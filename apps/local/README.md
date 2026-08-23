@@ -250,6 +250,21 @@ personal-export, or multi-device-management flow. A quiet
 Native troubleshooting-only local erase and targeted Keychain reset remain
 under **Data & Diagnostics…** and are not contribution steps.
 
+The companion can read one to eight explicitly selected Codex homes as one
+local profile. Launch it with one `--codex-home PATH` per activity root and,
+when more than one is supplied, exactly one `--primary-codex-home PATH` that
+matches the list. Historical rollout activity is combined in the existing
+unified index; live quota and root-specific `config.toml` behavior use only the
+primary home. Configure together only folders you intend TiboTattle to treat as
+one local user/account: it does not verify account equivalence. Secondary homes
+add history; they do not create separate users, quota meters, contribution
+devices, or upload credentials. The companion does not enumerate user profiles
+or WSL distributions. A missing secondary root yields path-free partial coverage while
+last-known-good facts remain available. Removing a root stops future reads and
+does not erase accepted history. Each root's active and archived trees share a
+500,000-entry and 125,000-rollout discovery ceiling; an oversized root is
+discarded for that pass without blocking fully scanned roots.
+
 ## Local API
 
 - `GET /api/local/health`

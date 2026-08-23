@@ -198,6 +198,8 @@ export const WEB_MESSAGES = Object.freeze({
   "dashboard.unavailable.noLocalEvidence": ["No local evidence", "没有本地证据", "Sin evidencia local"],
   "dashboard.unavailable.offline": ["Offline", "离线", "Sin conexión"],
   "dashboard.unavailable.emptyState": ["This empty state is intentional. Demo values are never substituted automatically.", "此空状态是有意设计的。绝不会自动替换为演示值。", "Este estado vacío es intencional. Los valores de demostración nunca se sustituyen automáticamente."],
+  "dashboard.sources.partialTitle": ["Codex source coverage is partial", "Codex 数据源覆盖不完整", "La cobertura de fuentes de Codex es parcial"],
+  "dashboard.sources.partialCopy": ["Available configured roots: {available} of {configured}. Some configured or previously indexed activity could not be refreshed. Any last-known indexed history is retained, and TiboTattle will not automatically switch physical copies; totals may be incomplete until coverage recovers.", "可用的已配置根目录：{available}/{configured}。部分已配置或之前索引的活动无法刷新。任何上次已知的索引历史记录都会保留，并且 TiboTattle 不会自动切换物理副本；在覆盖恢复前，总计可能不完整。", "Raíces configuradas disponibles: {available} de {configured}. No se pudo actualizar parte de la actividad configurada o indexada anteriormente. Se conserva cualquier historial indexado conocido y TiboTattle no cambia automáticamente de copia física; los totales pueden estar incompletos hasta que se recupere la cobertura."],
   "dashboard.quota.observations": ["Quota observations", "额度观测", "Observaciones de cuota"],
   "dashboard.quota.insufficient": ["Insufficient", "不足", "Insuficiente"],
   "dashboard.quota.noCurrent": ["The local companion has not exposed a current normal Codex allowance window.", "本地伴随程序尚未提供当前的正常 Codex 额度窗口。", "El acompañante local no ha expuesto una ventana actual de asignación normal de Codex."],
@@ -1476,6 +1478,10 @@ export function pseudoLocalize(value) {
 // test keeps this catalog complete for both shipped HTML entry points; new DOM
 // code should instead use a semantic `t` key above.
 export const LEGACY_TEXT_CATALOG = Object.freeze({
+  // Hidden pre-JS fallback for the multi-root coverage notice. The dashboard
+  // replaces these nodes with the parameterized semantic messages when shown.
+  "Codex source coverage is partial": ["Codex 数据源覆盖不完整", "La cobertura de fuentes de Codex es parcial"],
+  "Some configured or previously indexed activity could not be refreshed. Any last-known indexed history is retained, but totals may be incomplete until coverage recovers.": ["部分已配置或之前索引的活动无法刷新。任何上次已知的索引历史记录都会保留，但在覆盖恢复前，总计可能不完整。", "No se pudo actualizar parte de la actividad configurada o indexada anteriormente. Se conserva cualquier historial indexado conocido, pero los totales pueden estar incompletos hasta que se recupere la cobertura."],
   // The single approve-once contribution flow (2026-08-08).
   "Contribute anonymous usage data": ["贡献匿名使用数据", "Contribuir datos de uso anónimos"],
   // One-step flow (owner-directed 2026-08-08): sign in, then approve once.

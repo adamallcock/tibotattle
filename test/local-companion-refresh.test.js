@@ -544,6 +544,238 @@ test("unified accounting mode never advances the legacy archive and passes expli
   assert.equal(result.accounting.sourceMode, "unified");
 });
 
+test("multi-root refresh uses one primary live profile and forwards every activity root", async () => {
+  const codexHomes = ["/private/primary-codex", "/private/secondary-codex"];
+  let collectorOptions = null;
+  let unifiedOptions = null;
+  let accountingOptions = null;
+  let baselineReads = 0;
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    codexHomes,
+    primaryCodexHome: codexHomes[0],
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async (options) => {
+      collectorOptions = options;
+      return {
+        rolloutRecordsWritten: 1,
+        filesDiscovered: 1,
+        refresh: { attempted: false, recordWritten: false, errorCode: null },
+        indexing: COMPLETE_INDEX,
+      };
+    },
+    recordCodexSpeedBaseline: async () => {
+      baselineReads += 1;
+      return [{ mode: "fast" }];
+    },
+    refreshUnifiedIndex: async (options) => {
+      unifiedOptions = options;
+      return {
+        status: "ingested",
+        generation: {
+          id: 17,
+          fingerprint: "r".repeat(64),
+          status: "complete",
+          discoveryComplete: true,
+          diagnosticsComplete: true,
+          usageProvenanceComplete: true,
+          sourceOrderComplete: true,
+          quotaProvenanceComplete: true,
+          toolProvenanceComplete: true,
+        },
+        rootCoverage: {
+          status: "partial",
+          configuredRoots: 2,
+          availableRoots: 2,
+          emptyRoots: 0,
+          unavailableRoots: 0,
+          retainedHistory: false,
+          ambiguousSources: 1,
+          privateRoot: codexHomes[1],
+        },
+      };
+    },
+    refreshAccounting: async (options) => {
+      accountingOptions = options;
+      return {
+        generatedAt: "2026-07-23T12:00:00.000Z",
+        periods: [{ id: "7d", events: 3 }],
+        diagnostics: {},
+        sourceDescriptor: { fallbackCount: 0 },
+      };
+    },
+  });
+
+  const result = await runner();
+
+  assert.equal(collectorOptions.codexHome, codexHomes[0]);
+  assert.equal(collectorOptions.skipRolloutIngestion, true);
+  assert.deepEqual(unifiedOptions.codexHomes, codexHomes);
+  assert.equal(Object.hasOwn(unifiedOptions, "codexHome"), false);
+  assert.equal(Object.hasOwn(unifiedOptions, "primaryCodexHome"), false);
+  assert.deepEqual(accountingOptions.codexHomes, codexHomes);
+  assert.equal(Object.hasOwn(accountingOptions, "codexHome"), false);
+  assert.equal(Object.hasOwn(accountingOptions, "primaryCodexHome"), false);
+  assert.equal(baselineReads, 0);
+  assert.deepEqual(result.unifiedIndex.rootCoverage, {
+    status: "partial",
+    configuredRoots: 2,
+    availableRoots: 2,
+    emptyRoots: 0,
+    unavailableRoots: 0,
+    retainedHistory: false,
+    unavailableOwnerSources: 0,
+    ambiguousSources: 1,
+  });
+  assert.equal(JSON.stringify(result).includes("/private/"), false);
+});
+
+test("all-unavailable roots without retained history cannot publish an empty corpus", async () => {
+  let accountingRuns = 0;
+  const codexHomes = ["/private/primary-codex", "/private/offline-codex"];
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    codexHomes,
+    primaryCodexHome: codexHomes[0],
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 0,
+      filesDiscovered: 0,
+      refresh: { attempted: false, recordWritten: false, errorCode: null },
+      indexing: COMPLETE_INDEX,
+    }),
+    refreshUnifiedIndex: async () => ({
+      status: "ingested",
+      generation: {
+        id: 1,
+        fingerprint: "u".repeat(64),
+        status: "complete",
+        discoveryComplete: true,
+        diagnosticsComplete: true,
+        usageProvenanceComplete: true,
+        sourceOrderComplete: true,
+        quotaProvenanceComplete: true,
+        toolProvenanceComplete: true,
+      },
+      totalUsageEvents: 0,
+      rootCoverage: {
+        status: "unavailable",
+        configuredRoots: 2,
+        availableRoots: 0,
+        emptyRoots: 0,
+        unavailableRoots: 2,
+        retainedHistory: false,
+      },
+    }),
+    refreshAccounting: async () => {
+      accountingRuns += 1;
+      return REUSABLE_ACCOUNTING_CACHE;
+    },
+  });
+
+  const result = await runner();
+
+  assert.deepEqual(result.unifiedIndex, {
+    status: "failed",
+    errorCode: "local_unified_index_roots_unavailable",
+  });
+  assert.equal(accountingRuns, 0);
+  assert.equal(result.accounting.status, "unavailable");
+  assert.equal(Object.hasOwn(result.unifiedIndex, "totalUsageEvents"), false);
+});
+
+test("all-unavailable roots may serve an authoritative retained generation", async () => {
+  let accountingRuns = 0;
+  const codexHomes = ["/private/primary-codex", "/private/offline-codex"];
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    codexHomes,
+    primaryCodexHome: codexHomes[0],
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 1,
+      filesDiscovered: 0,
+      refresh: { attempted: false, recordWritten: false, errorCode: null },
+      indexing: COMPLETE_INDEX,
+    }),
+    refreshUnifiedIndex: async () => ({
+      status: "ingested",
+      unchanged: true,
+      generation: {
+        id: 4,
+        fingerprint: "l".repeat(64),
+        status: "complete",
+        discoveryComplete: true,
+        diagnosticsComplete: true,
+        usageProvenanceComplete: true,
+        sourceOrderComplete: true,
+        quotaProvenanceComplete: true,
+        toolProvenanceComplete: true,
+      },
+      totalUsageEvents: 9,
+      rootCoverage: {
+        status: "unavailable",
+        configuredRoots: 2,
+        availableRoots: 0,
+        emptyRoots: 0,
+        unavailableRoots: 2,
+        retainedHistory: true,
+        unavailableOwnerSources: 3,
+        ambiguousSources: 0,
+      },
+    }),
+    refreshAccounting: async () => {
+      accountingRuns += 1;
+      return {
+        generatedAt: "2026-07-23T12:00:00.000Z",
+        periods: [{ id: "7d", events: 9 }],
+        diagnostics: {},
+        sourceDescriptor: { fallbackCount: 0 },
+      };
+    },
+  });
+
+  const result = await runner();
+
+  assert.equal(result.unifiedIndex.status, "ingested");
+  assert.equal(result.unifiedIndex.totalUsageEvents, 9);
+  assert.deepEqual(result.unifiedIndex.rootCoverage, {
+    status: "unavailable",
+    configuredRoots: 2,
+    availableRoots: 0,
+    emptyRoots: 0,
+    unavailableRoots: 2,
+    retainedHistory: true,
+    unavailableOwnerSources: 3,
+    ambiguousSources: 0,
+  });
+  assert.equal(accountingRuns, 1);
+});
+
+test("multi-root refresh requires an explicit primary and unified authority", () => {
+  assert.throws(
+    () => createLocalCollectorRefreshRunner({
+      accountingSourceMode: "unified",
+      codexHomes: ["/private/one", "/private/two"],
+    }),
+    /primaryCodexHome is required/u,
+  );
+  assert.throws(
+    () => createLocalCollectorRefreshRunner({
+      accountingSourceMode: "legacy",
+      codexHomes: ["/private/one", "/private/two"],
+      primaryCodexHome: "/private/one",
+    }),
+    /require unified accounting mode/u,
+  );
+});
+
 test("tool-only partial coverage does not block complete usage accounting", async () => {
   let accountingCalls = 0;
   const generation = {
@@ -868,6 +1100,41 @@ test("unified mode fails closed when the authoritative generation is missing or 
     {
       name: "missing generation",
       unifiedIndex: { status: "ingested" },
+      expectedUnifiedIndex: {
+        status: "failed",
+        errorCode: "local_unified_index_generation_invalid",
+      },
+      expectedAccountingError: "accounting_unified_source_unavailable",
+      expectedCoverage: "unavailable",
+      expectedGeneration: null,
+      expectedFingerprint: null,
+    },
+    {
+      name: "ready root coverage with an unavailable owner",
+      unifiedIndex: {
+        status: "ingested",
+        generation: {
+          id: 6,
+          fingerprint: "a".repeat(64),
+          status: "complete",
+          discoveryComplete: true,
+          diagnosticsComplete: true,
+          usageProvenanceComplete: true,
+          sourceOrderComplete: true,
+          quotaProvenanceComplete: true,
+          toolProvenanceComplete: true,
+        },
+        rootCoverage: {
+          status: "ready",
+          configuredRoots: 1,
+          availableRoots: 1,
+          emptyRoots: 0,
+          unavailableRoots: 0,
+          retainedHistory: true,
+          unavailableOwnerSources: 1,
+          ambiguousSources: 0,
+        },
+      },
       expectedUnifiedIndex: {
         status: "failed",
         errorCode: "local_unified_index_generation_invalid",

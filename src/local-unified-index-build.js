@@ -32,6 +32,7 @@ import {
   sessionLocal,
   snapshotLocal,
   sourceLocal,
+  sourceOwnerLocal,
 } from "./local-unified-index.js";
 
 // Rebuild the unified index from source.
@@ -205,6 +206,9 @@ export function writeCursorForOutcome(writer, deviceSalt, info, state, {
 }) {
   writer.writeSourceCursor({
     sourceLocal: sourceLocal(deviceSalt, info.rolloutKey),
+    ownerLocal: typeof info.rootOwnerKey === "string"
+      ? sourceOwnerLocal(deviceSalt, info.rootOwnerKey)
+      : null,
     sourceOrdinal: state.sourceOrdinal ?? null,
     sessionLocal: state.sessionLocal,
     scannedBytes: nextOffset,
@@ -509,6 +513,7 @@ async function runWorkerLane(lane, laneIndex, { maximumLineBytes, signal, onBatc
  */
 export async function rebuildLocalUnifiedIndex({
   codexHome,
+  codexHomes = null,
   indexFile = defaultLocalUnifiedIndexPath(),
   secretFile = null,
   startAt = "1970-01-01T00:00:00.000Z",
@@ -522,8 +527,13 @@ export async function rebuildLocalUnifiedIndex({
   onProgress = null,
   discoveryLimits = null,
 } = {}) {
-  if (typeof codexHome !== "string" || codexHome.length < 1) {
-    throw new TypeError("codexHome must be a non-empty string");
+  if (codexHome !== null && codexHome !== undefined
+      && codexHomes !== null && codexHomes !== undefined) {
+    throw new TypeError("codexHome and codexHomes are mutually exclusive");
+  }
+  if (codexHomes === null
+      && (typeof codexHome !== "string" || codexHome.length < 1)) {
+    throw new TypeError("codexHome or codexHomes must be configured");
   }
   if (typeof contractVersion !== "string" || contractVersion.length < 1) {
     throw new TypeError("contractVersion must be a non-empty string");
@@ -540,16 +550,20 @@ export async function rebuildLocalUnifiedIndex({
   await assertSafeLocalUnifiedIndexTarget(resolvedIndexFile, {
     allowMissing: true,
   });
-  const deviceSalt = await readOrCreateDeviceSalt(
-    secretFile ?? defaultLocalUnifiedIndexSecretPath(resolvedIndexFile),
-  );
   const infos = await discoverCodexRolloutInfos({
     codexHome,
+    codexHomes,
     startAt,
     endAt,
     signal,
     discoveryLimits,
   });
+  if (infos.rootCoverage?.status === "unavailable") {
+    throw fixedError("local_unified_index_roots_unavailable");
+  }
+  const deviceSalt = await readOrCreateDeviceSalt(
+    secretFile ?? defaultLocalUnifiedIndexSecretPath(resolvedIndexFile),
+  );
   const discoveredAt = performance.now();
   const sourceBytes = infos.reduce((total, info) => total + Number(info.size ?? 0), 0);
 
@@ -898,6 +912,7 @@ export async function rebuildLocalUnifiedIndex({
       scanWallMs: scannedAt - discoveredAt,
       wallMs: performance.now() - startedAt,
       peakRssBytes: process.memoryUsage.rss(),
+      rootCoverage: infos.rootCoverage ?? null,
     };
   } catch (error) {
     try {

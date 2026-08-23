@@ -183,17 +183,17 @@ function usage() {
   usage-monitor doctor
   usage-monitor capture [--label TEXT] [--controlled] [--offline] [--data-file PATH]
   usage-monitor report [--json] [--data-file PATH] [--corrections PATH]
-  usage-monitor transitions --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--offline] [--compact] [--window-minutes N] [--output PATH] [--audit-file PATH]
+  usage-monitor transitions --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--codex-home PATH ...] [--offline] [--compact] [--window-minutes N] [--output PATH] [--audit-file PATH]
   usage-monitor infer [--input PATH] [--output PATH] [--report-file PATH]
   usage-monitor history [--input PATH] [--output PATH] [--report-file PATH]
   usage-monitor crosscheck --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--input LOCAL_HISTORY_PATH] [--allow-stale-cache] [--offline] [--provider-ui PATH] [--output PATH] [--report-file PATH]
   usage-monitor quality [--input TRANSITIONS_PATH] [--collector-file PATH] [--output PATH] [--report-file PATH]
   usage-monitor calibrate-weekly [--input TRANSITIONS_PATH] [--output PATH] [--report-file PATH]
   usage-monitor mark-activity --surface SURFACE --state start|end|pulse [--experiment-id ID] [--activity-file PATH]
-  usage-monitor inspect-export --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--codex-home PATH] [--activity-file PATH] [--secret-file PATH]
-  usage-monitor export-local --since ISO_TIMESTAMP --until ISO_TIMESTAMP --output PATH [--receipt PATH] [--codex-home PATH] [--activity-file PATH] [--secret-file PATH]
+  usage-monitor inspect-export --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--codex-home PATH ...] [--activity-file PATH] [--secret-file PATH]
+  usage-monitor export-local --since ISO_TIMESTAMP --until ISO_TIMESTAMP --output PATH [--receipt PATH] [--codex-home PATH ...] [--activity-file PATH] [--secret-file PATH]
   usage-monitor verify-bundle --input PATH [--receipt PATH]
-  usage-monitor export-set --workspace PATH --directory PATH [--resume] [--since ISO_TIMESTAMP --until ISO_TIMESTAMP] [--codex-home PATH] [--collector-file PATH] [--claude-status | --claude-state-dir PATH] [--claude-usage] [--claude-projects-dir PATH] [--activity-file PATH] [--secret-file PATH] [--max-records-per-chunk N] [--max-bundle-bytes N] [--max-artifact-bytes N]
+  usage-monitor export-set --workspace PATH --directory PATH [--resume] [--since ISO_TIMESTAMP --until ISO_TIMESTAMP] [--codex-home PATH ...] [--collector-file PATH] [--claude-status | --claude-state-dir PATH] [--claude-usage] [--claude-projects-dir PATH] [--activity-file PATH] [--secret-file PATH] [--max-records-per-chunk N] [--max-bundle-bytes N] [--max-artifact-bytes N]
   usage-monitor inspect-export-workspace --workspace PATH
   usage-monitor verify-export-set --directory PATH
   usage-monitor delete-local-export --workspace PATH --directory PATH [--confirm-deletion TOKEN]
@@ -216,13 +216,13 @@ function usage() {
   usage-monitor sync-contributions-status [--queue-file PATH]
   usage-monitor sync-contributions-pause [--queue-file PATH]
   usage-monitor sync-contributions-resume [--queue-file PATH]
-  usage-monitor collect-once [--stale-after-ms N] [--no-refresh] [--backfill] [--state-file PATH]
-  usage-monitor collect-foreground [--stale-after-ms N] [--reconciliation-ms N] [--duration-ms N] [--state-file PATH]
+  usage-monitor collect-once [--codex-home PATH] [--stale-after-ms N] [--no-refresh] [--backfill] [--state-file PATH]
+  usage-monitor collect-foreground [--codex-home PATH] [--stale-after-ms N] [--reconciliation-ms N] [--duration-ms N] [--state-file PATH]
   usage-monitor collector-state-status [--state-file PATH] [--json]
   usage-monitor plan-collector-retention --before ISO_TIMESTAMP [--state-file PATH] [--json]
   usage-monitor experiment --manifest PATH [--execute-live] [--offline] [--result-file PATH]
   usage-monitor contamination [--transitions PATH] [--inference PATH] [--experiments PATH] [--observations PATH] [--output PATH] [--report-file PATH]
-  usage-monitor tools --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--output PATH] [--report-file PATH]
+  usage-monitor tools --since ISO_TIMESTAMP --until ISO_TIMESTAMP [--codex-home PATH ...] [--output PATH] [--report-file PATH]
   usage-monitor migrate-corrections [--observations PATH] [--transitions PATH] [--corrections PATH] [--output PATH] [--report-file PATH]
 `);
 }
@@ -282,6 +282,8 @@ export function parseArgs(argv) {
     activityFile: null,
     experimentId: null,
     codexHome: null,
+    codexHomes: [],
+    primaryCodexHome: null,
     exportSecretFile: null,
     receiptFile: null,
     directory: null,
@@ -350,7 +352,15 @@ export function parseArgs(argv) {
     else if (arg === "--state") result.activityState = readOptionValue(argv, index++, arg);
     else if (arg === "--activity-file") result.activityFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--experiment-id") result.experimentId = readOptionValue(argv, index++, arg);
-    else if (arg === "--codex-home") result.codexHome = resolve(readOptionValue(argv, index++, arg));
+    else if (arg === "--codex-home") {
+      result.codexHomes.push(resolve(readOptionValue(argv, index++, arg)));
+    }
+    else if (arg === "--primary-codex-home") {
+      if (result.primaryCodexHome !== null) {
+        throw new Error("--primary-codex-home may be specified only once");
+      }
+      result.primaryCodexHome = resolve(readOptionValue(argv, index++, arg));
+    }
     else if (arg === "--secret-file") result.exportSecretFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--receipt") result.receiptFile = resolve(readOptionValue(argv, index++, arg));
     else if (arg === "--directory") result.directory = resolve(readOptionValue(argv, index++, arg));
@@ -447,6 +457,32 @@ export function parseArgs(argv) {
         || new Date(Date.parse(result.beforeAt)).toISOString() !== result.beforeAt)) {
     throw new Error("plan-collector-retention requires --before as a valid ISO timestamp");
   }
+  if (result.codexHomes.length > 8) {
+    throw new Error("--codex-home may be specified at most eight times");
+  }
+  if (new Set(result.codexHomes).size !== result.codexHomes.length) {
+    throw new Error("--codex-home paths must be unique");
+  }
+  if (result.codexHomes.length === 0) {
+    if (result.primaryCodexHome !== null) {
+      throw new Error("--primary-codex-home requires at least one --codex-home");
+    }
+  } else {
+    if (result.codexHomes.length === 1) {
+      result.primaryCodexHome ??= result.codexHomes[0];
+    }
+    if (result.primaryCodexHome !== null
+        && !result.codexHomes.includes(result.primaryCodexHome)) {
+      throw new Error("--primary-codex-home must match one --codex-home");
+    }
+    // Preserve the original scalar contract for singleton callers. Plural
+    // activity-only commands consume codexHomes directly; live/legacy commands
+    // reject the plural list before this null alias could drop a root.
+    result.codexHome = result.codexHomes.length === 1
+      ? result.primaryCodexHome
+      : null;
+  }
+  result.codexHomes = Object.freeze([...result.codexHomes]);
   result.dataFile ??= defaultDataFile();
   return result;
 }
@@ -608,6 +644,24 @@ export async function run(
     usage();
     return;
   }
+  const pluralActivityCommands = new Set([
+    "export-local",
+    "export-set",
+    "inspect-export",
+    "tools",
+    "transitions",
+  ]);
+  if (args.codexHomes.length > 1
+      && !pluralActivityCommands.has(args.command)) {
+    throw new Error(
+      `${args.command} does not support multiple --codex-home activity roots`,
+    );
+  }
+  const codexActivityRootOptions = args.codexHomes.length > 1
+    ? { codexHomes: args.codexHomes }
+    : args.codexHome === null
+      ? {}
+      : { codexHome: args.codexHome };
   if (args.command === "benchmark-r7") {
     if (!args.outputFile) throw new Error("benchmark-r7 requires --output");
     const profile = args.benchmarkProfile ?? "smoke";
@@ -915,7 +969,7 @@ export async function run(
       const workspaceResult = args.resume
         ? await resumeLocalExportWorkspace({
             directory: args.workspaceDirectory,
-            codexHome: args.codexHome ?? undefined,
+            ...codexActivityRootOptions,
             secret: identity.secret,
             activityMarkers,
             collectorPath: args.collectorFile,
@@ -928,7 +982,7 @@ export async function run(
             directory: args.workspaceDirectory,
             startAt: args.startAt,
             endAt: args.endAt,
-            codexHome: args.codexHome ?? undefined,
+            ...codexActivityRootOptions,
             secret: identity.secret,
             activityMarkers,
             collectorPath: args.collectorFile,
@@ -1096,7 +1150,7 @@ export async function run(
       const result = await buildLocalMetadataBundle({
         startAt: args.startAt,
         endAt: args.endAt,
-        codexHome: args.codexHome ?? undefined,
+        ...codexActivityRootOptions,
         secret: identity.secret,
         activityMarkers,
         resourceGuard: exportResourceGuard,
@@ -1190,6 +1244,7 @@ export async function run(
     const dataset = await mineCodexTransitions({
       startAt: args.startAt,
       endAt: args.endAt,
+      ...codexActivityRootOptions,
       offline: args.offline,
       includeSnapshotIntervals: !args.compact,
       windowDurationMins: args.windowDurationMins,
@@ -1405,6 +1460,7 @@ export async function run(
   if (args.command === "collect-once") {
     const selection = selectedAccountObservation();
     const result = await runCollectorOnceCommand({
+      ...(args.codexHome === null ? {} : { codexHome: args.codexHome }),
       stateFile: args.stateFile ?? defaultCollectorStateFile(),
       staleAfterMs: args.staleAfterMs,
       refreshStale: args.refreshStale,
@@ -1424,6 +1480,7 @@ export async function run(
     try {
       const selection = selectedAccountObservation();
       const result = await runCollectorForegroundCommand({
+        ...(args.codexHome === null ? {} : { codexHome: args.codexHome }),
         stateFile: args.stateFile ?? defaultCollectorStateFile(),
         staleAfterMs: args.staleAfterMs,
         reconciliationMs: args.reconciliationMs,
@@ -1479,7 +1536,11 @@ export async function run(
     if (!Number.isFinite(Date.parse(args.startAt)) || !Number.isFinite(Date.parse(args.endAt))) {
       throw new Error("--since and --until must be valid ISO timestamps");
     }
-    const scan = await scanCodexLogEvents({ startAt: args.startAt, endAt: args.endAt });
+    const scan = await scanCodexLogEvents({
+      startAt: args.startAt,
+      endAt: args.endAt,
+      ...codexActivityRootOptions,
+    });
     const clientSources = Object.entries(scan.toolObservationsBySource)
       .filter(([sourceKind]) => sourceKind.startsWith("client_"));
     const clientToolEvents = REQUIRED_TOOL_CLASSES.map((toolClass) => ({

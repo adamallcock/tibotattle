@@ -51,6 +51,7 @@ import {
   configuredAccountingSourceMode,
   createCentralOutboundFetch,
   createLocalCompanionServer,
+  parseLocalCompanionCodexRootArgs,
   resolveClaudeDesktopShadowConfiguration,
   startLocalCompanionServer,
 } from "./server.js";
@@ -230,6 +231,170 @@ test("production authority defaults unified and keeps legacy as explicit rollbac
   );
 });
 
+test("local companion CLI accepts bounded repeated Codex roots with one stable primary", () => {
+  const roots = [
+    resolve("private-codex-one"),
+    resolve("private-codex-two"),
+    resolve("private-codex-three"),
+  ];
+  assert.deepEqual(parseLocalCompanionCodexRootArgs([
+    "--codex-home", roots[0],
+    "--codex-home", roots[1],
+    "--primary-codex-home", roots[0],
+  ]), {
+    codexHomes: roots.slice(0, 2),
+    primaryCodexHome: roots[0],
+  });
+  assert.deepEqual(parseLocalCompanionCodexRootArgs([
+    "--codex-home", roots[1],
+  ]), {
+    codexHomes: [roots[1]],
+    primaryCodexHome: roots[1],
+  });
+  assert.throws(
+    () => parseLocalCompanionCodexRootArgs([
+      "--codex-home", roots[0],
+      "--codex-home", roots[1],
+    ]),
+    /require --primary-codex-home/u,
+  );
+  assert.throws(
+    () => parseLocalCompanionCodexRootArgs(Array.from(
+      { length: 9 },
+      (_, index) => ["--codex-home", resolve(`codex-${index}`)],
+    ).flat()),
+    /at most eight/u,
+  );
+  const rejected = [
+    {
+      name: "duplicate roots",
+      argv: [
+        "--codex-home", roots[0],
+        "--codex-home", roots[0],
+        "--primary-codex-home", roots[0],
+      ],
+      pattern: /paths must be unique/u,
+    },
+    {
+      name: "repeated primary",
+      argv: [
+        "--codex-home", roots[0],
+        "--codex-home", roots[1],
+        "--primary-codex-home", roots[0],
+        "--primary-codex-home", roots[1],
+      ],
+      pattern: /may be specified only once/u,
+    },
+    {
+      name: "primary outside roots",
+      argv: [
+        "--codex-home", roots[0],
+        "--codex-home", roots[1],
+        "--primary-codex-home", roots[2],
+      ],
+      pattern: /must match one --codex-home/u,
+    },
+    {
+      name: "missing Codex root value",
+      argv: ["--codex-home"],
+      pattern: /requires a path/u,
+    },
+    {
+      name: "missing primary value",
+      argv: ["--codex-home", roots[0], "--primary-codex-home"],
+      pattern: /requires a path/u,
+    },
+    {
+      name: "unsupported flag",
+      argv: ["--codex-home", roots[0], "--automatic-discovery"],
+      pattern: /argument is unsupported/u,
+    },
+  ];
+  for (const { name, argv, pattern } of rejected) {
+    assert.throws(
+      () => parseLocalCompanionCodexRootArgs(argv),
+      pattern,
+      name,
+    );
+  }
+});
+
+test("local companion aggregates plural-root onboarding without path disclosure", async () => {
+  const files = await fixture();
+  const unavailableRoot = join(files.root, "offline-profile", ".codex");
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHomes: [files.codexHome, unavailableRoot],
+    primaryCodexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({}),
+    port: 0,
+  });
+  try {
+    const onboarding = await fetch(
+      `http://127.0.0.1:${app.port}/api/local/onboarding`,
+    ).then((response) => response.json());
+    assert.equal(onboarding.status, "ready");
+    assert.equal(onboarding.source.availability, "partial");
+    assert.equal(onboarding.source.configuredRoots, 2);
+    assert.equal(onboarding.source.availableRoots, 1);
+    assert.equal(onboarding.source.unavailableRoots, 1);
+    assert.equal(onboarding.capabilities.customCodexHomeConfigured, true);
+    const serialized = JSON.stringify(onboarding);
+    assert.equal(serialized.includes(files.codexHome), false);
+    assert.equal(serialized.includes(unavailableRoot), false);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("plural companion binds the development side-chat probe to the primary root", async () => {
+  const files = await fixture();
+  const secondaryCodexHome = join(files.root, "secondary", ".codex");
+  await mkdir(join(secondaryCodexHome, "sessions"), {
+    recursive: true,
+    mode: 0o700,
+  });
+  await mkdir(join(secondaryCodexHome, "archived_sessions"), {
+    recursive: true,
+    mode: 0o700,
+  });
+  let receivedCodexHome = null;
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHomes: [files.codexHome, secondaryCodexHome],
+    primaryCodexHome: secondaryCodexHome,
+    staticRoot: files.staticRoot,
+    environment: {
+      USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_ESTIMATES: "1",
+    },
+    sideChatEstimateCollector: async (options) => {
+      receivedCodexHome = options.codexHome;
+      return {
+        status: "unavailable",
+        errorCode: "side_chat_logs2_unavailable",
+        methodology: null,
+        timeline: [],
+        periods: [],
+        recent: [],
+      };
+    },
+    refreshRunner: async () => ({}),
+    port: 0,
+  });
+  try {
+    await app.snapshotReady;
+    assert.equal(receivedCodexHome, secondaryCodexHome);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
 function rawRequest({ port, path, method = "GET", headers = {}, body = "" }) {
   return new Promise((resolveRequest, rejectRequest) => {
     const request = httpRequest({
@@ -358,10 +523,15 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     const onboarding = await fetch(`${base}/api/local/onboarding`);
     assert.equal(onboarding.status, 200);
     assert.deepEqual(await onboarding.json(), {
-      schemaVersion: "local-onboarding-v0.2",
+      schemaVersion: "local-onboarding-v0.3",
       status: "ready",
       source: {
         status: "ready",
+        availability: "ready",
+        configuredRoots: 1,
+        availableRoots: 1,
+        emptyRoots: 0,
+        unavailableRoots: 0,
         sessionsReadable: true,
         archivedSessionsReadable: true,
         rolloutFilesPresent: true,
@@ -550,10 +720,15 @@ test("local companion remains usable before Codex is installed", async () => {
     );
     assert.equal(onboarding.status, 200);
     assert.deepEqual(await onboarding.json(), {
-      schemaVersion: "local-onboarding-v0.2",
+      schemaVersion: "local-onboarding-v0.3",
       status: "needs_attention",
       source: {
         status: "codex_home_missing",
+        availability: "unavailable",
+        configuredRoots: 1,
+        availableRoots: 0,
+        emptyRoots: 0,
+        unavailableRoots: 1,
         sessionsReadable: false,
         archivedSessionsReadable: false,
         rolloutFilesPresent: false,
@@ -1908,11 +2083,16 @@ test("development file override drives the real default preparation runner witho
   const secretCanary = Buffer.alloc(32, 37).toString("base64url");
   const secretFile = join(files.root, "development-export-identity");
   const codexHome = join(files.root, "codex-home");
+  const secondaryCodexHome = join(files.root, "secondary-codex-home");
   const sessionDirectory = join(codexHome, "sessions");
+  const secondarySessionDirectory = join(secondaryCodexHome, "sessions");
   const preparedDirectory = join(files.stateRoot, "prepared");
   const reviewDirectory = join(files.stateRoot, "reviews");
   const queueFile = join(files.stateRoot, "queue.sqlite3");
-  await mkdir(sessionDirectory, { recursive: true, mode: 0o700 });
+  await Promise.all([
+    mkdir(sessionDirectory, { recursive: true, mode: 0o700 }),
+    mkdir(secondarySessionDirectory, { recursive: true, mode: 0o700 }),
+  ]);
   await writeFile(secretFile, `${secretCanary}\n`, { mode: 0o600 });
   const tokenUsage = {
     input_tokens: 100,
@@ -1962,6 +2142,16 @@ test("development file override drives the real default preparation runner witho
     `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`,
     { mode: 0o600 },
   );
+  const secondaryRows = structuredClone(rows);
+  secondaryRows[0].payload.id = "second-private-session-that-must-not-leak";
+  secondaryRows[0].timestamp = "2026-07-24T23:00:30.000Z";
+  secondaryRows[1].timestamp = "2026-07-24T23:00:31.000Z";
+  secondaryRows[2].timestamp = "2026-07-24T23:01:30.000Z";
+  await writeFile(
+    join(secondarySessionDirectory, "rollout-secondary.jsonl"),
+    `${secondaryRows.map((row) => JSON.stringify(row)).join("\n")}\n`,
+    { mode: 0o600 },
+  );
   const store = fakeStore();
   store.getOverview = () => ({
     schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
@@ -1975,7 +2165,8 @@ test("development file override drives the real default preparation runner witho
   const app = await startLocalCompanionServer({
     resourceRoot: files.resourceRoot,
     stateRoot: files.stateRoot,
-    codexHome: files.codexHome,
+    codexHomes: [codexHome, secondaryCodexHome],
+    primaryCodexHome: codexHome,
     staticRoot: files.staticRoot,
     dataStore: store,
     refreshRunner: async () => ({}),
@@ -1990,7 +2181,6 @@ test("development file override drives the real default preparation runner witho
       throw new Error("Keychain must not be constructed");
     },
     contributionPreparationOptions: {
-      codexHome,
       activityFile: join(
         files.stateRoot,
         "missing-activity-markers.jsonl",
@@ -2026,6 +2216,7 @@ test("development file override drives the real default preparation runner witho
     const result = await prepared.json();
     assert.equal(result.status, "prepared");
     assert.equal(result.prepared.batchCount, 1);
+    assert.equal(result.recordCounts.usageEvents, 2);
     assert.equal(result.networkActivity, false);
     assert.equal(JSON.stringify(result).includes(files.root), false);
     assert.equal(JSON.stringify(result).includes(privateCanary), false);

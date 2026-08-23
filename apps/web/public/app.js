@@ -10,6 +10,7 @@ import {
   demoDashboard,
   isValidQuotaWindowDuration,
   normalizeIncrementalContributionSyncStatus,
+  normalizeLocalRootCoverage,
   selectPrimaryCodexQuotaWindow
 } from "./data-client.js";
 import {
@@ -59,6 +60,7 @@ import {
   getFormattingLocale,
   localCalendarParts,
   numberFormatter,
+  renderCodexRootCoverageNotice,
   selectAvailableAccountingPeriod,
   setFormattingLocale,
   setMessageLocale,
@@ -166,6 +168,11 @@ let localCompanionHealth = null;
 // for hours behind that silence. Only a successful status read updates this,
 // so a transient poll failure cannot clear an honest note.
 let accountingRebuildDeferral = null;
+// The last closed, path-free multi-root coverage receipt. It comes from a
+// terminal local refresh, which can see identity collisions and remembered
+// physical-owner loss that the lightweight filesystem onboarding check cannot.
+// A missing or malformed status read never clears an existing warning.
+let localCodexRootCoverage = null;
 // This is an optional, short-lived rendering hint from the public health
 // endpoint. The Worker remains authoritative; a missing or stale health read
 // never blocks a legitimate sign-in, while an explicit paused state avoids
@@ -945,8 +952,25 @@ function onboardingSourceGuidance(value) {
   };
 }
 
+function renderCodexRootCoverage(value) {
+  renderCodexRootCoverageNotice({
+    documentRef: document,
+    onboarding: value,
+    indexedCoverage: localCodexRootCoverage,
+    setLocalizedText,
+  });
+}
+
+function observeLocalRootCoverage(refreshState) {
+  const observed = normalizeLocalRootCoverage(
+    refreshState?.refresh?.result?.unifiedIndex?.rootCoverage,
+  );
+  if (observed !== null) localCodexRootCoverage = observed;
+}
+
 function renderLocalOnboarding(value) {
   localOnboarding = value;
+  renderCodexRootCoverage(value);
   const card = $("#setup-card");
   if (!card) return;
   if (runsInsideNativeDashboard()) {
@@ -9993,6 +10017,7 @@ async function loadLocalDashboard() {
     if (refreshState !== null) {
       accountingRebuildDeferral =
         refreshState?.refresh?.result?.accountingRebuildDeferred ?? null;
+      observeLocalRootCoverage(refreshState);
     }
     renderDashboard(data);
     // Health arrives after the first paint, and the sign-in controls are gated
@@ -10056,7 +10081,11 @@ function renderDashboardSkeleton() {
 }
 
 async function loadQuickResultDashboard() {
-  const data = await localClient.load();
+  const [data, refreshState] = await Promise.all([
+    localClient.load(),
+    localClient.refreshStatus().catch(() => null),
+  ]);
+  if (refreshState !== null) observeLocalRootCoverage(refreshState);
   renderDashboard(data);
   if (localOnboarding) renderLocalOnboarding(localOnboarding);
 }

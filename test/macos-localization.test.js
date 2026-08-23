@@ -150,7 +150,8 @@ test("native catalogs have complete language parity and preserve placeholders", 
   assert.match(appSource, /launcherErrorInvalidCentralService/u);
   assert.match(appSource, /launcherRecoveryReinstall/u);
   assert.match(appSource, /nativeDashboardCurrentEvidenceTooltip/u);
-  assert.match(appSource, /settingsCodexFolderCustomSelected/u);
+  assert.match(appSource, /settingsCodexFolderActivitySelectedPath/u);
+  assert.match(appSource, /settingsCodexFolderPrimarySelectedPath/u);
   assert.match(appSource, /settingsRefreshInterval/u);
   assert.match(appSource, /static let defaultsKey = "tibotattle\.refresh-interval\.v1"/u);
   assert.match(appSource, /allowedSeconds = \[60, 5 \* 60, 15 \* 60, 30 \* 60\]/u);

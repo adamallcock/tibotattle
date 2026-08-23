@@ -83,6 +83,9 @@ const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION = "local-unified-index-v1";
 // v8 (2026-08-17): typed response-item tool observations are source-scoped and
 // generation-bound. Existing v7 cursors must rescan so a complete generation
 // cannot silently publish an empty tool projection for already indexed files.
+// v9 (2026-08-23): every logical rollout cursor may bind to one opaque local
+// physical-root owner. Existing v8 cursors migrate with NULL ownership and the
+// next accepted ingest stamps the deterministic current owner.
 export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v8";
 
 // A row salvaged from a line that exceeded the bounded-line cap carries this
@@ -107,11 +110,12 @@ const INDEX_APPLICATION_ID = 0x554d5549;
 // columns on usage_event plus one interned local-source dimension. Version 7
 // adds generation-bound usage/quota provenance. Version 8 adds source-scoped,
 // generation-bound tool facts and widens the closed diagnostic vocabulary.
+// Version 9 adds the opaque physical-root owner binding to source cursors.
 // Each widening is additive except that closed diagnostic CHECK widening,
 // which is rebuilt transactionally while preserving every existing row.
-export const LOCAL_UNIFIED_INDEX_USER_VERSION = 8;
+export const LOCAL_UNIFIED_INDEX_USER_VERSION = 9;
 const INDEX_USER_VERSION = LOCAL_UNIFIED_INDEX_USER_VERSION;
-const MIGRATABLE_USER_VERSIONS = new Set([1, 2, 3, 4, 5, 6, 7, 8]);
+const MIGRATABLE_USER_VERSIONS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9]);
 const SECRET_BYTES = 32;
 const MAX_SECRET_BYTES = 256;
 const DEFAULT_COMMIT_ROWS = 10_000;
@@ -399,6 +403,9 @@ const SCHEMA = `
   -- six cumulative token counters. No path, no content.
   CREATE TABLE IF NOT EXISTS source_cursor(
     source_local BLOB PRIMARY KEY,     -- HMAC(device_salt, rollout key)
+    -- Physical root ownership is deliberately separate from source identity.
+    -- It is an opaque device-local digest, never a path or caller root id.
+    owner_local BLOB CHECK(owner_local IS NULL OR length(owner_local) = 32),
     source_ordinal INTEGER CHECK(source_ordinal IS NULL OR source_ordinal >= 0),
     session_local BLOB,
     scanned_bytes INTEGER NOT NULL,
@@ -693,6 +700,10 @@ export function sourceLocal(deviceSalt, rolloutKey) {
   return localDigest(deviceSalt, "unified-index-source", rolloutKey);
 }
 
+export function sourceOwnerLocal(deviceSalt, rootOwnerKey) {
+  return localDigest(deviceSalt, "unified-index-source-owner", rootOwnerKey);
+}
+
 /**
  * A persisted fork-replay snapshot key. The raw key is a "|"-joined tuple of
  * cumulative token counters; membership is the only question the boundary
@@ -912,6 +923,8 @@ function migrateDatabase(database, { deferSecondaryIndexes = false } = {}) {
     addColumnIfMissing(database, "usage_event", "tier_observed_at_ms", "INTEGER");
     addColumnIfMissing(database, "source_cursor", "source_ordinal",
       "INTEGER CHECK(source_ordinal IS NULL OR source_ordinal >= 0)");
+    addColumnIfMissing(database, "source_cursor", "owner_local",
+      "BLOB CHECK(owner_local IS NULL OR length(owner_local) = 32)");
     ensureToolDiagnosticCodes(database);
     if (!deferSecondaryIndexes) database.exec(SECONDARY_INDEX_SCHEMA);
     ensureGenerationAttestationColumns(database);
@@ -1366,13 +1379,15 @@ export function createUnifiedIndexWriter(database, {
       GROUP BY session_local, tool_class`),
     sourceCursor: database.prepare(`
       INSERT INTO source_cursor(
-        source_local, source_ordinal, session_local, scanned_bytes, size_bytes, mtime_ms,
+        source_local, owner_local, source_ordinal, session_local,
+        scanned_bytes, size_bytes, mtime_ms,
         snapshots_persisted, turn_context_seen, carry_model, carry_effort,
         carry_tier_raw, carry_tier_observed_at_ms, carry_total_input,
         carry_total_cached, carry_total_cache_write, carry_total_output,
         carry_total_reasoning, carry_total_total, ingest_run_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(source_local) DO UPDATE SET
+        owner_local = COALESCE(source_cursor.owner_local, excluded.owner_local),
         source_ordinal = excluded.source_ordinal,
         session_local = excluded.session_local,
         scanned_bytes = excluded.scanned_bytes,
@@ -1814,6 +1829,7 @@ export function createUnifiedIndexWriter(database, {
       begin();
       statements.sourceCursor.run(
         cursor.sourceLocal,
+        cursor.ownerLocal ?? null,
         cursor.sourceOrdinal ?? null,
         cursor.sessionLocal ?? null,
         cursor.scannedBytes,

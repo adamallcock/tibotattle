@@ -50,10 +50,21 @@ a clean-profile smoke all succeed.
 7. Choose **Data & Diagnostics…** to see and copy a fixed, path-free diagnostic
    receipt. Startup and lifecycle failures include a stable `UM_MACOS_*` code
    and a fixed recovery action.
-8. Choose **Codex Source…** to select a custom `CODEX_HOME` with the native
-   folder picker, or restore `~/.codex`. The selection is revalidated at every
-   launch and stored only in the owner-only app state; copied diagnostics expose
-   only `default` or `custom`, never the path.
+8. Choose **Settings…** → **General** to add up to eight explicit Codex homes,
+   remove a source, or choose the single primary source used for live quota and
+   other account-scoped provider state. Every primary and secondary source
+   contributes session history to one local dashboard and one contribution
+   identity. Add folders only when you intend TiboTattle to treat them as the
+   same Codex user/account; the app cannot verify account equivalence. Native
+   Settings shows each private path as ready, temporarily unavailable, or
+   invalid/unsafe, including which one is primary. Removing a source stops
+   future reads but retains history already accepted into the local index. The
+   app never switches a remembered rollout to another physical copy
+   automatically; unavailable coverage remains visible until the owner
+   returns. The prior one-folder setting migrates automatically, every selected
+   folder is revalidated at launch, and owner-only settings are the only place
+   paths and stable root IDs are stored. Copied diagnostics expose only bounded
+   counts and `default`/`custom`, never paths, per-root health, or root IDs.
 9. Choose **About TiboTattle** → **Check for Updates** to check a signed
    production appcast. Automatic update downloads are controlled by one native
    switch in **Settings…** → **General**. Developer and ad-hoc builds contain

@@ -137,6 +137,7 @@ const UNIFIED_INDEX_PUBLIC_ERROR_CODES = new Set([
   "local_unified_index_meta_invalid",
   "local_unified_index_missing",
   "local_unified_index_publication_durability_uncertain",
+  "local_unified_index_roots_unavailable",
   "local_unified_index_schema_invalid",
   "local_unified_index_secondary_indexes_failed",
   "local_unified_index_secondary_indexes_missing",
@@ -485,7 +486,57 @@ function unifiedGenerationAuthoritative(value) {
     && generation.diagnosticsComplete === true
     && generation.usageProvenanceComplete === true
     && generation.sourceOrderComplete === true
-    && generation.quotaProvenanceComplete === true;
+    && generation.quotaProvenanceComplete === true
+    && (value.rootCoverage?.status !== "unavailable"
+      || value.rootCoverage?.retainedHistory === true);
+}
+
+function publicRootCoverage(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const configuredRoots = value.configuredRoots;
+  const availableRoots = value.availableRoots;
+  const emptyRoots = value.emptyRoots;
+  const unavailableRoots = value.unavailableRoots;
+  const unavailableOwnerSources = value.unavailableOwnerSources ?? 0;
+  const ambiguousSources = value.ambiguousSources ?? 0;
+  if (!Number.isSafeInteger(configuredRoots)
+      || configuredRoots < 1
+      || configuredRoots > 8
+      || !Number.isSafeInteger(availableRoots)
+      || availableRoots < 0
+      || availableRoots > configuredRoots
+      || !Number.isSafeInteger(emptyRoots)
+      || emptyRoots < 0
+      || emptyRoots > availableRoots
+      || !Number.isSafeInteger(unavailableRoots)
+      || unavailableRoots < 0
+      || availableRoots + unavailableRoots !== configuredRoots
+      || !Number.isSafeInteger(unavailableOwnerSources)
+      || unavailableOwnerSources < 0
+      || !Number.isSafeInteger(ambiguousSources)
+      || ambiguousSources < 0
+      || typeof value.retainedHistory !== "boolean") {
+    return null;
+  }
+  const status = value.status;
+  if (!["ready", "partial", "unavailable"].includes(status)
+      || (status === "unavailable" && availableRoots !== 0)
+      || (status !== "unavailable" && availableRoots === 0)
+      || (status === "ready" && (unavailableRoots !== 0
+        || unavailableOwnerSources !== 0
+        || ambiguousSources !== 0))) {
+    return null;
+  }
+  return Object.freeze({
+    status,
+    configuredRoots,
+    availableRoots,
+    emptyRoots,
+    unavailableRoots,
+    retainedHistory: value.retainedHistory,
+    unavailableOwnerSources,
+    ambiguousSources,
+  });
 }
 
 function safeAccountingUnavailableCode(value) {
@@ -830,8 +881,55 @@ function runClaudeUsageShadowRefresh(refreshClaudeUsageShadow, signal) {
   });
 }
 
+function normalizedRefreshCodexRoots({
+  codexHome,
+  codexHomes,
+  primaryCodexHome,
+  accountingSourceMode,
+}) {
+  const selectedCodexHomes = codexHomes === null || codexHomes === undefined
+    ? [codexHome ?? join(homedir(), ".codex")]
+    : codexHomes;
+  if (!Array.isArray(selectedCodexHomes)
+      || selectedCodexHomes.length < 1
+      || selectedCodexHomes.length > 8
+      || selectedCodexHomes.some((value) => (
+        typeof value !== "string" || value.length < 1
+      ))
+      || new Set(selectedCodexHomes).size !== selectedCodexHomes.length) {
+    throw new TypeError(
+      "codexHomes must contain between one and eight unique non-empty paths",
+    );
+  }
+  if (selectedCodexHomes.length > 1 && primaryCodexHome === null) {
+    throw new TypeError(
+      "primaryCodexHome is required when codexHomes contains multiple paths",
+    );
+  }
+  const selectedPrimaryCodexHome = primaryCodexHome
+    ?? (selectedCodexHomes.length === 1
+      ? selectedCodexHomes[0]
+      : null);
+  if (!selectedCodexHomes.includes(selectedPrimaryCodexHome)) {
+    throw new TypeError("primaryCodexHome must identify one configured codexHomes path");
+  }
+  if (codexHome !== null && codexHome !== undefined
+      && codexHome !== selectedPrimaryCodexHome) {
+    throw new TypeError("codexHome must match primaryCodexHome");
+  }
+  if (selectedCodexHomes.length > 1 && accountingSourceMode !== "unified") {
+    throw new TypeError("multiple Codex homes require unified accounting mode");
+  }
+  return Object.freeze({
+    codexHomes: Object.freeze([...selectedCodexHomes]),
+    primaryCodexHome: selectedPrimaryCodexHome,
+  });
+}
+
 export function createLocalCollectorRefreshRunner({
-  codexHome = join(homedir(), ".codex"),
+  codexHome = null,
+  codexHomes = null,
+  primaryCodexHome = null,
   stateFile = null,
   accountObservationOperationLockFile = null,
   selectAccountObservationSecret = selectProductionAccountObservationSecret,
@@ -891,6 +989,14 @@ export function createLocalCollectorRefreshRunner({
   if (!["unified", "legacy"].includes(accountingSourceMode)) {
     throw new TypeError("accountingSourceMode must be unified or legacy");
   }
+  const selectedCodexRoots = normalizedRefreshCodexRoots({
+    codexHome,
+    codexHomes,
+    primaryCodexHome,
+    accountingSourceMode,
+  });
+  const selectedCodexHomes = selectedCodexRoots.codexHomes;
+  const selectedPrimaryCodexHome = selectedCodexRoots.primaryCodexHome;
   if (refreshArchiveIndex !== null && typeof refreshArchiveIndex !== "function") {
     throw new TypeError("refreshArchiveIndex must be a function or null");
   }
@@ -981,7 +1087,7 @@ export function createLocalCollectorRefreshRunner({
     // here is never allowed to block collection: it simply leaves those turns
     // to the stated preference, or unknown.
     let declaredSpeedBaselines = [];
-    if (recordCodexSpeedBaseline !== null) {
+    if (recordCodexSpeedBaseline !== null && selectedCodexHomes.length === 1) {
       try {
         const recorded = await recordCodexSpeedBaseline();
         if (Array.isArray(recorded)) declaredSpeedBaselines = recorded;
@@ -1008,7 +1114,10 @@ export function createLocalCollectorRefreshRunner({
       selection = { loadAccountObservationSecret: null };
     }
     const collectorOptions = {
-      codexHome,
+      // The collector's app-server/quota pass belongs to exactly one stable
+      // primary profile. Unified rollout activity is advanced separately from
+      // every configured root below.
+      codexHome: selectedPrimaryCodexHome,
       ...(stateFile === null ? {} : { stateFile }),
       staleAfterMs: 0,
       refreshStale: true,
@@ -1113,7 +1222,9 @@ export function createLocalCollectorRefreshRunner({
       // to the bounded window and says so.
       try {
         unifiedIndex = publicUnifiedIndexResult(await refreshUnifiedIndex({
-          codexHome,
+          ...(selectedCodexHomes.length > 1
+            ? { codexHomes: selectedCodexHomes }
+            : { codexHome: selectedPrimaryCodexHome }),
           ...(unifiedIndexFile === null ? {} : { indexFile: unifiedIndexFile }),
           ...(unifiedIndexSecretFile === null
             ? {}
@@ -1196,7 +1307,9 @@ export function createLocalCollectorRefreshRunner({
         let rebuilt = null;
         try {
           rebuilt = await refreshAccounting({
-            codexHome,
+            ...(selectedCodexHomes.length > 1
+              ? { codexHomes: selectedCodexHomes }
+              : { codexHome: selectedPrimaryCodexHome }),
             ...(stateFile === null ? {} : { stateFile }),
             now: clock,
             sourceMode: accountingSourceMode,
@@ -1328,7 +1441,7 @@ export function createLocalCollectorRefreshRunner({
         status: "scanning",
       });
       archiveIndex = await refreshArchiveIndex({
-        codexHome,
+        codexHome: selectedPrimaryCodexHome,
         ...(archiveIndexFile === null ? {} : { indexFile: archiveIndexFile }),
         ...(archiveIndexSecretFile === null
           ? {}
@@ -1444,6 +1557,27 @@ function publicUnifiedIndexResult(value) {
       errorCode: "local_unified_index_generation_invalid",
     };
   }
+  const hasRootCoverage = Object.hasOwn(value, "rootCoverage");
+  const rootCoverage = hasRootCoverage
+    ? publicRootCoverage(value.rootCoverage)
+    : null;
+  if (hasRootCoverage && rootCoverage === null) {
+    return {
+      status: "failed",
+      errorCode: "local_unified_index_generation_invalid",
+    };
+  }
+  if (rootCoverage?.status === "unavailable"
+      && rootCoverage.retainedHistory !== true) {
+    // Never turn a temporarily unreachable set of configured roots into a
+    // successful empty corpus. A retained generation may still be served, but
+    // without that evidence the refresh stays unavailable and preserves the
+    // prior dashboard snapshot.
+    return {
+      status: "failed",
+      errorCode: "local_unified_index_roots_unavailable",
+    };
+  }
   const counts = {};
   for (const key of [
     "sources",
@@ -1466,6 +1600,7 @@ function publicUnifiedIndexResult(value) {
     status: "ingested",
     unchanged: value.unchanged === true,
     generation,
+    ...(rootCoverage === null ? {} : { rootCoverage }),
     ...counts,
     wallMs: Number.isFinite(value.wallMs) && value.wallMs >= 0
       ? Math.round(value.wallMs)

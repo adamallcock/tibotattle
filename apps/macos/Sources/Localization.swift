@@ -77,6 +77,8 @@ enum TiboTattleLocalization {
         case dialogChooseCodexHomeFolder = "dialog.chooseCodexHomeFolder"
         case dialogChooseCodexHomeFolderMessage = "dialog.chooseCodexHomeFolderMessage"
         case dialogCodexFolderDescription = "dialog.codexFolderDescription"
+        case dialogCodexFolderLimitDescription = "dialog.codexFolderLimitDescription"
+        case dialogCodexFolderLimitTitle = "dialog.codexFolderLimitTitle"
         case dialogCopyDiagnostics = "dialog.copyDiagnostics"
         case dialogCustomCodexFolder = "dialog.customCodexFolder"
         case dialogDataAndDiagnostics = "dialog.dataAndDiagnostics"
@@ -103,6 +105,12 @@ enum TiboTattleLocalization {
         case dialogResetFinishingDescription = "dialog.resetFinishingDescription"
         case dialogResetIdentityDevice = "dialog.resetIdentityDevice"
         case dialogResetLocalIdentity = "dialog.resetLocalIdentity"
+        case dialogRemoveCodexFolderDescription = "dialog.removeCodexFolderDescription"
+        case dialogRemoveCodexFolderTitle = "dialog.removeCodexFolderTitle"
+        case dialogResetCodexFoldersDescription = "dialog.resetCodexFoldersDescription"
+        case dialogResetCodexFoldersTitle = "dialog.resetCodexFoldersTitle"
+        case dialogSetPrimaryCodexFolderDescription = "dialog.setPrimaryCodexFolderDescription"
+        case dialogSetPrimaryCodexFolderTitle = "dialog.setPrimaryCodexFolderTitle"
         case dialogShowLocalData = "dialog.showLocalData"
         case dialogUseThisFolder = "dialog.useThisFolder"
         case launcherCompanionUnavailable = "launcher.companionUnavailable"
@@ -250,10 +258,16 @@ enum TiboTattleLocalization {
         case settingsAutomaticUpdatesUnavailable = "settings.automaticUpdatesUnavailable"
         case settingsAutomaticUpdatesTooltip = "settings.automaticUpdatesTooltip"
         case settingsCheckForUpdates = "settings.checkForUpdates"
+        case settingsAddCodexFolder = "settings.addCodexFolder"
         case settingsChooseCodexFolder = "settings.chooseCodexFolder"
         case settingsCodexFolder = "settings.codexFolder"
-        case settingsCodexFolderCustomSelectedPath = "settings.codexFolderCustomSelectedPath"
+        case settingsCodexFolderActivitySelectedPath = "settings.codexFolderActivitySelectedPath"
         case settingsCodexFolderDefaultLocation = "settings.codexFolderDefaultLocation"
+        case settingsCodexFolderPathWithStatus = "settings.codexFolderPathWithStatus"
+        case settingsCodexFolderPrimarySelectedPath = "settings.codexFolderPrimarySelectedPath"
+        case settingsCodexFolderStatusInvalid = "settings.codexFolderStatusInvalid"
+        case settingsCodexFolderStatusReady = "settings.codexFolderStatusReady"
+        case settingsCodexFolderStatusTemporarilyUnavailable = "settings.codexFolderStatusTemporarilyUnavailable"
         case settingsCodexFolderSummary = "settings.codexFolderSummary"
         case settingsGeneral = "settings.general"
         case settingsGeneralSummary = "settings.generalSummary"
@@ -331,6 +345,8 @@ enum TiboTattleLocalization {
         case settingsRefreshIntervalFiveMinutes = "settings.refreshIntervalFiveMinutes"
         case settingsRefreshIntervalFifteenMinutes = "settings.refreshIntervalFifteenMinutes"
         case settingsRefreshIntervalThirtyMinutes = "settings.refreshIntervalThirtyMinutes"
+        case settingsRemoveCodexFolder = "settings.removeCodexFolder"
+        case settingsSetPrimaryCodexFolder = "settings.setPrimaryCodexFolder"
         case settingsUseDefault = "settings.useDefault"
         case settingsUpdateDisclosureAutomaticOff = "settings.updateDisclosureAutomaticOff"
         case settingsUpdateDisclosureAutomaticOn = "settings.updateDisclosureAutomaticOn"
@@ -360,7 +376,11 @@ enum TiboTattleLocalization {
             case .dialogChooseCodexHomeFolderMessage:
                 "Choose the folder that contains Codex sessions or archived_sessions."
             case .dialogCodexFolderDescription:
-                "Current: %@\n\n%@ stores a custom folder only in owner-only app settings. Diagnostics never copy its path. The local companion reads only the sessions and archived_sessions folders beneath the selected Codex home."
+                "Current activity folders:\n%@\n\n%@ stores these explicit folders only in owner-only app settings. Diagnostics never copy their paths. The local companion reads only sessions and archived_sessions below the configured folders."
+            case .dialogCodexFolderLimitDescription:
+                "Remove an activity folder before adding another. TiboTattle reads at most 8 explicit folders."
+            case .dialogCodexFolderLimitTitle:
+                "8 activity folders are already configured"
             case .dialogCopyDiagnostics:
                 "Copy Diagnostics"
             case .dialogCustomCodexFolder:
@@ -413,6 +433,18 @@ enum TiboTattleLocalization {
                 "Reset local identity and device?"
             case .dialogResetLocalIdentity:
                 "Reset Local Identity"
+            case .dialogRemoveCodexFolderDescription:
+                "Removing this folder stops future reading but retains imported history. The folder and its Codex files are not deleted. To remove the primary, set another folder as primary first."
+            case .dialogRemoveCodexFolderTitle:
+                "Remove activity folder?"
+            case .dialogResetCodexFoldersDescription:
+                "This removes the configured activity folders and returns to ~/.codex. It stops future reading from the removed folders but retains imported history. No Codex files are deleted."
+            case .dialogResetCodexFoldersTitle:
+                "Return to the default Codex folder?"
+            case .dialogSetPrimaryCodexFolderDescription:
+                "The primary folder anchors account-scoped provider state. Every configured folder remains combined in this dashboard."
+            case .dialogSetPrimaryCodexFolderTitle:
+                "Choose the primary Codex folder"
             case .dialogShowLocalData:
                 "Show Local Data"
             case .dialogUseThisFolder:
@@ -510,7 +542,7 @@ enum TiboTattleLocalization {
             case .launcherRecoveryCheckAccess:
                 "Check access to your home and Application Support folders, then retry."
             case .launcherRecoveryChooseCodexHome:
-                "Choose Codex Source and select a readable Codex home owned by your macOS user account, or restore the default."
+                "Open Settings → General and add a readable Codex home owned by your macOS user account, or reset to the default."
             case .launcherRecoveryDashboardDownload:
                 "Check access to your Downloads folder, then save the file again."
             case .launcherRecoveryDashboardWebView:
@@ -707,16 +739,28 @@ enum TiboTattleLocalization {
                 "Download signed TiboTattle updates automatically."
             case .settingsCheckForUpdates:
                 "Check for Updates"
+            case .settingsAddCodexFolder:
+                "Add Folder…"
             case .settingsChooseCodexFolder:
                 "Choose Codex Folder…"
             case .settingsCodexFolder:
-                "Codex folder"
-            case .settingsCodexFolderCustomSelectedPath:
-                "Custom folder: %@"
+                "Codex activity folders"
+            case .settingsCodexFolderActivitySelectedPath:
+                "Activity: %@"
             case .settingsCodexFolderDefaultLocation:
                 "Default location (~/.codex)"
+            case .settingsCodexFolderPathWithStatus:
+                "%@ — %@"
+            case .settingsCodexFolderPrimarySelectedPath:
+                "Primary: %@"
+            case .settingsCodexFolderStatusInvalid:
+                "Invalid or unsafe"
+            case .settingsCodexFolderStatusReady:
+                "Ready"
+            case .settingsCodexFolderStatusTemporarilyUnavailable:
+                "Temporarily unavailable"
             case .settingsCodexFolderSummary:
-                "TiboTattle reads only the sessions and archived_sessions folders below this location. Use the default unless your Codex data lives somewhere else."
+                "Add 1–8 folders only when you intend their activity to be treated as one Codex user/account. TiboTattle cannot verify account equivalence. The primary anchors live account-scoped provider state; all folders contribute history. Removing a folder stops future reading but retains imported history."
             case .settingsGeneral:
                 "General"
             case .settingsGeneralSummary:
@@ -869,8 +913,12 @@ enum TiboTattleLocalization {
                 "Every 15 minutes"
             case .settingsRefreshIntervalThirtyMinutes:
                 "Every 30 minutes"
+            case .settingsRemoveCodexFolder:
+                "Remove Folder…"
+            case .settingsSetPrimaryCodexFolder:
+                "Set Primary…"
             case .settingsUseDefault:
-                "Use Default"
+                "Reset to Default…"
             case .settingsUpdateDisclosureAutomaticOff:
                 "Signed app updates are available from About → Check for Updates. Automatic downloads are currently off; you can turn them on in Settings → General when available."
             case .settingsUpdateDisclosureAutomaticOn:

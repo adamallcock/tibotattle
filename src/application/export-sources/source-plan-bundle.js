@@ -215,13 +215,28 @@ async function createExportSourcePlanBundle({
   startAt,
   endAt,
   codexHome,
+  codexHomes,
   secret,
   collectorPath = null,
   claudeStateDirectory = null,
   claudeProjectsDirectory = null,
   resourceGuard,
 } = {}) {
-  if (!secret || !resourceGuard?.limits || typeof codexHome !== "string" || codexHome.length === 0
+  const scalarCodexHomeSpecified = codexHome !== null
+    && codexHome !== undefined;
+  const pluralCodexHomesSpecified = codexHomes !== null
+    && codexHomes !== undefined;
+  const scalarCodexHomeValid = typeof codexHome === "string"
+    && codexHome.length > 0;
+  const pluralCodexHomesValid = Array.isArray(codexHomes)
+    && codexHomes.length >= 1
+    && codexHomes.length <= 8
+    && codexHomes.every((value) => typeof value === "string" && value.length > 0)
+    && new Set(codexHomes).size === codexHomes.length;
+  if (!secret || !resourceGuard?.limits
+      || scalarCodexHomeSpecified === pluralCodexHomesSpecified
+      || (scalarCodexHomeSpecified && !scalarCodexHomeValid)
+      || (pluralCodexHomesSpecified && !pluralCodexHomesValid)
       || (collectorPath !== null && (typeof collectorPath !== "string" || collectorPath.length === 0))
       || (claudeStateDirectory !== null
         && (typeof claudeStateDirectory !== "string" || claudeStateDirectory.length === 0))
@@ -257,6 +272,7 @@ async function createExportSourcePlanBundle({
     if (claudeTranscript !== null && claudeTranscript.sources.length === 0) fail("configuration");
     const codexPlan = await createCodexExportSourcePlan({
       codexHome,
+      codexHomes,
       startAt: bounds.startAt,
       endAt: bounds.endAt,
       resourceGuard: planningGuard,

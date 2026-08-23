@@ -21,6 +21,7 @@ import {
   refreshLocalArchiveAccountingIndex,
 } from "../../src/local-archive-accounting-index.js";
 import {
+  LOCAL_UNIFIED_INDEX_DISCOVERY_LIMITS,
   ingestLocalUnifiedIndexIncrement,
 } from "../../src/local-unified-index-ingest.js";
 import {
@@ -2461,6 +2462,128 @@ function startParentDeathWatchdog({
   });
 }
 
+function codexRootConfigurationError(message) {
+  const error = new TypeError(message);
+  error.code = "USAGE_MONITOR_CODEX_ROOTS_INVALID";
+  return error;
+}
+
+function configuredCodexRoots({ options, environment, homeDirectory }) {
+  const pluralConfigured = Object.hasOwn(options, "codexHomes");
+  let codexHomes;
+  if (pluralConfigured) {
+    if (!Array.isArray(options.codexHomes)
+        || options.codexHomes.length < 1
+        || options.codexHomes.length > 8) {
+      throw codexRootConfigurationError(
+        "codexHomes must contain between one and eight absolute paths",
+      );
+    }
+    codexHomes = options.codexHomes.map(assertLocalAbsolutePath);
+  } else {
+    codexHomes = [assertLocalAbsolutePath(
+      options.codexHome
+        ?? environment.CODEX_HOME
+        ?? join(homeDirectory, ".codex"),
+    )];
+  }
+  if (new Set(codexHomes).size !== codexHomes.length) {
+    throw codexRootConfigurationError("codexHomes paths must be unique");
+  }
+  const explicitPrimary = Object.hasOwn(options, "primaryCodexHome")
+    ? assertLocalAbsolutePath(options.primaryCodexHome)
+    : null;
+  if (codexHomes.length > 1 && explicitPrimary === null) {
+    throw codexRootConfigurationError(
+      "primaryCodexHome is required when codexHomes contains multiple paths",
+    );
+  }
+  const primaryCodexHome = explicitPrimary ?? codexHomes[0];
+  if (!codexHomes.includes(primaryCodexHome)) {
+    throw codexRootConfigurationError(
+      "primaryCodexHome must identify one configured codexHomes path",
+    );
+  }
+  if (pluralConfigured && Object.hasOwn(options, "codexHome")) {
+    const legacyAlias = assertLocalAbsolutePath(options.codexHome);
+    if (legacyAlias !== primaryCodexHome) {
+      throw codexRootConfigurationError(
+        "codexHome must match primaryCodexHome when codexHomes is configured",
+      );
+    }
+  }
+  return Object.freeze({
+    codexHomes: Object.freeze([...codexHomes]),
+    primaryCodexHome,
+    customCodexHomesConfigured: pluralConfigured
+      || (typeof environment.CODEX_HOME === "string"
+        && environment.CODEX_HOME.length > 0),
+  });
+}
+
+export function parseLocalCompanionCodexRootArgs(argv = []) {
+  if (!Array.isArray(argv)) {
+    throw codexRootConfigurationError("local companion arguments must be an array");
+  }
+  const codexHomes = [];
+  let primaryCodexHome = null;
+  const readValue = (index, option) => {
+    const value = argv[index + 1];
+    if (typeof value !== "string" || value.length < 1 || value.startsWith("--")) {
+      throw codexRootConfigurationError(`${option} requires a path`);
+    }
+    return assertLocalAbsolutePath(resolve(value));
+  };
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (argument === "--codex-home") {
+      codexHomes.push(readValue(index, argument));
+      index += 1;
+    } else if (argument === "--primary-codex-home") {
+      if (primaryCodexHome !== null) {
+        throw codexRootConfigurationError(
+          "--primary-codex-home may be specified only once",
+        );
+      }
+      primaryCodexHome = readValue(index, argument);
+      index += 1;
+    } else {
+      throw codexRootConfigurationError("local companion argument is unsupported");
+    }
+  }
+  if (codexHomes.length === 0) {
+    if (primaryCodexHome !== null) {
+      throw codexRootConfigurationError(
+        "--primary-codex-home requires at least one --codex-home",
+      );
+    }
+    return Object.freeze({});
+  }
+  if (codexHomes.length > 8) {
+    throw codexRootConfigurationError(
+      "--codex-home may be specified at most eight times",
+    );
+  }
+  if (new Set(codexHomes).size !== codexHomes.length) {
+    throw codexRootConfigurationError("--codex-home paths must be unique");
+  }
+  if (codexHomes.length > 1 && primaryCodexHome === null) {
+    throw codexRootConfigurationError(
+      "multiple --codex-home values require --primary-codex-home",
+    );
+  }
+  primaryCodexHome ??= codexHomes[0];
+  if (!codexHomes.includes(primaryCodexHome)) {
+    throw codexRootConfigurationError(
+      "--primary-codex-home must match one --codex-home",
+    );
+  }
+  return Object.freeze({
+    codexHomes: Object.freeze([...codexHomes]),
+    primaryCodexHome,
+  });
+}
+
 export function createLocalCompanionServer(options = {}) {
   if (!options || typeof options !== "object" || Array.isArray(options)) {
     throw new TypeError("options must be an object");
@@ -2510,11 +2633,11 @@ export function createLocalCompanionServer(options = {}) {
     options.staticRoot
       ?? resolve(installation.resourceRoot, "apps", "web", "public"),
   );
-  const codexHome = assertLocalAbsolutePath(
-    options.codexHome
-      ?? environment.CODEX_HOME
-      ?? join(homeDirectory, ".codex"),
-  );
+  const codexRootConfiguration = configuredCodexRoots({
+    options,
+    environment,
+    homeDirectory,
+  });
   const contributionQueueFile = assertLocalStatePath(
     installation.stateRoot,
     options.contributionQueueFile
@@ -2563,8 +2686,18 @@ export function createLocalCompanionServer(options = {}) {
       || Array.isArray(contributionPreparationOptions)) {
     throw new TypeError("contributionPreparationOptions must be an object");
   }
+  const {
+    codexHome: ignoredPreparationCodexHome,
+    codexHomes: ignoredPreparationCodexHomes,
+    ...preparationOverrides
+  } = contributionPreparationOptions;
+  void ignoredPreparationCodexHome;
+  void ignoredPreparationCodexHomes;
   const selectedPreparationOptions = {
-    ...contributionPreparationOptions,
+    ...preparationOverrides,
+    ...(codexRootConfiguration.codexHomes.length > 1
+      ? { codexHomes: codexRootConfiguration.codexHomes }
+      : { codexHome: codexRootConfiguration.primaryCodexHome }),
     activityFile: assertLocalStatePath(
       installation.stateRoot,
       contributionPreparationOptions.activityFile
@@ -2583,7 +2716,11 @@ export function createLocalCompanionServer(options = {}) {
     stateRoot: installation.stateRoot,
     statePaths: installation.paths,
     staticRoot,
-    codexHome,
+    codexHome: codexRootConfiguration.primaryCodexHome,
+    codexHomes: codexRootConfiguration.codexHomes,
+    primaryCodexHome: codexRootConfiguration.primaryCodexHome,
+    customCodexHomesConfigured:
+      codexRootConfiguration.customCodexHomesConfigured,
     contributionQueueFile,
     diagnosticsLogFile,
     legacyContributionDeviceStateFile,
@@ -2602,6 +2739,9 @@ function createPreparedLocalCompanionServer({
   statePaths,
   staticRoot,
   codexHome,
+  codexHomes,
+  primaryCodexHome,
+  customCodexHomesConfigured,
   homeDirectory,
   claudeConfigDirectory,
   claudeProjectDirectory,
@@ -2621,8 +2761,11 @@ function createPreparedLocalCompanionServer({
   // moment it happened and attributes only turns from then on.
   codexSpeedBaseline = createCodexSpeedBaselineController({
     ledgerFile: statePaths.codexSpeedBaselineFile,
-    configFile: join(codexHome, "config.toml"),
+    configFile: join(primaryCodexHome, "config.toml"),
   }),
+  // Programmatic test seam for the development-only side-chat estimate. The
+  // production default remains owned by buildLocalCompanionSnapshot.
+  sideChatEstimateCollector = null,
   dataStore = new LocalCompanionDataStore({
     builder: async ({ purpose = "full" } = {}) => buildLocalCompanionSnapshot({
       root: resourceRoot,
@@ -2631,7 +2774,11 @@ function createPreparedLocalCompanionServer({
         ? statePaths.archiveAccountingIndexFile
         : null,
       unifiedIndexFile: statePaths.unifiedIndexFile,
-      codexHome,
+      // History comes from the unified index. The development-only side-chat
+      // probe is account/profile scoped and still accepts one CODEX_HOME, so
+      // bind it explicitly to the selected primary instead of letting plural
+      // mode fall back to the process user's ~/.codex.
+      codexHome: primaryCodexHome,
       accountingSourceMode,
       unifiedProjectionMode: ["startup", "quick"].includes(purpose)
         ? "deferred"
@@ -2640,6 +2787,9 @@ function createPreparedLocalCompanionServer({
         environment.USAGE_MONITOR_DEVELOPMENT_ARTIFACT_FALLBACK === "1",
       includeDevelopmentSideChatEstimates:
         environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_ESTIMATES === "1",
+      ...(sideChatEstimateCollector === null
+        ? {}
+        : { sideChatEstimateCollector }),
       developmentSideChatHistoricalGapDate:
         environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_DATE ?? null,
       developmentSideChatHistoricalGapTimeZone:
@@ -2656,7 +2806,13 @@ function createPreparedLocalCompanionServer({
       // Timestamped declared baselines. They fill only the turns the rollout
       // log left unobserved and that a reading actually covers; an observed
       // tier always wins, and an unreadable ledger is simply no coverage.
-      codexSpeedBaselines: await codexSpeedBaseline.readWindows(),
+      // A top-level config.toml value is not rollout- or root-qualified. It is
+      // safe for the historical corpus only while there is exactly one
+      // activity root; otherwise an observed setting from the primary root
+      // would be projected onto unrelated roots.
+      codexSpeedBaselines: codexHomes.length === 1
+        ? await codexSpeedBaseline.readWindows()
+        : [],
     }),
   }),
   // Reprice the usage events inside a bounded [from, to] window from the
@@ -2685,7 +2841,9 @@ function createPreparedLocalCompanionServer({
     claudeConfigDirectory,
   }),
   refreshRunner = createLocalCollectorRefreshRunner({
-    codexHome,
+    ...(codexHomes.length > 1
+      ? { codexHomes, primaryCodexHome }
+      : { codexHome }),
     stateFile: statePaths.collectorStateFile,
     accountObservationOperationLockFile:
       statePaths.accountObservationLockFile,
@@ -2729,20 +2887,21 @@ function createPreparedLocalCompanionServer({
     refreshUnifiedIndex: (options) => ingestLocalUnifiedIndexIncrement({
       ...options,
       contractVersion: TELEMETRY_SCHEMA_VERSION,
+      discoveryLimits: LOCAL_UNIFIED_INDEX_DISCOVERY_LIMITS,
     }),
     unifiedIndexFile: statePaths.unifiedIndexFile,
     unifiedIndexSecretFile: statePaths.unifiedIndexSecretFile,
-    recordCodexSpeedBaseline: async () => (
-      (await codexSpeedBaseline.record()).windows
-    ),
+    recordCodexSpeedBaseline: codexHomes.length === 1
+      ? async () => ((await codexSpeedBaseline.record()).windows)
+      : null,
   }),
   onboardingProvider = () => inspectLocalOnboarding({
-    codexHome,
+    ...(codexHomes.length > 1
+      ? { codexHomes }
+      : { codexHome }),
     stateRoot,
     explicitRefresh: true,
-    customCodexHomeConfigured:
-      typeof environment.CODEX_HOME === "string"
-      && environment.CODEX_HOME.length > 0,
+    customCodexHomeConfigured: customCodexHomesConfigured,
   }),
   refreshTimeoutMs = 300_000,
   centralOrigin = environment.USAGE_MONITOR_CENTRAL_ORIGIN ?? null,
@@ -2824,6 +2983,10 @@ function createPreparedLocalCompanionServer({
   }
   if (!dataStore || typeof dataStore.initialize !== "function") {
     throw new TypeError("dataStore.initialize must be a function");
+  }
+  if (sideChatEstimateCollector !== null
+      && typeof sideChatEstimateCollector !== "function") {
+    throw new TypeError("sideChatEstimateCollector must be a function or null");
   }
   if (typeof onboardingProvider !== "function") {
     throw new TypeError("onboardingProvider must be a function");
@@ -4895,7 +5058,11 @@ export async function startLocalCompanionServer({
 if (process.argv[1]
     && resolve(process.argv[1]) === LOCAL_COMPANION_MODULE_FILE) {
   const requestedPort = Number(process.env.USAGE_MONITOR_PORT ?? 8787);
+  const codexRootOptions = parseLocalCompanionCodexRootArgs(
+    process.argv.slice(2),
+  );
   const app = await startLocalCompanionServer({
+    ...codexRootOptions,
     port: requestedPort,
     terminateProcessOnParentDeath: true,
   });

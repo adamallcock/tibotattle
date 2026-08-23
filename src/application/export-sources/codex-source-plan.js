@@ -96,11 +96,18 @@ const { planDigest } = createSourcePlanSummaryContract();
 
 async function createCodexExportSourcePlan({
   codexHome,
+  codexHomes,
   startAt,
   endAt,
   resourceGuard = null,
 } = {}) {
-  const infos = await discoverCodexRolloutInfos({ codexHome, startAt, endAt, resourceGuard });
+  const infos = await discoverCodexRolloutInfos({
+    codexHome,
+    codexHomes,
+    startAt,
+    endAt,
+    resourceGuard,
+  });
   resourceGuard?.assertSourceSelection(
     infos.length,
     infos.reduce((sum, info) => sum + info.size, 0),
@@ -214,6 +221,7 @@ async function verifyCodexExportSourceHandle(source, handle, {
 
 async function resolveCodexExportSourcePlan(plan, {
   codexHome,
+  codexHomes,
   resourceGuard = null,
 } = {}) {
   if (!plan || plan.schemaVersion !== EXPORT_SOURCE_PLAN_VERSION || !Array.isArray(plan.sources)) {
@@ -221,6 +229,7 @@ async function resolveCodexExportSourcePlan(plan, {
   }
   const infos = await discoverCodexRolloutInfos({
     codexHome,
+    codexHomes,
     startAt: plan.startAt,
     endAt: plan.endAt,
     resourceGuard,
@@ -237,6 +246,14 @@ async function resolveCodexExportSourcePlan(plan, {
     return {
       ...source,
       path: info.path,
+      // The frozen capability is logical key + byte prefix, not one inode.
+      // Bind the verified open to the currently discovered physical candidate
+      // and then prove the entire frozen prefix below. This permits an
+      // active/archive move or an exact replica without weakening TOCTOU
+      // identity checks on the handle that will actually be read.
+      dev: info.dev,
+      ino: info.ino,
+      birthtimeMs: Math.trunc(info.birthtimeMs),
       rolloutInfo: { ...info, size: source.prefixBytes },
     };
   });

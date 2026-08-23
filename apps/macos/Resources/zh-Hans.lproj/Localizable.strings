@@ -79,9 +79,10 @@
 "settings.automaticUpdatesUnavailable" = "此版本不提供自动更新。";
 "settings.automaticUpdatesTooltip" = "自动下载已签名的 TiboTattle 更新。";
 "settings.checkForUpdates" = "检查更新";
+"settings.addCodexFolder" = "添加文件夹…";
 "settings.chooseCodexFolder" = "选择 Codex 文件夹…";
-"settings.codexFolder" = "Codex 文件夹";
-"settings.codexFolderSummary" = "TiboTattle 只读取此位置下的 sessions 和 archived_sessions 文件夹。除非你的 Codex 数据位于其他位置，否则请使用默认值。";
+"settings.codexFolder" = "Codex 活动文件夹";
+"settings.codexFolderSummary" = "仅当你希望将其中的活动视为同一个 Codex 用户/账户时，才添加 1–8 个文件夹。TiboTattle 无法验证账户是否相同。主文件夹用于绑定实时的账户范围提供商状态；所有文件夹都提供历史活动。移除文件夹会停止后续读取，但保留已导入的历史记录。";
 "settings.general" = "通用";
 "settings.generalSummary" = "TiboTattle 打开时会刷新本地用量。原始日志保留在这台 Mac 上。";
 "settings.github" = "GitHub";
@@ -97,7 +98,9 @@
 "settings.previewUpdatesPending" = "此预览版使用实时的 TiboTattle 更新源。首个已签名发行版尚未发布，因此暂时无法发现更新。";
 "settings.previewUpdatesPendingMessage" = "此预览版已连接到实时 TiboTattle 服务，但已签名更新源尚未发布。本地分析不受影响。已签名发行版可用后请再次检查。";
 "settings.previewUpdatesPendingTitle" = "更新尚未发布";
-"settings.useDefault" = "使用默认值";
+"settings.removeCodexFolder" = "移除文件夹…";
+"settings.setPrimaryCodexFolder" = "设为主文件夹…";
+"settings.useDefault" = "重置为默认值…";
 "settings.version" = "版本 %@（%@）";
 "settings.website" = "TiboTattle 网站";
 "settings.windowTitle" = "TiboTattle 设置";
@@ -127,7 +130,9 @@
 
 "dialog.chooseCodexHomeFolder" = "选择你的 Codex 主文件夹";
 "dialog.chooseCodexHomeFolderMessage" = "选择包含 Codex sessions 或 archived_sessions 的文件夹。";
-"dialog.codexFolderDescription" = "当前：%@ \n\n%@ 只会在仅所有者可访问的应用设置中保存自定义文件夹。诊断永远不会复制其路径。本地伴随程序只会读取所选 Codex 主目录下的 sessions 和 archived_sessions 文件夹。";
+"dialog.codexFolderDescription" = "当前活动文件夹：\n%@\n\n%@ 只会在仅所有者可访问的应用设置中保存这些明确指定的文件夹。诊断永远不会复制其路径。本地伴随程序只读取已配置文件夹下的 sessions 和 archived_sessions。";
+"dialog.codexFolderLimitDescription" = "请先移除一个活动文件夹再添加其他文件夹。TiboTattle 最多读取 8 个明确指定的文件夹。";
+"dialog.codexFolderLimitTitle" = "已配置 8 个活动文件夹";
 "dialog.copyDiagnostics" = "拷贝诊断信息";
 "dialog.customCodexFolder" = "自定义 Codex 文件夹";
 "dialog.dataAndDiagnostics" = "%@ 数据与诊断";
@@ -154,6 +159,12 @@
 "dialog.resetFinishingDescription" = "请等待这次简短的钥匙串事务完成，然后再退出。";
 "dialog.resetIdentityDevice" = "要重置本地身份和设备吗？";
 "dialog.resetLocalIdentity" = "重置本地身份";
+"dialog.removeCodexFolderDescription" = "移除此文件夹会停止后续读取，但保留已导入的历史记录。该文件夹及其中的 Codex 文件不会被删除。如需移除主文件夹，请先将其他文件夹设为主文件夹。";
+"dialog.removeCodexFolderTitle" = "要移除活动文件夹吗？";
+"dialog.resetCodexFoldersDescription" = "这会移除已配置的活动文件夹并恢复使用 ~/.codex。来自已移除文件夹的后续读取将停止，但已导入的历史记录会保留。不会删除任何 Codex 文件。";
+"dialog.resetCodexFoldersTitle" = "要恢复使用默认 Codex 文件夹吗？";
+"dialog.setPrimaryCodexFolderDescription" = "主文件夹用于绑定账户范围的提供商状态。所有已配置文件夹仍会合并显示在此仪表板中。";
+"dialog.setPrimaryCodexFolderTitle" = "选择主 Codex 文件夹";
 "dialog.showLocalData" = "显示本地数据";
 "dialog.useThisFolder" = "使用此文件夹";
 
@@ -192,7 +203,7 @@
 "launcher.errorKeychainReset" = "本地身份和设备重置未完成。";
 "launcher.errorKeychainResetPartial" = "本地身份和设备重置仅部分完成。";
 "launcher.recoveryCheckAccess" = "请检查对主目录和 Application Support 文件夹的访问权限，然后重试。";
-"launcher.recoveryChooseCodexHome" = "请选择“Codex 来源”并选择可读取且归你的 macOS 用户帐户所有的 Codex 主文件夹，或恢复默认设置。";
+"launcher.recoveryChooseCodexHome" = "请打开“设置”→“通用”，添加一个可读取且归你的 macOS 用户帐户所有的 Codex 主文件夹，或重置为默认设置。";
 "launcher.recoveryDashboardDownload" = "请检查对“下载”文件夹的访问权限，然后再次保存该文件。";
 "launcher.recoveryDashboardWebView" = "请选择“打开仪表板”重试，或选择“在浏览器中打开”以在浏览器中使用同一份本地仪表板。";
 "launcher.recoveryDataErase" = "请退出正在使用 %@ 数据的其他进程，然后再次尝试抹掉。";
@@ -206,8 +217,13 @@
 "nativeDashboard.currentEvidenceTooltip" = "当前本地证据状态。";
 "menuBar.analysisRequestRejected" = "本地伴随程序无法接受分析请求。";
 "menuBar.failureRecovery" = "未在运行：%@。请打开窗口查看恢复步骤。";
-"settings.codexFolderCustomSelectedPath" = "自定义文件夹：%@";
+"settings.codexFolderActivitySelectedPath" = "活动：%@";
 "settings.codexFolderDefaultLocation" = "默认位置（~/.codex）";
+"settings.codexFolderPathWithStatus" = "%@ — %@";
+"settings.codexFolderPrimarySelectedPath" = "主文件夹：%@";
+"settings.codexFolderStatusInvalid" = "无效或不安全";
+"settings.codexFolderStatusReady" = "可用";
+"settings.codexFolderStatusTemporarilyUnavailable" = "暂时不可用";
 "settings.updateDisclosureAutomaticOff" = "已签名应用更新可在“关于”→“检查更新”中获取。自动下载目前已关闭；可在“设置”→“关于”中开启（如可用）。";
 "settings.updateDisclosureAutomaticOn" = "会自动检查已签名应用更新。默认情况下，已验证的更新会在后台下载并在退出时安装；可在“设置”→“关于”中关闭此项。";
 "settings.updateDisclosureDevelopment" = "此开发构建不包含更新检查。安装在“应用程序”中的已签名版本可从“关于”中检查更新。";

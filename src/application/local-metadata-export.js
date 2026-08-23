@@ -119,6 +119,7 @@ export function createLocalMetadataExportContext(configuration = {}) {
     startAt,
     endAt,
     codexHome,
+    codexHomes,
     secret,
     activityMarkers = [],
     createdAt = new Date().toISOString(),
@@ -150,6 +151,7 @@ export function createLocalMetadataExportContext(configuration = {}) {
       startAt: bounds.startAt,
       endAt: bounds.endAt,
       codexHome,
+      codexHomes,
       secret,
       activityMarkers,
       onRecord({ recordType, record }) {

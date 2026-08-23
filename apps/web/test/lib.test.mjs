@@ -70,6 +70,7 @@ import {
   normalizeLocalContributionDevicePairing,
   normalizeLocalContributionPreparation,
   normalizeLocalOnboarding,
+  normalizeLocalRootCoverage,
   normalizeDashboardPayload,
   normalizeParticipantCommunityComparison,
   normalizeParticipantDeletionReceipt,
@@ -101,6 +102,7 @@ import {
   formatTimeZoneLabel,
   formatUtcCalendarDay,
   numberFormatter,
+  renderCodexRootCoverageNotice,
   REPORTING_TIME_ZONE,
   reportingCalendarParts,
   selectAvailableAccountingPeriod,
@@ -2427,6 +2429,11 @@ test("local onboarding is path-free, bounded, and fails closed", async () => {
     status: "ready",
     source: {
       status: "ready",
+      availability: "ready",
+      configuredRoots: 1,
+      availableRoots: 1,
+      emptyRoots: 0,
+      unavailableRoots: 0,
       sessionsReadable: true,
       archivedSessionsReadable: false,
       rolloutFilesPresent: true,
@@ -2444,6 +2451,11 @@ test("local onboarding is path-free, bounded, and fails closed", async () => {
   assert.deepEqual(normalizeLocalOnboarding(payload), {
     state: "ready",
     sourceStatus: "ready",
+    sourceAvailability: "ready",
+    configuredCodexRoots: 1,
+    availableCodexRoots: 1,
+    emptyCodexRoots: 0,
+    unavailableCodexRoots: 0,
     sessionsReadable: true,
     archivedSessionsReadable: false,
     rolloutFilesPresent: true,
@@ -2460,6 +2472,36 @@ test("local onboarding is path-free, bounded, and fails closed", async () => {
       privatePath: "/Users/private/.codex"
     }).state,
     "unavailable"
+  );
+  assert.deepEqual(
+    normalizeLocalOnboarding({
+      ...payload,
+      source: {
+        ...payload.source,
+        availability: "partial",
+        configuredRoots: 2,
+        availableRoots: 1,
+        unavailableRoots: 1
+      }
+    }),
+    {
+      state: "ready",
+      sourceStatus: "ready",
+      sourceAvailability: "partial",
+      configuredCodexRoots: 2,
+      availableCodexRoots: 1,
+      emptyCodexRoots: 0,
+      unavailableCodexRoots: 1,
+      sessionsReadable: true,
+      archivedSessionsReadable: false,
+      rolloutFilesPresent: true,
+      rolloutFilesObserved: 42,
+      rolloutFilesObservedCapped: false,
+      stateStatus: "ready",
+      stateWritable: true,
+      explicitRefresh: true,
+      customCodexHomeConfigured: false
+    }
   );
   assert.equal(
     normalizeLocalOnboarding({
@@ -2484,6 +2526,153 @@ test("local onboarding is path-free, bounded, and fails closed", async () => {
   });
   assert.equal((await client.onboarding()).state, "ready");
   assert.deepEqual(calls, ["/api/local/onboarding"]);
+});
+
+test("terminal multi-root coverage is aggregate-only and fails closed", () => {
+  const partial = {
+    status: "partial",
+    configuredRoots: 2,
+    availableRoots: 2,
+    emptyRoots: 0,
+    unavailableRoots: 0,
+    retainedHistory: true,
+    unavailableOwnerSources: 1,
+    ambiguousSources: 1
+  };
+  assert.deepEqual(normalizeLocalRootCoverage(partial), partial);
+  assert.equal(normalizeLocalRootCoverage({
+    ...partial,
+    privatePath: "/Users/private/.codex"
+  }), null);
+  assert.equal(normalizeLocalRootCoverage({
+    ...partial,
+    status: "ready"
+  }), null);
+  assert.equal(normalizeLocalRootCoverage({
+    ...partial,
+    status: "unavailable",
+    availableRoots: 0,
+    unavailableRoots: 2,
+    retainedHistory: false
+  }), null);
+  assert.deepEqual(normalizeLocalRootCoverage({
+    ...partial,
+    status: "unavailable",
+    availableRoots: 0,
+    unavailableRoots: 2,
+    retainedHistory: true
+  }), {
+    ...partial,
+    status: "unavailable",
+    availableRoots: 0,
+    unavailableRoots: 2,
+    retainedHistory: true
+  });
+});
+
+test("multi-root coverage warning renders partial and retained-unavailable states then hides on recovery", () => {
+  const elements = new Map([
+    ["#source-coverage-notice", { hidden: true }],
+    ["#source-coverage-title", { textContent: "" }],
+    ["#source-coverage-copy", { textContent: "" }],
+  ]);
+  const documentRef = {
+    querySelector(selector) {
+      return elements.get(selector) ?? null;
+    },
+  };
+  const privateCanary = "/Users/private/.codex";
+  const setLocalizedText = (element, key, values) => {
+    if (!element) return;
+    element.textContent = key === "dashboard.sources.partialCopy"
+      ? `${values.available} of ${values.configured} roots available`
+      : "Some Codex history is temporarily unavailable";
+  };
+
+  const partial = renderCodexRootCoverageNotice({
+    documentRef,
+    onboarding: {
+      sourceAvailability: "partial",
+      configuredCodexRoots: 2,
+      availableCodexRoots: 1,
+      privatePath: privateCanary,
+    },
+    indexedCoverage: null,
+    setLocalizedText,
+  });
+  assert.deepEqual(partial, {
+    status: "partial",
+    configuredRoots: 2,
+    availableRoots: 1,
+  });
+  assert.equal(elements.get("#source-coverage-notice").hidden, false);
+  assert.equal(elements.get("#source-coverage-copy").textContent, "1 of 2 roots available");
+
+  const unavailable = renderCodexRootCoverageNotice({
+    documentRef,
+    onboarding: {
+      sourceAvailability: "ready",
+      configuredCodexRoots: 2,
+      availableCodexRoots: 2,
+    },
+    indexedCoverage: {
+      status: "unavailable",
+      configuredRoots: 2,
+      availableRoots: 0,
+      retainedHistory: true,
+      privatePath: privateCanary,
+    },
+    setLocalizedText,
+  });
+  assert.deepEqual(unavailable, {
+    status: "unavailable",
+    configuredRoots: 2,
+    availableRoots: 0,
+  });
+  assert.equal(elements.get("#source-coverage-copy").textContent, "0 of 2 roots available");
+
+  assert.equal(elements.get("#source-coverage-notice").hidden, false);
+  const recoveredReadyPayload = {
+    status: "ready",
+    configuredRoots: 2,
+    availableRoots: 2,
+    emptyRoots: 0,
+    unavailableRoots: 0,
+    retainedHistory: false,
+    unavailableOwnerSources: 0,
+    ambiguousSources: 0
+  };
+  const recoveredCoverage = normalizeLocalRootCoverage(recoveredReadyPayload);
+  assert.deepEqual(recoveredCoverage, {
+    status: "ready",
+    configuredRoots: 2,
+    availableRoots: 2,
+    emptyRoots: 0,
+    unavailableRoots: 0,
+    retainedHistory: false,
+    unavailableOwnerSources: 0,
+    ambiguousSources: 0
+  });
+  const recovered = renderCodexRootCoverageNotice({
+    documentRef,
+    // The page does not refetch onboarding after every foreground refresh.
+    // A terminal ready receipt therefore has to override this still-partial
+    // snapshot rather than relying on onboarding to recover first.
+    onboarding: {
+      sourceAvailability: "partial",
+      configuredCodexRoots: 2,
+      availableCodexRoots: 1,
+    },
+    indexedCoverage: recoveredCoverage,
+    setLocalizedText,
+  });
+  assert.equal(recovered, null);
+  assert.equal(elements.get("#source-coverage-notice").hidden, true);
+  assert.equal(
+    [...elements.values()].some((element) =>
+      element.textContent?.includes(privateCanary)),
+    false,
+  );
 });
 
 test("local contribution queue status remains bounded and fails closed", async () => {
@@ -5120,6 +5309,10 @@ test("native dashboard readiness follows both first-render outcomes", async () =
 test("first run is a truthful install and local preflight journey", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const uiFormatSource = await readFile(
+    new URL("../public/ui-format.js", import.meta.url),
+    "utf8",
+  );
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
 
   assert.match(html, /<body class="first-run" data-i18n-root>/u);
@@ -5227,6 +5420,10 @@ test("first run is a truthful install and local preflight journey", async () => 
   assert.match(appSource, /System Settings → Privacy & Security → Files and Folders/u);
   assert.match(appSource, /customCodexHomeConfigured/u);
   assert.match(appSource, /rolloutFilesObservedCapped/u);
+  assert.match(html, /id="source-coverage-notice"/u);
+  assert.match(appSource, /function renderCodexRootCoverage\(value\)/u);
+  assert.match(uiFormatSource, /dashboard\.sources\.partialTitle/u);
+  assert.match(uiFormatSource, /dashboard\.sources\.partialCopy/u);
   assert.match(appSource, /setup-check-again.*checkLocalSetup/su);
   assert.match(appSource, /setJourneyState\(ready \? "local-ready" : "needs-local-setup"\)/u);
   assert.match(appSource, /setup: "status\.setUpMac"/u);

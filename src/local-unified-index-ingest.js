@@ -36,10 +36,15 @@ import {
   sessionLocal,
   snapshotLocal,
   sourceLocal,
+  sourceOwnerLocal,
 } from "./local-unified-index.js";
 
 const MAXIMUM_COLD_BACKFILL_WORKERS = 10;
 const MINIMUM_AUTOMATIC_PARALLEL_BACKFILL_BYTES = 1024 * 1024 * 1024;
+export const LOCAL_UNIFIED_INDEX_DISCOVERY_LIMITS = Object.freeze({
+  maximumDirectoryEntries: 500_000,
+  maximumRolloutFiles: 125_000,
+});
 
 // Incremental ingest: advance the live unified index by exactly the bytes the
 // rollout corpus grew since the last pass.
@@ -79,7 +84,7 @@ function loadCursors(database) {
   // missing; a NULL parser_version then reads as "unknown", which classifies
   // as a forced rescan — the safe direction.
   const rows = database.prepare(`
-    SELECT sc.source_local, sc.source_ordinal, sc.session_local,
+    SELECT sc.source_local, sc.owner_local, sc.source_ordinal, sc.session_local,
            sc.scanned_bytes, sc.size_bytes,
            sc.mtime_ms, sc.snapshots_persisted, sc.turn_context_seen,
            sc.carry_model, sc.carry_effort, sc.carry_tier_raw,
@@ -98,6 +103,116 @@ function loadCursors(database) {
     cursors.set(Buffer.from(row.source_local).toString("hex"), row);
   }
   return cursors;
+}
+
+function selectOwnedRolloutInfos(discoveredInfos, cursors, deviceSalt) {
+  const infos = [];
+  const discoveredSourceKeys = new Set();
+  const unavailableOwnerSourceKeys = new Set();
+  const degradedRetainedSourceKeys = new Set();
+  const configuredOwnerLocals = new Set(
+    (discoveredInfos.configuredRootOwnerKeys ?? []).map((rootOwnerKey) => (
+      sourceOwnerLocal(deviceSalt, rootOwnerKey).toString("hex")
+    )),
+  );
+  const unavailableOwnerLocals = new Set(
+    (discoveredInfos.unavailableRootOwnerKeys ?? []).map((rootOwnerKey) => (
+      sourceOwnerLocal(deviceSalt, rootOwnerKey).toString("hex")
+    )),
+  );
+  for (const logical of discoveredInfos) {
+    const sourceHex = sourceLocal(deviceSalt, logical.rolloutKey).toString("hex");
+    discoveredSourceKeys.add(sourceHex);
+    const cursor = cursors.get(sourceHex);
+    const remembered = cursor?.owner_local === null
+        || cursor?.owner_local === undefined
+      ? null
+      : Buffer.from(cursor.owner_local).toString("hex");
+    const candidates = Array.isArray(logical.physicalCandidates)
+      ? logical.physicalCandidates
+      : [logical];
+    if (remembered === null) {
+      infos.push(logical);
+      continue;
+    }
+    const owned = candidates.find((candidate) => (
+      typeof candidate.rootOwnerKey === "string"
+      && sourceOwnerLocal(deviceSalt, candidate.rootOwnerKey).toString("hex")
+        === remembered
+    ));
+    if (owned === undefined) {
+      // A logical rollout is present only through another replica. Whether
+      // the remembered root is unavailable or was removed from configuration,
+      // silently rebinding would cross the persisted ownership boundary.
+      unavailableOwnerSourceKeys.add(sourceHex);
+      degradedRetainedSourceKeys.add(sourceHex);
+      continue;
+    }
+    if (Number.isSafeInteger(logical.size)
+        && Number.isSafeInteger(owned.size)
+        && owned.size < logical.size) {
+      // A compatible non-owner has advanced farther. Keep consuming the
+      // remembered owner (it may independently append), but surface the held
+      // tail instead of silently switching physical sources.
+      degradedRetainedSourceKeys.add(sourceHex);
+    }
+    infos.push({
+      ...owned,
+      physicalCandidates: logical.physicalCandidates,
+    });
+  }
+  for (const rolloutKey of discoveredInfos.ambiguousRolloutKeys ?? []) {
+    const sourceHex = sourceLocal(deviceSalt, rolloutKey).toString("hex");
+    if (cursors.has(sourceHex)) degradedRetainedSourceKeys.add(sourceHex);
+  }
+  let missingRetainedSources = 0;
+  for (const [sourceHex, cursor] of cursors) {
+    if (discoveredSourceKeys.has(sourceHex)) continue;
+    missingRetainedSources += 1;
+    if (cursor.owner_local === null || cursor.owner_local === undefined) continue;
+    const remembered = Buffer.from(cursor.owner_local).toString("hex");
+    if (unavailableOwnerLocals.has(remembered)) {
+      unavailableOwnerSourceKeys.add(sourceHex);
+      degradedRetainedSourceKeys.add(sourceHex);
+    } else if (!configuredOwnerLocals.has(remembered)) {
+      // The physical owner was deliberately or accidentally removed from the
+      // configured set. Retain LKG, but do not call a configured root down.
+      degradedRetainedSourceKeys.add(sourceHex);
+    }
+  }
+  // A discovered logical source whose remembered owner is missing is omitted
+  // above and therefore also retained from the prior generation.
+  missingRetainedSources += discoveredSourceKeys.size - infos.length;
+  return {
+    infos,
+    unavailableOwnerSources: unavailableOwnerSourceKeys.size,
+    missingRetainedSources,
+    degradedRetainedSources: degradedRetainedSourceKeys.size,
+  };
+}
+
+function coverageWithOwnership(base, cursors, ownership) {
+  const fallback = base ?? {
+    status: "ready",
+    configuredRoots: 1,
+    availableRoots: 1,
+    emptyRoots: 0,
+    unavailableRoots: 0,
+    retainedHistory: false,
+    unavailableOwnerSources: 0,
+    ambiguousSources: 0,
+  };
+  const retainedHistory = ownership.missingRetainedSources > 0
+    || ownership.degradedRetainedSources > 0
+    || (fallback.status !== "ready" && cursors.size > 0);
+  return Object.freeze({
+    ...fallback,
+    status: ownership.degradedRetainedSources > 0 && fallback.status === "ready"
+      ? "partial"
+      : fallback.status,
+    retainedHistory,
+    unavailableOwnerSources: ownership.unavailableOwnerSources,
+  });
 }
 
 function carriedTotals(cursor) {
@@ -182,6 +297,7 @@ export function classifySource(info, cursor, expectedParserVersion = null) {
  */
 export async function ingestLocalUnifiedIndexIncrement({
   codexHome,
+  codexHomes = null,
   indexFile = defaultLocalUnifiedIndexPath(),
   secretFile = null,
   contractVersion,
@@ -192,10 +308,15 @@ export async function ingestLocalUnifiedIndexIncrement({
   coldBackfillWorkerCount = null,
   signal = null,
   onProgress = null,
-  discoveryLimits = null,
+  discoveryLimits = LOCAL_UNIFIED_INDEX_DISCOVERY_LIMITS,
 } = {}) {
-  if (typeof codexHome !== "string" || codexHome.length < 1) {
-    throw new TypeError("codexHome must be a non-empty string");
+  if (codexHome !== null && codexHome !== undefined
+      && codexHomes !== null && codexHomes !== undefined) {
+    throw new TypeError("codexHome and codexHomes are mutually exclusive");
+  }
+  if (codexHomes === null
+      && (typeof codexHome !== "string" || codexHome.length < 1)) {
+    throw new TypeError("codexHome or codexHomes must be configured");
   }
   if (typeof contractVersion !== "string" || contractVersion.length < 1) {
     throw new TypeError("contractVersion must be a non-empty string");
@@ -210,25 +331,36 @@ export async function ingestLocalUnifiedIndexIncrement({
   }
   const startedAt = performance.now();
   const resolvedIndexFile = resolve(indexFile);
-  await assertSafeLocalUnifiedIndexTarget(resolvedIndexFile, {
+  const existingIndex = await assertSafeLocalUnifiedIndexTarget(resolvedIndexFile, {
     allowMissing: true,
   });
-  const deviceSalt = await readOrCreateDeviceSalt(
-    secretFile ?? defaultLocalUnifiedIndexSecretPath(resolvedIndexFile),
-  );
-  const infos = await discoverCodexRolloutInfos({
+  const discoveredInfos = await discoverCodexRolloutInfos({
     codexHome,
+    codexHomes,
     startAt,
     endAt,
     signal,
     discoveryLimits,
   });
+  const noCompletelyScannedRoots =
+    (discoveredInfos.availableRootOwnerKeys?.length ?? 0) === 0;
+  if ((discoveredInfos.rootCoverage?.status === "unavailable"
+        || noCompletelyScannedRoots)
+      && existingIndex === null) {
+    throw fixedError("local_unified_index_roots_unavailable");
+  }
+  const deviceSalt = await readOrCreateDeviceSalt(
+    secretFile ?? defaultLocalUnifiedIndexSecretPath(resolvedIndexFile),
+  );
   const discoveredAt = performance.now();
-  const sourceBytes = infos.reduce(
+  let infos = discoveredInfos;
+  let rootCoverage = discoveredInfos.rootCoverage ?? null;
+  let sourceBytes = infos.reduce(
     (total, info) => total + Number(info.size ?? 0),
     0,
   );
   let coldRebuildReason = null;
+  let retainedOwnershipBlocksColdRebuild = false;
   // Read-only preflight avoids cloning/publishing when every current source
   // is byte-for-byte unchanged. A same-size mtime change is deliberately a
   // rescan (classifySource's conservative race policy), so this reads no
@@ -253,10 +385,25 @@ export async function ingestLocalUnifiedIndexIncrement({
       if (coldRebuildReason === null && storedContract !== contractVersion) {
         coldRebuildReason = "contract_changed";
       }
-      if (coldRebuildReason === null
-          && schema === LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
-          && storedContract === contractVersion) {
+      if (schema === LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
+          && userVersion === LOCAL_UNIFIED_INDEX_USER_VERSION) {
         const cursors = loadCursors(unchangedDatabase);
+        const ownership = selectOwnedRolloutInfos(
+          discoveredInfos,
+          cursors,
+          deviceSalt,
+        );
+        infos = ownership.infos;
+        sourceBytes = infos.reduce(
+          (total, info) => total + Number(info.size ?? 0),
+          0,
+        );
+        rootCoverage = coverageWithOwnership(
+          discoveredInfos.rootCoverage,
+          cursors,
+          ownership,
+        );
+        retainedOwnershipBlocksColdRebuild = ownership.degradedRetainedSources > 0;
         const descriptor = readUnifiedIndexGenerationDescriptor(
           unchangedDatabase,
         );
@@ -317,10 +464,48 @@ export async function ingestLocalUnifiedIndexIncrement({
           && descriptor.sourceOrderComplete === true
           && descriptor.quotaProvenanceComplete === true
           && descriptor.toolProvenanceComplete === true;
+        if (coldRebuildReason === null
+            && (rootCoverage?.status === "unavailable"
+              || noCompletelyScannedRoots)
+            && generationAuthoritative) {
+          const totalBoundaryLinks = Number(
+            unchangedDatabase.prepare(
+              "SELECT COUNT(*) AS count FROM usage_event_boundary",
+            ).get()?.count ?? 0,
+          );
+          return {
+            status: "ingested",
+            unchanged: true,
+            indexFile: resolvedIndexFile,
+            generation: descriptor,
+            generationDescriptor: descriptor,
+            sources: 0,
+            sourceBytes: 0,
+            sourcesSkipped: 0,
+            sourcesTouched: 0,
+            sourcesResumed: 0,
+            sourcesRescanned: 0,
+            sourcesReparsedForParserVersion: 0,
+            usageRowsDeletedForReparse: 0,
+            sourcesScanned: 0,
+            bytesScanned: 0,
+            insertedUsageEvents: 0,
+            insertedBoundaryLinks: 0,
+            totalUsageEvents: descriptor.usageEvents ?? 0,
+            totalBoundaryLinks,
+            quotaOccurrences: descriptor.quotaOccurrences ?? 0,
+            discoveryWallMs: discoveredAt - startedAt,
+            scanWallMs: 0,
+            wallMs: performance.now() - startedAt,
+            peakRssBytes: process.memoryUsage.rss(),
+            rootCoverage,
+          };
+        }
         const sourceSetUnchanged = descriptor?.discoveredSourceCount
             === infos.length
           && descriptor?.discoveredSourceBytes === sourceBytes;
-        const unchanged = generationAuthoritative
+        const unchanged = coldRebuildReason === null
+          && generationAuthoritative
           && sourceSetUnchanged
           && infos.every((info) => classifySource(
             info,
@@ -328,7 +513,10 @@ export async function ingestLocalUnifiedIndexIncrement({
               sourceLocal(deviceSalt, info.rolloutKey).toString("hex"),
             ),
             LOCAL_UNIFIED_INDEX_PARSER_VERSION,
-          ).mode === "skip");
+          ).mode === "skip")
+          && infos.every((info) => cursors.get(
+            sourceLocal(deviceSalt, info.rolloutKey).toString("hex"),
+          )?.owner_local !== null);
         if (unchanged) {
           const totalBoundaryLinks = Number(
             unchangedDatabase.prepare(
@@ -360,6 +548,7 @@ export async function ingestLocalUnifiedIndexIncrement({
             scanWallMs: 0,
             wallMs: performance.now() - startedAt,
             peakRssBytes: process.memoryUsage.rss(),
+            rootCoverage,
           };
         }
       }
@@ -370,6 +559,19 @@ export async function ingestLocalUnifiedIndexIncrement({
       unchangedDatabase?.close();
     }
   }
+  if (discoveredInfos.rootCoverage?.status === "unavailable"
+      || noCompletelyScannedRoots) {
+    throw fixedError("local_unified_index_roots_unavailable");
+  }
+  if (coldRebuildReason !== null && retainedOwnershipBlocksColdRebuild) {
+    // A cold rebuild starts from an empty database. If any persisted physical
+    // owner is held, rebuilding would either discard its LKG facts or bind a
+    // different replica. Preserve the published file and wait for the owner
+    // (or an explicit user reset) instead.
+    const error = fixedError("local_unified_index_roots_unavailable");
+    error.rootCoverage = rootCoverage;
+    throw error;
+  }
   if (coldRebuildReason !== null) {
     const parallelBackfillRequested = coldBackfillWorkerCount !== null
       || sourceBytes >= MINIMUM_AUTOMATIC_PARALLEL_BACKFILL_BYTES;
@@ -378,6 +580,7 @@ export async function ingestLocalUnifiedIndexIncrement({
       : 1;
     const rebuilt = await rebuildLocalUnifiedIndex({
       codexHome,
+      codexHomes,
       indexFile: resolvedIndexFile,
       secretFile: secretFile
         ?? defaultLocalUnifiedIndexSecretPath(resolvedIndexFile),
@@ -445,12 +648,27 @@ export async function ingestLocalUnifiedIndexIncrement({
       ? null
       : Number(previousGenerationValue);
     recoverUnifiedIndexGenerations(database);
+    const cursors = loadCursors(database);
+    const ownership = selectOwnedRolloutInfos(
+      discoveredInfos,
+      cursors,
+      deviceSalt,
+    );
+    infos = ownership.infos;
+    sourceBytes = infos.reduce(
+      (total, info) => total + Number(info.size ?? 0),
+      0,
+    );
+    rootCoverage = coverageWithOwnership(
+      discoveredInfos.rootCoverage,
+      cursors,
+      ownership,
+    );
     generation = beginUnifiedIndexGeneration(database, {
       contractVersion,
       discoveredSourceCount: infos.length,
       discoveredSourceBytes: sourceBytes,
     });
-    const cursors = loadCursors(database);
     const selectLineageSnapshot = database.prepare(`
       SELECT 1 AS present FROM lineage_snapshot
       WHERE session_local = ? AND snapshot_local = ? LIMIT 1`);
@@ -511,6 +729,22 @@ export async function ingestLocalUnifiedIndexIncrement({
     const bySessionId = new Map();
     for (const info of infos) {
       if (info.lineage?.sessionId) bySessionId.set(info.lineage.sessionId, info);
+    }
+    const retainedCursorsBySession = new Map();
+    for (const cursor of cursors.values()) {
+      if (cursor.session_local === null || cursor.session_local === undefined) continue;
+      const sessionHex = Buffer.from(cursor.session_local).toString("hex");
+      const retained = retainedCursorsBySession.get(sessionHex);
+      if (retained === undefined) retainedCursorsBySession.set(sessionHex, [cursor]);
+      else retained.push(cursor);
+    }
+    function retainedCursorForSession(sessionId) {
+      if (typeof sessionId !== "string" || sessionId.length < 1) return undefined;
+      const sessionHex = sessionLocal(deviceSalt, sessionId).toString("hex");
+      const retained = retainedCursorsBySession.get(sessionHex);
+      // A segmented/legacy duplicate is not a safe implicit parent. Seeding
+      // from exactly one retained cursor preserves fail-closed lineage.
+      return retained?.length === 1 ? retained[0] : undefined;
     }
     const sessionLocals = new Map();
     const localForSession = (sessionId) => {
@@ -704,10 +938,11 @@ export async function ingestLocalUnifiedIndexIncrement({
         return { seedModel: scanned.model, seedEffort: scanned.effort };
       }
       const parent = bySessionId.get(parentId);
-      if (parent === undefined) return { seedModel: null, seedEffort: null };
-      const cursor = cursors.get(
-        sourceLocal(deviceSalt, parent.rolloutKey).toString("hex"),
-      );
+      const cursor = parent === undefined
+        ? retainedCursorForSession(parentId)
+        : cursors.get(
+          sourceLocal(deviceSalt, parent.rolloutKey).toString("hex"),
+        );
       if (cursor === undefined) return { seedModel: null, seedEffort: null };
       return {
         seedModel: cursor.carry_model ?? null,
@@ -742,7 +977,7 @@ export async function ingestLocalUnifiedIndexIncrement({
         } else {
           const parent = bySessionId.get(parentId);
           const cursor = parent === undefined
-            ? undefined
+            ? retainedCursorForSession(parentId)
             : cursors.get(
               sourceLocal(deviceSalt, parent.rolloutKey).toString("hex"),
             );
@@ -760,8 +995,11 @@ export async function ingestLocalUnifiedIndexIncrement({
       let parentId = info.lineage?.parentId ?? null;
       while (parentId && !seen.has(parentId)) {
         seen.add(parentId);
+        const parent = bySessionId.get(parentId);
+        if (parent === undefined
+            && retainedCursorForSession(parentId) === undefined) break;
         chain.push(localForSession(parentId));
-        parentId = bySessionId.get(parentId)?.lineage?.parentId ?? null;
+        parentId = parent?.lineage?.parentId ?? null;
       }
       return chain;
     }
@@ -782,6 +1020,10 @@ export async function ingestLocalUnifiedIndexIncrement({
           LOCAL_UNIFIED_INDEX_PARSER_VERSION,
         ),
       })).map((plan) => (
+        plan.mode === "skip" && plan.cursor?.owner_local === null
+          ? { ...plan, mode: "touch", reason: "owner_binding" }
+          : plan
+      )).map((plan) => (
         replacementSessionIds.has(
           plan.info.lineage?.sessionId ?? plan.info.rolloutKey,
         ) && plan.mode !== "rescan"
@@ -1123,6 +1365,7 @@ export async function ingestLocalUnifiedIndexIncrement({
       scanWallMs: scannedAt - discoveredAt,
       wallMs: performance.now() - startedAt,
       peakRssBytes: process.memoryUsage.rss(),
+      rootCoverage,
     };
   } catch (error) {
     if (writer !== null) {

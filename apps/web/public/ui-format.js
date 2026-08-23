@@ -450,3 +450,74 @@ export function createDomHelpers(documentRef) {
     },
   };
 }
+
+/**
+ * Render the path-free multi-root coverage notice from already-normalized
+ * onboarding and terminal-refresh projections. The helper owns only three
+ * fixed nodes and bounded aggregate counts, which makes the visible warning
+ * directly testable without importing the dashboard's stateful entrypoint.
+ */
+export function renderCodexRootCoverageNotice({
+  documentRef,
+  onboarding,
+  indexedCoverage,
+  setLocalizedText,
+}) {
+  if (typeof documentRef?.querySelector !== "function"
+      || typeof setLocalizedText !== "function") {
+    throw new TypeError("coverage notice rendering dependencies are invalid");
+  }
+  const select = (selector) => documentRef.querySelector(selector);
+  const notice = select("#source-coverage-notice");
+  if (!notice) return null;
+  const boundedCoverage = (value, statuses) => {
+    if (!value || !statuses.includes(value.status)
+        || !Number.isSafeInteger(value.configuredRoots)
+        || value.configuredRoots < 1
+        || value.configuredRoots > 8
+        || !Number.isSafeInteger(value.availableRoots)
+        || value.availableRoots < 0
+        || value.availableRoots > value.configuredRoots) {
+      return null;
+    }
+    return {
+      status: value.status,
+      configuredRoots: value.configuredRoots,
+      availableRoots: value.availableRoots,
+    };
+  };
+  const onboardingCoverage = onboarding?.sourceAvailability === "partial"
+    ? boundedCoverage({
+        status: "partial",
+        configuredRoots: onboarding.configuredCodexRoots,
+        availableRoots: onboarding.availableCodexRoots,
+      }, ["partial"])
+    : null;
+  const terminalCoverage = boundedCoverage(
+    indexedCoverage,
+    ["ready", "partial", "unavailable"],
+  );
+  // A validated terminal receipt is newer than the onboarding snapshot held
+  // by the already-loaded page. In particular, an explicit ready receipt must
+  // clear a warning raised while a root was absent; ignoring ready here would
+  // fall back to that stale partial onboarding value indefinitely.
+  const coverage = terminalCoverage?.status === "ready"
+    ? null
+    : terminalCoverage ?? onboardingCoverage;
+  notice.hidden = coverage === null;
+  if (coverage === null) return null;
+  setLocalizedText(
+    select("#source-coverage-title"),
+    "dashboard.sources.partialTitle",
+    {},
+  );
+  setLocalizedText(
+    select("#source-coverage-copy"),
+    "dashboard.sources.partialCopy",
+    {
+      available: coverage.availableRoots,
+      configured: coverage.configuredRoots,
+    },
+  );
+  return Object.freeze(coverage);
+}

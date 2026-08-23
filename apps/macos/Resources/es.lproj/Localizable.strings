@@ -79,9 +79,10 @@
 "settings.automaticUpdatesUnavailable" = "Las actualizaciones automáticas no están disponibles en esta versión.";
 "settings.automaticUpdatesTooltip" = "Descarga automáticamente actualizaciones firmadas de TiboTattle.";
 "settings.checkForUpdates" = "Buscar actualizaciones";
+"settings.addCodexFolder" = "Añadir carpeta…";
 "settings.chooseCodexFolder" = "Elegir carpeta de Codex…";
-"settings.codexFolder" = "Carpeta de Codex";
-"settings.codexFolderSummary" = "TiboTattle solo lee las carpetas sessions y archived_sessions bajo esta ubicación. Usa el valor predeterminado salvo que tus datos de Codex estén en otro lugar.";
+"settings.codexFolder" = "Carpetas de actividad de Codex";
+"settings.codexFolderSummary" = "Añade de 1 a 8 carpetas solo si quieres que su actividad se trate como un mismo usuario o una misma cuenta de Codex. TiboTattle no puede verificar que las cuentas sean equivalentes. La carpeta principal vincula el estado activo del proveedor asociado a la cuenta; todas las carpetas aportan historial. Eliminar una carpeta detiene lecturas futuras, pero conserva el historial importado.";
 "settings.general" = "General";
 "settings.generalSummary" = "El uso local se actualiza mientras TiboTattle está abierto. Los registros sin procesar permanecen en este Mac.";
 "settings.github" = "GitHub";
@@ -97,7 +98,9 @@
 "settings.previewUpdatesPending" = "Esta vista previa usa el canal de actualizaciones activo de TiboTattle. La primera versión firmada aún no se ha publicado, por lo que no se pueden detectar actualizaciones.";
 "settings.previewUpdatesPendingMessage" = "Esta vista previa está conectada al servicio activo de TiboTattle, pero el canal de actualizaciones firmado aún no se ha publicado. El análisis local no se ve afectado. Vuelve a comprobarlo cuando haya una versión firmada disponible.";
 "settings.previewUpdatesPendingTitle" = "Las actualizaciones aún no se han publicado";
-"settings.useDefault" = "Usar predeterminado";
+"settings.removeCodexFolder" = "Eliminar carpeta…";
+"settings.setPrimaryCodexFolder" = "Establecer principal…";
+"settings.useDefault" = "Restablecer valor predeterminado…";
 "settings.version" = "Versión %@ (%@)";
 "settings.website" = "Sitio web de TiboTattle";
 "settings.windowTitle" = "Configuración de TiboTattle";
@@ -127,7 +130,9 @@
 
 "dialog.chooseCodexHomeFolder" = "Elige tu carpeta de inicio de Codex";
 "dialog.chooseCodexHomeFolderMessage" = "Elige la carpeta que contiene sesiones de Codex o archived_sessions.";
-"dialog.codexFolderDescription" = "Actual: %@\n\n%@ guarda una carpeta personalizada solo en la configuración de la app disponible para el propietario. Los diagnósticos nunca copian su ruta. El acompañante local solo lee las carpetas sessions y archived_sessions bajo el inicio de Codex seleccionado.";
+"dialog.codexFolderDescription" = "Carpetas de actividad actuales:\n%@\n\n%@ guarda estas carpetas explícitas solo en la configuración de la app disponible para el propietario. Los diagnósticos nunca copian sus rutas. El acompañante local solo lee sessions y archived_sessions bajo las carpetas configuradas.";
+"dialog.codexFolderLimitDescription" = "Elimina una carpeta de actividad antes de añadir otra. TiboTattle lee como máximo 8 carpetas explícitas.";
+"dialog.codexFolderLimitTitle" = "Ya hay 8 carpetas de actividad configuradas";
 "dialog.copyDiagnostics" = "Copiar diagnósticos";
 "dialog.customCodexFolder" = "Carpeta de Codex personalizada";
 "dialog.dataAndDiagnostics" = "Datos y diagnósticos de %@";
@@ -154,6 +159,12 @@
 "dialog.resetFinishingDescription" = "Espera a que termine esta breve transacción del Llavero y luego sal.";
 "dialog.resetIdentityDevice" = "¿Restablecer la identidad y el dispositivo locales?";
 "dialog.resetLocalIdentity" = "Restablecer identidad local";
+"dialog.removeCodexFolderDescription" = "Eliminar esta carpeta detiene lecturas futuras, pero conserva el historial importado. La carpeta y sus archivos de Codex no se eliminan. Para eliminar la principal, establece primero otra carpeta como principal.";
+"dialog.removeCodexFolderTitle" = "¿Eliminar carpeta de actividad?";
+"dialog.resetCodexFoldersDescription" = "Esto elimina las carpetas de actividad configuradas y vuelve a ~/.codex. Detiene lecturas futuras de las carpetas eliminadas, pero conserva el historial importado. No se elimina ningún archivo de Codex.";
+"dialog.resetCodexFoldersTitle" = "¿Volver a la carpeta predeterminada de Codex?";
+"dialog.setPrimaryCodexFolderDescription" = "La carpeta principal vincula el estado del proveedor asociado a la cuenta. Todas las carpetas configuradas siguen combinadas en este panel.";
+"dialog.setPrimaryCodexFolderTitle" = "Elige la carpeta principal de Codex";
 "dialog.showLocalData" = "Mostrar datos locales";
 "dialog.useThisFolder" = "Usar esta carpeta";
 
@@ -192,7 +203,7 @@
 "launcher.errorKeychainReset" = "El restablecimiento de identidad y dispositivo locales no terminó.";
 "launcher.errorKeychainResetPartial" = "El restablecimiento de identidad y dispositivo locales terminó solo parcialmente.";
 "launcher.recoveryCheckAccess" = "Comprueba el acceso a tus carpetas de inicio y Application Support, y vuelve a intentarlo.";
-"launcher.recoveryChooseCodexHome" = "Elige Origen de Codex y selecciona una carpeta de inicio de Codex legible que pertenezca a tu cuenta de usuario de macOS, o restaura el valor predeterminado.";
+"launcher.recoveryChooseCodexHome" = "Abre Configuración → General y añade una carpeta de inicio de Codex legible que pertenezca a tu cuenta de usuario de macOS, o restablece el valor predeterminado.";
 "launcher.recoveryDashboardDownload" = "Comprueba el acceso a tu carpeta Descargas y vuelve a guardar el archivo.";
 "launcher.recoveryDashboardWebView" = "Elige Abrir panel para intentarlo de nuevo, o Abrir en el navegador para usar el mismo panel local en tu navegador.";
 "launcher.recoveryDataErase" = "Cierra otros procesos que usen datos de %@ y vuelve a intentar el borrado.";
@@ -206,8 +217,13 @@
 "nativeDashboard.currentEvidenceTooltip" = "El estado actual de la evidencia local.";
 "menuBar.analysisRequestRejected" = "El acompañante local no pudo aceptar una solicitud de análisis.";
 "menuBar.failureRecovery" = "No está en ejecución: %@. Abre la ventana para ver el paso de recuperación.";
-"settings.codexFolderCustomSelectedPath" = "Carpeta personalizada: %@";
+"settings.codexFolderActivitySelectedPath" = "Actividad: %@";
 "settings.codexFolderDefaultLocation" = "Ubicación predeterminada (~/.codex)";
+"settings.codexFolderPathWithStatus" = "%@ — %@";
+"settings.codexFolderPrimarySelectedPath" = "Principal: %@";
+"settings.codexFolderStatusInvalid" = "No válida o no segura";
+"settings.codexFolderStatusReady" = "Disponible";
+"settings.codexFolderStatusTemporarilyUnavailable" = "No disponible temporalmente";
 "settings.updateDisclosureAutomaticOff" = "Las actualizaciones de la app firmada están disponibles en Acerca de → Buscar actualizaciones. Las descargas automáticas están desactivadas; puedes activarlas en Configuración → Acerca de cuando estén disponibles.";
 "settings.updateDisclosureAutomaticOn" = "Las actualizaciones de la app firmada se comprueban automáticamente. De forma predeterminada, una actualización verificada se descarga en segundo plano y se instala al salir; puedes desactivarlo en Configuración → Acerca de.";
 "settings.updateDisclosureDevelopment" = "Esta compilación de desarrollo no incluye comprobaciones de actualización. Las versiones firmadas instaladas en Aplicaciones pueden buscar actualizaciones desde Acerca de.";

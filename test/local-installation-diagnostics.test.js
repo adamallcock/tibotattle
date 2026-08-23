@@ -206,6 +206,11 @@ test("onboarding reports capped source readiness without paths, names, content, 
       status: "ready",
       source: {
         status: "ready",
+        availability: "ready",
+        configuredRoots: 1,
+        availableRoots: 1,
+        emptyRoots: 0,
+        unavailableRoots: 0,
         sessionsReadable: true,
         archivedSessionsReadable: true,
         rolloutFilesPresent: true,
@@ -256,12 +261,148 @@ test("onboarding is ready for a fresh install with active sessions only", async 
     assert.equal(onboarding.status, "ready");
     assert.deepEqual(onboarding.source, {
       status: "ready",
+      availability: "ready",
+      configuredRoots: 1,
+      availableRoots: 1,
+      emptyRoots: 0,
+      unavailableRoots: 0,
       sessionsReadable: true,
       archivedSessionsReadable: false,
       rolloutFilesPresent: true,
       rolloutFilesObserved: 1,
       rolloutFilesObservedCapped: false,
     });
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("multi-root onboarding isolates an unavailable root while preserving operational readiness", async () => {
+  const files = await fixture();
+  const unavailableRoot = join(files.root, "stopped-wsl-profile", ".codex");
+  await writeFile(
+    join(files.codexHome, "sessions", "rollout-current.jsonl"),
+    `${JSON.stringify({ type: "session_meta" })}\n`,
+    { mode: 0o600 },
+  );
+  prepareLocalInstallationRoots({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+  });
+  try {
+    const onboarding = await inspectLocalOnboarding({
+      codexHomes: [files.codexHome, unavailableRoot],
+      stateRoot: files.stateRoot,
+    });
+    assert.equal(onboarding.status, "ready");
+    assert.deepEqual(onboarding.source, {
+      status: "ready",
+      availability: "partial",
+      configuredRoots: 2,
+      availableRoots: 1,
+      emptyRoots: 0,
+      unavailableRoots: 1,
+      sessionsReadable: true,
+      archivedSessionsReadable: true,
+      rolloutFilesPresent: true,
+      rolloutFilesObserved: 1,
+      rolloutFilesObservedCapped: false,
+    });
+    const serialized = JSON.stringify(onboarding);
+    assert.equal(serialized.includes(files.codexHome), false);
+    assert.equal(serialized.includes(unavailableRoot), false);
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("multi-root onboarding counts a readable root with no activity directories as available and empty", async () => {
+  const files = await fixture();
+  const emptyCodexHome = join(files.root, "new-profile", ".codex");
+  await mkdir(emptyCodexHome, { recursive: true, mode: 0o700 });
+  await writeFile(
+    join(files.codexHome, "sessions", "rollout-current.jsonl"),
+    `${JSON.stringify({ type: "session_meta" })}\n`,
+    { mode: 0o600 },
+  );
+  prepareLocalInstallationRoots({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+  });
+  try {
+    const onboarding = await inspectLocalOnboarding({
+      codexHomes: [files.codexHome, emptyCodexHome],
+      stateRoot: files.stateRoot,
+    });
+    assert.equal(onboarding.status, "ready");
+    assert.deepEqual(onboarding.source, {
+      status: "ready",
+      availability: "ready",
+      configuredRoots: 2,
+      availableRoots: 2,
+      emptyRoots: 1,
+      unavailableRoots: 0,
+      sessionsReadable: true,
+      archivedSessionsReadable: true,
+      rolloutFilesPresent: true,
+      rolloutFilesObserved: 1,
+      rolloutFilesObservedCapped: false,
+    });
+    const serialized = JSON.stringify(onboarding);
+    assert.equal(serialized.includes(files.codexHome), false);
+    assert.equal(serialized.includes(emptyCodexHome), false);
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("multi-root onboarding does not call an empty plus unavailable source ready", async () => {
+  const files = await fixture();
+  prepareLocalInstallationRoots({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+  });
+  try {
+    const onboarding = await inspectLocalOnboarding({
+      codexHomes: [
+        files.codexHome,
+        join(files.root, "unavailable-profile", ".codex"),
+      ],
+      stateRoot: files.stateRoot,
+    });
+    assert.equal(onboarding.status, "needs_attention");
+    assert.equal(onboarding.source.status, "no_rollout_files");
+    assert.equal(onboarding.source.availability, "partial");
+    assert.equal(onboarding.source.emptyRoots, 1);
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("multi-root onboarding reports all roots unavailable without exposing their identities", async () => {
+  const files = await fixture();
+  await rm(files.codexHome, { recursive: true });
+  prepareLocalInstallationRoots({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+  });
+  const roots = [
+    files.codexHome,
+    join(files.root, "second-missing-profile", ".codex"),
+  ];
+  try {
+    const onboarding = await inspectLocalOnboarding({
+      codexHomes: roots,
+      stateRoot: files.stateRoot,
+    });
+    assert.equal(onboarding.status, "needs_attention");
+    assert.equal(onboarding.source.availability, "unavailable");
+    assert.equal(onboarding.source.configuredRoots, 2);
+    assert.equal(onboarding.source.availableRoots, 0);
+    assert.equal(onboarding.source.emptyRoots, 0);
+    assert.equal(onboarding.source.unavailableRoots, 2);
+    const serialized = JSON.stringify(onboarding);
+    for (const root of roots) assert.equal(serialized.includes(root), false);
   } finally {
     await rm(files.root, { recursive: true });
   }
@@ -315,6 +456,11 @@ test("onboarding fails closed for unreadable source/state and hostile provider d
       status: "needs_attention",
       source: {
         status: "codex_home_unreadable",
+        availability: "unavailable",
+        configuredRoots: 1,
+        availableRoots: 0,
+        emptyRoots: 0,
+        unavailableRoots: 1,
         sessionsReadable: true,
         archivedSessionsReadable: true,
         rolloutFilesPresent: true,

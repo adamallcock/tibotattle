@@ -567,7 +567,8 @@ async function prepareRecentLocalContribution({
   replayOverlapHours =
     LOCAL_CONTRIBUTION_PREPARATION_REPLAY_OVERLAP_HOURS,
   coveredAt,
-  codexHome = codexHomeDefault(),
+  codexHome = undefined,
+  codexHomes = null,
   activityFile = activityFileDefault(),
   reviewArchiveDirectory =
     defaultLocalContributionPreparationDirectories().reviewArchiveDirectory,
@@ -591,6 +592,21 @@ async function prepareRecentLocalContribution({
   syncParentDirectory = preparedStorage.syncDirectory,
   signal = null,
 } = {}) {
+  if (codexHome !== null && codexHome !== undefined && codexHomes !== null) {
+    throw new TypeError("codexHome and codexHomes are mutually exclusive");
+  }
+  if (codexHomes !== null
+      && (!Array.isArray(codexHomes)
+        || codexHomes.length < 1
+        || codexHomes.length > 8
+        || codexHomes.some((value) => (
+          typeof value !== "string" || value.length < 1
+        ))
+        || new Set(codexHomes).size !== codexHomes.length)) {
+    throw new TypeError("codexHomes must contain between one and eight unique paths");
+  }
+  const selectedCodexHome = codexHome
+    ?? (codexHomes === null ? codexHomeDefault() : undefined);
   if (typeof failpoint !== "function"
       || typeof createResourceGuard !== "function"
       || typeof readActivityMarkers !== "function"
@@ -822,7 +838,9 @@ async function prepareRecentLocalContribution({
           built = await buildBundle({
             startAt: coverage.startAt,
             endAt: coverage.endAt,
-            codexHome,
+            ...(codexHomes === null
+              ? { codexHome: selectedCodexHome }
+              : { codexHomes }),
             secret: identity.secret,
             activityMarkers,
             createdAt: coverage.endAt,

@@ -98,7 +98,7 @@ export const LOCAL_CONTRIBUTION_PREPARATION_RESULT_VERSION =
   "local-contribution-preparation-result-v0.1";
 export const LOCAL_CONTRIBUTION_DEVICE_PAIRING_VERSION =
   "local-contribution-device-pairing-v0.1";
-export const LOCAL_ONBOARDING_SCHEMA_VERSION = "local-onboarding-v0.2";
+export const LOCAL_ONBOARDING_SCHEMA_VERSION = "local-onboarding-v0.3";
 export const LOCAL_COMPANION_SCHEMA_VERSION = "local-companion-v0.1";
 const MAXIMUM_ONBOARDING_ROLLOUT_FILES = 100;
 
@@ -575,6 +575,11 @@ export function normalizeLocalOnboarding(payload) {
   const unavailable = Object.freeze({
     state: "unavailable",
     sourceStatus: "unavailable",
+    sourceAvailability: "unavailable",
+    configuredCodexRoots: 0,
+    availableCodexRoots: 0,
+    emptyCodexRoots: 0,
+    unavailableCodexRoots: 0,
     sessionsReadable: false,
     archivedSessionsReadable: false,
     rolloutFilesPresent: false,
@@ -596,6 +601,11 @@ export function normalizeLocalOnboarding(payload) {
       || !["ready", "needs_attention"].includes(payload.status)
       || !hasExactKeys(payload.source, [
         "status",
+        "availability",
+        "configuredRoots",
+        "availableRoots",
+        "emptyRoots",
+        "unavailableRoots",
         "sessionsReadable",
         "archivedSessionsReadable",
         "rolloutFilesPresent",
@@ -617,6 +627,29 @@ export function normalizeLocalOnboarding(payload) {
         "session_directories_unreadable",
         "no_rollout_files"
       ].includes(payload.source.status)
+      || !["ready", "partial", "unavailable"].includes(
+        payload.source.availability
+      )
+      || !Number.isSafeInteger(payload.source.configuredRoots)
+      || payload.source.configuredRoots < 1
+      || payload.source.configuredRoots > 8
+      || !Number.isSafeInteger(payload.source.availableRoots)
+      || payload.source.availableRoots < 0
+      || payload.source.availableRoots > payload.source.configuredRoots
+      || !Number.isSafeInteger(payload.source.emptyRoots)
+      || payload.source.emptyRoots < 0
+      || payload.source.emptyRoots > payload.source.availableRoots
+      || !Number.isSafeInteger(payload.source.unavailableRoots)
+      || payload.source.unavailableRoots < 0
+      || payload.source.unavailableRoots
+        !== payload.source.configuredRoots - payload.source.availableRoots
+      || payload.source.availability !== (
+        payload.source.availableRoots === 0
+          ? "unavailable"
+          : payload.source.unavailableRoots > 0
+            ? "partial"
+            : "ready"
+      )
       || typeof payload.source.sessionsReadable !== "boolean"
       || typeof payload.source.archivedSessionsReadable !== "boolean"
       || typeof payload.source.rolloutFilesPresent !== "boolean"
@@ -647,6 +680,7 @@ export function normalizeLocalOnboarding(payload) {
         && payload.source.rolloutFilesPresent)
       || payload.status !== (
         payload.source.status === "ready"
+        && payload.source.availability !== "unavailable"
         && payload.state.status === "ready"
         && payload.capabilities.explicitRefresh
           ? "ready"
@@ -657,6 +691,11 @@ export function normalizeLocalOnboarding(payload) {
   return Object.freeze({
     state: payload.status,
     sourceStatus: payload.source.status,
+    sourceAvailability: payload.source.availability,
+    configuredCodexRoots: payload.source.configuredRoots,
+    availableCodexRoots: payload.source.availableRoots,
+    emptyCodexRoots: payload.source.emptyRoots,
+    unavailableCodexRoots: payload.source.unavailableRoots,
     sessionsReadable: payload.source.sessionsReadable,
     archivedSessionsReadable: payload.source.archivedSessionsReadable,
     rolloutFilesPresent: payload.source.rolloutFilesPresent,
@@ -667,6 +706,69 @@ export function normalizeLocalOnboarding(payload) {
     explicitRefresh: payload.capabilities.explicitRefresh,
     customCodexHomeConfigured:
       payload.capabilities.customCodexHomeConfigured
+  });
+}
+
+/**
+ * Validate the aggregate, path-free source coverage attached to a completed
+ * local refresh. `null` means the receipt is absent or malformed; callers keep
+ * their prior truthful state rather than interpreting that as recovered
+ * coverage.
+ */
+export function normalizeLocalRootCoverage(payload) {
+  if (!payload
+      || typeof payload !== "object"
+      || Array.isArray(payload)
+      || !hasExactKeys(payload, [
+        "status",
+        "configuredRoots",
+        "availableRoots",
+        "emptyRoots",
+        "unavailableRoots",
+        "retainedHistory",
+        "unavailableOwnerSources",
+        "ambiguousSources"
+      ])) return null;
+  const configuredRoots = payload.configuredRoots;
+  const availableRoots = payload.availableRoots;
+  const emptyRoots = payload.emptyRoots;
+  const unavailableRoots = payload.unavailableRoots;
+  const unavailableOwnerSources = payload.unavailableOwnerSources;
+  const ambiguousSources = payload.ambiguousSources;
+  if (!Number.isSafeInteger(configuredRoots)
+      || configuredRoots < 1
+      || configuredRoots > 8
+      || !Number.isSafeInteger(availableRoots)
+      || availableRoots < 0
+      || availableRoots > configuredRoots
+      || !Number.isSafeInteger(emptyRoots)
+      || emptyRoots < 0
+      || emptyRoots > availableRoots
+      || !Number.isSafeInteger(unavailableRoots)
+      || unavailableRoots < 0
+      || availableRoots + unavailableRoots !== configuredRoots
+      || typeof payload.retainedHistory !== "boolean"
+      || !Number.isSafeInteger(unavailableOwnerSources)
+      || unavailableOwnerSources < 0
+      || !Number.isSafeInteger(ambiguousSources)
+      || ambiguousSources < 0
+      || !["ready", "partial", "unavailable"].includes(payload.status)
+      || (payload.status === "unavailable"
+        && (availableRoots !== 0 || payload.retainedHistory !== true))
+      || (payload.status !== "unavailable" && availableRoots === 0)
+      || (payload.status === "ready"
+        && (unavailableRoots !== 0
+          || unavailableOwnerSources !== 0
+          || ambiguousSources !== 0))) return null;
+  return Object.freeze({
+    status: payload.status,
+    configuredRoots,
+    availableRoots,
+    emptyRoots,
+    unavailableRoots,
+    retainedHistory: payload.retainedHistory,
+    unavailableOwnerSources,
+    ambiguousSources
   });
 }
 

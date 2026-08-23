@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   appendFile,
   lstat,
@@ -34,6 +35,7 @@ import {
 import {
   classifySource,
   ingestLocalUnifiedIndexIncrement,
+  LOCAL_UNIFIED_INDEX_DISCOVERY_LIMITS,
 } from "../src/local-unified-index-ingest.js";
 import {
   createLocalUnifiedIndexSecondaryIndexes,
@@ -50,6 +52,7 @@ import {
   REASONING_EFFORTS,
   reasoningEffortOrdinal,
   sessionLocal,
+  sourceOwnerLocal,
 } from "../src/local-unified-index.js";
 import { readLocalUnifiedWindowBreakdown } from "../src/local-unified-window-breakdown.js";
 
@@ -2440,7 +2443,7 @@ test("a version-1 index is migrated additively, never rebuilt", async () => {
     const writable = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: false });
     assert.equal(
       Number(writable.prepare("PRAGMA user_version").get().user_version),
-      8,
+      9,
     );
     assert.equal(
       Number(writable.prepare("SELECT COUNT(*) AS c FROM usage_event").get().c),
@@ -2458,7 +2461,7 @@ test("a version-1 index is migrated additively, never rebuilt", async () => {
   }
 });
 
-test("v7 diagnostic rows survive the closed-vocabulary v8 migration", async () => {
+test("v7 diagnostic rows survive the closed-vocabulary and owner migration", async () => {
   const { root } = await corpus({
     "rollout-2026-07-25T00-00-00-v7-diagnostics.jsonl": [
       sessionMeta("session-v7-diagnostics"),
@@ -2507,7 +2510,7 @@ test("v7 diagnostic rows survive the closed-vocabulary v8 migration", async () =
     try {
       assert.equal(
         Number(migrated.prepare("PRAGMA user_version").get().user_version),
-        8,
+        9,
       );
       assert.equal(Number(migrated.prepare(
         "SELECT COUNT(*) AS count FROM source_diagnostic",
@@ -2666,7 +2669,7 @@ test("classifySource forces a whole-file rescan for cursors stamped by an older 
   }
 });
 
-test("a v5 development cursor migrates to v8 with complete source order", async () => {
+test("a v5 development cursor migrates to v9 with complete source order", async () => {
   const { root } = await corpus({
     "rollout-2026-07-25T00-00-00-aaaa.jsonl": [
       sessionMeta("session-a"),
@@ -2717,7 +2720,7 @@ test("a v5 development cursor migrates to v8 with complete source order", async 
     try {
       assert.equal(
         Number(database.prepare("PRAGMA user_version").get().user_version),
-        8,
+        9,
       );
       assert.equal(
         Number(database.prepare(`
@@ -3237,5 +3240,531 @@ test("an inherited Fast turn reaches Fast pricing through the speed crossing", a
     assert.equal(breakdown.bySpeed.unknown, undefined, "no turn fell back to unknown speed");
   } finally {
     await rm(root, { recursive: true });
+  }
+});
+
+test("v8 cursors acquire a stable physical owner and never rebind to a replica", async () => {
+  const base = await mkdtemp(join(tmpdir(), "unified-multi-owner-"));
+  const rootA = join(base, "root-a");
+  const rootB = join(base, "root-b");
+  const sessionsA = join(rootA, "sessions");
+  const sessionsB = join(rootB, "sessions");
+  const indexFile = join(base, "index.sqlite");
+  const secretFile = join(base, "salt");
+  const name = "rollout-2026-07-25T00-00-00-replica.jsonl";
+  const common = [
+    sessionMeta("88888888-8888-4888-8888-888888888888"),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+    tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+  ];
+  const longer = [
+    ...common,
+    tokenCount("2026-07-25T00:00:02.000Z", usage(200, 20), usage(100, 10)),
+  ];
+  const configured = [
+    { path: rootA, id: "root-a" },
+    { path: rootB, id: "root-b" },
+  ];
+  const ingest = (codexHomes = configured) => ingestLocalUnifiedIndexIncrement({
+    codexHomes,
+    indexFile,
+    secretFile,
+    contractVersion: CONTRACT,
+  });
+  try {
+    await mkdir(sessionsA, { recursive: true });
+    await mkdir(sessionsB, { recursive: true });
+    await writeFile(join(sessionsA, name), `${longer.join("\n")}\n`);
+    await writeFile(join(sessionsB, name), `${common.join("\n")}\n`);
+
+    const initial = await ingest();
+    assert.equal(initial.sources, 1);
+    assert.equal(initial.totalUsageEvents, 2);
+    assert.equal(initial.rootCoverage.status, "ready");
+
+    // Reproduce a genuine v8 file: the owner column did not exist yet. The
+    // writable staged migration must add it, and the first accepted refresh
+    // must touch the otherwise unchanged cursor to bind the current owner.
+    {
+      const { DatabaseSync } = await import("node:sqlite");
+      const old = new DatabaseSync(indexFile);
+      old.exec(`
+        ALTER TABLE source_cursor DROP COLUMN owner_local;
+        PRAGMA user_version=8;
+      `);
+      old.close();
+    }
+    const migrated = await ingest([...configured].reverse());
+    assert.equal(migrated.rebuilt, undefined);
+    assert.equal(migrated.sourcesTouched, 1);
+    let boundOwner;
+    {
+      const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+      try {
+        assert.equal(
+          Number(database.prepare("PRAGMA user_version").get().user_version),
+          9,
+        );
+        boundOwner = database.prepare(
+          "SELECT hex(owner_local) AS owner FROM source_cursor",
+        ).get().owner;
+        assert.equal(boundOwner.length, 64);
+      } finally {
+        database.close();
+      }
+    }
+
+    // The longer A copy was selected and bound. Losing A while B remains must
+    // retain A's facts and must not resume or rescan from B's shorter replica.
+    await rm(rootA, { recursive: true });
+    const held = await ingest([...configured].reverse());
+    assert.equal(held.generation.status, "complete");
+    assert.equal(held.totalUsageEvents, 2);
+    assert.equal(held.sourcesResumed, 0);
+    assert.equal(held.sourcesRescanned, 0);
+    assert.deepEqual(held.rootCoverage, {
+      status: "partial",
+      configuredRoots: 2,
+      availableRoots: 1,
+      emptyRoots: 0,
+      unavailableRoots: 1,
+      retainedHistory: true,
+      unavailableOwnerSources: 1,
+      ambiguousSources: 0,
+    });
+    {
+      const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+      try {
+        assert.equal(database.prepare(
+          "SELECT hex(owner_local) AS owner FROM source_cursor",
+        ).get().owner, boundOwner);
+        assert.equal(Number(database.prepare(
+          "SELECT COUNT(*) AS count FROM usage_event",
+        ).get().count), 2);
+      } finally {
+        database.close();
+      }
+    }
+
+    // With no replica left anywhere, removing the owner from configuration is
+    // retained-history partial, but it is not called a configured-owner outage.
+    await rm(join(sessionsB, name));
+    const removed = await ingest([{ path: rootB, id: "root-b" }]);
+    assert.equal(removed.rootCoverage.status, "partial");
+    assert.equal(removed.rootCoverage.retainedHistory, true);
+    assert.equal(removed.rootCoverage.unavailableOwnerSources, 0);
+    assert.equal(removed.totalUsageEvents, 2);
+
+    // With every configured root unavailable, return the authoritative LKG
+    // without publishing a new apparently-complete empty generation.
+    await rm(rootB, { recursive: true });
+    const beforeUnavailable = await stat(indexFile);
+    const unavailable = await ingest(configured);
+    const afterUnavailable = await stat(indexFile);
+    assert.equal(unavailable.unchanged, true);
+    assert.equal(unavailable.generation.id, removed.generation.id);
+    assert.equal(unavailable.totalUsageEvents, 2);
+    assert.equal(unavailable.rootCoverage.status, "unavailable");
+    assert.equal(unavailable.rootCoverage.retainedHistory, true);
+    assert.equal(afterUnavailable.mtimeMs, beforeUnavailable.mtimeMs);
+  } finally {
+    await rm(base, { recursive: true });
+  }
+});
+
+test("a parallel rebuild combines unique roots and persists one local owner per source", async () => {
+  const base = await mkdtemp(join(tmpdir(), "unified-multi-rebuild-"));
+  const rootA = join(base, "root-a");
+  const rootB = join(base, "root-b");
+  const sessionsA = join(rootA, "sessions");
+  const sessionsB = join(rootB, "sessions");
+  const indexFile = join(base, "index.sqlite");
+  try {
+    await mkdir(sessionsA, { recursive: true });
+    await mkdir(sessionsB, { recursive: true });
+    await writeFile(join(
+      sessionsA,
+      "rollout-2026-07-25T00-00-00-root-a.jsonl",
+    ), `${[
+      sessionMeta("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ].join("\n")}\n`);
+    await writeFile(join(
+      sessionsB,
+      "rollout-2026-07-25T01-00-00-root-b.jsonl",
+    ), `${[
+      sessionMeta("ffffffff-ffff-4fff-8fff-ffffffffffff"),
+      turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-terra"),
+      tokenCount("2026-07-25T01:00:01.000Z", usage(200, 20), usage(200, 20)),
+    ].join("\n")}\n`);
+    const rebuilt = await rebuildLocalUnifiedIndex({
+      codexHomes: [
+        { path: rootB, id: "rebuild-b" },
+        { path: rootA, id: "rebuild-a" },
+      ],
+      indexFile,
+      secretFile: join(base, "salt"),
+      contractVersion: CONTRACT,
+      workerCount: 2,
+    });
+    assert.equal(rebuilt.sources, 2);
+    assert.equal(rebuilt.usageEvents, 2);
+    assert.equal(rebuilt.rootCoverage.status, "ready");
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.equal(Number(database.prepare(
+        "SELECT COUNT(*) AS count FROM source_cursor WHERE owner_local IS NOT NULL",
+      ).get().count), 2);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(base, { recursive: true });
+  }
+});
+
+test("a longer non-owner replica is held without importing its tail or changing ownership", async () => {
+  const base = await mkdtemp(join(tmpdir(), "unified-multi-held-tail-"));
+  const rootA = join(base, "root-a");
+  const rootB = join(base, "root-b");
+  const sessionsA = join(rootA, "sessions");
+  const sessionsB = join(rootB, "sessions");
+  const name = "rollout-2026-07-25T00-00-00-equal.jsonl";
+  const initialLines = [
+    sessionMeta("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+    tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+  ];
+  const configured = [
+    { path: rootA, id: "equal-a" },
+    { path: rootB, id: "equal-b" },
+  ];
+  const indexFile = join(base, "index.sqlite");
+  const secretFile = join(base, "salt");
+  const ingest = (codexHomes = configured) => ingestLocalUnifiedIndexIncrement({
+    codexHomes,
+    indexFile,
+    secretFile,
+    contractVersion: CONTRACT,
+  });
+  try {
+    await mkdir(sessionsA, { recursive: true });
+    await mkdir(sessionsB, { recursive: true });
+    const initialBytes = `${initialLines.join("\n")}\n`;
+    await writeFile(join(sessionsA, name), initialBytes);
+    await writeFile(join(sessionsB, name), initialBytes);
+    const first = await ingest();
+    assert.equal(first.totalUsageEvents, 1);
+
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    let boundOwner;
+    try {
+      boundOwner = database.prepare(
+        "SELECT hex(owner_local) AS owner FROM source_cursor",
+      ).get().owner.toLowerCase();
+    } finally {
+      database.close();
+    }
+    const salt = await readFile(secretFile);
+    const ownerFor = (id) => sourceOwnerLocal(
+      salt,
+      createHash("sha256")
+        .update("app-usagemonitor/codex-root-owner/v1\0")
+        .update(id)
+        .digest("hex"),
+    ).toString("hex");
+    const ownerA = ownerFor("equal-a");
+    const ownerB = ownerFor("equal-b");
+    assert.ok([ownerA, ownerB].includes(boundOwner));
+    const nonOwnerFile = boundOwner === ownerA
+      ? join(sessionsB, name)
+      : join(sessionsA, name);
+    await appendFile(nonOwnerFile, `${tokenCount(
+      "2026-07-25T00:00:02.000Z",
+      usage(200, 20),
+      usage(100, 10),
+    )}\n`);
+
+    const held = await ingest([...configured].reverse());
+    assert.equal(held.totalUsageEvents, 1);
+    assert.equal(held.sourcesResumed, 0);
+    assert.equal(held.sourcesRescanned, 0);
+    assert.equal(held.rootCoverage.status, "partial");
+    assert.equal(held.rootCoverage.retainedHistory, true);
+    assert.equal(held.rootCoverage.unavailableOwnerSources, 0);
+    const reopened = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.equal(reopened.prepare(
+        "SELECT hex(owner_local) AS owner FROM source_cursor",
+      ).get().owner.toLowerCase(), boundOwner);
+      assert.equal(Number(reopened.prepare(
+        "SELECT COUNT(*) AS count FROM usage_event",
+      ).get().count), 1);
+    } finally {
+      reopened.close();
+    }
+
+    // A contract-triggered cold rebuild must not bypass the persisted binding
+    // and choose the longer replica. The existing generation stays untouched
+    // until the bound owner catches up or the user explicitly resets it.
+    const beforeBlockedRebuild = await stat(indexFile);
+    await assert.rejects(
+      ingestLocalUnifiedIndexIncrement({
+        codexHomes: configured,
+        indexFile,
+        secretFile,
+        contractVersion: `${CONTRACT}-next`,
+      }),
+      (error) => {
+        assert.equal(error.code, "local_unified_index_roots_unavailable");
+        assert.equal(error.rootCoverage.status, "partial");
+        assert.equal(error.rootCoverage.retainedHistory, true);
+        return true;
+      },
+    );
+    const afterBlockedRebuild = await stat(indexFile);
+    assert.equal(afterBlockedRebuild.mtimeMs, beforeBlockedRebuild.mtimeMs);
+    const preserved = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.equal(preserved.prepare(
+        "SELECT value FROM meta WHERE key = 'contract_version'",
+      ).get().value, CONTRACT);
+      assert.equal(preserved.prepare(
+        "SELECT hex(owner_local) AS owner FROM source_cursor",
+      ).get().owner.toLowerCase(), boundOwner);
+      assert.equal(Number(preserved.prepare(
+        "SELECT COUNT(*) AS count FROM usage_event",
+      ).get().count), 1);
+    } finally {
+      preserved.close();
+    }
+  } finally {
+    await rm(base, { recursive: true });
+  }
+});
+
+test("normal deletion from a successfully scanned owner root retains history without degrading coverage", async () => {
+  const { root, sessions } = await corpus({
+    "rollout-2026-07-25T00-00-00-historical.jsonl": [
+      sessionMeta("cccccccc-cccc-4ccc-8ccc-cccccccccccc"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const source = join(sessions, "rollout-2026-07-25T00-00-00-historical.jsonl");
+  const ingest = () => ingestLocalUnifiedIndexIncrement({
+    codexHome: root,
+    indexFile: join(root, "index.sqlite"),
+    secretFile: join(root, "salt"),
+    contractVersion: CONTRACT,
+  });
+  try {
+    const first = await ingest();
+    assert.equal(first.totalUsageEvents, 1);
+    await rm(source);
+    const retained = await ingest();
+    assert.equal(retained.totalUsageEvents, 1);
+    assert.equal(retained.generation.status, "complete");
+    assert.equal(retained.rootCoverage.status, "ready");
+    assert.equal(retained.rootCoverage.retainedHistory, true);
+    assert.equal(retained.rootCoverage.unavailableOwnerSources, 0);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a rebuild refuses to publish when every configured root is unavailable", async () => {
+  const base = await mkdtemp(join(tmpdir(), "unified-multi-unavailable-"));
+  const indexFile = join(base, "index.sqlite");
+  const secretFile = join(base, "salt");
+  try {
+    await assert.rejects(
+      rebuildLocalUnifiedIndex({
+        codexHomes: [{ path: join(base, "missing"), id: "missing" }],
+        indexFile,
+        secretFile,
+        contractVersion: CONTRACT,
+      }),
+      (error) => error?.code === "local_unified_index_roots_unavailable",
+    );
+    await assert.rejects(
+      ingestLocalUnifiedIndexIncrement({
+        codexHomes: [{ path: join(base, "missing"), id: "missing" }],
+        indexFile,
+        secretFile,
+        contractVersion: CONTRACT,
+      }),
+      (error) => error?.code === "local_unified_index_roots_unavailable",
+    );
+    await assert.rejects(lstat(indexFile), (error) => error?.code === "ENOENT");
+    await assert.rejects(lstat(secretFile), (error) => error?.code === "ENOENT");
+  } finally {
+    await rm(base, { recursive: true });
+  }
+});
+
+test("root-local discovery ceilings preserve LKG and refuse a fresh empty publication", async () => {
+  assert.deepEqual(LOCAL_UNIFIED_INDEX_DISCOVERY_LIMITS, {
+    maximumDirectoryEntries: 500_000,
+    maximumRolloutFiles: 125_000,
+  });
+  const base = await mkdtemp(join(tmpdir(), "unified-multi-limited-root-"));
+  const root = join(base, "codex");
+  const sessions = join(root, "sessions");
+  const indexFile = join(base, "index.sqlite");
+  const secretFile = join(base, "salt");
+  const limits = {
+    maximumDirectoryEntries: 10,
+    maximumRolloutFiles: 1,
+  };
+  try {
+    await mkdir(sessions, { recursive: true });
+    await writeFile(
+      join(sessions, "rollout-2026-07-25T00-00-00-limit-a.jsonl"),
+      `${[
+        sessionMeta("10000000-0000-4000-8000-000000000021"),
+        turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+        tokenCount(
+          "2026-07-25T00:00:01.000Z",
+          usage(100, 10),
+          usage(100, 10),
+        ),
+      ].join("\n")}\n`,
+    );
+    await writeFile(
+      join(sessions, "rollout-2026-07-25T00-01-00-limit-b.jsonl"),
+      `${[
+        sessionMeta("10000000-0000-4000-8000-000000000022"),
+        turnContext("2026-07-25T00:01:00.000Z", "gpt-5.6-sol"),
+        tokenCount(
+          "2026-07-25T00:01:01.000Z",
+          usage(200, 20),
+          usage(200, 20),
+        ),
+      ].join("\n")}\n`,
+    );
+
+    const freshIndex = join(base, "fresh-index.sqlite");
+    const freshSecret = join(base, "fresh-salt");
+    await assert.rejects(
+      ingestLocalUnifiedIndexIncrement({
+        codexHome: root,
+        indexFile: freshIndex,
+        secretFile: freshSecret,
+        contractVersion: CONTRACT,
+        discoveryLimits: limits,
+      }),
+      (error) => error?.code === "local_unified_index_roots_unavailable",
+    );
+    await assert.rejects(lstat(freshIndex), (error) => error?.code === "ENOENT");
+    await assert.rejects(lstat(freshSecret), (error) => error?.code === "ENOENT");
+
+    const initial = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile,
+      contractVersion: CONTRACT,
+    });
+    assert.equal(initial.totalUsageEvents, 2);
+    const before = await stat(indexFile);
+    const retained = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile,
+      contractVersion: CONTRACT,
+      discoveryLimits: limits,
+    });
+    const after = await stat(indexFile);
+    assert.equal(retained.unchanged, true);
+    assert.equal(retained.totalUsageEvents, 2);
+    assert.equal(retained.rootCoverage.status, "partial");
+    assert.equal(retained.rootCoverage.retainedHistory, true);
+    assert.equal(retained.rootCoverage.unavailableOwnerSources, 2);
+    assert.equal(after.mtimeMs, before.mtimeMs);
+  } finally {
+    await rm(base, { recursive: true });
+  }
+});
+
+test("a child uses exactly one retained cross-root parent for lineage seed and replay proof", async () => {
+  const base = await mkdtemp(join(tmpdir(), "unified-multi-lineage-"));
+  const rootA = join(base, "root-a");
+  const rootB = join(base, "root-b");
+  const sessionsA = join(rootA, "sessions");
+  const sessionsB = join(rootB, "sessions");
+  const indexFile = join(base, "index.sqlite");
+  const parentId = "99999999-9999-4999-8999-999999999999";
+  const parentName = "rollout-2026-07-25T00-00-00-parent.jsonl";
+  const firstName = "rollout-2026-07-25T01-00-00-first.jsonl";
+  const secondName = "rollout-2026-07-25T02-00-00-second.jsonl";
+  const forkLines = (sessionId, hour) => [
+    sessionMeta(sessionId, { parentId, threadSource: "subagent" }),
+    // Replayed parent snapshot, then one child-owned cumulative advance.
+    tokenCount(`2026-07-25T0${hour}:00:00.000Z`, usage(100, 10), usage(100, 10)),
+    turnContext(`2026-07-25T0${hour}:00:00.500Z`, undefined),
+    tokenCount(`2026-07-25T0${hour}:00:01.000Z`, usage(200, 20), usage(100, 10)),
+  ];
+  const configured = [
+    { path: rootA, id: "lineage-a" },
+    { path: rootB, id: "lineage-b" },
+  ];
+  const ingest = () => ingestLocalUnifiedIndexIncrement({
+    codexHomes: configured,
+    indexFile,
+    secretFile: join(base, "salt"),
+    contractVersion: CONTRACT,
+  });
+  try {
+    await mkdir(sessionsA, { recursive: true });
+    await mkdir(sessionsB, { recursive: true });
+    await writeFile(join(sessionsA, parentName), `${[
+      sessionMeta(parentId),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      threadSettings("2026-07-25T00:00:00.500Z", "priority"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ].join("\n")}\n`);
+    await writeFile(join(sessionsB, firstName), `${forkLines(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      1,
+    ).join("\n")}\n`);
+    const initial = await ingest();
+    assert.equal(initial.totalUsageEvents, 2);
+    {
+      const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+      try {
+        assert.equal(Number(database.prepare(`
+          SELECT snapshots_persisted AS persisted FROM source_cursor
+          WHERE carry_tier_raw = 'priority'`).get().persisted), 1);
+      } finally {
+        database.close();
+      }
+    }
+
+    await rm(rootA, { recursive: true });
+    await writeFile(join(sessionsB, secondName), `${forkLines(
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      2,
+    ).join("\n")}\n`);
+    const advanced = await ingest();
+    assert.equal(advanced.rootCoverage.status, "partial");
+    assert.equal(advanced.rootCoverage.retainedHistory, true);
+    assert.equal(advanced.rootCoverage.unavailableOwnerSources, 1);
+    assert.equal(advanced.sourcesRescanned, 1);
+    assert.equal(advanced.forkReplayEventsSkipped, 1);
+    assert.ok(advanced.lineageSnapshotLookups > 0);
+    assert.equal(advanced.totalUsageEvents, 3);
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.deepEqual(tierRows(database), [
+        { model: "gpt-5.6-sol", speed: "fast", source: "rollout_thread_settings", raw: "priority" },
+        { model: "gpt-5.6-sol", speed: "fast", source: "lineage_inherited", raw: "priority" },
+        { model: "gpt-5.6-sol", speed: "fast", source: "lineage_inherited", raw: "priority" },
+      ]);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(base, { recursive: true });
   }
 });

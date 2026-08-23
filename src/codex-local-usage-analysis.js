@@ -26,6 +26,7 @@ export async function scanAndPriceCodexLogs({
   endAt,
   offline = false,
   codexHome,
+  codexHomes,
   priceCards = null,
   excludeSessionIds = [],
 }) {
@@ -154,6 +155,7 @@ export async function scanAndPriceCodexLogs({
     startAt,
     endAt,
     codexHome,
+    codexHomes,
     onUsage,
     onToolCall: onProviderToolObservation,
     excludeSessionIds,

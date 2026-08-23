@@ -14,6 +14,7 @@ export function createCodexLogIngestion({
     startAt,
     endAt,
     codexHome,
+    codexHomes,
     onUsage = () => {},
     onRateLimitSnapshot,
     onToolCall,
@@ -42,6 +43,7 @@ export function createCodexLogIngestion({
     throwIfAborted(signal);
     const rolloutInfos = suppliedRolloutInfos ?? await sources.discoverCodexRolloutInfos({
       codexHome,
+      codexHomes,
       startAt: new Date(Math.min(startMs, activeCutoffMs)).toISOString(),
       endAt,
       resourceGuard,

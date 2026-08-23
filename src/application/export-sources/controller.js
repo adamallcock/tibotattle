@@ -261,6 +261,7 @@ async function createLocalExportWorkspaceUnlocked({
   startAt,
   endAt,
   codexHome,
+  codexHomes,
   secret,
   activityMarkers = [],
   createdAt = new Date().toISOString(),
@@ -373,6 +374,7 @@ async function createLocalExportWorkspaceUnlocked({
     const supplementalSummary = summarizeSupplementalSourcePlan(effectiveSupplementalSourcePlan);
     sourcePlan = await createCodexExportSourcePlan({
       codexHome,
+      codexHomes,
       startAt: bounds.startAt,
       endAt: bounds.endAt,
       resourceGuard: supplementalSummary.sourceCount === 0
@@ -458,6 +460,7 @@ async function createLocalExportWorkspaceUnlocked({
 async function resumeLocalExportWorkspaceUnlocked({
   directory,
   codexHome,
+  codexHomes,
   secret,
   activityMarkers = [],
   resourceLimits = {},
@@ -533,7 +536,11 @@ async function resumeLocalExportWorkspaceUnlocked({
     resourceGuard.assertCoveredInterval(Date.parse(storedPlan.startAt), Date.parse(storedPlan.endAt));
     let sourcePlan;
     try {
-      sourcePlan = await resolveCodexExportSourcePlan(storedPlan, { codexHome, resourceGuard });
+      sourcePlan = await resolveCodexExportSourcePlan(storedPlan, {
+        codexHome,
+        codexHomes,
+        resourceGuard,
+      });
     } catch (error) {
       if (error instanceof ExportSourcePlanError) workspace.markPoisoned("source_integrity");
       throw error;
@@ -622,7 +629,7 @@ async function createLocalExportWorkspace(options = {}) {
   if (!options.directory) throw new Error("Export workspace directory is required");
   if (options.sourcePlanBundle !== null && options.sourcePlanBundle !== undefined) {
     const discoveryKeys = [
-      "codexHome", "supplementalSourcePlan", "collectorPath", "enableCollector", "enableCodexCollector",
+      "codexHome", "codexHomes", "supplementalSourcePlan", "collectorPath", "enableCollector", "enableCodexCollector",
       "claudeStateDirectory", "enableClaudeStatus", "enableClaudeStatusline",
       "claudeProjectsDirectory", "enableClaudeUsage", "enableClaudeTranscripts",
     ];

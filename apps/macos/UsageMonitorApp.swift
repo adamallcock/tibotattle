@@ -76,8 +76,14 @@ private enum BundledProduct {
 private let loopbackHost = "127.0.0.1"
 private let readyLinePattern =
     #"^USAGE_MONITOR_READY http://127\.0\.0\.1:([0-9]{1,5})/$"#
-private let launcherSettingsSchema = "usage-monitor-launcher-settings-v1"
+private let launcherSettingsSchema = "usage-monitor-launcher-settings-v2"
+private let legacyLauncherSettingsSchema = "usage-monitor-launcher-settings-v1"
 private let launcherSettingsFileName = "launcher-settings-v1.json"
+private let maximumCodexActivityRoots = 8
+private let maximumLauncherSettingsBytes: off_t = 65_536
+private let defaultCodexActivityRootID = UUID(
+    uuidString: "00000000-0000-4000-8000-000000000001"
+)!
 private let firstRunReceiptSchema = "usage-monitor-first-run-v1"
 private let firstRunReceiptFileName = "first-run-v1.json"
 private let keychainResetHelperName = "reset-local-keychain.js"
@@ -1014,14 +1020,123 @@ private enum CodexHomeMode: String {
     case defaultLocation = "default"
 }
 
-private struct CodexHomeConfiguration {
-    let mode: CodexHomeMode
+/// Serializes Settings-driven companion replacement without retaining any
+/// filesystem details. A request received while the old process is stopping
+/// is already represented by the latest in-memory configuration. A request
+/// received after the replacement starts is remembered and earns exactly one
+/// more stop/start cycle after that process reaches a terminal state.
+private struct CodexHomeRestartGate {
+    enum Action: Equatable {
+        case none
+        case stopCurrent
+        case startLatest
+        case complete
+    }
+
+    private enum Phase: Equatable {
+        case idle
+        case stopping
+        case starting
+    }
+
+    private var phase: Phase = .idle
+    private var restartRequestedWhileStarting = false
+
+    var isInFlight: Bool {
+        phase != .idle
+    }
+
+    mutating func requestRestart() -> Action {
+        switch phase {
+        case .idle:
+            phase = .stopping
+            return .stopCurrent
+        case .stopping:
+            // The next start reads the latest configuration, so repeated
+            // accepted changes coalesce without launching an interim child.
+            return .none
+        case .starting:
+            restartRequestedWhileStarting = true
+            return .none
+        }
+    }
+
+    mutating func companionStopped() -> Action {
+        guard phase == .stopping else { return .none }
+        phase = .starting
+        return .startLatest
+    }
+
+    mutating func companionReachedTerminalState() -> Action {
+        guard phase == .starting else { return .none }
+        if restartRequestedWhileStarting {
+            restartRequestedWhileStarting = false
+            phase = .stopping
+            return .stopCurrent
+        }
+        phase = .idle
+        return .complete
+    }
+
+    mutating func cancel() {
+        phase = .idle
+        restartRequestedWhileStarting = false
+    }
+}
+
+/// Resolves the one companion process the application still owns while
+/// terminating. During a Settings restart, ownership has already moved out of
+/// `companion` and into `stoppingCompanion`; choosing that slot first prevents
+/// Quit from abandoning the child and its stop-completion queue.
+private func companionToAwaitOnTermination(
+    active: CompanionProcess?,
+    stopping: CompanionProcess?
+) -> CompanionProcess? {
+    stopping ?? active
+}
+
+private struct CodexActivityRoot: Equatable {
+    let id: UUID
     let url: URL
+}
+
+private struct CodexHomeConfiguration: Equatable {
+    let roots: [CodexActivityRoot]
+    let primaryRootID: UUID
+
+    var primaryRoot: CodexActivityRoot? {
+        roots.first { $0.id == primaryRootID }
+    }
+
+    var url: URL {
+        // Construction and decoding validate this invariant before a
+        // configuration can reach the launcher. Keep the fallback bounded for
+        // diagnostics-only callers if a future internal change violates it.
+        primaryRoot?.url ?? roots[0].url
+    }
+
+    var mode: CodexHomeMode {
+        roots.count == 1 && roots[0].id == defaultCodexActivityRootID
+            ? .defaultLocation
+            : .custom
+    }
+}
+
+private struct LegacyLauncherSettings: Codable {
+    let schemaVersion: String
+    let codexHome: String
+}
+
+private struct LauncherActivityRoot: Codable {
+    let rootId: UUID
+    let path: String
+    let enabled: Bool
 }
 
 private struct LauncherSettings: Codable {
     let schemaVersion: String
-    let codexHome: String
+    let activityRoots: [LauncherActivityRoot]
+    let primaryRootId: UUID
 }
 
 private struct FirstRunReceipt: Codable {
@@ -1248,6 +1363,17 @@ private func defaultCodexHome() throws -> URL {
         .appendingPathComponent(".codex", isDirectory: true)
 }
 
+private func defaultCodexHomeConfiguration() throws -> CodexHomeConfiguration {
+    let root = CodexActivityRoot(
+        id: defaultCodexActivityRootID,
+        url: try defaultCodexHome()
+    )
+    return CodexHomeConfiguration(
+        roots: [root],
+        primaryRootID: root.id
+    )
+}
+
 private func validatedCustomCodexHome(_ candidate: URL) throws -> URL {
     let inputPath = candidate.path
     guard candidate.isFileURL,
@@ -1282,6 +1408,90 @@ private func validatedCustomCodexHome(_ candidate: URL) throws -> URL {
     return selected
 }
 
+private func validatedUnavailablePersistedCodexHome(
+    _ candidate: URL
+) throws -> URL {
+    let inputPath = candidate.path
+    guard candidate.isFileURL,
+          inputPath.hasPrefix("/"),
+          inputPath != "/",
+          !inputPath.contains("\0"),
+          inputPath.utf8.count <= 4_096,
+          URL(
+              fileURLWithPath: inputPath,
+              isDirectory: true
+          ).standardizedFileURL.path == inputPath
+    else {
+        throw LauncherError.invalidCodexHome
+    }
+
+    var finalMetadata = stat()
+    let finalStatus = inputPath.withCString { path in
+        lstat(path, &finalMetadata)
+    }
+    guard finalStatus != 0, errno == ENOENT else {
+        // Existing paths never use this tolerance: they must continue to pass
+        // the full canonical-directory, owner, and access validation above.
+        throw LauncherError.invalidCodexHome
+    }
+
+    var existingPrefix = "/"
+    let components = inputPath.split(
+        separator: "/",
+        omittingEmptySubsequences: true
+    )
+    for component in components {
+        if existingPrefix != "/" {
+            existingPrefix += "/"
+        }
+        existingPrefix += String(component)
+        var metadata = stat()
+        let status = existingPrefix.withCString { path in
+            lstat(path, &metadata)
+        }
+        if status != 0 {
+            guard errno == ENOENT else {
+                throw LauncherError.invalidCodexHome
+            }
+            // From the first absent component onward this is a temporarily
+            // unavailable stored spelling, not a newly trusted filesystem
+            // object. The owner-only settings file remains its authority.
+            break
+        }
+        guard (metadata.st_mode & S_IFMT) != S_IFLNK,
+              (metadata.st_mode & S_IFMT) == S_IFDIR
+        else {
+            throw LauncherError.invalidCodexHome
+        }
+    }
+    return URL(fileURLWithPath: inputPath, isDirectory: true)
+}
+
+/// Native Settings may disclose the selected paths back to their owner and
+/// can therefore pair each one with a local reachability result. This value is
+/// deliberately not part of diagnostics or the loopback API. "Ready" means
+/// the existing directory passes the same canonical-path, owner, type, and
+/// read/execute checks as a newly accepted folder. Only a safely spelled,
+/// absent persisted path is considered temporarily unavailable; every other
+/// validation failure is invalid or unsafe.
+private enum CodexActivityRootReachability: String, Equatable {
+    case ready
+    case temporarilyUnavailable = "temporarily_unavailable"
+    case invalid
+}
+
+private func codexActivityRootReachability(
+    _ root: CodexActivityRoot
+) -> CodexActivityRootReachability {
+    if (try? validatedCustomCodexHome(root.url)) != nil {
+        return .ready
+    }
+    if (try? validatedUnavailablePersistedCodexHome(root.url)) != nil {
+        return .temporarilyUnavailable
+    }
+    return .invalid
+}
+
 private func launcherSettingsFile(in stateRoot: URL) -> URL {
     stateRoot.appendingPathComponent(
         launcherSettingsFileName,
@@ -1307,47 +1517,109 @@ private func validateSettingsFile(
           metadata.st_nlink == 1,
           (metadata.st_mode & 0o077) == 0,
           !requireValidContentSize
-            || (metadata.st_size > 0 && metadata.st_size <= 8_192)
+            || (metadata.st_size > 0
+                && metadata.st_size <= maximumLauncherSettingsBytes)
     else {
         throw LauncherError.invalidCodexHomeSettings
     }
     return true
 }
 
-private func loadCodexHomeConfiguration(
-    stateRoot: URL
-) throws -> CodexHomeConfiguration {
-    let settingsFile = launcherSettingsFile(in: stateRoot)
-    guard try validateSettingsFile(settingsFile) else {
-        return CodexHomeConfiguration(
-            mode: .defaultLocation,
-            url: try defaultCodexHome()
-        )
-    }
-    do {
-        let settings = try JSONDecoder().decode(
-            LauncherSettings.self,
-            from: Data(contentsOf: settingsFile, options: [.mappedIfSafe])
-        )
-        guard settings.schemaVersion == launcherSettingsSchema else {
-            throw LauncherError.invalidCodexHomeSettings
-        }
-        let selected = try validatedCustomCodexHome(
-            URL(fileURLWithPath: settings.codexHome, isDirectory: true)
-        )
-        return CodexHomeConfiguration(mode: .custom, url: selected)
-    } catch let error as LauncherError {
-        throw error
-    } catch {
+private func launcherSettingsDocumentSchema(_ data: Data) throws -> String {
+    guard let object = try? JSONSerialization.jsonObject(with: data)
+            as? [String: Any],
+          let schema = object["schemaVersion"] as? String
+    else {
         throw LauncherError.invalidCodexHomeSettings
     }
+    switch schema {
+    case launcherSettingsSchema:
+        guard Set(object.keys) == [
+                  "schemaVersion", "activityRoots", "primaryRootId",
+              ],
+              object["primaryRootId"] is String,
+              let roots = object["activityRoots"] as? [[String: Any]],
+              roots.allSatisfy({ root in
+                  Set(root.keys) == ["rootId", "path", "enabled"]
+                      && root["rootId"] is String
+                      && root["path"] is String
+                      && root["enabled"] is Bool
+              })
+        else {
+            throw LauncherError.invalidCodexHomeSettings
+        }
+    case legacyLauncherSettingsSchema:
+        guard Set(object.keys) == ["schemaVersion", "codexHome"],
+              object["codexHome"] is String
+        else {
+            throw LauncherError.invalidCodexHomeSettings
+        }
+    default:
+        throw LauncherError.invalidCodexHomeSettings
+    }
+    return schema
 }
 
-private func saveCodexHomeConfiguration(
-    _ selected: URL,
-    stateRoot: URL
+private func validatedCodexHomeConfiguration(
+    _ configuration: CodexHomeConfiguration,
+    unavailableAllowedRootIDs: Set<UUID> = []
 ) throws -> CodexHomeConfiguration {
-    let validated = try validatedCustomCodexHome(selected)
+    guard (1...maximumCodexActivityRoots).contains(configuration.roots.count),
+          Set(configuration.roots.map(\.id)).count == configuration.roots.count,
+          configuration.roots.contains(where: {
+              $0.id == configuration.primaryRootID
+          })
+    else {
+        throw LauncherError.invalidCodexHome
+    }
+
+    let defaultHome = try defaultCodexHome()
+    var paths = Set<String>()
+    var validatedRoots: [CodexActivityRoot] = []
+    validatedRoots.reserveCapacity(configuration.roots.count)
+    for root in configuration.roots {
+        if root.id == defaultCodexActivityRootID {
+            guard root.url.path == defaultHome.path else {
+                throw LauncherError.invalidCodexHome
+            }
+        }
+        let validatedURL: URL
+        do {
+            validatedURL = try validatedCustomCodexHome(root.url)
+        } catch {
+            guard unavailableAllowedRootIDs.contains(root.id) else {
+                throw error
+            }
+            // This also covers an absent historical ~/.codex after it has
+            // become part of a persisted plural configuration. If it exists,
+            // it must pass the same symlink, owner, type, and access checks as
+            // every explicitly selected root.
+            validatedURL = try validatedUnavailablePersistedCodexHome(
+                root.url
+            )
+        }
+        guard paths.insert(validatedURL.path).inserted else {
+            throw LauncherError.invalidCodexHome
+        }
+        validatedRoots.append(
+            CodexActivityRoot(id: root.id, url: validatedURL)
+        )
+    }
+    return CodexHomeConfiguration(
+        roots: validatedRoots,
+        primaryRootID: configuration.primaryRootID
+    )
+}
+
+private func writeCodexHomeConfiguration(
+    _ configuration: CodexHomeConfiguration,
+    stateRoot: URL,
+    unavailableAllowedRootIDs: Set<UUID> = []
+) throws -> CodexHomeConfiguration {
+    let validated = try validatedCodexHomeConfiguration(
+        configuration,
+        unavailableAllowedRootIDs: unavailableAllowedRootIDs
+    )
     let settingsFile = launcherSettingsFile(in: stateRoot)
     _ = try validateSettingsFile(
         settingsFile,
@@ -1355,13 +1627,23 @@ private func saveCodexHomeConfiguration(
     )
     let settings = LauncherSettings(
         schemaVersion: launcherSettingsSchema,
-        codexHome: validated.path
+        activityRoots: validated.roots.map { root in
+            LauncherActivityRoot(
+                rootId: root.id,
+                path: root.url.path,
+                enabled: true
+            )
+        },
+        primaryRootId: validated.primaryRootID
     )
     do {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         var bytes = try encoder.encode(settings)
         bytes.append(0x0a)
+        guard bytes.count <= maximumLauncherSettingsBytes else {
+            throw LauncherError.codexHomeSettingsWrite
+        }
         try bytes.write(to: settingsFile, options: [.atomic])
         guard chmod(settingsFile.path, 0o600) == 0,
               try validateSettingsFile(settingsFile)
@@ -1373,7 +1655,162 @@ private func saveCodexHomeConfiguration(
     } catch {
         throw LauncherError.codexHomeSettingsWrite
     }
-    return CodexHomeConfiguration(mode: .custom, url: validated)
+    return validated
+}
+
+private func loadCodexHomeConfiguration(
+    stateRoot: URL
+) throws -> CodexHomeConfiguration {
+    let settingsFile = launcherSettingsFile(in: stateRoot)
+    guard try validateSettingsFile(settingsFile) else {
+        return try defaultCodexHomeConfiguration()
+    }
+    let data: Data
+    do {
+        data = try Data(contentsOf: settingsFile, options: [.mappedIfSafe])
+    } catch {
+        throw LauncherError.invalidCodexHomeSettings
+    }
+    let schema = try launcherSettingsDocumentSchema(data)
+    do {
+        if schema == launcherSettingsSchema {
+            let settings = try JSONDecoder().decode(
+                LauncherSettings.self,
+                from: data
+            )
+            guard settings.activityRoots.allSatisfy({ root in
+                root.enabled
+                    && URL(
+                        fileURLWithPath: root.path,
+                        isDirectory: true
+                    ).path == root.path
+            }) else {
+                throw LauncherError.invalidCodexHomeSettings
+            }
+            return try validatedCodexHomeConfiguration(
+                CodexHomeConfiguration(
+                    roots: settings.activityRoots.map { root in
+                        CodexActivityRoot(
+                            id: root.rootId,
+                            url: URL(
+                                fileURLWithPath: root.path,
+                                isDirectory: true
+                            )
+                        )
+                    },
+                    primaryRootID: settings.primaryRootId
+                ),
+                unavailableAllowedRootIDs: Set(
+                    settings.activityRoots.map(\.rootId)
+                )
+            )
+        }
+        let settings = try JSONDecoder().decode(
+            LegacyLauncherSettings.self,
+            from: data
+        )
+        let migratedRoot = CodexActivityRoot(
+            id: UUID(),
+            url: URL(
+                fileURLWithPath: settings.codexHome,
+                isDirectory: true
+            )
+        )
+        let migrated = CodexHomeConfiguration(
+            roots: [migratedRoot],
+            primaryRootID: migratedRoot.id
+        )
+        return try writeCodexHomeConfiguration(
+            migrated,
+            stateRoot: stateRoot,
+            unavailableAllowedRootIDs: [migratedRoot.id]
+        )
+    } catch LauncherError.codexHomeSettingsWrite {
+        throw LauncherError.codexHomeSettingsWrite
+    } catch {
+        throw LauncherError.invalidCodexHomeSettings
+    }
+}
+
+private func saveCodexHomeConfiguration(
+    _ selected: URL,
+    stateRoot: URL
+) throws -> CodexHomeConfiguration {
+    let validated = try validatedCustomCodexHome(selected)
+    let root = CodexActivityRoot(id: UUID(), url: validated)
+    return try writeCodexHomeConfiguration(
+        CodexHomeConfiguration(
+            roots: [root],
+            primaryRootID: root.id
+        ),
+        stateRoot: stateRoot
+    )
+}
+
+private func addCodexHome(
+    _ selected: URL,
+    to configuration: CodexHomeConfiguration,
+    stateRoot: URL
+) throws -> CodexHomeConfiguration {
+    guard configuration.roots.count < maximumCodexActivityRoots else {
+        throw LauncherError.invalidCodexHome
+    }
+    let validated = try validatedCustomCodexHome(selected)
+    guard !configuration.roots.contains(where: {
+        $0.url.path == validated.path
+    }) else {
+        throw LauncherError.invalidCodexHome
+    }
+    return try writeCodexHomeConfiguration(
+        CodexHomeConfiguration(
+            roots: configuration.roots + [
+                CodexActivityRoot(id: UUID(), url: validated),
+            ],
+            primaryRootID: configuration.primaryRootID
+        ),
+        stateRoot: stateRoot,
+        unavailableAllowedRootIDs: Set(configuration.roots.map(\.id))
+    )
+}
+
+private func selectPrimaryCodexHome(
+    _ rootID: UUID,
+    in configuration: CodexHomeConfiguration,
+    stateRoot: URL
+) throws -> CodexHomeConfiguration {
+    guard configuration.roots.contains(where: { $0.id == rootID }) else {
+        throw LauncherError.invalidCodexHome
+    }
+    return try writeCodexHomeConfiguration(
+        CodexHomeConfiguration(
+            roots: configuration.roots,
+            primaryRootID: rootID
+        ),
+        stateRoot: stateRoot,
+        unavailableAllowedRootIDs: Set(configuration.roots.map(\.id))
+    )
+}
+
+private func removeCodexHome(
+    _ rootID: UUID,
+    from configuration: CodexHomeConfiguration,
+    stateRoot: URL
+) throws -> CodexHomeConfiguration {
+    guard configuration.roots.count > 1,
+          configuration.roots.contains(where: { $0.id == rootID }),
+          configuration.primaryRootID != rootID
+    else {
+        throw LauncherError.invalidCodexHome
+    }
+    let remaining = configuration.roots.filter { $0.id != rootID }
+    return try writeCodexHomeConfiguration(
+        CodexHomeConfiguration(
+            roots: remaining,
+            primaryRootID: configuration.primaryRootID
+        ),
+        stateRoot: stateRoot,
+        unavailableAllowedRootIDs: Set(configuration.roots.map(\.id))
+    )
 }
 
 private func clearCodexHomeConfiguration(
@@ -1384,20 +1821,14 @@ private func clearCodexHomeConfiguration(
         settingsFile,
         requireValidContentSize: false
     ) else {
-        return CodexHomeConfiguration(
-            mode: .defaultLocation,
-            url: try defaultCodexHome()
-        )
+        return try defaultCodexHomeConfiguration()
     }
     do {
         try FileManager.default.removeItem(at: settingsFile)
     } catch {
         throw LauncherError.codexHomeSettingsWrite
     }
-    return CodexHomeConfiguration(
-        mode: .defaultLocation,
-        url: try defaultCodexHome()
-    )
+    return try defaultCodexHomeConfiguration()
 }
 
 private func firstRunReceiptFile(in stateRoot: URL) -> URL {
@@ -1570,9 +2001,23 @@ private struct CompanionResources {
     }
 }
 
+private func codexHomeLaunchArguments(
+    _ configuration: CodexHomeConfiguration
+) -> [String] {
+    var arguments: [String] = []
+    arguments.reserveCapacity((configuration.roots.count * 2) + 2)
+    for root in configuration.roots {
+        arguments.append("--codex-home")
+        arguments.append(root.url.path)
+    }
+    arguments.append("--primary-codex-home")
+    arguments.append(configuration.url.path)
+    return arguments
+}
+
 private final class CompanionProcess {
     private let centralService: CentralServiceConfiguration?
-    private let codexHome: URL
+    private let codexHomeConfiguration: CodexHomeConfiguration
     private let lock = NSLock()
     private var pendingOutput = ""
     private var pendingStandardError = ""
@@ -1587,13 +2032,13 @@ private final class CompanionProcess {
 
     init(
         centralService: CentralServiceConfiguration?,
-        codexHome: URL,
+        codexHomeConfiguration: CodexHomeConfiguration,
         nodeRuntimeModeOverride: BundledNodeRuntimeMode? = nil,
         onReady: @escaping (URL) -> Void,
         onExit: @escaping (Bool, Bool) -> Void
     ) {
         self.centralService = centralService
-        self.codexHome = codexHome
+        self.codexHomeConfiguration = codexHomeConfiguration
         self.nodeRuntimeModeOverride = nodeRuntimeModeOverride
         self.onReady = onReady
         self.onExit = onExit
@@ -1623,7 +2068,10 @@ private final class CompanionProcess {
         child.executableURL = resources.node
         child.arguments = (
             nodeRuntimeModeOverride ?? resources.nodeRuntimeMode
-        ).arguments(entrypoint: resources.entrypoint)
+        ).arguments(
+            entrypoint: resources.entrypoint,
+            trailing: codexHomeLaunchArguments(codexHomeConfiguration)
+        )
         child.currentDirectoryURL = resources.resourceRoot
         // The companion's standard input is the app's Keychain broker
         // channel: fresh contribution-device credentials are minted and read
@@ -1648,7 +2096,10 @@ private final class CompanionProcess {
             "USAGE_MONITOR_PORT": "0",
             "USAGE_MONITOR_RESOURCE_ROOT": resources.resourceRoot.path,
             "USAGE_MONITOR_STATE_ROOT": stateRoot.path,
-            "CODEX_HOME": codexHome.path,
+            // Compatibility lane for collectors that still read one scalar
+            // CODEX_HOME. The complete ordered root set travels only through
+            // repeated argv flags; this value is exactly the selected primary.
+            "CODEX_HOME": codexHomeConfiguration.url.path,
         ]
         if broker?.childEndpoint != nil {
             environment[
@@ -3266,7 +3717,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private var centralService: CentralServiceConfiguration?
     private var centralServiceMode: CentralServiceMode?
     private var codexHomeConfiguration: CodexHomeConfiguration?
+    private var codexHomeRestartGate = CodexHomeRestartGate()
     private var companion: CompanionProcess?
+    /// Keeps a deliberately stopped child alive until its termination handler
+    /// delivers the restart completion. `CompanionProcess` owns the Process
+    /// and its completion queue, so clearing `companion` without this handoff
+    /// can deallocate both before the replacement launch is scheduled.
+    private var stoppingCompanion: CompanionProcess?
     private var dashboardURL: URL?
     private var firstRunAcknowledged = false
     private var keychainResetProcess: Process?
@@ -3288,6 +3745,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private var settingsTabs: NSTabViewController?
     private var settingsPages: [SettingsPage] = []
     private weak var settingsCodexHomeLabel: NSTextField?
+    private weak var settingsAddCodexHomeButton: NSButton?
+    private weak var settingsRemoveCodexHomeButton: NSButton?
+    private weak var settingsSetPrimaryCodexHomeButton: NSButton?
+    private weak var settingsUseDefaultCodexHomeButton: NSButton?
     private weak var settingsAutomaticUpdatesSwitch: NSSwitch?
     private weak var settingsAboutAutomaticUpdatesDetailLabel: NSTextField?
     private weak var settingsCheckForUpdatesButton: NSButton?
@@ -3371,11 +3832,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         title: TiboTattleLocalization.string(.launcherDataDiagnostics),
         target: self,
         action: #selector(showDiagnostics)
-    )
-    private lazy var codexHomeButton = NSButton(
-        title: TiboTattleLocalization.string(.settingsChooseCodexFolder),
-        target: self,
-        action: #selector(showCodexHomeOptions)
     )
     private lazy var openInBrowserButton = NSButton(
         title: TiboTattleLocalization.string(.launcherOpenInBrowser),
@@ -3475,6 +3931,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         // changes. Refresh when the person returns so the Settings switch is
         // not a stale cached preference.
         updateStartAtLoginSettingsControl()
+        // A selected external volume or restored folder may have changed
+        // reachability while the app was inactive. Reclassify only in native
+        // Settings; diagnostics and loopback responses remain path-free.
+        updateSettingsCodexHomeSummary()
         // Read-only resynchronization after a user changes notification
         // permission in System Settings. This path cannot prompt by itself.
         quotaNotificationCoordinator?.refreshAuthorization()
@@ -3608,7 +4068,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         menuBarStatus?.companionStarting()
         let process = CompanionProcess(
             centralService: centralService,
-            codexHome: codexHomeConfiguration.url,
+            codexHomeConfiguration: codexHomeConfiguration,
             onReady: { [weak self] url in
                 DispatchQueue.main.async {
                     self?.companionReady(
@@ -3684,7 +4144,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         for button in [
             settingsButton,
             diagnosticsButton,
-            codexHomeButton,
             quitButton,
         ] {
             button.bezelStyle = NSButton.BezelStyle.rounded
@@ -4914,6 +5373,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func companionReady(_ url: URL, generation: Int) {
         guard generation == launchGeneration else { return }
+        if codexHomeRestartTerminalEventRequiresAnotherRestart() {
+            return
+        }
         startupTimeout?.cancel()
         startupTimeout = nil
         guard url.host == loopbackHost, url.scheme == "http" else {
@@ -4988,6 +5450,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func showFailure(_ error: Error) {
+        if codexHomeRestartTerminalEventRequiresAnotherRestart() {
+            return
+        }
         startupTimeout?.cancel()
         startupTimeout = nil
         dashboardURL = nil
@@ -5052,7 +5517,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     @objc private func retryCompanion() {
-        guard !quitting, retryAllowed, firstRunAcknowledged else { return }
+        guard !quitting, retryAllowed, firstRunAcknowledged,
+              !codexHomeRestartGate.isInFlight
+        else { return }
         automaticCompanionRecoveryUsed = false
         if let previous = companion, previous.isRunning {
             retryButton.isEnabled = false
@@ -5183,23 +5650,51 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func codexHomeSettingsSummary() -> String {
-        guard let configuration = codexHomeConfiguration,
-              configuration.mode == .custom
-        else {
+        guard let configuration = codexHomeConfiguration else {
             return TiboTattleLocalization.string(
                 .settingsCodexFolderDefaultLocation
             )
         }
-        // The Settings label may name the folder; Data & Diagnostics keeps
-        // its paths_included: false promise and never carries this value.
-        return TiboTattleLocalization.format(
-            .settingsCodexFolderCustomSelectedPath,
-            (configuration.url.path as NSString).abbreviatingWithTildeInPath
-        )
+        // Settings may name every explicit root. Data & Diagnostics keeps its
+        // paths_included/identifiers_included promises and carries neither
+        // these paths nor their stable local root IDs.
+        return configuration.roots.map { root in
+            let pathKey: TiboTattleLocalization.Key =
+                root.id == configuration.primaryRootID
+                ? .settingsCodexFolderPrimarySelectedPath
+                : .settingsCodexFolderActivitySelectedPath
+            let reachabilityKey: TiboTattleLocalization.Key
+            switch codexActivityRootReachability(root) {
+            case .ready:
+                reachabilityKey = .settingsCodexFolderStatusReady
+            case .temporarilyUnavailable:
+                reachabilityKey =
+                    .settingsCodexFolderStatusTemporarilyUnavailable
+            case .invalid:
+                reachabilityKey = .settingsCodexFolderStatusInvalid
+            }
+            return TiboTattleLocalization.format(
+                .settingsCodexFolderPathWithStatus,
+                TiboTattleLocalization.format(
+                    pathKey,
+                    (root.url.path as NSString).abbreviatingWithTildeInPath
+                ),
+                TiboTattleLocalization.string(reachabilityKey)
+            )
+        }.joined(separator: "\n")
     }
 
     private func updateSettingsCodexHomeSummary() {
         settingsCodexHomeLabel?.stringValue = codexHomeSettingsSummary()
+        let rootCount = codexHomeConfiguration?.roots.count ?? 0
+        let controlsEnabled = !codexHomeRestartGate.isInFlight
+        settingsAddCodexHomeButton?.isEnabled =
+            controlsEnabled && rootCount < maximumCodexActivityRoots
+        settingsRemoveCodexHomeButton?.isEnabled =
+            controlsEnabled && rootCount > 1
+        settingsSetPrimaryCodexHomeButton?.isEnabled =
+            controlsEnabled && rootCount > 1
+        settingsUseDefaultCodexHomeButton?.isEnabled = controlsEnabled
         refitSettingsWindowToContent()
     }
 
@@ -5742,6 +6237,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         settingsTabs = nil
         settingsPages = []
         settingsCodexHomeLabel = nil
+        settingsAddCodexHomeButton = nil
+        settingsRemoveCodexHomeButton = nil
+        settingsSetPrimaryCodexHomeButton = nil
+        settingsUseDefaultCodexHomeButton = nil
         settingsAutomaticUpdatesSwitch = nil
         settingsAboutAutomaticUpdatesDetailLabel = nil
         settingsCheckForUpdatesButton = nil
@@ -5757,9 +6256,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         settingsButton.title = TiboTattleLocalization.string(.menuSettings)
         diagnosticsButton.title = TiboTattleLocalization.string(
             .launcherDataDiagnostics
-        )
-        codexHomeButton.title = TiboTattleLocalization.string(
-            .settingsChooseCodexFolder
         )
         openInBrowserButton.title = TiboTattleLocalization.string(
             .launcherOpenInBrowser
@@ -5797,17 +6293,37 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             color: .labelColor
         )
         settingsCodexHomeLabel = sourceStatus
-        let chooseSource = NSButton(
-            title: TiboTattleLocalization.string(.settingsChooseCodexFolder),
+        let addSource = NSButton(
+            title: TiboTattleLocalization.string(.settingsAddCodexFolder),
             target: self,
-            action: #selector(showCodexHomeOptions)
+            action: #selector(addCodexHomeFromSettings)
         )
+        settingsAddCodexHomeButton = addSource
+        let removeSource = NSButton(
+            title: TiboTattleLocalization.string(.settingsRemoveCodexFolder),
+            target: self,
+            action: #selector(removeCodexHomeFromSettings)
+        )
+        settingsRemoveCodexHomeButton = removeSource
+        let setPrimarySource = NSButton(
+            title: TiboTattleLocalization.string(
+                .settingsSetPrimaryCodexFolder
+            ),
+            target: self,
+            action: #selector(setPrimaryCodexHomeFromSettings)
+        )
+        settingsSetPrimaryCodexHomeButton = setPrimarySource
         let useDefaultSource = NSButton(
             title: TiboTattleLocalization.string(.settingsUseDefault),
             target: self,
             action: #selector(useDefaultCodexHome)
         )
-        let sourceActions = settingsControlRow([chooseSource, useDefaultSource])
+        settingsUseDefaultCodexHomeButton = useDefaultSource
+        let sourceActions = settingsControlColumn([
+            settingsControlRow([addSource, removeSource]),
+            settingsControlRow([setPrimarySource, useDefaultSource]),
+        ])
+        updateSettingsCodexHomeSummary()
         let languagePicker = NSPopUpButton(
             frame: .zero,
             pullsDown: false
@@ -6286,8 +6802,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         let mode = codexHomeConfiguration?.mode ?? .defaultLocation
         let codexValidated: Bool
         if let selected = codexHomeConfiguration {
-            codexValidated = selected.mode == .defaultLocation
-                || (try? validatedCustomCodexHome(selected.url)) != nil
+            codexValidated = (try? validatedCodexHomeConfiguration(
+                selected,
+                unavailableAllowedRootIDs: Set(selected.roots.map(\.id))
+            )) != nil
         } else {
             codexValidated = false
         }
@@ -6432,31 +6950,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         }
     }
 
-    @objc private func showCodexHomeOptions() {
-        let current =
-            codexHomeConfiguration?.mode == .custom
-            ? TiboTattleLocalization.string(.dialogCustomCodexFolder)
-            : TiboTattleLocalization.string(.dialogDefaultCodexFolder)
-        let alert = NSAlert()
-        alert.messageText = TiboTattleLocalization.string(.settingsCodexFolder)
-        alert.informativeText = TiboTattleLocalization.format(
-            .dialogCodexFolderDescription,
-            current,
-            BundledProduct.displayName
-        )
-        alert.addButton(withTitle: TiboTattleLocalization.string(.commonCancel))
-        alert.addButton(
-            withTitle: TiboTattleLocalization.string(.settingsChooseCodexFolder)
-        )
-        alert.addButton(withTitle: TiboTattleLocalization.string(.settingsUseDefault))
-        switch alert.runModal() {
-        case .alertSecondButtonReturn:
-            chooseCustomCodexHome()
-        case .alertThirdButtonReturn:
-            useDefaultCodexHome()
-        default:
-            break
-        }
+    @objc private func addCodexHomeFromSettings() {
+        guard !codexHomeRestartGate.isInFlight else { return }
+        chooseCustomCodexHome()
     }
 
     // A rejected folder change alters nothing: the companion keeps running
@@ -6485,7 +6981,75 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         }
     }
 
+    private func presentCodexHomeLimitReached() {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = TiboTattleLocalization.string(
+            .dialogCodexFolderLimitTitle
+        )
+        alert.informativeText = TiboTattleLocalization.string(
+            .dialogCodexFolderLimitDescription
+        )
+        alert.addButton(withTitle: TiboTattleLocalization.string(.commonOK))
+        if let settingsWindow, settingsWindow.isVisible {
+            alert.beginSheetModal(for: settingsWindow)
+        } else {
+            alert.runModal()
+        }
+    }
+
+    private func codexRootSelector(
+        for configuration: CodexHomeConfiguration,
+        includingPrimary: Bool = true
+    ) -> NSPopUpButton {
+        let selector = NSPopUpButton(
+            frame: NSRect(x: 0, y: 0, width: 440, height: 28),
+            pullsDown: false
+        )
+        for root in configuration.roots {
+            if !includingPrimary && root.id == configuration.primaryRootID {
+                continue
+            }
+            let key: TiboTattleLocalization.Key =
+                root.id == configuration.primaryRootID
+                ? .settingsCodexFolderPrimarySelectedPath
+                : .settingsCodexFolderActivitySelectedPath
+            selector.addItem(
+                withTitle: TiboTattleLocalization.format(
+                    key,
+                    (root.url.path as NSString).abbreviatingWithTildeInPath
+                )
+            )
+            selector.lastItem?.representedObject = root.id.uuidString
+        }
+        return selector
+    }
+
+    private func selectedCodexRootID(
+        from selector: NSPopUpButton
+    ) -> UUID? {
+        guard let value = selector.selectedItem?.representedObject as? String
+        else {
+            return nil
+        }
+        return UUID(uuidString: value)
+    }
+
+    private func adoptCodexHomeConfiguration(
+        _ configuration: CodexHomeConfiguration
+    ) {
+        codexHomeConfiguration = configuration
+        retryAllowed = true
+        restartCompanionAfterCodexHomeChange()
+    }
+
     private func chooseCustomCodexHome() {
+        guard !codexHomeRestartGate.isInFlight else { return }
+        if let configuration = codexHomeConfiguration,
+           configuration.roots.count >= maximumCodexActivityRoots {
+            presentCodexHomeLimitReached()
+            return
+        }
         let panel = NSOpenPanel()
         panel.title = TiboTattleLocalization.string(.dialogChooseCodexHomeFolder)
         panel.message = TiboTattleLocalization.string(
@@ -6504,26 +7068,143 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             return
         }
         do {
-            codexHomeConfiguration = try saveCodexHomeConfiguration(
-                selected,
-                stateRoot: ownerOnlyStateRoot()
+            let stateRoot = try ownerOnlyStateRoot()
+            let updated: CodexHomeConfiguration
+            if let configuration = codexHomeConfiguration {
+                updated = try addCodexHome(
+                    selected,
+                    to: configuration,
+                    stateRoot: stateRoot
+                )
+            } else {
+                // Invalid legacy settings can still be repaired by choosing one
+                // explicit folder; the old file is replaced only after the new
+                // selection passes every path and owner-only write check.
+                updated = try saveCodexHomeConfiguration(
+                    selected,
+                    stateRoot: stateRoot
+                )
+            }
+            adoptCodexHomeConfiguration(updated)
+        } catch {
+            presentCodexHomeSelectionRejection(error)
+        }
+    }
+
+    @objc private func setPrimaryCodexHomeFromSettings() {
+        guard !codexHomeRestartGate.isInFlight,
+              let configuration = codexHomeConfiguration,
+              configuration.roots.count > 1
+        else {
+            return
+        }
+        let selector = codexRootSelector(
+            for: configuration,
+            includingPrimary: false
+        )
+        let alert = NSAlert()
+        alert.messageText = TiboTattleLocalization.string(
+            .dialogSetPrimaryCodexFolderTitle
+        )
+        alert.informativeText = TiboTattleLocalization.string(
+            .dialogSetPrimaryCodexFolderDescription
+        )
+        alert.accessoryView = selector
+        alert.addButton(withTitle: TiboTattleLocalization.string(.commonCancel))
+        alert.addButton(
+            withTitle: TiboTattleLocalization.string(
+                .settingsSetPrimaryCodexFolder
             )
-            updateSettingsCodexHomeSummary()
-            retryAllowed = true
-            restartCompanionAfterCodexHomeChange()
+        )
+        guard alert.runModal() == .alertSecondButtonReturn,
+              let rootID = selectedCodexRootID(from: selector)
+        else {
+            return
+        }
+        do {
+            adoptCodexHomeConfiguration(
+                try selectPrimaryCodexHome(
+                    rootID,
+                    in: configuration,
+                    stateRoot: ownerOnlyStateRoot()
+                )
+            )
+        } catch {
+            presentCodexHomeSelectionRejection(error)
+        }
+    }
+
+    @objc private func removeCodexHomeFromSettings() {
+        guard !codexHomeRestartGate.isInFlight,
+              let configuration = codexHomeConfiguration,
+              configuration.roots.count > 1
+        else {
+            return
+        }
+        let selector = codexRootSelector(
+            for: configuration,
+            includingPrimary: false
+        )
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = TiboTattleLocalization.string(
+            .dialogRemoveCodexFolderTitle
+        )
+        alert.informativeText = TiboTattleLocalization.string(
+            .dialogRemoveCodexFolderDescription
+        )
+        alert.accessoryView = selector
+        alert.addButton(withTitle: TiboTattleLocalization.string(.commonCancel))
+        alert.addButton(
+            withTitle: TiboTattleLocalization.string(
+                .settingsRemoveCodexFolder
+            )
+        )
+        guard alert.runModal() == .alertSecondButtonReturn,
+              let rootID = selectedCodexRootID(from: selector)
+        else {
+            return
+        }
+        do {
+            adoptCodexHomeConfiguration(
+                try removeCodexHome(
+                    rootID,
+                    from: configuration,
+                    stateRoot: ownerOnlyStateRoot()
+                )
+            )
         } catch {
             presentCodexHomeSelectionRejection(error)
         }
     }
 
     @objc private func useDefaultCodexHome() {
-        do {
-            codexHomeConfiguration = try clearCodexHomeConfiguration(
-                stateRoot: ownerOnlyStateRoot()
+        guard !codexHomeRestartGate.isInFlight else { return }
+        if codexHomeConfiguration?.mode != .defaultLocation {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = TiboTattleLocalization.string(
+                .dialogResetCodexFoldersTitle
             )
-            updateSettingsCodexHomeSummary()
-            retryAllowed = true
-            restartCompanionAfterCodexHomeChange()
+            alert.informativeText = TiboTattleLocalization.string(
+                .dialogResetCodexFoldersDescription
+            )
+            alert.addButton(
+                withTitle: TiboTattleLocalization.string(.commonCancel)
+            )
+            alert.addButton(
+                withTitle: TiboTattleLocalization.string(.settingsUseDefault)
+            )
+            guard alert.runModal() == .alertSecondButtonReturn else {
+                return
+            }
+        }
+        do {
+            adoptCodexHomeConfiguration(
+                try clearCodexHomeConfiguration(
+                    stateRoot: ownerOnlyStateRoot()
+                )
+            )
         } catch {
             presentCodexHomeSelectionRejection(error)
         }
@@ -6540,18 +7221,62 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         retryButton.isEnabled = false
         // This status has to be readable, so the embedded dashboard yields.
         hideDashboardWebView()
+        let action = codexHomeRestartGate.requestRestart()
+        updateSettingsCodexHomeSummary()
+        guard action == .stopCurrent else {
+            // While the old child is stopping, the eventual launch reads the
+            // latest configuration. Once a replacement has started, the gate
+            // remembers one further serialized cycle instead.
+            return
+        }
+        stopCurrentCompanionForCodexHomeRestart()
+    }
+
+    private func stopCurrentCompanionForCodexHomeRestart() {
         startupTimeout?.cancel()
         launchGeneration += 1
         let previous = companion
         companion = nil
         if let previous, previous.isRunning {
+            stoppingCompanion = previous
             previous.stop { [weak self] in
                 DispatchQueue.main.async {
-                    self?.startCompanion()
+                    guard let self,
+                          self.stoppingCompanion === previous
+                    else { return }
+                    self.stoppingCompanion = nil
+                    self.codexHomeRestartCompanionStopped()
                 }
             }
         } else {
-            startCompanion()
+            stoppingCompanion = nil
+            codexHomeRestartCompanionStopped()
+        }
+    }
+
+    private func codexHomeRestartCompanionStopped() {
+        guard !quitting else { return }
+        guard codexHomeRestartGate.companionStopped() == .startLatest else {
+            return
+        }
+        startCompanion()
+    }
+
+    /// Returns true when the caller must suppress the ready/failure surface
+    /// because a change accepted after the latest child started still needs a
+    /// serialized replacement. Controls remain disabled until the final child
+    /// reports ready or failure.
+    private func codexHomeRestartTerminalEventRequiresAnotherRestart()
+        -> Bool {
+        switch codexHomeRestartGate.companionReachedTerminalState() {
+        case .stopCurrent:
+            stopCurrentCompanionForCodexHomeRestart()
+            return true
+        case .complete:
+            updateSettingsCodexHomeSummary()
+            return false
+        case .none, .startLatest:
+            return false
         }
     }
 
@@ -6771,10 +7496,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                             guard let self, !self.quitting else { return }
                             do {
                                 self.codexHomeConfiguration =
-                                    CodexHomeConfiguration(
-                                        mode: .defaultLocation,
-                                        url: try defaultCodexHome()
-                                    )
+                                    try defaultCodexHomeConfiguration()
                             } catch {
                                 self.showFailure(error)
                                 return
@@ -6878,7 +7600,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             alert.runModal()
             return .terminateCancel
         }
-        guard !quitting, companion?.isRunning == true else {
+        let ownedCompanion = companionToAwaitOnTermination(
+            active: companion,
+            stopping: stoppingCompanion
+        )
+        guard !quitting,
+              let ownedCompanion,
+              ownedCompanion.isRunning
+        else {
             // When the companion is already stopped there is no asynchronous
             // cleanup to wait for. Mark termination as intentional so the
             // window-close delegate cannot turn an explicit Quit into a
@@ -6887,7 +7616,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             return .terminateNow
         }
         quitting = true
-        companion?.stop {
+        codexHomeRestartGate.cancel()
+        ownedCompanion.stop {
             DispatchQueue.main.async {
                 sender.reply(toApplicationShouldTerminate: true)
             }
@@ -6907,8 +7637,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         // — window button and menu-bar item alike — routes through.
         menuBarStatus?.shutDown()
         menuBarStatus = nil
-        if companion?.isRunning == true {
-            companion?.stop {}
+        if let ownedCompanion = companionToAwaitOnTermination(
+            active: companion,
+            stopping: stoppingCompanion
+        ), ownedCompanion.isRunning {
+            ownedCompanion.stop {}
         }
     }
 }
@@ -6973,7 +7706,8 @@ private enum SmokeTest {
             )
             return 1
         }
-        guard let codexHome = try? defaultCodexHome() else {
+        guard let codexHomeConfiguration = try? defaultCodexHomeConfiguration()
+        else {
             FileHandle.standardError.write(
                 Data("macOS smoke: Codex home unavailable\n".utf8)
             )
@@ -6986,7 +7720,7 @@ private enum SmokeTest {
         var exitedEarly = false
         let companion = CompanionProcess(
             centralService: centralService,
-            codexHome: codexHome,
+            codexHomeConfiguration: codexHomeConfiguration,
             nodeRuntimeModeOverride: nodeRuntimeModeOverride,
             onReady: { url in
                 stateLock.lock()
@@ -7102,6 +7836,99 @@ private enum SmokeTest {
     }
 }
 
+/// Executes the exact ownership handoff used when Quit arrives during a
+/// Settings-driven companion restart. This is a real child-process test: the
+/// first stop represents the settings change, the second stop represents Quit,
+/// and both callbacks must survive until the child has actually terminated.
+private enum CodexHomeQuitDuringStopSmokeTest {
+    static func run() -> Int32 {
+        _ = umask(0o077)
+        let centralService: CentralServiceConfiguration?
+        do {
+            centralService = try CentralServiceConfiguration.bundled()
+        } catch {
+            return 1
+        }
+        guard let codexHomeConfiguration = try? defaultCodexHomeConfiguration()
+        else {
+            return 1
+        }
+
+        let ready = DispatchSemaphore(value: 0)
+        let settingsStopCompleted = DispatchSemaphore(value: 0)
+        let quitStopCompleted = DispatchSemaphore(value: 0)
+        let exited = DispatchSemaphore(value: 0)
+        let stateLock = NSLock()
+        var requestedExit = false
+        var active: CompanionProcess? = CompanionProcess(
+            centralService: centralService,
+            codexHomeConfiguration: codexHomeConfiguration,
+            onReady: { _ in ready.signal() },
+            onExit: { requested, _ in
+                stateLock.lock()
+                requestedExit = requested
+                stateLock.unlock()
+                exited.signal()
+            }
+        )
+        guard let launched = active else { return 1 }
+        do {
+            try launched.launch()
+        } catch {
+            return 1
+        }
+        guard ready.wait(timeout: .now() + .seconds(20)) == .success,
+              launched.isRunning
+        else {
+            launched.stop {}
+            return 1
+        }
+
+        var restartGate = CodexHomeRestartGate()
+        guard restartGate.requestRestart() == .stopCurrent else {
+            launched.stop {}
+            return 1
+        }
+        var stopping = active
+        active = nil
+        stopping?.stop { settingsStopCompleted.signal() }
+
+        // This selection is shared with both real AppDelegate termination
+        // hooks, binding the process-level race proof to the UI lifecycle.
+        guard let ownedOnQuit = companionToAwaitOnTermination(
+            active: active,
+            stopping: stopping
+        ), ownedOnQuit === launched else {
+            launched.stop {}
+            return 1
+        }
+        restartGate.cancel()
+        ownedOnQuit.stop { quitStopCompleted.signal() }
+
+        let deadline = DispatchTime.now() + .seconds(5)
+        guard settingsStopCompleted.wait(timeout: deadline) == .success,
+              quitStopCompleted.wait(timeout: deadline) == .success,
+              exited.wait(timeout: deadline) == .success,
+              !ownedOnQuit.isRunning,
+              restartGate.companionStopped() == .none
+        else {
+            ownedOnQuit.stop {}
+            return 1
+        }
+        stateLock.lock()
+        let wasRequested = requestedExit
+        stateLock.unlock()
+        guard wasRequested, active == nil else { return 1 }
+        stopping = nil
+        print(
+            "USAGE_MONITOR_MACOS_CODEX_HOME_QUIT_DURING_STOP "
+                + "stopped=true requested=true active_nil=true "
+                + "restart_cancelled=true path_exposed=false"
+        )
+        return 0
+    }
+}
+
 private enum WatchdogSmokeTest {
     static func run() -> Int32 {
         _ = umask(0o077)
@@ -7114,7 +7941,8 @@ private enum WatchdogSmokeTest {
             )
             return 1
         }
-        guard let codexHome = try? defaultCodexHome() else {
+        guard let codexHomeConfiguration = try? defaultCodexHomeConfiguration()
+        else {
             FileHandle.standardError.write(
                 Data("macOS watchdog smoke: Codex home unavailable\n".utf8)
             )
@@ -7127,7 +7955,7 @@ private enum WatchdogSmokeTest {
         var exitedEarly = false
         let companion = CompanionProcess(
             centralService: centralService,
-            codexHome: codexHome,
+            codexHomeConfiguration: codexHomeConfiguration,
             onReady: { url in
                 stateLock.lock()
                 dashboardURL = url
@@ -7263,29 +8091,117 @@ private enum LifecycleContractSmokeTest {
         return rendered.contains("/") ? 1 : 0
     }
 
-    static func codexHomeSettings(codexHomePath: String) -> Int32 {
+    static func codexHomeSettings(codexHomePaths: [String]) -> Int32 {
         _ = umask(0o077)
         do {
+            guard (1...maximumCodexActivityRoots).contains(
+                codexHomePaths.count
+            ) else {
+                throw LauncherError.invalidCodexHome
+            }
             let stateRoot = try ownerOnlyStateRoot()
-            let selected = try saveCodexHomeConfiguration(
-                URL(
-                    fileURLWithPath: codexHomePath,
-                    isDirectory: true
-                ),
+            // Validate the complete requested set before the functional
+            // add-flow smoke writes its first root. Rejected duplicate or
+            // unsafe inputs must leave an existing settings document intact.
+            let validatedURLs = try codexHomePaths.map { path in
+                try validatedCustomCodexHome(
+                    URL(fileURLWithPath: path, isDirectory: true)
+                )
+            }
+            guard Set(validatedURLs.map(\.path)).count
+                    == validatedURLs.count
+            else {
+                throw LauncherError.invalidCodexHome
+            }
+            var initial = try saveCodexHomeConfiguration(
+                validatedURLs[0],
+                stateRoot: stateRoot
+            )
+            for url in validatedURLs.dropFirst() {
+                initial = try addCodexHome(
+                    url,
+                    to: initial,
+                    stateRoot: stateRoot
+                )
+            }
+            let selected = initial.roots.count > 1
+                ? try selectPrimaryCodexHome(
+                    initial.roots[initial.roots.count - 1].id,
+                    in: initial,
+                    stateRoot: stateRoot
+                )
+                : initial
+            if selected.roots.count > 1 {
+                let settingsBeforePrimaryRemoval = try Data(
+                    contentsOf: launcherSettingsFile(in: stateRoot),
+                    options: [.mappedIfSafe]
+                )
+                do {
+                    _ = try removeCodexHome(
+                        selected.primaryRootID,
+                        from: selected,
+                        stateRoot: stateRoot
+                    )
+                    return 1
+                } catch LauncherError.invalidCodexHome {
+                    // The primary cannot be removed implicitly, and a refused
+                    // attempt must not rewrite even one settings byte.
+                }
+                guard try Data(
+                    contentsOf: launcherSettingsFile(in: stateRoot),
+                    options: [.mappedIfSafe]
+                ) == settingsBeforePrimaryRemoval else {
+                    return 1
+                }
+                let removed = try removeCodexHome(
+                    selected.roots[0].id,
+                    from: selected,
+                    stateRoot: stateRoot
+                )
+                guard removed.roots.count == selected.roots.count - 1,
+                      removed.primaryRootID == selected.primaryRootID
+                else {
+                    return 1
+                }
+                _ = try writeCodexHomeConfiguration(
+                    selected,
+                    stateRoot: stateRoot
+                )
+            }
+            let reset = try clearCodexHomeConfiguration(
+                stateRoot: stateRoot
+            )
+            guard reset.mode == .defaultLocation,
+                  reset.roots.count == 1,
+                  reset.primaryRootID == reset.roots[0].id,
+                  try validateSettingsFile(
+                      launcherSettingsFile(in: stateRoot)
+                  ) == false
+            else {
+                return 1
+            }
+            _ = try writeCodexHomeConfiguration(
+                selected,
                 stateRoot: stateRoot
             )
             let loaded = try loadCodexHomeConfiguration(
                 stateRoot: stateRoot
             )
+            let expectedArguments = codexHomePaths.flatMap { path in
+                ["--codex-home", path]
+            } + ["--primary-codex-home", codexHomePaths.last!]
             guard selected.mode == .custom,
-                  loaded.mode == .custom,
-                  selected.url == loaded.url
+                  loaded == selected,
+                  codexHomeLaunchArguments(loaded) == expectedArguments
             else {
                 return 1
             }
             print(
                 "USAGE_MONITOR_MACOS_CODEX_HOME_READY "
-                    + "mode=custom persisted=true path_exposed=false"
+                    + "roots=\(loaded.roots.count) "
+                    + "primary_stable=true primary_removal_refused=true "
+                    + "add=true reset=true persisted=true "
+                    + "argv=repeatable path_exposed=false"
             )
             return 0
         } catch {
@@ -7294,6 +8210,158 @@ private enum LifecycleContractSmokeTest {
             )
             return 1
         }
+    }
+
+    static func codexHomeSettingsMigration() -> Int32 {
+        _ = umask(0o077)
+        do {
+            let stateRoot = try ownerOnlyStateRoot()
+            let migrated = try loadCodexHomeConfiguration(
+                stateRoot: stateRoot
+            )
+            let reloaded = try loadCodexHomeConfiguration(
+                stateRoot: stateRoot
+            )
+            guard migrated == reloaded,
+                  migrated.mode == .custom,
+                  migrated.roots.count == 1,
+                  migrated.primaryRootID == migrated.roots[0].id,
+                  try validateSettingsFile(
+                      launcherSettingsFile(in: stateRoot)
+                  )
+            else {
+                return 1
+            }
+            print(
+                "USAGE_MONITOR_MACOS_CODEX_HOME_MIGRATED "
+                    + "roots=1 primary_stable=true owner_only=true "
+                    + "path_exposed=false"
+            )
+            return 0
+        } catch {
+            FileHandle.standardError.write(
+                Data("macOS Codex home settings migration failed\n".utf8)
+            )
+            return 1
+        }
+    }
+
+    static func codexHomeSettingsReload() -> Int32 {
+        _ = umask(0o077)
+        do {
+            let stateRoot = try ownerOnlyStateRoot()
+            let loaded = try loadCodexHomeConfiguration(
+                stateRoot: stateRoot
+            )
+            var unavailableRootIDs = Set<UUID>()
+            for root in loaded.roots {
+                var metadata = stat()
+                let status = root.url.path.withCString { path in
+                    lstat(path, &metadata)
+                }
+                if status != 0 && errno == ENOENT {
+                    unavailableRootIDs.insert(root.id)
+                }
+            }
+            let arguments = codexHomeLaunchArguments(loaded)
+            guard loaded.roots.count > 1,
+                  unavailableRootIDs.count == 1,
+                  arguments.filter({ $0 == "--codex-home" }).count
+                    == loaded.roots.count,
+                  Array(arguments.suffix(2)) == [
+                      "--primary-codex-home", loaded.url.path,
+                  ]
+            else {
+                return 1
+            }
+            print(
+                "USAGE_MONITOR_MACOS_CODEX_HOME_RELOAD_READY "
+                    + "roots=\(loaded.roots.count) unavailable=1 "
+                    + "primary_unavailable="
+                    + "\(unavailableRootIDs.contains(loaded.primaryRootID)) "
+                    + "argv=retained path_exposed=false"
+            )
+            return 0
+        } catch {
+            FileHandle.standardError.write(
+                Data("macOS Codex home settings reload failed\n".utf8)
+            )
+            return 1
+        }
+    }
+
+    static func codexHomeReachability(codexHomePaths: [String]) -> Int32 {
+        guard codexHomePaths.count == 3 else { return 2 }
+        let reachability = codexHomePaths.map { path in
+            codexActivityRootReachability(
+                CodexActivityRoot(
+                    id: UUID(),
+                    url: URL(fileURLWithPath: path, isDirectory: true)
+                )
+            )
+        }
+        guard reachability == [
+                  .ready,
+                  .temporarilyUnavailable,
+                  .invalid,
+              ]
+        else {
+            return 1
+        }
+        print(
+            "USAGE_MONITOR_MACOS_CODEX_HOME_REACHABILITY "
+                + "ready=1 temporarily_unavailable=1 invalid=1 "
+                + "native_only=true path_exposed=false"
+        )
+        return 0
+    }
+
+    static func codexHomeRestartGate() -> Int32 {
+        var gate = CodexHomeRestartGate()
+        guard !gate.isInFlight,
+              gate.requestRestart() == .stopCurrent,
+              gate.isInFlight,
+              // A second accepted change before stop completion is folded
+              // into the configuration used by the first replacement start.
+              gate.requestRestart() == .none,
+              gate.isInFlight,
+              gate.companionStopped() == .startLatest,
+              gate.isInFlight,
+              // If a change arrives after that start, it earns one more
+              // serialized cycle rather than a concurrent launch.
+              gate.requestRestart() == .none,
+              gate.companionReachedTerminalState() == .stopCurrent,
+              gate.isInFlight,
+              gate.companionStopped() == .startLatest,
+              gate.isInFlight,
+              gate.companionReachedTerminalState() == .complete,
+              !gate.isInFlight
+        else {
+            return 1
+        }
+
+        // Quitting while the old companion is still stopping cancels the
+        // pending replacement. Its late stop completion must never launch a
+        // new child during application termination.
+        var quittingGate = CodexHomeRestartGate()
+        guard quittingGate.requestRestart() == .stopCurrent,
+              quittingGate.isInFlight
+        else {
+            return 1
+        }
+        quittingGate.cancel()
+        guard !quittingGate.isInFlight,
+              quittingGate.companionStopped() == .none
+        else {
+            return 1
+        }
+        print(
+            "USAGE_MONITOR_MACOS_CODEX_HOME_RESTART_GATE "
+                + "coalesced=true serialized=true starts=2 "
+                + "controls=disabled-until-terminal "
+                + "quit_cancels_restart=true"
+        )
+        return 0
     }
 
     static func keychainResetContract() -> Int32 {
@@ -9098,6 +10166,28 @@ private struct UsageMonitorMain {
         if arguments.contains("--diagnostics-smoke-test") {
             exit(LifecycleContractSmokeTest.diagnostics())
         }
+        if arguments.contains("--codex-home-settings-migration-smoke-test") {
+            exit(LifecycleContractSmokeTest.codexHomeSettingsMigration())
+        }
+        if arguments.contains("--codex-home-settings-reload-smoke-test") {
+            exit(LifecycleContractSmokeTest.codexHomeSettingsReload())
+        }
+        if arguments.contains("--codex-home-restart-gate-smoke-test") {
+            exit(LifecycleContractSmokeTest.codexHomeRestartGate())
+        }
+        if arguments.contains("--codex-home-quit-during-stop-smoke-test") {
+            exit(CodexHomeQuitDuringStopSmokeTest.run())
+        }
+        if let reachabilityIndex = arguments.firstIndex(
+            of: "--codex-home-reachability-smoke-test"
+        ) {
+            let paths = Array(arguments[(reachabilityIndex + 1)...])
+            exit(
+                LifecycleContractSmokeTest.codexHomeReachability(
+                    codexHomePaths: paths
+                )
+            )
+        }
         if let settingsIndex = arguments.firstIndex(
             of: "--codex-home-settings-smoke-test"
         ) {
@@ -9106,7 +10196,7 @@ private struct UsageMonitorMain {
             }
             exit(
                 LifecycleContractSmokeTest.codexHomeSettings(
-                    codexHomePath: arguments[settingsIndex + 1]
+                    codexHomePaths: Array(arguments[(settingsIndex + 1)...])
                 )
             )
         }
