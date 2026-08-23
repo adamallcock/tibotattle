@@ -288,6 +288,7 @@ class FakeApp extends EventEmitter {
     super();
     this.quitCalls = 0;
     this.showCalls = 0;
+    this.focusCalls = [];
     this.lockCalls = 0;
     this.readyCalls = 0;
   }
@@ -307,6 +308,10 @@ class FakeApp extends EventEmitter {
 
   show() {
     this.showCalls += 1;
+  }
+
+  focus(options) {
+    this.focusCalls.push(options);
   }
 }
 
@@ -1479,14 +1484,59 @@ test("desktop lifecycle restores the macOS application before reopening a hidden
   dashboard.emit("close", { preventDefault() {} });
   assert.equal(dashboard.visible, false);
   assert.equal(app.showCalls, 1, "initial ready-to-show reveals the macOS app");
+  assert.deepEqual(app.focusCalls, [{ steal: true }]);
 
   const openItem = trays[0].menu.template.find((item) => item.label === "Open TiboTattle");
   assert.equal(typeof openItem?.click, "function");
   openItem.click();
   assert.equal(app.showCalls, 2, "tray reopen restores application-level hidden state");
+  assert.deepEqual(app.focusCalls, [{ steal: true }, { steal: true }]);
   assert.equal(dashboard.visible, true);
   assert.equal(lifecycle.state.windowVisible, true);
 
+  await lifecycle.dispose();
+});
+
+test("desktop lifecycle leaves macOS app reveal and focus APIs unused on Windows", async () => {
+  const app = new FakeApp();
+  const windows = [];
+  const trays = [];
+  const supervisor = {
+    setUnexpectedExitHandler() {},
+    async start() {
+      return { origin: "http://127.0.0.1:4022" };
+    },
+    async stop() {},
+  };
+  const lifecycle = createDesktopLifecycle({
+    app,
+    platform: "win32",
+    BrowserWindow: class extends FakeWindow {
+      constructor(options) {
+        super(options);
+        windows.push(this);
+      }
+    },
+    Tray: class extends FakeTray {
+      constructor(icon) {
+        super(icon);
+        trays.push(this);
+      }
+    },
+    Menu: { buildFromTemplate: (template) => ({ template }) },
+    icon: "empty-icon",
+    preloadPath: "/private/preload.cjs",
+    supervisor,
+  });
+
+  await lifecycle.start();
+  const dashboard = dashboardWindowsForTest(windows)[0];
+  dashboard.emit("ready-to-show");
+  const openItem = trays[0].menu.template.find((item) => item.label === "Open TiboTattle");
+  openItem.click();
+  assert.equal(app.showCalls, 0);
+  assert.deepEqual(app.focusCalls, []);
+  assert.equal(dashboard.visible, true);
   await lifecycle.dispose();
 });
 

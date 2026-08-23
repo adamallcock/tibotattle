@@ -257,9 +257,13 @@ export function createDesktopLifecycle({
     // macOS can hide the application as a whole when its last window is
     // closed or when the status item is used.  BrowserWindow.show() alone
     // does not undo that application-level hidden state; app.show() is the
-    // supported counterpart and is a no-op on the other desktop targets.
+    // supported counterpart.  app.focus({ steal: true }) is needed as well:
+    // app.show() makes the layer visible but does not make the status-item
+    // application frontmost.  Both calls are restricted to macOS; optional
+    // invocation keeps dependency-injected and older runtimes fail-safe.
     if (platform === "darwin") app.show?.();
     target.show?.();
+    if (platform === "darwin") app.focus?.({ steal: true });
     target.focus?.();
     return true;
   }
@@ -269,7 +273,10 @@ export function createDesktopLifecycle({
       return showApplicationWindow(window);
     }
     if (!recovery?.window || recovery.window.isDestroyed?.()) return false;
-    if (platform === "darwin") app.show?.();
+    if (platform === "darwin") {
+      app.show?.();
+      app.focus?.({ steal: true });
+    }
     recovery.show?.();
     return true;
   }
