@@ -66,6 +66,29 @@ import {
   USER_TIME_ZONE,
 } from "./ui-format.js";
 
+const NATIVE_APPEARANCE_THEMES = new Set(["light", "dark"]);
+
+function applyNativeAppearanceTheme(theme) {
+  if (!NATIVE_APPEARANCE_THEMES.has(theme)) return false;
+  document.documentElement.dataset.theme = theme;
+  document.documentElement.style.colorScheme = theme;
+  const themeColor = document.querySelector('meta[name="theme-color"]');
+  if (themeColor) {
+    themeColor.content = theme === "dark" ? "#141a17" : "#f5f1e8";
+  }
+  return true;
+}
+
+// WKWebView installs this handoff at document start, before the stylesheet can
+// paint. Reapplying it here owns live Settings changes and keeps the browser
+// metadata in step without reloading a dashboard or losing in-memory state.
+applyNativeAppearanceTheme(
+  globalThis.__TIBOTATTLE_APPEARANCE__?.resolvedTheme,
+);
+window.addEventListener("tibotattle:appearance-override", (event) => {
+  applyNativeAppearanceTheme(event.detail?.resolvedTheme);
+});
+
 const localization = createBrowserLocalization();
 setFormattingLocale(localization.formatLocale());
 setMessageLocale(localization.locale());
@@ -10004,12 +10027,15 @@ async function loadLocalDashboard() {
     // companion answers are still unsettled — and an onboarding verdict this
     // load already holds is not one of them.
     renderLocalOnboarding(onboarding);
+    // The primary local result is now rendered. Do not keep the native
+    // readiness signal waiting on the secondary contribution-status read;
+    // its consent invariant still completes before the preview renders.
+    markLocalDashboardReady();
     // Consent state is read from the companion before the queue renders, so
     // an already-approved Mac never re-prepares a review instance it no
     // longer needs.
     await loadIncrementalSyncStatus();
     renderContributionSyncPreview(sync.preview);
-    markLocalDashboardReady();
   } catch {
     const [localHealth, onboarding] = await Promise.all([
       localClient.health().catch(() => null),

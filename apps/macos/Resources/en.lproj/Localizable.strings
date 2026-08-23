@@ -18,6 +18,12 @@
 "settings.aboutProduct" = "About %@";
 "settings.aboutTab" = "About";
 "settings.aboutSummary" = "Local Codex allowance, measured on your Mac.";
+"settings.appearance" = "Appearance";
+"settings.appearanceDark" = "Dark";
+"settings.appearanceLight" = "Light";
+"settings.appearancePickerHint" = "Choose how TiboTattle looks.";
+"settings.appearanceSummary" = "Uses your Mac appearance by default.";
+"settings.appearanceSystem" = "System";
 "settings.automaticUpdates" = "Automatic updates";
 "settings.automaticUpdatesOff" = "Automatic downloads are off.";
 "settings.automaticUpdatesOn" = "Automatic downloads are on.";
@@ -118,14 +124,25 @@
 "nativeDashboard.community" = "Community";
 "nativeDashboard.dataPrivacy" = "Data & Privacy";
 "nativeDashboard.fresh" = "Fresh";
+"nativeDashboard.hideSidebar" = "Hide Sidebar";
 "nativeDashboard.howItWorks" = "Usage and costs";
 "nativeDashboard.needsRefresh" = "Stale";
 "nativeDashboard.localOnly" = "Local only";
 "nativeDashboard.localOnlyTooltip" = "Analysis and cached results stay on this Mac. Community contribution is optional.";
 "nativeDashboard.overview" = "Overview";
+"nativeDashboard.progressAnalyzing" = "Analyzing local history…";
+"nativeDashboard.progressAnalyzingFiles" = "Analyzing %@ of %@ files…";
+"nativeDashboard.progressArchiveIndex" = "Updating older history…";
+"nativeDashboard.progressDiscovering" = "Finding local history…";
+"nativeDashboard.progressFinishing" = "Finishing analysis…";
+"nativeDashboard.progressProspective" = "Preparing ongoing tracking…";
+"nativeDashboard.progressQuickResult" = "Headline ready · finishing analysis…";
+"nativeDashboard.progressQuotaRefresh" = "Refreshing allowance…";
+"nativeDashboard.progressSaving" = "Saving analysis progress…";
 "nativeDashboard.refreshUsage" = "Refresh";
 "nativeDashboard.refreshUsageTooltip" = "Update local usage now. This reads only the selected Codex folders on this Mac.";
 "nativeDashboard.share" = "Share";
+"nativeDashboard.showSidebar" = "Show Sidebar";
 "nativeDashboard.shareTooltip" = "Open the local share card.";
 "nativeDashboard.starting" = "Starting…";
 "nativeDashboard.status" = "Status";
@@ -223,6 +240,7 @@
 
 "launcher.codexFolderUpdated" = "Codex folder updated";
 "launcher.dashboardDidNotOpen" = "Dashboard didn’t open";
+"launcher.dashboardTakingLonger" = "Dashboard is taking longer than expected";
 "launcher.localDataMovedToTrash" = "Local data moved to Trash";
 "launcher.localDashboardCouldNotStart" = "The local dashboard could not be started.";
 "launcher.localDataMovedToTrashDetail" = "A fresh owner-only local store will be created now. Codex logs were not changed.";
@@ -239,7 +257,11 @@
 "launcher.errorCompanionLaunch" = "The local companion could not be started.";
 "launcher.errorCompanionTimeout" = "The local companion did not become ready in time.";
 "launcher.errorCodexHomeSettingsWrite" = "The selected Codex folder could not be saved privately.";
+"launcher.errorDashboardContentProcessTerminated" = "The macOS web content process stopped while opening the local dashboard.";
 "launcher.errorDashboardDownloadFailed" = "The dashboard could not save that file to your Downloads folder.";
+"launcher.errorDashboardNavigationFailed" = "The in-app dashboard could not load its local page.";
+"launcher.errorDashboardReadinessTimeout" = "The local dashboard page loaded, but it did not become ready during the initial wait.";
+"launcher.errorDashboardViewportUnavailable" = "The in-app dashboard did not receive a usable window size.";
 "launcher.errorDashboardWebViewUnavailable" = "The in-app dashboard view could not be displayed.";
 "launcher.errorDataErase" = "The local %@ data could not be moved to Trash.";
 "launcher.errorFirstRunStateWrite" = "The first-run acknowledgement could not be saved privately.";
@@ -258,7 +280,7 @@
 "launcher.recoveryCheckAccess" = "Check access to your home and Application Support folders, then retry.";
 "launcher.recoveryChooseCodexHome" = "Choose Codex Source and select a readable Codex home owned by your macOS user account, or restore the default.";
 "launcher.recoveryDashboardDownload" = "Check access to your Downloads folder, then save the file again.";
-"launcher.recoveryDashboardWebView" = "Choose Open Dashboard to try again, or Open in Browser to use the same local dashboard in your browser.";
+"launcher.recoveryDashboardWebView" = "Choose Open Dashboard to try the local view again. If it still does not open, choose Retry.";
 "launcher.recoveryDataErase" = "Quit other processes using %@ data, then try the erase again.";
 "launcher.recoveryExistingWindow" = "Open the existing %@ window, or quit it before starting another copy.";
 "launcher.recoveryKeychainDenied" = "Retry the reset and approve the macOS Keychain prompt.";
@@ -272,6 +294,8 @@
 "menuBar.failureRecovery" = "Not running: %@. Open the window for the recovery step.";
 "settings.codexFolderCustomSelectedPath" = "Custom folder: %@";
 "settings.codexFolderDefaultLocation" = "Default location (~/.codex)";
+"settings.updateCheckUnavailableMessage" = "TiboTattle couldn't complete the update check. Check your internet connection and try again.";
+"settings.updateCheckUnavailableTitle" = "Couldn't check for updates";
 "settings.updateDisclosureAutomaticOff" = "Signed app updates are available from About → Check for Updates. Automatic downloads are currently off; you can turn them on in Settings → About when available.";
 "settings.updateDisclosureAutomaticOn" = "Signed app updates are checked automatically. By default, a verified update downloads in the background and installs when you quit; you can turn that off in Settings → About.";
 "settings.updateDisclosureDevelopment" = "This development build does not include update checks. Signed releases installed in Applications can check for updates from About.";

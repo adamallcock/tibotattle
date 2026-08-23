@@ -24,6 +24,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
 import {
   PRODUCT_BRAND,
   validateStateDirectoryName,
@@ -857,7 +858,15 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(
     source,
-    /guard Self\.feedResponseIsReachable\([\s\S]*showFeedFailureAlert/u,
+    /guard Self\.feedResponseIsReachable\([\s\S]*showUpdateFailureAlert\(\s*messageKey:\s*\.settingsUpdateCheckUnavailableTitle,\s*informativeTextKey:\s*\.settingsUpdateCheckUnavailableMessage/u,
+  );
+  assert.match(
+    source,
+    /guard let appcastURL = Self\.appcastURL else \{[\s\S]*showUpdateFailureAlert\(\s*messageKey:\s*\.launcherUpdateUnavailable,\s*informativeTextKey:\s*\.settingsAutomaticUpdatesUnavailable/u,
+  );
+  assert.match(
+    source,
+    /private func showUpdateFailureAlert\([\s\S]*?alert\.messageText = TiboTattleLocalization\.string\(messageKey\)[\s\S]*?alert\.informativeText = TiboTattleLocalization\.string\(informativeTextKey\)/u,
   );
   assert.match(source, /alert\.addButton\(withTitle: TiboTattleLocalization\.string\(\.launcherRetry\)\)/u);
   assert.match(source, /alert\.addButton\(withTitle: TiboTattleLocalization\.string\(\.commonCancel\)\)/u);
@@ -938,6 +947,18 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(
     source,
+    /TiboTattleLocalization\.string\(\.settingsAppearance\)/u,
+  );
+  assert.match(
+    source,
+    /\(\.system, \.settingsAppearanceSystem\)/u,
+  );
+  assert.match(
+    source,
+    /TiboTattleLocalization\.string\(\.settingsAppearanceSummary\)/u,
+  );
+  assert.match(
+    source,
     /settingsAboutAutomaticUpdatesDetailLabel\?\.stringValue\s*=\s*automaticUpdatesSettingsSummary\(\)/u,
   );
   assert.doesNotMatch(
@@ -957,7 +978,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.ok(generalSettings, "general settings page wiring should be present");
   assert.match(
     generalSettings,
-    /languageSection[\s\S]*sourceSection[\s\S]*refreshIntervalSection[\s\S]*startAtLoginSection/u,
+    /appearanceSection[\s\S]*languageSection[\s\S]*sourceSection[\s\S]*refreshIntervalSection[\s\S]*startAtLoginSection/u,
   );
   assert.doesNotMatch(generalSettings, /quotaNotificationsSection/u);
   assert.doesNotMatch(
@@ -1010,6 +1031,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     );
   }
   assert.match(settingsSource, /symbolName: "globe"/u);
+  assert.match(settingsSource, /symbolName: "circle\.lefthalf\.filled"/u);
   assert.match(settingsSource, /symbolName: "folder"/u);
   assert.match(settingsSource, /symbolName: "clock"/u);
   assert.match(source, /settingsOpenNotifications/u);
@@ -1026,6 +1048,38 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(
     localizationSource,
     /Start TiboTattle when you sign in\. Manage this in System Settings → Login Items\./iu,
+  );
+  assert.match(localizationSource, /Uses your Mac appearance by default\./iu);
+  assert.match(source, /static let defaultsKey = "tibotattle\.appearance\.v1"/u);
+  assert.match(source, /case system\s*\n\s*case light\s*\n\s*case dark/u);
+  assert.match(
+    source,
+    /guard let rawValue = defaults\.string\(forKey: defaultsKey\),[\s\S]*?else \{\s*\n\s*return \.system\s*\n\s*\}/u,
+  );
+  assert.match(
+    source,
+    /var applicationAppearance: NSAppearance\? \{[\s\S]*?case \.system:\s*\n\s*nil[\s\S]*?case \.light:\s*\n\s*NSAppearance\(named: \.aqua\)[\s\S]*?case \.dark:\s*\n\s*NSAppearance\(named: \.darkAqua\)/u,
+  );
+  assert.match(
+    source,
+    /func resolvedTheme\(for systemAppearance: NSAppearance\) -> String \{[\s\S]*?case \.light:\s*\n\s*return "light"[\s\S]*?case \.dark:\s*\n\s*return "dark"[\s\S]*?case \.system:[\s\S]*?systemAppearance\.bestMatch\(from: \[\.darkAqua, \.aqua\]\)[\s\S]*?\? "dark"\s*\n\s*: "light"/u,
+  );
+  assert.match(source, /NSApp\.appearance = preference\.applicationAppearance/u);
+  assert.match(
+    source,
+    /private func synchronizeResolvedAppearance\(\) \{[\s\S]*?let preference = NativeAppearancePreference\.current[\s\S]*?guard preference == \.system else \{ return \}[\s\S]*?notifyAppearancePreferenceChange\(preference\)/u,
+  );
+  assert.match(
+    source,
+    /func applicationDidBecomeActive\([\s\S]*?synchronizeResolvedAppearance\(\)/u,
+  );
+  assert.match(
+    source,
+    /chrome\.onAppearanceChange = \{ \[weak self\] in\s*\n\s*self\?\.synchronizeResolvedAppearance\(\)/u,
+  );
+  assert.match(
+    source,
+    /private func selectAppearancePreference\([\s\S]*?NativeAppearancePreference\.set\(preference\)[\s\S]*?applyAppearancePreference\(\)/u,
   );
   assert.match(source, /NSApp\.applicationIconImage/u);
   assert.doesNotMatch(source, /showAutomaticUpdateOptions/u);
@@ -1099,6 +1153,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /DispatchQueue\.main\.asyncAfter\(deadline: deadline, execute: work\)/u);
   assert.match(source, /setSeconds\(value, in: UserDefaults\.standard\)/u);
   assert.match(source, /--native-refresh-settings-contract-smoke-test/u);
+  assert.match(source, /--native-appearance-settings-contract-smoke-test/u);
   assert.doesNotMatch(source, /nativeRefreshIntervalSeconds/u);
   assert.match(source, /private func scheduleNativeRefresh\(\)/u);
   const refreshIntervalSelectionSource = source.match(
@@ -1312,8 +1367,18 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.equal(
     source.match(/setActivationPolicy\(\.accessory\)/gu)?.length,
-    3,
+    5,
     "only isolated AppKit smoke modes may use accessory activation",
+  );
+  // The sidebar-recovery and interaction-safety smokes build real AppKit or
+  // WebKit objects in windows they never bring forward.
+  assert.match(
+    source,
+    /private enum NativeDashboardSidebarRecoverySmokeTest \{[\s\S]*?application\.setActivationPolicy\(\.accessory\)/u,
+  );
+  assert.match(
+    source,
+    /private enum NativeDashboardInteractionSafetySmokeTest \{[\s\S]*?application\.setActivationPolicy\(\.accessory\)/u,
   );
   for (const forbidden of [
     "LSUIElement",
@@ -1417,6 +1482,16 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   );
   assert.match(source, /WKUserScript\([\s\S]*injectionTime: \.atDocumentStart/u);
   assert.match(source, /document\.documentElement\.classList\.add\('native-dashboard'\)/u);
+  assert.equal(
+    source.includes("window.__TIBOTATTLE_APPEARANCE__ = \\(json);"),
+    true,
+  );
+  assert.match(source, /document\.documentElement\.dataset\.theme = theme/u);
+  assert.match(source, /theme !== 'light' && theme !== 'dark'/u);
+  assert.match(
+    source,
+    /func notifyAppearancePreferenceChange\([\s\S]*?refreshDocumentStartScripts\(\)[\s\S]*?tibotattle:appearance-override/u,
+  );
   assert.match(
     source,
     /func notifyHostedSignInReturn\(\) \{[\s\S]*?window\.dispatchEvent\(new Event\('tibotattle:hosted-sign-in-return'\)\)/u,
@@ -1453,6 +1528,20 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   );
   assert.doesNotMatch(source, /Finish signing in in your browser/u);
   assert.match(source, /webView\.allowsBackForwardNavigationGestures = false/u);
+  assert.match(source, /webView = NativeDashboardWebView\(/u);
+  assert.match(source, /webView\.allowsLinkPreview = false/u);
+  const nativeWebView = source.match(
+    /private final class NativeDashboardWebView: WKWebView \{([\s\S]*?)\n\}\n\n\/\/\/ The dashboard is hosted/u,
+  )?.[1];
+  assert.ok(nativeWebView, "the native dashboard WKWebView subclass should be present");
+  for (const hiddenIdentifier of [
+    "WKMenuItemIdentifierGoBack",
+    "WKMenuItemIdentifierGoForward",
+    "WKMenuItemIdentifierDownloadLinkedFile",
+  ]) {
+    assert.match(nativeWebView, new RegExp(hiddenIdentifier, "u"));
+  }
+  assert.doesNotMatch(nativeWebView, /WKMenuItemIdentifierReload/u);
   for (const forbidden of [
     "allowsLinkPreview = true",
     "javaScriptCanOpenWindowsAutomatically",
@@ -1491,11 +1580,11 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   // stack and the native recovery controls return together.
   assert.match(
     source,
-    /private func dashboardWebViewFailed\(code: String\) \{[\s\S]*?dashboardContainer\.isHidden = true\s*\n\s*statusStack\.isHidden = false/u,
+    /private func dashboardWebViewFailed\(_ failure: LauncherError\) \{[\s\S]*?dashboardContainer\.isHidden = true\s*\n\s*statusStack\.isHidden = false/u,
   );
   assert.match(
     source,
-    /private func dashboardWebViewFailed\(code: String\) \{[\s\S]*?retryButton\.isEnabled = retryAllowed && firstRunAcknowledged/u,
+    /private func dashboardWebViewFailed\(_ failure: LauncherError\) \{[\s\S]*?retryButton\.isEnabled = retryAllowed && firstRunAcknowledged/u,
   );
   assert.match(
     source,
@@ -1511,12 +1600,47 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   );
   assert.match(
     source,
+    /for button in \[\s*retryButton,\s*openButton,\s*\] \{\s*actionRow\.addView\(button, in: \.trailing\)/u,
+  );
+  assert.doesNotMatch(
+    source,
+    /for button in \[\s*retryButton,\s*openButton,\s*openInBrowserButton,/u,
+  );
+  assert.match(
+    source,
     /@objc private func openDashboard\(\) \{[\s\S]*?showDashboardWebView\(dashboardURL\)/u,
   );
   assert.match(
     source,
     /@objc private func openDashboardInBrowser\(\) \{[\s\S]*?NSWorkspace\.shared\.open\(dashboardURL\)/u,
   );
+  // Recovery copy and diagnostics distinguish the host phase without adding
+  // another dashboard lifecycle or retry path.
+  assert.match(source, /private let onFailure: \(LauncherError\) -> Void/u);
+  assert.match(
+    source,
+    /guard viewportPreparationAttempts < 20 else \{[\s\S]*?onFailure\(\.dashboardViewportUnavailable\)/u,
+  );
+  assert.match(
+    source,
+    /guard Date\(\) < deadline else \{[\s\S]*?self\.onFailure\(\.dashboardReadinessTimeout\)/u,
+  );
+  assert.match(
+    source,
+    /func webViewWebContentProcessDidTerminate[\s\S]*?onFailure\(\.dashboardContentProcessTerminated\)/u,
+  );
+  assert.match(
+    source,
+    /private func reportNavigationFailure[\s\S]*?onFailure\(\.dashboardNavigationFailed\)/u,
+  );
+  assert.match(
+    source,
+    /private func dashboardWebViewFailed\(_ failure: LauncherError\) \{[\s\S]*?case \.dashboardReadinessTimeout:[\s\S]*?headline = \.launcherDashboardTakingLonger[\s\S]*?lastFailureCode = failure\.failureCode[\s\S]*?failure\.errorDescription[\s\S]*?failure\.failureCode[\s\S]*?failure\.recoverySuggestion/u,
+  );
+  assert.match(source, /UM_MACOS_DASHBOARD_VIEWPORT_UNAVAILABLE/u);
+  assert.match(source, /UM_MACOS_DASHBOARD_NAVIGATION_FAILED/u);
+  assert.match(source, /UM_MACOS_DASHBOARD_WEB_PROCESS_TERMINATED/u);
+  assert.match(source, /UM_MACOS_DASHBOARD_READY_TIMEOUT/u);
   assert.match(source, /UM_MACOS_DASHBOARD_VIEW_UNAVAILABLE/u);
   assert.match(source, /UM_MACOS_DASHBOARD_DOWNLOAD_FAILED/u);
 });
@@ -1539,7 +1663,7 @@ test("native dashboard launch gates its first refresh on the rendered page", asy
     "private func navigateNativeDashboard(",
   );
   const dashboardFailure = section(
-    "private func dashboardWebViewFailed(code: String)",
+    "private func dashboardWebViewFailed(_ failure: LauncherError)",
     "private func hideDashboardWebView()",
   );
   const dashboardTeardown = section(
@@ -1588,6 +1712,60 @@ test("native dashboard launch gates its first refresh on the rendered page", asy
     /cancelNativeRefreshSchedule\(\)[\s\S]*?startupAutomaticRefreshPending = false/u,
   );
   assert.match(companionExit, /startupAutomaticRefreshPending = false/u);
+});
+
+test("native app disables AppKit window tabbing before startup", async () => {
+  const source = await readFile(SWIFT_SOURCE, "utf8");
+  const mainStart = source.indexOf("static func main() {");
+  const tabbingOptOut = source.indexOf(
+    "NSWindow.allowsAutomaticWindowTabbing = false",
+    mainStart,
+  );
+  const argumentParsing = source.indexOf(
+    "let arguments = Array(CommandLine.arguments.dropFirst())",
+    mainStart,
+  );
+
+  assert.ok(mainStart >= 0, "the native app entry point is present");
+  assert.ok(tabbingOptOut > mainStart, "AppKit window tabbing is disabled");
+  assert.ok(
+    argumentParsing > tabbingOptOut,
+    "window tabbing is disabled before any startup or smoke-test path",
+  );
+});
+
+test("native refresh progress stays fixed-vocabulary and count-bounded", async () => {
+  const [source, menuBarStatusSource] = await Promise.all([
+    readFile(SWIFT_SOURCE, "utf8"),
+    readFile(MENU_BAR_STATUS_SOURCE, "utf8"),
+  ]);
+  const progressProjection = menuBarStatusSource.match(
+    /struct LocalAnalysisProgress:[\s\S]*?(?=\n\/\/\/ Whether an explicit local analysis pass)/u,
+  )?.[0] ?? "";
+  const activityDecoder = menuBarStatusSource.match(
+    /static func decodeActivity\([\s\S]*?(?=\n    private static func decodeRefreshID)/u,
+  )?.[0] ?? "";
+  const refreshPoll = source.match(
+    /private func pollNativeRefresh\([\s\S]*?(?=\n    private func finishNativeRefresh)/u,
+  )?.[0] ?? "";
+
+  assert.ok(progressProjection, "native progress projection is present");
+  assert.match(progressProjection, /case discovering/u);
+  assert.match(progressProjection, /case rolloutIndex = "rollout_index"/u);
+  assert.match(progressProjection, /case quotaRefresh = "quota_refresh"/u);
+  assert.match(progressProjection, /case quickResult = "quick_result"/u);
+  assert.match(progressProjection, /case archiveIndex = "archive_index"/u);
+  assert.doesNotMatch(progressProjection, /\b(?:percentage|percent|eta)\b/iu);
+  assert.match(activityDecoder, /maximumProgressCount = 1_000_000_000/u);
+  assert.match(activityDecoder, /doubleValue\.rounded\(\.towardZero\)/u);
+  assert.match(activityDecoder, /progress\["phase"\]/u);
+  assert.match(activityDecoder, /progress\["kind"\][\s\S]*?"archive_index"/u);
+  assert.doesNotMatch(activityDecoder, /progress\["message"\]/u);
+  assert.match(
+    refreshPoll,
+    /case let \.running\(_, progress\):[\s\S]*?progress\?\.nativeToolbarTitle[\s\S]*?pollNativeRefresh/u,
+  );
+  assert.match(source, /--native-analysis-progress-contract-smoke-test/u);
 });
 
 test("unified toolbar preserves the rich loopback report and single authority", async () => {
@@ -1639,6 +1817,44 @@ test("unified toolbar preserves the rich loopback report and single authority", 
   assert.match(source, /case \.live:[\s\S]*?nativeDashboardFresh/u);
   assert.match(toolbar, /toolbarShareIdentifier/u);
   assert.match(toolbar, /toolbarSettingsIdentifier/u);
+  const immovableToolbarItems = [...source.matchAll(
+    /func toolbarImmovableItemIdentifiers\(\s*\n\s*_ toolbar: NSToolbar\s*\n\s*\) -> Set<NSToolbarItem\.Identifier> \{([\s\S]*?)\n    \}/gu,
+  )]
+    .map((match) => match[1])
+    .find((body) => body.includes("Self.mandatoryDashboardToolbarItemIdentifiers"));
+  assert.ok(
+    immovableToolbarItems,
+    "the dashboard's mandatory toolbar policy should be present",
+  );
+  assert.match(
+    immovableToolbarItems,
+    /Self\.mandatoryDashboardToolbarItemIdentifiers/u,
+  );
+  const mandatoryToolbarItems = source.match(
+    /static let mandatoryDashboardToolbarItemIdentifiers: Set<\s*\n\s*NSToolbarItem\.Identifier\s*\n\s*> = \[([\s\S]*?)\n    \]/u,
+  )?.[1];
+  assert.ok(mandatoryToolbarItems, "the mandatory toolbar identifiers should be declared");
+  for (const identifier of [
+    ".toggleSidebar",
+    "toolbarStatusRefreshIdentifier",
+    "toolbarShareIdentifier",
+    "toolbarSettingsIdentifier",
+  ]) {
+    assert.ok(mandatoryToolbarItems.includes(identifier), identifier);
+  }
+  assert.equal(mandatoryToolbarItems.includes(".flexibleSpace"), false);
+  assert.match(
+    source,
+    /private enum NativeSettingsToolbarPolicy \{[\s\S]*?static let mandatoryTabIdentifiers/u,
+  );
+  assert.match(
+    source,
+    /private final class NativeSettingsToolbarDelegate: NSObject,[\s\S]*?NSToolbarDelegate[\s\S]*?func toolbarImmovableItemIdentifiers\([\s\S]*?NativeSettingsToolbarPolicy\.mandatoryTabIdentifiers/u,
+  );
+  assert.match(source, /let tabs = NSTabViewController\(\)/u);
+  assert.match(source, /let item = NSTabViewItem\(identifier: identifier\)/u);
+  assert.match(source, /toolbar\.delegate = toolbarDelegate/u);
+  assert.match(source, /settingsToolbarDelegate = toolbarDelegate/u);
   assert.match(toolbar, /@objc private func refreshDashboardFromToolbar\(\) \{[\s\S]*?refreshLocalUsage\(automatic: false\)/u);
   assert.match(
     toolbar,
@@ -1650,6 +1866,130 @@ test("unified toolbar preserves the rich loopback report and single authority", 
     toolbar,
     /\b(?:CompanionProcess|Process|URLSession|NSSharingService)\b/u,
   );
+});
+
+test("toolbar Share opens the page that owns the share card before scrolling", async () => {
+  const [source, dashboardHTML] = await Promise.all([
+    readFile(SWIFT_SOURCE, "utf8"),
+    readFile(join(REPOSITORY_ROOT, "apps", "web", "public", "index.html"), "utf8"),
+  ]);
+  const sharePanelIndex = dashboardHTML.indexOf('id="share-panel"');
+  assert.notEqual(sharePanelIndex, -1, "the dashboard should contain the share panel");
+  const ownerPages = [
+    ...dashboardHTML.slice(0, sharePanelIndex).matchAll(
+      /data-dashboard-page="([^"]+)"/gu,
+    ),
+  ];
+  const ownerPage = ownerPages.at(-1)?.[1];
+  assert.ok(ownerPage, "the share panel should belong to a dashboard page");
+
+  const handler = source.match(
+    /@objc private func showShareCardFromToolbar\(\) \{([\s\S]*?)\n    \}\n\n    \/\/\/ Puts the native chrome/u,
+  )?.[1];
+  assert.ok(handler, "the toolbar Share handler should be present");
+  const selectedPage = handler.match(
+    /nativeDashboardChrome\?\.select\(\.(\w+)\)/u,
+  )?.[1];
+  assert.equal(
+    selectedPage,
+    ownerPage,
+    "the native sidebar should select the page that contains the share card",
+  );
+  const script = handler.match(
+    /webView\.evaluateJavaScript\("""\n([\s\S]*?)\n        """\)/u,
+  )?.[1];
+  assert.ok(script, "the toolbar Share navigation script should be present");
+
+  function exerciseShareNavigation(initialHash) {
+    let currentHash = initialHash;
+    let activePage = initialHash.slice(1);
+    const listeners = new Map();
+    const hashTasks = [];
+    const timerTasks = [];
+    const frameTasks = [];
+    const scrolls = [];
+    class FakeHashChangeEvent {
+      constructor(type) {
+        this.type = type;
+      }
+    }
+    const windowRef = {
+      addEventListener(type, callback, options = {}) {
+        const registered = listeners.get(type) ?? [];
+        registered.push({ callback, once: options.once === true });
+        listeners.set(type, registered);
+      },
+      dispatchEvent(event) {
+        const registered = [...(listeners.get(event.type) ?? [])];
+        for (const listener of registered) {
+          listener.callback(event);
+          if (listener.once) {
+            listeners.set(
+              event.type,
+              (listeners.get(event.type) ?? []).filter(
+                (candidate) => candidate !== listener,
+              ),
+            );
+          }
+        }
+      },
+      requestAnimationFrame(callback) {
+        frameTasks.push(callback);
+      },
+    };
+    const location = {};
+    Object.defineProperty(location, "hash", {
+      get() {
+        return currentHash;
+      },
+      set(value) {
+        currentHash = value;
+        hashTasks.push(() => {
+          windowRef.dispatchEvent(new FakeHashChangeEvent("hashchange"));
+        });
+      },
+    });
+    windowRef.location = location;
+    windowRef.addEventListener("hashchange", () => {
+      activePage = currentHash.slice(1);
+    });
+    const documentRef = {
+      getElementById(id) {
+        if (id !== "share-panel") return null;
+        return {
+          scrollIntoView(options) {
+            scrolls.push({ activePage, options });
+          },
+        };
+      },
+    };
+    runInNewContext(script, {
+      document: documentRef,
+      HashChangeEvent: FakeHashChangeEvent,
+      setTimeout(callback) {
+        timerTasks.push(callback);
+      },
+      window: windowRef,
+    });
+    for (const task of hashTasks) task();
+    for (const task of timerTasks) task();
+    for (const task of frameTasks) task();
+    return { activePage, currentHash, scrolls };
+  }
+
+  for (const initialHash of ["#overview", `#${ownerPage}`]) {
+    const result = exerciseShareNavigation(initialHash);
+    assert.equal(result.currentHash, `#${ownerPage}`);
+    assert.equal(result.activePage, ownerPage);
+    assert.equal(result.scrolls.length, 1);
+    assert.equal(
+      result.scrolls[0].activePage,
+      ownerPage,
+      "the card must be visible before the toolbar scrolls to it",
+    );
+    assert.equal(result.scrolls[0].options.behavior, "smooth");
+    assert.equal(result.scrolls[0].options.block, "start");
+  }
 });
 
 test("toolbar pill narrates the real index build and terminal refresh failure", async () => {
@@ -1755,18 +2095,93 @@ test("dashboard sidebar resizes for real, wears the brand palette, and the title
     source,
     /NativeDashboardChrome\.sidebarMinimumThickness - 1/u,
   );
-  // 2. The sidebar carries the web report's warm-paper palette over the
-  // system material, and the selected row uses the brand's deep green
-  // instead of the user's system accent. Both mirror the web tokens
-  // --paper #f5f1e8 and --green #174f45 and resolve per appearance.
-  assert.match(source, /private enum NativeBrandPalette/u);
+  // 1b. A collapsed sidebar must always be reopenable. The sidebar can be
+  // collapsed by dragging its divider to the leading edge, the split view's
+  // autosave persists that across relaunches, and a collapsed pane leaves no
+  // divider to drag back — so builds through 0.1.16, which had neither a
+  // toolbar item nor a menu command for it, stranded the window with no
+  // navigation at all (owner-reported, 2026-08-22). Two independent ways back
+  // are pinned here because the sidebar is the only navigation the packaged
+  // app has: the web report hides its own sidebar in native mode.
+  assert.match(source, /sidebarItem\.canCollapse = true/u);
+  // The system toolbar toggle, in both the allowed and the default sets, so
+  // it is present on a fresh install and cannot be customized away without
+  // the menu command below still existing.
+  const toolbarDefaults = [...source.matchAll(
+    /func toolbarDefaultItemIdentifiers\(\s*\n\s*_ toolbar: NSToolbar\s*\n\s*\) -> \[NSToolbarItem\.Identifier\] \{([\s\S]*?)\n    \}/gu,
+  )]
+    .map((match) => match[1])
+    .find((body) => body.includes(".toggleSidebar"));
+  assert.ok(toolbarDefaults, "the toolbar default identifiers are available");
+  assert.match(toolbarDefaults, /\.toggleSidebar/u);
+  const toolbarAllowed = [...source.matchAll(
+    /func toolbarAllowedItemIdentifiers\(\s*\n\s*_ toolbar: NSToolbar\s*\n\s*\) -> \[NSToolbarItem\.Identifier\] \{([\s\S]*?)\n    \}/gu,
+  )]
+    .map((match) => match[1])
+    .find((body) => body.includes(".toggleSidebar"));
+  assert.ok(toolbarAllowed, "the toolbar allowed identifiers are available");
+  assert.match(toolbarAllowed, /\.toggleSidebar/u);
+  // The standard macOS command and key equivalent, on the responder chain so
+  // it reaches whichever dashboard window is key.
   assert.match(
     source,
-    /srgbRed: 245 \/ 255,\s*\n\s*green: 241 \/ 255,\s*\n\s*blue: 232 \/ 255/u,
+    /action: #selector\(NSSplitViewController\.toggleSidebar\(_:\)\),\s*\n\s*keyEquivalent: "s"/u,
   );
   assert.match(
     source,
-    /srgbRed: 23 \/ 255,\s*\n\s*green: 79 \/ 255,\s*\n\s*blue: 69 \/ 255/u,
+    /toggleSidebar\.keyEquivalentModifierMask = \[\.control, \.command\]/u,
+  );
+  // The one-time rescue must run BEFORE the seeding gate returns: every
+  // already-installed user has the seeded marker set, and a stranded sidebar
+  // is exactly the state those users are in, so a rescue behind that early
+  // return would never execute for the people who need it.
+  const viewDidAppear = source.match(
+    /override func viewDidAppear\(\) \{([\s\S]*?)\n    \}/u,
+  )?.[1];
+  assert.ok(viewDidAppear, "the chrome's viewDidAppear is available");
+  assert.ok(
+    viewDidAppear.indexOf("rescueStrandedSidebar(defaults)")
+      < viewDidAppear.indexOf("guard !defaults.bool(forKey: Self.splitSeededDefaultsKey)"),
+    "the stranded-sidebar rescue must precede the seeding early return",
+  );
+  // The rescue fires once and then never fights a deliberate collapse.
+  assert.match(
+    source,
+    /private func rescueStrandedSidebar\(_ defaults: UserDefaults\) \{\s*\n\s*guard !defaults\.bool\(forKey: Self\.sidebarRescuedDefaultsKey\) else \{\s*\n\s*return\s*\n\s*\}\s*\n\s*defaults\.set\(true, forKey: Self\.sidebarRescuedDefaultsKey\)/u,
+  );
+  // 2. The sidebar and report carry the exact light and Forest Ink tokens over
+  // native material instead of inheriting the user's unrelated system accent.
+  const nativeBrandPalette = source.match(
+    /private enum NativeBrandPalette \{[\s\S]*?\n\}/u,
+  )?.[0];
+  assert.ok(nativeBrandPalette, "native brand palette should be present");
+  assert.match(
+    nativeBrandPalette,
+    /static let accent = NSColor\(name: nil\)[\s\S]*?srgbRed: 118 \/ 255,[\s\S]*?green: 170 \/ 255,[\s\S]*?blue: 156 \/ 255/u,
+  );
+  assert.match(
+    nativeBrandPalette,
+    /static let accent = NSColor\(name: nil\)[\s\S]*?srgbRed: 23 \/ 255,[\s\S]*?green: 79 \/ 255,[\s\S]*?blue: 69 \/ 255/u,
+  );
+  assert.match(
+    nativeBrandPalette,
+    /static let reportPaper = NSColor\(name: nil\)[\s\S]*?srgbRed: 20 \/ 255,[\s\S]*?green: 26 \/ 255,[\s\S]*?blue: 23 \/ 255/u,
+  );
+  assert.match(
+    nativeBrandPalette,
+    /static let reportPaper = NSColor\(name: nil\)[\s\S]*?srgbRed: 245 \/ 255,[\s\S]*?green: 241 \/ 255,[\s\S]*?blue: 232 \/ 255/u,
+  );
+  assert.match(
+    nativeBrandPalette,
+    /static let sidebarWash = NSColor\(name: nil\)[\s\S]*?srgbRed: 45 \/ 255,[\s\S]*?green: 116 \/ 255,[\s\S]*?blue: 102 \/ 255,[\s\S]*?alpha: 0\.22/u,
+  );
+  assert.match(
+    source,
+    /private final class NativeDashboardReportPane[\s\S]*?override var wantsUpdateLayer: Bool \{ true \}[\s\S]*?NativeBrandPalette\.reportPaper\.cgColor/u,
+  );
+  assert.match(
+    source,
+    /override func viewDidChangeEffectiveAppearance\(\)[\s\S]*?onAppearanceChange\?\(\)/u,
   );
   assert.match(source, /private final class NativeSidebarBrandWash: NSView/u);
   assert.match(source, /sidebar\.addSubview\(sidebarWash\)/u);
@@ -1877,13 +2292,21 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.match(source, /configure\(\s*aboutItem,/u);
   assert.match(source, /#selector\(showAbout\)/u);
 
-  // The compact title shows a number only for live evidence; stale, absent,
-  // starting, failed, and analyzing states all collapse to a placeholder.
+  // The compact title keeps a verified live number visible while a refresh is
+  // running. Analysis gets its own placeholder only when no live number is
+  // available; stale, absent, starting, and failed states remain non-numeric.
   assert.match(
     source,
-    /guard phase == \.ready, evidence == \.live, let lane = primaryLane else \{\s*return unknownPlaceholder/u,
+    /if companionReachable,\s*evidence == \.live,\s*let lane = primaryLane \{\s*return TiboTattleLocalization\.percentString\(\s*lane\.roundedRemainingPercent\s*\)/u,
   );
-  assert.match(source, /if phase == \.analyzing \{ return analyzingPlaceholder \}/u);
+  assert.match(
+    source,
+    /return phase == \.analyzing\s*\? analyzingPlaceholder\s*:\s*unknownPlaceholder/u,
+  );
+  assert.doesNotMatch(
+    source,
+    /if phase == \.analyzing \{ return analyzingPlaceholder \}/u,
+  );
   assert.match(source, /private let analyzingPlaceholder = "…"/u);
   assert.match(source, /private let unknownPlaceholder = "–"/u);
   assert.match(
@@ -5805,7 +6228,21 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       menuBarSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT native_rows=true titles=true states=starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q dismissal=native,escape,same-app,deactivation weekly_position=fresh-only$/mu,
+      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT native_rows=true titles=true states=starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q dismissal=native,escape,same-app,deactivation weekly_position=fresh-only analysis_title=live-fallback$/mu,
+    );
+    const analysisProgressSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--native-analysis-progress-contract-smoke-test"],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    assert.equal(
+      analysisProgressSmoke.status,
+      0,
+      analysisProgressSmoke.stderr || analysisProgressSmoke.stdout,
+    );
+    assert.match(
+      analysisProgressSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_ANALYSIS_PROGRESS_CONTRACT phases=allowlisted archive=scanning counts=bounded contradictory=generic unknown=generic free_text=ignored idle=unchanged percent=false eta=false$/mu,
     );
     const quotaNotificationSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),
@@ -5834,6 +6271,20 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.match(
       refreshSettingsSmoke.stdout,
       /^USAGE_MONITOR_MACOS_REFRESH_SETTINGS_CONTRACT default=300 persisted=900 reloaded=900 picker_action=true picker_persisted=true scheduler=300->900 invalid_ignored=true$/mu,
+    );
+    const appearanceSettingsSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--native-appearance-settings-contract-smoke-test"],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    assert.equal(
+      appearanceSettingsSmoke.status,
+      0,
+      appearanceSettingsSmoke.stderr || appearanceSettingsSmoke.stdout,
+    );
+    assert.match(
+      appearanceSettingsSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_APPEARANCE_SETTINGS_CONTRACT default=system persisted=light,dark,system invalid=system system_resolution=light,dark explicit_resolution=light,dark appkit=system,aqua,darkAqua$/mu,
     );
     // The settings window is sized from what its pages measure. Source text
     // cannot show whether a page then fits, so this measures the real frames:
@@ -5867,6 +6318,40 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.match(
       nativeDashboardLayoutSmoke.stdout,
       /^USAGE_MONITOR_MACOS_NATIVE_DASHBOARD_LAYOUT web_width=[6-9][0-9]{2,} web_height=[6-9][0-9]{2,}$/mu,
+    );
+    // A sidebar that cannot be reopened is a window with no navigation: the
+    // rows live only here, because the web report hides its own sidebar in
+    // native mode. Source text can show a toolbar item and a menu command
+    // exist; only this proves the action reaches a live target, that the pane
+    // returns at its enforced width, and that a sidebar stranded shut by an
+    // older build reopens exactly once on upgrade.
+    const sidebarRecoverySmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--native-dashboard-sidebar-recovery-smoke-test"],
+      { encoding: "utf8", timeout: 15_000 },
+    );
+    assert.equal(
+      sidebarRecoverySmoke.status,
+      0,
+      sidebarRecoverySmoke.stderr || sidebarRecoverySmoke.stdout,
+    );
+    assert.match(
+      sidebarRecoverySmoke.stdout,
+      /^USAGE_MONITOR_MACOS_SIDEBAR_RECOVERY collapse=true responds=true menu_enabled=true reveal=true width=[12][0-9]{2} rescue_once=true respects_choice=true$/mu,
+    );
+    const interactionSafetySmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--native-dashboard-interaction-safety-smoke-test"],
+      { encoding: "utf8", timeout: 15_000 },
+    );
+    assert.equal(
+      interactionSafetySmoke.status,
+      0,
+      interactionSafetySmoke.stderr || interactionSafetySmoke.stdout,
+    );
+    assert.match(
+      interactionSafetySmoke.stdout,
+      /^USAGE_MONITOR_MACOS_NATIVE_INTERACTION_SAFETY back=false forward=false reload=true download_link=false open_link=true link_preview=false toolbar_immovable=true settings_tabs_immovable=true settings_delegate=true$/mu,
     );
     const generatedFiles = bundleFiles
       .map(({ relativePath }) => relativePath)

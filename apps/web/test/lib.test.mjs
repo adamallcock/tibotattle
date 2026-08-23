@@ -5082,7 +5082,11 @@ test("public interface is dashboard-first and never substitutes demo data automa
 });
 
 test("native dashboard readiness follows both first-render outcomes", async () => {
-  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const [html, appSource, styles] = await Promise.all([
+    readFile(new URL("../public/index.html", import.meta.url), "utf8"),
+    readFile(new URL("../public/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/styles.css", import.meta.url), "utf8"),
+  ]);
   const markerStart = appSource.indexOf("function markLocalDashboardReady() {");
   const markerEnd = appSource.indexOf(
     "\n}\n\nasync function loadLocalDashboard",
@@ -5098,6 +5102,30 @@ test("native dashboard readiness follows both first-render outcomes", async () =
 
   const marker = appSource.slice(markerStart, markerEnd);
   const loader = appSource.slice(loadStart, loadEnd);
+  const bootSurface = html.match(
+    /<section[\s\S]*?id="dashboard-boot-state"[\s\S]*?<\/section>/u,
+  )?.[0] ?? "";
+  assert.ok(bootSurface, "the native dashboard has a static boot surface");
+  assert.match(bootSurface, /role="status"/u);
+  assert.match(bootSurface, /aria-live="polite"/u);
+  assert.match(bootSurface, /aria-busy="true"/u);
+  assert.match(bootSurface, /Loading saved results…/u);
+  assert.match(
+    bootSurface,
+    /Checking the summary on this Mac\. Nothing is sent while you look at it\./u,
+  );
+  const bootOpeningTag = bootSurface.match(/^<section[\s\S]*?>/u)?.[0] ?? "";
+  assert.doesNotMatch(bootOpeningTag, /\shidden(?:\s|=|>)/u);
+  assert.doesNotMatch(bootSurface, /data-requires-evidence/u);
+  assert.match(styles, /\.dashboard-boot-state \{ display: none; \}/u);
+  assert.match(
+    styles,
+    /html\.native-dashboard:not\(\[data-local-dashboard-ready="true"\]\) \.dashboard-boot-state,[\s\S]*?display: grid;/u,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 520px\)[\s\S]*?\.dashboard-boot-card \.state-pill \{[\s\S]*?width: max-content;[\s\S]*?font-size: \.67rem;/u,
+  );
   assert.match(
     marker,
     /document\.documentElement\.dataset\.localDashboardReady = "true";/u,
@@ -5114,6 +5142,41 @@ test("native dashboard readiness follows both first-render outcomes", async () =
     (loader.match(/markLocalDashboardReady\(\)/gu) ?? []).length,
     2,
     "the first available or unavailable render marks readiness exactly once",
+  );
+});
+
+test("native dashboard readiness does not wait on secondary contribution status", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const loadStart = appSource.indexOf("async function loadLocalDashboard() {");
+  const loadEnd = appSource.indexOf(
+    "\n}\n\n// The \"preparation identity\"",
+    loadStart,
+  );
+  assert.ok(loadStart >= 0 && loadEnd > loadStart, "dashboard loader is present");
+
+  const loader = appSource.slice(loadStart, loadEnd);
+  const successEnd = loader.indexOf(
+    "\n  } catch {",
+    loader.indexOf("renderContributionSyncPreview(sync.preview);"),
+  );
+  const successPath = loader.slice(0, successEnd);
+  const dashboardRender = successPath.indexOf("renderDashboard(data);");
+  const onboardingRender = successPath.indexOf("renderLocalOnboarding(onboarding);");
+  const readinessMarker = successPath.indexOf("markLocalDashboardReady();");
+  const secondaryStatus = successPath.indexOf("await loadIncrementalSyncStatus();");
+  const contributionPreview = successPath.indexOf(
+    "renderContributionSyncPreview(sync.preview);",
+  );
+
+  assert.ok(dashboardRender >= 0, "the primary dashboard render is present");
+  assert.ok(onboardingRender > dashboardRender, "onboarding joins the primary render");
+  assert.ok(
+    readinessMarker > onboardingRender && readinessMarker < secondaryStatus,
+    "the native shell is released after the primary render and before secondary status",
+  );
+  assert.ok(
+    contributionPreview > secondaryStatus,
+    "the consent status still resolves before the contribution preview",
   );
 });
 
@@ -12548,4 +12611,56 @@ test("the journey names the unanswered health, never an index that is not the bl
   );
   assert.doesNotMatch(appSource, /journey\.community\.waitingCompanion/u);
   assert.doesNotMatch(localizationSource, /journey\.community\.waitingCompanion/u);
+});
+
+test("Forest Ink dark appearance is explicit, balanced, and live-updateable", async () => {
+  const [styles, appSource] = await Promise.all([
+    readFile(new URL("../public/styles.css", import.meta.url), "utf8"),
+    readFile(new URL("../public/app.js", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(styles, /html\[data-theme="dark"\] \{/u);
+  assert.match(styles, /--paper: #141a17;/u);
+  assert.match(styles, /--surface-raised: #24322c;/u);
+  assert.match(styles, /--ink: #f5f1e8;/u);
+  assert.match(styles, /--green: #76aa9c;/u);
+  assert.match(styles, /--feature-bg: #2d7466;/u);
+  assert.match(styles, /--chart-accent: #99c5ba;/u);
+  assert.match(styles, /--blue: #7d9eb8;/u);
+  assert.match(
+    styles,
+    /html\[data-theme="dark"\] \.weekly-hero \{[\s\S]*?gap: 0;[\s\S]*?padding: 0;[\s\S]*?background: var\(--surface\);/u,
+  );
+  assert.match(
+    styles,
+    /html\[data-theme="dark"\] \.weekly-hero > div:first-child \{[\s\S]*?background: var\(--feature-bg\);/u,
+  );
+  assert.match(
+    styles,
+    /html\[data-theme="dark"\] \.notice\.notice-info\.accounting-disclosure \{[\s\S]*?border-inline-start: 3px solid var\(--blue\);[\s\S]*?background: var\(--surface\);/u,
+  );
+  assert.match(
+    styles,
+    /Portable share-card exports deliberately keep the existing light brand/u,
+  );
+  assert.doesNotMatch(
+    styles,
+    /@media[^\{]*prefers-color-scheme[^\{]*\{[\s\S]*?--paper: #141a17/u,
+  );
+
+  assert.match(
+    appSource,
+    /const NATIVE_APPEARANCE_THEMES = new Set\(\["light", "dark"\]\)/u,
+  );
+  assert.match(
+    appSource,
+    /if \(!NATIVE_APPEARANCE_THEMES\.has\(theme\)\) return false;/u,
+  );
+  assert.match(appSource, /document\.documentElement\.dataset\.theme = theme/u);
+  assert.match(appSource, /__TIBOTATTLE_APPEARANCE__\?\.resolvedTheme/u);
+  assert.match(appSource, /"tibotattle:appearance-override"/u);
+  assert.match(
+    appSource,
+    /theme === "dark" \? "#141a17" : "#f5f1e8"/u,
+  );
 });

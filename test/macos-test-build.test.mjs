@@ -48,6 +48,20 @@ test("test compiler profile builds a development-only launcher that runs", {
     });
     assert.equal(smoke.status, 0, smoke.error?.message ?? smoke.stderr);
     assert.match(smoke.stdout, /runtime=development_disabled/u);
+    const progressSmoke = spawnSync(
+      launcher,
+      ["--native-analysis-progress-contract-smoke-test"],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(
+      progressSmoke.status,
+      0,
+      progressSmoke.error?.message ?? progressSmoke.stderr,
+    );
+    assert.match(
+      progressSmoke.stdout,
+      /phases=allowlisted[\s\S]*counts=bounded[\s\S]*unknown=generic[\s\S]*free_text=ignored/u,
+    );
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }

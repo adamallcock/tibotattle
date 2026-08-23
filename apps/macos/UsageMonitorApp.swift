@@ -317,6 +317,65 @@ private enum NativeRefreshIntervalPreference {
     }
 }
 
+/// One persisted appearance choice owns both AppKit and the embedded report.
+/// `system` stores an explicit preference, but leaves `NSApp.appearance` nil so
+/// scheduled and user-driven macOS appearance changes continue to flow
+/// through without the app guessing at the system setting.
+private enum NativeAppearancePreference: String, CaseIterable {
+    case system
+    case light
+    case dark
+
+    static let defaultsKey = "tibotattle.appearance.v1"
+
+    static var current: NativeAppearancePreference {
+        current(in: .standard)
+    }
+
+    static func current(
+        in defaults: UserDefaults
+    ) -> NativeAppearancePreference {
+        guard let rawValue = defaults.string(forKey: defaultsKey),
+              let preference = NativeAppearancePreference(rawValue: rawValue)
+        else {
+            return .system
+        }
+        return preference
+    }
+
+    static func set(
+        _ preference: NativeAppearancePreference,
+        in defaults: UserDefaults = .standard
+    ) {
+        defaults.set(preference.rawValue, forKey: defaultsKey)
+    }
+
+    var applicationAppearance: NSAppearance? {
+        switch self {
+        case .system:
+            nil
+        case .light:
+            NSAppearance(named: .aqua)
+        case .dark:
+            NSAppearance(named: .darkAqua)
+        }
+    }
+
+    func resolvedTheme(for systemAppearance: NSAppearance) -> String {
+        switch self {
+        case .light:
+            return "light"
+        case .dark:
+            return "dark"
+        case .system:
+            return systemAppearance.bestMatch(from: [.darkAqua, .aqua])
+                == .darkAqua
+                ? "dark"
+                : "light"
+        }
+    }
+}
+
 private enum NativeRefreshIntervalSelection {
     @discardableResult
     static func apply(
@@ -556,7 +615,10 @@ private final class AppUpdater: NSObject {
             feedIsReachable = false
             setState(.failed)
             if userInitiated {
-                showFeedFailureAlert()
+                showUpdateFailureAlert(
+                    messageKey: .launcherUpdateUnavailable,
+                    informativeTextKey: .settingsAutomaticUpdatesUnavailable
+                )
             }
             return
         }
@@ -580,7 +642,10 @@ private final class AppUpdater: NSObject {
                     self.feedIsReachable = false
                     self.setState(.failed)
                     if userInitiated {
-                        self.showFeedFailureAlert()
+                        self.showUpdateFailureAlert(
+                            messageKey: .settingsUpdateCheckUnavailableTitle,
+                            informativeTextKey: .settingsUpdateCheckUnavailableMessage
+                        )
                     }
                     return
                 }
@@ -590,15 +655,14 @@ private final class AppUpdater: NSObject {
         }.resume()
     }
 
-    private func showFeedFailureAlert() {
+    private func showUpdateFailureAlert(
+        messageKey: TiboTattleLocalization.Key,
+        informativeTextKey: TiboTattleLocalization.Key
+    ) {
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = TiboTattleLocalization.string(
-            .launcherUpdateUnavailable
-        )
-        alert.informativeText = TiboTattleLocalization.string(
-            .settingsAutomaticUpdatesUnavailable
-        )
+        alert.messageText = TiboTattleLocalization.string(messageKey)
+        alert.informativeText = TiboTattleLocalization.string(informativeTextKey)
         alert.addButton(withTitle: TiboTattleLocalization.string(.launcherRetry))
         alert.addButton(withTitle: TiboTattleLocalization.string(.commonCancel))
         if alert.runModal() == .alertFirstButtonReturn {
@@ -828,7 +892,11 @@ private enum LauncherError: LocalizedError {
     case companionLaunch(String)
     case companionTimeout
     case codexHomeSettingsWrite
+    case dashboardContentProcessTerminated
     case dashboardDownloadFailed
+    case dashboardNavigationFailed
+    case dashboardReadinessTimeout
+    case dashboardViewportUnavailable
     case dashboardWebViewUnavailable
     case dataErase
     case firstRunStateWrite
@@ -876,9 +944,25 @@ private enum LauncherError: LocalizedError {
             return TiboTattleLocalization.string(
                 .launcherErrorCodexHomeSettingsWrite
             )
+        case .dashboardContentProcessTerminated:
+            return TiboTattleLocalization.string(
+                .launcherErrorDashboardContentProcessTerminated
+            )
         case .dashboardDownloadFailed:
             return TiboTattleLocalization.string(
                 .launcherErrorDashboardDownloadFailed
+            )
+        case .dashboardNavigationFailed:
+            return TiboTattleLocalization.string(
+                .launcherErrorDashboardNavigationFailed
+            )
+        case .dashboardReadinessTimeout:
+            return TiboTattleLocalization.string(
+                .launcherErrorDashboardReadinessTimeout
+            )
+        case .dashboardViewportUnavailable:
+            return TiboTattleLocalization.string(
+                .launcherErrorDashboardViewportUnavailable
             )
         case .dashboardWebViewUnavailable:
             return TiboTattleLocalization.string(
@@ -932,8 +1016,16 @@ private enum LauncherError: LocalizedError {
             return "UM_MACOS_COMPANION_START_TIMEOUT"
         case .codexHomeSettingsWrite:
             return "UM_MACOS_CODEX_HOME_SETTINGS_WRITE_FAILED"
+        case .dashboardContentProcessTerminated:
+            return "UM_MACOS_DASHBOARD_WEB_PROCESS_TERMINATED"
         case .dashboardDownloadFailed:
             return "UM_MACOS_DASHBOARD_DOWNLOAD_FAILED"
+        case .dashboardNavigationFailed:
+            return "UM_MACOS_DASHBOARD_NAVIGATION_FAILED"
+        case .dashboardReadinessTimeout:
+            return "UM_MACOS_DASHBOARD_READY_TIMEOUT"
+        case .dashboardViewportUnavailable:
+            return "UM_MACOS_DASHBOARD_VIEWPORT_UNAVAILABLE"
         case .dashboardWebViewUnavailable:
             return "UM_MACOS_DASHBOARD_VIEW_UNAVAILABLE"
         case .dataErase:
@@ -976,7 +1068,9 @@ private enum LauncherError: LocalizedError {
             return TiboTattleLocalization.string(
                 .launcherRecoveryDashboardDownload
             )
-        case .dashboardWebViewUnavailable:
+        case .dashboardContentProcessTerminated, .dashboardNavigationFailed,
+             .dashboardReadinessTimeout, .dashboardViewportUnavailable,
+             .dashboardWebViewUnavailable:
             return TiboTattleLocalization.string(
                 .launcherRecoveryDashboardWebView
             )
@@ -1864,6 +1958,41 @@ private struct LocalKeychainResetResult: Decodable {
     }
 }
 
+/// Removes browser commands that do not belong in TiboTattle's single-page
+/// dashboard while preserving useful page commands such as Reload, Copy, and
+/// Open Link. WKWebView does not expose a public context-menu delegate on
+/// macOS, but it does identify the NSMenuItems it supplies. Filtering those
+/// identifiers here avoids localized-title matching and leaves the rest of
+/// WebKit's menu behavior intact.
+@MainActor
+private final class NativeDashboardWebView: WKWebView {
+    private static let unsupportedContextMenuIdentifiers: Set<
+        NSUserInterfaceItemIdentifier
+    > = [
+        NSUserInterfaceItemIdentifier("WKMenuItemIdentifierGoBack"),
+        NSUserInterfaceItemIdentifier("WKMenuItemIdentifierGoForward"),
+        NSUserInterfaceItemIdentifier(
+            "WKMenuItemIdentifierDownloadLinkedFile"
+        ),
+    ]
+
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        super.willOpenMenu(menu, with: event)
+        Self.stripUnsupportedContextMenuItems(from: menu)
+    }
+
+    static func stripUnsupportedContextMenuItems(from menu: NSMenu) {
+        for item in menu.items {
+            guard let identifier = item.identifier,
+                  unsupportedContextMenuIdentifiers.contains(identifier)
+            else {
+                continue
+            }
+            menu.removeItem(item)
+        }
+    }
+}
+
 /// The dashboard is hosted inside the app, so this web view is the product's
 /// primary surface. It is deliberately the narrowest possible browser: it may
 /// load exactly one origin — the loopback companion this launcher started —
@@ -1875,7 +2004,7 @@ private struct LocalKeychainResetResult: Decodable {
 private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelegate,
     WKDownloadDelegate, WKScriptMessageHandler {
     private let onLoaded: () -> Void
-    private let onFailure: (String) -> Void
+    private let onFailure: (LauncherError) -> Void
     private let onDownloadFailure: () -> Void
     private let openExternally: (URL) -> Void
     private let onNavigation: (String) -> Void
@@ -1903,7 +2032,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
 
     init(
         onLoaded: @escaping () -> Void,
-        onFailure: @escaping (String) -> Void,
+        onFailure: @escaping (LauncherError) -> Void,
         onDownloadFailure: @escaping () -> Void,
         openExternally: @escaping (URL) -> Void,
         onNavigation: @escaping (String) -> Void,
@@ -1935,7 +2064,10 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         Self.addDocumentStartScripts(
             to: configuration.userContentController
         )
-        webView = WKWebView(frame: .zero, configuration: configuration)
+        webView = NativeDashboardWebView(
+            frame: .zero,
+            configuration: configuration
+        )
         super.init()
         configuration.userContentController.add(
             self,
@@ -1952,6 +2084,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = false
+        webView.allowsLinkPreview = false
         webView.setAccessibilityLabel(
             TiboTattleLocalization.string(.accessibilityLocalDashboard)
         )
@@ -1980,6 +2113,48 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         return "window.__TIBOTATTLE_LOCALIZATION__ = \(json);"
     }
 
+    /// Paint the report in the native appearance before its stylesheet gets a
+    /// first frame. The preference and its resolved light/dark value are both
+    /// handed over: the former is useful context, while the latter is the only
+    /// bounded value the page is permitted to render.
+    private static func appearanceHandoffScript() -> String {
+        let preference = NativeAppearancePreference.current
+        let resolvedTheme = preference.resolvedTheme(
+            for: NSApp.effectiveAppearance
+        )
+        let payload: [String: Any] = [
+            "schemaVersion": 1,
+            "host": "native",
+            "preference": preference.rawValue,
+            "resolvedTheme": resolvedTheme,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8)
+        else {
+            return "window.__TIBOTATTLE_APPEARANCE__ = null;"
+        }
+        return """
+        window.__TIBOTATTLE_APPEARANCE__ = \(json);
+        (function () {
+          function applyNativeAppearance() {
+            const handoff = window.__TIBOTATTLE_APPEARANCE__;
+            const theme = handoff?.resolvedTheme;
+            if (theme !== 'light' && theme !== 'dark') return;
+            if (document.documentElement) {
+              document.documentElement.dataset.theme = theme;
+              document.documentElement.style.colorScheme = theme;
+            }
+            const themeColor = document.querySelector?.('meta[name="theme-color"]');
+            if (themeColor) {
+              themeColor.content = theme === 'dark' ? '#141a17' : '#f5f1e8';
+            }
+          }
+          applyNativeAppearance();
+          document.addEventListener('DOMContentLoaded', applyNativeAppearance, { once: true });
+        })();
+        """
+    }
+
     /// The AppKit frame owns navigation and refresh in the installed app.
     /// Install this fixed marker before any dashboard script runs so the
     /// public-web header cannot flash, or remain visible if WebKit delays a
@@ -2004,6 +2179,13 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     private static func addDocumentStartScripts(
         to controller: WKUserContentController
     ) {
+        controller.addUserScript(
+            WKUserScript(
+                source: appearanceHandoffScript(),
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: true
+            )
+        )
         controller.addUserScript(
             WKUserScript(
                 source: localizationHandoffScript(),
@@ -2036,7 +2218,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
               url.host == loopbackHost,
               let port = url.port
         else {
-            onFailure(LauncherError.healthCheck.failureCode)
+            onFailure(.healthCheck)
             return
         }
         allowedPort = port
@@ -2059,7 +2241,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
             guard viewportPreparationAttempts < 20 else {
                 pendingDashboardURL = nil
                 hasDashboardTarget = false
-                onFailure(LauncherError.dashboardWebViewUnavailable.failureCode)
+                onFailure(.dashboardViewportUnavailable)
                 return
             }
             viewportPreparationAttempts += 1
@@ -2179,6 +2361,43 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         // other width-sensitive controls measure their translated labels
         // after that redraw has committed, without reloading the document or
         // interrupting the active hosted-sign-in attempt.
+        window.requestAnimationFrame?.(() => {
+          window.dispatchEvent(new Event('resize'));
+        });
+        """)
+    }
+
+    /// Change the live document without reloading it. The native shell has
+    /// already applied this appearance to AppKit; the resolved value makes the
+    /// report follow the same effective appearance when the stored choice is
+    /// `system`.
+    func notifyAppearancePreferenceChange(
+        _ preference: NativeAppearancePreference
+    ) {
+        guard hasDashboardTarget else { return }
+        // The live event below updates the current document, but WebKit's
+        // context-menu Reload creates a new document without passing through
+        // loadWhenViewportIsReady(). Refresh the document-start snapshot now
+        // so that later manual reload starts in the same resolved appearance
+        // instead of replaying whichever theme was current when this host was
+        // first constructed.
+        refreshDocumentStartScripts()
+        let payload: [String: Any] = [
+            "schemaVersion": 1,
+            "host": "native",
+            "preference": preference.rawValue,
+            "resolvedTheme": preference.resolvedTheme(
+                for: NSApp.effectiveAppearance
+            ),
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8)
+        else { return }
+        webView.evaluateJavaScript("""
+        window.__TIBOTATTLE_APPEARANCE__ = \(json);
+        window.dispatchEvent(new CustomEvent('tibotattle:appearance-override', {
+          detail: window.__TIBOTATTLE_APPEARANCE__
+        }));
         window.requestAnimationFrame?.(() => {
           window.dispatchEvent(new Event('resize'));
         });
@@ -2319,7 +2538,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
             }
             guard Date() < deadline else {
                 self.hasDashboardTarget = false
-                self.onFailure(LauncherError.dashboardWebViewUnavailable.failureCode)
+                self.onFailure(.dashboardReadinessTimeout)
                 return
             }
             DispatchQueue.main.asyncAfter(
@@ -2349,7 +2568,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         guard hasDashboardTarget else { return }
         hasDashboardTarget = false
-        onFailure(LauncherError.dashboardWebViewUnavailable.failureCode)
+        onFailure(.dashboardContentProcessTerminated)
     }
 
     private func reportNavigationFailure(_ error: Error) {
@@ -2362,7 +2581,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
             return
         }
         hasDashboardTarget = false
-        onFailure(LauncherError.dashboardWebViewUnavailable.failureCode)
+        onFailure(.dashboardNavigationFailed)
     }
 
     // MARK: - Window, dialog, and file affordances
@@ -2580,24 +2799,16 @@ private enum NativeDashboardDestination: String, CaseIterable {
 /// that has, twice, resolved to zero before the window existed.
 @MainActor
 private final class NativeDashboardReportPane: NSView {
-    /// `--paper` from the dashboard stylesheet. The report document has no
-    /// dark variant, so a fixed value is the honest match. Painting it here
-    /// means no system grey is ever visible in the strip the title bar
-    /// reserves, or in the instant before WebKit has drawn.
-    private static let paper = NSColor(
-        srgbRed: 0xF5 / 255,
-        green: 0xF1 / 255,
-        blue: 0xE8 / 255,
-        alpha: 1
-    )
-
     private let webView: WKWebView
+    var onAppearanceChange: (() -> Void)?
+
+    override var wantsUpdateLayer: Bool { true }
 
     init(webView: WKWebView) {
         self.webView = webView
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.backgroundColor = Self.paper.cgColor
+        layer?.backgroundColor = NativeBrandPalette.reportPaper.cgColor
         webView.translatesAutoresizingMaskIntoConstraints = true
         // Deliberately no autoresizing mask.  The pane now insets WebKit by
         // its own safe area, and a mask would spring the view back to the full
@@ -2609,6 +2820,19 @@ private final class NativeDashboardReportPane: NSView {
 
     required init?(coder: NSCoder) {
         nil
+    }
+
+    /// Match the report's `--paper` token during the gap before WebKit paints
+    /// and in the titlebar safe-area strip. Dynamic colors must be re-resolved
+    /// here because a CALayer does not track appearance changes on its own.
+    override func updateLayer() {
+        layer?.backgroundColor = NativeBrandPalette.reportPaper.cgColor
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+        onAppearanceChange?()
     }
 
     override func layout() {
@@ -2697,13 +2921,13 @@ private struct NativeDashboardChromeMetrics {
 /// accent is lifted for contrast and the paper wash becomes a deep-green
 /// cast rather than a glaring cream sheet.
 private enum NativeBrandPalette {
-    /// Web accent #174f45, lifted for dark backgrounds.
+    /// Web accent #174f45 in light appearance and Forest Ink #76aa9c in dark.
     static let accent = NSColor(name: nil) { appearance in
         appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
             ? NSColor(
-                srgbRed: 122 / 255,
-                green: 184 / 255,
-                blue: 170 / 255,
+                srgbRed: 118 / 255,
+                green: 170 / 255,
+                blue: 156 / 255,
                 alpha: 1
             )
             : NSColor(
@@ -2714,14 +2938,32 @@ private enum NativeBrandPalette {
             )
     }
 
+    /// Exact web report paper in each appearance. Painting this behind
+    /// WKWebView prevents a mismatched system-grey flash at launch or reload.
+    static let reportPaper = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(
+                srgbRed: 20 / 255,
+                green: 26 / 255,
+                blue: 23 / 255,
+                alpha: 1
+            )
+            : NSColor(
+                srgbRed: 245 / 255,
+                green: 241 / 255,
+                blue: 232 / 255,
+                alpha: 1
+            )
+    }
+
     /// Web background #f5f1e8, washed over the system sidebar material so
     /// vibrancy still reads through it.
     static let sidebarWash = NSColor(name: nil) { appearance in
         appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
             ? NSColor(
-                srgbRed: 23 / 255,
-                green: 79 / 255,
-                blue: 69 / 255,
+                srgbRed: 45 / 255,
+                green: 116 / 255,
+                blue: 102 / 255,
                 alpha: 0.22
             )
             : NSColor(
@@ -2963,11 +3205,15 @@ private final class NativeDashboardChrome: NSSplitViewController {
     /// and above the report item's default 250 so a window resize stretches
     /// the report rather than the sidebar.
     private static let sidebarHoldingPriority = NSLayoutConstraint.Priority(260)
-    private static let splitAutosaveName = "com.usagemonitor.local.dashboard-split.v1"
+    static let splitAutosaveName = "com.usagemonitor.local.dashboard-split.v1"
     /// One-time marker that the resting width has been seeded. After this,
     /// the autosaved divider position is the user's own and is never fought.
     private static let splitSeededDefaultsKey =
         "tibotattle.dashboard-split-seeded.v1"
+    /// One-time marker that a sidebar stranded by an older build has been
+    /// reopened. See `rescueStrandedSidebar(_:)`.
+    static let sidebarRescuedDefaultsKey =
+        "tibotattle.dashboard-sidebar-rescued.v1"
 
     private let sidebar = NSVisualEffectView()
     private let sidebarWash = NativeSidebarBrandWash()
@@ -2977,6 +3223,11 @@ private final class NativeDashboardChrome: NSSplitViewController {
     private var restingWidthSeeded = false
 
     var onNavigate: ((NativeDashboardDestination) -> Void)?
+    var onAppearanceChange: (() -> Void)? {
+        didSet {
+            reportPane.onAppearanceChange = onAppearanceChange
+        }
+    }
 
     init(webView: WKWebView) {
         reportPane = NativeDashboardReportPane(webView: webView)
@@ -3091,6 +3342,46 @@ private final class NativeDashboardChrome: NSSplitViewController {
         nil
     }
 
+    /// The sidebar pane's split item. The sidebar is added first, so it is the
+    /// leading item; reading it back through `splitViewItems` keeps a single
+    /// source of truth rather than a second stored reference that could drift.
+    private var sidebarItem: NSSplitViewItem? { splitViewItems.first }
+
+    /// Whether the sidebar is currently collapsed. The navigation rows live
+    /// only here — the web report hides its own sidebar in native mode — so a
+    /// collapsed sidebar is a window with no way to change page.
+    var sidebarIsCollapsed: Bool { sidebarItem?.isCollapsed ?? false }
+
+    /// Reopen the sidebar. Returns true when it actually reopened one, so a
+    /// caller (and the smoke test) can tell a rescue from a no-op.
+    @discardableResult
+    func revealSidebar() -> Bool {
+        guard let item = sidebarItem, item.isCollapsed else { return false }
+        item.isCollapsed = false
+        return true
+    }
+
+    /// Reopen a sidebar that an older build could strand shut.
+    ///
+    /// Dragging the divider to the leading edge collapses the sidebar, and the
+    /// split view's autosave persists that across relaunches — but builds
+    /// through 0.1.16 shipped no toolbar item, menu command, or key equivalent
+    /// that could reopen it, and a collapsed pane has no divider left to drag.
+    /// The result was a window with no navigation at all, permanently
+    /// (owner-reported, 2026-08-22).
+    ///
+    /// This build adds those affordances, so a collapse is now the user's
+    /// reversible choice and must be respected. The one exception is the
+    /// stranded state itself: reopen it exactly once, on the first launch that
+    /// can undo it, then record the marker and never reopen again.
+    private func rescueStrandedSidebar(_ defaults: UserDefaults) {
+        guard !defaults.bool(forKey: Self.sidebarRescuedDefaultsKey) else {
+            return
+        }
+        defaults.set(true, forKey: Self.sidebarRescuedDefaultsKey)
+        revealSidebar()
+    }
+
     /// The very first launch has no autosaved divider to restore, and plain
     /// constraint solving would rest the sidebar at its 180pt minimum. Seed
     /// the designed 216pt opening width exactly once; every later launch
@@ -3100,12 +3391,35 @@ private final class NativeDashboardChrome: NSSplitViewController {
         guard !restingWidthSeeded else { return }
         restingWidthSeeded = true
         let defaults = UserDefaults.standard
+        // Before the seeding gate below: every already-installed user has the
+        // seeded marker set, and a stranded sidebar is exactly the state those
+        // users are in, so a rescue behind that early return would never run.
+        rescueStrandedSidebar(defaults)
         guard !defaults.bool(forKey: Self.splitSeededDefaultsKey) else {
             return
         }
         defaults.set(true, forKey: Self.splitSeededDefaultsKey)
         view.layoutSubtreeIfNeeded()
         splitView.setPosition(Self.sidebarRestingThickness, ofDividerAt: 0)
+    }
+
+    /// Keep the sidebar command readable in the View menu: AppKit flips the
+    /// toolbar item's own label, but a menu item keeps whatever title it was
+    /// built with unless validation rewrites it.
+    override func validateUserInterfaceItem(
+        _ item: NSValidatedUserInterfaceItem
+    ) -> Bool {
+        if item.action == #selector(NSSplitViewController.toggleSidebar(_:)) {
+            if let menuItem = item as? NSMenuItem {
+                menuItem.title = TiboTattleLocalization.string(
+                    sidebarIsCollapsed
+                        ? .nativeDashboardShowSidebar
+                        : .nativeDashboardHideSidebar
+                )
+            }
+            return true
+        }
+        return super.validateUserInterfaceItem(item)
     }
 
     func select(_ destination: NativeDashboardDestination) {
@@ -3191,6 +3505,86 @@ private final class NativeDashboardChrome: NSSplitViewController {
     }
 }
 
+/// Stable, non-localized identifiers for the three Settings pages. A page is
+/// reachable only through its toolbar tab, so all three are mandatory.
+private enum NativeSettingsToolbarPolicy {
+    static let generalIdentifier = NSToolbarItem.Identifier(
+        "com.usagemonitor.local.settings-general"
+    )
+    static let notificationsIdentifier = NSToolbarItem.Identifier(
+        "com.usagemonitor.local.settings-notifications"
+    )
+    static let aboutIdentifier = NSToolbarItem.Identifier(
+        "com.usagemonitor.local.settings-about"
+    )
+    static let mandatoryTabIdentifiers: Set<NSToolbarItem.Identifier> = [
+        generalIdentifier,
+        notificationsIdentifier,
+        aboutIdentifier,
+    ]
+}
+
+/// NSTabViewController supplies the Settings toolbar items, while this proxy
+/// adds the removal policy AppKit's generated delegate does not expose. Every
+/// item-building and selection query still forwards to the tab controller, so
+/// tab behavior remains owned by AppKit.
+@MainActor
+private final class NativeSettingsToolbarDelegate: NSObject,
+    NSToolbarDelegate {
+    private weak var tabController: NSTabViewController?
+
+    init(tabController: NSTabViewController) {
+        self.tabController = tabController
+        super.init()
+    }
+
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
+        willBeInsertedIntoToolbar flag: Bool
+    ) -> NSToolbarItem? {
+        tabController?.toolbar(
+            toolbar,
+            itemForItemIdentifier: itemIdentifier,
+            willBeInsertedIntoToolbar: flag
+        )
+    }
+
+    func toolbarDefaultItemIdentifiers(
+        _ toolbar: NSToolbar
+    ) -> [NSToolbarItem.Identifier] {
+        tabController?.toolbarDefaultItemIdentifiers(toolbar) ?? []
+    }
+
+    func toolbarAllowedItemIdentifiers(
+        _ toolbar: NSToolbar
+    ) -> [NSToolbarItem.Identifier] {
+        tabController?.toolbarAllowedItemIdentifiers(toolbar) ?? []
+    }
+
+    func toolbarSelectableItemIdentifiers(
+        _ toolbar: NSToolbar
+    ) -> [NSToolbarItem.Identifier] {
+        tabController?.toolbarSelectableItemIdentifiers(toolbar) ?? []
+    }
+
+    func toolbarImmovableItemIdentifiers(
+        _ toolbar: NSToolbar
+    ) -> Set<NSToolbarItem.Identifier> {
+        NativeSettingsToolbarPolicy.mandatoryTabIdentifiers
+    }
+
+    func toolbar(
+        _ toolbar: NSToolbar,
+        itemIdentifier: NSToolbarItem.Identifier,
+        canBeInsertedAt index: Int
+    ) -> Bool {
+        index != NSNotFound
+            || !NativeSettingsToolbarPolicy.mandatoryTabIdentifiers
+                .contains(itemIdentifier)
+    }
+}
+
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate,
     NSWindowDelegate, NSToolbarDelegate {
@@ -3219,6 +3613,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private var menuBarStatus: MenuBarStatusController?
     private var settingsWindow: NSWindow?
     private var settingsTabs: NSTabViewController?
+    private var settingsToolbarDelegate: NativeSettingsToolbarDelegate?
     private var settingsPages: [SettingsPage] = []
     private weak var settingsCodexHomeLabel: NSTextField?
     private weak var settingsAutomaticUpdatesSwitch: NSSwitch?
@@ -3233,6 +3628,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private weak var settingsQuotaNotificationsSwitch: NSSwitch?
     private weak var settingsQuotaNotificationThresholds: NSSegmentedControl?
     private weak var settingsQuotaNotificationStatusLabel: NSTextField?
+    private weak var settingsAppearancePicker: NSPopUpButton?
     private weak var settingsRefreshIntervalPicker: NSPopUpButton?
     private let nativeEvidenceReader = LocalCompanionEvidenceReader()
     private var quotaNotificationCoordinator: QuotaNotificationCoordinator?
@@ -3247,6 +3643,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private var nativeRefreshPoll: DispatchWorkItem?
     private var nativeRefreshSchedule: DispatchWorkItem?
     private var nativeRefreshInFlight = false
+    private var nativeRefreshProgress: LocalAnalysisProgress?
     /// One launch-only refresh waits until the page has rendered its first
     /// local result. This prevents the heavy collector from winning the
     /// loopback race against the dashboard's own initial reads.
@@ -3271,6 +3668,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     static let toolbarSettingsIdentifier = NSToolbarItem.Identifier(
         "com.usagemonitor.local.dashboard-settings"
     )
+    static let mandatoryDashboardToolbarItemIdentifiers: Set<
+        NSToolbarItem.Identifier
+    > = [
+        .toggleSidebar,
+        toolbarStatusRefreshIdentifier,
+        toolbarShareIdentifier,
+        toolbarSettingsIdentifier,
+    ]
     private let statusLabel = NSTextField(labelWithString:
         TiboTattleLocalization.string(.launcherStartingLocally))
     private let detailLabel = NSTextField(
@@ -3345,6 +3750,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = umask(0o077)
+        applyAppearancePreference(notifyDashboard: false)
         installApplicationMenu()
         createWindow()
         // Installed before any early return below so a launch that fails still
@@ -3411,6 +3817,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         // Read-only resynchronization after a user changes notification
         // permission in System Settings. This path cannot prompt by itself.
         quotaNotificationCoordinator?.refreshAuthorization()
+        // System appearance can change while TiboTattle is inactive. AppKit
+        // already updates native dynamic colors; this keeps the live report's
+        // explicit document theme synchronized when the window returns.
+        synchronizeResolvedAppearance()
     }
 
     private func showFirstRunDisclosure() -> Bool {
@@ -3840,6 +4250,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         _ toolbar: NSToolbar
     ) -> [NSToolbarItem.Identifier] {
         [
+            .toggleSidebar,
             .flexibleSpace,
             Self.toolbarStatusRefreshIdentifier,
             Self.toolbarShareIdentifier,
@@ -3851,11 +4262,30 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         _ toolbar: NSToolbar
     ) -> [NSToolbarItem.Identifier] {
         [
+            // The system sidebar toggle, first and always present. The sidebar
+            // can be collapsed by dragging its divider, and a collapsed pane
+            // leaves no divider to drag back — so the only guaranteed way back
+            // must live outside the sidebar. AppKit supplies this item, keeps
+            // its icon and Hide/Show label in step with the pane, and routes
+            // it to `toggleSidebar(_:)` down the responder chain.
+            .toggleSidebar,
             Self.toolbarStatusRefreshIdentifier,
             .flexibleSpace,
             Self.toolbarShareIdentifier,
             Self.toolbarSettingsIdentifier,
         ]
+    }
+
+    /// These controls are the native shell's only routes to navigation,
+    /// refresh, sharing, and Settings. AppKit's accessibility actions can
+    /// otherwise offer "Remove from Toolbar" even though customization and
+    /// configuration persistence are disabled. Declaring the product controls
+    /// immovable prevents user-initiated dragging or removal while leaving the
+    /// flexible spacer free to do its normal layout work.
+    func toolbarImmovableItemIdentifiers(
+        _ toolbar: NSToolbar
+    ) -> Set<NSToolbarItem.Identifier> {
+        Self.mandatoryDashboardToolbarItemIdentifiers
     }
 
     func toolbar(
@@ -3932,11 +4362,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             nativeStatusPill = pill
             nativeStatusToolbarItem = item
             updateNativeToolbar(
-                title: nativeToolbarEvidenceTitle(
-                    fallback: TiboTattleLocalization.string(
-                        .launcherStartingLocally
-                    )
-                ),
+                title: nativeRefreshInFlight
+                    ? nativeRefreshProgress?.nativeToolbarTitle
+                        ?? TiboTattleLocalization.string(
+                            .nativeDashboardUpdating
+                        )
+                    : nativeToolbarEvidenceTitle(
+                        fallback: TiboTattleLocalization.string(
+                            .launcherStartingLocally
+                        )
+                    ),
                 isRefreshing: nativeRefreshInFlight,
                 refreshEnabled: dashboardURL != nil
             )
@@ -3982,18 +4417,18 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         refreshEnabled: Bool
     ) {
         let statusTitle = isRefreshing
-            ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+            ? title
             : nativeToolbarEvidenceTitle(fallback: title)
         nativeStatusRefreshButton?.title = statusTitle
         nativeStatusRefreshButton?.toolTip = isRefreshing
-            ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+            ? statusTitle
             : nativeRefreshToolbarTooltip()
         nativeStatusRefreshButton?.image = NSImage(
             systemSymbolName: isRefreshing
                 ? "arrow.triangle.2.circlepath.circle.fill"
                 : "arrow.clockwise",
             accessibilityDescription: isRefreshing
-                ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+                ? statusTitle
                 : TiboTattleLocalization.string(
                     .nativeDashboardRefreshUsage
                 )
@@ -4033,7 +4468,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func refreshNativeToolbarLocalization() {
         let statusTitle = nativeRefreshInFlight
-            ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+            ? nativeRefreshProgress?.nativeToolbarTitle
+                ?? TiboTattleLocalization.string(.nativeDashboardUpdating)
             : nativeToolbarEvidenceTitle(
                 fallback: TiboTattleLocalization.string(
                     .nativeDashboardStatus
@@ -4041,14 +4477,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             )
         nativeStatusRefreshButton?.title = statusTitle
         nativeStatusRefreshButton?.toolTip = nativeRefreshInFlight
-            ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+            ? statusTitle
             : nativeRefreshToolbarTooltip()
         nativeStatusRefreshButton?.image = NSImage(
             systemSymbolName: nativeRefreshInFlight
                 ? "arrow.triangle.2.circlepath.circle.fill"
                 : "arrow.clockwise",
             accessibilityDescription: nativeRefreshInFlight
-                ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+                ? statusTitle
                 : TiboTattleLocalization.string(
                     .nativeDashboardRefreshUsage
                 )
@@ -4095,22 +4531,28 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         else {
             return
         }
-        nativeDashboardChrome?.select(.overview)
+        nativeDashboardChrome?.select(.weekly)
         // This is a closed local navigation: it exposes the report's already
         // rendered, privacy-reviewed share card and does not generate a new
         // process, read path, or native-to-JavaScript capability.
         webView.evaluateJavaScript("""
-        if (window.location.hash !== '#overview') {
-          window.location.hash = '#overview';
-        } else {
-          window.dispatchEvent(new HashChangeEvent('hashchange'));
-        }
-        window.setTimeout(function () {
-          document.getElementById('share-panel')?.scrollIntoView({
-            behavior: 'smooth',
-            block: 'start'
-          });
-        }, 0);
+        (function () {
+          function focusShareCard() {
+            window.requestAnimationFrame(function () {
+              document.getElementById('share-panel')?.scrollIntoView({
+                behavior: 'smooth',
+                block: 'start'
+              });
+            });
+          }
+          if (window.location.hash !== '#weekly') {
+            window.addEventListener('hashchange', focusShareCard, { once: true });
+            window.location.hash = '#weekly';
+          } else {
+            window.dispatchEvent(new HashChangeEvent('hashchange'));
+            focusShareCard();
+          }
+        }());
         """)
     }
 
@@ -4122,6 +4564,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         webView: WKWebView
     ) -> NativeDashboardChrome {
         let chrome = NativeDashboardChrome(webView: webView)
+        chrome.onAppearanceChange = { [weak self] in
+            self?.synchronizeResolvedAppearance()
+        }
         dashboardContentController?.addChild(chrome)
         let chromeView = chrome.view
         chromeView.translatesAutoresizingMaskIntoConstraints = false
@@ -4185,8 +4630,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         let host = dashboardWebHost ?? {
             let created = DashboardWebHost(
                 onLoaded: { [weak self] in self?.dashboardWebViewLoaded() },
-                onFailure: { [weak self] code in
-                    self?.dashboardWebViewFailed(code: code)
+                onFailure: { [weak self] failure in
+                    self?.dashboardWebViewFailed(failure)
                 },
                 onDownloadFailure: { [weak self] in
                     self?.reportDashboardDownloadFailure()
@@ -4215,7 +4660,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             TiboTattleLocalization.string(.launcherLoadingPrivateDashboard)
         updateNativeToolbar(
             title: nativeRefreshInFlight
-                ? TiboTattleLocalization.string(.nativeDashboardUpdating)
+                ? nativeRefreshProgress?.nativeToolbarTitle
+                    ?? TiboTattleLocalization.string(
+                        .nativeDashboardUpdating
+                    )
                 : TiboTattleLocalization.string(.nativeDashboardStarting),
             isRefreshing: nativeRefreshInFlight,
             refreshEnabled: dashboardURL != nil
@@ -4244,7 +4692,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         openInBrowserButton.isEnabled = true
         updateNativeToolbar(
             title: nativeRefreshInFlight
-                ? "Updating local usage…"
+                ? nativeRefreshProgress?.nativeToolbarTitle
+                    ?? TiboTattleLocalization.string(
+                        .nativeDashboardUpdating
+                    )
                 : "Local report ready",
             isRefreshing: nativeRefreshInFlight,
             refreshEnabled: dashboardURL != nil
@@ -4301,6 +4752,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         cancelNativeRefreshSchedule()
         cancelNativeIndexingCoveragePoll()
         nativeRefreshInFlight = true
+        nativeRefreshProgress = nil
         updateNativeToolbar(
             title: automatic
                 ? TiboTattleLocalization.string(.launcherUpdatingAutomatically)
@@ -4355,8 +4807,17 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 }
                 let terminalRefreshID: String?
                 switch activity {
-                case .running:
+                case let .running(_, progress):
                     terminalRefreshID = nil
+                    self.nativeRefreshProgress = progress
+                    self.updateNativeToolbar(
+                        title: progress?.nativeToolbarTitle
+                            ?? TiboTattleLocalization.string(
+                                .nativeDashboardUpdating
+                            ),
+                        isRefreshing: true,
+                        refreshEnabled: false
+                    )
                     if remainingAttempts > 0 {
                         self.pollNativeRefresh(
                             base: base,
@@ -4433,6 +4894,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func finishNativeRefresh(title: String, refreshEnabled: Bool) {
         nativeRefreshInFlight = false
+        nativeRefreshProgress = nil
         nativeRefreshID = nil
         cancelNativeRefreshPoll()
         updateNativeToolbar(
@@ -4655,6 +5117,21 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         )
         refresh.target = self
         viewMenu.addItem(refresh)
+        // The standard macOS sidebar command, on the standard key equivalent.
+        // A collapsed sidebar has no divider left to drag, so this and the
+        // toolbar item are the two ways back; the title is rewritten to
+        // Hide/Show by the chrome's validation. Target stays nil so the
+        // responder chain delivers it to whichever dashboard window is key,
+        // and the item disables itself when none is.
+        viewMenu.addItem(NSMenuItem.separator())
+        let toggleSidebar = NSMenuItem(
+            title: TiboTattleLocalization.string(.nativeDashboardHideSidebar),
+            action: #selector(NSSplitViewController.toggleSidebar(_:)),
+            keyEquivalent: "s"
+        )
+        toggleSidebar.keyEquivalentModifierMask = [.control, .command]
+        toggleSidebar.target = nil
+        viewMenu.addItem(toggleSidebar)
         viewItem.submenu = viewMenu
         mainMenu.addItem(viewItem)
         NSApp.mainMenu = mainMenu
@@ -4678,7 +5155,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         alert.runModal()
     }
 
-    private func dashboardWebViewFailed(code: String) {
+    private func dashboardWebViewFailed(_ failure: LauncherError) {
         cancelNativeRefreshSchedule()
         startupAutomaticRefreshPending = false
         nativeEvidenceState = .readFailed
@@ -4686,13 +5163,27 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         dashboardContainer.isHidden = true
         statusStack.isHidden = false
         actionRow.isHidden = false
-        let failure = LauncherError.dashboardWebViewUnavailable
-        lastLifecycleStatus = "Dashboard unavailable"
+        let headline: TiboTattleLocalization.Key
+        switch failure {
+        case .dashboardContentProcessTerminated:
+            lastLifecycleStatus = "Dashboard web process terminated"
+            headline = .launcherDashboardDidNotOpen
+        case .dashboardNavigationFailed:
+            lastLifecycleStatus = "Dashboard navigation failed"
+            headline = .launcherDashboardDidNotOpen
+        case .dashboardReadinessTimeout:
+            lastLifecycleStatus = "Dashboard readiness timed out"
+            headline = .launcherDashboardTakingLonger
+        case .dashboardViewportUnavailable:
+            lastLifecycleStatus = "Dashboard viewport unavailable"
+            headline = .launcherDashboardDidNotOpen
+        default:
+            lastLifecycleStatus = "Dashboard unavailable"
+            headline = .launcherDashboardDidNotOpen
+        }
         lastFailureCode = failure.failureCode
         lastRecoverySuggestion = failure.recoverySuggestion
-        statusLabel.stringValue = TiboTattleLocalization.string(
-            .launcherDashboardDidNotOpen
-        )
+        statusLabel.stringValue = TiboTattleLocalization.string(headline)
         detailLabel.stringValue = TiboTattleLocalization.format(
             .launcherFailureDetails,
             failure.errorDescription ?? "",
@@ -4739,6 +5230,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         nativeHistoryIndexingCoverage = nil
         nativeRefreshFailure = nil
         nativeRefreshInFlight = false
+        nativeRefreshProgress = nil
         nativeRefreshID = nil
         dashboardWebHost?.stop()
         updateNativeToolbar(
@@ -5214,6 +5706,39 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         refitSettingsWindowToContent()
     }
 
+    private func updateAppearanceSettingsControl() {
+        guard let picker = settingsAppearancePicker else { return }
+        let preference = NativeAppearancePreference.current
+        if let index = picker.itemArray.firstIndex(where: {
+            ($0.representedObject as? String) == preference.rawValue
+        }) {
+            picker.selectItem(at: index)
+        }
+    }
+
+    private func applyAppearancePreference(
+        notifyDashboard: Bool = true
+    ) {
+        let preference = NativeAppearancePreference.current
+        NSApp.appearance = preference.applicationAppearance
+        updateAppearanceSettingsControl()
+        window?.contentView?.needsDisplay = true
+        if notifyDashboard {
+            dashboardWebHost?.notifyAppearancePreferenceChange(preference)
+        }
+    }
+
+    private func synchronizeResolvedAppearance() {
+        let preference = NativeAppearancePreference.current
+        updateAppearanceSettingsControl()
+        window?.contentView?.needsDisplay = true
+        // Explicit Light and Dark are intentionally insulated from later
+        // system changes. Only System follows the effective AppKit appearance;
+        // selecting any preference already sends its own immediate update.
+        guard preference == .system else { return }
+        dashboardWebHost?.notifyAppearancePreferenceChange(preference)
+    }
+
     private func updateRefreshIntervalSettingsControl() {
         guard let picker = settingsRefreshIntervalPicker else { return }
         let value = NativeRefreshIntervalPreference.seconds
@@ -5585,6 +6110,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         showSettings(selecting: 2)
     }
 
+    @objc private func selectAppearancePreference(
+        _ sender: NSPopUpButton
+    ) {
+        guard let rawPreference = sender.selectedItem?.representedObject
+            as? String,
+              let preference = NativeAppearancePreference(
+                  rawValue: rawPreference
+              )
+        else {
+            updateAppearanceSettingsControl()
+            return
+        }
+        NativeAppearancePreference.set(preference)
+        applyAppearancePreference()
+    }
+
     @objc private func selectLanguagePreference(_ sender: NSPopUpButton) {
         guard let rawPreference = sender.selectedItem?.representedObject
             as? String,
@@ -5650,11 +6191,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         settingsWindow?.close()
         settingsWindow = nil
         settingsTabs = nil
+        settingsToolbarDelegate = nil
         settingsPages = []
         settingsCodexHomeLabel = nil
         settingsAutomaticUpdatesSwitch = nil
         settingsAboutAutomaticUpdatesDetailLabel = nil
         settingsCheckForUpdatesButton = nil
+        settingsAppearancePicker = nil
         settingsRefreshIntervalPicker = nil
         if shouldRestoreSettings {
             showSettings(selecting: selectedSettingsTab)
@@ -5691,6 +6234,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             settingsTabs.selectedTabViewItemIndex = index
             updateSettingsCodexHomeSummary()
             updateAutomaticUpdatesSettingsControl()
+            updateAppearanceSettingsControl()
             updateRefreshIntervalSettingsControl()
             updateStartAtLoginSettingsControl()
             quotaNotificationCoordinator?.refreshAuthorization()
@@ -5718,6 +6262,49 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             action: #selector(useDefaultCodexHome)
         )
         let sourceActions = settingsControlRow([chooseSource, useDefaultSource])
+        let appearancePicker = NSPopUpButton(
+            frame: .zero,
+            pullsDown: false
+        )
+        let appearanceChoices: [(
+            NativeAppearancePreference,
+            TiboTattleLocalization.Key
+        )] = [
+            (.system, .settingsAppearanceSystem),
+            (.light, .settingsAppearanceLight),
+            (.dark, .settingsAppearanceDark),
+        ]
+        for (preference, key) in appearanceChoices {
+            appearancePicker.addItem(
+                withTitle: TiboTattleLocalization.string(key)
+            )
+            appearancePicker.lastItem?.representedObject = preference.rawValue
+        }
+        appearancePicker.target = self
+        appearancePicker.action = #selector(selectAppearancePreference(_:))
+        appearancePicker.toolTip = TiboTattleLocalization.string(
+            .settingsAppearancePickerHint
+        )
+        appearancePicker.setAccessibilityLabel(
+            TiboTattleLocalization.string(.settingsAppearance)
+        )
+        settingsAppearancePicker = appearancePicker
+        updateAppearanceSettingsControl()
+        let appearanceRow = NSStackView(views: [appearancePicker])
+        appearanceRow.orientation = .horizontal
+        appearanceRow.alignment = .centerY
+        let appearanceSection = settingsGroup(
+            title: TiboTattleLocalization.string(.settingsAppearance),
+            symbolName: "circle.lefthalf.filled",
+            views: [
+                appearanceRow,
+                settingsLabel(
+                    TiboTattleLocalization.string(.settingsAppearanceSummary),
+                    font: .systemFont(ofSize: 12),
+                    color: .secondaryLabelColor
+                ),
+            ]
+        )
         let languagePicker = NSPopUpButton(
             frame: .zero,
             pullsDown: false
@@ -6011,6 +6598,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             title: TiboTattleLocalization.string(.settingsGeneral),
             summary: TiboTattleLocalization.string(.settingsGeneralSummary),
             views: [
+                appearanceSection,
                 languageSection,
                 sourceSection,
                 refreshIntervalSection,
@@ -6122,24 +6710,27 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
         let tabs = NSTabViewController()
         tabs.tabStyle = .toolbar
-        for (label, symbol, controller) in [
+        for (identifier, label, symbol, controller) in [
             (
+                NativeSettingsToolbarPolicy.generalIdentifier,
                 TiboTattleLocalization.string(.settingsGeneral),
                 "gearshape",
                 general.controller
             ),
             (
+                NativeSettingsToolbarPolicy.notificationsIdentifier,
                 TiboTattleLocalization.string(.settingsNotifications),
                 "bell",
                 notifications.controller
             ),
             (
+                NativeSettingsToolbarPolicy.aboutIdentifier,
                 TiboTattleLocalization.string(.settingsAboutTab),
                 "info.circle",
                 about.controller
             ),
         ] {
-            let item = NSTabViewItem(identifier: label)
+            let item = NSTabViewItem(identifier: identifier)
             item.label = label
             item.image = NSImage(
                 systemSymbolName: symbol,
@@ -6150,6 +6741,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         }
         tabs.selectedTabViewItemIndex = index
         let newWindow = NSWindow(contentViewController: tabs)
+        let toolbarDelegate = NativeSettingsToolbarDelegate(
+            tabController: tabs
+        )
+        if let toolbar = newWindow.toolbar {
+            toolbar.allowsUserCustomization = false
+            toolbar.autosavesConfiguration = false
+            toolbar.delegate = toolbarDelegate
+        }
         newWindow.title = TiboTattleLocalization.string(.settingsWindowTitle)
         newWindow.styleMask = [.titled, .closable, .miniaturizable]
         // The window is as tall as the page it is showing. A hard-coded height
@@ -6175,6 +6774,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         newWindow.center()
         settingsWindow = newWindow
         settingsTabs = tabs
+        settingsToolbarDelegate = toolbarDelegate
         updateQuotaNotificationSettingsControls()
         newWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -7410,6 +8010,88 @@ private enum NativeRefreshSettingsContractSmokeTest {
     }
 }
 
+/// Exercises the complete persisted appearance contract in an isolated
+/// defaults suite. This proves that explicit choices never depend on AppKit
+/// timing, while System follows both light and dark effective appearances.
+/// It does not mutate the developer's normal TiboTattle preference.
+private enum NativeAppearanceSettingsContractSmokeTest {
+    private static let suiteName =
+        "com.usagemonitor.local.native-appearance-settings-contract"
+
+    static func run() -> Int32 {
+        guard let defaults = UserDefaults(suiteName: suiteName),
+              let aqua = NSAppearance(named: .aqua),
+              let darkAqua = NSAppearance(named: .darkAqua)
+        else {
+            return 1
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+
+        guard NativeAppearancePreference.current(in: defaults) == .system,
+              NativeAppearancePreference.system.applicationAppearance == nil,
+              NativeAppearancePreference.system.resolvedTheme(for: aqua)
+                == "light",
+              NativeAppearancePreference.system.resolvedTheme(for: darkAqua)
+                == "dark"
+        else {
+            return 1
+        }
+
+        NativeAppearancePreference.set(.light, in: defaults)
+        defaults.synchronize()
+        guard let reloaded = UserDefaults(suiteName: suiteName),
+              NativeAppearancePreference.current(in: reloaded) == .light,
+              NativeAppearancePreference.light.applicationAppearance?.name
+                == .aqua,
+              NativeAppearancePreference.light.resolvedTheme(for: darkAqua)
+                == "light"
+        else {
+            return 1
+        }
+
+        NativeAppearancePreference.set(.dark, in: reloaded)
+        reloaded.synchronize()
+        guard let darkReloaded = UserDefaults(suiteName: suiteName),
+              NativeAppearancePreference.current(in: darkReloaded) == .dark,
+              NativeAppearancePreference.dark.applicationAppearance?.name
+                == .darkAqua,
+              NativeAppearancePreference.dark.resolvedTheme(for: aqua)
+                == "dark"
+        else {
+            return 1
+        }
+
+        NativeAppearancePreference.set(.system, in: darkReloaded)
+        darkReloaded.synchronize()
+        guard let systemReloaded = UserDefaults(suiteName: suiteName),
+              NativeAppearancePreference.current(in: systemReloaded) == .system
+        else {
+            return 1
+        }
+
+        systemReloaded.set(
+            "unsupported",
+            forKey: NativeAppearancePreference.defaultsKey
+        )
+        guard NativeAppearancePreference.current(in: systemReloaded) == .system
+        else {
+            return 1
+        }
+
+        print(
+            "USAGE_MONITOR_MACOS_APPEARANCE_SETTINGS_CONTRACT "
+                + "default=system persisted=light,dark,system "
+                + "invalid=system system_resolution=light,dark "
+                + "explicit_resolution=light,dark "
+                + "appkit=system,aqua,darkAqua"
+        )
+        return 0
+    }
+}
+
 /// Exercises the login-item seam with a fake manager.  This mode deliberately
 /// never constructs the production login-item adapter or opens System Settings;
 /// it proves the registration boundary in an isolated
@@ -7650,6 +8332,155 @@ private enum LoginItemContractSmokeTest {
     }
 }
 
+/// Exercises the closed refresh-progress projection without contacting the
+/// companion. This proves that only allowlisted phases and bounded counts can
+/// reach native presentation, while the existing idle/running contract remains
+/// intact for unknown or forged fields.
+private enum NativeAnalysisProgressContractSmokeTest {
+    private static let refreshID = "123e4567-e89b-42d3-a456-426614174000"
+
+    private static func decode(
+        progress: [String: Any],
+        status: String = "running"
+    ) -> LocalAnalysisActivity? {
+        guard let data = try? JSONSerialization.data(withJSONObject: [
+            "refresh": [
+                "status": status,
+                "refreshId": refreshID,
+                "progress": progress,
+            ],
+        ]) else {
+            return nil
+        }
+        return LocalCompanionEvidenceReader.decodeActivity(data)
+    }
+
+    static func run() -> Int32 {
+        let phases: [(String, LocalAnalysisProgress.Phase)] = [
+            ("discovering", .discovering),
+            ("rollout_index", .rolloutIndex),
+            ("quota_refresh", .quotaRefresh),
+            ("quick_result", .quickResult),
+            ("complete", .complete),
+            ("paused", .paused),
+            ("prospective", .prospective),
+        ]
+        for (rawPhase, expectedPhase) in phases {
+            guard case let .running(decodedRefreshID, progress) = decode(
+                progress: ["phase": rawPhase]
+            ),
+                decodedRefreshID == refreshID,
+                progress?.phase == expectedPhase,
+                progress?.nativeToolbarTitle.isEmpty == false
+            else {
+                return failure("phase \(rawPhase)")
+            }
+        }
+
+        let counted = decode(progress: [
+            "phase": "rollout_index",
+            "filesSelected": 180,
+            "filesProcessed": 42,
+            "message": "/Users/private/repository",
+        ])
+        let expectedCountedTitle = TiboTattleLocalization.format(
+            .nativeDashboardProgressAnalyzingFiles,
+            TiboTattleLocalization.integerString(42),
+            TiboTattleLocalization.integerString(180)
+        )
+        guard case let .running(_, countedProgress) = counted,
+              countedProgress == LocalAnalysisProgress(
+                phase: .rolloutIndex,
+                filesSelected: 180,
+                filesProcessed: 42
+              ),
+              countedProgress?.nativeToolbarTitle == expectedCountedTitle
+        else {
+            return failure("bounded counts")
+        }
+
+        let unsafe = decode(progress: [
+            "phase": "rollout_index",
+            "filesSelected": 1_000_000_001,
+            "filesProcessed": -1,
+        ])
+        guard case let .running(_, unsafeProgress) = unsafe,
+              unsafeProgress?.filesSelected == nil,
+              unsafeProgress?.filesProcessed == nil
+        else {
+            return failure("unsafe counts")
+        }
+
+        let malformed = decode(progress: [
+            "phase": "rollout_index",
+            "filesSelected": true,
+            "filesProcessed": 4.5,
+        ])
+        guard case let .running(_, malformedProgress) = malformed,
+              malformedProgress?.filesSelected == nil,
+              malformedProgress?.filesProcessed == nil
+        else {
+            return failure("malformed counts")
+        }
+
+        let contradictory = decode(progress: [
+            "phase": "rollout_index",
+            "filesSelected": 2,
+            "filesProcessed": 3,
+        ])
+        guard case let .running(_, contradictoryProgress) = contradictory,
+              contradictoryProgress?.nativeToolbarTitle
+                == TiboTattleLocalization.string(
+                    .nativeDashboardProgressAnalyzing
+                )
+        else {
+            return failure("contradictory counts")
+        }
+
+        let archive = decode(progress: [
+            "kind": "archive_index",
+            "status": "scanning",
+        ])
+        guard case let .running(_, archiveProgress) = archive,
+              archiveProgress?.phase == .archiveIndex
+        else {
+            return failure("archive phase")
+        }
+
+        let unknown = decode(progress: [
+            "phase": "server_supplied_unreviewed_phase",
+            "message": "server supplied prose",
+        ])
+        guard case let .running(_, unknownProgress) = unknown,
+              unknownProgress == nil
+        else {
+            return failure("unknown phase")
+        }
+
+        guard decode(
+            progress: ["phase": "discovering"],
+            status: "succeeded"
+        ) == .idle(refreshID: refreshID) else {
+            return failure("idle contract")
+        }
+
+        print(
+            "USAGE_MONITOR_MACOS_ANALYSIS_PROGRESS_CONTRACT "
+                + "phases=allowlisted archive=scanning counts=bounded "
+                + "contradictory=generic unknown=generic free_text=ignored "
+                + "idle=unchanged percent=false eta=false"
+        )
+        return 0
+    }
+
+    private static func failure(_ detail: String) -> Int32 {
+        FileHandle.standardError.write(
+            Data("macOS analysis progress contract failed: \(detail)\n".utf8)
+        )
+        return 1
+    }
+}
+
 /// Exercises the real AppKit status item without starting the local companion
 /// or reading any local evidence. This catches the class of regression where a
 /// custom menu view has no measured frame and leaves an apparently empty menu
@@ -7690,7 +8521,14 @@ private enum MenuBarContractSmokeTest {
             weeklyLane,
             now: observedAt
         )
+        var analyzingLiveSnapshot = liveSnapshot
+        analyzingLiveSnapshot.phase = .analyzing
+        var analyzingWithoutLiveEvidence = MenuBarStatusSnapshot()
+        analyzingWithoutLiveEvidence.phase = .analyzing
+        var unavailableLiveSnapshot = liveSnapshot
+        unavailableLiveSnapshot.phase = .unavailable
         let reset = resetCountdown(resetAt, now: observedAt)
+        let expectedLiveTitle = TiboTattleLocalization.percentString(71)
         let expectedLiveSummary = reset.map {
             TiboTattleLocalization.format(
                 .menuBarQuotaWeeklyPositionResets,
@@ -7734,6 +8572,11 @@ private enum MenuBarContractSmokeTest {
                   elapsedPercent: 24,
                   usedPercent: 29
               ),
+              liveSnapshot.title == expectedLiveTitle,
+              analyzingLiveSnapshot.title == expectedLiveTitle,
+              analyzingWithoutLiveEvidence.title == "…",
+              staleSnapshot.title == "–",
+              unavailableLiveSnapshot.title == "–",
               liveSummary == expectedLiveSummary,
               staleSummary == expectedStaleSummary
         else {
@@ -7747,7 +8590,8 @@ private enum MenuBarContractSmokeTest {
                 + "native_rows=true titles=true states=starting,unavailable "
                 + "shortcuts=cmd-r,cmd-comma,cmd-q "
                 + "dismissal=native,escape,same-app,deactivation "
-                + "weekly_position=fresh-only"
+                + "weekly_position=fresh-only "
+                + "analysis_title=live-fallback"
         )
         return 0
     }
@@ -8466,6 +9310,322 @@ private enum NativeDashboardLayoutSmokeTest {
     }
 }
 
+/// Proves a collapsed sidebar can always be reopened.
+///
+/// Source text can show that a toolbar item and a menu command exist; it cannot
+/// show that either one reaches a live target, nor that the pane actually comes
+/// back with usable width. This drives the real chrome: collapse it the way a
+/// divider drag leaves it, then reopen it through the same action the toolbar
+/// and menu send, and check the one-time rescue for sidebars that older builds
+/// stranded shut.
+@MainActor
+private enum NativeDashboardSidebarRecoverySmokeTest {
+    static func run() -> Int32 {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        let defaults = UserDefaults.standard
+        // This runs inside the shipped bundle's own defaults domain, so the
+        // markers it must forge are saved and put back before returning.
+        let rescueKey = NativeDashboardChrome.sidebarRescuedDefaultsKey
+        let priorRescue = defaults.object(forKey: rescueKey)
+        defer {
+            if let priorRescue {
+                defaults.set(priorRescue, forKey: rescueKey)
+            } else {
+                defaults.removeObject(forKey: rescueKey)
+            }
+            // Defaults writes are asynchronous and this process exits
+            // immediately after returning; without the flush the restore is
+            // lost and the smoke would silently consume the real one-time
+            // rescue belonging to whoever ran it.
+            defaults.synchronize()
+        }
+
+        func makeChrome() -> (NativeDashboardChrome, NSWindow) {
+            let host = DashboardWebHost(
+                onLoaded: {},
+                onFailure: { _ in },
+                onDownloadFailure: {},
+                openExternally: { _ in },
+                onNavigation: { _ in },
+                onLanguagePreferenceChange: { _ in }
+            )
+            let chrome = NativeDashboardChrome(webView: host.webView)
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 1_180, height: 860),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                backing: .buffered,
+                defer: false
+            )
+            window.contentViewController = chrome
+            window.setContentSize(NSSize(width: 1_180, height: 860))
+            window.displayIfNeeded()
+            chrome.view.layoutSubtreeIfNeeded()
+            return (chrome, window)
+        }
+
+        // A collapsed item keeps its own pane's width — AppKit hides the pane
+        // rather than zeroing it — so the width alone cannot tell the states
+        // apart. What the user actually sees is where the report begins: flush
+        // against the window's leading edge with the sidebar gone, or pushed
+        // right by the sidebar's full width when it is back.
+        func panes(
+            _ chrome: NativeDashboardChrome,
+            _ window: NSWindow
+        ) -> (sidebar: CGFloat, report: CGFloat, reportLeading: CGFloat) {
+            chrome.view.layoutSubtreeIfNeeded()
+            guard let reference = window.contentView else { return (0, 0, 0) }
+            let metrics = chrome.measure(in: reference)
+            return (
+                metrics.sidebarPane.width,
+                metrics.reportPane.width,
+                metrics.reportPane.minX
+            )
+        }
+
+        let (chrome, window) = makeChrome()
+
+        // 1. Collapse the way a divider dragged to the leading edge leaves it.
+        chrome.splitViewItems.first?.isCollapsed = true
+        let collapsed = chrome.sidebarIsCollapsed
+        let collapsedPanes = panes(chrome, window)
+        let collapsedWidth = collapsedPanes.sidebar
+
+        // 2. The action both affordances send must reach a live target.
+        let selector = #selector(NSSplitViewController.toggleSidebar(_:))
+        let responds = chrome.responds(to: selector)
+
+        // 3. Validation enables the command and names the state it will move
+        //    to, in both directions.
+        let probe = NSMenuItem(
+            title: "",
+            action: selector,
+            keyEquivalent: ""
+        )
+        let enabledWhileCollapsed = chrome.validateUserInterfaceItem(probe)
+        let showTitle = probe.title
+
+        // 4. Reopening restores a pane at or above the enforced minimum, and
+        //    the report gives back the width the sidebar now occupies.
+        let revealed = chrome.revealSidebar()
+        let revealedPanes = panes(chrome, window)
+        let revealedWidth = revealedPanes.sidebar
+        let reportYielded = collapsedPanes.report - revealedPanes.report
+        _ = chrome.validateUserInterfaceItem(probe)
+        let hideTitle = probe.title
+
+        // 5. A sidebar stranded by an older build reopens once on upgrade.
+        defaults.removeObject(forKey: rescueKey)
+        let (stranded, strandedWindow) = makeChrome()
+        _ = strandedWindow
+        stranded.splitViewItems.first?.isCollapsed = true
+        stranded.viewDidAppear()
+        let rescued = !stranded.sidebarIsCollapsed
+
+        // 6. After that one rescue a deliberate collapse is left alone: the
+        //    marker is set, and the user can reopen it themselves now.
+        let (afterRescue, afterWindow) = makeChrome()
+        _ = afterWindow
+        afterRescue.splitViewItems.first?.isCollapsed = true
+        afterRescue.viewDidAppear()
+        let respectsChoice = afterRescue.sidebarIsCollapsed
+
+        let minimum = NativeDashboardChrome.sidebarMinimumThickness
+        guard collapsed,
+              // Nothing between the window edge and the report.
+              collapsedPanes.reportLeading < 1,
+              // The sidebar is back in front of it, at its enforced width.
+              revealedPanes.reportLeading >= minimum,
+              responds,
+              enabledWhileCollapsed,
+              showTitle == TiboTattleLocalization.string(
+                  .nativeDashboardShowSidebar
+              ),
+              revealed,
+              revealedWidth >= minimum,
+              reportYielded >= minimum,
+              hideTitle == TiboTattleLocalization.string(
+                  .nativeDashboardHideSidebar
+              ),
+              rescued,
+              respectsChoice
+        else {
+            FileHandle.standardError.write(
+                Data(
+                    ("macOS sidebar recovery smoke failed "
+                        + "collapsed=\(collapsed) "
+                        + "collapsed_width=\(Int(collapsedWidth)) "
+                        + "collapsed_report_leading="
+                        + "\(Int(collapsedPanes.reportLeading)) "
+                        + "revealed_report_leading="
+                        + "\(Int(revealedPanes.reportLeading)) "
+                        + "responds=\(responds) "
+                        + "enabled=\(enabledWhileCollapsed) "
+                        + "show_title=\(showTitle) "
+                        + "revealed=\(revealed) "
+                        + "revealed_width=\(Int(revealedWidth)) "
+                        + "report_yielded=\(Int(reportYielded)) "
+                        + "hide_title=\(hideTitle) "
+                        + "rescued=\(rescued) "
+                        + "respects_choice=\(respectsChoice)\n").utf8
+                )
+            )
+            return 1
+        }
+        print(
+            "USAGE_MONITOR_MACOS_SIDEBAR_RECOVERY "
+                + "collapse=true "
+                + "responds=true "
+                + "menu_enabled=true "
+                + "reveal=true "
+                + "width=\(Int(revealedWidth)) "
+                + "rescue_once=true "
+                + "respects_choice=true"
+        )
+        return 0
+    }
+}
+
+/// Exercises the product-policy layer on top of WebKit and AppKit. The real
+/// framework objects matter here: source assertions alone cannot show that the
+/// context-menu filter operates on NSMenu identifiers or that link previews
+/// are disabled on the web view the dashboard actually constructs.
+@MainActor
+private enum NativeDashboardInteractionSafetySmokeTest {
+    private static let backIdentifier = NSUserInterfaceItemIdentifier(
+        "WKMenuItemIdentifierGoBack"
+    )
+    private static let forwardIdentifier = NSUserInterfaceItemIdentifier(
+        "WKMenuItemIdentifierGoForward"
+    )
+    private static let reloadIdentifier = NSUserInterfaceItemIdentifier(
+        "WKMenuItemIdentifierReload"
+    )
+    private static let downloadIdentifier = NSUserInterfaceItemIdentifier(
+        "WKMenuItemIdentifierDownloadLinkedFile"
+    )
+    private static let openLinkIdentifier = NSUserInterfaceItemIdentifier(
+        "WKMenuItemIdentifierOpenLink"
+    )
+
+    static func run() -> Int32 {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        let host = DashboardWebHost(
+            onLoaded: {},
+            onFailure: { _ in },
+            onDownloadFailure: {},
+            openExternally: { _ in },
+            onNavigation: { _ in },
+            onLanguagePreferenceChange: { _ in }
+        )
+        let menu = NSMenu(title: "dashboard-context-menu")
+        addItem(backIdentifier, to: menu)
+        addItem(forwardIdentifier, to: menu)
+        addItem(reloadIdentifier, to: menu)
+        addItem(downloadIdentifier, to: menu)
+        addItem(openLinkIdentifier, to: menu)
+
+        NativeDashboardWebView.stripUnsupportedContextMenuItems(from: menu)
+        let remaining = Set(menu.items.compactMap(\.identifier))
+        let mandatoryToolbarItems =
+            AppDelegate.mandatoryDashboardToolbarItemIdentifiers
+        let expectedToolbarItems: Set<NSToolbarItem.Identifier> = [
+            .toggleSidebar,
+            AppDelegate.toolbarStatusRefreshIdentifier,
+            AppDelegate.toolbarShareIdentifier,
+            AppDelegate.toolbarSettingsIdentifier,
+        ]
+
+        let backRemoved = !remaining.contains(backIdentifier)
+        let forwardRemoved = !remaining.contains(forwardIdentifier)
+        let reloadPreserved = remaining.contains(reloadIdentifier)
+        let downloadRemoved = !remaining.contains(downloadIdentifier)
+        let openLinkPreserved = remaining.contains(openLinkIdentifier)
+        let usesSubclass = host.webView is NativeDashboardWebView
+        let linkPreviewDisabled = !host.webView.allowsLinkPreview
+        let toolbarItemsImmovable = mandatoryToolbarItems
+            == expectedToolbarItems
+        let settingsTabs = NSTabViewController()
+        settingsTabs.tabStyle = .toolbar
+        for identifier in NativeSettingsToolbarPolicy
+            .mandatoryTabIdentifiers {
+            let item = NSTabViewItem(identifier: identifier)
+            item.label = identifier.rawValue
+            item.viewController = NSViewController()
+            settingsTabs.addTabViewItem(item)
+        }
+        let settingsWindow = NSWindow(
+            contentViewController: settingsTabs
+        )
+        guard let settingsToolbar = settingsWindow.toolbar else { return 1 }
+        let settingsDelegate = NativeSettingsToolbarDelegate(
+            tabController: settingsTabs
+        )
+        settingsToolbar.delegate = settingsDelegate
+        let expectedSettingsItems =
+            NativeSettingsToolbarPolicy.mandatoryTabIdentifiers
+        let settingsDelegateInstalled = settingsToolbar.delegate
+            === settingsDelegate
+        let settingsTabsImmovable = expectedSettingsItems.count == 3
+            && settingsDelegate.toolbarImmovableItemIdentifiers(settingsToolbar)
+                .isSuperset(of: expectedSettingsItems)
+            && Set(settingsDelegate.toolbarDefaultItemIdentifiers(
+                settingsToolbar
+            )) == expectedSettingsItems
+
+        guard backRemoved,
+              forwardRemoved,
+              reloadPreserved,
+              downloadRemoved,
+              openLinkPreserved,
+              usesSubclass,
+              linkPreviewDisabled,
+              toolbarItemsImmovable,
+              settingsTabsImmovable,
+              settingsDelegateInstalled
+        else {
+            FileHandle.standardError.write(Data(
+                ("macOS native interaction safety smoke failed "
+                    + "back_removed=\(backRemoved) "
+                    + "forward_removed=\(forwardRemoved) "
+                    + "reload_preserved=\(reloadPreserved) "
+                    + "download_removed=\(downloadRemoved) "
+                    + "open_link_preserved=\(openLinkPreserved) "
+                    + "subclass=\(usesSubclass) "
+                    + "link_preview_disabled=\(linkPreviewDisabled) "
+                    + "toolbar_immovable=\(toolbarItemsImmovable) "
+                    + "settings_tabs_immovable="
+                    + "\(settingsTabsImmovable) "
+                    + "settings_delegate="
+                    + "\(settingsDelegateInstalled)\n").utf8
+            ))
+            return 1
+        }
+        print(
+            "USAGE_MONITOR_MACOS_NATIVE_INTERACTION_SAFETY "
+                + "back=false forward=false reload=true "
+                + "download_link=false open_link=true "
+                + "link_preview=false toolbar_immovable=true "
+                + "settings_tabs_immovable=true settings_delegate=true"
+        )
+        return 0
+    }
+
+    private static func addItem(
+        _ identifier: NSUserInterfaceItemIdentifier,
+        to menu: NSMenu
+    ) {
+        let item = NSMenuItem(
+            title: identifier.rawValue,
+            action: nil,
+            keyEquivalent: ""
+        )
+        item.identifier = identifier
+        menu.addItem(item)
+    }
+}
+
 /// Opens the shipped dashboard window and measures the chrome in it. This is
 /// the guard for the reported "the menu is not seamless, not rounded, and not
 /// even the right size" defect, and the three things it pins are the three
@@ -8766,6 +9926,10 @@ private enum NativeDashboardChromeLayoutSmokeTest {
 @main
 private struct UsageMonitorMain {
     static func main() {
+        // TiboTattle has no document-style multi-window workflow. Opt out
+        // before AppKit creates the application or any windows so it does not
+        // expose a browser-style tab bar with no product meaning.
+        NSWindow.allowsAutomaticWindowTabbing = false
         let arguments = Array(CommandLine.arguments.dropFirst())
         // This isolated seam smoke intentionally runs before bundle branding
         // is resolved, so it can execute as a plain launcher binary without
@@ -8853,6 +10017,14 @@ private struct UsageMonitorMain {
         if arguments.contains("--native-refresh-settings-contract-smoke-test") {
             exit(NativeRefreshSettingsContractSmokeTest.run())
         }
+        if arguments.contains(
+            "--native-appearance-settings-contract-smoke-test"
+        ) {
+            exit(NativeAppearanceSettingsContractSmokeTest.run())
+        }
+        if arguments.contains("--native-analysis-progress-contract-smoke-test") {
+            exit(NativeAnalysisProgressContractSmokeTest.run())
+        }
         if arguments.contains("--menu-bar-contract-smoke-test") {
             exit(MainActor.assumeIsolated {
                 MenuBarContractSmokeTest.run()
@@ -8872,6 +10044,16 @@ private struct UsageMonitorMain {
         if arguments.contains("--native-dashboard-layout-smoke-test") {
             exit(MainActor.assumeIsolated {
                 NativeDashboardLayoutSmokeTest.run()
+            })
+        }
+        if arguments.contains("--native-dashboard-sidebar-recovery-smoke-test") {
+            exit(MainActor.assumeIsolated {
+                NativeDashboardSidebarRecoverySmokeTest.run()
+            })
+        }
+        if arguments.contains("--native-dashboard-interaction-safety-smoke-test") {
+            exit(MainActor.assumeIsolated {
+                NativeDashboardInteractionSafetySmokeTest.run()
             })
         }
         let application = NSApplication.shared
