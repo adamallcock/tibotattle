@@ -81,6 +81,12 @@
 "settings.aboutProduct" = "关于 %@";
 "settings.aboutTab" = "关于";
 "settings.aboutSummary" = "在你的 Mac 上测量本地 Codex 额度。";
+"settings.appearance" = "外观";
+"settings.appearanceDark" = "深色";
+"settings.appearanceLight" = "浅色";
+"settings.appearancePickerHint" = "选择 TiboTattle 的外观。";
+"settings.appearanceSummary" = "默认使用这台 Mac 的外观。";
+"settings.appearanceSystem" = "跟随系统";
 "settings.automaticUpdates" = "自动更新";
 "settings.automaticUpdatesOff" = "自动下载已关闭。";
 "settings.automaticUpdatesOn" = "自动下载已开启。";

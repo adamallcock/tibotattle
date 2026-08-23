@@ -12591,3 +12591,55 @@ test("the journey names the unanswered health, never an index that is not the bl
   assert.doesNotMatch(appSource, /journey\.community\.waitingCompanion/u);
   assert.doesNotMatch(localizationSource, /journey\.community\.waitingCompanion/u);
 });
+
+test("Forest Ink dark appearance is explicit, balanced, and live-updateable", async () => {
+  const [styles, appSource] = await Promise.all([
+    readFile(new URL("../public/styles.css", import.meta.url), "utf8"),
+    readFile(new URL("../public/app.js", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(styles, /html\[data-theme="dark"\] \{/u);
+  assert.match(styles, /--paper: #141a17;/u);
+  assert.match(styles, /--surface-raised: #24322c;/u);
+  assert.match(styles, /--ink: #f5f1e8;/u);
+  assert.match(styles, /--green: #76aa9c;/u);
+  assert.match(styles, /--feature-bg: #2d7466;/u);
+  assert.match(styles, /--chart-accent: #99c5ba;/u);
+  assert.match(styles, /--blue: #7d9eb8;/u);
+  assert.match(
+    styles,
+    /html\[data-theme="dark"\] \.weekly-hero \{[\s\S]*?gap: 0;[\s\S]*?padding: 0;[\s\S]*?background: var\(--surface\);/u,
+  );
+  assert.match(
+    styles,
+    /html\[data-theme="dark"\] \.weekly-hero > div:first-child \{[\s\S]*?background: var\(--feature-bg\);/u,
+  );
+  assert.match(
+    styles,
+    /html\[data-theme="dark"\] \.notice\.notice-info\.accounting-disclosure \{[\s\S]*?border-inline-start: 3px solid var\(--blue\);[\s\S]*?background: var\(--surface\);/u,
+  );
+  assert.match(
+    styles,
+    /Portable share-card exports deliberately keep the existing light brand/u,
+  );
+  assert.doesNotMatch(
+    styles,
+    /@media[^\{]*prefers-color-scheme[^\{]*\{[\s\S]*?--paper: #141a17/u,
+  );
+
+  assert.match(
+    appSource,
+    /const NATIVE_APPEARANCE_THEMES = new Set\(\["light", "dark"\]\)/u,
+  );
+  assert.match(
+    appSource,
+    /if \(!NATIVE_APPEARANCE_THEMES\.has\(theme\)\) return false;/u,
+  );
+  assert.match(appSource, /document\.documentElement\.dataset\.theme = theme/u);
+  assert.match(appSource, /__TIBOTATTLE_APPEARANCE__\?\.resolvedTheme/u);
+  assert.match(appSource, /"tibotattle:appearance-override"/u);
+  assert.match(
+    appSource,
+    /theme === "dark" \? "#141a17" : "#f5f1e8"/u,
+  );
+});
