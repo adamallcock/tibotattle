@@ -5117,6 +5117,41 @@ test("native dashboard readiness follows both first-render outcomes", async () =
   );
 });
 
+test("native dashboard readiness does not wait on secondary contribution status", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const loadStart = appSource.indexOf("async function loadLocalDashboard() {");
+  const loadEnd = appSource.indexOf(
+    "\n}\n\n// The \"preparation identity\"",
+    loadStart,
+  );
+  assert.ok(loadStart >= 0 && loadEnd > loadStart, "dashboard loader is present");
+
+  const loader = appSource.slice(loadStart, loadEnd);
+  const successEnd = loader.indexOf(
+    "\n  } catch {",
+    loader.indexOf("renderContributionSyncPreview(sync.preview);"),
+  );
+  const successPath = loader.slice(0, successEnd);
+  const dashboardRender = successPath.indexOf("renderDashboard(data);");
+  const onboardingRender = successPath.indexOf("renderLocalOnboarding(onboarding);");
+  const readinessMarker = successPath.indexOf("markLocalDashboardReady();");
+  const secondaryStatus = successPath.indexOf("await loadIncrementalSyncStatus();");
+  const contributionPreview = successPath.indexOf(
+    "renderContributionSyncPreview(sync.preview);",
+  );
+
+  assert.ok(dashboardRender >= 0, "the primary dashboard render is present");
+  assert.ok(onboardingRender > dashboardRender, "onboarding joins the primary render");
+  assert.ok(
+    readinessMarker > onboardingRender && readinessMarker < secondaryStatus,
+    "the native shell is released after the primary render and before secondary status",
+  );
+  assert.ok(
+    contributionPreview > secondaryStatus,
+    "the consent status still resolves before the contribution preview",
+  );
+});
+
 test("first run is a truthful install and local preflight journey", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
