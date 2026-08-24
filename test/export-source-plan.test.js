@@ -14,7 +14,7 @@ import {
 } from "../src/export-source-plan.js";
 import { scanCodexSafeRecords } from "../src/export-safe-records.js";
 
-async function fixture() {
+async function fixture({ incompleteTail = false } = {}) {
   const home = await mkdtemp(join(tmpdir(), "usage-monitor-source-plan-"));
   await mkdir(join(home, "sessions", "2026", "07", "24"), { recursive: true });
   await mkdir(join(home, "archived_sessions"), { recursive: true });
@@ -23,7 +23,7 @@ async function fixture() {
     JSON.stringify({ timestamp: "2026-07-24T12:00:00.000Z", type: "session_meta", payload: { id: "private-session" } }),
     JSON.stringify({ timestamp: "2026-07-24T12:01:00.000Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } }),
   ];
-  await writeFile(path, `${lines.join("\n")}\npartial-private-content`);
+  await writeFile(path, `${lines.join("\n")}\n${incompleteTail ? "partial-private-content" : ""}`);
   return { home, path, complete: `${lines.join("\n")}\n` };
 }
 
@@ -36,7 +36,20 @@ function safeFailure(code) {
   };
 }
 
-test("source plan freezes only complete lines and allows later appends", async () => {
+test("source plan rejects an incomplete trailing JSONL record", async () => {
+  const value = await fixture({ incompleteTail: true });
+  try {
+    await assert.rejects(createCodexExportSourcePlan({
+      codexHome: value.home,
+      startAt: "2026-07-24T11:00:00.000Z",
+      endAt: "2026-07-24T13:00:00.000Z",
+    }), safeFailure("export_source_codex_rollout_tail_incomplete"));
+  } finally {
+    await rm(value.home, { recursive: true, force: true });
+  }
+});
+
+test("source plan freezes a complete source and allows later appends", async () => {
   const value = await fixture();
   try {
     const plan = await createCodexExportSourcePlan({

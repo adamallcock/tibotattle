@@ -1304,6 +1304,8 @@ function cacheContinuityImpactProjection(
   const methodology = {
     minimumGapSeconds: impact?.minimumGapSeconds ?? 0,
     maximumRetainedCacheRatio: impact?.maximumRetainedCacheRatio ?? 0.5,
+    outcomeDisplayMaximumGapSeconds:
+      impact?.outcomeDisplayMaximumGapSeconds ?? 7 * 24 * 60 * 60,
     recentDetailLimit: impact?.recentDetailLimit ?? 20,
   };
   if (impact?.status !== "available" || !Array.isArray(impact.periods)) {
@@ -1361,6 +1363,11 @@ function cacheContinuityImpactProjection(
     contextContractedReturns: selected.contextContractedReturns,
     insufficientEvidenceReturns: selected.insufficientEvidenceReturns,
     uncoveredReturns: selected.uncoveredReturns,
+    reusedMoreThanHalfReturns: selected.reusedMoreThanHalfReturns,
+    reusedHalfOrLessReturns: selected.reusedHalfOrLessReturns,
+    matchedOrExceededReturns: selected.matchedOrExceededReturns,
+    reusedBetweenHalfAndPreviousReturns:
+      selected.reusedBetweenHalfAndPreviousReturns,
     orderingCoverageGaps: selected.orderingCoverageGaps ?? 0,
     coverageStatus: selected.coverageStatus,
     cacheReadDrops: selected.cacheReadDrops,
@@ -1374,6 +1381,7 @@ function cacheContinuityImpactProjection(
     postCompactionRequests: selected.postCompactionRequests,
     postCompactionCacheReadDrops: selected.postCompactionCacheReadDrops,
     byGapBand: selected.byGapBand,
+    byOutcomeBucket: selected.byOutcomeBucket,
     recent: selected.recent,
     allowanceImpact: selected.allowanceImpact,
     periods,
@@ -2154,8 +2162,13 @@ function timelineAllowanceWeightingEncoding(preference) {
 function completeUnifiedGeneration(value) {
   const accountingStatus = value?.status === "complete"
     || (value?.status === "partial"
-      && value?.blockReason === "tool_provenance_incomplete"
-      && value?.toolProvenanceComplete === false);
+      && ((value?.blockReason === "tool_provenance_incomplete"
+          && value?.toolProvenanceComplete === false)
+        || (value?.blockReason === "codex_rollout_sources_quarantined"
+          && Number.isSafeInteger(value?.skippedSourceCount)
+          && value.skippedSourceCount > 0
+          && Number.isSafeInteger(value?.skippedThreadCount)
+          && value.skippedThreadCount > 0)));
   return value
     && typeof value === "object"
     && !Array.isArray(value)
@@ -2229,11 +2242,14 @@ function unifiedHistoryState({ cache, unified, cacheErrorCode }) {
   const history = cache?.history;
   const descriptor = cache?.sourceDescriptor;
   const generationMatched = descriptor?.generationMatched === true;
+  const coverageStatus = history?.coverage?.status;
+  const descriptorStatus = descriptor?.coverageStatus;
   const available = history?.status === "available"
     && history.period !== null
-    && history.coverage?.status === "complete"
-    && descriptor?.coverageStatus === "complete"
+    && ["complete", "partial"].includes(coverageStatus)
+    && descriptorStatus === coverageStatus
     && generationMatched;
+  const partialTerminal = available && coverageStatus === "partial";
   const sourceCount = Number.isSafeInteger(unified?.discoveredSourceCount)
     && unified.discoveredSourceCount >= 0
     ? unified.discoveredSourceCount
@@ -2249,6 +2265,24 @@ function unifiedHistoryState({ cache, unified, cacheErrorCode }) {
   const indexedSourceBytes = Number.isSafeInteger(unified?.indexedSourceBytes)
     && unified.indexedSourceBytes >= 0
     ? unified.indexedSourceBytes
+    : 0;
+  const skippedSourceCount = Number.isSafeInteger(
+    unified?.skippedSourceCount ?? unified?.generation?.skippedSourceCount,
+  )
+    ? Math.max(0, unified?.skippedSourceCount
+      ?? unified?.generation?.skippedSourceCount)
+    : 0;
+  const skippedSourceBytes = Number.isSafeInteger(
+    unified?.skippedSourceBytes ?? unified?.generation?.skippedSourceBytes,
+  )
+    ? Math.max(0, unified?.skippedSourceBytes
+      ?? unified?.generation?.skippedSourceBytes)
+    : 0;
+  const skippedThreadCount = Number.isSafeInteger(
+    unified?.skippedThreadCount ?? unified?.generation?.skippedThreadCount,
+  )
+    ? Math.max(0, unified?.skippedThreadCount
+      ?? unified?.generation?.skippedThreadCount)
     : 0;
   const coveredAt = safeHistoryCoveredAt(history?.coverage?.coveredAt);
   const errorCode = available
@@ -2275,14 +2309,21 @@ function unifiedHistoryState({ cache, unified, cacheErrorCode }) {
         period: null,
       },
     coverage: {
-      status: available ? "complete" : "partial",
-      phase: available ? "complete" : cache === null ? "not_started" : "unavailable",
+      status: available && !partialTerminal ? "complete" : "partial",
+      phase: partialTerminal
+        ? "partial_terminal"
+        : available ? "complete" : cache === null ? "not_started" : "unavailable",
       errorCode,
       generatedAt: available ? history.coverage.generatedAt : null,
       coveredAt,
       sourceCount,
       indexedSourceCount,
-      pendingSourceCount: Math.max(0, sourceCount - indexedSourceCount),
+      pendingSourceCount: partialTerminal
+        ? 0
+        : Math.max(0, sourceCount - indexedSourceCount - skippedSourceCount),
+      skippedSourceCount,
+      skippedSourceBytes,
+      skippedThreadCount,
       sourceBytes,
       indexedBytes: indexedSourceBytes,
       sourceMode: "unified",
@@ -2444,8 +2485,14 @@ export async function buildLocalCompanionSnapshot({
   const unifiedGenerationReady = unifiedProjectionAvailable
     && (unified.indexStatus === "complete"
       || (unified.indexStatus === "partial"
-        && unified.generation?.blockReason === "tool_provenance_incomplete"
-        && unified.generation?.toolProvenanceComplete === false))
+        && ((unified.generation?.blockReason === "tool_provenance_incomplete"
+            && unified.generation?.toolProvenanceComplete === false)
+          || (unified.generation?.blockReason
+              === "codex_rollout_sources_quarantined"
+            && Number.isSafeInteger(unified.generation?.skippedSourceCount)
+            && unified.generation.skippedSourceCount > 0
+            && Number.isSafeInteger(unified.generation?.skippedThreadCount)
+            && unified.generation.skippedThreadCount > 0))))
     && completeUnifiedGeneration(unified.generation);
   let replaySafeAccounting = initialReplaySafeAccounting;
   if (accountingSourceMode === "unified"
@@ -2950,7 +2997,9 @@ export async function buildLocalCompanionSnapshot({
   }
   if (historyCoverage.status !== "complete") {
     warnings.push(historyAccounting.status === "available"
-      ? `Indexed-history totals currently cover ${historyCoverage.indexedSourceCount}/${historyCoverage.sourceCount} discovered sources and expand as later foreground refreshes advance the index.`
+      ? historyCoverage.phase === "partial_terminal"
+        ? `Indexed-history totals include ${historyCoverage.indexedSourceCount} verified sources; ${historyCoverage.skippedSourceCount} sources across ${historyCoverage.skippedThreadCount} threads were quarantined after a local integrity check. The missing portion is a known gap, not zero usage.`
+        : `Indexed-history totals currently cover ${historyCoverage.indexedSourceCount}/${historyCoverage.sourceCount} discovered sources and expand as later foreground refreshes advance the index.`
       : HISTORY_TOTALS_HIDDEN_WARNING);
   } else if (historyAccounting.status !== "available") {
     warnings.push(

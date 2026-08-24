@@ -254,7 +254,7 @@ test("tier attribution follows timestamps and cannot leak a future setting into 
   }
 });
 
-test("active rollout wins over an archive duplicate and null or malformed records remain diagnostic", async () => {
+test("a byte-identical active/archive duplicate is scanned once and malformed records remain diagnostic", async () => {
   const active = [
     ...metadata(),
     tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), null),
@@ -262,10 +262,7 @@ test("active rollout wins over an archive duplicate and null or malformed record
     tokenRecord("2026-07-23T00:00:02.000Z", usage(20), usage(10), limits({ primary: 1 })),
     tokenRecord("2026-07-23T00:00:03.000Z", usage(30), usage(10), limits({ primary: 2 })),
   ];
-  const archive = [
-    ...metadata(),
-    tokenRecord("2026-07-23T00:00:01.000Z", usage(999), usage(999), limits({ primary: 1 })),
-  ];
+  const archive = [...active];
   const home = await fixtureHome(active, { archiveLines: archive });
   try {
     const dataset = await mineCodexTransitions({ ...RANGE, codexHome: home });

@@ -45,11 +45,11 @@ export function throwIfAborted(signal) {
 }
 
 export function normalizeTokenUsage(value) {
-  if (!value || typeof value !== "object") return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const normalized = {};
   for (const key of COMPONENT_KEYS) {
     const quantity = value[key] ?? 0;
-    if (!Number.isFinite(quantity) || quantity < 0) return null;
+    if (!Number.isSafeInteger(quantity) || quantity < 0) return null;
     normalized[key] = quantity;
   }
   return normalized;

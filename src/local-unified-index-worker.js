@@ -5,7 +5,10 @@ import {
   extractRolloutUsage,
   inheritedTierSeed,
   ownObservedTier,
+  rolloutContentQuarantineReason,
 } from "./local-unified-index-extract.js";
+import { createHistoryBaseSeedResolver } from "./local-unified-index-history.js";
+import { withStableRolloutSource } from "./rollout-source-snapshot.js";
 
 // One lane of a parallel rebuild.
 //
@@ -51,20 +54,79 @@ async function run() {
         sessionId: source.sessionId,
         parentId: source.parentId,
         isFork: source.isFork === true,
+        isInlineFork: source.isInlineFork === true,
+        historyMode: source.historyMode,
+        historyBase: source.historyBase,
+        startOrdinal: source.startOrdinal,
       },
     }));
     const snapshots = createLineageSnapshots(shaped);
     const finalBySessionId = new Map();
+    const historySeeds = createHistoryBaseSeedResolver(shaped, {
+      maximumLineBytes,
+    });
+    const invalidRolloutIds = new Set();
+    const invalidSessionIds = new Set();
+    const dependencyUnavailable = (source) => {
+      const baseId = source.historyBase?.rolloutId ?? null;
+      if (baseId !== null && invalidRolloutIds.has(baseId)) return true;
+      return source.isInlineFork === true
+        && typeof source.parentId === "string"
+        && invalidSessionIds.has(source.parentId);
+    };
+    const markUnavailable = (source) => {
+      if (typeof source.rolloutId === "string") {
+        invalidRolloutIds.add(source.rolloutId);
+      }
+      if (typeof source.sessionId === "string") {
+        invalidSessionIds.add(source.sessionId);
+      }
+    };
     try {
       for (const source of shaped) {
-        const seed = source.parentId === null || source.parentId === undefined
+        const logicalSeed = source.parentId === null || source.parentId === undefined
           ? null
           : finalBySessionId.get(source.parentId) ?? null;
+        if (dependencyUnavailable(source)) {
+          markUnavailable(source);
+          parentPort.postMessage({
+            type: "batch",
+            rolloutKey: source.rolloutKey,
+            events: [],
+            boundaries: [],
+            tools: [],
+            snapshotKeys: [],
+            snapshotReset: false,
+            snapshotSeedKeys: [],
+            final: true,
+            diagnostics: {},
+            cursor: null,
+            quarantineReason: "codex_rollout_lineage_invalid",
+          });
+          continue;
+        }
+        const collector = snapshots.collectorFor(source);
+        const historySeed = await historySeeds.resolveSeed(source, {
+          includeSnapshots: collector !== null,
+        });
+        const snapshotReset = collector !== null && historySeed !== null
+          && snapshots.replaceFor(source, historySeed.seedSnapshots);
+        let snapshotResetPending = snapshotReset;
+        let snapshotSeedKeys = snapshotReset
+          ? [...historySeed.seedSnapshots]
+          : [];
         let events = [];
         let boundaries = [];
         let tools = [];
         let snapshotKeys = [];
-        const flush = (rolloutKey, final, diagnostics, cursor = null) => {
+        const flush = (
+          rolloutKey,
+          final,
+          diagnostics,
+          cursor = null,
+          quarantineReason = null,
+        ) => {
+          const seedKeys = snapshotSeedKeys.splice(0, BATCH_EVENTS);
           parentPort.postMessage({
             type: "batch",
             rolloutKey,
@@ -75,31 +137,46 @@ async function run() {
             // counters, nothing that can hold content. The host persists them
             // so a later incremental ingest can answer for this ancestor.
             snapshotKeys,
+            snapshotReset: snapshotResetPending,
+            snapshotSeedKeys: seedKeys,
             final,
             diagnostics,
             cursor,
+            quarantineReason,
           });
           events = [];
           boundaries = [];
           tools = [];
           snapshotKeys = [];
+          snapshotResetPending = false;
         };
-        const collector = snapshots.collectorFor(source);
-        const outcome = await extractRolloutUsage(source.path, {
+        while (snapshotSeedKeys.length > BATCH_EVENTS) {
+          flush(source.rolloutKey, false, null);
+        }
+        const outcome = await withStableRolloutSource(source, (stableSource) => (
+          extractRolloutUsage(stableSource, {
           size: source.size,
-          isFork: source.isFork === true,
-          inheritedSnapshots: snapshots.inheritedFor(source),
+          isFork: source.isInlineFork === true,
+          inheritedSnapshots: source.isInlineFork === true
+            ? snapshots.inheritedFor(source)
+            : null,
           collectSnapshots: collector === null ? null : {
             add(key) {
               collector.add(key);
               snapshotKeys.push(key);
+              if (events.length + boundaries.length + tools.length
+                  + snapshotKeys.length >= BATCH_EVENTS) {
+                flush(source.rolloutKey, false, null);
+              }
             },
           },
-          seedModel: seed?.model ?? null,
-          seedEffort: seed?.effort ?? null,
+          seedModel: historySeed?.seedModel ?? logicalSeed?.model ?? null,
+          seedEffort: historySeed?.seedEffort ?? logicalSeed?.effort ?? null,
           // Lineage speed carry-forward: the parent's final tier already folds
           // in its own seed, so a direct-parent lookup spans the whole chain.
-          seedTier: inheritedTierSeed(seed?.tier ?? null),
+          seedTier: historySeed?.seedTier
+            ?? inheritedTierSeed(logicalSeed?.tier ?? null),
+          seedTotals: historySeed?.seedTotals ?? null,
           ...(maximumLineBytes === undefined ? {} : { maximumLineBytes }),
           onEvent: (event) => {
             events.push(event);
@@ -113,14 +190,17 @@ async function run() {
               flush(source.rolloutKey, false, null);
             }
           },
-          onTool: (event) => {
+            onTool: (event) => {
             tools.push(event);
             if (events.length + boundaries.length + tools.length >= BATCH_EVENTS) {
               flush(source.rolloutKey, false, null);
             }
-          },
-        });
-        if (source.sessionId) {
+            },
+          })
+        ));
+        const quarantineReason = rolloutContentQuarantineReason(outcome);
+        if (quarantineReason !== null) markUnavailable(source);
+        if (source.sessionId && quarantineReason === null) {
           finalBySessionId.set(source.sessionId, {
             model: outcome.finalModel,
             effort: outcome.finalEffort,
@@ -130,6 +210,11 @@ async function run() {
         flush(source.rolloutKey, true, {
           relevantLines: outcome.diagnostics.relevantLines,
           malformedLines: outcome.diagnostics.malformedLines,
+          malformedAccountingRecords:
+            outcome.diagnostics.malformedAccountingRecords,
+          malformedUsageRecords: outcome.diagnostics.malformedUsageRecords,
+          malformedRateLimitRecords:
+            outcome.diagnostics.malformedRateLimitRecords,
           partialLines: outcome.diagnostics.partialLines,
           salvagedRecords: outcome.diagnostics.salvagedRecords,
           compactionEvents: outcome.diagnostics.compactionEvents,
@@ -141,8 +226,8 @@ async function run() {
           toolRecordsSkipped: outcome.diagnostics.toolRecordsSkipped,
           oversizedLines: outcome.read.oversizedLines,
           retainedSnapshotKeys: snapshots.retainedKeys,
-          seeded: seed?.model != null,
-        }, {
+          seeded: historySeed?.seedModel != null || logicalSeed?.model != null,
+        }, quarantineReason === null ? {
           nextOffset: outcome.read.nextOffset,
           finalModel: outcome.finalModel,
           finalEffort: outcome.finalEffort,
@@ -155,7 +240,7 @@ async function run() {
           finalTurnContextPending: outcome.finalTurnContextPending,
           turnContextSeen: outcome.finalTurnContextSeen,
           snapshotsPersisted: collector !== null,
-        });
+        } : null, quarantineReason);
       }
     } finally {
       snapshots.release();

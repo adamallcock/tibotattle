@@ -1936,6 +1936,17 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
       0,
     );
     assert.equal(
+      snapshot.overview.accounting.cacheContinuityImpact
+        .outcomeDisplayMaximumGapSeconds,
+      604_800,
+    );
+    assert.equal(
+      Object.keys(
+        snapshot.overview.accounting.cacheContinuityImpact.byOutcomeBucket,
+      ).length,
+      10,
+    );
+    assert.equal(
       snapshot.overview.accounting.cacheContinuityImpact.cacheReadDrops,
       0,
     );
@@ -2210,6 +2221,133 @@ test("a deferred unified projection publishes a loading history receipt", async 
     )));
   } finally {
     await rm(root, { recursive: true });
+  }
+});
+
+test("an attested rollout quarantine publishes verified totals as a terminal gap, never as zero", async () => {
+  const root = await fixtureRoot();
+  const sessions = join(root, "sessions", "2026", "07", "25");
+  const threadGap = "11111111-1111-4111-8111-111111111111";
+  const threadValid = "22222222-2222-4222-8222-222222222222";
+  const name = (timestamp, threadId) => (
+    `rollout-${timestamp}-${threadId}.jsonl`
+  );
+  try {
+    await mkdir(sessions, { recursive: true });
+    const meta = (id) => JSON.stringify({
+      timestamp: "2026-07-25T11:00:00.000Z",
+      type: "session_meta",
+      payload: { id, session_id: id, thread_source: "user" },
+    });
+    const turn = (model) => JSON.stringify({
+      timestamp: "2026-07-25T11:00:01.000Z",
+      type: "turn_context",
+      payload: { model, effort: "high" },
+    });
+    const writeLines = (filename, lines) => writeFile(
+      join(sessions, filename),
+      `${lines.join("\n")}\n`,
+      { mode: 0o600 },
+    );
+    await writeLines(name("2026-07-25T10-00-00", threadGap), [
+      meta(threadGap),
+    ]);
+    await writeLines(name("2026-07-25T10-00-01", threadGap), [
+      meta(threadGap),
+      turn("gpt-5.6-terra"),
+    ]);
+    await writeLines(name("2026-07-25T11-00-00", threadValid), [
+      meta(threadValid),
+      turn("gpt-5.6-sol"),
+      rolloutToken(
+        "2026-07-25T11:00:02.000Z",
+        rolloutUsage(100, 10),
+        rolloutUsage(100, 10),
+        12,
+      ),
+    ]);
+
+    const { rebuildLocalUnifiedIndex } = await import(
+      "../src/local-unified-index-build.js"
+    );
+    const unifiedIndexFile = join(
+      root,
+      ".usage-monitor",
+      "local-unified-index-v1.sqlite",
+    );
+    const built = await rebuildLocalUnifiedIndex({
+      codexHome: root,
+      indexFile: unifiedIndexFile,
+      secretFile: join(
+        root,
+        ".usage-monitor",
+        "local-unified-index-device-salt-v1",
+      ),
+      contractVersion: "companion-test-v1",
+    });
+    assert.equal(built.generation.status, "partial");
+    assert.equal(built.generation.skippedSourceCount, 2);
+
+    await refreshReplaySafeAccountingCache({
+      stateFile: join(
+        root,
+        ".usage-monitor",
+        "local-collector-state-v1.sqlite",
+      ),
+      sourceMode: "unified",
+      unifiedIndexFile,
+      expectedGeneration: built.generation,
+      contextBehavior: "legacy_zero",
+      codexHome: root,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      accountingSourceMode: "unified",
+      unifiedIndexFile,
+      allowDevelopmentArtifactFallback: false,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(snapshot.overview.timeline.history.status, "partial");
+    assert.equal(snapshot.overview.timeline.history.usageEvents, 1);
+    assert.deepEqual(snapshot.overview.accounting.historyCoverage, {
+      status: "partial",
+      phase: "partial_terminal",
+      errorCode: null,
+      generatedAt: snapshot.overview.accounting.historyCoverage.generatedAt,
+      coveredAt: snapshot.overview.accounting.historyCoverage.coveredAt,
+      sourceCount: 3,
+      indexedSourceCount: 1,
+      pendingSourceCount: 0,
+      skippedSourceCount: 2,
+      skippedSourceBytes: built.generation.skippedSourceBytes,
+      skippedThreadCount: 1,
+      sourceBytes: built.generation.discoveredSourceBytes,
+      indexedBytes: built.generation.indexedSourceBytes,
+      sourceMode: "unified",
+      generationMatched: true,
+    });
+    assert.equal(
+      snapshot.overview.accounting.historyCoverage.phase,
+      "partial_terminal",
+    );
+    assert.equal(snapshot.overview.accounting.historyPeriodStatus, "available");
+    assert.equal(
+      snapshot.overview.accounting.periods.find((period) => (
+        period.periodId === "history"
+      )).events,
+      1,
+    );
+    assert.equal(
+      snapshot.overview.usage.find((period) => period.id === "all").events,
+      1,
+    );
+    assert.ok(snapshot.overview.warnings.some((warning) => (
+      warning.includes("known gap, not zero usage")
+    )));
+    assert.equal(JSON.stringify(snapshot).includes(threadGap), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 

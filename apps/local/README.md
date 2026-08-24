@@ -182,6 +182,32 @@ Legacy JSON/JSONL retirement is serialized by an owner-only migration lease,
 requires strict valid bounded records, and does not report complete until every
 managed legacy artifact has been removed after a durable parity receipt.
 
+### Codex rollout generations and integrity gaps
+
+Codex may retain several immutable rollout files for one stable thread, including
+the canonical `rollout-<timestamp>-<thread>_<rollout>.jsonl` form used by
+paginated history. TiboTattle treats the stable thread and the physical rollout
+as separate identities. It indexes every valid physical spend delta once,
+resolves `history_base` by rollout ID and exact ordinal/byte cutoff, and seeds the
+new generation from that boundary so retained history is not charged twice.
+Codex's owner-controlled `state_5.sqlite` selected path is used only as a
+read-only lineage hint; it never removes superseded real spend from accounting.
+
+An invalid lineage, divergent duplicate rollout, filename mismatch, or
+unsupported compressed source quarantines only the affected logical thread.
+Unrelated rollouts continue into a terminal partial generation. The dashboard
+keeps verified nonzero totals, labels the refresh **degraded**, and reports
+privacy-safe skipped-thread/source counts and fixed reason codes; it never
+represents the missing portion as zero or calls that archive generation
+complete. Raw paths, IDs, prompts, responses, and rollout contents remain local.
+
+An unchanged terminal integrity receipt is a stopping condition. Browser
+continuation and the native foreground cadence do not repeatedly rescan the same
+corpus. Automatic work is re-enabled only after the source receipt changes; a
+user can still explicitly choose **Retry analysis** after repairing the local
+files. Old parser identities trigger a cold transactional rebuild so legacy and
+rollout-aware event keys cannot coexist in a supposedly complete generation.
+
 Repository-generated weekly artifacts are not a native production fallback.
 Developers who specifically need the frozen historical fixture may opt in while
 running the source checkout:

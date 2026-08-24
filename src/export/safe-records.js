@@ -643,6 +643,38 @@ function diagnosticsFromCodexScan(scan, leftoverToolCalls = 0) {
   };
 }
 
+function assertCompleteCodexDiscovery(scan) {
+  if (scan?.discovery?.status !== "partial") return;
+  const reason = Object.keys(scan.discovery.reasonCounts ?? {}).sort()[0]
+    ?? "codex_rollout_sources_quarantined";
+  const error = new Error("Codex rollout coverage is partial; local metadata export stopped");
+  error.name = "CodexRolloutCoverageError";
+  error.code = reason;
+  error.coverage = Object.freeze({
+    skippedSourceCount: Number(scan.discovery.skippedSourceCount ?? 0),
+    skippedSourceBytes: Number(scan.discovery.skippedSourceBytes ?? 0),
+    skippedThreadCount: Number(scan.discovery.skippedThreadCount ?? 0),
+    reasonCounts: Object.freeze({ ...scan.discovery.reasonCounts }),
+  });
+  throw error;
+}
+
+function assertCompleteCodexContent(scan) {
+  const invalid = [
+    "malformedAccountingRecords",
+    "malformedUsageRecords",
+    "malformedRateLimitRecords",
+  ].reduce((sum, code) => sum + Number(scan?.diagnostics?.[code] ?? 0), 0);
+  if (invalid === 0) return;
+  const error = new Error(
+    "Codex rollout accounting is malformed; local metadata export stopped",
+  );
+  error.name = "CodexRolloutCoverageError";
+  error.code = "codex_rollout_content_invalid";
+  error.coverage = Object.freeze({ invalidAccountingRecords: invalid });
+  throw error;
+}
+
 async function emitSafeRecord(onRecord, resourceGuard, recordType, record) {
   resourceGuard.observeOutputRecord(new TextEncoder().encode(stableJson(record)).byteLength);
   await onRecord({ recordType, record });
@@ -703,12 +735,19 @@ async function scanCodexSafeRecords({
     rolloutInfos,
     openRolloutSource,
     verifyRolloutSource,
+    requireCompleteDiscovery: true,
+    signal,
   });
 
   const compatibility = exportCompatibilityTuple();
   if (scan.parserVersion !== compatibility.providerAdapters.openaiCodex.sourceFormats.rollout.parserVersion) {
     throw new Error("Codex scanner version does not match the export compatibility contract");
   }
+  // The privacy-export bundle has no partial-coverage contract. Never publish
+  // a syntactically valid zero/partial bundle after discovery quarantines a
+  // rollout group; terminate once with a fixed, content-free reason instead.
+  assertCompleteCodexDiscovery(scan);
+  assertCompleteCodexContent(scan);
   for (const marker of activityMarkers) {
     const normalized = normalizeActivityMarker(secret, marker, bounds);
     if (normalized) await emitSafeRecord(onRecord, resourceGuard, "activityMarker", normalized);
