@@ -654,10 +654,10 @@ async function runWorkerLane(lane, laneIndex, { maximumLineBytes, signal, onBatc
           // the companion has serviced its loopback control plane. Release
           // exactly one batch on the next event-loop turn, providing bounded
           // backpressure and an opportunity for health/status/cancel I/O.
-          setTimeout(() => {
+          setImmediate(() => {
             Atomics.add(batchSequence, 0, 1);
             Atomics.notify(batchSequence, 0, 1);
-          }, 1);
+          });
         } catch (error) {
           failed = error;
           worker.terminate();
