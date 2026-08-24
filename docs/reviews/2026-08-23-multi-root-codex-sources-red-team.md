@@ -2,7 +2,7 @@
 title: Multi-root Codex sources red-team review
 date: 2026-08-23
 type: review
-status: stage-a-source-complete; no-blocking-findings
+status: stage-a-complete; no-blocking-findings
 reviewers:
   - source-and-index-map
   - availability-and-lifecycle-map
@@ -426,10 +426,15 @@ the pre-existing full SQLite staging copy can require space proportional to the
 combined index on filesystems without cheap cloning. Neither changes logical
 correctness; both belong in installed-platform measurement and Stage B tuning.
 
-The final repository run had no reproducible functional failure in the changed
-path. One unrelated collector-state timing failure passed by name and as part
-of its complete 52-test file on immediate rerun. The two remaining deterministic
-failures are the expected R7 generated-receipt provenance checks, which must
-remain invalid after runtime source changes until the separately governed
-source-freeze regeneration. No receipt, release artifact, commit, or public
-issue was changed as part of Stage A.
+The final unrestricted repository run passed 2,826 tests with 17 explicit
+native-Windows platform skips and zero failures. The separately governed R7
+source-freeze run regenerated ten validated owner-only receipts in 43.3
+minutes; the focused retained-receipt contract passed 2/2. That R7 evidence is
+current-source and scalar-history provenance, not plural-root performance
+qualification.
+
+The verified native journey is recorded in the
+[Multi-root Codex AppKit QA receipt](../receipts/2026-08-23-multi-root-codex-appkit-qa-receipt.md).
+Stage A and its R7 receipts were committed locally on the isolated branch. No
+release artifact, push, tag, public issue change, installation replacement, or
+publication was performed.

@@ -2,7 +2,7 @@
 title: Multi-root Codex sources plan
 date: 2026-08-23
 type: plan
-status: stage-a-verified; release-provenance-refresh-pending
+status: stage-a-complete; local-only
 owners:
   - product
   - local-companion
@@ -473,26 +473,28 @@ claim.
 
 Validated on 2026-08-23:
 
-- local companion suite: 238/238 passed;
-- browser product suite: 328/328 passed;
-- packaged macOS product suite: 58/58 passed;
-- final focused provider, legacy-index, and browser compatibility audit:
-  235/235 passed with no code-quality finding;
-- full repository run: 2,820 passed, 17 platform skips, and three failures out
-  of 2,840 tests;
-- the one functional failure in that run was a collector-state timing race
-  outside the changed path; its named test passed immediately in isolation and
-  the complete collector file then passed 52/52;
-- the other two failures are the governed R7 receipt checks: Stage A changes
-  runtime source bytes covered by those receipts, so their stored workload
-  provenance correctly no longer validates;
+- focused browser/provider/index/export/native-localization matrix: 398/398
+  passed;
+- loopback local companion suite: 51/51 passed;
+- portable plural companion process suite: 2/2 passed;
+- complete packaged macOS bundle suite: 50/50 passed, including the compiled
+  Quit-during-stop child-process regression;
+- full repository run: 2,826 passed, 17 explicit native-Windows platform
+  skips, and zero failures out of 2,843 tests;
+- dual-runtime R7 regeneration completed in 43.3 minutes and atomically
+  replaced ten validated owner-only receipts against 342 source files, with
+  workload source SHA-256
+  `ea0c8fa2ee836ba0a33cfd149ccb7532f3bd7b8179f2696a29d7124140218a1b`;
+- focused retained-R7 validation: 2/2 passed, and all ten receipts are mode
+  `0600`;
 - architecture/import audit, documentation links, browser localization, and
   diff hygiene passed; and
 - the partial-root dashboard state was exercised through a real loopback
   companion and visually inspected for path-free, honest retained-history
   copy.
 
-No R7 receipts were regenerated. Their ten-receipt replacement requires a
-separately authorized source freeze and exact dual-runtime real-history run;
-it is a release-evidence gate, not Stage A implementation work. Installed
-Windows/WSL filesystem and signing qualification is likewise still separate.
+Independent code-quality and test/documentation re-audits reported no finding
+at any severity after the lifecycle fixes. Source was frozen in local commit
+`3a4a55a2`; the regenerated receipts are a separate local provenance commit.
+Nothing was pushed, published, tagged, released, or posted to the public issue.
+Installed Windows/WSL filesystem and signing qualification remains separate.
