@@ -22,7 +22,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, win32 } from "node:path";
 import { once } from "node:events";
 import { createServer } from "node:net";
 import { fileURLToPath } from "node:url";
@@ -59,6 +59,10 @@ const MAX_SHUTDOWN_MS = 15_000;
 const WINDOWS_ELECTRON_SMOKE_MESSAGE_TYPE = "windows-electron-smoke-v1";
 const WINDOWS_ELECTRON_SMOKE_OUTPUT_PATH_ENV =
   "TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_OUTPUT_PATH";
+const WINDOWS_ELECTRON_SMOKE_DIAGNOSTIC_PATH_ENV =
+  "TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_DIAGNOSTIC_PATH";
+const WINDOWS_ELECTRON_SMOKE_DIAGNOSTIC_SCHEMA =
+  "tibotattle-windows-electron-runtime-diagnostic-v1";
 const WINDOWS_ELECTRON_SMOKE_COMMAND_MESSAGE = "command-v1";
 const WINDOWS_ELECTRON_SMOKE_STATE_MESSAGE = "state-v1";
 const WINDOWS_ELECTRON_SMOKE_CREDENTIAL_MESSAGE = "credential-v1";
@@ -88,6 +92,85 @@ const WINDOWS_PROCESS_TABLE_QUERY = [
   "foreach ($row in $all) { Write-Output (([int]$row.ProcessId).ToString() + ':' + ([int]$row.ParentProcessId).ToString())",
   "}",
 ].join(";");
+
+const WINDOWS_ELECTRON_SMOKE_DIAGNOSTIC_PHASES = new Set([
+  "module_loaded",
+  "entry_started",
+  "run_smoke_started",
+  "terminate_process_tree_started",
+  "terminate_process_tree_finished",
+  "cleanup_started",
+  "post_terminate_cleanup_started",
+  "cleanup_finished",
+  "caught_failure",
+  "completed",
+]);
+const WINDOWS_ELECTRON_SMOKE_DIAGNOSTIC_EXIT_CLASSES = new Set([
+  "running",
+  "caught_failure",
+  "completed",
+]);
+let smokeDiagnosticWrite = Promise.resolve();
+
+/**
+ * Write one small, content-free checkpoint for the outer workflow boundary.
+ * Marker delivery does not alter the product smoke result, but the workflow
+ * requires a valid checkpoint and fails closed when it is missing or invalid.
+ * The workflow deletes this file before retaining any evidence.
+ */
+async function writeSmokeDiagnostic(
+  phase,
+  status = "running",
+  exitClass = "running",
+) {
+  const outputPath = process.env[WINDOWS_ELECTRON_SMOKE_DIAGNOSTIC_PATH_ENV];
+  if (typeof outputPath !== "string" || outputPath.length === 0
+      || !WINDOWS_ELECTRON_SMOKE_DIAGNOSTIC_PHASES.has(phase)
+      || !["running", "sealed"].includes(status)
+      || !WINDOWS_ELECTRON_SMOKE_DIAGNOSTIC_EXIT_CLASSES.has(exitClass)) {
+    return;
+  }
+  const marker = JSON.stringify({
+    schemaVersion: WINDOWS_ELECTRON_SMOKE_DIAGNOSTIC_SCHEMA,
+    status,
+    phase,
+    exitClass,
+    contentFree: true,
+  });
+  smokeDiagnosticWrite = smokeDiagnosticWrite
+    .catch(() => {})
+    .then(async () => {
+      try {
+        await writeFile(outputPath, `${marker}\n`, "utf8");
+      } catch {
+        // The workflow treats a missing marker as a bounded diagnostic failure.
+      }
+    });
+  await smokeDiagnosticWrite;
+}
+
+/**
+ * Match the CLI entry path using the filesystem's path identity rules.
+ * Windows paths are case-insensitive, while the POSIX comparison remains
+ * case-sensitive.  This is defensive entry-point hygiene; the diagnostic
+ * checkpoint below remains the source of truth when entry is not reached.
+ */
+export function isWindowsSmokeDirectEntry({
+  argvPath = process.argv[1],
+  modulePath = fileURLToPath(import.meta.url),
+  platform = process.platform,
+} = {}) {
+  if (typeof argvPath !== "string" || argvPath.length === 0
+      || typeof modulePath !== "string" || modulePath.length === 0) {
+    return false;
+  }
+  const pathResolve = platform === "win32" ? win32.resolve : resolve;
+  const selectedArgvPath = pathResolve(argvPath);
+  const selectedModulePath = pathResolve(modulePath);
+  return platform === "win32"
+    ? selectedArgvPath.toLowerCase() === selectedModulePath.toLowerCase()
+    : selectedArgvPath === selectedModulePath;
+}
 
 const RESULT_KEYS = Object.freeze([
   "artifact",
@@ -871,6 +954,7 @@ function childExitPromise(child) {
 
 async function terminateProcessTree(child) {
   if (!child || childExited(child)) return;
+  await writeSmokeDiagnostic("terminate_process_tree_started");
   if (process.platform === "win32" && child.pid) {
     const killer = spawn("taskkill.exe", ["/pid", String(child.pid), "/t", "/f"], {
       shell: false,
@@ -892,6 +976,7 @@ async function terminateProcessTree(child) {
     "process termination",
     "WINDOWS_ELECTRON_SMOKE_SHUTDOWN_TIMEOUT",
   ).catch(() => {});
+  await writeSmokeDiagnostic("terminate_process_tree_finished");
 }
 
 async function queryWindowsProcessTableWithSpawner(spawnProbe = spawn) {
@@ -1865,6 +1950,7 @@ export async function runSmoke(progress) {
   if (process.platform !== "win32" || process.arch !== "x64") {
     return aggregate("unsupported");
   }
+  await writeSmokeDiagnostic("run_smoke_started");
   const executable = resolve(process.env.TIBOTATTLE_ELECTRON_EXE ?? DEFAULT_EXECUTABLE);
   const artifactRoot = dirname(executable);
   let fixture = null;
@@ -2155,6 +2241,7 @@ export async function runSmoke(progress) {
     progress.failureReason = diagnostic.failureReason;
     throw error;
   } finally {
+    await writeSmokeDiagnostic("cleanup_started");
     await cleanupCredential({ allowLiveControl: true });
     nextPrimaryMessage?.close?.();
     nextRelaunchMessage?.close?.();
@@ -2164,14 +2251,18 @@ export async function runSmoke(progress) {
     await terminateProcessTree(second);
     await terminateProcessTree(primary);
     await terminateProcessTree(relaunch);
+    await writeSmokeDiagnostic("post_terminate_cleanup_started");
     await cleanupCredential({ allowLiveControl: false });
     if (fixture !== null) {
       await rm(fixture.root, { recursive: true, force: true });
     }
+    await writeSmokeDiagnostic("cleanup_finished");
   }
 }
 
-if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
+await writeSmokeDiagnostic("module_loaded");
+
+if (isWindowsSmokeDirectEntry()) {
   // Keep progress outside the smoke promise so a startup, dashboard, or
   // cleanup failure can retain only the already-completed closed-schema
   // booleans and fixed diagnostic enums. The caller owns this plain object;
@@ -2179,12 +2270,17 @@ if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
   const progress = {};
   let output;
   try {
+    await writeSmokeDiagnostic("entry_started");
     output = await runSmoke(progress);
   } catch {
     // Never expose executable paths, child diagnostics, account values, or
     // filesystem contents. The aggregate is the only supported smoke output.
     output = aggregate("failed", progress);
     process.exitCode = 1;
+    await writeSmokeDiagnostic("caught_failure", "sealed", "caught_failure");
+  }
+  if (output?.status === "passed" || output?.status === "unsupported") {
+    await writeSmokeDiagnostic("completed", "sealed", "completed");
   }
   const outputPath = process.env[WINDOWS_ELECTRON_SMOKE_OUTPUT_PATH_ENV];
   if (typeof outputPath === "string" && outputPath.length > 0) {

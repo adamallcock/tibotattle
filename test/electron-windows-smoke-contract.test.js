@@ -12,6 +12,7 @@ import {
   classifyAutomaticStartupRefreshReceipt,
   classifySmokeFailure,
   createSyntheticFixture,
+  isWindowsSmokeDirectEntry,
   observeLocalRefreshRequests,
   queryWindowsProcessTableForTest,
   WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES,
@@ -19,6 +20,31 @@ import {
   WINDOWS_ELECTRON_SMOKE_FAILURE_STAGE_ALLOWLIST,
   waitFor,
 } from "../scripts/smoke-electron-windows.mjs";
+
+test("Windows smoke direct entry tolerates case-only checkout path differences", () => {
+  const modulePath = "C:\\actions\\_work\\TiboTattle\\TiboTattle\\scripts\\smoke-electron-windows.mjs";
+  const argvPath = "c:\\ACTIONS\\_WORK\\tibotattle\\tibotattle\\SCRIPTS\\smoke-electron-windows.mjs";
+  assert.equal(
+    isWindowsSmokeDirectEntry({ argvPath, modulePath, platform: "win32" }),
+    true,
+  );
+  assert.equal(
+    isWindowsSmokeDirectEntry({
+      argvPath: `${argvPath.slice(0, -3)}js2`,
+      modulePath,
+      platform: "win32",
+    }),
+    false,
+  );
+  assert.equal(
+    isWindowsSmokeDirectEntry({
+      argvPath: "/tmp/Scripts/smoke-electron-windows.mjs",
+      modulePath: "/tmp/scripts/smoke-electron-windows.mjs",
+      platform: "linux",
+    }),
+    false,
+  );
+});
 
 class FakeCdp {
   constructor() {
@@ -87,6 +113,13 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /failureReason/u);
   assert.match(source, /classifySmokeFailure/u);
   assert.match(source, /TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_OUTPUT_PATH/u);
+  assert.match(source, /TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_DIAGNOSTIC_PATH/u);
+  assert.match(source, /await writeSmokeDiagnostic\("module_loaded"\)/u);
+  assert.match(source, /terminate_process_tree_started/u);
+  assert.match(source, /terminate_process_tree_finished/u);
+  assert.match(source, /cleanup_started/u);
+  assert.match(source, /post_terminate_cleanup_started/u);
+  assert.match(source, /cleanup_finished/u);
   assert.match(source, /await writeFile\(outputPath, `\$\{JSON\.stringify\(output\)\}/u);
   for (const reason of [
     "refresh_not_accepted",
@@ -1010,10 +1043,44 @@ test("non-Windows Electron smoke reports unsupported rather than success", () =>
   });
 });
 
+test("import-only Windows smoke leaves an entry-boundary diagnostic", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-electron-windows-entry-"));
+  const outputPath = join(root, "aggregate.json");
+  const diagnosticPath = join(root, "diagnostic.json");
+  try {
+    const result = spawnSync(
+      process.execPath,
+      ["--input-type=module", "-e", "import('./scripts/smoke-electron-windows.mjs')"],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_OUTPUT_PATH: outputPath,
+          TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_DIAGNOSTIC_PATH: diagnosticPath,
+        },
+      },
+    );
+    assert.equal(result.status, 0);
+    assert.equal(result.stdout, "");
+    await assert.rejects(readFile(outputPath));
+    assert.deepEqual(JSON.parse(await readFile(diagnosticPath, "utf8")), {
+      schemaVersion: "tibotattle-windows-electron-runtime-diagnostic-v1",
+      status: "running",
+      phase: "module_loaded",
+      exitClass: "running",
+      contentFree: true,
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Windows Electron smoke can seal its aggregate through an explicit sidecar", async () => {
   if (process.platform === "win32") return;
   const root = await mkdtemp(join(tmpdir(), "tibotattle-electron-windows-sidecar-"));
   const outputPath = join(root, "aggregate.json");
+  const diagnosticPath = join(root, "diagnostic.json");
   try {
     const result = spawnSync(
       process.execPath,
@@ -1023,13 +1090,22 @@ test("Windows Electron smoke can seal its aggregate through an explicit sidecar"
         env: {
           ...process.env,
           TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_OUTPUT_PATH: outputPath,
+          TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_DIAGNOSTIC_PATH: diagnosticPath,
         },
       },
     );
     assert.equal(result.status, 0);
     const consoleAggregate = JSON.parse(result.stdout.trim());
     const sidecarAggregate = JSON.parse(await readFile(outputPath, "utf8"));
+    const diagnostic = JSON.parse(await readFile(diagnosticPath, "utf8"));
     assert.deepEqual(sidecarAggregate, consoleAggregate);
+    assert.deepEqual(diagnostic, {
+      schemaVersion: "tibotattle-windows-electron-runtime-diagnostic-v1",
+      status: "sealed",
+      phase: "completed",
+      exitClass: "completed",
+      contentFree: true,
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

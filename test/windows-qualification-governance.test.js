@@ -357,7 +357,7 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /tibotattle-windows-electron-runtime-smoke\.stderr\.raw/u);
   assert.match(workflow, /Remove-VerifiedRuntimeTransientOutput/u);
   assert.match(workflow, /WINDOWS_ELECTRON_RUNTIME_TRANSIENT_OUTPUT_DELETE_FAILED/u);
-  assert.match(workflow, /foreach \(\$path in @\(\$runtimeStdoutPath, \$runtimeStderrPath, \$runtimeAggregatePath\)\)/u);
+  assert.match(workflow, /foreach \(\$path in @\(\$runtimeStdoutPath, \$runtimeStderrPath, \$runtimeAggregatePath, \$runtimeDiagnosticPath\)\)/u);
   assert.match(workflow, /Test-Path -LiteralPath \$path -ErrorAction Stop/u);
   const electronVerifierBodyForDeletion = workflow.slice(verificationStep, runtimeStep);
   assert.match(electronVerifierBodyForDeletion, /function Fail-ClosedVerifierArtifact/u);
@@ -380,6 +380,19 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(workflow, /runtimeFailureStages/u);
   assert.match(workflow, /runtimeFailureReasons/u);
   assert.match(workflow, /runtimeFallbackReasons/u);
+  assert.match(workflow, /runtimeDiagnosticSchema/u);
+  assert.match(workflow, /runtimeDiagnosticPhases/u);
+  assert.match(workflow, /runtimeDiagnosticStatuses/u);
+  assert.match(workflow, /runtimeDiagnosticExitClasses/u);
+  assert.match(workflow, /TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_DIAGNOSTIC_PATH = \$runtimeDiagnosticPath/u);
+  assert.match(workflow, /runtime diagnostic shape/u);
+  assert.match(workflow, /terminate_process_tree_started_unsealed/u);
+  assert.match(workflow, /terminate_process_tree_finished_unsealed/u);
+  assert.match(workflow, /post_terminate_cleanup_unsealed/u);
+  assert.match(workflow, /cleanup_finished_unsealed/u);
+  assert.match(workflow, /runtime diagnostic phase status/u);
+  assert.match(workflow, /runtimeDiagnosticDecision\.status -ne 'sealed'/u);
+  assert.match(workflow, /runtime diagnostic does not match aggregate status/u);
   assert.match(workflow, /runtime aggregate diagnostics/u);
   assert.match(workflow, /failureStage = 'control'/u);
   assert.match(workflow, /failureReason = 'output_read_failed'/u);
@@ -388,6 +401,17 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
     "aggregate_invalid",
     "stderr_present",
     "output_read_failed",
+    "entry_not_reached",
+    "entry_unsealed",
+    "run_smoke_unsealed",
+    "terminate_process_tree_started_unsealed",
+    "terminate_process_tree_finished_unsealed",
+    "cleanup_unsealed",
+    "post_terminate_cleanup_unsealed",
+    "cleanup_finished_unsealed",
+    "caught_failure_output_missing",
+    "completed_output_missing",
+    "diagnostic_invalid",
   ]) {
     assert.match(workflow, new RegExp(`'${reason}'`, "u"));
   }
@@ -417,6 +441,11 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
     runtimeStepBody,
     /node \.\/scripts\/smoke-electron-windows\.mjs 1> \$runtimeStdoutPath 2> \$runtimeStderrPath/u,
     "runtime console stdout and stderr must be captured separately",
+  );
+  assert.match(
+    runtimeStepBody,
+    /try \{\s+node \.\/scripts\/smoke-electron-windows\.mjs[\s\S]+?\} catch \{[\s\S]+?\$runtimeExitCode = 1/u,
+    "runtime launch failures must continue into the closed classifier",
   );
   assert.match(
     runtimeStepBody,
@@ -471,6 +500,11 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
     runtimeStepBody.indexOf("Write-NormalizedRuntimeSummary -Evidence $runtimeEvidence")
       < runtimeStepBody.indexOf("Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_FAILED'"),
     "normalized runtime status must be summarized before runtime failure exits",
+  );
+  assert.match(
+    runtimeStepBody,
+    /Remove Windows Electron runtime transient output\n\s+if: \$\{\{ always\(\) \}\}[\s\S]+?runtime-smoke\.diagnostic\.json[\s\S]+?WINDOWS_ELECTRON_RUNTIME_TRANSIENT_OUTPUT_DELETE_FAILED/u,
+    "an always step must remove every runtime transient after abnormal step exits",
   );
   assert.match(workflow, /WINDOWS_ELECTRON_VERIFICATION_LOG_DELETE_FAILED/u);
   assert.match(workflow, /Test-Path -LiteralPath \$verificationLog -ErrorAction Stop/u);

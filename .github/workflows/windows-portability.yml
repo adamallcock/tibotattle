@@ -529,9 +529,10 @@ jobs:
           $runtimeStdoutPath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.stdout.raw'
           $runtimeStderrPath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.stderr.raw'
           $runtimeAggregatePath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.aggregate.json'
+          $runtimeDiagnosticPath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.diagnostic.json'
           $runtimeEvidencePath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.json'
           function Remove-VerifiedRuntimeTransientOutput {
-            foreach ($path in @($runtimeStdoutPath, $runtimeStderrPath, $runtimeAggregatePath)) {
+            foreach ($path in @($runtimeStdoutPath, $runtimeStderrPath, $runtimeAggregatePath, $runtimeDiagnosticPath)) {
               try {
                 if (Test-Path -LiteralPath $path -PathType Leaf -ErrorAction Stop) {
                   Remove-Item -LiteralPath $path -Force -ErrorAction Stop
@@ -549,9 +550,11 @@ jobs:
           # left by an earlier attempt on a reused runner workspace.
           Remove-VerifiedRuntimeTransientOutput
           # Retain only a closed aggregate. Console stdout, stderr, and the
-          # explicit aggregate sidecar are transient diagnostic inputs, never
-          # upload candidates; the sidecar is normalized into this
-          # content-free shape below.
+          # explicit aggregate/diagnostic files are transient inputs, never
+          # upload candidates; the aggregate is normalized into this
+          # content-free shape below. A valid aggregate also requires a
+          # matching sealed diagnostic checkpoint; that control is fail-closed
+          # and is not a product/runtime payload.
           $runtimeFailureStages = @(
             'none',
             'unsupported',
@@ -609,8 +612,34 @@ jobs:
             'aggregate_missing',
             'aggregate_invalid',
             'stderr_present',
-            'output_read_failed'
+            'output_read_failed',
+            'entry_not_reached',
+            'entry_unsealed',
+            'run_smoke_unsealed',
+            'terminate_process_tree_started_unsealed',
+            'terminate_process_tree_finished_unsealed',
+            'cleanup_unsealed',
+            'post_terminate_cleanup_unsealed',
+            'cleanup_finished_unsealed',
+            'caught_failure_output_missing',
+            'completed_output_missing',
+            'diagnostic_invalid'
           )
+          $runtimeDiagnosticSchema = 'tibotattle-windows-electron-runtime-diagnostic-v1'
+          $runtimeDiagnosticPhases = @(
+            'module_loaded',
+            'entry_started',
+            'run_smoke_started',
+            'terminate_process_tree_started',
+            'terminate_process_tree_finished',
+            'cleanup_started',
+            'post_terminate_cleanup_started',
+            'cleanup_finished',
+            'caught_failure',
+            'completed'
+          )
+          $runtimeDiagnosticStatuses = @('running', 'sealed')
+          $runtimeDiagnosticExitClasses = @('running', 'caught_failure', 'completed')
           $defaultRuntimeEvidence = [ordered]@{
             artifact = $false
             dashboardReady = $false
@@ -646,14 +675,109 @@ jobs:
           )
           "TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_EVIDENCE_PATH=$runtimeEvidencePath" >> $env:GITHUB_ENV
           $env:TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_OUTPUT_PATH = $runtimeAggregatePath
-          node ./scripts/smoke-electron-windows.mjs 1> $runtimeStdoutPath 2> $runtimeStderrPath
-          $runtimeExitCode = $LASTEXITCODE
-          $runtimeEvidence = $null
+          $env:TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_DIAGNOSTIC_PATH = $runtimeDiagnosticPath
+          $runtimeExitCode = 1
           try {
+            node ./scripts/smoke-electron-windows.mjs 1> $runtimeStdoutPath 2> $runtimeStderrPath
+            $runtimeExitCode = $LASTEXITCODE
+          } catch {
+            # Continue into the closed diagnostic/aggregate classifier. Raw
+            # launch or redirection errors are never retained.
+            $runtimeExitCode = 1
+          }
+          $runtimeEvidence = $null
+          $runtimeDiagnosticDecision = $null
+          try {
+            $runtimeDiagnosticDecision = [ordered]@{
+              present = $false
+              valid = $false
+              reason = 'entry_not_reached'
+              status = $null
+              exitClass = $null
+            }
+            $diagnosticExists = Test-Path -LiteralPath $runtimeDiagnosticPath -PathType Leaf -ErrorAction Stop
+            if ($diagnosticExists) {
+              $runtimeDiagnosticDecision.present = $true
+              $diagnosticValue = $null
+              try {
+                $diagnosticValue = Get-Content -LiteralPath $runtimeDiagnosticPath -Raw -ErrorAction Stop | ConvertFrom-Json
+              } catch {
+                $runtimeDiagnosticDecision.reason = 'diagnostic_invalid'
+                throw 'runtime diagnostic is invalid'
+              }
+              $expectedDiagnosticKeys = @(
+                'contentFree',
+                'exitClass',
+                'phase',
+                'schemaVersion',
+                'status'
+              ) | Sort-Object
+              $actualDiagnosticKeys = @($diagnosticValue.psobject.Properties.Name | Sort-Object)
+              if (($actualDiagnosticKeys -join '|') -ne ($expectedDiagnosticKeys -join '|') -or
+                  $diagnosticValue.schemaVersion -ne $runtimeDiagnosticSchema -or
+                  $diagnosticValue.contentFree -isnot [bool] -or
+                  $diagnosticValue.contentFree -ne $true -or
+                  $runtimeDiagnosticStatuses -notcontains $diagnosticValue.status -or
+                  $runtimeDiagnosticPhases -notcontains $diagnosticValue.phase -or
+                  $runtimeDiagnosticExitClasses -notcontains $diagnosticValue.exitClass) {
+                $runtimeDiagnosticDecision.reason = 'diagnostic_invalid'
+                throw 'runtime diagnostic shape'
+              }
+              if (($diagnosticValue.status -eq 'running' -and
+                   ($diagnosticValue.exitClass -ne 'running' -or
+                    $diagnosticValue.phase -in @('caught_failure', 'completed'))) -or
+                  ($diagnosticValue.status -eq 'sealed' -and
+                   -not (($diagnosticValue.phase -eq 'caught_failure' -and
+                          $diagnosticValue.exitClass -eq 'caught_failure') -or
+                         ($diagnosticValue.phase -eq 'completed' -and
+                          $diagnosticValue.exitClass -eq 'completed')))) {
+                $runtimeDiagnosticDecision.reason = 'diagnostic_invalid'
+                throw 'runtime diagnostic phase status'
+              }
+              $runtimeDiagnosticDecision.valid = $true
+              $runtimeDiagnosticDecision.status = $diagnosticValue.status
+              $runtimeDiagnosticDecision.exitClass = $diagnosticValue.exitClass
+              if ($diagnosticValue.status -eq 'running') {
+                # Keep the last fixed checkpoint visible as a semantic class:
+                # this distinguishes entry, runSmoke, taskkill, and cleanup
+                # termination without retaining raw process diagnostics.
+                if ($diagnosticValue.phase -eq 'module_loaded') {
+                  $runtimeDiagnosticDecision.reason = 'entry_not_reached'
+                } elseif ($diagnosticValue.phase -eq 'entry_started') {
+                  $runtimeDiagnosticDecision.reason = 'entry_unsealed'
+                } elseif ($diagnosticValue.phase -eq 'run_smoke_started') {
+                  $runtimeDiagnosticDecision.reason = 'run_smoke_unsealed'
+                } elseif ($diagnosticValue.phase -eq 'terminate_process_tree_started') {
+                  $runtimeDiagnosticDecision.reason = 'terminate_process_tree_started_unsealed'
+                } elseif ($diagnosticValue.phase -eq 'terminate_process_tree_finished') {
+                  $runtimeDiagnosticDecision.reason = 'terminate_process_tree_finished_unsealed'
+                } elseif ($diagnosticValue.phase -eq 'cleanup_started') {
+                  $runtimeDiagnosticDecision.reason = 'cleanup_unsealed'
+                } elseif ($diagnosticValue.phase -eq 'post_terminate_cleanup_started') {
+                  $runtimeDiagnosticDecision.reason = 'post_terminate_cleanup_unsealed'
+                } elseif ($diagnosticValue.phase -eq 'cleanup_finished') {
+                  $runtimeDiagnosticDecision.reason = 'cleanup_finished_unsealed'
+                } else {
+                  $runtimeDiagnosticDecision.reason = 'diagnostic_invalid'
+                  throw 'runtime diagnostic running phase'
+                }
+              } elseif ($diagnosticValue.exitClass -eq 'caught_failure') {
+                $runtimeDiagnosticDecision.reason = 'caught_failure_output_missing'
+              } elseif ($diagnosticValue.exitClass -eq 'completed') {
+                $runtimeDiagnosticDecision.reason = 'completed_output_missing'
+              } else {
+                $runtimeDiagnosticDecision.reason = 'diagnostic_invalid'
+                throw 'runtime diagnostic completion class'
+              }
+            }
             $aggregateExists = Test-Path -LiteralPath $runtimeAggregatePath -PathType Leaf -ErrorAction Stop
             if (-not $aggregateExists) {
-              $runtimeEvidenceFailureReason = 'aggregate_missing'
+              $runtimeEvidenceFailureReason = $runtimeDiagnosticDecision.reason
               throw 'runtime aggregate is missing'
+            }
+            if ($runtimeDiagnosticDecision.valid -ne $true) {
+              $runtimeEvidenceFailureReason = 'diagnostic_invalid'
+              throw 'runtime diagnostic is missing'
             }
             $runtimeAggregate = $null
             try {
@@ -702,6 +826,14 @@ jobs:
                 $runtimeEvidence.contentFree -isnot [bool] -or
                 $runtimeEvidence.contentFree -ne $true) {
               throw 'runtime aggregate status'
+            }
+            if ($runtimeDiagnosticDecision.status -ne 'sealed' -or
+                ($runtimeEvidence.status -eq 'passed' -and
+                 $runtimeDiagnosticDecision.exitClass -ne 'completed') -or
+                ($runtimeEvidence.status -eq 'failed' -and
+                 $runtimeDiagnosticDecision.exitClass -ne 'caught_failure')) {
+              $runtimeEvidenceFailureReason = 'diagnostic_invalid'
+              throw 'runtime diagnostic does not match aggregate status'
             }
             if ($runtimeEvidence.failureStage -isnot [string] -or
                 $runtimeFailureStages -notcontains $runtimeEvidence.failureStage -or
@@ -810,6 +942,27 @@ jobs:
           "- Protected state persistence: passed" >> $env:GITHUB_STEP_SUMMARY
           "- Disposable Credential Manager persistence and cleanup: passed" >> $env:GITHUB_STEP_SUMMARY
           "- Diagnostics: content-free" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Remove Windows Electron runtime transient output
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @(
+            'tibotattle-windows-electron-runtime-smoke.stdout.raw',
+            'tibotattle-windows-electron-runtime-smoke.stderr.raw',
+            'tibotattle-windows-electron-runtime-smoke.aggregate.json',
+            'tibotattle-windows-electron-runtime-smoke.diagnostic.json'
+          )) {
+            $path = Join-Path $env:RUNNER_TEMP $name
+            if (Test-Path -LiteralPath $path -PathType Leaf -ErrorAction Stop) {
+              Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+            }
+            if (Test-Path -LiteralPath $path -ErrorAction Stop) {
+              Write-Error 'WINDOWS_ELECTRON_RUNTIME_TRANSIENT_OUTPUT_DELETE_FAILED'
+              exit 1
+            }
+          }
 
       - name: Create content-free Windows Electron qualification receipt
         if: ${{ success() && steps.native_security_qualification.outcome == 'success' }}
