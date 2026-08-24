@@ -1253,9 +1253,14 @@ test("qualification hook rejects a fresh SQLite publication target collision", {
     assert.throws(
       () => adapter.createFile(`${stagePath}-journal`, Buffer.alloc(64)),
       (error) => {
-        if (typeof error?.code === "string"
-          && WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST.includes(error.code)) {
-          t.diagnostic(`windowsFilesystemError: ${error.code}`);
+        const diagnosticCode = error?.code === "EEXIST"
+          ? "WINDOWS_FILESYSTEM_ALREADY_EXISTS"
+          : error?.code === "ENOENT"
+            ? "WINDOWS_FILESYSTEM_NOT_FOUND"
+            : error?.code;
+        if (typeof diagnosticCode === "string"
+          && WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST.includes(diagnosticCode)) {
+          t.diagnostic(`windowsFilesystemError: ${diagnosticCode}`);
         }
         assert.ok([
           "WINDOWS_FILESYSTEM_ACCESS_DENIED",
