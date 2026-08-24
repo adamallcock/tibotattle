@@ -1,11 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import {
   createServer as createHttpServer,
   request as httpRequest,
 } from "node:http";
+import {
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import {
   chmod,
   lstat,
@@ -21,6 +28,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   LOCAL_COMPANION_SCHEMA_VERSION,
+  LocalCompanionDataStore,
+  buildLocalCompanionSnapshot,
 } from "../../src/local-companion-data.js";
 import {
   LocalContributionPreparationError,
@@ -50,10 +59,29 @@ import {
 import {
   configuredAccountingSourceMode,
   createCentralOutboundFetch,
+  createCompanionWindowsStateComposition,
+  createWindowsContributionMaterializer,
+  createPreparedLocalCompanionServer,
   createLocalCompanionServer,
+  loadCompanionWindowsFilesystemAdapter,
   resolveClaudeDesktopShadowConfiguration,
   startLocalCompanionServer,
 } from "./server.js";
+import {
+  assertLocalStatePath,
+  prepareLocalInstallationRoots,
+} from "../../src/local-installation-diagnostics.js";
+import { createWindowsFilesystemAdapter } from "../../src/platform/windows-filesystem.js";
+import {
+  WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_ARTIFACT_BYTES,
+  WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_CONTRIBUTION_BYTES,
+  createWindowsQualificationModeContext,
+  createWindowsQualificationStateSessionFactory,
+} from "../../src/platform/index.js";
+import {
+  currentLocalCollectorStateSessionBoundary,
+  withLocalCollectorStateSessionBoundary,
+} from "../../src/platform/local-collector-state-session.js";
 
 const DEVELOPMENT_COVERAGE = Object.freeze({
   startAt: "2026-07-24T21:00:00.000Z",
@@ -61,6 +89,267 @@ const DEVELOPMENT_COVERAGE = Object.freeze({
 });
 const REVIEW_JOB_ID = "11111111-1111-4111-8111-111111111111";
 const REVIEW_SHA256 = "a".repeat(64);
+
+function unqualifiedWindowsFilesystemAdapter({
+  readPreparedFile = () => ({
+    data: Buffer.from("data"),
+    identity: {
+      volumeSerialNumber: "0000000000000001",
+      fileId: "00112233445566778899aabbccddeeff",
+      linkCount: 1,
+    },
+  }),
+  protectedChildMetadata = false,
+} = {}) {
+  const identity = {
+    volumeSerialNumber: "0000000000000001",
+    fileId: "00112233445566778899aabbccddeeff",
+    linkCount: 1,
+  };
+  const binding = {
+    contractVersion: "windows-filesystem-v1",
+    securityContractVersion: "windows-filesystem-security-v1",
+    credentialAuditFileGuardContractVersion:
+      "windows-credential-audit-file-guard-v1",
+    sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
+    credentialMutexContractVersion: "windows-credential-mutex-v1",
+    companionInstanceMutexContractVersion:
+      "windows-companion-instance-mutex-v1",
+    preparedArtifactContractVersion: "windows-prepared-artifact-v1",
+    productionSafe: false,
+    pathWalkRaceSafe: false,
+    credentialMutexSafe: true,
+    companionInstanceMutexSafe: false,
+    credentialAuditFileGuardSafe: true,
+    sqliteStateLeaseSafe: false,
+    preparedArtifactSafe: false,
+    inspectPath: () => ({
+      identity,
+      isDirectory: true,
+      isRegularFile: false,
+      isReparsePoint: false,
+      ownerMatches: true,
+      nullDacl: false,
+      daclProtected: true,
+      broadAccess: false,
+      nonOwnerAllow: false,
+      unrecognizedAce: false,
+      finalPathResolved: true,
+    }),
+    ensureDirectory: () => identity,
+    readFile: () => ({ data: Buffer.from("data"), identity }),
+    readFileBounded: () => ({ data: Buffer.from("data"), identity }),
+    createFile: () => identity,
+    deleteFile: () => ({ deleted: true, identity }),
+    replaceFile: () => identity,
+    inspectProtectedChild: () => protectedChildMetadata
+      ? {
+        identity,
+        isDirectory: false,
+        isRegularFile: true,
+        isReparsePoint: false,
+        ownerMatches: true,
+        nullDacl: false,
+        daclProtected: true,
+        broadAccess: false,
+        nonOwnerAllow: false,
+        unrecognizedAce: false,
+        finalPathResolved: true,
+      }
+      : { identity },
+    readProtectedChild: () => ({ data: Buffer.from("data"), identity }),
+    createProtectedChild: () => identity,
+    deleteProtectedChild: () => ({ deleted: true, identity }),
+    replaceProtectedChild: () => identity,
+    acquireSqliteStateLease: () => ({
+      lease: {},
+      databaseIdentity: identity,
+      journalIdentity: identity,
+    }),
+    releaseSqliteStateLease: () => {},
+    acquireCredentialAuditFileGuard: () => ({ lease: {} }),
+    releaseCredentialAuditFileGuard: () => {},
+    acquireCredentialMutex: () => ({ lease: {}, abandoned: false }),
+    releaseCredentialMutex: () => {},
+    acquireCompanionInstanceMutex: () => ({ lease: {}, abandoned: false }),
+    releaseCompanionInstanceMutex: () => {},
+    inspectPreparedChild: () => ({
+      identity,
+      isDirectory: true,
+      isRegularFile: false,
+      isReparsePoint: false,
+    }),
+    ensurePreparedDirectory: () => identity,
+    enumeratePreparedDirectory: () => [],
+    removePreparedDirectory: () => ({ removed: true, identity }),
+    renamePreparedDirectory: () => ({ renamed: true, identity }),
+    createPreparedFile: () => identity,
+    readPreparedFile,
+    deletePreparedFile: () => ({ deleted: true, identity }),
+    publishPreparedFile: () => ({ published: true, identity }),
+  };
+  return createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding,
+  });
+}
+
+const WINDOWS_QUALIFICATION_RESOURCE_ROOT = mkdtempSync(
+  join(tmpdir(), "tibotattle-local-qualification-resource-"),
+);
+
+function qualificationResourceSha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function writeQualificationResourceManifest() {
+  const paths = [
+    "apps/electron/companion-supervisor.js",
+    "apps/electron/desktop-command.js",
+    "apps/electron/desktop-contract.js",
+    "apps/electron/desktop-deep-links.js",
+    "apps/electron/desktop-controller.js",
+    "apps/electron/desktop-copy.js",
+    "apps/electron/desktop-first-run.js",
+    "apps/electron/desktop-first-run-login.js",
+    "apps/electron/desktop-hosted-signin.js",
+    "apps/electron/desktop-recovery-settings.js",
+    "apps/electron/desktop-ipc.js",
+    "apps/electron/desktop-owned-downloads.js",
+    "apps/electron/desktop-lifecycle.js",
+    "apps/electron/desktop-notification-coordinator.js",
+    "apps/electron/desktop-notification-delivery.js",
+    "apps/electron/desktop-notification-policy.js",
+    "apps/electron/desktop-platform-services.js",
+    "apps/electron/desktop-runtime.js",
+    "apps/electron/desktop-settings-backends.js",
+    "apps/electron/desktop-settings-store.js",
+    "apps/electron/desktop-menu.js",
+    "apps/electron/desktop-tray.js",
+    "apps/electron/desktop-status-monitor.js",
+    "apps/electron/desktop-tray-status.js",
+    "apps/electron/errors.js",
+    "apps/electron/loopback-policy.js",
+    "apps/electron/main.js",
+    "apps/electron/platform-gate.js",
+    "apps/electron/preload.cjs",
+    "apps/electron/recovery-preload.cjs",
+    "apps/electron/recovery-window.js",
+    "apps/electron/ready-line.js",
+    "apps/electron/windows-qualification.js",
+    "src/desktop-shell-status.js",
+    "src/platform/windows-credential-manager-probe.js",
+    "apps/local/server.js",
+    "apps/web/public/index.html",
+    "native/windows-filesystem/build/Release/windows_filesystem.node",
+    "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
+    "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node",
+  ].sort((left, right) => Buffer.from(left).compare(Buffer.from(right)));
+  const files = paths.map((path) => {
+    const bytes = Buffer.from(path, "utf8");
+    return {
+      bytes: bytes.byteLength,
+      kind: path.startsWith("apps/electron/")
+        || path === "src/desktop-shell-status.js"
+        || path === "src/platform/windows-credential-manager-probe.js"
+        ? "electron_shell"
+        : path.startsWith("apps/web/")
+          ? "dashboard_asset"
+          : path === "apps/local/server.js"
+            ? "companion_source"
+          : path.startsWith("native/")
+            ? "windows_native_binding"
+            : "third_party_dependency",
+      path,
+      sha256: qualificationResourceSha256(bytes),
+    };
+  });
+  const payloadHash = createHash("sha256");
+  let payloadBytes = 0;
+  for (const row of files) {
+    payloadBytes += row.bytes;
+    payloadHash.update(`F\0${row.path}\0${row.bytes}\0${row.sha256}\0${row.kind}\0`);
+  }
+  const binding = files.find((row) =>
+    row.path === "native/windows-filesystem/build/Release/windows_filesystem.node");
+  writeFileSync(
+    join(WINDOWS_QUALIFICATION_RESOURCE_ROOT, "electron-runtime-manifest.json"),
+    `${JSON.stringify({
+      architecture: "x64",
+      dashboardRoot: "apps/web/public",
+      entrypoint: "apps/electron/main.js",
+      files,
+      payload: {
+        bytes: payloadBytes,
+        sha256: payloadHash.digest("hex"),
+      },
+      releaseVersion: "0.1.0-dev",
+      schemaVersion: "usage-monitor-electron-runtime-v0.1",
+      target: "win32",
+      windowsBinding: {
+        binding: {
+          bytes: binding.bytes,
+          path: binding.path,
+          sha256: binding.sha256,
+        },
+        included: true,
+        manifest: {
+          path: "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
+        },
+        status: "included_unverified",
+        verified: false,
+      },
+    })}\n`,
+  );
+}
+
+writeQualificationResourceManifest();
+test.after(() => rmSync(WINDOWS_QUALIFICATION_RESOURCE_ROOT, {
+  recursive: true,
+  force: true,
+}));
+
+function windowsElectronQualificationContext({ adapter, stateRoot, environment = {
+  USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION: "windows-electron-v1",
+  USAGE_MONITOR_TEST_LANE: "windows-electron-smoke",
+  USAGE_MONITOR_ACCOUNTING_SOURCE_MODE: "unified",
+  TEMP: "C:\\Users\\tester\\AppData\\Local\\TiboTattle",
+  HOME: "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\home",
+  USERPROFILE: "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\home",
+  CODEX_HOME: "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\home\\.codex",
+  CLAUDE_CONFIG_DIR: "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\home\\.claude",
+  USAGE_MONITOR_RESOURCE_ROOT: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+  USAGE_MONITOR_STATE_ROOT: stateRoot,
+} }) {
+  return createWindowsQualificationModeContext({
+    platform: "win32",
+    architecture: "x64",
+    environment,
+    adapter,
+    resourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+    stateRoot,
+  });
+}
+
+function withNativeWindowsPlatform(callback) {
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  const originalArchitecture = Object.getOwnPropertyDescriptor(process, "arch");
+  Object.defineProperty(process, "platform", {
+    ...originalPlatform,
+    value: "win32",
+  });
+  Object.defineProperty(process, "arch", {
+    ...originalArchitecture,
+    value: "x64",
+  });
+  try {
+    return callback();
+  } finally {
+    Object.defineProperty(process, "platform", originalPlatform);
+    Object.defineProperty(process, "arch", originalArchitecture);
+  }
+}
 
 function exactReviewContribution() {
   return buildTelemetryContributionsFromBundle({
@@ -230,6 +519,776 @@ test("production authority defaults unified and keeps legacy as explicit rollbac
   );
 });
 
+test("companion composition owns one branded Windows adapter boundary", () => {
+  const adapter = unqualifiedWindowsFilesystemAdapter({
+    protectedChildMetadata: true,
+  });
+  let loaderOptions = null;
+  const selected = loadCompanionWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    environment: {},
+    createAdapter(options) {
+      loaderOptions = options;
+      return adapter;
+    },
+  });
+  assert.equal(selected, adapter);
+  assert.deepEqual(loaderOptions, { platform: "win32", architecture: "x64" });
+  assert.equal(
+    loadCompanionWindowsFilesystemAdapter({
+      platform: "win32",
+      environment: {
+        USAGE_MONITOR_WINDOWS_FILESYSTEM_DEVELOPMENT: "1",
+      },
+      windowsFilesystemAdapter: null,
+    }),
+    null,
+  );
+  assert.throws(
+    () => loadCompanionWindowsFilesystemAdapter({
+      platform: "win32",
+      environment: {},
+      windowsFilesystemAdapter: null,
+    }),
+    (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+  );
+  for (const forged of [
+    { ...adapter },
+    Object.freeze({ ...adapter, productionSafe: true, pathWalkRaceSafe: true }),
+  ]) {
+    assert.throws(
+      () => loadCompanionWindowsFilesystemAdapter({
+        platform: "win32",
+        environment: {},
+        windowsFilesystemAdapter: forged,
+      }),
+      (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID"
+        && error.message === "Windows filesystem adapter configuration is invalid",
+    );
+  }
+});
+
+test("Windows state composition shares one branded adapter and remains unqualified", () => {
+  const adapter = unqualifiedWindowsFilesystemAdapter();
+  const stateRoot = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state";
+  const composition = createCompanionWindowsStateComposition({
+    platform: "win32",
+    architecture: "x64",
+    stateRoot,
+    windowsFilesystemAdapter: adapter,
+  });
+  assert.equal(composition.protectedStateStore.productionSafe, false);
+  assert.equal(composition.protectedStateStore.rootBindingSafe, false);
+  assert.equal(composition.protectedStateStore.nativeReadBounded, false);
+  assert.equal(typeof composition.sqliteStateSessionFactory, "function");
+  assert.equal(typeof composition.sqliteStateSessionForPath, "function");
+  assert.equal(
+    typeof composition.contributionSyncQueue.inspectContributionSyncQueue,
+    "function",
+  );
+  assert.equal(composition.windowsPreparedArtifactStorage,
+    composition.preparedArtifactStorage);
+  assert.equal(composition.windowsPreparedContributionContext,
+    composition.preparedContributionContext);
+  assert.equal(composition.windowsReviewPairStorage,
+    composition.reviewPairStorage);
+  assert.equal(
+    typeof composition.windowsReviewPairStorage.writeReviewPair,
+    "function",
+  );
+  assert.equal(
+    typeof composition.windowsReviewPairStorage.readReviewPair,
+    "function",
+  );
+  assert.equal(
+    typeof composition.windowsReviewPairStorage.recoverReviewPairTransactions,
+    "function",
+  );
+  assert.equal(
+    composition.windowsReviewPairStorage.maximumBundleBytes,
+    WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_ARTIFACT_BYTES,
+  );
+  assert.equal(composition.windowsReviewPairStorage.readiness, false);
+  assert.equal(composition.windowsReviewPairStorage.productionSafe, false);
+  assert.equal(
+    typeof composition.windowsMetadataExportContext.buildLocalMetadataBundle,
+    "function",
+  );
+  assert.equal(
+    typeof composition.windowsMetadataExportContext.writeLocalMetadataBundle,
+    "function",
+  );
+  assert.equal(
+    typeof composition.windowsMetadataBundleVerificationContext
+      .loadVerifiedLocalMetadataBundleFiles,
+    "function",
+  );
+  assert.equal(composition.preparedArtifactStorage.rootPath, stateRoot);
+  assert.equal(
+    composition.preparedArtifactStorage.maximumFileBytes,
+    WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_ARTIFACT_BYTES,
+  );
+  assert.ok(
+    composition.preparedArtifactStorage.maximumFileBytes
+      > WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_CONTRIBUTION_BYTES,
+  );
+  assert.equal(composition.preparedContributionContext.rootPath, stateRoot);
+  assert.equal(composition.preparedArtifactStorage.readiness, false);
+  assert.equal(composition.preparedContributionContext.productionSafe, false);
+  assert.equal(
+    typeof composition.preparedContributionContext.verifyPreparedContributionSet,
+    "function",
+  );
+  assert.equal(
+    typeof composition.preparedContributionContext.loadVerifiedPreparedContribution,
+    "function",
+  );
+  assert.equal(composition.windowsCompanionInstanceLease.crossProcessSafe, true);
+  assert.equal(composition.windowsCompanionInstanceLease.productionSafe, false);
+  assert.throws(
+    () => createCompanionWindowsStateComposition({
+      platform: "win32",
+      architecture: "x64",
+      stateRoot: "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state",
+      windowsFilesystemAdapter: { ...adapter },
+    }),
+    (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+  );
+});
+
+test("Windows Electron qualification context enables only the bound native composition", () => {
+  const adapter = unqualifiedWindowsFilesystemAdapter();
+  const stateRoot = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state";
+  const context = windowsElectronQualificationContext({ adapter, stateRoot });
+  withNativeWindowsPlatform(() => {
+    const composition = createCompanionWindowsStateComposition({
+      platform: "win32",
+      architecture: "x64",
+      resourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+      stateRoot,
+      windowsFilesystemAdapter: adapter,
+      windowsQualificationModeContext: context,
+    });
+    // Qualification mode permits construction only; it must not promote any
+    // production selector or readiness claim.
+    assert.equal(composition.protectedStateStore.productionSafe, false);
+    assert.equal(composition.protectedStateStore.rootBindingSafe, false);
+    assert.equal(composition.protectedStateStore.nativeReadBounded, false);
+    assert.equal(composition.preparedArtifactStorage.readiness, false);
+    assert.equal(composition.preparedContributionContext.productionSafe, false);
+  });
+});
+
+test("Windows collector startup boundary accepts only the exact qualification binding", () => {
+  const adapter = unqualifiedWindowsFilesystemAdapter();
+  const stateRoot = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state";
+  const context = windowsElectronQualificationContext({ adapter, stateRoot });
+  const composition = withNativeWindowsPlatform(() => (
+    createCompanionWindowsStateComposition({
+      platform: "win32",
+      architecture: "x64",
+      resourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+      stateRoot,
+      windowsFilesystemAdapter: adapter,
+      windowsQualificationModeContext: context,
+    })
+  ));
+  const boundaryOptions = {
+    platform: "win32",
+    architecture: "x64",
+    simulation: false,
+    windowsFilesystemAdapter: adapter,
+    windowsSqliteStateSessionFactory: composition.sqliteStateSessionFactory,
+    windowsQualificationModeContext: context,
+    stateRoot,
+    resourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+  };
+  const observed = withNativeWindowsPlatform(() => (
+    withLocalCollectorStateSessionBoundary(
+      boundaryOptions,
+      () => currentLocalCollectorStateSessionBoundary(),
+    )
+  ));
+  assert.equal(observed.windowsQualificationModeContext, context);
+  assert.equal(observed.windowsFilesystemAdapter, adapter);
+  assert.equal(observed.windowsSqliteStateSessionFactory,
+    composition.sqliteStateSessionFactory);
+  assert.equal(observed.stateRoot, stateRoot);
+  assert.throws(
+    () => withNativeWindowsPlatform(() => (
+      withLocalCollectorStateSessionBoundary({
+        ...boundaryOptions,
+        windowsSqliteStateSessionFactory: () => ({
+          rootPath: stateRoot,
+          databaseName: "forged.sqlite",
+          database: {},
+          close() {},
+        }),
+      }, () => "unreachable")
+    )),
+    (error) => error?.code === "local_collector_state_unavailable",
+  );
+  assert.throws(
+    () => withNativeWindowsPlatform(() => (
+      withLocalCollectorStateSessionBoundary({
+        ...boundaryOptions,
+        simulation: false,
+        windowsQualificationModeContext: null,
+      }, () => "unreachable")
+    )),
+    (error) => error?.code === "local_collector_state_unavailable",
+  );
+  for (const candidate of [
+    Object.freeze({ ...context }),
+    windowsElectronQualificationContext({
+      adapter,
+      stateRoot: "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\other",
+    }),
+  ]) {
+    assert.throws(
+      () => withNativeWindowsPlatform(() => (
+        withLocalCollectorStateSessionBoundary({
+          ...boundaryOptions,
+          windowsQualificationModeContext: candidate,
+        }, () => "unreachable")
+      )),
+      (error) => error?.code === "local_collector_state_unavailable",
+    );
+  }
+});
+
+test("native qualification factory rejects database constructor injection", () => {
+  const adapter = unqualifiedWindowsFilesystemAdapter({
+    protectedChildMetadata: true,
+  });
+  const stateRoot = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state";
+  const context = windowsElectronQualificationContext({ adapter, stateRoot });
+  const portableFactory = createWindowsQualificationStateSessionFactory({
+    platform: "win32",
+    architecture: "x64",
+    windowsFilesystemAdapter: adapter,
+    windowsQualificationModeContext: context,
+    stateRoot,
+    resourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+  });
+  assert.throws(
+    () => portableFactory({
+      rootPath: stateRoot,
+      databaseName: "portable-injected.sqlite",
+      databaseFactory: () => {
+        throw new Error("portable test database factory");
+      },
+    }),
+    (error) => error?.code === "windows_sqlite_state_session_database_unavailable",
+  );
+  assert.throws(
+    () => withNativeWindowsPlatform(() => portableFactory({
+      rootPath: stateRoot,
+      databaseName: "native-per-call-injected.sqlite",
+      databaseFactory: () => new DatabaseSync(":memory:"),
+    })),
+    (error) => error?.code === "local_collector_state_unavailable",
+  );
+  assert.throws(
+    () => withNativeWindowsPlatform(() => (
+      createWindowsQualificationStateSessionFactory({
+        platform: "win32",
+        architecture: "x64",
+        windowsFilesystemAdapter: adapter,
+        windowsQualificationModeContext: context,
+        stateRoot,
+        resourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+        databaseFactory: () => new DatabaseSync(":memory:"),
+      })
+    )),
+    (error) => error?.code === "local_collector_state_unavailable",
+  );
+});
+
+test("qualification-bound snapshot construction reaches a usable overview", {
+  skip: process.platform === "win32"
+    ? "portable qualification simulation only"
+    : false,
+}, async () => {
+  const files = await fixture();
+  const adapter = unqualifiedWindowsFilesystemAdapter({
+    protectedChildMetadata: true,
+  });
+  const stateRoot = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state";
+  const context = windowsElectronQualificationContext({ adapter, stateRoot });
+  const collectorStateFile = `${stateRoot}\\local-collector-state-v1.sqlite`;
+  const qualificationDatabaseFile = join(files.root, "qualification.sqlite");
+  let sessionOpenCount = 0;
+  let sessionCloseCount = 0;
+  let databaseOpenCount = 0;
+  let databaseCloseCount = 0;
+  const sessionFactory = createWindowsQualificationStateSessionFactory({
+    platform: "win32",
+    architecture: "x64",
+    windowsFilesystemAdapter: adapter,
+    windowsQualificationModeContext: context,
+    stateRoot,
+    resourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+    databaseFactory: () => {
+      databaseOpenCount += 1;
+      sessionOpenCount += 1;
+      const database = new DatabaseSync(qualificationDatabaseFile);
+      return {
+        get isOpen() { return database.isOpen; },
+        get isTransaction() { return database.isTransaction; },
+        exec: (...args) => database.exec(...args),
+        prepare: (...args) => database.prepare(...args),
+        enableDefensive: (...args) => database.enableDefensive(...args),
+        setAuthorizer: (...args) => database.setAuthorizer(...args),
+        // The portable double stores a real SQLite file but deliberately does
+        // not claim that its POSIX path is the protected Windows path.
+        location: () => null,
+        close: () => {
+          databaseCloseCount += 1;
+          sessionCloseCount += 1;
+          return database.close();
+        },
+      };
+    },
+  });
+  const probeSession = sessionFactory({
+    rootPath: stateRoot,
+    databaseName: "qualification-probe.sqlite",
+    readOnly: false,
+    create: true,
+  });
+  assert.equal(probeSession.productionSafe, false);
+  assert.equal(probeSession.sqliteStateLeaseSafe, false);
+  probeSession.close();
+  const boundaryOptions = {
+    platform: "win32",
+    architecture: "x64",
+    simulation: true,
+    windowsFilesystemAdapter: adapter,
+    windowsSqliteStateSessionFactory: sessionFactory,
+    windowsQualificationModeContext: context,
+    stateRoot,
+    resourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+  };
+  try {
+    const store = new LocalCompanionDataStore({
+      builder: () => withLocalCollectorStateSessionBoundary(
+        boundaryOptions,
+        () => buildLocalCompanionSnapshot({
+          root: files.root,
+          collectorStateFile,
+          unifiedIndexFile: `${stateRoot}\\local-unified-index.sqlite`,
+          codexHome: `${stateRoot}\\home\\.codex`,
+          accountingSourceMode: "unified",
+          now: () => Date.parse("2026-08-22T00:00:00.000Z"),
+        }),
+      ),
+    });
+    const overview = await store.initialize();
+    assert.equal(overview.schemaVersion, LOCAL_COMPANION_SCHEMA_VERSION);
+    assert.equal(typeof overview.mode, "string");
+    assert.equal(overview.accounting.sourceMode, "unified");
+    assert.ok(sessionOpenCount > 0);
+    assert.equal(sessionCloseCount, sessionOpenCount);
+    assert.equal(databaseCloseCount, databaseOpenCount);
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("Windows Electron qualification binds local installation roots to both roots", {
+  skip: process.platform === "win32"
+    ? false
+    : "native Windows path and adapter qualification contract",
+}, () => {
+  const adapter = unqualifiedWindowsFilesystemAdapter();
+  const stateRoot = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state";
+  const context = windowsElectronQualificationContext({ adapter, stateRoot });
+  withNativeWindowsPlatform(() => {
+    const installation = prepareLocalInstallationRoots({
+      resourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+      stateRoot,
+      windowsFilesystemAdapter: adapter,
+      windowsQualificationModeContext: context,
+    });
+    assert.equal(installation.stateRoot, stateRoot);
+    assert.throws(
+      () => prepareLocalInstallationRoots({
+        resourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+        stateRoot: `${stateRoot}\\other`,
+        windowsFilesystemAdapter: adapter,
+        windowsQualificationModeContext: context,
+      }),
+      (error) => error?.code === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID",
+    );
+    assert.throws(
+      () => assertLocalStatePath(
+        `${stateRoot}\\other`,
+        `${stateRoot}\\other\\queue.sqlite3`,
+        {
+          windowsFilesystemAdapter: adapter,
+          windowsQualificationModeContext: context,
+          windowsQualificationResourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+        },
+      ),
+      (error) => error?.code === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID",
+    );
+    assert.throws(
+      () => assertLocalStatePath(
+        stateRoot,
+        `${stateRoot}\\queue.sqlite3`,
+        {
+          windowsFilesystemAdapter: adapter,
+          windowsQualificationModeContext: context,
+        },
+      ),
+      (error) => error?.code === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID",
+    );
+    assert.throws(
+      () => prepareLocalInstallationRoots({
+        resourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+        stateRoot,
+        windowsFilesystemAdapter: null,
+        windowsQualificationModeContext: context,
+      }),
+      (error) => error?.code === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID",
+    );
+    assert.throws(
+      () => assertLocalStatePath(
+        stateRoot,
+        `${stateRoot}\\queue.sqlite3`,
+        {
+          windowsFilesystemAdapter: null,
+          windowsQualificationModeContext: context,
+          windowsQualificationResourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+        },
+      ),
+      (error) => error?.code === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID",
+    );
+    assert.throws(
+      () => createCompanionWindowsStateComposition({
+        platform: "win32",
+        architecture: "x64",
+        resourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+        stateRoot,
+        windowsFilesystemAdapter: null,
+        windowsQualificationModeContext: context,
+      }),
+      (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+    );
+  });
+});
+
+test("Windows Electron qualification stays closed for absent, copied, and path-mismatched contexts", () => {
+  const adapter = unqualifiedWindowsFilesystemAdapter();
+  const stateRoot = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state";
+  const context = windowsElectronQualificationContext({ adapter, stateRoot });
+  const copiedContext = Object.freeze({ ...context });
+  withNativeWindowsPlatform(() => {
+    for (const candidate of [
+      null,
+      copiedContext,
+      windowsElectronQualificationContext({
+        adapter,
+        stateRoot: "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\other",
+      }),
+    ]) {
+      assert.throws(
+        () => createCompanionWindowsStateComposition({
+          platform: "win32",
+          architecture: "x64",
+          resourceRoot: WINDOWS_QUALIFICATION_RESOURCE_ROOT,
+          stateRoot,
+          windowsFilesystemAdapter: adapter,
+          windowsQualificationModeContext: candidate,
+        }),
+        (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+      );
+    }
+    assert.throws(
+      () => createCompanionWindowsStateComposition({
+        platform: "win32",
+        architecture: "x64",
+        resourceRoot: join(WINDOWS_QUALIFICATION_RESOURCE_ROOT, "missing"),
+        stateRoot,
+        windowsFilesystemAdapter: adapter,
+        windowsQualificationModeContext: context,
+      }),
+      (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+    );
+  });
+});
+
+test("Windows Electron qualification does not accept a null adapter or a secret-origin marker", async () => {
+  const files = await fixture();
+  const marker = "USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION";
+  const originalMarker = process.env[marker];
+  process.env[marker] = "windows-electron-v1";
+  try {
+    withNativeWindowsPlatform(() => {
+      assert.throws(
+        () => createLocalCompanionServer({
+          environment: {
+            USERPROFILE: join(files.root, "home"),
+            USAGE_MONITOR_WINDOWS_FILESYSTEM_DEVELOPMENT: "1",
+          },
+          resourceRoot: files.resourceRoot,
+          stateRoot: files.stateRoot,
+          codexHome: files.codexHome,
+          staticRoot: files.staticRoot,
+          dataStore: fakeStore(),
+          refreshRunner: async () => ({}),
+          windowsFilesystemAdapter: null,
+        }),
+        (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID"
+          || error?.code === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID",
+      );
+    });
+  } finally {
+    if (originalMarker === undefined) delete process.env[marker];
+    else process.env[marker] = originalMarker;
+    await rm(files.root, { recursive: true, force: true });
+  }
+});
+
+test("Windows materializer receives the composed metadata verifier", async () => {
+  let reviewedReads = 0;
+  const stateRoot = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state";
+  const composition = createCompanionWindowsStateComposition({
+    platform: "win32",
+    architecture: "x64",
+    stateRoot,
+    windowsFilesystemAdapter: unqualifiedWindowsFilesystemAdapter({
+      readPreparedFile() {
+        reviewedReads += 1;
+        return {
+          data: Buffer.from("not canonical JSON"),
+          identity: {
+            volumeSerialNumber: "0000000000000001",
+            fileId: "00112233445566778899aabbccddeeff",
+            linkCount: 1,
+          },
+        };
+      },
+    }),
+  });
+  const materialize = createWindowsContributionMaterializer({
+    preparedContributionContext: composition.preparedContributionContext,
+    windowsPreparedArtifactStorage: composition.preparedArtifactStorage,
+    windowsReviewPairStorage: composition.windowsReviewPairStorage,
+    windowsMetadataBundleVerificationContext:
+      composition.windowsMetadataBundleVerificationContext,
+  });
+  await assert.rejects(
+    materialize({
+      bundleFile: `${stateRoot}\\review-11111111-1111-4111-8111-111111111111\\review.umx.json`,
+      receiptFile: `${stateRoot}\\review-11111111-1111-4111-8111-111111111111\\review.umx.json.privacy-receipt.json`,
+      outputDirectory: `${stateRoot}\\prepared`,
+    }),
+    (error) => error instanceof Error,
+  );
+  assert.equal(reviewedReads, 2);
+  assert.throws(
+    () => createWindowsContributionMaterializer({
+      preparedContributionContext: composition.preparedContributionContext,
+      windowsPreparedArtifactStorage: composition.preparedArtifactStorage,
+      windowsReviewPairStorage: composition.windowsReviewPairStorage,
+      windowsMetadataBundleVerificationContext: {
+        ...composition.windowsMetadataBundleVerificationContext,
+      },
+    }),
+    (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+  );
+});
+
+test("Windows prepared contexts reject missing or forged roots before controllers", () => {
+  const adapter = unqualifiedWindowsFilesystemAdapter();
+  const stateRoot = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state";
+  const composition = createCompanionWindowsStateComposition({
+    platform: "win32",
+    architecture: "x64",
+    stateRoot,
+    windowsFilesystemAdapter: adapter,
+  });
+  const base = {
+    environment: {},
+    resourceRoot: "C:\\TiboTattle\\resources",
+    stateRoot,
+    statePaths: {},
+    staticRoot: "C:\\TiboTattle\\resources\\public",
+    codexHome: "C:\\Users\\tester\\.codex",
+    homeDirectory: "C:\\Users\\tester",
+    diagnosticsLogFile: `${stateRoot}\\diagnostics-v0.1.log`,
+    contributionQueueFile: `${stateRoot}\\contribution-queue.sqlite3`,
+    preparedContributionDirectory: `${stateRoot}\\prepared`,
+    windowsFilesystemAdapter: adapter,
+    windowsProtectedStateStore: composition.protectedStateStore,
+    windowsSqliteStateSessionFactory:
+      composition.sqliteStateSessionFactory,
+    windowsSqliteStateSessionForPath:
+      composition.sqliteStateSessionForPath,
+    windowsSqliteStateStaging: composition.sqliteStateStaging,
+    contributionSyncQueueContext: composition.contributionSyncQueue,
+    windowsCompanionInstanceLease: composition.windowsCompanionInstanceLease,
+  };
+  assert.throws(
+    () => createPreparedLocalCompanionServer(base),
+    (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+  );
+  assert.throws(
+    () => createPreparedLocalCompanionServer({
+      ...base,
+      windowsPreparedArtifactStorage: composition.preparedArtifactStorage,
+      windowsPreparedContributionContext: {},
+    }),
+    (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+  );
+  assert.throws(
+    () => createPreparedLocalCompanionServer({
+      ...base,
+      windowsPreparedArtifactStorage: { ...composition.preparedArtifactStorage },
+      windowsPreparedContributionContext:
+        composition.preparedContributionContext,
+    }),
+    (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+  );
+  const complete = {
+    ...base,
+    windowsPreparedArtifactStorage: composition.preparedArtifactStorage,
+    windowsPreparedContributionContext: composition.preparedContributionContext,
+    windowsReviewPairStorage: composition.windowsReviewPairStorage,
+    windowsMetadataExportContext: composition.windowsMetadataExportContext,
+    windowsMetadataBundleVerificationContext:
+      composition.windowsMetadataBundleVerificationContext,
+  };
+  const secondComposition = createCompanionWindowsStateComposition({
+    platform: "win32",
+    architecture: "x64",
+    // Keep every visible path identical: only exact object ownership should
+    // distinguish this composition from the one used by `complete`.
+    stateRoot,
+    windowsFilesystemAdapter: unqualifiedWindowsFilesystemAdapter(),
+  });
+  for (const [field, value] of [
+    ["windowsPreparedContributionContext",
+      secondComposition.preparedContributionContext],
+    ["windowsReviewPairStorage", secondComposition.windowsReviewPairStorage],
+    ["windowsMetadataExportContext",
+      secondComposition.windowsMetadataExportContext],
+    ["windowsMetadataBundleVerificationContext",
+      secondComposition.windowsMetadataBundleVerificationContext],
+  ]) {
+    assert.throws(
+      () => createPreparedLocalCompanionServer({
+        ...complete,
+        [field]: value,
+      }),
+      (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+      `cross-composition ${field} must be rejected`,
+    );
+  }
+  assert.throws(
+    () => createPreparedLocalCompanionServer({
+      ...complete,
+      windowsReviewPairStorage: { ...composition.windowsReviewPairStorage },
+    }),
+    (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+  );
+  assert.throws(
+    () => createPreparedLocalCompanionServer({
+      ...complete,
+      windowsMetadataExportContext: {
+        ...composition.windowsMetadataExportContext,
+      },
+    }),
+    (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+  );
+});
+
+test("Windows prepared server rejects caller-supplied preparation runners", () => {
+  const adapter = unqualifiedWindowsFilesystemAdapter();
+  const stateRoot = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state";
+  const composition = createCompanionWindowsStateComposition({
+    platform: "win32",
+    architecture: "x64",
+    stateRoot,
+    windowsFilesystemAdapter: adapter,
+  });
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", {
+    ...originalPlatform,
+    value: "win32",
+  });
+  try {
+    assert.throws(
+      () => createPreparedLocalCompanionServer({
+        environment: {},
+        resourceRoot: "C:\\TiboTattle\\resources",
+        stateRoot,
+        statePaths: {},
+        staticRoot: "C:\\TiboTattle\\resources\\public",
+        codexHome: "C:\\Users\\tester\\.codex",
+        homeDirectory: "C:\\Users\\tester",
+        diagnosticsLogFile: `${stateRoot}\\diagnostics-v0.1.log`,
+        contributionQueueFile: `${stateRoot}\\contribution-queue.sqlite3`,
+        preparedContributionDirectory: `${stateRoot}\\prepared`,
+        windowsFilesystemAdapter: adapter,
+        windowsProtectedStateStore: composition.protectedStateStore,
+        windowsSqliteStateSessionFactory:
+          composition.sqliteStateSessionFactory,
+        windowsSqliteStateSessionForPath:
+          composition.sqliteStateSessionForPath,
+        windowsSqliteStateStaging: composition.sqliteStateStaging,
+        contributionSyncQueueContext: composition.contributionSyncQueue,
+        windowsCompanionInstanceLease:
+          composition.windowsCompanionInstanceLease,
+        windowsPreparedArtifactStorage:
+          composition.preparedArtifactStorage,
+        windowsPreparedContributionContext:
+          composition.preparedContributionContext,
+        windowsReviewPairStorage: composition.windowsReviewPairStorage,
+        windowsMetadataExportContext:
+          composition.windowsMetadataExportContext,
+        windowsMetadataBundleVerificationContext:
+          composition.windowsMetadataBundleVerificationContext,
+        contributionPreparationRunner: async () => {},
+      }),
+      (error) => error?.code === "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID",
+    );
+  } finally {
+    Object.defineProperty(process, "platform", originalPlatform);
+  }
+});
+
+test("Windows root rejects the unqualified branded adapter before state creation", async () => {
+  const files = await fixture();
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+  try {
+    assert.throws(
+      () => createLocalCompanionServer({
+        environment: {
+          USERPROFILE: join(files.root, "home"),
+        },
+        resourceRoot: files.resourceRoot,
+        stateRoot: files.stateRoot,
+        codexHome: files.codexHome,
+        staticRoot: files.staticRoot,
+        dataStore: fakeStore(),
+        refreshRunner: async () => ({}),
+        windowsFilesystemAdapter: unqualifiedWindowsFilesystemAdapter(),
+      }),
+      (error) => error?.code === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID"
+        && error.message === "Local installation configuration is invalid",
+    );
+    await assert.rejects(lstat(files.stateRoot), { code: "ENOENT" });
+  } finally {
+    Object.defineProperty(process, "platform", originalPlatform);
+    await rm(files.root, { recursive: true, force: true });
+  }
+});
+
 function rawRequest({ port, path, method = "GET", headers = {}, body = "" }) {
   return new Promise((resolveRequest, rejectRequest) => {
     const request = httpRequest({
@@ -259,6 +1318,29 @@ async function waitFor(predicate, timeoutMs = 1_000) {
     await new Promise((resolveWait) => setTimeout(resolveWait, 10));
   }
   throw new Error("condition was not reached");
+}
+
+async function waitForOwnedChildClose(closePromise, timeoutMs = 2_000) {
+  let timeout;
+  try {
+    return await Promise.race([
+      closePromise,
+      new Promise((_, rejectClose) => {
+        timeout = setTimeout(
+          () => rejectClose(new Error("owned child stdio did not close")),
+          timeoutMs,
+        );
+        timeout.unref?.();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function disposeOwnedChildOutput(child) {
+  child.stdout?.destroy();
+  child.stderr?.destroy();
 }
 
 function deferred() {
@@ -1627,6 +2709,12 @@ test("participant relay never follows an upstream redirect", async () => {
     upstream.once("error", rejectListen);
     upstream.listen(0, "127.0.0.1", resolveListen);
   });
+  // This private fixture must never own the test runner's lifetime. Windows
+  // can retain the listener's ref after close even though `listening` is false;
+  // explicit unref keeps the fixture non-owning while the close assertions
+  // below still prove orderly shutdown.
+  upstream.unref();
+  assert.equal(upstream.listening, true);
   const address = upstream.address();
   assert.equal(typeof address, "object");
   const app = await startLocalCompanionServer({
@@ -1650,7 +2738,17 @@ test("participant relay never follows an upstream redirect", async () => {
     assert.deepEqual(upstreamRequests, ["/api/v1/session"]);
   } finally {
     await app.close();
-    await new Promise((resolveClose) => upstream.close(resolveClose));
+    await new Promise((resolveClose, rejectClose) => {
+      upstream.close((error) => {
+        if (error && error.code !== "ERR_SERVER_NOT_RUNNING") {
+          rejectClose(error);
+          return;
+        }
+        resolveClose();
+      });
+      upstream.closeAllConnections?.();
+    });
+    assert.equal(upstream.listening, false);
     await rm(files.root, { recursive: true });
   }
 });
@@ -3669,6 +4767,7 @@ test("configured CLI exits after its declared parent disappears", async () => {
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
+  const parentClosed = once(parent, "close");
   let output = "";
   let errors = "";
   let childPid = null;
@@ -3695,13 +4794,18 @@ test("configured CLI exits after its declared parent disappears", async () => {
     await assert.rejects(fetch(url, {
       signal: AbortSignal.timeout(1_000),
     }));
+    disposeOwnedChildOutput(parent);
+    await waitForOwnedChildClose(parentClosed);
   } finally {
     if (parent.exitCode === null && parent.signalCode === null) {
       parent.kill("SIGKILL");
       await once(parent, "exit");
     }
+    disposeOwnedChildOutput(parent);
+    await waitForOwnedChildClose(parentClosed);
     if (Number.isSafeInteger(childPid) && processIsRunning(childPid)) {
       process.kill(childPid, "SIGKILL");
+      await waitFor(() => !processIsRunning(childPid), 5_000);
     }
     await rm(files.root, { recursive: true });
   }
@@ -3786,6 +4890,7 @@ test("CLI port zero prints its actual ready URL and honors explicit roots", asyn
     env: childEnvironment,
     stdio: ["ignore", "pipe", "pipe"],
   });
+  const childClosed = once(child, "close");
   let output = "";
   child.stdout.on("data", (chunk) => {
     output += chunk.toString("utf8");
@@ -3815,11 +4920,15 @@ test("CLI port zero prints its actual ready URL and honors explicit roots", asyn
       }),
     ]);
     assert.ok(code === 0 || signal === "SIGINT");
+    disposeOwnedChildOutput(child);
+    await waitForOwnedChildClose(childClosed);
   } finally {
     if (child.exitCode === null && child.signalCode === null) {
       child.kill("SIGKILL");
       await once(child, "exit");
     }
+    disposeOwnedChildOutput(child);
+    await waitForOwnedChildClose(childClosed);
     await rm(files.root, { recursive: true });
   }
 });

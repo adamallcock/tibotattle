@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { copyFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import {
@@ -31,6 +31,7 @@ import { createHistoryBaseSeedResolver } from "./local-unified-index-history.js"
 import { withStableRolloutSource } from "./rollout-source-snapshot.js";
 import {
   assertSafeLocalUnifiedIndexTarget,
+  assertWindowsUnifiedIndexStagingUnavailable,
   createUnifiedIndexWriter,
   beginUnifiedIndexGeneration,
   defaultLocalUnifiedIndexPath,
@@ -221,7 +222,12 @@ export async function ingestLocalUnifiedIndexIncrement({
   signal = null,
   onProgress = null,
   discoveryLimits = null,
+  windowsProtectedStateStore = null,
+  windowsSqliteStateSession = null,
+  windowsSqliteStateSessionFactory = null,
+  windowsSqliteStateStaging = null,
 } = {}) {
+  assertWindowsUnifiedIndexStagingUnavailable({ windowsSqliteStateStaging });
   if (typeof codexHome !== "string" || codexHome.length < 1) {
     throw new TypeError("codexHome must be a non-empty string");
   }
@@ -238,11 +244,23 @@ export async function ingestLocalUnifiedIndexIncrement({
   }
   const startedAt = performance.now();
   const resolvedIndexFile = resolve(indexFile);
-  await assertSafeLocalUnifiedIndexTarget(resolvedIndexFile, {
-    allowMissing: true,
-  });
+  let liveTargetIdentity = null;
+  if (process.platform === "win32") {
+    const targetName = basename(resolvedIndexFile.replaceAll("/", "\\"));
+    try {
+      liveTargetIdentity = windowsSqliteStateStaging.inspect(targetName);
+    } catch (error) {
+      if (error?.code !== "windows_sqlite_state_staging_database_missing") throw error;
+    }
+  } else {
+    await assertSafeLocalUnifiedIndexTarget(resolvedIndexFile, {
+      allowMissing: true,
+      windowsSqliteStateSession,
+    });
+  }
   const deviceSalt = await readOrCreateDeviceSalt(
     secretFile ?? defaultLocalUnifiedIndexSecretPath(resolvedIndexFile),
+    { windowsProtectedStateStore },
   );
   const infos = await discoverCodexRolloutInfos({
     codexHome,
@@ -255,28 +273,45 @@ export async function ingestLocalUnifiedIndexIncrement({
   const discoveredAt = performance.now();
   const sourceBytes = discovery.discoveredSourceBytes;
   let coldRebuildReason = null;
-  // Inspect only the SQLite header/meta needed to identify a pre-current index.
-  // The normal reader intentionally rejects old source-identity contracts;
-  // this narrow preflight must detect them before a writable clone can retain
-  // old rollout-key facts beside current rollout-id/snapshot facts.
-  try {
-    const raw = new DatabaseSync(resolvedIndexFile, {
-      readOnly: true,
-      timeout: 5_000,
-    });
+  // The raw node:sqlite preflight is intentionally portable-only. Windows
+  // must inspect/open the protected state through its qualified native
+  // session, never through a path-based DatabaseSync connection.
+  if (process.platform !== "win32") {
+    // Inspect only the SQLite header/meta needed to identify a pre-current index.
+    // The normal reader intentionally rejects old source-identity contracts;
+    // this narrow preflight must detect them before a writable clone can retain
+    // old rollout-key facts beside current rollout-id/snapshot facts.
     try {
-      const userVersion = Number(raw.prepare(
-        "PRAGMA user_version",
-      ).get()?.user_version);
-      if (userVersion !== LOCAL_UNIFIED_INDEX_USER_VERSION) {
-        coldRebuildReason = "source_identity_changed";
+      const raw = new DatabaseSync(resolvedIndexFile, {
+        readOnly: true,
+        timeout: 5_000,
+      });
+      try {
+        const userVersion = Number(raw.prepare(
+          "PRAGMA user_version",
+        ).get()?.user_version);
+        if (userVersion !== LOCAL_UNIFIED_INDEX_USER_VERSION) {
+          coldRebuildReason = "source_identity_changed";
+        }
+      } finally {
+        raw.close();
       }
-    } finally {
-      raw.close();
+    } catch {
+      // A missing index is handled by the normal staged creation path. Other
+      // unreadable files retain the existing fixed-error behavior below.
     }
-  } catch {
-    // A missing index is handled by the normal staged creation path. Other
-    // unreadable files retain the existing fixed-error behavior below.
+  }
+  if (process.platform === "win32"
+      && liveTargetIdentity !== null
+      && windowsSqliteStateSession === null
+      && typeof windowsSqliteStateSessionFactory === "function") {
+    const targetName = basename(resolvedIndexFile.replaceAll("/", "\\"));
+    windowsSqliteStateSession = windowsSqliteStateSessionFactory({
+      rootPath: dirname(resolvedIndexFile.replaceAll("/", "\\")),
+      databaseName: targetName,
+      readOnly: true,
+      create: false,
+    });
   }
   // Read-only preflight avoids cloning/publishing when every current source
   // is byte-for-byte unchanged. A same-size mtime change is deliberately a
@@ -285,7 +320,10 @@ export async function ingestLocalUnifiedIndexIncrement({
   if (!signal?.aborted && coldRebuildReason === null) {
     let unchangedDatabase = null;
     try {
-      unchangedDatabase = openLocalUnifiedIndex(resolvedIndexFile, { readOnly: true });
+      unchangedDatabase = openLocalUnifiedIndex(resolvedIndexFile, {
+        readOnly: true,
+        windowsSqliteStateSession,
+      });
       const schema = unchangedDatabase.prepare(
         "SELECT value FROM meta WHERE key = 'schema_version'",
       ).get()?.value;
@@ -539,6 +577,10 @@ export async function ingestLocalUnifiedIndexIncrement({
       signal,
       onProgress,
       discoveryLimits,
+      windowsProtectedStateStore,
+      windowsSqliteStateSession,
+      windowsSqliteStateSessionFactory,
+      windowsSqliteStateStaging,
     });
     return {
       ...rebuilt,
@@ -560,16 +602,36 @@ export async function ingestLocalUnifiedIndexIncrement({
     };
   }
   const stageFile = `${resolvedIndexFile}.incremental-${process.pid}-${Date.now().toString(36)}`;
-  await removeIfPresent(stageFile);
+  await removeIfPresent(stageFile, { windowsSqliteStateStaging });
   let database = null;
   let writer = null;
   let generation = null;
+  let stageSession = null;
   try {
-    const liveExists = await assertSafeLocalUnifiedIndexTarget(
-      resolvedIndexFile,
-      { allowMissing: true },
-    ) !== null;
-    if (liveExists) {
+    const liveExists = process.platform === "win32"
+      ? liveTargetIdentity !== null
+      : await assertSafeLocalUnifiedIndexTarget(
+        resolvedIndexFile,
+        { allowMissing: true, windowsSqliteStateSession },
+      ) !== null;
+    if (process.platform === "win32") {
+      const stageName = basename(stageFile.replaceAll("/", "\\"));
+      const targetName = basename(resolvedIndexFile.replaceAll("/", "\\"));
+      if (liveExists) {
+        windowsSqliteStateStaging.clone(targetName, stageName);
+      } else {
+        windowsSqliteStateStaging.create(stageName);
+      }
+      if (typeof windowsSqliteStateSessionFactory !== "function") {
+        throw fixedError("local_unified_index_windows_state_unqualified");
+      }
+      stageSession = windowsSqliteStateSessionFactory({
+        rootPath: dirname(stageFile.replaceAll("/", "\\")),
+        databaseName: stageName,
+        readOnly: false,
+        create: true,
+      });
+    } else if (liveExists) {
       try {
         await copyFile(
           resolvedIndexFile,
@@ -586,6 +648,7 @@ export async function ingestLocalUnifiedIndexIncrement({
       readOnly: false,
       create: !liveExists,
       staging: true,
+      windowsSqliteStateSession: stageSession,
     });
     const previousGenerationValue = database.prepare(
       "SELECT value FROM meta WHERE key = 'current_generation_id'",
@@ -1624,10 +1687,13 @@ export async function ingestLocalUnifiedIndexIncrement({
     );
     const closed = await writer.close({
       integrityCheck: true,
-      fsyncPath: stageFile,
+      fsyncPath: process.platform === "win32" ? null : stageFile,
     });
     writer = null;
-    await publishStagedUnifiedIndex(stageFile, resolvedIndexFile);
+    await publishStagedUnifiedIndex(stageFile, resolvedIndexFile, {
+      windowsSqliteStateStaging,
+      expectedTargetIdentity: liveTargetIdentity,
+    });
     return {
       status: "ingested",
       indexFile: resolvedIndexFile,
@@ -1665,7 +1731,7 @@ export async function ingestLocalUnifiedIndexIncrement({
         // The connection may already be closed.
       }
     }
-    await removeIfPresent(stageFile);
+    await removeIfPresent(stageFile, { windowsSqliteStateStaging });
     throw error;
   }
 }

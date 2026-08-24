@@ -6,8 +6,15 @@ import {
 } from "node:crypto";
 import { constants, lstatSync } from "node:fs";
 import { chmod, lstat, mkdir, open, rename, unlink } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { dirname, resolve, win32 } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+
+import {
+  isWindowsSqliteStateDatabase,
+  isWindowsSqliteStateSession,
+  isWindowsProtectedStateStore,
+  isWindowsSqliteStateStaging,
+} from "./platform/index.js";
 
 // The one local index.
 //
@@ -614,6 +621,119 @@ function fixedError(code) {
   return error;
 }
 
+const WINDOWS_UNIFIED_INDEX_STATE_UNQUALIFIED =
+  "local_unified_index_windows_state_unqualified";
+const WINDOWS_UNIFIED_INDEX_STAGING_UNAVAILABLE =
+  "local_unified_index_windows_staging_unavailable";
+const WINDOWS_UNIFIED_INDEX_INSPECTION_UNAVAILABLE =
+  "local_unified_index_windows_inspection_unavailable";
+const WINDOWS_UNIFIED_INDEX_STAGING_INVALID =
+  "local_unified_index_windows_staging_invalid";
+
+function windowsPath(path) {
+  if (typeof path !== "string" || path.length < 1 || path.includes("\0")) {
+    throw fixedError(WINDOWS_UNIFIED_INDEX_STATE_UNQUALIFIED);
+  }
+  try {
+    return win32.normalize(path.replaceAll("/", "\\"));
+  } catch {
+    throw fixedError(WINDOWS_UNIFIED_INDEX_STATE_UNQUALIFIED);
+  }
+}
+
+function sameWindowsPath(left, right) {
+  return windowsPath(left).toLowerCase() === windowsPath(right).toLowerCase();
+}
+
+/**
+ * A qualified session is the only permitted Windows SQLite entry point.
+ *
+ * The session brand is intentionally checked in addition to its fields. A
+ * copied object with `productionSafe: true` must not authorize a raw
+ * DatabaseSync(path) call. The current session implementation remains
+ * qualification-only (`productionSafe: false`), so this gate is closed on
+ * every real Windows process until native evidence promotes it.
+ */
+function qualifiedWindowsSqliteStateSession(session, indexFile) {
+  let valid = false;
+  try {
+    const expected = windowsPath(indexFile);
+    const sessionPath = win32.join(
+      windowsPath(session.rootPath),
+      windowsPath(session.databaseName),
+    );
+    valid = isWindowsSqliteStateSession(session)
+      && session.contractVersion === "windows-sqlite-state-session-v1"
+      && sameWindowsPath(sessionPath, expected)
+      && session.productionSafe === true
+      && session.sqliteStateLeaseSafe === true
+      && isWindowsSqliteStateDatabase(session.database)
+      && typeof session.close === "function"
+      && typeof session.abort === "function";
+  } catch {
+    valid = false;
+  }
+  if (!valid) throw fixedError(WINDOWS_UNIFIED_INDEX_STATE_UNQUALIFIED);
+  return session;
+}
+
+function qualifiedWindowsProtectedStateStore(store, secretFile) {
+  let valid = false;
+  try {
+    const selectedSecret = windowsPath(secretFile);
+    const storeRoot = windowsPath(store.rootPath);
+    valid = isWindowsProtectedStateStore(store)
+      && store.contractVersion === "windows-protected-state-store-v1"
+      && store.productionSafe === true
+      && store.rootBindingSafe === true
+      && store.nativeReadBounded === true
+      && sameWindowsPath(win32.dirname(selectedSecret), storeRoot)
+      && typeof store.ensureProtectedDirectory === "function"
+      && typeof store.read === "function"
+      && typeof store.create === "function";
+  } catch {
+    valid = false;
+  }
+  if (!valid) throw fixedError(WINDOWS_UNIFIED_INDEX_STATE_UNQUALIFIED);
+  return store;
+}
+
+function qualifiedWindowsSqliteStateStaging(staging) {
+  let valid = false;
+  try {
+    valid = isWindowsSqliteStateStaging(staging)
+      && staging.contractVersion === "windows-sqlite-state-staging-v1"
+      && staging.stagingSafe === true
+      && typeof staging.create === "function"
+      && typeof staging.clone === "function"
+      && typeof staging.publish === "function"
+      && typeof staging.discard === "function";
+  } catch {
+    valid = false;
+  }
+  if (!valid) throw fixedError(WINDOWS_UNIFIED_INDEX_STAGING_INVALID);
+  return staging;
+}
+
+export function assertWindowsUnifiedIndexStagingUnavailable(
+  { windowsSqliteStateStaging = null } = {},
+) {
+  if (process.platform === "win32") {
+    // The native coordinator is now wired, but its readiness bit remains
+    // false until a real Windows qualification proves clone, sidecar, and
+    // atomic-replacement behavior across the supported filesystem matrix.
+    if (windowsSqliteStateStaging === null) {
+      throw fixedError(WINDOWS_UNIFIED_INDEX_STAGING_UNAVAILABLE);
+    }
+    qualifiedWindowsSqliteStateStaging(windowsSqliteStateStaging);
+    if (windowsSqliteStateStaging.stagingSafe !== true) {
+      throw fixedError(WINDOWS_UNIFIED_INDEX_STAGING_UNAVAILABLE);
+    }
+  } else if (windowsSqliteStateStaging !== null) {
+    throw new TypeError("windowsSqliteStateStaging is only valid on Windows");
+  }
+}
+
 export function defaultLocalUnifiedIndexPath(root = process.cwd()) {
   return resolve(root, ".usage-monitor", "local-unified-index-v1.sqlite");
 }
@@ -634,8 +754,17 @@ function ownerOnlyRegularFile(metadata) {
 
 export async function assertSafeLocalUnifiedIndexTarget(
   indexFile,
-  { allowMissing = true } = {},
+  { allowMissing = true, windowsSqliteStateSession = null } = {},
 ) {
+  if (process.platform === "win32") {
+    // A qualified session has already inspected and identity-bound the
+    // database path. Never reintroduce a Node lstat race on Windows.
+    qualifiedWindowsSqliteStateSession(
+      windowsSqliteStateSession,
+      indexFile,
+    );
+    return Object.freeze({ nativeBoundary: true });
+  }
   let metadata;
   try {
     metadata = await lstat(resolve(indexFile));
@@ -658,7 +787,63 @@ export async function assertSafeLocalUnifiedIndexTarget(
  */
 export async function readOrCreateDeviceSalt(
   secretFile = defaultLocalUnifiedIndexSecretPath(),
+  { windowsProtectedStateStore = null } = {},
 ) {
+  if (process.platform === "win32") {
+    // The device salt is a secret, not a portable cache. On Windows it must
+    // use the same qualified protected-child boundary as other credential
+    // state; mkdir/open/read/chmod are never an allowed fallback.
+    const store = qualifiedWindowsProtectedStateStore(
+      windowsProtectedStateStore,
+      secretFile,
+    );
+    const selected = windowsPath(secretFile);
+    const relativeName = win32.basename(selected);
+    try {
+      store.ensureProtectedDirectory();
+      try {
+        const result = store.read(relativeName);
+        if (!result
+            || (!Buffer.isBuffer(result.data)
+              && !(result.data instanceof Uint8Array))
+            || result.data.byteLength < SECRET_BYTES
+            || result.data.byteLength > MAX_SECRET_BYTES) {
+          throw fixedError("local_unified_index_secret_invalid");
+        }
+        return Buffer.from(result.data);
+      } catch (error) {
+        if (error?.code !== "windows_protected_state_store_missing") throw error;
+      }
+      const candidate = randomBytes(SECRET_BYTES);
+      try {
+        try {
+          store.create(relativeName, candidate);
+        } catch (error) {
+          if (error?.code !== "windows_protected_state_store_already_exists") {
+            throw error;
+          }
+          const result = store.read(relativeName);
+          if (!result
+              || (!Buffer.isBuffer(result.data)
+                && !(result.data instanceof Uint8Array))
+              || result.data.byteLength < SECRET_BYTES
+              || result.data.byteLength > MAX_SECRET_BYTES) {
+            throw fixedError("local_unified_index_secret_invalid");
+          }
+          return Buffer.from(result.data);
+        }
+        return Buffer.from(candidate);
+      } finally {
+        candidate.fill(0);
+      }
+    } catch (error) {
+      if (error?.code === "local_unified_index_secret_invalid") throw error;
+      throw fixedError("local_unified_index_secret_unavailable");
+    }
+  }
+  if (windowsProtectedStateStore !== null) {
+    throw new TypeError("windowsProtectedStateStore is only valid on Windows");
+  }
   await mkdir(dirname(resolve(secretFile)), { recursive: true, mode: 0o700 });
   let handle;
   try {
@@ -1080,11 +1265,21 @@ export function openLocalUnifiedIndex(indexFile, {
   create = false,
   staging = false,
   deferSecondaryIndexes = false,
+  windowsSqliteStateSession = null,
 } = {}) {
+  let windowsSession = null;
+  if (process.platform === "win32") {
+    windowsSession = qualifiedWindowsSqliteStateSession(
+      windowsSqliteStateSession,
+      indexFile,
+    );
+  } else if (windowsSqliteStateSession !== null) {
+    throw new TypeError("windowsSqliteStateSession is only valid on Windows");
+  }
   if (deferSecondaryIndexes && (readOnly || !create || !staging)) {
     throw fixedError("local_unified_index_deferred_indexes_invalid");
   }
-  if (deferSecondaryIndexes) {
+  if (deferSecondaryIndexes && windowsSession === null) {
     try {
       lstatSync(resolve(indexFile));
       throw fixedError("local_unified_index_deferred_indexes_requires_new_stage");
@@ -1099,15 +1294,37 @@ export function openLocalUnifiedIndex(indexFile, {
     }
   }
   let database;
+  let sessionDatabase = null;
   try {
-    database = new DatabaseSync(indexFile, { readOnly, timeout: 5_000 });
-    configureDatabase(database, { readOnly, staging });
+    if (windowsSession !== null) {
+      // The qualified session owns the Windows connection and its native
+      // lease. Do not construct DatabaseSync(path) here.
+      sessionDatabase = windowsSession.database;
+      database = {
+        get isOpen() { return sessionDatabase.isOpen !== false; },
+        get isTransaction() { return sessionDatabase.isTransaction === true; },
+        exec(...args) { return sessionDatabase.exec(...args); },
+        prepare(...args) { return sessionDatabase.prepare(...args); },
+        close() { return windowsSession.close(); },
+      };
+    } else {
+      database = new DatabaseSync(indexFile, { readOnly, timeout: 5_000 });
+      configureDatabase(database, { readOnly, staging });
+    }
     if (create) initializeSchema(database, { deferSecondaryIndexes });
     if (!readOnly) migrateDatabase(database, { deferSecondaryIndexes });
     validateDatabase(database, { readOnly, deferSecondaryIndexes });
     return database;
   } catch (error) {
-    if (database?.isOpen) database.close();
+    if (windowsSession !== null) {
+      try {
+        windowsSession.abort();
+      } catch {
+        // Preserve the fixed open failure.
+      }
+    } else if (database?.isOpen) {
+      database.close();
+    }
     if (error?.code?.startsWith("local_unified_index_")) throw error;
     throw fixedError("local_unified_index_unavailable");
   }
@@ -2485,6 +2702,9 @@ export function createUnifiedIndexWriter(database, {
      * Settle the whole run: one optimize, one integrity check, one fsync.
      */
     async close({ integrityCheck = true, fsyncPath = null } = {}) {
+      if (process.platform === "win32" && fsyncPath !== null) {
+        assertWindowsUnifiedIndexStagingUnavailable();
+      }
       commit();
       database.exec("PRAGMA optimize");
       if (integrityCheck) {
@@ -2514,7 +2734,33 @@ export function createUnifiedIndexWriter(database, {
  * fsynced first, so a crash mid-publish leaves either the old index or the new
  * one, never a torn mixture.
  */
-export async function publishStagedUnifiedIndex(stageFile, indexFile) {
+export async function publishStagedUnifiedIndex(
+  stageFile,
+  indexFile,
+  {
+    windowsSqliteStateStaging = null,
+    expectedTargetIdentity = null,
+  } = {},
+) {
+  if (process.platform === "win32") {
+    assertWindowsUnifiedIndexStagingUnavailable({ windowsSqliteStateStaging });
+    const stageName = win32.basename(windowsPath(stageFile));
+    const targetName = win32.basename(windowsPath(indexFile));
+    try {
+      windowsSqliteStateStaging.publish(
+        stageName,
+        targetName,
+        expectedTargetIdentity,
+      );
+    } catch (error) {
+      if (error?.code?.startsWith("local_unified_index_")) throw error;
+      throw fixedError("local_unified_index_publication_failed");
+    }
+    return;
+  }
+  if (windowsSqliteStateStaging !== null) {
+    throw new TypeError("windowsSqliteStateStaging is only valid on Windows");
+  }
   await chmod(stageFile, 0o600);
   await syncFile(stageFile);
   await assertSafeLocalUnifiedIndexTarget(indexFile, { allowMissing: true });
@@ -2534,7 +2780,24 @@ export async function publishStagedUnifiedIndex(stageFile, indexFile) {
   }
 }
 
-export async function removeIfPresent(path) {
+export async function removeIfPresent(
+  path,
+  { windowsSqliteStateStaging = null } = {},
+) {
+  if (process.platform === "win32") {
+    assertWindowsUnifiedIndexStagingUnavailable({ windowsSqliteStateStaging });
+    try {
+      windowsSqliteStateStaging.discard(win32.basename(windowsPath(path)));
+    } catch (error) {
+      if (error?.code === "windows_sqlite_state_staging_database_missing") return;
+      if (error?.code?.startsWith("local_unified_index_")) throw error;
+      throw fixedError("local_unified_index_staging_cleanup_failed");
+    }
+    return;
+  }
+  if (windowsSqliteStateStaging !== null) {
+    throw new TypeError("windowsSqliteStateStaging is only valid on Windows");
+  }
   try {
     await unlink(path);
   } catch (error) {
@@ -2557,17 +2820,30 @@ const EMPTY_INSPECTION = Object.freeze({
 
 export async function inspectLocalUnifiedIndex({
   indexFile = defaultLocalUnifiedIndexPath(),
+  windowsSqliteStateSession = null,
 } = {}) {
   let metadata;
-  try {
-    metadata = await lstat(indexFile);
-  } catch (error) {
-    if (error?.code === "ENOENT") return EMPTY_INSPECTION;
-    throw fixedError("local_unified_index_unavailable");
+  if (process.platform === "win32") {
+    qualifiedWindowsSqliteStateSession(windowsSqliteStateSession, indexFile);
+    // The native session owns path inspection, but it does not yet expose a
+    // handle-bound byte size. Do not fabricate a zero-sized index or reopen a
+    // Node lstat race; keep this diagnostic closed until that metadata is part
+    // of the qualified session contract.
+    throw fixedError(WINDOWS_UNIFIED_INDEX_INSPECTION_UNAVAILABLE);
+  } else {
+    try {
+      metadata = await lstat(indexFile);
+    } catch (error) {
+      if (error?.code === "ENOENT") return EMPTY_INSPECTION;
+      throw fixedError("local_unified_index_unavailable");
+    }
   }
   let database;
   try {
-    database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    database = openLocalUnifiedIndex(indexFile, {
+      readOnly: true,
+      windowsSqliteStateSession,
+    });
     const usage = database.prepare(`
       SELECT COUNT(*) AS events,
              COUNT(DISTINCT session_local) AS sessions,

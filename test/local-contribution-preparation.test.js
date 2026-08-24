@@ -12,7 +12,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   LocalContributionPreparationError,
   createLocalContributionPreparationRunner,
@@ -20,6 +20,9 @@ import {
   prepareRecentLocalContribution,
   projectLocalContributionPreparationError,
 } from "../src/local-contribution-preparation.js";
+import {
+  createLocalPreparedContributionContext,
+} from "../src/application/local-prepared-contribution.js";
 import {
   loadVerifiedLocalMetadataBundleFiles,
   verifyLocalMetadataBundleFiles,
@@ -32,7 +35,11 @@ import {
 } from "../src/contribution-sync-queue.js";
 import {
   TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
+  materializeTelemetryContributions,
 } from "../src/telemetry-contribution-builder.js";
+import {
+  createOwnerOnlyPreparedContributionStorageContext,
+} from "../src/platform/owner-only-prepared-contribution-storage.js";
 import {
   PREPARED_CONTRIBUTION_SET_MANIFEST,
   verifyPreparedContributionSet,
@@ -132,6 +139,124 @@ async function runPreparation(files, uuid, options = {}) {
     preparedSpoolDirectory: files.preparedSpoolDirectory,
     uuid: () => uuid,
     ...identityDependencies(),
+    ...options,
+  });
+}
+
+function injectedPreparationStorage(files) {
+  const base = createOwnerOnlyPreparedContributionStorageContext();
+  const root = files.root;
+  const calls = [];
+  let identitySwapped = false;
+  const directoryMethods = new Set([
+    "assertPathAbsent",
+    "createOwnerOnlyDirectory",
+    "ownerOnlyDirectoryExists",
+    "prepareOwnerOnlyDirectory",
+    "removeEmptyOwnerOnlyDirectory",
+    "renameDirectory",
+    "syncDirectory",
+  ]);
+  const names = [
+    "assertPathAbsent",
+    "canonicalDirectory",
+    "createOwnerOnlyDirectory",
+    "ownerOnlyDirectoryExists",
+    "prepareOwnerOnlyDirectory",
+    "publishManifest",
+    "publishOwnerOnlyFile",
+    "readDirectoryEntries",
+    "readOwnerOnlyFile",
+    "removeEmptyOwnerOnlyDirectory",
+    "renameDirectory",
+    "sha256Hex",
+    "syncDirectory",
+  ];
+  const storage = {};
+  for (const name of names) {
+    Object.defineProperty(storage, name, {
+      configurable: false,
+      enumerable: true,
+      writable: false,
+      value: (...args) => {
+        calls.push([name, ...args]);
+        if (!directoryMethods.has(name)) {
+          return Reflect.apply(base[name], base, args);
+        }
+        const paths = name === "removeEmptyOwnerOnlyDirectory"
+          ? args.slice(0, 2)
+          : name === "renameDirectory"
+            ? args.slice(0, 2)
+            : args.slice(0, 1);
+        let createError;
+        for (let index = args.length - 1; index >= 0; index -= 1) {
+          if (typeof args[index] === "function") {
+            createError = args[index];
+            break;
+          }
+        }
+        if (identitySwapped && name !== "syncDirectory") {
+          if (typeof createError === "function") {
+            throw createError("preparation_failed");
+          }
+          throw new Error("identity_mismatch");
+        }
+        for (const path of paths) {
+          if (typeof path !== "string") continue;
+          const canonical = resolve(path);
+          const privateRoot = root.startsWith("/private/")
+            ? root.slice("/private".length)
+            : `/private${root}`;
+          const insideRoot = (canonical === root
+            || canonical.startsWith(`${root}/`)
+            || canonical === privateRoot
+            || canonical.startsWith(`${privateRoot}/`));
+          if (!insideRoot) {
+            if (typeof createError === "function") {
+              throw createError(
+                name === "prepareOwnerOnlyDirectory"
+                  ? args[1]
+                  : "preparation_failed",
+              );
+            }
+            throw new Error("path_escape");
+          }
+        }
+        return Reflect.apply(base[name], base, args);
+      },
+    });
+  }
+  Object.freeze(storage);
+  return Object.freeze({
+    storage,
+    calls,
+    isStorage: (value) => value === storage,
+    swapIdentity() {
+      identitySwapped = true;
+    },
+  });
+}
+
+function injectedPreparationRunner(files, injected, options = {}) {
+  const preparedContext = createLocalPreparedContributionContext({
+    storage: injected.storage,
+    sha256Hex: injected.storage.sha256Hex,
+  });
+  return createLocalContributionPreparationRunner({
+    storage: injected.storage,
+    storageValidator: injected.isStorage,
+    coverageProvider: async () => COVERAGE,
+    codexHome: files.codexHome,
+    activityFile: join(files.root, "missing-activity-markers.jsonl"),
+    reviewArchiveDirectory: files.reviewArchiveDirectory,
+    preparedSpoolDirectory: files.preparedSpoolDirectory,
+    uuid: () => UUID_ONE,
+    ...identityDependencies(),
+    materialize: (materializeOptions) => materializeTelemetryContributions({
+      ...materializeOptions,
+      preparedContributionContext: preparedContext,
+    }),
+    verifyPreparedSet: preparedContext.verifyPreparedContributionSet,
     ...options,
   });
 }
@@ -681,6 +806,82 @@ test("identical latest evidence produces identical prepared manifests and queue 
     });
     assert.equal(discovered.length, 2);
     assert.equal(discovered[0].preparedSetId, discovered[1].preparedSetId);
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("an injected preparation storage owns directory publication, recovery, and identity failures", async () => {
+  const files = await fixture();
+  const injected = injectedPreparationStorage(files);
+  let crash = true;
+  let overrideCalls = 0;
+  try {
+    assert.throws(
+      () => createLocalContributionPreparationRunner({
+        storage: { ...injected.storage },
+        storageValidator: injected.isStorage,
+      }),
+      /local contribution preparation storage is invalid/u,
+    );
+    assert.throws(
+      () => createLocalContributionPreparationRunner({
+        storage: {},
+        storageValidator: () => true,
+      }),
+      /local contribution preparation storage/u,
+    );
+
+    const runner = injectedPreparationRunner(files, injected, {
+      failpoint: async (name) => {
+        if (crash && name === "after_review_pair") {
+          throw new Error("simulated process interruption");
+        }
+      },
+      renameDirectory: async () => {
+        overrideCalls += 1;
+        throw new Error("untrusted rename override");
+      },
+      syncParentDirectory: async () => {
+        overrideCalls += 1;
+        throw new Error("untrusted sync override");
+      },
+    });
+
+    await assert.rejects(
+      runner(),
+      (error) => error instanceof LocalContributionPreparationError
+        && error.code === "preparation_failed",
+    );
+    assert.equal(overrideCalls, 0);
+    assert.ok(injected.calls.some(([name]) => name === "prepareOwnerOnlyDirectory"));
+    assert.ok(injected.calls.some(([name]) => name === "syncDirectory"));
+
+    crash = false;
+    const recovered = await runner();
+    assert.equal(recovered.status, "prepared");
+    assert.ok(injected.calls.some(([name]) => name === "createOwnerOnlyDirectory"));
+    assert.ok(injected.calls.some(([name]) => name === "renameDirectory"));
+    assert.equal(overrideCalls, 0);
+
+    const outsideRunner = injectedPreparationRunner(files, injected, {
+      reviewArchiveDirectory: join(tmpdir(), "outside-review-root"),
+    });
+    await assert.rejects(
+      outsideRunner(),
+      (error) => error instanceof LocalContributionPreparationError
+        && error.code === "review_archive_invalid",
+    );
+
+    injected.swapIdentity();
+    const identityRunner = injectedPreparationRunner(files, injected, {
+      preparationId: UUID_TWO,
+    });
+    await assert.rejects(
+      identityRunner(),
+      (error) => error instanceof LocalContributionPreparationError
+        && error.code === "preparation_failed",
+    );
   } finally {
     await rm(files.root, { recursive: true });
   }

@@ -12,6 +12,9 @@ import {
   readLocalCollectorRecords,
   saveLocalCollectorCheckpoint,
 } from "../src/local-collector-state.js";
+import {
+  withLocalCollectorStateSessionBoundary,
+} from "../src/platform/local-collector-state-session.js";
 
 const CLOCK = () => Date.parse("2026-08-06T00:00:00.000Z");
 
@@ -185,4 +188,61 @@ test("session options are validated", async () => {
     () => openLocalCollectorStateSession({ stateFile: "/tmp/x", clock: "not-a-clock" }),
     TypeError,
   );
+});
+
+test("Windows collector state refuses the raw DatabaseSync and lock/filesystem fallback", async () => {
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+  try {
+    await assert.rejects(
+      () => openLocalCollectorStateSession({
+        stateFile: "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state.sqlite",
+        clock: CLOCK,
+      }),
+      (error) => error?.code === "local_collector_state_unavailable",
+    );
+  } finally {
+    Object.defineProperty(process, "platform", originalPlatform);
+  }
+});
+
+test("a simulated branded Windows session composes through the collector boundary", async () => {
+  const database = new DatabaseSync(":memory:");
+  let factoryCalls = 0;
+  const stateFile = "C:\\qualification\\collector.sqlite";
+  try {
+    await withLocalCollectorStateSessionBoundary({
+      platform: "win32",
+      architecture: "x64",
+      simulation: true,
+      windowsFilesystemAdapter: {},
+      windowsSqliteStateSessionFactory: ({ rootPath, databaseName, readOnly, create }) => {
+        factoryCalls += 1;
+        assert.equal(typeof rootPath, "string");
+        assert.equal(databaseName, "collector.sqlite");
+        assert.equal(typeof readOnly, "boolean");
+        assert.equal(typeof create, "boolean");
+        return {
+          rootPath,
+          databaseName,
+          database,
+          close() {},
+        };
+      },
+    }, async () => {
+      const session = await openLocalCollectorStateSession({
+        stateFile,
+        clock: CLOCK,
+      });
+      session.commit({ checkpoint: checkpointFor(7), records: [] });
+      await session.close();
+      assert.deepEqual(
+        await readLocalCollectorCheckpoint({ stateFile }),
+        checkpointFor(7),
+      );
+    });
+    assert.equal(factoryCalls >= 3, true);
+  } finally {
+    database.close();
+  }
 });

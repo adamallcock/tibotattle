@@ -10,8 +10,16 @@ import {
 
 test("every transitive browser module is served by loopback and every served module is in the closure", async () => {
   const discovered = await collectMacOSWebModuleGraph();
+  // Electron owns two additional static entrypoints: the desktop shell is
+  // loaded by the shared dashboard document, while Settings is a separate
+  // page. Neither belongs to the native macOS app's app.js closure.
+  const electronOnlyModules = new Set([
+    "electron-settings.js",
+    "desktop-shell.js",
+  ]);
   const servedModules = Object.entries(LOCAL_COMPANION_STATIC_FILES)
     .filter(([, { file }]) => /\.(?:m?js)$/u.test(file))
+    .filter(([, { file }]) => !electronOnlyModules.has(file))
     .map(([route, { file, type }]) => ({
       file: `apps/web/public/${file}`,
       route,

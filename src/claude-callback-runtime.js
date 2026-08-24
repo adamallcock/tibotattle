@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import { win32 } from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import {
@@ -12,19 +13,105 @@ import {
   createProductionClaudeCallbackBackend,
   readClaudeCallbackCapability,
 } from "./claude-callback-capability.js";
-import { readClaudeCallbackRuntimeConfiguration } from "./claude-callback-lifecycle.js";
+import {
+  buildClaudeCallbackRunnerInvocation,
+  readClaudeCallbackRuntimeConfiguration,
+  validateClaudeCallbackRunner,
+} from "./claude-callback-lifecycle.js";
 
 const MAX_COEXISTING_OUTPUT_BYTES = 8 * 1024;
 const COEXISTING_TIMEOUT_MILLISECONDS = 1_500;
+const WINDOWS_TREE_CLEANUP_TIMEOUT_MILLISECONDS = 3_000;
 
 function missingCapability() {
   throw new ClaudeCallbackCapabilityError("credential_missing");
 }
 
-function createCoexistingInvocation(command, {
+function waitForProcessClose(child, timeoutMilliseconds) {
+  if (!child || typeof child.once !== "function") return Promise.resolve({ closed: false, code: null });
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve({ closed: true, code: child.exitCode ?? null });
+  }
+  return new Promise((resolve) => {
+    let timer = null;
+    let settled = false;
+    const cleanup = () => {
+      if (timer !== null) clearTimeout(timer);
+      child.off?.("close", onClose);
+      child.off?.("error", onError);
+    };
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+    const onClose = (code) => finish({ closed: true, code });
+    const onError = () => finish({ closed: false, code: null });
+    child.once("close", onClose);
+    child.once("error", onError);
+    timer = setTimeout(() => finish({ closed: false, code: null }), timeoutMilliseconds);
+    timer.unref?.();
+  });
+}
+
+function windowsTaskkillPath(environment) {
+  const root = typeof environment?.SystemRoot === "string" && environment.SystemRoot.length > 0
+    ? environment.SystemRoot
+    : "C:\\Windows";
+  let normalized;
+  try {
+    normalized = win32.normalize(root.replaceAll("/", "\\"));
+  } catch {
+    return null;
+  }
+  const trimmed = normalized.replace(/[\\]+$/u, "");
+  // Only the real Windows directory at the root of a local drive is reviewed
+  // as a source for taskkill.exe. An arbitrary SystemRoot-like environment
+  // value could otherwise redirect cleanup to attacker-controlled code.
+  if (!/^[A-Za-z]:\\Windows$/iu.test(trimmed)) return null;
+  return `${trimmed}\\System32\\taskkill.exe`;
+}
+
+async function terminateWindowsProcessTree(child, {
+  spawnCommand,
+  env,
+  timeoutMilliseconds = WINDOWS_TREE_CLEANUP_TIMEOUT_MILLISECONDS,
+} = {}) {
+  const pid = child?.pid;
+  const executable = windowsTaskkillPath(env);
+  if (!Number.isSafeInteger(pid) || pid < 1 || executable === null) {
+    try { child.kill?.("SIGKILL"); } catch { /* Best-effort containment only. */ }
+    return false;
+  }
+  let killer;
+  try {
+    killer = spawnCommand(executable, ["/PID", String(pid), "/T", "/F"], {
+      env,
+      stdio: "ignore",
+      shell: false,
+      windowsHide: true,
+    });
+  } catch {
+    try { child.kill?.("SIGKILL"); } catch { /* Best-effort containment only. */ }
+    return false;
+  }
+  const killerResult = await waitForProcessClose(killer, timeoutMilliseconds);
+  const childResult = await waitForProcessClose(child, timeoutMilliseconds);
+  if (!killerResult.closed || killerResult.code !== 0 || !childResult.closed) {
+    try { child.kill?.("SIGKILL"); } catch { /* No success is reported below. */ }
+    return false;
+  }
+  return true;
+}
+
+export function createCoexistingInvocation(command, {
+  platform = process.platform,
+  runner = null,
   spawnCommand = spawn,
   env = process.env,
   timeoutMilliseconds = COEXISTING_TIMEOUT_MILLISECONDS,
+  windowsCleanupTimeoutMilliseconds = WINDOWS_TREE_CLEANUP_TIMEOUT_MILLISECONDS,
 } = {}) {
   if (command === null) {
     return Object.freeze({
@@ -39,6 +126,8 @@ function createCoexistingInvocation(command, {
   let settled = false;
   let outputBytes = 0;
   let timer = null;
+  let terminationRequested = false;
+  let terminationPromise = null;
   const outputChunks = [];
   let resolveResult;
   const result = new Promise((resolve) => { resolveResult = resolve; });
@@ -56,40 +145,75 @@ function createCoexistingInvocation(command, {
       output,
     });
   };
+  const requestTermination = () => {
+    if (settled || terminationRequested) return;
+    terminationRequested = true;
+    if (platform !== "win32") {
+      try { child.kill("SIGKILL"); } catch { /* The result owns failure handling. */ }
+      child.stdin.destroy();
+      finish("failed");
+      return;
+    }
+    terminationPromise = terminateWindowsProcessTree(child, {
+      spawnCommand,
+      env,
+      timeoutMilliseconds: windowsCleanupTimeoutMilliseconds,
+    }).finally(() => {
+      // A Windows timeout/overflow is never a successful coexistence result;
+      // completion waits for taskkill and the target close event first.
+      child.stdin.destroy();
+      finish("failed");
+    });
+    terminationPromise.catch(() => finish("failed"));
+  };
+  const failChild = () => {
+    if (!terminationRequested || terminationPromise === null) {
+      finish("failed");
+      return;
+    }
+    terminationPromise.then(() => finish("failed"), () => finish("failed"));
+  };
   const armTimer = () => {
     if (settled || timer !== null) return;
     timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      child.stdin.destroy();
-      finish("failed");
+      requestTermination();
     }, timeoutMilliseconds);
     timer.unref?.();
   };
+  const invocation = platform === "win32"
+    ? buildClaudeCallbackRunnerInvocation(validateClaudeCallbackRunner(runner), command)
+    : { command: "/bin/sh", args: ["-c", command] };
   try {
-    child = spawnCommand("/bin/sh", ["-c", command], {
+    child = spawnCommand(invocation.command, invocation.args, {
       env,
       stdio: ["pipe", "pipe", "ignore"],
+      shell: false,
+      windowsHide: platform === "win32",
     });
   } catch {
     finish("failed");
   }
   if (child) {
-    child.on("error", () => finish("failed"));
-    child.stdout.on("error", () => finish("failed"));
+    child.on("error", failChild);
+    child.stdout.on("error", failChild);
     child.stdout.on("data", (chunk) => {
       if (settled) return;
       const buffer = Buffer.from(chunk);
       if (buffer.byteLength > MAX_COEXISTING_OUTPUT_BYTES - outputBytes) {
         buffer.fill(0);
-        child.kill("SIGKILL");
-        child.stdin.destroy();
-        finish("failed");
+        requestTermination();
         return;
       }
       outputBytes += buffer.byteLength;
       outputChunks.push(buffer);
     });
-    child.on("close", (code) => finish(code === 0 ? "ok" : "failed"));
+    child.on("close", (code) => {
+      if (terminationRequested) {
+        if (terminationPromise === null) finish("failed");
+        return;
+      }
+      finish(code === 0 ? "ok" : "failed");
+    });
     child.stdin.on("error", () => { acceptingInput = false; });
   }
   return Object.freeze({
@@ -223,11 +347,18 @@ export async function runClaudeCallback({
   readRuntimeConfiguration = readClaudeCallbackRuntimeConfiguration,
   capturedAt = new Date().toISOString(),
   spawnCommand = spawn,
+  platform = process.platform,
 } = {}) {
-  const configuration = await readRuntimeConfiguration({ lifecycleDirectory });
+  const configuration = await readRuntimeConfiguration({
+    lifecycleDirectory,
+    platform,
+    environment: env,
+  });
   const previous = createCoexistingInvocation(configuration.previousCommand, {
     spawnCommand,
     env,
+    platform,
+    runner: configuration.previousRunner ?? null,
   });
   let input = null;
   let secret = null;

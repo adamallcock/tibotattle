@@ -174,11 +174,9 @@ function projection(windows, { status, declaredMode = null } = {}) {
 export function createCodexSpeedBaselineController({
   ledgerFile,
   configFile,
-  storage = createOwnerOnlyAutomaticContributionStorageContext({
-    createError: () => new CodexSpeedBaselineError(
-      "codex_speed_baseline_unavailable",
-    ),
-  }),
+  storage = undefined,
+  platform = process.platform,
+  windowsProtectedStateStore = null,
   readServiceTier = readCodexConfigServiceTier,
   now = () => new Date(),
 } = {}) {
@@ -192,11 +190,31 @@ export function createCodexSpeedBaselineController({
     throw new TypeError("readServiceTier must be a function");
   }
   if (typeof now !== "function") throw new TypeError("now must be a function");
+  if (process.platform === "win32" && platform !== "win32") {
+    throw new CodexSpeedBaselineError("codex_speed_baseline_unavailable");
+  }
+  if (platform !== "win32" && windowsProtectedStateStore !== null) {
+    throw new CodexSpeedBaselineError("codex_speed_baseline_unavailable");
+  }
+  if (platform === "win32" && storage !== undefined) {
+    // The ledger must use the branded Windows state store. An injected
+    // reader/writer pair would silently restore the old path-only boundary.
+    throw new CodexSpeedBaselineError("codex_speed_baseline_unavailable");
+  }
+  const selectedStorage = storage === undefined
+    ? createOwnerOnlyAutomaticContributionStorageContext({
+      createError: () => new CodexSpeedBaselineError(
+        "codex_speed_baseline_unavailable",
+      ),
+      platform,
+      windowsProtectedStateStore,
+    })
+    : storage;
 
   async function readDocument() {
     let text;
     try {
-      text = await storage.readSettingsText({
+      text = await selectedStorage.readSettingsText({
         settingsFile: ledgerFile,
         maximumBytes: MAXIMUM_LEDGER_BYTES,
       });
@@ -308,7 +326,7 @@ export function createCodexSpeedBaselineController({
         throw new CodexSpeedBaselineError("codex_speed_baseline_unavailable");
       }
       try {
-        await storage.writeSettingsText({
+        await selectedStorage.writeSettingsText({
           settingsFile: ledgerFile,
           text: `${JSON.stringify(next)}\n`,
           maximumBytes: MAXIMUM_LEDGER_BYTES,

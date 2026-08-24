@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { isProxy } from "node:util/types";
@@ -38,6 +39,59 @@ const SAFE_RECORD_EXPORTS = [
   "summarizeActivityMarkerPlan",
   "usageEventIdentitySubject",
 ].sort();
+
+function metadataExportConfiguration({
+  platformName = () => "macos",
+  writeOwnerOnlyPairNoClobber,
+  reviewPairStorage,
+  reviewPairStorageValidator,
+} = {}) {
+  const configuration = {
+    clock: () => 0,
+    codexLogPorts: createLocalCodexLogPorts(),
+    createHash,
+    deriveAccountScopeId: () => "account",
+    deriveEventOccurrenceId: () => "event",
+    deriveMarkerOccurrenceId: () => "marker",
+    deriveModelFingerprint: () => "model",
+    deriveParticipantId: () => "participant",
+    deriveQuotaStateId: () => "quota",
+    deriveSessionScopeId: () => "session",
+    deriveSnapshotObservationId: () => "snapshot",
+    exportCompatibilityTuple: () => ({ version: "test" }),
+    platformName,
+    randomBundleId: () => "bundle:v1:test",
+    resolvePath: resolve,
+    rss: () => 0,
+    sha256Hex: () => "0".repeat(64),
+    writeOwnerOnlyPairNoClobber,
+  };
+  if (reviewPairStorage !== undefined) configuration.reviewPairStorage = reviewPairStorage;
+  if (reviewPairStorageValidator !== undefined) {
+    configuration.reviewPairStorageValidator = reviewPairStorageValidator;
+  }
+  return configuration;
+}
+
+function fakeReviewPairStorage({ writer, reader = async () => ({}) }) {
+  return Object.freeze({
+    contractVersion: "windows-review-pair-storage-v1",
+    writeReviewPair: async () => ({ status: "published" }),
+    readReviewPair: reader,
+    recoverReviewPairTransactions: async () => ({ recovered: 0, transactionsFound: 0 }),
+    recoverOwnerOnlyPairTransactions: async () => ({ recovered: 0, transactionsFound: 0 }),
+    writeOwnerOnlyPairNoClobber: writer,
+    readOwnerOnlyLocalMetadataBundlePair: reader,
+  });
+}
+
+function reviewPairPaths() {
+  const root = join(tmpdir(), "tibotattle-review-pair");
+  return {
+    outputFile: join(root, "review.umx.json"),
+    receiptFile: join(root, "review.privacy-receipt.json"),
+  };
+}
 
 test("metadata export owners expose only their reviewed factories and exact legacy APIs", () => {
   assert.equal(typeof createLocalMetadataExportContext, "function");
@@ -110,19 +164,97 @@ test("new safe-record and metadata option boundaries fail without reflecting pri
   );
 });
 
+test("Windows metadata export uses only the reviewed injected writer", async () => {
+  const calls = [];
+  const fallbackCalls = [];
+  const storage = fakeReviewPairStorage({
+    writer: async (request) => {
+      calls.push(request);
+      return { status: "published" };
+    },
+  });
+  const context = createLocalMetadataExportContext(metadataExportConfiguration({
+    platformName: () => "windows",
+    reviewPairStorage: storage,
+    reviewPairStorageValidator: (candidate) => candidate === storage,
+    writeOwnerOnlyPairNoClobber: async () => {
+      fallbackCalls.push(true);
+    },
+  }));
+
+  const paths = reviewPairPaths();
+  const result = await context.writeLocalMetadataBundle({
+    bundle: { schemaVersion: "test-bundle" },
+    receipt: { schemaVersion: "test-receipt" },
+    ...paths,
+  });
+  assert.equal(result.outputFile, paths.outputFile);
+  assert.equal(calls.length, 1);
+  assert.equal(fallbackCalls.length, 0);
+  assert.deepEqual(JSON.parse(calls[0].firstContent), { schemaVersion: "test-bundle" });
+  assert.deepEqual(JSON.parse(calls[0].secondContent), { schemaVersion: "test-receipt" });
+});
+
+test("Windows metadata export fails closed without a reviewed writer", async () => {
+  const fallbackCalls = [];
+  const context = createLocalMetadataExportContext(metadataExportConfiguration({
+    platformName: () => "windows",
+    writeOwnerOnlyPairNoClobber: async () => {
+      fallbackCalls.push(true);
+    },
+  }));
+
+  await assert.rejects(
+    context.writeLocalMetadataBundle({
+      bundle: { schemaVersion: "test-bundle" },
+      receipt: { schemaVersion: "test-receipt" },
+      ...reviewPairPaths(),
+    }),
+    (error) => error instanceof TypeError
+      && error.message === "Windows review pair storage writer is required",
+  );
+  assert.equal(fallbackCalls.length, 0);
+});
+
+test("macOS metadata export retains the default writer when a Windows port is present", async () => {
+  const injectedCalls = [];
+  const fallbackCalls = [];
+  const storage = fakeReviewPairStorage({
+    writer: async () => {
+      injectedCalls.push(true);
+    },
+  });
+  const context = createLocalMetadataExportContext(metadataExportConfiguration({
+    platformName: () => "macos",
+    reviewPairStorage: storage,
+    writeOwnerOnlyPairNoClobber: async () => {
+      fallbackCalls.push(true);
+    },
+  }));
+
+  await context.writeLocalMetadataBundle({
+    bundle: { schemaVersion: "test-bundle" },
+    receipt: { schemaVersion: "test-receipt" },
+    ...reviewPairPaths(),
+  });
+  assert.equal(fallbackCalls.length, 1);
+  assert.equal(injectedCalls.length, 0);
+});
+
 test("local Codex ports observe CODEX_HOME at each default-home call and reject hostile values", () => {
   const environment = {};
+  const fallbackCodexHome = join("/fallback-home", ".codex");
   const ports = createLocalCodexLogPorts({
     environment,
     homeDirectory: "/fallback-home",
   });
-  assert.equal(ports.filesystem.defaultCodexHome(), "/fallback-home/.codex");
+  assert.equal(ports.filesystem.defaultCodexHome(), fallbackCodexHome);
   environment.CODEX_HOME = "/first-codex-home";
   assert.equal(ports.filesystem.defaultCodexHome(), "/first-codex-home");
   environment.CODEX_HOME = "/second-codex-home";
   assert.equal(ports.filesystem.defaultCodexHome(), "/second-codex-home");
   delete environment.CODEX_HOME;
-  assert.equal(ports.filesystem.defaultCodexHome(), "/fallback-home/.codex");
+  assert.equal(ports.filesystem.defaultCodexHome(), fallbackCodexHome);
 
   Object.defineProperty(environment, "CODEX_HOME", {
     configurable: true,

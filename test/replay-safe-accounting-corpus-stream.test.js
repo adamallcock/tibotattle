@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildReplaySafeAccountingCache,
+  replaySafeAccountingChildEnvironment,
   refreshReplaySafeAccountingCache,
   readReplaySafeAccountingCache,
   REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY,
@@ -698,6 +699,35 @@ const SUBPROCESS_FIXTURE_SHAPE = Object.freeze({
   usagePerBoundary: 5,
 });
 const SUBPROCESS_FIXTURE_TRANSITIONS = 4 * 99;
+
+test("packaged Electron rebuild children run as Node with a closed environment", () => {
+  const inherited = Object.freeze({
+    TMPDIR: "/private/tmp/tibotattle-rebuild",
+    HOME: "/private/home",
+    NODE_OPTIONS: "--require=/private/unsafe/preload.cjs",
+    ELECTRON_RUN_AS_NODE: "0",
+    PRIVATE_PROVIDER_TOKEN: "must-not-cross",
+  });
+  assert.deepEqual(
+    replaySafeAccountingChildEnvironment({
+      environment: inherited,
+      runtime: { versions: { electron: "43.2.0", node: "22.14.0" } },
+    }),
+    {
+      TMPDIR: "/private/tmp/tibotattle-rebuild",
+      ELECTRON_RUN_AS_NODE: "1",
+    },
+  );
+  // A normal Node/test parent must retain the old minimal shape and must not
+  // inherit an Electron-only switch supplied by its own environment.
+  assert.deepEqual(
+    replaySafeAccountingChildEnvironment({
+      environment: inherited,
+      runtime: { versions: { node: "22.14.0" } },
+    }),
+    { TMPDIR: "/private/tmp/tibotattle-rebuild" },
+  );
+});
 
 test("the default production rebuild is isolated in a child and byte-identical to the in-process build", { timeout: 120_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rebuild-subprocess-equivalence-"));

@@ -10,6 +10,7 @@ import {
 } from "../src/account-observation-secret.js";
 import { selectProductionAccountObservationSecret } from "../src/account-observation-production.js";
 import { EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES } from "../src/export-identity-keychain.js";
+import { createWindowsFilesystemAdapter } from "../src/platform/windows-filesystem.js";
 import { run } from "../src/cli.js";
 import { sanitizeCodexAccountSnapshotWithSecretLoader } from "../src/providers/codex/account.js";
 
@@ -42,6 +43,68 @@ function memoryBackend(initial = null) {
   };
 }
 
+function unqualifiedWindowsFilesystemAdapter() {
+  const identity = {
+    volumeSerialNumber: "0000000000000001",
+    fileId: "00112233445566778899aabbccddeeff",
+    linkCount: 1,
+  };
+  const binding = {
+    contractVersion: "windows-filesystem-v1",
+    securityContractVersion: "windows-filesystem-security-v1",
+    credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
+    sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
+    credentialMutexContractVersion: "windows-credential-mutex-v1",
+    companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
+    preparedArtifactContractVersion: "windows-prepared-artifact-v1",
+    productionSafe: false,
+    pathWalkRaceSafe: false,
+    credentialMutexSafe: true,
+    companionInstanceMutexSafe: false,
+    credentialAuditFileGuardSafe: true,
+    sqliteStateLeaseSafe: false,
+    preparedArtifactSafe: false,
+    inspectPath: () => ({ identity }),
+    ensureDirectory: () => identity,
+    readFile: () => ({ data: Buffer.from("data"), identity }),
+    readFileBounded: () => ({ data: Buffer.from("data"), identity }),
+    createFile: () => identity,
+    deleteFile: () => ({ deleted: true, identity }),
+    replaceFile: () => identity,
+    inspectProtectedChild: () => ({ identity }),
+    readProtectedChild: () => ({ data: Buffer.from("data"), identity }),
+    createProtectedChild: () => identity,
+    deleteProtectedChild: () => ({ deleted: true, identity }),
+    replaceProtectedChild: () => identity,
+    acquireCredentialAuditFileGuard: () => ({ lease: {} }),
+    releaseCredentialAuditFileGuard: () => {},
+    acquireSqliteStateLease: () => ({
+      lease: {},
+      databaseIdentity: identity,
+      journalIdentity: identity,
+    }),
+    releaseSqliteStateLease: () => {},
+    acquireCredentialMutex: () => ({ lease: {}, abandoned: false }),
+    releaseCredentialMutex: () => {},
+    acquireCompanionInstanceMutex: () => ({ lease: {}, abandoned: false }),
+    releaseCompanionInstanceMutex: () => {},
+    inspectPreparedChild: () => ({ identity }),
+    ensurePreparedDirectory: () => identity,
+    enumeratePreparedDirectory: () => [],
+    removePreparedDirectory: () => ({ removed: true, identity }),
+    renamePreparedDirectory: () => ({ renamed: true, identity }),
+    createPreparedFile: () => identity,
+    readPreparedFile: () => ({ data: Buffer.from("data"), identity }),
+    deletePreparedFile: () => ({ deleted: true, identity }),
+    publishPreparedFile: () => ({ published: true, identity }),
+  };
+  return createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding,
+  });
+}
+
 test("account observation loader reads or creates only the distinct capability under its operation lease", async () => {
   const root = await mkdtemp(join(tmpdir(), "app-usagemonitor-account-secret-"));
   const lock = join(root, "state", "account-operation.lock");
@@ -65,6 +128,48 @@ test("account observation loader reads or creates only the distinct capability u
     assert.equal(backend.calls.some(([, capability]) => capability === EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity), false);
     await assert.rejects(readFile(lock), { code: "ENOENT" });
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("account observation rejects forged, copied, and currently unqualified Windows adapters", () => {
+  const brandedUnqualified = unqualifiedWindowsFilesystemAdapter();
+  const forged = Object.freeze({
+    ...brandedUnqualified,
+    productionSafe: true,
+    pathWalkRaceSafe: true,
+  });
+  const copied = { ...brandedUnqualified };
+  for (const windowsFilesystemAdapter of [forged, copied, brandedUnqualified]) {
+    assert.throws(
+      () => createAccountObservationSecretLoader({
+        backend: memoryBackend(Buffer.alloc(32, 93)),
+        capability: ACCOUNT_CAPABILITY,
+        operationLockFile: "/virtual-windows/app-state/account-operation.lock",
+        windowsFilesystemAdapter,
+      }),
+      (error) => [
+        "account_observation_credential_invalid",
+        "account_observation_credential_unavailable",
+      ].includes(error.code)
+        && error.message === "Account observation credential is unavailable",
+    );
+  }
+});
+
+test("account observation preserves the no-adapter development path on Windows", async () => {
+  const root = await mkdtemp(join(tmpdir(), "app-usagemonitor-account-win32-dev-"));
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+  try {
+    const load = createAccountObservationSecretLoader({
+      backend: memoryBackend(Buffer.alloc(32, 94)),
+      capability: ACCOUNT_CAPABILITY,
+      operationLockFile: join(root, "operation.lock"),
+    });
+    assert.deepEqual(await load(), Buffer.alloc(32, 94));
+  } finally {
+    Object.defineProperty(process, "platform", originalPlatform);
     await rm(root, { recursive: true, force: true });
   }
 });

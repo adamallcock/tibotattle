@@ -25,6 +25,9 @@ import {
 import {
   stableJson,
 } from "./storage.js";
+import {
+  isLocalCollectorStateWindowsBoundaryActive,
+} from "./platform/index.js";
 import { forEachRolloutLine } from "./rollout-line-reader.js";
 import {
   acquireLocalCollectorStateLock,
@@ -1497,7 +1500,15 @@ export async function runCollectorOnce({
   // with the store: 636-663 ms of a 754 ms batch on the live 1.7 GB state.
   // Only the built-in write path can be pooled this way; an injected
   // `commitState` or `saveState` keeps its exact previous behaviour.
-  const pooled = commitState === commitLocalCollectorState
+  // The native Windows SQLite lease is deliberately non-reentrant within one
+  // process. The pooled connection cannot coexist with the collector's
+  // checkpoint reads (and other state helpers), which open the same database
+  // through the protected session boundary. Keep the ordinary pooled
+  // connection on macOS/Linux; Windows uses the same protected boundary for
+  // each sequential operation so no raw or concurrently leased path is
+  // introduced.
+  const pooled = !isLocalCollectorStateWindowsBoundaryActive()
+    && commitState === commitLocalCollectorState
     && saveState === saveLocalCollectorCheckpoint
     ? await openLocalCollectorStateSession({ stateFile, clock })
     : null;

@@ -1,9 +1,13 @@
 import { constants } from "node:fs";
 import { mkdir, open, rename, unlink } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, win32 } from "node:path";
 
 import { defaultExportStateDirectory } from "./export-identity.js";
 import { renewContributionDeviceCredential } from "./contribution-device-client.js";
+import {
+  isWindowsFilesystemIdentity,
+  isWindowsProtectedStateStore,
+} from "./platform/index.js";
 
 // Companion half of the sign-in-once auto-renewal (section 2 of
 // docs/design/2026-08-11-sign-in-once-durability.md). The 30-day device
@@ -73,30 +77,126 @@ function canonicalRenewalState({ deviceId, expiresAt }) {
   })}\n`;
 }
 
-/**
- * The renewal-state file records only public-ish binding metadata — the device
- * id and the last-known expiry — never any secret; the durable secret lives in
- * the Keychain. It is therefore read tolerantly: any absence, malformed
- * content, or unexpected shape yields `null` (the caller then treats the
- * credential as unseeded and waits for the next pairing to seed it) rather than
- * an error that could stall a sync pass.
- */
-export async function readContributionDeviceRenewalState(stateFile) {
-  if (typeof stateFile !== "string" || stateFile.length < 1) fail("invalid_configuration");
-  let handle;
-  let text;
-  try {
-    handle = await open(stateFile, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-    const stats = await handle.stat();
-    if (!stats.isFile() || stats.size < 1 || stats.size > MAXIMUM_STATE_BYTES) {
-      return null;
-    }
-    text = (await handle.readFile()).toString("utf8");
-  } catch {
-    return null;
-  } finally {
-    await handle?.close().catch(() => {});
+function normalizedPlatform(platform) {
+  if (typeof platform !== "string" || platform.length < 1) {
+    fail("invalid_configuration");
   }
+  // A Windows process must never be able to opt back into the ordinary Node
+  // filesystem implementation by passing a downgraded platform label.
+  if (process.platform === "win32" && platform !== "win32") {
+    fail("invalid_configuration");
+  }
+  return platform;
+}
+
+function protectedStoreErrorCode(error) {
+  try {
+    return typeof error?.code === "string" ? error.code : "";
+  } catch {
+    return "";
+  }
+}
+
+function isProtectedStoreMissing(error) {
+  return protectedStoreErrorCode(error)
+    === "windows_protected_state_store_missing";
+}
+
+function isProtectedStoreAlreadyExists(error) {
+  return protectedStoreErrorCode(error)
+    === "windows_protected_state_store_already_exists";
+}
+
+/**
+ * A Windows renewal tracker is a direct child of the one protected state
+ * root. The child name is derived from the store's canonical root, never from
+ * a caller-controlled path walk. This is also the identity boundary used by
+ * the protected store's inspect/read/replace methods.
+ */
+function qualifiedWindowsRenewalStore(store) {
+  let valid = false;
+  try {
+    valid = isWindowsProtectedStateStore(store)
+      && store.contractVersion === "windows-protected-state-store-v1"
+      && typeof store.rootPath === "string"
+      && typeof store.ensureProtectedDirectory === "function"
+      && typeof store.inspect === "function"
+      && typeof store.read === "function"
+      && typeof store.create === "function"
+      && typeof store.replace === "function";
+    // The store is intentionally qualification-only in the current tree. A
+    // simulated adapter on macOS may exercise the routing contract, but a
+    // real Windows process may use it only after native readiness is proven.
+    if (valid && process.platform === "win32") {
+      valid = store.productionSafe === true
+        && store.rootBindingSafe === true
+        && store.nativeReadBounded === true;
+    }
+  } catch {
+    valid = false;
+  }
+  if (!valid) fail("state_unavailable");
+  return store;
+}
+
+function windowsRenewalChildName(stateFile, store) {
+  let selected;
+  let root;
+  try {
+    selected = win32.normalize(stateFile.replaceAll("/", "\\"));
+    root = win32.normalize(store.rootPath.replaceAll("/", "\\"));
+  } catch {
+    fail("invalid_configuration");
+  }
+  if (!win32.isAbsolute(selected)
+      || !win32.isAbsolute(root)
+      || win32.dirname(selected).toLowerCase() !== root.toLowerCase()) {
+    fail("invalid_configuration");
+  }
+  const child = win32.basename(selected);
+  if (child.length < 1 || child === "." || child === ".."
+      || child.includes("\\") || child.includes("/")) {
+    fail("invalid_configuration");
+  }
+  return child;
+}
+
+function sameWindowsIdentity(left, right) {
+  return isWindowsFilesystemIdentity(left)
+    && isWindowsFilesystemIdentity(right)
+    && left.volumeSerialNumber === right.volumeSerialNumber
+    && left.fileId === right.fileId
+    && left.linkCount === 1
+    && right.linkCount === 1;
+}
+
+function protectedStateRecord(store, childName) {
+  let inspected;
+  try {
+    inspected = store.inspect(childName);
+  } catch (error) {
+    if (isProtectedStoreMissing(error)) return null;
+    fail("state_unavailable");
+  }
+  let observed;
+  try {
+    observed = store.read(childName);
+  } catch {
+    fail("state_unavailable");
+  }
+  if (!observed
+      || (!Buffer.isBuffer(observed.data)
+        && !(observed.data instanceof Uint8Array))
+      || !sameWindowsIdentity(inspected?.identity, observed.identity)) {
+    fail("state_unavailable");
+  }
+  return Object.freeze({
+    data: Buffer.from(observed.data),
+    identity: observed.identity,
+  });
+}
+
+function parseRenewalStateText(text) {
   let parsed;
   try {
     parsed = JSON.parse(text);
@@ -113,12 +213,120 @@ export async function readContributionDeviceRenewalState(stateFile) {
   return Object.freeze({ deviceId: parsed.deviceId, expiresAt: parsed.expiresAt });
 }
 
-export async function writeContributionDeviceRenewalState(stateFile, { deviceId, expiresAt } = {}) {
+function windowsReadContributionDeviceRenewalState(stateFile, store) {
+  const childName = windowsRenewalChildName(stateFile, store);
+  const record = protectedStateRecord(store, childName);
+  if (record === null) return null;
+  try {
+    if (record.data.byteLength < 1 || record.data.byteLength > MAXIMUM_STATE_BYTES) {
+      return null;
+    }
+    return parseRenewalStateText(record.data.toString("utf8"));
+  } finally {
+    record.data.fill(0);
+  }
+}
+
+function windowsWriteContributionDeviceRenewalState(stateFile, value, store) {
+  const childName = windowsRenewalChildName(stateFile, store);
+  const content = Buffer.from(canonicalRenewalState(value), "utf8");
+  try {
+    store.ensureProtectedDirectory();
+    let record = protectedStateRecord(store, childName);
+    if (record === null) {
+      try {
+        store.create(childName, content);
+        return Object.freeze(value);
+      } catch (error) {
+        if (!isProtectedStoreAlreadyExists(error)) throw error;
+        record = protectedStateRecord(store, childName);
+      }
+    }
+    if (record === null) fail("state_unavailable");
+    try {
+      store.replace(childName, record.identity, content);
+    } finally {
+      record.data.fill(0);
+    }
+    return Object.freeze(value);
+  } catch (error) {
+    if (error instanceof ContributionDeviceRenewalError) throw error;
+    fail("state_unavailable");
+  } finally {
+    content.fill(0);
+  }
+}
+
+/**
+ * The renewal-state file records only public-ish binding metadata — the device
+ * id and the last-known expiry — never any secret; the durable secret lives in
+ * the Keychain. It is therefore read tolerantly: any absence, malformed
+ * content, or unexpected shape yields `null` (the caller then treats the
+ * credential as unseeded and waits for the next pairing to seed it) rather than
+ * an error that could stall a sync pass.
+ */
+export async function readContributionDeviceRenewalState(
+  stateFile,
+  options = {},
+) {
+  if (typeof stateFile !== "string" || stateFile.length < 1) fail("invalid_configuration");
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    fail("invalid_configuration");
+  }
+  let {
+    platform = process.platform,
+    windowsProtectedStateStore = null,
+  } = options;
+  platform = normalizedPlatform(platform);
+  if (platform === "win32") {
+    const store = qualifiedWindowsRenewalStore(windowsProtectedStateStore);
+    return windowsReadContributionDeviceRenewalState(stateFile, store);
+  }
+  if (windowsProtectedStateStore !== null) fail("invalid_configuration");
+  let handle;
+  let text;
+  try {
+    handle = await open(stateFile, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const stats = await handle.stat();
+    if (!stats.isFile() || stats.size < 1 || stats.size > MAXIMUM_STATE_BYTES) {
+      return null;
+    }
+    text = (await handle.readFile()).toString("utf8");
+  } catch {
+    return null;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+  return parseRenewalStateText(text);
+}
+
+export async function writeContributionDeviceRenewalState(
+  stateFile,
+  { deviceId, expiresAt } = {},
+  options = {},
+) {
   if (typeof stateFile !== "string" || stateFile.length < 1
       || typeof deviceId !== "string" || !DEVICE_ID_PATTERN.test(deviceId)
       || !validExpiry(expiresAt)) {
     fail("invalid_configuration");
   }
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    fail("invalid_configuration");
+  }
+  let {
+    platform = process.platform,
+    windowsProtectedStateStore = null,
+  } = options;
+  platform = normalizedPlatform(platform);
+  if (platform === "win32") {
+    const store = qualifiedWindowsRenewalStore(windowsProtectedStateStore);
+    return windowsWriteContributionDeviceRenewalState(
+      stateFile,
+      { deviceId, expiresAt },
+      store,
+    );
+  }
+  if (windowsProtectedStateStore !== null) fail("invalid_configuration");
   const content = canonicalRenewalState({ deviceId, expiresAt });
   const directory = dirname(stateFile);
   const temporary = join(directory, `.${basename(stateFile)}.${process.pid}.tmp`);
@@ -185,6 +393,8 @@ export async function renewContributionDeviceCredentialIfDue({
   renewalStateFile = defaultContributionDeviceRenewalStateFile(),
   now = Date.now(),
   leadMilliseconds = DEFAULT_RENEWAL_LEAD_MILLISECONDS,
+  platform = process.platform,
+  windowsProtectedStateStore = null,
   capabilityOptions = {},
   renew = renewContributionDeviceCredential,
   readState = readContributionDeviceRenewalState,
@@ -193,6 +403,7 @@ export async function renewContributionDeviceCredentialIfDue({
   if (typeof renewalStateFile !== "string" || renewalStateFile.length < 1
       || !Number.isFinite(now)
       || !Number.isSafeInteger(leadMilliseconds) || leadMilliseconds < 0
+      || typeof platform !== "string" || platform.length < 1
       || typeof renew !== "function"
       || typeof readState !== "function"
       || typeof writeState !== "function"
@@ -200,7 +411,22 @@ export async function renewContributionDeviceCredentialIfDue({
       || Array.isArray(capabilityOptions)) {
     fail("invalid_configuration");
   }
-  const state = await readState(renewalStateFile);
+  platform = normalizedPlatform(platform);
+  if (platform === "win32"
+      && (readState !== readContributionDeviceRenewalState
+        || writeState !== writeContributionDeviceRenewalState)) {
+    // Injected POSIX readers/writers would be an easy way to bypass the
+    // protected Windows boundary. Windows callers must use the branded store
+    // path above; custom collaborators remain available on macOS/Linux tests.
+    fail("invalid_configuration");
+  }
+  if (platform !== "win32" && windowsProtectedStateStore !== null) {
+    fail("invalid_configuration");
+  }
+  const state = await readState(renewalStateFile, {
+    platform,
+    windowsProtectedStateStore,
+  });
   if (state === null) return Object.freeze({ status: "unseeded" });
   if (!contributionDeviceCredentialRenewalDue({
     expiresAt: state.expiresAt,
@@ -224,10 +450,17 @@ export async function renewContributionDeviceCredentialIfDue({
     return Object.freeze({ status: "renewal_failed" });
   }
   try {
-    await writeState(renewalStateFile, {
-      deviceId: renewed.deviceId,
-      expiresAt: renewed.expiresAt,
-    });
+    await writeState(
+      renewalStateFile,
+      {
+        deviceId: renewed.deviceId,
+        expiresAt: renewed.expiresAt,
+      },
+      {
+        platform,
+        windowsProtectedStateStore,
+      },
+    );
   } catch {
     // The rotation succeeded on both the service and the Keychain; only the
     // due-tracking record failed to update. Harmless: the next pass re-reads
