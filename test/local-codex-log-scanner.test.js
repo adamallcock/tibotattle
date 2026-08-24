@@ -10,6 +10,7 @@ const FILESYSTEM_METHODS = Object.freeze([
   "defaultCodexHome",
   "joinPath",
   "currentUid",
+  "readSelectedRolloutNames",
   "openDirectory",
   "statPath",
   "lstatPath",
@@ -46,6 +47,7 @@ test("application scanner composition accepts concrete local Codex ports", () =>
   assert.deepEqual(Object.keys(scanner).sort(), [
     "appendedRolloutSourcesAreAfterEnd",
     "codexLogSourceFingerprint",
+    "codexRolloutDiscoveryReceipt",
     "discoverCodexRolloutInfos",
     "discoverCodexRollouts",
     "hasForkReplayPrefix",

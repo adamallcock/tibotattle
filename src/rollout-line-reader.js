@@ -75,7 +75,33 @@ export async function forEachRolloutLine(path, {
   };
   if (end <= start) return empty;
 
-  const input = createReadStream(path, { start, end: end - 1, highWaterMark });
+  const callerOwnedHandle = path && typeof path === "object"
+    && Number.isInteger(path.fd) && typeof path.read === "function";
+  const input = callerOwnedHandle
+    ? null
+    : createReadStream(path, { start, end: end - 1, highWaterMark });
+  const chunks = callerOwnedHandle ? {
+    async *[Symbol.asyncIterator]() {
+      const scratch = Buffer.allocUnsafe(highWaterMark);
+      let position = start;
+      while (position < end) {
+        if (signal?.aborted) return;
+        const length = Math.min(highWaterMark, end - position);
+        const { bytesRead } = await path.read(
+          scratch,
+          0,
+          length,
+          position,
+        );
+        if (bytesRead === 0) return;
+        position += bytesRead;
+        // Complete-line callbacks finish before the iterator advances, and
+        // `appendSegment` copies only an unterminated tail that must survive a
+        // refill. Reuse this allocation without copying every scanned byte.
+        yield scratch.subarray(0, bytesRead);
+      }
+    },
+  } : input;
 
   // Carry state for a line that straddles a chunk boundary. `carry` holds only
   // the bytes below the cap; once `truncated` is set the rest of the line is
@@ -123,7 +149,7 @@ export async function forEachRolloutLine(path, {
     return carry.length === 1 ? carry[0] : Buffer.concat(carry, carryBytes);
   }
 
-  for await (const chunk of input) {
+  for await (const chunk of chunks) {
     if (signal?.aborted) {
       aborted = true;
       break;
@@ -170,7 +196,7 @@ export async function forEachRolloutLine(path, {
     appendSegment(chunk.subarray(from));
     absolutePosition += chunk.length;
   }
-  if (aborted) input.destroy();
+  if (aborted) input?.destroy();
 
   return {
     nextOffset,

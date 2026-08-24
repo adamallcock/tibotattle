@@ -107,11 +107,21 @@ export function createCodexLogParser({ lineReader }) {
         continue;
       }
       if (record.type !== "event_msg" || record.payload?.type !== "thread_settings_applied") continue;
-      const timestampMs = Date.parse(record.timestamp);
+      const timestampMs = typeof record?.timestamp === "string"
+        ? Date.parse(record.timestamp)
+        : Number.NaN;
       if (!Number.isFinite(timestampMs)) continue;
-      const rawTier = record.payload?.thread_settings?.service_tier;
+      const settings = record.payload?.thread_settings;
+      if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+        diagnostics.malformedTierSettingEvents += 1;
+        diagnostics.malformedAccountingRecords += 1;
+        continue;
+      }
+      if (!Object.hasOwn(settings, "service_tier")) continue;
+      const rawTier = settings.service_tier;
       if (rawTier !== null && typeof rawTier !== "string") {
         diagnostics.malformedTierSettingEvents += 1;
+        diagnostics.malformedAccountingRecords += 1;
         continue;
       }
       const normalized = normalizeProviderTier(rawTier, {
@@ -126,7 +136,7 @@ export function createCodexLogParser({ lineReader }) {
     return timeline.sort((left, right) => left.timestampMs - right.timestampMs || left.ordinal - right.ordinal);
   }
 
-  function tierAt(timeline, timestampMs) {
+  function tierAt(timeline, timestampMs, inheritedTier = null) {
     let lower = 0;
     let upper = timeline.length;
     while (lower < upper) {
@@ -134,7 +144,96 @@ export function createCodexLogParser({ lineReader }) {
       if (timeline[middle].timestampMs <= timestampMs) lower = middle + 1;
       else upper = middle;
     }
-    return lower === 0 ? null : timeline[lower - 1];
+    return lower === 0 ? inheritedTier : timeline[lower - 1];
+  }
+
+  async function collectHistorySeed(source, {
+    seedModel = null,
+    seedTotals = null,
+    seedTotalsPresence = null,
+    seedTier = null,
+    seedSnapshots = null,
+    includeSnapshots = false,
+    resourceGuard = null,
+    maximumTotalBytes = Number.POSITIVE_INFINITY,
+    signal = null,
+  } = {}) {
+    let model = seedModel;
+    let totals = seedTotals;
+    let totalsPresence = seedTotalsPresence;
+    let ownTier = null;
+    const snapshots = includeSnapshots
+      ? new Set(seedSnapshots ?? [])
+      : null;
+    for await (const line of boundedScannerLines(
+      source,
+      resourceGuard,
+      maximumTotalBytes,
+      signal,
+    )) {
+      throwIfAborted(signal);
+      if (line === null
+          || !CODEX_LOG_RELEVANT_LINE_NEEDLES.some((needle) => (
+            line.includes(needle)
+          ))) continue;
+      let record;
+      try {
+        record = JSON.parse(line);
+      } catch {
+        // The source's ordinary complete scan owns diagnostics and rejection.
+        continue;
+      }
+      const timestampMs = typeof record?.timestamp === "string"
+        ? Date.parse(record.timestamp)
+        : Number.NaN;
+      if (!Number.isFinite(timestampMs)) continue;
+      if (record.type === "turn_context") {
+        if (typeof record.payload?.model === "string") {
+          model = record.payload.model;
+        }
+        continue;
+      }
+      if (record.type !== "event_msg") continue;
+      if (record.payload?.type === "thread_settings_applied") {
+        const settings = record.payload?.thread_settings;
+        if (!settings || typeof settings !== "object"
+            || Array.isArray(settings)
+            || !Object.hasOwn(settings, "service_tier")) continue;
+        const rawTier = settings.service_tier;
+        if (rawTier !== null && typeof rawTier !== "string") continue;
+        if (ownTier === null || timestampMs >= ownTier.timestampMs) {
+          ownTier = {
+            rawTier,
+            timestamp: record.timestamp,
+            timestampMs,
+            inherited: true,
+          };
+        }
+        continue;
+      }
+      if (record.payload?.type !== "token_count") continue;
+      const nextTotals = normalizeTokenUsage(
+        record.payload?.info?.total_token_usage,
+      );
+      const last = normalizeTokenUsage(
+        record.payload?.info?.last_token_usage,
+      );
+      const snapshot = cumulativeSnapshotKey(nextTotals, last);
+      if (snapshot !== null && snapshots !== null) snapshots.add(snapshot);
+      if (nextTotals !== null) {
+        totals = nextTotals;
+        totalsPresence = tokenComponentPresence(
+          record.payload?.info?.total_token_usage,
+        );
+      }
+    }
+    return Object.freeze({
+      model,
+      totals,
+      totalsPresence,
+      tier: ownTier ?? seedTier,
+      snapshots,
+    });
   }
 
   async function parseRollout(source, {
@@ -159,6 +258,10 @@ export function createCodexLogParser({ lineReader }) {
     resourceGuard,
     maximumTotalBytes = Number.POSITIVE_INFINITY,
     signal = null,
+    seedModel = null,
+    seedTotals = null,
+    seedTotalsPresence = null,
+    seedTier = null,
   }) {
     const tierTimeline = await collectTierTimeline(
       source,
@@ -167,9 +270,9 @@ export function createCodexLogParser({ lineReader }) {
       maximumTotalBytes,
       signal,
     );
-    let currentModel = null;
-    let previousTotals = null;
-    let previousTotalsPresence = null;
+    let currentModel = seedModel;
+    let previousTotals = seedTotals;
+    let previousTotalsPresence = seedTotalsPresence;
     // Set when the cumulative baseline was re-anchored on a counter
     // regression. Until the next positive swing is derived, the delta from
     // the new anchor may span two interleaved streams, so that swing charges
@@ -177,6 +280,7 @@ export function createCodexLogParser({ lineReader }) {
     let reAnchored = false;
     const openTaskIds = new Set();
     let sourceRecordOrdinal = 0;
+    let sessionMetaRecords = 0;
     const leadingRateLimitGate = createLeadingRateLimitGate();
 
     // Every movement of the cumulative baseline goes through here, including
@@ -229,11 +333,32 @@ export function createCodexLogParser({ lineReader }) {
         record = JSON.parse(line);
       } catch {
         diagnostics.malformedLines += 1;
+        if (line.includes('"turn_context"')
+            || line.includes('"token_count"')
+            || line.includes('"thread_settings_applied"')
+            || line.includes('"type":"session_meta"')) {
+          diagnostics.malformedAccountingRecords += 1;
+        }
         continue;
       }
-      const timestampMs = Date.parse(record.timestamp);
+      if (record.type === "session_meta") {
+        sessionMetaRecords += 1;
+        if (sessionMetaRecords > 1) {
+          diagnostics.malformedAccountingRecords += 1;
+        }
+        continue;
+      }
+      const timestampMs = typeof record?.timestamp === "string"
+        ? Date.parse(record.timestamp)
+        : Number.NaN;
       if (!Number.isFinite(timestampMs)) {
         diagnostics.malformedTimestamps += 1;
+        if (record?.type === "turn_context"
+            || (record?.type === "event_msg"
+              && ["token_count", "thread_settings_applied"]
+                .includes(record?.payload?.type))) {
+          diagnostics.malformedAccountingRecords += 1;
+        }
         continue;
       }
 
@@ -292,7 +417,13 @@ export function createCodexLogParser({ lineReader }) {
       const lastPresence = tokenComponentPresence(info?.last_token_usage);
       const total = normalizeTokenUsage(info?.total_token_usage);
       const last = normalizeTokenUsage(info?.last_token_usage);
-      if ((info?.total_token_usage && !total) || (info?.last_token_usage && !last)) {
+      const malformedInfo = info !== null && info !== undefined
+        && (typeof info !== "object" || Array.isArray(info));
+      if (malformedInfo
+          || (info?.total_token_usage !== null
+            && info?.total_token_usage !== undefined && total === null)
+          || (info?.last_token_usage !== null
+            && info?.last_token_usage !== undefined && last === null)) {
         diagnostics.malformedUsageRecords += 1;
       }
       const cumulativeKey = cumulativeSnapshotKey(total, last);
@@ -396,7 +527,7 @@ export function createCodexLogParser({ lineReader }) {
         continue;
       }
       seenEvents.add(eventKey);
-      const effectiveTier = tierAt(tierTimeline, timestampMs);
+      const effectiveTier = tierAt(tierTimeline, timestampMs, seedTier);
       await onUsage({
         timestamp: record.timestamp,
         model,
@@ -406,7 +537,9 @@ export function createCodexLogParser({ lineReader }) {
         componentAvailability: canonicalComponentAvailability(usagePresence, usage),
         tierSemantics: normalizeProviderTier(effectiveTier?.rawTier ?? null, {
           billingSurface: "chatgpt_subscription",
-          tierSource: effectiveTier ? "rollout_thread_settings" : "unobserved",
+          tierSource: effectiveTier?.inherited === true
+            ? "lineage_inherited"
+            : effectiveTier ? "rollout_thread_settings" : "unobserved",
           tierObservedAt: effectiveTier?.timestamp ?? null,
         }),
         surfaceClassification,
@@ -423,6 +556,7 @@ export function createCodexLogParser({ lineReader }) {
   }
 
   return {
+    collectHistorySeed,
     collectCumulativeSnapshotKeys,
     parseRollout,
   };

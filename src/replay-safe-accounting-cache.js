@@ -640,10 +640,20 @@ function sourceDescriptor({
     coverage: mode === "unified"
       ? {
         status: boundedDescriptorText(coverage?.status),
+        blockReason: boundedDescriptorText(coverage?.blockReason),
         generatedAt: canonicalInstant(coverage?.generatedAt) ?? null,
         coveredAt,
         sourceCount: boundedDescriptorCount(coverage?.sourceCount),
         sourceBytes: boundedDescriptorCount(coverage?.sourceBytes),
+        skippedSourceCount: boundedDescriptorCount(
+          coverage?.skippedSourceCount,
+        ),
+        skippedSourceBytes: boundedDescriptorCount(
+          coverage?.skippedSourceBytes,
+        ),
+        skippedThreadCount: boundedDescriptorCount(
+          coverage?.skippedThreadCount,
+        ),
         usageEvents: boundedDescriptorCount(coverage?.usageEvents),
         quotaObservations: boundedDescriptorCount(coverage?.quotaObservations),
         quotaOccurrences: boundedDescriptorCount(coverage?.quotaOccurrences),
@@ -700,7 +710,15 @@ function normalizeUnifiedCoverage(scanned, expectedGeneration) {
   if (!coverage || typeof coverage !== "object" || Array.isArray(coverage)) {
     throw fixedError("accounting_unified_coverage_unavailable");
   }
-  if (coverage.status !== "complete" || coverage.generationProof !== true) {
+  const attestedGap = coverage.status === "partial"
+    && coverage.blockReason === "codex_rollout_sources_quarantined"
+    && coverage.generationProof === true
+    && Number.isSafeInteger(coverage.skippedSourceCount)
+    && coverage.skippedSourceCount > 0
+    && Number.isSafeInteger(coverage.skippedThreadCount)
+    && coverage.skippedThreadCount > 0;
+  if ((coverage.status !== "complete" && !attestedGap)
+      || coverage.generationProof !== true) {
     throw fixedError("accounting_unified_coverage_incomplete");
   }
   const capabilities = scanned?.capabilities;
@@ -804,7 +822,7 @@ function historyProjection(value, coverage, generation, generationFingerprint) {
     status: "available",
     errorCode: null,
     coverage: {
-      status: "complete",
+      status: coverage.coverage.status,
       generatedAt: value.generatedAt,
       coveredAt: value.coveredAt,
       generation,
@@ -4683,6 +4701,7 @@ function validSourceDescriptor(value) {
     const coverage = value.coverage;
     const coverageKeys = [
       "admittedQuotaOccurrences",
+      "blockReason",
       "coveredAt",
       "generatedAt",
       "generationProof",
@@ -4690,6 +4709,9 @@ function validSourceDescriptor(value) {
       "quotaOccurrences",
       "sourceBytes",
       "sourceCount",
+      "skippedSourceBytes",
+      "skippedSourceCount",
+      "skippedThreadCount",
       "status",
       "usageEvents",
     ].sort().join("\0");
@@ -4717,20 +4739,37 @@ function validSourceDescriptor(value) {
         && boundedDescriptorText(value.generationFingerprint) === null) {
       return false;
     }
-    return value.coverageStatus === "complete"
+    const complete = value.coverageStatus === "complete"
+      && coverage?.status === "complete"
+      && coverage?.blockReason === null
+      && coverage?.skippedSourceCount === 0
+      && coverage?.skippedSourceBytes === 0
+      && coverage?.skippedThreadCount === 0;
+    const attestedGap = value.coverageStatus === "partial"
+      && coverage?.status === "partial"
+      && coverage?.blockReason === "codex_rollout_sources_quarantined"
+      && Number.isSafeInteger(coverage?.skippedSourceCount)
+      && coverage.skippedSourceCount > 0
+      && Number.isSafeInteger(coverage?.skippedSourceBytes)
+      && coverage.skippedSourceBytes >= 0
+      && Number.isSafeInteger(coverage?.skippedThreadCount)
+      && coverage.skippedThreadCount > 0;
+    return (complete || attestedGap)
       && value.diagnosticsAvailable === true
       && value.generationMatched === true
       && coverage
       && typeof coverage === "object"
       && !Array.isArray(coverage)
       && Object.keys(coverage).sort().join("\0") === coverageKeys
-      && coverage.status === "complete"
       && (coverage.generatedAt === null
         || canonicalInstant(coverage.generatedAt) !== null)
       && validCoveredAt
       && [
         coverage.sourceCount,
         coverage.sourceBytes,
+        coverage.skippedSourceCount,
+        coverage.skippedSourceBytes,
+        coverage.skippedThreadCount,
         coverage.usageEvents,
         coverage.quotaObservations,
         coverage.quotaOccurrences,
@@ -4786,7 +4825,7 @@ function validHistory(value) {
       || !value.coverage
       || typeof value.coverage !== "object"
       || Array.isArray(value.coverage)
-      || !["complete", "unavailable"].includes(value.coverage.status)
+      || !["complete", "partial", "unavailable"].includes(value.coverage.status)
       || (value.generation !== null
         && generationToken(value.generation) === null)
       || (value.generationFingerprint !== null
@@ -4810,7 +4849,7 @@ function validHistory(value) {
   if (!validCoveredAt) return false;
   if (value.status === "available") {
     return value.errorCode === null
-      && value.coverage.status === "complete"
+      && ["complete", "partial"].includes(value.coverage.status)
       && value.generation !== null
       && validHistoryPeriod(value.period);
   }

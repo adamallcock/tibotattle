@@ -232,6 +232,18 @@ const CONTINUITY_GAP_BANDS = [
   "six_to_twenty_four_hours",
   "over_twenty_four_hours",
 ];
+const CONTINUITY_OUTCOME_BUCKETS = [
+  ["under_one_minute", 0, 60],
+  ["one_to_two_minutes", 60, 120],
+  ["two_to_five_minutes", 120, 300],
+  ["five_to_ten_minutes", 300, 600],
+  ["ten_to_thirty_minutes", 600, 1_800],
+  ["thirty_minutes_to_one_hour", 1_800, 3_600],
+  ["one_to_six_hours", 3_600, 21_600],
+  ["six_to_twenty_four_hours", 21_600, 86_400],
+  ["one_to_three_days", 86_400, 259_200],
+  ["over_three_days", 259_200, null],
+];
 
 function zeroContinuityBreakdown() {
   return {
@@ -241,6 +253,10 @@ function zeroContinuityBreakdown() {
     contextContractedReturns: 0,
     insufficientEvidenceReturns: 0,
     uncoveredReturns: 0,
+    reusedMoreThanHalfReturns: 0,
+    reusedHalfOrLessReturns: 0,
+    matchedOrExceededReturns: 0,
+    reusedBetweenHalfAndPreviousReturns: 0,
     coverageStatus: "complete",
     cacheReadDrops: 0,
     lostCacheTokens: 0,
@@ -248,6 +264,21 @@ function zeroContinuityBreakdown() {
     unpricedDrops: 0,
     estimatedPremiumUsd: 0,
   };
+}
+
+function continuityOutcomeBuckets(active) {
+  return Object.fromEntries(CONTINUITY_OUTCOME_BUCKETS.map(
+    ([key, startSeconds, endSeconds]) => [
+      key,
+      {
+        startSeconds,
+        endSeconds,
+        ...(key === "under_one_minute"
+          ? active
+          : zeroContinuityBreakdown()),
+      },
+    ],
+  ));
 }
 
 function continuityRecentRow(overrides = {}) {
@@ -272,6 +303,7 @@ function continuityPeriod(overrides = {}) {
     ...zeroContinuityBreakdown(),
     sameConfigurationReturns: 1,
     comparableReturns: 1,
+    reusedHalfOrLessReturns: 1,
     cacheReadDrops: 1,
     lostCacheTokens: 8_000,
     pricedDrops: 1,
@@ -290,6 +322,7 @@ function continuityPeriod(overrides = {}) {
       key,
       key === "under_one_minute" ? active : zeroContinuityBreakdown(),
     ])),
+    byOutcomeBucket: continuityOutcomeBuckets(active),
     recent: [continuityRecentRow()],
     allowanceImpact: allowanceImpact(
       0.01,
@@ -310,6 +343,7 @@ function continuityImpact(overrides = {}) {
     periodLabel: selected.periodLabel,
     minimumGapSeconds: 0,
     maximumRetainedCacheRatio: 0.5,
+    outcomeDisplayMaximumGapSeconds: 604_800,
     recentDetailLimit: 20,
     ...selected,
     periods: [selected],
@@ -362,8 +396,13 @@ test("cache-continuity evidence has no timing floor and drops local identifiers"
   const result = normalizedContinuityImpact(continuityImpact());
   assert.equal(result.status, "available");
   assert.equal(result.minimumGapSeconds, 0);
+  assert.equal(result.outcomeDisplayMaximumGapSeconds, 604_800);
   assert.equal(result.sameConfigurationReturns, 1);
   assert.equal(result.comparableReturns, 1);
+  assert.equal(result.reusedMoreThanHalfReturns, 0);
+  assert.equal(result.reusedHalfOrLessReturns, 1);
+  assert.equal(result.matchedOrExceededReturns, 0);
+  assert.equal(result.reusedBetweenHalfAndPreviousReturns, 0);
   assert.equal(result.orderingCoverageGaps, 0);
   assert.equal(result.cacheReadDrops, 1);
   assert.equal(result.postCompactionRequests, 5);
@@ -384,12 +423,26 @@ test("cache-continuity evidence has no timing floor and drops local identifiers"
     JSON.stringify(result),
     /secret-session|secret-event|private\/rollout|sessionLocal|eventKey|rolloutPath/u,
   );
+  assert.deepEqual(Object.keys(result.byOutcomeBucket),
+    CONTINUITY_OUTCOME_BUCKETS.map(([key]) => key));
+  assert.deepEqual(
+    [
+      result.byOutcomeBucket.under_one_minute.startSeconds,
+      result.byOutcomeBucket.under_one_minute.endSeconds,
+      result.byOutcomeBucket.over_three_days.startSeconds,
+      result.byOutcomeBucket.over_three_days.endSeconds,
+    ],
+    [0, 60, 259_200, null],
+  );
 });
 
 test("cache-continuity normalization fails closed on methodology and partitions", () => {
   assert.equal(normalizedContinuityImpact({}).status, "unavailable");
   assert.equal(normalizedContinuityImpact(continuityImpact({
     minimumGapSeconds: 1_800,
+  })).status, "unavailable");
+  assert.equal(normalizedContinuityImpact(continuityImpact({
+    outcomeDisplayMaximumGapSeconds: 259_200,
   })).status, "unavailable");
 
   const invalidPartition = continuityPeriod({
@@ -398,6 +451,13 @@ test("cache-continuity normalization fails closed on methodology and partitions"
   assert.equal(normalizedContinuityImpact(continuityImpact({
     ...invalidPartition,
     periods: [invalidPartition],
+  })).status, "unavailable");
+
+  const invalidOutcomeBoundary = continuityPeriod();
+  invalidOutcomeBoundary.byOutcomeBucket.two_to_five_minutes.startSeconds = 121;
+  assert.equal(normalizedContinuityImpact(continuityImpact({
+    ...invalidOutcomeBoundary,
+    periods: [invalidOutcomeBoundary],
   })).status, "unavailable");
 
   const invalidRecent = continuityPeriod({
@@ -431,6 +491,7 @@ test("incomplete compaction coverage withholds a continuity premium", () => {
       key,
       key === "under_one_minute" ? uncovered : zeroContinuityBreakdown(),
     ])),
+    byOutcomeBucket: continuityOutcomeBuckets(uncovered),
     recent: [],
   });
   const result = normalizedContinuityImpact(continuityImpact({
@@ -564,38 +625,76 @@ test("non-weekly periods cannot carry a weekly allowance conversion", () => {
   }
 });
 
-test("cache-switch money rendering distinguishes unavailable from evaluated zero", async () => {
+test("cache-impact money rendering keeps Standard continuity evidence visible", async () => {
   const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const start = source.indexOf("function cacheSwitchMetricValue(impact) {");
   const end = source.indexOf("\nfunction appendCacheSwitchMetricNote", start);
   assert.ok(start >= 0 && end > start, "cache-switch metric helper is available");
-  const metricValue = Function(
+  const metricValues = Function(
     "finite",
     "formatApiMoney",
-    `${source.slice(start, end)}\nreturn cacheSwitchMetricValue;`,
+    `${source.slice(start, end)}\nreturn {`
+      + " cacheSwitchMetricValue, cacheContinuityStandardMetricValue,"
+      + " cacheContinuityMetricValue,"
+      + " cacheContinuityUsesStandardFallback };",
   )(
     (value, fallback = null) => (
       typeof value === "number" && Number.isFinite(value) ? value : fallback
     ),
     (value) => value > 0 && value < 0.01 ? "<$0.01" : `$${value.toFixed(2)}`,
   );
-  assert.equal(metricValue({ status: "unavailable", estimatedPremiumUsd: 0 }), "—");
-  assert.equal(metricValue({ status: "available", allowanceWeighting: null }), "—");
-  assert.equal(metricValue({
+  assert.equal(metricValues.cacheSwitchMetricValue({
+    status: "unavailable",
+    estimatedPremiumUsd: 0,
+  }), "—");
+  assert.equal(metricValues.cacheSwitchMetricValue({
+    status: "available",
+    allowanceWeighting: null,
+  }), "—");
+  assert.equal(metricValues.cacheSwitchMetricValue({
     status: "available",
     allowanceWeighting: { status: "complete", selectedPremiumUsd: 0 },
   }), "$0.00");
-  assert.equal(metricValue({
+  assert.equal(metricValues.cacheSwitchMetricValue({
     status: "available",
     allowanceWeighting: { status: "complete", selectedPremiumUsd: 0.005 },
   }), "<$0.01");
-  assert.equal(metricValue({
+  assert.equal(metricValues.cacheSwitchMetricValue({
     status: "available",
     allowanceWeighting: {
       status: "range",
       rangePremiumUsd: { lower: 0.01, upper: 0.025 },
     },
   }), "$0.01–$0.03");
+  const standardFallback = {
+    status: "available",
+    standardApiPremiumUsd: 231.44,
+    allowanceWeighting: { status: "unavailable" },
+  };
+  assert.equal(
+    metricValues.cacheContinuityMetricValue(standardFallback),
+    "$231.44",
+  );
+  assert.equal(
+    metricValues.cacheContinuityUsesStandardFallback(standardFallback),
+    true,
+  );
+  const weightedContinuity = {
+    ...standardFallback,
+    allowanceWeighting: { status: "complete", selectedPremiumUsd: 300 },
+  };
+  assert.equal(
+    metricValues.cacheContinuityMetricValue(weightedContinuity),
+    "$300.00",
+  );
+  assert.equal(
+    metricValues.cacheContinuityStandardMetricValue(weightedContinuity),
+    "$231.44",
+  );
+  assert.equal(
+    metricValues.cacheContinuityUsesStandardFallback(weightedContinuity),
+    false,
+  );
 });
 
 test("a pager is drawn only when there is more than one page to reach", async () => {
@@ -834,6 +933,7 @@ test("cache-continuity notes distinguish unavailable, incomplete, zero, and obse
     "formatCount",
     "document",
     "appendCacheContinuityAllowance",
+    "cacheContinuityUsesStandardFallback",
     `${source.slice(start, end)}\nreturn appendCacheContinuityMetricNote;`,
   )(
     (_tag, _className, key) => key,
@@ -843,6 +943,7 @@ test("cache-continuity notes distinguish unavailable, incomplete, zero, and obse
     String,
     documentRef,
     (container) => container.append("allowance"),
+    () => false,
   );
   const keysFor = (impact) => {
     const children = [];
@@ -903,107 +1004,6 @@ test("cache-continuity notes distinguish unavailable, incomplete, zero, and obse
     "accounting.cacheContinuity.noteCompaction",
     "allowance",
   ]);
-});
-
-test("cache-continuity time bands render all seven summaries and fail closed", async () => {
-  const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  const start = source.indexOf("const CACHE_CONTINUITY_GAP_BAND_UI = Object.freeze([");
-  const end = source.indexOf(
-    "\nfunction renderAccountingCacheContinuityDetails",
-    start,
-  );
-  assert.ok(start >= 0 && end > start, "cache-continuity gap renderer is available");
-  const element = (tagName, className = "", textContent = "") => ({
-    tagName,
-    className,
-    textContent,
-    children: [],
-    append(...items) { this.children.push(...items); },
-  });
-  const renderRows = Function(
-    "clear",
-    "node",
-    "localizedNode",
-    "rawNode",
-    "formatCount",
-    "formatApiMoney",
-    "paginateCacheImpactRows",
-    "cacheContinuityGapTablePagination",
-    "cacheImpactTableSignature",
-    "renderCacheImpactPagination",
-    `${source.slice(start, end)}\nreturn renderAccountingCacheContinuityGapRows;`,
-  )(
-    (target) => { target.children.length = 0; },
-    element,
-    (tagName, className, key) => element(tagName, className, key),
-    element,
-    String,
-    (value) => `$${value.toFixed(2)}`,
-    (values) => ({
-      rows: values,
-      start: 0,
-      end: values.length,
-      total: values.length,
-      pageCount: 1,
-    }),
-    { page: 0, signature: "" },
-    () => "test",
-    () => {},
-  );
-
-  const rows = element("tbody");
-  renderRows(continuityImpact(), rows);
-  assert.equal(rows.children.length, 7);
-  assert.deepEqual(
-    rows.children.map((row) => row.children[0].textContent),
-    [
-      "accounting.cacheContinuity.gapBand.underOneMinute",
-      "accounting.cacheContinuity.gapBand.oneToFiveMinutes",
-      "accounting.cacheContinuity.gapBand.fiveToThirtyMinutes",
-      "accounting.cacheContinuity.gapBand.thirtyMinutesToOneHour",
-      "accounting.cacheContinuity.gapBand.oneToSixHours",
-      "accounting.cacheContinuity.gapBand.sixToTwentyFourHours",
-      "accounting.cacheContinuity.gapBand.overTwentyFourHours",
-    ],
-  );
-  assert.equal(rows.children[0].children[1].textContent, "1 / 1");
-  assert.equal(rows.children[0].children[2].textContent, "8000");
-  assert.equal(rows.children[0].children[3].textContent, "$0.01");
-  assert.equal(rows.children[1].children[3].textContent, "$0.00");
-
-  const unpriced = continuityImpact();
-  unpriced.byGapBand.under_one_minute = {
-    ...unpriced.byGapBand.under_one_minute,
-    pricedDrops: 0,
-    unpricedDrops: 1,
-    estimatedPremiumUsd: null,
-  };
-  renderRows(unpriced, rows);
-  assert.equal(
-    rows.children[0].children[3].textContent,
-    "accounting.cacheContinuity.premiumUnavailable",
-  );
-
-  const orderingIncomplete = continuityImpact();
-  orderingIncomplete.coverageStatus = "incomplete";
-  orderingIncomplete.orderingCoverageGaps = 1;
-  orderingIncomplete.estimatedPremiumUsd = null;
-  renderRows(orderingIncomplete, rows);
-  assert.equal(rows.children.length, 7);
-  assert.ok(rows.children.every((row) => (
-    row.children[3].textContent
-      === "accounting.cacheContinuity.premiumUnavailable"
-  )));
-
-  const incomplete = continuityImpact();
-  delete incomplete.byGapBand.over_twenty_four_hours;
-  renderRows(incomplete, rows);
-  assert.equal(rows.children.length, 1);
-  assert.equal(
-    rows.children[0].children[0].textContent,
-    "accounting.cacheContinuity.gapBreakdownUnavailable",
-  );
-  assert.equal(rows.children[0].children[0].colSpan, 4);
 });
 
 test("the history selector reads the analyzer's all-indexed period", async () => {
@@ -1086,7 +1086,10 @@ test("cache-impact UI copy has three-locale parity and collapsed evidence tables
     /exact local event order/u,
   );
 
-  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  const [html, styles] = await Promise.all([
+    readFile(new URL("../public/index.html", import.meta.url), "utf8"),
+    readFile(new URL("../public/styles.css", import.meta.url), "utf8"),
+  ]);
   assert.match(html, /<details[^>]+id="cache-switch-details"[^>]+hidden>/u);
   assert.doesNotMatch(
     html.match(/<details[^>]+id="cache-switch-details"[^>]*>/u)?.[0] ?? "",
@@ -1118,6 +1121,16 @@ test("cache-impact UI copy has three-locale parity and collapsed evidence tables
     )),
     expectedContinuityLabels,
   );
+  assert.deepEqual(
+    SUPPORTED_LOCALES.map((locale) => (
+      translate("accounting.cacheContinuity.detailsSummary", {}, locale)
+    )),
+    [
+      "See recent large cache drops",
+      "查看近期缓存大幅下降",
+      "Ver las caídas grandes de caché recientes",
+    ],
+  );
   for (const locale of SUPPORTED_LOCALES) {
     assert.doesNotMatch(
       translate("accounting.cacheContinuity.metricExplanation", {}, locale),
@@ -1134,33 +1147,56 @@ test("cache-impact UI copy has three-locale parity and collapsed evidence tables
       /accounting\.cacheContinuity|\{ordering\}/u,
     );
   }
-  const continuityBandKeys = [
+  const outcomeBucketKeys = [
     "underOneMinute",
-    "oneToFiveMinutes",
-    "fiveToThirtyMinutes",
+    "oneToTwoMinutes",
+    "twoToFiveMinutes",
+    "fiveToTenMinutes",
+    "tenToThirtyMinutes",
     "thirtyMinutesToOneHour",
     "oneToSixHours",
     "sixToTwentyFourHours",
-    "overTwentyFourHours",
+    "oneToThreeDays",
+    "overThreeDays",
   ];
-  assert.deepEqual(
-    continuityBandKeys.map((key) => (
-      translate(`accounting.cacheContinuity.gapBand.${key}`, {}, "en")
-    )),
-    [
-      "Under 1 minute",
-      "1–5 minutes",
-      "5–30 minutes",
-      "30 minutes–1 hour",
-      "1–6 hours",
-      "6–24 hours",
-      "Over 24 hours",
-    ],
-  );
   for (const locale of SUPPORTED_LOCALES) {
-    for (const key of continuityBandKeys) {
+    for (const key of [
+      "heading",
+      "subtitle",
+      "howToRead",
+      "canvasLabel",
+      "readoutLost",
+      "readoutApi",
+      "legendInline",
+    ]) {
       assert.doesNotMatch(
-        translate(`accounting.cacheContinuity.gapBand.${key}`, {}, locale),
+        translate(`accounting.cacheContinuity.outcome.${key}`, {
+          percent: "80%",
+          matched: "8",
+          between: "1",
+          count: "10",
+          more: "8",
+          less: "2",
+          unit: "20",
+          tokens: "1,024",
+          amount: "$0.01",
+        }, locale),
+        /accounting\.cacheContinuity|\{(?:percent|matched|between|count|more|less|unit|tokens|amount)\}/u,
+      );
+    }
+    for (const key of ["overheadLabel", "overheadBasis"]) {
+      assert.doesNotMatch(
+        translate(`accounting.cacheContinuity.outcome.${key}`, {}, locale),
+        /accounting\.cacheContinuity/u,
+      );
+    }
+    assert.doesNotMatch(
+      translate("accounting.cacheContinuity.noteStandardFallback", {}, locale),
+      /accounting\.cacheContinuity/u,
+    );
+    for (const key of outcomeBucketKeys) {
+      assert.doesNotMatch(
+        translate(`accounting.cacheContinuity.outcome.bucket.${key}`, {}, locale),
         /accounting\.cacheContinuity/u,
       );
     }
@@ -1178,18 +1214,54 @@ test("cache-impact UI copy has three-locale parity and collapsed evidence tables
     html.indexOf('id="cache-continuity-details"'),
     html.indexOf("</details>", html.indexOf('id="cache-continuity-details"')),
   );
-  assert.match(continuityDetails, /<tbody id="cache-continuity-gap-rows"><\/tbody>/u);
-  assert.match(continuityDetails, /id="cache-continuity-gap-pagination"/u);
-  assert.match(continuityDetails, /id="cache-continuity-gap-page-prev"/u);
-  assert.match(continuityDetails, /id="cache-continuity-gap-page-next"/u);
+  const continuityOutcome = html.slice(
+    html.indexOf('id="cache-reuse-outcome"'),
+    html.indexOf("</section>", html.indexOf('id="cache-reuse-outcome"')),
+  );
+  assert.match(
+    html.match(/<section[^>]+id="cache-reuse-outcome"[^>]*>/u)?.[0] ?? "",
+    /\shidden(?:\s|>)/u,
+  );
+  assert.ok(
+    html.indexOf('id="cache-reuse-outcome"')
+      < html.indexOf('id="cache-continuity-details"'),
+    "cache outcome is a first-class section before the recent-evidence disclosure",
+  );
+  assert.doesNotMatch(continuityDetails, /id="cache-reuse-outcome"/u);
+  assert.match(continuityDetails, /See recent large cache drops/u);
+  assert.match(continuityOutcome, /<canvas id="cache-reuse-canvas"/u);
+  assert.match(continuityOutcome, /id="cache-reuse-readout"/u);
+  assert.match(
+    continuityOutcome,
+    /id="cache-reuse-readout-rail"[^>]+hidden/u,
+  );
+  assert.match(continuityOutcome, /id="cache-reuse-readout-lost"/u);
+  assert.match(continuityOutcome, /id="cache-reuse-readout-api"/u);
+  assert.match(continuityOutcome, /id="cache-reuse-overhead"/u);
+  assert.doesNotMatch(continuityOutcome, /id="cache-reuse-checked"/u);
+  assert.doesNotMatch(continuityOutcome, /id="cache-reuse-mark-unit"/u);
+  assert.doesNotMatch(continuityOutcome, /cache-reuse-(?:privacy|timeout-note|detail)/u);
+  assert.doesNotMatch(
+    continuityDetails,
+    /accounting\.cacheContinuity\.detailsExplanation/u,
+  );
+  assert.match(
+    styles,
+    /\.cache-reuse-metrics\s*\{[^}]*grid-template-columns:\s*repeat\(3,/u,
+  );
+  assert.match(
+    styles,
+    /\.cache-reuse-raster-scroll\s*\{[^}]*overflow:\s*visible/u,
+  );
+  assert.match(
+    styles,
+    /\.cache-reuse-raster-stage\s*\{[^}]*min-width:\s*0/u,
+  );
+  assert.doesNotMatch(continuityOutcome, /cache-continuity-gap-(?:rows|pagination|page)/u);
+  assert.doesNotMatch(continuityOutcome, /cache-continuity-gap-table/u);
   assert.match(html, /<tbody id="cache-continuity-rows"><\/tbody>/u);
   assert.match(continuityDetails, /id="cache-continuity-pagination"/u);
   assert.match(continuityDetails, /id="cache-continuity-page-prev"/u);
   assert.match(continuityDetails, /id="cache-continuity-page-next"/u);
-  assert.ok(
-    continuityDetails.indexOf('id="cache-continuity-gap-rows"')
-      < continuityDetails.indexOf('id="cache-continuity-rows"'),
-    "aggregate gap rows precede recent evidence rows",
-  );
   assert.match(html, /Time between turns/u);
 });

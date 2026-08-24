@@ -328,9 +328,12 @@ test("Codex sanitizer rejects quota percentages outside zero to one hundred", ()
   assert.equal(result.canonical.secondary, null);
 });
 
-test("local usage normalization rejects negative and non-numeric counters", () => {
+test("local usage normalization accepts only non-negative safe-integer counters", () => {
   assert.equal(normalizeTokenUsage({ input_tokens: -1 }), null);
   assert.equal(normalizeTokenUsage({ input_tokens: "10" }), null);
+  assert.equal(normalizeTokenUsage({ input_tokens: 1.5 }), null);
+  assert.equal(normalizeTokenUsage({ input_tokens: Number.MAX_SAFE_INTEGER + 1 }), null);
+  assert.equal(normalizeTokenUsage([]), null);
   assert.deepEqual(normalizeTokenUsage({ input_tokens: 10, output_tokens: 2 }), {
     input_tokens: 10,
     cached_input_tokens: 0,
@@ -441,7 +444,7 @@ test("forked cumulative snapshots are excluded while new fork usage is retained"
       record("2026-07-23T00:00:01.000Z", usage(100), usage(100)),
     ].join("\n");
     const fork = [
-      JSON.stringify({ timestamp: "2026-07-23T00:01:00.000Z", type: "session_meta", payload: { forked_from_id: "controller-parent-secret" } }),
+      JSON.stringify({ timestamp: "2026-07-23T00:01:00.000Z", type: "session_meta", payload: { id: "controller-fork-secret", forked_from_id: "controller-parent-secret" } }),
       JSON.stringify({ timestamp: "2026-07-23T00:01:00.001Z", type: "turn_context", payload: { model: "gpt-test" } }),
       record("2026-07-23T00:01:00.002Z", usage(100), usage(100)),
       record("2026-07-23T00:01:01.000Z", usage(160), usage(60)),

@@ -49,8 +49,8 @@
       "properties": {
         "exporterVersion": { "const": "0.3.0-draft.3" },
         "resourcePolicyVersion": { "const": "g1-r3-candidate-0.5" },
-        "checkpointParserVersion": { "const": "codex-checkpoint-state-v0.1" },
-        "checkpointScanVersion": { "const": "codex-export-checkpoint-scan-v0.2" },
+        "checkpointParserVersion": { "const": "codex-checkpoint-state-v0.2" },
+        "checkpointScanVersion": { "const": "codex-export-checkpoint-scan-v0.3" },
         "packageName": { "const": "app-usagemonitor" },
         "packageVersion": { "const": "0.1.16" }
       }
@@ -95,7 +95,7 @@
                   "properties": {
                     "status": { "const": "implemented" },
                     "sourceFormat": { "const": "codex-rollout-jsonl" },
-                    "parserVersion": { "const": "codex-log-scan-v5" },
+                    "parserVersion": { "const": "codex-log-scan-v7" },
                     "adapterVersion": { "const": "codex-metadata-export-v5" }
                   }
                 },

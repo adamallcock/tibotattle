@@ -324,7 +324,9 @@ function readCurrentGeneration(
       SELECT id, started_at_ms, completed_at_ms, parser_version_id,
              contract_version, status, block_reason,
              discovered_source_count, discovered_source_bytes,
-             indexed_source_count, indexed_source_bytes, usage_events,
+             indexed_source_count, indexed_source_bytes,
+             skipped_source_count, skipped_source_bytes,
+             skipped_thread_count, usage_events,
              quota_occurrences, covered_start_ms, covered_end_ms,
              discovery_complete, diagnostics_complete,
              usage_provenance_complete, source_order_complete,
@@ -386,6 +388,9 @@ function readCurrentGeneration(
     : null;
   const declaredSourceCount = boundedCount(generation.indexed_source_count);
   const declaredSourceBytes = boundedCount(generation.indexed_source_bytes);
+  const skippedSourceCount = boundedCount(generation.skipped_source_count) ?? 0;
+  const skippedSourceBytes = boundedCount(generation.skipped_source_bytes) ?? 0;
+  const skippedThreadCount = boundedCount(generation.skipped_thread_count) ?? 0;
   const usageProvenanceAttested = generation.usage_provenance_complete === 1;
   const sourceOrderAttested = generation.source_order_complete === 1;
   const quotaProvenanceAttested = generation.quota_provenance_complete === 1;
@@ -479,11 +484,12 @@ function readCurrentGeneration(
     `);
     sourceCount = queryCount(database, `
       SELECT COUNT(*) AS count FROM generation_source
-      WHERE generation_id = ?
+      WHERE generation_id = ? AND status <> 'failed'
     `, currentGenerationId);
     const sourceBytesValue = database.prepare(`
       SELECT COALESCE(SUM(discovered_size_bytes), 0) AS bytes
-      FROM generation_source WHERE generation_id = ?
+      FROM generation_source
+      WHERE generation_id = ? AND status <> 'failed'
     `).get(currentGenerationId)?.bytes;
     sourceBytes = boundedCount(sourceBytesValue);
     if (sourceBytes === null) {
@@ -492,7 +498,7 @@ function readCurrentGeneration(
     sourceIncomplete = queryCount(database, `
       SELECT COUNT(*) AS count FROM generation_source
       WHERE generation_id = ?
-        AND (status IN ('pending', 'failed') OR diagnostics_complete <> 1)
+        AND (status = 'pending' OR diagnostics_complete <> 1)
     `, currentGenerationId) > 0;
     sourceOrdinalMissing = queryCount(database, `
       SELECT COUNT(*) AS count FROM generation_source
@@ -519,6 +525,7 @@ function readCurrentGeneration(
         (SELECT COUNT(*) FROM generation_source gs
          LEFT JOIN source_cursor sc ON sc.source_local = gs.source_local
          WHERE gs.generation_id = ?
+           AND gs.status <> 'failed'
            AND (sc.source_local IS NULL OR sc.source_ordinal IS NULL
              OR sc.source_ordinal != gs.source_ordinal))
       ) AS count
@@ -606,8 +613,13 @@ function readCurrentGeneration(
     && indexStatus === "partial"
     && generation.block_reason === "tool_provenance_incomplete"
     && !toolProvenanceAttested;
+  const quarantinePartial = generation.status === "partial"
+    && indexStatus === "partial"
+    && generation.block_reason === "codex_rollout_sources_quarantined"
+    && skippedSourceCount > 0
+    && skippedThreadCount > 0;
   const generationComplete = ((generation.status === "complete"
-      && indexStatus === "complete") || toolOnlyPartial)
+      && indexStatus === "complete") || toolOnlyPartial || quarantinePartial)
     && generation.discovery_complete === 1
     && generation.diagnostics_complete === 1;
   const diagnosticsComplete = !sourceIncomplete
@@ -641,9 +653,19 @@ function readCurrentGeneration(
   } else if (!diagnosticsComplete) {
     blockReason = "source_diagnostics_incomplete";
   }
-  const generationProof = blockReason === null;
+  const partialGapProof = quarantinePartial
+    && countsMatch
+    && provenanceComplete
+    && quotaOccurrencesComplete
+    && diagnosticsComplete;
+  // A proven gap is still a gap. Preserve its fixed reason for downstream
+  // coverage/UI contracts even though every published fact is fully attested.
+  if (partialGapProof && blockReason === null) {
+    blockReason = "codex_rollout_sources_quarantined";
+  }
+  const generationProof = blockReason === null || partialGapProof;
   return {
-    status: generationProof ? "complete" : "partial",
+    status: quarantinePartial ? "partial" : generationProof ? "complete" : "partial",
     indexStatus,
     blockReason,
     generatedAt,
@@ -654,6 +676,9 @@ function readCurrentGeneration(
     requestedWindow,
     sourceCount,
     sourceBytes,
+    skippedSourceCount,
+    skippedSourceBytes,
+    skippedThreadCount,
     usageEvents,
     quotaObservations,
     quotaOccurrences,
@@ -953,7 +978,10 @@ export function createLocalUnifiedAccountingSource({
         coverage.generationProof = false;
         coverage.blockReason = "mixed_parser_versions";
       }
-      if (requireComplete && coverage.status !== "complete") {
+      const attestedGap = coverage.status === "partial"
+        && coverage.blockReason === "codex_rollout_sources_quarantined"
+        && coverage.generationProof === true;
+      if (requireComplete && coverage.status !== "complete" && !attestedGap) {
         throw fixedError("local_unified_index_accounting_coverage_incomplete");
       }
       const diagnostics = readDiagnostics(database, coverage.generationId);
