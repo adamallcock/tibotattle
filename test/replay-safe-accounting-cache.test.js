@@ -2945,6 +2945,8 @@ test("the shipped accounting memory policy is the owner-set pair and a derived c
     maximumRssBytes: 6 * 1024 * 1024 * 1024,
     rssDeltaBudgetBytes: Math.floor(5.25 * 1024 * 1024 * 1024),
     rebuildChildOldSpaceMib: 6_144,
+    archiveMaximumRssBytes: 3 * 1024 * 1024 * 1024,
+    archiveRssDeltaBudgetBytes: 512 * 1024 * 1024,
   });
   // DERIVED, not coincident: the child's V8 old-space cap is the absolute
   // target expressed in MiB. Because the effective ceiling is at most the
@@ -2983,6 +2985,143 @@ test("the shipped accounting memory policy is the owner-set pair and a derived c
       + "than by the accounting delta; if that stops holding, the scan-guard "
       + "regression below is asserting the wrong regime",
   );
+});
+
+// The resident companion's OBSERVED whole-process residency (dogfood 0.1.13
+// build 1020, 4,886 sources / 128.5 GB indexed), sampled every two seconds
+// over twenty seconds: 1,312-2,089 MiB. Both ends matter. The high end is why
+// the archive projection cannot be policed by a 2 GiB absolute — the companion
+// crosses that line on GC timing alone, so the guard would fire or not fire at
+// random. The spread is why the ceiling is resolved off a per-pass baseline
+// rather than fixed.
+const OBSERVED_COMPANION_RSS_FLOOR = 1_312 * 1024 * 1024;
+const OBSERVED_COMPANION_RSS_PEAK = 2_089 * 1024 * 1024;
+const ARCHIVE_RSS_ABSOLUTE =
+  REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY.archiveMaximumRssBytes;
+const ARCHIVE_RSS_DELTA =
+  REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY.archiveRssDeltaBudgetBytes;
+
+test("the resident archive projection is bounded by its own policy, never the rebuild's", () => {
+  // THE SEPARATION. buildReplaySafeAccountingPeriod once defaulted to the
+  // rebuild's ceiling, so the 2026-08-20 raise of a constant that exists to
+  // size a SHORT-LIVED CHILD silently handed the resident menu-bar companion
+  // a 6 GiB backstop — undoing, for this path, what #38 moved the rebuild out
+  // of process to achieve. Free headroom in a process that exits is not free
+  // in one the user leaves running all day.
+  assert.ok(
+    ARCHIVE_RSS_ABSOLUTE < ACCOUNTING_RSS_ABSOLUTE,
+    "the resident archive ceiling must stay strictly below the rebuild's; "
+      + "equality would mean the default had drifted back into inheritance",
+  );
+  assert.ok(
+    ARCHIVE_RSS_DELTA < ACCOUNTING_RSS_DELTA,
+    "the resident archive delta must stay strictly below the rebuild's",
+  );
+
+  // Which arm binds, at the residency actually measured on the owner's
+  // machine. The DELTA has to be the binding arm across the whole observed
+  // band, because the absolute arm charges the projection for memory the
+  // companion allocated for unrelated reasons and cannot hand back.
+  for (const baseline of [
+    OBSERVED_COMPANION_RSS_FLOOR,
+    OBSERVED_COMPANION_RSS_PEAK,
+  ]) {
+    assert.ok(
+      baseline + ARCHIVE_RSS_DELTA < ARCHIVE_RSS_ABSOLUTE,
+      "across the observed companion band the delta must bind, so the pass "
+        + "gets its full budget rather than whatever the absolute leaves over",
+    );
+  }
+
+  // And the reason a bare absolute was rejected rather than merely retuned: at
+  // the pre-raise 2 GiB the observed band STRADDLES the ceiling, so the same
+  // projection on the same corpus would defer or not defer on GC timing.
+  const PRE_RAISE_ABSOLUTE = 2 * 1024 * 1024 * 1024;
+  assert.ok(
+    OBSERVED_COMPANION_RSS_FLOOR < PRE_RAISE_ABSOLUTE
+      && OBSERVED_COMPANION_RSS_PEAK > PRE_RAISE_ABSOLUTE,
+    "restoring the pre-raise absolute would have made the guard a coin flip "
+      + "on this machine; that is what the baseline + delta shape avoids",
+  );
+});
+
+test("an archive projection past its own delta defers while still far under the rebuild ceiling", async () => {
+  // The discriminating case, and the one that fails if the default ever goes
+  // back to inheriting: residency here is well inside the rebuild's effective
+  // ceiling, so a period build reading that policy would sail through.
+  const baseline = OBSERVED_COMPANION_RSS_PEAK;
+  const overArchiveUnderRebuild = baseline + ARCHIVE_RSS_DELTA + 1;
+  assert.ok(
+    overArchiveUnderRebuild < ACCOUNTING_RSS_ABSOLUTE
+      && overArchiveUnderRebuild < baseline + ACCOUNTING_RSS_DELTA,
+    "the fixture must sit under BOTH arms of the rebuild policy, or it is "
+      + "not evidence about which policy the archive path read",
+  );
+
+  let sampled = 0;
+  await assert.rejects(
+    buildReplaySafeAccountingPeriod({
+      startAt: "1970-01-01T00:00:00.000Z",
+      endAt: "2026-08-20T12:00:00.000Z",
+      // Baseline first, then the pass grows one byte past its delta.
+      rss: () => {
+        sampled += 1;
+        return sampled === 1 ? baseline : overArchiveUnderRebuild;
+      },
+      scan: scanner([
+        usageEvent({
+          timestamp: "2026-07-27T11:55:00.000Z",
+          components: { input_uncached_tokens: 1 },
+        }),
+      ]),
+    }),
+    (error) => error?.code === "accounting_archive_rss_limit_exceeded",
+  );
+
+  // The absolute arm is a real backstop too: a companion already past it gets
+  // no projection at all, however little the pass itself would have grown.
+  await assert.rejects(
+    buildReplaySafeAccountingPeriod({
+      startAt: "1970-01-01T00:00:00.000Z",
+      endAt: "2026-08-20T12:00:00.000Z",
+      rss: () => ARCHIVE_RSS_ABSOLUTE + 1,
+      scan: scanner([]),
+    }),
+    (error) => error?.code === "accounting_archive_rss_limit_exceeded",
+  );
+});
+
+test("a caller that names its own ceiling keeps it, which is how the rebuild sub-build stays unchanged", async () => {
+  // buildReplaySafeAccountingCache passes the effective ceiling it already
+  // computed off the CHILD's baseline. That seam has to keep taking the named
+  // number verbatim — the archive policy must not tighten a rebuild that is
+  // already fighting for room, and must not sample rss() an extra time.
+  const named = 4 * 1024 * 1024 * 1024;
+  assert.ok(
+    named > ARCHIVE_RSS_ABSOLUTE,
+    "the named ceiling must exceed the archive absolute, or this proves "
+      + "nothing about which one was applied",
+  );
+  const samples = [];
+  const result = await buildReplaySafeAccountingPeriod({
+    startAt: "1970-01-01T00:00:00.000Z",
+    endAt: "2026-08-20T12:00:00.000Z",
+    maximumRssBytes: named,
+    rss: () => {
+      samples.push(ARCHIVE_RSS_ABSOLUTE + 1);
+      return ARCHIVE_RSS_ABSOLUTE + 1;
+    },
+    scan: scanner([
+      usageEvent({
+        timestamp: "2026-07-27T11:55:00.000Z",
+        components: { input_uncached_tokens: 1 },
+      }),
+    ]),
+  });
+  assert.equal(result.period.events, 1);
+  // Two readings: the pre-flight check and the post-scan check. A third would
+  // mean the named path had started deriving a baseline it was told not to.
+  assert.equal(samples.length, 2);
 });
 
 test("an RSS ceiling miss during accounting is a soft target: the prior cache is retained and served", async () => {
