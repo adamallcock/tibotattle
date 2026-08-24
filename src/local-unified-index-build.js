@@ -53,7 +53,6 @@ import {
 // leaves the previous index untouched and costs only the work done so far.
 
 const MAXIMUM_WORKERS = 10;
-export const LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS = 500;
 
 const CODEX_BILLING_SURFACE = "chatgpt_subscription";
 
@@ -611,7 +610,6 @@ async function runWorkerLane(lane, laneIndex, { maximumLineBytes, signal, onBatc
       {
         workerData: {
           maximumLineBytes,
-          batchEvents: LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS,
           components: lane.components.map((members) => members.map((info) => ({
             path: info.path,
             size: Number(info.size ?? 0),
