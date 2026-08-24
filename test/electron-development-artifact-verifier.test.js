@@ -62,6 +62,7 @@ const SHELL_FILES = [
   "apps/electron/recovery-window.js",
   "apps/electron/ready-line.js",
   "apps/electron/windows-qualification.js",
+  "config/deployment-endpoints.js",
   "src/desktop-shell-status.js",
   "src/platform/windows-credential-manager-probe.js",
 ];
