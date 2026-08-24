@@ -1778,7 +1778,7 @@ function windowsReceiptFixture({
       contentFree: true,
       credentialPersistence: true,
       dashboardReady: true,
-      dashboardCheckpoint: "dashboard_ready",
+      dashboardCheckpoint: "startup_refresh_terminal_succeeded",
       failureReason: "none",
       failureStage: "none",
       noOrphan: true,
@@ -1904,6 +1904,10 @@ test("Windows Electron qualification receipt rejects incomplete or mismatched ev
     "not_started",
     "target_poll_recovery_only",
     "renderer_not_ready",
+    "dashboard_ready",
+    "startup_gate_released",
+    "startup_refresh_request_observed",
+    "startup_refresh_receipt_accepted",
     "unexpected",
   ]) {
     assert.throws(
@@ -1915,7 +1919,7 @@ test("Windows Electron qualification receipt rejects incomplete or mismatched ev
         },
       }),
       (error) => error.code === WINDOWS_RECEIPT_STATUS.runtimeInvalid,
-      `canonical receipts must require dashboard_ready, got ${dashboardCheckpoint}`,
+      `canonical receipts must require startup_refresh_terminal_succeeded, got ${dashboardCheckpoint}`,
     );
   }
   assert.throws(

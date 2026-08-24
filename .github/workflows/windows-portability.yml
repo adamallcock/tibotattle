@@ -617,7 +617,11 @@ jobs:
             'cdp_attach_failed',
             'frame_unavailable',
             'renderer_not_ready',
-            'dashboard_ready'
+            'dashboard_ready',
+            'startup_gate_released',
+            'startup_refresh_request_observed',
+            'startup_refresh_receipt_accepted',
+            'startup_refresh_terminal_succeeded'
           )
           $runtimeFallbackReasons = @(
             'aggregate_missing',
@@ -938,7 +942,7 @@ jobs:
               $runtimeEvidence.contentFree -ne $true -or
               $runtimeEvidence.failureStage -ne 'none' -or
               $runtimeEvidence.failureReason -ne 'none' -or
-              $runtimeEvidence.dashboardCheckpoint -ne 'dashboard_ready' -or
+              $runtimeEvidence.dashboardCheckpoint -ne 'startup_refresh_terminal_succeeded' -or
               $runtimeJson -match '(?i)(?:[A-Za-z]:[\\/]|/Users/|/home/|\\Users\\|username|password|secret|token|pid|process|stdout|stderr|command|executable)') {
             Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_EVIDENCE_NOT_CONTENT_FREE'
             exit 1
@@ -950,7 +954,7 @@ jobs:
             }
           }
           "TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_EVIDENCE_PATH=$runtimeEvidencePath" >> $env:GITHUB_ENV
-          "- Dashboard readiness: passed" >> $env:GITHUB_STEP_SUMMARY
+          "- Startup refresh terminal: passed" >> $env:GITHUB_STEP_SUMMARY
           "- Synthetic refresh: passed" >> $env:GITHUB_STEP_SUMMARY
           "- Tray/window lifecycle: passed" >> $env:GITHUB_STEP_SUMMARY
           "- Single-instance rejection: passed" >> $env:GITHUB_STEP_SUMMARY
