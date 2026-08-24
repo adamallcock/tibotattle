@@ -624,6 +624,15 @@ jobs:
             'startup_refresh_receipt_accepted',
             'startup_refresh_terminal_succeeded'
           )
+          $runtimeShutdownCheckpoints = @(
+            'not_started',
+            'started',
+            'descendants_captured',
+            'quit_acknowledged',
+            'primary_exited',
+            'monitor_settled',
+            'descendants_gone'
+          )
           $runtimeDashboardRefreshProgressStages = @('none', 'collector', 'indexing')
           $runtimeDashboardRefreshProgressDetails = @('none', 'in_progress', 'quick_result', 'archive_index')
           $runtimeUnifiedIndexFailureCodes = @(
@@ -697,6 +706,7 @@ jobs:
               failedStep = 'none'
               failureCode = 'none'
             }
+            shutdownCheckpoint = 'not_started'
             syntheticRefresh = $false
             secondInstanceRejected = $false
             showHideTrayLifecycle = $false
@@ -861,6 +871,7 @@ jobs:
               'dashboardCheckpoint',
               'dashboardRefreshProgress',
               'dashboardRefreshFailure',
+              'shutdownCheckpoint',
               'syntheticRefresh',
               'secondInstanceRejected',
               'showHideTrayLifecycle',
@@ -899,6 +910,8 @@ jobs:
                 $runtimeFailureReasons -notcontains $runtimeEvidence.failureReason -or
                 $runtimeEvidence.dashboardCheckpoint -isnot [string] -or
                 $runtimeDashboardCheckpoints -notcontains $runtimeEvidence.dashboardCheckpoint -or
+                $runtimeEvidence.shutdownCheckpoint -isnot [string] -or
+                $runtimeShutdownCheckpoints -notcontains $runtimeEvidence.shutdownCheckpoint -or
                 $runtimeEvidence.dashboardRefreshProgress -eq $null -or
                 $runtimeEvidence.dashboardRefreshProgress -isnot [object] -or
                 $runtimeEvidence.dashboardRefreshFailure -eq $null -or
@@ -929,7 +942,7 @@ jobs:
               throw 'runtime refresh failure diagnostics'
             }
             foreach ($name in $expectedRuntimeKeys) {
-              if ($name -in @('status', 'target', 'contentFree', 'failureStage', 'failureReason', 'dashboardCheckpoint', 'dashboardRefreshProgress', 'dashboardRefreshFailure')) { continue }
+              if ($name -in @('status', 'target', 'contentFree', 'failureStage', 'failureReason', 'dashboardCheckpoint', 'shutdownCheckpoint', 'dashboardRefreshProgress', 'dashboardRefreshFailure')) { continue }
               if ($runtimeEvidence.$name -isnot [bool]) {
                 throw 'runtime aggregate check'
               }
@@ -1010,6 +1023,7 @@ jobs:
               $runtimeEvidence.failureStage -ne 'none' -or
               $runtimeEvidence.failureReason -ne 'none' -or
               $runtimeEvidence.dashboardCheckpoint -ne 'startup_refresh_terminal_succeeded' -or
+              $runtimeEvidence.shutdownCheckpoint -ne 'descendants_gone' -or
               $runtimeEvidence.dashboardRefreshFailure.failedStep -ne 'none' -or
               $runtimeEvidence.dashboardRefreshFailure.failureCode -ne 'none' -or
               $runtimeJson -match '(?i)(?:[A-Za-z]:[\\/]|/Users/|/home/|\\Users\\|username|password|secret|token|pid|process|stdout|stderr|command|executable)') {
