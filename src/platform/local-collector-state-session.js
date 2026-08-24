@@ -23,6 +23,7 @@ export const LOCAL_COLLECTOR_STATE_SESSION_BOUNDARY_CONTRACT_VERSION =
 const BOUNDARIES = new AsyncLocalStorage();
 const WINDOWS_QUALIFICATION_SESSION_FACTORY_BINDINGS = new WeakMap();
 const WINDOWS_QUALIFICATION_SESSION_FACTORIES = new WeakSet();
+const WINDOWS_QUALIFICATION_SESSION_BINDINGS = new WeakMap();
 
 function unavailable() {
   const error = new Error("local_collector_state_unavailable");
@@ -64,6 +65,29 @@ function sameQualificationResourceRoot(left, right) {
     && normalizedLeft.toLowerCase() === normalizedRight.toLowerCase();
 }
 
+function qualificationStateFilePath(session) {
+  if (session === null || typeof session !== "object") return null;
+  try {
+    if (typeof session.rootPath !== "string"
+        || typeof session.databaseName !== "string") return null;
+    return win32.join(
+      normalizedQualificationStateRoot(session.rootPath),
+      session.databaseName,
+    );
+  } catch {
+    return null;
+  }
+}
+
+function qualificationPathForRoot(path, root) {
+  const selected = normalizedQualificationStateRoot(path);
+  const selectedRoot = normalizedQualificationStateRoot(root);
+  if (selected === null || selectedRoot === null) return false;
+  const prefix = selectedRoot.endsWith("\\") ? selectedRoot : `${selectedRoot}\\`;
+  return selected.toLowerCase() === selectedRoot.toLowerCase()
+    || selected.toLowerCase().startsWith(prefix.toLowerCase());
+}
+
 function isWindowsQualificationSessionFactoryFor({
   factory,
   context,
@@ -88,6 +112,49 @@ function isWindowsQualificationSessionFactoryFor({
         stateRoot,
         resourceRoot,
       });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Return true only for the exact session object issued by the qualification
+ * factory, bound to the exact context/adapter/roots and requested file.
+ *
+ * The public session fields intentionally remain production-unqualified. The
+ * WeakMap is the private capability that lets the disposable qualification
+ * lane exercise the same native path without turning a copied object or a
+ * direct `createWindowsSqliteStateSession` call into authorization.
+ */
+export function isWindowsQualificationStateSessionFor({
+  session,
+  context,
+  adapter,
+  stateFile = null,
+  stateRoot = null,
+  resourceRoot = null,
+} = {}) {
+  try {
+    const binding = WINDOWS_QUALIFICATION_SESSION_BINDINGS.get(session);
+    if (binding === undefined
+        || binding.context !== context
+        || binding.adapter !== adapter
+        || !sameQualificationStateRoot(binding.stateRoot, stateRoot)
+        || !sameQualificationResourceRoot(binding.resourceRoot, resourceRoot)
+        || !isWindowsQualificationModeContextFor({
+          context,
+          adapter,
+          stateRoot,
+          resourceRoot,
+        })) {
+      return false;
+    }
+    const expectedPath = qualificationStateFilePath(session);
+    if (expectedPath === null || !qualificationPathForRoot(expectedPath, stateRoot)) {
+      return false;
+    }
+    return stateFile !== null
+      && sameQualificationStateRoot(expectedPath, stateFile);
   } catch {
     return false;
   }
@@ -189,7 +256,7 @@ export function createWindowsQualificationStateSessionFactory({
       }
       selectedDatabaseFactory = requestedDatabaseFactory;
     }
-    return createWindowsSqliteStateSession({
+    const session = createWindowsSqliteStateSession({
       ...sessionOptions,
       platform: binding.platform,
       architecture: binding.architecture,
@@ -200,6 +267,13 @@ export function createWindowsQualificationStateSessionFactory({
         ? {}
         : { databaseFactory: selectedDatabaseFactory }),
     });
+    WINDOWS_QUALIFICATION_SESSION_BINDINGS.set(session, Object.freeze({
+      context: binding.context,
+      adapter: binding.adapter,
+      stateRoot: binding.stateRoot,
+      resourceRoot: binding.resourceRoot,
+    }));
+    return session;
   };
   WINDOWS_QUALIFICATION_SESSION_FACTORY_BINDINGS.set(factory, binding);
   WINDOWS_QUALIFICATION_SESSION_FACTORIES.add(factory);

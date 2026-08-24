@@ -95,6 +95,7 @@ export {
   WindowsProtectedStateStoreError,
   createWindowsProtectedStateStore,
   isWindowsProtectedStateStore,
+  isWindowsQualificationProtectedStateStoreFor,
   isWindowsProtectedStateStoreError,
 } from "./windows-protected-state-store.js";
 export {
@@ -109,11 +110,13 @@ export {
   WindowsSqliteStateStagingError,
   createWindowsSqliteStateStaging,
   isWindowsSqliteStateStaging,
+  isWindowsQualificationSqliteStateStagingFor,
 } from "./windows-sqlite-state-staging.js";
 export {
   LOCAL_COLLECTOR_STATE_SESSION_BOUNDARY_CONTRACT_VERSION,
   createWindowsQualificationStateSessionFactory,
   currentLocalCollectorStateSessionBoundary,
+  isWindowsQualificationStateSessionFor,
   isLocalCollectorStateWindowsBoundaryActive,
   openLocalCollectorStateSessionBoundary,
   withLocalCollectorStateSessionBoundary,

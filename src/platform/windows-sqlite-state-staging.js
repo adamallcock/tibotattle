@@ -1,9 +1,12 @@
-import { win32 } from "node:path";
+import { resolve, win32 } from "node:path";
 
 import {
   isWindowsFilesystemAdapter,
   isWindowsFilesystemIdentity,
 } from "./windows-filesystem.js";
+import {
+  isWindowsQualificationModeContextFor,
+} from "./windows-qualification-mode.js";
 
 /**
  * Root-bound SQLite staging and publication for the unified index.
@@ -19,6 +22,7 @@ export const WINDOWS_SQLITE_STATE_STAGING_CONTRACT_VERSION =
 export const WINDOWS_SQLITE_STATE_STAGING_SAFE = false;
 
 const CONTEXTS = new WeakSet();
+const QUALIFICATION_BINDINGS = new WeakMap();
 const MAX_PATH_LENGTH = 32_767;
 const RESERVED_DEVICE_NAMES = new Set([
   "CON", "PRN", "AUX", "NUL",
@@ -195,9 +199,114 @@ export function isWindowsSqliteStateStaging(value) {
   }
 }
 
-export function createWindowsSqliteStateStaging({ adapter, rootPath } = {}) {
+function normalizedQualificationPath(value) {
+  if (typeof value !== "string" || value.length < 1 || value.includes("\0")) {
+    return null;
+  }
+  try {
+    return win32.normalize(value.replaceAll("/", "\\"));
+  } catch {
+    return null;
+  }
+}
+
+function qualificationPathUnderRoot(path, root) {
+  const selected = normalizedQualificationPath(path);
+  const selectedRoot = normalizedQualificationPath(root);
+  if (selected === null || selectedRoot === null) return false;
+  const prefix = selectedRoot.endsWith("\\") ? selectedRoot : `${selectedRoot}\\`;
+  return selected.toLowerCase() === selectedRoot.toLowerCase()
+    || selected.toLowerCase().startsWith(prefix.toLowerCase());
+}
+
+function sameQualificationResourceRoot(left, right) {
+  if (typeof left !== "string" || typeof right !== "string") return false;
+  try {
+    return resolve(left).toLowerCase() === resolve(right).toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+function validateQualificationBinding({
+  adapter,
+  rootPath,
+  windowsQualificationModeContext,
+  resourceRoot,
+}) {
+  if (windowsQualificationModeContext === null) return null;
+  let valid = false;
+  try {
+    valid = isWindowsQualificationModeContextFor({
+      context: windowsQualificationModeContext,
+      adapter,
+      stateRoot: rootPath,
+      resourceRoot,
+    })
+      && windowsQualificationModeContext.qualificationOnly === true
+      && windowsQualificationModeContext.productionSafe === false
+      && adapter.productionSafe === false
+      && adapter.sqliteStateLeaseSafe === false;
+  } catch {
+    valid = false;
+  }
+  if (!valid) fail("invalid_configuration");
+  return Object.freeze({
+    adapter,
+    context: windowsQualificationModeContext,
+    stateRoot: canonicalRoot(rootPath),
+    resourceRoot,
+  });
+}
+
+/**
+ * Check the private qualification capability for an exact staging object.
+ * `path` is revalidated on every gate so a caller cannot reuse the object for
+ * a different root or an escaped state file.
+ */
+export function isWindowsQualificationSqliteStateStagingFor({
+  staging,
+  context,
+  adapter,
+  path = null,
+  stateRoot = null,
+  resourceRoot = null,
+} = {}) {
+  try {
+    const binding = QUALIFICATION_BINDINGS.get(staging);
+    if (binding === undefined
+        || binding.context !== context
+        || binding.adapter !== adapter
+        || !qualificationPathUnderRoot(binding.stateRoot, stateRoot)
+        || !sameQualificationResourceRoot(binding.resourceRoot, resourceRoot)
+        || !isWindowsQualificationModeContextFor({
+          context,
+          adapter,
+          stateRoot,
+          resourceRoot,
+        })) {
+      return false;
+    }
+    return path !== null && qualificationPathUnderRoot(path, binding.stateRoot);
+  } catch {
+    return false;
+  }
+}
+
+export function createWindowsSqliteStateStaging({
+  adapter,
+  rootPath,
+  windowsQualificationModeContext = null,
+  resourceRoot = null,
+} = {}) {
   if (!isWindowsFilesystemAdapter(adapter)) fail("invalid_adapter");
   const root = canonicalRoot(rootPath);
+  const qualificationBinding = validateQualificationBinding({
+    adapter,
+    rootPath: root,
+    windowsQualificationModeContext,
+    resourceRoot,
+  });
   let rootIdentity;
   const stageIdentities = new Map();
 
@@ -355,5 +464,8 @@ export function createWindowsSqliteStateStaging({ adapter, rootPath } = {}) {
   };
   Object.freeze(context);
   CONTEXTS.add(context);
+  if (qualificationBinding !== null) {
+    QUALIFICATION_BINDINGS.set(context, qualificationBinding);
+  }
   return context;
 }

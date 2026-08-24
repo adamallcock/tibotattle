@@ -114,6 +114,7 @@ const QUALIFICATION_TEST_FILES = Object.freeze([
   "test/windows-prepared-contribution.test.js",
   "test/windows-security-consumer-composition.test.js",
   "test/windows-sqlite-state-session-native.test.js",
+  "test/windows-local-unified-index-native.test.js",
   "test/claude-callback-windows-native.test.js",
   "test/windows-path-contract.test.js",
   "test/windows-qualification-governance.test.js",

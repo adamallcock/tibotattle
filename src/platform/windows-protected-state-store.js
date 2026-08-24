@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { win32 } from "node:path";
+import { resolve, win32 } from "node:path";
 
 import {
   isWindowsFilesystemAdapter,
@@ -7,6 +7,9 @@ import {
   isWindowsFilesystemIdentity,
   isWindowsFilesystemNotFound,
 } from "./windows-filesystem.js";
+import {
+  isWindowsQualificationModeContextFor,
+} from "./windows-qualification-mode.js";
 
 /**
  * The small state-store boundary used by future Windows lifecycle consumers.
@@ -33,6 +36,7 @@ export const WINDOWS_PROTECTED_STATE_STORE_NATIVE_READ_BOUNDED = false;
 const MAX_PATH_LENGTH = 32_767;
 const NO_ERROR = Symbol("no error");
 const CONTEXTS = new WeakSet();
+const QUALIFICATION_BINDINGS = new WeakMap();
 const ERRORS = new WeakSet();
 const LEASES = new WeakSet();
 const RESERVED_DEVICE_NAMES = new Set([
@@ -84,6 +88,97 @@ export function isWindowsProtectedStateStore(context) {
   return Boolean(context && CONTEXTS.has(context));
 }
 
+function qualificationPathUnderRoot(path, root) {
+  if (typeof path !== "string" || typeof root !== "string") return false;
+  try {
+    const selected = win32.normalize(path.replaceAll("/", "\\"));
+    const selectedRoot = win32.normalize(root.replaceAll("/", "\\"));
+    const prefix = selectedRoot.endsWith("\\") ? selectedRoot : `${selectedRoot}\\`;
+    return selected.toLowerCase() === selectedRoot.toLowerCase()
+      || selected.toLowerCase().startsWith(prefix.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+function sameQualificationResourceRoot(left, right) {
+  if (typeof left !== "string" || typeof right !== "string") return false;
+  try {
+    return resolve(left).toLowerCase() === resolve(right).toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+function qualificationBindingFor({
+  adapter,
+  rootPath,
+  windowsQualificationModeContext,
+  resourceRoot,
+}) {
+  if (windowsQualificationModeContext === null) return null;
+  let valid = false;
+  try {
+    valid = isWindowsQualificationModeContextFor({
+      context: windowsQualificationModeContext,
+      adapter,
+      stateRoot: windowsQualificationModeContext.stateRoot,
+      resourceRoot,
+    })
+      && windowsQualificationModeContext.qualificationOnly === true
+      && windowsQualificationModeContext.productionSafe === false
+      && adapter.productionSafe === false
+      && adapter.sqliteStateLeaseSafe === false
+      && qualificationPathUnderRoot(rootPath, windowsQualificationModeContext.stateRoot);
+  } catch {
+    valid = false;
+  }
+  if (!valid) fail("invalid_configuration");
+  return Object.freeze({
+    adapter,
+    context: windowsQualificationModeContext,
+    contextStateRoot: windowsQualificationModeContext.stateRoot,
+    storeRoot: rootPath,
+    resourceRoot,
+  });
+}
+
+/**
+ * Check the private qualification capability for an exact protected store.
+ * The store's root and requested path are checked again at each call site;
+ * public `productionSafe` readiness facts remain false.
+ */
+export function isWindowsQualificationProtectedStateStoreFor({
+  store,
+  context,
+  adapter,
+  path = null,
+  stateRoot = null,
+  resourceRoot = null,
+} = {}) {
+  try {
+    const binding = QUALIFICATION_BINDINGS.get(store);
+    if (binding === undefined
+        || binding.context !== context
+        || binding.adapter !== adapter
+        || !qualificationPathUnderRoot(binding.storeRoot, stateRoot)
+        || !qualificationPathUnderRoot(binding.storeRoot, binding.contextStateRoot)
+        || !qualificationPathUnderRoot(binding.contextStateRoot, stateRoot)
+        || !sameQualificationResourceRoot(binding.resourceRoot, resourceRoot)
+        || !isWindowsQualificationModeContextFor({
+          context,
+          adapter,
+          stateRoot,
+          resourceRoot,
+        })) {
+      return false;
+    }
+    return path !== null && qualificationPathUnderRoot(path, binding.storeRoot);
+  } catch {
+    return false;
+  }
+}
+
 function fail(code) {
   throw new WindowsProtectedStateStoreError(code);
 }
@@ -98,6 +193,8 @@ function validateConfiguration(options) {
     maxBytes = WINDOWS_PROTECTED_STATE_STORE_DEFAULT_MAX_BYTES,
     audit = null,
     idFactory = randomUUID,
+    windowsQualificationModeContext = null,
+    resourceRoot = null,
   } = options;
   if (!isWindowsFilesystemAdapter(adapter)) fail("invalid_adapter");
   if (typeof audit !== "function" && audit !== null) fail("invalid_configuration");
@@ -107,7 +204,15 @@ function validateConfiguration(options) {
       || maxBytes > WINDOWS_PROTECTED_STATE_STORE_DEFAULT_MAX_BYTES) {
     fail("invalid_configuration");
   }
-  return { adapter, rootPath, maxBytes, audit, idFactory };
+  return {
+    adapter,
+    rootPath,
+    maxBytes,
+    audit,
+    idFactory,
+    windowsQualificationModeContext,
+    resourceRoot,
+  };
 }
 
 function invalidWindowsComponent(component) {
@@ -411,8 +516,16 @@ export function createWindowsProtectedStateStore(options = {}) {
     maxBytes,
     audit,
     idFactory,
+    windowsQualificationModeContext = null,
+    resourceRoot = null,
   } = configuration;
   const root = canonicalRoot(rootPath);
+  const qualificationBinding = qualificationBindingFor({
+    adapter,
+    rootPath: root,
+    windowsQualificationModeContext,
+    resourceRoot,
+  });
   const records = new WeakMap();
   let rootIdentity;
 
@@ -722,6 +835,9 @@ export function createWindowsProtectedStateStore(options = {}) {
     },
   });
   CONTEXTS.add(context);
+  if (qualificationBinding !== null) {
+    QUALIFICATION_BINDINGS.set(context, qualificationBinding);
+  }
   ensureProtectedDirectory();
   return context;
 }
