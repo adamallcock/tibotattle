@@ -1059,6 +1059,23 @@
       "legacyPaths": []
     },
     {
+      "classification": "build_release_operation",
+      "owner": "export_test_infrastructure",
+      "canonicalPath": "scripts/windows-wsl-multi-root-qualification.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The content-free Windows and WSL2 multi-root qualification is invoked only by the explicitly selected disposable hosted-runner job.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/windows-portability.yml",
+        "test/windows-qualification-governance.test.js",
+        "test/windows-wsl-multi-root-qualification.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-08-23-multi-root-codex-sources-plan.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
       "classification": "historical_research_report",
       "owner": "reporting",
       "canonicalPath": "src/build-monitoring-quality-report.js",

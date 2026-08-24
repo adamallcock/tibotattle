@@ -523,30 +523,33 @@ claim.
 
 ### Validation receipt
 
-Validated on 2026-08-23:
+Validated across 2026-08-23 and 2026-08-24:
 
-- focused browser/provider/index/export/native-localization matrix: 398/398
-  passed;
-- loopback local companion suite: 51/51 passed;
-- portable plural companion process suite: 2/2 passed;
-- complete packaged macOS bundle suite: 50/50 passed, including the compiled
-  Quit-during-stop child-process regression;
-- full repository run: 2,826 passed, 17 explicit native-Windows platform
-  skips, and zero failures out of 2,843 tests;
-- dual-runtime R7 regeneration completed in 43.3 minutes and atomically
+- final scanner/Windows/WSL/governance matrix: 52 passed, 2 expected
+  non-Windows skips, and zero failures;
+- complete portable lane: 1,155 passed, 18 explicit native-Windows platform
+  skips, and zero failures out of 1,173 tests;
+- complete packaged macOS bundle suite: 58/58 passed, including compiled
+  launcher/watchdog and updater coverage;
+- full repository run: 2,855 passed, 18 explicit native-Windows platform
+  skips, and zero failures out of 2,873 tests;
+- dual-runtime R7 regeneration completed in 38.7 minutes and atomically
   replaced ten validated owner-only receipts against 342 source files, with
   workload source SHA-256
-  `ea0c8fa2ee836ba0a33cfd149ccb7532f3bd7b8179f2696a29d7124140218a1b`;
+  `eb4060a420bcae176ae7e506dba66ed8a5dc55a55496374ad44051ccd263ec0d`;
 - focused retained-R7 validation: 2/2 passed, and all ten receipts are mode
   `0600`;
-- architecture/import audit, documentation links, browser localization, and
-  diff hygiene passed; and
+- architecture/import audit, documentation links, workflow lint, tool
+  inventory (79 records / 81 executable paths), and diff hygiene passed; and
 - the partial-root dashboard state was exercised through a real loopback
   companion and visually inspected for path-free, honest retained-history
   copy.
 
 Independent code-quality and test/documentation re-audits reported no finding
-at any severity after the lifecycle fixes. Source was frozen in local commit
-`3a4a55a2`; the regenerated receipts are a separate local provenance commit.
-Nothing was pushed, published, tagged, released, or posted to the public issue.
-Installed Windows/WSL filesystem and signing qualification remains separate.
+at any severity after the lifecycle fixes. The performance re-audit reported
+no new regression while retaining the explicit high-water RSS/latency gate.
+Source was frozen in local commit `c8e50615`; the regenerated receipts,
+tool-inventory registration, and final documentation are a separate local
+provenance commit. Nothing was pushed, published, tagged, released, or posted
+to the public issue. Installed Windows/WSL filesystem and signing
+qualification remains separate.
