@@ -1811,6 +1811,10 @@ export async function ingestLocalUnifiedIndexIncrement({
     });
     return {
       status: "ingested",
+      // A staged pass has scanned and published source state. The unchanged
+      // fast path returns true above; every normal staged publication must
+      // expose the same explicit boolean contract as a cold rebuild.
+      unchanged: false,
       indexFile: resolvedIndexFile,
       generation: generationDescriptor,
       generationDescriptor,
