@@ -68,8 +68,9 @@ async function fixture({ replayTool = false } = {}) {
     JSON.stringify({ timestamp: "2026-07-24T12:01:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: "PRIVATE_PARENT_TASK" } }),
     JSON.stringify({ timestamp: "2026-07-24T12:01:10.000Z", type: "response_item", payload: { type: "function_call", name: "exec_command", call_id: "PRIVATE_TOOL_1" } }),
     tokenCount("2026-07-24T12:01:30.000Z", usage({ input: 100, cached: 40, output: 20, reasoning: 8, total: 120 }), usage({ input: 100, cached: 40, output: 20, reasoning: 8, total: 120 }), 11.2),
-    // Relevant but malformed JSON must become a single safe diagnostic.
-    '{"timestamp":"2026-07-24T12:01:40.000Z","type":"event_msg","payload":{"type":"token_count"',
+    // A malformed non-accounting record remains a safe diagnostic. Malformed
+    // accounting records are covered separately and poison the export.
+    '{"timestamp":"2026-07-24T12:01:40.000Z","type":"response_item","payload":{"type":"function_call"',
     "ordinary private-looking text without a scanner needle",
     JSON.stringify({ timestamp: "2026-07-24T12:02:10.000Z", type: "response_item", payload: { type: "shell_call", call_id: "PRIVATE_TOOL_2" } }),
     tokenCount("2026-07-24T12:02:30.000Z", usage({ input: 160, cached: 60, output: 35, reasoning: 11, total: 195 }), usage({ input: 60, cached: 20, output: 15, reasoning: 3, total: 75 }), 14.6, 42),
@@ -230,6 +231,38 @@ test("checkpoint lineage excludes copied parent tool calls from child usage", as
     assert.equal(result.diagnostics.some((item) => item.code === "replayed_tool_calls_skipped" && item.count === 1), true);
   } finally {
     await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("checkpoint counter re-anchors survive one-line batches", async () => {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-checkpoint-reanchor-"));
+  const home = join(root, "codex-home");
+  await mkdir(join(home, "sessions"), { recursive: true });
+  await mkdir(join(home, "archived_sessions"), { recursive: true });
+  const lines = [
+    JSON.stringify({ timestamp: "2026-07-24T12:00:00.000Z", type: "session_meta", payload: { id: "PRIVATE_REANCHOR" } }),
+    JSON.stringify({ timestamp: "2026-07-24T12:00:00.010Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } }),
+    tokenCount("2026-07-24T12:01:00.000Z", usage({ input: 100, total: 100 }), usage({ input: 100, total: 100 }), 1),
+    tokenCount("2026-07-24T12:02:00.000Z", usage({ input: 1_000, total: 1_000 }), usage({ input: 100, total: 100 }), 2),
+    tokenCount("2026-07-24T12:03:00.000Z", usage({ input: 50, total: 50 }), usage({ input: 50, total: 50 }), 3),
+    tokenCount("2026-07-24T12:04:00.000Z", usage({ input: 100, total: 100 }), usage({ input: 50, total: 50 }), 4),
+  ];
+  await writeFile(
+    join(home, "sessions", "rollout-2026-07-24T12-00-00-reanchor.jsonl"),
+    `${lines.join("\n")}\n`,
+  );
+  try {
+    const legacy = await legacyResult(home);
+    const checkpoint = await checkpointResult({
+      root,
+      home,
+      label: "reanchor",
+      maximumLinesPerBatch: 1,
+    });
+    assert.equal(legacy.records.filter((item) => item.recordType === "usageEvent").length, 4);
+    assert.deepEqual(checkpoint.records, legacy.records);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 

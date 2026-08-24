@@ -64,6 +64,8 @@ const STATE_KEYS = Object.freeze([
   "currentModel",
   "previousTotals",
   "previousTotalsPresence",
+  "reAnchored",
+  "sessionMetaSeen",
   "tier",
   "pendingToolCounts",
 ]);
@@ -164,6 +166,8 @@ function createEmptyCodexCheckpointState() {
     currentModel: null,
     previousTotals: null,
     previousTotalsPresence: null,
+    reAnchored: false,
+    sessionMetaSeen: false,
     tier: {
       timelineIndex: 0,
       speedMode: "unknown",
@@ -183,12 +187,16 @@ function normalizeCodexCheckpointState(value) {
   if (value.currentModel !== null && !isObject(value.currentModel)) invalid();
   const hasTotals = value.previousTotals !== null;
   if (hasTotals !== (value.previousTotalsPresence !== null)) invalid();
+  if (typeof value.reAnchored !== "boolean"
+      || typeof value.sessionMetaSeen !== "boolean") invalid();
 
   return {
     schemaVersion: EXPORT_CHECKPOINT_PARSER_VERSION,
     currentModel: value.currentModel === null ? null : normalizeModel(value.currentModel),
     previousTotals: hasTotals ? normalizeTokenTotals(value.previousTotals) : null,
     previousTotalsPresence: hasTotals ? normalizePresence(value.previousTotalsPresence) : null,
+    reAnchored: value.reAnchored,
+    sessionMetaSeen: value.sessionMetaSeen,
     tier: normalizeTier(value.tier),
     pendingToolCounts: normalizePendingTools(value.pendingToolCounts),
   };

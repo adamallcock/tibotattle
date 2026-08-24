@@ -23,6 +23,7 @@ import {
   createSyntheticEnvelope,
   createTelemetryEnvelope,
   detectDeviationPeriods,
+  historyIndexContinuationDecision,
   contributionReviewBootstrapAction,
   contributionReviewPreparationPermitted,
   withContributionReviewDeadline,
@@ -1168,6 +1169,60 @@ test("completed bounded passes continue under the original user action", () => {
   }), false);
 });
 
+test("history auto-continuation stops on terminal gaps and unchanged receipts", () => {
+  const history = {
+    status: "partial",
+    phase: "scanning",
+    indexedSourceCount: 7,
+    indexedBytes: 7_000,
+    sourceCount: 10,
+    sourceBytes: 10_000,
+  };
+  const advancing = historyIndexContinuationDecision({
+    history,
+    generation: 4,
+    generationFingerprint: "a".repeat(64),
+  });
+  assert.equal(advancing.incomplete, true);
+  assert.equal(advancing.shouldContinue, true);
+  assert.equal(typeof advancing.receipt, "string");
+
+  const unchanged = historyIndexContinuationDecision({
+    history,
+    generation: 4,
+    generationFingerprint: "a".repeat(64),
+    previousReceipt: advancing.receipt,
+  });
+  assert.equal(unchanged.incomplete, true);
+  assert.equal(unchanged.shouldContinue, false);
+
+  const advancedBytes = historyIndexContinuationDecision({
+    history: { ...history, indexedBytes: 7_001 },
+    generation: 4,
+    generationFingerprint: "a".repeat(64),
+    previousReceipt: advancing.receipt,
+  });
+  assert.equal(advancedBytes.shouldContinue, true);
+
+  const terminalGap = historyIndexContinuationDecision({
+    history: {
+      ...history,
+      phase: "partial_terminal",
+      skippedSourceCount: 3,
+    },
+    generation: 5,
+    generationFingerprint: "b".repeat(64),
+    previousReceipt: advancing.receipt,
+  });
+  assert.equal(terminalGap.incomplete, false);
+  assert.equal(terminalGap.shouldContinue, false);
+  assert.equal(terminalGap.terminalGap, true);
+
+  assert.equal(historyIndexContinuationDecision({
+    history: { ...history, status: "complete" },
+  }).shouldContinue, false);
+});
+
 function communitySnapshot() {
   const releasedTokens = { status: "released", value: 100_000, unit: "tokens_rounded_down" };
   return {
@@ -1586,6 +1641,47 @@ test("history coverage only becomes complete from coherent archive evidence", ()
       },
     }).pricing.historyCoverage.errorCode,
     "archive_disk_space",
+  );
+  const terminalGap = {
+    status: "partial",
+    phase: "partial_terminal",
+    generatedAt: "2026-08-03T12:00:00.000Z",
+    coveredAt: complete.coveredAt,
+    sourceCount: 3,
+    indexedSourceCount: 1,
+    pendingSourceCount: 0,
+    skippedSourceCount: 2,
+    skippedSourceBytes: 60,
+    skippedThreadCount: 1,
+    sourceBytes: 100,
+    indexedBytes: 40,
+  };
+  assert.deepEqual(
+    normalizeDashboardPayload({ pricing: { historyCoverage: terminalGap } })
+      .pricing.historyCoverage,
+    {
+      status: "partial",
+      phase: "partial_terminal",
+      sourceCount: 3,
+      indexedSourceCount: 1,
+      pendingSourceCount: 0,
+      skippedSourceCount: 2,
+      skippedSourceBytes: 60,
+      skippedThreadCount: 1,
+      sourceBytes: 100,
+      indexedBytes: 40,
+      generatedAt: "2026-08-03T12:00:00.000Z",
+      errorCode: null,
+      coveredAt: complete.coveredAt,
+    },
+  );
+  assert.equal(
+    normalizeDashboardPayload({
+      pricing: {
+        historyCoverage: { ...terminalGap, skippedSourceBytes: 59 },
+      },
+    }).pricing.historyCoverage.phase,
+    "not_started",
   );
 });
 

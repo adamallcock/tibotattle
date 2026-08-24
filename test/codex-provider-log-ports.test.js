@@ -20,6 +20,7 @@ const FILESYSTEM_METHODS = Object.freeze([
   "defaultCodexHome",
   "joinPath",
   "currentUid",
+  "readSelectedRolloutNames",
   "openDirectory",
   "statPath",
   "lstatPath",
@@ -59,6 +60,7 @@ function completeFilesystem(overrides = {}) {
     defaultCodexHome: () => VIRTUAL_CODEX_HOME,
     joinPath: (...parts) => posix.join(...parts),
     currentUid: () => 501,
+    readSelectedRolloutNames: async () => null,
     openDirectory: async () => asyncEntries(),
     statPath: async () => {
       throw new Error("unexpected statPath call");
@@ -195,7 +197,7 @@ test("lineage forwards the bounded-reader policy, byte ceiling, guard, and signa
   assert.deepEqual(calls[0].options.oversizedIrrelevantNeedles, RELEVANT_LINE_NEEDLES);
 });
 
-test("discovery preserves unbounded lineage reads while scan passes use the discovered source size", async () => {
+test("discovery bounds lineage reads while scan passes use the discovered source size", async () => {
   const sourceSize = 6_789;
   const guard = resourceGuard(5_432);
   const signal = new AbortController().signal;
@@ -242,11 +244,21 @@ test("discovery preserves unbounded lineage reads while scan passes use the disc
   assert.equal(discoveryCallCount, 1);
   assert.equal(calls[0].source, ROLLOUT_PATH);
   assert.equal(calls[0].options.maximumLineBytes, guard.limits.maximumLineBytes);
-  assert.equal(calls[0].options.maximumTotalBytes, Number.POSITIVE_INFINITY);
+  assert.equal(calls[0].options.maximumTotalBytes, 1024 * 1024);
   assert.equal(calls[0].options.resourceGuard, guard);
   assert.equal(calls[0].options.signal, signal);
   assert.deepEqual(calls[0].options.oversizedIrrelevantNeedles, RELEVANT_LINE_NEEDLES);
 
+  await scanner.discoverCodexRolloutInfos({
+    startAt: START_AT,
+    endAt: END_AT,
+    signal,
+  });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].options.maximumTotalBytes, 1024 * 1024);
+  assert.equal(calls[1].options.resourceGuard, null);
+
+  const scanCallStart = calls.length;
   await scanner.scanCodexLogEvents({
     startAt: START_AT,
     endAt: END_AT,
@@ -255,8 +267,8 @@ test("discovery preserves unbounded lineage reads while scan passes use the disc
     signal,
   });
 
-  assert.ok(calls.length > discoveryCallCount);
-  for (const call of calls.slice(discoveryCallCount)) {
+  assert.ok(calls.length > scanCallStart);
+  for (const call of calls.slice(scanCallStart)) {
     assert.equal(call.source, ROLLOUT_PATH);
     assert.equal(call.options.maximumLineBytes, guard.limits.maximumLineBytes);
     assert.equal(call.options.maximumTotalBytes, sourceSize);

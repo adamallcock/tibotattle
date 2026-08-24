@@ -29,6 +29,7 @@ const PROVIDER_PUBLIC_EXPORTS = [
   "canonicalRateLimitWindows",
   "classifySessionSurface",
   "classifyToolCall",
+  "codexRolloutDiscoveryReceipt",
   "createCodexLogScanner",
   "createLeadingRateLimitGate",
   "createSnapshotLineage",
@@ -38,6 +39,7 @@ const PROVIDER_PUBLIC_EXPORTS = [
   "isCodexSpeedMode",
   "normalizeProviderTier",
   "normalizeTokenUsage",
+  "parseCodexRolloutFilename",
   "sameUsage",
   "subtractUsage",
   "tokenComponentPresence",
@@ -53,6 +55,7 @@ const LEGACY_SCANNER_EXPORTS = [
   "canonicalRateLimitWindows",
   "classifyToolCall",
   "codexLogSourceFingerprint",
+  "codexRolloutDiscoveryReceipt",
   "createLeadingRateLimitGate",
   "createSnapshotLineage",
   "cumulativeSnapshotKey",
@@ -74,6 +77,7 @@ const LEGACY_SCANNER_EXPORTS = [
 const BOUND_SCANNER_OPERATIONS = [
   "appendedRolloutSourcesAreAfterEnd",
   "codexLogSourceFingerprint",
+  "codexRolloutDiscoveryReceipt",
   "discoverCodexRolloutInfos",
   "discoverCodexRollouts",
   "hasForkReplayPrefix",
@@ -168,7 +172,7 @@ test("only the application scanner composition owner references the provider fac
   assert.deepEqual(references, ["src/application/local-codex-log-scanner.js"]);
 });
 
-test("the root Codex scanner preserves its exact legacy API through provider identities", () => {
+test("the root Codex scanner preserves its legacy API plus reviewed rollout identities", () => {
   assert.deepEqual(
     Object.keys(legacyScanner).sort(),
     LEGACY_SCANNER_EXPORTS,
@@ -212,7 +216,7 @@ test("the Codex log facade re-exports each pure provider binding by identity", (
   }
 });
 
-test("the Codex log scanner factory binds exactly the eight source operations", () => {
+test("the Codex log scanner factory binds exactly the nine source operations", () => {
   const filesystem = Object.fromEntries([
     "createSha256",
     "currentUid",
@@ -221,6 +225,7 @@ test("the Codex log scanner factory binds exactly the eight source operations", 
     "lstatPath",
     "openDirectory",
     "openReadOnlyNoFollow",
+    "readSelectedRolloutNames",
     "readUtf8LinesRange",
     "readUtf8Range",
     "statPath",

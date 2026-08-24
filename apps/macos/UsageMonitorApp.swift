@@ -133,6 +133,9 @@ private enum NativeDashboardEvidenceState: Equatable {
 private struct NativeHistoryIndexingCoverage: Equatable {
     let indexedSourceCount: Int
     let sourceCount: Int
+    let skippedSourceCount: Int
+    let skippedThreadCount: Int
+    let partialTerminal: Bool
 
     var isComplete: Bool {
         indexedSourceCount >= sourceCount
@@ -155,10 +158,17 @@ private enum NativeHistoryIndexingObservation: Equatable {
 /// free-form failure text.
 private struct NativeRefreshFailure: Equatable {
     let failedStep: String?
+    let failureCode: String?
+
+    var suppressesAutomaticRetry: Bool {
+        guard let failureCode else { return false }
+        return LocalCompanionEvidenceReader.rolloutIntegrityFailureCodes
+            .contains(failureCode)
+    }
 }
 
 private enum NativeRefreshTerminalObservation: Equatable {
-    case failed(step: String?)
+    case failed(step: String?, code: String?)
     case notFailed
 }
 
@@ -186,6 +196,15 @@ private enum NativeToolbarStatusText {
         guard let step else { return "Refresh failed" }
         return "Refresh failed: \(step)"
     }
+
+    static func historyPartial(
+        skippedSourceCount: Int,
+        skippedThreadCount: Int
+    ) -> String {
+        let sourceNoun = skippedSourceCount == 1 ? "source" : "sources"
+        let threadNoun = skippedThreadCount == 1 ? "thread" : "threads"
+        return "History partial: \(skippedSourceCount) \(sourceNoun), \(skippedThreadCount) \(threadNoun) skipped"
+    }
 }
 
 /// Toolbar-pill facts the shared menu-bar projection intentionally leaves
@@ -202,6 +221,14 @@ private extension LocalCompanionEvidenceReader {
         "archive_index",
         "unified_index",
         "assemble",
+    ]
+    static let rolloutIntegrityFailureCodes: Set<String> = [
+        "codex_rollout_compression_unsupported",
+        "codex_rollout_filename_identity_mismatch",
+        "codex_rollout_generation_ambiguous",
+        "codex_rollout_lineage_invalid",
+        "codex_rollout_content_invalid",
+        "codex_rollout_tail_incomplete",
     ]
 
     func readHistoryIndexingCoverage(
@@ -267,9 +294,17 @@ private extension LocalCompanionEvidenceReader {
         else {
             return .notIndexing
         }
+        let skippedSources = (history["skippedSourceCount"] as? NSNumber)?
+            .intValue ?? 0
+        let skippedThreads = (history["skippedThreadCount"] as? NSNumber)?
+            .intValue ?? 0
         return .indexing(NativeHistoryIndexingCoverage(
             indexedSourceCount: indexed,
-            sourceCount: total
+            sourceCount: total,
+            skippedSourceCount: max(0, skippedSources),
+            skippedThreadCount: max(0, skippedThreads),
+            partialTerminal: history["phase"] as? String
+                == "partial_terminal"
         ))
     }
 
@@ -283,11 +318,17 @@ private extension LocalCompanionEvidenceReader {
         else {
             return nil
         }
-        guard status == "failed" else { return .notFailed }
+        guard ["failed", "degraded"].contains(status) else {
+            return .notFailed
+        }
         let step = refresh["failedStep"] as? String
+        let rawCode = refresh["failureCode"] as? String
         return .failed(
             step: step.flatMap {
                 Self.refreshFailureSteps.contains($0) ? $0 : nil
+            },
+            code: rawCode.flatMap {
+                Self.rolloutIntegrityFailureCodes.contains($0) ? $0 : nil
             }
         )
     }
@@ -4745,6 +4786,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private func refreshLocalUsage(automatic: Bool) {
         guard !quitting,
               !nativeRefreshInFlight,
+              !(automatic
+                && nativeRefreshFailure?.suppressesAutomaticRetry == true),
               let dashboardURL
         else {
             return
@@ -4933,9 +4976,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             self.nativeEvidenceReader.readRefreshTerminalObservation(base: base) { [weak self] terminal in
                 guard let self, !self.quitting else { return }
                 switch terminal {
-                case let .failed(step):
+                case let .failed(step, code):
                     self.nativeRefreshFailure = NativeRefreshFailure(
-                        failedStep: step
+                        failedStep: step,
+                        failureCode: code
                     )
                 case .notFailed:
                     self.nativeRefreshFailure = nil
@@ -4982,7 +5026,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     /// background worker or keeps the app alive after quit.
     private func scheduleNativeRefresh() {
         cancelNativeRefreshSchedule()
-        guard !quitting, dashboardURL != nil else { return }
+        guard !quitting,
+              dashboardURL != nil,
+              nativeRefreshFailure?.suppressesAutomaticRetry != true
+        else {
+            return
+        }
         let work = NativeForegroundRefreshScheduler.schedule { [weak self] in
             self?.refreshLocalUsage(automatic: true)
         }
@@ -5008,7 +5057,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         guard !quitting,
               dashboardURL != nil,
               let coverage = nativeHistoryIndexingCoverage,
-              !coverage.isComplete
+              !coverage.isComplete,
+              !coverage.partialTerminal
         else {
             return
         }
@@ -5636,16 +5686,29 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         // index that is still building must narrate its real progress rather
         // than hiding behind a bare "Status". Once coverage is complete and
         // the last refresh succeeded, the existing vocabulary returns.
+        if nativeRefreshFailure?.suppressesAutomaticRetry == true,
+           let coverage = nativeHistoryIndexingCoverage,
+           coverage.partialTerminal {
+            return NativeToolbarStatusText.historyPartial(
+                skippedSourceCount: coverage.skippedSourceCount,
+                skippedThreadCount: coverage.skippedThreadCount
+            )
+        }
         if let failure = nativeRefreshFailure {
             return NativeToolbarStatusText.refreshFailed(
                 step: failure.failedStep
             )
         }
         if let coverage = nativeHistoryIndexingCoverage, !coverage.isComplete {
-            return NativeToolbarStatusText.indexing(
-                indexedSourceCount: coverage.indexedSourceCount,
-                sourceCount: coverage.sourceCount
-            )
+            return coverage.partialTerminal
+                ? NativeToolbarStatusText.historyPartial(
+                    skippedSourceCount: coverage.skippedSourceCount,
+                    skippedThreadCount: coverage.skippedThreadCount
+                )
+                : NativeToolbarStatusText.indexing(
+                    indexedSourceCount: coverage.indexedSourceCount,
+                    sourceCount: coverage.sourceCount
+                )
         }
         switch nativeEvidenceState {
         case .live:

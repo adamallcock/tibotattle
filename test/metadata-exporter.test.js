@@ -245,7 +245,7 @@ test("same-session tool records without provider IDs remain separate physical oc
   }
 });
 
-test("distinct rollout files claiming one session identity fail closed instead of dropping one occurrence", async () => {
+test("unexplained noncanonical rollouts claiming one session fail once with a fixed content-free code", async () => {
   const home = await mkdtemp(join(tmpdir(), "app-usagemonitor-duplicate-session-"));
   await mkdir(join(home, "sessions"), { recursive: true });
   const lines = [
@@ -265,7 +265,18 @@ test("distinct rollout files claiming one session identity fail closed instead o
         bundleId: BUNDLE_ID,
         createdAt: CREATED_AT,
       }),
-      /Ambiguous duplicate Codex session identity/,
+      (error) => {
+        assert.equal(error?.name, "CodexRolloutCoverageError");
+        assert.equal(error?.code, "codex_rollout_generation_ambiguous");
+        assert.deepEqual(error?.coverage, {
+          skippedSourceCount: 2,
+          skippedSourceBytes: Buffer.byteLength(`${lines.join("\n")}\n`) * 2,
+          skippedThreadCount: 1,
+          reasonCounts: { codex_rollout_generation_ambiguous: 1 },
+        });
+        assert.equal(error?.message.includes("duplicated-session"), false);
+        return true;
+      },
     );
   } finally {
     await rm(home, { recursive: true, force: true });

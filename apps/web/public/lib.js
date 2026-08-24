@@ -395,6 +395,65 @@ export function refreshNeedsContinuation({
     || (outcome === "failed" && errorCode === "refresh_timed_out");
 }
 
+function historyProgressNumber(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function historyProgressToken(value) {
+  if (Number.isSafeInteger(value) && value >= 0) return value;
+  return typeof value === "string" && /^[A-Za-z0-9._:-]{1,128}$/u.test(value)
+    ? value
+    : null;
+}
+
+/**
+ * Decide whether the browser may automatically start another archive-index
+ * pass. A terminal partial generation is useful verified evidence, but never
+ * advancing work. An incomplete pass may continue only when its closed,
+ * content-free receipt differs from the receipt visible before the last pass.
+ */
+export function historyIndexContinuationDecision({
+  history = null,
+  generation = null,
+  generationFingerprint = null,
+  previousReceipt = null,
+} = {}) {
+  const safeHistory = history !== null
+      && typeof history === "object"
+      && !Array.isArray(history)
+    ? history
+    : null;
+  const indexedSourceCount = historyProgressNumber(
+    safeHistory?.indexedSourceCount,
+  );
+  const sourceCount = historyProgressNumber(safeHistory?.sourceCount);
+  const receipt = safeHistory === null
+    ? null
+    : JSON.stringify([
+      typeof safeHistory.phase === "string" ? safeHistory.phase : null,
+      indexedSourceCount,
+      historyProgressNumber(safeHistory.indexedBytes),
+      sourceCount,
+      historyProgressNumber(safeHistory.sourceBytes),
+      historyProgressToken(generation),
+      historyProgressToken(generationFingerprint),
+    ]);
+  const terminalGap = safeHistory?.status === "partial"
+    && safeHistory?.phase === "partial_terminal";
+  const incomplete = safeHistory?.status !== "complete"
+    && !terminalGap
+    && indexedSourceCount !== null
+    && sourceCount !== null
+    && sourceCount > 0
+    && indexedSourceCount < sourceCount;
+  return Object.freeze({
+    incomplete,
+    receipt,
+    terminalGap,
+    shouldContinue: incomplete && receipt !== previousReceipt,
+  });
+}
+
 export function formatTokenTotal(usage) {
   const total = usage.inputUncachedTokens
     + usage.inputCachedTokens

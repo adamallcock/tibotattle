@@ -172,6 +172,7 @@ export const WEB_MESSAGES = Object.freeze({
   "language.changed": ["Language changed to {language}.", "语言已切换为{language}。", "Idioma cambiado a {language}."],
   "status.fresh": ["Fresh", "最新", "Actualizado"],
   "status.indexingHistory": ["Indexing history · {indexed} of {total}", "正在索引历史 · {indexed}/{total}", "Indexando historial · {indexed} de {total}"],
+  "status.historyPartial": ["History partial · {skipped} skipped", "历史记录不完整 · 已跳过 {skipped} 个来源", "Historial parcial · {skipped} fuentes omitidas"],
   "status.running": ["Running", "运行中", "En ejecución"],
   "status.upToDate": ["Up to date", "已是最新", "Actualizado"],
   "status.updating": ["Updating", "正在更新", "Actualizando"],
@@ -255,6 +256,16 @@ export const WEB_MESSAGES = Object.freeze({
     "尚未索引你更早的历史记录",
     "Tu historial anterior aún no se ha indexado",
   ],
+  "dashboard.history.partialHeadline": [
+    "Partial local history · {sources} quarantined",
+    "本地历史记录不完整 · 已隔离 {sources}",
+    "Historial local parcial · {sources} en cuarentena",
+  ],
+  "dashboard.history.partialSources": [
+    "Indexed {indexed} of {total} discovered sources ({bytesIndexed} of {bytesTotal}). Verified figures exclude {sources} in quarantine; the gap remains explicit.",
+    "已索引 {total} 个已发现来源中的 {indexed} 个（{bytesIndexed}/{bytesTotal}）。已验证的数字不包含已隔离的 {sources}；该缺口会保持明确标示。",
+    "Fuentes indexadas: {indexed} de {total} ({bytesIndexed} de {bytesTotal}). Las cifras verificadas excluyen {sources} en cuarentena; la brecha permanece explícita.",
+  ],
   "dashboard.history.indexingSources": [
     "{indexed} of {total} discovered sources indexed ({bytesIndexed} of {bytesTotal}). Every figure on this page is drawn from that share and will change as the index advances.",
     "已索引 {total} 个已发现来源中的 {indexed} 个（{bytesIndexed}/{bytesTotal}）。本页的每个数字都基于这一部分，并会随着索引推进而变化。",
@@ -274,6 +285,26 @@ export const WEB_MESSAGES = Object.freeze({
     "Indexing continues on the next update; no completion time is known.",
     "索引将在下次更新时继续；完成时间未知。",
     "La indexación continúa en la próxima actualización; no se conoce la hora de finalización.",
+  ],
+  "refresh.degradedLoading": [
+    "Loading verified partial evidence…",
+    "正在加载已验证的部分证据…",
+    "Cargando evidencia parcial verificada…",
+  ],
+  "refresh.degradedTitle": [
+    "Local analysis finished with a known history gap",
+    "本地分析已完成，但存在已知历史缺口",
+    "El análisis local terminó con una brecha histórica conocida",
+  ],
+  "refresh.degradedCopy": [
+    "Verified totals remain available. TiboTattle quarantined {sources} across {threads} after an integrity check; the missing portion is not shown as zero. Automatic retries have stopped; use the explicit update after the source files change or whenever you want to check again.",
+    "已验证的总计仍然可用。完整性检查后，TiboTattle 隔离了 {threads} 中的 {sources}；缺失部分不会显示为零。自动重试已停止；来源文件发生变化后，或你想再次检查时，请使用明确的更新操作。",
+    "Los totales verificados siguen disponibles. Tras una comprobación de integridad, TiboTattle puso en cuarentena {sources} de {threads}; la parte ausente no se muestra como cero. Los reintentos automáticos se han detenido; usa la actualización explícita cuando cambien los archivos de origen o cuando quieras comprobar de nuevo.",
+  ],
+  "refresh.degradedGenericCopy": [
+    "Verified headline evidence remains available, but the unified history step ended in a fixed degraded state ({code}). Automatic retries have stopped; an explicit retry remains available.",
+    "已验证的概要证据仍然可用，但统一历史步骤以固定的降级状态结束（{code}）。自动重试已停止；仍可明确重试。",
+    "La evidencia resumida verificada sigue disponible, pero el paso de historial unificado terminó en un estado degradado fijo ({code}). Los reintentos automáticos se han detenido; aún puedes reintentar expresamente.",
   ],
   // Why the replay-safe accounting artifacts are missing when the rebuild has
   // deferred repeatedly: the rebuild misses its memory ceiling, softly, and
@@ -1320,6 +1351,18 @@ export function translate(key, values = {}, locale = DEFAULT_LOCALE) {
 // plural category through Intl.PluralRules, while catalog entries retain the
 // same locale-column convention as WEB_MESSAGES.
 export const WEB_PLURAL_MESSAGES = Object.freeze({
+  "format.rolloutSourceCount": Object.freeze({
+    one: ["{count} rollout source", "{count} 个 rollout 来源", "{count} fuente rollout"],
+    other: ["{count} rollout sources", "{count} 个 rollout 来源", "{count} fuentes rollout"],
+  }),
+  "format.affectedThreadCount": Object.freeze({
+    one: ["{count} affected thread", "受影响的 {count} 个线程", "{count} hilo afectado"],
+    other: ["{count} affected threads", "受影响的 {count} 个线程", "{count} hilos afectados"],
+  }),
+  "dashboard.history.partialNote": Object.freeze({
+    one: ["The indexed totals remain usable, but {count} affected thread is a known gap, not zero usage. Retry only after the local rollout files change.", "已索引的总计仍然可用，但受影响的 {count} 个线程是已知缺口，并不代表零使用量。仅在本地 rollout 文件发生变化后重试。", "Los totales indexados siguen siendo utilizables, pero {count} hilo afectado es una brecha conocida, no uso cero. Reinténtalo solo después de que cambien los archivos rollout locales."],
+    other: ["The indexed totals remain usable, but {count} affected threads are a known gap, not zero usage. Retry only after the local rollout files change.", "已索引的总计仍然可用，但受影响的 {count} 个线程是已知缺口，并不代表零使用量。仅在本地 rollout 文件发生变化后重试。", "Los totales indexados siguen siendo utilizables, pero {count} hilos afectados son una brecha conocida, no uso cero. Reinténtalo solo después de que cambien los archivos rollout locales."],
+  }),
   "accounting.sideChat.coverageRetentionLimit": Object.freeze({
     one: ["{count} retained side-chat partition reached the local 1,000-row retention limit, so earlier evidence in it may be missing.", "{count} 个保留的侧聊分区已达到本地 1,000 行保留上限，因此其中较早的证据可能缺失。", "{count} partición conservada alcanzó el límite local de 1.000 filas, por lo que puede faltar evidencia anterior."],
     other: ["{count} retained side-chat partitions reached the local 1,000-row retention limit, so earlier evidence in them may be missing.", "{count} 个保留的侧聊分区已达到本地 1,000 行保留上限，因此其中较早的证据可能缺失。", "{count} particiones conservadas alcanzaron el límite local de 1.000 filas, por lo que puede faltar evidencia anterior."],

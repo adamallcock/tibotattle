@@ -4981,7 +4981,7 @@ function normalizeQuota(window, index) {
 }
 
 function normalizeHistoryCoverage(value = {}) {
-  const phase = [
+  const admittedPhase = [
     "complete",
     "idle",
     "awaiting_resume",
@@ -4993,8 +4993,11 @@ function normalizeHistoryCoverage(value = {}) {
   const sourceCount = count(value?.sourceCount, null);
   const indexedSourceCount = count(value?.indexedSourceCount, null);
   const pendingSourceCount = count(value?.pendingSourceCount, null);
+  const skippedSourceCount = count(value?.skippedSourceCount, null);
+  const skippedThreadCount = count(value?.skippedThreadCount, null);
   const sourceBytes = count(value?.sourceBytes, null);
   const indexedBytes = count(value?.indexedBytes, null);
+  const skippedSourceBytes = count(value?.skippedSourceBytes, null);
   const generatedAt = canonicalInstant(value?.generatedAt);
   const coveredStartAt = canonicalInstant(value?.coveredAt?.startAt);
   const coveredEndAt = canonicalInstant(value?.coveredAt?.endAt);
@@ -5009,6 +5012,28 @@ function normalizeHistoryCoverage(value = {}) {
   ].includes(value?.errorCode)
     ? value.errorCode
     : null;
+  // `partial_terminal` is the one non-progress state whose missing sources
+  // remain intentionally visible. Admit it only with a coherent quarantine
+  // receipt: otherwise an arbitrary partial payload could turn off automatic
+  // refreshes or manufacture a skipped-source explanation in the browser.
+  const terminalGap = value?.status === "partial"
+    && value?.phase === "partial_terminal"
+    && errorCode === null
+    && sourceCount !== null
+    && sourceCount > 0
+    && indexedSourceCount !== null
+    && pendingSourceCount === 0
+    && skippedSourceCount !== null
+    && skippedSourceCount > 0
+    && indexedSourceCount + skippedSourceCount === sourceCount
+    && skippedThreadCount !== null
+    && skippedThreadCount > 0
+    && skippedThreadCount <= skippedSourceCount
+    && sourceBytes !== null
+    && indexedBytes !== null
+    && skippedSourceBytes !== null
+    && indexedBytes + skippedSourceBytes === sourceBytes;
+  const phase = terminalGap ? "partial_terminal" : admittedPhase;
   const coherent = sourceCount !== null
     && indexedSourceCount !== null
     && pendingSourceCount !== null
@@ -5039,6 +5064,9 @@ function normalizeHistoryCoverage(value = {}) {
     pendingSourceCount: sourceCount === null || pendingSourceCount === null
       ? 0
       : Math.min(pendingSourceCount, sourceCount),
+    skippedSourceCount: terminalGap ? skippedSourceCount : 0,
+    skippedSourceBytes: terminalGap ? skippedSourceBytes : 0,
+    skippedThreadCount: terminalGap ? skippedThreadCount : 0,
     sourceBytes: sourceBytes ?? 0,
     indexedBytes: sourceBytes === null || indexedBytes === null
       ? 0

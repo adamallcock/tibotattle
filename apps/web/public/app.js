@@ -24,6 +24,7 @@ import {
   diagnosticErrorCode,
   diagnosticReferenceSentence,
   diagnosticSurface,
+  historyIndexContinuationDecision,
   isContributionReviewableQueueState,
   refreshNeedsContinuation,
   serviceRequestId,
@@ -254,6 +255,7 @@ let reindexAutoContinuations = 0;
 const REINDEX_AUTO_CONTINUE_LIMIT = 40;
 const REINDEX_AUTO_CONTINUE_DELAY_MS = 1_500;
 let reindexAutoContinueTimer = null;
+let lastReindexProgressReceipt = null;
 // The short read-only polling loop behind the live first-pass status line.
 // setTimeout-chained (never an interval), bounded, and it only ever performs
 // the same GET the page performs on load.
@@ -797,16 +799,21 @@ function renderHistoryIndexBadge(data) {
   const total = finite(history?.sourceCount, null);
   const complete = history?.status === "complete"
     || (indexed !== null && total !== null && total > 0 && indexed >= total);
+  const partialTerminal = history?.phase === "partial_terminal";
   if (data?.mode === "demo" || complete
       || indexed === null || total === null || total <= 0) {
     badge.hidden = true;
     return;
   }
   badge.hidden = false;
-  setRawText(badge, t("status.indexingHistory", {
-    indexed: compact(indexed),
-    total: compact(total),
-  }));
+  setRawText(badge, partialTerminal
+    ? t("status.historyPartial", {
+      skipped: compact(history?.skippedSourceCount ?? 0),
+    })
+    : t("status.indexingHistory", {
+      indexed: compact(indexed),
+      total: compact(total),
+    }));
 }
 
 function renderGlobalState() {
@@ -1398,43 +1405,72 @@ function renderHistoryProgress(data) {
     ?? null;
   const total = finite(history?.sourceCount, 0);
   const indexed = finite(history?.indexedSourceCount, 0);
+  const partialTerminal = history?.phase === "partial_terminal";
   if (history === null || history.status === "complete" || total <= 0) {
     container.hidden = true;
     return false;
   }
   container.hidden = false;
   const percent = (indexed / total) * 100;
-  setLocalizedText(
-    $("#history-progress-headline"),
-    archiveHistoryScanActive
+  const skippedSourceCount = finite(history?.skippedSourceCount, 0);
+  const skippedSources = tPlural(
+    "format.rolloutSourceCount",
+    skippedSourceCount,
+    { count: formatNumber(skippedSourceCount) },
+  );
+  if (partialTerminal) {
+    setRawText(
+      $("#history-progress-headline"),
+      t("dashboard.history.partialHeadline", {
+        sources: skippedSources,
+      }),
+    );
+  } else {
+    setLocalizedText(
+      $("#history-progress-headline"),
+      archiveHistoryScanActive
       ? "dashboard.history.indexingActive"
       : history.phase === "not_started"
         ? "dashboard.history.indexingNotStarted"
         : "dashboard.history.indexingPaused",
-    { percent: formatPercent(percent, 1) },
-  );
+      { percent: formatPercent(percent, 1) },
+    );
+  }
   container.classList.toggle("active", archiveHistoryScanActive);
   const track = $("#history-progress-track");
   track.setAttribute("aria-valuenow", String(Math.round(percent)));
-  // The bar alone would announce a bare percentage. The counted sources are
-  // the fact worth hearing, so they are what it reports.
-  track.setAttribute("aria-valuetext", t("dashboard.history.indexingSources", {
+  const coverageKey = partialTerminal
+    ? "dashboard.history.partialSources"
+    : "dashboard.history.indexingSources";
+  const coverageValues = {
     bytesIndexed: formatBytes(history.indexedBytes),
     bytesTotal: formatBytes(history.sourceBytes),
     indexed: formatNumber(indexed),
     total: formatNumber(total),
-  }));
+    sources: skippedSources,
+  };
+  // The bar alone would announce a bare percentage. The counted sources are
+  // the fact worth hearing, so they are what it reports.
+  track.setAttribute("aria-valuetext", t(coverageKey, coverageValues));
   // A started-but-tiny index must still be visibly non-empty, or 2.7% reads as
   // "nothing has happened".
   $("#history-progress-fill").style.width =
     `${indexed > 0 ? Math.max(1.5, percent) : 0}%`;
-  setLocalizedText($("#history-progress-detail"), "dashboard.history.indexingSources", {
-    bytesIndexed: formatBytes(history.indexedBytes),
-    bytesTotal: formatBytes(history.sourceBytes),
-    indexed: formatNumber(indexed),
-    total: formatNumber(total),
-  });
-  setLocalizedText($("#history-progress-note"), "dashboard.history.indexingResumes");
+  setLocalizedText($("#history-progress-detail"), coverageKey, coverageValues);
+  if (partialTerminal) {
+    const affectedThreads = finite(history?.skippedThreadCount, 0);
+    setRawText(
+      $("#history-progress-note"),
+      tPlural("dashboard.history.partialNote", affectedThreads, {
+        count: formatNumber(affectedThreads),
+      }),
+    );
+  } else {
+    setLocalizedText(
+      $("#history-progress-note"),
+      "dashboard.history.indexingResumes",
+    );
+  }
   return true;
 }
 
@@ -10675,13 +10711,24 @@ async function refreshDashboardAfterFastModeChange() {
  */
 function historyIndexIncomplete() {
   if (!dashboard || dashboard.mode === "demo") return false;
+  return currentHistoryContinuationDecision().incomplete;
+}
+
+function currentHistoryContinuationDecision() {
   const history = dashboard?.pricing?.historyCoverage
     ?? dashboard?.accounting?.historyCoverage
     ?? null;
-  const indexed = finite(history?.indexedSourceCount, null);
-  const total = finite(history?.sourceCount, null);
-  if (history?.status === "complete") return false;
-  return indexed !== null && total !== null && total > 0 && indexed < total;
+  return historyIndexContinuationDecision({
+    history,
+    generation: dashboard?.accounting?.generation ?? null,
+    generationFingerprint:
+      dashboard?.accounting?.generationFingerprint ?? null,
+    previousReceipt: lastReindexProgressReceipt,
+  });
+}
+
+function historyProgressReceipt() {
+  return currentHistoryContinuationDecision().receipt;
 }
 
 /**
@@ -10696,10 +10743,14 @@ function scheduleReindexAutoContinuation() {
     clearTimeout(reindexAutoContinueTimer);
     reindexAutoContinueTimer = null;
   }
-  if (!historyIndexIncomplete()) {
+  const decision = currentHistoryContinuationDecision();
+  if (!decision.incomplete) {
     reindexAutoContinuations = 0;
+    lastReindexProgressReceipt = null;
     return;
   }
+  if (!decision.shouldContinue) return;
+  lastReindexProgressReceipt = decision.receipt;
   if (reindexAutoContinuations >= REINDEX_AUTO_CONTINUE_LIMIT) return;
   reindexAutoContinueTimer = setTimeout(() => {
     reindexAutoContinueTimer = null;
@@ -10714,6 +10765,11 @@ function scheduleReindexAutoContinuation() {
 
 async function requestRefresh({ autoContinue = false } = {}) {
   if (localActionBusy) return;
+  // Fence continuation against the exact coverage visible before this pass.
+  // If the terminal reload presents the same generation/count/byte receipt,
+  // scheduleReindexAutoContinuation stops immediately instead of spending the
+  // rest of its 40-pass budget on identical work.
+  lastReindexProgressReceipt = historyProgressReceipt();
   // A person pressing Refresh restarts the auto-continuation budget; a chained
   // reindex pass keeps counting toward the bound set when it began.
   if (!autoContinue) reindexAutoContinuations = 0;
@@ -10750,6 +10806,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
     let finalErrorCode = null;
     let finalFailedStep = null;
     let finalFailureCode = null;
+    let finalUnifiedIndex = null;
     let pollCount = 0;
     let timeoutSettlementNoted = false;
     while (pollingBudget.hasTime()
@@ -10771,6 +10828,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
       finalErrorCode = refresh.errorCode ?? null;
       finalFailedStep = refresh.failedStep ?? finalFailedStep;
       finalFailureCode = refresh.failureCode ?? finalFailureCode;
+      finalUnifiedIndex = refresh.result?.unifiedIndex ?? finalUnifiedIndex;
       const progress = refresh.progress ?? refresh.result?.indexing ?? null;
       const archiveScanning = progress?.kind === "archive_index";
       if (archiveScanning && !archiveHistoryScanActive) {
@@ -10863,6 +10921,36 @@ async function requestRefresh({ autoContinue = false } = {}) {
       showConnectionNotice({
         title: "This scan paused to protect your Mac",
         copy: "Your last verified results are still shown. This unusually large history reached TiboTattle’s fixed local safety limit, so it paused before exceeding it. No partial result replaced your existing results, and nothing left this Mac.",
+        kind: "warning",
+      });
+      return;
+    }
+    if (outcome === "degraded") {
+      button.textContent = t("refresh.degradedLoading");
+      await loadLocalDashboard();
+      lastReindexProgressReceipt = historyProgressReceipt();
+      const skipped = finite(
+        finalUnifiedIndex?.generation?.skippedSourceCount,
+        0,
+      );
+      const threads = finite(
+        finalUnifiedIndex?.generation?.skippedThreadCount,
+        0,
+      );
+      showConnectionNotice({
+        title: t("refresh.degradedTitle"),
+        copy: skipped > 0
+          ? t("refresh.degradedCopy", {
+            sources: tPlural("format.rolloutSourceCount", skipped, {
+              count: formatNumber(skipped),
+            }),
+            threads: tPlural("format.affectedThreadCount", threads, {
+              count: formatNumber(threads),
+            }),
+          })
+          : t("refresh.degradedGenericCopy", {
+            code: finalFailureCode ?? "unified_index",
+          }),
         kind: "warning",
       });
       return;
@@ -11019,9 +11107,11 @@ function scheduleReturningUserRefresh() {
       || dashboard?.collector?.lastScanAt
       || dashboard?.freshness?.latestObservedAt
     );
+  const terminalHistoryGap = currentHistoryContinuationDecision().terminalGap;
   if (returnRefreshScheduled
       || !priorEvidence
       || !localAnalysisAllowed()
+      || terminalHistoryGap
       || localRefreshInProgress) {
     return;
   }
