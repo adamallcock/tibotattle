@@ -4,7 +4,10 @@ on:
   pull_request:
     paths:
       - ".github/**"
+      - "CHANGELOG.md"
       - "config/release-evidence.js"
+      - "release-notes/**"
+      - "scripts/check-release-notes.mjs"
       - "schemas/release-evidence-v1/**"
       - "scripts/check-release-workflow-policy.mjs"
       - "scripts/release-attestation-evidence.mjs"
@@ -29,7 +32,10 @@ on:
       - main
     paths:
       - ".github/**"
+      - "CHANGELOG.md"
       - "config/release-evidence.js"
+      - "release-notes/**"
+      - "scripts/check-release-notes.mjs"
       - "schemas/release-evidence-v1/**"
       - "scripts/check-release-workflow-policy.mjs"
       - "scripts/release-attestation-evidence.mjs"
@@ -86,6 +92,9 @@ jobs:
 
       - name: Enforce immutable workflow dependencies and runner policy
         run: node ./scripts/check-release-workflow-policy.mjs
+
+      - name: Check release documentation
+        run: node ./scripts/check-release-notes.mjs
 
       - name: Test release evidence and attestation contracts
         run: node --test test/release-workflow-policy.test.js test/release-evidence.test.js test/release-attestation-action.test.js test/release-sbom-action.test.js

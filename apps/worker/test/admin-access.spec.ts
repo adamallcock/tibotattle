@@ -4,6 +4,9 @@ import type { D1Migration } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { clearAdminAccessJwksCacheForTests } from "../src/admin-access";
+import {
+  warmAdminCommunityAllowancePreviewCache,
+} from "../src/admin-community-allowance";
 import { adminHostname } from "../src/admin-ui";
 import { handleRequest } from "../src/index";
 
@@ -370,6 +373,11 @@ describe("admin surface hostname gating", () => {
   });
 
   it("serves the allowance merge preview only through the authenticated admin host", async () => {
+    expect((await warmAdminCommunityAllowancePreviewCache(
+      testBindings().USAGE_MONITOR_DB,
+      Date.now(),
+    )).code).toBe("ALLOWANCE_PREVIEW_CACHE_REFRESHED");
+
     const response = await handleRequest(
       new Request(`${ADMIN_ORIGIN}/api/v1/admin/community/allowance-preview`, {
         headers: { "cf-access-jwt-assertion": await signedAccessJwt() },

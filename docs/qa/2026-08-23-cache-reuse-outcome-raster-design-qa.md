@@ -1,18 +1,26 @@
+---
+title: Cache reuse outcome raster design QA
+date: 2026-08-23
+type: qa
+status: passed
+---
+
 # Cache reuse outcome raster design QA
 
-Date: 2026-08-23
+This receipt records a source-level browser comparison. The temporary captures
+used during the review were not committed, so the measurements and findings
+below are retained as review evidence but are not independently replayable
+visual artifacts.
 
 ## Comparison target
 
-- Source visual truth: the user's Browser annotation and the matching nested
-  source-state capture at
-  `/private/tmp/cache-reuse-source-nested-701x737.jpg`.
-- Final implementation:
-  `/private/tmp/cache-reuse-implementation-standalone-701x737.jpg`.
-- Side-by-side comparison:
-  `/private/tmp/cache-reuse-placement-comparison-701x737.jpg`.
-- Focused final placement:
-  `/private/tmp/cache-reuse-standalone-with-evidence-disclosure-701x737.jpg`.
+- Source visual truth: the user's Browser annotation and a matching nested
+  source-state capture.
+- Final implementation: the standalone cache-reuse outcome view, including a
+  focused capture with the separate evidence disclosure visible.
+- Comparison method: equal-size side-by-side local captures with no scaling.
+- Capture retention: the four temporary comparison files were not retained in
+  the repository; their machine-local paths are intentionally omitted.
 - Viewport: 701 × 737 CSS pixels at a reported device pixel ratio of 2.66.
 - Source and implementation captures: 702 × 738 pixels each. The combined
   comparison is 1,404 × 738 pixels with no scaling between sides.

@@ -44,10 +44,17 @@ A version bump is **not** just package.json. Bump or regenerate all of:
 5. The worker workspace copies with cd apps/worker && npm ci; they are copies,
    not symlinks, and stale copies make the worker check and bundle use old
    package versions.
+6. `release-notes/X.Y.Z.md` with the reviewed user-facing release body, and a
+   dated `CHANGELOG.md` entry linking to it. The entry must link the future
+   GitHub Release, annotated source tag, and exact previous-tag comparison.
+   Add only publicly verifiable PR/issue credits, label source-only or open
+   boundaries explicitly, and move shipped items out of `Unreleased`. Do not
+   reconstruct claims or attribution that were not validated.
 
 Run the release preflight before tagging:
 
 ~~~bash
+node scripts/check-release-notes.mjs
 npm test
 npm run product:worker:check
 npm run architecture:check
@@ -456,6 +463,12 @@ test "$(gh release view "$TAG" --repo "$REPO" --json tagName --jq '.tagName')" =
 test "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq '.isDraft')" = "false"
 test "$(gh release view "$TAG" --repo "$REPO" --json isImmutable --jq '.isImmutable')" = "true"
 ~~~
+
+Confirm that the published UTC calendar date matches the `CHANGELOG.md`
+heading, the published body matches `release-notes/X.Y.Z.md` apart from a
+conventional terminal newline, and every release/tag/comparison/reference link
+opens the intended public record. Do not convert a related issue into a closed
+claim unless GitHub shows it closed.
 
 Now run GitHub's release-level checks for the published release. Download every
 published asset again into a new directory; never reuse the draft download for
