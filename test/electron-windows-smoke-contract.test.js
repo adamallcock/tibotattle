@@ -10,6 +10,7 @@ import {
   attachSmokeChildErrorBoundary,
   attachSmokeMonitorRejectionBoundary,
   aggregate,
+  advanceWindowsDashboardCheckpoint,
   buildPackagedElectronArgs,
   classifyAutomaticStartupRefreshReceipt,
   classifyWindowsSmokeStartupGateResult,
@@ -625,6 +626,10 @@ test("Windows dashboard checkpoints are fixed, content-free, and retained on fai
     "frame_unavailable",
     "renderer_not_ready",
     "dashboard_ready",
+    "startup_gate_released",
+    "startup_refresh_request_observed",
+    "startup_refresh_receipt_accepted",
+    "startup_refresh_terminal_succeeded",
   ]);
   for (const checkpoint of WINDOWS_ELECTRON_SMOKE_DASHBOARD_CHECKPOINT_ALLOWLIST) {
     assert.equal(normalizeWindowsDashboardCheckpoint(checkpoint), checkpoint);
@@ -650,6 +655,34 @@ test("Windows dashboard checkpoints are fixed, content-free, and retained on fai
   assert.doesNotMatch(
     JSON.stringify(failed),
     /(?:[A-Za-z]:[\\/]|127\.0\.0\.1|private|title|url|renderer content|\.log)/iu,
+  );
+});
+
+test("Windows dashboard checkpoints advance monotonically through startup proof", () => {
+  const checkpoints = WINDOWS_ELECTRON_SMOKE_DASHBOARD_CHECKPOINT_ALLOWLIST;
+  let current = checkpoints[0];
+  const observed = [];
+  for (const next of checkpoints.slice(1)) {
+    const advanced = advanceWindowsDashboardCheckpoint(current, next);
+    assert.equal(advanced, next);
+    observed.push(advanced);
+    current = advanced;
+  }
+  assert.deepEqual(observed, checkpoints.slice(1));
+  assert.equal(
+    advanceWindowsDashboardCheckpoint(
+      "startup_refresh_terminal_succeeded",
+      "dashboard_ready",
+    ),
+    "startup_refresh_terminal_succeeded",
+  );
+  assert.equal(
+    advanceWindowsDashboardCheckpoint("dashboard_ready", "not_started"),
+    "dashboard_ready",
+  );
+  assert.equal(
+    advanceWindowsDashboardCheckpoint("not_started", "not-a-checkpoint"),
+    "not_started",
   );
 });
 
@@ -692,6 +725,10 @@ test("Windows dashboard target polling remains strict and records checkpoint seq
     "await releaseWindowsSmokeRefreshGate(cdp)",
     connectionStart,
   );
+  const gateCheckpoint = source.indexOf(
+    'checkpoint("startup_gate_released")',
+    connectionStart,
+  );
   const automaticRefresh = source.indexOf(
     "await assertAutomaticStartupRefresh({",
     connectionStart,
@@ -703,8 +740,41 @@ test("Windows dashboard target polling remains strict and records checkpoint seq
   assert.ok(readyLoaderBinding > rendererReadyWait);
   assert.ok(originValidation > readyLoaderBinding);
   assert.ok(gateRelease > originValidation);
+  assert.ok(gateCheckpoint > gateRelease);
   assert.ok(automaticRefresh > gateRelease);
+  assert.ok(gateCheckpoint < automaticRefresh);
   assert.match(source, /dashboardUrl\.origin !== targetDashboardOrigin/u);
+});
+
+test("Windows startup checkpoint emissions are guarded and ordered", async () => {
+  const source = await readFile("scripts/smoke-electron-windows.mjs", "utf8");
+  const startupStart = source.indexOf("async function assertAutomaticStartupRefresh");
+  const startupEnd = source.indexOf("\nasync function dashboardConnection", startupStart);
+  assert.ok(startupStart >= 0 && startupEnd > startupStart);
+  const startup = source.slice(startupStart, startupEnd);
+  const request = startup.indexOf('onCheckpoint("startup_refresh_request_observed")');
+  const receipt = startup.indexOf('onCheckpoint("startup_refresh_receipt_accepted")');
+  const terminal = startup.indexOf('onCheckpoint("startup_refresh_terminal_succeeded")');
+  assert.ok(request >= 0);
+  assert.ok(receipt > request);
+  assert.ok(terminal > receipt);
+  assert.match(
+    startup.slice(Math.max(0, request - 300), request),
+    /requests\.length === 1/u,
+    "request checkpoint must require exactly one qualifying request",
+  );
+  assert.match(
+    startup.slice(Math.max(0, receipt - 500), receipt),
+    /decision\.status === "pending"/u,
+    "receipt checkpoint must follow receipt classification",
+  );
+  assert.match(
+    startup.slice(Math.max(0, terminal - 500), terminal),
+    /decision\.status === "pending"[\s\S]+?decision\.status === "failed"/u,
+    "terminal checkpoint must follow exact receipt completion checks",
+  );
+  assert.match(startup, /onCheckpoint = \(\) => \{\}/u);
+  assert.match(source, /progress\.dashboardCheckpoint !== "startup_refresh_terminal_succeeded"/u);
 });
 
 test("Windows preload startup gate requires one exact successful release", async () => {

@@ -94,6 +94,10 @@ const DASHBOARD_CHECKPOINT_ALLOWLIST = Object.freeze([
   "frame_unavailable",
   "renderer_not_ready",
   "dashboard_ready",
+  "startup_gate_released",
+  "startup_refresh_request_observed",
+  "startup_refresh_receipt_accepted",
+  "startup_refresh_terminal_succeeded",
 ]);
 const RECEIPT_KEYS = Object.freeze([
   "binding",
@@ -298,7 +302,7 @@ export function validateRuntimeEvidence(value) {
       || value.failureStage !== "none"
       || value.failureReason !== "none"
       || !DASHBOARD_CHECKPOINT_ALLOWLIST.includes(value.dashboardCheckpoint)
-      || value.dashboardCheckpoint !== "dashboard_ready"
+      || value.dashboardCheckpoint !== "startup_refresh_terminal_succeeded"
       || RUNTIME_KEYS
         .filter((key) => !["status", "target", "contentFree", "failureStage", "failureReason", "dashboardCheckpoint"].includes(key))
         .some((key) => value[key] !== true)) {

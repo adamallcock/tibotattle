@@ -391,16 +391,39 @@ export const WINDOWS_ELECTRON_SMOKE_DASHBOARD_CHECKPOINT_ALLOWLIST = Object.free
   "frame_unavailable",
   "renderer_not_ready",
   "dashboard_ready",
+  "startup_gate_released",
+  "startup_refresh_request_observed",
+  "startup_refresh_receipt_accepted",
+  "startup_refresh_terminal_succeeded",
 ]);
 
 const DASHBOARD_CHECKPOINT_SET = new Set(
   WINDOWS_ELECTRON_SMOKE_DASHBOARD_CHECKPOINT_ALLOWLIST,
+);
+const DASHBOARD_CHECKPOINT_RANK = new Map(
+  WINDOWS_ELECTRON_SMOKE_DASHBOARD_CHECKPOINT_ALLOWLIST
+    .map((checkpoint, index) => [checkpoint, index]),
 );
 
 export function normalizeWindowsDashboardCheckpoint(value) {
   return typeof value === "string" && DASHBOARD_CHECKPOINT_SET.has(value)
     ? value
     : "not_started";
+}
+
+/**
+ * Advance one content-free dashboard checkpoint without ever moving the
+ * aggregate backwards.  The same progress object is used for the initial
+ * launch and relaunch, so an otherwise healthy relaunch must not replace a
+ * completed startup receipt with an earlier readiness observation.
+ */
+export function advanceWindowsDashboardCheckpoint(current, next) {
+  const currentCheckpoint = normalizeWindowsDashboardCheckpoint(current);
+  const nextCheckpoint = normalizeWindowsDashboardCheckpoint(next);
+  return (DASHBOARD_CHECKPOINT_RANK.get(nextCheckpoint) ?? 0)
+    > (DASHBOARD_CHECKPOINT_RANK.get(currentCheckpoint) ?? 0)
+    ? nextCheckpoint
+    : currentCheckpoint;
 }
 
 /**
@@ -1814,9 +1837,11 @@ async function assertAutomaticStartupRefresh({
   dashboardUrl,
   refreshObserver,
   previousRefreshId = null,
+  onCheckpoint = () => {},
 }) {
   const refreshUrl = new URL("/api/local/refresh", dashboardUrl);
   let refreshId = null;
+  let requestObserved = false;
   await waitFor(async () => {
     if (childExited(child)) fail("WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_READY");
     const requests = refreshObserver.snapshot();
@@ -1828,6 +1853,10 @@ async function assertAutomaticStartupRefresh({
       previousRefreshId,
     });
     if (noReceiptDecision.status === "failed") fail(noReceiptDecision.errorCode);
+    if (requests.length === 1 && !requestObserved) {
+      requestObserved = true;
+      onCheckpoint("startup_refresh_request_observed");
+    }
     const status = await jsonFetch(
       refreshUrl,
       undefined,
@@ -1843,6 +1872,7 @@ async function assertAutomaticStartupRefresh({
     if (decision.status === "pending") return null;
     if (decision.status === "failed") fail(decision.errorCode);
     refreshId = decision.refreshId;
+    onCheckpoint("startup_refresh_receipt_accepted");
     return true;
   }, MAX_REFRESH_MS, "automatic startup refresh acceptance", "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT");
 
@@ -1872,6 +1902,7 @@ async function assertAutomaticStartupRefresh({
     });
     if (decision.status === "pending") return false;
     if (decision.status === "failed") fail(decision.errorCode);
+    onCheckpoint("startup_refresh_terminal_succeeded");
     return true;
   }, MAX_REFRESH_MS, "automatic startup refresh completion", "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT");
   // A completed pass may schedule an intentional bounded reindex continuation.
@@ -1882,9 +1913,13 @@ async function assertAutomaticStartupRefresh({
 }
 
 async function dashboardConnection(child, port, onCheckpoint = () => {}) {
+  let currentCheckpoint = "not_started";
   const checkpoint = (value) => {
     const normalized = normalizeWindowsDashboardCheckpoint(value);
-    if (normalized !== "not_started") onCheckpoint(normalized);
+    const advanced = advanceWindowsDashboardCheckpoint(currentCheckpoint, normalized);
+    if (advanced === currentCheckpoint) return;
+    currentCheckpoint = advanced;
+    onCheckpoint(advanced);
   };
   const version = await waitFor(
     () => {
@@ -2006,6 +2041,7 @@ async function dashboardConnection(child, port, onCheckpoint = () => {}) {
     fail("WINDOWS_ELECTRON_SMOKE_LOOPBACK_ORIGIN_INVALID");
   }
   await releaseWindowsSmokeRefreshGate(cdp);
+  checkpoint("startup_gate_released");
   const health = await jsonFetch(
     new URL("/api/local/health", dashboardUrl),
     undefined,
@@ -2017,12 +2053,14 @@ async function dashboardConnection(child, port, onCheckpoint = () => {}) {
     child,
     dashboardUrl,
     refreshObserver,
+    onCheckpoint: checkpoint,
   });
   return Object.freeze({
     cdp,
     dashboardUrl,
     browser: version.Browser,
     refreshObserver,
+    onCheckpoint: checkpoint,
     child,
   });
 }
@@ -2073,11 +2111,14 @@ async function reloadDashboardDocument(connection) {
       && snapshot.timeOrigin !== before.timeOrigin
       && snapshot.url === before.url;
   }, MAX_STARTUP_MS, "dashboard fresh-document render", "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT");
+  await releaseWindowsSmokeRefreshGate(connection.cdp);
+  connection.onCheckpoint?.("startup_gate_released");
   await assertAutomaticStartupRefresh({
     child: connection.child,
     dashboardUrl: new URL(before.url),
     refreshObserver: connection.refreshObserver,
     previousRefreshId,
+    onCheckpoint: connection.onCheckpoint,
   });
 }
 
@@ -2260,7 +2301,11 @@ export async function runSmoke(progress) {
   );
   const setDashboardCheckpoint = (checkpoint) => {
     const normalized = normalizeWindowsDashboardCheckpoint(checkpoint);
-    if (normalized !== "not_started") progress.dashboardCheckpoint = normalized;
+    const advanced = advanceWindowsDashboardCheckpoint(
+      progress.dashboardCheckpoint,
+      normalized,
+    );
+    if (advanced !== progress.dashboardCheckpoint) progress.dashboardCheckpoint = advanced;
   };
   let fixture = null;
   let primary = null;
@@ -2552,6 +2597,9 @@ export async function runSmoke(progress) {
     }
     progress.relaunchPersistence = progress.statePersistence === true
       && progress.credentialPersistence === true;
+    if (progress.dashboardCheckpoint !== "startup_refresh_terminal_succeeded") {
+      fail("WINDOWS_ELECTRON_SMOKE_REFRESH_BOUNDARY_INVALID");
+    }
     return aggregate("passed", progress);
   } catch (error) {
     const diagnostic = classifySmokeFailure(error, failurePhase);

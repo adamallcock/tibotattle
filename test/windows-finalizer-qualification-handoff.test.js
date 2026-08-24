@@ -93,7 +93,7 @@ function receiptFixture({ cacheMode = "warm", revision = REVISION, bindingSha256
       contentFree: true,
       credentialPersistence: true,
       dashboardReady: true,
-      dashboardCheckpoint: "dashboard_ready",
+      dashboardCheckpoint: "startup_refresh_terminal_succeeded",
       failureReason: "none",
       failureStage: "none",
       noOrphan: true,
