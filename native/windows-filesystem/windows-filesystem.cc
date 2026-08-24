@@ -273,6 +273,7 @@ Failure FromLastError(DWORD error = GetLastError()) {
     return AlreadyExists();
   }
   if (error == ERROR_ACCESS_DENIED
+      || error == ERROR_DELETE_PENDING
       || error == ERROR_SHARING_VIOLATION
       || error == ERROR_LOCK_VIOLATION
       || error == ERROR_WRITE_PROTECT) {
@@ -2285,6 +2286,56 @@ bool IsCleanSqliteRollbackJournal(HANDLE handle, Failure* failure) {
   return true;
 }
 
+// Once a clean journal is marked delete-pending, Windows reports zero links
+// through FILE_STANDARD_INFO.  That is the expected lifecycle state, not a
+// hard-link violation, so the pre-delete child validator cannot be reused.
+// Re-read the exact object identity from the still-held handle and require the
+// kernel's delete-pending bit as the bounded post-transition proof.
+bool ValidateSqliteStageJournalDeletion(
+    HANDLE handle,
+    const HandleIdentity& expected,
+    Failure* failure) {
+  HandleIdentity observed;
+  if (!GetIdentity(handle, &observed)) {
+    *failure = FromLastError();
+    return false;
+  }
+  if (!EqualIdentity(observed, expected)) {
+    *failure = IdentityMismatch();
+    return false;
+  }
+  if (observed.directory) {
+    *failure = NotRegularFile();
+    return false;
+  }
+  if (observed.linkCount != 0) {
+    *failure = HardLink();
+    return false;
+  }
+  FILE_STANDARD_INFO standard{};
+  if (!GetFileInformationByHandleEx(
+          handle,
+          FileStandardInfo,
+          &standard,
+          sizeof(standard))) {
+    *failure = FromLastError();
+    return false;
+  }
+  if (standard.Directory) {
+    *failure = NotRegularFile();
+    return false;
+  }
+  if (standard.NumberOfLinks != 0) {
+    *failure = HardLink();
+    return false;
+  }
+  if (!standard.DeletePending) {
+    *failure = OperationFailed();
+    return false;
+  }
+  return true;
+}
+
 // Pin the stage journal decision to the same stage parent and publication
 // operation as the database handle.  An existing clean journal is marked
 // delete-pending and held exclusively until the callback exits.  If the
@@ -2347,14 +2398,10 @@ bool OpenSqliteStageJournalGuard(
       *failure = FromLastError();
       return false;
     }
-    HandleIdentity postDeleteIdentity;
-    if (!ValidateSqliteChildHandle(
+    if (!ValidateSqliteStageJournalDeletion(
             guard->final,
-            journalPath,
-            &postDeleteIdentity,
-            failure)
-        || !EqualIdentity(postDeleteIdentity, journalIdentity)) {
-      if (failure->code == OperationFailed().code) *failure = IdentityMismatch();
+            journalIdentity,
+            failure)) {
       return false;
     }
     return true;

@@ -557,6 +557,14 @@ test("SQLite publication guards PERSIST journals before the final rename", async
   const guardBody = source.slice(guardStart, guardEnd);
   const journalSection = source.slice(journalSectionStart, guardEnd);
   const publishBody = source.slice(publishStart, publishEnd);
+  const deletionProofStart = source.indexOf(
+    "bool ValidateSqliteStageJournalDeletion(",
+  );
+  const deletionProofEnd = source.indexOf(
+    "// Pin the stage journal decision",
+    deletionProofStart,
+  );
+  const deletionProof = source.slice(deletionProofStart, deletionProofEnd);
 
   // Existing journals are opened exclusively, so the header decision and
   // delete-pending transition cannot be separated by a writer/name swap.
@@ -576,6 +584,35 @@ test("SQLite publication guards PERSIST journals before the final rename", async
   );
   assert.match(guardBody, /ReserveSqliteSidecar\(/u);
   assert.match(guardBody, /MarkHandleForDeletion\(guard->final\)/u);
+  assert.ok(deletionProofStart > journalSectionStart && deletionProofEnd > deletionProofStart);
+  assert.match(deletionProof, /GetIdentity\(handle, &observed\)/u);
+  assert.match(deletionProof, /EqualIdentity\(observed, expected\)/u);
+  assert.match(deletionProof, /observed\.directory[\s\S]*NotRegularFile\(\)/u);
+  assert.match(deletionProof, /observed\.linkCount != 0[\s\S]*HardLink\(\)/u);
+  assert.match(deletionProof, /FileStandardInfo/u);
+  assert.match(deletionProof, /standard\.Directory[\s\S]*NotRegularFile\(\)/u);
+  assert.match(deletionProof, /standard\.NumberOfLinks != 0[\s\S]*HardLink\(\)/u);
+  assert.match(deletionProof, /standard\.DeletePending/u);
+
+  const preDeleteValidationOffset = guardBody.indexOf(
+    "ValidateSqliteChildHandle(guard->final",
+  );
+  const deleteTransitionOffset = guardBody.indexOf(
+    "MarkHandleForDeletion(guard->final)",
+  );
+  const postDeleteBody = guardBody.slice(deleteTransitionOffset);
+  assert.ok(
+    preDeleteValidationOffset >= 0
+      && deleteTransitionOffset > preDeleteValidationOffset,
+  );
+  assert.match(postDeleteBody, /ValidateSqliteStageJournalDeletion\(/u);
+  assert.doesNotMatch(postDeleteBody, /ValidateSqliteChildHandle\(/u);
+
+  const fromLastErrorStart = source.indexOf("Failure FromLastError(");
+  const fromLastErrorEnd = source.indexOf("napi_value ThrowFailure(", fromLastErrorStart);
+  const fromLastErrorBody = source.slice(fromLastErrorStart, fromLastErrorEnd);
+  assert.match(fromLastErrorBody, /ERROR_DELETE_PENDING/u);
+  assert.match(fromLastErrorBody, /ERROR_DELETE_PENDING[\s\S]*return AccessDenied\(\)/u);
 
   const targetPreflightOffset = publishBody.indexOf(
     'failure.stage = "publish_target_preflight";',
