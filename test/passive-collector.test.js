@@ -35,6 +35,9 @@ import {
   readLocalCollectorRecords,
   readLocalCollectorState,
 } from "../src/local-collector-state.js";
+import {
+  withLocalCollectorStateSessionBoundary,
+} from "../src/platform/local-collector-state-session.js";
 
 const virtualCollectorStatePaths = new Map();
 
@@ -63,6 +66,53 @@ async function stat(path) {
 test("collector discovery defaults leave room for the resumable archive index", () => {
   assert.equal(MAX_DISCOVERY_DIRECTORY_ENTRIES, 500_000);
   assert.equal(MAX_DISCOVERY_ROLLOUT_FILES, 125_000);
+});
+
+test("Windows collector refresh does not overlap the protected SQLite lease", async () => {
+  const database = new DatabaseSync(":memory:");
+  let activeSessions = 0;
+  let openedSessions = 0;
+  const sessionFactory = ({ rootPath, databaseName }) => {
+    if (activeSessions !== 0) {
+      throw new Error("same-process SQLite lease contention");
+    }
+    activeSessions += 1;
+    openedSessions += 1;
+    let closed = false;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      activeSessions -= 1;
+    };
+    return {
+      contractVersion: "windows-sqlite-state-session-v1",
+      rootPath,
+      databaseName,
+      productionSafe: false,
+      sqliteStateLeaseSafe: false,
+      database,
+      close,
+      abort: close,
+    };
+  };
+
+  const result = await withLocalCollectorStateSessionBoundary({
+    platform: "win32",
+    architecture: "x64",
+    windowsFilesystemAdapter: {},
+    windowsSqliteStateSessionFactory: sessionFactory,
+    simulation: true,
+  }, () => runCollectorOnce({
+    stateFile: "C:\\TiboTattle\\state\\local-collector-state-v1.sqlite",
+    codexHome: "C:\\TiboTattle\\codex-home",
+    skipRolloutIngestion: true,
+    refreshStale: false,
+  }));
+
+  assert.equal(result.status, "complete");
+  assert.ok(openedSessions > 1);
+  assert.equal(activeSessions, 0);
+  database.close();
 });
 
 function usage(input) {

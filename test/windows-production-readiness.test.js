@@ -29,18 +29,22 @@ function readinessError(code) {
 }
 
 function qualifiedReadiness() {
-  return createWindowsProductionReadinessAttestation({
-    qualifiedAt: "2026-08-17T12:00:00.000Z",
-    qualificationReceipt: "windows-qualification-receipt-v1",
+  return Object.freeze({
+    contractVersion: "windows-production-readiness-v1",
+    status: "qualified",
+    platform: "win32",
+    architecture: "x64",
     credentialMutexSafe: true,
     durableAuditSafe: true,
     protectedStatePathsSafe: true,
     authenticatedBindingSafe: true,
-    bindingProvenance: {
+    bindingProvenance: Object.freeze({
       contractVersion: "windows-binding-provenance-v1",
       status: "qualified",
       source: "audited-signed-native-binding",
-    },
+    }),
+    qualificationReceipt: "windows-qualification-receipt-v1",
+    qualifiedAt: "2026-08-17T12:00:00.000Z",
   });
 }
 
@@ -60,7 +64,7 @@ test("the current Windows readiness state is explicitly disabled", () => {
   );
 });
 
-test("Windows readiness requires all four facts and a qualified binding provenance", () => {
+test("Windows readiness cannot be self-issued from facts, provenance, and a receipt", () => {
   assert.throws(
     () => createWindowsProductionReadinessAttestation({
       qualifiedAt: "2026-08-17T12:00:00.000Z",
@@ -75,7 +79,7 @@ test("Windows readiness requires all four facts and a qualified binding provenan
         source: "audited-signed-native-binding",
       },
     }),
-    readinessError("invalid_configuration"),
+    readinessError("unqualified"),
   );
   assert.throws(
     () => createWindowsProductionReadinessAttestation({
@@ -91,14 +95,17 @@ test("Windows readiness requires all four facts and a qualified binding provenan
         source: "untrusted-input",
       },
     }),
-    readinessError("invalid_configuration"),
+    readinessError("unqualified"),
   );
   const readiness = qualifiedReadiness();
-  assert.equal(assertWindowsProductionReadiness({
-    platform: "win32",
-    architecture: "x64",
-    readiness,
-  }), readiness);
+  assert.throws(
+    () => assertWindowsProductionReadiness({
+      platform: "win32",
+      architecture: "x64",
+      readiness,
+    }),
+    readinessError("unqualified"),
+  );
   assert.throws(
     () => assertWindowsProductionReadiness({
       platform: "win32",
@@ -134,15 +141,37 @@ test("Windows capability adapter rejects the currently qualification-only manage
       capability: CAPABILITY,
       readiness,
     }),
-    readinessError("backend_unqualified"),
+    readinessError("unqualified"),
   );
   assert.deepEqual(calls, []);
 });
 
-test("Windows capability adapter holds a leased mutation boundary for qualified backends", async () => {
+test("Windows production backend rejects shape-only and copied flags", () => {
+  const backend = {
+    productionSafe: true,
+    crossProcessSafe: true,
+    auditDurable: true,
+    auditFilesystemProtected: true,
+    startupRecoveryComplete: true,
+    bindingProvenanceAuthenticated: true,
+    read: async () => null,
+    withOperationLease: async () => null,
+    createIfMissing: async () => "created",
+    replaceExact: async () => "replaced",
+    deleteExact: async () => "deleted",
+  };
+  assert.throws(
+    () => assertWindowsProductionBackend(backend),
+    readinessError("backend_unqualified"),
+  );
+  assert.throws(
+    () => assertWindowsProductionBackend({ ...backend }),
+    readinessError("backend_unqualified"),
+  );
+});
+
+test("Windows capability adapter remains unavailable until trusted construction exists", () => {
   const readiness = qualifiedReadiness();
-  const calls = [];
-  const stored = { value: null };
   const backend = {
     productionSafe: true,
     crossProcessSafe: true,
@@ -180,34 +209,20 @@ test("Windows capability adapter holds a leased mutation boundary for qualified 
     async deleteExact(capability, expected, lease) {
       assert.equal(capability, CAPABILITY);
       assert.deepEqual(lease, { token: true });
-      calls.push(["delete"]);
-      if (!stored.value) return "missing";
-      if (!stored.value.equals(expected)) return "conflict";
-      stored.value = null;
       return "deleted";
     },
   };
-  const adapted = createWindowsProductionCapabilityBackend({
-    backend,
-    capability: CAPABILITY,
-    readiness,
-  });
-  const secret = Buffer.alloc(32, 44);
-  assert.deepEqual(adapted.describe(), {
-    backend: "windows_credential_manager",
-    status: "available",
-  });
-  assert.equal(await adapted.createIfMissing(CAPABILITY, secret), "created");
-  assert.equal(await adapted.replaceExact(CAPABILITY, secret, Buffer.alloc(32, 45)), "replaced");
-  assert.equal(await adapted.deleteExact(CAPABILITY, Buffer.alloc(32, 45)), "deleted");
-  assert.deepEqual(calls.map(([event]) => event), ["lease", "create", "lease", "replace", "lease", "delete"]);
-  await assert.rejects(
-    adapted.read({ ...CAPABILITY }),
-    readinessError("invalid_configuration"),
+  assert.throws(
+    () => createWindowsProductionCapabilityBackend({
+      backend,
+      capability: CAPABILITY,
+      readiness,
+    }),
+    readinessError("unqualified"),
   );
 });
 
-test("qualified participant selection retains the required Windows filesystem seam", () => {
+test("qualified participant selection still rejects an unbranded Windows filesystem seam", () => {
   const readiness = qualifiedReadiness();
   const filesystem = {
     productionSafe: true,
@@ -226,22 +241,19 @@ test("qualified participant selection retains the required Windows filesystem se
     deleteExact: async () => "deleted",
     withOperationLease: async (capability, options, callback) => callback({}),
   };
-  const selected = selectProductionParticipantIdentity({
-    environmentSecret: null,
-    explicitSecretFile: null,
-    platform: "win32",
-    architecture: "x64",
-    appStateSecretFile: "C:\\app-state\\export-secret",
-    windowsReadiness: readiness,
-    createWindowsBackend: () => backend,
-    windowsFilesystemAdapter: filesystem,
-  });
-  assert.equal(selected.mode, "windows_credential_manager");
-  assert.equal(selected.identityOptions.windowsFilesystemAdapter, filesystem);
-  assert.deepEqual(selected.identityOptions.participantSecretBackend.describe(), {
-    backend: "windows_credential_manager",
-    status: "available",
-  });
+  assert.throws(
+    () => selectProductionParticipantIdentity({
+      environmentSecret: null,
+      explicitSecretFile: null,
+      platform: "win32",
+      architecture: "x64",
+      appStateSecretFile: "C:\\app-state\\export-secret",
+      windowsReadiness: readiness,
+      createWindowsBackend: () => backend,
+      windowsFilesystemAdapter: filesystem,
+    }),
+    (error) => error.code === "EXPORT_IDENTITY_PRODUCTION_BACKEND_UNAVAILABLE",
+  );
 });
 
 test("all four production selectors remain closed while the manager reports qualification-only", () => {
@@ -296,5 +308,8 @@ test("all four production selectors remain closed while the manager reports qual
     windowsReadiness: readiness,
     createWindowsBackend,
   }), (error) => error.code === "contribution_device_invalid_configuration");
-  assert.equal(constructions, 4);
+  // Participant identity and contribution-device selection both reject the
+  // unbranded/missing filesystem seam before constructing a backend; only the
+  // account-observation selector reaches the manager capability gate.
+  assert.equal(constructions, 0);
 });

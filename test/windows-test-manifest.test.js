@@ -8,7 +8,7 @@ import {
 } from "../scripts/portable-test-manifest.mjs";
 
 test("Windows portable test deferrals are explicit, unique, and bounded", () => {
-  assert.equal(WINDOWS_DEFERRED_TESTS.length, 1);
+  assert.equal(WINDOWS_DEFERRED_TESTS.length, 30);
   const deferred = new Set();
   for (const entry of WINDOWS_DEFERRED_TESTS) {
     assert.deepEqual(Object.keys(entry).sort(), ["file", "reason"]);
@@ -23,4 +23,42 @@ test("Windows portable test deferrals are explicit, unique, and bounded", () => 
     WINDOWS_PORTABLE_TEST_FILES,
     PORTABLE_TEST_FILES.filter((file) => !deferred.has(file)),
   );
+  assert.deepEqual([...deferred].sort(), [
+    "apps/local/desktop-status-route.test.mjs",
+    "apps/local/server.test.mjs",
+    "test/claude-callback-lifecycle-owner-boundary.test.js",
+    "test/claude-callback-lifecycle.test.js",
+    "test/claude-callback-runtime.test.js",
+    "test/claude-desktop-quota-refresh.test.js",
+    "test/codex-interleaved-usage-streams.test.js",
+    "test/contribution-device-capability.test.js",
+    "test/contribution-device-renewal.test.js",
+    "test/contribution-sync-queue.test.js",
+    "test/electron-package-layout.test.js",
+    "test/export-identity.test.js",
+    "test/fast-mode-accounting.test.js",
+    "test/local-collector-state-session.test.js",
+    "test/local-collector-state.test.js",
+    "test/local-companion-data.test.js",
+    "test/local-companion-refresh.test.js",
+    "test/local-contribution-preparation.test.js",
+    "test/portable-local-companion-process.test.js",
+    "test/prospective-collector-cli.test.js",
+    "test/quota-track-identity.test.js",
+    "test/real-local-backend-acceptance.test.js",
+    "test/telemetry-contribution-builder.test.js",
+    "test/tool-inventory.test.js",
+    "test/weekly-pace-local-companion.test.js",
+    "test/weekly-pace-refresh-integration.test.js",
+    "test/windows-credential-operation-audit.test.js",
+    "test/windows-filesystem-companion-instance-lease.test.js",
+    "test/windows-native-presign.test.js",
+    "test/windows-sqlite-state-session-contract.test.js",
+  ]);
+});
+
+test("Windows preparation transport has portable contracts and explicit native proof", () => {
+  const transportTest = "test/windows-preparation-manifest-transport.test.js";
+  assert.equal(PORTABLE_TEST_FILES.includes(transportTest), true);
+  assert.equal(WINDOWS_PORTABLE_TEST_FILES.includes(transportTest), true);
 });

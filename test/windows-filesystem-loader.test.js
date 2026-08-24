@@ -6,6 +6,7 @@ import {
   assertWindowsFilesystemProductionSafe,
   createWindowsFilesystemAdapter,
   isWindowsFilesystemAlreadyExists,
+  isWindowsFilesystemAdapter,
   isWindowsFilesystemNotFound,
   loadWindowsFilesystemBinding,
   WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION,
@@ -34,19 +35,33 @@ function manifest(overrides = {}) {
     contractVersion: "windows-filesystem-v1",
     securityContractVersion: "windows-filesystem-security-v1",
     credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
+    sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
+    companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
+    preparedArtifactContractVersion: "windows-prepared-artifact-v1",
     requiredMethods: [...WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS],
     nativeClaims: {
       productionSafe: false,
       pathWalkRaceSafe: false,
       credentialMutexSafe: true,
+      companionInstanceMutexSafe: false,
       credentialAuditFileGuardSafe: true,
+      sqliteStateLeaseSafe: false,
+      preparedArtifactSafe: false,
     },
     approvedPolicy: {
       productionSafe: false,
       pathWalkRaceSafe: false,
       credentialMutexSafe: true,
+      companionInstanceMutexSafe: false,
       credentialAuditFileGuardSafe: true,
+      sqliteStateLeaseSafe: false,
+      preparedArtifactSafe: false,
+    },
+    bindingProvenance: {
+      contractVersion: "windows-binding-provenance-v1",
+      status: "unqualified",
+      source: "unsigned-development-binding",
     },
     ...overrides,
   };
@@ -57,21 +72,50 @@ function binding(overrides = {}) {
     contractVersion: "windows-filesystem-v1",
     securityContractVersion: "windows-filesystem-security-v1",
     credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
+    sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
+    companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
+    preparedArtifactContractVersion: "windows-prepared-artifact-v1",
     productionSafe: false,
     pathWalkRaceSafe: false,
     credentialMutexSafe: true,
     credentialAuditFileGuardSafe: true,
+    sqliteStateLeaseSafe: false,
+    companionInstanceMutexSafe: false,
+    preparedArtifactSafe: false,
     inspectPath: () => ({ identity: IDENTITY }),
     ensureDirectory: () => IDENTITY,
     readFile: () => ({ data: Buffer.from("data"), identity: IDENTITY }),
+    readFileBounded: () => ({ data: Buffer.from("data"), identity: IDENTITY }),
     createFile: () => IDENTITY,
     deleteFile: () => ({ deleted: true, identity: IDENTITY }),
     replaceFile: () => IDENTITY,
+    inspectProtectedChild: () => ({ identity: IDENTITY }),
+    readProtectedChild: () => ({ data: Buffer.from("data"), identity: IDENTITY }),
+    createProtectedChild: () => IDENTITY,
+    deleteProtectedChild: () => ({ deleted: true, identity: IDENTITY }),
+    replaceProtectedChild: () => IDENTITY,
+    inspectPreparedChild: () => ({ identity: IDENTITY }),
+    ensurePreparedDirectory: () => IDENTITY,
+    enumeratePreparedDirectory: () => [],
+    removePreparedDirectory: () => ({ removed: true, identity: IDENTITY }),
+    renamePreparedDirectory: () => ({ renamed: true, identity: IDENTITY }),
+    createPreparedFile: () => IDENTITY,
+    readPreparedFile: () => ({ data: Buffer.from("data"), identity: IDENTITY }),
+    deletePreparedFile: () => ({ deleted: true, identity: IDENTITY }),
+    publishPreparedFile: () => ({ published: true, identity: IDENTITY }),
     acquireCredentialMutex: () => ({ lease: {}, abandoned: false }),
     releaseCredentialMutex: () => {},
+    acquireCompanionInstanceMutex: () => ({ lease: {}, abandoned: false }),
+    releaseCompanionInstanceMutex: () => {},
     acquireCredentialAuditFileGuard: () => ({ lease: {} }),
     releaseCredentialAuditFileGuard: () => {},
+    acquireSqliteStateLease: () => ({
+      lease: {},
+      databaseIdentity: IDENTITY,
+      journalIdentity: IDENTITY,
+    }),
+    releaseSqliteStateLease: () => {},
     ...overrides,
   };
 }
@@ -177,8 +221,91 @@ test("Windows native loader requires a sidecar manifest and exact binding digest
   );
 });
 
+test("Windows native loader rejects a stale sidecar before loading an older binding", () => {
+  const bindingPath = "C:\\checkout\\native\\windows-filesystem\\build\\Release\\windows_filesystem.node";
+  const staleManifest = manifest();
+  delete staleManifest.companionInstanceMutexContractVersion;
+  delete staleManifest.nativeClaims.companionInstanceMutexSafe;
+  delete staleManifest.approvedPolicy.companionInstanceMutexSafe;
+  let required = false;
+  assert.throws(
+    () => loadWindowsFilesystemBinding({
+      platform: "win32",
+      architecture: "x64",
+      bindingPath,
+      resolveBinding: (path) => path,
+      readManifest: () => JSON.stringify(staleManifest),
+      readBindingBytes: () => BINDING_BYTES,
+      requireBinding: () => {
+        required = true;
+        return binding({
+          acquireCompanionInstanceMutex: undefined,
+          releaseCompanionInstanceMutex: undefined,
+        });
+      },
+    }),
+    (error) => error.code === "WINDOWS_FILESYSTEM_INVALID_MANIFEST",
+  );
+  assert.equal(required, false);
+});
+
+test("Windows native loader rejects a sidecar missing a prepared method before loading", () => {
+  const bindingPath = "C:\\checkout\\native\\windows-filesystem\\build\\Release\\windows_filesystem.node";
+  const staleManifest = manifest({
+    requiredMethods: manifest().requiredMethods.filter(
+      (method) => method !== "deletePreparedFile",
+    ),
+  });
+  let required = false;
+  assert.throws(
+    () => loadWindowsFilesystemBinding({
+      platform: "win32",
+      architecture: "x64",
+      bindingPath,
+      resolveBinding: (path) => path,
+      readManifest: () => JSON.stringify(staleManifest),
+      readBindingBytes: () => BINDING_BYTES,
+      requireBinding: () => {
+        required = true;
+        return binding();
+      },
+    }),
+    (error) => error.code === "WINDOWS_FILESYSTEM_INVALID_MANIFEST",
+  );
+  assert.equal(required, false);
+});
+
+test("Windows native loader rejects malformed binding provenance before loading", () => {
+  const bindingPath = "C:\\checkout\\native\\windows-filesystem\\build\\Release\\windows_filesystem.node";
+  let required = false;
+  assert.throws(
+    () => loadWindowsFilesystemBinding({
+      platform: "win32",
+      architecture: "x64",
+      bindingPath,
+      resolveBinding: (path) => path,
+      readManifest: () => JSON.stringify(manifest({
+        bindingProvenance: {
+          contractVersion: "windows-binding-provenance-v1",
+          status: "unqualified",
+          source: "unsigned-development-binding",
+          extra: "reject",
+        },
+      })),
+      readBindingBytes: () => BINDING_BYTES,
+      requireBinding: () => {
+        required = true;
+        return binding();
+      },
+    }),
+    (error) => error.code === "WINDOWS_FILESYSTEM_INVALID_MANIFEST",
+  );
+  assert.equal(required, false);
+});
+
 test("manifest policy and native claims are cross-checked before loading", () => {
   const bindingPath = "C:\\checkout\\native\\windows-filesystem\\build\\Release\\windows_filesystem.node";
+  let nativeClaimBindingRequired = false;
   assert.throws(
     () => loadWindowsFilesystemBinding({
       platform: "win32",
@@ -190,14 +317,35 @@ test("manifest policy and native claims are cross-checked before loading", () =>
           productionSafe: true,
           pathWalkRaceSafe: true,
           credentialMutexSafe: true,
+          companionInstanceMutexSafe: false,
           credentialAuditFileGuardSafe: true,
+          sqliteStateLeaseSafe: false,
+          preparedArtifactSafe: false,
+        },
+        approvedPolicy: {
+          productionSafe: true,
+          pathWalkRaceSafe: true,
+          credentialMutexSafe: true,
+          companionInstanceMutexSafe: false,
+          credentialAuditFileGuardSafe: true,
+          sqliteStateLeaseSafe: false,
+          preparedArtifactSafe: false,
+        },
+        bindingProvenance: {
+          contractVersion: "windows-binding-provenance-v1",
+          status: "authenticated",
+          source: "development-package",
         },
       })),
       readBindingBytes: () => BINDING_BYTES,
-      requireBinding: () => binding(),
+      requireBinding: () => {
+        nativeClaimBindingRequired = true;
+        return binding();
+      },
     }),
-    (error) => error.code === "WINDOWS_FILESYSTEM_MANIFEST_BINDING_MISMATCH",
+    (error) => error.code === "WINDOWS_FILESYSTEM_PROVENANCE_VERIFIER_UNAVAILABLE",
   );
+  assert.equal(nativeClaimBindingRequired, false);
   assert.throws(
     () => loadWindowsFilesystemBinding({
       platform: "win32",
@@ -218,6 +366,42 @@ test("manifest policy and native claims are cross-checked before loading", () =>
     }),
     (error) => error.code === "WINDOWS_FILESYSTEM_INVALID_MANIFEST",
   );
+  let mismatchedClaimBindingRequired = false;
+  assert.throws(
+    () => loadWindowsFilesystemBinding({
+      platform: "win32",
+      architecture: "x64",
+      bindingPath,
+      resolveBinding: (path) => path,
+      readManifest: () => JSON.stringify(manifest({
+        nativeClaims: {
+          productionSafe: false,
+          pathWalkRaceSafe: false,
+          credentialMutexSafe: false,
+          companionInstanceMutexSafe: false,
+          credentialAuditFileGuardSafe: true,
+          sqliteStateLeaseSafe: false,
+          preparedArtifactSafe: false,
+        },
+        approvedPolicy: {
+          productionSafe: false,
+          pathWalkRaceSafe: false,
+          credentialMutexSafe: true,
+          companionInstanceMutexSafe: false,
+          credentialAuditFileGuardSafe: true,
+          sqliteStateLeaseSafe: false,
+          preparedArtifactSafe: false,
+        },
+      })),
+      readBindingBytes: () => BINDING_BYTES,
+      requireBinding: () => {
+        mismatchedClaimBindingRequired = true;
+        return binding();
+      },
+    }),
+    (error) => error.code === "WINDOWS_FILESYSTEM_INVALID_MANIFEST",
+  );
+  assert.equal(mismatchedClaimBindingRequired, false);
 });
 
 test("adapter production flags require the reviewed manifest policy as well as native claims", () => {
@@ -231,6 +415,102 @@ test("adapter production flags require the reviewed manifest policy as well as n
     readBindingBytes: () => BINDING_BYTES,
     requireBinding: () => binding(),
   });
+  assert.equal(isWindowsFilesystemAdapter(adapter), true);
+  assert.equal(adapter.productionSafe, false);
+  assert.equal(adapter.pathWalkRaceSafe, false);
+});
+
+test("production promotion remains blocked until a package verifier exists", () => {
+  const bindingPath = "C:\\checkout\\native\\windows-filesystem\\build\\Release\\windows_filesystem.node";
+  const authenticatedManifest = manifest({
+    nativeClaims: {
+      productionSafe: true,
+      pathWalkRaceSafe: true,
+      credentialMutexSafe: true,
+      companionInstanceMutexSafe: false,
+      credentialAuditFileGuardSafe: true,
+      sqliteStateLeaseSafe: false,
+      preparedArtifactSafe: false,
+    },
+    approvedPolicy: {
+      productionSafe: true,
+      pathWalkRaceSafe: true,
+      credentialMutexSafe: true,
+      companionInstanceMutexSafe: false,
+      credentialAuditFileGuardSafe: true,
+      sqliteStateLeaseSafe: false,
+      preparedArtifactSafe: false,
+    },
+    bindingProvenance: {
+      contractVersion: "windows-binding-provenance-v1",
+      status: "authenticated",
+      source: "development-package",
+    },
+  });
+  const manifestText = JSON.stringify(authenticatedManifest);
+  let bindingRequired = 0;
+  const common = {
+    platform: "win32",
+    architecture: "x64",
+    bindingPath,
+    resolveBinding: (path) => path,
+    readManifest: () => manifestText,
+    readBindingBytes: () => BINDING_BYTES,
+    requireBinding: () => {
+      bindingRequired += 1;
+      return binding({
+        productionSafe: true,
+        pathWalkRaceSafe: true,
+      });
+    },
+  };
+
+  assert.throws(
+    () => loadWindowsFilesystemBinding(common),
+    (error) => error.code === "WINDOWS_FILESYSTEM_PROVENANCE_VERIFIER_UNAVAILABLE",
+  );
+  assert.equal(bindingRequired, 0);
+  assert.throws(
+    () => createWindowsFilesystemAdapter(common),
+    (error) => error.code === "WINDOWS_FILESYSTEM_PROVENANCE_VERIFIER_UNAVAILABLE",
+  );
+  assert.equal(bindingRequired, 0);
+  let callbackCalled = false;
+  assert.throws(
+    () => createWindowsFilesystemAdapter({
+      ...common,
+      authenticateManifest: () => {
+        callbackCalled = true;
+        return true;
+      },
+    }),
+    (error) => error.code === "WINDOWS_FILESYSTEM_PROVENANCE_VERIFIER_UNAVAILABLE",
+  );
+  assert.equal(callbackCalled, false);
+  assert.throws(
+    () => createWindowsFilesystemAdapter({
+      ...common,
+      authenticateManifest: () => ({
+        contractVersion: "windows-binding-provenance-v1",
+        status: "authenticated",
+        source: "development-package",
+      }),
+    }),
+    (error) => error.code === "WINDOWS_FILESYSTEM_PROVENANCE_VERIFIER_UNAVAILABLE",
+  );
+});
+
+test("injected caller booleans cannot promote a portable binding", () => {
+  const adapter = createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding: binding({
+      productionSafe: true,
+      pathWalkRaceSafe: true,
+      bindingProvenanceAuthenticated: true,
+    }),
+  });
+  assert.equal(isWindowsFilesystemAdapter(adapter), true);
   assert.equal(adapter.productionSafe, false);
   assert.equal(adapter.pathWalkRaceSafe, false);
 });
@@ -266,6 +546,11 @@ test("adapter validates native identities and keeps operation errors fixed", () 
         error.code = "WINDOWS_FILESYSTEM_NOT_FOUND";
         throw error;
       },
+      inspectProtectedChild() {
+        const error = new Error("path must not appear");
+        error.code = "WINDOWS_FILESYSTEM_NOT_FOUND";
+        throw error;
+      },
     }),
   });
   assert.throws(() => missing.readFile("C:\\private\\secret"), (error) => {
@@ -273,8 +558,68 @@ test("adapter validates native identities and keeps operation errors fixed", () 
     assert.equal(error.message.includes("private"), false);
     return true;
   });
+  assert.throws(
+    () => missing.inspectProtectedChild("C:\\private", IDENTITY, "secret"),
+    (error) => {
+      assert.equal(error.code, "ENOENT");
+      assert.equal(error.message.includes("private"), false);
+      return true;
+    },
+  );
   assert.equal(isWindowsFilesystemNotFound({ code: "ENOENT" }), true);
   assert.equal(isWindowsFilesystemAlreadyExists({ code: "EEXIST" }), true);
+});
+
+test("adapter exposes bounded and root-identity-bound state primitives", () => {
+  const calls = [];
+  const adapter = createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding: binding({
+      readFileBounded(path, maximumBytes) {
+        calls.push(["readFileBounded", path, maximumBytes]);
+        return { data: Buffer.from("bounded"), identity: IDENTITY };
+      },
+      inspectProtectedChild(rootPath, rootIdentity, childPath) {
+        calls.push(["inspectProtectedChild", rootPath, rootIdentity, childPath]);
+        return { identity: IDENTITY };
+      },
+      readProtectedChild(rootPath, rootIdentity, childPath, maximumBytes) {
+        calls.push(["readProtectedChild", rootPath, rootIdentity, childPath, maximumBytes]);
+        return { data: Buffer.from("child"), identity: IDENTITY };
+      },
+    }),
+  });
+  assert.deepEqual(
+    adapter.readFileBounded("C:\\state\\state.json", 32),
+    { data: Buffer.from("bounded"), identity: IDENTITY },
+  );
+  assert.deepEqual(
+    adapter.inspectProtectedChild("C:\\state", IDENTITY, "state.json").identity,
+    IDENTITY,
+  );
+  assert.deepEqual(
+    adapter.readProtectedChild("C:\\state", IDENTITY, "state.json", 32),
+    { data: Buffer.from("child"), identity: IDENTITY },
+  );
+  assert.throws(
+    () => adapter.readFileBounded("C:\\state\\state.json", 1024 * 1024 + 1),
+    (error) => error.code === "WINDOWS_FILESYSTEM_INVALID_MAXIMUM_BYTES",
+  );
+  assert.equal(calls.some(([method]) => method === "readFileBounded"), true);
+  assert.equal(calls.some(([method]) => method === "inspectProtectedChild"), true);
+  assert.equal(calls.some(([method]) => method === "readProtectedChild"), true);
+});
+
+test("production adapter does not expose qualification-only SQLite release fault hooks", () => {
+  const adapter = createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding: binding({
+      armSqliteStateLeaseReleaseFailure: () => true,
+    }),
+  });
+  assert.equal(Object.hasOwn(adapter, "armSqliteStateLeaseReleaseFailure"), false);
 });
 
 test("adapter rejects malformed native identities before use", () => {
@@ -291,11 +636,88 @@ test("adapter rejects malformed native identities before use", () => {
   );
 });
 
-test("production integration guard rejects the unproven native path walk", () => {
+test("adapter wraps SQLite state leases with branded identities and one-shot release", () => {
+  const calls = [];
+  const adapter = createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding: binding({
+      acquireSqliteStateLease(rootPath, rootIdentity, databaseName) {
+        calls.push(["acquireSqliteStateLease", rootPath, rootIdentity, databaseName]);
+        return {
+          lease: {},
+          databaseIdentity: IDENTITY,
+          journalIdentity: IDENTITY,
+        };
+      },
+      releaseSqliteStateLease(lease) {
+        calls.push(["releaseSqliteStateLease", lease]);
+      },
+    }),
+  });
+  const lease = adapter.acquireSqliteStateLease(
+    "C:\\state",
+    IDENTITY,
+    "state.sqlite",
+  );
+  assert.deepEqual(lease.databaseIdentity, IDENTITY);
+  assert.deepEqual(lease.journalIdentity, IDENTITY);
+  adapter.releaseSqliteStateLease(lease);
+  assert.equal(calls[0][0], "acquireSqliteStateLease");
+  assert.equal(calls[1][0], "releaseSqliteStateLease");
+  assert.throws(
+    () => adapter.releaseSqliteStateLease(lease),
+    (error) => error.code === "WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_FOREIGN",
+  );
+  assert.throws(
+    () => adapter.releaseSqliteStateLease({ ...lease }),
+    (error) => error.code === "WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_FOREIGN",
+  );
+});
+
+test("production integration guard requires a branded safe adapter", () => {
   assert.throws(
     () => assertWindowsFilesystemProductionSafe({ productionSafe: false, pathWalkRaceSafe: false }),
     (error) => error.code === "EXPORT_IDENTITY_WINDOWS_FILESYSTEM_POLICY_UNAVAILABLE",
   );
-  const safe = { productionSafe: true, pathWalkRaceSafe: true };
-  assert.equal(assertWindowsFilesystemProductionSafe(safe), safe);
+
+  const fullShape = {
+    productionSafe: true,
+    pathWalkRaceSafe: true,
+    inspectPath() {},
+    ensureDirectory() {},
+    readFile() {},
+    createFile() {},
+    deleteFile() {},
+    replaceFile() {},
+  };
+  assert.equal(isWindowsFilesystemAdapter(fullShape), false);
+  assert.throws(
+    () => assertWindowsFilesystemProductionSafe(fullShape),
+    (error) => error.code === "EXPORT_IDENTITY_WINDOWS_FILESYSTEM_POLICY_UNAVAILABLE",
+  );
+
+  const current = createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding: binding(),
+  });
+  assert.equal(isWindowsFilesystemAdapter(current), true);
+  assert.equal(current.productionSafe, false);
+  assert.equal(current.pathWalkRaceSafe, false);
+  assert.throws(
+    () => assertWindowsFilesystemProductionSafe(current),
+    (error) => error.code === "EXPORT_IDENTITY_WINDOWS_FILESYSTEM_POLICY_UNAVAILABLE",
+  );
+
+  const copied = {
+    ...current,
+    productionSafe: true,
+    pathWalkRaceSafe: true,
+  };
+  assert.equal(isWindowsFilesystemAdapter(copied), false);
+  assert.throws(
+    () => assertWindowsFilesystemProductionSafe(copied),
+    (error) => error.code === "EXPORT_IDENTITY_WINDOWS_FILESYSTEM_POLICY_UNAVAILABLE",
+  );
 });

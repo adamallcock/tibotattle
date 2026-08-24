@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import vm from "node:vm";
 import {
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../../config/product-brand.js";
@@ -1720,6 +1721,110 @@ test("the cost card drops its metadata line while coverage honesty stays elsewhe
   assert.doesNotMatch(appSource, /cost-history-coverage/u);
   assert.doesNotMatch(appSource, /coverage-unpriced|unpricedTokens/u);
   assert.doesNotMatch(appSource, /pricedEventCoveragePercent[^\n]*priced/u);
+});
+
+test("Electron share-card saving is completion-gated and payload-free", async () => {
+  const [appSource, localizationSource] = await Promise.all([
+    readFile(new URL("../public/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/localization.js", import.meta.url), "utf8"),
+  ]);
+  const start = appSource.indexOf("function downloadShareCard() {");
+  const end = appSource.indexOf("\nfunction copyShareCardImage", start);
+  assert.ok(start >= 0 && end > start, "share-card download flow is present");
+  const source = appSource.slice(start, end);
+  const electronStart = source.indexOf("const electron =");
+  const electronEnd = source.indexOf("if (electron) return;", electronStart);
+  assert.ok(electronStart >= 0 && electronEnd > electronStart);
+  const electronFlow = source.slice(electronStart, electronEnd);
+  assert.match(appSource, /function beginElectronShareCardDownload\(\)[\s\S]*?shareCard\.saving/u);
+  assert.doesNotMatch(electronFlow, /shareCardFileName\(card\).*Saved as/uis);
+  assert.doesNotMatch(electronFlow, /showInFolder/u);
+  assert.match(appSource, /tibotattle:share-card-download-completed/u);
+  assert.match(appSource, /tibotattle:share-card-download-failed/u);
+  assert.match(appSource, /shareCard\.saved/u);
+  assert.match(appSource, /shareCard\.saveFailed/u);
+  assert.match(appSource, /revealLatestDownload\(\)/u);
+  assert.match(appSource, /Promise\.resolve\(result\)[\s\S]*?catch/u);
+  for (const key of [
+    "shareCard.showInFolder",
+    "shareCard.saving",
+    "shareCard.saved",
+    "shareCard.saveFailed",
+    "shareCard.revealFailed",
+  ]) {
+    assert.match(localizationSource, new RegExp(`"${key.replaceAll(".", "\\.")}":`, "u"));
+    for (const locale of SUPPORTED_LOCALES) {
+      const value = translate(key, {}, locale);
+      assert.notEqual(value, key);
+      assert.ok(value.trim().length > 0);
+    }
+  }
+});
+
+test("Electron share-card pending state fails closed after the bounded timeout", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const stateStart = appSource.indexOf("let electronShareCardDownloadPending = false;");
+  const stateEnd = appSource.indexOf("// The posted image", stateStart);
+  const beginStart = appSource.indexOf("function beginElectronShareCardDownload() {");
+  const beginEnd = appSource.indexOf("\nfunction updateShareCardActions", beginStart);
+  const completedStart = appSource.indexOf("function handleElectronShareCardDownloadCompleted() {");
+  const completedEnd = appSource.indexOf("\nfunction beginElectronShareCardDownload", completedStart);
+  const failedStart = appSource.indexOf("function handleElectronShareCardDownloadFailed() {");
+  const failedEnd = appSource.indexOf("\nfunction beginElectronShareCardDownload", failedStart);
+  const updateStart = appSource.indexOf("function updateShareCardActions() {");
+  const updateEnd = appSource.indexOf("\n/**\n * Render the shareable card", updateStart);
+  assert.ok(stateStart >= 0 && stateEnd > stateStart);
+  assert.ok(beginStart >= 0 && beginEnd > beginStart);
+  assert.ok(completedStart >= 0 && completedEnd > completedStart);
+  assert.ok(failedStart >= 0 && failedEnd > failedStart);
+  assert.ok(updateStart >= 0 && updateEnd > updateStart);
+
+  const timers = new Map();
+  let nextTimer = 1;
+  const context = {
+    clearTimeout(id) { timers.delete(id); },
+    setTimeout(callback) {
+      const id = nextTimer++;
+      timers.set(id, callback);
+      return id;
+    },
+    document: { body: { classList: { contains: () => true } } },
+    window: { tibotattleDesktop: null },
+    t: (key) => key,
+    setShareCardStatus() {},
+    showShareCardToast() {},
+    electronShareCardBridge() { return null; },
+    showElectronShareCardRevealFailure() {},
+    shareCard: {},
+    shareCardBusy: false,
+    $() { return { disabled: false }; },
+  };
+  vm.runInNewContext(`
+    ${appSource.slice(stateStart, stateEnd)}
+    ${appSource.slice(completedStart, completedEnd)}
+    ${appSource.slice(failedStart, failedEnd)}
+    ${appSource.slice(beginStart, beginEnd)}
+    ${appSource.slice(updateStart, updateEnd)}
+    globalThis.api = {
+      beginElectronShareCardDownload,
+      handleElectronShareCardDownloadCompleted,
+      handleElectronShareCardDownloadFailed,
+      pending: () => electronShareCardDownloadPending,
+    };
+  `, vm.createContext(context));
+  context.api.beginElectronShareCardDownload();
+  assert.equal(context.api.pending(), true);
+  assert.equal(timers.size, 1);
+  const [timeoutId, timeoutCallback] = timers.entries().next().value;
+  timers.delete(timeoutId);
+  timeoutCallback();
+  assert.equal(context.api.pending(), false);
+  assert.equal(timers.size, 0);
+  context.api.beginElectronShareCardDownload();
+  assert.equal(timers.size, 1);
+  context.api.handleElectronShareCardDownloadCompleted();
+  assert.equal(context.api.pending(), false);
+  assert.equal(timers.size, 0);
 });
 
 test("a model row carries its own components, and a row without them says so rather than reporting zeroes", () => {
@@ -5406,15 +5511,14 @@ test("local analysis exposes quick results and cancel-safe progress", async () =
   assert.match(appSource, /phase === "quick_result"/u);
   assert.match(appSource, /await loadQuickResultDashboard\(\)/u);
   assert.match(appSource, /renderDashboard\(data\)/u);
-  assert.match(appSource, /Headline ready; finishing deeper accounting/u);
-  assert.match(appSource, /finishing deeper accounting/u);
-  assert.match(appSource, /Local analysis cancelled/u);
-  assert.match(appSource, /Verified existing results were kept/u);
-  assert.match(appSource, /preserving a resumable local checkpoint/u);
+  assert.match(appSource, /localAnalysis\.progress\.headlineReady/u);
+  assert.match(appSource, /localAnalysis\.progress\.calculating/u);
+  assert.match(appSource, /localAnalysis\.notice\.cancelledTitle/u);
+  assert.match(appSource, /localAnalysis\.notice\.cancelledCopy/u);
   assert.match(appSource, /refresh_resource_limited/u);
-  assert.match(appSource, /This scan paused to protect your Mac/u);
-  assert.match(appSource, /No partial result replaced your existing results/u);
-  assert.match(appSource, /Deep analysis paused after two bounded continuations/u);
+  assert.match(appSource, /localAnalysis\.notice\.resourceLimitedTitle/u);
+  assert.match(appSource, /localAnalysis\.notice\.resourceLimitedCopy/u);
+  assert.match(appSource, /localAnalysis\.notice\.continuationLimitTitle/u);
 });
 
 test("timeline keeps time, uncertainty, and primary navigation explicit", async () => {
@@ -5475,7 +5579,7 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   assert.match(appSource, /renderHistoryProgress\(data\)/u);
   assert.match(appSource, /chart\.status\.resetOrTrackChange/u);
   assert.match(appSource, /chart\.status\.backwardOrAmbiguous/u);
-  assert.match(appSource, /Calculating usage and allowance/);
+  assert.match(appSource, /localAnalysis\.progress\.calculating/u);
   assert.match(html, /id="calibration-range-controls"/);
   assert.match(html, /id="weekly-range-controls"/);
   assert.match(html, /id="weekly-partial-legend"/);
@@ -6619,6 +6723,22 @@ test("the invisible review bootstrap keeps fixed lookbacks and fails dense days 
 
 test("return visits schedule one bounded checkpoint refresh after cached results render", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  // Electron matches the native installed app by starting one foreground
+  // analysis only after its first real dashboard read. The page-local fence
+  // prevents duplicate startup calls, while native WebKit and normal browsers
+  // retain their existing owners.
+  assert.match(
+    appSource,
+    /let electronStartupRefreshTriggered = false;/u,
+  );
+  assert.match(
+    appSource,
+    /function startElectronStartupRefresh\(\) \{[\s\S]*?electronStartupRefreshTriggered[\s\S]*?!runsInsideElectronDashboard\(\)[\s\S]*?!localAnalysisAllowed\(\)[\s\S]*?electronStartupRefreshTriggered = true;[\s\S]*?void requestRefresh\(\);[\s\S]*?return true;/u,
+  );
+  assert.match(
+    appSource,
+    /await loadLocalDashboard\(\);\s*\n\s*startElectronStartupRefresh\(\);/u,
+  );
   assert.match(appSource, /function scheduleReturningUserRefresh\(\)/u);
   assert.match(appSource, /if \(runsInsideNativeDashboard\(\)\) return;/u);
   assert.match(appSource, /document\.documentElement\.classList\.contains\("native-dashboard"\)/u);
@@ -6632,6 +6752,168 @@ test("return visits schedule one bounded checkpoint refresh after cached results
     appSource,
     /await loadCommunityResults\(\);[\s\S]{0,360}?void resumePendingHostedSignIn\(\);\s*\n\s*scheduleReturningUserRefresh\(\);/u,
   );
+});
+
+test("Electron startup refresh is behaviorally gated and owns the document return pass", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  // app.js is a shipped browser boot script rather than an importable module.
+  // Execute the real gate, one-shot, and return-scheduler functions in a small
+  // browser-shaped VM so this test checks behavior instead of only matching
+  // their source text.
+  const stateStart = appSource.indexOf("let returnRefreshScheduled = false;");
+  const stateEnd = appSource.indexOf("let globalState = null;", stateStart);
+  const localAllowedStart = appSource.indexOf("function localAnalysisAllowed(value = localOnboarding)");
+  const localAllowedEnd = appSource.indexOf("\nfunction localAnalysisLabel", localAllowedStart);
+  const nativeStart = appSource.indexOf("function runsInsideNativeDashboard() {");
+  const nativeEnd = appSource.indexOf("\nfunction runsInsideElectronDashboard", nativeStart);
+  const electronStart = appSource.indexOf("function runsInsideElectronDashboard() {");
+  const electronEnd = appSource.indexOf("\nfunction hostedSignInBrowserHandoffError", electronStart);
+  const startupStart = appSource.indexOf("function startElectronStartupRefresh() {");
+  const startupEnd = appSource.indexOf("\nfunction scheduleReturningUserRefresh", startupStart);
+  const scheduleStart = appSource.indexOf("function scheduleReturningUserRefresh() {");
+  const scheduleEnd = appSource.indexOf("\nconst HOSTED_IDENTITY_ERROR_COPY", scheduleStart);
+  for (const [name, start, end] of [
+    ["state", stateStart, stateEnd],
+    ["local analysis gate", localAllowedStart, localAllowedEnd],
+    ["native marker helper", nativeStart, nativeEnd],
+    ["Electron marker helper", electronStart, electronEnd],
+    ["startup helper", startupStart, startupEnd],
+    ["return scheduler", scheduleStart, scheduleEnd],
+  ]) {
+    assert.ok(start >= 0 && end > start, `could not isolate ${name}`);
+  }
+
+  function createHarness({
+    classes,
+    allowed,
+    smokeBridge = undefined,
+    terminalHistoryGap = false,
+  }) {
+    const harness = {
+      calls: 0,
+      timers: [],
+      __TIBOTATTLE_ELECTRON_MACOS_SMOKE__: smokeBridge,
+      __terminalHistoryGap: terminalHistoryGap,
+      dashboard: {
+        mode: "real_local_evidence",
+        activity: { lastScanAt: "2026-08-23T00:00:00.000Z" },
+      },
+      localOnboarding: {
+        state: "ready",
+        sessionsReadable: allowed,
+        archivedSessionsReadable: false,
+        rolloutFilesPresent: allowed,
+        stateWritable: allowed,
+        explicitRefresh: allowed,
+      },
+      localActionBusy: false,
+      localRefreshInProgress: false,
+      document: {
+        documentElement: { classList: { contains: (name) => classes.has(name) } },
+        body: { classList: { contains: (name) => classes.has(name) } },
+      },
+      window: {
+        setTimeout: (callback) => {
+          harness.timers.push(callback);
+          return harness.timers.length;
+        },
+      },
+      showConnectionNotice() {},
+    };
+    harness.requestRefresh = () => { harness.calls += 1; };
+    vm.runInNewContext(`
+      ${appSource.slice(stateStart, stateEnd)}
+      ${appSource.slice(localAllowedStart, localAllowedEnd)}
+      ${appSource.slice(nativeStart, nativeEnd)}
+      ${appSource.slice(electronStart, electronEnd)}
+      ${appSource.slice(startupStart, startupEnd)}
+      // The production scheduler reads this decision from the history
+      // continuation helper, which is outside the intentionally narrow VM
+      // slice above. Inject only the field this test exercises so the harness
+      // remains faithful to that owner boundary.
+      function currentHistoryContinuationDecision() {
+        return { terminalGap: globalThis.__terminalHistoryGap === true };
+      }
+      ${appSource.slice(scheduleStart, scheduleEnd)}
+      globalThis.api = { startElectronStartupRefresh, scheduleReturningUserRefresh };
+    `, vm.createContext(harness));
+    return harness;
+  }
+
+  const browser = createHarness({ classes: new Set(), allowed: true });
+  assert.equal(browser.api.startElectronStartupRefresh(), false);
+  assert.equal(browser.calls, 0);
+  browser.api.scheduleReturningUserRefresh();
+  assert.equal(browser.timers.length, 1, "browser return visits retain their scheduler");
+
+  const browserWithTerminalHistoryGap = createHarness({
+    classes: new Set(),
+    allowed: true,
+    terminalHistoryGap: true,
+  });
+  browserWithTerminalHistoryGap.api.scheduleReturningUserRefresh();
+  assert.equal(
+    browserWithTerminalHistoryGap.timers.length,
+    0,
+    "terminal history gaps suppress a return refresh",
+  );
+
+  const native = createHarness({ classes: new Set(["native-dashboard"]), allowed: true });
+  assert.equal(native.api.startElectronStartupRefresh(), false);
+  assert.equal(native.calls, 0);
+  native.api.scheduleReturningUserRefresh();
+  assert.equal(native.timers.length, 0, "native cadence remains main-owned");
+
+  const electronBlocked = createHarness({
+    classes: new Set(["electron-dashboard"]),
+    allowed: false,
+  });
+  assert.equal(electronBlocked.api.startElectronStartupRefresh(), false);
+  assert.equal(electronBlocked.calls, 0);
+  electronBlocked.api.scheduleReturningUserRefresh();
+  assert.equal(electronBlocked.timers.length, 0, "Electron never refreshes before its preflight gate");
+
+  const electron = createHarness({
+    classes: new Set(["electron-dashboard"]),
+    allowed: true,
+  });
+  assert.equal(electron.api.startElectronStartupRefresh(), true);
+  assert.equal(electron.calls, 1);
+  assert.equal(electron.api.startElectronStartupRefresh(), false, "startup is one-shot per document");
+  assert.equal(electron.calls, 1);
+  electron.api.scheduleReturningUserRefresh();
+  assert.equal(
+    electron.timers.length,
+    0,
+    "a fast startup completion cannot schedule a second Electron return refresh",
+  );
+
+  let releaseGate;
+  const startupGate = new Promise((resolve) => {
+    releaseGate = resolve;
+  });
+  const electronHeld = createHarness({
+    classes: new Set(["electron-dashboard"]),
+    allowed: true,
+    smokeBridge: Object.freeze({
+      version: "v1",
+      waitForStartupRefresh: () => startupGate,
+    }),
+  });
+  assert.equal(electronHeld.api.startElectronStartupRefresh(), true);
+  assert.equal(electronHeld.calls, 0, "mac smoke gate holds the first refresh");
+  assert.equal(electronHeld.api.startElectronStartupRefresh(), false);
+  releaseGate();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(electronHeld.calls, 1, "the refresh starts only after the gate resolves");
+
+  const electronMalformed = createHarness({
+    classes: new Set(["electron-dashboard"]),
+    allowed: true,
+    smokeBridge: Object.freeze({ version: "v1" }),
+  });
+  assert.equal(electronMalformed.api.startElectronStartupRefresh(), true);
+  assert.equal(electronMalformed.calls, 0, "a malformed smoke bridge fails closed");
 });
 
 test("new enrollment pairs immediately and intentionally discards recovery capability", async () => {
@@ -11287,7 +11569,31 @@ test("the handoff persists the moment the browser opens and every activation ret
   // initiator verifier alongside the state.
   assert.match(
     appSource,
-    /await persistPendingHostedSignIn\([\s\S]{0,140}?providerId,[\s\S]{0,80}?request\.state,[\s\S]{0,80}?request\.verifier,[\s\S]{0,80}?\);[\s\S]{0,300}?openHostedSignInInBrowser\(request\.authorizeUrl\);/u,
+    /await persistPendingHostedSignIn\([\s\S]{0,140}?providerId,[\s\S]{0,80}?request\.state,[\s\S]{0,80}?request\.verifier,[\s\S]{0,80}?\);[\s\S]{0,300}?await openHostedSignInInBrowser\(request\.authorizeUrl\);/u,
+  );
+  // Electron uses the one explicit, bounded bridge action. Native AppKit
+  // keeps its existing main-frame handoff, while an ordinary browser keeps
+  // its popup alive for result polling; no branch falls through accidentally.
+  assert.match(appSource, /async function openHostedSignInInBrowser\(authorizeUrl\)/u);
+  assert.match(
+    appSource,
+    /if \(runsInsideNativeDashboard\(\)\) \{[\s\S]{0,220}?window\.location\.assign\(authorizeUrl\);/u,
+  );
+  assert.match(
+    appSource,
+    /if \(runsInsideElectronDashboard\(\)\) \{[\s\S]{0,500}?await window\.tibotattleDesktop\.openHostedSignIn\(authorizeUrl\);/u,
+  );
+  assert.match(
+    appSource,
+    /const opened = window\.open\(authorizeUrl, "_blank", "noopener,noreferrer"\);/u,
+  );
+  assert.match(
+    appSource,
+    /hostedSignInBrowserHandoffError\("HOSTED_SIGNIN_BROWSER_BLOCKED"\)/u,
+  );
+  assert.doesNotMatch(
+    appSource,
+    /catch \(error\) \{[\s\S]{0,220}?error\.message[\s\S]{0,220}?throw error;/u,
   );
   // Collected on load and on every reactivation surface.
   assert.match(

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   chmod,
   link,
@@ -17,8 +18,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  buildClaudeCallbackRunnerInvocation,
   ClaudeCallbackLifecycleError,
   buildManagedClaudeStatusLine,
+  defaultClaudeSettingsFile,
   inspectClaudeCallbackLifecycle,
   installClaudeCallback,
   planManagedClaudeCallbackCapabilityRemoval,
@@ -26,9 +29,16 @@ import {
   recoverClaudeCallbackLifecycle,
   removeManagedClaudeCallbackCapability,
   rotateManagedClaudeCallbackCapability,
+  selectClaudeCallbackRunner,
   uninstallClaudeCallback,
 } from "../src/claude-callback-lifecycle.js";
 import { EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES } from "../src/export-identity-keychain.js";
+import { createWindowsFilesystemAdapter } from "../src/platform/windows-filesystem.js";
+import {
+  createWindowsProtectedStateStore,
+  isWindowsProtectedStateStore,
+} from "../src/platform/windows-protected-state-store.js";
+import { WINDOWS_PRODUCTION_READINESS } from "../src/platform/windows-production-readiness.js";
 
 const CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.claudeSessionPseudonym;
 const EXISTING_COMMAND = "printf 'existing status'";
@@ -113,6 +123,348 @@ function lifecycleOptions(value, extra = {}) {
   };
 }
 
+const WINDOWS_LIFECYCLE_ROOT = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\callback";
+const WINDOWS_SETTINGS_ROOT = "C:\\Users\\tester\\.claude";
+const WINDOWS_SETTINGS_FILE = `${WINDOWS_SETTINGS_ROOT}\\settings.json`;
+const WINDOWS_IDENTITY = Object.freeze({
+  volumeSerialNumber: "0000000000000001",
+  fileId: "00112233445566778899aabbccddeeff",
+  linkCount: 1,
+});
+const WINDOWS_TEST_RUNNER = Object.freeze({
+  schemaVersion: "claude-callback-runner-v1",
+  kind: "powershell",
+  executable: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+});
+
+test("Windows callback runner selection prefers Git Bash and falls back to inbox PowerShell", () => {
+  const environment = {
+    ProgramFiles: "C:\\Program Files",
+    SystemRoot: "C:\\Windows",
+  };
+  const git = selectClaudeCallbackRunner({
+    platform: "win32",
+    environment,
+    exists: (path) => path === "C:\\Program Files\\Git\\bin\\bash.exe",
+  });
+  assert.deepEqual(git, {
+    schemaVersion: "claude-callback-runner-v1",
+    kind: "git_bash",
+    executable: "C:\\Program Files\\Git\\bin\\bash.exe",
+  });
+  const powershell = selectClaudeCallbackRunner({
+    platform: "win32",
+    environment,
+    exists: (path) => path.endsWith("\\powershell.exe"),
+  });
+  assert.deepEqual(powershell, {
+    schemaVersion: "claude-callback-runner-v1",
+    kind: "powershell",
+    executable: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+  });
+  assert.throws(
+    () => selectClaudeCallbackRunner({
+      platform: "win32",
+      runner: {
+        schemaVersion: "claude-callback-runner-v1",
+        kind: "powershell",
+        executable: "C:\\Windows\\System32\\cmd.exe",
+      },
+    }),
+    fixedLifecycleError("coexistence_unsupported"),
+  );
+  for (const runner of [
+    {
+      schemaVersion: "claude-callback-runner-v1",
+      kind: "git_bash",
+      executable: "C:\\Temp\\git\\bash.exe",
+    },
+    {
+      schemaVersion: "claude-callback-runner-v1",
+      kind: "powershell",
+      executable: "C:\\Users\\tester\\WindowsPowerShell\\powershell.exe",
+    },
+  ]) {
+    assert.throws(
+      () => selectClaudeCallbackRunner({ platform: "win32", runner }),
+      fixedLifecycleError("coexistence_unsupported"),
+    );
+  }
+});
+
+test("Windows managed callback command quotes packaged Electron paths and sets run-as-node", () => {
+  const powershell = {
+    schemaVersion: "claude-callback-runner-v1",
+    kind: "powershell",
+    executable: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+  };
+  const statusLine = buildManagedClaudeStatusLine({
+    platform: "win32",
+    windowsRunner: powershell,
+    nodeExecutable: "C:\\Program Files\\Tibo's Ω\\TiboTattle.exe",
+    runtimeScript: "C:\\Program Files\\Tibo's Ω\\callback runtime.js",
+  });
+  assert.equal(
+    statusLine.command,
+    "$env:ELECTRON_RUN_AS_NODE = '1'; & 'C:\\Program Files\\Tibo''s Ω\\TiboTattle.exe' 'C:\\Program Files\\Tibo''s Ω\\callback runtime.js'",
+  );
+  assert.equal(statusLine.command.includes("cmd.exe"), false);
+  assert.deepEqual(
+    buildClaudeCallbackRunnerInvocation(powershell, statusLine.command),
+    {
+      command: powershell.executable,
+      args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", statusLine.command],
+    },
+  );
+});
+
+test("Claude callback settings default follows Windows USERPROFILE and CLAUDE_CONFIG_DIR", () => {
+  assert.equal(
+    defaultClaudeSettingsFile({
+      platform: "win32",
+      environment: { USERPROFILE: "C:\\Users\\tester" },
+    }),
+    "C:\\Users\\tester\\.claude\\settings.json",
+  );
+  assert.equal(
+    defaultClaudeSettingsFile({
+      platform: "win32",
+      environment: {
+        USERPROFILE: "C:\\Users\\tester",
+        CLAUDE_CONFIG_DIR: "D:/Claude//config/",
+      },
+    }),
+    "D:\\Claude\\config\\settings.json",
+  );
+  assert.equal(
+    defaultClaudeSettingsFile({
+      platform: "win32",
+      environment: { USERPROFILE: "C:/Users//Zoë Smith" },
+    }),
+    "C:\\Users\\Zoë Smith\\.claude\\settings.json",
+  );
+  for (const value of ["relative-config", "/tmp/config", "C:\\Users\\tester\\..\\other", "C:\\tmp\u0000private"]) {
+    assert.throws(
+      () => defaultClaudeSettingsFile({
+        platform: "win32",
+        environment: { USERPROFILE: "C:\\Users\\tester", CLAUDE_CONFIG_DIR: value },
+      }),
+      (error) => error?.code === "claude_callback_lifecycle_invalid_configuration",
+      value,
+    );
+  }
+  for (const component of [
+    "CON", "NUL.txt", "PRN", "AUX", "COM1", "LPT9",
+    "bad<name", "bad>name", 'bad"name', "bad|name", "bad?name", "bad*name",
+    "trailing.", "trailing ",
+  ]) {
+    assert.throws(
+      () => defaultClaudeSettingsFile({
+        platform: "win32",
+        environment: {
+          USERPROFILE: "C:\\Users\\tester",
+          CLAUDE_CONFIG_DIR: `C:\\Users\\tester\\${component}`,
+        },
+      }),
+      (error) => error?.code === "claude_callback_lifecycle_invalid_configuration",
+      component,
+    );
+  }
+});
+
+function windowsStoreFixture(settings = {
+  theme: "dark",
+  statusLine: { type: "command", command: EXISTING_COMMAND },
+}) {
+  const entries = new Map();
+  const calls = [];
+  let nextFileId = 2;
+  const identity = (number) => Object.freeze({
+    volumeSerialNumber: WINDOWS_IDENTITY.volumeSerialNumber,
+    fileId: number.toString(16).padStart(32, "0"),
+    linkCount: 1,
+  });
+  const same = (left, right) => left?.volumeSerialNumber === right?.volumeSerialNumber
+    && left?.fileId === right?.fileId
+    && left?.linkCount === right?.linkCount;
+  const metadata = (entry) => ({
+    identity: entry.identity,
+    isDirectory: entry.directory === true,
+    isRegularFile: entry.directory !== true,
+    isReparsePoint: false,
+    ownerMatches: true,
+    nullDacl: false,
+    daclProtected: true,
+    broadAccess: false,
+    nonOwnerAllow: false,
+    unrecognizedAce: false,
+    finalPathResolved: true,
+  });
+  const addDirectory = (path, entry = {}) => {
+    entries.set(path, { directory: true, identity: entry.identity ?? identity(nextFileId++), ...entry });
+  };
+  addDirectory(WINDOWS_LIFECYCLE_ROOT, { identity: WINDOWS_IDENTITY });
+  addDirectory(WINDOWS_SETTINGS_ROOT, { identity: identity(nextFileId++) });
+  const failure = (code) => {
+    const error = new Error("Windows filesystem operation failed");
+    error.code = `WINDOWS_FILESYSTEM_${code}`;
+    return error;
+  };
+  const binding = {
+    contractVersion: "windows-filesystem-v1",
+    securityContractVersion: "windows-filesystem-security-v1",
+    credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
+    sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
+    credentialMutexContractVersion: "windows-credential-mutex-v1",
+    companionInstanceMutexContractVersion: "windows-companion-instance-mutex-v1",
+    preparedArtifactContractVersion: "windows-prepared-artifact-v1",
+    productionSafe: false,
+    pathWalkRaceSafe: false,
+    credentialMutexSafe: true,
+    companionInstanceMutexSafe: false,
+    credentialAuditFileGuardSafe: true,
+    sqliteStateLeaseSafe: false,
+    preparedArtifactSafe: false,
+    inspectPath(path) {
+      calls.push(["inspectPath", path]);
+      const entry = entries.get(path);
+      if (!entry) throw failure("NOT_FOUND");
+      return metadata(entry);
+    },
+    ensureDirectory(path) {
+      calls.push(["ensureDirectory", path]);
+      const entry = entries.get(path);
+      if (entry) {
+        if (!entry.directory) throw failure("NOT_DIRECTORY");
+        return entry.identity;
+      }
+      addDirectory(path);
+      return entries.get(path).identity;
+    },
+    readFile(path) {
+      calls.push(["readFile", path]);
+      const entry = entries.get(path);
+      if (!entry) throw failure("NOT_FOUND");
+      if (entry.directory) throw failure("NOT_REGULAR_FILE");
+      return { data: Buffer.from(entry.data), identity: entry.identity };
+    },
+    readFileBounded(path, maximumBytes) {
+      const result = this.readFile(path);
+      if (result.data.byteLength > maximumBytes) throw failure("FILE_TOO_LARGE");
+      return result;
+    },
+    createFile(path, data) {
+      calls.push(["createFile", path]);
+      if (entries.has(path)) throw failure("ALREADY_EXISTS");
+      const file = { directory: false, data: Buffer.from(data), identity: identity(nextFileId++) };
+      entries.set(path, file);
+      return file.identity;
+    },
+    deleteFile(path, expectedIdentity) {
+      calls.push(["deleteFile", path]);
+      const entry = entries.get(path);
+      if (!entry) throw failure("NOT_FOUND");
+      if (!same(entry.identity, expectedIdentity)) throw failure("IDENTITY_MISMATCH");
+      entries.delete(path);
+      return { deleted: true, identity: entry.identity };
+    },
+    replaceFile(path, expectedIdentity, data) {
+      calls.push(["replaceFile", path]);
+      const entry = entries.get(path);
+      if (!entry) throw failure("NOT_FOUND");
+      if (entry.directory || !same(entry.identity, expectedIdentity)) throw failure("IDENTITY_MISMATCH");
+      entry.data = Buffer.from(data);
+      entry.identity = identity(nextFileId++);
+      return entry.identity;
+    },
+    inspectProtectedChild(rootPath, _rootIdentity, childPath) {
+      return this.inspectPath(`${rootPath}\\${childPath}`);
+    },
+    readProtectedChild(rootPath, _rootIdentity, childPath, maximumBytes) {
+      return this.readFileBounded(`${rootPath}\\${childPath}`, maximumBytes);
+    },
+    createProtectedChild(rootPath, _rootIdentity, childPath, data) {
+      return this.createFile(`${rootPath}\\${childPath}`, data);
+    },
+    deleteProtectedChild(rootPath, _rootIdentity, childPath, expectedIdentity) {
+      return this.deleteFile(`${rootPath}\\${childPath}`, expectedIdentity);
+    },
+    replaceProtectedChild(rootPath, _rootIdentity, childPath, expectedIdentity, data) {
+      return this.replaceFile(`${rootPath}\\${childPath}`, expectedIdentity, data);
+    },
+    inspectPreparedChild() { return { identity: WINDOWS_IDENTITY }; },
+    ensurePreparedDirectory() { return WINDOWS_IDENTITY; },
+    enumeratePreparedDirectory() { return []; },
+    removePreparedDirectory() {
+      return { removed: true, identity: WINDOWS_IDENTITY };
+    },
+    renamePreparedDirectory() {
+      return { renamed: true, identity: WINDOWS_IDENTITY };
+    },
+    createPreparedFile() { return WINDOWS_IDENTITY; },
+    readPreparedFile() {
+      return { data: Buffer.from("data"), identity: WINDOWS_IDENTITY };
+    },
+    deletePreparedFile() {
+      return { deleted: true, identity: WINDOWS_IDENTITY };
+    },
+    publishPreparedFile() {
+      return { published: true, identity: WINDOWS_IDENTITY };
+    },
+    acquireCredentialAuditFileGuard() { return { guard: {}, identity: WINDOWS_IDENTITY }; },
+    releaseCredentialAuditFileGuard() {},
+    acquireCredentialMutex() { return { lease: {}, abandoned: false }; },
+    releaseCredentialMutex() {},
+    acquireCompanionInstanceMutex() { return { lease: {}, abandoned: false }; },
+    releaseCompanionInstanceMutex() {},
+    acquireSqliteStateLease() {
+      return {
+        lease: {},
+        databaseIdentity: WINDOWS_IDENTITY,
+        journalIdentity: WINDOWS_IDENTITY,
+      };
+    },
+    releaseSqliteStateLease() {},
+  };
+  const adapter = createWindowsFilesystemAdapter({ platform: "win32", architecture: "x64", binding });
+  const lifecycleStore = createWindowsProtectedStateStore({
+    adapter,
+    rootPath: WINDOWS_LIFECYCLE_ROOT,
+  });
+  const settingsStore = createWindowsProtectedStateStore({
+    adapter,
+    rootPath: WINDOWS_SETTINGS_ROOT,
+  });
+  settingsStore.createJson("settings.json", settings);
+  return {
+    adapter,
+    calls,
+    entries,
+    lifecycleStore,
+    settingsStore,
+    settingsFile: WINDOWS_SETTINGS_FILE,
+    lifecycleDirectory: WINDOWS_LIFECYCLE_ROOT,
+  };
+}
+
+function windowsLifecycleOptions(value, extra = {}) {
+  return {
+    platform: "win32",
+    windowsRunner: WINDOWS_TEST_RUNNER,
+    settingsFile: value.settingsFile,
+    lifecycleDirectory: value.lifecycleDirectory,
+    windowsLifecycleStore: value.lifecycleStore,
+    windowsSettingsStore: value.settingsStore,
+    installedStatusLine: buildManagedClaudeStatusLine({
+      platform: "win32",
+      windowsRunner: WINDOWS_TEST_RUNNER,
+      nodeExecutable: "C:\\safe\\node.exe",
+      runtimeScript: "C:\\safe\\runtime.js",
+    }),
+    ...extra,
+  };
+}
+
 function fixedLifecycleError(code) {
   return (error) => {
     assert.equal(error instanceof ClaudeCallbackLifecycleError, true);
@@ -121,6 +473,16 @@ function fixedLifecycleError(code) {
     assert.equal(error.message.includes(EXISTING_COMMAND), false);
     return true;
   };
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return value.map(stableJson);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value).sort().map((key) => [key, stableJson(value[key])]),
+    );
+  }
+  return value;
 }
 
 test("install composes a supported existing command, stores private state, and uninstall restores it exactly", async () => {
@@ -191,6 +553,228 @@ test("inspection binding never hashes or exposes the private existing command", 
     assert.match(first.targetBinding, /^[a-f0-9]{64}$/);
     assert.equal(JSON.stringify(first).includes(EXISTING_COMMAND), false);
   });
+});
+
+test("Windows callback lifecycle state is blocked before touching settings, state, or locks", async () => {
+  const root = await mkdtemp(join(tmpdir(), "claude-callback-windows-gate-"));
+  const ownerUrl = new URL("../src/platform/claude-callback-lifecycle.js", import.meta.url).href;
+  const script = `
+    Object.defineProperty(process, "platform", { value: "win32" });
+    const { createClaudeCallbackLifecycleContext } = await import(${JSON.stringify(ownerUrl)});
+    const { join } = await import("node:path");
+    class CapabilityError extends Error {}
+    const calls = [];
+    const context = createClaudeCallbackLifecycleContext({
+      ClaudeCallbackCapabilityError: CapabilityError,
+      ensureClaudeCallbackCapability: async () => { calls.push("ensure"); return { status: "created", secret: Buffer.alloc(32) }; },
+      planClaudeCallbackCapabilityRemoval: async () => { calls.push("plan"); return { status: "missing", confirmationToken: null }; },
+      removeClaudeCallbackCapability: async () => { calls.push("remove"); return { status: "removed", secureErasure: false }; },
+      rotateClaudeCallbackCapability: async () => { calls.push("rotate"); return { status: "rotated" }; },
+      runtimeScript: "/safe/runtime.js",
+    });
+    const options = {
+      // A caller cannot downgrade a real Windows runtime into the POSIX
+      // implementation by supplying a synthetic platform override.
+      platform: "darwin",
+      settingsFile: join(process.env.CLAUDE_WINDOWS_GATE_ROOT, "settings.json"),
+      lifecycleDirectory: join(process.env.CLAUDE_WINDOWS_GATE_ROOT, "lifecycle"),
+      installedStatusLine: context.buildManagedClaudeStatusLine({
+        nodeExecutable: "C:/Safe/node.exe",
+        runtimeScript: "C:/Safe/runtime.js",
+        platform: "win32",
+        windowsRunner: {
+          schemaVersion: "claude-callback-runner-v1",
+          kind: "powershell",
+          executable: "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+        },
+      }),
+      backend: {},
+    };
+    const operations = [
+      () => context.inspectClaudeCallbackLifecycle(options),
+      () => context.recoverClaudeCallbackLifecycle(options),
+      () => context.installClaudeCallback(options),
+      () => context.uninstallClaudeCallback(options),
+      () => context.rotateManagedClaudeCallbackCapability(options),
+      () => context.planManagedClaudeCallbackCapabilityRemoval(options),
+      () => context.removeManagedClaudeCallbackCapability({ ...options, providedToken: "" }),
+      () => context.readClaudeCallbackRuntimeConfiguration(options),
+    ];
+    const codes = [];
+    for (const operation of operations) {
+      try {
+        await operation();
+      } catch (error) {
+        codes.push(error?.code ?? "unknown");
+      }
+    }
+    process.stdout.write(JSON.stringify({ calls, codes }));
+  `;
+  try {
+    const result = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+      cwd: process.cwd(),
+      env: { ...process.env, CLAUDE_WINDOWS_GATE_ROOT: root },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), {
+      calls: [],
+      codes: Array.from({ length: 8 }, () => "claude_callback_lifecycle_windows_state_unqualified"),
+    });
+    await assert.rejects(lstat(join(root, "settings.json")), { code: "ENOENT" });
+    await assert.rejects(lstat(join(root, "lifecycle")), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("explicit Windows composition routes settings, lifecycle state, pending state, and lease through branded stores", async () => {
+  const value = windowsStoreFixture();
+  const backend = memoryBackend();
+  const options = windowsLifecycleOptions(value, {
+    backend,
+    generateSecret: () => Buffer.alloc(32, 7),
+  });
+  assert.equal(isWindowsProtectedStateStore(value.lifecycleStore), true);
+  assert.equal(isWindowsProtectedStateStore(value.settingsStore), true);
+  assert.deepEqual(await installClaudeCallback(options), {
+    status: "installed",
+    capability: "created",
+  });
+  assert.deepEqual(value.settingsStore.readJson("settings.json").value.statusLine, options.installedStatusLine);
+  assert.equal(value.lifecycleStore.readJson("lifecycle-state.json").value.phase, "installed");
+  assert.equal(value.entries.has(`${WINDOWS_LIFECYCLE_ROOT}\\operation.lock`), false);
+  assert.equal(value.entries.has(`${WINDOWS_LIFECYCLE_ROOT}\\.lifecycle-state.pending`), false);
+  assert.deepEqual(await readClaudeCallbackRuntimeConfiguration(options), {
+    previousCommand: EXISTING_COMMAND,
+    previousRunner: WINDOWS_TEST_RUNNER,
+  });
+  assert.deepEqual(await uninstallClaudeCallback(options), {
+    status: "uninstalled",
+    capabilityPreserved: true,
+  });
+  assert.equal(value.settingsStore.readJson("settings.json").value.statusLine.command, EXISTING_COMMAND);
+  assert.equal(value.lifecycleStore.readJson("lifecycle-state.json").value.phase, "uninstalled");
+  assert.ok(value.calls.length > 0);
+  assert.equal(value.calls.every(([, path]) => typeof path !== "string" || path.startsWith("C:\\")), true);
+});
+
+test("Windows runtime rejects a persisted runner identity substitution", async () => {
+  const value = windowsStoreFixture();
+  const options = windowsLifecycleOptions(value, {
+    backend: memoryBackend(),
+    generateSecret: () => Buffer.alloc(32, 11),
+  });
+  await installClaudeCallback(options);
+  const statePath = `${value.lifecycleDirectory}\\lifecycle-state.json`;
+  const stateEntry = value.entries.get(statePath);
+  const state = JSON.parse(stateEntry.data.toString("utf8"));
+  state.previousRunner = {
+    schemaVersion: "claude-callback-runner-v1",
+    kind: "git_bash",
+    executable: "C:\\Program Files\\Git\\bin\\bash.exe",
+  };
+  stateEntry.data = Buffer.from(`${JSON.stringify(stableJson(state), null, 2)}\n`);
+  await assert.rejects(
+    readClaudeCallbackRuntimeConfiguration(options),
+    fixedLifecycleError("coexistence_unsupported"),
+  );
+});
+
+test("explicit Windows protected stores preserve prepared-phase crash recovery", async () => {
+  const value = windowsStoreFixture();
+  const backend = memoryBackend();
+  const options = windowsLifecycleOptions(value, {
+    backend,
+    generateSecret: () => Buffer.alloc(32, 8),
+    failpoint(point) {
+      if (point === "after_install_state_prepared") throw new Error("simulated interruption");
+    },
+  });
+  await assert.rejects(installClaudeCallback(options), /simulated interruption/u);
+  assert.equal(value.lifecycleStore.readJson("lifecycle-state.json").value.phase, "install_prepared");
+  const recovered = await recoverClaudeCallbackLifecycle(windowsLifecycleOptions(value, { backend }));
+  assert.deepEqual(recovered.status, "installed");
+  assert.equal(value.lifecycleStore.readJson("lifecycle-state.json").value.phase, "installed");
+  assert.deepEqual(value.settingsStore.readJson("settings.json").value.statusLine, options.installedStatusLine);
+});
+
+test("an actual Windows runtime rejects branded unqualified stores and copied readiness", async () => {
+  const value = windowsStoreFixture();
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  const settingsBefore = Buffer.from(value.entries.get(WINDOWS_SETTINGS_FILE).data);
+  const copiedReadiness = {
+    ...WINDOWS_PRODUCTION_READINESS,
+    status: "qualified",
+    credentialMutexSafe: true,
+    durableAuditSafe: true,
+    protectedStatePathsSafe: true,
+    authenticatedBindingSafe: true,
+    bindingProvenance: {
+      ...WINDOWS_PRODUCTION_READINESS.bindingProvenance,
+      status: "qualified",
+      source: "audited-signed-native-binding",
+    },
+    qualificationReceipt: "windows-fake",
+    qualifiedAt: "2026-08-18T00:00:00.000Z",
+  };
+  Object.defineProperty(process, "platform", { ...platformDescriptor, value: "win32" });
+  try {
+    await assert.rejects(
+      installClaudeCallback(windowsLifecycleOptions(value, {
+        backend: memoryBackend(),
+        generateSecret: () => Buffer.alloc(32, 10),
+        windowsReadiness: copiedReadiness,
+      })),
+      fixedLifecycleError("windows_state_unqualified"),
+    );
+    assert.deepEqual(value.entries.get(WINDOWS_SETTINGS_FILE).data, settingsBefore);
+    assert.equal(value.entries.has(`${WINDOWS_LIFECYCLE_ROOT}\\operation.lock`), false);
+    assert.equal(value.entries.has(`${WINDOWS_LIFECYCLE_ROOT}\\lifecycle-state.json`), false);
+  } finally {
+    Object.defineProperty(process, "platform", platformDescriptor);
+  }
+});
+
+test("Windows settings revalidation rejects same-identity content mutation", async () => {
+  const value = windowsStoreFixture();
+  const backend = memoryBackend();
+  const options = windowsLifecycleOptions(value, {
+    backend,
+    generateSecret: () => Buffer.alloc(32, 9),
+    failpoint(point) {
+      if (point === "after_install_state_prepared") {
+        const settings = value.entries.get(WINDOWS_SETTINGS_FILE);
+        settings.data = Buffer.from(settings.data.toString("utf8").replace("dark", "dork"));
+      }
+    },
+  });
+  await assert.rejects(
+    installClaudeCallback(options),
+    fixedLifecycleError("settings_replaced"),
+  );
+  assert.equal(value.entries.get(WINDOWS_SETTINGS_FILE).identity.linkCount, 1);
+  assert.equal(value.lifecycleStore.readJson("lifecycle-state.json").value.phase, "install_prepared");
+});
+
+test("Windows protected-store composition rejects missing, copied, and root-mismatched stores", async () => {
+  const value = windowsStoreFixture();
+  const backend = memoryBackend();
+  const base = windowsLifecycleOptions(value, { backend });
+  const cases = [
+    { windowsLifecycleStore: undefined },
+    { windowsSettingsStore: undefined },
+    { windowsLifecycleStore: { ...value.lifecycleStore } },
+    { windowsSettingsStore: { ...value.settingsStore } },
+    { lifecycleDirectory: "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\other" },
+    { settingsFile: "C:\\Users\\tester\\.other\\settings.json" },
+  ];
+  for (const override of cases) {
+    await assert.rejects(
+      inspectClaudeCallbackLifecycle({ ...base, ...override }),
+      fixedLifecycleError("windows_state_unqualified"),
+    );
+  }
 });
 
 test("install and uninstall prepared phases recover deterministically after interruptions", async () => {

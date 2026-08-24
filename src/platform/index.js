@@ -30,6 +30,95 @@ export {
   createWindowsProductionReadinessAttestation,
 } from "./windows-production-readiness.js";
 export {
+  assertWindowsFilesystemProductionSafe,
+  createWindowsFilesystemAdapter,
+  isWindowsFilesystemAdapter,
+  isWindowsFilesystemIdentity,
+} from "./windows-filesystem.js";
+export {
+  WINDOWS_ELECTRON_QUALIFICATION_ENVIRONMENT_VALUE,
+  WINDOWS_ELECTRON_QUALIFICATION_ENVIRONMENT_VARIABLE,
+  WINDOWS_ELECTRON_QUALIFICATION_MODE_CONTRACT_VERSION,
+  WINDOWS_ELECTRON_QUALIFICATION_TEST_LANE,
+  WINDOWS_QUALIFICATION_MODE_ACCOUNTING_SOURCE_MODE,
+  WINDOWS_QUALIFICATION_MODE_CONTRACT_VERSION,
+  WINDOWS_QUALIFICATION_MODE_ENVIRONMENT_VALUE,
+  WINDOWS_QUALIFICATION_MODE_ENVIRONMENT_VARIABLE,
+  WINDOWS_QUALIFICATION_MODE_PRODUCTION_SAFE,
+  WINDOWS_QUALIFICATION_MODE_QUALIFICATION_ONLY,
+  WINDOWS_QUALIFICATION_MODE_TEST_LANE,
+  WINDOWS_QUALIFICATION_MODE_TEST_LANE_ENVIRONMENT_VARIABLE,
+  WindowsQualificationModeError,
+  assertWindowsQualificationResourceAuthority,
+  createWindowsQualificationModeContext,
+  isWindowsQualificationModeContext,
+  isWindowsQualificationModeContextFor,
+  isWindowsQualificationModeError,
+} from "./windows-qualification-mode.js";
+export {
+  WINDOWS_PREPARED_ARTIFACT_STORAGE_CONTRACT_VERSION,
+  WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_ARTIFACT_BYTES,
+  WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_CONTRIBUTION_BYTES,
+  WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_DIRECTORY_ENTRIES,
+  WINDOWS_PREPARED_ARTIFACT_STORAGE_PRODUCTION_SAFE,
+  WINDOWS_PREPARED_ARTIFACT_STORAGE_READINESS,
+  WINDOWS_PREPARED_ARTIFACT_STORAGE_SAFE,
+  WindowsPreparedArtifactStorageError,
+  createWindowsPreparedArtifactStorageContext,
+  isWindowsPreparedArtifactStorage,
+  isWindowsPreparedArtifactStorageError,
+} from "./windows-prepared-artifact-storage.js";
+export {
+  WINDOWS_CONTRIBUTION_SYNC_QUEUE_STORAGE_CONTRACT_VERSION,
+  WINDOWS_CONTRIBUTION_SYNC_QUEUE_STORAGE_PRODUCTION_SAFE,
+  WINDOWS_CONTRIBUTION_SYNC_QUEUE_STORAGE_READINESS,
+  createWindowsContributionSyncQueuePreparedStoragePorts,
+} from "./windows-contribution-sync-queue-storage.js";
+export {
+  WINDOWS_REVIEW_PAIR_STORAGE_CONTRACT_VERSION,
+  WINDOWS_REVIEW_PAIR_STORAGE_MAXIMUM_BUNDLE_BYTES,
+  WINDOWS_REVIEW_PAIR_STORAGE_MAXIMUM_RECEIPT_BYTES,
+  WINDOWS_REVIEW_PAIR_STORAGE_PRODUCTION_SAFE,
+  WINDOWS_REVIEW_PAIR_STORAGE_READINESS,
+  WINDOWS_REVIEW_PAIR_STORAGE_SAFE,
+  WindowsReviewPairStorageError,
+  createWindowsReviewPairStorageContext,
+  isWindowsReviewPairStorage,
+  isWindowsReviewPairStorageError,
+} from "./windows-review-pair-storage.js";
+export {
+  WINDOWS_PROTECTED_STATE_STORE_CONTRACT_VERSION,
+  WINDOWS_PROTECTED_STATE_STORE_DEFAULT_MAX_BYTES,
+  WINDOWS_PROTECTED_STATE_STORE_LEASE_VERSION,
+  WINDOWS_PROTECTED_STATE_STORE_NATIVE_READ_BOUNDED,
+  WINDOWS_PROTECTED_STATE_STORE_ROOT_BINDING_SAFE,
+  WindowsProtectedStateStoreError,
+  createWindowsProtectedStateStore,
+  isWindowsProtectedStateStore,
+  isWindowsProtectedStateStoreError,
+} from "./windows-protected-state-store.js";
+export {
+  WINDOWS_SQLITE_STATE_SESSION_PRODUCTION_SAFE,
+  createWindowsSqliteStateSession,
+  isWindowsSqliteStateDatabase,
+  isWindowsSqliteStateSession,
+} from "./windows-sqlite-state-session.js";
+export {
+  WINDOWS_SQLITE_STATE_STAGING_CONTRACT_VERSION,
+  WINDOWS_SQLITE_STATE_STAGING_SAFE,
+  WindowsSqliteStateStagingError,
+  createWindowsSqliteStateStaging,
+  isWindowsSqliteStateStaging,
+} from "./windows-sqlite-state-staging.js";
+export {
+  LOCAL_COLLECTOR_STATE_SESSION_BOUNDARY_CONTRACT_VERSION,
+  createWindowsQualificationStateSessionFactory,
+  currentLocalCollectorStateSessionBoundary,
+  isLocalCollectorStateWindowsBoundaryActive,
+  openLocalCollectorStateSessionBoundary,
+  withLocalCollectorStateSessionBoundary,
+} from "./local-collector-state-session.js";
+export {
   CONTRIBUTION_DEVICE_READER_CODE_IDENTIFIER,
   CONTRIBUTION_DEVICE_READER_TEAM_IDENTIFIER,
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
@@ -65,8 +154,11 @@ export {
   readExportCompatibilityArtifactSet,
 } from "./export-compatibility-artifacts.js";
 export {
+  buildClaudeCallbackRunnerInvocation,
   ClaudeCallbackLifecycleError,
   createClaudeCallbackLifecycleContext,
+  selectClaudeCallbackRunner,
+  validateClaudeCallbackRunner,
 } from "./claude-callback-lifecycle.js";
 export {
   createExportSetVerificationStorageContext,
@@ -77,6 +169,13 @@ export {
 export {
   createOwnerOnlyAutomaticContributionStorageContext,
 } from "./owner-only-automatic-contribution-storage.js";
+export {
+  WINDOWS_COMPANION_INSTANCE_MUTEX_CONTRACT_VERSION,
+  WindowsCompanionInstanceLeaseError,
+  createWindowsCompanionInstanceLeaseContext,
+  isWindowsCompanionInstanceLeaseContext,
+  isWindowsCompanionInstanceLeaseError,
+} from "./windows-companion-instance-lease.js";
 export {
   createOwnerOnlyExportDeletionStorage,
 } from "./owner-only-export-deletion-storage.js";

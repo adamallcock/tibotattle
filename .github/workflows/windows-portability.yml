@@ -129,7 +129,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $buildLog = Join-Path $env:RUNNER_TEMP 'windows-filesystem-build.log'
+          $productionBuildLog = Join-Path $env:RUNNER_TEMP 'windows-filesystem-production-build.log'
+          $qualificationBuildLog = Join-Path $env:RUNNER_TEMP 'windows-filesystem-qualification-build.log'
           $npmCommand = (Get-Command npm.cmd).Source
           $nodeRoot = Split-Path $npmCommand -Parent
           $nodeGypScript = Join-Path $nodeRoot 'node_modules\npm\node_modules\node-gyp\bin\node-gyp.js'
@@ -137,16 +138,49 @@ jobs:
             Write-Error 'WINDOWS_FILESYSTEM_BINDING_BUILDER_UNAVAILABLE'
             exit 1
           }
-          node $nodeGypScript rebuild --directory native/windows-filesystem *> $buildLog
+          # The ordinary build has an explicit default of zero in binding.gyp;
+          # it must emit only the production target. The qualification target
+          # is compiled in a second, explicit pass with test hooks enabled.
+          node $nodeGypScript rebuild --directory native/windows-filesystem *> $productionBuildLog
           if ($LASTEXITCODE -ne 0) {
             # This hosted build runs before credentials or user state are
             # created. A bounded compiler tail is therefore safe and necessary
             # to diagnose native source failures without dumping later test
             # output, paths, SIDs, or credential-shaped values.
-            Get-Content -LiteralPath $buildLog -Tail 200
-            Write-Error 'WINDOWS_FILESYSTEM_BINDING_BUILD_FAILED'
+            Get-Content -LiteralPath $productionBuildLog -Tail 200
+            Write-Error 'WINDOWS_FILESYSTEM_PRODUCTION_BUILD_FAILED'
             exit 1
           }
+          $qualificationBindingPath = Join-Path $env:GITHUB_WORKSPACE 'native/windows-filesystem/build/Release/windows_filesystem_qualification.node'
+          if (Test-Path -LiteralPath $qualificationBindingPath -PathType Leaf) {
+            Write-Error 'WINDOWS_FILESYSTEM_PRODUCTION_BUILD_EMITTED_QUALIFICATION'
+            exit 1
+          }
+          node $nodeGypScript rebuild --directory native/windows-filesystem -- -Dtibotattle_build_qualification=1 *> $qualificationBuildLog
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content -LiteralPath $qualificationBuildLog -Tail 200
+            Write-Error 'WINDOWS_FILESYSTEM_QUALIFICATION_BUILD_FAILED'
+            exit 1
+          }
+          if (-not (Test-Path -LiteralPath $qualificationBindingPath -PathType Leaf)) {
+            Write-Error 'WINDOWS_FILESYSTEM_QUALIFICATION_BUILD_OUTPUT_MISSING'
+            exit 1
+          }
+          $qualificationDestination = Join-Path $env:RUNNER_TEMP 'windows_filesystem_qualification.node'
+          if (Test-Path -LiteralPath $qualificationDestination -PathType Leaf) {
+            Write-Error 'WINDOWS_FILESYSTEM_QUALIFICATION_DESTINATION_EXISTS'
+            exit 1
+          }
+          Move-Item -LiteralPath $qualificationBindingPath -Destination $qualificationDestination
+          if (Test-Path -LiteralPath $qualificationBindingPath -PathType Leaf) {
+            Write-Error 'WINDOWS_FILESYSTEM_PRODUCTION_BUILD_EMITTED_QUALIFICATION'
+            exit 1
+          }
+          if (-not (Test-Path -LiteralPath $qualificationDestination -PathType Leaf)) {
+            Write-Error 'WINDOWS_FILESYSTEM_QUALIFICATION_BINDING_MOVE_FAILED'
+            exit 1
+          }
+          "TIBOTATTLE_WINDOWS_QUALIFICATION_BINDING_PATH=$qualificationDestination" >> $env:GITHUB_ENV
 
       - name: Build the binding integrity manifest
         shell: pwsh
@@ -196,6 +230,22 @@ jobs:
           "- Credential mutex contract: windows-credential-mutex-v1 (owner-only, per capability)" >> $env:GITHUB_STEP_SUMMARY
           "- Credential audit file guard: windows-credential-audit-file-guard-v1 (main, journal, and two owned ancestors)" >> $env:GITHUB_STEP_SUMMARY
 
+      - name: Run bounded Windows filesystem security diagnostic
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node --input-type=module -e 'import { FIXED_STATUS, WINDOWS_PREPARED_DIRECTORY_ERROR_ALLOWLIST, WINDOWS_PREPARED_DIRECTORY_STAGE_ALLOWLIST, WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST, WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST, runNodeTests } from "./scripts/windows-security-qualification.mjs"; try { await runNodeTests(["test/windows-filesystem-security.test.js"], { timeoutMs: 120_000 }); console.log("WINDOWS_FILESYSTEM_SECURITY_DIAGNOSTIC_PASSED"); } catch (error) { const status = error?.code && Object.values(FIXED_STATUS).includes(error.code) ? error.code : FIXED_STATUS.failed; const testIndex = Number.isSafeInteger(error?.testIndex) && error.testIndex > 0 ? error.testIndex : "unavailable"; const testIndexes = Array.isArray(error?.testIndexes) && error.testIndexes.length <= 64 && error.testIndexes.every((value) => Number.isSafeInteger(value) && value > 0) ? error.testIndexes : []; const testLocations = Array.isArray(error?.testLocations) && error.testLocations.length <= 64 && error.testLocations.every((value) => Array.isArray(value) && value.length === 2 && value.every((part) => Number.isSafeInteger(part) && part > 0)) ? error.testLocations : []; const publishStages = Array.isArray(error?.publishStages) && error.publishStages.length <= 64 && error.publishStages.every((value) => WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST.includes(value)) ? [...new Set(error.publishStages)] : []; const publishErrors = Array.isArray(error?.publishErrors) && error.publishErrors.length <= 64 && error.publishErrors.every((value) => WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST.includes(value)) ? [...new Set(error.publishErrors)] : []; const preparedStages = Array.isArray(error?.preparedStages) && error.preparedStages.length <= 64 && error.preparedStages.every((value) => WINDOWS_PREPARED_DIRECTORY_STAGE_ALLOWLIST.includes(value)) ? [...new Set(error.preparedStages)] : []; const preparedErrors = Array.isArray(error?.preparedErrors) && error.preparedErrors.length <= 64 && error.preparedErrors.every((value) => WINDOWS_PREPARED_DIRECTORY_ERROR_ALLOWLIST.includes(value)) ? [...new Set(error.preparedErrors)] : []; console.error(`${status} test_index=${testIndex} test_indexes=${testIndexes.length > 0 ? testIndexes.join(",") : "unavailable"} test_locations=${testLocations.length > 0 ? testLocations.map(([line, column]) => `${line}:${column}`).join(";") : "unavailable"} publish_stages=${publishStages.length > 0 ? publishStages.join(",") : "unavailable"} publish_errors=${publishErrors.length > 0 ? publishErrors.join(",") : "unavailable"} prepared_stages=${preparedStages.length > 0 ? preparedStages.join(",") : "unavailable"} prepared_errors=${preparedErrors.length > 0 ? preparedErrors.join(",") : "unavailable"}`); process.exitCode = 1; }'
+
+      - name: Run bounded per-file Windows portable diagnostic
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node ./scripts/run-windows-portable-diagnostic.mjs
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_PORTABLE_DIAGNOSTIC_FAILED'
+            exit 1
+          }
+
       - name: Run portable Windows qualification
         shell: pwsh
         run: |
@@ -221,16 +271,41 @@ jobs:
           "TIBOTATTLE_WINDOWS_QUALIFICATION_STATE_ROOT=$qualificationStateRoot" >> $env:GITHUB_ENV
 
       - name: Run content-free Windows security qualification
+        id: native_security_qualification
+        continue-on-error: true
         shell: pwsh
         env:
           USAGE_MONITOR_WINDOWS_QUALIFICATION: "1"
         run: |
           $ErrorActionPreference = 'Stop'
+          $qualificationResultPath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-security-qualification.txt'
+          "TIBOTATTLE_WINDOWS_SECURITY_QUALIFICATION_RESULT_PATH=$qualificationResultPath" >> $env:GITHUB_ENV
           $result = node ./scripts/windows-security-qualification.mjs
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error 'WINDOWS_SECURITY_QUALIFICATION_FAILED'
+          $qualificationExitCode = $LASTEXITCODE
+          if ($qualificationExitCode -ne 0) {
+            # Keep only a fixed, bound marker for the blocked-development
+            # artifact. The native diagnostic already emits content-free
+            # failure metadata; this marker intentionally records no test
+            # output, paths, identities, or exception text.
+            $failureResult = "WINDOWS_SECURITY_QUALIFICATION_FAILED revision=$env:TIBOTATTLE_QUALIFICATION_REVISION cache=$env:TIBOTATTLE_QUALIFICATION_CACHE_MODE binding_bytes=$env:TIBOTATTLE_WINDOWS_BINDING_BYTES binding_sha256=$env:TIBOTATTLE_WINDOWS_BINDING_SHA256"
+            [IO.File]::WriteAllText(
+              $qualificationResultPath,
+              "$failureResult`n",
+              [Text.UTF8Encoding]::new($false)
+            )
+            "TIBOTATTLE_WINDOWS_SECURITY_QUALIFICATION_STATUS=failed" >> $env:GITHUB_ENV
+            "### Content-free security result" >> $env:GITHUB_STEP_SUMMARY
+            "- Result: native qualification failed; unsigned development packaging may continue for evidence only" >> $env:GITHUB_STEP_SUMMARY
+            "- Production promotion: blocked" >> $env:GITHUB_STEP_SUMMARY
+            Write-Error 'WINDOWS_SECURITY_QUALIFICATION_FAILED_DEVELOPMENT_CONTINUES'
             exit 1
           }
+          [IO.File]::WriteAllText(
+            $qualificationResultPath,
+            "$result`n",
+            [Text.UTF8Encoding]::new($false)
+          )
+          "TIBOTATTLE_WINDOWS_SECURITY_QUALIFICATION_STATUS=passed" >> $env:GITHUB_ENV
           "### Content-free security result" >> $env:GITHUB_STEP_SUMMARY
           "- Command: node ./scripts/windows-security-qualification.mjs" >> $env:GITHUB_STEP_SUMMARY
           "- Result: $result" >> $env:GITHUB_STEP_SUMMARY
@@ -239,10 +314,854 @@ jobs:
           "- Canonical deferrals: docs/goals/2026-08-17-windows-security-credentials-goal.md" >> $env:GITHUB_STEP_SUMMARY
           "- Deferred: authenticated binary provenance; replacement CAS; complete DACL/path/concurrency matrix; selector and remaining state/SQLite integration; export locking; retention/uninstall policy; packaging, signing, installer, and updater" >> $env:GITHUB_STEP_SUMMARY
 
-      - name: Confirm qualification did not modify the checkout
+      - name: Reconfirm checked-out revision before Electron artifact work
+        shell: pwsh
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = $env:EXPECTED_REVISION.Trim().ToLowerInvariant()
+          $actual = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          $qualified = ($env:TIBOTATTLE_QUALIFICATION_REVISION ?? '').Trim().ToLowerInvariant()
+          if ($expected -notmatch '^[0-9a-f]{40}$' -or $actual -ne $expected -or $qualified -ne $actual) {
+            Write-Error 'WINDOWS_ELECTRON_REVISION_MISMATCH'
+            exit 1
+          }
+
+      - name: Stage exact Windows x64 Electron development inputs
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $stagingLog = Join-Path $env:RUNNER_TEMP 'tibotattle-electron-staging.log'
+          $stagedAppPath = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-dev/windows-x64/app'
+          $windowsBindingPath = Join-Path $env:GITHUB_WORKSPACE 'native/windows-filesystem/build/Release/windows_filesystem.node'
+          $windowsManifestPath = "${windowsBindingPath}.manifest.json"
+          if (-not (Test-Path -LiteralPath $windowsBindingPath -PathType Leaf) -or
+              -not (Test-Path -LiteralPath $windowsManifestPath -PathType Leaf)) {
+            Write-Error 'WINDOWS_ELECTRON_BINDING_PAIR_MISSING'
+            exit 1
+          }
+          node ./scripts/build-electron-app.mjs `
+            --target win32 `
+            --profile development `
+            --output $stagedAppPath `
+            --replace `
+            --windows-binding $windowsBindingPath `
+            --windows-manifest $windowsManifestPath *> $stagingLog
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_ELECTRON_STAGING_FAILED'
+            exit 1
+          }
+          $runtimeManifestPath = Join-Path $stagedAppPath 'electron-runtime-manifest.json'
+          if (-not (Test-Path -LiteralPath $runtimeManifestPath -PathType Leaf)) {
+            Write-Error 'WINDOWS_ELECTRON_RUNTIME_MANIFEST_MISSING'
+            exit 1
+          }
+          try {
+            $runtimeManifest = Get-Content -LiteralPath $runtimeManifestPath -Raw | ConvertFrom-Json
+            $nativeManifest = Get-Content -LiteralPath $windowsManifestPath -Raw | ConvertFrom-Json
+          } catch {
+            Write-Error 'WINDOWS_ELECTRON_RUNTIME_MANIFEST_INVALID'
+            exit 1
+          }
+          if ($runtimeManifest.target -ne 'win32' -or
+              $runtimeManifest.architecture -ne 'x64' -or
+              $runtimeManifest.windowsBinding.status -ne 'included_unverified' -or
+              $runtimeManifest.windowsBinding.verified -ne $false -or
+              $runtimeManifest.windowsBinding.binding.bytes -ne $nativeManifest.bytes -or
+              $runtimeManifest.windowsBinding.binding.sha256 -ne $nativeManifest.sha256 -or
+              $nativeManifest.bytes.ToString() -ne $env:TIBOTATTLE_WINDOWS_BINDING_BYTES -or
+              $nativeManifest.sha256 -ne $env:TIBOTATTLE_WINDOWS_BINDING_SHA256) {
+            Write-Error 'WINDOWS_ELECTRON_BINDING_INPUT_MISMATCH'
+            exit 1
+          }
+          "TIBOTATTLE_ELECTRON_STAGED_APP_PATH=$stagedAppPath" >> $env:GITHUB_ENV
+          "TIBOTATTLE_ELECTRON_WINDOWS_BINDING_PATH=$windowsBindingPath" >> $env:GITHUB_ENV
+          "TIBOTATTLE_ELECTRON_WINDOWS_MANIFEST_PATH=$windowsManifestPath" >> $env:GITHUB_ENV
+
+      - name: Build unsigned Windows x64 Electron directory artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $builderVersionLog = Join-Path $env:RUNNER_TEMP 'tibotattle-electron-builder-version.log'
+          $builderLog = Join-Path $env:RUNNER_TEMP 'tibotattle-electron-builder.log'
+          pnpm exec electron-builder --version *> $builderVersionLog
+          if ($LASTEXITCODE -ne 0 -or (Get-Content -LiteralPath $builderVersionLog -Raw).Trim() -ne '26.15.7') {
+            Write-Error 'WINDOWS_ELECTRON_BUILDER_VERSION_MISMATCH'
+            exit 1
+          }
+          $env:TIBOTATTLE_ELECTRON_TARGET = 'win32'
+          pnpm exec electron-builder `
+            --config apps/electron/electron-builder.config.cjs `
+            --win dir `
+            --x64 `
+            --publish never *> $builderLog
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_ELECTRON_DIRECTORY_BUILD_FAILED'
+            exit 1
+          }
+          $artifactRoot = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-dev/windows-x64/artifacts'
+          $artifactAppPath = Join-Path $artifactRoot 'win-unpacked'
+          $asarPath = Join-Path $artifactAppPath 'resources/app.asar'
+          $unpackedPath = Join-Path $artifactAppPath 'resources/app.asar.unpacked'
+          if (-not (Test-Path -LiteralPath $artifactAppPath -PathType Container) -or
+              -not (Test-Path -LiteralPath $asarPath -PathType Leaf) -or
+              -not (Test-Path -LiteralPath $unpackedPath -PathType Container)) {
+            Write-Error 'WINDOWS_ELECTRON_DIRECTORY_ARTIFACT_MISSING'
+            exit 1
+          }
+          $topLevelInstallers = @(Get-ChildItem -LiteralPath $artifactRoot -File -Force |
+            Where-Object { $_.Name -match '\.(?:exe|msi|msix|appx|zip|7z|nsis)$' })
+          if ($topLevelInstallers.Count -ne 0) {
+            Write-Error 'WINDOWS_ELECTRON_INSTALLER_OUTPUT_UNEXPECTED'
+            exit 1
+          }
+          "TIBOTATTLE_ELECTRON_ARTIFACT_APP_PATH=$artifactAppPath" >> $env:GITHUB_ENV
+          "TIBOTATTLE_ELECTRON_ASAR_PATH=$asarPath" >> $env:GITHUB_ENV
+          "TIBOTATTLE_ELECTRON_UNPACKED_PATH=$unpackedPath" >> $env:GITHUB_ENV
+
+      - name: Verify Windows Electron development artifact
+        id: electron_artifact_verification
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $verificationLog = Join-Path $env:RUNNER_TEMP 'tibotattle-electron-verification.json'
+          $verificationFailureEvidencePath = Join-Path $env:RUNNER_TEMP 'tibotattle-electron-verification-failure.txt'
+          function Fail-ClosedVerifierArtifact {
+            param(
+              [Parameter(Mandatory = $true)][string]$StepStatus,
+              [Parameter(Mandatory = $true)][string]$MarkerStatus
+            )
+            try {
+              if (Test-Path -LiteralPath $verificationLog -PathType Leaf -ErrorAction Stop) {
+                Remove-Item -LiteralPath $verificationLog -Force -ErrorAction Stop
+              }
+              if (Test-Path -LiteralPath $verificationLog -ErrorAction Stop) {
+                throw 'verifier failure log remains'
+              }
+            } catch {
+              Write-Error 'WINDOWS_ELECTRON_VERIFICATION_LOG_DELETE_FAILED'
+              exit 1
+            }
+            [IO.File]::WriteAllText(
+              $verificationFailureEvidencePath,
+              "$MarkerStatus`n",
+              [Text.UTF8Encoding]::new($false)
+            )
+            "### Windows Electron development artifact verification" >> $env:GITHUB_STEP_SUMMARY
+            "- Status: blocked; fixed verifier status: $MarkerStatus" >> $env:GITHUB_STEP_SUMMARY
+            "- Executable retention: none; only the allowlisted status marker may be retained" >> $env:GITHUB_STEP_SUMMARY
+            Write-Error $StepStatus
+            exit 1
+          }
+          # Export the marker location, but do not create the marker until the
+          # raw verifier log has been deleted and its absence verified.
+          "TIBOTATTLE_ELECTRON_VERIFICATION_FAILURE_EVIDENCE_PATH=$verificationFailureEvidencePath" >> $env:GITHUB_ENV
+          node ./scripts/verify-electron-development-artifact.mjs `
+            --target win32-x64 `
+            --app $env:TIBOTATTLE_ELECTRON_STAGED_APP_PATH `
+            --asar $env:TIBOTATTLE_ELECTRON_ASAR_PATH `
+            --unpacked $env:TIBOTATTLE_ELECTRON_UNPACKED_PATH *> $verificationLog
+          $verificationExitCode = $LASTEXITCODE
+          if ($verificationExitCode -ne 0) {
+            $verificationStatus = node --input-type=module -e 'import { readFile } from "node:fs/promises"; import { parseFixedStatusOutput } from "./scripts/verify-electron-development-artifact.mjs"; const path = process.argv[1]; const output = await readFile(path, "utf8"); process.stdout.write(parseFixedStatusOutput(output));' -- $verificationLog
+            if ($LASTEXITCODE -ne 0 -or $null -eq $verificationStatus) {
+              $verificationStatus = 'ELECTRON_DEVELOPMENT_ARTIFACT_FAILED'
+            }
+            $verificationStatus = $verificationStatus.Trim()
+            Fail-ClosedVerifierArtifact `
+              -StepStatus 'WINDOWS_ELECTRON_ARTIFACT_VERIFICATION_FAILED' `
+              -MarkerStatus $verificationStatus
+          }
+          "TIBOTATTLE_ELECTRON_VERIFICATION_EVIDENCE_PATH=$verificationLog" >> $env:GITHUB_ENV
+          try {
+            $evidence = Get-Content -LiteralPath $verificationLog -Raw | ConvertFrom-Json
+          } catch {
+            Fail-ClosedVerifierArtifact `
+              -StepStatus 'WINDOWS_ELECTRON_ARTIFACT_EVIDENCE_INVALID' `
+              -MarkerStatus 'ELECTRON_DEVELOPMENT_ARTIFACT_FAILED'
+          }
+          $evidenceJson = $evidence | ConvertTo-Json -Depth 10 -Compress
+          if ($evidence.status -ne 'ELECTRON_DEVELOPMENT_ARTIFACT_VERIFIED' -or
+              $evidence.target -ne 'win32-x64' -or
+              $evidence.nativeFileCount -ne 2 -or
+              $evidence.binding.status -ne 'included_unverified' -or
+              $evidence.binding.bytes -ne [int64]$env:TIBOTATTLE_WINDOWS_BINDING_BYTES -or
+              $evidence.binding.sha256 -ne $env:TIBOTATTLE_WINDOWS_BINDING_SHA256 -or
+              $evidenceJson -match '(?i)(?:[A-Za-z]:[\\/]|/Users/|/home/|\\Users\\|password|secret|token|credential)') {
+            Fail-ClosedVerifierArtifact `
+              -StepStatus 'WINDOWS_ELECTRON_ARTIFACT_EVIDENCE_NOT_CONTENT_FREE' `
+              -MarkerStatus 'ELECTRON_DEVELOPMENT_ARTIFACT_FAILED'
+          }
+          foreach ($name in @('staged', 'asar', 'unpacked', 'artifact')) {
+            $inventory = $evidence.$name
+            if ($null -eq $inventory -or
+                (($inventory.count -isnot [int]) -and ($inventory.count -isnot [long])) -or
+                (($inventory.bytes -isnot [int]) -and ($inventory.bytes -isnot [long])) -or
+                $inventory.count -lt 0 -or
+                $inventory.bytes -lt 0 -or
+                $inventory.sha256 -notmatch '^[0-9a-f]{64}$') {
+              Fail-ClosedVerifierArtifact `
+                -StepStatus 'WINDOWS_ELECTRON_ARTIFACT_INVENTORY_INVALID' `
+                -MarkerStatus 'ELECTRON_DEVELOPMENT_ARTIFACT_FAILED'
+            }
+          }
+          "### Windows Electron development artifact" >> $env:GITHUB_STEP_SUMMARY
+          "- Status: $($evidence.status)" >> $env:GITHUB_STEP_SUMMARY
+          "- Target: $($evidence.target)" >> $env:GITHUB_STEP_SUMMARY
+          "- Checked-out revision: $env:TIBOTATTLE_QUALIFICATION_REVISION" >> $env:GITHUB_STEP_SUMMARY
+          "- Packaging: unsigned directory target only; publication disabled" >> $env:GITHUB_STEP_SUMMARY
+          "- Native file count: $($evidence.nativeFileCount)" >> $env:GITHUB_STEP_SUMMARY
+          "- Staged files: $($evidence.staged.count); bytes: $($evidence.staged.bytes); SHA-256: $($evidence.staged.sha256)" >> $env:GITHUB_STEP_SUMMARY
+          "- app.asar files: $($evidence.asar.count); bytes: $($evidence.asar.bytes); SHA-256: $($evidence.asar.sha256)" >> $env:GITHUB_STEP_SUMMARY
+          "- app.asar.unpacked files: $($evidence.unpacked.count); bytes: $($evidence.unpacked.bytes); SHA-256: $($evidence.unpacked.sha256)" >> $env:GITHUB_STEP_SUMMARY
+          "- Artifact union files: $($evidence.artifact.count); bytes: $($evidence.artifact.bytes); SHA-256: $($evidence.artifact.sha256)" >> $env:GITHUB_STEP_SUMMARY
+          "- Binding bytes: $($evidence.binding.bytes); SHA-256: $($evidence.binding.sha256)" >> $env:GITHUB_STEP_SUMMARY
+          "- Runtime qualification: deferred to the native Windows Electron smoke step" >> $env:GITHUB_STEP_SUMMARY
+          "- Windows production readiness: not claimed" >> $env:GITHUB_STEP_SUMMARY
+          "- Signing, notarization, installer, updater, and publication: not performed" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Run Windows Electron x64 runtime smoke
+        id: electron_runtime_smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runtimeStdoutPath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.stdout.raw'
+          $runtimeStderrPath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.stderr.raw'
+          $runtimeAggregatePath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.aggregate.json'
+          $runtimeDiagnosticPath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.diagnostic.json'
+          $runtimeEvidencePath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-runtime-smoke.json'
+          function Remove-VerifiedRuntimeTransientOutput {
+            foreach ($path in @($runtimeStdoutPath, $runtimeStderrPath, $runtimeAggregatePath, $runtimeDiagnosticPath)) {
+              try {
+                if (Test-Path -LiteralPath $path -PathType Leaf -ErrorAction Stop) {
+                  Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+                }
+                if (Test-Path -LiteralPath $path -ErrorAction Stop) {
+                  throw 'runtime transient output remains'
+                }
+              } catch {
+                Write-Error 'WINDOWS_ELECTRON_RUNTIME_TRANSIENT_OUTPUT_DELETE_FAILED'
+                exit 1
+              }
+            }
+          }
+          # A missing sidecar must describe this invocation, never stale data
+          # left by an earlier attempt on a reused runner workspace.
+          Remove-VerifiedRuntimeTransientOutput
+          # Retain only a closed aggregate. Console stdout, stderr, and the
+          # explicit aggregate/diagnostic files are transient inputs, never
+          # upload candidates; the aggregate is normalized into this
+          # content-free shape below. A valid aggregate also requires a
+          # matching sealed diagnostic checkpoint; that control is fail-closed
+          # and is not a product/runtime payload.
+          $runtimeFailureStages = @(
+            'none',
+            'unsupported',
+            'artifact',
+            'launch',
+            'control',
+            'dashboard',
+            'credential',
+            'lifecycle',
+            'refresh',
+            'status',
+            'persistence',
+            'instance',
+            'shutdown',
+            'relaunch',
+            'unknown'
+          )
+          $runtimeFailureReasons = @(
+            'none',
+            'unsupported',
+            'child_exit',
+            'timeout',
+            'protocol',
+            'assertion',
+            'operation',
+            'refresh_not_accepted',
+            'refresh_terminal_failed',
+            'status_schema',
+            'status_state',
+            'status_query_accepted',
+            'status_method_accepted',
+            'dash_loopback',
+            'dash_origin',
+            'dash_health',
+            'dash_topbar',
+            'dash_sidebar',
+            'dash_nav',
+            'dash_active_nav',
+            'dash_active_page',
+            'dash_refresh',
+            'dash_language',
+            'dash_trends_nav',
+            'dash_trends_page',
+            'dash_previous_page',
+            'dash_trends_count',
+            'dash_refresh_boundary',
+            'dash_startup_duplicate',
+            'dash_startup_receipt',
+            'dash_startup_changed',
+            'dash_startup_failed',
+            'dash_startup_cancelled',
+            'unknown'
+          )
+          $runtimeFallbackReasons = @(
+            'aggregate_missing',
+            'aggregate_invalid',
+            'stderr_present',
+            'output_read_failed',
+            'entry_not_reached',
+            'entry_unsealed',
+            'run_smoke_unsealed',
+            'terminate_process_tree_started_unsealed',
+            'terminate_process_tree_finished_unsealed',
+            'cleanup_unsealed',
+            'post_terminate_cleanup_unsealed',
+            'cleanup_finished_unsealed',
+            'caught_failure_output_missing',
+            'completed_output_missing',
+            'diagnostic_invalid'
+          )
+          $runtimeDiagnosticSchema = 'tibotattle-windows-electron-runtime-diagnostic-v1'
+          $runtimeDiagnosticPhases = @(
+            'module_loaded',
+            'entry_started',
+            'run_smoke_started',
+            'terminate_process_tree_started',
+            'terminate_process_tree_finished',
+            'cleanup_started',
+            'post_terminate_cleanup_started',
+            'cleanup_finished',
+            'caught_failure',
+            'completed'
+          )
+          $runtimeDiagnosticStatuses = @('running', 'sealed')
+          $runtimeDiagnosticExitClasses = @('running', 'caught_failure', 'completed')
+          $defaultRuntimeEvidence = [ordered]@{
+            artifact = $false
+            dashboardReady = $false
+            syntheticRefresh = $false
+            secondInstanceRejected = $false
+            showHideTrayLifecycle = $false
+            cleanQuit = $false
+            noOrphan = $false
+            statePersistence = $false
+            credentialPersistence = $false
+            relaunchPersistence = $false
+            failureStage = 'control'
+            failureReason = 'output_read_failed'
+            status = 'failed'
+            target = 'win32-x64'
+            contentFree = $true
+          }
+          # Keep this fallback reason fixed until the smoke output boundary
+          # has been classified. It is replaced only with one of the
+          # allowlisted, content-free evidence conditions below.
+          $runtimeEvidenceFailureReason = 'output_read_failed'
+          function Write-NormalizedRuntimeSummary {
+            param([object]$Evidence)
+            "### Windows Electron runtime smoke" >> $env:GITHUB_STEP_SUMMARY
+            "- Status: $($Evidence.status)" >> $env:GITHUB_STEP_SUMMARY
+            "- Failure stage: $($Evidence.failureStage)" >> $env:GITHUB_STEP_SUMMARY
+            "- Failure reason: $($Evidence.failureReason)" >> $env:GITHUB_STEP_SUMMARY
+          }
+          [IO.File]::WriteAllText(
+            $runtimeEvidencePath,
+            "$($defaultRuntimeEvidence | ConvertTo-Json -Compress)`n",
+            [Text.UTF8Encoding]::new($false)
+          )
+          "TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_EVIDENCE_PATH=$runtimeEvidencePath" >> $env:GITHUB_ENV
+          $env:TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_OUTPUT_PATH = $runtimeAggregatePath
+          $env:TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_DIAGNOSTIC_PATH = $runtimeDiagnosticPath
+          $runtimeExitCode = 1
+          try {
+            node ./scripts/smoke-electron-windows.mjs 1> $runtimeStdoutPath 2> $runtimeStderrPath
+            $runtimeExitCode = $LASTEXITCODE
+          } catch {
+            # Continue into the closed diagnostic/aggregate classifier. Raw
+            # launch or redirection errors are never retained.
+            $runtimeExitCode = 1
+          }
+          $runtimeEvidence = $null
+          $runtimeDiagnosticDecision = $null
+          try {
+            $runtimeDiagnosticDecision = [ordered]@{
+              present = $false
+              valid = $false
+              reason = 'entry_not_reached'
+              status = $null
+              exitClass = $null
+            }
+            $diagnosticExists = Test-Path -LiteralPath $runtimeDiagnosticPath -PathType Leaf -ErrorAction Stop
+            if ($diagnosticExists) {
+              $runtimeDiagnosticDecision.present = $true
+              $diagnosticValue = $null
+              try {
+                $diagnosticValue = Get-Content -LiteralPath $runtimeDiagnosticPath -Raw -ErrorAction Stop | ConvertFrom-Json
+              } catch {
+                $runtimeDiagnosticDecision.reason = 'diagnostic_invalid'
+                throw 'runtime diagnostic is invalid'
+              }
+              $expectedDiagnosticKeys = @(
+                'contentFree',
+                'exitClass',
+                'phase',
+                'schemaVersion',
+                'status'
+              ) | Sort-Object
+              $actualDiagnosticKeys = @($diagnosticValue.psobject.Properties.Name | Sort-Object)
+              if (($actualDiagnosticKeys -join '|') -ne ($expectedDiagnosticKeys -join '|') -or
+                  $diagnosticValue.schemaVersion -ne $runtimeDiagnosticSchema -or
+                  $diagnosticValue.contentFree -isnot [bool] -or
+                  $diagnosticValue.contentFree -ne $true -or
+                  $runtimeDiagnosticStatuses -notcontains $diagnosticValue.status -or
+                  $runtimeDiagnosticPhases -notcontains $diagnosticValue.phase -or
+                  $runtimeDiagnosticExitClasses -notcontains $diagnosticValue.exitClass) {
+                $runtimeDiagnosticDecision.reason = 'diagnostic_invalid'
+                throw 'runtime diagnostic shape'
+              }
+              if (($diagnosticValue.status -eq 'running' -and
+                   ($diagnosticValue.exitClass -ne 'running' -or
+                    $diagnosticValue.phase -in @('caught_failure', 'completed'))) -or
+                  ($diagnosticValue.status -eq 'sealed' -and
+                   -not (($diagnosticValue.phase -eq 'caught_failure' -and
+                          $diagnosticValue.exitClass -eq 'caught_failure') -or
+                         ($diagnosticValue.phase -eq 'completed' -and
+                          $diagnosticValue.exitClass -eq 'completed')))) {
+                $runtimeDiagnosticDecision.reason = 'diagnostic_invalid'
+                throw 'runtime diagnostic phase status'
+              }
+              $runtimeDiagnosticDecision.valid = $true
+              $runtimeDiagnosticDecision.status = $diagnosticValue.status
+              $runtimeDiagnosticDecision.exitClass = $diagnosticValue.exitClass
+              if ($diagnosticValue.status -eq 'running') {
+                # Keep the last fixed checkpoint visible as a semantic class:
+                # this distinguishes entry, runSmoke, taskkill, and cleanup
+                # termination without retaining raw process diagnostics.
+                if ($diagnosticValue.phase -eq 'module_loaded') {
+                  $runtimeDiagnosticDecision.reason = 'entry_not_reached'
+                } elseif ($diagnosticValue.phase -eq 'entry_started') {
+                  $runtimeDiagnosticDecision.reason = 'entry_unsealed'
+                } elseif ($diagnosticValue.phase -eq 'run_smoke_started') {
+                  $runtimeDiagnosticDecision.reason = 'run_smoke_unsealed'
+                } elseif ($diagnosticValue.phase -eq 'terminate_process_tree_started') {
+                  $runtimeDiagnosticDecision.reason = 'terminate_process_tree_started_unsealed'
+                } elseif ($diagnosticValue.phase -eq 'terminate_process_tree_finished') {
+                  $runtimeDiagnosticDecision.reason = 'terminate_process_tree_finished_unsealed'
+                } elseif ($diagnosticValue.phase -eq 'cleanup_started') {
+                  $runtimeDiagnosticDecision.reason = 'cleanup_unsealed'
+                } elseif ($diagnosticValue.phase -eq 'post_terminate_cleanup_started') {
+                  $runtimeDiagnosticDecision.reason = 'post_terminate_cleanup_unsealed'
+                } elseif ($diagnosticValue.phase -eq 'cleanup_finished') {
+                  $runtimeDiagnosticDecision.reason = 'cleanup_finished_unsealed'
+                } else {
+                  $runtimeDiagnosticDecision.reason = 'diagnostic_invalid'
+                  throw 'runtime diagnostic running phase'
+                }
+              } elseif ($diagnosticValue.exitClass -eq 'caught_failure') {
+                $runtimeDiagnosticDecision.reason = 'caught_failure_output_missing'
+              } elseif ($diagnosticValue.exitClass -eq 'completed') {
+                $runtimeDiagnosticDecision.reason = 'completed_output_missing'
+              } else {
+                $runtimeDiagnosticDecision.reason = 'diagnostic_invalid'
+                throw 'runtime diagnostic completion class'
+              }
+            }
+            $aggregateExists = Test-Path -LiteralPath $runtimeAggregatePath -PathType Leaf -ErrorAction Stop
+            if (-not $aggregateExists) {
+              $runtimeEvidenceFailureReason = $runtimeDiagnosticDecision.reason
+              throw 'runtime aggregate is missing'
+            }
+            if ($runtimeDiagnosticDecision.valid -ne $true) {
+              $runtimeEvidenceFailureReason = 'diagnostic_invalid'
+              throw 'runtime diagnostic is missing'
+            }
+            $runtimeAggregate = $null
+            try {
+              $runtimeAggregate = Get-Content -LiteralPath $runtimeAggregatePath -Raw -ErrorAction Stop
+            } catch {
+              $runtimeEvidenceFailureReason = 'output_read_failed'
+              throw
+            }
+            if ([string]::IsNullOrEmpty($runtimeAggregate)) {
+              $runtimeEvidenceFailureReason = 'aggregate_invalid'
+              throw 'runtime aggregate is empty'
+            }
+            try {
+              $runtimeEvidence = $runtimeAggregate | ConvertFrom-Json
+            } catch {
+              $runtimeEvidenceFailureReason = 'aggregate_invalid'
+              throw
+            }
+            # Any later shape/status/field failure is still a rejected
+            # aggregate, not a product diagnostic. Keep the classification
+            # fixed and content-free if validation below throws.
+            $runtimeEvidenceFailureReason = 'aggregate_invalid'
+            $expectedRuntimeKeys = @(
+              'artifact',
+              'dashboardReady',
+              'syntheticRefresh',
+              'secondInstanceRejected',
+              'showHideTrayLifecycle',
+              'cleanQuit',
+              'noOrphan',
+              'statePersistence',
+              'credentialPersistence',
+              'relaunchPersistence',
+              'failureStage',
+              'failureReason',
+              'status',
+              'target',
+              'contentFree'
+            ) | Sort-Object
+            $actualRuntimeKeys = @($runtimeEvidence.psobject.Properties.Name | Sort-Object)
+            if (($actualRuntimeKeys -join '|') -ne ($expectedRuntimeKeys -join '|')) {
+              throw 'runtime aggregate shape'
+            }
+            if ($runtimeEvidence.status -notin @('passed', 'failed') -or
+                $runtimeEvidence.target -ne 'win32-x64' -or
+                $runtimeEvidence.contentFree -isnot [bool] -or
+                $runtimeEvidence.contentFree -ne $true) {
+              throw 'runtime aggregate status'
+            }
+            if ($runtimeDiagnosticDecision.status -ne 'sealed' -or
+                ($runtimeEvidence.status -eq 'passed' -and
+                 $runtimeDiagnosticDecision.exitClass -ne 'completed') -or
+                ($runtimeEvidence.status -eq 'failed' -and
+                 $runtimeDiagnosticDecision.exitClass -ne 'caught_failure')) {
+              $runtimeEvidenceFailureReason = 'diagnostic_invalid'
+              throw 'runtime diagnostic does not match aggregate status'
+            }
+            if ($runtimeEvidence.failureStage -isnot [string] -or
+                $runtimeFailureStages -notcontains $runtimeEvidence.failureStage -or
+                $runtimeEvidence.failureReason -isnot [string] -or
+                $runtimeFailureReasons -notcontains $runtimeEvidence.failureReason) {
+              throw 'runtime aggregate diagnostics'
+            }
+            foreach ($name in $expectedRuntimeKeys) {
+              if ($name -in @('status', 'target', 'contentFree', 'failureStage', 'failureReason')) { continue }
+              if ($runtimeEvidence.$name -isnot [bool]) {
+                throw 'runtime aggregate check'
+              }
+            }
+            $stderrPresent = $false
+            try {
+              $stderrExists = Test-Path -LiteralPath $runtimeStderrPath -PathType Leaf -ErrorAction Stop
+              if (-not $stderrExists) {
+                $runtimeEvidenceFailureReason = 'output_read_failed'
+                throw 'runtime stderr output is unavailable'
+              }
+              $stderrPresent = (Get-Item -LiteralPath $runtimeStderrPath -ErrorAction Stop).Length -gt 0
+            } catch {
+              if ($runtimeEvidenceFailureReason -ne 'output_read_failed') {
+                $runtimeEvidenceFailureReason = 'output_read_failed'
+              }
+              throw
+            }
+            if ($stderrPresent -and $runtimeEvidence.status -eq 'passed') {
+              $runtimeEvidenceFailureReason = 'stderr_present'
+              throw 'runtime stderr is present for passed output'
+            }
+            $safeRuntimeEvidence = [ordered]@{}
+            foreach ($name in $expectedRuntimeKeys) {
+              $safeRuntimeEvidence[$name] = $runtimeEvidence.$name
+            }
+            [IO.File]::WriteAllText(
+              $runtimeEvidencePath,
+              "$($safeRuntimeEvidence | ConvertTo-Json -Compress)`n",
+              [Text.UTF8Encoding]::new($false)
+            )
+            $runtimeEvidence = $safeRuntimeEvidence | ConvertTo-Json -Compress | ConvertFrom-Json
+          } catch {
+            # Rewrite only the closed aggregate reason. No raw smoke output,
+            # path, command, process id, or exception text is retained.
+            if ($runtimeFallbackReasons -notcontains $runtimeEvidenceFailureReason) {
+              $runtimeEvidenceFailureReason = 'output_read_failed'
+            }
+            $defaultRuntimeEvidence.failureStage = 'control'
+            $defaultRuntimeEvidence.failureReason = $runtimeEvidenceFailureReason
+            try {
+              [IO.File]::WriteAllText(
+                $runtimeEvidencePath,
+                "$($defaultRuntimeEvidence | ConvertTo-Json -Compress)`n",
+                [Text.UTF8Encoding]::new($false)
+              )
+            } catch {
+              # The original prewritten aggregate remains the only retained
+              # evidence if this bounded rewrite cannot be completed.
+            }
+            Write-NormalizedRuntimeSummary -Evidence $defaultRuntimeEvidence
+            Remove-VerifiedRuntimeTransientOutput
+            Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_EVIDENCE_INVALID'
+            exit 1
+          }
+          Write-NormalizedRuntimeSummary -Evidence $runtimeEvidence
+          Remove-VerifiedRuntimeTransientOutput
+          if ($runtimeExitCode -ne 0) {
+            Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_FAILED'
+            exit 1
+          }
+          $runtimeJson = $runtimeEvidence | ConvertTo-Json -Depth 10 -Compress
+          $requiredChecks = @(
+            'artifact',
+            'dashboardReady',
+            'credentialPersistence',
+            'syntheticRefresh',
+            'secondInstanceRejected',
+            'showHideTrayLifecycle',
+            'cleanQuit',
+            'noOrphan',
+            'statePersistence',
+            'relaunchPersistence'
+          )
+          if ($runtimeEvidence.status -ne 'passed' -or
+              $runtimeEvidence.target -ne 'win32-x64' -or
+              $runtimeEvidence.contentFree -ne $true -or
+              $runtimeEvidence.failureStage -ne 'none' -or
+              $runtimeEvidence.failureReason -ne 'none' -or
+              $runtimeJson -match '(?i)(?:[A-Za-z]:[\\/]|/Users/|/home/|\\Users\\|username|password|secret|token|pid|process|stdout|stderr|command|executable)') {
+            Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_EVIDENCE_NOT_CONTENT_FREE'
+            exit 1
+          }
+          foreach ($check in $requiredChecks) {
+            if ($runtimeEvidence.$check -ne $true) {
+              Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_CHECK_FAILED'
+              exit 1
+            }
+          }
+          "TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_EVIDENCE_PATH=$runtimeEvidencePath" >> $env:GITHUB_ENV
+          "- Dashboard readiness: passed" >> $env:GITHUB_STEP_SUMMARY
+          "- Synthetic refresh: passed" >> $env:GITHUB_STEP_SUMMARY
+          "- Tray/window lifecycle: passed" >> $env:GITHUB_STEP_SUMMARY
+          "- Single-instance rejection: passed" >> $env:GITHUB_STEP_SUMMARY
+          "- Clean quit and no orphan: passed" >> $env:GITHUB_STEP_SUMMARY
+          "- Relaunch persistence: passed" >> $env:GITHUB_STEP_SUMMARY
+          "- Protected state persistence: passed" >> $env:GITHUB_STEP_SUMMARY
+          "- Disposable Credential Manager persistence and cleanup: passed" >> $env:GITHUB_STEP_SUMMARY
+          "- Diagnostics: content-free" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Remove Windows Electron runtime transient output
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @(
+            'tibotattle-windows-electron-runtime-smoke.stdout.raw',
+            'tibotattle-windows-electron-runtime-smoke.stderr.raw',
+            'tibotattle-windows-electron-runtime-smoke.aggregate.json',
+            'tibotattle-windows-electron-runtime-smoke.diagnostic.json'
+          )) {
+            $path = Join-Path $env:RUNNER_TEMP $name
+            if (Test-Path -LiteralPath $path -PathType Leaf -ErrorAction Stop) {
+              Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+            }
+            if (Test-Path -LiteralPath $path -ErrorAction Stop) {
+              Write-Error 'WINDOWS_ELECTRON_RUNTIME_TRANSIENT_OUTPUT_DELETE_FAILED'
+              exit 1
+            }
+          }
+
+      - name: Create content-free Windows Electron qualification receipt
+        if: ${{ success() && steps.native_security_qualification.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $receiptPath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-electron-qualification-receipt.json'
+          node ./scripts/build-windows-electron-qualification-receipt.mjs `
+            --output $receiptPath `
+            --revision $env:TIBOTATTLE_QUALIFICATION_REVISION `
+            --target win32-x64 `
+            --cache-mode $env:TIBOTATTLE_QUALIFICATION_CACHE_MODE `
+            --binding-sha256 $env:TIBOTATTLE_WINDOWS_BINDING_SHA256 `
+            --binding-bytes $env:TIBOTATTLE_WINDOWS_BINDING_BYTES `
+            --qualification-result $env:TIBOTATTLE_WINDOWS_SECURITY_QUALIFICATION_RESULT_PATH `
+            --packaged-evidence $env:TIBOTATTLE_ELECTRON_VERIFICATION_EVIDENCE_PATH `
+            --runtime-evidence $env:TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_EVIDENCE_PATH
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_ELECTRON_QUALIFICATION_RECEIPT_FAILED'
+            exit 1
+          }
+          try {
+            $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
+          } catch {
+            Write-Error 'WINDOWS_ELECTRON_QUALIFICATION_RECEIPT_INVALID'
+            exit 1
+          }
+          $receiptJson = $receipt | ConvertTo-Json -Depth 20 -Compress
+          if ($receipt.status -ne 'WINDOWS_ELECTRON_DEVELOPMENT_QUALIFICATION_PASSED' -or
+              $receipt.schemaVersion -ne 'tibotattle-windows-electron-development-qualification-v1' -or
+              $receipt.target -ne 'win32-x64' -or
+              $receipt.mode -ne 'qualification_only' -or
+              $receipt.productionReadiness -ne 'not_claimed' -or
+              $receipt.revision -ne $env:TIBOTATTLE_QUALIFICATION_REVISION -or
+              $receipt.cacheMode -ne $env:TIBOTATTLE_QUALIFICATION_CACHE_MODE -or
+              $receiptJson -match '(?i)(?:[A-Za-z]:[\\/]|/Users/|/home/|\\Users\\|username|password|secret|token|pid|stdout|stderr|command|executable)') {
+            Write-Error 'WINDOWS_ELECTRON_QUALIFICATION_RECEIPT_NOT_CONTENT_FREE'
+            exit 1
+          }
+          "TIBOTATTLE_ELECTRON_QUALIFICATION_RECEIPT_PATH=$receiptPath" >> $env:GITHUB_ENV
+          "### Windows Electron qualification receipt" >> $env:GITHUB_STEP_SUMMARY
+          "- Status: $($receipt.status)" >> $env:GITHUB_STEP_SUMMARY
+          "- Revision: $($receipt.revision)" >> $env:GITHUB_STEP_SUMMARY
+          "- Target: $($receipt.target)" >> $env:GITHUB_STEP_SUMMARY
+          "- Cache mode: $($receipt.cacheMode)" >> $env:GITHUB_STEP_SUMMARY
+          "- Mode: qualification only; production readiness: not claimed" >> $env:GITHUB_STEP_SUMMARY
+          "- Binding bytes: $($receipt.binding.bytes); SHA-256: $($receipt.binding.sha256)" >> $env:GITHUB_STEP_SUMMARY
+          "- Runtime and package evidence: aggregate-only" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Retain exact Windows x64 development artifact and qualification receipt
+        if: ${{ success() && steps.native_security_qualification.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tibotattle-windows-x64-electron-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}-${{ matrix.cache-mode }}
+          path: |
+            ${{ env.TIBOTATTLE_ELECTRON_ARTIFACT_APP_PATH }}
+            ${{ env.TIBOTATTLE_ELECTRON_QUALIFICATION_RECEIPT_PATH }}
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Prepare exact raw Windows x64 qualification receipt handoff
+        if: ${{ success() && steps.native_security_qualification.outcome == 'success' }}
+        shell: pwsh
+        env:
+          TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_BASENAME: tibotattle-windows-electron-qualification-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}-${{ matrix.cache-mode }}.json
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $receiptPath = $env:TIBOTATTLE_ELECTRON_QUALIFICATION_RECEIPT_PATH
+          $receiptBasename = $env:TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_BASENAME
+          $revision = ($env:TIBOTATTLE_QUALIFICATION_REVISION ?? '').Trim().ToLowerInvariant()
+          $cacheMode = ($env:TIBOTATTLE_QUALIFICATION_CACHE_MODE ?? '').Trim()
+          $runId = ($env:GITHUB_RUN_ID ?? '').Trim()
+          $runAttempt = ($env:GITHUB_RUN_ATTEMPT ?? '').Trim()
+          $expectedReceiptBasename = "tibotattle-windows-electron-qualification-$runId-$runAttempt-$revision-$cacheMode.json"
+          if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf) -or
+              $receiptBasename -notmatch '^tibotattle-windows-electron-qualification-[1-9][0-9]*-[1-9][0-9]*-[0-9a-f]{40}-(warm|clean)\.json$' -or
+              $receiptBasename -cne $expectedReceiptBasename) {
+            Write-Error 'WINDOWS_QUALIFICATION_RECEIPT_RAW_BASENAME_INVALID'
+            exit 1
+          }
+          $receiptRawPath = Join-Path $env:RUNNER_TEMP $receiptBasename
+          if (Test-Path -LiteralPath $receiptRawPath) {
+            Write-Error 'WINDOWS_QUALIFICATION_RECEIPT_RAW_DESTINATION_EXISTS'
+            exit 1
+          }
+          try {
+            Copy-Item -LiteralPath $receiptPath -Destination $receiptRawPath -Force:$false
+          } catch {
+            Write-Error 'WINDOWS_QUALIFICATION_RECEIPT_RAW_COPY_FAILED'
+            exit 1
+          }
+          if (-not (Test-Path -LiteralPath $receiptRawPath -PathType Leaf)) {
+            Write-Error 'WINDOWS_QUALIFICATION_RECEIPT_RAW_COPY_FAILED'
+            exit 1
+          }
+          "TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_PATH=$receiptRawPath" >> $env:GITHUB_ENV
+          "TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_BASENAME=$receiptBasename" >> $env:GITHUB_ENV
+
+      - name: Retain raw Windows x64 qualification receipt handoff
+        id: windows_qualification_receipt_raw_upload
+        if: ${{ success() && steps.native_security_qualification.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_BASENAME }}
+          path: ${{ env.TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_PATH }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Validate raw Windows x64 qualification receipt handoff
+        if: ${{ success() && steps.native_security_qualification.outcome == 'success' }}
+        shell: pwsh
+        env:
+          TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_PATH: ${{ env.TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_PATH }}
+          TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_BASENAME: ${{ env.TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_BASENAME }}
+          TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_ARTIFACT_ID: ${{ steps.windows_qualification_receipt_raw_upload.outputs['artifact-id'] }}
+          TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_ARTIFACT_DIGEST: ${{ steps.windows_qualification_receipt_raw_upload.outputs['artifact-digest'] }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $artifactId = $env:TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_ARTIFACT_ID
+          $artifactDigest = $env:TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_ARTIFACT_DIGEST
+          $receiptRawPath = $env:TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_PATH
+          if (-not (Test-Path -LiteralPath $receiptRawPath -PathType Leaf) -or
+              $env:TIBOTATTLE_WINDOWS_QUALIFICATION_RECEIPT_RAW_BASENAME -notmatch '^tibotattle-windows-electron-qualification-[1-9][0-9]*-[1-9][0-9]*-[0-9a-f]{40}-(warm|clean)\.json$' -or
+              $artifactId -cnotmatch '^[1-9][0-9]*$' -or
+              $artifactDigest -cnotmatch '^[0-9a-f]{64}$') {
+            Write-Error 'WINDOWS_QUALIFICATION_RECEIPT_ARTIFACT_OUTPUT_INVALID'
+            exit 1
+          }
+          try {
+            $localDigest = (Get-FileHash -LiteralPath $receiptRawPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          } catch {
+            Write-Error 'WINDOWS_QUALIFICATION_RECEIPT_RAW_HASH_FAILED'
+            exit 1
+          }
+          $expectedDigest = $localDigest
+          if ($artifactDigest -cne $expectedDigest) {
+            Write-Error 'WINDOWS_QUALIFICATION_RECEIPT_ARTIFACT_DIGEST_MISMATCH'
+            exit 1
+          }
+          "### Raw Windows qualification receipt handoff" >> $env:GITHUB_STEP_SUMMARY
+          "- Status: validated" >> $env:GITHUB_STEP_SUMMARY
+          "- Artifact output: positive decimal id and sha256 digest verified" >> $env:GITHUB_STEP_SUMMARY
+          "- Local SHA-256: matches the upload action digest" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Retain safe Windows Electron verifier failure evidence
+        if: ${{ always() && !cancelled() && steps.electron_artifact_verification.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tibotattle-windows-x64-electron-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}-${{ matrix.cache-mode }}-verification-blocked
+          path: ${{ env.TIBOTATTLE_ELECTRON_VERIFICATION_FAILURE_EVIDENCE_PATH }}
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Retain safe Windows Electron runtime failure evidence
+        if: ${{ always() && !cancelled() && steps.electron_runtime_smoke.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tibotattle-windows-x64-electron-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}-${{ matrix.cache-mode }}-runtime-blocked
+          path: ${{ env.TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_EVIDENCE_PATH }}
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Retain blocked unsigned Windows x64 development artifact
+        if: ${{ always() && !cancelled() && steps.electron_artifact_verification.outcome == 'success' && (steps.native_security_qualification.outcome == 'failure' || steps.electron_runtime_smoke.outcome == 'failure') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tibotattle-windows-x64-electron-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}-${{ matrix.cache-mode }}-blocked-development
+          path: |
+            ${{ env.TIBOTATTLE_ELECTRON_ARTIFACT_APP_PATH }}
+            ${{ env.TIBOTATTLE_WINDOWS_SECURITY_QUALIFICATION_RESULT_PATH }}
+            ${{ env.TIBOTATTLE_ELECTRON_VERIFICATION_EVIDENCE_PATH }}
+            ${{ env.TIBOTATTLE_ELECTRON_RUNTIME_SMOKE_EVIDENCE_PATH }}
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Remove generated Electron artifact tree before clean checkout gate
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $releaseBuild = Join-Path $env:GITHUB_WORKSPACE '.release-build'
+          if (Test-Path -LiteralPath $releaseBuild) {
+            Remove-Item -LiteralPath $releaseBuild -Recurse -Force
+          }
+
+      - name: Confirm qualification and artifact work did not modify the checkout
+        if: ${{ always() }}
+        shell: pwsh
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = $env:EXPECTED_REVISION.Trim().ToLowerInvariant()
+          $actual = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($expected -notmatch '^[0-9a-f]{40}$' -or $actual -ne $expected) {
+            Write-Error 'WINDOWS_QUALIFICATION_REVISION_MISMATCH'
+            exit 1
+          }
           git diff --quiet
           if ($LASTEXITCODE -ne 0) {
             Write-Error 'WINDOWS_QUALIFICATION_WORKTREE_DIRTY'
@@ -262,3 +1181,11 @@ jobs:
             Write-Error 'WINDOWS_QUALIFICATION_UNTRACKED_OUTPUT'
             exit 1
           }
+
+      - name: Fail closed after retaining blocked development artifact
+        if: ${{ always() && !cancelled() && steps.native_security_qualification.outcome == 'failure' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Error 'WINDOWS_SECURITY_QUALIFICATION_FAILED_ARTIFACT_RETAINED'
+          exit 1

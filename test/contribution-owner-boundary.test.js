@@ -380,6 +380,8 @@ test("contribution implementations use only reviewed package and owner edges", a
     automaticStorageImports.map(({ specifier }) => specifier).sort(),
     [
       "./owner-only-filesystem.js",
+      "./windows-companion-instance-lease.js",
+      "./windows-protected-state-store.js",
       "node:crypto",
       "node:fs",
       "node:fs/promises",
@@ -425,6 +427,8 @@ test("contribution implementations use only reviewed package and owner edges", a
     [
       "./bounded-directory-reader.js",
       "./owner-only-filesystem.js",
+      "./windows-contribution-sync-queue-storage.js",
+      "./windows-sqlite-state-session.js",
       "node:crypto",
       "node:fs",
       "node:fs/promises",

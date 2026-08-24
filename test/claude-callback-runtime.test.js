@@ -3,17 +3,23 @@ import assert from "node:assert/strict";
 import { chmod, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { Readable } from "node:stream";
+import { PassThrough, Readable } from "node:stream";
 import { EventEmitter } from "node:events";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { runClaudeCallback } from "../src/claude-callback-runtime.js";
+import { createCoexistingInvocation } from "../src/claude-callback-runtime.js";
 import { readClaudeStatusSnapshots } from "../src/claude-statusline-storage.js";
 import { EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES } from "../src/export-identity-keychain.js";
 
 const CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.claudeSessionPseudonym;
 const CAPTURED_AT = "2026-07-25T12:00:00.000Z";
 const HERE = dirname(fileURLToPath(import.meta.url));
+const WINDOWS_POWERSHELL_RUNNER = Object.freeze({
+  schemaVersion: "claude-callback-runner-v1",
+  kind: "powershell",
+  executable: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+});
 
 function payload() {
   return Buffer.from(JSON.stringify({
@@ -55,6 +61,128 @@ function outputSink() {
   let value = "";
   return { sink: { write(chunk) { value += chunk; } }, value: () => value };
 }
+
+function fakeChild({ pid = 4100 } = {}) {
+  const child = new EventEmitter();
+  child.pid = pid;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.killCalls = [];
+  child.kill = (signal) => child.killCalls.push(signal);
+  return child;
+}
+
+test("Windows coexistence uses the persisted reviewed runner directly with shell=false", async () => {
+  const calls = [];
+  const child = fakeChild();
+  const invocation = createCoexistingInvocation("status command with spaces & unicode Ω", {
+    platform: "win32",
+    runner: WINDOWS_POWERSHELL_RUNNER,
+    env: { SystemRoot: "C:\\Windows" },
+    spawnCommand(command, args, options) {
+      calls.push({ command, args, options });
+      queueMicrotask(() => {
+        child.stdout.end("existing status");
+        child.emit("close", 0);
+      });
+      return child;
+    },
+  });
+  invocation.end();
+  assert.deepEqual(await invocation.result, { status: "ok", output: "existing status" });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].command, WINDOWS_POWERSHELL_RUNNER.executable);
+  assert.deepEqual(calls[0].args, [
+    "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+    "status command with spaces & unicode Ω",
+  ]);
+  assert.equal(calls[0].options.shell, false);
+});
+
+test("Windows timeout waits for fixed taskkill tree cleanup and never reports success", async () => {
+  const calls = [];
+  const target = fakeChild({ pid: 4101 });
+  const killer = fakeChild({ pid: 4102 });
+  const invocation = createCoexistingInvocation("long-running", {
+    platform: "win32",
+    runner: WINDOWS_POWERSHELL_RUNNER,
+    env: { SystemRoot: "C:\\Windows" },
+    timeoutMilliseconds: 5,
+    windowsCleanupTimeoutMilliseconds: 100,
+    spawnCommand(command, args, options) {
+      calls.push({ command, args, options });
+      if (calls.length === 1) return target;
+      queueMicrotask(() => {
+        killer.emit("close", 0);
+        target.emit("close", null);
+      });
+      return killer;
+    },
+  });
+  invocation.end();
+  assert.deepEqual(await invocation.result, { status: "failed", output: "" });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].command, "C:\\Windows\\System32\\taskkill.exe");
+  assert.deepEqual(calls[1].args, ["/PID", "4101", "/T", "/F"]);
+  assert.equal(calls[1].options.shell, false);
+});
+
+test("Windows timeout rejects a redirected SystemRoot cleanup path", async () => {
+  const calls = [];
+  const target = fakeChild({ pid: 4105 });
+  const invocation = createCoexistingInvocation("long-running", {
+    platform: "win32",
+    runner: WINDOWS_POWERSHELL_RUNNER,
+    env: { SystemRoot: "C:\\Users\\attacker\\Windows" },
+    timeoutMilliseconds: 5,
+    windowsCleanupTimeoutMilliseconds: 100,
+    spawnCommand(command, args, options) {
+      calls.push({ command, args, options });
+      return target;
+    },
+  });
+  invocation.end();
+  assert.deepEqual(await invocation.result, { status: "failed", output: "" });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(target.killCalls, ["SIGKILL"]);
+});
+
+test("Windows output overflow uses the same tree cleanup and drops retained bytes", async () => {
+  const calls = [];
+  const target = fakeChild({ pid: 4103 });
+  const killer = fakeChild({ pid: 4104 });
+  const invocation = createCoexistingInvocation("overflowing", {
+    platform: "win32",
+    runner: WINDOWS_POWERSHELL_RUNNER,
+    env: { SystemRoot: "C:\\Windows" },
+    windowsCleanupTimeoutMilliseconds: 100,
+    spawnCommand(command, args, options) {
+      calls.push({ command, args, options });
+      if (calls.length === 1) {
+        queueMicrotask(() => target.stdout.write(Buffer.alloc(8 * 1024 + 1, 0x61)));
+        return target;
+      }
+      queueMicrotask(() => {
+        killer.emit("close", 0);
+        target.emit("close", null);
+      });
+      return killer;
+    },
+  });
+  invocation.end();
+  assert.deepEqual(await invocation.result, { status: "failed", output: "" });
+  assert.equal(calls[1].command, "C:\\Windows\\System32\\taskkill.exe");
+  assert.deepEqual(calls[1].args, ["/PID", "4103", "/T", "/F"]);
+});
+
+test("Windows coexistence fails closed when no runner identity is persisted", () => {
+  assert.throws(
+    () => createCoexistingInvocation("private existing command", { platform: "win32" }),
+    (error) => error?.code === "claude_callback_lifecycle_coexistence_unsupported",
+  );
+});
 
 test("runtime fans identical bounded input to the existing command and private collector", async () => {
   await withFixture(async ({ stateDirectory }) => {
