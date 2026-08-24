@@ -5,6 +5,10 @@ const ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION =
 const ADMIN_ALLOWANCE_PREVIEW_BASIS =
   "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview";
 const ADMIN_ALLOWANCE_PREVIEW_DAYS = 70;
+const ADMIN_METRICS_HISTORY_SCHEMA_VERSION = "admin-metrics-history-v0.2";
+const ADMIN_METRICS_HISTORY_MAX_DAYS = 30;
+const ADMIN_METRICS_HISTORY_MAX_SNAPSHOTS = 400;
+const ADMIN_METRICS_HISTORY_MAX_GAUGES = 128;
 const ADMIN_ALLOWANCE_PREVIEW_PLANS = Object.freeze([
   Object.freeze({ planType: "pro", label: "Pro 20x", multiplier: 1 }),
   Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 4 }),
@@ -103,6 +107,51 @@ function calendarDay(value, code) {
     invalid(code);
   }
   return value;
+}
+
+function isoTimestamp(value, code) {
+  const timestamp = string(value, code);
+  const epoch = Date.parse(timestamp);
+  if (!Number.isFinite(epoch)) invalid(code);
+  return timestamp;
+}
+
+function boundedArray(value, maximum, code) {
+  const values = array(value, code);
+  if (values.length > maximum) invalid(code);
+  return values;
+}
+
+function projectAllowancePreviewCoverage(value) {
+  if (value === undefined || value === null) return null;
+  const code = "ADMIN_ALLOWANCE_PREVIEW_INVALID";
+  const coverage = record(value, code);
+  const projected = Object.freeze({
+    uploadingParticipantCount: count(coverage.uploadingParticipantCount, code),
+    cachedParticipantCount: count(coverage.cachedParticipantCount, code),
+    recentFittedParticipantCount: count(coverage.recentFittedParticipantCount, code),
+    mergeEligibleParticipantCount: count(coverage.mergeEligibleParticipantCount, code),
+    noQualifyingFitParticipantCount: count(
+      coverage.noQualifyingFitParticipantCount,
+      code,
+    ),
+    noRecentFitParticipantCount: count(coverage.noRecentFitParticipantCount, code),
+    unsupportedPlanParticipantCount: count(
+      coverage.unsupportedPlanParticipantCount,
+      code,
+    ),
+  });
+  const gapCount = projected.noQualifyingFitParticipantCount
+    + projected.noRecentFitParticipantCount
+    + projected.unsupportedPlanParticipantCount;
+  if (projected.cachedParticipantCount > projected.uploadingParticipantCount
+      || projected.recentFittedParticipantCount > projected.cachedParticipantCount
+      || projected.mergeEligibleParticipantCount > projected.recentFittedParticipantCount
+      || gapCount !== projected.uploadingParticipantCount
+        - projected.mergeEligibleParticipantCount) {
+    invalid(code);
+  }
+  return projected;
 }
 
 function projectAllowancePreviewSummary(value) {
@@ -216,6 +265,144 @@ export function projectAdminAllowancePreview(value) {
     spanFloorPp: 40,
     plans: Object.freeze(plans),
     days: Object.freeze(days),
+    coverage: projectAllowancePreviewCoverage(preview.coverage),
+  });
+}
+
+function projectAdminEventSeries(value, generatedDay, expectedStartsAt) {
+  const code = "ADMIN_METRICS_HISTORY_INVALID";
+  const series = record(value, code);
+  const byDayStartsAt = calendarDay(series.byDayStartsAt, code);
+  if (byDayStartsAt !== expectedStartsAt) invalid(code);
+  const byDay = boundedArray(series.byDay, ADMIN_METRICS_HISTORY_MAX_DAYS, code)
+    .map((candidate) => {
+      const row = record(candidate, code);
+      return Object.freeze({
+        day: calendarDay(row.day, code),
+        count: count(row.count, code),
+      });
+    });
+  let previousDay = null;
+  for (const row of byDay) {
+    if ((previousDay !== null && row.day <= previousDay)
+        || row.day < byDayStartsAt
+        || row.day > generatedDay) {
+      invalid(code);
+    }
+    previousDay = row.day;
+  }
+  const total = count(series.total, code);
+  const last24Hours = count(series.last24Hours, code);
+  const previous24Hours = count(series.previous24Hours, code);
+  if (last24Hours > total || previous24Hours > total) invalid(code);
+  return Object.freeze({
+    total,
+    last24Hours,
+    previous24Hours,
+    byDayStartsAt,
+    byDay: Object.freeze(byDay),
+  });
+}
+
+/**
+ * Fail-closed projection for the single aggregate history payload. New gauge
+ * names are additive: the projector accepts only bounded, non-negative safe
+ * integer values, while the renderer decides which known metric each key can
+ * support. Missing new gauges remain an explicit history gap.
+ */
+export function projectAdminMetricsHistory(value) {
+  const code = "ADMIN_METRICS_HISTORY_INVALID";
+  const history = record(value, code);
+  if (history.schemaVersion !== ADMIN_METRICS_HISTORY_SCHEMA_VERSION) invalid(code);
+  const generatedAt = isoTimestamp(history.generatedAt, code);
+  const generatedEpoch = Date.parse(generatedAt);
+  const generatedDay = generatedAt.slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/u.test(generatedDay)) invalid(code);
+  const expectedStartsAtDate = new Date(`${generatedDay}T00:00:00.000Z`);
+  expectedStartsAtDate.setUTCDate(expectedStartsAtDate.getUTCDate() - 29);
+  const expectedStartsAt = expectedStartsAtDate.toISOString().slice(0, 10);
+  const events = record(history.events, code);
+  const eventNames = [
+    "participants",
+    "webSessions",
+    "devicePairings",
+    "deviceCredentials",
+    "deviceConsents",
+    "uploadedChunks",
+    "acceptedUploads",
+    "uploadedRecords",
+    "uploadingParticipants",
+  ];
+  const projectedEvents = Object.fromEntries(eventNames.map((name) => [
+    name,
+    projectAdminEventSeries(events[name], generatedDay, expectedStartsAt),
+  ]));
+  const downloads = record(history.downloads, code);
+  const downloadStartsAt = calendarDay(downloads.byDayStartsAt, code);
+  if (downloadStartsAt !== expectedStartsAt) invalid(code);
+  const downloadRows = boundedArray(
+    downloads.byDay,
+    ADMIN_METRICS_HISTORY_MAX_DAYS,
+    code,
+  ).map((candidate) => {
+    const row = record(candidate, code);
+    return Object.freeze({
+      day: calendarDay(row.day, code),
+      cumulativeDmgDownloads: count(row.cumulativeDmgDownloads, code),
+    });
+  });
+  let previousDownloadDay = null;
+  for (const row of downloadRows) {
+    if ((previousDownloadDay !== null && row.day <= previousDownloadDay)
+        || row.day < downloadStartsAt
+        || row.day > generatedDay) {
+      invalid(code);
+    }
+    previousDownloadDay = row.day;
+  }
+  const downloadsAvailable = boolean(downloads.available, code);
+  if (!downloadsAvailable && downloadRows.length !== 0) invalid(code);
+
+  const gauges = record(history.gauges, code);
+  const gaugeKeyPattern = /^[A-Za-z][A-Za-z0-9_]{0,79}$/u;
+  const snapshots = boundedArray(
+    gauges.snapshots,
+    ADMIN_METRICS_HISTORY_MAX_SNAPSHOTS,
+    code,
+  ).map((candidate) => {
+    const snapshot = record(candidate, code);
+    const capturedAt = isoTimestamp(snapshot.capturedAt, code);
+    const rawMetrics = record(snapshot.metrics, code);
+    const entries = Object.entries(rawMetrics);
+    if (entries.length > ADMIN_METRICS_HISTORY_MAX_GAUGES) invalid(code);
+    const metrics = {};
+    for (const [key, metricValue] of entries) {
+      if (!gaugeKeyPattern.test(key)) invalid(code);
+      const projected = count(metricValue, code);
+      if (key.endsWith("Bounded") && projected > 1) invalid(code);
+      metrics[key] = projected;
+    }
+    return Object.freeze({ capturedAt, metrics: Object.freeze(metrics) });
+  });
+  let previousCapturedAt = -Infinity;
+  const earliestSnapshotAt = generatedEpoch - 30 * 24 * 60 * 60 * 1_000;
+  for (const snapshot of snapshots) {
+    const capturedAt = Date.parse(snapshot.capturedAt);
+    if (capturedAt < earliestSnapshotAt
+        || capturedAt <= previousCapturedAt
+        || capturedAt > generatedEpoch) invalid(code);
+    previousCapturedAt = capturedAt;
+  }
+  return Object.freeze({
+    schemaVersion: ADMIN_METRICS_HISTORY_SCHEMA_VERSION,
+    generatedAt,
+    events: Object.freeze(projectedEvents),
+    downloads: Object.freeze({
+      available: downloadsAvailable,
+      byDayStartsAt: downloadStartsAt,
+      byDay: Object.freeze(downloadRows),
+    }),
+    gauges: Object.freeze({ snapshots: Object.freeze(snapshots) }),
   });
 }
 
@@ -468,6 +655,44 @@ function projectDistribution(value) {
       ),
     });
   });
+  const bySegment = boundedArray(
+    cloudflare.bySegment ?? [],
+    32,
+    "ADMIN_OVERVIEW_INVALID",
+  ).map((value) => {
+    const segment = record(value, "ADMIN_OVERVIEW_INVALID");
+    const startsAt = isoTimestamp(segment.startsAt, "ADMIN_OVERVIEW_INVALID");
+    const endsAt = isoTimestamp(segment.endsAt, "ADMIN_OVERVIEW_INVALID");
+    if (Date.parse(endsAt) <= Date.parse(startsAt)) invalid("ADMIN_OVERVIEW_INVALID");
+    return Object.freeze({
+      startsAt,
+      endsAt,
+      activeSourceAddresses: count(
+        segment.activeSourceAddresses,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      preflightRequests: count(segment.preflightRequests, "ADMIN_OVERVIEW_INVALID"),
+      sparkleCheckRequests: count(
+        segment.sparkleCheckRequests,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      sparkleDownloadRequests: count(
+        segment.sparkleDownloadRequests,
+        "ADMIN_OVERVIEW_INVALID",
+      ),
+      currentVersionSourceAddresses: segment.currentVersionSourceAddresses === null
+        ? null
+        : count(
+          segment.currentVersionSourceAddresses,
+          "ADMIN_OVERVIEW_INVALID",
+        ),
+    });
+  });
+  for (let index = 1; index < bySegment.length; index += 1) {
+    if (bySegment[index].startsAt < bySegment[index - 1].endsAt) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
+  }
   let cloudflareWindow = null;
   let activeSourceAddresses = null;
   let preflight = null;
@@ -496,6 +721,7 @@ function projectDistribution(value) {
       || cloudflare.currentVersion !== null
       || cloudflare.currentVersionSourceAddresses !== null
       || observedVersions.length !== 0
+      || bySegment.length !== 0
       || cloudflare.observedVersionsBounded !== false
       || typeof cloudflare.reasonCode !== "string") {
     invalid("ADMIN_OVERVIEW_INVALID");
@@ -509,6 +735,11 @@ function projectDistribution(value) {
     ? null
     : projectDistributionWindow(cloudflare.currentVersionSourceAddresses);
   if ((currentVersion === null) !== (currentVersionSourceAddresses === null)) {
+    invalid("ADMIN_OVERVIEW_INVALID");
+  }
+  if (bySegment.some((segment) => (
+    (segment.currentVersionSourceAddresses === null) !== (currentVersion === null)
+  ))) {
     invalid("ADMIN_OVERVIEW_INVALID");
   }
 
@@ -718,6 +949,7 @@ function projectDistribution(value) {
       currentVersion,
       currentVersionSourceAddresses,
       observedVersions: Object.freeze(observedVersions),
+      bySegment: Object.freeze(bySegment),
       observedVersionsBounded: boolean(
         cloudflare.observedVersionsBounded,
         "ADMIN_OVERVIEW_INVALID",
@@ -839,9 +1071,15 @@ function projectErrors(value) {
   const errors = record(value, "ADMIN_OVERVIEW_INVALID");
   const groups = array(errors.groups, "ADMIN_OVERVIEW_INVALID").map((value) => {
     const group = record(value, "ADMIN_OVERVIEW_INVALID");
+    if (!Number.isSafeInteger(group.status)
+        || group.status < 500
+        || group.status > 599) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
     return Object.freeze({
       routeClass: string(group.routeClass, "ADMIN_OVERVIEW_INVALID"),
       errorCode: string(group.errorCode, "ADMIN_OVERVIEW_INVALID"),
+      status: group.status,
       occurrences: count(group.occurrences, "ADMIN_OVERVIEW_INVALID"),
       ratePerDay: typeof group.ratePerDay === "number" && Number.isFinite(group.ratePerDay)
         ? group.ratePerDay
@@ -852,11 +1090,17 @@ function projectErrors(value) {
   const projectLookup = (value) => {
     if (value === null) return null;
     const lookup = record(value, "ADMIN_OVERVIEW_INVALID");
+    if (!Number.isSafeInteger(lookup.status)
+        || lookup.status < 500
+        || lookup.status > 599) {
+      invalid("ADMIN_OVERVIEW_INVALID");
+    }
     return Object.freeze({
       requestId: string(lookup.requestId, "ADMIN_OVERVIEW_INVALID"),
       errorCode: string(lookup.errorCode, "ADMIN_OVERVIEW_INVALID"),
       routeClass: string(lookup.routeClass, "ADMIN_OVERVIEW_INVALID"),
       occurredAt: string(lookup.occurredAt, "ADMIN_OVERVIEW_INVALID"),
+      status: lookup.status,
     });
   };
   const recentDiagnostics = array(
@@ -878,6 +1122,9 @@ function projectErrors(value) {
     });
   });
   return Object.freeze({
+    retentionDays: positiveInteger(errors.retentionDays, "ADMIN_OVERVIEW_INVALID"),
+    sampled: boolean(errors.sampled, "ADMIN_OVERVIEW_INVALID"),
+    capacity: positiveInteger(errors.capacity, "ADMIN_OVERVIEW_INVALID"),
     groups: Object.freeze(groups),
     recentDiagnostics: Object.freeze(recentDiagnostics),
     lookup: projectLookup(errors.lookup),

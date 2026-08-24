@@ -86,6 +86,16 @@ export interface DistributionVersionActivity {
   readonly sourceAddressesLast7Days: number;
 }
 
+export interface DistributionActivitySegment {
+  readonly startsAt: string;
+  readonly endsAt: string;
+  readonly activeSourceAddresses: number;
+  readonly preflightRequests: number;
+  readonly sparkleCheckRequests: number;
+  readonly sparkleDownloadRequests: number;
+  readonly currentVersionSourceAddresses: number | null;
+}
+
 export interface CloudflareDistributionAnalytics {
   readonly status: SourceStatus;
   readonly reasonCode: string | null;
@@ -101,6 +111,12 @@ export interface CloudflareDistributionAnalytics {
   readonly sparkleDownloads: DistributionRequestCounts | null;
   readonly currentVersion: string | null;
   readonly currentVersionSourceAddresses: DistributionWindowCounts | null;
+  /**
+   * The same seven already-fetched 24-hour segments used for the rolling
+   * totals, reduced to aggregate chart points. No additional analytics query
+   * or raw source address crosses this boundary.
+   */
+  readonly bySegment: readonly DistributionActivitySegment[];
   readonly observedVersions: readonly DistributionVersionActivity[];
   readonly observedVersionsBounded: boolean;
 }
@@ -195,6 +211,7 @@ function sourceUnavailable(
     sparkleDownloads: null,
     currentVersion: null,
     currentVersionSourceAddresses: null,
+    bySegment: [],
     observedVersions: [],
     observedVersionsBounded: false,
   };
@@ -425,12 +442,18 @@ function aggregateAnalytics(
   const preflight = requestAccumulator();
   const sparkleChecks = requestAccumulator();
   const sparkleDownloads = requestAccumulator();
+  const bySegment: DistributionActivitySegment[] = [];
   const versions = new Map<string, VersionAccumulator>();
   let sampled = false;
   let bounded = false;
 
   segments.forEach((segment, index) => {
     const inLast24Hours = index === segments.length - 1;
+    const segmentActiveAddresses = new Set<string>();
+    const segmentCurrentVersionAddresses = new Set<string>();
+    let segmentPreflightRequests = 0;
+    let segmentSparkleCheckRequests = 0;
+    let segmentSparkleDownloadRequests = 0;
     bounded ||= segment.bounded;
     for (const row of [...segment.appcast, ...segment.releases]) {
       sampled ||= row.sampleInterval > 1;
@@ -443,8 +466,17 @@ function aggregateAnalytics(
       if (!isSparkle && !isTiboTattle) continue;
 
       activeAddressesLast7Days.add(row.clientIP);
+      segmentActiveAddresses.add(row.clientIP);
       if (inLast24Hours) activeAddressesLast24Hours.add(row.clientIP);
       addRequest(row, inLast24Hours, isSparkle ? sparkleChecks : preflight);
+      if (isSparkle) {
+        segmentSparkleCheckRequests = safeAdd(
+          segmentSparkleCheckRequests,
+          row.count,
+        );
+      } else {
+        segmentPreflightRequests = safeAdd(segmentPreflightRequests, row.count);
+      }
 
       const version = appVersion(row.userAgent);
       if (version !== null) {
@@ -463,6 +495,9 @@ function aggregateAnalytics(
         }
         versions.set(version, accumulator);
       }
+      if (version !== null && version === currentVersion) {
+        segmentCurrentVersionAddresses.add(row.clientIP);
+      }
     }
     for (const row of segment.releases) {
       if (!isSuccessfulDownload(row.edgeResponseStatus)
@@ -470,7 +505,22 @@ function aggregateAnalytics(
         continue;
       }
       addRequest(row, inLast24Hours, sparkleDownloads);
+      segmentSparkleDownloadRequests = safeAdd(
+        segmentSparkleDownloadRequests,
+        row.count,
+      );
     }
+    bySegment.push({
+      startsAt: segment.startsAt,
+      endsAt: segment.endsAt,
+      activeSourceAddresses: segmentActiveAddresses.size,
+      preflightRequests: segmentPreflightRequests,
+      sparkleCheckRequests: segmentSparkleCheckRequests,
+      sparkleDownloadRequests: segmentSparkleDownloadRequests,
+      currentVersionSourceAddresses: currentVersion === null
+        ? null
+        : segmentCurrentVersionAddresses.size,
+    });
   });
 
   const observedVersions = [...versions.entries()]
@@ -508,6 +558,7 @@ function aggregateAnalytics(
         last24Hours: current?.sourceAddressesLast24Hours.size ?? 0,
         last7Days: current?.sourceAddressesLast7Days.size ?? 0,
       },
+    bySegment,
     observedVersions,
     observedVersionsBounded: versions.size > MAX_RENDERED_VERSIONS,
   };

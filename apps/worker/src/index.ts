@@ -277,9 +277,13 @@ import {
 } from "./community-daily-aggregates";
 import {
   captureAdminMetricSnapshot,
-  readAdminMetricsHistory,
+  readCachedAdminMetricsHistory,
+  warmAdminMetricsHistoryCache,
 } from "./admin-metrics-history";
-import { readAdminCommunityAllowancePreview } from "./admin-community-allowance";
+import {
+  readCachedAdminCommunityAllowancePreview,
+  warmAdminCommunityAllowancePreviewCache,
+} from "./admin-community-allowance";
 import { canonicalJson } from "./canonical-json";
 import {
   insertTelemetryContributionV02,
@@ -2945,7 +2949,10 @@ async function handleAdminMetricsHistory(
     }
     await adminSession(request, env);
   }
-  const history = await readAdminMetricsHistory(env.USAGE_MONITOR_DB, Date.now());
+  const history = await readCachedAdminMetricsHistory(
+    env.USAGE_MONITOR_DB,
+    Date.now(),
+  );
   return jsonResponse(history, 200, {
     "cache-control": "no-store",
     vary: "Cookie",
@@ -2964,13 +2971,10 @@ async function handleAdminCommunityAllowancePreview(
     }
     await adminSession(request, env);
   }
-  const preview = await readAdminCommunityAllowancePreview(
+  const preview = await readCachedAdminCommunityAllowancePreview(
     env.USAGE_MONITOR_DB,
     Date.now(),
   );
-  if (preview === null) {
-    throw new ApiError(503, "ADMIN_ALLOWANCE_CACHE_UNAVAILABLE");
-  }
   return jsonResponse(preview, 200, {
     "cache-control": "no-store",
     vary: "Cookie",
@@ -3770,11 +3774,14 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }));
       return noStore(errorResponse(apiError, requestId));
     }
-    if (apiError.code === "ADMIN_ALLOWANCE_CACHE_UNAVAILABLE") {
-      // Expected fail-closed state for the read-only admin preview. The
-      // scheduled aggregate pass warms the fit cache; an interactive request
-      // never writes that cache, falls through to raw analysis, or persists a
-      // diagnostic row while waiting for it.
+    if ([
+      "ADMIN_ALLOWANCE_CACHE_UNAVAILABLE",
+      "ADMIN_METRICS_HISTORY_CACHE_UNAVAILABLE",
+    ].includes(apiError.code)) {
+      // Expected fail-closed state for read-only admin aggregates. Scheduled
+      // maintenance warms each cache; an interactive request never writes a
+      // cache, falls through to raw analysis, or persists a diagnostic row
+      // while waiting for it.
       console.warn(JSON.stringify({
         level: "warn",
         event: "request_unavailable",
@@ -4012,6 +4019,48 @@ export async function runScheduledMaintenance(
       // captureAdminMetricSnapshot reports rather than throws; this guard
       // exists so no future edit can turn a metrics failure into a
       // maintenance failure.
+    }
+    // The authenticated browser endpoint reads exactly one singleton cache
+    // row. Rebuilding that row is scheduled work only: it self-throttles to
+    // roughly hourly and any failure remains isolated from retention,
+    // reconciliation, and publication.
+    try {
+      const historyCache = await warmAdminMetricsHistoryCache(
+        env.USAGE_MONITOR_DB,
+        Date.now(),
+      );
+      if (historyCache.code === "HISTORY_CACHE_UNAVAILABLE") {
+        console.warn(JSON.stringify({
+          level: "warn",
+          event: "admin_metrics_history_cache",
+          outcome: "failure",
+          code: historyCache.code,
+        }));
+      }
+    } catch {
+      // warmAdminMetricsHistoryCache reports rather than throws; preserve this
+      // belt-and-suspenders boundary against future cache implementation edits.
+    }
+    // The merged allowance preview follows the same browser contract: exactly
+    // one singleton aggregate read after authentication. Source-cache scanning
+    // and preview construction happen only here, at a bounded cadence, and a
+    // preview failure cannot impede the service's required maintenance work.
+    try {
+      const allowanceCache = await warmAdminCommunityAllowancePreviewCache(
+        env.USAGE_MONITOR_DB,
+        Date.now(),
+      );
+      if (allowanceCache.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE") {
+        console.warn(JSON.stringify({
+          level: "warn",
+          event: "admin_allowance_preview_cache",
+          outcome: "failure",
+          code: allowanceCache.code,
+        }));
+      }
+    } catch {
+      // The warmer reports rather than throws. Retain an explicit isolation
+      // guard so future cache changes cannot widen its operational blast radius.
     }
     const handoffPurge = await purgeExpiredIdentityHandoffs(
       env.USAGE_MONITOR_DB,

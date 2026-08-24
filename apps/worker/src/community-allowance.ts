@@ -309,19 +309,30 @@ interface CachedCommunityAllowanceFitRow {
 }
 
 /**
- * Read the fit corpus for an interactive admin request without ever invoking
- * either raw-corpus analyzer or issuing a database mutation.
+ * Fully validated, cache-backed fit evidence for the active uploading cohort.
+ * Participant identifiers stay inside Worker code; callers must project only
+ * aggregate counts before returning anything to a browser.
+ */
+export interface CachedCommunityAllowanceCorpus {
+  readonly participantIds: readonly string[];
+  readonly fits: readonly CommunityAllowanceFit[];
+}
+
+/**
+ * Read the validated fit-cache corpus for scheduled aggregate construction
+ * without invoking either raw-corpus analyzer or issuing a database mutation.
  *
  * The single SELECT verifies each active participant's cheap chunk epoch
  * against the same registry + adapter cache key used by the scheduled
  * collector. Missing/stale v1 rows and v0.2-selected participants fail closed:
- * those sources require analysis and an admin page refresh must never perform
- * that expensive work. The scheduled aggregate builder remains the sole cache
- * warmer and keeps its existing best-effort INSERT behaviour.
+ * those sources require analysis and this SELECT-only source cannot substitute
+ * raw work. Browser routes must read their own aggregate singleton instead;
+ * the scheduled aggregate builder remains the sole fit-cache warmer and keeps
+ * its existing best-effort INSERT behaviour.
  */
-export async function readCachedCommunityAllowanceFits(
+export async function readCachedCommunityAllowanceCorpus(
   db: D1Database,
-): Promise<CommunityAllowanceFit[] | null> {
+): Promise<CachedCommunityAllowanceCorpus | null> {
   let rows: CachedCommunityAllowanceFitRow[];
   try {
     const result = await db.prepare(
@@ -412,7 +423,22 @@ export async function readCachedCommunityAllowanceFits(
     || left.capacityNanousd - right.capacityNanousd
     || left.participantId.localeCompare(right.participantId)
   ));
-  return fits;
+  return Object.freeze({
+    participantIds: Object.freeze([...participants].sort()),
+    fits: Object.freeze(fits),
+  });
+}
+
+/**
+ * Compatibility projection for existing scheduled/public aggregation code.
+ * It deliberately delegates to the corpus reader so there remains one cache
+ * validation and source-selection contract.
+ */
+export async function readCachedCommunityAllowanceFits(
+  db: D1Database,
+): Promise<CommunityAllowanceFit[] | null> {
+  const corpus = await readCachedCommunityAllowanceCorpus(db);
+  return corpus === null ? null : [...corpus.fits];
 }
 
 /**

@@ -76,6 +76,11 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     // of hourly gauge snapshots — named counts only, shape-capped at 4000
     // bytes. No participant, device, or upload data.
     "0038_admin_metrics_history.sql",
+    // Added with the cache-only owner dashboard endpoints (2026-08-24):
+    // singleton metrics-history and allowance-preview aggregate JSON payloads,
+    // rebuilt by scheduled maintenance. Interactive admin requests read these
+    // cache rows instead of event or per-account analysis tables.
+    "0039_admin_metrics_history_cache.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",
