@@ -4434,6 +4434,12 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
   targetOptions.shareMode = FILE_SHARE_READ | FILE_SHARE_DELETE;
   targetOptions.protectedAncestorDepth = 1;
   targetOptions.disposition = kFileOpen;
+  // A fresh unified-index ingest has no live destination yet.  Keep that
+  // absence inside the protected handle walk so the stage can be published by
+  // the final handle-relative replacement below.  Without this flag, the
+  // expected first-run ENOENT escapes as publish_target_open and every fresh
+  // Windows profile fails before its first index is visible.
+  targetOptions.finalMayBeMissing = true;
   RelativeHandles target;
   bool targetMissing = false;
   ParsedPath targetPath;
@@ -4497,7 +4503,12 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
           stage.final,
           stage.parents.front(),
           targetName,
-          &failure)) {
+          &failure,
+          // A target that was absent during the protected walk must never be
+          // clobbered if another creator wins the name race. An existing
+          // target passed the identity-bound validation above, so replacement
+          // remains the intended atomic update for that case.
+          !targetMissing)) {
     // RenameHandleRelative reports its generic helper stage. Replace it here
     // with the bounded publish vocabulary before crossing the N-API boundary.
     failure.stage = "publish_rename";
