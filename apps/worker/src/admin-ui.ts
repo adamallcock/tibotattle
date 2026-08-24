@@ -64,10 +64,18 @@ export function canonicalPublicRedirectUrl(
       || requestUrl.hostname !== `www.${configured.hostname}`) {
     return null;
   }
-  return new URL(
-    `${requestUrl.pathname}${requestUrl.search}`,
-    configured,
-  ).href;
+  // Assign the path and query as fields rather than parsing them as a relative
+  // reference against `configured`: a pathname beginning `//` (or `/\`, which
+  // the URL parser folds to `//`) is a network-path reference to the URL
+  // constructor and would swap the authority to an attacker origin — an open
+  // redirect from the canonical host. The setter keeps the origin fixed, and
+  // collapsing a leading slash run means such a value cannot even survive as a
+  // confusing same-origin `//…` Location. A network-path prefix never names one
+  // of our own pages, so nothing legitimate is lost.
+  const target = new URL(configured.href);
+  target.pathname = requestUrl.pathname.replace(/^[/\\]+/, "/");
+  target.search = requestUrl.search;
+  return target.href;
 }
 
 /**

@@ -14,6 +14,8 @@ import { join } from "node:path";
 import {
   LOCAL_COMPANION_SCHEMA_VERSION,
   LocalCompanionDataStore,
+  RETAINED_EVIDENCE_REFRESH_WARNING,
+  RETAINED_EVIDENCE_RELABELED_WARNINGS,
   RETAINED_PROJECTION_SURFACE_PATHS,
   buildLocalCompanionSnapshot,
 } from "../src/local-companion-data.js";
@@ -2710,6 +2712,114 @@ test("a mismatch window keeps the cost figures while the truth fields stay curre
   await wiped.reload({ purpose: "full" });
   assert.equal(wiped.getOverview().accounting.events, 0,
     "an authoritative empty accounting must land");
+});
+
+test("a build serving retained evidence does not claim its figures are loading", async () => {
+  // Captured live 2026-08-21 on the owner's machine: every ~5-minute refresh
+  // pass republishes a quick-milestone snapshot for the first ~2 minutes.
+  // Retention keeps the page's figures complete and current through that
+  // window, but the build's own warnings — "Full indexed history is loading",
+  // "History indexing is still advancing. Complete historical totals stay
+  // hidden" — were served verbatim alongside them. On the Usage-and-costs
+  // page the banners therefore showed on a ~40% duty cycle forever, always
+  // claiming figures were hidden that were plainly on screen.
+  const UNRELATED_WARNING =
+    "Usage accounting is complete, but typed tool history is partial. Tool totals are withheld rather than reported as zero.";
+  const snapshot = ({ matched, empty, warnings }) => ({
+    schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+    mode: "real_local_evidence",
+    generatedAt: "2026-08-21T20:32:51.918Z",
+    overview: {
+      accounting: {
+        sourceMode: "unified",
+        generationMatched: matched,
+        events: empty ? 0 : 95636,
+        byModel: empty ? [] : [{ model: "gpt-5.4", events: 90000 }],
+        periods: empty
+          ? [{ periodId: "7d", events: 0 }]
+          : [{ periodId: "7d", events: 95636 }],
+      },
+      usage: [{ id: "7d", label: "Last 7 days", events: empty ? 0 : 12 }],
+      timeline: { usage: empty ? [] : [{ at: 1 }] },
+      warnings,
+    },
+    gradient: { datasets: { rolling: empty ? [] : [{ at: 1 }] } },
+    weekly: { datasets: { weekly_values: empty ? [] : [{ sequence: 1 }] } },
+    quality: {},
+    reports: [],
+  });
+  const storeWith = (sequence) => {
+    let call = 0;
+    return new LocalCompanionDataStore({
+      builder: async () => snapshot(sequence[Math.min(call++, sequence.length - 1)]),
+    });
+  };
+  const [deferredLoading, withheldPartial, , , historyHidden] =
+    RETAINED_EVIDENCE_RELABELED_WARNINGS;
+
+  // The captured cycle: an authoritative full, then the quick milestone. Both
+  // loading sentences are replaced by the one sentence that is true of the
+  // retained figures — once, first, with unrelated warnings kept in place.
+  const quick = storeWith([
+    { matched: true, empty: false, warnings: [] },
+    {
+      matched: false,
+      empty: true,
+      warnings: [deferredLoading, UNRELATED_WARNING, historyHidden],
+    },
+  ]);
+  await quick.reload({ purpose: "full" });
+  await quick.reload({ purpose: "quick" });
+  assert.deepEqual(quick.getOverview().warnings, [
+    RETAINED_EVIDENCE_REFRESH_WARNING,
+    UNRELATED_WARNING,
+  ], "loading claims must not outlive the evidence they describe");
+
+  // The mismatch-window full build (M3) gets the same relabel: its withheld
+  // sentence is false of the retained figures the page keeps showing.
+  const mismatch = storeWith([
+    { matched: true, empty: false, warnings: [] },
+    { matched: false, empty: true, warnings: [withheldPartial] },
+  ]);
+  await mismatch.reload({ purpose: "full" });
+  await mismatch.reload({ purpose: "full" });
+  assert.deepEqual(mismatch.getOverview().warnings, [
+    RETAINED_EVIDENCE_REFRESH_WARNING,
+  ]);
+
+  // A true cold start retains nothing, so "loading" is exactly right and the
+  // build's own sentences stand untouched.
+  const cold = storeWith([
+    {
+      matched: false,
+      empty: true,
+      warnings: [deferredLoading, historyHidden],
+    },
+  ]);
+  await cold.reload({ purpose: "startup" });
+  assert.deepEqual(cold.getOverview().warnings, [deferredLoading, historyHidden],
+    "a cold start genuinely is loading and must say so");
+
+  // A deferred build with no replaceable sentence gains nothing: the relabel
+  // replaces false claims, it does not add a standing banner to every pass.
+  const quiet = storeWith([
+    { matched: true, empty: false, warnings: [] },
+    { matched: false, empty: true, warnings: [UNRELATED_WARNING] },
+  ]);
+  await quiet.reload({ purpose: "full" });
+  await quiet.reload({ purpose: "quick" });
+  assert.deepEqual(quiet.getOverview().warnings, [UNRELATED_WARNING]);
+
+  // An authoritative build keeps its own words even when they include these
+  // sentences: nothing was retained over it, so nothing is relabeled.
+  const authoritative = storeWith([
+    { matched: true, empty: false, warnings: [] },
+    { matched: true, empty: true, warnings: [historyHidden] },
+  ]);
+  await authoritative.reload({ purpose: "full" });
+  await authoritative.reload({ purpose: "full" });
+  assert.deepEqual(authoritative.getOverview().warnings, [historyHidden],
+    "an authoritative build's own sentences are its own to make");
 });
 
 test("every surface a withheld projection empties is registered for retention", async () => {

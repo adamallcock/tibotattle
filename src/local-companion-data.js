@@ -2207,6 +2207,37 @@ function unifiedPartialReason(unified) {
     : "unified_index_generation_incomplete";
 }
 
+// Each sentence below claims figures are loading, withheld, or hidden. That is
+// a statement about THIS build's own projection — and it becomes untrue the
+// moment the data store serves retained full-authority evidence in its place,
+// which is exactly what every quick milestone and every mismatch-window full
+// build does. The store therefore needs to recognize these sentences to
+// replace them (owner-reported, 2026-08-21: both banners on screen through
+// every refresh cycle while the figures were complete and current), so they
+// are named constants rather than inline strings.
+const UNIFIED_DEFERRED_LOADING_WARNING =
+  "Full indexed history is loading. The latest replay-safe snapshot is shown meanwhile and will be replaced only by the completed full projection.";
+const UNIFIED_WITHHELD_PARTIAL_WARNING =
+  "The unified local index is readable but only partially covered. Usage totals and timelines are withheld until a complete generation-bound publication is available.";
+const UNIFIED_WITHHELD_MISSING_WARNING =
+  "The unified local index has not been built yet. Usage totals and timelines remain unavailable until a complete generation-bound publication is available.";
+const UNIFIED_WITHHELD_UNREADABLE_WARNING =
+  "The unified local index is unavailable. Usage totals and timelines remain unavailable until a complete generation-bound publication is available.";
+const HISTORY_TOTALS_HIDDEN_WARNING =
+  "History indexing is still advancing. Complete historical totals stay hidden until an indexed aggregate is available.";
+export const RETAINED_EVIDENCE_RELABELED_WARNINGS = Object.freeze([
+  UNIFIED_DEFERRED_LOADING_WARNING,
+  UNIFIED_WITHHELD_PARTIAL_WARNING,
+  UNIFIED_WITHHELD_MISSING_WARNING,
+  UNIFIED_WITHHELD_UNREADABLE_WARNING,
+  HISTORY_TOTALS_HIDDEN_WARNING,
+]);
+// The one sentence that is true while retained evidence is on screen: nothing
+// is hidden, and what is loading is a replacement, not the figures. "still"
+// keeps the page's quiet progress treatment rather than the alert one.
+export const RETAINED_EVIDENCE_REFRESH_WARNING =
+  "The full history projection is still being recalculated in the background. The figures shown are the most recent completed projection and are replaced automatically when it finishes.";
+
 function unifiedHistoryState({ cache, unified, cacheErrorCode }) {
   const history = cache?.history;
   const descriptor = cache?.sourceDescriptor;
@@ -2899,17 +2930,15 @@ export async function buildLocalCompanionSnapshot({
   }
   if (unifiedAccountingWithheld) {
     warnings.push(unified.status === "deferred"
-      ? "Full indexed history is loading. The latest replay-safe snapshot is shown meanwhile and will be replaced only by the completed full projection."
+      ? UNIFIED_DEFERRED_LOADING_WARNING
       : unifiedAuthorityPartial
-        ? "The unified local index is readable but only partially covered. Usage totals and timelines are withheld until a complete generation-bound publication is available."
+        ? UNIFIED_WITHHELD_PARTIAL_WARNING
         : unified.status === "missing"
-          ? "The unified local index has not been built yet. Usage totals and timelines remain unavailable until a complete generation-bound publication is available."
-          : "The unified local index is unavailable. Usage totals and timelines remain unavailable until a complete generation-bound publication is available.");
+          ? UNIFIED_WITHHELD_MISSING_WARNING
+          : UNIFIED_WITHHELD_UNREADABLE_WARNING);
   } else if (!unifiedAvailable) {
     if (unified.status === "deferred") {
-      warnings.push(
-        "Full indexed history is loading. The latest replay-safe snapshot is shown meanwhile and will be replaced only by the completed full projection.",
-      );
+      warnings.push(UNIFIED_DEFERRED_LOADING_WARNING);
     } else {
       warnings.push(unified.status === "missing"
         ? `The unified local index has not been built yet. Usage history and the broadest period are bounded to the recent ${RECENT_TIMELINE_DAYS}-day collector window until it is.`
@@ -2971,7 +3000,7 @@ export async function buildLocalCompanionSnapshot({
       ? historyCoverage.phase === "partial_terminal"
         ? `Indexed-history totals include ${historyCoverage.indexedSourceCount} verified sources; ${historyCoverage.skippedSourceCount} sources across ${historyCoverage.skippedThreadCount} threads were quarantined after a local integrity check. The missing portion is a known gap, not zero usage.`
         : `Indexed-history totals currently cover ${historyCoverage.indexedSourceCount}/${historyCoverage.sourceCount} discovered sources and expand as later foreground refreshes advance the index.`
-      : "History indexing is still advancing. Complete historical totals stay hidden until an indexed aggregate is available.");
+      : HISTORY_TOTALS_HIDDEN_WARNING);
   } else if (historyAccounting.status !== "available") {
     warnings.push(
       "Historical sources are indexed, but their aggregate is temporarily unavailable and is not substituted with a recent-window total.",
@@ -3590,9 +3619,12 @@ export class LocalCompanionDataStore {
   // unconditionally ONLY when it is authoritative. A genuine transition to
   // empty still lands — the wipe mints a ready generation, its rebuild
   // catches up, matched turns true, and the empty authoritative build
-  // publishes. Until then the previous figures stand behind the build's own
-  // "history indexing is still advancing" warning, which is the stale-labeled
-  // presentation the owner chose for exactly this state.
+  // publishes. Until then the previous figures stand behind the retained-
+  // evidence refresh sentence below — stale-with-label, the presentation the
+  // owner chose for exactly this state. The build's own "loading/withheld/
+  // hidden" sentences do NOT stand: they describe the build's empty
+  // projection, not the retained one actually being served, and the owner
+  // reported them showing through every refresh cycle (2026-08-21).
   //
   // M1 needs no special case: retention only ever fills surfaces whose
   // incoming evidence is ZERO, and M1 carries its buckets.
@@ -3609,6 +3641,7 @@ export class LocalCompanionDataStore {
     }
     const retained = this.#snapshot;
     if (retained === null) return next;
+    let usageEvidenceRetained = false;
     for (const { path, rows } of PROJECTION_SURFACES) {
       const key = path[path.length - 1];
       const nextParent = surfaceParent(next, path);
@@ -3616,10 +3649,31 @@ export class LocalCompanionDataStore {
       if (nextParent === null || retainedParent === null) continue;
       if (rows(nextParent[key]) === 0 && rows(retainedParent[key]) > 0) {
         nextParent[key] = structuredClone(retainedParent[key]);
+        if (path.length === 2 && path[0] === "overview" && path[1] === "usage") {
+          usageEvidenceRetained = true;
+        }
       }
     }
-    this.#retainAccountingEvidence(next, retained);
+    if (this.#retainAccountingEvidence(next, retained)) {
+      usageEvidenceRetained = true;
+    }
+    if (usageEvidenceRetained) this.#relabelRetainedWarnings(next);
     return next;
+  }
+
+  // Only the usage/accounting axes gate the relabel: those are the figures the
+  // five replaced sentences claim are loading, withheld, or hidden. A build
+  // that retained nothing on that axis keeps its own sentences — on a true
+  // cold start "loading" is exactly right.
+  #relabelRetainedWarnings(next) {
+    const warnings = next?.overview?.warnings;
+    if (!Array.isArray(warnings)) return;
+    const kept = warnings.filter(
+      (sentence) => !RETAINED_EVIDENCE_RELABELED_WARNINGS.includes(sentence),
+    );
+    if (kept.length === warnings.length) return;
+    kept.unshift(RETAINED_EVIDENCE_REFRESH_WARNING);
+    next.overview.warnings = kept;
   }
 
   // The cost-accounting node is the last surface of this class, and it cannot
@@ -3635,10 +3689,10 @@ export class LocalCompanionDataStore {
   #retainAccountingEvidence(next, retained) {
     const incoming = next?.overview?.accounting;
     const previous = retained?.overview?.accounting;
-    if (!incoming || typeof incoming !== "object") return;
-    if (!previous || typeof previous !== "object") return;
-    if (accountingEvidenceRows(incoming) > 0) return;
-    if (accountingEvidenceRows(previous) === 0) return;
+    if (!incoming || typeof incoming !== "object") return false;
+    if (!previous || typeof previous !== "object") return false;
+    if (accountingEvidenceRows(incoming) > 0) return false;
+    if (accountingEvidenceRows(previous) === 0) return false;
     const truth = {};
     for (const field of ACCOUNTING_TRUTH_FIELDS) {
       if (Object.hasOwn(incoming, field)) truth[field] = incoming[field];
@@ -3647,6 +3701,7 @@ export class LocalCompanionDataStore {
       ...structuredClone(previous),
       ...truth,
     };
+    return true;
   }
 
   #required() {

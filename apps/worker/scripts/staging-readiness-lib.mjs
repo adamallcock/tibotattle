@@ -72,6 +72,10 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     // admin_action_audit action vocabulary and adds the content-free GitHub
     // release-asset snapshot tables. No participant, device, or upload data.
     "0037_admin_distribution_history.sql",
+    // Added with the owner metrics history (2026-08-21): one append-only table
+    // of hourly gauge snapshots — named counts only, shape-capped at 4000
+    // bytes. No participant, device, or upload data.
+    "0038_admin_metrics_history.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",

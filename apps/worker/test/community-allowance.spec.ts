@@ -467,6 +467,39 @@ describe("summarizeCommunityAllowanceDay", () => {
 });
 
 describe("community allowance in the daily aggregate", () => {
+  it("keeps an uncached admin preview read-only instead of analyzing on demand", async () => {
+    const participant = await enrolledParticipant();
+    const accepted = await upload(participant, calibratableContribution());
+    expect(accepted.status, await accepted.clone().text()).toBe(202);
+    const adminIdentityKey = "a".repeat(64);
+    await db().prepare(
+      "UPDATE participants SET identity_link_key = ? WHERE id = ?",
+    ).bind(adminIdentityKey, participant.participantId).run();
+
+    const response = await api(
+      "/api/v1/admin/community/allowance-preview",
+      { headers: { cookie: participant.cookie } },
+      bindings({ ADMIN_IDENTITY_LINK_KEY: adminIdentityKey }),
+    );
+    expect(response.status).toBe(503);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "ADMIN_ALLOWANCE_CACHE_UNAVAILABLE" },
+    });
+
+    // v0.2 has no fit-cache writer. The interactive route must fail closed,
+    // not analyze raw records, invent a cache row, or persist its expected
+    // unavailable state as a diagnostic error.
+    const cacheRows = await db().prepare(
+      "SELECT COUNT(*) AS total FROM community_allowance_fit_cache",
+    ).first<{ total: number }>();
+    const diagnosticRows = await db().prepare(
+      "SELECT COUNT(*) AS total FROM diagnostic_error_events",
+    ).first<{ total: number }>();
+    expect(cacheRows?.total).toBe(0);
+    expect(diagnosticRows?.total).toBe(0);
+  });
+
   it("collects fits from the v0.2 corpus and publishes the allowance block", async () => {
     const participant = await enrolledParticipant();
     const accepted = await upload(participant, calibratableContribution());

@@ -5,6 +5,7 @@ import {
   AdminResponseError,
   adminActionErrorMessage,
   adminResponseError,
+  projectAdminAllowancePreview,
   projectAdminAction,
   projectAdminOverview,
 } from "../public/admin-client.js";
@@ -13,6 +14,111 @@ const fixture = async (name) => JSON.parse(await readFile(
   new URL(`./fixtures/${name}`, import.meta.url),
   "utf8",
 ));
+
+const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
+
+function emptyAllowanceSummary() {
+  return {
+    fitCount: 0,
+    participantCount: 0,
+    centralUsd: null,
+    band80Usd: null,
+  };
+}
+
+function allowancePreviewPayload() {
+  const fromMs = Date.parse("2026-06-15T00:00:00.000Z");
+  const days = Array.from({ length: 70 }, (_, index) => ({
+    day: new Date(fromMs + index * DAY_MILLISECONDS).toISOString().slice(0, 10),
+    combined: emptyAllowanceSummary(),
+    byPlanType: {
+      pro: emptyAllowanceSummary(),
+      prolite: emptyAllowanceSummary(),
+      plus: emptyAllowanceSummary(),
+    },
+  }));
+  days.at(-1).combined = {
+    fitCount: 6,
+    participantCount: 4,
+    centralUsd: 2_100,
+    band80Usd: { lowerUsd: 1_800, upperUsd: 2_400 },
+  };
+  days.at(-1).byPlanType = {
+    pro: {
+      fitCount: 2,
+      participantCount: 2,
+      centralUsd: 2_050,
+      band80Usd: null,
+    },
+    prolite: {
+      fitCount: 1,
+      participantCount: 1,
+      centralUsd: 2_200,
+      band80Usd: null,
+    },
+    plus: {
+      fitCount: 3,
+      participantCount: 2,
+      centralUsd: 1_900,
+      band80Usd: { lowerUsd: 1_700, upperUsd: 2_100 },
+    },
+  };
+  return {
+    schemaVersion: "admin-community-allowance-preview-v0.1",
+    generatedAt: "2026-08-23T10:30:00.000Z",
+    from: "2026-06-15",
+    to: "2026-08-23",
+    basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview",
+    referencePlanType: "pro",
+    trailingDays: 30,
+    qualification: "shared_reset_fit_gates_40pp_span_floor",
+    spanFloorPp: 40,
+    plans: [
+      { planType: "pro", label: "Pro 20x", multiplier: 1 },
+      { planType: "prolite", label: "Pro 5x", multiplier: 4 },
+      { planType: "plus", label: "Plus", multiplier: 20 },
+    ],
+    days,
+  };
+}
+
+test("admin allowance preview projects the fixed merge trial contract", () => {
+  const preview = projectAdminAllowancePreview(allowancePreviewPayload());
+  assert.equal(preview.days.length, 70);
+  assert.deepEqual(preview.plans.map((plan) => [plan.planType, plan.multiplier]), [
+    ["pro", 1],
+    ["prolite", 4],
+    ["plus", 20],
+  ]);
+  assert.deepEqual(preview.days.at(-1).combined, {
+    fitCount: 6,
+    participantCount: 4,
+    centralUsd: 2_100,
+    band80Usd: { lowerUsd: 1_800, upperUsd: 2_400 },
+  });
+  assert.equal(Object.isFrozen(preview), true);
+  assert.equal(Object.isFrozen(preview.days), true);
+  assert.equal(Object.isFrozen(preview.days.at(-1).byPlanType), true);
+});
+
+test("admin allowance preview rejects drifted factors, chronology, and evidence", () => {
+  const mutations = [
+    (payload) => { payload.basis = "different-basis"; },
+    (payload) => { payload.plans[1].multiplier = 5; },
+    (payload) => { payload.days[1].day = payload.days[0].day; },
+    (payload) => { payload.days.at(-1).combined.band80Usd = null; },
+    (payload) => { payload.days[0].combined.participantCount = 1; },
+    (payload) => { delete payload.days.at(-1).byPlanType.plus; },
+  ];
+  for (const mutate of mutations) {
+    const payload = allowancePreviewPayload();
+    mutate(payload);
+    assert.throws(
+      () => projectAdminAllowancePreview(payload),
+      /ADMIN_ALLOWANCE_PREVIEW_INVALID/u,
+    );
+  }
+});
 
 test("admin overview fixture projects to the renderer's explicit contract", async () => {
   const overview = projectAdminOverview(await fixture("admin-overview-valid.json"));

@@ -2516,6 +2516,143 @@ describe("synthetic usage monitor service", () => {
     expect(conflictAudit?.details_json).toContain("ADMIN_ACTION_CONFLICT");
   });
 
+  it("serves owner metrics history with day series and gauge snapshots", async () => {
+    const notConfigured = await api("/api/v1/admin/metrics/history");
+    expect(notConfigured.status).toBe(503);
+    await expect(notConfigured.json()).resolves.toMatchObject({
+      error: { code: "ADMIN_NOT_CONFIGURED" },
+    });
+
+    const participant = await enrollTelemetry();
+    const adminIdentityKey = "a".repeat(64);
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      "UPDATE participants SET identity_link_key = ? WHERE id = ?",
+    ).bind(adminIdentityKey, participant.participantId).run();
+    const adminBindings = testBindings({
+      ADMIN_IDENTITY_LINK_KEY: adminIdentityKey,
+    });
+
+    const denied = await api(
+      "/api/v1/admin/metrics/history",
+      { headers: personalHeaders(participant) },
+      testBindings({ ADMIN_IDENTITY_LINK_KEY: "b".repeat(64) }),
+    );
+    expect(denied.status).toBe(403);
+
+    const rejectedMethod = await api(
+      "/api/v1/admin/metrics/history",
+      { method: "POST", headers: personalHeaders(participant, { csrf: true }) },
+      adminBindings,
+    );
+    expect(rejectedMethod.status).toBe(405);
+
+    // A stored gauge snapshot rides along; non-numeric values never leave D1.
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      `INSERT INTO admin_metric_snapshots (captured_at, metrics_json)
+       VALUES (?, ?)`,
+    ).bind(
+      "2026-08-21T11:00:00.000Z",
+      JSON.stringify({ bandParticipantCount: 1, smuggled: "text" }),
+    ).run();
+
+    const history = await api(
+      "/api/v1/admin/metrics/history",
+      { headers: personalHeaders(participant) },
+      adminBindings,
+    );
+    expect(history.status).toBe(200);
+    expect(history.headers.get("cache-control")).toBe("no-store");
+    const body = await history.json<{
+      schemaVersion: string;
+      generatedAt: string;
+      events: Record<string, {
+        total: number;
+        last24Hours: number;
+        previous24Hours: number;
+        byDay: { day: string; count: number }[];
+      }>;
+      gauges: { snapshots: { metrics: Record<string, unknown> }[] };
+    }>();
+    expect(body.schemaVersion).toBe("admin-metrics-history-v0.1");
+    const today = body.generatedAt.slice(0, 10);
+    // The enrolled participant is a real event in today's bucket.
+    const participants = body.events.participants;
+    if (!participants) throw new Error("participants series missing");
+    expect(participants.total).toBeGreaterThanOrEqual(1);
+    expect(participants.last24Hours).toBeGreaterThanOrEqual(1);
+    expect(
+      participants.byDay.find((row) => row.day === today)?.count,
+    ).toBeGreaterThanOrEqual(1);
+    for (const key of [
+      "participants", "webSessions", "devicePairings", "deviceCredentials",
+      "deviceConsents", "uploadedChunks", "uploadedRecords",
+      "uploadingParticipants",
+    ]) {
+      const series = body.events[key];
+      if (!series) throw new Error(`series missing: ${key}`);
+      expect(Array.isArray(series.byDay)).toBe(true);
+    }
+    expect(body.gauges.snapshots).toEqual([{
+      capturedAt: "2026-08-21T11:00:00.000Z",
+      metrics: { bandParticipantCount: 1 },
+    }]);
+  });
+
+  it("serves the owner-only allowance merge preview without publishing it", async () => {
+    const notConfigured = await api(
+      "/api/v1/admin/community/allowance-preview",
+    );
+    expect(notConfigured.status).toBe(503);
+    await expect(notConfigured.json()).resolves.toMatchObject({
+      error: { code: "ADMIN_NOT_CONFIGURED" },
+    });
+
+    const participant = await enrollTelemetry();
+    const adminIdentityKey = "a".repeat(64);
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      "UPDATE participants SET identity_link_key = ? WHERE id = ?",
+    ).bind(adminIdentityKey, participant.participantId).run();
+    const adminBindings = testBindings({
+      ADMIN_IDENTITY_LINK_KEY: adminIdentityKey,
+    });
+
+    const rejectedMethod = await api(
+      "/api/v1/admin/community/allowance-preview",
+      { method: "POST", headers: personalHeaders(participant, { csrf: true }) },
+      adminBindings,
+    );
+    expect(rejectedMethod.status).toBe(405);
+
+    const response = await api(
+      "/api/v1/admin/community/allowance-preview",
+      { headers: personalHeaders(participant) },
+      adminBindings,
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    const body = await response.json<{
+      schemaVersion: string;
+      basis: string;
+      plans: { planType: string; multiplier: number }[];
+      days: {
+        combined: { fitCount: number; centralUsd: number | null };
+      }[];
+    }>();
+    expect(body.schemaVersion).toBe("admin-community-allowance-preview-v0.1");
+    expect(body.basis).toBe(
+      "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview",
+    );
+    expect(body.plans).toMatchObject([
+      { planType: "pro", multiplier: 1 },
+      { planType: "prolite", multiplier: 4 },
+      { planType: "plus", multiplier: 20 },
+    ]);
+    expect(body.days).toHaveLength(70);
+    expect(body.days.every((day) => (
+      day.combined.fitCount === 0 && day.combined.centralUsd === null
+    ))).toBe(true);
+  });
+
   it("independently contains collection while preserving participant rights", async () => {
     const participant = await enrollTelemetry();
     const device = await pairDevice(participant);

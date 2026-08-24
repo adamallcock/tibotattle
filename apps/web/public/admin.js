@@ -1,11 +1,10 @@
 import {
   adminActionErrorMessage,
   adminResponseError,
+  projectAdminAllowancePreview,
   projectAdminAction,
   projectAdminOverview,
 } from "./admin-client.js";
-import { PublicCommunityClient } from "./community-data.js";
-import { renderCommunityAllowanceSection } from "./community-view.js";
 import { formatNumber, formatReportingTime } from "./ui-format.js";
 
 const state = {
@@ -17,8 +16,10 @@ const state = {
   nextRefreshAt: null,
   lastSuccessfulLoadAt: null,
   retryDelayMilliseconds: 30_000,
-  communityPayload: null,
-  communityRangeDays: null,
+  allowancePreview: null,
+  allowanceMode: "combined",
+  allowancePlanFilter: null,
+  allowanceRangeDays: 30,
   notificationPreferences: null,
 };
 const $ = (selector) => document.querySelector(selector);
@@ -30,15 +31,6 @@ const AUTO_REFRESH_OPTIONS = new Set([0, 1, 5, 15]);
 const NOTIFICATION_REPEAT_OPTIONS = new Set([0, 5, 15, 60]);
 const ADMIN_TITLE = "TiboTattle operations";
 const isAdminPage = document.body?.classList?.contains(ADMIN_PAGE_CLASS) === true;
-const communityClient = new PublicCommunityClient({
-  fetchImpl(path, init = {}) {
-    return fetch(path, {
-      ...init,
-      credentials: "same-origin",
-      cache: "no-store",
-    });
-  },
-});
 let infoHintSequence = 0;
 
 const INFO_HINTS = Object.freeze({
@@ -95,6 +87,17 @@ const INFO_HINTS = Object.freeze({
   "Latest daily publication": "When a daily community aggregate was most recently published.",
   "Last maintenance": "When the latest bounded retention, reconciliation, and publication maintenance pass ran.",
   "Failure code": "The latest lifecycle failure identifier. A dash means no failure was recorded.",
+  "New sign-ups": "Community accounts created, from the retained participant records: full day-by-day history.",
+  "Web sign-ins": "Completed sign-ins on the website, counted from issued web sessions. Sign-in attempts that never completed are not retained and are not counted.",
+  "Device pairings": "Pairing handshakes issued to Macs starting community upload setup.",
+  "Device credentials": "Upload credentials issued to Macs that completed pairing.",
+  "Upload consents": "Devices that recorded an explicit telemetry upload consent.",
+  "Chunks uploaded": "Incremental contribution chunks accepted into the corpus.",
+  "Records uploaded": "Usage records inside accepted chunks, summed per day.",
+  "People uploading": "Distinct accounts that uploaded at least one chunk that day.",
+  "DMG downloads": "Cumulative installer downloads across all GitHub releases, sampled by the distribution sync. The delta is movement since the prior day's last sample.",
+  "Published band cohort": "People inside the published community allowance band (the site's “from N people”).",
+  "Plan cohorts": "Distinct contributors on each Codex plan (each counted under their current plan only), and that plan's measured allowance-window value in API-price-equivalent dollars. Ratios are measured from real fits, never assumed from the nominal plan multipliers.",
 });
 
 const AUDIT_ACTIONS = Object.freeze({
@@ -628,6 +631,259 @@ function renderMetricCards(selector, metrics) {
     card.append(name, number, caption);
     return card;
   }));
+}
+
+const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
+const GROWTH_SCHEMA_VERSION = "admin-metrics-history-v0.1";
+
+/**
+ * A day-by-day count series with calendar gaps filled: event tables have no
+ * row for a quiet day, but a sparkline that skips quiet days overstates the
+ * slope. `fill` is 0 for per-day counts and "carry" for cumulative counters.
+ * Exported for functional tests.
+ */
+export function calendarSeries(byDay, throughDay, fill) {
+  if (!Array.isArray(byDay) || byDay.length === 0) return [];
+  const counts = new Map(byDay.map((row) => [row.day, row.count]));
+  const values = [];
+  let cursor = byDay[0].day;
+  let previous = 0;
+  // Calendar walk in UTC, bounded to ~2 years of points as a corruption guard.
+  for (let step = 0; step < 800 && cursor <= throughDay; step += 1) {
+    const present = counts.get(cursor);
+    const value = present === undefined
+      ? (fill === "carry" ? previous : 0)
+      : present;
+    values.push(value);
+    previous = value;
+    const next = new Date(`${cursor}T00:00:00.000Z`);
+    next.setUTCDate(next.getUTCDate() + 1);
+    cursor = next.toISOString().slice(0, 10);
+  }
+  return values;
+}
+
+/**
+ * Pure sparkline geometry over a 120×28 viewBox: min-max normalized, flat
+ * series drawn mid-band rather than dividing by zero. Fewer than two points
+ * yields no geometry — a single sample is a number, not a shape. Exported for
+ * functional tests.
+ */
+export function sparklineGeometry(values) {
+  if (!Array.isArray(values) || values.length < 2) return null;
+  const pad = 2;
+  const max = Math.max(...values);
+  const min = Math.min(...values);
+  const span = max - min || 1;
+  const step = (120 - pad * 2) / (values.length - 1);
+  const points = values.map((value, index) => {
+    const x = pad + index * step;
+    const y = 28 - pad - ((value - min) / span) * (28 - pad * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  const [endX, endY] = points[points.length - 1].split(",");
+  return { points: points.join(" "), endX, endY };
+}
+
+function sparkline(values, description) {
+  const svg = document.createElementNS(SVG_NAMESPACE, "svg");
+  svg.setAttribute("class", "admin-sparkline");
+  svg.setAttribute("viewBox", "0 0 120 28");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", description);
+  const geometry = sparklineGeometry(values);
+  if (geometry === null) return svg;
+  const line = document.createElementNS(SVG_NAMESPACE, "polyline");
+  line.setAttribute("class", "admin-sparkline-line");
+  line.setAttribute("points", geometry.points);
+  line.setAttribute("fill", "none");
+  const last = document.createElementNS(SVG_NAMESPACE, "circle");
+  last.setAttribute("class", "admin-sparkline-endpoint");
+  last.setAttribute("cx", geometry.endX);
+  last.setAttribute("cy", geometry.endY);
+  last.setAttribute("r", "2");
+  svg.append(line, last);
+  return svg;
+}
+
+function deltaChip(delta, caption) {
+  const chip = document.createElement("span");
+  chip.className = `admin-delta ${delta > 0 ? "admin-delta-up" : "admin-delta-flat"}`;
+  chip.textContent = `${delta > 0 ? "+" : ""}${count(delta)} last 24h`;
+  if (caption) chip.title = caption;
+  return chip;
+}
+
+function growthCard({ label, value, delta, deltaCaption, series, seriesLabel }) {
+  const card = document.createElement("div");
+  card.className = "admin-card admin-metric admin-growth-card";
+  const name = labelWithInfo(label);
+  const number = document.createElement("strong");
+  number.textContent = text(value);
+  const caption = document.createElement("small");
+  caption.replaceChildren(deltaChip(delta, deltaCaption));
+  card.append(name, number, caption, sparkline(series, seriesLabel));
+  return card;
+}
+
+function eventGrowthCard(label, series, throughDay) {
+  return growthCard({
+    label,
+    value: count(series.total),
+    delta: series.last24Hours,
+    deltaCaption: `${count(series.previous24Hours)} in the prior 24h`,
+    series: calendarSeries(series.byDay, throughDay, 0),
+    seriesLabel: `${label}, per day since ${series.byDay[0]?.day ?? "the first record"}`,
+  });
+}
+
+function renderGrowth(history) {
+  const container = $("#growth-cards");
+  const badge = $("#growth-status");
+  if (!container || !badge) return;
+  if (history === null) {
+    badge.className = "admin-source-badge admin-source-partial";
+    badge.textContent = "History unavailable";
+    return;
+  }
+  const throughDay = history.generatedAt.slice(0, 10);
+  const events = history.events;
+  const cards = [
+    eventGrowthCard("New sign-ups", events.participants, throughDay),
+    eventGrowthCard("Web sign-ins", events.webSessions, throughDay),
+    eventGrowthCard("Device pairings", events.devicePairings, throughDay),
+    eventGrowthCard("Device credentials", events.deviceCredentials, throughDay),
+    eventGrowthCard("Upload consents", events.deviceConsents, throughDay),
+    eventGrowthCard("Chunks uploaded", events.uploadedChunks, throughDay),
+    eventGrowthCard("Records uploaded", events.uploadedRecords, throughDay),
+    eventGrowthCard("People uploading", events.uploadingParticipants, throughDay),
+  ];
+  if (history.downloads.available && history.downloads.byDay.length > 0) {
+    const byDay = history.downloads.byDay.map((row) => ({
+      day: row.day,
+      count: row.cumulativeDmgDownloads,
+    }));
+    const series = calendarSeries(byDay, throughDay, "carry");
+    const latest = series[series.length - 1] ?? 0;
+    const prior = series.length > 1 ? series[series.length - 2] : latest;
+    cards.push(growthCard({
+      label: "DMG downloads",
+      value: count(latest),
+      delta: latest - prior,
+      deltaCaption: "movement since the prior day's last sample",
+      series,
+      seriesLabel: `Cumulative DMG downloads since ${byDay[0].day}`,
+    }));
+  }
+  const bandCard = growthBandCard(history.gauges.snapshots);
+  if (bandCard) cards.push(bandCard);
+  const cohortCard = growthPlanCohortCard(history.gauges.snapshots);
+  if (cohortCard) cards.push(cohortCard);
+  container.replaceChildren(...cards);
+  badge.className = "admin-source-badge admin-source-available";
+  badge.textContent = "History available";
+}
+
+function growthBandCard(snapshots) {
+  if (!Array.isArray(snapshots) || snapshots.length === 0) return null;
+  const latest = snapshots[snapshots.length - 1];
+  const published = latest.metrics.bandParticipantCount;
+  if (typeof published !== "number") return null;
+  const dayAgoEpoch = Date.parse(latest.capturedAt) - 24 * 60 * 60 * 1_000;
+  const reference = [...snapshots].reverse().find(
+    (snapshot) => Date.parse(snapshot.capturedAt) <= dayAgoEpoch,
+  );
+  const referenceCount = reference?.metrics.bandParticipantCount;
+  return growthCard({
+    label: "Published band cohort",
+    value: count(published),
+    delta: typeof referenceCount === "number" ? published - referenceCount : 0,
+    deltaCaption: typeof referenceCount === "number"
+      ? `${count(referenceCount)} a day earlier`
+      : "history starts after the first hourly snapshot",
+    series: snapshots
+      .map((snapshot) => snapshot.metrics.bandParticipantCount)
+      .filter((value) => typeof value === "number"),
+    seriesLabel: "Published band participant count by snapshot",
+  });
+}
+
+/**
+ * A dedicated per-plan card. One account legitimately spans several plan labels
+ * (plan changes over time, plus records that never carried a plan stamp), so
+ * each person is counted under their current plan only — never once per label.
+ * Median capacity pools every fit by its own label, so a plan's window size is
+ * shown even for a plan nobody is currently on. Capacity is the API-price-
+ * equivalent value of one 7-day allowance window; the ratios between plans are
+ * measured here, never assumed from the nominal multipliers.
+ */
+function growthPlanCohortCard(snapshots) {
+  if (!Array.isArray(snapshots) || snapshots.length === 0) return null;
+  const latest = snapshots[snapshots.length - 1].metrics;
+  const plans = new Set();
+  for (const key of Object.keys(latest)) {
+    if (key.startsWith("cohortParticipants_")) {
+      plans.add(key.slice("cohortParticipants_".length));
+    }
+    if (key.startsWith("cohortMedianUsd_")) {
+      plans.add(key.slice("cohortMedianUsd_".length));
+    }
+  }
+  if (plans.size === 0) return null;
+  const rows = [...plans]
+    .map((plan) => ({
+      plan,
+      people: typeof latest[`cohortParticipants_${plan}`] === "number"
+        ? latest[`cohortParticipants_${plan}`]
+        : 0,
+      median: typeof latest[`cohortMedianUsd_${plan}`] === "number"
+        ? latest[`cohortMedianUsd_${plan}`]
+        : null,
+    }))
+    .sort((a, b) => (b.median ?? 0) - (a.median ?? 0));
+  const totalPeople = rows.reduce((sum, row) => sum + row.people, 0);
+
+  const card = document.createElement("div");
+  card.className = "admin-card admin-metric admin-growth-card";
+  card.append(labelWithInfo("Plan cohorts"));
+  const number = document.createElement("strong");
+  number.textContent = text(count(totalPeople));
+  const caption = document.createElement("small");
+  caption.textContent =
+    `${rows.length} plan${rows.length === 1 ? "" : "s"} seen · $ = API-price-equivalent per 7-day window`;
+  card.append(number, caption);
+
+  const list = document.createElement("ul");
+  list.className = "admin-plan-cohorts";
+  for (const row of rows) {
+    const item = document.createElement("li");
+    const name = document.createElement("span");
+    name.className = "admin-plan-name";
+    name.textContent = row.plan;
+    const stat = document.createElement("span");
+    stat.className = "admin-plan-stat";
+    const people = `${count(row.people)} on plan`;
+    stat.textContent = row.median !== null
+      ? `${people} · ~$${count(row.median)}/window`
+      : people;
+    item.append(name, stat);
+    list.append(item);
+  }
+  card.append(list);
+  return card;
+}
+
+async function loadGrowthHistory() {
+  if (!isAdminPage) return;
+  try {
+    const history = await request("/api/v1/admin/metrics/history");
+    if (history?.schemaVersion !== GROWTH_SCHEMA_VERSION) {
+      throw new Error("unexpected metrics-history schema");
+    }
+    renderGrowth(history);
+  } catch {
+    renderGrowth(null);
+  }
 }
 
 function renderCounts(overview) {
@@ -1382,49 +1638,531 @@ function scheduleRefresh({ retry = false } = {}) {
   refreshStatusText();
 }
 
-function renderCommunityRangeControls() {
-  const controls = $("#admin-community-range-controls");
-  if (!controls) return;
-  for (const button of controls.querySelectorAll("button[data-range-days]")) {
-    const value = button.dataset.rangeDays;
-    const selected = value === "all"
-      ? state.communityRangeDays === null
-      : Number(value) === state.communityRangeDays;
+const ADMIN_ALLOWANCE_DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
+const ADMIN_ALLOWANCE_CHART_WIDTH = 960;
+const ADMIN_ALLOWANCE_CHART_HEIGHT = 300;
+const ADMIN_ALLOWANCE_PLAN_STYLES = Object.freeze({
+  pro: Object.freeze({ label: "Pro 20x", className: "pro" }),
+  prolite: Object.freeze({ label: "Pro 5x → 20x", className: "prolite" }),
+  plus: Object.freeze({ label: "Plus → 20x", className: "plus" }),
+});
+
+function adminAllowanceTickStep(span, target = 4) {
+  if (!Number.isFinite(span) || span <= 0) return 1;
+  const raw = span / Math.max(1, target);
+  const magnitude = 10 ** Math.floor(Math.log10(raw));
+  const normalized = raw / magnitude;
+  const factor = normalized <= 1 ? 1
+    : normalized <= 2 ? 2
+      : normalized <= 2.5 ? 2.5
+        : normalized <= 5 ? 5
+          : 10;
+  return factor * magnitude;
+}
+
+function adminAllowanceSegments(points) {
+  const segments = [];
+  let segment = [];
+  for (const point of points) {
+    const prior = segment[segment.length - 1];
+    if (prior && Math.round(
+      (Date.parse(`${point.day}T00:00:00.000Z`)
+        - Date.parse(`${prior.day}T00:00:00.000Z`))
+        / ADMIN_ALLOWANCE_DAY_MILLISECONDS,
+    ) > 1) {
+      segments.push(segment);
+      segment = [];
+    }
+    segment.push(point);
+  }
+  if (segment.length > 0) segments.push(segment);
+  return segments;
+}
+
+/**
+ * Pure geometry for the admin-only merge preview. Every line shares the same
+ * UTC date and Pro-20x-equivalent dollar axes, so switching views changes the
+ * evidence shown rather than the meaning of the scale.
+ */
+export function adminAllowanceChartModel(preview, {
+  mode = "combined",
+  planFilter = null,
+  rangeDays = 30,
+  width = ADMIN_ALLOWANCE_CHART_WIDTH,
+  height = ADMIN_ALLOWANCE_CHART_HEIGHT,
+} = {}) {
+  if (!preview || !Array.isArray(preview.days) || preview.days.length === 0
+      || (mode !== "combined" && mode !== "plans")) {
+    return null;
+  }
+  const anchor = preview.days.at(-1).day;
+  const cutoffMs = rangeDays === null
+    ? Number.NEGATIVE_INFINITY
+    : Date.parse(`${anchor}T00:00:00.000Z`)
+      - (rangeDays - 1) * ADMIN_ALLOWANCE_DAY_MILLISECONDS;
+  const days = preview.days.filter((day) => (
+    Date.parse(`${day.day}T00:00:00.000Z`) >= cutoffMs
+  ));
+  if (days.length === 0) return null;
+  const planSeries = preview.plans.map((plan) => ({
+    key: plan.planType,
+    ...ADMIN_ALLOWANCE_PLAN_STYLES[plan.planType],
+  }));
+  const activePlanFilter = mode === "plans"
+    && planSeries.some((plan) => plan.key === planFilter)
+    ? planFilter
+    : null;
+  const legendSeries = mode === "combined"
+    ? [{ key: "combined", label: "Combined", className: "combined" }]
+    : planSeries;
+  const series = activePlanFilter === null
+    ? legendSeries
+    : planSeries.filter((plan) => plan.key === activePlanFilter);
+  const summaryFor = (day, key) => (
+    key === "combined" ? day.combined : day.byPlanType[key]
+  );
+  let visibleValueCount = 0;
+  const valueCandidates = [];
+  for (const day of days) {
+    for (const definition of series) {
+      const summary = summaryFor(day, definition.key);
+      if (summary?.centralUsd !== null && summary?.centralUsd !== undefined) {
+        visibleValueCount += 1;
+      }
+    }
+    // Keep the numerical y-axis fixed while the operator switches between
+    // Combined and By plan. Otherwise the same vertical movement could appear
+    // larger merely because a different series changed the automatic scale.
+    if (day.combined.centralUsd !== null) {
+      valueCandidates.push(day.combined.centralUsd);
+      if (day.combined.band80Usd !== null) {
+        valueCandidates.push(day.combined.band80Usd.lowerUsd);
+        valueCandidates.push(day.combined.band80Usd.upperUsd);
+      }
+    }
+    for (const plan of preview.plans) {
+      const summary = day.byPlanType[plan.planType];
+      const central = summary?.centralUsd;
+      if (central !== null && central !== undefined) valueCandidates.push(central);
+      if (summary?.band80Usd !== null && summary?.band80Usd !== undefined) {
+        valueCandidates.push(
+          summary.band80Usd.lowerUsd,
+          summary.band80Usd.upperUsd,
+        );
+      }
+    }
+  }
+  if (visibleValueCount === 0 || valueCandidates.length === 0) return null;
+  const margin = { top: 16, right: 24, bottom: 34, left: 64 };
+  const plot = {
+    top: margin.top,
+    right: width - margin.right,
+    bottom: height - margin.bottom,
+    left: margin.left,
+  };
+  const startMs = Date.parse(`${days[0].day}T00:00:00.000Z`);
+  const endMs = Date.parse(`${days.at(-1).day}T00:00:00.000Z`);
+  const x = (day) => {
+    const atMs = Date.parse(`${day}T00:00:00.000Z`);
+    return startMs === endMs
+      ? plot.left + (plot.right - plot.left) / 2
+      : plot.left + ((atMs - startMs) / (endMs - startMs))
+        * (plot.right - plot.left);
+  };
+  const step = adminAllowanceTickStep(Math.max(...valueCandidates));
+  const axisTop = Math.ceil(Math.max(...valueCandidates) / step) * step;
+  const y = (value) => plot.bottom
+    - (value / axisTop) * (plot.bottom - plot.top);
+  const dollarTicks = [];
+  for (let value = 0; value <= axisTop + step / 100; value += step) {
+    dollarTicks.push({ value, y: y(value) });
+  }
+  const modeledSeries = series.map((definition) => {
+    const points = days.flatMap((day) => {
+      const summary = summaryFor(day, definition.key);
+      if (!summary || summary.centralUsd === null) return [];
+      return [{
+        day: day.day,
+        value: summary.centralUsd,
+        fitCount: summary.fitCount,
+        participantCount: summary.participantCount,
+        x: x(day.day),
+        y: y(summary.centralUsd),
+      }];
+    });
+    return {
+      ...definition,
+      points,
+      segments: adminAllowanceSegments(points),
+      latest: points.at(-1) ?? null,
+    };
+  });
+  const bandSeries = series.flatMap((definition) => {
+    const points = days.flatMap((day) => {
+      const band = summaryFor(day, definition.key)?.band80Usd;
+      return band === null || band === undefined ? [] : [{
+        day: day.day,
+        x: x(day.day),
+        upperY: y(band.upperUsd),
+        lowerY: y(band.lowerUsd),
+      }];
+    });
+    const segments = adminAllowanceSegments(points);
+    return segments.length === 0 ? [] : [{ ...definition, segments }];
+  });
+  const maximumTicks = 6;
+  const dayTicks = Array.from({ length: maximumTicks }, (_, index) => {
+    const atMs = startMs + Math.round(
+      ((endMs - startMs) * index) / (maximumTicks - 1)
+      / ADMIN_ALLOWANCE_DAY_MILLISECONDS,
+    ) * ADMIN_ALLOWANCE_DAY_MILLISECONDS;
+    const day = new Date(atMs).toISOString().slice(0, 10);
+    return { day, x: x(day) };
+  }).filter((tick, index, ticks) => index === 0 || tick.day !== ticks[index - 1].day);
+  return {
+    width,
+    height,
+    plot,
+    dollarTicks,
+    dayTicks,
+    tickLabelStyle: days.length > 45 ? "month" : "day",
+    mode,
+    activePlanFilter,
+    legendSeries,
+    series: modeledSeries,
+    bandSeries,
+    bandSegments: bandSeries.flatMap((band) => band.segments),
+  };
+}
+
+export function toggleAdminAllowancePlanFilter(
+  currentPlanType,
+  selectedPlanType,
+  plans,
+) {
+  if (!plans.some((plan) => plan.planType === selectedPlanType)) return null;
+  return currentPlanType === selectedPlanType ? null : selectedPlanType;
+}
+
+function adminAllowanceSvg(tag, className = "", attributes = {}) {
+  const element = document.createElementNS(SVG_NAMESPACE, tag);
+  if (className) element.setAttribute("class", className);
+  for (const [name, value] of Object.entries(attributes)) {
+    element.setAttribute(name, String(value));
+  }
+  return element;
+}
+
+function latestAllowanceSummary(preview, key) {
+  for (const day of [...preview.days].reverse()) {
+    const summary = key === "combined" ? day.combined : day.byPlanType[key];
+    if (summary.centralUsd !== null) return { day: day.day, summary };
+  }
+  return null;
+}
+
+function allowanceUsd(value) {
+  return new Intl.NumberFormat(undefined, {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 0,
+  }).format(value);
+}
+
+function allowanceCountLabel(value, singular) {
+  return `${value} ${singular}${value === 1 ? "" : "s"}`;
+}
+
+function appendAdminAllowanceLegend(figure, model) {
+  const legend = document.createElement("div");
+  legend.className = "admin-allowance-legend";
+  if (model.mode === "plans") {
+    legend.classList.add("admin-allowance-legend-interactive");
+    if (model.activePlanFilter !== null) {
+      legend.classList.add("admin-allowance-legend-filtered");
+    }
+    legend.setAttribute("role", "group");
+    legend.setAttribute("aria-label", "Filter allowance chart by plan");
+  }
+  for (const series of model.legendSeries) {
+    const item = document.createElement(model.mode === "plans" ? "button" : "span");
+    if (model.mode === "plans") {
+      const selected = model.activePlanFilter === series.key;
+      item.type = "button";
+      item.className = "admin-allowance-legend-button";
+      item.dataset.allowancePlan = series.key;
+      item.setAttribute("aria-pressed", String(selected));
+      item.setAttribute(
+        "aria-label",
+        selected ? `Show all plans` : `Show only ${series.label}`,
+      );
+      item.title = selected
+        ? "Show all plans"
+        : `Filter chart to ${series.label}`;
+    }
+    const swatch = document.createElement("span");
+    swatch.className = model.mode === "plans"
+      ? `admin-allowance-plan-key admin-allowance-plan-key-${series.className}`
+      : `admin-allowance-swatch admin-allowance-swatch-${series.className}`;
+    swatch.setAttribute("aria-hidden", "true");
+    const label = document.createElement("span");
+    label.textContent = series.label;
+    item.append(swatch, label);
+    legend.append(item);
+  }
+  if (model.mode === "combined" && model.bandSegments.length > 0) {
+    const item = document.createElement("span");
+    const swatch = document.createElement("span");
+    swatch.className = "admin-allowance-swatch admin-allowance-swatch-band";
+    swatch.setAttribute("aria-hidden", "true");
+    const label = document.createElement("span");
+    label.textContent = "Middle 80% of fitted windows";
+    item.append(swatch, label);
+    legend.append(item);
+  }
+  figure.append(legend);
+}
+
+function appendAdminAllowanceChart(container, preview) {
+  const model = adminAllowanceChartModel(preview, {
+    mode: state.allowanceMode,
+    planFilter: state.allowancePlanFilter,
+    rangeDays: state.allowanceRangeDays,
+  });
+  if (model === null) {
+    const empty = document.createElement("p");
+    empty.className = "admin-allowance-empty";
+    empty.textContent = "No qualifying fits in this range.";
+    container.append(empty);
+    return;
+  }
+  const figure = document.createElement("div");
+  figure.className = "community-daily-chart community-allowance-chart";
+  if (model.activePlanFilter !== null) {
+    figure.classList.add("community-allowance-chart-filtered");
+  }
+  appendAdminAllowanceLegend(figure, model);
+  const svg = adminAllowanceSvg("svg", "", {
+    viewBox: `0 0 ${model.width} ${model.height}`,
+    role: "img",
+    "aria-label": state.allowanceMode === "combined"
+      ? "Combined Pro 20x-equivalent community allowance by day"
+      : model.activePlanFilter === null
+        ? "Pro 20x-equivalent community allowance by plan and day"
+        : `${model.series[0].label} Pro 20x-equivalent community allowance by day`,
+  });
+  for (const tick of model.dollarTicks) {
+    svg.append(adminAllowanceSvg("line", "chart-grid", {
+      x1: model.plot.left,
+      x2: model.plot.right,
+      y1: tick.y,
+      y2: tick.y,
+    }));
+    const label = adminAllowanceSvg("text", "chart-axis-label", {
+      x: model.plot.left - 8,
+      y: tick.y + 3,
+      "text-anchor": "end",
+    });
+    label.textContent = allowanceUsd(tick.value);
+    svg.append(label);
+  }
+  const tickFormatter = new Intl.DateTimeFormat(undefined, model.tickLabelStyle === "month"
+    ? { timeZone: "UTC", month: "short", year: "numeric" }
+    : { timeZone: "UTC", month: "short", day: "numeric" });
+  for (const tick of model.dayTicks) {
+    const label = adminAllowanceSvg("text", "chart-axis-label", {
+      x: tick.x,
+      y: model.height - 10,
+      "text-anchor": "middle",
+    });
+    label.textContent = tickFormatter.format(new Date(`${tick.day}T00:00:00.000Z`));
+    svg.append(label);
+  }
+  for (const bandSeries of model.bandSeries) {
+    for (const band of bandSeries.segments) {
+      if (band.length >= 2) {
+        const forward = band.map((point) => (
+          `${point.x.toFixed(1)},${point.upperY.toFixed(1)}`
+        ));
+        const backward = [...band].reverse().map((point) => (
+          `${point.x.toFixed(1)},${point.lowerY.toFixed(1)}`
+        ));
+        svg.append(adminAllowanceSvg(
+          "path",
+          `admin-allowance-band-area admin-allowance-band-area-${bandSeries.className}`,
+          { d: `M${[...forward, ...backward].join(" L")} Z` },
+        ));
+      } else {
+        svg.append(adminAllowanceSvg(
+          "line",
+          `admin-allowance-band-mark admin-allowance-band-mark-${bandSeries.className}`,
+          {
+            x1: band[0].x,
+            x2: band[0].x,
+            y1: band[0].upperY,
+            y2: band[0].lowerY,
+          },
+        ));
+      }
+    }
+  }
+  for (const series of model.series) {
+    for (const segment of series.segments) {
+      if (segment.length >= 2) {
+        svg.append(adminAllowanceSvg(
+          "polyline",
+          `admin-allowance-line admin-allowance-line-${series.className}`,
+          { points: segment.map((point) => (
+            `${point.x.toFixed(1)},${point.y.toFixed(1)}`
+          )).join(" ") },
+        ));
+      }
+    }
+    for (const point of series.points) {
+      const dot = adminAllowanceSvg(
+        "circle",
+        `admin-allowance-dot admin-allowance-dot-${series.className}`,
+        {
+          cx: point.x,
+          cy: point.y,
+          r: Math.min(6, 2.4 + Math.sqrt(point.fitCount)),
+          tabindex: 0,
+          "aria-label": `${series.label}, ${point.day}: ${allowanceUsd(point.value)}, ${allowanceCountLabel(point.participantCount, "account")}, ${allowanceCountLabel(point.fitCount, "fit")}`,
+        },
+      );
+      const title = adminAllowanceSvg("title");
+      title.textContent = `${series.label} · ${point.day} · ${allowanceUsd(point.value)} · ${allowanceCountLabel(point.participantCount, "account")} · ${allowanceCountLabel(point.fitCount, "fit")}`;
+      dot.append(title);
+      svg.append(dot);
+    }
+  }
+  figure.append(svg);
+  container.append(figure);
+}
+
+function appendCombinedAllowanceSummary(container, preview) {
+  const latest = latestAllowanceSummary(preview, "combined");
+  if (latest === null) return;
+  const summary = document.createElement("div");
+  summary.className = "admin-allowance-summary";
+  const value = document.createElement("p");
+  value.className = "admin-allowance-value";
+  value.textContent = allowanceUsd(latest.summary.centralUsd);
+  const unit = document.createElement("span");
+  unit.className = "admin-allowance-unit";
+  unit.textContent = "per 7 days, Pro 20x equivalent";
+  const meta = document.createElement("p");
+  meta.className = "admin-allowance-meta";
+  const evidence = document.createElement("span");
+  const accounts = document.createElement("strong");
+  accounts.textContent = String(latest.summary.participantCount);
+  const fits = document.createElement("strong");
+  fits.textContent = String(latest.summary.fitCount);
+  evidence.append(
+    accounts,
+    document.createTextNode(` ${latest.summary.participantCount === 1 ? "account" : "accounts"} · `),
+    fits,
+    document.createTextNode(` ${latest.summary.fitCount === 1 ? "fit" : "fits"}`),
+  );
+  const date = document.createElement("span");
+  date.textContent = latest.day;
+  meta.append(evidence, date);
+  if (latest.summary.band80Usd !== null) {
+    const range = document.createElement("span");
+    range.textContent = `${allowanceUsd(latest.summary.band80Usd.lowerUsd)}–${allowanceUsd(latest.summary.band80Usd.upperUsd)} range`;
+    meta.append(range);
+  }
+  summary.append(value, unit, meta);
+  container.append(summary);
+}
+
+function appendPlanAllowanceSummaries(container, preview) {
+  const list = document.createElement("div");
+  list.className = "admin-allowance-plan-summaries";
+  for (const plan of preview.plans) {
+    const latest = latestAllowanceSummary(preview, plan.planType);
+    const style = ADMIN_ALLOWANCE_PLAN_STYLES[plan.planType];
+    const item = document.createElement("div");
+    item.className = "admin-allowance-plan-summary";
+    if (state.allowancePlanFilter === plan.planType) {
+      item.classList.add("admin-allowance-plan-summary-selected");
+    }
+    const label = document.createElement("span");
+    label.textContent = style.label;
+    const value = document.createElement("strong");
+    value.textContent = latest === null ? "—" : allowanceUsd(latest.summary.centralUsd);
+    const meta = document.createElement("small");
+    meta.textContent = latest === null
+      ? "No qualifying fits"
+      : `${allowanceCountLabel(latest.summary.participantCount, "account")} · ${allowanceCountLabel(latest.summary.fitCount, "fit")}`;
+    const range = document.createElement("small");
+    range.className = "admin-allowance-plan-range";
+    range.textContent = latest?.summary.band80Usd
+      ? `Middle 80% ${allowanceUsd(latest.summary.band80Usd.lowerUsd)}–${allowanceUsd(latest.summary.band80Usd.upperUsd)}`
+      : "Middle 80% unavailable";
+    item.append(label, value, meta, range);
+    list.append(item);
+  }
+  container.append(list);
+}
+
+function renderAdminAllowanceControls() {
+  const modeControls = $("#admin-community-mode-controls");
+  for (const button of modeControls?.querySelectorAll("button[data-allowance-mode]") ?? []) {
+    const selected = button.dataset.allowanceMode === state.allowanceMode;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  }
+  const rangeControls = $("#admin-community-range-controls");
+  for (const button of rangeControls?.querySelectorAll("button[data-range-days]") ?? []) {
+    const selected = button.dataset.rangeDays === "all"
+      ? state.allowanceRangeDays === null
+      : Number(button.dataset.rangeDays) === state.allowanceRangeDays;
     button.classList.toggle("active", selected);
     button.setAttribute("aria-pressed", String(selected));
   }
 }
 
-function renderAdminCommunityAllowance(payload) {
+function renderAdminCommunityAllowance(preview) {
   if (!isAdminPage) return;
   const container = $("#admin-community-allowance-result");
-  const stateNode = $("#admin-community-allowance-state");
-  if (!container || !stateNode) return;
-  const result = renderCommunityAllowanceSection({
-    documentRef: document,
-    container,
-    stateNode,
-    payload,
-    rangeDays: state.communityRangeDays,
-  });
   const badge = $("#admin-community-status");
-  const available = result === "published";
-  badge.className = `admin-source-badge ${
-    available ? "admin-source-available" : "admin-source-partial"
-  }`;
-  badge.textContent = available ? "Public graph available" : "Public graph unavailable";
-  renderCommunityRangeControls();
+  if (!container || !badge) return;
+  container.replaceChildren();
+  if (preview === null) {
+    badge.className = "admin-source-badge admin-source-partial";
+    badge.textContent = "Preview unavailable";
+    const empty = document.createElement("p");
+    empty.className = "admin-allowance-empty";
+    empty.textContent = "The allowance preview could not be loaded.";
+    container.append(empty);
+    renderAdminAllowanceControls();
+    return;
+  }
+  badge.className = "admin-source-badge admin-source-available";
+  badge.textContent = "Admin preview available";
+  if (!preview.plans.some((plan) => plan.planType === state.allowancePlanFilter)) {
+    state.allowancePlanFilter = null;
+  }
+  if (state.allowanceMode === "combined") {
+    appendCombinedAllowanceSummary(container, preview);
+  } else {
+    appendPlanAllowanceSummaries(container, preview);
+  }
+  appendAdminAllowanceChart(container, preview);
+  renderAdminAllowanceControls();
 }
 
 async function loadAdminCommunityAllowance() {
   if (!isAdminPage) return;
   try {
-    state.communityPayload = await communityClient.communityDaily();
-    renderAdminCommunityAllowance(state.communityPayload);
+    state.allowancePreview = projectAdminAllowancePreview(await request(
+      "/api/v1/admin/community/allowance-preview",
+    ));
   } catch {
-    state.communityPayload = null;
-    renderAdminCommunityAllowance(null);
+    state.allowancePreview = null;
   }
+  renderAdminCommunityAllowance(state.allowancePreview);
 }
 
 function render(overview) {
@@ -1462,6 +2200,7 @@ async function load() {
     state.retryDelayMilliseconds = 30_000;
     succeeded = true;
     void loadAdminCommunityAllowance();
+    void loadGrowthHistory();
   } catch (error) {
     showNotice(`Operations view unavailable: ${error.message}.`);
     state.retryDelayMilliseconds = Math.min(
@@ -1592,13 +2331,29 @@ if (isAdminPage) {
       setNotificationStatus("The browser could not show a test alert.");
     }
   });
+  $("#admin-community-mode-controls").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-allowance-mode]");
+    if (!button) return;
+    state.allowanceMode = button.dataset.allowanceMode;
+    renderAdminCommunityAllowance(state.allowancePreview);
+  });
   $("#admin-community-range-controls").addEventListener("click", (event) => {
     const button = event.target.closest("button[data-range-days]");
     if (!button) return;
-    state.communityRangeDays = button.dataset.rangeDays === "all"
+    state.allowanceRangeDays = button.dataset.rangeDays === "all"
       ? null
       : Number(button.dataset.rangeDays);
-    renderAdminCommunityAllowance(state.communityPayload);
+    renderAdminCommunityAllowance(state.allowancePreview);
+  });
+  $("#admin-community-allowance-result").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-allowance-plan]");
+    if (!button || state.allowancePreview === null) return;
+    state.allowancePlanFilter = toggleAdminAllowancePlanFilter(
+      state.allowancePlanFilter,
+      button.dataset.allowancePlan,
+      state.allowancePreview.plans,
+    );
+    renderAdminCommunityAllowance(state.allowancePreview);
   });
   $("#sync-distribution").addEventListener("click", async () => {
     const button = $("#sync-distribution");
