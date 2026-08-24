@@ -1483,6 +1483,63 @@ async function assertRendererShell(cdp) {
   await cdp.evaluate(`document.querySelector('[data-nav="overview"]')?.click()`);
 }
 
+/**
+ * Select only the main dashboard page for this smoke's ephemeral server.
+ *
+ * Electron exposes loading, recovery, settings, and other renderer targets
+ * through the same /json endpoint. A page target is not sufficient evidence
+ * of the dashboard: the URL must be the exact loopback root for a valid local
+ * dashboard port, while the CDP websocket must belong to this run's exact
+ * debugging port. Recovery is a data URL and is intentionally ignored here.
+ */
+export function isWindowsDashboardTarget(target, debugPort) {
+  if (target === null
+      || typeof target !== "object"
+      || Array.isArray(target)
+      || target.type !== "page"
+      || typeof target.url !== "string"
+      || typeof target.webSocketDebuggerUrl !== "string"
+      || target.webSocketDebuggerUrl.length === 0
+      || !Number.isInteger(debugPort)
+      || debugPort < 1
+      || debugPort > 65_535) {
+    return false;
+  }
+  let parsed;
+  let websocket;
+  try {
+    parsed = new URL(target.url);
+    websocket = new URL(target.webSocketDebuggerUrl);
+  } catch {
+    return false;
+  }
+  const dashboardPort = Number(parsed.port);
+  return parsed.protocol === "http:"
+    && parsed.hostname === "127.0.0.1"
+    && Number.isInteger(dashboardPort)
+    && dashboardPort >= 1
+    && dashboardPort <= 65_535
+    && target.url === `http://127.0.0.1:${dashboardPort}/`
+    && parsed.pathname === "/"
+    && parsed.search === ""
+    && parsed.hash === ""
+    && parsed.username === ""
+    && parsed.password === ""
+    && websocket.protocol === "ws:"
+    && websocket.hostname === "127.0.0.1"
+    && websocket.port === String(debugPort)
+    && /^\/devtools\/page\/[^/?#]+$/u.test(websocket.pathname)
+    && websocket.search === ""
+    && websocket.hash === ""
+    && websocket.username === ""
+    && websocket.password === "";
+}
+
+export function selectWindowsDashboardTarget(targets, debugPort) {
+  if (!Array.isArray(targets)) return undefined;
+  return targets.find((target) => isWindowsDashboardTarget(target, debugPort));
+}
+
 async function mainFrameLoaderId(cdp) {
   const tree = await cdp.request("Page.getFrameTree");
   const loaderId = tree?.frameTree?.frame?.loaderId;
@@ -1684,7 +1741,7 @@ async function dashboardConnection(child, port) {
       undefined,
       "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT",
     );
-    return targets.find((entry) => entry.type === "page" && entry.webSocketDebuggerUrl);
+    return selectWindowsDashboardTarget(targets, port);
   }, MAX_STARTUP_MS, "Electron dashboard target", "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT");
   const cdp = await connectCdp(target);
   const refreshObserver = observeLocalRefreshRequests(cdp);

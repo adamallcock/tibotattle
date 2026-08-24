@@ -14,9 +14,11 @@ import {
   classifyAutomaticStartupRefreshReceipt,
   classifySmokeFailure,
   createSyntheticFixture,
+  isWindowsDashboardTarget,
   isWindowsSmokeDirectEntry,
   observeLocalRefreshRequests,
   queryWindowsProcessTableForTest,
+  selectWindowsDashboardTarget,
   WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES,
   WINDOWS_ELECTRON_SMOKE_FAILURE_REASON_ALLOWLIST,
   WINDOWS_ELECTRON_SMOKE_FAILURE_STAGE_ALLOWLIST,
@@ -271,6 +273,15 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   );
   assert.match(source, /Page\.getFrameTree/u);
   assert.match(source, /Network\.enable/u);
+  assert.match(source, /isWindowsDashboardTarget/u);
+  assert.match(source, /selectWindowsDashboardTarget/u);
+  assert.match(
+    source,
+    /return selectWindowsDashboardTarget\(targets, port\)/u,
+    "dashboard target polling must ignore non-dashboard pages until the exact target exists",
+  );
+  assert.match(source, /target\.url === `http:\/\/127\.0\.0\.1:\$\{dashboardPort\}\/`/u);
+  assert.match(source, /websocket\.port === String\(debugPort\)/u);
   assert.match(source, /observeLocalRefreshRequests/u);
   assert.match(source, /refreshObserver\.selectOrigin/u);
   assert.match(source, /assertAutomaticStartupRefresh/u);
@@ -444,6 +455,113 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(qualification, /runWindowsElectronQualificationCredentialCommandForTest/u);
   assert.match(qualification, /windows-qualification/u);
   assert.doesNotMatch(qualification, /console\.(?:log|error|warn)/u);
+});
+
+test("Windows smoke selects only the exact ephemeral loopback dashboard target", () => {
+  const debugPort = 43123;
+  const dashboardPort = 49299;
+  const target = (url, overrides = {}) => ({
+    type: "page",
+    url,
+    webSocketDebuggerUrl: `ws://127.0.0.1:${debugPort}/devtools/page/1`,
+    ...overrides,
+  });
+  const valid = target(`http://127.0.0.1:${dashboardPort}/`);
+  assert.equal(isWindowsDashboardTarget(valid, debugPort), true);
+  assert.equal(
+    selectWindowsDashboardTarget([
+      target("data:text/html,<h1>loading</h1>"),
+      target("file:///tmp/recovery.html"),
+      target(`https://127.0.0.1:${dashboardPort}/`),
+      target(`http://localhost:${dashboardPort}/`),
+      target(`http://127.0.0.1:${dashboardPort}/electron-settings.html`),
+      target(`http://127.0.0.1:${dashboardPort}/#weekly`),
+      target(`http://127.0.0.1:${dashboardPort}/?ready=1`),
+      target(`http://user:pass@127.0.0.1:${dashboardPort}/`),
+      target(`http://127.0.0.2:${dashboardPort}/`),
+      target(`http://127.0.0.1:${dashboardPort}`),
+      { ...valid, type: "other" },
+      {
+        ...valid,
+        webSocketDebuggerUrl: `ws://127.0.0.1:${debugPort + 1}/devtools/page/2`,
+      },
+      {
+        ...valid,
+        webSocketDebuggerUrl: `ws://localhost:${debugPort}/devtools/page/wrong-host`,
+      },
+      {
+        ...valid,
+        webSocketDebuggerUrl: `wss://127.0.0.1:${debugPort}/devtools/page/wrong-protocol`,
+      },
+      {
+        ...valid,
+        webSocketDebuggerUrl: `ws://127.0.0.1:${debugPort}/json/version`,
+      },
+      {
+        ...valid,
+        webSocketDebuggerUrl: `ws://127.0.0.1:${debugPort}/devtools/page/`,
+      },
+      {
+        ...valid,
+        webSocketDebuggerUrl: `ws://user:pass@127.0.0.1:${debugPort}/devtools/page/auth`,
+      },
+      {
+        ...valid,
+        webSocketDebuggerUrl: `ws://127.0.0.1:${debugPort}/devtools/page/query?bad=1`,
+      },
+      valid,
+    ],
+    debugPort,
+  ), valid);
+  for (const rejected of [
+    target("data:text/html,<h1>loading</h1>"),
+    target("file:///tmp/recovery.html"),
+    target(`https://127.0.0.1:${dashboardPort}/`),
+    target(`http://localhost:${dashboardPort}/`),
+    target(`http://127.0.0.1:${dashboardPort}/electron-settings.html`),
+    target(`http://127.0.0.1:${dashboardPort}/#weekly`),
+    target(`http://127.0.0.1:${dashboardPort}/?ready=1`),
+    target(`http://user:pass@127.0.0.1:${dashboardPort}/`),
+    target(`http://127.0.0.2:${dashboardPort}/`),
+    target(`http://127.0.0.1:${dashboardPort}`),
+    target("not a URL"),
+    { ...valid, type: "other" },
+    { ...valid, webSocketDebuggerUrl: "" },
+    {
+      ...valid,
+      webSocketDebuggerUrl: `ws://127.0.0.1:${debugPort + 1}/devtools/page/wrong-port`,
+    },
+    {
+      ...valid,
+      webSocketDebuggerUrl: `ws://localhost:${debugPort}/devtools/page/wrong-host`,
+    },
+    {
+      ...valid,
+      webSocketDebuggerUrl: `wss://127.0.0.1:${debugPort}/devtools/page/wrong-protocol`,
+    },
+    {
+      ...valid,
+      webSocketDebuggerUrl: `ws://127.0.0.1:${debugPort}/json/version`,
+    },
+    {
+      ...valid,
+      webSocketDebuggerUrl: `ws://127.0.0.1:${debugPort}/devtools/page/`,
+    },
+    {
+      ...valid,
+      webSocketDebuggerUrl: `ws://user:pass@127.0.0.1:${debugPort}/devtools/page/auth`,
+    },
+    {
+      ...valid,
+      webSocketDebuggerUrl: `ws://127.0.0.1:${debugPort}/devtools/page/query?bad=1`,
+    },
+  ]) {
+    assert.equal(isWindowsDashboardTarget(rejected, debugPort), false);
+  }
+  assert.equal(selectWindowsDashboardTarget(valid, debugPort), undefined);
+  assert.equal(selectWindowsDashboardTarget([valid], 0), undefined);
+  assert.equal(selectWindowsDashboardTarget([valid], 65_536), undefined);
+  assert.equal(selectWindowsDashboardTarget([valid], "43123"), undefined);
 });
 
 test("Windows startup refresh evidence requires the validated origin and active loader", () => {
