@@ -54,6 +54,47 @@ import {
 const MAXIMUM_COLD_BACKFILL_WORKERS = 10;
 const MINIMUM_AUTOMATIC_PARALLEL_BACKFILL_BYTES = 1024 * 1024 * 1024;
 
+// Qualification-only diagnostics may expose one of these coarse operation
+// phases.  Keep the vocabulary finite and content-free: no path, native
+// message, SQL, or runtime error text crosses the boundary.
+const WINDOWS_UNIFIED_INDEX_PHASE_ALLOWLIST = Object.freeze([
+  "capability",
+  "secret",
+  "stage_prepare",
+  "stage_create_or_clone",
+  "session_open",
+  "database_open_or_write",
+  "close",
+  "publish",
+  "cleanup",
+]);
+
+function annotateUnifiedIndexFailure(error, phase) {
+  if (process.platform !== "win32"
+      || process.env.USAGE_MONITOR_WINDOWS_QUALIFICATION !== "1"
+      || !WINDOWS_UNIFIED_INDEX_PHASE_ALLOWLIST.includes(phase)
+      || error === null
+      || (typeof error !== "object" && typeof error !== "function")) {
+    return error;
+  }
+  try {
+    // Never inspect or overwrite an existing value.  The native qualification
+    // boundary reads only this own property and applies its own allowlist.
+    if (!Object.hasOwn(error, "windowsUnifiedIndexStage")) {
+      Object.defineProperty(error, "windowsUnifiedIndexStage", {
+        configurable: false,
+        enumerable: false,
+        value: phase,
+        writable: false,
+      });
+    }
+  } catch {
+    // Preserve the original error even when it is sealed or otherwise cannot
+    // carry a non-enumerable diagnostic property.
+  }
+  return error;
+}
+
 // Incremental ingest: advance the live unified index by exactly the bytes the
 // rollout corpus grew since the last pass.
 //
@@ -231,14 +272,18 @@ export async function ingestLocalUnifiedIndexIncrement({
   windowsSqliteStateSessionFactory = null,
   windowsSqliteStateStaging = null,
 } = {}) {
-  assertWindowsUnifiedIndexStagingUnavailable({
-    windowsSqliteStateStaging,
-    windowsQualificationModeContext,
-    windowsFilesystemAdapter,
-    path: indexFile,
-    stateRoot,
-    resourceRoot,
-  });
+  try {
+    assertWindowsUnifiedIndexStagingUnavailable({
+      windowsSqliteStateStaging,
+      windowsQualificationModeContext,
+      windowsFilesystemAdapter,
+      path: indexFile,
+      stateRoot,
+      resourceRoot,
+    });
+  } catch (error) {
+    throw annotateUnifiedIndexFailure(error, "capability");
+  }
   if (typeof codexHome !== "string" || codexHome.length < 1) {
     throw new TypeError("codexHome must be a non-empty string");
   }
@@ -273,16 +318,21 @@ export async function ingestLocalUnifiedIndexIncrement({
       resourceRoot,
     });
   }
-  const deviceSalt = await readOrCreateDeviceSalt(
-    secretFile ?? defaultLocalUnifiedIndexSecretPath(resolvedIndexFile),
-    {
-      windowsProtectedStateStore,
-      windowsQualificationModeContext,
-      windowsFilesystemAdapter,
-      stateRoot,
-      resourceRoot,
-    },
-  );
+  let deviceSalt;
+  try {
+    deviceSalt = await readOrCreateDeviceSalt(
+      secretFile ?? defaultLocalUnifiedIndexSecretPath(resolvedIndexFile),
+      {
+        windowsProtectedStateStore,
+        windowsQualificationModeContext,
+        windowsFilesystemAdapter,
+        stateRoot,
+        resourceRoot,
+      },
+    );
+  } catch (error) {
+    throw annotateUnifiedIndexFailure(error, "secret");
+  }
   const infos = await discoverCodexRolloutInfos({
     codexHome,
     startAt,
@@ -644,6 +694,7 @@ export async function ingestLocalUnifiedIndexIncrement({
   let writer = null;
   let generation = null;
   let stageSession = null;
+  let diagnosticStage = "stage_prepare";
   try {
     const liveExists = process.platform === "win32"
       ? liveTargetIdentity !== null
@@ -658,6 +709,7 @@ export async function ingestLocalUnifiedIndexIncrement({
           resourceRoot,
         },
       ) !== null;
+    diagnosticStage = "stage_create_or_clone";
     if (process.platform === "win32") {
       const stageName = basename(stageFile.replaceAll("/", "\\"));
       const targetName = basename(resolvedIndexFile.replaceAll("/", "\\"));
@@ -669,6 +721,7 @@ export async function ingestLocalUnifiedIndexIncrement({
       if (typeof windowsSqliteStateSessionFactory !== "function") {
         throw fixedError("local_unified_index_windows_state_unqualified");
       }
+      diagnosticStage = "session_open";
       stageSession = windowsSqliteStateSessionFactory({
         rootPath: dirname(stageFile.replaceAll("/", "\\")),
         databaseName: stageName,
@@ -690,6 +743,7 @@ export async function ingestLocalUnifiedIndexIncrement({
         await copyFile(resolvedIndexFile, stageFile);
       }
     }
+    diagnosticStage = "database_open_or_write";
     database = openLocalUnifiedIndex(stageFile, {
       readOnly: false,
       create: !liveExists,
@@ -1735,6 +1789,7 @@ export async function ingestLocalUnifiedIndexIncrement({
       database,
       generation.generationId,
     );
+    diagnosticStage = "close";
     const closed = await writer.close({
       integrityCheck: true,
       fsyncPath: process.platform === "win32" ? null : stageFile,
@@ -1745,6 +1800,7 @@ export async function ingestLocalUnifiedIndexIncrement({
       resourceRoot,
     });
     writer = null;
+    diagnosticStage = "publish";
     await publishStagedUnifiedIndex(stageFile, resolvedIndexFile, {
       windowsSqliteStateStaging,
       expectedTargetIdentity: liveTargetIdentity,
@@ -1774,9 +1830,10 @@ export async function ingestLocalUnifiedIndexIncrement({
       peakRssBytes: process.memoryUsage.rss(),
     };
   } catch (error) {
+    const annotatedError = annotateUnifiedIndexFailure(error, diagnosticStage);
     if (writer !== null) {
       try {
-        writer.failGeneration(error?.code === "local_unified_index_aborted"
+        writer.failGeneration(annotatedError?.code === "local_unified_index_aborted"
           ? "aborted"
           : "exception");
       } catch {
@@ -1790,13 +1847,17 @@ export async function ingestLocalUnifiedIndexIncrement({
         // The connection may already be closed.
       }
     }
-    await removeIfPresent(stageFile, {
-      windowsSqliteStateStaging,
-      windowsQualificationModeContext,
-      windowsFilesystemAdapter,
-      stateRoot,
-      resourceRoot,
-    });
-    throw error;
+    try {
+      await removeIfPresent(stageFile, {
+        windowsSqliteStateStaging,
+        windowsQualificationModeContext,
+        windowsFilesystemAdapter,
+        stateRoot,
+        resourceRoot,
+      });
+    } catch (cleanupError) {
+      throw annotateUnifiedIndexFailure(cleanupError, "cleanup");
+    }
+    throw annotatedError;
   }
 }
