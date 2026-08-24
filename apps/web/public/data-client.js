@@ -5523,6 +5523,7 @@ async function fetchJson(fetchImpl, url, options = {}) {
 }
 
 export const LOCAL_REFRESH_STATUS_TIMEOUT_MS = 4_000;
+const LOCAL_REFRESH_STATUS_TIMEOUT_MAX_MS = 30_000;
 
 export function normalizeBackendReadiness(payload) {
   const unavailable = Object.freeze({
@@ -5606,7 +5607,10 @@ export class LocalCompanionClient {
     this.fetchImpl = (...args) => fetchImpl(...args);
     this.refreshStatusTimeoutMs = Number.isFinite(refreshStatusTimeoutMs)
       && refreshStatusTimeoutMs > 0
-      ? Math.max(1, Math.trunc(refreshStatusTimeoutMs))
+      ? Math.min(
+        LOCAL_REFRESH_STATUS_TIMEOUT_MAX_MS,
+        Math.max(1, Math.trunc(refreshStatusTimeoutMs)),
+      )
       : LOCAL_REFRESH_STATUS_TIMEOUT_MS;
     // Set once the companion has answered 404/405 for the consolidated
     // endpoint, so the negotiation is not repeated on every later load.

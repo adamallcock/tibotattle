@@ -2618,6 +2618,26 @@ test("local refresh status polling settles when the companion stops answering", 
     client.refreshStatus(),
     (error) => error?.name === "AbortError",
   );
+
+  let completedSignal = null;
+  const completedClient = new LocalCompanionClient({
+    refreshStatusTimeoutMs: 10,
+    fetchImpl: async (_url, { signal } = {}) => {
+      completedSignal = signal;
+      return new Response(JSON.stringify({ refresh: { status: "succeeded" } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  });
+  await completedClient.refreshStatus();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(completedSignal.aborted, false);
+
+  const cappedClient = new LocalCompanionClient({
+    refreshStatusTimeoutMs: Number.MAX_SAFE_INTEGER,
+  });
+  assert.equal(cappedClient.refreshStatusTimeoutMs, 30_000);
 });
 
 test("local health exposes the content-free preparation mode", async () => {
@@ -5537,7 +5557,10 @@ test("local analysis exposes quick results and cancel-safe progress", async () =
   assert.match(appSource, /progressTicker = setInterval\(renderRefreshActivity, 1_000\)/u);
   assert.match(appSource, /Date\.now\(\) - lastStatusReceivedMs >= 3_000/u);
   assert.match(appSource, /localAnalysis\.progress\.statusDelayed/u);
-  assert.match(appSource, /if \(latestOutcome !== "running"\) return;/u);
+  assert.match(
+    appSource,
+    /if \(!\["running", "cancelling"\]\.includes\(latestOutcome\)\) return;/u,
+  );
   assert.match(appSource, /clearInterval\(progressTicker\)/u);
   assert.match(localizationSource, /"localAnalysis\.progress\.statusDelayed"/u);
   assert.match(appSource, /localAnalysis\.notice\.cancelledTitle/u);
@@ -5586,7 +5609,6 @@ test("local refresh activity keeps elapsed time honest without overwriting termi
     localRefreshCancelRequested = true;
     renderRefreshActivity();
 
-    localRefreshCancelRequested = false;
     latestOutcome = "succeeded";
     const terminalLabelCount = labels.length;
     renderRefreshActivity();

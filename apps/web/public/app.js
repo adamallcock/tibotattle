@@ -10945,14 +10945,15 @@ async function requestRefresh({ autoContinue = false } = {}) {
   };
   const renderRefreshActivity = () => {
     if (!localRefreshInProgress || activePassStartedMs === null) return;
+    // A terminal response owns the label while its verified dashboard is
+    // loading. This check must precede the local cancel flag: that flag stays
+    // set until finally, including after the companion confirms cancellation
+    // or finishes before the request reaches it.
+    if (!["running", "cancelling"].includes(latestOutcome)) return;
     if (localRefreshCancelRequested || latestOutcome === "cancelling") {
       setLocalizedText(button, "localAnalysis.progress.stopping");
       return;
     }
-    // A terminal response owns the label while its verified dashboard is
-    // loading. The independent ticker must never replace that truthful state
-    // with the last running phase merely because the load takes another tick.
-    if (latestOutcome !== "running") return;
     const elapsed = elapsedLabel();
     const statusDelayed = lastStatusReceivedMs !== null
       && Date.now() - lastStatusReceivedMs >= 3_000;
