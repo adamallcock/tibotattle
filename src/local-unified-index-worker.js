@@ -51,12 +51,6 @@ async function run() {
   if (!Number.isSafeInteger(batchEvents) || batchEvents < 1 || batchEvents > 500) {
     throw new Error("unified index worker batch bound is invalid");
   }
-  const batchAcknowledgement = workerData?.batchAcknowledgement;
-  if (!(batchAcknowledgement instanceof SharedArrayBuffer)
-      || batchAcknowledgement.byteLength !== Int32Array.BYTES_PER_ELEMENT) {
-    throw new Error("unified index worker acknowledgement is invalid");
-  }
-  const batchSequence = new Int32Array(batchAcknowledgement);
 
   for (const members of components) {
     // `createLineageSnapshots` wants lineage-shaped members; the wire form is
@@ -139,7 +133,6 @@ async function run() {
           cursor = null,
           quarantineReason = null,
         ) => {
-          const sequence = Atomics.load(batchSequence, 0);
           const seedKeys = snapshotSeedKeys.splice(0, batchEvents);
           parentPort.postMessage({
             type: "batch",
@@ -158,11 +151,6 @@ async function run() {
             cursor,
             quarantineReason,
           });
-          while (Atomics.load(batchSequence, 0) === sequence) {
-            if (Atomics.wait(batchSequence, 0, sequence, 30_000) === "timed-out") {
-              throw new Error("unified index worker acknowledgement timed out");
-            }
-          }
           events = [];
           boundaries = [];
           tools = [];

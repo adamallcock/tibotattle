@@ -606,15 +606,12 @@ export function createEventSink({
 
 async function runWorkerLane(lane, laneIndex, { maximumLineBytes, signal, onBatch }) {
   return new Promise((settle, fail) => {
-    const batchAcknowledgement = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
-    const batchSequence = new Int32Array(batchAcknowledgement);
     const worker = new Worker(
       new URL("./local-unified-index-worker.js", import.meta.url),
       {
         workerData: {
           maximumLineBytes,
           batchEvents: LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS,
-          batchAcknowledgement,
           components: lane.components.map((members) => members.map((info) => ({
             path: info.path,
             size: Number(info.size ?? 0),
@@ -650,14 +647,6 @@ async function runWorkerLane(lane, laneIndex, { maximumLineBytes, signal, onBatc
       if (message.type === "batch") {
         try {
           onBatch(laneIndex, message);
-          // A worker may otherwise queue the next MessagePort callback before
-          // the companion has serviced its loopback control plane. Release
-          // exactly one batch on the next event-loop turn, providing bounded
-          // backpressure and an opportunity for health/status/cancel I/O.
-          setImmediate(() => {
-            Atomics.add(batchSequence, 0, 1);
-            Atomics.notify(batchSequence, 0, 1);
-          });
         } catch (error) {
           failed = error;
           worker.terminate();
