@@ -941,6 +941,11 @@ test("Codex SQLite selected heads are owner-controlled hints and stale or missin
   const databaseFile = join(fixture.codexHome, "state_5.sqlite");
   try {
     assert.equal(await readCodexSelectedRolloutNames(fixture.codexHome), null);
+    if (process.platform === "win32") {
+      // Windows has no owner-only POSIX mode proof. Do not create or chmod an
+      // optional SQLite hint there; canonical metadata is the safe fallback.
+      return;
+    }
     const database = new DatabaseSync(databaseFile);
     database.exec("CREATE TABLE threads(id TEXT, rollout_path TEXT)");
     database.prepare("INSERT INTO threads(id, rollout_path) VALUES (?, ?)").run(
