@@ -326,6 +326,56 @@ export const WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES = Object.freeze(
   cancelled: "WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_CANCELLED",
 });
 
+// The Windows preload gate is a qualification-only observation seam.  Its
+// failure crosses the same fixed, content-free boundary as the existing
+// loader/origin checks; no renderer object, URL, or exception text is ever
+// retained in the runtime aggregate.
+export const WINDOWS_ELECTRON_SMOKE_STARTUP_GATE_ERROR_CODES = Object.freeze({
+  boundaryInvalid: "WINDOWS_ELECTRON_SMOKE_REFRESH_BOUNDARY_INVALID",
+});
+
+const WINDOWS_ELECTRON_SMOKE_STARTUP_GATE_BRIDGE_NAME =
+  "__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__";
+const WINDOWS_ELECTRON_SMOKE_STARTUP_GATE_BRIDGE_VERSION = "v1";
+
+/**
+ * Classify the fixed result returned by the renderer-side startup gate.  The
+ * CDP expression returns only these short vocabulary values, so malformed,
+ * missing, and already-released bridges cannot leak renderer details across
+ * the runtime evidence boundary.
+ */
+export function classifyWindowsSmokeStartupGateResult(value) {
+  if (value === "released") {
+    return Object.freeze({ status: "released" });
+  }
+  if (value === "missing") {
+    return Object.freeze({
+      status: "failed",
+      errorCode: WINDOWS_ELECTRON_SMOKE_STARTUP_GATE_ERROR_CODES.boundaryInvalid,
+      reason: "missing",
+    });
+  }
+  if (value === "malformed") {
+    return Object.freeze({
+      status: "failed",
+      errorCode: WINDOWS_ELECTRON_SMOKE_STARTUP_GATE_ERROR_CODES.boundaryInvalid,
+      reason: "malformed",
+    });
+  }
+  if (value === "duplicate") {
+    return Object.freeze({
+      status: "failed",
+      errorCode: WINDOWS_ELECTRON_SMOKE_STARTUP_GATE_ERROR_CODES.boundaryInvalid,
+      reason: "duplicate",
+    });
+  }
+  return Object.freeze({
+    status: "failed",
+    errorCode: WINDOWS_ELECTRON_SMOKE_STARTUP_GATE_ERROR_CODES.boundaryInvalid,
+    reason: "malformed",
+  });
+}
+
 // Dashboard connection progress is deliberately a closed vocabulary.  It is
 // retained in the failed aggregate so a blocked runtime can distinguish the
 // recovery page from a dashboard target without exposing a URL, port, title,
@@ -1610,6 +1660,61 @@ function selectRequiredRefreshLoader(refreshObserver, loaderId) {
 }
 
 /**
+ * Release the Windows preload-owned startup pass only after the CDP observer
+ * has been bound to the active dashboard document.  The renderer evaluates a
+ * strict, fixed bridge contract and returns only a closed vocabulary result;
+ * all failure classes intentionally collapse to the content-free boundary
+ * code used by the runtime receipt.
+ */
+export async function releaseWindowsSmokeRefreshGate(cdp) {
+  if (cdp === null || typeof cdp !== "object"
+      || typeof cdp.evaluate !== "function") {
+    fail(WINDOWS_ELECTRON_SMOKE_STARTUP_GATE_ERROR_CODES.boundaryInvalid);
+  }
+  let result;
+  try {
+    result = await cdp.evaluate(`(() => {
+      const bridgeName = ${JSON.stringify(WINDOWS_ELECTRON_SMOKE_STARTUP_GATE_BRIDGE_NAME)};
+      const bridge = globalThis[bridgeName];
+      if (!Object.hasOwn(globalThis, bridgeName)) return "missing";
+      if (bridge === null
+          || typeof bridge !== "object"
+          || Array.isArray(bridge)
+          || Object.isFrozen(bridge) !== true
+          || bridge.version !== ${JSON.stringify(WINDOWS_ELECTRON_SMOKE_STARTUP_GATE_BRIDGE_VERSION)}
+          || Object.keys(bridge).length !== 3
+          || Object.keys(bridge)[0] !== "version"
+          || Object.keys(bridge)[1] !== "waitForStartupRefresh"
+          || Object.keys(bridge)[2] !== "releaseStartupRefresh"
+          || !Object.hasOwn(bridge, "version")
+          || !Object.hasOwn(bridge, "waitForStartupRefresh")
+          || !Object.hasOwn(bridge, "releaseStartupRefresh")
+          || typeof bridge.waitForStartupRefresh !== "function"
+          || typeof bridge.releaseStartupRefresh !== "function"
+          || bridge.waitForStartupRefresh.length !== 0
+          || bridge.releaseStartupRefresh.length !== 0) {
+        return "malformed";
+      }
+      try {
+        const released = bridge.releaseStartupRefresh();
+        return released === true
+          ? "released"
+          : released === false
+            ? "duplicate"
+            : "malformed";
+      } catch {
+        return "malformed";
+      }
+    })()`);
+  } catch {
+    result = "malformed";
+  }
+  const decision = classifyWindowsSmokeStartupGateResult(result);
+  if (decision.status !== "released") fail(decision.errorCode);
+  return true;
+}
+
+/**
  * Observe the renderer's first-party refresh mutation without asking the
  * companion to expose an additional qualification-only counter. The
  * automatic Electron startup pass is a real renderer POST, so CDP's network
@@ -1809,6 +1914,12 @@ async function dashboardConnection(child, port, onCheckpoint = () => {}) {
     }
     return undefined;
   }, MAX_STARTUP_MS, "Electron dashboard target", "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT");
+  let targetDashboardOrigin;
+  try {
+    targetDashboardOrigin = new URL(target.url).origin;
+  } catch {
+    fail("WINDOWS_ELECTRON_SMOKE_LOOPBACK_ORIGIN_INVALID");
+  }
   let cdp;
   try {
     cdp = await connectCdp(target);
@@ -1883,9 +1994,18 @@ async function dashboardConnection(child, port, onCheckpoint = () => {}) {
   if (dashboardUrl.protocol !== "http:" || dashboardUrl.hostname !== "127.0.0.1") {
     fail("WINDOWS_ELECTRON_SMOKE_LOOPBACK_REQUIRED");
   }
+  if (dashboardUrl.origin !== targetDashboardOrigin
+      || dashboardUrl.pathname !== "/"
+      || dashboardUrl.search !== ""
+      || dashboardUrl.hash !== ""
+      || dashboardUrl.username !== ""
+      || dashboardUrl.password !== "") {
+    fail("WINDOWS_ELECTRON_SMOKE_LOOPBACK_ORIGIN_INVALID");
+  }
   if (refreshObserver.selectOrigin(dashboardUrl.origin) !== dashboardUrl.origin) {
     fail("WINDOWS_ELECTRON_SMOKE_LOOPBACK_ORIGIN_INVALID");
   }
+  await releaseWindowsSmokeRefreshGate(cdp);
   const health = await jsonFetch(
     new URL("/api/local/health", dashboardUrl),
     undefined,

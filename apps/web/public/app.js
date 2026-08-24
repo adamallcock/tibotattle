@@ -11265,19 +11265,32 @@ function startElectronStartupRefresh() {
   }
   electronStartupRefreshTriggered = true;
   const macSmokeBridge = globalThis.__TIBOTATTLE_ELECTRON_MACOS_SMOKE__;
-  if (macSmokeBridge !== undefined) {
-    // The opt-in macOS smoke bridge is a preload-owned barrier. A malformed
-    // bridge fails closed after the document's one-shot has been consumed;
-    // the smoke then reports the missing/malformed gate instead of allowing
-    // an unobserved refresh to race CDP attachment.
-    if (macSmokeBridge === null
-        || macSmokeBridge.version !== "v1"
-        || typeof macSmokeBridge.waitForStartupRefresh !== "function") {
+  const windowsSmokeBridge = globalThis.__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__;
+  // Only one qualified bridge should ever be present. Treat both bridges as
+  // malformed rather than choosing one, so a stale or mixed preload cannot
+  // silently release an unobserved refresh. A present bridge is selected even
+  // when its value is null, preserving the existing macOS fail-closed rule.
+  const smokeBridge = macSmokeBridge !== undefined
+    && windowsSmokeBridge !== undefined
+    ? null
+    : windowsSmokeBridge !== undefined
+      ? windowsSmokeBridge
+      : macSmokeBridge;
+  if (smokeBridge !== undefined) {
+    // The opt-in platform smoke bridge is a preload-owned barrier. A
+    // malformed bridge fails closed after the document's one-shot has been
+    // consumed; the smoke then reports the missing/malformed gate instead of
+    // allowing an unobserved refresh to race CDP attachment. This remains
+    // inert in production because neither bridge is exposed without its
+    // exact platform/control gate in preload.cjs.
+    if (smokeBridge === null
+        || smokeBridge.version !== "v1"
+        || typeof smokeBridge.waitForStartupRefresh !== "function") {
       return true;
     }
     let gate;
     try {
-      gate = macSmokeBridge.waitForStartupRefresh();
+      gate = smokeBridge.waitForStartupRefresh();
     } catch {
       return true;
     }

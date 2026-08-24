@@ -6787,12 +6787,20 @@ test("Electron startup refresh is behaviorally gated and owns the document retur
     classes,
     allowed,
     smokeBridge = undefined,
+    smokeBridgePlatform = "macos",
     terminalHistoryGap = false,
   }) {
     const harness = {
       calls: 0,
       timers: [],
-      __TIBOTATTLE_ELECTRON_MACOS_SMOKE__: smokeBridge,
+      __TIBOTATTLE_ELECTRON_MACOS_SMOKE__:
+        smokeBridgePlatform === "macos" || smokeBridgePlatform === "both"
+          ? smokeBridge
+          : undefined,
+      __TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__:
+        smokeBridgePlatform === "windows" || smokeBridgePlatform === "both"
+          ? smokeBridge
+          : undefined,
       __terminalHistoryGap: terminalHistoryGap,
       dashboard: {
         mode: "real_local_evidence",
@@ -6914,6 +6922,51 @@ test("Electron startup refresh is behaviorally gated and owns the document retur
   });
   assert.equal(electronMalformed.api.startElectronStartupRefresh(), true);
   assert.equal(electronMalformed.calls, 0, "a malformed smoke bridge fails closed");
+
+  let releaseWindowsGate;
+  const windowsStartupGate = new Promise((resolve) => {
+    releaseWindowsGate = resolve;
+  });
+  const windowsHeld = createHarness({
+    classes: new Set(["electron-dashboard"]),
+    allowed: true,
+    smokeBridgePlatform: "windows",
+    smokeBridge: Object.freeze({
+      version: "v1",
+      waitForStartupRefresh: () => windowsStartupGate,
+    }),
+  });
+  assert.equal(windowsHeld.api.startElectronStartupRefresh(), true);
+  assert.equal(windowsHeld.calls, 0, "Windows smoke gate holds the first refresh");
+  assert.equal(windowsHeld.api.startElectronStartupRefresh(), false);
+  releaseWindowsGate();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(windowsHeld.calls, 1, "Windows refresh starts only after the gate resolves");
+
+  const windowsMalformed = createHarness({
+    classes: new Set(["electron-dashboard"]),
+    allowed: true,
+    smokeBridgePlatform: "windows",
+    smokeBridge: Object.freeze({ version: "v1" }),
+  });
+  assert.equal(windowsMalformed.api.startElectronStartupRefresh(), true);
+  assert.equal(windowsMalformed.calls, 0, "a malformed Windows smoke bridge fails closed");
+
+  const mixedQualifiedBridges = createHarness({
+    classes: new Set(["electron-dashboard"]),
+    allowed: true,
+    smokeBridgePlatform: "both",
+    smokeBridge: Object.freeze({
+      version: "v1",
+      waitForStartupRefresh: () => Promise.resolve(),
+    }),
+  });
+  assert.equal(mixedQualifiedBridges.api.startElectronStartupRefresh(), true);
+  assert.equal(
+    mixedQualifiedBridges.calls,
+    0,
+    "mixed platform gates fail closed instead of selecting an ambiguous bridge",
+  );
 });
 
 test("new enrollment pairs immediately and intentionally discards recovery capability", async () => {
