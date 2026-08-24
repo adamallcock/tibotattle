@@ -74,6 +74,7 @@ const CODEX_FILESYSTEM_FUNCTION_KEYS = Object.freeze([
   "defaultCodexHome",
   "joinPath",
   "currentUid",
+  "readSelectedRolloutNames",
   "openDirectory",
   "statPath",
   "lstatPath",

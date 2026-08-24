@@ -261,6 +261,10 @@ test("cache reads invalidate when the unified generation no longer matches", asy
     coverageStatus: "complete",
     coverage: {
       status: "complete",
+      blockReason: null,
+      skippedSourceCount: 0,
+      skippedSourceBytes: 0,
+      skippedThreadCount: 0,
       generatedAt: "2026-07-27T12:00:00.000Z",
       coveredAt: {
         startAt: "2026-07-20T12:00:00.000Z",
@@ -631,6 +635,10 @@ function completeUnifiedScanner(
       generationFingerprint,
       coverage: {
         status: coverageStatus,
+        blockReason: null,
+        skippedSourceCount: 0,
+        skippedSourceBytes: 0,
+        skippedThreadCount: 0,
         generationProof,
         generatedAt: endAt,
         coveredAt: { startAt, endAt },

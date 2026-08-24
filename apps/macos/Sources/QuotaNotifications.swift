@@ -214,7 +214,7 @@ extension LocalCompanionEvidenceReader: QuotaNotificationEvidenceProvider {
             // later refresh. Never let it borrow notification eligibility.
             return .ineligible(.unobserved)
         }
-        guard refreshStatus == "succeeded" else {
+        guard ["succeeded", "degraded"].contains(refreshStatus) else {
             return refreshStatus == "failed"
                 ? .ineligible(.refreshFailed)
                 : .ineligible(.unobserved)

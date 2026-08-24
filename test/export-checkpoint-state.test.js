@@ -44,6 +44,8 @@ test("empty Codex checkpoint state is closed and independently mutable", () => {
   assert.equal(first.currentModel, null);
   assert.equal(first.previousTotals, null);
   assert.equal(first.previousTotalsPresence, null);
+  assert.equal(first.reAnchored, false);
+  assert.equal(first.sessionMetaSeen, false);
   assert.deepEqual(first.tier, { timelineIndex: 0, speedMode: "unknown", apiServiceTier: "unknown" });
   first.pendingToolCounts.mcp = 3;
   assert.equal(second.pendingToolCounts.mcp, 0);
@@ -67,6 +69,8 @@ test("serialization and digest are deterministic across input key order", () => 
     tier: { apiServiceTier: "unknown", speedMode: "fast", timelineIndex: 7 },
     previousTotalsPresence: Object.fromEntries(Object.entries(source.previousTotalsPresence).reverse()),
     previousTotals: Object.fromEntries(Object.entries(source.previousTotals).reverse()),
+    sessionMetaSeen: source.sessionMetaSeen,
+    reAnchored: source.reAnchored,
     currentModel: { modelFingerprint: source.currentModel.modelFingerprint, modelRecognition: "unrecognized", modelId: "unknown" },
     schemaVersion: EXPORT_CHECKPOINT_PARSER_VERSION,
   };
@@ -85,6 +89,8 @@ test("closed-shape validation rejects raw identifiers, arbitrary keys, and incon
     { mutate(value) { value.previousTotals = { input_tokens: 1 }; value.previousTotalsPresence = null; } },
     { mutate(value) { value.previousTotals = null; value.previousTotalsPresence = { input_tokens: false }; } },
     { mutate(value) { value.pendingToolCounts.mcp = 1_000_001; } },
+    { mutate(value) { value.reAnchored = 1; } },
+    { mutate(value) { value.sessionMetaSeen = "yes"; } },
     { mutate(value) { Object.defineProperty(value, "hidden", { value: "PRIVATE_HIDDEN_CANARY" }); } },
   ];
   for (const { mutate } of cases) {

@@ -31,6 +31,7 @@ import { forEachRolloutLine, ROLLOUT_LINE_BYTES } from "./rollout-line-reader.js
 const NEEDLE_TURN_CONTEXT = Buffer.from('"turn_context"');
 const NEEDLE_TOKEN_COUNT = Buffer.from('"token_count"');
 const NEEDLE_THREAD_SETTINGS = Buffer.from('"thread_settings_applied"');
+const NEEDLE_SESSION_META = Buffer.from('"type":"session_meta"');
 const NEEDLE_RESPONSE_ITEM = Buffer.from('"type":"response_item"');
 const NEEDLE_RELEVANT_PREFIX = Buffer.from('"t');
 const COMPACTION_TIMESTAMP_PREFIX = Buffer.from('{"timestamp":"');
@@ -117,6 +118,7 @@ function relevant(line) {
     if (line[at + 2] === 0x6f) needle = NEEDLE_TOKEN_COUNT;
     else if (line[at + 2] === 0x75) needle = NEEDLE_TURN_CONTEXT;
     else if (line[at + 2] === 0x68) needle = NEEDLE_THREAD_SETTINGS;
+    else if (line[at + 2] === 0x79) needle = NEEDLE_SESSION_META;
     if (needle !== null
         && at + needle.length <= line.length
         && line.compare(needle, 0, needle.length, at, at + needle.length) === 0) {
@@ -126,12 +128,35 @@ function relevant(line) {
   }
 }
 
+function accountingMarker(text) {
+  return text.includes('"turn_context"')
+    || text.includes('"token_count"')
+    || text.includes('"thread_settings_applied"')
+    || text.includes('"type":"session_meta"');
+}
+
+export function rolloutContentQuarantineReason(outcome) {
+  if (outcome?.read?.partialDeferred === true) {
+    return "codex_rollout_tail_incomplete";
+  }
+  if (Number(outcome?.diagnostics?.malformedAccountingRecords ?? 0) > 0
+      || Number(outcome?.diagnostics?.malformedUsageRecords ?? 0) > 0
+      || Number(outcome?.diagnostics?.malformedRateLimitRecords ?? 0) > 0) {
+    return "codex_rollout_content_invalid";
+  }
+  if (Number(outcome?.diagnostics?.sourceStartedAtOffset ?? -1) === 0
+      && Number(outcome?.diagnostics?.sessionMetaRecords ?? 0) !== 1) {
+    return "codex_rollout_content_invalid";
+  }
+  return null;
+}
+
 function normalizeUsage(value) {
-  if (!value || typeof value !== "object") return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const normalized = {};
   for (const key of TOKEN_KEYS) {
     const quantity = value[key] ?? 0;
-    if (!Number.isFinite(quantity) || quantity < 0) return null;
+    if (!Number.isSafeInteger(quantity) || quantity < 0) return null;
     normalized[key] = quantity;
   }
   return normalized;
@@ -449,9 +474,15 @@ export async function extractRolloutUsage(path, {
     }
   }
   const diagnostics = {
+    sourceStartedAtOffset: startOffset,
+    sessionMetaRecords: 0,
+    unexpectedSessionMetaRecords: 0,
     relevantLines: 0,
     malformedLines: 0,
     malformedTimestamps: 0,
+    malformedAccountingRecords: 0,
+    malformedUsageRecords: 0,
+    malformedRateLimitRecords: 0,
     partialLines: 0,
     salvagedRecords: 0,
     turnContexts: 0,
@@ -495,11 +526,17 @@ export async function extractRolloutUsage(path, {
       let record = null;
       if (partial) {
         diagnostics.partialLines += 1;
+        if (accountingMarker(text)) {
+          diagnostics.malformedAccountingRecords += 1;
+        }
       } else {
         try {
           record = JSON.parse(text);
         } catch {
           diagnostics.malformedLines += 1;
+          if (accountingMarker(text)) {
+            diagnostics.malformedAccountingRecords += 1;
+          }
           if (text.includes(NEEDLE_RESPONSE_ITEM)) {
             diagnostics.toolRecordsSkipped += 1;
           }
@@ -562,9 +599,25 @@ export async function extractRolloutUsage(path, {
         }, delta);
       }
 
-      const observedAtMs = Date.parse(record?.timestamp);
+      if (record.type === "session_meta") {
+        diagnostics.sessionMetaRecords += 1;
+        if (startOffset > 0 || diagnostics.sessionMetaRecords > 1) {
+          diagnostics.unexpectedSessionMetaRecords += 1;
+          diagnostics.malformedAccountingRecords += 1;
+        }
+        return;
+      }
+      const observedAtMs = typeof record?.timestamp === "string"
+        ? Date.parse(record.timestamp)
+        : Number.NaN;
       if (!Number.isFinite(observedAtMs)) {
         diagnostics.malformedTimestamps += 1;
+        if (record?.type === "turn_context"
+            || (record?.type === "event_msg"
+              && ["token_count", "thread_settings_applied"]
+                .includes(record?.payload?.type))) {
+          diagnostics.malformedAccountingRecords += 1;
+        }
         return;
       }
       if (record.type === "turn_context") {
@@ -601,23 +654,30 @@ export async function extractRolloutUsage(path, {
       if (record.type !== "event_msg") return;
       if (record.payload?.type === "thread_settings_applied") {
         const settings = record.payload?.thread_settings;
-        if (!settings || typeof settings !== "object") return;
-        if (!Object.hasOwn(settings, "service_tier")) return;
-        const raw = settings.service_tier;
-        if (raw !== null && typeof raw !== "string") return;
-        diagnostics.tierEvents += 1;
-        // An own-file declaration always supersedes an inherited seed — the
-        // ancestor's declaration is upstream of everything in this file, so
-        // its timestamp must not outvote a genuine local observation. Among
-        // own declarations the latest-at-or-before rule stands.
-        const priorMs = tierState === null || tierState.inherited === true
-          ? Number.NEGATIVE_INFINITY
-          : tierState.observedAtMs;
-        if (observedAtMs >= priorMs) {
-          tierState = {
-            providerTierRaw: safeClassification(raw),
-            observedAtMs,
-          };
+        if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+          diagnostics.malformedAccountingRecords += 1;
+          return;
+        }
+        if (Object.hasOwn(settings, "service_tier")) {
+          const raw = settings.service_tier;
+          if (raw !== null && typeof raw !== "string") {
+            diagnostics.malformedAccountingRecords += 1;
+            return;
+          }
+          diagnostics.tierEvents += 1;
+          // An own-file declaration always supersedes an inherited seed — the
+          // ancestor's declaration is upstream of everything in this file, so
+          // its timestamp must not outvote a genuine local observation. Among
+          // own declarations the latest-at-or-before rule stands.
+          const priorMs = tierState === null || tierState.inherited === true
+            ? Number.NEGATIVE_INFINITY
+            : tierState.observedAtMs;
+          if (observedAtMs >= priorMs) {
+            tierState = {
+              providerTierRaw: safeClassification(raw),
+              observedAtMs,
+            };
+          }
         }
         // A thread setting is only a fallback. `turn_context.effort` is what
         // actually applied to the turn, and the two genuinely disagree in real
@@ -633,6 +693,15 @@ export async function extractRolloutUsage(path, {
       const info = record.payload?.info;
       const total = normalizeUsage(info?.total_token_usage);
       const last = normalizeUsage(info?.last_token_usage);
+      const malformedInfo = info !== null && info !== undefined
+        && (typeof info !== "object" || Array.isArray(info));
+      if (malformedInfo
+          || (info?.total_token_usage !== null
+            && info?.total_token_usage !== undefined && total === null)
+          || (info?.last_token_usage !== null
+            && info?.last_token_usage !== undefined && last === null)) {
+        diagnostics.malformedUsageRecords += 1;
+      }
 
       // Fork-replay suppression.
       //
@@ -664,7 +733,9 @@ export async function extractRolloutUsage(path, {
       // Ordering matters and mirrors the reviewed implementation: a row
       // suppressed by rule 1 is not offered to descendants, a row suppressed
       // by rule 2 is.
-      if (snapshotKey !== null) collectSnapshots?.add(snapshotKey);
+      if (snapshotKey !== null) {
+        collectSnapshots?.add(snapshotKey, lineEndOffset);
+      }
       if (isFork && !turnContextSeenHere) {
         consumeReplayedBoundary(last ?? total);
         if (total) rebaseTotals(total);
@@ -712,6 +783,11 @@ export async function extractRolloutUsage(path, {
         usage = last;
       }
       const quota = quotaWindows(record.payload?.rate_limits, observedAtMs);
+      if (record.payload?.rate_limits !== null
+          && record.payload?.rate_limits !== undefined
+          && quota.length === 0) {
+        diagnostics.malformedRateLimitRecords += 1;
+      }
       if ((!usage || (usage.input_tokens === 0 && usage.output_tokens === 0))
           && quota.length === 0) return;
       if (currentModel === null) diagnostics.modelMissing += 1;
@@ -758,10 +834,12 @@ export async function extractRolloutUsage(path, {
  * which is exactly the moment that in-memory-only design stops being valid:
  * an ancestor's set must outlive the pass that built it so a later-ingested
  * fork can still recognise replayed turns. The build and ingest paths
- * therefore persist every collected key into the `lineage_snapshot` table
- * (as salted digests), and the incremental path consults that table for
- * ancestors it is not currently scanning. The in-memory sets remain the hot
- * path within a single pass.
+ * therefore persist the selected physical-history snapshot set into the
+ * `lineage_snapshot` table (as salted digests), and the incremental path
+ * consults that table for ancestors it is not currently scanning. Paginated
+ * generations replace the set with the exact history-base prefix before
+ * adding their local rows, so a reverted suffix cannot suppress later work.
+ * The in-memory sets remain the hot path within a single pass.
  *
  * Only a source that some later source names as an ancestor gets a set at all,
  * so a corpus of unforked sessions allocates nothing.
@@ -774,7 +852,10 @@ export function createLineageSnapshots(members) {
   }
   const bySessionId = new Map();
   for (const info of members) {
-    if (info.lineage?.sessionId) bySessionId.set(info.lineage.sessionId, info);
+    if (!info.lineage?.sessionId) continue;
+    const generations = bySessionId.get(info.lineage.sessionId) ?? [];
+    generations.push(info);
+    bySessionId.set(info.lineage.sessionId, generations);
   }
   const sets = new Map();
 
@@ -783,9 +864,18 @@ export function createLineageSnapshots(members) {
     collectorFor(info) {
       const sessionId = info.lineage?.sessionId;
       if (!sessionId || !referenced.has(sessionId)) return null;
-      const set = new Set();
+      const set = sets.get(sessionId) ?? new Set();
       sets.set(sessionId, set);
       return set;
+    },
+    replaceFor(info, values) {
+      const sessionId = info.lineage?.sessionId;
+      if (!sessionId || !referenced.has(sessionId)) return false;
+      const set = sets.get(sessionId) ?? new Set();
+      set.clear();
+      for (const value of values ?? []) set.add(value);
+      sets.set(sessionId, set);
+      return true;
     },
     /** A view over every ancestor's set, nearest first. */
     inheritedFor(info) {
@@ -796,7 +886,8 @@ export function createLineageSnapshots(members) {
         seen.add(parentId);
         const set = sets.get(parentId);
         if (set) chain.push(set);
-        parentId = bySessionId.get(parentId)?.lineage?.parentId ?? null;
+        const parentGenerations = bySessionId.get(parentId) ?? [];
+        parentId = parentGenerations.at(-1)?.lineage?.parentId ?? null;
       }
       if (chain.length === 0) return null;
       return { has: (key) => chain.some((set) => set.has(key)) };

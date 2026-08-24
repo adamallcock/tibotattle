@@ -1992,7 +1992,7 @@ test("toolbar Share opens the page that owns the share card before scrolling", a
   }
 });
 
-test("toolbar pill narrates the real index build and terminal refresh failure", async () => {
+test("toolbar pill narrates index progress, terminal gaps, and refresh failure without automatic retry", async () => {
   const source = await readFile(SWIFT_SOURCE, "utf8");
   // Deliberately re-pinned pill vocabulary: while the unified history index
   // is incomplete the idle pill says "Indexing <n> of <m>", and a refresh the
@@ -2028,11 +2028,30 @@ test("toolbar pill narrates the real index build and terminal refresh failure", 
     /\(root\["coverage"\] as\? \[String: Any\]\)\?\["history"\][\s\S]*?\(root\["pricing"\] as\? \[String: Any\]\)\?\["historyCoverage"\]/u,
   );
   assert.match(source, /\["demo", "synthetic"\]\.contains\(mode\)/u);
-  // The failure receipt comes from /api/local/refresh, and only a "failed"
-  // status may claim a failure.
+  // The failure receipt comes from /api/local/refresh. Both a hard failure and
+  // the controller's explicit degraded terminal state may carry the closed
+  // step/code pair; an ordinary success may not.
   assert.match(
     source,
-    /guard status == "failed" else \{ return \.notFailed \}/u,
+    /guard \["failed", "degraded"\]\.contains\(status\) else \{\s*return \.notFailed\s*\}/u,
+  );
+  assert.match(source, /let sourceNoun = skippedSourceCount == 1 \? "source" : "sources"/u);
+  assert.match(source, /let threadNoun = skippedThreadCount == 1 \? "thread" : "threads"/u);
+  assert.equal(source.includes(
+    '"History partial: \\(skippedSourceCount) \\(sourceNoun), \\(skippedThreadCount) \\(threadNoun) skipped"',
+  ), true);
+  assert.match(source, /history\["phase"\] as\? String\s*== "partial_terminal"/u);
+  assert.match(
+    source,
+    /dashboardURL != nil,\s*\n\s*nativeRefreshFailure\?\.suppressesAutomaticRetry != true/u,
+  );
+  assert.match(
+    source,
+    /!\(automatic\s*\n\s*&& nativeRefreshFailure\?\.suppressesAutomaticRetry == true\)/u,
+  );
+  assert.match(
+    source,
+    /let coverage = nativeHistoryIndexingCoverage,\s*\n\s*!coverage\.isComplete,\s*\n\s*!coverage\.partialTerminal/u,
   );
   // Both reads reuse the already-audited loopback reader rather than adding
   // a second session or network route.

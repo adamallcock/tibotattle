@@ -6,6 +6,10 @@ export const EXPORT_SOURCE_PLAN_VERSION = "codex-export-source-plan-v2";
 const SAFE_SOURCE_PLAN_CODES = new Set([
   "source_missing", "source_type", "source_owner", "source_links", "source_changed",
   "source_prefix", "source_duplicate", "source_lineage",
+  "codex_rollout_compression_unsupported", "codex_rollout_filename_identity_mismatch",
+  "codex_rollout_generation_ambiguous", "codex_rollout_lineage_invalid",
+  "codex_rollout_checkpoint_history_unsupported",
+  "codex_rollout_content_invalid", "codex_rollout_tail_incomplete",
 ]);
 export class ExportSourcePlanError extends Error {
   constructor(code) {

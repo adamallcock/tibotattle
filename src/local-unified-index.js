@@ -83,7 +83,21 @@ const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION = "local-unified-index-v1";
 // v8 (2026-08-17): typed response-item tool observations are source-scoped and
 // generation-bound. Existing v7 cursors must rescan so a complete generation
 // cannot silently publish an empty tool projection for already indexed files.
-export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v8";
+//
+// v9 (2026-08-23): stable thread identity and immutable rollout identity are
+// separate. Source and event keys are now rollout-scoped, and paginated
+// history-base counters are seeded at their exact byte/ordinal boundary. This
+// changes primary-key semantics, so incremental ingest performs a cold staged
+// rebuild instead of mixing v8 and v9 facts.
+//
+// v10 (2026-08-23): every scan is bound to one opened physical source
+// snapshot. Malformed accounting and unfinished JSONL tails are quarantined,
+// with physical identity and the quarantine reason persisted in the cursor so
+// an unchanged damaged rollout terminates cheaply and a changed one retries
+// from byte zero.
+export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v10";
+export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
+  "codex-immutable-rollout-v1";
 
 // A row salvaged from a line that exceeded the bounded-line cap carries this
 // parser version instead. The agreed schema has no "partial" column and the
@@ -92,7 +106,7 @@ export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v8";
 // degraded row is recorded. Kept in lockstep with the main constant: salvaged
 // rows run the same delta derivation.
 export const LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION =
-  "unified-rollout-typed-v8-partial";
+  "unified-rollout-typed-v10-partial";
 
 const INDEX_APPLICATION_ID = 0x554d5549;
 // Version 2 (2026-08-07) widens version 1 with the two incremental-ingest
@@ -109,9 +123,9 @@ const INDEX_APPLICATION_ID = 0x554d5549;
 // generation-bound tool facts and widens the closed diagnostic vocabulary.
 // Each widening is additive except that closed diagnostic CHECK widening,
 // which is rebuilt transactionally while preserving every existing row.
-export const LOCAL_UNIFIED_INDEX_USER_VERSION = 8;
+export const LOCAL_UNIFIED_INDEX_USER_VERSION = 10;
 const INDEX_USER_VERSION = LOCAL_UNIFIED_INDEX_USER_VERSION;
-const MIGRATABLE_USER_VERSIONS = new Set([1, 2, 3, 4, 5, 6, 7, 8]);
+const MIGRATABLE_USER_VERSIONS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 const SECRET_BYTES = 32;
 const MAX_SECRET_BYTES = 256;
 const DEFAULT_COMMIT_ROWS = 10_000;
@@ -120,6 +134,9 @@ const DIAGNOSTIC_CODES = new Set([
   "relevantLines",
   "malformedLines",
   "malformedTimestamps",
+  "malformedAccountingRecords",
+  "malformedUsageRecords",
+  "malformedRateLimitRecords",
   "partialLines",
   "salvagedRecords",
   "turnContexts",
@@ -137,6 +154,14 @@ const DIAGNOSTIC_CODES = new Set([
   "toolEvents",
   "toolRecordsSkipped",
   "toolSourceHistoryUnavailable",
+]);
+const GENERATION_ISSUE_CODES = new Set([
+  "codex_rollout_compression_unsupported",
+  "codex_rollout_filename_identity_mismatch",
+  "codex_rollout_generation_ambiguous",
+  "codex_rollout_lineage_invalid",
+  "codex_rollout_content_invalid",
+  "codex_rollout_tail_incomplete",
 ]);
 // The one shape a stored raw session identity may take: the provider-issued
 // UUID. Deliberately narrower than the transport regex so a filename-shaped
@@ -221,6 +246,9 @@ const SCHEMA = `
     discovered_source_bytes INTEGER,
     indexed_source_count INTEGER,
     indexed_source_bytes INTEGER,
+    skipped_source_count INTEGER,
+    skipped_source_bytes INTEGER,
+    skipped_thread_count INTEGER,
     usage_events INTEGER,
     quota_occurrences INTEGER,
     covered_start_ms INTEGER,
@@ -404,6 +432,16 @@ const SCHEMA = `
     scanned_bytes INTEGER NOT NULL,
     size_bytes INTEGER NOT NULL,
     mtime_ms INTEGER NOT NULL,
+    source_dev INTEGER,
+    source_ino INTEGER,
+    source_birthtime_ms INTEGER,
+    source_ctime_ms INTEGER,
+    source_identity_token TEXT,
+    source_state_token TEXT,
+    quarantine_code TEXT CHECK(quarantine_code IS NULL OR quarantine_code IN (
+      'codex_rollout_content_invalid',
+      'codex_rollout_tail_incomplete',
+      'codex_rollout_lineage_invalid')),
     -- 1 when this source's whole fork-replay snapshot set is durably in
     -- lineage_snapshot. A source scanned before anything forked from it was
     -- never asked to collect one; when a fork of it later appears, the
@@ -477,6 +515,38 @@ const SCHEMA = `
       CHECK(diagnostics_complete IN (0, 1)),
     PRIMARY KEY(generation_id, source_local)) STRICT, WITHOUT ROWID;
 
+  -- One bounded row per quarantine reason in a publication. Counts only: no
+  -- path, thread id, rollout id, basename, message text or payload crosses
+  -- this boundary. Owner-directed diagnostics use the separately salted
+  -- discovery receipt before publication.
+  CREATE TABLE IF NOT EXISTS generation_issue(
+    generation_id INTEGER NOT NULL REFERENCES index_generation ON DELETE CASCADE,
+    code TEXT NOT NULL CHECK(code IN (
+      'codex_rollout_compression_unsupported',
+      'codex_rollout_filename_identity_mismatch',
+      'codex_rollout_generation_ambiguous',
+      'codex_rollout_lineage_invalid',
+      'codex_rollout_content_invalid',
+      'codex_rollout_tail_incomplete')),
+    thread_count INTEGER NOT NULL CHECK(thread_count >= 0),
+    source_count INTEGER NOT NULL CHECK(source_count >= 0),
+    source_bytes INTEGER NOT NULL CHECK(source_bytes >= 0),
+    PRIMARY KEY(generation_id, code)) STRICT, WITHOUT ROWID;
+
+  CREATE TABLE IF NOT EXISTS generation_issue_group(
+    generation_id INTEGER NOT NULL REFERENCES index_generation ON DELETE CASCADE,
+    group_local BLOB NOT NULL CHECK(length(group_local) = 32),
+    code TEXT NOT NULL CHECK(code IN (
+      'codex_rollout_compression_unsupported',
+      'codex_rollout_filename_identity_mismatch',
+      'codex_rollout_generation_ambiguous',
+      'codex_rollout_lineage_invalid',
+      'codex_rollout_content_invalid',
+      'codex_rollout_tail_incomplete')),
+    source_count INTEGER NOT NULL CHECK(source_count >= 0),
+    source_bytes INTEGER NOT NULL CHECK(source_bytes >= 0),
+    PRIMARY KEY(generation_id, group_local, code)) STRICT, WITHOUT ROWID;
+
   -- Diagnostic names are deliberately a closed set. Counts contain no source
   -- path, message or content and are only meaningful when the owning source
   -- row says diagnostics_complete=1.
@@ -485,6 +555,8 @@ const SCHEMA = `
     source_local BLOB NOT NULL CHECK(length(source_local) = 32),
     code TEXT NOT NULL CHECK(code IN (
       'relevantLines', 'malformedLines', 'malformedTimestamps',
+      'malformedAccountingRecords', 'malformedUsageRecords',
+      'malformedRateLimitRecords',
       'partialLines', 'salvagedRecords', 'turnContexts', 'tokenCounts',
       'forkReplayEventsSkipped', 'unattributedForkReplayEventsSkipped',
       'cumulativeCounterRegressions', 'tierEvents', 'modelSeededFromLineage',
@@ -810,6 +882,12 @@ function addColumnIfMissing(database, tableName, columnName, definition) {
 }
 
 function ensureGenerationAttestationColumns(database) {
+  addColumnIfMissing(database, "index_generation", "skipped_source_count",
+    "INTEGER");
+  addColumnIfMissing(database, "index_generation", "skipped_source_bytes",
+    "INTEGER");
+  addColumnIfMissing(database, "index_generation", "skipped_thread_count",
+    "INTEGER");
   addColumnIfMissing(database, "index_generation", "usage_provenance_complete",
     "INTEGER NOT NULL DEFAULT 0 CHECK(usage_provenance_complete IN (0, 1))");
   addColumnIfMissing(database, "index_generation", "source_order_complete",
@@ -822,13 +900,16 @@ function ensureGenerationAttestationColumns(database) {
     "INTEGER NOT NULL DEFAULT 0 CHECK(tool_provenance_complete IN (0, 1))");
 }
 
-function ensureToolDiagnosticCodes(database) {
+function ensureDiagnosticCodes(database) {
   const sql = database.prepare(
     "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'source_diagnostic'",
   ).get()?.sql;
   if (typeof sql !== "string"
       || (sql.includes("toolRecordsSkipped")
-        && sql.includes("toolSourceHistoryUnavailable"))) return;
+        && sql.includes("toolSourceHistoryUnavailable")
+        && sql.includes("malformedAccountingRecords")
+        && sql.includes("malformedUsageRecords")
+        && sql.includes("malformedRateLimitRecords"))) return;
   // SQLite cannot widen a CHECK constraint in place. Rebuild this small,
   // content-free count table inside the caller's migration transaction so a
   // v7 index either retains every diagnostic row under the v8 vocabulary or
@@ -840,6 +921,8 @@ function ensureToolDiagnosticCodes(database) {
       source_local BLOB NOT NULL CHECK(length(source_local) = 32),
       code TEXT NOT NULL CHECK(code IN (
         'relevantLines', 'malformedLines', 'malformedTimestamps',
+        'malformedAccountingRecords', 'malformedUsageRecords',
+        'malformedRateLimitRecords',
         'partialLines', 'salvagedRecords', 'turnContexts', 'tokenCounts',
         'forkReplayEventsSkipped', 'unattributedForkReplayEventsSkipped',
         'cumulativeCounterRegressions', 'tierEvents', 'modelSeededFromLineage',
@@ -852,6 +935,56 @@ function ensureToolDiagnosticCodes(database) {
       SELECT generation_id, source_local, code, count
       FROM source_diagnostic_v7;
     DROP TABLE source_diagnostic_v7;
+  `);
+}
+
+function ensureGenerationIssueCodes(database) {
+  const sql = database.prepare(
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'generation_issue'",
+  ).get()?.sql;
+  if (typeof sql !== "string"
+      || (sql.includes("codex_rollout_content_invalid")
+        && sql.includes("codex_rollout_tail_incomplete"))) return;
+  database.exec(`
+    ALTER TABLE generation_issue RENAME TO generation_issue_v9;
+    CREATE TABLE generation_issue(
+      generation_id INTEGER NOT NULL REFERENCES index_generation ON DELETE CASCADE,
+      code TEXT NOT NULL CHECK(code IN (
+        'codex_rollout_compression_unsupported',
+        'codex_rollout_filename_identity_mismatch',
+        'codex_rollout_generation_ambiguous',
+        'codex_rollout_lineage_invalid',
+        'codex_rollout_content_invalid',
+        'codex_rollout_tail_incomplete')),
+      thread_count INTEGER NOT NULL CHECK(thread_count >= 0),
+      source_count INTEGER NOT NULL CHECK(source_count >= 0),
+      source_bytes INTEGER NOT NULL CHECK(source_bytes >= 0),
+      PRIMARY KEY(generation_id, code)) STRICT, WITHOUT ROWID;
+    INSERT INTO generation_issue(
+      generation_id, code, thread_count, source_count, source_bytes)
+      SELECT generation_id, code, thread_count, source_count, source_bytes
+      FROM generation_issue_v9;
+    DROP TABLE generation_issue_v9;
+
+    ALTER TABLE generation_issue_group RENAME TO generation_issue_group_v9;
+    CREATE TABLE generation_issue_group(
+      generation_id INTEGER NOT NULL REFERENCES index_generation ON DELETE CASCADE,
+      group_local BLOB NOT NULL CHECK(length(group_local) = 32),
+      code TEXT NOT NULL CHECK(code IN (
+        'codex_rollout_compression_unsupported',
+        'codex_rollout_filename_identity_mismatch',
+        'codex_rollout_generation_ambiguous',
+        'codex_rollout_lineage_invalid',
+        'codex_rollout_content_invalid',
+        'codex_rollout_tail_incomplete')),
+      source_count INTEGER NOT NULL CHECK(source_count >= 0),
+      source_bytes INTEGER NOT NULL CHECK(source_bytes >= 0),
+      PRIMARY KEY(generation_id, group_local, code)) STRICT, WITHOUT ROWID;
+    INSERT INTO generation_issue_group(
+      generation_id, group_local, code, source_count, source_bytes)
+      SELECT generation_id, group_local, code, source_count, source_bytes
+      FROM generation_issue_group_v9;
+    DROP TABLE generation_issue_group_v9;
   `);
 }
 
@@ -912,7 +1045,18 @@ function migrateDatabase(database, { deferSecondaryIndexes = false } = {}) {
     addColumnIfMissing(database, "usage_event", "tier_observed_at_ms", "INTEGER");
     addColumnIfMissing(database, "source_cursor", "source_ordinal",
       "INTEGER CHECK(source_ordinal IS NULL OR source_ordinal >= 0)");
-    ensureToolDiagnosticCodes(database);
+    addColumnIfMissing(database, "source_cursor", "source_dev", "INTEGER");
+    addColumnIfMissing(database, "source_cursor", "source_ino", "INTEGER");
+    addColumnIfMissing(database, "source_cursor", "source_birthtime_ms", "INTEGER");
+    addColumnIfMissing(database, "source_cursor", "source_ctime_ms", "INTEGER");
+    addColumnIfMissing(database, "source_cursor", "source_identity_token", "TEXT");
+    addColumnIfMissing(database, "source_cursor", "source_state_token", "TEXT");
+    addColumnIfMissing(database, "source_cursor", "quarantine_code",
+      "TEXT CHECK(quarantine_code IS NULL OR quarantine_code IN "
+        + "('codex_rollout_content_invalid', 'codex_rollout_tail_incomplete', "
+        + "'codex_rollout_lineage_invalid'))");
+    ensureDiagnosticCodes(database);
+    ensureGenerationIssueCodes(database);
     if (!deferSecondaryIndexes) database.exec(SECONDARY_INDEX_SCHEMA);
     ensureGenerationAttestationColumns(database);
     database.prepare(
@@ -1055,7 +1199,9 @@ export function readUnifiedIndexGenerationDescriptor(database, generationId = nu
     SELECT id, started_at_ms, completed_at_ms, parser_version_id,
            contract_version, status, block_reason,
            discovered_source_count, discovered_source_bytes,
-           indexed_source_count, indexed_source_bytes, usage_events,
+           indexed_source_count, indexed_source_bytes,
+           skipped_source_count, skipped_source_bytes, skipped_thread_count,
+           usage_events,
            quota_occurrences, covered_start_ms, covered_end_ms,
            discovery_complete, diagnostics_complete,
            usage_provenance_complete, source_order_complete,
@@ -1071,7 +1217,9 @@ export function readUnifiedIndexGenerationDescriptor(database, generationId = nu
     row.id, row.started_at_ms, row.completed_at_ms, row.parser_version_id,
     row.contract_version, row.status, row.block_reason,
     row.discovered_source_count, row.discovered_source_bytes,
-    row.indexed_source_count, row.indexed_source_bytes, row.usage_events,
+    row.indexed_source_count, row.indexed_source_bytes,
+    row.skipped_source_count, row.skipped_source_bytes,
+    row.skipped_thread_count, row.usage_events,
     row.quota_occurrences, row.covered_start_ms, row.covered_end_ms,
     row.discovery_complete, row.diagnostics_complete,
     row.usage_provenance_complete, row.source_order_complete,
@@ -1080,6 +1228,14 @@ export function readUnifiedIndexGenerationDescriptor(database, generationId = nu
   ].map((value) => value === null || value === undefined ? "" : String(value));
   const first = row.covered_start_ms === null ? null : Number(row.covered_start_ms);
   const last = row.covered_end_ms === null ? null : Number(row.covered_end_ms);
+  const issueCounts = Object.fromEntries(database.prepare(`
+    SELECT code, thread_count, source_count, source_bytes
+    FROM generation_issue WHERE generation_id = ? ORDER BY code
+  `).all(id).map((issue) => [issue.code, Object.freeze({
+    threadCount: Number(issue.thread_count),
+    sourceCount: Number(issue.source_count),
+    sourceBytes: Number(issue.source_bytes),
+  })]));
   return {
     id,
     fingerprint: `generation-v2-${createHash("sha256")
@@ -1099,6 +1255,13 @@ export function readUnifiedIndexGenerationDescriptor(database, generationId = nu
       ? null : Number(row.indexed_source_count),
     indexedSourceBytes: row.indexed_source_bytes === null
       ? null : Number(row.indexed_source_bytes),
+    skippedSourceCount: row.skipped_source_count === null
+      ? 0 : Number(row.skipped_source_count),
+    skippedSourceBytes: row.skipped_source_bytes === null
+      ? 0 : Number(row.skipped_source_bytes),
+    skippedThreadCount: row.skipped_thread_count === null
+      ? 0 : Number(row.skipped_thread_count),
+    issueCounts: Object.freeze(issueCounts),
     usageEvents: row.usage_events === null ? null : Number(row.usage_events),
     quotaOccurrences: row.quota_occurrences === null
       ? null : Number(row.quota_occurrences),
@@ -1356,6 +1519,32 @@ export function createUnifiedIndexWriter(database, {
     deleteToolFactsForSource: database.prepare(
       "DELETE FROM tool_class_fact WHERE source_local = ?",
     ),
+    affectedQuotaForSource: database.prepare(`
+      SELECT DISTINCT canonical_observation_id AS id
+      FROM quota_occurrence WHERE source_local = ?`),
+    deleteUsageForSource: database.prepare(
+      "DELETE FROM usage_event WHERE source_local = ?",
+    ),
+    deleteQuotaForSource: database.prepare(
+      "DELETE FROM quota_occurrence WHERE source_local = ?",
+    ),
+    replacementQuota: database.prepare(`
+      SELECT plan_type, used_percent, resets_at_ms, duration_mins
+      FROM quota_occurrence WHERE canonical_observation_id = ?
+      ORDER BY used_percent DESC, COALESCE(resets_at_ms, -1) DESC, id ASC
+      LIMIT 1`),
+    updateCanonicalQuota: database.prepare(`
+      UPDATE quota_observation SET plan_type = ?, used_percent = ?,
+        resets_at_ms = ?, duration_mins = ? WHERE id = ?`),
+    deleteOrphanQuota: database.prepare(`
+      DELETE FROM quota_observation WHERE id = ?
+        AND NOT EXISTS (
+          SELECT 1 FROM quota_occurrence WHERE canonical_observation_id = ?)
+        AND NOT EXISTS (
+          SELECT 1 FROM usage_event WHERE quota_observation_id = ?)`),
+    deleteSourceCursor: database.prepare(
+      "DELETE FROM source_cursor WHERE source_local = ?",
+    ),
     rebindToolFactsForSource: database.prepare(`
       UPDATE tool_class_fact SET generation_id = ? WHERE source_local = ?`),
     clearToolClasses: database.prepare("DELETE FROM tool_class_count"),
@@ -1367,17 +1556,27 @@ export function createUnifiedIndexWriter(database, {
     sourceCursor: database.prepare(`
       INSERT INTO source_cursor(
         source_local, source_ordinal, session_local, scanned_bytes, size_bytes, mtime_ms,
+        source_dev, source_ino, source_birthtime_ms, source_ctime_ms,
+        source_identity_token, source_state_token,
+        quarantine_code,
         snapshots_persisted, turn_context_seen, carry_model, carry_effort,
         carry_tier_raw, carry_tier_observed_at_ms, carry_total_input,
         carry_total_cached, carry_total_cache_write, carry_total_output,
         carry_total_reasoning, carry_total_total, ingest_run_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(source_local) DO UPDATE SET
         source_ordinal = excluded.source_ordinal,
         session_local = excluded.session_local,
         scanned_bytes = excluded.scanned_bytes,
         size_bytes = excluded.size_bytes,
         mtime_ms = excluded.mtime_ms,
+        source_dev = excluded.source_dev,
+        source_ino = excluded.source_ino,
+        source_birthtime_ms = excluded.source_birthtime_ms,
+        source_ctime_ms = excluded.source_ctime_ms,
+        source_identity_token = excluded.source_identity_token,
+        source_state_token = excluded.source_state_token,
+        quarantine_code = excluded.quarantine_code,
         snapshots_persisted = excluded.snapshots_persisted,
         turn_context_seen = excluded.turn_context_seen,
         carry_model = excluded.carry_model,
@@ -1406,6 +1605,8 @@ export function createUnifiedIndexWriter(database, {
     lineageSnapshot: database.prepare(`
       INSERT INTO lineage_snapshot(session_local, snapshot_local)
       VALUES (?, ?) ON CONFLICT DO NOTHING`),
+    deleteLineageSnapshots: database.prepare(`
+      DELETE FROM lineage_snapshot WHERE session_local = ?`),
     sessionIdentity: database.prepare(`
       INSERT INTO session_identity(session_local, session_uuid)
       VALUES (?, ?) ON CONFLICT DO NOTHING`),
@@ -1429,6 +1630,21 @@ export function createUnifiedIndexWriter(database, {
       VALUES (?, ?, ?, ?)
       ON CONFLICT(generation_id, source_local, code)
       DO UPDATE SET count = excluded.count`),
+    generationIssue: database.prepare(`
+      INSERT INTO generation_issue(
+        generation_id, code, thread_count, source_count, source_bytes)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(generation_id, code) DO UPDATE SET
+        thread_count = excluded.thread_count,
+        source_count = excluded.source_count,
+        source_bytes = excluded.source_bytes`),
+    generationIssueGroup: database.prepare(`
+      INSERT INTO generation_issue_group(
+        generation_id, group_local, code, source_count, source_bytes)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(generation_id, group_local, code) DO UPDATE SET
+        source_count = excluded.source_count,
+        source_bytes = excluded.source_bytes`),
     copySourceDiagnostics: database.prepare(`
       INSERT INTO source_diagnostic(generation_id, source_local, code, count)
       SELECT ?, source_local, code, count
@@ -1444,6 +1660,8 @@ export function createUnifiedIndexWriter(database, {
       UPDATE index_generation SET
         completed_at_ms = ?, status = ?, block_reason = ?,
         indexed_source_count = ?, indexed_source_bytes = ?,
+        skipped_source_count = ?, skipped_source_bytes = ?,
+        skipped_thread_count = ?,
         usage_events = ?, quota_occurrences = ?,
         covered_start_ms = ?, covered_end_ms = ?,
         discovery_complete = ?, diagnostics_complete = ?,
@@ -1797,6 +2015,41 @@ export function createUnifiedIndexWriter(database, {
       return Number(result.changes ?? 0);
     },
 
+    deleteSourceFacts(sourceLocalKey, sessionLocalKey = null) {
+      begin();
+      const affectedQuotaIds = statements.affectedQuotaForSource
+        .all(sourceLocalKey).map((row) => Number(row.id));
+      const usageEvents = Number(
+        statements.deleteUsageForSource.run(sourceLocalKey).changes ?? 0,
+      );
+      const quotaOccurrences = Number(
+        statements.deleteQuotaForSource.run(sourceLocalKey).changes ?? 0,
+      );
+      const toolFacts = Number(
+        statements.deleteToolFactsForSource.run(sourceLocalKey).changes ?? 0,
+      );
+      statements.deleteSourceCursor.run(sourceLocalKey);
+      if (sessionLocalKey !== null) {
+        statements.deleteLineageSnapshots.run(sessionLocalKey);
+      }
+      for (const quotaId of affectedQuotaIds) {
+        const replacement = statements.replacementQuota.get(quotaId);
+        if (replacement === undefined) {
+          statements.deleteOrphanQuota.run(quotaId, quotaId, quotaId);
+        } else {
+          statements.updateCanonicalQuota.run(
+            replacement.plan_type,
+            replacement.used_percent,
+            replacement.resets_at_ms,
+            replacement.duration_mins,
+            quotaId,
+          );
+        }
+      }
+      step();
+      return { usageEvents, quotaOccurrences, toolFacts };
+    },
+
     rebindToolFactsForSource(sourceLocalKey, targetGenerationId = generationId) {
       if (targetGenerationId === null || targetGenerationId === undefined) {
         throw fixedError("local_unified_index_generation_required");
@@ -1819,6 +2072,13 @@ export function createUnifiedIndexWriter(database, {
         cursor.scannedBytes,
         cursor.sizeBytes,
         cursor.mtimeMs,
+        cursor.sourceDev ?? null,
+        cursor.sourceIno ?? null,
+        cursor.sourceBirthtimeMs ?? null,
+        cursor.sourceCtimeMs ?? null,
+        cursor.sourceIdentityToken ?? null,
+        cursor.sourceStateToken ?? null,
+        cursor.quarantineCode ?? null,
         cursor.snapshotsPersisted ? 1 : 0,
         cursor.turnContextSeen ? 1 : 0,
         cursor.carryModel ?? null,
@@ -1865,6 +2125,51 @@ export function createUnifiedIndexWriter(database, {
         source.scannedBytes,
         source.mtimeMs,
         source.diagnosticsComplete ? 1 : 0,
+      );
+      step();
+    },
+
+    writeGenerationIssue(code, {
+      threadCount = 0,
+      sourceCount = 0,
+      sourceBytes = 0,
+    } = {}) {
+      if (generationId === null || !GENERATION_ISSUE_CODES.has(code)) {
+        throw fixedError("local_unified_index_generation_invalid");
+      }
+      for (const value of [threadCount, sourceCount, sourceBytes]) {
+        if (!Number.isSafeInteger(value) || value < 0) {
+          throw fixedError("local_unified_index_generation_invalid");
+        }
+      }
+      begin();
+      statements.generationIssue.run(
+        generationId,
+        code,
+        threadCount,
+        sourceCount,
+        sourceBytes,
+      );
+      step();
+    },
+
+    writeGenerationIssueGroup(groupLocal, code, {
+      sourceCount = 0,
+      sourceBytes = 0,
+    } = {}) {
+      if (generationId === null || !GENERATION_ISSUE_CODES.has(code)
+          || !Buffer.isBuffer(groupLocal) || groupLocal.length !== 32
+          || !Number.isSafeInteger(sourceCount) || sourceCount < 0
+          || !Number.isSafeInteger(sourceBytes) || sourceBytes < 0) {
+        throw fixedError("local_unified_index_generation_invalid");
+      }
+      begin();
+      statements.generationIssueGroup.run(
+        generationId,
+        groupLocal,
+        code,
+        sourceCount,
+        sourceBytes,
       );
       step();
     },
@@ -1924,6 +2229,12 @@ export function createUnifiedIndexWriter(database, {
       step();
     },
 
+    clearLineageSnapshots(sessionLocalKey) {
+      begin();
+      statements.deleteLineageSnapshots.run(sessionLocalKey);
+      step();
+    },
+
     /**
      * Record the raw provider-issued session UUID beside its local join key.
      * Only a strictly UUID-shaped identifier is accepted: the ingest paths
@@ -1956,6 +2267,9 @@ export function createUnifiedIndexWriter(database, {
       discoveredSourceBytes = null,
       indexedSourceCount = null,
       indexedSourceBytes = null,
+      skippedSourceCount = 0,
+      skippedSourceBytes = 0,
+      skippedThreadCount = 0,
       coveredStartMs = null,
       coveredEndMs = null,
       discoveryComplete = status === "complete",
@@ -1994,7 +2308,7 @@ export function createUnifiedIndexWriter(database, {
       const sourceCompleteness = database.prepare(`
         SELECT COUNT(*) AS total,
                SUM(CASE WHEN diagnostics_complete <> 1
-                          OR status IN ('pending', 'failed')
+                          OR status = 'pending'
                         THEN 1 ELSE 0 END) AS incomplete
         FROM generation_source
         WHERE generation_id = ?
@@ -2049,6 +2363,7 @@ export function createUnifiedIndexWriter(database, {
           (SELECT COUNT(*) FROM generation_source gs
            LEFT JOIN source_cursor sc ON sc.source_local = gs.source_local
            WHERE gs.generation_id = ?
+             AND gs.status <> 'failed'
              AND (sc.source_local IS NULL OR sc.source_ordinal IS NULL
                OR sc.source_ordinal != gs.source_ordinal))
         ) AS count
@@ -2127,6 +2442,9 @@ export function createUnifiedIndexWriter(database, {
         publishedReason,
         indexedSourceCount ?? discoveredSourceCount,
         indexedSourceBytes ?? discoveredSourceBytes,
+        skippedSourceCount,
+        skippedSourceBytes,
+        skippedThreadCount,
         Number(counts?.usage_events ?? 0),
         Number(counts?.quota_occurrences ?? 0),
         starts.length === 0 ? coveredStartMs : Math.min(...starts),
@@ -2153,7 +2471,7 @@ export function createUnifiedIndexWriter(database, {
       begin();
       statements.generation.run(
         Date.now(), "failed", blockReason,
-        null, null, null, null, null, null, 0, 0, 0, 0, 0,
+        null, null, null, null, null, null, null, null, null, 0, 0, 0, 0, 0,
         null, null, 0, generationId,
       );
       commit();

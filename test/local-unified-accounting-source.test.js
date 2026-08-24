@@ -449,8 +449,8 @@ test("mixed parser rows are reported without pretending to have one parser", asy
     assert.equal(result.parserVersion, null);
     assert.equal(result.compatibility.status, "mixed_parser_versions");
     assert.deepEqual(result.compatibility.parserVersions, [
-      "unified-rollout-typed-v2",
       LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+      "unified-rollout-typed-v2",
     ]);
   } finally {
     await rm(root, { recursive: true, force: true });
