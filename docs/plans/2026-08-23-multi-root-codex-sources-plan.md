@@ -2,7 +2,7 @@
 title: Multi-root Codex sources plan
 date: 2026-08-23
 type: plan
-status: stage-a-complete; local-only
+status: stage-a-complete; platform-hardening-local-only
 owners:
   - product
   - local-companion
@@ -49,6 +49,31 @@ the accepted history is retained and coverage is partial.
 The paired adversarial review is
 [Multi-root Codex sources red-team review](../reviews/2026-08-23-multi-root-codex-sources-red-team.md).
 
+## Reconciliation with the original issue
+
+The original issue proposed root-qualified logical identity and required two
+same-basename files in different roots to remain distinct. Stage A deliberately
+does not adopt that model. A root is a physical owner of an existing logical
+rollout, not part of `sourceLocal`; making it part of logical identity would
+turn ordinary active/archive or Windows/WSL copies into separate accounting
+sources and require broad downstream deduplication.
+
+| Original suggestion | Implemented decision |
+|---|---|
+| internal `codexHomes[]` while preserving scalar `CODEX_HOME` | implemented; plural roots feed history and the explicit primary alone feeds scalar live behavior |
+| repeatable `--codex-home` | implemented for the local companion and direct activity/export commands; legacy passive collection remains primary-only |
+| app-managed root list | implemented in the macOS app; a native Windows picker/settings surface remains a Windows desktop task |
+| scan `sessions` and `archived_sessions` under every root | implemented with one bounded discovery allowance per root |
+| watch or poll every root | foreground dashboard refresh polls every selected activity root; the legacy passive filesystem watcher remains primary-only |
+| root-qualified source/checkpoint identity | replaced by root-independent logical identity plus an opaque, no-automatic-rebind physical cursor owner |
+| same-basename files in different roots always remain distinct | replaced by collision-only proof: equivalent prefix replicas collapse; divergent or session-conflicting claims are omitted as ambiguous and make coverage partial |
+| detailed browser-visible per-root readiness | owner-visible native settings retain per-root status; browser/API output intentionally exposes only bounded, path-free aggregate coverage |
+| copied sessions deduplicate only when equivalent | implemented through same-session raw-prefix equivalence, without a general record deduplication system |
+
+This is an intentional issue-scope correction, not an accidental shortfall.
+Issue #51 should describe this lean contract and remain open for the platform
+qualification items below rather than retaining contradictory acceptance text.
+
 ## Scope split
 
 ### Stage A — implemented in this change
@@ -87,6 +112,33 @@ The paired adversarial review is
 Installed Windows/WSL support remains part of the broader Windows desktop,
 filesystem-security, signing, and installer work. Portable Node support for
 several paths is not an installed Windows support claim.
+
+The self-contained platform hardening that can live with Stage A is now present
+locally:
+
+- Windows path grammar covers drive, ordinary UNC, `\\wsl.localhost`, and
+  `\\wsl$` spellings without pretending that parsing proves availability;
+- the native Windows lane includes two drive-letter roots with spaces/Unicode,
+  reorder, unavailable-root, last-known-good, and path-free coverage test;
+- Codex discovery rejects statically observed symlink/junction aliases at the
+  configured root, activity trees, nested directories, and JSONL candidates,
+  then identity-revalidates admitted directories and files; and
+- an opt-in `windows-2025` WSL2 canary provisions disposable Ubuntu 24.04 and
+  exercises a Windows primary plus a real `\\wsl$` activity root through
+  ready, stopped/partial/LKG, and recovered/ready phases.
+
+The WSL canary is evidence infrastructure, not yet evidence: it must pass at
+the exact reviewed commit before the stopped-distro criterion is qualified.
+The product still does not enumerate, start, stop, or otherwise manage WSL.
+The canary uses `\\wsl$` because [Microsoft documents that it is unavailable
+while the distribution is
+stopped](https://learn.microsoft.com/windows/dev-environment/wsl-interop);
+`\\wsl.localhost` may auto-start a distribution on Windows 11 and therefore
+cannot prove no-auto-start behavior.
+
+Still outside this patch are a native Windows root picker/settings journey,
+an explicit DACL policy, handle-relative/path-walk race safety, long-path and
+installed-artifact qualification, signing, installer, and updater work.
 
 ## Why this avoids broad deduplication
 

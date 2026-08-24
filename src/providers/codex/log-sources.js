@@ -6,6 +6,7 @@ import {
 import { classifySessionSurface } from "./surface-classification.js";
 
 const MAXIMUM_ACTIVE_APPEND_PROOF_BYTES = 8 * 1024 * 1024;
+const MAXIMUM_CONCURRENT_ROOT_SCANS = 2;
 
 function discoveryLimitError(dimension, limit, observed, progress) {
   const error = new Error("Codex log discovery stopped at a resource limit");
@@ -95,6 +96,25 @@ function sameSourceState(left, right) {
     && left.size === right.size
     && left.mtimeMs === right.mtimeMs
     && left.ctimeMs === right.ctimeMs;
+}
+
+function isDirectFilesystemObject(stats, typeMethod) {
+  try {
+    return typeof stats?.[typeMethod] === "function"
+      && stats[typeMethod]() === true
+      && typeof stats.isSymbolicLink === "function"
+      && stats.isSymbolicLink() === false;
+  } catch {
+    return false;
+  }
+}
+
+function isDirectDirectory(stats) {
+  return isDirectFilesystemObject(stats, "isDirectory");
+}
+
+function isDirectFile(stats) {
+  return isDirectFilesystemObject(stats, "isFile");
 }
 
 function rethrowDiscoveryControlError(error) {
@@ -339,19 +359,60 @@ export function createCodexLogSources({ filesystem, lineReader }) {
     const files = [];
     let rootOpened = false;
     let unsafeFailure = false;
+    let unsafeAlias = false;
     let discoveryFailureCode = null;
+    async function lstatDirectory(directory, {
+      allowMissing = false,
+      expected = null,
+    } = {}) {
+      let metadata;
+      try {
+        metadata = await filesystem.lstatPath(directory);
+      } catch (error) {
+        rethrowDiscoveryControlError(error);
+        if (allowMissing && error?.code === "ENOENT") return null;
+        unsafeFailure = true;
+        return null;
+      }
+      if (!isDirectDirectory(metadata)
+          || (expected !== null && !sameSourceIdentity(metadata, expected))) {
+        unsafeAlias = true;
+        return null;
+      }
+      return metadata;
+    }
+
+    async function lstatEntry(path) {
+      let metadata;
+      try {
+        metadata = await filesystem.lstatPath(path);
+      } catch (error) {
+        rethrowDiscoveryControlError(error);
+        unsafeFailure = true;
+        return null;
+      }
+      if (metadata?.isSymbolicLink?.() === true) {
+        unsafeAlias = true;
+        return null;
+      }
+      return metadata;
+    }
+
     async function walk(directory, depth = 0) {
       throwIfAborted(signal);
+      const directoryBefore = await lstatDirectory(directory, {
+        allowMissing: depth === 0,
+      });
+      if (directoryBefore === null) return;
       let entries;
       try {
         entries = await filesystem.openDirectory(directory);
       } catch (error) {
         rethrowDiscoveryControlError(error);
-        // A Codex home need not have both top-level source directories. A
-        // missing top-level directory is therefore not degraded coverage, but
-        // an unreadable top-level directory or any mid-tree failure is: using
-        // the files seen before that failure would be a truncated snapshot.
-        if (depth > 0 || error?.code !== "ENOENT") unsafeFailure = true;
+        // A missing top-level tree was handled by the lstat above. Failure
+        // after a successful type check means the tree changed or became
+        // unreadable, so a partial inventory cannot be admitted.
+        unsafeFailure = true;
         return;
       }
       if (depth === 0) rootOpened = true;
@@ -361,19 +422,28 @@ export function createCodexLogSources({ filesystem, lineReader }) {
           discoveryLimiter?.observeDirectoryEntry();
           resourceGuard?.observeDirectoryEntry();
           const path = filesystem.joinPath(directory, entry.name);
+          if (entry.isSymbolicLink?.() === true) {
+            unsafeAlias = true;
+            break;
+          }
           if (entry.isDirectory()) {
+            const metadata = await lstatEntry(path);
+            if (metadata === null) break;
+            if (!isDirectDirectory(metadata)) {
+              unsafeAlias = true;
+              break;
+            }
             await walk(path, depth + 1);
-          } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+            if (unsafeFailure || unsafeAlias || discoveryFailureCode !== null) break;
+          } else if (entry.name.endsWith(".jsonl")) {
+            const metadata = await lstatEntry(path);
+            if (metadata === null) break;
+            if (!isDirectFile(metadata)) {
+              unsafeAlias = true;
+              break;
+            }
             throwIfAborted(signal);
             discoveryLimiter?.observeRolloutFile();
-            let metadata;
-            try {
-              metadata = await filesystem.statPath(path);
-            } catch (error) {
-              rethrowDiscoveryControlError(error);
-              unsafeFailure = true;
-              continue;
-            }
             // Discovery walks bounded history to resolve ancestry, but charges
             // selected sources once before parsing.
             resourceGuard?.checkRuntime();
@@ -400,9 +470,32 @@ export function createCodexLogSources({ filesystem, lineReader }) {
           unsafeFailure = true;
         }
       }
+      if (!unsafeAlias) {
+        await lstatDirectory(directory, { expected: directoryBefore });
+      }
     }
     await walk(root);
-    return { files, rootOpened, unsafeFailure, discoveryFailureCode };
+    if (!unsafeFailure && !unsafeAlias && discoveryFailureCode === null) {
+      // Revalidate every candidate after its containing tree has been walked.
+      // This closes static alias/replacement gaps before any rollout content
+      // is read. It is intentionally not a claim of handle-relative race
+      // safety: the parser's later read still occurs in a separate operation.
+      for (const info of files) {
+        const metadata = await lstatEntry(info.path);
+        if (metadata === null) break;
+        if (!isDirectFile(metadata) || !sameSourceIdentity(metadata, info)) {
+          unsafeAlias = true;
+          break;
+        }
+      }
+    }
+    return {
+      files,
+      rootOpened,
+      unsafeFailure,
+      unsafeAlias,
+      discoveryFailureCode,
+    };
   }
 
   async function hashRolloutPrefix(info, prefixBytes, resourceGuard, signal) {
@@ -539,7 +632,31 @@ export function createCodexLogSources({ filesystem, lineReader }) {
     const roots = normalizeCodexHomes(codexHome, codexHomes);
     const cutoffMs = new Date(startAt).getTime();
     const endMs = endAt === null ? Number.POSITIVE_INFINITY : new Date(endAt).getTime();
-    const rootResults = await Promise.all(roots.map(async (root) => {
+    async function scanRoot(root) {
+      let rootBefore;
+      try {
+        rootBefore = await filesystem.lstatPath(root.path);
+      } catch (error) {
+        rethrowDiscoveryControlError(error);
+        return {
+          candidates: [],
+          available: false,
+          empty: false,
+          partial: false,
+          rootOwnerKey: root.rootOwnerKey,
+          discoveryFailureCode: null,
+        };
+      }
+      if (!isDirectDirectory(rootBefore)) {
+        return {
+          candidates: [],
+          available: false,
+          empty: false,
+          partial: false,
+          rootOwnerKey: root.rootOwnerKey,
+          discoveryFailureCode: null,
+        };
+      }
       // Active and archived trees share one ceiling within a root, while
       // independent roots cannot consume or abort each other's allowance.
       const discoveryLimiter = createDiscoveryLimiter(discoveryLimits);
@@ -557,18 +674,33 @@ export function createCodexLogSources({ filesystem, lineReader }) {
           discoveryLimiter,
         ),
       ]);
-      let unsafeFailure = active.unsafeFailure || archived.unsafeFailure;
-      let emptyHomePresent = false;
-      if (!active.rootOpened && !archived.rootOpened && !unsafeFailure) {
-        try {
-          const homeStats = await filesystem.statPath(root.path);
-          emptyHomePresent = homeStats?.isDirectory?.() === true;
-          if (!emptyHomePresent) unsafeFailure = true;
-        } catch (error) {
-          rethrowDiscoveryControlError(error);
-          if (error?.code !== "ENOENT") unsafeFailure = true;
-        }
+      let rootStillDirect = false;
+      try {
+        const rootAfter = await filesystem.lstatPath(root.path);
+        rootStillDirect = isDirectDirectory(rootAfter)
+          && sameSourceIdentity(rootAfter, rootBefore);
+      } catch (error) {
+        rethrowDiscoveryControlError(error);
       }
+      if (!rootStillDirect || active.unsafeAlias || archived.unsafeAlias) {
+        // Treat an alias, type mismatch, or replaced configured root as
+        // unavailable. With another healthy root this produces aggregate
+        // partial coverage; alone it produces unavailable coverage. Never
+        // admit any candidate from the affected root.
+        return {
+          candidates: [],
+          available: false,
+          empty: false,
+          partial: false,
+          rootOwnerKey: root.rootOwnerKey,
+          discoveryFailureCode: active.discoveryFailureCode
+            ?? archived.discoveryFailureCode,
+        };
+      }
+      const unsafeFailure = active.unsafeFailure || archived.unsafeFailure;
+      const emptyHomePresent = !unsafeFailure
+        && !active.rootOpened
+        && !archived.rootOpened;
       const discoveryFailureCode = active.discoveryFailureCode
         ?? archived.discoveryFailureCode;
       if (unsafeFailure) {
@@ -610,7 +742,12 @@ export function createCodexLogSources({ filesystem, lineReader }) {
         rootOwnerKey: root.rootOwnerKey,
         discoveryFailureCode: null,
       };
-    }));
+    }
+    const rootResults = await mapWithConcurrency(
+      roots,
+      MAXIMUM_CONCURRENT_ROOT_SCANS,
+      scanRoot,
+    );
     throwIfAborted(signal);
     const availableRoots = rootResults.filter((result) => result.available).length;
     const unavailableRoots = roots.length - availableRoots;

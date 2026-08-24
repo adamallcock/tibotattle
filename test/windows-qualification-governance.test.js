@@ -77,6 +77,59 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.equal(actions.every((action) => /@[0-9a-f]{40}$/u.test(action)), true);
 });
 
+test("WSL2 multi-root qualification is a separate explicit disposable canary", async () => {
+  const workflow = await readFile(
+    resolve(REPOSITORY_ROOT, ".github/workflows/windows-portability.yml"),
+    "utf8",
+  );
+  const qualificationScript = await readFile(
+    resolve(REPOSITORY_ROOT, "scripts/windows-wsl-multi-root-qualification.mjs"),
+    "utf8",
+  );
+  assert.match(workflow, /wsl2_multi_root:\n\s+description:/u);
+  assert.match(workflow, /wsl2_multi_root:[\s\S]*?default: false[\s\S]*?type: boolean/u);
+  assert.match(workflow, /windows-wsl2-multi-root:[\s\S]*?if: \$\{\{ inputs\.wsl2_multi_root == true \}\}/u);
+  assert.match(workflow, /windows-wsl2-multi-root:[\s\S]*?runs-on: windows-2025/u);
+  assert.match(
+    workflow,
+    /Vampire\/setup-wsl@d1da7f2c0322a5ee4f24975344f67fc0f5baf364 # v7\.0\.0/u,
+  );
+  assert.match(workflow, /distribution: Ubuntu-24\.04/u);
+  assert.match(workflow, /use-cache: "false"/u);
+  assert.match(workflow, /wsl-version: "2"/u);
+  assert.match(workflow, /USAGE_MONITOR_WSL_QUALIFICATION: "1"/u);
+  assert.match(workflow, /TIBOTATTLE_WSL_QUALIFICATION_REVISION: \$\{\{ github\.sha \}\}/u);
+  assert.ok(
+    workflow.indexOf("Require a disposable GitHub-hosted runner")
+      < workflow.indexOf("Install disposable pinned WSL2 distribution"),
+    "the hosted-runner guard must execute before WSL is installed",
+  );
+  assert.match(workflow, /EXPECTED_RUNNER_ENVIRONMENT: \$\{\{ runner\.environment \}\}/u);
+  assert.match(workflow, /pnpm install --frozen-lockfile/u);
+  assert.match(workflow, /windows-wsl-multi-root-qualification\.mjs/u);
+  assert.match(workflow, /\$allowedFailures = @\([\s\S]*?WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_DISTRO_STATE_INVALID[\s\S]*?WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_REFRESH_TIMED_OUT[\s\S]*?WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_TEMP_CLEANUP_FAILED[\s\S]*?WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_OWNER_REBOUND[\s\S]*?\)/u);
+  assert.match(workflow, /if \(\$allowedFailures -contains \$result\) \{\s+Write-Error \$result/u);
+  assert.match(workflow, /else \{\s+Write-Error 'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_FAILED'/u);
+  assert.match(workflow, /if: \$\{\{ always\(\) \}\}[\s\S]*?--unregister', 'Ubuntu-24\.04'/u);
+  assert.match(
+    workflow,
+    /Always unregister disposable WSL distribution[\s\S]*?RUNNER_ENVIRONMENT -ne 'github-hosted'[\s\S]*?--unregister', 'Ubuntu-24\.04'/u,
+  );
+  assert.match(workflow, /WaitForExit\(60000\)/u);
+  assert.match(workflow, /Not qualified: installed picker, DACL policy, reparse race safety/u);
+  assert.doesNotMatch(workflow, /wsl\.exe --install|wsl\.exe --set-default/iu);
+
+  assert.match(qualificationScript, /return `\\\\\\\\wsl\$\\\\\$\{distribution\}\\\\root\\\\\.codex`/u);
+  assert.match(qualificationScript, /\["--terminate", DISTRIBUTION\]/u);
+  assert.match(qualificationScript, /\["--list", "--running", "--quiet"\]/u);
+  assert.match(qualificationScript, /\(await listRunning\(\)\)\.includes\(DISTRIBUTION\)/u);
+  assert.match(qualificationScript, /unavailableOwnerSources: 1/u);
+  assert.match(qualificationScript, /assertOwnersUnchanged/u);
+  assert.match(qualificationScript, /RUNNER_ENVIRONMENT !== "github-hosted"/u);
+  assert.match(qualificationScript, /shell: false/u);
+  assert.doesNotMatch(qualificationScript, /(?:exec|spawn)Sync\(/u);
+});
+
 test("qualification selection is fail-closed away from native Windows", async () => {
   const selected = await qualificationTestFiles({
     platform: "darwin",

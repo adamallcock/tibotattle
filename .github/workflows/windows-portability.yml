@@ -2,6 +2,12 @@ name: Windows portability canary
 
 on:
   workflow_dispatch:
+    inputs:
+      wsl2_multi_root:
+        description: Run the disposable Ubuntu 24.04 WSL2 multi-root qualification
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -260,5 +266,214 @@ jobs:
           }
           if ($null -ne $untracked -and $untracked.Count -gt 0) {
             Write-Error 'WINDOWS_QUALIFICATION_UNTRACKED_OUTPUT'
+            exit 1
+          }
+
+  windows-wsl2-multi-root:
+    name: Windows x64 plus disposable Ubuntu 24.04 WSL2 multi-root qualification
+    if: ${{ inputs.wsl2_multi_root == true }}
+    runs-on: windows-2025
+    timeout-minutes: 35
+    env:
+      CI: "1"
+      USAGE_MONITOR_TEST_LANE_REPORTER: dot
+      USAGE_MONITOR_WSL_QUALIFICATION: "1"
+      TIBOTATTLE_WSL_QUALIFICATION_REVISION: ${{ github.sha }}
+    steps:
+      - name: Check out the requested revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify the selected revision is immutable
+        shell: pwsh
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = $env:EXPECTED_REVISION.Trim().ToLowerInvariant()
+          $actual = (git rev-parse HEAD).Trim().ToLowerInvariant()
+          if ($expected -notmatch '^[0-9a-f]{40}$' -or $actual -ne $expected) {
+            Write-Error 'WINDOWS_WSL_QUALIFICATION_REVISION_MISMATCH'
+            exit 1
+          }
+
+      - name: Require a disposable GitHub-hosted runner
+        shell: pwsh
+        env:
+          EXPECTED_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:EXPECTED_RUNNER_ENVIRONMENT -ne 'github-hosted' -or
+              $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
+            Write-Error 'WINDOWS_WSL_QUALIFICATION_GITHUB_HOSTED_REQUIRED'
+            exit 1
+          }
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Activate pinned pnpm
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm install --global corepack@0.34.0 --force
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_WSL_QUALIFICATION_COREPACK_INSTALL_FAILED'
+            exit 1
+          }
+          corepack enable
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_WSL_QUALIFICATION_COREPACK_ENABLE_FAILED'
+            exit 1
+          }
+          corepack prepare pnpm@11.9.0 --activate
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_WSL_QUALIFICATION_PNPM_ACTIVATION_FAILED'
+            exit 1
+          }
+          if ((node --version).Trim() -ne 'v26.2.0' -or
+              (corepack --version).Trim() -ne '0.34.0' -or
+              (pnpm --version).Trim() -ne '11.9.0') {
+            Write-Error 'WINDOWS_WSL_QUALIFICATION_RUNTIME_VERSION_MISMATCH'
+            exit 1
+          }
+
+      - name: Install disposable pinned WSL2 distribution
+        uses: Vampire/setup-wsl@d1da7f2c0322a5ee4f24975344f67fc0f5baf364 # v7.0.0
+        with:
+          distribution: Ubuntu-24.04
+          use-cache: "false"
+          set-as-default: "false"
+          update: "false"
+          wsl-version: "2"
+
+      - name: Verify the disposable distribution is WSL2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $inventory = (wsl.exe --list --verbose | Out-String) -replace "`0", ''
+          if ($LASTEXITCODE -ne 0 -or
+              $inventory -notmatch '(?m)^\s*\*?\s*Ubuntu-24\.04\s+\S+\s+2\s*$') {
+            Write-Error 'WINDOWS_WSL_QUALIFICATION_WSL2_REQUIRED'
+            exit 1
+          }
+
+      - name: Install locked workspace dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_WSL_QUALIFICATION_DEPENDENCY_INSTALL_FAILED'
+            exit 1
+          }
+
+      - name: Run static WSL qualification contract tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node --test test/windows-wsl-multi-root-qualification.test.js test/windows-qualification-governance.test.js
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_WSL_QUALIFICATION_CONTRACT_TEST_FAILED'
+            exit 1
+          }
+
+      - name: Run content-free Windows and WSL2 multi-root qualification
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $allowedFailures = @(
+            'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_FLAG_REQUIRED',
+            'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_NATIVE_WINDOWS_REQUIRED',
+            'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_X64_REQUIRED',
+            'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_HOSTED_ENVIRONMENT_REQUIRED',
+            'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_REVISION_INVALID',
+            'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_TEMP_ROOT_INVALID',
+            'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_COMMAND_FAILED',
+            'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_COMMAND_TIMED_OUT',
+            'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_COMMAND_OUTPUT_EXCEEDED',
+            'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_DISTRO_UNAVAILABLE',
+            'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_WSL2_REQUIRED',
+            'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_DISTRO_STATE_INVALID',
+            'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_REFRESH_TIMED_OUT',
+            'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_TEMP_CLEANUP_FAILED',
+            'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_PHASE_INVALID',
+            'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_PUBLIC_RECEIPT_INVALID',
+            'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_OWNER_REBOUND',
+            'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_FAILED'
+          )
+          $result = (& node ./scripts/windows-wsl-multi-root-qualification.mjs 2>&1 | Out-String).Trim()
+          $qualificationExit = $LASTEXITCODE
+          if ($qualificationExit -ne 0) {
+            if ($allowedFailures -contains $result) {
+              Write-Error $result
+            } else {
+              Write-Error 'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_FAILED'
+            }
+            exit 1
+          }
+          if ($result -ne 'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_PASSED') {
+            Write-Error 'WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_FAILED'
+            exit 1
+          }
+          "### Windows and WSL2 multi-root result" >> $env:GITHUB_STEP_SUMMARY
+          "- Revision: $env:TIBOTATTLE_WSL_QUALIFICATION_REVISION" >> $env:GITHUB_STEP_SUMMARY
+          "- Result: WINDOWS_WSL_MULTI_ROOT_QUALIFICATION_PASSED" >> $env:GITHUB_STEP_SUMMARY
+          "- Scope: Windows primary plus explicit Ubuntu-24.04 activity root; stopped-root retained-history and recovery" >> $env:GITHUB_STEP_SUMMARY
+          "- Not qualified: installed picker, DACL policy, reparse race safety, signing, installer, or updater" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Confirm WSL qualification did not modify the checkout
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git diff --quiet
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_WSL_QUALIFICATION_WORKTREE_DIRTY'
+            exit 1
+          }
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_WSL_QUALIFICATION_INDEX_DIRTY'
+            exit 1
+          }
+          $untracked = git ls-files --others --exclude-standard
+          if ($LASTEXITCODE -ne 0 -or ($null -ne $untracked -and $untracked.Count -gt 0)) {
+            Write-Error 'WINDOWS_WSL_QUALIFICATION_UNTRACKED_OUTPUT'
+            exit 1
+          }
+
+      - name: Always unregister disposable WSL distribution
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
+            exit 0
+          }
+          $installed = (wsl.exe --list --quiet | Out-String) -replace "`0", ''
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_WSL_QUALIFICATION_CLEANUP_INVENTORY_FAILED'
+            exit 1
+          }
+          if ($installed -notmatch '(?m)^\s*Ubuntu-24\.04\s*$') {
+            exit 0
+          }
+          $cleanup = Start-Process -FilePath 'wsl.exe' `
+            -ArgumentList @('--unregister', 'Ubuntu-24.04') `
+            -NoNewWindow -PassThru
+          if (-not $cleanup.WaitForExit(60000)) {
+            $cleanup.Kill()
+            Write-Error 'WINDOWS_WSL_QUALIFICATION_CLEANUP_TIMED_OUT'
+            exit 1
+          }
+          if ($cleanup.ExitCode -ne 0) {
+            Write-Error 'WINDOWS_WSL_QUALIFICATION_CLEANUP_FAILED'
             exit 1
           }

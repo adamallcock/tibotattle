@@ -2,7 +2,7 @@
 title: Multi-root Codex sources red-team review
 date: 2026-08-23
 type: review
-status: stage-a-complete; no-blocking-findings
+status: stage-a-complete; platform-hardening-review-pending
 reviewers:
   - source-and-index-map
   - availability-and-lifecycle-map
@@ -54,7 +54,8 @@ It does not promise:
 - semantic merging of divergent JSONL histories;
 - automatic discovery or startup of WSL distributions;
 - automatic recovery from a missing cursor owner;
-- safe installed Windows reparse/ACL/UNC handling;
+- handle-relative Windows reparse-race safety, a complete DACL policy, or an
+  installed Windows picker journey;
 - account separation across roots; or
 - erasure/retraction of previously accepted history when a root is removed.
 
@@ -349,8 +350,11 @@ new readiness/coverage surfaces.
 
 Ordinary non-collision discovery does not hash every file solely for dedup.
 Collision proof streams the shorter common prefix in 256 KiB chunks and checks
-the runtime guard. Memory remains bounded by a small number of candidate and
-hash buffers.
+the runtime guard. Hashing itself retains only a small number of chunk buffers.
+Discovery metadata is separately bounded but can still be large: eight roots
+at the configured per-root limit can retain up to 1,000,000 candidate records
+before global grouping. Native Windows/WSL RSS and latency at that high-water
+mark remain an installed-platform qualification gate.
 
 Potential Stage B trigger: repeated very large replica collisions make normal
 foreground refresh materially slower. The remedy would be a persisted,
@@ -370,11 +374,31 @@ Stage A identity requirement.
 macOS Stage A has native settings, migration, missing-root tolerance, launch
 plumbing, localization, and source tests.
 
-The portable server/scanner accepts Windows-style activity paths only to the
-extent already supported by the runtime. This review makes no claim about
-installed Windows picker UX, WSL UNC availability, reparse points, DACLs,
-long-path behavior, signed artifacts, or installer/updater behavior. Those are
-release gates under the Windows work, not polish hidden inside Stage A.
+The follow-up hardening closes several narrower gaps without changing the
+logical-source design:
+
+- the Windows lane now owns a native two-root drive/space/Unicode/reorder/
+  unavailable-root test rather than relying on path-string fixtures alone;
+- discovery rejects statically visible symlink/junction aliases and identity
+  replacements at selected roots, source trees, traversed directories, and
+  JSONL candidates, discarding only the affected root; and
+- a manual, opt-in WSL2 job can provision disposable Ubuntu 24.04 and exercise
+  one Windows root plus a real `\\wsl$` root through ready, stopped, partial
+  last-known-good, restart, and recovery phases.
+
+Those controls do not prove more than they exercise. Repeated `lstat` identity
+checks narrow static substitution windows but are not handle-relative traversal
+and cannot establish race freedom. They do not define or verify DACL policy.
+The WSL job is not qualification evidence until it passes on the exact reviewed
+revision, and it does not exercise a shipping Windows picker or installed app.
+[Microsoft's documented lifecycle distinction](https://learn.microsoft.com/windows/dev-environment/wsl-interop)
+matters: `\\wsl$` does not resolve when the distro is stopped, while
+`\\wsl.localhost` may start it on Windows 11. The stopped-root canary therefore
+uses the former and fails if a refresh wakes the distro.
+
+This review still makes no claim about native Windows picker UX, complete
+reparse/DACL race safety, long-path behavior, signed artifacts, or installer/
+updater behavior. Those remain explicit release gates under the Windows work.
 
 ## Required validation gates
 
@@ -390,7 +414,8 @@ release gates under the Windows work, not polish hidden inside Stage A.
 5. Web tests prove closed coverage validation and rendered warning wiring.
 6. Focused suites, full repository tests, docs links, localization checks, and
    independent audits pass without weakening existing tests.
-7. Installed Windows/WSL qualification remains explicitly outstanding.
+7. Native Windows and real WSL jobs pass on the exact reviewed revision; until
+   then installed Windows/WSL qualification remains explicitly outstanding.
 
 R7 regeneration is a current-source provenance and existing scalar real-history
 benchmark gate. Because the governed R7 harness does not accept plural Codex

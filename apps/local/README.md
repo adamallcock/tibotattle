@@ -265,6 +265,16 @@ does not erase accepted history. Each root's active and archived trees share a
 500,000-entry and 125,000-rollout discovery ceiling; an oversized root is
 discarded for that pass without blocking fully scanned roots.
 
+On Windows, pass an explicit UNC `.codex` path just as you would a drive path.
+Use `\\wsl.localhost\<distribution>\...\.codex` when Windows 11 auto-start
+behavior is acceptable. Use the legacy `\\wsl$\<distribution>\...\.codex`
+form when a stopped distribution must remain stopped: [Microsoft documents
+that this form resolves only while that distribution is
+running](https://learn.microsoft.com/windows/dev-environment/wsl-interop).
+TiboTattle never starts or stops WSL itself; an unavailable WSL root therefore
+produces the same path-free partial coverage as any other unavailable secondary
+root.
+
 ## Local API
 
 - `GET /api/local/health`

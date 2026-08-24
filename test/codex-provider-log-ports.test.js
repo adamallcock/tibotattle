@@ -54,6 +54,51 @@ function asyncEntries(values = []) {
   })();
 }
 
+function virtualDirectoryStats({ dev = 1, ino = 1 } = {}) {
+  return {
+    dev,
+    ino,
+    birthtimeMs: 1,
+    isDirectory: () => true,
+    isFile: () => false,
+    isSymbolicLink: () => false,
+  };
+}
+
+function virtualFileStats({
+  dev = 1,
+  ino = 1,
+  size = 0,
+  mtimeMs = Date.parse("2026-07-24T12:30:00.000Z"),
+  ctimeMs = mtimeMs,
+  birthtimeMs = Date.parse("2026-07-24T12:00:00.000Z"),
+} = {}) {
+  return {
+    dev,
+    ino,
+    size,
+    mtimeMs,
+    ctimeMs,
+    birthtimeMs,
+    uid: 501,
+    nlink: 1,
+    isDirectory: () => false,
+    isFile: () => true,
+    isSymbolicLink: () => false,
+  };
+}
+
+function virtualSymlinkStats({ dev = 1, ino = 1 } = {}) {
+  return {
+    dev,
+    ino,
+    birthtimeMs: 1,
+    isDirectory: () => false,
+    isFile: () => false,
+    isSymbolicLink: () => true,
+  };
+}
+
 function completeFilesystem(overrides = {}) {
   return {
     defaultCodexHome: () => VIRTUAL_CODEX_HOME,
@@ -88,7 +133,10 @@ function sessionMetadataLine(sessionId = "session-port-contract") {
   });
 }
 
-function virtualDiscoveryScanner(rootSpecs) {
+function virtualDiscoveryScanner(rootSpecs, {
+  onLineRead = null,
+  onLstat = null,
+} = {}) {
   const directories = new Map();
   const files = new Map();
   const metadata = new Map();
@@ -97,28 +145,34 @@ function virtualDiscoveryScanner(rootSpecs) {
   for (const root of rootSpecs) {
     const sessions = posix.join(root.path, "sessions");
     const archived = posix.join(root.path, "archived_sessions");
+    metadata.set(root.path, root.symlink === true
+      ? virtualSymlinkStats({ dev: root.dev ?? 1, ino: nextInode++ })
+      : virtualDirectoryStats({ dev: root.dev ?? 1, ino: nextInode++ }));
+    metadata.set(sessions, root.sessionsSymlink === true
+      ? virtualSymlinkStats({ dev: root.dev ?? 1, ino: nextInode++ })
+      : virtualDirectoryStats({ dev: root.dev ?? 1, ino: nextInode++ }));
+    metadata.set(archived, root.archivedSymlink === true
+      ? virtualSymlinkStats({ dev: root.dev ?? 1, ino: nextInode++ })
+      : virtualDirectoryStats({ dev: root.dev ?? 1, ino: nextInode++ }));
     const entries = [];
     for (const file of root.files ?? []) {
       const path = posix.join(sessions, file.name);
       const bytes = Buffer.isBuffer(file.bytes)
         ? file.bytes
         : Buffer.from(file.bytes, "utf8");
-      const stats = {
-        dev: root.dev ?? 1,
-        ino: nextInode++,
-        size: bytes.length,
-        mtimeMs: file.mtimeMs ?? Date.parse("2026-07-24T12:30:00.000Z"),
-        ctimeMs: file.mtimeMs ?? Date.parse("2026-07-24T12:30:00.000Z"),
-        birthtimeMs: Date.parse("2026-07-24T12:00:00.000Z"),
-        uid: 501,
-        nlink: 1,
-        isFile: () => true,
-        isSymbolicLink: () => false,
-      };
+      const stats = file.symlink === true
+        ? virtualSymlinkStats({ dev: root.dev ?? 1, ino: nextInode++ })
+        : virtualFileStats({
+          dev: root.dev ?? 1,
+          ino: nextInode++,
+          size: bytes.length,
+          mtimeMs: file.mtimeMs ?? Date.parse("2026-07-24T12:30:00.000Z"),
+        });
       entries.push({
         name: file.name,
         isDirectory: () => false,
-        isFile: () => true,
+        isFile: () => file.symlink !== true,
+        isSymbolicLink: () => file.symlink === true,
       });
       files.set(path, bytes);
       metadata.set(path, stats);
@@ -128,10 +182,29 @@ function virtualDiscoveryScanner(rootSpecs) {
         name: "broken",
         isDirectory: () => true,
         isFile: () => false,
+        isSymbolicLink: () => false,
       });
+      const brokenPath = posix.join(sessions, "broken");
+      metadata.set(brokenPath, virtualDirectoryStats({
+        dev: root.dev ?? 1,
+        ino: nextInode++,
+      }));
       const error = new Error("virtual inaccessible directory");
       error.code = "EACCES";
-      openFailures.set(posix.join(sessions, "broken"), error);
+      openFailures.set(brokenPath, error);
+    }
+    if (root.nestedSymlink === true) {
+      const nestedAliasPath = posix.join(sessions, "aliased-subtree");
+      entries.push({
+        name: "aliased-subtree",
+        isDirectory: () => false,
+        isFile: () => false,
+        isSymbolicLink: () => true,
+      });
+      metadata.set(nestedAliasPath, virtualSymlinkStats({
+        dev: root.dev ?? 1,
+        ino: nextInode++,
+      }));
     }
     directories.set(sessions, entries);
     directories.set(archived, []);
@@ -148,7 +221,16 @@ function virtualDiscoveryScanner(rootSpecs) {
       return asyncEntries(directories.get(path));
     },
     statPath: async (path) => metadata.get(path),
-    lstatPath: async (path) => metadata.get(path),
+    lstatPath: async (path) => {
+      const stats = metadata.get(path);
+      if (stats !== undefined) {
+        await onLstat?.(path, stats);
+        return stats;
+      }
+      const error = new Error("virtual path missing");
+      error.code = "ENOENT";
+      throw error;
+    },
     openReadOnlyNoFollow: async (path) => {
       const bytes = files.get(path);
       const stats = metadata.get(path);
@@ -170,6 +252,7 @@ function virtualDiscoveryScanner(rootSpecs) {
     },
   });
   const lineReader = completeLineReader(async function* readLines(source) {
+    onLineRead?.(source);
     const bytes = files.get(source);
     if (bytes === undefined) return;
     yield* bytes.toString("utf8").split("\n").filter(Boolean);
@@ -289,7 +372,14 @@ test("discovery preserves unbounded lineage reads while scan passes use the disc
   const guard = resourceGuard(5_432);
   const signal = new AbortController().signal;
   const calls = [];
+  const activeRoot = `${VIRTUAL_CODEX_HOME}/sessions`;
   const archivedRoot = `${VIRTUAL_CODEX_HOME}/archived_sessions`;
+  const metadata = new Map([
+    [VIRTUAL_CODEX_HOME, virtualDirectoryStats({ dev: 12, ino: 30 })],
+    [activeRoot, virtualDirectoryStats({ dev: 12, ino: 31 })],
+    [archivedRoot, virtualDirectoryStats({ dev: 12, ino: 32 })],
+    [ROLLOUT_PATH, virtualFileStats({ dev: 12, ino: 34, size: sourceSize })],
+  ]);
   const filesystem = completeFilesystem({
     openDirectory: async (path) => asyncEntries(path === archivedRoot
       ? [{
@@ -298,17 +388,7 @@ test("discovery preserves unbounded lineage reads while scan passes use the disc
         isFile: () => true,
       }]
       : []),
-    statPath: async (path) => {
-      assert.equal(path, ROLLOUT_PATH);
-      return {
-        dev: 12,
-        ino: 34,
-        size: sourceSize,
-        mtimeMs: Date.parse("2026-07-24T12:30:00.000Z"),
-        ctimeMs: Date.parse("2026-07-24T12:30:00.000Z"),
-        birthtimeMs: Date.parse("2026-07-24T12:00:00.000Z"),
-      };
-    },
+    lstatPath: async (path) => metadata.get(path),
   });
   const scanner = createCodexLogScanner({
     filesystem,
@@ -356,32 +436,17 @@ test("discovery preserves unbounded lineage reads while scan passes use the disc
 });
 
 test("a discovery limit discards the affected root as partial", async () => {
-  const archivedRoot = `${VIRTUAL_CODEX_HOME}/archived_sessions`;
   const privateSecondName = "rollout-2026-07-24T12-00-01-private-limit-canary.jsonl";
-  const scanner = createCodexLogScanner({
-    filesystem: completeFilesystem({
-      openDirectory: async (path) => asyncEntries(path === archivedRoot
-        ? [{
-          name: ROLLOUT_NAME,
-          isDirectory: () => false,
-          isFile: () => true,
-        }, {
-          name: privateSecondName,
-          isDirectory: () => false,
-          isFile: () => true,
-        }]
-        : []),
-      statPath: async () => ({
-        dev: 12,
-        ino: 34,
-        size: 6789,
-        mtimeMs: Date.parse("2026-07-24T12:30:00.000Z"),
-        ctimeMs: Date.parse("2026-07-24T12:30:00.000Z"),
-        birthtimeMs: Date.parse("2026-07-24T12:00:00.000Z"),
-      }),
-    }),
-    lineReader: completeLineReader(),
-  });
+  const scanner = virtualDiscoveryScanner([{
+    path: VIRTUAL_CODEX_HOME,
+    files: [{
+      name: ROLLOUT_NAME,
+      bytes: `${sessionMetadataLine()}\n`,
+    }, {
+      name: privateSecondName,
+      bytes: `${sessionMetadataLine("private-limit-session")}\n`,
+    }],
+  }]);
 
   const infos = await scanner.discoverCodexRolloutInfos({
     startAt: START_AT,
@@ -655,8 +720,8 @@ test("coverage distinguishes an existing empty home from an unavailable home", a
         error.code = "ENOENT";
         throw error;
       },
-      statPath: async (path) => {
-        if (path === emptyRoot) return { isDirectory: () => true };
+      lstatPath: async (path) => {
+        if (path === emptyRoot) return virtualDirectoryStats({ ino: 201 });
         const error = new Error("virtual home missing");
         error.code = "ENOENT";
         throw error;
@@ -673,6 +738,557 @@ test("coverage distinguishes an existing empty home from an unavailable home", a
   assert.equal(infos.rootCoverage.status, "partial");
   assert.equal(infos.rootCoverage.availableRoots, 1);
   assert.equal(infos.rootCoverage.emptyRoots, 1);
+  assert.equal(infos.rootCoverage.unavailableRoots, 1);
+});
+
+test("a configured Codex home symlink is unavailable and is not traversed", async () => {
+  const unsafeRoot = "/virtual/private-root-alias";
+  let openCalls = 0;
+  const scanner = createCodexLogScanner({
+    filesystem: completeFilesystem({
+      openDirectory: async () => {
+        openCalls += 1;
+        return asyncEntries();
+      },
+      lstatPath: async (path) => {
+        assert.equal(path, unsafeRoot);
+        return virtualSymlinkStats({ ino: 301 });
+      },
+    }),
+    lineReader: completeLineReader(),
+  });
+
+  const infos = await scanner.discoverCodexRolloutInfos({
+    codexHomes: [unsafeRoot],
+    startAt: START_AT,
+    endAt: END_AT,
+  });
+
+  assert.deepEqual([...infos], []);
+  assert.equal(openCalls, 0);
+  assert.deepEqual(infos.rootCoverage, {
+    status: "unavailable",
+    configuredRoots: 1,
+    availableRoots: 0,
+    emptyRoots: 0,
+    unavailableRoots: 1,
+    retainedHistory: false,
+    unavailableOwnerSources: 0,
+    ambiguousSources: 0,
+  });
+  assert.equal(JSON.stringify(infos.rootCoverage).includes(unsafeRoot), false);
+});
+
+test("configured-root revalidation rejects a same-type directory replacement", async () => {
+  const root = "/virtual/replaced-direct-root";
+  const sessions = `${root}/sessions`;
+  const archived = `${root}/archived_sessions`;
+  const candidate = `${sessions}/${ROLLOUT_NAME}`;
+  const sessionsStats = virtualDirectoryStats({ ino: 601 });
+  const archivedStats = virtualDirectoryStats({ ino: 602 });
+  const candidateStats = virtualFileStats({
+    ino: 605,
+    size: Buffer.byteLength(`${sessionMetadataLine()}\n`),
+  });
+  let rootLstats = 0;
+  let lineReads = 0;
+  const scanner = createCodexLogScanner({
+    filesystem: completeFilesystem({
+      openDirectory: async (path) => asyncEntries(path === sessions
+        ? [{
+          name: ROLLOUT_NAME,
+          isDirectory: () => false,
+          isFile: () => true,
+          isSymbolicLink: () => false,
+        }]
+        : []),
+      lstatPath: async (path) => {
+        if (path === sessions) return sessionsStats;
+        if (path === archived) return archivedStats;
+        if (path === candidate) return candidateStats;
+        assert.equal(path, root);
+        rootLstats += 1;
+        return virtualDirectoryStats({
+          ino: rootLstats === 1 ? 603 : 604,
+        });
+      },
+    }),
+    lineReader: completeLineReader(async function* readLines() {
+      lineReads += 1;
+      yield sessionMetadataLine();
+    }),
+  });
+
+  const infos = await scanner.discoverCodexRolloutInfos({
+    codexHomes: [root],
+    startAt: START_AT,
+    endAt: END_AT,
+  });
+
+  assert.equal(rootLstats, 2);
+  assert.equal(lineReads, 0);
+  assert.deepEqual([...infos], []);
+  assert.equal(infos.rootCoverage.status, "unavailable");
+  assert.equal(infos.rootCoverage.unavailableRoots, 1);
+});
+
+test("top-level sessions revalidation rejects a same-type replacement before lineage reads", async () => {
+  const root = "/virtual/replaced-sessions-tree-root";
+  const sessions = `${root}/sessions`;
+  const archived = `${root}/archived_sessions`;
+  const candidate = `${sessions}/${ROLLOUT_NAME}`;
+  const rootStats = virtualDirectoryStats({ ino: 611 });
+  const archivedStats = virtualDirectoryStats({ ino: 612 });
+  const candidateStats = virtualFileStats({
+    ino: 613,
+    size: Buffer.byteLength(`${sessionMetadataLine()}\n`),
+  });
+  let sessionsLstats = 0;
+  let lineReads = 0;
+  const scanner = createCodexLogScanner({
+    filesystem: completeFilesystem({
+      openDirectory: async (path) => asyncEntries(path === sessions
+        ? [{
+          name: ROLLOUT_NAME,
+          isDirectory: () => false,
+          isFile: () => true,
+          isSymbolicLink: () => false,
+        }]
+        : []),
+      lstatPath: async (path) => {
+        if (path === root) return rootStats;
+        if (path === archived) return archivedStats;
+        if (path === candidate) return candidateStats;
+        assert.equal(path, sessions);
+        sessionsLstats += 1;
+        return virtualDirectoryStats({
+          ino: sessionsLstats === 1 ? 614 : 615,
+        });
+      },
+    }),
+    lineReader: completeLineReader(async function* readLines() {
+      lineReads += 1;
+      yield sessionMetadataLine();
+    }),
+  });
+
+  const infos = await scanner.discoverCodexRolloutInfos({
+    codexHomes: [root],
+    startAt: START_AT,
+    endAt: END_AT,
+  });
+
+  assert.equal(sessionsLstats, 2);
+  assert.equal(lineReads, 0);
+  assert.deepEqual([...infos], []);
+  assert.deepEqual(infos.rootCoverage, {
+    status: "unavailable",
+    configuredRoots: 1,
+    availableRoots: 0,
+    emptyRoots: 0,
+    unavailableRoots: 1,
+    retainedHistory: false,
+    unavailableOwnerSources: 0,
+    ambiguousSources: 0,
+  });
+});
+
+for (const [label, flag] of [
+  ["sessions", "sessionsSymlink"],
+  ["archived_sessions", "archivedSymlink"],
+]) {
+  test(`a symlinked ${label} tree discards its configured root`, async () => {
+    const unsafeRoot = `/virtual/private-${label}-alias`;
+    const scanner = virtualDiscoveryScanner([{
+      path: unsafeRoot,
+      [flag]: true,
+      files: [{
+        name: ROLLOUT_NAME,
+        bytes: `${sessionMetadataLine("private-tree-alias-session")}\n`,
+      }],
+    }]);
+
+    const infos = await scanner.discoverCodexRolloutInfos({
+      codexHomes: [unsafeRoot],
+      startAt: START_AT,
+      endAt: END_AT,
+    });
+
+    assert.deepEqual([...infos], []);
+    assert.equal(infos.rootCoverage.status, "unavailable");
+    assert.equal(infos.rootCoverage.availableRoots, 0);
+    assert.equal(infos.rootCoverage.unavailableRoots, 1);
+    assert.equal(JSON.stringify(infos.rootCoverage).includes(unsafeRoot), false);
+  });
+}
+
+test("a symlinked nested activity directory discards its configured root", async () => {
+  const unsafeRoot = "/virtual/private-nested-alias";
+  const scanner = virtualDiscoveryScanner([{
+    path: unsafeRoot,
+    nestedSymlink: true,
+  }]);
+
+  const infos = await scanner.discoverCodexRolloutInfos({
+    codexHomes: [unsafeRoot],
+    startAt: START_AT,
+    endAt: END_AT,
+  });
+
+  assert.deepEqual([...infos], []);
+  assert.equal(infos.rootCoverage.status, "unavailable");
+  assert.equal(infos.rootCoverage.unavailableRoots, 1);
+});
+
+test("irrelevant direct entries do not incur per-entry lstat calls", async () => {
+  const root = "/virtual/large-direct-root";
+  const sessions = `${root}/sessions`;
+  const archived = `${root}/archived_sessions`;
+  const metadata = new Map([
+    [root, virtualDirectoryStats({ ino: 501 })],
+    [sessions, virtualDirectoryStats({ ino: 502 })],
+    [archived, virtualDirectoryStats({ ino: 503 })],
+  ]);
+  const lstatCounts = new Map();
+  const irrelevant = Array.from({ length: 1_000 }, (_, index) => ({
+    name: `unrelated-${index}.txt`,
+    isDirectory: () => false,
+    isFile: () => true,
+    isSymbolicLink: () => false,
+  }));
+  const scanner = createCodexLogScanner({
+    filesystem: completeFilesystem({
+      openDirectory: async (path) => asyncEntries(path === sessions ? irrelevant : []),
+      lstatPath: async (path) => {
+        assert.equal(metadata.has(path), true, `unexpected lstat for ${path}`);
+        lstatCounts.set(path, (lstatCounts.get(path) ?? 0) + 1);
+        return metadata.get(path);
+      },
+    }),
+    lineReader: completeLineReader(),
+  });
+
+  const infos = await scanner.discoverCodexRolloutInfos({
+    codexHomes: [root],
+    startAt: START_AT,
+    endAt: END_AT,
+  });
+
+  assert.deepEqual([...infos], []);
+  assert.equal(infos.rootCoverage.status, "ready");
+  assert.equal(infos.rootCoverage.emptyRoots, 1);
+  assert.deepEqual(Object.fromEntries(lstatCounts), {
+    [root]: 2,
+    [sessions]: 2,
+    [archived]: 2,
+  });
+});
+
+test("a symlinked rollout candidate discards its configured root before content reads", async () => {
+  const unsafeRoot = "/virtual/private-candidate-alias";
+  let lineReads = 0;
+  const scanner = virtualDiscoveryScanner([{
+    path: unsafeRoot,
+    files: [{
+      name: ROLLOUT_NAME,
+      bytes: `${sessionMetadataLine("private-candidate-alias-session")}\n`,
+      symlink: true,
+    }],
+  }], {
+    onLineRead() {
+      lineReads += 1;
+    },
+  });
+
+  const infos = await scanner.discoverCodexRolloutInfos({
+    codexHomes: [unsafeRoot],
+    startAt: START_AT,
+    endAt: END_AT,
+  });
+
+  assert.deepEqual([...infos], []);
+  assert.equal(infos.rootCoverage.status, "unavailable");
+  assert.equal(infos.rootCoverage.availableRoots, 0);
+  assert.equal(infos.rootCoverage.unavailableRoots, 1);
+  assert.equal(lineReads, 0);
+  assert.equal(JSON.stringify(infos.rootCoverage).includes(unsafeRoot), false);
+});
+
+test("candidate revalidation rejects a file replaced by an alias before lineage reads", async () => {
+  const root = "/virtual/replaced-candidate-root";
+  const sessions = `${root}/sessions`;
+  const archived = `${root}/archived_sessions`;
+  const candidate = `${sessions}/${ROLLOUT_NAME}`;
+  const rootStats = virtualDirectoryStats({ ino: 401 });
+  const sessionsStats = virtualDirectoryStats({ ino: 402 });
+  const archivedStats = virtualDirectoryStats({ ino: 403 });
+  const fileStats = virtualFileStats({
+    ino: 404,
+    size: Buffer.byteLength(`${sessionMetadataLine()}\n`),
+  });
+  let candidateLstats = 0;
+  let lineReads = 0;
+  const scanner = createCodexLogScanner({
+    filesystem: completeFilesystem({
+      openDirectory: async (path) => asyncEntries(path === sessions
+        ? [{
+          name: ROLLOUT_NAME,
+          isDirectory: () => false,
+          isFile: () => true,
+        }]
+        : []),
+      lstatPath: async (path) => {
+        if (path === root) return rootStats;
+        if (path === sessions) return sessionsStats;
+        if (path === archived) return archivedStats;
+        assert.equal(path, candidate);
+        candidateLstats += 1;
+        return candidateLstats === 1
+          ? fileStats
+          : virtualSymlinkStats({ ino: 405 });
+      },
+    }),
+    lineReader: completeLineReader(async function* readLines() {
+      lineReads += 1;
+      yield sessionMetadataLine();
+    }),
+  });
+
+  const infos = await scanner.discoverCodexRolloutInfos({
+    codexHomes: [root],
+    startAt: START_AT,
+    endAt: END_AT,
+  });
+
+  assert.equal(candidateLstats, 2);
+  assert.equal(lineReads, 0);
+  assert.deepEqual([...infos], []);
+  assert.equal(infos.rootCoverage.status, "unavailable");
+});
+
+test("nested-directory revalidation rejects a same-type replacement before lineage reads", async () => {
+  const root = "/virtual/replaced-nested-root";
+  const sessions = `${root}/sessions`;
+  const archived = `${root}/archived_sessions`;
+  const nested = `${sessions}/nested`;
+  const candidate = `${nested}/${ROLLOUT_NAME}`;
+  const rootStats = virtualDirectoryStats({ ino: 701 });
+  const sessionsStats = virtualDirectoryStats({ ino: 702 });
+  const archivedStats = virtualDirectoryStats({ ino: 703 });
+  const candidateStats = virtualFileStats({
+    ino: 704,
+    size: Buffer.byteLength(`${sessionMetadataLine()}\n`),
+  });
+  let nestedLstats = 0;
+  let lineReads = 0;
+  const scanner = createCodexLogScanner({
+    filesystem: completeFilesystem({
+      openDirectory: async (path) => {
+        if (path === sessions) {
+          return asyncEntries([{
+            name: "nested",
+            isDirectory: () => true,
+            isFile: () => false,
+            isSymbolicLink: () => false,
+          }]);
+        }
+        if (path === nested) {
+          return asyncEntries([{
+            name: ROLLOUT_NAME,
+            isDirectory: () => false,
+            isFile: () => true,
+            isSymbolicLink: () => false,
+          }]);
+        }
+        return asyncEntries();
+      },
+      lstatPath: async (path) => {
+        if (path === root) return rootStats;
+        if (path === sessions) return sessionsStats;
+        if (path === archived) return archivedStats;
+        if (path === candidate) return candidateStats;
+        assert.equal(path, nested);
+        nestedLstats += 1;
+        return virtualDirectoryStats({
+          ino: nestedLstats <= 2 ? 705 : 706,
+        });
+      },
+    }),
+    lineReader: completeLineReader(async function* readLines() {
+      lineReads += 1;
+      yield sessionMetadataLine();
+    }),
+  });
+
+  const infos = await scanner.discoverCodexRolloutInfos({
+    codexHomes: [root],
+    startAt: START_AT,
+    endAt: END_AT,
+  });
+
+  assert.equal(nestedLstats, 3);
+  assert.equal(lineReads, 0);
+  assert.deepEqual([...infos], []);
+  assert.equal(infos.rootCoverage.status, "unavailable");
+});
+
+test("candidate revalidation rejects a same-type file replacement before lineage reads", async () => {
+  const root = "/virtual/replaced-direct-file-root";
+  const sessions = `${root}/sessions`;
+  const archived = `${root}/archived_sessions`;
+  const candidate = `${sessions}/${ROLLOUT_NAME}`;
+  const rootStats = virtualDirectoryStats({ ino: 711 });
+  const sessionsStats = virtualDirectoryStats({ ino: 712 });
+  const archivedStats = virtualDirectoryStats({ ino: 713 });
+  const sourceSize = Buffer.byteLength(`${sessionMetadataLine()}\n`);
+  let candidateLstats = 0;
+  let lineReads = 0;
+  const scanner = createCodexLogScanner({
+    filesystem: completeFilesystem({
+      openDirectory: async (path) => asyncEntries(path === sessions
+        ? [{
+          name: ROLLOUT_NAME,
+          isDirectory: () => false,
+          isFile: () => true,
+          isSymbolicLink: () => false,
+        }]
+        : []),
+      lstatPath: async (path) => {
+        if (path === root) return rootStats;
+        if (path === sessions) return sessionsStats;
+        if (path === archived) return archivedStats;
+        assert.equal(path, candidate);
+        candidateLstats += 1;
+        return virtualFileStats({
+          ino: candidateLstats === 1 ? 714 : 715,
+          size: sourceSize,
+        });
+      },
+    }),
+    lineReader: completeLineReader(async function* readLines() {
+      lineReads += 1;
+      yield sessionMetadataLine();
+    }),
+  });
+
+  const infos = await scanner.discoverCodexRolloutInfos({
+    codexHomes: [root],
+    startAt: START_AT,
+    endAt: END_AT,
+  });
+
+  assert.equal(candidateLstats, 2);
+  assert.equal(lineReads, 0);
+  assert.deepEqual([...infos], []);
+  assert.equal(infos.rootCoverage.status, "unavailable");
+});
+
+test("an unsafe alias root cannot block or contaminate a healthy root", async () => {
+  const unsafeRoot = "/virtual/private-unsafe-alias";
+  const healthyRoot = "/virtual/healthy-direct-root";
+  const healthyName = "rollout-2026-07-24T12-00-03-healthy-alias-isolation.jsonl";
+  const scanner = virtualDiscoveryScanner([{
+    path: unsafeRoot,
+    sessionsSymlink: true,
+    files: [{
+      name: ROLLOUT_NAME,
+      bytes: `${sessionMetadataLine("private-unsafe-alias-session")}\n`,
+    }],
+  }, {
+    path: healthyRoot,
+    files: [{
+      name: healthyName,
+      bytes: `${sessionMetadataLine("88888888-8888-4888-8888-888888888888")}\n`,
+    }],
+  }]);
+
+  const infos = await scanner.discoverCodexRolloutInfos({
+    codexHomes: [unsafeRoot, healthyRoot],
+    startAt: START_AT,
+    endAt: END_AT,
+  });
+
+  assert.deepEqual(infos.map((info) => info.rolloutKey), [healthyName]);
+  assert.equal(infos.rootCoverage.status, "partial");
+  assert.equal(infos.rootCoverage.availableRoots, 1);
+  assert.equal(infos.rootCoverage.unavailableRoots, 1);
+  assert.equal(infos.availableRootOwnerKeys.length, 1);
+  assert.equal(infos.unavailableRootOwnerKeys.length, 1);
+  assert.equal(JSON.stringify(infos.rootCoverage).includes(unsafeRoot), false);
+});
+
+test("root discovery caps concurrency at two without blocking healthy roots", async () => {
+  const rootSpecs = Array.from({ length: 5 }, (_, index) => ({
+    path: `/virtual/capped-root-${index}`,
+    sessionsSymlink: index === 2,
+    files: index === 2 ? [] : [{
+      name: `rollout-2026-07-24T12-00-0${index}-capped-${index}.jsonl`,
+      bytes: `${sessionMetadataLine(`capped-session-${index}`)}\n`,
+    }],
+  }));
+  const rootPaths = new Set(rootSpecs.map((root) => root.path));
+  const rootLstatCounts = new Map();
+  let releaseInitialScans;
+  const initialScanGate = new Promise((resolve) => {
+    releaseInitialScans = resolve;
+  });
+  const initiallyStarted = [];
+  let activeRootScans = 0;
+  let maximumActiveRootScans = 0;
+  const scanner = virtualDiscoveryScanner(rootSpecs, {
+    async onLstat(path) {
+      if (rootPaths.has(path)) {
+        const count = (rootLstatCounts.get(path) ?? 0) + 1;
+        rootLstatCounts.set(path, count);
+        if (count === 1) {
+          activeRootScans += 1;
+          maximumActiveRootScans = Math.max(
+            maximumActiveRootScans,
+            activeRootScans,
+          );
+          initiallyStarted.push(path);
+        } else {
+          assert.equal(count, 2);
+          activeRootScans -= 1;
+        }
+        return;
+      }
+      if (path.endsWith("/sessions")
+          || path.endsWith("/archived_sessions")) {
+        await initialScanGate;
+      }
+    },
+  });
+
+  const discovery = scanner.discoverCodexRolloutInfos({
+    codexHomes: rootSpecs.map((root) => root.path),
+    startAt: START_AT,
+    endAt: END_AT,
+  });
+  // Hold each worker at its first activity-tree metadata check, then allow the
+  // microtask queue to settle. This deterministically exposes the configured
+  // pool width: one would underfill, while Promise.all would start all five.
+  await new Promise((resolve) => setImmediate(resolve));
+  try {
+    assert.equal(initiallyStarted.length, 2);
+    assert.equal(rootLstatCounts.size, 2);
+    assert.equal(maximumActiveRootScans, 2);
+  } finally {
+    releaseInitialScans();
+  }
+
+  const infos = await discovery;
+  const expectedHealthyNames = rootSpecs
+    .filter((root) => root.sessionsSymlink !== true)
+    .map((root) => root.files[0].name)
+    .sort();
+  assert.deepEqual(infos.map((info) => info.rolloutKey), expectedHealthyNames);
+  assert.equal(maximumActiveRootScans, 2);
+  assert.equal(activeRootScans, 0);
+  assert.equal(rootLstatCounts.size, 5);
+  assert.deepEqual([...rootLstatCounts.values()], [2, 2, 2, 2, 2]);
+  assert.equal(infos.rootCoverage.status, "partial");
+  assert.equal(infos.rootCoverage.availableRoots, 4);
   assert.equal(infos.rootCoverage.unavailableRoots, 1);
 });
 
