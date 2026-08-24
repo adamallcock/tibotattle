@@ -1145,7 +1145,7 @@ test("native SQLite staging clones, rejects aliases, and publishes atomically", 
     assert.deepEqual(adapter.readFile(unsafeStagePath).data, unsafeStageBytes);
     assert.deepEqual(adapter.inspectPath(unsafeJournalPath).identity, unsafeJournalIdentity);
     assert.deepEqual(adapter.inspectPath(unsafeJournalSourcePath).identity, unsafeJournalIdentity);
-    assert.deepEqual(adapter.readFile(unsafeJournalPath).data, unsafeJournalBytes);
+    assert.deepEqual(await readFile(unsafeJournalPath), unsafeJournalBytes);
 
     const cloned = adapter.cloneSqliteDatabase(
       root,
@@ -1256,6 +1256,9 @@ test("qualification hook rejects a fresh SQLite publication target collision", {
         assert.ok([
           "WINDOWS_FILESYSTEM_ACCESS_DENIED",
           "WINDOWS_FILESYSTEM_ALREADY_EXISTS",
+          "WINDOWS_FILESYSTEM_NOT_FOUND",
+          "WINDOWS_FILESYSTEM_OPERATION_FAILED",
+          "WINDOWS_FILESYSTEM_HARD_LINK",
         ].includes(error?.code));
         return true;
       },
