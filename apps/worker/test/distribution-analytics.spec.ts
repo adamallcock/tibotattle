@@ -177,6 +177,33 @@ describe("owner distribution analytics", () => {
         sourceAddressesLast7Days: 1,
       }],
     });
+    expect(overview.cloudflare.bySegment).toHaveLength(7);
+    expect(overview.cloudflare.bySegment.slice(0, 2)).toEqual([{
+      startsAt: "2026-08-10T12:00:00.000Z",
+      endsAt: "2026-08-11T12:00:00.000Z",
+      activeSourceAddresses: 2,
+      preflightRequests: 3,
+      sparkleCheckRequests: 0,
+      sparkleDownloadRequests: 0,
+      currentVersionSourceAddresses: 2,
+    }, {
+      startsAt: "2026-08-11T12:00:00.000Z",
+      endsAt: "2026-08-12T12:00:00.000Z",
+      activeSourceAddresses: 1,
+      preflightRequests: 2,
+      sparkleCheckRequests: 0,
+      sparkleDownloadRequests: 0,
+      currentVersionSourceAddresses: 1,
+    }]);
+    expect(overview.cloudflare.bySegment.at(-1)).toEqual({
+      startsAt: "2026-08-16T12:00:00.000Z",
+      endsAt: "2026-08-17T12:00:00.000Z",
+      activeSourceAddresses: 3,
+      preflightRequests: 3,
+      sparkleCheckRequests: 3,
+      sparkleDownloadRequests: 1,
+      currentVersionSourceAddresses: 2,
+    });
     expect(overview.github).toMatchObject({
       status: "available",
       repository: "adamallcock/tibotattle",
@@ -309,6 +336,14 @@ describe("owner distribution analytics", () => {
       currentVersionSourceAddresses: { last24Hours: 0, last7Days: 0 },
       observedVersions: [],
     });
+    expect(overview.cloudflare.bySegment).toHaveLength(7);
+    expect(overview.cloudflare.bySegment.every((segment) => (
+      segment.activeSourceAddresses === 0
+      && segment.preflightRequests === 0
+      && segment.sparkleCheckRequests === 0
+      && segment.sparkleDownloadRequests === 0
+      && segment.currentVersionSourceAddresses === 0
+    ))).toBe(true);
   });
 
   it("degrades failed sources instead of failing the owner overview", async () => {
@@ -324,6 +359,7 @@ describe("owner distribution analytics", () => {
     expect(overview.cloudflare).toMatchObject({
       status: "unavailable",
       reasonCode: "ANALYTICS_UNAVAILABLE",
+      bySegment: [],
     });
     expect(overview.github).toMatchObject({
       status: "unavailable",

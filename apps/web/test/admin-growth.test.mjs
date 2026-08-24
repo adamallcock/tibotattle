@@ -128,6 +128,141 @@ test("sparkline geometry normalizes into the viewBox and refuses one point", asy
   // A flat series draws a level line rather than dividing by zero.
   const flat = sparklineGeometry([4, 4, 4]);
   assert.ok(flat.points.split(" ").every((point) => point.endsWith(",26.0")));
+
+  const timed = sparklineGeometry([
+    { at: "2026-08-01", value: 0 },
+    { at: "2026-08-02", value: 5 },
+    { at: "2026-08-04", value: 10 },
+  ]);
+  assert.ok(
+    timed.coordinates[1].x < 60,
+    "a point one day into a three-day span uses true time, not equal spacing",
+  );
+});
+
+test("audit pagination and native alert topics are bounded and independent", async () => {
+  const { auditPageWindow, selectedNotificationAlerts } = await importAdminModule();
+  const rows = Array.from({ length: 20 }, (_, index) => ({ index }));
+  assert.deepEqual(auditPageWindow(rows, 1).rows.map((row) => row.index), [
+    10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+  ]);
+  assert.equal(auditPageWindow(rows, 99).page, 1);
+  const items = [
+    { id: "one", topic: "collection", level: "alert" },
+    { id: "two", topic: "evidence", level: "warning" },
+    { id: "three", topic: "failures", level: "ok" },
+  ];
+  assert.deepEqual(
+    selectedNotificationAlerts(items, ["evidence"]).map((item) => item.id),
+    ["two"],
+  );
+});
+
+test("history gaps distinguish loading, unavailable evidence, and a new series", async () => {
+  const {
+    gaugeHistoryIsBounded,
+    historyGapLabel,
+    isCurrentLoadGeneration,
+  } = await importAdminModule();
+  assert.equal(historyGapLabel(undefined, null), "Recent history loading…");
+  assert.equal(historyGapLabel(null, null), "Recent history unavailable");
+  assert.equal(
+    historyGapLabel({}, [], false),
+    "Recent history not yet recorded",
+  );
+  assert.equal(
+    historyGapLabel({}, [{ at: "2026-08-23", value: 4 }]),
+    "1 snapshot · history starts here",
+  );
+  assert.equal(
+    historyGapLabel({}, [{ at: "2026-08-22", value: 3 }, { at: "2026-08-23", value: 4 }]),
+    null,
+  );
+  assert.equal(historyGapLabel({}, [], true), "Recent history unavailable");
+  assert.equal(isCurrentLoadGeneration(4, 4), true);
+  assert.equal(isCurrentLoadGeneration(3, 4), false);
+  assert.equal(gaugeHistoryIsBounded([
+    { metrics: { contributingAccountsTotalBounded: 1 } },
+    { metrics: { contributingAccountsTotalBounded: 0 } },
+  ], "contributingAccountsTotalBounded"), true);
+  assert.equal(gaugeHistoryIsBounded([
+    { metrics: { contributingAccountsTotalBounded: 0 } },
+  ], "contributingAccountsTotalBounded"), false);
+});
+
+test("sparkline inspection exposes dated values for pointer and keyboard input", async () => {
+  const previousDocument = globalThis.document;
+  const documentRef = initDocument();
+  globalThis.document = documentRef;
+  try {
+    const { sparkline } = await importAdminModule();
+    const chart = sparkline([
+      { at: "2026-08-21", value: 4 },
+      { at: "2026-08-22", value: 7 },
+      { at: "2026-08-23", value: 9 },
+    ], "Approved accounts", String);
+    assert.equal(chart.tabIndex, 0, "the chart has one keyboard focus target");
+    const [svg, tooltip] = chart.children;
+    svg.getBoundingClientRect = () => ({ left: 0, width: 120 });
+    chart.listeners.get("pointermove")({ clientX: 2 });
+    assert.match(tooltip.textContent, /Aug 21, 2026 · 4/u);
+    let prevented = false;
+    chart.listeners.get("keydown")({
+      key: "End",
+      preventDefault() { prevented = true; },
+    });
+    assert.equal(prevented, true);
+    assert.match(tooltip.textContent, /Aug 23, 2026 · 9/u);
+    chart.listeners.get("keydown")({ key: "ArrowLeft", preventDefault() {} });
+    assert.match(tooltip.textContent, /Aug 22, 2026 · 7/u);
+  } finally {
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+  }
+});
+
+test("alert migration, recurrence reset, blocked recovery, audit reset, and diagnostics classify", async () => {
+  const {
+    diagnosticReferenceKind,
+    nextAuditPaginationState,
+    notificationPermissionStatus,
+    notificationPreferencesAfterResolution,
+    projectNotificationPreferences,
+    resetNotificationRecurrence,
+  } = await importAdminModule();
+  const migrated = projectNotificationPreferences({
+    enabled: true,
+    repeatMinutes: 15,
+    lastFingerprint: "old",
+    lastSentAt: 123,
+  });
+  assert.deepEqual(migrated.topics, ["collection", "maintenance", "evidence", "failures"]);
+  assert.deepEqual(
+    resetNotificationRecurrence(migrated, { topics: ["failures"] }),
+    { ...migrated, topics: ["failures"], lastFingerprint: null, lastSentAt: null },
+  );
+  assert.deepEqual(
+    notificationPreferencesAfterResolution(migrated, []),
+    { ...migrated, lastFingerprint: null, lastSentAt: null },
+  );
+  assert.equal(
+    notificationPreferencesAfterResolution(migrated, [{ id: "still-open" }]),
+    migrated,
+  );
+  assert.match(notificationPermissionStatus({ supported: true, permission: "denied" }), /site settings/u);
+
+  const rows = [{ createdAt: "2026-08-23", action: "run_maintenance", outcome: "success" }];
+  const first = nextAuditPaginationState({ signature: null, page: 1 }, rows);
+  assert.equal(nextAuditPaginationState(first, rows).page, 1, "unchanged refresh preserves page");
+  assert.equal(nextAuditPaginationState(first, [...rows, { ...rows[0], createdAt: "2026-08-24" }]).page, 0);
+
+  assert.equal(diagnosticReferenceKind("TT-7QF3K2"), "local");
+  assert.equal(diagnosticReferenceKind("TT-ILLEGAL"), "invalid-local");
+  assert.equal(
+    diagnosticReferenceKind("0f2c7a11-4b93-4bb2-9a7c-1c0d2e3f4a5b"),
+    "retained",
+  );
+  assert.equal(diagnosticReferenceKind("019fc0b7-6c19-7b40-bda0-a1a1d7202100"), "invalid");
 });
 
 test("the growth loader wiring stays pinned to the metrics-history contract", async () => {
@@ -140,11 +275,34 @@ test("the growth loader wiring stays pinned to the metrics-history contract", as
   assert.match(source, /request\("\/api\/v1\/admin\/metrics\/history"\)/u);
   assert.match(
     source,
-    /GROWTH_SCHEMA_VERSION = "admin-metrics-history-v0\.1"/u,
+    /GROWTH_SCHEMA_VERSION = "admin-metrics-history-v0\.2"/u,
   );
   assert.match(
     source,
-    /async function loadGrowthHistory\(\) \{\n  if \(!isAdminPage\) return;/u,
+    /async function loadGrowthHistory\(loadGeneration\) \{\n  if \(!isAdminPage\) return;/u,
+  );
+  assert.match(
+    source,
+    /isCurrentLoadGeneration\(loadGeneration, state\.loadGeneration\)/u,
+  );
+  assert.match(
+    source,
+    /state\.metricsHistory = undefined;\n    render\(overview\);/u,
+    "a new overview cannot temporarily reuse the prior refresh's history",
+  );
+  assert.match(
+    source,
+    /lookupGeneration = \+\+state\.diagnosticLookupGeneration/u,
+    "diagnostic responses are generation-scoped",
+  );
+  assert.match(
+    source,
+    /lookupGeneration,\n\s+state\.diagnosticLookupGeneration,/u,
+  );
+  assert.match(
+    source,
+    /cloudflareHistoryUnavailable = !cloudflareAvailable[\s\S]*cloudflare\.sampled === true[\s\S]*cloudflare\.bounded === true/u,
+    "unavailable or approximate activity evidence cannot look exact",
   );
   // Every growth card label carries an operator tooltip: a label missing from
   // INFO_HINTS renders silently without one, so the coverage is pinned here.
