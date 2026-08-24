@@ -226,7 +226,10 @@ skip those attestation steps.
    and `sbom.attestation` bundle outputs beside the final subject.
 9. Generate and validate release-manifest.json and SHA256SUMS with
    scripts/generate-release-evidence.js.
-10. Create a draft GitHub release and upload only reviewed public assets.
+10. Finalize the release notes and changelog: add release, annotated-tag, and
+    exact comparison provenance; include only verified public credits and mark
+    related open issues as open. Then create a draft GitHub release and upload
+    only reviewed public assets.
 11. Copy every draft asset from the reviewed staging area into a fresh
     verification directory. Validate the manifest and SHA256SUMS and source
     identity there. For the attested v1 profile/path, also verify both
@@ -272,9 +275,13 @@ it as a content-addressed updater receipt in R2. Do not copy that receipt into
 general GitHub evidence or the website. Never publish credentials, signing
 logs, raw local paths, or whole staging directories.
 
-Create and upload a draft. Use a reviewed, existing notes file; keep the path
-quoted so shell metacharacters cannot turn a placeholder into input/output
-redirection:
+Create and upload a draft. Before staging it, run
+`node scripts/check-release-notes.mjs`; the package version, stable tags,
+checked-in `release-notes/X.Y.Z.md` files, dated linked `CHANGELOG.md` entries,
+and their release/tag/history provenance links must agree. Issue and PR links
+are context and credit, not closure evidence. Use the reviewed, existing notes
+file; keep the path quoted so shell metacharacters cannot turn a placeholder
+into input/output redirection:
 
 ~~~bash
 TAG="vX.Y.Z"
@@ -386,6 +393,12 @@ npm run release:evidence:validate -- \
   --artifacts-dir "$VERIFY_DIR" \
   --sha256sums "$VERIFY_DIR/SHA256SUMS"
 ~~~
+
+Before continuing, compare the public `publishedAt` date and body with the
+dated changelog entry and checked-in notes. A single conventional EOF newline
+may differ; substantive text may not. Open every release, tag, comparison,
+issue, and PR link added for this version, and keep related issues labelled
+open unless their public state is actually closed.
 
 Only now run the release-level checks:
 
