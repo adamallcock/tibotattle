@@ -881,7 +881,40 @@ test("native SQLite staging clones, rejects aliases, and publishes atomically", 
   };
   try {
     const rootIdentity = adapter.ensureDirectory(root);
-    const liveIdentity = adapter.createFile(join(root, liveName), bytes);
+    // Exercise the first-run publication boundary explicitly: there is no
+    // live target yet, so the native protected walk must return targetMissing
+    // and let the stage be renamed into place atomically.
+    const freshStageName = `${liveName}.building-fresh`;
+    const freshStageIdentity = adapter.createSqliteDatabase(
+      root,
+      rootIdentity,
+      freshStageName,
+    );
+    adapter.replaceFile(
+      join(root, freshStageName),
+      freshStageIdentity,
+      bytes,
+    );
+    const freshStageContentIdentity = adapter.inspectPath(
+      join(root, freshStageName),
+    ).identity;
+    const freshPublished = publishWithDiagnostic(() => adapter.publishSqliteDatabase(
+      root,
+      rootIdentity,
+      freshStageName,
+      freshStageContentIdentity,
+      liveName,
+      null,
+    ));
+    assert.equal(freshPublished.published, true);
+    const freshTargetPath = join(root, liveName);
+    assert.deepEqual(adapter.readFile(freshTargetPath).data, bytes);
+    assert.deepEqual(
+      freshPublished.identity,
+      adapter.inspectPath(freshTargetPath).identity,
+    );
+    const liveIdentity = adapter.inspectPath(freshTargetPath).identity;
+
     const cloned = adapter.cloneSqliteDatabase(
       root,
       rootIdentity,
