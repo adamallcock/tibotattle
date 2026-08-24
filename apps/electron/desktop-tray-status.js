@@ -3,11 +3,13 @@
  *
  * The native menu-bar implementation deliberately separates lifecycle phase
  * from evidence freshness.  This smaller cross-platform contract exposes the
- * five user-visible states the tray may claim and carries one primary
- * allowance summary only when the companion has supplied fresh, direct,
- * validated evidence.  It does not read the filesystem, inspect a renderer,
+ * five user-visible states the tray may claim and carries only the companion's
+ * closed, direct allowance windows when it has supplied fresh, validated
+ * evidence. It does not read the filesystem, inspect a renderer,
  * preserve raw errors, or infer a value from stale data.
  */
+
+import { projectDesktopShellNotificationEvidence } from "../../src/desktop-shell-status.js";
 
 export const DESKTOP_TRAY_STATUS_STATES = Object.freeze([
   "starting",
@@ -42,6 +44,7 @@ const ALLOWANCE_WINDOW_SET = new Set(DESKTOP_TRAY_ALLOWANCE_WINDOWS);
 const INITIAL_STATUS = Object.freeze({
   status: "starting",
   allowance: null,
+  notificationEvidence: null,
 });
 
 const DEFAULT_STATUS_LABELS = Object.freeze({
@@ -125,14 +128,30 @@ function cloneAllowance(allowance, { allowNull = true } = {}) {
   });
 }
 
-function statusSnapshot(status, allowance = null) {
+function cloneNotificationEvidence(value, { allowNull = true } = {}) {
+  if (value === null) {
+    if (allowNull) return null;
+    throw new TypeError("notification evidence is required");
+  }
+  const observedAt = Date.parse(value?.observedAt);
+  const projected = projectDesktopShellNotificationEvidence(value, {
+    now: observedAt,
+  });
+  if (projected === null) {
+    throw new TypeError("notification evidence lanes are invalid");
+  }
+  return projected;
+}
+
+function statusSnapshot(status, allowance = null, notificationEvidence = null) {
   assertStatus(status);
-  if (status !== "fresh" && allowance !== null) {
-    throw new TypeError("only fresh status may carry allowance evidence");
+  if (status !== "fresh" && (allowance !== null || notificationEvidence !== null)) {
+    throw new TypeError("only fresh status may carry evidence");
   }
   return Object.freeze({
     status,
     allowance: cloneAllowance(allowance),
+    notificationEvidence: cloneNotificationEvidence(notificationEvidence),
   });
 }
 
@@ -142,10 +161,10 @@ function statusSnapshot(status, allowance = null) {
  */
 export function validateDesktopTrayStatus(value) {
   assertPlainRecord(value, "tray status");
-  if (!hasExactKeys(value, ["status", "allowance"])) {
+  if (!hasExactKeys(value, ["status", "allowance", "notificationEvidence"])) {
     throw new TypeError("tray status has unexpected fields");
   }
-  return statusSnapshot(value.status, value.allowance);
+  return statusSnapshot(value.status, value.allowance, value.notificationEvidence);
 }
 
 /**
@@ -160,10 +179,10 @@ export function validateDesktopTrayAllowance(value) {
 /**
  * Reduce one bounded lifecycle/evidence event into the next tray state.
  *
- * Events use the same closed vocabulary as the output status.  A `fresh`
- * event may carry `allowance: null` when the companion is current but has no
- * eligible primary allowance window.  All other events reject any allowance
- * or error payload and clear a previously displayed summary.
+ * Events use the same closed vocabulary as the output status. A `fresh`
+ * event carries the already-validated notification evidence alongside its
+ * optional primary summary. All other events reject evidence and error
+ * payloads and clear every previously displayed numeric claim.
  */
 export function reduceDesktopTrayStatus(current, event) {
   const previous = validateDesktopTrayStatus(current);
@@ -181,10 +200,10 @@ export function reduceDesktopTrayStatus(current, event) {
       }
       return statusSnapshot(event.type);
     case "fresh":
-      if (!hasExactKeys(event, ["type", "allowance"])) {
+      if (!hasExactKeys(event, ["type", "allowance", "notificationEvidence"])) {
         throw new TypeError("fresh tray event has unexpected fields");
       }
-      return statusSnapshot("fresh", event.allowance);
+      return statusSnapshot("fresh", event.allowance, event.notificationEvidence);
     default:
       // Keep `previous` referenced so a debugger can inspect the validated
       // boundary without changing the fail-closed behavior.
@@ -204,6 +223,15 @@ function defaultLocalize(key, values = {}) {
   if (window !== undefined) {
     const percent = values.remainingPercent;
     return `${DEFAULT_ALLOWANCE_LABELS[window]}: ${percent}% remaining`;
+  }
+  if (key === "electron.tray.evidenceCurrent") {
+    return `Observed ${values.age} · verified current evidence`;
+  }
+  if (key === "electron.tray.windowFiveHour") {
+    return `Five-hour allowance: ${values.remainingPercent}% remaining · resets in ${values.reset}`;
+  }
+  if (key === "electron.tray.windowSevenDay") {
+    return `Seven-day allowance: ${values.elapsedPercent}% elapsed · ${values.usedPercent}% used · resets in ${values.reset}`;
   }
   throw new TypeError("tray localization key is invalid");
 }
@@ -226,10 +254,10 @@ function localizeText(localize, key, values, label) {
  */
 export function projectDesktopTrayStatus(value, options = {}) {
   assertPlainRecord(options, "projector options");
-  if (Reflect.ownKeys(options).some((key) => key !== "localize")) {
+  if (Reflect.ownKeys(options).some((key) => !["localize", "now"].includes(key))) {
     throw new TypeError("projector options have unexpected fields");
   }
-  const { localize = defaultLocalize } = options;
+  const { localize = defaultLocalize, now = Date.now() } = options;
   const status = validateDesktopTrayStatus(value);
   if (typeof localize !== "function") {
     throw new TypeError("localize must be a function");
@@ -255,10 +283,47 @@ export function projectDesktopTrayStatus(value, options = {}) {
       ),
     });
   }
+  const evidence = status.notificationEvidence;
+  const windows = evidence === null ? [] : evidence.windows.map((window) => {
+    const remainingPercent = Math.round(100 - window.usedPercent);
+    const resetMs = Math.max(0, Date.parse(window.resetAt) - now);
+    const resetMinutes = Math.ceil(resetMs / 60_000);
+    const resetText = resetMinutes >= 1_440
+      ? `${Math.floor(resetMinutes / 1_440)}d ${Math.floor((resetMinutes % 1_440) / 60)}h`
+      : resetMinutes >= 60
+        ? `${Math.floor(resetMinutes / 60)}h ${resetMinutes % 60}m`
+        : `${resetMinutes}m`;
+    const isWeekly = window.durationMinutes === 10_080;
+    const elapsedPercent = Math.max(0, Math.min(100, Math.round(
+      ((now - (Date.parse(window.resetAt) - window.durationMinutes * 60_000))
+        / (window.durationMinutes * 60_000)) * 100,
+    )));
+    const label = localizeText(
+      localize,
+      isWeekly ? "electron.tray.windowSevenDay" : "electron.tray.windowFiveHour",
+      isWeekly
+        ? { elapsedPercent, usedPercent: Math.round(window.usedPercent), reset: resetText }
+        : { remainingPercent, reset: resetText },
+      "quota window label",
+    );
+    return Object.freeze({ ...window, remainingPercent, label });
+  });
+  const primary = windows.find(({ lane }) => lane === "primary") ?? windows[0] ?? null;
+  const observedMinutes = evidence === null
+    ? null
+    : Math.max(0, Math.floor((now - Date.parse(evidence.observedAt)) / 60_000));
   return Object.freeze({
     status: status.status,
     label: statusLabel,
     allowance,
+    compactTitle: primary === null ? (status.status === "analyzing" ? "…" : "–") : `${primary.remainingPercent}%`,
+    evidenceLabel: evidence === null ? statusLabel : localizeText(
+      localize,
+      "electron.tray.evidenceCurrent",
+      { age: observedMinutes === 0 ? "just now" : `${observedMinutes} minute${observedMinutes === 1 ? "" : "s"} ago` },
+      "evidence label",
+    ),
+    windows: Object.freeze(windows),
   });
 }
 

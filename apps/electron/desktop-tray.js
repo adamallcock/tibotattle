@@ -1,10 +1,8 @@
 /**
  * Dependency-injected tray descriptors for the Electron shell.
  *
- * The status row is deliberately disabled and fixed: the tray module does
- * not infer dashboard freshness or quota state from renderer data.  A future
- * main-process status controller can replace this descriptor through an
- * explicitly reviewed integration.
+ * The information rows are derived only from the main process's closed status
+ * contract. The tray never infers freshness or quota state from renderer data.
  */
 
 import { isAbsolute, join } from "node:path";
@@ -21,6 +19,7 @@ import {
 const STATUS_PLACEHOLDER = "Status unavailable";
 const TRAY_ICON_RELATIVE_PATH = "apps/web/public/tibotattle-icon.png";
 const TRAY_ICON_SIZE = 16;
+const TRAY_TEMPLATE_WORK_SIZE = 32;
 
 function defaultSystemLocales() {
   try {
@@ -37,6 +36,7 @@ export function createDesktopTrayTemplate({
   statusLabel,
   locale = "system",
   systemLocales = defaultSystemLocales(),
+  now = Date.now(),
 } = {}) {
   if (typeof appName !== "string" || appName.trim().length === 0) {
     throw new TypeError("appName is required");
@@ -55,6 +55,7 @@ export function createDesktopTrayTemplate({
       validateDesktopTrayStatus(trayStatus),
       {
         localize: (key, values) => desktopText(key, values, textOptions),
+        now,
       },
     );
   } else if (statusLabel !== undefined) {
@@ -69,48 +70,56 @@ export function createDesktopTrayTemplate({
       status: "unavailable",
       label: statusLabel,
       allowance: null,
+      compactTitle: "–",
+      evidenceLabel: statusLabel,
+      windows: Object.freeze([]),
     });
   } else {
     // Preserve the previous default: an unconnected tray is unavailable
     // until a main-process status controller supplies a snapshot.
     projectedStatus = projectDesktopTrayStatus(
-      { status: "unavailable", allowance: null },
+      { status: "unavailable", allowance: null, notificationEvidence: null },
       {
         localize: (key, values) => desktopText(key, values, textOptions),
+        now,
       },
     );
   }
 
   const template = [
     {
-      label: desktopText("electron.tray.open", { appName }, textOptions),
-      click: boundedActions.show,
+      label: desktopText("electron.tray.allowanceTitle", {
+        appName,
+        allowance: projectedStatus.compactTitle,
+      }, textOptions),
+      enabled: false,
     },
     {
-      label: projectedStatus.label,
+      label: projectedStatus.evidenceLabel,
       enabled: false,
     },
   ];
-  if (projectedStatus.allowance !== null) {
+  for (const window of projectedStatus.windows ?? []) {
     template.push({
-      label: projectedStatus.allowance.label,
+      label: window.label,
       enabled: false,
     });
   }
   template.push(
     { type: "separator" },
     {
-      label: desktopText("electron.tray.refresh", {}, textOptions),
-      click: boundedActions.refresh,
+      label: desktopText("electron.tray.open", { appName }, textOptions),
+      click: boundedActions.show,
     },
     {
-      label: desktopText("electron.tray.retry", {}, textOptions),
-      click: boundedActions.retry,
+      label: desktopText("electron.tray.refresh", {}, textOptions),
+      click: boundedActions.refresh,
+      accelerator: "CmdOrCtrl+R",
     },
-    { type: "separator" },
     {
       label: desktopText("electron.tray.settings", {}, textOptions),
       click: boundedActions.settings,
+      accelerator: "CmdOrCtrl+,",
     },
     {
       label: desktopText("electron.tray.about", { appName }, textOptions),
@@ -120,8 +129,16 @@ export function createDesktopTrayTemplate({
     {
       label: desktopText("electron.tray.quit", {}, textOptions),
       click: boundedActions.quit,
+      accelerator: "CmdOrCtrl+Q",
     },
   );
+  if (["stale", "unavailable"].includes(projectedStatus.status)) {
+    const settingsIndex = template.findIndex((entry) => entry.accelerator === "CmdOrCtrl+,");
+    template.splice(settingsIndex, 0, {
+      label: desktopText("electron.tray.retry", {}, textOptions),
+      click: boundedActions.retry,
+    });
+  }
   return template;
 }
 
@@ -169,15 +186,51 @@ export function resolveDesktopTrayIcon({
 
   let resized;
   try {
+    const size = platform === "darwin" ? TRAY_TEMPLATE_WORK_SIZE : TRAY_ICON_SIZE;
     resized = source.resize({
-      width: TRAY_ICON_SIZE,
-      height: TRAY_ICON_SIZE,
+      width: size,
+      height: size,
       quality: "best",
     });
   } catch {
     return undefined;
   }
   if (!isNonEmptyNativeImage(resized)) return undefined;
+
+  if (platform === "darwin"
+      && typeof resized.toBitmap === "function"
+      && typeof nativeImage.createFromBitmap === "function") {
+    try {
+      const bitmap = Buffer.from(resized.toBitmap());
+      if (bitmap.length !== TRAY_TEMPLATE_WORK_SIZE * TRAY_TEMPLATE_WORK_SIZE * 4) {
+        return undefined;
+      }
+      for (let offset = 0; offset < bitmap.length; offset += 4) {
+        const blue = bitmap[offset];
+        const green = bitmap[offset + 1];
+        const red = bitmap[offset + 2];
+        const sourceAlpha = bitmap[offset + 3];
+        const brightness = Math.max(red, green, blue);
+        const markAlpha = Math.max(0, Math.min(255, (brightness - 130) * 4));
+        bitmap[offset] = 255;
+        bitmap[offset + 1] = 255;
+        bitmap[offset + 2] = 255;
+        bitmap[offset + 3] = Math.round((sourceAlpha * markAlpha) / 255);
+      }
+      const templateSource = nativeImage.createFromBitmap(bitmap, {
+        width: TRAY_TEMPLATE_WORK_SIZE,
+        height: TRAY_TEMPLATE_WORK_SIZE,
+        scaleFactor: 1,
+      });
+      resized = templateSource.resize({
+        width: TRAY_ICON_SIZE,
+        height: TRAY_ICON_SIZE,
+        quality: "best",
+      });
+    } catch {
+      return undefined;
+    }
+  }
 
   if (platform === "darwin" && typeof resized.setTemplateImage === "function") {
     try {
@@ -193,4 +246,5 @@ export {
   STATUS_PLACEHOLDER,
   TRAY_ICON_RELATIVE_PATH,
   TRAY_ICON_SIZE,
+  TRAY_TEMPLATE_WORK_SIZE,
 };

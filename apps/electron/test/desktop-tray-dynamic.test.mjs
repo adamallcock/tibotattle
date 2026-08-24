@@ -43,35 +43,59 @@ test("semantic tray states project fixed status copy in every supported locale",
       const template = createDesktopTrayTemplate({
         appName: "TiboTattle Dev",
         locale,
-        trayStatus: { status, allowance: null },
+        trayStatus: { status, allowance: null, notificationEvidence: null },
       });
+      const compact = status === "analyzing" ? "…" : "–";
+      const expectedTitle = locale === "en-US"
+        ? `TiboTattle Dev · ${compact} allowance`
+        : locale === "zh-Hans"
+          ? `TiboTattle Dev · 剩余 ${compact}`
+          : `TiboTattle Dev · ${compact} disponible`;
+      assert.equal(template[0].label, expectedTitle);
       assert.equal(template[1].label, expected);
       assert.equal(template[1].enabled, false);
-      assert.equal(template.filter((entry) => entry.enabled === false).length, 1);
-      assert.equal(template.some((entry) => entry.label?.includes("allowance")
+      assert.equal(template.filter((entry) => entry.enabled === false).length, 2);
+      assert.equal(template.some((entry, index) => index > 1 && (entry.label?.includes("allowance")
         || entry.label?.includes("配额")
-        || entry.label?.includes("Cuota")), false);
+        || entry.label?.includes("Cuota"))), false);
     }
   }
 });
-test("fresh direct evidence adds one disabled, rounded allowance row", () => {
+test("fresh direct evidence projects compact title, evidence age, and quota lanes", () => {
+  const notificationEvidence = {
+    schemaVersion: "tibotattle-notification-evidence-v2",
+    status: "fresh_provider_observation",
+    provider: "openai_codex",
+    source: "app_server_read",
+    freshness: "fresh",
+    observedAt: "2026-08-22T12:00:00.000Z",
+    continuityKey: "a".repeat(43),
+    windows: [{
+      lane: "primary",
+      usedPercent: 26.4,
+      durationMinutes: 300,
+      resetAt: "2026-08-22T15:00:00.000Z",
+      resetProofKind: "provider_reported_schedule_only",
+    }],
+  };
   const fiveHour = createDesktopTrayTemplate({
     appName: "TiboTattle Dev",
     locale: "en-US",
     trayStatus: {
       status: "fresh",
       allowance: { source: "direct", window: "five_hour", remainingPercent: 73.6 },
+      notificationEvidence,
     },
+    now: Date.parse("2026-08-22T12:04:00.000Z"),
   });
-  assert.equal(fiveHour[1].label, "Fresh");
-  assert.equal(fiveHour[1].enabled, false);
-  assert.equal(fiveHour[2].label, "Five-hour allowance: 74% remaining");
+  assert.equal(fiveHour[0].label, "TiboTattle Dev · 74% allowance");
+  assert.equal(fiveHour[1].label, "Observed 4 minutes ago · verified current evidence");
+  assert.equal(fiveHour[2].label, "Five-hour allowance: 74% remaining · resets in 2h 56m");
   assert.equal(fiveHour[2].enabled, false);
   assert.deepEqual(fiveHour.slice(3).map((entry) => entry.type === "separator" ? entry.type : entry.label), [
     "separator",
+    "Open TiboTattle Dev",
     "Refresh Usage",
-    "Retry",
-    "separator",
     "Settings…",
     "About TiboTattle Dev",
     "separator",
@@ -84,9 +108,15 @@ test("fresh direct evidence adds one disabled, rounded allowance row", () => {
     trayStatus: {
       status: "fresh",
       allowance: { source: "direct", window: "seven_day", remainingPercent: 12.4 },
+      notificationEvidence: {
+        ...notificationEvidence,
+        windows: [{ ...notificationEvidence.windows[0], durationMinutes: 10_080, usedPercent: 87.6, resetAt: "2026-08-25T12:00:00.000Z" }],
+      },
     },
+    now: Date.parse("2026-08-22T12:00:00.000Z"),
   });
-  assert.equal(sevenDay[2].label, "七天配额：剩余 12%");
+  assert.equal(sevenDay[0].label, "TiboTattle Dev · 剩余 12%");
+  assert.equal(sevenDay[2].label, "七天配额：已过 57% · 已用 88% · 3d 0h 后重置");
 });
 
 test("allowance evidence never leaks into non-fresh tray states", () => {
@@ -96,6 +126,7 @@ test("allowance evidence never leaks into non-fresh tray states", () => {
         trayStatus: {
           status,
           allowance: { source: "direct", window: "five_hour", remainingPercent: 80 },
+          notificationEvidence: null,
         },
       }),
       TypeError,
@@ -107,15 +138,15 @@ test("tray status rejects arbitrary fields and renderer-shaped labels", () => {
   for (const trayStatus of [
     null,
     { status: "fresh" },
-    { status: "fresh", allowance: null, path: "/private/secret" },
-    { status: "fresh", allowance: null, error: "raw" },
-    { status: "unknown", allowance: null },
+    { status: "fresh", allowance: null, notificationEvidence: null, path: "/private/secret" },
+    { status: "fresh", allowance: null, notificationEvidence: null, error: "raw" },
+    { status: "unknown", allowance: null, notificationEvidence: null },
     { status: "fresh", allowance: {
       source: "direct",
       window: "five_hour",
       remainingPercent: 73,
       identity: "account",
-    } },
+    }, notificationEvidence: null },
   ]) {
     assert.throws(
       () => createDesktopTrayTemplate({ trayStatus }),
@@ -124,7 +155,7 @@ test("tray status rejects arbitrary fields and renderer-shaped labels", () => {
   }
   assert.throws(
     () => createDesktopTrayTemplate({
-      trayStatus: { status: "fresh", allowance: null },
+      trayStatus: { status: "fresh", allowance: null, notificationEvidence: null },
       statusLabel: "arbitrary renderer label",
     }),
     TypeError,
@@ -139,12 +170,12 @@ test("default and legacy label callers remain bounded and preserve action identi
   });
   assert.equal(defaultTemplate[1].label, STATUS_PLACEHOLDER);
   assert.deepEqual(menuLabels(defaultTemplate), [
-    "Open TiboTattle Dev",
+    "TiboTattle Dev · – allowance",
     STATUS_PLACEHOLDER,
     "separator",
+    "Open TiboTattle Dev",
     "Refresh Usage",
     "Retry",
-    "separator",
     "Settings…",
     "About TiboTattle Dev",
     "separator",

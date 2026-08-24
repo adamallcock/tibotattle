@@ -181,7 +181,9 @@ export function createDesktopLifecycle({
 
   function sameTrayStatus(left, right) {
     return left.status === right.status
-      && sameAllowance(left.allowance, right.allowance);
+      && sameAllowance(left.allowance, right.allowance)
+      && left.notificationEvidence?.continuityKey === right.notificationEvidence?.continuityKey
+      && left.notificationEvidence?.observedAt === right.notificationEvidence?.observedAt;
   }
 
   function dispatchDesktopTrayEvent(event) {
@@ -204,7 +206,11 @@ export function createDesktopLifecycle({
     try {
       validated = validateDesktopShellStatus(status);
       const event = validated.state === "fresh"
-        ? { type: "fresh", allowance: validated.allowance }
+        ? {
+          type: "fresh",
+          allowance: validated.allowance,
+          notificationEvidence: validated.notificationEvidence,
+        }
         : { type: validated.state };
       dispatchDesktopTrayEvent(event);
     } catch {
@@ -874,6 +880,8 @@ export function createDesktopLifecycle({
     });
     const menu = Menu?.buildFromTemplate?.(template);
     tray.setContextMenu?.(menu);
+    const projected = desktopTrayStatusReducer.project();
+    tray.setTitle?.(platform === "darwin" ? projected.compactTitle : "");
     tray.on?.("click", () => invokeTrayCommand("toggle"));
     return tray;
   }
@@ -911,6 +919,8 @@ export function createDesktopLifecycle({
         systemLocales: desktopSystemLocales,
       });
       tray.setContextMenu?.(Menu.buildFromTemplate(template));
+      const projected = desktopTrayStatusReducer.project();
+      tray.setTitle?.(platform === "darwin" ? projected.compactTitle : "");
     }
   }
 

@@ -1413,7 +1413,7 @@ test("desktop lifecycle composes secure window, tray, single instance, retry, an
   ));
   const firstDashboard = dashboard();
   assert.equal(trays.length, 1);
-  assert.equal(trays[0].menu.template.some((item) => item.label === "Retry"), true);
+  assert.equal(trays[0].menu.template.some((item) => item.label === "Retry"), false);
   assert.equal(firstDashboard.options.webPreferences.nodeIntegration, false);
   assert.equal(firstDashboard.options.webPreferences.contextIsolation, true);
   assert.equal(firstDashboard.options.webPreferences.sandbox, true);

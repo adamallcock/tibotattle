@@ -407,7 +407,7 @@ test("runtime applies the persisted desktop language to the initial tray menu", 
     }),
   });
   const tray = FakeTray.instances.at(-1);
-  assert.equal(tray.menu.template[0].label, "打开 TiboTattle");
+  assert.equal(tray.menu.template.find((item) => item.label === "打开 TiboTattle")?.label, "打开 TiboTattle");
   await fixture.desktop.lifecycle.dispose();
 });
 

@@ -18,6 +18,7 @@ import {
 const freshWithoutAllowance = Object.freeze({
   status: "fresh",
   allowance: null,
+  notificationEvidence: null,
 });
 const directAllowance = Object.freeze({
   source: "direct",
@@ -42,6 +43,7 @@ test("tray status exposes only the fixed states and bounded allowance windows", 
   assert.deepEqual(DESKTOP_TRAY_INITIAL_STATUS, {
     status: "starting",
     allowance: null,
+    notificationEvidence: null,
   });
   assert.equal(Object.isFrozen(DESKTOP_TRAY_INITIAL_STATUS), true);
 });
@@ -49,23 +51,25 @@ test("tray status exposes only the fixed states and bounded allowance windows", 
 test("reducer transitions clear evidence until fresh direct evidence returns", () => {
   let state = DESKTOP_TRAY_INITIAL_STATUS;
   state = reduceDesktopTrayStatus(state, { type: "analyzing" });
-  assert.deepEqual(state, { status: "analyzing", allowance: null });
+  assert.deepEqual(state, { status: "analyzing", allowance: null, notificationEvidence: null });
   state = reduceDesktopTrayStatus(state, {
     type: "fresh",
     allowance: directAllowance,
+    notificationEvidence: null,
   });
   assert.deepEqual(state, {
     status: "fresh",
     allowance: directAllowance,
+    notificationEvidence: null,
   });
   state = reduceDesktopTrayStatus(state, { type: "stale" });
-  assert.deepEqual(state, { status: "stale", allowance: null });
+  assert.deepEqual(state, { status: "stale", allowance: null, notificationEvidence: null });
   state = reduceDesktopTrayStatus(state, { type: "analyzing" });
-  assert.deepEqual(state, { status: "analyzing", allowance: null });
+  assert.deepEqual(state, { status: "analyzing", allowance: null, notificationEvidence: null });
   state = reduceDesktopTrayStatus(state, { type: "unavailable" });
-  assert.deepEqual(state, { status: "unavailable", allowance: null });
+  assert.deepEqual(state, { status: "unavailable", allowance: null, notificationEvidence: null });
   state = reduceDesktopTrayStatus(state, { type: "starting" });
-  assert.deepEqual(state, { status: "starting", allowance: null });
+  assert.deepEqual(state, { status: "starting", allowance: null, notificationEvidence: null });
   assert.equal(Object.isFrozen(state), true);
   assert.equal(Object.isFrozen(state.allowance), true);
 });
@@ -73,7 +77,7 @@ test("reducer transitions clear evidence until fresh direct evidence returns", (
 test("fresh status may be current without a primary allowance summary", () => {
   const state = reduceDesktopTrayStatus(
     DESKTOP_TRAY_INITIAL_STATUS,
-    { type: "fresh", allowance: null },
+    { type: "fresh", allowance: null, notificationEvidence: null },
   );
   assert.deepEqual(state, freshWithoutAllowance);
   assert.deepEqual(validateDesktopTrayStatus(state), freshWithoutAllowance);
@@ -123,10 +127,10 @@ test("stale and unavailable events reject summaries, paths, identifiers, and err
     );
   }
   const stale = reduceDesktopTrayStatus(
-    { status: "fresh", allowance: directAllowance },
+    { status: "fresh", allowance: directAllowance, notificationEvidence: null },
     { type: "stale" },
   );
-  assert.deepEqual(stale, { status: "stale", allowance: null });
+  assert.deepEqual(stale, { status: "stale", allowance: null, notificationEvidence: null });
 });
 
 test("state and event contracts reject arbitrary or extra fields", () => {
@@ -134,11 +138,11 @@ test("state and event contracts reject arbitrary or extra fields", () => {
     null,
     [],
     { status: "fresh" },
-    { status: "fresh", allowance: null, path: "/tmp" },
-    { status: "fresh", allowance: directAllowance, error: "raw" },
-    { status: "stale", allowance: directAllowance },
-    { status: "unknown", allowance: null },
-    Object.assign(Object.create(null), { status: "starting", allowance: null }),
+    { status: "fresh", allowance: null, notificationEvidence: null, path: "/tmp" },
+    { status: "fresh", allowance: directAllowance, notificationEvidence: null, error: "raw" },
+    { status: "stale", allowance: directAllowance, notificationEvidence: null },
+    { status: "unknown", allowance: null, notificationEvidence: null },
+    Object.assign(Object.create(null), { status: "starting", allowance: null, notificationEvidence: null }),
   ]) {
     assert.throws(() => validateDesktopTrayStatus(value), TypeError);
   }
@@ -147,8 +151,8 @@ test("state and event contracts reject arbitrary or extra fields", () => {
     [],
     { type: "unknown" },
     { type: "fresh" },
-    { type: "fresh", allowance: null, extra: true },
-    { type: "fresh", allowance: { source: "direct", window: "five_hour", remainingPercent: 1, path: "/tmp" } },
+    { type: "fresh", allowance: null, notificationEvidence: null, extra: true },
+    { type: "fresh", allowance: { source: "direct", window: "five_hour", remainingPercent: 1, path: "/tmp" }, notificationEvidence: null },
     { type: "stale", note: "arbitrary" },
   ]) {
     assert.throws(
@@ -161,7 +165,7 @@ test("state and event contracts reject arbitrary or extra fields", () => {
 test("projector supplies a localization seam without exposing raw input fields", () => {
   const calls = [];
   const projected = projectDesktopTrayStatus(
-    { status: "fresh", allowance: directAllowance },
+    { status: "fresh", allowance: directAllowance, notificationEvidence: null },
     {
       localize(key, values) {
         calls.push({ key, values });
@@ -181,6 +185,9 @@ test("projector supplies a localization seam without exposing raw input fields",
       remainingPercent: 73,
       label: "5H 73%",
     },
+    compactTitle: "–",
+    evidenceLabel: "FRESH",
+    windows: [],
   });
   assert.deepEqual(calls, [
     {
@@ -195,8 +202,8 @@ test("projector supplies a localization seam without exposing raw input fields",
   assert.equal(Object.isFrozen(projected), true);
   assert.equal(Object.isFrozen(projected.allowance), true);
   assert.deepEqual(
-    projectDesktopTrayStatus({ status: "stale", allowance: null }),
-    { status: "stale", label: "Stale", allowance: null },
+    projectDesktopTrayStatus({ status: "stale", allowance: null, notificationEvidence: null }),
+    { status: "stale", label: "Stale", allowance: null, compactTitle: "–", evidenceLabel: "Stale", windows: [] },
   );
 });
 
@@ -229,7 +236,7 @@ test("stateful reducer serializes transitions and can reset to starting", () => 
   const reducer = createDesktopTrayStatusReducer();
   assert.deepEqual(reducer.state, DESKTOP_TRAY_INITIAL_STATUS);
   reducer.dispatch({ type: "analyzing" });
-  reducer.dispatch({ type: "fresh", allowance: directAllowance });
+  reducer.dispatch({ type: "fresh", allowance: directAllowance, notificationEvidence: null });
   assert.equal(reducer.state.status, "fresh");
   assert.equal(reducer.project().allowance.remainingPercent, 73);
   assert.deepEqual(reducer.reset(), DESKTOP_TRAY_INITIAL_STATUS);

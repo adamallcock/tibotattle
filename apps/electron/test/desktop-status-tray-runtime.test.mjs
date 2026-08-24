@@ -73,10 +73,12 @@ class FakeTray extends EventEmitter {
   constructor() {
     super();
     this.menu = null;
+    this.titles = [];
   }
 
   setToolTip() {}
   setContextMenu(menu) { this.menu = menu; }
+  setTitle(value) { this.titles.push(value); }
   destroy() {}
 }
 
@@ -157,16 +159,17 @@ test("lifecycle projects monitor status into a dynamic localized tray and observ
   await fixtureValue.lifecycle.start();
   const tray = fixtureValue.trays[0];
   assert.equal(tray.menu.template[1].label, "Starting");
-  await waitFor(() => tray.menu.template[1].label === "Fresh");
+  await waitFor(() => tray.menu.template[0].label === "TiboTattle · 74% allowance");
   assert.equal(requested[0], "http://127.0.0.1:4801/api/local/desktop-status");
-  assert.equal(tray.menu.template[1].label, "Fresh");
-  assert.equal(tray.menu.template[2].label, "Five-hour allowance: 74% remaining");
+  assert.equal(tray.menu.template[0].label, "TiboTattle · 74% allowance");
+  assert.match(tray.menu.template[1].label, /^Observed /u);
+  assert.match(tray.menu.template[2].label, /^Five-hour allowance: 74% remaining/u);
+  assert.equal(tray.titles.at(-1), "74%");
   assert.deepEqual(observed.map((value) => value.state), ["starting", "fresh"]);
   assert.equal(JSON.stringify(observed).includes("/private"), false);
 
   assert.equal(fixtureValue.lifecycle.setDesktopLanguage("zh-Hans"), true);
-  assert.equal(tray.menu.template[1].label, "最新");
-  assert.equal(tray.menu.template[2].label, "五小时配额：剩余 74%");
+  assert.equal(tray.menu.template[0].label, "TiboTattle · 剩余 74%");
   await fixtureValue.lifecycle.dispose();
 });
 
@@ -180,8 +183,7 @@ test("lifecycle stops status polling at recovery and restarts it for bounded ret
     },
   });
   await fixtureValue.lifecycle.start();
-  await waitFor(() => fixtureValue.trays[0].menu.template[1].label === "Fresh");
-  assert.equal(fixtureValue.trays[0].menu.template[1].label, "Fresh");
+  await waitFor(() => fixtureValue.trays[0].menu.template[0].label === "TiboTattle · 74% allowance");
 
   fixtureValue.supervisor.exitHandler({ kind: "companion_exit" });
   assert.equal(fixtureValue.trays[0].menu.template[1].label, "Status unavailable");

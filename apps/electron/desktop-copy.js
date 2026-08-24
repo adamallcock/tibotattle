@@ -416,6 +416,26 @@ const DESKTOP_MESSAGES = Object.freeze({
     "zh-Hans": "打开 {appName}",
     es: "Abrir {appName}",
   }),
+  "electron.tray.allowanceTitle": Object.freeze({
+    "en-US": "{appName} · {allowance} allowance",
+    "zh-Hans": "{appName} · 剩余 {allowance}",
+    es: "{appName} · {allowance} disponible",
+  }),
+  "electron.tray.evidenceCurrent": Object.freeze({
+    "en-US": "Observed {age} · verified current evidence",
+    "zh-Hans": "{age}前观测 · 当前证据已验证",
+    es: "Observado hace {age} · evidencia actual verificada",
+  }),
+  "electron.tray.windowFiveHour": Object.freeze({
+    "en-US": "Five-hour allowance: {remainingPercent}% remaining · resets in {reset}",
+    "zh-Hans": "五小时配额：剩余 {remainingPercent}% · {reset} 后重置",
+    es: "Cuota de cinco horas: queda {remainingPercent}% · se reinicia en {reset}",
+  }),
+  "electron.tray.windowSevenDay": Object.freeze({
+    "en-US": "Seven-day allowance: {elapsedPercent}% elapsed · {usedPercent}% used · resets in {reset}",
+    "zh-Hans": "七天配额：已过 {elapsedPercent}% · 已用 {usedPercent}% · {reset} 后重置",
+    es: "Cuota de siete días: {elapsedPercent}% transcurrido · {usedPercent}% usado · se reinicia en {reset}",
+  }),
   "electron.tray.statusStarting": Object.freeze({
     "en-US": "Starting",
     "zh-Hans": "正在启动",

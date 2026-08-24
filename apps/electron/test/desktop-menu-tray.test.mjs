@@ -145,7 +145,7 @@ test("desktop menu and tray copy resolves every supported language", () => {
     const view = menu.find(({ label }) => label === (locale === "en-US" ? "View" : locale === "zh-Hans" ? "视图" : "Ver"));
     assert.equal(view.submenu[0].label, copy.refresh);
     const tray = createDesktopTrayTemplate({ appName: "TiboTattle Dev", locale });
-    assert.equal(tray[0].label, copy.tray);
+    assert.equal(tray.find((entry) => entry.label === copy.tray)?.label, copy.tray);
     assert.equal(tray[1].label, copy.status);
   }
 });
@@ -175,12 +175,12 @@ test("tray menu exposes truthful status and shared action callbacks", () => {
     actions,
   });
   assert.deepEqual(template.map(({ label, type }) => type === "separator" ? type : label), [
-    "Open TiboTattle Dev",
+    "TiboTattle Dev · – allowance",
     STATUS_PLACEHOLDER,
     "separator",
+    "Open TiboTattle Dev",
     "Refresh Usage",
     "Retry",
-    "separator",
     "Settings…",
     "About TiboTattle Dev",
     "separator",
@@ -194,6 +194,9 @@ test("tray menu exposes truthful status and shared action callbacks", () => {
   item(template, "About TiboTattle Dev").click();
   item(template, "Quit").click();
   assert.deepEqual(calls, ["show", "refresh", "retry", "settings", "about", "quit"]);
+  assert.equal(item(template, "Refresh Usage").accelerator, "CmdOrCtrl+R");
+  assert.equal(item(template, "Settings…").accelerator, "CmdOrCtrl+,");
+  assert.equal(item(template, "Quit").accelerator, "CmdOrCtrl+Q");
 });
 
 function nativeImageFixture({
@@ -243,11 +246,55 @@ test("tray icon resolution loads the fixed packaged asset and sizes it for macOS
     join("/trusted/app.asar", TRAY_ICON_RELATIVE_PATH),
   ]);
   assert.deepEqual(fixture.calls.resize, [{
-    width: TRAY_ICON_SIZE,
-    height: TRAY_ICON_SIZE,
+    width: 32,
+    height: 32,
     quality: "best",
   }]);
   assert.deepEqual(fixture.calls.template, [true]);
+});
+
+test("macOS tray icon removes the app plate and keeps only a template mark", () => {
+  const bitmap = Buffer.alloc(32 * 32 * 4);
+  // One bright app-mark pixel and one dark plate pixel in BGRA order.
+  bitmap.set([240, 245, 250, 255], 0);
+  bitmap.set([40, 70, 35, 255], 4);
+  const calls = { templateBitmap: null, template: [] };
+  const finalImage = {
+    isEmpty: () => false,
+    setTemplateImage: (value) => calls.template.push(value),
+  };
+  const templateSource = {
+    resize: () => finalImage,
+  };
+  const workingImage = {
+    isEmpty: () => false,
+    toBitmap: () => bitmap,
+    setTemplateImage() {},
+  };
+  const source = {
+    isEmpty: () => false,
+    resize: () => workingImage,
+  };
+  const result = resolveDesktopTrayIcon({
+    nativeImage: {
+      createFromPath: () => source,
+      createFromBitmap: (value, options) => {
+        calls.templateBitmap = { value: Buffer.from(value), options };
+        return templateSource;
+      },
+    },
+    resourceRoot: "/trusted/app",
+    platform: "darwin",
+  });
+  assert.equal(result, finalImage);
+  assert.equal(calls.templateBitmap.value[3], 255);
+  assert.equal(calls.templateBitmap.value[7], 0);
+  assert.deepEqual(calls.templateBitmap.options, {
+    width: 32,
+    height: 32,
+    scaleFactor: 1,
+  });
+  assert.deepEqual(calls.template, [true]);
 });
 
 test("Windows tray icon resolution uses the same fixed asset without template mode", () => {
