@@ -2258,6 +2258,7 @@ test("a same-parser shrink removes stale usage and boundary rows before rescan",
   });
   try {
     const first = await ingest();
+    assert.equal(first.unchanged, false);
     assert.equal(first.insertedUsageEvents, 3);
     assert.equal(first.insertedBoundaryLinks, 3);
 
