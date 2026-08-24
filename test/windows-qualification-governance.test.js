@@ -428,7 +428,15 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(normalizedRuntimeSummary, /- Status: \$\(\$Evidence\.status\)/u);
   assert.match(normalizedRuntimeSummary, /- Failure stage: \$\(\$Evidence\.failureStage\)/u);
   assert.match(normalizedRuntimeSummary, /- Failure reason: \$\(\$Evidence\.failureReason\)/u);
-  assert.doesNotMatch(normalizedRuntimeSummary, /Target|Dashboard|path|command|process|stdout|stderr/iu);
+  assert.match(
+    normalizedRuntimeSummary,
+    /- Dashboard checkpoint: \$\(\$Evidence\.dashboardCheckpoint\)/u,
+  );
+  const summaryWithoutCheckpoint = normalizedRuntimeSummary.replace(
+    /\s*"- Dashboard checkpoint: \$\(\$Evidence\.dashboardCheckpoint\)" >> \$env:GITHUB_STEP_SUMMARY/u,
+    "",
+  );
+  assert.doesNotMatch(summaryWithoutCheckpoint, /Target|Dashboard|path|command|process|stdout|stderr/iu);
   assert.match(
     runtimeStepBody,
     /Write-NormalizedRuntimeSummary -Evidence \$defaultRuntimeEvidence\s+Remove-VerifiedRuntimeTransientOutput/u,
@@ -1770,6 +1778,7 @@ function windowsReceiptFixture({
       contentFree: true,
       credentialPersistence: true,
       dashboardReady: true,
+      dashboardCheckpoint: "dashboard_ready",
       failureReason: "none",
       failureStage: "none",
       noOrphan: true,
@@ -1891,6 +1900,24 @@ test("Windows Electron qualification receipt rejects incomplete or mismatched ev
     }),
     (error) => error.code === WINDOWS_RECEIPT_STATUS.runtimeInvalid,
   );
+  for (const dashboardCheckpoint of [
+    "not_started",
+    "target_poll_recovery_only",
+    "renderer_not_ready",
+    "unexpected",
+  ]) {
+    assert.throws(
+      () => buildWindowsElectronQualificationReceipt({
+        ...fixture,
+        runtimeEvidence: {
+          ...fixture.runtimeEvidence,
+          dashboardCheckpoint,
+        },
+      }),
+      (error) => error.code === WINDOWS_RECEIPT_STATUS.runtimeInvalid,
+      `canonical receipts must require dashboard_ready, got ${dashboardCheckpoint}`,
+    );
+  }
   assert.throws(
     () => buildWindowsElectronQualificationReceipt({
       ...fixture,

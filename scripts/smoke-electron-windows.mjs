@@ -301,6 +301,7 @@ const SMOKE_PROTOCOL_CODES = new Set([
   "WINDOWS_ELECTRON_SMOKE_CREDENTIAL_CONTROL_UNAVAILABLE",
   "WINDOWS_ELECTRON_SMOKE_PROCESS_TABLE_INVALID",
   "WINDOWS_ELECTRON_SMOKE_REFRESH_BOUNDARY_INVALID",
+  "WINDOWS_ELECTRON_SMOKE_CDP_ATTACH_FAILED",
 ]);
 const SMOKE_PHASE_STAGE = Object.freeze({
   artifact: "artifact",
@@ -324,6 +325,33 @@ export const WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES = Object.freeze(
   failed: "WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_FAILED",
   cancelled: "WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_CANCELLED",
 });
+
+// Dashboard connection progress is deliberately a closed vocabulary.  It is
+// retained in the failed aggregate so a blocked runtime can distinguish the
+// recovery page from a dashboard target without exposing a URL, port, title,
+// path, log, or renderer content.  `not_started` covers artifact/launch and
+// unsupported boundaries where no dashboard probe was attempted.
+export const WINDOWS_ELECTRON_SMOKE_DASHBOARD_CHECKPOINT_ALLOWLIST = Object.freeze([
+  "not_started",
+  "debug_endpoint_ready",
+  "target_poll_no_page",
+  "target_poll_recovery_only",
+  "target_poll_dashboard_candidate",
+  "cdp_attach_failed",
+  "frame_unavailable",
+  "renderer_not_ready",
+  "dashboard_ready",
+]);
+
+const DASHBOARD_CHECKPOINT_SET = new Set(
+  WINDOWS_ELECTRON_SMOKE_DASHBOARD_CHECKPOINT_ALLOWLIST,
+);
+
+export function normalizeWindowsDashboardCheckpoint(value) {
+  return typeof value === "string" && DASHBOARD_CHECKPOINT_SET.has(value)
+    ? value
+    : "not_started";
+}
 
 /**
  * Classify one renderer startup-refresh observation without consulting the
@@ -427,6 +455,7 @@ export function aggregate(status, values = {}) {
     contentFree: true,
     ...diagnostic,
     ...Object.fromEntries(RESULT_KEYS.map((key) => [key, values[key] === true])),
+    dashboardCheckpoint: normalizeWindowsDashboardCheckpoint(values.dashboardCheckpoint),
   });
 }
 
@@ -1540,6 +1569,33 @@ export function selectWindowsDashboardTarget(targets, debugPort) {
   return targets.find((target) => isWindowsDashboardTarget(target, debugPort));
 }
 
+/**
+ * The pre-companion recovery window is the only non-dashboard page that may
+ * be classified as recovery-only.  Its source is a fixed data-document
+ * surface from recovery-window.js; the encoded document body is never read
+ * or returned at this boundary.
+ */
+export function isWindowsRecoveryTarget(target) {
+  return target !== null
+    && typeof target === "object"
+    && !Array.isArray(target)
+    && target.type === "page"
+    && typeof target.url === "string"
+    && target.url.startsWith("data:text/html;charset=utf-8,");
+}
+
+export function classifyWindowsDashboardTargetPoll(targets, debugPort) {
+  if (selectWindowsDashboardTarget(targets, debugPort) !== undefined) {
+    return "target_poll_dashboard_candidate";
+  }
+  const pageTargets = Array.isArray(targets)
+    ? targets.filter((candidate) => candidate?.type === "page")
+    : [];
+  return pageTargets.length > 0 && pageTargets.every(isWindowsRecoveryTarget)
+    ? "target_poll_recovery_only"
+    : "target_poll_no_page";
+}
+
 async function mainFrameLoaderId(cdp) {
   const tree = await cdp.request("Page.getFrameTree");
   const loaderId = tree?.frameTree?.frame?.loaderId;
@@ -1720,7 +1776,11 @@ async function assertAutomaticStartupRefresh({
   return refreshId;
 }
 
-async function dashboardConnection(child, port) {
+async function dashboardConnection(child, port, onCheckpoint = () => {}) {
+  const checkpoint = (value) => {
+    const normalized = normalizeWindowsDashboardCheckpoint(value);
+    if (normalized !== "not_started") onCheckpoint(normalized);
+  };
   const version = await waitFor(
     () => {
       if (childExited(child)) fail("WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_READY");
@@ -1734,6 +1794,7 @@ async function dashboardConnection(child, port) {
     "Electron debugging endpoint",
     "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT",
   );
+  checkpoint("debug_endpoint_ready");
   const target = await waitFor(async () => {
     if (childExited(child)) fail("WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_READY");
     const targets = await jsonFetch(
@@ -1741,34 +1802,83 @@ async function dashboardConnection(child, port) {
       undefined,
       "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT",
     );
-    return selectWindowsDashboardTarget(targets, port);
+    const selected = selectWindowsDashboardTarget(targets, port);
+    checkpoint(classifyWindowsDashboardTargetPoll(targets, port));
+    if (selected !== undefined) {
+      return selected;
+    }
+    return undefined;
   }, MAX_STARTUP_MS, "Electron dashboard target", "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT");
-  const cdp = await connectCdp(target);
+  let cdp;
+  try {
+    cdp = await connectCdp(target);
+  } catch {
+    checkpoint("cdp_attach_failed");
+    fail("WINDOWS_ELECTRON_SMOKE_CDP_ATTACH_FAILED");
+  }
   const refreshObserver = observeLocalRefreshRequests(cdp);
   // Enable both domains immediately after attaching. The renderer's startup
   // pass is launched by the dashboard bootstrap, so delaying these domains
   // until after readiness can miss the only POST we are qualifying.
-  await cdp.request("Page.enable");
-  await cdp.request("Network.enable");
-  selectRequiredRefreshLoader(refreshObserver, await waitFor(
-    () => mainFrameLoaderId(cdp),
+  try {
+    await cdp.request("Page.enable");
+    await cdp.request("Network.enable");
+  } catch (error) {
+    checkpoint("frame_unavailable");
+    throw error;
+  }
+  const initialLoader = await waitFor(
+    async () => {
+      if (childExited(child)) {
+        checkpoint("frame_unavailable");
+        fail("WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_READY");
+      }
+      try {
+        const loaderId = await mainFrameLoaderId(cdp);
+        if (loaderId === null) checkpoint("frame_unavailable");
+        return loaderId;
+      } catch {
+        checkpoint("frame_unavailable");
+        return null;
+      }
+    },
     MAX_STARTUP_MS,
     "Electron dashboard frame",
     "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT",
-  ));
+  );
+  selectRequiredRefreshLoader(refreshObserver, initialLoader);
   const ready = await waitFor(async () => {
-    if (childExited(child)) fail("WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_READY");
-    const snapshot = await cdp.evaluate(`(() => ({
-      ready: document.documentElement?.dataset?.localDashboardReady === "true",
-      title: document.title,
-      heading: document.querySelector("#overview-title")?.textContent?.trim() ?? "",
-      location: location.href,
-    }))()`);
-    return snapshot.ready && snapshot.title === "TiboTattle" && snapshot.heading
-      ? snapshot
-      : null;
+    if (childExited(child)) {
+      checkpoint("renderer_not_ready");
+      fail("WINDOWS_ELECTRON_SMOKE_EXITED_BEFORE_READY");
+    }
+    try {
+      const snapshot = await cdp.evaluate(`(() => ({
+        ready: document.documentElement?.dataset?.localDashboardReady === "true",
+        title: document.title,
+        heading: document.querySelector("#overview-title")?.textContent?.trim() ?? "",
+        location: location.href,
+      }))()`);
+      if (snapshot.ready && snapshot.title === "TiboTattle" && snapshot.heading) {
+        checkpoint("dashboard_ready");
+        return snapshot;
+      }
+    } catch {
+      // A renderer evaluation failure is indistinguishable from a renderer
+      // that has not reached its app-owned readiness marker at this boundary.
+    }
+    checkpoint("renderer_not_ready");
+    return null;
   }, MAX_STARTUP_MS, "dashboard readiness", "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT");
-  selectRequiredRefreshLoader(refreshObserver, await mainFrameLoaderId(cdp));
+  let readyLoader;
+  try {
+    readyLoader = await mainFrameLoaderId(cdp);
+  } catch (error) {
+    checkpoint("frame_unavailable");
+    throw error;
+  }
+  if (readyLoader === null) checkpoint("frame_unavailable");
+  selectRequiredRefreshLoader(refreshObserver, readyLoader);
   const dashboardUrl = new URL(ready.location);
   if (dashboardUrl.protocol !== "http:" || dashboardUrl.hostname !== "127.0.0.1") {
     fail("WINDOWS_ELECTRON_SMOKE_LOOPBACK_REQUIRED");
@@ -2025,6 +2135,13 @@ export async function runSmoke(progress) {
   await writeSmokeDiagnostic("run_smoke_started");
   const executable = resolve(process.env.TIBOTATTLE_ELECTRON_EXE ?? DEFAULT_EXECUTABLE);
   const artifactRoot = dirname(executable);
+  progress.dashboardCheckpoint = normalizeWindowsDashboardCheckpoint(
+    progress.dashboardCheckpoint,
+  );
+  const setDashboardCheckpoint = (checkpoint) => {
+    const normalized = normalizeWindowsDashboardCheckpoint(checkpoint);
+    if (normalized !== "not_started") progress.dashboardCheckpoint = normalized;
+  };
   let fixture = null;
   let primary = null;
   let second = null;
@@ -2097,7 +2214,7 @@ export async function runSmoke(progress) {
     );
     assertPrimaryShellState(initialState, "WINDOWS_ELECTRON_SMOKE_PRIMARY_STATE_INVALID");
     failurePhase = "dashboard";
-    connection = await dashboardConnection(primary, primaryPort);
+    connection = await dashboardConnection(primary, primaryPort, setDashboardCheckpoint);
     failurePhase = "lifecycle";
     const primaryDescendantPids = await captureDescendantPids(primary.pid);
     progress.dashboardReady = true;
@@ -2261,7 +2378,11 @@ export async function runSmoke(progress) {
       if (!state.started || !state.primary || !state.tray) {
         fail("WINDOWS_ELECTRON_SMOKE_RELAUNCH_STATE_INVALID");
       }
-      const relaunched = await dashboardConnection(relaunch, relaunchPort);
+      const relaunched = await dashboardConnection(
+        relaunch,
+        relaunchPort,
+        setDashboardCheckpoint,
+      );
       const relaunchDescendantPids = await captureDescendantPids(relaunch.pid);
       await verifyPersistentQualificationState(relaunched);
       progress.statePersistence = true;

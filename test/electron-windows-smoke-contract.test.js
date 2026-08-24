@@ -14,14 +14,18 @@ import {
   classifyAutomaticStartupRefreshReceipt,
   classifySmokeFailure,
   createSyntheticFixture,
+  classifyWindowsDashboardTargetPoll,
   isWindowsDashboardTarget,
+  isWindowsRecoveryTarget,
   isWindowsSmokeDirectEntry,
   observeLocalRefreshRequests,
   queryWindowsProcessTableForTest,
   selectWindowsDashboardTarget,
   WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES,
+  WINDOWS_ELECTRON_SMOKE_DASHBOARD_CHECKPOINT_ALLOWLIST,
   WINDOWS_ELECTRON_SMOKE_FAILURE_REASON_ALLOWLIST,
   WINDOWS_ELECTRON_SMOKE_FAILURE_STAGE_ALLOWLIST,
+  normalizeWindowsDashboardCheckpoint,
   waitFor,
 } from "../scripts/smoke-electron-windows.mjs";
 
@@ -277,7 +281,7 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /selectWindowsDashboardTarget/u);
   assert.match(
     source,
-    /return selectWindowsDashboardTarget\(targets, port\)/u,
+    /const selected = selectWindowsDashboardTarget\(targets, port\)/u,
     "dashboard target polling must ignore non-dashboard pages until the exact target exists",
   );
   assert.match(source, /target\.url === `http:\/\/127\.0\.0\.1:\$\{dashboardPort\}\/`/u);
@@ -290,10 +294,11 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /STARTUP_REFRESH_DUPLICATED/u);
   assert.match(source, /previousRefreshId/u);
   assert.match(source, /refreshObserver\.reset\(\)/u);
+  assert.match(source, /const initialLoader = await waitFor/u);
   assert.match(
     source,
-    /selectRequiredRefreshLoader\(refreshObserver, await waitFor\(\s+\(\) => mainFrameLoaderId\(cdp\)/u,
-    "initial loader acquisition must poll through a null result",
+    /mainFrameLoaderId\(cdp\)[\s\S]+?checkpoint\("frame_unavailable"\)/u,
+    "initial loader acquisition must preserve a frame-unavailable checkpoint",
   );
   assert.doesNotMatch(source, /waitFor\(\s+\(\) => readRequiredRefreshLoader\(cdp\)/u);
   assert.match(source, /reloadDashboardDocument/u);
@@ -564,6 +569,102 @@ test("Windows smoke selects only the exact ephemeral loopback dashboard target",
   assert.equal(selectWindowsDashboardTarget([valid], "43123"), undefined);
 });
 
+test("Windows dashboard polling labels only the fixed recovery data surface as recovery", () => {
+  const debugPort = 43123;
+  const dashboardPort = 49299;
+  const target = (url, overrides = {}) => ({
+    type: "page",
+    url,
+    webSocketDebuggerUrl: `ws://127.0.0.1:${debugPort}/devtools/page/1`,
+    ...overrides,
+  });
+  const recovery = target("data:text/html;charset=utf-8,%3Cmain%3Erecovery%3C%2Fmain%3E");
+  const settings = target(`http://127.0.0.1:${dashboardPort}/electron-settings.html`);
+  const hostileLocalPage = target(`http://127.0.0.1:${dashboardPort}/unexpected.html`);
+  const valid = target(`http://127.0.0.1:${dashboardPort}/`);
+  assert.equal(isWindowsRecoveryTarget(recovery), true);
+  assert.equal(isWindowsRecoveryTarget(settings), false);
+  assert.equal(isWindowsRecoveryTarget(hostileLocalPage), false);
+  assert.equal(classifyWindowsDashboardTargetPoll([], debugPort), "target_poll_no_page");
+  assert.equal(
+    classifyWindowsDashboardTargetPoll([recovery], debugPort),
+    "target_poll_recovery_only",
+  );
+  assert.equal(
+    classifyWindowsDashboardTargetPoll([recovery, settings], debugPort),
+    "target_poll_no_page",
+  );
+  assert.equal(
+    classifyWindowsDashboardTargetPoll([hostileLocalPage], debugPort),
+    "target_poll_no_page",
+  );
+  assert.equal(
+    classifyWindowsDashboardTargetPoll([recovery, valid], debugPort),
+    "target_poll_dashboard_candidate",
+  );
+});
+
+test("Windows dashboard checkpoints are fixed, content-free, and retained on failure", () => {
+  assert.deepEqual(WINDOWS_ELECTRON_SMOKE_DASHBOARD_CHECKPOINT_ALLOWLIST, [
+    "not_started",
+    "debug_endpoint_ready",
+    "target_poll_no_page",
+    "target_poll_recovery_only",
+    "target_poll_dashboard_candidate",
+    "cdp_attach_failed",
+    "frame_unavailable",
+    "renderer_not_ready",
+    "dashboard_ready",
+  ]);
+  for (const checkpoint of WINDOWS_ELECTRON_SMOKE_DASHBOARD_CHECKPOINT_ALLOWLIST) {
+    assert.equal(normalizeWindowsDashboardCheckpoint(checkpoint), checkpoint);
+  }
+  for (const invalid of [
+    null,
+    undefined,
+    "http://127.0.0.1:43123/",
+    "C:\\private\\dashboard.log",
+    "private renderer content",
+    "target_poll_dashboard_candidate secret",
+  ]) {
+    assert.equal(normalizeWindowsDashboardCheckpoint(invalid), "not_started");
+  }
+  const failed = aggregate("failed", {
+    dashboardCheckpoint: "target_poll_recovery_only",
+    failureStage: "dashboard",
+    failureReason: "timeout",
+    title: "must not cross the aggregate boundary",
+    url: "http://127.0.0.1:49299/",
+  });
+  assert.equal(failed.dashboardCheckpoint, "target_poll_recovery_only");
+  assert.doesNotMatch(
+    JSON.stringify(failed),
+    /(?:[A-Za-z]:[\\/]|127\.0\.0\.1|private|title|url|renderer content|\.log)/iu,
+  );
+});
+
+test("Windows dashboard target polling remains strict and records checkpoint sequencing", async () => {
+  const source = await readFile("scripts/smoke-electron-windows.mjs", "utf8");
+  const connectionStart = source.indexOf("async function dashboardConnection");
+  const endpoint = source.indexOf('checkpoint("debug_endpoint_ready")', connectionStart);
+  const targetPoll = source.indexOf("classifyWindowsDashboardTargetPoll", connectionStart);
+  const attach = source.indexOf('checkpoint("cdp_attach_failed")', connectionStart);
+  const frame = source.indexOf('checkpoint("frame_unavailable")', connectionStart);
+  const renderer = source.indexOf('checkpoint("renderer_not_ready")', connectionStart);
+  const ready = source.indexOf('checkpoint("dashboard_ready")', connectionStart);
+  assert.ok(endpoint >= 0);
+  assert.ok(targetPoll > endpoint);
+  assert.ok(attach > targetPoll);
+  assert.ok(frame > attach);
+  assert.ok(renderer > frame);
+  assert.ok(ready > renderer);
+  assert.match(source, /target_poll_no_page/u);
+  assert.match(source, /target_poll_recovery_only/u);
+  assert.match(source, /return selectWindowsDashboardTarget|selectWindowsDashboardTarget\(targets, port\)/u);
+  assert.match(source, /dashboardCheckpoint/u);
+  assert.match(source, /dashboardCheckpoint: normalizeWindowsDashboardCheckpoint/u);
+});
+
 test("Windows startup refresh evidence requires the validated origin and active loader", () => {
   const cdp = new FakeCdp();
   const observer = observeLocalRefreshRequests(cdp);
@@ -805,6 +906,7 @@ test("failed Windows Electron smoke preserves completed closed-schema progress",
   const progress = {
     artifact: true,
     dashboardReady: true,
+    dashboardCheckpoint: "renderer_not_ready",
     syntheticRefresh: false,
     failureStage: "control",
     failureReason: "child_exit",
@@ -821,6 +923,7 @@ test("failed Windows Electron smoke preserves completed closed-schema progress",
     failureReason: "child_exit",
     artifact: true,
     dashboardReady: true,
+    dashboardCheckpoint: "renderer_not_ready",
     syntheticRefresh: false,
     secondInstanceRejected: false,
     showHideTrayLifecycle: false,
@@ -1038,6 +1141,7 @@ test("Windows Electron smoke diagnostics are fixed, phase-bound, and content-fre
       failureReason: "status_state",
       artifact: false,
       dashboardReady: false,
+      dashboardCheckpoint: "not_started",
       syntheticRefresh: false,
       secondInstanceRejected: false,
       showHideTrayLifecycle: false,
@@ -1086,6 +1190,7 @@ test("Windows Electron smoke diagnostics are fixed, phase-bound, and content-fre
       failureReason: "none",
       artifact: false,
       dashboardReady: false,
+      dashboardCheckpoint: "not_started",
       syntheticRefresh: false,
       secondInstanceRejected: false,
       showHideTrayLifecycle: false,
@@ -1233,6 +1338,7 @@ test("non-Windows Electron smoke reports unsupported rather than success", () =>
     failureReason: "unsupported",
     artifact: false,
     dashboardReady: false,
+    dashboardCheckpoint: "not_started",
     syntheticRefresh: false,
     secondInstanceRejected: false,
     showHideTrayLifecycle: false,

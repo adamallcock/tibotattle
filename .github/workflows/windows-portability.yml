@@ -608,6 +608,17 @@ jobs:
             'dash_startup_cancelled',
             'unknown'
           )
+          $runtimeDashboardCheckpoints = @(
+            'not_started',
+            'debug_endpoint_ready',
+            'target_poll_no_page',
+            'target_poll_recovery_only',
+            'target_poll_dashboard_candidate',
+            'cdp_attach_failed',
+            'frame_unavailable',
+            'renderer_not_ready',
+            'dashboard_ready'
+          )
           $runtimeFallbackReasons = @(
             'aggregate_missing',
             'aggregate_invalid',
@@ -643,6 +654,7 @@ jobs:
           $defaultRuntimeEvidence = [ordered]@{
             artifact = $false
             dashboardReady = $false
+            dashboardCheckpoint = 'not_started'
             syntheticRefresh = $false
             secondInstanceRejected = $false
             showHideTrayLifecycle = $false
@@ -667,6 +679,7 @@ jobs:
             "- Status: $($Evidence.status)" >> $env:GITHUB_STEP_SUMMARY
             "- Failure stage: $($Evidence.failureStage)" >> $env:GITHUB_STEP_SUMMARY
             "- Failure reason: $($Evidence.failureReason)" >> $env:GITHUB_STEP_SUMMARY
+            "- Dashboard checkpoint: $($Evidence.dashboardCheckpoint)" >> $env:GITHUB_STEP_SUMMARY
           }
           [IO.File]::WriteAllText(
             $runtimeEvidencePath,
@@ -803,6 +816,7 @@ jobs:
             $expectedRuntimeKeys = @(
               'artifact',
               'dashboardReady',
+              'dashboardCheckpoint',
               'syntheticRefresh',
               'secondInstanceRejected',
               'showHideTrayLifecycle',
@@ -838,11 +852,13 @@ jobs:
             if ($runtimeEvidence.failureStage -isnot [string] -or
                 $runtimeFailureStages -notcontains $runtimeEvidence.failureStage -or
                 $runtimeEvidence.failureReason -isnot [string] -or
-                $runtimeFailureReasons -notcontains $runtimeEvidence.failureReason) {
+                $runtimeFailureReasons -notcontains $runtimeEvidence.failureReason -or
+                $runtimeEvidence.dashboardCheckpoint -isnot [string] -or
+                $runtimeDashboardCheckpoints -notcontains $runtimeEvidence.dashboardCheckpoint) {
               throw 'runtime aggregate diagnostics'
             }
             foreach ($name in $expectedRuntimeKeys) {
-              if ($name -in @('status', 'target', 'contentFree', 'failureStage', 'failureReason')) { continue }
+              if ($name -in @('status', 'target', 'contentFree', 'failureStage', 'failureReason', 'dashboardCheckpoint')) { continue }
               if ($runtimeEvidence.$name -isnot [bool]) {
                 throw 'runtime aggregate check'
               }
@@ -922,6 +938,7 @@ jobs:
               $runtimeEvidence.contentFree -ne $true -or
               $runtimeEvidence.failureStage -ne 'none' -or
               $runtimeEvidence.failureReason -ne 'none' -or
+              $runtimeEvidence.dashboardCheckpoint -ne 'dashboard_ready' -or
               $runtimeJson -match '(?i)(?:[A-Za-z]:[\\/]|/Users/|/home/|\\Users\\|username|password|secret|token|pid|process|stdout|stderr|command|executable)') {
             Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_EVIDENCE_NOT_CONTENT_FREE'
             exit 1
