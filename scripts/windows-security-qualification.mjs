@@ -163,6 +163,21 @@ export const WINDOWS_PREPARED_DIRECTORY_STAGE_ALLOWLIST = Object.freeze([
   "prepared_ancestor_validation",
   "prepared_final_validation",
 ]);
+// Unified-index ingest diagnostics are deliberately coarse and separate from
+// native filesystem publication details. Only these fixed phases may cross
+// the qualification boundary; paths, SQL, messages, and arbitrary codes do
+// not.
+export const WINDOWS_UNIFIED_INDEX_PHASE_ALLOWLIST = Object.freeze([
+  "capability",
+  "secret",
+  "stage_prepare",
+  "stage_create_or_clone",
+  "session_open",
+  "database_open_or_write",
+  "close",
+  "publish",
+  "cleanup",
+]);
 // These are the finite native Failure/FromLastError classes that can cross
 // the SQLite publication callback. The TAP diagnostic never accepts arbitrary
 // error-like strings or host/runtime exception names.
@@ -645,6 +660,27 @@ function safeCapturedSqliteErrorCategories(value) {
   return Object.freeze(categories);
 }
 
+function safeCapturedUnifiedIndexStages(value) {
+  if (!Array.isArray(value) || value.length > MAXIMUM_FAILURE_METADATA_ITEMS) {
+    return null;
+  }
+  const stages = [];
+  const seen = new Set();
+  try {
+    for (const stage of value) {
+      if (!WINDOWS_UNIFIED_INDEX_PHASE_ALLOWLIST.includes(stage)
+          || seen.has(stage)) {
+        return null;
+      }
+      seen.add(stage);
+      stages.push(stage);
+    }
+  } catch {
+    return null;
+  }
+  return Object.freeze(stages);
+}
+
 function safeQualificationFailureStatus(error) {
   return error?.code && Object.values(FIXED_STATUS).includes(error.code)
     ? error.code
@@ -677,6 +713,9 @@ export function formatWindowsSecurityQualificationFailure(error) {
   const sqliteErrorCategories = safeCapturedSqliteErrorCategories(
     error?.sqliteErrorCategories,
   );
+  const unifiedIndexStages = safeCapturedUnifiedIndexStages(
+    error?.unifiedIndexStages,
+  );
   const preparedStages = Array.isArray(error?.preparedStages)
     && error.preparedStages.length <= MAXIMUM_FAILURE_METADATA_ITEMS
     && error.preparedStages.every(
@@ -706,6 +745,10 @@ export function formatWindowsSecurityQualificationFailure(error) {
       && sqliteErrorCategories.length > 0
     ? ` sqlite_error_categories=${sqliteErrorCategories.join(",")}`
     : "";
+  const unifiedIndexMetadata = unifiedIndexStages !== null
+      && unifiedIndexStages.length > 0
+    ? ` unified_index_stages=${unifiedIndexStages.join(",")}`
+    : "";
   return `${status} test_index=${testIndex}`
     + ` test_indexes=${testIndexes !== null && testIndexes.length > 0
       ? testIndexes.join(",")
@@ -720,7 +763,8 @@ export function formatWindowsSecurityQualificationFailure(error) {
       ? nativeErrors.join(",")
       : "unavailable"}`
     + sqliteMetadata
-    + preparedMetadata;
+    + preparedMetadata
+    + unifiedIndexMetadata;
 }
 
 /**
@@ -864,6 +908,34 @@ export function extractTapSqliteErrorCategories(output) {
 
 export const extractTapWindowsSqliteErrorCategories = extractTapSqliteErrorCategories;
 
+/**
+ * Extract only the fixed unified-index ingest phase from a TAP diagnostic.
+ * Require an exact comment property and allowlisted value; no arbitrary
+ * suffix, path, SQL, or error text is retained.
+ */
+export function extractTapUnifiedIndexStages(output) {
+  const stages = [];
+  if (typeof output !== "string") return Object.freeze(stages);
+  const seen = new Set();
+  const escapedStages = WINDOWS_UNIFIED_INDEX_PHASE_ALLOWLIST
+    .map((stage) => stage.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"))
+    .join("|");
+  const pattern = new RegExp(
+    `^\\s*#\\s+unifiedIndexStage\\s*:\\s*(${escapedStages})\\s*$`,
+    "gmu",
+  );
+  for (const match of output.matchAll(pattern)) {
+    const stage = match[1];
+    if (seen.has(stage)) continue;
+    seen.add(stage);
+    stages.push(stage);
+    if (stages.length === MAXIMUM_FAILURE_METADATA_ITEMS) break;
+  }
+  return Object.freeze(stages);
+}
+
+export const extractTapWindowsUnifiedIndexStages = extractTapUnifiedIndexStages;
+
 function fixedFailureWithTapMetadata(output) {
   const error = fixedError(FIXED_STATUS.failed);
   error.testIndexes = extractTapTestIndexes(output);
@@ -881,6 +953,8 @@ function fixedFailureWithTapMetadata(output) {
   error.preparedStage = error.preparedStages[0] ?? null;
   error.preparedErrors = extractTapPreparedErrors(output);
   error.preparedError = error.preparedErrors[0] ?? null;
+  error.unifiedIndexStages = extractTapUnifiedIndexStages(output);
+  error.unifiedIndexStage = error.unifiedIndexStages[0] ?? null;
   return error;
 }
 

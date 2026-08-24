@@ -17,6 +17,7 @@ import {
   WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST,
   WINDOWS_SECURITY_QUALIFICATION_TEST_FILES,
   WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST,
+  WINDOWS_UNIFIED_INDEX_PHASE_ALLOWLIST,
   classifyWindowsSqliteError,
   classifyWindowsSqliteErrorCode,
   extractTapPublishErrors,
@@ -25,6 +26,7 @@ import {
   extractTapPreparedErrors,
   extractTapPreparedStages,
   extractTapSqliteErrorCategories,
+  extractTapUnifiedIndexStages,
   extractTapTestIndex,
   extractTapTestIndexes,
   extractTapTestLocations,
@@ -92,11 +94,16 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(qualificationScript, /classifyWindowsSqliteErrorCode/u);
   assert.match(qualificationScript, /extractTapSqliteErrorCategories/u);
   assert.match(qualificationScript, /sqlite_error_categories=/u);
+  assert.match(qualificationScript, /WINDOWS_UNIFIED_INDEX_PHASE_ALLOWLIST/u);
+  assert.match(qualificationScript, /extractTapUnifiedIndexStages/u);
+  assert.match(qualificationScript, /unified_index_stages=/u);
   assert.match(sqliteQualificationTest, /classifyWindowsSqliteError/u);
   assert.match(sqliteQualificationTest, /windowsSqliteErrorCategory/u);
   assert.match(unifiedIndexQualificationTest, /emitBoundedIngestFailureDiagnostic/u);
   assert.match(unifiedIndexQualificationTest, /windowsFilesystemStage/u);
   assert.match(unifiedIndexQualificationTest, /windowsFilesystemError/u);
+  assert.match(unifiedIndexQualificationTest, /windowsUnifiedIndexStage/u);
+  assert.match(unifiedIndexQualificationTest, /unifiedIndexStage/u);
   assert.match(sqliteQualificationTest, /USAGE_MONITOR_WINDOWS_QUALIFICATION/u);
   assert.match(workflow, /\$nodeGypScript rebuild --directory native\/windows-filesystem/u);
   assert.match(
@@ -1536,6 +1543,61 @@ test("SQLite publish diagnostic parser is TAP-only, allowlisted, deduplicated, b
   assert.equal(repeated.length <= 64, true);
 });
 
+test("unified-index phase diagnostics are fixed, content-free, deduplicated, and frozen", () => {
+  assert.deepEqual(WINDOWS_UNIFIED_INDEX_PHASE_ALLOWLIST, [
+    "capability",
+    "secret",
+    "stage_prepare",
+    "stage_create_or_clone",
+    "session_open",
+    "database_open_or_write",
+    "close",
+    "publish",
+    "cleanup",
+  ]);
+  assert.equal(Object.isFrozen(WINDOWS_UNIFIED_INDEX_PHASE_ALLOWLIST), true);
+  assert.equal(
+    new Set(WINDOWS_UNIFIED_INDEX_PHASE_ALLOWLIST).size,
+    WINDOWS_UNIFIED_INDEX_PHASE_ALLOWLIST.length,
+  );
+  const output = [
+    "unifiedIndexStage: secret",
+    "# unifiedIndexStage: capability",
+    "# unifiedIndexStage: session_open",
+    "# unifiedIndexStage: session_open",
+    "# unifiedIndexStage: arbitrary secret",
+    "# unifiedIndexStage: C:\\private\\secret\\state.sqlite",
+    "# unifiedIndexStage: database_open_or_write SQL=hidden",
+    "# otherProperty: cleanup",
+  ].join("\n");
+  const stages = extractTapUnifiedIndexStages(output);
+  assert.deepEqual(stages, ["capability", "session_open"]);
+  assert.equal(Object.isFrozen(stages), true);
+  assert.doesNotMatch(stages.join(" "), /arbitrary|private|secret|SQL|hidden/u);
+  const repeated = extractTapUnifiedIndexStages(
+    Array.from(
+      { length: 128 },
+      (_, index) => `# unifiedIndexStage: ${WINDOWS_UNIFIED_INDEX_PHASE_ALLOWLIST[index % 9]}`,
+    ).join("\n"),
+  );
+  assert.deepEqual(repeated, WINDOWS_UNIFIED_INDEX_PHASE_ALLOWLIST);
+  assert.equal(repeated.length <= 64, true);
+  assert.match(
+    formatWindowsSecurityQualificationFailure({
+      code: FIXED_STATUS.failed,
+      unifiedIndexStages: ["capability", "session_open"],
+    }),
+    /unified_index_stages=capability,session_open$/u,
+  );
+  assert.doesNotMatch(
+    formatWindowsSecurityQualificationFailure({
+      code: FIXED_STATUS.failed,
+      unifiedIndexStages: ["capability", "private-path"],
+    }),
+    /unified_index_stages/u,
+  );
+});
+
 test("SQLite publish error parser is TAP-only, allowlisted, deduplicated, bounded, and frozen", () => {
   const output = [
     "windowsFilesystemError: WINDOWS_FILESYSTEM_ACCESS_DENIED",
@@ -1574,19 +1636,23 @@ test("unified-index failure markers retain only fixed classes, codes, and stages
     "# windowsSqliteErrorCategory: BUSY_LOCKED",
     "# windowsFilesystemStage: publish_target_open",
     "# windowsFilesystemError: WINDOWS_FILESYSTEM_ACCESS_DENIED",
+    "# unifiedIndexStage: database_open_or_write",
     "# windowsSqliteErrorCategory: C:\\private\\secret\\state.sqlite",
     "# windowsFilesystemStage: secret=do-not-return",
     "# windowsFilesystemError: private-message",
     "# windowsFilesystemError: WINDOWS_FILESYSTEM_ACCESS_DENIED SQL=hidden",
+    "# unifiedIndexStage: private-message",
   ].join("\n");
   const categories = extractTapSqliteErrorCategories(output);
   const stages = extractTapPublishStages(output);
   const errors = extractTapPublishErrors(output);
+  const unifiedIndexStages = extractTapUnifiedIndexStages(output);
   assert.deepEqual(categories, ["BUSY_LOCKED"]);
   assert.deepEqual(stages, ["publish_target_open"]);
   assert.deepEqual(errors, ["WINDOWS_FILESYSTEM_ACCESS_DENIED"]);
+  assert.deepEqual(unifiedIndexStages, ["database_open_or_write"]);
   assert.doesNotMatch(
-    JSON.stringify({ categories, stages, errors }),
+    JSON.stringify({ categories, stages, errors, unifiedIndexStages }),
     /private|secret|message|SQL|hidden|state\.sqlite/iu,
   );
 });
@@ -1653,6 +1719,9 @@ test("qualification child failures attach only a safe index and never TAP conten
     "# windowsFilesystemError: secret=do-not-return",
     "# windowsSqliteErrorCategory: CANTOPEN_IOERR",
     "# windowsSqliteErrorCategory: CANTOPEN_IOERR secret=do-not-return",
+    "# unifiedIndexStage: database_open_or_write",
+    "# unifiedIndexStage: database_open_or_write",
+    "# unifiedIndexStage: C:\\private\\secret\\state.sqlite",
   ].join("\n"));
   child.emit("close", 1);
   await assert.rejects(
@@ -1687,6 +1756,8 @@ test("qualification child failures attach only a safe index and never TAP conten
       assert.equal(error.publishError, "WINDOWS_FILESYSTEM_ACCESS_DENIED");
       assert.deepEqual(error.sqliteErrorCategories, ["CANTOPEN_IOERR"]);
       assert.equal(error.sqliteErrorCategory, "CANTOPEN_IOERR");
+      assert.deepEqual(error.unifiedIndexStages, ["database_open_or_write"]);
+      assert.equal(error.unifiedIndexStage, "database_open_or_write");
       assert.equal(Object.isFrozen(error.sqliteErrorCategories), true);
       assert.equal(Object.isFrozen(error.testIndexes), true);
       assert.equal(Object.isFrozen(error.testLocations), true);
@@ -1695,6 +1766,7 @@ test("qualification child failures attach only a safe index and never TAP conten
       assert.equal(Object.isFrozen(error.testFileLocations[0]), true);
       assert.equal(Object.isFrozen(error.publishStages), true);
       assert.equal(Object.isFrozen(error.publishErrors), true);
+      assert.equal(Object.isFrozen(error.unifiedIndexStages), true);
       assert.equal(error.message, FIXED_STATUS.failed);
       assert.equal(Object.hasOwn(error, "stdout"), false);
       assert.equal(Object.hasOwn(error, "testName"), false);

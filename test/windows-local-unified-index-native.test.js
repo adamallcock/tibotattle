@@ -18,6 +18,7 @@ import {
   classifyWindowsSqliteError,
   WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST,
   WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST,
+  WINDOWS_UNIFIED_INDEX_PHASE_ALLOWLIST,
 } from "../scripts/windows-security-qualification.mjs";
 import { ingestLocalUnifiedIndexIncrement } from "../src/local-unified-index-ingest.js";
 import {
@@ -301,6 +302,11 @@ function emitBoundedIngestFailureDiagnostic(testContext, error) {
   const code = ownStringProperty(error, "code");
   if (WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST.includes(code)) {
     testContext.diagnostic(`windowsFilesystemError: ${code}`);
+  }
+
+  const unifiedIndexStage = ownStringProperty(error, "windowsUnifiedIndexStage");
+  if (WINDOWS_UNIFIED_INDEX_PHASE_ALLOWLIST.includes(unifiedIndexStage)) {
+    testContext.diagnostic(`unifiedIndexStage: ${unifiedIndexStage}`);
   }
 }
 
