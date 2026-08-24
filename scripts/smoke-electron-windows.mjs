@@ -55,6 +55,12 @@ const DEFAULT_EXECUTABLE = join(DEFAULT_ARTIFACT_ROOT, "TiboTattle Dev.exe");
 const MAX_STARTUP_MS = 45_000;
 const MAX_OPERATION_MS = 10_000;
 const MAX_REFRESH_MS = 45_000;
+// The first primary dashboard startup is the one foreground pass where the
+// qualification fixture may need a bounded diagnostic extension. This is a
+// one-run ceiling for that initial observation, not a claim about normal
+// indexing latency; it remains below the companion's own five-minute abort.
+// Reloads and relaunches deliberately use MAX_REFRESH_MS instead.
+const MAX_STARTUP_REFRESH_COMPLETION_MS = 120_000;
 const MAX_SHUTDOWN_MS = 15_000;
 const WINDOWS_ELECTRON_SMOKE_MESSAGE_TYPE = "windows-electron-smoke-v1";
 const WINDOWS_ELECTRON_SMOKE_OUTPUT_PATH_ENV =
@@ -237,6 +243,7 @@ export const WINDOWS_ELECTRON_SMOKE_FAILURE_REASON_ALLOWLIST = Object.freeze([
   "dash_startup_changed",
   "dash_startup_failed",
   "dash_startup_cancelled",
+  "dash_startup_degraded",
   "unknown",
 ]);
 
@@ -274,6 +281,7 @@ const DASHBOARD_FAILURE_REASON_BY_CODE = Object.freeze({
   WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_RECEIPT_CHANGED: "dash_startup_changed",
   WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_FAILED: "dash_startup_failed",
   WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_CANCELLED: "dash_startup_cancelled",
+  WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_DEGRADED: "dash_startup_degraded",
 });
 const DASHBOARD_FAILURE_PHASES = new Set(["dashboard", "refresh"]);
 const DEFAULT_SMOKE_TIMEOUT_CODE = "WINDOWS_ELECTRON_SMOKE_TIMEOUT";
@@ -324,6 +332,7 @@ export const WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES = Object.freeze(
   changedReceipt: "WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_RECEIPT_CHANGED",
   failed: "WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_FAILED",
   cancelled: "WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_CANCELLED",
+  degraded: "WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_DEGRADED",
 });
 
 // The Windows preload gate is a qualification-only observation seam.  Its
@@ -397,6 +406,72 @@ export const WINDOWS_ELECTRON_SMOKE_DASHBOARD_CHECKPOINT_ALLOWLIST = Object.free
   "startup_refresh_terminal_succeeded",
 ]);
 
+// Refresh progress is projected into four fixed pairs.  The smoke never
+// serializes the companion's counters, timestamps, result, error code, or
+// indexing payload; these pairs only answer which bounded phase was visible
+// when the startup completion window expired.
+export const WINDOWS_ELECTRON_SMOKE_DASHBOARD_REFRESH_PROGRESS_ALLOWLIST = Object.freeze([
+  Object.freeze({ stage: "none", detail: "none" }),
+  Object.freeze({ stage: "collector", detail: "in_progress" }),
+  Object.freeze({ stage: "collector", detail: "quick_result" }),
+  Object.freeze({ stage: "indexing", detail: "archive_index" }),
+]);
+
+// Copied from the companion's reviewed public unified-index error vocabulary.
+// Pattern-valid strings are not accepted: an unknown/missing degraded reason
+// collapses to the fixed `{ unified_index, unknown }` pair.
+export const WINDOWS_ELECTRON_SMOKE_UNIFIED_INDEX_FAILURE_CODE_ALLOWLIST = Object.freeze([
+  "codex_rollout_compression_unsupported",
+  "codex_rollout_filename_identity_mismatch",
+  "codex_rollout_generation_ambiguous",
+  "codex_rollout_lineage_invalid",
+  "codex_rollout_content_invalid",
+  "codex_rollout_tail_incomplete",
+  "local_unified_index_aborted",
+  "local_unified_index_directory_sync_failed",
+  "local_unified_index_file_changed",
+  "local_unified_index_file_invalid",
+  "local_unified_index_generation_invalid",
+  "local_unified_index_generation_mismatch",
+  "local_unified_index_integrity_failed",
+  "local_unified_index_journal_mode_refused",
+  "local_unified_index_meta_invalid",
+  "local_unified_index_missing",
+  "local_unified_index_publication_durability_uncertain",
+  "local_unified_index_schema_invalid",
+  "local_unified_index_secondary_indexes_failed",
+  "local_unified_index_secondary_indexes_missing",
+  "local_unified_index_secret_invalid",
+  "local_unified_index_secret_unavailable",
+  "local_unified_index_unavailable",
+  "local_unified_index_worker_failed",
+  "local_unified_index_refresh_failed",
+]);
+
+const DASHBOARD_REFRESH_PROGRESS_KEY = (value) =>
+  `${value?.stage ?? ""}\0${value?.detail ?? ""}`;
+const DASHBOARD_REFRESH_PROGRESS_SET = new Set(
+  WINDOWS_ELECTRON_SMOKE_DASHBOARD_REFRESH_PROGRESS_ALLOWLIST
+    .map(DASHBOARD_REFRESH_PROGRESS_KEY),
+);
+const DASHBOARD_REFRESH_PROGRESS_RANK = new Map(
+  WINDOWS_ELECTRON_SMOKE_DASHBOARD_REFRESH_PROGRESS_ALLOWLIST
+    .map((value, index) => [DASHBOARD_REFRESH_PROGRESS_KEY(value), index]),
+);
+const DEFAULT_DASHBOARD_REFRESH_PROGRESS =
+  WINDOWS_ELECTRON_SMOKE_DASHBOARD_REFRESH_PROGRESS_ALLOWLIST[0];
+const UNIFIED_INDEX_FAILURE_CODE_SET = new Set(
+  WINDOWS_ELECTRON_SMOKE_UNIFIED_INDEX_FAILURE_CODE_ALLOWLIST,
+);
+const DEFAULT_DASHBOARD_REFRESH_FAILURE = Object.freeze({
+  failedStep: "none",
+  failureCode: "none",
+});
+const UNKNOWN_DASHBOARD_REFRESH_FAILURE = Object.freeze({
+  failedStep: "unified_index",
+  failureCode: "unknown",
+});
+
 const DASHBOARD_CHECKPOINT_SET = new Set(
   WINDOWS_ELECTRON_SMOKE_DASHBOARD_CHECKPOINT_ALLOWLIST,
 );
@@ -409,6 +484,102 @@ export function normalizeWindowsDashboardCheckpoint(value) {
   return typeof value === "string" && DASHBOARD_CHECKPOINT_SET.has(value)
     ? value
     : "not_started";
+}
+
+export function normalizeWindowsDashboardRefreshProgress(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return DEFAULT_DASHBOARD_REFRESH_PROGRESS;
+  }
+  const keys = Object.keys(value).sort().join("\0");
+  if (keys !== "detail\0stage"
+      || !DASHBOARD_REFRESH_PROGRESS_SET.has(DASHBOARD_REFRESH_PROGRESS_KEY(value))) {
+    return DEFAULT_DASHBOARD_REFRESH_PROGRESS;
+  }
+  return WINDOWS_ELECTRON_SMOKE_DASHBOARD_REFRESH_PROGRESS_ALLOWLIST.find(
+    (candidate) => DASHBOARD_REFRESH_PROGRESS_KEY(candidate)
+      === DASHBOARD_REFRESH_PROGRESS_KEY(value),
+  ) ?? DEFAULT_DASHBOARD_REFRESH_PROGRESS;
+}
+
+export function advanceWindowsDashboardRefreshProgress(current, next) {
+  const currentProgress = normalizeWindowsDashboardRefreshProgress(current);
+  const nextProgress = normalizeWindowsDashboardRefreshProgress(next);
+  return (DASHBOARD_REFRESH_PROGRESS_RANK.get(DASHBOARD_REFRESH_PROGRESS_KEY(nextProgress)) ?? 0)
+      > (DASHBOARD_REFRESH_PROGRESS_RANK.get(DASHBOARD_REFRESH_PROGRESS_KEY(currentProgress)) ?? 0)
+    ? nextProgress
+    : currentProgress;
+}
+
+export function normalizeWindowsDashboardRefreshFailure(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return DEFAULT_DASHBOARD_REFRESH_FAILURE;
+  }
+  const keys = Object.keys(value).sort().join("\0");
+  if (keys !== "failedStep\0failureCode") {
+    return DEFAULT_DASHBOARD_REFRESH_FAILURE;
+  }
+  if (value.failedStep === "none" && value.failureCode === "none") {
+    return DEFAULT_DASHBOARD_REFRESH_FAILURE;
+  }
+  if (value.failedStep !== "unified_index"
+      || (value.failureCode !== "unknown"
+        && !UNIFIED_INDEX_FAILURE_CODE_SET.has(value.failureCode))) {
+    return DEFAULT_DASHBOARD_REFRESH_FAILURE;
+  }
+  return Object.freeze({
+    failedStep: "unified_index",
+    failureCode: value.failureCode,
+  });
+}
+
+export function classifyWindowsDashboardRefreshFailure(refresh) {
+  if (refresh?.status !== "degraded") return DEFAULT_DASHBOARD_REFRESH_FAILURE;
+  return Object.freeze({
+    failedStep: "unified_index",
+    failureCode: UNIFIED_INDEX_FAILURE_CODE_SET.has(refresh.failureCode)
+      ? refresh.failureCode
+      : UNKNOWN_DASHBOARD_REFRESH_FAILURE.failureCode,
+  });
+}
+
+/**
+ * Project the companion's public refresh status into a content-free phase.
+ * `in_progress` identifies a validated collector descriptor before the early
+ * headline; `quick_result` identifies that headline; the separate
+ * archive-index marker identifies later indexing. Any missing or unrecognized
+ * status remains `none` rather than allowing arbitrary response fields out.
+ */
+export function classifyWindowsDashboardRefreshProgress(refresh) {
+  const value = refresh?.progress;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return DEFAULT_DASHBOARD_REFRESH_PROGRESS;
+  }
+  if (value.kind === "archive_index" && value.status === "scanning") {
+    return WINDOWS_ELECTRON_SMOKE_DASHBOARD_REFRESH_PROGRESS_ALLOWLIST[3];
+  }
+  if (value.phase === "quick_result") {
+    return WINDOWS_ELECTRON_SMOKE_DASHBOARD_REFRESH_PROGRESS_ALLOWLIST[2];
+  }
+  if (value.boundedBy === "modified_at_and_collection_start"
+      && ["recent_7d", "prospective"].includes(value.mode)
+      && [
+        "recent_7d_indexing",
+        "recent_7d_complete",
+        "recent_7d_partial",
+        "prospective_only",
+        "bounded_pause",
+      ].includes(value.status)
+      && [
+        "discovering",
+        "rollout_index",
+        "quota_refresh",
+        "complete",
+        "paused",
+        "prospective",
+      ].includes(value.phase)) {
+    return WINDOWS_ELECTRON_SMOKE_DASHBOARD_REFRESH_PROGRESS_ALLOWLIST[1];
+  }
+  return DEFAULT_DASHBOARD_REFRESH_PROGRESS;
 }
 
 /**
@@ -496,6 +667,14 @@ export function classifyAutomaticStartupRefreshReceipt({
       errorCode: WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES.cancelled,
     });
   }
+  if (refresh.status === "degraded") {
+    const failure = classifyWindowsDashboardRefreshFailure(refresh);
+    return Object.freeze({
+      status: "failed",
+      errorCode: WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES.degraded,
+      ...failure,
+    });
+  }
   return Object.freeze({ status: "pending", refreshId: refresh.refreshId });
 }
 
@@ -529,6 +708,12 @@ export function aggregate(status, values = {}) {
     ...diagnostic,
     ...Object.fromEntries(RESULT_KEYS.map((key) => [key, values[key] === true])),
     dashboardCheckpoint: normalizeWindowsDashboardCheckpoint(values.dashboardCheckpoint),
+    dashboardRefreshProgress: normalizeWindowsDashboardRefreshProgress(
+      values.dashboardRefreshProgress,
+    ),
+    dashboardRefreshFailure: normalizeWindowsDashboardRefreshFailure(
+      values.dashboardRefreshFailure,
+    ),
   });
 }
 
@@ -572,6 +757,18 @@ export function attachSmokeMonitorRejectionBoundary(promise) {
 
 function fail(code) {
   throw fixedError(code);
+}
+
+function failStartupRefreshDecision(decision) {
+  const error = fixedError(decision.errorCode);
+  const failure = normalizeWindowsDashboardRefreshFailure({
+    failedStep: decision.failedStep,
+    failureCode: decision.failureCode,
+  });
+  if (failure.failedStep !== "none") {
+    error.dashboardRefreshFailure = failure;
+  }
+  throw error;
 }
 
 function wait(ms) {
@@ -1838,6 +2035,8 @@ async function assertAutomaticStartupRefresh({
   refreshObserver,
   previousRefreshId = null,
   onCheckpoint = () => {},
+  onRefreshProgress = () => {},
+  completionTimeoutMs = MAX_REFRESH_MS,
 }) {
   const refreshUrl = new URL("/api/local/refresh", dashboardUrl);
   let refreshId = null;
@@ -1863,6 +2062,7 @@ async function assertAutomaticStartupRefresh({
       "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT",
     );
     const refresh = status?.refresh;
+    onRefreshProgress(classifyWindowsDashboardRefreshProgress(refresh));
     const decision = classifyAutomaticStartupRefreshReceipt({
       phase: "acceptance",
       requestCount: requests.length,
@@ -1870,7 +2070,7 @@ async function assertAutomaticStartupRefresh({
       previousRefreshId,
     });
     if (decision.status === "pending") return null;
-    if (decision.status === "failed") fail(decision.errorCode);
+    if (decision.status === "failed") failStartupRefreshDecision(decision);
     refreshId = decision.refreshId;
     onCheckpoint("startup_refresh_receipt_accepted");
     return true;
@@ -1894,6 +2094,7 @@ async function assertAutomaticStartupRefresh({
       "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT",
     );
     const refresh = status?.refresh;
+    onRefreshProgress(classifyWindowsDashboardRefreshProgress(refresh));
     const decision = classifyAutomaticStartupRefreshReceipt({
       phase: "completion",
       requestCount: requests.length,
@@ -1901,10 +2102,10 @@ async function assertAutomaticStartupRefresh({
       expectedRefreshId: refreshId,
     });
     if (decision.status === "pending") return false;
-    if (decision.status === "failed") fail(decision.errorCode);
+    if (decision.status === "failed") failStartupRefreshDecision(decision);
     onCheckpoint("startup_refresh_terminal_succeeded");
     return true;
-  }, MAX_REFRESH_MS, "automatic startup refresh completion", "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT");
+  }, completionTimeoutMs, "automatic startup refresh completion", "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT");
   // A completed pass may schedule an intentional bounded reindex continuation.
   // It is a separate operation, not a second startup trigger; stop counting
   // this document once the startup receipt has reached its terminal success.
@@ -1912,7 +2113,13 @@ async function assertAutomaticStartupRefresh({
   return refreshId;
 }
 
-async function dashboardConnection(child, port, onCheckpoint = () => {}) {
+async function dashboardConnection(
+  child,
+  port,
+  onCheckpoint = () => {},
+  onRefreshProgress = () => {},
+  startupRefreshCompletionMs = MAX_REFRESH_MS,
+) {
   let currentCheckpoint = "not_started";
   const checkpoint = (value) => {
     const normalized = normalizeWindowsDashboardCheckpoint(value);
@@ -2054,6 +2261,8 @@ async function dashboardConnection(child, port, onCheckpoint = () => {}) {
     dashboardUrl,
     refreshObserver,
     onCheckpoint: checkpoint,
+    onRefreshProgress,
+    completionTimeoutMs: startupRefreshCompletionMs,
   });
   return Object.freeze({
     cdp,
@@ -2061,6 +2270,7 @@ async function dashboardConnection(child, port, onCheckpoint = () => {}) {
     browser: version.Browser,
     refreshObserver,
     onCheckpoint: checkpoint,
+    onRefreshProgress,
     child,
   });
 }
@@ -2119,6 +2329,7 @@ async function reloadDashboardDocument(connection) {
     refreshObserver: connection.refreshObserver,
     previousRefreshId,
     onCheckpoint: connection.onCheckpoint,
+    onRefreshProgress: connection.onRefreshProgress,
   });
 }
 
@@ -2299,6 +2510,12 @@ export async function runSmoke(progress) {
   progress.dashboardCheckpoint = normalizeWindowsDashboardCheckpoint(
     progress.dashboardCheckpoint,
   );
+  progress.dashboardRefreshProgress = normalizeWindowsDashboardRefreshProgress(
+    progress.dashboardRefreshProgress,
+  );
+  progress.dashboardRefreshFailure = normalizeWindowsDashboardRefreshFailure(
+    progress.dashboardRefreshFailure,
+  );
   const setDashboardCheckpoint = (checkpoint) => {
     const normalized = normalizeWindowsDashboardCheckpoint(checkpoint);
     const advanced = advanceWindowsDashboardCheckpoint(
@@ -2306,6 +2523,15 @@ export async function runSmoke(progress) {
       normalized,
     );
     if (advanced !== progress.dashboardCheckpoint) progress.dashboardCheckpoint = advanced;
+  };
+  const setDashboardRefreshProgress = (refreshProgress) => {
+    const advanced = advanceWindowsDashboardRefreshProgress(
+      progress.dashboardRefreshProgress,
+      refreshProgress,
+    );
+    if (advanced !== progress.dashboardRefreshProgress) {
+      progress.dashboardRefreshProgress = advanced;
+    }
   };
   let fixture = null;
   let primary = null;
@@ -2379,7 +2605,13 @@ export async function runSmoke(progress) {
     );
     assertPrimaryShellState(initialState, "WINDOWS_ELECTRON_SMOKE_PRIMARY_STATE_INVALID");
     failurePhase = "dashboard";
-    connection = await dashboardConnection(primary, primaryPort, setDashboardCheckpoint);
+    connection = await dashboardConnection(
+      primary,
+      primaryPort,
+      setDashboardCheckpoint,
+      setDashboardRefreshProgress,
+      MAX_STARTUP_REFRESH_COMPLETION_MS,
+    );
     failurePhase = "lifecycle";
     const primaryDescendantPids = await captureDescendantPids(primary.pid);
     progress.dashboardReady = true;
@@ -2547,6 +2779,7 @@ export async function runSmoke(progress) {
         relaunch,
         relaunchPort,
         setDashboardCheckpoint,
+        setDashboardRefreshProgress,
       );
       const relaunchDescendantPids = await captureDescendantPids(relaunch.pid);
       await verifyPersistentQualificationState(relaunched);
@@ -2605,6 +2838,9 @@ export async function runSmoke(progress) {
     const diagnostic = classifySmokeFailure(error, failurePhase);
     progress.failureStage = diagnostic.failureStage;
     progress.failureReason = diagnostic.failureReason;
+    progress.dashboardRefreshFailure = normalizeWindowsDashboardRefreshFailure(
+      error?.dashboardRefreshFailure,
+    );
     throw error;
   } finally {
     await writeSmokeDiagnostic("cleanup_started");

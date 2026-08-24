@@ -606,6 +606,7 @@ jobs:
             'dash_startup_changed',
             'dash_startup_failed',
             'dash_startup_cancelled',
+            'dash_startup_degraded',
             'unknown'
           )
           $runtimeDashboardCheckpoints = @(
@@ -622,6 +623,35 @@ jobs:
             'startup_refresh_request_observed',
             'startup_refresh_receipt_accepted',
             'startup_refresh_terminal_succeeded'
+          )
+          $runtimeDashboardRefreshProgressStages = @('none', 'collector', 'indexing')
+          $runtimeDashboardRefreshProgressDetails = @('none', 'in_progress', 'quick_result', 'archive_index')
+          $runtimeUnifiedIndexFailureCodes = @(
+            'codex_rollout_compression_unsupported',
+            'codex_rollout_filename_identity_mismatch',
+            'codex_rollout_generation_ambiguous',
+            'codex_rollout_lineage_invalid',
+            'codex_rollout_content_invalid',
+            'codex_rollout_tail_incomplete',
+            'local_unified_index_aborted',
+            'local_unified_index_directory_sync_failed',
+            'local_unified_index_file_changed',
+            'local_unified_index_file_invalid',
+            'local_unified_index_generation_invalid',
+            'local_unified_index_generation_mismatch',
+            'local_unified_index_integrity_failed',
+            'local_unified_index_journal_mode_refused',
+            'local_unified_index_meta_invalid',
+            'local_unified_index_missing',
+            'local_unified_index_publication_durability_uncertain',
+            'local_unified_index_schema_invalid',
+            'local_unified_index_secondary_indexes_failed',
+            'local_unified_index_secondary_indexes_missing',
+            'local_unified_index_secret_invalid',
+            'local_unified_index_secret_unavailable',
+            'local_unified_index_unavailable',
+            'local_unified_index_worker_failed',
+            'local_unified_index_refresh_failed'
           )
           $runtimeFallbackReasons = @(
             'aggregate_missing',
@@ -659,6 +689,14 @@ jobs:
             artifact = $false
             dashboardReady = $false
             dashboardCheckpoint = 'not_started'
+            dashboardRefreshProgress = [ordered]@{
+              stage = 'none'
+              detail = 'none'
+            }
+            dashboardRefreshFailure = [ordered]@{
+              failedStep = 'none'
+              failureCode = 'none'
+            }
             syntheticRefresh = $false
             secondInstanceRejected = $false
             showHideTrayLifecycle = $false
@@ -821,6 +859,8 @@ jobs:
               'artifact',
               'dashboardReady',
               'dashboardCheckpoint',
+              'dashboardRefreshProgress',
+              'dashboardRefreshFailure',
               'syntheticRefresh',
               'secondInstanceRejected',
               'showHideTrayLifecycle',
@@ -858,11 +898,38 @@ jobs:
                 $runtimeEvidence.failureReason -isnot [string] -or
                 $runtimeFailureReasons -notcontains $runtimeEvidence.failureReason -or
                 $runtimeEvidence.dashboardCheckpoint -isnot [string] -or
-                $runtimeDashboardCheckpoints -notcontains $runtimeEvidence.dashboardCheckpoint) {
+                $runtimeDashboardCheckpoints -notcontains $runtimeEvidence.dashboardCheckpoint -or
+                $runtimeEvidence.dashboardRefreshProgress -eq $null -or
+                $runtimeEvidence.dashboardRefreshProgress -isnot [object] -or
+                $runtimeEvidence.dashboardRefreshFailure -eq $null -or
+                $runtimeEvidence.dashboardRefreshFailure -isnot [object]) {
               throw 'runtime aggregate diagnostics'
             }
+            $refreshProgressKeys = @($runtimeEvidence.dashboardRefreshProgress.psobject.Properties.Name | Sort-Object)
+            if (($refreshProgressKeys -join '|') -ne 'detail|stage' -or
+                $runtimeDashboardRefreshProgressStages -notcontains $runtimeEvidence.dashboardRefreshProgress.stage -or
+                $runtimeDashboardRefreshProgressDetails -notcontains $runtimeEvidence.dashboardRefreshProgress.detail -or
+                (($runtimeEvidence.dashboardRefreshProgress.stage -eq 'none') -and
+                 $runtimeEvidence.dashboardRefreshProgress.detail -ne 'none') -or
+                (($runtimeEvidence.dashboardRefreshProgress.stage -eq 'collector') -and
+                 $runtimeEvidence.dashboardRefreshProgress.detail -notin @('in_progress', 'quick_result')) -or
+                (($runtimeEvidence.dashboardRefreshProgress.stage -eq 'indexing') -and
+                 $runtimeEvidence.dashboardRefreshProgress.detail -ne 'archive_index')) {
+              throw 'runtime refresh progress diagnostics'
+            }
+            $refreshFailureKeys = @($runtimeEvidence.dashboardRefreshFailure.psobject.Properties.Name | Sort-Object)
+            if (($refreshFailureKeys -join '|') -ne 'failedStep|failureCode' -or
+                $runtimeEvidence.dashboardRefreshFailure.failedStep -notin @('none', 'unified_index') -or
+                $runtimeEvidence.dashboardRefreshFailure.failureCode -isnot [string] -or
+                (($runtimeEvidence.dashboardRefreshFailure.failedStep -eq 'none') -and
+                 $runtimeEvidence.dashboardRefreshFailure.failureCode -ne 'none') -or
+                (($runtimeEvidence.dashboardRefreshFailure.failedStep -eq 'unified_index') -and
+                 $runtimeEvidence.dashboardRefreshFailure.failureCode -ne 'unknown' -and
+                 $runtimeUnifiedIndexFailureCodes -notcontains $runtimeEvidence.dashboardRefreshFailure.failureCode)) {
+              throw 'runtime refresh failure diagnostics'
+            }
             foreach ($name in $expectedRuntimeKeys) {
-              if ($name -in @('status', 'target', 'contentFree', 'failureStage', 'failureReason', 'dashboardCheckpoint')) { continue }
+              if ($name -in @('status', 'target', 'contentFree', 'failureStage', 'failureReason', 'dashboardCheckpoint', 'dashboardRefreshProgress', 'dashboardRefreshFailure')) { continue }
               if ($runtimeEvidence.$name -isnot [bool]) {
                 throw 'runtime aggregate check'
               }
@@ -943,6 +1010,8 @@ jobs:
               $runtimeEvidence.failureStage -ne 'none' -or
               $runtimeEvidence.failureReason -ne 'none' -or
               $runtimeEvidence.dashboardCheckpoint -ne 'startup_refresh_terminal_succeeded' -or
+              $runtimeEvidence.dashboardRefreshFailure.failedStep -ne 'none' -or
+              $runtimeEvidence.dashboardRefreshFailure.failureCode -ne 'none' -or
               $runtimeJson -match '(?i)(?:[A-Za-z]:[\\/]|/Users/|/home/|\\Users\\|username|password|secret|token|pid|process|stdout|stderr|command|executable)') {
             Write-Error 'WINDOWS_ELECTRON_RUNTIME_SMOKE_EVIDENCE_NOT_CONTENT_FREE'
             exit 1
