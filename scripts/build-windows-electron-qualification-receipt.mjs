@@ -58,6 +58,7 @@ const RUNTIME_KEYS = Object.freeze([
   "cleanQuit",
   "contentFree",
   "dashboardReady",
+  "dashboardCheckpoint",
   "credentialPersistence",
   "failureReason",
   "failureStage",
@@ -82,6 +83,17 @@ const RUNTIME_CHECK_KEYS = Object.freeze([
   "statePersistence",
   "syntheticRefresh",
   "trayWindowLifecycle",
+]);
+const DASHBOARD_CHECKPOINT_ALLOWLIST = Object.freeze([
+  "not_started",
+  "debug_endpoint_ready",
+  "target_poll_no_page",
+  "target_poll_recovery_only",
+  "target_poll_dashboard_candidate",
+  "cdp_attach_failed",
+  "frame_unavailable",
+  "renderer_not_ready",
+  "dashboard_ready",
 ]);
 const RECEIPT_KEYS = Object.freeze([
   "binding",
@@ -285,8 +297,10 @@ export function validateRuntimeEvidence(value) {
       || value.contentFree !== true
       || value.failureStage !== "none"
       || value.failureReason !== "none"
+      || !DASHBOARD_CHECKPOINT_ALLOWLIST.includes(value.dashboardCheckpoint)
+      || value.dashboardCheckpoint !== "dashboard_ready"
       || RUNTIME_KEYS
-        .filter((key) => !["status", "target", "contentFree", "failureStage", "failureReason"].includes(key))
+        .filter((key) => !["status", "target", "contentFree", "failureStage", "failureReason", "dashboardCheckpoint"].includes(key))
         .some((key) => value[key] !== true)) {
     fail(FIXED_STATUS.runtimeInvalid);
   }
