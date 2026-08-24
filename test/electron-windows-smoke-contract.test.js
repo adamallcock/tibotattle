@@ -8,6 +8,7 @@ import test from "node:test";
 
 import {
   attachSmokeChildErrorBoundary,
+  attachSmokeMonitorRejectionBoundary,
   aggregate,
   classifyAutomaticStartupRefreshReceipt,
   classifySmokeFailure,
@@ -280,6 +281,7 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /loadAuditedWindowsCredentialBinding/u);
   assert.match(source, /remaining === null/u);
   assert.match(source, /monitorDescendantsUntilExit/u);
+  assert.match(source, /attachSmokeMonitorRejectionBoundary/u);
   const refreshSucceeded = source.indexOf('value === "succeeded"');
   const refreshBoundary = source.indexOf("await reloadDashboardDocument(connection)");
   assert.ok(refreshSucceeded >= 0 && refreshBoundary > refreshSucceeded);
@@ -310,13 +312,22 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
     readyWait >= 0 && automaticRefresh > readyWait,
     "the startup refresh check is ordered after the readiness wait",
   );
-  const secondMonitor = source.indexOf("const secondDescendantMonitor");
+  const secondMonitor = source.indexOf(
+    "const secondDescendantMonitor = attachSmokeMonitorRejectionBoundary(",
+  );
   const secondExit = source.indexOf("childExitPromise(second)");
-  const primaryMonitor = source.indexOf("const primaryDescendantMonitor");
+  const secondEndpoint = source.indexOf(
+    "const secondEndpointMonitor = attachSmokeMonitorRejectionBoundary(",
+  );
+  const primaryMonitor = source.indexOf(
+    "const primaryDescendantMonitor = attachSmokeMonitorRejectionBoundary(",
+  );
   const primaryQuit = source.indexOf("await quitCommand(\n        primary,");
-  const relaunchMonitor = source.indexOf("const relaunchDescendantMonitor");
+  const relaunchMonitor = source.indexOf(
+    "const relaunchDescendantMonitor = attachSmokeMonitorRejectionBoundary(",
+  );
   const relaunchQuit = source.indexOf("await quitCommand(\n          relaunch,");
-  assert.ok(secondMonitor >= 0 && secondExit > secondMonitor);
+  assert.ok(secondMonitor >= 0 && secondEndpoint > secondMonitor && secondExit > secondEndpoint);
   assert.ok(primaryMonitor >= 0 && primaryQuit > primaryMonitor);
   assert.ok(relaunchMonitor >= 0 && relaunchQuit > relaunchMonitor);
   assert.match(source, /relaunchPersistence/u);
@@ -658,6 +669,25 @@ test("packaged child spawn errors stay inside the aggregate boundary", () => {
   assert.doesNotThrow(() => {
     child.emit("error", new Error("private launch details"));
   });
+});
+
+test("deferred monitor rejection is handled immediately and still propagates", async () => {
+  let unhandledReason = null;
+  const onUnhandledRejection = (reason) => {
+    unhandledReason = reason;
+  };
+  process.on("unhandledRejection", onUnhandledRejection);
+  const expected = new Error("fixed monitor failure");
+  const monitor = Promise.reject(expected);
+  const returned = attachSmokeMonitorRejectionBoundary(monitor);
+  try {
+    assert.equal(returned, monitor);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(unhandledReason, null);
+    await assert.rejects(returned, (error) => error === expected);
+  } finally {
+    process.off("unhandledRejection", onUnhandledRejection);
+  }
 });
 
 test("fixture setup failures use the artifact assertion diagnostic", () => {

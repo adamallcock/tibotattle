@@ -451,6 +451,23 @@ export function attachSmokeChildErrorBoundary(child) {
   return child;
 }
 
+/**
+ * A concurrently-started smoke monitor can reject before its later cleanup
+ * await is reached. Attach a rejection handler at construction time so Node
+ * does not terminate the runner for an early unhandled rejection, while
+ * returning the original promise so that the later await still propagates
+ * the fixed monitor failure through the smoke boundary.
+ */
+export function attachSmokeMonitorRejectionBoundary(promise) {
+  if (promise === null
+      || (typeof promise !== "object" && typeof promise !== "function")
+      || typeof promise.catch !== "function") {
+    throw new TypeError("Windows Electron smoke monitor promise is invalid");
+  }
+  void promise.catch(() => {});
+  return promise;
+}
+
 function fail(code) {
   throw fixedError(code);
 }
@@ -2064,12 +2081,16 @@ export async function runSmoke(progress) {
       if (secondObservedMessages.length < 32) secondObservedMessages.push(message);
     }, false);
     const secondDescendantPids = new Set();
-    const secondDescendantMonitor = monitorDescendantsUntilExit(
-      second,
-      secondDescendantPids,
-      "second instance descendant monitor",
+    const secondDescendantMonitor = attachSmokeMonitorRejectionBoundary(
+      monitorDescendantsUntilExit(
+        second,
+        secondDescendantPids,
+        "second instance descendant monitor",
+      ),
     );
-    const secondEndpointMonitor = assertSecondInstanceNeverReady(second, secondPort);
+    const secondEndpointMonitor = attachSmokeMonitorRejectionBoundary(
+      assertSecondInstanceNeverReady(second, secondPort),
+    );
     let primaryDuringSecond;
     try {
       primaryDuringSecond = await command(
@@ -2128,10 +2149,12 @@ export async function runSmoke(progress) {
     // parent is the now-terminated primary process.
     await addCurrentDescendants(primary.pid, primaryDescendantPids);
 
-    const primaryDescendantMonitor = monitorDescendantsUntilExit(
-      primary,
-      primaryDescendantPids,
-      "primary descendant monitor",
+    const primaryDescendantMonitor = attachSmokeMonitorRejectionBoundary(
+      monitorDescendantsUntilExit(
+        primary,
+        primaryDescendantPids,
+        "primary descendant monitor",
+      ),
     );
     primaryQuitRequested = true;
     try {
@@ -2196,10 +2219,12 @@ export async function runSmoke(progress) {
       credentialDeleted = true;
       credentialMayExist = false;
       progress.credentialPersistence = true;
-      const relaunchDescendantMonitor = monitorDescendantsUntilExit(
-        relaunch,
-        relaunchDescendantPids,
-        "relaunch descendant monitor",
+      const relaunchDescendantMonitor = attachSmokeMonitorRejectionBoundary(
+        monitorDescendantsUntilExit(
+          relaunch,
+          relaunchDescendantPids,
+          "relaunch descendant monitor",
+        ),
       );
       relaunchQuitRequested = true;
       try {
