@@ -5522,6 +5522,8 @@ async function fetchJson(fetchImpl, url, options = {}) {
   return response.status === 204 ? null : response.json();
 }
 
+export const LOCAL_REFRESH_STATUS_TIMEOUT_MS = 4_000;
+
 export function normalizeBackendReadiness(payload) {
   const unavailable = Object.freeze({
     state: "unavailable",
@@ -5592,13 +5594,20 @@ export function normalizeBackendReadiness(payload) {
 }
 
 export class LocalCompanionClient {
-  constructor({ fetchImpl = globalThis.fetch } = {}) {
+  constructor({
+    fetchImpl = globalThis.fetch,
+    refreshStatusTimeoutMs = LOCAL_REFRESH_STATUS_TIMEOUT_MS,
+  } = {}) {
     // Browser-native fetch is receiver-sensitive: invoked as a property of
     // this client it throws "Illegal invocation" (WebKit: "Can only call
     // Window.fetch on instances of Window") before any request leaves the
     // page. Hold a detached wrapper so every method may call
     // this.fetchImpl(...) directly.
     this.fetchImpl = (...args) => fetchImpl(...args);
+    this.refreshStatusTimeoutMs = Number.isFinite(refreshStatusTimeoutMs)
+      && refreshStatusTimeoutMs > 0
+      ? Math.max(1, Math.trunc(refreshStatusTimeoutMs))
+      : LOCAL_REFRESH_STATUS_TIMEOUT_MS;
     // Set once the companion has answered 404/405 for the consolidated
     // endpoint, so the negotiation is not repeated on every later load.
     this.consolidatedUnavailable = false;
@@ -5661,8 +5670,23 @@ export class LocalCompanionClient {
     });
   }
 
-  refreshStatus() {
-    return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh`);
+  async refreshStatus() {
+    // The UI's elapsed clock is independent of this request, but the polling
+    // loop still needs a bounded answer so it can enter its explicit
+    // reconnecting state instead of awaiting one starved companion request
+    // forever.
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      this.refreshStatusTimeoutMs,
+    );
+    try {
+      return await fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh`, {
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   /**

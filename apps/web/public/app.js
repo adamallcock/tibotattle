@@ -10928,6 +10928,61 @@ async function requestRefresh({ autoContinue = false } = {}) {
   let cancelled = false;
   let quickResultLoaded = false;
   let continuationLimitReached = false;
+  let progressTicker = null;
+  let activePassStartedMs = null;
+  let latestProgress = null;
+  let latestOutcome = "running";
+  let latestPollCount = 0;
+  let lastStatusReceivedMs = null;
+  const elapsedLabel = () => {
+    const elapsedSeconds = Math.max(
+      0,
+      Math.floor((Date.now() - (activePassStartedMs ?? Date.now())) / 1_000),
+    );
+    return elapsedSeconds >= 60
+      ? `${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s`
+      : `${elapsedSeconds}s`;
+  };
+  const renderRefreshActivity = () => {
+    if (!localRefreshInProgress || activePassStartedMs === null) return;
+    if (localRefreshCancelRequested || latestOutcome === "cancelling") {
+      setLocalizedText(button, "localAnalysis.progress.stopping");
+      return;
+    }
+    // A terminal response owns the label while its verified dashboard is
+    // loading. The independent ticker must never replace that truthful state
+    // with the last running phase merely because the load takes another tick.
+    if (latestOutcome !== "running") return;
+    const elapsed = elapsedLabel();
+    const statusDelayed = lastStatusReceivedMs !== null
+      && Date.now() - lastStatusReceivedMs >= 3_000;
+    const progress = latestProgress;
+    const archiveScanning = progress?.kind === "archive_index";
+    const processed = Number.isSafeInteger(progress?.filesProcessed)
+      ? progress.filesProcessed : null;
+    const selected = Number.isSafeInteger(progress?.filesSelected)
+      ? progress.filesSelected : null;
+    if (statusDelayed) {
+      setLocalizedText(button, "localAnalysis.progress.statusDelayed", { elapsed });
+    } else if (archiveScanning) {
+      setLocalizedText(button, "localAnalysis.progress.indexingArchive", { elapsed });
+    } else if (progress?.phase === "quick_result") {
+      setLocalizedText(button, "localAnalysis.progress.headlineReady", { elapsed });
+    } else if (processed !== null && selected !== null) {
+      if (selected > 0 && processed >= selected) {
+        setLocalizedText(button, "localAnalysis.progress.calculating", { elapsed });
+      } else {
+        setLocalizedText(button, "localAnalysis.progress.analyzingFiles", {
+          processed: formatNumber(processed),
+          selected: formatNumber(selected),
+        });
+      }
+    } else if (latestPollCount < 3) {
+      setLocalizedText(button, "localAnalysis.progress.analyzingEvidence");
+    } else {
+      setLocalizedText(button, "localAnalysis.progress.analyzingElapsed", { elapsed });
+    }
+  };
   localActionBusy = true;
   localRefreshInProgress = true;
   localRefreshCancelRequested = false;
@@ -10938,7 +10993,9 @@ async function requestRefresh({ autoContinue = false } = {}) {
   try {
     await localClient.refresh();
     refreshAccepted = true;
-    let activePassStartedMs = Date.now();
+    activePassStartedMs = Date.now();
+    lastStatusReceivedMs = activePassStartedMs;
+    progressTicker = setInterval(renderRefreshActivity, 1_000);
     const pollingBudget = createRefreshPollingBudget();
     let consecutiveStatusFailures = 0;
     let outcome = "running";
@@ -10956,6 +11013,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
       try {
         status = await localClient.refreshStatus();
         consecutiveStatusFailures = 0;
+        lastStatusReceivedMs = Date.now();
       } catch (error) {
         consecutiveStatusFailures += 1;
         setLocalizedText(button, "localAnalysis.progress.reconnecting");
@@ -10969,6 +11027,9 @@ async function requestRefresh({ autoContinue = false } = {}) {
       finalFailureCode = refresh.failureCode ?? finalFailureCode;
       finalUnifiedIndex = refresh.result?.unifiedIndex ?? finalUnifiedIndex;
       const progress = refresh.progress ?? refresh.result?.indexing ?? null;
+      latestProgress = progress;
+      latestOutcome = outcome;
+      latestPollCount = pollCount;
       const archiveScanning = progress?.kind === "archive_index";
       if (archiveScanning && !archiveHistoryScanActive) {
         archiveHistoryScanActive = true;
@@ -10983,45 +11044,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
           // deep accounting finishes, and no partial replacement is invented.
         }
       }
-      const elapsedSeconds = Math.max(
-        0,
-        Math.floor((Date.now() - activePassStartedMs) / 1_000),
-      );
-      const elapsedLabel = elapsedSeconds >= 60
-        ? `${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s`
-        : `${elapsedSeconds}s`;
-      const processed = Number.isSafeInteger(progress?.filesProcessed)
-        ? progress.filesProcessed : null;
-      const selected = Number.isSafeInteger(progress?.filesSelected)
-        ? progress.filesSelected : null;
-      if (outcome === "cancelling") {
-        setLocalizedText(button, "localAnalysis.progress.stopping");
-      } else if (archiveScanning) {
-        setLocalizedText(button, "localAnalysis.progress.indexingArchive", {
-          elapsed: elapsedLabel,
-        });
-      } else if (progress?.phase === "quick_result") {
-        setLocalizedText(button, "localAnalysis.progress.headlineReady", {
-          elapsed: elapsedLabel,
-        });
-      } else if (processed !== null && selected !== null) {
-        if (selected > 0 && processed >= selected) {
-          setLocalizedText(button, "localAnalysis.progress.calculating", {
-            elapsed: elapsedLabel,
-          });
-        } else {
-          setLocalizedText(button, "localAnalysis.progress.analyzingFiles", {
-            processed: formatNumber(processed),
-            selected: formatNumber(selected),
-          });
-        }
-      } else if (pollCount < 3) {
-        setLocalizedText(button, "localAnalysis.progress.analyzingEvidence");
-      } else {
-        setLocalizedText(button, "localAnalysis.progress.analyzingElapsed", {
-          elapsed: elapsedLabel,
-        });
-      }
+      renderRefreshActivity();
       if (refreshNeedsContinuation({
         outcome,
         errorCode: refresh.errorCode,
@@ -11035,6 +11058,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
           await localClient.refresh();
           pollingBudget.noteContinuation();
           activePassStartedMs = Date.now();
+          lastStatusReceivedMs = activePassStartedMs;
           timeoutSettlementNoted = false;
           setLocalizedText(button, "localAnalysis.progress.continuing");
         } catch (error) {
@@ -11165,6 +11189,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
       showDemo: !dashboard
     });
   } finally {
+    if (progressTicker !== null) clearInterval(progressTicker);
     const wasArchiveScanning = archiveHistoryScanActive;
     archiveHistoryScanActive = false;
     if (wasArchiveScanning && dashboard) renderPricing(dashboard);

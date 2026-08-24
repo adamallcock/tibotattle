@@ -57,6 +57,7 @@ import {
   CONTRIBUTION_SYNC_STATUS_SCHEMA_VERSION,
   formatQuotaWindowDuration,
   isValidQuotaWindowDuration,
+  LOCAL_REFRESH_STATUS_TIMEOUT_MS,
   LOCAL_ONBOARDING_SCHEMA_VERSION,
   CommunityClient,
   demoDashboard,
@@ -2601,6 +2602,22 @@ test("local refresh uses the closed same-origin contract and exposes polling", a
   assert.equal(calls[0].options.body, "{}");
   assert.equal(calls[0].options.headers["X-Usage-Monitor-Local"], "1");
   assert.equal(calls[1].options.method, undefined);
+  assert.ok(calls[1].options.signal instanceof AbortSignal);
+  assert.equal(LOCAL_REFRESH_STATUS_TIMEOUT_MS, 4_000);
+});
+
+test("local refresh status polling settles when the companion stops answering", async () => {
+  const client = new LocalCompanionClient({
+    refreshStatusTimeoutMs: 10,
+    fetchImpl: async (_url, { signal } = {}) => new Promise((resolve, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    }),
+  });
+
+  await assert.rejects(
+    client.refreshStatus(),
+    (error) => error?.name === "AbortError",
+  );
 });
 
 test("local health exposes the content-free preparation mode", async () => {
@@ -5504,6 +5521,10 @@ test("first run is a truthful install and local preflight journey", async () => 
 test("local analysis exposes quick results and cancel-safe progress", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const localizationSource = await readFile(
+    new URL("../public/localization.js", import.meta.url),
+    "utf8",
+  );
 
   assert.match(html, /id="cancel-refresh"[^>]*hidden/u);
   assert.match(appSource, /localClient\.cancelRefresh\(\)/u);
@@ -5513,12 +5534,73 @@ test("local analysis exposes quick results and cancel-safe progress", async () =
   assert.match(appSource, /renderDashboard\(data\)/u);
   assert.match(appSource, /localAnalysis\.progress\.headlineReady/u);
   assert.match(appSource, /localAnalysis\.progress\.calculating/u);
+  assert.match(appSource, /progressTicker = setInterval\(renderRefreshActivity, 1_000\)/u);
+  assert.match(appSource, /Date\.now\(\) - lastStatusReceivedMs >= 3_000/u);
+  assert.match(appSource, /localAnalysis\.progress\.statusDelayed/u);
+  assert.match(appSource, /if \(latestOutcome !== "running"\) return;/u);
+  assert.match(appSource, /clearInterval\(progressTicker\)/u);
+  assert.match(localizationSource, /"localAnalysis\.progress\.statusDelayed"/u);
   assert.match(appSource, /localAnalysis\.notice\.cancelledTitle/u);
   assert.match(appSource, /localAnalysis\.notice\.cancelledCopy/u);
   assert.match(appSource, /refresh_resource_limited/u);
   assert.match(appSource, /localAnalysis\.notice\.resourceLimitedTitle/u);
   assert.match(appSource, /localAnalysis\.notice\.resourceLimitedCopy/u);
   assert.match(appSource, /localAnalysis\.notice\.continuationLimitTitle/u);
+});
+
+test("local refresh activity keeps elapsed time honest without overwriting terminal state", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("  let progressTicker = null;");
+  const end = appSource.indexOf("  localActionBusy = true;", start);
+  assert.ok(start >= 0 && end > start);
+
+  const labels = [];
+  const clock = { now: 5_000 };
+  const context = vm.createContext({
+    button: {},
+    clock,
+    Date: { now: () => clock.now },
+    formatNumber: (value) => String(value),
+    labels,
+    localRefreshCancelRequested: false,
+    localRefreshInProgress: true,
+    setLocalizedText: (_button, key, parameters = {}) => {
+      labels.push({ key, parameters });
+    },
+  });
+  vm.runInContext(`
+    ${appSource.slice(start, end)}
+    activePassStartedMs = 1_000;
+    lastStatusReceivedMs = 1_000;
+    latestProgress = { phase: "quick_result" };
+
+    renderRefreshActivity();
+    clock.now = 66_000;
+    renderRefreshActivity();
+
+    activePassStartedMs = clock.now;
+    lastStatusReceivedMs = clock.now;
+    clock.now += 1_000;
+    renderRefreshActivity();
+
+    localRefreshCancelRequested = true;
+    renderRefreshActivity();
+
+    localRefreshCancelRequested = false;
+    latestOutcome = "succeeded";
+    const terminalLabelCount = labels.length;
+    renderRefreshActivity();
+    globalThis.terminalWriteSuppressed = labels.length === terminalLabelCount;
+  `, context);
+
+  assert.equal(labels[0].key, "localAnalysis.progress.statusDelayed");
+  assert.equal(labels[0].parameters.elapsed, "4s");
+  assert.equal(labels[1].key, "localAnalysis.progress.statusDelayed");
+  assert.equal(labels[1].parameters.elapsed, "1m 5s");
+  assert.equal(labels[2].key, "localAnalysis.progress.headlineReady");
+  assert.equal(labels[2].parameters.elapsed, "1s");
+  assert.equal(labels[3].key, "localAnalysis.progress.stopping");
+  assert.equal(context.terminalWriteSuppressed, true);
 });
 
 test("timeline keeps time, uncertainty, and primary navigation explicit", async () => {
@@ -7158,7 +7240,16 @@ test("the page never schedules uploads itself; recurrence is the approved compan
     /normalizeIncrementalContributionSyncStatus\(payload\)/u,
   );
   assert.match(appSource, /boundedOutcomeDetailCode\(payload\)/u);
-  assert.doesNotMatch(appSource, /setInterval\(/u);
+  // The refresh button owns one display-only elapsed clock. Remove that exact
+  // reviewed expression before retaining this broader guard: contribution
+  // still cannot schedule uploads or any other recurring browser work.
+  assert.doesNotMatch(
+    appSource.replace(
+      "progressTicker = setInterval(renderRefreshActivity, 1_000);",
+      "",
+    ),
+    /setInterval\(/u,
+  );
 });
 
 test("stale local device conflicts name the leftover credential and offer the repair", async () => {

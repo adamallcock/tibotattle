@@ -1071,6 +1071,7 @@ export const WEB_MESSAGES = Object.freeze({
   ],
   "localAnalysis.progress.starting": ["Starting local analysis…", "正在开始本地分析…", "Iniciando análisis local…"],
   "localAnalysis.progress.reconnecting": ["Update running; reconnecting…", "更新正在运行；正在重新连接…", "La actualización continúa; reconectando…"],
+  "localAnalysis.progress.statusDelayed": ["Waiting for companion status… {elapsed}", "正在等待本地伴侣状态… {elapsed}", "Esperando el estado del servicio local… {elapsed}"],
   "localAnalysis.progress.stopping": ["Stopping safely…", "正在安全停止…", "Deteniendo de forma segura…"],
   "localAnalysis.progress.indexingArchive": ["Indexing archive history… {elapsed}", "正在索引存档历史… {elapsed}", "Indexando el historial archivado… {elapsed}"],
   "localAnalysis.progress.headlineReady": ["Headline ready; finishing deeper accounting… {elapsed}", "摘要已就绪；正在完成更深入的核算… {elapsed}", "El resumen está listo; terminando la contabilidad detallada… {elapsed}"],
