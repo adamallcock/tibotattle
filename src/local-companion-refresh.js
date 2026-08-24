@@ -938,6 +938,7 @@ export function createLocalCollectorRefreshRunner({
   // Windows SQLite must be opened through the native lease/session seam. This
   // is qualification-only plumbing until sqliteStateLeaseSafe is true; the
   // current production refresh remains fail-closed on Windows.
+  windowsProtectedStateStore = null,
   windowsSqliteStateSessionFactory = null,
   // The qualification context is a capability, not a readiness override. It
   // is independently checked against the adapter and roots before it enters
@@ -1021,6 +1022,11 @@ export function createLocalCollectorRefreshRunner({
   if (windowsSqliteStateSessionFactory !== null
       && typeof windowsSqliteStateSessionFactory !== "function") {
     throw new TypeError("windowsSqliteStateSessionFactory must be a function or null");
+  }
+  if (windowsProtectedStateStore !== null
+      && (typeof windowsProtectedStateStore !== "object"
+        || Array.isArray(windowsProtectedStateStore))) {
+    throw new TypeError("windowsProtectedStateStore must be an object or null");
   }
   if (windowsSqliteStateStaging !== null
       && (typeof windowsSqliteStateStaging !== "object"
@@ -1268,6 +1274,19 @@ export function createLocalCollectorRefreshRunner({
           ...(windowsSqliteStateSessionFactory === null
             ? {}
             : { windowsSqliteStateSessionFactory }),
+          ...(windowsProtectedStateStore === null
+            ? {}
+            : { windowsProtectedStateStore }),
+          ...(windowsFilesystemAdapter === null
+            ? {}
+            : { windowsFilesystemAdapter }),
+          ...(windowsQualificationModeContext === null
+            ? {}
+            : {
+              windowsQualificationModeContext,
+              stateRoot,
+              resourceRoot,
+            }),
           ...(windowsSqliteStateStaging === null
             ? {}
             : { windowsSqliteStateStaging }),

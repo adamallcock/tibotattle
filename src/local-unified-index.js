@@ -14,6 +14,9 @@ import {
   isWindowsSqliteStateSession,
   isWindowsProtectedStateStore,
   isWindowsSqliteStateStaging,
+  isWindowsQualificationProtectedStateStoreFor,
+  isWindowsQualificationStateSessionFor,
+  isWindowsQualificationSqliteStateStagingFor,
 } from "./platform/index.js";
 
 // The one local index.
@@ -651,10 +654,18 @@ function sameWindowsPath(left, right) {
  * The session brand is intentionally checked in addition to its fields. A
  * copied object with `productionSafe: true` must not authorize a raw
  * DatabaseSync(path) call. The current session implementation remains
- * qualification-only (`productionSafe: false`), so this gate is closed on
- * every real Windows process until native evidence promotes it.
+ * production-unqualified (`productionSafe: false`); only an exact privately
+ * bound disposable qualification session may cross that otherwise-closed
+ * branch while native evidence is collected.
  */
-function qualifiedWindowsSqliteStateSession(session, indexFile) {
+function qualifiedWindowsSqliteStateSession(
+  session,
+  indexFile,
+  windowsQualificationModeContext = null,
+  windowsFilesystemAdapter = null,
+  stateRoot = null,
+  resourceRoot = null,
+) {
   let valid = false;
   try {
     const expected = windowsPath(indexFile);
@@ -665,8 +676,18 @@ function qualifiedWindowsSqliteStateSession(session, indexFile) {
     valid = isWindowsSqliteStateSession(session)
       && session.contractVersion === "windows-sqlite-state-session-v1"
       && sameWindowsPath(sessionPath, expected)
-      && session.productionSafe === true
-      && session.sqliteStateLeaseSafe === true
+      && (
+        (session.productionSafe === true
+          && session.sqliteStateLeaseSafe === true)
+        || isWindowsQualificationStateSessionFor({
+          session,
+          context: windowsQualificationModeContext,
+          adapter: windowsFilesystemAdapter,
+          stateFile: expected,
+          stateRoot,
+          resourceRoot,
+        })
+      )
       && isWindowsSqliteStateDatabase(session.database)
       && typeof session.close === "function"
       && typeof session.abort === "function";
@@ -677,16 +698,33 @@ function qualifiedWindowsSqliteStateSession(session, indexFile) {
   return session;
 }
 
-function qualifiedWindowsProtectedStateStore(store, secretFile) {
+function qualifiedWindowsProtectedStateStore(
+  store,
+  secretFile,
+  windowsQualificationModeContext = null,
+  windowsFilesystemAdapter = null,
+  stateRoot = null,
+  resourceRoot = null,
+) {
   let valid = false;
   try {
     const selectedSecret = windowsPath(secretFile);
     const storeRoot = windowsPath(store.rootPath);
     valid = isWindowsProtectedStateStore(store)
       && store.contractVersion === "windows-protected-state-store-v1"
-      && store.productionSafe === true
-      && store.rootBindingSafe === true
-      && store.nativeReadBounded === true
+      && (
+        (store.productionSafe === true
+          && store.rootBindingSafe === true
+          && store.nativeReadBounded === true)
+        || isWindowsQualificationProtectedStateStoreFor({
+          store,
+          context: windowsQualificationModeContext,
+          adapter: windowsFilesystemAdapter,
+          path: selectedSecret,
+          stateRoot,
+          resourceRoot,
+        })
+      )
       && sameWindowsPath(win32.dirname(selectedSecret), storeRoot)
       && typeof store.ensureProtectedDirectory === "function"
       && typeof store.read === "function"
@@ -698,12 +736,27 @@ function qualifiedWindowsProtectedStateStore(store, secretFile) {
   return store;
 }
 
-function qualifiedWindowsSqliteStateStaging(staging) {
+function qualifiedWindowsSqliteStateStaging(
+  staging,
+  windowsQualificationModeContext = null,
+  windowsFilesystemAdapter = null,
+  path = null,
+  stateRoot = null,
+  resourceRoot = null,
+) {
   let valid = false;
   try {
     valid = isWindowsSqliteStateStaging(staging)
       && staging.contractVersion === "windows-sqlite-state-staging-v1"
-      && staging.stagingSafe === true
+      && (staging.stagingSafe === true
+        || isWindowsQualificationSqliteStateStagingFor({
+          staging,
+          context: windowsQualificationModeContext,
+          adapter: windowsFilesystemAdapter,
+          path,
+          stateRoot,
+          resourceRoot,
+        }))
       && typeof staging.create === "function"
       && typeof staging.clone === "function"
       && typeof staging.publish === "function"
@@ -716,17 +769,39 @@ function qualifiedWindowsSqliteStateStaging(staging) {
 }
 
 export function assertWindowsUnifiedIndexStagingUnavailable(
-  { windowsSqliteStateStaging = null } = {},
+  {
+    windowsSqliteStateStaging = null,
+    windowsQualificationModeContext = null,
+    windowsFilesystemAdapter = null,
+    path = null,
+    stateRoot = null,
+    resourceRoot = null,
+  } = {},
 ) {
   if (process.platform === "win32") {
-    // The native coordinator is now wired, but its readiness bit remains
-    // false until a real Windows qualification proves clone, sidecar, and
-    // atomic-replacement behavior across the supported filesystem matrix.
+    // The native coordinator is wired, but its production readiness bit stays
+    // false until the supported filesystem matrix is proven. The disposable
+    // qualification lane is admitted only through its exact private binding.
     if (windowsSqliteStateStaging === null) {
       throw fixedError(WINDOWS_UNIFIED_INDEX_STAGING_UNAVAILABLE);
     }
-    qualifiedWindowsSqliteStateStaging(windowsSqliteStateStaging);
-    if (windowsSqliteStateStaging.stagingSafe !== true) {
+    qualifiedWindowsSqliteStateStaging(
+      windowsSqliteStateStaging,
+      windowsQualificationModeContext,
+      windowsFilesystemAdapter,
+      path,
+      stateRoot,
+      resourceRoot,
+    );
+    if (windowsSqliteStateStaging.stagingSafe !== true
+        && !isWindowsQualificationSqliteStateStagingFor({
+          staging: windowsSqliteStateStaging,
+          context: windowsQualificationModeContext,
+          adapter: windowsFilesystemAdapter,
+          path,
+          stateRoot,
+          resourceRoot,
+        })) {
       throw fixedError(WINDOWS_UNIFIED_INDEX_STAGING_UNAVAILABLE);
     }
   } else if (windowsSqliteStateStaging !== null) {
@@ -754,7 +829,14 @@ function ownerOnlyRegularFile(metadata) {
 
 export async function assertSafeLocalUnifiedIndexTarget(
   indexFile,
-  { allowMissing = true, windowsSqliteStateSession = null } = {},
+  {
+    allowMissing = true,
+    windowsSqliteStateSession = null,
+    windowsQualificationModeContext = null,
+    windowsFilesystemAdapter = null,
+    stateRoot = null,
+    resourceRoot = null,
+  } = {},
 ) {
   if (process.platform === "win32") {
     // A qualified session has already inspected and identity-bound the
@@ -762,6 +844,10 @@ export async function assertSafeLocalUnifiedIndexTarget(
     qualifiedWindowsSqliteStateSession(
       windowsSqliteStateSession,
       indexFile,
+      windowsQualificationModeContext,
+      windowsFilesystemAdapter,
+      stateRoot,
+      resourceRoot,
     );
     return Object.freeze({ nativeBoundary: true });
   }
@@ -787,7 +873,13 @@ export async function assertSafeLocalUnifiedIndexTarget(
  */
 export async function readOrCreateDeviceSalt(
   secretFile = defaultLocalUnifiedIndexSecretPath(),
-  { windowsProtectedStateStore = null } = {},
+  {
+    windowsProtectedStateStore = null,
+    windowsQualificationModeContext = null,
+    windowsFilesystemAdapter = null,
+    stateRoot = null,
+    resourceRoot = null,
+  } = {},
 ) {
   if (process.platform === "win32") {
     // The device salt is a secret, not a portable cache. On Windows it must
@@ -796,6 +888,10 @@ export async function readOrCreateDeviceSalt(
     const store = qualifiedWindowsProtectedStateStore(
       windowsProtectedStateStore,
       secretFile,
+      windowsQualificationModeContext,
+      windowsFilesystemAdapter,
+      stateRoot,
+      resourceRoot,
     );
     const selected = windowsPath(secretFile);
     const relativeName = win32.basename(selected);
@@ -1266,12 +1362,20 @@ export function openLocalUnifiedIndex(indexFile, {
   staging = false,
   deferSecondaryIndexes = false,
   windowsSqliteStateSession = null,
+  windowsQualificationModeContext = null,
+  windowsFilesystemAdapter = null,
+  stateRoot = null,
+  resourceRoot = null,
 } = {}) {
   let windowsSession = null;
   if (process.platform === "win32") {
     windowsSession = qualifiedWindowsSqliteStateSession(
       windowsSqliteStateSession,
       indexFile,
+      windowsQualificationModeContext,
+      windowsFilesystemAdapter,
+      stateRoot,
+      resourceRoot,
     );
   } else if (windowsSqliteStateSession !== null) {
     throw new TypeError("windowsSqliteStateSession is only valid on Windows");
@@ -2701,9 +2805,24 @@ export function createUnifiedIndexWriter(database, {
     /**
      * Settle the whole run: one optimize, one integrity check, one fsync.
      */
-    async close({ integrityCheck = true, fsyncPath = null } = {}) {
+    async close({
+      integrityCheck = true,
+      fsyncPath = null,
+      windowsSqliteStateStaging = null,
+      windowsQualificationModeContext = null,
+      windowsFilesystemAdapter = null,
+      stateRoot = null,
+      resourceRoot = null,
+    } = {}) {
       if (process.platform === "win32" && fsyncPath !== null) {
-        assertWindowsUnifiedIndexStagingUnavailable();
+        assertWindowsUnifiedIndexStagingUnavailable({
+          windowsSqliteStateStaging,
+          windowsQualificationModeContext,
+          windowsFilesystemAdapter,
+          path: fsyncPath,
+          stateRoot,
+          resourceRoot,
+        });
       }
       commit();
       database.exec("PRAGMA optimize");
@@ -2740,10 +2859,29 @@ export async function publishStagedUnifiedIndex(
   {
     windowsSqliteStateStaging = null,
     expectedTargetIdentity = null,
+    windowsQualificationModeContext = null,
+    windowsFilesystemAdapter = null,
+    stateRoot = null,
+    resourceRoot = null,
   } = {},
 ) {
   if (process.platform === "win32") {
-    assertWindowsUnifiedIndexStagingUnavailable({ windowsSqliteStateStaging });
+    assertWindowsUnifiedIndexStagingUnavailable({
+      windowsSqliteStateStaging,
+      windowsQualificationModeContext,
+      windowsFilesystemAdapter,
+      path: stageFile,
+      stateRoot,
+      resourceRoot,
+    });
+    assertWindowsUnifiedIndexStagingUnavailable({
+      windowsSqliteStateStaging,
+      windowsQualificationModeContext,
+      windowsFilesystemAdapter,
+      path: indexFile,
+      stateRoot,
+      resourceRoot,
+    });
     const stageName = win32.basename(windowsPath(stageFile));
     const targetName = win32.basename(windowsPath(indexFile));
     try {
@@ -2782,10 +2920,23 @@ export async function publishStagedUnifiedIndex(
 
 export async function removeIfPresent(
   path,
-  { windowsSqliteStateStaging = null } = {},
+  {
+    windowsSqliteStateStaging = null,
+    windowsQualificationModeContext = null,
+    windowsFilesystemAdapter = null,
+    stateRoot = null,
+    resourceRoot = null,
+  } = {},
 ) {
   if (process.platform === "win32") {
-    assertWindowsUnifiedIndexStagingUnavailable({ windowsSqliteStateStaging });
+    assertWindowsUnifiedIndexStagingUnavailable({
+      windowsSqliteStateStaging,
+      windowsQualificationModeContext,
+      windowsFilesystemAdapter,
+      path,
+      stateRoot,
+      resourceRoot,
+    });
     try {
       windowsSqliteStateStaging.discard(win32.basename(windowsPath(path)));
     } catch (error) {
@@ -2821,10 +2972,21 @@ const EMPTY_INSPECTION = Object.freeze({
 export async function inspectLocalUnifiedIndex({
   indexFile = defaultLocalUnifiedIndexPath(),
   windowsSqliteStateSession = null,
+  windowsQualificationModeContext = null,
+  windowsFilesystemAdapter = null,
+  stateRoot = null,
+  resourceRoot = null,
 } = {}) {
   let metadata;
   if (process.platform === "win32") {
-    qualifiedWindowsSqliteStateSession(windowsSqliteStateSession, indexFile);
+    qualifiedWindowsSqliteStateSession(
+      windowsSqliteStateSession,
+      indexFile,
+      windowsQualificationModeContext,
+      windowsFilesystemAdapter,
+      stateRoot,
+      resourceRoot,
+    );
     // The native session owns path inspection, but it does not yet expose a
     // handle-bound byte size. Do not fabricate a zero-sized index or reopen a
     // Node lstat race; keep this diagnostic closed until that metadata is part
@@ -2843,6 +3005,10 @@ export async function inspectLocalUnifiedIndex({
     database = openLocalUnifiedIndex(indexFile, {
       readOnly: true,
       windowsSqliteStateSession,
+      windowsQualificationModeContext,
+      windowsFilesystemAdapter,
+      stateRoot,
+      resourceRoot,
     });
     const usage = database.prepare(`
       SELECT COUNT(*) AS events,

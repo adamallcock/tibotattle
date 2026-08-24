@@ -3273,6 +3273,7 @@ export function createCompanionWindowsStateComposition({
       rootPath: stateRoot,
       windowsQualificationModeContext:
         authenticWindowsQualificationModeContext,
+      resourceRoot,
     });
   } catch {
     throw windowsFilesystemConfigurationError();
@@ -3282,6 +3283,9 @@ export function createCompanionWindowsStateComposition({
     sqliteStateStaging = createWindowsSqliteStateStaging({
       adapter: windowsFilesystemAdapter,
       rootPath: stateRoot,
+      windowsQualificationModeContext:
+        authenticWindowsQualificationModeContext,
+      resourceRoot,
     });
   } catch {
     throw windowsFilesystemConfigurationError();
@@ -3997,6 +4001,9 @@ export function createPreparedLocalCompanionServer({
       windowsPrivateProtectedStateStore = createWindowsProtectedStateStore({
         adapter: windowsFilesystemAdapter,
         rootPath: privateStateRoot,
+        windowsQualificationModeContext:
+          windowsQualificationModeContext,
+        resourceRoot,
       });
     } catch {
       throw windowsFilesystemConfigurationError();
@@ -4082,6 +4089,7 @@ export function createPreparedLocalCompanionServer({
       accountObservationOperationLockFile:
         statePaths.accountObservationLockFile,
       windowsFilesystemAdapter,
+      windowsProtectedStateStore,
       windowsSqliteStateSessionFactory,
       windowsQualificationModeContext,
       stateRoot,
@@ -4137,6 +4145,12 @@ export function createPreparedLocalCompanionServer({
       refreshUnifiedIndex: (options) => ingestLocalUnifiedIndexIncrement({
         ...options,
         contractVersion: TELEMETRY_SCHEMA_VERSION,
+        windowsFilesystemAdapter,
+        windowsProtectedStateStore,
+        windowsQualificationModeContext,
+        stateRoot,
+        resourceRoot,
+        windowsSqliteStateStaging,
       }),
       unifiedIndexFile: statePaths.unifiedIndexFile,
       unifiedIndexSecretFile: statePaths.unifiedIndexSecretFile,
