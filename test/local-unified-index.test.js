@@ -57,7 +57,7 @@ import { readLocalUnifiedWindowBreakdown } from "../src/local-unified-window-bre
 const CONTRACT = "usage-event-v0.2";
 
 test("worker batches bound synchronous companion write turns", () => {
-  assert.equal(LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS, 500);
+  assert.equal(LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS, 50);
 });
 const THREAD_ONE = "11111111-1111-4111-8111-111111111111";
 const THREAD_TWO = "22222222-2222-4222-8222-222222222222";
