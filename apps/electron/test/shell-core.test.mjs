@@ -2748,7 +2748,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
 
 test("preload exposes a macOS smoke-only one-shot startup gate and rejects hostile calls", async () => {
   const source = await readFile(join(REPOSITORY_ROOT, "apps/electron/preload.cjs"), "utf8");
-  function runPreload({ platform, control } = {}) {
+  function runPreload({ platform, control, lexicalProcess = false } = {}) {
     const exposed = {};
     const calls = [];
     const contextBridge = {
@@ -2768,20 +2768,32 @@ test("preload exposes a macOS smoke-only one-shot startup gate and rejects hosti
       Promise,
       contextBridge,
       ipcRenderer,
-      process: {
-        platform,
-        env: { USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: control },
-      },
       require(specifier) {
         assert.equal(specifier, "electron");
         return { contextBridge, ipcRenderer };
       },
     };
-    vm.runInNewContext(source, context, { filename: "preload.cjs" });
+    const processValue = {
+      platform,
+      env: { USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: control },
+    };
+    if (lexicalProcess) {
+      context.lexicalProcess = processValue;
+      vm.runInNewContext(`const process = lexicalProcess;\n${source}`, context, {
+        filename: "preload.cjs",
+      });
+    } else {
+      context.process = processValue;
+      vm.runInNewContext(source, context, { filename: "preload.cjs" });
+    }
     return { exposed, calls };
   }
 
-  const smoke = runPreload({ platform: "darwin", control: "quit-v1" });
+  const smoke = runPreload({
+    platform: "darwin",
+    control: "quit-v1",
+    lexicalProcess: true,
+  });
   assert.deepEqual(Object.keys(smoke.exposed), [
     "__TIBOTATTLE_ELECTRON_MACOS_SMOKE__",
     "tibotattleDesktop",
@@ -2818,7 +2830,7 @@ test("preload exposes a macOS smoke-only one-shot startup gate and rejects hosti
     { platform: "darwin", control: "other" },
     { platform: "darwin", control: undefined },
   ]) {
-    const unqualified = runPreload(options);
+    const unqualified = runPreload({ ...options, lexicalProcess: true });
     assert.equal(
       Object.hasOwn(unqualified.exposed, "__TIBOTATTLE_ELECTRON_MACOS_SMOKE__"),
       false,

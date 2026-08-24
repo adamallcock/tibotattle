@@ -257,7 +257,11 @@ function installDesktopBridge() {
 }
 
 function installMacSmokeBridge() {
-  const processRef = globalThis.process;
+  // Electron's sandboxed preload exposes `process` as a preload binding, but
+  // does not guarantee it is an own property of globalThis. Keep the opt-in
+  // gate available in that runtime without weakening its platform/control
+  // checks or exposing anything to production renderers.
+  const processRef = typeof process !== "undefined" ? process : null;
   if (processRef?.platform !== "darwin"
       || processRef?.env?.[MACOS_SMOKE_CONTROL_ENV] !== MACOS_SMOKE_CONTROL
       || typeof contextBridge?.exposeInMainWorld !== "function") {
