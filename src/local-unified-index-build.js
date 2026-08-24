@@ -53,7 +53,7 @@ import {
 // leaves the previous index untouched and costs only the work done so far.
 
 const MAXIMUM_WORKERS = 10;
-export const LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS = 50;
+export const LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS = 1;
 
 const CODEX_BILLING_SURFACE = "chatgpt_subscription";
 

@@ -48,7 +48,7 @@ async function run() {
   // Transaction commits remain governed independently by the host's larger
   // commitRows setting, so this responsiveness bound does not multiply fsyncs.
   const batchEvents = workerData?.batchEvents;
-  if (!Number.isSafeInteger(batchEvents) || batchEvents < 1 || batchEvents > 50) {
+  if (batchEvents !== 1) {
     throw new Error("unified index worker batch bound is invalid");
   }
   const batchAcknowledgement = workerData?.batchAcknowledgement;
