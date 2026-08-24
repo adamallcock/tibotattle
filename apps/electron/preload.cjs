@@ -20,6 +20,13 @@ const MACOS_SMOKE_CONTROL_ENV = "USAGE_MONITOR_ELECTRON_SMOKE_CONTROL";
 const MACOS_SMOKE_CONTROL = "quit-v1";
 const MACOS_SMOKE_BRIDGE_NAME = "__TIBOTATTLE_ELECTRON_MACOS_SMOKE__";
 const MACOS_SMOKE_BRIDGE_VERSION = "v1";
+const WINDOWS_SMOKE_CONTROL = "windows-v1";
+const WINDOWS_SMOKE_BRIDGE_NAME = "__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__";
+const WINDOWS_SMOKE_BRIDGE_VERSION = "v1";
+const WINDOWS_QUALIFICATION_ENV = "USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION";
+const WINDOWS_QUALIFICATION_MARKER = "windows-electron-v1";
+const WINDOWS_TEST_LANE_ENV = "USAGE_MONITOR_TEST_LANE";
+const WINDOWS_TEST_LANE = "windows-electron-smoke";
 const LANGUAGES = Object.freeze(["system", "en", "zh-Hans", "es"]);
 const REFRESH_INTERVALS = Object.freeze([60, 300, 900, 1800]);
 const NOTIFICATION_THRESHOLDS = Object.freeze([
@@ -256,15 +263,32 @@ function installDesktopBridge() {
   contextBridge.exposeInMainWorld("tibotattleDesktop", bridge);
 }
 
-function installMacSmokeBridge() {
+function installQualifiedSmokeBridge() {
   // Electron's sandboxed preload exposes `process` as a preload binding, but
   // does not guarantee it is an own property of globalThis. Keep the opt-in
   // gate available in that runtime without weakening its platform/control
-  // checks or exposing anything to production renderers.
+  // checks or exposing anything to production renderers. Windows uses the
+  // same renderer observation barrier, but with its own exact platform,
+  // control, and bridge name. The two branches are deliberately explicit so
+  // a control intended for one qualification lane can never expose the other
+  // lane's bridge.
   const processRef = typeof process !== "undefined" ? process : null;
-  if (processRef?.platform !== "darwin"
-      || processRef?.env?.[MACOS_SMOKE_CONTROL_ENV] !== MACOS_SMOKE_CONTROL
-      || typeof contextBridge?.exposeInMainWorld !== "function") {
+  const control = processRef?.env?.[MACOS_SMOKE_CONTROL_ENV];
+  let bridgeName;
+  let bridgeVersion;
+  if (processRef?.platform === "darwin" && control === MACOS_SMOKE_CONTROL) {
+    bridgeName = MACOS_SMOKE_BRIDGE_NAME;
+    bridgeVersion = MACOS_SMOKE_BRIDGE_VERSION;
+  } else if (processRef?.platform === "win32"
+      && control === WINDOWS_SMOKE_CONTROL
+      && processRef?.env?.[WINDOWS_QUALIFICATION_ENV] === WINDOWS_QUALIFICATION_MARKER
+      && processRef?.env?.[WINDOWS_TEST_LANE_ENV] === WINDOWS_TEST_LANE) {
+    bridgeName = WINDOWS_SMOKE_BRIDGE_NAME;
+    bridgeVersion = WINDOWS_SMOKE_BRIDGE_VERSION;
+  } else {
+    return;
+  }
+  if (typeof contextBridge?.exposeInMainWorld !== "function") {
     return;
   }
   let resolveStartupRefresh;
@@ -287,8 +311,8 @@ function installMacSmokeBridge() {
     resolveStartupRefresh?.();
     return true;
   };
-  contextBridge.exposeInMainWorld(MACOS_SMOKE_BRIDGE_NAME, Object.freeze({
-    version: MACOS_SMOKE_BRIDGE_VERSION,
+  contextBridge.exposeInMainWorld(bridgeName, Object.freeze({
+    version: bridgeVersion,
     waitForStartupRefresh,
     releaseStartupRefresh,
   }));
@@ -318,5 +342,5 @@ Object.defineProperty(globalThis, "__TIBOTATTLE_PRELOAD_MARKER__", {
   value: marker,
 });
 
-installMacSmokeBridge();
+installQualifiedSmokeBridge();
 installDesktopBridge();

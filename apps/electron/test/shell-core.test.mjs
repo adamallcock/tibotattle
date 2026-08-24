@@ -2746,9 +2746,15 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   );
 });
 
-test("preload exposes a macOS smoke-only one-shot startup gate and rejects hostile calls", async () => {
+test("preload exposes platform-qualified one-shot startup gates and rejects hostile calls", async () => {
   const source = await readFile(join(REPOSITORY_ROOT, "apps/electron/preload.cjs"), "utf8");
-  function runPreload({ platform, control, lexicalProcess = false } = {}) {
+  function runPreload({
+    platform,
+    control,
+    qualificationMarker,
+    testLane,
+    lexicalProcess = false,
+  } = {}) {
     const exposed = {};
     const calls = [];
     const contextBridge = {
@@ -2775,7 +2781,11 @@ test("preload exposes a macOS smoke-only one-shot startup gate and rejects hosti
     };
     const processValue = {
       platform,
-      env: { USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: control },
+      env: {
+        USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: control,
+        USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION: qualificationMarker,
+        USAGE_MONITOR_TEST_LANE: testLane,
+      },
     };
     if (lexicalProcess) {
       context.lexicalProcess = processValue;
@@ -2789,50 +2799,98 @@ test("preload exposes a macOS smoke-only one-shot startup gate and rejects hosti
     return { exposed, calls };
   }
 
-  const smoke = runPreload({
+  async function assertSmokeGate(smoke, name) {
+    const gate = smoke.exposed[name];
+    assert.equal(Object.isFrozen(gate), true);
+    assert.deepEqual(Object.keys(gate), [
+      "version",
+      "waitForStartupRefresh",
+      "releaseStartupRefresh",
+    ]);
+    assert.equal(gate.version, "v1");
+    const pending = gate.waitForStartupRefresh();
+    let settled = false;
+    pending.then(() => { settled = true; });
+    await Promise.resolve();
+    assert.equal(settled, false);
+    assert.equal(gate.releaseStartupRefresh(), true);
+    await pending;
+    assert.equal(gate.releaseStartupRefresh(), false);
+    assert.throws(
+      () => gate.waitForStartupRefresh("unexpected"),
+      (error) => error?.name === "TypeError",
+    );
+    assert.throws(
+      () => gate.releaseStartupRefresh("unexpected"),
+      (error) => error?.name === "TypeError",
+    );
+    assert.deepEqual(smoke.calls, [], "the gate carries no IPC or private data");
+  }
+
+  const macSmoke = runPreload({
     platform: "darwin",
     control: "quit-v1",
     lexicalProcess: true,
   });
-  assert.deepEqual(Object.keys(smoke.exposed), [
+  assert.deepEqual(Object.keys(macSmoke.exposed), [
     "__TIBOTATTLE_ELECTRON_MACOS_SMOKE__",
     "tibotattleDesktop",
   ]);
-  const gate = smoke.exposed.__TIBOTATTLE_ELECTRON_MACOS_SMOKE__;
-  assert.equal(Object.isFrozen(gate), true);
-  assert.deepEqual(Object.keys(gate), [
-    "version",
-    "waitForStartupRefresh",
-    "releaseStartupRefresh",
+  await assertSmokeGate(macSmoke, "__TIBOTATTLE_ELECTRON_MACOS_SMOKE__");
+
+  const windowsSmoke = runPreload({
+    platform: "win32",
+    control: "windows-v1",
+    qualificationMarker: "windows-electron-v1",
+    testLane: "windows-electron-smoke",
+    lexicalProcess: true,
+  });
+  assert.deepEqual(Object.keys(windowsSmoke.exposed), [
+    "__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__",
+    "tibotattleDesktop",
   ]);
-  assert.equal(gate.version, "v1");
-  const pending = gate.waitForStartupRefresh();
-  let settled = false;
-  pending.then(() => { settled = true; });
-  await Promise.resolve();
-  assert.equal(settled, false);
-  assert.equal(gate.releaseStartupRefresh(), true);
-  await pending;
-  assert.equal(gate.releaseStartupRefresh(), false);
-  assert.throws(
-    () => gate.waitForStartupRefresh("unexpected"),
-    (error) => error?.name === "TypeError",
-  );
-  assert.throws(
-    () => gate.releaseStartupRefresh("unexpected"),
-    (error) => error?.name === "TypeError",
-  );
-  assert.deepEqual(smoke.calls, [], "the gate carries no IPC or private data");
+  await assertSmokeGate(windowsSmoke, "__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__");
 
   for (const options of [
     { platform: "linux", control: "quit-v1" },
+    { platform: "linux", control: "windows-v1" },
     { platform: "win32", control: "quit-v1" },
+    { platform: "win32", control: "windows-v1" },
+    { platform: "win32", control: undefined },
+    {
+      platform: "win32",
+      control: "windows-v1",
+      qualificationMarker: "wrong-marker",
+      testLane: "windows-electron-smoke",
+    },
+    {
+      platform: "win32",
+      control: "windows-v1",
+      qualificationMarker: "windows-electron-v1",
+      testLane: "wrong-lane",
+    },
+    {
+      platform: "win32",
+      control: "windows-v1",
+      qualificationMarker: "windows-electron-v1",
+    },
+    {
+      platform: "win32",
+      control: "windows-v1",
+      testLane: "windows-electron-smoke",
+    },
     { platform: "darwin", control: "other" },
+    { platform: "darwin", control: "windows-v1" },
     { platform: "darwin", control: undefined },
   ]) {
     const unqualified = runPreload({ ...options, lexicalProcess: true });
     assert.equal(
       Object.hasOwn(unqualified.exposed, "__TIBOTATTLE_ELECTRON_MACOS_SMOKE__"),
+      false,
+      JSON.stringify(options),
+    );
+    assert.equal(
+      Object.hasOwn(unqualified.exposed, "__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__"),
       false,
       JSON.stringify(options),
     );

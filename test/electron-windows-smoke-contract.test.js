@@ -12,6 +12,7 @@ import {
   aggregate,
   buildPackagedElectronArgs,
   classifyAutomaticStartupRefreshReceipt,
+  classifyWindowsSmokeStartupGateResult,
   classifySmokeFailure,
   createSyntheticFixture,
   classifyWindowsDashboardTargetPoll,
@@ -26,6 +27,8 @@ import {
   WINDOWS_ELECTRON_SMOKE_FAILURE_REASON_ALLOWLIST,
   WINDOWS_ELECTRON_SMOKE_FAILURE_STAGE_ALLOWLIST,
   normalizeWindowsDashboardCheckpoint,
+  releaseWindowsSmokeRefreshGate,
+  WINDOWS_ELECTRON_SMOKE_STARTUP_GATE_ERROR_CODES,
   waitFor,
 } from "../scripts/smoke-electron-windows.mjs";
 
@@ -248,6 +251,13 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.doesNotMatch(source, /\b(?:mkdir|makeDirectory)\(stateRoot/u);
   assert.match(source, /localDashboardReady/u);
   assert.match(source, /\/api\/local\/refresh/u);
+  assert.match(source, /__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__/u);
+  assert.match(source, /releaseWindowsSmokeRefreshGate/u);
+  assert.match(source, /Object\.isFrozen\(bridge\)/u);
+  assert.match(source, /waitForStartupRefresh\.length !== 0/u);
+  assert.match(source, /releaseStartupRefresh\.length !== 0/u);
+  assert.match(source, /bridge\.releaseStartupRefresh\(\)/u);
+  assert.match(source, /WINDOWS_ELECTRON_SMOKE_REFRESH_BOUNDARY_INVALID/u);
   assert.match(source, /\/api\/local\/desktop-status/u);
   assert.match(source, /validateDesktopShellStatus/u);
   assert.match(source, /DESKTOP_STATUS_SCHEMA_INVALID/u);
@@ -663,6 +673,83 @@ test("Windows dashboard target polling remains strict and records checkpoint seq
   assert.match(source, /return selectWindowsDashboardTarget|selectWindowsDashboardTarget\(targets, port\)/u);
   assert.match(source, /dashboardCheckpoint/u);
   assert.match(source, /dashboardCheckpoint: normalizeWindowsDashboardCheckpoint/u);
+  const pageEnable = source.indexOf('await cdp.request("Page.enable")', connectionStart);
+  const networkEnable = source.indexOf('await cdp.request("Network.enable")', connectionStart);
+  const initialLoaderBinding = source.indexOf(
+    "selectRequiredRefreshLoader(refreshObserver, initialLoader)",
+    connectionStart,
+  );
+  const rendererReadyWait = source.indexOf("const ready = await waitFor", connectionStart);
+  const readyLoaderBinding = source.indexOf(
+    "selectRequiredRefreshLoader(refreshObserver, readyLoader)",
+    connectionStart,
+  );
+  const originValidation = source.indexOf(
+    "refreshObserver.selectOrigin(dashboardUrl.origin)",
+    connectionStart,
+  );
+  const gateRelease = source.indexOf(
+    "await releaseWindowsSmokeRefreshGate(cdp)",
+    connectionStart,
+  );
+  const automaticRefresh = source.indexOf(
+    "await assertAutomaticStartupRefresh({",
+    connectionStart,
+  );
+  assert.ok(pageEnable >= 0);
+  assert.ok(networkEnable > pageEnable);
+  assert.ok(initialLoaderBinding > networkEnable);
+  assert.ok(rendererReadyWait > initialLoaderBinding);
+  assert.ok(readyLoaderBinding > rendererReadyWait);
+  assert.ok(originValidation > readyLoaderBinding);
+  assert.ok(gateRelease > originValidation);
+  assert.ok(automaticRefresh > gateRelease);
+  assert.match(source, /dashboardUrl\.origin !== targetDashboardOrigin/u);
+});
+
+test("Windows preload startup gate requires one exact successful release", async () => {
+  const expressions = [];
+  const cdp = {
+    async evaluate(expression) {
+      expressions.push(expression);
+      return "released";
+    },
+  };
+  assert.equal(await releaseWindowsSmokeRefreshGate(cdp), true);
+  assert.equal(expressions.length, 1);
+  assert.match(expressions[0], /__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__/u);
+  assert.match(expressions[0], /Object\.isFrozen\(bridge\)/u);
+  assert.match(expressions[0], /Object\.keys\(bridge\)\[0\] !== "version"/u);
+  assert.match(expressions[0], /waitForStartupRefresh\.length !== 0/u);
+  assert.match(expressions[0], /releaseStartupRefresh\.length !== 0/u);
+  assert.match(expressions[0], /releaseStartupRefresh\(\)/u);
+
+  const errorCode = WINDOWS_ELECTRON_SMOKE_STARTUP_GATE_ERROR_CODES.boundaryInvalid;
+  for (const [result, reason] of [
+    ["missing", "missing"],
+    ["malformed", "malformed"],
+    ["duplicate", "duplicate"],
+    [null, "malformed"],
+    [{ status: "released" }, "malformed"],
+  ]) {
+    assert.deepEqual(
+      classifyWindowsSmokeStartupGateResult(result),
+      result === "released"
+        ? { status: "released" }
+        : { status: "failed", errorCode, reason },
+    );
+    await assert.rejects(
+      () => releaseWindowsSmokeRefreshGate({
+        evaluate: async () => result,
+      }),
+      (error) => error?.code === errorCode,
+      `gate result ${String(result)} must fail closed`,
+    );
+  }
+  await assert.rejects(
+    () => releaseWindowsSmokeRefreshGate(null),
+    (error) => error?.code === errorCode,
+  );
 });
 
 test("Windows startup refresh evidence requires the validated origin and active loader", () => {
