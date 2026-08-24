@@ -107,9 +107,9 @@ function allowancePreview() {
         day,
         combined: allowanceSummary(2_000 + index * 2),
         byPlanType: {
-          pro: allowanceSummary(1_900 + index * 2, 2, 2),
-          prolite: allowanceSummary(2_150 + index, 2, 2),
-          plus: allowanceSummary(1_750 + index * 3, 2, 1),
+          pro: allowanceSummary(1_900 + index * 2, 5, 2),
+          prolite: allowanceSummary(2_150 + index, 4, 2),
+          plus: allowanceSummary(1_750 + index * 3, 3, 1),
         },
       };
     }),
@@ -143,7 +143,45 @@ test("allowance preview switches series without changing its numerical axes", as
   assert.deepEqual(plans.dollarTicks, combined.dollarTicks);
   assert.deepEqual(plans.dayTicks, combined.dayTicks);
   assert.deepEqual(plans.plot, combined.plot);
-  assert.equal(plans.bandSegments.length, 0);
+  assert.equal(plans.bandSeries.length, 3);
+  assert.ok(plans.bandSeries.every((band) => band.segments[0].length === 30));
+  assert.equal(plans.bandSegments.length, 3);
+});
+
+test("allowance preview filters one plan without rescaling or hiding legend choices", async () => {
+  const { adminAllowanceChartModel } = await importAdminModule();
+  const preview = allowancePreview();
+  const allPlans = adminAllowanceChartModel(preview, {
+    mode: "plans",
+    rangeDays: 30,
+  });
+  const filtered = adminAllowanceChartModel(preview, {
+    mode: "plans",
+    planFilter: "prolite",
+    rangeDays: 30,
+  });
+
+  assert.equal(filtered.activePlanFilter, "prolite");
+  assert.deepEqual(filtered.series.map((series) => series.label), ["Pro 5x → 20x"]);
+  assert.deepEqual(filtered.bandSeries.map((band) => band.key), ["prolite"]);
+  assert.deepEqual(filtered.legendSeries.map((series) => series.key), [
+    "pro",
+    "prolite",
+    "plus",
+  ]);
+  assert.deepEqual(filtered.dollarTicks, allPlans.dollarTicks);
+  assert.deepEqual(filtered.dayTicks, allPlans.dayTicks);
+  assert.deepEqual(filtered.plot, allPlans.plot);
+});
+
+test("allowance plan filter toggles the selected plan and rejects unknown plans", async () => {
+  const { toggleAdminAllowancePlanFilter } = await importAdminModule();
+  const plans = allowancePreview().plans;
+
+  assert.equal(toggleAdminAllowancePlanFilter(null, "pro", plans), "pro");
+  assert.equal(toggleAdminAllowancePlanFilter("pro", "pro", plans), null);
+  assert.equal(toggleAdminAllowancePlanFilter("pro", "plus", plans), "plus");
+  assert.equal(toggleAdminAllowancePlanFilter("pro", "unknown", plans), null);
 });
 
 test("allowance preview exposes the complete honest 70-day range", async () => {

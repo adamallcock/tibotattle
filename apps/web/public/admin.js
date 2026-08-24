@@ -18,6 +18,7 @@ const state = {
   retryDelayMilliseconds: 30_000,
   allowancePreview: null,
   allowanceMode: "combined",
+  allowancePlanFilter: null,
   allowanceRangeDays: 30,
   notificationPreferences: null,
 };
@@ -1685,6 +1686,7 @@ function adminAllowanceSegments(points) {
  */
 export function adminAllowanceChartModel(preview, {
   mode = "combined",
+  planFilter = null,
   rangeDays = 30,
   width = ADMIN_ALLOWANCE_CHART_WIDTH,
   height = ADMIN_ALLOWANCE_CHART_HEIGHT,
@@ -1702,12 +1704,20 @@ export function adminAllowanceChartModel(preview, {
     Date.parse(`${day.day}T00:00:00.000Z`) >= cutoffMs
   ));
   if (days.length === 0) return null;
-  const series = mode === "combined"
+  const planSeries = preview.plans.map((plan) => ({
+    key: plan.planType,
+    ...ADMIN_ALLOWANCE_PLAN_STYLES[plan.planType],
+  }));
+  const activePlanFilter = mode === "plans"
+    && planSeries.some((plan) => plan.key === planFilter)
+    ? planFilter
+    : null;
+  const legendSeries = mode === "combined"
     ? [{ key: "combined", label: "Combined", className: "combined" }]
-    : preview.plans.map((plan) => ({
-      key: plan.planType,
-      ...ADMIN_ALLOWANCE_PLAN_STYLES[plan.planType],
-    }));
+    : planSeries;
+  const series = activePlanFilter === null
+    ? legendSeries
+    : planSeries.filter((plan) => plan.key === activePlanFilter);
   const summaryFor = (day, key) => (
     key === "combined" ? day.combined : day.byPlanType[key]
   );
@@ -1726,12 +1736,20 @@ export function adminAllowanceChartModel(preview, {
     if (day.combined.centralUsd !== null) {
       valueCandidates.push(day.combined.centralUsd);
       if (day.combined.band80Usd !== null) {
+        valueCandidates.push(day.combined.band80Usd.lowerUsd);
         valueCandidates.push(day.combined.band80Usd.upperUsd);
       }
     }
     for (const plan of preview.plans) {
-      const central = day.byPlanType[plan.planType]?.centralUsd;
+      const summary = day.byPlanType[plan.planType];
+      const central = summary?.centralUsd;
       if (central !== null && central !== undefined) valueCandidates.push(central);
+      if (summary?.band80Usd !== null && summary?.band80Usd !== undefined) {
+        valueCandidates.push(
+          summary.band80Usd.lowerUsd,
+          summary.band80Usd.upperUsd,
+        );
+      }
     }
   }
   if (visibleValueCount === 0 || valueCandidates.length === 0) return null;
@@ -1779,16 +1797,19 @@ export function adminAllowanceChartModel(preview, {
       latest: points.at(-1) ?? null,
     };
   });
-  const bandPoints = mode === "combined" ? days.flatMap((day) => {
-    const band = day.combined.band80Usd;
-    return band === null ? [] : [{
-      day: day.day,
-      x: x(day.day),
-      upperY: y(band.upperUsd),
-      lowerY: y(band.lowerUsd),
-    }];
-  }) : [];
-  const bandSegments = adminAllowanceSegments(bandPoints);
+  const bandSeries = series.flatMap((definition) => {
+    const points = days.flatMap((day) => {
+      const band = summaryFor(day, definition.key)?.band80Usd;
+      return band === null || band === undefined ? [] : [{
+        day: day.day,
+        x: x(day.day),
+        upperY: y(band.upperUsd),
+        lowerY: y(band.lowerUsd),
+      }];
+    });
+    const segments = adminAllowanceSegments(points);
+    return segments.length === 0 ? [] : [{ ...definition, segments }];
+  });
   const maximumTicks = 6;
   const dayTicks = Array.from({ length: maximumTicks }, (_, index) => {
     const atMs = startMs + Math.round(
@@ -1805,9 +1826,22 @@ export function adminAllowanceChartModel(preview, {
     dollarTicks,
     dayTicks,
     tickLabelStyle: days.length > 45 ? "month" : "day",
+    mode,
+    activePlanFilter,
+    legendSeries,
     series: modeledSeries,
-    bandSegments,
+    bandSeries,
+    bandSegments: bandSeries.flatMap((band) => band.segments),
   };
+}
+
+export function toggleAdminAllowancePlanFilter(
+  currentPlanType,
+  selectedPlanType,
+  plans,
+) {
+  if (!plans.some((plan) => plan.planType === selectedPlanType)) return null;
+  return currentPlanType === selectedPlanType ? null : selectedPlanType;
 }
 
 function adminAllowanceSvg(tag, className = "", attributes = {}) {
@@ -1835,20 +1869,48 @@ function allowanceUsd(value) {
   }).format(value);
 }
 
+function allowanceCountLabel(value, singular) {
+  return `${value} ${singular}${value === 1 ? "" : "s"}`;
+}
+
 function appendAdminAllowanceLegend(figure, model) {
-  const legend = document.createElement("p");
+  const legend = document.createElement("div");
   legend.className = "admin-allowance-legend";
-  for (const series of model.series) {
-    const item = document.createElement("span");
+  if (model.mode === "plans") {
+    legend.classList.add("admin-allowance-legend-interactive");
+    if (model.activePlanFilter !== null) {
+      legend.classList.add("admin-allowance-legend-filtered");
+    }
+    legend.setAttribute("role", "group");
+    legend.setAttribute("aria-label", "Filter allowance chart by plan");
+  }
+  for (const series of model.legendSeries) {
+    const item = document.createElement(model.mode === "plans" ? "button" : "span");
+    if (model.mode === "plans") {
+      const selected = model.activePlanFilter === series.key;
+      item.type = "button";
+      item.className = "admin-allowance-legend-button";
+      item.dataset.allowancePlan = series.key;
+      item.setAttribute("aria-pressed", String(selected));
+      item.setAttribute(
+        "aria-label",
+        selected ? `Show all plans` : `Show only ${series.label}`,
+      );
+      item.title = selected
+        ? "Show all plans"
+        : `Filter chart to ${series.label}`;
+    }
     const swatch = document.createElement("span");
-    swatch.className = `admin-allowance-swatch admin-allowance-swatch-${series.className}`;
+    swatch.className = model.mode === "plans"
+      ? `admin-allowance-plan-key admin-allowance-plan-key-${series.className}`
+      : `admin-allowance-swatch admin-allowance-swatch-${series.className}`;
     swatch.setAttribute("aria-hidden", "true");
     const label = document.createElement("span");
     label.textContent = series.label;
     item.append(swatch, label);
     legend.append(item);
   }
-  if (model.bandSegments.length > 0) {
+  if (model.mode === "combined" && model.bandSegments.length > 0) {
     const item = document.createElement("span");
     const swatch = document.createElement("span");
     swatch.className = "admin-allowance-swatch admin-allowance-swatch-band";
@@ -1864,6 +1926,7 @@ function appendAdminAllowanceLegend(figure, model) {
 function appendAdminAllowanceChart(container, preview) {
   const model = adminAllowanceChartModel(preview, {
     mode: state.allowanceMode,
+    planFilter: state.allowancePlanFilter,
     rangeDays: state.allowanceRangeDays,
   });
   if (model === null) {
@@ -1875,13 +1938,18 @@ function appendAdminAllowanceChart(container, preview) {
   }
   const figure = document.createElement("div");
   figure.className = "community-daily-chart community-allowance-chart";
+  if (model.activePlanFilter !== null) {
+    figure.classList.add("community-allowance-chart-filtered");
+  }
   appendAdminAllowanceLegend(figure, model);
   const svg = adminAllowanceSvg("svg", "", {
     viewBox: `0 0 ${model.width} ${model.height}`,
     role: "img",
     "aria-label": state.allowanceMode === "combined"
       ? "Combined Pro 20x-equivalent community allowance by day"
-      : "Pro 20x-equivalent community allowance by plan and day",
+      : model.activePlanFilter === null
+        ? "Pro 20x-equivalent community allowance by plan and day"
+        : `${model.series[0].label} Pro 20x-equivalent community allowance by day`,
   });
   for (const tick of model.dollarTicks) {
     svg.append(adminAllowanceSvg("line", "chart-grid", {
@@ -1910,24 +1978,32 @@ function appendAdminAllowanceChart(container, preview) {
     label.textContent = tickFormatter.format(new Date(`${tick.day}T00:00:00.000Z`));
     svg.append(label);
   }
-  for (const band of model.bandSegments) {
-    if (band.length >= 2) {
-      const forward = band.map((point) => (
-        `${point.x.toFixed(1)},${point.upperY.toFixed(1)}`
-      ));
-      const backward = [...band].reverse().map((point) => (
-        `${point.x.toFixed(1)},${point.lowerY.toFixed(1)}`
-      ));
-      svg.append(adminAllowanceSvg("path", "admin-allowance-band-area", {
-        d: `M${[...forward, ...backward].join(" L")} Z`,
-      }));
-    } else {
-      svg.append(adminAllowanceSvg("line", "admin-allowance-band-mark", {
-        x1: band[0].x,
-        x2: band[0].x,
-        y1: band[0].upperY,
-        y2: band[0].lowerY,
-      }));
+  for (const bandSeries of model.bandSeries) {
+    for (const band of bandSeries.segments) {
+      if (band.length >= 2) {
+        const forward = band.map((point) => (
+          `${point.x.toFixed(1)},${point.upperY.toFixed(1)}`
+        ));
+        const backward = [...band].reverse().map((point) => (
+          `${point.x.toFixed(1)},${point.lowerY.toFixed(1)}`
+        ));
+        svg.append(adminAllowanceSvg(
+          "path",
+          `admin-allowance-band-area admin-allowance-band-area-${bandSeries.className}`,
+          { d: `M${[...forward, ...backward].join(" L")} Z` },
+        ));
+      } else {
+        svg.append(adminAllowanceSvg(
+          "line",
+          `admin-allowance-band-mark admin-allowance-band-mark-${bandSeries.className}`,
+          {
+            x1: band[0].x,
+            x2: band[0].x,
+            y1: band[0].upperY,
+            y2: band[0].lowerY,
+          },
+        ));
+      }
     }
   }
   for (const series of model.series) {
@@ -1951,11 +2027,11 @@ function appendAdminAllowanceChart(container, preview) {
           cy: point.y,
           r: Math.min(6, 2.4 + Math.sqrt(point.fitCount)),
           tabindex: 0,
-          "aria-label": `${series.label}, ${point.day}: ${allowanceUsd(point.value)}, ${point.participantCount} accounts, ${point.fitCount} fits`,
+          "aria-label": `${series.label}, ${point.day}: ${allowanceUsd(point.value)}, ${allowanceCountLabel(point.participantCount, "account")}, ${allowanceCountLabel(point.fitCount, "fit")}`,
         },
       );
       const title = adminAllowanceSvg("title");
-      title.textContent = `${series.label} · ${point.day} · ${allowanceUsd(point.value)} · ${point.participantCount} accounts · ${point.fitCount} fits`;
+      title.textContent = `${series.label} · ${point.day} · ${allowanceUsd(point.value)} · ${allowanceCountLabel(point.participantCount, "account")} · ${allowanceCountLabel(point.fitCount, "fit")}`;
       dot.append(title);
       svg.append(dot);
     }
@@ -1984,9 +2060,9 @@ function appendCombinedAllowanceSummary(container, preview) {
   fits.textContent = String(latest.summary.fitCount);
   evidence.append(
     accounts,
-    document.createTextNode(" accounts · "),
+    document.createTextNode(` ${latest.summary.participantCount === 1 ? "account" : "accounts"} · `),
     fits,
-    document.createTextNode(" fits"),
+    document.createTextNode(` ${latest.summary.fitCount === 1 ? "fit" : "fits"}`),
   );
   const date = document.createElement("span");
   date.textContent = latest.day;
@@ -2008,6 +2084,9 @@ function appendPlanAllowanceSummaries(container, preview) {
     const style = ADMIN_ALLOWANCE_PLAN_STYLES[plan.planType];
     const item = document.createElement("div");
     item.className = "admin-allowance-plan-summary";
+    if (state.allowancePlanFilter === plan.planType) {
+      item.classList.add("admin-allowance-plan-summary-selected");
+    }
     const label = document.createElement("span");
     label.textContent = style.label;
     const value = document.createElement("strong");
@@ -2015,8 +2094,13 @@ function appendPlanAllowanceSummaries(container, preview) {
     const meta = document.createElement("small");
     meta.textContent = latest === null
       ? "No qualifying fits"
-      : `${latest.summary.participantCount} accounts · ${latest.summary.fitCount} fits`;
-    item.append(label, value, meta);
+      : `${allowanceCountLabel(latest.summary.participantCount, "account")} · ${allowanceCountLabel(latest.summary.fitCount, "fit")}`;
+    const range = document.createElement("small");
+    range.className = "admin-allowance-plan-range";
+    range.textContent = latest?.summary.band80Usd
+      ? `Middle 80% ${allowanceUsd(latest.summary.band80Usd.lowerUsd)}–${allowanceUsd(latest.summary.band80Usd.upperUsd)}`
+      : "Middle 80% unavailable";
+    item.append(label, value, meta, range);
     list.append(item);
   }
   container.append(list);
@@ -2057,6 +2141,9 @@ function renderAdminCommunityAllowance(preview) {
   }
   badge.className = "admin-source-badge admin-source-available";
   badge.textContent = "Admin preview available";
+  if (!preview.plans.some((plan) => plan.planType === state.allowancePlanFilter)) {
+    state.allowancePlanFilter = null;
+  }
   if (state.allowanceMode === "combined") {
     appendCombinedAllowanceSummary(container, preview);
   } else {
@@ -2256,6 +2343,16 @@ if (isAdminPage) {
     state.allowanceRangeDays = button.dataset.rangeDays === "all"
       ? null
       : Number(button.dataset.rangeDays);
+    renderAdminCommunityAllowance(state.allowancePreview);
+  });
+  $("#admin-community-allowance-result").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-allowance-plan]");
+    if (!button || state.allowancePreview === null) return;
+    state.allowancePlanFilter = toggleAdminAllowancePlanFilter(
+      state.allowancePlanFilter,
+      button.dataset.allowancePlan,
+      state.allowancePreview.plans,
+    );
     renderAdminCommunityAllowance(state.allowancePreview);
   });
   $("#sync-distribution").addEventListener("click", async () => {
