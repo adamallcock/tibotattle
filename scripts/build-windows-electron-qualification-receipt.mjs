@@ -59,6 +59,8 @@ const RUNTIME_KEYS = Object.freeze([
   "contentFree",
   "dashboardReady",
   "dashboardCheckpoint",
+  "dashboardRefreshProgress",
+  "dashboardRefreshFailure",
   "credentialPersistence",
   "failureReason",
   "failureStage",
@@ -98,6 +100,39 @@ const DASHBOARD_CHECKPOINT_ALLOWLIST = Object.freeze([
   "startup_refresh_request_observed",
   "startup_refresh_receipt_accepted",
   "startup_refresh_terminal_succeeded",
+]);
+const DASHBOARD_REFRESH_PROGRESS_ALLOWLIST = Object.freeze([
+  Object.freeze({ stage: "none", detail: "none" }),
+  Object.freeze({ stage: "collector", detail: "in_progress" }),
+  Object.freeze({ stage: "collector", detail: "quick_result" }),
+  Object.freeze({ stage: "indexing", detail: "archive_index" }),
+]);
+const UNIFIED_INDEX_FAILURE_CODE_ALLOWLIST = Object.freeze([
+  "codex_rollout_compression_unsupported",
+  "codex_rollout_filename_identity_mismatch",
+  "codex_rollout_generation_ambiguous",
+  "codex_rollout_lineage_invalid",
+  "codex_rollout_content_invalid",
+  "codex_rollout_tail_incomplete",
+  "local_unified_index_aborted",
+  "local_unified_index_directory_sync_failed",
+  "local_unified_index_file_changed",
+  "local_unified_index_file_invalid",
+  "local_unified_index_generation_invalid",
+  "local_unified_index_generation_mismatch",
+  "local_unified_index_integrity_failed",
+  "local_unified_index_journal_mode_refused",
+  "local_unified_index_meta_invalid",
+  "local_unified_index_missing",
+  "local_unified_index_publication_durability_uncertain",
+  "local_unified_index_schema_invalid",
+  "local_unified_index_secondary_indexes_failed",
+  "local_unified_index_secondary_indexes_missing",
+  "local_unified_index_secret_invalid",
+  "local_unified_index_secret_unavailable",
+  "local_unified_index_unavailable",
+  "local_unified_index_worker_failed",
+  "local_unified_index_refresh_failed",
 ]);
 const RECEIPT_KEYS = Object.freeze([
   "binding",
@@ -295,6 +330,28 @@ export function parseQualificationResult(value, expected) {
  * unsupported runtime claim.
  */
 export function validateRuntimeEvidence(value) {
+  const progress = value?.dashboardRefreshProgress;
+  const progressKeys = progress !== null
+    && typeof progress === "object"
+    && !Array.isArray(progress)
+    ? Object.keys(progress).sort(compareKeys).join("\0")
+    : null;
+  const validProgress = progressKeys === "detail\0stage"
+    && DASHBOARD_REFRESH_PROGRESS_ALLOWLIST.some(
+      (candidate) => candidate.stage === progress.stage
+        && candidate.detail === progress.detail,
+    );
+  const failure = value?.dashboardRefreshFailure;
+  const failureKeys = failure !== null
+    && typeof failure === "object"
+    && !Array.isArray(failure)
+    ? Object.keys(failure).sort(compareKeys).join("\0")
+    : null;
+  const validFailure = failureKeys === "failedStep\0failureCode"
+    && ((failure.failedStep === "none" && failure.failureCode === "none")
+      || (failure.failedStep === "unified_index"
+        && (failure.failureCode === "unknown"
+          || UNIFIED_INDEX_FAILURE_CODE_ALLOWLIST.includes(failure.failureCode))));
   if (!exactObjectKeys(value, RUNTIME_KEYS)
       || value.status !== RUNTIME_AGGREGATE_STATUS
       || value.target !== TARGET
@@ -303,11 +360,18 @@ export function validateRuntimeEvidence(value) {
       || value.failureReason !== "none"
       || !DASHBOARD_CHECKPOINT_ALLOWLIST.includes(value.dashboardCheckpoint)
       || value.dashboardCheckpoint !== "startup_refresh_terminal_succeeded"
+      || !validProgress
+      || !validFailure
+      || failure.failedStep !== "none"
+      || failure.failureCode !== "none"
       || RUNTIME_KEYS
-        .filter((key) => !["status", "target", "contentFree", "failureStage", "failureReason", "dashboardCheckpoint"].includes(key))
+        .filter((key) => !["status", "target", "contentFree", "failureStage", "failureReason", "dashboardCheckpoint", "dashboardRefreshProgress", "dashboardRefreshFailure"].includes(key))
         .some((key) => value[key] !== true)) {
     fail(FIXED_STATUS.runtimeInvalid);
   }
+  // Startup progress is retained in the failed/safe runtime sidecar. A
+  // passed canonical receipt only carries the boolean checks, so this
+  // qualification-only diagnostic cannot expand the release receipt shape.
   return Object.freeze({
     checks: Object.freeze({
       cleanQuit: true,

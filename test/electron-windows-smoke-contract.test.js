@@ -25,9 +25,16 @@ import {
   selectWindowsDashboardTarget,
   WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES,
   WINDOWS_ELECTRON_SMOKE_DASHBOARD_CHECKPOINT_ALLOWLIST,
+  WINDOWS_ELECTRON_SMOKE_DASHBOARD_REFRESH_PROGRESS_ALLOWLIST,
+  WINDOWS_ELECTRON_SMOKE_UNIFIED_INDEX_FAILURE_CODE_ALLOWLIST,
+  classifyWindowsDashboardRefreshProgress,
+  classifyWindowsDashboardRefreshFailure,
   WINDOWS_ELECTRON_SMOKE_FAILURE_REASON_ALLOWLIST,
   WINDOWS_ELECTRON_SMOKE_FAILURE_STAGE_ALLOWLIST,
   normalizeWindowsDashboardCheckpoint,
+  normalizeWindowsDashboardRefreshProgress,
+  normalizeWindowsDashboardRefreshFailure,
+  advanceWindowsDashboardRefreshProgress,
   releaseWindowsSmokeRefreshGate,
   WINDOWS_ELECTRON_SMOKE_STARTUP_GATE_ERROR_CODES,
   waitFor,
@@ -199,6 +206,7 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
     "dash_startup_changed",
     "dash_startup_failed",
     "dash_startup_cancelled",
+    "dash_startup_degraded",
   ]) {
     assert.match(workflow, new RegExp(`'${reason}'`, "u"));
   }
@@ -686,6 +694,133 @@ test("Windows dashboard checkpoints advance monotonically through startup proof"
   );
 });
 
+test("Windows startup refresh progress is fixed, bounded, and content-free", () => {
+  assert.deepEqual(WINDOWS_ELECTRON_SMOKE_DASHBOARD_REFRESH_PROGRESS_ALLOWLIST, [
+    { stage: "none", detail: "none" },
+    { stage: "collector", detail: "in_progress" },
+    { stage: "collector", detail: "quick_result" },
+    { stage: "indexing", detail: "archive_index" },
+  ]);
+  for (const progress of WINDOWS_ELECTRON_SMOKE_DASHBOARD_REFRESH_PROGRESS_ALLOWLIST) {
+    assert.equal(normalizeWindowsDashboardRefreshProgress(progress), progress);
+  }
+  for (const invalid of [
+    null,
+    undefined,
+    { stage: "collector", detail: "quick_result", path: "private" },
+    { stage: "collector", detail: "private" },
+    { stage: "indexing", detail: "archive_index secret" },
+  ]) {
+    assert.deepEqual(
+      normalizeWindowsDashboardRefreshProgress(invalid),
+      { stage: "none", detail: "none" },
+    );
+  }
+  assert.deepEqual(
+    classifyWindowsDashboardRefreshProgress({ refreshId: "private" }),
+    { stage: "none", detail: "none" },
+  );
+  assert.deepEqual(
+    classifyWindowsDashboardRefreshProgress({
+      progress: { phase: "quick_result", coveredAt: { startAt: "private" } },
+    }),
+    { stage: "collector", detail: "quick_result" },
+  );
+  assert.deepEqual(
+    classifyWindowsDashboardRefreshProgress({
+      progress: {
+        mode: "prospective",
+        status: "prospective_only",
+        phase: "prospective",
+        boundedBy: "modified_at_and_collection_start",
+        filesProcessed: 1,
+      },
+    }),
+    { stage: "collector", detail: "in_progress" },
+  );
+  assert.deepEqual(
+    classifyWindowsDashboardRefreshProgress({
+      progress: { kind: "archive_index", status: "scanning", sourceCount: 99 },
+    }),
+    { stage: "indexing", detail: "archive_index" },
+  );
+  assert.deepEqual(
+    advanceWindowsDashboardRefreshProgress(
+      { stage: "indexing", detail: "archive_index" },
+      { stage: "none", detail: "none" },
+    ),
+    { stage: "indexing", detail: "archive_index" },
+  );
+  const serialized = JSON.stringify(
+    classifyWindowsDashboardRefreshProgress({
+      progress: { phase: "quick_result", secret: "must not cross boundary" },
+    }),
+  );
+  assert.doesNotMatch(serialized, /secret|private|coveredAt/iu);
+});
+
+test("Windows degraded startup refreshes fail closed with fixed unified-index diagnostics", () => {
+  assert.ok(WINDOWS_ELECTRON_SMOKE_UNIFIED_INDEX_FAILURE_CODE_ALLOWLIST.length > 0);
+  const knownCode = WINDOWS_ELECTRON_SMOKE_UNIFIED_INDEX_FAILURE_CODE_ALLOWLIST[0];
+  const fallbackCode = "local_unified_index_refresh_failed";
+  assert.equal(
+    WINDOWS_ELECTRON_SMOKE_UNIFIED_INDEX_FAILURE_CODE_ALLOWLIST.includes(fallbackCode),
+    true,
+  );
+  assert.deepEqual(
+    normalizeWindowsDashboardRefreshFailure({
+      failedStep: "none",
+      failureCode: "none",
+    }),
+    { failedStep: "none", failureCode: "none" },
+  );
+  assert.deepEqual(
+    classifyWindowsDashboardRefreshFailure({
+      status: "degraded",
+      failedStep: "unified_index",
+      failureCode: knownCode,
+      result: { secret: "must not cross boundary" },
+    }),
+    { failedStep: "unified_index", failureCode: knownCode },
+  );
+  assert.deepEqual(
+    classifyWindowsDashboardRefreshFailure({
+      status: "degraded",
+      failedStep: "collector",
+      failureCode: "private_internal_code",
+    }),
+    { failedStep: "unified_index", failureCode: "unknown" },
+  );
+  assert.deepEqual(
+    classifyWindowsDashboardRefreshFailure({
+      status: "degraded",
+      failedStep: "unified_index",
+      failureCode: fallbackCode,
+    }),
+    { failedStep: "unified_index", failureCode: fallbackCode },
+  );
+  for (const invalid of [
+    null,
+    undefined,
+    { failedStep: "unified_index", failureCode: "private_internal_code" },
+    { failedStep: "collector", failureCode: knownCode },
+    { failedStep: "unified_index", failureCode: knownCode, path: "private" },
+  ]) {
+    assert.deepEqual(
+      normalizeWindowsDashboardRefreshFailure(invalid),
+      { failedStep: "none", failureCode: "none" },
+    );
+  }
+  const serialized = JSON.stringify(
+    classifyWindowsDashboardRefreshFailure({
+      status: "degraded",
+      failureCode: "private_internal_code",
+      result: { path: "private", secret: "private" },
+    }),
+  );
+  assert.equal(serialized, '{"failedStep":"unified_index","failureCode":"unknown"}');
+});
+
 test("Windows dashboard target polling remains strict and records checkpoint sequencing", async () => {
   const source = await readFile("scripts/smoke-electron-windows.mjs", "utf8");
   const connectionStart = source.indexOf("async function dashboardConnection");
@@ -775,6 +910,53 @@ test("Windows startup checkpoint emissions are guarded and ordered", async () =>
   );
   assert.match(startup, /onCheckpoint = \(\) => \{\}/u);
   assert.match(source, /progress\.dashboardCheckpoint !== "startup_refresh_terminal_succeeded"/u);
+});
+
+test("Windows startup completion ceiling is limited to the initial primary document", async () => {
+  const source = await readFile("scripts/smoke-electron-windows.mjs", "utf8");
+  const startupStart = source.indexOf("async function assertAutomaticStartupRefresh");
+  const startupEnd = source.indexOf("\nasync function dashboardConnection", startupStart);
+  assert.ok(startupStart >= 0 && startupEnd > startupStart);
+  const startup = source.slice(startupStart, startupEnd);
+  assert.match(startup, /completionTimeoutMs = MAX_REFRESH_MS/u);
+  assert.match(
+    startup,
+    /\}, completionTimeoutMs, "automatic startup refresh completion"/u,
+  );
+
+  const connectionStart = source.indexOf("async function dashboardConnection");
+  const connectionEnd = source.indexOf("\n/**", connectionStart);
+  const connection = source.slice(connectionStart, connectionEnd);
+  assert.match(connection, /startupRefreshCompletionMs = MAX_REFRESH_MS/u);
+  assert.match(connection, /completionTimeoutMs: startupRefreshCompletionMs/u);
+
+  const primaryCallStart = source.indexOf("connection = await dashboardConnection(");
+  const primaryCallEnd = source.indexOf("\n    );", primaryCallStart);
+  assert.ok(primaryCallStart >= 0 && primaryCallEnd > primaryCallStart);
+  assert.match(
+    source.slice(primaryCallStart, primaryCallEnd),
+    /MAX_STARTUP_REFRESH_COMPLETION_MS/u,
+  );
+
+  const relaunchCallStart = source.indexOf("const relaunched = await dashboardConnection(");
+  const relaunchCallEnd = source.indexOf("\n      );", relaunchCallStart);
+  assert.ok(relaunchCallStart >= 0 && relaunchCallEnd > relaunchCallStart);
+  assert.doesNotMatch(
+    source.slice(relaunchCallStart, relaunchCallEnd),
+    /MAX_STARTUP_REFRESH_COMPLETION_MS/u,
+  );
+
+  const reloadStart = source.indexOf("async function reloadDashboardDocument");
+  const reloadRefreshStart = source.indexOf(
+    "await assertAutomaticStartupRefresh({",
+    reloadStart,
+  );
+  const reloadRefreshEnd = source.indexOf("\n  });", reloadRefreshStart);
+  assert.ok(reloadStart >= 0 && reloadRefreshStart > reloadStart && reloadRefreshEnd > reloadRefreshStart);
+  assert.doesNotMatch(
+    source.slice(reloadRefreshStart, reloadRefreshEnd),
+    /MAX_STARTUP_REFRESH_COMPLETION_MS/u,
+  );
 });
 
 test("Windows preload startup gate requires one exact successful release", async () => {
@@ -933,6 +1115,24 @@ test("Windows startup refresh receipt semantics are stateful and content-free", 
     classifyAutomaticStartupRefreshReceipt({
       phase: "completion",
       requestCount: 1,
+      refresh: {
+        status: "degraded",
+        refreshId: "refresh-new",
+        failureCode: "private_internal_code",
+      },
+      expectedRefreshId: "refresh-new",
+    }),
+    {
+      status: "failed",
+      errorCode: codes.degraded,
+      failedStep: "unified_index",
+      failureCode: "unknown",
+    },
+  );
+  assert.deepEqual(
+    classifyAutomaticStartupRefreshReceipt({
+      phase: "completion",
+      requestCount: 1,
       refresh: { status: "succeeded", refreshId: "refresh-other" },
       expectedRefreshId: "refresh-new",
     }),
@@ -1064,6 +1264,8 @@ test("failed Windows Electron smoke preserves completed closed-schema progress",
     artifact: true,
     dashboardReady: true,
     dashboardCheckpoint: "renderer_not_ready",
+    dashboardRefreshProgress: { stage: "none", detail: "none" },
+    dashboardRefreshFailure: { failedStep: "none", failureCode: "none" },
     syntheticRefresh: false,
     failureStage: "control",
     failureReason: "child_exit",
@@ -1081,6 +1283,8 @@ test("failed Windows Electron smoke preserves completed closed-schema progress",
     artifact: true,
     dashboardReady: true,
     dashboardCheckpoint: "renderer_not_ready",
+    dashboardRefreshProgress: { stage: "none", detail: "none" },
+    dashboardRefreshFailure: { failedStep: "none", failureCode: "none" },
     syntheticRefresh: false,
     secondInstanceRejected: false,
     showHideTrayLifecycle: false,
@@ -1190,6 +1394,7 @@ test("Windows Electron smoke diagnostics are fixed, phase-bound, and content-fre
     "dash_startup_changed",
     "dash_startup_failed",
     "dash_startup_cancelled",
+    "dash_startup_degraded",
     "unknown",
   ]);
   const dashboardFailureCases = [
@@ -1213,6 +1418,7 @@ test("Windows Electron smoke diagnostics are fixed, phase-bound, and content-fre
     ["WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_RECEIPT_CHANGED", "dash_startup_changed", "assertion"],
     ["WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_FAILED", "dash_startup_failed", "assertion"],
     ["WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_CANCELLED", "dash_startup_cancelled", "assertion"],
+    ["WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_DEGRADED", "dash_startup_degraded", "assertion"],
   ];
   const dashboardReasons = dashboardFailureCases.map(([, reason]) => reason);
   assert.equal(new Set(dashboardReasons).size, dashboardReasons.length);
@@ -1299,6 +1505,8 @@ test("Windows Electron smoke diagnostics are fixed, phase-bound, and content-fre
       artifact: false,
       dashboardReady: false,
       dashboardCheckpoint: "not_started",
+      dashboardRefreshProgress: { stage: "none", detail: "none" },
+      dashboardRefreshFailure: { failedStep: "none", failureCode: "none" },
       syntheticRefresh: false,
       secondInstanceRejected: false,
       showHideTrayLifecycle: false,
@@ -1348,6 +1556,8 @@ test("Windows Electron smoke diagnostics are fixed, phase-bound, and content-fre
       artifact: false,
       dashboardReady: false,
       dashboardCheckpoint: "not_started",
+      dashboardRefreshProgress: { stage: "none", detail: "none" },
+      dashboardRefreshFailure: { failedStep: "none", failureCode: "none" },
       syntheticRefresh: false,
       secondInstanceRejected: false,
       showHideTrayLifecycle: false,
@@ -1496,6 +1706,8 @@ test("non-Windows Electron smoke reports unsupported rather than success", () =>
     artifact: false,
     dashboardReady: false,
     dashboardCheckpoint: "not_started",
+    dashboardRefreshProgress: { stage: "none", detail: "none" },
+    dashboardRefreshFailure: { failedStep: "none", failureCode: "none" },
     syntheticRefresh: false,
     secondInstanceRejected: false,
     showHideTrayLifecycle: false,
