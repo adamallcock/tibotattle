@@ -62,6 +62,10 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
     resolve(REPOSITORY_ROOT, "test/windows-sqlite-state-session-native.test.js"),
     "utf8",
   );
+  const unifiedIndexQualificationTest = await readFile(
+    resolve(REPOSITORY_ROOT, "test/windows-local-unified-index-native.test.js"),
+    "utf8",
+  );
   const portableDiagnosticScript = await readFile(
     resolve(REPOSITORY_ROOT, "scripts/run-windows-portable-diagnostic.mjs"),
     "utf8",
@@ -90,6 +94,9 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(qualificationScript, /sqlite_error_categories=/u);
   assert.match(sqliteQualificationTest, /classifyWindowsSqliteError/u);
   assert.match(sqliteQualificationTest, /windowsSqliteErrorCategory/u);
+  assert.match(unifiedIndexQualificationTest, /emitBoundedIngestFailureDiagnostic/u);
+  assert.match(unifiedIndexQualificationTest, /windowsFilesystemStage/u);
+  assert.match(unifiedIndexQualificationTest, /windowsFilesystemError/u);
   assert.match(sqliteQualificationTest, /USAGE_MONITOR_WINDOWS_QUALIFICATION/u);
   assert.match(workflow, /\$nodeGypScript rebuild --directory native\/windows-filesystem/u);
   assert.match(
@@ -1560,6 +1567,28 @@ test("SQLite publish error parser is TAP-only, allowlisted, deduplicated, bounde
   assert.deepEqual(repeated, WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST);
   assert.equal(Object.isFrozen(repeated), true);
   assert.equal(repeated.length <= 64, true);
+});
+
+test("unified-index failure markers retain only fixed classes, codes, and stages", () => {
+  const output = [
+    "# windowsSqliteErrorCategory: BUSY_LOCKED",
+    "# windowsFilesystemStage: publish_target_open",
+    "# windowsFilesystemError: WINDOWS_FILESYSTEM_ACCESS_DENIED",
+    "# windowsSqliteErrorCategory: C:\\private\\secret\\state.sqlite",
+    "# windowsFilesystemStage: secret=do-not-return",
+    "# windowsFilesystemError: private-message",
+    "# windowsFilesystemError: WINDOWS_FILESYSTEM_ACCESS_DENIED SQL=hidden",
+  ].join("\n");
+  const categories = extractTapSqliteErrorCategories(output);
+  const stages = extractTapPublishStages(output);
+  const errors = extractTapPublishErrors(output);
+  assert.deepEqual(categories, ["BUSY_LOCKED"]);
+  assert.deepEqual(stages, ["publish_target_open"]);
+  assert.deepEqual(errors, ["WINDOWS_FILESYSTEM_ACCESS_DENIED"]);
+  assert.doesNotMatch(
+    JSON.stringify({ categories, stages, errors }),
+    /private|secret|message|SQL|hidden|state\.sqlite/iu,
+  );
 });
 
 test("qualification failure locations require the trusted test path and stay numeric", () => {

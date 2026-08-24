@@ -14,6 +14,11 @@ import { basename, join, resolve, win32 } from "node:path";
 import test from "node:test";
 
 import { createCompanionWindowsStateComposition } from "../apps/local/server.js";
+import {
+  classifyWindowsSqliteError,
+  WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST,
+  WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST,
+} from "../scripts/windows-security-qualification.mjs";
 import { ingestLocalUnifiedIndexIncrement } from "../src/local-unified-index-ingest.js";
 import {
   createWindowsFilesystemAdapter,
@@ -261,9 +266,56 @@ function assertNoStagedResidue(entries) {
   );
 }
 
+function ownStringProperty(value, property) {
+  try {
+    if (value === null
+        || (typeof value !== "object" && typeof value !== "function")) {
+      return null;
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(value, property);
+    return descriptor !== undefined
+      && Object.hasOwn(descriptor, "value")
+      && typeof descriptor.value === "string"
+      ? descriptor.value
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function emitBoundedIngestFailureDiagnostic(testContext, error) {
+  if (process.env.USAGE_MONITOR_WINDOWS_QUALIFICATION !== "1") return;
+
+  // These markers are consumed by the qualification harness' existing
+  // allowlisted parsers. Keep the SQLite category visible even when the
+  // higher-level index wrapper has already removed the native errcode.
+  testContext.diagnostic(
+    `windowsSqliteErrorCategory: ${classifyWindowsSqliteError(error)}`,
+  );
+
+  const stage = ownStringProperty(error, "windowsFilesystemStage");
+  if (WINDOWS_SQLITE_PUBLISH_STAGE_ALLOWLIST.includes(stage)) {
+    testContext.diagnostic(`windowsFilesystemStage: ${stage}`);
+  }
+
+  const code = ownStringProperty(error, "code");
+  if (WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST.includes(code)) {
+    testContext.diagnostic(`windowsFilesystemError: ${code}`);
+  }
+}
+
+async function ingestWithBoundedFailureDiagnostic(options, testContext) {
+  try {
+    return await ingestLocalUnifiedIndexIncrement(options);
+  } catch (error) {
+    emitBoundedIngestFailureDiagnostic(testContext, error);
+    throw error;
+  }
+}
+
 test("native Windows unified index ingests fresh protected state and settles unchanged", {
   skip: NATIVE_SKIP,
-}, async () => {
+}, async (t) => {
   const fixture = await createQualificationFixture();
   try {
     const options = {
@@ -280,7 +332,7 @@ test("native Windows unified index ingests fresh protected state and settles unc
         fixture.composition.sqliteStateSessionFactory,
       windowsSqliteStateStaging: fixture.composition.sqliteStateStaging,
     };
-    const first = await ingestLocalUnifiedIndexIncrement(options);
+    const first = await ingestWithBoundedFailureDiagnostic(options, t);
     assert.equal(first.status, "ingested");
     assert.equal(first.unchanged, false);
     assert.equal(first.generation.status, "complete");
@@ -289,7 +341,7 @@ test("native Windows unified index ingests fresh protected state and settles unc
     assert.ok(first.totalUsageEvents > 0);
     assertNoStagedResidue(await readdir(fixture.stateRoot));
 
-    const second = await ingestLocalUnifiedIndexIncrement(options);
+    const second = await ingestWithBoundedFailureDiagnostic(options, t);
     assert.equal(second.status, "ingested");
     assert.equal(second.unchanged, true);
     assert.equal(second.sourcesSkipped, 1);
