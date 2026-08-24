@@ -1,6 +1,7 @@
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { DEPLOYMENT_ENDPOINTS } from "../../config/deployment-endpoints.js";
 import { launchDesktopRuntime } from "./desktop-runtime.js";
 import { resolveDesktopTrayIcon } from "./desktop-tray.js";
 import { ELECTRON_ENTRY_FAILURE_DIAGNOSTIC, shellError } from "./errors.js";
@@ -62,6 +63,17 @@ function packagedResourcesPath(app, appPath, resourcesPath) {
     return resolve(process.resourcesPath);
   }
   return appPath === null ? null : dirname(appPath);
+}
+
+function companionEnvironment({ app, environment, qualificationContext }) {
+  if (!isPackagedElectronApp(app)
+      || qualificationContext !== null) {
+    return environment;
+  }
+  return {
+    ...environment,
+    USAGE_MONITOR_CENTRAL_ORIGIN: DEPLOYMENT_ENDPOINTS.public.origin,
+  };
 }
 
 function resolveCompanionLaunchPaths({
@@ -415,7 +427,7 @@ export async function launchElectronShell({
         preloadPath: resolve(MODULE_DIRECTORY, "preload.cjs"),
       },
       environment: {
-        ...environment,
+        ...companionEnvironment({ app, environment, qualificationContext }),
         USAGE_MONITOR_RESOURCE_ROOT: paths.resourceRoot,
       },
       supervisorOptions,

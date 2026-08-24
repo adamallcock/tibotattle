@@ -2529,6 +2529,9 @@ test("packaged Electron composition keeps the companion in app.asar and uses phy
       },
     },
     resourcesPath: "/private/TiboTattle.app/Contents/Resources",
+    environment: {
+      USAGE_MONITOR_CENTRAL_ORIGIN: "http://127.0.0.1:8792",
+    },
     firstRunReceiptBackend: {
       load: async () => ({
         schemaVersion: DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
@@ -2565,6 +2568,10 @@ test("packaged Electron composition keeps the companion in app.asar and uses phy
   assert.equal(
     spawnCalls[0].options.env.USAGE_MONITOR_STATE_ROOT,
     "/private/TiboTattle-user-data/companion-state",
+  );
+  assert.equal(
+    spawnCalls[0].options.env.USAGE_MONITOR_CENTRAL_ORIGIN,
+    "https://tibotattle.com",
   );
   child.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4711/\n"));
   const lifecycle = await launch;
