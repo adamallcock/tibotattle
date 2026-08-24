@@ -34,8 +34,8 @@ import {
   refreshLocalArchiveAccountingIndex,
 } from "../../src/local-archive-accounting-index.js";
 import {
-  ingestLocalUnifiedIndexIncrement,
-} from "../../src/local-unified-index-ingest.js";
+  ingestLocalUnifiedIndexOffMain,
+} from "../../src/local-unified-index-off-main.js";
 import {
   readLocalUnifiedWindowBreakdown,
 } from "../../src/local-unified-window-breakdown.js";
@@ -4142,7 +4142,7 @@ export function createPreparedLocalCompanionServer({
         ? statePaths.archiveAccountingIndexSecretFile
         : null,
       // Advance the unified index by its cursors on every foreground refresh.
-      refreshUnifiedIndex: (options) => ingestLocalUnifiedIndexIncrement({
+      refreshUnifiedIndex: (options) => ingestLocalUnifiedIndexOffMain({
         ...options,
         contractVersion: TELEMETRY_SCHEMA_VERSION,
         windowsFilesystemAdapter,
