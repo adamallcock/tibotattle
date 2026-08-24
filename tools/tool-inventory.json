@@ -331,6 +331,24 @@
     },
     {
       "classification": "build_release_operation",
+      "owner": "repository_operations",
+      "canonicalPath": "scripts/check-release-notes.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The checker runs directly from release-trust CI, the canonical release runbooks, and its repository test; avoiding a package-manifest alias keeps documentation tooling outside the R7 workload provenance.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/release-trust-policy.yml",
+        "test/release-notes.test.js",
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+        "docs/runbooks/macos-stable-release-runbook.md"
+      ],
+      "decision": "retain_as_release_documentation_gate",
+      "provenance": null,
+      "provenanceReason": "The offline checker keeps the package version, stable tags, changelog index, checked-in release bodies, and release/tag/history provenance links in lockstep before publication.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
       "owner": "export_test_infrastructure",
       "canonicalPath": "scripts/export-deletion-sigkill-child.js",
       "stableAlias": null,
