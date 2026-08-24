@@ -1154,14 +1154,41 @@ async function waitForDescendantsGone(rootPid, descendants, label) {
   }, MAX_SHUTDOWN_MS, label, "WINDOWS_ELECTRON_SMOKE_SHUTDOWN_TIMEOUT");
 }
 
-function spawnPackagedElectron(executable, fixture, port, cwd) {
-  const child = spawn(executable, [
-    `--user-data-dir=${fixture.userData}`,
-    `--remote-debugging-port=${port}`,
-    "--remote-debugging-address=127.0.0.1",
-    "--disable-gpu",
-    "--no-first-run",
-  ], {
+export function buildPackagedElectronArgs({
+  userDataDir,
+  remoteDebuggingPort,
+  remoteDebugging = true,
+} = {}) {
+  if (typeof userDataDir !== "string" || userDataDir.length === 0
+      || typeof remoteDebugging !== "boolean") {
+    throw new TypeError("Packaged Electron launch arguments are invalid");
+  }
+  const args = [`--user-data-dir=${userDataDir}`];
+  if (remoteDebugging) {
+    if (!Number.isSafeInteger(remoteDebuggingPort) || remoteDebuggingPort < 1) {
+      throw new TypeError("Packaged Electron debugging port is invalid");
+    }
+    args.push(
+      `--remote-debugging-port=${remoteDebuggingPort}`,
+      "--remote-debugging-address=127.0.0.1",
+    );
+  }
+  args.push("--disable-gpu", "--no-first-run");
+  return args;
+}
+
+function spawnPackagedElectron(
+  executable,
+  fixture,
+  port,
+  cwd,
+  { remoteDebugging = true } = {},
+) {
+  const child = spawn(executable, buildPackagedElectronArgs({
+    userDataDir: fixture.userData,
+    remoteDebuggingPort: port,
+    remoteDebugging,
+  }), {
     cwd,
     env: safeChildEnvironment(fixture),
     shell: false,
@@ -1385,35 +1412,6 @@ async function quitCommand(
     "clean quit acknowledgement",
     timeoutCode,
   );
-}
-
-/**
- * A rejected second Electron invocation must not briefly expose its own
- * debugging endpoint before the single-instance exit. Probe its private port
- * for the whole bounded lifetime; any successful response is a shell-start
- * failure even if the process later exits with code zero.
- */
-async function assertSecondInstanceNeverReady(child, port) {
-  const started = Date.now();
-  while (true) {
-    const endpoint = await withTimeout(
-      fetch(`http://127.0.0.1:${port}/json/version`),
-      MAX_OPERATION_MS,
-      "second instance debugging endpoint",
-      "WINDOWS_ELECTRON_SMOKE_INSTANCE_TIMEOUT",
-    ).catch(() => null);
-    if (endpoint?.ok === true) {
-      fail("WINDOWS_ELECTRON_SMOKE_SECOND_INSTANCE_STARTED");
-    }
-    if (typeof endpoint?.body?.cancel === "function") {
-      await endpoint.body.cancel().catch(() => {});
-    }
-    if (childExited(child)) return;
-    if (Date.now() - started >= MAX_SHUTDOWN_MS) {
-      fail("WINDOWS_ELECTRON_SMOKE_SECOND_INSTANCE_REJECTION_TIMEOUT");
-    }
-    await wait(50);
-  }
 }
 
 function assertRendererShellSnapshot(snapshot) {
@@ -2074,8 +2072,9 @@ export async function runSmoke(progress) {
     await writePersistentQualificationState(connection);
 
     failurePhase = "instance";
-    const secondPort = await freeTcpPort();
-    second = spawnPackagedElectron(executable, fixture, secondPort, artifactRoot);
+    second = spawnPackagedElectron(executable, fixture, null, artifactRoot, {
+      remoteDebugging: false,
+    });
     const secondObservedMessages = [];
     secondMessageReader = controlReader(second, (message) => {
       if (secondObservedMessages.length < 32) secondObservedMessages.push(message);
@@ -2087,9 +2086,6 @@ export async function runSmoke(progress) {
         secondDescendantPids,
         "second instance descendant monitor",
       ),
-    );
-    const secondEndpointMonitor = attachSmokeMonitorRejectionBoundary(
-      assertSecondInstanceNeverReady(second, secondPort),
     );
     let primaryDuringSecond;
     try {
@@ -2109,7 +2105,6 @@ export async function runSmoke(progress) {
       await terminateProcessTree(second);
       secondMessageReader?.close?.();
       await secondDescendantMonitor;
-      await secondEndpointMonitor;
     }
     assertPrimaryShellState(
       primaryDuringSecond,

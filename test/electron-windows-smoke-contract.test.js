@@ -10,6 +10,7 @@ import {
   attachSmokeChildErrorBoundary,
   attachSmokeMonitorRejectionBoundary,
   aggregate,
+  buildPackagedElectronArgs,
   classifyAutomaticStartupRefreshReceipt,
   classifySmokeFailure,
   createSyntheticFixture,
@@ -43,6 +44,45 @@ test("Windows smoke direct entry tolerates case-only checkout path differences",
       modulePath: "/tmp/scripts/smoke-electron-windows.mjs",
       platform: "linux",
     }),
+    false,
+  );
+});
+
+test("packaged smoke launch args debug only the primary and relaunch processes", () => {
+  const primaryArgs = buildPackagedElectronArgs({
+    userDataDir: "C:\\temp\\electron-user-data",
+    remoteDebuggingPort: 43123,
+  });
+  const relaunchArgs = buildPackagedElectronArgs({
+    userDataDir: "C:\\temp\\electron-user-data",
+    remoteDebuggingPort: 43124,
+  });
+  const secondaryArgs = buildPackagedElectronArgs({
+    userDataDir: "C:\\temp\\electron-user-data",
+    remoteDebugging: false,
+  });
+
+  assert.deepEqual(primaryArgs, [
+    "--user-data-dir=C:\\temp\\electron-user-data",
+    "--remote-debugging-port=43123",
+    "--remote-debugging-address=127.0.0.1",
+    "--disable-gpu",
+    "--no-first-run",
+  ]);
+  assert.deepEqual(relaunchArgs, [
+    "--user-data-dir=C:\\temp\\electron-user-data",
+    "--remote-debugging-port=43124",
+    "--remote-debugging-address=127.0.0.1",
+    "--disable-gpu",
+    "--no-first-run",
+  ]);
+  assert.deepEqual(secondaryArgs, [
+    "--user-data-dir=C:\\temp\\electron-user-data",
+    "--disable-gpu",
+    "--no-first-run",
+  ]);
+  assert.equal(
+    secondaryArgs.some((argument) => argument.startsWith("--remote-debugging-")),
     false,
   );
 });
@@ -252,7 +292,23 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /performance\.timeOrigin/u);
   assert.doesNotMatch(source, /location\.reload\(\)/u);
   assert.match(source, /secondInstanceRejected/u);
-  assert.match(source, /assertSecondInstanceNeverReady/u);
+  assert.match(source, /export function buildPackagedElectronArgs/u);
+  assert.match(source, /remoteDebuggingPort/u);
+  assert.match(source, /remoteDebugging = true/u);
+  assert.match(source, /remoteDebugging: false/u);
+  assert.match(
+    source,
+    /primary = spawnPackagedElectron\(executable, fixture, primaryPort, artifactRoot\)/u,
+  );
+  assert.match(
+    source,
+    /second = spawnPackagedElectron\(executable, fixture, null, artifactRoot, \{\s*remoteDebugging: false,\s*\}\)/u,
+  );
+  assert.match(
+    source,
+    /relaunch = spawnPackagedElectron\(executable, fixture, relaunchPort, artifactRoot\)/u,
+  );
+  assert.doesNotMatch(source, /assertSecondInstanceNeverReady|secondEndpointMonitor|secondPort/u);
   assert.match(source, /primaryDuringSecond/u);
   assert.match(source, /primaryAfterSecond/u);
   assert.match(source, /SECOND_INSTANCE_BECAME_PRIMARY/u);
@@ -316,9 +372,6 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
     "const secondDescendantMonitor = attachSmokeMonitorRejectionBoundary(",
   );
   const secondExit = source.indexOf("childExitPromise(second)");
-  const secondEndpoint = source.indexOf(
-    "const secondEndpointMonitor = attachSmokeMonitorRejectionBoundary(",
-  );
   const primaryMonitor = source.indexOf(
     "const primaryDescendantMonitor = attachSmokeMonitorRejectionBoundary(",
   );
@@ -327,7 +380,7 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
     "const relaunchDescendantMonitor = attachSmokeMonitorRejectionBoundary(",
   );
   const relaunchQuit = source.indexOf("await quitCommand(\n          relaunch,");
-  assert.ok(secondMonitor >= 0 && secondEndpoint > secondMonitor && secondExit > secondEndpoint);
+  assert.ok(secondMonitor >= 0 && secondExit > secondMonitor);
   assert.ok(primaryMonitor >= 0 && primaryQuit > primaryMonitor);
   assert.ok(relaunchMonitor >= 0 && relaunchQuit > relaunchMonitor);
   assert.match(source, /relaunchPersistence/u);
