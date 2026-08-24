@@ -480,6 +480,45 @@ const DASHBOARD_CHECKPOINT_RANK = new Map(
     .map((checkpoint, index) => [checkpoint, index]),
 );
 
+// Shutdown progress is deliberately a single fixed enum.  It describes the
+// last successful boundary of the currently-qualifying Electron root and
+// never carries a PID, process-table row, path, timeout text, or exception.
+// The relaunch resets this enum before its own bounded shutdown sequence so a
+// failed relaunch does not look like a completed shutdown merely because the
+// primary process exited cleanly.
+export const WINDOWS_ELECTRON_SMOKE_SHUTDOWN_CHECKPOINT_ALLOWLIST = Object.freeze([
+  "not_started",
+  "started",
+  "descendants_captured",
+  "quit_acknowledged",
+  "primary_exited",
+  "monitor_settled",
+  "descendants_gone",
+]);
+const SHUTDOWN_CHECKPOINT_SET = new Set(
+  WINDOWS_ELECTRON_SMOKE_SHUTDOWN_CHECKPOINT_ALLOWLIST,
+);
+const SHUTDOWN_CHECKPOINT_RANK = new Map(
+  WINDOWS_ELECTRON_SMOKE_SHUTDOWN_CHECKPOINT_ALLOWLIST
+    .map((checkpoint, index) => [checkpoint, index]),
+);
+
+export function normalizeWindowsShutdownCheckpoint(value) {
+  return typeof value === "string" && SHUTDOWN_CHECKPOINT_SET.has(value)
+    ? value
+    : "not_started";
+}
+
+export function advanceWindowsShutdownCheckpoint(current, next) {
+  const currentCheckpoint = normalizeWindowsShutdownCheckpoint(current);
+  const nextCheckpoint = normalizeWindowsShutdownCheckpoint(next);
+  const currentRank = SHUTDOWN_CHECKPOINT_RANK.get(currentCheckpoint) ?? 0;
+  const nextRank = SHUTDOWN_CHECKPOINT_RANK.get(nextCheckpoint) ?? 0;
+  return nextRank === currentRank + 1
+    ? nextCheckpoint
+    : currentCheckpoint;
+}
+
 export function normalizeWindowsDashboardCheckpoint(value) {
   return typeof value === "string" && DASHBOARD_CHECKPOINT_SET.has(value)
     ? value
@@ -707,6 +746,7 @@ export function aggregate(status, values = {}) {
     contentFree: true,
     ...diagnostic,
     ...Object.fromEntries(RESULT_KEYS.map((key) => [key, values[key] === true])),
+    shutdownCheckpoint: normalizeWindowsShutdownCheckpoint(values.shutdownCheckpoint),
     dashboardCheckpoint: normalizeWindowsDashboardCheckpoint(values.dashboardCheckpoint),
     dashboardRefreshProgress: normalizeWindowsDashboardRefreshProgress(
       values.dashboardRefreshProgress,
@@ -2516,6 +2556,10 @@ export async function runSmoke(progress) {
   progress.dashboardRefreshFailure = normalizeWindowsDashboardRefreshFailure(
     progress.dashboardRefreshFailure,
   );
+  // A retry owns a fresh shutdown observation. Never inherit a prior run's
+  // checkpoint, even when the caller reuses its progress object after a
+  // timeout or partial cleanup.
+  progress.shutdownCheckpoint = "not_started";
   const setDashboardCheckpoint = (checkpoint) => {
     const normalized = normalizeWindowsDashboardCheckpoint(checkpoint);
     const advanced = advanceWindowsDashboardCheckpoint(
@@ -2532,6 +2576,18 @@ export async function runSmoke(progress) {
     if (advanced !== progress.dashboardRefreshProgress) {
       progress.dashboardRefreshProgress = advanced;
     }
+  };
+  const setShutdownCheckpoint = (checkpoint) => {
+    const advanced = advanceWindowsShutdownCheckpoint(
+      progress.shutdownCheckpoint,
+      checkpoint,
+    );
+    if (advanced !== progress.shutdownCheckpoint) {
+      progress.shutdownCheckpoint = advanced;
+    }
+  };
+  const resetShutdownCheckpoint = () => {
+    progress.shutdownCheckpoint = "not_started";
   };
   let fixture = null;
   let primary = null;
@@ -2709,11 +2765,13 @@ export async function runSmoke(progress) {
     progress.secondInstanceRejected = true;
 
     failurePhase = "shutdown";
+    setShutdownCheckpoint("started");
     // Capture once more after refresh and the second-instance attempt. This
     // includes helpers created after initial dashboard readiness. A final
     // post-exit capture below also catches any Windows child whose recorded
     // parent is the now-terminated primary process.
     await addCurrentDescendants(primary.pid, primaryDescendantPids);
+    setShutdownCheckpoint("descendants_captured");
 
     const primaryDescendantMonitor = attachSmokeMonitorRejectionBoundary(
       monitorDescendantsUntilExit(
@@ -2729,15 +2787,18 @@ export async function runSmoke(progress) {
         nextPrimaryMessage,
         "WINDOWS_ELECTRON_SMOKE_SHUTDOWN_TIMEOUT",
       );
+      setShutdownCheckpoint("quit_acknowledged");
       await withTimeout(
         childExitPromise(primary),
         MAX_SHUTDOWN_MS,
         "primary clean quit",
         "WINDOWS_ELECTRON_SMOKE_SHUTDOWN_TIMEOUT",
       );
+      setShutdownCheckpoint("primary_exited");
     } finally {
       await terminateProcessTree(primary);
       await primaryDescendantMonitor;
+      setShutdownCheckpoint("monitor_settled");
     }
     connection.cdp.close();
     connection = null;
@@ -2750,12 +2811,14 @@ export async function runSmoke(progress) {
       primaryDescendantPids,
       "primary descendant cleanup",
     );
+    setShutdownCheckpoint("descendants_gone");
     const primaryNoOrphan = true;
     progress.cleanQuit = true;
     // The companion is launched by the Electron process and should disappear
     // with it. A relaunch against the same profile proves that the old process
     // released its single-instance lock and did not leave a child holding it.
     failurePhase = "relaunch";
+    resetShutdownCheckpoint();
     const relaunchPort = await freeTcpPort();
     relaunch = spawnPackagedElectron(executable, fixture, relaunchPort, artifactRoot);
     if (!relaunch.pid) fail("WINDOWS_ELECTRON_SMOKE_RELAUNCH_PID_MISSING");
@@ -2790,6 +2853,9 @@ export async function runSmoke(progress) {
       credentialDeleted = true;
       credentialMayExist = false;
       progress.credentialPersistence = true;
+      setShutdownCheckpoint("started");
+      await addCurrentDescendants(relaunch.pid, relaunchDescendantPids);
+      setShutdownCheckpoint("descendants_captured");
       const relaunchDescendantMonitor = attachSmokeMonitorRejectionBoundary(
         monitorDescendantsUntilExit(
           relaunch,
@@ -2804,15 +2870,18 @@ export async function runSmoke(progress) {
           nextRelaunchMessage,
           "WINDOWS_ELECTRON_SMOKE_RELAUNCH_TIMEOUT",
         );
+        setShutdownCheckpoint("quit_acknowledged");
         await withTimeout(
           childExitPromise(relaunch),
           MAX_SHUTDOWN_MS,
           "relaunch clean quit",
           "WINDOWS_ELECTRON_SMOKE_RELAUNCH_TIMEOUT",
         );
+        setShutdownCheckpoint("primary_exited");
       } finally {
         await terminateProcessTree(relaunch);
         await relaunchDescendantMonitor;
+        setShutdownCheckpoint("monitor_settled");
       }
       if (relaunch.exitCode !== 0 || relaunch.signalCode !== null) {
         fail("WINDOWS_ELECTRON_SMOKE_RELAUNCH_QUIT_FAILED");
@@ -2823,6 +2892,7 @@ export async function runSmoke(progress) {
         relaunchDescendantPids,
         "relaunch descendant cleanup",
       );
+      setShutdownCheckpoint("descendants_gone");
       const relaunchNoOrphan = true;
       progress.noOrphan = primaryNoOrphan && relaunchNoOrphan;
     } finally {
@@ -2830,6 +2900,9 @@ export async function runSmoke(progress) {
     }
     progress.relaunchPersistence = progress.statePersistence === true
       && progress.credentialPersistence === true;
+    if (progress.shutdownCheckpoint !== "descendants_gone") {
+      fail("WINDOWS_ELECTRON_SMOKE_SHUTDOWN_CHECKPOINT_INVALID");
+    }
     if (progress.dashboardCheckpoint !== "startup_refresh_terminal_succeeded") {
       fail("WINDOWS_ELECTRON_SMOKE_REFRESH_BOUNDARY_INVALID");
     }

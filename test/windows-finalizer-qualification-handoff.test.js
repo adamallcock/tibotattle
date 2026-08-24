@@ -102,6 +102,7 @@ function receiptFixture({ cacheMode = "warm", revision = REVISION, bindingSha256
       relaunchPersistence: true,
       secondInstanceRejected: true,
       showHideTrayLifecycle: true,
+      shutdownCheckpoint: "descendants_gone",
       statePersistence: true,
       status: "passed",
       syntheticRefresh: true,

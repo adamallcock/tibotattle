@@ -26,12 +26,15 @@ import {
   WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES,
   WINDOWS_ELECTRON_SMOKE_DASHBOARD_CHECKPOINT_ALLOWLIST,
   WINDOWS_ELECTRON_SMOKE_DASHBOARD_REFRESH_PROGRESS_ALLOWLIST,
+  WINDOWS_ELECTRON_SMOKE_SHUTDOWN_CHECKPOINT_ALLOWLIST,
   WINDOWS_ELECTRON_SMOKE_UNIFIED_INDEX_FAILURE_CODE_ALLOWLIST,
   classifyWindowsDashboardRefreshProgress,
   classifyWindowsDashboardRefreshFailure,
   WINDOWS_ELECTRON_SMOKE_FAILURE_REASON_ALLOWLIST,
   WINDOWS_ELECTRON_SMOKE_FAILURE_STAGE_ALLOWLIST,
   normalizeWindowsDashboardCheckpoint,
+  normalizeWindowsShutdownCheckpoint,
+  advanceWindowsShutdownCheckpoint,
   normalizeWindowsDashboardRefreshProgress,
   normalizeWindowsDashboardRefreshFailure,
   advanceWindowsDashboardRefreshProgress,
@@ -418,6 +421,69 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.ok(secondMonitor >= 0 && secondExit > secondMonitor);
   assert.ok(primaryMonitor >= 0 && primaryQuit > primaryMonitor);
   assert.ok(relaunchMonitor >= 0 && relaunchQuit > relaunchMonitor);
+  const primaryShutdownStart = source.indexOf('setShutdownCheckpoint("started")');
+  const primaryCaptured = source.indexOf('setShutdownCheckpoint("descendants_captured")');
+  const primaryAck = source.indexOf('setShutdownCheckpoint("quit_acknowledged")');
+  const primaryExited = source.indexOf('setShutdownCheckpoint("primary_exited")');
+  const primarySettled = source.indexOf('setShutdownCheckpoint("monitor_settled")');
+  const primaryGone = source.indexOf('setShutdownCheckpoint("descendants_gone")');
+  assert.ok(
+    primaryShutdownStart >= 0
+      && primaryCaptured > primaryShutdownStart
+      && primaryAck > primaryCaptured
+      && primaryExited > primaryAck
+      && primarySettled > primaryExited
+      && primaryGone > primarySettled,
+    "primary shutdown checkpoints must follow successful boundaries",
+  );
+  const relaunchReset = source.indexOf("resetShutdownCheckpoint()", primaryGone);
+  const relaunchShutdownStart = source.indexOf(
+    'setShutdownCheckpoint("started")',
+    relaunchReset,
+  );
+  const relaunchCaptured = source.indexOf(
+    'setShutdownCheckpoint("descendants_captured")',
+    relaunchShutdownStart,
+  );
+  const relaunchAck = source.indexOf(
+    'setShutdownCheckpoint("quit_acknowledged")',
+    relaunchCaptured,
+  );
+  const relaunchExited = source.indexOf(
+    'setShutdownCheckpoint("primary_exited")',
+    relaunchAck,
+  );
+  const relaunchSettled = source.indexOf(
+    'setShutdownCheckpoint("monitor_settled")',
+    relaunchExited,
+  );
+  const relaunchGone = source.indexOf(
+    'setShutdownCheckpoint("descendants_gone")',
+    relaunchSettled,
+  );
+  assert.ok(
+    relaunchReset > primaryGone
+      && relaunchShutdownStart > relaunchReset
+      && relaunchCaptured > relaunchShutdownStart
+      && relaunchAck > relaunchCaptured
+      && relaunchExited > relaunchAck
+      && relaunchSettled > relaunchExited
+      && relaunchGone > relaunchSettled,
+    "relaunch shutdown checkpoints must follow successful boundaries",
+  );
+  const shutdownRunStart = source.indexOf("export async function runSmoke");
+  const shutdownInitialization = source.indexOf(
+    'progress.shutdownCheckpoint = "not_started";',
+    shutdownRunStart,
+  );
+  const shutdownHelpers = source.indexOf("const setShutdownCheckpoint", shutdownRunStart);
+  assert.ok(
+    shutdownRunStart >= 0
+      && shutdownInitialization > shutdownRunStart
+      && shutdownHelpers > shutdownInitialization,
+    "each smoke retry must initialize shutdown evidence before its helpers",
+  );
+  assert.match(source, /progress\.shutdownCheckpoint !== "descendants_gone"/u);
   assert.match(source, /relaunchPersistence/u);
   assert.match(source, /WINDOWS_PROCESS_TABLE_QUERY/u);
   assert.match(source, /Get-CimInstance -ClassName Win32_Process/u);
@@ -690,6 +756,62 @@ test("Windows dashboard checkpoints advance monotonically through startup proof"
   );
   assert.equal(
     advanceWindowsDashboardCheckpoint("not_started", "not-a-checkpoint"),
+    "not_started",
+  );
+});
+
+test("Windows shutdown checkpoints are fixed, ordered, and content-free", () => {
+  assert.deepEqual(WINDOWS_ELECTRON_SMOKE_SHUTDOWN_CHECKPOINT_ALLOWLIST, [
+    "not_started",
+    "started",
+    "descendants_captured",
+    "quit_acknowledged",
+    "primary_exited",
+    "monitor_settled",
+    "descendants_gone",
+  ]);
+  for (const checkpoint of WINDOWS_ELECTRON_SMOKE_SHUTDOWN_CHECKPOINT_ALLOWLIST) {
+    assert.equal(normalizeWindowsShutdownCheckpoint(checkpoint), checkpoint);
+  }
+  for (const invalid of [
+    null,
+    undefined,
+    "C:\\private\\process-table.log",
+    "pid=1234",
+    "private shutdown failure",
+  ]) {
+    assert.equal(normalizeWindowsShutdownCheckpoint(invalid), "not_started");
+  }
+  let current = WINDOWS_ELECTRON_SMOKE_SHUTDOWN_CHECKPOINT_ALLOWLIST[0];
+  for (const next of WINDOWS_ELECTRON_SMOKE_SHUTDOWN_CHECKPOINT_ALLOWLIST.slice(1)) {
+    current = advanceWindowsShutdownCheckpoint(current, next);
+    assert.equal(current, next);
+  }
+  assert.equal(
+    advanceWindowsShutdownCheckpoint("monitor_settled", "descendants_captured"),
+    "monitor_settled",
+  );
+  assert.equal(
+    advanceWindowsShutdownCheckpoint("descendants_captured", "monitor_settled"),
+    "descendants_captured",
+  );
+  assert.equal(
+    advanceWindowsShutdownCheckpoint("quit_acknowledged", "monitor_settled"),
+    "quit_acknowledged",
+  );
+  assert.equal(
+    advanceWindowsShutdownCheckpoint("descendants_gone", "private detail"),
+    "descendants_gone",
+  );
+  const failed = aggregate("failed", {
+    shutdownCheckpoint: "quit_acknowledged",
+    shutdownPath: "C:\\private\\shutdown.log",
+  });
+  assert.equal(failed.shutdownCheckpoint, "quit_acknowledged");
+  assert.doesNotMatch(JSON.stringify(failed), /(?:[A-Za-z]:[\\/]|private|shutdownPath|pid)/iu);
+  assert.equal(
+    aggregate("failed", { shutdownCheckpoint: "C:\\private\\raw.log" })
+      .shutdownCheckpoint,
     "not_started",
   );
 });
@@ -1266,6 +1388,7 @@ test("failed Windows Electron smoke preserves completed closed-schema progress",
     dashboardCheckpoint: "renderer_not_ready",
     dashboardRefreshProgress: { stage: "none", detail: "none" },
     dashboardRefreshFailure: { failedStep: "none", failureCode: "none" },
+    shutdownCheckpoint: "not_started",
     syntheticRefresh: false,
     failureStage: "control",
     failureReason: "child_exit",
@@ -1285,6 +1408,7 @@ test("failed Windows Electron smoke preserves completed closed-schema progress",
     dashboardCheckpoint: "renderer_not_ready",
     dashboardRefreshProgress: { stage: "none", detail: "none" },
     dashboardRefreshFailure: { failedStep: "none", failureCode: "none" },
+    shutdownCheckpoint: "not_started",
     syntheticRefresh: false,
     secondInstanceRejected: false,
     showHideTrayLifecycle: false,
@@ -1507,6 +1631,7 @@ test("Windows Electron smoke diagnostics are fixed, phase-bound, and content-fre
       dashboardCheckpoint: "not_started",
       dashboardRefreshProgress: { stage: "none", detail: "none" },
       dashboardRefreshFailure: { failedStep: "none", failureCode: "none" },
+      shutdownCheckpoint: "not_started",
       syntheticRefresh: false,
       secondInstanceRejected: false,
       showHideTrayLifecycle: false,
@@ -1558,6 +1683,7 @@ test("Windows Electron smoke diagnostics are fixed, phase-bound, and content-fre
       dashboardCheckpoint: "not_started",
       dashboardRefreshProgress: { stage: "none", detail: "none" },
       dashboardRefreshFailure: { failedStep: "none", failureCode: "none" },
+      shutdownCheckpoint: "not_started",
       syntheticRefresh: false,
       secondInstanceRejected: false,
       showHideTrayLifecycle: false,
@@ -1708,6 +1834,7 @@ test("non-Windows Electron smoke reports unsupported rather than success", () =>
     dashboardCheckpoint: "not_started",
     dashboardRefreshProgress: { stage: "none", detail: "none" },
     dashboardRefreshFailure: { failedStep: "none", failureCode: "none" },
+    shutdownCheckpoint: "not_started",
     syntheticRefresh: false,
     secondInstanceRejected: false,
     showHideTrayLifecycle: false,

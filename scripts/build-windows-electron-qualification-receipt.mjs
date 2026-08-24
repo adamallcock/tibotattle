@@ -68,6 +68,7 @@ const RUNTIME_KEYS = Object.freeze([
   "relaunchPersistence",
   "secondInstanceRejected",
   "showHideTrayLifecycle",
+  "shutdownCheckpoint",
   "statePersistence",
   "status",
   "syntheticRefresh",
@@ -100,6 +101,15 @@ const DASHBOARD_CHECKPOINT_ALLOWLIST = Object.freeze([
   "startup_refresh_request_observed",
   "startup_refresh_receipt_accepted",
   "startup_refresh_terminal_succeeded",
+]);
+const SHUTDOWN_CHECKPOINT_ALLOWLIST = Object.freeze([
+  "not_started",
+  "started",
+  "descendants_captured",
+  "quit_acknowledged",
+  "primary_exited",
+  "monitor_settled",
+  "descendants_gone",
 ]);
 const DASHBOARD_REFRESH_PROGRESS_ALLOWLIST = Object.freeze([
   Object.freeze({ stage: "none", detail: "none" }),
@@ -360,12 +370,14 @@ export function validateRuntimeEvidence(value) {
       || value.failureReason !== "none"
       || !DASHBOARD_CHECKPOINT_ALLOWLIST.includes(value.dashboardCheckpoint)
       || value.dashboardCheckpoint !== "startup_refresh_terminal_succeeded"
+      || !SHUTDOWN_CHECKPOINT_ALLOWLIST.includes(value.shutdownCheckpoint)
+      || value.shutdownCheckpoint !== "descendants_gone"
       || !validProgress
       || !validFailure
       || failure.failedStep !== "none"
       || failure.failureCode !== "none"
       || RUNTIME_KEYS
-        .filter((key) => !["status", "target", "contentFree", "failureStage", "failureReason", "dashboardCheckpoint", "dashboardRefreshProgress", "dashboardRefreshFailure"].includes(key))
+        .filter((key) => !["status", "target", "contentFree", "failureStage", "failureReason", "dashboardCheckpoint", "dashboardRefreshProgress", "dashboardRefreshFailure", "shutdownCheckpoint"].includes(key))
         .some((key) => value[key] !== true)) {
     fail(FIXED_STATUS.runtimeInvalid);
   }

@@ -391,6 +391,21 @@ test("Windows security workflow is manual, pinned, read-only, and content-free",
   assert.match(electronVerifierBodyForDeletion, /WINDOWS_ELECTRON_ARTIFACT_INVENTORY_INVALID/u);
   assert.match(workflow, /runtime aggregate shape/u);
   assert.match(workflow, /runtime aggregate status/u);
+  assert.match(workflow, /shutdownCheckpoint/u);
+  assert.match(workflow, /runtimeShutdownCheckpoints/u);
+  assert.match(workflow, /shutdownCheckpoint = 'not_started'/u);
+  assert.match(workflow, /'shutdownCheckpoint'/u);
+  assert.match(workflow, /'descendants_gone'/u);
+  assert.match(
+    workflow,
+    /runtimeEvidence\.shutdownCheckpoint -isnot \[string\][\s\S]+?runtimeShutdownCheckpoints -notcontains \$runtimeEvidence\.shutdownCheckpoint/u,
+    "runtime aggregate shutdown checkpoint must be a fixed enum",
+  );
+  assert.match(
+    workflow,
+    /runtimeEvidence\.shutdownCheckpoint -ne 'descendants_gone'/u,
+    "passed runtime aggregate must prove descendants are gone",
+  );
   assert.match(workflow, /runtimeFailureStages/u);
   assert.match(workflow, /runtimeFailureReasons/u);
   assert.match(workflow, /runtimeFallbackReasons/u);
@@ -1889,6 +1904,7 @@ function windowsReceiptFixture({
       relaunchPersistence: true,
       secondInstanceRejected: true,
       showHideTrayLifecycle: true,
+      shutdownCheckpoint: "descendants_gone",
       statePersistence: true,
       status: "passed",
       syntheticRefresh: true,
@@ -2026,6 +2042,45 @@ test("Windows Electron qualification receipt rejects incomplete or mismatched ev
       `canonical receipts must require startup_refresh_terminal_succeeded, got ${dashboardCheckpoint}`,
     );
   }
+  for (const shutdownCheckpoint of [
+    "not_started",
+    "started",
+    "descendants_captured",
+    "quit_acknowledged",
+    "primary_exited",
+    "monitor_settled",
+    "unexpected",
+    undefined,
+  ]) {
+    const runtimeEvidence = { ...fixture.runtimeEvidence };
+    if (shutdownCheckpoint === undefined) {
+      delete runtimeEvidence.shutdownCheckpoint;
+    } else {
+      runtimeEvidence.shutdownCheckpoint = shutdownCheckpoint;
+    }
+    assert.throws(
+      () => buildWindowsElectronQualificationReceipt({
+        ...fixture,
+        runtimeEvidence,
+      }),
+      (error) => error.code === WINDOWS_RECEIPT_STATUS.runtimeInvalid,
+      `canonical receipts must require descendants_gone shutdown completion, got ${shutdownCheckpoint}`,
+    );
+  }
+  assert.throws(
+    () => buildWindowsElectronQualificationReceipt({
+      ...fixture,
+      runtimeEvidence: {
+        ...fixture.runtimeEvidence,
+        status: "failed",
+        failureReason: "child_exit",
+        failureStage: "shutdown",
+        shutdownCheckpoint: "monitor_settled",
+      },
+    }),
+    (error) => error.code === WINDOWS_RECEIPT_STATUS.runtimeInvalid,
+    "failed runtime evidence must never produce a canonical passed receipt",
+  );
   assert.throws(
     () => buildWindowsElectronQualificationReceipt({
       ...fixture,
