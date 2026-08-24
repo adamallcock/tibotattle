@@ -39,6 +39,12 @@
       "followUp": "Replace O_NOFOLLOW coverage with native Windows reparse-point refusal."
     },
     {
+      "file": "test/codex-log-scan-discovery.test.js",
+      "win32BranchCount": 1,
+      "classification": "posix-only-assertion",
+      "followUp": "Windows safely omits the optional POSIX owner-controlled SQLite hint and falls back to canonical rollout metadata; add a native owner-ACL equivalent before enabling that hint on Windows."
+    },
+    {
       "file": "test/codex-log-scan-source-consistency.test.js",
       "win32BranchCount": 1,
       "classification": "windows-equivalent-needed",
