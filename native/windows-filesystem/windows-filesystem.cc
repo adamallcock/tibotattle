@@ -2239,6 +2239,146 @@ bool ReserveSqliteSidecar(
   return true;
 }
 
+// A rollback journal left by SQLite in PERSIST mode is safe to remove only
+// after its header has been cleared.  The first 28 bytes are the bounded
+// hot-journal discriminator: a clean PERSIST journal is either empty or has
+// an all-zero header, while a non-zero (or truncated) header must be treated
+// as live/unknown.  The journal is opened without sharing before this check,
+// so another writer cannot replace the bytes between inspection and the
+// delete-pending transition.
+bool IsCleanSqliteRollbackJournal(HANDLE handle, Failure* failure) {
+  constexpr std::size_t kSqliteRollbackJournalHeaderBytes = 28;
+  LARGE_INTEGER size{};
+  if (!GetFileSizeEx(handle, &size) || size.QuadPart < 0) {
+    *failure = FromLastError();
+    return false;
+  }
+  if (size.QuadPart == 0) return true;
+  if (static_cast<ULONGLONG>(size.QuadPart) < kSqliteRollbackJournalHeaderBytes) {
+    *failure = SqliteStateLeaseSidecarPresent();
+    return false;
+  }
+
+  LARGE_INTEGER beginning{};
+  if (!SetFilePointerEx(handle, beginning, nullptr, FILE_BEGIN)) {
+    *failure = FromLastError();
+    return false;
+  }
+  std::array<BYTE, kSqliteRollbackJournalHeaderBytes> header{};
+  DWORD bytesRead = 0;
+  if (!ReadFile(
+          handle,
+          header.data(),
+          static_cast<DWORD>(header.size()),
+          &bytesRead,
+          nullptr)) {
+    *failure = FromLastError();
+    return false;
+  }
+  if (bytesRead != header.size()
+      || std::any_of(header.begin(), header.end(), [](BYTE byte) {
+        return byte != 0;
+      })) {
+    *failure = SqliteStateLeaseSidecarPresent();
+    return false;
+  }
+  return true;
+}
+
+// Pin the stage journal decision to the same stage parent and publication
+// operation as the database handle.  An existing clean journal is marked
+// delete-pending and held exclusively until the callback exits.  If the
+// journal is absent, ReserveSqliteSidecar creates an owner-only
+// delete-on-close placeholder, preventing a name recreation race before the
+// stage database is renamed.  Hot, malformed, reparse, hard-linked, or
+// otherwise unsafe journals fail closed and remain untouched.
+bool OpenSqliteStageJournalGuard(
+    HANDLE stageParent,
+    const ParsedPath& stagePath,
+    const std::wstring& stageName,
+    RelativeHandles* guard,
+    Failure* failure) {
+  if (stagePath.components.empty()
+      || stageName.size() > static_cast<std::size_t>(USHRT_MAX / sizeof(wchar_t)) - 8) {
+    *failure = InvalidPath();
+    return false;
+  }
+  const std::wstring journalName = stageName + L"-journal";
+  OpenRelativeOptions options;
+  options.finalDirectoryKnown = true;
+  options.finalDirectory = false;
+  options.access = GENERIC_READ
+      | DELETE
+      | READ_CONTROL
+      | FILE_READ_ATTRIBUTES
+      | SYNCHRONIZE;
+  // Do not allow another process to keep or replace this basename while the
+  // journal header is checked and the stage is renamed.
+  options.shareMode = 0;
+  options.disposition = kFileOpen;
+
+  HANDLE journal = INVALID_HANDLE_VALUE;
+  ULONG_PTR information = 0;
+  if (OpenRelativeComponent(
+          stageParent,
+          journalName,
+          options.access,
+          options.shareMode,
+          options.disposition,
+          kFileNonDirectoryFile,
+          nullptr,
+          &journal,
+          &information,
+          failure)) {
+    if (information != kFileOpened) {
+      CloseHandle(journal);
+      *failure = IdentityMismatch();
+      return false;
+    }
+    guard->final = journal;
+    ParsedPath journalPath = stagePath;
+    journalPath.components.back() = journalName;
+    HandleIdentity journalIdentity;
+    if (!ValidateSqliteChildHandle(guard->final, journalPath, &journalIdentity, failure)
+        || !IsCleanSqliteRollbackJournal(guard->final, failure)) {
+      return false;
+    }
+    if (!MarkHandleForDeletion(guard->final)) {
+      *failure = FromLastError();
+      return false;
+    }
+    HandleIdentity postDeleteIdentity;
+    if (!ValidateSqliteChildHandle(
+            guard->final,
+            journalPath,
+            &postDeleteIdentity,
+            failure)
+        || !EqualIdentity(postDeleteIdentity, journalIdentity)) {
+      if (failure->code == OperationFailed().code) *failure = IdentityMismatch();
+      return false;
+    }
+    return true;
+  }
+
+  // A missing journal is the normal fresh-stage case.  Any other error,
+  // including a sharing violation/access denial from a live or protected
+  // journal, is a fail-closed publication failure.
+  if (failure->code != NotFound().code) return false;
+  ParsedPath parsedRoot = stagePath;
+  parsedRoot.components.pop_back();
+  HANDLE reserved = INVALID_HANDLE_VALUE;
+  if (!ReserveSqliteSidecar(
+          stageParent,
+          parsedRoot,
+          journalName,
+          &reserved,
+          failure)) {
+    return false;
+  }
+  guard->final = reserved;
+  return true;
+}
+
 std::vector<HANDLE> TakeAllHandles(RelativeHandles* opened) {
   std::vector<HANDLE> handles;
   handles.reserve(opened->parents.size() + 1);
@@ -4471,6 +4611,18 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
       failure.stage = "publish_target_preflight";
       return ThrowFailure(env, failure);
     }
+  }
+  RelativeHandles stageJournal;
+  if (stage.parents.empty()
+      || !OpenSqliteStageJournalGuard(
+          stage.parents.front(),
+          stagePath,
+          stageName,
+          &stageJournal,
+          &failure)) {
+    if (failure.code == OperationFailed().code) failure = IdentityMismatch();
+    failure.stage = "publish_stage_preflight";
+    return ThrowFailure(env, failure);
   }
   if (stage.parents.empty()) {
     failure = OperationFailed();

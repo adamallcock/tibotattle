@@ -535,3 +535,62 @@ test("SQLite staging grants existing-stage write access only to publication", as
   assert.match(source, /napi_get_boolean\(env, false, &sqliteStateStagingSafe\)/u);
   assert.doesNotMatch(publishBody, /sqliteState(?:Lease|Staging)Safe/u);
 });
+
+test("SQLite publication guards PERSIST journals before the final rename", async () => {
+  const source = await readFile(
+    resolve(REPOSITORY_ROOT, "native/windows-filesystem/windows-filesystem.cc"),
+    "utf8",
+  );
+  const guardStart = source.indexOf("bool OpenSqliteStageJournalGuard(");
+  const guardEnd = source.indexOf("std::vector<HANDLE> TakeAllHandles", guardStart);
+  const journalSectionStart = source.indexOf("bool IsCleanSqliteRollbackJournal(");
+  const publishStart = source.indexOf("napi_value PublishSqliteDatabaseCallback(");
+  const publishEnd = source.indexOf("napi_value DeleteProtectedChildCallback(", publishStart);
+  assert.ok(
+    guardStart >= 0
+      && guardEnd > guardStart
+      && journalSectionStart >= 0
+      && journalSectionStart < guardStart
+      && publishStart > guardEnd
+      && publishEnd > publishStart,
+  );
+  const guardBody = source.slice(guardStart, guardEnd);
+  const journalSection = source.slice(journalSectionStart, guardEnd);
+  const publishBody = source.slice(publishStart, publishEnd);
+
+  // Existing journals are opened exclusively, so the header decision and
+  // delete-pending transition cannot be separated by a writer/name swap.
+  assert.match(guardBody, /options\.shareMode = 0;/u);
+  assert.match(guardBody, /options\.disposition = kFileOpen;/u);
+  assert.match(
+    guardBody,
+    /OpenRelativeComponent\([\s\S]*?options\.shareMode[\s\S]*?options\.disposition/u,
+  );
+
+  // SQLite's rollback-journal header is bounded and truncated headers fail
+  // closed with the existing content-free sidecar error vocabulary.
+  assert.match(journalSection, /kSqliteRollbackJournalHeaderBytes = 28/u);
+  assert.match(
+    journalSection,
+    /static_cast<ULONGLONG>\(size\.QuadPart\) < kSqliteRollbackJournalHeaderBytes[\s\S]*?SqliteStateLeaseSidecarPresent\(\)/u,
+  );
+  assert.match(guardBody, /ReserveSqliteSidecar\(/u);
+  assert.match(guardBody, /MarkHandleForDeletion\(guard->final\)/u);
+
+  const targetPreflightOffset = publishBody.indexOf(
+    'failure.stage = "publish_target_preflight";',
+  );
+  const journalGuardOffset = publishBody.indexOf(
+    "OpenSqliteStageJournalGuard(",
+  );
+  const stageRevalidateOffset = publishBody.indexOf(
+    'failure.stage = "publish_stage_revalidate";',
+  );
+  const renameOffset = publishBody.indexOf("RenameHandleRelative(");
+  assert.ok(
+    targetPreflightOffset >= 0
+      && journalGuardOffset > targetPreflightOffset
+      && stageRevalidateOffset > journalGuardOffset
+      && renameOffset > stageRevalidateOffset,
+  );
+});

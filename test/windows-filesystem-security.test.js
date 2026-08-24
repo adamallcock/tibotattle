@@ -987,6 +987,11 @@ test("native SQLite staging clones, rejects aliases, and publishes atomically", 
       freshStageIdentity,
       bytes,
     );
+    // SQLite's PERSIST journal may remain as a zeroed file after a clean
+    // commit. Publication must validate and remove it while the stage/root
+    // handles are still pinned rather than relying on a path-level cleanup.
+    const freshJournalPath = join(root, `${freshStageName}-journal`);
+    adapter.createFile(freshJournalPath, Buffer.alloc(64));
     const freshStageContentIdentity = adapter.inspectPath(
       join(root, freshStageName),
     ).identity;
@@ -1005,7 +1010,142 @@ test("native SQLite staging clones, rejects aliases, and publishes atomically", 
       freshPublished.identity,
       adapter.inspectPath(freshTargetPath).identity,
     );
+    assert.throws(
+      () => adapter.inspectPath(freshJournalPath),
+      fixedNativeError("ENOENT"),
+    );
     const liveIdentity = adapter.inspectPath(freshTargetPath).identity;
+
+    // A non-zero rollback-journal header is hot/unknown. It must block the
+    // rename and leave the stage, journal, and existing target untouched.
+    const hotStageName = `${liveName}.building-hot-state`;
+    const hotStagePath = join(root, hotStageName);
+    const hotJournalPath = join(root, `${hotStageName}-journal`);
+    const hotStageBytes = Buffer.from("hot-journal-stage\n", "utf8");
+    const hotStageCreated = adapter.createSqliteDatabase(
+      root,
+      rootIdentity,
+      hotStageName,
+    );
+    adapter.replaceFile(hotStagePath, hotStageCreated, hotStageBytes);
+    const hotStageIdentity = adapter.inspectPath(hotStagePath).identity;
+    const hotJournalBytes = Buffer.alloc(64);
+    hotJournalBytes[0] = 0xd9;
+    const hotJournalIdentity = adapter.createFile(hotJournalPath, hotJournalBytes);
+    const targetBeforeHot = adapter.inspectPath(freshTargetPath).identity;
+    assert.throws(
+      () => publishWithDiagnostic(() => adapter.publishSqliteDatabase(
+        root,
+        rootIdentity,
+        hotStageName,
+        hotStageIdentity,
+        liveName,
+        targetBeforeHot,
+      )),
+      fixedNativeError("WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_SIDECAR_PRESENT"),
+    );
+    assert.deepEqual(adapter.inspectPath(freshTargetPath).identity, targetBeforeHot);
+    assert.deepEqual(adapter.readFile(freshTargetPath).data, bytes);
+    assert.deepEqual(adapter.inspectPath(hotStagePath).identity, hotStageIdentity);
+    assert.deepEqual(adapter.readFile(hotStagePath).data, hotStageBytes);
+    assert.deepEqual(adapter.inspectPath(hotJournalPath).identity, hotJournalIdentity);
+    assert.deepEqual(adapter.readFile(hotJournalPath).data, hotJournalBytes);
+
+    // A truncated all-zero header is not proof of a clean PERSIST journal.
+    // Publication must fail closed without changing any of the three files.
+    const truncatedStageName = `${liveName}.building-truncated-state`;
+    const truncatedStagePath = join(root, truncatedStageName);
+    const truncatedJournalPath = join(root, `${truncatedStageName}-journal`);
+    const truncatedStageBytes = Buffer.from("truncated-journal-stage\n", "utf8");
+    const truncatedStageCreated = adapter.createSqliteDatabase(
+      root,
+      rootIdentity,
+      truncatedStageName,
+    );
+    adapter.replaceFile(
+      truncatedStagePath,
+      truncatedStageCreated,
+      truncatedStageBytes,
+    );
+    const truncatedStageIdentity = adapter.inspectPath(truncatedStagePath).identity;
+    const truncatedJournalBytes = Buffer.alloc(27);
+    const truncatedJournalIdentity = adapter.createFile(
+      truncatedJournalPath,
+      truncatedJournalBytes,
+    );
+    const targetBeforeTruncated = adapter.inspectPath(freshTargetPath).identity;
+    assert.throws(
+      () => publishWithDiagnostic(() => adapter.publishSqliteDatabase(
+        root,
+        rootIdentity,
+        truncatedStageName,
+        truncatedStageIdentity,
+        liveName,
+        targetBeforeTruncated,
+      )),
+      fixedNativeError("WINDOWS_FILESYSTEM_SQLITE_STATE_LEASE_SIDECAR_PRESENT"),
+    );
+    assert.deepEqual(
+      adapter.inspectPath(freshTargetPath).identity,
+      targetBeforeTruncated,
+    );
+    assert.deepEqual(adapter.readFile(freshTargetPath).data, bytes);
+    assert.deepEqual(
+      adapter.inspectPath(truncatedStagePath).identity,
+      truncatedStageIdentity,
+    );
+    assert.deepEqual(adapter.readFile(truncatedStagePath).data, truncatedStageBytes);
+    assert.deepEqual(
+      adapter.inspectPath(truncatedJournalPath).identity,
+      truncatedJournalIdentity,
+    );
+    assert.deepEqual(
+      adapter.readFile(truncatedJournalPath).data,
+      truncatedJournalBytes,
+    );
+
+    // A journal with unsafe identity (here a hard link) is rejected before
+    // any deletion or publication. The source and linked journal remain
+    // intact, as does the current target.
+    const unsafeStageName = `${liveName}.building-unsafe-state`;
+    const unsafeStagePath = join(root, unsafeStageName);
+    const unsafeJournalPath = join(root, `${unsafeStageName}-journal`);
+    const unsafeJournalSourcePath = join(root, `${unsafeStageName}-journal-source`);
+    const unsafeStageBytes = Buffer.from("unsafe-journal-stage\n", "utf8");
+    const unsafeStageCreated = adapter.createSqliteDatabase(
+      root,
+      rootIdentity,
+      unsafeStageName,
+    );
+    adapter.replaceFile(unsafeStagePath, unsafeStageCreated, unsafeStageBytes);
+    const unsafeStageIdentity = adapter.inspectPath(unsafeStagePath).identity;
+    const unsafeJournalBytes = Buffer.alloc(64);
+    adapter.createFile(unsafeJournalSourcePath, unsafeJournalBytes);
+    await link(unsafeJournalSourcePath, unsafeJournalPath);
+    const unsafeJournalIdentity = adapter.inspectPath(unsafeJournalPath).identity;
+    assert.equal(unsafeJournalIdentity.linkCount, 2);
+    assert.deepEqual(
+      adapter.inspectPath(unsafeJournalSourcePath).identity,
+      unsafeJournalIdentity,
+    );
+    assert.throws(
+      () => publishWithDiagnostic(() => adapter.publishSqliteDatabase(
+        root,
+        rootIdentity,
+        unsafeStageName,
+        unsafeStageIdentity,
+        liveName,
+        targetBeforeHot,
+      )),
+      fixedNativeError("WINDOWS_FILESYSTEM_HARD_LINK"),
+    );
+    assert.deepEqual(adapter.inspectPath(freshTargetPath).identity, targetBeforeHot);
+    assert.deepEqual(adapter.readFile(freshTargetPath).data, bytes);
+    assert.deepEqual(adapter.inspectPath(unsafeStagePath).identity, unsafeStageIdentity);
+    assert.deepEqual(adapter.readFile(unsafeStagePath).data, unsafeStageBytes);
+    assert.deepEqual(adapter.inspectPath(unsafeJournalPath).identity, unsafeJournalIdentity);
+    assert.deepEqual(adapter.inspectPath(unsafeJournalSourcePath).identity, unsafeJournalIdentity);
+    assert.deepEqual(adapter.readFile(unsafeJournalPath).data, unsafeJournalBytes);
 
     const cloned = adapter.cloneSqliteDatabase(
       root,
@@ -1107,6 +1247,19 @@ test("qualification hook rejects a fresh SQLite publication target collision", {
       targetName: liveName,
     });
     assert.equal(binding.waitForReplacementPause(5000), true);
+    // The absent-journal path is protected by a native delete-on-close
+    // reservation held through the rename boundary; a same-name recreation
+    // must fail while the worker is paused.
+    assert.throws(
+      () => adapter.createFile(`${stagePath}-journal`, Buffer.alloc(64)),
+      (error) => {
+        assert.ok([
+          "WINDOWS_FILESYSTEM_ACCESS_DENIED",
+          "WINDOWS_FILESYSTEM_ALREADY_EXISTS",
+        ].includes(error?.code));
+        return true;
+      },
+    );
     const competingIdentity = adapter.createFile(targetPath, competingBytes);
     assert.deepEqual(adapter.readFile(targetPath).data, competingBytes);
 
@@ -1122,6 +1275,10 @@ test("qualification hook rejects a fresh SQLite publication target collision", {
     assert.deepEqual(adapter.readFile(targetPath).data, competingBytes);
     assert.deepEqual(adapter.inspectPath(stagePath).identity, expectedStageIdentity);
     assert.deepEqual(adapter.readFile(stagePath).data, stageBytes);
+    assert.throws(
+      () => adapter.inspectPath(`${stagePath}-journal`),
+      fixedNativeError("ENOENT"),
+    );
     assert.deepEqual(adapter.deleteFile(stagePath, expectedStageIdentity), {
       deleted: true,
       identity: expectedStageIdentity,
