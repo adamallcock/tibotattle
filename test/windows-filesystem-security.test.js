@@ -1263,11 +1263,8 @@ test("qualification hook rejects a fresh SQLite publication target collision", {
           t.diagnostic(`windowsFilesystemError: ${diagnosticCode}`);
         }
         assert.ok([
+          "EEXIST",
           "WINDOWS_FILESYSTEM_ACCESS_DENIED",
-          "WINDOWS_FILESYSTEM_ALREADY_EXISTS",
-          "WINDOWS_FILESYSTEM_NOT_FOUND",
-          "WINDOWS_FILESYSTEM_OPERATION_FAILED",
-          "WINDOWS_FILESYSTEM_HARD_LINK",
         ].includes(error?.code));
         return true;
       },
