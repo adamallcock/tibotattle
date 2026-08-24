@@ -4499,6 +4499,13 @@ napi_value PublishSqliteDatabaseCallback(napi_env env, napi_callback_info info) 
       return ThrowFailure(env, failure);
     }
   }
+  // Qualification-only pause for the fresh-target no-clobber boundary. The
+  // protected walk above observed the target as absent; let the adversarial
+  // test create it before the conditional rename so the native operation must
+  // return a bounded collision without replacing the competing file.
+#if defined(TIBOTATTLE_WINDOWS_FILESYSTEM_TEST_HOOK)
+  if (targetMissing) PauseBeforeReplacementRename();
+#endif
   if (!RenameHandleRelative(
           stage.final,
           stage.parents.front(),

@@ -286,6 +286,98 @@ function runReplacementWorker({ bindingPath, path, expectedIdentity, bytes }) {
   return { worker, result };
 }
 
+function runSqlitePublishWorker({
+  bindingPath,
+  root,
+  rootIdentity,
+  stageName,
+  expectedStageIdentity,
+  targetName,
+}) {
+  const worker = new Worker(`
+    const { parentPort, workerData } = require("node:worker_threads");
+    try {
+      const binding = require(workerData.bindingPath);
+      binding.publishSqliteDatabase(
+        workerData.root,
+        workerData.rootIdentity,
+        workerData.stageName,
+        workerData.expectedStageIdentity,
+        workerData.targetName,
+        null,
+      );
+      parentPort.postMessage({ status: "ok" });
+    } catch (error) {
+      parentPort.postMessage({
+        status: "error",
+        code: typeof error?.code === "string"
+          ? error.code
+          : "WINDOWS_FILESYSTEM_UNKNOWN",
+      });
+    }
+  `, {
+    eval: true,
+    workerData: {
+      bindingPath,
+      root,
+      rootIdentity,
+      stageName,
+      expectedStageIdentity,
+      targetName,
+    },
+  });
+
+  const result = new Promise((resolveResult, rejectResult) => {
+    let settled = false;
+    let messageReceived = false;
+    let message;
+    let exitReceived = false;
+    let exitCode;
+    let timeout;
+    const finishIfClean = () => {
+      if (settled || !messageReceived || !exitReceived) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (exitCode !== 0) {
+        rejectResult(new Error("WINDOWS_FILESYSTEM_SQLITE_PUBLISH_WORKER_EXIT"));
+        return;
+      }
+      resolveResult(message);
+    };
+    timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      void worker.terminate();
+      rejectResult(new Error("WINDOWS_FILESYSTEM_SQLITE_PUBLISH_WORKER_TIMEOUT"));
+    }, QUALIFICATION_ATTACK_TIMEOUT_MS);
+    worker.once("message", (value) => {
+      if (settled) return;
+      messageReceived = true;
+      message = value;
+      finishIfClean();
+    });
+    worker.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      rejectResult(error);
+    });
+    worker.once("exit", (code) => {
+      if (settled) return;
+      exitReceived = true;
+      exitCode = code;
+      if (code !== 0) {
+        settled = true;
+        clearTimeout(timeout);
+        rejectResult(new Error("WINDOWS_FILESYSTEM_SQLITE_PUBLISH_WORKER_EXIT"));
+        return;
+      }
+      finishIfClean();
+    });
+  });
+  return { worker, result };
+}
+
 const REVIEWED_SHARING_OR_PERMISSION_CODES = new Set([
   "EACCES",
   "EBUSY",
@@ -967,6 +1059,114 @@ test("native SQLite staging clones, rejects aliases, and publishes atomically", 
     );
   } finally {
     await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("qualification hook rejects a fresh SQLite publication target collision", {
+  skip: NATIVE_SKIP,
+}, async () => {
+  const parent = await mkdtemp(join(tmpdir(), "tibotattle-windows-sqlite-publish-race-"));
+  const root = join(parent, `private state Ω ${randomUUID()}`);
+  const liveName = "local-unified-index-v1.sqlite";
+  const stageName = `${liveName}.building-collision`;
+  const stagePath = join(root, stageName);
+  const targetPath = join(root, liveName);
+  const stageBytes = Buffer.from("sqlite-publish-stage-survives-collision\n", "utf8");
+  const competingBytes = Buffer.from("competing-target-remains-authoritative\n", "utf8");
+  const bindingPath = qualificationBindingPath();
+  const binding = loadQualificationBinding(bindingPath);
+  const adapter = createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding,
+  });
+  let operation;
+  let primaryError;
+  const cleanupErrors = [];
+  try {
+    const rootIdentity = adapter.ensureDirectory(root);
+    const createdStageIdentity = adapter.createSqliteDatabase(
+      root,
+      rootIdentity,
+      stageName,
+    );
+    adapter.replaceFile(stagePath, createdStageIdentity, stageBytes);
+    const expectedStageIdentity = adapter.inspectPath(stagePath).identity;
+
+    // The worker pauses only after the protected walk has observed the live
+    // target as absent and immediately before the no-clobber rename. The
+    // competing file is created through the ordinary create primitive so this
+    // test does not recursively trigger the replacement pause itself.
+    binding.armReplacementPause();
+    operation = runSqlitePublishWorker({
+      bindingPath,
+      root,
+      rootIdentity,
+      stageName,
+      expectedStageIdentity,
+      targetName: liveName,
+    });
+    assert.equal(binding.waitForReplacementPause(5000), true);
+    const competingIdentity = adapter.createFile(targetPath, competingBytes);
+    assert.deepEqual(adapter.readFile(targetPath).data, competingBytes);
+
+    binding.releaseReplacementPause();
+    assert.deepEqual(await operation.result, {
+      status: "error",
+      code: "WINDOWS_FILESYSTEM_ALREADY_EXISTS",
+    });
+
+    // A no-clobber collision leaves the staged database recoverable. The
+    // caller owns cleanup after deciding whether to retry or discard it.
+    assert.deepEqual(adapter.inspectPath(targetPath).identity, competingIdentity);
+    assert.deepEqual(adapter.readFile(targetPath).data, competingBytes);
+    assert.deepEqual(adapter.inspectPath(stagePath).identity, expectedStageIdentity);
+    assert.deepEqual(adapter.readFile(stagePath).data, stageBytes);
+    assert.deepEqual(adapter.deleteFile(stagePath, expectedStageIdentity), {
+      deleted: true,
+      identity: expectedStageIdentity,
+    });
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    if (operation !== undefined) {
+      try {
+        binding.releaseReplacementPause();
+      } catch {
+        // Cleanup remains bounded if the worker had already passed the pause.
+      }
+      try {
+        await awaitWithin(
+          operation.result.catch(() => {}),
+          QUALIFICATION_CLEANUP_TIMEOUT_MS,
+          "WINDOWS_FILESYSTEM_SQLITE_PUBLISH_WORKER_CLEANUP_TIMEOUT",
+        );
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      try {
+        await awaitWithin(
+          operation.worker.terminate(),
+          QUALIFICATION_CLEANUP_TIMEOUT_MS,
+          "WINDOWS_FILESYSTEM_SQLITE_PUBLISH_WORKER_TERMINATE_TIMEOUT",
+        );
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    try {
+      await awaitWithin(
+        rm(parent, { recursive: true, force: true }),
+        QUALIFICATION_CLEANUP_TIMEOUT_MS,
+        "WINDOWS_FILESYSTEM_SQLITE_PUBLISH_ROOT_CLEANUP_TIMEOUT",
+      );
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    if (primaryError === undefined && cleanupErrors.length > 0) {
+      throw cleanupErrors[0];
+    }
   }
 });
 
