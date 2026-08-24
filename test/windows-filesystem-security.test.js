@@ -1204,7 +1204,7 @@ test("native SQLite staging clones, rejects aliases, and publishes atomically", 
 
 test("qualification hook rejects a fresh SQLite publication target collision", {
   skip: NATIVE_SKIP,
-}, async () => {
+}, async (t) => {
   const parent = await mkdtemp(join(tmpdir(), "tibotattle-windows-sqlite-publish-race-"));
   const root = join(parent, `private state Ω ${randomUUID()}`);
   const liveName = "local-unified-index-v1.sqlite";
@@ -1253,6 +1253,10 @@ test("qualification hook rejects a fresh SQLite publication target collision", {
     assert.throws(
       () => adapter.createFile(`${stagePath}-journal`, Buffer.alloc(64)),
       (error) => {
+        if (typeof error?.code === "string"
+          && WINDOWS_SQLITE_PUBLISH_ERROR_ALLOWLIST.includes(error.code)) {
+          t.diagnostic(`windowsFilesystemError: ${error.code}`);
+        }
         assert.ok([
           "WINDOWS_FILESYSTEM_ACCESS_DENIED",
           "WINDOWS_FILESYSTEM_ALREADY_EXISTS",
