@@ -945,6 +945,66 @@ test("held and suppressed quota observations remain represented by a complete ge
   }
 });
 
+test("clearing deleted quota ids prevents a later source from using an orphaned observation", async () => {
+  const { root } = await corpus({
+    [canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE)]: [
+      sessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount(
+        "2026-07-25T00:00:01.000Z",
+        usage(100, 10),
+        usage(100, 10),
+        { usedPercent: 12 },
+      ),
+      // The valid event above populates the writer's quota interning cache.
+      // This malformed accounting record quarantines the source afterward,
+      // deleting its now-orphaned canonical observation.
+      '{"timestamp":"2026-07-25T00:00:02.000Z","type":"event_msg","payload":{"type":"token_count"',
+    ],
+    [canonicalRolloutName("2026-07-25T00-00-01", THREAD_TWO)]: [
+      sessionMeta(THREAD_TWO),
+      turnContext("2026-07-25T00:00:03.000Z", "gpt-5.6-sol"),
+      tokenCount(
+        // Match the invalid source's full observation key so the regression
+        // exercises a stale interning-cache hit after orphan deletion.
+        "2026-07-25T00:00:01.000Z",
+        usage(100, 10),
+        usage(100, 10),
+        { usedPercent: 12 },
+      ),
+    ],
+  });
+  try {
+    const built = await build(root);
+    assert.equal(built.generation.status, "partial");
+    assert.equal(built.usageEvents, 1);
+    assert.equal(built.quotaOccurrences, 1);
+
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), {
+      readOnly: true,
+    });
+    try {
+      assert.equal(
+        Number(database.prepare(
+          "SELECT COUNT(*) AS count FROM quota_occurrence",
+        ).get().count),
+        1,
+      );
+      assert.equal(
+        Number(database.prepare(
+          "SELECT COUNT(*) AS count FROM quota_observation",
+        ).get().count),
+        1,
+      );
+      assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 test("a forked source contributes only its post-fork turns", async () => {
   // Owner ruling: a fork's replayed parent history is not our spend. Those
   // turns were charged against the allowance in the parent thread; Codex

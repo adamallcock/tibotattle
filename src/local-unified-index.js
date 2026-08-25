@@ -2375,6 +2375,10 @@ export function createUnifiedIndexWriter(database, {
           );
         }
       }
+      // A deleted source can orphan its canonical observation. Never let the
+      // writer's interning cache return that deleted id to a later source in
+      // this same staged generation.
+      quotaIds.clear();
       step();
       return { usageEvents, quotaOccurrences, toolFacts };
     },
