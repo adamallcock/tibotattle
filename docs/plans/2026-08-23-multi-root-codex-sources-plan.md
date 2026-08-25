@@ -71,7 +71,7 @@ sources and require broad downstream deduplication.
 | copied sessions deduplicate only when equivalent | implemented through same-session raw-prefix equivalence, without a general record deduplication system |
 
 This is an intentional issue-scope correction, not an accidental shortfall.
-Issue #51 should describe this lean contract and remain open for the platform
+Issue #51 now describes this lean contract and remains open for the platform
 qualification items below rather than retaining contradictory acceptance text.
 
 ## Scope split
@@ -550,6 +550,8 @@ at any severity after the lifecycle fixes. The performance re-audit reported
 no new regression while retaining the explicit high-water RSS/latency gate.
 Source was frozen in local commit `c8e50615`; the regenerated receipts,
 tool-inventory registration, and final documentation are a separate local
-provenance commit. Nothing was pushed, published, tagged, released, or posted
-to the public issue. Installed Windows/WSL filesystem and signing
-qualification remains separate.
+provenance commit. No code or artifact was pushed, tagged, released, or
+installed. The body of public issue #51 was reconciled on 2026-08-25 with the
+lean Stage A contract, and the issue remains open for the explicit platform
+gates above. Installed Windows/WSL filesystem and signing qualification remains
+separate.

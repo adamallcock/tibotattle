@@ -465,5 +465,6 @@ plural-root performance qualification.
 The verified native journey is recorded in the
 [Multi-root Codex AppKit QA receipt](../receipts/2026-08-23-multi-root-codex-appkit-qa-receipt.md).
 Stage A and its R7 receipts were committed locally on the isolated branch. No
-release artifact, push, tag, public issue change, installation replacement, or
-publication was performed.
+release artifact, code push, tag, installation replacement, or code publication
+was performed. The body of public issue #51 was reconciled on 2026-08-25, and
+the issue remains open for platform qualification.
