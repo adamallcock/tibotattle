@@ -129,7 +129,7 @@ export function createDesktopTrayTemplate({
     },
     { type: "separator" },
     {
-      label: desktopText("electron.tray.quit", {}, textOptions),
+      label: desktopText("electron.tray.quit", { appName }, textOptions),
       click: boundedActions.quit,
       accelerator: "CmdOrCtrl+Q",
     },

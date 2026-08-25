@@ -133,9 +133,30 @@ test("Windows and Linux menus use conventional File and Help entries", () => {
 
 test("desktop menu and tray copy resolves every supported language", () => {
   const expected = {
-    "en-US": { file: "File", refresh: "Refresh Usage", tray: "Open TiboTattle Dev", status: STATUS_PLACEHOLDER },
-    "zh-Hans": { file: "文件", refresh: "刷新使用情况", tray: "打开 TiboTattle Dev", status: "状态不可用" },
-    es: { file: "Archivo", refresh: "Actualizar uso", tray: "Abrir TiboTattle Dev", status: "Estado no disponible" },
+    "en-US": {
+      file: "File",
+      refresh: "Refresh Usage",
+      tray: "Open TiboTattle Dev",
+      update: "Update Local Usage",
+      quit: "Quit TiboTattle Dev",
+      status: STATUS_PLACEHOLDER,
+    },
+    "zh-Hans": {
+      file: "文件",
+      refresh: "刷新使用情况",
+      tray: "打开 TiboTattle Dev",
+      update: "更新本地使用情况",
+      quit: "退出 TiboTattle Dev",
+      status: "状态不可用",
+    },
+    es: {
+      file: "Archivo",
+      refresh: "Actualizar uso",
+      tray: "Abrir TiboTattle Dev",
+      update: "Actualizar uso local",
+      quit: "Salir de TiboTattle Dev",
+      status: "Estado no disponible",
+    },
   };
   for (const [locale, copy] of Object.entries(expected)) {
     assert.equal(resolveDesktopLocale(locale, ["en-US"]), locale);
@@ -151,6 +172,8 @@ test("desktop menu and tray copy resolves every supported language", () => {
     assert.equal(view.submenu[0].label, copy.refresh);
     const tray = createDesktopTrayTemplate({ appName: "TiboTattle Dev", locale });
     assert.equal(tray.find((entry) => entry.label === copy.tray)?.label, copy.tray);
+    assert.equal(tray.find((entry) => entry.label === copy.update)?.label, copy.update);
+    assert.equal(tray.find((entry) => entry.label === copy.quit)?.label, copy.quit);
     assert.equal(tray[1].label, copy.status);
   }
 });
@@ -184,24 +207,31 @@ test("tray menu exposes truthful status and shared action callbacks", () => {
     STATUS_PLACEHOLDER,
     "separator",
     "Open TiboTattle Dev",
-    "Refresh Usage",
+    "Update Local Usage",
     "Retry",
     "Settings…",
     "About TiboTattle Dev",
     "separator",
-    "Quit",
+    "Quit TiboTattle Dev",
   ]);
   assert.equal(item(template, STATUS_PLACEHOLDER).enabled, false);
   item(template, "Open TiboTattle Dev").click();
-  item(template, "Refresh Usage").click();
+  item(template, "Update Local Usage").click();
   item(template, "Retry").click();
   item(template, "Settings…").click();
   item(template, "About TiboTattle Dev").click();
-  item(template, "Quit").click();
-  assert.deepEqual(calls, ["show", "refresh", "retry", "settings", "about", "quit"]);
-  assert.equal(item(template, "Refresh Usage").accelerator, "CmdOrCtrl+R");
+  item(template, "Quit TiboTattle Dev").click();
+  assert.deepEqual(calls, [
+    "show",
+    "refresh",
+    "retry",
+    "settings",
+    "about",
+    "quit",
+  ]);
+  assert.equal(item(template, "Update Local Usage").accelerator, "CmdOrCtrl+R");
   assert.equal(item(template, "Settings…").accelerator, "CmdOrCtrl+,");
-  assert.equal(item(template, "Quit").accelerator, "CmdOrCtrl+Q");
+  assert.equal(item(template, "Quit TiboTattle Dev").accelerator, "CmdOrCtrl+Q");
 });
 
 function nativeImageFixture({

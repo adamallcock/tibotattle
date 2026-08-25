@@ -95,11 +95,11 @@ test("fresh direct evidence projects compact title, evidence age, and quota lane
   assert.deepEqual(fiveHour.slice(3).map((entry) => entry.type === "separator" ? entry.type : entry.label), [
     "separator",
     "Open TiboTattle Dev",
-    "Refresh Usage",
+    "Update Local Usage",
     "Settings…",
     "About TiboTattle Dev",
     "separator",
-    "Quit",
+    "Quit TiboTattle Dev",
   ]);
 
   const sevenDay = createDesktopTrayTemplate({
@@ -174,20 +174,20 @@ test("default and legacy label callers remain bounded and preserve action identi
     STATUS_PLACEHOLDER,
     "separator",
     "Open TiboTattle Dev",
-    "Refresh Usage",
+    "Update Local Usage",
     "Retry",
     "Settings…",
     "About TiboTattle Dev",
     "separator",
-    "Quit",
+    "Quit TiboTattle Dev",
   ]);
   for (const [label, action] of [
     ["Open TiboTattle Dev", "show"],
-    ["Refresh Usage", "refresh"],
+    ["Update Local Usage", "refresh"],
     ["Retry", "retry"],
     ["Settings…", "settings"],
     ["About TiboTattle Dev", "about"],
-    ["Quit", "quit"],
+    ["Quit TiboTattle Dev", "quit"],
   ]) {
     labeled(defaultTemplate, label).click();
     assert.equal(calls.at(-1), action);

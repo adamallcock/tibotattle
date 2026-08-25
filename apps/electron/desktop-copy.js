@@ -477,9 +477,9 @@ const DESKTOP_MESSAGES = Object.freeze({
     es: "Cuota de siete días: queda un {remainingPercent}%",
   }),
   "electron.tray.refresh": Object.freeze({
-    "en-US": "Refresh Usage",
-    "zh-Hans": "刷新使用情况",
-    es: "Actualizar uso",
+    "en-US": "Update Local Usage",
+    "zh-Hans": "更新本地使用情况",
+    es: "Actualizar uso local",
   }),
   "electron.tray.retry": Object.freeze({
     "en-US": "Retry",
@@ -497,9 +497,9 @@ const DESKTOP_MESSAGES = Object.freeze({
     es: "Acerca de {appName}",
   }),
   "electron.tray.quit": Object.freeze({
-    "en-US": "Quit",
-    "zh-Hans": "退出",
-    es: "Salir",
+    "en-US": "Quit {appName}",
+    "zh-Hans": "退出 {appName}",
+    es: "Salir de {appName}",
   }),
 });
 
