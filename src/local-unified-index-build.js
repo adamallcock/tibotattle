@@ -55,6 +55,44 @@ import {
 
 const MAXIMUM_WORKERS = 10;
 
+// Off-main Electron runs own one immutable, parent-generated token for the
+// whole ingest attempt. It is deliberately narrow: the bounded abandoned-
+// stage scanner can classify a hard-terminated worker's orphan without
+// enumerating or globbing the state directory by token prefix. Direct/native
+// callers leave this unset and retain the historical pid/timestamp stage names.
+export const LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN = /^[0-9a-f]{32}$/u;
+
+export function validateLocalUnifiedIndexAttemptToken(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string"
+      || !LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN.test(value)) {
+    throw fixedError("local_unified_index_attempt_token_invalid");
+  }
+  return value;
+}
+
+export function localUnifiedIndexStageFile(
+  indexFile,
+  kind,
+  attemptToken = null,
+) {
+  if (typeof indexFile !== "string" || indexFile.length < 1) {
+    throw fixedError("local_unified_index_worker_options_invalid");
+  }
+  if (kind !== "building" && kind !== "incremental") {
+    throw fixedError("local_unified_index_worker_options_invalid");
+  }
+  const resolvedIndexFile = resolve(indexFile);
+  const token = validateLocalUnifiedIndexAttemptToken(attemptToken);
+  return token === null
+    ? `${resolvedIndexFile}.${kind}-${process.pid}-${Date.now().toString(36)}`
+    // Keep the parent-generated capability exact while retaining the owner
+    // PID in the filename. If a worker is hard-terminated, the normal
+    // bounded abandoned-stage scanner can recognize this orphan without a
+    // token-prefix enumeration or parent-side pathname deletion.
+    : `${resolvedIndexFile}.${kind}-${process.pid}-${token}`;
+}
+
 // The host consumes worker messages through synchronous SQLite calls. Keep a
 // single delivery turn bounded without changing the writer's independent
 // commitRows policy (10,000 by default).
@@ -741,6 +779,7 @@ export async function rebuildLocalUnifiedIndex({
   commitRows = 10_000,
   deferSecondaryIndexes = true,
   maximumLineBytes,
+  attemptToken = null,
   signal = null,
   onProgress = null,
   discoveryLimits = null,
@@ -774,6 +813,7 @@ export async function rebuildLocalUnifiedIndex({
   if (typeof deferSecondaryIndexes !== "boolean") {
     throw new TypeError("deferSecondaryIndexes must be a boolean");
   }
+  validateLocalUnifiedIndexAttemptToken(attemptToken);
   const startedAt = performance.now();
   const resolvedIndexFile = resolve(indexFile);
   let expectedTargetIdentity = null;
@@ -819,7 +859,11 @@ export async function rebuildLocalUnifiedIndex({
   const discoveredAt = performance.now();
   const sourceBytes = discovery.discoveredSourceBytes;
 
-  const stageFile = `${resolvedIndexFile}.building-${process.pid}-${Date.now().toString(36)}`;
+  const stageFile = localUnifiedIndexStageFile(
+    resolvedIndexFile,
+    "building",
+    attemptToken,
+  );
   await removeIfPresent(stageFile, {
     windowsSqliteStateStaging,
     windowsQualificationModeContext,

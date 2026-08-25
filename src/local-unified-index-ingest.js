@@ -21,6 +21,8 @@ import {
   lineageComponents,
   persistingCollector,
   rebuildLocalUnifiedIndex,
+  localUnifiedIndexStageFile,
+  validateLocalUnifiedIndexAttemptToken,
   sourceIdentityForInfo,
   sourceRepresentationIdentityForInfo,
   sourcePhysicalIdentityToken,
@@ -262,6 +264,7 @@ export async function ingestLocalUnifiedIndexIncrement({
   commitRows = 10_000,
   maximumLineBytes,
   coldBackfillWorkerCount = null,
+  attemptToken = null,
   signal = null,
   onProgress = null,
   discoveryLimits = null,
@@ -300,6 +303,7 @@ export async function ingestLocalUnifiedIndexIncrement({
       `coldBackfillWorkerCount must be null or between 1 and ${MAXIMUM_COLD_BACKFILL_WORKERS}`,
     );
   }
+  validateLocalUnifiedIndexAttemptToken(attemptToken);
   const startedAt = performance.now();
   const resolvedIndexFile = resolve(indexFile);
   let liveTargetIdentity = null;
@@ -323,7 +327,13 @@ export async function ingestLocalUnifiedIndexIncrement({
     // staged-build catch could discard its temporary index. This is
     // deliberately portable-only; Windows cleanup stays behind the native
     // protected-state staging boundary.
-    await removeAbandonedLocalUnifiedIndexStages(resolvedIndexFile);
+    await removeAbandonedLocalUnifiedIndexStages(resolvedIndexFile, {
+      // The worker's token is the sole active attempt admitted by the
+      // off-main parent guard. This lets cleanup distinguish an older
+      // same-PID token after the age threshold while preserving this attempt
+      // and all legacy/non-token names.
+      activeAttemptToken: attemptToken,
+    });
   }
   let deviceSalt;
   try {
@@ -658,6 +668,7 @@ export async function ingestLocalUnifiedIndexIncrement({
       workerCount,
       commitRows,
       maximumLineBytes,
+      attemptToken,
       signal,
       onProgress,
       discoveryLimits,
@@ -689,7 +700,11 @@ export async function ingestLocalUnifiedIndexIncrement({
       totalBoundaryLinks: rebuilt.boundaryLinks ?? 0,
     };
   }
-  const stageFile = `${resolvedIndexFile}.incremental-${process.pid}-${Date.now().toString(36)}`;
+  const stageFile = localUnifiedIndexStageFile(
+    resolvedIndexFile,
+    "incremental",
+    attemptToken,
+  );
   await removeIfPresent(stageFile, {
     windowsSqliteStateStaging,
     windowsQualificationModeContext,

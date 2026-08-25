@@ -2973,10 +2973,13 @@ export async function removeIfPresent(
 // dogfooding left gigabytes of `.building-*` files beside the live index. The
 // companion holds its owner-only instance lock before it can accept a refresh,
 // so a stage older than the longest bounded refresh is abandoned unless its
-// recorded process is still alive. Keep the age margin deliberately large so
-// this remains cleanup rather than coordination.
+// recorded process is still alive. Tokenized off-main stages additionally
+// carry the active attempt identity, allowing an older same-PID token to be
+// reclaimed without treating cleanup as coordination. Keep the age margin
+// deliberately large so this remains cleanup rather than coordination.
 export const LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_MIN_AGE_MS = 2 * 60 * 60_000;
 export const LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_SCAN_LIMIT = 64;
+const LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN = /^[0-9a-f]{32}$/u;
 
 function localUnifiedIndexStageOwner(name, indexName) {
   for (const kind of ["building", "incremental"]) {
@@ -2986,7 +2989,14 @@ function localUnifiedIndexStageOwner(name, indexName) {
     const match = /^([1-9][0-9]*)-([0-9a-z]+)$/u.exec(remainder);
     if (match === null) return null;
     const pid = Number(match[1]);
-    return Number.isSafeInteger(pid) ? pid : null;
+    return Number.isSafeInteger(pid)
+      ? {
+        pid,
+        attemptToken: LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN.test(match[2])
+          ? match[2]
+          : null,
+      }
+      : null;
   }
   return null;
 }
@@ -3011,6 +3021,7 @@ export async function removeAbandonedLocalUnifiedIndexStages(
     scanLimit = LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_SCAN_LIMIT,
     platform = process.platform,
     isProcessAlive = processAppearsAlive,
+    activeAttemptToken = null,
   } = {},
 ) {
   if (typeof indexFile !== "string" || indexFile.length < 1) {
@@ -3025,6 +3036,11 @@ export async function removeAbandonedLocalUnifiedIndexStages(
   }
   if (typeof isProcessAlive !== "function") {
     throw new TypeError("isProcessAlive must be a function");
+  }
+  if (activeAttemptToken !== null
+      && (typeof activeAttemptToken !== "string"
+        || !LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN.test(activeAttemptToken))) {
+    throw new TypeError("activeAttemptToken must be null or a 32-character hex token");
   }
   // Windows stage names are capabilities owned by the qualified native
   // staging context. Never enumerate or unlink them through path-based Node
@@ -3054,11 +3070,23 @@ export async function removeAbandonedLocalUnifiedIndexStages(
   let skipped = 0;
   for (const name of names) {
     inspected += 1;
-    const pid = localUnifiedIndexStageOwner(name, indexName);
+    const owner = localUnifiedIndexStageOwner(name, indexName);
+    const pid = owner?.pid ?? null;
     const candidate = resolve(directory, name);
     // Exact basename filtering above plus this containment check make the
     // deletion root-bounded even if a future path implementation changes.
-    if (pid === null || dirname(candidate) !== directory || isProcessAlive(pid)) {
+    // A tokenized stage owned by this process is live only when it is the
+    // caller's active token. A different token is a prior terminated attempt,
+    // but only after the age check below. Legacy timestamp/non-token names and
+    // tokenized names from other processes still use PID liveness, so a direct
+    // or concurrent caller cannot accidentally reclaim a live same-PID stage.
+    const ownerIsAlive = owner?.attemptToken !== null
+      && owner?.attemptToken !== undefined
+      && pid === process.pid
+      && activeAttemptToken !== null
+      ? owner.attemptToken === activeAttemptToken
+      : pid !== null && isProcessAlive(pid);
+    if (pid === null || dirname(candidate) !== directory || ownerIsAlive) {
       skipped += 1;
       continue;
     }
