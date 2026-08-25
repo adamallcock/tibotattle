@@ -41,6 +41,7 @@ function sha256(value) {
 
 function buildResourceManifest() {
   const paths = [
+  "config/deployment-endpoints.js",
   "apps/electron/companion-supervisor.js",
   "apps/electron/desktop-command.js",
   "apps/electron/desktop-contract.js",
@@ -87,6 +88,7 @@ function buildResourceManifest() {
     return {
       bytes: value.byteLength,
       kind: path.startsWith("apps/electron/")
+        || path === "config/deployment-endpoints.js"
         || path === "src/desktop-shell-status.js"
         || path === "src/platform/windows-credential-manager-probe.js"
         ? "electron_shell"

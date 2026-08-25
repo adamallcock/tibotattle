@@ -94,6 +94,21 @@
             </label>
           </section>
 
+          <section class="settings-card" aria-labelledby="settings-appearance-title">
+            <div class="settings-card-copy">
+              <h3 id="settings-appearance-title" data-i18n="electron.settings.appearance.title">Appearance</h3>
+              <p data-i18n="electron.settings.appearance.description">Choose whether TiboTattle follows the operating system or uses a fixed light or dark appearance.</p>
+            </div>
+            <label class="settings-field" for="settings-appearance">
+              <span data-i18n="electron.settings.appearance.label">Appearance</span>
+              <select id="settings-appearance" autocomplete="off">
+                <option value="system" data-i18n="appearance.system">System</option>
+                <option value="light" data-i18n="appearance.light">Light</option>
+                <option value="dark" data-i18n="appearance.dark">Dark</option>
+              </select>
+            </label>
+          </section>
+
           <section class="settings-card" aria-labelledby="settings-codex-folder-title">
             <div class="settings-card-copy">
               <h3 id="settings-codex-folder-title" data-i18n="electron.settings.codexFolder.title">Codex folder</h3>

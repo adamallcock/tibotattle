@@ -14,6 +14,7 @@ import {
   createDeferredAccountingRebuildRecorder,
   createLocalCollectorRefreshRunner,
   createTerminalRefreshFailureRecorder,
+  LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS,
   LocalCompanionRefreshController,
 } from "../src/local-companion-refresh.js";
 import {
@@ -380,6 +381,24 @@ function qualificationRefreshResult() {
     indexing: COMPLETE_INDEX,
   };
 }
+
+test("refresh controller accepts the bounded Electron cold-index ceiling", () => {
+  const dependencies = {
+    runner: async () => ({}),
+    dataStore: { async reload() {} },
+  };
+  assert.doesNotThrow(() => new LocalCompanionRefreshController({
+    ...dependencies,
+    timeoutMs: LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS,
+  }));
+  assert.throws(
+    () => new LocalCompanionRefreshController({
+      ...dependencies,
+      timeoutMs: LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS + 1,
+    }),
+    /1,800,000/u,
+  );
+});
 
 test("local refresh exposes only the closed fresh direct-provider notification receipt", async (t) => {
   const validRunner = createLocalCollectorRefreshRunner({

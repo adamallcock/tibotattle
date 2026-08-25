@@ -305,6 +305,48 @@ async function launchFixture({
   return { app, children, desktop };
 }
 
+test("runtime persists the fixed Electron appearance and updates live renderers", async () => {
+  const nativeTheme = new EventEmitter();
+  nativeTheme.themeSource = "system";
+  nativeTheme.shouldUseDarkColors = true;
+  const { desktop } = await launchFixture({
+    load: async () => null,
+    runtimeOverrides: { nativeTheme },
+  });
+
+  assert.equal(nativeTheme.themeSource, "system");
+  assert.equal((await desktop.controller.handlers.getSettings()).settings.appearance, "system");
+
+  const dark = await desktop.controller.handlers.setAppearance({ value: "dark" });
+  assert.equal(nativeTheme.themeSource, "dark");
+  assert.equal(dark.settings.appearance, "dark");
+  assert.ok(FakeWindow.instances.some((candidate) => (
+    candidate.webContents.commands.some(({ value }) => (
+      value?.command === "appearance"
+      && value.preference === "dark"
+      && value.resolvedTheme === "dark"
+    ))
+  )));
+
+  nativeTheme.shouldUseDarkColors = false;
+  nativeTheme.emit("updated");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(nativeTheme.themeSource, "dark", "a forced theme remains forced when the system changes");
+
+  await desktop.controller.handlers.setAppearance({ value: "system" });
+  assert.equal(nativeTheme.themeSource, "system");
+  nativeTheme.emit("updated");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(FakeWindow.instances.some((candidate) => (
+    candidate.webContents.commands.some(({ value }) => (
+      value?.command === "appearance"
+      && value.preference === "system"
+      && value.resolvedTheme === "light"
+    ))
+  )));
+  await desktop.lifecycle.dispose();
+});
+
 test("runtime awaits Electron readiness before the first-run native dialog", async () => {
   const app = new FakeApp();
   const dialogCalls = [];

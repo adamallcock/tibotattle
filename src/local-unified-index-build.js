@@ -1,5 +1,6 @@
 import { availableParallelism } from "node:os";
 import { basename, dirname, resolve, win32 } from "node:path";
+import { setImmediate as setImmediatePromise } from "node:timers/promises";
 import { Worker } from "node:worker_threads";
 
 import {
@@ -54,6 +55,18 @@ import {
 
 const MAXIMUM_WORKERS = 10;
 
+// The host consumes worker messages through synchronous SQLite calls. Keep a
+// single delivery turn bounded without changing the writer's independent
+// commitRows policy (10,000 by default).
+export const LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS = 500;
+
+// A cooperative checkpoint is deliberately much less frequent than a worker
+// delivery batch. It closes any sub-threshold writer transaction before
+// yielding, so cancellation can be observed without introducing an async
+// boundary in the middle of an open transaction or turning every event into a
+// commit.
+export const LOCAL_UNIFIED_INDEX_COOPERATIVE_CHECKPOINT_ROWS = 10_000;
+
 const CODEX_BILLING_SURFACE = "chatgpt_subscription";
 
 export function sourceIdentityForInfo(info) {
@@ -85,6 +98,47 @@ function fixedError(code) {
   const error = new Error(code);
   error.code = code;
   return error;
+}
+
+/**
+ * Create a bounded cancellation/event-loop checkpoint for synchronous ingest.
+ *
+ * Callers invoke the returned function immediately after one sink operation.
+ * At the fixed threshold, `flush` closes any residual SQLite transaction and
+ * the next event-loop turn gives the companion's abort/control messages a
+ * chance to run. The default threshold intentionally matches commitRows.
+ */
+export function createLocalUnifiedIndexCooperativeCheckpoint({
+  signal = null,
+  flush = null,
+  every = LOCAL_UNIFIED_INDEX_COOPERATIVE_CHECKPOINT_ROWS,
+} = {}) {
+  if (signal !== null
+      && (typeof signal !== "object"
+        || typeof signal.aborted !== "boolean")) {
+    throw new TypeError("signal must be an AbortSignal or null");
+  }
+  if (flush !== null && typeof flush !== "function") {
+    throw new TypeError("flush must be a function or null");
+  }
+  if (!Number.isSafeInteger(every) || every < 1) {
+    throw new TypeError("every must be a positive safe integer");
+  }
+  let sinceCheckpoint = 0;
+  return () => {
+    if (signal?.aborted === true) {
+      throw fixedError("local_unified_index_aborted");
+    }
+    sinceCheckpoint += 1;
+    if (sinceCheckpoint < every) return null;
+    sinceCheckpoint = 0;
+    flush?.();
+    return setImmediatePromise().then(() => {
+      if (signal?.aborted === true) {
+        throw fixedError("local_unified_index_aborted");
+      }
+    });
+  };
 }
 
 /**
@@ -610,6 +664,7 @@ async function runWorkerLane(lane, laneIndex, { maximumLineBytes, signal, onBatc
       {
         workerData: {
           maximumLineBytes,
+          batchEvents: LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS,
           components: lane.components.map((members) => members.map((info) => ({
             path: info.path,
             size: Number(info.size ?? 0),
@@ -777,6 +832,7 @@ export async function rebuildLocalUnifiedIndex({
   let writer = null;
   let sink = null;
   let stageSession = null;
+  let cooperativeCheckpoint = null;
   try {
     if (process.platform === "win32") {
       const stageName = win32.basename(stageFile.replaceAll("/", "\\"));
@@ -840,6 +896,10 @@ export async function rebuildLocalUnifiedIndex({
       accountScopeId,
       generationId: generation.generationId,
       onCounts: null,
+    });
+    cooperativeCheckpoint = createLocalUnifiedIndexCooperativeCheckpoint({
+      signal,
+      flush: () => writer.flush(),
     });
   } catch (error) {
     try {
@@ -1178,9 +1238,18 @@ export async function rebuildLocalUnifiedIndex({
               seedTotals: historySeed?.seedTotals ?? null,
               maximumLineBytes,
               signal,
-              onEvent: (event) => sink.write(state, event),
-              onBoundary: (event) => sink.writeBoundary(state, event),
-                onTool: (event) => sink.writeTool(state, event),
+              onEvent: (event) => {
+                sink.write(state, event);
+                return cooperativeCheckpoint?.();
+              },
+              onBoundary: (event) => {
+                sink.writeBoundary(state, event);
+                return cooperativeCheckpoint?.();
+              },
+              onTool: (event) => {
+                sink.writeTool(state, event);
+                return cooperativeCheckpoint?.();
+              },
               })
             ));
             sink.finishSource(state);

@@ -102,11 +102,32 @@ function openSettings(windowRef) {
   return false;
 }
 
-function readPersistedLanguage(bridge, applyLanguage) {
+function applySidebarState(documentRef, collapsed) {
+  if (typeof collapsed !== "boolean") return false;
+  const shell = documentRef?.querySelector?.(".dashboard-shell");
+  const sidebar = documentRef?.querySelector?.(".dashboard-sidebar");
+  if (!shell) return false;
+  shell.classList?.toggle?.("sidebar-collapsed", collapsed);
+  if (sidebar) {
+    sidebar.setAttribute?.("aria-hidden", collapsed ? "true" : "false");
+    if ("inert" in sidebar) sidebar.inert = collapsed;
+    else if (collapsed) sidebar.setAttribute?.("inert", "");
+    else sidebar.removeAttribute?.("inert");
+  }
+  if (collapsed && sidebar && documentRef.activeElement
+      && sidebar.contains?.(documentRef.activeElement)) {
+    documentRef.querySelector?.("#main")?.focus?.({ preventScroll: true });
+  }
+  return true;
+}
+
+function readPersistedSettings(bridge, applyLanguage, applySidebar) {
   if (typeof bridge?.getSettings !== "function") return;
   void bridge.getSettings().then((state) => {
     const candidate = state?.settings?.language ?? state?.language;
     applyLanguage(candidate);
+    const sidebarCollapsed = state?.settings?.sidebarCollapsed ?? state?.sidebarCollapsed;
+    applySidebar(sidebarCollapsed);
   }).catch(() => {});
 }
 
@@ -121,7 +142,29 @@ function dispatchFixedDesktopEvent(windowRef, type) {
   return true;
 }
 
-function installCommandBridge(documentRef, windowRef, applyLanguage) {
+function dispatchAppearanceOverride(windowRef, command) {
+  if (![
+    "system",
+    "light",
+    "dark",
+  ].includes(command?.preference)
+      || !["light", "dark"].includes(command?.resolvedTheme)) return false;
+  const CustomEventConstructor = windowRef?.CustomEvent;
+  if (typeof CustomEventConstructor !== "function"
+      || typeof windowRef?.dispatchEvent !== "function") return false;
+  windowRef.dispatchEvent(new CustomEventConstructor(
+    "tibotattle:appearance-override",
+    {
+      detail: Object.freeze({
+        preference: command.preference,
+        resolvedTheme: command.resolvedTheme,
+      }),
+    },
+  ));
+  return true;
+}
+
+function installCommandBridge(documentRef, windowRef, applyLanguage, applySidebar) {
   const bridge = windowRef?.tibotattleDesktop;
   if (bridge?.version !== ELECTRON_API_VERSION
       || typeof bridge.onCommand !== "function") return () => {};
@@ -138,6 +181,10 @@ function installCommandBridge(documentRef, windowRef, applyLanguage) {
       dispatchFixedDesktopEvent(windowRef, "tibotattle:hosted-sign-in-return");
       return;
     }
+    if (command.command === "sidebar") {
+      applySidebar(command.collapsed);
+      return;
+    }
     if (command.command === "shareCardDownloadCompleted") {
       dispatchFixedDesktopEvent(
         windowRef,
@@ -150,6 +197,10 @@ function installCommandBridge(documentRef, windowRef, applyLanguage) {
         windowRef,
         "tibotattle:share-card-download-failed",
       );
+      return;
+    }
+    if (command.command === "appearance") {
+      dispatchAppearanceOverride(windowRef, command);
       return;
     }
     if (command.command !== "language" || !LANGUAGE_VALUES.has(command.value)) return;
@@ -180,6 +231,7 @@ export function mountDesktopShell({
   const onSettings = () => openSettings(windowRef);
   const bridge = windowRef?.tibotattleDesktop;
   const picker = documentRef.querySelector?.("[data-language-picker]");
+  const applySidebar = (collapsed) => applySidebarState(documentRef, collapsed);
   let applyingLanguage = false;
   const applyLanguage = (value) => {
     if (!LANGUAGE_VALUES.has(value) || !picker) return;
@@ -204,8 +256,13 @@ export function mountDesktopShell({
   shareButton.addEventListener("click", onShare);
   settingsButton.addEventListener("click", onSettings);
   picker?.addEventListener?.("change", onLanguageChange);
-  readPersistedLanguage(bridge, applyLanguage);
-  const unsubscribeCommand = installCommandBridge(documentRef, windowRef, applyLanguage);
+  readPersistedSettings(bridge, applyLanguage, applySidebar);
+  const unsubscribeCommand = installCommandBridge(
+    documentRef,
+    windowRef,
+    applyLanguage,
+    applySidebar,
+  );
   const mounted = Object.freeze({
     teardown() {
       shareButton.removeEventListener?.("click", onShare);

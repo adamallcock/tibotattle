@@ -64,6 +64,8 @@ test("settings store restores a valid persisted snapshot and rejects malformed u
     threshold: "ninety",
     extra: true,
   }), TypeError);
+  assert.equal((await store.setAppearance("dark")).appearance, "dark");
+  await assert.rejects(store.setAppearance("sepia"), TypeError);
 });
 
 test("settings writes are serialized and retain the last working state after failure", async () => {

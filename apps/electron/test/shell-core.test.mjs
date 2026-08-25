@@ -2632,6 +2632,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     "chooseCodexHome",
     "useDefaultCodexHome",
     "setLanguage",
+    "setAppearance",
     "setRefreshInterval",
     "setStartAtLogin",
     "setNotificationPreferences",
@@ -2649,6 +2650,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   assert.equal(typeof commandListener, "function");
   commandListener({}, { command: "refresh" });
   commandListener({}, { command: "language", value: "es" });
+  commandListener({}, { command: "sidebar", collapsed: true });
   commandListener({}, { command: "hostedSignInReturn" });
   commandListener({}, { command: "shareCardDownloadCompleted" });
   commandListener({}, { command: "shareCardDownloadFailed" });
@@ -2665,6 +2667,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   assert.deepEqual(JSON.parse(JSON.stringify(commands)), [
     { command: "refresh" },
     { command: "language", value: "es" },
+    { command: "sidebar", collapsed: true },
     { command: "hostedSignInReturn" },
     { command: "shareCardDownloadCompleted" },
     { command: "shareCardDownloadFailed" },
@@ -2676,6 +2679,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   await bridge.chooseCodexHome();
   await bridge.useDefaultCodexHome();
   await bridge.setLanguage("en");
+  await bridge.setAppearance("dark");
   await bridge.setRefreshInterval(300);
   await bridge.setStartAtLogin(true);
   await bridge.setNotificationPreferences({
@@ -2695,6 +2699,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     { channel: "tibotattle:desktop:v1", request: { action: "chooseCodexHome", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "useDefaultCodexHome", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "setLanguage", args: { value: "en" } } },
+    { channel: "tibotattle:desktop:v1", request: { action: "setAppearance", args: { value: "dark" } } },
     { channel: "tibotattle:desktop:v1", request: { action: "setRefreshInterval", args: { seconds: 300 } } },
     { channel: "tibotattle:desktop:v1", request: { action: "setStartAtLogin", args: { enabled: true } } },
     {
@@ -2731,6 +2736,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   for (const operation of [
     () => bridge.onCommand(() => {}, "extra"),
     () => bridge.setLanguage("en", "extra"),
+    () => bridge.setAppearance("dark", "extra"),
     () => bridge.setRefreshInterval(300, "extra"),
     () => bridge.setStartAtLogin(true, "extra"),
     () => bridge.setNotificationPreferences(

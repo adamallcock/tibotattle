@@ -68,6 +68,7 @@ import {
 } from "../../src/codex-speed-baseline.js";
 import { createLocalCentralProxy } from "../../src/local-companion-central-proxy.js";
 import {
+  LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS,
   LocalCompanionRefreshController,
   createDeferredAccountingRebuildRecorder,
   createLocalCollectorRefreshRunner,
@@ -255,6 +256,24 @@ const PARTICIPANT_RELAY_TIMEOUT_MS = 15_000;
 // emitting a long `Keep-Alive: timeout=` response header; the pre-warm below is
 // the dependency-free half that removes the measured cold handshake.
 const CENTRAL_PREWARM_TIMEOUT_MS = 10_000;
+export const LOCAL_COMPANION_NODE_REFRESH_TIMEOUT_MS = 5 * 60_000;
+export const LOCAL_COMPANION_ELECTRON_REFRESH_TIMEOUT_MS =
+  LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS;
+
+/**
+ * A native Node companion keeps the established five-minute safety bound.
+ * Electron starts with its own private app-data root, however, so its first
+ * run may need to build the unified index for an existing multi-year Codex
+ * history instead of reusing the native macOS application's completed cache.
+ * Keep that cold migration bounded, but do not guarantee failure at five
+ * minutes after the quick headline has already succeeded.
+ */
+export function defaultLocalCompanionRefreshTimeoutMs(runtime = process) {
+  return typeof runtime?.versions?.electron === "string"
+      && runtime.versions.electron.length > 0
+    ? LOCAL_COMPANION_ELECTRON_REFRESH_TIMEOUT_MS
+    : LOCAL_COMPANION_NODE_REFRESH_TIMEOUT_MS;
+}
 
 /**
  * Wrap the outbound central fetch with a startup pre-warm, engaged only for the
@@ -3817,7 +3836,7 @@ export function createPreparedLocalCompanionServer({
     windowsFilesystemAdapter,
     windowsQualificationModeContext,
   }),
-  refreshTimeoutMs = 300_000,
+  refreshTimeoutMs = defaultLocalCompanionRefreshTimeoutMs(),
   centralOrigin = environment.USAGE_MONITOR_CENTRAL_ORIGIN ?? null,
   centralFetch = globalThis.fetch,
   contributionPreviewProvider = async () => ({ status: "not_configured" }),

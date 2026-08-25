@@ -22,6 +22,9 @@ import { createLocalUnifiedAccountingSource } from "../src/local-unified-account
 
 import {
   balanceComponents,
+  createLocalUnifiedIndexCooperativeCheckpoint,
+  LOCAL_UNIFIED_INDEX_COOPERATIVE_CHECKPOINT_ROWS,
+  LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS,
   lineageComponents,
   modelDeclaration,
   rebuildLocalUnifiedIndex,
@@ -40,6 +43,7 @@ import {
   createUnifiedIndexWriter,
   beginUnifiedIndexGeneration,
   inspectLocalUnifiedIndex,
+  LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_MIN_AGE_MS,
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
   localDigest,
   openLocalUnifiedIndex,
@@ -47,6 +51,7 @@ import {
   outcomeOrdinal,
   readUnifiedIndexAggregate,
   readUnifiedIndexGenerationDescriptor,
+  removeAbandonedLocalUnifiedIndexStages,
   REASONING_EFFORTS,
   reasoningEffortOrdinal,
   sessionLocal,
@@ -58,6 +63,88 @@ const THREAD_ONE = "11111111-1111-4111-8111-111111111111";
 const THREAD_TWO = "22222222-2222-4222-8222-222222222222";
 const ROLLOUT_TWO = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const ROLLOUT_THREE = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+test("worker delivery stays bounded and checkpoints yield before cancellation", async () => {
+  assert.equal(LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS, 500);
+  assert.equal(LOCAL_UNIFIED_INDEX_COOPERATIVE_CHECKPOINT_ROWS, 10_000);
+  const controller = new AbortController();
+  let flushes = 0;
+  let eventLoopRan = false;
+  const checkpoint = createLocalUnifiedIndexCooperativeCheckpoint({
+    signal: controller.signal,
+    flush: () => { flushes += 1; },
+  });
+  for (let index = 0; index < LOCAL_UNIFIED_INDEX_COOPERATIVE_CHECKPOINT_ROWS - 1; index += 1) {
+    assert.equal(checkpoint(), null);
+  }
+  const scheduled = new Promise((resolve) => {
+    setImmediate(() => {
+      eventLoopRan = true;
+      resolve();
+    });
+  });
+  const yielded = checkpoint();
+  assert.equal(typeof yielded?.then, "function");
+  await yielded;
+  await scheduled;
+  assert.equal(flushes, 1);
+  assert.equal(eventLoopRan, true);
+  controller.abort();
+  await assert.rejects(
+    async () => checkpoint(),
+    (error) => error?.code === "local_unified_index_aborted",
+  );
+});
+
+test("abandoned unified-index cleanup is exact, stale-only, and process-aware", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "local-unified-index-cleanup-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const indexFile = join(root, "local-unified-index-v1.sqlite");
+  const oldDead = `${indexFile}.building-111-oldtoken`;
+  const newDead = `${indexFile}.incremental-222-newtoken`;
+  const oldLive = `${indexFile}.building-333-livetoken`;
+  const oldLink = `${indexFile}.building-444-linktoken`;
+  const malformed = `${indexFile}.building-555-token-journal`;
+  const unrelated = join(root, "unrelated.sqlite.building-111-oldtoken");
+  await Promise.all([
+    writeFile(oldDead, "old"),
+    writeFile(newDead, "new"),
+    writeFile(oldLive, "live"),
+    writeFile(malformed, "malformed"),
+    writeFile(unrelated, "unrelated"),
+  ]);
+  await symlink(oldDead, oldLink);
+  const nowMs = Date.parse("2026-08-24T18:00:00.000Z");
+  const oldTime = new Date(
+    nowMs - LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_MIN_AGE_MS - 60_000,
+  );
+  const newTime = new Date(nowMs - 60_000);
+  await Promise.all([
+    utimes(oldDead, oldTime, oldTime),
+    utimes(oldLive, oldTime, oldTime),
+    utimes(newDead, newTime, newTime),
+  ]);
+
+  const receipt = await removeAbandonedLocalUnifiedIndexStages(indexFile, {
+    nowMs,
+    platform: "darwin",
+    isProcessAlive: (pid) => pid === 333,
+  });
+  assert.deepEqual(receipt, { inspected: 4, removed: 1, skipped: 3 });
+  const remaining = new Set(await readdir(root));
+  assert.equal(remaining.has("local-unified-index-v1.sqlite.building-111-oldtoken"), false);
+  assert.equal(remaining.has("local-unified-index-v1.sqlite.incremental-222-newtoken"), true);
+  assert.equal(remaining.has("local-unified-index-v1.sqlite.building-333-livetoken"), true);
+  assert.equal(remaining.has("local-unified-index-v1.sqlite.building-444-linktoken"), true);
+  assert.equal(remaining.has("local-unified-index-v1.sqlite.building-555-token-journal"), true);
+  assert.equal(remaining.has("unrelated.sqlite.building-111-oldtoken"), true);
+
+  const windowsReceipt = await removeAbandonedLocalUnifiedIndexStages(
+    indexFile,
+    { nowMs, platform: "win32", isProcessAlive: () => false },
+  );
+  assert.deepEqual(windowsReceipt, { inspected: 0, removed: 0, skipped: 0 });
+});
 
 function canonicalRolloutName(timestamp, threadId, rolloutId = null) {
   return `rollout-${timestamp}-${threadId}${rolloutId === null ? "" : `_${rolloutId}`}.jsonl`;

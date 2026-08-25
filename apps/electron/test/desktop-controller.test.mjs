@@ -128,11 +128,13 @@ test("controller initializes persisted cadence and projects truthful settings st
   assert.equal(value.timers[0].milliseconds, 300_000);
   assert.deepEqual(value.languageChanges, ["system"]);
   assert.deepEqual(snapshot, {
-    settings: {
-      language: "system",
-      codexFolder: { kind: "default" },
-      refreshIntervalSeconds: 300,
-      startAtLogin: { status: "disabled", canSet: true, detail: "disabled" },
+      settings: {
+        language: "system",
+        appearance: "system",
+        codexFolder: { kind: "default" },
+        refreshIntervalSeconds: 300,
+        startAtLogin: { status: "disabled", canSet: true, detail: "disabled" },
+        sidebarCollapsed: false,
       notifications: {
         enabled: false,
         threshold: "off",
@@ -196,6 +198,22 @@ test("controller implements every bounded bridge action and desktop command", as
     startAtLogin: true,
     notifications: { enabled: false, threshold: "off" },
   });
+});
+
+test("controller persists sidebar collapse and sends only the bounded presentation command", async () => {
+  const value = fixture();
+  await value.controller.initialize();
+  const collapsed = await value.controller.toggleSidebar();
+  assert.equal(collapsed.settings.sidebarCollapsed, true);
+  assert.deepEqual(value.commands, [{ command: "sidebar", collapsed: true }]);
+  assert.equal((await value.store.getSettings()).sidebarCollapsed, true);
+
+  const restored = await value.controller.toggleSidebar();
+  assert.equal(restored.settings.sidebarCollapsed, false);
+  assert.deepEqual(value.commands, [
+    { command: "sidebar", collapsed: true },
+    { command: "sidebar", collapsed: false },
+  ]);
 });
 
 test("controller persists notification preferences only after coordinator confirmation", async () => {

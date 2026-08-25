@@ -391,6 +391,11 @@ const DESKTOP_MESSAGES = Object.freeze({
     "zh-Hans": "刷新使用情况",
     es: "Actualizar uso",
   }),
+  "electron.menu.toggleSidebar": Object.freeze({
+    "en-US": "Toggle Sidebar",
+    "zh-Hans": "切换侧边栏",
+    es: "Alternar barra lateral",
+  }),
   "electron.menu.show": Object.freeze({
     "en-US": "Show {appName}",
     "zh-Hans": "显示 {appName}",

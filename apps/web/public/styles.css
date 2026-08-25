@@ -243,6 +243,27 @@ body.electron-dashboard .electron-only-control { display: inline-flex !important
 .dashboard-content { min-width: 0; -webkit-user-select: text; user-select: text; }
 [data-dashboard-page][hidden] { display: none !important; }
 
+/* Electron keeps the web sidebar, but its native-style View > Toggle Sidebar
+   command must be able to collapse it without changing the native AppKit
+   document. The zero-width column preserves the dashboard content width and
+   the hidden/inert sidebar cannot retain keyboard focus while collapsed. */
+html.electron-dashboard .dashboard-shell.sidebar-collapsed,
+body.electron-dashboard .dashboard-shell.sidebar-collapsed {
+  display: grid;
+  grid-template-columns: 0 minmax(0, 1fr);
+}
+html.electron-dashboard .dashboard-shell.sidebar-collapsed .dashboard-sidebar,
+body.electron-dashboard .dashboard-shell.sidebar-collapsed .dashboard-sidebar {
+  width: 0;
+  min-width: 0;
+  min-height: 0;
+  padding-inline: 0;
+  overflow: hidden;
+  visibility: hidden;
+  border-inline-end: 0;
+  pointer-events: none;
+}
+
 /* The packaged Mac app supplies a real AppKit header and sidebar. Keep this
    document focused on the selected, readable report instead of rendering a
    second browser-shaped navigation system inside the native shell. */

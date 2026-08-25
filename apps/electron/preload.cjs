@@ -28,6 +28,7 @@ const WINDOWS_QUALIFICATION_MARKER = "windows-electron-v1";
 const WINDOWS_TEST_LANE_ENV = "USAGE_MONITOR_TEST_LANE";
 const WINDOWS_TEST_LANE = "windows-electron-smoke";
 const LANGUAGES = Object.freeze(["system", "en", "zh-Hans", "es"]);
+const APPEARANCES = Object.freeze(["system", "light", "dark"]);
 const REFRESH_INTERVALS = Object.freeze([60, 300, 900, 1800]);
 const NOTIFICATION_THRESHOLDS = Object.freeze([
   "off",
@@ -134,6 +135,23 @@ function validDesktopCommand(value) {
       ? Object.freeze({ command: "language", value: value.value })
       : null;
   }
+  if (value?.command === "sidebar") {
+    return exactObject(value, ["command", "collapsed"], "command")
+      && typeof value.collapsed === "boolean"
+      ? Object.freeze({ command: "sidebar", collapsed: value.collapsed })
+      : null;
+  }
+  if (value?.command === "appearance") {
+    return exactObject(value, ["command", "preference", "resolvedTheme"], "command")
+      && APPEARANCES.includes(value.preference)
+      && (value.resolvedTheme === "light" || value.resolvedTheme === "dark")
+      ? Object.freeze({
+        command: "appearance",
+        preference: value.preference,
+        resolvedTheme: value.resolvedTheme,
+      })
+      : null;
+  }
   if (value?.command === "hostedSignInReturn") {
     return exactObject(value, ["command"], "command")
       ? Object.freeze({ command: "hostedSignInReturn" })
@@ -192,6 +210,11 @@ function installDesktopBridge() {
       "setLanguage",
       values,
       (value) => enumMethod("setLanguage", value, LANGUAGES),
+    ),
+    setAppearance: (...values) => oneArgument(
+      "setAppearance",
+      values,
+      (value) => enumMethod("setAppearance", value, APPEARANCES),
     ),
     setRefreshInterval: (...values) => oneArgument(
       "setRefreshInterval",

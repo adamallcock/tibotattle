@@ -63,7 +63,10 @@ import {
   createWindowsContributionMaterializer,
   createPreparedLocalCompanionServer,
   createLocalCompanionServer,
+  defaultLocalCompanionRefreshTimeoutMs,
   loadCompanionWindowsFilesystemAdapter,
+  LOCAL_COMPANION_ELECTRON_REFRESH_TIMEOUT_MS,
+  LOCAL_COMPANION_NODE_REFRESH_TIMEOUT_MS,
   resolveClaudeDesktopShadowConfiguration,
   startLocalCompanionServer,
 } from "./server.js";
@@ -89,6 +92,19 @@ const DEVELOPMENT_COVERAGE = Object.freeze({
 });
 const REVIEW_JOB_ID = "11111111-1111-4111-8111-111111111111";
 const REVIEW_SHA256 = "a".repeat(64);
+
+test("Electron companions receive a bounded cold-index refresh window", () => {
+  assert.equal(
+    defaultLocalCompanionRefreshTimeoutMs({ versions: { electron: "43.2.0" } }),
+    LOCAL_COMPANION_ELECTRON_REFRESH_TIMEOUT_MS,
+  );
+  assert.equal(
+    defaultLocalCompanionRefreshTimeoutMs({ versions: { node: "24.18.0" } }),
+    LOCAL_COMPANION_NODE_REFRESH_TIMEOUT_MS,
+  );
+  assert.equal(LOCAL_COMPANION_NODE_REFRESH_TIMEOUT_MS, 5 * 60_000);
+  assert.equal(LOCAL_COMPANION_ELECTRON_REFRESH_TIMEOUT_MS, 30 * 60_000);
+});
 
 function unqualifiedWindowsFilesystemAdapter({
   readPreparedFile = () => ({
@@ -205,6 +221,7 @@ function qualificationResourceSha256(value) {
 
 function writeQualificationResourceManifest() {
   const paths = [
+    "config/deployment-endpoints.js",
     "apps/electron/companion-supervisor.js",
     "apps/electron/desktop-command.js",
     "apps/electron/desktop-contract.js",
@@ -251,6 +268,7 @@ function writeQualificationResourceManifest() {
     return {
       bytes: bytes.byteLength,
       kind: path.startsWith("apps/electron/")
+        || path === "config/deployment-endpoints.js"
         || path === "src/desktop-shell-status.js"
         || path === "src/platform/windows-credential-manager-probe.js"
         ? "electron_shell"

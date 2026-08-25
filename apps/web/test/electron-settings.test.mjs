@@ -14,6 +14,7 @@ import {
   DESKTOP_SETTINGS_API_VERSION,
   SETTINGS_ACTION_NAMES,
   SETTINGS_EXTERNAL_TARGETS,
+  SETTINGS_APPEARANCE_VALUES,
   SETTINGS_LANGUAGE_VALUES,
   SETTINGS_NOTIFICATION_THRESHOLD_VALUES,
   SETTINGS_REFRESH_INTERVAL_VALUES,
@@ -79,6 +80,10 @@ class FakeElement {
     this.attributes.set(name, String(value));
   }
 
+  removeAttribute(name) {
+    this.attributes.delete(name);
+  }
+
   getAttribute(name) {
     return this.attributes.get(name) ?? null;
   }
@@ -103,6 +108,7 @@ function makeSettingsDocument({ electron = false } = {}) {
   };
   make("settings-bridge-status");
   make("settings-language", { value: "system" });
+  make("settings-appearance", { value: "system" });
   make("settings-codex-folder-status");
   make("settings-refresh-interval", { value: "300" });
   make("settings-start-at-login");
@@ -143,11 +149,20 @@ function makeSettingsDocument({ electron = false } = {}) {
   const shareButton = make("electron-share-button");
   const settingsButton = make("electron-settings-button");
   const sharePanel = make("share-panel");
+  const shell = make("dashboard-shell");
+  const sidebar = make("dashboard-sidebar");
+  const main = make("main");
   const documentRef = {
-    documentElement: { classList: new FakeClassList() },
+    documentElement: {
+      classList: new FakeClassList(),
+      dataset: {},
+      style: {},
+    },
     body: { classList: new FakeClassList() },
     querySelector(selector) {
       if (selector.startsWith("#")) return byId.get(selector.slice(1)) ?? null;
+      if (selector === ".dashboard-shell") return shell;
+      if (selector === ".dashboard-sidebar") return sidebar;
       if (selector === "[data-settings-tab]") return [...byId.values()].filter((item) => item.dataset.settingsTab);
       if (selector === "[data-settings-panel]") return [...byId.values()].filter((item) => item.dataset.settingsPanel);
       if (selector === "[data-external-target]") return links;
@@ -164,6 +179,9 @@ function makeSettingsDocument({ electron = false } = {}) {
     shareButton,
     settingsButton,
     sharePanel,
+    shell,
+    sidebar,
+    main,
     languagePicker,
     refreshButton,
   };
@@ -178,6 +196,8 @@ function settingsState(overrides = {}) {
     version: "0.1.16",
     build: "2826517",
     language: "en",
+    appearance: "system",
+    sidebarCollapsed: false,
     refreshIntervalSeconds: 300,
     codexFolder: { kind: "default" },
     startAtLogin: { status: "disabled", canSet: true },
@@ -226,6 +246,7 @@ function bridgeFixture(calls, state = settingsState(), commandSlot = null) {
       return result("useDefaultCodexHome");
     },
     setLanguage: async (value) => result("setLanguage", value),
+    setAppearance: async (value) => result("setAppearance", value),
     setRefreshInterval: async (value) => result("setRefreshInterval", value),
     setStartAtLogin: async (value) => result("setStartAtLogin", value),
     setNotificationPreferences: async (value) => result("setNotificationPreferences", value),
@@ -276,6 +297,7 @@ test("settings assets expose the exact v1 bridge, finite values, and fixed links
   assert.match(css, /\.electron-settings-page/u);
   assert.match(css, /@media \(max-width: 760px\)/u);
   assert.deepEqual(SETTINGS_LANGUAGE_VALUES, ["system", "en", "zh-Hans", "es"]);
+  assert.deepEqual(SETTINGS_APPEARANCE_VALUES, ["system", "light", "dark"]);
   assert.deepEqual(SETTINGS_REFRESH_INTERVAL_VALUES, [60, 300, 900, 1800]);
   assert.deepEqual(SETTINGS_NOTIFICATION_THRESHOLD_VALUES, ["off", "ninety", "eighty_and_ninety"]);
   assert.deepEqual(Object.keys(SETTINGS_EXTERNAL_TARGETS), ["website", "github", "x"]);
@@ -283,6 +305,7 @@ test("settings assets expose the exact v1 bridge, finite values, and fixed links
     "getSettings",
     "openSettings",
     "setLanguage",
+    "setAppearance",
     "chooseCodexHome",
     "useDefaultCodexHome",
     "setRefreshInterval",
@@ -471,6 +494,7 @@ test("settings bridge renders native-parity controls and supports keyboard tabs"
 
   assert.equal(documentRef.byId.get("settings-bridge-status").textContent, "Desktop settings connected");
   assert.equal(documentRef.byId.get("settings-language").value, "en");
+  assert.equal(documentRef.byId.get("settings-appearance").value, "system");
   assert.equal(documentRef.byId.get("settings-refresh-interval").value, "300");
   assert.equal(
     documentRef.byId.get("settings-codex-folder-status").textContent,
@@ -497,6 +521,12 @@ test("settings bridge renders native-parity controls and supports keyboard tabs"
   language.dispatch("change");
   await settle();
   assert.deepEqual(calls.at(-1), ["setLanguage", "es"]);
+
+  documentRef.byId.get("settings-appearance").value = "dark";
+  documentRef.byId.get("settings-appearance").dispatch("change");
+  await settle();
+  assert.deepEqual(calls.at(-1), ["setAppearance", "dark"]);
+  assert.equal(documentRef.documentElement.dataset.theme, "light", "fixture state remains authoritative until the bridge returns the new preference");
 
   documentRef.byId.get("settings-refresh-interval").value = "900";
   documentRef.byId.get("settings-refresh-interval").dispatch("change");
@@ -538,6 +568,14 @@ test("settings bridge renders native-parity controls and supports keyboard tabs"
   commandSlot.callback({ command: "language", value: "zh-Hans" });
   await settle();
   assert.equal(documentRef.byId.get("settings-language").value, "zh-Hans");
+  state.appearance = "dark";
+  commandSlot.callback({
+    command: "appearance",
+    preference: "dark",
+    resolvedTheme: "dark",
+  });
+  await settle();
+  assert.equal(documentRef.documentElement.dataset.theme, "dark");
 
   mounted.teardown();
   assert.equal(commandSlot.unsubscribed, true);
@@ -662,7 +700,7 @@ test("Electron-only Share focuses the Allowance share panel, commands bridge to 
     requestAnimationFrame(callback) { callback(); },
     tibotattleDesktop: Object.freeze({
       version: DESKTOP_SETTINGS_API_VERSION,
-      getSettings: async () => ({ language: "es" }),
+      getSettings: async () => ({ language: "es", sidebarCollapsed: true }),
       setLanguage: async (value) => { calls.push(["setLanguage", value]); },
       onCommand(callback) {
         commandSlot.callback = callback;
@@ -674,8 +712,15 @@ test("Electron-only Share focuses the Allowance share panel, commands bridge to 
   const mounted = mountDesktopShell({ documentRef, windowRef });
   await settle();
   assert.equal(documentRef.languagePicker.value, "es");
+  assert.equal(documentRef.shell.classList.contains("sidebar-collapsed"), true);
+  assert.equal(documentRef.sidebar.getAttribute("aria-hidden"), "true");
+  assert.equal(documentRef.sidebar.getAttribute("inert"), "");
   commandSlot.callback({ command: "refresh" });
   assert.equal(refreshClicks, 1);
+  commandSlot.callback({ command: "sidebar", collapsed: false });
+  assert.equal(documentRef.shell.classList.contains("sidebar-collapsed"), false);
+  assert.equal(documentRef.sidebar.getAttribute("aria-hidden"), "false");
+  assert.equal(documentRef.sidebar.getAttribute("inert"), null);
   commandSlot.callback({ command: "hostedSignInReturn" });
   commandSlot.callback({
     command: "shareCardDownloadCompleted",

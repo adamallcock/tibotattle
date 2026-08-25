@@ -2,8 +2,10 @@ import {
   DESKTOP_DEFAULT_SETTINGS,
   DESKTOP_LANGUAGES,
   DESKTOP_NOTIFICATION_THRESHOLDS,
+  DESKTOP_APPEARANCES,
   DESKTOP_REFRESH_INTERVAL_SECONDS,
   DESKTOP_SETTINGS_SCHEMA_VERSION,
+  migrateDesktopSettingsSnapshot,
   validateDesktopSettingsSnapshot,
 } from "./desktop-contract.js";
 
@@ -17,9 +19,11 @@ const DEFAULT_BACKEND = Object.freeze({
 const UPDATE_KEYS = Object.freeze([
   "codexHome",
   "language",
+  "appearance",
   "refreshIntervalSeconds",
   "startAtLogin",
   "notifications",
+  "sidebarCollapsed",
 ]);
 
 function assertBackend(backend) {
@@ -33,13 +37,16 @@ function assertBackend(backend) {
 }
 
 function cloneSettings(settings) {
+  const migrated = migrateDesktopSettingsSnapshot(settings);
   return validateDesktopSettingsSnapshot({
-    schemaVersion: settings.schemaVersion,
-    codexHome: { ...settings.codexHome },
-    language: settings.language,
-    refreshIntervalSeconds: settings.refreshIntervalSeconds,
-    startAtLogin: settings.startAtLogin,
-    notifications: { ...settings.notifications },
+    schemaVersion: migrated.schemaVersion,
+    codexHome: { ...migrated.codexHome },
+    language: migrated.language,
+    appearance: migrated.appearance,
+    refreshIntervalSeconds: migrated.refreshIntervalSeconds,
+    startAtLogin: migrated.startAtLogin,
+    notifications: { ...migrated.notifications },
+    sidebarCollapsed: migrated.sidebarCollapsed,
   });
 }
 
@@ -179,6 +186,13 @@ export function createDesktopSettingsStore({ backend = DEFAULT_BACKEND } = {}) {
     return enqueueUpdate((current) => ({ ...current, language }));
   }
 
+  async function setAppearance(appearance) {
+    if (!DESKTOP_APPEARANCES.includes(appearance)) {
+      throw new TypeError("appearance is invalid");
+    }
+    return enqueueUpdate((current) => ({ ...current, appearance }));
+  }
+
   async function setRefreshInterval(seconds) {
     if (!DESKTOP_REFRESH_INTERVAL_SECONDS.includes(seconds)) {
       throw new TypeError("seconds is invalid");
@@ -203,6 +217,11 @@ export function createDesktopSettingsStore({ backend = DEFAULT_BACKEND } = {}) {
       ...current,
       notifications: { ...preferences },
     }));
+  }
+
+  async function setSidebarCollapsed(collapsed) {
+    if (typeof collapsed !== "boolean") throw new TypeError("collapsed is invalid");
+    return enqueueUpdate((current) => ({ ...current, sidebarCollapsed: collapsed }));
   }
 
   async function setCodexHome(home) {
@@ -230,9 +249,11 @@ export function createDesktopSettingsStore({ backend = DEFAULT_BACKEND } = {}) {
     update,
     updateSnapshot,
     setLanguage,
+    setAppearance,
     setRefreshInterval,
     setStartAtLogin,
     setNotificationPreferences,
+    setSidebarCollapsed,
     setCodexHome,
     useDefaultCodexHome,
     get lastLoadFailed() {

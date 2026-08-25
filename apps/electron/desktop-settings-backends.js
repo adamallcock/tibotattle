@@ -4,6 +4,7 @@ import * as nodeFs from "node:fs/promises";
 import { basename, isAbsolute, join } from "node:path";
 
 import {
+  migrateDesktopSettingsSnapshot,
   validateDesktopSettingsSnapshot,
 } from "./desktop-contract.js";
 import {
@@ -324,7 +325,7 @@ function decodeSnapshot(bytes) {
     fail("corrupt");
   }
   try {
-    return validateDesktopSettingsSnapshot(parsed);
+    return validateDesktopSettingsSnapshot(migrateDesktopSettingsSnapshot(parsed));
   } catch {
     fail("corrupt");
   }
@@ -347,7 +348,7 @@ function defaultRecordCodec() {
     },
     decodeValue(value) {
       try {
-        return validateDesktopSettingsSnapshot(value);
+        return validateDesktopSettingsSnapshot(migrateDesktopSettingsSnapshot(value));
       } catch {
         fail("corrupt");
       }

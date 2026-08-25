@@ -22,6 +22,12 @@ export const SETTINGS_LANGUAGE_VALUES = Object.freeze([
   "es",
 ]);
 
+export const SETTINGS_APPEARANCE_VALUES = Object.freeze([
+  "system",
+  "light",
+  "dark",
+]);
+
 export const SETTINGS_REFRESH_INTERVAL_VALUES = Object.freeze([60, 300, 900, 1800]);
 
 export const SETTINGS_NOTIFICATION_THRESHOLD_VALUES = Object.freeze([
@@ -40,6 +46,7 @@ export const SETTINGS_ACTION_NAMES = Object.freeze([
   "getSettings",
   "openSettings",
   "setLanguage",
+  "setAppearance",
   "chooseCodexHome",
   "useDefaultCodexHome",
   "setRefreshInterval",
@@ -217,6 +224,9 @@ function normalizeSettingsState(raw) {
   const language = valueIn(SETTINGS_LANGUAGE_VALUES, settings.language)
     ? settings.language
     : "system";
+  const appearance = valueIn(SETTINGS_APPEARANCE_VALUES, settings.appearance)
+    ? settings.appearance
+    : "system";
   const refreshIntervalSeconds = valueIn(
     SETTINGS_REFRESH_INTERVAL_VALUES,
     finiteNumber(settings.refreshIntervalSeconds, 300),
@@ -265,6 +275,7 @@ function normalizeSettingsState(raw) {
 
   return Object.freeze({
     language,
+    appearance,
     codexFolder: Object.freeze({
       kind: folderKind,
     }),
@@ -327,6 +338,8 @@ function fixedActionValue(actionName, value) {
   switch (actionName) {
     case "setLanguage":
       return valueIn(SETTINGS_LANGUAGE_VALUES, value);
+    case "setAppearance":
+      return valueIn(SETTINGS_APPEARANCE_VALUES, value);
     case "setRefreshInterval":
       return valueIn(SETTINGS_REFRESH_INTERVAL_VALUES, Number(value));
     case "setNotificationPreferences":
@@ -357,6 +370,39 @@ function translateSettingsMessage(localizer, key, values = {}) {
 
 function browserLanguagePreference(value) {
   return DESKTOP_TO_BROWSER_LANGUAGE[value] ?? "system";
+}
+
+export function applyElectronAppearancePreference(
+  preference,
+  {
+    resolvedTheme = null,
+    documentRef = globalThis.document,
+    windowRef = globalThis.window,
+  } = {},
+) {
+  if (!SETTINGS_APPEARANCE_VALUES.includes(preference)) return false;
+  let theme = resolvedTheme;
+  if (!(["light", "dark"].includes(theme))) {
+    if (preference === "light" || preference === "dark") {
+      theme = preference;
+    } else {
+      let dark = false;
+      try {
+        dark = windowRef?.matchMedia?.("(prefers-color-scheme: dark)")?.matches === true;
+      } catch {
+        dark = false;
+      }
+      theme = dark ? "dark" : "light";
+    }
+  }
+  const root = documentRef?.documentElement;
+  if (!root || !["light", "dark"].includes(theme)) return false;
+  root.dataset ??= {};
+  root.dataset.theme = theme;
+  if (root.style) root.style.colorScheme = theme;
+  const themeColor = documentRef.querySelector?.('meta[name="theme-color"]');
+  if (themeColor) themeColor.content = theme === "dark" ? "#141a17" : "#f5f1e8";
+  return true;
 }
 
 function setText(documentRef, selector, value) {
@@ -398,6 +444,7 @@ function notificationPermissionMessageKey(notifications) {
 
 function renderSettingsState(documentRef, state, bridgeAvailable, localizer) {
   const language = queryRequired(documentRef, "#settings-language");
+  const appearance = queryRequired(documentRef, "#settings-appearance");
   const folder = queryRequired(documentRef, "#settings-codex-folder-status");
   const refresh = queryRequired(documentRef, "#settings-refresh-interval");
   const loginSwitch = queryRequired(documentRef, "#settings-start-at-login");
@@ -416,6 +463,7 @@ function renderSettingsState(documentRef, state, bridgeAvailable, localizer) {
   const checkForUpdates = queryRequired(documentRef, "#settings-check-for-updates");
 
   language.value = state.language;
+  appearance.value = state.appearance;
   folder.textContent = state.codexFolder.kind === "default"
     ? translateSettingsMessage(localizer, "electron.settings.codexFolder.default")
     : translateSettingsMessage(localizer, "electron.settings.codexFolder.custom");
@@ -548,6 +596,7 @@ export async function mountSettingsPage({
       ? createBrowserLocalization({ windowRef, documentRef })
       : null);
   let currentState = normalizeSettingsState(null);
+  applyElectronAppearancePreference(currentState.appearance, { documentRef, windowRef });
   let busy = false;
   let unsubscribeDesktopCommands = () => {};
   const listeners = [];
@@ -578,6 +627,7 @@ export async function mountSettingsPage({
     try {
       const next = await settingsBridge.getSettings();
       currentState = normalizeSettingsState(next);
+      applyElectronAppearancePreference(currentState.appearance, { documentRef, windowRef });
       pageLocalizer?.setLanguagePreference?.(
         browserLanguagePreference(currentState.language),
         { notifyHost: false, announce: false },
@@ -614,6 +664,7 @@ export async function mountSettingsPage({
         ? await action()
         : await action(value);
       if (result !== undefined) currentState = normalizeSettingsState(result);
+      applyElectronAppearancePreference(currentState.appearance, { documentRef, windowRef });
       pageLocalizer?.setLanguagePreference?.(
         browserLanguagePreference(currentState.language),
         { notifyHost: false, announce: false },
@@ -636,6 +687,17 @@ export async function mountSettingsPage({
   if (settingsBridge && typeof settingsBridge.onCommand === "function") {
     try {
       const unsubscribe = settingsBridge.onCommand((command) => {
+        if (command?.command === "appearance"
+            && SETTINGS_APPEARANCE_VALUES.includes(command.preference)
+            && ["light", "dark"].includes(command.resolvedTheme)) {
+          applyElectronAppearancePreference(command.preference, {
+            resolvedTheme: command.resolvedTheme,
+            documentRef,
+            windowRef,
+          });
+          void refresh();
+          return;
+        }
         if (command?.command !== "language"
             || !SETTINGS_LANGUAGE_VALUES.includes(command.value)) return;
         pageLocalizer?.setLanguagePreference?.(
@@ -672,6 +734,9 @@ export async function mountSettingsPage({
       { notifyHost: false },
     );
     void invoke("setLanguage", event.target.value);
+  });
+  listen(queryRequired(documentRef, "#settings-appearance"), "change", (event) => {
+    void invoke("setAppearance", event.target.value);
   });
   listen(queryRequired(documentRef, "#settings-choose-codex-folder"), "click", () => {
     void invoke("chooseCodexHome");

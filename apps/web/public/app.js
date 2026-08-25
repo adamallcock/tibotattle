@@ -4,6 +4,7 @@ import {
   isPrimaryCodexWeeklyQuotaWindow,
   isSparkQuotaLimitId,
   LocalCompanionClient,
+  shouldAbortRefreshStatusPolling,
   CODEX_PRIMARY_LIMIT_ID,
   CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
   CODEX_WEEKLY_ALLOWANCE_MINUTES,
@@ -86,6 +87,19 @@ function applyNativeAppearanceTheme(theme) {
 applyNativeAppearanceTheme(
   globalThis.__TIBOTATTLE_APPEARANCE__?.resolvedTheme,
 );
+// Electron owns the preference in its main process.  Chromium exposes the
+// resolved system choice through matchMedia, which lets a fresh dashboard
+// paint correctly before the first main-to-renderer command arrives.
+if (window.tibotattleDesktop?.version === "v1"
+    || document.documentElement?.classList?.contains?.("electron-dashboard")) {
+  let dark = false;
+  try {
+    dark = window.matchMedia?.("(prefers-color-scheme: dark)")?.matches === true;
+  } catch {
+    dark = false;
+  }
+  applyNativeAppearanceTheme(dark ? "dark" : "light");
+}
 window.addEventListener("tibotattle:appearance-override", (event) => {
   applyNativeAppearanceTheme(event.detail?.resolvedTheme);
 });
@@ -301,6 +315,12 @@ let googleSignInUnavailable = false;
 let localActionBusy = false;
 let localRefreshInProgress = false;
 let localRefreshCancelRequested = false;
+// The Electron companion's first private unified index is allowed a bounded
+// 30-minute cold-build window. Keep the foreground page alive one minute
+// longer so its elapsed clock, Cancel control, and terminal reload remain the
+// owner of that operation instead of looking crashed after the browser's
+// ordinary six-minute companion budget expires.
+const ELECTRON_REFRESH_POLLING_WINDOW_MS = 31 * 60_000;
 // Archive indexing progress is intentionally transient: the durable dashboard
 // continues to show only the last verified complete/partial coverage receipt.
 // While a refresh owns a new pass, make that distinction visible beside cost
@@ -10924,6 +10944,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
     return;
   }
   const button = $("#refresh-button");
+  const electronRefresh = runsInsideElectronDashboard();
   let refreshAccepted = false;
   let cancelled = false;
   let quickResultLoaded = false;
@@ -10997,7 +11018,18 @@ async function requestRefresh({ autoContinue = false } = {}) {
     activePassStartedMs = Date.now();
     lastStatusReceivedMs = activePassStartedMs;
     progressTicker = setInterval(renderRefreshActivity, 1_000);
-    const pollingBudget = createRefreshPollingBudget();
+    const pollingBudget = createRefreshPollingBudget(
+      electronRefresh
+        ? { windowMs: ELECTRON_REFRESH_POLLING_WINDOW_MS }
+        : {},
+    );
+    // Continuation checkpoints may each receive a fresh short polling window,
+    // but an Electron foreground operation has one immutable wall-clock
+    // deadline. This prevents a sequence of bounded pauses from silently
+    // turning into an hour-plus operation in the renderer.
+    const electronOperationDeadlineMs = electronRefresh
+      ? Date.now() + ELECTRON_REFRESH_POLLING_WINDOW_MS
+      : null;
     let consecutiveStatusFailures = 0;
     let outcome = "running";
     let finalErrorCode = null;
@@ -11007,18 +11039,31 @@ async function requestRefresh({ autoContinue = false } = {}) {
     let pollCount = 0;
     let timeoutSettlementNoted = false;
     while (pollingBudget.hasTime()
+        && (electronOperationDeadlineMs === null
+          || Date.now() < electronOperationDeadlineMs)
         && ["running", "cancelling"].includes(outcome)) {
       await new Promise((resolve) => setTimeout(resolve, 750));
       pollCount += 1;
       let status;
       try {
-        status = await localClient.refreshStatus();
+        const remainingElectronMs = electronOperationDeadlineMs === null
+          ? null
+          : Math.max(1, electronOperationDeadlineMs - Date.now());
+        status = await localClient.refreshStatus(
+          remainingElectronMs === null
+            ? undefined
+            : { timeoutMs: remainingElectronMs },
+        );
         consecutiveStatusFailures = 0;
         lastStatusReceivedMs = Date.now();
       } catch (error) {
         consecutiveStatusFailures += 1;
         setLocalizedText(button, "localAnalysis.progress.reconnecting");
-        if (consecutiveStatusFailures >= 8) throw error;
+        if (shouldAbortRefreshStatusPolling({
+          isElectron: electronRefresh,
+          consecutiveFailures: consecutiveStatusFailures,
+          operationDeadlineMs: electronOperationDeadlineMs,
+        })) throw error;
         continue;
       }
       const refresh = status?.refresh ?? {};
@@ -11212,11 +11257,46 @@ async function cancelLocalAnalysis() {
       copyKey: "localAnalysis.notice.cancellationRequestedCopy",
       kind: "info",
     });
-  } catch {
+  } catch (error) {
     localRefreshCancelRequested = false;
+    if (error?.code === "refresh_cancel_timed_out") {
+      // The cancellation request itself has a deadline. A timeout means only
+      // that cancellation was not confirmed; the refresh status loop remains
+      // the authority and keeps running until it reaches a terminal state or
+      // its operation deadline. Never leave the toolbar stuck on Stopping.
+      showConnectionNotice({
+        titleKey: "localAnalysis.notice.cancellationFailedTitle",
+        copyKey: "localAnalysis.notice.cancellationFailedCopy",
+        kind: "warning",
+        showCheck: true,
+      });
+      updateLocalActionButtons();
+      return;
+    }
+    if (error?.code === "refresh_not_running") {
+      // The refresh can reach its terminal state between the toolbar's last
+      // status poll and this POST. That is not a failed cancellation or a
+      // crashed companion: the request simply lost a harmless race. Keep the
+      // foreground refresh loop alive so it can render the terminal result,
+      // and explain the race instead of showing the generic warning seen in
+      // the Electron dogfood build.
+      showConnectionNotice({
+        titleKey: "localAnalysis.notice.alreadyStoppedTitle",
+        copyKey: "localAnalysis.notice.alreadyStoppedCopy",
+        kind: "info",
+        showCheck: true,
+      });
+      updateLocalActionButtons();
+      return;
+    }
+    const described = await describeFailure({
+      surface: "local_refresh",
+      error,
+      fallback: t("localAnalysis.notice.cancellationFailedCopy"),
+    });
     showConnectionNotice({
       titleKey: "localAnalysis.notice.cancellationFailedTitle",
-      copyKey: "localAnalysis.notice.cancellationFailedCopy",
+      copy: described.text,
       kind: "warning",
       showCheck: true,
     });

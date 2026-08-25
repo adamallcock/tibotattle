@@ -20,6 +20,15 @@ export const DESKTOP_LANGUAGES = Object.freeze([
   "es",
 ]);
 
+// Keep appearance a closed preference.  `system` delegates to the host's
+// effective appearance; the other values are the only renderer-visible
+// overrides accepted by the Electron shell.
+export const DESKTOP_APPEARANCES = Object.freeze([
+  "system",
+  "light",
+  "dark",
+]);
+
 export const DESKTOP_REFRESH_INTERVAL_SECONDS = Object.freeze([
   60,
   300,
@@ -50,6 +59,7 @@ export const DESKTOP_ACTIONS = Object.freeze([
   "chooseCodexHome",
   "useDefaultCodexHome",
   "setLanguage",
+  "setAppearance",
   "setRefreshInterval",
   "setStartAtLogin",
   "setNotificationPreferences",
@@ -66,6 +76,7 @@ const ACTION_ARGUMENT_KEYS = Object.freeze({
   chooseCodexHome: Object.freeze([]),
   useDefaultCodexHome: Object.freeze([]),
   setLanguage: Object.freeze(["value"]),
+  setAppearance: Object.freeze(["value"]),
   setRefreshInterval: Object.freeze(["seconds"]),
   setStartAtLogin: Object.freeze(["enabled"]),
   setNotificationPreferences: Object.freeze(["enabled", "threshold"]),
@@ -90,9 +101,11 @@ export const DESKTOP_DEFAULT_SETTINGS = Object.freeze({
   schemaVersion: DESKTOP_SETTINGS_SCHEMA_VERSION,
   codexHome: DEFAULT_CODEX_HOME,
   language: "system",
+  appearance: "system",
   refreshIntervalSeconds: 300,
   startAtLogin: false,
   notifications: DEFAULT_NOTIFICATIONS,
+  sidebarCollapsed: false,
 });
 
 function hasExactKeys(value, expectedKeys) {
@@ -152,6 +165,9 @@ export function validateDesktopRequest(request) {
     case "setLanguage":
       assertEnum(args.value, DESKTOP_LANGUAGES, "value");
       break;
+    case "setAppearance":
+      assertEnum(args.value, DESKTOP_APPEARANCES, "value");
+      break;
     case "setRefreshInterval":
       assertSeconds(args.seconds);
       break;
@@ -195,18 +211,21 @@ export function createDesktopRequest(action, args = {}) {
  * operation that chooses a Codex home.
  */
 export function validateDesktopSettingsSnapshot(snapshot) {
-  assertExactKeys(
-    snapshot,
-    [
-      "schemaVersion",
-      "codexHome",
-      "language",
-      "refreshIntervalSeconds",
-      "startAtLogin",
-      "notifications",
-    ],
-    "settings",
-  );
+  const currentKeys = [
+    "schemaVersion",
+    "codexHome",
+    "language",
+    "appearance",
+    "refreshIntervalSeconds",
+    "startAtLogin",
+    "notifications",
+    "sidebarCollapsed",
+  ];
+  const preSidebarKeys = currentKeys.slice(0, -1);
+  assertPlainRecord(snapshot, "settings");
+  if (!hasExactKeys(snapshot, currentKeys) && !hasExactKeys(snapshot, preSidebarKeys)) {
+    throw new TypeError("settings has unexpected keys");
+  }
   if (snapshot.schemaVersion !== DESKTOP_SETTINGS_SCHEMA_VERSION) {
     throw new TypeError("settings schemaVersion is invalid");
   }
@@ -226,6 +245,7 @@ export function validateDesktopSettingsSnapshot(snapshot) {
   }
 
   assertEnum(snapshot.language, DESKTOP_LANGUAGES, "language");
+  assertEnum(snapshot.appearance, DESKTOP_APPEARANCES, "appearance");
   assertSeconds(snapshot.refreshIntervalSeconds);
   assertBoolean(snapshot.startAtLogin, "startAtLogin");
   assertExactKeys(
@@ -239,15 +259,61 @@ export function validateDesktopSettingsSnapshot(snapshot) {
     DESKTOP_NOTIFICATION_THRESHOLDS,
     "notifications.threshold",
   );
+  const sidebarCollapsed = snapshot.sidebarCollapsed === undefined
+    ? false
+    : assertBoolean(snapshot.sidebarCollapsed, "sidebarCollapsed");
 
   return Object.freeze({
     schemaVersion: snapshot.schemaVersion,
     codexHome: Object.freeze({ ...snapshot.codexHome }),
     language: snapshot.language,
+    appearance: snapshot.appearance,
     refreshIntervalSeconds: snapshot.refreshIntervalSeconds,
     startAtLogin: snapshot.startAtLogin,
     notifications: Object.freeze({ ...snapshot.notifications }),
+    sidebarCollapsed,
   });
+}
+
+/**
+ * Additive migration for the original v1 settings record.  Appearance was
+ * not present in early Electron builds; retaining the other user choices is
+ * safer than treating that otherwise-valid record as corrupt.  The strict
+ * validator above remains the only accepted post-migration shape.
+ */
+export function migrateDesktopSettingsSnapshot(snapshot) {
+  if (snapshot === null
+      || typeof snapshot !== "object"
+      || Array.isArray(snapshot)
+      || Object.getPrototypeOf(snapshot) !== Object.prototype
+      || snapshot.schemaVersion !== DESKTOP_SETTINGS_SCHEMA_VERSION) {
+    return snapshot;
+  }
+  const expectedBaseKeys = [
+    "schemaVersion",
+    "codexHome",
+    "language",
+    "refreshIntervalSeconds",
+    "startAtLogin",
+    "notifications",
+  ];
+  const actualKeys = Reflect.ownKeys(snapshot);
+  const hasAppearance = Object.hasOwn(snapshot, "appearance");
+  const hasSidebarCollapsed = Object.hasOwn(snapshot, "sidebarCollapsed");
+  const expectedKeys = [
+    ...expectedBaseKeys,
+    ...(hasAppearance ? ["appearance"] : []),
+    ...(hasSidebarCollapsed ? ["sidebarCollapsed"] : []),
+  ];
+  if (actualKeys.length !== expectedKeys.length
+      || !expectedKeys.every((key) => Object.hasOwn(snapshot, key))) {
+    return snapshot;
+  }
+  return {
+    ...snapshot,
+    ...(hasAppearance ? {} : { appearance: "system" }),
+    ...(hasSidebarCollapsed ? {} : { sidebarCollapsed: false }),
+  };
 }
 
 export const DESKTOP_ACTION_ARGUMENT_KEYS = ACTION_ARGUMENT_KEYS;

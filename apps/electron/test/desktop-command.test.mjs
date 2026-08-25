@@ -14,6 +14,16 @@ test("desktop commands contain only the fixed presentation vocabulary", () => {
     command: "language",
     value: "zh-Hans",
   });
+  assert.deepEqual(createDesktopCommand("sidebar", true), {
+    command: "sidebar",
+    collapsed: true,
+  });
+  assert.equal(Object.isFrozen(createDesktopCommand("sidebar", false)), true);
+  assert.deepEqual(createDesktopCommand("appearance", "dark", "dark"), {
+    command: "appearance",
+    preference: "dark",
+    resolvedTheme: "dark",
+  });
   assert.deepEqual(createDesktopCommand("hostedSignInReturn"), {
     command: "hostedSignInReturn",
   });
@@ -33,6 +43,10 @@ test("desktop commands reject selectors, paths, URLs, extra keys, and prototypes
     { command: "navigate", value: "https://attacker.example" },
     { command: "language", value: "fr" },
     { command: "language", value: "en", path: "/tmp/private" },
+    { command: "sidebar", collapsed: true, path: "/tmp/private" },
+    { command: "sidebar", collapsed: "true" },
+    { command: "appearance", preference: "dark", resolvedTheme: "sepia" },
+    { command: "appearance", preference: "sepia", resolvedTheme: "dark" },
     { command: "hostedSignInReturn", value: "unexpected" },
     { command: "shareCardDownloadCompleted", path: "/private/download.png" },
     { command: "shareCardDownloadFailed", error: "private details" },
@@ -48,4 +62,6 @@ test("desktop commands reject selectors, paths, URLs, extra keys, and prototypes
     () => createDesktopCommand("shareCardDownloadFailed", { path: "/private/download.png" }),
     TypeError,
   );
+  assert.throws(() => createDesktopCommand("sidebar"), TypeError);
+  assert.throws(() => createDesktopCommand("appearance", "dark"), TypeError);
 });

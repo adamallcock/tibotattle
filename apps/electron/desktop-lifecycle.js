@@ -319,7 +319,7 @@ export function createDesktopLifecycle({
     // Refresh belongs only to the dashboard. Language is shared presentation
     // state, so an already-open trusted Settings renderer receives that same
     // validated command and no broader broadcast surface.
-    if (command.command === "language"
+    if ((command.command === "language" || command.command === "appearance")
         && isLiveBrowserWindow(settingsWindow)
         && typeof settingsWindow.webContents?.send === "function") {
       settingsWindow.webContents.send(DESKTOP_COMMAND_CHANNEL, command);
@@ -500,6 +500,7 @@ export function createDesktopLifecycle({
       show: suppliedActions.show ?? showWindow,
       focus: suppliedActions.focus ?? showWindow,
       refresh: suppliedActions.refresh ?? (() => sendDashboardCommand({ command: "refresh" })),
+      toggleSidebar: suppliedActions.toggleSidebar ?? (() => false),
       retry: suppliedActions.retry ?? (() => retry()),
       settings: suppliedActions.settings ?? (() => showSettingsWindow()),
       about: suppliedActions.about ?? (() => showSettingsWindow("about")),

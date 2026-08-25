@@ -20,6 +20,8 @@ test("dashboard exposes bounded live state, focusable skip targets, and a labell
   assert.match(html, /<h3 id="share-panel-title">A results card you can post<\/h3>/u);
   assert.match(css, /\.share-panel:focus\s*\{/u);
   assert.match(css, /#main:focus-visible/u);
+  assert.match(css, /dashboard-shell\.sidebar-collapsed/u);
+  assert.match(css, /dashboard-sidebar[^\n]*\{[\s\S]*?visibility:\s*hidden/u);
   assert.match(css, /@media \(forced-colors: active\), \(prefers-contrast: more\)/u);
   assert.match(css, /@media \(prefers-reduced-motion: reduce\)/u);
   assert.match(css, /outline:\s*3px solid Highlight/u);

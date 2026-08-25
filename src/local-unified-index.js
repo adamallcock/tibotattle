@@ -5,8 +5,16 @@ import {
   randomBytes,
 } from "node:crypto";
 import { constants, lstatSync } from "node:fs";
-import { chmod, lstat, mkdir, open, rename, unlink } from "node:fs/promises";
-import { dirname, resolve, win32 } from "node:path";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  open,
+  readdir,
+  rename,
+  unlink,
+} from "node:fs/promises";
+import { basename, dirname, resolve, win32 } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import {
@@ -2954,6 +2962,124 @@ export async function removeIfPresent(
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
+}
+
+// A normal abort removes its own stage in the build/ingest catch path. A hard
+// process death cannot run that catch, however, and repeated Electron
+// dogfooding left gigabytes of `.building-*` files beside the live index. The
+// companion holds its owner-only instance lock before it can accept a refresh,
+// so a stage older than the longest bounded refresh is abandoned unless its
+// recorded process is still alive. Keep the age margin deliberately large so
+// this remains cleanup rather than coordination.
+export const LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_MIN_AGE_MS = 2 * 60 * 60_000;
+export const LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_SCAN_LIMIT = 64;
+
+function localUnifiedIndexStageOwner(name, indexName) {
+  for (const kind of ["building", "incremental"]) {
+    const prefix = `${indexName}.${kind}-`;
+    if (!name.startsWith(prefix)) continue;
+    const remainder = name.slice(prefix.length);
+    const match = /^([1-9][0-9]*)-([0-9a-z]+)$/u.exec(remainder);
+    if (match === null) return null;
+    const pid = Number(match[1]);
+    return Number.isSafeInteger(pid) ? pid : null;
+  }
+  return null;
+}
+
+function processAppearsAlive(pid) {
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM still proves that a process owns the pid. ESRCH is the only
+    // affirmative evidence that it is no longer live.
+    return error?.code !== "ESRCH";
+  }
+}
+
+export async function removeAbandonedLocalUnifiedIndexStages(
+  indexFile,
+  {
+    nowMs = Date.now(),
+    minimumAgeMs = LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_MIN_AGE_MS,
+    scanLimit = LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_SCAN_LIMIT,
+    platform = process.platform,
+    isProcessAlive = processAppearsAlive,
+  } = {},
+) {
+  if (typeof indexFile !== "string" || indexFile.length < 1) {
+    throw new TypeError("indexFile must be a non-empty string");
+  }
+  if (!Number.isFinite(nowMs) || !Number.isFinite(minimumAgeMs)
+      || minimumAgeMs < 60_000) {
+    throw new TypeError("abandoned stage age is invalid");
+  }
+  if (!Number.isSafeInteger(scanLimit) || scanLimit < 1 || scanLimit > 256) {
+    throw new TypeError("abandoned stage scan limit is invalid");
+  }
+  if (typeof isProcessAlive !== "function") {
+    throw new TypeError("isProcessAlive must be a function");
+  }
+  // Windows stage names are capabilities owned by the qualified native
+  // staging context. Never enumerate or unlink them through path-based Node
+  // APIs; that boundary needs a separately qualified enumeration primitive.
+  if (platform === "win32") {
+    return Object.freeze({ inspected: 0, removed: 0, skipped: 0 });
+  }
+
+  const resolvedIndexFile = resolve(indexFile);
+  const directory = dirname(resolvedIndexFile);
+  const indexName = basename(resolvedIndexFile);
+  let names;
+  try {
+    names = (await readdir(directory))
+      .filter((name) => localUnifiedIndexStageOwner(name, indexName) !== null)
+      .sort()
+      .slice(0, scanLimit);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return Object.freeze({ inspected: 0, removed: 0, skipped: 0 });
+    }
+    throw error;
+  }
+
+  let inspected = 0;
+  let removed = 0;
+  let skipped = 0;
+  for (const name of names) {
+    inspected += 1;
+    const pid = localUnifiedIndexStageOwner(name, indexName);
+    const candidate = resolve(directory, name);
+    // Exact basename filtering above plus this containment check make the
+    // deletion root-bounded even if a future path implementation changes.
+    if (pid === null || dirname(candidate) !== directory || isProcessAlive(pid)) {
+      skipped += 1;
+      continue;
+    }
+    let metadata;
+    try {
+      metadata = await lstat(candidate);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      skipped += 1;
+      continue;
+    }
+    if (!metadata.isFile()
+        || !Number.isFinite(metadata.mtimeMs)
+        || nowMs - metadata.mtimeMs < minimumAgeMs) {
+      skipped += 1;
+      continue;
+    }
+    try {
+      await unlink(candidate);
+      removed += 1;
+    } catch (error) {
+      if (error?.code !== "ENOENT") skipped += 1;
+    }
+  }
+  return Object.freeze({ inspected, removed, skipped });
 }
 
 const EMPTY_INSPECTION = Object.freeze({

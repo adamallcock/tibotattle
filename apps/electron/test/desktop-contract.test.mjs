@@ -25,6 +25,7 @@ test("desktop contract freezes the exact bridge action and enum vocabulary", () 
     "chooseCodexHome",
     "useDefaultCodexHome",
     "setLanguage",
+    "setAppearance",
     "setRefreshInterval",
     "setStartAtLogin",
     "setNotificationPreferences",
@@ -124,15 +125,18 @@ test("settings snapshot validator enforces the exact schema and defaults", () =>
     schemaVersion: DESKTOP_SETTINGS_SCHEMA_VERSION,
     codexHome: { mode: "default", path: null },
     language: "system",
+    appearance: "system",
     refreshIntervalSeconds: 300,
     startAtLogin: false,
     notifications: { enabled: false, threshold: "off" },
+    sidebarCollapsed: false,
   });
 
   const valid = validateDesktopSettingsSnapshot({
     ...DESKTOP_DEFAULT_SETTINGS,
     codexHome: { mode: "custom", path: "C:\\Users\\adam\\.codex" },
     language: "zh-Hans",
+    appearance: "dark",
     refreshIntervalSeconds: 1800,
     startAtLogin: true,
     notifications: { enabled: true, threshold: "ninety" },
@@ -140,15 +144,30 @@ test("settings snapshot validator enforces the exact schema and defaults", () =>
   assert.equal(valid.codexHome.mode, "custom");
   assert.equal(Object.isFrozen(valid.notifications), true);
 
+  assert.equal(
+    validateDesktopSettingsSnapshot({
+      schemaVersion: DESKTOP_SETTINGS_SCHEMA_VERSION,
+      codexHome: { mode: "default", path: null },
+      language: "system",
+      appearance: "system",
+      refreshIntervalSeconds: 300,
+      startAtLogin: false,
+      notifications: { enabled: false, threshold: "off" },
+    }).sidebarCollapsed,
+    false,
+  );
+
   for (const invalid of [
     { ...DESKTOP_DEFAULT_SETTINGS, schemaVersion: "v2" },
     { ...DESKTOP_DEFAULT_SETTINGS, extra: true },
     { ...DESKTOP_DEFAULT_SETTINGS, codexHome: { mode: "default", path: "/tmp" } },
     { ...DESKTOP_DEFAULT_SETTINGS, codexHome: { mode: "custom", path: null } },
     { ...DESKTOP_DEFAULT_SETTINGS, language: "fr" },
+    { ...DESKTOP_DEFAULT_SETTINGS, appearance: "sepia" },
     { ...DESKTOP_DEFAULT_SETTINGS, refreshIntervalSeconds: 1 },
     { ...DESKTOP_DEFAULT_SETTINGS, startAtLogin: 1 },
     { ...DESKTOP_DEFAULT_SETTINGS, notifications: { enabled: false, threshold: "90" } },
+    { ...DESKTOP_DEFAULT_SETTINGS, sidebarCollapsed: "false" },
   ]) {
     assert.throws(() => validateDesktopSettingsSnapshot(invalid), TypeError);
   }

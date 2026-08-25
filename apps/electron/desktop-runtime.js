@@ -16,6 +16,7 @@ import {
   createWindowsDesktopSettingsBackend,
 } from "./desktop-settings-backends.js";
 import { createDesktopSettingsStore } from "./desktop-settings-store.js";
+import { DESKTOP_APPEARANCES } from "./desktop-contract.js";
 import {
   createDesktopFirstRunReceiptBackend,
   ensureDesktopFirstRunAcknowledged,
@@ -68,6 +69,25 @@ function electronSystemLocales(app) {
     // See the preferred-languages fallback above.
   }
   return locales;
+}
+
+function applyElectronAppearance(nativeTheme, preference) {
+  if (!DESKTOP_APPEARANCES.includes(preference)
+      || nativeTheme === null
+      || typeof nativeTheme !== "object") {
+    return null;
+  }
+  try {
+    nativeTheme.themeSource = preference;
+  } catch {
+    return null;
+  }
+  const resolvedTheme = preference === "dark"
+    ? "dark"
+    : preference === "light"
+      ? "light"
+      : nativeTheme.shouldUseDarkColors === true ? "dark" : "light";
+  return resolvedTheme;
 }
 
 function childEnvironmentWithStateRoot({ app, environment }) {
@@ -536,6 +556,12 @@ export async function launchDesktopRuntime({
   let controller;
   let ipcInstallation = createNoopIpcInstallation();
   let cleanupPromise = null;
+  let removeNativeThemeListener = () => {};
+
+  const updateDesktopAppearance = (value) => applyElectronAppearance(
+    runtime.nativeTheme,
+    value,
+  );
 
   function updateDesktopLanguage(value) {
     activeDesktopLocale = value;
@@ -604,6 +630,7 @@ export async function launchDesktopRuntime({
     validateCodexHome,
     sendDashboardCommand,
     onLanguageChanged: (value) => updateDesktopLanguage(value),
+    onAppearanceChanged: updateDesktopAppearance,
   });
 
   // Load persisted settings before starting the child. This is what makes a
@@ -643,6 +670,11 @@ export async function launchDesktopRuntime({
   const desktopActions = {
     ...boundedCallerActions,
     refresh: () => controller.refreshUsage(),
+    toggleSidebar: () => {
+      const operation = controller.toggleSidebar();
+      operation?.catch?.(() => {});
+      return operation;
+    },
     retry: () => lifecycle?.retry?.(),
     settings: () => controller.showSettings("general"),
     about: () => controller.showSettings("about"),
@@ -697,6 +729,8 @@ export async function launchDesktopRuntime({
   async function disposeControllerAndIpc() {
     if (cleanupPromise !== null) return cleanupPromise;
     cleanupPromise = (async () => {
+      removeNativeThemeListener();
+      removeNativeThemeListener = () => {};
       ipcInstallation.dispose?.();
       await controller.dispose();
       // Drain first so a final status evaluation cannot race disposal. The
@@ -734,6 +768,24 @@ export async function launchDesktopRuntime({
       });
     } else if (qualificationContext !== null && qualificationContext !== undefined) {
       throw shellError("desktop_ipc_unavailable");
+    }
+    if (typeof runtime.nativeTheme?.on === "function") {
+      const onNativeThemeUpdated = () => {
+        void store.getSettings().then((settings) => {
+          const resolvedTheme = updateDesktopAppearance(settings.appearance);
+          if (resolvedTheme !== null) {
+            facade?.sendDashboardCommand?.({
+              command: "appearance",
+              preference: settings.appearance,
+              resolvedTheme,
+            });
+          }
+        }).catch(() => {});
+      };
+      runtime.nativeTheme.on("updated", onNativeThemeUpdated);
+      removeNativeThemeListener = () => {
+        runtime.nativeTheme.removeListener?.("updated", onNativeThemeUpdated);
+      };
     }
     await lifecycle.start();
   } catch (error) {

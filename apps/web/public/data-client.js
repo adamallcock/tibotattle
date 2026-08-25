@@ -5524,6 +5524,36 @@ async function fetchJson(fetchImpl, url, options = {}) {
 
 export const LOCAL_REFRESH_STATUS_TIMEOUT_MS = 4_000;
 const LOCAL_REFRESH_STATUS_TIMEOUT_MAX_MS = 30_000;
+export const LOCAL_REFRESH_CANCEL_TIMEOUT_MS = 8_000;
+const LOCAL_REFRESH_CANCEL_TIMEOUT_MAX_MS = 30_000;
+export const LOCAL_REFRESH_MAX_TRANSIENT_STATUS_FAILURES = 8;
+
+/**
+ * The browser owns the foreground refresh loop, so a status request can fail
+ * transiently while the companion is busy with synchronous accounting work.
+ * Electron keeps retrying those reads until its immutable operation deadline;
+ * the ordinary browser/native path retains the historical eight-failure stop.
+ */
+export function shouldAbortRefreshStatusPolling({
+  isElectron = false,
+  consecutiveFailures = 0,
+  operationDeadlineMs = null,
+  now = () => Date.now(),
+} = {}) {
+  if (typeof now !== "function"
+      || !Number.isSafeInteger(consecutiveFailures)
+      || consecutiveFailures < 0
+      || (operationDeadlineMs !== null
+        && (!Number.isSafeInteger(operationDeadlineMs)
+          || operationDeadlineMs < 0))) {
+    throw new TypeError("Refresh status polling inputs are invalid.");
+  }
+  if (operationDeadlineMs !== null && now() >= operationDeadlineMs) {
+    return true;
+  }
+  return isElectron !== true
+    && consecutiveFailures >= LOCAL_REFRESH_MAX_TRANSIENT_STATUS_FAILURES;
+}
 
 export function normalizeBackendReadiness(payload) {
   const unavailable = Object.freeze({
@@ -5598,6 +5628,7 @@ export class LocalCompanionClient {
   constructor({
     fetchImpl = globalThis.fetch,
     refreshStatusTimeoutMs = LOCAL_REFRESH_STATUS_TIMEOUT_MS,
+    refreshCancelTimeoutMs = LOCAL_REFRESH_CANCEL_TIMEOUT_MS,
   } = {}) {
     // Browser-native fetch is receiver-sensitive: invoked as a property of
     // this client it throws "Illegal invocation" (WebKit: "Can only call
@@ -5612,6 +5643,13 @@ export class LocalCompanionClient {
         Math.max(1, Math.trunc(refreshStatusTimeoutMs)),
       )
       : LOCAL_REFRESH_STATUS_TIMEOUT_MS;
+    this.refreshCancelTimeoutMs = Number.isFinite(refreshCancelTimeoutMs)
+      && refreshCancelTimeoutMs > 0
+      ? Math.min(
+        LOCAL_REFRESH_CANCEL_TIMEOUT_MAX_MS,
+        Math.max(1, Math.trunc(refreshCancelTimeoutMs)),
+      )
+      : LOCAL_REFRESH_CANCEL_TIMEOUT_MS;
     // Set once the companion has answered 404/405 for the consolidated
     // endpoint, so the negotiation is not repeated on every later load.
     this.consolidatedUnavailable = false;
@@ -5674,22 +5712,28 @@ export class LocalCompanionClient {
     });
   }
 
-  async refreshStatus() {
+  async refreshStatus({ timeoutMs = this.refreshStatusTimeoutMs } = {}) {
     // The UI's elapsed clock is independent of this request, but the polling
     // loop still needs a bounded answer so it can enter its explicit
     // reconnecting state instead of awaiting one starved companion request
     // forever.
+    const timeout = Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? Math.min(
+        this.refreshStatusTimeoutMs,
+        Math.max(1, Math.trunc(timeoutMs)),
+      )
+      : this.refreshStatusTimeoutMs;
     const controller = new AbortController();
-    const timeout = setTimeout(
+    const timeoutHandle = setTimeout(
       () => controller.abort(),
-      this.refreshStatusTimeoutMs,
+      timeout,
     );
     try {
       return await fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh`, {
         signal: controller.signal,
       });
     } finally {
-      clearTimeout(timeout);
+      clearTimeout(timeoutHandle);
     }
   }
 
@@ -5719,14 +5763,30 @@ export class LocalCompanionClient {
   }
 
   async cancelRefresh() {
-    return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh/cancel`, {
+    const controller = new AbortController();
+    let timeoutHandle = null;
+    const request = fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh/cancel`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-Usage-Monitor-Local": "1"
       },
+      signal: controller.signal,
       body: JSON.stringify({})
     });
+    const deadline = new Promise((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        controller.abort();
+        const error = new Error("The cancellation request timed out.");
+        error.code = "refresh_cancel_timed_out";
+        reject(error);
+      }, this.refreshCancelTimeoutMs);
+    });
+    try {
+      return await Promise.race([request, deadline]);
+    } finally {
+      if (timeoutHandle !== null) clearTimeout(timeoutHandle);
+    }
   }
 
   async contributionSyncStatus() {

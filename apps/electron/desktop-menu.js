@@ -16,6 +16,7 @@ const DESKTOP_ACTION_NAMES = Object.freeze([
   "show",
   "focus",
   "refresh",
+  "toggleSidebar",
   "retry",
   "settings",
   "about",
@@ -126,6 +127,9 @@ export function createDesktopMenuTemplate({
       submenu: [
         actionItem(desktopText("electron.menu.refresh", {}, textOptions), boundedActions.refresh, {
           accelerator: "CmdOrCtrl+R",
+        }),
+        actionItem(desktopText("electron.menu.toggleSidebar", {}, textOptions), boundedActions.toggleSidebar, {
+          accelerator: "CmdOrCtrl+Shift+S",
         }),
         { type: "separator" },
         actionItem(desktopText("electron.menu.show", { appName }, textOptions), boundedActions.show),

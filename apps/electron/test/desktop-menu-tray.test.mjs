@@ -15,6 +15,8 @@ import {
   STATUS_PLACEHOLDER,
   TRAY_ICON_RELATIVE_PATH,
   TRAY_ICON_SIZE,
+  TRAY_TEMPLATE_CROP_INSET_RATIO,
+  TRAY_TEMPLATE_CROP_SIZE_RATIO,
 } from "../desktop-tray.js";
 
 function actionRecorder() {
@@ -83,6 +85,7 @@ test("application menu maps all desktop commands to the injected action interfac
 
   const view = template.find(({ label }) => label === "View").submenu;
   item(view, "Refresh Usage").click();
+  item(view, "Toggle Sidebar").click();
   item(view, "Show TiboTattle Dev").click();
   item(view, "Focus TiboTattle Dev").click();
   assert.deepEqual(calls, [
@@ -90,10 +93,12 @@ test("application menu maps all desktop commands to the injected action interfac
     "settings",
     "quit",
     "refresh",
+    "toggleSidebar",
     "show",
     "focus",
   ]);
   assert.equal(item(view, "Refresh Usage").accelerator, "CmdOrCtrl+R");
+  assert.equal(item(view, "Toggle Sidebar").accelerator, "CmdOrCtrl+Shift+S");
 
   const windowMenu = template.find(({ label }) => label === "Window").submenu;
   assert.deepEqual(windowMenu.map(({ role }) => role), ["minimize", "zoom", "front"]);
@@ -206,6 +211,7 @@ function nativeImageFixture({
 } = {}) {
   const calls = {
     createFromPath: [],
+    crop: [],
     resize: [],
     template: [],
   };
@@ -217,6 +223,11 @@ function nativeImageFixture({
   }
   const source = {
     isEmpty: () => sourceEmpty,
+    getSize: () => ({ width: 1_024, height: 1_024 }),
+    crop: (options) => {
+      calls.crop.push(options);
+      return source;
+    },
     resize: (options) => {
       calls.resize.push(options);
       return resized;
@@ -245,6 +256,12 @@ test("tray icon resolution loads the fixed packaged asset and sizes it for macOS
   assert.deepEqual(fixture.calls.createFromPath, [
     join("/trusted/app.asar", TRAY_ICON_RELATIVE_PATH),
   ]);
+  assert.deepEqual(fixture.calls.crop, [{
+    x: Math.floor(1_024 * TRAY_TEMPLATE_CROP_INSET_RATIO),
+    y: Math.floor(1_024 * TRAY_TEMPLATE_CROP_INSET_RATIO),
+    width: Math.round(1_024 * TRAY_TEMPLATE_CROP_SIZE_RATIO),
+    height: Math.round(1_024 * TRAY_TEMPLATE_CROP_SIZE_RATIO),
+  }]);
   assert.deepEqual(fixture.calls.resize, [{
     width: 32,
     height: 32,

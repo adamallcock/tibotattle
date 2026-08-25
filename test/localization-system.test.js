@@ -345,6 +345,18 @@ test("local analysis controls and bounded progress use semantic live-localized m
   assert.match(source, /localAnalysis\.action\.update/u);
   assert.match(source, /localAnalysis\.action\.analyze/u);
   assert.match(source, /localRefreshCancelRequested \? "action\.cancelling" : "action\.cancel"/u);
+  assert.match(source, /error\?\.code === "refresh_cancel_timed_out"/u);
+  assert.match(refreshSource, /ELECTRON_REFRESH_POLLING_WINDOW_MS/u);
+  assert.match(refreshSource, /runsInsideElectronDashboard\(\)/u);
+  for (const key of [
+    "localAnalysis.notice.alreadyStoppedTitle",
+    "localAnalysis.notice.alreadyStoppedCopy",
+  ]) {
+    assert.match(source, new RegExp(key.replaceAll(".", "\\."), "u"), key);
+    assert.equal(Object.hasOwn(WEB_MESSAGES, key), true, `${key} is catalogued`);
+  }
+  assert.match(source, /error\?\.code === "refresh_not_running"/u);
+  assert.match(source, /surface: "local_refresh"/u);
   assert.doesNotMatch(refreshSource, /button\.textContent\s*=\s*["'`]/u);
 
   assert.equal(

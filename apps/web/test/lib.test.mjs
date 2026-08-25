@@ -57,6 +57,8 @@ import {
   CONTRIBUTION_SYNC_STATUS_SCHEMA_VERSION,
   formatQuotaWindowDuration,
   isValidQuotaWindowDuration,
+  LOCAL_REFRESH_CANCEL_TIMEOUT_MS,
+  LOCAL_REFRESH_MAX_TRANSIENT_STATUS_FAILURES,
   LOCAL_REFRESH_STATUS_TIMEOUT_MS,
   LOCAL_ONBOARDING_SCHEMA_VERSION,
   CommunityClient,
@@ -88,6 +90,7 @@ import {
   PARTICIPANT_PROFILE_SCHEMA_VERSION,
   PARTICIPANT_STATS_SCHEMA_VERSION,
   selectPrimaryCodexQuotaWindow,
+  shouldAbortRefreshStatusPolling,
   isPrimaryCodexQuotaWindow,
   isPrimaryCodexWeeklyQuotaWindow,
   SUPPORTED_COMMUNITY_SNAPSHOT_SCHEMA_VERSIONS,
@@ -2604,6 +2607,7 @@ test("local refresh uses the closed same-origin contract and exposes polling", a
   assert.equal(calls[1].options.method, undefined);
   assert.ok(calls[1].options.signal instanceof AbortSignal);
   assert.equal(LOCAL_REFRESH_STATUS_TIMEOUT_MS, 4_000);
+  assert.equal(LOCAL_REFRESH_CANCEL_TIMEOUT_MS, 8_000);
 });
 
 test("local refresh status polling settles when the companion stops answering", async () => {
@@ -2638,6 +2642,107 @@ test("local refresh status polling settles when the companion stops answering", 
     refreshStatusTimeoutMs: Number.MAX_SAFE_INTEGER,
   });
   assert.equal(cappedClient.refreshStatusTimeoutMs, 30_000);
+});
+
+test("Electron refresh status polling survives eight transient failures then observes success", async () => {
+  let statusReads = 0;
+  const client = new LocalCompanionClient({
+    fetchImpl: async (_url, options = {}) => {
+      assert.ok(options.signal instanceof AbortSignal);
+      statusReads += 1;
+      if (statusReads <= LOCAL_REFRESH_MAX_TRANSIENT_STATUS_FAILURES) {
+        throw new Error("temporary companion starvation");
+      }
+      return new Response(JSON.stringify({ refresh: { status: "succeeded" } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  });
+  const operationDeadlineMs = Date.now() + 60_000;
+  let consecutiveFailures = 0;
+  let terminal = null;
+  while (terminal === null) {
+    try {
+      terminal = (await client.refreshStatus()).refresh.status;
+      consecutiveFailures = 0;
+    } catch (error) {
+      consecutiveFailures += 1;
+      assert.equal(
+        shouldAbortRefreshStatusPolling({
+          isElectron: true,
+          consecutiveFailures,
+          operationDeadlineMs,
+        }),
+        false,
+        `Electron should keep polling after failure ${consecutiveFailures}`,
+      );
+      assert.ok(error instanceof Error);
+    }
+  }
+  assert.equal(statusReads, LOCAL_REFRESH_MAX_TRANSIENT_STATUS_FAILURES + 1);
+  assert.equal(terminal, "succeeded");
+  assert.equal(consecutiveFailures, 0);
+});
+
+test("ordinary browser/native refresh polling still stops after eight failures", () => {
+  assert.equal(
+    shouldAbortRefreshStatusPolling({
+      isElectron: false,
+      consecutiveFailures: LOCAL_REFRESH_MAX_TRANSIENT_STATUS_FAILURES,
+      operationDeadlineMs: null,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldAbortRefreshStatusPolling({
+      isElectron: true,
+      consecutiveFailures: LOCAL_REFRESH_MAX_TRANSIENT_STATUS_FAILURES,
+      operationDeadlineMs: 60_000,
+      now: () => 1_000,
+    }),
+    false,
+  );
+});
+
+test("refresh status polling uses one immutable Electron operation deadline", () => {
+  let nowMs = 10_000;
+  const deadlineMs = 20_000;
+  assert.equal(
+    shouldAbortRefreshStatusPolling({
+      isElectron: true,
+      consecutiveFailures: 100,
+      operationDeadlineMs: deadlineMs,
+      now: () => nowMs,
+    }),
+    false,
+  );
+  nowMs = deadlineMs;
+  assert.equal(
+    shouldAbortRefreshStatusPolling({
+      isElectron: true,
+      consecutiveFailures: 0,
+      operationDeadlineMs: deadlineMs,
+      now: () => nowMs,
+    }),
+    true,
+  );
+});
+
+test("cancelRefresh aborts and settles when the cancellation request never resolves", async () => {
+  let observedSignal = null;
+  const client = new LocalCompanionClient({
+    refreshCancelTimeoutMs: 10,
+    fetchImpl: async (_url, { signal } = {}) => {
+      observedSignal = signal;
+      return new Promise(() => {});
+    },
+  });
+  await assert.rejects(
+    client.cancelRefresh(),
+    (error) => error?.code === "refresh_cancel_timed_out",
+  );
+  assert.equal(observedSignal?.aborted, true);
 });
 
 test("local health exposes the content-free preparation mode", async () => {

@@ -1903,6 +1903,8 @@ function unifiedIndexDegradation(result) {
   return null;
 }
 
+export const LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS = 30 * 60_000;
+
 export class LocalCompanionRefreshController {
   #abortController = null;
   #cancelRequested = false;
@@ -1941,8 +1943,10 @@ export class LocalCompanionRefreshController {
     if (!dataStore || typeof dataStore.reload !== "function") {
       throw new TypeError("dataStore.reload must be a function");
     }
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 5 * 60_000) {
-      throw new TypeError("timeoutMs must be between 1,000 and 300,000");
+    if (!Number.isSafeInteger(timeoutMs)
+        || timeoutMs < 1_000
+        || timeoutMs > LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS) {
+      throw new TypeError("timeoutMs must be between 1,000 and 1,800,000");
     }
     if (typeof createRefreshId !== "function") {
       throw new TypeError("createRefreshId must be a function");

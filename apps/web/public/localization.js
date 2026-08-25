@@ -169,6 +169,9 @@ export const WEB_MESSAGES = Object.freeze({
   "language.english": ["English", "English", "English"],
   "language.simplifiedChinese": ["Simplified Chinese", "简体中文", "Chino simplificado"],
   "language.spanish": ["Spanish", "Español", "Español"],
+  "appearance.system": ["System", "跟随系统", "Sistema"],
+  "appearance.light": ["Light", "浅色", "Claro"],
+  "appearance.dark": ["Dark", "深色", "Oscuro"],
   "language.changed": ["Language changed to {language}.", "语言已切换为{language}。", "Idioma cambiado a {language}."],
   // Electron Settings and the desktop menu/tray use the same three-column
   // browser catalog as the dashboard. Keep these strings semantic so the
@@ -192,6 +195,9 @@ export const WEB_MESSAGES = Object.freeze({
   "electron.settings.language.title": ["Language", "语言", "Idioma"],
   "electron.settings.language.description": ["Choose the language used for TiboTattle controls and explanations.", "选择 TiboTattle 控件和说明使用的语言。", "Elige el idioma de los controles y las explicaciones de TiboTattle."],
   "electron.settings.language.label": ["Language", "语言", "Idioma"],
+  "electron.settings.appearance.title": ["Appearance", "外观", "Apariencia"],
+  "electron.settings.appearance.description": ["Choose whether TiboTattle follows the operating system or uses a fixed light or dark appearance.", "选择 TiboTattle 是否跟随操作系统，或使用固定的浅色或深色外观。", "Elige si TiboTattle sigue al sistema operativo o usa una apariencia clara u oscura fija."],
+  "electron.settings.appearance.label": ["Appearance", "外观", "Apariencia"],
   "electron.settings.codexFolder.title": ["Codex folder", "Codex 文件夹", "Carpeta de Codex"],
   "electron.settings.codexFolder.description": ["TiboTattle reads only the sessions and archived_sessions folders below this location. Use the default unless your Codex data lives elsewhere.", "TiboTattle 只读取此位置下的 sessions 和 archived_sessions 文件夹。除非 Codex 数据位于其他位置，否则请使用默认位置。", "TiboTattle solo lee las carpetas sessions y archived_sessions dentro de esta ubicación. Usa la predeterminada salvo que tus datos de Codex estén en otro sitio."],
   "electron.settings.codexFolder.default": ["Default location (~/.codex)", "默认位置 (~/.codex)", "Ubicación predeterminada (~/.codex)"],
@@ -1094,6 +1100,8 @@ export const WEB_MESSAGES = Object.freeze({
   "localAnalysis.notice.couldNotStartTitle": ["Local analysis could not be started", "无法开始本地分析", "No se pudo iniciar el análisis local"],
   "localAnalysis.notice.cancellationRequestedTitle": ["Cancellation requested", "已请求取消", "Cancelación solicitada"],
   "localAnalysis.notice.cancellationRequestedCopy": ["TiboTattle is stopping after its current atomic step and preserving a resumable local checkpoint.", "TiboTattle 将在当前原子步骤完成后停止，并保留可恢复的本地检查点。", "TiboTattle se detendrá después de su paso atómico actual y conservará un punto de control local reanudable."],
+  "localAnalysis.notice.alreadyStoppedTitle": ["Analysis already stopped", "分析已停止", "El análisis ya se detuvo"],
+  "localAnalysis.notice.alreadyStoppedCopy": ["There is no analysis left to cancel. It may have finished while the request was sent; TiboTattle is loading its verified final state.", "没有仍在运行的分析可供取消。它可能在发送请求时已经完成；TiboTattle 正在加载其经过验证的最终状态。", "Ya no hay ningún análisis que cancelar. Puede haber terminado mientras se enviaba la solicitud; TiboTattle está cargando su estado final verificado."],
   "localAnalysis.notice.cancellationFailedTitle": ["Cancellation could not be requested", "无法请求取消", "No se pudo solicitar la cancelación"],
   "localAnalysis.notice.cancellationFailedCopy": ["The analysis may already have finished or the local companion may be reconnecting. Existing verified results are unchanged.", "分析可能已经完成，或者本地伴随程序正在重新连接。现有验证结果未变。", "Es posible que el análisis ya haya terminado o que el acompañante local se esté reconectando. Los resultados verificados existentes no han cambiado."],
   "status.unknown": ["Unknown state", "未知状态", "Estado desconocido"],

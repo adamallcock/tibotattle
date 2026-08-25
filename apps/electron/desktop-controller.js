@@ -1,4 +1,5 @@
-import { DESKTOP_ACTIONS } from "./desktop-contract.js";
+import { DESKTOP_ACTIONS, DESKTOP_APPEARANCES } from "./desktop-contract.js";
+import { createDesktopCommand } from "./desktop-command.js";
 import { desktopText } from "./desktop-copy.js";
 
 const DASHBOARD_COMMANDS = Object.freeze({
@@ -202,15 +203,18 @@ export function createDesktopController({
   validateCodexHome,
   sendDashboardCommand = () => false,
   onLanguageChanged = () => {},
+  onAppearanceChanged = () => null,
   setRecurringTimer = setInterval,
   clearRecurringTimer = clearInterval,
 } = {}) {
   const store = assertPort(settingsStore, [
     "getSettings",
     "setLanguage",
+    "setAppearance",
     "setRefreshInterval",
     "setStartAtLogin",
     "setNotificationPreferences",
+    "setSidebarCollapsed",
     "setCodexHome",
     "useDefaultCodexHome",
   ], "settingsStore");
@@ -236,6 +240,9 @@ export function createDesktopController({
   }
   if (typeof onLanguageChanged !== "function") {
     throw new TypeError("onLanguageChanged is required");
+  }
+  if (typeof onAppearanceChanged !== "function") {
+    throw new TypeError("onAppearanceChanged is required");
   }
   if (typeof setRecurringTimer !== "function" || typeof clearRecurringTimer !== "function") {
     throw new TypeError("timer functions are required");
@@ -272,6 +279,17 @@ export function createDesktopController({
       // Native presentation copy must never make a persisted language change
       // fail. The next Settings snapshot remains bounded and recoverable.
       return false;
+    }
+  }
+
+  function notifyAppearanceChanged(value) {
+    try {
+      const resolved = onAppearanceChanged(value);
+      return resolved === "light" || resolved === "dark" ? resolved : null;
+    } catch {
+      // Appearance is presentation-only. A host without nativeTheme (for
+      // example a plain-Node composition test) must not reject persistence.
+      return null;
     }
   }
 
@@ -367,9 +385,11 @@ export function createDesktopController({
     return Object.freeze({
       settings: Object.freeze({
         language: settings.language,
+        appearance: settings.appearance,
         codexFolder: Object.freeze(codexFolder),
         refreshIntervalSeconds: settings.refreshIntervalSeconds,
         startAtLogin: login,
+        sidebarCollapsed: settings.sidebarCollapsed,
         notifications: notificationSnapshot(settings),
       }),
       about: platform.about(),
@@ -383,6 +403,7 @@ export function createDesktopController({
       if (initialized) return snapshot();
       const settings = await store.getSettings();
       notifyLanguageChanged(settings.language);
+      notifyAppearanceChanged(settings.appearance);
       await initializeNotificationCoordinator(settings.notifications);
       let initialHome = cloneHome(settings.codexHome);
       if (initialHome.mode === "custom") {
@@ -454,6 +475,16 @@ export function createDesktopController({
     });
   }
 
+  async function toggleSidebar() {
+    return enqueue(async () => {
+      const settings = await store.getSettings();
+      const collapsed = !settings.sidebarCollapsed;
+      await store.setSidebarCollapsed(collapsed);
+      emitDashboardCommand(createDesktopCommand("sidebar", collapsed));
+      return snapshot();
+    });
+  }
+
   const handlers = Object.freeze({
     async getSettings() {
       return snapshot();
@@ -475,6 +506,23 @@ export function createDesktopController({
         await store.setLanguage(value);
         notifyLanguageChanged(value);
         emitDashboardCommand(Object.freeze({ command: "language", value }));
+        return snapshot();
+      });
+    },
+    async setAppearance({ value }) {
+      if (!DESKTOP_APPEARANCES.includes(value)) {
+        throw controllerError("desktop_appearance_invalid");
+      }
+      return enqueue(async () => {
+        await store.setAppearance(value);
+        const resolvedTheme = notifyAppearanceChanged(value);
+        if (resolvedTheme !== null) {
+          emitDashboardCommand(Object.freeze({
+            command: "appearance",
+            preference: value,
+            resolvedTheme,
+          }));
+        }
         return snapshot();
       });
     },
@@ -609,6 +657,7 @@ export function createDesktopController({
     refreshUsage() {
       return emitDashboardCommand(DASHBOARD_COMMANDS.refresh);
     },
+    toggleSidebar,
     async dispose() {
       disposed = true;
       stopRefreshTimer();

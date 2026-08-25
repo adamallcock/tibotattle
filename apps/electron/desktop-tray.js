@@ -20,6 +20,8 @@ const STATUS_PLACEHOLDER = "Status unavailable";
 const TRAY_ICON_RELATIVE_PATH = "apps/web/public/tibotattle-icon.png";
 const TRAY_ICON_SIZE = 16;
 const TRAY_TEMPLATE_WORK_SIZE = 32;
+const TRAY_TEMPLATE_CROP_INSET_RATIO = 0.14;
+const TRAY_TEMPLATE_CROP_SIZE_RATIO = 0.72;
 
 function defaultSystemLocales() {
   try {
@@ -184,10 +186,43 @@ export function resolveDesktopTrayIcon({
     return undefined;
   }
 
+  // The reviewed application artwork is a full squircle. At menu-bar size,
+  // shrinking that whole plate makes the cream bird collapse into a white
+  // rounded square. Match the native AppKit shell's reviewed crop before
+  // extracting the bright brand mark. The crop seam is optional so older
+  // Electron/nativeImage implementations still fail soft to the previous
+  // thresholding path rather than losing the status item entirely.
+  let workingSource = source;
+  if (platform === "darwin"
+      && typeof source.getSize === "function"
+      && typeof source.crop === "function") {
+    try {
+      const size = source.getSize();
+      const width = Number(size?.width);
+      const height = Number(size?.height);
+      if (Number.isFinite(width) && Number.isFinite(height)
+          && width > 0 && height > 0) {
+        const cropWidth = Math.max(1, Math.round(width * TRAY_TEMPLATE_CROP_SIZE_RATIO));
+        const cropHeight = Math.max(1, Math.round(height * TRAY_TEMPLATE_CROP_SIZE_RATIO));
+        const cropped = source.crop({
+          x: Math.max(0, Math.floor(width * TRAY_TEMPLATE_CROP_INSET_RATIO)),
+          y: Math.max(0, Math.floor(height * TRAY_TEMPLATE_CROP_INSET_RATIO)),
+          width: Math.min(Math.round(width), cropWidth),
+          height: Math.min(Math.round(height), cropHeight),
+        });
+        if (isNonEmptyNativeImage(cropped) && typeof cropped.resize === "function") {
+          workingSource = cropped;
+        }
+      }
+    } catch {
+      workingSource = source;
+    }
+  }
+
   let resized;
   try {
     const size = platform === "darwin" ? TRAY_TEMPLATE_WORK_SIZE : TRAY_ICON_SIZE;
-    resized = source.resize({
+    resized = workingSource.resize({
       width: size,
       height: size,
       quality: "best",
@@ -246,5 +281,7 @@ export {
   STATUS_PLACEHOLDER,
   TRAY_ICON_RELATIVE_PATH,
   TRAY_ICON_SIZE,
+  TRAY_TEMPLATE_CROP_INSET_RATIO,
+  TRAY_TEMPLATE_CROP_SIZE_RATIO,
   TRAY_TEMPLATE_WORK_SIZE,
 };

@@ -16,6 +16,7 @@ import {
 } from "./local-unified-index-extract.js";
 import {
   createEventSink,
+  createLocalUnifiedIndexCooperativeCheckpoint,
   defaultRebuildWorkerCount,
   lineageComponents,
   persistingCollector,
@@ -45,6 +46,7 @@ import {
   recoverUnifiedIndexGenerations,
   readOrCreateDeviceSalt,
   readUnifiedIndexGenerationDescriptor,
+  removeAbandonedLocalUnifiedIndexStages,
   removeIfPresent,
   sessionLocal,
   snapshotLocal,
@@ -317,6 +319,11 @@ export async function ingestLocalUnifiedIndexIncrement({
       stateRoot,
       resourceRoot,
     });
+    // Recover space left by a companion that was killed before the normal
+    // staged-build catch could discard its temporary index. This is
+    // deliberately portable-only; Windows cleanup stays behind the native
+    // protected-state staging boundary.
+    await removeAbandonedLocalUnifiedIndexStages(resolvedIndexFile);
   }
   let deviceSalt;
   try {
@@ -789,6 +796,10 @@ export async function ingestLocalUnifiedIndexIncrement({
       accountScopeId,
       generationId: generation.generationId,
       onCounts: null,
+    });
+    const cooperativeCheckpoint = createLocalUnifiedIndexCooperativeCheckpoint({
+      signal,
+      flush: () => writer.flush(),
     });
     const countSourceBoundaries = database.prepare(`
       SELECT COUNT(*) AS count
@@ -1655,9 +1666,18 @@ export async function ingestLocalUnifiedIndexIncrement({
               && Number(cursor.turn_context_seen) === 1,
             ...(maximumLineBytes === undefined ? {} : { maximumLineBytes }),
             signal,
-            onEvent: (event) => sink.write(state, event),
-            onBoundary: (event) => sink.writeBoundary(state, event),
-              onTool: (event) => sink.writeTool(state, event),
+            onEvent: (event) => {
+              sink.write(state, event);
+              return cooperativeCheckpoint();
+            },
+            onBoundary: (event) => {
+              sink.writeBoundary(state, event);
+              return cooperativeCheckpoint();
+            },
+            onTool: (event) => {
+              sink.writeTool(state, event);
+              return cooperativeCheckpoint();
+            },
             })
           ));
           sink.finishSource(state);
