@@ -23,6 +23,43 @@ work. This plan does not authorize a version bump, production signing,
 publication, updater-feed change, release, service deployment, production
 selector, or replacement of the native client.
 
+## Acceptance reset — 2026-08-24
+
+The earlier M0 handoff proved a thin Electron shell and a small set of happy
+paths. It did **not** prove full product parity. In particular, a visible
+sidebar, a successful startup request, and source-level presence of a module
+do not prove that the packaged Electron application can reach, populate, and
+operate that module with the same production configuration as the native
+macOS application.
+
+The active acceptance requirement is now full behavioral parity with the
+shipping native macOS application wherever Electron and the operating system
+provide an equivalent capability. This explicitly includes every visible
+Usage and costs module, live Community/contribution behavior, refresh and
+cancellation responsiveness, Settings, Share, application menus, the macOS
+status item (brand glyph, live percentage, evidence rows, and actions),
+notifications, updater presentation, diagnostics and data-management entry
+points, hosted sign-in, deep links, lifecycle, persistence, and truthful
+failure/recovery states. A capability may remain different only when the
+platform cannot provide an equivalent; that difference must be visible,
+tested, and recorded rather than silently omitted.
+
+Completion now requires a row-by-row parity ledger containing all of the
+following evidence for one exact packaged revision:
+
+1. the relevant source and packaged bytes are present;
+2. the entry point is visible and reachable by pointer and keyboard;
+3. the real companion or reviewed production service supplies the state;
+4. the success, empty, unavailable, running, cancellation, and recovery states
+   behave truthfully where applicable;
+5. close/reopen and full quit/relaunch preserve the intended state; and
+6. rendered/package-level automation or a recorded physical observation proves
+   the behavior.
+
+Until every ledger row passes, this document may describe individual slices as
+implemented or narrowly qualified, but must not call the Electron application
+fully complete or at parity.
+
 ## Starting evidence and source boundary
 
 - This isolated integration is based exactly on `origin/main` revision
