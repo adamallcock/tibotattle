@@ -5585,9 +5585,10 @@ test("first run is a truthful install and local preflight journey", async () => 
   assert.match(html, /A normal website cannot read Codex files/u);
   assert.match(html, /Your real usage appears only on that loopback page/u);
   assert.match(html, /You may close this hosted browser tab at any time/u);
-  assert.match(html, /A useful headline often appears in seconds/u);
-  assert.match(html, /first deep pass can\s+take a few minutes/u);
+  assert.match(html, /A useful headline can\s+appear in seconds/u);
+  assert.match(html, /first deep pass may\s+take longer/u);
   assert.match(html, /later updates are normally faster/u);
+  assert.doesNotMatch(html, /first deep pass can\s+take a few minutes/u);
   assert.match(html, /id="release-notes-link"/u);
   assert.match(html, /id="privacy-link"/u);
   assert.match(html, /id="security-link"/u);
@@ -5631,6 +5632,42 @@ test("first run is a truthful install and local preflight journey", async () => 
   assert.match(appSource, /function openInstalledApp\(\)/u);
   assert.match(appSource, /function localAnalysisAllowed\(/u);
   assert.match(appSource, /if \(!localAnalysisAllowed\(\)\) \{/u);
+  assert.match(appSource, /localAnalysis\.setup\.readyNote/u);
+  assert.match(appSource, /localAnalysis\.setup\.electronReadyNote/u);
+  assert.match(
+    appSource,
+    /runsInsideElectronDashboard\(\)[\s\S]{0,180}?"localAnalysis\.setup\.electronReadyNote"/u,
+  );
+  assert.match(
+    appSource,
+    /localAnalysis\.setup\.electronReadyNote[\s\S]{0,220}?localAnalysis\.setup\.readyNote/u,
+  );
+  const durationCopyChecks = {
+    "en-US": {
+      headline: /seconds/u,
+      bound: /two hours/u,
+      timer: /elapsed timer keeps counting/u,
+    },
+    "zh-Hans": {
+      headline: /几秒/u,
+      bound: /两小时/u,
+      timer: /计时器会继续计时/u,
+    },
+    es: {
+      headline: /segundos/u,
+      bound: /dos horas/u,
+      timer: /temporizador de tiempo transcurrido sigue contando/u,
+    },
+  };
+  for (const locale of SUPPORTED_LOCALES) {
+    const ordinary = translate("localAnalysis.setup.readyNote", {}, locale);
+    const electron = translate("localAnalysis.setup.electronReadyNote", {}, locale);
+    assert.match(ordinary, durationCopyChecks[locale].headline, `${locale} ordinary headline timing`);
+    assert.doesNotMatch(ordinary, durationCopyChecks[locale].bound, `${locale} ordinary copy stays platform-neutral`);
+    assert.match(electron, durationCopyChecks[locale].headline, `${locale} Electron headline timing`);
+    assert.match(electron, durationCopyChecks[locale].bound, `${locale} Electron bound`);
+    assert.match(electron, durationCopyChecks[locale].timer, `${locale} Electron elapsed timer`);
+  }
   for (const status of [
     "codex_home_missing",
     "codex_home_unreadable",

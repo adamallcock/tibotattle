@@ -1099,12 +1099,19 @@ function renderLocalOnboarding(value) {
   if (ready && boundedPause) {
     setLocalizedText($("#setup-note"), "localAnalysis.setup.boundedNote");
   } else {
-    setProductText(
-      $("#setup-note"),
-      ready
-        ? "A useful headline often appears in seconds. The first deep pass can take a few minutes and later updates are normally faster. Work stops or checkpoints at a fixed bound; prompts, responses, commands, paths, and account identifiers never enter this page."
-        : "After completing the action above, choose Check again. Checking does not analyze logs or upload anything.",
-    );
+    if (ready) {
+      setLocalizedText(
+        $("#setup-note"),
+        runsInsideElectronDashboard()
+          ? "localAnalysis.setup.electronReadyNote"
+          : "localAnalysis.setup.readyNote",
+      );
+    } else {
+      setProductText(
+        $("#setup-note"),
+        "After completing the action above, choose Check again. Checking does not analyze logs or upload anything.",
+      );
+    }
   }
   if (!ready) setGlobalState("setup", { companionReachable: true });
   setJourneyState(ready ? "local-ready" : "needs-local-setup");
