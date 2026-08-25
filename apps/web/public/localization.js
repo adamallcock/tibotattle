@@ -1154,6 +1154,16 @@ export const WEB_MESSAGES = Object.freeze({
     "正在索引 {total} 个来源中的第 {indexed} 个 · 最新观测 {time}。",
     "Indexando {indexed} de {total} fuentes · última observación {time}.",
   ],
+  "journey.index.partial": [
+    "Partial history · {indexed} valid sources · {sources} quarantined.",
+    "历史记录不完整 · 已索引 {indexed} 个有效来源 · {sources} 个来源已隔离。",
+    "Historial parcial · {indexed} fuentes válidas · {sources} en cuarentena.",
+  ],
+  "journey.index.partialWithEvidence": [
+    "Partial history · {indexed} valid sources · {sources} quarantined · latest {time}.",
+    "历史记录不完整 · 已索引 {indexed} 个有效来源 · {sources} 个来源已隔离 · 最新观测 {time}。",
+    "Historial parcial · {indexed} fuentes válidas · {sources} en cuarentena · última {time}.",
+  ],
   "journey.index.complete": [
     "The discovered history is fully indexed.",
     "已发现的历史记录已全部编入索引。",

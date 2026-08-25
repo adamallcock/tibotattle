@@ -7588,6 +7588,10 @@ test("the community journey states its stages and gates effort behind sign-in an
     appSource,
     /stage\("index", "progress", "journey\.index\.progress", counts\);/u,
   );
+  assert.match(
+    appSource,
+    /history\?\.phase === "partial_terminal"[\s\S]{0,900}?stage\("index", "done", "journey\.index\.partial/u,
+  );
   // Re-pinned 2026-08-08 (one-step flow): journey.community.connectNext left
   // with the connect step; the signed-in state points straight at the single
   // Review-and-approve action. Re-pinned 2026-08-20: waitingIndex now covers
@@ -7599,6 +7603,8 @@ test("the community journey states its stages and gates effort behind sign-in an
       "journey.index.complete",
       "journey.index.completeWithEvidence",
       "journey.index.progressWithEvidence",
+      "journey.index.partial",
+      "journey.index.partialWithEvidence",
       "journey.index.waiting",
       "journey.community.signInFirst",
       "journey.community.waitingIndex",
@@ -13225,6 +13231,71 @@ ${chain}`,
   assert.equal(staged.length, 1, "the chain states exactly one community stage");
   return staged[0];
 }
+
+async function communityIndexJourneyStageFor(history, latestObservedAt = null) {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const renderStart = appSource.indexOf("function renderCommunityJourney() {");
+  const start = appSource.indexOf(
+    "  const history = dashboard?.pricing?.historyCoverage",
+    renderStart,
+  );
+  const end = appSource.indexOf("\n\n  // 2 — sign in", start);
+  assert.ok(start >= 0 && end > start, "the community journey index stage is available");
+  const staged = [];
+  Function(
+    "dashboard", "finite", "formatLocal", "formatNumber", "stage",
+    appSource.slice(start, end),
+  )(
+    {
+      mode: "live",
+      pricing: { historyCoverage: history },
+      freshness: { latestObservedAt },
+    },
+    (value, fallback = null) => Number.isFinite(value) ? value : fallback,
+    (value) => String(value),
+    (value) => String(value),
+    (name, state, key, values = {}) => staged.push({ name, state, key, values }),
+  );
+  assert.equal(staged.length, 1, "the chain states exactly one index stage");
+  return staged[0];
+}
+
+test("the community journey treats a coherent terminal partial history as done", async () => {
+  const partialHistory = {
+    status: "partial",
+    phase: "partial_terminal",
+    sourceCount: 5,
+    indexedSourceCount: 4,
+    skippedSourceCount: 1,
+  };
+  const partial = await communityIndexJourneyStageFor(partialHistory);
+  assert.equal(partial.state, "done");
+  assert.equal(partial.key, "journey.index.partial");
+  assert.deepEqual(partial.values, { indexed: "4", sources: "1" });
+
+  const partialWithEvidence = await communityIndexJourneyStageFor(
+    partialHistory,
+    "Aug 24, 7:47 AM",
+  );
+  assert.equal(partialWithEvidence.state, "done");
+  assert.equal(partialWithEvidence.key, "journey.index.partialWithEvidence");
+  assert.deepEqual(partialWithEvidence.values, {
+    indexed: "4",
+    sources: "1",
+    time: "Aug 24, 7:47 AM",
+  });
+
+  for (const locale of SUPPORTED_LOCALES) {
+    const copy = translate("journey.index.partial", {
+      indexed: "4",
+      sources: "1",
+    }, locale);
+    assert.ok(copy.length > 0 && copy.length <= 90, `${locale} partial copy stays short`);
+    assert.match(copy, /4|四/u, `${locale} names indexed valid history`);
+    assert.match(copy, /1|一/u, `${locale} names quarantined source count`);
+    assert.doesNotMatch(copy, /fully|complet|全部|完全/u, `${locale} does not imply completeness`);
+  }
+});
 
 test("the journey names the unanswered health, never an index that is not the blocker", async () => {
   const retrying = await communityJourneyStageFor({

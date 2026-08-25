@@ -12654,6 +12654,25 @@ function renderCommunityJourney() {
         time: observedAt,
       });
     }
+  } else if (dashboard
+      && dashboard.mode !== "demo"
+      && history?.phase === "partial_terminal") {
+    // A coherent terminal gap is finished work, not an index still in flight.
+    // Keep the valid indexed history and quarantined source count visible; the
+    // detail deliberately says partial so "Done" cannot imply that missing
+    // sources were recovered or uploaded.
+    const partialValues = {
+      indexed: formatNumber(finite(history.indexedSourceCount, 0)),
+      sources: formatNumber(finite(history.skippedSourceCount, 0)),
+    };
+    if (observedAt === null) {
+      stage("index", "done", "journey.index.partial", partialValues);
+    } else {
+      stage("index", "done", "journey.index.partialWithEvidence", {
+        ...partialValues,
+        time: observedAt,
+      });
+    }
   } else if (dashboard && dashboard.mode !== "demo" && totalSources > 0) {
     // The same measured counts the history progress surface reports, stated
     // as one short sentence: the two-sentence byte breakdown wrapped this
