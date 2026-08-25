@@ -315,12 +315,13 @@ let googleSignInUnavailable = false;
 let localActionBusy = false;
 let localRefreshInProgress = false;
 let localRefreshCancelRequested = false;
-// The Electron companion's first private unified index is allowed a bounded
-// 30-minute cold-build window. Keep the foreground page alive one minute
-// longer so its elapsed clock, Cancel control, and terminal reload remain the
-// owner of that operation instead of looking crashed after the browser's
-// ordinary six-minute companion budget expires.
-const ELECTRON_REFRESH_POLLING_WINDOW_MS = 31 * 60_000;
+// The Electron companion's first private unified index is allowed the
+// two-hour server ceiling. Keep the foreground page alive for 121 minutes so
+// its elapsed clock, Cancel control, and terminal reload remain the owner of
+// that operation instead of looking crashed after the browser's ordinary
+// six-minute companion budget expires. The one-minute renderer margin lets a
+// terminal response settle after the companion's bounded work window closes.
+const ELECTRON_REFRESH_POLLING_WINDOW_MS = 121 * 60_000;
 // Archive indexing progress is intentionally transient: the durable dashboard
 // continues to show only the last verified complete/partial coverage receipt.
 // While a refresh owns a new pass, make that distinction visible beside cost

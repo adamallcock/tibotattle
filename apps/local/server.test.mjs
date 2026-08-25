@@ -103,7 +103,7 @@ test("Electron companions receive a bounded cold-index refresh window", () => {
     LOCAL_COMPANION_NODE_REFRESH_TIMEOUT_MS,
   );
   assert.equal(LOCAL_COMPANION_NODE_REFRESH_TIMEOUT_MS, 5 * 60_000);
-  assert.equal(LOCAL_COMPANION_ELECTRON_REFRESH_TIMEOUT_MS, 30 * 60_000);
+  assert.equal(LOCAL_COMPANION_ELECTRON_REFRESH_TIMEOUT_MS, 2 * 60 * 60_000);
 });
 
 function unqualifiedWindowsFilesystemAdapter({

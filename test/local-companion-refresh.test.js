@@ -396,7 +396,7 @@ test("refresh controller accepts the bounded Electron cold-index ceiling", () =>
       ...dependencies,
       timeoutMs: LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS + 1,
     }),
-    /1,800,000/u,
+    /7,200,000/u,
   );
 });
 

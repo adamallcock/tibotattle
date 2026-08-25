@@ -2729,6 +2729,16 @@ test("refresh status polling uses one immutable Electron operation deadline", ()
   );
 });
 
+test("Electron renderer leaves a one-minute settlement margin over the two-hour cold-index bound", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  assert.match(
+    appSource,
+    /const ELECTRON_REFRESH_POLLING_WINDOW_MS = 121 \* 60_000;/u,
+  );
+  assert.match(appSource, /two-hour server ceiling/u);
+  assert.doesNotMatch(appSource, /31 \* 60_000/u);
+});
+
 test("cancelRefresh aborts and settles when the cancellation request never resolves", async () => {
   let observedSignal = null;
   const client = new LocalCompanionClient({

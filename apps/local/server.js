@@ -265,8 +265,9 @@ export const LOCAL_COMPANION_ELECTRON_REFRESH_TIMEOUT_MS =
  * Electron starts with its own private app-data root, however, so its first
  * run may need to build the unified index for an existing multi-year Codex
  * history instead of reusing the native macOS application's completed cache.
- * Keep that cold migration bounded, but do not guarantee failure at five
- * minutes after the quick headline has already succeeded.
+ * Keep that cold migration bounded at the Electron-specific two-hour
+ * ceiling, but do not guarantee failure at five minutes after the quick
+ * headline has already succeeded.
  */
 export function defaultLocalCompanionRefreshTimeoutMs(runtime = process) {
   return typeof runtime?.versions?.electron === "string"

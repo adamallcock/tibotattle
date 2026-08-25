@@ -1903,7 +1903,14 @@ function unifiedIndexDegradation(result) {
   return null;
 }
 
-export const LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS = 30 * 60_000;
+// The native/browser default remains five minutes, but Electron can own a
+// private cold index that is materially larger than the native app's already
+// warmed state. The largest measured production-equivalent pass completed in
+// about 50 minutes, so keep a two-hour ceiling: enough recovery margin for a
+// large first ingest while still making a hung refresh fail closed.
+export const LOCAL_COMPANION_ELECTRON_REFRESH_TIMEOUT_MS = 2 * 60 * 60_000;
+export const LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS =
+  LOCAL_COMPANION_ELECTRON_REFRESH_TIMEOUT_MS;
 
 export class LocalCompanionRefreshController {
   #abortController = null;
@@ -1946,7 +1953,7 @@ export class LocalCompanionRefreshController {
     if (!Number.isSafeInteger(timeoutMs)
         || timeoutMs < 1_000
         || timeoutMs > LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS) {
-      throw new TypeError("timeoutMs must be between 1,000 and 1,800,000");
+      throw new TypeError("timeoutMs must be between 1,000 and 7,200,000");
     }
     if (typeof createRefreshId !== "function") {
       throw new TypeError("createRefreshId must be a function");
