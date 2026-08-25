@@ -54,6 +54,9 @@ import {
   createCompanionReadyLineParser,
   parseCompanionReadyLine,
 } from "../ready-line.js";
+import {
+  WINDOWS_QUALIFICATION_REQUIRED_RESOURCE_PATHS,
+} from "../../../src/platform/windows-qualification-mode.js";
 
 const REPOSITORY_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 const require = createRequire(import.meta.url);
@@ -106,45 +109,7 @@ async function withWindowsQualificationFixture(run) {
       source: "unsigned-development-binding",
     },
   })}\n`);
-  const runtimeSourcePaths = [
-    "apps/electron/companion-supervisor.js",
-    "apps/electron/desktop-command.js",
-    "apps/electron/desktop-contract.js",
-    "apps/electron/desktop-deep-links.js",
-    "apps/electron/desktop-controller.js",
-    "apps/electron/desktop-copy.js",
-    "apps/electron/desktop-first-run.js",
-    "apps/electron/desktop-first-run-login.js",
-    "apps/electron/desktop-hosted-signin.js",
-    "apps/electron/desktop-recovery-settings.js",
-    "apps/electron/desktop-ipc.js",
-    "apps/electron/desktop-owned-downloads.js",
-    "apps/electron/desktop-lifecycle.js",
-    "apps/electron/desktop-notification-coordinator.js",
-    "apps/electron/desktop-notification-delivery.js",
-    "apps/electron/desktop-notification-policy.js",
-    "apps/electron/desktop-platform-services.js",
-    "apps/electron/desktop-runtime.js",
-    "apps/electron/desktop-settings-backends.js",
-    "apps/electron/desktop-settings-store.js",
-    "apps/electron/desktop-menu.js",
-    "apps/electron/desktop-tray.js",
-    "apps/electron/desktop-status-monitor.js",
-    "apps/electron/desktop-tray-status.js",
-    "apps/electron/errors.js",
-    "apps/electron/loopback-policy.js",
-    "apps/electron/main.js",
-    "apps/electron/platform-gate.js",
-    "apps/electron/preload.cjs",
-    "apps/electron/recovery-preload.cjs",
-    "apps/electron/recovery-window.js",
-    "apps/electron/ready-line.js",
-    "apps/electron/windows-qualification.js",
-    "src/desktop-shell-status.js",
-    "src/platform/windows-credential-manager-probe.js",
-    "apps/local/server.js",
-    "apps/web/public/index.html",
-  ];
+  const runtimeSourcePaths = [...WINDOWS_QUALIFICATION_REQUIRED_RESOURCE_PATHS];
   const runtimeFiles = [
     ...runtimeSourcePaths.map((path) => {
       const content = Buffer.from(path, "utf8");
