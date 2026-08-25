@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   assertMacAppContract,
   buildClosedReceipt,
+  classifyMacDashboardParityEvidence,
   classifyAutomaticStartupRefreshReceipt,
   ELECTRON_MACOS_SMOKE_FAILURE_REASONS,
   ELECTRON_MACOS_SMOKE_STARTUP_REFRESH_ERROR_CODES,
@@ -60,6 +61,14 @@ test("macOS Electron smoke is an explicit packaged arm64 lane", async () => {
   assert.match(source, /Page\.getFrameTree/u);
   assert.match(source, /localDashboardReady/u);
   assert.match(source, /assertDashboardData/u);
+  assert.match(source, /assertDashboardParitySurfaces/u);
+  assert.match(source, /#accounting-component-counts/u);
+  assert.match(source, /#accounting-component-costs/u);
+  assert.match(source, /#accounting-models/u);
+  assert.match(source, /#cache-reuse-outcome/u);
+  assert.match(source, /#identity-google-signin/u);
+  assert.match(source, /#identity-apple-signin/u);
+  assert.match(source, /no contribution service/u);
   assert.match(source, /failureReason/u);
   assert.match(source, /dashboard_data_unavailable/u);
   assert.match(source, /runSmoke\(appPath, progress\)/u);
@@ -82,10 +91,14 @@ test("macOS Electron smoke is an explicit packaged arm64 lane", async () => {
   assert.match(source, /contentFree: true/u);
   assert.match(source, /qualification: "development-only"/u);
   assert.ok(ELECTRON_MACOS_SMOKE_FAILURE_REASONS.includes("dashboard_data_unavailable"));
+  assert.ok(ELECTRON_MACOS_SMOKE_FAILURE_REASONS.includes("usage_parity_invalid"));
+  assert.ok(ELECTRON_MACOS_SMOKE_FAILURE_REASONS.includes("community_parity_invalid"));
   const chrome = source.indexOf("dashboardReceipt = await assertDashboardShell(cdp)");
   const refresh = source.indexOf("startupReceipt = await assertAutomaticStartupRefresh");
   const data = source.indexOf("...(await assertDashboardData(cdp))");
-  assert.ok(chrome >= 0 && refresh > chrome && data > refresh);
+  const parity = source.indexOf("parityReceipt = await assertDashboardParitySurfaces");
+  const share = source.indexOf("shareReceipt = await assertShareFlow(cdp)");
+  assert.ok(chrome >= 0 && refresh > chrome && data > refresh && parity > data && share > parity);
   const networkEnable = source.indexOf('await cdp.request("Network.enable")');
   const binding = source.indexOf("const refreshBinding = await bindMacSmokeRefreshObserver");
   const release = source.indexOf("await releaseMacSmokeRefreshGate(cdp)");
@@ -337,6 +350,71 @@ test("macOS startup receipt requires one new request and terminal success", () =
   );
 });
 
+test("macOS parity evidence rejects empty Usage rows and hidden legacy Community layout", () => {
+  const health = {
+    capabilities: {
+      contributionDevicePairing: true,
+      incrementalContributionSync: "telemetry-contribution-v1.0",
+    },
+  };
+  const usage = {
+    route: "#accounting",
+    pageVisible: true,
+    periodCount: 4,
+    summaryCardCount: 4,
+    tokenCountRows: 1,
+    costContributionRows: 1,
+    modelIdentityRows: 1,
+    priceCoverage: true,
+    advancedModuleShellCount: 3,
+    advancedModuleAvailableCount: 1,
+    advancedModuleUnavailableCount: 2,
+  };
+  const community = {
+    route: "#community",
+    pageVisible: true,
+    journeyStageCount: 2,
+    indexTerminal: true,
+    googleButton: true,
+    appleButton: true,
+    currentLayout: true,
+    noServiceCopy: false,
+  };
+  assert.deepEqual(
+    classifyMacDashboardParityEvidence({ health, usage, community }),
+    { status: "passed", reason: null },
+  );
+  assert.deepEqual(
+    classifyMacDashboardParityEvidence({
+      health,
+      usage: { ...usage, tokenCountRows: 0, modelIdentityRows: 0 },
+      community,
+    }),
+    { status: "failed", reason: "usage" },
+  );
+  assert.deepEqual(
+    classifyMacDashboardParityEvidence({
+      health,
+      usage,
+      community: { ...community, currentLayout: false },
+    }),
+    { status: "failed", reason: "community" },
+  );
+  assert.deepEqual(
+    classifyMacDashboardParityEvidence({
+      health: {
+        capabilities: {
+          contributionDevicePairing: true,
+          incrementalContributionSync: false,
+        },
+      },
+      usage,
+      community,
+    }),
+    { status: "failed", reason: "community" },
+  );
+});
+
 test("closed macOS receipt is content-free and has no runtime identifiers", () => {
   const receipt = buildClosedReceipt({
     status: "passed",
@@ -349,6 +427,27 @@ test("closed macOS receipt is content-free and has no runtime identifiers", () =
       terminalStatus: "succeeded",
     },
     dashboard: { chrome: true, dataFlow: true, navCount: 5 },
+    parity: {
+      usage: {
+        pageVisible: true,
+        periodCount: 4,
+        summaryCardCount: 4,
+        tokenCountRows: 3,
+        costContributionRows: 2,
+        modelIdentityRows: 1,
+        advancedModuleShells: true,
+        advancedModulesAvailable: 1,
+        advancedModulesUnavailable: 2,
+      },
+      community: {
+        pageVisible: true,
+        serviceConfigured: true,
+        journeyStageCount: 2,
+        currentLayout: true,
+        providerControls: true,
+        indexTerminal: true,
+      },
+    },
     settings: { connected: true, tabCount: 3, tabs: true },
     share: {
       route: "#weekly",
@@ -364,6 +463,13 @@ test("closed macOS receipt is content-free and has no runtime identifiers", () =
   assert.equal(receipt.startupRefresh.requestCount, 1);
   assert.equal(receipt.startupRefresh.terminalStatus, "succeeded");
   assert.equal(receipt.dashboard.dataFlow, true);
+  assert.equal(receipt.parity.usage.summaryCardCount, 4);
+  assert.equal(receipt.parity.usage.advancedModuleShells, true);
+  assert.equal(receipt.parity.usage.tokenCountRows, 3);
+  assert.equal(receipt.parity.usage.advancedModulesAvailable, 1);
+  assert.equal(receipt.parity.usage.advancedModulesUnavailable, 2);
+  assert.equal(receipt.parity.community.serviceConfigured, true);
+  assert.equal(receipt.parity.community.currentLayout, true);
   assert.equal(receipt.settings.connected, true);
   assert.equal(receipt.share.route, "#weekly");
   assert.equal(Object.hasOwn(receipt, "refreshId"), false);

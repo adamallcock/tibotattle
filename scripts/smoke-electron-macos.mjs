@@ -60,6 +60,7 @@ const FAILURE_STAGES = new Set([
   "launch",
   "dashboard",
   "startup_refresh",
+  "parity",
   "share",
   "settings",
   "quit",
@@ -83,6 +84,8 @@ export const ELECTRON_MACOS_SMOKE_FAILURE_REASONS = Object.freeze([
   "startup_refresh_receipt_changed",
   "startup_refresh_failed",
   "startup_refresh_cancelled",
+  "usage_parity_invalid",
+  "community_parity_invalid",
   "share_flow_invalid",
   "settings_flow_invalid",
   "settings_tabs_invalid",
@@ -109,6 +112,8 @@ const FAILURE_REASON_BY_CODE = Object.freeze({
   ELECTRON_MACOS_SMOKE_NON_LOOPBACK_REQUEST: "non_loopback_request",
   ELECTRON_MACOS_SMOKE_EXITED_BEFORE_REFRESH: "startup_refresh_failed",
   ELECTRON_MACOS_SMOKE_EXITED_DURING_REFRESH: "startup_refresh_failed",
+  ELECTRON_MACOS_SMOKE_USAGE_PARITY_INVALID: "usage_parity_invalid",
+  ELECTRON_MACOS_SMOKE_COMMUNITY_PARITY_INVALID: "community_parity_invalid",
   ELECTRON_MACOS_SMOKE_SHARE_FLOW_INVALID: "share_flow_invalid",
   ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID: "settings_flow_invalid",
   ELECTRON_MACOS_SMOKE_SETTINGS_TABS_INVALID: "settings_tabs_invalid",
@@ -134,6 +139,7 @@ const FAILURE_STAGE_DEFAULT_REASONS = Object.freeze({
   launch: "launch_failed",
   dashboard: "runtime_failed",
   startup_refresh: "startup_refresh_failed",
+  parity: "usage_parity_invalid",
   share: "share_flow_invalid",
   settings: "settings_flow_invalid",
   quit: "clean_quit_invalid",
@@ -834,6 +840,153 @@ async function assertDashboardData(cdp) {
   });
 }
 
+function usageParitySnapshotValid(snapshot) {
+  return snapshot?.route === "#accounting"
+    && snapshot?.pageVisible === true
+    && snapshot?.periodCount === 4
+    && snapshot?.summaryCardCount === 4
+    && snapshot?.tokenCountRows >= 1
+    && snapshot?.costContributionRows >= 1
+    && snapshot?.modelIdentityRows >= 1
+    && snapshot?.priceCoverage === true
+    && snapshot?.advancedModuleShellCount === 3
+    && snapshot?.advancedModuleAvailableCount
+      + snapshot?.advancedModuleUnavailableCount === 3;
+}
+
+function communityParitySnapshotValid(snapshot, health) {
+  return health?.capabilities?.contributionDevicePairing === true
+    && health?.capabilities?.incrementalContributionSync
+      === "telemetry-contribution-v1.0"
+    && snapshot?.route === "#community"
+    && snapshot?.pageVisible === true
+    && snapshot?.journeyStageCount === 2
+    && snapshot?.indexTerminal === true
+    && snapshot?.googleButton === true
+    && snapshot?.appleButton === true
+    && snapshot?.currentLayout === true
+    && snapshot?.noServiceCopy === false;
+}
+
+export function classifyMacDashboardParityEvidence({
+  health = {},
+  usage = {},
+  community = {},
+} = {}) {
+  if (!usageParitySnapshotValid(usage)) {
+    return Object.freeze({ status: "failed", reason: "usage" });
+  }
+  if (!communityParitySnapshotValid(community, health)) {
+    return Object.freeze({ status: "failed", reason: "community" });
+  }
+  return Object.freeze({ status: "passed", reason: null });
+}
+
+async function assertDashboardParitySurfaces(cdp, health) {
+
+  const usage = await waitFor(async () => {
+    const snapshot = await cdp.evaluate(`(() => {
+      const visible = ${visible.toString()};
+      document.querySelector('[data-nav="method"]')?.click();
+      const page = document.querySelector('#accounting[data-dashboard-page="method"]');
+      return {
+        route: location.hash,
+        pageVisible: visible(page) && page?.inert !== true,
+        periodCount: document.querySelectorAll('#accounting-period-controls [data-period]').length,
+        summaryCardCount: document.querySelectorAll('#accounting-summary .metric-card').length,
+        tokenCountRows: document.querySelectorAll('#accounting-component-counts .component-row').length,
+        costContributionRows: document.querySelectorAll('#accounting-component-costs .component-row').length,
+        modelIdentityRows: document.querySelectorAll(
+          '#accounting-models > tr > .model-identity:not(.model-component-identity)',
+        ).length,
+        priceCoverage: Boolean(document.querySelector('#accounting-price-coverage')),
+        advancedModuleShellCount: [
+          '#cache-switch-details',
+          '#cache-reuse-outcome',
+          '#cache-continuity-details',
+        ].filter((selector) => Boolean(document.querySelector(selector))).length,
+        advancedModuleAvailableCount: [
+          '#cache-switch-details',
+          '#cache-reuse-outcome',
+          '#cache-continuity-details',
+        ].filter((selector) => visible(document.querySelector(selector))).length,
+        advancedModuleUnavailableCount: [
+          '#cache-switch-details',
+          '#cache-reuse-outcome',
+          '#cache-continuity-details',
+        ].filter((selector) => {
+          const element = document.querySelector(selector);
+          return Boolean(element) && !visible(element);
+        }).length,
+      };
+    })()`);
+    return usageParitySnapshotValid(snapshot) ? snapshot : null;
+  }, MAX_OPERATION_MS, "Usage parity surfaces").catch(() => null);
+  if (usage === null) {
+    fail("ELECTRON_MACOS_SMOKE_USAGE_PARITY_INVALID", "parity");
+  }
+
+  const community = await waitFor(async () => {
+    const snapshot = await cdp.evaluate(`(() => {
+      const visible = ${visible.toString()};
+      document.querySelector('[data-nav="community"]')?.click();
+      const page = document.querySelector('#community[data-dashboard-page="community"]');
+      const pageText = page?.textContent?.toLowerCase() ?? '';
+      return {
+        route: location.hash,
+        pageVisible: visible(page) && page?.inert !== true,
+        journeyStageCount: document.querySelectorAll('#community-journey .journey-stage').length,
+        indexTerminal: document.querySelector('#journey-stage-index')
+          ?.classList?.contains('journey-stage-done') === true,
+        googleButton: visible(document.querySelector('#identity-google-signin')),
+        appleButton: visible(document.querySelector('#identity-apple-signin')),
+        currentLayout: Boolean(document.querySelector('#identity-signin-next'))
+          && visible(document.querySelector('#incremental-consent')),
+        noServiceCopy: pageText.includes('no contribution service'),
+      };
+    })()`);
+    return communityParitySnapshotValid(snapshot, health) ? snapshot : null;
+  }, MAX_OPERATION_MS, "Community parity surfaces").catch(() => null);
+  if (community === null) {
+    fail("ELECTRON_MACOS_SMOKE_COMMUNITY_PARITY_INVALID", "parity");
+  }
+  const classification = classifyMacDashboardParityEvidence({
+    health,
+    usage,
+    community,
+  });
+  if (classification.status !== "passed") {
+    fail(
+      classification.reason === "community"
+        ? "ELECTRON_MACOS_SMOKE_COMMUNITY_PARITY_INVALID"
+        : "ELECTRON_MACOS_SMOKE_USAGE_PARITY_INVALID",
+      "parity",
+    );
+  }
+
+  return Object.freeze({
+    usage: Object.freeze({
+      pageVisible: true,
+      periodCount: usage.periodCount,
+      summaryCardCount: usage.summaryCardCount,
+      tokenCountRows: usage.tokenCountRows,
+      costContributionRows: usage.costContributionRows,
+      modelIdentityRows: usage.modelIdentityRows,
+      advancedModuleShells: true,
+      advancedModulesAvailable: usage.advancedModuleAvailableCount,
+      advancedModulesUnavailable: usage.advancedModuleUnavailableCount,
+    }),
+    community: Object.freeze({
+      pageVisible: true,
+      serviceConfigured: true,
+      journeyStageCount: community.journeyStageCount,
+      currentLayout: true,
+      providerControls: true,
+      indexTerminal: true,
+    }),
+  });
+}
+
 /**
  * Select only the main dashboard page for this smoke's ephemeral server.
  *
@@ -1096,6 +1249,7 @@ function descendantsOf(parentPid) {
 const SMOKE_PROGRESS_KEYS = new Set([
   "dashboard",
   "startupRefresh",
+  "parity",
   "share",
   "settings",
 ]);
@@ -1116,6 +1270,7 @@ export function buildClosedReceipt({
   cleanQuit = false,
   startupRefresh = {},
   dashboard = {},
+  parity = {},
   settings = {},
   share = {},
   failureStage = null,
@@ -1152,6 +1307,43 @@ export function buildClosedReceipt({
       chrome: dashboard.chrome === true,
       dataFlow: dashboard.dataFlow === true,
       navCount: Number.isInteger(dashboard.navCount) ? dashboard.navCount : 0,
+    }),
+    parity: Object.freeze({
+      usage: Object.freeze({
+        pageVisible: parity.usage?.pageVisible === true,
+        periodCount: Number.isInteger(parity.usage?.periodCount)
+          ? parity.usage.periodCount
+          : 0,
+        summaryCardCount: Number.isInteger(parity.usage?.summaryCardCount)
+          ? parity.usage.summaryCardCount
+          : 0,
+        tokenCountRows: Number.isInteger(parity.usage?.tokenCountRows)
+          ? parity.usage.tokenCountRows
+          : 0,
+        costContributionRows: Number.isInteger(parity.usage?.costContributionRows)
+          ? parity.usage.costContributionRows
+          : 0,
+        modelIdentityRows: Number.isInteger(parity.usage?.modelIdentityRows)
+          ? parity.usage.modelIdentityRows
+          : 0,
+        advancedModuleShells: parity.usage?.advancedModuleShells === true,
+        advancedModulesAvailable: Number.isInteger(
+          parity.usage?.advancedModulesAvailable,
+        ) ? parity.usage.advancedModulesAvailable : 0,
+        advancedModulesUnavailable: Number.isInteger(
+          parity.usage?.advancedModulesUnavailable,
+        ) ? parity.usage.advancedModulesUnavailable : 0,
+      }),
+      community: Object.freeze({
+        pageVisible: parity.community?.pageVisible === true,
+        serviceConfigured: parity.community?.serviceConfigured === true,
+        journeyStageCount: Number.isInteger(parity.community?.journeyStageCount)
+          ? parity.community.journeyStageCount
+          : 0,
+        currentLayout: parity.community?.currentLayout === true,
+        providerControls: parity.community?.providerControls === true,
+        indexTerminal: parity.community?.indexTerminal === true,
+      }),
     }),
     settings: Object.freeze({
       connected: settings.connected === true,
@@ -1234,6 +1426,7 @@ async function runSmoke(appPath, progress = {}) {
     : {};
   let dashboardReceipt = {};
   let startupReceipt = {};
+  let parityReceipt = {};
   let settingsReceipt = {};
   let shareReceipt = {};
   let cleanQuit = false;
@@ -1364,6 +1557,10 @@ async function runSmoke(appPath, progress = {}) {
       ...(await assertDashboardData(cdp)),
     });
     recordSmokeProgress(progressRecord, "dashboard", dashboardReceipt);
+    const postRefreshHealth = await jsonFetch(new URL("/api/local/health", dashboardUrl));
+    stage = "parity";
+    parityReceipt = await assertDashboardParitySurfaces(cdp, postRefreshHealth);
+    recordSmokeProgress(progressRecord, "parity", parityReceipt);
     stage = "share";
     shareReceipt = await assertShareFlow(cdp);
     recordSmokeProgress(progressRecord, "share", shareReceipt);
@@ -1408,6 +1605,7 @@ async function runSmoke(appPath, progress = {}) {
       cleanQuit,
       startupRefresh: startupReceipt,
       dashboard: dashboardReceipt,
+      parity: parityReceipt,
       settings: settingsReceipt,
       share: shareReceipt,
     });
@@ -1460,6 +1658,7 @@ if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
         FAILURE_STAGES.has(error?.smokeStage) ? error.smokeStage : "launch",
       ),
       dashboard: progress.dashboard,
+      parity: progress.parity,
       startupRefresh: progress.startupRefresh,
       share: progress.share,
       settings: progress.settings,
