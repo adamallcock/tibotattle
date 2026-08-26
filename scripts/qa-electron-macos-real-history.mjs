@@ -446,6 +446,41 @@ function isExactDashboardTarget(target, debugPort) {
   }
 }
 
+/**
+ * A CDP evaluation can return a perfectly valid-looking object while the
+ * dashboard is still booting.  Keep polling until the renderer has published
+ * the same readiness contract as the macOS smoke: the ready marker, the
+ * product title, a rendered overview heading, and the exact loopback root for
+ * this target.  The location check also prevents a Settings/recovery/hash
+ * navigation from being accepted as the dashboard document.
+ */
+export function realHistoryDashboardReadySnapshotValid(snapshot, expectedOrigin) {
+  if (snapshot === null
+      || typeof snapshot !== "object"
+      || Array.isArray(snapshot)
+      || snapshot.ready !== true
+      || snapshot.title !== "TiboTattle"
+      || typeof snapshot.heading !== "string"
+      || snapshot.heading.trim().length === 0
+      || typeof snapshot.location !== "string"
+      || typeof expectedOrigin !== "string") {
+    return false;
+  }
+  try {
+    const location = new URL(snapshot.location);
+    return location.protocol === "http:"
+      && location.hostname === "127.0.0.1"
+      && location.origin === expectedOrigin
+      && location.pathname === "/"
+      && location.search === ""
+      && location.hash === ""
+      && location.username === ""
+      && location.password === "";
+  } catch {
+    return false;
+  }
+}
+
 class CdpConnection {
   constructor(target) {
     this.socket = new WebSocket(target.webSocketDebuggerUrl);
@@ -851,13 +886,18 @@ async function launchSession({ appPath, codexHomePath, fixture, debugPort }) {
       }
     }, REAL_HISTORY_QA_TIMEOUTS.startupMs, "Electron dashboard binding");
     observer.select({ expectedOrigin: binding.origin, expectedLoaderId: binding.loaderId });
-    const ready = await waitFor(async () => cdp.evaluate(`(() => ({
+    const ready = await waitFor(async () => {
+      const snapshot = await cdp.evaluate(`(() => ({
       ready: document.documentElement?.dataset?.localDashboardReady === "true",
       title: document.title,
       heading: document.querySelector("#overview-title")?.textContent?.trim() ?? "",
       location: location.href,
-    }))()`), REAL_HISTORY_QA_TIMEOUTS.startupMs, "Electron dashboard readiness");
-    if (ready?.ready !== true || typeof ready.location !== "string") {
+    }))()`);
+      return realHistoryDashboardReadySnapshotValid(snapshot, dashboardUrl.origin)
+        ? snapshot
+        : null;
+    }, REAL_HISTORY_QA_TIMEOUTS.startupMs, "Electron dashboard readiness");
+    if (!realHistoryDashboardReadySnapshotValid(ready, dashboardUrl.origin)) {
       fail("REAL_HISTORY_QA_DASHBOARD_UNAVAILABLE", "dashboard", "dashboard_unavailable");
     }
     const readyLoader = await frameLoaderId(cdp);

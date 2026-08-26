@@ -19,6 +19,8 @@ import {
   createControlPlaneObserver,
   createRefreshObserver,
   parseRealHistoryArguments,
+  realHistoryDashboardReadySnapshotValid,
+  waitFor,
   verifyPackagedArtifactIdentity,
   usageParitySnapshotValid,
 } from "../scripts/qa-electron-macos-real-history.mjs";
@@ -107,6 +109,57 @@ test("real-history timeout budgets are finite and bounded", () => {
     assert.ok(value <= 125 * 60_000, `${name} must be bounded`);
   }
   assert.ok(REAL_HISTORY_QA_TIMEOUTS.healthMs <= REAL_HISTORY_QA_TIMEOUTS.operationMs * 2);
+});
+
+test("real-history dashboard readiness retries truthy boot snapshots until the exact root is ready", async () => {
+  const expectedOrigin = "http://127.0.0.1:49299";
+  const snapshots = [
+    {
+      ready: false,
+      title: "TiboTattle",
+      heading: "",
+      location: `${expectedOrigin}/`,
+    },
+    {
+      ready: true,
+      title: "Loading TiboTattle",
+      heading: "Where your allowance stands",
+      location: `${expectedOrigin}/`,
+    },
+    {
+      ready: true,
+      title: "TiboTattle",
+      heading: "Where your allowance stands",
+      location: `${expectedOrigin}/#weekly`,
+    },
+    {
+      ready: true,
+      title: "TiboTattle",
+      heading: "Where your allowance stands",
+      location: `${expectedOrigin}/`,
+    },
+  ];
+  let attempts = 0;
+  const ready = await waitFor(() => {
+    const snapshot = snapshots[Math.min(attempts++, snapshots.length - 1)];
+    return realHistoryDashboardReadySnapshotValid(snapshot, expectedOrigin)
+      ? snapshot
+      : null;
+  }, 2_000, "test dashboard readiness", 1);
+  assert.equal(attempts, 4);
+  assert.deepEqual(ready, snapshots[3]);
+
+  for (const invalid of [
+    { ...snapshots[3], ready: false },
+    { ...snapshots[3], title: "Loading TiboTattle" },
+    { ...snapshots[3], heading: "   " },
+    { ...snapshots[3], location: `${expectedOrigin}/electron-settings.html` },
+    { ...snapshots[3], location: `${expectedOrigin}/?ready=1` },
+    { ...snapshots[3], location: `${expectedOrigin}/#overview` },
+    { ...snapshots[3], location: "http://localhost:49299/" },
+  ]) {
+    assert.equal(realHistoryDashboardReadySnapshotValid(invalid, expectedOrigin), false);
+  }
 });
 
 test("full-history terminal acceptance allows success and only coherent quarantine degradation", () => {
