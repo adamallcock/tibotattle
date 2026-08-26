@@ -104,6 +104,11 @@ test("real-history QA requires explicit isolated inputs and bounded modes", () =
     });
   }
   assert.deepEqual(parseRealHistoryArguments(["--help"]), { help: true });
+  assert.equal(
+    parseRealHistoryArguments(VALID_ARGS.concat(["--receipt", "/tmp/receipt.json"]))
+      .receiptPath,
+    "/tmp/receipt.json",
+  );
 });
 
 test("real-history timeout budgets are finite and bounded", () => {
@@ -776,6 +781,9 @@ test("source contract preserves the real profile and bounds every health poll", 
   assert.match(source, /Promise\.allSettled\(\[/u);
   assert.match(source, /timer: evidence\.timer/u);
   assert.match(source, /controlPlane: evidence\.controlPlane/u);
+  assert.match(source, /cancel: evidence\.cancel/u);
+  assert.match(source, /retry: evidence\.retry/u);
+  assert.match(source, /options\?\.receiptPath/u);
   assert.match(source, /waitForLaunchGate/u);
   assert.match(source, /runLaunchGate/u);
   assert.match(source, /releaseRealHistoryRefreshGate/u);

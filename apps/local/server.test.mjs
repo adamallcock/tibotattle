@@ -3229,7 +3229,7 @@ test("loopback refresh publishes a rollout quarantine as degraded verified cover
   }
 });
 
-test("server exposes an authorized bounded refresh cancellation", async () => {
+test("server exposes an authorized cancellation without rebuilding the dashboard", async () => {
   const files = await fixture();
   const store = fakeStore();
   let observedAbort = false;
@@ -3320,7 +3320,7 @@ test("server exposes an authorized bounded refresh cancellation", async () => {
     assert.equal(observedAbort, true);
     assert.equal(status.refresh.errorCode, "refresh_cancelled");
     assert.equal(status.refresh.progress.status, "bounded_pause");
-    assert.equal(store.reloads, 1);
+    assert.equal(store.reloads, 0);
 
     const duplicateCancel = await fetch(`${base}/api/local/refresh/cancel`, {
       method: "POST",

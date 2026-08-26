@@ -1466,24 +1466,34 @@ async function sampleAdvancingTimer(session) {
 }
 
 async function waitRefreshTerminal(session, expectedRefreshId, timeoutMs) {
-  return waitFor(async () => {
-    if (session.observer.snapshot().length !== 1) {
-      fail("REAL_HISTORY_QA_REFRESH_DUPLICATE", "refresh", "refresh_duplicate");
-    }
-    const status = await refreshStatus(session);
-    const refresh = status?.refresh;
-    if (refresh?.refreshId !== expectedRefreshId) return null;
-    return ["cancelled", "failed", "succeeded", "degraded"].includes(refresh.status)
-      ? refresh
-      : null;
-  }, timeoutMs, "refresh terminal status", 1_000);
+  try {
+    return await waitFor(async () => {
+      if (session.observer.snapshot().length !== 1) {
+        fail("REAL_HISTORY_QA_REFRESH_DUPLICATE", "refresh", "refresh_duplicate");
+      }
+      const status = await refreshStatus(session);
+      const refresh = status?.refresh;
+      if (refresh?.refreshId !== expectedRefreshId) return null;
+      return ["cancelled", "failed", "succeeded", "degraded"].includes(refresh.status)
+        ? refresh
+        : null;
+    }, timeoutMs, "refresh terminal status", 1_000);
+  } catch (error) {
+    if (error?.qaStage) throw error;
+    fail("REAL_HISTORY_QA_CANCEL_WRONG_TERMINAL", "cancel", "cancel_wrong_terminal");
+  }
 }
 
 async function waitUiReleased(session) {
-  return waitFor(async () => {
-    const snapshot = await uiSnapshot(session);
-    return snapshot?.refreshDisabled === false && snapshot?.cancelHidden === true;
-  }, REAL_HISTORY_QA_TIMEOUTS.uiMs, "refresh UI release");
+  try {
+    return await waitFor(async () => {
+      const snapshot = await uiSnapshot(session);
+      return snapshot?.refreshDisabled === false && snapshot?.cancelHidden === true;
+    }, REAL_HISTORY_QA_TIMEOUTS.uiMs, "refresh UI release");
+  } catch (error) {
+    if (error?.qaStage) throw error;
+    fail("REAL_HISTORY_QA_CANCEL_WRONG_TERMINAL", "cancel", "cancel_wrong_terminal");
+  }
 }
 
 async function clickCancel(session) {
@@ -1497,16 +1507,25 @@ async function clickCancel(session) {
 }
 
 async function waitCancelAcknowledged(session) {
-  return waitFor(async () => {
-    const [status, snapshot] = await Promise.all([
-      refreshStatus(session),
-      uiSnapshot(session),
-    ]);
-    return ["cancelling", "cancelled"].includes(status?.refresh?.status)
-      || snapshot?.cancelDisabled === true
-      ? true
-      : null;
-  }, 8_000, "refresh cancellation acknowledgement", 250);
+  try {
+    return await waitFor(async () => {
+      const [status, snapshot] = await Promise.all([
+        refreshStatus(session),
+        uiSnapshot(session),
+      ]);
+      return ["cancelling", "cancelled"].includes(status?.refresh?.status)
+        || snapshot?.cancelDisabled === true
+        ? true
+        : null;
+    }, 8_000, "refresh cancellation acknowledgement", 250);
+  } catch (error) {
+    if (error?.qaStage) throw error;
+    fail(
+      "REAL_HISTORY_QA_CANCEL_NOT_ACKNOWLEDGED",
+      "cancel",
+      "cancel_not_acknowledged",
+    );
+  }
 }
 
 async function runCancelMode(session) {
@@ -1525,6 +1544,8 @@ async function runCancelMode(session) {
   session.controlPlane.reset();
   let timer = {};
   let controlPlane = {};
+  let cancelEvidence = {};
+  let retryEvidence = {};
   try {
     ({ timer, controlPlane } = await sampleTimerAndControlPlaneConcurrently(
       () => sampleAdvancingTimer(session),
@@ -1534,7 +1555,9 @@ async function runCancelMode(session) {
     await clickCancel(session);
     await waitCancelAcknowledged(session);
     const acknowledgedMs = Date.now() - cancelStartedAt;
+    cancelEvidence = { acknowledgedMs };
     const cancelHttp = await waitCancelHttpResponse(session);
+    cancelEvidence = { ...cancelEvidence, http: cancelHttp };
     const firstTerminal = await waitRefreshTerminal(
       session,
       first.refreshId,
@@ -1544,6 +1567,11 @@ async function runCancelMode(session) {
       fail("REAL_HISTORY_QA_CANCEL_WRONG_TERMINAL", "cancel", "cancel_wrong_terminal");
     }
     const terminalMs = Date.now() - cancelStartedAt;
+    cancelEvidence = {
+      ...cancelEvidence,
+      terminalMs,
+      terminalStatus: "cancelled",
+    };
     await waitUiReleased(session);
     session.observer.reset();
     const retryClicked = await session.cdp.evaluate(`(() => {
@@ -1554,19 +1582,26 @@ async function runCancelMode(session) {
     })()`);
     if (retryClicked !== true) fail("REAL_HISTORY_QA_RETRY_REJECTED", "cancel", "retry_rejected");
     session.controlPlane.reset();
-    const retry = await waitFor(async () => {
-      const requests = session.observer.snapshot();
-      if (requests.length > 1) {
-        fail("REAL_HISTORY_QA_REFRESH_DUPLICATE", "cancel", "refresh_duplicate");
-      }
-      if (requests.length !== 1) return null;
-      const status = await refreshStatus(session);
-      return status?.refresh?.status === "running"
-        && typeof status.refresh.refreshId === "string"
-        && status.refresh.refreshId !== first.refreshId
-        ? status.refresh
-        : null;
-    }, REAL_HISTORY_QA_TIMEOUTS.retryMs, "cancel mode retry");
+    let retry;
+    try {
+      retry = await waitFor(async () => {
+        const requests = session.observer.snapshot();
+        if (requests.length > 1) {
+          fail("REAL_HISTORY_QA_REFRESH_DUPLICATE", "cancel", "refresh_duplicate");
+        }
+        if (requests.length !== 1) return null;
+        const status = await refreshStatus(session);
+        return status?.refresh?.status === "running"
+          && typeof status.refresh.refreshId === "string"
+          && status.refresh.refreshId !== first.refreshId
+          ? status.refresh
+          : null;
+      }, REAL_HISTORY_QA_TIMEOUTS.retryMs, "cancel mode retry");
+    } catch (error) {
+      if (error?.qaStage) throw error;
+      fail("REAL_HISTORY_QA_RETRY_REJECTED", "cancel", "retry_rejected");
+    }
+    retryEvidence = { newRefreshId: true, accepted: true };
     await wait(2_000);
     await clickCancel(session);
     await waitCancelAcknowledged(session);
@@ -1579,6 +1614,11 @@ async function runCancelMode(session) {
     if (retryTerminal.status !== "cancelled") {
       fail("REAL_HISTORY_QA_CANCEL_WRONG_TERMINAL", "cancel", "cancel_wrong_terminal");
     }
+    retryEvidence = {
+      ...retryEvidence,
+      terminalStatus: "cancelled",
+      cancelHttp: retryCancelHttp,
+    };
     return Object.freeze({
       timer,
       controlPlane,
@@ -1601,6 +1641,12 @@ async function runCancelMode(session) {
       controlPlane: Object.keys(controlPlane).length > 0
         ? controlPlane
         : samplerEvidence(error, "controlPlane"),
+      cancel: Object.keys(cancelEvidence).length > 0
+        ? cancelEvidence
+        : samplerEvidence(error, "cancel"),
+      retry: Object.keys(retryEvidence).length > 0
+        ? retryEvidence
+        : samplerEvidence(error, "retry"),
     });
     throw error;
   }
@@ -2171,13 +2217,15 @@ if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
       failureReason: failureReason(error),
       timer: evidence.timer,
       controlPlane: evidence.controlPlane,
+      cancel: evidence.cancel,
+      retry: evidence.retry,
       artifactSha256: error?.verifiedArtifactSha256 ?? null,
       artifactIdentityVerified: typeof error?.verifiedArtifactSha256 === "string",
     });
     process.exitCode = 1;
   }
   if (receipt) {
-    await persistReceipt(receipt, options?.receipt ?? null).catch(() => {});
+    await persistReceipt(receipt, options?.receiptPath ?? null).catch(() => {});
     process.stdout.write(`${JSON.stringify(receipt, null, 2)}\n`);
   }
 }

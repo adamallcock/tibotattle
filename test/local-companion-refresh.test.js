@@ -3450,7 +3450,7 @@ test("refresh controller keeps a bounded-pause headline observable after the pas
   assert.equal(reloads, 2);
 });
 
-test("refresh controller cancels bounded work and preserves safe progress", async () => {
+test("refresh controller cancels bounded work without reloading the last-good dashboard", async () => {
   let observedAbort = false;
   let reloads = 0;
   const controller = new LocalCompanionRefreshController({
@@ -3499,7 +3499,7 @@ test("refresh controller cancels bounded work and preserves safe progress", asyn
   assert.equal(status.errorCode, "refresh_cancelled");
   assert.equal(status.progress.status, "bounded_pause");
   assert.equal(status.progress.recordsWritten, 2);
-  assert.equal(reloads, 1);
+  assert.equal(reloads, 0);
   assert.equal(controller.cancel(), false);
 });
 

@@ -2243,11 +2243,11 @@ export class LocalCompanionRefreshController {
       }))
       .then(async (result) => {
         if (this.#cancelRequested) {
-          try {
-            await this.#dataStore.reload({ purpose: "full" });
-          } catch {
-            // Cancellation preserves the last good dashboard snapshot.
-          }
+          // Cancellation must not wait for a full dashboard projection. On a
+          // large history that projection can take tens of seconds, making a
+          // successfully acknowledged Cancel look frozen. The data store
+          // already owns the last verified snapshot; retain it unchanged and
+          // publish the terminal state as soon as bounded work settles.
           this.#state = {
             status: "cancelled",
             refreshId: this.#state.refreshId,
