@@ -1324,7 +1324,17 @@ function renderLocalOnboarding(value) {
   updateLocalActionButtons();
 }
 
-function renderDashboard(data) {
+/**
+ * Render the lightweight dashboard frame.
+ *
+ * A refresh publishes a quick snapshot before the expensive history and
+ * accounting projections finish. Keep that first useful result visible in
+ * Electron without asking the renderer to redraw every chart/table while the
+ * companion is still doing deeper indexing work. The full renderer below
+ * deliberately owns the remaining projections so a quick pass cannot make a
+ * partial payload look like a completed accounting result.
+ */
+function renderDashboardFrame(data) {
   dashboardUnavailableState = null;
   dashboard = data;
   if (data.mode === "demo") {
@@ -1388,6 +1398,20 @@ function renderDashboard(data) {
 
   renderQuotaCards(data);
   renderEvidenceWarnings(data);
+}
+
+function renderQuickResultDashboard(data) {
+  renderDashboardFrame(data);
+  // Pricing includes the current quota-weighted headline and the measured
+  // history-index coverage. It is intentionally kept in the quick pass: it
+  // gives a fresh install something truthful to show while the heavier
+  // timeline, weekly, and model/accounting projections catch up.
+  renderPricing(data);
+  renderCommunityJourney();
+}
+
+function renderDashboard(data) {
+  renderDashboardFrame(data);
   renderPricing(data);
   renderComparison(data);
   // The share card renders inside renderWeekly, from the same history model
@@ -11097,13 +11121,17 @@ function renderDashboardSkeleton() {
   container.append(card);
 }
 
-async function loadQuickResultDashboard() {
+async function loadQuickResultDashboard({ lightweight = false } = {}) {
   const [data, refreshState] = await Promise.all([
     localClient.load(),
     localClient.refreshStatus().catch(() => null),
   ]);
   if (refreshState !== null) observeLocalRootCoverage(refreshState);
-  renderDashboard(data);
+  if (lightweight) {
+    renderQuickResultDashboard(data);
+  } else {
+    renderDashboard(data);
+  }
   if (localOnboarding) renderLocalOnboarding(localOnboarding);
 }
 
@@ -11291,12 +11319,12 @@ async function requestRefresh({ autoContinue = false } = {}) {
     // set until finally, including after the companion confirms cancellation
     // or finishes before the request reaches it.
     if (!["running", "cancelling"].includes(latestOutcome)) return;
+    const elapsed = elapsedLabel();
     if (localRefreshCancelRequested || latestOutcome === "cancelling") {
-      setLocalizedText(button, "localAnalysis.progress.stopping");
+      setLocalizedText(button, "localAnalysis.progress.stopping", { elapsed });
       renderElectronRefreshControl();
       return;
     }
-    const elapsed = elapsedLabel();
     const statusDelayed = lastStatusReceivedMs !== null
       && Date.now() - lastStatusReceivedMs >= 3_000;
     const progress = latestProgress;
@@ -11412,13 +11440,19 @@ async function requestRefresh({ autoContinue = false } = {}) {
         archiveHistoryScanActive = true;
         if (dashboard) renderPricing(dashboard);
       }
-      if (progress?.phase === "quick_result" && !quickResultLoaded) {
+      // The quick snapshot endpoint can return current quota/headline data
+      // before the expensive projections finish. In Electron, render only
+      // that lightweight frame so the user gets a useful result without
+      // rebuilding every chart/table while the companion is still indexing.
+      // Browser/native shells retain their earlier full quick-result behavior.
+      if (progress?.phase === "quick_result"
+          && !quickResultLoaded) {
         try {
-          await loadQuickResultDashboard();
+          await loadQuickResultDashboard({ lightweight: electronRefresh });
           quickResultLoaded = true;
         } catch {
-          // Keep polling. The verified quick snapshot can still be loaded when
-          // deep accounting finishes, and no partial replacement is invented.
+          // Keep polling. The verified snapshot can still be loaded when deep
+          // accounting finishes, and no partial replacement is invented.
         }
       }
       renderRefreshActivity();

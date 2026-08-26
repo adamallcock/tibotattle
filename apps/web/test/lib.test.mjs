@@ -5925,16 +5925,54 @@ test("local analysis exposes quick results and cancel-safe progress", async () =
   assert.match(appSource, /localAnalysis\.progress\.statusDelayed/u);
   assert.match(
     appSource,
+    /progress\?\.phase === "quick_result"\s*&& !quickResultLoaded/u,
+  );
+  assert.match(
+    appSource,
+    /await loadQuickResultDashboard\(\{ lightweight: electronRefresh \}\)/u,
+  );
+  assert.match(appSource, /function renderDashboardFrame\(data\)/u);
+  assert.match(appSource, /function renderQuickResultDashboard\(data\)/u);
+  assert.match(
+    appSource,
     /if \(!\["running", "cancelling"\]\.includes\(latestOutcome\)\) return;/u,
   );
   assert.match(appSource, /clearInterval\(progressTicker\)/u);
   assert.match(localizationSource, /"localAnalysis\.progress\.statusDelayed"/u);
+  assert.match(
+    localizationSource,
+    /"localAnalysis\.progress\.stopping": \["Stopping safely… \{elapsed\}"/u,
+  );
   assert.match(appSource, /localAnalysis\.notice\.cancelledTitle/u);
   assert.match(appSource, /localAnalysis\.notice\.cancelledCopy/u);
   assert.match(appSource, /refresh_resource_limited/u);
   assert.match(appSource, /localAnalysis\.notice\.resourceLimitedTitle/u);
   assert.match(appSource, /localAnalysis\.notice\.resourceLimitedCopy/u);
   assert.match(appSource, /localAnalysis\.notice\.continuationLimitTitle/u);
+});
+
+test("Electron quick results render the useful frame without rebuilding heavy projections", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = appSource.indexOf("function renderQuickResultDashboard(data) {");
+  const end = appSource.indexOf("\n}\n\nfunction renderDashboard(data)", start);
+  assert.ok(start >= 0 && end > start);
+
+  const calls = [];
+  const context = vm.createContext({
+    renderDashboardFrame: () => calls.push("frame"),
+    renderPricing: () => calls.push("pricing"),
+    renderCommunityJourney: () => calls.push("community"),
+  });
+  vm.runInContext(`
+    ${appSource.slice(start, end + 2)}
+    renderQuickResultDashboard({});
+  `, context);
+
+  assert.deepEqual(calls, ["frame", "pricing", "community"]);
+  assert.doesNotMatch(
+    appSource.slice(start, end + 2),
+    /render(?:Comparison|UsageTimeline|Timeline|Weekly|Accounting)\(/u,
+  );
 });
 
 test("local refresh activity keeps elapsed time honest without overwriting terminal state", async () => {
@@ -5993,6 +6031,7 @@ test("local refresh activity keeps elapsed time honest without overwriting termi
   assert.equal(labels[2].key, "localAnalysis.progress.headlineReady");
   assert.equal(labels[2].parameters.elapsed, "1s");
   assert.equal(labels[3].key, "localAnalysis.progress.stopping");
+  assert.equal(labels[3].parameters.elapsed, "1s");
   assert.equal(context.terminalWriteSuppressed, true);
 });
 
