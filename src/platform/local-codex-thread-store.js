@@ -31,6 +31,10 @@ function ownerControlledRegularFile(stats) {
  */
 export async function readCodexSelectedRolloutNames(codexHome) {
   if (typeof codexHome !== "string" || codexHome.length < 1) return null;
+  // Windows cannot establish the owner-only POSIX proof used below. The
+  // SQLite file is only a disambiguating hint, so fail closed and let the
+  // canonical rollout metadata remain the source of truth.
+  if (process.platform === "win32") return null;
   const databaseFile = join(codexHome, "state_5.sqlite");
   let stats;
   try {

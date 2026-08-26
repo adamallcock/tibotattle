@@ -496,6 +496,39 @@ test("state storage rejects a pre-existing non-owner-only database", async () =>
   }
 });
 
+test("Windows quota state rejects forged or missing protected SQLite sessions without opening a path", () => {
+  const calls = [];
+  const forgedSession = {
+    contractVersion: "windows-sqlite-state-session-v1",
+    productionSafe: true,
+    sqliteStateLeaseSafe: true,
+    database: {
+      exec() { calls.push("exec"); },
+      prepare() { calls.push("prepare"); },
+    },
+    close() { calls.push("close"); },
+    abort() { calls.push("abort"); },
+  };
+  assert.throws(
+    () => openClaudeDesktopQuotaState(
+      "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state\\claude-desktop-quota-state-v1.sqlite",
+      {
+        platform: "win32",
+        windowsSqliteStateSession: forgedSession,
+      },
+    ),
+    (error) => error.code === "claude_desktop_quota_state_windows_state_unqualified",
+  );
+  assert.deepEqual(calls, []);
+  assert.throws(
+    () => openClaudeDesktopQuotaState(
+      "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state\\claude-desktop-quota-state-v1.sqlite",
+      { platform: "win32" },
+    ),
+    (error) => error.code === "claude_desktop_quota_state_windows_state_unqualified",
+  );
+});
+
 test("source key is stable and does not encode the home directory", () => {
   assert.equal(claudeDesktopQuotaSourceKey({ secret: SECRET }), claudeDesktopQuotaSourceKey({ secret: SECRET }));
   assert.notEqual(
@@ -555,6 +588,33 @@ test("quota HMAC secret is owner-only, stable, and rejects unsafe replacement", 
   } finally {
     await rm(paths.root, { recursive: true, force: true });
   }
+});
+
+test("Windows quota secret rejects a forged or missing protected store without Node filesystem fallback", async () => {
+  let calls = 0;
+  const forgedStore = {
+    contractVersion: "windows-protected-state-store-v1",
+    rootPath: "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state",
+    productionSafe: true,
+    rootBindingSafe: true,
+    nativeReadBounded: true,
+    ensureProtectedDirectory() { calls += 1; },
+    read() { calls += 1; },
+    create() { calls += 1; },
+  };
+  const secretFile = "C:\\Users\\tester\\AppData\\Local\\TiboTattle\\state\\claude-desktop-quota-state-v1-secret";
+  await assert.rejects(
+    readOrCreateClaudeDesktopQuotaSecret(secretFile, {
+      platform: "win32",
+      windowsProtectedStateStore: forgedStore,
+    }),
+    (error) => error.code === "claude_desktop_quota_refresh_windows_secret_unqualified",
+  );
+  assert.equal(calls, 0);
+  await assert.rejects(
+    readOrCreateClaudeDesktopQuotaSecret(secretFile, { platform: "win32" }),
+    (error) => error.code === "claude_desktop_quota_refresh_windows_secret_unqualified",
+  );
 });
 
 test("a present source with no observations remains unavailable", async () => {

@@ -8,6 +8,10 @@ import {
   deriveExportPseudonym,
   deriveExportPseudonymV2,
 } from "@app-usagemonitor/identity-core";
+import {
+  assertWindowsFilesystemProductionSafe,
+  isWindowsFilesystemAdapter,
+} from "./windows-filesystem.js";
 
 const SECRET_BYTES = 32;
 const BASE64URL_256_PATTERN = /^[A-Za-z0-9_-]{43}$/;
@@ -17,13 +21,16 @@ const ROTATION_CONFIRMATION_ERROR = "Participant secret rotation requires confir
 
 function resolveWindowsFilesystemAdapter(adapter) {
   const selected = adapter ?? null;
-  if (process.platform === "win32"
-      && (selected?.productionSafe !== true || selected?.pathWalkRaceSafe !== true)) {
-    const error = new Error("Windows filesystem production policy is unavailable");
-    error.code = "EXPORT_IDENTITY_WINDOWS_FILESYSTEM_POLICY_UNAVAILABLE";
+  // A missing adapter retains the existing portable/development Node path on
+  // Windows. An explicitly supplied adapter is a privileged boundary: it
+  // must be the module-branded native adapter, safe, and used only on Windows.
+  if (selected === null) return null;
+  if (process.platform !== "win32" || !isWindowsFilesystemAdapter(selected)) {
+    const error = new Error("Windows filesystem adapter is invalid");
+    error.code = "EXPORT_IDENTITY_WINDOWS_FILESYSTEM_ADAPTER_INVALID";
     throw error;
   }
-  return selected;
+  return assertWindowsFilesystemProductionSafe(selected);
 }
 
 function isWindowsFilesystemNotFound(error) {
@@ -413,10 +420,27 @@ async function readOptionalSecret(path, windowsFilesystemAdapter = null) {
 }
 
 async function readRetiredSecretResidue(path, windowsFilesystemAdapter = null) {
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
   try {
-    return { state: "retired_retained", ...(await readSecretFileEventually(path, windowsFilesystemAdapter)) };
+    return { state: "retired_retained", ...(await readSecretFileEventually(path, windowsFilesystem)) };
   } catch (error) {
     if (isWindowsFilesystemNotFound(error)) return { state: "retired_removed", secret: null, identity: null };
+    if (windowsFilesystem) {
+      if (typeof windowsFilesystem.inspectPath !== "function") {
+        const invalid = new Error("Windows filesystem adapter is invalid");
+        invalid.code = "EXPORT_IDENTITY_WINDOWS_FILESYSTEM_ADAPTER_INVALID";
+        throw invalid;
+      }
+      try {
+        windowsFilesystem.inspectPath(path);
+        return { state: "retired_retained_unverified", secret: null, identity: null };
+      } catch (inspectError) {
+        if (isWindowsFilesystemNotFound(inspectError)) {
+          return { state: "retired_removed", secret: null, identity: null };
+        }
+        throw inspectError;
+      }
+    }
     try {
       await lstat(path);
       return { state: "retired_retained_unverified", secret: null, identity: null };

@@ -1,9 +1,9 @@
 import { createServer } from "node:http";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { constants, lstatSync } from "node:fs";
 import { lstat, open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   LOCAL_COMPANION_REPORT_FILES,
@@ -11,6 +11,19 @@ import {
   LocalCompanionDataStore,
   buildLocalCompanionSnapshot,
 } from "../../src/local-companion-data.js";
+import {
+  createLocalContributionSyncQueueContext,
+  createLocalMetadataBundleVerificationContext,
+  createLocalMetadataExportContext,
+  createWindowsPreparedContributionContext,
+  isWindowsPreparedContributionContext,
+} from "../../src/application/index.js";
+import {
+  createLocalContributionPreparationContext,
+} from "../../src/application/local-contribution-preparation.js";
+import {
+  defaultClaudeSettingsFile,
+} from "../../src/claude-callback-lifecycle.js";
 import {
   resolveLocalLegacyReportReadPath,
 } from "../../src/local-legacy-report-storage.js";
@@ -21,9 +34,8 @@ import {
   refreshLocalArchiveAccountingIndex,
 } from "../../src/local-archive-accounting-index.js";
 import {
-  LOCAL_UNIFIED_INDEX_DISCOVERY_LIMITS,
-  ingestLocalUnifiedIndexIncrement,
-} from "../../src/local-unified-index-ingest.js";
+  ingestLocalUnifiedIndexOffMain,
+} from "../../src/local-unified-index-off-main.js";
 import {
   readLocalUnifiedWindowBreakdown,
 } from "../../src/local-unified-window-breakdown.js";
@@ -40,6 +52,10 @@ import {
 import {
   runIncrementalContributionSyncOnce,
 } from "../../src/contribution-incremental-sync.js";
+import { syncPreparedContributionEntryOnce } from "../../src/contribution-device-sync.js";
+import {
+  materializeTelemetryContributions,
+} from "../../src/telemetry-contribution-builder.js";
 import {
   createFastModePreferenceController,
 } from "../../src/fast-mode-preference.js";
@@ -52,6 +68,7 @@ import {
 } from "../../src/codex-speed-baseline.js";
 import { createLocalCentralProxy } from "../../src/local-companion-central-proxy.js";
 import {
+  LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS,
   LocalCompanionRefreshController,
   createDeferredAccountingRebuildRecorder,
   createLocalCollectorRefreshRunner,
@@ -125,6 +142,47 @@ import {
   selectProductionParticipantIdentity,
 } from "../../src/export-identity-production.js";
 import {
+  deriveAccountScopeId,
+  deriveEventOccurrenceId,
+  deriveMarkerOccurrenceId,
+  deriveModelFingerprint,
+  deriveParticipantId,
+  deriveQuotaStateId,
+  deriveSessionScopeId,
+  deriveSnapshotObservationId,
+  randomBundleId,
+  withParticipantSecretLease,
+} from "../../src/export-identity.js";
+import { exportCompatibilityTuple } from "../../src/export-contract.js";
+import { createExportResourceGuard } from "../../src/export-resource-policy.js";
+import { readBoundedJsonLines } from "../../src/bounded-jsonl.js";
+import {
+  createLocalCodexLogPorts,
+  createWindowsFilesystemAdapter,
+  createWindowsCompanionInstanceLeaseContext,
+  createWindowsPreparedArtifactStorageContext,
+  createWindowsReviewPairStorageContext,
+  createWindowsProtectedStateStore,
+  createOwnerOnlyAutomaticContributionStorageContext,
+  createWindowsSqliteStateSession,
+  createWindowsSqliteStateStaging,
+  createLocalContributionSyncQueueStorageContext,
+  isWindowsCompanionInstanceLeaseContext,
+  isWindowsFilesystemAdapter,
+  isWindowsPreparedArtifactStorage,
+  isWindowsPreparedArtifactStorageError,
+  isWindowsReviewPairStorage,
+  isWindowsProtectedStateStore,
+  isWindowsSqliteStateStaging,
+  WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_ARTIFACT_BYTES,
+  sha256Hex,
+  WINDOWS_SQLITE_STATE_SESSION_PRODUCTION_SAFE,
+  createWindowsQualificationModeContext,
+  createWindowsQualificationStateSessionFactory,
+  isWindowsQualificationModeContextFor,
+  withLocalCollectorStateSessionBoundary,
+} from "../../src/platform/index.js";
+import {
   PRODUCT_BRAND,
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../config/product-brand.js";
@@ -149,6 +207,9 @@ import {
   createParticipantSessionCookieBridge,
   participantRelayPathUsesSessionCookie,
 } from "./transport/participant-session-cookie-bridge.js";
+import {
+  projectDesktopShellStatus,
+} from "../../src/desktop-shell-status.js";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const LOCAL_COMPANION_MODULE_FILE = fileURLToPath(import.meta.url);
@@ -195,6 +256,25 @@ const PARTICIPANT_RELAY_TIMEOUT_MS = 15_000;
 // emitting a long `Keep-Alive: timeout=` response header; the pre-warm below is
 // the dependency-free half that removes the measured cold handshake.
 const CENTRAL_PREWARM_TIMEOUT_MS = 10_000;
+export const LOCAL_COMPANION_NODE_REFRESH_TIMEOUT_MS = 5 * 60_000;
+export const LOCAL_COMPANION_ELECTRON_REFRESH_TIMEOUT_MS =
+  LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS;
+
+/**
+ * A native Node companion keeps the established five-minute safety bound.
+ * Electron starts with its own private app-data root, however, so its first
+ * run may need to build the unified index for an existing multi-year Codex
+ * history instead of reusing the native macOS application's completed cache.
+ * Keep that cold migration bounded at the Electron-specific two-hour
+ * ceiling, but do not guarantee failure at five minutes after the quick
+ * headline has already succeeded.
+ */
+export function defaultLocalCompanionRefreshTimeoutMs(runtime = process) {
+  return typeof runtime?.versions?.electron === "string"
+      && runtime.versions.electron.length > 0
+    ? LOCAL_COMPANION_ELECTRON_REFRESH_TIMEOUT_MS
+    : LOCAL_COMPANION_NODE_REFRESH_TIMEOUT_MS;
+}
 
 /**
  * Wrap the outbound central fetch with a startup pre-warm, engaged only for the
@@ -263,6 +343,11 @@ export const LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION =
   "local-contribution-device-disconnect-v0.1";
 const MAX_DIAGNOSTICS_LOG_BYTES = 256 * 1024;
 const DIAGNOSTIC_REFERENCE = /^TT-[0-9A-HJKMNP-TV-Z]{6}$/u;
+const WINDOWS_FILESYSTEM_DEVELOPMENT_ENV =
+  "USAGE_MONITOR_WINDOWS_FILESYSTEM_DEVELOPMENT";
+const WINDOWS_ELECTRON_QUALIFICATION_ENV =
+  "USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION";
+const WINDOWS_ELECTRON_QUALIFICATION_MARKER = "windows-electron-v1";
 // Fixed journey names. Anything else is refused, so no free-form label can
 // ever be written to the log.
 const DIAGNOSTIC_SURFACES = new Set([
@@ -371,6 +456,7 @@ const REPORT_ROUTES = createLocalCompanionReportRoutes(
 );
 
 const API_ROUTES = new Set([
+  "/api/local/desktop-status",
   "/api/local/health",
   "/api/local/diagnostics/contribution",
   "/api/local/diagnostics/note",
@@ -409,6 +495,7 @@ const API_ROUTES = new Set([
 // snapshot is still being built (or even if it fails): readiness, diagnostics,
 // and the separately persisted native Claude quota projection.
 const SNAPSHOT_INDEPENDENT_API_ROUTES = new Set([
+  "/api/local/desktop-status",
   "/api/local/health",
   "/api/local/diagnostics/contribution",
   "/api/local/diagnostics/note",
@@ -2298,12 +2385,14 @@ function preparationErrorStatus(code) {
 }
 
 function configuredHomeDirectory(environment) {
-  const selected = process.platform === "win32"
-    ? environment.USERPROFILE
-    : environment.HOME;
-  if (typeof selected === "string" && selected.length > 0
-      && isAbsolute(selected) && resolve(selected) === selected) {
-    return selected;
+  const key = process.platform === "win32" ? "USERPROFILE" : "HOME";
+  const selected = environment[key];
+  if (selected !== undefined) {
+    if (typeof selected === "string" && selected.length > 0
+        && isAbsolute(selected) && resolve(selected) === selected) {
+      return selected;
+    }
+    throw new TypeError("Home directory is invalid");
   }
   const fallback = homedir();
   if (!isAbsolute(fallback) || resolve(fallback) !== fallback) {
@@ -2343,10 +2432,26 @@ export function resolveClaudeDesktopShadowConfiguration({
       : Object.hasOwn(environment, "CLAUDE_PROJECT_DIRECTORY")
         ? environment.CLAUDE_PROJECT_DIRECTORY
         : fallbackProjectDirectory;
+  const selectedPlatform = process.platform;
+  const shouldResolveConfig = selectedPlatform === "win32" || configCandidate !== undefined;
+  let resolvedConfigDirectory;
+  if (shouldResolveConfig) {
+    try {
+      resolvedConfigDirectory = dirname(defaultClaudeSettingsFile({
+        platform: selectedPlatform,
+        homeDirectory: configuredHomeDirectory(environment),
+        environment,
+        ...(configCandidate === undefined ? {} : { claudeConfigDirectory: configCandidate }),
+      }));
+    } catch (error) {
+      // Preserve the local composition error contract for malformed explicit
+      // provider paths while ensuring no fallback path is selected.
+      if (configCandidate !== undefined) assertLocalAbsolutePath(configCandidate);
+      throw error;
+    }
+  }
   return Object.freeze({
-    claudeConfigDirectory: configCandidate === undefined
-      ? undefined
-      : assertLocalAbsolutePath(configCandidate),
+    claudeConfigDirectory: resolvedConfigDirectory,
     claudeProjectDirectory: assertLocalAbsolutePath(projectCandidate),
   });
 }
@@ -2366,6 +2471,975 @@ export function configuredAccountingSourceMode(environment) {
     );
   }
   return selected;
+}
+
+function windowsFilesystemConfigurationError() {
+  const error = new TypeError("Windows filesystem adapter configuration is invalid");
+  error.code = "USAGE_MONITOR_WINDOWS_FILESYSTEM_INVALID";
+  return error;
+}
+
+function sameWindowsStateRoot(left, right) {
+  if (typeof left !== "string" || typeof right !== "string") return false;
+  try {
+    return win32.normalize(left.replaceAll("/", "\\")).toLowerCase()
+      === win32.normalize(right.replaceAll("/", "\\")).toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+const WINDOWS_REVIEW_DIRECTORY =
+  /^review-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const WINDOWS_REVIEW_PAIR_STORAGE_ROOTS = new WeakMap();
+const WINDOWS_REVIEW_PAIR_STORAGE_BACKENDS = new WeakMap();
+const WINDOWS_METADATA_EXPORT_CONTEXTS = new WeakSet();
+const WINDOWS_METADATA_VERIFICATION_CONTEXTS = new WeakSet();
+const WINDOWS_METADATA_EXPORT_REVIEW_PAIR_STORAGES = new WeakMap();
+const WINDOWS_METADATA_VERIFICATION_REVIEW_PAIR_STORAGES = new WeakMap();
+const WINDOWS_PREPARED_CONTRIBUTION_STORAGES = new WeakMap();
+
+function isWindowsReviewPairStorageForRoot(value, root) {
+  if (!isWindowsReviewPairStorage(value)) return false;
+  try {
+    return sameWindowsStateRoot(
+      WINDOWS_REVIEW_PAIR_STORAGE_ROOTS.get(value),
+      root,
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isWindowsReviewPairStorageForStorage(value, storage) {
+  if (!isWindowsReviewPairStorage(value)
+      || !isWindowsPreparedArtifactStorage(storage)) {
+    return false;
+  }
+  try {
+    return WINDOWS_REVIEW_PAIR_STORAGE_BACKENDS.get(value) === storage;
+  } catch {
+    return false;
+  }
+}
+
+function isWindowsMetadataExportContext(value) {
+  try {
+    return value !== null
+      && typeof value === "object"
+      && WINDOWS_METADATA_EXPORT_CONTEXTS.has(value);
+  } catch {
+    return false;
+  }
+}
+
+function isWindowsMetadataVerificationContext(value) {
+  try {
+    return value !== null
+      && typeof value === "object"
+      && WINDOWS_METADATA_VERIFICATION_CONTEXTS.has(value);
+  } catch {
+    return false;
+  }
+}
+
+function isWindowsMetadataExportContextForReviewPairStorage(
+  value,
+  reviewPairStorage,
+) {
+  if (!isWindowsMetadataExportContext(value)
+      || !isWindowsReviewPairStorage(reviewPairStorage)) {
+    return false;
+  }
+  try {
+    return WINDOWS_METADATA_EXPORT_REVIEW_PAIR_STORAGES.get(value)
+      === reviewPairStorage;
+  } catch {
+    return false;
+  }
+}
+
+function isWindowsMetadataVerificationContextForReviewPairStorage(
+  value,
+  reviewPairStorage,
+) {
+  if (!isWindowsMetadataVerificationContext(value)
+      || !isWindowsReviewPairStorage(reviewPairStorage)) {
+    return false;
+  }
+  try {
+    return WINDOWS_METADATA_VERIFICATION_REVIEW_PAIR_STORAGES.get(value)
+      === reviewPairStorage;
+  } catch {
+    return false;
+  }
+}
+
+function isWindowsPreparedContributionContextForStorage(
+  value,
+  storage,
+) {
+  if (!isWindowsPreparedContributionContext(value)
+      || !isWindowsPreparedArtifactStorage(storage)) {
+    return false;
+  }
+  try {
+    return WINDOWS_PREPARED_CONTRIBUTION_STORAGES.get(value) === storage;
+  } catch {
+    return false;
+  }
+}
+
+const WINDOWS_PREPARATION_STAGING_DIRECTORY =
+  /^\.preparing-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const WINDOWS_PREPARATION_STORAGE_CONTEXTS = new WeakSet();
+
+/**
+ * Remove only abandoned Windows contribution staging directories before a
+ * preparation attempt. The prepared-artifact context deliberately uses
+ * no-clobber publication, so a crash between staged-manifest creation and
+ * publication must not leave a stage file that makes the next recovery pass
+ * fail closed forever. Review-pair files are outside this helper's scope and
+ * remain owned by the metadata storage seam.
+ */
+function recoverWindowsPreparedStagingEvidence({
+  storage,
+  preparedContributionDirectory,
+} = {}) {
+  if (!isWindowsPreparedArtifactStorage(storage)
+      || typeof storage.rootPath !== "string"
+      || typeof preparedContributionDirectory !== "string") {
+    throw new TypeError("Windows prepared staging recovery is invalid");
+  }
+  const root = win32.normalize(storage.rootPath.replaceAll("/", "\\"));
+  const candidate = win32.normalize(
+    preparedContributionDirectory.replaceAll("/", "\\"),
+  );
+  const relative = win32.relative(root, candidate);
+  if (!relative
+      || relative === ".."
+      || relative.startsWith("..\\")
+      || win32.isAbsolute(relative)) {
+    throw new TypeError("Windows prepared staging recovery is invalid");
+  }
+  let entries;
+  try {
+    entries = storage.enumerateDirectory(relative, 256);
+  } catch {
+    throw new Error("Windows prepared staging recovery failed");
+  }
+  if (!Array.isArray(entries)) {
+    throw new Error("Windows prepared staging recovery failed");
+  }
+  for (const entry of entries) {
+    if (!entry?.isDirectory
+        || entry.isReparsePoint !== false
+        || !WINDOWS_PREPARATION_STAGING_DIRECTORY.test(entry.name)) {
+      continue;
+    }
+    const stagingRelative = win32.join(relative, entry.name);
+    let children;
+    try {
+      children = storage.enumerateDirectory(stagingRelative, 256);
+    } catch {
+      throw new Error("Windows prepared staging recovery failed");
+    }
+    if (!Array.isArray(children)
+        || children.some((child) => !child?.isRegularFile
+          || child.isDirectory
+          || child.isReparsePoint !== false)) {
+      throw new Error("Windows prepared staging recovery failed");
+    }
+    try {
+      for (const child of children) {
+        storage.deleteFile(
+          win32.join(stagingRelative, child.name),
+          child.identity,
+        );
+      }
+      storage.removeDirectory(stagingRelative, entry.identity);
+    } catch {
+      throw new Error("Windows prepared staging recovery failed");
+    }
+  }
+}
+
+function windowsPreparationFailure(createError, code) {
+  if (typeof createError !== "function") {
+    throw new TypeError("Windows preparation error factory is invalid");
+  }
+  let error;
+  try {
+    error = createError(code);
+  } catch {
+    throw new TypeError("Windows preparation error factory is invalid");
+  }
+  if (!(error instanceof Error)) {
+    throw new TypeError("Windows preparation error factory is invalid");
+  }
+  throw error;
+}
+
+function windowsPreparedRelativePath(
+  storage,
+  value,
+  createError,
+  code,
+) {
+  if (!isWindowsPreparedArtifactStorage(storage)
+      || typeof value !== "string"
+      || value.length < 1) {
+    windowsPreparationFailure(createError, code);
+  }
+  const root = win32.normalize(storage.rootPath.replaceAll("/", "\\"));
+  const candidate = win32.normalize(value.replaceAll("/", "\\"));
+  const relative = win32.relative(root, candidate);
+  if (!relative
+      || relative === ".."
+      || relative.startsWith("..\\")
+      || win32.isAbsolute(relative)) {
+    windowsPreparationFailure(createError, code);
+  }
+  return relative;
+}
+
+function createWindowsMetadataContexts({
+  reviewPairStorage,
+  stateRoot,
+  environment = process.env,
+  homeDirectory = homedir(),
+} = {}) {
+  if (!isWindowsReviewPairStorage(reviewPairStorage)
+      || !isWindowsReviewPairStorageForRoot(
+        reviewPairStorage,
+        stateRoot,
+      )) {
+    throw windowsFilesystemConfigurationError();
+  }
+  const platformName = () => "windows";
+  let metadataExport;
+  let metadataVerification;
+  try {
+    const codexLogPorts = createLocalCodexLogPorts({
+      environment,
+      homeDirectory,
+    });
+    metadataExport = createLocalMetadataExportContext({
+      clock: () => Date.now(),
+      codexLogPorts,
+      createHash,
+      deriveAccountScopeId,
+      deriveEventOccurrenceId,
+      deriveMarkerOccurrenceId,
+      deriveModelFingerprint,
+      deriveParticipantId,
+      deriveQuotaStateId,
+      deriveSessionScopeId,
+      deriveSnapshotObservationId,
+      exportCompatibilityTuple,
+      platformName,
+      randomBundleId,
+      // The Windows review-pair context accepts the absolute compatibility
+      // paths emitted by the metadata application facade and resolves them
+      // with Windows semantics even when a contract test runs on another OS.
+      resolvePath: win32.resolve,
+      rss: () => process.memoryUsage().rss,
+      sha256Hex,
+      reviewPairStorage,
+      reviewPairStorageValidator: isWindowsReviewPairStorage,
+    });
+    metadataVerification = createLocalMetadataBundleVerificationContext({
+      compatibilityTuple: exportCompatibilityTuple,
+      platformName,
+      reviewPairStorage,
+      reviewPairStorageValidator: isWindowsReviewPairStorage,
+      sha256Hex,
+    });
+  } catch {
+    throw windowsFilesystemConfigurationError();
+  }
+  if (!metadataExport
+      || typeof metadataExport.buildLocalMetadataBundle !== "function"
+      || typeof metadataExport.writeLocalMetadataBundle !== "function"
+      || !metadataVerification
+      || typeof metadataVerification.loadVerifiedLocalMetadataBundleFiles
+        !== "function") {
+    throw windowsFilesystemConfigurationError();
+  }
+  WINDOWS_METADATA_EXPORT_CONTEXTS.add(metadataExport);
+  WINDOWS_METADATA_VERIFICATION_CONTEXTS.add(metadataVerification);
+  WINDOWS_METADATA_EXPORT_REVIEW_PAIR_STORAGES.set(
+    metadataExport,
+    reviewPairStorage,
+  );
+  WINDOWS_METADATA_VERIFICATION_REVIEW_PAIR_STORAGES.set(
+    metadataVerification,
+    reviewPairStorage,
+  );
+  return Object.freeze({
+    metadataExport,
+    metadataVerification,
+  });
+}
+
+function createWindowsContributionPreparationContext({
+  preparationStorage,
+  preparationStorageValidator,
+  stateRoot,
+  codexHome,
+  activityFile,
+  selectIdentity,
+  metadataExport,
+  metadataVerification,
+  materialize,
+  verifyPreparedSet,
+} = {}) {
+  if (!isWindowsContributionPreparationStorage(preparationStorage)
+      || typeof preparationStorageValidator !== "function"
+      || typeof selectIdentity !== "function"
+      || !isWindowsMetadataExportContext(metadataExport)
+      || !isWindowsMetadataVerificationContext(metadataVerification)
+      || typeof materialize !== "function"
+      || typeof verifyPreparedSet !== "function") {
+    throw windowsFilesystemConfigurationError();
+  }
+  try {
+    return createLocalContributionPreparationContext({
+      defaultStateDirectory: () => stateRoot,
+      defaultCodexHome: () => codexHome,
+      defaultActivityFile: () => activityFile,
+      joinPath: win32.join,
+      storage: preparationStorage,
+      storageValidator: preparationStorageValidator,
+      uuid: randomUUID,
+      createResourceGuard: createExportResourceGuard,
+      readActivityMarkers: readBoundedJsonLines,
+      selectIdentity,
+      withIdentityLease: withParticipantSecretLease,
+      buildBundle: metadataExport.buildLocalMetadataBundle,
+      writeBundle: metadataExport.writeLocalMetadataBundle,
+      verifySource: metadataVerification.loadVerifiedLocalMetadataBundleFiles,
+      materialize,
+      verifyPreparedSet,
+    });
+  } catch {
+    throw windowsFilesystemConfigurationError();
+  }
+}
+
+/**
+ * Bind telemetry materialization to the root-bound Windows contribution and
+ * metadata contexts. The caller-supplied contexts have already been proven to
+ * belong to one composition by createPreparedLocalCompanionServer; keeping
+ * the adapter here small makes it impossible for a Windows preparation runner
+ * to fall back to the module-level POSIX source verifier.
+ */
+export function createWindowsContributionMaterializer({
+  preparedContributionContext,
+  windowsPreparedArtifactStorage,
+  windowsReviewPairStorage,
+  windowsMetadataBundleVerificationContext,
+} = {}) {
+  if (!isWindowsPreparedContributionContextForStorage(
+    preparedContributionContext,
+    windowsPreparedArtifactStorage,
+  )
+      || !isWindowsMetadataVerificationContextForReviewPairStorage(
+        windowsMetadataBundleVerificationContext,
+        windowsReviewPairStorage,
+      )
+      || typeof windowsMetadataBundleVerificationContext
+        .loadVerifiedLocalMetadataBundleFiles !== "function") {
+    throw windowsFilesystemConfigurationError();
+  }
+  const loadVerifiedSource =
+    windowsMetadataBundleVerificationContext
+      .loadVerifiedLocalMetadataBundleFiles;
+  return (options = {}) => materializeTelemetryContributions({
+    ...options,
+    preparedContributionContext,
+    isPreparedContributionContext: isWindowsPreparedContributionContext,
+    loadVerifiedSource,
+  });
+}
+
+async function recoverWindowsReviewPairEvidence({
+  storage,
+  reviewPairStorage,
+  reviewArchiveDirectory,
+} = {}) {
+  if (!isWindowsPreparedArtifactStorage(storage)
+      || !isWindowsReviewPairStorageForRoot(
+        reviewPairStorage,
+        storage.rootPath,
+      )
+      || typeof reviewArchiveDirectory !== "string") {
+    throw new Error("Windows review-pair recovery is invalid");
+  }
+  const relative = windowsPreparedRelativePath(
+    storage,
+    reviewArchiveDirectory,
+    () => new Error("Windows review-pair recovery is invalid"),
+    "review_archive_invalid",
+  );
+  let archive;
+  try {
+    archive = storage.inspect(relative);
+  } catch (error) {
+    if (windowsPreparedStorageErrorIsMissing(error)) return;
+    throw new Error("Windows review-pair recovery failed");
+  }
+  if (!archive?.isDirectory || archive.isReparsePoint !== false) {
+    throw new Error("Windows review-pair recovery failed");
+  }
+  let entries;
+  try {
+    entries = storage.enumerateDirectory(relative, 256);
+  } catch {
+    throw new Error("Windows review-pair recovery failed");
+  }
+  if (!Array.isArray(entries)) {
+    throw new Error("Windows review-pair recovery failed");
+  }
+  for (const entry of entries) {
+    if (typeof entry?.name !== "string"
+        || !entry.name.toLowerCase().startsWith("review-")) continue;
+    if (!WINDOWS_REVIEW_DIRECTORY.test(entry.name)
+        || !entry.isDirectory
+        || entry.isReparsePoint !== false) {
+      throw new Error("Windows review-pair recovery failed");
+    }
+    try {
+      await reviewPairStorage.recoverReviewPairTransactions({
+        directory: win32.join(reviewArchiveDirectory, entry.name),
+      });
+    } catch {
+      throw new Error("Windows review-pair recovery failed");
+    }
+  }
+}
+
+function windowsPreparedStorageErrorIsMissing(error) {
+  return isWindowsPreparedArtifactStorageError(error)
+    && typeof error.code === "string"
+    && error.code.endsWith("_missing");
+}
+
+/**
+ * Adapt the root-bound prepared-artifact capability to the directory
+ * lifecycle ports consumed by the application preparation state machine.
+ * Every operation is translated to a root-relative native call; none of the
+ * six ports can reach Node's path-based filesystem implementation.
+ */
+function createWindowsContributionPreparationStorage({ storage }) {
+  if (!isWindowsPreparedArtifactStorage(storage)) {
+    throw windowsFilesystemConfigurationError();
+  }
+  const inspectDirectory = async (path, code, createError) => {
+    const relative = windowsPreparedRelativePath(
+      storage,
+      path,
+      createError,
+      code,
+    );
+    try {
+      const inspected = storage.inspect(relative);
+      if (!inspected?.isDirectory
+          || inspected.isReparsePoint !== false
+          || !inspected.identity) {
+        windowsPreparationFailure(createError, code);
+      }
+      return { relative, inspected };
+    } catch (error) {
+      if (error instanceof Error && error.code?.startsWith(
+        "local-contribution-preparation-",
+      )) {
+        throw error;
+      }
+      if (windowsPreparedStorageErrorIsMissing(error)) return null;
+      windowsPreparationFailure(createError, code);
+    }
+  };
+  const ensureDirectory = async (path, code, createError, allowExisting) => {
+    const selected = await inspectDirectory(path, code, createError);
+    if (selected !== null && !allowExisting) {
+      windowsPreparationFailure(createError, code);
+    }
+    const relative = selected?.relative
+      ?? windowsPreparedRelativePath(storage, path, createError, code);
+    try {
+      storage.ensureDirectory(relative);
+    } catch {
+      windowsPreparationFailure(createError, code);
+    }
+    return path;
+  };
+  const context = Object.freeze({
+    assertPathAbsent: async (path, code, createError) => {
+      const selected = await inspectDirectory(path, code, createError);
+      if (selected !== null) windowsPreparationFailure(createError, code);
+    },
+    createOwnerOnlyDirectory: (path, code, createError) => ensureDirectory(
+      path,
+      code,
+      createError,
+      false,
+    ),
+    ownerOnlyDirectoryExists: async (path, code, createError) => (
+      (await inspectDirectory(path, code, createError)) !== null
+    ),
+    prepareOwnerOnlyDirectory: (path, code, createError) => ensureDirectory(
+      path,
+      code,
+      createError,
+      true,
+    ),
+    removeEmptyOwnerOnlyDirectory: async (
+      path,
+      parentDirectory,
+      createError,
+    ) => {
+      const selected = await inspectDirectory(
+        path,
+        "preparation_failed",
+        createError,
+      );
+      if (selected === null) return;
+      let entries;
+      try {
+        entries = storage.enumerateDirectory(selected.relative, 256);
+      } catch {
+        // Cleanup is deliberately best-effort; the outer recovery pass will
+        // inspect the same staging directory before the next attempt.
+        return;
+      }
+      if (!Array.isArray(entries) || entries.length !== 0) return;
+      try {
+        storage.removeDirectory(selected.relative, selected.inspected.identity);
+      } catch {
+        // Preserve the original preparation error and leave evidence for the
+        // next guarded recovery pass.
+      }
+    },
+    renameDirectory: async (source, target) => {
+      const sourceRelative = windowsPreparedRelativePath(
+        storage,
+        source,
+        () => new Error("Windows prepared directory rename failed"),
+        "preparation_failed",
+      );
+      const targetRelative = windowsPreparedRelativePath(
+        storage,
+        target,
+        () => new Error("Windows prepared directory rename failed"),
+        "preparation_failed",
+      );
+      let inspected;
+      try {
+        inspected = storage.inspect(sourceRelative);
+        if (!inspected?.isDirectory || inspected.isReparsePoint !== false) {
+          throw new Error("Windows prepared directory rename failed");
+        }
+        storage.renameDirectory(
+          sourceRelative,
+          inspected.identity,
+          targetRelative,
+        );
+      } catch {
+        throw new Error("Windows prepared directory rename failed");
+      }
+      return target;
+    },
+    syncDirectory: async (path) => {
+      const relative = windowsPreparedRelativePath(
+        storage,
+        path,
+        () => new Error("Windows prepared directory sync failed"),
+        "preparation_failed",
+      );
+      // Current native prepared operations are synchronous and perform their
+      // own handle-bound flush. If a future reviewed context exposes an
+      // explicit directory sync port, prefer it without changing the
+      // application contract.
+      if (typeof storage.syncDirectory === "function") {
+        storage.syncDirectory(relative);
+      } else {
+        storage.ensureDirectory(relative);
+      }
+    },
+  });
+  WINDOWS_PREPARATION_STORAGE_CONTEXTS.add(context);
+  return context;
+}
+
+function isWindowsContributionPreparationStorage(value) {
+  try {
+    return value !== null
+      && typeof value === "object"
+      && WINDOWS_PREPARATION_STORAGE_CONTEXTS.has(value);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Select the single Windows filesystem boundary owned by this composition
+ * root. Packaged Windows starts by loading the repository-owned adapter;
+ * callers may explicitly select the existing no-adapter development path with
+ * USAGE_MONITOR_WINDOWS_FILESYSTEM_DEVELOPMENT=1.
+ * Non-null injected values must be branded by the platform module, which
+ * rejects copied or shape-compatible virtual backends.
+ */
+export function loadCompanionWindowsFilesystemAdapter({
+  platform = process.platform,
+  architecture = process.arch,
+  environment = process.env,
+  windowsFilesystemAdapter = undefined,
+  createAdapter = createWindowsFilesystemAdapter,
+} = {}) {
+  if (!environment || typeof environment !== "object"
+      || Array.isArray(environment)
+      || (platform === "win32" && typeof createAdapter !== "function")) {
+    throw windowsFilesystemConfigurationError();
+  }
+  const supplied = windowsFilesystemAdapter !== undefined;
+  if (platform !== "win32") {
+    if (supplied && windowsFilesystemAdapter !== null) {
+      throw windowsFilesystemConfigurationError();
+    }
+    return null;
+  }
+  if (supplied) {
+    if (windowsFilesystemAdapter === null) {
+      if (environment[WINDOWS_FILESYSTEM_DEVELOPMENT_ENV] !== "1") {
+        throw windowsFilesystemConfigurationError();
+      }
+      return null;
+    }
+    if (!isWindowsFilesystemAdapter(windowsFilesystemAdapter)) {
+      throw windowsFilesystemConfigurationError();
+    }
+    return windowsFilesystemAdapter;
+  }
+  if (environment[WINDOWS_FILESYSTEM_DEVELOPMENT_ENV] === "1") return null;
+  let adapter;
+  try {
+    adapter = createAdapter({ platform, architecture });
+  } catch {
+    // Keep native loader details and paths out of the process boundary. The
+    // caller fails before the private state root can be created.
+    throw windowsFilesystemConfigurationError();
+  }
+  if (!isWindowsFilesystemAdapter(adapter)) {
+    throw windowsFilesystemConfigurationError();
+  }
+  return adapter;
+}
+
+/**
+ * Compose every Windows-owned state consumer from the one branded adapter.
+ *
+ * This is intentionally a qualification-only composition on the current
+ * tree: the protected store and SQLite session still report their readiness
+ * flags as false.  The returned factories nevertheless fail closed before
+ * ordinary Node filesystem/DatabaseSync work when called on Windows, while
+ * macOS/Linux continue using their existing static queue and POSIX stores.
+ * A non-Windows caller may use the `platform: "win32"` option for contract
+ * tests; that path never promotes either readiness flag.
+ */
+export function createCompanionWindowsStateComposition({
+  platform = process.platform,
+  architecture = process.arch,
+  resourceRoot = null,
+  stateRoot,
+  windowsFilesystemAdapter = null,
+  windowsQualificationModeContext = null,
+  environment = process.env,
+  homeDirectory = homedir(),
+} = {}) {
+  if (windowsFilesystemAdapter === null) {
+    if (windowsQualificationModeContext !== null) {
+      throw windowsFilesystemConfigurationError();
+    }
+    return Object.freeze({
+      protectedStateStore: null,
+      sqliteStateSessionFactory: null,
+      sqliteStateSessionForPath: null,
+      sqliteStateStaging: null,
+      contributionSyncQueue: null,
+      windowsCompanionInstanceLease: null,
+      preparedArtifactStorage: null,
+      preparedContributionContext: null,
+      windowsPreparedArtifactStorage: null,
+      windowsPreparedContributionContext: null,
+      windowsReviewPairStorage: null,
+      reviewPairStorage: null,
+      windowsMetadataExportContext: null,
+      windowsMetadataBundleVerificationContext: null,
+    });
+  }
+  if (platform !== "win32"
+      || typeof architecture !== "string"
+      || architecture.length < 1
+      || !isWindowsFilesystemAdapter(windowsFilesystemAdapter)) {
+    throw windowsFilesystemConfigurationError();
+  }
+  // The qualification context is a capability, not configuration.  Validate
+  // it against the exact branded adapter and canonical state root before it
+  // is threaded into either of the two qualification-only state consumers.
+  // Hostile/copy-shaped values are treated as absent and therefore remain
+  // behind the normal Windows readiness stop below.
+  let windowsQualificationModeActive = false;
+  try {
+    windowsQualificationModeActive = process.platform === "win32"
+      && isWindowsQualificationModeContextFor(
+        {
+          context: windowsQualificationModeContext,
+          adapter: windowsFilesystemAdapter,
+          stateRoot,
+          resourceRoot,
+        },
+      ) === true;
+  } catch {
+    windowsQualificationModeActive = false;
+  }
+  const authenticWindowsQualificationModeContext =
+    windowsQualificationModeActive
+      ? windowsQualificationModeContext
+      : null;
+  let preparedArtifactStorage;
+  try {
+    preparedArtifactStorage = createWindowsPreparedArtifactStorageContext({
+      adapter: windowsFilesystemAdapter,
+      // The shared root context must admit the larger reviewed metadata pair
+      // (34 MiB), while the Windows prepared-contribution application facade
+      // still enforces its narrower per-contribution limit on every payload.
+      maximumFileBytes:
+        WINDOWS_PREPARED_ARTIFACT_STORAGE_MAXIMUM_ARTIFACT_BYTES,
+      rootPath: stateRoot,
+    });
+  } catch {
+    // The native context is the only authority allowed to touch prepared
+    // contribution state.  Collapse its native details before the companion
+    // composition can expose any state-path information.
+    throw windowsFilesystemConfigurationError();
+  }
+  if (!isWindowsPreparedArtifactStorage(preparedArtifactStorage)
+      || !sameWindowsStateRoot(preparedArtifactStorage.rootPath, stateRoot)) {
+    throw windowsFilesystemConfigurationError();
+  }
+  let preparedContributionContext;
+  try {
+    preparedContributionContext = createWindowsPreparedContributionContext({
+      storage: preparedArtifactStorage,
+      isStorage: isWindowsPreparedArtifactStorage,
+      isStorageError: isWindowsPreparedArtifactStorageError,
+    });
+  } catch {
+    throw windowsFilesystemConfigurationError();
+  }
+  if (!isWindowsPreparedContributionContext(preparedContributionContext)
+      || !sameWindowsStateRoot(
+        preparedContributionContext.rootPath,
+        preparedArtifactStorage.rootPath,
+      )) {
+    throw windowsFilesystemConfigurationError();
+  }
+  WINDOWS_PREPARED_CONTRIBUTION_STORAGES.set(
+    preparedContributionContext,
+    preparedArtifactStorage,
+  );
+  let windowsReviewPairStorage;
+  try {
+    windowsReviewPairStorage = createWindowsReviewPairStorageContext({
+      platform,
+      storage: preparedArtifactStorage,
+    });
+  } catch {
+    throw windowsFilesystemConfigurationError();
+  }
+  if (!isWindowsReviewPairStorage(windowsReviewPairStorage)) {
+    throw windowsFilesystemConfigurationError();
+  }
+  WINDOWS_REVIEW_PAIR_STORAGE_ROOTS.set(
+    windowsReviewPairStorage,
+    preparedArtifactStorage.rootPath,
+  );
+  WINDOWS_REVIEW_PAIR_STORAGE_BACKENDS.set(
+    windowsReviewPairStorage,
+    preparedArtifactStorage,
+  );
+  if (!isWindowsReviewPairStorageForRoot(
+    windowsReviewPairStorage,
+    preparedArtifactStorage.rootPath,
+  )) {
+    throw windowsFilesystemConfigurationError();
+  }
+  let windowsMetadataContexts;
+  try {
+    windowsMetadataContexts = createWindowsMetadataContexts({
+      environment,
+      homeDirectory,
+      reviewPairStorage: windowsReviewPairStorage,
+      stateRoot: preparedArtifactStorage.rootPath,
+    });
+  } catch {
+    throw windowsFilesystemConfigurationError();
+  }
+  let protectedStateStore;
+  try {
+    protectedStateStore = createWindowsProtectedStateStore({
+      adapter: windowsFilesystemAdapter,
+      rootPath: stateRoot,
+      windowsQualificationModeContext:
+        authenticWindowsQualificationModeContext,
+      resourceRoot,
+    });
+  } catch {
+    throw windowsFilesystemConfigurationError();
+  }
+  let sqliteStateStaging;
+  try {
+    sqliteStateStaging = createWindowsSqliteStateStaging({
+      adapter: windowsFilesystemAdapter,
+      rootPath: stateRoot,
+      windowsQualificationModeContext:
+        authenticWindowsQualificationModeContext,
+      resourceRoot,
+    });
+  } catch {
+    throw windowsFilesystemConfigurationError();
+  }
+  let windowsCompanionInstanceLease;
+  try {
+    windowsCompanionInstanceLease = createWindowsCompanionInstanceLeaseContext({
+      platform,
+      architecture,
+      adapter: windowsFilesystemAdapter,
+    });
+  } catch {
+    throw windowsFilesystemConfigurationError();
+  }
+  // The current store/session readiness facts are deliberately false.  A
+  // native Windows process must stop here rather than construct the rest of
+  // the companion, while a macOS contract test may still inspect the routing
+  // and the unqualified flags without promoting them.
+  if (process.platform === "win32"
+      && (protectedStateStore.productionSafe !== true
+        || protectedStateStore.rootBindingSafe !== true
+        || protectedStateStore.nativeReadBounded !== true
+        || WINDOWS_SQLITE_STATE_SESSION_PRODUCTION_SAFE !== true)
+      && !windowsQualificationModeActive) {
+    throw windowsFilesystemConfigurationError();
+  }
+  let sqliteStateSessionFactory;
+  if (authenticWindowsQualificationModeContext !== null) {
+    try {
+      sqliteStateSessionFactory = createWindowsQualificationStateSessionFactory({
+        platform,
+        architecture,
+        windowsFilesystemAdapter,
+        windowsQualificationModeContext: authenticWindowsQualificationModeContext,
+        stateRoot,
+        resourceRoot,
+      });
+    } catch {
+      throw windowsFilesystemConfigurationError();
+    }
+  } else {
+    // Production/null qualification context behavior remains unchanged. The
+    // native process cannot inject a DatabaseSync replacement; non-Windows
+    // contract tests may continue to supply their explicit test double.
+    sqliteStateSessionFactory = (options = {}) => {
+      if (!options || typeof options !== "object" || Array.isArray(options)) {
+        throw windowsFilesystemConfigurationError();
+      }
+      const {
+        databaseFactory = null,
+        windowsQualificationModeContext: requestedQualificationContext,
+        windowsQualificationResourceRoot: requestedQualificationResourceRoot,
+        ...sessionOptions
+      } = options;
+      if (requestedQualificationContext !== undefined
+          && requestedQualificationContext !== null) {
+        throw windowsFilesystemConfigurationError();
+      }
+      return createWindowsSqliteStateSession({
+        ...sessionOptions,
+        platform,
+        architecture,
+        adapter: windowsFilesystemAdapter,
+        windowsQualificationModeContext: null,
+        windowsQualificationResourceRoot:
+          requestedQualificationResourceRoot === undefined
+            ? resourceRoot
+            : requestedQualificationResourceRoot,
+        ...(process.platform === "win32" || databaseFactory === null
+          ? {}
+          : { databaseFactory }),
+      });
+    };
+  }
+  const sqliteStateSessionForPath = (path) => {
+    if (typeof path !== "string" || path.length < 1) {
+      throw windowsFilesystemConfigurationError();
+    }
+    const selected = win32.normalize(path.replaceAll("/", "\\"));
+    return sqliteStateSessionFactory({
+      rootPath: win32.dirname(selected),
+      databaseName: win32.basename(selected),
+      windowsQualificationModeContext:
+        authenticWindowsQualificationModeContext,
+    });
+  };
+  let contributionSyncQueue;
+  try {
+    contributionSyncQueue = createLocalContributionSyncQueueContext({
+      createStorage: createLocalContributionSyncQueueStorageContext,
+      resolvePath: resolve,
+      // Keep these explicit even though the branded application context is
+      // also supplied below.  This makes the Windows selection visible at the
+      // composition boundary and prevents a future queue refactor from
+      // silently falling back to the module-level POSIX verifier.
+      verifyPreparedSet:
+        preparedContributionContext.verifyPreparedContributionSet,
+      loadPreparedContribution:
+        preparedContributionContext.loadVerifiedPreparedContribution,
+      syncPreparedEntry: syncPreparedContributionEntryOnce,
+      platform,
+      windowsSqliteStateSessionFactory: sqliteStateSessionFactory,
+      windowsPreparedArtifactStorage: preparedArtifactStorage,
+      windowsPreparedContributionContext: preparedContributionContext,
+      isWindowsPreparedContributionContext,
+      windowsSyncPreparedEntry: (options = {}) => (
+        syncPreparedContributionEntryOnce({
+          ...options,
+          platform,
+          loadContribution:
+            preparedContributionContext.loadVerifiedPreparedContribution,
+        })
+      ),
+    });
+  } catch {
+    throw windowsFilesystemConfigurationError();
+  }
+  return Object.freeze({
+    protectedStateStore,
+    sqliteStateSessionFactory,
+    sqliteStateSessionForPath,
+    sqliteStateStaging,
+    contributionSyncQueue,
+    windowsCompanionInstanceLease,
+    preparedArtifactStorage,
+    preparedContributionContext,
+    windowsPreparedArtifactStorage: preparedArtifactStorage,
+    windowsPreparedContributionContext: preparedContributionContext,
+    windowsReviewPairStorage,
+    reviewPairStorage: windowsReviewPairStorage,
+    windowsMetadataExportContext: windowsMetadataContexts.metadataExport,
+    windowsMetadataBundleVerificationContext:
+      windowsMetadataContexts.metadataVerification,
+  });
 }
 
 function parentWatchdogConfigurationError() {
@@ -2624,30 +3698,86 @@ export function createLocalCompanionServer(options = {}) {
       homeDirectory,
       environment,
     });
+  const windowsFilesystemAdapter = loadCompanionWindowsFilesystemAdapter({
+    platform: process.platform,
+    architecture: process.arch,
+    environment,
+    windowsFilesystemAdapter: Object.hasOwn(options, "windowsFilesystemAdapter")
+      ? options.windowsFilesystemAdapter
+      : undefined,
+    createAdapter: options.createWindowsFilesystemAdapter
+      ?? createWindowsFilesystemAdapter,
+  });
+  const codexRootConfiguration = configuredCodexRoots({
+    options,
+    environment,
+    homeDirectory,
+  });
+  const codexHome = codexRootConfiguration.primaryCodexHome;
+  // The packaged Electron parent cannot transfer its process-local
+  // qualification context over the child boundary. Recreate the exact
+  // child-local capability from the allowlisted marker/lane and the branded
+  // native adapter before installation root validation. The platform module
+  // binds it to the disposable roots, resource manifest and x64 Windows
+  // boundary; absent, copied, or mismatched contexts remain closed.
+  const windowsQualificationModeContext =
+    process.platform === "win32"
+      && environment[WINDOWS_ELECTRON_QUALIFICATION_ENV]
+        === WINDOWS_ELECTRON_QUALIFICATION_MARKER
+      ? createWindowsQualificationModeContext({
+        platform: process.platform,
+        architecture: process.arch,
+        environment,
+        adapter: windowsFilesystemAdapter,
+        resourceRoot,
+        codexHome,
+        ...(Object.hasOwn(options, "claudeConfigDirectory")
+          ? { claudeConfigDirectory: options.claudeConfigDirectory }
+          : {}),
+        stateRoot,
+      })
+      : null;
   const installation = prepareLocalInstallationRoots({
     resourceRoot,
     stateRoot,
+    windowsFilesystemAdapter,
+    windowsQualificationModeContext,
+  });
+  const windowsStateComposition = createCompanionWindowsStateComposition({
+    platform: process.platform,
+    architecture: process.arch,
+    resourceRoot: installation.resourceRoot,
+    stateRoot: installation.stateRoot,
+    windowsFilesystemAdapter,
+    windowsQualificationModeContext,
+    environment,
+    homeDirectory,
   });
   const staticRoot = assertLocalResourceDirectory(
     installation.resourceRoot,
     options.staticRoot
       ?? resolve(installation.resourceRoot, "apps", "web", "public"),
   );
-  const codexRootConfiguration = configuredCodexRoots({
-    options,
-    environment,
-    homeDirectory,
-  });
   const contributionQueueFile = assertLocalStatePath(
     installation.stateRoot,
     options.contributionQueueFile
       ?? environment.USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE
       ?? installation.paths.contributionQueueFile,
+    {
+      windowsFilesystemAdapter,
+      windowsQualificationModeContext,
+      windowsQualificationResourceRoot: installation.resourceRoot,
+    },
   );
   const diagnosticsLogFile = assertLocalStatePath(
     installation.stateRoot,
     options.diagnosticsLogFile
       ?? join(installation.stateRoot, DIAGNOSTICS_LOG_FILE_NAME),
+    {
+      windowsFilesystemAdapter,
+      windowsQualificationModeContext,
+      windowsQualificationResourceRoot: installation.resourceRoot,
+    },
   );
   const legacyContributionDeviceStateCandidate = Object.hasOwn(
     options,
@@ -2678,7 +3808,11 @@ export function createLocalCompanionServer(options = {}) {
       : installation.paths.preparedSpoolDirectory;
   const preparedContributionDirectory = preparedCandidate === null
     ? null
-    : assertLocalStatePath(installation.stateRoot, preparedCandidate);
+    : assertLocalStatePath(installation.stateRoot, preparedCandidate, {
+      windowsFilesystemAdapter,
+      windowsQualificationModeContext,
+      windowsQualificationResourceRoot: installation.resourceRoot,
+    });
   const contributionPreparationOptions =
     options.contributionPreparationOptions ?? {};
   if (!contributionPreparationOptions
@@ -2702,11 +3836,21 @@ export function createLocalCompanionServer(options = {}) {
       installation.stateRoot,
       contributionPreparationOptions.activityFile
         ?? installation.paths.activityMarkersFile,
+      {
+        windowsFilesystemAdapter,
+        windowsQualificationModeContext,
+        windowsQualificationResourceRoot: installation.resourceRoot,
+      },
     ),
     reviewArchiveDirectory: assertLocalStatePath(
       installation.stateRoot,
       contributionPreparationOptions.reviewArchiveDirectory
         ?? installation.paths.reviewArchiveDirectory,
+      {
+        windowsFilesystemAdapter,
+        windowsQualificationModeContext,
+        windowsQualificationResourceRoot: installation.resourceRoot,
+      },
     ),
   };
   return createPreparedLocalCompanionServer({
@@ -2726,95 +3870,76 @@ export function createLocalCompanionServer(options = {}) {
     legacyContributionDeviceStateFile,
     preparedContributionDirectory,
     contributionPreparationOptions: selectedPreparationOptions,
+    windowsFilesystemAdapter,
+    windowsQualificationModeContext,
+    windowsProtectedStateStore: windowsStateComposition.protectedStateStore,
+    windowsSqliteStateSessionFactory:
+      windowsStateComposition.sqliteStateSessionFactory,
+    windowsSqliteStateSessionForPath:
+      windowsStateComposition.sqliteStateSessionForPath,
+    windowsSqliteStateStaging: windowsStateComposition.sqliteStateStaging,
+    contributionSyncQueueContext: windowsStateComposition.contributionSyncQueue,
+    windowsCompanionInstanceLease:
+      windowsStateComposition.windowsCompanionInstanceLease,
+    windowsPreparedArtifactStorage:
+      windowsStateComposition.preparedArtifactStorage,
+    windowsPreparedContributionContext:
+      windowsStateComposition.preparedContributionContext,
+    windowsReviewPairStorage:
+      windowsStateComposition.windowsReviewPairStorage,
+    windowsMetadataExportContext:
+      windowsStateComposition.windowsMetadataExportContext,
+    windowsMetadataBundleVerificationContext:
+      windowsStateComposition.windowsMetadataBundleVerificationContext,
     parentWatchdogPid,
     homeDirectory,
     ...claudeShadowConfiguration,
   });
 }
 
-function createPreparedLocalCompanionServer({
+export function createPreparedLocalCompanionServer({
   environment,
   resourceRoot,
   stateRoot,
   statePaths,
   staticRoot,
-  codexHome,
-  codexHomes,
-  primaryCodexHome,
-  customCodexHomesConfigured,
+  codexHome = null,
+  codexHomes = null,
+  primaryCodexHome = null,
+  customCodexHomesConfigured = false,
   homeDirectory,
   claudeConfigDirectory,
   claudeProjectDirectory,
   diagnosticsLogFile,
+  windowsFilesystemAdapter = null,
+  windowsQualificationModeContext = null,
+  windowsProtectedStateStore = null,
+  windowsSqliteStateSessionFactory = null,
+  windowsSqliteStateSessionForPath = null,
+  windowsSqliteStateStaging = null,
+  contributionSyncQueueContext = null,
+  windowsCompanionInstanceLease = null,
+  windowsPreparedArtifactStorage = null,
+  windowsPreparedContributionContext = null,
+  windowsReviewPairStorage = null,
+  windowsMetadataExportContext = null,
+  windowsMetadataBundleVerificationContext = null,
   parentWatchdogPid,
   // Explicit reversible authority switch. Unified is the normal authority;
   // legacy is retained only for an explicit rollback selection.
   accountingSourceMode =
     configuredAccountingSourceMode(environment),
-  fastModePreference = createFastModePreferenceController({
-    settingsFile: statePaths.fastModePreferenceFile,
-  }),
+  fastModePreference,
   // The declared Codex speed-mode baseline. Codex records the mode only when
   // it is applied or changed, never at session start, so the baseline lives
   // nowhere but the configuration's top-level `service_tier` key - and only
   // that key is ever read from that file. Each reading is stamped with the
   // moment it happened and attributes only turns from then on.
-  codexSpeedBaseline = createCodexSpeedBaselineController({
-    ledgerFile: statePaths.codexSpeedBaselineFile,
-    configFile: join(primaryCodexHome, "config.toml"),
-  }),
   // Programmatic test seam for the development-only side-chat estimate. The
   // production default remains owned by buildLocalCompanionSnapshot.
   sideChatEstimateCollector = null,
-  dataStore = new LocalCompanionDataStore({
-    builder: async ({ purpose = "full" } = {}) => buildLocalCompanionSnapshot({
-      root: resourceRoot,
-      collectorStateFile: statePaths.collectorStateFile,
-      archiveIndexFile: accountingSourceMode === "legacy"
-        ? statePaths.archiveAccountingIndexFile
-        : null,
-      unifiedIndexFile: statePaths.unifiedIndexFile,
-      // History comes from the unified index. The development-only side-chat
-      // probe is account/profile scoped and still accepts one CODEX_HOME, so
-      // bind it explicitly to the selected primary instead of letting plural
-      // mode fall back to the process user's ~/.codex.
-      codexHome: primaryCodexHome,
-      accountingSourceMode,
-      unifiedProjectionMode: ["startup", "quick"].includes(purpose)
-        ? "deferred"
-        : "full",
-      allowDevelopmentArtifactFallback:
-        environment.USAGE_MONITOR_DEVELOPMENT_ARTIFACT_FALLBACK === "1",
-      includeDevelopmentSideChatEstimates:
-        environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_ESTIMATES === "1",
-      ...(sideChatEstimateCollector === null
-        ? {}
-        : { sideChatEstimateCollector }),
-      developmentSideChatHistoricalGapDate:
-        environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_DATE ?? null,
-      developmentSideChatHistoricalGapTimeZone:
-        environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_TIME_ZONE
-          ?? "America/New_York",
-      developmentSideChatHistoricalGapAssumedSpeed:
-        environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_SPEED
-          ?? "fast",
-      // The owner's stated Codex speed mode. It attributes only the turns that
-      // precede the first recorded tier change in their session; an observed
-      // tier always wins. A missing or unreadable statement degrades to the
-      // Standard default rather than inventing a Fast attribution.
-      fastModePreference: await fastModePreference.readMode(),
-      // Timestamped declared baselines. They fill only the turns the rollout
-      // log left unobserved and that a reading actually covers; an observed
-      // tier always wins, and an unreadable ledger is simply no coverage.
-      // A top-level config.toml value is not rollout- or root-qualified. It is
-      // safe for the historical corpus only while there is exactly one
-      // activity root; otherwise an observed setting from the primary root
-      // would be projected onto unrelated roots.
-      codexSpeedBaselines: codexHomes.length === 1
-        ? await codexSpeedBaseline.readWindows()
-        : [],
-    }),
-  }),
+  codexSpeedBaseline,
+  dataStore,
   // Reprice the usage events inside a bounded [from, to] window from the
   // unified local index, grouped by model and observed speed. Injected so a
   // test can drive the route's range validation and response shape without a
@@ -2827,83 +3952,25 @@ function createPreparedLocalCompanionServer({
   }),
   claudeQuotaProvider = () => readClaudeDesktopQuotaProjection(
     statePaths.claudeDesktopQuotaStateFile,
+    {
+      platform: process.platform,
+      windowsSqliteStateSession:
+        windowsSqliteStateSessionForPath === null
+          ? null
+          : windowsSqliteStateSessionForPath(
+            statePaths.claudeDesktopQuotaStateFile,
+          ),
+    },
   ),
   // This is a programmatic, development-only gate: no environment variable,
   // settings control, route, or UI surface enables Claude usage collection.
   // A caller must explicitly opt into the production-shaped local shadow.
   claudeShadowEnabled = false,
   claudeShadowControllerFactory = createClaudeDesktopShadowController,
-  claudeShadowController = claudeShadowControllerFactory({
-    enabled: claudeShadowEnabled,
-    stateRoot,
-    homeDirectory,
-    projectDirectory: claudeProjectDirectory,
-    claudeConfigDirectory,
-  }),
-  refreshRunner = createLocalCollectorRefreshRunner({
-    ...(codexHomes.length > 1
-      ? { codexHomes, primaryCodexHome }
-      : { codexHome }),
-    stateFile: statePaths.collectorStateFile,
-    accountObservationOperationLockFile:
-      statePaths.accountObservationLockFile,
-    refreshAccounting: refreshReplaySafeAccountingCache,
-    refreshClaudeQuota: async ({ signal }) => {
-      const secret = await readOrCreateClaudeDesktopQuotaSecret(
-        statePaths.claudeDesktopQuotaSecretFile,
-      );
-      try {
-        return await refreshClaudeDesktopQuota({
-          statePath: statePaths.claudeDesktopQuotaStateFile,
-          homeDirectory,
-          secret,
-          signal,
-        });
-      } finally {
-        secret.fill(0);
-      }
-    },
-    refreshClaudeUsageShadow: claudeShadowEnabled
-      ? ({ signal }) => claudeShadowController.refresh({ signal })
-      : null,
-    accountingSourceMode,
-    legacyAnalysisIndexFile: accountingSourceMode === "legacy"
-      ? statePaths.legacyAnalysisIndexFile
-      : null,
-    legacyAnalysisIndexSecretFile: accountingSourceMode === "legacy"
-      ? statePaths.legacyAnalysisIndexSecretFile
-      : null,
-    refreshArchiveIndex: accountingSourceMode === "legacy"
-      ? refreshLocalArchiveAccountingIndex
-      : null,
-    archiveIndexFile: accountingSourceMode === "legacy"
-      ? statePaths.archiveAccountingIndexFile
-      : null,
-    archiveIndexSecretFile: accountingSourceMode === "legacy"
-      ? statePaths.archiveAccountingIndexSecretFile
-      : null,
-    // Advance the unified index by its cursors on every foreground refresh:
-    // an ordinary pass reads only the bytes the rollout corpus grew.
-    refreshUnifiedIndex: (options) => ingestLocalUnifiedIndexIncrement({
-      ...options,
-      contractVersion: TELEMETRY_SCHEMA_VERSION,
-      discoveryLimits: LOCAL_UNIFIED_INDEX_DISCOVERY_LIMITS,
-    }),
-    unifiedIndexFile: statePaths.unifiedIndexFile,
-    unifiedIndexSecretFile: statePaths.unifiedIndexSecretFile,
-    recordCodexSpeedBaseline: codexHomes.length === 1
-      ? async () => ((await codexSpeedBaseline.record()).windows)
-      : null,
-  }),
-  onboardingProvider = () => inspectLocalOnboarding({
-    ...(codexHomes.length > 1
-      ? { codexHomes }
-      : { codexHome }),
-    stateRoot,
-    explicitRefresh: true,
-    customCodexHomeConfigured: customCodexHomesConfigured,
-  }),
-  refreshTimeoutMs = 300_000,
+  claudeShadowController,
+  refreshRunner,
+  onboardingProvider = null,
+  refreshTimeoutMs = defaultLocalCompanionRefreshTimeoutMs(),
   centralOrigin = environment.USAGE_MONITOR_CENTRAL_ORIGIN ?? null,
   centralFetch = globalThis.fetch,
   contributionPreviewProvider = async () => ({ status: "not_configured" }),
@@ -2916,9 +3983,7 @@ function createPreparedLocalCompanionServer({
     environment[DEVELOPMENT_IDENTITY_OPT_IN_ENV] ?? null,
   contributionQueueFile,
   legacyContributionDeviceStateFile = null,
-  contributionSyncStatusProvider = () => inspectContributionSyncQueue({
-    queueFile: contributionQueueFile,
-  }),
+  contributionSyncStatusProvider = null,
   preparedContributionDirectory,
   contributionServiceOrigin = centralOrigin,
   // When the signed app spawned this companion it hands over a Keychain
@@ -2981,6 +4046,317 @@ function createPreparedLocalCompanionServer({
       || Array.isArray(environment)) {
     throw new TypeError("environment must be an object");
   }
+  if (codexHomes === null || codexHomes === undefined) {
+    if (typeof codexHome !== "string" || codexHome.length < 1) {
+      throw new TypeError("codexHome must be a non-empty string");
+    }
+    codexHomes = [codexHome];
+  } else if (!Array.isArray(codexHomes)
+      || codexHomes.length < 1
+      || codexHomes.length > 8
+      || codexHomes.some((value) => typeof value !== "string"
+        || value.length < 1)) {
+    throw new TypeError("codexHomes must contain one to eight paths");
+  } else {
+    codexHomes = [...codexHomes];
+  }
+  if (new Set(codexHomes).size !== codexHomes.length) {
+    throw new TypeError("codexHomes paths must be unique");
+  }
+  primaryCodexHome ??= codexHome ?? codexHomes[0];
+  if (typeof primaryCodexHome !== "string"
+      || primaryCodexHome.length < 1
+      || !codexHomes.includes(primaryCodexHome)) {
+    throw new TypeError("primaryCodexHome must identify a configured root");
+  }
+  codexHome ??= primaryCodexHome;
+  if (windowsFilesystemAdapter !== null
+      && !isWindowsFilesystemAdapter(windowsFilesystemAdapter)) {
+    throw windowsFilesystemConfigurationError();
+  }
+  if (windowsFilesystemAdapter === null
+      && (windowsProtectedStateStore !== null
+        || windowsSqliteStateSessionFactory !== null
+        || windowsSqliteStateSessionForPath !== null
+        || windowsSqliteStateStaging !== null
+        || contributionSyncQueueContext !== null
+        || windowsCompanionInstanceLease !== null
+        || windowsPreparedArtifactStorage !== null
+        || windowsPreparedContributionContext !== null
+        || windowsReviewPairStorage !== null
+        || windowsMetadataExportContext !== null
+        || windowsMetadataBundleVerificationContext !== null)) {
+    throw windowsFilesystemConfigurationError();
+  }
+  if (windowsFilesystemAdapter !== null
+      && (!isWindowsProtectedStateStore(windowsProtectedStateStore)
+        || typeof windowsSqliteStateSessionFactory !== "function"
+        || typeof windowsSqliteStateSessionForPath !== "function"
+        || !isWindowsSqliteStateStaging(windowsSqliteStateStaging)
+        || contributionSyncQueueContext === null
+        || !isWindowsCompanionInstanceLeaseContext(
+          windowsCompanionInstanceLease,
+        )
+        || !isWindowsPreparedArtifactStorage(windowsPreparedArtifactStorage)
+        || !isWindowsPreparedContributionContextForStorage(
+          windowsPreparedContributionContext,
+          windowsPreparedArtifactStorage,
+        )
+        || !isWindowsReviewPairStorageForRoot(
+          windowsReviewPairStorage,
+          stateRoot,
+        )
+        || !isWindowsReviewPairStorageForStorage(
+          windowsReviewPairStorage,
+          windowsPreparedArtifactStorage,
+        )
+        || !isWindowsMetadataExportContextForReviewPairStorage(
+          windowsMetadataExportContext,
+          windowsReviewPairStorage,
+        )
+        || !isWindowsMetadataVerificationContextForReviewPairStorage(
+          windowsMetadataBundleVerificationContext,
+          windowsReviewPairStorage,
+        )
+        || !sameWindowsStateRoot(
+          windowsPreparedArtifactStorage.rootPath,
+          stateRoot,
+        )
+        || !sameWindowsStateRoot(
+          windowsPreparedContributionContext.rootPath,
+          windowsPreparedArtifactStorage.rootPath,
+        ))) {
+    throw windowsFilesystemConfigurationError();
+  }
+  if (contributionPreparationRunner !== null
+      && typeof contributionPreparationRunner !== "function") {
+    throw new TypeError(
+      "contributionPreparationRunner must be a function or null",
+    );
+  }
+  if (process.platform === "win32"
+      && contributionPreparationRunner !== null) {
+    // The Windows runner is created only after the native preparation context
+    // has captured the root-bound storage and verifier. A caller-supplied
+    // runner could otherwise reintroduce the ordinary POSIX preparation path.
+    throw windowsFilesystemConfigurationError();
+  }
+  // These defaults used to be constructed as parameter initializers. That
+  // meant a Windows call could instantiate the ordinary module-level storage
+  // context before this composition had proved the protected store and
+  // companion lease. Construct them only after the one branded composition is
+  // validated, and pass that exact store through every fixed-state consumer.
+  const windowsFixedStateOptions = process.platform === "win32"
+    ? {
+      platform: process.platform,
+      windowsProtectedStateStore,
+    }
+    : {};
+  // Several fixed-value companion records intentionally live below
+  // stateRoot/private, while secrets and renewal state remain direct children
+  // of stateRoot. Bind one additional store to that exact private directory
+  // and share it across every private-state controller. The store creates and
+  // validates the directory through the same native adapter; no ordinary
+  // filesystem fallback or cross-root child access is introduced.
+  let windowsPrivateFixedStateOptions = windowsFixedStateOptions;
+  let windowsPrivateProtectedStateStore = null;
+  if (process.platform === "win32" && windowsFilesystemAdapter !== null) {
+    const privateStateFiles = [
+      statePaths.fastModePreferenceFile,
+      statePaths.codexSpeedBaselineFile,
+      statePaths.automaticContributionSettingsFile,
+      statePaths.incrementalContributionSyncSettingsFile,
+      statePaths.hostedSignInHandoffFile,
+    ];
+    const privateStateRoot = win32.join(stateRoot, "private");
+    if (privateStateFiles.some((file) => typeof file !== "string"
+        || win32.dirname(file).toLowerCase()
+          !== privateStateRoot.toLowerCase())) {
+      throw windowsFilesystemConfigurationError();
+    }
+    try {
+      windowsPrivateProtectedStateStore = createWindowsProtectedStateStore({
+        adapter: windowsFilesystemAdapter,
+        rootPath: privateStateRoot,
+        windowsQualificationModeContext:
+          windowsQualificationModeContext,
+        resourceRoot,
+      });
+    } catch {
+      throw windowsFilesystemConfigurationError();
+    }
+    windowsPrivateFixedStateOptions = {
+      platform: process.platform,
+      windowsProtectedStateStore: windowsPrivateProtectedStateStore,
+    };
+  }
+  if (fastModePreference === undefined) {
+    fastModePreference = createFastModePreferenceController({
+      settingsFile: statePaths.fastModePreferenceFile,
+      ...windowsPrivateFixedStateOptions,
+    });
+  }
+  if (codexSpeedBaseline === undefined) {
+    codexSpeedBaseline = createCodexSpeedBaselineController({
+      ledgerFile: statePaths.codexSpeedBaselineFile,
+      configFile: join(codexHome, "config.toml"),
+      ...windowsPrivateFixedStateOptions,
+    });
+  }
+  if (claudeShadowController === undefined) {
+    claudeShadowController = claudeShadowControllerFactory({
+      enabled: claudeShadowEnabled,
+      stateRoot,
+      homeDirectory,
+      projectDirectory: claudeProjectDirectory,
+      claudeConfigDirectory,
+    });
+  }
+  if (dataStore === undefined) {
+    dataStore = new LocalCompanionDataStore({
+      builder: async ({ purpose = "full" } = {}) => (
+        withLocalCollectorStateSessionBoundary({
+          platform: process.platform,
+          architecture: process.arch,
+          windowsFilesystemAdapter,
+          windowsSqliteStateSessionFactory,
+          windowsQualificationModeContext,
+          stateRoot,
+          resourceRoot,
+        }, async () => buildLocalCompanionSnapshot({
+          root: resourceRoot,
+          collectorStateFile: statePaths.collectorStateFile,
+          archiveIndexFile: accountingSourceMode === "legacy"
+            ? statePaths.archiveAccountingIndexFile
+            : null,
+          unifiedIndexFile: statePaths.unifiedIndexFile,
+          codexHome,
+          accountingSourceMode,
+          unifiedProjectionMode: ["startup", "quick"].includes(purpose)
+            ? "deferred"
+            : "full",
+          allowDevelopmentArtifactFallback:
+            environment.USAGE_MONITOR_DEVELOPMENT_ARTIFACT_FALLBACK === "1",
+          includeDevelopmentSideChatEstimates:
+            environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_ESTIMATES === "1",
+          ...(sideChatEstimateCollector === null
+            ? {}
+            : { sideChatEstimateCollector }),
+          developmentSideChatHistoricalGapDate:
+            environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_DATE ?? null,
+          developmentSideChatHistoricalGapTimeZone:
+            environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_TIME_ZONE
+              ?? "America/New_York",
+          developmentSideChatHistoricalGapAssumedSpeed:
+            environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_SPEED
+              ?? "fast",
+          // The owner's stated Codex speed mode. It attributes only the turns
+          // that precede the first recorded tier change in their session; an
+          // observed tier always wins. A missing or unreadable statement
+          // degrades to the Standard default rather than inventing Fast.
+          fastModePreference: await fastModePreference.readMode(),
+          // Timestamped declared baselines fill only unobserved turns covered by
+          // a reading. An unreadable ledger is simply no coverage.
+          // A top-level config.toml value is not rollout- or root-qualified.
+          // Only use it when there is one activity root; in multi-root mode
+          // the primary root must not be projected onto the other roots.
+          codexSpeedBaselines: codexHomes.length === 1
+            ? await codexSpeedBaseline.readWindows()
+            : [],
+        }))
+      ),
+    });
+  }
+  if (refreshRunner === undefined) {
+    refreshRunner = createLocalCollectorRefreshRunner({
+      ...(codexHomes.length > 1
+        ? { codexHomes, primaryCodexHome }
+        : { codexHome }),
+      stateFile: statePaths.collectorStateFile,
+      accountObservationOperationLockFile:
+        statePaths.accountObservationLockFile,
+      windowsFilesystemAdapter,
+      windowsProtectedStateStore,
+      windowsSqliteStateSessionFactory,
+      windowsQualificationModeContext,
+      stateRoot,
+      resourceRoot,
+      windowsSqliteStateStaging,
+      refreshAccounting: refreshReplaySafeAccountingCache,
+      refreshClaudeQuota: async ({ signal }) => {
+        const secret = await readOrCreateClaudeDesktopQuotaSecret(
+          statePaths.claudeDesktopQuotaSecretFile,
+          {
+            platform: process.platform,
+            windowsProtectedStateStore,
+          },
+        );
+        try {
+          return await refreshClaudeDesktopQuota({
+            statePath: statePaths.claudeDesktopQuotaStateFile,
+            homeDirectory,
+            secret,
+            signal,
+            platform: process.platform,
+            windowsSqliteStateSession:
+              windowsSqliteStateSessionForPath === null
+                ? null
+                : windowsSqliteStateSessionForPath(
+                  statePaths.claudeDesktopQuotaStateFile,
+                ),
+          });
+        } finally {
+          secret.fill(0);
+        }
+      },
+      refreshClaudeUsageShadow: claudeShadowEnabled
+        ? ({ signal }) => claudeShadowController.refresh({ signal })
+        : null,
+      accountingSourceMode,
+      legacyAnalysisIndexFile: accountingSourceMode === "legacy"
+        ? statePaths.legacyAnalysisIndexFile
+        : null,
+      legacyAnalysisIndexSecretFile: accountingSourceMode === "legacy"
+        ? statePaths.legacyAnalysisIndexSecretFile
+        : null,
+      refreshArchiveIndex: accountingSourceMode === "legacy"
+        ? refreshLocalArchiveAccountingIndex
+        : null,
+      archiveIndexFile: accountingSourceMode === "legacy"
+        ? statePaths.archiveAccountingIndexFile
+        : null,
+      archiveIndexSecretFile: accountingSourceMode === "legacy"
+        ? statePaths.archiveAccountingIndexSecretFile
+        : null,
+      // Advance the unified index by its cursors on every foreground refresh.
+      refreshUnifiedIndex: (options) => ingestLocalUnifiedIndexOffMain({
+        ...options,
+        contractVersion: TELEMETRY_SCHEMA_VERSION,
+        windowsFilesystemAdapter,
+        windowsProtectedStateStore,
+        windowsQualificationModeContext,
+        stateRoot,
+        resourceRoot,
+        windowsSqliteStateStaging,
+      }),
+      unifiedIndexFile: statePaths.unifiedIndexFile,
+      unifiedIndexSecretFile: statePaths.unifiedIndexSecretFile,
+      recordCodexSpeedBaseline: codexHomes.length === 1
+        ? async () => ((await codexSpeedBaseline.record()).windows)
+        : null,
+    });
+  }
+  onboardingProvider ??= () => inspectLocalOnboarding({
+    ...(codexHomes.length > 1
+      ? { codexHomes }
+      : { codexHome }),
+    stateRoot,
+    resourceRoot,
+    explicitRefresh: true,
+    customCodexHomeConfigured: customCodexHomesConfigured,
+    windowsFilesystemAdapter,
+    windowsQualificationModeContext,
+  });
   if (!dataStore || typeof dataStore.initialize !== "function") {
     throw new TypeError("dataStore.initialize must be a function");
   }
@@ -2999,12 +4375,6 @@ function createPreparedLocalCompanionServer({
   }
   if (typeof contributionPreviewProvider !== "function") {
     throw new TypeError("contributionPreviewProvider must be a function");
-  }
-  if (contributionPreparationRunner !== null
-      && typeof contributionPreparationRunner !== "function") {
-    throw new TypeError(
-      "contributionPreparationRunner must be a function or null",
-    );
   }
   if (!contributionPreparationOptions
       || typeof contributionPreparationOptions !== "object"
@@ -3040,12 +4410,39 @@ function createPreparedLocalCompanionServer({
     environmentExportSecretPresent:
       Object.hasOwn(environment, EXPORT_IDENTITY_ENV),
   });
+  // Keep status inspection on the installation-owned queue file.  The
+  // Windows queue context is deliberately root-bound, but its public method
+  // still accepts an explicit path; omitting it would fall back to the
+  // process-working-directory queue and can put writable state beside the
+  // packaged resources.  macOS/Linux use the same explicit path through the
+  // legacy POSIX storage implementation.
+  contributionSyncStatusProvider ??= contributionSyncQueueContext === null
+    ? () => inspectContributionSyncQueue({ queueFile: contributionQueueFile })
+    : () => contributionSyncQueueContext.inspectContributionSyncQueue({
+      queueFile: contributionQueueFile,
+    });
   if (typeof contributionSyncStatusProvider !== "function") {
     throw new TypeError("contributionSyncStatusProvider must be a function");
   }
   if (typeof contributionQueueFile !== "string"
       || contributionQueueFile.length < 1) {
     throw new TypeError("contributionQueueFile must be a non-empty string");
+  }
+  if (contributionSyncQueueContext !== null
+      && (typeof contributionSyncQueueContext !== "object"
+        || typeof contributionSyncQueueContext.inspectContributionSyncQueue
+          !== "function"
+        || typeof contributionSyncQueueContext.inspectExactNextContributionSyncUpload
+          !== "function"
+        || typeof contributionSyncQueueContext.inspectNextContributionSyncUpload
+          !== "function"
+        || typeof contributionSyncQueueContext.runContributionSyncQueueOnce
+          !== "function"
+        || typeof contributionSyncQueueContext.setContributionSyncPaused
+          !== "function"
+        || typeof contributionSyncQueueContext.retireAcceptedContributionArtifacts
+          !== "function")) {
+    throw new TypeError("contributionSyncQueueContext is invalid");
   }
   if (preparedContributionDirectory !== null
       && typeof preparedContributionDirectory !== "string") {
@@ -3105,12 +4502,19 @@ function createPreparedLocalCompanionServer({
   const nextContribution = contributionSyncNextProvider
     ?? (preparedContributionDirectory === null
       ? async () => null
-      : () => inspectNextContributionSyncUpload({
-        directory: preparedContributionDirectory,
-        queueFile: contributionQueueFile,
-      }));
+      : contributionSyncQueueContext === null
+        ? () => inspectNextContributionSyncUpload({
+          directory: preparedContributionDirectory,
+          queueFile: contributionQueueFile,
+        })
+        : () => contributionSyncQueueContext.inspectNextContributionSyncUpload({
+          directory: preparedContributionDirectory,
+          queueFile: contributionQueueFile,
+        }));
   const createContributionDeviceBackend = async () => {
-    const backend = contributionDeviceBackendFactory();
+    const backend = contributionDeviceBackendFactory({
+      windowsFilesystemAdapter,
+    });
     if (legacyContributionDeviceStateFile !== null) {
       await migrateLegacyContributionDeviceCapability({
         backend,
@@ -3168,6 +4572,10 @@ function createPreparedLocalCompanionServer({
             await writeContributionDeviceRenewalState(
               statePaths.contributionDeviceRenewalStateFile,
               { deviceId: paired.deviceId, expiresAt: paired.expiresAt },
+              {
+                platform: process.platform,
+                windowsProtectedStateStore,
+              },
             );
           } catch {
             // A missing due-tracker only defers the first silent renewal until
@@ -3268,15 +4676,32 @@ function createPreparedLocalCompanionServer({
   const hostedSignInHandoff = hostedSignInHandoffController
     ?? createHostedSignInHandoffController({
       handoffFile: statePaths.hostedSignInHandoffFile,
+      ...(process.platform === "win32"
+        ? {
+          storage: createOwnerOnlyAutomaticContributionStorageContext({
+            createError: () => new HostedSignInHandoffError(
+              "hosted_signin_handoff_unavailable",
+            ),
+            platform: process.platform,
+            windowsProtectedStateStore:
+              windowsPrivateProtectedStateStore,
+          }),
+        }
+        : {}),
       now: clock,
     });
   const reviewExactContribution = contributionSyncExactReviewProvider
     ?? (preparedContributionDirectory === null
       ? async () => null
-      : () => inspectExactNextContributionSyncUpload({
-        directory: preparedContributionDirectory,
-        queueFile: contributionQueueFile,
-      }));
+      : contributionSyncQueueContext === null
+        ? () => inspectExactNextContributionSyncUpload({
+          directory: preparedContributionDirectory,
+          queueFile: contributionQueueFile,
+        })
+        : () => contributionSyncQueueContext.inspectExactNextContributionSyncUpload({
+          directory: preparedContributionDirectory,
+          queueFile: contributionQueueFile,
+        }));
   const runContributionPass = contributionSyncOnceRunner
     ?? (preparedContributionDirectory === null
         || contributionServiceOrigin === null
@@ -3290,7 +4715,7 @@ function createPreparedLocalCompanionServer({
           LOCAL_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES,
       }) => {
         const backend = await createContributionDeviceBackend();
-        return runContributionSyncQueueOnce({
+        const options = {
           directory: preparedContributionDirectory,
           origin: contributionServiceOrigin,
           backend,
@@ -3301,13 +4726,18 @@ function createPreparedLocalCompanionServer({
           reviewedJob,
           preparedSetId,
           signal,
-        });
+        };
+        return contributionSyncQueueContext === null
+          ? runContributionSyncQueueOnce(options)
+          : contributionSyncQueueContext.runContributionSyncQueueOnce(options);
       });
   const setContributionPaused = contributionSyncPauseSetter
-    ?? (({ paused }) => setContributionSyncPaused({
-      paused,
-      queueFile: contributionQueueFile,
-    }));
+    ?? (({ paused }) => {
+      const options = { paused, queueFile: contributionQueueFile };
+      return contributionSyncQueueContext === null
+        ? setContributionSyncPaused(options)
+        : contributionSyncQueueContext.setContributionSyncPaused(options);
+    });
   const syncPreviewConfigured = preparedContributionDirectory !== null
     || contributionSyncNextProvider !== null;
   const contributionDevicePairingConfigured =
@@ -3320,30 +4750,100 @@ function createPreparedLocalCompanionServer({
     (preparedContributionDirectory !== null
       && contributionServiceOrigin !== null)
     || contributionSyncOnceRunner !== null;
-  const runContributionPreparation = contributionPreparationRunner
-    ?? createLocalContributionPreparationRunner({
+  const selectedContributionPreparationOptions = process.platform === "win32"
+    ? {
       ...contributionPreparationOptions,
-      coverageProvider: () => (
-        dataStore.getOverview()?.collector?.exportableCoveredAt
-      ),
-      ...(preparedContributionDirectory === null
+      // Every Windows preparation dependency is supplied by the one root-bound
+      // composition. The metadata contexts below provide the review-pair
+      // writer/reader; the materializer and prepared-set verifier use the same
+      // branded contribution context so no POSIX operation is reachable from a
+      // Windows attempt.
+      materialize: createWindowsContributionMaterializer({
+        preparedContributionContext: windowsPreparedContributionContext,
+        windowsPreparedArtifactStorage,
+        windowsReviewPairStorage,
+        windowsMetadataBundleVerificationContext,
+      }),
+      verifyPreparedSet:
+        windowsPreparedContributionContext.verifyPreparedContributionSet,
+    }
+    : contributionPreparationOptions;
+  const selectedPreparationIdentity = ({ explicitSecretFile }) => (
+    selectProductionParticipantIdentity({
+      explicitSecretFile,
+      environmentSecret: environment[EXPORT_IDENTITY_ENV],
+      appStateSecretFile: statePaths.exportParticipantSecretFile,
+      ...(contributionPreparationCreateKeychainBackend === undefined
         ? {}
-        : { preparedSpoolDirectory: preparedContributionDirectory }),
-      explicitSecretFile: developmentIdentity.explicitSecretFile,
-      selectIdentity: ({ explicitSecretFile }) => (
-        selectProductionParticipantIdentity({
-          explicitSecretFile,
-          environmentSecret: environment[EXPORT_IDENTITY_ENV],
-          appStateSecretFile: statePaths.exportParticipantSecretFile,
-          ...(contributionPreparationCreateKeychainBackend === undefined
-            ? {}
-            : {
-              createKeychainBackend:
-                contributionPreparationCreateKeychainBackend,
-            }),
-        })
-      ),
-  });
+        : {
+          createKeychainBackend:
+            contributionPreparationCreateKeychainBackend,
+        }),
+      windowsFilesystemAdapter,
+    })
+  );
+  const preparationRunnerOptions = {
+    ...selectedContributionPreparationOptions,
+    coverageProvider: () => (
+      dataStore.getOverview()?.collector?.exportableCoveredAt
+    ),
+    ...(preparedContributionDirectory === null
+      ? {}
+      : { preparedSpoolDirectory: preparedContributionDirectory }),
+    explicitSecretFile: developmentIdentity.explicitSecretFile,
+    selectIdentity: selectedPreparationIdentity,
+  };
+  const windowsPreparationStorage = process.platform === "win32"
+    ? createWindowsContributionPreparationStorage({
+      storage: windowsPreparedArtifactStorage,
+    })
+    : null;
+  const selectedPreparationRunnerOptions = process.platform === "win32"
+    ? {
+      ...preparationRunnerOptions,
+      // The application preparation context captures these ports once. They
+      // cannot be replaced by an attempt-level rename/sync option, preventing
+      // a Windows retry from selecting the POSIX owner-only storage.
+      preparationStorage: windowsPreparationStorage,
+      preparationStorageValidator: isWindowsContributionPreparationStorage,
+    }
+    : preparationRunnerOptions;
+  const windowsPreparationContext = process.platform === "win32"
+    ? createWindowsContributionPreparationContext({
+      preparationStorage: windowsPreparationStorage,
+      preparationStorageValidator: isWindowsContributionPreparationStorage,
+      stateRoot,
+      codexHome,
+      activityFile: contributionPreparationOptions.activityFile
+        ?? statePaths.activityMarkersFile,
+      selectIdentity: selectedPreparationIdentity,
+      metadataExport: windowsMetadataExportContext,
+      metadataVerification: windowsMetadataBundleVerificationContext,
+      materialize: selectedContributionPreparationOptions.materialize,
+      verifyPreparedSet: selectedContributionPreparationOptions.verifyPreparedSet,
+    })
+    : null;
+  const windowsPreparationRunnerOptions = process.platform === "win32"
+    ? (() => {
+      const {
+        preparationStorage: _preparationStorage,
+        preparationStorageValidator: _preparationStorageValidator,
+        buildBundle: _buildBundle,
+        writeBundle: _writeBundle,
+        verifySource: _verifySource,
+        materialize: _materialize,
+        verifyPreparedSet: _verifyPreparedSet,
+        ...runnerOptions
+      } = selectedPreparationRunnerOptions;
+      return runnerOptions;
+    })()
+    : null;
+  const runContributionPreparation = contributionPreparationRunner
+    ?? (process.platform === "win32"
+      ? windowsPreparationContext.createLocalContributionPreparationRunner(
+        windowsPreparationRunnerOptions,
+      )
+      : createLocalContributionPreparationRunner(selectedPreparationRunnerOptions));
   let contributionPreparationInProgress = false;
   let contributionSyncInProgress = false;
   const runAutomaticContributionRetirement =
@@ -3355,15 +4855,19 @@ function createPreparedLocalCompanionServer({
         interrupted: false,
         networkActivity: false,
       })
-      : ({ protectedPreparedSetIds, signal }) =>
-        retireAcceptedContributionArtifacts({
+      : ({ protectedPreparedSetIds, signal }) => {
+        const options = {
           preparedSpoolDirectory: preparedContributionDirectory,
           reviewArchiveDirectory:
             contributionPreparationOptions.reviewArchiveDirectory,
           queueFile: contributionQueueFile,
           protectedPreparedSetIds,
           signal,
-        }));
+        };
+        return contributionSyncQueueContext === null
+          ? retireAcceptedContributionArtifacts(options)
+          : contributionSyncQueueContext.retireAcceptedContributionArtifacts(options);
+      });
   const runSupersededContributionRetirement =
     supersededContributionRetirementRunner
     ?? (preparedContributionDirectory === null
@@ -3389,6 +4893,21 @@ function createPreparedLocalCompanionServer({
     }
     contributionPreparationInProgress = true;
     try {
+      if (process.platform === "win32"
+          && windowsPreparedArtifactStorage !== null) {
+        await recoverWindowsReviewPairEvidence({
+          storage: windowsPreparedArtifactStorage,
+          reviewPairStorage: windowsReviewPairStorage,
+          reviewArchiveDirectory:
+            contributionPreparationOptions.reviewArchiveDirectory,
+        });
+        if (preparedContributionDirectory !== null) {
+          recoverWindowsPreparedStagingEvidence({
+            storage: windowsPreparedArtifactStorage,
+            preparedContributionDirectory,
+          });
+        }
+      }
       return await runContributionPreparation(request);
     } finally {
       contributionPreparationInProgress = false;
@@ -3420,6 +4939,10 @@ function createPreparedLocalCompanionServer({
   const automaticContribution = automaticContributionController
     ?? createAutomaticContributionController({
       ...automaticContributionOptions,
+      ...windowsPrivateFixedStateOptions,
+      ...(process.platform === "win32"
+        ? { windowsCompanionInstanceLease }
+        : {}),
       settingsFile: statePaths.automaticContributionSettingsFile,
       destinationOrigin: syncDeliveryConfigured
         ? contributionServiceOrigin
@@ -3467,6 +4990,7 @@ function createPreparedLocalCompanionServer({
     ?? (contributionServiceOrigin === null
       ? null
       : createIncrementalContributionSyncController({
+        ...windowsPrivateFixedStateOptions,
         settingsFile: statePaths.incrementalContributionSyncSettingsFile,
         destinationOrigin: contributionServiceOrigin,
         runner: async ({ signal }) => {
@@ -3489,6 +5013,8 @@ function createPreparedLocalCompanionServer({
               await renewContributionDeviceCredentialIfDue({
                 origin: contributionServiceOrigin,
                 renewalStateFile: statePaths.contributionDeviceRenewalStateFile,
+                platform: process.platform,
+                windowsProtectedStateStore,
                 capabilityOptions: {
                   backend,
                   stateFile: statePaths.contributionDeviceStateFile,
@@ -3617,6 +5143,8 @@ function createPreparedLocalCompanionServer({
         automaticContributionInstanceLock =
           await acquireAutomaticContributionInstanceLock({
             lockFile: statePaths.automaticContributionLockFile,
+            platform: process.platform,
+            windowsCompanionInstanceLease,
           });
       })();
     }
@@ -3635,6 +5163,15 @@ function createPreparedLocalCompanionServer({
     if (snapshotPromise === null) {
       snapshotPromise = (async () => {
         try {
+          if (process.platform === "win32"
+              && windowsPreparedArtifactStorage !== null) {
+            await recoverWindowsReviewPairEvidence({
+              storage: windowsPreparedArtifactStorage,
+              reviewPairStorage: windowsReviewPairStorage,
+              reviewArchiveDirectory:
+                contributionPreparationOptions.reviewArchiveDirectory,
+            });
+          }
           await dataStore.initialize();
           await automaticContribution.start();
           // v1.0 incremental sync starts beside the v0.1 scheduler; a
@@ -3677,6 +5214,7 @@ function createPreparedLocalCompanionServer({
     runner: refreshRunner,
     dataStore,
     timeoutMs: refreshTimeoutMs,
+    clock,
     // Five hours of refresh_resource_limited loops once left zero local
     // trail: the terminal classification lived only in this controller's
     // in-memory state. Every terminal refresh failure now files one bounded,
@@ -3934,6 +5472,23 @@ function createPreparedLocalCompanionServer({
             remoteProxy: false,
           },
         });
+        return;
+      }
+      if (path === "/api/local/desktop-status") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        // This endpoint intentionally reads only the lifecycle receipt and the
+        // already closed direct-provider notification evidence. It stays
+        // independent of the dashboard snapshot so the shell can distinguish
+        // a still-starting companion from a ready one without receiving a
+        // partial dashboard payload.
+        send(response, 200, projectDesktopShellStatus({
+          snapshotStatus: snapshotState.status,
+          refresh: refresh.getStatus(),
+          now: clock(),
+        }));
         return;
       }
       if (path === "/api/local/diagnostics/contribution") {

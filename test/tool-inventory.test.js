@@ -303,13 +303,13 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  // 80 records / 82 executable paths: the release-documentation gate and the
-  // Windows/WSL multi-root qualification are both reviewed repository
-  // operations. Keep these exact so any future executable still requires an
-  // ownership decision.
-  assert.equal(result.records, 80);
-  assert.equal(result.candidates.length, 82);
-  assert.ok(result.aliases >= 25);
+  // Current main's release-note checker, Electron qualification operations,
+  // and Windows/WSL multi-root qualification are all reviewed repository
+  // tools. Keep these exact so any future executable or npm alias still
+  // requires an ownership decision.
+  assert.equal(result.records, 105);
+  assert.equal(result.candidates.length, 106);
+  assert.equal(result.aliases, 64);
 });
 
 test("the inventory names every static ESM caller of a classified tool", async () => {

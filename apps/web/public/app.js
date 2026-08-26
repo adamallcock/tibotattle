@@ -4,6 +4,7 @@ import {
   isPrimaryCodexWeeklyQuotaWindow,
   isSparkQuotaLimitId,
   LocalCompanionClient,
+  shouldAbortRefreshStatusPolling,
   CODEX_PRIMARY_LIMIT_ID,
   CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
   CODEX_WEEKLY_ALLOWANCE_MINUTES,
@@ -88,6 +89,19 @@ function applyNativeAppearanceTheme(theme) {
 applyNativeAppearanceTheme(
   globalThis.__TIBOTATTLE_APPEARANCE__?.resolvedTheme,
 );
+// Electron owns the preference in its main process.  Chromium exposes the
+// resolved system choice through matchMedia, which lets a fresh dashboard
+// paint correctly before the first main-to-renderer command arrives.
+if (window.tibotattleDesktop?.version === "v1"
+    || document.documentElement?.classList?.contains?.("electron-dashboard")) {
+  let dark = false;
+  try {
+    dark = window.matchMedia?.("(prefers-color-scheme: dark)")?.matches === true;
+  } catch {
+    dark = false;
+  }
+  applyNativeAppearanceTheme(dark ? "dark" : "light");
+}
 window.addEventListener("tibotattle:appearance-override", (event) => {
   applyNativeAppearanceTheme(event.detail?.resolvedTheme);
 });
@@ -308,6 +322,18 @@ let googleSignInUnavailable = false;
 let localActionBusy = false;
 let localRefreshInProgress = false;
 let localRefreshCancelRequested = false;
+// The Electron companion's first private unified index is allowed the
+// two-hour server ceiling. Keep the foreground page alive for 121 minutes so
+// its elapsed clock, Cancel control, and terminal reload remain the owner of
+// that operation instead of looking crashed after the browser's ordinary
+// six-minute companion budget expires. The one-minute renderer margin lets a
+// terminal response settle after the companion's bounded work window closes.
+const ELECTRON_REFRESH_POLLING_WINDOW_MS = 121 * 60_000;
+// Cadence ownership is a shell convenience, not a reason to delay the
+// renderer's status polling or progress ticker. A missing/restarting main
+// process gets only this bounded wait before the local operation continues;
+// the main-process lease watchdog remains the final recovery authority.
+const ELECTRON_REFRESH_LIFECYCLE_SIGNAL_TIMEOUT_MS = 1_000;
 // Archive indexing progress is intentionally transient: the durable dashboard
 // continues to show only the last verified complete/partial coverage receipt.
 // While a refresh owns a new pass, make that distinction visible beside cost
@@ -315,6 +341,11 @@ let localRefreshCancelRequested = false;
 let archiveHistoryScanActive = false;
 let returnRefreshScheduled = false;
 let returnRefreshDeferrals = 0;
+// The native macOS shell starts one foreground refresh after the dashboard's
+// first real local render. Electron shares the dashboard renderer instead of
+// owning a WKWebView readiness callback, so this page-local fence supplies the
+// equivalent one-shot handoff without changing ordinary browser behavior.
+let electronStartupRefreshTriggered = false;
 let globalState = null;
 let visibleConnectionNotice = null;
 let dashboardUnavailableState = null;
@@ -515,11 +546,11 @@ function localAnalysisAllowed(value = localOnboarding) {
 
 function localAnalysisLabel() {
   if (dashboard?.collector?.indexing?.status === "bounded_pause") {
-    return "Continue local analysis";
+    return "localAnalysis.action.continue";
   }
   return dashboard?.activity?.lastScanAt || dashboard?.collector?.lastScanAt
-    ? "Update local usage"
-    : "Analyze local usage";
+    ? "localAnalysis.action.update"
+    : "localAnalysis.action.analyze";
 }
 
 function updateLocalActionButtons() {
@@ -528,7 +559,7 @@ function updateLocalActionButtons() {
   for (const selector of ["#refresh-button", "#setup-refresh"]) {
     const button = $(selector);
     button.disabled = localActionBusy || !allowed;
-    if (!localActionBusy) button.textContent = label;
+    if (!localActionBusy) setLocalizedText(button, label);
   }
   const setupCheck = $("#setup-check-again");
   if (setupCheck) setupCheck.disabled = localActionBusy;
@@ -539,7 +570,10 @@ function updateLocalActionButtons() {
   const cancel = $("#cancel-refresh");
   cancel.hidden = !localRefreshInProgress;
   cancel.disabled = localRefreshCancelRequested;
-  cancel.textContent = localRefreshCancelRequested ? "Cancelling…" : "Cancel";
+  setLocalizedText(
+    cancel,
+    localRefreshCancelRequested ? "action.cancelling" : "action.cancel",
+  );
 }
 
 function setCommunitySession(value) {
@@ -1040,20 +1074,30 @@ function renderLocalOnboarding(value) {
   card.hidden = false;
   card.removeAttribute("aria-hidden");
   card.classList.toggle("needs-attention", !ready);
-  $("#setup-title").textContent = boundedPause
-    ? "Continue your local analysis"
-    : ready
-      ? "This Mac is ready"
-      : value.stateStatus === "unwritable" && sourceReady
-        ? "Local app state needs attention"
-        : sourceGuidance.title;
-  $("#setup-summary").textContent = boundedPause
-    ? `A bounded pass completed safely: ${compact(indexing.filesProcessed)} of ${compact(indexing.filesSelected)} recent rollout files are analyzed. Continue when convenient; existing results remain usable.`
-    : ready
-      ? "Codex metadata and TiboTattle's private state are available. Raw logs remain inside the local companion."
-    : value.stateStatus === "unwritable" && sourceReady
-      ? "TiboTattle can read Codex metadata but cannot safely write its private app state. Quit and reopen the Mac app, then check again before attempting an analysis."
-      : sourceGuidance.summary;
+  if (boundedPause) {
+    setLocalizedText($("#setup-title"), "localAnalysis.setup.continueTitle");
+    setLocalizedText($("#setup-summary"), "localAnalysis.setup.boundedSummary", {
+      processed: compact(indexing.filesProcessed),
+      selected: compact(indexing.filesSelected),
+    });
+  } else {
+    setProductText(
+      $("#setup-title"),
+      ready
+        ? "This Mac is ready"
+        : value.stateStatus === "unwritable" && sourceReady
+          ? "Local app state needs attention"
+          : sourceGuidance.title,
+    );
+    setProductText(
+      $("#setup-summary"),
+      ready
+        ? "Codex metadata and TiboTattle's private state are available. Raw logs remain inside the local companion."
+        : value.stateStatus === "unwritable" && sourceReady
+          ? "TiboTattle can read Codex metadata but cannot safely write its private app state. Quit and reopen the Mac app, then check again before attempting an analysis."
+          : sourceGuidance.summary,
+    );
+  }
 
   const checks = $("#setup-checks");
   clear(checks);
@@ -1081,11 +1125,23 @@ function renderLocalOnboarding(value) {
     const row = node("li", item.ok ? "" : "missing", item.text);
     checks.append(row);
   }
-  $("#setup-note").textContent = ready
-    ? boundedPause
-      ? "Continue when convenient. A useful headline is already available; later bounded updates are normally faster. Existing results remain visible, and every additional pass stays on this Mac."
-      : "A useful headline often appears in seconds. The first deep pass can take a few minutes and later updates are normally faster. Work stops or checkpoints at a fixed bound; prompts, responses, commands, paths, and account identifiers never enter this page."
-      : "After completing the action above, choose Check again. Checking does not analyze logs or upload anything.";
+  if (ready && boundedPause) {
+    setLocalizedText($("#setup-note"), "localAnalysis.setup.boundedNote");
+  } else {
+    if (ready) {
+      setLocalizedText(
+        $("#setup-note"),
+        runsInsideElectronDashboard()
+          ? "localAnalysis.setup.electronReadyNote"
+          : "localAnalysis.setup.readyNote",
+      );
+    } else {
+      setProductText(
+        $("#setup-note"),
+        "After completing the action above, choose Check again. Checking does not analyze logs or upload anything.",
+      );
+    }
+  }
   if (!ready) setGlobalState("setup", { companionReachable: true });
   setJourneyState(ready ? "local-ready" : "needs-local-setup");
   updateLocalActionButtons();
@@ -1990,6 +2046,12 @@ let shareCard = null;
 let shareCardReference = "";
 let shareCardSignature = "";
 let shareCardBusy = false;
+// Electron owns the actual download and reports only a fixed semantic result
+// after it has verified the completed file. Keep this state separate from
+// `shareCardBusy`: the PNG request can finish before the OS download does.
+let electronShareCardDownloadPending = false;
+let electronShareCardDownloadTimeout = null;
+const ELECTRON_SHARE_CARD_DOWNLOAD_TIMEOUT_MS = 15_000;
 // The posted image uses the same bundled mark as the dashboard and macOS app.
 // If it loads after a card has been drawn, repaint the existing card rather
 // than leaving an approximated logo in the image.
@@ -3015,8 +3077,92 @@ function showShareCardToast(text, { actionLabel = "", onAction = null } = {}) {
   }, SHARE_CARD_TOAST_HOLD_MS);
 }
 
+function electronShareCardBridge() {
+  return document.body?.classList?.contains("electron-dashboard")
+    ? window.tibotattleDesktop ?? null
+    : null;
+}
+
+function showElectronShareCardRevealFailure() {
+  const message = t("shareCard.revealFailed");
+  setShareCardStatus(message, { error: true });
+  showShareCardToast(message);
+}
+
+function revealElectronShareCard() {
+  const bridge = electronShareCardBridge();
+  if (typeof bridge?.revealLatestDownload !== "function") {
+    showElectronShareCardRevealFailure();
+    return;
+  }
+  try {
+    // The bridge is intentionally zero-argument. Consume both synchronous
+    // throws and rejected promises so clicking Reveal can never create an
+    // unhandled rejection or imply that the folder opened when it did not.
+    const result = bridge.revealLatestDownload();
+    void Promise.resolve(result).then((outcome) => {
+      if (outcome !== "revealed") showElectronShareCardRevealFailure();
+    }).catch(() => {
+      showElectronShareCardRevealFailure();
+    });
+  } catch {
+    showElectronShareCardRevealFailure();
+  }
+}
+
+function handleElectronShareCardDownloadCompleted() {
+  if (!electronShareCardDownloadPending) return;
+  if (electronShareCardDownloadTimeout !== null) {
+    clearTimeout(electronShareCardDownloadTimeout);
+    electronShareCardDownloadTimeout = null;
+  }
+  electronShareCardDownloadPending = false;
+  updateShareCardActions();
+  setShareCardStatus(t("shareCard.saved"));
+  const bridge = electronShareCardBridge();
+  showShareCardToast(
+    t("shareCard.saved"),
+    typeof bridge?.revealLatestDownload === "function"
+      ? {
+        actionLabel: t("shareCard.showInFolder"),
+        onAction: revealElectronShareCard,
+      }
+      : {},
+  );
+}
+
+function handleElectronShareCardDownloadFailed() {
+  if (!electronShareCardDownloadPending) return;
+  if (electronShareCardDownloadTimeout !== null) {
+    clearTimeout(electronShareCardDownloadTimeout);
+    electronShareCardDownloadTimeout = null;
+  }
+  electronShareCardDownloadPending = false;
+  updateShareCardActions();
+  const message = t("shareCard.saveFailed");
+  setShareCardStatus(message, { error: true });
+  showShareCardToast(message);
+}
+
+function beginElectronShareCardDownload() {
+  electronShareCardDownloadPending = true;
+  if (electronShareCardDownloadTimeout !== null) {
+    clearTimeout(electronShareCardDownloadTimeout);
+  }
+  electronShareCardDownloadTimeout = setTimeout(() => {
+    electronShareCardDownloadTimeout = null;
+    handleElectronShareCardDownloadFailed();
+  }, ELECTRON_SHARE_CARD_DOWNLOAD_TIMEOUT_MS);
+  updateShareCardActions();
+  const saving = t("shareCard.saving");
+  setShareCardStatus(saving);
+  showShareCardToast(saving);
+}
+
 function updateShareCardActions() {
-  const ready = shareCard !== null && !shareCardBusy;
+  const ready = shareCard !== null
+    && !shareCardBusy
+    && !electronShareCardDownloadPending;
   for (const id of [
     "share-card-download",
     "share-card-copy",
@@ -3166,21 +3312,47 @@ function downloadShareCard() {
     const link = document.createElement("a");
     link.href = url;
     link.download = shareCardFileName(card);
-    link.click();
-    URL.revokeObjectURL(url);
+    const electron = document.body?.classList?.contains("electron-dashboard") === true;
+    if (electron) {
+      // Electron's main process owns the destination and has not verified the
+      // file yet. Do not claim a filename, expose its opaque destination, or
+      // offer Reveal until the payload-free completion command arrives.
+      beginElectronShareCardDownload();
+    }
+    try {
+      link.click();
+    } catch {
+      if (electron) {
+        handleElectronShareCardDownloadFailed();
+        return;
+      }
+      throw new Error("download could not be started");
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+    if (electron) return;
     // The image no longer prints the reference (owner-directed, 2026-08-08),
     // so the claim moved with the fact: the file name carries it.
     const saved = `Saved as ${shareCardFileName(card)}. The file name carries reference ${card.reference}.`;
-    // Reveal is native-only: the shell tracks where the download landed and
-    // shows it in Finder itself, so the page never learns a filesystem path.
+    // Reveal is shell-owned: the native or Electron shell tracks where the
+    // download landed and shows it in the OS file manager, so the page never
+    // learns a filesystem path.
     // In a plain browser the button is absent rather than disabled.
-    const bridge = document.body.classList.contains("native-dashboard")
+    const nativeBridge = document.body.classList.contains("native-dashboard")
       ? window.webkit?.messageHandlers?.tibotattleDownloads
       : undefined;
-    showShareCardToast(saved, bridge ? {
-      actionLabel: t("shareCard.showInFinder"),
-      onAction: () => bridge.postMessage({ type: "reveal-latest-download" }),
-    } : {});
+    const electronBridge = document.body.classList.contains("electron-dashboard")
+      ? window.tibotattleDesktop
+      : undefined;
+    const reveal = nativeBridge
+      ? () => nativeBridge.postMessage({ type: "reveal-latest-download" })
+      : typeof electronBridge?.revealLatestDownload === "function"
+        ? () => electronBridge.revealLatestDownload()
+        : null;
+    showShareCardToast(saved, reveal === null ? {} : {
+      actionLabel: t("shareCard.showInFolder"),
+      onAction: reveal,
+    });
   });
 }
 
@@ -7832,9 +8004,22 @@ function renderAccountingCacheSwitchDetails(impact) {
   if (!disclosure || !rows) return;
   clear(rows);
   const available = impact?.status === "available";
-  disclosure.hidden = !available;
+  // Keep the diagnostic surface discoverable even before there is enough
+  // evidence to evaluate it. Hiding the whole panel leaves a new or
+  // single-turn installation looking as though the feature is absent; the
+  // row below instead says that no numeric estimate has been made.
+  disclosure.hidden = false;
   if (!available) {
     disclosure.open = false;
+    const row = node("tr");
+    const cell = localizedNode(
+      "td",
+      "empty-cell",
+      "accounting.cacheSwitch.detailsUnavailable",
+    );
+    cell.colSpan = 5;
+    row.append(cell);
+    rows.append(row);
     renderCacheImpactPagination(
       "cache-switch",
       cacheSwitchTablePagination,
@@ -8662,9 +8847,20 @@ function renderAccountingCacheReuseOutcome(impact) {
   const empty = $("#cache-reuse-empty");
   if (!outcome || !raster || !empty) return;
   const buckets = cacheReuseOutcomeBuckets(impact);
-  outcome.hidden = buckets === null;
+  const available = buckets !== null;
+  outcome.hidden = false;
+  for (const selector of [".cache-reuse-real-data", ".cache-reuse-summary"]) {
+    const element = outcome.querySelector(selector);
+    if (element) element.hidden = !available;
+  }
   if (buckets === null) {
     cacheReuseCurrentImpact = null;
+    raster.hidden = true;
+    empty.hidden = false;
+    setLocalizedText(
+      empty,
+      "accounting.cacheContinuity.outcome.insufficientEvidence",
+    );
     return;
   }
   cacheReuseCurrentImpact = impact;
@@ -8700,6 +8896,7 @@ function renderAccountingCacheReuseOutcome(impact) {
       between: formatCount(impact.reusedBetweenHalfAndPreviousReturns),
     },
   );
+  setLocalizedText(empty, "accounting.cacheContinuity.outcome.noData");
   empty.hidden = total !== 0;
   raster.hidden = total === 0;
   if (total === 0) return;
@@ -8746,10 +8943,22 @@ function renderAccountingCacheContinuityDetails(impact) {
   if (!disclosure || !rows) return;
   clear(rows);
   const available = impact?.status === "available";
-  disclosure.hidden = !available;
+  // Like the switch panel, an unavailable analysis is a truthful state, not
+  // an absent feature. Keep the panel visible and make the missing evidence
+  // explicit without rendering a zero-valued estimate.
+  disclosure.hidden = false;
   renderAccountingCacheReuseOutcome(available ? impact : null);
   if (!available) {
     disclosure.open = false;
+    const row = node("tr");
+    const cell = localizedNode(
+      "td",
+      "empty-cell",
+      "accounting.cacheContinuity.detailsUnavailable",
+    );
+    cell.colSpan = 6;
+    row.append(cell);
+    rows.append(row);
     renderCacheImpactPagination(
       "cache-continuity",
       cacheContinuityTablePagination,
@@ -10605,7 +10814,7 @@ async function loadLocalDashboard() {
   const previousBusy = localActionBusy;
   localActionBusy = true;
   const button = $("#refresh-button");
-  button.textContent = "Connecting…";
+  setLocalizedText(button, "action.connecting");
   updateLocalActionButtons();
   try {
     const syncState = (async () => {
@@ -10792,6 +11001,55 @@ function scheduleReindexAutoContinuation() {
   }, REINDEX_AUTO_CONTINUE_DELAY_MS);
 }
 
+function signalElectronRefreshLifecycle(action, args = [], options = {}) {
+  if (!runsInsideElectronDashboard()) return Promise.resolve(null);
+  const bridge = globalThis.tibotattleDesktop;
+  if (typeof bridge?.[action] !== "function" || !Array.isArray(args)) {
+    return Promise.resolve(null);
+  }
+  const onLateValue = typeof options?.onLateValue === "function"
+    ? options.onLateValue
+    : null;
+  let call;
+  try {
+    call = Promise.resolve(bridge[action](...args));
+  } catch {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    let timedOut = false;
+    const reportLateValue = (value) => {
+      if (!onLateValue) return;
+      try {
+        onLateValue(value);
+      } catch {
+        // A late cadence cleanup is best effort and must not affect the
+        // already-running renderer refresh.
+      }
+    };
+    const timer = setTimeout(() => {
+      settled = true;
+      timedOut = true;
+      resolve(null);
+    }, ELECTRON_REFRESH_LIFECYCLE_SIGNAL_TIMEOUT_MS);
+    call.then((value) => {
+      if (settled) {
+        if (timedOut) reportLateValue(value);
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      return resolve(value);
+    }, () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(null);
+    });
+  });
+}
+
 async function requestRefresh({ autoContinue = false } = {}) {
   if (localActionBusy) return;
   // Fence continuation against the exact coverage visible before this pass.
@@ -10804,8 +11062,8 @@ async function requestRefresh({ autoContinue = false } = {}) {
   if (!autoContinue) reindexAutoContinuations = 0;
   if (!localAnalysisAllowed()) {
     showConnectionNotice({
-      title: "Finish the local check before analyzing",
-      copy: "Open Codex and complete one response, then choose Check again. TiboTattle will not start an analysis while its local preflight is incomplete.",
+      titleKey: "localAnalysis.notice.preflightTitle",
+      copyKey: "localAnalysis.notice.preflightCopy",
       kind: "warning",
       showCheck: true,
       showDemo: !dashboard,
@@ -10814,22 +11072,115 @@ async function requestRefresh({ autoContinue = false } = {}) {
     return;
   }
   const button = $("#refresh-button");
+  const electronRefresh = runsInsideElectronDashboard();
   let refreshAccepted = false;
   let cancelled = false;
   let quickResultLoaded = false;
   let continuationLimitReached = false;
+  let progressTicker = null;
+  let activePassStartedMs = null;
+  let latestProgress = null;
+  let latestOutcome = "running";
+  let latestPollCount = 0;
+  let lastStatusReceivedMs = null;
+  let refreshStartSignal = Promise.resolve(null);
+  let lateRefreshLease = null;
+  let refreshLifecycleFinished = false;
+  const handleLateRefreshLease = (lease) => {
+    if (!Number.isSafeInteger(lease) || lease <= 0) return;
+    if (!refreshLifecycleFinished) {
+      lateRefreshLease = lease;
+      return;
+    }
+    // The operation has already reached its terminal cleanup. Settle a lease
+    // whose start response crossed the one-second bridge bound after the
+    // renderer had stopped awaiting it.
+    void signalElectronRefreshLifecycle("refreshSettled", [{ lease }]);
+  };
+  const elapsedLabel = () => {
+    const elapsedSeconds = Math.max(
+      0,
+      Math.floor((Date.now() - (activePassStartedMs ?? Date.now())) / 1_000),
+    );
+    return elapsedSeconds >= 60
+      ? `${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s`
+      : `${elapsedSeconds}s`;
+  };
+  const renderRefreshActivity = () => {
+    if (!localRefreshInProgress || activePassStartedMs === null) return;
+    // A terminal response owns the label while its verified dashboard is
+    // loading. This check must precede the local cancel flag: that flag stays
+    // set until finally, including after the companion confirms cancellation
+    // or finishes before the request reaches it.
+    if (!["running", "cancelling"].includes(latestOutcome)) return;
+    if (localRefreshCancelRequested || latestOutcome === "cancelling") {
+      setLocalizedText(button, "localAnalysis.progress.stopping");
+      return;
+    }
+    const elapsed = elapsedLabel();
+    const statusDelayed = lastStatusReceivedMs !== null
+      && Date.now() - lastStatusReceivedMs >= 3_000;
+    const progress = latestProgress;
+    const archiveScanning = progress?.kind === "archive_index";
+    const processed = Number.isSafeInteger(progress?.filesProcessed)
+      ? progress.filesProcessed : null;
+    const selected = Number.isSafeInteger(progress?.filesSelected)
+      ? progress.filesSelected : null;
+    if (statusDelayed) {
+      setLocalizedText(button, "localAnalysis.progress.statusDelayed", { elapsed });
+    } else if (archiveScanning) {
+      setLocalizedText(button, "localAnalysis.progress.indexingArchive", { elapsed });
+    } else if (progress?.phase === "quick_result") {
+      setLocalizedText(button, "localAnalysis.progress.headlineReady", { elapsed });
+    } else if (processed !== null && selected !== null) {
+      if (selected > 0 && processed >= selected) {
+        setLocalizedText(button, "localAnalysis.progress.calculating", { elapsed });
+      } else {
+        setLocalizedText(button, "localAnalysis.progress.analyzingFiles", {
+          processed: formatNumber(processed),
+          selected: formatNumber(selected),
+        });
+      }
+    } else if (latestPollCount < 3) {
+      setLocalizedText(button, "localAnalysis.progress.analyzingEvidence");
+    } else {
+      setLocalizedText(button, "localAnalysis.progress.analyzingElapsed", { elapsed });
+    }
+  };
   localActionBusy = true;
   localRefreshInProgress = true;
   localRefreshCancelRequested = false;
   archiveHistoryScanActive = false;
-  button.textContent = "Starting local analysis…";
+  setLocalizedText(button, "localAnalysis.progress.starting");
   updateLocalActionButtons();
   setGlobalState("updating");
   try {
     await localClient.refresh();
     refreshAccepted = true;
-    let activePassStartedMs = Date.now();
-    const pollingBudget = createRefreshPollingBudget();
+    if (electronRefresh) {
+      // Do not await the main-process cadence lease: status polling and the
+      // progress ticker must begin as soon as the companion accepts work.
+      refreshStartSignal = signalElectronRefreshLifecycle(
+        "refreshStarted",
+        [],
+        { onLateValue: handleLateRefreshLease },
+      );
+    }
+    activePassStartedMs = Date.now();
+    lastStatusReceivedMs = activePassStartedMs;
+    progressTicker = setInterval(renderRefreshActivity, 1_000);
+    const pollingBudget = createRefreshPollingBudget(
+      electronRefresh
+        ? { windowMs: ELECTRON_REFRESH_POLLING_WINDOW_MS }
+        : {},
+    );
+    // Continuation checkpoints may each receive a fresh short polling window,
+    // but an Electron foreground operation has one immutable wall-clock
+    // deadline. This prevents a sequence of bounded pauses from silently
+    // turning into an hour-plus operation in the renderer.
+    const electronOperationDeadlineMs = electronRefresh
+      ? Date.now() + ELECTRON_REFRESH_POLLING_WINDOW_MS
+      : null;
     let consecutiveStatusFailures = 0;
     let outcome = "running";
     let finalErrorCode = null;
@@ -10839,17 +11190,31 @@ async function requestRefresh({ autoContinue = false } = {}) {
     let pollCount = 0;
     let timeoutSettlementNoted = false;
     while (pollingBudget.hasTime()
+        && (electronOperationDeadlineMs === null
+          || Date.now() < electronOperationDeadlineMs)
         && ["running", "cancelling"].includes(outcome)) {
       await new Promise((resolve) => setTimeout(resolve, 750));
       pollCount += 1;
       let status;
       try {
-        status = await localClient.refreshStatus();
+        const remainingElectronMs = electronOperationDeadlineMs === null
+          ? null
+          : Math.max(1, electronOperationDeadlineMs - Date.now());
+        status = await localClient.refreshStatus(
+          remainingElectronMs === null
+            ? undefined
+            : { timeoutMs: remainingElectronMs },
+        );
         consecutiveStatusFailures = 0;
+        lastStatusReceivedMs = Date.now();
       } catch (error) {
         consecutiveStatusFailures += 1;
-        button.textContent = "Update running; reconnecting…";
-        if (consecutiveStatusFailures >= 8) throw error;
+        setLocalizedText(button, "localAnalysis.progress.reconnecting");
+        if (shouldAbortRefreshStatusPolling({
+          isElectron: electronRefresh,
+          consecutiveFailures: consecutiveStatusFailures,
+          operationDeadlineMs: electronOperationDeadlineMs,
+        })) throw error;
         continue;
       }
       const refresh = status?.refresh ?? {};
@@ -10859,6 +11224,9 @@ async function requestRefresh({ autoContinue = false } = {}) {
       finalFailureCode = refresh.failureCode ?? finalFailureCode;
       finalUnifiedIndex = refresh.result?.unifiedIndex ?? finalUnifiedIndex;
       const progress = refresh.progress ?? refresh.result?.indexing ?? null;
+      latestProgress = progress;
+      latestOutcome = outcome;
+      latestPollCount = pollCount;
       const archiveScanning = progress?.kind === "archive_index";
       if (archiveScanning && !archiveHistoryScanActive) {
         archiveHistoryScanActive = true;
@@ -10873,28 +11241,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
           // deep accounting finishes, and no partial replacement is invented.
         }
       }
-      const elapsedSeconds = Math.max(
-        0,
-        Math.floor((Date.now() - activePassStartedMs) / 1_000),
-      );
-      const elapsedLabel = elapsedSeconds >= 60
-        ? `${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s`
-        : `${elapsedSeconds}s`;
-      const processed = Number.isSafeInteger(progress?.filesProcessed)
-        ? progress.filesProcessed : null;
-      const selected = Number.isSafeInteger(progress?.filesSelected)
-        ? progress.filesSelected : null;
-      button.textContent = outcome === "cancelling"
-        ? "Stopping safely…"
-        : archiveScanning
-          ? `Indexing archive history… ${elapsedLabel}`
-        : progress?.phase === "quick_result"
-          ? `Headline ready; finishing deeper accounting… ${elapsedLabel}`
-        : processed !== null && selected !== null
-        ? selected > 0 && processed >= selected
-          ? `Calculating usage and allowance… ${elapsedLabel}`
-          : `Analyzing ${processed}/${selected} files…`
-        : pollCount < 3 ? "Analyzing local evidence…" : `Analyzing… ${elapsedLabel}`;
+      renderRefreshActivity();
       if (refreshNeedsContinuation({
         outcome,
         errorCode: refresh.errorCode,
@@ -10908,8 +11255,9 @@ async function requestRefresh({ autoContinue = false } = {}) {
           await localClient.refresh();
           pollingBudget.noteContinuation();
           activePassStartedMs = Date.now();
+          lastStatusReceivedMs = activePassStartedMs;
           timeoutSettlementNoted = false;
-          button.textContent = "Continuing local analysis…";
+          setLocalizedText(button, "localAnalysis.progress.continuing");
         } catch (error) {
           // A 409 means a timed-out pass is still finishing its durable
           // checkpoint. Keep polling until it becomes resumable.
@@ -10924,7 +11272,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
       }
       if (outcome === "failed"
           && refresh.errorCode === "refresh_timed_out") {
-        button.textContent = "Finalizing bounded pause…";
+        setLocalizedText(button, "localAnalysis.progress.finalizingPause");
         if (!timeoutSettlementNoted) {
           pollingBudget.noteSettling();
           timeoutSettlementNoted = true;
@@ -10934,22 +11282,22 @@ async function requestRefresh({ autoContinue = false } = {}) {
     }
     cancelled = outcome === "cancelled";
     if (cancelled) {
-      button.textContent = "Loading saved results…";
+      setLocalizedText(button, "localAnalysis.progress.loadingSaved");
       await loadLocalDashboard();
       showConnectionNotice({
-        title: "Local analysis cancelled",
-        copy: "TiboTattle stopped at a safe boundary. Verified existing results were kept, and the resumable checkpoint remains on this Mac.",
+        titleKey: "localAnalysis.notice.cancelledTitle",
+        copyKey: "localAnalysis.notice.cancelledCopy",
         kind: "info",
       });
       return;
     }
     if (outcome === "failed"
         && finalErrorCode === "refresh_resource_limited") {
-      button.textContent = "Loading saved results…";
+      setLocalizedText(button, "localAnalysis.progress.loadingSaved");
       await loadLocalDashboard();
       showConnectionNotice({
-        title: "This scan paused to protect your Mac",
-        copy: "Your last verified results are still shown. This unusually large history reached TiboTattle’s fixed local safety limit, so it paused before exceeding it. No partial result replaced your existing results, and nothing left this Mac.",
+        titleKey: "localAnalysis.notice.resourceLimitedTitle",
+        copyKey: "localAnalysis.notice.resourceLimitedCopy",
         kind: "warning",
       });
       return;
@@ -10998,7 +11346,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
       throw failure;
     }
     archiveHistoryScanActive = false;
-    button.textContent = "Loading updated evidence…";
+    setLocalizedText(button, "localAnalysis.progress.loadingUpdated");
     await loadLocalDashboard();
     scheduleReindexAutoContinuation();
   } catch (error) {
@@ -11028,22 +11376,31 @@ async function requestRefresh({ autoContinue = false } = {}) {
         : "The local companion may be offline, busy, or rejecting this request. Existing evidence has not been altered.",
     });
     showConnectionNotice({
-      title: continuationLimitReached
-        ? "Deep analysis paused after two bounded continuations"
+      titleKey: continuationLimitReached
+        ? "localAnalysis.notice.continuationLimitTitle"
         : refreshAccepted
-          ? "The local analysis did not finish"
-        : "Local analysis could not be started",
+          ? "localAnalysis.notice.notFinishedTitle"
+        : "localAnalysis.notice.couldNotStartTitle",
       copy: described.text,
       kind: continuationLimitReached ? "warning" : "error",
       showDemo: !dashboard
     });
   } finally {
+    if (progressTicker !== null) clearInterval(progressTicker);
     const wasArchiveScanning = archiveHistoryScanActive;
     archiveHistoryScanActive = false;
     if (wasArchiveScanning && dashboard) renderPricing(dashboard);
     localActionBusy = false;
     localRefreshInProgress = false;
     localRefreshCancelRequested = false;
+    if (electronRefresh && refreshAccepted) {
+      let lease = await refreshStartSignal;
+      if (!Number.isSafeInteger(lease) || lease <= 0) lease = lateRefreshLease;
+      if (Number.isSafeInteger(lease) && lease > 0) {
+        await signalElectronRefreshLifecycle("refreshSettled", [{ lease }]);
+      }
+    }
+    refreshLifecycleFinished = true;
     updateLocalActionButtons();
   }
 }
@@ -11055,15 +11412,50 @@ async function cancelLocalAnalysis() {
   try {
     await localClient.cancelRefresh();
     showConnectionNotice({
-      title: "Cancellation requested",
-      copy: "TiboTattle is stopping after its current atomic step and preserving a resumable local checkpoint.",
+      titleKey: "localAnalysis.notice.cancellationRequestedTitle",
+      copyKey: "localAnalysis.notice.cancellationRequestedCopy",
       kind: "info",
     });
-  } catch {
+  } catch (error) {
     localRefreshCancelRequested = false;
+    if (error?.code === "refresh_cancel_timed_out") {
+      // The cancellation request itself has a deadline. A timeout means only
+      // that cancellation was not confirmed; the refresh status loop remains
+      // the authority and keeps running until it reaches a terminal state or
+      // its operation deadline. Never leave the toolbar stuck on Stopping.
+      showConnectionNotice({
+        titleKey: "localAnalysis.notice.cancellationFailedTitle",
+        copyKey: "localAnalysis.notice.cancellationFailedCopy",
+        kind: "warning",
+        showCheck: true,
+      });
+      updateLocalActionButtons();
+      return;
+    }
+    if (error?.code === "refresh_not_running") {
+      // The refresh can reach its terminal state between the toolbar's last
+      // status poll and this POST. That is not a failed cancellation or a
+      // crashed companion: the request simply lost a harmless race. Keep the
+      // foreground refresh loop alive so it can render the terminal result,
+      // and explain the race instead of showing the generic warning seen in
+      // the Electron dogfood build.
+      showConnectionNotice({
+        titleKey: "localAnalysis.notice.alreadyStoppedTitle",
+        copyKey: "localAnalysis.notice.alreadyStoppedCopy",
+        kind: "info",
+        showCheck: true,
+      });
+      updateLocalActionButtons();
+      return;
+    }
+    const described = await describeFailure({
+      surface: "local_refresh",
+      error,
+      fallback: t("localAnalysis.notice.cancellationFailedCopy"),
+    });
     showConnectionNotice({
-      title: "Cancellation could not be requested",
-      copy: "The analysis may already have finished or the local companion may be reconnecting. Existing verified results are unchanged.",
+      titleKey: "localAnalysis.notice.cancellationFailedTitle",
+      copy: described.text,
       kind: "warning",
       showCheck: true,
     });
@@ -11080,16 +11472,16 @@ async function checkLocalSetup() {
     "#setup-check-again",
   ]) {
     const button = $(selector);
-    if (button) button.textContent = "Checking…";
+    if (button) setLocalizedText(button, "action.checking");
   }
   updateLocalActionButtons();
   try {
     await loadLocalDashboard();
   } finally {
     localActionBusy = false;
-    $("#connection-check").textContent = "Check again";
-    $("#companion-check").textContent = "Check this page again";
-    $("#setup-check-again").textContent = "Check again";
+    setLocalizedText($("#connection-check"), "action.checkAgain");
+    setLocalizedText($("#companion-check"), "action.checkThisPageAgain");
+    setLocalizedText($("#setup-check-again"), "action.checkAgain");
     updateLocalActionButtons();
   }
 }
@@ -11123,13 +11515,72 @@ async function reloadLocalEvidenceAfterNativeRefresh() {
   }
 }
 
+/**
+ * Start Electron's one launch-time foreground analysis after the initial
+ * dashboard read has settled. `ready-to-show` is too early: it can race the
+ * page's loopback reads, and a first-ever snapshot contains no prior evidence
+ * for the ordinary return-visit scheduler below. The existing request guards
+ * still prevent overlap with a refresh already accepted by the companion.
+ */
+function startElectronStartupRefresh() {
+  if (electronStartupRefreshTriggered
+      || !runsInsideElectronDashboard()
+      || !localAnalysisAllowed()) {
+    return false;
+  }
+  electronStartupRefreshTriggered = true;
+  const macSmokeBridge = globalThis.__TIBOTATTLE_ELECTRON_MACOS_SMOKE__;
+  const windowsSmokeBridge = globalThis.__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__;
+  // Only one qualified bridge should ever be present. Treat both bridges as
+  // malformed rather than choosing one, so a stale or mixed preload cannot
+  // silently release an unobserved refresh. A present bridge is selected even
+  // when its value is null, preserving the existing macOS fail-closed rule.
+  const smokeBridge = macSmokeBridge !== undefined
+    && windowsSmokeBridge !== undefined
+    ? null
+    : windowsSmokeBridge !== undefined
+      ? windowsSmokeBridge
+      : macSmokeBridge;
+  if (smokeBridge !== undefined) {
+    // The opt-in platform smoke bridge is a preload-owned barrier. A
+    // malformed bridge fails closed after the document's one-shot has been
+    // consumed; the smoke then reports the missing/malformed gate instead of
+    // allowing an unobserved refresh to race CDP attachment. This remains
+    // inert in production because neither bridge is exposed without its
+    // exact platform/control gate in preload.cjs.
+    if (smokeBridge === null
+        || smokeBridge.version !== "v1"
+        || typeof smokeBridge.waitForStartupRefresh !== "function") {
+      return true;
+    }
+    let gate;
+    try {
+      gate = smokeBridge.waitForStartupRefresh();
+    } catch {
+      return true;
+    }
+    if (!gate || typeof gate.then !== "function") return true;
+    void Promise.resolve(gate).then(() => {
+      void requestRefresh();
+    }).catch(() => {});
+    return true;
+  }
+  void requestRefresh();
+  return true;
+}
+
 function scheduleReturningUserRefresh() {
-  // The native macOS shell owns the foreground cadence. Running both the web
-  // return-visit timer and the native timer races the same bounded companion
-  // request, which can surface a harmless 409 as a confusing dashboard error.
-  // What the shell owes in return is a signal when its refresh finished, which
-  // `tibotattle:local-evidence-updated` carries.
+  // The native macOS shell and Electron main process own the foreground
+  // cadence. Running both the web return-visit timer and an app-owned timer
+  // races the same bounded companion request, which can surface a harmless 409
+  // as a confusing dashboard error. The Electron launch pass is deliberately
+  // fenced for the whole document: a fast startup completion must not be
+  // followed by this scheduler's cached-results refresh. What the native
+  // shell owes in return is a signal when its refresh finished, which
+  // `tibotattle:local-evidence-updated` carries; Electron's controller has its
+  // own recurring timer for the next pass.
   if (runsInsideNativeDashboard()) return;
+  if (runsInsideElectronDashboard() && electronStartupRefreshTriggered) return;
   const priorEvidence = dashboard?.mode !== "demo"
     && Boolean(
       dashboard?.activity?.lastScanAt
@@ -11862,15 +12313,53 @@ function runsInsideNativeDashboard() {
     || document.body?.classList.contains("native-dashboard");
 }
 
-function openHostedSignInInBrowser(authorizeUrl) {
+function runsInsideElectronDashboard() {
+  return document.documentElement.classList.contains("electron-dashboard")
+    || document.body?.classList.contains("electron-dashboard");
+}
+
+function hostedSignInBrowserHandoffError(code) {
+  const error = new Error("TiboTattle could not open the sign-in browser.");
+  error.code = code;
+  return error;
+}
+
+async function openHostedSignInInBrowser(authorizeUrl) {
   if (runsInsideNativeDashboard()) {
     window.location.assign(authorizeUrl);
-    return;
+    return true;
+  }
+  if (runsInsideElectronDashboard()) {
+    if (typeof window.tibotattleDesktop?.openHostedSignIn !== "function") {
+      throw hostedSignInBrowserHandoffError("HOSTED_SIGNIN_BRIDGE_UNAVAILABLE");
+    }
+    try {
+      await window.tibotattleDesktop.openHostedSignIn(authorizeUrl);
+      return true;
+    } catch (error) {
+      // Do not let a renderer-visible error carry an authorization request or
+      // an arbitrary platform message. The main/preload boundaries already
+      // expose only fixed error codes; this final projection keeps that rule
+      // true if a future Electron API changes its rejection shape.
+      const safeCodes = new Set([
+        "desktop_hosted_signin_url_invalid",
+        "desktop_hosted_signin_open_failed",
+        "desktop_ipc_handler_failed",
+      ]);
+      const code = safeCodes.has(error?.code)
+        ? error.code
+        : "HOSTED_SIGNIN_BROWSER_OPEN_FAILED";
+      throw hostedSignInBrowserHandoffError(code);
+    }
   }
   // A regular browser needs to keep this dashboard alive so its bounded poll
   // can collect the one-time result. The callback page still offers the same
   // safe return link to the installed app.
-  window.open(authorizeUrl, "_blank", "noopener,noreferrer");
+  const opened = window.open(authorizeUrl, "_blank", "noopener,noreferrer");
+  if (opened === null) {
+    throw hostedSignInBrowserHandoffError("HOSTED_SIGNIN_BROWSER_BLOCKED");
+  }
+  return true;
 }
 
 function foregroundNativeDashboardAfterSignIn() {
@@ -12183,7 +12672,7 @@ async function beginHostedSignIn(providerId) {
       await clearPendingHostedSignIn().catch(() => {});
       return;
     }
-    openHostedSignInInBrowser(request.authorizeUrl);
+    await openHostedSignInInBrowser(request.authorizeUrl);
     status.textContent = flow.waiting;
     for (let poll = 0; poll < HOSTED_SIGNIN_POLL_ATTEMPTS; poll += 1) {
       if (attempt.cancelled || activeHostedSignIn !== attempt) return;
@@ -12320,6 +12809,25 @@ function renderCommunityJourney() {
       stage("index", "done", "journey.index.complete");
     } else {
       stage("index", "done", "journey.index.completeWithEvidence", {
+        time: observedAt,
+      });
+    }
+  } else if (dashboard
+      && dashboard.mode !== "demo"
+      && history?.phase === "partial_terminal") {
+    // A coherent terminal gap is finished work, not an index still in flight.
+    // Keep the valid indexed history and quarantined source count visible; the
+    // detail deliberately says partial so "Done" cannot imply that missing
+    // sources were recovered or uploaded.
+    const partialValues = {
+      indexed: formatNumber(finite(history.indexedSourceCount, 0)),
+      sources: formatNumber(finite(history.skippedSourceCount, 0)),
+    };
+    if (observedAt === null) {
+      stage("index", "done", "journey.index.partial", partialValues);
+    } else {
+      stage("index", "done", "journey.index.partialWithEvidence", {
+        ...partialValues,
         time: observedAt,
       });
     }
@@ -14013,6 +14521,14 @@ $("#accounting-period-controls").addEventListener("click", (event) => {
 });
 $("#share-card-download").addEventListener("click", downloadShareCard);
 $("#share-card-copy").addEventListener("click", copyShareCardImage);
+window.addEventListener(
+  "tibotattle:share-card-download-completed",
+  handleElectronShareCardDownloadCompleted,
+);
+window.addEventListener(
+  "tibotattle:share-card-download-failed",
+  handleElectronShareCardDownloadFailed,
+);
 document.addEventListener("click", (event) => {
   const current = activeInformationPopover;
   if (!current) return;
@@ -14046,6 +14562,7 @@ async function bootstrapDashboard() {
   renderHostedIdentity();
   updateLocalActionButtons();
   await loadLocalDashboard();
+  startElectronStartupRefresh();
   if (
     localCompanionHealth === null
     || localCompanionHealth?.capabilities?.centralServiceProxy === true

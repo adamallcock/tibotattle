@@ -1,6 +1,6 @@
 ---
 title: Windows portability qualification environments
-date: 2026-08-17
+date: 2026-08-18
 type: runbook
 status: qualified-and-restorable
 ---
@@ -57,6 +57,35 @@ watchdog must still terminate it after its configured parent disappears.
 To recover the environment, reinstall Docker Desktop or Colima, start the
 daemon, and rerun the two commands. The Dockerfile is the environment
 definition; no long-lived container state is required.
+
+### Linux Electron GUI smoke
+
+Build the pinned Debian-based Electron image, then run the GUI smoke with no
+network access:
+
+```bash
+pnpm container:electron-linux:build
+pnpm container:electron-linux:test
+```
+
+The image uses Debian Bookworm arm64, Node 26.2.0, pnpm 11.9.0, Electron
+43.2.0, and Xvfb with TCP listening disabled. The build needs network access
+for the pinned base image, locked dependencies, and Electron runtime; the
+test command uses `--network none`, `--init`, and synthetic disposable
+`HOME`, `CODEX_HOME`, Claude configuration, and state directories. The
+package script also supplies `--cap-add=SYS_ADMIN`, a disposable test-only
+allowance needed by Chromium's sandbox namespace under the default Colima
+seccomp profile; it does not grant the image network access or persist any
+state.
+
+The smoke proves source Electron on Linux can launch the real dashboard and
+companion, observe the loopback health endpoint, reload the renderer, and
+invoke the exact gated main-process `requestQuit()` path via `SIGUSR2`, ending
+with Electron exit code 0 and no remaining companion descendant. It is
+development smoke evidence only. It does not qualify a Linux package,
+installer, signer, updater, credential backend, desktop-manager integration,
+cross-distro behavior, or Windows filesystem/ACL/Credential Manager/SQLite
+support. Never point this lane at a real user home or credential store.
 
 ## Native Windows x64 lane
 

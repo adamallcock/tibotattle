@@ -273,6 +273,55 @@ test("supplemental plans are strict, deterministic, and resource-accountable", a
   }
 });
 
+test("Windows-sized Claude supplemental identities round-trip through close and reopen", async () => {
+  const base = supplementalPlan().sources[0];
+  const oversized = ((2n ** 64n) - 1n).toString(10);
+  const supplemental = createSupplementalSourcePlan({
+    sources: [{
+      ...base,
+      kind: "claude_transcript_jsonl",
+      parserVersion: "claude-transcript-export-source-plan-v0.2",
+      binding: {
+        ...base.binding,
+        device: oversized,
+        inode: oversized,
+      },
+    }],
+  });
+  const value = await fixture({ supplemental });
+  const supplementalPrivatePlans = [{
+    sourceKey: supplemental.sources[0].sourceKey,
+    valueJson: stableJson({ opaquePrivatePlan: "claude-transcript-fixture" }),
+  }];
+  let workspace;
+  try {
+    workspace = await createExportWorkspace({
+      directory: value.workspace,
+      descriptor: value.descriptor,
+      sourcePlan: value.sourcePlan,
+      supplementalSourcePlan: supplemental,
+      supplementalPrivatePlans,
+    });
+    assert.deepEqual(workspace.loadSupplementalSourcePlan(), supplemental);
+    const checkpoint = workspace.loadNextSupplementalSourceCheckpoint();
+    assert.equal(checkpoint.binding.device, oversized);
+    assert.equal(checkpoint.binding.inode, oversized);
+    workspace.close();
+    workspace = await openExportWorkspace({ directory: value.workspace, expectedDescriptor: value.descriptor });
+    assert.deepEqual(workspace.loadSupplementalSourcePlan(), supplemental);
+    assert.deepEqual(
+      workspace.loadSupplementalPrivatePlan(supplemental.sources[0].sourceKey),
+      { opaquePrivatePlan: "claude-transcript-fixture" },
+    );
+    const reopenedCheckpoint = workspace.loadNextSupplementalSourceCheckpoint();
+    assert.equal(reopenedCheckpoint.binding.device, oversized);
+    assert.equal(reopenedCheckpoint.binding.inode, oversized);
+  } finally {
+    await workspace?.close?.();
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
 test("Claude private plans are exact and bounded before reopening parses them", async () => {
   const value = await fixture();
   let workspace;

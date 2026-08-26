@@ -166,6 +166,68 @@ test("installation roots reject relative, overlapping, symlink, and open state d
   }
 });
 
+test("Windows adapter injection is rejected on non-Windows hosts", {
+  skip: process.platform === "win32" ? "non-Windows injection contract" : false,
+}, async () => {
+  const files = await fixture();
+  const virtualStateRoot = join(files.root, "virtual-windows-state");
+  const virtualFilesystem = {
+    productionSafe: true,
+    pathWalkRaceSafe: true,
+    inspectPath() {},
+    ensureDirectory() {},
+    readFile() {},
+    createFile() {},
+    deleteFile() {},
+    replaceFile() {},
+  };
+  try {
+    for (const adapter of [virtualFilesystem, { ...virtualFilesystem }]) {
+      assert.throws(
+        () => prepareLocalInstallationRoots({
+          resourceRoot: files.resourceRoot,
+          stateRoot: virtualStateRoot,
+          windowsFilesystemAdapter: adapter,
+        }),
+        (error) => error?.code === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID",
+      );
+      await assert.rejects(lstat(virtualStateRoot));
+    }
+    await assert.rejects(
+      () => inspectLocalOnboarding({
+        codexHome: files.codexHome,
+        stateRoot: virtualStateRoot,
+        windowsFilesystemAdapter: virtualFilesystem,
+      }),
+      (error) => error?.code === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID",
+    );
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("Windows state-root diagnostics reject a partial adapter instead of falling back", async () => {
+  const files = await fixture();
+  const virtualStateRoot = join(files.root, "virtual-windows-state");
+  try {
+    assert.throws(
+      () => prepareLocalInstallationRoots({
+        resourceRoot: files.resourceRoot,
+        stateRoot: virtualStateRoot,
+        windowsFilesystemAdapter: {
+          productionSafe: true,
+          pathWalkRaceSafe: true,
+          ensureDirectory() {},
+        },
+      }),
+      (error) => error?.code === "USAGE_MONITOR_LOCAL_INSTALLATION_INVALID",
+    );
+    await assert.rejects(lstat(virtualStateRoot));
+  } finally {
+    await rm(files.root, { recursive: true });
+  }
+});
+
 test("onboarding reports capped source readiness without paths, names, content, or identifiers", async () => {
   const files = await fixture();
   const privateCanary = "account-private-canary";

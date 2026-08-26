@@ -3,3 +3,7 @@ packages:
 
 allowBuilds:
   '@github/keytar': false
+  electron-winstaller: false
+
+patchedDependencies:
+  app-builder-lib@26.15.7: patches/app-builder-lib@26.15.7.patch

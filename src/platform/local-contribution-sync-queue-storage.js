@@ -10,11 +10,26 @@ import {
   rmdir,
   unlink,
 } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
+import {
+  basename,
+  dirname,
+  join,
+  posix,
+  resolve,
+  win32,
+} from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { readBoundedDirectoryEntries } from "./bounded-directory-reader.js";
 import { syncDirectory } from "./owner-only-filesystem.js";
+import {
+  createWindowsContributionSyncQueuePreparedStoragePorts,
+} from "./windows-contribution-sync-queue-storage.js";
+import {
+  WINDOWS_SQLITE_STATE_SESSION_CONTRACT_VERSION,
+  isWindowsSqliteStateDatabase,
+  isWindowsSqliteStateSession,
+} from "./windows-sqlite-state-session.js";
 
 const SQLITE_USER_VERSION = 1;
 const SHA256 = /^[a-f0-9]{64}$/u;
@@ -73,6 +88,9 @@ export function createLocalContributionSyncQueueStorageContext({
   maximumQueueJobs,
   jobStates,
   uuid = randomUUID,
+  platform = process.platform,
+  windowsSqliteStateSessionFactory = null,
+  windowsPreparedArtifactStorage = null,
 } = {}) {
   const failures = failureContext(createError);
   const createUuid = requireFunction(uuid, "uuid");
@@ -84,10 +102,27 @@ export function createLocalContributionSyncQueueStorageContext({
       || !integer(maximumQueueJobs, 1, Number.MAX_SAFE_INTEGER)
       || !Array.isArray(jobStates)
       || jobStates.length !== 5
-      || jobStates.some((state) => typeof state !== "string")) {
+      || jobStates.some((state) => typeof state !== "string")
+      || typeof platform !== "string"
+      || platform.length < 1
+      || platform.length > 32
+      || (process.platform === "win32" && platform !== "win32")
+      || (windowsSqliteStateSessionFactory !== null
+        && typeof windowsSqliteStateSessionFactory !== "function")
+      || (windowsPreparedArtifactStorage !== null
+        && (typeof windowsPreparedArtifactStorage !== "object"
+          || Array.isArray(windowsPreparedArtifactStorage)))) {
     throw new TypeError("contribution queue storage configuration is invalid");
   }
   const states = Object.freeze([...jobStates]);
+  const windowsPreparedStoragePorts = platform === "win32"
+    && windowsPreparedArtifactStorage !== null
+    ? createWindowsContributionSyncQueuePreparedStoragePorts({
+      createError,
+      storage: windowsPreparedArtifactStorage,
+      maximumDirectoryEntries: 256,
+    })
+    : null;
 
   function nextUuid(code) {
     let value;
@@ -233,7 +268,8 @@ export function createLocalContributionSyncQueueStorageContext({
     }
   }
 
-  function createRepository(database) {
+  function createRepository(database, close = () => database.close()) {
+    const closeDatabase = requireFunction(close, "close");
     function enqueueJob({
       preparedSetId,
       setName,
@@ -621,7 +657,7 @@ export function createLocalContributionSyncQueueStorageContext({
     return Object.freeze({
       acceptedSets,
       claimJob,
-      close: () => database.close(),
+      close: closeDatabase,
       deleteAcceptedSet,
       deleteInactiveSet,
       enqueueJob,
@@ -639,7 +675,88 @@ export function createLocalContributionSyncQueueStorageContext({
     });
   }
 
+  async function openWindowsQueue({ queueFile, now } = {}) {
+    // A Windows queue must be opened by the native root-bound SQLite session.
+    // In particular, do not call prepareQueueFile(), lstat(), or ordinary
+    // DatabaseSync(path) here: those paths cannot provide the qualified
+    // identity/lease contract required by production Windows state.
+    const factory = windowsSqliteStateSessionFactory;
+    if (typeof factory !== "function") failures.fail("queue_unavailable");
+    if (typeof queueFile !== "string" || queueFile.length < 1) {
+      failures.fail("configuration_invalid");
+    }
+    const pathModule = platform === "win32" ? win32 : posix;
+    const rootPath = pathModule.dirname(queueFile);
+    const databaseName = pathModule.basename(queueFile);
+    let session;
+    try {
+      session = await Reflect.apply(factory, undefined, [{
+        rootPath,
+        databaseName,
+        queueFile,
+      }]);
+    } catch {
+      failures.fail("queue_unavailable");
+    }
+    let qualified = false;
+    try {
+      qualified = isWindowsSqliteStateSession(session)
+        && session.contractVersion
+          === WINDOWS_SQLITE_STATE_SESSION_CONTRACT_VERSION
+        && pathModule.normalize(session.rootPath).toLowerCase()
+          === pathModule.normalize(rootPath).toLowerCase()
+        && pathModule.normalize(session.databaseName).toLowerCase()
+          === pathModule.normalize(databaseName).toLowerCase()
+        && session.productionSafe === true
+        && session.sqliteStateLeaseSafe === true
+        && isWindowsSqliteStateDatabase(session.database)
+        && typeof session.close === "function";
+    } catch {
+      qualified = false;
+    }
+    if (!qualified) {
+      try {
+        if (isWindowsSqliteStateSession(session)) session.abort();
+      } catch {
+        // Preserve the fixed qualification failure boundary.
+      }
+      failures.fail("queue_unavailable");
+    }
+
+    const database = session.database;
+    try {
+      const version = Number(
+        Object.values(database.prepare("PRAGMA user_version").get())[0],
+      );
+      if (version === 0) createSchema(database, iso(now(), failures));
+      else if (version !== SQLITE_USER_VERSION) failures.fail("queue_invalid");
+      const check = database.prepare("PRAGMA quick_check(1)").get();
+      if (Object.values(check)[0] !== "ok") failures.fail("queue_invalid");
+      const meta = database.prepare(`
+        SELECT schema_version, paused
+          FROM queue_meta
+         WHERE singleton = 1
+      `).get();
+      if (meta?.schema_version !== queueSchemaVersion
+          || ![0, 1].includes(meta?.paused)) {
+        failures.fail("queue_invalid");
+      }
+      return createRepository(database, () => session.close());
+    } catch (error) {
+      try {
+        session.abort();
+      } catch {
+        // Preserve the fixed queue failure below.
+      }
+      if (failures.issued(error)) throw error;
+      failures.fail("queue_invalid");
+    }
+  }
+
   async function openQueue({ queueFile, now } = {}) {
+    if (platform === "win32") {
+      return openWindowsQueue({ queueFile, now });
+    }
     const selected = await prepareQueueFile(queueFile);
     let database;
     try {
@@ -687,6 +804,12 @@ export function createLocalContributionSyncQueueStorageContext({
   }
 
   async function canonicalPreparedRoot(directory) {
+    if (platform === "win32") {
+      if (windowsPreparedStoragePorts === null) {
+        failures.fail("prepared_root_invalid");
+      }
+      return windowsPreparedStoragePorts.canonicalPreparedRoot(directory);
+    }
     if (typeof directory !== "string" || directory.length < 1) {
       failures.fail("configuration_invalid");
     }
@@ -722,6 +845,12 @@ export function createLocalContributionSyncQueueStorageContext({
   }
 
   async function manifestExists(directory, manifestName) {
+    if (platform === "win32") {
+      if (windowsPreparedStoragePorts === null) {
+        failures.fail("prepared_root_invalid");
+      }
+      return windowsPreparedStoragePorts.manifestExists(directory, manifestName);
+    }
     try {
       const stats = await lstat(join(directory, manifestName));
       return stats.isFile() && !stats.isSymbolicLink();
@@ -732,6 +861,16 @@ export function createLocalContributionSyncQueueStorageContext({
   }
 
   async function preparedSetDirectories({ root, maximumEntries, matches }) {
+    if (platform === "win32") {
+      if (windowsPreparedStoragePorts === null) {
+        failures.fail("prepared_root_invalid");
+      }
+      return windowsPreparedStoragePorts.preparedSetDirectories({
+        root,
+        maximumEntries,
+        matches,
+      });
+    }
     const match = requireFunction(matches, "matches");
     let names;
     try {
@@ -756,6 +895,12 @@ export function createLocalContributionSyncQueueStorageContext({
   }
 
   async function prepareRetentionRoot(directory) {
+    if (platform === "win32") {
+      if (windowsPreparedStoragePorts === null) {
+        failures.fail("retirement_invalid");
+      }
+      return windowsPreparedStoragePorts.prepareRetentionRoot(directory);
+    }
     if (typeof directory !== "string" || directory.length < 1) {
       failures.fail("configuration_invalid");
     }
@@ -790,6 +935,16 @@ export function createLocalContributionSyncQueueStorageContext({
   }
 
   async function retireFlatDirectory({ root, name, maximumEntries }) {
+    if (platform === "win32") {
+      if (windowsPreparedStoragePorts === null) {
+        failures.fail("retirement_invalid");
+      }
+      return windowsPreparedStoragePorts.retireFlatDirectory({
+        root,
+        name,
+        maximumEntries,
+      });
+    }
     if (basename(name) !== name || !integer(maximumEntries, 1, 256)) {
       failures.fail("retirement_invalid");
     }

@@ -124,6 +124,13 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 }
 [hidden] { display: none !important; }
 
+/* The native AppKit shell owns its own toolbar. These two controls are
+ * present in shared dashboard markup only so Electron can reveal the
+ * corresponding desktop actions after its preload marker lands. */
+.electron-only-control { display: none !important; }
+html.electron-dashboard .electron-only-control,
+body.electron-dashboard .electron-only-control { display: inline-flex !important; }
+
 .skip-link {
   position: fixed;
   z-index: 100;
@@ -135,6 +142,22 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
   border-radius: var(--radius-sm);
 }
 .skip-link:focus { top: 1rem; }
+.skip-link:focus-visible {
+  outline: 3px solid var(--blue);
+  outline-offset: 3px;
+}
+.share-panel:focus {
+  outline: 3px solid var(--blue);
+  outline-offset: 4px;
+}
+.share-panel:focus:not(:focus-visible) {
+  outline-color: rgba(49, 95, 132, .45);
+}
+.share-panel:focus-visible,
+#main:focus-visible {
+  outline: 3px solid var(--blue);
+  outline-offset: 4px;
+}
 .sr-only {
   position: absolute;
   width: 1px;
@@ -219,6 +242,27 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .primary-nav a:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 .dashboard-content { min-width: 0; -webkit-user-select: text; user-select: text; }
 [data-dashboard-page][hidden] { display: none !important; }
+
+/* Electron keeps the web sidebar, but its native-style View > Toggle Sidebar
+   command must be able to collapse it without changing the native AppKit
+   document. The zero-width column preserves the dashboard content width and
+   the hidden/inert sidebar cannot retain keyboard focus while collapsed. */
+html.electron-dashboard .dashboard-shell.sidebar-collapsed,
+body.electron-dashboard .dashboard-shell.sidebar-collapsed {
+  display: grid;
+  grid-template-columns: 0 minmax(0, 1fr);
+}
+html.electron-dashboard .dashboard-shell.sidebar-collapsed .dashboard-sidebar,
+body.electron-dashboard .dashboard-shell.sidebar-collapsed .dashboard-sidebar {
+  width: 0;
+  min-width: 0;
+  min-height: 0;
+  padding-inline: 0;
+  overflow: hidden;
+  visibility: hidden;
+  border-inline-end: 0;
+  pointer-events: none;
+}
 
 /* The packaged Mac app supplies a real AppKit header and sidebar. Keep this
    document focused on the selected, readable report instead of rendering a
@@ -2776,6 +2820,67 @@ footer p { margin: 0; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation: none !important; transition: none !important; }
+}
+
+/* Windows High Contrast and other high-contrast modes must retain a visible
+   focus boundary even when the theme removes our cream/green palette. The
+   system colors are intentionally used here so the browser maps them to the
+   user's selected contrast pair instead of leaving low-contrast hard-coded
+   colors behind. */
+@media (forced-colors: active), (prefers-contrast: more) {
+  body { color: CanvasText; background: Canvas; }
+  .topbar,
+  .dashboard-sidebar,
+  .panel,
+  .metric-card,
+  .share-preview,
+  .state-pill,
+  .button,
+  .language-picker select {
+    border-color: CanvasText;
+    forced-color-adjust: auto;
+  }
+  .topbar,
+  .dashboard-sidebar,
+  .panel,
+  .metric-card,
+  .share-preview,
+  .language-picker select,
+  .button-secondary,
+  .button-quiet {
+    color: CanvasText;
+    background: Canvas;
+  }
+  .button-primary,
+  .skip-link {
+    color: HighlightText;
+    background: Highlight;
+    border-color: Highlight;
+  }
+  .state-pill,
+  .state-live,
+  .state-local,
+  .state-updating,
+  .state-setup,
+  .state-stale,
+  .state-insufficient,
+  .state-offline,
+  .state-demo,
+  .state-connecting {
+    color: CanvasText;
+    background: Canvas;
+  }
+  .state-dot { background: CanvasText; }
+  button:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  a:focus-visible,
+  summary:focus-visible,
+  .share-panel:focus,
+  #main:focus {
+    outline: 3px solid Highlight;
+    outline-offset: 3px;
+  }
 }
 
 /*

@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash, createHmac } from "node:crypto";
+import { constants } from "node:fs";
 import { appendFile, link, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,6 +19,12 @@ import { normalizeClaudeTranscriptUsageCandidate } from "../src/export-safe-reco
 import {
   parseClaudeTranscriptRecord,
 } from "../src/application/export-sources/claude-transcript-record.js";
+import {
+  normalizeClaudeConfiguredPath,
+  resolveClaudeConfigRoot,
+} from "../src/application/export-sources/claude-config-root.js";
+import { createClaudeTranscriptExportContext } from "../src/application/export-sources/claude-transcript-export.js";
+import { readBoundedUtf8LineEntries } from "../src/platform/bounded-jsonl-reader.js";
 
 const SECRET = Buffer.alloc(32, 71);
 const START_AT = "2026-07-24T12:00:00.000Z";
@@ -100,6 +108,78 @@ async function fixture() {
 function guard(overrides = {}) {
   return createExportResourceGuard({ scope: "export_set", limits: overrides });
 }
+
+test("Claude config-root contract uses Windows USERPROFILE and CLAUDE_CONFIG_DIR without POSIX fallback", () => {
+  const configured = resolveClaudeConfigRoot({
+    platform: "win32",
+    homeDirectory: "C:\\fallback",
+    environment: {
+      USERPROFILE: "C:\\Users\\tester",
+      CLAUDE_CONFIG_DIR: "D:/Claude/config",
+    },
+  });
+  assert.deepEqual(configured, {
+    platform: "win32",
+    homeDirectory: "C:\\Users\\tester",
+    configDirectory: "D:\\Claude\\config",
+    settingsFile: "D:\\Claude\\config\\settings.json",
+    projectsDirectory: "D:\\Claude\\config\\projects",
+  });
+  assert.equal(
+    resolveClaudeConfigRoot({
+      platform: "win32",
+      homeDirectory: "C:\\fallback",
+      environment: { USERPROFILE: "C:\\Users\\tester" },
+    }).projectsDirectory,
+    "C:\\Users\\tester\\.claude\\projects",
+  );
+  for (const path of ["relative", "/tmp/claude", "C:\\Users\\tester\\..\\other", "C:\\tmp\u0000private"]) {
+    assert.throws(
+      () => normalizeClaudeConfiguredPath(path, { platform: "win32" }),
+      (error) => error?.code === "claude_config_root_path",
+      path,
+    );
+  }
+  for (const component of [
+    "CON", "NUL.txt", "PRN", "AUX", "COM1", "LPT9",
+    "bad<name", "bad>name", 'bad"name', "bad|name", "bad?name", "bad*name",
+    "trailing.", "trailing ",
+  ]) {
+    const path = `C:\\Users\\tester\\${component}`;
+    assert.throws(
+      () => normalizeClaudeConfiguredPath(path, { platform: "win32" }),
+      (error) => error?.code === "claude_config_root_path",
+      component,
+    );
+  }
+  // Repeated separators are intentionally accepted and collapsed; Unicode and
+  // ordinary internal spaces remain valid Windows components.
+  assert.equal(
+    normalizeClaudeConfiguredPath("C:/Users//Zoë Smith///Claude config/", { platform: "win32" }),
+    "C:\\Users\\Zoë Smith\\Claude config",
+  );
+  assert.throws(
+    () => resolveClaudeConfigRoot({
+      platform: "win32",
+      homeDirectory: "C:\\fallback",
+      environment: { USERPROFILE: "C:\\Users\\tester", CLAUDE_CONFIG_DIR: "relative-config" },
+    }),
+    (error) => error?.code === "claude_config_root_path",
+  );
+});
+
+test("Claude transcript planning rejects relative roots before filesystem access", async () => {
+  await assert.rejects(
+    createClaudeTranscriptExportSourcePlan({
+      projectsDirectory: "relative-projects",
+      startAt: START_AT,
+      endAt: END_AT,
+      secret: SECRET,
+      resourceGuard: guard(),
+    }),
+    (error) => error?.code === "claude_transcript_export_configuration",
+  );
+});
 
 test("Claude selective row parsing validates all JSON while discarding private bodies", () => {
   const record = assistant("2026-07-24T12:10:00.000Z");
@@ -620,4 +700,92 @@ test("Claude partial iteration growth and cross-file copies choose one final exp
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("Claude Windows identity serialization preserves an oversized file ID through plan validation", async () => {
+  const root = "C:\\claude-projects";
+  const sourcePath = `${root}\\records.jsonl`;
+  const sourceText = `${JSON.stringify({ type: "user", message: { content: "ignored" } })}\n`;
+  const oversizedFileId = 2n ** 60n;
+  const observed = { lstatOptions: [], statOptions: [], openFlags: [] };
+  function stats({ directory = false } = {}) {
+    return {
+      dev: 17n,
+      ino: directory ? 23n : oversizedFileId,
+      birthtimeMs: 1_722_000_000_000n,
+      size: directory ? 0n : BigInt(Buffer.byteLength(sourceText, "utf8")),
+      mode: 0o700n,
+      uid: 0n,
+      nlink: 1n,
+      isDirectory: () => directory,
+      isFile: () => !directory,
+      isSymbolicLink: () => false,
+    };
+  }
+  const context = createClaudeTranscriptExportContext({
+    allocUnsafe: Buffer.allocUnsafe.bind(Buffer),
+    bufferByteLength: Buffer.byteLength.bind(Buffer),
+    bufferFrom: Buffer.from.bind(Buffer),
+    bufferIsBuffer: Buffer.isBuffer,
+    claudeConfigDirectory: undefined,
+    createHash,
+    createHmac,
+    currentUid: () => null,
+    deriveSessionScopeId: () => "unused",
+    defaultHomeDirectory: "C:\\Users\\tester",
+    fsConstants: { O_NOFOLLOW: 0x200, O_RDONLY: constants.O_RDONLY },
+    joinPath: (directory, name) => `${directory}\\${name}`,
+    lstat: async (path, options) => {
+      observed.lstatOptions.push(options);
+      return stats({ directory: path === root });
+    },
+    open: async (path, flags) => {
+      observed.openFlags.push(flags);
+      return {
+        fd: 41,
+        async read(buffer, offset, length, position) {
+          const bytes = Buffer.from(sourceText, "utf8").subarray(position, position + length);
+          bytes.copy(buffer, offset);
+          return { bytesRead: bytes.length };
+        },
+        async stat(options) {
+          observed.statOptions.push(options);
+          return stats();
+        },
+        async close() {},
+      };
+    },
+    openDirectory: async () => ({
+      async *[Symbol.asyncIterator]() {
+        yield {
+          name: "records.jsonl",
+          isDirectory: () => false,
+          isFile: () => true,
+          isSymbolicLink: () => false,
+        };
+      },
+    }),
+    platform: "win32",
+    readBoundedUtf8LineEntries,
+    realpath: async (path) => path,
+    resolvePath: (path) => path,
+    safeExportModelDeclaration: () => ({ modelId: "unused" }),
+    userProfile: "C:\\Users\\tester",
+  });
+  const plan = await context.createClaudeTranscriptExportSourcePlan({
+    projectsDirectory: root,
+    startAt: START_AT,
+    endAt: END_AT,
+    secret: SECRET,
+    resourceGuard: guard(),
+  });
+  assert.equal(plan.sources[0].inode, oversizedFileId.toString(10));
+  assert.doesNotThrow(() => context.createClaudeTranscriptExportCursor(
+    plan,
+    plan.sources[0].sourceKey,
+    { secret: SECRET },
+  ));
+  assert.equal(observed.openFlags.every((flags) => flags === constants.O_RDONLY), true);
+  assert.equal(observed.lstatOptions.every((options) => options?.bigint === true), true);
+  assert.equal(observed.statOptions.every((options) => options?.bigint === true), true);
 });

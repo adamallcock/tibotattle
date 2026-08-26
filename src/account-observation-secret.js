@@ -3,6 +3,11 @@ import { constants } from "node:fs";
 import { lstat, mkdir, open, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { defaultExportStateDirectory } from "./export-identity.js";
+import {
+  assertWindowsFilesystemProductionSafe,
+  isWindowsFilesystemAdapter,
+  isWindowsFilesystemIdentity,
+} from "./platform/index.js";
 
 const SECRET_BYTES = 32;
 const LOCK_SCHEMA_VERSION = "account-observation-operation-v1";
@@ -64,9 +69,57 @@ async function invokeBackend(backend, method, ...args) {
 }
 
 function sameIdentity(left, right) {
+  if (isWindowsFilesystemIdentity(left) && isWindowsFilesystemIdentity(right)) {
+    return left.volumeSerialNumber === right.volumeSerialNumber
+      && left.fileId === right.fileId;
+  }
   return typeof left?.dev === "number" && typeof left?.ino === "number"
     && typeof right?.dev === "number" && typeof right?.ino === "number"
     && left.dev === right.dev && left.ino === right.ino;
+}
+
+function isWindowsFilesystemNotFound(error) {
+  return error?.code === "ENOENT"
+    || error?.code === "WINDOWS_FILESYSTEM_NOT_FOUND";
+}
+
+function isWindowsFilesystemAlreadyExists(error) {
+  return error?.code === "EEXIST"
+    || error?.code === "WINDOWS_FILESYSTEM_ALREADY_EXISTS";
+}
+
+function resolveWindowsFilesystemAdapter(adapter) {
+  const selected = adapter ?? null;
+  // No adapter is the existing development/portable path. Production Windows
+  // selection is gated separately, so this loader must not turn an ordinary
+  // no-adapter test or developer invocation into an accidental policy claim.
+  if (selected === null) return null;
+  if (!isWindowsFilesystemAdapter(selected)) {
+    fail("account_observation_credential_unavailable");
+  }
+  try {
+    return assertWindowsFilesystemProductionSafe(selected);
+  } catch {
+    fail("account_observation_credential_invalid");
+  }
+}
+
+function assertWindowsLockMetadata(metadata) {
+  if (metadata?.isDirectory !== false
+      || metadata.isRegularFile !== true
+      || metadata.isReparsePoint !== false
+      || metadata.ownerMatches !== true
+      || metadata.nullDacl !== false
+      || metadata.daclProtected !== true
+      || metadata.broadAccess !== false
+      || metadata.nonOwnerAllow !== false
+      || metadata.unrecognizedAce !== false
+      || metadata.finalPathResolved !== true
+      || !isWindowsFilesystemIdentity(metadata.identity)
+      || metadata.identity.linkCount !== 1) {
+    fail("account_observation_credential_unavailable");
+  }
+  return metadata;
 }
 
 function assertOwnerOnlyLock(stats) {
@@ -82,8 +135,20 @@ function assertOwnerOnlyLock(stats) {
   }
 }
 
-async function prepareLockDirectory(path) {
+async function prepareLockDirectory(path, windowsFilesystem = null) {
   const directory = dirname(path);
+  if (windowsFilesystem !== null) {
+    let identity;
+    try {
+      identity = windowsFilesystem.ensureDirectory(directory);
+    } catch {
+      fail("account_observation_credential_unavailable");
+    }
+    if (!isWindowsFilesystemIdentity(identity) || identity.linkCount !== 1) {
+      fail("account_observation_credential_unavailable");
+    }
+    return { directory, identity, windowsFilesystem };
+  }
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const stats = await lstat(directory);
   if (!stats.isDirectory() || stats.isSymbolicLink()) fail("account_observation_credential_unavailable");
@@ -97,6 +162,32 @@ async function prepareLockDirectory(path) {
 }
 
 async function assertLockDirectory(directoryState) {
+  if (directoryState.windowsFilesystem !== undefined) {
+    try {
+      const metadata = directoryState.windowsFilesystem.inspectPath(directoryState.directory);
+      if (!isWindowsFilesystemIdentity(directoryState.identity)
+          || directoryState.identity.linkCount !== 1
+          || metadata?.isDirectory !== true
+          || metadata.isRegularFile !== false
+          || metadata.isReparsePoint !== false
+          || metadata.ownerMatches !== true
+          || metadata.nullDacl !== false
+          || metadata.daclProtected !== true
+          || metadata.broadAccess !== false
+          || metadata.nonOwnerAllow !== false
+          || metadata.unrecognizedAce !== false
+          || metadata.finalPathResolved !== true
+          || !isWindowsFilesystemIdentity(metadata.identity)
+          || metadata.identity.linkCount !== 1
+          || !sameIdentity(metadata.identity, directoryState.identity)) {
+        fail("account_observation_credential_unavailable");
+      }
+    } catch (error) {
+      if (error instanceof AccountObservationSecretError) throw error;
+      fail("account_observation_credential_unavailable");
+    }
+    return;
+  }
   const stats = await lstat(directoryState.directory);
   if (!stats.isDirectory() || stats.isSymbolicLink() || !sameIdentity(stats, directoryState.identity)
       || (typeof process.getuid === "function" && typeof stats.uid === "number" && stats.uid !== process.getuid())
@@ -107,6 +198,7 @@ async function assertLockDirectory(directoryState) {
 
 async function syncLockDirectory(directoryState) {
   await assertLockDirectory(directoryState);
+  if (directoryState.windowsFilesystem !== undefined) return;
   // Windows cannot open a directory for fsync. The lock file itself is
   // flushed before this point; the unavailable directory-entry barrier is a
   // POSIX-only durability primitive.
@@ -164,6 +256,42 @@ function looksLikeIncompleteLockContent(bytes) {
 
 async function inspectExistingLock(path, directoryState) {
   await assertLockDirectory(directoryState);
+  if (directoryState.windowsFilesystem !== undefined) {
+    let metadata;
+    try {
+      metadata = assertWindowsLockMetadata(
+        directoryState.windowsFilesystem.inspectPath(path),
+      );
+    } catch (error) {
+      if (isWindowsFilesystemNotFound(error)) return null;
+      if (error instanceof AccountObservationSecretError) throw error;
+      fail("account_observation_credential_unavailable");
+    }
+    let observed;
+    try {
+      observed = directoryState.windowsFilesystem.readFile(path);
+    } catch {
+      fail("account_observation_credential_unavailable");
+    }
+    try {
+      if (!Buffer.isBuffer(observed?.data)
+          || !sameIdentity(metadata.identity, observed.identity)) {
+        fail("account_observation_credential_unavailable");
+      }
+      const owner = parseLockContent(observed.data);
+      return {
+        kind: "complete",
+        owner,
+        identity: metadata.identity,
+        // The native boundary publishes the complete lock in one create call,
+        // so there is no mtime-based incomplete-write recovery path. The
+        // signed content timestamp is the only stale-owner clock available.
+        mtimeMs: owner.createdAtMs,
+      };
+    } finally {
+      observed?.data?.fill?.(0);
+    }
+  }
   let pathStats;
   try {
     pathStats = await lstat(path);
@@ -204,9 +332,23 @@ async function removeExactStaleLock(path, directoryState, inspected, operationHo
   if (revalidated === null || !sameIdentity(revalidated.identity, inspected.identity)
       || revalidated.kind !== inspected.kind || revalidated.mtimeMs !== inspected.mtimeMs
       || (revalidated.kind === "complete"
-        && (revalidated.owner.processId !== inspected.owner.processId
+      && (revalidated.owner.processId !== inspected.owner.processId
           || revalidated.owner.createdAtMs !== inspected.owner.createdAtMs))) {
     return false;
+  }
+  if (directoryState.windowsFilesystem !== undefined) {
+    try {
+      directoryState.windowsFilesystem.deleteFile(path, inspected.identity);
+    } catch (error) {
+      if (isWindowsFilesystemNotFound(error)
+          || error?.code === "WINDOWS_FILESYSTEM_IDENTITY_MISMATCH") {
+        return false;
+      }
+      fail("account_observation_credential_unavailable");
+    }
+    await syncLockDirectory(directoryState);
+    await operationHook?.("after-stale-lock-removal");
+    return true;
   }
   let current;
   try {
@@ -234,9 +376,77 @@ async function acquireOperationLease(path, {
   processId,
   staleLockMilliseconds,
   operationHook,
+  windowsFilesystem = null,
 }) {
-  const directoryState = await prepareLockDirectory(path);
+  const directoryState = await prepareLockDirectory(path, windowsFilesystem);
   for (let attempt = 0; attempt < 4; attempt += 1) {
+    if (windowsFilesystem !== null) {
+      let identity;
+      try {
+        identity = windowsFilesystem.createFile(
+          path,
+          Buffer.from(lockContent(processId, clock()), "utf8"),
+        );
+      } catch (error) {
+        if (!isWindowsFilesystemAlreadyExists(error)) {
+          fail("account_observation_credential_unavailable");
+        }
+        const inspected = await inspectExistingLock(path, directoryState);
+        if (inspected === null) continue;
+        const now = clock();
+        if (!Number.isFinite(now)) fail("account_observation_credential_unavailable");
+        const age = now - inspected.owner.createdAtMs;
+        if (age < -MAXIMUM_CLOCK_SKEW_MILLISECONDS) {
+          fail("account_observation_credential_unavailable");
+        }
+        let ownerExists;
+        try {
+          ownerExists = processExists(inspected.owner.processId) === true;
+        } catch {
+          fail("account_observation_credential_unavailable");
+        }
+        if (age < staleLockMilliseconds || ownerExists) {
+          fail("account_observation_credential_locked");
+        }
+        if (await removeExactStaleLock(path, directoryState, inspected, operationHook)) continue;
+        continue;
+      }
+      try {
+        const metadata = assertWindowsLockMetadata(
+          windowsFilesystem.inspectPath(path),
+        );
+        if (!sameIdentity(identity, metadata.identity)) {
+          fail("account_observation_credential_unavailable");
+        }
+        const observed = windowsFilesystem.readFile(path);
+        try {
+          if (!Buffer.isBuffer(observed?.data)
+              || !sameIdentity(identity, observed.identity)
+              || !parseLockContent(observed.data)) {
+            fail("account_observation_credential_unavailable");
+          }
+        } finally {
+          observed?.data?.fill?.(0);
+        }
+        await assertLockDirectory(directoryState);
+        await syncLockDirectory(directoryState);
+        await operationHook?.("after-operation-lock-acquired");
+        return {
+          handle: null,
+          identity,
+          directoryState,
+          windowsFilesystem,
+        };
+      } catch (error) {
+        try {
+          windowsFilesystem.deleteFile(path, identity);
+        } catch {
+          // The fixed failure below is more useful than an unsafe cleanup guess.
+        }
+        if (error instanceof AccountObservationSecretError) throw error;
+        fail("account_observation_credential_unavailable");
+      }
+    }
     let handle;
     let createdIdentity = null;
     try {
@@ -310,6 +520,17 @@ async function acquireOperationLease(path, {
 }
 
 async function releaseOperationLease(path, lease) {
+  if (lease.windowsFilesystem !== undefined) {
+    try {
+      await assertLockDirectory(lease.directoryState);
+      lease.windowsFilesystem.deleteFile(path, lease.identity);
+      await syncLockDirectory(lease.directoryState);
+      return;
+    } catch (error) {
+      if (isWindowsFilesystemNotFound(error)) return;
+      fail("account_observation_credential_unavailable");
+    }
+  }
   await lease.handle.close().catch(() => {});
   try {
     await assertLockDirectory(lease.directoryState);
@@ -340,8 +561,10 @@ export function createAccountObservationSecretLoader({
   processId = process.pid,
   staleLockMilliseconds = DEFAULT_STALE_LOCK_MILLISECONDS,
   operationHook = null,
+  windowsFilesystemAdapter = null,
 } = {}) {
   assertBackend(backend, capability);
+  const windowsFilesystem = resolveWindowsFilesystemAdapter(windowsFilesystemAdapter);
   if (typeof generateSecret !== "function" || typeof clock !== "function" || typeof processExists !== "function"
       || !Number.isSafeInteger(processId) || processId < 1
       || !Number.isFinite(staleLockMilliseconds) || staleLockMilliseconds < 1
@@ -356,6 +579,7 @@ export function createAccountObservationSecretLoader({
       processId,
       staleLockMilliseconds,
       operationHook,
+      windowsFilesystem,
     });
     let generated = null;
     let generatedValue = null;

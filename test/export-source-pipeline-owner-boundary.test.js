@@ -432,10 +432,18 @@ test("platform ports reject hostile configuration without evaluating traps", () 
 });
 
 test("platform ports snapshot only required environment data and retain no caller environment", () => {
+  const windows = process.platform === "win32";
   const environment = {
-    LOCALAPPDATA: "/local/app-data",
-    XDG_STATE_HOME: "/xdg/state",
-    CODEX_HOME: "/codex/original",
+    ...(windows
+      ? {
+        LOCALAPPDATA: "C:\\local\\app-data",
+        CODEX_HOME: "C:\\codex\\original",
+      }
+      : {
+        LOCALAPPDATA: "/local/app-data",
+        XDG_STATE_HOME: "/xdg/state",
+        CODEX_HOME: "/codex/original",
+      }),
   };
   let touched = 0;
   Object.defineProperty(environment, "UNRELATED_PRIVATE_VALUE", {
@@ -444,26 +452,60 @@ test("platform ports snapshot only required environment data and retain no calle
   });
   const ports = platform.createLocalExportSourcePorts({
     environment,
-    homeDirectory: "/home/original",
-    platform: "linux",
+    homeDirectory: windows ? "C:\\home\\original" : "/home/original",
+    platform: windows ? "win32" : "linux",
   });
   assert.equal(touched, 0);
   assert.equal(Object.hasOwn(ports, "environment"), false);
   assert.equal(
     ports.defaultClaudeStatusStateDirectory(),
-    "/xdg/state/app-usagemonitor/claude-statusline-v0.2",
+    windows
+      ? "C:\\local\\app-data\\app-usagemonitor\\claude-statusline-v0.2"
+      : "/xdg/state/app-usagemonitor/claude-statusline-v0.2",
   );
-  assert.equal(ports.codexLogPorts.filesystem.defaultCodexHome(), "/codex/original");
+  assert.equal(
+    ports.codexLogPorts.filesystem.defaultCodexHome(),
+    windows ? "C:\\codex\\original" : "/codex/original",
+  );
 
-  environment.XDG_STATE_HOME = "/xdg/mutated";
-  environment.LOCALAPPDATA = "/local/mutated";
-  environment.CODEX_HOME = "/codex/mutated";
+  if (windows) {
+    environment.LOCALAPPDATA = "C:\\local\\mutated";
+    environment.CODEX_HOME = "C:\\codex\\mutated";
+  } else {
+    environment.XDG_STATE_HOME = "/xdg/mutated";
+    environment.LOCALAPPDATA = "/local/mutated";
+    environment.CODEX_HOME = "/codex/mutated";
+  }
   assert.equal(
     ports.defaultClaudeStatusStateDirectory(),
-    "/xdg/state/app-usagemonitor/claude-statusline-v0.2",
+    windows
+      ? "C:\\local\\app-data\\app-usagemonitor\\claude-statusline-v0.2"
+      : "/xdg/state/app-usagemonitor/claude-statusline-v0.2",
   );
-  assert.equal(ports.codexLogPorts.filesystem.defaultCodexHome(), "/codex/original");
+  assert.equal(
+    ports.codexLogPorts.filesystem.defaultCodexHome(),
+    windows ? "C:\\codex\\original" : "/codex/original",
+  );
   assert.equal(touched, 0);
+});
+
+test("Claude transcript defaults use the snapped Windows config root", () => {
+  const ports = platform.createLocalExportSourcePorts({
+    platform: "win32",
+    homeDirectory: "C:\\fallback",
+    environment: {
+      USERPROFILE: "C:\\Users\\tester",
+      CLAUDE_CONFIG_DIR: "D:/Claude/config",
+    },
+  });
+  const context = createPipeline(ports, {
+    workspace: workspaceRuntime(),
+    exportCompatibilityTuple: () => ({}),
+  });
+  assert.equal(
+    context.claudeTranscriptExport.defaultClaudeProjectsDirectory(),
+    "D:\\Claude\\config\\projects",
+  );
 });
 
 test("platform ports reject nested environment Proxies and accessors without canary execution", () => {
@@ -544,10 +586,11 @@ test("compatibility singleton imports without source discovery or local state", 
 
 test("local-review accepts the composed controller as an explicit default seam", async () => {
   const calls = [];
+  const workspace = resolve("opaque", "workspace");
   const originalLog = console.log;
   console.log = () => {};
   try {
-    await runLocalReview(["inspect-export-workspace", "--workspace", "/opaque/workspace"], {
+    await runLocalReview(["inspect-export-workspace", "--workspace", workspace], {
       exportSetController: {
         async createLocalExportWorkspace() { throw new Error("not called"); },
         async resumeLocalExportWorkspace() { throw new Error("not called"); },
@@ -567,5 +610,5 @@ test("local-review accepts the composed controller as an explicit default seam",
   } finally {
     console.log = originalLog;
   }
-  assert.deepEqual(calls, [{ directory: "/opaque/workspace" }]);
+  assert.deepEqual(calls, [{ directory: workspace }]);
 });

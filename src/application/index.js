@@ -52,3 +52,10 @@ export {
 export {
   createLocalMetadataExportContext,
 } from "./local-metadata-export.js";
+export {
+  WINDOWS_PREPARED_CONTRIBUTION_CONTEXT_CONTRACT_VERSION,
+  WINDOWS_PREPARED_CONTRIBUTION_CONTEXT_PRODUCTION_SAFE,
+  WINDOWS_PREPARED_CONTRIBUTION_CONTEXT_READINESS,
+  createWindowsPreparedContributionContext,
+  isWindowsPreparedContributionContext,
+} from "./windows-prepared-contribution.js";

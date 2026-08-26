@@ -1,5 +1,6 @@
 import { availableParallelism } from "node:os";
-import { basename, dirname, resolve } from "node:path";
+import { basename, dirname, resolve, win32 } from "node:path";
+import { setImmediate as setImmediatePromise } from "node:timers/promises";
 import { Worker } from "node:worker_threads";
 
 import {
@@ -19,6 +20,7 @@ import { createHistoryBaseSeedResolver } from "./local-unified-index-history.js"
 import { withStableRolloutSource } from "./rollout-source-snapshot.js";
 import {
   assertSafeLocalUnifiedIndexTarget,
+  assertWindowsUnifiedIndexStagingUnavailable,
   createUnifiedIndexWriter,
   createLocalUnifiedIndexSecondaryIndexes,
   beginUnifiedIndexGeneration,
@@ -54,6 +56,67 @@ import {
 
 const MAXIMUM_WORKERS = 10;
 
+function validCodexHomeValue(value) {
+  if (typeof value === "string") return value.length > 0;
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && typeof value.path === "string"
+    && value.path.length > 0
+    && (value.id === undefined || typeof value.id === "string")
+    && (value.rootId === undefined || typeof value.rootId === "string");
+}
+
+// Off-main Electron runs own one immutable, parent-generated token for the
+// whole ingest attempt. It is deliberately narrow: the bounded abandoned-
+// stage scanner can classify a hard-terminated worker's orphan without
+// enumerating or globbing the state directory by token prefix. Direct/native
+// callers leave this unset and retain the historical pid/timestamp stage names.
+export const LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN = /^[0-9a-f]{32}$/u;
+
+export function validateLocalUnifiedIndexAttemptToken(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string"
+      || !LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN.test(value)) {
+    throw fixedError("local_unified_index_attempt_token_invalid");
+  }
+  return value;
+}
+
+export function localUnifiedIndexStageFile(
+  indexFile,
+  kind,
+  attemptToken = null,
+) {
+  if (typeof indexFile !== "string" || indexFile.length < 1) {
+    throw fixedError("local_unified_index_worker_options_invalid");
+  }
+  if (kind !== "building" && kind !== "incremental") {
+    throw fixedError("local_unified_index_worker_options_invalid");
+  }
+  const resolvedIndexFile = resolve(indexFile);
+  const token = validateLocalUnifiedIndexAttemptToken(attemptToken);
+  return token === null
+    ? `${resolvedIndexFile}.${kind}-${process.pid}-${Date.now().toString(36)}`
+    // Keep the parent-generated capability exact while retaining the owner
+    // PID in the filename. If a worker is hard-terminated, the normal
+    // bounded abandoned-stage scanner can recognize this orphan without a
+    // token-prefix enumeration or parent-side pathname deletion.
+    : `${resolvedIndexFile}.${kind}-${process.pid}-${token}`;
+}
+
+// The host consumes worker messages through synchronous SQLite calls. Keep a
+// single delivery turn bounded without changing the writer's independent
+// commitRows policy (10,000 by default).
+export const LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS = 500;
+
+// A cooperative checkpoint is deliberately much less frequent than a worker
+// delivery batch. It closes any sub-threshold writer transaction before
+// yielding, so cancellation can be observed without introducing an async
+// boundary in the middle of an open transaction or turning every event into a
+// commit.
+export const LOCAL_UNIFIED_INDEX_COOPERATIVE_CHECKPOINT_ROWS = 10_000;
+
 const CODEX_BILLING_SURFACE = "chatgpt_subscription";
 
 export function sourceIdentityForInfo(info) {
@@ -85,6 +148,47 @@ function fixedError(code) {
   const error = new Error(code);
   error.code = code;
   return error;
+}
+
+/**
+ * Create a bounded cancellation/event-loop checkpoint for synchronous ingest.
+ *
+ * Callers invoke the returned function immediately after one sink operation.
+ * At the fixed threshold, `flush` closes any residual SQLite transaction and
+ * the next event-loop turn gives the companion's abort/control messages a
+ * chance to run. The default threshold intentionally matches commitRows.
+ */
+export function createLocalUnifiedIndexCooperativeCheckpoint({
+  signal = null,
+  flush = null,
+  every = LOCAL_UNIFIED_INDEX_COOPERATIVE_CHECKPOINT_ROWS,
+} = {}) {
+  if (signal !== null
+      && (typeof signal !== "object"
+        || typeof signal.aborted !== "boolean")) {
+    throw new TypeError("signal must be an AbortSignal or null");
+  }
+  if (flush !== null && typeof flush !== "function") {
+    throw new TypeError("flush must be a function or null");
+  }
+  if (!Number.isSafeInteger(every) || every < 1) {
+    throw new TypeError("every must be a positive safe integer");
+  }
+  let sinceCheckpoint = 0;
+  return () => {
+    if (signal?.aborted === true) {
+      throw fixedError("local_unified_index_aborted");
+    }
+    sinceCheckpoint += 1;
+    if (sinceCheckpoint < every) return null;
+    sinceCheckpoint = 0;
+    flush?.();
+    return setImmediatePromise().then(() => {
+      if (signal?.aborted === true) {
+        throw fixedError("local_unified_index_aborted");
+      }
+    });
+  };
 }
 
 /**
@@ -613,6 +717,7 @@ async function runWorkerLane(lane, laneIndex, { maximumLineBytes, signal, onBatc
       {
         workerData: {
           maximumLineBytes,
+          batchEvents: LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS,
           components: lane.components.map((members) => members.map((info) => ({
             path: info.path,
             size: Number(info.size ?? 0),
@@ -690,9 +795,18 @@ export async function rebuildLocalUnifiedIndex({
   commitRows = 10_000,
   deferSecondaryIndexes = true,
   maximumLineBytes,
+  attemptToken = null,
   signal = null,
   onProgress = null,
   discoveryLimits = null,
+  windowsProtectedStateStore = null,
+  windowsFilesystemAdapter = null,
+  windowsQualificationModeContext = null,
+  stateRoot = null,
+  resourceRoot = null,
+  windowsSqliteStateSession = null,
+  windowsSqliteStateSessionFactory = null,
+  windowsSqliteStateStaging = null,
 } = {}) {
   if (codexHome !== null && codexHome !== undefined
       && codexHomes !== null && codexHomes !== undefined) {
@@ -702,6 +816,21 @@ export async function rebuildLocalUnifiedIndex({
       && (typeof codexHome !== "string" || codexHome.length < 1)) {
     throw new TypeError("codexHome or codexHomes must be configured");
   }
+  if (codexHomes !== null
+      && (!Array.isArray(codexHomes)
+        || codexHomes.length < 1
+        || codexHomes.length > 8
+        || codexHomes.some((value) => !validCodexHomeValue(value)))) {
+    throw new TypeError("codexHomes must contain one to eight paths");
+  }
+  assertWindowsUnifiedIndexStagingUnavailable({
+    windowsSqliteStateStaging,
+    windowsQualificationModeContext,
+    windowsFilesystemAdapter,
+    path: indexFile,
+    stateRoot,
+    resourceRoot,
+  });
   if (typeof contractVersion !== "string" || contractVersion.length < 1) {
     throw new TypeError("contractVersion must be a non-empty string");
   }
@@ -712,14 +841,33 @@ export async function rebuildLocalUnifiedIndex({
   if (typeof deferSecondaryIndexes !== "boolean") {
     throw new TypeError("deferSecondaryIndexes must be a boolean");
   }
+  validateLocalUnifiedIndexAttemptToken(attemptToken);
   const startedAt = performance.now();
   const resolvedIndexFile = resolve(indexFile);
-  await assertSafeLocalUnifiedIndexTarget(resolvedIndexFile, {
-    allowMissing: true,
-  });
+  let expectedTargetIdentity = null;
+  if (process.platform === "win32") {
+    // The native staging object owns the root-relative inspection on Windows.
+    // Do not fall back to assertSafeLocalUnifiedIndexTarget here: callers
+    // normally provide a staging context and session factory, not a pre-opened
+    // live target session.
+    const targetName = win32.basename(resolvedIndexFile.replaceAll("/", "\\"));
+    try {
+      expectedTargetIdentity = windowsSqliteStateStaging.inspect(targetName);
+    } catch (error) {
+      if (error?.code !== "windows_sqlite_state_staging_database_missing") throw error;
+    }
+  } else {
+    await assertSafeLocalUnifiedIndexTarget(resolvedIndexFile, {
+      allowMissing: true,
+      windowsSqliteStateSession,
+      windowsQualificationModeContext,
+      windowsFilesystemAdapter,
+      stateRoot,
+      resourceRoot,
+    });
+  }
   const infos = await discoverCodexRolloutInfos({
-    codexHome,
-    codexHomes,
+    ...(codexHomes === null ? { codexHome } : { codexHomes }),
     startAt,
     endAt,
     signal,
@@ -731,23 +879,68 @@ export async function rebuildLocalUnifiedIndex({
   }
   const deviceSalt = await readOrCreateDeviceSalt(
     secretFile ?? defaultLocalUnifiedIndexSecretPath(resolvedIndexFile),
+    {
+      windowsProtectedStateStore,
+      windowsQualificationModeContext,
+      windowsFilesystemAdapter,
+      stateRoot,
+      resourceRoot,
+    },
   );
   const discovery = codexRolloutDiscoveryReceipt(infos);
   const discoveredAt = performance.now();
   const sourceBytes = discovery.discoveredSourceBytes;
 
-  const stageFile = `${resolvedIndexFile}.building-${process.pid}-${Date.now().toString(36)}`;
-  await removeIfPresent(stageFile);
+  const stageFile = localUnifiedIndexStageFile(
+    resolvedIndexFile,
+    "building",
+    attemptToken,
+  );
+  await removeIfPresent(stageFile, {
+    windowsSqliteStateStaging,
+    windowsQualificationModeContext,
+    windowsFilesystemAdapter,
+    stateRoot,
+    resourceRoot,
+  });
   let database = null;
   let generation = null;
   let writer = null;
   let sink = null;
+  let stageSession = null;
+  let cooperativeCheckpoint = null;
   try {
+    if (process.platform === "win32") {
+      const stageName = win32.basename(stageFile.replaceAll("/", "\\"));
+      const targetName = win32.basename(resolvedIndexFile.replaceAll("/", "\\"));
+      try {
+        expectedTargetIdentity = windowsSqliteStateStaging.inspect(targetName);
+      } catch (error) {
+        if (error?.code !== "windows_sqlite_state_staging_database_missing") throw error;
+      }
+      windowsSqliteStateStaging.create(stageName);
+      if (typeof windowsSqliteStateSessionFactory !== "function") {
+        throw fixedError("local_unified_index_windows_state_unqualified");
+      }
+      stageSession = windowsSqliteStateSessionFactory({
+        rootPath: win32.dirname(stageFile.replaceAll("/", "\\")),
+        databaseName: stageName,
+        readOnly: false,
+        create: true,
+        windowsQualificationModeContext,
+        windowsQualificationResourceRoot: resourceRoot,
+      });
+    }
     database = openLocalUnifiedIndex(stageFile, {
       readOnly: false,
       create: true,
       staging: true,
       deferSecondaryIndexes,
+      windowsSqliteStateSession: stageSession,
+      windowsQualificationModeContext,
+      windowsFilesystemAdapter,
+      stateRoot,
+      resourceRoot,
     });
     recoverUnifiedIndexGenerations(database);
     generation = beginUnifiedIndexGeneration(database, {
@@ -780,13 +973,23 @@ export async function rebuildLocalUnifiedIndex({
       generationId: generation.generationId,
       onCounts: null,
     });
+    cooperativeCheckpoint = createLocalUnifiedIndexCooperativeCheckpoint({
+      signal,
+      flush: () => writer.flush(),
+    });
   } catch (error) {
     try {
       database?.close();
     } catch {
       // Preserve the setup failure; the incomplete stage is discarded below.
     }
-    await removeIfPresent(stageFile);
+    await removeIfPresent(stageFile, {
+      windowsSqliteStateStaging,
+      windowsQualificationModeContext,
+      windowsFilesystemAdapter,
+      stateRoot,
+      resourceRoot,
+    });
     throw error;
   }
   const diagnostics = {
@@ -1111,9 +1314,18 @@ export async function rebuildLocalUnifiedIndex({
               seedTotals: historySeed?.seedTotals ?? null,
               maximumLineBytes,
               signal,
-              onEvent: (event) => sink.write(state, event),
-              onBoundary: (event) => sink.writeBoundary(state, event),
-                onTool: (event) => sink.writeTool(state, event),
+              onEvent: (event) => {
+                sink.write(state, event);
+                return cooperativeCheckpoint?.();
+              },
+              onBoundary: (event) => {
+                sink.writeBoundary(state, event);
+                return cooperativeCheckpoint?.();
+              },
+              onTool: (event) => {
+                sink.writeTool(state, event);
+                return cooperativeCheckpoint?.();
+              },
               })
             ));
             sink.finishSource(state);
@@ -1337,8 +1549,23 @@ export async function rebuildLocalUnifiedIndex({
       database,
       generation.generationId,
     );
-    const closed = await writer.close({ integrityCheck: true, fsyncPath: null });
-    await publishStagedUnifiedIndex(stageFile, resolvedIndexFile);
+    const closed = await writer.close({
+      integrityCheck: true,
+      fsyncPath: null,
+      windowsSqliteStateStaging,
+      windowsQualificationModeContext,
+      windowsFilesystemAdapter,
+      stateRoot,
+      resourceRoot,
+    });
+    await publishStagedUnifiedIndex(stageFile, resolvedIndexFile, {
+      windowsSqliteStateStaging,
+      expectedTargetIdentity,
+      windowsQualificationModeContext,
+      windowsFilesystemAdapter,
+      stateRoot,
+      resourceRoot,
+    });
     return {
       status: "built",
       indexFile: resolvedIndexFile,
@@ -1368,7 +1595,13 @@ export async function rebuildLocalUnifiedIndex({
     } catch {
       // The connection may already be closed by the writer.
     }
-    await removeIfPresent(stageFile);
+    await removeIfPresent(stageFile, {
+      windowsSqliteStateStaging,
+      windowsQualificationModeContext,
+      windowsFilesystemAdapter,
+      stateRoot,
+      resourceRoot,
+    });
     throw error;
   }
 }

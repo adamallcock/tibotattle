@@ -426,6 +426,42 @@ test("rejects CommonJS production modules instead of missing literal, computed, 
   );
 });
 
+test("permits only Electron's exact sandboxed CommonJS preload bridge", async () => {
+  await withFixtureTree(
+    {
+      "apps/electron/preload.cjs": [
+        'const { contextBridge, ipcRenderer } = require("electron");',
+        "contextBridge.exposeInMainWorld('bounded', { invoke: () => ipcRenderer.invoke('fixed') });",
+        "",
+      ].join("\n"),
+    },
+    async (rootDirectory) => {
+      const result = await checkArchitectureBoundaries({ baseline: [], rootDirectory });
+      assert.equal(result.ok, true, formatArchitectureBoundaryReport(result));
+    },
+  );
+
+  for (const unsafeSource of [
+    'const fs = require("node:fs");',
+    'const electron = require("electron"); const fs = require("node:fs");',
+    'const target = "electron"; const electron = require(target);',
+  ]) {
+    await withFixtureTree(
+      { "apps/electron/preload.cjs": unsafeSource },
+      async (rootDirectory) => {
+        const result = await checkArchitectureBoundaries({ baseline: [], rootDirectory });
+        assert.deepEqual(
+          result.violations.map(({ category, importer }) => ({ category, importer })),
+          [{
+            category: "commonjs_production_source",
+            importer: "apps/electron/preload.cjs",
+          }],
+        );
+      },
+    );
+  }
+});
+
 test("rejects ESM CommonJS loaders before they can hide cross-app dependencies", async () => {
   await withFixtureTree(
     {

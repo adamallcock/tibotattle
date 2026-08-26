@@ -434,9 +434,24 @@ function requireFunction(value, name) {
   return value;
 }
 
-function captureStorage(storage) {
+function captureStorage(storage, configuredValidator) {
   if (storage === null || typeof storage !== "object" || Array.isArray(storage)) {
     throw new TypeError("local contribution preparation storage is invalid");
+  }
+  if (configuredValidator !== undefined) {
+    const validator = requireFunction(
+      configuredValidator,
+      "local contribution preparation storage validator",
+    );
+    let trusted = false;
+    try {
+      trusted = Reflect.apply(validator, undefined, [storage]) === true;
+    } catch {
+      trusted = false;
+    }
+    if (!trusted) {
+      throw new TypeError("local contribution preparation storage is invalid");
+    }
   }
   const captured = {};
   for (const name of [
@@ -448,12 +463,16 @@ function captureStorage(storage) {
     "renameDirectory",
     "syncDirectory",
   ]) {
-    let value;
+    let descriptor;
     try {
-      value = storage[name];
+      descriptor = Object.getOwnPropertyDescriptor(storage, name);
     } catch {
       throw new TypeError(`local contribution preparation storage ${name} is invalid`);
     }
+    if (!descriptor || !Object.hasOwn(descriptor, "value")) {
+      throw new TypeError(`local contribution preparation storage ${name} is invalid`);
+    }
+    const value = descriptor.value;
     captured[name] = requireFunction(
       value,
       `local contribution preparation storage ${name}`,
@@ -468,6 +487,7 @@ export function createLocalContributionPreparationContext({
   defaultActivityFile,
   joinPath,
   storage,
+  storageValidator,
   uuid: configuredUuid,
   createResourceGuard: configuredCreateResourceGuard,
   readActivityMarkers: configuredReadActivityMarkers,
@@ -489,7 +509,7 @@ export function createLocalContributionPreparationContext({
     "defaultActivityFile",
   );
   const joinLocalPath = requireFunction(joinPath, "joinPath");
-  const preparedStorage = captureStorage(storage);
+  const preparedStorage = captureStorage(storage, storageValidator);
   const defaultUuid = requireFunction(configuredUuid, "uuid");
   const defaultCreateResourceGuard = requireFunction(
     configuredCreateResourceGuard,
@@ -546,6 +566,18 @@ export function createLocalContributionPreparationContext({
       parentDirectory,
       createPreparationError,
     );
+  // Directory publication and durability are part of the same captured
+  // storage boundary as root preparation and cleanup.  They are deliberately
+  // not accepted as per-run overrides: a Windows composition must not be able
+  // to select the POSIX rename/sync implementation for one attempt.
+  const renameDirectory = (source, target) =>
+    preparedStorage.renameDirectory(
+      source,
+      target,
+      createPreparationError,
+    );
+  const syncParentDirectory = (directory) =>
+    preparedStorage.syncDirectory(directory, createPreparationError);
 
 function defaultLocalContributionPreparationDirectories(options = {}) {
   const state = defaultState(options);
@@ -588,8 +620,6 @@ async function prepareRecentLocalContribution({
   beforePreparedPublish = async () => {},
   preparationId = null,
   uuid = defaultUuid,
-  renameDirectory = preparedStorage.renameDirectory,
-  syncParentDirectory = preparedStorage.syncDirectory,
   signal = null,
 } = {}) {
   if (codexHome !== null && codexHome !== undefined && codexHomes !== null) {
@@ -619,8 +649,6 @@ async function prepareRecentLocalContribution({
       || typeof verifyPreparedSet !== "function"
       || typeof beforePreparedPublish !== "function"
       || typeof uuid !== "function"
-      || typeof renameDirectory !== "function"
-      || typeof syncParentDirectory !== "function"
       || !validAbortSignal(signal)) {
     throw new TypeError("Local contribution preparation dependencies are invalid");
   }
