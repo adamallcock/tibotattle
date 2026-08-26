@@ -20,6 +20,9 @@ import {
   createRefreshObserver,
   parseRealHistoryArguments,
   realHistoryDashboardReadySnapshotValid,
+  releaseRealHistoryRefreshGate,
+  runLaunchGate,
+  waitForLaunchGate,
   waitFor,
   verifyPackagedArtifactIdentity,
   usageParitySnapshotValid,
@@ -109,6 +112,93 @@ test("real-history timeout budgets are finite and bounded", () => {
     assert.ok(value <= 125 * 60_000, `${name} must be bounded`);
   }
   assert.ok(REAL_HISTORY_QA_TIMEOUTS.healthMs <= REAL_HISTORY_QA_TIMEOUTS.operationMs * 2);
+});
+
+test("real-history launch gates classify raw timeout and setup errors without exposing them", async () => {
+  const launchGate = {
+    code: "REAL_HISTORY_QA_LAUNCH_FAILED",
+    stage: "launch",
+    reason: "launch_failed",
+  };
+  const dashboardGate = {
+    code: "REAL_HISTORY_QA_DASHBOARD_UNAVAILABLE",
+    stage: "dashboard",
+    reason: "dashboard_unavailable",
+  };
+  await assert.rejects(
+    () => waitForLaunchGate(
+      () => null,
+      1,
+      "test remote debugging",
+      launchGate,
+      1,
+    ),
+    (error) => {
+      assert.equal(error.code, launchGate.code);
+      assert.equal(error.qaStage, launchGate.stage);
+      assert.equal(error.qaReason, launchGate.reason);
+      assert.equal(Object.hasOwn(error, "cause"), false);
+      return true;
+    },
+  );
+  await assert.rejects(
+    () => runLaunchGate(
+      () => { throw new Error("machine-specific setup detail"); },
+      dashboardGate,
+    ),
+    (error) => {
+      assert.equal(error.code, dashboardGate.code);
+      assert.equal(error.qaStage, dashboardGate.stage);
+      assert.equal(error.qaReason, dashboardGate.reason);
+      assert.equal(error.message, dashboardGate.code);
+      assert.equal(Object.hasOwn(error, "cause"), false);
+      return true;
+    },
+  );
+  const receipt = buildRealHistoryReceipt({
+    status: "failed",
+    failureStage: dashboardGate.stage,
+    failureReason: dashboardGate.reason,
+    artifactSha256: "b".repeat(64),
+    artifactIdentityVerified: true,
+  });
+  assert.equal(receipt.failureStage, "dashboard");
+  assert.equal(receipt.failureReason, "dashboard_unavailable");
+  assert.equal(JSON.stringify(receipt).includes("machine-specific"), false);
+});
+
+test("real-history startup gate requires the exact preload release bridge and returns structured refresh failures", async () => {
+  const makeCdp = (value) => ({
+    async evaluate() {
+      return value;
+    },
+  });
+  assert.equal(await releaseRealHistoryRefreshGate(makeCdp(true)), true);
+  for (const value of [false, null, undefined]) {
+    await assert.rejects(
+      () => releaseRealHistoryRefreshGate(makeCdp(value)),
+      (error) => {
+        assert.equal(error.code, "REAL_HISTORY_QA_REFRESH_NOT_STARTED");
+        assert.equal(error.qaStage, "refresh");
+        assert.equal(error.qaReason, "refresh_not_started");
+        return true;
+      },
+    );
+  }
+  await assert.rejects(
+    () => releaseRealHistoryRefreshGate({
+      async evaluate() {
+        throw new Error("private CDP detail");
+      },
+    }),
+    (error) => {
+      assert.equal(error.code, "REAL_HISTORY_QA_DASHBOARD_UNAVAILABLE");
+      assert.equal(error.qaStage, "dashboard");
+      assert.equal(error.qaReason, "dashboard_unavailable");
+      assert.equal(JSON.stringify(error).includes("private CDP detail"), false);
+      return true;
+    },
+  );
 });
 
 test("real-history dashboard readiness retries truthy boot snapshots until the exact root is ready", async () => {
@@ -619,6 +709,12 @@ test("source contract preserves the real profile and bounds every health poll", 
   assert.match(source, /new URL\("\/api\/health", session\.dashboardUrl\)/u);
   assert.match(source, /serviceHealth\?\.status === "ok"/u);
   assert.match(source, /REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS/u);
+  assert.match(source, /waitForLaunchGate/u);
+  assert.match(source, /runLaunchGate/u);
+  assert.match(source, /releaseRealHistoryRefreshGate/u);
+  assert.match(source, /__TIBOTATTLE_ELECTRON_MACOS_SMOKE__/u);
+  assert.match(source, /Object\.keys\(bridge\)\.length !== 3/u);
+  assert.match(source, /bridge\.releaseStartupRefresh\(\) === true/u);
   assert.match(source, /Network\.responseReceived/u);
   assert.match(source, /sampleControlPlane/u);
   assert.match(source, /cancelHttp/u);
@@ -627,4 +723,16 @@ test("source contract preserves the real profile and bounds every health poll", 
   assert.match(source, /session\.expectedDescendantPids = descendantsOf\(child\.pid\)/u);
   assert.match(source, /capturedDescendantCount: expectedDescendantPids\.length/u);
   assert.match(source, /session\.observer\.snapshot\(\)\.length !== 1/u);
+  const pageEnable = source.indexOf('await cdp.request("Page.enable")');
+  const networkEnable = source.indexOf('await cdp.request("Network.enable")');
+  const binding = source.indexOf("const binding = await waitForLaunchGate");
+  const observerSelect = source.indexOf("observer.select({ expectedOrigin: binding.origin");
+  const release = source.indexOf("await releaseRealHistoryRefreshGate(cdp)");
+  const readiness = source.indexOf("const ready = await waitForLaunchGate");
+  assert.ok(pageEnable >= 0
+    && networkEnable > pageEnable
+    && binding > networkEnable
+    && observerSelect > binding
+    && release > observerSelect
+    && readiness > release);
 });

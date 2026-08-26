@@ -166,6 +166,53 @@ export async function waitFor(predicate, timeoutMs, label, intervalMs = 250) {
   throw new Error(`${label} timed out`);
 }
 
+const REAL_HISTORY_LAUNCH_GATE = Object.freeze({
+  code: "REAL_HISTORY_QA_LAUNCH_FAILED",
+  stage: "launch",
+  reason: "launch_failed",
+});
+
+const REAL_HISTORY_DASHBOARD_GATE = Object.freeze({
+  code: "REAL_HISTORY_QA_DASHBOARD_UNAVAILABLE",
+  stage: "dashboard",
+  reason: "dashboard_unavailable",
+});
+
+function classifiedQaError(error) {
+  return typeof error?.qaStage === "string"
+    && FAILURE_STAGES.has(error.qaStage)
+    && typeof error?.qaReason === "string"
+    && FAILURE_REASONS.has(error.qaReason);
+}
+
+/**
+ * Convert only an unclassified launch/setup error into a fixed QA error.
+ * Never retain or expose the original error: these gates run around process,
+ * CDP, and filesystem-adjacent operations whose messages can contain paths or
+ * other machine-specific details.
+ */
+export async function runLaunchGate(operation, gate) {
+  try {
+    return await operation();
+  } catch (error) {
+    if (classifiedQaError(error)) throw error;
+    fail(gate.code, gate.stage, gate.reason);
+  }
+}
+
+export async function waitForLaunchGate(
+  predicate,
+  timeoutMs,
+  label,
+  gate,
+  intervalMs = 250,
+) {
+  return runLaunchGate(
+    () => waitFor(predicate, timeoutMs, label, intervalMs),
+    gate,
+  );
+}
+
 function argumentValue(argv, name) {
   const index = argv.indexOf(name);
   return index >= 0 && typeof argv[index + 1] === "string"
@@ -479,6 +526,37 @@ export function realHistoryDashboardReadySnapshotValid(snapshot, expectedOrigin)
   } catch {
     return false;
   }
+}
+
+/**
+ * The real-history harness opts into the same preload-controlled startup gate
+ * as the macOS smoke so Network.enable can attach before the first refresh.
+ * Release it exactly once after binding the active dashboard loader.  Keep the
+ * bridge shape closed and return no bridge data to the receipt.
+ */
+export async function releaseRealHistoryRefreshGate(cdp) {
+  const released = await runLaunchGate(() => cdp.evaluate(`(() => {
+    const bridge = globalThis.__TIBOTATTLE_ELECTRON_MACOS_SMOKE__;
+    if (bridge === null
+        || typeof bridge !== "object"
+        || Array.isArray(bridge)
+        || bridge.version !== "v1"
+        || Object.isFrozen(bridge) !== true
+        || Object.keys(bridge).length !== 3
+        || typeof bridge.waitForStartupRefresh !== "function"
+        || typeof bridge.releaseStartupRefresh !== "function") {
+      return false;
+    }
+    try {
+      return bridge.releaseStartupRefresh() === true;
+    } catch {
+      return false;
+    }
+  })()`), REAL_HISTORY_DASHBOARD_GATE);
+  if (released !== true) {
+    fail("REAL_HISTORY_QA_REFRESH_NOT_STARTED", "refresh", "refresh_not_started");
+  }
+  return true;
 }
 
 class CdpConnection {
@@ -848,27 +926,35 @@ async function launchSession({ appPath, codexHomePath, fixture, debugPort }) {
   child.on("error", () => {});
   if (!child.pid) fail("REAL_HISTORY_QA_LAUNCH_FAILED", "launch", "launch_failed");
   try {
-    const version = await waitFor(
+    const version = await waitForLaunchGate(
       () => fetchJson(`http://127.0.0.1:${debugPort}/json/version`),
       REAL_HISTORY_QA_TIMEOUTS.startupMs,
       "Electron remote debugging",
+      REAL_HISTORY_LAUNCH_GATE,
     );
     if (!version) fail("REAL_HISTORY_QA_LAUNCH_FAILED", "launch", "launch_failed");
-    const target = await waitFor(async () => {
+    const target = await waitForLaunchGate(async () => {
       const targets = await fetchJson(`http://127.0.0.1:${debugPort}/json/list`);
       return Array.isArray(targets)
         ? targets.find((candidate) => isExactDashboardTarget(candidate, debugPort)) ?? null
         : null;
-    }, REAL_HISTORY_QA_TIMEOUTS.startupMs, "Electron dashboard target");
-    const dashboardUrl = new URL(target.url);
-    const cdp = new CdpConnection(target);
-    await cdp.open();
-    const observer = createRefreshObserver(cdp);
-    const controlPlane = createControlPlaneObserver(cdp, dashboardUrl.origin);
-    const takeNetworkBoundary = createNetworkBoundaryObserver(cdp, dashboardUrl.origin);
-    await cdp.request("Page.enable");
-    await cdp.request("Network.enable");
-    const binding = await waitFor(async () => {
+    }, REAL_HISTORY_QA_TIMEOUTS.startupMs, "Electron dashboard target", REAL_HISTORY_DASHBOARD_GATE);
+    const dashboardUrl = await runLaunchGate(
+      () => new URL(target.url),
+      REAL_HISTORY_DASHBOARD_GATE,
+    );
+    const setup = await runLaunchGate(async () => {
+      const cdp = new CdpConnection(target);
+      await cdp.open();
+      const observer = createRefreshObserver(cdp);
+      const controlPlane = createControlPlaneObserver(cdp, dashboardUrl.origin);
+      const takeNetworkBoundary = createNetworkBoundaryObserver(cdp, dashboardUrl.origin);
+      await cdp.request("Page.enable");
+      await cdp.request("Network.enable");
+      return { cdp, observer, controlPlane, takeNetworkBoundary };
+    }, REAL_HISTORY_DASHBOARD_GATE);
+    const { cdp, observer, controlPlane, takeNetworkBoundary } = setup;
+    const binding = await waitForLaunchGate(async () => {
       const loaderId = await frameLoaderId(cdp);
       const location = await cdp.evaluate("location.href");
       try {
@@ -884,9 +970,13 @@ async function launchSession({ appPath, codexHomePath, fixture, debugPort }) {
       } catch {
         return null;
       }
-    }, REAL_HISTORY_QA_TIMEOUTS.startupMs, "Electron dashboard binding");
-    observer.select({ expectedOrigin: binding.origin, expectedLoaderId: binding.loaderId });
-    const ready = await waitFor(async () => {
+    }, REAL_HISTORY_QA_TIMEOUTS.startupMs, "Electron dashboard binding", REAL_HISTORY_DASHBOARD_GATE);
+    await runLaunchGate(
+      () => observer.select({ expectedOrigin: binding.origin, expectedLoaderId: binding.loaderId }),
+      REAL_HISTORY_DASHBOARD_GATE,
+    );
+    await releaseRealHistoryRefreshGate(cdp);
+    const ready = await waitForLaunchGate(async () => {
       const snapshot = await cdp.evaluate(`(() => ({
       ready: document.documentElement?.dataset?.localDashboardReady === "true",
       title: document.title,
@@ -896,11 +986,14 @@ async function launchSession({ appPath, codexHomePath, fixture, debugPort }) {
       return realHistoryDashboardReadySnapshotValid(snapshot, dashboardUrl.origin)
         ? snapshot
         : null;
-    }, REAL_HISTORY_QA_TIMEOUTS.startupMs, "Electron dashboard readiness");
+    }, REAL_HISTORY_QA_TIMEOUTS.startupMs, "Electron dashboard readiness", REAL_HISTORY_DASHBOARD_GATE);
     if (!realHistoryDashboardReadySnapshotValid(ready, dashboardUrl.origin)) {
       fail("REAL_HISTORY_QA_DASHBOARD_UNAVAILABLE", "dashboard", "dashboard_unavailable");
     }
-    const readyLoader = await frameLoaderId(cdp);
+    const readyLoader = await runLaunchGate(
+      () => frameLoaderId(cdp),
+      REAL_HISTORY_DASHBOARD_GATE,
+    );
     if (readyLoader !== binding.loaderId) {
       fail("REAL_HISTORY_QA_REFRESH_BOUNDARY_INVALID", "refresh", "refresh_not_started");
     }
