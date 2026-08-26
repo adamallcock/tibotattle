@@ -211,6 +211,11 @@ const DESKTOP_MESSAGES = Object.freeze({
     "zh-Hans": "设置",
     es: "Configuración",
   }),
+  "electron.recovery.diagnostics": Object.freeze({
+    "en-US": "Diagnostics",
+    "zh-Hans": "诊断信息",
+    es: "Diagnósticos",
+  }),
   "electron.recovery.settings.title": Object.freeze({
     "en-US": "Repair Codex folder",
     "zh-Hans": "修复 Codex 文件夹",
@@ -345,6 +350,26 @@ const DESKTOP_MESSAGES = Object.freeze({
     "en-US": "Automatic updates are unavailable in this development build.",
     "zh-Hans": "此开发构建中无法使用自动更新。",
     es: "Las actualizaciones automáticas no están disponibles en esta compilación de desarrollo.",
+  }),
+  "electron.diagnostics.title": Object.freeze({
+    "en-US": "TiboTattle diagnostics",
+    "zh-Hans": "TiboTattle 诊断信息",
+    es: "Diagnósticos de TiboTattle",
+  }),
+  "electron.diagnostics.message": Object.freeze({
+    "en-US": "Content-free diagnostics",
+    "zh-Hans": "不含内容的诊断信息",
+    es: "Diagnósticos sin contenido",
+  }),
+  "electron.diagnostics.copy": Object.freeze({
+    "en-US": "Copy diagnostics",
+    "zh-Hans": "复制诊断信息",
+    es: "Copiar diagnósticos",
+  }),
+  "electron.diagnostics.done": Object.freeze({
+    "en-US": "Done",
+    "zh-Hans": "完成",
+    es: "Listo",
   }),
   "electron.menu.about": Object.freeze({
     "en-US": "About {appName}",

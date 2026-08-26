@@ -1411,6 +1411,37 @@ test("desktop lifecycle composes secure window, tray, single instance, retry, an
   assert.equal(app.quitCalls, 1);
 });
 
+test("desktop lifecycle opens only its current validated dashboard origin", async () => {
+  const app = new FakeApp();
+  const opened = [];
+  const supervisor = {
+    starts: 0,
+    setUnexpectedExitHandler() {},
+    async start() {
+      this.starts += 1;
+      return { origin: `http://127.0.0.1:${61000 + this.starts}` };
+    },
+    async stop() {},
+  };
+  const lifecycle = createDesktopLifecycle({
+    app,
+    BrowserWindow: FakeWindow,
+    Tray: FakeTray,
+    Menu: { buildFromTemplate: (template) => ({ template }) },
+    icon: "empty-icon",
+    preloadPath: "/private/preload.cjs",
+    supervisor,
+    openDashboardExternal: async (url) => {
+      opened.push(url);
+      return true;
+    },
+  });
+  await lifecycle.start();
+  assert.equal(await lifecycle.openDashboardInBrowser(), true);
+  assert.deepEqual(opened, ["http://127.0.0.1:61001/"]);
+  await lifecycle.requestQuit();
+});
+
 test("desktop lifecycle restores the macOS application before reopening a hidden dashboard", async () => {
   const app = new FakeApp();
   const windows = [];
@@ -1837,6 +1868,7 @@ for (const failureEvent of ["did-fail-load", "render-process-gone"]) {
         windows.push(this);
       }
     }
+    let invalidations = 0;
     const lifecycle = createDesktopLifecycle({
       app,
       BrowserWindow: RuntimeFailWindow,
@@ -1845,6 +1877,9 @@ for (const failureEvent of ["did-fail-load", "render-process-gone"]) {
       icon: "empty-icon",
       preloadPath: "/private/preload.cjs",
       supervisor,
+      onDashboardInvalidated: () => {
+        invalidations += 1;
+      },
     });
 
     await lifecycle.start();
@@ -1868,6 +1903,7 @@ for (const failureEvent of ["did-fail-load", "render-process-gone"]) {
       });
     }
     assert.equal(oldDashboard.destroyed, true);
+    assert.equal(invalidations, 1, "renderer teardown invalidates its refresh session");
     assert.equal(oldDashboard.webContents.listenerCount("did-fail-load"), 0);
     assert.equal(oldDashboard.webContents.listenerCount("render-process-gone"), 0);
     assert.equal(lifecycle.state.started, false);
@@ -2190,6 +2226,8 @@ test("desktop lifecycle owns a bounded Settings window and authorizes only its t
   const settingsContents = settings.webContents;
   assert.equal(lifecycle.isAuthorizedDesktopSender(primaryContents), true);
   assert.equal(lifecycle.isAuthorizedDesktopSender(settingsContents), true);
+  assert.equal(lifecycle.isAuthorizedDashboardSender(primaryContents), true);
+  assert.equal(lifecycle.isAuthorizedDashboardSender(settingsContents), false);
   assert.equal(lifecycle.isAuthorizedDesktopSender({}), false);
   assert.equal(
     lifecycle.isAuthorizedDesktopFrame(
@@ -2204,6 +2242,20 @@ test("desktop lifecycle owns a bounded Settings window and authorizes only its t
       { sender: settingsContents },
     ),
     true,
+  );
+  assert.equal(
+    lifecycle.isAuthorizedDashboardFrame(
+      primaryContents.mainFrame,
+      { sender: primaryContents },
+    ),
+    true,
+  );
+  assert.equal(
+    lifecycle.isAuthorizedDashboardFrame(
+      settingsContents.mainFrame,
+      { sender: settingsContents },
+    ),
+    false,
   );
   assert.equal(
     lifecycle.isAuthorizedDesktopFrame(
@@ -2606,6 +2658,11 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     "openHostedSignIn",
     "checkForUpdates",
     "revealLatestDownload",
+    "openDashboardInBrowser",
+    "showDiagnostics",
+    "revealLocalData",
+    "refreshStarted",
+    "refreshSettled",
   ]);
   assert.equal(bridge.version, "v1");
   const commands = [];
@@ -2658,6 +2715,11 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   );
   await bridge.checkForUpdates();
   await bridge.revealLatestDownload();
+  await bridge.openDashboardInBrowser();
+  await bridge.showDiagnostics();
+  await bridge.revealLocalData();
+  await bridge.refreshStarted();
+  await bridge.refreshSettled(1);
   assert.deepEqual(JSON.parse(JSON.stringify(calls.map(({ channel, request }) => ({ channel, request })))), [
     { channel: "tibotattle:desktop:v1", request: { action: "getSettings", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "openSettings", args: {} } },
@@ -2693,6 +2755,11 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     },
     { channel: "tibotattle:desktop:v1", request: { action: "checkForUpdates", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "revealLatestDownload", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "openDashboardInBrowser", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "showDiagnostics", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "revealLocalData", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "refreshStarted", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "refreshSettled", args: { lease: 1 } } },
   ]);
   await assert.rejects(
     bridge.setNotificationPreferences({ enabled: true, threshold: "ninety", extra: true }),
@@ -2715,6 +2782,12 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
       "extra",
     ),
     () => bridge.revealLatestDownload("extra"),
+    () => bridge.openDashboardInBrowser("extra"),
+    () => bridge.showDiagnostics("extra"),
+    () => bridge.revealLocalData("extra"),
+    () => bridge.refreshStarted("extra"),
+    () => bridge.refreshSettled("extra"),
+    () => bridge.refreshSettled(0),
   ]) {
     await assert.rejects(operation(), (error) => error?.name === "TypeError");
   }

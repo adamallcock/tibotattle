@@ -57,8 +57,18 @@ const REFRESH_STATES = new Set([
   "running",
   "cancelling",
   "succeeded",
+  "degraded",
   "failed",
   "cancelled",
+]);
+
+const QUARANTINE_FAILURE_CODES = new Set([
+  "codex_rollout_compression_unsupported",
+  "codex_rollout_filename_identity_mismatch",
+  "codex_rollout_generation_ambiguous",
+  "codex_rollout_lineage_invalid",
+  "codex_rollout_content_invalid",
+  "codex_rollout_tail_incomplete",
 ]);
 
 function isPlainRecord(value) {
@@ -226,12 +236,47 @@ function safeRefreshState(refresh) {
   return REFRESH_STATES.has(refresh.status) ? refresh.status : null;
 }
 
+function coherentQuarantinedRefresh(refresh) {
+  if (!isPlainRecord(refresh)
+      || refresh.status !== "degraded"
+      || refresh.errorCode !== "refresh_degraded"
+      || refresh.failedStep !== "unified_index"
+      || !QUARANTINE_FAILURE_CODES.has(refresh.failureCode)) {
+    return false;
+  }
+  const result = refresh.result;
+  const unifiedIndex = result?.unifiedIndex;
+  const generation = unifiedIndex?.generation;
+  const accounting = result?.accounting;
+  return unifiedIndex?.status === "ingested"
+    && generation?.status === "partial"
+    && generation?.blockReason === "codex_rollout_sources_quarantined"
+    && Number.isSafeInteger(generation.skippedSourceCount)
+    && generation.skippedSourceCount > 0
+    && Number.isSafeInteger(generation.skippedThreadCount)
+    && generation.skippedThreadCount > 0
+    && Number.isSafeInteger(generation.reasonCounts?.[refresh.failureCode])
+    && generation.reasonCounts[refresh.failureCode] > 0
+    && generation.discoveryComplete === true
+    && generation.diagnosticsComplete === true
+    && generation.usageProvenanceComplete === true
+    && generation.sourceOrderComplete === true
+    && generation.quotaProvenanceComplete === true
+    && accounting?.status === "replay_safe"
+    && accounting.sourceMode === "unified"
+    && accounting.coverageStatus === "partial"
+    && accounting.generationMatched === true
+    && accounting.fallbackCount === 0
+    && accounting.diagnosticsAvailable === true;
+}
+
 /**
  * Project the companion lifecycle and latest closed refresh receipt.
  *
  * The input is intentionally limited to `snapshotStatus`, `refresh`, and a
- * testable clock.  A refresh ID, progress payload, error code, or arbitrary
- * dashboard value is never read or copied into the result.
+ * testable clock. Error classifications are read only to fail closed on the
+ * bounded degraded-quarantine case; no refresh ID, progress payload, error
+ * code, or arbitrary dashboard value is ever copied into the result.
  */
 export function projectDesktopShellStatus({
   snapshotStatus = "ready",
@@ -248,7 +293,11 @@ export function projectDesktopShellStatus({
   if (refreshStatus === "running" || refreshStatus === "cancelling") {
     return closedOutput("analyzing");
   }
-  if (refreshStatus !== "succeeded") {
+  if (refreshStatus === "degraded"
+      && !coherentQuarantinedRefresh(refresh)) {
+    return closedOutput("unavailable");
+  }
+  if (refreshStatus !== "succeeded" && refreshStatus !== "degraded") {
     return closedOutput(
       refreshStatus === "cancelled" ? "stale" : "unavailable",
     );

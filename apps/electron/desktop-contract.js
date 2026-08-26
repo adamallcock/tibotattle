@@ -68,6 +68,11 @@ export const DESKTOP_ACTIONS = Object.freeze([
   "openHostedSignIn",
   "checkForUpdates",
   "revealLatestDownload",
+  "openDashboardInBrowser",
+  "showDiagnostics",
+  "revealLocalData",
+  "refreshStarted",
+  "refreshSettled",
 ]);
 
 const ACTION_ARGUMENT_KEYS = Object.freeze({
@@ -85,6 +90,11 @@ const ACTION_ARGUMENT_KEYS = Object.freeze({
   openHostedSignIn: Object.freeze(["authorizeUrl"]),
   checkForUpdates: Object.freeze([]),
   revealLatestDownload: Object.freeze([]),
+  openDashboardInBrowser: Object.freeze([]),
+  showDiagnostics: Object.freeze([]),
+  revealLocalData: Object.freeze([]),
+  refreshStarted: Object.freeze([]),
+  refreshSettled: Object.freeze(["lease"]),
 });
 
 const DEFAULT_CODEX_HOME = Object.freeze({
@@ -150,6 +160,13 @@ function assertSeconds(value) {
   return value;
 }
 
+function assertRefreshLease(value) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new TypeError("lease is invalid");
+  }
+  return value;
+}
+
 /**
  * Validate and return a frozen request envelope.  The envelope is deliberately
  * `{ action, args }` rather than an open-ended command object: both the action
@@ -190,6 +207,9 @@ export function validateDesktopRequest(request) {
       break;
     case "openHostedSignIn":
       validateHostedSignInAuthorizeUrl(args.authorizeUrl);
+      break;
+    case "refreshSettled":
+      assertRefreshLease(args.lease);
       break;
     default:
       break;

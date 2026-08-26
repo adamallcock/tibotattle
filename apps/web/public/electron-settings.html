@@ -146,6 +146,26 @@
             </label>
           </section>
 
+          <section class="settings-card" aria-labelledby="settings-local-tools-title">
+            <div class="settings-card-copy">
+              <h3 id="settings-local-tools-title" data-i18n="electron.settings.localTools.title">Local tools</h3>
+              <p data-i18n="electron.settings.localTools.description">
+                Open the current dashboard in your browser, inspect content-free diagnostics, or reveal TiboTattle's local data folder. These actions do not upload or erase data.
+              </p>
+            </div>
+            <div class="settings-actions" aria-label="Local tools" data-i18n-aria-label="electron.settings.localTools.actions">
+              <button class="button button-secondary" id="settings-open-dashboard-browser" type="button" data-i18n="electron.settings.localTools.openBrowser">
+                Open dashboard in browser
+              </button>
+              <button class="button button-quiet" id="settings-show-diagnostics" type="button" data-i18n="electron.settings.localTools.diagnostics">
+                Show diagnostics
+              </button>
+              <button class="button button-quiet" id="settings-reveal-local-data" type="button" data-i18n="electron.settings.localTools.revealData">
+                Show local data
+              </button>
+            </div>
+          </section>
+
           <section class="settings-card" aria-labelledby="settings-login-title">
             <div class="settings-card-copy">
               <h3 id="settings-login-title" data-i18n="electron.settings.login.title">Start at login</h3>

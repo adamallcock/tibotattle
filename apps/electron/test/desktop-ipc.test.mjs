@@ -66,6 +66,55 @@ test("desktop IPC fails closed for an untrusted sender or frame before handlers 
   assert.equal(calls, 0);
 });
 
+test("desktop IPC restricts refresh lifecycle actions to the active dashboard frame", async () => {
+  const dashboardSender = {};
+  const dashboardFrame = {};
+  const settingsSender = {};
+  const settingsFrame = {};
+  const calls = [];
+  const handler = createDesktopIpcHandler({
+    trustedSender: (sender) => sender === dashboardSender || sender === settingsSender,
+    trustedFrame: (frame) => frame === dashboardFrame || frame === settingsFrame,
+    trustedAction: (action, event) => (
+      action !== "refreshStarted"
+      && action !== "refreshSettled"
+    ) || (event.sender === dashboardSender && event.senderFrame === dashboardFrame),
+    handlers: {
+      refreshStarted() {
+        calls.push("started");
+        return 1;
+      },
+      refreshSettled() {
+        calls.push("settled");
+        return true;
+      },
+    },
+  });
+
+  await assert.rejects(
+    handler(
+      { sender: settingsSender, senderFrame: settingsFrame },
+      { action: "refreshStarted", args: {} },
+    ),
+    errorCode("desktop_ipc_untrusted_context"),
+  );
+  assert.deepEqual(
+    await handler(
+      { sender: dashboardSender, senderFrame: dashboardFrame },
+      { action: "refreshStarted", args: {} },
+    ),
+    1,
+  );
+  assert.deepEqual(
+    await handler(
+      { sender: dashboardSender, senderFrame: dashboardFrame },
+      { action: "refreshSettled", args: { lease: 1 } },
+    ),
+    true,
+  );
+  assert.deepEqual(calls, ["started", "settled"]);
+});
+
 test("desktop IPC rejects malformed and extra request keys without invoking a handler", async () => {
   const sender = {};
   const frame = {};

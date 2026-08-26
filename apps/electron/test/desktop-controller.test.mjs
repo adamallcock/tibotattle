@@ -2,10 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { DESKTOP_DEFAULT_SETTINGS } from "../desktop-contract.js";
-import { createDesktopController } from "../desktop-controller.js";
+import {
+  createDesktopController,
+  DESKTOP_REFRESH_LEASE_WATCHDOG_MS,
+} from "../desktop-controller.js";
 import { createDesktopSettingsStore } from "../desktop-settings-store.js";
 
-function fixture({ platformOverrides = {}, lifecycleOverrides = {} } = {}) {
+function fixture({
+  platformOverrides = {},
+  lifecycleOverrides = {},
+  actionOverrides = {},
+} = {}) {
   let persisted = null;
   const store = createDesktopSettingsStore({
     backend: {
@@ -98,6 +105,7 @@ function fixture({ platformOverrides = {}, lifecycleOverrides = {} } = {}) {
       languageChanges.push(value);
       return true;
     },
+    ...actionOverrides,
     setRecurringTimer(callback, milliseconds) {
       const timer = { callback, milliseconds, unref() {} };
       timers.push(timer);
@@ -198,6 +206,92 @@ test("controller implements every bounded bridge action and desktop command", as
     startAtLogin: true,
     notifications: { enabled: false, threshold: "off" },
   });
+});
+
+test("controller exposes bounded browser, diagnostics, local-data, and refresh lifecycle actions", async () => {
+  const actions = [];
+  const value = fixture({
+    actionOverrides: {
+      openDashboardInBrowserAction: async () => actions.push("browser"),
+      showDiagnosticsAction: async () => actions.push("diagnostics"),
+      revealLocalDataAction: async () => actions.push("local-data"),
+    },
+  });
+  await value.controller.initialize();
+  await value.controller.handlers.openDashboardInBrowser({});
+  await value.controller.handlers.showDiagnostics({});
+  await value.controller.handlers.revealLocalData({});
+  assert.deepEqual(actions, ["browser", "diagnostics", "local-data"]);
+
+  value.timers[0].callback();
+  assert.deepEqual(value.commands, [{ command: "refresh" }]);
+  const fallbackTimer = value.timers.at(-1);
+  assert.notEqual(fallbackTimer, value.timers[0]);
+  fallbackTimer.callback();
+  assert.deepEqual(
+    value.commands,
+    [{ command: "refresh" }],
+    "a delivered-but-unaccepted tick only rearms the cadence; it does not spin refresh commands",
+  );
+  const rearmedTimer = value.timers.at(-1);
+  assert.notEqual(rearmedTimer, fallbackTimer);
+  const lease = await value.controller.handlers.refreshStarted({});
+  assert.equal(lease, 1);
+  assert.equal(value.timers.at(-1).milliseconds, DESKTOP_REFRESH_LEASE_WATCHDOG_MS);
+  assert.ok(value.cleared.includes(rearmedTimer));
+  assert.equal(await value.controller.handlers.refreshSettled({}), false);
+  assert.equal(await value.controller.handlers.refreshSettled({ lease }), true);
+  assert.equal(value.timers.at(-1).milliseconds, 300_000);
+});
+
+test("refresh leases ignore stale completion and only the current lease rearms cadence", async () => {
+  const value = fixture();
+  await value.controller.initialize();
+  const leaseA = await value.controller.handlers.refreshStarted({});
+  const watchdogA = value.timers.at(-1);
+  const leaseB = await value.controller.handlers.refreshStarted({});
+  const watchdogB = value.timers.at(-1);
+  assert.deepEqual([leaseA, leaseB], [1, 2]);
+  assert.equal(watchdogA.milliseconds, DESKTOP_REFRESH_LEASE_WATCHDOG_MS);
+  assert.ok(value.cleared.includes(watchdogA));
+  assert.equal(await value.controller.handlers.refreshSettled({ lease: leaseA }), false);
+  assert.equal(value.timers.at(-1), watchdogB);
+  assert.equal(await value.controller.handlers.refreshSettled({ lease: leaseB }), true);
+  assert.equal(value.timers.at(-1).milliseconds, 300_000);
+});
+
+test("changing the refresh interval during an active lease persists without arming a timer", async () => {
+  const value = fixture();
+  await value.controller.initialize();
+  const lease = await value.controller.handlers.refreshStarted({});
+  const timerCount = value.timers.length;
+  await value.controller.handlers.setRefreshInterval({ seconds: 60 });
+  assert.equal(value.timers.length, timerCount);
+  assert.equal((await value.store.getSettings()).refreshIntervalSeconds, 60);
+  assert.equal(await value.controller.handlers.refreshSettled({ lease }), true);
+  assert.equal(value.timers.at(-1).milliseconds, 60_000);
+});
+
+test("dashboard replacement releases an abandoned lease and rearms the cadence", async () => {
+  const value = fixture();
+  await value.controller.initialize();
+  const lease = await value.controller.handlers.refreshStarted({});
+  const watchdog = value.timers.at(-1);
+  assert.equal(value.controller.reconcileDashboardSession(), true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(value.cleared.includes(watchdog));
+  assert.equal(await value.controller.handlers.refreshSettled({ lease }), false);
+  assert.equal(value.timers.at(-1).milliseconds, 300_000);
+});
+
+test("lease watchdog recovers cadence after a renderer disappears", async () => {
+  const value = fixture();
+  await value.controller.initialize();
+  await value.controller.handlers.refreshStarted({});
+  const watchdog = value.timers.at(-1);
+  watchdog.callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(value.timers.at(-1).milliseconds, 300_000);
 });
 
 test("controller persists sidebar collapse and sends only the bounded presentation command", async () => {

@@ -70,10 +70,14 @@ export function createDesktopIpcHandler({
   handlers = {},
   trustedSender,
   trustedFrame,
+  trustedAction,
 } = {}) {
   const boundedHandlers = assertHandlerMap(handlers);
   const senderCheck = makeAuthorization(trustedSender, "sender");
   const frameCheck = makeAuthorization(trustedFrame, "frame");
+  const actionCheck = trustedAction === undefined
+    ? () => true
+    : makeAuthorization(trustedAction, "action");
 
   return async function handleDesktopIpc(event, rawRequest) {
     if (!authorized(senderCheck, event?.sender, event)
@@ -86,6 +90,10 @@ export function createDesktopIpcHandler({
       request = validateDesktopRequest(rawRequest);
     } catch {
       throw ipcError("desktop_ipc_invalid_request");
+    }
+
+    if (!authorized(actionCheck, request.action, event)) {
+      throw ipcError("desktop_ipc_untrusted_context");
     }
 
     const handler = boundedHandlers[request.action];
@@ -114,9 +122,15 @@ export function installDesktopIpc({
   handlers = {},
   trustedSender,
   trustedFrame,
+  trustedAction,
 } = {}) {
   const main = assertIpcMain(ipcMain);
-  const handle = createDesktopIpcHandler({ handlers, trustedSender, trustedFrame });
+  const handle = createDesktopIpcHandler({
+    handlers,
+    trustedSender,
+    trustedFrame,
+    trustedAction,
+  });
   main.handle(DESKTOP_IPC_CHANNEL, handle);
   let installed = true;
   return Object.freeze({

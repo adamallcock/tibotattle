@@ -322,6 +322,11 @@ let localRefreshCancelRequested = false;
 // six-minute companion budget expires. The one-minute renderer margin lets a
 // terminal response settle after the companion's bounded work window closes.
 const ELECTRON_REFRESH_POLLING_WINDOW_MS = 121 * 60_000;
+// Cadence ownership is a shell convenience, not a reason to delay the
+// renderer's status polling or progress ticker. A missing/restarting main
+// process gets only this bounded wait before the local operation continues;
+// the main-process lease watchdog remains the final recovery authority.
+const ELECTRON_REFRESH_LIFECYCLE_SIGNAL_TIMEOUT_MS = 1_000;
 // Archive indexing progress is intentionally transient: the durable dashboard
 // continues to show only the last verified complete/partial coverage receipt.
 // While a refresh owns a new pass, make that distinction visible beside cost
@@ -7975,9 +7980,22 @@ function renderAccountingCacheSwitchDetails(impact) {
   if (!disclosure || !rows) return;
   clear(rows);
   const available = impact?.status === "available";
-  disclosure.hidden = !available;
+  // Keep the diagnostic surface discoverable even before there is enough
+  // evidence to evaluate it. Hiding the whole panel leaves a new or
+  // single-turn installation looking as though the feature is absent; the
+  // row below instead says that no numeric estimate has been made.
+  disclosure.hidden = false;
   if (!available) {
     disclosure.open = false;
+    const row = node("tr");
+    const cell = localizedNode(
+      "td",
+      "empty-cell",
+      "accounting.cacheSwitch.detailsUnavailable",
+    );
+    cell.colSpan = 5;
+    row.append(cell);
+    rows.append(row);
     renderCacheImpactPagination(
       "cache-switch",
       cacheSwitchTablePagination,
@@ -8805,9 +8823,20 @@ function renderAccountingCacheReuseOutcome(impact) {
   const empty = $("#cache-reuse-empty");
   if (!outcome || !raster || !empty) return;
   const buckets = cacheReuseOutcomeBuckets(impact);
-  outcome.hidden = buckets === null;
+  const available = buckets !== null;
+  outcome.hidden = false;
+  for (const selector of [".cache-reuse-real-data", ".cache-reuse-summary"]) {
+    const element = outcome.querySelector(selector);
+    if (element) element.hidden = !available;
+  }
   if (buckets === null) {
     cacheReuseCurrentImpact = null;
+    raster.hidden = true;
+    empty.hidden = false;
+    setLocalizedText(
+      empty,
+      "accounting.cacheContinuity.outcome.insufficientEvidence",
+    );
     return;
   }
   cacheReuseCurrentImpact = impact;
@@ -8843,6 +8872,7 @@ function renderAccountingCacheReuseOutcome(impact) {
       between: formatCount(impact.reusedBetweenHalfAndPreviousReturns),
     },
   );
+  setLocalizedText(empty, "accounting.cacheContinuity.outcome.noData");
   empty.hidden = total !== 0;
   raster.hidden = total === 0;
   if (total === 0) return;
@@ -8889,10 +8919,22 @@ function renderAccountingCacheContinuityDetails(impact) {
   if (!disclosure || !rows) return;
   clear(rows);
   const available = impact?.status === "available";
-  disclosure.hidden = !available;
+  // Like the switch panel, an unavailable analysis is a truthful state, not
+  // an absent feature. Keep the panel visible and make the missing evidence
+  // explicit without rendering a zero-valued estimate.
+  disclosure.hidden = false;
   renderAccountingCacheReuseOutcome(available ? impact : null);
   if (!available) {
     disclosure.open = false;
+    const row = node("tr");
+    const cell = localizedNode(
+      "td",
+      "empty-cell",
+      "accounting.cacheContinuity.detailsUnavailable",
+    );
+    cell.colSpan = 6;
+    row.append(cell);
+    rows.append(row);
     renderCacheImpactPagination(
       "cache-continuity",
       cacheContinuityTablePagination,
@@ -10930,6 +10972,55 @@ function scheduleReindexAutoContinuation() {
   }, REINDEX_AUTO_CONTINUE_DELAY_MS);
 }
 
+function signalElectronRefreshLifecycle(action, args = [], options = {}) {
+  if (!runsInsideElectronDashboard()) return Promise.resolve(null);
+  const bridge = globalThis.tibotattleDesktop;
+  if (typeof bridge?.[action] !== "function" || !Array.isArray(args)) {
+    return Promise.resolve(null);
+  }
+  const onLateValue = typeof options?.onLateValue === "function"
+    ? options.onLateValue
+    : null;
+  let call;
+  try {
+    call = Promise.resolve(bridge[action](...args));
+  } catch {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    let timedOut = false;
+    const reportLateValue = (value) => {
+      if (!onLateValue) return;
+      try {
+        onLateValue(value);
+      } catch {
+        // A late cadence cleanup is best effort and must not affect the
+        // already-running renderer refresh.
+      }
+    };
+    const timer = setTimeout(() => {
+      settled = true;
+      timedOut = true;
+      resolve(null);
+    }, ELECTRON_REFRESH_LIFECYCLE_SIGNAL_TIMEOUT_MS);
+    call.then((value) => {
+      if (settled) {
+        if (timedOut) reportLateValue(value);
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      return resolve(value);
+    }, () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(null);
+    });
+  });
+}
+
 async function requestRefresh({ autoContinue = false } = {}) {
   if (localActionBusy) return;
   // Fence continuation against the exact coverage visible before this pass.
@@ -10963,6 +11054,20 @@ async function requestRefresh({ autoContinue = false } = {}) {
   let latestOutcome = "running";
   let latestPollCount = 0;
   let lastStatusReceivedMs = null;
+  let refreshStartSignal = Promise.resolve(null);
+  let lateRefreshLease = null;
+  let refreshLifecycleFinished = false;
+  const handleLateRefreshLease = (lease) => {
+    if (!Number.isSafeInteger(lease) || lease <= 0) return;
+    if (!refreshLifecycleFinished) {
+      lateRefreshLease = lease;
+      return;
+    }
+    // The operation has already reached its terminal cleanup. Settle a lease
+    // whose start response crossed the one-second bridge bound after the
+    // renderer had stopped awaiting it.
+    void signalElectronRefreshLifecycle("refreshSettled", [{ lease }]);
+  };
   const elapsedLabel = () => {
     const elapsedSeconds = Math.max(
       0,
@@ -11023,6 +11128,15 @@ async function requestRefresh({ autoContinue = false } = {}) {
   try {
     await localClient.refresh();
     refreshAccepted = true;
+    if (electronRefresh) {
+      // Do not await the main-process cadence lease: status polling and the
+      // progress ticker must begin as soon as the companion accepts work.
+      refreshStartSignal = signalElectronRefreshLifecycle(
+        "refreshStarted",
+        [],
+        { onLateValue: handleLateRefreshLease },
+      );
+    }
     activePassStartedMs = Date.now();
     lastStatusReceivedMs = activePassStartedMs;
     progressTicker = setInterval(renderRefreshActivity, 1_000);
@@ -11250,6 +11364,14 @@ async function requestRefresh({ autoContinue = false } = {}) {
     localActionBusy = false;
     localRefreshInProgress = false;
     localRefreshCancelRequested = false;
+    if (electronRefresh && refreshAccepted) {
+      let lease = await refreshStartSignal;
+      if (!Number.isSafeInteger(lease) || lease <= 0) lease = lateRefreshLease;
+      if (Number.isSafeInteger(lease) && lease > 0) {
+        await signalElectronRefreshLifecycle("refreshSettled", [{ lease }]);
+      }
+    }
+    refreshLifecycleFinished = true;
     updateLocalActionButtons();
   }
 }

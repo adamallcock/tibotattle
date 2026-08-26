@@ -122,6 +122,9 @@ function makeSettingsDocument({ electron = false } = {}) {
   make("settings-version");
   make("settings-build");
   make("settings-operation-status");
+  make("settings-open-dashboard-browser");
+  make("settings-show-diagnostics");
+  make("settings-reveal-local-data");
   make("settings-choose-codex-folder");
   make("settings-use-default-codex-folder");
   make("settings-open-login-items");
@@ -256,6 +259,18 @@ function bridgeFixture(calls, state = settingsState(), commandSlot = null) {
       assert.equal(args.length, 0);
       return result("checkForUpdates");
     },
+    openDashboardInBrowser: async (...args) => {
+      assert.equal(args.length, 0);
+      return result("openDashboardInBrowser");
+    },
+    showDiagnostics: async (...args) => {
+      assert.equal(args.length, 0);
+      return result("showDiagnostics");
+    },
+    revealLocalData: async (...args) => {
+      assert.equal(args.length, 0);
+      return result("revealLocalData");
+    },
   });
 }
 
@@ -314,6 +329,9 @@ test("settings assets expose the exact v1 bridge, finite values, and fixed links
     "openSystemSettings",
     "checkForUpdates",
     "openExternal",
+    "openDashboardInBrowser",
+    "showDiagnostics",
+    "revealLocalData",
   ]);
   assert.doesNotMatch(source, /innerHTML|outerHTML|insertAdjacentHTML/u);
   assert.doesNotMatch(source, /window\.tibotattleDesktop\.actions/u);
@@ -548,6 +566,16 @@ test("settings bridge renders native-parity controls and supports keyboard tabs"
   documentRef.byId.get("settings-check-for-updates").dispatch("click");
   await settle();
   assert.deepEqual(calls.at(-1), ["checkForUpdates"]);
+
+  documentRef.byId.get("settings-open-dashboard-browser").dispatch("click");
+  await settle();
+  assert.deepEqual(calls.at(-1), ["openDashboardInBrowser"]);
+  documentRef.byId.get("settings-show-diagnostics").dispatch("click");
+  await settle();
+  assert.deepEqual(calls.at(-1), ["showDiagnostics"]);
+  documentRef.byId.get("settings-reveal-local-data").dispatch("click");
+  await settle();
+  assert.deepEqual(calls.at(-1), ["revealLocalData"]);
 
   documentRef.byId.get("settings-notifications-enabled").checked = false;
   documentRef.byId.get("settings-notifications-enabled").dispatch("change");

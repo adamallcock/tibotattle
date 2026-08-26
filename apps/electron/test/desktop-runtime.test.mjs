@@ -441,6 +441,48 @@ test("runtime applies persisted custom CODEX_HOME before first child start", asy
   await fixture.desktop.lifecycle.dispose();
 });
 
+test("runtime wires safe browser, diagnostics, and local-data actions", async () => {
+  const external = [];
+  const revealed = [];
+  const copied = [];
+  const dialogs = [];
+  const fixture = await launchFixture({
+    load: async () => null,
+    runtimeOverrides: {
+      dialog: {
+        showMessageBox: async (options) => {
+          dialogs.push(options);
+          return { response: 0 };
+        },
+      },
+      shell: {
+        openExternal: async (url) => external.push(url),
+        showItemInFolder: (path) => revealed.push(path),
+      },
+      clipboard: {
+        writeText: (value) => copied.push(value),
+      },
+    },
+  });
+
+  assert.equal(await fixture.desktop.controller.handlers.openDashboardInBrowser({}), true);
+  assert.deepEqual(external, ["http://127.0.0.1:4811/"]);
+
+  assert.equal(await fixture.desktop.controller.handlers.revealLocalData({}), true);
+  assert.deepEqual(revealed, ["/Users/adam/Library/Application Support/TiboTattle/companion-state"]);
+
+  assert.deepEqual(
+    await fixture.desktop.controller.handlers.showDiagnostics({}),
+    { status: "copied" },
+  );
+  assert.equal(dialogs.length, 1);
+  assert.equal(copied.length, 1);
+  assert.equal(copied[0], dialogs[0].detail);
+  assert.match(dialogs[0].detail, /tibotattle-electron-diagnostics-v1/u);
+  assert.doesNotMatch(dialogs[0].detail, /Users|127\.0\.0\.1|codex-first/u);
+  await fixture.desktop.lifecycle.dispose();
+});
+
 test("runtime applies the persisted desktop language to the initial tray menu", async () => {
   const fixture = await launchFixture({
     load: async () => ({
@@ -450,6 +492,28 @@ test("runtime applies the persisted desktop language to the initial tray menu", 
   });
   const tray = FakeTray.instances.at(-1);
   assert.equal(tray.menu.template.find((item) => item.label === "打开 TiboTattle")?.label, "打开 TiboTattle");
+  await fixture.desktop.lifecycle.dispose();
+});
+
+test("runtime invalidates a dashboard refresh lease when its renderer is replaced", async () => {
+  const fixture = await launchFixture({
+    load: async () => null,
+  });
+  const dashboard = FakeWindow.instances.find((candidate) => (
+    candidate.options.webPreferences.preload === "/repo/apps/electron/preload.cjs"
+  ));
+  assert.notEqual(dashboard, undefined);
+  dashboard.emit("ready-to-show");
+  const lease = await fixture.desktop.controller.handlers.refreshStarted();
+  dashboard.webContents.emit("render-process-gone", {}, {
+    reason: "crashed",
+    exitCode: 17,
+  });
+  assert.equal(
+    await fixture.desktop.controller.handlers.refreshSettled({ lease }),
+    false,
+    "a replaced dashboard cannot settle the abandoned renderer lease",
+  );
   await fixture.desktop.lifecycle.dispose();
 });
 

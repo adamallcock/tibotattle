@@ -55,6 +55,9 @@ export const SETTINGS_ACTION_NAMES = Object.freeze([
   "openSystemSettings",
   "checkForUpdates",
   "openExternal",
+  "openDashboardInBrowser",
+  "showDiagnostics",
+  "revealLocalData",
 ]);
 
 const LOGIN_ITEM_STATUSES = new Set([
@@ -461,6 +464,12 @@ function renderSettingsState(documentRef, state, bridgeAvailable, localizer) {
   );
   const automaticSwitch = queryRequired(documentRef, "#settings-automatic-updates");
   const checkForUpdates = queryRequired(documentRef, "#settings-check-for-updates");
+  const openDashboardBrowser = queryRequired(
+    documentRef,
+    "#settings-open-dashboard-browser",
+  );
+  const showDiagnostics = queryRequired(documentRef, "#settings-show-diagnostics");
+  const revealLocalData = queryRequired(documentRef, "#settings-reveal-local-data");
 
   language.value = state.language;
   appearance.value = state.appearance;
@@ -524,6 +533,9 @@ function renderSettingsState(documentRef, state, bridgeAvailable, localizer) {
   checkForUpdates.textContent = state.about.update.status === "checking"
     ? translateSettingsMessage(localizer, "electron.settings.updates.checkingButton")
     : translateSettingsMessage(localizer, "electron.settings.updates.check");
+  openDashboardBrowser.disabled = !bridgeAvailable;
+  showDiagnostics.disabled = !bridgeAvailable;
+  revealLocalData.disabled = !bridgeAvailable;
 }
 
 function setTab(documentRef, tabName, { focus = false } = {}) {
@@ -663,7 +675,10 @@ export async function mountSettingsPage({
       const result = value === undefined
         ? await action()
         : await action(value);
-      if (result !== undefined) currentState = normalizeSettingsState(result);
+      if (result !== undefined
+          && (result?.settings !== undefined || result?.language !== undefined)) {
+        currentState = normalizeSettingsState(result);
+      }
       applyElectronAppearancePreference(currentState.appearance, { documentRef, windowRef });
       pageLocalizer?.setLanguagePreference?.(
         browserLanguagePreference(currentState.language),
@@ -782,6 +797,15 @@ export async function mountSettingsPage({
   });
   listen(queryRequired(documentRef, "#settings-check-for-updates"), "click", () => {
     void invoke("checkForUpdates");
+  });
+  listen(queryRequired(documentRef, "#settings-open-dashboard-browser"), "click", () => {
+    void invoke("openDashboardInBrowser");
+  });
+  listen(queryRequired(documentRef, "#settings-show-diagnostics"), "click", () => {
+    void invoke("showDiagnostics");
+  });
+  listen(queryRequired(documentRef, "#settings-reveal-local-data"), "click", () => {
+    void invoke("revealLocalData");
   });
   for (const link of documentRef.querySelectorAll("[data-external-target]")) {
     listen(link, "click", (event) => {

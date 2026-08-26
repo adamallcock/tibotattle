@@ -6,6 +6,11 @@ const DASHBOARD_COMMANDS = Object.freeze({
   refresh: Object.freeze({ command: "refresh" }),
 });
 
+// The renderer keeps one immutable 121-minute operation deadline. This small
+// additional margin releases a lease after a crashed/replaced renderer while
+// still allowing a legitimate cold index pass to settle first.
+export const DESKTOP_REFRESH_LEASE_WATCHDOG_MS = 123 * 60_000;
+
 const NOTIFICATION_THRESHOLDS = Object.freeze([
   "off",
   "ninety",
@@ -204,8 +209,17 @@ export function createDesktopController({
   sendDashboardCommand = () => false,
   onLanguageChanged = () => {},
   onAppearanceChanged = () => null,
-  setRecurringTimer = setInterval,
-  clearRecurringTimer = clearInterval,
+  openDashboardInBrowserAction = async () => {
+    throw controllerError("desktop_dashboard_browser_unavailable");
+  },
+  showDiagnosticsAction = async () => {
+    throw controllerError("desktop_diagnostics_unavailable");
+  },
+  revealLocalDataAction = async () => {
+    throw controllerError("desktop_local_data_unavailable");
+  },
+  setRecurringTimer = setTimeout,
+  clearRecurringTimer = clearTimeout,
 } = {}) {
   const store = assertPort(settingsStore, [
     "getSettings",
@@ -244,6 +258,13 @@ export function createDesktopController({
   if (typeof onAppearanceChanged !== "function") {
     throw new TypeError("onAppearanceChanged is required");
   }
+  for (const [name, value] of Object.entries({
+    openDashboardInBrowserAction,
+    showDiagnosticsAction,
+    revealLocalDataAction,
+  })) {
+    if (typeof value !== "function") throw new TypeError(`${name} is required`);
+  }
   if (typeof setRecurringTimer !== "function" || typeof clearRecurringTimer !== "function") {
     throw new TypeError("timer functions are required");
   }
@@ -251,6 +272,10 @@ export function createDesktopController({
   let initialized = false;
   let disposed = false;
   let refreshTimer = null;
+  let refreshInFlight = false;
+  let refreshLeaseWatchdogTimer = null;
+  let refreshLeaseCounter = 0;
+  let activeRefreshLease = null;
   let operation = Promise.resolve();
   let activeCodexHome = null;
   let codexHomeRecovery = null;
@@ -299,11 +324,57 @@ export function createDesktopController({
     refreshTimer = null;
   }
 
+  function stopRefreshLeaseWatchdog() {
+    if (refreshLeaseWatchdogTimer === null) return;
+    clearRecurringTimer(refreshLeaseWatchdogTimer);
+    refreshLeaseWatchdogTimer = null;
+  }
+
+  function rearmRefreshTimerFromSettings() {
+    return enqueue(async () => {
+      if (disposed || refreshInFlight) return false;
+      const settings = await store.getSettings();
+      startRefreshTimer(settings.refreshIntervalSeconds);
+      return true;
+    });
+  }
+
+  function startRefreshLeaseWatchdog(lease) {
+    stopRefreshLeaseWatchdog();
+    refreshLeaseWatchdogTimer = setRecurringTimer(() => {
+      refreshLeaseWatchdogTimer = null;
+      if (activeRefreshLease !== lease) return;
+      activeRefreshLease = null;
+      refreshInFlight = false;
+      void rearmRefreshTimerFromSettings().catch(() => {});
+    }, DESKTOP_REFRESH_LEASE_WATCHDOG_MS);
+    refreshLeaseWatchdogTimer?.unref?.();
+  }
+
   function startRefreshTimer(seconds) {
     stopRefreshTimer();
-    if (disposed) return;
+    if (disposed || refreshInFlight) return;
     refreshTimer = setRecurringTimer(() => {
-      emitDashboardCommand(DASHBOARD_COMMANDS.refresh);
+      // The desktop cadence is deliberately one-shot. The renderer reports a
+      // terminal requestRefresh finally before another timer is armed, so a
+      // long accounting pass cannot be started again merely because the app
+      // has been open longer than the configured interval.
+      refreshTimer = null;
+      const delivered = emitDashboardCommand(DASHBOARD_COMMANDS.refresh);
+      if (!delivered) {
+        // A hidden/restarting dashboard may ignore this tick. Keep a bounded
+        // retry armed rather than losing the cadence or spinning commands.
+        startRefreshTimer(seconds);
+        return;
+      }
+      // The renderer calls refreshStarted after its POST is accepted. If the
+      // command was delivered to a busy renderer and no POST is accepted,
+      // this one-shot fallback retries at the normal cadence. An accepted
+      // refreshStarted clears it, so long accounting never overlaps itself.
+      refreshTimer = setRecurringTimer(() => {
+        refreshTimer = null;
+        if (!refreshInFlight) startRefreshTimer(seconds);
+      }, seconds * 1_000);
     }, seconds * 1_000);
     refreshTimer?.unref?.();
   }
@@ -529,7 +600,9 @@ export function createDesktopController({
     async setRefreshInterval({ seconds }) {
       return enqueue(async () => {
         await store.setRefreshInterval(seconds);
-        startRefreshTimer(seconds);
+        // Do not replace an active lease with a timer. The terminal settle or
+        // watchdog recovery will reread this persisted interval exactly once.
+        if (!refreshInFlight) startRefreshTimer(seconds);
         return snapshot();
       });
     },
@@ -639,6 +712,44 @@ export function createDesktopController({
       }
       return selected.revealLatestDownload();
     },
+    async openDashboardInBrowser() {
+      return openDashboardInBrowserAction();
+    },
+    async showDiagnostics() {
+      return showDiagnosticsAction();
+    },
+    async revealLocalData() {
+      return revealLocalDataAction();
+    },
+    async refreshStarted() {
+      if (disposed) return false;
+      if (refreshLeaseCounter >= Number.MAX_SAFE_INTEGER) {
+        throw controllerError("desktop_refresh_lease_exhausted");
+      }
+      refreshLeaseCounter += 1;
+      const lease = refreshLeaseCounter;
+      activeRefreshLease = lease;
+      refreshInFlight = true;
+      stopRefreshTimer();
+      startRefreshLeaseWatchdog(lease);
+      return lease;
+    },
+    async refreshSettled({ lease } = {}) {
+      if (disposed) return false;
+      if (!Number.isSafeInteger(lease)
+          || lease <= 0
+          || activeRefreshLease !== lease) {
+        return false;
+      }
+      activeRefreshLease = null;
+      refreshInFlight = false;
+      stopRefreshLeaseWatchdog();
+      return enqueue(async () => {
+        const settings = await store.getSettings();
+        startRefreshTimer(settings.refreshIntervalSeconds);
+        return true;
+      });
+    },
   });
 
   const handlerKeys = Object.keys(handlers);
@@ -658,9 +769,20 @@ export function createDesktopController({
       return emitDashboardCommand(DASHBOARD_COMMANDS.refresh);
     },
     toggleSidebar,
+    reconcileDashboardSession() {
+      if (disposed) return false;
+      if (activeRefreshLease !== null) {
+        activeRefreshLease = null;
+        refreshInFlight = false;
+        stopRefreshLeaseWatchdog();
+      }
+      void rearmRefreshTimerFromSettings().catch(() => {});
+      return true;
+    },
     async dispose() {
       disposed = true;
       stopRefreshTimer();
+      stopRefreshLeaseWatchdog();
       await operation.catch(() => {});
     },
   });

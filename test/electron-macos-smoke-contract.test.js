@@ -8,7 +8,9 @@ import {
   classifyMacDashboardParityEvidence,
   classifyAutomaticStartupRefreshReceipt,
   ELECTRON_MACOS_SMOKE_FAILURE_REASONS,
+  ELECTRON_MACOS_SMOKE_DEGRADED_FAILURE_CODES,
   ELECTRON_MACOS_SMOKE_STARTUP_REFRESH_ERROR_CODES,
+  hasMeaningfulMacCostEvidence,
   isMacDashboardTarget,
   isMacSettingsTarget,
   observeLocalRefreshRequests,
@@ -84,6 +86,12 @@ test("macOS Electron smoke is an explicit packaged arm64 lane", async () => {
   assert.match(source, /bindMacSmokeRefreshObserver/u);
   assert.match(source, /releaseMacSmokeRefreshGate/u);
   assert.match(source, /releaseStartupRefresh/u);
+  assert.match(source, /terminalStatus: "degraded"/u);
+  assert.match(source, /degradedFailureCode/u);
+  assert.match(source, /codex_rollout_sources_quarantined/u);
+  assert.match(source, /meaningfulTokenRows/u);
+  assert.match(source, /advancedModulesReady/u);
+  assert.match(source, /partialHistoryDetail/u);
   assert.match(source, /#weekly/u);
   assert.match(source, /#share-panel/u);
   assert.match(source, /electron-settings/u);
@@ -320,7 +328,11 @@ test("macOS startup receipt requires one new request and terminal success", () =
       refresh: { status: "succeeded", refreshId: "new-refresh" },
       expectedRefreshId: "new-refresh",
     }),
-    { status: "completed", refreshId: "new-refresh" },
+    {
+      status: "completed",
+      refreshId: "new-refresh",
+      terminalStatus: "succeeded",
+    },
   );
   assert.deepEqual(
     classifyAutomaticStartupRefreshReceipt({
@@ -350,6 +362,105 @@ test("macOS startup receipt requires one new request and terminal success", () =
   );
 });
 
+test("macOS startup receipt accepts only coherent partial quarantine as degraded", () => {
+  const codes = ELECTRON_MACOS_SMOKE_STARTUP_REFRESH_ERROR_CODES;
+  const refresh = {
+    status: "degraded",
+    refreshId: "partial-refresh",
+    errorCode: "refresh_degraded",
+    failedStep: "unified_index",
+    failureCode: "codex_rollout_generation_ambiguous",
+    result: {
+      unifiedIndex: {
+        status: "ingested",
+        generation: {
+          status: "partial",
+          blockReason: "codex_rollout_sources_quarantined",
+          skippedSourceCount: 2,
+          skippedThreadCount: 1,
+          reasonCounts: {
+            codex_rollout_generation_ambiguous: 1,
+          },
+          discoveryComplete: true,
+          diagnosticsComplete: true,
+          usageProvenanceComplete: true,
+          sourceOrderComplete: true,
+          quotaProvenanceComplete: true,
+        },
+      },
+      accounting: {
+        status: "replay_safe",
+        sourceMode: "unified",
+        coverageStatus: "partial",
+        generationMatched: true,
+        fallbackCount: 0,
+        diagnosticsAvailable: true,
+      },
+    },
+  };
+  assert.deepEqual(
+    classifyAutomaticStartupRefreshReceipt({
+      phase: "completion",
+      requestCount: 1,
+      refresh,
+      expectedRefreshId: "partial-refresh",
+    }),
+    {
+      status: "completed",
+      refreshId: "partial-refresh",
+      terminalStatus: "degraded",
+      degradedFailureCode: "codex_rollout_generation_ambiguous",
+    },
+  );
+  for (const failureCode of ELECTRON_MACOS_SMOKE_DEGRADED_FAILURE_CODES) {
+    const candidate = structuredClone(refresh);
+    candidate.failureCode = failureCode;
+    candidate.result.unifiedIndex.generation.reasonCounts = { [failureCode]: 1 };
+    assert.equal(classifyAutomaticStartupRefreshReceipt({
+      phase: "completion",
+      requestCount: 1,
+      refresh: candidate,
+      expectedRefreshId: "partial-refresh",
+    }).status, "completed", failureCode);
+  }
+  assert.deepEqual(
+    classifyAutomaticStartupRefreshReceipt({
+      phase: "completion",
+      requestCount: 1,
+      refresh: {
+        ...refresh,
+        result: {
+          ...refresh.result,
+          accounting: {
+            ...refresh.result.accounting,
+            generationMatched: false,
+          },
+        },
+      },
+      expectedRefreshId: "partial-refresh",
+    }),
+    { status: "failed", errorCode: codes.degradedInvalid },
+  );
+  assert.deepEqual(
+    classifyAutomaticStartupRefreshReceipt({
+      phase: "completion",
+      requestCount: 1,
+      refresh: { ...refresh, failureCode: "codex_rollout_content_invalid" },
+      expectedRefreshId: "partial-refresh",
+    }),
+    { status: "failed", errorCode: codes.degradedInvalid },
+  );
+  assert.deepEqual(
+    classifyAutomaticStartupRefreshReceipt({
+      phase: "completion",
+      requestCount: 1,
+      refresh: { ...refresh, failureCode: "private_failure" },
+      expectedRefreshId: "partial-refresh",
+    }),
+    { status: "failed", errorCode: codes.degradedInvalid },
+  );
+});
+
 test("macOS parity evidence rejects empty Usage rows and hidden legacy Community layout", () => {
   const health = {
     capabilities: {
@@ -365,16 +476,22 @@ test("macOS parity evidence rejects empty Usage rows and hidden legacy Community
     tokenCountRows: 1,
     costContributionRows: 1,
     modelIdentityRows: 1,
+    meaningfulTokenRows: 1,
+    meaningfulCostRows: 1,
+    meaningfulModelRows: 1,
     priceCoverage: true,
     advancedModuleShellCount: 3,
     advancedModuleAvailableCount: 1,
     advancedModuleUnavailableCount: 2,
+    advancedModulesReady: true,
   };
   const community = {
     route: "#community",
     pageVisible: true,
     journeyStageCount: 2,
     indexTerminal: true,
+    indexDetail: true,
+    partialHistoryDetail: false,
     googleButton: true,
     appleButton: true,
     currentLayout: true,
@@ -388,6 +505,22 @@ test("macOS parity evidence rejects empty Usage rows and hidden legacy Community
     classifyMacDashboardParityEvidence({
       health,
       usage: { ...usage, tokenCountRows: 0, modelIdentityRows: 0 },
+      community,
+    }),
+    { status: "failed", reason: "usage" },
+  );
+  assert.deepEqual(
+    classifyMacDashboardParityEvidence({
+      health,
+      usage: { ...usage, meaningfulCostRows: 0, priceCoverage: false },
+      community,
+    }),
+    { status: "failed", reason: "usage" },
+  );
+  assert.deepEqual(
+    classifyMacDashboardParityEvidence({
+      health,
+      usage: { ...usage, advancedModulesReady: false },
       community,
     }),
     { status: "failed", reason: "usage" },
@@ -413,6 +546,45 @@ test("macOS parity evidence rejects empty Usage rows and hidden legacy Community
     }),
     { status: "failed", reason: "community" },
   );
+  assert.deepEqual(
+    classifyMacDashboardParityEvidence({
+      health,
+      usage,
+      community: { ...community, partialHistoryDetail: false },
+      startupRefresh: { terminalStatus: "degraded" },
+    }),
+    { status: "failed", reason: "community" },
+  );
+  assert.deepEqual(
+    classifyMacDashboardParityEvidence({
+      health,
+      usage,
+      community: { ...community, partialHistoryDetail: true },
+      startupRefresh: { terminalStatus: "degraded" },
+    }),
+    { status: "passed", reason: null },
+  );
+});
+
+test("macOS cost-row evidence rejects placeholders and accepts priced or explained rows", () => {
+  for (const placeholder of [
+    "Cached input —",
+    "Cached input $0.00",
+    "Cached input 0.00",
+    "Cached input",
+  ]) {
+    assert.equal(hasMeaningfulMacCostEvidence(placeholder), false, placeholder);
+  }
+  for (const evidence of [
+    "Cached input $0.01",
+    "Cached input < $0.01",
+    "Cached input not priced",
+    "Cached input: price unavailable",
+    "Cached input: no published price",
+    "Cached input: cost withheld",
+  ]) {
+    assert.equal(hasMeaningfulMacCostEvidence(evidence), true, evidence);
+  }
 });
 
 test("closed macOS receipt is content-free and has no runtime identifiers", () => {
@@ -435,9 +607,14 @@ test("closed macOS receipt is content-free and has no runtime identifiers", () =
         tokenCountRows: 3,
         costContributionRows: 2,
         modelIdentityRows: 1,
+        meaningfulTokenRows: 3,
+        meaningfulCostRows: 2,
+        meaningfulModelRows: 1,
+        priceCoverage: true,
         advancedModuleShells: true,
         advancedModulesAvailable: 1,
         advancedModulesUnavailable: 2,
+        advancedModulesReady: true,
       },
       community: {
         pageVisible: true,
@@ -446,6 +623,7 @@ test("closed macOS receipt is content-free and has no runtime identifiers", () =
         currentLayout: true,
         providerControls: true,
         indexTerminal: true,
+        partialHistoryDetail: false,
       },
     },
     settings: { connected: true, tabCount: 3, tabs: true },
@@ -456,20 +634,28 @@ test("closed macOS receipt is content-free and has no runtime identifiers", () =
       canvas: true,
     },
   });
+  assert.equal(receipt.schemaVersion, "tibotattle-electron-macos-smoke-v2");
   assert.equal(receipt.status, "passed");
   assert.equal(receipt.cleanQuit, true);
   assert.equal(receipt.contentFree, true);
   assert.equal(receipt.failureReason, null);
   assert.equal(receipt.startupRefresh.requestCount, 1);
   assert.equal(receipt.startupRefresh.terminalStatus, "succeeded");
+  assert.equal(receipt.startupRefresh.degradedFailureCode, null);
   assert.equal(receipt.dashboard.dataFlow, true);
   assert.equal(receipt.parity.usage.summaryCardCount, 4);
   assert.equal(receipt.parity.usage.advancedModuleShells, true);
   assert.equal(receipt.parity.usage.tokenCountRows, 3);
+  assert.equal(receipt.parity.usage.meaningfulTokenRows, 3);
+  assert.equal(receipt.parity.usage.meaningfulCostRows, 2);
+  assert.equal(receipt.parity.usage.meaningfulModelRows, 1);
+  assert.equal(receipt.parity.usage.priceCoverage, true);
+  assert.equal(receipt.parity.usage.advancedModulesReady, true);
   assert.equal(receipt.parity.usage.advancedModulesAvailable, 1);
   assert.equal(receipt.parity.usage.advancedModulesUnavailable, 2);
   assert.equal(receipt.parity.community.serviceConfigured, true);
   assert.equal(receipt.parity.community.currentLayout, true);
+  assert.equal(receipt.parity.community.partialHistoryDetail, false);
   assert.equal(receipt.settings.connected, true);
   assert.equal(receipt.share.route, "#weekly");
   assert.equal(Object.hasOwn(receipt, "refreshId"), false);
@@ -477,6 +663,37 @@ test("closed macOS receipt is content-free and has no runtime identifiers", () =
   assert.equal(Object.hasOwn(receipt, "fixtureRoot"), false);
   assert.equal(Object.isFrozen(receipt), true);
   assert.equal(Object.isFrozen(receipt.startupRefresh), true);
+});
+
+test("closed macOS receipt preserves a bounded degraded startup code", () => {
+  const receipt = buildClosedReceipt({
+    status: "passed",
+    cleanQuit: true,
+    startupRefresh: {
+      requestCount: 1,
+      originBound: true,
+      activeLoaderBound: true,
+      refreshIdChanged: true,
+      terminalStatus: "degraded",
+      degradedFailureCode: "codex_rollout_generation_ambiguous",
+    },
+  });
+  assert.equal(receipt.status, "passed");
+  assert.equal(receipt.startupRefresh.terminalStatus, "degraded");
+  assert.equal(
+    receipt.startupRefresh.degradedFailureCode,
+    "codex_rollout_generation_ambiguous",
+  );
+  assert.equal(
+    buildClosedReceipt({
+      status: "passed",
+      startupRefresh: {
+        terminalStatus: "degraded",
+        degradedFailureCode: "private-error",
+      },
+    }).startupRefresh.terminalStatus,
+    "unknown",
+  );
 });
 
 test("failed macOS receipt keeps an allowlisted fixed reason", () => {

@@ -30,6 +30,7 @@ const WINDOWS_TEST_LANE = "windows-electron-smoke";
 const LANGUAGES = Object.freeze(["system", "en", "zh-Hans", "es"]);
 const APPEARANCES = Object.freeze(["system", "light", "dark"]);
 const REFRESH_INTERVALS = Object.freeze([60, 300, 900, 1800]);
+const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
 const NOTIFICATION_THRESHOLDS = Object.freeze([
   "off",
   "ninety",
@@ -99,6 +100,13 @@ function enumMethod(action, value, allowed, key = "value") {
 function booleanMethod(action, value, key = "enabled") {
   if (typeof value !== "boolean") return rejected(`${key} is invalid`);
   return invoke(action, { [key]: value });
+}
+
+function refreshLeaseMethod(action, lease) {
+  if (!Number.isSafeInteger(lease) || lease <= 0 || lease > MAX_SAFE_INTEGER) {
+    return rejected("lease is invalid");
+  }
+  return invoke(action, { lease });
 }
 
 // This deliberately mirrors the host allowlist without importing a
@@ -281,6 +289,18 @@ function installDesktopBridge() {
     revealLatestDownload: (...values) => noArguments(
       "revealLatestDownload",
       values,
+    ),
+    openDashboardInBrowser: (...values) => noArguments(
+      "openDashboardInBrowser",
+      values,
+    ),
+    showDiagnostics: (...values) => noArguments("showDiagnostics", values),
+    revealLocalData: (...values) => noArguments("revealLocalData", values),
+    refreshStarted: (...values) => noArguments("refreshStarted", values),
+    refreshSettled: (...values) => oneArgument(
+      "refreshSettled",
+      values,
+      (lease) => refreshLeaseMethod("refreshSettled", lease),
     ),
   });
   contextBridge.exposeInMainWorld("tibotattleDesktop", bridge);

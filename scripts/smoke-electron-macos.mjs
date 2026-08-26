@@ -41,7 +41,7 @@ const MAX_STARTUP_MS = 30_000;
 const MAX_OPERATION_MS = 10_000;
 const MAX_REFRESH_MS = 45_000;
 const MAX_SHUTDOWN_MS = 10_000;
-const MACOS_SMOKE_SCHEMA_VERSION = "tibotattle-electron-macos-smoke-v1";
+const MACOS_SMOKE_SCHEMA_VERSION = "tibotattle-electron-macos-smoke-v2";
 const MACOS_SMOKE_CONTROL = "quit-v1";
 const REQUIRED_APP_NAME = "TiboTattle Dev";
 const CLI_FAILURE_STATUS = "ELECTRON_MACOS_SMOKE_FAILED";
@@ -52,8 +52,22 @@ export const ELECTRON_MACOS_SMOKE_STARTUP_REFRESH_ERROR_CODES = Object.freeze({
   changedReceipt: "ELECTRON_MACOS_SMOKE_STARTUP_REFRESH_RECEIPT_CHANGED",
   failed: "ELECTRON_MACOS_SMOKE_STARTUP_REFRESH_FAILED",
   cancelled: "ELECTRON_MACOS_SMOKE_STARTUP_REFRESH_CANCELLED",
+  degradedInvalid: "ELECTRON_MACOS_SMOKE_STARTUP_REFRESH_DEGRADED_INVALID",
   boundaryInvalid: "ELECTRON_MACOS_SMOKE_REFRESH_BOUNDARY_INVALID",
 });
+
+export const ELECTRON_MACOS_SMOKE_DEGRADED_FAILURE_CODES = Object.freeze([
+  "codex_rollout_compression_unsupported",
+  "codex_rollout_filename_identity_mismatch",
+  "codex_rollout_generation_ambiguous",
+  "codex_rollout_lineage_invalid",
+  "codex_rollout_content_invalid",
+  "codex_rollout_tail_incomplete",
+]);
+
+const DEGRADED_FAILURE_CODE_SET = new Set(
+  ELECTRON_MACOS_SMOKE_DEGRADED_FAILURE_CODES,
+);
 
 const FAILURE_STAGES = new Set([
   "contract",
@@ -132,6 +146,8 @@ const FAILURE_REASON_BY_CODE = Object.freeze({
     "startup_refresh_failed",
   [ELECTRON_MACOS_SMOKE_STARTUP_REFRESH_ERROR_CODES.cancelled]:
     "startup_refresh_cancelled",
+  [ELECTRON_MACOS_SMOKE_STARTUP_REFRESH_ERROR_CODES.degradedInvalid]:
+    "startup_refresh_failed",
 });
 
 const FAILURE_STAGE_DEFAULT_REASONS = Object.freeze({
@@ -694,7 +710,49 @@ export function classifyAutomaticStartupRefreshReceipt({
     return Object.freeze({ status: "failed", errorCode: codes.changedReceipt });
   }
   if (refresh.status === "succeeded") {
-    return Object.freeze({ status: "completed", refreshId: refresh.refreshId });
+    return Object.freeze({
+      status: "completed",
+      refreshId: refresh.refreshId,
+      terminalStatus: "succeeded",
+    });
+  }
+  if (refresh.status === "degraded") {
+    const generation = refresh.result?.unifiedIndex?.generation;
+    const accounting = refresh.result?.accounting;
+    const coherent = refresh.errorCode === "refresh_degraded"
+      && refresh.failedStep === "unified_index"
+      && DEGRADED_FAILURE_CODE_SET.has(refresh.failureCode)
+      && refresh.result?.unifiedIndex?.status === "ingested"
+      && generation?.status === "partial"
+      && generation?.blockReason === "codex_rollout_sources_quarantined"
+      && Number.isSafeInteger(generation.skippedSourceCount)
+      && generation.skippedSourceCount > 0
+      && Number.isSafeInteger(generation.skippedThreadCount)
+      && generation.skippedThreadCount > 0
+      && Number.isSafeInteger(generation.reasonCounts?.[refresh.failureCode])
+      && generation.reasonCounts[refresh.failureCode] > 0
+      && generation.discoveryComplete === true
+      && generation.diagnosticsComplete === true
+      && generation.usageProvenanceComplete === true
+      && generation.sourceOrderComplete === true
+      && generation.quotaProvenanceComplete === true
+      && accounting?.status === "replay_safe"
+      && accounting.sourceMode === "unified"
+      && accounting.coverageStatus === "partial"
+      && accounting.generationMatched === true
+      && accounting.fallbackCount === 0
+      && accounting.diagnosticsAvailable === true;
+    return coherent
+      ? Object.freeze({
+        status: "completed",
+        refreshId: refresh.refreshId,
+        terminalStatus: "degraded",
+        degradedFailureCode: refresh.failureCode,
+      })
+      : Object.freeze({
+        status: "failed",
+        errorCode: codes.degradedInvalid,
+      });
   }
   if (refresh.status === "failed") return Object.freeze({ status: "failed", errorCode: codes.failed });
   if (refresh.status === "cancelled") {
@@ -711,6 +769,8 @@ async function assertAutomaticStartupRefresh({
 }) {
   const refreshUrl = new URL("/api/local/refresh", dashboardUrl);
   let refreshId = null;
+  let terminalStatus = null;
+  let degradedFailureCode = null;
   await waitFor(async () => {
     if (child.exitCode !== null || child.signalCode !== null) {
       fail("ELECTRON_MACOS_SMOKE_EXITED_BEFORE_REFRESH", "startup_refresh");
@@ -753,6 +813,8 @@ async function assertAutomaticStartupRefresh({
     });
     if (decision.status === "pending") return false;
     if (decision.status === "failed") fail(decision.errorCode, "startup_refresh");
+    terminalStatus = decision.terminalStatus;
+    degradedFailureCode = decision.degradedFailureCode ?? null;
     return true;
   }, MAX_REFRESH_MS, "automatic startup refresh completion");
   refreshObserver.seal();
@@ -761,7 +823,8 @@ async function assertAutomaticStartupRefresh({
     originBound: true,
     activeLoaderBound: true,
     refreshIdChanged: true,
-    terminalStatus: "succeeded",
+    terminalStatus,
+    degradedFailureCode,
   });
 }
 
@@ -773,6 +836,24 @@ function visible(element) {
     && style.visibility !== "hidden"
     && rect.width > 0
     && rect.height > 0;
+}
+
+/**
+ * A cost row is meaningful only when it carries a positive amount or names
+ * why an amount cannot be priced.  A bare em dash (or a formatted $0.00) is
+ * the renderer's placeholder for withheld pricing, not parity evidence: it
+ * would let an empty/stale cost table satisfy the packaged smoke.
+ */
+export function hasMeaningfulMacCostEvidence(value) {
+  const text = String(value ?? "").trim();
+  if (text.length === 0) return false;
+  const matches = text.match(
+    /(?:^|[^0-9])([1-9][0-9]*(?:[.,][0-9]+)?|0\.[0-9]+)/u,
+  );
+  if (matches !== null && Number(matches[1].replace(",", ".")) > 0) {
+    return true;
+  }
+  return /\b(?:unavailable|not\s+(?:priced|reported|available|provided)|(?:no|without)\s+(?:published\s+)?price|(?:price|cost)\s+(?:unavailable|withheld|not\s+(?:available|provided))|separate\s+allowance|withheld)\b/iu.test(text);
 }
 
 async function assertDashboardShell(cdp) {
@@ -844,17 +925,19 @@ function usageParitySnapshotValid(snapshot) {
   return snapshot?.route === "#accounting"
     && snapshot?.pageVisible === true
     && snapshot?.periodCount === 4
-    && snapshot?.summaryCardCount === 4
+    && snapshot?.summaryCardCount >= 4
     && snapshot?.tokenCountRows >= 1
     && snapshot?.costContributionRows >= 1
     && snapshot?.modelIdentityRows >= 1
+    && snapshot?.meaningfulTokenRows >= 1
+    && snapshot?.meaningfulCostRows >= 1
+    && snapshot?.meaningfulModelRows >= 1
     && snapshot?.priceCoverage === true
     && snapshot?.advancedModuleShellCount === 3
-    && snapshot?.advancedModuleAvailableCount
-      + snapshot?.advancedModuleUnavailableCount === 3;
+    && snapshot?.advancedModulesReady === true;
 }
 
-function communityParitySnapshotValid(snapshot, health) {
+function communityParitySnapshotValid(snapshot, health, { requirePartialDetail = false } = {}) {
   return health?.capabilities?.contributionDevicePairing === true
     && health?.capabilities?.incrementalContributionSync
       === "telemetry-contribution-v1.0"
@@ -862,6 +945,8 @@ function communityParitySnapshotValid(snapshot, health) {
     && snapshot?.pageVisible === true
     && snapshot?.journeyStageCount === 2
     && snapshot?.indexTerminal === true
+    && snapshot?.indexDetail === true
+    && (!requirePartialDetail || snapshot?.partialHistoryDetail === true)
     && snapshot?.googleButton === true
     && snapshot?.appleButton === true
     && snapshot?.currentLayout === true
@@ -872,52 +957,99 @@ export function classifyMacDashboardParityEvidence({
   health = {},
   usage = {},
   community = {},
+  startupRefresh = {},
 } = {}) {
   if (!usageParitySnapshotValid(usage)) {
     return Object.freeze({ status: "failed", reason: "usage" });
   }
-  if (!communityParitySnapshotValid(community, health)) {
+  if (!communityParitySnapshotValid(community, health, {
+    requirePartialDetail: startupRefresh.terminalStatus === "degraded",
+  })) {
     return Object.freeze({ status: "failed", reason: "community" });
   }
   return Object.freeze({ status: "passed", reason: null });
 }
 
-async function assertDashboardParitySurfaces(cdp, health) {
+async function assertDashboardParitySurfaces(cdp, health, startupRefresh = {}) {
 
   const usage = await waitFor(async () => {
     const snapshot = await cdp.evaluate(`(() => {
       const visible = ${visible.toString()};
+      const positiveNumber = (value) => {
+        const matches = String(value ?? "").match(/(?:^|[^0-9])([1-9][0-9]*(?:[.,][0-9]+)?|0\\.[0-9]+)/u);
+        return matches !== null
+          && Number(matches[1].replace(",", ".")) > 0;
+      };
+      const meaningfulRows = (selector, { costEvidence = false } = {}) => {
+        const rows = [...document.querySelectorAll(selector)];
+        return rows.filter((row) => {
+          const text = row.textContent?.trim() ?? "";
+          if (text.length === 0) return false;
+          if (costEvidence) return ${hasMeaningfulMacCostEvidence.toString()}(text);
+          if (positiveNumber(text)) return true;
+          return false;
+        }).length;
+      };
+      const advancedSelectors = [
+        "#cache-switch-details",
+        "#cache-reuse-outcome",
+        "#cache-continuity-details",
+      ];
+      const advancedModules = advancedSelectors.map((selector) => {
+        const element = document.querySelector(selector);
+        const text = element?.textContent?.trim() ?? "";
+        return {
+          present: element !== null,
+          visible: visible(element),
+          explicitContent: text.length > 0,
+          explicitUnavailable: /no eligible|no .* (?:available|priced|reported)|unavailable|not available|insufficient/iu.test(text),
+        };
+      });
+      const indexDetail = document.querySelector("#journey-stage-index-detail")
+        ?.textContent?.trim() ?? "";
       document.querySelector('[data-nav="method"]')?.click();
       const page = document.querySelector('#accounting[data-dashboard-page="method"]');
+      const tokenRows = document.querySelectorAll('#accounting-component-counts .component-row');
+      const costRows = document.querySelectorAll('#accounting-component-costs .component-row');
+      const modelRows = [...document.querySelectorAll('#accounting-models > tr')]
+        .filter((row) => row.querySelector(
+          ':scope > .model-identity:not(.model-component-identity)',
+        ));
+      const priceCoverage = document.querySelector('#accounting-price-coverage');
       return {
         route: location.hash,
         pageVisible: visible(page) && page?.inert !== true,
         periodCount: document.querySelectorAll('#accounting-period-controls [data-period]').length,
         summaryCardCount: document.querySelectorAll('#accounting-summary .metric-card').length,
-        tokenCountRows: document.querySelectorAll('#accounting-component-counts .component-row').length,
-        costContributionRows: document.querySelectorAll('#accounting-component-costs .component-row').length,
-        modelIdentityRows: document.querySelectorAll(
-          '#accounting-models > tr > .model-identity:not(.model-component-identity)',
+        tokenCountRows: tokenRows.length,
+        costContributionRows: costRows.length,
+        modelIdentityRows: modelRows.length,
+        meaningfulTokenRows: meaningfulRows('#accounting-component-counts .component-row'),
+        meaningfulCostRows: meaningfulRows('#accounting-component-costs .component-row', {
+          costEvidence: true,
+        }),
+        meaningfulModelRows: modelRows.filter((row) => [...row.querySelectorAll(
+          ':scope > .numeric-cell',
+        )].some((cell) => positiveNumber(cell.textContent))).length,
+        priceCoverage: visible(priceCoverage)
+          && (priceCoverage.textContent?.trim() ?? "").length > 0,
+        advancedModuleShellCount: advancedModules.filter((module) => module.present).length,
+        advancedModuleAvailableCount: advancedModules.filter(
+          (module) => module.visible
+            && module.explicitContent
+            && !module.explicitUnavailable,
         ).length,
-        priceCoverage: Boolean(document.querySelector('#accounting-price-coverage')),
-        advancedModuleShellCount: [
-          '#cache-switch-details',
-          '#cache-reuse-outcome',
-          '#cache-continuity-details',
-        ].filter((selector) => Boolean(document.querySelector(selector))).length,
-        advancedModuleAvailableCount: [
-          '#cache-switch-details',
-          '#cache-reuse-outcome',
-          '#cache-continuity-details',
-        ].filter((selector) => visible(document.querySelector(selector))).length,
-        advancedModuleUnavailableCount: [
-          '#cache-switch-details',
-          '#cache-reuse-outcome',
-          '#cache-continuity-details',
-        ].filter((selector) => {
-          const element = document.querySelector(selector);
-          return Boolean(element) && !visible(element);
-        }).length,
+        advancedModuleUnavailableCount: advancedModules.filter(
+          (module) => module.visible
+            && module.explicitContent
+            && module.explicitUnavailable,
+        ).length,
+        advancedModulesReady: advancedModules.length === 3
+          && advancedModules.every((module) => module.present
+            && module.visible
+            && module.explicitContent),
+        indexDetail: indexDetail.length > 0,
+        partialHistoryDetail: /partial|quarantined/iu.test(indexDetail),
       };
     })()`);
     return usageParitySnapshotValid(snapshot) ? snapshot : null;
@@ -932,16 +1064,24 @@ async function assertDashboardParitySurfaces(cdp, health) {
       document.querySelector('[data-nav="community"]')?.click();
       const page = document.querySelector('#community[data-dashboard-page="community"]');
       const pageText = page?.textContent?.toLowerCase() ?? '';
+      const indexDetail = document.querySelector('#journey-stage-index-detail')
+        ?.textContent?.trim() ?? '';
+      const nextAction = document.querySelector('#identity-signin-next');
+      const consent = document.querySelector('#incremental-consent');
       return {
         route: location.hash,
         pageVisible: visible(page) && page?.inert !== true,
         journeyStageCount: document.querySelectorAll('#community-journey .journey-stage').length,
         indexTerminal: document.querySelector('#journey-stage-index')
           ?.classList?.contains('journey-stage-done') === true,
+        indexDetail: indexDetail.length > 0,
+        partialHistoryDetail: /partial|quarantined/iu.test(indexDetail),
         googleButton: visible(document.querySelector('#identity-google-signin')),
         appleButton: visible(document.querySelector('#identity-apple-signin')),
-        currentLayout: Boolean(document.querySelector('#identity-signin-next'))
-          && visible(document.querySelector('#incremental-consent')),
+        currentLayout: visible(nextAction)
+          && (nextAction.textContent?.trim() ?? '').length > 0
+          && visible(consent)
+          && (consent.textContent?.trim() ?? '').length > 0,
         noServiceCopy: pageText.includes('no contribution service'),
       };
     })()`);
@@ -954,6 +1094,7 @@ async function assertDashboardParitySurfaces(cdp, health) {
     health,
     usage,
     community,
+    startupRefresh,
   });
   if (classification.status !== "passed") {
     fail(
@@ -972,9 +1113,14 @@ async function assertDashboardParitySurfaces(cdp, health) {
       tokenCountRows: usage.tokenCountRows,
       costContributionRows: usage.costContributionRows,
       modelIdentityRows: usage.modelIdentityRows,
-      advancedModuleShells: true,
+      meaningfulTokenRows: usage.meaningfulTokenRows,
+      meaningfulCostRows: usage.meaningfulCostRows,
+      meaningfulModelRows: usage.meaningfulModelRows,
+      priceCoverage: usage.priceCoverage,
+      advancedModuleShells: usage.advancedModuleShellCount === 3,
       advancedModulesAvailable: usage.advancedModuleAvailableCount,
       advancedModulesUnavailable: usage.advancedModuleUnavailableCount,
+      advancedModulesReady: usage.advancedModulesReady,
     }),
     community: Object.freeze({
       pageVisible: true,
@@ -983,6 +1129,7 @@ async function assertDashboardParitySurfaces(cdp, health) {
       currentLayout: true,
       providerControls: true,
       indexTerminal: true,
+      partialHistoryDetail: community.partialHistoryDetail,
     }),
   });
 }
@@ -1301,7 +1448,14 @@ export function buildClosedReceipt({
       refreshIdChanged: startupRefresh.refreshIdChanged === true,
       terminalStatus: startupRefresh.terminalStatus === "succeeded"
         ? "succeeded"
-        : "unknown",
+        : startupRefresh.terminalStatus === "degraded"
+          && DEGRADED_FAILURE_CODE_SET.has(startupRefresh.degradedFailureCode)
+          ? "degraded"
+          : "unknown",
+      degradedFailureCode: startupRefresh.terminalStatus === "degraded"
+          && DEGRADED_FAILURE_CODE_SET.has(startupRefresh.degradedFailureCode)
+        ? startupRefresh.degradedFailureCode
+        : null,
     }),
     dashboard: Object.freeze({
       chrome: dashboard.chrome === true,
@@ -1326,6 +1480,16 @@ export function buildClosedReceipt({
         modelIdentityRows: Number.isInteger(parity.usage?.modelIdentityRows)
           ? parity.usage.modelIdentityRows
           : 0,
+        meaningfulTokenRows: Number.isInteger(parity.usage?.meaningfulTokenRows)
+          ? parity.usage.meaningfulTokenRows
+          : 0,
+        meaningfulCostRows: Number.isInteger(parity.usage?.meaningfulCostRows)
+          ? parity.usage.meaningfulCostRows
+          : 0,
+        meaningfulModelRows: Number.isInteger(parity.usage?.meaningfulModelRows)
+          ? parity.usage.meaningfulModelRows
+          : 0,
+        priceCoverage: parity.usage?.priceCoverage === true,
         advancedModuleShells: parity.usage?.advancedModuleShells === true,
         advancedModulesAvailable: Number.isInteger(
           parity.usage?.advancedModulesAvailable,
@@ -1333,6 +1497,7 @@ export function buildClosedReceipt({
         advancedModulesUnavailable: Number.isInteger(
           parity.usage?.advancedModulesUnavailable,
         ) ? parity.usage.advancedModulesUnavailable : 0,
+        advancedModulesReady: parity.usage?.advancedModulesReady === true,
       }),
       community: Object.freeze({
         pageVisible: parity.community?.pageVisible === true,
@@ -1343,6 +1508,7 @@ export function buildClosedReceipt({
         currentLayout: parity.community?.currentLayout === true,
         providerControls: parity.community?.providerControls === true,
         indexTerminal: parity.community?.indexTerminal === true,
+        partialHistoryDetail: parity.community?.partialHistoryDetail === true,
       }),
     }),
     settings: Object.freeze({
@@ -1559,7 +1725,11 @@ async function runSmoke(appPath, progress = {}) {
     recordSmokeProgress(progressRecord, "dashboard", dashboardReceipt);
     const postRefreshHealth = await jsonFetch(new URL("/api/local/health", dashboardUrl));
     stage = "parity";
-    parityReceipt = await assertDashboardParitySurfaces(cdp, postRefreshHealth);
+    parityReceipt = await assertDashboardParitySurfaces(
+      cdp,
+      postRefreshHealth,
+      startupReceipt,
+    );
     recordSmokeProgress(progressRecord, "parity", parityReceipt);
     stage = "share";
     shareReceipt = await assertShareFlow(cdp);

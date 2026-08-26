@@ -1,7 +1,7 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 const CHANNEL = "tibotattle:electron-recovery:v1";
-const ACTIONS = new Set(["retry", "settings", "quit"]);
+const ACTIONS = new Set(["retry", "settings", "diagnostics", "quit"]);
 
 function send(action) {
   if (!ACTIONS.has(action) || typeof ipcRenderer?.send !== "function") return;
@@ -18,6 +18,7 @@ if (typeof contextBridge?.exposeInMainWorld === "function") {
     version: "v1",
     retry: () => send("retry"),
     settings: () => send("settings"),
+    diagnostics: () => send("diagnostics"),
     quit: () => send("quit"),
   }));
 }

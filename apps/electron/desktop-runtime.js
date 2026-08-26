@@ -1,4 +1,4 @@
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 
 import { createCompanionSupervisor } from "./companion-supervisor.js";
@@ -17,6 +17,11 @@ import {
 } from "./desktop-settings-backends.js";
 import { createDesktopSettingsStore } from "./desktop-settings-store.js";
 import { DESKTOP_APPEARANCES } from "./desktop-contract.js";
+import { desktopText } from "./desktop-copy.js";
+import {
+  createDesktopDiagnostics,
+  formatDesktopDiagnostics,
+} from "./desktop-diagnostics.js";
 import {
   createDesktopFirstRunReceiptBackend,
   ensureDesktopFirstRunAcknowledged,
@@ -558,6 +563,75 @@ export async function launchDesktopRuntime({
   let cleanupPromise = null;
   let removeNativeThemeListener = () => {};
 
+  async function collectDesktopDiagnostics() {
+    let snapshot = null;
+    try {
+      snapshot = await controller?.snapshot?.();
+    } catch {
+      snapshot = null;
+    }
+    return formatDesktopDiagnostics(createDesktopDiagnostics({
+      platform,
+      architecture,
+      version: snapshot?.about?.version ?? app.getVersion?.(),
+      build: snapshot?.about?.build ?? environment.TIBOTATTLE_BUILD_ID,
+      lifecycle: lifecycle?.state,
+      settings: snapshot?.settings,
+    }));
+  }
+
+  async function showDesktopDiagnostics() {
+    if (typeof runtime.dialog?.showMessageBox !== "function") {
+      throw shellError("desktop_diagnostics_unavailable");
+    }
+    const textOptions = {
+      locale: activeDesktopLocale,
+      systemLocales: desktopSystemLocales,
+    };
+    const detail = await collectDesktopDiagnostics();
+    const response = await runtime.dialog.showMessageBox({
+      type: "info",
+      title: desktopText("electron.diagnostics.title", {}, textOptions),
+      message: desktopText("electron.diagnostics.message", {}, textOptions),
+      detail,
+      buttons: [
+        desktopText("electron.diagnostics.copy", {}, textOptions),
+        desktopText("electron.diagnostics.done", {}, textOptions),
+      ],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (response?.response !== 0) return Object.freeze({ status: "shown" });
+    if (typeof runtime.clipboard?.writeText !== "function") {
+      return Object.freeze({ status: "copy_unavailable" });
+    }
+    try {
+      runtime.clipboard.writeText(detail);
+      return Object.freeze({ status: "copied" });
+    } catch {
+      return Object.freeze({ status: "copy_unavailable" });
+    }
+  }
+
+  async function revealLocalData() {
+    const selected = childEnvironment.USAGE_MONITOR_STATE_ROOT;
+    if (typeof selected !== "string" || !isAbsolute(selected)
+        || typeof runtime.shell?.showItemInFolder !== "function") {
+      throw shellError("desktop_local_data_unavailable");
+    }
+    runtime.shell.showItemInFolder(resolve(selected));
+    return true;
+  }
+
+  async function openDashboardInBrowser() {
+    const selected = lifecycle;
+    if (selected === null || typeof selected.openDashboardInBrowser !== "function") {
+      throw shellError("desktop_dashboard_browser_unavailable");
+    }
+    return selected.openDashboardInBrowser();
+  }
+
   const updateDesktopAppearance = (value) => applyElectronAppearance(
     runtime.nativeTheme,
     value,
@@ -631,6 +705,9 @@ export async function launchDesktopRuntime({
     sendDashboardCommand,
     onLanguageChanged: (value) => updateDesktopLanguage(value),
     onAppearanceChanged: updateDesktopAppearance,
+    openDashboardInBrowserAction: openDashboardInBrowser,
+    showDiagnosticsAction: showDesktopDiagnostics,
+    revealLocalDataAction: revealLocalData,
   });
 
   // Load persisted settings before starting the child. This is what makes a
@@ -679,6 +756,7 @@ export async function launchDesktopRuntime({
     settings: () => controller.showSettings("general"),
     about: () => controller.showSettings("about"),
     recoverySettings: () => recoverySettingsAction.show(),
+    diagnostics: () => controller.handlers.showDiagnostics({}),
     quit: () => { void requestQuit(); },
   };
   const selectedLifecycleOptions = {
@@ -687,9 +765,19 @@ export async function launchDesktopRuntime({
     desktopLocale: initialDesktopSnapshot.settings.language,
     desktopSystemLocales,
     singleInstanceLockAcquired,
+    openDashboardExternal: lifecycleOptions.openDashboardExternal
+      ?? (async (url) => {
+        if (typeof runtime.shell?.openExternal !== "function") return false;
+        await runtime.shell.openExternal(url, { activate: true });
+        return true;
+      }),
     onDashboardReady: () => {
       dashboardReady = true;
+      controller.reconcileDashboardSession?.();
       dispatchPendingDeepLinks();
+    },
+    onDashboardInvalidated: () => {
+      controller.reconcileDashboardSession?.();
     },
     onDesktopStatus: (status) => {
       // The lifecycle has already validated this closed status contract. The
@@ -765,6 +853,13 @@ export async function launchDesktopRuntime({
         handlers: controller.handlers,
         trustedSender: (sender, event) => lifecycle?.isAuthorizedDesktopSender?.(sender, event) === true,
         trustedFrame: (frame, event) => lifecycle?.isAuthorizedDesktopFrame?.(frame, event) === true,
+        trustedAction: (action, event) => {
+          if (action !== "refreshStarted" && action !== "refreshSettled") return true;
+          return lifecycle?.isAuthorizedDashboardFrame?.(
+            event?.senderFrame,
+            { sender: event?.sender },
+          ) === true;
+        },
       });
     } else if (qualificationContext !== null && qualificationContext !== undefined) {
       throw shellError("desktop_ipc_unavailable");
@@ -806,6 +901,7 @@ export async function launchDesktopRuntime({
     setDesktopLanguage: lifecycle.setDesktopLanguage,
     invokeTrayCommand: lifecycle.invokeTrayCommand,
     requestQuit,
+    openDashboardInBrowser: lifecycle.openDashboardInBrowser,
     dispose: async () => {
       deepLinkIntakeCleanup();
       await disposeControllerAndIpc();
@@ -814,6 +910,8 @@ export async function launchDesktopRuntime({
     },
     isAuthorizedDesktopSender: lifecycle.isAuthorizedDesktopSender,
     isAuthorizedDesktopFrame: lifecycle.isAuthorizedDesktopFrame,
+    isAuthorizedDashboardSender: lifecycle.isAuthorizedDashboardSender,
+    isAuthorizedDashboardFrame: lifecycle.isAuthorizedDashboardFrame,
     isAuthorizedDesktopDownloadContext: lifecycle.isAuthorizedDesktopDownloadContext,
     revealLatestDownload: lifecycle.revealLatestDownload,
     get state() {

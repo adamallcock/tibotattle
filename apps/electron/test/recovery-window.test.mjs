@@ -210,6 +210,37 @@ test("recovery page is fixed, content-free, and never permits remote navigation"
   policy.remove();
 });
 
+test("recovery Diagnostics accepts only an authorized main-frame IPC message", () => {
+  const page = createRecoveryPageURL("companion_start_timeout");
+  const webContents = new FakeWebContents();
+  const actions = [];
+  const policy = installRecoveryWindowPolicy({
+    webContents,
+    initialURL: page,
+    onAction: (action) => actions.push(action),
+  });
+
+  webContents.emit("ipc-message", {
+    sender: webContents,
+    frameId: 0,
+  }, RECOVERY_ACTION_CHANNEL, "diagnostics");
+  webContents.emit("ipc-message", {
+    sender: {},
+    frameId: 0,
+  }, RECOVERY_ACTION_CHANNEL, "diagnostics");
+  webContents.emit("ipc-message", {
+    sender: webContents,
+    frameId: 1,
+  }, RECOVERY_ACTION_CHANNEL, "diagnostics");
+  webContents.emit("ipc-message", {
+    sender: webContents,
+    frameId: 0,
+  }, RECOVERY_ACTION_CHANNEL, "unknown");
+
+  assert.deepEqual(actions, ["diagnostics"]);
+  policy.remove();
+});
+
 test("recovery status reload keeps deterministic focus on the non-actionable status region", () => {
   const html = decodeURIComponent(createRecoveryPageURL("companion_ready_invalid"));
   assert.match(html, /<main aria-labelledby="title">/u);

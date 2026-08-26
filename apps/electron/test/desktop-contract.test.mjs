@@ -34,6 +34,11 @@ test("desktop contract freezes the exact bridge action and enum vocabulary", () 
     "openHostedSignIn",
     "checkForUpdates",
     "revealLatestDownload",
+    "openDashboardInBrowser",
+    "showDiagnostics",
+    "revealLocalData",
+    "refreshStarted",
+    "refreshSettled",
   ]);
   assert.deepEqual(DESKTOP_LANGUAGES, ["system", "en", "zh-Hans", "es"]);
   assert.deepEqual(DESKTOP_REFRESH_INTERVAL_SECONDS, [60, 300, 900, 1800]);
@@ -73,9 +78,17 @@ test("request validation accepts exact envelopes and freezes the result", () => 
     "useDefaultCodexHome",
     "checkForUpdates",
     "revealLatestDownload",
+    "openDashboardInBrowser",
+    "showDiagnostics",
+    "revealLocalData",
+    "refreshStarted",
   ]) {
     assert.deepEqual(validateDesktopRequest({ action, args: {} }), { action, args: {} });
   }
+  assert.deepEqual(
+    validateDesktopRequest({ action: "refreshSettled", args: { lease: 1 } }),
+    { action: "refreshSettled", args: { lease: 1 } },
+  );
   assert.deepEqual(
     validateDesktopRequest({
       action: "openHostedSignIn",
@@ -102,6 +115,10 @@ test("request validation rejects unknown actions, extra keys, malformed values, 
     { action: "setRefreshInterval", args: { seconds: 5 } },
     { action: "setStartAtLogin", args: { enabled: "true" } },
     { action: "setNotificationPreferences", args: { enabled: true, threshold: "90" } },
+    { action: "refreshSettled", args: {} },
+    { action: "refreshSettled", args: { lease: 0 } },
+    { action: "refreshSettled", args: { lease: Number.MAX_SAFE_INTEGER + 1 } },
+    { action: "refreshSettled", args: { lease: 1, extra: true } },
     { action: "openSystemSettings", args: { target: "arbitrary" } },
     { action: "openExternal", args: { target: "https://evil.example" } },
     { action: "openHostedSignIn", args: { authorizeUrl: "https://evil.example/?x=1" } },

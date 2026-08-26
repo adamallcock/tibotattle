@@ -12,6 +12,10 @@ const SAFE_ERROR_CODES = new Set([
   "windows_qualification_launch_override_forbidden",
   "desktop_ipc_unavailable",
   "electron_configuration_invalid",
+  "desktop_dashboard_browser_unavailable",
+  "desktop_diagnostics_unavailable",
+  "desktop_local_data_unavailable",
+  "desktop_refresh_lease_exhausted",
 ]);
 
 // The automatic Electron entrypoint may report this one fixed code to the

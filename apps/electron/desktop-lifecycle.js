@@ -1,6 +1,10 @@
 import { dirname, resolve } from "node:path";
 
-import { createLoopbackNavigationPolicy, installLoopbackNavigationPolicy } from "./loopback-policy.js";
+import {
+  createLoopbackNavigationPolicy,
+  installLoopbackNavigationPolicy,
+  isExactLoopbackOrigin,
+} from "./loopback-policy.js";
 import { shellError } from "./errors.js";
 import { DESKTOP_COMMAND_CHANNEL, validateDesktopCommand } from "./desktop-command.js";
 import {
@@ -77,8 +81,10 @@ export function createDesktopLifecycle({
   ownedDownloadsRegistry = null,
   singleInstanceLockAcquired = false,
   onDashboardReady,
+  onDashboardInvalidated,
   onDesktopStatus,
   desktopStatusMonitorOptions = {},
+  openDashboardExternal,
 } = {}) {
   if (!app || typeof app.on !== "function") throw new TypeError("app is required");
   assertFunction(BrowserWindow, "BrowserWindow");
@@ -103,6 +109,14 @@ export function createDesktopLifecycle({
   }
   if (onDesktopStatus !== undefined && typeof onDesktopStatus !== "function") {
     throw new TypeError("onDesktopStatus must be a function");
+  }
+  if (onDashboardInvalidated !== undefined
+      && typeof onDashboardInvalidated !== "function") {
+    throw new TypeError("onDashboardInvalidated must be a function");
+  }
+  if (openDashboardExternal !== undefined
+      && typeof openDashboardExternal !== "function") {
+    throw new TypeError("openDashboardExternal must be a function");
   }
   if (desktopStatusMonitorOptions === null
       || typeof desktopStatusMonitorOptions !== "object"
@@ -338,20 +352,32 @@ export function createDesktopLifecycle({
       || (isLiveBrowserWindow(settingsWindow) && sender === settingsWindow.webContents);
   }
 
-  function isAuthorizedDesktopFrame(frame, event = undefined) {
+  function isAuthorizedDashboardSender(sender) {
+    return isLiveBrowserWindow(window) && sender === window.webContents;
+  }
+
+  function isAuthorizedDashboardFrame(frame, event = undefined) {
     if (!frame || typeof frame !== "object") return false;
     const sender = event?.sender;
-    if (!isAuthorizedDesktopSender(sender)) return false;
-    const owner = sender === window?.webContents
-      ? window
-      : sender === settingsWindow?.webContents
-        ? settingsWindow
-        : null;
-    if (!isLiveBrowserWindow(owner)) return false;
+    if (!isAuthorizedDashboardSender(sender)) return false;
+    if (!isLiveBrowserWindow(window)) return false;
     // Electron's mainFrame identity is the authoritative top-frame check. The
     // additional shape checks make the predicate fail closed in tests and in
     // any future Electron object that does not expose the usual frame fields.
-    if (owner.webContents?.mainFrame !== frame) return false;
+    if (window.webContents?.mainFrame !== frame) return false;
+    if (Object.hasOwn(frame, "isMainFrame") && frame.isMainFrame !== true) return false;
+    if (Object.hasOwn(frame, "parent") && frame.parent !== null) return false;
+    return true;
+  }
+
+  function isAuthorizedDesktopFrame(frame, event = undefined) {
+    if (isAuthorizedDashboardFrame(frame, event)) return true;
+    if (!frame || typeof frame !== "object") return false;
+    const sender = event?.sender;
+    if (!isLiveBrowserWindow(settingsWindow) || sender !== settingsWindow.webContents) {
+      return false;
+    }
+    if (settingsWindow.webContents?.mainFrame !== frame) return false;
     if (Object.hasOwn(frame, "isMainFrame") && frame.isMainFrame !== true) return false;
     if (Object.hasOwn(frame, "parent") && frame.parent !== null) return false;
     return true;
@@ -375,6 +401,21 @@ export function createDesktopLifecycle({
     } catch {
       return false;
     }
+  }
+
+  async function openDashboardInBrowser() {
+    if (!isExactLoopbackOrigin(ready?.origin)
+        || typeof openDashboardExternal !== "function") {
+      throw shellError("desktop_dashboard_browser_unavailable");
+    }
+    const target = `${ready.origin}/`;
+    try {
+      const opened = await openDashboardExternal(target);
+      if (opened === false) throw new Error("dashboard browser open was rejected");
+    } catch {
+      throw shellError("desktop_dashboard_browser_unavailable");
+    }
+    return true;
   }
 
   function assertSettingsSection(section) {
@@ -424,6 +465,21 @@ export function createDesktopLifecycle({
       } catch {
         // Recovery remains usable through Retry and Quit if the bounded native
         // settings action itself is unavailable.
+      }
+      return;
+    }
+    if (action === "diagnostics") {
+      try {
+        const diagnostics = desktopActions !== null
+          && typeof desktopActions === "object"
+          && !Array.isArray(desktopActions)
+          ? desktopActions.diagnostics
+          : null;
+        const result = typeof diagnostics === "function" ? diagnostics() : undefined;
+        result?.catch?.(() => {});
+      } catch {
+        // Retry and Quit remain available if the native diagnostics dialog is
+        // unavailable during an early startup failure.
       }
       return;
     }
@@ -517,6 +573,7 @@ export function createDesktopLifecycle({
   }
 
   function destroyWindow() {
+    const hadDashboardWindow = window !== null;
     dashboardReady = false;
     dashboardLoadState = null;
     downloadHandlerInstallation?.remove?.();
@@ -529,6 +586,14 @@ export function createDesktopLifecycle({
     policyInstallation = null;
     if (window && !window.isDestroyed?.()) window.destroy?.();
     window = null;
+    if (hadDashboardWindow) {
+      try {
+        onDashboardInvalidated?.();
+      } catch {
+        // Session invalidation is a bounded controller recovery hook. Its
+        // failure must not interrupt renderer teardown or recovery UI.
+      }
+    }
   }
 
   function destroySettingsWindow() {
@@ -1231,10 +1296,13 @@ export function createDesktopLifecycle({
     setDesktopLanguage,
     invokeTrayCommand,
     requestQuit,
+    openDashboardInBrowser,
     dispose,
     createWindow,
     isAuthorizedDesktopSender,
     isAuthorizedDesktopFrame,
+    isAuthorizedDashboardSender,
+    isAuthorizedDashboardFrame,
     isAuthorizedDesktopDownloadContext,
     revealLatestDownload() {
       if (ownedDownloadsRegistry === null) return Promise.resolve("unavailable");

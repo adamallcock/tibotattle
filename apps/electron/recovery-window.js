@@ -13,7 +13,7 @@ import {
   resolveDesktopLocale,
 } from "./desktop-copy.js";
 
-const RECOVERY_ACTIONS = Object.freeze(["retry", "settings", "quit"]);
+const RECOVERY_ACTIONS = Object.freeze(["retry", "settings", "diagnostics", "quit"]);
 const RECOVERY_STATUSES = Object.freeze([
   "starting",
   "companion_spawn_failed",
@@ -106,6 +106,7 @@ button:disabled { cursor: default; opacity: .45; }
 <div class="actions">
 <button class="primary" id="retry" type="button">__RETRY__</button>
 <button id="settings" type="button" __SETTINGS_DISABLED__>__SETTINGS__</button>
+<button id="diagnostics" type="button">__DIAGNOSTICS__</button>
 <button id="quit" type="button">__QUIT__</button>
 </div>
 </main>
@@ -115,6 +116,7 @@ button:disabled { cursor: default; opacity: .45; }
   const actions = Object.freeze({
     retry: document.getElementById("retry"),
     settings: document.getElementById("settings"),
+    diagnostics: document.getElementById("diagnostics"),
     quit: document.getElementById("quit"),
   });
   for (const [name, button] of Object.entries(actions)) {
@@ -193,6 +195,10 @@ export function createRecoveryPageURL(status = "starting", options = {}) {
     .replaceAll(
       "__SETTINGS_DISABLED__",
       status === "starting" ? 'disabled aria-disabled="true"' : "",
+    )
+    .replaceAll(
+      "__DIAGNOSTICS__",
+      escapeHTML(desktopText("electron.recovery.diagnostics", {}, textOptions)),
     )
     .replaceAll(
       "__QUIT__",
