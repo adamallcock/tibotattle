@@ -3670,6 +3670,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private weak var settingsQuotaNotificationThresholds: NSSegmentedControl?
     private weak var settingsQuotaNotificationStatusLabel: NSTextField?
     private weak var settingsAppearancePicker: NSPopUpButton?
+    private weak var settingsMenuBarAllowancePicker: NSPopUpButton?
     private weak var settingsRefreshIntervalPicker: NSPopUpButton?
     private let nativeEvidenceReader = LocalCompanionEvidenceReader()
     private var quotaNotificationCoordinator: QuotaNotificationCoordinator?
@@ -5779,6 +5780,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         }
     }
 
+    private func updateMenuBarAllowanceSettingsControl() {
+        guard let picker = settingsMenuBarAllowancePicker else { return }
+        let preference = NativeMenuBarAllowanceDisplayPreference.current
+        if let index = picker.itemArray.firstIndex(where: {
+            ($0.representedObject as? String) == preference.rawValue
+        }) {
+            picker.selectItem(at: index)
+        }
+    }
+
     private func applyAppearancePreference(
         notifyDashboard: Bool = true
     ) {
@@ -6189,6 +6200,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         applyAppearancePreference()
     }
 
+    @objc private func selectMenuBarAllowancePreference(
+        _ sender: NSPopUpButton
+    ) {
+        guard let rawPreference = sender.selectedItem?.representedObject
+            as? String,
+              let preference = NativeMenuBarAllowanceDisplayPreference(
+                  rawValue: rawPreference
+              )
+        else {
+            updateMenuBarAllowanceSettingsControl()
+            return
+        }
+        NativeMenuBarAllowanceDisplayPreference.set(preference)
+        menuBarStatus?.setAllowanceDisplayPreference(preference)
+        updateMenuBarAllowanceSettingsControl()
+    }
+
     @objc private func selectLanguagePreference(_ sender: NSPopUpButton) {
         guard let rawPreference = sender.selectedItem?.representedObject
             as? String,
@@ -6261,6 +6289,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         settingsAboutAutomaticUpdatesDetailLabel = nil
         settingsCheckForUpdatesButton = nil
         settingsAppearancePicker = nil
+        settingsMenuBarAllowancePicker = nil
         settingsRefreshIntervalPicker = nil
         if shouldRestoreSettings {
             showSettings(selecting: selectedSettingsTab)
@@ -6298,6 +6327,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             updateSettingsCodexHomeSummary()
             updateAutomaticUpdatesSettingsControl()
             updateAppearanceSettingsControl()
+            updateMenuBarAllowanceSettingsControl()
             updateRefreshIntervalSettingsControl()
             updateStartAtLoginSettingsControl()
             quotaNotificationCoordinator?.refreshAuthorization()
@@ -6363,6 +6393,52 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 appearanceRow,
                 settingsLabel(
                     TiboTattleLocalization.string(.settingsAppearanceSummary),
+                    font: .systemFont(ofSize: 12),
+                    color: .secondaryLabelColor
+                ),
+            ]
+        )
+        let menuBarAllowancePicker = NSPopUpButton(
+            frame: .zero,
+            pullsDown: false
+        )
+        let menuBarAllowanceChoices: [(
+            NativeMenuBarAllowanceDisplayPreference,
+            TiboTattleLocalization.Key
+        )] = [
+            (.fiveHour, .settingsMenuBarAllowanceFiveHour),
+            (.both, .settingsMenuBarAllowanceBoth),
+        ]
+        for (preference, key) in menuBarAllowanceChoices {
+            menuBarAllowancePicker.addItem(
+                withTitle: TiboTattleLocalization.string(key)
+            )
+            menuBarAllowancePicker.lastItem?.representedObject =
+                preference.rawValue
+        }
+        menuBarAllowancePicker.target = self
+        menuBarAllowancePicker.action =
+            #selector(selectMenuBarAllowancePreference(_:))
+        menuBarAllowancePicker.toolTip = TiboTattleLocalization.string(
+            .settingsMenuBarAllowanceDetail
+        )
+        menuBarAllowancePicker.setAccessibilityLabel(
+            TiboTattleLocalization.string(.settingsMenuBarAllowance)
+        )
+        settingsMenuBarAllowancePicker = menuBarAllowancePicker
+        updateMenuBarAllowanceSettingsControl()
+        let menuBarAllowanceRow = NSStackView(views: [menuBarAllowancePicker])
+        menuBarAllowanceRow.orientation = .horizontal
+        menuBarAllowanceRow.alignment = .centerY
+        let menuBarAllowanceSection = settingsGroup(
+            title: TiboTattleLocalization.string(.settingsMenuBarAllowance),
+            symbolName: "chart.bar",
+            views: [
+                menuBarAllowanceRow,
+                settingsLabel(
+                    TiboTattleLocalization.string(
+                        .settingsMenuBarAllowanceDetail
+                    ),
                     font: .systemFont(ofSize: 12),
                     color: .secondaryLabelColor
                 ),
@@ -6662,6 +6738,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             summary: TiboTattleLocalization.string(.settingsGeneralSummary),
             views: [
                 appearanceSection,
+                menuBarAllowanceSection,
                 languageSection,
                 sourceSection,
                 refreshIntervalSection,
@@ -8568,12 +8645,24 @@ private enum MenuBarContractSmokeTest {
             observedAt: observedAt,
             isPrimary: true
         )
+        let fiveHourLane = ObservedQuotaLane(
+            label: TiboTattleLocalization.string(.menuBarFiveHourAllowance),
+            remainingPercent: 63,
+            durationMinutes: CodexQuotaWindowDuration.fiveHourMinutes,
+            resetAt: resetAt,
+            observedAt: observedAt,
+            isPrimary: false
+        )
         let weeklyPosition = weeklyWindowPosition(weeklyLane)
         var liveSnapshot = MenuBarStatusSnapshot()
         liveSnapshot.phase = .ready
         liveSnapshot.evidence = .live
-        liveSnapshot.lanes = [weeklyLane]
+        liveSnapshot.lanes = [weeklyLane, fiveHourLane]
         liveSnapshot.observedAt = observedAt
+        var bothLiveSnapshot = liveSnapshot
+        bothLiveSnapshot.allowanceDisplayPreference = .both
+        var weeklyOnlySnapshot = liveSnapshot
+        weeklyOnlySnapshot.lanes = [weeklyLane]
         let liveSummary = liveSnapshot.laneSummary(
             weeklyLane,
             now: observedAt
@@ -8591,7 +8680,23 @@ private enum MenuBarContractSmokeTest {
         var unavailableLiveSnapshot = liveSnapshot
         unavailableLiveSnapshot.phase = .unavailable
         let reset = resetCountdown(resetAt, now: observedAt)
-        let expectedLiveTitle = TiboTattleLocalization.percentString(71)
+        let expectedLiveTitle = TiboTattleLocalization.format(
+            .menuBarCompactAllowance,
+            TiboTattleLocalization.string(.menuBarFiveHourShort),
+            TiboTattleLocalization.percentString(63)
+        )
+        let expectedBothLiveTitle = [
+            TiboTattleLocalization.format(
+                .menuBarCompactAllowance,
+                TiboTattleLocalization.string(.menuBarFiveHourShort),
+                TiboTattleLocalization.percentString(63)
+            ),
+            TiboTattleLocalization.format(
+                .menuBarCompactAllowance,
+                TiboTattleLocalization.string(.menuBarSevenDayShort),
+                TiboTattleLocalization.percentString(71)
+            ),
+        ].joined(separator: " · ")
         let expectedLiveSummary = reset.map {
             TiboTattleLocalization.format(
                 .menuBarQuotaWeeklyPositionResets,
@@ -8635,7 +8740,10 @@ private enum MenuBarContractSmokeTest {
                   elapsedPercent: 24,
                   usedPercent: 29
               ),
+              liveSnapshot.allowanceDisplayPreference == .fiveHour,
               liveSnapshot.title == expectedLiveTitle,
+              bothLiveSnapshot.title == expectedBothLiveTitle,
+              weeklyOnlySnapshot.title == "–",
               analyzingLiveSnapshot.title == expectedLiveTitle,
               analyzingWithoutLiveEvidence.title == "…",
               staleSnapshot.title == "–",
@@ -8654,6 +8762,7 @@ private enum MenuBarContractSmokeTest {
                 + "shortcuts=cmd-r,cmd-comma,cmd-q "
                 + "dismissal=native,escape,same-app,deactivation "
                 + "weekly_position=fresh-only "
+                + "compact_allowance=five-hour-or-both "
                 + "analysis_title=live-fallback"
         )
         return 0

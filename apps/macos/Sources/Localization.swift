@@ -214,12 +214,14 @@ enum TiboTattleLocalization {
         case menuBarAnalysisRequestRejected = "menuBar.analysisRequestRejected"
         case menuBarAnalyzingLocalUsage = "menuBar.analyzingLocalUsage"
         case menuBarAllowanceTitle = "menuBar.allowanceTitle"
+        case menuBarCompactAllowance = "menuBar.compactAllowance"
         case menuBarCompanionNotRunning = "menuBar.companionNotRunning"
         case menuBarCompanionStarting = "menuBar.companionStarting"
         case menuBarCurrentEvidence = "menuBar.currentEvidence"
         case menuBarCurrentEvidenceWithAge = "menuBar.currentEvidenceWithAge"
         case menuBarDaysAgo = "menuBar.daysAgo"
         case menuBarFiveHourAllowance = "menuBar.fiveHourAllowance"
+        case menuBarFiveHourShort = "menuBar.fiveHourShort"
         case menuBarFailureRecovery = "menuBar.failureRecovery"
         case menuBarHoursAgo = "menuBar.hoursAgo"
         case menuBarJustNow = "menuBar.justNow"
@@ -242,6 +244,7 @@ enum TiboTattleLocalization {
         case menuBarResetMinutes = "menuBar.resetMinutes"
         case menuBarRetryLocalAnalysis = "menuBar.retryLocalAnalysis"
         case menuBarSevenDayAllowance = "menuBar.sevenDayAllowance"
+        case menuBarSevenDayShort = "menuBar.sevenDayShort"
         case menuBarStaleEvidenceHidden = "menuBar.staleEvidenceHidden"
         case menuBarUpdateLocalUsage = "menuBar.updateLocalUsage"
         case menuBarVerifiedAllowanceMany = "menuBar.verifiedAllowanceMany"
@@ -263,6 +266,10 @@ enum TiboTattleLocalization {
         case settingsAppearancePickerHint = "settings.appearancePickerHint"
         case settingsAppearanceSummary = "settings.appearanceSummary"
         case settingsAppearanceSystem = "settings.appearanceSystem"
+        case settingsMenuBarAllowance = "settings.menuBarAllowance"
+        case settingsMenuBarAllowanceDetail = "settings.menuBarAllowanceDetail"
+        case settingsMenuBarAllowanceFiveHour = "settings.menuBarAllowanceFiveHour"
+        case settingsMenuBarAllowanceBoth = "settings.menuBarAllowanceBoth"
         case settingsAutomaticUpdates = "settings.automaticUpdates"
         case settingsAutomaticUpdatesOff = "settings.automaticUpdatesOff"
         case settingsAutomaticUpdatesOn = "settings.automaticUpdatesOn"
@@ -657,6 +664,8 @@ enum TiboTattleLocalization {
                 "Analyzing Local Usage…"
             case .menuBarAllowanceTitle:
                 "%@ · %@ allowance"
+            case .menuBarCompactAllowance:
+                "%@ %@"
             case .menuBarCompanionNotRunning:
                 "The local companion is not running."
             case .menuBarCompanionStarting:
@@ -669,6 +678,8 @@ enum TiboTattleLocalization {
                 "%d days ago"
             case .menuBarFiveHourAllowance:
                 "Five-hour allowance"
+            case .menuBarFiveHourShort:
+                "5h"
             case .menuBarFailureRecovery:
                 "Not running: %@. Open the window for the recovery step."
             case .menuBarHoursAgo:
@@ -713,6 +724,8 @@ enum TiboTattleLocalization {
                 "Retry Local Analysis"
             case .menuBarSevenDayAllowance:
                 "Seven-day allowance"
+            case .menuBarSevenDayShort:
+                "7d"
             case .menuBarStaleEvidenceHidden:
                 "Allowance values and reset countdowns are hidden."
             case .menuBarUpdateLocalUsage:
@@ -755,6 +768,14 @@ enum TiboTattleLocalization {
                 "Uses your Mac appearance by default."
             case .settingsAppearanceSystem:
                 "System"
+            case .settingsMenuBarAllowance:
+                "Menu bar allowance"
+            case .settingsMenuBarAllowanceDetail:
+                "Choose which fresh allowance percentage appears beside the menu-bar icon."
+            case .settingsMenuBarAllowanceFiveHour:
+                "5-hour only"
+            case .settingsMenuBarAllowanceBoth:
+                "Both 5-hour and 7-day"
             case .settingsAutomaticUpdates:
                 "Automatic updates"
             case .settingsAutomaticUpdatesOff:

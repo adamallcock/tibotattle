@@ -285,6 +285,37 @@ private enum StatusGlyphState: Equatable {
     case unavailable
 }
 
+/// Which provider-reported Codex allowance appears in the compact status-item
+/// title. The drop-down menu continues to show every observed lane; this
+/// preference only controls the always-visible title beside the app mark.
+enum NativeMenuBarAllowanceDisplayPreference: String, CaseIterable {
+    case fiveHour = "five-hour"
+    case both
+
+    static let defaultsKey = "tibotattle.menu-bar-allowance.v1"
+    static let defaultPreference: Self = .fiveHour
+
+    static var current: Self {
+        current(in: .standard)
+    }
+
+    static func current(in defaults: UserDefaults) -> Self {
+        guard let rawValue = defaults.string(forKey: defaultsKey),
+              let preference = Self(rawValue: rawValue)
+        else {
+            return defaultPreference
+        }
+        return preference
+    }
+
+    static func set(
+        _ preference: Self,
+        in defaults: UserDefaults = .standard
+    ) {
+        defaults.set(preference.rawValue, forKey: defaultsKey)
+    }
+}
+
 /// A deliberately small observable contract for the native menu smoke test.
 /// It contains presentation facts only, never evidence values or an account
 /// identifier, so the packaged launcher can prove this surface without
@@ -329,12 +360,42 @@ struct MenuBarStatusSnapshot: Equatable {
     var lanes: [ObservedQuotaLane] = []
     var observedAt: Date?
     var failureSummary: String?
+    var allowanceDisplayPreference =
+        NativeMenuBarAllowanceDisplayPreference.defaultPreference
 
     /// Mirrors the dashboard's primary selection across the normal Codex
     /// allowance track. Other provider products are rejected while decoding,
     /// so they cannot become a fallback for the compact title.
     var primaryLane: ObservedQuotaLane? {
         lanes.first(where: \.isPrimary) ?? lanes.first
+    }
+
+    /// The compact title is intentionally limited to the normal Codex
+    /// five-hour and seven-day windows. A selected five-hour display never
+    /// falls back to the weekly lane when the five-hour observation is absent.
+    var compactDisplayLanes: [ObservedQuotaLane] {
+        switch allowanceDisplayPreference {
+        case .fiveHour:
+            return lanes.filter {
+                $0.durationMinutes == fiveHourWindowDurationMinutes
+            }
+        case .both:
+            return [
+                lanes.first {
+                    $0.durationMinutes == fiveHourWindowDurationMinutes
+                },
+                lanes.first {
+                    $0.durationMinutes == weeklyWindowDurationMinutes
+                },
+            ].compactMap { $0 }
+        }
+    }
+
+    /// The icon meter follows the most relevant compact lane. With both lanes
+    /// selected, the five-hour meter stays primary because it is the first
+    /// number shown in the title.
+    var primaryDisplayLane: ObservedQuotaLane? {
+        compactDisplayLanes.first
     }
 
     /// True only when the companion has published a loopback dashboard.
@@ -350,10 +411,19 @@ struct MenuBarStatusSnapshot: Equatable {
     var title: String {
         if companionReachable,
            evidence == .live,
-           let lane = primaryLane {
-            return TiboTattleLocalization.percentString(
-                lane.roundedRemainingPercent
-            )
+           !compactDisplayLanes.isEmpty {
+            return compactDisplayLanes.map { lane in
+                let label = lane.durationMinutes == fiveHourWindowDurationMinutes
+                    ? TiboTattleLocalization.string(.menuBarFiveHourShort)
+                    : TiboTattleLocalization.string(.menuBarSevenDayShort)
+                return TiboTattleLocalization.format(
+                    .menuBarCompactAllowance,
+                    label,
+                    TiboTattleLocalization.percentString(
+                        lane.roundedRemainingPercent
+                    )
+                )
+            }.joined(separator: " · ")
         }
         return phase == .analyzing
             ? analyzingPlaceholder
@@ -1061,6 +1131,8 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         self.productName = productName
         self.actions = actions
         self.brandBirdTemplate = Self.makeBrandBirdTemplate()
+        snapshot.allowanceDisplayPreference =
+            NativeMenuBarAllowanceDisplayPreference.current
         // Constructing the item touches only in-memory AppKit state: no
         // network, no disk, and no waiting. Every evidence read below is
         // asynchronous with a main-queue completion.
@@ -1245,6 +1317,16 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             .menuQuitProduct,
             productName
         )
+        render()
+    }
+
+    /// Applies the persisted compact-title preference without touching the
+    /// companion, its evidence, or the menu's quota rows.
+    func setAllowanceDisplayPreference(
+        _ preference: NativeMenuBarAllowanceDisplayPreference
+    ) {
+        guard !stopped else { return }
+        snapshot.allowanceDisplayPreference = preference
         render()
     }
 
@@ -1698,7 +1780,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         if snapshot.phase == .analyzing { return .analyzing }
         guard snapshot.phase == .ready else { return .unavailable }
         guard snapshot.evidence == .live,
-              let lane = snapshot.primaryLane
+              let lane = snapshot.primaryDisplayLane
         else {
             return snapshot.evidence == .stale ? .stale : .unavailable
         }

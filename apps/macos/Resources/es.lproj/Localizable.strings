@@ -46,12 +46,14 @@
 "menuBar.analyzeLocalUsage" = "Analizar uso local";
 "menuBar.analyzingLocalUsage" = "Analizando uso local…";
 "menuBar.allowanceTitle" = "%@ · %@ de límite";
+"menuBar.compactAllowance" = "%@ %@";
 "menuBar.companionNotRunning" = "El acompañante local no se está ejecutando.";
 "menuBar.companionStarting" = "Iniciando el acompañante local…";
 "menuBar.currentEvidence" = "Observado localmente · evidencia actual verificada";
 "menuBar.currentEvidenceWithAge" = "Observado hace %@ · evidencia actual verificada";
 "menuBar.daysAgo" = "Hace %d días";
 "menuBar.fiveHourAllowance" = "Límite de cinco horas";
+"menuBar.fiveHourShort" = "5 h";
 "menuBar.hoursAgo" = "Hace %d horas";
 "menuBar.justNow" = "ahora mismo";
 "menuBar.lastObservationNotCurrent" = "Las ventanas de límite se observaron antes, pero no son actuales";
@@ -73,6 +75,7 @@
 "menuBar.resetMinutes" = "en %d min";
 "menuBar.retryLocalAnalysis" = "Reintentar análisis local";
 "menuBar.sevenDayAllowance" = "Límite de siete días";
+"menuBar.sevenDayShort" = "7 d";
 "menuBar.staleEvidenceHidden" = "Se ocultan los valores de límite y las cuentas atrás de reinicio.";
 "menuBar.updateLocalUsage" = "Actualizar uso local";
 "menuBar.verifiedAllowanceMany" = "%d límites de Codex verificados";
@@ -87,6 +90,10 @@
 "settings.appearancePickerHint" = "Elige cómo se ve TiboTattle.";
 "settings.appearanceSummary" = "Usa la apariencia de tu Mac de forma predeterminada.";
 "settings.appearanceSystem" = "Sistema";
+"settings.menuBarAllowance" = "Límite de la barra de menús";
+"settings.menuBarAllowanceDetail" = "Elige qué porcentaje de límite reciente aparece junto al icono de la barra de menús.";
+"settings.menuBarAllowanceFiveHour" = "Solo 5 horas";
+"settings.menuBarAllowanceBoth" = "5 horas y 7 días";
 "settings.automaticUpdates" = "Actualizaciones automáticas";
 "settings.automaticUpdatesOff" = "Las descargas automáticas están desactivadas.";
 "settings.automaticUpdatesOn" = "Las descargas automáticas están activadas.";

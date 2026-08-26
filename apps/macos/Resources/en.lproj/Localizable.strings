@@ -24,6 +24,10 @@
 "settings.appearancePickerHint" = "Choose how TiboTattle looks.";
 "settings.appearanceSummary" = "Uses your Mac appearance by default.";
 "settings.appearanceSystem" = "System";
+"settings.menuBarAllowance" = "Menu bar allowance";
+"settings.menuBarAllowanceDetail" = "Choose which fresh allowance percentage appears beside the menu-bar icon.";
+"settings.menuBarAllowanceFiveHour" = "5-hour only";
+"settings.menuBarAllowanceBoth" = "Both 5-hour and 7-day";
 "settings.automaticUpdates" = "Automatic updates";
 "settings.automaticUpdatesOff" = "Automatic downloads are off.";
 "settings.automaticUpdatesOn" = "Automatic downloads are on.";
@@ -151,12 +155,14 @@
 "menuBar.analyzeLocalUsage" = "Analyze Local Usage";
 "menuBar.analyzingLocalUsage" = "Analyzing Local Usage…";
 "menuBar.allowanceTitle" = "%@ · %@ allowance";
+"menuBar.compactAllowance" = "%@ %@";
 "menuBar.companionNotRunning" = "The local companion is not running.";
 "menuBar.companionStarting" = "Starting the local companion…";
 "menuBar.currentEvidence" = "Observed locally · verified current evidence";
 "menuBar.currentEvidenceWithAge" = "Observed %@ · verified current evidence";
 "menuBar.daysAgo" = "%d days ago";
 "menuBar.fiveHourAllowance" = "Five-hour allowance";
+"menuBar.fiveHourShort" = "5h";
 "menuBar.hoursAgo" = "%d hours ago";
 "menuBar.justNow" = "just now";
 "menuBar.lastObservationNotCurrent" = "Quota lanes were last observed, but are not current";
@@ -178,6 +184,7 @@
 "menuBar.resetMinutes" = "in %dm";
 "menuBar.retryLocalAnalysis" = "Retry Local Analysis";
 "menuBar.sevenDayAllowance" = "Seven-day allowance";
+"menuBar.sevenDayShort" = "7d";
 "menuBar.staleEvidenceHidden" = "Allowance values and reset countdowns are hidden.";
 "menuBar.updateLocalUsage" = "Update Local Usage";
 "menuBar.verifiedAllowanceMany" = "%d verified Codex allowances";

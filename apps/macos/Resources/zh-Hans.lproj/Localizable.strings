@@ -46,12 +46,14 @@
 "menuBar.analyzeLocalUsage" = "分析本地使用情况";
 "menuBar.analyzingLocalUsage" = "正在分析本地使用情况…";
 "menuBar.allowanceTitle" = "%@ · %@ 额度";
+"menuBar.compactAllowance" = "%@ %@";
 "menuBar.companionNotRunning" = "本地伴随程序没有运行。";
 "menuBar.companionStarting" = "正在启动本地伴随程序…";
 "menuBar.currentEvidence" = "已在本机观测 · 已验证的当前证据";
 "menuBar.currentEvidenceWithAge" = "%@前在本机观测 · 已验证的当前证据";
 "menuBar.daysAgo" = "%d 天前";
 "menuBar.fiveHourAllowance" = "五小时额度";
+"menuBar.fiveHourShort" = "5小时";
 "menuBar.hoursAgo" = "%d 小时前";
 "menuBar.justNow" = "刚刚";
 "menuBar.lastObservationNotCurrent" = "额度窗口曾被观测到，但不再是当前状态";
@@ -73,6 +75,7 @@
 "menuBar.resetMinutes" = "%d 分钟后";
 "menuBar.retryLocalAnalysis" = "重试本地分析";
 "menuBar.sevenDayAllowance" = "七天额度";
+"menuBar.sevenDayShort" = "7天";
 "menuBar.staleEvidenceHidden" = "额度数值和重置倒计时已隐藏。";
 "menuBar.updateLocalUsage" = "更新本地使用情况";
 "menuBar.verifiedAllowanceMany" = "%d 个已验证的 Codex 额度";
@@ -87,6 +90,10 @@
 "settings.appearancePickerHint" = "选择 TiboTattle 的外观。";
 "settings.appearanceSummary" = "默认使用这台 Mac 的外观。";
 "settings.appearanceSystem" = "跟随系统";
+"settings.menuBarAllowance" = "菜单栏额度";
+"settings.menuBarAllowanceDetail" = "选择菜单栏图标旁显示哪个最新额度百分比。";
+"settings.menuBarAllowanceFiveHour" = "仅五小时";
+"settings.menuBarAllowanceBoth" = "五小时和七天";
 "settings.automaticUpdates" = "自动更新";
 "settings.automaticUpdatesOff" = "自动下载已关闭。";
 "settings.automaticUpdatesOn" = "自动下载已开启。";

@@ -978,7 +978,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.ok(generalSettings, "general settings page wiring should be present");
   assert.match(
     generalSettings,
-    /appearanceSection[\s\S]*languageSection[\s\S]*sourceSection[\s\S]*refreshIntervalSection[\s\S]*startAtLoginSection/u,
+    /appearanceSection[\s\S]*menuBarAllowanceSection[\s\S]*languageSection[\s\S]*sourceSection[\s\S]*refreshIntervalSection[\s\S]*startAtLoginSection/u,
   );
   assert.doesNotMatch(generalSettings, /quotaNotificationsSection/u);
   assert.doesNotMatch(
@@ -1034,6 +1034,16 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(settingsSource, /symbolName: "circle\.lefthalf\.filled"/u);
   assert.match(settingsSource, /symbolName: "folder"/u);
   assert.match(settingsSource, /symbolName: "clock"/u);
+  assert.match(settingsSource, /symbolName: "chart\.bar"/u);
+  assert.match(settingsSource, /settingsMenuBarAllowancePicker/u);
+  assert.match(
+    settingsSource,
+    /NativeMenuBarAllowanceDisplayPreference[\s\S]*?\.fiveHour[\s\S]*?\.settingsMenuBarAllowanceFiveHour[\s\S]*?\.both[\s\S]*?\.settingsMenuBarAllowanceBoth/u,
+  );
+  assert.match(
+    source,
+    /NativeMenuBarAllowanceDisplayPreference\.set\(preference\)[\s\S]*?menuBarStatus\?\.setAllowanceDisplayPreference\(preference\)/u,
+  );
   assert.match(source, /settingsOpenNotifications/u);
   assert.match(source, /x-apple\.systempreferences:com\.apple\.Notifications-Settings\.extension/u);
   assert.match(source, /case \.unverified:[\s\S]*?settingsCheckForUpdates/u);
@@ -2316,8 +2326,16 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   // available; stale, absent, starting, and failed states remain non-numeric.
   assert.match(
     source,
-    /if companionReachable,\s*evidence == \.live,\s*let lane = primaryLane \{\s*return TiboTattleLocalization\.percentString\(\s*lane\.roundedRemainingPercent\s*\)/u,
+    /if companionReachable,\s*evidence == \.live,\s*!compactDisplayLanes\.isEmpty/u,
   );
+  assert.match(
+    source,
+    /enum NativeMenuBarAllowanceDisplayPreference: String, CaseIterable/u,
+  );
+  assert.match(source, /static let defaultsKey = "tibotattle\.menu-bar-allowance\.v1"/u);
+  assert.match(source, /static let defaultPreference: Self = \.fiveHour/u);
+  assert.match(source, /case fiveHour = "five-hour"[\s\S]*?case both/u);
+  assert.match(source, /let lane = snapshot\.primaryDisplayLane/u);
   assert.match(
     source,
     /return phase == \.analyzing\s*\? analyzingPlaceholder\s*:\s*unknownPlaceholder/u,
