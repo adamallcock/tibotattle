@@ -11,7 +11,7 @@
  * subsequent app launch.
  *
  * Modes:
- *   cancel   startup refresh -> advancing timer -> cancel -> retry -> cancel
+ *   cancel   startup refresh -> advancing timer/control-plane gate -> cancel -> retry -> cancel
  *   full     startup refresh -> real Usage/Community parity -> clean quit
  *   relaunch full pass -> clean quit -> persisted dashboard -> new refresh
  *
@@ -48,12 +48,22 @@ export const REAL_HISTORY_QA_TIMEOUTS = Object.freeze({
   startupMs: 60_000,
   healthMs: 10_000,
   timerMs: 30_000,
+  controlPlaneMs: 10_000,
   cancelMs: 45_000,
   retryMs: 15_000,
   uiMs: 30_000,
   refreshMs: 125 * 60_000,
   quitMs: 15_000,
 });
+
+// The loopback control plane is intentionally independent of the dashboard
+// snapshot. A response that takes longer than this while the refresh is still
+// running is user-visible as a frozen counter/cancel button, even when the
+// eventual refresh result is correct. Keep this threshold separate from the
+// much longer work/terminal budgets below.
+export const REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS = 3_000;
+const CONTROL_PLANE_MIN_SAMPLES = 3;
+const CONTROL_PLANE_SAMPLE_INTERVAL_MS = 500;
 
 const DEGRADED_FAILURE_CODES = new Set([
   "codex_rollout_compression_unsupported",
@@ -88,8 +98,10 @@ const FAILURE_REASONS = new Set([
   "refresh_wrong_terminal",
   "refresh_degraded_invalid",
   "timer_stalled",
+  "control_plane_unresponsive",
   "cancel_unavailable",
   "cancel_not_acknowledged",
+  "cancel_http_invalid",
   "cancel_wrong_terminal",
   "retry_rejected",
   "usage_invalid",
@@ -566,6 +578,97 @@ export function createRefreshObserver(cdp) {
   });
 }
 
+/**
+ * Observe the app's own loopback control-plane responses without retaining
+ * response bodies. This is deliberately separate from the startup refresh
+ * observer: the latter proves one exact POST, while this observer proves that
+ * the renderer can still reach health/status/cancel while accounting runs.
+ */
+export function createControlPlaneObserver(cdp, expectedOrigin) {
+  const pending = new Map();
+  const completed = [];
+  let sealed = false;
+  const allowedPaths = new Set([
+    "/api/local/health",
+    "/api/local/refresh",
+    "/api/local/refresh/cancel",
+  ]);
+  const requestId = (value) => typeof value === "string" && value.length > 0
+    ? value
+    : null;
+  const routeFor = (url) => {
+    if (typeof url !== "string") return null;
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol !== "http:"
+          || parsed.hostname !== "127.0.0.1"
+          || parsed.origin !== expectedOrigin
+          || !allowedPaths.has(parsed.pathname)
+          || parsed.search !== ""
+          || parsed.hash !== "") return null;
+      return parsed.pathname;
+    } catch {
+      return null;
+    }
+  };
+  const onRequest = ({ requestId: eventRequestId, request } = {}) => {
+    if (sealed) return;
+    const id = requestId(eventRequestId);
+    const path = routeFor(request?.url);
+    if (id === null || path === null
+        || !["GET", "POST"].includes(request?.method)) return;
+    pending.set(id, {
+      method: request.method,
+      path,
+      startedAt: Date.now(),
+    });
+  };
+  const complete = (id, status = null) => {
+    const entry = pending.get(id);
+    if (!entry) return;
+    pending.delete(id);
+    completed.push(Object.freeze({
+      method: entry.method,
+      path: entry.path,
+      status: Number.isSafeInteger(status) ? status : null,
+      latencyMs: Math.max(0, Date.now() - entry.startedAt),
+    }));
+  };
+  const onResponse = ({ requestId: eventRequestId, response } = {}) => {
+    const id = requestId(eventRequestId);
+    if (id !== null) complete(id, response?.status);
+  };
+  const onFailure = ({ requestId: eventRequestId } = {}) => {
+    const id = requestId(eventRequestId);
+    if (id !== null) complete(id);
+  };
+  const unsubscribeRequest = cdp.on("Network.requestWillBeSent", onRequest);
+  const unsubscribeResponse = cdp.on("Network.responseReceived", onResponse);
+  const unsubscribeFailure = cdp.on("Network.loadingFailed", onFailure);
+  return Object.freeze({
+    snapshot() {
+      return completed.slice();
+    },
+    reset() {
+      pending.clear();
+      completed.length = 0;
+      sealed = false;
+    },
+    seal() {
+      sealed = true;
+      pending.clear();
+    },
+    dispose() {
+      unsubscribeRequest();
+      unsubscribeResponse();
+      unsubscribeFailure();
+      pending.clear();
+      completed.length = 0;
+      sealed = true;
+    },
+  });
+}
+
 function createNetworkBoundaryObserver(cdp, expectedOrigin) {
   let invalid = false;
   const unsubscribe = cdp.on("Network.requestWillBeSent", ({ request } = {}) => {
@@ -726,6 +829,7 @@ async function launchSession({ appPath, codexHomePath, fixture, debugPort }) {
     const cdp = new CdpConnection(target);
     await cdp.open();
     const observer = createRefreshObserver(cdp);
+    const controlPlane = createControlPlaneObserver(cdp, dashboardUrl.origin);
     const takeNetworkBoundary = createNetworkBoundaryObserver(cdp, dashboardUrl.origin);
     await cdp.request("Page.enable");
     await cdp.request("Network.enable");
@@ -764,6 +868,7 @@ async function launchSession({ appPath, codexHomePath, fixture, debugPort }) {
       child,
       cdp,
       observer,
+      controlPlane,
       takeNetworkBoundary,
       dashboardUrl,
       debugPort,
@@ -782,6 +887,7 @@ async function closeSession(session, { signal = "SIGUSR2" } = {}) {
   }
   const expectedDescendantPids = session.expectedDescendantPids;
   session.observer?.dispose?.();
+  session.controlPlane?.dispose?.();
   session.cdp?.close?.();
   if (child.exitCode === null && child.signalCode === null) {
     try { child.kill(signal); } catch { /* best effort */ }
@@ -844,6 +950,133 @@ async function refreshStatus(session) {
     new URL("/api/local/refresh", session.dashboardUrl),
     REAL_HISTORY_QA_TIMEOUTS.healthMs,
   );
+}
+
+async function fetchJsonMeasured(url, timeoutMs) {
+  const startedAt = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let status = null;
+  let body = null;
+  try {
+    const response = await fetch(url, {
+      cache: "no-store",
+      headers: { "X-Usage-Monitor-Local": "1" },
+      signal: controller.signal,
+    });
+    status = response.status;
+    if (response.ok) body = await response.json();
+  } catch {
+    // The bounded result below intentionally retains no transport/error text.
+  } finally {
+    clearTimeout(timer);
+  }
+  return Object.freeze({
+    status,
+    body,
+    latencyMs: Math.max(0, Date.now() - startedAt),
+  });
+}
+
+export function controlPlaneSnapshotValid(snapshot) {
+  return snapshot?.active === true
+    && Number.isSafeInteger(snapshot.sampleCount)
+    && snapshot.sampleCount >= CONTROL_PLANE_MIN_SAMPLES
+    && Number.isSafeInteger(snapshot.healthSuccessCount)
+    && snapshot.healthSuccessCount >= CONTROL_PLANE_MIN_SAMPLES
+    && snapshot.healthSuccessCount <= snapshot.sampleCount
+    && Number.isSafeInteger(snapshot.refreshStatusSuccessCount)
+    && snapshot.refreshStatusSuccessCount >= CONTROL_PLANE_MIN_SAMPLES
+    && snapshot.refreshStatusSuccessCount <= snapshot.sampleCount
+    && Number.isSafeInteger(snapshot.maxLatencyMs)
+    && snapshot.maxLatencyMs >= 0
+    && snapshot.maxLatencyMs <= REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS;
+}
+
+export function cancelHttpResponseValid(response) {
+  return response?.method === "POST"
+    && response?.path === "/api/local/refresh/cancel"
+    && response?.status === 202
+    && Number.isSafeInteger(response.latencyMs)
+    && response.latencyMs >= 0
+    && response.latencyMs <= REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS;
+}
+
+async function sampleControlPlane(session, expectedRefreshId) {
+  const healthUrl = new URL("/api/local/health", session.dashboardUrl);
+  const refreshUrl = new URL("/api/local/refresh", session.dashboardUrl);
+  const requestTimeoutMs = REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS;
+  const deadline = Date.now() + REAL_HISTORY_QA_TIMEOUTS.controlPlaneMs;
+  let sampleCount = 0;
+  let healthSuccessCount = 0;
+  let refreshStatusSuccessCount = 0;
+  let maxLatencyMs = 0;
+  while (Date.now() < deadline) {
+    const [health, status] = await Promise.all([
+      fetchJsonMeasured(healthUrl, requestTimeoutMs),
+      fetchJsonMeasured(refreshUrl, requestTimeoutMs),
+    ]);
+    sampleCount += 1;
+    maxLatencyMs = Math.max(maxLatencyMs, health.latencyMs, status.latencyMs);
+    if (health.status === 200 && health.body?.status === "ready") {
+      healthSuccessCount += 1;
+    }
+    if (status.status === 200
+        && status.body?.refresh?.refreshId === expectedRefreshId
+        && ["running", "cancelling"].includes(status.body.refresh.status)) {
+      refreshStatusSuccessCount += 1;
+    }
+    // A slow successful response is just as user-visible as a timeout. Fail
+    // at the measured boundary rather than allowing a later fast sample to
+    // hide the event-loop stall.
+    if (health.latencyMs > REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS
+        || status.latencyMs > REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS) {
+      fail("REAL_HISTORY_QA_CONTROL_PLANE_UNRESPONSIVE", "refresh", "control_plane_unresponsive");
+    }
+    if (healthSuccessCount >= CONTROL_PLANE_MIN_SAMPLES
+        && refreshStatusSuccessCount >= CONTROL_PLANE_MIN_SAMPLES) {
+      const result = Object.freeze({
+        active: true,
+        sampleCount,
+        healthSuccessCount,
+        refreshStatusSuccessCount,
+        maxLatencyMs,
+      });
+      if (!controlPlaneSnapshotValid(result)) {
+        fail("REAL_HISTORY_QA_CONTROL_PLANE_UNRESPONSIVE", "refresh", "control_plane_unresponsive");
+      }
+      return result;
+    }
+    await wait(CONTROL_PLANE_SAMPLE_INTERVAL_MS);
+  }
+  fail("REAL_HISTORY_QA_CONTROL_PLANE_UNRESPONSIVE", "refresh", "control_plane_unresponsive");
+}
+
+async function waitCancelHttpResponse(session) {
+  try {
+    const response = await waitFor(() => {
+      const entries = session.controlPlane.snapshot().filter(
+        (entry) => entry.method === "POST"
+          && entry.path === "/api/local/refresh/cancel",
+      );
+      if (entries.length > 1) {
+        fail("REAL_HISTORY_QA_CANCEL_HTTP_INVALID", "cancel", "cancel_http_invalid");
+      }
+      return entries.length === 1 ? entries[0] : null;
+    }, 8_000, "refresh cancellation HTTP response", 100);
+    if (!cancelHttpResponseValid(response)) {
+      fail("REAL_HISTORY_QA_CANCEL_HTTP_INVALID", "cancel", "cancel_http_invalid");
+    }
+    return Object.freeze({
+      requestCount: 1,
+      status: 202,
+      latencyMs: response.latencyMs,
+      accepted: true,
+    });
+  } catch (error) {
+    if (error?.qaStage) throw error;
+    fail("REAL_HISTORY_QA_CANCEL_HTTP_INVALID", "cancel", "cancel_http_invalid");
+  }
 }
 
 function coherentDegraded(refresh) {
@@ -1082,11 +1315,14 @@ async function runCancelMode(session) {
       ? status.refresh
       : null;
   }, REAL_HISTORY_QA_TIMEOUTS.startupMs, "cancel mode refresh start");
+  session.controlPlane.reset();
   const timer = await sampleAdvancingTimer(session);
+  const controlPlane = await sampleControlPlane(session, first.refreshId);
   const cancelStartedAt = Date.now();
   await clickCancel(session);
   await waitCancelAcknowledged(session);
   const acknowledgedMs = Date.now() - cancelStartedAt;
+  const cancelHttp = await waitCancelHttpResponse(session);
   const firstTerminal = await waitRefreshTerminal(
     session,
     first.refreshId,
@@ -1105,6 +1341,7 @@ async function runCancelMode(session) {
     return true;
   })()`);
   if (retryClicked !== true) fail("REAL_HISTORY_QA_RETRY_REJECTED", "cancel", "retry_rejected");
+  session.controlPlane.reset();
   const retry = await waitFor(async () => {
     const requests = session.observer.snapshot();
     if (requests.length > 1) {
@@ -1120,6 +1357,8 @@ async function runCancelMode(session) {
   }, REAL_HISTORY_QA_TIMEOUTS.retryMs, "cancel mode retry");
   await wait(2_000);
   await clickCancel(session);
+  await waitCancelAcknowledged(session);
+  const retryCancelHttp = await waitCancelHttpResponse(session);
   const retryTerminal = await waitRefreshTerminal(
     session,
     retry.refreshId,
@@ -1130,15 +1369,18 @@ async function runCancelMode(session) {
   }
   return Object.freeze({
     timer,
+    controlPlane,
     cancel: Object.freeze({
       acknowledgedMs,
       terminalMs,
       terminalStatus: "cancelled",
+      http: cancelHttp,
     }),
     retry: Object.freeze({
       newRefreshId: true,
       accepted: true,
       terminalStatus: "cancelled",
+      cancelHttp: retryCancelHttp,
     }),
   });
 }
@@ -1393,6 +1635,7 @@ export function buildRealHistoryReceipt({
   timer = {},
   startup = {},
   parity = {},
+  controlPlane = {},
   cancel = {},
   retry = {},
   relaunch = {},
@@ -1405,6 +1648,33 @@ export function buildRealHistoryReceipt({
   const passed = status === "passed";
   const identityBound = artifactIdentityVerified === true
     && SHA256_PATTERN.test(artifactSha256 ?? "");
+  const controlPlaneValid = controlPlaneSnapshotValid(controlPlane);
+  const boundedLatency = (value) => Number.isSafeInteger(value)
+      && value >= 0
+      && value <= REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS
+    ? value
+    : 0;
+  const validLatency = (value) => Number.isSafeInteger(value)
+      && value >= 0
+      && value <= REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS;
+  const cancelHttp = {
+    requestCount: cancel.http?.requestCount === 1 ? 1 : 0,
+    status: cancel.http?.status === 202 ? 202 : 0,
+    latencyMs: boundedLatency(cancel.http?.latencyMs),
+    accepted: cancel.http?.requestCount === 1
+      && cancel.http?.status === 202
+      && cancel.http?.accepted === true
+      && validLatency(cancel.http?.latencyMs),
+  };
+  const retryCancelHttp = {
+    requestCount: retry.cancelHttp?.requestCount === 1 ? 1 : 0,
+    status: retry.cancelHttp?.status === 202 ? 202 : 0,
+    latencyMs: boundedLatency(retry.cancelHttp?.latencyMs),
+    accepted: retry.cancelHttp?.requestCount === 1
+      && retry.cancelHttp?.status === 202
+      && retry.cancelHttp?.accepted === true
+      && validLatency(retry.cancelHttp?.latencyMs),
+  };
   return Object.freeze({
     schemaVersion: REAL_HISTORY_SCHEMA_VERSION,
     status: passed ? "passed" : "failed",
@@ -1437,6 +1707,14 @@ export function buildRealHistoryReceipt({
           && DEGRADED_FAILURE_CODES.has(startup.degradedFailureCode)
         ? startup.degradedFailureCode
         : null,
+    }),
+    controlPlane: Object.freeze({
+      active: controlPlaneValid,
+      sampleCount: controlPlaneValid ? controlPlane.sampleCount : 0,
+      healthSuccessCount: controlPlaneValid ? controlPlane.healthSuccessCount : 0,
+      refreshStatusSuccessCount: controlPlaneValid
+        ? controlPlane.refreshStatusSuccessCount : 0,
+      maxLatencyMs: controlPlaneValid ? controlPlane.maxLatencyMs : 0,
     }),
     parity: Object.freeze({
       dashboardPopulated: parity.dashboard?.populated === true,
@@ -1477,11 +1755,13 @@ export function buildRealHistoryReceipt({
       acknowledgedMs: Number.isSafeInteger(cancel.acknowledgedMs) ? cancel.acknowledgedMs : 0,
       terminalMs: Number.isSafeInteger(cancel.terminalMs) ? cancel.terminalMs : 0,
       terminalStatus: cancel.terminalStatus === "cancelled" ? "cancelled" : "unknown",
+      http: Object.freeze(cancelHttp),
     }),
     retry: Object.freeze({
       newRefreshId: retry.newRefreshId === true,
       accepted: retry.accepted === true,
       terminalStatus: retry.terminalStatus === "cancelled" ? "cancelled" : "unknown",
+      cancelHttp: Object.freeze(retryCancelHttp),
     }),
     relaunch: Object.freeze({
       persistedDashboard: relaunch.persistedDashboard === true,
@@ -1527,6 +1807,7 @@ async function runQa(options) {
   let timer = {};
   let startup = {};
   let parity = {};
+  let controlPlane = {};
   let cancel = {};
   let retry = {};
   let relaunch = {};
@@ -1541,6 +1822,7 @@ async function runQa(options) {
       // toolbar and exercise its user-facing cancellation/retry controls.
       const result = await runCancelMode(session);
       timer = result.timer;
+      controlPlane = result.controlPlane;
       cancel = result.cancel;
       retry = result.retry;
     } else if (options.mode === "relaunch") {
@@ -1610,6 +1892,7 @@ async function runQa(options) {
       timer,
       startup,
       parity,
+      controlPlane,
       cancel,
       retry,
       relaunch,

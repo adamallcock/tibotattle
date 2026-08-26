@@ -9,11 +9,14 @@ import {
   REAL_HISTORY_QA_MODES,
   REAL_HISTORY_QA_TIMEOUTS,
   buildRealHistoryReceipt,
+  cancelHttpResponseValid,
   capturedDescendantPidsGone,
   capturedDescendantPidsValid,
   classifyAdvancedModuleText,
   classifyRealHistoryTerminal,
   communityParitySnapshotValid,
+  controlPlaneSnapshotValid,
+  createControlPlaneObserver,
   createRefreshObserver,
   parseRealHistoryArguments,
   verifyPackagedArtifactIdentity,
@@ -177,6 +180,25 @@ test("real-history receipt is allowlisted, content-free, and strips refresh iden
     status: "passed",
     cleanQuit: true,
     timer: { sampleCount: 5, uniqueCount: 5, advanced: true },
+    controlPlane: {
+      active: true,
+      sampleCount: 3,
+      healthSuccessCount: 3,
+      refreshStatusSuccessCount: 3,
+      maxLatencyMs: 21,
+    },
+    cancel: {
+      acknowledgedMs: 40,
+      terminalMs: 120,
+      terminalStatus: "cancelled",
+      http: { requestCount: 1, status: 202, latencyMs: 12, accepted: true },
+    },
+    retry: {
+      newRefreshId: true,
+      accepted: true,
+      terminalStatus: "cancelled",
+      cancelHttp: { requestCount: 1, status: 202, latencyMs: 9, accepted: true },
+    },
     artifactSha256: "b".repeat(64),
     artifactIdentityVerified: true,
     startup: {
@@ -239,6 +261,25 @@ test("real-history receipt is allowlisted, content-free, and strips refresh iden
   assert.equal(receipt.parity.community.serviceReachability, "ok");
   assert.equal(receipt.parity.community.serviceReachabilityProven, true);
   assert.equal(receipt.startupRefresh.terminalStatus, "degraded");
+  assert.deepEqual(receipt.controlPlane, {
+    active: true,
+    sampleCount: 3,
+    healthSuccessCount: 3,
+    refreshStatusSuccessCount: 3,
+    maxLatencyMs: 21,
+  });
+  assert.deepEqual(receipt.cancel.http, {
+    requestCount: 1,
+    status: 202,
+    latencyMs: 12,
+    accepted: true,
+  });
+  assert.deepEqual(receipt.retry.cancelHttp, {
+    requestCount: 1,
+    status: 202,
+    latencyMs: 9,
+    accepted: true,
+  });
   assert.equal(receipt.relaunch.persistedDashboard, true);
   assert.equal(receipt.relaunch.newAutomaticRefresh, true);
   assert.equal(Object.hasOwn(receipt, "refreshId"), false);
@@ -249,6 +290,122 @@ test("real-history receipt is allowlisted, content-free, and strips refresh iden
   assert.equal(JSON.stringify(receipt).includes("http://"), false);
   assert.equal(Object.isFrozen(receipt), true);
   assert.equal(Object.isFrozen(receipt.startupRefresh), true);
+  assert.equal(Object.isFrozen(receipt.controlPlane), true);
+  assert.equal(Object.isFrozen(receipt.cancel.http), true);
+});
+
+test("control-plane gate requires bounded health/status samples", () => {
+  assert.equal(controlPlaneSnapshotValid({
+    active: true,
+    sampleCount: 3,
+    healthSuccessCount: 3,
+    refreshStatusSuccessCount: 3,
+    maxLatencyMs: 0,
+  }), true);
+  assert.equal(controlPlaneSnapshotValid({
+    active: true,
+    sampleCount: 2,
+    healthSuccessCount: 2,
+    refreshStatusSuccessCount: 2,
+    maxLatencyMs: 0,
+  }), false);
+  assert.equal(controlPlaneSnapshotValid({
+    active: true,
+    sampleCount: 3,
+    healthSuccessCount: 3,
+    refreshStatusSuccessCount: 3,
+    maxLatencyMs: 3_001,
+  }), false);
+  assert.equal(controlPlaneSnapshotValid({
+    active: true,
+    sampleCount: 3,
+    healthSuccessCount: 4,
+    refreshStatusSuccessCount: 3,
+    maxLatencyMs: 0,
+  }), false);
+  const untrusted = buildRealHistoryReceipt({
+    status: "passed",
+    controlPlane: {
+      active: true,
+      sampleCount: 1,
+      healthSuccessCount: 1,
+      refreshStatusSuccessCount: 1,
+      maxLatencyMs: 99_999,
+    },
+    cancel: {
+      http: { requestCount: 7, status: 500, latencyMs: -1, accepted: true },
+    },
+  });
+  assert.deepEqual(untrusted.controlPlane, {
+    active: false,
+    sampleCount: 0,
+    healthSuccessCount: 0,
+    refreshStatusSuccessCount: 0,
+    maxLatencyMs: 0,
+  });
+  assert.deepEqual(untrusted.cancel.http, {
+    requestCount: 0,
+    status: 0,
+    latencyMs: 0,
+    accepted: false,
+  });
+});
+
+test("control-plane observer retains only exact loopback route response metadata", () => {
+  const handlers = new Map();
+  const cdp = {
+    on(method, handler) {
+      handlers.set(method, handler);
+      return () => handlers.delete(method);
+    },
+  };
+  const observer = createControlPlaneObserver(cdp, "http://127.0.0.1:4321");
+  const emit = (method, event) => handlers.get(method)?.(event);
+  emit("Network.requestWillBeSent", {
+    requestId: "health-1",
+    request: { method: "GET", url: "http://127.0.0.1:4321/api/local/health" },
+  });
+  emit("Network.responseReceived", {
+    requestId: "health-1",
+    response: { status: 200 },
+  });
+  emit("Network.requestWillBeSent", {
+    requestId: "foreign-1",
+    request: { method: "GET", url: "http://localhost:4321/api/local/health" },
+  });
+  emit("Network.responseReceived", {
+    requestId: "foreign-1",
+    response: { status: 200 },
+  });
+  emit("Network.requestWillBeSent", {
+    requestId: "cancel-1",
+    request: { method: "POST", url: "http://127.0.0.1:4321/api/local/refresh/cancel" },
+  });
+  emit("Network.responseReceived", {
+    requestId: "cancel-1",
+    response: { status: 202 },
+  });
+  assert.deepEqual(observer.snapshot().map(({ method, path, status }) => ({ method, path, status })), [
+    { method: "GET", path: "/api/local/health", status: 200 },
+    { method: "POST", path: "/api/local/refresh/cancel", status: 202 },
+  ]);
+  observer.reset();
+  assert.deepEqual(observer.snapshot(), []);
+  observer.dispose();
+});
+
+test("cancel proof requires the renderer POST rather than a GET with the same status", () => {
+  const accepted = {
+    method: "POST",
+    path: "/api/local/refresh/cancel",
+    status: 202,
+    latencyMs: 12,
+  };
+  assert.equal(cancelHttpResponseValid(accepted), true);
+  assert.equal(cancelHttpResponseValid({ ...accepted, method: "GET" }), false);
+  assert.equal(cancelHttpResponseValid({ ...accepted, path: "/api/local/refresh" }), false);
+  assert.equal(cancelHttpResponseValid({ ...accepted, status: 200 }), false);
+  assert.equal(cancelHttpResponseValid({ ...accepted, latencyMs: 3_001 }), false);
 });
 
 test("real-history process proof requires exact captured descendants and observes their disappearance", () => {
@@ -408,6 +565,10 @@ test("source contract preserves the real profile and bounds every health poll", 
   assert.match(source, /centralServiceProxy === true/u);
   assert.match(source, /new URL\("\/api\/health", session\.dashboardUrl\)/u);
   assert.match(source, /serviceHealth\?\.status === "ok"/u);
+  assert.match(source, /REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS/u);
+  assert.match(source, /Network\.responseReceived/u);
+  assert.match(source, /sampleControlPlane/u);
+  assert.match(source, /cancelHttp/u);
   assert.match(source, /(?:loading|preparing|checking)/u);
   assert.match(source, /capturedDescendantPidsGone/u);
   assert.match(source, /session\.expectedDescendantPids = descendantsOf\(child\.pid\)/u);
