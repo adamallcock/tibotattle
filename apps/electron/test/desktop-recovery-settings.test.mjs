@@ -64,6 +64,20 @@ test("Choose Codex Folder invokes only the bounded custom-folder handler", async
   assert.equal(value.calls[0].noLink, true);
 });
 
+test("Choose Codex Folder uses the replacement port when multi-root recovery is available", async () => {
+  const value = fixture({ response: 0 });
+  const replacements = [];
+  value.controller.replaceCodexHome = async (...args) => replacements.push(args);
+  const action = createDesktopRecoverySettingsAction({
+    controller: value.controller,
+    dialog: value.dialog,
+  });
+
+  assert.deepEqual(await action.show(), { status: "choose_applied" });
+  assert.deepEqual(replacements, [[]]);
+  assert.deepEqual(value.handlerCalls.choose, []);
+});
+
 test("Use Default Folder invokes only the bounded default-folder handler", async () => {
   const value = fixture({ response: 1 });
   const action = createDesktopRecoverySettingsAction({

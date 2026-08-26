@@ -50,6 +50,10 @@ function assertController(controller) {
   if (typeof controller.handlers.useDefaultCodexHome !== "function") {
     throw new TypeError("controller.handlers.useDefaultCodexHome is required");
   }
+  if (controller.replaceCodexHome !== undefined
+      && typeof controller.replaceCodexHome !== "function") {
+    throw new TypeError("controller.replaceCodexHome must be a function");
+  }
   return controller;
 }
 
@@ -155,7 +159,11 @@ async function showOnce({ controller, dialog }, copy) {
     // Keep the argument shape explicit. The handlers are main-process
     // capability ports and accept no path or renderer-supplied data here.
     if (selected === 0) {
-      await controller.handlers.chooseCodexHome({});
+      if (typeof controller.replaceCodexHome === "function") {
+        await controller.replaceCodexHome();
+      } else {
+        await controller.handlers.chooseCodexHome({});
+      }
     } else {
       await controller.handlers.useDefaultCodexHome({});
     }

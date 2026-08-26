@@ -370,8 +370,7 @@ export function createDesktopLifecycle({
     return true;
   }
 
-  function isAuthorizedDesktopFrame(frame, event = undefined) {
-    if (isAuthorizedDashboardFrame(frame, event)) return true;
+  function isAuthorizedSettingsFrame(frame, event = undefined) {
     if (!frame || typeof frame !== "object") return false;
     const sender = event?.sender;
     if (!isLiveBrowserWindow(settingsWindow) || sender !== settingsWindow.webContents) {
@@ -380,7 +379,33 @@ export function createDesktopLifecycle({
     if (settingsWindow.webContents?.mainFrame !== frame) return false;
     if (Object.hasOwn(frame, "isMainFrame") && frame.isMainFrame !== true) return false;
     if (Object.hasOwn(frame, "parent") && frame.parent !== null) return false;
+    // Navigation policy is the primary URL gate. Recheck the live URL when
+    // Electron exposes it so a renderer that navigated away cannot retain
+    // access to pathful root settings actions.
+    const getURL = settingsWindow.webContents?.getURL;
+    if (typeof getURL === "function") {
+      let currentURL;
+      try {
+        currentURL = getURL.call(settingsWindow.webContents);
+        const parsed = new URL(currentURL);
+        if (!isExactLoopbackOrigin(ready?.origin)
+            || parsed.origin !== ready.origin
+            || parsed.pathname !== "/electron-settings.html"
+            || parsed.search !== ""
+            || parsed.username !== ""
+            || parsed.password !== "") {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+    }
     return true;
+  }
+
+  function isAuthorizedDesktopFrame(frame, event = undefined) {
+    if (isAuthorizedDashboardFrame(frame, event)) return true;
+    return isAuthorizedSettingsFrame(frame, event);
   }
 
   function isAuthorizedDesktopDownloadContext(sender, frame) {
@@ -1303,6 +1328,7 @@ export function createDesktopLifecycle({
     isAuthorizedDesktopFrame,
     isAuthorizedDashboardSender,
     isAuthorizedDashboardFrame,
+    isAuthorizedSettingsFrame,
     isAuthorizedDesktopDownloadContext,
     revealLatestDownload() {
       if (ownedDownloadsRegistry === null) return Promise.resolve("unavailable");

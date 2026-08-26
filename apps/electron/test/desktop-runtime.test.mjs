@@ -10,6 +10,21 @@ import {
   DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
 } from "../../../src/desktop-shell-status.js";
 
+const DEFAULT_CODEX_ROOT_ID = DESKTOP_DEFAULT_SETTINGS.codexHomes.primaryRootId;
+const CUSTOM_CODEX_ROOT_ID = "11111111-1111-4111-8111-111111111111";
+
+function customCodexHomes(path, rootId = CUSTOM_CODEX_ROOT_ID) {
+  return {
+    activityRoots: [{
+      rootId,
+      kind: "custom",
+      path,
+      enabled: true,
+    }],
+    primaryRootId: rootId,
+  };
+}
+
 class FakeChild extends EventEmitter {
   constructor() {
     super();
@@ -129,6 +144,7 @@ class FakeTray extends EventEmitter {
 
 function platformServices() {
   return {
+    defaultCodexHome: "/Users/adam/.codex",
     defaultCodexHomeDisplay: "Default location (~/.codex)",
     validateCodexHome: async (path) => path,
     loginItemStatus: () => ({
@@ -271,6 +287,7 @@ async function launchFixture({
   FakeWindow.instances = [];
   const app = suppliedApp ?? new FakeApp();
   const children = [];
+  const spawnCalls = [];
   const backend = { load, save };
   const launch = launchDesktopRuntime({
     runtime: { ...runtime(app), ...runtimeOverrides },
@@ -290,7 +307,8 @@ async function launchFixture({
     lifecycleOptions,
     settingsBackend: backend,
     supervisorOptions: {
-      spawnChild() {
+      spawnChild(_command, args, options) {
+        spawnCalls.push({ args: [...args], options });
         const child = new FakeChild();
         children.push(child);
         return child;
@@ -299,10 +317,14 @@ async function launchFixture({
       shutdownTimeoutMs: 1_000,
     },
   });
+  // Attach a rejection observer before the readiness tick. Some negative
+  // launch cases fail during controller initialization, before this helper
+  // can return its outer promise to the test.
+  launch.catch(() => {});
   await new Promise((resolve) => setImmediate(resolve));
   children[0]?.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4811/\n"));
   const desktop = await launch;
-  return { app, children, desktop };
+  return { app, children, spawnCalls, desktop };
 }
 
 test("runtime persists the fixed Electron appearance and updates live renderers", async () => {
@@ -434,11 +456,94 @@ test("runtime applies persisted custom CODEX_HOME before first child start", asy
   const fixture = await launchFixture({
     load: async () => ({
       ...DESKTOP_DEFAULT_SETTINGS,
-      codexHome: { mode: "custom", path: "/Users/adam/.codex-first" },
+      codexHomes: customCodexHomes("/Users/adam/.codex-first"),
     }),
   });
   assert.equal(fixture.desktop.childEnvironment.CODEX_HOME, "/Users/adam/.codex-first");
+  assert.deepEqual(fixture.spawnCalls[0].args, [
+    "/repo/apps/local/server.js",
+    "--codex-home",
+    "/Users/adam/.codex-first",
+    "--primary-codex-home",
+    "/Users/adam/.codex-first",
+  ]);
   await fixture.desktop.lifecycle.dispose();
+});
+
+test("runtime relaunches with every configured root and exactly one primary flag", async () => {
+  const fixture = await launchFixture({ load: async () => null });
+  const add = fixture.desktop.controller.handlers.addCodexHome({});
+  for (let attempt = 0; attempt < 20 && fixture.children.length < 2; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(fixture.children.length, 2);
+  fixture.children[1].stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4812/\n"));
+  await add;
+  assert.deepEqual(fixture.spawnCalls[1].args, [
+    "/repo/apps/local/server.js",
+    "--codex-home",
+    "/Users/adam/.codex",
+    "--codex-home",
+    "/Users/adam/.codex-custom",
+    "--primary-codex-home",
+    "/Users/adam/.codex",
+  ]);
+  assert.equal(fixture.spawnCalls[1].options.env.CODEX_HOME, "/Users/adam/.codex");
+
+  const roots = await fixture.desktop.controller.handlers.getCodexHomesForSettings({});
+  const custom = roots.activityRoots.find(({ kind }) => kind === "custom");
+  const setPrimary = fixture.desktop.controller.handlers.setPrimaryCodexHome({
+    rootId: custom.rootId,
+  });
+  for (let attempt = 0; attempt < 20 && fixture.children.length < 3; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(fixture.children.length, 3);
+  fixture.children[2].stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4813/\n"));
+  await setPrimary;
+  assert.deepEqual(fixture.spawnCalls[2].args, [
+    "/repo/apps/local/server.js",
+    "--codex-home",
+    "/Users/adam/.codex",
+    "--codex-home",
+    "/Users/adam/.codex-custom",
+    "--primary-codex-home",
+    "/Users/adam/.codex-custom",
+  ]);
+  assert.equal(fixture.spawnCalls[2].options.env.CODEX_HOME, "/Users/adam/.codex-custom");
+  await fixture.desktop.lifecycle.dispose();
+});
+
+test("runtime rejects a root path written in the wrong host grammar before spawning", async () => {
+  await assert.rejects(
+    launchFixture({
+      platform: "darwin",
+      load: async () => ({
+        ...DESKTOP_DEFAULT_SETTINGS,
+        codexHomes: customCodexHomes("C:\\Users\\adam\\.codex"),
+      }),
+    }),
+    (error) => error?.code === "electron_shell_desktop_codex_roots_invalid",
+  );
+
+  await assert.rejects(
+    launchFixture({
+      platform: "win32",
+      platformServices: {
+        ...platformServices(),
+        defaultCodexHome: "C:\\Users\\adam\\.codex",
+      },
+      environment: {
+        USERPROFILE: "C:\\Users\\adam",
+        USAGE_MONITOR_RESOURCE_ROOT: "/repo",
+      },
+      load: async () => ({
+        ...DESKTOP_DEFAULT_SETTINGS,
+        codexHomes: customCodexHomes("/Users/adam/.codex"),
+      }),
+    }),
+    (error) => error?.code === "electron_shell_desktop_codex_roots_invalid",
+  );
 });
 
 test("runtime wires safe browser, diagnostics, and local-data actions", async () => {
@@ -577,9 +682,9 @@ test("a secondary Electron instance exits before first-run or companion startup"
   assert.equal(fixture.children.length, 0);
 });
 
-test("runtime falls back before launch when a persisted Codex home is unavailable", async () => {
+test("runtime retains a configured root when its path is currently unavailable", async () => {
   const validated = [];
-  const persisted = [];
+  const missing = "/Users/adam/.codex-gone";
   const services = {
     ...platformServices(),
     validateCodexHome: async (path) => {
@@ -591,21 +696,29 @@ test("runtime falls back before launch when a persisted Codex home is unavailabl
     platformServices: services,
     load: async () => ({
       ...DESKTOP_DEFAULT_SETTINGS,
-      codexHome: { mode: "custom", path: "/Users/adam/.codex-gone" },
+      codexHomes: customCodexHomes(missing),
     }),
-    save: async (value) => persisted.push(value),
   });
-  assert.deepEqual(validated, ["/Users/adam/.codex-gone"]);
-  assert.equal(fixture.desktop.childEnvironment.CODEX_HOME, undefined);
-  assert.equal(persisted.length, 1);
-  assert.deepEqual(persisted[0].codexHome, { mode: "default", path: null });
+  assert.deepEqual(validated, []);
+  assert.equal(fixture.desktop.childEnvironment.CODEX_HOME, missing);
+  assert.deepEqual(fixture.spawnCalls[0].args, [
+    "/repo/apps/local/server.js",
+    "--codex-home",
+    missing,
+    "--primary-codex-home",
+    missing,
+  ]);
+  assert.equal(
+    (await fixture.desktop.controller.handlers.getCodexHomesForSettings({})).activityRoots[0].path,
+    missing,
+  );
   const settings = await fixture.desktop.controller.handlers.getSettings({});
-  assert.equal(settings.settings.codexFolder.kind, "default");
-  assert.equal(settings.settings.codexFolder.recovery.status, "fallback");
+  assert.equal(settings.settings.codexFolder.kind, "custom");
+  assert.equal(Object.hasOwn(settings.settings.codexFolder, "recovery"), false);
   await fixture.desktop.lifecycle.dispose();
 });
 
-test("runtime uses bounded retry and restores the prior environment when persistence fails", async () => {
+test("runtime keeps the prior child and environment when root persistence fails", async () => {
   let saves = 0;
   const fixture = await launchFixture({
     load: async () => null,
@@ -614,19 +727,20 @@ test("runtime uses bounded retry and restores the prior environment when persist
       throw new Error("synthetic persistence failure");
     },
   });
-  const selection = fixture.desktop.controller.handlers.chooseCodexHome({});
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(fixture.children.length, 2);
-  fixture.children[1].stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4812/\n"));
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(fixture.children.length, 3);
-  fixture.children[2].stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4813/\n"));
   await assert.rejects(
-    selection,
-    (error) => error?.code === "desktop_codex_home_change_failed",
+    fixture.desktop.controller.handlers.chooseCodexHome({}),
+    (error) => error?.code === "desktop_codex_roots_persistence_failed",
   );
   assert.equal(saves, 1);
-  assert.equal(fixture.desktop.childEnvironment.CODEX_HOME, undefined);
+  assert.equal(fixture.children.length, 1);
+  assert.equal(fixture.desktop.childEnvironment.CODEX_HOME, "/Users/adam/.codex");
+  assert.deepEqual(fixture.spawnCalls[0].args, [
+    "/repo/apps/local/server.js",
+    "--codex-home",
+    "/Users/adam/.codex",
+    "--primary-codex-home",
+    "/Users/adam/.codex",
+  ]);
   await fixture.desktop.lifecycle.dispose();
 });
 
@@ -695,12 +809,21 @@ test("runtime truthfully gates development and Windows notification identity", a
   const fake = fakeNotification();
   const app = new FakeApp();
   app.isPackaged = true;
+  const windowsServices = {
+    ...platformServices(),
+    defaultCodexHome: "C:\\Users\\adam\\.codex",
+  };
   const windows = await launchFixture({
     app,
     platform: "win32",
+    platformServices: windowsServices,
     runtimeOverrides: { Notification: fake.Notification },
     notificationBackend: notificationBackendFixture(),
     load: async () => null,
+    environment: {
+      USERPROFILE: "C:\\Users\\adam",
+      USAGE_MONITOR_RESOURCE_ROOT: "/repo",
+    },
   });
   const windowsSettings = await windows.desktop.controller.handlers.getSettings({});
   assert.equal(

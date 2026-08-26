@@ -15,6 +15,7 @@ const SAFE_ERROR_CODES = new Set([
   "desktop_dashboard_browser_unavailable",
   "desktop_diagnostics_unavailable",
   "desktop_local_data_unavailable",
+  "desktop_codex_roots_invalid",
   "desktop_refresh_lease_exhausted",
 ]);
 

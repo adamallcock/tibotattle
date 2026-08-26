@@ -6,18 +6,41 @@ import {
   createDesktopController,
   DESKTOP_REFRESH_LEASE_WATCHDOG_MS,
 } from "../desktop-controller.js";
+import {
+  createDefaultCodexHomes,
+  normalizeCodexHomes,
+} from "../desktop-codex-roots.js";
 import { createDesktopSettingsStore } from "../desktop-settings-store.js";
+
+const ROOT_A = "11111111-1111-4111-8111-111111111111";
+const ROOT_B = "22222222-2222-4222-8222-222222222222";
+
+function twoCodexHomes() {
+  return normalizeCodexHomes({
+    activityRoots: [
+      { rootId: ROOT_A, kind: "custom", path: "/Users/adam/codex-a", enabled: true },
+      { rootId: ROOT_B, kind: "custom", path: "/Users/adam/codex-b", enabled: true },
+    ],
+    primaryRootId: ROOT_A,
+  });
+}
 
 function fixture({
   platformOverrides = {},
   lifecycleOverrides = {},
   actionOverrides = {},
+  settingsLoad = async () => null,
+  settingsSave = null,
+  settingsStore: suppliedSettingsStore = null,
 } = {}) {
   let persisted = null;
-  const store = createDesktopSettingsStore({
+  const store = suppliedSettingsStore ?? createDesktopSettingsStore({
     backend: {
-      load: async () => null,
-      save: async (value) => { persisted = value; },
+      load: settingsLoad,
+      save: async (value) => {
+        persisted = value;
+        if (settingsSave !== null) await settingsSave(value);
+      },
     },
   });
   const commands = [];
@@ -140,6 +163,14 @@ test("controller initializes persisted cadence and projects truthful settings st
         language: "system",
         appearance: "system",
         codexFolder: { kind: "default" },
+        codexHomes: {
+          activityRoots: [{
+            rootId: DESKTOP_DEFAULT_SETTINGS.codexHomes.primaryRootId,
+            kind: "default",
+            enabled: true,
+          }],
+          primaryRootId: DESKTOP_DEFAULT_SETTINGS.codexHomes.primaryRootId,
+        },
         refreshIntervalSeconds: 300,
         startAtLogin: { status: "disabled", canSet: true, detail: "disabled" },
         sidebarCollapsed: false,
@@ -198,14 +229,19 @@ test("controller implements every bounded bridge action and desktop command", as
   assert.deepEqual(value.hostedSignIns, [
     "https://accounts.google.com/o/oauth2/v2/auth?client_id=test",
   ]);
-  assert.deepEqual(value.persisted, {
-    ...DESKTOP_DEFAULT_SETTINGS,
-    codexHome: { mode: "custom", path: "/Users/adam/custom-codex" },
-    language: "es",
-    refreshIntervalSeconds: 60,
-    startAtLogin: true,
-    notifications: { enabled: false, threshold: "off" },
-  });
+  assert.equal(value.persisted.schemaVersion, DESKTOP_DEFAULT_SETTINGS.schemaVersion);
+  assert.equal(Object.hasOwn(value.persisted, "codexHome"), false);
+  assert.equal(value.persisted.codexHomes.activityRoots.length, 1);
+  assert.equal(value.persisted.codexHomes.activityRoots[0].kind, "custom");
+  assert.equal(value.persisted.codexHomes.activityRoots[0].path, "/Users/adam/custom-codex");
+  assert.equal(
+    value.persisted.codexHomes.primaryRootId,
+    value.persisted.codexHomes.activityRoots[0].rootId,
+  );
+  assert.equal(value.persisted.language, "es");
+  assert.equal(value.persisted.refreshIntervalSeconds, 60);
+  assert.equal(value.persisted.startAtLogin, true);
+  assert.deepEqual(value.persisted.notifications, { enabled: false, threshold: "off" });
 });
 
 test("controller exposes bounded browser, diagnostics, local-data, and refresh lifecycle actions", async () => {
@@ -490,7 +526,7 @@ test("controller permits reveal only for the live dashboard context", async () =
   );
 });
 
-test("Codex home change rolls back process configuration when persistence fails", async () => {
+test("Codex root change persists before process configuration when persistence fails", async () => {
   let saves = 0;
   const store = createDesktopSettingsStore({
     backend: {
@@ -515,7 +551,7 @@ test("Codex home change rolls back process configuration when persistence fails"
       about: () => ({}),
     },
     getLifecycle: () => ({ showSettingsWindow: () => true }),
-    applyCodexHome: async (next, previous) => homes.push([next, previous]),
+    applyCodexHomes: async (next, previous) => homes.push([next, previous]),
     validateCodexHome: async (path) => path,
     sendDashboardCommand: () => false,
     setRecurringTimer: () => ({ unref() {} }),
@@ -523,20 +559,14 @@ test("Codex home change rolls back process configuration when persistence fails"
   });
   await assert.rejects(
     controller.handlers.chooseCodexHome({}),
-    (error) => error?.code === "desktop_codex_home_change_failed",
+    (error) => error?.code === "desktop_codex_roots_persistence_failed",
   );
   assert.equal(saves, 1);
-  assert.deepEqual(homes, [
-    [
-      { mode: "custom", path: "/safe/custom" },
-      { mode: "default", path: null },
-    ],
-    [
-      { mode: "default", path: null },
-      { mode: "custom", path: "/safe/custom" },
-    ],
-  ]);
-  assert.equal((await store.getSettings()).codexHome.mode, "default");
+  assert.deepEqual(homes, []);
+  assert.deepEqual(
+    (await store.getCodexHomesForSettings()).activityRoots.map(({ kind }) => kind),
+    ["default"],
+  );
 });
 
 test("unconfirmed login-item changes are not persisted", async () => {
@@ -602,4 +632,178 @@ test("start-at-login persistence failure restores the prior OS state", async () 
   assert.deepEqual(calls, [true, false]);
   assert.equal(persisted, false);
   assert.equal((await store.getSettings()).startAtLogin, false);
+});
+
+test("controller keeps multi-root paths main-process-only and orders persistence before apply", async () => {
+  const events = [];
+  let selectedPath = "/Users/adam/codex-c";
+  const value = fixture({
+    settingsLoad: async () => ({
+      ...DESKTOP_DEFAULT_SETTINGS,
+      codexHomes: twoCodexHomes(),
+    }),
+    settingsSave: async () => { events.push("persist"); },
+    platformOverrides: {
+      chooseCodexHome: async () => selectedPath,
+    },
+    actionOverrides: {
+      applyCodexHomes: async (next, previous) => {
+        events.push("apply");
+        assert.equal(next.activityRoots.every((root) => root.enabled === true), true);
+        if (previous !== null) assert.equal(typeof previous.primaryRootId, "string");
+      },
+    },
+  });
+
+  await value.controller.initialize();
+  assert.deepEqual(events, ["apply"]);
+  const generic = await value.controller.handlers.getSettings({});
+  assert.doesNotMatch(JSON.stringify(generic), /codex-a|codex-b/u);
+  assert.deepEqual(
+    (await value.controller.handlers.getCodexHomesForSettings({})).activityRoots
+      .map(({ path }) => path),
+    ["/Users/adam/codex-a", "/Users/adam/codex-b"],
+  );
+
+  await value.controller.handlers.addCodexHome({});
+  assert.deepEqual(events.slice(-2), ["persist", "apply"]);
+  const afterAdd = await value.controller.handlers.getCodexHomesForSettings({});
+  assert.equal(afterAdd.activityRoots.length, 3);
+
+  selectedPath = "/Users/adam/codex-a-edited";
+  await value.controller.handlers.editCodexHome({ rootId: ROOT_A });
+  await value.controller.handlers.setPrimaryCodexHome({ rootId: ROOT_B });
+  const addedRoot = (await value.controller.handlers.getCodexHomesForSettings({})).activityRoots
+    .find(({ rootId }) => rootId !== ROOT_A && rootId !== ROOT_B);
+  assert.notEqual(addedRoot, undefined);
+  await value.controller.handlers.removeCodexHome({ rootId: ROOT_A });
+  await value.controller.handlers.reorderCodexHomes({
+    rootIds: [addedRoot.rootId, ROOT_B],
+  });
+  await value.controller.handlers.useDefaultCodexHome({});
+
+  const final = await value.controller.handlers.getCodexHomesForSettings({});
+  assert.deepEqual(final, createDefaultCodexHomes());
+  assert.equal(events.filter((event) => event === "persist").length, 6);
+  assert.equal(events.filter((event) => event === "apply").length, 7);
+});
+
+test("controller leaves the persisted multi-root configuration and runtime candidate unchanged on persistence failure", async () => {
+  const applyCalls = [];
+  const value = fixture({
+    settingsSave: async () => { throw new Error("backend unavailable"); },
+    actionOverrides: {
+      applyCodexHomes: async (...args) => applyCalls.push(args),
+    },
+  });
+  await value.controller.initialize();
+  await assert.rejects(
+    value.controller.handlers.addCodexHome({}),
+    (error) => error?.code === "desktop_codex_roots_persistence_failed",
+  );
+  assert.equal(applyCalls.length, 1, "a failed write must not restart the companion");
+  assert.deepEqual(
+    await value.controller.handlers.getCodexHomesForSettings({}),
+    createDefaultCodexHomes(),
+  );
+  assert.doesNotMatch(
+    JSON.stringify(await value.controller.handlers.getSettings({})),
+    /custom-codex/u,
+  );
+});
+
+test("controller retains persisted roots and exposes bounded recovery when companion apply fails", async () => {
+  const applyCalls = [];
+  const value = fixture({
+    actionOverrides: {
+      applyCodexHomes: async (...args) => {
+        applyCalls.push(args);
+        if (args[1] !== null) throw new Error("companion restart failed");
+      },
+    },
+  });
+  await value.controller.initialize();
+  await assert.rejects(
+    value.controller.handlers.addCodexHome({}),
+    (error) => error?.code === "desktop_codex_roots_apply_failed",
+  );
+  assert.equal(applyCalls.length, 2);
+  const pathful = await value.controller.handlers.getCodexHomesForSettings({});
+  assert.equal(pathful.activityRoots.length, 2);
+  assert.equal(pathful.activityRoots.at(-1).path, "/Users/adam/custom-codex");
+  const snapshot = await value.controller.handlers.getSettings({});
+  assert.equal(snapshot.settings.codexFolder.recovery.status, "apply_failed");
+  assert.doesNotMatch(JSON.stringify(snapshot), /custom-codex/u);
+});
+
+test("controller retains missing configured roots instead of validating or falling back", async () => {
+  const validated = [];
+  const applied = [];
+  const missing = "/Users/adam/missing-codex";
+  const value = fixture({
+    settingsLoad: async () => ({
+      ...DESKTOP_DEFAULT_SETTINGS,
+      codexHomes: {
+        activityRoots: [{
+          rootId: ROOT_A,
+          kind: "custom",
+          path: missing,
+          enabled: true,
+        }],
+        primaryRootId: ROOT_A,
+      },
+    }),
+    platformOverrides: {
+      validateCodexHome: async (path) => {
+        validated.push(path);
+        throw new Error("missing");
+      },
+    },
+    actionOverrides: {
+      applyCodexHomes: async (next) => applied.push(next),
+    },
+  });
+  await value.controller.initialize();
+  assert.deepEqual(validated, []);
+  assert.equal(applied.length, 1);
+  assert.equal(applied[0].activityRoots[0].path, missing);
+  assert.equal(
+    (await value.controller.handlers.getCodexHomesForSettings({})).activityRoots[0].path,
+    missing,
+  );
+  assert.equal((await value.controller.handlers.getSettings({})).settings.codexFolder.kind, "custom");
+});
+
+test("legacy add fallback does not deadlock inside the serialized controller queue", async () => {
+  let state = {
+    ...DESKTOP_DEFAULT_SETTINGS,
+    codexHome: { mode: "default", path: null },
+  };
+  delete state.codexHomes;
+  const legacyStore = {
+    async getSettings() { return state; },
+    async setLanguage(value) { state = { ...state, language: value }; },
+    async setAppearance(value) { state = { ...state, appearance: value }; },
+    async setRefreshInterval(value) { state = { ...state, refreshIntervalSeconds: value }; },
+    async setStartAtLogin(value) { state = { ...state, startAtLogin: value }; },
+    async setNotificationPreferences(value) { state = { ...state, notifications: value }; },
+    async setSidebarCollapsed(value) { state = { ...state, sidebarCollapsed: value }; },
+    async setCodexHome(value) { state = { ...state, codexHome: value }; },
+    async useDefaultCodexHome() { state = { ...state, codexHome: { mode: "default", path: null } }; },
+  };
+  const value = fixture({ settingsStore: legacyStore });
+  await value.controller.initialize();
+  let timeout;
+  try {
+    const result = await Promise.race([
+      value.controller.handlers.addCodexHome({}),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("legacy add timed out")), 250);
+      }),
+    ]);
+    assert.equal(result.settings.codexFolder.kind, "custom");
+    assert.equal(state.codexHome.mode, "custom");
+  } finally {
+    clearTimeout(timeout);
+  }
 });

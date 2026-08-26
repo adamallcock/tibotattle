@@ -2224,6 +2224,7 @@ test("desktop lifecycle owns a bounded Settings window and authorizes only its t
 
   const primaryContents = dashboardWindowsForTest(windows)[0].webContents;
   const settingsContents = settings.webContents;
+  settingsContents.getURL = () => settings.loaded.at(-1) ?? "";
   assert.equal(lifecycle.isAuthorizedDesktopSender(primaryContents), true);
   assert.equal(lifecycle.isAuthorizedDesktopSender(settingsContents), true);
   assert.equal(lifecycle.isAuthorizedDashboardSender(primaryContents), true);
@@ -2257,6 +2258,30 @@ test("desktop lifecycle owns a bounded Settings window and authorizes only its t
     ),
     false,
   );
+  assert.equal(
+    lifecycle.isAuthorizedSettingsFrame(
+      settingsContents.mainFrame,
+      { sender: settingsContents },
+    ),
+    true,
+  );
+  assert.equal(
+    lifecycle.isAuthorizedSettingsFrame(
+      primaryContents.mainFrame,
+      { sender: primaryContents },
+    ),
+    false,
+  );
+  settingsContents.getURL = () => "http://user:pass@127.0.0.1:4701/electron-settings.html#general";
+  assert.equal(
+    lifecycle.isAuthorizedSettingsFrame(
+      settingsContents.mainFrame,
+      { sender: settingsContents },
+    ),
+    false,
+    "credentials in the live Settings URL must fail closed",
+  );
+  settingsContents.getURL = () => settings.loaded.at(-1) ?? "";
   assert.equal(
     lifecycle.isAuthorizedDesktopFrame(
       { isMainFrame: false, parent: primaryContents.mainFrame },
@@ -2573,6 +2598,10 @@ test("packaged Electron composition keeps the companion in app.asar and uses phy
   assert.equal(spawnCalls.length, 1);
   assert.deepEqual(spawnCalls[0].args, [
     "/private/TiboTattle.app/Contents/Resources/app.asar/apps/local/server.js",
+    "--codex-home",
+    "/Users/adamallcock/.codex",
+    "--primary-codex-home",
+    "/Users/adamallcock/.codex",
   ]);
   assert.equal(
     spawnCalls[0].options.cwd,
@@ -2645,8 +2674,14 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     "version",
     "onCommand",
     "getSettings",
+    "getCodexHomesForSettings",
     "openSettings",
     "chooseCodexHome",
+    "addCodexHome",
+    "editCodexHome",
+    "removeCodexHome",
+    "setPrimaryCodexHome",
+    "reorderCodexHomes",
     "useDefaultCodexHome",
     "setLanguage",
     "setAppearance",
@@ -2697,8 +2732,16 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   unsubscribe();
   assert.equal(commandListeners.size, 0);
   await bridge.getSettings();
+  await bridge.getCodexHomesForSettings();
   await bridge.openSettings();
   await bridge.chooseCodexHome();
+  await bridge.addCodexHome();
+  await bridge.editCodexHome({ rootId: "11111111-1111-4111-8111-111111111111" });
+  await bridge.removeCodexHome({ rootId: "11111111-1111-4111-8111-111111111111" });
+  await bridge.setPrimaryCodexHome({ rootId: "11111111-1111-4111-8111-111111111111" });
+  await bridge.reorderCodexHomes({
+    rootIds: ["11111111-1111-4111-8111-111111111111"],
+  });
   await bridge.useDefaultCodexHome();
   await bridge.setLanguage("en");
   await bridge.setAppearance("dark");
@@ -2722,8 +2765,38 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   await bridge.refreshSettled(1);
   assert.deepEqual(JSON.parse(JSON.stringify(calls.map(({ channel, request }) => ({ channel, request })))), [
     { channel: "tibotattle:desktop:v1", request: { action: "getSettings", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "getCodexHomesForSettings", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "openSettings", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "chooseCodexHome", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "addCodexHome", args: {} } },
+    {
+      channel: "tibotattle:desktop:v1",
+      request: {
+        action: "editCodexHome",
+        args: { rootId: "11111111-1111-4111-8111-111111111111" },
+      },
+    },
+    {
+      channel: "tibotattle:desktop:v1",
+      request: {
+        action: "removeCodexHome",
+        args: { rootId: "11111111-1111-4111-8111-111111111111" },
+      },
+    },
+    {
+      channel: "tibotattle:desktop:v1",
+      request: {
+        action: "setPrimaryCodexHome",
+        args: { rootId: "11111111-1111-4111-8111-111111111111" },
+      },
+    },
+    {
+      channel: "tibotattle:desktop:v1",
+      request: {
+        action: "reorderCodexHomes",
+        args: { rootIds: ["11111111-1111-4111-8111-111111111111"] },
+      },
+    },
     { channel: "tibotattle:desktop:v1", request: { action: "useDefaultCodexHome", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "setLanguage", args: { value: "en" } } },
     { channel: "tibotattle:desktop:v1", request: { action: "setAppearance", args: { value: "dark" } } },
@@ -2768,6 +2841,12 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   for (const operation of [
     () => bridge.onCommand(() => {}, "extra"),
     () => bridge.setLanguage("en", "extra"),
+    () => bridge.getCodexHomesForSettings("extra"),
+    () => bridge.addCodexHome("extra"),
+    () => bridge.editCodexHome({ rootId: "11111111-1111-4111-8111-111111111111" }, "extra"),
+    () => bridge.removeCodexHome({ rootId: "11111111-1111-4111-8111-111111111111" }, "extra"),
+    () => bridge.setPrimaryCodexHome({ rootId: "11111111-1111-4111-8111-111111111111" }, "extra"),
+    () => bridge.reorderCodexHomes({ rootIds: ["11111111-1111-4111-8111-111111111111"] }, "extra"),
     () => bridge.setAppearance("dark", "extra"),
     () => bridge.setRefreshInterval(300, "extra"),
     () => bridge.setStartAtLogin(true, "extra"),

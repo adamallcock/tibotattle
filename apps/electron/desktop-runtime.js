@@ -17,6 +17,11 @@ import {
 } from "./desktop-settings-backends.js";
 import { createDesktopSettingsStore } from "./desktop-settings-store.js";
 import { DESKTOP_APPEARANCES } from "./desktop-contract.js";
+import {
+  isAbsoluteCodexPath,
+  normalizeCodexHomes,
+  normalizeCodexPathForComparison,
+} from "./desktop-codex-roots.js";
 import { desktopText } from "./desktop-copy.js";
 import {
   createDesktopDiagnostics,
@@ -42,6 +47,17 @@ import {
 } from "../../src/platform/index.js";
 
 const DESKTOP_SETTINGS_DIRECTORY = "desktop-settings";
+
+const SETTINGS_CODEX_ROOT_ACTIONS = new Set([
+  "getCodexHomesForSettings",
+  "chooseCodexHome",
+  "addCodexHome",
+  "editCodexHome",
+  "removeCodexHome",
+  "setPrimaryCodexHome",
+  "reorderCodexHomes",
+  "useDefaultCodexHome",
+]);
 
 function assertObject(value, label) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -115,6 +131,24 @@ function runtimeHomeDirectory({ platform, environment }) {
     if (typeof value === "string" && value.length > 0) return value;
   }
   return homedir();
+}
+
+function isWindowsCodexPath(value) {
+  return typeof value === "string"
+    && (/^[A-Za-z]:[\\/]/u.test(value) || /^\\\\/u.test(value));
+}
+
+function isPlatformCodexPath(value, platform) {
+  if (!isAbsoluteCodexPath(value)) return false;
+  if (platform === "win32") {
+    // The lexical root model is deliberately cross-platform, but a child on
+    // Windows must never receive a POSIX spelling that the Win32 APIs would
+    // reinterpret as relative/current-drive state.
+    return isWindowsCodexPath(value);
+  }
+  // Conversely, do not reinterpret a drive/UNC path on macOS or Linux. The
+  // native picker and the companion must agree on the host path grammar.
+  return value.startsWith("/") && !isWindowsCodexPath(value);
 }
 
 function assertNoWindowsTestOverrides({
@@ -371,11 +405,27 @@ export async function launchDesktopRuntime({
     throw new TypeError("BrowserWindow is required");
   }
   const childEnvironment = childEnvironmentWithStateRoot({ app, environment });
+  // Keep one mutable argument vector for the lifetime of this runtime. The
+  // supervisor snapshots it for each spawn, so a Settings root change can
+  // persist first, update this vector, and then use the ordinary bounded
+  // lifecycle Retry path without constructing a second supervisor.
+  const companionArgs = [paths.companionScript];
+  const {
+    args: ignoredSupervisorArgs,
+    command: ignoredSupervisorCommand,
+    cwd: ignoredSupervisorCwd,
+    environment: ignoredSupervisorEnvironment,
+    ...safeSupervisorOptions
+  } = supervisorOptions;
+  void ignoredSupervisorArgs;
+  void ignoredSupervisorCommand;
+  void ignoredSupervisorCwd;
+  void ignoredSupervisorEnvironment;
   const supervisor = createCompanionSupervisor({
+    ...safeSupervisorOptions,
     command: process.execPath,
-    args: [paths.companionScript],
+    args: companionArgs,
     cwd: paths.companionCwd,
-    ...supervisorOptions,
     environment: childEnvironment,
   });
   const services = platformServices ?? runtimePlatformServices({
@@ -676,8 +726,68 @@ export async function launchDesktopRuntime({
     if (home.mode === "custom") {
       childEnvironment.CODEX_HOME = home.path;
     } else {
-      delete childEnvironment.CODEX_HOME;
+      childEnvironment.CODEX_HOME = services.defaultCodexHome
+        ?? join(runtimeHomeDirectory({ platform, environment }), ".codex");
     }
+  }
+
+  function effectiveCodexHomes(configuration) {
+    let selected;
+    try {
+      selected = normalizeCodexHomes(configuration);
+    } catch {
+      throw shellError("desktop_codex_roots_invalid");
+    }
+    const resolvedRoots = [];
+    const seen = new Set();
+    for (const root of selected.activityRoots) {
+      let path = root.kind === "default"
+        ? services.defaultCodexHome
+          ?? join(runtimeHomeDirectory({ platform, environment }), ".codex")
+        : root.path;
+      if (typeof path !== "string" || !isPlatformCodexPath(path, platform)) {
+        throw shellError("desktop_codex_roots_invalid");
+      }
+      // Tests can compose a Win32 runtime on a POSIX host. Do not run a
+      // Windows drive/UNC spelling through the host's node:path resolver;
+      // the real Windows process already treats it as absolute.
+      if (platform !== "win32" && !isWindowsCodexPath(path)) path = resolve(path);
+      let comparison;
+      try {
+        comparison = normalizeCodexPathForComparison(path);
+      } catch {
+        throw shellError("desktop_codex_roots_invalid");
+      }
+      // The default sentinel is a physical root too. Reject a custom root
+      // that resolves to the same location before mutating child argv/env;
+      // otherwise the local companion would silently double-read one root.
+      if (seen.has(comparison)) throw shellError("desktop_codex_roots_invalid");
+      seen.add(comparison);
+      resolvedRoots.push(Object.freeze({ root, path }));
+    }
+    const primary = resolvedRoots.find(
+      ({ root }) => root.rootId === selected.primaryRootId,
+    );
+    if (!primary) throw shellError("desktop_codex_roots_invalid");
+    return Object.freeze({
+      configuration: selected,
+      roots: Object.freeze(resolvedRoots),
+      primaryPath: primary.path,
+    });
+  }
+
+  function assignCodexHomes(configuration) {
+    const selected = effectiveCodexHomes(configuration);
+    const nextArguments = [];
+    for (const { path } of selected.roots) {
+      nextArguments.push("--codex-home", path);
+    }
+    nextArguments.push("--primary-codex-home", selected.primaryPath);
+    // Mutate in place so createCompanionSupervisor's closure sees the exact
+    // candidate on its next start, while preserving the script at argv[0].
+    companionArgs.splice(1, companionArgs.length - 1, ...nextArguments);
+    childEnvironment.CODEX_HOME = selected.primaryPath;
+    return selected;
   }
 
   async function applyCodexHome(home, previous) {
@@ -685,6 +795,17 @@ export async function launchDesktopRuntime({
     // Initialization has no running child. Every subsequent selection uses
     // the lifecycle's bounded stop/start path, so no unbounded direct spawn is
     // introduced by the settings bridge.
+    if (previous !== null && previous !== undefined) {
+      if (lifecycle === null) throw shellError("companion_not_running");
+      await lifecycle.retry();
+    }
+  }
+
+  async function applyCodexHomes(configuration, previous) {
+    assignCodexHomes(configuration);
+    // Initialization has no running child. All later updates are a bounded
+    // stop/start through lifecycle.retry; if it fails the persisted config and
+    // this argv/env candidate intentionally remain in place for Retry.
     if (previous !== null && previous !== undefined) {
       if (lifecycle === null) throw shellError("companion_not_running");
       await lifecycle.retry();
@@ -701,6 +822,7 @@ export async function launchDesktopRuntime({
     notificationCoordinator,
     getLifecycle: () => facade ?? lifecycle,
     applyCodexHome,
+    applyCodexHomes,
     validateCodexHome,
     sendDashboardCommand,
     onLanguageChanged: (value) => updateDesktopLanguage(value),
@@ -854,6 +976,12 @@ export async function launchDesktopRuntime({
         trustedSender: (sender, event) => lifecycle?.isAuthorizedDesktopSender?.(sender, event) === true,
         trustedFrame: (frame, event) => lifecycle?.isAuthorizedDesktopFrame?.(frame, event) === true,
         trustedAction: (action, event) => {
+          if (SETTINGS_CODEX_ROOT_ACTIONS.has(action)) {
+            return lifecycle?.isAuthorizedSettingsFrame?.(
+              event?.senderFrame,
+              { sender: event?.sender },
+            ) === true;
+          }
           if (action !== "refreshStarted" && action !== "refreshSettled") return true;
           return lifecycle?.isAuthorizedDashboardFrame?.(
             event?.senderFrame,
@@ -912,6 +1040,7 @@ export async function launchDesktopRuntime({
     isAuthorizedDesktopFrame: lifecycle.isAuthorizedDesktopFrame,
     isAuthorizedDashboardSender: lifecycle.isAuthorizedDashboardSender,
     isAuthorizedDashboardFrame: lifecycle.isAuthorizedDashboardFrame,
+    isAuthorizedSettingsFrame: lifecycle.isAuthorizedSettingsFrame,
     isAuthorizedDesktopDownloadContext: lifecycle.isAuthorizedDesktopDownloadContext,
     revealLatestDownload: lifecycle.revealLatestDownload,
     get state() {
