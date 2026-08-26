@@ -54,7 +54,12 @@ test("semantic tray states project fixed status copy in every supported locale",
       assert.equal(template[0].label, expectedTitle);
       assert.equal(template[1].label, expected);
       assert.equal(template[1].enabled, false);
-      assert.equal(template.filter((entry) => entry.enabled === false).length, 2);
+      assert.equal(template.filter((entry) => entry.enabled === false).length, 3);
+      const checkForUpdates = template.find((entry) => entry.label === "Check for Updates…"
+        || entry.label === "检查更新…"
+        || entry.label === "Buscar actualizaciones…");
+      assert.ok(checkForUpdates);
+      assert.equal(checkForUpdates.enabled, false);
       assert.equal(template.some((entry, index) => index > 1 && (entry.label?.includes("allowance")
         || entry.label?.includes("配额")
         || entry.label?.includes("Cuota"))), false);
@@ -96,6 +101,7 @@ test("fresh direct evidence projects compact title, evidence age, and quota lane
     "separator",
     "Open TiboTattle Dev",
     "Update Local Usage",
+    "Check for Updates…",
     "Settings…",
     "About TiboTattle Dev",
     "separator",
@@ -175,6 +181,7 @@ test("default and legacy label callers remain bounded and preserve action identi
     "separator",
     "Open TiboTattle Dev",
     "Update Local Usage",
+    "Check for Updates…",
     "Retry",
     "Settings…",
     "About TiboTattle Dev",

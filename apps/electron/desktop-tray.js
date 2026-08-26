@@ -10,6 +10,7 @@ import { isAbsolute, join } from "node:path";
 import {
   createDesktopActionInterface,
   desktopText,
+  getDesktopOptionalAction,
 } from "./desktop-menu.js";
 import {
   projectDesktopTrayStatus,
@@ -44,6 +45,10 @@ export function createDesktopTrayTemplate({
     throw new TypeError("appName is required");
   }
   const boundedActions = createDesktopActionInterface(actions);
+  const checkForUpdates = getDesktopOptionalAction(
+    boundedActions,
+    "checkForUpdates",
+  );
   const textOptions = { locale, systemLocales };
   let projectedStatus;
   if (trayStatus !== undefined) {
@@ -117,6 +122,15 @@ export function createDesktopTrayTemplate({
       label: desktopText("electron.tray.refresh", {}, textOptions),
       click: boundedActions.refresh,
       accelerator: "CmdOrCtrl+R",
+    },
+    // Keep the native status-menu affordance visible even in the Electron
+    // development shell, where no updater action is wired. A disabled item
+    // makes the capability boundary explicit without pretending that a check
+    // happened or allowing a click to cross into an unowned updater path.
+    {
+      label: desktopText("electron.tray.checkForUpdates", {}, textOptions),
+      enabled: checkForUpdates !== null,
+      ...(checkForUpdates === null ? {} : { click: checkForUpdates }),
     },
     {
       label: desktopText("electron.tray.settings", {}, textOptions),

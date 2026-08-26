@@ -84,7 +84,7 @@ test("application menu maps all desktop commands to the injected action interfac
   assert.deepEqual(edit.map(({ role }) => role), ["copy", "selectAll"]);
 
   const view = template.find(({ label }) => label === "View").submenu;
-  item(view, "Refresh Usage").click();
+  item(view, "Update Local Usage").click();
   item(view, "Toggle Sidebar").click();
   item(view, "Show TiboTattle Dev").click();
   item(view, "Focus TiboTattle Dev").click();
@@ -97,7 +97,7 @@ test("application menu maps all desktop commands to the injected action interfac
     "show",
     "focus",
   ]);
-  assert.equal(item(view, "Refresh Usage").accelerator, "CmdOrCtrl+R");
+  assert.equal(item(view, "Update Local Usage").accelerator, "CmdOrCtrl+R");
   assert.equal(item(view, "Toggle Sidebar").accelerator, "CmdOrCtrl+Shift+S");
 
   const windowMenu = template.find(({ label }) => label === "Window").submenu;
@@ -135,7 +135,8 @@ test("desktop menu and tray copy resolves every supported language", () => {
   const expected = {
     "en-US": {
       file: "File",
-      refresh: "Refresh Usage",
+      refresh: "Update Local Usage",
+      checkForUpdates: "Check for Updates…",
       tray: "Open TiboTattle Dev",
       update: "Update Local Usage",
       quit: "Quit TiboTattle Dev",
@@ -143,7 +144,8 @@ test("desktop menu and tray copy resolves every supported language", () => {
     },
     "zh-Hans": {
       file: "文件",
-      refresh: "刷新使用情况",
+      refresh: "更新本地使用情况",
+      checkForUpdates: "检查更新…",
       tray: "打开 TiboTattle Dev",
       update: "更新本地使用情况",
       quit: "退出 TiboTattle Dev",
@@ -151,7 +153,8 @@ test("desktop menu and tray copy resolves every supported language", () => {
     },
     es: {
       file: "Archivo",
-      refresh: "Actualizar uso",
+      refresh: "Actualizar uso local",
+      checkForUpdates: "Buscar actualizaciones…",
       tray: "Abrir TiboTattle Dev",
       update: "Actualizar uso local",
       quit: "Salir de TiboTattle Dev",
@@ -173,6 +176,10 @@ test("desktop menu and tray copy resolves every supported language", () => {
     const tray = createDesktopTrayTemplate({ appName: "TiboTattle Dev", locale });
     assert.equal(tray.find((entry) => entry.label === copy.tray)?.label, copy.tray);
     assert.equal(tray.find((entry) => entry.label === copy.update)?.label, copy.update);
+    const checkForUpdates = tray.find((entry) => entry.label === copy.checkForUpdates);
+    assert.ok(checkForUpdates);
+    assert.equal(checkForUpdates.enabled, false);
+    assert.equal(checkForUpdates.click, undefined);
     assert.equal(tray.find((entry) => entry.label === copy.quit)?.label, copy.quit);
     assert.equal(tray[1].label, copy.status);
   }
@@ -208,6 +215,7 @@ test("tray menu exposes truthful status and shared action callbacks", () => {
     "separator",
     "Open TiboTattle Dev",
     "Update Local Usage",
+    "Check for Updates…",
     "Retry",
     "Settings…",
     "About TiboTattle Dev",
@@ -229,9 +237,23 @@ test("tray menu exposes truthful status and shared action callbacks", () => {
     "about",
     "quit",
   ]);
+  assert.equal(item(template, "Check for Updates…").enabled, false);
+  assert.equal(item(template, "Check for Updates…").click, undefined);
   assert.equal(item(template, "Update Local Usage").accelerator, "CmdOrCtrl+R");
   assert.equal(item(template, "Settings…").accelerator, "CmdOrCtrl+,");
   assert.equal(item(template, "Quit TiboTattle Dev").accelerator, "CmdOrCtrl+Q");
+});
+
+test("tray check-for-updates is enabled only for an injected bounded capability", () => {
+  const calls = [];
+  const template = createDesktopTrayTemplate({
+    appName: "TiboTattle Dev",
+    actions: { checkForUpdates: () => calls.push("checkForUpdates") },
+  });
+  const checkForUpdates = item(template, "Check for Updates…");
+  assert.equal(checkForUpdates.enabled, true);
+  checkForUpdates.click();
+  assert.deepEqual(calls, ["checkForUpdates"]);
 });
 
 function nativeImageFixture({

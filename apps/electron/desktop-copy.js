@@ -412,9 +412,9 @@ const DESKTOP_MESSAGES = Object.freeze({
     es: "Ver",
   }),
   "electron.menu.refresh": Object.freeze({
-    "en-US": "Refresh Usage",
-    "zh-Hans": "刷新使用情况",
-    es: "Actualizar uso",
+    "en-US": "Update Local Usage",
+    "zh-Hans": "更新本地使用情况",
+    es: "Actualizar uso local",
   }),
   "electron.menu.toggleSidebar": Object.freeze({
     "en-US": "Toggle Sidebar",
@@ -505,6 +505,11 @@ const DESKTOP_MESSAGES = Object.freeze({
     "en-US": "Update Local Usage",
     "zh-Hans": "更新本地使用情况",
     es: "Actualizar uso local",
+  }),
+  "electron.tray.checkForUpdates": Object.freeze({
+    "en-US": "Check for Updates…",
+    "zh-Hans": "检查更新…",
+    es: "Buscar actualizaciones…",
   }),
   "electron.tray.retry": Object.freeze({
     "en-US": "Retry",

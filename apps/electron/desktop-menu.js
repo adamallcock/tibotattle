@@ -23,6 +23,7 @@ const DESKTOP_ACTION_NAMES = Object.freeze([
   "quit",
 ]);
 const ACTION_INTERFACES = new WeakSet();
+const OPTIONAL_ACTION_INTERFACES = new WeakMap();
 
 function noOp() {}
 
@@ -57,7 +58,32 @@ export function createDesktopActionInterface(actions = {}) {
     ]),
   ));
   ACTION_INTERFACES.add(boundedActions);
+  // Optional capabilities deliberately stay outside the mandatory lifecycle
+  // action vocabulary. This lets the shell render a disabled affordance for
+  // a capability that is unavailable in development while still allowing a
+  // future signed build to inject a reviewed updater action without widening
+  // the renderer-facing command surface.
+  OPTIONAL_ACTION_INTERFACES.set(boundedActions, Object.freeze({
+    checkForUpdates: typeof actions.checkForUpdates === "function"
+      ? actions.checkForUpdates
+      : null,
+  }));
   return boundedActions;
+}
+
+/**
+ * Return one optional main-process capability from a bounded action object.
+ * Unknown capabilities are intentionally indistinguishable from an absent
+ * capability so callers cannot accidentally turn arbitrary functions into
+ * menu commands.
+ */
+export function getDesktopOptionalAction(actions, name) {
+  if (actions === null || typeof actions !== "object" || Array.isArray(actions)) {
+    return null;
+  }
+  if (name !== "checkForUpdates") return null;
+  const boundedActions = createDesktopActionInterface(actions);
+  return OPTIONAL_ACTION_INTERFACES.get(boundedActions)?.[name] ?? null;
 }
 
 function actionItem(label, action, options = {}) {
