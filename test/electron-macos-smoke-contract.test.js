@@ -11,6 +11,9 @@ import {
   ELECTRON_MACOS_SMOKE_DEGRADED_FAILURE_CODES,
   ELECTRON_MACOS_SMOKE_STARTUP_REFRESH_ERROR_CODES,
   hasMeaningfulMacCostEvidence,
+  isMacPathFreeSettingsSnapshot,
+  isMacPathfulCodexHomes,
+  classifyMacSettingsEvidence,
   isMacDashboardTarget,
   isMacSettingsTarget,
   observeLocalRefreshRequests,
@@ -56,6 +59,9 @@ test("macOS Electron smoke is an explicit packaged arm64 lane", async () => {
   assert.match(source, /USAGE_MONITOR_STATE_ROOT/u);
   assert.match(source, /CODEX_HOME/u);
   assert.match(source, /desktop-first-run-v1\.json/u);
+  assert.match(source, /desktop-settings-v1\.json/u);
+  assert.match(source, /secondaryCodexHome/u);
+  assert.match(source, /DESKTOP_SETTINGS_SCHEMA_VERSION/u);
   assert.match(source, /USAGE_MONITOR_ELECTRON_SMOKE_CONTROL/u);
   assert.match(source, /Page\.enable/u);
   assert.match(source, /Network\.enable/u);
@@ -82,6 +88,14 @@ test("macOS Electron smoke is an explicit packaged arm64 lane", async () => {
   assert.match(source, /selectMacDashboardTarget/u);
   assert.match(source, /isMacSettingsTarget/u);
   assert.match(source, /selectMacSettingsTarget/u);
+  assert.match(source, /getCodexHomesForSettings/u);
+  assert.match(source, /genericSnapshotPathFree/u);
+  assert.match(source, /pathfulRead/u);
+  assert.match(source, /settings-codex-roots/u);
+  assert.match(source, /settings-primary-codex-root/u);
+  assert.match(source, /settings-add-codex-root/u);
+  assert.match(source, /isMacPathFreeSettingsSnapshot/u);
+  assert.match(source, /classifyMacSettingsEvidence/u);
   assert.match(source, /__TIBOTATTLE_ELECTRON_MACOS_SMOKE__/u);
   assert.match(source, /bindMacSmokeRefreshObserver/u);
   assert.match(source, /releaseMacSmokeRefreshGate/u);
@@ -256,6 +270,205 @@ test("macOS smoke selects Settings only for the exact dashboard origin and CDP p
   assert.equal(
     isMacSettingsTarget(valid, `http://127.0.0.1:${dashboardPort + 1}`, debugPort),
     false,
+  );
+});
+
+test("macOS Settings smoke requires multi-root semantics and separate pathful read", () => {
+  const defaultRootId = "00000000-0000-4000-8000-000000000001";
+  const customRootId = "11111111-1111-4111-8111-111111111111";
+  const genericSettings = {
+    settings: {
+      codexHomes: {
+        activityRoots: [
+          { rootId: defaultRootId, kind: "default", enabled: true },
+          { rootId: customRootId, kind: "custom", enabled: true },
+        ],
+        primaryRootId: defaultRootId,
+      },
+    },
+  };
+  const pathfulRoots = {
+    activityRoots: [
+      {
+        rootId: defaultRootId,
+        kind: "default",
+        path: null,
+        enabled: true,
+      },
+      {
+        rootId: customRootId,
+        kind: "custom",
+        path: "/tmp/tibotattle-electron-macos-secondary",
+        enabled: true,
+      },
+    ],
+    primaryRootId: defaultRootId,
+  };
+  assert.equal(isMacPathFreeSettingsSnapshot(genericSettings), true);
+  assert.equal(isMacPathfulCodexHomes(pathfulRoots), true);
+  assert.deepEqual(
+    classifyMacSettingsEvidence({
+      rootCount: 2,
+      renderedRootCount: 2,
+      primaryRadioCount: 2,
+      selectedPrimaryCount: 1,
+      selectedPrimaryRootId: defaultRootId,
+      primaryCardCount: 1,
+      listRole: true,
+      cardsHaveSemantics: true,
+      addPresent: true,
+      addDisabled: false,
+      genericSettings,
+      genericDashboardSettings: genericSettings,
+      pathfulRoots,
+    }),
+    {
+      status: "passed",
+      rootCount: 2,
+      renderedRootCount: 2,
+      primarySelected: true,
+      listSemantics: true,
+      addPresent: true,
+      addEnabled: true,
+      genericSnapshotPathFree: true,
+      pathfulRead: true,
+    },
+  );
+  assert.equal(
+    isMacPathFreeSettingsSnapshot({
+      settings: {
+        codexHomes: {
+          activityRoots: [
+            {
+              rootId: customRootId,
+              kind: "custom",
+              enabled: true,
+              path: "/tmp/should-not-cross-the-generic-boundary",
+            },
+          ],
+          primaryRootId: customRootId,
+        },
+      },
+    }),
+    false,
+  );
+  for (const invalid of [
+    { selectedPrimaryCount: 2 },
+    { primaryCardCount: 0 },
+    { listRole: false },
+    { cardsHaveSemantics: false },
+    { addPresent: false },
+    { addDisabled: true },
+    {
+      genericDashboardSettings: {
+        settings: {
+          codexHomes: {
+            activityRoots: [
+              {
+                rootId: customRootId,
+                kind: "custom",
+                enabled: true,
+                path: "/tmp/should-not-cross-the-dashboard-boundary",
+              },
+            ],
+            primaryRootId: customRootId,
+          },
+        },
+      },
+    },
+    { pathfulRoots: { ...pathfulRoots, primaryRootId: customRootId } },
+  ]) {
+    assert.equal(
+      classifyMacSettingsEvidence({
+        rootCount: 2,
+        renderedRootCount: 2,
+        primaryRadioCount: 2,
+        selectedPrimaryCount: 1,
+        selectedPrimaryRootId: defaultRootId,
+        primaryCardCount: 1,
+        listRole: true,
+        cardsHaveSemantics: true,
+        addPresent: true,
+        addDisabled: false,
+        genericSettings,
+        genericDashboardSettings: genericSettings,
+        pathfulRoots,
+        ...invalid,
+      }).status,
+      "failed",
+    );
+  }
+});
+
+test("macOS Settings smoke requires Add to be disabled exactly at the root limit", () => {
+  const defaultRootId = "00000000-0000-4000-8000-000000000001";
+  const customRootIds = [
+    "22222222-2222-4222-8222-222222222222",
+    "33333333-3333-4333-8333-333333333333",
+    "44444444-4444-4444-8444-444444444444",
+    "55555555-5555-4555-8555-555555555555",
+    "66666666-6666-4666-8666-666666666666",
+    "77777777-7777-4777-8777-777777777777",
+    "88888888-8888-4888-8888-888888888888",
+  ];
+  const roots = [
+    {
+      rootId: defaultRootId,
+      kind: "default",
+      path: null,
+      enabled: true,
+    },
+    ...customRootIds.map((rootId, index) => ({
+      rootId,
+      kind: "custom",
+      path: `/tmp/tibotattle-electron-macos-secondary-${index + 1}`,
+      enabled: true,
+    })),
+  ];
+  const pathfulRoots = { activityRoots: roots, primaryRootId: defaultRootId };
+  const genericSettings = {
+    settings: {
+      codexHomes: {
+        activityRoots: roots.map(({ rootId, kind, enabled }) => ({
+          rootId,
+          kind,
+          enabled,
+        })),
+        primaryRootId: defaultRootId,
+      },
+    },
+  };
+  const base = {
+    rootCount: 8,
+    renderedRootCount: 8,
+    primaryRadioCount: 8,
+    selectedPrimaryCount: 1,
+    selectedPrimaryRootId: defaultRootId,
+    primaryCardCount: 1,
+    listRole: true,
+    cardsHaveSemantics: true,
+    addPresent: true,
+    genericSettings,
+    genericDashboardSettings: genericSettings,
+    pathfulRoots,
+  };
+  assert.deepEqual(
+    classifyMacSettingsEvidence({ ...base, addDisabled: true }),
+    {
+      status: "passed",
+      rootCount: 8,
+      renderedRootCount: 8,
+      primarySelected: true,
+      listSemantics: true,
+      addPresent: true,
+      addEnabled: false,
+      genericSnapshotPathFree: true,
+      pathfulRead: true,
+    },
+  );
+  assert.equal(
+    classifyMacSettingsEvidence({ ...base, addDisabled: false }).status,
+    "failed",
   );
 });
 
@@ -626,7 +839,19 @@ test("closed macOS receipt is content-free and has no runtime identifiers", () =
         partialHistoryDetail: false,
       },
     },
-    settings: { connected: true, tabCount: 3, tabs: true },
+    settings: {
+      connected: true,
+      tabCount: 3,
+      tabs: true,
+      rootCount: 2,
+      renderedRootCount: 2,
+      primarySelected: true,
+      listSemantics: true,
+      addPresent: true,
+      addEnabled: true,
+      genericSnapshotPathFree: true,
+      pathfulRead: true,
+    },
     share: {
       route: "#weekly",
       panelVisible: true,
@@ -657,6 +882,16 @@ test("closed macOS receipt is content-free and has no runtime identifiers", () =
   assert.equal(receipt.parity.community.currentLayout, true);
   assert.equal(receipt.parity.community.partialHistoryDetail, false);
   assert.equal(receipt.settings.connected, true);
+  assert.equal(receipt.settings.rootCount, 2);
+  assert.equal(receipt.settings.renderedRootCount, 2);
+  assert.equal(receipt.settings.primarySelected, true);
+  assert.equal(receipt.settings.listSemantics, true);
+  assert.equal(receipt.settings.addPresent, true);
+  assert.equal(receipt.settings.addEnabled, true);
+  assert.equal(receipt.settings.genericSnapshotPathFree, true);
+  assert.equal(receipt.settings.pathfulRead, true);
+  assert.equal(Object.hasOwn(receipt.settings, "path"), false);
+  assert.equal(Object.hasOwn(receipt.settings, "activityRoots"), false);
   assert.equal(receipt.share.route, "#weekly");
   assert.equal(Object.hasOwn(receipt, "refreshId"), false);
   assert.equal(Object.hasOwn(receipt, "dashboardOrigin"), false);

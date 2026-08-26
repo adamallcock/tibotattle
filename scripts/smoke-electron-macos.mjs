@@ -36,6 +36,12 @@ import { fileURLToPath } from "node:url";
 import {
   DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
 } from "../apps/electron/desktop-first-run.js";
+import {
+  DESKTOP_DEFAULT_CODEX_ROOT_ID,
+} from "../apps/electron/desktop-codex-roots.js";
+import {
+  DESKTOP_SETTINGS_SCHEMA_VERSION,
+} from "../apps/electron/desktop-contract.js";
 
 const MAX_STARTUP_MS = 30_000;
 const MAX_OPERATION_MS = 10_000;
@@ -45,6 +51,9 @@ const MACOS_SMOKE_SCHEMA_VERSION = "tibotattle-electron-macos-smoke-v2";
 const MACOS_SMOKE_CONTROL = "quit-v1";
 const REQUIRED_APP_NAME = "TiboTattle Dev";
 const CLI_FAILURE_STATUS = "ELECTRON_MACOS_SMOKE_FAILED";
+const MACOS_SMOKE_CODEX_ROOT_LIMIT = 8;
+const MACOS_SMOKE_CODEX_ROOT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const MACOS_SMOKE_CUSTOM_CODEX_ROOT_ID = "11111111-1111-4111-8111-111111111111";
 
 export const ELECTRON_MACOS_SMOKE_STARTUP_REFRESH_ERROR_CODES = Object.freeze({
   duplicate: "ELECTRON_MACOS_SMOKE_STARTUP_REFRESH_DUPLICATED",
@@ -321,8 +330,10 @@ async function createSyntheticFixture() {
   const profile = join(root, "profile");
   const home = join(profile, "home");
   const codexHome = join(home, ".codex");
+  const secondaryCodexHome = join(profile, "codex-secondary");
   const claudeHome = join(home, ".claude");
   const sessions = join(codexHome, "sessions");
+  const secondarySessions = join(secondaryCodexHome, "sessions");
   const archivedSessions = join(codexHome, "archived_sessions");
   const stateRoot = join(profile, "state");
   const userData = join(profile, "user-data");
@@ -336,7 +347,9 @@ async function createSyntheticFixture() {
     profile,
     home,
     codexHome,
+    secondaryCodexHome,
     sessions,
+    secondarySessions,
     archivedSessions,
     claudeHome,
     stateRoot,
@@ -400,10 +413,53 @@ async function createSyntheticFixture() {
       `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`,
       { mode: 0o600 },
     );
+    const secondaryRows = rows.map((row) => row.type === "session_meta"
+      ? { ...row, payload: { id: "macos-electron-smoke-secondary" } }
+      : row);
+    await writeFile(
+      join(secondarySessions, "rollout-macos-electron-smoke-secondary.jsonl"),
+      `${secondaryRows.map((row) => JSON.stringify(row)).join("\n")}\n`,
+      { mode: 0o600 },
+    );
     await writeFile(join(codexHome, "config.toml"), 'service_tier = "standard"\n', {
       mode: 0o600,
     });
     await writeFile(join(claudeHome, "settings.json"), "{}\n", { mode: 0o600 });
+
+    // Seed one custom root so the Settings smoke exercises the real pathful
+    // settings-only read.  The dashboard-facing getSettings() projection is
+    // still checked separately and must not contain this path.
+    await writeFile(
+      join(settingsRoot, "desktop-settings-v1.json"),
+      `${JSON.stringify({
+        schemaVersion: DESKTOP_SETTINGS_SCHEMA_VERSION,
+        codexHomes: {
+          activityRoots: [
+            {
+              rootId: DESKTOP_DEFAULT_CODEX_ROOT_ID,
+              kind: "default",
+              path: null,
+              enabled: true,
+            },
+            {
+              rootId: MACOS_SMOKE_CUSTOM_CODEX_ROOT_ID,
+              kind: "custom",
+              path: secondaryCodexHome,
+              enabled: true,
+            },
+          ],
+          primaryRootId: DESKTOP_DEFAULT_CODEX_ROOT_ID,
+        },
+        language: "system",
+        appearance: "system",
+        refreshIntervalSeconds: 300,
+        startAtLogin: false,
+        notifications: { enabled: false, threshold: "off" },
+        sidebarCollapsed: false,
+      })}\n`,
+      { mode: 0o600 },
+    );
+    await chmod(join(settingsRoot, "desktop-settings-v1.json"), 0o600);
 
     // This is a returning-user qualification fixture.  It uses the same
     // content-free receipt validated by the production POSIX backend and
@@ -423,6 +479,7 @@ async function createSyntheticFixture() {
       profile,
       home,
       codexHome,
+      secondaryCodexHome,
       claudeHome,
       stateRoot,
       userData,
@@ -854,6 +911,193 @@ export function hasMeaningfulMacCostEvidence(value) {
     return true;
   }
   return /\b(?:unavailable|not\s+(?:priced|reported|available|provided)|(?:no|without)\s+(?:published\s+)?price|(?:price|cost)\s+(?:unavailable|withheld|not\s+(?:available|provided))|separate\s+allowance|withheld)\b/iu.test(text);
+}
+
+function isPlainSmokeRecord(value) {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.getPrototypeOf(value) === Object.prototype;
+}
+
+function hasExactSmokeKeys(value, keys) {
+  return isPlainSmokeRecord(value)
+    && Reflect.ownKeys(value).length === keys.length
+    && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function looksLikeAbsoluteSmokePath(value) {
+  return typeof value === "string"
+    && (/^\//u.test(value)
+      || /^[A-Za-z]:[\\/]/u.test(value)
+      || /^\\\\/u.test(value));
+}
+
+function containsSmokePath(value, seen = new Set()) {
+  if (typeof value === "string") return looksLikeAbsoluteSmokePath(value);
+  if (value === null || typeof value !== "object") return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) return value.some((entry) => containsSmokePath(entry, seen));
+  return Object.entries(value).some(([key, entry]) => /path/iu.test(key)
+    || containsSmokePath(entry, seen));
+}
+
+/**
+ * Validate the renderer-facing Codex-root metadata projection.  This is kept
+ * deliberately stricter than a "no path property" check: every root must use
+ * the path-free shape, and unexpected path-like values anywhere in the
+ * generic desktop snapshot fail the smoke.
+ */
+export function isMacPathFreeSettingsSnapshot(value) {
+  if (!isPlainSmokeRecord(value)) return false;
+  const settings = isPlainSmokeRecord(value.settings) ? value.settings : value;
+  const homes = settings.codexHomes;
+  if (!isPlainSmokeRecord(homes)
+      || !hasExactSmokeKeys(homes, ["activityRoots", "primaryRootId"])
+      || !Array.isArray(homes.activityRoots)
+      || homes.activityRoots.length < 1
+      || homes.activityRoots.length > MACOS_SMOKE_CODEX_ROOT_LIMIT
+      || !MACOS_SMOKE_CODEX_ROOT_ID_PATTERN.test(homes.primaryRootId)) {
+    return false;
+  }
+  const ids = new Set();
+  for (const root of homes.activityRoots) {
+    if (!hasExactSmokeKeys(root, ["rootId", "kind", "enabled"])
+        || !MACOS_SMOKE_CODEX_ROOT_ID_PATTERN.test(root.rootId)
+        || !["default", "custom"].includes(root.kind)
+        || root.enabled !== true
+        || ids.has(root.rootId)) {
+      return false;
+    }
+    ids.add(root.rootId);
+  }
+  return ids.has(homes.primaryRootId) && !containsSmokePath(value);
+}
+
+/** Validate the settings-only projection, which may carry pathful roots. */
+export function isMacPathfulCodexHomes(value) {
+  if (!isPlainSmokeRecord(value)
+      || !hasExactSmokeKeys(value, ["activityRoots", "primaryRootId"])
+      || !Array.isArray(value.activityRoots)
+      || value.activityRoots.length < 1
+      || value.activityRoots.length > MACOS_SMOKE_CODEX_ROOT_LIMIT
+      || !MACOS_SMOKE_CODEX_ROOT_ID_PATTERN.test(value.primaryRootId)) {
+    return false;
+  }
+  const ids = new Set();
+  let primaryCount = 0;
+  let defaultCount = 0;
+  for (const root of value.activityRoots) {
+    if (!hasExactSmokeKeys(root, ["rootId", "kind", "path", "enabled"])
+        || !MACOS_SMOKE_CODEX_ROOT_ID_PATTERN.test(root.rootId)
+        || !["default", "custom"].includes(root.kind)
+        || root.enabled !== true
+        || ids.has(root.rootId)) {
+      return false;
+    }
+    ids.add(root.rootId);
+    if (root.rootId === value.primaryRootId) primaryCount += 1;
+    if (root.kind === "default") {
+      if (++defaultCount > 1
+          || root.rootId !== DESKTOP_DEFAULT_CODEX_ROOT_ID
+          || root.path !== null) {
+        return false;
+      }
+    } else if (root.rootId === DESKTOP_DEFAULT_CODEX_ROOT_ID
+        || !looksLikeAbsoluteSmokePath(root.path)) {
+      return false;
+    }
+  }
+  return ids.has(value.primaryRootId) && primaryCount === 1;
+}
+
+/**
+ * Classify only content-free Settings evidence.  The returned object is safe
+ * to put in a smoke receipt: it contains counts/booleans, never root paths or
+ * renderer snapshots.
+ */
+export function classifyMacSettingsEvidence({
+  rootCount = 0,
+  renderedRootCount = 0,
+  primaryRadioCount = 0,
+  selectedPrimaryCount = 0,
+  primaryCardCount = 0,
+  selectedPrimaryRootId = null,
+  listRole = false,
+  cardsHaveSemantics = false,
+  addPresent = false,
+  addDisabled = true,
+  genericSettings = null,
+  genericDashboardSettings = null,
+  pathfulRoots = null,
+} = {}) {
+  const normalizedRootCount = Number.isInteger(rootCount) ? rootCount : 0;
+  const normalizedRenderedRootCount = Number.isInteger(renderedRootCount)
+    ? renderedRootCount
+    : 0;
+  const belowLimit = normalizedRootCount >= 1
+    && normalizedRootCount < MACOS_SMOKE_CODEX_ROOT_LIMIT;
+  const genericSnapshotPathFree = isMacPathFreeSettingsSnapshot(genericSettings)
+    && isMacPathFreeSettingsSnapshot(genericDashboardSettings);
+  const pathfulRead = isMacPathfulCodexHomes(pathfulRoots);
+  const genericHomes = isPlainSmokeRecord(genericSettings?.settings)
+    ? genericSettings.settings.codexHomes
+    : genericSettings?.codexHomes;
+  const genericDashboardHomes = isPlainSmokeRecord(genericDashboardSettings?.settings)
+    ? genericDashboardSettings.settings.codexHomes
+    : genericDashboardSettings?.codexHomes;
+  const primaryIdentityMatches = typeof selectedPrimaryRootId === "string"
+    && selectedPrimaryRootId === genericHomes?.primaryRootId
+    && selectedPrimaryRootId === genericDashboardHomes?.primaryRootId
+    && selectedPrimaryRootId === pathfulRoots?.primaryRootId;
+  const primarySelected = normalizedRootCount >= 1
+    && primaryRadioCount === normalizedRootCount
+    && selectedPrimaryCount === 1
+    && primaryCardCount === 1
+    && primaryIdentityMatches;
+  const listSemantics = listRole === true && cardsHaveSemantics === true;
+  const addEnabled = addPresent === true && addDisabled === false;
+  const addSemantics = addPresent === true
+    && (belowLimit ? addDisabled === false : addDisabled === true);
+  const pathfulRootCount = Array.isArray(pathfulRoots?.activityRoots)
+    ? pathfulRoots.activityRoots.length
+    : 0;
+  const genericRootCount = Array.isArray(genericSettings?.settings?.codexHomes?.activityRoots)
+    ? genericSettings.settings.codexHomes.activityRoots.length
+    : Array.isArray(genericSettings?.codexHomes?.activityRoots)
+      ? genericSettings.codexHomes.activityRoots.length
+      : 0;
+  const genericDashboardRootCount = Array.isArray(
+    genericDashboardSettings?.settings?.codexHomes?.activityRoots,
+  )
+    ? genericDashboardSettings.settings.codexHomes.activityRoots.length
+    : Array.isArray(genericDashboardSettings?.codexHomes?.activityRoots)
+      ? genericDashboardSettings.codexHomes.activityRoots.length
+      : 0;
+  const status = normalizedRootCount >= 1
+    && normalizedRenderedRootCount >= 1
+    && normalizedRenderedRootCount === normalizedRootCount
+    && primarySelected
+    && listSemantics
+    && addSemantics
+    && genericSnapshotPathFree
+    && pathfulRead
+    && pathfulRootCount === normalizedRootCount
+    && genericRootCount === normalizedRootCount
+    && genericDashboardRootCount === normalizedRootCount;
+
+  return Object.freeze({
+    status: status ? "passed" : "failed",
+    rootCount: normalizedRootCount,
+    renderedRootCount: normalizedRenderedRootCount,
+    primarySelected,
+    listSemantics,
+    addPresent: addPresent === true,
+    addEnabled,
+    genericSnapshotPathFree,
+    pathfulRead,
+  });
 }
 
 async function assertDashboardShell(cdp) {
@@ -1309,6 +1553,9 @@ async function findSettingsTarget(port, dashboardOrigin) {
 }
 
 async function assertSettingsFlow(cdp, port, dashboardOrigin) {
+  const genericDashboardSettings = await cdp.evaluate(
+    "globalThis.tibotattleDesktop?.getSettings?.()",
+  );
   await cdp.evaluate("document.querySelector('#electron-settings-button')?.click()");
   const target = await waitFor(
     () => findSettingsTarget(port, dashboardOrigin),
@@ -1359,7 +1606,71 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin) {
     if (tabs?.notificationsVisible !== true || tabs?.aboutVisible !== true) {
       fail("ELECTRON_MACOS_SMOKE_SETTINGS_TABS_INVALID", "settings");
     }
-    return Object.freeze({ connected: true, tabCount: 3, tabs: true });
+    // The root list lives on General. Return to that panel before collecting
+    // rendered-root evidence; otherwise a semantically correct list would be
+    // hidden behind the About tab and look like an empty UI.
+    await settingsCdp.evaluate(
+      "document.querySelector('[data-settings-tab=\"general\"]')?.click(); true",
+    );
+    const evidence = await settingsCdp.evaluate(`(async () => {
+      const visible = ${visible.toString()};
+      const list = document.querySelector("#settings-codex-roots");
+      const cards = list === null
+        ? []
+        : [...list.children].filter((element) => element.getAttribute("role") === "listitem");
+      const radios = [...document.querySelectorAll(
+        '#settings-codex-roots input[type="radio"][name="settings-primary-codex-root"]',
+      )];
+      const selected = radios.filter((input) => input.checked === true);
+      const primaryCards = cards.filter((card) => card.dataset.primary === "true");
+      const cardsHaveSemantics = cards.length > 0 && cards.every((card) => {
+        const heading = card.querySelector("h4");
+        const radio = card.querySelector(
+          'input[type="radio"][name="settings-primary-codex-root"]',
+        );
+        return heading !== null
+          && typeof heading.id === "string"
+          && heading.id.startsWith("settings-codex-root-")
+          && card.getAttribute("aria-labelledby") === heading.id
+          && radio !== null
+          && typeof radio.value === "string"
+          && radio.value.length > 0;
+      });
+      const genericSettings = await globalThis.tibotattleDesktop?.getSettings?.();
+      const pathfulRoots = await globalThis.tibotattleDesktop?.getCodexHomesForSettings?.();
+      return {
+        rootCount: cards.length,
+        renderedRootCount: cards.filter(visible).length,
+        primaryRadioCount: radios.length,
+        selectedPrimaryCount: selected.length,
+        selectedPrimaryRootId: selected.length === 1 ? selected[0].value : null,
+        primaryCardCount: primaryCards.length,
+        listRole: list?.getAttribute("role") === "list",
+        cardsHaveSemantics,
+        addPresent: document.querySelector("#settings-add-codex-root") !== null,
+        addDisabled: document.querySelector("#settings-add-codex-root")?.disabled === true,
+        genericSettings,
+        pathfulRoots,
+      };
+    })()`);
+    evidence.genericDashboardSettings = genericDashboardSettings;
+    const settingsEvidence = classifyMacSettingsEvidence(evidence);
+    if (settingsEvidence.status !== "passed") {
+      fail("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
+    }
+    return Object.freeze({
+      connected: true,
+      tabCount: 3,
+      tabs: true,
+      rootCount: settingsEvidence.rootCount,
+      renderedRootCount: settingsEvidence.renderedRootCount,
+      primarySelected: settingsEvidence.primarySelected,
+      listSemantics: settingsEvidence.listSemantics,
+      addPresent: settingsEvidence.addPresent,
+      addEnabled: settingsEvidence.addEnabled,
+      genericSnapshotPathFree: settingsEvidence.genericSnapshotPathFree,
+      pathfulRead: settingsEvidence.pathfulRead,
+    });
   } finally {
     settingsCdp.close();
   }
@@ -1515,6 +1826,16 @@ export function buildClosedReceipt({
       connected: settings.connected === true,
       tabCount: Number.isInteger(settings.tabCount) ? settings.tabCount : 0,
       tabs: settings.tabs === true,
+      rootCount: Number.isInteger(settings.rootCount) ? settings.rootCount : 0,
+      renderedRootCount: Number.isInteger(settings.renderedRootCount)
+        ? settings.renderedRootCount
+        : 0,
+      primarySelected: settings.primarySelected === true,
+      listSemantics: settings.listSemantics === true,
+      addPresent: settings.addPresent === true,
+      addEnabled: settings.addEnabled === true,
+      genericSnapshotPathFree: settings.genericSnapshotPathFree === true,
+      pathfulRead: settings.pathfulRead === true,
     }),
     share: Object.freeze({
       route: share.route === "#weekly" ? "#weekly" : "unknown",
