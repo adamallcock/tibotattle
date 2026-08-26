@@ -6021,6 +6021,17 @@ test("local refresh activity keeps elapsed time honest without overwriting termi
     localRefreshCancelRequested = true;
     renderRefreshActivity();
 
+    localRefreshCancelRequested = false;
+    latestProgress = { filesProcessed: 4, filesSelected: 10 };
+    clock.now += 1_000;
+    renderRefreshActivity();
+
+    latestProgress = null;
+    latestPollCount = 1;
+    lastStatusReceivedMs = clock.now;
+    clock.now += 1_000;
+    renderRefreshActivity();
+
     latestOutcome = "succeeded";
     const terminalLabelCount = labels.length;
     renderRefreshActivity();
@@ -6035,6 +6046,10 @@ test("local refresh activity keeps elapsed time honest without overwriting termi
   assert.equal(labels[2].parameters.elapsed, "1s");
   assert.equal(labels[3].key, "localAnalysis.progress.stopping");
   assert.equal(labels[3].parameters.elapsed, "1s");
+  assert.equal(labels[4].key, "localAnalysis.progress.analyzingFiles");
+  assert.equal(labels[4].parameters.elapsed, "2s");
+  assert.equal(labels[5].key, "localAnalysis.progress.analyzingEvidence");
+  assert.equal(labels[5].parameters.elapsed, "3s");
   assert.equal(context.terminalWriteSuppressed, true);
 });
 

@@ -11524,10 +11524,11 @@ async function requestRefresh({ autoContinue = false } = {}) {
         setLocalizedText(button, "localAnalysis.progress.analyzingFiles", {
           processed: formatNumber(processed),
           selected: formatNumber(selected),
+          elapsed,
         });
       }
     } else if (latestPollCount < 3) {
-      setLocalizedText(button, "localAnalysis.progress.analyzingEvidence");
+      setLocalizedText(button, "localAnalysis.progress.analyzingEvidence", { elapsed });
     } else {
       setLocalizedText(button, "localAnalysis.progress.analyzingElapsed", { elapsed });
     }
