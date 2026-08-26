@@ -172,7 +172,7 @@ test("checkpoint workspace atomically persists an initial tier batch and rejects
       byteOffset: 0,
       lineOrdinal: 0,
       checkpointSeq: 0,
-      parserVersion: "codex-checkpoint-state-v0.1",
+      parserVersion: "codex-checkpoint-state-v0.2",
       parserState: createEmptyCodexCheckpointState(),
       lastBatchSha256: null,
       parentSourceKey: null,

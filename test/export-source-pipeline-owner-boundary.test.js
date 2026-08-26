@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import * as application from "../src/application/index.js";
@@ -306,11 +307,13 @@ test("application pipeline snapshots exact nested Codex-log capabilities without
   );
 });
 
-test("application pipeline behavior is detached from later source-port mutation", async () => {
+test("application pipeline behavior is detached from later source-port mutation", async (t) => {
+  const codexHome = await mkdtemp(join(tmpdir(), "usage-monitor-snapshotted-codex-home-"));
+  t.after(() => rm(codexHome, { recursive: true, force: true }));
   const original = platform.createLocalExportSourcePorts();
   const filesystem = {
     ...original.codexLogPorts.filesystem,
-    defaultCodexHome: () => resolve(ROOT, ".tmp-does-not-exist-snapshotted-codex-home"),
+    defaultCodexHome: () => codexHome,
   };
   const mutable = {
     ...original,

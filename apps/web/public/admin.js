@@ -1,11 +1,11 @@
 import {
   adminActionErrorMessage,
   adminResponseError,
+  projectAdminAllowancePreview,
   projectAdminAction,
+  projectAdminMetricsHistory,
   projectAdminOverview,
 } from "./admin-client.js";
-import { PublicCommunityClient } from "./community-data.js";
-import { renderCommunityAllowanceSection } from "./community-view.js";
 import { formatNumber, formatReportingTime } from "./ui-format.js";
 
 const state = {
@@ -17,28 +17,41 @@ const state = {
   nextRefreshAt: null,
   lastSuccessfulLoadAt: null,
   retryDelayMilliseconds: 30_000,
-  communityPayload: null,
-  communityRangeDays: null,
+  allowancePreview: null,
+  allowanceMode: "combined",
+  allowancePlanFilter: null,
+  allowanceRangeDays: 30,
   notificationPreferences: null,
+  metricsHistory: undefined,
+  auditRows: [],
+  auditPage: 0,
+  auditSignature: null,
+  diagnosticLookup: null,
+  diagnosticLookupGeneration: 0,
+  loadGeneration: 0,
 };
 const $ = (selector) => document.querySelector(selector);
 const ADMIN_PAGE_CLASS = "admin-operator-page";
 const AUTO_REFRESH_STORAGE_KEY = "tibotattle-admin-auto-refresh-minutes-v1";
-const NOTIFICATION_STORAGE_KEY = "tibotattle-admin-notifications-v1";
+const NOTIFICATION_STORAGE_KEY = "tibotattle-admin-notifications-v2";
+const LEGACY_NOTIFICATION_STORAGE_KEY = "tibotattle-admin-notifications-v1";
 const DEFAULT_AUTO_REFRESH_MINUTES = 5;
 const AUTO_REFRESH_OPTIONS = new Set([0, 1, 5, 15]);
 const NOTIFICATION_REPEAT_OPTIONS = new Set([0, 5, 15, 60]);
+const NOTIFICATION_TOPICS = Object.freeze({
+  collection: "Collection",
+  maintenance: "Maintenance, storage & rebuilds",
+  evidence: "Evidence sources",
+  failures: "Sampled server failures",
+});
+const NOTIFICATION_TOPIC_IDS = Object.freeze(Object.keys(NOTIFICATION_TOPICS));
+const AUDIT_PAGE_SIZE = 10;
+const AUDIT_RESULT_LIMIT = 20;
+const RETAINED_SERVICE_REQUEST_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const LOCAL_DIAGNOSTIC_REFERENCE = /^TT-[0-9A-HJKMNP-TV-Z]{6}$/u;
 const ADMIN_TITLE = "TiboTattle operations";
 const isAdminPage = document.body?.classList?.contains(ADMIN_PAGE_CLASS) === true;
-const communityClient = new PublicCommunityClient({
-  fetchImpl(path, init = {}) {
-    return fetch(path, {
-      ...init,
-      credentials: "same-origin",
-      cache: "no-store",
-    });
-  },
-});
 let infoHintSequence = 0;
 
 const INFO_HINTS = Object.freeze({
@@ -95,7 +108,7 @@ const INFO_HINTS = Object.freeze({
   "Latest daily publication": "When a daily community aggregate was most recently published.",
   "Last maintenance": "When the latest bounded retention, reconciliation, and publication maintenance pass ran.",
   "Failure code": "The latest lifecycle failure identifier. A dash means no failure was recorded.",
-  "New sign-ups": "Community accounts created, from the retained participant records: full day-by-day history.",
+  "New sign-ups": "Community accounts created, from retained participant records over the recent 30-day history window.",
   "Web sign-ins": "Completed sign-ins on the website, counted from issued web sessions. Sign-in attempts that never completed are not retained and are not counted.",
   "Device pairings": "Pairing handshakes issued to Macs starting community upload setup.",
   "Device credentials": "Upload credentials issued to Macs that completed pairing.",
@@ -627,8 +640,24 @@ async function request(path, init = {}) {
   return body;
 }
 
+function metricDescriptor(metric) {
+  if (Array.isArray(metric)) {
+    const [label, value, detail, points] = metric;
+    return { label, value, detail, points };
+  }
+  return metric;
+}
+
 function renderMetricCards(selector, metrics) {
-  $(selector).replaceChildren(...metrics.map(([label, value, detail]) => {
+  $(selector).replaceChildren(...metrics.map((metric) => {
+    const {
+      label,
+      value,
+      detail,
+      points,
+      valueFormatter,
+      historyUnavailable,
+    } = metricDescriptor(metric);
     const card = document.createElement("div");
     card.className = "admin-card admin-metric";
     const name = labelWithInfo(label);
@@ -636,13 +665,18 @@ function renderMetricCards(selector, metrics) {
     number.textContent = text(value);
     const caption = document.createElement("small");
     caption.textContent = detail;
-    card.append(name, number, caption);
+    card.append(
+      name,
+      number,
+      caption,
+      recentHistory(points, label, valueFormatter, historyUnavailable),
+    );
     return card;
   }));
 }
 
 const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
-const GROWTH_SCHEMA_VERSION = "admin-metrics-history-v0.1";
+const GROWTH_SCHEMA_VERSION = "admin-metrics-history-v0.2";
 
 /**
  * A day-by-day count series with calendar gaps filled: event tables have no
@@ -651,9 +685,13 @@ const GROWTH_SCHEMA_VERSION = "admin-metrics-history-v0.1";
  * Exported for functional tests.
  */
 export function calendarSeries(byDay, throughDay, fill) {
+  return calendarPoints(byDay, throughDay, fill).map((point) => point.value);
+}
+
+export function calendarPoints(byDay, throughDay, fill) {
   if (!Array.isArray(byDay) || byDay.length === 0) return [];
   const counts = new Map(byDay.map((row) => [row.day, row.count]));
-  const values = [];
+  const points = [];
   let cursor = byDay[0].day;
   let previous = 0;
   // Calendar walk in UTC, bounded to ~2 years of points as a corruption guard.
@@ -662,13 +700,13 @@ export function calendarSeries(byDay, throughDay, fill) {
     const value = present === undefined
       ? (fill === "carry" ? previous : 0)
       : present;
-    values.push(value);
+    points.push({ at: cursor, value });
     previous = value;
     const next = new Date(`${cursor}T00:00:00.000Z`);
     next.setUTCDate(next.getUTCDate() + 1);
     cursor = next.toISOString().slice(0, 10);
   }
-  return values;
+  return points;
 }
 
 /**
@@ -679,39 +717,156 @@ export function calendarSeries(byDay, throughDay, fill) {
  */
 export function sparklineGeometry(values) {
   if (!Array.isArray(values) || values.length < 2) return null;
+  const normalized = values.map((point, index) => (
+    typeof point === "number"
+      ? { at: index, value: point }
+      : { at: Date.parse(point.at), value: point.value }
+  ));
+  if (normalized.some((point) => !Number.isFinite(point.at)
+      || !Number.isFinite(point.value))) return null;
   const pad = 2;
-  const max = Math.max(...values);
-  const min = Math.min(...values);
+  const max = Math.max(...normalized.map((point) => point.value));
+  const min = Math.min(...normalized.map((point) => point.value));
   const span = max - min || 1;
-  const step = (120 - pad * 2) / (values.length - 1);
-  const points = values.map((value, index) => {
-    const x = pad + index * step;
-    const y = 28 - pad - ((value - min) / span) * (28 - pad * 2);
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  const firstAt = normalized[0].at;
+  const timeSpan = normalized.at(-1).at - firstAt || 1;
+  const coordinates = normalized.map((point) => {
+    const x = pad + ((point.at - firstAt) / timeSpan) * (120 - pad * 2);
+    const y = 28 - pad - ((point.value - min) / span) * (28 - pad * 2);
+    return { x, y };
   });
-  const [endX, endY] = points[points.length - 1].split(",");
-  return { points: points.join(" "), endX, endY };
+  const end = coordinates.at(-1);
+  return {
+    points: coordinates.map(({ x, y }) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" "),
+    endX: end.x.toFixed(1),
+    endY: end.y.toFixed(1),
+    coordinates: Object.freeze(coordinates),
+  };
 }
 
-function sparkline(values, description) {
+function sparkDate(value) {
+  const options = value.length === 10
+    ? { timeZone: "UTC", month: "short", day: "numeric", year: "numeric" }
+    : {
+      timeZone: "UTC",
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    };
+  return new Intl.DateTimeFormat(undefined, options).format(
+    new Date(value.length === 10 ? `${value}T00:00:00.000Z` : value),
+  );
+}
+
+export function historyGapLabel(
+  historyState,
+  points,
+  explicitlyUnavailable = false,
+) {
+  if (explicitlyUnavailable
+      || (historyState === null && !Array.isArray(points))) {
+    return "Recent history unavailable";
+  }
+  if (historyState === undefined && !Array.isArray(points)) {
+    return "Recent history loading…";
+  }
+  if (!Array.isArray(points) || points.length < 2) {
+    return points?.length === 1
+      ? "1 snapshot · history starts here"
+      : "Recent history not yet recorded";
+  }
+  return null;
+}
+
+function recentHistory(
+  points,
+  description,
+  valueFormatter = count,
+  explicitlyUnavailable = false,
+) {
+  const shell = document.createElement("div");
+  shell.className = "admin-sparkline-shell";
+  const gapLabel = historyGapLabel(
+    state.metricsHistory,
+    points,
+    explicitlyUnavailable,
+  );
+  if (gapLabel !== null) {
+    shell.classList?.add?.("admin-sparkline-gap");
+    shell.textContent = gapLabel;
+    return shell;
+  }
+  return sparkline(points, description, valueFormatter);
+}
+
+export function sparkline(points, description, valueFormatter = count) {
+  const shell = document.createElement("div");
+  shell.className = "admin-sparkline-shell admin-sparkline-interactive";
+  shell.tabIndex = 0;
+  shell.setAttribute("role", "figure");
+  shell.setAttribute("aria-label", `${description} recent history. Use left and right arrows to inspect dates.`);
   const svg = document.createElementNS(SVG_NAMESPACE, "svg");
   svg.setAttribute("class", "admin-sparkline");
   svg.setAttribute("viewBox", "0 0 120 28");
-  svg.setAttribute("role", "img");
-  svg.setAttribute("aria-label", description);
-  const geometry = sparklineGeometry(values);
-  if (geometry === null) return svg;
+  svg.setAttribute("aria-hidden", "true");
+  const geometry = sparklineGeometry(points);
+  if (geometry === null) return shell;
   const line = document.createElementNS(SVG_NAMESPACE, "polyline");
   line.setAttribute("class", "admin-sparkline-line");
   line.setAttribute("points", geometry.points);
   line.setAttribute("fill", "none");
-  const last = document.createElementNS(SVG_NAMESPACE, "circle");
-  last.setAttribute("class", "admin-sparkline-endpoint");
-  last.setAttribute("cx", geometry.endX);
-  last.setAttribute("cy", geometry.endY);
-  last.setAttribute("r", "2");
-  svg.append(line, last);
-  return svg;
+  const marker = document.createElementNS(SVG_NAMESPACE, "circle");
+  marker.setAttribute("class", "admin-sparkline-endpoint admin-sparkline-marker");
+  marker.setAttribute("r", "2.6");
+  const tooltip = document.createElement("span");
+  tooltip.className = "admin-sparkline-tooltip";
+  tooltip.id = `admin-sparkline-tooltip-${++infoHintSequence}`;
+  tooltip.setAttribute("role", "status");
+  tooltip.hidden = true;
+  shell.setAttribute("aria-describedby", tooltip.id);
+  let selectedIndex = points.length - 1;
+  const select = (index, visible = true) => {
+    selectedIndex = Math.max(0, Math.min(points.length - 1, index));
+    const point = points[selectedIndex];
+    const coordinate = geometry.coordinates[selectedIndex];
+    marker.setAttribute("cx", coordinate.x.toFixed(1));
+    marker.setAttribute("cy", coordinate.y.toFixed(1));
+    tooltip.textContent = `${sparkDate(point.at)} · ${valueFormatter(point.value)}`;
+    tooltip.hidden = !visible;
+    shell.setAttribute("aria-label", `${description}: ${tooltip.textContent}. Use left and right arrows to inspect dates.`);
+  };
+  const selectFromPointer = (event) => {
+    const touch = event.touches?.[0];
+    const clientX = touch?.clientX ?? event.clientX;
+    const rect = svg.getBoundingClientRect?.();
+    if (!rect || !Number.isFinite(clientX) || rect.width <= 0) return;
+    const viewX = Math.max(0, Math.min(120, ((clientX - rect.left) / rect.width) * 120));
+    let nearest = 0;
+    for (let index = 1; index < geometry.coordinates.length; index += 1) {
+      if (Math.abs(geometry.coordinates[index].x - viewX)
+          < Math.abs(geometry.coordinates[nearest].x - viewX)) nearest = index;
+    }
+    select(nearest);
+  };
+  shell.addEventListener("pointermove", selectFromPointer);
+  shell.addEventListener("pointerenter", selectFromPointer);
+  shell.addEventListener("pointerleave", () => { tooltip.hidden = true; });
+  shell.addEventListener("touchstart", selectFromPointer, { passive: true });
+  shell.addEventListener("focus", () => select(selectedIndex));
+  shell.addEventListener("blur", () => { tooltip.hidden = true; });
+  shell.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    if (event.key === "Home") select(0);
+    else if (event.key === "End") select(points.length - 1);
+    else select(selectedIndex + (event.key === "ArrowRight" ? 1 : -1));
+  });
+  select(selectedIndex, false);
+  svg.append(line, marker);
+  shell.append(svg, tooltip);
+  return shell;
 }
 
 function deltaChip(delta, caption) {
@@ -722,7 +877,7 @@ function deltaChip(delta, caption) {
   return chip;
 }
 
-function growthCard({ label, value, delta, deltaCaption, series, seriesLabel }) {
+function growthCard({ label, value, delta, deltaCaption, points, seriesLabel }) {
   const card = document.createElement("div");
   card.className = "admin-card admin-metric admin-growth-card";
   const name = labelWithInfo(label);
@@ -730,21 +885,68 @@ function growthCard({ label, value, delta, deltaCaption, series, seriesLabel }) 
   number.textContent = text(value);
   const caption = document.createElement("small");
   caption.replaceChildren(deltaChip(delta, deltaCaption));
-  card.append(name, number, caption, sparkline(series, seriesLabel));
+  card.append(name, number, caption, recentHistory(points, seriesLabel));
   return card;
 }
 
 function eventGrowthCard(label, series, throughDay) {
+  const points = calendarPoints(series.byDay, throughDay, 0).slice(-30);
   return growthCard({
     label,
     value: count(series.total),
     delta: series.last24Hours,
     deltaCaption: `${count(series.previous24Hours)} in the prior 24h`,
-    series: calendarSeries(series.byDay, throughDay, 0),
-    seriesLabel: `${label}, per day since ${series.byDay[0]?.day ?? "the first record"}`,
+    points,
+    seriesLabel: `${label}, daily over the most recent ${points.length} calendar days`,
   });
 }
 
+function recentTimestampPoints(points, generatedAt, days = 30) {
+  const through = Date.parse(generatedAt);
+  const since = through - days * 24 * 60 * 60 * 1_000;
+  return points.filter((point) => {
+    const epoch = Date.parse(point.at);
+    return Number.isFinite(epoch) && epoch >= since && epoch <= through;
+  });
+}
+
+function gaugePoints(snapshots, key) {
+  const points = (snapshots ?? []).flatMap((snapshot) => (
+    typeof snapshot.metrics[key] === "number"
+      ? [{ at: snapshot.capturedAt, value: snapshot.metrics[key] }]
+      : []
+  ));
+  const generatedAt = state.metricsHistory?.generatedAt ?? points.at(-1)?.at;
+  return generatedAt ? recentTimestampPoints(points, generatedAt) : points;
+}
+
+function eventHistoryPoints(name) {
+  const history = state.metricsHistory;
+  const series = history?.events?.[name];
+  if (!history || !series) return null;
+  return calendarPoints(series.byDay, history.generatedAt.slice(0, 10), 0).slice(-30);
+}
+
+function metricGaugePoints(key) {
+  return state.metricsHistory
+    ? gaugePoints(state.metricsHistory.gauges.snapshots, key)
+    : null;
+}
+
+export function gaugeHistoryIsBounded(snapshots, boundedKey) {
+  return (snapshots ?? []).some(
+    (snapshot) => snapshot?.metrics?.[boundedKey] === 1,
+  );
+}
+
+function metricGaugeEvidence(key, boundedKey, currentlyBounded = false) {
+  const snapshots = state.metricsHistory?.gauges?.snapshots ?? [];
+  return {
+    points: metricGaugePoints(key),
+    unavailable: currentlyBounded
+      || gaugeHistoryIsBounded(snapshots, boundedKey),
+  };
+}
 function renderGrowth(history) {
   const container = $("#growth-cards");
   const badge = $("#growth-status");
@@ -752,6 +954,10 @@ function renderGrowth(history) {
   if (history === null) {
     badge.className = "admin-source-badge admin-source-partial";
     badge.textContent = "History unavailable";
+    const unavailable = document.createElement("p");
+    unavailable.className = "admin-empty";
+    unavailable.textContent = "Recent metric history could not be loaded. Current service values remain above.";
+    container.replaceChildren(unavailable);
     return;
   }
   const throughDay = history.generatedAt.slice(0, 10);
@@ -771,15 +977,15 @@ function renderGrowth(history) {
       day: row.day,
       count: row.cumulativeDmgDownloads,
     }));
-    const series = calendarSeries(byDay, throughDay, "carry");
-    const latest = series[series.length - 1] ?? 0;
-    const prior = series.length > 1 ? series[series.length - 2] : latest;
+    const points = calendarPoints(byDay, throughDay, "carry").slice(-30);
+    const latest = points.at(-1)?.value ?? 0;
+    const prior = points.length > 1 ? points.at(-2).value : latest;
     cards.push(growthCard({
       label: "DMG downloads",
       value: count(latest),
       delta: latest - prior,
       deltaCaption: "movement since the prior day's last sample",
-      series,
+      points,
       seriesLabel: `Cumulative DMG downloads since ${byDay[0].day}`,
     }));
   }
@@ -809,9 +1015,7 @@ function growthBandCard(snapshots) {
     deltaCaption: typeof referenceCount === "number"
       ? `${count(referenceCount)} a day earlier`
       : "history starts after the first hourly snapshot",
-    series: snapshots
-      .map((snapshot) => snapshot.metrics.bandParticipantCount)
-      .filter((value) => typeof value === "number"),
+    points: gaugePoints(snapshots, "bandParticipantCount"),
     seriesLabel: "Published band participant count by snapshot",
   });
 }
@@ -861,6 +1065,21 @@ function growthPlanCohortCard(snapshots) {
     `${rows.length} plan${rows.length === 1 ? "" : "s"} seen · $ = API-price-equivalent per 7-day window`;
   card.append(number, caption);
 
+  const allCohortPoints = snapshots.flatMap((snapshot) => {
+    const counts = Object.entries(snapshot.metrics)
+      .filter(([key, value]) => key.startsWith("cohortParticipants_")
+        && typeof value === "number")
+      .map(([, value]) => value);
+    return counts.length === 0
+      ? []
+      : [{ at: snapshot.capturedAt, value: counts.reduce((sum, value) => sum + value, 0) }];
+  });
+  const generatedAt = state.metricsHistory?.generatedAt
+    ?? snapshots.at(-1)?.capturedAt;
+  const cohortPoints = generatedAt
+    ? recentTimestampPoints(allCohortPoints, generatedAt)
+    : allCohortPoints;
+  card.append(recentHistory(cohortPoints, "Plan cohort participants by snapshot"));
   const list = document.createElement("ul");
   list.className = "admin-plan-cohorts";
   for (const row of rows) {
@@ -881,42 +1100,79 @@ function growthPlanCohortCard(snapshots) {
   return card;
 }
 
-async function loadGrowthHistory() {
+async function loadGrowthHistory(loadGeneration) {
   if (!isAdminPage) return;
   try {
-    const history = await request("/api/v1/admin/metrics/history");
-    if (history?.schemaVersion !== GROWTH_SCHEMA_VERSION) {
-      throw new Error("unexpected metrics-history schema");
-    }
-    renderGrowth(history);
+    const history = projectAdminMetricsHistory(await request("/api/v1/admin/metrics/history"));
+    if (history.schemaVersion !== GROWTH_SCHEMA_VERSION) throw new Error("unexpected metrics-history schema");
+    if (!isCurrentLoadGeneration(loadGeneration, state.loadGeneration)) return;
+    state.metricsHistory = history;
+    renderHistoryBackedSections();
   } catch {
-    renderGrowth(null);
+    if (!isCurrentLoadGeneration(loadGeneration, state.loadGeneration)) return;
+    state.metricsHistory = null;
+    renderHistoryBackedSections();
   }
 }
 
+function renderHistoryBackedSections() {
+  renderGrowth(state.metricsHistory ?? null);
+  if (!state.overview) return;
+  renderCounts(state.overview);
+  renderQuarantine(state.overview);
+  renderDistribution(state.overview.distribution);
+}
+
+export function isCurrentLoadGeneration(requestGeneration, currentGeneration) {
+  return requestGeneration === currentGeneration;
+}
 function renderCounts(overview) {
   const counts = overview.counts;
   const contributors = counts.contributions.contributingAccounts;
   const quarantine = overview.quarantine;
   const quarantineDue = quarantine.dueReferenced + quarantine.dueUnreferenced;
+  const contributorHistory = metricGaugeEvidence(
+    "contributingAccountsTotal",
+    "contributingAccountsTotalBounded",
+    contributors.bounded,
+  );
+  const pendingHistory = metricGaugeEvidence(
+    "quarantinePendingObjects",
+    "quarantinePendingObjectsBounded",
+    quarantine.pendingObjectsBounded,
+  );
   const metrics = [
-    ["Approved community accounts", count(counts.participants.active, counts.participants.bounded), `${count(counts.participants.total, counts.participants.bounded)} total identities`],
-    ["Accounts with accepted data", count(contributors.total, contributors.bounded), `${count(contributors.acceptedLast30Days, contributors.bounded)} active in the last 30 days`],
-    ["Approved last 24h", count(counts.participants.enrolledLast24Hours), `${count(counts.participants.enrolledLast7Days)} in the last 7 days`],
-    ["Current incremental chunks", count(counts.contributions.incrementalChunks.current, counts.contributions.incrementalChunks.bounded), `${count(counts.contributions.incrementalChunks.total, counts.contributions.incrementalChunks.bounded)} journal rows`],
-    ["Accepted uploads last 24h", count(counts.contributions.acceptedLast24Hours), `${count(counts.contributions.acceptedLast7Days)} in the last 7 days`],
-    ["Upload safety registrations", count(quarantine.pendingObjects, quarantine.pendingObjectsBounded), `${quarantine.withinGrace} recent · ${quarantineDue} due`],
+    ["Approved community accounts", count(counts.participants.active, counts.participants.bounded), `${count(counts.participants.total, counts.participants.bounded)} total identities`, metricGaugePoints("participantsActive")],
+    {
+      label: "Accounts with accepted data",
+      value: count(contributors.total, contributors.bounded),
+      detail: `${count(contributors.acceptedLast30Days, contributors.bounded)} active in the last 30 days`,
+      points: contributorHistory.points,
+      historyUnavailable: contributorHistory.unavailable,
+    },
+    ["Approved last 24h", count(counts.participants.enrolledLast24Hours), `${count(counts.participants.enrolledLast7Days)} in the last 7 days`, eventHistoryPoints("participants")],
+    ["Current incremental chunks", count(counts.contributions.incrementalChunks.current, counts.contributions.incrementalChunks.bounded), `${count(counts.contributions.incrementalChunks.total, counts.contributions.incrementalChunks.bounded)} journal rows`, metricGaugePoints("corpusCurrentChunks")],
+    ["Accepted uploads last 24h", count(counts.contributions.acceptedLast24Hours), `${count(counts.contributions.acceptedLast7Days)} in the last 7 days`, eventHistoryPoints("acceptedUploads")],
+    {
+      label: "Upload safety registrations",
+      value: count(quarantine.pendingObjects, quarantine.pendingObjectsBounded),
+      detail: `${quarantine.withinGrace} recent · ${quarantineDue} due`,
+      points: pendingHistory.points,
+      historyUnavailable: pendingHistory.unavailable,
+    },
   ];
   renderMetricCards("#counts", metrics);
 }
 
-function addAttentionItem(items, level, title, detail, target, linkLabel) {
-  items.push({ level, title, detail, target, linkLabel });
+function addAttentionItem(items, id, topic, level, title, detail, target, linkLabel) {
+  items.push({ id, topic, level, title, detail, target, linkLabel });
 }
 
-function attentionRow({ level, title, detail, target, linkLabel }) {
+function attentionRow({ id, topic, level, title, detail, target, linkLabel }) {
   const row = document.createElement("div");
   row.className = `admin-attention-item admin-attention-item-${level}`;
+  if (id) row.setAttribute("data-alert-id", id);
+  if (topic) row.setAttribute("data-alert-topic", topic);
   const dot = document.createElement("span");
   dot.className = "admin-attention-dot";
   dot.setAttribute?.("aria-hidden", "true");
@@ -955,6 +1211,8 @@ function collectAttentionItems(overview) {
   if (collection.state !== "operational") {
     addAttentionItem(
       items,
+      "collection-state",
+      "collection",
       collection.state === "contained" ? "alert" : "warning",
       `Collection is ${collection.state}`,
       `${disabledControls.join(", ")} ${disabledControls.length === 1 ? "is" : "are"} disabled.`,
@@ -975,6 +1233,8 @@ function collectAttentionItems(overview) {
   if (maintenanceFailures.length > 0) {
     addAttentionItem(
       items,
+      "maintenance-failure",
+      "maintenance",
       "alert",
       "Maintenance failure recorded",
       maintenanceFailures.join(" · "),
@@ -987,6 +1247,8 @@ function collectAttentionItems(overview) {
   if (dueObjects > 0) {
     addAttentionItem(
       items,
+      "storage-reconciliation-due",
+      "maintenance",
       "warning",
       `${dueObjects} upload safety ${dueObjects === 1 ? "registration is" : "registrations are"} due`,
       `${quarantine.dueReferenced} referenced · ${quarantine.dueUnreferenced} unreferenced.`,
@@ -1000,6 +1262,8 @@ function collectAttentionItems(overview) {
   if (queuedRebuilds > 0) {
     addAttentionItem(
       items,
+      "rebuild-queue",
+      "maintenance",
       "warning",
       `${queuedRebuilds} publication ${queuedRebuilds === 1 ? "rebuild is" : "rebuilds are"} queued`,
       `${overview.pendingHistoricalRebuilds} weekly · ${daily.pendingRebuilds} daily.`,
@@ -1023,6 +1287,8 @@ function collectAttentionItems(overview) {
     }
     addAttentionItem(
       items,
+      "evidence-availability",
+      "evidence",
       "warning",
       title,
       detail,
@@ -1035,6 +1301,8 @@ function collectAttentionItems(overview) {
   if (github.status !== "available") {
     addAttentionItem(
       items,
+      "github-availability",
+      "evidence",
       "warning",
       "GitHub release evidence is unavailable",
       github.reasonCode === "GITHUB_SNAPSHOT_PENDING"
@@ -1046,6 +1314,8 @@ function collectAttentionItems(overview) {
   } else if (github.sync.stale || github.sync.lastFailureCode !== null) {
     addAttentionItem(
       items,
+      "github-refresh",
+      "evidence",
       "warning",
       "GitHub release evidence needs a refresh",
       github.sync.lastFailureCode !== null
@@ -1058,6 +1328,8 @@ function collectAttentionItems(overview) {
   if (github.history.counterRegressions > 0) {
     addAttentionItem(
       items,
+      "github-counter-regression",
+      "evidence",
       "warning",
       `${github.history.counterRegressions} GitHub DMG ${github.history.counterRegressions === 1 ? "counter decreased" : "counters decreased"}`,
       "The affected asset may have been replaced or corrected; no negative download total is shown.",
@@ -1082,6 +1354,8 @@ function collectAttentionItems(overview) {
       .at(-1);
     addAttentionItem(
       items,
+      "sampled-server-failure",
+      "failures",
       "warning",
       `${recentServerFailures.length} sampled server ${recentServerFailures.length === 1 ? "failure" : "failures"} in the last 24 hours`,
       `Latest retained event: ${formatTime(latest)}.`,
@@ -1141,22 +1415,34 @@ function renderQuarantine(overview) {
     badge.textContent = quarantine.withinGrace > 0 ? "Healthy · settling" : "Clear";
   }
 
+  const historyUnavailable = metricGaugeEvidence(
+    "quarantinePendingObjects",
+    "quarantinePendingObjectsBounded",
+    quarantine.pendingObjectsBounded,
+  ).unavailable;
+
   renderMetricCards("#quarantine-counts", [
-    [
-      "Recent registrations",
-      count(quarantine.withinGrace, quarantine.pendingObjectsBounded),
-      `normal ${quarantine.gracePeriodMinutes}-minute safety window`,
-    ],
-    [
-      "Due and referenced",
-      count(quarantine.dueReferenced, quarantine.pendingObjectsBounded),
-      "valid objects; temporary markers should clear",
-    ],
-    [
-      "Due and unreferenced",
-      count(quarantine.dueUnreferenced, quarantine.pendingObjectsBounded),
-      "orphan candidates scheduled for safe deletion",
-    ],
+    {
+      label: "Recent registrations",
+      value: count(quarantine.withinGrace, quarantine.pendingObjectsBounded),
+      detail: `normal ${quarantine.gracePeriodMinutes}-minute safety window`,
+      points: metricGaugePoints("quarantineWithinGrace"),
+      historyUnavailable,
+    },
+    {
+      label: "Due and referenced",
+      value: count(quarantine.dueReferenced, quarantine.pendingObjectsBounded),
+      detail: "valid objects; temporary markers should clear",
+      points: metricGaugePoints("quarantineDueReferenced"),
+      historyUnavailable,
+    },
+    {
+      label: "Due and unreferenced",
+      value: count(quarantine.dueUnreferenced, quarantine.pendingObjectsBounded),
+      detail: "orphan candidates scheduled for safe deletion",
+      points: metricGaugePoints("quarantineDueUnreferenced"),
+      historyUnavailable,
+    },
   ]);
 
   $("#quarantine-status").replaceChildren(
@@ -1189,10 +1475,39 @@ function percentage(value, total) {
   return `${Math.round((value / total) * 100)}%`;
 }
 
+function distributionSegmentPoints(cloudflare, key) {
+  if (!Array.isArray(cloudflare.bySegment) || cloudflare.bySegment.length === 0) {
+    return null;
+  }
+  const points = cloudflare.bySegment.flatMap((segment) => (
+    typeof segment[key] === "number"
+      ? [{ at: segment.endsAt, value: segment[key] }]
+      : []
+  ));
+  return points.length > 0 ? points : null;
+}
+
+function downloadHistoryPoints({ delta = false } = {}) {
+  const history = state.metricsHistory;
+  if (!history?.downloads.available) return null;
+  const points = history.downloads.byDay.map((row) => ({
+    at: row.day,
+    value: row.cumulativeDmgDownloads,
+  })).slice(-30);
+  if (!delta) return points;
+  return points.slice(1).map((point, index) => ({
+    at: point.at,
+    value: Math.max(0, point.value - points[index].value),
+  }));
+}
+
 function renderDistribution(distribution) {
   const cloudflare = distribution.cloudflare;
   const github = distribution.github;
   const cloudflareAvailable = cloudflare.status === "available";
+  const cloudflareHistoryUnavailable = !cloudflareAvailable
+    || cloudflare.sampled === true
+    || cloudflare.bounded === true;
   const githubAvailable = github.status === "available";
   const badge = $("#distribution-status");
   badge.className = `admin-source-badge ${
@@ -1217,39 +1532,54 @@ function renderDistribution(distribution) {
   const summary = github.summary;
   const history = github.history;
   renderMetricCards("#distribution-counts", [
-    [
-      "Active-install proxy",
-      distributionCount(active?.last24Hours, cloudflare),
-      `${distributionCount(active?.last7Days, cloudflare)} distinct source addresses in 7 days`,
-    ],
-    [
-      "App preflight call-ins",
-      distributionCount(preflight?.requests.last24Hours, cloudflare),
-      `${distributionCount(preflight?.sourceAddresses.last24Hours, cloudflare)} addresses · ${distributionCount(preflight?.requests.last7Days, cloudflare)} requests/7d`,
-    ],
-    [
-      "Sparkle update checks",
-      distributionCount(checks?.requests.last24Hours, cloudflare),
-      `${distributionCount(checks?.sourceAddresses.last24Hours, cloudflare)} addresses · ${distributionCount(checks?.requests.last7Days, cloudflare)} checks/7d`,
-    ],
-    [
-      "Sparkle artifact fetches",
-      distributionCount(downloads?.requests.last24Hours, cloudflare),
-      `${distributionCount(downloads?.sourceAddresses.last24Hours, cloudflare)} addresses · ${distributionCount(downloads?.requests.last7Days, cloudflare)} fetches/7d`,
-    ],
-    [
-      "Current-version reach",
-      distributionCount(current?.last24Hours, cloudflare),
-      cloudflare.currentVersion
+    {
+      label: "Active-install proxy",
+      value: distributionCount(active?.last24Hours, cloudflare),
+      detail: `${distributionCount(active?.last7Days, cloudflare)} distinct source addresses in 7 days`,
+      points: distributionSegmentPoints(cloudflare, "activeSourceAddresses"),
+      historyUnavailable: cloudflareHistoryUnavailable,
+    },
+    {
+      label: "App preflight call-ins",
+      value: distributionCount(preflight?.requests.last24Hours, cloudflare),
+      detail: `${distributionCount(preflight?.sourceAddresses.last24Hours, cloudflare)} addresses · ${distributionCount(preflight?.requests.last7Days, cloudflare)} requests/7d`,
+      points: distributionSegmentPoints(cloudflare, "preflightRequests"),
+      historyUnavailable: cloudflareHistoryUnavailable,
+    },
+    {
+      label: "Sparkle update checks",
+      value: distributionCount(checks?.requests.last24Hours, cloudflare),
+      detail: `${distributionCount(checks?.sourceAddresses.last24Hours, cloudflare)} addresses · ${distributionCount(checks?.requests.last7Days, cloudflare)} checks/7d`,
+      points: distributionSegmentPoints(cloudflare, "sparkleCheckRequests"),
+      historyUnavailable: cloudflareHistoryUnavailable,
+    },
+    {
+      label: "Sparkle artifact fetches",
+      value: distributionCount(downloads?.requests.last24Hours, cloudflare),
+      detail: `${distributionCount(downloads?.sourceAddresses.last24Hours, cloudflare)} addresses · ${distributionCount(downloads?.requests.last7Days, cloudflare)} fetches/7d`,
+      points: distributionSegmentPoints(cloudflare, "sparkleDownloadRequests"),
+      historyUnavailable: cloudflareHistoryUnavailable,
+    },
+    {
+      label: "Current-version reach",
+      value: distributionCount(current?.last24Hours, cloudflare),
+      detail: cloudflare.currentVersion
         ? `v${cloudflare.currentVersion} · ${distributionCount(current?.last7Days, cloudflare)} addresses/7d`
         : "current release could not be matched to traffic",
-    ],
+      points: distributionSegmentPoints(
+        cloudflare,
+        "currentVersionSourceAddresses",
+      ),
+      historyUnavailable: cloudflareHistoryUnavailable
+        || cloudflare.currentVersion === null,
+    },
     [
       "GitHub DMG downloads",
       summary ? count(summary.dmgDownloads) : "—",
       summary
         ? `${summary.releaseCount} releases · ${summary.dmgAssetCount} DMG assets · all time`
         : "unavailable from GitHub; activity counts are unaffected",
+      downloadHistoryPoints(),
     ],
     [
       "GitHub DMG downloads since prior snapshot",
@@ -1259,6 +1589,7 @@ function renderDistribution(distribution) {
       history.previousObservedAt
         ? `${formatTime(history.previousObservedAt)} → ${formatTime(history.latestObservedAt)}`
         : "available after a second complete snapshot",
+      downloadHistoryPoints({ delta: true }),
     ],
   ]);
 
@@ -1379,6 +1710,7 @@ function renderErrors(errors) {
   body.replaceChildren(...errors.groups.map((group) => tableRow([
     group.routeClass,
     group.errorCode,
+    group.status,
     `${group.occurrences} (${group.ratePerDay}/day)`,
     formatTime(group.latestAt),
   ])));
@@ -1393,16 +1725,80 @@ function renderErrors(errors) {
     ])),
   );
   $("#recent-diagnostic-empty").hidden = errors.recentDiagnostics.length !== 0;
+  const summary = $("#diagnostic-retention-summary");
+  if (summary) {
+    summary.textContent = `${errors.sampled ? "A bounded sample" : "Retained events"} of service 5xx failures is kept for ${errors.retentionDays} days, capped at ${count(errors.capacity)} events. Retained service request IDs are UUIDs; TT-… references stay only in the reporting Mac’s local diagnostics log.`;
+  }
+  renderDiagnosticLookup();
+}
+
+function renderDiagnosticLookup() {
   const lookup = $("#diagnostic-lookup");
-  if (errors.lookup) {
-    lookup.textContent = `${errors.lookup.requestId}: ${errors.lookup.errorCode} on ${errors.lookup.routeClass} at ${formatTime(errors.lookup.occurredAt)}`;
+  const result = state.diagnosticLookup;
+  if (result?.event) {
+    lookup.textContent = `${result.event.requestId}: HTTP ${result.event.status} · ${result.event.errorCode} on ${result.event.routeClass} at ${formatTime(result.event.occurredAt)}`;
     lookup.hidden = false;
-  } else if ($("#diagnostic-reference").value) {
-    lookup.textContent = "No retained event matched that reference.";
+  } else if (result?.message) {
+    lookup.textContent = result.message;
     lookup.hidden = false;
   } else {
     lookup.hidden = true;
   }
+}
+
+async function lookupDiagnosticReference() {
+  const lookupGeneration = ++state.diagnosticLookupGeneration;
+  const reference = $("#diagnostic-reference").value.trim();
+  const kind = diagnosticReferenceKind(reference);
+  if (kind === "local") {
+    state.diagnosticLookup = {
+      message: "TT-… references are local to the reporting Mac and are not uploaded here. Ask for the local diagnostics log or export from that Mac.",
+    };
+    renderDiagnosticLookup();
+    return;
+  }
+  if (kind === "invalid-local") {
+    state.diagnosticLookup = {
+      message: "That TT reference is incomplete or malformed. A local reference looks like TT-7QF3K2 and can be checked only in the reporting Mac’s diagnostics log.",
+    };
+    renderDiagnosticLookup();
+    return;
+  }
+  if (kind !== "retained") {
+    state.diagnosticLookup = {
+      message: "Enter the UUID service request ID shown with the 5xx response (xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx).",
+    };
+    renderDiagnosticLookup();
+    return;
+  }
+  state.diagnosticLookup = { message: "Looking up that exact retained service request ID…" };
+  renderDiagnosticLookup();
+  try {
+    const overview = projectAdminOverview(await request(
+      `/api/v1/admin/overview?diagnosticReference=${encodeURIComponent(reference)}`,
+    ));
+    if (!isCurrentLoadGeneration(
+      lookupGeneration,
+      state.diagnosticLookupGeneration,
+    )) return;
+    state.diagnosticLookup = overview.errors.lookup
+      ? { event: overview.errors.lookup }
+      : { message: `No retained sampled service failure matched ${reference}.` };
+  } catch (error) {
+    if (!isCurrentLoadGeneration(
+      lookupGeneration,
+      state.diagnosticLookupGeneration,
+    )) return;
+    state.diagnosticLookup = { message: `Lookup unavailable: ${error.message}.` };
+  }
+  renderDiagnosticLookup();
+}
+
+export function diagnosticReferenceKind(reference) {
+  const normalized = typeof reference === "string" ? reference.trim() : "";
+  if (LOCAL_DIAGNOSTIC_REFERENCE.test(normalized)) return "local";
+  if (/^TT-/iu.test(normalized)) return "invalid-local";
+  return RETAINED_SERVICE_REQUEST_ID.test(normalized) ? "retained" : "invalid";
 }
 
 function renderOperational(overview) {
@@ -1433,9 +1829,63 @@ function renderOperational(overview) {
   $("#snapshot-empty").hidden = rows.length !== 0;
 }
 
+export function auditPageWindow(rows, page, pageSize = AUDIT_PAGE_SIZE) {
+  const pageCount = Math.max(1, Math.ceil(rows.length / pageSize));
+  const safePage = Math.max(0, Math.min(pageCount - 1, page));
+  const start = safePage * pageSize;
+  return Object.freeze({
+    page: safePage,
+    pageCount,
+    start,
+    end: Math.min(rows.length, start + pageSize),
+    rows: rows.slice(start, start + pageSize),
+  });
+}
+
+function auditRowsSignature(rows) {
+  return rows.map((row) => (
+    `${row.createdAt}:${row.action}:${row.outcome}:${JSON.stringify(row.details)}`
+  )).join("|");
+}
+
+export function nextAuditPaginationState(previous, rows) {
+  const signature = auditRowsSignature(rows);
+  return Object.freeze({
+    signature,
+    page: previous.signature !== null && previous.signature !== signature
+      ? 0
+      : previous.page,
+  });
+}
+
+function renderAuditPage() {
+  const window = auditPageWindow(state.auditRows, state.auditPage);
+  state.auditPage = window.page;
+  $("#audit-rows").replaceChildren(...window.rows.map(auditRow));
+  $("#audit-empty").hidden = state.auditRows.length !== 0;
+  const pagination = $("#audit-pagination");
+  if (!pagination) return;
+  pagination.hidden = state.auditRows.length <= AUDIT_PAGE_SIZE;
+  $("#audit-previous").disabled = window.page === 0;
+  $("#audit-next").disabled = window.page >= window.pageCount - 1;
+  $("#audit-page-status").textContent = state.auditRows.length === 0
+    ? "No recent actions"
+    : `Showing ${window.start + 1}–${window.end} of ${
+      state.auditRows.length === AUDIT_RESULT_LIMIT
+        ? `the latest ${AUDIT_RESULT_LIMIT}`
+        : state.auditRows.length
+    } recent actions`;
+}
+
 function renderAudit(rows) {
-  $("#audit-rows").replaceChildren(...rows.map(auditRow));
-  $("#audit-empty").hidden = rows.length !== 0;
+  const next = nextAuditPaginationState({
+    signature: state.auditSignature,
+    page: state.auditPage,
+  }, rows);
+  state.auditPage = next.page;
+  state.auditSignature = next.signature;
+  state.auditRows = rows;
+  renderAuditPage();
 }
 
 function storageRead(key, fallback) {
@@ -1466,24 +1916,69 @@ function notificationDefaults() {
   return {
     enabled: false,
     repeatMinutes: 0,
+    topics: [...NOTIFICATION_TOPIC_IDS],
     lastFingerprint: null,
     lastSentAt: null,
   };
 }
 
-function readNotificationPreferences() {
-  const saved = storageRead(NOTIFICATION_STORAGE_KEY, notificationDefaults());
+export function projectNotificationPreferences(saved) {
   const repeatMinutes = Number(saved?.repeatMinutes);
+  const topics = Array.isArray(saved?.topics)
+    ? NOTIFICATION_TOPIC_IDS.filter((topic) => saved.topics.includes(topic))
+    : [...NOTIFICATION_TOPIC_IDS];
   return {
     enabled: saved?.enabled === true,
     repeatMinutes: NOTIFICATION_REPEAT_OPTIONS.has(repeatMinutes)
       ? repeatMinutes
       : 0,
+    topics,
     lastFingerprint: typeof saved?.lastFingerprint === "string"
       ? saved.lastFingerprint
       : null,
     lastSentAt: Number.isFinite(saved?.lastSentAt) ? saved.lastSentAt : null,
   };
+}
+
+export function resetNotificationRecurrence(preferences, changes = {}) {
+  return {
+    ...preferences,
+    ...changes,
+    lastFingerprint: null,
+    lastSentAt: null,
+  };
+}
+
+export function notificationPermissionStatus({
+  supported,
+  permission,
+  enabled,
+  topicCount,
+  repeatMinutes,
+}) {
+  if (!supported) {
+    return "Native notifications are unavailable in this browser. The on-page attention list still works.";
+  }
+  if (permission === "denied") {
+    return "Blocked for this site. Allow notifications in your browser site settings, then return to this tab.";
+  }
+  if (enabled && topicCount === 0) return "On, but no alert topics are selected.";
+  if (enabled && repeatMinutes === 0) {
+    return `On for ${topicCount} selected topics · once per changed state.`;
+  }
+  if (enabled) return `Enabled: unresolved alerts repeat every ${repeatMinutes} minutes.`;
+  return "Off.";
+}
+
+function readNotificationPreferences() {
+  const current = storageRead(NOTIFICATION_STORAGE_KEY, null);
+  const legacy = current === null
+    ? storageRead(LEGACY_NOTIFICATION_STORAGE_KEY, notificationDefaults())
+    : null;
+  const saved = current ?? legacy;
+  const projected = projectNotificationPreferences(saved);
+  if (current === null) storageWrite(NOTIFICATION_STORAGE_KEY, projected);
+  return projected;
 }
 
 function saveNotificationPreferences(preferences) {
@@ -1510,45 +2005,65 @@ function updateNotificationControls() {
   const repeat = $("#notification-repeat-minutes");
   const test = $("#notification-test");
   const api = notificationApi();
+  for (const topic of document.querySelectorAll?.('input[name="notification-topic"]') ?? []) {
+    topic.checked = preferences.topics.includes(topic.value);
+  }
   if (!api) {
     enabled.checked = false;
     enabled.disabled = true;
     repeat.disabled = true;
     test.disabled = true;
-    setNotificationStatus("This browser does not support native notifications.");
+    setNotificationStatus(notificationPermissionStatus({ supported: false }));
     return;
   }
   enabled.checked = preferences.enabled && api.permission === "granted";
+  enabled.disabled = api.permission === "denied";
   repeat.value = String(preferences.repeatMinutes);
-  repeat.disabled = !enabled.checked;
-  test.disabled = !enabled.checked;
-  if (api.permission === "denied") {
-    setNotificationStatus("Blocked in browser settings.");
-  } else if (enabled.checked) {
-    setNotificationStatus(
-      preferences.repeatMinutes === 0
-        ? "Enabled: once for each new attention state."
-        : `Enabled: unresolved alerts repeat every ${preferences.repeatMinutes} minutes.`,
-    );
-  } else {
-    setNotificationStatus("Off.");
-  }
+  const hasTopics = preferences.topics.length > 0;
+  repeat.disabled = !enabled.checked || !hasTopics;
+  test.disabled = !enabled.checked || !hasTopics;
+  setNotificationStatus(notificationPermissionStatus({
+    supported: true,
+    permission: api.permission,
+    enabled: enabled.checked,
+    topicCount: preferences.topics.length,
+    repeatMinutes: preferences.repeatMinutes,
+  }));
 }
 
 function notificationFingerprint(items) {
   return items
     .filter((item) => item.level !== "ok")
-    .map((item) => `${item.level}:${item.title}:${item.detail}`)
+    .map((item) => `${item.id}:${item.topic}:${item.level}:${item.title}:${item.detail}`)
     .sort()
     .join("|");
 }
 
+export function selectedNotificationAlerts(items, topics) {
+  const selectedTopics = new Set(topics);
+  return items.filter((item) => item.level !== "ok" && selectedTopics.has(item.topic));
+}
+
+export function notificationPreferencesAfterResolution(preferences, alerts) {
+  if (alerts.length !== 0
+      || (preferences.lastFingerprint === null && preferences.lastSentAt === null)) {
+    return preferences;
+  }
+  return resetNotificationRecurrence(preferences);
+}
+
 function notifyAttention(items) {
   if (!isAdminPage) return;
-  const alerts = items.filter((item) => item.level !== "ok");
-  document.title = alerts.length > 0 ? `• ${ADMIN_TITLE}` : ADMIN_TITLE;
+  const allAlerts = items.filter((item) => item.level !== "ok");
+  document.title = allAlerts.length > 0 ? `• ${ADMIN_TITLE}` : ADMIN_TITLE;
   const preferences = state.notificationPreferences ?? readNotificationPreferences();
-  if (!preferences.enabled || alerts.length === 0) return;
+  const alerts = selectedNotificationAlerts(allAlerts, preferences.topics);
+  if (alerts.length === 0) {
+    const resolved = notificationPreferencesAfterResolution(preferences, alerts);
+    if (resolved !== preferences) saveNotificationPreferences(resolved);
+    return;
+  }
+  if (!preferences.enabled) return;
   const api = notificationApi();
   if (!api || api.permission !== "granted") return;
   const fingerprint = notificationFingerprint(alerts);
@@ -1646,49 +2161,558 @@ function scheduleRefresh({ retry = false } = {}) {
   refreshStatusText();
 }
 
-function renderCommunityRangeControls() {
-  const controls = $("#admin-community-range-controls");
-  if (!controls) return;
-  for (const button of controls.querySelectorAll("button[data-range-days]")) {
-    const value = button.dataset.rangeDays;
-    const selected = value === "all"
-      ? state.communityRangeDays === null
-      : Number(value) === state.communityRangeDays;
+const ADMIN_ALLOWANCE_DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
+const ADMIN_ALLOWANCE_CHART_WIDTH = 960;
+const ADMIN_ALLOWANCE_CHART_HEIGHT = 300;
+const ADMIN_ALLOWANCE_PLAN_STYLES = Object.freeze({
+  pro: Object.freeze({ label: "Pro 20x", className: "pro" }),
+  prolite: Object.freeze({ label: "Pro 5x → 20x", className: "prolite" }),
+  plus: Object.freeze({ label: "Plus → 20x", className: "plus" }),
+});
+
+function adminAllowanceTickStep(span, target = 4) {
+  if (!Number.isFinite(span) || span <= 0) return 1;
+  const raw = span / Math.max(1, target);
+  const magnitude = 10 ** Math.floor(Math.log10(raw));
+  const normalized = raw / magnitude;
+  const factor = normalized <= 1 ? 1
+    : normalized <= 2 ? 2
+      : normalized <= 2.5 ? 2.5
+        : normalized <= 5 ? 5
+          : 10;
+  return factor * magnitude;
+}
+
+function adminAllowanceSegments(points) {
+  const segments = [];
+  let segment = [];
+  for (const point of points) {
+    const prior = segment[segment.length - 1];
+    if (prior && Math.round(
+      (Date.parse(`${point.day}T00:00:00.000Z`)
+        - Date.parse(`${prior.day}T00:00:00.000Z`))
+        / ADMIN_ALLOWANCE_DAY_MILLISECONDS,
+    ) > 1) {
+      segments.push(segment);
+      segment = [];
+    }
+    segment.push(point);
+  }
+  if (segment.length > 0) segments.push(segment);
+  return segments;
+}
+
+/**
+ * Pure geometry for the admin-only merge preview. Every line shares the same
+ * UTC date and Pro-20x-equivalent dollar axes, so switching views changes the
+ * evidence shown rather than the meaning of the scale.
+ */
+export function adminAllowanceChartModel(preview, {
+  mode = "combined",
+  planFilter = null,
+  rangeDays = 30,
+  width = ADMIN_ALLOWANCE_CHART_WIDTH,
+  height = ADMIN_ALLOWANCE_CHART_HEIGHT,
+} = {}) {
+  if (!preview || !Array.isArray(preview.days) || preview.days.length === 0
+      || (mode !== "combined" && mode !== "plans")) {
+    return null;
+  }
+  const anchor = preview.days.at(-1).day;
+  const cutoffMs = rangeDays === null
+    ? Number.NEGATIVE_INFINITY
+    : Date.parse(`${anchor}T00:00:00.000Z`)
+      - (rangeDays - 1) * ADMIN_ALLOWANCE_DAY_MILLISECONDS;
+  const days = preview.days.filter((day) => (
+    Date.parse(`${day.day}T00:00:00.000Z`) >= cutoffMs
+  ));
+  if (days.length === 0) return null;
+  const planSeries = preview.plans.map((plan) => ({
+    key: plan.planType,
+    ...ADMIN_ALLOWANCE_PLAN_STYLES[plan.planType],
+  }));
+  const activePlanFilter = mode === "plans"
+    && planSeries.some((plan) => plan.key === planFilter)
+    ? planFilter
+    : null;
+  const legendSeries = mode === "combined"
+    ? [{ key: "combined", label: "Combined", className: "combined" }]
+    : planSeries;
+  const series = activePlanFilter === null
+    ? legendSeries
+    : planSeries.filter((plan) => plan.key === activePlanFilter);
+  const summaryFor = (day, key) => (
+    key === "combined" ? day.combined : day.byPlanType[key]
+  );
+  let visibleValueCount = 0;
+  const valueCandidates = [];
+  for (const day of days) {
+    for (const definition of series) {
+      const summary = summaryFor(day, definition.key);
+      if (summary?.centralUsd !== null && summary?.centralUsd !== undefined) {
+        visibleValueCount += 1;
+      }
+    }
+    // Keep the numerical y-axis fixed while the operator switches between
+    // Combined and By plan. Otherwise the same vertical movement could appear
+    // larger merely because a different series changed the automatic scale.
+    if (day.combined.centralUsd !== null) {
+      valueCandidates.push(day.combined.centralUsd);
+      if (day.combined.band80Usd !== null) {
+        valueCandidates.push(day.combined.band80Usd.lowerUsd);
+        valueCandidates.push(day.combined.band80Usd.upperUsd);
+      }
+    }
+    for (const plan of preview.plans) {
+      const summary = day.byPlanType[plan.planType];
+      const central = summary?.centralUsd;
+      if (central !== null && central !== undefined) valueCandidates.push(central);
+      if (summary?.band80Usd !== null && summary?.band80Usd !== undefined) {
+        valueCandidates.push(
+          summary.band80Usd.lowerUsd,
+          summary.band80Usd.upperUsd,
+        );
+      }
+    }
+  }
+  if (visibleValueCount === 0 || valueCandidates.length === 0) return null;
+  const margin = { top: 16, right: 24, bottom: 34, left: 64 };
+  const plot = {
+    top: margin.top,
+    right: width - margin.right,
+    bottom: height - margin.bottom,
+    left: margin.left,
+  };
+  const startMs = Date.parse(`${days[0].day}T00:00:00.000Z`);
+  const endMs = Date.parse(`${days.at(-1).day}T00:00:00.000Z`);
+  const x = (day) => {
+    const atMs = Date.parse(`${day}T00:00:00.000Z`);
+    return startMs === endMs
+      ? plot.left + (plot.right - plot.left) / 2
+      : plot.left + ((atMs - startMs) / (endMs - startMs))
+        * (plot.right - plot.left);
+  };
+  const step = adminAllowanceTickStep(Math.max(...valueCandidates));
+  const axisTop = Math.ceil(Math.max(...valueCandidates) / step) * step;
+  const y = (value) => plot.bottom
+    - (value / axisTop) * (plot.bottom - plot.top);
+  const dollarTicks = [];
+  for (let value = 0; value <= axisTop + step / 100; value += step) {
+    dollarTicks.push({ value, y: y(value) });
+  }
+  const modeledSeries = series.map((definition) => {
+    const points = days.flatMap((day) => {
+      const summary = summaryFor(day, definition.key);
+      if (!summary || summary.centralUsd === null) return [];
+      return [{
+        day: day.day,
+        value: summary.centralUsd,
+        fitCount: summary.fitCount,
+        participantCount: summary.participantCount,
+        x: x(day.day),
+        y: y(summary.centralUsd),
+      }];
+    });
+    return {
+      ...definition,
+      points,
+      segments: adminAllowanceSegments(points),
+      latest: points.at(-1) ?? null,
+    };
+  });
+  const bandSeries = series.flatMap((definition) => {
+    const points = days.flatMap((day) => {
+      const band = summaryFor(day, definition.key)?.band80Usd;
+      return band === null || band === undefined ? [] : [{
+        day: day.day,
+        x: x(day.day),
+        upperY: y(band.upperUsd),
+        lowerY: y(band.lowerUsd),
+      }];
+    });
+    const segments = adminAllowanceSegments(points);
+    return segments.length === 0 ? [] : [{ ...definition, segments }];
+  });
+  const maximumTicks = 6;
+  const dayTicks = Array.from({ length: maximumTicks }, (_, index) => {
+    const atMs = startMs + Math.round(
+      ((endMs - startMs) * index) / (maximumTicks - 1)
+      / ADMIN_ALLOWANCE_DAY_MILLISECONDS,
+    ) * ADMIN_ALLOWANCE_DAY_MILLISECONDS;
+    const day = new Date(atMs).toISOString().slice(0, 10);
+    return { day, x: x(day) };
+  }).filter((tick, index, ticks) => index === 0 || tick.day !== ticks[index - 1].day);
+  return {
+    width,
+    height,
+    plot,
+    dollarTicks,
+    dayTicks,
+    tickLabelStyle: days.length > 45 ? "month" : "day",
+    mode,
+    activePlanFilter,
+    legendSeries,
+    series: modeledSeries,
+    bandSeries,
+    bandSegments: bandSeries.flatMap((band) => band.segments),
+  };
+}
+
+export function toggleAdminAllowancePlanFilter(
+  currentPlanType,
+  selectedPlanType,
+  plans,
+) {
+  if (!plans.some((plan) => plan.planType === selectedPlanType)) return null;
+  return currentPlanType === selectedPlanType ? null : selectedPlanType;
+}
+function adminAllowanceSvg(tag, className = "", attributes = {}) {
+  const element = document.createElementNS(SVG_NAMESPACE, tag);
+  if (className) element.setAttribute("class", className);
+  for (const [name, value] of Object.entries(attributes)) {
+    element.setAttribute(name, String(value));
+  }
+  return element;
+}
+
+function latestAllowanceSummary(preview, key) {
+  for (const day of [...preview.days].reverse()) {
+    const summary = key === "combined" ? day.combined : day.byPlanType[key];
+    if (summary.centralUsd !== null) return { day: day.day, summary };
+  }
+  return null;
+}
+
+function allowanceUsd(value) {
+  return new Intl.NumberFormat(undefined, {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 0,
+  }).format(value);
+}
+
+function allowanceCountLabel(value, singular) {
+  return `${value} ${singular}${value === 1 ? "" : "s"}`;
+}
+
+function appendAdminAllowanceLegend(figure, model) {
+  const legend = document.createElement("div");
+  legend.className = "admin-allowance-legend";
+  if (model.mode === "plans") {
+    legend.classList.add("admin-allowance-legend-interactive");
+    if (model.activePlanFilter !== null) {
+      legend.classList.add("admin-allowance-legend-filtered");
+    }
+    legend.setAttribute("role", "group");
+    legend.setAttribute("aria-label", "Filter allowance chart by plan");
+  }
+  for (const series of model.legendSeries) {
+    const item = document.createElement(model.mode === "plans" ? "button" : "span");
+    if (model.mode === "plans") {
+      const selected = model.activePlanFilter === series.key;
+      item.type = "button";
+      item.className = "admin-allowance-legend-button";
+      item.dataset.allowancePlan = series.key;
+      item.setAttribute("aria-pressed", String(selected));
+      item.setAttribute(
+        "aria-label",
+        selected ? `Show all plans` : `Show only ${series.label}`,
+      );
+      item.title = selected
+        ? "Show all plans"
+        : `Filter chart to ${series.label}`;
+    }
+    const swatch = document.createElement("span");
+    swatch.className = model.mode === "plans"
+      ? `admin-allowance-plan-key admin-allowance-plan-key-${series.className}`
+      : `admin-allowance-swatch admin-allowance-swatch-${series.className}`;
+    swatch.setAttribute("aria-hidden", "true");
+    const label = document.createElement("span");
+    label.textContent = series.label;
+    item.append(swatch, label);
+    legend.append(item);
+  }
+  if (model.mode === "combined" && model.bandSegments.length > 0) {
+    const item = document.createElement("span");
+    const swatch = document.createElement("span");
+    swatch.className = "admin-allowance-swatch admin-allowance-swatch-band";
+    swatch.setAttribute("aria-hidden", "true");
+    const label = document.createElement("span");
+    label.textContent = "Middle 80% of fitted windows";
+    item.append(swatch, label);
+    legend.append(item);
+  }
+  figure.append(legend);
+}
+
+function appendAdminAllowanceChart(container, preview) {
+  const model = adminAllowanceChartModel(preview, {
+    mode: state.allowanceMode,
+    planFilter: state.allowancePlanFilter,
+    rangeDays: state.allowanceRangeDays,
+  });
+  if (model === null) {
+    const empty = document.createElement("p");
+    empty.className = "admin-allowance-empty";
+    empty.textContent = "No qualifying fits in this range.";
+    container.append(empty);
+    return;
+  }
+  const figure = document.createElement("div");
+  figure.className = "community-daily-chart community-allowance-chart";
+  if (model.activePlanFilter !== null) {
+    figure.classList.add("community-allowance-chart-filtered");
+  }
+  appendAdminAllowanceLegend(figure, model);
+  const svg = adminAllowanceSvg("svg", "", {
+    viewBox: `0 0 ${model.width} ${model.height}`,
+    role: "img",
+    "aria-label": state.allowanceMode === "combined"
+      ? "Combined Pro 20x-equivalent community allowance by day"
+      : model.activePlanFilter === null
+        ? "Pro 20x-equivalent community allowance by plan and day"
+        : `${model.series[0].label} Pro 20x-equivalent community allowance by day`,
+  });
+  for (const tick of model.dollarTicks) {
+    svg.append(adminAllowanceSvg("line", "chart-grid", {
+      x1: model.plot.left,
+      x2: model.plot.right,
+      y1: tick.y,
+      y2: tick.y,
+    }));
+    const label = adminAllowanceSvg("text", "chart-axis-label", {
+      x: model.plot.left - 8,
+      y: tick.y + 3,
+      "text-anchor": "end",
+    });
+    label.textContent = allowanceUsd(tick.value);
+    svg.append(label);
+  }
+  const tickFormatter = new Intl.DateTimeFormat(undefined, model.tickLabelStyle === "month"
+    ? { timeZone: "UTC", month: "short", year: "numeric" }
+    : { timeZone: "UTC", month: "short", day: "numeric" });
+  for (const tick of model.dayTicks) {
+    const label = adminAllowanceSvg("text", "chart-axis-label", {
+      x: tick.x,
+      y: model.height - 10,
+      "text-anchor": "middle",
+    });
+    label.textContent = tickFormatter.format(new Date(`${tick.day}T00:00:00.000Z`));
+    svg.append(label);
+  }
+  for (const bandSeries of model.bandSeries) {
+    for (const band of bandSeries.segments) {
+      if (band.length >= 2) {
+        const forward = band.map((point) => (
+          `${point.x.toFixed(1)},${point.upperY.toFixed(1)}`
+        ));
+        const backward = [...band].reverse().map((point) => (
+          `${point.x.toFixed(1)},${point.lowerY.toFixed(1)}`
+        ));
+        svg.append(adminAllowanceSvg(
+          "path",
+          `admin-allowance-band-area admin-allowance-band-area-${bandSeries.className}`,
+          { d: `M${[...forward, ...backward].join(" L")} Z` },
+        ));
+      } else {
+        svg.append(adminAllowanceSvg(
+          "line",
+          `admin-allowance-band-mark admin-allowance-band-mark-${bandSeries.className}`,
+          {
+            x1: band[0].x,
+            x2: band[0].x,
+            y1: band[0].upperY,
+            y2: band[0].lowerY,
+          },
+        ));
+      }
+    }
+  }
+  for (const series of model.series) {
+    for (const segment of series.segments) {
+      if (segment.length >= 2) {
+        svg.append(adminAllowanceSvg(
+          "polyline",
+          `admin-allowance-line admin-allowance-line-${series.className}`,
+          { points: segment.map((point) => (
+            `${point.x.toFixed(1)},${point.y.toFixed(1)}`
+          )).join(" ") },
+        ));
+      }
+    }
+    for (const point of series.points) {
+      const dot = adminAllowanceSvg(
+        "circle",
+        `admin-allowance-dot admin-allowance-dot-${series.className}`,
+        {
+          cx: point.x,
+          cy: point.y,
+          r: Math.min(6, 2.4 + Math.sqrt(point.fitCount)),
+          tabindex: 0,
+          "aria-label": `${series.label}, ${point.day}: ${allowanceUsd(point.value)}, ${allowanceCountLabel(point.participantCount, "account")}, ${allowanceCountLabel(point.fitCount, "fit")}`,
+        },
+      );
+      const title = adminAllowanceSvg("title");
+      title.textContent = `${series.label} · ${point.day} · ${allowanceUsd(point.value)} · ${allowanceCountLabel(point.participantCount, "account")} · ${allowanceCountLabel(point.fitCount, "fit")}`;
+      dot.append(title);
+      svg.append(dot);
+    }
+  }
+  figure.append(svg);
+  container.append(figure);
+}
+
+function appendCombinedAllowanceSummary(container, preview) {
+  const latest = latestAllowanceSummary(preview, "combined");
+  if (latest === null) return;
+  const summary = document.createElement("div");
+  summary.className = "admin-allowance-summary";
+  const value = document.createElement("p");
+  value.className = "admin-allowance-value";
+  value.textContent = allowanceUsd(latest.summary.centralUsd);
+  const unit = document.createElement("span");
+  unit.className = "admin-allowance-unit";
+  unit.textContent = "per 7 days, Pro 20x equivalent";
+  const meta = document.createElement("p");
+  meta.className = "admin-allowance-meta";
+  const evidence = document.createElement("span");
+  const accounts = document.createElement("strong");
+  accounts.textContent = String(latest.summary.participantCount);
+  const fits = document.createElement("strong");
+  fits.textContent = String(latest.summary.fitCount);
+  evidence.append(
+    accounts,
+    document.createTextNode(` ${latest.summary.participantCount === 1 ? "account" : "accounts"} · `),
+    fits,
+    document.createTextNode(` ${latest.summary.fitCount === 1 ? "fit" : "fits"}`),
+  );
+  const date = document.createElement("span");
+  date.textContent = latest.day;
+  meta.append(evidence, date);
+  if (latest.summary.band80Usd !== null) {
+    const range = document.createElement("span");
+    range.textContent = `${allowanceUsd(latest.summary.band80Usd.lowerUsd)}–${allowanceUsd(latest.summary.band80Usd.upperUsd)} range`;
+    meta.append(range);
+  }
+  summary.append(value, unit, meta);
+  container.append(summary);
+}
+
+function appendPlanAllowanceSummaries(container, preview) {
+  const list = document.createElement("div");
+  list.className = "admin-allowance-plan-summaries";
+  for (const plan of preview.plans) {
+    const latest = latestAllowanceSummary(preview, plan.planType);
+    const style = ADMIN_ALLOWANCE_PLAN_STYLES[plan.planType];
+    const item = document.createElement("div");
+    item.className = "admin-allowance-plan-summary";
+    if (state.allowancePlanFilter === plan.planType) {
+      item.classList.add("admin-allowance-plan-summary-selected");
+    }
+    const label = document.createElement("span");
+    label.textContent = style.label;
+    const value = document.createElement("strong");
+    value.textContent = latest === null ? "—" : allowanceUsd(latest.summary.centralUsd);
+    const meta = document.createElement("small");
+    meta.textContent = latest === null
+      ? "No qualifying fits"
+      : `${allowanceCountLabel(latest.summary.participantCount, "account")} · ${allowanceCountLabel(latest.summary.fitCount, "fit")}`;
+    const range = document.createElement("small");
+    range.className = "admin-allowance-plan-range";
+    range.textContent = latest?.summary.band80Usd
+      ? `Middle 80% ${allowanceUsd(latest.summary.band80Usd.lowerUsd)}–${allowanceUsd(latest.summary.band80Usd.upperUsd)}`
+      : "Middle 80% unavailable";
+    item.append(label, value, meta, range);
+    list.append(item);
+  }
+  container.append(list);
+}
+
+function appendAllowanceCoverage(container, coverage) {
+  const panel = document.createElement("div");
+  panel.className = "admin-allowance-coverage";
+  if (coverage === null) {
+    panel.textContent = "Coverage summary is not available in this cached preview.";
+    container.append(panel);
+    return;
+  }
+  const funnel = document.createElement("p");
+  funnel.className = "admin-allowance-coverage-funnel";
+  funnel.textContent = `${count(coverage.uploadingParticipantCount)} uploading · ${count(coverage.cachedParticipantCount)} cached · ${count(coverage.recentFittedParticipantCount)} recent fitted · ${count(coverage.mergeEligibleParticipantCount)} merged`;
+  const reasons = [
+    [coverage.noQualifyingFitParticipantCount, "no qualifying fit yet"],
+    [coverage.noRecentFitParticipantCount, "no recent fit"],
+    [coverage.unsupportedPlanParticipantCount, "unknown or unsupported plan"],
+  ].filter(([value]) => value > 0);
+  const detail = document.createElement("p");
+  detail.className = "admin-allowance-coverage-gaps";
+  detail.textContent = reasons.length > 0
+    ? reasons.map(([value, label]) => `${count(value)} ${label}`).join(" · ")
+    : "Every uploading account contributes to the merged estimate.";
+  panel.append(funnel, detail);
+  container.append(panel);
+}
+function renderAdminAllowanceControls() {
+  const modeControls = $("#admin-community-mode-controls");
+  for (const button of modeControls?.querySelectorAll("button[data-allowance-mode]") ?? []) {
+    const selected = button.dataset.allowanceMode === state.allowanceMode;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  }
+  const rangeControls = $("#admin-community-range-controls");
+  for (const button of rangeControls?.querySelectorAll("button[data-range-days]") ?? []) {
+    const selected = button.dataset.rangeDays === "all"
+      ? state.allowanceRangeDays === null
+      : Number(button.dataset.rangeDays) === state.allowanceRangeDays;
     button.classList.toggle("active", selected);
     button.setAttribute("aria-pressed", String(selected));
   }
 }
 
-function renderAdminCommunityAllowance(payload) {
+function renderAdminCommunityAllowance(preview) {
   if (!isAdminPage) return;
   const container = $("#admin-community-allowance-result");
-  const stateNode = $("#admin-community-allowance-state");
-  if (!container || !stateNode) return;
-  const result = renderCommunityAllowanceSection({
-    documentRef: document,
-    container,
-    stateNode,
-    payload,
-    rangeDays: state.communityRangeDays,
-  });
   const badge = $("#admin-community-status");
-  const available = result === "published";
-  badge.className = `admin-source-badge ${
-    available ? "admin-source-available" : "admin-source-partial"
-  }`;
-  badge.textContent = available ? "Public graph available" : "Public graph unavailable";
-  renderCommunityRangeControls();
+  if (!container || !badge) return;
+  container.replaceChildren();
+  if (preview === null) {
+    badge.className = "admin-source-badge admin-source-partial";
+    badge.textContent = "Preview unavailable";
+    const empty = document.createElement("p");
+    empty.className = "admin-allowance-empty";
+    empty.textContent = "The allowance preview could not be loaded.";
+    container.append(empty);
+    renderAdminAllowanceControls();
+    return;
+  }
+  badge.className = "admin-source-badge admin-source-available";
+  badge.textContent = "Admin preview available";
+  if (!preview.plans.some((plan) => plan.planType === state.allowancePlanFilter)) {
+    state.allowancePlanFilter = null;
+  }
+  if (state.allowanceMode === "combined") {
+    appendCombinedAllowanceSummary(container, preview);
+  } else {
+    appendPlanAllowanceSummaries(container, preview);
+  }
+  appendAllowanceCoverage(container, preview.coverage);
+  appendAdminAllowanceChart(container, preview);
+  renderAdminAllowanceControls();
 }
 
-async function loadAdminCommunityAllowance() {
+async function loadAdminCommunityAllowance(loadGeneration) {
   if (!isAdminPage) return;
+  let preview;
   try {
-    state.communityPayload = await communityClient.communityDaily();
-    renderAdminCommunityAllowance(state.communityPayload);
+    preview = projectAdminAllowancePreview(await request(
+      "/api/v1/admin/community/allowance-preview",
+    ));
   } catch {
-    state.communityPayload = null;
-    renderAdminCommunityAllowance(null);
+    preview = null;
   }
+  if (!isCurrentLoadGeneration(loadGeneration, state.loadGeneration)) return;
+  state.allowancePreview = preview;
+  renderAdminCommunityAllowance(state.allowancePreview);
 }
 
 function render(overview) {
@@ -1709,6 +2733,7 @@ function render(overview) {
 
 async function load() {
   if (state.loading) return;
+  const loadGeneration = ++state.loadGeneration;
   state.loading = true;
   let succeeded = false;
   $("#refresh").disabled = true;
@@ -1718,15 +2743,15 @@ async function load() {
     // the owner-email pin, and CSRF is the always-sent x-usage-monitor-admin
     // header. The old /api/v1/session pre-fetch 401'd here and was the dead
     // console symptom.
-    const reference = $("#diagnostic-reference").value.trim();
-    const query = reference ? `?diagnosticReference=${encodeURIComponent(reference)}` : "";
-    render(projectAdminOverview(await request(`/api/v1/admin/overview${query}`)));
+    const overview = projectAdminOverview(await request("/api/v1/admin/overview"));
+    state.metricsHistory = undefined;
+    render(overview);
     $("#notice").hidden = true;
     state.lastSuccessfulLoadAt = Date.now();
     state.retryDelayMilliseconds = 30_000;
     succeeded = true;
-    void loadAdminCommunityAllowance();
-    void loadGrowthHistory();
+    void loadAdminCommunityAllowance(loadGeneration);
+    void loadGrowthHistory(loadGeneration);
   } catch (error) {
     showNotice(`Operations view unavailable: ${error.message}.`);
     state.retryDelayMilliseconds = Math.min(
@@ -1743,7 +2768,7 @@ async function load() {
 $("#refresh").addEventListener("click", () => load());
 $("#diagnostic-form").addEventListener("submit", (event) => {
   event.preventDefault();
-  void load();
+  void lookupDiagnosticReference();
 });
 $("#controls-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -1787,6 +2812,14 @@ $("#run-maintenance").addEventListener("click", async () => {
 });
 
 if (isAdminPage) {
+  $("#audit-previous").addEventListener("click", () => {
+    state.auditPage -= 1;
+    renderAuditPage();
+  });
+  $("#audit-next").addEventListener("click", () => {
+    state.auditPage += 1;
+    renderAuditPage();
+  });
   const autoRefresh = $("#auto-refresh-minutes");
   autoRefresh.value = String(selectedAutoRefreshMinutes());
   autoRefresh.addEventListener("change", () => {
@@ -1807,13 +2840,15 @@ if (isAdminPage) {
     const preferences = state.notificationPreferences ?? readNotificationPreferences();
     const api = notificationApi();
     if (!control.checked) {
-      saveNotificationPreferences({ ...preferences, enabled: false });
+      saveNotificationPreferences(resetNotificationRecurrence(preferences, {
+        enabled: false,
+      }));
       updateNotificationControls();
       return;
     }
     if (!api) {
       control.checked = false;
-      setNotificationStatus("This browser does not support native notifications.");
+      setNotificationStatus("Native notifications are unavailable in this browser.");
       return;
     }
     const permission = api.permission === "default"
@@ -1825,21 +2860,35 @@ if (isAdminPage) {
       updateNotificationControls();
       return;
     }
-    saveNotificationPreferences({ ...preferences, enabled: true });
+    saveNotificationPreferences(resetNotificationRecurrence(preferences, {
+      enabled: true,
+    }));
     updateNotificationControls();
     if (state.overview) notifyAttention(collectAttentionItems(state.overview));
   });
   $("#notification-repeat-minutes").addEventListener("change", (event) => {
     const repeatMinutes = Number(event.currentTarget.value);
     const preferences = state.notificationPreferences ?? readNotificationPreferences();
-    saveNotificationPreferences({
-      ...preferences,
+    saveNotificationPreferences(resetNotificationRecurrence(preferences, {
       repeatMinutes: NOTIFICATION_REPEAT_OPTIONS.has(repeatMinutes)
         ? repeatMinutes
         : 0,
-    });
+    }));
     updateNotificationControls();
   });
+  for (const topic of document.querySelectorAll('input[name="notification-topic"]')) {
+    topic.addEventListener("change", () => {
+      const preferences = state.notificationPreferences ?? readNotificationPreferences();
+      const topics = [...document.querySelectorAll('input[name="notification-topic"]')]
+        .filter((input) => input.checked)
+        .map((input) => input.value)
+        .filter((value) => NOTIFICATION_TOPIC_IDS.includes(value));
+      saveNotificationPreferences(resetNotificationRecurrence(preferences, {
+        topics,
+      }));
+      updateNotificationControls();
+    });
+  }
   $("#notification-test").addEventListener("click", () => {
     const api = notificationApi();
     if (!api || api.permission !== "granted") {
@@ -1847,23 +2896,42 @@ if (isAdminPage) {
       return;
     }
     try {
-      new api("TiboTattle admin test", {
-        body: "Browser alerts are enabled for this private admin browser.",
+      const preferences = state.notificationPreferences ?? readNotificationPreferences();
+      const labels = preferences.topics.map((topic) => NOTIFICATION_TOPICS[topic]);
+      new api("TiboTattle admin notification test", {
+        body: `Test only — no incident detected. Selected topics: ${labels.join(", ")}.`,
         tag: "tibotattle-admin-test",
         renotify: true,
       });
-      setNotificationStatus("Test alert sent.");
+      setNotificationStatus("Test notification requested. Delivery is controlled by your browser and operating system.");
     } catch {
       setNotificationStatus("The browser could not show a test alert.");
     }
   });
+  window.addEventListener("focus", updateNotificationControls);
+  $("#admin-community-mode-controls").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-allowance-mode]");
+    if (!button) return;
+    state.allowanceMode = button.dataset.allowanceMode;
+    renderAdminCommunityAllowance(state.allowancePreview);
+  });
   $("#admin-community-range-controls").addEventListener("click", (event) => {
     const button = event.target.closest("button[data-range-days]");
     if (!button) return;
-    state.communityRangeDays = button.dataset.rangeDays === "all"
+    state.allowanceRangeDays = button.dataset.rangeDays === "all"
       ? null
       : Number(button.dataset.rangeDays);
-    renderAdminCommunityAllowance(state.communityPayload);
+    renderAdminCommunityAllowance(state.allowancePreview);
+  });
+  $("#admin-community-allowance-result").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-allowance-plan]");
+    if (!button || state.allowancePreview === null) return;
+    state.allowancePlanFilter = toggleAdminAllowancePlanFilter(
+      state.allowancePlanFilter,
+      button.dataset.allowancePlan,
+      state.allowancePreview.plans,
+    );
+    renderAdminCommunityAllowance(state.allowancePreview);
   });
   $("#sync-distribution").addEventListener("click", async () => {
     const button = $("#sync-distribution");

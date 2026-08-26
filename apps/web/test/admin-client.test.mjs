@@ -5,7 +5,9 @@ import {
   AdminResponseError,
   adminActionErrorMessage,
   adminResponseError,
+  projectAdminAllowancePreview,
   projectAdminAction,
+  projectAdminMetricsHistory,
   projectAdminOverview,
 } from "../public/admin-client.js";
 
@@ -13,6 +15,224 @@ const fixture = async (name) => JSON.parse(await readFile(
   new URL(`./fixtures/${name}`, import.meta.url),
   "utf8",
 ));
+
+const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
+
+function emptyAllowanceSummary() {
+  return {
+    fitCount: 0,
+    participantCount: 0,
+    centralUsd: null,
+    band80Usd: null,
+  };
+}
+
+function allowancePreviewPayload() {
+  const fromMs = Date.parse("2026-06-15T00:00:00.000Z");
+  const days = Array.from({ length: 70 }, (_, index) => ({
+    day: new Date(fromMs + index * DAY_MILLISECONDS).toISOString().slice(0, 10),
+    combined: emptyAllowanceSummary(),
+    byPlanType: {
+      pro: emptyAllowanceSummary(),
+      prolite: emptyAllowanceSummary(),
+      plus: emptyAllowanceSummary(),
+    },
+  }));
+  days.at(-1).combined = {
+    fitCount: 6,
+    participantCount: 4,
+    centralUsd: 2_100,
+    band80Usd: { lowerUsd: 1_800, upperUsd: 2_400 },
+  };
+  days.at(-1).byPlanType = {
+    pro: {
+      fitCount: 2,
+      participantCount: 2,
+      centralUsd: 2_050,
+      band80Usd: null,
+    },
+    prolite: {
+      fitCount: 1,
+      participantCount: 1,
+      centralUsd: 2_200,
+      band80Usd: null,
+    },
+    plus: {
+      fitCount: 3,
+      participantCount: 2,
+      centralUsd: 1_900,
+      band80Usd: { lowerUsd: 1_700, upperUsd: 2_100 },
+    },
+  };
+  return {
+    schemaVersion: "admin-community-allowance-preview-v0.1",
+    generatedAt: "2026-08-23T10:30:00.000Z",
+    from: "2026-06-15",
+    to: "2026-08-23",
+    basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview",
+    referencePlanType: "pro",
+    trailingDays: 30,
+    qualification: "shared_reset_fit_gates_40pp_span_floor",
+    spanFloorPp: 40,
+    plans: [
+      { planType: "pro", label: "Pro 20x", multiplier: 1 },
+      { planType: "prolite", label: "Pro 5x", multiplier: 4 },
+      { planType: "plus", label: "Plus", multiplier: 20 },
+    ],
+    days,
+  };
+}
+
+function metricsHistoryPayload() {
+  const event = {
+    total: 30,
+    last24Hours: 2,
+    previous24Hours: 1,
+    byDayStartsAt: "2026-07-25",
+    byDay: [
+      { day: "2026-08-22", count: 1 },
+      { day: "2026-08-23", count: 2 },
+    ],
+  };
+  return {
+    schemaVersion: "admin-metrics-history-v0.2",
+    generatedAt: "2026-08-23T12:00:00.000Z",
+    events: Object.fromEntries([
+      "participants",
+      "webSessions",
+      "devicePairings",
+      "deviceCredentials",
+      "deviceConsents",
+      "uploadedChunks",
+      "uploadedRecords",
+      "uploadingParticipants",
+      "acceptedUploads",
+    ].map((name) => [name, structuredClone(event)])),
+    downloads: {
+      available: true,
+      byDayStartsAt: "2026-07-25",
+      byDay: [
+        { day: "2026-08-22", cumulativeDmgDownloads: 10 },
+        { day: "2026-08-23", cumulativeDmgDownloads: 12 },
+      ],
+    },
+    gauges: {
+      snapshots: [{
+        capturedAt: "2026-08-22T12:00:00.000Z",
+        metrics: { participantsActive: 5 },
+      }, {
+        capturedAt: "2026-08-23T11:00:00.000Z",
+        metrics: { participantsActive: 6, contributingAccountsTotal: 4 },
+      }],
+    },
+  };
+}
+
+test("admin allowance preview projects the fixed merge trial contract", () => {
+  const preview = projectAdminAllowancePreview(allowancePreviewPayload());
+  assert.equal(preview.days.length, 70);
+  assert.deepEqual(preview.plans.map((plan) => [plan.planType, plan.multiplier]), [
+    ["pro", 1],
+    ["prolite", 4],
+    ["plus", 20],
+  ]);
+  assert.deepEqual(preview.days.at(-1).combined, {
+    fitCount: 6,
+    participantCount: 4,
+    centralUsd: 2_100,
+    band80Usd: { lowerUsd: 1_800, upperUsd: 2_400 },
+  });
+  assert.equal(Object.isFrozen(preview), true);
+  assert.equal(Object.isFrozen(preview.days), true);
+  assert.equal(Object.isFrozen(preview.days.at(-1).byPlanType), true);
+});
+
+test("admin allowance preview validates additive upload-to-merge coverage", () => {
+  const payload = allowancePreviewPayload();
+  payload.coverage = {
+    uploadingParticipantCount: 8,
+    cachedParticipantCount: 8,
+    recentFittedParticipantCount: 6,
+    mergeEligibleParticipantCount: 5,
+    noQualifyingFitParticipantCount: 2,
+    noRecentFitParticipantCount: 0,
+    unsupportedPlanParticipantCount: 1,
+  };
+  assert.deepEqual(projectAdminAllowancePreview(payload).coverage, payload.coverage);
+  payload.coverage.unsupportedPlanParticipantCount = 0;
+  assert.throws(
+    () => projectAdminAllowancePreview(payload),
+    /ADMIN_ALLOWANCE_PREVIEW_INVALID/u,
+  );
+});
+
+test("metrics history projector keeps bounded dated points and additive gauges", () => {
+  const history = projectAdminMetricsHistory(metricsHistoryPayload());
+  assert.equal(history.events.acceptedUploads.total, 30);
+  assert.equal(history.events.acceptedUploads.byDayStartsAt, "2026-07-25");
+  assert.equal(history.gauges.snapshots.at(-1).metrics.contributingAccountsTotal, 4);
+  assert.equal(Object.isFrozen(history.gauges.snapshots.at(-1).metrics), true);
+
+  const badGauge = metricsHistoryPayload();
+  badGauge.gauges.snapshots[0].metrics.participantsActive = -1;
+  assert.throws(() => projectAdminMetricsHistory(badGauge), /ADMIN_METRICS_HISTORY_INVALID/u);
+
+  const badBoundedFlag = metricsHistoryPayload();
+  badBoundedFlag.gauges.snapshots[0].metrics.participantsActiveBounded = 2;
+  assert.throws(
+    () => projectAdminMetricsHistory(badBoundedFlag),
+    /ADMIN_METRICS_HISTORY_INVALID/u,
+  );
+
+  const unsorted = metricsHistoryPayload();
+  unsorted.events.participants.byDay.reverse();
+  assert.throws(() => projectAdminMetricsHistory(unsorted), /ADMIN_METRICS_HISTORY_INVALID/u);
+});
+
+test("metrics history projector enforces the declared recent window", () => {
+  const bounded = metricsHistoryPayload();
+  bounded.events.participants.byDay.unshift({
+    day: "2026-07-24",
+    count: 1,
+  });
+  assert.throws(
+    () => projectAdminMetricsHistory(bounded),
+    /ADMIN_METRICS_HISTORY_INVALID/u,
+  );
+
+  const impossibleWindow = metricsHistoryPayload();
+  impossibleWindow.events.webSessions.last24Hours = 31;
+  assert.throws(
+    () => projectAdminMetricsHistory(impossibleWindow),
+    /ADMIN_METRICS_HISTORY_INVALID/u,
+  );
+
+  const oldSchema = metricsHistoryPayload();
+  oldSchema.schemaVersion = "admin-metrics-history-v0.1";
+  assert.throws(
+    () => projectAdminMetricsHistory(oldSchema),
+    /ADMIN_METRICS_HISTORY_INVALID/u,
+  );
+});
+
+test("admin allowance preview rejects drifted factors, chronology, and evidence", () => {
+  const mutations = [
+    (payload) => { payload.basis = "different-basis"; },
+    (payload) => { payload.plans[1].multiplier = 5; },
+    (payload) => { payload.days[1].day = payload.days[0].day; },
+    (payload) => { payload.days.at(-1).combined.band80Usd = null; },
+    (payload) => { payload.days[0].combined.participantCount = 1; },
+    (payload) => { delete payload.days.at(-1).byPlanType.plus; },
+  ];
+  for (const mutate of mutations) {
+    const payload = allowancePreviewPayload();
+    mutate(payload);
+    assert.throws(
+      () => projectAdminAllowancePreview(payload),
+      /ADMIN_ALLOWANCE_PREVIEW_INVALID/u,
+    );
+  }
+});
 
 test("admin overview fixture projects to the renderer's explicit contract", async () => {
   const overview = projectAdminOverview(await fixture("admin-overview-valid.json"));
@@ -142,6 +362,7 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
           requestsLast7Days: 9,
           sourceAddressesLast7Days: 5,
         }],
+        bySegment: [],
         observedVersionsBounded: false,
       },
       github: {
@@ -211,9 +432,13 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
     },
     pendingHistoricalRebuilds: 0,
     errors: {
+      retentionDays: 30,
+      sampled: true,
+      capacity: 256,
       groups: [{
         routeClass: "admin_overview",
         errorCode: "BACKEND_STORAGE_UNAVAILABLE",
+        status: 503,
         occurrences: 2,
         ratePerDay: 0.29,
         latestAt: "2026-08-02T10:00:00.000Z",
@@ -304,6 +529,68 @@ test("distribution sources may degrade without invalidating exact D1 counts", as
   const overview = projectAdminOverview(payload);
   assert.equal(overview.distribution.cloudflare.status, "not_configured");
   assert.equal(overview.counts.contributions.contributingAccounts.total, 2);
+});
+
+test("Cloudflare activity stays available when GitHub has no current release", async () => {
+  const payload = await fixture("admin-overview-valid.json");
+  payload.distribution.cloudflare.currentVersion = null;
+  payload.distribution.cloudflare.currentVersionSourceAddresses = null;
+  payload.distribution.cloudflare.bySegment = [{
+    startsAt: "2026-08-16T12:00:00.000Z",
+    endsAt: "2026-08-17T12:00:00.000Z",
+    activeSourceAddresses: 19,
+    preflightRequests: 22,
+    sparkleCheckRequests: 14,
+    sparkleDownloadRequests: 3,
+    currentVersionSourceAddresses: null,
+  }];
+  payload.distribution.github = {
+    status: "unavailable",
+    reasonCode: "GITHUB_SNAPSHOT_PENDING",
+    repository: "adamallcock/tibotattle",
+    release: null,
+    summary: null,
+    releases: [],
+    releasesBounded: false,
+    history: {
+      firstObservedAt: null,
+      previousObservedAt: null,
+      latestObservedAt: null,
+      dmgDownloadsSincePrevious: null,
+      counterRegressions: 0,
+    },
+    sync: {
+      lastAttemptedAt: null,
+      lastSuccessAt: null,
+      lastFailureCode: null,
+      stale: false,
+    },
+  };
+
+  const overview = projectAdminOverview(payload);
+  assert.equal(overview.distribution.cloudflare.status, "available");
+  assert.equal(
+    overview.distribution.cloudflare.bySegment[0].currentVersionSourceAddresses,
+    null,
+  );
+  assert.equal(overview.distribution.github.status, "unavailable");
+});
+
+test("distribution segments agree with current-version availability", async () => {
+  const payload = await fixture("admin-overview-valid.json");
+  payload.distribution.cloudflare.bySegment = [{
+    startsAt: "2026-08-16T12:00:00.000Z",
+    endsAt: "2026-08-17T12:00:00.000Z",
+    activeSourceAddresses: 19,
+    preflightRequests: 22,
+    sparkleCheckRequests: 14,
+    sparkleDownloadRequests: 3,
+    currentVersionSourceAddresses: null,
+  }];
+  assert.throws(
+    () => projectAdminOverview(payload),
+    /ADMIN_OVERVIEW_INVALID/u,
+  );
 });
 
 test("distribution projection rejects stale values behind unavailable sources", async () => {

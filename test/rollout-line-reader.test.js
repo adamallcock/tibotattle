@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -57,6 +57,38 @@ test("a line straddling many read chunks is reassembled byte-for-byte", async ()
     assert.equal(lines[0].partial, false);
     assert.equal(lines[1].text, "short");
   } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a caller-owned FileHandle preserves a line across scratch-buffer refills", async () => {
+  const contents = "first-record-crosses-buffer\nsecond\n";
+  const { root, path, size } = await fixture(contents);
+  const handle = await open(path, "r");
+  try {
+    const lines = [];
+    const result = await forEachRolloutLine(handle, {
+      end: size,
+      highWaterMark: 5,
+      onLine(line, lineEndOffset, partial) {
+        lines.push({ text: line.toString("utf8"), lineEndOffset, partial });
+      },
+    });
+
+    assert.deepEqual(lines, [
+      {
+        text: "first-record-crosses-buffer",
+        lineEndOffset: 28,
+        partial: false,
+      },
+      { text: "second", lineEndOffset: size, partial: false },
+    ]);
+    assert.equal(result.nextOffset, size);
+    assert.equal(result.completeLines, 2);
+    // Passing a FileHandle transfers no ownership to the reader.
+    assert.equal((await handle.stat()).size, size);
+  } finally {
+    await handle.close();
     await rm(root, { recursive: true });
   }
 });

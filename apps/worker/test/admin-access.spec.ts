@@ -4,6 +4,9 @@ import type { D1Migration } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { clearAdminAccessJwksCacheForTests } from "../src/admin-access";
+import {
+  warmAdminCommunityAllowancePreviewCache,
+} from "../src/admin-community-allowance";
 import { adminHostname } from "../src/admin-ui";
 import { handleRequest } from "../src/index";
 
@@ -182,14 +185,20 @@ describe("admin surface hostname gating", () => {
       expect(response.status, path).toBe(404);
     }
 
-    const adminApi = await handleRequest(
-      new Request(`${PUBLIC_ORIGIN}/api/v1/admin/overview`),
-      runtimeEnv,
-    );
-    expect(adminApi.status).toBe(404);
-    await expect(adminApi.json()).resolves.toMatchObject({
-      error: { code: "NOT_FOUND" },
-    });
+    for (const path of [
+      "/api/v1/admin/overview",
+      "/api/v1/admin/metrics/history",
+      "/api/v1/admin/community/allowance-preview",
+    ]) {
+      const adminApi = await handleRequest(
+        new Request(`${PUBLIC_ORIGIN}${path}`),
+        runtimeEnv,
+      );
+      expect(adminApi.status, path).toBe(404);
+      await expect(adminApi.json()).resolves.toMatchObject({
+        error: { code: "NOT_FOUND" },
+      });
+    }
     const adminAction = await handleRequest(
       new Request(`${PUBLIC_ORIGIN}/api/v1/admin/action`, {
         method: "POST",
@@ -360,6 +369,31 @@ describe("admin surface hostname gating", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       schemaVersion: "admin-overview-v0.3",
+    });
+  });
+
+  it("serves the allowance merge preview only through the authenticated admin host", async () => {
+    expect((await warmAdminCommunityAllowancePreviewCache(
+      testBindings().USAGE_MONITOR_DB,
+      Date.now(),
+    )).code).toBe("ALLOWANCE_PREVIEW_CACHE_REFRESHED");
+
+    const response = await handleRequest(
+      new Request(`${ADMIN_ORIGIN}/api/v1/admin/community/allowance-preview`, {
+        headers: { "cf-access-jwt-assertion": await signedAccessJwt() },
+      }),
+      adminSurfaceBindings(),
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    await expect(response.json()).resolves.toMatchObject({
+      schemaVersion: "admin-community-allowance-preview-v0.1",
+      referencePlanType: "pro",
+      plans: [
+        { planType: "pro", multiplier: 1 },
+        { planType: "prolite", multiplier: 4 },
+        { planType: "plus", multiplier: 20 },
+      ],
     });
   });
 

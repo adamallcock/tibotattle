@@ -2,7 +2,7 @@
 title: Multi-root Codex sources plan
 date: 2026-08-23
 type: plan
-status: stage-a-complete; platform-hardening-local-only
+status: stage-a-integrated; current-source-r7-open; platform-hardening-local-only
 owners:
   - product
   - local-companion
@@ -329,8 +329,11 @@ to invent semantic deduplication.
 
 ## Unified index continuity
 
-The local index schema advances from user version 8 to 9. `source_cursor` gains
-one nullable, 32-byte `owner_local` value:
+Current main advanced the local index through user versions 9 and 10 for
+immutable rollout identity, physical snapshot state, and bounded quarantine
+receipts. Stage A composes with that work by advancing the integrated schema
+from version 10 to 11. `source_cursor` gains one nullable, 32-byte
+`owner_local` value:
 
 ```text
 owner_local = HMAC(deviceSalt, opaqueRootOwnerKey)
@@ -338,10 +341,14 @@ owner_local = HMAC(deviceSalt, opaqueRootOwnerKey)
 
 It is local-only and cannot recover the path or native root UUID.
 
-Migration is additive. Existing v8 cursors begin with `NULL` ownership. Their
+Migration is additive. Existing v10 cursors begin with `NULL` ownership. Their
 first accepted source pass is changed from a no-op `skip` to a metadata-only
-`touch`, which stamps the deterministic current owner without rebuilding
-logical identities.
+`touch`, which stamps the deterministic current owner without reparsing the
+source or rebuilding logical identities. Earlier indexes migrate through the
+same additive schema path. If a v9 cursor needs the v10 immutable-identity
+rebuild while its source owner is unavailable, automatic ingest refuses the
+rebuild and preserves the published last-known-good generation instead of
+binding an unproven replica.
 
 For an owned cursor:
 
@@ -407,7 +414,11 @@ Export and transition/tool scanners use the same global arbitration. Export
 plans retain existing frozen-prefix behavior: a resumed workspace may resolve
 the same logical source at another currently proven replica only when the
 frozen byte count and SHA-256 still verify. It never continues from an
-unverified prefix.
+unverified prefix. Initial export planning and complete contribution scans
+refuse any root coverage other than `ready`; after a complete plan is frozen,
+resume may tolerate a missing root only when every planned logical source is
+still present as a byte-proven replica. A missing frozen source stops the
+resume.
 
 Local contribution preparation now receives the same plural root set as the
 dashboard. The payload and Worker schema remain unchanged.
@@ -431,7 +442,7 @@ dashboard. The payload and Worker schema remain unchanged.
 | Path | Stage A responsibility |
 |---|---|
 | `src/providers/codex/log-sources.js` | plural discovery, root isolation, prefix arbitration, global lineage |
-| `src/local-unified-index.js` | v9 owner cursor migration |
+| `src/local-unified-index.js` | v10-to-v11 owner stamping and v9 owner-gap LKG preservation |
 | `src/local-unified-index-build.js` | plural cold build, owner cursor writes, unavailable refusal |
 | `src/local-unified-index-ingest.js` | stable owner selection, LKG, retained parent |
 | `src/local-companion-refresh.js` | primary/activity split and closed coverage receipt |
@@ -498,8 +509,8 @@ Stage A source work is complete only when:
 
 1. focused discovery/index/refresh/server/native/web/export tests pass;
 2. the full repository functional/source tests pass without weakened or
-   skipped source tests; retained generated release evidence is refreshed only
-   at the separately authorized source-freeze gate;
+   skipped source tests; the retained generated-evidence checks close only at
+   the separately authorized current-source R7 source-freeze gate;
 3. documentation and localization checks pass;
 4. independent code-quality and test/documentation audits have no unresolved
    high-severity finding;
@@ -523,35 +534,38 @@ claim.
 
 ### Validation receipt
 
-Validated across 2026-08-23 and 2026-08-24:
+The Stage A source tree integrated with `origin/main`
+`020ee8419cad33871b733cfd777a93eb68ee4c4f` was validated on
+2026-08-25:
 
-- final scanner/Windows/WSL/governance matrix: 52 passed, 2 expected
-  non-Windows skips, and zero failures;
-- complete portable lane: 1,155 passed, 18 explicit native-Windows platform
-  skips, and zero failures out of 1,173 tests;
-- complete packaged macOS bundle suite: 58/58 passed, including compiled
-  launcher/watchdog and updater coverage;
-- full repository run: 2,855 passed, 18 explicit native-Windows platform
-  skips, and zero failures out of 2,873 tests;
-- dual-runtime R7 regeneration completed in 38.7 minutes and atomically
-  replaced ten validated owner-only receipts against 342 source files, with
-  workload source SHA-256
-  `eb4060a420bcae176ae7e506dba66ed8a5dc55a55496374ad44051ccd263ec0d`;
-- focused retained-R7 validation: 2/2 passed, and all ten receipts are mode
-  `0600`;
-- architecture/import audit, documentation links, workflow lint, tool
-  inventory (79 records / 81 executable paths), and diff hygiene passed; and
-- the partial-root dashboard state was exercised through a real loopback
-  companion and visually inspected for path-free, honest retained-history
-  copy.
+- focused integrated matrix: 541 passed, 2 expected native-Windows skips, and
+  zero failures out of 543 tests;
+- root-coverage, contribution, and export hardening: 78/78 passed;
+- complete portable lane: 1,191 passed, 18 explicit native-Windows skips, and
+  zero failures out of 1,209 tests;
+- complete packaged macOS bundle suite: 61/61 passed, including the compiled
+  launcher/watchdog and signed-app relay coverage; and
+- awake-host full repository run: 2,958 passed, 18 skipped, 2 failed, and 1
+  cancelled out of 2,979 tests. Both failures are the retained-R7 provenance
+  assertions; the cancelled RSS-budget stress case is covered by the green
+  portable lane and passed 1/1 in a separate isolated rerun.
 
-Independent code-quality and test/documentation re-audits reported no finding
-at any severity after the lifecycle fixes. The performance re-audit reported
-no new regression while retaining the explicit high-water RSS/latency gate.
-Source was frozen in local commit `c8e50615`; the regenerated receipts,
-tool-inventory registration, and final documentation are a separate local
-provenance commit. No code or artifact was pushed, tagged, released, or
-installed. The body of public issue #51 was reconciled on 2026-08-25 with the
-lean Stage A contract, and the issue remains open for the explicit platform
-gates above. Installed Windows/WSL filesystem and signing qualification remains
-separate.
+An atomic dual-runtime current-source R7 refresh was attempted but did not
+complete because the Node 26 pressure profile exceeded the existing
+`elapsed_time` resource ceiling. The atomic generator preserved all prior
+receipts unchanged. Those receipts are historical pre-integration evidence
+only and must not be cited as current-source or plural-root qualification.
+Current-source R7 refresh remains an open source-freeze/release gate.
+
+Independent code-quality and test/documentation audits found no unresolved
+Stage A correctness finding. The performance review retains the explicit
+eight-root RSS, latency, and disk high-water gate. Architecture,
+documentation-link, localization, workflow, tool-inventory (80 records / 82
+executable paths), and diff-hygiene checks passed after integration.
+
+This local integration combines Stage A head `a9ed0ec6` with `origin/main`
+`020ee841`. No code or artifact was pushed, tagged, released, installed, or
+merged into public `main`. The body of public issue #51 was reconciled on
+2026-08-25 with the lean Stage A contract, and the issue remains open for the
+installed Windows/WSL, eight-root platform-measurement, R7 provenance, and
+release gates.

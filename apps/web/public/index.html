@@ -109,6 +109,26 @@
       </aside>
       <div class="dashboard-content">
     <main id="main">
+      <section
+        class="dashboard-boot-state"
+        id="dashboard-boot-state"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        aria-busy="true"
+      >
+        <div class="dashboard-boot-card">
+          <span class="state-pill state-connecting">
+            <span class="state-dot" aria-hidden="true"></span>
+            Connecting
+          </span>
+          <strong class="dashboard-boot-title">Loading saved results…</strong>
+          <p class="dashboard-boot-copy">
+            Checking the summary on this Mac. Nothing is sent while you look at it.
+          </p>
+        </div>
+      </section>
+
       <div class="page-heading" data-dashboard-page="overview">
         <div>
           <p class="eyebrow">Local evidence dashboard</p>
@@ -859,36 +879,57 @@
             <button class="button button-quiet compact" id="cache-switch-page-next" type="button" aria-controls="cache-switch-rows" data-i18n="table.pagination.next">Next</button>
           </div>
         </details>
+        <section class="cache-reuse-outcome" id="cache-reuse-outcome" aria-labelledby="cache-reuse-outcome-heading" hidden>
+          <div class="cache-reuse-real-data">
+            <span aria-hidden="true"></span>
+            <span data-i18n="accounting.cacheContinuity.outcome.realData">Using real local data</span>
+          </div>
+          <div class="cache-reuse-summary">
+            <header class="cache-reuse-title">
+              <p class="panel-kicker" data-i18n="accounting.cacheContinuity.outcome.eyebrow">Cache reuse between turns</p>
+              <h3 id="cache-reuse-outcome-heading" data-i18n="accounting.cacheContinuity.outcome.heading">Did the cache carry over?</h3>
+              <p data-i18n="accounting.cacheContinuity.outcome.subtitle">Follow-up turns with the same model and settings, grouped by time since the previous turn.</p>
+            </header>
+            <div class="cache-reuse-metrics">
+              <div class="cache-reuse-metric-more">
+                <strong id="cache-reuse-more-percent">0%</strong>
+                <span data-i18n="accounting.cacheContinuity.outcome.moreLabel">reused more than half</span>
+                <small id="cache-reuse-more-count"></small>
+              </div>
+              <div class="cache-reuse-metric-less">
+                <strong id="cache-reuse-less-percent">0%</strong>
+                <span data-i18n="accounting.cacheContinuity.outcome.lessLabel">reused half or less</span>
+                <small id="cache-reuse-less-count"></small>
+              </div>
+              <div class="cache-reuse-metric-overhead">
+                <strong id="cache-reuse-overhead">—</strong>
+                <span data-i18n="accounting.cacheContinuity.outcome.overheadLabel">estimated overhead from cache drops</span>
+                <small data-i18n="accounting.cacheContinuity.outcome.overheadBasis">Standard API equivalent</small>
+              </div>
+              <p class="cache-reuse-explanation" id="cache-reuse-explanation"></p>
+            </div>
+          </div>
+          <p class="cache-reuse-empty" id="cache-reuse-empty" data-i18n="accounting.cacheContinuity.outcome.noData" hidden>No eligible follow-up turns were found in this period.</p>
+          <div class="cache-reuse-raster" id="cache-reuse-raster">
+            <div class="cache-reuse-raster-scroll" id="cache-reuse-raster-scroll">
+              <div class="cache-reuse-raster-stage" id="cache-reuse-raster-stage">
+                <canvas id="cache-reuse-canvas" height="376" tabindex="0"></canvas>
+                <div class="cache-reuse-readout-rail" id="cache-reuse-readout-rail" hidden>
+                  <div class="cache-reuse-readout" id="cache-reuse-readout" aria-live="polite">
+                    <strong id="cache-reuse-readout-bucket"></strong>
+                    <span id="cache-reuse-readout-checked"></span>
+                    <span class="cache-reuse-readout-more" id="cache-reuse-readout-more"></span>
+                    <span class="cache-reuse-readout-less" id="cache-reuse-readout-less"></span>
+                    <small class="cache-reuse-readout-lost" id="cache-reuse-readout-lost"></small>
+                    <small class="cache-reuse-readout-api" id="cache-reuse-readout-api"></small>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
         <details class="panel advanced-diagnostics evidence-disclosure cache-switch-details cache-continuity-details" id="cache-continuity-details" hidden>
-          <summary data-i18n="accounting.cacheContinuity.detailsSummary">See possible cache-continuity overhead</summary>
-          <p class="annotation" data-i18n="accounting.cacheContinuity.detailsExplanation">
-            The first table groups comparable adjacent user turns by elapsed
-            time; the recent rows below show qualifying material cache-read
-            drops while the effective model, reasoning, routing, and surface
-            remained unchanged. Time is evidence, not an eligibility rule;
-            compactions and contracted contexts stay out of the cost.
-          </p>
-          <h3 class="evidence-subheading" data-i18n="accounting.cacheContinuity.gapHeading">By time between turns</h3>
-          <div class="table-wrap">
-            <table class="cache-continuity-gap-table">
-              <caption class="sr-only" data-i18n="accounting.cacheContinuity.gapTableCaption">Possible cache-continuity overhead by time between turns</caption>
-              <thead>
-                <tr>
-                  <th data-i18n="accounting.cacheContinuity.column.gapBand">Time between turns</th>
-                  <th data-i18n="accounting.cacheContinuity.column.dropsComparable">Material drops / comparable returns</th>
-                  <th data-i18n="accounting.cacheContinuity.column.lostTokens">Estimated lost reuse</th>
-                  <th data-i18n="accounting.cacheContinuity.column.apiEquivalent">Standard API equivalent</th>
-                </tr>
-              </thead>
-              <tbody id="cache-continuity-gap-rows"></tbody>
-            </table>
-          </div>
-          <div class="table-pagination" id="cache-continuity-gap-pagination" hidden>
-            <button class="button button-quiet compact" id="cache-continuity-gap-page-prev" type="button" aria-controls="cache-continuity-gap-rows" data-i18n="table.pagination.previous">Previous</button>
-            <span class="table-pagination-status" id="cache-continuity-gap-page-status" role="status"></span>
-            <button class="button button-quiet compact" id="cache-continuity-gap-page-next" type="button" aria-controls="cache-continuity-gap-rows" data-i18n="table.pagination.next">Next</button>
-          </div>
-          <h3 class="evidence-subheading" data-i18n="accounting.cacheContinuity.recentHeading">Recent qualifying drops</h3>
+          <summary data-i18n="accounting.cacheContinuity.detailsSummary">See recent large cache drops</summary>
           <div class="table-wrap">
             <table class="cache-continuity-recent-table">
               <caption class="sr-only" data-i18n="accounting.cacheContinuity.tableCaption">Recent possible cache-continuity overhead evidence</caption>

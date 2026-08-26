@@ -84,8 +84,13 @@ function fakeDocument() {
     "recent-diagnostic-empty",
     "diagnostic-lookup",
     "diagnostic-reference",
+    "diagnostic-retention-summary",
     "audit-rows",
     "audit-empty",
+    "audit-pagination",
+    "audit-previous",
+    "audit-next",
+    "audit-page-status",
     "last-refresh",
     "refresh",
     "diagnostic-form",
@@ -307,6 +312,7 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     assert.deepEqual(tableTexts(documentRef, "error-groups"), [[
       "<route-class>",
       errorGroup.errorCode,
+      String(errorGroup.status),
       `${errorGroup.occurrences} (${errorGroup.ratePerDay}/day)`,
       formatReportingTime(errorGroup.latestAt),
     ]]);
@@ -348,6 +354,8 @@ test("admin tables preserve row order, text rendering, and empty states", async 
     for (const id of ["counts", "quarantine-counts", "distribution-counts"]) {
       for (const card of documentRef.byId.get(id).children) {
         assertInfoHint(card.children[0], card.children[0].children[0].textContent);
+        assert.equal(card.children.length, 4, `${id} card is missing recent history`);
+        assert.match(card.children[3].className, /admin-sparkline-shell/u);
       }
     }
     const narrowHint = documentRef.byId.get("counts").children[0].children[0]
@@ -576,18 +584,19 @@ test("admin tables preserve row order, text rendering, and empty states", async 
   }
 });
 
-test("the owner dashboard imports the public community graph rather than copying it", async () => {
-  const source = await readFile(
-    new URL("../public/admin.js", import.meta.url),
-    "utf8",
-  );
+test("the owner dashboard keeps the merge trial private and separate from the public graph", async () => {
+  const [source, html] = await Promise.all([
+    readFile(new URL("../public/admin.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/admin.html", import.meta.url), "utf8"),
+  ]);
   assert.match(
     source,
-    /import \{ PublicCommunityClient \} from "\.\/community-data\.js";/u,
+    /request\(\n      "\/api\/v1\/admin\/community\/allowance-preview",/u,
   );
-  assert.match(
-    source,
-    /import \{ renderCommunityAllowanceSection \} from "\.\/community-view\.js";/u,
-  );
-  assert.doesNotMatch(source, /from "\.\/community\.js"/u);
+  assert.match(source, /projectAdminAllowancePreview/u);
+  assert.doesNotMatch(source, /PublicCommunityClient/u);
+  assert.doesNotMatch(source, /renderCommunityAllowanceSection/u);
+  assert.match(html, /data-allowance-mode="combined"[^>]*>Combined</u);
+  assert.match(html, /data-allowance-mode="plans"[^>]*>By plan</u);
+  assert.doesNotMatch(html, /same published community graph/u);
 });

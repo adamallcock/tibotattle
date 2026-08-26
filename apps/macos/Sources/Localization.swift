@@ -118,13 +118,18 @@ enum TiboTattleLocalization {
         case launcherCodexFolderUpdated = "launcher.codexFolderUpdated"
         case launcherDataDiagnostics = "launcher.dataDiagnostics"
         case launcherDashboardDidNotOpen = "launcher.dashboardDidNotOpen"
+        case launcherDashboardTakingLonger = "launcher.dashboardTakingLonger"
         case launcherDetailPreparingLocalDashboard = "launcher.detailPreparingLocalDashboard"
         case launcherErrorCompanionAlreadyRunning = "launcher.errorCompanionAlreadyRunning"
         case launcherErrorCompanionExited = "launcher.errorCompanionExited"
         case launcherErrorCompanionLaunch = "launcher.errorCompanionLaunch"
         case launcherErrorCompanionTimeout = "launcher.errorCompanionTimeout"
         case launcherErrorCodexHomeSettingsWrite = "launcher.errorCodexHomeSettingsWrite"
+        case launcherErrorDashboardContentProcessTerminated = "launcher.errorDashboardContentProcessTerminated"
         case launcherErrorDashboardDownloadFailed = "launcher.errorDashboardDownloadFailed"
+        case launcherErrorDashboardNavigationFailed = "launcher.errorDashboardNavigationFailed"
+        case launcherErrorDashboardReadinessTimeout = "launcher.errorDashboardReadinessTimeout"
+        case launcherErrorDashboardViewportUnavailable = "launcher.errorDashboardViewportUnavailable"
         case launcherErrorDashboardWebViewUnavailable = "launcher.errorDashboardWebViewUnavailable"
         case launcherErrorDataErase = "launcher.errorDataErase"
         case launcherErrorFirstRunStateWrite = "launcher.errorFirstRunStateWrite"
@@ -190,6 +195,15 @@ enum TiboTattleLocalization {
         case nativeDashboardLocalOnly = "nativeDashboard.localOnly"
         case nativeDashboardLocalOnlyTooltip = "nativeDashboard.localOnlyTooltip"
         case nativeDashboardOverview = "nativeDashboard.overview"
+        case nativeDashboardProgressAnalyzing = "nativeDashboard.progressAnalyzing"
+        case nativeDashboardProgressAnalyzingFiles = "nativeDashboard.progressAnalyzingFiles"
+        case nativeDashboardProgressArchiveIndex = "nativeDashboard.progressArchiveIndex"
+        case nativeDashboardProgressDiscovering = "nativeDashboard.progressDiscovering"
+        case nativeDashboardProgressFinishing = "nativeDashboard.progressFinishing"
+        case nativeDashboardProgressProspective = "nativeDashboard.progressProspective"
+        case nativeDashboardProgressQuickResult = "nativeDashboard.progressQuickResult"
+        case nativeDashboardProgressQuotaRefresh = "nativeDashboard.progressQuotaRefresh"
+        case nativeDashboardProgressSaving = "nativeDashboard.progressSaving"
         case nativeDashboardRefreshUsage = "nativeDashboard.refreshUsage"
         case nativeDashboardRefreshUsageTooltip = "nativeDashboard.refreshUsageTooltip"
         case nativeDashboardShare = "nativeDashboard.share"
@@ -251,6 +265,12 @@ enum TiboTattleLocalization {
         case settingsAboutProduct = "settings.aboutProduct"
         case settingsAboutTab = "settings.aboutTab"
         case settingsAboutSummary = "settings.aboutSummary"
+        case settingsAppearance = "settings.appearance"
+        case settingsAppearanceDark = "settings.appearanceDark"
+        case settingsAppearanceLight = "settings.appearanceLight"
+        case settingsAppearancePickerHint = "settings.appearancePickerHint"
+        case settingsAppearanceSummary = "settings.appearanceSummary"
+        case settingsAppearanceSystem = "settings.appearanceSystem"
         case settingsAutomaticUpdates = "settings.automaticUpdates"
         case settingsAutomaticUpdatesOff = "settings.automaticUpdatesOff"
         case settingsAutomaticUpdatesOn = "settings.automaticUpdatesOn"
@@ -348,6 +368,8 @@ enum TiboTattleLocalization {
         case settingsRemoveCodexFolder = "settings.removeCodexFolder"
         case settingsSetPrimaryCodexFolder = "settings.setPrimaryCodexFolder"
         case settingsUseDefault = "settings.useDefault"
+        case settingsUpdateCheckUnavailableMessage = "settings.updateCheckUnavailableMessage"
+        case settingsUpdateCheckUnavailableTitle = "settings.updateCheckUnavailableTitle"
         case settingsUpdateDisclosureAutomaticOff = "settings.updateDisclosureAutomaticOff"
         case settingsUpdateDisclosureAutomaticOn = "settings.updateDisclosureAutomaticOn"
         case settingsUpdateDisclosureDevelopment = "settings.updateDisclosureDevelopment"
@@ -459,6 +481,8 @@ enum TiboTattleLocalization {
                 "Data & Diagnostics…"
             case .launcherDashboardDidNotOpen:
                 "Dashboard didn’t open"
+            case .launcherDashboardTakingLonger:
+                "Dashboard is taking longer than expected"
             case .launcherDetailPreparingLocalDashboard:
                 "Preparing the private local dashboard and its bounded foreground update."
             case .launcherErrorCompanionAlreadyRunning:
@@ -471,8 +495,16 @@ enum TiboTattleLocalization {
                 "The local companion did not become ready in time."
             case .launcherErrorCodexHomeSettingsWrite:
                 "The selected Codex folder could not be saved privately."
+            case .launcherErrorDashboardContentProcessTerminated:
+                "The macOS web content process stopped while opening the local dashboard."
             case .launcherErrorDashboardDownloadFailed:
                 "The dashboard could not save that file to your Downloads folder."
+            case .launcherErrorDashboardNavigationFailed:
+                "The in-app dashboard could not load its local page."
+            case .launcherErrorDashboardReadinessTimeout:
+                "The local dashboard page loaded, but it did not become ready during the initial wait."
+            case .launcherErrorDashboardViewportUnavailable:
+                "The in-app dashboard did not receive a usable window size."
             case .launcherErrorDashboardWebViewUnavailable:
                 "The in-app dashboard view could not be displayed."
             case .launcherErrorDataErase:
@@ -546,7 +578,7 @@ enum TiboTattleLocalization {
             case .launcherRecoveryDashboardDownload:
                 "Check access to your Downloads folder, then save the file again."
             case .launcherRecoveryDashboardWebView:
-                "Choose Open Dashboard to try again, or Open in Browser to use the same local dashboard in your browser."
+                "Choose Open Dashboard to try the local view again. If it still does not open, choose Retry."
             case .launcherRecoveryDataErase:
                 "Quit other processes using %@ data, then try the erase again."
             case .launcherRecoveryExistingWindow:
@@ -603,6 +635,24 @@ enum TiboTattleLocalization {
                 "Analysis and cached results stay on this Mac. Community contribution is optional."
             case .nativeDashboardOverview:
                 "Overview"
+            case .nativeDashboardProgressAnalyzing:
+                "Analyzing local history…"
+            case .nativeDashboardProgressAnalyzingFiles:
+                "Analyzing %@ of %@ files…"
+            case .nativeDashboardProgressArchiveIndex:
+                "Updating older history…"
+            case .nativeDashboardProgressDiscovering:
+                "Finding local history…"
+            case .nativeDashboardProgressFinishing:
+                "Finishing analysis…"
+            case .nativeDashboardProgressProspective:
+                "Preparing ongoing tracking…"
+            case .nativeDashboardProgressQuickResult:
+                "Headline ready · finishing analysis…"
+            case .nativeDashboardProgressQuotaRefresh:
+                "Refreshing allowance…"
+            case .nativeDashboardProgressSaving:
+                "Saving analysis progress…"
             case .nativeDashboardRefreshUsage:
                 "Refresh"
             case .nativeDashboardRefreshUsageTooltip:
@@ -725,6 +775,18 @@ enum TiboTattleLocalization {
                 "About"
             case .settingsAboutSummary:
                 "Local Codex allowance, measured on your Mac."
+            case .settingsAppearance:
+                "Appearance"
+            case .settingsAppearanceDark:
+                "Dark"
+            case .settingsAppearanceLight:
+                "Light"
+            case .settingsAppearancePickerHint:
+                "Choose how TiboTattle looks."
+            case .settingsAppearanceSummary:
+                "Uses your Mac appearance by default."
+            case .settingsAppearanceSystem:
+                "System"
             case .settingsAutomaticUpdates:
                 "Automatic updates"
             case .settingsAutomaticUpdatesOff:
@@ -919,6 +981,10 @@ enum TiboTattleLocalization {
                 "Set Primary…"
             case .settingsUseDefault:
                 "Reset to Default…"
+            case .settingsUpdateCheckUnavailableMessage:
+                "TiboTattle couldn't complete the update check. Check your internet connection and try again."
+            case .settingsUpdateCheckUnavailableTitle:
+                "Couldn't check for updates"
             case .settingsUpdateDisclosureAutomaticOff:
                 "Signed app updates are available from About → Check for Updates. Automatic downloads are currently off; you can turn them on in Settings → General when available."
             case .settingsUpdateDisclosureAutomaticOn:
@@ -1098,6 +1164,11 @@ enum TiboTattleLocalization {
         return formatter.string(
             from: NSNumber(value: Double(value) / 100)
         ) ?? "\(value)%"
+    }
+
+    static func integerString(_ value: Int) -> String {
+        decimalNumberFormatter(maximumFractionDigits: 0)
+            .string(from: NSNumber(value: value)) ?? String(value)
     }
 
     static func dateFormatter(

@@ -6,7 +6,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createSyntheticEnvelope } from "../../web/public/lib.js";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { hashInviteGrantSecret } from "../src/admission";
-import worker, { handleRequest } from "../src/index";
+import worker, { handleRequest, runScheduledMaintenance } from "../src/index";
 import {
   createSessionMaterial,
   sessionCookie,
@@ -35,6 +35,10 @@ import {
 import {
   telemetryContributionAdmissionWindow,
 } from "../src/telemetry-repository";
+import { warmAdminMetricsHistoryCache } from "../src/admin-metrics-history";
+import {
+  warmAdminCommunityAllowancePreviewCache,
+} from "../src/admin-community-allowance";
 
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
@@ -2546,6 +2550,22 @@ describe("synthetic usage monitor service", () => {
     );
     expect(rejectedMethod.status).toBe(405);
 
+    const cacheMissing = await api(
+      "/api/v1/admin/metrics/history",
+      { headers: personalHeaders(participant) },
+      adminBindings,
+    );
+    expect(cacheMissing.status).toBe(503);
+    await expect(cacheMissing.json()).resolves.toMatchObject({
+      error: { code: "ADMIN_METRICS_HISTORY_CACHE_UNAVAILABLE" },
+    });
+    const cacheFailureDiagnostics = await testBindings().USAGE_MONITOR_DB
+      .prepare(
+        `SELECT COUNT(*) AS n FROM diagnostic_error_events
+          WHERE error_code = 'ADMIN_METRICS_HISTORY_CACHE_UNAVAILABLE'`,
+      ).first<{ n: number }>();
+    expect(cacheFailureDiagnostics?.n).toBe(0);
+
     // A stored gauge snapshot rides along; non-numeric values never leave D1.
     await testBindings().USAGE_MONITOR_DB.prepare(
       `INSERT INTO admin_metric_snapshots (captured_at, metrics_json)
@@ -2554,6 +2574,10 @@ describe("synthetic usage monitor service", () => {
       "2026-08-21T11:00:00.000Z",
       JSON.stringify({ bandParticipantCount: 1, smuggled: "text" }),
     ).run();
+    expect((await warmAdminMetricsHistoryCache(
+      testBindings().USAGE_MONITOR_DB,
+      Date.now(),
+    )).code).toBe("HISTORY_CACHE_REFRESHED");
 
     const history = await api(
       "/api/v1/admin/metrics/history",
@@ -2573,7 +2597,7 @@ describe("synthetic usage monitor service", () => {
       }>;
       gauges: { snapshots: { metrics: Record<string, unknown> }[] };
     }>();
-    expect(body.schemaVersion).toBe("admin-metrics-history-v0.1");
+    expect(body.schemaVersion).toBe("admin-metrics-history-v0.2");
     const today = body.generatedAt.slice(0, 10);
     // The enrolled participant is a real event in today's bucket.
     const participants = body.events.participants;
@@ -2596,6 +2620,103 @@ describe("synthetic usage monitor service", () => {
       capturedAt: "2026-08-21T11:00:00.000Z",
       metrics: { bandParticipantCount: 1 },
     }]);
+  });
+
+  it("serves the owner-only allowance merge preview without publishing it", async () => {
+    const notConfigured = await api(
+      "/api/v1/admin/community/allowance-preview",
+    );
+    expect(notConfigured.status).toBe(503);
+    await expect(notConfigured.json()).resolves.toMatchObject({
+      error: { code: "ADMIN_NOT_CONFIGURED" },
+    });
+
+    const participant = await enrollTelemetry();
+    const adminIdentityKey = "a".repeat(64);
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      "UPDATE participants SET identity_link_key = ? WHERE id = ?",
+    ).bind(adminIdentityKey, participant.participantId).run();
+    const adminBindings = testBindings({
+      ADMIN_IDENTITY_LINK_KEY: adminIdentityKey,
+    });
+
+    const rejectedMethod = await api(
+      "/api/v1/admin/community/allowance-preview",
+      { method: "POST", headers: personalHeaders(participant, { csrf: true }) },
+      adminBindings,
+    );
+    expect(rejectedMethod.status).toBe(405);
+
+    const cacheMissing = await api(
+      "/api/v1/admin/community/allowance-preview",
+      { headers: personalHeaders(participant) },
+      adminBindings,
+    );
+    expect(cacheMissing.status).toBe(503);
+    await expect(cacheMissing.json()).resolves.toMatchObject({
+      error: { code: "ADMIN_ALLOWANCE_CACHE_UNAVAILABLE" },
+    });
+    const cacheFailureDiagnostics = await testBindings().USAGE_MONITOR_DB
+      .prepare(
+        `SELECT COUNT(*) AS n FROM diagnostic_error_events
+          WHERE error_code = 'ADMIN_ALLOWANCE_CACHE_UNAVAILABLE'`,
+      ).first<{ n: number }>();
+    expect(cacheFailureDiagnostics?.n).toBe(0);
+
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      `INSERT INTO admin_community_allowance_preview_cache (
+         singleton, generated_at, payload_json
+       ) VALUES (1, ?, '{')`,
+    ).bind(new Date().toISOString()).run();
+    const cacheCorrupt = await api(
+      "/api/v1/admin/community/allowance-preview",
+      { headers: personalHeaders(participant) },
+      adminBindings,
+    );
+    expect(cacheCorrupt.status).toBe(503);
+    await expect(cacheCorrupt.json()).resolves.toMatchObject({
+      error: { code: "ADMIN_ALLOWANCE_CACHE_UNAVAILABLE" },
+    });
+    const corruptFailureDiagnostics = await testBindings().USAGE_MONITOR_DB
+      .prepare(
+        `SELECT COUNT(*) AS n FROM diagnostic_error_events
+          WHERE error_code = 'ADMIN_ALLOWANCE_CACHE_UNAVAILABLE'`,
+      ).first<{ n: number }>();
+    expect(corruptFailureDiagnostics?.n).toBe(0);
+
+    expect((await warmAdminCommunityAllowancePreviewCache(
+      testBindings().USAGE_MONITOR_DB,
+      Date.now(),
+    )).code).toBe("ALLOWANCE_PREVIEW_CACHE_REFRESHED");
+
+    const response = await api(
+      "/api/v1/admin/community/allowance-preview",
+      { headers: personalHeaders(participant) },
+      adminBindings,
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    const body = await response.json<{
+      schemaVersion: string;
+      basis: string;
+      plans: { planType: string; multiplier: number }[];
+      days: {
+        combined: { fitCount: number; centralUsd: number | null };
+      }[];
+    }>();
+    expect(body.schemaVersion).toBe("admin-community-allowance-preview-v0.1");
+    expect(body.basis).toBe(
+      "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview",
+    );
+    expect(body.plans).toMatchObject([
+      { planType: "pro", multiplier: 1 },
+      { planType: "prolite", multiplier: 4 },
+      { planType: "plus", multiplier: 20 },
+    ]);
+    expect(body.days).toHaveLength(70);
+    expect(body.days.every((day) => (
+      day.combined.fitCount === 0 && day.combined.centralUsd === null
+    ))).toBe(true);
   });
 
   it("independently contains collection while preserving participant rights", async () => {
@@ -3884,6 +4005,26 @@ describe("synthetic usage monitor service", () => {
       cells: [],
     });
     expect(sealedSuppressionText).not.toContain("participantCount");
+  });
+
+  it("isolates an allowance-preview cache failure from scheduled maintenance", async () => {
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      "DROP TABLE admin_community_allowance_preview_cache",
+    ).run();
+    const result = await runScheduledMaintenance(
+      testBindings(),
+      Date.parse("2026-08-23T12:00:00.000Z"),
+    );
+    expect(result).toMatchObject({
+      outcome: "success",
+      event: "scheduled_backend_maintenance",
+    });
+    const retention = await testBindings().USAGE_MONITOR_DB.prepare(
+      `SELECT state, maintenance_lease_token
+         FROM retention_state WHERE singleton = 1`,
+    ).first<{ state: string; maintenance_lease_token: string | null }>();
+    expect(retention?.state).not.toBe("failed");
+    expect(retention?.maintenance_lease_token).toBeNull();
   });
 
   it("uses the scheduled event time and waitUntil to seal a weekly snapshot", async () => {

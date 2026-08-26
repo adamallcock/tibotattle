@@ -57,6 +57,48 @@ import {
 import { readLocalUnifiedWindowBreakdown } from "../src/local-unified-window-breakdown.js";
 
 const CONTRACT = "usage-event-v0.2";
+const THREAD_ONE = "11111111-1111-4111-8111-111111111111";
+const THREAD_TWO = "22222222-2222-4222-8222-222222222222";
+const ROLLOUT_TWO = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const ROLLOUT_THREE = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+function canonicalRolloutName(timestamp, threadId, rolloutId = null) {
+  return `rollout-${timestamp}-${threadId}${rolloutId === null ? "" : `_${rolloutId}`}.jsonl`;
+}
+
+function paginatedSessionMeta(sessionId, {
+  ordinal,
+  baseRolloutId,
+  endOrdinalExclusive,
+  endByteOffset,
+  parentId = null,
+} = {}) {
+  return JSON.stringify({
+    ordinal,
+    timestamp: "2026-07-25T00:00:00.000Z",
+    type: "session_meta",
+    payload: {
+      id: sessionId,
+      session_id: sessionId,
+      history_mode: "paginated",
+      history_base: {
+        thread_id: baseRolloutId,
+        end_ordinal_exclusive: endOrdinalExclusive,
+        end_byte_offset: endByteOffset,
+      },
+      ...(parentId === null ? {} : {
+        forked_from_id: parentId,
+        parent_thread_id: parentId,
+      }),
+      thread_source: "user",
+      originator: "codex_cli_rs",
+    },
+  });
+}
+
+function jsonlBytes(lines) {
+  return Buffer.byteLength(`${lines.join("\n")}\n`);
+}
 
 function sessionMeta(sessionId, { parentId = null, threadSource = "user" } = {}) {
   return JSON.stringify({
@@ -1033,6 +1075,419 @@ test("a standalone source is never suppressed", async () => {
     assert.equal(result.usageEvents, 2);
     assert.equal(result.forkReplayEventsSkipped, 0);
     assert.equal(result.unattributedForkReplayEventsSkipped, 0);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a paginated replacement charges old removed work and only its post-boundary delta", async () => {
+  const baseLines = [
+    sessionMeta(THREAD_ONE),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+    tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    // Work later removed from the visible branch remains actual spend.
+    tokenCount("2026-07-25T00:00:02.000Z", usage(300, 30), usage(200, 20)),
+  ];
+  const retainedPrefix = baseLines.slice(0, 3);
+  const replacementLines = [
+    paginatedSessionMeta(THREAD_ONE, {
+      ordinal: retainedPrefix.length,
+      baseRolloutId: THREAD_ONE,
+      endOrdinalExclusive: retainedPrefix.length,
+      endByteOffset: jsonlBytes(retainedPrefix),
+    }),
+    turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-sol"),
+    // No last_token_usage: the exact history seed is the only way to derive
+    // the new 150/15 delta from this cumulative 250/25 counter.
+    tokenCountTotalOnly("2026-07-25T01:00:01.000Z", usage(250, 25)),
+  ];
+  const { root } = await corpus({
+    [canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE)]: baseLines,
+    [canonicalRolloutName("2026-07-25T01-00-00", THREAD_ONE, ROLLOUT_TWO)]: replacementLines,
+  });
+  try {
+    const single = await build(root);
+    assert.equal(single.generation.status, "complete");
+    assert.equal(single.usageEvents, 3);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      const totals = database.prepare(`
+        SELECT SUM(tokens_in_uncached) AS input,
+               SUM(tokens_out_text) AS output,
+               COUNT(DISTINCT source_local) AS sources,
+               COUNT(DISTINCT session_local) AS sessions
+        FROM usage_event`).get();
+      assert.equal(Number(totals.input), 450);
+      assert.equal(Number(totals.output), 45);
+      assert.equal(Number(totals.sources), 2);
+      assert.equal(Number(totals.sessions), 1);
+    } finally {
+      database.close();
+    }
+
+    // Exercise the worker implementation separately; its history-base seed
+    // resolver must be bit-for-bit equivalent to the in-process reference.
+    await rebuildLocalUnifiedIndex({
+      codexHome: root,
+      indexFile: join(root, "parallel.sqlite"),
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      workerCount: 2,
+    });
+    const reference = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    const parallel = openLocalUnifiedIndex(join(root, "parallel.sqlite"), { readOnly: true });
+    try {
+      assert.deepEqual(logicalProjection(parallel), logicalProjection(reference));
+    } finally {
+      reference.close();
+      parallel.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a later inline fork inherits only the selected paginated history snapshots", async () => {
+  const baseLines = [
+    sessionMeta(THREAD_ONE),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+    tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    // This paid work is retained in accounting but removed from the visible
+    // branch. Its cumulative snapshot must not suppress coincidentally equal
+    // new work in a later inline fork.
+    tokenCount("2026-07-25T00:00:02.000Z", usage(300, 30), usage(200, 20)),
+  ];
+  const retainedPrefix = baseLines.slice(0, 3);
+  const replacementLines = [
+    paginatedSessionMeta(THREAD_ONE, {
+      ordinal: retainedPrefix.length,
+      baseRolloutId: THREAD_ONE,
+      endOrdinalExclusive: retainedPrefix.length,
+      endByteOffset: jsonlBytes(retainedPrefix),
+    }),
+  ];
+  const childLines = [
+    sessionMeta(THREAD_TWO, {
+      parentId: THREAD_ONE,
+      threadSource: "subagent",
+    }),
+    // Replayed retained prefix, suppressed by the pre-turn-context rule.
+    tokenCount("2026-07-25T02:00:00.000Z", usage(100, 10), usage(100, 10)),
+    turnContext("2026-07-25T02:00:01.000Z", "gpt-5.6-sol"),
+    // This is genuinely new spend but deliberately shares the removed
+    // suffix's cumulative/last snapshot. A union of every physical parent
+    // generation would wrongly suppress it.
+    tokenCount("2026-07-25T02:00:02.000Z", usage(300, 30), usage(200, 20)),
+  ];
+  const { root } = await corpus({
+    [canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE)]: baseLines,
+    [canonicalRolloutName(
+      "2026-07-25T01-00-00",
+      THREAD_ONE,
+      ROLLOUT_TWO,
+    )]: replacementLines,
+    [canonicalRolloutName("2026-07-25T02-00-00", THREAD_TWO)]: childLines,
+  });
+  try {
+    const single = await build(root);
+    assert.equal(single.generation.status, "complete");
+    assert.equal(single.usageEvents, 3);
+    assert.equal(single.forkReplayEventsSkipped, 1);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), {
+      readOnly: true,
+    });
+    try {
+      const totals = database.prepare(`
+        SELECT SUM(tokens_in_uncached) AS input,
+               SUM(tokens_out_text) AS output
+        FROM usage_event`).get();
+      assert.equal(Number(totals.input), 500);
+      assert.equal(Number(totals.output), 50);
+    } finally {
+      database.close();
+    }
+
+    const parallel = await rebuildLocalUnifiedIndex({
+      codexHome: root,
+      indexFile: join(root, "parallel-history.sqlite"),
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      workerCount: 2,
+    });
+    assert.equal(parallel.usageEvents, 3);
+    const parallelDatabase = openLocalUnifiedIndex(
+      join(root, "parallel-history.sqlite"),
+      { readOnly: true },
+    );
+    try {
+      const totals = parallelDatabase.prepare(`
+        SELECT SUM(tokens_in_uncached) AS input,
+               SUM(tokens_out_text) AS output
+        FROM usage_event`).get();
+      assert.equal(Number(totals.input), 500);
+      assert.equal(Number(totals.output), 50);
+    } finally {
+      parallelDatabase.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a replacement counter reset re-anchors once, charges per-turn usage, and records the regression", async () => {
+  const baseLines = [
+    sessionMeta(THREAD_ONE),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+    tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+  ];
+  const replacementLines = [
+    paginatedSessionMeta(THREAD_ONE, {
+      ordinal: baseLines.length,
+      baseRolloutId: THREAD_ONE,
+      endOrdinalExclusive: baseLines.length,
+      endByteOffset: jsonlBytes(baseLines),
+    }),
+    turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-sol"),
+    tokenCount("2026-07-25T01:00:01.000Z", usage(50, 5), usage(50, 5)),
+    tokenCount("2026-07-25T01:00:02.000Z", usage(100, 10), usage(50, 5)),
+  ];
+  const { root } = await corpus({
+    [canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE)]: baseLines,
+    [canonicalRolloutName("2026-07-25T01-00-00", THREAD_ONE, ROLLOUT_TWO)]: replacementLines,
+  });
+  try {
+    await build(root);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      const totals = database.prepare(`
+        SELECT SUM(tokens_in_uncached) AS input,
+               SUM(tokens_out_text) AS output
+        FROM usage_event`).get();
+      assert.equal(Number(totals.input), 200);
+      assert.equal(Number(totals.output), 20);
+      assert.equal(Number(database.prepare(`
+        SELECT COALESCE(SUM(count), 0) AS count FROM source_diagnostic
+        WHERE code = 'cumulativeCounterRegressions'`).get().count), 1);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a third physical generation appends incrementally with a recursively resolved history seed", async () => {
+  const baseLines = [
+    sessionMeta(THREAD_ONE),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+    tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+  ];
+  const replacementLines = [
+    paginatedSessionMeta(THREAD_ONE, {
+      ordinal: baseLines.length,
+      baseRolloutId: THREAD_ONE,
+      endOrdinalExclusive: baseLines.length,
+      endByteOffset: jsonlBytes(baseLines),
+    }),
+    turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-sol"),
+    tokenCountTotalOnly("2026-07-25T01:00:01.000Z", usage(150, 15)),
+  ];
+  const baseName = canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE);
+  const replacementName = canonicalRolloutName(
+    "2026-07-25T01-00-00",
+    THREAD_ONE,
+    ROLLOUT_TWO,
+  );
+  const { root, sessions } = await corpus({
+    [baseName]: baseLines,
+    [replacementName]: replacementLines,
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    const first = await build(root);
+    assert.equal(first.usageEvents, 2);
+    const thirdLines = [
+      paginatedSessionMeta(THREAD_ONE, {
+        ordinal: baseLines.length + replacementLines.length,
+        baseRolloutId: ROLLOUT_TWO,
+        endOrdinalExclusive: baseLines.length + replacementLines.length,
+        endByteOffset: jsonlBytes(replacementLines),
+      }),
+      turnContext("2026-07-25T02:00:00.000Z", "gpt-5.6-sol"),
+      tokenCountTotalOnly("2026-07-25T02:00:01.000Z", usage(190, 19)),
+    ];
+    await writeFile(join(
+      sessions,
+      canonicalRolloutName("2026-07-25T02-00-00", THREAD_ONE, ROLLOUT_THREE),
+    ), `${thirdLines.join("\n")}\n`);
+
+    const advanced = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(advanced.rebuilt, undefined);
+    assert.equal(advanced.sourcesRescanned, 1);
+    assert.equal(advanced.insertedUsageEvents, 1);
+    assert.equal(advanced.totalUsageEvents, 3);
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      const totals = database.prepare(`
+        SELECT SUM(tokens_in_uncached) AS input,
+               SUM(tokens_out_text) AS output,
+               COUNT(DISTINCT source_local) AS sources
+        FROM usage_event`).get();
+      assert.equal(Number(totals.input), 190);
+      assert.equal(Number(totals.output), 19);
+      assert.equal(Number(totals.sources), 3);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("same-thread rollout events at identical timestamp and byte offset keep distinct event keys", async () => {
+  const baseMeta = sessionMeta(THREAD_ONE);
+  const baseCutoffBytes = Buffer.byteLength(`${baseMeta}\n`);
+  const replacementMeta = paginatedSessionMeta(THREAD_ONE, {
+    ordinal: 1,
+    baseRolloutId: THREAD_ONE,
+    endOrdinalExclusive: 1,
+    endByteOffset: baseCutoffBytes,
+  });
+  const context = turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol");
+  const event = tokenCount(
+    "2026-07-25T00:00:01.000Z",
+    usage(10, 1),
+    usage(10, 1),
+  );
+  const basePrefixBytes = Buffer.byteLength(`${baseMeta}\n${context}\n`);
+  const replacementPrefixBytes = Buffer.byteLength(`${replacementMeta}\n${context}\n`);
+  assert.ok(replacementPrefixBytes >= basePrefixBytes);
+  const paddedContext = `${context}${" ".repeat(replacementPrefixBytes - basePrefixBytes)}`;
+  assert.equal(
+    Buffer.byteLength(`${baseMeta}\n${paddedContext}\n`),
+    replacementPrefixBytes,
+  );
+  const { root } = await corpus({
+    [canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE)]: [
+      baseMeta,
+      paddedContext,
+      event,
+    ],
+    [canonicalRolloutName("2026-07-25T01-00-00", THREAD_ONE, ROLLOUT_TWO)]: [
+      replacementMeta,
+      context,
+      event,
+    ],
+  });
+  try {
+    await build(root);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: true });
+    try {
+      const rows = database.prepare(`
+        SELECT observed_at_ms, source_offset, hex(source_local) AS source_local,
+               hex(event_key) AS event_key
+        FROM usage_event ORDER BY source_local`).all();
+      assert.equal(rows.length, 2);
+      assert.equal(rows[0].observed_at_ms, rows[1].observed_at_ms);
+      assert.equal(rows[0].source_offset, rows[1].source_offset);
+      assert.notEqual(rows[0].source_local, rows[1].source_local);
+      assert.notEqual(rows[0].event_key, rows[1].event_key);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("one divergent thread publishes an attested partial generation and an unchanged pass terminates", async () => {
+  const validLines = [
+    sessionMeta(THREAD_TWO),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+    tokenCount("2026-07-25T00:00:01.000Z", usage(25, 2), usage(25, 2)),
+  ];
+  const divergentA = [sessionMeta(THREAD_ONE)];
+  const divergentB = [
+    sessionMeta(THREAD_ONE),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-terra"),
+  ];
+  const { root } = await corpus({
+    [canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE)]: divergentA,
+    [canonicalRolloutName("2026-07-25T00-00-01", THREAD_ONE)]: divergentB,
+    [canonicalRolloutName("2026-07-25T00-00-02", THREAD_TWO)]: validLines,
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    const built = await build(root);
+    assert.equal(built.generation.status, "partial");
+    assert.equal(built.generation.blockReason, "codex_rollout_sources_quarantined");
+    assert.equal(built.generation.discoveredSourceCount, 3);
+    assert.equal(built.generation.indexedSourceCount, 1);
+    assert.equal(built.generation.skippedSourceCount, 2);
+    assert.equal(built.generation.skippedThreadCount, 1);
+    assert.deepEqual(built.generation.issueCounts, {
+      codex_rollout_generation_ambiguous: {
+        threadCount: 1,
+        sourceCount: 2,
+        sourceBytes: jsonlBytes(divergentA) + jsonlBytes(divergentB),
+      },
+    });
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.deepEqual(database.prepare(`
+        SELECT status, COUNT(*) AS count FROM generation_source
+        WHERE generation_id = ? GROUP BY status ORDER BY status
+      `).all(built.generation.id).map((row) => ({ ...row })), [
+        { status: "complete", count: 1 },
+        { status: "failed", count: 2 },
+      ]);
+      const groups = database.prepare(`
+        SELECT code, source_count, source_bytes, length(group_local) AS local_bytes
+        FROM generation_issue_group WHERE generation_id = ?
+      `).all(built.generation.id).map((row) => ({ ...row }));
+      assert.deepEqual(groups, [{
+        code: "codex_rollout_generation_ambiguous",
+        source_count: 2,
+        source_bytes: jsonlBytes(divergentA) + jsonlBytes(divergentB),
+        local_bytes: 32,
+      }]);
+    } finally {
+      database.close();
+    }
+
+    const rows = [];
+    const accountingSource = createLocalUnifiedAccountingSource({
+      indexFile,
+      requireComplete: true,
+      expectedGeneration: built.generation,
+      contextBehavior: "legacy_zero",
+    });
+    const accounting = await accountingSource({
+      startAt: "2026-07-25T00:00:00.000Z",
+      endAt: "2026-07-26T00:00:00.000Z",
+      onUsage: (row) => rows.push(row),
+    });
+    assert.equal(accounting.coverage.status, "partial");
+    assert.equal(accounting.coverage.generationProof, true);
+    assert.equal(accounting.coverage.skippedSourceCount, 2);
+    assert.equal(accounting.coverage.skippedThreadCount, 1);
+    assert.equal(rows.length, 1);
+
+    const unchanged = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(unchanged.unchanged, true);
+    assert.equal(unchanged.generation.id, built.generation.id);
+    assert.equal(unchanged.sourcesScanned, 0);
+    assert.equal(unchanged.skippedSourceCount, 2);
   } finally {
     await rm(root, { recursive: true });
   }
@@ -2033,6 +2488,16 @@ test("an oversized typed tool record blocks complete generation publication", as
     } finally {
       database.close();
     }
+    const unchanged = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile: join(root, "index.sqlite"),
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      maximumLineBytes: 512,
+    });
+    assert.equal(unchanged.unchanged, true);
+    assert.equal(unchanged.sourcesScanned, 0);
+    assert.equal(unchanged.generation.blockReason, "tool_provenance_incomplete");
   } finally {
     await rm(root, { recursive: true });
   }
@@ -2261,6 +2726,22 @@ test("a rotated pre-tool source withholds tools without blocking accounting", as
     assert.equal(projection.tools.total, 0);
     assert.equal(projection.discoveredSourceCount, 1);
     assert.equal(projection.indexedSourceCount, 2);
+
+    const unchanged = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(unchanged.unchanged, true);
+    assert.equal(unchanged.sourcesScanned, 0);
+    assert.equal(unchanged.totalUsageEvents, 2);
+    assert.equal(unchanged.generation.status, "partial");
+    assert.equal(
+      unchanged.generation.blockReason,
+      "tool_provenance_incomplete",
+    );
+    assert.equal(unchanged.generation.toolProvenanceComplete, false);
   } finally {
     await rm(root, { recursive: true });
   }
@@ -2398,7 +2879,7 @@ test("a fork created after its parent was indexed still suppresses replay", asyn
   }
 });
 
-test("a version-1 index is migrated additively, never rebuilt", async () => {
+test("a version-1 index can be opened through the additive v11 schema migration", async () => {
   const { root } = await corpus({
     "rollout-2026-07-25T00-00-00-aaaa.jsonl": [
       sessionMeta("session-a"),
@@ -2443,7 +2924,7 @@ test("a version-1 index is migrated additively, never rebuilt", async () => {
     const writable = openLocalUnifiedIndex(join(root, "index.sqlite"), { readOnly: false });
     assert.equal(
       Number(writable.prepare("PRAGMA user_version").get().user_version),
-      9,
+      11,
     );
     assert.equal(
       Number(writable.prepare("SELECT COUNT(*) AS c FROM usage_event").get().c),
@@ -2455,13 +2936,15 @@ test("a version-1 index is migrated additively, never rebuilt", async () => {
     assert.ok(writable.prepare("PRAGMA table_info(usage_event)").all()
       .some((column) => column.name === "source_offset"));
     writable.prepare("SELECT COUNT(*) AS c FROM source_boundary_state").get();
+    writable.prepare("SELECT COUNT(*) AS c FROM generation_issue").get();
+    writable.prepare("SELECT COUNT(*) AS c FROM generation_issue_group").get();
     writable.close();
   } finally {
     await rm(root, { recursive: true });
   }
 });
 
-test("v7 diagnostic rows survive the closed-vocabulary and owner migration", async () => {
+test("v7 diagnostic rows survive the closed-vocabulary v11 migration", async () => {
   const { root } = await corpus({
     "rollout-2026-07-25T00-00-00-v7-diagnostics.jsonl": [
       sessionMeta("session-v7-diagnostics"),
@@ -2495,7 +2978,10 @@ test("v7 diagnostic rows survive the closed-vocabulary and owner migration", asy
       INSERT INTO source_diagnostic(generation_id, source_local, code, count)
         SELECT generation_id, source_local, code, count
         FROM source_diagnostic_v8
-        WHERE code NOT IN ('toolRecords', 'toolEvents', 'toolRecordsSkipped');
+        WHERE code NOT IN (
+          'toolRecords', 'toolEvents', 'toolRecordsSkipped',
+          'toolSourceHistoryUnavailable', 'malformedAccountingRecords',
+          'malformedUsageRecords', 'malformedRateLimitRecords');
       DROP TABLE source_diagnostic_v8;
       PRAGMA user_version=7;
       COMMIT;
@@ -2510,7 +2996,7 @@ test("v7 diagnostic rows survive the closed-vocabulary and owner migration", asy
     try {
       assert.equal(
         Number(migrated.prepare("PRAGMA user_version").get().user_version),
-        9,
+        11,
       );
       assert.equal(Number(migrated.prepare(
         "SELECT COUNT(*) AS count FROM source_diagnostic",
@@ -2520,6 +3006,69 @@ test("v7 diagnostic rows survive the closed-vocabulary and owner migration", asy
         WHERE type = 'table' AND name = 'source_diagnostic'
       `).get()?.sql;
       assert.match(sql, /toolRecordsSkipped/u);
+      assert.match(sql, /malformedAccountingRecords/u);
+    } finally {
+      migrated.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a v9 multi-root schema migrates to v11 without losing its owner", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-v9-owner.jsonl": [
+      sessionMeta("77777777-7777-4777-8777-777777777777"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const old = new DatabaseSync(indexFile);
+    const ownerBefore = old.prepare(
+      "SELECT hex(owner_local) AS owner FROM source_cursor",
+    ).get().owner;
+    old.exec(`
+      ALTER TABLE source_cursor DROP COLUMN source_dev;
+      ALTER TABLE source_cursor DROP COLUMN source_ino;
+      ALTER TABLE source_cursor DROP COLUMN source_birthtime_ms;
+      ALTER TABLE source_cursor DROP COLUMN source_ctime_ms;
+      ALTER TABLE source_cursor DROP COLUMN source_identity_token;
+      ALTER TABLE source_cursor DROP COLUMN source_state_token;
+      ALTER TABLE source_cursor DROP COLUMN quarantine_code;
+      DELETE FROM meta WHERE key = 'source_identity_version';
+      PRAGMA user_version=9;
+    `);
+    old.close();
+
+    const migrated = openLocalUnifiedIndex(indexFile, { readOnly: false });
+    try {
+      assert.equal(
+        Number(migrated.prepare("PRAGMA user_version").get().user_version),
+        11,
+      );
+      const columns = new Set(migrated.prepare(
+        "PRAGMA table_info(source_cursor)",
+      ).all().map((column) => column.name));
+      for (const column of [
+        "owner_local",
+        "source_dev",
+        "source_ino",
+        "source_birthtime_ms",
+        "source_ctime_ms",
+        "source_identity_token",
+        "source_state_token",
+        "quarantine_code",
+      ]) assert.ok(columns.has(column), `missing migrated ${column}`);
+      assert.equal(migrated.prepare(
+        "SELECT hex(owner_local) AS owner FROM source_cursor",
+      ).get().owner, ownerBefore);
+      assert.equal(Number(migrated.prepare(
+        "SELECT COUNT(*) AS count FROM usage_event",
+      ).get().count), 1);
     } finally {
       migrated.close();
     }
@@ -2564,7 +3113,7 @@ test("the first ingest after a legacy migration publishes a clean authoritative 
       contractVersion: CONTRACT,
     });
     assert.equal(healed.rebuilt, true);
-    assert.equal(healed.rebuildReason, "legacy_schema");
+    assert.equal(healed.rebuildReason, "source_identity_changed");
     assert.equal(healed.generation.status, "complete");
     assert.equal(healed.generation.usageProvenanceComplete, true);
     assert.equal(healed.generation.sourceOrderComplete, true);
@@ -2617,40 +3166,91 @@ test("an additively widened but unattested generation rebuilds in one refresh", 
   }
 });
 
-test("classifySource maps growth, touch, shrink and novelty to the right work", () => {
-  const info = { size: 100, mtimeMs: 5 };
+test("classifySource maps growth, identity, corruption, shrink and novelty to the right work", () => {
+  const info = {
+    size: 100,
+    mtimeMs: 5,
+    ctimeMs: 6,
+    dev: 7,
+    ino: 8,
+    birthtimeMs: 9,
+  };
+  const physicalCursor = {
+    source_identity_token: "7:8:9",
+    source_state_token: "5:6",
+    quarantine_code: null,
+    scanned_bytes: 100,
+  };
   assert.deepEqual(classifySource(info, undefined), { mode: "rescan" });
   assert.deepEqual(
-    classifySource(info, { size_bytes: 100, mtime_ms: 5 }),
+    classifySource(info, { ...physicalCursor, size_bytes: 100, mtime_ms: 5 }),
     { mode: "skip" },
   );
   assert.deepEqual(
-    classifySource(info, { size_bytes: 100, mtime_ms: 4 }),
+    classifySource(info, {
+      ...physicalCursor,
+      size_bytes: 100,
+      mtime_ms: 4,
+      source_state_token: "4:6",
+    }),
     { mode: "rescan", reason: "same_size_changed" },
   );
   assert.deepEqual(
-    classifySource(info, { size_bytes: 60, mtime_ms: 5 }),
+    classifySource(info, {
+      ...physicalCursor,
+      size_bytes: 60,
+      scanned_bytes: 60,
+      mtime_ms: 5,
+    }),
     { mode: "resume" },
   );
   assert.deepEqual(
-    classifySource(info, { size_bytes: 160, mtime_ms: 5 }),
+    classifySource(info, {
+      ...physicalCursor,
+      size_bytes: 160,
+      scanned_bytes: 160,
+      mtime_ms: 5,
+    }),
     { mode: "rescan", reason: "shrink" },
+  );
+  assert.deepEqual(
+    classifySource(info, {
+      ...physicalCursor,
+      size_bytes: 100,
+      scanned_bytes: 99,
+    }),
+    { mode: "rescan", reason: "cursor_invalid" },
   );
 });
 
 test("classifySource forces a whole-file rescan for cursors stamped by an older parser", () => {
-  const info = { size: 100, mtimeMs: 5 };
+  const info = {
+    size: 100,
+    mtimeMs: 5,
+    ctimeMs: 6,
+    dev: 7,
+    ino: 8,
+    birthtimeMs: 9,
+  };
   // An up-to-date cursor keeps its cheap classification.
   assert.deepEqual(
     classifySource(
       info,
-      { size_bytes: 100, mtime_ms: 5, parser_version: LOCAL_UNIFIED_INDEX_PARSER_VERSION },
+      {
+        size_bytes: 100,
+        mtime_ms: 5,
+        source_identity_token: "7:8:9",
+        source_state_token: "5:6",
+        quarantine_code: null,
+        scanned_bytes: 100,
+        parser_version: LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+      },
       LOCAL_UNIFIED_INDEX_PARSER_VERSION,
     ),
     { mode: "skip" },
   );
   // A cursor stamped by an older parser is re-derived regardless of size or
-  // mtime — skip, touch and resume are all overridden.
+  // state — skip and resume are both overridden.
   for (const cursor of [
     { size_bytes: 100, mtime_ms: 5, parser_version: "unified-rollout-typed-v1" },
     { size_bytes: 100, mtime_ms: 4, parser_version: "unified-rollout-typed-v1" },
@@ -2669,7 +3269,7 @@ test("classifySource forces a whole-file rescan for cursors stamped by an older 
   }
 });
 
-test("a v5 development cursor migrates to v9 with complete source order", async () => {
+test("a v5 cursor cold-rebuilds into v11 with v10 rollout identity", async () => {
   const { root } = await corpus({
     "rollout-2026-07-25T00-00-00-aaaa.jsonl": [
       sessionMeta("session-a"),
@@ -2706,9 +3306,11 @@ test("a v5 development cursor migrates to v9 with complete source order", async 
     }
 
     const healed = await ingest();
-    assert.equal(healed.sourcesReparsedForParserVersion, 1);
-    assert.equal(healed.usageRowsDeletedForReparse, 2);
-    assert.equal(healed.boundaryRowsDeletedForReparse, 2);
+    assert.equal(healed.rebuilt, true);
+    assert.equal(healed.rebuildReason, "source_identity_changed");
+    assert.equal(healed.sourcesReparsedForParserVersion ?? 0, 0);
+    assert.equal(healed.usageRowsDeletedForReparse ?? 0, 0);
+    assert.equal(healed.boundaryRowsDeletedForReparse ?? 0, 0);
     assert.equal(healed.generation.status, "complete");
     assert.equal(healed.generation.usageProvenanceComplete, true);
     assert.equal(healed.generation.sourceOrderComplete, true);
@@ -2720,7 +3322,7 @@ test("a v5 development cursor migrates to v9 with complete source order", async 
     try {
       assert.equal(
         Number(database.prepare("PRAGMA user_version").get().user_version),
-        9,
+        11,
       );
       assert.equal(
         Number(database.prepare(`
@@ -3243,7 +3845,7 @@ test("an inherited Fast turn reaches Fast pricing through the speed crossing", a
   }
 });
 
-test("v8 cursors acquire a stable physical owner and never rebind to a replica", async () => {
+test("v10 cursors migrate to v11, bind one owner, and never rebind", async () => {
   const base = await mkdtemp(join(tmpdir(), "unified-multi-owner-"));
   const rootA = join(base, "root-a");
   const rootB = join(base, "root-b");
@@ -3282,7 +3884,7 @@ test("v8 cursors acquire a stable physical owner and never rebind to a replica",
     assert.equal(initial.totalUsageEvents, 2);
     assert.equal(initial.rootCoverage.status, "ready");
 
-    // Reproduce a genuine v8 file: the owner column did not exist yet. The
+    // Reproduce a genuine main v10 file: the owner column did not exist yet. The
     // writable staged migration must add it, and the first accepted refresh
     // must touch the otherwise unchanged cursor to bind the current owner.
     {
@@ -3290,20 +3892,23 @@ test("v8 cursors acquire a stable physical owner and never rebind to a replica",
       const old = new DatabaseSync(indexFile);
       old.exec(`
         ALTER TABLE source_cursor DROP COLUMN owner_local;
-        PRAGMA user_version=8;
+        PRAGMA user_version=10;
       `);
       old.close();
     }
     const migrated = await ingest([...configured].reverse());
     assert.equal(migrated.rebuilt, undefined);
     assert.equal(migrated.sourcesTouched, 1);
+    assert.equal(migrated.sourcesScanned, 0);
+    assert.equal(migrated.insertedUsageEvents, 0);
+    assert.equal(migrated.totalUsageEvents, 2);
     let boundOwner;
     {
       const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
       try {
         assert.equal(
           Number(database.prepare("PRAGMA user_version").get().user_version),
-          9,
+          11,
         );
         boundOwner = database.prepare(
           "SELECT hex(owner_local) AS owner FROM source_cursor",
@@ -3533,6 +4138,108 @@ test("a longer non-owner replica is held without importing its tail or changing 
       assert.equal(preserved.prepare(
         "SELECT hex(owner_local) AS owner FROM source_cursor",
       ).get().owner.toLowerCase(), boundOwner);
+      assert.equal(Number(preserved.prepare(
+        "SELECT COUNT(*) AS count FROM usage_event",
+      ).get().count), 1);
+    } finally {
+      preserved.close();
+    }
+  } finally {
+    await rm(base, { recursive: true });
+  }
+});
+
+test("a v9 owner gap blocks the v10 identity rebuild and preserves LKG", async () => {
+  const base = await mkdtemp(join(tmpdir(), "unified-v9-held-owner-"));
+  const rootA = join(base, "root-a");
+  const rootB = join(base, "root-b");
+  const sessionsA = join(rootA, "sessions");
+  const sessionsB = join(rootB, "sessions");
+  const name = "rollout-2026-07-25T00-00-00-v9-held.jsonl";
+  const indexFile = join(base, "index.sqlite");
+  const secretFile = join(base, "salt");
+  const configured = [
+    { path: rootA, id: "v9-a" },
+    { path: rootB, id: "v9-b" },
+  ];
+  const lines = [
+    sessionMeta("66666666-6666-4666-8666-666666666666"),
+    turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+    tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+  ];
+  try {
+    await mkdir(sessionsA, { recursive: true });
+    await mkdir(sessionsB, { recursive: true });
+    const bytes = `${lines.join("\n")}\n`;
+    await writeFile(join(sessionsA, name), bytes);
+    await writeFile(join(sessionsB, name), bytes);
+    await ingestLocalUnifiedIndexIncrement({
+      codexHomes: configured,
+      indexFile,
+      secretFile,
+      contractVersion: CONTRACT,
+    });
+
+    const { DatabaseSync } = await import("node:sqlite");
+    const old = new DatabaseSync(indexFile);
+    const owner = old.prepare(
+      "SELECT hex(owner_local) AS owner FROM source_cursor",
+    ).get().owner.toLowerCase();
+    const salt = await readFile(secretFile);
+    const ownerFor = (id) => sourceOwnerLocal(
+      salt,
+      createHash("sha256")
+        .update("app-usagemonitor/codex-root-owner/v1\0")
+        .update(id)
+        .digest("hex"),
+    ).toString("hex");
+    const nonOwnerFile = owner === ownerFor("v9-a")
+      ? join(sessionsB, name)
+      : join(sessionsA, name);
+    await appendFile(nonOwnerFile, `${tokenCount(
+      "2026-07-25T00:00:02.000Z",
+      usage(200, 20),
+      usage(100, 10),
+    )}\n`);
+    old.exec(`
+      ALTER TABLE source_cursor DROP COLUMN source_dev;
+      ALTER TABLE source_cursor DROP COLUMN source_ino;
+      ALTER TABLE source_cursor DROP COLUMN source_birthtime_ms;
+      ALTER TABLE source_cursor DROP COLUMN source_ctime_ms;
+      ALTER TABLE source_cursor DROP COLUMN source_identity_token;
+      ALTER TABLE source_cursor DROP COLUMN source_state_token;
+      ALTER TABLE source_cursor DROP COLUMN quarantine_code;
+      DELETE FROM meta WHERE key = 'source_identity_version';
+      PRAGMA user_version=9;
+    `);
+    old.close();
+
+    const before = await stat(indexFile);
+    await assert.rejects(
+      ingestLocalUnifiedIndexIncrement({
+        codexHomes: configured,
+        indexFile,
+        secretFile,
+        contractVersion: CONTRACT,
+      }),
+      (error) => {
+        assert.equal(error.code, "local_unified_index_roots_unavailable");
+        assert.equal(error.rootCoverage.status, "partial");
+        assert.equal(error.rootCoverage.retainedHistory, true);
+        return true;
+      },
+    );
+    const after = await stat(indexFile);
+    assert.equal(after.mtimeMs, before.mtimeMs);
+    const preserved = new DatabaseSync(indexFile, { readOnly: true });
+    try {
+      assert.equal(
+        Number(preserved.prepare("PRAGMA user_version").get().user_version),
+        9,
+      );
+      assert.equal(preserved.prepare(
+        "SELECT hex(owner_local) AS owner FROM source_cursor",
+      ).get().owner.toLowerCase(), owner);
       assert.equal(Number(preserved.prepare(
         "SELECT COUNT(*) AS count FROM usage_event",
       ).get().count), 1);

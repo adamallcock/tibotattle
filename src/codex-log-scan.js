@@ -4,11 +4,13 @@ import { createLocalCodexLogPorts } from "./platform/index.js";
 // Temporary Node composition and legacy import facade. Migrate every flat
 // consumer to the reviewed provider entrypoint, then remove this file before
 // the final R7 source freeze and receipt regeneration.
-const scanner = createLocalCodexLogScanner(createLocalCodexLogPorts());
+const localPorts = createLocalCodexLogPorts();
+const scanner = createLocalCodexLogScanner(localPorts);
 
 export const {
   appendedRolloutSourcesAreAfterEnd,
   codexLogSourceFingerprint,
+  codexRolloutDiscoveryReceipt,
   discoverCodexRolloutInfos,
   discoverCodexRollouts,
   hasForkReplayPrefix,

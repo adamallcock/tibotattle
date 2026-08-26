@@ -55,8 +55,8 @@ test("generated compatibility manifest exactly matches all live contract inputs"
 test("executed scanner version is the version embedded in the bundle", async () => {
   const result = await emptyBundle();
   try {
-    assert.equal(result.bundle.compatibility.providerAdapters.openaiCodex.sourceFormats.rollout.parserVersion, "codex-log-scan-v5");
-    assert.equal(result.receipt.compatibility.providerAdapters.openaiCodex.sourceFormats.rollout.parserVersion, "codex-log-scan-v5");
+    assert.equal(result.bundle.compatibility.providerAdapters.openaiCodex.sourceFormats.rollout.parserVersion, "codex-log-scan-v7");
+    assert.equal(result.receipt.compatibility.providerAdapters.openaiCodex.sourceFormats.rollout.parserVersion, "codex-log-scan-v7");
   } finally {
     await rm(result.home, { recursive: true, force: true });
   }

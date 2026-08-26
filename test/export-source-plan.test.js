@@ -14,7 +14,7 @@ import {
 } from "../src/export-source-plan.js";
 import { scanCodexSafeRecords } from "../src/export-safe-records.js";
 
-async function fixture() {
+async function fixture({ incompleteTail = false } = {}) {
   const home = await mkdtemp(join(tmpdir(), "usage-monitor-source-plan-"));
   await mkdir(join(home, "sessions", "2026", "07", "24"), { recursive: true });
   await mkdir(join(home, "archived_sessions"), { recursive: true });
@@ -23,7 +23,7 @@ async function fixture() {
     JSON.stringify({ timestamp: "2026-07-24T12:00:00.000Z", type: "session_meta", payload: { id: "private-session" } }),
     JSON.stringify({ timestamp: "2026-07-24T12:01:00.000Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } }),
   ];
-  await writeFile(path, `${lines.join("\n")}\npartial-private-content`);
+  await writeFile(path, `${lines.join("\n")}\n${incompleteTail ? "partial-private-content" : ""}`);
   return { home, path, complete: `${lines.join("\n")}\n` };
 }
 
@@ -50,7 +50,20 @@ function safeFailure(code) {
   };
 }
 
-test("source plan freezes only complete lines and allows later appends", async () => {
+test("source plan rejects an incomplete trailing JSONL record", async () => {
+  const value = await fixture({ incompleteTail: true });
+  try {
+    await assert.rejects(createCodexExportSourcePlan({
+      codexHome: value.home,
+      startAt: "2026-07-24T11:00:00.000Z",
+      endAt: "2026-07-24T13:00:00.000Z",
+    }), safeFailure("export_source_codex_rollout_tail_incomplete"));
+  } finally {
+    await rm(value.home, { recursive: true, force: true });
+  }
+});
+
+test("source plan freezes a complete source and allows later appends", async () => {
   const value = await fixture();
   try {
     const plan = await createCodexExportSourcePlan({
@@ -106,6 +119,52 @@ test("multi-root source plans contain the union once and ignore root input order
     assert.deepEqual(
       forward.sources.map((source) => source.sourceKey),
       reversed.sources.map((source) => source.sourceKey),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("source planning refuses unavailable roots and resume refuses a missing frozen source", async () => {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-source-plan-coverage-"));
+  const first = join(root, "first");
+  const second = join(root, "second");
+  const offline = join(root, "second-offline");
+  const missing = join(root, "missing");
+  const options = {
+    startAt: "2026-07-24T11:00:00.000Z",
+    endAt: "2026-07-24T13:00:00.000Z",
+  };
+  try {
+    await writeRollout(
+      first,
+      "rollout-2026-07-24T12-00-00-first.jsonl",
+      "10000000-0000-4000-8000-000000000011",
+      "2026-07-24T12:00:00.000Z",
+    );
+    await writeRollout(
+      second,
+      "rollout-2026-07-24T12-05-00-second.jsonl",
+      "10000000-0000-4000-8000-000000000012",
+      "2026-07-24T12:05:00.000Z",
+    );
+    await assert.rejects(
+      createCodexExportSourcePlan({ ...options, codexHomes: [missing] }),
+      safeFailure("export_source_codex_rollout_roots_unavailable"),
+    );
+    await assert.rejects(
+      createCodexExportSourcePlan({ ...options, codexHomes: [first, missing] }),
+      safeFailure("export_source_codex_rollout_roots_unavailable"),
+    );
+
+    const plan = await createCodexExportSourcePlan({
+      ...options,
+      codexHomes: [first, second],
+    });
+    await rename(second, offline);
+    await assert.rejects(
+      resolveCodexExportSourcePlan(plan, { codexHomes: [first, second] }),
+      safeFailure("export_source_source_missing"),
     );
   } finally {
     await rm(root, { recursive: true, force: true });

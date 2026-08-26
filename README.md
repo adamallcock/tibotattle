@@ -243,10 +243,12 @@ vulnerabilities privately.
 
 ## Status
 
-This is an early, personal-pilot release (v0.1.12). It is not a
-provider-authoritative billing dashboard: quota estimates carry explicit
-uncertainty, and unknown models or tiers stay explicit unknowns rather than
-silently defaulted. See
+This is an early, personal-pilot release. The current published version and
+its user-facing history are listed in the [changelog](CHANGELOG.md) and on the
+[GitHub Releases page](https://github.com/adamallcock/tibotattle/releases).
+TiboTattle is not a provider-authoritative billing dashboard: quota estimates
+carry explicit uncertainty, and unknown models or tiers stay explicit unknowns
+rather than silently defaulted. See
 [docs/reports](docs/reports/2026-07-29-end-to-end-pilot-readiness-report.md)
 for the current verification boundary.
 

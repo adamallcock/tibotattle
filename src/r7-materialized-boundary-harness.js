@@ -172,9 +172,9 @@ function seededBytes(length) {
   return bytes;
 }
 
-function exactRelevantLine(byteLength) {
+function exactAccountingLine(byteLength) {
   const prefix = Buffer.from(
-    `{"timestamp":"${R7_FIXTURE_START_AT}","type":"event_msg","payload":{"type":"token_count"},"padding":"`,
+    `{"timestamp":"${R7_FIXTURE_START_AT}","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":1},"last_token_usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":1}},"rate_limits":null},"padding":"`,
     "utf8",
   );
   const suffix = Buffer.from('"}', "utf8");
@@ -185,11 +185,20 @@ function exactRelevantLine(byteLength) {
 
 async function createLineHome(root, label, byteLength) {
   const home = join(root, label);
+  const threadId = "70000000-0000-4000-8000-000000000098";
   await mkdir(join(home, "sessions"), { recursive: true, mode: 0o700 });
   await mkdir(join(home, "archived_sessions"), { recursive: true, mode: 0o700 });
   await writeFile(
-    join(home, "sessions", "material-line.jsonl"),
-    Buffer.concat([exactRelevantLine(byteLength), Buffer.from("\n")]),
+    join(home, "sessions", `rollout-2026-07-24T11-00-00-${threadId}.jsonl`),
+    Buffer.concat([
+      Buffer.from(`${JSON.stringify({
+        timestamp: R7_FIXTURE_START_AT,
+        type: "session_meta",
+        payload: { id: threadId },
+      })}\n`),
+      exactAccountingLine(byteLength),
+      Buffer.from("\n"),
+    ]),
     { mode: 0o600 },
   );
   return home;
@@ -502,12 +511,20 @@ export async function runR7MaterializedBoundaryHarness({
     const fixture = fixturePaths === null
       ? await createR7StructuralFixture(root)
       : { paths: fixturePaths, evidence: await inspectR7StructuralFixture(fixturePaths) };
-    // A second, empty frozen rollout makes the source-file boundary observable
-    // at a positive small limit without introducing any source content.
+    // A second metadata-only frozen rollout makes the source-file boundary
+    // observable at a positive small limit without introducing event content.
     if (fixturePaths === null) {
       await writeFile(
-        join(fixture.paths.codexHome, "archived_sessions", "rollout-2026-07-24T11-00-00-empty.jsonl"),
-        "\n",
+        join(
+          fixture.paths.codexHome,
+          "archived_sessions",
+          "rollout-2026-07-24T11-00-00-70000000-0000-4000-8000-000000000099.jsonl",
+        ),
+        `${JSON.stringify({
+          timestamp: R7_FIXTURE_START_AT,
+          type: "session_meta",
+          payload: { id: "70000000-0000-4000-8000-000000000099" },
+        })}\n`,
         { mode: 0o600 },
       );
     }

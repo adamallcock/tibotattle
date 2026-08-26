@@ -826,6 +826,99 @@ test("tool-only partial coverage does not block complete usage accounting", asyn
   assert.equal(result.unifiedIndex.generation.toolProvenanceComplete, false);
 });
 
+test("rollout quarantine remains accounting-authoritative but terminates the controller as degraded", async () => {
+  let accountingCalls = 0;
+  const generation = {
+    id: 9,
+    fingerprint: "d".repeat(64),
+    status: "partial",
+    blockReason: "codex_rollout_sources_quarantined",
+    discoveredSourceCount: 3,
+    discoveredSourceBytes: 3_000,
+    indexedSourceCount: 1,
+    indexedSourceBytes: 1_000,
+    skippedSourceCount: 2,
+    skippedSourceBytes: 2_000,
+    skippedThreadCount: 1,
+    issueCounts: {
+      codex_rollout_generation_ambiguous: {
+        threadCount: 1,
+        sourceCount: 2,
+        sourceBytes: 2_000,
+      },
+    },
+    discoveryComplete: true,
+    diagnosticsComplete: true,
+    usageProvenanceComplete: true,
+    sourceOrderComplete: true,
+    quotaProvenanceComplete: true,
+    toolProvenanceComplete: true,
+  };
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    unifiedIndexFile: "/private/local-unified-index-v1.sqlite",
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 1,
+      filesDiscovered: 3,
+      refresh: { attempted: false, recordWritten: false, errorCode: null },
+      indexing: COMPLETE_INDEX,
+    }),
+    refreshUnifiedIndex: async () => ({ status: "ingested", generation }),
+    refreshAccounting: async (options) => {
+      accountingCalls += 1;
+      assert.equal(options.expectedGeneration.status, "partial");
+      assert.equal(
+        options.expectedGeneration.blockReason,
+        "codex_rollout_sources_quarantined",
+      );
+      return {
+        generatedAt: "2026-07-23T12:00:00.000Z",
+        periods: [{ id: "7d", events: 1 }],
+        diagnostics: {},
+        sourceDescriptor: {
+          fallbackCount: 0,
+          coverage: {
+            status: "partial",
+            blockReason: "codex_rollout_sources_quarantined",
+            skippedSourceCount: 2,
+            skippedThreadCount: 1,
+          },
+        },
+      };
+    },
+  });
+
+  const result = await runner();
+  assert.equal(accountingCalls, 1);
+  assert.equal(result.accounting.status, "replay_safe");
+  assert.equal(result.accounting.sourceMode, "unified");
+  assert.equal(result.unifiedIndex.generation.status, "partial");
+  assert.equal(result.unifiedIndex.generation.skippedSourceCount, 2);
+  assert.deepEqual(result.unifiedIndex.generation.reasonCounts, {
+    codex_rollout_generation_ambiguous: 1,
+  });
+
+  const controller = new LocalCompanionRefreshController({
+    runner: async () => result,
+    dataStore: { reload: async () => {} },
+  });
+  assert.equal(controller.start(), true);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (controller.getStatus().status === "degraded") break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  const status = controller.getStatus();
+  assert.equal(status.status, "degraded");
+  assert.equal(status.errorCode, "refresh_degraded");
+  assert.equal(status.failedStep, "unified_index");
+  assert.equal(status.failureCode, "codex_rollout_generation_ambiguous");
+  assert.equal(status.result.accounting.status, "replay_safe");
+  assert.equal(status.result.unifiedIndex.generation.skippedSourceCount, 2);
+});
+
 test("explicit legacy rollback leaves the unified index untouched", async () => {
   let unifiedCalls = 0;
   let archiveCalls = 0;
@@ -1177,6 +1270,10 @@ test("unified mode fails closed when the authoritative generation is missing or 
           discoveredSourceBytes: 0,
           indexedSourceCount: 0,
           indexedSourceBytes: 0,
+          skippedSourceCount: 0,
+          skippedSourceBytes: 0,
+          skippedThreadCount: 0,
+          reasonCounts: {},
           usageEvents: 0,
           quotaOccurrences: 0,
           toolFacts: 0,
@@ -3137,7 +3234,10 @@ test("refresh controller exposes only allowlisted unified-index failure codes", 
       await new Promise((resolve) => setImmediate(resolve));
     }
     const status = controller.getStatus();
-    assert.equal(status.status, "succeeded");
+    assert.equal(status.status, "degraded");
+    assert.equal(status.errorCode, "refresh_degraded");
+    assert.equal(status.failedStep, "unified_index");
+    assert.equal(status.failureCode, fixture.expected);
     assert.equal(status.result.unifiedIndex.errorCode, fixture.expected);
     assert.equal(JSON.stringify(status).includes("/Users/private"), false);
   }

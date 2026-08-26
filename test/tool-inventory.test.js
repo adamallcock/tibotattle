@@ -303,11 +303,12 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  // 78: scripts/generate-social-preview.js entered with the 0.1.15
-  // social-card generation (98fe9c9) but was never inventoried — the sixth
-  // instance of the merged-change-with-stale-pin class this week.
-  assert.equal(result.records, 79);
-  assert.equal(result.candidates.length, 81);
+  // 80 records / 82 executable paths: the release-documentation gate and the
+  // Windows/WSL multi-root qualification are both reviewed repository
+  // operations. Keep these exact so any future executable still requires an
+  // ownership decision.
+  assert.equal(result.records, 80);
+  assert.equal(result.candidates.length, 82);
   assert.ok(result.aliases >= 25);
 });
 

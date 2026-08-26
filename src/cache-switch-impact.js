@@ -22,6 +22,8 @@ export const MAX_CACHE_SWITCH_RECENT_DETAILS = 20;
 // product show how the pattern changes with age without asserting a cache TTL.
 export const CACHE_CONTINUITY_MINIMUM_GAP_MS = 0;
 export const MAX_CACHE_CONTINUITY_RECENT_DETAILS = 20;
+export const CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_MS =
+  7 * 24 * 60 * 60_000;
 
 const FUTURE_EVIDENCE_TOLERANCE_MS = 5 * 60_000;
 const CHANGE_TYPES = Object.freeze([
@@ -70,6 +72,71 @@ const CONTINUITY_GAP_BANDS = Object.freeze([
     id: "over_twenty_four_hours",
     label: "More than 24 hours",
     startMs: 24 * 60 * 60_000,
+    endMs: Number.POSITIVE_INFINITY,
+  }),
+]);
+// The cost table keeps its established seven bands. The outcome raster uses a
+// finer, human-readable partition so the dense first few minutes remain
+// inspectable without data-derived boundaries such as "11–27 seconds".
+const CONTINUITY_OUTCOME_BUCKETS = Object.freeze([
+  Object.freeze({
+    id: "under_one_minute",
+    label: "Under 1 minute",
+    startMs: 0,
+    endMs: 60_000,
+  }),
+  Object.freeze({
+    id: "one_to_two_minutes",
+    label: "1 to 2 minutes",
+    startMs: 60_000,
+    endMs: 2 * 60_000,
+  }),
+  Object.freeze({
+    id: "two_to_five_minutes",
+    label: "2 to 5 minutes",
+    startMs: 2 * 60_000,
+    endMs: 5 * 60_000,
+  }),
+  Object.freeze({
+    id: "five_to_ten_minutes",
+    label: "5 to 10 minutes",
+    startMs: 5 * 60_000,
+    endMs: 10 * 60_000,
+  }),
+  Object.freeze({
+    id: "ten_to_thirty_minutes",
+    label: "10 to 30 minutes",
+    startMs: 10 * 60_000,
+    endMs: 30 * 60_000,
+  }),
+  Object.freeze({
+    id: "thirty_minutes_to_one_hour",
+    label: "30 minutes to 1 hour",
+    startMs: 30 * 60_000,
+    endMs: 60 * 60_000,
+  }),
+  Object.freeze({
+    id: "one_to_six_hours",
+    label: "1 to 6 hours",
+    startMs: 60 * 60_000,
+    endMs: 6 * 60 * 60_000,
+  }),
+  Object.freeze({
+    id: "six_to_twenty_four_hours",
+    label: "6 to 24 hours",
+    startMs: 6 * 60 * 60_000,
+    endMs: 24 * 60 * 60_000,
+  }),
+  Object.freeze({
+    id: "one_to_three_days",
+    label: "1 to 3 days",
+    startMs: 24 * 60 * 60_000,
+    endMs: 3 * 24 * 60 * 60_000,
+  }),
+  Object.freeze({
+    id: "over_three_days",
+    label: "3 days or more",
+    startMs: 3 * 24 * 60 * 60_000,
     endMs: Number.POSITIVE_INFINITY,
   }),
 ]);
@@ -532,6 +599,10 @@ function newContinuitySummary() {
     contextContractedReturns: 0,
     insufficientEvidenceReturns: 0,
     uncoveredReturns: 0,
+    reusedMoreThanHalfReturns: 0,
+    reusedHalfOrLessReturns: 0,
+    matchedOrExceededReturns: 0,
+    reusedBetweenHalfAndPreviousReturns: 0,
     cacheReadDrops: 0,
     lostCacheTokens: 0,
     pricedDrops: 0,
@@ -557,6 +628,15 @@ function newContinuityPeriod(period, nowMs) {
         summary: newContinuitySummary(),
       },
     ])),
+    byOutcomeBucket: Object.fromEntries(CONTINUITY_OUTCOME_BUCKETS.map(
+      (bucket) => [
+        bucket.id,
+        {
+          outcomeBucketLabel: bucket.label,
+          summary: newContinuitySummary(),
+        },
+      ],
+    )),
     postCompactionRequests: 0,
     postCompactionCacheReadDrops: 0,
     recent: [],
@@ -569,14 +649,32 @@ function gapBandFor(gapMs) {
   ) ?? null;
 }
 
+function outcomeBucketFor(gapMs) {
+  return CONTINUITY_OUTCOME_BUCKETS.find(
+    (bucket) => gapMs >= bucket.startMs && gapMs < bucket.endMs,
+  ) ?? null;
+}
+
 function addContinuityExclusion(summary, field) {
   summary.sameConfigurationReturns += 1;
   summary[field] += 1;
 }
 
-function addComparableReturn(summary) {
+function addComparableReturn(summary, row) {
   summary.sameConfigurationReturns += 1;
   summary.comparableReturns += 1;
+  const previous = row.previous_tokens_in_cache_read;
+  const current = row.tokens_in_cache_read;
+  if (current <= previous * CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO) {
+    summary.reusedHalfOrLessReturns += 1;
+    return;
+  }
+  summary.reusedMoreThanHalfReturns += 1;
+  if (current >= previous) {
+    summary.matchedOrExceededReturns += 1;
+  } else {
+    summary.reusedBetweenHalfAndPreviousReturns += 1;
+  }
 }
 
 function addContinuityDrop(summary, lostCacheTokens, premiumNanos) {
@@ -602,6 +700,11 @@ function finalizeContinuitySummary(summary) {
     contextContractedReturns: summary.contextContractedReturns,
     insufficientEvidenceReturns: summary.insufficientEvidenceReturns,
     uncoveredReturns: summary.uncoveredReturns,
+    reusedMoreThanHalfReturns: summary.reusedMoreThanHalfReturns,
+    reusedHalfOrLessReturns: summary.reusedHalfOrLessReturns,
+    matchedOrExceededReturns: summary.matchedOrExceededReturns,
+    reusedBetweenHalfAndPreviousReturns:
+      summary.reusedBetweenHalfAndPreviousReturns,
     coverageStatus: completeCoverage ? "complete" : "incomplete",
     cacheReadDrops: summary.cacheReadDrops,
     lostCacheTokens: summary.lostCacheTokens,
@@ -796,11 +899,13 @@ export function analyzeCacheContinuityRows(rows, {
         || !sameContinuityConfiguration(row)) continue;
     const gapMs = observedMs - previousObservedMs;
     const gapBand = gapBandFor(gapMs);
-    if (gapBand === null) continue;
+    const outcomeBucket = outcomeBucketFor(gapMs);
+    if (gapBand === null || outcomeBucket === null) continue;
 
     const targets = applicablePeriods.flatMap((period) => [
       period.summary,
       period.byGapBand[gapBand.id].summary,
+      period.byOutcomeBucket[outcomeBucket.id].summary,
     ]);
     if (!compactionAwareParser(row.previous_parser_version)
         || !compactionAwareParser(row.parser_version)) {
@@ -828,7 +933,7 @@ export function analyzeCacheContinuityRows(rows, {
       }
       continue;
     }
-    for (const summary of targets) addComparableReturn(summary);
+    for (const summary of targets) addComparableReturn(summary, row);
     const drop = materialDropFor(row);
     if (drop === null) continue;
     const premiumNanos = premiumFor(row, drop.lostCacheTokens, pricer);
@@ -850,6 +955,8 @@ export function analyzeCacheContinuityRows(rows, {
     errorCode: null,
     minimumGapSeconds: CACHE_CONTINUITY_MINIMUM_GAP_MS / 1_000,
     maximumRetainedCacheRatio: CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO,
+    outcomeDisplayMaximumGapSeconds:
+      CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_MS / 1_000,
     recentDetailLimit: MAX_CACHE_CONTINUITY_RECENT_DETAILS,
     periods: periods.map((period) => ({
       periodId: period.periodId,
@@ -867,6 +974,22 @@ export function analyzeCacheContinuityRows(rows, {
           ...finalizeContinuitySummary(period.byGapBand[band.id].summary),
         },
       ])),
+      byOutcomeBucket: Object.fromEntries(CONTINUITY_OUTCOME_BUCKETS.map(
+        (bucket) => [
+          bucket.id,
+          {
+            outcomeBucketLabel:
+              period.byOutcomeBucket[bucket.id].outcomeBucketLabel,
+            startSeconds: bucket.startMs / 1_000,
+            endSeconds: Number.isFinite(bucket.endMs)
+              ? bucket.endMs / 1_000
+              : null,
+            ...finalizeContinuitySummary(
+              period.byOutcomeBucket[bucket.id].summary,
+            ),
+          },
+        ],
+      )),
       recent: [...period.recent].reverse(),
     })),
   };
@@ -1129,6 +1252,8 @@ export function unavailableCacheContinuityImpact(errorCode) {
       : "local_unified_index_unavailable",
     minimumGapSeconds: CACHE_CONTINUITY_MINIMUM_GAP_MS / 1_000,
     maximumRetainedCacheRatio: CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO,
+    outcomeDisplayMaximumGapSeconds:
+      CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_MS / 1_000,
     recentDetailLimit: MAX_CACHE_CONTINUITY_RECENT_DETAILS,
     periods: [],
   };

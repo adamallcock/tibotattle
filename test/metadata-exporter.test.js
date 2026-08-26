@@ -245,7 +245,7 @@ test("same-session tool records without provider IDs remain separate physical oc
   }
 });
 
-test("distinct rollout files claiming one session identity fail closed instead of dropping one occurrence", async () => {
+test("unexplained noncanonical rollouts claiming one session fail once with a fixed content-free code", async () => {
   const home = await mkdtemp(join(tmpdir(), "app-usagemonitor-duplicate-session-"));
   await mkdir(join(home, "sessions"), { recursive: true });
   const lines = [
@@ -265,10 +265,49 @@ test("distinct rollout files claiming one session identity fail closed instead o
         bundleId: BUNDLE_ID,
         createdAt: CREATED_AT,
       }),
-      /Ambiguous duplicate Codex session identity/,
+      (error) => {
+        assert.equal(error?.name, "CodexRolloutCoverageError");
+        assert.equal(error?.code, "codex_rollout_generation_ambiguous");
+        assert.deepEqual(error?.coverage, {
+          skippedSourceCount: 2,
+          skippedSourceBytes: Buffer.byteLength(`${lines.join("\n")}\n`) * 2,
+          skippedThreadCount: 1,
+          reasonCounts: { codex_rollout_generation_ambiguous: 1 },
+        });
+        assert.equal(error?.message.includes("duplicated-session"), false);
+        return true;
+      },
     );
   } finally {
     await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("local metadata export refuses an all-unavailable Codex root set", async () => {
+  const root = await mkdtemp(join(tmpdir(), "app-usagemonitor-unavailable-roots-"));
+  try {
+    await assert.rejects(
+      buildLocalMetadataBundle({
+        startAt: "2026-07-24T11:59:00.000Z",
+        endAt: "2026-07-24T12:03:00.000Z",
+        codexHomes: [join(root, "missing")],
+        secret: SECRET,
+        bundleId: BUNDLE_ID,
+        createdAt: CREATED_AT,
+      }),
+      (error) => {
+        assert.equal(error?.name, "CodexRolloutCoverageError");
+        assert.equal(error?.code, "codex_rollout_roots_unavailable");
+        assert.deepEqual(error?.coverage, {
+          configuredRootCount: 1,
+          availableRootCount: 0,
+          unavailableRootCount: 1,
+        });
+        return true;
+      },
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 

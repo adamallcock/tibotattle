@@ -34,6 +34,17 @@
   --blue: #2c5878;
   --blue-soft: #e0eaf1;
 
+  /* Semantic pairs for the few components that invert their foreground and
+     background together. Keeping these separate from `--green` lets the dark
+     theme lift links and chart strokes without turning filled controls into
+     low-contrast mint panels. */
+  --action-bg: var(--green);
+  --action-bg-hover: var(--green-2);
+  --action-ink: #fff;
+  --feature-bg: var(--green);
+  --feature-ink: #fff;
+  --feature-muted: rgba(255, 255, 255, .76);
+
   /* Surfaces. Every panel, card and tile picks one of these four so nothing
      falls back to an untinted grey or to the raw border colour. */
   --surface: rgba(255, 254, 249, .78);
@@ -119,8 +130,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
   top: -4rem;
   inset-inline-start: 1rem;
   padding: .7rem 1rem;
-  color: white;
-  background: var(--green);
+  color: var(--action-ink);
+  background: var(--action-bg);
   border-radius: var(--radius-sm);
 }
 .skip-link:focus { top: 1rem; }
@@ -226,6 +237,41 @@ body.native-dashboard .dashboard-shell {
   display: block;
   width: 100%;
   min-height: 0;
+}
+/* The AppKit shell marks this document before page scripts run. Give that
+   otherwise blank interval one static, truthful surface, then let the
+   existing first-result marker remove it. The normal browser keeps its
+   current dashboard-first rendering because this surface is native-only. */
+.dashboard-boot-state { display: none; }
+html.native-dashboard:not([data-local-dashboard-ready="true"]) .dashboard-boot-state,
+html:not([data-local-dashboard-ready="true"]) body.native-dashboard .dashboard-boot-state {
+  display: grid;
+  min-height: clamp(280px, 72vh, 560px);
+  padding: clamp(28px, 7vw, 72px) 0;
+  place-items: center;
+}
+.dashboard-boot-card {
+  display: grid;
+  gap: var(--space-4);
+  width: min(34rem, 100%);
+  padding: clamp(24px, 5vw, 40px);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-card);
+}
+.dashboard-boot-card .state-pill { margin-bottom: var(--space-1); }
+.dashboard-boot-title {
+  font-size: clamp(1.55rem, 3vw, 2.2rem);
+  font-weight: var(--weight-semibold);
+  letter-spacing: -.025em;
+  line-height: 1.1;
+}
+.dashboard-boot-copy {
+  max-width: 29rem;
+  margin-bottom: 0;
+  color: var(--muted);
+  font-size: .88rem;
 }
 html.native-dashboard main,
 html.native-dashboard footer,
@@ -335,8 +381,8 @@ body.native-dashboard #setup-card { display: none !important; }
 .button:hover:not(:disabled) { transform: translateY(-1px); box-shadow: var(--shadow-card); }
 .button:active:not(:disabled) { transform: translateY(0); box-shadow: none; }
 .button:disabled { opacity: .45; cursor: not-allowed; }
-.button-primary { color: white; background: var(--green); }
-.button-primary:hover:not(:disabled) { background: var(--green-2); }
+.button-primary { color: var(--action-ink); background: var(--action-bg); }
+.button-primary:hover:not(:disabled) { background: var(--action-bg-hover); }
 .button-secondary, .button-quiet { color: var(--ink); border-color: var(--line); background: var(--surface); }
 .button-secondary:hover:not(:disabled), .button-quiet:hover:not(:disabled) {
   border-color: var(--line-strong);
@@ -563,7 +609,7 @@ h1 {
   justify-self: start;
   margin-top: 4px;
 }
-.companion-steps .button-primary { color: white; }
+.companion-steps .button-primary { color: var(--action-ink); }
 .installer-details {
   display: grid;
   gap: 3px;
@@ -1283,7 +1329,7 @@ h2 {
 
 .segmented-control { display: inline-flex; padding: 3px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--surface-raised); }
 .segmented-control button { padding: .5rem .7rem; border: 0; border-radius: var(--radius-xs); color: var(--muted); background: transparent; font-size: .7rem; font-weight: var(--weight-semibold); cursor: pointer; }
-.segmented-control button.active { color: white; background: var(--green); }
+.segmented-control button.active { color: var(--action-ink); background: var(--action-bg); }
 .timeline-controls,
 .calibration-controls { display: grid; justify-items: end; gap: 7px; }
 /* Grouping, date range, and legend used to occupy one stacked row each, so the
@@ -1604,14 +1650,14 @@ tbody tr:last-child td { border-bottom: 0; }
   align-items: center;
   margin-bottom: 18px;
   padding: 34px;
-  color: white;
-  background: var(--green);
+  color: var(--feature-ink);
+  background: var(--feature-bg);
   border-radius: var(--radius-md);
 }
 .weekly-hero > div:first-child { display: flex; flex-direction: column; }
-.weekly-hero span, .weekly-hero small { color: rgba(255,255,255,.7); font-size: .72rem; }
+.weekly-hero span, .weekly-hero small { color: var(--feature-muted); font-size: .72rem; }
 .weekly-hero > div:first-child strong { margin: .2rem 0; font-family: var(--serif); font-size: clamp(3rem, 6vw, 5rem); font-weight: var(--weight-regular); line-height: 1; }
-.weekly-hero > p { max-width: 55ch; margin: 0; color: rgba(255,255,255,.8); font-size: .86rem; line-height: 1.5; }
+.weekly-hero > p { max-width: 55ch; margin: 0; color: var(--feature-muted); font-size: .86rem; line-height: 1.5; }
 /*
  * Pace forecast card.
  *
@@ -1985,14 +2031,190 @@ tbody tr:last-child td { border-bottom: 0; }
 #cache-switch-details td { padding-inline: var(--space-2); }
 .cache-switch-details th:nth-child(n + 3),
 .cache-switch-details td:nth-child(n + 3) { text-align: end; }
-.cache-continuity-details .evidence-subheading {
-  margin: var(--space-5) 0 var(--space-2);
-  font-size: .82rem;
+.cache-reuse-outcome {
+  margin-top: var(--space-5);
+  padding: var(--space-5);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-card);
 }
-.cache-continuity-gap-table th:not(:first-child),
-.cache-continuity-gap-table td:not(:first-child) { text-align: end; }
-.cache-continuity-gap-table td:first-child { white-space: normal; }
-.cache-continuity-premium-unavailable { color: var(--muted); }
+.cache-reuse-real-data {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+  color: var(--muted);
+  font-size: .68rem;
+  font-weight: var(--weight-semibold);
+}
+.cache-reuse-real-data > span:first-child {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: var(--radius-round);
+  background: var(--green-2);
+  box-shadow: 0 0 0 3px rgba(45, 116, 102, .12);
+}
+.cache-reuse-summary {
+  display: grid;
+  grid-template-columns: minmax(250px, .9fr) minmax(500px, 1.55fr);
+  align-items: start;
+  gap: var(--space-7);
+  padding-bottom: var(--space-5);
+}
+.cache-reuse-title .panel-kicker { margin-bottom: var(--space-1); }
+.cache-reuse-title h3 {
+  margin: 0 0 var(--space-2);
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: clamp(1.85rem, 3vw, 2.55rem);
+  font-weight: var(--weight-display);
+  line-height: 1.04;
+  letter-spacing: -.025em;
+}
+.cache-reuse-title > p:last-child {
+  max-width: 26rem;
+  margin: 0;
+  color: var(--muted);
+  font-size: .78rem;
+  line-height: 1.5;
+}
+.cache-reuse-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: stretch;
+  gap: var(--space-2);
+  padding-top: var(--space-2);
+}
+.cache-reuse-metrics > div {
+  min-width: 0;
+  min-height: 94px;
+  display: grid;
+  align-content: center;
+  gap: var(--space-1);
+  padding: var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--paper);
+  box-shadow: 0 2px 8px rgba(31, 45, 39, .04);
+  text-align: center;
+}
+.cache-reuse-metrics strong {
+  color: var(--ink);
+  font-family: var(--serif);
+  font-size: clamp(1.35rem, 2vw, 1.75rem);
+  font-weight: var(--weight-display);
+  line-height: 1.1;
+  letter-spacing: -.02em;
+  white-space: nowrap;
+}
+.cache-reuse-metrics span {
+  color: var(--muted);
+  font-size: .72rem;
+  line-height: 1.3;
+}
+.cache-reuse-metrics small {
+  color: var(--muted);
+  font-size: .64rem;
+}
+.cache-reuse-metric-more strong { color: var(--green); }
+.cache-reuse-metric-less strong { color: var(--rust); }
+.cache-reuse-metric-overhead strong { color: var(--blue); }
+.cache-reuse-metrics > p {
+  grid-column: 1 / -1;
+  margin: 0;
+  text-align: center;
+}
+.cache-reuse-metrics .cache-reuse-explanation {
+  margin-top: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid rgba(45, 116, 102, .18);
+  border-radius: var(--radius-xs);
+  color: var(--green);
+  background: var(--green-soft);
+  font-size: .72rem;
+  font-weight: var(--weight-medium);
+  line-height: 1.45;
+  text-align: start;
+}
+.cache-reuse-empty {
+  margin: 0;
+  padding: var(--space-5);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  text-align: center;
+}
+.cache-reuse-raster {
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--line);
+}
+.cache-reuse-raster-scroll {
+  width: 100%;
+  overflow: visible;
+}
+.cache-reuse-raster-stage {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+}
+.cache-reuse-raster canvas {
+  display: block;
+  cursor: crosshair;
+  outline: 0;
+}
+.cache-reuse-raster canvas:focus-visible {
+  border-radius: var(--radius-xs);
+  box-shadow: inset 0 0 0 2px rgba(44, 88, 120, .62);
+}
+.cache-reuse-readout-rail {
+  position: absolute;
+  z-index: 4;
+  inset: 0;
+  height: 0;
+  pointer-events: none;
+}
+.cache-reuse-readout {
+  position: absolute;
+  top: 46px;
+  left: var(--cache-reuse-card-x, 50%);
+  width: min(260px, calc(100% - 16px));
+  display: grid;
+  gap: var(--space-1);
+  padding: 10px 14px 11px;
+  border: 1px solid var(--green);
+  border-radius: var(--radius-sm);
+  color: var(--ink);
+  background: rgba(255, 254, 249, .98);
+  box-shadow: 0 18px 42px rgba(31, 45, 39, .2);
+  font-size: .68rem;
+  line-height: 1.35;
+  transform: translateX(-50%);
+}
+.cache-reuse-readout strong { font-size: .78rem; }
+.cache-reuse-readout > span:first-of-type { color: var(--muted); }
+.cache-reuse-readout-more {
+  color: var(--green);
+  font-weight: var(--weight-semibold);
+}
+.cache-reuse-readout-less {
+  color: var(--rust);
+  font-weight: var(--weight-semibold);
+}
+.cache-reuse-readout small {
+  color: var(--muted);
+  font-size: .62rem;
+}
+.cache-reuse-readout-lost {
+  margin-top: 2px;
+  padding-top: 5px;
+  border-top: 1px solid var(--line);
+}
+.cache-reuse-readout-api {
+  color: var(--ink);
+  font-weight: var(--weight-semibold);
+}
 .cache-continuity-recent-table th:nth-child(3),
 .cache-continuity-recent-table td:nth-child(3) { text-align: start; }
 .cache-continuity-recent-table th:nth-child(n + 4),
@@ -2032,6 +2254,24 @@ tbody tr:last-child td { border-bottom: 0; }
 .cache-switch-change {
   min-width: 15rem;
   white-space: normal;
+}
+@media (max-width: 1080px) {
+  .cache-reuse-summary {
+    grid-template-columns: 1fr;
+    gap: var(--space-3);
+  }
+  .cache-reuse-title > p:last-child { max-width: none; }
+}
+@media (max-width: 700px) {
+  .cache-reuse-outcome { padding: var(--space-4); }
+  .cache-reuse-metrics { gap: 6px; }
+  .cache-reuse-metrics > div {
+    min-height: 88px;
+    padding: 8px 5px;
+  }
+  .cache-reuse-metrics strong { font-size: 1.15rem; }
+  .cache-reuse-metrics span { font-size: .62rem; }
+  .cache-reuse-metrics small { font-size: .58rem; }
 }
 /* A five-column evidence table is readable on a desktop but not at phone
    width. Retain its table semantics there, then turn each row into a labelled
@@ -2503,6 +2743,15 @@ footer p { margin: 0; }
     gap: 0;
     overflow: hidden;
     font-size: 0;
+  }
+  /* The toolbar saves space with a dot at this width. The boot card has the
+     room — and its whole purpose is to name the state — so keep its label. */
+  .dashboard-boot-card .state-pill {
+    width: max-content;
+    height: auto;
+    padding: .38rem .62rem;
+    gap: .45rem;
+    font-size: .67rem;
   }
   .primary-nav a {
     flex: 0 0 auto;
@@ -3931,3 +4180,231 @@ footer p { margin: 0; }
 }
 
 .share-toast-action { margin-inline-start: .75rem; flex: 0 0 auto; }
+
+/*
+ * Forest Ink dark appearance.
+ *
+ * The public dashboard remains light unless a trusted host explicitly sets
+ * `data-theme="dark"` on the document element. The native app installs that
+ * marker at document start, before this sheet paints, so there is no cream
+ * flash when the Mac is using Dark appearance. These values deliberately
+ * stay in the light design's cream-and-forest family: the hierarchy and
+ * component shapes are unchanged; only their surface roles are remapped.
+ */
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --paper: #141a17;
+  --paper-2: #101512;
+  --white: #f5f1e8;
+  --ink: #f5f1e8;
+  --text: #f5f1e8;
+  --muted: #bec5bd;
+  --line: rgba(245, 241, 232, .14);
+  --line-strong: rgba(245, 241, 232, .21);
+  --green: #76aa9c;
+  --green-2: #99c5ba;
+  --green-text: #99c5ba;
+  --chart-accent: #99c5ba;
+  --green-soft: rgba(118, 170, 156, .14);
+  --rust: #bd735f;
+  --rust-soft: rgba(189, 115, 95, .14);
+  --amber: #c5a46a;
+  --amber-soft: rgba(197, 164, 106, .14);
+  --blue: #7d9eb8;
+  --blue-soft: rgba(125, 158, 184, .14);
+  --action-bg: #76aa9c;
+  --action-bg-hover: #99c5ba;
+  --action-ink: #141a17;
+  --feature-bg: #2d7466;
+  --feature-ink: #fffef9;
+  --feature-muted: rgba(255, 254, 249, .76);
+  --surface: rgba(27, 37, 33, .9);
+  --surface-raised: #24322c;
+  --surface-quiet: rgba(27, 37, 33, .72);
+  --surface-sunken: #101512;
+  --shadow: 0 18px 50px rgba(0, 0, 0, .28);
+  --shadow-card: 0 10px 28px rgba(0, 0, 0, .18);
+}
+
+html[data-theme="dark"],
+html[data-theme="dark"] body,
+html[data-theme="dark"] body.community-site {
+  background:
+    radial-gradient(circle at 85% 4%, rgba(45, 116, 102, .13), transparent 27rem),
+    var(--paper);
+}
+
+html[data-theme="dark"] .topbar {
+  background: rgba(20, 26, 23, .92);
+}
+
+html[data-theme="dark"] .primary-nav a:hover,
+html[data-theme="dark"] .primary-nav a.active,
+html[data-theme="dark"] .state-pill,
+html[data-theme="dark"] .evidence-chip {
+  border-color: rgba(118, 170, 156, .24);
+}
+
+html[data-theme="dark"] .notice p,
+html[data-theme="dark"] .timeline-confidence.low,
+html[data-theme="dark"] .series-coverage,
+html[data-theme="dark"] .evidence-warning,
+html[data-theme="dark"] .installer-unavailable {
+  color: #d7ba84;
+}
+
+html[data-theme="dark"] .notice-error p,
+html[data-theme="dark"] .evidence-warning:not(.progress):not(.informational) {
+  color: #d89a88;
+}
+
+html[data-theme="dark"] .notice-demo p,
+html[data-theme="dark"] .notice-info p,
+html[data-theme="dark"] .history-index-badge-headline,
+html[data-theme="dark"] .history-index-badge-detail,
+html[data-theme="dark"] .evidence-warning.progress,
+html[data-theme="dark"] .evidence-warning.informational,
+html[data-theme="dark"] .plain-result {
+  color: #afc8db;
+}
+
+html[data-theme="dark"] .metric-card.quota-card-spark {
+  border-color: rgba(125, 158, 184, .28);
+  background: linear-gradient(145deg, rgba(125, 158, 184, .13), rgba(36, 50, 44, .92));
+}
+
+/* Forest Ink uses the selected balanced treatment: the metric retains one
+   confident brand band while the explanation stays part of the dark report. */
+html[data-theme="dark"] .weekly-hero {
+  gap: 0;
+  padding: 0;
+  overflow: hidden;
+  color: var(--ink);
+  border: 1px solid rgba(118, 170, 156, .3);
+  background: var(--surface);
+}
+
+html[data-theme="dark"] .weekly-hero > div:first-child {
+  padding: 34px;
+  color: var(--feature-ink);
+  background: var(--feature-bg);
+}
+
+html[data-theme="dark"] .weekly-hero > div:first-child span,
+html[data-theme="dark"] .weekly-hero > div:first-child small {
+  color: var(--feature-muted);
+}
+
+html[data-theme="dark"] .weekly-hero > p {
+  padding: 34px;
+  margin: 0;
+  color: var(--muted);
+}
+
+html[data-theme="dark"] .weekly-pace-forecast {
+  background: linear-gradient(100deg, var(--pace-accent-wash), var(--surface));
+}
+
+html[data-theme="dark"] .weekly-pace-forecast:not(.is-on-pace):not(.is-over-pace):not(.is-insufficient) {
+  --pace-accent-edge: rgba(118, 170, 156, .28);
+  --pace-accent-wash: rgba(118, 170, 156, .13);
+}
+
+html[data-theme="dark"] .weekly-pace-forecast.is-on-pace,
+html[data-theme="dark"] .weekly-pace-forecast.is-insufficient {
+  --pace-accent-edge: rgba(125, 158, 184, .28);
+  --pace-accent-wash: rgba(125, 158, 184, .13);
+}
+
+html[data-theme="dark"] .weekly-pace-forecast.is-over-pace {
+  --pace-accent-edge: rgba(197, 164, 106, .28);
+  --pace-accent-wash: rgba(197, 164, 106, .13);
+}
+
+html[data-theme="dark"] .weekly-pace-forecast.is-over-pace.is-critical {
+  --pace-accent-edge: rgba(189, 115, 95, .28);
+  --pace-accent-wash: rgba(189, 115, 95, .13);
+}
+
+html[data-theme="dark"] .notice.notice-info.accounting-disclosure {
+  border-color: rgba(125, 158, 184, .2);
+  border-inline-start: 3px solid var(--blue);
+  background: var(--surface);
+}
+
+html[data-theme="dark"] .chart-grid {
+  stroke: rgba(245, 241, 232, .1);
+}
+
+html[data-theme="dark"] .chart-error-bar-weekly .chart-error-bar-line,
+html[data-theme="dark"] .chart-error-bar-weekly .chart-error-bar-cap {
+  stroke: rgba(125, 158, 184, .86);
+}
+
+html[data-theme="dark"] .chart-area-confidence {
+  fill: rgba(125, 158, 184, .14);
+}
+
+html[data-theme="dark"] .chart-point-weekly-mature {
+  fill: var(--blue);
+  stroke: var(--paper);
+}
+
+html[data-theme="dark"] .contribution-cta {
+  border-color: rgba(118, 170, 156, .3);
+  border-top-color: var(--green);
+  background:
+    radial-gradient(circle at 8% 10%, rgba(45, 116, 102, .18), transparent 52%),
+    var(--surface-raised);
+  box-shadow: 0 18px 46px rgba(0, 0, 0, .24);
+}
+
+html[data-theme="dark"] .info-popover,
+html[data-theme="dark"] .share-toast {
+  color: var(--ink);
+  background: var(--surface-raised);
+  box-shadow: 0 14px 30px rgba(0, 0, 0, .34);
+}
+
+html[data-theme="dark"] .provider-button-google {
+  color: #17211e;
+  background: #fff;
+  border-color: #aeb8b3;
+}
+
+html[data-theme="dark"] .provider-button-apple {
+  color: #f5f1e8;
+  background: #070908;
+  border-color: #070908;
+}
+
+html[data-theme="dark"] input:not([type="checkbox"]):not([type="radio"]),
+html[data-theme="dark"] select,
+html[data-theme="dark"] textarea {
+  color: var(--ink);
+  border-color: var(--line);
+  background-color: var(--surface-raised);
+}
+
+html[data-theme="dark"] .share-preview canvas {
+  /* Portable share-card exports deliberately keep the existing light brand
+     artwork in the first release, independent of the viewer's preference. */
+  background: #f5f1e8;
+}
+
+html[data-theme="dark"] .skeleton-card {
+  background: linear-gradient(100deg, rgba(245, 241, 232, .04) 35%, rgba(245, 241, 232, .13) 50%, rgba(245, 241, 232, .04) 65%);
+  background-size: 300% 100%;
+}
+
+html[data-theme="dark"] .noscript {
+  color: #141a17;
+  background: var(--rust);
+}
+
+@media (max-width: 700px) {
+  html[data-theme="dark"] .weekly-hero > div:first-child,
+  html[data-theme="dark"] .weekly-hero > p {
+    padding: 24px;
+  }
+}

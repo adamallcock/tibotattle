@@ -72,6 +72,10 @@ function unavailable(status, errorCode = null) {
     discoveredSourceBytes: 0,
     indexedSourceCount: 0,
     indexedSourceBytes: 0,
+    skippedSourceCount: 0,
+    skippedSourceBytes: 0,
+    skippedThreadCount: 0,
+    rolloutIssueCounts: {},
     indexBytes: 0,
     latestExportableRecordAt: null,
     tools: emptyToolProjection(),
@@ -586,6 +590,13 @@ export async function readLocalUnifiedCompanionProjection({
         ? indexedSourceCount : 0,
       indexedSourceBytes: Number.isSafeInteger(indexedSourceBytes)
         ? indexedSourceBytes : 0,
+      skippedSourceCount: Number.isSafeInteger(generation?.skippedSourceCount)
+        ? generation.skippedSourceCount : 0,
+      skippedSourceBytes: Number.isSafeInteger(generation?.skippedSourceBytes)
+        ? generation.skippedSourceBytes : 0,
+      skippedThreadCount: Number.isSafeInteger(generation?.skippedThreadCount)
+        ? generation.skippedThreadCount : 0,
+      rolloutIssueCounts: generation?.issueCounts ?? {},
       indexBytes: metadata.size,
       latestExportableRecordAt: isoOrNull(lastObservedMs),
       tools: toolProjection(database, generation),

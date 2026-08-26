@@ -110,6 +110,34 @@ test("native catalogs have complete language parity and preserve placeholders", 
     english.get("settings.languageSummary"),
     "Uses your Mac language by default.",
   );
+  assert.equal(
+    english.get("settings.updateCheckUnavailableTitle"),
+    "Couldn't check for updates",
+  );
+  assert.equal(
+    english.get("settings.updateCheckUnavailableMessage"),
+    "TiboTattle couldn't complete the update check. Check your internet connection and try again.",
+  );
+  assert.equal(
+    english.get("launcher.dashboardTakingLonger"),
+    "Dashboard is taking longer than expected",
+  );
+  assert.equal(
+    english.get("launcher.errorDashboardReadinessTimeout"),
+    "The local dashboard page loaded, but it did not become ready during the initial wait.",
+  );
+  assert.equal(
+    english.get("launcher.recoveryDashboardWebView"),
+    "Choose Open Dashboard to try the local view again. If it still does not open, choose Retry.",
+  );
+  assert.equal(
+    catalogs.get("es").get("launcher.recoveryDashboardWebView"),
+    "Elige Abrir panel para volver a intentar la vista local. Si aún no se abre, elige Reintentar.",
+  );
+  assert.equal(
+    catalogs.get("zh-Hans").get("launcher.recoveryDashboardWebView"),
+    "请选择“打开仪表板”再次尝试本地视图。如果仍无法打开，请选择“重试”。",
+  );
   assert.match(swiftSource, /LanguagePreference: String, CaseIterable/u);
   assert.match(swiftSource, /UserDefaults\.standard\.set/u);
   assert.match(swiftSource, /Locale\.preferredLanguages/u);

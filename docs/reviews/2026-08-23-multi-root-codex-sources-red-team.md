@@ -2,7 +2,7 @@
 title: Multi-root Codex sources red-team review
 date: 2026-08-23
 type: review
-status: stage-a-complete; platform-hardening-local-only; no-blocking-findings
+status: stage-a-integrated; current-source-r7-open; platform-hardening-local-only; no-code-quality-blocking-findings
 reviewers:
   - source-and-index-map
   - availability-and-lifecycle-map
@@ -404,16 +404,18 @@ updater behavior. Those remain explicit release gates under the Windows work.
 
 1. Multi-root discovery tests prove union, reorder, raw-byte collision proof,
    ambiguity, and unsafe-root discard.
-2. Index tests prove v8-to-v9 owner stamping, SQL-level no-rebind, lagging
-   replica coverage, normal historical deletion, all-unavailable LKG, and
-   retained parent lineage.
+2. Index tests prove v10-to-v11 owner stamping, v9 owner-gap LKG preservation,
+   SQL-level no-rebind, lagging replica coverage, normal historical deletion,
+   all-unavailable LKG, and retained parent lineage.
 3. Refresh/server tests prove primary-only live behavior, plural unified and
    contribution behavior, aggregate path-free projection, and no zero publish.
 4. Native tests prove schema constraints, migration, settings UI, missing-root
    reload, primary launch environment, and removal copy.
 5. Web tests prove closed coverage validation and rendered warning wiring.
-6. Focused suites, full repository tests, docs links, localization checks, and
-   independent audits pass without weakening existing tests.
+6. Focused suites and the functional/source repository lanes pass without
+   weakening existing tests; docs, localization, and independent audits pass,
+   while retained generated-evidence assertions close only at the separate
+   current-source R7 source-freeze gate.
 7. Native Windows and real WSL jobs pass on the exact reviewed revision; until
    then installed Windows/WSL qualification remains explicitly outstanding.
 
@@ -440,10 +442,12 @@ defines an explicit safe recovery.
 ## Final review disposition
 
 Independent code-quality, test/documentation, and performance passes found no
-Stage A blocker. Those passes directly caused fixes for v1 missing-path
-migration, primary-only side-chat binding, export-resume physical proof,
-closed aggregate coverage validation, per-root production discovery ceilings,
-legacy archive-limit compatibility, and static fallback translation parity.
+unresolved Stage A source-correctness blocker. Those passes directly caused
+fixes for v1 missing-path migration, primary-only side-chat binding,
+export-resume physical proof, closed aggregate coverage validation, per-root
+production discovery ceilings, legacy archive-limit compatibility, static
+fallback translation parity, and complete-scan fail-closed behavior when root
+coverage is degraded.
 
 The residual performance risk is bounded and explicit: configured discovery
 ceilings can still retain a large metadata inventory across eight roots, and
@@ -451,20 +455,32 @@ the pre-existing full SQLite staging copy can require space proportional to the
 combined index on filesystems without cheap cloning. Neither changes logical
 correctness; both belong in installed-platform measurement and Stage B tuning.
 
-The final unrestricted repository run passed 2,855 tests with 18 explicit
-native-Windows platform skips and zero failures. The complete portable lane
-passed 1,155 tests with the same 18 platform skips, and the packaged macOS
-suite passed 58/58. The separately governed R7 source-freeze run regenerated
-ten validated owner-only receipts in 38.7 minutes against 342 source files at
-workload SHA-256
-`eb4060a420bcae176ae7e506dba66ed8a5dc55a55496374ad44051ccd263ec0d`;
-the focused retained-receipt contract passed 2/2 and all receipts remain mode
-`0600`. That R7 evidence is current-source and scalar-history provenance, not
-plural-root performance qualification.
+For the source tree integrated with `origin/main`
+`020ee8419cad33871b733cfd777a93eb68ee4c4f`, the focused integrated matrix
+passed 541 tests with 2 expected native-Windows skips; the new
+coverage/contribution/export matrix passed 78/78; the portable lane passed
+1,191 tests with 18 native-Windows skips; and the packaged macOS suite passed
+61/61.
 
-The verified native journey is recorded in the
+The awake-host full repository run recorded 2,958 passed, 18 skipped, 2
+failed, and 1 cancelled out of 2,979 tests. Both failures correctly identify
+the retained R7 receipts as stale for the integrated source tree. The one
+cancelled RSS-budget stress case is covered by the green portable lane and a
+separate 1/1 isolated rerun; it is not a Stage A behavior failure. The standard
+full suite therefore remains red only at its two current-source R7 provenance
+assertions.
+
+Atomic current-source R7 regeneration remains open. The Node 26 pressure
+profile exceeded the unchanged `elapsed_time` ceiling, and the generator
+correctly retained the prior ten receipts without partial replacement. Those
+receipts remain historical pre-integration evidence, not current-source or
+plural-root qualification.
+
+The earlier native journey is recorded in the
 [Multi-root Codex AppKit QA receipt](../receipts/2026-08-23-multi-root-codex-appkit-qa-receipt.md).
-Stage A and its R7 receipts were committed locally on the isolated branch. No
-release artifact, code push, tag, installation replacement, or code publication
-was performed. The body of public issue #51 was reconciled on 2026-08-25, and
-the issue remains open for platform qualification.
+It is not described as a fresh integrated-UI rerun. Stage A is locally
+integrated, but current-source R7 provenance, installed Windows/WSL
+qualification, eight-root platform measurement, and Windows signing/installer
+work remain open. No release artifact, code push, tag, installation
+replacement, or code publication was performed. The body of public issue #51
+was reconciled on 2026-08-25, and the issue remains open for those gates.

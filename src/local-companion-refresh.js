@@ -126,6 +126,12 @@ const ACCOUNTING_TERMINAL_FAILURE_CODES = new Set([
 // arbitrary internal string can still be well formed while carrying an
 // unreviewed diagnostic promise.
 const UNIFIED_INDEX_PUBLIC_ERROR_CODES = new Set([
+  "codex_rollout_compression_unsupported",
+  "codex_rollout_filename_identity_mismatch",
+  "codex_rollout_generation_ambiguous",
+  "codex_rollout_lineage_invalid",
+  "codex_rollout_content_invalid",
+  "codex_rollout_tail_incomplete",
   "local_unified_index_aborted",
   "local_unified_index_directory_sync_failed",
   "local_unified_index_file_changed",
@@ -148,6 +154,14 @@ const UNIFIED_INDEX_PUBLIC_ERROR_CODES = new Set([
 ]);
 const DEFAULT_UNIFIED_INDEX_PUBLIC_ERROR_CODE =
   "local_unified_index_refresh_failed";
+const ROLLOUT_QUARANTINE_CODES = Object.freeze([
+  "codex_rollout_compression_unsupported",
+  "codex_rollout_filename_identity_mismatch",
+  "codex_rollout_generation_ambiguous",
+  "codex_rollout_lineage_invalid",
+  "codex_rollout_content_invalid",
+  "codex_rollout_tail_incomplete",
+]);
 const ARCHIVE_INDEX_STATUSES = new Set(["complete", "partial"]);
 const ARCHIVE_INDEX_PHASES = new Set(["complete", "awaiting_resume"]);
 const ARCHIVE_INDEX_ERROR_CODES = new Set([
@@ -443,6 +457,17 @@ function publicUnifiedGeneration(value) {
     source.indexedSourceBytes ?? source.sourceBytes
       ?? source.discoveredSourceBytes,
   );
+  const skippedSourceCount = safeCount(source.skippedSourceCount);
+  const skippedSourceBytes = safeCount(source.skippedSourceBytes);
+  const skippedThreadCount = safeCount(source.skippedThreadCount);
+  const reasonCounts = {};
+  for (const code of ROLLOUT_QUARANTINE_CODES) {
+    const issue = source.issueCounts?.[code];
+    const count = safeCount(
+      issue?.threadCount ?? source.reasonCounts?.[code],
+    );
+    if (count > 0) reasonCounts[code] = count;
+  }
   return {
     id,
     fingerprint,
@@ -461,6 +486,10 @@ function publicUnifiedGeneration(value) {
     discoveredSourceBytes,
     indexedSourceCount,
     indexedSourceBytes,
+    skippedSourceCount,
+    skippedSourceBytes,
+    skippedThreadCount,
+    reasonCounts,
     usageEvents: safeCount(source.usageEvents),
     quotaOccurrences: safeCount(source.quotaOccurrences),
     toolFacts: safeCount(source.toolFacts),
@@ -478,8 +507,11 @@ function unifiedGenerationAuthoritative(value) {
   const generation = value?.generation;
   const accountingStatus = generation?.status === "complete"
     || (generation?.status === "partial"
-      && generation?.blockReason === "tool_provenance_incomplete"
-      && generation?.toolProvenanceComplete === false);
+      && ((generation?.blockReason === "tool_provenance_incomplete"
+          && generation?.toolProvenanceComplete === false)
+        || (generation?.blockReason === "codex_rollout_sources_quarantined"
+          && generation?.skippedSourceCount > 0
+          && generation?.skippedThreadCount > 0)));
   return value?.status === "ingested"
     && accountingStatus
     && generation.discoveryComplete === true
@@ -1843,6 +1875,29 @@ function publicRefreshResult(result, now = Date.now()) {
   return projected;
 }
 
+function unifiedIndexDegradation(result) {
+  const unified = result?.unifiedIndex;
+  if (unified?.status === "failed") {
+    return {
+      failedStep: "unified_index",
+      failureCode: safeUnifiedIndexPublicErrorCode(unified.errorCode),
+    };
+  }
+  const generation = unified?.generationDescriptor ?? unified?.generation;
+  if (generation?.status === "partial"
+      && generation?.blockReason === "codex_rollout_sources_quarantined") {
+    const reason = ROLLOUT_QUARANTINE_CODES.find((code) => (
+      safeCount(generation?.issueCounts?.[code]?.threadCount
+        ?? generation?.reasonCounts?.[code]) > 0
+    ));
+    return {
+      failedStep: "unified_index",
+      failureCode: reason ?? "codex_rollout_generation_ambiguous",
+    };
+  }
+  return null;
+}
+
 export class LocalCompanionRefreshController {
   #abortController = null;
   #cancelRequested = false;
@@ -2076,8 +2131,9 @@ export class LocalCompanionRefreshController {
         }
         await this.#dataStore.reload({ purpose: "full" });
         const finalProgress = publicIndexingResult(result?.indexing);
+        const degradation = unifiedIndexDegradation(result);
         this.#state = {
-          status: "succeeded",
+          status: degradation === null ? "succeeded" : "degraded",
           refreshId: this.#state.refreshId,
           startedAt: this.#state.startedAt,
           finishedAt: new Date(this.#clock()).toISOString(),
@@ -2087,7 +2143,8 @@ export class LocalCompanionRefreshController {
             ? { ...finalProgress, phase: "quick_result" }
             : finalProgress,
           quickResultAt: this.#state.quickResultAt,
-          errorCode: null,
+          errorCode: degradation === null ? null : "refresh_degraded",
+          ...(degradation ?? {}),
         };
         // A budget miss is a SOFT outcome: the run succeeded serving the
         // retained cache. File the degraded-event note (kept from the incident)

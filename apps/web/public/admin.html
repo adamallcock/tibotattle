@@ -55,24 +55,35 @@
           </span>
           <button class="button button-secondary" id="refresh" type="button">Refresh now</button>
         </div>
-        <div class="admin-toolbar-group admin-notification-controls">
-          <label class="admin-checkbox" for="browser-notifications">
-            <input id="browser-notifications" type="checkbox">
-            Browser alerts for this admin browser
-          </label>
-          <label class="admin-field" for="notification-repeat-minutes">Repeat unresolved alerts
-            <select id="notification-repeat-minutes">
-              <option value="0">Once per change</option>
-              <option value="5">Every 5 minutes</option>
-              <option value="15">Every 15 minutes</option>
-              <option value="60">Every hour</option>
-            </select>
-          </label>
-          <button class="button button-quiet compact" id="notification-test" type="button">
-            Send test
-          </button>
-          <span class="admin-toolbar-status" id="notification-status" role="status"></span>
-          <p class="admin-toolbar-note">Alerts stay in this private browser while this tab is open. Your browser and OS control any sound.</p>
+        <div class="admin-notification-controls">
+          <div class="admin-alert-heading">
+            <label class="admin-checkbox" for="browser-notifications">
+              <input id="browser-notifications" type="checkbox">
+              Browser alerts for this tab
+            </label>
+            <span class="admin-toolbar-status" id="notification-status" role="status"></span>
+          </div>
+          <fieldset class="admin-alert-topics">
+            <legend>Alert topics</legend>
+            <label><input name="notification-topic" value="collection" type="checkbox"> Collection</label>
+            <label><input name="notification-topic" value="maintenance" type="checkbox"> Maintenance, storage &amp; rebuilds</label>
+            <label><input name="notification-topic" value="evidence" type="checkbox"> Evidence sources</label>
+            <label><input name="notification-topic" value="failures" type="checkbox"> Sampled server failures</label>
+          </fieldset>
+          <div class="admin-alert-actions">
+            <label class="admin-field" for="notification-repeat-minutes">While an alert remains unresolved
+              <select id="notification-repeat-minutes">
+                <option value="0">Once per change</option>
+                <option value="5">Every 5 minutes</option>
+                <option value="15">Every 15 minutes</option>
+                <option value="60">Every hour</option>
+              </select>
+            </label>
+            <button class="button button-quiet compact" id="notification-test" type="button">
+              Send test
+            </button>
+          </div>
+          <p class="admin-toolbar-note">Preferences stay in this browser. Alerts are evaluated only when this open tab refreshes; closing it stops them. Browser and OS settings control delivery and sound.</p>
         </div>
       </section>
 
@@ -197,28 +208,27 @@
       <section class="admin-section admin-community-view community-site" aria-labelledby="admin-community-title">
         <div class="section-heading">
           <div>
-            <p class="eyebrow">Public community evidence</p>
-            <h2 id="admin-community-title">Community allowance signal</h2>
+            <p class="eyebrow">Admin-only trial</p>
+            <h2 id="admin-community-title">Allowance merge preview</h2>
           </div>
-          <span class="admin-source-badge" id="admin-community-status">Loading public graph…</span>
+          <span class="admin-source-badge" id="admin-community-status">Loading preview…</span>
         </div>
-        <p class="admin-copy admin-distribution-copy">
-          This is the same published community graph and renderer used by the public dashboard. It reads the delayed, privacy-gated public aggregate only; no private contribution data is added here.
-        </p>
         <div class="community-window">
           <div class="community-window-content">
             <div class="community-allowance">
               <div class="activity-heading">
                 <div>
-                  <h3>Fitted seven-day allowance</h3>
-                  <p>Released estimates, plausible ranges, and per-day evidence from the public aggregate.</p>
+                  <h3>Pro 20x-equivalent allowance</h3>
+                  <p>Compare the proposed combined estimate with each eligible plan.</p>
                 </div>
-                <div class="allowance-controls">
-                  <span class="evidence-chip neutral" id="admin-community-allowance-state">Loading…</span>
+                <div class="admin-allowance-controls">
+                  <div class="segmented-control" id="admin-community-mode-controls" role="group" aria-label="Allowance preview view">
+                    <button type="button" data-allowance-mode="combined" aria-pressed="true" class="active">Combined</button>
+                    <button type="button" data-allowance-mode="plans" aria-pressed="false">By plan</button>
+                  </div>
                   <div class="segmented-control" id="admin-community-range-controls" role="group" aria-label="Community graph range">
-                    <button type="button" data-range-days="30">30d</button>
-                    <button type="button" data-range-days="90">90d</button>
-                    <button type="button" data-range-days="all" aria-pressed="true" class="active">All</button>
+                    <button type="button" data-range-days="30" aria-pressed="true" class="active">30d</button>
+                    <button type="button" data-range-days="all" aria-pressed="false">All</button>
                   </div>
                 </div>
               </div>
@@ -300,17 +310,21 @@
         <div class="section-heading">
           <div>
             <p class="eyebrow">Diagnostics</p>
-            <h2 id="errors-title">Errors and user-reported references</h2>
+            <h2 id="errors-title">Sampled service failures</h2>
+            <p class="admin-copy admin-diagnostic-copy" id="diagnostic-retention-summary">
+              Retention details load with the service snapshot. Retained service request IDs are UUIDs;
+              TT-… references stay only in the reporting Mac’s local diagnostics log.
+            </p>
           </div>
           <form id="diagnostic-form" class="diagnostic-form">
-            <label class="sr-only" for="diagnostic-reference">Diagnostic reference</label>
-            <input id="diagnostic-reference" placeholder="Paste request reference" autocomplete="off">
+            <label class="sr-only" for="diagnostic-reference">Retained service request ID</label>
+            <input id="diagnostic-reference" placeholder="Retained service request ID (UUID)" autocomplete="off" spellcheck="false">
             <button class="button button-quiet" type="submit">Look up</button>
           </form>
         </div>
         <div class="admin-card admin-table-wrap">
           <table>
-            <thead><tr><th>Route</th><th>Error</th><th>Count</th><th>Latest</th></tr></thead>
+            <thead><tr><th>Route</th><th>Error</th><th>HTTP</th><th>Count</th><th>Latest</th></tr></thead>
             <tbody id="error-groups"></tbody>
           </table>
           <p class="admin-empty" id="error-empty">No retained errors in the window.</p>
@@ -318,7 +332,7 @@
         </div>
         <div class="admin-card admin-table-wrap">
           <table>
-            <thead><tr><th>Reference</th><th>Route</th><th>Error</th><th>Status</th><th>Time</th></tr></thead>
+            <thead><tr><th>Retained service request ID</th><th>Route</th><th>Error</th><th>HTTP</th><th>Time</th></tr></thead>
             <tbody id="recent-diagnostic-rows"></tbody>
           </table>
           <p class="admin-empty" id="recent-diagnostic-empty">No sampled failures retained.</p>
@@ -329,9 +343,9 @@
         <p class="eyebrow">Owner audit</p>
         <h2 id="audit-title">Recent control actions</h2>
         <p class="admin-copy admin-audit-copy">
-          Newest first. Each entry explains what the action did and whether any
-          follow-up remains. Open technical fields only when you need the exact
-          stored values.
+          Newest first, with up to the latest 20 actions split into pages. Each
+          entry explains what the action did and whether any follow-up remains.
+          Open technical fields only when you need the exact stored values.
         </p>
         <div class="admin-card admin-audit-wrap">
           <table class="admin-audit-table">
@@ -340,6 +354,11 @@
           </table>
           <p class="admin-empty" id="audit-empty">No recent control actions.</p>
         </div>
+        <nav class="admin-pagination" id="audit-pagination" aria-label="Recent control action pages" hidden>
+          <button class="button button-quiet compact" id="audit-previous" type="button">Previous</button>
+          <span id="audit-page-status" role="status"></span>
+          <button class="button button-quiet compact" id="audit-next" type="button">Next</button>
+        </nav>
       </section>
     </main>
   </body>

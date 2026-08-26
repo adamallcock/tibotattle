@@ -7,6 +7,7 @@ const FILESYSTEM_METHODS = Object.freeze([
   "defaultCodexHome",
   "joinPath",
   "currentUid",
+  "readSelectedRolloutNames",
   "openDirectory",
   "statPath",
   "lstatPath",

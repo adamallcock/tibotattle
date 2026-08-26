@@ -2,12 +2,13 @@ import { createCodexLogIngestion } from "./log-ingestion.js";
 import { createCodexLogParser } from "./log-parser.js";
 import { createCodexLogSources } from "./log-sources.js";
 
-export const CODEX_LOG_SCAN_VERSION = "codex-log-scan-v5";
+export const CODEX_LOG_SCAN_VERSION = "codex-log-scan-v7";
 
 const FILESYSTEM_METHODS = Object.freeze([
   "defaultCodexHome",
   "joinPath",
   "currentUid",
+  "readSelectedRolloutNames",
   "openDirectory",
   "statPath",
   "lstatPath",
@@ -91,6 +92,7 @@ export function createCodexLogScanner(options) {
     readRolloutLineage: sources.readRolloutLineage,
     hasForkReplayPrefix: sources.hasForkReplayPrefix,
     discoverCodexRolloutInfos: sources.discoverCodexRolloutInfos,
+    codexRolloutDiscoveryReceipt: sources.codexRolloutDiscoveryReceipt,
     discoverCodexRollouts: sources.discoverCodexRollouts,
     summarizeCodexRolloutSources: sources.summarizeCodexRolloutSources,
     codexLogSourceFingerprint: sources.codexLogSourceFingerprint,
@@ -115,7 +117,11 @@ export {
   tokenComponentPresence,
 } from "./log-normalization.js";
 
-export { CodexLogSourceChangedError } from "./log-sources.js";
+export {
+  CodexLogSourceChangedError,
+  codexRolloutDiscoveryReceipt,
+  parseCodexRolloutFilename,
+} from "./log-sources.js";
 export { classifySessionSurface } from "./surface-classification.js";
 export {
   isCodexSpeedMode,

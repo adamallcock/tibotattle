@@ -11,6 +11,7 @@ import {
 import {
   analyzeCacheContinuityRows,
   analyzeCacheSwitchRows,
+  CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_MS,
   CACHE_SWITCH_MAXIMUM_RETAINED_CACHE_RATIO,
   MAX_CACHE_SWITCH_RECENT_DETAILS,
 } from "../src/cache-switch-impact.js";
@@ -464,6 +465,83 @@ test("continuity gap bands use exact half-open boundaries without an age floor",
   }
 });
 
+test("continuity outcome raster uses ten fixed human time buckets", () => {
+  const boundaries = [
+    ["under_one_minute", 0, 0, 60],
+    ["one_to_two_minutes", 60_000, 60, 120],
+    ["two_to_five_minutes", 2 * 60_000, 120, 300],
+    ["five_to_ten_minutes", 5 * 60_000, 300, 600],
+    ["ten_to_thirty_minutes", 10 * 60_000, 600, 1_800],
+    ["thirty_minutes_to_one_hour", 30 * 60_000, 1_800, 3_600],
+    ["one_to_six_hours", 60 * 60_000, 3_600, 21_600],
+    ["six_to_twenty_four_hours", 6 * 60 * 60_000, 21_600, 86_400],
+    ["one_to_three_days", 24 * 60 * 60_000, 86_400, 259_200],
+    ["over_three_days", 3 * 24 * 60 * 60_000, 259_200, null],
+  ];
+  const rows = boundaries.map(([, gapMs], index) => {
+    const observedAt = NOW_MS - index * 1_000;
+    return continuityRow({
+      observed_at_ms: observedAt,
+      previous_observed_at_ms: observedAt - gapMs,
+    });
+  });
+  const projection = analyzeCacheContinuityRows(rows, {
+    nowMs: NOW_MS,
+    pricer: fullyPriced,
+  });
+  const period = projection.periods.find(
+    (candidate) => candidate.periodId === "24h",
+  );
+
+  assert.equal(
+    projection.outcomeDisplayMaximumGapSeconds,
+    CACHE_CONTINUITY_OUTCOME_DISPLAY_MAXIMUM_GAP_MS / 1_000,
+  );
+  assert.deepEqual(Object.keys(period.byOutcomeBucket), boundaries.map(
+    ([id]) => id,
+  ));
+  for (const [id, , startSeconds, endSeconds] of boundaries) {
+    assert.equal(period.byOutcomeBucket[id].startSeconds, startSeconds, id);
+    assert.equal(period.byOutcomeBucket[id].endSeconds, endSeconds, id);
+    assert.equal(period.byOutcomeBucket[id].comparableReturns, 1, id);
+    assert.equal(period.byOutcomeBucket[id].reusedHalfOrLessReturns, 1, id);
+  }
+});
+
+test("continuity outcomes partition checked follow-ups at the exact half boundary", () => {
+  const outcomes = [
+    { cacheRead: 1_200, uncached: 0 },
+    { cacheRead: 1_000, uncached: 0 },
+    { cacheRead: 750, uncached: 250 },
+    { cacheRead: 500, uncached: 500 },
+    { cacheRead: 0, uncached: 1_000 },
+  ];
+  const rows = outcomes.map(({ cacheRead, uncached }, index) => {
+    const observedAt = NOW_MS - index * 1_000;
+    return continuityRow({
+      observed_at_ms: observedAt,
+      previous_observed_at_ms: observedAt - 2 * 60_000,
+      tokens_in_cache_read: cacheRead,
+      tokens_in_uncached: uncached,
+    });
+  });
+  const period = analyzeCacheContinuityRows(rows, {
+    nowMs: NOW_MS,
+    pricer: fullyPriced,
+  }).periods.find((candidate) => candidate.periodId === "24h");
+  const bucket = period.byOutcomeBucket.two_to_five_minutes;
+
+  assert.equal(period.comparableReturns, 5);
+  assert.equal(period.reusedMoreThanHalfReturns, 3);
+  assert.equal(period.reusedHalfOrLessReturns, 2);
+  assert.equal(period.matchedOrExceededReturns, 2);
+  assert.equal(period.reusedBetweenHalfAndPreviousReturns, 1);
+  assert.equal(period.cacheReadDrops, 2);
+  assert.equal(bucket.comparableReturns, 5);
+  assert.equal(bucket.reusedMoreThanHalfReturns, 3);
+  assert.equal(bucket.reusedHalfOrLessReturns, 2);
+});
+
 test("continuity lens has no timing floor, requires a turn boundary, and separates confounders", () => {
   const shortGap = continuityRow({
     observed_at_ms: NOW_MS - 10_000,
@@ -793,8 +871,17 @@ test("raw rollout facts flow through the existing index into the read-only impac
     assert.equal(continuity.orderingCoverageGaps, 0);
     assert.equal(continuity.sameConfigurationReturns, 1);
     assert.equal(continuity.comparableReturns, 1);
+    assert.equal(continuity.reusedMoreThanHalfReturns, 0);
+    assert.equal(continuity.reusedHalfOrLessReturns, 1);
     assert.equal(continuity.cacheReadDrops, 1);
     assert.equal(continuity.lostCacheTokens, 1_100);
+    assert.equal(
+      Object.values(continuity.byOutcomeBucket).reduce(
+        (sum, bucket) => sum + bucket.comparableReturns,
+        0,
+      ),
+      continuity.comparableReturns,
+    );
     assert.ok(continuity.estimatedPremiumUsd > 0);
     assert.doesNotMatch(serialized, new RegExp(sessionId, "u"));
     assert.doesNotMatch(serialized, /turn-high|event_key|session_local/u);

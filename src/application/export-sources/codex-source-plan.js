@@ -17,9 +17,18 @@ const {
   fsConstants: constants,
   open,
 } = configuration;
-const { discoverCodexRolloutInfos } = createLocalCodexLogScanner(codexLogPorts);
+const {
+  discoverCodexRolloutInfos,
+  codexRolloutDiscoveryReceipt,
+} = createLocalCodexLogScanner(codexLogPorts);
 
 function fail(code) { throw new ExportSourcePlanError(code); }
+
+function assertReadyRootCoverage(infos) {
+  if (infos.rootCoverage?.status !== "ready") {
+    fail("codex_rollout_roots_unavailable");
+  }
+}
 
 function sourceKey(rolloutKey) {
   return createHash("sha256")
@@ -62,18 +71,13 @@ async function openSource(path, expectedIdentity = null) {
 
 async function completeLinePrefixBytes(handle, size, resourceGuard = null) {
   if (!Number.isSafeInteger(size) || size < 0) fail("source_changed");
-  const chunkBytes = 256 * 1024;
-  for (let end = size; end > 0;) {
-    resourceGuard?.checkRuntime();
-    const start = Math.max(0, end - chunkBytes);
-    const buffer = allocUnsafe(end - start);
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
-    if (bytesRead !== buffer.length) fail("source_changed");
-    const newline = buffer.lastIndexOf(0x0a);
-    if (newline !== -1) return start + newline + 1;
-    end = start;
-  }
-  return 0;
+  if (size === 0) return 0;
+  resourceGuard?.checkRuntime();
+  const tail = allocUnsafe(1);
+  const { bytesRead } = await handle.read(tail, 0, 1, size - 1);
+  if (bytesRead !== 1) fail("source_changed");
+  if (tail[0] !== 0x0a) fail("codex_rollout_tail_incomplete");
+  return size;
 }
 
 async function sha256Prefix(handle, prefixBytes, resourceGuard = null) {
@@ -108,6 +112,20 @@ async function createCodexExportSourcePlan({
     endAt,
     resourceGuard,
   });
+  const discovery = codexRolloutDiscoveryReceipt(infos);
+  if (discovery.status === "partial") {
+    fail(Object.keys(discovery.reasonCounts).sort()[0]
+      ?? "codex_rollout_generation_ambiguous");
+  }
+  assertReadyRootCoverage(infos);
+  // The resumable checkpoint schema can inherit a whole inline parent, but it
+  // cannot represent an exact physical-history cutoff. Never approximate a
+  // paginated continuation by replaying a removed suffix or starting its
+  // cumulative counter from zero. The direct scanner and local index support
+  // this shape; this lane stops until its persisted snapshots become ordinal-aware.
+  if (infos.some((info) => info.lineage?.historyMode === "paginated")) {
+    fail("codex_rollout_checkpoint_history_unsupported");
+  }
   resourceGuard?.assertSourceSelection(
     infos.length,
     infos.reduce((sum, info) => sum + info.size, 0),
@@ -234,6 +252,18 @@ async function resolveCodexExportSourcePlan(plan, {
     endAt: plan.endAt,
     resourceGuard,
   });
+  const discovery = codexRolloutDiscoveryReceipt(infos);
+  if (discovery.status === "partial") {
+    fail(Object.keys(discovery.reasonCounts).sort()[0]
+      ?? "codex_rollout_generation_ambiguous");
+  }
+  // The initial plan already froze the complete source inventory. A root may
+  // disappear during resume when every planned logical source is still
+  // available as a byte-proven replica; the exact map and prefix verification
+  // below fail closed if even one frozen source cannot be resolved.
+  if (infos.some((info) => info.lineage?.historyMode === "paginated")) {
+    fail("codex_rollout_checkpoint_history_unsupported");
+  }
   const current = new Map();
   for (const info of infos) {
     const key = sourceKey(info.rolloutKey);

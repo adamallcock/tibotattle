@@ -1920,6 +1920,112 @@ test("server rejects forged hosts and requires same-origin refresh authorization
   }
 });
 
+test("loopback refresh publishes a rollout quarantine as degraded verified coverage", async () => {
+  const files = await fixture();
+  const generation = {
+    id: 9,
+    fingerprint: "d".repeat(64),
+    status: "partial",
+    blockReason: "codex_rollout_sources_quarantined",
+    discoveredSourceCount: 3,
+    discoveredSourceBytes: 3_000,
+    indexedSourceCount: 1,
+    indexedSourceBytes: 1_000,
+    skippedSourceCount: 2,
+    skippedSourceBytes: 2_000,
+    skippedThreadCount: 1,
+    issueCounts: {
+      codex_rollout_generation_ambiguous: {
+        threadCount: 1,
+        sourceCount: 2,
+        sourceBytes: 2_000,
+      },
+    },
+    discoveryComplete: true,
+    diagnosticsComplete: true,
+    usageProvenanceComplete: true,
+    sourceOrderComplete: true,
+    quotaProvenanceComplete: true,
+    toolProvenanceComplete: true,
+  };
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => ({
+      unifiedIndex: {
+        status: "ingested",
+        generation,
+      },
+    }),
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const started = await fetch(`${base}/api/local/refresh`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1",
+        Origin: base,
+      },
+      body: "{}",
+    });
+    assert.equal(started.status, 202);
+    await waitFor(async () => {
+      const payload = await fetch(`${base}/api/local/refresh`)
+        .then((response) => response.json());
+      return payload.refresh.status === "degraded";
+    });
+    const payload = await fetch(`${base}/api/local/refresh`)
+      .then((response) => response.json());
+    assert.equal(payload.refresh.status, "degraded");
+    assert.equal(payload.refresh.errorCode, "refresh_degraded");
+    assert.equal(payload.refresh.failedStep, "unified_index");
+    assert.equal(
+      payload.refresh.failureCode,
+      "codex_rollout_generation_ambiguous",
+    );
+    assert.deepEqual(payload.refresh.result.unifiedIndex.generation, {
+      id: 9,
+      fingerprint: "d".repeat(64),
+      status: "partial",
+      blockReason: "codex_rollout_sources_quarantined",
+      schemaVersion: null,
+      parserVersion: null,
+      contractVersion: null,
+      coveredAt: { startAt: null, endAt: null },
+      sourceCount: 1,
+      sourceBytes: 1_000,
+      discoveredSourceCount: 3,
+      discoveredSourceBytes: 3_000,
+      indexedSourceCount: 1,
+      indexedSourceBytes: 1_000,
+      skippedSourceCount: 2,
+      skippedSourceBytes: 2_000,
+      skippedThreadCount: 1,
+      reasonCounts: {
+        codex_rollout_generation_ambiguous: 1,
+      },
+      usageEvents: 0,
+      quotaOccurrences: 0,
+      toolFacts: 0,
+      toolFactFingerprint: null,
+      discoveryComplete: true,
+      diagnosticsComplete: true,
+      usageProvenanceComplete: true,
+      sourceOrderComplete: true,
+      quotaProvenanceComplete: true,
+      toolProvenanceComplete: true,
+    });
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
 test("server exposes an authorized bounded refresh cancellation", async () => {
   const files = await fixture();
   const store = fakeStore();
