@@ -62,17 +62,28 @@ fully complete or at parity.
 
 ## Starting evidence and source boundary
 
-- This isolated integration is based exactly on `origin/main` revision
-  `8687cbb9ce0cdad63893b726381e40a73099f09b`. It is the current integration
-  candidate for the Electron parity, Windows qualification, and signed-finalizer
-  changes; it has not yet been freshly packaged or natively Windows-qualified
-  as one exact candidate. No local-versus-remote `main` divergence is part of
-  this plan.
+- The current local integration candidate is exact commits
+  `b7fb1dd6` (`fix(electron): close desktop parity gaps`) followed by
+  `5289e7f0` (`test(electron): qualify real-history relaunch`). The candidate
+  contains the completion-relative refresh lease/watchdog, diagnostics and
+  local-data entry points, visible Usage unavailable states, degraded shell
+  qualification, stricter macOS smoke, and the content-free real-history
+  cancel/full/relaunch harness. These commits are local: the attempted branch
+  push was rejected by the environment approval boundary, so they are not yet
+  available from the remote branch.
+- The verified remote `main` tip is
+  `020ee8419cad33871b733cfd777a93eb68ee4c4f`, and it is already an ancestor
+  of this local candidate. The candidate therefore includes remote `main`; it
+  does not require a separate reconciliation or rebase boundary. No receipt,
+  package, or Windows verdict may be spliced across different product
+  revisions. Later smoke- or documentation-only commits do not change the
+  current package's product bytes; any product-source change requires a fresh
+  rebuild and provenance receipt.
 - The exact Windows development-qualified candidate is the separate revision
   `b37bd4918f75995130f8a4ed6b123e61e48f9179`, validated by run
   `32678463671`. Its receipts and payload evidence belong only to that exact
-  revision and must not be attributed to the current `origin/main` integration
-  until a fresh qualification run passes.
+  revision and must not be attributed to the current local candidate until a
+  fresh qualification run passes.
 - The exact macOS M0 product-feedback handoff was built from
   `e66591c4bc275f2a3060c8b073bb32500fa3931d`; its payload and physical evidence
   remain valid as a separate handoff. This plan does not treat that artifact as
@@ -80,9 +91,11 @@ fully complete or at parity.
 - The application/package version remains `0.1.16` throughout this integration.
   A version bump, release publication, updater-feed change, or replacement of
   the native macOS client is outside this plan.
-- The packaged Electron application already proves secure BrowserWindow
-  defaults, companion startup, loopback-only navigation, close-to-tray,
-  single-instance handling, clean shutdown, and dashboard rendering on macOS.
+- The packaged Electron application already has source and structural evidence
+  for secure BrowserWindow defaults, companion startup, loopback-only
+  navigation, close-to-tray, single-instance handling, clean shutdown, and
+  dashboard rendering on macOS. Current runtime proof remains pending because
+  the host console is locked.
 - The visible dashboard regression was caused by Electron stamping the
   AppKit-only `native-dashboard` marker. Electron now uses its own marker and
   mounts its frozen preload bridge independently of DOM-listener ordering.
@@ -90,7 +103,10 @@ fully complete or at parity.
   and real companion-backed refresh/data interactions. It is reused, not
   rewritten.
 
-## Progress snapshot — 2026-08-23
+## Historical progress snapshot — 2026-08-23
+
+The following record is retained to preserve the earlier M0 evidence. It is
+not evidence for the current `b7fb1dd6`/`5289e7f0` candidate.
 
 - The exact macOS M0 handoff is source-, package-, and physical-acceptance
   complete. Electron has its own visible dashboard marker and restores the
@@ -98,9 +114,10 @@ fully complete or at parity.
   changing the native macOS layout. Direct packaged-app inspection confirmed
   all five routes, exactly one active page, inert inactive pages, real rendered
   data, and no renderer exceptions.
-- P0.1 is implemented in the current integration and physically proven by the
-  separate M0 handoff. A fresh current-integration package remains required
-  before this plan attributes that evidence to `8687cbb9`-based bytes.
+- P0.1 was implemented in that integration and physically proven by the
+  separate M0 handoff. A fresh package remained required before the current
+  candidate could inherit that evidence; the historical handoff is not current
+  integration qualification.
 - P0.2 is complete for the development shell: the renderer receives an exact
   frozen v1 bridge, main-process sender and frame checks, fixed actions,
   loopback-only navigation, sandboxing, and protected desktop settings. Codex
@@ -185,7 +202,7 @@ fully complete or at parity.
   orphans, protected-state persistence, Credential Manager persistence, and
   relaunch. The canonical receipts are explicitly `qualification_only` with
   `productionReadiness: not_claimed`. This evidence must not be reused as a
-  verdict for the current `origin/main` integration.
+  verdict for the current local candidate or the newer remote `main` tip.
 - The clean qualified Windows payload digest for that exact b37 candidate is
   `7d6854448d1ecc289ed86aaea461fd050eb40b336bed43737b48e933e27348a8` across
   466 staged/artifact files and 8,616,547 bytes. Its verified physical handoff
@@ -222,6 +239,53 @@ fully complete or at parity.
   startup POST and its status-item test proves hide/restore, one companion, and
   clean Quit. Those observations are not current-integration qualification.
 
+## Current integration snapshot — 2026-08-25
+
+- The active local candidate is `b7fb1dd6` followed by `5289e7f0`. The product
+  commit closes the major source-level desktop parity gaps found during
+  dogfooding: completion-relative refresh scheduling with stale-settlement
+  protection and a watchdog, responsive cancellation boundaries, visible
+  unavailable states for advanced Usage modules, current degraded shell/status
+  evidence, diagnostics/local-data entry points, and stricter packaged smoke
+  contracts. The harness commit adds content-free real-history cancellation,
+  full-refresh, and relaunch qualification with exact artifact, loader, and
+  process-tree binding.
+- The exact macOS arm64 package from this candidate passed the structural
+  verifier in its original, copied, and zip-extracted forms. The verifier
+  recorded 470 files and 8,456,921 bytes, artifact digest
+  `a5c222093714ece702a80d1e30aab32b38a62b4cd9e2b987b379f82728dd6c39`, and
+  `app.asar` digest
+  `f87fcc8c70861b8015219cf83cd037a4c27d6c9d5b428d1ce08dbb4705760a96`.
+  The handoff zip SHA-256 is
+  `8bda59c56fdac33e912439c4b16d8a1e455f9873b86870e8f3b11aac0250ad4c`.
+  These are structural/package-integrity receipts only; they are not runtime
+  or release receipts.
+- Current source and contract validation records 259 Electron tests, 379 web
+  tests, and 32 status/smoke-harness tests. Independent reviews of the
+  scheduler, desktop parity slice, visible parity gate, and real-history
+  harness are recorded as **GO**. These results establish source behavior and
+  test coverage, not successful launch of the current package.
+- Current macOS runtime qualification is blocked by the locked host console
+  (`IOConsoleLocked=Yes`). The attempted synthetic receipt failed only at
+  `launch` with `remote_debugging_unavailable`; no dashboard, data, tray, or
+  lifecycle verdict was recorded. Unlocking the host and rerunning the exact
+  package is therefore the next macOS acceptance action, not a reason to mark
+  the package failed or complete.
+- Linux GUI qualification is also open. The Linux image download terminated
+  twice on the network boundary, so no Linux runtime or packaging claim is
+  made from those attempts.
+- The parity ledger is intentionally **not complete**. Notifications and the
+  updater remain production-only capabilities until native identity,
+  installer/signing, and release-channel evidence exists. Destructive data and
+  credential reset remains pending an explicit product/security decision.
+  Windows exact-current warm/clean qualification, signed-artifact evidence,
+  native credential/ACL/autostart/notification behavior, and physical macOS
+  tray/icon/percentage observation remain outstanding. The historical M0 and
+  b37 Windows receipts below remain valid only for their stated revisions.
+- The candidate branch has not been pushed because the environment rejected
+  the approval required for that operation. Until a later authorized push or
+  merge, GitHub PR/CI state cannot be used as evidence for these local commits.
+
 ## Definition of parity
 
 Parity means that a user can complete the same supported task with equivalent
@@ -233,6 +297,78 @@ working production updater.
 Compiled but unreachable native macOS diagnostics and data-reset controls are
 not silently added to scope. Re-exposing them requires a separate product and
 security decision.
+
+## Current ordered next steps and exit criteria
+
+The following order supersedes the earlier implementation order for the
+current candidate. Each step has a bounded exit; a source-test pass alone does
+not advance a physical or platform gate.
+
+1. **Seal and publish the exact source boundary.** The local
+   `b7fb1dd6`/`5289e7f0` candidate already includes remote `main` at `020ee841`;
+   do not rebase solely to reconcile those revisions. Record the exact HEAD,
+   package provenance, and receipts before making a shared-branch or CI claim.
+   Later smoke- or documentation-only commits do not change the current
+   package product bytes. If any product source changes, rebuild and regenerate
+   the package evidence before proceeding. Publish the branch when the
+   environment approval boundary permits it.
+   **Exit:** one recorded 40-hex revision, clean intended worktree, package
+   provenance bound to that revision, and no receipt assembled from mixed
+   revisions. Push/merge/CI visibility follows only after the authorized
+   publish; it is not inferred from local commits.
+
+2. **Finish the macOS physical prototype gate.** Unlock the host, rerun the
+   current exact package's synthetic smoke with CDP available, then run the
+   real-history harness in the bounded cancel/full/relaunch modes as needed.
+   Physically inspect the status item and application menu: branded icon,
+   live percentage/evidence rows, refresh/retry/settings/about/quit actions,
+   close-to-tray, restore/focus, one companion, and clean quit.
+   **Exit:** structural verification, launch and dashboard receipts, exactly
+   one startup refresh, populated or explicitly unavailable Usage modules,
+   current Community state, Settings/Share behavior, cancellation or terminal
+   completion, exact descendant shutdown, and physical tray evidence all bind
+   to the same package revision. A locked host or remote-debugging failure is a
+   blocked observation, not a pass.
+
+3. **Run exact-current Windows qualification.** After the source boundary is
+   sealed and published, build the Windows artifact and rerun warm and clean
+   native qualification on that exact revision. Include protected
+   filesystem/SQLite state, Credential
+   Manager persistence, source changes, autostart, notifications, owned
+   downloads, installer/lifecycle, single-instance behavior, relaunch, and
+   no-orphan process-tree checks.
+   **Exit:** both canonical warm and clean receipts are bound to the same
+   revision and package/binding digests, have zero failed/skipped required
+   checks, and explicitly record any capability that remains unavailable.
+   Historical `b37bd491` receipts cannot satisfy this exit.
+
+4. **Recover Linux qualification.** Retry the Linux image/build boundary after
+   the two network-terminated downloads are understood, then run the packaged
+   Linux CDP and lifecycle smoke. Keep claims limited to the container and
+   native Linux capabilities actually exercised (Secret Service, XDG paths,
+   autostart, notifications, AppImage, and process lifecycle).
+   **Exit:** reproducible image provenance, packaged launch, renderer/data
+   smoke, refresh/cancel/quit receipts, and no unsupported Windows/macOS
+   parity claim.
+
+5. **Close production-only decisions.** Decide whether to implement or
+   explicitly defer destructive data/credential reset. Separately complete the
+   signed installer/updater channel and native notification identity before
+   presenting those capabilities as available. Development packages must
+   continue to say unavailable where those production prerequisites are absent.
+   **Exit:** each row has an owner decision, implementation evidence or a
+   visible documented limitation; no simulated updater, notification, or reset
+   success is accepted.
+
+6. **Seal the parity ledger and handoff.** Re-run the source suites and
+   artifact verifier after the final accepted revision, then update the ledger
+   row by row for visible navigation, data, accounting, cancellation,
+   Community, Settings, Share, menus/tray, lifecycle, persistence, recovery,
+   and platform-only limitations.
+   **Exit:** every claimed row has package/source, rendered/runtime, and
+   lifecycle evidence from one exact revision. Until then, the result is a
+   development prototype with bounded qualified slices, not full parity or a
+   release candidate.
 
 ## Ordered implementation slices
 
@@ -375,7 +511,7 @@ security decision.
 | Autostart and notifications | Functional development check | Native Linux lane later | Authoritative |
 | Installer, signing, updater | Not claimed | Not claimed in initial lane | Separate production gates |
 
-## First physical handoff
+## First physical handoff (historical and current gate)
 
 The first user-test handoff is complete only when an unsigned macOS Electron
 application is rebuilt from the parity branch, passes package verification and
@@ -390,10 +526,17 @@ clean lifecycle smoke, is visually inspected, and includes:
 That artifact is a product-feedback build, not release or Windows-support
 evidence.
 
-The current `200d8d7bb70e` handoff satisfies all five items. Its exact package
-receipt proves startup/data, Share, and Settings paths; repeated physical
-status-item cycles prove hide, foreground restoration, one companion, and clean
-Quit. M0 is complete within the explicitly unsigned development-only boundary.
+The historical `200d8d7bb70e` handoff satisfied all five items for its own
+revision. Its exact package receipt proved startup/data, Share, and Settings
+paths; repeated physical status-item cycles proved hide, foreground
+restoration, one companion, and clean Quit. That historical M0 result remains
+useful evidence but does not transfer to the current local candidate.
+
+The current candidate's package has passed structural verification in three
+copies, but its runtime receipt and physical observation are still blocked by
+the locked host console and the resulting `remote_debugging_unavailable`
+launch failure. The current M0 gate therefore remains open until the exact
+current package is launched, smoke-tested, and physically inspected.
 
 ## Stop conditions
 
@@ -402,7 +545,7 @@ Quit. M0 is complete within the explicitly unsigned development-only boundary.
   changing architecture.
 - Do not weaken security, qualification, package-manifest, or release gates to
   make the prototype appear complete.
-- Do not silently rebase or replace the current `origin/main` integration while
+- Do not silently rebase or replace an exact candidate while
   a qualification run depends on an exact candidate. Requalify any changed
   revision from its own packaged bytes and receipt; do not splice evidence from
   the b37 candidate or the separate macOS handoff into current-integration
