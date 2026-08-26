@@ -78,13 +78,56 @@
         <img class="brand-icon" src="./tibotattle-icon.png" alt="">
         <span>TiboTattle</span>
       </a>
-      <div class="top-actions">
+      <div
+        class="top-actions"
+        role="toolbar"
+        aria-label="Dashboard toolbar"
+        data-i18n-aria-label="aria.dashboardToolbar"
+      >
+        <button
+          class="button button-quiet electron-only-control electron-sidebar-toggle"
+          id="electron-sidebar-toggle"
+          type="button"
+          data-electron-only
+          aria-controls="dashboard-sidebar"
+          aria-expanded="true"
+          aria-label="Hide sidebar"
+          data-i18n-aria-label="electron.shell.hideSidebar"
+          title="Hide sidebar"
+          data-i18n-title="electron.shell.hideSidebar"
+        >
+          <span class="electron-sidebar-glyph" aria-hidden="true"></span>
+          <span
+            class="electron-sidebar-toggle-label"
+            data-i18n="electron.shell.hideSidebar"
+          >Hide sidebar</span>
+        </button>
         <label class="language-picker">
           <span class="sr-only" data-i18n="language.label">Language</span>
           <select data-language-picker aria-label="Language"></select>
         </label>
         <p class="sr-only" data-language-announcement role="status" aria-live="polite" aria-atomic="true"></p>
         <span class="history-index-badge" id="history-index-badge" hidden></span>
+        <span
+          class="electron-toolbar-status electron-only-control"
+          data-electron-only
+          role="group"
+          aria-label="Allowance unavailable"
+          data-i18n-aria-label="electron.shell.allowanceUnavailable"
+        >
+          <span class="electron-toolbar-brand" aria-hidden="true">
+            <img src="./tibotattle-icon.png" alt="">
+          </span>
+          <span
+            class="electron-toolbar-allowance"
+            id="electron-toolbar-allowance"
+            data-available="false"
+            aria-label="Allowance unavailable"
+            data-i18n-aria-label="electron.shell.allowanceUnavailable"
+            title="Allowance unavailable"
+            data-i18n-title="electron.shell.allowanceUnavailable"
+          >—</span>
+        </span>
         <span
           class="state-pill state-connecting"
           id="global-state"
@@ -96,7 +139,13 @@
           <span class="state-dot" aria-hidden="true"></span>
           Connecting
         </span>
-        <button class="button button-secondary compact" id="refresh-button" type="button" disabled>
+        <button
+          class="button button-secondary compact electron-refresh-control"
+          id="refresh-button"
+          type="button"
+          disabled
+          aria-busy="false"
+        >
           Analyze local usage
         </button>
         <button class="button button-quiet compact" id="cancel-refresh" type="button" hidden>
@@ -118,7 +167,12 @@
     </header>
 
     <div class="dashboard-shell" data-i18n-legacy-root>
-      <aside class="dashboard-sidebar" aria-label="Dashboard navigation" data-i18n-aria-label="aria.dashboardNavigation">
+      <aside
+        class="dashboard-sidebar"
+        id="dashboard-sidebar"
+        aria-label="Dashboard navigation"
+        data-i18n-aria-label="aria.dashboardNavigation"
+      >
         <nav class="primary-nav" aria-label="Dashboard sections" data-i18n-aria-label="aria.dashboardSections">
           <a href="#overview" data-nav="overview" data-requires-evidence>Overview</a>
           <a href="#weekly" data-nav="weekly" data-requires-evidence>Allowance</a>

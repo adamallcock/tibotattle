@@ -553,6 +553,178 @@ function localAnalysisLabel() {
     : "localAnalysis.action.analyze";
 }
 
+/**
+ * Render the small Electron-only allowance readout in the shared toolbar.
+ *
+ * The main dashboard already has the companion's normalized, provider-reported
+ * quota windows. Reuse that exact selection rather than asking the desktop
+ * shell for a second status payload or deriving a percentage from accounting
+ * estimates. A number is allowed only when both the dashboard and its selected
+ * normal-Codex window are explicitly live; everything else is an honest dash.
+ */
+function renderElectronToolbarAllowance(data = dashboard) {
+  const allowance = $("#electron-toolbar-allowance");
+  const status = $(".electron-toolbar-status");
+  if (!allowance || !runsInsideElectronDashboard()) return;
+
+  // These nodes start with static i18n attributes so an offline page is
+  // accessible before the first dashboard response. Once the renderer owns
+  // the value, the label is dynamic (it includes the observed percentage), so
+  // leave the localization bridge no stale fallback attribute to overwrite
+  // during a later language-tree pass.
+  allowance.removeAttribute("data-i18n-aria-label");
+  allowance.removeAttribute("data-i18n-title");
+  status?.removeAttribute("data-i18n-aria-label");
+
+  const candidate = data?.mode !== "demo" && data?.state === "live"
+    ? selectPrimaryCodexQuotaWindow(
+      (Array.isArray(data?.quotaWindows) ? data.quotaWindows : [])
+        .filter((window) => (
+          isPrimaryCodexQuotaWindow(window)
+          && window?.status === "live"
+          && finite(window?.remainingPercent) !== null
+        )),
+    )
+    : null;
+  const remaining = finite(candidate?.remainingPercent, null);
+  const valid = candidate !== null
+    && remaining !== null
+    && remaining >= 0
+    && remaining <= 100;
+  if (!valid) {
+    setRawText(allowance, "—");
+    allowance.dataset.available = "false";
+    delete allowance.dataset.window;
+    const unavailable = t("electron.shell.allowanceUnavailable");
+    allowance.setAttribute("aria-label", unavailable);
+    allowance.title = unavailable;
+    if (status) status.setAttribute("aria-label", unavailable);
+    return;
+  }
+
+  // Native status surfaces use a compact whole-percent complement. The
+  // dashboard quota card remains the place for precision and reset details.
+  const value = formatPercent(remaining, 0);
+  setRawText(allowance, value);
+  allowance.dataset.available = "true";
+  allowance.dataset.window = String(candidate.durationMinutes);
+  const label = t("electron.shell.allowanceRemaining", { value });
+  allowance.setAttribute("aria-label", label);
+  allowance.title = label;
+  if (status) status.setAttribute("aria-label", label);
+}
+
+/**
+ * Keep the Electron refresh affordance truthful while the shared request path
+ * owns the operation. The button's visible label is still written by the
+ * existing local-analysis renderer; this adds the native-style refresh glyph,
+ * busy semantics, and a useful tooltip without starting a second request.
+ */
+function renderElectronRefreshControl() {
+  const button = $("#refresh-button");
+  if (!button || !runsInsideElectronDashboard()) return;
+  const busy = localRefreshInProgress;
+  button.setAttribute("aria-busy", String(busy));
+  button.dataset.refreshState = busy
+    ? "analyzing"
+    : globalState?.state ?? "unavailable";
+  const label = busy
+    ? button.textContent?.trim() || t("status.running")
+    : t("electron.shell.refreshTooltip");
+  button.title = label;
+}
+
+function renderElectronSidebarToggle() {
+  const toggle = $("#electron-sidebar-toggle");
+  const shell = $(".dashboard-shell");
+  if (!toggle || !shell || !runsInsideElectronDashboard()) return false;
+  const collapsed = shell.classList.contains("sidebar-collapsed");
+  const key = collapsed
+    ? "electron.shell.showSidebar"
+    : "electron.shell.hideSidebar";
+  toggle.setAttribute("aria-expanded", String(!collapsed));
+  toggle.setAttribute("aria-label", t(key));
+  toggle.title = t(key);
+  toggle.setAttribute("data-i18n-aria-label", key);
+  toggle.setAttribute("data-i18n-title", key);
+  const label = toggle.querySelector?.(".electron-sidebar-toggle-label");
+  if (label) label.setAttribute("data-i18n", key);
+  setLocalizedText(label, key);
+  return true;
+}
+
+function applyElectronSidebarState(collapsed) {
+  if (typeof collapsed !== "boolean") return false;
+  const shell = $(".dashboard-shell");
+  const sidebar = $("#dashboard-sidebar") ?? $(".dashboard-sidebar");
+  if (!shell) return false;
+  shell.classList.toggle("sidebar-collapsed", collapsed);
+  if (sidebar) {
+    sidebar.setAttribute("aria-hidden", collapsed ? "true" : "false");
+    if ("inert" in sidebar) sidebar.inert = collapsed;
+    else if (collapsed) sidebar.setAttribute("inert", "");
+    else sidebar.removeAttribute("inert");
+  }
+  if (collapsed && sidebar && document.activeElement
+      && sidebar.contains?.(document.activeElement)) {
+    $("#main")?.focus?.({ preventScroll: true });
+  }
+  renderElectronSidebarToggle();
+  return true;
+}
+
+function toggleElectronSidebar() {
+  const shell = $(".dashboard-shell");
+  if (!shell) return false;
+  const collapsed = !shell.classList.contains("sidebar-collapsed");
+  // Apply immediately so a click remains responsive even when an older
+  // preload has no outbound sidebar method. A current preload may confirm the
+  // persisted value asynchronously; that response is folded back into the
+  // same DOM state below.
+  applyElectronSidebarState(collapsed);
+  const bridge = globalThis.tibotattleDesktop;
+  if (typeof bridge?.toggleSidebar !== "function") return true;
+  try {
+    const result = bridge.toggleSidebar();
+    const applyReturnedState = (snapshot) => {
+      const persisted = snapshot?.settings?.sidebarCollapsed
+        ?? snapshot?.sidebarCollapsed;
+      if (typeof persisted === "boolean") applyElectronSidebarState(persisted);
+    };
+    if (result && typeof result.then === "function") {
+      void Promise.resolve(result).then(applyReturnedState).catch(() => {});
+    } else {
+      applyReturnedState(result);
+    }
+  } catch {
+    // The optimistic local state remains a useful rescue path for an old or
+    // restarting desktop bridge. The next persisted-settings read can settle
+    // it without surfacing an IPC implementation error to the page.
+  }
+  return true;
+}
+
+function installElectronSidebarToggle() {
+  const toggle = $("#electron-sidebar-toggle");
+  const shell = $(".dashboard-shell");
+  if (!toggle || !shell || !runsInsideElectronDashboard()) return false;
+  if (toggle.dataset.electronSidebarBound !== "true") {
+    toggle.addEventListener("click", toggleElectronSidebar);
+    toggle.dataset.electronSidebarBound = "true";
+  }
+  renderElectronSidebarToggle();
+  // The desktop-shell module applies the persisted setting independently. A
+  // small attribute observer keeps the button's expanded label and rescue
+  // semantics aligned without polling or duplicating that bridge.
+  if (typeof globalThis.MutationObserver === "function"
+      && toggle.dataset.electronSidebarObserver !== "true") {
+    const observer = new MutationObserver(renderElectronSidebarToggle);
+    observer.observe(shell, { attributes: true, attributeFilter: ["class"] });
+    toggle.dataset.electronSidebarObserver = "true";
+  }
+  return true;
+}
+
 function updateLocalActionButtons() {
   const allowed = localAnalysisAllowed();
   const label = localAnalysisLabel();
@@ -574,6 +746,7 @@ function updateLocalActionButtons() {
     cancel,
     localRefreshCancelRequested ? "action.cancelling" : "action.cancel",
   );
+  renderElectronRefreshControl();
 }
 
 function setCommunitySession(value) {
@@ -877,6 +1050,9 @@ function renderGlobalState() {
     node("span", "state-dot"),
     document.createTextNode(t(keys[globalState.state] ?? "status.unknown")),
   );
+  renderElectronToolbarAllowance(dashboard);
+  renderElectronRefreshControl();
+  renderElectronSidebarToggle();
 }
 
 function showConnectionNotice({
@@ -959,6 +1135,7 @@ function renderDashboardUnavailableState(kind) {
     ? kind
     : "companion-unavailable";
   setGlobalState("offline");
+  renderElectronToolbarAllowance(null);
   setLocalizedText($("#latest-observation"), selected.latestObservation);
   setLocalizedText($("#data-source"), "dashboard.unavailable.noRealUsage");
   showConnectionNotice({
@@ -1157,6 +1334,7 @@ function renderDashboard(data) {
   setGlobalState(data.state, {
     companionReachable: data.mode !== "demo"
   });
+  renderElectronToolbarAllowance(data);
   renderHistoryIndexBadge(data);
   $("#latest-observation").textContent = data.freshness.latestObservedAt
     ? formatAge(data.freshness.ageSeconds ?? (Date.now() - Date.parse(data.freshness.latestObservedAt)) / 1000)
@@ -11115,6 +11293,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
     if (!["running", "cancelling"].includes(latestOutcome)) return;
     if (localRefreshCancelRequested || latestOutcome === "cancelling") {
       setLocalizedText(button, "localAnalysis.progress.stopping");
+      renderElectronRefreshControl();
       return;
     }
     const elapsed = elapsedLabel();
@@ -11146,6 +11325,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
     } else {
       setLocalizedText(button, "localAnalysis.progress.analyzingElapsed", { elapsed });
     }
+    renderElectronRefreshControl();
   };
   localActionBusy = true;
   localRefreshInProgress = true;
@@ -12120,9 +12300,14 @@ function renderHostedIdentity() {
   const appleUnavailableNow = appleSignInUnavailable
     || !serviceConfigured
     || enrollmentPaused;
-  // When enrollment is paused, use one shared sentence instead of displaying
-  // the same global status below both provider buttons.
-  appleUnavailable.hidden = !appleUnavailableNow || signedIn || enrollmentPaused;
+  // Global service absence and enrollment pause each get one shared sentence
+  // through the Google/general notice above. Keep Apple's provider-specific
+  // notice for the narrower case where the service exists but Apple itself is
+  // unavailable; otherwise the same no-service copy appears twice.
+  appleUnavailable.hidden = !appleUnavailableNow
+    || signedIn
+    || enrollmentPaused
+    || !serviceConfigured;
   setProductText(appleUnavailable, serviceConfigured
     ? "Hosted Apple sign-in is not configured for this build."
     : "This build has no contribution service, so hosted sign-in is unavailable.");
@@ -14553,6 +14738,20 @@ mountDashboardNavigation({
   documentRef: document,
   windowRef: window,
 });
+installElectronSidebarToggle();
+if (document.readyState !== "complete") {
+  // The preload normally stamps the Electron marker before this module runs.
+  // If the page-world desktop-shell module wins the startup race, retry after
+  // its DOM-ready mount and once more in the following macrotask so the
+  // renderer rescue control cannot silently disappear on a fresh window.
+  document.addEventListener("DOMContentLoaded", () => {
+    installElectronSidebarToggle();
+    const schedule = typeof window?.setTimeout === "function"
+      ? window.setTimeout.bind(window)
+      : globalThis.setTimeout;
+    if (typeof schedule === "function") schedule(installElectronSidebarToggle, 0);
+  }, { once: true });
+}
 
 async function bootstrapDashboard() {
   renderSharedInstallerJourney(document, {

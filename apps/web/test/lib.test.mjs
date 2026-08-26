@@ -4713,6 +4713,23 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
     appSource,
     /This build has no contribution service, so hosted sign-in is unavailable\./u,
   );
+  // A missing global contribution service is one state, not two provider
+  // failures. The Google/general notice owns that shared sentence while the
+  // Apple-specific notice remains hidden until a configured service reports
+  // Apple itself unavailable.
+  const hostedIdentityRenderStart = appSource.indexOf("function renderHostedIdentity() {");
+  const hostedIdentityRenderEnd = appSource.indexOf(
+    "\nfunction hostedIdentityStatusState",
+    hostedIdentityRenderStart,
+  );
+  const hostedIdentityRender = hostedIdentityRenderStart >= 0
+      && hostedIdentityRenderEnd > hostedIdentityRenderStart
+    ? appSource.slice(hostedIdentityRenderStart, hostedIdentityRenderEnd)
+    : "";
+  assert.match(
+    hostedIdentityRender,
+    /appleUnavailable\.hidden\s*=\s*!appleUnavailableNow[\s\S]*?\|\| !serviceConfigured;/u,
+  );
   // That gate reads a capability the companion reports asynchronously, so both
   // load paths must re-render the controls once it lands. Bootstrap renders
   // them before the first health response, and without these calls the buttons
@@ -5936,6 +5953,11 @@ test("local refresh activity keeps elapsed time honest without overwriting termi
     labels,
     localRefreshCancelRequested: false,
     localRefreshInProgress: true,
+    // The refresh activity helper also keeps the Electron toolbar's busy
+    // affordance synchronized. This isolated timing fixture only exercises
+    // its localized progress labels, so provide the renderer side-effect as a
+    // no-op rather than coupling the clock assertions to DOM state.
+    renderElectronRefreshControl: () => {},
     setLocalizedText: (_button, key, parameters = {}) => {
       labels.push({ key, parameters });
     },

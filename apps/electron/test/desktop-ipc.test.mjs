@@ -66,7 +66,7 @@ test("desktop IPC fails closed for an untrusted sender or frame before handlers 
   assert.equal(calls, 0);
 });
 
-test("desktop IPC restricts refresh lifecycle actions to the active dashboard frame", async () => {
+test("desktop IPC restricts dashboard-owned actions to the active dashboard frame", async () => {
   const dashboardSender = {};
   const dashboardFrame = {};
   const settingsSender = {};
@@ -78,6 +78,7 @@ test("desktop IPC restricts refresh lifecycle actions to the active dashboard fr
     trustedAction: (action, event) => (
       action !== "refreshStarted"
       && action !== "refreshSettled"
+      && action !== "toggleSidebar"
     ) || (event.sender === dashboardSender && event.senderFrame === dashboardFrame),
     handlers: {
       refreshStarted() {
@@ -88,6 +89,10 @@ test("desktop IPC restricts refresh lifecycle actions to the active dashboard fr
         calls.push("settled");
         return true;
       },
+      toggleSidebar() {
+        calls.push("sidebar");
+        return true;
+      },
     },
   });
 
@@ -95,6 +100,13 @@ test("desktop IPC restricts refresh lifecycle actions to the active dashboard fr
     handler(
       { sender: settingsSender, senderFrame: settingsFrame },
       { action: "refreshStarted", args: {} },
+    ),
+    errorCode("desktop_ipc_untrusted_context"),
+  );
+  await assert.rejects(
+    handler(
+      { sender: settingsSender, senderFrame: settingsFrame },
+      { action: "toggleSidebar", args: {} },
     ),
     errorCode("desktop_ipc_untrusted_context"),
   );
@@ -112,7 +124,14 @@ test("desktop IPC restricts refresh lifecycle actions to the active dashboard fr
     ),
     true,
   );
-  assert.deepEqual(calls, ["started", "settled"]);
+  assert.deepEqual(
+    await handler(
+      { sender: dashboardSender, senderFrame: dashboardFrame },
+      { action: "toggleSidebar", args: {} },
+    ),
+    true,
+  );
+  assert.deepEqual(calls, ["started", "settled", "sidebar"]);
 });
 
 test("desktop IPC rejects malformed and extra request keys without invoking a handler", async () => {

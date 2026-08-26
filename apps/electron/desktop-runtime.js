@@ -982,7 +982,9 @@ export async function launchDesktopRuntime({
               { sender: event?.sender },
             ) === true;
           }
-          if (action !== "refreshStarted" && action !== "refreshSettled") return true;
+          if (action !== "refreshStarted"
+              && action !== "refreshSettled"
+              && action !== "toggleSidebar") return true;
           return lifecycle?.isAuthorizedDashboardFrame?.(
             event?.senderFrame,
             { sender: event?.sender },

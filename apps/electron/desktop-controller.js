@@ -927,6 +927,9 @@ export function createDesktopController({
       lifecycle().showSettingsWindow?.("general");
       return snapshot();
     },
+    async toggleSidebar() {
+      return toggleSidebar();
+    },
     async getCodexHomesForSettings() {
       const selected = await readCodexHomes();
       if (selected === null) throw controllerError("desktop_codex_roots_unavailable");

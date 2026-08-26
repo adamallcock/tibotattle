@@ -333,12 +333,12 @@ test("lease watchdog recovers cadence after a renderer disappears", async () => 
 test("controller persists sidebar collapse and sends only the bounded presentation command", async () => {
   const value = fixture();
   await value.controller.initialize();
-  const collapsed = await value.controller.toggleSidebar();
+  const collapsed = await value.controller.handlers.toggleSidebar({});
   assert.equal(collapsed.settings.sidebarCollapsed, true);
   assert.deepEqual(value.commands, [{ command: "sidebar", collapsed: true }]);
   assert.equal((await value.store.getSettings()).sidebarCollapsed, true);
 
-  const restored = await value.controller.toggleSidebar();
+  const restored = await value.controller.handlers.toggleSidebar({});
   assert.equal(restored.settings.sidebarCollapsed, false);
   assert.deepEqual(value.commands, [
     { command: "sidebar", collapsed: true },

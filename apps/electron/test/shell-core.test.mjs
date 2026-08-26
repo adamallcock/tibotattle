@@ -2676,6 +2676,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     "getSettings",
     "getCodexHomesForSettings",
     "openSettings",
+    "toggleSidebar",
     "chooseCodexHome",
     "addCodexHome",
     "editCodexHome",
@@ -2734,6 +2735,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   await bridge.getSettings();
   await bridge.getCodexHomesForSettings();
   await bridge.openSettings();
+  await bridge.toggleSidebar();
   await bridge.chooseCodexHome();
   await bridge.addCodexHome();
   await bridge.editCodexHome({ rootId: "11111111-1111-4111-8111-111111111111" });
@@ -2767,6 +2769,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     { channel: "tibotattle:desktop:v1", request: { action: "getSettings", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "getCodexHomesForSettings", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "openSettings", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "toggleSidebar", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "chooseCodexHome", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "addCodexHome", args: {} } },
     {
@@ -2841,6 +2844,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   for (const operation of [
     () => bridge.onCommand(() => {}, "extra"),
     () => bridge.setLanguage("en", "extra"),
+    () => bridge.toggleSidebar("extra"),
     () => bridge.getCodexHomesForSettings("extra"),
     () => bridge.addCodexHome("extra"),
     () => bridge.editCodexHome({ rootId: "11111111-1111-4111-8111-111111111111" }, "extra"),

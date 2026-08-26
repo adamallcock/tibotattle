@@ -245,6 +245,7 @@ function installDesktopBridge() {
       values,
     ),
     openSettings: (...values) => noArguments("openSettings", values),
+    toggleSidebar: (...values) => noArguments("toggleSidebar", values),
     chooseCodexHome: (...values) => noArguments("chooseCodexHome", values),
     addCodexHome: (...values) => noArguments("addCodexHome", values),
     editCodexHome: (...values) => oneArgument(
