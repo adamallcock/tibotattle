@@ -2870,6 +2870,21 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   ]) {
     await assert.rejects(operation(), (error) => error?.name === "TypeError");
   }
+  const validRootId = "11111111-1111-4111-8111-111111111111";
+  for (const operation of [
+    () => bridge.editCodexHome({ rootId: "not-a-uuid" }),
+    () => bridge.editCodexHome({ rootId: validRootId, extra: true }),
+    () => bridge.removeCodexHome({ rootId: "not-a-uuid" }),
+    () => bridge.setPrimaryCodexHome({ rootId: "11111111-1111-5111-8111-111111111111" }),
+    () => bridge.reorderCodexHomes({ rootIds: [] }),
+    () => bridge.reorderCodexHomes({ rootIds: [validRootId, validRootId] }),
+    () => bridge.reorderCodexHomes({
+      rootIds: Array.from({ length: 9 }, () => validRootId),
+    }),
+    () => bridge.reorderCodexHomes({ rootIds: ["not-a-uuid"] }),
+  ]) {
+    await assert.rejects(operation(), (error) => error?.name === "TypeError");
+  }
   await assert.rejects(
     bridge.openHostedSignIn("https://accounts.google.com.evil/?client_id=test"),
     (error) => error?.name === "TypeError",

@@ -47,6 +47,8 @@ const HOSTED_SIGNIN_DEFAULT_PORT_ENDPOINTS = Object.freeze([
   "https://accounts.google.com:443/o/oauth2/v2/auth",
   "https://appleid.apple.com:443/auth/authorize",
 ]);
+const CODEX_ROOT_LIMIT = 8;
+const CODEX_ROOT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 function rejected(message) {
   return Promise.reject(new TypeError(message));
@@ -107,6 +109,33 @@ function refreshLeaseMethod(action, lease) {
     return rejected("lease is invalid");
   }
   return invoke(action, { lease });
+}
+
+// Root IDs are the only root values that the renderer may send back. The
+// selected folder itself is returned by the main-process picker and never
+// crosses this outbound bridge as a mutation argument.
+function validCodexRootId(value) {
+  return typeof value === "string" && CODEX_ROOT_ID_PATTERN.test(value);
+}
+
+function codexRootIdMethod(action, value) {
+  if (!exactObject(value, ["rootId"], "root")) {
+    return rejected("rootId is invalid");
+  }
+  if (!validCodexRootId(value.rootId)) return rejected("rootId is invalid");
+  return invoke(action, { rootId: value.rootId });
+}
+
+function reorderCodexRootsMethod(action, value) {
+  if (!exactObject(value, ["rootIds"], "roots")
+      || !Array.isArray(value.rootIds)
+      || value.rootIds.length < 1
+      || value.rootIds.length > CODEX_ROOT_LIMIT
+      || value.rootIds.some((rootId) => !validCodexRootId(rootId))
+      || new Set(value.rootIds).size !== value.rootIds.length) {
+    return rejected("rootIds are invalid");
+  }
+  return invoke(action, { rootIds: [...value.rootIds] });
 }
 
 // This deliberately mirrors the host allowlist without importing a
@@ -211,8 +240,33 @@ function installDesktopBridge() {
       subscribeToDesktopCommands,
     ),
     getSettings: (...values) => noArguments("getSettings", values),
+    getCodexHomesForSettings: (...values) => noArguments(
+      "getCodexHomesForSettings",
+      values,
+    ),
     openSettings: (...values) => noArguments("openSettings", values),
     chooseCodexHome: (...values) => noArguments("chooseCodexHome", values),
+    addCodexHome: (...values) => noArguments("addCodexHome", values),
+    editCodexHome: (...values) => oneArgument(
+      "editCodexHome",
+      values,
+      (value) => codexRootIdMethod("editCodexHome", value),
+    ),
+    removeCodexHome: (...values) => oneArgument(
+      "removeCodexHome",
+      values,
+      (value) => codexRootIdMethod("removeCodexHome", value),
+    ),
+    setPrimaryCodexHome: (...values) => oneArgument(
+      "setPrimaryCodexHome",
+      values,
+      (value) => codexRootIdMethod("setPrimaryCodexHome", value),
+    ),
+    reorderCodexHomes: (...values) => oneArgument(
+      "reorderCodexHomes",
+      values,
+      (value) => reorderCodexRootsMethod("reorderCodexHomes", value),
+    ),
     useDefaultCodexHome: (...values) => noArguments("useDefaultCodexHome", values),
     setLanguage: (...values) => oneArgument(
       "setLanguage",

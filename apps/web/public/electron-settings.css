@@ -156,6 +156,134 @@
   box-shadow: var(--shadow-card);
 }
 
+.settings-roots-card {
+  display: block;
+}
+
+.settings-roots-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-6);
+}
+
+.settings-roots-heading > .settings-actions {
+  flex: 0 0 auto;
+}
+
+.settings-roots-status {
+  min-height: 1.35em;
+  margin: var(--space-4) 0 0 !important;
+  color: var(--rust);
+  font-size: .86rem;
+}
+
+.settings-roots-list {
+  display: grid;
+  gap: var(--space-3);
+  margin-top: var(--space-5);
+}
+
+.settings-root-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-4);
+  align-items: start;
+  padding: var(--space-4);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+
+.settings-root-card[data-primary="true"] {
+  border-color: rgba(23, 79, 69, .38);
+  box-shadow: inset 3px 0 var(--green);
+}
+
+.settings-root-card h4 {
+  margin: 0;
+  color: var(--ink);
+  font-size: .96rem;
+  font-weight: var(--weight-semibold);
+}
+
+.settings-root-path {
+  display: block;
+  margin-top: var(--space-2);
+  color: var(--ink);
+  font-size: .88rem;
+  overflow-wrap: anywhere;
+}
+
+.settings-root-role {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  color: var(--muted);
+  font-size: .78rem;
+}
+
+.settings-root-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.6rem;
+  padding: 0 var(--space-2);
+  color: var(--green);
+  background: var(--green-soft);
+  border-radius: var(--radius-pill);
+  font-weight: var(--weight-semibold);
+}
+
+.settings-root-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.settings-root-actions .button {
+  min-height: 36px;
+  padding-inline: var(--space-3);
+  font-size: .8rem;
+}
+
+.settings-root-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 36px;
+  padding: 0 var(--space-3);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  font-size: .8rem;
+  font-weight: var(--weight-medium);
+}
+
+.settings-root-primary:has(input:checked) {
+  color: var(--green);
+  background: var(--green-soft);
+  border-color: rgba(23, 79, 69, .25);
+}
+
+.settings-root-primary input {
+  accent-color: var(--green);
+}
+
+.settings-root-primary input:focus-visible,
+.settings-root-actions .button:focus-visible {
+  outline: 3px solid rgba(49, 95, 132, .42);
+  outline-offset: 2px;
+}
+
+.settings-root-actions .button:disabled,
+.settings-root-primary:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: .54;
+}
+
 .settings-card-copy {
   min-width: 0;
   flex: 1 1 auto;
@@ -368,8 +496,14 @@
   }
 
   .settings-header,
-  .settings-card {
+  .settings-card,
+  .settings-roots-heading,
+  .settings-root-card {
     flex-direction: column;
+  }
+
+  .settings-root-card {
+    display: block;
   }
 
   .settings-bridge-status,
@@ -381,7 +515,8 @@
 
   .settings-actions,
   .settings-control-column,
-  .settings-radio-group {
+  .settings-radio-group,
+  .settings-root-actions {
     justify-content: flex-start;
   }
 
@@ -412,8 +547,22 @@
   .settings-card p {
     color: CanvasText;
   }
+  .settings-root-card,
+  .settings-root-primary,
+  .settings-root-actions .button {
+    color: CanvasText;
+    background: Canvas;
+    border-color: CanvasText;
+  }
+  .settings-root-path,
+  .settings-root-role,
+  .settings-roots-status {
+    color: CanvasText;
+  }
   .settings-tab[aria-selected="true"],
   .settings-radio-group label:has(input:checked),
+  .settings-root-card[data-primary="true"],
+  .settings-root-primary:has(input:checked),
   .settings-switch input:checked + .settings-switch-track {
     color: HighlightText;
     background: Highlight;
@@ -431,6 +580,8 @@
   .settings-field select:focus-visible,
   .settings-switch input:focus-visible + .settings-switch-track,
   .settings-project-links a:focus-visible,
+  .settings-root-primary:focus-visible,
+  .settings-root-actions .button:focus-visible,
   .electron-settings-page #settings-content:focus {
     outline: 3px solid Highlight;
     outline-offset: 3px;

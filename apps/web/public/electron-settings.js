@@ -44,10 +44,16 @@ export const SETTINGS_EXTERNAL_TARGETS = Object.freeze({
 
 export const SETTINGS_ACTION_NAMES = Object.freeze([
   "getSettings",
+  "getCodexHomesForSettings",
   "openSettings",
   "setLanguage",
   "setAppearance",
   "chooseCodexHome",
+  "addCodexHome",
+  "editCodexHome",
+  "removeCodexHome",
+  "setPrimaryCodexHome",
+  "reorderCodexHomes",
   "useDefaultCodexHome",
   "setRefreshInterval",
   "setStartAtLogin",
@@ -59,6 +65,11 @@ export const SETTINGS_ACTION_NAMES = Object.freeze([
   "showDiagnostics",
   "revealLocalData",
 ]);
+
+export const SETTINGS_CODEX_ROOT_LIMIT = 8;
+export const SETTINGS_CODEX_ROOT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+export const SETTINGS_DEFAULT_CODEX_ROOT_ID =
+  "00000000-0000-4000-8000-000000000001";
 
 const LOGIN_ITEM_STATUSES = new Set([
   "enabled",
@@ -198,7 +209,105 @@ function safeText(value, fallback) {
   return typeof value === "string" && value.trim() !== "" ? value : fallback;
 }
 
-function normalizeSettingsState(raw) {
+function validCodexRootId(value) {
+  return typeof value === "string" && SETTINGS_CODEX_ROOT_ID_PATTERN.test(value);
+}
+
+function validCodexRootDisplayPath(value) {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= 4096
+    && !value.includes("\0");
+}
+
+function normalizeCodexRoots(value, { includePaths = false } = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || !Array.isArray(value.activityRoots)
+      || value.activityRoots.length < 1
+      || value.activityRoots.length > SETTINGS_CODEX_ROOT_LIMIT
+      || !validCodexRootId(value.primaryRootId)) {
+    return null;
+  }
+  const roots = [];
+  const ids = new Set();
+  const customPaths = new Set();
+  let defaultCount = 0;
+  for (const candidate of value.activityRoots) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)
+        || !validCodexRootId(candidate.rootId)
+        || ids.has(candidate.rootId)
+        || (candidate.enabled !== undefined && candidate.enabled !== true)
+        || !["default", "custom"].includes(candidate.kind)) {
+      return null;
+    }
+    if (candidate.kind === "default") {
+      if (candidate.rootId !== SETTINGS_DEFAULT_CODEX_ROOT_ID || ++defaultCount > 1) {
+        return null;
+      }
+    } else if (candidate.rootId === SETTINGS_DEFAULT_CODEX_ROOT_ID) {
+      return null;
+    }
+    const root = {
+      rootId: candidate.rootId,
+      kind: candidate.kind,
+      enabled: true,
+    };
+    if (includePaths) {
+      if (candidate.kind === "default") {
+        root.path = null;
+      } else {
+        if (!Object.hasOwn(candidate, "path")
+            || !validCodexRootDisplayPath(candidate.path)) return null;
+        root.path = candidate.path;
+        const key = root.path.replaceAll("/", "\\").toLowerCase();
+        if (customPaths.has(key)) return null;
+        customPaths.add(key);
+      }
+    }
+    ids.add(candidate.rootId);
+    roots.push(Object.freeze(root));
+  }
+  if (!ids.has(value.primaryRootId)) return null;
+  return Object.freeze({
+    activityRoots: Object.freeze(roots),
+    primaryRootId: value.primaryRootId,
+  });
+}
+
+function defaultCodexRoots() {
+  return Object.freeze({
+    activityRoots: Object.freeze([Object.freeze({
+      rootId: SETTINGS_DEFAULT_CODEX_ROOT_ID,
+      kind: "default",
+      enabled: true,
+    })]),
+    primaryRootId: SETTINGS_DEFAULT_CODEX_ROOT_ID,
+  });
+}
+
+function pathfulCodexRoots(value) {
+  return normalizeCodexRoots(value, { includePaths: true });
+}
+
+function pathFreeCodexRoots(value) {
+  return normalizeCodexRoots(value, { includePaths: false });
+}
+
+export function normalizeCodexHomesForSettings(value, { includePaths = false } = {}) {
+  return normalizeCodexRoots(value, { includePaths });
+}
+
+export function projectCodexHomesForSettings(value) {
+  const normalized = pathfulCodexRoots(value);
+  return normalized === null ? null : normalized;
+}
+
+export function projectCodexHomesPathFree(value) {
+  const normalized = pathfulCodexRoots(value) ?? pathFreeCodexRoots(value);
+  return normalized === null ? null : pathFreeCodexRoots(normalized);
+}
+
+export function normalizeSettingsState(raw, settingsRoots = null) {
   const source = raw && typeof raw === "object" ? raw : {};
   const settings = source.settings && typeof source.settings === "object"
     ? source.settings
@@ -223,6 +332,14 @@ function normalizeSettingsState(raw) {
   const automaticUpdates = about.automaticUpdates && typeof about.automaticUpdates === "object"
     ? about.automaticUpdates
     : {};
+  const rawRoots = settings.codexHomes ?? source.codexHomes;
+  const codexHomes = pathFreeCodexRoots(rawRoots) ?? defaultCodexRoots();
+  const codexHomesForSettings = settingsRoots === null
+    ? pathfulCodexRoots(rawRoots)
+    : pathfulCodexRoots(settingsRoots);
+  const primaryRoot = codexHomes.activityRoots.find(
+    (root) => root.rootId === codexHomes.primaryRootId,
+  );
 
   const language = valueIn(SETTINGS_LANGUAGE_VALUES, settings.language)
     ? settings.language
@@ -236,7 +353,7 @@ function normalizeSettingsState(raw) {
   )
     ? finiteNumber(settings.refreshIntervalSeconds, 300)
     : 300;
-  const folderKind = folder.kind === "custom" ? "custom" : "default";
+  const folderKind = primaryRoot?.kind ?? (folder.kind === "custom" ? "custom" : "default");
   const loginStatus = LOGIN_ITEM_STATUSES.has(startAtLogin.status)
     ? startAtLogin.status
     : "unavailable";
@@ -279,6 +396,8 @@ function normalizeSettingsState(raw) {
   return Object.freeze({
     language,
     appearance,
+    codexHomes,
+    codexHomesForSettings,
     codexFolder: Object.freeze({
       kind: folderKind,
     }),
@@ -355,6 +474,26 @@ function fixedActionValue(actionName, value) {
       return Object.hasOwn(SETTINGS_EXTERNAL_TARGETS, value);
     case "setStartAtLogin":
       return typeof value === "boolean";
+    case "editCodexHome":
+    case "removeCodexHome":
+    case "setPrimaryCodexHome":
+      return value !== null
+        && typeof value === "object"
+        && !Array.isArray(value)
+        && Reflect.ownKeys(value).length === 1
+        && Object.hasOwn(value, "rootId")
+        && validCodexRootId(value.rootId);
+    case "reorderCodexHomes":
+      return value !== null
+        && typeof value === "object"
+        && !Array.isArray(value)
+        && Reflect.ownKeys(value).length === 1
+        && Object.hasOwn(value, "rootIds")
+        && Array.isArray(value.rootIds)
+        && value.rootIds.length >= 1
+        && value.rootIds.length <= SETTINGS_CODEX_ROOT_LIMIT
+        && value.rootIds.every((rootId) => validCodexRootId(rootId))
+        && new Set(value.rootIds).size === value.rootIds.length;
     default:
       return value === undefined;
   }
@@ -445,7 +584,164 @@ function notificationPermissionMessageKey(notifications) {
     ?? NOTIFICATION_PERMISSION_MESSAGE_KEYS.unavailable;
 }
 
-function renderSettingsState(documentRef, state, bridgeAvailable, localizer) {
+function createSettingsElement(documentRef, tagName, className = "") {
+  if (typeof documentRef?.createElement !== "function") return null;
+  const element = documentRef.createElement(tagName);
+  if (className) element.className = className;
+  return element;
+}
+
+function configureRootAction(element, action, rootId, label) {
+  element.type = "button";
+  element.dataset.rootAction = action;
+  element.dataset.rootId = rootId;
+  element.setAttribute("aria-label", label);
+}
+
+function renderCodexRoots(
+  documentRef,
+  state,
+  bridgeAvailable,
+  localizer,
+  onAction,
+) {
+  const list = queryRequired(documentRef, "#settings-codex-roots");
+  const status = queryRequired(documentRef, "#settings-codex-roots-status");
+  const add = queryRequired(documentRef, "#settings-add-codex-root");
+  const roots = state.codexHomesForSettings?.activityRoots
+    ?? state.codexHomes.activityRoots;
+  const primaryRootId = state.codexHomesForSettings?.primaryRootId
+    ?? state.codexHomes.primaryRootId;
+  const detailsAvailable = state.codexHomesForSettings !== null;
+
+  add.disabled = !bridgeAvailable || roots.length >= SETTINGS_CODEX_ROOT_LIMIT;
+  status.textContent = detailsAvailable
+    ? ""
+    : translateSettingsMessage(localizer, "electron.settings.codexRoots.unavailable");
+  list.replaceChildren?.();
+  if (!detailsAvailable && typeof list.replaceChildren !== "function") {
+    list.textContent = "";
+  }
+
+  roots.forEach((root, index) => {
+    const card = createSettingsElement(documentRef, "article", "settings-root-card");
+    const info = createSettingsElement(documentRef, "div");
+    const heading = createSettingsElement(documentRef, "h4");
+    const location = createSettingsElement(documentRef, "span", "settings-root-path");
+    const role = createSettingsElement(documentRef, "div", "settings-root-role");
+    const actions = createSettingsElement(documentRef, "div", "settings-root-actions");
+    const primaryLabel = createSettingsElement(documentRef, "label", "settings-root-primary");
+    const primaryInput = createSettingsElement(documentRef, "input");
+    const primaryText = createSettingsElement(documentRef, "span");
+    if (!card || !info || !heading || !location || !role || !actions
+        || !primaryLabel || !primaryInput || !primaryText) return;
+
+    const rootLabel = translateSettingsMessage(
+      localizer,
+      "electron.settings.codexRoots.rootLabel",
+      { position: index + 1 },
+    );
+    const isPrimary = root.rootId === primaryRootId;
+    card.dataset.primary = String(isPrimary);
+    card.setAttribute("role", "listitem");
+    card.setAttribute("aria-labelledby", `settings-codex-root-${root.rootId}`);
+    heading.id = `settings-codex-root-${root.rootId}`;
+    heading.textContent = rootLabel;
+    location.textContent = root.kind === "default"
+      ? translateSettingsMessage(localizer, "electron.settings.codexRoots.defaultPath")
+      : (root.path ?? translateSettingsMessage(
+        localizer,
+        "electron.settings.codexRoots.missingPath",
+      ));
+
+    primaryInput.type = "radio";
+    primaryInput.name = "settings-primary-codex-root";
+    primaryInput.value = root.rootId;
+    primaryInput.checked = isPrimary;
+    primaryInput.disabled = !bridgeAvailable;
+    primaryInput.setAttribute(
+      "aria-label",
+      translateSettingsMessage(localizer, "electron.settings.codexRoots.setPrimary"),
+    );
+    primaryText.textContent = translateSettingsMessage(
+      localizer,
+      isPrimary
+        ? "electron.settings.codexRoots.primary"
+        : "electron.settings.codexRoots.setPrimary",
+    );
+    primaryLabel.append(primaryInput, primaryText);
+    primaryLabel.setAttribute(
+      "title",
+      translateSettingsMessage(localizer, "electron.settings.codexRoots.primaryHelp"),
+    );
+    primaryInput.addEventListener("change", () => {
+      if (primaryInput.checked && typeof onAction === "function") {
+        onAction("setPrimaryCodexHome", { rootId: root.rootId });
+      }
+    });
+
+    const roleText = createSettingsElement(documentRef, "span");
+    if (roleText) {
+      roleText.textContent = translateSettingsMessage(
+        localizer,
+        isPrimary
+          ? "electron.settings.codexRoots.primaryHelp"
+          : "electron.settings.codexRoots.historyHelp",
+      );
+      role.append(primaryLabel, roleText);
+    } else {
+      role.append(primaryLabel);
+    }
+
+    const edit = createSettingsElement(documentRef, "button", "button button-quiet");
+    const remove = createSettingsElement(documentRef, "button", "button button-quiet");
+    const moveUp = createSettingsElement(documentRef, "button", "button button-quiet");
+    const moveDown = createSettingsElement(documentRef, "button", "button button-quiet");
+    if (!edit || !remove || !moveUp || !moveDown) return;
+    const editLabel = translateSettingsMessage(localizer, "electron.settings.codexRoots.edit");
+    const removeLabel = translateSettingsMessage(localizer, "electron.settings.codexRoots.remove");
+    const moveUpLabel = translateSettingsMessage(localizer, "electron.settings.codexRoots.moveUp");
+    const moveDownLabel = translateSettingsMessage(localizer, "electron.settings.codexRoots.moveDown");
+    configureRootAction(edit, "editCodexHome", root.rootId, `${editLabel}: ${rootLabel}`);
+    configureRootAction(remove, "removeCodexHome", root.rootId, `${removeLabel}: ${rootLabel}`);
+    configureRootAction(moveUp, "moveUpCodexHome", root.rootId, `${moveUpLabel}: ${rootLabel}`);
+    configureRootAction(moveDown, "moveDownCodexHome", root.rootId, `${moveDownLabel}: ${rootLabel}`);
+    edit.textContent = editLabel;
+    remove.textContent = removeLabel;
+    moveUp.textContent = moveUpLabel;
+    moveDown.textContent = moveDownLabel;
+    edit.disabled = !bridgeAvailable || root.kind !== "custom";
+    remove.disabled = !bridgeAvailable || roots.length <= 1 || isPrimary;
+    remove.setAttribute(
+      "title",
+      isPrimary
+        ? translateSettingsMessage(localizer, "electron.settings.codexRoots.removeDisabled")
+        : translateSettingsMessage(localizer, "electron.settings.codexRoots.only"),
+    );
+    moveUp.disabled = !bridgeAvailable || index === 0;
+    moveDown.disabled = !bridgeAvailable || index === roots.length - 1;
+    edit.addEventListener("click", () => onAction?.("editCodexHome", { rootId: root.rootId }));
+    remove.addEventListener("click", () => onAction?.("removeCodexHome", { rootId: root.rootId }));
+    moveUp.addEventListener("click", () => {
+      if (index === 0) return;
+      const rootIds = roots.map(({ rootId }) => rootId);
+      [rootIds[index - 1], rootIds[index]] = [rootIds[index], rootIds[index - 1]];
+      onAction?.("reorderCodexHomes", { rootIds });
+    });
+    moveDown.addEventListener("click", () => {
+      if (index === roots.length - 1) return;
+      const rootIds = roots.map(({ rootId }) => rootId);
+      [rootIds[index], rootIds[index + 1]] = [rootIds[index + 1], rootIds[index]];
+      onAction?.("reorderCodexHomes", { rootIds });
+    });
+    actions.append(edit, remove, moveUp, moveDown);
+    info.append(heading, location, role);
+    card.append(info, actions);
+    list.append(card);
+  });
+}
+
+function renderSettingsState(documentRef, state, bridgeAvailable, localizer, onRootAction) {
   const language = queryRequired(documentRef, "#settings-language");
   const appearance = queryRequired(documentRef, "#settings-appearance");
   const folder = queryRequired(documentRef, "#settings-codex-folder-status");
@@ -476,6 +772,7 @@ function renderSettingsState(documentRef, state, bridgeAvailable, localizer) {
   folder.textContent = state.codexFolder.kind === "default"
     ? translateSettingsMessage(localizer, "electron.settings.codexFolder.default")
     : translateSettingsMessage(localizer, "electron.settings.codexFolder.custom");
+  renderCodexRoots(documentRef, state, bridgeAvailable, localizer, onRootAction);
   refresh.value = String(state.refreshIntervalSeconds);
   loginSwitch.checked = state.startAtLogin.status === "enabled";
   loginSwitch.disabled = !bridgeAvailable || !state.startAtLogin.canSet;
@@ -610,6 +907,7 @@ export async function mountSettingsPage({
   let currentState = normalizeSettingsState(null);
   applyElectronAppearancePreference(currentState.appearance, { documentRef, windowRef });
   let busy = false;
+  let invoke = null;
   let unsubscribeDesktopCommands = () => {};
   const listeners = [];
   const listen = (element, type, handler) => {
@@ -631,20 +929,40 @@ export async function mountSettingsPage({
       false,
       pageLocalizer,
     );
-    renderSettingsState(documentRef, currentState, false, pageLocalizer);
+    renderSettingsState(
+      documentRef,
+      currentState,
+      false,
+      pageLocalizer,
+      () => {},
+    );
   }
 
   const refresh = async () => {
     if (!settingsBridge) return currentState;
     try {
       const next = await settingsBridge.getSettings();
-      currentState = normalizeSettingsState(next);
+      let rootsForSettings = null;
+      if (typeof settingsBridge.getCodexHomesForSettings === "function") {
+        try {
+          rootsForSettings = await settingsBridge.getCodexHomesForSettings();
+        } catch {
+          rootsForSettings = undefined;
+        }
+      }
+      currentState = normalizeSettingsState(next, rootsForSettings);
       applyElectronAppearancePreference(currentState.appearance, { documentRef, windowRef });
       pageLocalizer?.setLanguagePreference?.(
         browserLanguagePreference(currentState.language),
         { notifyHost: false, announce: false },
       );
-      renderSettingsState(documentRef, currentState, true, pageLocalizer);
+      renderSettingsState(
+        documentRef,
+        currentState,
+        true,
+        pageLocalizer,
+        (actionName, value) => { void invoke?.(actionName, value); },
+      );
       setBridgeStatus(documentRef, "electron.settings.bridge.connected", true, pageLocalizer);
       return currentState;
     } catch {
@@ -654,12 +972,18 @@ export async function mountSettingsPage({
         false,
         pageLocalizer,
       );
-      renderSettingsState(documentRef, currentState, false, pageLocalizer);
+      renderSettingsState(
+        documentRef,
+        currentState,
+        false,
+        pageLocalizer,
+        () => {},
+      );
       return currentState;
     }
   };
 
-  const invoke = async (actionName, value) => {
+  invoke = async (actionName, value) => {
     if (!settingsBridge || busy || !SETTINGS_ACTION_NAMES.includes(actionName)) return;
     if (!fixedActionValue(actionName, value)) {
       operationError(documentRef, pageLocalizer);
@@ -677,14 +1001,32 @@ export async function mountSettingsPage({
         : await action(value);
       if (result !== undefined
           && (result?.settings !== undefined || result?.language !== undefined)) {
-        currentState = normalizeSettingsState(result);
+        currentState = normalizeSettingsState(result, currentState.codexHomesForSettings);
+      }
+      if (actionName === "addCodexHome"
+          || actionName === "editCodexHome"
+          || actionName === "removeCodexHome"
+          || actionName === "setPrimaryCodexHome"
+          || actionName === "reorderCodexHomes"
+          || actionName === "useDefaultCodexHome") {
+        // Root mutations return a path-free dashboard snapshot. Re-read the
+        // settings-only projection so the newly chosen location is rendered
+        // without ever sending it through a renderer mutation argument.
+        await refresh();
+        return;
       }
       applyElectronAppearancePreference(currentState.appearance, { documentRef, windowRef });
       pageLocalizer?.setLanguagePreference?.(
         browserLanguagePreference(currentState.language),
         { notifyHost: false, announce: false },
       );
-      renderSettingsState(documentRef, currentState, true, pageLocalizer);
+      renderSettingsState(
+        documentRef,
+        currentState,
+        true,
+        pageLocalizer,
+        (nextAction, nextValue) => { void invoke?.(nextAction, nextValue); },
+      );
       if (actionName === "setNotificationPreferences") {
         notificationOperationStatus(documentRef, currentState, pageLocalizer);
       } else {
@@ -693,7 +1035,13 @@ export async function mountSettingsPage({
       setBridgeStatus(documentRef, "electron.settings.bridge.connected", true, pageLocalizer);
     } catch {
       operationError(documentRef, pageLocalizer);
-      renderSettingsState(documentRef, currentState, true, pageLocalizer);
+      renderSettingsState(
+        documentRef,
+        currentState,
+        true,
+        pageLocalizer,
+        (nextAction, nextValue) => { void invoke?.(nextAction, nextValue); },
+      );
     } finally {
       busy = false;
     }
@@ -753,8 +1101,8 @@ export async function mountSettingsPage({
   listen(queryRequired(documentRef, "#settings-appearance"), "change", (event) => {
     void invoke("setAppearance", event.target.value);
   });
-  listen(queryRequired(documentRef, "#settings-choose-codex-folder"), "click", () => {
-    void invoke("chooseCodexHome");
+  listen(queryRequired(documentRef, "#settings-add-codex-root"), "click", () => {
+    void invoke("addCodexHome");
   });
   listen(queryRequired(documentRef, "#settings-use-default-codex-folder"), "click", () => {
     void invoke("useDefaultCodexHome");

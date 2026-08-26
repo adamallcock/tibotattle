@@ -39,8 +39,9 @@ class FakeClassList {
 }
 
 class FakeElement {
-  constructor({ id = "", dataset = {}, value = "" } = {}) {
+  constructor({ id = "", dataset = {}, value = "", tagName = "DIV" } = {}) {
     this.id = id;
+    this.tagName = tagName;
     this.dataset = { ...dataset };
     this.value = value;
     this.textContent = "";
@@ -53,6 +54,13 @@ class FakeElement {
     this.classList = new FakeClassList();
     this.focusCalls = [];
     this.scrollCalls = [];
+    this.children = [];
+    this.parentNode = null;
+    this.ownerDocument = null;
+    this.className = "";
+    this.type = "";
+    this.name = "";
+    this.title = "";
   }
 
   addEventListener(type, listener) {
@@ -78,6 +86,7 @@ class FakeElement {
 
   setAttribute(name, value) {
     this.attributes.set(name, String(value));
+    if (name === "id") this.id = String(value);
   }
 
   removeAttribute(name) {
@@ -90,6 +99,26 @@ class FakeElement {
 
   focus(options) { this.focusCalls.push(options); }
   scrollIntoView(options) { this.scrollCalls.push(options); }
+  append(...nodes) {
+    for (const node of nodes) this.appendChild(node);
+  }
+  appendChild(node) {
+    if (!node) return node;
+    this.children.push(node);
+    node.parentNode = this;
+    return node;
+  }
+  replaceChildren(...nodes) {
+    for (const child of this.children) child.parentNode = null;
+    this.children = [];
+    this.append(...nodes);
+  }
+  removeChild(node) {
+    const index = this.children.indexOf(node);
+    if (index >= 0) this.children.splice(index, 1);
+    if (node) node.parentNode = null;
+    return node;
+  }
   dispatchEvent(event) {
     return this.dispatch(event.type, event);
   }
@@ -110,6 +139,9 @@ function makeSettingsDocument({ electron = false } = {}) {
   make("settings-language", { value: "system" });
   make("settings-appearance", { value: "system" });
   make("settings-codex-folder-status");
+  make("settings-add-codex-root");
+  make("settings-codex-roots-status");
+  make("settings-codex-roots");
   make("settings-refresh-interval", { value: "300" });
   make("settings-start-at-login");
   make("settings-start-at-login-summary");
@@ -162,6 +194,11 @@ function makeSettingsDocument({ electron = false } = {}) {
       style: {},
     },
     body: { classList: new FakeClassList() },
+    createElement(tagName) {
+      const element = new FakeElement({ tagName: String(tagName).toUpperCase() });
+      element.ownerDocument = documentRef;
+      return element;
+    },
     querySelector(selector) {
       if (selector.startsWith("#")) return byId.get(selector.slice(1)) ?? null;
       if (selector === ".dashboard-shell") return shell;
@@ -203,6 +240,14 @@ function settingsState(overrides = {}) {
     sidebarCollapsed: false,
     refreshIntervalSeconds: 300,
     codexFolder: { kind: "default" },
+    codexHomes: {
+      activityRoots: [{
+        rootId: "00000000-0000-4000-8000-000000000001",
+        kind: "default",
+        enabled: true,
+      }],
+      primaryRootId: "00000000-0000-4000-8000-000000000001",
+    },
     startAtLogin: { status: "disabled", canSet: true },
     notifications: {
       enabled: true,
@@ -233,6 +278,13 @@ function bridgeFixture(calls, state = settingsState(), commandSlot = null) {
   return Object.freeze({
     version: DESKTOP_SETTINGS_API_VERSION,
     getSettings: async () => state,
+    getCodexHomesForSettings: async () => state.codexHomesForSettings ?? {
+      activityRoots: state.codexHomes.activityRoots.map((root) => ({
+        ...root,
+        ...(root.kind === "default" ? { path: null } : {}),
+      })),
+      primaryRootId: state.codexHomes.primaryRootId,
+    },
     onCommand: (callback) => {
       if (commandSlot) commandSlot.callback = callback;
       return () => {
@@ -244,6 +296,14 @@ function bridgeFixture(calls, state = settingsState(), commandSlot = null) {
       assert.equal(args.length, 0);
       return result("chooseCodexHome");
     },
+    addCodexHome: async (...args) => {
+      assert.equal(args.length, 0);
+      return result("addCodexHome");
+    },
+    editCodexHome: async (value) => result("editCodexHome", value),
+    removeCodexHome: async (value) => result("removeCodexHome", value),
+    setPrimaryCodexHome: async (value) => result("setPrimaryCodexHome", value),
+    reorderCodexHomes: async (value) => result("reorderCodexHomes", value),
     useDefaultCodexHome: async (...args) => {
       assert.equal(args.length, 0);
       return result("useDefaultCodexHome");
@@ -318,10 +378,16 @@ test("settings assets expose the exact v1 bridge, finite values, and fixed links
   assert.deepEqual(Object.keys(SETTINGS_EXTERNAL_TARGETS), ["website", "github", "x"]);
   assert.deepEqual(SETTINGS_ACTION_NAMES, [
     "getSettings",
+    "getCodexHomesForSettings",
     "openSettings",
     "setLanguage",
     "setAppearance",
     "chooseCodexHome",
+    "addCodexHome",
+    "editCodexHome",
+    "removeCodexHome",
+    "setPrimaryCodexHome",
+    "reorderCodexHomes",
     "useDefaultCodexHome",
     "setRefreshInterval",
     "setStartAtLogin",
@@ -555,9 +621,9 @@ test("settings bridge renders native-parity controls and supports keyboard tabs"
   await settle();
   assert.deepEqual(calls.at(-1), ["openSystemSettings", "startup"]);
 
-  documentRef.byId.get("settings-choose-codex-folder").dispatch("click");
+  documentRef.byId.get("settings-add-codex-root").dispatch("click");
   await settle();
-  assert.deepEqual(calls.at(-1), ["chooseCodexHome"]);
+  assert.deepEqual(calls.at(-1), ["addCodexHome"]);
 
   documentRef.byId.get("settings-use-default-codex-folder").dispatch("click");
   await settle();
@@ -609,11 +675,156 @@ test("settings bridge renders native-parity controls and supports keyboard tabs"
   assert.equal(commandSlot.unsubscribed, true);
 });
 
+test("settings renders multi-root roles and sends only canonical root identities", async () => {
+  const defaultRootId = "00000000-0000-4000-8000-000000000001";
+  const firstCustomRootId = "11111111-1111-4111-8111-111111111111";
+  const secondCustomRootId = "22222222-2222-4222-8222-222222222222";
+  const firstPath = "/Users/adam/.codex-work";
+  const secondPath = "/Users/adam/.codex-alt";
+  const codexHomes = {
+    activityRoots: [
+      { rootId: defaultRootId, kind: "default", enabled: true },
+      { rootId: firstCustomRootId, kind: "custom", enabled: true },
+      { rootId: secondCustomRootId, kind: "custom", enabled: true },
+    ],
+    primaryRootId: defaultRootId,
+  };
+  const codexHomesForSettings = {
+    activityRoots: [
+      { rootId: defaultRootId, kind: "default", path: null, enabled: true },
+      { rootId: firstCustomRootId, kind: "custom", path: firstPath, enabled: true },
+      { rootId: secondCustomRootId, kind: "custom", path: secondPath, enabled: true },
+    ],
+    primaryRootId: defaultRootId,
+  };
+  const documentRef = makeSettingsDocument();
+  const calls = [];
+  const state = settingsState({ codexHomes, codexHomesForSettings });
+  const bridge = bridgeFixture(calls, state);
+  await mountSettingsPage({ documentRef, windowRef: { tibotattleDesktop: bridge }, bridge });
+
+  const list = documentRef.byId.get("settings-codex-roots");
+  assert.equal(list.getAttribute("role"), null, "role is owned by the real HTML list");
+  assert.equal(list.children.length, 3);
+  assert.equal(documentRef.byId.get("settings-add-codex-root").disabled, false);
+  assert.equal(documentRef.byId.get("settings-codex-roots-status").textContent, "");
+
+  const firstCard = list.children[0];
+  const firstInfo = firstCard.children[0];
+  const firstActions = firstCard.children[1];
+  assert.equal(firstInfo.children[1].textContent, "Default location (~/.codex)");
+  assert.equal(firstInfo.children[2].children[0].children[0].checked, true);
+  assert.equal(firstInfo.children[2].children[0].children[1].textContent, "Primary");
+  assert.equal(firstActions.children[0].disabled, true, "default root cannot be edited");
+  assert.equal(firstActions.children[1].disabled, true, "primary root cannot be removed");
+  assert.equal(firstActions.children[2].disabled, true);
+  assert.equal(firstActions.children[3].disabled, false);
+
+  const secondCard = list.children[1];
+  assert.equal(secondCard.children[0].children[1].textContent, firstPath);
+  assert.equal(secondCard.children[1].children[0].disabled, false);
+  assert.equal(secondCard.children[1].children[1].disabled, false);
+  assert.equal(secondCard.children[1].children[2].disabled, false);
+  assert.equal(secondCard.children[1].children[3].disabled, false);
+  assert.equal(
+    secondCard.children[0].children[2].children[0].children[0].getAttribute("aria-label"),
+    "Set as primary",
+  );
+
+  const textAndAttributes = [];
+  const collect = (element) => {
+    textAndAttributes.push(element.textContent);
+    for (const value of element.attributes.values()) textAndAttributes.push(value);
+    for (const child of element.children) collect(child);
+  };
+  collect(secondCard);
+  assert.ok(textAndAttributes.includes(secondPath) === false, "unrendered root path stays out of other cards");
+  assert.ok(textAndAttributes.includes(firstPath), "configured location is rendered as text content");
+  assert.doesNotMatch(textAndAttributes.filter(Boolean).join("\n"), /<|>/u);
+
+  const secondPrimaryInput = secondCard.children[0].children[2].children[0].children[0];
+  assert.equal(secondPrimaryInput.type, "radio");
+  assert.equal(secondPrimaryInput.disabled, false);
+  assert.equal(secondPrimaryInput.listeners.has("change"), true);
+  secondPrimaryInput.checked = true;
+  secondPrimaryInput.dispatch("change");
+  await settle();
+  assert.deepEqual(calls.at(-1), ["setPrimaryCodexHome", { rootId: firstCustomRootId }]);
+
+  secondCard.children[1].children[0].click();
+  await settle();
+  assert.deepEqual(calls.at(-1), ["editCodexHome", { rootId: firstCustomRootId }]);
+  secondCard.children[1].children[1].click();
+  await settle();
+  assert.deepEqual(calls.at(-1), ["removeCodexHome", { rootId: firstCustomRootId }]);
+  secondCard.children[1].children[2].click();
+  await settle();
+  assert.deepEqual(calls.at(-1), ["reorderCodexHomes", {
+    rootIds: [firstCustomRootId, defaultRootId, secondCustomRootId],
+  }]);
+  firstCard.children[1].children[3].click();
+  await settle();
+  assert.deepEqual(calls.at(-1), ["reorderCodexHomes", {
+    rootIds: [firstCustomRootId, defaultRootId, secondCustomRootId],
+  }]);
+});
+
+test("settings bounds multi-root controls at one and eight roots", async () => {
+  const rootIds = [
+    "11111111-1111-4111-8111-111111111111",
+    "22222222-2222-4222-8222-222222222222",
+    "33333333-3333-4333-8333-333333333333",
+    "44444444-4444-4444-8444-444444444444",
+    "55555555-5555-4555-8555-555555555555",
+    "66666666-6666-4666-8666-666666666666",
+    "77777777-7777-4777-8777-777777777777",
+    "88888888-8888-4888-8888-888888888888",
+  ];
+  const stateFor = (ids) => {
+    const roots = ids.map((rootId) => ({ rootId, kind: "custom", enabled: true }));
+    const pathful = roots.map((root, index) => ({
+      ...root,
+      path: "/Users/adam/codex-" + index,
+    }));
+    return settingsState({
+      codexFolder: { kind: "custom" },
+      codexHomes: { activityRoots: roots, primaryRootId: ids[0] },
+      codexHomesForSettings: { activityRoots: pathful, primaryRootId: ids[0] },
+    });
+  };
+
+  const oneDocument = makeSettingsDocument();
+  const oneBridge = bridgeFixture([], stateFor([rootIds[0]]));
+  await mountSettingsPage({
+    documentRef: oneDocument,
+    windowRef: { tibotattleDesktop: oneBridge },
+    bridge: oneBridge,
+  });
+  assert.equal(oneDocument.byId.get("settings-add-codex-root").disabled, false);
+  assert.equal(oneDocument.byId.get("settings-codex-roots").children.length, 1);
+  assert.equal(oneDocument.byId.get("settings-codex-roots").children[0].children[1].children[1].disabled, true);
+
+  const eightDocument = makeSettingsDocument();
+  const eightBridge = bridgeFixture([], stateFor(rootIds));
+  await mountSettingsPage({
+    documentRef: eightDocument,
+    windowRef: { tibotattleDesktop: eightBridge },
+    bridge: eightBridge,
+  });
+  assert.equal(eightDocument.byId.get("settings-add-codex-root").disabled, true);
+  assert.equal(eightDocument.byId.get("settings-codex-roots").children.length, 8);
+});
+
 test("settings renders a truthful custom-folder state without exposing its path", async () => {
   const documentRef = makeSettingsDocument();
   const customPath = "/Users/adam/custom-codex";
+  const customRootId = "11111111-1111-4111-8111-111111111111";
   const bridge = bridgeFixture([], settingsState({
     codexFolder: { kind: "custom", displayPath: customPath },
+    codexHomes: {
+      activityRoots: [{ rootId: customRootId, kind: "custom", enabled: true }],
+      primaryRootId: customRootId,
+    },
   }));
 
   await mountSettingsPage({

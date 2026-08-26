@@ -45,3 +45,28 @@ test("Electron Settings exposes focusable skip target and a live login summary r
   assert.match(css, /@media \(prefers-reduced-motion: reduce\)/u);
   assert.match(css, /outline:\s*3px solid Highlight/u);
 });
+
+test("Electron Settings exposes an accessible multi-root editor surface", async () => {
+  const html = await readPublic("electron-settings.html");
+  const css = await readPublic("electron-settings.css");
+
+  assert.match(
+    html,
+    /id="settings-codex-roots"[^>]*role="list"[^>]*aria-label="Configured Codex folders"/u,
+  );
+  assert.match(
+    html,
+    /id="settings-codex-roots-status"[^>]*role="status"[^>]*aria-live="polite"[^>]*aria-atomic="true"/u,
+  );
+  assert.match(
+    html,
+    /id="settings-add-codex-root"[^>]*type="button"/u,
+  );
+  assert.match(
+    html,
+    /id="settings-use-default-codex-folder"[^>]*type="button"/u,
+  );
+  assert.match(css, /\.settings-root-card/u);
+  assert.match(css, /\.settings-root-primary/u);
+  assert.match(css, /\.settings-root-actions/u);
+});
