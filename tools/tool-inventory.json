@@ -1097,6 +1097,7 @@
         ".github/workflows/windows-portability.yml",
         "test/windows-filesystem-prepared-artifact-native.test.js",
         "test/windows-filesystem-security.test.js",
+        "test/windows-local-unified-index-native.test.js",
         "test/windows-sqlite-state-session-native.test.js",
         "test/windows-qualification-governance.test.js"
       ],
