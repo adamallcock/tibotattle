@@ -16,6 +16,7 @@ import { join } from "node:path";
 
 import {
   DESKTOP_DEFAULT_SETTINGS,
+  DESKTOP_SETTINGS_LEGACY_MIGRATION_MARKER,
   validateDesktopSettingsSnapshot,
 } from "../desktop-contract.js";
 import {
@@ -25,6 +26,7 @@ import {
   DESKTOP_SETTINGS_FILE_NAME,
   DESKTOP_SETTINGS_STAGE_PREFIX,
 } from "../desktop-settings-backends.js";
+import { createDesktopSettingsStore } from "../desktop-settings-store.js";
 import {
   createWindowsFilesystemAdapter,
   createWindowsProtectedStateStore,
@@ -50,6 +52,18 @@ function snapshot(overrides = {}) {
     ...clone(DESKTOP_DEFAULT_SETTINGS),
     ...overrides,
   });
+}
+
+function legacySnapshot(overrides = {}) {
+  return {
+    schemaVersion: "tibotattle-desktop-settings-v1",
+    codexHome: { mode: "custom", path: "/Users/test/.codex" },
+    language: "system",
+    refreshIntervalSeconds: 300,
+    startAtLogin: false,
+    notifications: { enabled: false, threshold: "off" },
+    ...overrides,
+  };
 }
 
 async function temporaryRoot(callback) {
@@ -277,6 +291,31 @@ test("POSIX backend returns missing for a fresh root and persists valid snapshot
   });
 });
 
+test("POSIX backend marks legacy decode and the store atomically rewrites v2", {
+  skip: POSIX_TEST_SKIP,
+}, async () => {
+  await temporaryRoot(async (parent) => {
+    const root = join(parent, "state");
+    await fs.mkdir(root, { mode: 0o700 });
+    const path = join(root, SETTINGS_FILE);
+    await writeFile(path, `${JSON.stringify(legacySnapshot())}\n`, { mode: 0o600 });
+
+    const backend = createPosixDesktopSettingsBackend({ rootPath: root });
+    const decoded = await backend.load();
+    assert.equal(decoded.schemaVersion, "tibotattle-desktop-settings-v2");
+    assert.equal(decoded[DESKTOP_SETTINGS_LEGACY_MIGRATION_MARKER], true);
+    assert.equal(Object.keys(decoded).includes("codexHome"), false);
+
+    const store = createDesktopSettingsStore({ backend });
+    const projection = await store.getSettings();
+    assert.equal(projection.schemaVersion, "tibotattle-desktop-settings-v2");
+    const persisted = JSON.parse(await readFile(path, "utf8"));
+    assert.equal(persisted.schemaVersion, "tibotattle-desktop-settings-v2");
+    assert.equal(Object.hasOwn(persisted, "codexHomes"), true);
+    assert.equal(Object.hasOwn(persisted, "codexHome"), false);
+  });
+});
+
 test("POSIX backend rejects unsafe roots, files, symlinks, and hard links", {
   skip: POSIX_TEST_SKIP,
 }, async () => {
@@ -426,8 +465,8 @@ test("Windows backend creates, reloads, and identity-replaces only its fixed chi
     windowsProtectedStateStore: fixture.store,
   });
   assert.equal(await backend.load(), null);
-  const first = snapshot({ language: "zh-Hans" });
-  const second = snapshot({ language: "es" });
+    const first = snapshot({ language: "zh-Hans" });
+    const second = snapshot({ language: "es" });
   await backend.save(first);
   assert.deepEqual(await backend.load(), first);
   await backend.save(second);

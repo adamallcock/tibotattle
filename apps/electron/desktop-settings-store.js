@@ -4,10 +4,23 @@ import {
   DESKTOP_NOTIFICATION_THRESHOLDS,
   DESKTOP_APPEARANCES,
   DESKTOP_REFRESH_INTERVAL_SECONDS,
+  DESKTOP_SETTINGS_LEGACY_MIGRATION_MARKER,
   DESKTOP_SETTINGS_SCHEMA_VERSION,
   migrateDesktopSettingsSnapshot,
+  projectDesktopSettingsPathFree,
   validateDesktopSettingsSnapshot,
 } from "./desktop-contract.js";
+import {
+  addCodexHomeToConfiguration,
+  createDefaultCodexHomes,
+  editCodexHomeInConfiguration,
+  migrateLegacyCodexHome,
+  normalizeCodexHomes,
+  projectCodexHomesForSettings,
+  removeCodexHomeFromConfiguration,
+  reorderCodexHomesConfiguration,
+  setPrimaryCodexHomeInConfiguration,
+} from "./desktop-codex-roots.js";
 
 const DEFAULT_BACKEND = Object.freeze({
   async load() {
@@ -18,6 +31,7 @@ const DEFAULT_BACKEND = Object.freeze({
 
 const UPDATE_KEYS = Object.freeze([
   "codexHome",
+  "codexHomes",
   "language",
   "appearance",
   "refreshIntervalSeconds",
@@ -36,11 +50,24 @@ function assertBackend(backend) {
   return backend;
 }
 
-function cloneSettings(settings) {
-  const migrated = migrateDesktopSettingsSnapshot(settings);
+function defaultSettings() {
+  return validateDesktopSettingsSnapshot({
+    schemaVersion: DESKTOP_DEFAULT_SETTINGS.schemaVersion,
+    codexHomes: DESKTOP_DEFAULT_SETTINGS.codexHomes,
+    language: DESKTOP_DEFAULT_SETTINGS.language,
+    appearance: DESKTOP_DEFAULT_SETTINGS.appearance,
+    refreshIntervalSeconds: DESKTOP_DEFAULT_SETTINGS.refreshIntervalSeconds,
+    startAtLogin: DESKTOP_DEFAULT_SETTINGS.startAtLogin,
+    notifications: { ...DESKTOP_DEFAULT_SETTINGS.notifications },
+    sidebarCollapsed: DESKTOP_DEFAULT_SETTINGS.sidebarCollapsed,
+  });
+}
+
+function cloneSettings(settings, idFactory) {
+  const migrated = migrateDesktopSettingsSnapshot(settings, { idFactory });
   return validateDesktopSettingsSnapshot({
     schemaVersion: migrated.schemaVersion,
-    codexHome: { ...migrated.codexHome },
+    codexHomes: migrated.codexHomes,
     language: migrated.language,
     appearance: migrated.appearance,
     refreshIntervalSeconds: migrated.refreshIntervalSeconds,
@@ -79,16 +106,12 @@ function loadError() {
   return error;
 }
 
-function defaultSettings() {
-  return cloneSettings(DESKTOP_DEFAULT_SETTINGS);
-}
-
 /**
  * A serialized, dependency-injected settings store.  It owns no filesystem
  * implementation: production chooses the backend appropriate to the host
  * platform, while tests can provide an in-memory or failure-injecting port.
  */
-export function createDesktopSettingsStore({ backend = DEFAULT_BACKEND } = {}) {
+export function createDesktopSettingsStore({ backend = DEFAULT_BACKEND, idFactory } = {}) {
   const persistence = assertBackend(backend);
   let state = defaultSettings();
   let loaded = false;
@@ -105,9 +128,22 @@ export function createDesktopSettingsStore({ backend = DEFAULT_BACKEND } = {}) {
         if (stored === null || stored === undefined) {
           state = defaultSettings();
         } else {
-          state = cloneSettings(stored);
+          const migrated = migrateDesktopSettingsSnapshot(stored, { idFactory });
+          state = cloneSettings(migrated, idFactory);
+          // Persist a legacy migration as one normal backend transaction. The
+          // backend owns its atomic/no-clobber publication boundary. Keep the
+          // migrated state usable in memory if that publication is unavailable
+          // and expose only a fixed diagnostic to the caller.
+          if (stored.schemaVersion !== DESKTOP_SETTINGS_SCHEMA_VERSION
+              || stored[DESKTOP_SETTINGS_LEGACY_MIGRATION_MARKER] === true) {
+            try {
+              await persistence.save(state);
+            } catch (error) {
+              lastLoadError = loadError();
+              void error;
+            }
+          }
         }
-        lastLoadError = null;
       } catch (error) {
         // A corrupt/unavailable preference backend must never make the desktop
         // shell unusable. Keep the exact defaults and expose only a fixed
@@ -134,7 +170,7 @@ export function createDesktopSettingsStore({ backend = DEFAULT_BACKEND } = {}) {
   }
 
   async function save(next) {
-    const candidate = cloneSettings(next);
+    const candidate = cloneSettings(next, idFactory);
     try {
       await persistence.save(candidate);
     } catch (error) {
@@ -144,7 +180,8 @@ export function createDesktopSettingsStore({ backend = DEFAULT_BACKEND } = {}) {
       throw persistenceError();
     }
     state = candidate;
-    return state;
+    lastLoadError = null;
+    return projectDesktopSettingsPathFree(state);
   }
 
   async function updateSnapshot(next) {
@@ -164,21 +201,50 @@ export function createDesktopSettingsStore({ backend = DEFAULT_BACKEND } = {}) {
     if (keys.length === 0 || keys.some((key) => !UPDATE_KEYS.includes(key))) {
       throw new TypeError("update has unexpected keys");
     }
-    return enqueueUpdate((current) => ({
-      ...current,
-      ...patch,
-      codexHome: patch.codexHome === undefined
-        ? { ...current.codexHome }
-        : { ...patch.codexHome },
-      notifications: patch.notifications === undefined
-        ? { ...current.notifications }
-        : { ...patch.notifications },
-    }));
+    if (Object.hasOwn(patch, "codexHome") && Object.hasOwn(patch, "codexHomes")) {
+      throw new TypeError("codexHome and codexHomes are mutually exclusive");
+    }
+    return enqueueUpdate((current) => {
+      let codexHomes = current.codexHomes;
+      if (Object.hasOwn(patch, "codexHomes")) {
+        codexHomes = normalizeCodexHomes(patch.codexHomes);
+      } else if (Object.hasOwn(patch, "codexHome")) {
+        codexHomes = migrateLegacyCodexHome(patch.codexHome, { idFactory });
+      }
+      return {
+        ...current,
+        codexHomes,
+        language: patch.language === undefined ? current.language : patch.language,
+        appearance: patch.appearance === undefined ? current.appearance : patch.appearance,
+        refreshIntervalSeconds: patch.refreshIntervalSeconds === undefined
+          ? current.refreshIntervalSeconds
+          : patch.refreshIntervalSeconds,
+        startAtLogin: patch.startAtLogin === undefined
+          ? current.startAtLogin
+          : patch.startAtLogin,
+        notifications: patch.notifications === undefined
+          ? { ...current.notifications }
+          : { ...patch.notifications },
+        sidebarCollapsed: patch.sidebarCollapsed === undefined
+          ? current.sidebarCollapsed
+          : patch.sidebarCollapsed,
+      };
+    });
   }
 
   async function getSettings() {
     await ensureLoaded();
-    return state;
+    return projectDesktopSettingsPathFree(state);
+  }
+
+  async function getPersistedSettings() {
+    await ensureLoaded();
+    return cloneSettings(state, idFactory);
+  }
+
+  async function getCodexHomesForSettings() {
+    await ensureLoaded();
+    return projectCodexHomesForSettings(state.codexHomes);
   }
 
   async function setLanguage(language) {
@@ -226,26 +292,64 @@ export function createDesktopSettingsStore({ backend = DEFAULT_BACKEND } = {}) {
 
   async function setCodexHome(home) {
     assertExactKeys(home, ["mode", "path"], "codexHome");
-    if (![
-      "default",
-      "custom",
-    ].includes(home.mode)) throw new TypeError("codexHome.mode is invalid");
-    if (home.mode === "default" && home.path !== null) {
-      throw new TypeError("default codexHome.path must be null");
-    }
-    if (home.mode === "custom"
-        && (typeof home.path !== "string" || home.path.length === 0 || home.path.includes("\0"))) {
-      throw new TypeError("custom codexHome.path is invalid");
-    }
-    return enqueueUpdate((current) => ({ ...current, codexHome: { ...home } }));
+    const codexHomes = migrateLegacyCodexHome(home, { idFactory });
+    return enqueueUpdate((current) => ({ ...current, codexHomes }));
+  }
+
+  async function addCodexHome(options = {}) {
+    assertExactKeys(options, ["path"], "addCodexHome");
+    return enqueueUpdate((current) => ({
+      ...current,
+      codexHomes: addCodexHomeToConfiguration(current.codexHomes, {
+        path: options.path,
+        idFactory,
+      }),
+    }));
+  }
+
+  async function editCodexHome(options = {}) {
+    assertExactKeys(options, ["rootId", "path"], "editCodexHome");
+    return enqueueUpdate((current) => ({
+      ...current,
+      codexHomes: editCodexHomeInConfiguration(current.codexHomes, options),
+    }));
+  }
+
+  async function removeCodexHome(options = {}) {
+    assertExactKeys(options, ["rootId"], "removeCodexHome");
+    return enqueueUpdate((current) => ({
+      ...current,
+      codexHomes: removeCodexHomeFromConfiguration(current.codexHomes, options),
+    }));
+  }
+
+  async function setPrimaryCodexHome(options = {}) {
+    assertExactKeys(options, ["rootId"], "setPrimaryCodexHome");
+    return enqueueUpdate((current) => ({
+      ...current,
+      codexHomes: setPrimaryCodexHomeInConfiguration(current.codexHomes, options),
+    }));
+  }
+
+  async function reorderCodexHomes(options = {}) {
+    assertExactKeys(options, ["rootIds"], "reorderCodexHomes");
+    return enqueueUpdate((current) => ({
+      ...current,
+      codexHomes: reorderCodexHomesConfiguration(current.codexHomes, options),
+    }));
   }
 
   async function useDefaultCodexHome() {
-    return setCodexHome({ mode: "default", path: null });
+    return enqueueUpdate((current) => ({
+      ...current,
+      codexHomes: createDefaultCodexHomes(),
+    }));
   }
 
   return Object.freeze({
     getSettings,
+    getPersistedSettings,
+    getCodexHomesForSettings,
     update,
     updateSnapshot,
     setLanguage,
@@ -255,6 +359,11 @@ export function createDesktopSettingsStore({ backend = DEFAULT_BACKEND } = {}) {
     setNotificationPreferences,
     setSidebarCollapsed,
     setCodexHome,
+    addCodexHome,
+    editCodexHome,
+    removeCodexHome,
+    setPrimaryCodexHome,
+    reorderCodexHomes,
     useDefaultCodexHome,
     get lastLoadFailed() {
       return lastLoadError !== null;

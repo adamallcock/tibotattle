@@ -13,6 +13,8 @@ import {
   DESKTOP_SETTINGS_SCHEMA_VERSION,
   DESKTOP_SYSTEM_SETTINGS_TARGETS,
   createDesktopRequest,
+  migrateDesktopSettingsSnapshot,
+  projectDesktopSettingsPathFree,
   validateDesktopRequest,
   validateDesktopSettingsSnapshot,
 } from "../desktop-contract.js";
@@ -21,8 +23,14 @@ test("desktop contract freezes the exact bridge action and enum vocabulary", () 
   assert.equal(DESKTOP_IPC_CHANNEL, "tibotattle:desktop:v1");
   assert.deepEqual(DESKTOP_ACTIONS, [
     "getSettings",
+    "getCodexHomesForSettings",
     "openSettings",
     "chooseCodexHome",
+    "addCodexHome",
+    "editCodexHome",
+    "removeCodexHome",
+    "setPrimaryCodexHome",
+    "reorderCodexHomes",
     "useDefaultCodexHome",
     "setLanguage",
     "setAppearance",
@@ -52,7 +60,7 @@ test("desktop contract freezes the exact bridge action and enum vocabulary", () 
   assert.equal(Object.isFrozen(DESKTOP_ACTIONS), true);
   assert.equal(Object.isFrozen(DESKTOP_ACTION_ARGUMENT_KEYS), true);
   assert.equal(Object.isFrozen(DESKTOP_DEFAULT_SETTINGS), true);
-  assert.equal(Object.isFrozen(DESKTOP_DEFAULT_SETTINGS.codexHome), true);
+  assert.equal(Object.isFrozen(DESKTOP_DEFAULT_SETTINGS.codexHomes), true);
   assert.equal(Object.isFrozen(DESKTOP_DEFAULT_SETTINGS.notifications), true);
 });
 
@@ -73,8 +81,10 @@ test("request validation accepts exact envelopes and freezes the result", () => 
 
   for (const action of [
     "getSettings",
+    "getCodexHomesForSettings",
     "openSettings",
     "chooseCodexHome",
+    "addCodexHome",
     "useDefaultCodexHome",
     "checkForUpdates",
     "revealLatestDownload",
@@ -103,6 +113,25 @@ test("request validation accepts exact envelopes and freezes the result", () => 
       },
     },
   );
+  for (const action of ["editCodexHome", "removeCodexHome", "setPrimaryCodexHome"]) {
+    assert.deepEqual(
+      validateDesktopRequest({
+        action,
+        args: { rootId: "11111111-1111-4111-8111-111111111111" },
+      }),
+      { action, args: { rootId: "11111111-1111-4111-8111-111111111111" } },
+    );
+  }
+  assert.deepEqual(
+    validateDesktopRequest({
+      action: "reorderCodexHomes",
+      args: { rootIds: ["11111111-1111-4111-8111-111111111111"] },
+    }),
+    {
+      action: "reorderCodexHomes",
+      args: { rootIds: ["11111111-1111-4111-8111-111111111111"] },
+    },
+  );
 });
 
 test("request validation rejects unknown actions, extra keys, malformed values, and prototypes", () => {
@@ -124,6 +153,9 @@ test("request validation rejects unknown actions, extra keys, malformed values, 
     { action: "openHostedSignIn", args: { authorizeUrl: "https://evil.example/?x=1" } },
     { action: "openHostedSignIn", args: { authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth" } },
     { action: "openHostedSignIn", args: { authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth?x=1#fragment" } },
+    { action: "editCodexHome", args: { rootId: "root-a" } },
+    { action: "removeCodexHome", args: { rootId: "11111111-1111-4111-8111-111111111111", extra: true } },
+    { action: "reorderCodexHomes", args: { rootIds: [] } },
     { action: "openExternal", args: Object.assign(Object.create(null), {
       target: "github",
       extra: "reject",
@@ -140,7 +172,15 @@ test("request validation rejects unknown actions, extra keys, malformed values, 
 test("settings snapshot validator enforces the exact schema and defaults", () => {
   assert.deepEqual(validateDesktopSettingsSnapshot(DESKTOP_DEFAULT_SETTINGS), {
     schemaVersion: DESKTOP_SETTINGS_SCHEMA_VERSION,
-    codexHome: { mode: "default", path: null },
+    codexHomes: {
+      activityRoots: [{
+        rootId: "00000000-0000-4000-8000-000000000001",
+        kind: "default",
+        path: null,
+        enabled: true,
+      }],
+      primaryRootId: "00000000-0000-4000-8000-000000000001",
+    },
     language: "system",
     appearance: "system",
     refreshIntervalSeconds: 300,
@@ -151,20 +191,28 @@ test("settings snapshot validator enforces the exact schema and defaults", () =>
 
   const valid = validateDesktopSettingsSnapshot({
     ...DESKTOP_DEFAULT_SETTINGS,
-    codexHome: { mode: "custom", path: "C:\\Users\\adam\\.codex" },
+    codexHomes: {
+      activityRoots: [{
+        rootId: "11111111-1111-4111-8111-111111111111",
+        kind: "custom",
+        path: "C:\\Users\\adam\\.codex",
+        enabled: true,
+      }],
+      primaryRootId: "11111111-1111-4111-8111-111111111111",
+    },
     language: "zh-Hans",
     appearance: "dark",
     refreshIntervalSeconds: 1800,
     startAtLogin: true,
     notifications: { enabled: true, threshold: "ninety" },
   });
-  assert.equal(valid.codexHome.mode, "custom");
+  assert.equal(valid.codexHomes.activityRoots[0].kind, "custom");
   assert.equal(Object.isFrozen(valid.notifications), true);
 
   assert.equal(
     validateDesktopSettingsSnapshot({
       schemaVersion: DESKTOP_SETTINGS_SCHEMA_VERSION,
-      codexHome: { mode: "default", path: null },
+      codexHomes: DESKTOP_DEFAULT_SETTINGS.codexHomes,
       language: "system",
       appearance: "system",
       refreshIntervalSeconds: 300,
@@ -177,8 +225,24 @@ test("settings snapshot validator enforces the exact schema and defaults", () =>
   for (const invalid of [
     { ...DESKTOP_DEFAULT_SETTINGS, schemaVersion: "v2" },
     { ...DESKTOP_DEFAULT_SETTINGS, extra: true },
-    { ...DESKTOP_DEFAULT_SETTINGS, codexHome: { mode: "default", path: "/tmp" } },
-    { ...DESKTOP_DEFAULT_SETTINGS, codexHome: { mode: "custom", path: null } },
+    { ...DESKTOP_DEFAULT_SETTINGS, codexHomes: {
+      activityRoots: [{
+        rootId: "00000000-0000-4000-8000-000000000001",
+        kind: "default",
+        path: "/tmp",
+        enabled: true,
+      }],
+      primaryRootId: "00000000-0000-4000-8000-000000000001",
+    } },
+    { ...DESKTOP_DEFAULT_SETTINGS, codexHomes: {
+      activityRoots: [{
+        rootId: "11111111-1111-4111-8111-111111111111",
+        kind: "custom",
+        path: null,
+        enabled: true,
+      }],
+      primaryRootId: "11111111-1111-4111-8111-111111111111",
+    } },
     { ...DESKTOP_DEFAULT_SETTINGS, language: "fr" },
     { ...DESKTOP_DEFAULT_SETTINGS, appearance: "sepia" },
     { ...DESKTOP_DEFAULT_SETTINGS, refreshIntervalSeconds: 1 },
@@ -188,4 +252,32 @@ test("settings snapshot validator enforces the exact schema and defaults", () =>
   ]) {
     assert.throws(() => validateDesktopSettingsSnapshot(invalid), TypeError);
   }
+});
+
+test("v1 scalar migration creates one stable v2 root and path-free projection", () => {
+  const legacy = {
+    schemaVersion: "tibotattle-desktop-settings-v1",
+    codexHome: { mode: "custom", path: "C:\\Users\\adam\\.codex" },
+    language: "en",
+    appearance: "light",
+    refreshIntervalSeconds: 900,
+    startAtLogin: true,
+    notifications: { enabled: false, threshold: "off" },
+  };
+  const migrated = migrateDesktopSettingsSnapshot(legacy, {
+    idFactory: () => "11111111-1111-4111-8111-111111111111",
+  });
+  assert.equal(migrated.schemaVersion, DESKTOP_SETTINGS_SCHEMA_VERSION);
+  assert.equal(migrated.codexHomes.activityRoots[0].rootId, "11111111-1111-4111-8111-111111111111");
+  const projected = projectDesktopSettingsPathFree(migrated);
+  assert.equal(Object.hasOwn(projected.codexHomes.activityRoots[0], "path"), false);
+  assert.equal(JSON.stringify(projected).includes("Users"), false);
+
+  const scalar = migrateDesktopSettingsSnapshot({
+    schemaVersion: "usage-monitor-launcher-settings-v1",
+    codexHome: "/Users/adam/.codex",
+  });
+  assert.equal(scalar.schemaVersion, DESKTOP_SETTINGS_SCHEMA_VERSION);
+  assert.equal(scalar.language, "system");
+  assert.equal(scalar.codexHomes.activityRoots[0].kind, "custom");
 });

@@ -4,6 +4,7 @@ import * as nodeFs from "node:fs/promises";
 import { basename, isAbsolute, join } from "node:path";
 
 import {
+  DESKTOP_SETTINGS_LEGACY_MIGRATION_MARKER,
   migrateDesktopSettingsSnapshot,
   validateDesktopSettingsSnapshot,
 } from "./desktop-contract.js";
@@ -325,7 +326,17 @@ function decodeSnapshot(bytes) {
     fail("corrupt");
   }
   try {
-    return validateDesktopSettingsSnapshot(migrateDesktopSettingsSnapshot(parsed));
+    const migrated = migrateDesktopSettingsSnapshot(parsed);
+    const validated = validateDesktopSettingsSnapshot(migrated);
+    if (parsed?.schemaVersion !== validated.schemaVersion) {
+      const marked = { ...validated };
+      Object.defineProperty(marked, DESKTOP_SETTINGS_LEGACY_MIGRATION_MARKER, {
+        value: true,
+        enumerable: false,
+      });
+      return Object.freeze(marked);
+    }
+    return validated;
   } catch {
     fail("corrupt");
   }
@@ -348,7 +359,17 @@ function defaultRecordCodec() {
     },
     decodeValue(value) {
       try {
-        return validateDesktopSettingsSnapshot(migrateDesktopSettingsSnapshot(value));
+        const migrated = migrateDesktopSettingsSnapshot(value);
+        const validated = validateDesktopSettingsSnapshot(migrated);
+        if (value?.schemaVersion !== validated.schemaVersion) {
+          const marked = { ...validated };
+          Object.defineProperty(marked, DESKTOP_SETTINGS_LEGACY_MIGRATION_MARKER, {
+            value: true,
+            enumerable: false,
+          });
+          return Object.freeze(marked);
+        }
+        return validated;
       } catch {
         fail("corrupt");
       }
