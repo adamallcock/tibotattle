@@ -9,6 +9,7 @@ import {
   LOCAL_COMPANION_REPORT_FILES,
   LOCAL_COMPANION_SCHEMA_VERSION,
   LocalCompanionDataStore,
+  buildLocalCompanionQuickOverview,
   buildLocalCompanionSnapshot,
 } from "../../src/local-companion-data.js";
 import {
@@ -463,6 +464,7 @@ const API_ROUTES = new Set([
   "/api/local/identity/hosted-signin-handoff",
   "/api/local/onboarding",
   "/api/local/overview",
+  "/api/local/quick-overview",
   "/api/local/claude/quota",
   "/api/local/gradient",
   "/api/local/weekly",
@@ -4265,6 +4267,25 @@ export function createPreparedLocalCompanionServer({
             : [],
         }))
       ),
+      quickBuilder: async ({
+        previousSnapshot,
+        previousQuickOverview,
+        progress,
+      } = {}) => withLocalCollectorStateSessionBoundary({
+        platform: process.platform,
+        architecture: process.arch,
+        windowsFilesystemAdapter,
+        windowsSqliteStateSessionFactory,
+        windowsQualificationModeContext,
+        stateRoot,
+        resourceRoot,
+      }, async () => buildLocalCompanionQuickOverview({
+        collectorStateFile: statePaths.collectorStateFile,
+        previousSnapshot,
+        previousQuickOverview,
+        progress,
+        now: clock,
+      })),
     });
   }
   if (refreshRunner === undefined) {
@@ -5578,6 +5599,14 @@ export function createPreparedLocalCompanionServer({
           return;
         }
         send(response, 200, dataStore.getOverview());
+        return;
+      }
+      if (path === "/api/local/quick-overview") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        send(response, 200, await dataStore.getQuickOverview());
         return;
       }
       if (path === "/api/local/claude/quota") {

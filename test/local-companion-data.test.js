@@ -17,6 +17,7 @@ import {
   RETAINED_EVIDENCE_REFRESH_WARNING,
   RETAINED_EVIDENCE_RELABELED_WARNINGS,
   RETAINED_PROJECTION_SURFACE_PATHS,
+  buildLocalCompanionQuickOverview,
   buildLocalCompanionSnapshot,
 } from "../src/local-companion-data.js";
 import {
@@ -26,6 +27,7 @@ import {
   refreshLocalArchiveAccountingIndex,
 } from "../src/local-archive-accounting-index.js";
 import {
+  commitLocalCollectorState,
   readLocalCollectorAccountingCache,
   writeLocalCollectorAccountingCache,
 } from "../src/local-collector-state.js";
@@ -1682,6 +1684,529 @@ test("data store retains its last good snapshot when a reload fails", async () =
   await store.initialize();
   await assert.rejects(() => store.reload(), /private internal failure/);
   assert.equal(store.getOverview().marker, "last-good");
+});
+
+test("quick overview keeps current state without cloning full accounting surfaces", async () => {
+  const snapshot = {
+    schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+    mode: "real_local_evidence",
+    generatedAt: "2026-08-26T12:00:00.000Z",
+    overview: {
+      status: "live",
+      evidenceStatus: "available",
+      latestEvidenceAt: "2026-08-26T11:59:00.000Z",
+      latestObservedAt: "2026-08-26T11:59:00.000Z",
+      freshness: {
+        status: "live",
+        latestObservedAt: "2026-08-26T11:59:00.000Z",
+        ageSeconds: 60,
+        staleAfterSeconds: 1_800,
+        accountingStatus: "available",
+        accountingAgeSeconds: 30,
+      },
+      quota: {
+        status: "available",
+        observedAt: "2026-08-26T11:59:00.000Z",
+        accountAttribution: "attributed_pseudonymous",
+        windows: [{
+          limitId: "codex",
+          slot: "secondary",
+          planType: "pro",
+          usedPercent: 18,
+          remainingPercent: 82,
+          durationMinutes: 10_080,
+          resetAt: "2026-08-30T11:59:00.000Z",
+          observedAt: "2026-08-26T11:59:00.000Z",
+          status: "live",
+        }],
+        heavyQuotaDiagnostic: "QUICK_HEAVY_QUOTA_DIAGNOSTIC",
+      },
+      quotaWindows: [{
+        limitId: "codex",
+        slot: "secondary",
+        planType: "pro",
+        usedPercent: 18,
+        remainingPercent: 82,
+        durationMinutes: 10_080,
+        resetAt: "2026-08-30T11:59:00.000Z",
+        observedAt: "2026-08-26T11:59:00.000Z",
+        status: "live",
+      }],
+      collector: {
+        status: "available",
+        records: 42,
+        recordCounts: { usage: 4, quota: 2, tools: 3, other: 1 },
+        malformedLines: 0,
+        lastScanAt: "2026-08-26T11:59:00.000Z",
+        safeRecordCount: 42,
+        identityMode: "prospective_pseudonymous_not_exposed",
+        sourceMode: "content_free_collector_state",
+        indexingState: "recent_7d_partial",
+        indexing: {
+          status: "recent_7d_partial",
+          phase: "rollout_index",
+          mode: "recent_7d",
+          filesDiscovered: 10,
+          filesSelected: 8,
+          filesProcessed: 4,
+          recordsWritten: 42,
+          coveredAt: {
+            startAt: "2026-08-20T00:00:00.000Z",
+            endAt: "2026-08-26T11:59:00.000Z",
+          },
+          boundedBy: "modified_at_and_collection_start",
+        },
+        coveredAt: {
+          startAt: "2026-08-20T00:00:00.000Z",
+          endAt: "2026-08-26T11:59:00.000Z",
+        },
+        exportableCoveredAt: {
+          startAt: "2026-08-20T00:00:00.000Z",
+          endAt: "2026-08-26T11:59:00.000Z",
+        },
+        heavyCollectorDiagnostic: "QUICK_HEAVY_COLLECTOR_DIAGNOSTIC",
+      },
+      activity: {
+        safeRecordCount: 42,
+        usageEvents: 4,
+        toolEvents: 3,
+        lastScanAt: "2026-08-26T11:59:00.000Z",
+        heavyActivityDiagnostic: "QUICK_HEAVY_ACTIVITY_DIAGNOSTIC",
+      },
+      pricing: {
+        accountingSourceMode: "unified",
+        accountingGeneration: 7,
+        accountingGenerationMatched: true,
+        basis: "official_api_price_equivalent_not_subscription_allowance",
+        totalCostUsd: 12.34,
+        quotaWeightedTotalCostUsd: 14.56,
+        quotaWeightedMetricLabel: "Quota-weighted API-price equivalent",
+        quotaWeightedMetricExplainer: "A bounded explanation for the headline.",
+        periodLabel: "Last 7 days",
+        coveragePercent: 98.5,
+        eventCount: 4,
+        apiTier: "standard",
+        eventTimeHistoricalTotalUsdExact: "12.34",
+        currentPriceSensitivityTotalUsdExact: null,
+        apiServiceTier: "standard",
+        subscriptionSpeedIsSeparate: true,
+        registryVersion: "prices-v1",
+        registryObservedAt: "2026-08-01T00:00:00.000Z",
+        evidenceStartDate: "2026-07-26",
+        priceEpochBasis: "event_time_when_registry_has_effective_evidence",
+        accountingSource: "unified_local_index_replay_suppressed",
+        accountingCacheStatus: "available",
+        historyPeriodStatus: "available",
+        pricingCoverage: {
+          fullyPricedEvents: 3,
+          partiallyPricedEvents: 1,
+          unpricedEvents: 0,
+        },
+        components: [{
+          name: "input_uncached_tokens",
+          tokens: 100,
+          pricedTokens: 100,
+          unpricedTokens: 0,
+          costUsd: 1.23,
+          heavyComponentDiagnostic: "QUICK_HEAVY_COMPONENT_DIAGNOSTIC",
+        }],
+        fastMode: {
+          preference: "standard",
+          defaultPreference: "standard",
+          metricKey: "quota_weighted_api_price_equivalent",
+          metricLabel: "Quota-weighted API-price equivalent",
+          metricShortLabel: "Weighted",
+          metricExplainer: "A bounded explanation for the weighting.",
+          standardMetricKey: "standard_api_price_equivalent",
+          standardMetricLabel: "Standard API-price equivalent",
+          quotaWeightedApiPriceEquivalentUsd: 14.56,
+          standardApiPriceEquivalentUsd: 12.34,
+          unweightedUnknownApiPriceEquivalentUsd: 0,
+          weightingStatus: "complete",
+          coverage: {
+            totalEvents: 4,
+            observedEvents: 4,
+            declaredFromConfigEvents: 0,
+            assumedFromPreferenceEvents: 0,
+            inferredEvents: 0,
+            unknownEvents: 0,
+            observedSharePercent: 100,
+            unknownSharePercent: 0,
+          },
+          inference: {
+            windows: ["QUICK_HEAVY_INFERENCE_WINDOW"],
+          },
+        },
+        priceCardBreakdown: [{
+          priceCardId: "QUICK_HEAVY_PRICE_CARD",
+          events: 4,
+          costUsd: "12.34",
+        }],
+        replayExclusionDiagnostics: {
+          events: ["QUICK_HEAVY_REPLAY_DIAGNOSTIC"],
+        },
+        historyCoverage: {
+          status: "partial",
+          phase: "rollout_index",
+          errorCode: null,
+          generatedAt: "2026-08-26T11:59:00.000Z",
+          coveredAt: {
+            startAt: "2026-08-20T00:00:00.000Z",
+            endAt: "2026-08-26T11:59:00.000Z",
+          },
+          sourceCount: 10,
+          indexedSourceCount: 4,
+          pendingSourceCount: 6,
+          skippedSourceCount: 0,
+          skippedSourceBytes: 0,
+          skippedThreadCount: 0,
+          sourceBytes: 1_000,
+          indexedBytes: 400,
+          sourceMode: "unified",
+          generationMatched: true,
+        },
+      },
+      coverage: {
+        overallPercent: 98.5,
+        history: {
+          status: "partial",
+          phase: "rollout_index",
+          sourceCount: 10,
+          indexedSourceCount: 4,
+          pendingSourceCount: 6,
+          sourceBytes: 1_000,
+          indexedBytes: 400,
+          coveredAt: {
+            startAt: "2026-08-20T00:00:00.000Z",
+            endAt: "2026-08-26T11:59:00.000Z",
+          },
+        },
+      },
+      warnings: [
+        "The unified local index is still advancing.",
+        "Some usage remains unpriced.",
+      ],
+      usage: [{ events: 4, heavyUsageDiagnostic: "QUICK_HEAVY_USAGE_DIAGNOSTIC" }],
+      timeline: { usage: [{ heavyTimelineDiagnostic: "QUICK_HEAVY_TIMELINE_DIAGNOSTIC" }] },
+      accounting: {
+        periods: [{ heavyAccountingPeriod: "QUICK_HEAVY_ACCOUNTING_PERIOD" }],
+        byModel: [{ heavyModel: "QUICK_HEAVY_MODEL" }],
+        cacheSwitchImpact: { heavyCacheDetail: "QUICK_HEAVY_CACHE_DETAIL" },
+      },
+      monitoringGaps: [{ heavyMonitoringGap: "QUICK_HEAVY_MONITORING_GAP" }],
+      artifactStatus: { heavyArtifactStatus: "QUICK_HEAVY_ARTIFACT_STATUS" },
+    },
+    gradient: { heavyGradient: "QUICK_HEAVY_GRADIENT" },
+    weekly: { heavyWeekly: "QUICK_HEAVY_WEEKLY" },
+    quality: { heavyQuality: "QUICK_HEAVY_QUALITY" },
+    reports: [{ heavyReport: "QUICK_HEAVY_REPORT" }],
+  };
+  const store = new LocalCompanionDataStore({ builder: async () => snapshot });
+  await store.initialize();
+
+  const quick = store.getQuickOverview();
+  assert.equal(quick.schemaVersion, LOCAL_COMPANION_SCHEMA_VERSION);
+  assert.equal(quick.status, "live");
+  assert.equal(quick.freshness.ageSeconds, 60);
+  assert.equal(quick.quotaWindows[0].remainingPercent, 82);
+  assert.equal(quick.collector.indexing.filesProcessed, 4);
+  assert.equal(quick.activity.usageEvents, 4);
+  assert.equal(quick.pricing.totalCostUsd, 12.34);
+  assert.equal(quick.pricing.components[0].costUsd, 1.23);
+  assert.equal(quick.pricing.fastMode.weightingStatus, "complete");
+  assert.equal(quick.pricing.historyCoverage.indexedSourceCount, 4);
+  assert.equal(quick.coverage.history.pendingSourceCount, 6);
+  assert.deepEqual(quick.warnings, [
+    "The unified local index is still advancing.",
+    "Some usage remains unpriced.",
+  ]);
+
+  for (const key of [
+    "usage",
+    "timeline",
+    "accounting",
+    "monitoringGaps",
+    "artifactStatus",
+    "gradient",
+    "weekly",
+    "quality",
+    "reports",
+  ]) {
+    assert.equal(Object.hasOwn(quick, key), false, `quick projection leaked ${key}`);
+  }
+  for (const key of [
+    "inference",
+    "priceCardBreakdown",
+    "replayExclusionDiagnostics",
+  ]) {
+    assert.equal(Object.hasOwn(quick.pricing.fastMode, key), false);
+    assert.equal(Object.hasOwn(quick.pricing, key), false);
+  }
+  assert.equal(
+    JSON.stringify(quick).includes("QUICK_HEAVY"),
+    false,
+    "heavy sentinel data must not reach the quick response",
+  );
+
+  // The method is a read projection, not a reference into the retained
+  // snapshot. A caller cannot mutate later full or quick reads through it.
+  quick.freshness.status = "stale";
+  quick.quotaWindows[0].remainingPercent = 0;
+  assert.equal(store.getQuickOverview().freshness.status, "live");
+  assert.equal(store.getQuickOverview().quotaWindows[0].remainingPercent, 82);
+  assert.equal(store.getOverview().freshness.status, "live");
+  assert.equal(
+    store.getOverview().timeline.usage[0].heavyTimelineDiagnostic,
+    "QUICK_HEAVY_TIMELINE_DIAGNOSTIC",
+  );
+  assert.equal(store.getGradient().heavyGradient, "QUICK_HEAVY_GRADIENT");
+});
+
+test("quick overview bounds scalar leaves and repeated current-state rows", async () => {
+  const normalWindow = (index) => ({
+    limitId: `codex-${index}`,
+    usedPercent: index,
+    remainingPercent: 100 - index,
+    durationMinutes: 10_080,
+  });
+  const normalComponent = (index) => ({
+    name: `component-${index}`,
+    tokens: index,
+    costUsd: index / 10,
+  });
+  const snapshot = {
+    schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+    mode: { unexpected: "nested" },
+    generatedAt: "x".repeat(513),
+    overview: {
+      status: { unexpected: "nested" },
+      freshness: {
+        status: "x".repeat(513),
+        ageSeconds: Number.NaN,
+        staleAfterSeconds: Number.POSITIVE_INFINITY,
+        accountingStatus: null,
+      },
+      quota: {
+        status: "available",
+        windows: [{ limitId: "must-not-duplicate" }],
+      },
+      quotaWindows: [
+        {
+          ...normalWindow(0),
+          limitId: { unexpected: "nested" },
+          usedPercent: Number.NaN,
+        },
+        ...Array.from({ length: 16 }, (_, index) => normalWindow(index + 1)),
+      ],
+      pricing: {
+        totalCostUsd: { unexpected: "nested" },
+        currentPriceSensitivityTotalUsdExact: null,
+        components: [
+          {
+            ...normalComponent(0),
+            name: "x".repeat(513),
+            tokens: { unexpected: "nested" },
+          },
+          ...Array.from({ length: 12 }, (_, index) => normalComponent(index + 1)),
+        ],
+      },
+      warnings: [
+        "x".repeat(513),
+        ...Array.from({ length: 33 }, (_, index) => `warning-${index}`),
+      ],
+    },
+    gradient: {},
+    weekly: {},
+    quality: {},
+    reports: [],
+  };
+  const store = new LocalCompanionDataStore({ builder: async () => snapshot });
+  await store.initialize();
+
+  const quick = store.getQuickOverview();
+  assert.equal(Object.hasOwn(quick, "mode"), false);
+  assert.equal(Object.hasOwn(quick, "generatedAt"), false);
+  assert.equal(Object.hasOwn(quick, "status"), false);
+  assert.deepEqual(quick.freshness, { accountingStatus: null });
+  assert.equal(Object.hasOwn(quick.quota, "windows"), false);
+  assert.equal(quick.quotaWindows.length, 16);
+  assert.equal(Object.hasOwn(quick.quotaWindows[0], "limitId"), false);
+  assert.equal(Object.hasOwn(quick.quotaWindows[0], "usedPercent"), false);
+  assert.equal(quick.pricing.components.length, 12);
+  assert.equal(Object.hasOwn(quick.pricing.components[0], "name"), false);
+  assert.equal(Object.hasOwn(quick.pricing.components[0], "tokens"), false);
+  assert.equal(Object.hasOwn(quick.pricing, "totalCostUsd"), false);
+  assert.equal(quick.pricing.currentPriceSensitivityTotalUsdExact, null);
+  assert.equal(quick.warnings.length, 32);
+  assert.equal(quick.warnings.includes("x".repeat(513)), false);
+});
+
+test("quick overview caps windows without hiding a later normal Codex window", async () => {
+  const root = await fixtureRoot();
+  const stateFile = join(root, ".usage-monitor", "local-collector-state-v1.sqlite");
+  const resetsAt = Math.floor(Date.parse("2026-08-10T00:00:00.000Z") / 1_000);
+  const quotaWindow = ({ limitId, slot, durationMinutes }) => ({
+    limitId,
+    slot,
+    planType: "pro",
+    usedPercent: 20,
+    windowDurationMins: durationMinutes,
+    resetsAt,
+  });
+  const collectorCheckpoint = {
+    schemaVersion: "0.3",
+    collectionStartedAt: "2026-08-01T00:00:00.000Z",
+    files: {},
+    recentEventKeys: [],
+    lastQuotaObservedAt: null,
+    accountScopeMarker: null,
+    diagnostics: {},
+    indexing: {
+      mode: "recent_7d",
+      status: "recent_7d_indexing",
+      phase: "discovering",
+      boundedBy: "modified_at_and_collection_start",
+      filesDiscovered: 0,
+      filesSelected: 0,
+      filesProcessed: 0,
+      recordsWritten: 0,
+      coveredAt: { startAt: "2026-08-01T00:00:00.000Z", endAt: null },
+    },
+  };
+  try {
+    await commitLocalCollectorState({
+      stateFile,
+      checkpoint: collectorCheckpoint,
+      records: [{
+        schemaVersion: "0.3",
+        kind: "codex_quota_snapshot",
+        observedAt: "2026-08-03T00:02:00.000Z",
+        eventKey: "quota-window-cap",
+        windows: [
+          quotaWindow({ limitId: "codex", slot: "primary", durationMinutes: 300 }),
+          ...Array.from({ length: 14 }, () => quotaWindow({
+            limitId: "codex_bengalfox",
+            slot: "secondary",
+            durationMinutes: 300,
+          })),
+          quotaWindow({ limitId: "codex", slot: "secondary", durationMinutes: 10_080 }),
+        ],
+      }],
+    });
+
+    const quick = await buildLocalCompanionQuickOverview({
+      collectorStateFile: stateFile,
+      now: () => Date.parse("2026-08-03T00:03:00.000Z"),
+    });
+    assert.equal(quick.quotaWindows.length, 16);
+    assert.deepEqual(quick.quotaWindows[0], {
+      limitId: "codex",
+      slot: "secondary",
+      planType: "pro",
+      usedPercent: 20,
+      remainingPercent: 80,
+      durationMinutes: 10_080,
+      resetAt: "2026-08-10T00:00:00.000Z",
+    });
+    assert.equal(quick.quotaWindows[1].limitId, "codex");
+    assert.equal(quick.quotaWindows[1].durationMinutes, 300);
+
+    await commitLocalCollectorState({
+      stateFile,
+      checkpoint: collectorCheckpoint,
+      records: [{
+        schemaVersion: "0.3",
+        kind: "codex_quota_snapshot",
+        observedAt: "2026-08-03T00:02:30.000Z",
+        eventKey: "quota-window-over-cap",
+        windows: Array.from({ length: 17 }, () => quotaWindow({
+          limitId: "codex",
+          slot: "secondary",
+          durationMinutes: 10_080,
+        })),
+      }],
+    });
+    const overCap = await buildLocalCompanionQuickOverview({
+      collectorStateFile: stateFile,
+      now: () => Date.parse("2026-08-03T00:03:00.000Z"),
+    });
+    assert.equal(overCap.quota.status, "unavailable");
+    assert.deepEqual(overCap.quotaWindows, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("dedicated quick reload never re-enters the full snapshot builder", async () => {
+  let fullBuilds = 0;
+  let quickBuilds = 0;
+  let receivedProgress = null;
+  const fullSnapshot = {
+    schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+    mode: "real_local_evidence",
+    generatedAt: "2026-08-26T12:00:00.000Z",
+    overview: {
+      status: "live",
+      freshness: { status: "live" },
+      timeline: {
+        usage: [{ heavyTimeline: "must remain outside quick reload" }],
+      },
+      accounting: {
+        byModel: [{ heavyAccounting: "must remain outside quick reload" }],
+      },
+    },
+    gradient: { heavyGradient: "must remain outside quick reload" },
+    weekly: { heavyWeekly: "must remain outside quick reload" },
+    quality: {},
+    reports: [],
+  };
+  const store = new LocalCompanionDataStore({
+    builder: async () => {
+      fullBuilds += 1;
+      return fullSnapshot;
+    },
+    quickBuilder: async ({ progress, previousSnapshot }) => {
+      quickBuilds += 1;
+      receivedProgress = progress;
+      assert.equal(previousSnapshot.overview.timeline.usage[0].heavyTimeline,
+        "must remain outside quick reload");
+      return {
+        schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+        mode: "real_local_evidence",
+        generatedAt: "2026-08-26T12:01:00.000Z",
+        status: "live",
+        freshness: { status: "live" },
+        collector: {
+          indexing: progress,
+        },
+        quotaWindows: [],
+        pricing: {},
+        coverage: {},
+        warnings: [],
+      };
+    },
+  });
+
+  await store.initialize();
+  await store.reloadQuick({
+    progress: {
+      status: "recent_7d_indexing",
+      phase: "quick_result",
+      filesDiscovered: 9,
+      filesSelected: 9,
+      filesProcessed: 3,
+      recordsWritten: 4,
+      mode: "recent_7d",
+      boundedBy: "modified_at_and_collection_start",
+    },
+  });
+
+  assert.equal(fullBuilds, 1);
+  assert.equal(quickBuilds, 1);
+  assert.equal(receivedProgress.phase, "quick_result");
+  assert.equal(store.getQuickOverview().collector.indexing.filesProcessed, 3);
+  assert.equal(Object.hasOwn(store.getQuickOverview(), "timeline"), false);
+  assert.equal(Object.hasOwn(store.getQuickOverview(), "accounting"), false);
 });
 
 test("a deferred quick reload keeps the projection surfaces it cannot rebuild", async () => {

@@ -1585,6 +1585,15 @@ setTimeout(() => process.exit(3), 15_000);
 test("loopback server exposes only fixed API, static, and report routes", async () => {
   const files = await fixture();
   const store = fakeStore();
+  const quickOverview = {
+    schemaVersion: "local-quick-overview-v0.1",
+    status: "ready",
+    allowance: {
+      remainingPercent: 82,
+      observedAt: "2026-08-26T12:00:00.000Z",
+    },
+  };
+  store.getQuickOverview = () => quickOverview;
   const app = await startLocalCompanionServer({
     resourceRoot: files.resourceRoot,
     stateRoot: files.stateRoot,
@@ -1657,6 +1666,22 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     assert.equal(overview.status, 200);
     assert.equal((await overview.json()).mode, "real_local_evidence");
 
+    const quickOverviewResponse = await fetch(
+      `${base}/api/local/quick-overview`,
+    );
+    assert.equal(quickOverviewResponse.status, 200);
+    assert.deepEqual(await quickOverviewResponse.json(), quickOverview);
+    assert.equal(
+      (await fetch(`${base}/api/local/quick-overview`, {
+        method: "POST",
+      })).status,
+      405,
+    );
+    assert.equal(
+      (await fetch(`${base}/api/local/quick-overview?path=/Users/private`)).status,
+      400,
+    );
+
     const page = await fetch(`${base}/`);
     assert.equal(page.status, 200);
     const pageBody = await page.text();
@@ -1720,6 +1745,68 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     assert.equal((await fetch(`${base}/index.html`)).status, 404);
   } finally {
     await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("quick overview waits for the snapshot and rejects a forged host", async () => {
+  const files = await fixture();
+  const buildStarted = deferred();
+  const buildBarrier = deferred();
+  const quickOverview = {
+    schemaVersion: "local-quick-overview-v0.1",
+    status: "ready",
+    allowance: {
+      remainingPercent: 82,
+      observedAt: "2026-08-26T12:00:00.000Z",
+    },
+  };
+  const store = {
+    ...fakeStore(),
+    async initialize() {
+      buildStarted.resolve();
+      await buildBarrier.promise;
+    },
+    getQuickOverview() {
+      return quickOverview;
+    },
+  };
+  let app;
+  try {
+    app = await startLocalCompanionServer({
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      dataStore: store,
+      refreshRunner: async () => ({}),
+      port: 0,
+    });
+    await buildStarted.promise;
+    const base = `http://127.0.0.1:${app.port}`;
+    let settled = false;
+    const pending = fetch(`${base}/api/local/quick-overview`).then((response) => {
+      settled = true;
+      return response;
+    });
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+    assert.equal(settled, false);
+
+    const forgedHost = await rawRequest({
+      port: app.port,
+      path: "/api/local/quick-overview",
+      headers: { Host: "attacker.example" },
+    });
+    assert.equal(forgedHost.status, 403);
+    assert.equal(JSON.parse(forgedHost.body).error.code, "host_not_allowed");
+
+    buildBarrier.resolve();
+    const response = await pending;
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), quickOverview);
+  } finally {
+    buildBarrier.resolve();
+    await app?.close();
     await rm(files.root, { recursive: true });
   }
 });

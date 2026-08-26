@@ -5931,7 +5931,10 @@ test("local analysis exposes quick results and cancel-safe progress", async () =
     appSource,
     /await loadQuickResultDashboard\(\{ lightweight: electronRefresh \}\)/u,
   );
-  assert.match(appSource, /function renderDashboardFrame\(data\)/u);
+  assert.match(
+    appSource,
+    /function renderDashboardFrame\(data, \{ quick = false \} = \{\}\)/u,
+  );
   assert.match(appSource, /function renderQuickResultDashboard\(data\)/u);
   assert.match(
     appSource,
@@ -13529,16 +13532,18 @@ ${chain}`,
 
 async function communityIndexJourneyStageFor(history, latestObservedAt = null) {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  const renderStart = appSource.indexOf("function renderCommunityJourney() {");
+  const renderStart = appSource.indexOf(
+    "function renderCommunityJourney(data = dashboard) {",
+  );
   const start = appSource.indexOf(
-    "  const history = dashboard?.pricing?.historyCoverage",
+    "  const history = data?.pricing?.historyCoverage",
     renderStart,
   );
   const end = appSource.indexOf("\n\n  // 2 — sign in", start);
   assert.ok(start >= 0 && end > start, "the community journey index stage is available");
   const staged = [];
   Function(
-    "dashboard", "finite", "formatLocal", "formatNumber", "stage",
+    "data", "finite", "formatLocal", "formatNumber", "stage",
     appSource.slice(start, end),
   )(
     {

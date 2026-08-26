@@ -13,6 +13,7 @@ import {
   isFastModePreference,
   summarizeQuotaWeightedAccounting,
 } from "@app-usagemonitor/accounting";
+import { isValidQuotaWindowDuration } from "@app-usagemonitor/quota-analysis";
 import { codexPrimaryAllowanceBasis } from "./codex-primary-allowance-basis.js";
 import { declaredSpeedModeAt } from "./codex-speed-baseline.js";
 import {
@@ -33,7 +34,6 @@ import {
   KNOWN_SURFACES,
   KNOWN_TOOL_CLASSES,
   newUsagePeriod,
-  orderQuotaWindows,
   quotaWindowProjection,
   safeSpeed,
   safeSpeedWeighting,
@@ -61,6 +61,7 @@ import {
   defaultLocalCollectorStatePath,
   forEachLocalCollectorRecord,
   prepareLocalCollectorState,
+  readLocalCollectorLatestQuotaRecord,
   readLocalCollectorRecordSummary,
   readLocalCollectorState,
 } from "./local-collector-state.js";
@@ -1787,18 +1788,78 @@ async function readCollectorIndexProjection(stateFile, collector) {
   };
 }
 
+function quickQuotaWindowCandidate(window, index) {
+  if (!window || typeof window !== "object" || Array.isArray(window)) return null;
+  const usedPercent = finiteNumber(window.usedPercent);
+  if (usedPercent === null || usedPercent < 0 || usedPercent > 100
+      || !isValidQuotaWindowDuration(window.windowDurationMins)
+      || !Number.isSafeInteger(window.resetsAt)
+      || window.resetsAt <= 0
+      || window.resetsAt > MAX_QUOTA_RESET_EPOCH_SECONDS) {
+    return null;
+  }
+  return {
+    index,
+    window,
+    durationMinutes: window.windowDurationMins,
+    limitId: window.limitId === "codex" ? "codex" : "other",
+    slot: window.slot === "primary" ? "primary" : "other",
+  };
+}
+
+function preferredQuickQuotaWindow(left, right) {
+  if (right.limitId !== "codex") return left;
+  if (left === null
+      || right.durationMinutes > left.durationMinutes
+      || (right.durationMinutes === left.durationMinutes
+        && right.slot === "primary"
+        && left.slot !== "primary")) {
+    return right;
+  }
+  return left;
+}
+
+// A malformed provider record may contain a long windows array. Scan its
+// primitive selection keys to preserve the same normal-Codex winner that
+// orderQuotaWindows() would choose, but only run the full projection for the
+// winner plus the first deterministic remaining candidates. In particular, a
+// later weekly Codex window cannot be hidden behind an earlier 16-row cap.
+function boundedLatestQuotaWindows(value) {
+  if (!Array.isArray(value)) return [];
+  // A record containing more candidate windows than the quick contract can
+  // represent is unavailable, not a prefix. Prefixing would let a later
+  // normal Codex window disappear behind hostile filler rows.
+  if (value.length > QUICK_MAX_QUOTA_CANDIDATES) return [];
+  let selected = null;
+  for (let index = 0; index < value.length; index += 1) {
+    const candidate = quickQuotaWindowCandidate(value[index], index);
+    if (candidate === null) continue;
+    selected = preferredQuickQuotaWindow(selected, candidate);
+  }
+  const candidates = [];
+  if (selected !== null && selected.limitId === "codex") {
+    candidates.push(selected);
+  }
+  for (let index = 0;
+    index < value.length && candidates.length < QUICK_MAX_QUOTA_CANDIDATES;
+    index += 1) {
+    if (selected !== null && index === selected.index) continue;
+    const candidate = quickQuotaWindowCandidate(value[index], index);
+    if (candidate !== null) candidates.push(candidate);
+  }
+  return candidates.flatMap((candidate) => {
+    const projected = quotaWindowProjection(candidate.window);
+    return projected === null ? [] : [projected];
+  });
+}
+
 function latestQuotaProjection(records) {
   const latest = records
     .filter((record) => record.kind === "codex_quota_snapshot" && validObservedAt(record) !== null)
     .sort((left, right) => left.observedAt.localeCompare(right.observedAt))
     .at(-1);
   if (!latest) return { status: "unavailable", observedAt: null, windows: [] };
-  const windows = Array.isArray(latest.windows)
-    ? orderQuotaWindows(latest.windows.flatMap((window) => {
-      const projected = quotaWindowProjection(window);
-      return projected === null ? [] : [projected];
-    }))
-    : [];
+  const windows = boundedLatestQuotaWindows(latest.windows);
   return {
     status: windows.length > 0 ? "available" : "unavailable",
     observedAt: safeText(latest.observedAt),
@@ -3547,13 +3608,478 @@ export const RETAINED_PROJECTION_SURFACE_PATHS = Object.freeze(
   PROJECTION_SURFACES.map((surface) => surface.path.join(".")),
 );
 
+// The Electron quick-result route is deliberately a different read from the
+// full dashboard projection. A refresh can publish the quick result while the
+// unified index is still doing its expensive accounting pass; cloning the
+// complete overview at that point puts the same large timelines, period/model
+// tables, and cache diagnostics back on the companion's control path. Keep
+// this list explicit so a new full-projection field cannot silently turn the
+// quick route into another full snapshot.
+const QUICK_SIMPLE_FIELDS = Object.freeze([
+  "status",
+  "evidenceStatus",
+  "latestEvidenceAt",
+  "latestObservedAt",
+]);
+const QUICK_ROOT_FIELDS = Object.freeze([
+  "schemaVersion",
+  "mode",
+  "generatedAt",
+]);
+const QUICK_FRESHNESS_FIELDS = Object.freeze([
+  "status",
+  "latestObservedAt",
+  "ageSeconds",
+  "staleAfterSeconds",
+  "accountingStatus",
+  "accountingAgeSeconds",
+]);
+const QUICK_DATE_RANGE_FIELDS = Object.freeze(["startAt", "endAt"]);
+const QUICK_INDEXING_FIELDS = Object.freeze([
+  "status",
+  "phase",
+  "mode",
+  "filesDiscovered",
+  "filesSelected",
+  "filesProcessed",
+  "recordsWritten",
+  "boundedBy",
+]);
+const QUICK_COLLECTOR_FIELDS = Object.freeze([
+  "status",
+  "records",
+  "malformedLines",
+  "lastScanAt",
+  "safeRecordCount",
+  "identityMode",
+  "sourceMode",
+  "indexingState",
+]);
+const QUICK_RECORD_COUNT_FIELDS = Object.freeze([
+  "usage",
+  "quota",
+  "tools",
+  "other",
+]);
+const QUICK_QUOTA_FIELDS = Object.freeze([
+  "status",
+  "observedAt",
+  "accountAttribution",
+]);
+const QUICK_QUOTA_WINDOW_FIELDS = Object.freeze([
+  "id",
+  "limitId",
+  "slot",
+  "planType",
+  "usedPercent",
+  "remainingPercent",
+  "durationMinutes",
+  "resetAt",
+  "observedAt",
+  "precision",
+  "accountAttribution",
+  "status",
+]);
+const QUICK_ACTIVITY_FIELDS = Object.freeze([
+  "safeRecordCount",
+  "usageEvents",
+  "toolEvents",
+  "lastScanAt",
+]);
+const QUICK_FAST_MODE_FIELDS = Object.freeze([
+  "preference",
+  "defaultPreference",
+  "metricKey",
+  "metricLabel",
+  "metricShortLabel",
+  "metricExplainer",
+  "standardMetricKey",
+  "standardMetricLabel",
+  "quotaWeightedApiPriceEquivalentUsd",
+  "standardApiPriceEquivalentUsd",
+  "unweightedUnknownApiPriceEquivalentUsd",
+  "weightingStatus",
+]);
+const QUICK_FAST_MODE_COVERAGE_FIELDS = Object.freeze([
+  "totalEvents",
+  "observedEvents",
+  "declaredFromConfigEvents",
+  "assumedFromPreferenceEvents",
+  "inferredEvents",
+  "unknownEvents",
+  "observedSharePercent",
+  "unknownSharePercent",
+]);
+const QUICK_PRICING_FIELDS = Object.freeze([
+  "accountingSourceMode",
+  "accountingGeneration",
+  "accountingGenerationMatched",
+  "basis",
+  "totalCostUsd",
+  "quotaWeightedTotalCostUsd",
+  "quotaWeightedMetricLabel",
+  "quotaWeightedMetricExplainer",
+  "periodLabel",
+  "coveragePercent",
+  "eventCount",
+  "apiTier",
+  "eventTimeHistoricalTotalUsdExact",
+  "currentPriceSensitivityTotalUsdExact",
+  "apiServiceTier",
+  "subscriptionSpeedIsSeparate",
+  "registryVersion",
+  "registryObservedAt",
+  "evidenceStartDate",
+  "priceEpochBasis",
+  "accountingSource",
+  "accountingCacheStatus",
+  "historyPeriodStatus",
+]);
+const QUICK_PRICING_COVERAGE_FIELDS = Object.freeze([
+  "fullyPricedEvents",
+  "partiallyPricedEvents",
+  "unpricedEvents",
+]);
+const QUICK_COMPONENT_FIELDS = Object.freeze([
+  "name",
+  "tokens",
+  "pricedTokens",
+  "unpricedTokens",
+  "costUsd",
+]);
+const QUICK_HISTORY_COVERAGE_FIELDS = Object.freeze([
+  "status",
+  "phase",
+  "errorCode",
+  "generatedAt",
+  "sourceCount",
+  "indexedSourceCount",
+  "pendingSourceCount",
+  "skippedSourceCount",
+  "skippedSourceBytes",
+  "skippedThreadCount",
+  "sourceBytes",
+  "indexedBytes",
+  "sourceMode",
+  "generationMatched",
+]);
+const QUICK_COVERAGE_FIELDS = Object.freeze(["overallPercent"]);
+const QUICK_MAX_STRING_LENGTH = 512;
+const QUICK_MAX_QUOTA_WINDOWS = 16;
+const QUICK_MAX_PRICING_COMPONENTS = 12;
+const QUICK_MAX_WARNINGS = 32;
+const QUICK_MAX_QUOTA_CANDIDATES = QUICK_MAX_QUOTA_WINDOWS;
+const MAX_QUOTA_RESET_EPOCH_SECONDS = 8_640_000_000_000;
+
+// This route is a control-path response, not a generic clone of selected
+// fields. Keep every leaf scalar and bounded: an unexpected nested value or
+// large string must be omitted rather than making the quick response costly
+// to clone/serialize or widening its public shape.
+function quickScalar(value) {
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value === "string") {
+    return value.length <= QUICK_MAX_STRING_LENGTH ? value : undefined;
+  }
+  return undefined;
+}
+
+function quickFields(value, fields) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const projected = {};
+  for (const field of fields) {
+    if (!Object.hasOwn(value, field)) continue;
+    const scalar = quickScalar(value[field]);
+    if (scalar !== undefined) projected[field] = scalar;
+  }
+  return projected;
+}
+
+function quickDateRange(value) {
+  return quickFields(value, QUICK_DATE_RANGE_FIELDS);
+}
+
+function quickHistoryCoverage(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const projected = quickFields(value, QUICK_HISTORY_COVERAGE_FIELDS);
+  if (Object.hasOwn(value, "coveredAt")) {
+    projected.coveredAt = quickDateRange(value.coveredAt);
+  }
+  return projected;
+}
+
+function quickIndexing(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const projected = quickFields(value, QUICK_INDEXING_FIELDS);
+  if (Object.hasOwn(value, "coveredAt")) {
+    projected.coveredAt = quickDateRange(value.coveredAt);
+  }
+  return projected;
+}
+
+function quickQuotaWindow(value) {
+  return quickFields(value, QUICK_QUOTA_WINDOW_FIELDS);
+}
+
+function quickQuota(value, { includeWindows = true } = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const projected = quickFields(value, QUICK_QUOTA_FIELDS);
+  if (includeWindows && Array.isArray(value.windows)) {
+    projected.windows = value.windows
+      .slice(0, QUICK_MAX_QUOTA_WINDOWS)
+      .map(quickQuotaWindow);
+  }
+  return projected;
+}
+
+function quickCollector(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const projected = quickFields(value, QUICK_COLLECTOR_FIELDS);
+  if (Object.hasOwn(value, "recordCounts")) {
+    projected.recordCounts = quickFields(value.recordCounts, QUICK_RECORD_COUNT_FIELDS);
+  }
+  if (Object.hasOwn(value, "indexing")) {
+    projected.indexing = quickIndexing(value.indexing);
+  }
+  if (Object.hasOwn(value, "coveredAt")) {
+    projected.coveredAt = quickDateRange(value.coveredAt);
+  }
+  if (Object.hasOwn(value, "exportableCoveredAt")) {
+    projected.exportableCoveredAt = quickDateRange(value.exportableCoveredAt);
+  }
+  return projected;
+}
+
+function quickFastMode(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const projected = quickFields(value, QUICK_FAST_MODE_FIELDS);
+  if (Object.hasOwn(value, "coverage")) {
+    projected.coverage = quickFields(value.coverage, QUICK_FAST_MODE_COVERAGE_FIELDS);
+  }
+  return projected;
+}
+
+function quickPricing(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const projected = quickFields(value, QUICK_PRICING_FIELDS);
+  if (Object.hasOwn(value, "fastMode")) {
+    projected.fastMode = quickFastMode(value.fastMode);
+  }
+  if (Object.hasOwn(value, "pricingCoverage")) {
+    projected.pricingCoverage = quickFields(
+      value.pricingCoverage,
+      QUICK_PRICING_COVERAGE_FIELDS,
+    );
+  }
+  if (Array.isArray(value.components)) {
+    projected.components = value.components
+      .slice(0, QUICK_MAX_PRICING_COMPONENTS)
+      .map((component) => quickFields(component, QUICK_COMPONENT_FIELDS));
+  }
+  if (Object.hasOwn(value, "historyCoverage")) {
+    projected.historyCoverage = quickHistoryCoverage(value.historyCoverage);
+  }
+  return projected;
+}
+
+function quickCoverage(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const projected = quickFields(value, QUICK_COVERAGE_FIELDS);
+  if (Object.hasOwn(value, "history")) {
+    projected.history = quickHistoryCoverage(value.history);
+  }
+  return projected;
+}
+
+function quickOverviewProjection(snapshot) {
+  const overview = snapshot?.overview
+    ?? (snapshot && typeof snapshot === "object" && !Array.isArray(snapshot)
+      ? snapshot
+      : null);
+  if (!overview || typeof overview !== "object" || Array.isArray(overview)) {
+    return quickFields(snapshot, QUICK_ROOT_FIELDS);
+  }
+  const hasTopLevelQuotaWindows = Object.hasOwn(overview, "quotaWindows");
+  return {
+    ...quickFields(snapshot, QUICK_ROOT_FIELDS),
+    ...quickFields(overview, QUICK_SIMPLE_FIELDS),
+    freshness: quickFields(overview.freshness, QUICK_FRESHNESS_FIELDS),
+    quota: quickQuota(overview.quota, {
+      includeWindows: !hasTopLevelQuotaWindows,
+    }),
+    quotaWindows: Array.isArray(overview.quotaWindows)
+      ? overview.quotaWindows
+        .slice(0, QUICK_MAX_QUOTA_WINDOWS)
+        .map(quickQuotaWindow)
+      : [],
+    collector: quickCollector(overview.collector),
+    activity: quickFields(overview.activity, QUICK_ACTIVITY_FIELDS),
+    pricing: quickPricing(overview.pricing),
+    coverage: quickCoverage(overview.coverage),
+    warnings: Array.isArray(overview.warnings)
+      ? overview.warnings
+        .filter((warning) => (
+          typeof warning === "string" && warning.length <= QUICK_MAX_STRING_LENGTH
+        ))
+        .slice(0, QUICK_MAX_WARNINGS)
+      : [],
+  };
+}
+
+function quickCollectorFreshness(latestObservedAt, nowMs) {
+  if (latestObservedAt === null) {
+    return {
+      status: "unavailable",
+      ageSeconds: null,
+    };
+  }
+  const observedAtMs = Date.parse(latestObservedAt);
+  if (!Number.isFinite(observedAtMs)) {
+    return {
+      status: "unavailable",
+      ageSeconds: null,
+    };
+  }
+  const ageSeconds = Math.max(
+    0,
+    Math.round((nowMs - observedAtMs) / 1_000),
+  );
+  return {
+    status: ageSeconds * 1_000 <= MAX_COLLECTOR_LIVE_AGE_MS
+      ? "live"
+      : "stale",
+    ageSeconds,
+  };
+}
+
+/**
+ * Build the small, current observation needed at the refresh quick-result
+ * boundary. Unlike buildLocalCompanionSnapshot(), this deliberately never
+ * reads a replay-safe accounting cache, legacy report artifact, unified
+ * index, timeline, or accounting/model table. It makes one indexed SQLite
+ * read for the latest quota record and carries forward previously verified
+ * scalar facts until the terminal full projection replaces them.
+ *
+ * The headline's accounting provenance is carried from the last full
+ * snapshot. It remains a prior verified value until the terminal full pass
+ * replaces it; this function must not manufacture fresh accounting while the
+ * index is running.
+ */
+export async function buildLocalCompanionQuickOverview({
+  collectorStateFile = defaultLocalCollectorStatePath(),
+  previousSnapshot = null,
+  previousQuickOverview = null,
+  progress = null,
+  now = () => Date.now(),
+} = {}) {
+  if (typeof collectorStateFile !== "string" || collectorStateFile.length < 1
+      || typeof now !== "function") {
+    throw new TypeError("Local companion quick overview options are invalid");
+  }
+  const nowMs = now();
+  if (!Number.isFinite(nowMs)) {
+    throw new TypeError("now must return a finite epoch timestamp");
+  }
+  const latestQuota = await readLocalCollectorLatestQuotaRecord({
+    stateFile: collectorStateFile,
+    maximumObservedAtMs: Math.min(
+      Number.MAX_SAFE_INTEGER,
+      Math.floor(nowMs + 5 * 60_000),
+    ),
+  });
+  if (!["available", "missing"].includes(latestQuota.status)) {
+    throw fixedError("collector_unavailable");
+  }
+
+  const baseline = quickOverviewProjection(
+    previousQuickOverview ?? previousSnapshot ?? {},
+  );
+  const observedQuota = latestQuotaProjection(
+    latestQuota.record === null ? [] : [latestQuota.record],
+  );
+  const quota = observedQuota.observedAt === null
+    ? {
+      ...quickQuota(baseline.quota, { includeWindows: false }),
+      windows: Array.isArray(baseline.quotaWindows)
+        ? baseline.quotaWindows.map(quickQuotaWindow)
+        : [],
+    }
+    : observedQuota;
+  const latestObservedAt = quota.observedAt
+    ?? baseline.latestObservedAt
+    ?? baseline.freshness?.latestObservedAt
+    ?? null;
+  const freshness = quickCollectorFreshness(latestObservedAt, nowMs);
+  const currentIndexing = quickIndexing(progress);
+  const retainedIndexing = quickIndexing(baseline.collector?.indexing);
+  const indexing = Object.keys(currentIndexing).length > 0
+    ? currentIndexing
+    : retainedIndexing;
+  const retainedCollector = quickCollector(baseline.collector);
+  const retainedActivity = quickFields(baseline.activity, QUICK_ACTIVITY_FIELDS);
+  const evidenceStatus = quota.observedAt !== null
+    ? "available"
+    : baseline.evidenceStatus ?? "unavailable";
+
+  return {
+    schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+    mode: baseline.mode === "demo" ? "demo" : "real_local_evidence",
+    generatedAt: new Date(nowMs).toISOString(),
+    status: freshness.status,
+    evidenceStatus,
+    latestEvidenceAt: latestObservedAt ?? baseline.latestEvidenceAt ?? null,
+    latestObservedAt,
+    freshness: {
+      status: freshness.status,
+      latestObservedAt,
+      ageSeconds: freshness.ageSeconds,
+      staleAfterSeconds: MAX_COLLECTOR_LIVE_AGE_MS / 1_000,
+      accountingStatus: baseline.freshness?.accountingStatus ?? "unavailable",
+      accountingAgeSeconds:
+        baseline.freshness?.accountingAgeSeconds ?? null,
+    },
+    quota: quickQuota(quota, { includeWindows: false }),
+    quotaWindows: quota.windows
+      .slice(0, QUICK_MAX_QUOTA_WINDOWS)
+      .map(quickQuotaWindow),
+    collector: {
+      ...retainedCollector,
+      status: latestQuota.status === "missing"
+        && Object.keys(retainedCollector).length === 0
+        ? "missing"
+        : retainedCollector.status ?? "available",
+      lastScanAt: retainedCollector.lastScanAt ?? latestObservedAt,
+      indexingState: indexing.status ?? retainedCollector.indexingState ?? "not_started",
+      indexing,
+    },
+    activity: {
+      ...retainedActivity,
+      lastScanAt: retainedActivity.lastScanAt ?? latestObservedAt,
+    },
+    pricing: quickPricing(baseline.pricing),
+    coverage: quickCoverage(baseline.coverage),
+    // The terminal full projection owns refreshed warnings. Omit a possibly
+    // stale warning rather than asserting it describes the new pass.
+    warnings: [],
+  };
+}
+
 export class LocalCompanionDataStore {
   #builder;
+  #quickBuilder;
+  #quickOverview = null;
   #snapshot = null;
 
-  constructor({ builder = buildLocalCompanionSnapshot } = {}) {
-    if (typeof builder !== "function") throw new TypeError("builder must be a function");
+  constructor({
+    builder = buildLocalCompanionSnapshot,
+    quickBuilder = null,
+  } = {}) {
+    if (typeof builder !== "function"
+        || (quickBuilder !== null && typeof quickBuilder !== "function")) {
+      throw new TypeError("Local companion data builders are invalid");
+    }
     this.#builder = builder;
+    this.#quickBuilder = quickBuilder;
   }
 
   async initialize(options) {
@@ -3570,7 +4096,29 @@ export class LocalCompanionDataStore {
       structuredClone(candidate),
       options,
     );
+    this.#quickOverview = quickOverviewProjection(this.#snapshot);
     return this.getOverview();
+  }
+
+  // The refresh quick-result must not route through reload(): that method
+  // constructs and clones every dashboard surface before this small response
+  // can be published. A configured quick builder returns only the bounded
+  // current-state contract; old callers without one retain the last verified
+  // quick projection rather than silently falling back to the expensive path.
+  async reloadQuick(options = {}) {
+    if (this.#snapshot === null) throw fixedError("snapshot_unavailable");
+    if (this.#quickBuilder === null) return this.getQuickOverview();
+    const candidate = await this.#quickBuilder({
+      ...options,
+      previousSnapshot: this.#snapshot,
+      previousQuickOverview: this.#quickOverview,
+    });
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)
+        || candidate.schemaVersion !== LOCAL_COMPANION_SCHEMA_VERSION) {
+      throw fixedError("quick_snapshot_invalid");
+    }
+    this.#quickOverview = quickOverviewProjection(candidate);
+    return this.getQuickOverview();
   }
 
   // A quick reload exists to surface fast-moving figures (quota, pace) as soon
@@ -3717,6 +4265,15 @@ export class LocalCompanionDataStore {
       generatedAt: snapshot.generatedAt,
       ...structuredClone(snapshot.overview),
     };
+  }
+
+  // Return only the small, current-state projection needed to paint an
+  // Electron quick result while the full accounting snapshot is still being
+  // rebuilt. This must remain independent from getOverview(): the latter is
+  // the established full dashboard contract and callers rely on its complete
+  // timelines, accounting periods/models, and diagnostic surfaces.
+  getQuickOverview() {
+    return quickOverviewProjection(this.#quickOverview ?? this.#required());
   }
 
   getGradient() {

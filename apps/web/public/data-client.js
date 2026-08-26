@@ -9,6 +9,9 @@
  * Split endpoint aliases are supported while the local server evolves:
  *   /api/local/{onboarding,overview,gradient,weekly,quality,reports}
  *
+ * Electron quick-result contract:
+ *   GET  /api/local/quick-overview
+ *
  * Central contribution contract:
  *   POST /api/v1/contributions
  *   POST /api/v1/me/contributions/read
@@ -5787,6 +5790,17 @@ export class LocalCompanionClient {
     ]));
     if (!fragments.overview) throw new Error("The local companion did not return an overview.");
     return normalizeDashboardPayload({}, fragments);
+  }
+
+  // The Electron quick-result phase must not ask the companion to serialize
+  // the full dashboard while the unified index is still accounting. Keep this
+  // as a separate, fixed same-origin capability: there is deliberately no
+  // fallback to load(), because falling back would put the expensive full
+  // projection back on the Electron control path.
+  async loadQuick() {
+    return normalizeDashboardPayload(
+      await fetchJson(this.fetchImpl, `${LOCAL_ROOT}/quick-overview`),
+    );
   }
 
   health() {

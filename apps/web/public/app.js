@@ -120,6 +120,128 @@ const communityClient = new CommunityClient({
 });
 
 let dashboard = null;
+// A quick-result payload is intentionally smaller than the complete
+// dashboard. Keep it separate so a locale change or a control interaction
+// can never feed that partial object back through the full renderer. The
+// last complete dashboard remains the source for full-page controls until a
+// terminal refresh replaces it.
+let quickDashboard = null;
+
+// A quick result is useful enough to show while the companion finishes the
+// unified-index pass, but it does not contain the rows needed by the charts,
+// share card, or accounting tables. Keep every control that would ask one of
+// those renderers to run in an honest busy state until a complete dashboard
+// replaces the partial result. We use aria-disabled rather than the native
+// disabled property so a focused control does not disappear from the keyboard
+// order; the event handlers and renderer entry points below still fail closed.
+const QUICK_DASHBOARD_CONTROL_ROOTS = Object.freeze([
+  "#range-controls",
+  "#usage-group-controls",
+  "#usage-pan-back",
+  "#usage-zoom-out",
+  "#usage-zoom-in",
+  "#usage-reset-zoom",
+  "#usage-pan-forward",
+  "#calibration-range-controls",
+  "#timeline-pan-back",
+  "#timeline-zoom-out",
+  "#timeline-zoom-in",
+  "#timeline-reset-zoom",
+  "#timeline-pan-forward",
+  "#weekly-range-controls",
+  "#weekly-span-control",
+  "#accounting-period-controls",
+  "#residual-page-prev",
+  "#residual-page-next",
+  "#weekly-table-prev",
+  "#weekly-table-next",
+  "#accounting-model-page-prev",
+  "#accounting-model-page-next",
+  "#cache-switch-page-prev",
+  "#cache-switch-page-next",
+  "#cache-continuity-page-prev",
+  "#cache-continuity-page-next",
+  "#side-chat-page-prev",
+  "#side-chat-page-next",
+  "#side-chat-historical-gap-focus",
+  "#share-card-download",
+  "#share-card-copy",
+]);
+const quickDashboardControlStates = new Map();
+
+function quickDashboardControlElements() {
+  const elements = new Set();
+  for (const selector of QUICK_DASHBOARD_CONTROL_ROOTS) {
+    const root = $(selector);
+    if (!root) continue;
+    elements.add(root);
+    if (typeof root.querySelectorAll !== "function") continue;
+    for (const child of root.querySelectorAll("button, input")) {
+      elements.add(child);
+    }
+  }
+  return elements;
+}
+
+function rememberQuickDashboardControlState(element) {
+  if (quickDashboardControlStates.has(element)) return;
+  quickDashboardControlStates.set(element, {
+    ariaDisabled: element.getAttribute("aria-disabled"),
+    ariaBusy: element.getAttribute("aria-busy"),
+    marker: element.getAttribute("data-quick-dashboard-busy"),
+  });
+}
+
+function restoreQuickDashboardControlState(element, state) {
+  for (const [name, value] of [
+    ["aria-disabled", state.ariaDisabled],
+    ["aria-busy", state.ariaBusy],
+    ["data-quick-dashboard-busy", state.marker],
+  ]) {
+    if (value === null) element.removeAttribute(name);
+    else element.setAttribute(name, value);
+  }
+}
+
+function syncQuickDashboardControls() {
+  const busy = quickDashboard !== null;
+  const roots = new Set();
+  for (const selector of QUICK_DASHBOARD_CONTROL_ROOTS) {
+    const root = $(selector);
+    if (root) roots.add(root);
+  }
+  for (const element of quickDashboardControlElements()) {
+    if (busy) {
+      rememberQuickDashboardControlState(element);
+      element.setAttribute("aria-disabled", "true");
+      element.setAttribute("data-quick-dashboard-busy", "true");
+    }
+  }
+  for (const root of roots) {
+    if (busy) {
+      rememberQuickDashboardControlState(root);
+      root.setAttribute("aria-busy", "true");
+    }
+  }
+  if (typeof document?.documentElement?.setAttribute === "function") {
+    if (busy) {
+      document.documentElement.setAttribute("data-quick-dashboard-busy", "true");
+    } else {
+      document.documentElement.removeAttribute("data-quick-dashboard-busy");
+    }
+  }
+  if (!busy) {
+    for (const [element, state] of quickDashboardControlStates) {
+      restoreQuickDashboardControlState(element, state);
+    }
+    quickDashboardControlStates.clear();
+  }
+}
+
+function quickDashboardControlsBusy() {
+  return quickDashboard !== null;
+}
+
 // Owner decision 2026-08-06: the calibration rolling comparison window is
 // fixed at three hours. The 15-minute and 1-hour widths the old segmented
 // control offered proved inaccurate, so the chart, its summary tiles, the
@@ -464,7 +586,13 @@ function rerenderLocalizedDashboard() {
   // `data-i18n-skip` SVG text layer, so the evidence view is redrawn from the
   // state it was built from. This is a single state-driven redraw, not a list
   // of surfaces someone has to remember to extend.
-  if (dashboard) {
+  if (quickDashboard) {
+    // Quick accounting deliberately owns only the safe frame and its small
+    // pricing/community surfaces. Re-rendering the full dashboard here would
+    // treat absent projections as empty evidence while the index is still
+    // working.
+    renderQuickResultDashboard(quickDashboard);
+  } else if (dashboard) {
     renderDashboard(dashboard);
   } else if (dashboardUnavailableState) {
     renderDashboardUnavailableState(dashboardUnavailableState);
@@ -1334,9 +1462,18 @@ function renderLocalOnboarding(value) {
  * deliberately owns the remaining projections so a quick pass cannot make a
  * partial payload look like a completed accounting result.
  */
-function renderDashboardFrame(data) {
+function renderDashboardFrame(data, { quick = false } = {}) {
   dashboardUnavailableState = null;
-  dashboard = data;
+  if (quick) {
+    quickDashboard = data;
+  } else {
+    dashboard = data;
+    // A terminal/full render is the authority that retires the partial
+    // quick-result state. It is safe to do this before the heavy projections
+    // render because the complete payload is already in hand.
+    quickDashboard = null;
+  }
+  syncQuickDashboardControls();
   if (data.mode === "demo") {
     setJourneyState("demo-mode");
     $("#setup-card").hidden = true;
@@ -1401,13 +1538,13 @@ function renderDashboardFrame(data) {
 }
 
 function renderQuickResultDashboard(data) {
-  renderDashboardFrame(data);
+  renderDashboardFrame(data, { quick: true });
   // Pricing includes the current quota-weighted headline and the measured
   // history-index coverage. It is intentionally kept in the quick pass: it
   // gives a fresh install something truthful to show while the heavier
   // timeline, weekly, and model/accounting projections catch up.
   renderPricing(data);
-  renderCommunityJourney();
+  renderCommunityJourney(data);
 }
 
 function renderDashboard(data) {
@@ -1420,7 +1557,7 @@ function renderDashboard(data) {
   renderTimeline(data);
   renderWeekly(data);
   renderAccounting(data);
-  renderCommunityJourney();
+  renderCommunityJourney(data);
 }
 
 function renderQuotaCards(data) {
@@ -1852,6 +1989,9 @@ function matchedRollingPairs(data) {
 }
 
 function renderComparison(data) {
+  if (typeof quickDashboard !== "undefined" && quickDashboard !== null) {
+    return;
+  }
   // The observed-versus-calculated comparison depends on the calibration
   // capacity; when that capacity is served from the previous version's cache
   // during a recalculation, the comparison says so, quietly.
@@ -3420,6 +3560,9 @@ function shareCardActivitySelection(data, rangeDays) {
 }
 
 function renderShareCard(data, { history: sharedHistory = null } = {}) {
+  if (typeof quickDashboard !== "undefined" && quickDashboard !== null) {
+    return;
+  }
   const canvas = $("#share-card-canvas");
   const allowanceWindow = shareCardWindow(data?.quotaWindows ?? []);
   const isWeeklyWindow = shareCardWindowKind(allowanceWindow) === "seven_day";
@@ -3769,6 +3912,9 @@ function timelinePointsInViewport(points, viewport) {
 }
 
 function resetTimelineViewport() {
+  if (typeof quickDashboard !== "undefined" && quickDashboard !== null) {
+    return;
+  }
   chartViewportTarget.write(null);
 }
 
@@ -3859,6 +4005,9 @@ function updateTimelineViewport(points, update) {
 let timelineRenderFrame = 0;
 
 function scheduleTimelineRender() {
+  if (typeof quickDashboard !== "undefined" && quickDashboard !== null) {
+    return;
+  }
   if (!dashboard) return;
   if (typeof requestAnimationFrame !== "function") {
     renderTimeline(dashboard);
@@ -3883,6 +4032,9 @@ function wheelZoomFactor(event) {
 }
 
 function zoomTimeline(points, factor, anchorRatio = .5) {
+  if (typeof quickDashboard !== "undefined" && quickDashboard !== null) {
+    return;
+  }
   const step = Math.max(
     1 / TIMELINE_MAXIMUM_ZOOM_STEP,
     Math.min(TIMELINE_MAXIMUM_ZOOM_STEP, factor),
@@ -3903,6 +4055,9 @@ function zoomTimeline(points, factor, anchorRatio = .5) {
 }
 
 function panTimeline(points, fraction) {
+  if (typeof quickDashboard !== "undefined" && quickDashboard !== null) {
+    return;
+  }
   updateTimelineViewport(points, (current, bounds) => {
     const span = current.endMs - current.startMs;
     const shift = span * fraction;
@@ -4533,6 +4688,9 @@ function selectedUsagePoints(data) {
 let usageRenderFrame = 0;
 
 function scheduleUsageTimelineRender() {
+  if (typeof quickDashboard !== "undefined" && quickDashboard !== null) {
+    return;
+  }
   if (!dashboard) return;
   if (typeof requestAnimationFrame !== "function") {
     renderUsageTimeline(dashboard);
@@ -4546,6 +4704,9 @@ function scheduleUsageTimelineRender() {
 }
 
 function resetUsageTimelineViewport() {
+  if (typeof quickDashboard !== "undefined" && quickDashboard !== null) {
+    return;
+  }
   usageTimelineViewport = null;
 }
 
@@ -4560,6 +4721,9 @@ function completeUsageTimelineTotal(points, key) {
 }
 
 function renderUsageTimeline(data) {
+  if (typeof quickDashboard !== "undefined" && quickDashboard !== null) {
+    return;
+  }
   syncUsageGroupingControls();
   const points = selectedUsagePoints(data);
   const viewport = withChartViewport(
@@ -4875,6 +5039,9 @@ function selectedTimelinePoints(data) {
 }
 
 function renderTimeline(data) {
+  if (typeof quickDashboard !== "undefined" && quickDashboard !== null) {
+    return;
+  }
   const {
     points,
     baselinePoints,
@@ -7598,6 +7765,9 @@ function renderWeeklyPaceForecast(data) {
 }
 
 function renderWeekly(data) {
+  if (typeof quickDashboard !== "undefined" && quickDashboard !== null) {
+    return;
+  }
   renderWeeklyPaceForecast(data);
   // A weekly estimate carried over from the previous app version while the
   // recalculation runs announces itself here, quietly.
@@ -9044,6 +9214,9 @@ function ensureCacheReuseResizeObserver() {
 }
 
 function renderAccountingCacheReuseOutcome(impact) {
+  if (typeof quickDashboard !== "undefined" && quickDashboard !== null) {
+    return;
+  }
   const outcome = $("#cache-reuse-outcome");
   const raster = $("#cache-reuse-raster");
   const empty = $("#cache-reuse-empty");
@@ -9108,6 +9281,7 @@ function renderAccountingCacheReuseOutcome(impact) {
 }
 
 function selectCacheReuseBucketFromPointer(event) {
+  if (quickDashboardControlsBusy()) return;
   if (event.type === "pointermove" && event.pointerType === "touch") return;
   setCacheReuseReadoutVisible(true);
   const canvas = $("#cache-reuse-canvas");
@@ -9126,6 +9300,7 @@ function selectCacheReuseBucketFromPointer(event) {
 }
 
 function moveCacheReuseBucketSelection(direction) {
+  if (quickDashboardControlsBusy()) return;
   if (cacheReuseCurrentImpact === null) return;
   const next = Math.max(
     0,
@@ -9779,6 +9954,9 @@ function renderAccountingRebuildDeferral(data, { staleServeShown = false } = {})
 }
 
 function renderAccounting(data) {
+  if (typeof quickDashboard !== "undefined" && quickDashboard !== null) {
+    return;
+  }
   syncAccountingPeriodControls(data);
   // The prior-version figures stand in only while the current channels are
   // genuinely empty: no current cache AND no events from any live source for
@@ -11123,7 +11301,7 @@ function renderDashboardSkeleton() {
 
 async function loadQuickResultDashboard({ lightweight = false } = {}) {
   const [data, refreshState] = await Promise.all([
-    localClient.load(),
+    lightweight ? localClient.loadQuick() : localClient.load(),
     localClient.refreshStatus().catch(() => null),
   ]);
   if (refreshState !== null) observeLocalRootCoverage(refreshState);
@@ -12998,7 +13176,7 @@ const JOURNEY_STATE_KEYS = Object.freeze({
  * answers — and the "Local evidence" observation time is a fact, not a
  * stage, so it rides as the index box's second clause.
  */
-function renderCommunityJourney() {
+function renderCommunityJourney(data = dashboard) {
   if (!$("#community-journey")) return;
   const stage = (name, state, detailKey, detailValues = {}) => {
     const item = $(`#journey-stage-${name}`);
@@ -13015,15 +13193,15 @@ function renderCommunityJourney() {
   // 1 — the local index, with the same measured counts the history progress
   // surface reports, plus the newest local observation as the same line's
   // second fact. Nothing here estimates a finish time.
-  const history = dashboard?.pricing?.historyCoverage
-    ?? dashboard?.accounting?.historyCoverage
+  const history = data?.pricing?.historyCoverage
+    ?? data?.accounting?.historyCoverage
     ?? null;
   const totalSources = finite(history?.sourceCount, 0);
-  const observedAt = dashboard && dashboard.mode !== "demo"
-    && dashboard.freshness?.latestObservedAt
-    ? formatLocal(dashboard.freshness.latestObservedAt)
+  const observedAt = data && data.mode !== "demo"
+    && data.freshness?.latestObservedAt
+    ? formatLocal(data.freshness.latestObservedAt)
     : null;
-  if (dashboard && dashboard.mode !== "demo" && history?.status === "complete") {
+  if (data && data.mode !== "demo" && history?.status === "complete") {
     if (observedAt === null) {
       stage("index", "done", "journey.index.complete");
     } else {
@@ -13031,8 +13209,8 @@ function renderCommunityJourney() {
         time: observedAt,
       });
     }
-  } else if (dashboard
-      && dashboard.mode !== "demo"
+  } else if (data
+      && data.mode !== "demo"
       && history?.phase === "partial_terminal") {
     // A coherent terminal gap is finished work, not an index still in flight.
     // Keep the valid indexed history and quarantined source count visible; the
@@ -13050,7 +13228,7 @@ function renderCommunityJourney() {
         time: observedAt,
       });
     }
-  } else if (dashboard && dashboard.mode !== "demo" && totalSources > 0) {
+  } else if (data && data.mode !== "demo" && totalSources > 0) {
     // The same measured counts the history progress surface reports, stated
     // as one short sentence: the two-sentence byte breakdown wrapped this
     // card to eight lines (owner-directed tightening, 2026-08-08).
@@ -14499,6 +14677,7 @@ $("#delete-contributions").addEventListener("click", () => {
   void deleteCommunityContributions();
 });
 $("#range-controls").addEventListener("click", (event) => {
+  if (quickDashboardControlsBusy()) return;
   const button = event.target.closest("[data-days]");
   if (!button || !dashboard) return;
   activeUsageRangeDays = Number(button.dataset.days);
@@ -14521,26 +14700,28 @@ $("#range-controls").addEventListener("click", (event) => {
   renderWeekly(dashboard);
 });
 $("#usage-zoom-in").addEventListener("click", () => {
-  if (!dashboard) return;
+  if (quickDashboardControlsBusy() || !dashboard) return;
   zoomUsageTimeline(selectedUsagePoints(dashboard), 1 / TIMELINE_BUTTON_ZOOM_STEP);
 });
 $("#usage-zoom-out").addEventListener("click", () => {
-  if (!dashboard) return;
+  if (quickDashboardControlsBusy() || !dashboard) return;
   zoomUsageTimeline(selectedUsagePoints(dashboard), TIMELINE_BUTTON_ZOOM_STEP);
 });
 $("#usage-pan-back").addEventListener("click", () => {
-  if (!dashboard) return;
+  if (quickDashboardControlsBusy() || !dashboard) return;
   panUsageTimeline(selectedUsagePoints(dashboard), -.2);
 });
 $("#usage-pan-forward").addEventListener("click", () => {
-  if (!dashboard) return;
+  if (quickDashboardControlsBusy() || !dashboard) return;
   panUsageTimeline(selectedUsagePoints(dashboard), .2);
 });
 $("#usage-reset-zoom").addEventListener("click", () => {
+  if (quickDashboardControlsBusy()) return;
   resetUsageTimelineViewport();
   if (dashboard) renderUsageTimeline(dashboard);
 });
 $("#calibration-range-controls").addEventListener("click", (event) => {
+  if (quickDashboardControlsBusy()) return;
   const button = event.target.closest("[data-days]");
   if (!button || !dashboard) return;
   activeCalibrationRangeDays = Number(button.dataset.days);
@@ -14553,22 +14734,23 @@ $("#calibration-range-controls").addEventListener("click", (event) => {
   renderTimeline(dashboard);
 });
 $("#timeline-zoom-in").addEventListener("click", () => {
-  if (!dashboard) return;
+  if (quickDashboardControlsBusy() || !dashboard) return;
   zoomTimeline(selectedTimelinePoints(dashboard).points, 1 / TIMELINE_BUTTON_ZOOM_STEP);
 });
 $("#timeline-zoom-out").addEventListener("click", () => {
-  if (!dashboard) return;
+  if (quickDashboardControlsBusy() || !dashboard) return;
   zoomTimeline(selectedTimelinePoints(dashboard).points, TIMELINE_BUTTON_ZOOM_STEP);
 });
 $("#timeline-pan-back").addEventListener("click", () => {
-  if (!dashboard) return;
+  if (quickDashboardControlsBusy() || !dashboard) return;
   panTimeline(selectedTimelinePoints(dashboard).points, -.2);
 });
 $("#timeline-pan-forward").addEventListener("click", () => {
-  if (!dashboard) return;
+  if (quickDashboardControlsBusy() || !dashboard) return;
   panTimeline(selectedTimelinePoints(dashboard).points, .2);
 });
 $("#timeline-reset-zoom").addEventListener("click", () => {
+  if (quickDashboardControlsBusy()) return;
   resetTimelineViewport();
   if (dashboard) renderTimeline(dashboard);
 });
@@ -14576,47 +14758,56 @@ $("#timeline-reset-zoom").addEventListener("click", () => {
 // clamped inside the renderer, so a click at either end can never leave the
 // row set.
 $("#residual-page-prev").addEventListener("click", () => {
+  if (quickDashboardControlsBusy()) return;
   residualTablePage -= 1;
   renderResidualInspectionTable();
 });
 $("#residual-page-next").addEventListener("click", () => {
+  if (quickDashboardControlsBusy()) return;
   residualTablePage += 1;
   renderResidualInspectionTable();
 });
 // Same clamped-in-renderer rule for the Allowance page's reset-estimate table.
 $("#weekly-table-prev").addEventListener("click", () => {
+  if (quickDashboardControlsBusy()) return;
   weeklyTablePage -= 1;
   renderWeeklyTablePage();
 });
 $("#weekly-table-next").addEventListener("click", () => {
+  if (quickDashboardControlsBusy()) return;
   weeklyTablePage += 1;
   renderWeeklyTablePage();
 });
 $("#accounting-model-page-prev").addEventListener("click", () => {
+  if (quickDashboardControlsBusy()) return;
   accountingModelsTablePagination.page -= 1;
   renderAccountingModels(
     dashboard === null ? null : accountingPeriod(dashboard),
   );
 });
 $("#accounting-model-page-next").addEventListener("click", () => {
+  if (quickDashboardControlsBusy()) return;
   accountingModelsTablePagination.page += 1;
   renderAccountingModels(
     dashboard === null ? null : accountingPeriod(dashboard),
   );
 });
 $("#cache-switch-page-prev").addEventListener("click", () => {
+  if (quickDashboardControlsBusy()) return;
   cacheSwitchTablePagination.page -= 1;
   renderAccountingCacheSwitchDetails(
     dashboard === null ? null : accountingPeriod(dashboard)?.cacheSwitchImpact,
   );
 });
 $("#cache-switch-page-next").addEventListener("click", () => {
+  if (quickDashboardControlsBusy()) return;
   cacheSwitchTablePagination.page += 1;
   renderAccountingCacheSwitchDetails(
     dashboard === null ? null : accountingPeriod(dashboard)?.cacheSwitchImpact,
   );
 });
 $("#cache-continuity-page-prev").addEventListener("click", () => {
+  if (quickDashboardControlsBusy()) return;
   cacheContinuityTablePagination.page -= 1;
   renderAccountingCacheContinuityDetails(
     dashboard === null
@@ -14625,6 +14816,7 @@ $("#cache-continuity-page-prev").addEventListener("click", () => {
   );
 });
 $("#cache-continuity-page-next").addEventListener("click", () => {
+  if (quickDashboardControlsBusy()) return;
   cacheContinuityTablePagination.page += 1;
   renderAccountingCacheContinuityDetails(
     dashboard === null
@@ -14633,8 +14825,14 @@ $("#cache-continuity-page-next").addEventListener("click", () => {
   );
 });
 const cacheReuseCanvas = $("#cache-reuse-canvas");
-cacheReuseCanvas?.addEventListener("pointermove", selectCacheReuseBucketFromPointer);
-cacheReuseCanvas?.addEventListener("click", selectCacheReuseBucketFromPointer);
+cacheReuseCanvas?.addEventListener("pointermove", (event) => {
+  if (quickDashboardControlsBusy()) return;
+  selectCacheReuseBucketFromPointer(event);
+});
+cacheReuseCanvas?.addEventListener("click", (event) => {
+  if (quickDashboardControlsBusy()) return;
+  selectCacheReuseBucketFromPointer(event);
+});
 cacheReuseCanvas?.addEventListener("pointerleave", () => {
   setCacheReuseReadoutVisible(false);
 });
@@ -14645,6 +14843,7 @@ cacheReuseCanvas?.addEventListener("blur", () => {
   setCacheReuseReadoutVisible(false);
 });
 cacheReuseCanvas?.addEventListener("keydown", (event) => {
+  if (quickDashboardControlsBusy()) return;
   if (event.key === "ArrowLeft") {
     event.preventDefault();
     setCacheReuseReadoutVisible(true);
@@ -14656,6 +14855,7 @@ cacheReuseCanvas?.addEventListener("keydown", (event) => {
   }
 });
 $("#side-chat-page-prev").addEventListener("click", () => {
+  if (quickDashboardControlsBusy()) return;
   sideChatTablePagination.page -= 1;
   renderAccountingSideChatDetails(
     dashboard === null
@@ -14664,6 +14864,7 @@ $("#side-chat-page-prev").addEventListener("click", () => {
   );
 });
 $("#side-chat-page-next").addEventListener("click", () => {
+  if (quickDashboardControlsBusy()) return;
   sideChatTablePagination.page += 1;
   renderAccountingSideChatDetails(
     dashboard === null
@@ -14672,7 +14873,7 @@ $("#side-chat-page-next").addEventListener("click", () => {
   );
 });
 $("#side-chat-historical-gap-focus").addEventListener("click", () => {
-  if (!dashboard) return;
+  if (quickDashboardControlsBusy() || !dashboard) return;
   const probe = accountingPeriod(dashboard)?.sideChatEstimates
     ?.historicalGapProbe;
   const startMs = Date.parse(probe?.startAt ?? "");
@@ -14694,6 +14895,7 @@ $("#side-chat-historical-gap-focus").addEventListener("click", () => {
   renderTimeline(dashboard);
 });
 $("#usage-group-controls").addEventListener("click", (event) => {
+  if (quickDashboardControlsBusy()) return;
   const button = event.target.closest("[data-group]");
   if (!button || !dashboard || !usageGroupingsForRange().includes(button.dataset.group)) return;
   activeUsageGrouping = button.dataset.group;
@@ -14706,6 +14908,7 @@ $("#usage-group-controls").addEventListener("click", (event) => {
   renderUsageTimeline(dashboard);
 });
 $("#weekly-range-controls").addEventListener("click", (event) => {
+  if (quickDashboardControlsBusy()) return;
   const button = event.target.closest("[data-days]");
   if (!button || !dashboard) return;
   activeWeeklyRangeDays = Number(button.dataset.days);
@@ -14720,11 +14923,12 @@ $("#weekly-range-controls").addEventListener("click", (event) => {
   renderWeekly(dashboard);
 });
 $("#weekly-span-control").addEventListener("input", (event) => {
-  if (!dashboard) return;
+  if (quickDashboardControlsBusy() || !dashboard) return;
   activeWeeklyMinimumObservedSpanPp = Math.min(99, Math.max(0, Number(event.target.value)));
   renderWeekly(dashboard);
 });
 $("#accounting-period-controls").addEventListener("click", (event) => {
+  if (quickDashboardControlsBusy()) return;
   const button = event.target.closest("[data-period]");
   if (!button || !dashboard) return;
   const available = new Set(
@@ -14738,8 +14942,14 @@ $("#accounting-period-controls").addEventListener("click", (event) => {
   activeAccountingPeriod = button.dataset.period;
   renderAccounting(dashboard);
 });
-$("#share-card-download").addEventListener("click", downloadShareCard);
-$("#share-card-copy").addEventListener("click", copyShareCardImage);
+$("#share-card-download").addEventListener("click", () => {
+  if (quickDashboardControlsBusy()) return;
+  void downloadShareCard();
+});
+$("#share-card-copy").addEventListener("click", () => {
+  if (quickDashboardControlsBusy()) return;
+  void copyShareCardImage();
+});
 window.addEventListener(
   "tibotattle:share-card-download-completed",
   handleElectronShareCardDownloadCompleted,

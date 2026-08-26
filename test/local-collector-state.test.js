@@ -18,6 +18,7 @@ import {
   prepareLocalCollectorState,
   LOCAL_COLLECTOR_LEGACY_REFRESH_USE_MAX,
   readLocalCollectorLegacyRefreshUse,
+  readLocalCollectorLatestQuotaRecord,
   readLocalCollectorRecordSummary,
   readLocalCollectorRolloutStalenessSummary,
   readLocalCollectorState,
@@ -662,6 +663,58 @@ test("state summaries and kind filters avoid replaying usage JSON rows", async (
         firstUsageObservedAtMs: Date.parse("2026-08-03T00:01:00.000Z"),
         latestUsageObservedAtMs: Date.parse("2026-08-03T00:01:00.000Z"),
       },
+    );
+    assert.deepEqual(
+      await readLocalCollectorLatestQuotaRecord({
+        stateFile: value.stateFile,
+        maximumObservedAtMs: Date.parse("2026-08-03T00:02:30.000Z"),
+      }),
+      { status: "available", record: quota },
+    );
+    assert.deepEqual(
+      await readLocalCollectorLatestQuotaRecord({
+        stateFile: value.stateFile,
+        maximumObservedAtMs: Date.parse("2026-08-03T00:01:30.000Z"),
+      }),
+      { status: "available", record: null },
+    );
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("latest indexed quota record is size-bounded and fails closed before parsing", async () => {
+  const value = await fixture();
+  try {
+    await commitLocalCollectorState({
+      stateFile: value.stateFile,
+      checkpoint: checkpoint(),
+      records: [{
+        schemaVersion: "0.3",
+        kind: "codex_quota_snapshot",
+        observedAt: "2026-08-03T00:02:00.000Z",
+        eventKey: "quota",
+        windows: [],
+      }],
+    });
+    let database = new DatabaseSync(value.stateFile, { readOnly: false });
+    database.prepare(
+      "UPDATE records SET record_json = ? WHERE kind = 'codex_quota_snapshot'",
+    ).run(JSON.stringify({ padding: "x".repeat(64 * 1024) }));
+    database.close();
+    await assert.rejects(
+      () => readLocalCollectorLatestQuotaRecord({ stateFile: value.stateFile }),
+      { code: "local_collector_state_corrupt" },
+    );
+
+    database = new DatabaseSync(value.stateFile, { readOnly: false });
+    database.prepare(
+      "UPDATE records SET record_json = ? WHERE kind = 'codex_quota_snapshot'",
+    ).run("{not-json");
+    database.close();
+    await assert.rejects(
+      () => readLocalCollectorLatestQuotaRecord({ stateFile: value.stateFile }),
+      { code: "local_collector_state_corrupt" },
     );
   } finally {
     await rm(value.root, { recursive: true, force: true });

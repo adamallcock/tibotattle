@@ -3338,7 +3338,9 @@ test("cancellation after the early headline does not start the normal continuati
 });
 
 test("refresh controller reloads a quick result while deep accounting continues", async () => {
-  let reloads = 0;
+  let fullReloads = 0;
+  let quickReloads = 0;
+  let quickProgress = null;
   let releaseAccounting;
   const accountingGate = new Promise((resolve) => {
     releaseAccounting = resolve;
@@ -3370,7 +3372,11 @@ test("refresh controller reloads a quick result while deep accounting continues"
     },
     dataStore: {
       async reload() {
-        reloads += 1;
+        fullReloads += 1;
+      },
+      async reloadQuick({ progress }) {
+        quickReloads += 1;
+        quickProgress = progress;
       },
     },
     clock: () => Date.parse("2026-07-23T12:00:00.000Z"),
@@ -3385,7 +3391,12 @@ test("refresh controller reloads a quick result while deep accounting continues"
   assert.equal(quick.status, "running");
   assert.equal(quick.progress.phase, "quick_result");
   assert.equal(quick.quickResultAt, "2026-07-23T12:00:00.000Z");
-  assert.equal(reloads, 1);
+  assert.equal(quickReloads, 1);
+  assert.deepEqual(quickProgress, {
+    ...COMPLETE_INDEX,
+    phase: "quick_result",
+  });
+  assert.equal(fullReloads, 0);
 
   releaseAccounting();
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -3393,7 +3404,8 @@ test("refresh controller reloads a quick result while deep accounting continues"
     await new Promise((resolve) => setImmediate(resolve));
   }
   assert.equal(controller.getStatus().status, "succeeded");
-  assert.equal(reloads, 2);
+  assert.equal(quickReloads, 1);
+  assert.equal(fullReloads, 1);
 });
 
 test("refresh controller keeps a bounded-pause headline observable after the pass settles", async () => {

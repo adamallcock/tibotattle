@@ -2219,7 +2219,14 @@ export class LocalCompanionRefreshController {
               && projected.phase === "quick_result"
               && !this.#cancelRequested) {
             try {
-              await this.#dataStore.reload({ purpose: "quick" });
+              if (typeof this.#dataStore.reloadQuick === "function") {
+                await this.#dataStore.reloadQuick({ progress: projected });
+              } else {
+                // Compatibility seam for narrowly injected test/legacy
+                // stores. Production LocalCompanionDataStore implements the
+                // scalar-only path above; never add this fallback there.
+                await this.#dataStore.reload({ purpose: "quick" });
+              }
               quickResultAt = new Date(this.#clock()).toISOString();
             } catch {
               // Keep the previous good dashboard. Deep accounting can still
