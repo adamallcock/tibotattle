@@ -13,16 +13,31 @@ import {
   advanceWindowsDashboardCheckpoint,
   buildPackagedElectronArgs,
   classifyAutomaticStartupRefreshReceipt,
+  classifyWindowsDashboardParityEvidence,
   classifyWindowsSmokeStartupGateResult,
   classifySmokeFailure,
   createSyntheticFixture,
+  buildWindowsCancellationFixtureRows,
+  WINDOWS_ELECTRON_SMOKE_CANCEL_FIXTURE_EVENT_COUNT,
   classifyWindowsDashboardTargetPoll,
   isWindowsDashboardTarget,
+  isWindowsSettingsTarget,
   isWindowsRecoveryTarget,
   isWindowsSmokeDirectEntry,
   observeLocalRefreshRequests,
+  observeWindowsRefreshMutations,
   queryWindowsProcessTableForTest,
   selectWindowsDashboardTarget,
+  selectWindowsSettingsTarget,
+  hasMeaningfulWindowsCostEvidence,
+  hasMeaningfulWindowsPriceEvidence,
+  isMeaningfulWindowsAdvancedModuleText,
+  isWindowsShareTextPayloadFree,
+  classifyWindowsRefreshCancelOutcome,
+  readWindowsRefreshStartResponse,
+  classifyWindowsShareActionResult,
+  WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_OUTCOME_CODES,
+  WINDOWS_ELECTRON_SMOKE_SHARE_ACTION_TIMEOUT_MS,
   WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES,
   WINDOWS_ELECTRON_SMOKE_DASHBOARD_CHECKPOINT_ALLOWLIST,
   WINDOWS_ELECTRON_SMOKE_DASHBOARD_REFRESH_PROGRESS_ALLOWLIST,
@@ -139,6 +154,13 @@ function emitRefresh(cdp, {
   });
 }
 
+function emitNetworkResponse(cdp, { requestId, status }) {
+  cdp.emit("Network.responseReceived", {
+    requestId,
+    response: { status },
+  });
+}
+
 function fakeProcessTableProbe() {
   const probe = new EventEmitter();
   probe.stdout = new EventEmitter();
@@ -153,12 +175,23 @@ function fakeProcessTableProbe() {
 
 test("Windows Electron smoke is packaged, x64-only, and content-free", async () => {
   const source = await readFile("scripts/smoke-electron-windows.mjs", "utf8");
+  const webApp = await readFile("apps/web/public/app.js", "utf8");
   const entry = await readFile("apps/electron/main.js", "utf8");
   const lifecycle = await readFile("apps/electron/desktop-lifecycle.js", "utf8");
   const gate = await readFile("apps/electron/platform-gate.js", "utf8");
   const qualification = await readFile("apps/electron/windows-qualification.js", "utf8");
   const workflow = await readFile(".github/workflows/windows-portability.yml", "utf8");
   const packageJson = JSON.parse(await readFile("package.json", "utf8"));
+
+  const rendererShareTimeout = webApp.match(
+    /const ELECTRON_SHARE_CARD_DOWNLOAD_TIMEOUT_MS = ([0-9_]+);/u,
+  );
+  assert.notEqual(rendererShareTimeout, null);
+  assert.ok(
+    WINDOWS_ELECTRON_SMOKE_SHARE_ACTION_TIMEOUT_MS
+      > Number(rendererShareTimeout[1].replaceAll("_", "")),
+    "the packaged smoke must outwait the renderer's bounded Save fallback",
+  );
 
   assert.equal(packageJson.scripts["smoke:electron:windows"], "node ./scripts/smoke-electron-windows.mjs");
   assert.match(source, /win-unpacked/u);
@@ -270,6 +303,59 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /releaseStartupRefresh\.length !== 0/u);
   assert.match(source, /bridge\.releaseStartupRefresh\(\)/u);
   assert.match(source, /WINDOWS_ELECTRON_SMOKE_REFRESH_BOUNDARY_INVALID/u);
+  assert.match(source, /WINDOWS_ELECTRON_SMOKE_SHELL_SHARE_MISSING/u);
+  assert.match(source, /WINDOWS_ELECTRON_SMOKE_SHELL_SETTINGS_MISSING/u);
+  assert.match(source, /WINDOWS_ELECTRON_SMOKE_SHELL_CANCEL_MISSING/u);
+  assert.match(source, /assertWindowsDashboardParitySurfaces/u);
+  assert.match(source, /classifyWindowsDashboardParityEvidence/u);
+  assert.match(source, /assertWindowsRefreshTerminalControls/u);
+  assert.match(source, /assertWindowsRefreshCancelPath/u);
+  assert.match(source, /classifyWindowsRefreshCancelOutcome/u);
+  assert.match(source, /readWindowsRefreshStartResponse/u);
+  assert.match(source, /Network\.getResponseBody/u);
+  assert.match(source, /startResponseRefreshId/u);
+  assert.match(source, /WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_TOO_FAST/u);
+  assert.match(source, /busyObserved/u);
+  assert.match(source, /seedWindowsCancellationFixture/u);
+  assert.match(source, /WINDOWS_ELECTRON_SMOKE_CANCEL_FIXTURE_EVENT_COUNT/u);
+  assert.match(source, /Network\.responseReceived/u);
+  assert.match(source, /startResponseStatus/u);
+  assert.match(source, /cancelResponseStatus/u);
+  assert.match(source, /startRequestLoaderMatched/u);
+  assert.match(source, /cancelRequestLoaderMatched/u);
+  assert.match(source, /uiRefreshEnabled/u);
+  assert.match(source, /isMeaningfulWindowsAdvancedModuleText/u);
+  assert.match(source, /hasMeaningfulWindowsPriceEvidence/u);
+  assert.match(source, /classifyWindowsShareActionResult/u);
+  assert.match(source, /isWindowsShareTextPayloadFree/u);
+  assert.match(source, /WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_PATH_INVALID/u);
+  assert.match(source, /WINDOWS_ELECTRON_SMOKE_REFRESH_CONTROLS_INVALID/u);
+  assert.match(source, /previousRefreshId/u);
+  assert.match(source, /#accounting-component-counts/u);
+  assert.match(source, /#accounting-component-costs/u);
+  assert.match(source, /#accounting-models/u);
+  assert.match(source, /#cache-reuse-outcome/u);
+  assert.match(source, /#cache-reuse-empty/u);
+  assert.match(source, /#cache-reuse-summary/u);
+  assert.match(source, /#cache-switch-rows/u);
+  assert.match(source, /#cache-continuity-rows/u);
+  assert.match(source, /#identity-google-signin/u);
+  assert.match(source, /#identity-apple-signin/u);
+  assert.match(source, /no contribution service/u);
+  assert.match(source, /#share-panel/u);
+  assert.match(source, /assertWindowsSettingsFlow/u);
+  assert.match(source, /getSettings/u);
+  assert.match(source, /setRefreshInterval/u);
+  assert.match(source, /temporaryRefreshInterval/u);
+  assert.match(source, /#settings-show-diagnostics/u);
+  assert.match(source, /#settings-reveal-local-data/u);
+  assert.match(source, /localToolsReady/u);
+  assert.match(source, /localToolsPending/u);
+  assert.match(source, /open_dashboard_browser/u);
+  assert.match(source, /show_diagnostics/u);
+  assert.match(source, /reveal_local_data/u);
+  assert.match(source, /renderer\/bridge UI proof/u);
+  assert.match(source, /does not\s+claim durable file bytes/u);
   assert.match(source, /\/api\/local\/desktop-status/u);
   assert.match(source, /validateDesktopShellStatus/u);
   assert.match(source, /DESKTOP_STATUS_SCHEMA_INVALID/u);
@@ -301,6 +387,8 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   assert.match(source, /Network\.enable/u);
   assert.match(source, /isWindowsDashboardTarget/u);
   assert.match(source, /selectWindowsDashboardTarget/u);
+  assert.match(source, /isWindowsSettingsTarget/u);
+  assert.match(source, /selectWindowsSettingsTarget/u);
   assert.match(
     source,
     /const selected = selectWindowsDashboardTarget\(targets, port\)/u,
@@ -385,14 +473,36 @@ test("Windows Electron smoke is packaged, x64-only, and content-free", async () 
   const syntheticRefreshReceipt = source.indexOf(
     "progress.syntheticRefresh = true",
   );
+  const paritySurfaces = source.indexOf(
+    "await assertWindowsDashboardParitySurfaces(connection.cdp, parityHealth)",
+  );
+  const terminalControls = source.indexOf(
+    "await assertWindowsRefreshTerminalControls(connection.cdp)",
+  );
+  const cancelPath = source.indexOf(
+    "await assertWindowsRefreshCancelPath(",
+  );
+  const cancelFixture = source.indexOf(
+    "await seedWindowsCancellationFixture(fixture)",
+  );
+  const shareFlow = source.indexOf("await assertWindowsShareFlow(connection.cdp)");
+  const settingsFlow = source.indexOf("await assertWindowsSettingsFlow(");
   const statusPhase = source.indexOf('failurePhase = "status";');
   assert.ok(
     desktopStatusRoute >= 0
       && syntheticRefreshReceipt >= 0
+      && cancelPath >= 0
+      && cancelFixture >= 0
+      && cancelFixture < cancelPath
+      && cancelPath < syntheticRefreshReceipt
+      && terminalControls > syntheticRefreshReceipt
+      && paritySurfaces > syntheticRefreshReceipt
+      && shareFlow > paritySurfaces
+      && settingsFlow > shareFlow
       && syntheticRefreshReceipt < desktopStatusRoute
       && statusPhase > syntheticRefreshReceipt
       && statusPhase < desktopStatusRoute,
-    "synthetic refresh must be receipted before the separate packaged desktop-status route is qualified",
+    "synthetic refresh and visible parity must be receipted before the separate packaged desktop-status route is qualified",
   );
   const automaticRefresh = source.indexOf("await assertAutomaticStartupRefresh({");
   const syntheticRefresh = source.indexOf("async function runSyntheticRefresh");
@@ -652,6 +762,72 @@ test("Windows smoke selects only the exact ephemeral loopback dashboard target",
   assert.equal(selectWindowsDashboardTarget([valid], 0), undefined);
   assert.equal(selectWindowsDashboardTarget([valid], 65_536), undefined);
   assert.equal(selectWindowsDashboardTarget([valid], "43123"), undefined);
+});
+
+test("Windows smoke selects Settings only for the exact dashboard origin and CDP port", () => {
+  const debugPort = 43123;
+  const dashboardPort = 49299;
+  const dashboardOrigin = `http://127.0.0.1:${dashboardPort}`;
+  const target = (url, overrides = {}) => ({
+    type: "page",
+    url,
+    webSocketDebuggerUrl: `ws://127.0.0.1:${debugPort}/devtools/page/settings`,
+    ...overrides,
+  });
+  const valid = target(`${dashboardOrigin}/electron-settings.html#general`);
+  assert.equal(isWindowsSettingsTarget(valid, dashboardOrigin, debugPort), true);
+  assert.equal(
+    selectWindowsSettingsTarget([
+      target(`http://127.0.0.1:${dashboardPort + 1}/electron-settings.html`),
+      target(`http://localhost:${dashboardPort}/electron-settings.html`),
+      target(`https://127.0.0.1:${dashboardPort}/electron-settings.html`),
+      target(`${dashboardOrigin}/electron-settings.html?section=general`),
+      target(`http://user:pass@127.0.0.1:${dashboardPort}/electron-settings.html`),
+      target(`${dashboardOrigin}/electron-settings.html`, {
+        webSocketDebuggerUrl: `ws://127.0.0.1:${debugPort + 1}/devtools/page/wrong-port`,
+      }),
+      target(`${dashboardOrigin}/electron-settings.html`, {
+        webSocketDebuggerUrl: `ws://localhost:${debugPort}/devtools/page/wrong-host`,
+      }),
+      target(`${dashboardOrigin}/electron-settings.html`, {
+        webSocketDebuggerUrl: `wss://127.0.0.1:${debugPort}/devtools/page/wrong-protocol`,
+      }),
+      target(`${dashboardOrigin}/electron-settings.html`, {
+        webSocketDebuggerUrl: `ws://127.0.0.1:${debugPort}/json/version`,
+      }),
+      { ...valid, type: "other" },
+      valid,
+    ],
+    dashboardOrigin,
+    debugPort,
+  ), valid);
+  for (const rejected of [
+    target(`http://127.0.0.1:${dashboardPort + 1}/electron-settings.html`),
+    target(`http://localhost:${dashboardPort}/electron-settings.html`),
+    target(`https://127.0.0.1:${dashboardPort}/electron-settings.html`),
+    target(`${dashboardOrigin}/electron-settings.html?section=general`),
+    target(`http://user:pass@127.0.0.1:${dashboardPort}/electron-settings.html`),
+    target(`${dashboardOrigin}/electron-settings.html`, {
+      webSocketDebuggerUrl: `ws://127.0.0.1:${debugPort + 1}/devtools/page/wrong-port`,
+    }),
+    target(`${dashboardOrigin}/electron-settings.html`, {
+      webSocketDebuggerUrl: `ws://localhost:${debugPort}/devtools/page/wrong-host`,
+    }),
+    target(`${dashboardOrigin}/electron-settings.html`, {
+      webSocketDebuggerUrl: `wss://127.0.0.1:${debugPort}/devtools/page/wrong-protocol`,
+    }),
+    target(`${dashboardOrigin}/electron-settings.html`, {
+      webSocketDebuggerUrl: `ws://127.0.0.1:${debugPort}/json/version`,
+    }),
+    { ...valid, type: "other" },
+    { ...valid, webSocketDebuggerUrl: "" },
+  ]) {
+    assert.equal(isWindowsSettingsTarget(rejected, dashboardOrigin, debugPort), false);
+  }
+  assert.equal(
+    isWindowsSettingsTarget(valid, `http://127.0.0.1:${dashboardPort + 1}`, debugPort),
+    false,
+  );
 });
 
 test("Windows dashboard polling labels only the fixed recovery data surface as recovery", () => {
@@ -943,6 +1119,361 @@ test("Windows degraded startup refreshes fail closed with fixed unified-index di
   assert.equal(serialized, '{"failedStep":"unified_index","failureCode":"unknown"}');
 });
 
+test("Windows parity evidence rejects empty Usage rows and legacy Community layout", () => {
+  const configuredHealth = {
+    capabilities: {
+      contributionDevicePairing: true,
+      incrementalContributionSync: "telemetry-contribution-v1.0",
+    },
+  };
+  const unavailableHealth = {
+    capabilities: {
+      contributionDevicePairing: false,
+      incrementalContributionSync: false,
+    },
+  };
+  const usage = {
+    route: "#accounting",
+    pageVisible: true,
+    periodCount: 4,
+    summaryCardCount: 4,
+    tokenCountRows: 1,
+    costContributionRows: 1,
+    modelIdentityRows: 1,
+    meaningfulTokenRows: 1,
+    meaningfulCostRows: 1,
+    meaningfulModelRows: 1,
+    priceCoverage: true,
+    advancedModuleShellCount: 3,
+    advancedModulesReady: true,
+  };
+  const configuredCommunity = {
+    route: "#community",
+    pageVisible: true,
+    journeyStageCount: 2,
+    indexTerminal: true,
+    indexDetail: true,
+    googleButton: true,
+    appleButton: true,
+    googleButtonEnabled: true,
+    appleButtonEnabled: true,
+    currentLayout: true,
+    consentSurface: true,
+    noServiceCopy: false,
+  };
+  const unavailableCommunity = {
+    ...configuredCommunity,
+    googleButton: false,
+    appleButton: false,
+    googleButtonEnabled: false,
+    appleButtonEnabled: false,
+    consentSurface: false,
+    noServiceCopy: true,
+  };
+  assert.equal(
+    classifyWindowsDashboardParityEvidence({
+      health: configuredHealth,
+      usage,
+      community: configuredCommunity,
+    }).status,
+    "passed",
+  );
+  assert.equal(
+    classifyWindowsDashboardParityEvidence({
+      health: unavailableHealth,
+      usage,
+      community: unavailableCommunity,
+    }).status,
+    "passed",
+  );
+  assert.deepEqual(
+    classifyWindowsDashboardParityEvidence({
+      health: configuredHealth,
+      usage: { ...usage, tokenCountRows: 0, modelIdentityRows: 0 },
+      community: configuredCommunity,
+    }),
+    { status: "failed", reason: "usage" },
+  );
+  assert.deepEqual(
+    classifyWindowsDashboardParityEvidence({
+      health: configuredHealth,
+      usage: { ...usage, meaningfulCostRows: 0, priceCoverage: false },
+      community: configuredCommunity,
+    }),
+    { status: "failed", reason: "usage" },
+  );
+  assert.deepEqual(
+    classifyWindowsDashboardParityEvidence({
+      health: configuredHealth,
+      usage,
+      community: { ...configuredCommunity, currentLayout: false },
+    }),
+    { status: "failed", reason: "community" },
+  );
+  assert.deepEqual(
+    classifyWindowsDashboardParityEvidence({
+      health: configuredHealth,
+      usage,
+      community: { ...configuredCommunity, googleButtonEnabled: false },
+    }),
+    { status: "failed", reason: "community" },
+  );
+  assert.deepEqual(
+    classifyWindowsDashboardParityEvidence({
+      health: unavailableHealth,
+      usage,
+      community: { ...unavailableCommunity, noServiceCopy: false },
+    }),
+    { status: "failed", reason: "community" },
+  );
+  assert.deepEqual(
+    classifyWindowsDashboardParityEvidence({
+      health: unavailableHealth,
+      usage,
+      community: { ...unavailableCommunity, appleButtonEnabled: true },
+    }),
+    { status: "failed", reason: "community" },
+  );
+  assert.equal(hasMeaningfulWindowsCostEvidence("$0.02"), true);
+  assert.equal(hasMeaningfulWindowsCostEvidence("Price unavailable"), true);
+  assert.equal(hasMeaningfulWindowsCostEvidence("—"), false);
+  assert.equal(hasMeaningfulWindowsCostEvidence("$0.00"), false);
+});
+
+test("Windows parity classifiers reject lifecycle placeholders and weak price evidence", () => {
+  for (const placeholder of [
+    "",
+    "—",
+    "N/A",
+    "No data",
+    "Loading…",
+    "Preparing deeper accounting…",
+    "Checking cache continuity…",
+    "Working on the estimate…",
+  ]) {
+    assert.equal(
+      isMeaningfulWindowsAdvancedModuleText(placeholder),
+      false,
+      `lifecycle or empty placeholder should not qualify: ${placeholder}`,
+    );
+  }
+  for (const finalText of [
+    "Observed 3 recent transitions across 2 models.",
+    "No qualifying cache transitions were found in the retained local evidence.",
+    "The estimate is unavailable because the retained evidence is insufficient.",
+  ]) {
+    assert.equal(isMeaningfulWindowsAdvancedModuleText(finalText), true);
+  }
+
+  assert.equal(hasMeaningfulWindowsPriceEvidence("$0.004 per million tokens"), true);
+  assert.equal(hasMeaningfulWindowsPriceEvidence("Reviewed pricing is unavailable."), true);
+  assert.equal(hasMeaningfulWindowsPriceEvidence("No published price is available."), true);
+  for (const weakEvidence of [
+    "95% of rows covered",
+    "2026-08-24",
+    "123 rows",
+    "No complete usage evidence",
+  ]) {
+    assert.equal(
+      hasMeaningfulWindowsPriceEvidence(weakEvidence),
+      false,
+      `non-price evidence should not qualify: ${weakEvidence}`,
+    );
+  }
+});
+
+test("Windows cancellation evidence is fresh-operation bound and rejects API/UI disagreement", () => {
+  const codes = WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_OUTCOME_CODES;
+  const base = {
+    expectedRefreshId: "refresh-new",
+    actualRefreshId: "refresh-new",
+    startResponseRefreshId: "refresh-new",
+    startRequestObserved: true,
+    startRequestCount: 1,
+    startRequestLoaderMatched: true,
+    startResponseStatus: 202,
+    uiRefreshEnabled: true,
+    uiCancelHidden: true,
+    busyObserved: true,
+  };
+  assert.deepEqual(
+    classifyWindowsRefreshCancelOutcome({
+      ...base,
+      refreshStatus: "running",
+    }),
+    { status: "failed", errorCode: codes.nonterminal },
+    "an API-running refresh cannot pass just because the UI is idle",
+  );
+  assert.deepEqual(
+    classifyWindowsRefreshCancelOutcome({
+      ...base,
+      actualRefreshId: "refresh-old",
+      refreshStatus: "cancelled",
+      cancelRequestObserved: true,
+      cancelRequestCount: 1,
+      cancelRequestLoaderMatched: true,
+      cancelResponseStatus: 202,
+    }),
+    { status: "failed", errorCode: codes.changed },
+  );
+  assert.deepEqual(
+    classifyWindowsRefreshCancelOutcome({
+      ...base,
+      refreshStatus: "cancelled",
+      cancelRequestObserved: true,
+      cancelRequestCount: 1,
+      cancelRequestLoaderMatched: true,
+      cancelResponseStatus: 202,
+    }),
+    { status: "passed", outcome: "cancelled" },
+  );
+  assert.deepEqual(
+    classifyWindowsRefreshCancelOutcome({
+      ...base,
+      refreshStatus: "cancelled",
+    }),
+    { status: "failed", errorCode: codes.unobserved },
+    "cancelled status without an observed cancel request must not pass",
+  );
+  assert.deepEqual(
+    classifyWindowsRefreshCancelOutcome({
+      ...base,
+      refreshStatus: "succeeded",
+      busyObserved: false,
+    }),
+    {
+      status: "failed",
+      outcome: "too_fast_terminal_race",
+      errorCode: codes.tooFast,
+    },
+    "a fast terminal operation is recorded but cannot satisfy cancellation parity",
+  );
+  assert.deepEqual(
+    classifyWindowsRefreshCancelOutcome({
+      ...base,
+      busyObserved: false,
+      refreshStatus: "cancelled",
+      cancelRequestObserved: true,
+      cancelRequestCount: 1,
+      cancelRequestLoaderMatched: true,
+      cancelResponseStatus: 202,
+    }),
+    {
+      status: "failed",
+      outcome: "too_fast_terminal_race",
+      errorCode: codes.tooFast,
+    },
+    "a cancelled response without observed busy work is not a cancellation proof",
+  );
+  assert.deepEqual(
+    classifyWindowsRefreshCancelOutcome({
+      ...base,
+      refreshStatus: "succeeded",
+      cancelRequestObserved: true,
+      cancelRequestCount: 1,
+      cancelRequestLoaderMatched: true,
+      cancelResponseStatus: 409,
+    }),
+    {
+      status: "failed",
+      errorCode: codes.response,
+    },
+  );
+  for (const invalid of [
+    { startResponseRefreshId: null },
+    { expectedRefreshId: null, actualRefreshId: "refresh-new", startResponseRefreshId: null },
+    { startRequestCount: 2 },
+    { startRequestLoaderMatched: false },
+    { startResponseStatus: 201 },
+    { refreshStatus: "cancelled", cancelRequestObserved: true, cancelRequestCount: 2 },
+    {
+      refreshStatus: "cancelled",
+      cancelRequestObserved: true,
+      cancelRequestCount: 1,
+      cancelRequestLoaderMatched: false,
+      cancelResponseStatus: 202,
+    },
+    {
+      refreshStatus: "cancelled",
+      cancelRequestObserved: true,
+      cancelRequestCount: 1,
+      cancelRequestLoaderMatched: true,
+      cancelResponseStatus: 409,
+    },
+  ]) {
+    const result = classifyWindowsRefreshCancelOutcome({
+      ...base,
+      ...invalid,
+    });
+    assert.equal(result.status, "failed");
+  }
+});
+
+test("Windows Share classifiers require real action results and content-free boundaries", () => {
+  assert.ok(
+    WINDOWS_ELECTRON_SMOKE_SHARE_ACTION_TIMEOUT_MS > 15_000,
+    "the smoke must outwait the renderer's bounded 15-second Save fallback",
+  );
+  assert.equal(isWindowsShareTextPayloadFree("Saved image to Downloads"), true);
+  assert.equal(isWindowsShareTextPayloadFree("/Users/adam/Downloads/share.png"), false);
+  assert.equal(isWindowsShareTextPayloadFree("Error: clipboard permission denied"), false);
+
+  assert.deepEqual(
+    classifyWindowsShareActionResult({
+      action: "save",
+      clicked: true,
+      eventKind: "completed",
+      statusChanged: true,
+      actionEnabled: true,
+      payloadFree: true,
+    }),
+    { status: "passed", outcome: "completed" },
+  );
+  assert.deepEqual(
+    classifyWindowsShareActionResult({
+      action: "copy",
+      clicked: true,
+      eventKind: "none",
+      toastChanged: true,
+      actionEnabled: true,
+      payloadFree: true,
+      truthfulSuccess: true,
+    }),
+    { status: "passed", outcome: "completed" },
+  );
+  assert.deepEqual(
+    classifyWindowsShareActionResult({
+      action: "save",
+      clicked: true,
+      eventKind: "failed",
+      statusChanged: true,
+      actionEnabled: true,
+      payloadFree: true,
+      truthfulFailure: true,
+    }),
+    { status: "passed", outcome: "bounded_failure" },
+  );
+  for (const invalid of [
+    { clicked: false },
+    { actionEnabled: false },
+    { payloadFree: false },
+    { eventKind: "completed", statusChanged: false },
+    { eventKind: "none", truthfulSuccess: false, truthfulFailure: false },
+    { eventKind: "failed", statusChanged: true, truthfulFailure: false },
+  ]) {
+    const result = classifyWindowsShareActionResult({
+      action: "save",
+      clicked: true,
+      eventKind: "completed",
+      statusChanged: true,
+      actionEnabled: true,
+      payloadFree: true,
+      ...invalid,
+    });
+    assert.equal(result.status, "failed");
+  }
+});
+
 test("Windows dashboard target polling remains strict and records checkpoint sequencing", async () => {
   const source = await readFile("scripts/smoke-electron-windows.mjs", "utf8");
   const connectionStart = source.indexOf("async function dashboardConnection");
@@ -1189,6 +1720,105 @@ test("Windows startup refresh evidence requires the validated origin and active 
   });
   assert.deepEqual(observer.snapshot(), []);
   observer.dispose();
+});
+
+test("Windows cancel observer records only exact-origin active-loader mutations and responses", () => {
+  const cdp = new FakeCdp();
+  const dashboardUrl = new URL("http://127.0.0.1:43123/");
+  const observer = observeWindowsRefreshMutations(
+    cdp,
+    dashboardUrl,
+    "loader-current",
+  );
+  emitRefresh(cdp, {
+    origin: dashboardUrl.origin,
+    requestId: "start-current",
+    loaderId: "loader-current",
+  });
+  emitNetworkResponse(cdp, { requestId: "start-current", status: 202 });
+  cdp.emit("Network.requestWillBeSent", {
+    request: {
+      method: "POST",
+      url: `${dashboardUrl.origin}/api/local/refresh/cancel`,
+    },
+    requestId: "cancel-current",
+    loaderId: "loader-current",
+  });
+  emitNetworkResponse(cdp, { requestId: "cancel-current", status: 202 });
+  assert.deepEqual(observer.snapshot(), {
+    startRequestObserved: true,
+    startRequestCount: 1,
+    startRequestLoaderMatched: true,
+    startRequestId: "start-current",
+    startResponseStatus: 202,
+    cancelRequestObserved: true,
+    cancelRequestCount: 1,
+    cancelRequestLoaderMatched: true,
+    cancelRequestId: "cancel-current",
+    cancelResponseStatus: 202,
+  });
+
+  emitRefresh(cdp, {
+    origin: "http://127.0.0.1:43124",
+    requestId: "start-other-origin",
+    loaderId: "loader-current",
+  });
+  emitRefresh(cdp, {
+    origin: dashboardUrl.origin,
+    requestId: "start-other-loader",
+    loaderId: "loader-old",
+  });
+  cdp.emit("Network.requestWillBeSent", {
+    request: {
+      method: "GET",
+      url: `${dashboardUrl.origin}/api/local/refresh/cancel`,
+    },
+    requestId: "get-cancel",
+    loaderId: "loader-current",
+  });
+  assert.equal(observer.snapshot().startRequestCount, 1);
+  assert.equal(observer.snapshot().cancelRequestCount, 1);
+  observer.dispose();
+  emitNetworkResponse(cdp, { requestId: "start-current", status: 500 });
+  assert.equal(observer.snapshot().startResponseStatus, 202);
+});
+
+test("Windows cancellation reads the exact observed start response body", async () => {
+  const refreshId = "123e4567-e89b-12d3-a456-426614174000";
+  const calls = [];
+  const cdp = {
+    async request(method, params) {
+      calls.push({ method, params });
+      return {
+        body: JSON.stringify({
+          refresh: { refreshId, status: "running" },
+        }),
+        base64Encoded: false,
+      };
+    },
+  };
+  assert.deepEqual(
+    await readWindowsRefreshStartResponse(cdp, "start-current"),
+    { refreshId, status: "running" },
+  );
+  assert.deepEqual(calls, [{
+    method: "Network.getResponseBody",
+    params: { requestId: "start-current" },
+  }]);
+  assert.equal(await readWindowsRefreshStartResponse(cdp, null), null);
+  assert.equal(
+    await readWindowsRefreshStartResponse({
+      async request() {
+        return {
+          body: JSON.stringify({
+            refresh: { refreshId: "stale-or-malformed", status: "running" },
+          }),
+          base64Encoded: false,
+        };
+      },
+    }, "start-other"),
+    null,
+  );
 });
 
 test("Windows startup refresh receipt semantics are stateful and content-free", () => {

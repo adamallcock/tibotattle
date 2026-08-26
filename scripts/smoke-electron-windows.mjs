@@ -54,6 +54,9 @@ const DEFAULT_ARTIFACT_ROOT = resolve(
 const DEFAULT_EXECUTABLE = join(DEFAULT_ARTIFACT_ROOT, "TiboTattle Dev.exe");
 const MAX_STARTUP_MS = 45_000;
 const MAX_OPERATION_MS = 10_000;
+// Renderer Share save reports its bounded fallback at 15 seconds. The smoke
+// must wait beyond that ceiling so a truthful platform failure can qualify.
+export const WINDOWS_ELECTRON_SMOKE_SHARE_ACTION_TIMEOUT_MS = 20_000;
 const MAX_REFRESH_MS = 45_000;
 // The first primary dashboard startup is the one foreground pass where the
 // qualification fixture may need a bounded diagnostic extension. This is a
@@ -334,6 +337,159 @@ export const WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_ERROR_CODES = Object.freeze(
   cancelled: "WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_CANCELLED",
   degraded: "WINDOWS_ELECTRON_SMOKE_STARTUP_REFRESH_DEGRADED",
 });
+
+export const WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_OUTCOME_CODES = Object.freeze({
+  invalid: "WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_OUTCOME_INVALID",
+  nonterminal: "WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_API_NONTERMINAL",
+  changed: "WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_REFRESH_CHANGED",
+  unobserved: "WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_REQUEST_UNOBSERVED",
+  response: "WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_RESPONSE_INVALID",
+  ui: "WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_UI_DISAGREEMENT",
+  tooFast: "WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_TOO_FAST",
+});
+
+const WINDOWS_REFRESH_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const WINDOWS_REFRESH_TERMINAL_STATUS_SET = new Set([
+  "cancelled",
+  "succeeded",
+  "degraded",
+  "failed",
+]);
+
+/**
+ * Read only the identity/status fields from the exact HTTP 202 start
+ * response observed by CDP.  The response body itself never crosses the
+ * smoke boundary: malformed, oversized, or non-refresh bodies return null.
+ * The caller must use this id as the cancellation operation's authority;
+ * polling a later GET is not sufficient when the pre-click id was absent.
+ */
+export async function readWindowsRefreshStartResponse(cdp, requestId) {
+  if (cdp === null || typeof cdp !== "object"
+      || typeof cdp.request !== "function"
+      || typeof requestId !== "string" || requestId.length === 0) {
+    return null;
+  }
+  try {
+    const response = await cdp.request("Network.getResponseBody", { requestId });
+    let body = response?.body;
+    if (typeof body !== "string") return null;
+    if (response?.base64Encoded === true) {
+      body = Buffer.from(body, "base64").toString("utf8");
+    }
+    if (Buffer.byteLength(body, "utf8") > 16 * 1024) return null;
+    const parsed = JSON.parse(body);
+    const refresh = parsed?.refresh;
+    if (refresh === null || typeof refresh !== "object" || Array.isArray(refresh)
+        || !WINDOWS_REFRESH_ID_RE.test(refresh.refreshId)
+        || !WINDOWS_REFRESH_TERMINAL_STATUS_SET.has(refresh.status)
+            && !["running", "cancelling"].includes(refresh.status)) {
+      return null;
+    }
+    return Object.freeze({
+      refreshId: refresh.refreshId,
+      status: refresh.status,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Keep the cancellation acceptance rule independent from CDP and the Windows
+ * runner. A current refresh id plus an observed, same-document start request
+ * is required before any terminal status can qualify; otherwise a stale GET
+ * response could make an unstarted operation appear cancelled successfully.
+ * A terminal race is recorded as a failed, too-fast outcome.  This smoke
+ * intentionally requires a deliberately busy fixture, one observed cancel
+ * POST with HTTP 202, and a terminal `cancelled` API state; a fast successful
+ * refresh is useful diagnosis but never cancellation parity evidence.
+ */
+export function classifyWindowsRefreshCancelOutcome({
+  expectedRefreshId = null,
+  actualRefreshId = null,
+  startResponseRefreshId = null,
+  refreshStatus = null,
+  startRequestObserved = false,
+  startRequestCount = 0,
+  startRequestLoaderMatched = false,
+  startResponseStatus = null,
+  cancelRequestObserved = false,
+  cancelRequestCount = 0,
+  cancelRequestLoaderMatched = false,
+  cancelResponseStatus = null,
+  uiRefreshEnabled = false,
+  uiCancelHidden = false,
+  busyObserved = false,
+} = {}) {
+  if (typeof expectedRefreshId !== "string" || expectedRefreshId.length === 0
+      || typeof actualRefreshId !== "string" || actualRefreshId.length === 0
+      || typeof startResponseRefreshId !== "string"
+      || startResponseRefreshId.length === 0) {
+    return Object.freeze({
+      status: "failed",
+      errorCode: WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_OUTCOME_CODES.invalid,
+    });
+  }
+  if (startResponseRefreshId !== expectedRefreshId
+      || actualRefreshId !== expectedRefreshId) {
+    return Object.freeze({
+      status: "failed",
+      errorCode: WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_OUTCOME_CODES.changed,
+    });
+  }
+  if (startRequestObserved !== true
+      || startRequestCount !== 1
+      || startRequestLoaderMatched !== true) {
+    return Object.freeze({
+      status: "failed",
+      errorCode: WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_OUTCOME_CODES.unobserved,
+    });
+  }
+  if (startResponseStatus !== 202) {
+    return Object.freeze({
+      status: "failed",
+      errorCode: WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_OUTCOME_CODES.response,
+    });
+  }
+  if (!WINDOWS_REFRESH_TERMINAL_STATUS_SET.has(refreshStatus)) {
+    return Object.freeze({
+      status: "failed",
+      errorCode: WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_OUTCOME_CODES.nonterminal,
+    });
+  }
+  if (busyObserved !== true) {
+    return Object.freeze({
+      status: "failed",
+      outcome: "too_fast_terminal_race",
+      errorCode: WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_OUTCOME_CODES.tooFast,
+    });
+  }
+  if (uiRefreshEnabled !== true || uiCancelHidden !== true) {
+    return Object.freeze({
+      status: "failed",
+      errorCode: WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_OUTCOME_CODES.ui,
+    });
+  }
+  if (cancelRequestObserved === true) {
+    if (cancelRequestCount !== 1 || cancelRequestLoaderMatched !== true) {
+      return Object.freeze({
+        status: "failed",
+        errorCode: WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_OUTCOME_CODES.unobserved,
+      });
+    }
+    if (cancelResponseStatus === 202 && refreshStatus === "cancelled") {
+      return Object.freeze({ status: "passed", outcome: "cancelled" });
+    }
+    return Object.freeze({
+      status: "failed",
+      errorCode: WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_OUTCOME_CODES.response,
+    });
+  }
+  return Object.freeze({
+    status: "failed",
+    errorCode: WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_OUTCOME_CODES.unobserved,
+  });
+}
 
 // The Windows preload gate is a qualification-only observation seam.  Its
 // failure crosses the same fixed, content-free boundary as the existing
@@ -1044,6 +1200,83 @@ async function populateSyntheticFixture({
     runtimeDirectory,
     qualificationRunId: randomUUID(),
   });
+}
+
+// The cancellation probe deliberately adds a bounded, disposable history
+// after the startup pass.  The smoke does not assume that this amount is
+// always slow: it records a fast terminal race as a failed cancellation
+// qualification instead of turning a machine-speed accident into a pass.
+export const WINDOWS_ELECTRON_SMOKE_CANCEL_FIXTURE_EVENT_COUNT = 20_000;
+
+export function buildWindowsCancellationFixtureRows({
+  count = WINDOWS_ELECTRON_SMOKE_CANCEL_FIXTURE_EVENT_COUNT,
+  now = Date.now(),
+} = {}) {
+  if (!Number.isSafeInteger(count)
+      || count < 1
+      || count > WINDOWS_ELECTRON_SMOKE_CANCEL_FIXTURE_EVENT_COUNT) {
+    throw fixedError("WINDOWS_ELECTRON_SMOKE_CANCEL_FIXTURE_INVALID");
+  }
+  if (!Number.isFinite(now)) {
+    throw fixedError("WINDOWS_ELECTRON_SMOKE_CANCEL_FIXTURE_INVALID");
+  }
+  const rows = [
+    {
+      timestamp: new Date(now - (count + 2) * 1_000).toISOString(),
+      type: "session_meta",
+      payload: { id: "windows-electron-cancel-busy" },
+    },
+    {
+      timestamp: new Date(now - (count + 1) * 1_000).toISOString(),
+      type: "turn_context",
+      payload: { model: "gpt-5.6-sol" },
+    },
+  ];
+  for (let index = 0; index < count; index += 1) {
+    const total = {
+      input_tokens: 100 + (index % 17),
+      cached_input_tokens: 20,
+      cache_write_input_tokens: 0,
+      output_tokens: 24,
+      reasoning_output_tokens: 8,
+      total_tokens: 124 + (index % 17),
+    };
+    rows.push({
+      timestamp: new Date(now - (count - index) * 1_000).toISOString(),
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: total,
+          last_token_usage: total,
+        },
+        rate_limits: {
+          limit_id: "codex",
+          plan_type: "smoke-cancel-busy",
+          primary: {
+            used_percent: 20,
+            window_minutes: 10_080,
+            resets_at: Math.floor((now + 7 * 24 * 60 * 60 * 1_000) / 1_000),
+          },
+        },
+      },
+    });
+  }
+  return rows;
+}
+
+async function seedWindowsCancellationFixture(fixture) {
+  if (fixture === null
+      || typeof fixture !== "object"
+      || typeof fixture.codexHome !== "string") {
+    throw fixedError("WINDOWS_ELECTRON_SMOKE_CANCEL_FIXTURE_INVALID");
+  }
+  const rows = buildWindowsCancellationFixtureRows();
+  await writeFile(
+    join(fixture.codexHome, "sessions", "rollout-windows-electron-cancel-busy.jsonl"),
+    `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`,
+  );
+  return rows.length - 2;
 }
 
 export async function createSyntheticFixture({
@@ -1761,6 +1994,9 @@ function assertRendererShellSnapshot(snapshot) {
   if (snapshot?.activePageCount !== 1) fail("WINDOWS_ELECTRON_SMOKE_SHELL_ACTIVE_PAGE_INVALID");
   if (snapshot?.refresh !== true) fail("WINDOWS_ELECTRON_SMOKE_SHELL_REFRESH_MISSING");
   if (snapshot?.language !== true) fail("WINDOWS_ELECTRON_SMOKE_SHELL_LANGUAGE_MISSING");
+  if (snapshot?.share !== true) fail("WINDOWS_ELECTRON_SMOKE_SHELL_SHARE_MISSING");
+  if (snapshot?.settings !== true) fail("WINDOWS_ELECTRON_SMOKE_SHELL_SETTINGS_MISSING");
+  if (snapshot?.cancel !== true) fail("WINDOWS_ELECTRON_SMOKE_SHELL_CANCEL_MISSING");
 }
 
 async function assertRendererShell(cdp) {
@@ -1788,6 +2024,9 @@ async function assertRendererShell(cdp) {
       ).length,
       refresh: Boolean(document.querySelector("#refresh-button")),
       language: Boolean(document.querySelector("[data-language-picker]")),
+      share: Boolean(document.querySelector("#electron-share-button")),
+      settings: Boolean(document.querySelector("#electron-settings-button")),
+      cancel: Boolean(document.querySelector("#cancel-refresh")),
     };
   })()`);
   assertRendererShellSnapshot(snapshot);
@@ -1819,6 +2058,716 @@ async function assertRendererShell(cdp) {
   if (trends?.activePage !== true) fail("WINDOWS_ELECTRON_SMOKE_SHELL_TRENDS_PAGE_INACTIVE");
   if (trends?.previousPageInactive !== true) fail("WINDOWS_ELECTRON_SMOKE_SHELL_PREVIOUS_PAGE_ACTIVE");
   if (trends?.activePageCount !== 1) fail("WINDOWS_ELECTRON_SMOKE_SHELL_TRENDS_COUNT_INVALID");
+  await cdp.evaluate(`document.querySelector('[data-nav="overview"]')?.click()`);
+}
+
+const WINDOWS_MONEY_AMOUNT_RE = /(?:[$€£¥]|\b(?:usd|eur|gbp|jpy)\b)\s*([0-9]+(?:[.,][0-9]+)?)|([0-9]+(?:[.,][0-9]+)?)\s*(?:[$€£¥]|\b(?:usd|eur|gbp|jpy)\b)/iu;
+
+/**
+ * A cost row is useful evidence only when it contains a positive monetary
+ * amount or an explicit explanation for withheld pricing. Percentages, dates,
+ * counts, and bare zeroes are not cost evidence; a bare dash is the
+ * renderer's empty-state placeholder and must not satisfy the packaged gate.
+ */
+export function hasMeaningfulWindowsCostEvidence(value) {
+  const text = String(value ?? "").replace(/\s+/gu, " ").trim();
+  if (text.length === 0) return false;
+  const monetary = text.match(WINDOWS_MONEY_AMOUNT_RE);
+  const amount = monetary?.[1] ?? monetary?.[2];
+  if (amount !== undefined && Number(amount.replace(",", ".")) > 0) {
+    return true;
+  }
+  return /\b(?:unavailable|not\s+(?:priced|reported|available|provided)|(?:no|without)\s+(?:published\s+)?price|(?:price|pricing|cost)\s+(?:unavailable|withheld|not\s+(?:available|provided|reported))|separate\s+allowance|withheld)\b/iu.test(text);
+}
+
+const WINDOWS_ADVANCED_PLACEHOLDER_RE = /\b(?:loading|preparing|checking|calculating|updating|working)\b/iu;
+const WINDOWS_ADVANCED_UNAVAILABLE_RE = /(?:not enough eligible|no qualifying|no eligible|insufficient evidence|no estimate|estimate is withheld|unavailable|not available|not evaluated|no data|not reported|not priced)/iu;
+const WINDOWS_ADVANCED_TERMINAL_EVIDENCE_RE = /\b(?:observed|found|matched|measured|evaluated|estimated|reviewed|covered|priced|reported|reused|dropped|lost|changed|available|completed|retained|paired|calculated|derived)\b/iu;
+
+/**
+ * A visible advanced card is not evidence merely because it contains a
+ * heading or a renderer lifecycle word. Accept either a final explanatory
+ * sentence with an explicit terminal/evidence verb or a product-owned
+ * unavailable explanation; reject generic headings, empty, loading, and
+ * placeholder states. This deliberately rejects static labels such as
+ * "Cache continuity details" and "Cache reuse analysis".
+ */
+export function isMeaningfulWindowsAdvancedModuleText(value) {
+  const text = String(value ?? "").replace(/\s+/gu, " ").trim();
+  if (text.length < 12 || WINDOWS_ADVANCED_PLACEHOLDER_RE.test(text)) return false;
+  if (/^(?:[-—–]|n\/?a|none|empty|no data)$/iu.test(text)) return false;
+  if (WINDOWS_ADVANCED_UNAVAILABLE_RE.test(text)) return true;
+  return WINDOWS_ADVANCED_TERMINAL_EVIDENCE_RE.test(text);
+}
+
+/**
+ * Price coverage must contain money/pricing semantics. A positive percentage,
+ * date, or count alone is not price evidence and cannot close the packaged
+ * accounting gate.
+ */
+export function hasMeaningfulWindowsPriceEvidence(value) {
+  const text = String(value ?? "").replace(/\s+/gu, " ").trim();
+  if (text.length === 0) return false;
+  if (WINDOWS_MONEY_AMOUNT_RE.test(text)) {
+    return true;
+  }
+  return /\b(?:reviewed\s+(?:public\s+)?pricing|reviewed\s+price|price(?:d|s)?\s+(?:is\s+)?(?:unavailable|withheld|not\s+(?:available|provided|reported))|pricing\s+(?:is\s+)?(?:unavailable|withheld|not\s+(?:available|provided|reported))|cost\s+(?:is\s+)?(?:unavailable|withheld|not\s+(?:available|provided|reported))|no\s+(?:complete\s+)?(?:published\s+)?price|separate\s+allowance|without\s+(?:a\s+)?(?:published\s+)?price)\b/iu.test(text);
+}
+
+const WINDOWS_SHARE_TEXT_PAYLOAD_RE = /(?:[A-Z]:[\\/]|(?:^|[\s(])\/(?:Users|private|tmp|home|var|opt)[\\/]|file:\/\/|(?:Error|stack):)/iu;
+
+export function isWindowsShareTextPayloadFree(value) {
+  return !WINDOWS_SHARE_TEXT_PAYLOAD_RE.test(String(value ?? ""));
+}
+
+/**
+ * Classify the result of clicking a real packaged Share action. The action is
+ * accepted only after the button was actually clickable, the renderer reports
+ * a fixed completion/failure event or status, and no event/text payload looks
+ * like a path or raw error. Presence of a button alone is never sufficient.
+ */
+export function classifyWindowsShareActionResult({
+  action,
+  clicked = false,
+  eventKind = "none",
+  statusChanged = false,
+  toastChanged = false,
+  actionEnabled = false,
+  payloadFree = false,
+  truthfulSuccess = false,
+  truthfulFailure = false,
+} = {}) {
+  if (!["save", "copy"].includes(action)
+      || clicked !== true
+      || actionEnabled !== true
+      || payloadFree !== true) {
+    return Object.freeze({ status: "failed", reason: "boundary" });
+  }
+  if (![
+    "completed",
+    "failed",
+    "none",
+  ].includes(eventKind)) {
+    return Object.freeze({ status: "failed", reason: "event" });
+  }
+  if (eventKind === "completed") {
+    return statusChanged || toastChanged
+      ? Object.freeze({ status: "passed", outcome: "completed" })
+      : Object.freeze({ status: "failed", reason: "missing_success_surface" });
+  }
+  if (eventKind === "failed") {
+    return truthfulFailure && (statusChanged || toastChanged)
+      ? Object.freeze({ status: "passed", outcome: "bounded_failure" })
+      : Object.freeze({ status: "failed", reason: "missing_failure_surface" });
+  }
+  if (truthfulSuccess && (statusChanged || toastChanged)) {
+    return Object.freeze({ status: "passed", outcome: "completed" });
+  }
+  return truthfulFailure && (statusChanged || toastChanged)
+    ? Object.freeze({ status: "passed", outcome: "bounded_failure" })
+    : Object.freeze({ status: "failed", reason: "missing_result" });
+}
+
+function windowsUsageParitySnapshotValid(snapshot) {
+  return snapshot?.route === "#accounting"
+    && snapshot?.pageVisible === true
+    && snapshot?.periodCount === 4
+    && snapshot?.summaryCardCount >= 4
+    && snapshot?.tokenCountRows >= 1
+    && snapshot?.costContributionRows >= 1
+    && snapshot?.modelIdentityRows >= 1
+    && snapshot?.meaningfulTokenRows >= 1
+    && snapshot?.meaningfulCostRows >= 1
+    && snapshot?.meaningfulModelRows >= 1
+    && snapshot?.priceCoverage === true
+    && snapshot?.advancedModuleShellCount === 3
+    && snapshot?.advancedModulesReady === true;
+}
+
+function windowsCommunityParitySnapshotValid(snapshot, health) {
+  const serviceConfigured = health?.capabilities?.contributionDevicePairing === true
+    && health?.capabilities?.incrementalContributionSync
+      === "telemetry-contribution-v1.0";
+  return snapshot?.route === "#community"
+    && snapshot?.pageVisible === true
+    && snapshot?.journeyStageCount === 2
+    && snapshot?.indexTerminal === true
+    && snapshot?.indexDetail === true
+    && snapshot?.currentLayout === true
+    && (serviceConfigured
+      ? snapshot?.googleButton === true
+        && snapshot?.appleButton === true
+        && snapshot?.googleButtonEnabled === true
+        && snapshot?.appleButtonEnabled === true
+        && snapshot?.consentSurface === true
+        && snapshot?.noServiceCopy === false
+      : snapshot?.noServiceCopy === true
+        && snapshot?.googleButtonEnabled === false
+        && snapshot?.appleButtonEnabled === false);
+}
+
+/**
+ * Keep this pure so the Windows contract suite can reject the old Usage and
+ * Community layouts without starting a packaged process. The service branch
+ * is intentionally dual-sided: a configured service must expose both current
+ * provider controls, while an unavailable development service must say so
+ * explicitly instead of presenting inert legacy controls.
+ */
+export function classifyWindowsDashboardParityEvidence({
+  health = {},
+  usage = {},
+  community = {},
+} = {}) {
+  if (!windowsUsageParitySnapshotValid(usage)) {
+    return Object.freeze({ status: "failed", reason: "usage" });
+  }
+  if (!windowsCommunityParitySnapshotValid(community, health)) {
+    return Object.freeze({ status: "failed", reason: "community" });
+  }
+  return Object.freeze({ status: "passed", reason: null });
+}
+
+async function assertWindowsDashboardParitySurfaces(cdp, health) {
+  const usage = await waitFor(async () => {
+    const snapshot = await cdp.evaluate(`(() => {
+      const visible = (element) => {
+        if (!element) return false;
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== "none"
+          && style.visibility !== "hidden"
+          && rect.width > 0
+          && rect.height > 0;
+      };
+      const positiveNumber = (value) => {
+        const matches = String(value ?? "").match(/(?:^|[^0-9])([1-9][0-9]*(?:[.,][0-9]+)?|0\\.[0-9]+)/u);
+        return matches !== null
+          && Number(matches[1].replace(",", ".")) > 0;
+      };
+      const meaningfulRows = (selector, costEvidence = false) => {
+        const rows = [...document.querySelectorAll(selector)];
+        return rows.filter((row) => {
+          const text = row.textContent?.trim() ?? "";
+          if (text.length === 0) return false;
+          if (costEvidence) return ${hasMeaningfulWindowsCostEvidence.toString()}(text);
+          return positiveNumber(text);
+        }).length;
+      };
+      const advancedDescriptors = [
+        {
+          selector: "#cache-switch-details",
+          evidence: ["#cache-switch-rows"],
+        },
+        {
+          selector: "#cache-reuse-outcome",
+          evidence: ["#cache-reuse-empty", "#cache-reuse-summary"],
+        },
+        {
+          selector: "#cache-continuity-details",
+          evidence: ["#cache-continuity-rows"],
+        },
+      ];
+      const advancedModules = advancedDescriptors.map(({ selector, evidence }) => {
+        const element = document.querySelector(selector);
+        const evidenceText = evidence
+          .flatMap((candidate) => [...document.querySelectorAll(candidate)])
+          .filter((candidate) => candidate.hidden !== true)
+          .map((candidate) => candidate.textContent?.trim() ?? "")
+          .join(" ");
+        return {
+          present: element !== null,
+          visible: visible(element),
+          meaningful: ${isMeaningfulWindowsAdvancedModuleText.toString()}(evidenceText),
+        };
+      });
+      const priceCoverage = document.querySelector("#accounting-price-coverage");
+      document.querySelector('[data-nav="method"]')?.click();
+      const page = document.querySelector('#accounting[data-dashboard-page="method"]');
+      const tokenRows = document.querySelectorAll('#accounting-component-counts .component-row');
+      const costRows = document.querySelectorAll('#accounting-component-costs .component-row');
+      const modelRows = [...document.querySelectorAll('#accounting-models > tr')]
+        .filter((row) => row.querySelector(
+          ':scope > .model-identity:not(.model-component-identity)',
+        ));
+      return {
+        route: location.hash,
+        pageVisible: visible(page) && page?.inert !== true,
+        periodCount: document.querySelectorAll('#accounting-period-controls [data-period]').length,
+        summaryCardCount: document.querySelectorAll('#accounting-summary .metric-card').length,
+        tokenCountRows: tokenRows.length,
+        costContributionRows: costRows.length,
+        modelIdentityRows: modelRows.length,
+        meaningfulTokenRows: meaningfulRows('#accounting-component-counts .component-row'),
+        meaningfulCostRows: meaningfulRows('#accounting-component-costs .component-row', true),
+        meaningfulModelRows: modelRows.filter((row) => [...row.querySelectorAll(
+          ':scope > .numeric-cell',
+        )].some((cell) => positiveNumber(cell.textContent))).length,
+        priceCoverage: visible(priceCoverage)
+          && ${hasMeaningfulWindowsPriceEvidence.toString()}(priceCoverage.textContent),
+        advancedModuleShellCount: advancedModules.filter((module) => module.present).length,
+        advancedModulesReady: advancedModules.length === 3
+          && advancedModules.every((module) => module.present
+            && module.visible
+            && module.meaningful),
+      };
+    })()`);
+    return windowsUsageParitySnapshotValid(snapshot) ? snapshot : null;
+  }, MAX_OPERATION_MS, "Windows Usage parity surfaces").catch(() => null);
+  if (usage === null) fail("WINDOWS_ELECTRON_SMOKE_USAGE_PARITY_INVALID");
+
+  const community = await waitFor(async () => {
+    const snapshot = await cdp.evaluate(`(() => {
+      const visible = (element) => {
+        if (!element) return false;
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== "none"
+          && style.visibility !== "hidden"
+          && rect.width > 0
+          && rect.height > 0;
+      };
+      document.querySelector('[data-nav="community"]')?.click();
+      const page = document.querySelector('#community[data-dashboard-page="community"]');
+      const pageText = page?.textContent?.toLowerCase() ?? "";
+      const indexDetail = document.querySelector('#journey-stage-index-detail')
+        ?.textContent?.trim() ?? "";
+      const nextAction = document.querySelector('#identity-signin-next');
+      const consent = document.querySelector('#incremental-consent');
+      return {
+        route: location.hash,
+        pageVisible: visible(page) && page?.inert !== true,
+        journeyStageCount: document.querySelectorAll('#community-journey .journey-stage').length,
+        indexTerminal: document.querySelector('#journey-stage-index')
+          ?.classList?.contains('journey-stage-done') === true,
+        indexDetail: indexDetail.length > 0,
+        googleButton: visible(document.querySelector('#identity-google-signin')),
+        appleButton: visible(document.querySelector('#identity-apple-signin')),
+        googleButtonEnabled: document.querySelector('#identity-google-signin')?.disabled === false,
+        appleButtonEnabled: document.querySelector('#identity-apple-signin')?.disabled === false,
+        currentLayout: visible(nextAction)
+          && (nextAction.textContent?.trim() ?? '').length > 0,
+        consentSurface: visible(consent)
+          && (consent.textContent?.trim() ?? '').length > 0,
+        noServiceCopy: pageText.includes('no contribution service'),
+      };
+    })()`);
+    return windowsCommunityParitySnapshotValid(snapshot, health) ? snapshot : null;
+  }, MAX_OPERATION_MS, "Windows Community parity surfaces").catch(() => null);
+  if (community === null) fail("WINDOWS_ELECTRON_SMOKE_COMMUNITY_PARITY_INVALID");
+  if (classifyWindowsDashboardParityEvidence({ health, usage, community }).status !== "passed") {
+    fail("WINDOWS_ELECTRON_SMOKE_DASHBOARD_PARITY_INVALID");
+  }
+  await cdp.evaluate(`document.querySelector('[data-nav="overview"]')?.click()`);
+}
+
+/**
+ * A terminal refresh must release the foreground controls. This is the
+ * packaged proof for the user-facing failure mode where the accounting pass
+ * stopped but the toolbar continued to look busy; the long-running cancel
+ * latency matrix remains a separate real-history qualification.
+ */
+async function assertWindowsRefreshTerminalControls(cdp) {
+  const snapshot = await waitFor(async () => {
+    const value = await cdp.evaluate(`(() => {
+      const refresh = document.querySelector("#refresh-button");
+      const cancel = document.querySelector("#cancel-refresh");
+      return {
+        refreshPresent: refresh !== null,
+        refreshEnabled: refresh?.disabled === false,
+        cancelPresent: cancel !== null,
+        cancelHidden: cancel?.hidden === true,
+      };
+    })()`);
+    return value?.refreshPresent === true
+      && value?.refreshEnabled === true
+      && value?.cancelPresent === true
+      && value?.cancelHidden === true
+      ? value
+      : null;
+  }, MAX_OPERATION_MS, "Windows terminal refresh controls").catch(() => null);
+  if (snapshot === null) fail("WINDOWS_ELECTRON_SMOKE_REFRESH_CONTROLS_INVALID");
+}
+
+export function observeWindowsRefreshMutations(cdp, dashboardUrl, activeLoaderId) {
+  const records = new Map();
+  const origin = dashboardUrl?.origin;
+  const loaderId = typeof activeLoaderId === "string" ? activeLoaderId : null;
+  const onRequest = ({ request, requestId, loaderId: requestLoaderId } = {}) => {
+    if (request?.method !== "POST"
+        || typeof request?.url !== "string"
+        || typeof requestId !== "string"
+        || requestId.length === 0
+        || loaderId === null
+        || requestLoaderId !== loaderId) return;
+    let parsed;
+    try {
+      parsed = new URL(request.url);
+    } catch {
+      return;
+    }
+    if (parsed.protocol !== "http:"
+        || parsed.origin !== origin
+        || !["/api/local/refresh", "/api/local/refresh/cancel"].includes(parsed.pathname)
+        || parsed.search !== ""
+        || parsed.hash !== "") return;
+    records.set(requestId, {
+      requestId,
+      kind: parsed.pathname.endsWith("/cancel") ? "cancel" : "start",
+      loaderMatched: loaderId !== null && requestLoaderId === loaderId,
+      responseStatus: null,
+    });
+  };
+  const onResponse = ({ requestId, response } = {}) => {
+    if (typeof requestId !== "string") return;
+    const record = records.get(requestId);
+    if (!record || !Number.isInteger(response?.status)) return;
+    record.responseStatus = response.status;
+  };
+  const unsubscribeRequest = cdp.on("Network.requestWillBeSent", onRequest);
+  const unsubscribeResponse = cdp.on("Network.responseReceived", onResponse);
+  return Object.freeze({
+    snapshot() {
+      const starts = [...records.values()].filter((record) => record.kind === "start");
+      const cancels = [...records.values()].filter((record) => record.kind === "cancel");
+      const start = starts.at(-1) ?? null;
+      const cancel = cancels.at(-1) ?? null;
+      return Object.freeze({
+        startRequestObserved: starts.length > 0,
+        startRequestCount: starts.length,
+        startRequestLoaderMatched: start?.loaderMatched === true,
+        startRequestId: start?.requestId ?? null,
+        startResponseStatus: start?.responseStatus ?? null,
+        cancelRequestObserved: cancels.length > 0,
+        cancelRequestCount: cancels.length,
+        cancelRequestLoaderMatched: cancel?.loaderMatched === true,
+        cancelRequestId: cancel?.requestId ?? null,
+        cancelResponseStatus: cancel?.responseStatus ?? null,
+      });
+    },
+    dispose() {
+      unsubscribeRequest?.();
+      unsubscribeResponse?.();
+    },
+  });
+}
+
+async function readWindowsRefreshControls(cdp) {
+  return cdp.evaluate(`(() => {
+    const refresh = document.querySelector("#refresh-button");
+    const cancel = document.querySelector("#cancel-refresh");
+    return {
+      refreshPresent: refresh !== null,
+      refreshEnabled: refresh?.disabled === false,
+      cancelPresent: cancel !== null,
+      cancelHidden: cancel?.hidden === true,
+      cancelDisabled: cancel?.disabled === true,
+    };
+  })()`);
+}
+
+/**
+ * Exercise the actual dashboard Refresh/Cancel controls against the bounded,
+ * deliberately busy disposable fixture. A fast terminal race is recorded as
+ * a distinct failed outcome; it never satisfies cancellation parity. The
+ * operation id must come from the exact 202 start response body, not a later
+ * GET (especially when the pre-click endpoint had no id).
+ */
+async function assertWindowsRefreshCancelPath(cdp, dashboardUrl, activeLoaderId) {
+  const before = await jsonFetch(
+    new URL("/api/local/refresh", dashboardUrl),
+    undefined,
+    "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT",
+  ).catch(() => null);
+  if (before === null) fail("WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_PATH_INVALID");
+  const previousRefreshId = typeof before?.refresh?.refreshId === "string"
+    ? before.refresh.refreshId
+    : null;
+  const mutationObserver = observeWindowsRefreshMutations(
+    cdp,
+    dashboardUrl,
+    activeLoaderId,
+  );
+  const started = await cdp.evaluate(`(() => {
+    const refresh = document.querySelector("#refresh-button");
+    if (!refresh || refresh.disabled) return false;
+    refresh.click();
+    return true;
+  })()`);
+  if (started !== true) {
+    mutationObserver.dispose();
+    fail("WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_PATH_INVALID");
+  }
+  let cancelRequested = false;
+  let busyObserved = false;
+  let startResponseRefreshId = null;
+  try {
+    const terminal = await waitFor(async () => {
+      const status = await jsonFetch(
+        new URL("/api/local/refresh", dashboardUrl),
+        undefined,
+        "WINDOWS_ELECTRON_SMOKE_REFRESH_TIMEOUT",
+      );
+      const refreshId = typeof status?.refresh?.refreshId === "string"
+        ? status.refresh.refreshId
+        : null;
+      if (previousRefreshId !== null && refreshId === previousRefreshId) return null;
+      if (refreshId === null) return null;
+      const outcome = status?.refresh?.status;
+      const controls = await readWindowsRefreshControls(cdp);
+      const mutation = mutationObserver.snapshot();
+      if (mutation.startRequestCount !== 1
+          || mutation.startResponseStatus === null) {
+        return null;
+      }
+      if (startResponseRefreshId === null) {
+        const startResponse = await readWindowsRefreshStartResponse(
+          cdp,
+          mutation.startRequestId,
+        );
+        if (startResponse === null) return null;
+        startResponseRefreshId = startResponse.refreshId;
+        if (previousRefreshId !== null
+            && startResponseRefreshId === previousRefreshId) {
+          fail("WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_PATH_INVALID");
+        }
+      }
+      if (refreshId !== startResponseRefreshId) {
+        if (WINDOWS_REFRESH_TERMINAL_STATUS_SET.has(outcome)) {
+          fail("WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_PATH_INVALID");
+        }
+        return null;
+      }
+      if (["running", "cancelling"].includes(outcome)) {
+        busyObserved = true;
+        if (!cancelRequested
+            && controls?.cancelPresent === true
+            && controls.cancelHidden === false
+            && controls.cancelDisabled === false) {
+          const clicked = await cdp.evaluate(`(() => {
+            const cancel = document.querySelector("#cancel-refresh");
+            if (!cancel || cancel.hidden || cancel.disabled) return false;
+            cancel.click();
+            return true;
+          })()`);
+          if (clicked === true) cancelRequested = true;
+        }
+        // In particular, do not return controls here. The API remains the
+        // authority while the renderer catches up.
+        return null;
+      }
+      if (!WINDOWS_REFRESH_TERMINAL_STATUS_SET.has(outcome)) return null;
+      if (cancelRequested && mutation.cancelResponseStatus === null) return null;
+      const settledControls = await readWindowsRefreshControls(cdp);
+      const decision = classifyWindowsRefreshCancelOutcome({
+        expectedRefreshId: startResponseRefreshId,
+        actualRefreshId: refreshId,
+        startResponseRefreshId,
+        refreshStatus: outcome,
+        ...mutation,
+        uiRefreshEnabled: settledControls?.refreshEnabled === true,
+        uiCancelHidden: settledControls?.cancelHidden === true,
+        busyObserved,
+      });
+      if (decision.status !== "passed") {
+        // `too_fast_terminal_race` is intentionally terminal evidence for the
+        // diagnostic lane but does not qualify cancellation parity.
+        fail("WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_PATH_INVALID");
+      }
+      return decision;
+    }, MAX_REFRESH_MS, "Windows refresh cancellation").catch(() => null);
+    if (terminal === null) fail("WINDOWS_ELECTRON_SMOKE_REFRESH_CANCEL_PATH_INVALID");
+    await assertWindowsRefreshTerminalControls(cdp);
+  } finally {
+    mutationObserver.dispose();
+  }
+}
+
+/**
+ * This is renderer/bridge UI proof only. This does not claim durable file bytes
+ * or clipboard bytes because this harness has no
+ * content-free main-owned download/clipboard receipt to observe. Save and
+ * Copy must still produce a truthful completion or bounded platform failure
+ * through the real packaged renderer path.
+ */
+async function assertWindowsShareFlow(cdp) {
+  const opened = await cdp.evaluate(`(() => {
+    const button = document.querySelector("#electron-share-button");
+    if (!button || button.disabled) return false;
+    button.click();
+    return true;
+  })()`);
+  if (opened !== true) fail("WINDOWS_ELECTRON_SMOKE_SHARE_FLOW_INVALID");
+  const share = await waitFor(async () => {
+    const snapshot = await cdp.evaluate(`(() => {
+      const panel = document.querySelector("#share-panel");
+      const canvas = document.querySelector("#share-card-canvas");
+      const visible = (element) => {
+        if (!element) return false;
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== "none"
+          && style.visibility !== "hidden"
+          && rect.width > 0
+          && rect.height > 0;
+      };
+      return {
+        route: location.hash,
+        panelVisible: visible(panel),
+        panelFocused: document.activeElement === panel,
+        canvas: Boolean(canvas) && canvas.width > 0 && canvas.height > 0 && visible(canvas),
+        save: Boolean(document.querySelector("#share-card-download")),
+        copy: Boolean(document.querySelector("#share-card-copy")),
+      };
+    })()`);
+    return snapshot?.route === "#weekly"
+      && snapshot?.panelVisible === true
+      && snapshot?.panelFocused === true
+      && snapshot?.canvas === true
+      && snapshot?.save === true
+      && snapshot?.copy === true
+      ? snapshot
+      : null;
+  }, MAX_OPERATION_MS, "Windows Share panel").catch(() => null);
+  if (share?.route !== "#weekly"
+      || share?.panelVisible !== true
+      || share?.panelFocused !== true
+      || share?.canvas !== true
+      || share?.save !== true
+      || share?.copy !== true) {
+    fail("WINDOWS_ELECTRON_SMOKE_SHARE_FLOW_INVALID");
+  }
+  const installRecorder = await cdp.evaluate(`(() => {
+    const key = "__TIBOTATTLE_WINDOWS_SMOKE_SHARE_EVENTS__";
+    globalThis[key]?.cleanup?.();
+    const state = {
+      completed: 0,
+      failed: 0,
+      payloadFree: true,
+      reset() {
+        this.completed = 0;
+        this.failed = 0;
+        this.payloadFree = true;
+      },
+    };
+    const completed = (event) => {
+      state.completed += 1;
+      state.payloadFree = state.payloadFree && event?.detail === undefined;
+    };
+    const failed = (event) => {
+      state.failed += 1;
+      state.payloadFree = state.payloadFree && event?.detail === undefined;
+    };
+    window.addEventListener("tibotattle:share-card-download-completed", completed);
+    window.addEventListener("tibotattle:share-card-download-failed", failed);
+    state.cleanup = () => {
+      window.removeEventListener("tibotattle:share-card-download-completed", completed);
+      window.removeEventListener("tibotattle:share-card-download-failed", failed);
+      delete globalThis[key];
+    };
+    Object.defineProperty(globalThis, key, {
+      configurable: true,
+      value: state,
+    });
+    return true;
+  })()`);
+  if (installRecorder !== true) fail("WINDOWS_ELECTRON_SMOKE_SHARE_FLOW_INVALID");
+
+  const readAction = async (action, baseline) => cdp.evaluate(`(() => {
+    const key = "__TIBOTATTLE_WINDOWS_SMOKE_SHARE_EVENTS__";
+    const state = globalThis[key];
+    const button = document.querySelector(
+      ${JSON.stringify(action === "save" ? "#share-card-download" : "#share-card-copy")},
+    );
+    const status = document.querySelector("#share-card-status");
+    const toast = document.querySelector("#share-card-toast");
+    const statusText = status?.textContent?.trim() ?? "";
+    const toastText = toast?.textContent?.trim() ?? "";
+    const statusChanged = statusText !== ${JSON.stringify(baseline.statusText)};
+    const toastChanged = toastText !== ${JSON.stringify(baseline.toastText)}
+      && toastText.length > 0;
+    const eventKind = state?.failed > 0
+      ? "failed"
+      : state?.completed > 0
+        ? "completed"
+        : "none";
+    return {
+      eventKind,
+      statusChanged,
+      toastChanged,
+      actionEnabled: button?.disabled === false,
+      payloadFree: state?.payloadFree === true
+        && ${isWindowsShareTextPayloadFree.toString()}(statusText)
+        && ${isWindowsShareTextPayloadFree.toString()}(toastText),
+      truthfulSuccess: ${JSON.stringify(action)} === "save"
+        ? eventKind === "completed"
+        : toastChanged && status?.classList?.contains("error") !== true,
+      truthfulFailure: status?.classList?.contains("error") === true,
+    };
+  })()`);
+
+  const saveBaseline = await cdp.evaluate(`(() => ({
+    statusText: document.querySelector("#share-card-status")?.textContent?.trim() ?? "",
+    toastText: document.querySelector("#share-card-toast")?.textContent?.trim() ?? "",
+  }))()`);
+  const saveClicked = await cdp.evaluate(`(() => {
+    const button = document.querySelector("#share-card-download");
+    if (!button || button.disabled) return false;
+    button.click();
+    return true;
+  })()`);
+  const saveResult = await waitFor(async () => {
+    const value = await readAction("save", saveBaseline);
+    return value?.actionEnabled === true
+      && (value.eventKind !== "none" || value.statusChanged || value.toastChanged)
+      ? value
+      : null;
+  }, WINDOWS_ELECTRON_SMOKE_SHARE_ACTION_TIMEOUT_MS, "Windows Share save action").catch(() => null);
+  const saveDecision = classifyWindowsShareActionResult({
+    action: "save",
+    clicked: saveClicked === true,
+    ...saveResult,
+  });
+  if (saveDecision.status !== "passed") {
+    await cdp.evaluate(`() => {
+      globalThis.__TIBOTATTLE_WINDOWS_SMOKE_SHARE_EVENTS__?.cleanup?.();
+      return true;
+    })()`).catch(() => {});
+    fail("WINDOWS_ELECTRON_SMOKE_SHARE_SAVE_INVALID");
+  }
+
+  await cdp.evaluate(`() => {
+    globalThis.__TIBOTATTLE_WINDOWS_SMOKE_SHARE_EVENTS__?.reset?.();
+    return true;
+  })()`);
+  const copyBaseline = await cdp.evaluate(`(() => ({
+    statusText: document.querySelector("#share-card-status")?.textContent?.trim() ?? "",
+    toastText: document.querySelector("#share-card-toast")?.textContent?.trim() ?? "",
+  }))()`);
+  const copyClicked = await cdp.evaluate(`(() => {
+    const button = document.querySelector("#share-card-copy");
+    if (!button || button.disabled) return false;
+    button.click();
+    return true;
+  })()`);
+  const copyResult = await waitFor(async () => {
+    const value = await readAction("copy", copyBaseline);
+    return value?.actionEnabled === true
+      && (value.statusChanged || value.toastChanged)
+      ? value
+      : null;
+  }, WINDOWS_ELECTRON_SMOKE_SHARE_ACTION_TIMEOUT_MS, "Windows Share copy action").catch(() => null);
+  const copyDecision = classifyWindowsShareActionResult({
+    action: "copy",
+    clicked: copyClicked === true,
+    ...copyResult,
+  });
+  await cdp.evaluate(`() => {
+    globalThis.__TIBOTATTLE_WINDOWS_SMOKE_SHARE_EVENTS__?.cleanup?.();
+    return true;
+  })()`).catch(() => {});
+  if (copyDecision.status !== "passed") {
+    fail("WINDOWS_ELECTRON_SMOKE_SHARE_COPY_INVALID");
+  }
   await cdp.evaluate(`document.querySelector('[data-nav="overview"]')?.click()`);
 }
 
@@ -1877,6 +2826,190 @@ export function isWindowsDashboardTarget(target, debugPort) {
 export function selectWindowsDashboardTarget(targets, debugPort) {
   if (!Array.isArray(targets)) return undefined;
   return targets.find((target) => isWindowsDashboardTarget(target, debugPort));
+}
+
+/**
+ * Select only the settings document opened by this dashboard's Electron
+ * process. The target may carry a section hash, but its origin, path, and CDP
+ * websocket remain exact so an unrelated local page cannot satisfy Settings
+ * parity.
+ */
+export function isWindowsSettingsTarget(target, dashboardOrigin, debugPort) {
+  if (target === null
+      || typeof target !== "object"
+      || Array.isArray(target)
+      || target.type !== "page"
+      || typeof target.url !== "string"
+      || typeof target.webSocketDebuggerUrl !== "string"
+      || target.webSocketDebuggerUrl.length === 0
+      || typeof dashboardOrigin !== "string"
+      || typeof debugPort !== "number"
+      || !Number.isInteger(debugPort)
+      || debugPort < 1
+      || debugPort > 65_535) {
+    return false;
+  }
+  let parsed;
+  let websocket;
+  try {
+    parsed = new URL(target.url);
+    websocket = new URL(target.webSocketDebuggerUrl);
+  } catch {
+    return false;
+  }
+  return parsed.protocol === "http:"
+    && parsed.origin === dashboardOrigin
+    && parsed.pathname === "/electron-settings.html"
+    && parsed.search === ""
+    && parsed.username === ""
+    && parsed.password === ""
+    && websocket.protocol === "ws:"
+    && websocket.hostname === "127.0.0.1"
+    && websocket.port === String(debugPort)
+    && /^\/devtools\/page\/[^/?#]+$/u.test(websocket.pathname)
+    && websocket.search === ""
+    && websocket.hash === ""
+    && websocket.username === ""
+    && websocket.password === "";
+}
+
+export function selectWindowsSettingsTarget(targets, dashboardOrigin, debugPort) {
+  if (!Array.isArray(targets)) return undefined;
+  return targets.find((target) => isWindowsSettingsTarget(target, dashboardOrigin, debugPort));
+}
+
+async function findWindowsSettingsTarget(debugPort, dashboardOrigin) {
+  const targets = await jsonFetch(`http://127.0.0.1:${debugPort}/json`);
+  return selectWindowsSettingsTarget(targets, dashboardOrigin, debugPort);
+}
+
+async function assertWindowsSettingsFlow(cdp, debugPort, dashboardOrigin) {
+  await cdp.evaluate("document.querySelector('#electron-settings-button')?.click()");
+  const target = await waitFor(
+    () => findWindowsSettingsTarget(debugPort, dashboardOrigin),
+    MAX_STARTUP_MS,
+    "Windows Electron Settings target",
+  );
+  const settingsCdp = await connectCdp(target);
+  try {
+    await settingsCdp.request("Page.enable");
+    const state = await waitFor(async () => {
+      const snapshot = await settingsCdp.evaluate(`(() => {
+        const status = document.querySelector("#settings-bridge-status");
+        const tabs = [...document.querySelectorAll("[data-settings-tab]")];
+        const general = document.querySelector('[data-settings-panel="general"]');
+        const localTools = [
+          "#settings-open-dashboard-browser",
+          "#settings-show-diagnostics",
+          "#settings-reveal-local-data",
+        ];
+        const localToolElements = localTools.map((selector) => document.querySelector(selector));
+        return {
+          title: document.title,
+          connected: status?.classList.contains("is-ready") === true,
+          tabCount: tabs.length,
+          generalVisible: general?.hidden === false,
+          localToolsPresent: localToolElements.every((element) => element !== null),
+          localToolsReady: localToolElements.every((element) => element?.disabled === false),
+          // These controls are intentionally not clicked here. The packaged
+          // harness has no content-free receipt for their external UI side
+          // effects, so they remain separate pending checks rather than being
+          // mistaken for completed Settings parity.
+          localToolsPending: [
+            "open_dashboard_browser",
+            "show_diagnostics",
+            "reveal_local_data",
+          ],
+        };
+      })()`);
+      return snapshot?.title === "TiboTattle Settings"
+        && snapshot?.connected === true
+        && snapshot?.tabCount === 3
+        && snapshot?.generalVisible === true
+        && snapshot?.localToolsPresent === true
+        && snapshot?.localToolsReady === true
+        ? snapshot
+        : null;
+    }, MAX_STARTUP_MS, "Windows Electron Settings render").catch(() => null);
+    if (state?.title !== "TiboTattle Settings"
+        || state?.connected !== true
+        || state?.tabCount !== 3
+        || state?.generalVisible !== true
+        || state?.localToolsPresent !== true
+        || state?.localToolsReady !== true
+        || JSON.stringify(state?.localToolsPending)
+          !== JSON.stringify([
+            "open_dashboard_browser",
+            "show_diagnostics",
+            "reveal_local_data",
+          ])) {
+      fail("WINDOWS_ELECTRON_SMOKE_SETTINGS_FLOW_INVALID");
+    }
+    const tabs = await settingsCdp.evaluate(`(() => {
+      const notifications = document.querySelector('[data-settings-tab="notifications"]');
+      const about = document.querySelector('[data-settings-tab="about"]');
+      notifications?.click();
+      const notificationsVisible = document.querySelector(
+        '[data-settings-panel="notifications"]',
+      )?.hidden === false;
+      about?.click();
+      const aboutVisible = document.querySelector(
+        '[data-settings-panel="about"]',
+      )?.hidden === false;
+      return { notificationsVisible, aboutVisible };
+    })()`);
+    if (tabs?.notificationsVisible !== true || tabs?.aboutVisible !== true) {
+      fail("WINDOWS_ELECTRON_SMOKE_SETTINGS_TABS_INVALID");
+    }
+
+    // Exercise one low-risk, reversible settings bridge action end to end.
+    // The read-back is intentionally semantic and bounded: it proves that
+    // the main-process store accepted the change without carrying a path,
+    // account identifier, or error payload into the qualification receipt.
+    const readRefreshInterval = () => settingsCdp.evaluate(`(async () => {
+      const snapshot = await window.tibotattleDesktop?.getSettings?.();
+      const seconds = snapshot?.settings?.refreshIntervalSeconds;
+      return [60, 300, 900, 1800].includes(seconds) ? seconds : null;
+    })()`).catch(() => null);
+    const setRefreshInterval = async (seconds) => {
+      const dispatched = await settingsCdp.evaluate(`(() => {
+        const select = document.querySelector("#settings-refresh-interval");
+        if (!select || select.disabled) return false;
+        select.value = ${JSON.stringify(String(seconds))};
+        select.dispatchEvent(new Event("change", { bubbles: true }));
+        return select.value === ${JSON.stringify(String(seconds))};
+      })()`).catch(() => false);
+      if (dispatched !== true) return false;
+      return await waitFor(async () => {
+        const actual = await readRefreshInterval();
+        return actual === seconds ? true : null;
+      }, MAX_OPERATION_MS, "Windows Settings refresh interval action").catch(() => false);
+    };
+    let originalRefreshInterval = null;
+    let temporaryApplied = false;
+    let originalRestored = false;
+    try {
+      originalRefreshInterval = await readRefreshInterval();
+      if (![60, 300, 900, 1800].includes(originalRefreshInterval)) {
+        fail("WINDOWS_ELECTRON_SMOKE_SETTINGS_FLOW_INVALID");
+      }
+      const temporaryRefreshInterval = originalRefreshInterval === 60 ? 300 : 60;
+      temporaryApplied = await setRefreshInterval(temporaryRefreshInterval);
+      if (temporaryApplied !== true) {
+        fail("WINDOWS_ELECTRON_SMOKE_SETTINGS_FLOW_INVALID");
+      }
+    } finally {
+      if (originalRefreshInterval !== null) {
+        originalRestored = await setRefreshInterval(originalRefreshInterval)
+          .catch(() => false);
+      }
+    }
+    if (temporaryApplied !== true || originalRestored !== true) {
+      fail("WINDOWS_ELECTRON_SMOKE_SETTINGS_FLOW_INVALID");
+    }
+  } finally {
+    settingsCdp.close();
+  }
 }
 
 /**
@@ -2307,6 +3440,7 @@ async function dashboardConnection(
   return Object.freeze({
     cdp,
     dashboardUrl,
+    loaderId: readyLoader,
     browser: version.Browser,
     refreshObserver,
     onCheckpoint: checkpoint,
@@ -2691,8 +3825,35 @@ export async function runSmoke(progress) {
     progress.showHideTrayLifecycle = true;
 
     failurePhase = "refresh";
+    // Add a bounded, disposable history immediately before the cancellation
+    // probe. The probe only passes after it actually observes this operation
+    // in `running`/`cancelling`; if the fixture is still too fast, the smoke
+    // fails closed with a distinct terminal-race diagnosis.
+    await seedWindowsCancellationFixture(fixture);
+    await assertWindowsRefreshCancelPath(
+      connection.cdp,
+      connection.dashboardUrl,
+      connection.loaderId,
+    );
     await runSyntheticRefresh(connection);
     progress.syntheticRefresh = true;
+    await assertWindowsRefreshTerminalControls(connection.cdp);
+    // Do not inspect parity while the initial renderer is still showing
+    // accounting placeholders. The explicit synthetic pass above gives the
+    // packaged dashboard a terminal, renderable local snapshot first.
+    failurePhase = "dashboard";
+    const parityHealth = await jsonFetch(
+      new URL("/api/local/health", connection.dashboardUrl),
+      undefined,
+      "WINDOWS_ELECTRON_SMOKE_DASHBOARD_TIMEOUT",
+    );
+    await assertWindowsDashboardParitySurfaces(connection.cdp, parityHealth);
+    await assertWindowsShareFlow(connection.cdp);
+    await assertWindowsSettingsFlow(
+      connection.cdp,
+      primaryPort,
+      connection.dashboardUrl.origin,
+    );
     failurePhase = "status";
     await assertFailClosedDesktopStatusRoute(connection);
     failurePhase = "persistence";
