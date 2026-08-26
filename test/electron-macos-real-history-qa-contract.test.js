@@ -793,6 +793,8 @@ test("source contract preserves the real profile and bounds every health poll", 
   assert.match(source, /Network\.responseReceived/u);
   assert.match(source, /sampleControlPlane/u);
   assert.match(source, /cancelHttp/u);
+  assert.match(source, /status\.refresh\.quickResultAt/u);
+  assert.match(source, /status\.refresh\.progress\?\.phase === "quick_result"/u);
   assert.match(source, /(?:loading|preparing|checking)/u);
   assert.match(source, /capturedDescendantPidsGone/u);
   assert.match(source, /session\.expectedDescendantPids = descendantsOf\(child\.pid\)/u);

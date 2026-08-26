@@ -1529,18 +1529,26 @@ async function waitCancelAcknowledged(session) {
 }
 
 async function runCancelMode(session) {
-  const first = await waitFor(async () => {
-    const requests = session.observer.snapshot();
-    if (requests.length > 1) {
-      fail("REAL_HISTORY_QA_REFRESH_DUPLICATE", "cancel", "refresh_duplicate");
-    }
-    if (requests.length !== 1) return null;
-    const status = await refreshStatus(session);
-    return status?.refresh?.status === "running"
-      && typeof status.refresh.refreshId === "string"
-      ? status.refresh
-      : null;
-  }, REAL_HISTORY_QA_TIMEOUTS.startupMs, "cancel mode refresh start");
+  let first;
+  try {
+    first = await waitFor(async () => {
+      const requests = session.observer.snapshot();
+      if (requests.length > 1) {
+        fail("REAL_HISTORY_QA_REFRESH_DUPLICATE", "cancel", "refresh_duplicate");
+      }
+      if (requests.length !== 1) return null;
+      const status = await refreshStatus(session);
+      return status?.refresh?.status === "running"
+        && typeof status.refresh.refreshId === "string"
+        && typeof status.refresh.quickResultAt === "string"
+        && status.refresh.progress?.phase === "quick_result"
+        ? status.refresh
+        : null;
+    }, REAL_HISTORY_QA_TIMEOUTS.startupMs, "cancel mode quick-result boundary");
+  } catch (error) {
+    if (error?.qaStage) throw error;
+    fail("REAL_HISTORY_QA_REFRESH_NOT_STARTED", "refresh", "refresh_not_started");
+  }
   session.controlPlane.reset();
   let timer = {};
   let controlPlane = {};
