@@ -185,7 +185,7 @@ test("projector supplies a localization seam without exposing raw input fields",
       remainingPercent: 73,
       label: "5H 73%",
     },
-    compactTitle: "–",
+    compactTitle: "73%",
     evidenceLabel: "FRESH",
     windows: [],
   });
@@ -205,6 +205,31 @@ test("projector supplies a localization seam without exposing raw input fields",
     projectDesktopTrayStatus({ status: "stale", allowance: null, notificationEvidence: null }),
     { status: "stale", label: "Stale", allowance: null, compactTitle: "–", evidenceLabel: "Stale", windows: [] },
   );
+});
+
+test("compact title never promotes a secondary-only lane", () => {
+  const projected = projectDesktopTrayStatus({
+    status: "fresh",
+    allowance: null,
+    notificationEvidence: {
+      schemaVersion: "tibotattle-notification-evidence-v2",
+      status: "fresh_provider_observation",
+      provider: "openai_codex",
+      source: "app_server_read",
+      freshness: "fresh",
+      observedAt: "2026-08-22T12:00:00.000Z",
+      continuityKey: "a".repeat(43),
+      windows: [{
+        lane: "secondary",
+        usedPercent: 26,
+        durationMinutes: 300,
+        resetAt: "2026-08-22T15:00:00.000Z",
+        resetProofKind: "provider_reported_schedule_only",
+      }],
+    },
+  });
+  assert.equal(projected.compactTitle, "–");
+  assert.equal(projected.allowance, null);
 });
 
 test("localization output is bounded and cannot smuggle control text", () => {

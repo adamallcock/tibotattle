@@ -308,15 +308,20 @@ export function projectDesktopTrayStatus(value, options = {}) {
     );
     return Object.freeze({ ...window, remainingPercent, label });
   });
-  const primary = windows.find(({ lane }) => lane === "primary") ?? windows[0] ?? null;
   const observedMinutes = evidence === null
     ? null
     : Math.max(0, Math.floor((now - Date.parse(evidence.observedAt)) / 60_000));
+  // The compact status-item title may make only the already-validated direct
+  // allowance claim.  Do not promote a secondary lane (or a renderer-shaped
+  // value) into the title when the primary summary is unavailable.
+  const compactTitle = allowance === null
+    ? (status.status === "analyzing" ? "…" : "–")
+    : `${allowance.remainingPercent}%`;
   return Object.freeze({
     status: status.status,
     label: statusLabel,
     allowance,
-    compactTitle: primary === null ? (status.status === "analyzing" ? "…" : "–") : `${primary.remainingPercent}%`,
+    compactTitle,
     evidenceLabel: evidence === null ? statusLabel : localizeText(
       localize,
       "electron.tray.evidenceCurrent",

@@ -82,7 +82,7 @@ class FakeTray extends EventEmitter {
   destroy() {}
 }
 
-function fixture({ fetchImpl, onDesktopStatus } = {}) {
+function fixture({ fetchImpl, onDesktopStatus, platform = "darwin" } = {}) {
   const app = new FakeApp();
   const windows = [];
   const trays = [];
@@ -118,6 +118,7 @@ function fixture({ fetchImpl, onDesktopStatus } = {}) {
     createNavigationPolicy: () => ({}),
     installNavigationPolicy: () => ({ remove() {} }),
     onDesktopStatus,
+    platform,
     desktopStatusMonitorOptions: {
       fetchImpl,
       intervalMs: 60_000,
@@ -195,4 +196,20 @@ test("lifecycle stops status polling at recovery and restarts it for bounded ret
   assert.equal(fixtureValue.trays[0].menu.template[1].label, "Status unavailable");
   await fixtureValue.lifecycle.requestQuit();
   assert.equal(fixtureValue.app.quitCalls, 1);
+});
+
+test("lifecycle keeps the compact title Darwin-only", async () => {
+  for (const platform of ["win32", "linux"]) {
+    const fixtureValue = fixture({
+      platform,
+      fetchImpl: async (url) => jsonResponse(status(), url),
+    });
+    await fixtureValue.lifecycle.start();
+    await waitFor(() => fixtureValue.trays[0].menu.template[0].label === "TiboTattle · 74% allowance");
+    // Non-Darwin platforms receive only the existing empty-title clear. They
+    // must never receive the numeric compact title intended for macOS.
+    assert.ok(fixtureValue.trays[0].titles.length > 0);
+    assert.ok(fixtureValue.trays[0].titles.every((value) => value === ""));
+    await fixtureValue.lifecycle.dispose();
+  }
 });
