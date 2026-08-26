@@ -1135,6 +1135,70 @@ export function cancelHttpResponseValid(response) {
     && response.latencyMs <= REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS;
 }
 
+function attachQaEvidence(error, evidence = {}) {
+  if (error === null || (typeof error !== "object" && typeof error !== "function")) {
+    return error;
+  }
+  const previous = error.qaEvidence && typeof error.qaEvidence === "object"
+    ? error.qaEvidence
+    : {};
+  try {
+    Object.defineProperty(error, "qaEvidence", {
+      value: Object.freeze({ ...previous, ...evidence }),
+      enumerable: false,
+      configurable: true,
+      writable: false,
+    });
+  } catch {
+    // The original classified error remains the fail-closed signal. Evidence
+    // is best effort and must never turn a QA failure into a new failure.
+  }
+  return error;
+}
+
+function samplerEvidence(error, key) {
+  const evidence = error?.qaEvidence?.[key];
+  return evidence !== null && typeof evidence === "object" && !Array.isArray(evidence)
+    ? evidence
+    : {};
+}
+
+/**
+ * Run the renderer timer and direct loopback control-plane probes together.
+ * A timer failure must not cancel the health/status probes: the resulting
+ * classified error carries only their bounded summary so the failure receipt
+ * can distinguish a frozen renderer from an unresponsive companion.
+ */
+export async function sampleTimerAndControlPlaneConcurrently(
+  timerSampler,
+  controlPlaneSampler,
+) {
+  if (typeof timerSampler !== "function" || typeof controlPlaneSampler !== "function") {
+    throw new TypeError("real-history QA samplers must be functions");
+  }
+  const [timerResult, controlPlaneResult] = await Promise.allSettled([
+    Promise.resolve().then(timerSampler),
+    Promise.resolve().then(controlPlaneSampler),
+  ]);
+  const timer = timerResult.status === "fulfilled"
+    ? timerResult.value ?? {}
+    : samplerEvidence(timerResult.reason, "timer");
+  const controlPlane = controlPlaneResult.status === "fulfilled"
+    ? controlPlaneResult.value ?? {}
+    : samplerEvidence(controlPlaneResult.reason, "controlPlane");
+  if (timerResult.status === "rejected" || controlPlaneResult.status === "rejected") {
+    const reason = timerResult.status === "rejected"
+      ? timerResult.reason
+      : controlPlaneResult.reason;
+    const error = reason instanceof Error
+      ? reason
+      : new Error("real-history QA sampler failed");
+    attachQaEvidence(error, { timer, controlPlane });
+    throw error;
+  }
+  return Object.freeze({ timer, controlPlane });
+}
+
 async function sampleControlPlane(session, expectedRefreshId) {
   const healthUrl = new URL("/api/local/health", session.dashboardUrl);
   const refreshUrl = new URL("/api/local/refresh", session.dashboardUrl);
@@ -1383,7 +1447,17 @@ async function sampleAdvancingTimer(session) {
   }
   const unique = [...new Set(values)];
   const advanced = unique.length >= 4 && unique.at(-1) - unique[0] >= 3;
-  if (!advanced) fail("REAL_HISTORY_QA_TIMER_STALLED", "refresh", "timer_stalled");
+  if (!advanced) {
+    const error = qaError("REAL_HISTORY_QA_TIMER_STALLED", "refresh", "timer_stalled");
+    attachQaEvidence(error, {
+      timer: {
+        sampleCount: values.length,
+        uniqueCount: unique.length,
+        advanced: false,
+      },
+    });
+    throw error;
+  }
   return Object.freeze({
     sampleCount: values.length,
     uniqueCount: unique.length,
@@ -1449,73 +1523,87 @@ async function runCancelMode(session) {
       : null;
   }, REAL_HISTORY_QA_TIMEOUTS.startupMs, "cancel mode refresh start");
   session.controlPlane.reset();
-  const timer = await sampleAdvancingTimer(session);
-  const controlPlane = await sampleControlPlane(session, first.refreshId);
-  const cancelStartedAt = Date.now();
-  await clickCancel(session);
-  await waitCancelAcknowledged(session);
-  const acknowledgedMs = Date.now() - cancelStartedAt;
-  const cancelHttp = await waitCancelHttpResponse(session);
-  const firstTerminal = await waitRefreshTerminal(
-    session,
-    first.refreshId,
-    REAL_HISTORY_QA_TIMEOUTS.cancelMs,
-  );
-  if (firstTerminal.status !== "cancelled") {
-    fail("REAL_HISTORY_QA_CANCEL_WRONG_TERMINAL", "cancel", "cancel_wrong_terminal");
-  }
-  const terminalMs = Date.now() - cancelStartedAt;
-  await waitUiReleased(session);
-  session.observer.reset();
-  const retryClicked = await session.cdp.evaluate(`(() => {
-    const button = document.querySelector("#refresh-button");
-    if (!button || button.disabled) return false;
-    button.click();
-    return true;
-  })()`);
-  if (retryClicked !== true) fail("REAL_HISTORY_QA_RETRY_REJECTED", "cancel", "retry_rejected");
-  session.controlPlane.reset();
-  const retry = await waitFor(async () => {
-    const requests = session.observer.snapshot();
-    if (requests.length > 1) {
-      fail("REAL_HISTORY_QA_REFRESH_DUPLICATE", "cancel", "refresh_duplicate");
+  let timer = {};
+  let controlPlane = {};
+  try {
+    ({ timer, controlPlane } = await sampleTimerAndControlPlaneConcurrently(
+      () => sampleAdvancingTimer(session),
+      () => sampleControlPlane(session, first.refreshId),
+    ));
+    const cancelStartedAt = Date.now();
+    await clickCancel(session);
+    await waitCancelAcknowledged(session);
+    const acknowledgedMs = Date.now() - cancelStartedAt;
+    const cancelHttp = await waitCancelHttpResponse(session);
+    const firstTerminal = await waitRefreshTerminal(
+      session,
+      first.refreshId,
+      REAL_HISTORY_QA_TIMEOUTS.cancelMs,
+    );
+    if (firstTerminal.status !== "cancelled") {
+      fail("REAL_HISTORY_QA_CANCEL_WRONG_TERMINAL", "cancel", "cancel_wrong_terminal");
     }
-    if (requests.length !== 1) return null;
-    const status = await refreshStatus(session);
-    return status?.refresh?.status === "running"
-      && typeof status.refresh.refreshId === "string"
-      && status.refresh.refreshId !== first.refreshId
-      ? status.refresh
-      : null;
-  }, REAL_HISTORY_QA_TIMEOUTS.retryMs, "cancel mode retry");
-  await wait(2_000);
-  await clickCancel(session);
-  await waitCancelAcknowledged(session);
-  const retryCancelHttp = await waitCancelHttpResponse(session);
-  const retryTerminal = await waitRefreshTerminal(
-    session,
-    retry.refreshId,
-    REAL_HISTORY_QA_TIMEOUTS.cancelMs,
-  );
-  if (retryTerminal.status !== "cancelled") {
-    fail("REAL_HISTORY_QA_CANCEL_WRONG_TERMINAL", "cancel", "cancel_wrong_terminal");
+    const terminalMs = Date.now() - cancelStartedAt;
+    await waitUiReleased(session);
+    session.observer.reset();
+    const retryClicked = await session.cdp.evaluate(`(() => {
+      const button = document.querySelector("#refresh-button");
+      if (!button || button.disabled) return false;
+      button.click();
+      return true;
+    })()`);
+    if (retryClicked !== true) fail("REAL_HISTORY_QA_RETRY_REJECTED", "cancel", "retry_rejected");
+    session.controlPlane.reset();
+    const retry = await waitFor(async () => {
+      const requests = session.observer.snapshot();
+      if (requests.length > 1) {
+        fail("REAL_HISTORY_QA_REFRESH_DUPLICATE", "cancel", "refresh_duplicate");
+      }
+      if (requests.length !== 1) return null;
+      const status = await refreshStatus(session);
+      return status?.refresh?.status === "running"
+        && typeof status.refresh.refreshId === "string"
+        && status.refresh.refreshId !== first.refreshId
+        ? status.refresh
+        : null;
+    }, REAL_HISTORY_QA_TIMEOUTS.retryMs, "cancel mode retry");
+    await wait(2_000);
+    await clickCancel(session);
+    await waitCancelAcknowledged(session);
+    const retryCancelHttp = await waitCancelHttpResponse(session);
+    const retryTerminal = await waitRefreshTerminal(
+      session,
+      retry.refreshId,
+      REAL_HISTORY_QA_TIMEOUTS.cancelMs,
+    );
+    if (retryTerminal.status !== "cancelled") {
+      fail("REAL_HISTORY_QA_CANCEL_WRONG_TERMINAL", "cancel", "cancel_wrong_terminal");
+    }
+    return Object.freeze({
+      timer,
+      controlPlane,
+      cancel: Object.freeze({
+        acknowledgedMs,
+        terminalMs,
+        terminalStatus: "cancelled",
+        http: cancelHttp,
+      }),
+      retry: Object.freeze({
+        newRefreshId: true,
+        accepted: true,
+        terminalStatus: "cancelled",
+        cancelHttp: retryCancelHttp,
+      }),
+    });
+  } catch (error) {
+    attachQaEvidence(error, {
+      timer: Object.keys(timer).length > 0 ? timer : samplerEvidence(error, "timer"),
+      controlPlane: Object.keys(controlPlane).length > 0
+        ? controlPlane
+        : samplerEvidence(error, "controlPlane"),
+    });
+    throw error;
   }
-  return Object.freeze({
-    timer,
-    controlPlane,
-    cancel: Object.freeze({
-      acknowledgedMs,
-      terminalMs,
-      terminalStatus: "cancelled",
-      http: cancelHttp,
-    }),
-    retry: Object.freeze({
-      newRefreshId: true,
-      accepted: true,
-      terminalStatus: "cancelled",
-      cancelHttp: retryCancelHttp,
-    }),
-  });
 }
 
 function visibleInRenderer(element) {
@@ -2073,11 +2161,16 @@ if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
       receipt = await runQa(options);
     }
   } catch (error) {
+    const evidence = error?.qaEvidence && typeof error.qaEvidence === "object"
+      ? error.qaEvidence
+      : {};
     receipt = buildRealHistoryReceipt({
       mode: options?.mode ?? "full",
       status: "failed",
       failureStage: FAILURE_STAGES.has(error?.qaStage) ? error.qaStage : "input",
       failureReason: failureReason(error),
+      timer: evidence.timer,
+      controlPlane: evidence.controlPlane,
       artifactSha256: error?.verifiedArtifactSha256 ?? null,
       artifactIdentityVerified: typeof error?.verifiedArtifactSha256 === "string",
     });

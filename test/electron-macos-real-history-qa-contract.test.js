@@ -22,6 +22,7 @@ import {
   realHistoryDashboardReadySnapshotValid,
   releaseRealHistoryRefreshGate,
   runLaunchGate,
+  sampleTimerAndControlPlaneConcurrently,
   waitForLaunchGate,
   waitFor,
   verifyPackagedArtifactIdentity,
@@ -494,6 +495,68 @@ test("control-plane gate requires bounded health/status samples", () => {
   });
 });
 
+test("timer and control-plane probes run concurrently and retain safe evidence on timer failure", async () => {
+  const controlPlane = {
+    active: true,
+    sampleCount: 3,
+    healthSuccessCount: 3,
+    refreshStatusSuccessCount: 3,
+    maxLatencyMs: 21,
+  };
+  const timerError = Object.assign(
+    new Error("private timer detail"),
+    {
+      qaStage: "refresh",
+      qaReason: "timer_stalled",
+      qaEvidence: {
+        timer: { sampleCount: 4, uniqueCount: 1, advanced: false },
+      },
+    },
+  );
+  let timerStarted = false;
+  let controlPlaneStarted = false;
+  await assert.rejects(
+    () => sampleTimerAndControlPlaneConcurrently(
+      async () => {
+        timerStarted = true;
+        await new Promise((resolveTimer) => setTimeout(resolveTimer, 5));
+        throw timerError;
+      },
+      async () => {
+        controlPlaneStarted = true;
+        await new Promise((resolveControlPlane) => setTimeout(resolveControlPlane, 1));
+        return controlPlane;
+      },
+    ),
+    (error) => {
+      assert.equal(error, timerError);
+      assert.equal(error.qaReason, "timer_stalled");
+      assert.equal(timerStarted, true);
+      assert.equal(controlPlaneStarted, true);
+      assert.deepEqual(error.qaEvidence.timer, {
+        sampleCount: 4,
+        uniqueCount: 1,
+        advanced: false,
+      });
+      assert.deepEqual(error.qaEvidence.controlPlane, controlPlane);
+      assert.equal(JSON.stringify(error).includes("private timer detail"), false);
+      return true;
+    },
+  );
+
+  const receipt = buildRealHistoryReceipt({
+    status: "failed",
+    failureStage: "refresh",
+    failureReason: "timer_stalled",
+    timer: timerError.qaEvidence.timer,
+    controlPlane: timerError.qaEvidence.controlPlane,
+  });
+  assert.equal(receipt.failureReason, "timer_stalled");
+  assert.deepEqual(receipt.timer, timerError.qaEvidence.timer);
+  assert.deepEqual(receipt.controlPlane, controlPlane);
+  assert.equal(JSON.stringify(receipt).includes("private timer detail"), false);
+});
+
 test("control-plane observer retains only exact loopback route response metadata", () => {
   const handlers = new Map();
   const cdp = {
@@ -709,6 +772,10 @@ test("source contract preserves the real profile and bounds every health poll", 
   assert.match(source, /new URL\("\/api\/health", session\.dashboardUrl\)/u);
   assert.match(source, /serviceHealth\?\.status === "ok"/u);
   assert.match(source, /REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS/u);
+  assert.match(source, /sampleTimerAndControlPlaneConcurrently/u);
+  assert.match(source, /Promise\.allSettled\(\[/u);
+  assert.match(source, /timer: evidence\.timer/u);
+  assert.match(source, /controlPlane: evidence\.controlPlane/u);
   assert.match(source, /waitForLaunchGate/u);
   assert.match(source, /runLaunchGate/u);
   assert.match(source, /releaseRealHistoryRefreshGate/u);
