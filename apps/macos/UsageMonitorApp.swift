@@ -6407,7 +6407,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             TiboTattleLocalization.Key
         )] = [
             (.fiveHour, .settingsMenuBarAllowanceFiveHour),
+            (.weekly, .settingsMenuBarAllowanceWeekly),
             (.both, .settingsMenuBarAllowanceBoth),
+            (.off, .settingsMenuBarAllowanceOff),
         ]
         for (preference, key) in menuBarAllowanceChoices {
             menuBarAllowancePicker.addItem(
@@ -8659,8 +8661,15 @@ private enum MenuBarContractSmokeTest {
         liveSnapshot.evidence = .live
         liveSnapshot.lanes = [weeklyLane, fiveHourLane]
         liveSnapshot.observedAt = observedAt
+        var weeklyDisplaySnapshot = liveSnapshot
+        weeklyDisplaySnapshot.allowanceDisplayPreference = .weekly
         var bothLiveSnapshot = liveSnapshot
         bothLiveSnapshot.allowanceDisplayPreference = .both
+        var bothWeeklyOnlySnapshot = liveSnapshot
+        bothWeeklyOnlySnapshot.lanes = [weeklyLane]
+        bothWeeklyOnlySnapshot.allowanceDisplayPreference = .both
+        var offDisplaySnapshot = liveSnapshot
+        offDisplaySnapshot.allowanceDisplayPreference = .off
         var weeklyOnlySnapshot = liveSnapshot
         weeklyOnlySnapshot.lanes = [weeklyLane]
         let liveSummary = liveSnapshot.laneSummary(
@@ -8680,10 +8689,8 @@ private enum MenuBarContractSmokeTest {
         var unavailableLiveSnapshot = liveSnapshot
         unavailableLiveSnapshot.phase = .unavailable
         let reset = resetCountdown(resetAt, now: observedAt)
-        let expectedLiveTitle = TiboTattleLocalization.format(
-            .menuBarCompactAllowance,
-            TiboTattleLocalization.string(.menuBarFiveHourShort),
-            TiboTattleLocalization.percentString(63)
+        let expectedLiveTitle = TiboTattleLocalization.percentString(
+            63
         )
         let expectedBothLiveTitle = [
             TiboTattleLocalization.format(
@@ -8697,6 +8704,9 @@ private enum MenuBarContractSmokeTest {
                 TiboTattleLocalization.percentString(71)
             ),
         ].joined(separator: " · ")
+        let expectedWeeklyLiveTitle = TiboTattleLocalization.percentString(
+            71
+        )
         let expectedLiveSummary = reset.map {
             TiboTattleLocalization.format(
                 .menuBarQuotaWeeklyPositionResets,
@@ -8742,7 +8752,14 @@ private enum MenuBarContractSmokeTest {
               ),
               liveSnapshot.allowanceDisplayPreference == .fiveHour,
               liveSnapshot.title == expectedLiveTitle,
+              weeklyDisplaySnapshot.title == expectedWeeklyLiveTitle,
               bothLiveSnapshot.title == expectedBothLiveTitle,
+              bothWeeklyOnlySnapshot.title == TiboTattleLocalization.format(
+                  .menuBarCompactAllowance,
+                  TiboTattleLocalization.string(.menuBarSevenDayShort),
+                  TiboTattleLocalization.percentString(71)
+              ),
+              offDisplaySnapshot.title.isEmpty,
               weeklyOnlySnapshot.title == "–",
               analyzingLiveSnapshot.title == expectedLiveTitle,
               analyzingWithoutLiveEvidence.title == "…",
@@ -8762,7 +8779,7 @@ private enum MenuBarContractSmokeTest {
                 + "shortcuts=cmd-r,cmd-comma,cmd-q "
                 + "dismissal=native,escape,same-app,deactivation "
                 + "weekly_position=fresh-only "
-                + "compact_allowance=five-hour-or-both "
+                + "compact_allowance=five-hour,weekly,both,off "
                 + "analysis_title=live-fallback"
         )
         return 0

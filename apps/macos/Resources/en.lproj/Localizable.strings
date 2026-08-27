@@ -26,8 +26,10 @@
 "settings.appearanceSystem" = "System";
 "settings.menuBarAllowance" = "Menu bar allowance";
 "settings.menuBarAllowanceDetail" = "Choose which fresh allowance percentage appears beside the menu-bar icon.";
-"settings.menuBarAllowanceFiveHour" = "5-hour only";
-"settings.menuBarAllowanceBoth" = "Both 5-hour and 7-day";
+"settings.menuBarAllowanceFiveHour" = "5-hour";
+"settings.menuBarAllowanceWeekly" = "Week";
+"settings.menuBarAllowanceBoth" = "5-hour + week";
+"settings.menuBarAllowanceOff" = "Off";
 "settings.automaticUpdates" = "Automatic updates";
 "settings.automaticUpdatesOff" = "Automatic downloads are off.";
 "settings.automaticUpdatesOn" = "Automatic downloads are on.";

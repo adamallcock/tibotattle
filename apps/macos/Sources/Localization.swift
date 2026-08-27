@@ -269,7 +269,9 @@ enum TiboTattleLocalization {
         case settingsMenuBarAllowance = "settings.menuBarAllowance"
         case settingsMenuBarAllowanceDetail = "settings.menuBarAllowanceDetail"
         case settingsMenuBarAllowanceFiveHour = "settings.menuBarAllowanceFiveHour"
+        case settingsMenuBarAllowanceWeekly = "settings.menuBarAllowanceWeekly"
         case settingsMenuBarAllowanceBoth = "settings.menuBarAllowanceBoth"
+        case settingsMenuBarAllowanceOff = "settings.menuBarAllowanceOff"
         case settingsAutomaticUpdates = "settings.automaticUpdates"
         case settingsAutomaticUpdatesOff = "settings.automaticUpdatesOff"
         case settingsAutomaticUpdatesOn = "settings.automaticUpdatesOn"
@@ -773,9 +775,13 @@ enum TiboTattleLocalization {
             case .settingsMenuBarAllowanceDetail:
                 "Choose which fresh allowance percentage appears beside the menu-bar icon."
             case .settingsMenuBarAllowanceFiveHour:
-                "5-hour only"
+                "5-hour"
+            case .settingsMenuBarAllowanceWeekly:
+                "Week"
             case .settingsMenuBarAllowanceBoth:
-                "Both 5-hour and 7-day"
+                "5-hour + week"
+            case .settingsMenuBarAllowanceOff:
+                "Off"
             case .settingsAutomaticUpdates:
                 "Automatic updates"
             case .settingsAutomaticUpdatesOff:

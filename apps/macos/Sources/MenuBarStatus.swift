@@ -283,6 +283,7 @@ private enum StatusGlyphState: Equatable {
     case stale
     case analyzing
     case unavailable
+    case off
 }
 
 /// Which provider-reported Codex allowance appears in the compact status-item
@@ -290,7 +291,9 @@ private enum StatusGlyphState: Equatable {
 /// preference only controls the always-visible title beside the app mark.
 enum NativeMenuBarAllowanceDisplayPreference: String, CaseIterable {
     case fiveHour = "five-hour"
+    case weekly = "weekly"
     case both
+    case off
 
     static let defaultsKey = "tibotattle.menu-bar-allowance.v1"
     static let defaultPreference: Self = .fiveHour
@@ -371,13 +374,17 @@ struct MenuBarStatusSnapshot: Equatable {
     }
 
     /// The compact title is intentionally limited to the normal Codex
-    /// five-hour and seven-day windows. A selected five-hour display never
-    /// falls back to the weekly lane when the five-hour observation is absent.
+    /// five-hour and seven-day windows. A selected lane never falls back to
+    /// another window, and `off` removes the compact percentage entirely.
     var compactDisplayLanes: [ObservedQuotaLane] {
         switch allowanceDisplayPreference {
         case .fiveHour:
             return lanes.filter {
                 $0.durationMinutes == fiveHourWindowDurationMinutes
+            }
+        case .weekly:
+            return lanes.filter {
+                $0.durationMinutes == weeklyWindowDurationMinutes
             }
         case .both:
             return [
@@ -388,12 +395,15 @@ struct MenuBarStatusSnapshot: Equatable {
                     $0.durationMinutes == weeklyWindowDurationMinutes
                 },
             ].compactMap { $0 }
+        case .off:
+            return []
         }
     }
 
     /// The icon meter follows the most relevant compact lane. With both lanes
     /// selected, the five-hour meter stays primary because it is the first
-    /// number shown in the title.
+    /// number shown in the title. With the display off, no allowance meter is
+    /// drawn.
     var primaryDisplayLane: ObservedQuotaLane? {
         compactDisplayLanes.first
     }
@@ -407,12 +417,26 @@ struct MenuBarStatusSnapshot: Equatable {
     /// an explicit pass checks for newer evidence, so analysis state does not
     /// replace it. `…` means "a pass is running without a live number"; `–`
     /// means "no number can be shown honestly right now" and the menu explains
-    /// which case applies.
+    /// which case applies. A single-window preference uses only the percentage
+    /// to keep the status item narrow; combined mode keeps its short labels so
+    /// each value remains identifiable if one observation is temporarily
+    /// unavailable.
     var title: String {
+        if allowanceDisplayPreference == .off {
+            return ""
+        }
         if companionReachable,
            evidence == .live,
            !compactDisplayLanes.isEmpty {
-            return compactDisplayLanes.map { lane in
+            let displayLanes = compactDisplayLanes
+            if allowanceDisplayPreference != .both,
+               displayLanes.count == 1,
+               let lane = displayLanes.first {
+                return TiboTattleLocalization.percentString(
+                    lane.roundedRemainingPercent
+                )
+            }
+            return displayLanes.map { lane in
                 let label = lane.durationMinutes == fiveHourWindowDurationMinutes
                     ? TiboTattleLocalization.string(.menuBarFiveHourShort)
                     : TiboTattleLocalization.string(.menuBarSevenDayShort)
@@ -1759,6 +1783,8 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             0.58
         case .unavailable:
             0.42
+        case .off:
+            1
         }
         base.draw(
             in: birdRect,
@@ -1777,6 +1803,9 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     private static func glyphState(
         for snapshot: MenuBarStatusSnapshot
     ) -> StatusGlyphState {
+        if snapshot.allowanceDisplayPreference == .off {
+            return .off
+        }
         if snapshot.phase == .analyzing { return .analyzing }
         guard snapshot.phase == .ready else { return .unavailable }
         guard snapshot.evidence == .live,
@@ -1960,6 +1989,8 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             NSColor.black.withAlphaComponent(0.42).setStroke()
             track.lineWidth = 0.8
             track.stroke()
+        case .off:
+            break
         }
     }
 

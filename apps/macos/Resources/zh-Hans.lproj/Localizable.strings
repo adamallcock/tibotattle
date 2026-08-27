@@ -92,8 +92,10 @@
 "settings.appearanceSystem" = "跟随系统";
 "settings.menuBarAllowance" = "菜单栏额度";
 "settings.menuBarAllowanceDetail" = "选择菜单栏图标旁显示哪个最新额度百分比。";
-"settings.menuBarAllowanceFiveHour" = "仅五小时";
-"settings.menuBarAllowanceBoth" = "五小时和七天";
+"settings.menuBarAllowanceFiveHour" = "五小时";
+"settings.menuBarAllowanceWeekly" = "每周";
+"settings.menuBarAllowanceBoth" = "五小时 + 每周";
+"settings.menuBarAllowanceOff" = "关闭";
 "settings.automaticUpdates" = "自动更新";
 "settings.automaticUpdatesOff" = "自动下载已关闭。";
 "settings.automaticUpdatesOn" = "自动下载已开启。";

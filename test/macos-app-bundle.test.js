@@ -1038,7 +1038,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(settingsSource, /settingsMenuBarAllowancePicker/u);
   assert.match(
     settingsSource,
-    /NativeMenuBarAllowanceDisplayPreference[\s\S]*?\.fiveHour[\s\S]*?\.settingsMenuBarAllowanceFiveHour[\s\S]*?\.both[\s\S]*?\.settingsMenuBarAllowanceBoth/u,
+    /NativeMenuBarAllowanceDisplayPreference[\s\S]*?\.fiveHour[\s\S]*?\.settingsMenuBarAllowanceFiveHour[\s\S]*?\.weekly[\s\S]*?\.settingsMenuBarAllowanceWeekly[\s\S]*?\.both[\s\S]*?\.settingsMenuBarAllowanceBoth[\s\S]*?\.off[\s\S]*?\.settingsMenuBarAllowanceOff/u,
   );
   assert.match(
     source,
@@ -2334,7 +2334,10 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   );
   assert.match(source, /static let defaultsKey = "tibotattle\.menu-bar-allowance\.v1"/u);
   assert.match(source, /static let defaultPreference: Self = \.fiveHour/u);
-  assert.match(source, /case fiveHour = "five-hour"[\s\S]*?case both/u);
+  assert.match(
+    source,
+    /case fiveHour = "five-hour"[\s\S]*?case weekly = "weekly"[\s\S]*?case both[\s\S]*?case off/u,
+  );
   assert.match(source, /let lane = snapshot\.primaryDisplayLane/u);
   assert.match(
     source,

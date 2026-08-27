@@ -92,8 +92,10 @@
 "settings.appearanceSystem" = "Sistema";
 "settings.menuBarAllowance" = "Límite de la barra de menús";
 "settings.menuBarAllowanceDetail" = "Elige qué porcentaje de límite reciente aparece junto al icono de la barra de menús.";
-"settings.menuBarAllowanceFiveHour" = "Solo 5 horas";
-"settings.menuBarAllowanceBoth" = "5 horas y 7 días";
+"settings.menuBarAllowanceFiveHour" = "5 horas";
+"settings.menuBarAllowanceWeekly" = "Semana";
+"settings.menuBarAllowanceBoth" = "5 horas + semana";
+"settings.menuBarAllowanceOff" = "Desactivado";
 "settings.automaticUpdates" = "Actualizaciones automáticas";
 "settings.automaticUpdatesOff" = "Las descargas automáticas están desactivadas.";
 "settings.automaticUpdatesOn" = "Las descargas automáticas están activadas.";
