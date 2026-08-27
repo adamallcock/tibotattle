@@ -8113,7 +8113,10 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
 
 macOSArtifactTest("preview distribution builds retain the normal identity and reject production validation", {
   skip: BUILD_SUPPORTED ? false : "requires pinned macOS arm64 Node v26.2.0 builder",
-  timeout: 120_000,
+  // This performs two complete preview builds plus DMG packaging. A warm
+  // arm64 development host can legitimately approach two minutes, so retain
+  // enough margin for CI load without weakening any build assertion.
+  timeout: 240_000,
 }, async (context) => {
   const preparedFramework = join(
     REPOSITORY_ROOT,
@@ -8335,7 +8338,10 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
 
 macOSArtifactTest("signed app relays central readiness to an explicitly connected loopback lab", {
   skip: BUILD_SUPPORTED ? false : "requires pinned macOS arm64 Node v26.2.0 builder",
-  timeout: 60_000,
+  // The contract builds and signs both loopback and production variants.
+  // Keep the child and overall budgets above observed full-app compile time;
+  // the readiness and origin assertions below remain independently bounded.
+  timeout: 180_000,
 }, async () => {
   const temporaryRoot = await mkdtemp(
     join(await realpath(tmpdir()), "usage-monitor-macos-central-test-"),
@@ -8374,7 +8380,7 @@ macOSArtifactTest("signed app relays central readiness to an explicitly connecte
     ], {
       cwd: REPOSITORY_ROOT,
       encoding: "utf8",
-      timeout: 30_000,
+      timeout: 90_000,
     });
     assert.equal(build.status, 0, build.stderr || build.stdout);
     assert.match(build.stdout, /^Central service: development_loopback$/mu);
@@ -8449,7 +8455,7 @@ macOSArtifactTest("signed app relays central readiness to an explicitly connecte
     ], {
       cwd: REPOSITORY_ROOT,
       encoding: "utf8",
-      timeout: 30_000,
+      timeout: 90_000,
     });
     assert.equal(
       productionBuild.status,
