@@ -204,6 +204,11 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/local-legacy-report-storage.js",
   "src/local-unified-accounting-source.js",
   "src/local-unified-companion-source.js",
+  // Reviewed 2026-08-27: the Electron-only off-main coordinator and its
+  // dedicated worker move local index ingestion off the renderer host. They
+  // retain the same bounded local inputs and export no private content.
+  "src/local-unified-index-off-main.js",
+  "src/local-unified-index-off-main-worker.js",
   // Reviewed 2026-08-10: pure windowed repricing over the local index for
   // the divergence panel's per-period cost mix — no content, paths, or
   // identifiers beyond what the companion already exports.

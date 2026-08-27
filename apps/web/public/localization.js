@@ -1798,6 +1798,14 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   // replaces these nodes with the parameterized semantic messages when shown.
   "Codex source coverage is partial": ["Codex 数据源覆盖不完整", "La cobertura de fuentes de Codex es parcial"],
   "Some configured or previously indexed activity could not be refreshed. Any last-known indexed history is retained, but totals may be incomplete until coverage recovers.": ["部分已配置或之前索引的活动无法刷新。任何上次已知的索引历史记录都会保留，但在覆盖恢复前，总计可能不完整。", "No se pudo actualizar parte de la actividad configurada o indexada anteriormente. Se conserva cualquier historial indexado conocido, pero los totales pueden estar incompletos hasta que se recupere la cobertura."],
+  "Hide sidebar": ["隐藏侧边栏", "Ocultar barra lateral"],
+  "See community activity": ["查看社区活动", "Ver la actividad de la comunidad"],
+  "Community activity over time": ["社区活动趋势", "Actividad de la comunidad a lo largo del tiempo"],
+  "Delayed, aggregate daily totals from optional contributions. This public view includes no prompts, responses, or account details.": ["来自可选贡献的延迟汇总每日总量。此公开视图不包含提示词、回复或账户详情。", "Totales diarios agregados y diferidos de contribuciones opcionales. Esta vista pública no incluye prompts, respuestas ni datos de cuentas."],
+  "Explore community allowance history": ["探索社区额度历史", "Explora el historial de asignación comunitaria"],
+  "A larger view of the same published estimate. Hover, tap, or use the arrow keys to inspect a day.": ["同一已发布估计的放大视图。悬停、轻点或使用方向键查看某一天。", "Una vista ampliada de la misma estimación publicada. Pasa el cursor, toca o usa las flechas para examinar un día."],
+  "Close": ["关闭", "Cerrar"],
+  "Time range": ["时间范围", "Intervalo de tiempo"],
   "Settings…": ["设置…", "Configuración…"],
   "A useful headline often appears in seconds. The first deep pass can take a few minutes; later updates are normally faster. Work stops or checkpoints at a fixed bound, so a large Codex history may continue in another pass. You may close the browser tab; keep the Usage Monitor app open while analysis runs.": ["有用的摘要通常会在几秒内出现。首次深度分析可能需要几分钟，之后的更新通常更快。工作会在固定边界处停止或保存检查点，因此大型 Codex 历史可能在下一次分析中继续。你可以关闭浏览器标签页；分析运行时请保持 Usage Monitor 应用打开。", "Un titular útil suele aparecer en segundos. La primera pasada profunda puede tardar unos minutos; las actualizaciones posteriores normalmente son más rápidas. El trabajo se detiene o guarda un punto de control en un límite fijo, por lo que un historial grande de Codex puede continuar en otra pasada. Puedes cerrar la pestaña del navegador; mantén abierta la app Usage Monitor mientras se ejecuta el análisis."],
   // The single approve-once contribution flow (2026-08-08).

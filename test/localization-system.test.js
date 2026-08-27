@@ -366,10 +366,10 @@ test("local analysis controls and bounded progress use semantic live-localized m
   assert.equal(
     translate(
       "localAnalysis.progress.analyzingFiles",
-      { processed: 12, selected: 40 },
+      { processed: 12, selected: 40, elapsed: "1 min 23 sec" },
       "es",
     ),
-    "Analizando 12/40 archivos…",
+    "Analizando 12/40 archivos… 1 min 23 sec",
   );
   assert.equal(
     translate(
