@@ -5,6 +5,7 @@ import { createInterface } from "node:readline/promises";
 import { pathToFileURL } from "node:url";
 import { captureCodexObservation } from "./capture.js";
 import {
+  inspectCodexBinary,
   readCodexAccountSnapshot,
   sanitizeCodexAccountSnapshotWithSecretLoader,
 } from "./providers/codex/account.js";
@@ -582,6 +583,7 @@ export async function run(
     rotateIdentity = rotateParticipantSecret,
     withIdentityLease = withParticipantSecretLease,
     selectAccountObservationSecret = selectProductionAccountObservationSecret,
+    inspectCodexBinaryDiagnostic = inspectCodexBinary,
     readAccountSnapshot = readCodexAccountSnapshot,
     sanitizeAccountSnapshot = sanitizeCodexAccountSnapshotWithSecretLoader,
     captureObservation = captureCodexObservation,
@@ -1169,6 +1171,14 @@ export async function run(
     return;
   }
   if (args.command === "doctor") {
+    const binary = await inspectCodexBinaryDiagnostic();
+    const binarySource = {
+      environment_override: "CODEX_BIN override",
+      chatgpt_bundled: "ChatGPT bundled",
+      codex_bundled: "Codex bundled",
+      path: "PATH",
+    }[binary.source] ?? "unknown source";
+    console.log(`Codex binary: ${binarySource} (${binary.versionStatus === "available" ? binary.version : "version unavailable"})`);
     const capturedAt = new Date().toISOString();
     const snapshot = await readSanitizedAccountSnapshot(capturedAt);
     console.log("Codex app-server: available");

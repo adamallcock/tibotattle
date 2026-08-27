@@ -26,6 +26,7 @@ const RAW_CANARIES = Object.freeze({
   toolName: "private_tool_name_canary_f430b1de",
   callId: "call-id-canary-156ed54c",
   turnId: "turn-id-canary-685b2b47",
+  threadSource: "automated_review_canary-a862d77c",
 });
 
 const USAGE_CALLBACK_KEYS = [
@@ -107,6 +108,7 @@ async function privacyFixture() {
         source_path: rolloutPath,
         source_basename: basename(rolloutPath),
         origin: "terminal",
+        thread_source: RAW_CANARIES.threadSource,
       },
     },
     {
@@ -237,6 +239,21 @@ test("raw Codex scan callbacks and result retain accounting semantics without ex
     assert.equal(toolCalls[0].toolClass, "other");
     assert.equal(toolCalls[0].sourceKind, "client_function_call");
     assert.deepEqual(result.toolCallsByClass, { other: 1 });
+    assert.deepEqual(usageEvents[0].surfaceClassification, {
+      schemaVersion: "0.1",
+      threadSource: "unknown",
+      surface: "cli_exec",
+      agentScope: "unknown",
+      lineageDisposition: "forked",
+    });
+    assert.deepEqual(
+      rateLimitSnapshots[0].surfaceClassification,
+      usageEvents[0].surfaceClassification,
+    );
+    assert.deepEqual(
+      toolCalls[0].surfaceClassification,
+      usageEvents[0].surfaceClassification,
+    );
 
     const prohibited = [
       fixture.codexHome,
