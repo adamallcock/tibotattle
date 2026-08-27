@@ -628,16 +628,16 @@ test("real-history network boundary rejects external traffic and local contribut
   let finish = createNetworkBoundaryObserver(cdp, "http://127.0.0.1:4321");
   observe({ method: "POST", url: "http://127.0.0.1:4321/api/local/refresh" });
   observe({ method: "POST", url: "http://127.0.0.1:4321/api/local/refresh/cancel" });
-  assert.equal(finish(), false);
+  assert.equal(finish(), null);
 
   finish = createNetworkBoundaryObserver(cdp, "http://127.0.0.1:4321");
   observe({ method: "GET", url: "http://127.0.0.1:4321/api/local/contribution/sync-status" });
   observe({ method: "POST", url: "http://127.0.0.1:4321/api/local/contribution/prepare" });
-  assert.equal(finish(), true);
+  assert.equal(finish(), "local_mutation");
 
   finish = createNetworkBoundaryObserver(cdp, "http://127.0.0.1:4321");
   observe({ method: "GET", url: "https://tibotattle.com/api/health" });
-  assert.equal(finish(), true);
+  assert.equal(finish(), "external_http");
 });
 
 test("cancel proof requires the renderer POST rather than a GET with the same status", () => {

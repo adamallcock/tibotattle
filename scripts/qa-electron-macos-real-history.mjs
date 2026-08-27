@@ -108,6 +108,8 @@ const FAILURE_REASONS = new Set([
   "usage_invalid",
   "community_invalid",
   "network_boundary_invalid",
+  "network_external_invalid",
+  "network_mutation_invalid",
   "relaunch_persistence_invalid",
   "relaunch_refresh_invalid",
   "quit_invalid",
@@ -788,26 +790,28 @@ export function createControlPlaneObserver(cdp, expectedOrigin) {
 }
 
 export function createNetworkBoundaryObserver(cdp, expectedOrigin) {
-  let invalid = false;
+  let violation = null;
   const unsubscribe = cdp.on("Network.requestWillBeSent", ({ request } = {}) => {
     if (typeof request?.url !== "string") return;
     try {
       const parsed = new URL(request.url);
       if ((parsed.protocol === "http:" || parsed.protocol === "https:")
-          && parsed.origin !== expectedOrigin) invalid = true;
+          && parsed.origin !== expectedOrigin) {
+        violation ??= "external_http";
+      }
       if (parsed.origin === expectedOrigin
           && request?.method !== "GET"
           && (parsed.pathname.startsWith("/api/local/contribution/")
             || parsed.pathname.startsWith("/api/local/identity/"))) {
-        invalid = true;
+        violation ??= "local_mutation";
       }
     } catch {
-      invalid = true;
+      violation ??= "invalid_url";
     }
   });
   return () => {
     unsubscribe();
-    return invalid;
+    return violation;
   };
 }
 
@@ -2097,7 +2101,7 @@ async function runQa(options) {
   let cancel = {};
   let retry = {};
   let relaunch = {};
-  let networkInvalid = false;
+  let networkViolation = null;
   let unlistenBoundary = null;
   try {
     session = await launchSession(appOptions);
@@ -2116,7 +2120,7 @@ async function runQa(options) {
       timer = firstStartup.timer ?? {};
       const firstParity = await assertParity(session, firstStartup);
       const firstQuit = await cleanQuit(session);
-      networkInvalid ||= unlistenBoundary();
+      networkViolation ||= unlistenBoundary();
       unlistenBoundary = null;
       cleanQuitReceipt = firstQuit.clean;
       session = null;
@@ -2136,7 +2140,7 @@ async function runQa(options) {
       void firstParity;
       void secondParity;
       const secondQuit = await cleanQuit(session);
-      networkInvalid ||= unlistenBoundary();
+      networkViolation ||= unlistenBoundary();
       unlistenBoundary = null;
       cleanQuitReceipt = secondQuit.clean;
       session = null;
@@ -2157,14 +2161,19 @@ async function runQa(options) {
       timer = startup.timer ?? {};
       parity = await assertParity(session, startup);
       const quit = await cleanQuit(session);
-      networkInvalid ||= unlistenBoundary();
+      networkViolation ||= unlistenBoundary();
       unlistenBoundary = null;
       cleanQuitReceipt = quit.clean;
       session = null;
     }
-    if (unlistenBoundary !== null) networkInvalid ||= unlistenBoundary();
-    if (networkInvalid) {
-      fail("REAL_HISTORY_QA_NETWORK_BOUNDARY_INVALID", "parity", "network_boundary_invalid");
+    if (unlistenBoundary !== null) networkViolation ||= unlistenBoundary();
+    if (networkViolation !== null) {
+      const reason = networkViolation === "external_http"
+        ? "network_external_invalid"
+        : networkViolation === "local_mutation"
+          ? "network_mutation_invalid"
+          : "network_boundary_invalid";
+      fail("REAL_HISTORY_QA_NETWORK_BOUNDARY_INVALID", "parity", reason);
     }
     if (options.mode === "cancel") {
       const quit = await cleanQuit(session);
