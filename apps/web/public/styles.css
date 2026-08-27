@@ -2912,7 +2912,7 @@ footer p { margin: 0; }
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: clamp(42px, 4.5vw, 68px);
-  align-items: center;
+  align-items: start;
   min-height: min(790px, calc(100vh - 74px));
   padding:
     clamp(62px, 8vw, 104px)
