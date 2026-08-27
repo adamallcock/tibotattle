@@ -27,9 +27,11 @@ import {
 } from "../desktop-first-run.js";
 import {
   assertElectronQualificationLaunchOptions,
+  companionEnvironment,
   installWindowsSmokeControl,
   installWindowsSmokeControlForTest,
   launchElectronShell,
+  MACOS_ELECTRON_LOCAL_QA_TEST_LANE,
 } from "../main.js";
 import {
   ELECTRON_ENTRY_FAILURE_DIAGNOSTIC,
@@ -651,6 +653,39 @@ test("companion supervisor owns one child, injects a parent contract, and strips
   child.emit("exit", 0, null);
   await stopped;
   assert.equal(supervisor.state.hasChild, false);
+});
+
+test("packaged macOS local QA withholds the production central origin", () => {
+  const app = { isPackaged: true };
+  const production = companionEnvironment({
+    app,
+    environment: { USAGE_MONITOR_CENTRAL_ORIGIN: "http://127.0.0.1:8792" },
+    qualificationContext: null,
+    platform: "darwin",
+  });
+  assert.equal(production.USAGE_MONITOR_CENTRAL_ORIGIN, "https://tibotattle.com");
+
+  const qaEnvironment = {
+    USAGE_MONITOR_CENTRAL_ORIGIN: "http://127.0.0.1:8792",
+    USAGE_MONITOR_TEST_LANE: MACOS_ELECTRON_LOCAL_QA_TEST_LANE,
+  };
+  const qa = companionEnvironment({
+    app,
+    environment: qaEnvironment,
+    qualificationContext: null,
+    platform: "darwin",
+  });
+  assert.equal(qa.USAGE_MONITOR_CENTRAL_ORIGIN, undefined);
+  assert.equal(qa.USAGE_MONITOR_TEST_LANE, MACOS_ELECTRON_LOCAL_QA_TEST_LANE);
+  assert.equal(qaEnvironment.USAGE_MONITOR_CENTRAL_ORIGIN, "http://127.0.0.1:8792");
+
+  const nonMac = companionEnvironment({
+    app,
+    environment: qaEnvironment,
+    qualificationContext: null,
+    platform: "linux",
+  });
+  assert.equal(nonMac.USAGE_MONITOR_CENTRAL_ORIGIN, "https://tibotattle.com");
 });
 
 test("companion supervisor fails closed on malformed readiness and bounded startup timeout", async () => {

@@ -58,11 +58,14 @@ test("macOS Electron smoke is an explicit packaged arm64 lane", async () => {
   assert.match(source, /darwin-arm64-electron-app/u);
   assert.match(source, /USAGE_MONITOR_STATE_ROOT/u);
   assert.match(source, /CODEX_HOME/u);
+  assert.match(source, /HOME: process\.env\.HOME/u);
+  assert.doesNotMatch(source, /HOME: fixture\.home/u);
   assert.match(source, /desktop-first-run-v1\.json/u);
   assert.match(source, /desktop-settings-v1\.json/u);
   assert.match(source, /secondaryCodexHome/u);
   assert.match(source, /DESKTOP_SETTINGS_SCHEMA_VERSION/u);
   assert.match(source, /USAGE_MONITOR_ELECTRON_SMOKE_CONTROL/u);
+  assert.match(source, /USAGE_MONITOR_TEST_LANE: MACOS_LOCAL_QA_TEST_LANE/u);
   assert.match(source, /Page\.enable/u);
   assert.match(source, /Network\.enable/u);
   assert.doesNotMatch(source, /Page\.reload/u);

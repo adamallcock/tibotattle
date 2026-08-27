@@ -40,6 +40,7 @@ const REAL_HISTORY_SCHEMA_VERSION = "tibotattle-electron-macos-real-history-v1";
 const FIRST_RUN_SCHEMA_VERSION = "tibotattle-desktop-first-run-v1";
 const SETTINGS_SCHEMA_VERSION = "tibotattle-desktop-settings-v1";
 const QUIT_CONTROL = "quit-v1";
+const MACOS_LOCAL_QA_TEST_LANE = "macos-electron-local-qa-v1";
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 
 export const REAL_HISTORY_QA_MODES = Object.freeze(["cancel", "full", "relaunch"]);
@@ -419,7 +420,10 @@ function environmentForProfile(fixture, codexHomePath) {
   return Object.fromEntries(Object.entries({
     PATH: process.env.PATH,
     LANG: "en_US.UTF-8",
-    HOME: fixture.roots.home,
+    // Keep the host HOME so Security.framework can resolve the user's login
+    // Keychain. The app's writable data remains isolated by --user-data-dir,
+    // USAGE_MONITOR_STATE_ROOT, and the XDG/Claude directories below.
+    HOME: process.env.HOME,
     TMPDIR: fixture.roots.tmp,
     CODEX_HOME: codexHomePath,
     CLAUDE_CONFIG_DIR: fixture.roots.claude,
@@ -430,6 +434,7 @@ function environmentForProfile(fixture, codexHomePath) {
     USAGE_MONITOR_STATE_ROOT: fixture.roots.state,
     USAGE_MONITOR_ACCOUNTING_SOURCE_MODE: "unified",
     USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: QUIT_CONTROL,
+    USAGE_MONITOR_TEST_LANE: MACOS_LOCAL_QA_TEST_LANE,
     ELECTRON_NO_ATTACH_CONSOLE: "1",
   }).filter(([, value]) => value !== undefined));
 }
@@ -782,7 +787,7 @@ export function createControlPlaneObserver(cdp, expectedOrigin) {
   });
 }
 
-function createNetworkBoundaryObserver(cdp, expectedOrigin) {
+export function createNetworkBoundaryObserver(cdp, expectedOrigin) {
   let invalid = false;
   const unsubscribe = cdp.on("Network.requestWillBeSent", ({ request } = {}) => {
     if (typeof request?.url !== "string") return;
@@ -790,6 +795,12 @@ function createNetworkBoundaryObserver(cdp, expectedOrigin) {
       const parsed = new URL(request.url);
       if ((parsed.protocol === "http:" || parsed.protocol === "https:")
           && parsed.origin !== expectedOrigin) invalid = true;
+      if (parsed.origin === expectedOrigin
+          && request?.method !== "GET"
+          && (parsed.pathname.startsWith("/api/local/contribution/")
+            || parsed.pathname.startsWith("/api/local/identity/"))) {
+        invalid = true;
+      }
     } catch {
       invalid = true;
     }

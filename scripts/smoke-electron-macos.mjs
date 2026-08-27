@@ -49,6 +49,7 @@ const MAX_REFRESH_MS = 45_000;
 const MAX_SHUTDOWN_MS = 10_000;
 const MACOS_SMOKE_SCHEMA_VERSION = "tibotattle-electron-macos-smoke-v2";
 const MACOS_SMOKE_CONTROL = "quit-v1";
+const MACOS_LOCAL_QA_TEST_LANE = "macos-electron-local-qa-v1";
 const REQUIRED_APP_NAME = "TiboTattle Dev";
 const CLI_FAILURE_STATUS = "ELECTRON_MACOS_SMOKE_FAILED";
 const MACOS_SMOKE_CODEX_ROOT_LIMIT = 8;
@@ -1888,7 +1889,11 @@ async function runSmoke(appPath, progress = {}) {
   const environment = {
     PATH: process.env.PATH,
     LANG: "en_US.UTF-8",
-    HOME: fixture.home,
+    // A disposable HOME has no default login Keychain and makes macOS show a
+    // destructive-looking "Keychain Not Found" dialog. Preserve only HOME;
+    // all application, fixture, XDG, Claude, and temporary state stays below
+    // this smoke's private root.
+    HOME: process.env.HOME,
     TMPDIR: fixture.root,
     CODEX_HOME: fixture.codexHome,
     CLAUDE_CONFIG_DIR: fixture.claudeHome,
@@ -1899,6 +1904,7 @@ async function runSmoke(appPath, progress = {}) {
     USAGE_MONITOR_STATE_ROOT: fixture.stateRoot,
     USAGE_MONITOR_ACCOUNTING_SOURCE_MODE: "unified",
     USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: MACOS_SMOKE_CONTROL,
+    USAGE_MONITOR_TEST_LANE: MACOS_LOCAL_QA_TEST_LANE,
     ELECTRON_NO_ATTACH_CONSOLE: "1",
   };
   let port = null;

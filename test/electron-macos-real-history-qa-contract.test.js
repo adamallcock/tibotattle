@@ -17,6 +17,7 @@ import {
   communityParitySnapshotValid,
   controlPlaneSnapshotValid,
   createControlPlaneObserver,
+  createNetworkBoundaryObserver,
   createRefreshObserver,
   parseRealHistoryArguments,
   realHistoryDashboardReadySnapshotValid,
@@ -109,6 +110,16 @@ test("real-history QA requires explicit isolated inputs and bounded modes", () =
       .receiptPath,
     "/tmp/receipt.json",
   );
+});
+
+test("real-history QA preserves macOS login Keychain discovery while isolating app state", async () => {
+  const source = await readFile("scripts/qa-electron-macos-real-history.mjs", "utf8");
+  assert.match(source, /HOME: process\.env\.HOME/u);
+  assert.doesNotMatch(source, /HOME: fixture\.roots\.home/u);
+  assert.match(source, /--user-data-dir=\$\{fixture\.userData\}/u);
+  assert.match(source, /USAGE_MONITOR_STATE_ROOT: fixture\.roots\.state/u);
+  assert.match(source, /XDG_CONFIG_HOME: fixture\.roots\.config/u);
+  assert.match(source, /USAGE_MONITOR_TEST_LANE: MACOS_LOCAL_QA_TEST_LANE/u);
 });
 
 test("real-history timeout budgets are finite and bounded", () => {
@@ -603,6 +614,30 @@ test("control-plane observer retains only exact loopback route response metadata
   observer.reset();
   assert.deepEqual(observer.snapshot(), []);
   observer.dispose();
+});
+
+test("real-history network boundary rejects external traffic and local contribution mutations", () => {
+  const handlers = new Map();
+  const cdp = {
+    on(method, handler) {
+      handlers.set(method, handler);
+      return () => handlers.delete(method);
+    },
+  };
+  const observe = (request) => handlers.get("Network.requestWillBeSent")?.({ request });
+  let finish = createNetworkBoundaryObserver(cdp, "http://127.0.0.1:4321");
+  observe({ method: "POST", url: "http://127.0.0.1:4321/api/local/refresh" });
+  observe({ method: "POST", url: "http://127.0.0.1:4321/api/local/refresh/cancel" });
+  assert.equal(finish(), false);
+
+  finish = createNetworkBoundaryObserver(cdp, "http://127.0.0.1:4321");
+  observe({ method: "GET", url: "http://127.0.0.1:4321/api/local/contribution/sync-status" });
+  observe({ method: "POST", url: "http://127.0.0.1:4321/api/local/contribution/prepare" });
+  assert.equal(finish(), true);
+
+  finish = createNetworkBoundaryObserver(cdp, "http://127.0.0.1:4321");
+  observe({ method: "GET", url: "https://tibotattle.com/api/health" });
+  assert.equal(finish(), true);
 });
 
 test("cancel proof requires the renderer POST rather than a GET with the same status", () => {

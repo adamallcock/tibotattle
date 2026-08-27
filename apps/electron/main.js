@@ -19,6 +19,8 @@ const MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_COMPANION_SCRIPT = resolve(MODULE_DIRECTORY, "../local/server.js");
 const DEFAULT_RESOURCE_ROOT = resolve(MODULE_DIRECTORY, "../..");
 const ELECTRON_SMOKE_CONTROL = "quit-v1";
+export const MACOS_ELECTRON_LOCAL_QA_TEST_LANE =
+  "macos-electron-local-qa-v1";
 const WINDOWS_ELECTRON_SMOKE_CONTROL = "windows-v1";
 const WINDOWS_ELECTRON_SMOKE_MESSAGE_TYPE = "windows-electron-smoke-v1";
 const WINDOWS_ELECTRON_SMOKE_COMMAND_MESSAGE = "command-v1";
@@ -65,10 +67,22 @@ function packagedResourcesPath(app, appPath, resourcesPath) {
   return appPath === null ? null : dirname(appPath);
 }
 
-function companionEnvironment({ app, environment, qualificationContext }) {
+export function companionEnvironment({
+  app,
+  environment,
+  qualificationContext,
+  platform = process.platform,
+}) {
   if (!isPackagedElectronApp(app)
       || qualificationContext !== null) {
     return environment;
+  }
+  if (platform === "darwin"
+      && environment.USAGE_MONITOR_TEST_LANE
+        === MACOS_ELECTRON_LOCAL_QA_TEST_LANE) {
+    const selected = { ...environment };
+    delete selected.USAGE_MONITOR_CENTRAL_ORIGIN;
+    return selected;
   }
   return {
     ...environment,
