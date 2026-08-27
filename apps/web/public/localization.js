@@ -1820,6 +1820,10 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "A larger view of the same published estimate. Hover, tap, or use the arrow keys to inspect a day.": ["同一已发布估计的放大视图。悬停、轻点或使用方向键查看某一天。", "Una vista ampliada de la misma estimación publicada. Pasa el cursor, toca o usa las flechas para examinar un día."],
   "Close": ["关闭", "Cerrar"],
   "Time range": ["时间范围", "Intervalo de tiempo"],
+  "Windows is not yet available": ["Windows 尚未提供", "Windows aún no está disponible"],
+  "There is no published Windows build yet.": ["尚未发布 Windows 版本。", "Todavía no hay una versión publicada para Windows."],
+  "Linux is not yet available": ["Linux 尚未提供", "Linux aún no está disponible"],
+  "There is no published Linux build yet.": ["尚未发布 Linux 版本。", "Todavía no hay una versión publicada para Linux."],
   "Settings…": ["设置…", "Configuración…"],
   "A useful headline often appears in seconds. The first deep pass can take a few minutes; later updates are normally faster. Work stops or checkpoints at a fixed bound, so a large Codex history may continue in another pass. You may close the browser tab; keep the Usage Monitor app open while analysis runs.": ["有用的摘要通常会在几秒内出现。首次深度分析可能需要几分钟，之后的更新通常更快。工作会在固定边界处停止或保存检查点，因此大型 Codex 历史可能在下一次分析中继续。你可以关闭浏览器标签页；分析运行时请保持 Usage Monitor 应用打开。", "Un titular útil suele aparecer en segundos. La primera pasada profunda puede tardar unos minutos; las actualizaciones posteriores normalmente son más rápidas. El trabajo se detiene o guarda un punto de control en un límite fijo, por lo que un historial grande de Codex puede continuar en otra pasada. Puedes cerrar la pestaña del navegador; mantén abierta la app Usage Monitor mientras se ejecuta el análisis."],
   // The single approve-once contribution flow (2026-08-08).
