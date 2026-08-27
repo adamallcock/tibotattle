@@ -148,6 +148,27 @@ const MENU_BAR_STATUS_SOURCE = join(
   "Sources",
   "MenuBarStatus.swift",
 );
+const MENU_BAR_POPOVER_SOURCE = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "Sources",
+  "MenuBarPopover.swift",
+);
+const MENU_BAR_POPUP_MODEL_SOURCE = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "Sources",
+  "MenuBarPopupModel.swift",
+);
+const NATIVE_BRAND_PALETTE_SOURCE = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "Sources",
+  "NativeBrandPalette.swift",
+);
 const KEYCHAIN_BROKER_SOURCE = join(
   REPOSITORY_ROOT,
   "apps",
@@ -1497,8 +1518,12 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.equal(
     source.match(/setActivationPolicy\(\.accessory\)/gu)?.length,
-    5,
+    6,
     "only isolated AppKit smoke modes may use accessory activation",
+  );
+  assert.match(
+    source,
+    /static func render\(outputDirectory: String\) -> Int32 \{[\s\S]*?application\.setActivationPolicy\(\.accessory\)/u,
   );
   // The sidebar-recovery and interaction-safety smokes build real AppKit or
   // WebKit objects in windows they never bring forward.
@@ -2293,7 +2318,10 @@ test("toolbar pill narrates index progress, terminal gaps, and refresh failure w
 });
 
 test("dashboard sidebar resizes for real, wears the brand palette, and the titlebar carries the brand row", async () => {
-  const source = await readFile(SWIFT_SOURCE, "utf8");
+  const [source, palette] = await Promise.all([
+    readFile(SWIFT_SOURCE, "utf8"),
+    readFile(NATIVE_BRAND_PALETTE_SOURCE, "utf8"),
+  ]);
   // 1. The divider is a real control. AppKit applies a divider drag at
   // priority 490 (dragThatCannotResizeWindow); the previous .defaultHigh
   // (750) holding priority outranked the user's own drag, which is the
@@ -2382,8 +2410,8 @@ test("dashboard sidebar resizes for real, wears the brand palette, and the title
   );
   // 2. The sidebar and report carry the exact light and Forest Ink tokens over
   // native material instead of inheriting the user's unrelated system accent.
-  const nativeBrandPalette = source.match(
-    /private enum NativeBrandPalette \{[\s\S]*?\n\}/u,
+  const nativeBrandPalette = palette.match(
+    /enum NativeBrandPalette \{[\s\S]*?\n\}/u,
   )?.[0];
   assert.ok(nativeBrandPalette, "native brand palette should be present");
   assert.match(
@@ -2467,7 +2495,11 @@ test("dashboard sidebar resizes for real, wears the brand palette, and the title
 });
 
 test("menu-bar status item degrades honestly and never invents allowance evidence", async () => {
-  const source = await readFile(MENU_BAR_STATUS_SOURCE, "utf8");
+  const [source, popupSource, modelSource] = await Promise.all([
+    readFile(MENU_BAR_STATUS_SOURCE, "utf8"),
+    readFile(MENU_BAR_POPOVER_SOURCE, "utf8"),
+    readFile(MENU_BAR_POPUP_MODEL_SOURCE, "utf8"),
+  ]);
   assert.match(source, /import AppKit/u);
   // Variable-length item with the branded app mark, sized for the native
   // status bar rather than a generic system chart glyph.
@@ -2528,7 +2560,7 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   // available; stale, absent, starting, and failed states remain non-numeric.
   assert.match(
     source,
-    /if companionReachable,\s*evidence == \.live,\s*let lane = primaryLane \{\s*return TiboTattleLocalization\.percentString\(\s*lane\.roundedRemainingPercent\s*\)/u,
+    /if companionReachable,\s*let lane = currentPrimaryLane\(\) \{\s*return TiboTattleLocalization\.percentString\(\s*lane\.roundedRemainingPercent\s*\)/u,
   );
   assert.match(
     source,
@@ -2549,7 +2581,10 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
     /TiboTattleLocalization\.string\(\.menuBarLocalEvidenceStale\)/u,
   );
   assert.match(source, /func resetCountdown\(_ date: Date\?, now: Date = Date\(\)\) -> String\?/u);
-  assert.match(source, /guard companionReachable, evidence == \.live else/u);
+  assert.match(source, /func laneIsCurrent\(_ lane: ObservedQuotaLane,[\s\S]*?evidence == \.live/u);
+  assert.match(source, /now\.timeIntervalSince\(observedAt\) >= 0/u);
+  assert.match(source, /now\.timeIntervalSince\(observedAt\) <= freshnessLimit/u);
+  assert.match(source, /let resetAt = lane\.resetAt,[\s\S]*?resetAt > now/u);
 
   // Only the normal Codex allowance track is projected with fixed
   // privacy-safe labels; a separate product can never become the title.
@@ -2560,7 +2595,7 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.match(source, /private let codexPrimaryLimitId = "codex"/u);
   assert.match(
     source,
-    /private let supportedCodexAllowanceWindowDurations\s*=\s*\n\s*1\.\.\.CodexQuotaWindowDuration\.maximumMinutes/u,
+    /private let supportedCodexAllowanceWindowDurations: Set<Int> = \[[\s\S]*?fiveHourWindowDurationMinutes,[\s\S]*?weeklyWindowDurationMinutes,[\s\S]*?\]/u,
   );
   assert.match(source, /let candidates = rows\.compactMap/u);
   assert.match(source, /guard Self\.isSupportedCodexAllowance\(/u);
@@ -2583,16 +2618,18 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
     source,
     /return TiboTattleLocalization\.string\(\.menuBarSevenDayAllowance\)/u,
   );
-  assert.match(source, /left\.durationMinutes > right\.durationMinutes/u);
-  assert.match(source, /left\.isExplicitPrimary != right\.isExplicitPrimary/u);
+  assert.match(source, /candidates\.filter \{ \$0\.durationMinutes == duration \}/u);
+  assert.match(source, /left\.preferredSlot != right\.preferredSlot/u);
+  assert.match(source, /left\.observedAt > right\.observedAt/u);
   assert.match(source, /return left\.stableKey < right\.stableKey/u);
-  assert.match(source, /isPrimary: index == 0/u);
-  assert.match(source, /TiboTattleLocalization\.quotaWindowLabel\(/u);
+  assert.match(source, /isPrimary: candidate\.durationMinutes\s*\n\s*== weeklyWindowDurationMinutes/u);
+  assert.doesNotMatch(source, /TiboTattleLocalization\.quotaWindowLabel\(/u);
+  assert.match(source, /abs\(\(remaining \+ used\) - 100\) <= 0\.001/u);
   assert.match(source, /let observedAt = lanes\.compactMap\(\\\.observedAt\)\.max\(\)/u);
   assert.doesNotMatch(source, /codex_bengalfox|Secondary observed allowance|Observed quota lane/u);
   assert.match(
     source,
-    /guard overview\.freshnessStatus == "live" else \{ return \.stale \}/u,
+    /guard overview\.evidenceAvailable,[\s\S]*?overview\.freshnessStatus == "live"[\s\S]*?else \{ return \.stale \}/u,
   );
 
   // Menu contract: every information lane is a standard native text item.
@@ -2644,29 +2681,50 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.doesNotMatch(source, /openDashboardItem/u);
   assert.match(
     source,
-    /analyzeItem\.isEnabled = snapshot\.phase == \.ready\s*\n\s*\|\| \(snapshot\.phase == \.unavailable && dashboardURL != nil\)/u,
+    /analyzeItem\.isEnabled = snapshot\.analysisAvailable[\s\S]*?snapshot\.phase == \.ready \|\| snapshot\.phase == \.unavailable/u,
   );
 
-  // Keep the standard NSStatusItem menu lifecycle intact. Escape and app
-  // deactivation both cancel native menu tracking, and every action clears
-  // tracking before it can open another app surface.
-  assert.match(source, /statusItem\.menu = menu/u);
+  // Left-click owns one transient popover. Right-click or Control-click opens
+  // the same standard native actions menu; assigning statusItem.menu would
+  // consume the left click and make this routing impossible.
+  assert.doesNotMatch(source, /statusItem\.menu = menu/u);
+  assert.match(source, /popover\.behavior = \.transient/u);
+  assert.match(source, /popover\.contentViewController = popoverController/u);
+  assert.match(source, /button\.target = self/u);
+  assert.match(source, /button\.action = #selector\(statusItemActivated\)/u);
   assert.match(
     source,
-    /NSEvent\.addLocalMonitorForEvents\(matching: \.keyDown\)[\s\S]*?event\.keyCode == 53[\s\S]*?self\.dismissMenu\(\)/u,
+    /button\.sendAction\(on: \[\.leftMouseUp, \.rightMouseUp\]\)/u,
   );
   assert.match(
     source,
-    /NSEvent\.addLocalMonitorForEvents\([\s\S]*?\.leftMouseDown[\s\S]*?event\.window[\s\S]*?NSApp\.windows\.contains[\s\S]*?self\.dismissMenu\(\)/u,
+    /func menuBarStatusActivationIntent\([\s\S]*?eventType == \.rightMouseUp[\s\S]*?modifierFlags\.contains\(\.control\)/u,
+  );
+  assert.match(source, /popover\.show\([\s\S]*?preferredEdge: \.minY/u);
+  assert.match(source, /menu\.popUp\(positioning: nil, at: screenPoint, in: nil\)/u);
+  assert.match(source, /func popoverDidClose\(_ notification: Notification\)/u);
+
+  // Escape and app deactivation dismiss the active transient surface, and
+  // every action clears both surfaces before changing focus or ownership.
+  assert.match(
+    source,
+    /NSEvent\.addLocalMonitorForEvents\(matching: \.keyDown\)[\s\S]*?menuBarShouldDismissForEscape[\s\S]*?isPopoverShown: self\.popover\.isShown[\s\S]*?self\.dismissSurfaces\(\)/u,
   );
   assert.match(
     source,
-    /NSApplication\.didResignActiveNotification[\s\S]*?self\?\.dismissMenu\(\)/u,
+    /NSEvent\.addLocalMonitorForEvents\([\s\S]*?\.leftMouseDown[\s\S]*?event\.window[\s\S]*?NSApp\.windows\.contains[\s\S]*?self\.dismissSurfaces\(\)/u,
   );
-  assert.match(source, /private func dismissMenu\(\) \{\s*menu\.cancelTracking\(\)/u);
   assert.match(
     source,
-    /func shutDown\(\) \{[\s\S]*?dismissMenu\(\)[\s\S]*?removeInteractionMonitoring\(\)/u,
+    /NSApplication\.didResignActiveNotification[\s\S]*?self\?\.dismissSurfaces\(\)/u,
+  );
+  assert.match(
+    source,
+    /private func dismissSurfaces\(\) \{\s*menu\.cancelTracking\(\)[\s\S]*?popover\.performClose\(nil\)/u,
+  );
+  assert.match(
+    source,
+    /func shutDown\(\) \{[\s\S]*?dismissSurfaces\(\)[\s\S]*?removeInteractionMonitoring\(\)/u,
   );
   for (const action of [
     "openTiboTattle",
@@ -2678,7 +2736,7 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   ]) {
     assert.match(
       source,
-      new RegExp(`@objc private func ${action}\\(\\) \\{[\\s\\S]*?dismissMenu\\(\\)`, "u"),
+      new RegExp(`@objc private func ${action}\\(\\) \\{[\\s\\S]*?dismissSurfaces\\(\\)`, "u"),
       action,
     );
   }
@@ -2707,6 +2765,70 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.match(source, /structuralRebuildPending = true/u);
   assert.match(source, /deferredLaneTitle/u);
   assert.match(source, /private func expireCachedEvidenceIfNeeded\(\)/u);
+  assert.match(source, /private func scheduleEvidenceExpiry\(\)/u);
+  assert.match(
+    source,
+    /nextEvidencePresentationBoundary\([\s\S]*?staleAfterSeconds: snapshot\.staleAfterSeconds/u,
+  );
+
+  // The rich popup is a real AppKit surface with fixed width, no scroll view,
+  // two native history ranges, and an explicit non-forecast position visual.
+  assert.match(popupSource, /final class MenuBarPopoverViewController: NSViewController/u);
+  assert.match(popupSource, /static let width: CGFloat = 400/u);
+  assert.doesNotMatch(popupSource, /NSScrollView\s*\(/u);
+  assert.match(popupSource, /let rangeControl = NSSegmentedControl\(\)/u);
+  assert.match(modelSource, /case sevenDays = "7d"/u);
+  assert.match(modelSource, /case thirtyDays = "30d"/u);
+  assert.match(popupSource, /MenuBarWeeklyPositionView/u);
+  assert.match(popupSource, /difference <= -2/u);
+  assert.match(popupSource, /difference >= 2/u);
+  assert.match(popupSource, /menuBarPopupPositionDisclaimer/u);
+  assert.match(popupSource, /MenuBarDailyTokenBarsView/u);
+  assert.match(popupSource, /day\.totalTokens/u);
+  assert.match(popupSource, /day\.evidence == \.partial[\s\S]*?drawPartialBar/u);
+  assert.match(popupSource, /menuBarPopupNotSubscriptionBill/u);
+  assert.match(popupSource, /menuBarPopupCoverageMixed/u);
+  assert.match(popupSource, /menuBarPopupCoverageAccessible/u);
+  assert.match(popupSource, /historyCoverageLabel\.isHidden = historyChart\.coverageState == \.complete/u);
+  assert.match(popupSource, /refreshButton\.isEnabled = snapshot\.analysisAvailable/u);
+  assert.match(popupSource, /selectHistoryRangeForSmokeTest/u);
+  assert.match(popupSource, /renderPNG\(to url: URL, appearance: NSAppearance\.Name\)/u);
+
+  // Accounting is independently fail-closed. Calendar-day aggregation uses
+  // Calendar arithmetic for DST, preserves gaps, and admits authoritative
+  // zeros only inside complete coverage.
+  assert.match(modelSource, /freshness\["accountingStatus"\] as\? String == "available"/u);
+  assert.match(modelSource, /sourceMode != "unified"[\s\S]*?generationMatched/u);
+  assert.match(modelSource, /enum Evidence: Equatable \{[\s\S]*?case available[\s\S]*?case partial[\s\S]*?case unavailable/u);
+  assert.match(modelSource, /calendar\.date\([\s\S]*?byAdding: \.day/u);
+  assert.match(modelSource, /let fullCivilDayCovered/u);
+  assert.match(modelSource, /guard !matching\.isEmpty else/u);
+  assert.match(modelSource, /source != "insufficient_evidence"/u);
+  const popupCatalogs = await Promise.all(
+    ["en", "es", "zh-Hans"].map((locale) => readFile(join(
+      REPOSITORY_ROOT,
+      "apps",
+      "macos",
+      "Resources",
+      `${locale}.lproj`,
+      "Localizable.strings",
+    ), "utf8")),
+  );
+  const popupLocalization = popupCatalogs.map((catalog) => catalog
+    .split("\n")
+    .filter((line) => line.includes('"menuBarPopup.'))
+    .join("\n"))
+    .join("\n");
+  for (const privacyForbidden of [
+    /reset.?credit/iu,
+    /redeem/iu,
+    /buy.?credit/iu,
+    /account.?email/iu,
+  ]) {
+    assert.doesNotMatch(popupSource, privacyForbidden);
+    assert.doesNotMatch(modelSource, privacyForbidden);
+    assert.doesNotMatch(popupLocalization, privacyForbidden);
+  }
 
   // The analyze item drives the companion's own refresh route with the exact
   // same-origin proof the dashboard button sends.
@@ -5335,7 +5457,10 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/macos/Sources/KeychainBroker.swift",
     "apps/macos/Sources/Localization.swift",
     "apps/macos/Sources/LoginItemManager.swift",
+    "apps/macos/Sources/MenuBarPopover.swift",
+    "apps/macos/Sources/MenuBarPopupModel.swift",
     "apps/macos/Sources/MenuBarStatus.swift",
+    "apps/macos/Sources/NativeBrandPalette.swift",
     "apps/macos/Sources/QuotaNotifications.swift",
     "apps/macos/Sources/SemanticOpenTarget.swift",
     "apps/macos/UsageMonitorApp.swift",
@@ -6459,7 +6584,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       menuBarSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT native_rows=true titles=true states=starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q dismissal=native,escape,same-app,deactivation weekly_position=fresh-only analysis_title=live-fallback$/mu,
+      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT popover=true width=400 bars=7,30 pace=used-vs-elapsed native_actions=true states=live,starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q routing=left-popover,right-menu,control-menu dismissal=escape,transient,same-app,deactivation weekly_position=fresh-only history=authoritative,coverage-named,fail-closed pricing=complete,partial,unavailable model=dst,overlap,future,per-lane reset_credits=absent analysis_title=live-fallback$/mu,
     );
     const analysisProgressSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),
@@ -6474,6 +6599,90 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.match(
       analysisProgressSmoke.stdout,
       /^USAGE_MONITOR_MACOS_ANALYSIS_PROGRESS_CONTRACT phases=allowlisted archive=scanning counts=bounded contradictory=generic unknown=generic free_text=ignored idle=unchanged percent=false eta=false$/mu,
+    );
+    const popupRenderDirectory = join(temporaryRoot, "menu-bar-popover-render");
+    const popupRenderSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--menu-bar-popover-render-smoke-test", popupRenderDirectory],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(
+      popupRenderSmoke.status,
+      0,
+      popupRenderSmoke.stderr || popupRenderSmoke.stdout,
+    );
+    assert.match(
+      popupRenderSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_MENU_BAR_POPOVER_RENDER locales=en,es,zh-Hans appearances=light,dark ranges=7d,30d states=live,partial-pricing,unpriced,unavailable width=400 source=synthetic-content-free$/mu,
+    );
+    const popupRenders = (await readdir(popupRenderDirectory)).sort();
+    assert.equal(popupRenders.length, 11);
+    assert.equal(
+      popupRenders.includes("menu-bar-popover-en-30d-light.png"),
+      true,
+    );
+    assert.equal(
+      popupRenders.includes("menu-bar-popover-zh-Hans-dark.png"),
+      true,
+    );
+    assert.equal(
+      popupRenders.includes("menu-bar-popover-es-partial-pricing-light.png"),
+      true,
+    );
+    assert.equal(
+      popupRenders.includes("menu-bar-popover-es-unpriced-light.png"),
+      true,
+    );
+    assert.equal(
+      popupRenders.includes("menu-bar-popover-es-unavailable-light.png"),
+      true,
+    );
+    const popupRenderDigests = new Map();
+    for (const popupRender of popupRenders) {
+      const renderBytes = await readFile(join(popupRenderDirectory, popupRender));
+      assert.ok(
+        renderBytes.length > 1_000,
+        popupRender,
+      );
+      assert.equal(
+        renderBytes.subarray(0, 8).toString("hex"),
+        "89504e470d0a1a0a",
+        popupRender,
+      );
+      assert.equal(renderBytes.readUInt32BE(16), 800, popupRender);
+      const pixelHeight = renderBytes.readUInt32BE(20);
+      assert.ok(pixelHeight >= 600, popupRender);
+      if (!popupRender.includes("unavailable")) {
+        assert.ok(pixelHeight >= 1_000, popupRender);
+      }
+      popupRenderDigests.set(
+        popupRender,
+        createHash("sha256").update(renderBytes).digest("hex"),
+      );
+    }
+    assert.notEqual(
+      popupRenderDigests.get("menu-bar-popover-en-light.png"),
+      popupRenderDigests.get("menu-bar-popover-en-dark.png"),
+    );
+    assert.notEqual(
+      popupRenderDigests.get("menu-bar-popover-en-light.png"),
+      popupRenderDigests.get("menu-bar-popover-en-30d-light.png"),
+    );
+    assert.notEqual(
+      popupRenderDigests.get("menu-bar-popover-en-light.png"),
+      popupRenderDigests.get("menu-bar-popover-es-light.png"),
+    );
+    assert.notEqual(
+      popupRenderDigests.get("menu-bar-popover-es-light.png"),
+      popupRenderDigests.get("menu-bar-popover-zh-Hans-light.png"),
+    );
+    assert.notEqual(
+      popupRenderDigests.get("menu-bar-popover-es-partial-pricing-light.png"),
+      popupRenderDigests.get("menu-bar-popover-es-unpriced-light.png"),
+    );
+    assert.notEqual(
+      popupRenderDigests.get("menu-bar-popover-es-unpriced-light.png"),
+      popupRenderDigests.get("menu-bar-popover-es-unavailable-light.png"),
     );
     const quotaNotificationSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),
