@@ -316,6 +316,7 @@ export function createCodexLogIngestion({
           seedTotals: historySeed?.totals ?? null,
           seedTotalsPresence: historySeed?.totalsPresence ?? null,
           seedTier: historySeed?.tier ?? null,
+          expectedSessionId: info.lineage?.sessionId ?? null,
         })
       ));
       if (parsed.openTasksAtEnd > 0 && info.mtimeMs >= activeCutoffMs) {

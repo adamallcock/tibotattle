@@ -698,9 +698,9 @@ enum LocalCompanionOverviewProjection {
         return now.timeIntervalSince(observedAt) <= limit ? .live : .stale
     }
 
-    /// The overview intentionally carries no free-form labels. This fixed
-    /// vocabulary gives the normal Codex allowance a readable, privacy-safe
-    /// name without surfacing provider/account identifiers from raw records.
+    /// The compact menu intentionally ignores local-only provider display
+    /// metadata. This fixed vocabulary gives the normal Codex allowance a
+    /// readable name without surfacing an unknown pool in the headline.
     private static func isSupportedCodexAllowance(
         limitId: String,
         durationMinutes: Int?

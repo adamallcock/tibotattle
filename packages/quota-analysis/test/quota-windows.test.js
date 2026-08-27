@@ -2,12 +2,19 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  classifyQuotaWindowKind,
+  CODEX_PRIMARY_LIMIT_ID,
+  CODEX_SPARK_LIMIT_ID,
+  CODEX_SPARK_RESERVED_LIMIT_ID,
   FIVE_HOUR_WINDOW_MINUTES,
   formatQuotaWindowDuration,
   isSupportedQuotaWindowDuration,
   isValidQuotaWindowDuration,
   MAX_QUOTA_WINDOW_DURATION_MINUTES,
+  quotaLimitDisplayAlias,
   quotaWindowLabel,
+  sanitizeQuotaLimitDisplayName,
+  sanitizeQuotaLimitId,
   selectPrimaryQuotaWindow,
   SEVEN_DAY_WINDOW_MINUTES,
   SUPPORTED_QUOTA_WINDOW_DURATIONS,
@@ -152,8 +159,51 @@ test("primary selection and labels preserve named semantics for provider windows
   assert.equal(quotaWindowLabel("codex", 300), "Five-hour allowance");
   assert.equal(quotaWindowLabel("codex", 10_080), "Seven-day allowance");
   assert.equal(quotaWindowLabel("codex", 43_200), "Provider-reported 30-day window");
+  assert.equal(quotaWindowLabel(CODEX_SPARK_LIMIT_ID, 300), "Spark five-hour allowance");
+  assert.equal(quotaWindowLabel(CODEX_SPARK_RESERVED_LIMIT_ID, 10_080), "Spark seven-day allowance");
+  assert.equal(quotaWindowLabel("future_pool", 43_200), "Other observed 30-day allowance");
+  assert.equal(
+    quotaWindowLabel("future_pool", 43_200, "GPT-6 Preview"),
+    "GPT-6 Preview · 30-day allowance",
+  );
   assert.doesNotMatch(quotaWindowLabel("codex", 43_200), /month/iu);
   assert.equal(formatQuotaWindowDuration(0), null);
   assert.equal(quotaWindowLabel("codex", 0), "Unknown quota window");
   assert.equal(selectPrimaryQuotaWindow(null), null);
+});
+
+test("future limit display metadata is bounded and never defines quota identity", () => {
+  assert.equal(sanitizeQuotaLimitId("future_pool:v2"), "future_pool:v2");
+  for (const invalid of [null, "", " future_pool", "future/pool", "_future", "x".repeat(65)]) {
+    assert.equal(sanitizeQuotaLimitId(invalid), "unknown", String(invalid));
+  }
+
+  assert.equal(
+    sanitizeQuotaLimitDisplayName("GPT-5.3-Codex-Spark"),
+    "GPT-5.3-Codex-Spark",
+  );
+  assert.equal(sanitizeQuotaLimitDisplayName("  Future Pool  "), "Future Pool");
+  for (const invalid of [
+    null,
+    "",
+    "Account alice@example.com",
+    "https://example.com/limit",
+    "/Users/alice/limit",
+    "Future\nPool",
+    "<Future Pool>",
+    "x".repeat(81),
+  ]) {
+    assert.equal(sanitizeQuotaLimitDisplayName(invalid), null, String(invalid));
+  }
+
+  assert.equal(quotaLimitDisplayAlias(CODEX_PRIMARY_LIMIT_ID), "Codex");
+  assert.equal(quotaLimitDisplayAlias(CODEX_SPARK_LIMIT_ID), "Spark");
+  assert.equal(quotaLimitDisplayAlias(CODEX_SPARK_RESERVED_LIMIT_ID), "Spark");
+  assert.equal(quotaLimitDisplayAlias("future_pool"), null);
+  assert.equal(classifyQuotaWindowKind("future_pool", 300), "other");
+  assert.equal(classifyQuotaWindowKind(CODEX_SPARK_LIMIT_ID, 0), "other");
+  assert.equal(
+    quotaWindowLabel("future_pool", 300, "Account alice@example.com"),
+    "Other observed 5-hour allowance",
+  );
 });

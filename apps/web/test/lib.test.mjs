@@ -116,6 +116,7 @@ import {
   translatePlural,
 } from "../public/localization.js";
 import {
+  TELEMETRY_PLAN_DISPLAY_NAMES,
   TELEMETRY_PLAN_TYPES,
 } from "../public/telemetry-shared.generated.js";
 
@@ -2097,7 +2098,7 @@ test("normal Codex allowance selection uses stable identifiers, not labels", () 
   // still derived from (limitId, duration) alone, never from the provider's
   // label string supplied above.
   assert.equal(result.quotaWindows[1].label, "Spark seven-day allowance");
-  assert.equal(result.quotaWindows[2].label, "Other observed allowance");
+  assert.equal(result.quotaWindows[2].label, "Other observed 7-day allowance");
   assert.equal(result.quotaWindows[0].limitId, CODEX_PRIMARY_LIMIT_ID);
   assert.equal(result.quotaWindows[1].limitId, CODEX_SPARK_LIMIT_ID);
   assert.equal(result.quotaWindows[2].limitId, "unknown");
@@ -2376,12 +2377,16 @@ test("quota presentation keeps Spark separate and weekly surfaces exact", async 
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   assert.match(appSource, /isSparkQuotaLimitId/u);
   assert.match(appSource, /const sparkWindows = data\.quotaWindows\.filter/u);
+  assert.match(appSource, /const otherWindows = data\.quotaWindows\.filter/u);
+  assert.match(appSource, /\.\.\.otherOrderedWindows/u);
   assert.match(appSource, /quota-card-spark/u);
   assert.match(appSource, /dashboard\.quota\.windowSpark/u);
   // The Spark limit's two recognized windows carry duration-named titles; the
   // duration-blind windowSpark key stays as the honest generic fallback only.
   assert.match(appSource, /dashboard\.quota\.windowSparkFiveHour/u);
   assert.match(appSource, /dashboard\.quota\.windowSparkSevenDay/u);
+  assert.match(appSource, /dashboard\.quota\.windowOtherDuration/u);
+  assert.match(appSource, /dashboard\.quota\.windowNamedObserved/u);
   assert.match(appSource, /dashboard\.quota\.spark/u);
   assert.match(appSource, /const normalWindows = data\.quotaWindows\.filter\(isPrimaryCodexQuotaWindow\)/u);
   assert.match(appSource, /rows\.filter\(isPrimaryCodexWeeklyQuotaWindow\)/u);
@@ -6506,11 +6511,11 @@ test("live timeline couples quota-weighted usage to the matching allowance capac
     /data\.quotaWindows\.filter\(isPrimaryCodexQuotaWindow\)/u,
   );
   // Owner-directed 2026-08-20: the Spark cards lead the row and the
-  // normal-Codex allowance follows. Pinned so the grouping is not quietly
-  // reverted to normal-first by a later edit.
+  // normal-Codex allowance follows. Future pools remain visible only after
+  // both reviewed groups, never promoted into either one.
   assert.match(
     quotaCardsMatch[1],
-    /const windows = \[\.\.\.sparkOrderedWindows, \.\.\.normalOrderedWindows\];/u,
+    /const windows = \[[\s\S]*?\.\.\.sparkOrderedWindows,[\s\S]*?\.\.\.normalOrderedWindows,[\s\S]*?\.\.\.otherOrderedWindows,[\s\S]*?\];/u,
   );
   // Within the Spark pair the order comes from the window duration, not from
   // the provider's slot assignment, so five-hour precedes seven-day even if
@@ -8386,12 +8391,14 @@ async function loadShareCardPlan() {
   const section = appSource.slice(start, end);
   return Function(
     "finite",
+    "TELEMETRY_PLAN_DISPLAY_NAMES",
     "TELEMETRY_PLAN_TYPES",
     `${section}\nreturn { SHARE_CARD_PLAN_LABELS, shareCardPlanLabel, shareCardPlan };`,
   )(
     (value, fallback = null) => (
       typeof value === "number" && Number.isFinite(value) ? value : fallback
     ),
+    TELEMETRY_PLAN_DISPLAY_NAMES,
     TELEMETRY_PLAN_TYPES,
   );
 }
@@ -8403,6 +8410,8 @@ test("the share card names only a known, most-recent Codex plan", async () => {
   assert.equal(shareCardPlanLabel("pro"), "Pro (20×)");
   assert.equal(shareCardPlanLabel("prolite"), "Pro Lite (5×)");
   assert.equal(shareCardPlanLabel("plus"), "Plus");
+  assert.equal(shareCardPlanLabel("edu_plus"), "Edu Plus");
+  assert.equal(shareCardPlanLabel("edu_pro"), "Edu Pro");
   assert.equal(
     shareCardPlanLabel("self_serve_business_prolite"),
     "Business · Pro Lite (5×)",
@@ -8414,9 +8423,10 @@ test("the share card names only a known, most-recent Codex plan", async () => {
   assert.equal(shareCardPlanLabel(undefined), "");
   assert.equal(shareCardPlanLabel(null), "");
   assert.ok(!Object.hasOwn(SHARE_CARD_PLAN_LABELS, "unknown"));
-  for (const plan of Object.keys(SHARE_CARD_PLAN_LABELS)) {
-    assert.ok(TELEMETRY_PLAN_TYPES.includes(plan), `${plan} is a KnownPlan value`);
-  }
+  assert.deepEqual(
+    Object.keys(SHARE_CARD_PLAN_LABELS).sort(),
+    TELEMETRY_PLAN_TYPES.filter((plan) => plan !== "unknown").sort(),
+  );
 
   assert.equal(
     shareCardPlan([

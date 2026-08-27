@@ -8,6 +8,8 @@ import {
 } from "@app-usagemonitor/accounting";
 import {
   isValidQuotaWindowDuration,
+  sanitizeQuotaLimitDisplayName,
+  sanitizeQuotaLimitId,
 } from "@app-usagemonitor/quota-analysis";
 import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
 import {
@@ -652,8 +654,11 @@ export function quotaWindowProjection(window) {
   if (durationMinutes === null) return null;
   const resetAt = quotaResetIsoInstant(window.resetsAt);
   if (resetAt === null) return null;
-  return {
-    limitId: KNOWN_LIMITS.has(window.limitId) ? window.limitId : "unknown",
+  const projected = {
+    // Preserve a bounded future provider id for local display and track
+    // separation. Closed accounting/export boundaries still map it through
+    // their reviewed registries, so this cannot promote a new quota pool.
+    limitId: sanitizeQuotaLimitId(window.limitId),
     slot: KNOWN_SLOTS.has(window.slot) ? window.slot : "unknown",
     planType: KNOWN_PLANS.has(window.planType) ? window.planType : "unknown",
     usedPercent,
@@ -661,6 +666,9 @@ export function quotaWindowProjection(window) {
     durationMinutes,
     resetAt,
   };
+  const limitName = sanitizeQuotaLimitDisplayName(window.limitName);
+  if (limitName !== null) projected.limitName = limitName;
+  return projected;
 }
 
 function primaryCodexWindowIndex(windows) {

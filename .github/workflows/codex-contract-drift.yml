@@ -1,0 +1,132 @@
+name: Codex contract drift
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/codex-contract-drift.yml"
+      - "config/codex-contract-ledger.json"
+      - "package.json"
+      - "packages/telemetry-contract/src/constants.js"
+      - "scripts/check-codex-contract-drift.mjs"
+      - "test/codex-contract-drift.test.js"
+      - "test/fixtures/codex-*.rs"
+      - "test/fixtures/codex-*.ts"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/codex-contract-drift.yml"
+      - "config/codex-contract-ledger.json"
+      - "package.json"
+      - "packages/telemetry-contract/src/constants.js"
+      - "scripts/check-codex-contract-drift.mjs"
+      - "test/codex-contract-drift.test.js"
+      - "test/fixtures/codex-*.rs"
+      - "test/fixtures/codex-*.ts"
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-contract-drift-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  drift:
+    name: Compare source, releases, and product registry
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the selected revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Check the checked-in contract offline
+        run: |
+          node ./scripts/check-codex-contract-drift.mjs \
+            --report "$RUNNER_TEMP/codex-contract-offline.json" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve and fetch the exact openai/codex source revision
+        if: github.event_name != 'pull_request'
+        id: upstream-source
+        run: |
+          git ls-remote --refs https://github.com/openai/codex.git refs/heads/main \
+            > "$RUNNER_TEMP/openai-codex-main.txt"
+          source_revision="$(node -e '
+            const fs = require("node:fs");
+            const text = fs.readFileSync(process.argv[1], "utf8").trim();
+            const match = /^([0-9a-f]{40})\s+refs\/heads\/main$/u.exec(text);
+            if (!match) process.exit(1);
+            process.stdout.write(match[1]);
+          ' "$RUNNER_TEMP/openai-codex-main.txt")"
+          curl \
+            --proto '=https' \
+            --tlsv1.2 \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 3 \
+            --retry-all-errors \
+            --max-time 60 \
+            --max-filesize 1048576 \
+            --output "$RUNNER_TEMP/openai-codex-auth.rs" \
+            "https://raw.githubusercontent.com/openai/codex/$source_revision/codex-rs/protocol/src/auth.rs"
+          echo "revision=$source_revision" >> "$GITHUB_OUTPUT"
+
+      - name: Install the latest published Codex CLI without lifecycle scripts
+        if: github.event_name != 'pull_request'
+        run: |
+          npm view @openai/codex version --json \
+            > "$RUNNER_TEMP/openai-codex-version.json"
+          codex_version="$(node -e '
+            const fs = require("node:fs");
+            const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            if (typeof value !== "string" || !/^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u.test(value)) {
+              process.exit(1);
+            }
+            process.stdout.write(value);
+          ' "$RUNNER_TEMP/openai-codex-version.json")"
+          npm install \
+            --prefix "$RUNNER_TEMP/codex-release" \
+            --ignore-scripts \
+            --no-audit \
+            --no-fund \
+            --package-lock=false \
+            --save=false \
+            "@openai/codex@$codex_version"
+          test -x "$RUNNER_TEMP/codex-release/node_modules/.bin/codex"
+
+      - name: Compare current source and latest released binary
+        if: github.event_name != 'pull_request'
+        run: |
+          node ./scripts/check-codex-contract-drift.mjs \
+            --source-file "$RUNNER_TEMP/openai-codex-auth.rs" \
+            --source-revision "${{ steps.upstream-source.outputs.revision }}" \
+            --binary "standalone_latest=$RUNNER_TEMP/codex-release/node_modules/.bin/codex" \
+            --require-binary \
+            --report "$RUNNER_TEMP/codex-contract-live.json" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain path-free drift reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codex-contract-drift-reports
+          path: ${{ runner.temp }}/codex-contract-*.json
+          if-no-files-found: error
+          retention-days: 14

@@ -1,6 +1,6 @@
 {
   "schemaVersion": "tool-inventory-v0.1",
-  "reviewedAt": "2026-08-17",
+  "reviewedAt": "2026-08-26",
   "scope": "Executable and executable-adjacent sources under root scripts/** and tools/**, legacy root report builders and verifiers, and product contribution preparation.",
   "records": [
     {
@@ -294,6 +294,33 @@
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
       "provenanceReason": "The checker is a live repository quality gate and has no separate dated provenance artifact.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "repository_operations",
+      "canonicalPath": "scripts/check-codex-contract-drift.mjs",
+      "stableAlias": "codex:contract:check",
+      "stableAliasReason": null,
+      "additionalAliases": [
+        "codex:contract:record-installed",
+        "codex:contract:release:check"
+      ],
+      "callers": [
+        "package.json#scripts.codex:contract:check",
+        "package.json#scripts.codex:contract:record-installed",
+        "package.json#scripts.codex:contract:release:check",
+        ".github/workflows/codex-contract-drift.yml",
+        ".github/workflows/release-trust-policy.yml",
+        "test/codex-contract-drift.test.js",
+        "CONTRIBUTING.md",
+        "docs/design/2026-08-26-codex-plan-display-names.md",
+        "docs/runbooks/2026-08-04-owner-release-execution.md",
+        "docs/runbooks/macos-stable-release-runbook.md"
+      ],
+      "decision": "retain_as_upstream_contract_quality_gate",
+      "provenance": "docs/design/2026-08-26-codex-plan-display-names.md",
+      "provenanceReason": null,
       "legacyPaths": []
     },
     {

@@ -1196,15 +1196,15 @@ function windowsFromAppPayload(payload) {
   const limits = new Map();
   if (canonical?.limitId) limits.set(canonical.limitId, canonical);
   for (const [id, raw] of Object.entries(byLimit)) {
-    const limit = sanitizeRateLimit(raw);
-    if (limit) limits.set(id, limit);
+    const limit = sanitizeRateLimit(raw, id);
+    if (limit) limits.set(limit.limitId, limit);
   }
   const windows = [];
   for (const limit of limits.values()) {
     for (const slot of ["primary", "secondary"]) {
       const window = limit?.[slot];
       if (!window) continue;
-      windows.push({
+      const projected = {
         provider: "openai_codex",
         planType: limit.planType ?? "unknown",
         limitId: limit.limitId ?? "unknown",
@@ -1212,10 +1212,24 @@ function windowsFromAppPayload(payload) {
         usedPercent: window.usedPercent,
         windowDurationMins: window.windowDurationMins,
         resetsAt: window.resetsAt,
-      });
+      };
+      if (limit.limitName !== null) projected.limitName = limit.limitName;
+      windows.push(projected);
     }
   }
   return windows.sort((left, right) => left.limitId.localeCompare(right.limitId) || left.slot.localeCompare(right.slot));
+}
+
+function quotaWindowIdentityProjection(windows) {
+  return windows.map((window) => ({
+    provider: window.provider,
+    planType: window.planType,
+    limitId: window.limitId,
+    slot: window.slot,
+    usedPercent: window.usedPercent,
+    windowDurationMins: window.windowDurationMins,
+    resetsAt: window.resetsAt,
+  }));
 }
 
 export function appServerSnapshotRecord(payload, { source, receivedAt }) {
@@ -1240,9 +1254,12 @@ export function appServerSnapshotRecord(payload, { source, receivedAt }) {
     officialUsageSummary: source === "app_server_read" ? (accountSnapshot?.officialUsageSummary ?? null) : null,
     controlledState: "unknown",
   };
+  // A friendly name is presentation metadata, not quota identity. Provider
+  // copy changes must not manufacture a new observation or reset dedupe.
+  const identityWindows = quotaWindowIdentityProjection(windows);
   safe.eventKey = eventKey(source === "app_server_notification"
-    ? { source, windows, accountScope: safe.accountScope.scopeId }
-    : { source, windows, accountScope: safe.accountScope.scopeId, observedAt: receivedAt });
+    ? { source, windows: identityWindows, accountScope: safe.accountScope.scopeId }
+    : { source, windows: identityWindows, accountScope: safe.accountScope.scopeId, observedAt: receivedAt });
   return safe;
 }
 

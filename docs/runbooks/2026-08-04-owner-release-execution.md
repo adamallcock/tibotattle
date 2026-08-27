@@ -113,6 +113,7 @@ Run the existing local gates from the candidate checkout:
 ```sh
 npm test
 npm run product:check
+npm run codex:contract:release:check
 npm run docs:links:check
 npm run product:macos:build
 npm run product:macos:validate:development
@@ -120,7 +121,9 @@ npm run product:macos:validate:development
 
 The evidence must include the source revision and green results for the Worker,
 web, macOS, architecture, asset, and local-review checks covered by
-`product:check`. The identity tests must cover both Google and Apple state/
+`product:check`. The Codex release-contract check must inspect at least one
+installed Codex binary and reject an unreviewed `PlanType` before the candidate
+is built. The identity tests must cover both Google and Apple state/
 nonce/PKCE boundaries, expiry and replay rejection, single-use completion, and
 cancelled-flow cleanup. A live provider login is not substituted with test
 fixtures, and a green local suite is not called a deployed proof.

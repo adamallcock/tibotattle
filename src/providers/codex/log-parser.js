@@ -2,7 +2,9 @@ import {
   CODEX_LOG_RELEVANT_LINE_NEEDLES,
   canonicalComponentAvailability,
   canonicalComponents,
+  canonicalRateLimitSnapshot,
   canonicalRateLimitWindows,
+  codexSessionMetaIdentity,
   createLeadingRateLimitGate,
   cumulativeSnapshotKey,
   deltaComponentPresence,
@@ -262,6 +264,7 @@ export function createCodexLogParser({ lineReader }) {
     seedTotals = null,
     seedTotalsPresence = null,
     seedTier = null,
+    expectedSessionId = null,
   }) {
     const tierTimeline = await collectTierTimeline(
       source,
@@ -280,7 +283,7 @@ export function createCodexLogParser({ lineReader }) {
     let reAnchored = false;
     const openTaskIds = new Set();
     let sourceRecordOrdinal = 0;
-    let sessionMetaRecords = 0;
+    let sessionMetaSeen = false;
     const leadingRateLimitGate = createLeadingRateLimitGate();
 
     // Every movement of the cumulative baseline goes through here, including
@@ -342,10 +345,13 @@ export function createCodexLogParser({ lineReader }) {
         continue;
       }
       if (record.type === "session_meta") {
-        sessionMetaRecords += 1;
-        if (sessionMetaRecords > 1) {
+        const sessionMetaId = codexSessionMetaIdentity(record.payload);
+        if (sessionMetaId === null
+            || (!sessionMetaSeen && expectedSessionId !== null
+              && sessionMetaId !== expectedSessionId)) {
           diagnostics.malformedAccountingRecords += 1;
         }
+        sessionMetaSeen = true;
         continue;
       }
       const timestampMs = typeof record?.timestamp === "string"
@@ -443,10 +449,11 @@ export function createCodexLogParser({ lineReader }) {
         diagnostics.unattributedForkReplayEventsSkipped += 1;
         continue;
       }
-      const rateLimitWindows = canonicalRateLimitWindows(record.payload?.rate_limits);
+      const rateLimitSnapshot = canonicalRateLimitSnapshot(record.payload?.rate_limits);
+      const rateLimitWindows = rateLimitSnapshot?.windows ?? [];
       if (record.payload?.rate_limits === null || record.payload?.rate_limits === undefined) {
         diagnostics.missingRateLimitRecords += 1;
-      } else if (rateLimitWindows.length === 0) {
+      } else if (rateLimitSnapshot === null) {
         diagnostics.malformedRateLimitRecords += 1;
       }
       for (const window of rateLimitWindows) {

@@ -347,7 +347,7 @@ test("an unfinished JSONL tail never publishes facts, skips unchanged, and heals
   }
 });
 
-test("an appended second session metadata record quarantines instead of merging threads", async () => {
+test("copied session metadata keeps the rollout's first thread identity canonical", async () => {
   const { root, source } = await rolloutHome([
     sessionMeta(),
     turnContext(),
@@ -363,28 +363,13 @@ test("an appended second session metadata record quarantines instead of merging 
       "",
     ].join("\n"));
 
-    const quarantined = await ingest(root);
-    assert.equal(quarantined.generation.status, "partial");
-    assert.equal(
-      quarantined.generation.issueCounts
-        .codex_rollout_content_invalid.sourceCount,
-      1,
-    );
-    assert.equal(quarantined.totalUsageEvents, 0);
+    const ingested = await ingest(root);
+    assert.equal(ingested.generation.status, "complete");
+    assert.equal(ingested.totalUsageEvents, 2);
 
     const unchanged = await ingest(root);
     assert.equal(unchanged.unchanged, true);
     assert.equal(unchanged.sourcesScanned, 0);
-
-    await writeFile(source, [
-      sessionMeta(),
-      turnContext(),
-      tokenCount(),
-      "",
-    ].join("\n"), { mode: 0o600 });
-    const repaired = await ingest(root);
-    assert.equal(repaired.generation.status, "complete");
-    assert.equal(repaired.totalUsageEvents, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -910,10 +895,66 @@ test("complete Codex scans reject malformed accounting and unfinished tails with
     }
   });
 
-  await t.test("duplicate session metadata", async () => {
+  await t.test("copied session metadata", async () => {
     const { root } = await rolloutHome([
       sessionMeta(),
       sessionMeta(CHILD_THREAD),
+      turnContext(),
+      tokenCount(),
+      "",
+    ].join("\n"));
+    try {
+      const scan = await scanCodexLogEvents({
+        codexHome: root,
+        startAt: "1970-01-01T00:00:00.000Z",
+        endAt: "2030-01-01T00:00:00.000Z",
+        requireCompleteDiscovery: true,
+      });
+      assert.equal(scan.diagnostics.malformedAccountingRecords, 0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  await t.test("same-thread session metadata update", async () => {
+    const metadataUpdate = JSON.stringify({
+      timestamp: "2026-07-25T00:00:00.050Z",
+      type: "session_meta",
+      payload: {
+        id: THREAD,
+        session_id: THIRD_THREAD,
+        memory_mode: "enabled",
+      },
+    });
+    const { root } = await rolloutHome([
+      sessionMeta(),
+      metadataUpdate,
+      turnContext(),
+      tokenCount(),
+      "",
+    ].join("\n"));
+    try {
+      const scan = await scanCodexLogEvents({
+        codexHome: root,
+        startAt: "1970-01-01T00:00:00.000Z",
+        endAt: "2030-01-01T00:00:00.000Z",
+        requireCompleteDiscovery: true,
+      });
+      assert.equal(scan.diagnostics.malformedAccountingRecords, 0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  await t.test("malformed appended session metadata", async () => {
+    const malformedUpdate = JSON.stringify({
+      timestamp: "2026-07-25T00:00:00.050Z",
+      type: "session_meta",
+      payload: { memory_mode: "enabled" },
+    });
+    const { root } = await rolloutHome([
+      sessionMeta(),
+      malformedUpdate,
       turnContext(),
       tokenCount(),
       "",

@@ -1232,6 +1232,57 @@ test("notification event identity deduplicates repeated snapshots without retain
   assert.equal(JSON.stringify(first).includes("fixture"), false);
 });
 
+test("app-server records retain bounded local names without making them quota identity", () => {
+  const payload = (futureName) => ({
+    rateLimits: {
+      limitId: "codex",
+      limitName: null,
+      planType: "plus",
+      primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 1784854800 },
+      secondary: null,
+    },
+    rateLimitsByLimitId: {
+      future_alpha: {
+        limitId: "future_alpha",
+        limitName: futureName,
+        planType: "plus",
+        primary: { usedPercent: 10, windowDurationMins: 1_440, resetsAt: 1784854800 },
+        secondary: null,
+      },
+      future_beta: {
+        limitId: "future_beta",
+        limitName: "Account alice@example.com",
+        planType: "plus",
+        primary: { usedPercent: 20, windowDurationMins: 43_200, resetsAt: 1784854800 },
+        secondary: null,
+      },
+    },
+  });
+  const first = appServerSnapshotRecord(payload("Future Alpha"), {
+    source: "app_server_notification",
+    receivedAt: "2026-07-23T00:00:00.000Z",
+  });
+  const renamed = appServerSnapshotRecord(payload("Future Alpha Preview"), {
+    source: "app_server_notification",
+    receivedAt: "2026-07-23T00:00:10.000Z",
+  });
+
+  assert.deepEqual(
+    first.windows.map((window) => [
+      window.limitId,
+      window.limitName ?? null,
+      window.windowDurationMins,
+    ]),
+    [
+      ["codex", null, 300],
+      ["future_alpha", "Future Alpha", 1_440],
+      ["future_beta", null, 43_200],
+    ],
+  );
+  assert.equal(first.eventKey, renamed.eventKey);
+  assert.notEqual(first.windows[1].limitName, renamed.windows[1].limitName);
+});
+
 test("fresh direct app-server records expose a closed local notification projection", () => {
   assert.equal(notificationEvidenceFromAppServerRecord(null), null);
   const rateLimit = appPayload(84).rateLimits;

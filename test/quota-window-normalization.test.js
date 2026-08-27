@@ -8,6 +8,7 @@ import {
   selectPrimaryQuotaWindow,
 } from "@app-usagemonitor/quota-analysis";
 import {
+  canonicalRateLimitSnapshot,
   canonicalRateLimitWindows,
   createLeadingRateLimitGate,
 } from "../src/providers/codex/log-normalization.js";
@@ -44,6 +45,8 @@ test("provider fixtures retain exact named durations and admit a 30-day-like win
   );
   assert.equal(Object.hasOwn(windows[2], "planVariant"), false);
   assert.equal(Object.hasOwn(windows[2], "multiplier"), false);
+  assert.equal(windows[0].limitName, "Codex allowance");
+  assert.equal(windows[1].limitName, "Codex allowance");
 
   const primary = selectPrimaryQuotaWindow(windows);
   // The Spark limit's 300-minute window never joins the normal Codex
@@ -59,11 +62,34 @@ test("provider fixtures retain exact named durations and admit a 30-day-like win
   assert.doesNotMatch(quotaWindowLabel("codex", primary.windowDurationMins), /month/iu);
 });
 
+test("windowless Codex snapshots remain valid while malformed windows fail closed", () => {
+  const windowless = {
+    limit_id: "codex",
+    limit_name: "Codex allowance",
+    primary: null,
+    secondary: null,
+    credits: { has_credits: true, unlimited: false, balance: null },
+    individual_limit: null,
+    spend_control_reached: false,
+    plan_type: "plus",
+    rate_limit_reached_type: null,
+  };
+  assert.deepEqual(canonicalRateLimitSnapshot(windowless), { windows: [] });
+  assert.deepEqual(canonicalRateLimitWindows(windowless), []);
+  assert.equal(canonicalRateLimitSnapshot({}), null);
+  assert.equal(canonicalRateLimitSnapshot({
+    limit_id: "codex",
+    primary: { used_percent: 10, window_minutes: 0, resets_at: 1_785_456_360 },
+  }), null);
+});
+
 test("provider plan normalization is bounded and never infers a Pro multiplier", () => {
   assert.equal(sanitizeProviderPlanLabel(" Pro "), "pro");
   assert.equal(sanitizeProviderPlanLabel("business-preview"), "business-preview");
   assert.equal(sanitizeProviderPlanLabel("private owner@example.test"), null);
   assert.equal(normalizeProviderPlanType("pro"), "pro");
+  assert.equal(normalizeProviderPlanType("edu_plus"), "edu_plus");
+  assert.equal(normalizeProviderPlanType("edu_pro"), "edu_pro");
   assert.equal(normalizeProviderPlanType("pro-20x"), "unknown");
   assert.equal(normalizeProviderPlanType("provider-private-plan"), "unknown");
   assert.equal(normalizeProviderPlanType(null), "unknown");

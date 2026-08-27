@@ -2,6 +2,10 @@ import {
   CODEX_COLLECTOR_CANDIDATE_VERSION,
   ExportResourceLimitError,
 } from "../../export/index.js";
+import {
+  sanitizeQuotaLimitDisplayName,
+  sanitizeQuotaLimitId,
+} from "@app-usagemonitor/quota-analysis";
 import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
 
 export function createCodexCollectorExportContext(configuration) {
@@ -54,6 +58,11 @@ const RECORD_KEYS = Object.freeze([
 const WINDOW_KEYS = Object.freeze([
   "provider", "planType", "limitId", "slot", "usedPercent", "windowDurationMins", "resetsAt",
 ]);
+const WINDOW_KEYS_WITH_DISPLAY_NAME = Object.freeze([
+  ...WINDOW_KEYS,
+  "limitName",
+]);
+const MAXIMUM_LOCAL_WINDOWS = 64;
 const ACCOUNT_KEYS = Object.freeze(["status", "reason", "version", "scopeId", "planType"]);
 const DAILY_TOKEN_KEYS = Object.freeze(["date", "tokens"]);
 const SUMMARY_KEYS = Object.freeze([
@@ -423,15 +432,18 @@ function validateAccountScope(value) {
 }
 
 function validateWindows(value) {
-  if (!Array.isArray(value) || value.length < 1 || value.length > LIMIT_IDS.size * SLOTS.size) return null;
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAXIMUM_LOCAL_WINDOWS) return null;
   const windows = [];
   const keys = new Set();
   let priorSortKey = null;
   for (const window of value) {
-    if (!exactKeys(window, WINDOW_KEYS)
+    const hasDisplayName = exactKeys(window, WINDOW_KEYS_WITH_DISPLAY_NAME);
+    if ((!hasDisplayName && !exactKeys(window, WINDOW_KEYS))
         || window.provider !== "openai_codex"
         || !PLAN_TYPES.has(window.planType)
-        || !LIMIT_IDS.has(window.limitId)
+        || sanitizeQuotaLimitId(window.limitId) !== window.limitId
+        || (hasDisplayName
+          && sanitizeQuotaLimitDisplayName(window.limitName) !== window.limitName)
         || !SLOTS.has(window.slot)
         || !Number.isFinite(window.usedPercent) || window.usedPercent < 0 || window.usedPercent > 100
         || !Number.isSafeInteger(window.windowDurationMins) || window.windowDurationMins < 1
@@ -441,7 +453,13 @@ function validateWindows(value) {
     if (keys.has(key) || (priorSortKey !== null && key.localeCompare(priorSortKey) <= 0)) return null;
     keys.add(key);
     priorSortKey = key;
-    windows.push(window);
+    // Friendly names and unreviewed pools are local display evidence. The
+    // export candidate keeps its old exact contract and cannot carry either.
+    if (LIMIT_IDS.has(window.limitId)) {
+      windows.push(Object.fromEntries(
+        WINDOW_KEYS.map((field) => [field, window[field]]),
+      ));
+    }
   }
   return windows;
 }
@@ -642,6 +660,12 @@ async function scanCodexCollectorExportSource(plan, {
         }
         const normalized = classifyRecord(record, bounds, diagnostics);
         if (!normalized) {
+          next.nextByte = entry.endByteExclusive;
+          next.nextLineOrdinal = entry.lineOrdinal + 1;
+          next.nextWindowOrdinal = 0;
+          continue;
+        }
+        if (normalized.windows.length === 0) {
           next.nextByte = entry.endByteExclusive;
           next.nextLineOrdinal = entry.lineOrdinal + 1;
           next.nextWindowOrdinal = 0;

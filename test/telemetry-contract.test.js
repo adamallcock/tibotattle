@@ -5,10 +5,22 @@ import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expandAndValidatePolicy } from "../scripts/generate-telemetry-contract.js";
+import {
+  TELEMETRY_PLAN_DISPLAY_NAMES,
+  TELEMETRY_PLAN_TYPES,
+} from "@app-usagemonitor/telemetry-contract";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const GENERATED_FILE = resolve(REPO_ROOT, "generated", "telemetry-v0.1-field-dictionary.json");
 const CONTRACT_STATUS_FILE = resolve(REPO_ROOT, "contracts", "telemetry-v0.1", "contract-status.json");
+
+test("every named Codex plan has one canonical display name", () => {
+  assert.deepEqual(
+    Object.keys(TELEMETRY_PLAN_DISPLAY_NAMES).sort(),
+    TELEMETRY_PLAN_TYPES.filter((plan) => plan !== "unknown").sort(),
+  );
+  assert.equal(Object.hasOwn(TELEMETRY_PLAN_DISPLAY_NAMES, "unknown"), false);
+});
 
 function oneFieldInventory() {
   return [{

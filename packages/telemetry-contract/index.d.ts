@@ -18,18 +18,23 @@ export const TELEMETRY_PLAN_TYPES: readonly [
   "plus",
   "pro",
   "prolite",
-  "business",
-  "enterprise",
-  "edu",
   "team",
   "self_serve_business_prolite",
   "self_serve_business_usage_based",
+  "business",
   "ent26",
   "enterprise_cbp_automation",
   "enterprise_cbp_usage_based",
+  "enterprise",
+  "edu",
+  "edu_plus",
+  "edu_pro",
   "unknown",
 ];
 export type TelemetryPlanType = typeof TELEMETRY_PLAN_TYPES[number];
+export const TELEMETRY_PLAN_DISPLAY_NAMES: Readonly<
+  Record<Exclude<TelemetryPlanType, "unknown">, string>
+>;
 
 export const TELEMETRY_TOOL_CLASSES: readonly [
   "webSearch",

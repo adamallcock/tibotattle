@@ -22,17 +22,41 @@ export const TELEMETRY_PLAN_TYPES = Object.freeze([
   "plus",
   "pro",
   "prolite",
-  "business",
-  "enterprise",
-  "edu",
   "team",
   "self_serve_business_prolite",
   "self_serve_business_usage_based",
+  "business",
   "ent26",
   "enterprise_cbp_automation",
   "enterprise_cbp_usage_based",
+  "enterprise",
+  "edu",
+  "edu_plus",
+  "edu_pro",
   "unknown",
 ]);
+
+// Human-readable names mirror Codex's KnownPlan::display_name() values. Keep
+// this map exhaustive for every named plan above; "unknown" intentionally has
+// no display name so public surfaces fail closed instead of inventing one.
+export const TELEMETRY_PLAN_DISPLAY_NAMES = Object.freeze({
+  free: "Free",
+  go: "Go",
+  plus: "Plus",
+  pro: "Pro",
+  prolite: "Pro Lite",
+  team: "Team",
+  self_serve_business_prolite: "Self Serve Business ProLite",
+  self_serve_business_usage_based: "Self Serve Business Usage Based",
+  business: "Business",
+  ent26: "Enterprise",
+  enterprise_cbp_automation: "Enterprise (Automation)",
+  enterprise_cbp_usage_based: "Enterprise CBP Usage Based",
+  enterprise: "Enterprise",
+  edu: "Edu",
+  edu_plus: "Edu Plus",
+  edu_pro: "Edu Pro",
+});
 
 export const TELEMETRY_TOOL_CLASSES = Object.freeze([
   "webSearch",

@@ -53,6 +53,15 @@ export const CODEX_SPARK_LIMIT_IDS = Object.freeze([
 export const CODEX_FIVE_HOUR_ALLOWANCE_MINUTES = 300;
 export const CODEX_WEEKLY_ALLOWANCE_MINUTES = 10_080;
 export const MAX_QUOTA_WINDOW_DURATION_MINUTES = 525_600;
+export const MAX_QUOTA_LIMIT_DISPLAY_NAME_LENGTH = 80;
+export const QUOTA_LIMIT_DISPLAY_ALIASES = Object.freeze({
+  [CODEX_PRIMARY_LIMIT_ID]: "Codex",
+  [CODEX_SPARK_LIMIT_ID]: "Spark",
+  [CODEX_SPARK_RESERVED_LIMIT_ID]: "Spark",
+});
+const SAFE_QUOTA_LIMIT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/u;
+const SAFE_QUOTA_LIMIT_DISPLAY_NAME =
+  /^[\p{L}\p{N}][\p{L}\p{N}\p{M}\p{Pd} ._()+:]{0,79}$/u;
 
 export function isSparkQuotaLimitId(value) {
   return CODEX_SPARK_LIMIT_IDS.includes(value);
@@ -296,10 +305,36 @@ function canonicalInstant(value) {
 }
 
 function normalizeQuotaLimitId(value) {
-  const candidate = text(value, "");
-  return candidate === CODEX_PRIMARY_LIMIT_ID || isSparkQuotaLimitId(candidate)
-    ? candidate
+  return sanitizeQuotaLimitId(value);
+}
+
+export function sanitizeQuotaLimitId(value) {
+  return typeof value === "string" && SAFE_QUOTA_LIMIT_ID.test(value)
+    ? value
     : "unknown";
+}
+
+export function sanitizeQuotaLimitDisplayName(value) {
+  if (typeof value !== "string") return null;
+  let normalized;
+  try {
+    normalized = value.normalize("NFKC").trim();
+  } catch {
+    return null;
+  }
+  if (normalized.length === 0
+      || Array.from(normalized).length > MAX_QUOTA_LIMIT_DISPLAY_NAME_LENGTH
+      || !SAFE_QUOTA_LIMIT_DISPLAY_NAME.test(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
+export function quotaLimitDisplayAlias(limitId) {
+  const normalized = sanitizeQuotaLimitId(limitId);
+  return Object.hasOwn(QUOTA_LIMIT_DISPLAY_ALIASES, normalized)
+    ? QUOTA_LIMIT_DISPLAY_ALIASES[normalized]
+    : null;
 }
 
 /**
@@ -370,24 +405,24 @@ export const QUOTA_WINDOW_KINDS = Object.freeze([
 
 export function classifyQuotaWindowKind(limitId, durationMinutes) {
   const duration = finite(durationMinutes, null);
+  if (!isValidQuotaWindowDuration(duration)) return "other";
   if (limitId === CODEX_PRIMARY_LIMIT_ID) {
     if (duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES) return "codex_five_hour";
     if (duration === CODEX_WEEKLY_ALLOWANCE_MINUTES) return "codex_seven_day";
-    if (isValidQuotaWindowDuration(duration)) return "codex_provider_reported";
-    return "other";
+    return "codex_provider_reported";
   }
   if (isSparkQuotaLimitId(limitId)) {
     if (duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES) return "spark_five_hour";
     if (duration === CODEX_WEEKLY_ALLOWANCE_MINUTES) return "spark_seven_day";
-    // The limit identity is certain even when the duration is novel or
-    // unparseable, so the window keeps the generic Spark name rather than
-    // being promoted to a named duration or demoted to "other".
+    // The limit identity is certain even when a valid duration is novel, so
+    // the window keeps the generic Spark name rather than borrowing a named
+    // duration.
     return "spark_other";
   }
   return "other";
 }
 
-export function quotaWindowLabel(limitId, durationMinutes) {
+export function quotaWindowLabel(limitId, durationMinutes, limitName = null) {
   const duration = finite(durationMinutes, null);
   switch (classifyQuotaWindowKind(limitId, duration)) {
     case "codex_five_hour":
@@ -403,8 +438,18 @@ export function quotaWindowLabel(limitId, durationMinutes) {
     case "spark_other":
       return "Spark allowance";
     default:
-      return "Other observed allowance";
+      break;
   }
+  const durationLabel = formatQuotaWindowDuration(duration);
+  const providerName = sanitizeQuotaLimitDisplayName(limitName);
+  if (durationLabel === "") {
+    return providerName === null
+      ? "Other observed allowance"
+      : `${providerName} allowance`;
+  }
+  return providerName === null
+    ? `Other observed ${durationLabel} allowance`
+    : `${providerName} · ${durationLabel} allowance`;
 }
 
 function count(value, fallback = null) {
@@ -4961,13 +5006,17 @@ function normalizeQuota(window, index) {
     ? durationCandidate
     : null;
   const limitId = normalizeQuotaLimitId(window?.limitId);
+  const limitName = sanitizeQuotaLimitDisplayName(
+    window?.limitName ?? window?.limit_name,
+  );
   return {
     id: text(window?.id ?? limitId, `quota-${index}`),
     limitId,
     slot: text(window?.slot, "unknown"),
     // Labels are fixed product copy. The raw label can be localized or
     // provider-controlled, so it is never used to name or select a window.
-    label: quotaWindowLabel(limitId, durationMinutes),
+    label: quotaWindowLabel(limitId, durationMinutes, limitName),
+    limitName,
     durationMinutes,
     usedPercent: used,
     remainingPercent: remaining,
