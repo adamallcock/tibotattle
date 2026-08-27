@@ -26,6 +26,7 @@ const PUBLISHED_HOME = [
 ].join("\n");
 
 const DAILY_PAYLOAD = Object.freeze({
+  allowanceState: "ready",
   days: [],
   from: "2026-08-01",
   schemaVersion: "community-daily-read-v1.0",

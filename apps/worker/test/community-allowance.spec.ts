@@ -423,9 +423,13 @@ describe("summarizeCommunityAllowanceDay", () => {
     const summary = summarizeCommunityAllowanceDay(fits, "2026-08-08");
     expect(summary.fitCount).toBe(2);
     expect(summary.centralUsd).toBe(20);
-    expect(summary.basis).toBe("seven_day_codex_pro20x_trailing_30d");
-    expect(summary.planType).toBe("pro");
-    expect(summary.planVariant).toBe("pro-20x");
+    expect(summary.basis).toBe(
+      "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+    );
+    expect(summary.referencePlanType).toBe("pro");
+    expect(summary.normalization).toBe("pro_x1_prolite_x4_plus_x20");
+    expect(summary).not.toHaveProperty("planType");
+    expect(summary).not.toHaveProperty("planVariant");
     expect(summary.trailingDays).toBe(30);
     expect(summary.windowDurationMinutes).toBe(10_080);
     expect(summary.limitId).toBe("codex");
@@ -463,6 +467,22 @@ describe("summarizeCommunityAllowanceDay", () => {
     expect(five.centralUsd).toBe(300);
     // q10/q90 with linear interpolation over five points.
     expect(five.band80Usd).toEqual({ lowerUsd: 140, upperUsd: 460 });
+  });
+
+  it("normalizes supported personal plans into one combined equivalent", () => {
+    const summary = summarizeCommunityAllowanceDay([
+      fit({ participantId: "p1", planType: "pro", capacityNanousd: 100e9 }),
+      // Same person on an older Pro 5x fit: it is a second fit, but not a
+      // second contributing account after the cross-plan dedupe.
+      fit({ participantId: "p1", planType: "prolite", capacityNanousd: 25e9 }),
+      fit({ participantId: "p2", planType: "plus", capacityNanousd: 5e9 }),
+      fit({ participantId: "p3", planType: "team", capacityNanousd: 999e9 }),
+      fit({ participantId: "p4", planType: "unknown", capacityNanousd: 999e9 }),
+    ], "2026-07-25");
+    expect(summary.fitCount).toBe(3);
+    expect(summary.participantCount).toBe(2);
+    expect(summary.centralUsd).toBe(100);
+    expect(summary.band80Usd).toEqual({ lowerUsd: 100, upperUsd: 100 });
   });
 });
 
@@ -546,15 +566,17 @@ describe("community allowance in the daily aggregate", () => {
     expect(contributionPayload.schemaVersion)
       .toBe("community-daily-aggregate-v1.0");
     expect(contributionPayload.allowance).toMatchObject({
-      basis: "seven_day_codex_pro20x_trailing_30d",
-      planType: "pro",
-      planVariant: "pro-20x",
+      basis:
+        "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+      referencePlanType: "pro",
+      normalization: "pro_x1_prolite_x4_plus_x20",
       qualification: "shared_reset_fit_gates_40pp_span_floor",
       spanFloorPp: 40,
       fitCount: 1,
       participantCount: 1,
       band80Usd: null,
     });
+    expect(contributionPayload).not.toHaveProperty("capacityByPlanType");
     expect(contributionPayload.allowance.centralUsd).toBeGreaterThan(0);
 
     const staleDay = await readLatestCommunityDailyAggregate(
@@ -572,30 +594,26 @@ describe("community allowance in the daily aggregate", () => {
     });
   });
 
-  it("excludes fits from other plan cohorts: the series is one plan, not a pool", async () => {
+  it("includes supported non-reference plans in the combined equivalent", async () => {
     const participant = await enrolledParticipant();
-    // The identical calibratable series, but observed on a ProLite (5x) plan:
-    // the fit gates pass, yet the published Pro (20x) series must not absorb a
-    // smaller plan's allowance into its median. The cohort is pinned by
-    // plan_type, so plan_type "prolite" is excluded regardless of the variant
-    // tag (which real uploads always carry as "unknown").
+    // The identical calibratable series, but observed on a ProLite (5x) plan.
+    // The fit gates pass and the combined public summary converts it to the
+    // Pro 20x-equivalent basis with the shared multiplier configuration.
     const accepted = await upload(
       participant,
       calibratableContribution("unknown", "prolite"),
     );
     expect(accepted.status, await accepted.clone().text()).toBe(202);
-    // The collector gathers all plan_types (for the capacity monitor), but the
-    // published Pro (20x) band filters to plan_type "pro" in the summarizer, so
-    // a ProLite (5x) series contributes zero fits to the band.
     const fits = await collectCommunityAllowanceFits(db());
-    expect(summarizeCommunityAllowanceDay(fits, "2026-07-27").fitCount).toBe(0);
+    const summary = summarizeCommunityAllowanceDay(fits, "2026-07-27");
+    expect(summary.fitCount).toBe(1);
+    expect(summary.centralUsd).not.toBeNull();
   });
 
   it("summarizes median capacity per plan_type for the multiplier-ratio monitor", async () => {
     // Two participants on different plans; the collector gathers both, and the
-    // additive capacity monitor buckets by plan_type so pro:prolite:plus ratios
-    // can be watched against the stated multipliers. The published band still
-    // sees only the pro cohort.
+    // private diagnostics can still bucket by plan_type even though the public
+    // payload publishes only their one combined normalized result.
     const proParticipant = await enrolledParticipant();
     expect((await upload(
       proParticipant,
@@ -614,10 +632,9 @@ describe("community allowance in the daily aggregate", () => {
     expect(capacity.pro!.medianCapacityNanousd).toBeGreaterThan(0);
     expect(capacity.prolite!.fitCount).toBeGreaterThan(0);
     expect(capacity.prolite!.medianCapacityNanousd).toBeGreaterThan(0);
-    // The published band excludes the ProLite cohort.
     const band = summarizeCommunityAllowanceDay(fits, "2026-07-27");
-    expect(band.planType).toBe("pro");
-    expect(band.fitCount).toBe(1);
+    expect(band.referencePlanType).toBe("pro");
+    expect(band.fitCount).toBe(2);
   });
 
   it("re-enqueues published days whose allowance drifts when late v0.2 fits arrive", async () => {

@@ -192,7 +192,10 @@ test("the public site presents only the install call to action and the community
   assert.match(html, /id="community-daily-result"/u);
   assert.match(html, /id="community-daily-state"/u);
   assert.match(html, /id="community-daily-hero"/u);
-  assert.match(html, /id="community-method-summary">See community activity details<\/summary>/u);
+  assert.match(
+    html,
+    /id="community-method-summary"[^>]*>See community activity<\/summary>/u,
+  );
   assert.doesNotMatch(html, /community-daily-status|community-daily-panel-state/u);
 
   // The legacy sealed-snapshot presentation is retired: the page carries no
@@ -343,7 +346,12 @@ test("the first visit leads with the product, Mac download action, and daily com
     /brew install --cask adamallcock\/tap\/tibotattle/u,
   );
   assert.match(html, /Latest community evidence/u);
-  assert.match(html, /See community activity details/u);
+  assert.match(html, /See community activity/u);
+  assert.match(html, /Community activity over time/u);
+  assert.match(
+    html,
+    /Delayed, aggregate daily totals from optional contributions\./u,
+  );
   assert.doesNotMatch(html, /The community signal|Personal dashboards and contributions stay in the Mac app\./u);
   assert.doesNotMatch(html, /community-estimate-summary|community-daily-panel-state|community-daily-status/u);
   assert.match(html, /Install the Mac app/u);
@@ -471,6 +479,11 @@ test("the Homebrew command stays bounded and readable at narrow widths", async (
     styles,
     /@media \(max-width: 420px\) \{[\s\S]*?\.community-site \.homebrew-install code \{\s*overflow-x: visible;\s*white-space: normal;/u,
   );
+  assert.match(
+    styles,
+    /\.community-site \.homebrew-install code \{[\s\S]*?font-size: \.6rem;/u,
+    "the long fixed command uses the deliberately smaller desktop type size",
+  );
 });
 
 test("the public header and footer stay compact on narrow screens", async () => {
@@ -554,7 +567,12 @@ test("unavailable community activity uses the compact public state", async () =>
   );
   assert.match(
     html,
-    /<summary id="community-method-summary">See community activity details<\/summary>/u,
+    /<summary id="community-method-summary"[^>]*>See community activity<\/summary>/u,
+  );
+  assert.match(html, /Community activity over time/u);
+  assert.match(
+    html,
+    /This public view includes no prompts, responses, or account details\./u,
   );
   assert.doesNotMatch(
     html,
@@ -707,6 +725,7 @@ test("the retained weekly snapshot normalizer still guards the app's closed cont
 test("the community allowance surface leads the product hero with honest labeling", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   const source = await readFile(SITE_SOURCE, "utf8");
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
 
   assert.match(html, /id="community-allowance-figure"/u);
   assert.match(html, /id="community-allowance-result"/u);
@@ -725,17 +744,65 @@ test("the community allowance surface leads the product hero with honest labelin
     allowanceIndex < communityIndex && communityIndex < dailyIndex && dailyIndex < featureIndex,
     "the daily-activity disclosure renders above the supporting feature strip",
   );
-  // Segmented time controls follow the app's established range pattern.
-  for (const control of [
-    'data-range-days="30"',
-    'data-range-days="90"',
-    'data-range-days=""',
-  ]) {
+  // The honest recomputation horizon is 70 days, so 90d would duplicate All.
+  for (const control of ['data-range-days="30"', 'data-range-days=""']) {
     assert.match(html, new RegExp(control, "u"), control);
   }
+  assert.doesNotMatch(html, /data-range-days="90"/u);
+  assert.match(
+    html,
+    /data-range-days="30" class="active" aria-pressed="true"/u,
+  );
+  assert.match(html, /Combined Pro 20x-equivalent allowance/u);
+  assert.match(html, /One combined estimate across contributing personal-plan accounts/u);
+  assert.doesNotMatch(html, /data-allowance-mode|By plan|plan selector/u);
+
+  // The larger chart is a standard native-dialog lightbox. The launcher is
+  // hidden until a published chart is actually renderable, then exposes the
+  // dialog relationship to assistive technology without invoking browser
+  // fullscreen mode.
+  const launcherIndex = html.indexOf('id="community-allowance-expand"');
+  assert.ok(launcherIndex >= 0, "the allowance chart has an expand launcher");
+  const launcherMarkup = html.slice(
+    html.lastIndexOf("<button", launcherIndex),
+    html.indexOf("</button>", launcherIndex) + "</button>".length,
+  );
+  assert.match(launcherMarkup, /aria-haspopup="dialog"/u);
+  assert.match(launcherMarkup, /aria-controls="community-allowance-dialog"/u);
+  assert.match(launcherMarkup, /aria-label="Expand community allowance chart"/u);
+  assert.match(launcherMarkup, /\shidden(?:\s|>)/u);
+
+  assert.match(
+    html,
+    /<dialog[\s\S]*?id="community-allowance-dialog"[\s\S]*?aria-labelledby="community-allowance-dialog-title"[\s\S]*?aria-describedby="community-allowance-dialog-copy"/u,
+  );
+  assert.match(
+    html,
+    /<h2 id="community-allowance-dialog-title"[^>]*>Explore community allowance history<\/h2>/u,
+  );
+  assert.match(
+    html,
+    /id="community-allowance-dialog-close"[\s\S]*?type="button"[\s\S]*?aria-label="Close expanded community allowance chart"/u,
+  );
+  assert.match(html, /id="community-allowance-dialog-range-controls"/u);
+  assert.equal(
+    html.match(/data-allowance-range-controls/g)?.length,
+    2,
+    "inline and expanded views expose the same synchronized range contract",
+  );
 
   assert.match(source, /renderCommunityAllowanceSection/u);
-  assert.match(source, /community-allowance-range-controls/u);
+  assert.match(source, /syncAllowanceRangeControls/u);
+  assert.match(source, /launcher\.hidden = !available;/u);
+  assert.match(source, /dialog\.showModal\(\);/u);
+  assert.match(source, /closeButton\.focus\(\);/u);
+  assert.match(source, /dialog\.addEventListener\("close"/u);
+  assert.match(source, /allowanceDialogReturnFocus\?\.focus\?\.\(\);/u);
+  assert.match(styles, /\.community-site \.community-chart-dialog::backdrop/u);
+  assert.match(
+    styles,
+    /\.community-site \.community-chart-dialog \{\s*width: min\(1180px, calc\(100vw - 32px\)\);/u,
+  );
 
   const publicCopy = `${html}\n${source}`;
   assert.doesNotMatch(
@@ -807,6 +874,7 @@ function publishedDailySeries(overrides = {}) {
     schemaVersion: COMMUNITY_DAILY_READ_SCHEMA_VERSION,
     from: "2025-08-08",
     to: "2026-08-08",
+    allowanceState: "ready",
     days: [
       publishedDailyDay("2026-08-06", 1),
       publishedDailyDay("2026-08-07", 2),
@@ -921,7 +989,7 @@ test("the daily series normalizer accepts only the closed published contract", (
   }
 });
 
-test("a published daily series renders revision freshness, latest-first", () => {
+test("a published daily series renders friendly cumulative activity, latest-first", () => {
   const documentRef = fakeDocument();
   const container = documentRef.createElement("div");
   const stateNode = documentRef.createElement("span");
@@ -934,13 +1002,45 @@ test("a published daily series renders revision freshness, latest-first", () => 
   });
   assert.equal(state, "published");
   assert.equal(stateNode.textContent, "Daily series available");
-  assert.match(container.text, /Latest published day/u);
-  assert.match(container.text, /Aug 7, 2026/u);
-  assert.doesNotMatch(container.text, /Aug 6, 2026/u);
-  assert.match(container.text, /r2/u);
-  assert.match(container.text, /Revision age/u);
-  assert.match(container.text, /Published days in window/u);
-  assert.match(container.text, /never edit history/u);
+  const quality = container.descendants().find(
+    (element) => element.className === "snapshot-quality-grid",
+  );
+  assert.ok(quality, "the reader-facing activity summary is present");
+  const terms = quality.descendants()
+    .filter(({ tag }) => tag === "dt")
+    .map(({ textContent }) => textContent);
+  const values = quality.descendants()
+    .filter(({ tag }) => tag === "dd")
+    .map(({ textContent }) => textContent);
+  const details = quality.descendants()
+    .filter(({ tag }) => tag === "small")
+    .map(({ textContent }) => textContent);
+  assert.deepEqual(terms, [
+    "Activity through",
+    "Contributors that day",
+    "Turns counted",
+    "Output tokens counted",
+  ]);
+  assert.deepEqual(values, ["Aug 7, 2026", "3", "240", "1K"]);
+  assert.deepEqual(details, [
+    "Most recent community day",
+    "Accounts represented on that day",
+    "Usage events across 2 shared days",
+    "Combined output across 2 shared days",
+  ]);
+  for (const retiredOperationalLabel of [
+    "Latest published day",
+    "Revision",
+    "Revision age",
+    "Released",
+    "Published days in window",
+  ]) {
+    assert.equal(quality.text.includes(retiredOperationalLabel), false, retiredOperationalLabel);
+  }
+  assert.match(
+    container.text,
+    /Late contributions can update a day; this view always shows the newest published totals\./u,
+  );
 
   // The chart precedes the table: bars for usage events, a line series for
   // combined output, and — while the series is one or two days long — dots
@@ -976,13 +1076,13 @@ test("a published daily series renders revision freshness, latest-first", () => 
     "Quota observations",
     "Contributing devices",
     "Output tokens",
-    "Released",
   ]) {
     assert.equal(columnLabels.includes(label), true, label);
   }
-  // The revision column is gone from the table; revision freshness lives in
-  // the summary grid above (asserted earlier in this test).
+  // Operational publication metadata does not compete with the reader-facing
+  // activity itself in either the summary or detailed table.
   assert.equal(columnLabels.includes("Revision"), false);
+  assert.equal(columnLabels.includes("Released"), false);
   const bodyRows = table
     .descendants()
     .filter((element) => element.tag === "tr")
@@ -1046,8 +1146,9 @@ test("the public site hosts the daily series containers", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   assert.match(html, /id="community-daily-result"/u);
   assert.match(html, /id="community-daily-state"/u);
-  assert.match(html, /Daily activity series/u);
-  assert.match(html, /latest published revision/u);
+  assert.match(html, /Community activity over time/u);
+  assert.match(html, /Delayed, aggregate daily totals from optional contributions\./u);
+  assert.doesNotMatch(html, /latest published revision/u);
   const source = await readFile(SITE_SOURCE, "utf8");
   assert.match(source, /renderCommunityDailySeries/u);
   assert.match(source, /communityDaily\(\)/u);
@@ -1178,10 +1279,10 @@ test("the daily chart keeps an all-zero output series on the baseline", () => {
 
 function allowanceBlock(overrides = {}) {
   return {
-    basis: "seven_day_codex_pro20x_trailing_30d",
+    basis: "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
     limitId: "codex",
-    planType: "pro",
-    planVariant: "pro-20x",
+    referencePlanType: "pro",
+    normalization: "pro_x1_prolite_x4_plus_x20",
     windowDurationMinutes: 10_080,
     trailingDays: 30,
     qualification: "shared_reset_fit_gates_40pp_span_floor",
@@ -1237,14 +1338,11 @@ test("the daily normalizer treats the allowance block as additive and per-day", 
   // malformed.
   for (const [label, hostile] of [
     ["unknown basis", allowanceBlock({ basis: "five_hour_trailing_7d" })],
-    // A different plan_type is a different product's allowance (ProLite is the
-    // 5x plan); the page's copy names the Pro (20x) cohort, so the block must
-    // not render under it. Cohorting is by plan_type, not the frozen variant tag.
-    ["different plan cohort", allowanceBlock({ planType: "prolite" })],
-    ["cohort-less pooled block", allowanceBlock({
-      planType: undefined,
-      planVariant: undefined,
+    ["wrong reference plan", allowanceBlock({ referencePlanType: "prolite" })],
+    ["altered normalization", allowanceBlock({
+      normalization: "pro_x1_prolite_x5_plus_x20",
     })],
+    ["missing normalization", allowanceBlock({ normalization: undefined })],
     ["negative fit count", allowanceBlock({ fitCount: -1 })],
     ["missing central with fits", allowanceBlock({ centralUsd: null })],
     ["zero-dollar central", allowanceBlock({ centralUsd: 0 })],
@@ -1390,8 +1488,9 @@ test("the allowance section renders the estimate with its visible caveat", () =>
   assert.match(container.text, /5 qualifying reset fits in the trailing 30 days/u);
   assert.match(container.text, /Latest published estimate \(Aug 7, 2026\)/u);
   assert.doesNotMatch(container.text, /Latest published estimate \(Aug 6, 2026\)/u);
-  // The methodology note names the shared gates and the absent span floor.
-  assert.match(container.text, /no display-side span floor/u);
+  // The methodology note names the merged multipliers and real 40pp gate.
+  assert.match(container.text, /Pro ×1, Pro 5x ×4, Plus ×20/u);
+  assert.match(container.text, /40-point observed-span floor/u);
   // Chart present with band, line, and fit dots; sparse two-point series
   // carries the still-filling note.
   const svg = container.descendants().find(({ tag }) => tag === "svg");
@@ -1431,6 +1530,22 @@ test("the allowance section degrades honestly through every state", () => {
     assert.equal(stateNode.textContent, "Allowance estimates unavailable");
     assert.equal(stateNode.className, "evidence-chip neutral");
     assert.match(container.text, marker, expectedState);
+  }
+
+  // A basis cutover never renders a partly rebuilt merged history.
+  {
+    const documentRef = fakeDocument();
+    const container = documentRef.createElement("div");
+    const stateNode = documentRef.createElement("span");
+    const state = renderCommunityAllowanceSection({
+      documentRef,
+      container,
+      stateNode,
+      payload: publishedDailySeries({ allowanceState: "updating" }),
+    });
+    assert.equal(state, "allowance_updating");
+    assert.equal(stateNode.textContent, "Merged history updating");
+    assert.match(container.text, /Daily activity remains available/u);
   }
 
   // Published days exist but no estimate has accrued anywhere.

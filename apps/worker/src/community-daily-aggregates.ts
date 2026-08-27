@@ -1,27 +1,34 @@
 import { canonicalJson } from "./canonical-json";
 import {
+  COMMUNITY_ALLOWANCE_BASIS,
+  COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS,
   collectCommunityAllowanceFits,
   summarizeCommunityAllowanceDay,
-  summarizeCommunityCapacityByPlanType,
 } from "./community-allowance";
 import type { CommunityAllowanceFit } from "./community-allowance";
 import { sha256Hex } from "./crypto";
-import { V1_ANALYSIS_WINDOW_DAYS } from "./quota-analysis-v1";
 
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
 
+function driftReconcileToDay(nowMs: number): string {
+  return new Date(nowMs).toISOString().slice(0, 10);
+}
+
 /**
- * The lowest UTC day the drift reconciler still reconciles, given the analyzer's
- * trailing read horizon. Days that age past it RETIRE (keep their last published
- * value) rather than churn to a null block every pass: the v1 analyzer reads
- * only the trailing horizon, so recomputing a long-aged day would find no
- * in-window fits and republish it empty, erasing the historical series. Bounding
- * the enumeration to the SAME horizon keeps the reconciler and the analyzer in
- * lockstep. (No regression today — the band is still all-null — but this must
- * land with the windowed read before the series grows long.)
+ * The lowest UTC day whose complete trailing evidence window still fits inside
+ * the analyzer corpus. The analyzer exposes 100 days, while each point needs
+ * the preceding 30 days, so a methodology change may honestly rebuild the most
+ * recent 70 calendar days only. Older points retire with their last published
+ * value and the public read gate omits blocks on the superseded basis.
  */
 function driftReconcileFromDay(nowMs: number): string {
-  return new Date(nowMs - V1_ANALYSIS_WINDOW_DAYS * MILLISECONDS_PER_DAY)
+  const todayStartMs = Date.parse(
+    `${driftReconcileToDay(nowMs)}T00:00:00.000Z`,
+  );
+  return new Date(
+    todayStartMs
+      - (COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS - 1) * MILLISECONDS_PER_DAY,
+  )
     .toISOString()
     .slice(0, 10);
 }
@@ -132,18 +139,24 @@ async function enqueueCommunityAllowanceDriftRebuilds(
   // Reconcile only days inside the analyzer's trailing read horizon; aged days
   // keep their last published value instead of churning to a null block.
   const reconcileFromDay = driftReconcileFromDay(nowMs);
+  const reconcileToDay = driftReconcileToDay(nowMs);
   const published = await db.prepare(
     `SELECT a.day, a.payload_json
        FROM community_daily_aggregates a
        JOIN (
          SELECT day, MAX(revision) AS revision
            FROM community_daily_aggregates
-          WHERE release_state = 'published' AND day >= ?1
+          WHERE release_state = 'published'
+            AND day >= ?1 AND day <= ?2
           GROUP BY day
        ) latest ON latest.day = a.day AND latest.revision = a.revision
-      WHERE a.release_state = 'published' AND a.day >= ?1
+      WHERE a.release_state = 'published'
+        AND a.day >= ?1 AND a.day <= ?2
       ORDER BY a.day ASC`,
-  ).bind(reconcileFromDay).all<{ day: string; payload_json: string }>();
+  ).bind(reconcileFromDay, reconcileToDay).all<{
+    day: string;
+    payload_json: string;
+  }>();
   const drifted: string[] = [];
   for (const row of published.results) {
     const expected = canonicalJson(
@@ -160,6 +173,39 @@ async function enqueueCommunityAllowanceDriftRebuilds(
     }
     if (current !== expected) drifted.push(row.day);
   }
+  const publicationState = published.results.length > 0
+      && drifted.length === 0
+    ? "ready"
+    : "updating";
+  // This singleton is the only global cutover evidence public requests read.
+  // The WHERE clause avoids rewriting it every hour: it changes only with the
+  // state, basis, or UTC safe window (normally once per day when settled).
+  await db.prepare(
+    `INSERT INTO community_allowance_publication_state (
+       singleton, publication_state, expected_basis,
+       safe_from_day, safe_to_day, changed_at
+     ) VALUES (1, ?1, ?2, ?3, ?4, ?5)
+     ON CONFLICT(singleton) DO UPDATE SET
+       publication_state = excluded.publication_state,
+       expected_basis = excluded.expected_basis,
+       safe_from_day = excluded.safe_from_day,
+       safe_to_day = excluded.safe_to_day,
+       changed_at = excluded.changed_at
+     WHERE community_allowance_publication_state.publication_state
+             <> excluded.publication_state
+        OR community_allowance_publication_state.expected_basis
+             <> excluded.expected_basis
+        OR community_allowance_publication_state.safe_from_day
+             <> excluded.safe_from_day
+        OR community_allowance_publication_state.safe_to_day
+             <> excluded.safe_to_day`,
+  ).bind(
+    publicationState,
+    COMMUNITY_ALLOWANCE_BASIS,
+    reconcileFromDay,
+    reconcileToDay,
+    new Date(nowMs).toISOString(),
+  ).run();
   for (const day of drifted) {
     await db.prepare(
       `INSERT INTO community_daily_aggregate_rebuilds (
@@ -314,11 +360,6 @@ async function buildCommunityDailyAggregate(
   // revisions without it stay renderable and old clients ignore it entirely.
   const fits = await allowanceFitsForEpoch(buildEpoch);
   const allowance = summarizeCommunityAllowanceDay(fits, day);
-  // Additive per-plan_type capacity monitor: median observed capacity per plan
-  // over the same window, so the pro:prolite:plus ratios can be watched against
-  // the stated multipliers (pro = 20x, prolite = 5x). Rides the same fits and
-  // the same drift rebuild; read-side observability only, never gates the band.
-  const capacityByPlanType = summarizeCommunityCapacityByPlanType(fits, day);
   const aggregateId = `community-daily:${day}:r${revision}`;
   const releasedAt = new Date(scheduledTime).toISOString();
   const cellRows = cells.results.slice(0, MAX_DAILY_AGGREGATE_CELLS);
@@ -338,7 +379,6 @@ async function buildCommunityDailyAggregate(
     // explicitly owner-approved for publication; no per-account identifier
     // exists anywhere in this block.
     allowance,
-    capacityByPlanType,
     totals: {
       contributingParticipants: Number(totals?.contributing_participants ?? 0),
       contributingDevices: Number(totals?.contributing_devices ?? 0),
@@ -492,6 +532,95 @@ export interface PublishedCommunityDailyAggregateRow {
   revision: number;
   payload_json: string;
   released_at: string;
+}
+
+export interface CommunityAllowancePublicationStateRow {
+  publication_state: "updating" | "ready";
+  expected_basis: string;
+  safe_from_day: string;
+  safe_to_day: string;
+}
+
+export interface PublishedCommunityDailyRead {
+  rows: PublishedCommunityDailyAggregateRow[];
+  allowancePublicationState: CommunityAllowancePublicationStateRow | null;
+}
+
+/**
+ * Constant-cost public read for requested daily rows plus the scheduled
+ * allowance cutover singleton. A sentinel LEFT JOIN preserves requested daily
+ * availability even if the singleton is unexpectedly absent; callers then
+ * fail the allowance surface closed as updating.
+ */
+export async function readPublishedCommunityDailyAggregatesWithAllowanceState(
+  db: D1Database,
+  fromDay: string,
+  toDay: string,
+): Promise<PublishedCommunityDailyRead> {
+  const result = await db.prepare(
+    `WITH latest AS (
+       SELECT day, MAX(revision) AS revision
+         FROM community_daily_aggregates
+        WHERE day >= ?1 AND day <= ?2 AND release_state = 'published'
+        GROUP BY day
+     ),
+     requested AS (
+       SELECT a.day, a.revision, a.payload_json, a.released_at
+         FROM community_daily_aggregates a
+         JOIN latest
+           ON latest.day = a.day AND latest.revision = a.revision
+        WHERE a.release_state = 'published'
+     )
+     SELECT requested.day,
+            requested.revision,
+            requested.payload_json,
+            requested.released_at,
+            state.publication_state,
+            state.expected_basis,
+            state.safe_from_day,
+            state.safe_to_day
+       FROM (SELECT 1 AS singleton) gate
+       LEFT JOIN community_allowance_publication_state state
+         ON state.singleton = gate.singleton
+       LEFT JOIN requested ON 1 = 1
+      ORDER BY requested.day ASC`,
+  ).bind(fromDay, toDay).all<{
+    day: string | null;
+    revision: number | null;
+    payload_json: string | null;
+    released_at: string | null;
+    publication_state: "updating" | "ready" | null;
+    expected_basis: string | null;
+    safe_from_day: string | null;
+    safe_to_day: string | null;
+  }>();
+  const first = result.results[0];
+  const allowancePublicationState = first?.publication_state !== null
+      && first?.publication_state !== undefined
+      && typeof first.expected_basis === "string"
+      && typeof first.safe_from_day === "string"
+      && typeof first.safe_to_day === "string"
+    ? {
+        publication_state: first.publication_state,
+        expected_basis: first.expected_basis,
+        safe_from_day: first.safe_from_day,
+        safe_to_day: first.safe_to_day,
+      }
+    : null;
+  const rows = result.results.flatMap((row) => (
+    typeof row.day === "string"
+      && typeof row.revision === "number"
+      && typeof row.payload_json === "string"
+      && typeof row.released_at === "string"
+      ? [{
+          day: row.day,
+          revision: row.revision,
+          payload_json: row.payload_json,
+          released_at: row.released_at,
+        }]
+      : []
+  ));
+  return { rows, allowancePublicationState };
 }
 
 /**

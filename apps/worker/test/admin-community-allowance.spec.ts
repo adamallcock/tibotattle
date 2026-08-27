@@ -12,6 +12,7 @@ import {
 import {
   readCachedCommunityAllowanceCorpus,
   readCachedCommunityAllowanceFits,
+  summarizeCommunityAllowanceDay,
 } from "../src/community-allowance";
 import type { CommunityAllowanceFit } from "../src/community-allowance";
 
@@ -161,7 +162,7 @@ function fit(overrides: Partial<CommunityAllowanceFit> = {}): CommunityAllowance
 
 describe("admin community allowance preview", () => {
   it("normalizes eligible fits before merging and deduplicates participants", () => {
-    const preview = buildAdminCommunityAllowancePreview([
+    const fits = [
       fit(),
       fit({
         participantId: "participant-2",
@@ -185,7 +186,11 @@ describe("admin community allowance preview", () => {
         planType: "unknown",
         capacityNanousd: 150_000_000_000,
       }),
-    ], Date.parse("2026-08-23T10:30:00.000Z"));
+    ];
+    const preview = buildAdminCommunityAllowancePreview(
+      fits,
+      Date.parse("2026-08-23T10:30:00.000Z"),
+    );
 
     expect(preview.schemaVersion)
       .toBe(ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_SCHEMA_VERSION);
@@ -223,6 +228,13 @@ describe("admin community allowance preview", () => {
       band80Usd: null,
     });
     expect(Object.keys(latest.byPlanType)).toEqual(["pro", "prolite", "plus"]);
+    const publicSummary = summarizeCommunityAllowanceDay(fits, "2026-08-23");
+    expect(latest.combined).toEqual({
+      fitCount: publicSummary.fitCount,
+      participantCount: publicSummary.participantCount,
+      centralUsd: publicSummary.centralUsd,
+      band80Usd: publicSummary.band80Usd,
+    });
   });
 
   it("keeps the trailing window half-open and publishes honest empty days", () => {

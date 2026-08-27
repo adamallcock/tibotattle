@@ -1069,7 +1069,7 @@ test("checked-in public source satisfies the complete release contract", async (
   assert.match(html, /src="\.\/community\.js"/u);
   assert.match(
     html,
-    /id="community-method-summary">See community activity details<\/summary>/u,
+    /id="community-method-summary"[^>]*>See community activity<\/summary>/u,
   );
   assert.match(html, /id="installer-sha256-copy"/u);
   assert.doesNotMatch(html, /The community signal|installer-verification/u);

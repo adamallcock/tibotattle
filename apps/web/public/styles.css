@@ -3232,7 +3232,7 @@ footer p { margin: 0; }
   overflow-x: auto;
   color: rgba(255, 253, 247, .88);
   font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-  font-size: .64rem;
+  font-size: .6rem;
   line-height: 1.35;
   scrollbar-width: none;
   white-space: nowrap;
@@ -3511,6 +3511,43 @@ footer p { margin: 0; }
   letter-spacing: .05em;
   text-transform: uppercase;
 }
+.community-site .community-window-actions {
+  display: inline-flex;
+  gap: 7px;
+  align-items: center;
+}
+.community-site .community-window-expand {
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid rgba(23, 79, 69, .16);
+  border-radius: var(--radius-sm);
+  color: var(--site-green);
+  background: rgba(255, 253, 247, .5);
+  cursor: pointer;
+}
+.community-site .community-window-expand[hidden] {
+  display: none;
+}
+.community-site .community-window-expand:hover {
+  border-color: rgba(23, 79, 69, .3);
+  background: var(--site-paper);
+}
+.community-site .community-window-expand:focus-visible {
+  outline: 2px solid var(--site-green);
+  outline-offset: 2px;
+}
+.community-site .community-window-expand svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.7;
+}
 .community-site .community-window-content {
   padding: 22px;
 }
@@ -3671,6 +3708,16 @@ footer p { margin: 0; }
 .community-site .snapshot-quality-grid {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
+.community-site .community-proof .snapshot-quality-grid dd {
+  font-size: .9rem;
+}
+.community-site .community-proof .snapshot-quality-grid small {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: .61rem;
+  line-height: 1.35;
+}
 .community-site .table-wrap {
   margin-top: 16px;
 }
@@ -3747,6 +3794,120 @@ footer p { margin: 0; }
 }
 .community-site .allowance-controls .evidence-chip {
   margin: 0;
+}
+
+/*
+ * The hero chart expands into a modal lightbox rather than taking over the
+ * browser's fullscreen mode. Native <dialog> supplies background inertness,
+ * focus containment and Escape dismissal; these rules provide the spacious
+ * chart surface and keep the page behind it still.
+ */
+html.community-chart-modal-open,
+html.community-chart-modal-open body {
+  overflow: hidden;
+}
+.community-site .community-chart-dialog {
+  width: min(1180px, calc(100vw - 32px));
+  max-width: none;
+  max-height: calc(100dvh - 32px);
+  padding: 0;
+  overflow: auto;
+  border: 1px solid rgba(23, 79, 69, .24);
+  border-radius: var(--radius-lg);
+  color: var(--ink);
+  background: var(--site-paper);
+  box-shadow: 0 30px 90px rgba(4, 24, 21, .38);
+}
+.community-site .community-chart-dialog::backdrop {
+  background: rgba(4, 24, 21, .68);
+  backdrop-filter: blur(5px);
+}
+.community-site .community-chart-dialog-surface {
+  min-width: 0;
+}
+.community-site .community-chart-dialog-header {
+  position: sticky;
+  z-index: 6;
+  top: 0;
+  display: flex;
+  justify-content: space-between;
+  gap: 28px;
+  align-items: flex-start;
+  padding: 24px clamp(20px, 3vw, 34px) 20px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(255, 253, 247, .96);
+  backdrop-filter: blur(12px);
+}
+.community-site .community-chart-dialog-eyebrow {
+  display: block;
+  margin-bottom: 7px;
+  color: var(--site-green);
+  font-size: .59rem;
+  font-weight: var(--weight-bold);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+.community-site .community-chart-dialog-header h2 {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: clamp(2rem, 4vw, 3.25rem);
+  font-weight: var(--weight-display);
+  letter-spacing: -.04em;
+  line-height: .98;
+}
+.community-site .community-chart-dialog-header p {
+  max-width: 68ch;
+  margin: 9px 0 0;
+  color: var(--muted);
+  font-size: .76rem;
+  line-height: 1.5;
+}
+.community-site .community-chart-dialog-close {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 7px;
+  align-items: center;
+  min-height: 40px;
+  padding: .55rem .72rem;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  color: var(--site-green-deep);
+  background: var(--surface-raised);
+  font-size: .66rem;
+  font-weight: var(--weight-bold);
+  cursor: pointer;
+}
+.community-site .community-chart-dialog-close:hover {
+  background: var(--surface-quiet);
+}
+.community-site .community-chart-dialog-close svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-width: 1.7;
+}
+.community-site .community-chart-dialog-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  align-items: center;
+  padding: 18px clamp(20px, 3vw, 34px) 0;
+  color: var(--muted);
+  font-size: .66rem;
+  font-weight: var(--weight-semibold);
+}
+.community-site .community-chart-dialog-result {
+  margin: 0;
+  padding: 0 clamp(20px, 3vw, 34px) 30px;
+}
+.community-site .community-chart-dialog-result .allowance-headline-value strong {
+  font-size: clamp(2.75rem, 5vw, 4.5rem);
+}
+.community-site .community-chart-dialog-result .community-daily-chart {
+  margin-top: 22px;
+  padding: 18px 18px 10px;
 }
 .community-site .allowance-headline {
   margin-top: 15px;
@@ -4266,6 +4427,33 @@ footer p { margin: 0; }
   .community-site .community-window-content {
     padding: 20px;
   }
+  .community-site .community-chart-dialog {
+    width: calc(100vw - 16px);
+    max-height: calc(100dvh - 16px);
+    border-radius: var(--radius-md);
+  }
+  .community-site .community-chart-dialog-header {
+    gap: 16px;
+    padding: 18px 16px 16px;
+  }
+  .community-site .community-chart-dialog-header h2 {
+    font-size: clamp(1.8rem, 9vw, 2.6rem);
+  }
+  .community-site .community-chart-dialog-toolbar {
+    justify-content: space-between;
+    padding: 14px 16px 0;
+  }
+  .community-site .community-chart-dialog-result {
+    padding: 0 16px 20px;
+  }
+  .community-site .community-chart-dialog-result .allowance-headline-value {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .community-site .community-chart-dialog-result .community-daily-chart {
+    padding: 12px 10px 7px;
+  }
   .community-site .community-window .activity-heading {
     gap: 12px;
   }
@@ -4399,6 +4587,27 @@ footer p { margin: 0; }
   }
   .community-site .community-window-context {
     font-size: .5rem;
+  }
+  .community-site .community-window-actions {
+    gap: 5px;
+  }
+  .community-site .community-window-expand {
+    width: 34px;
+    height: 34px;
+  }
+  .community-site .community-chart-dialog-close {
+    width: 40px;
+    padding: 0;
+    justify-content: center;
+  }
+  .community-site .community-chart-dialog-close span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
   }
   .community-site .snapshot-quality-grid {
     grid-template-columns: 1fr;

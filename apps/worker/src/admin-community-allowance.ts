@@ -1,15 +1,16 @@
 import {
+  COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG,
   COMMUNITY_ALLOWANCE_QUALIFICATION,
+  COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS,
   COMMUNITY_ALLOWANCE_SPAN_FLOOR_PP,
   COMMUNITY_ALLOWANCE_TRAILING_DAYS,
   readCachedCommunityAllowanceCorpus,
+  summarizeCommunityAllowanceFits,
 } from "./community-allowance";
 import type { CommunityAllowanceFit } from "./community-allowance";
 import { ApiError } from "./errors";
-import { V1_ANALYSIS_WINDOW_DAYS } from "./quota-analysis-v1";
 
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
-const NANOUSD_PER_USD = 1_000_000_000;
 const MINIMUM_FITS_FOR_BAND = 3;
 // The preview is roughly 70 small aggregate rows. Keep its ceiling well below
 // D1's value limit and enforce it before both cache writes and reads.
@@ -32,13 +33,10 @@ export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_BASIS =
  * evidence window.
  */
 export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS =
-  V1_ANALYSIS_WINDOW_DAYS - COMMUNITY_ALLOWANCE_TRAILING_DAYS;
+  COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS;
 
-export const ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG = Object.freeze([
-  Object.freeze({ planType: "pro", label: "Pro 20x", multiplier: 1 }),
-  Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 4 }),
-  Object.freeze({ planType: "plus", label: "Plus", multiplier: 20 }),
-] as const);
+export const ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG =
+  COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG;
 
 type AdminCommunityAllowancePlanType =
   (typeof ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG)[number]["planType"];
@@ -293,42 +291,11 @@ function validCachedAdminCommunityAllowancePreview(
     && latestCombined.participantCount === eligible;
 }
 
-function quantile(values: readonly number[], probability: number): number | null {
-  const ordered = values.filter(Number.isFinite).sort((left, right) => left - right);
-  if (ordered.length === 0) return null;
-  const position = (ordered.length - 1) * probability;
-  const lower = Math.floor(position);
-  const upper = Math.ceil(position);
-  if (lower === upper) return ordered[lower]!;
-  const weight = position - lower;
-  return ordered[lower]! * (1 - weight) + ordered[upper]! * weight;
-}
-
-function usd(nanousd: number): number {
-  return Math.round((nanousd / NANOUSD_PER_USD + Number.EPSILON) * 10_000)
-    / 10_000;
-}
-
 function summarizeFits(
   fits: readonly CommunityAllowanceFit[],
   multiplier: number | ((fit: CommunityAllowanceFit) => number),
 ): AdminCommunityAllowanceSummary {
-  const capacities = fits.map((fit) => {
-    const factor = typeof multiplier === "function" ? multiplier(fit) : multiplier;
-    return fit.capacityNanousd * factor;
-  });
-  const central = quantile(capacities, 0.5);
-  const lower = quantile(capacities, 0.1);
-  const upper = quantile(capacities, 0.9);
-  return Object.freeze({
-    fitCount: fits.length,
-    participantCount: new Set(fits.map((fit) => fit.participantId)).size,
-    centralUsd: central === null ? null : usd(central),
-    band80Usd: fits.length >= MINIMUM_FITS_FOR_BAND
-        && lower !== null && upper !== null
-      ? Object.freeze({ lowerUsd: usd(lower), upperUsd: usd(upper) })
-      : null,
-  });
+  return summarizeCommunityAllowanceFits(fits, multiplier);
 }
 
 function previewDay(
