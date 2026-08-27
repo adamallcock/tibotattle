@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { handleRequest } from "../src/index";
 import {
   readPublishedCommunityDailyAggregates,
+  rebuildPendingCommunityDailyAggregates,
 } from "../src/community-daily-aggregates";
 
 interface TestBindings extends Env {
@@ -70,6 +71,7 @@ interface SeededRevision {
   state?: "published" | "withdrawn";
   usageEvents?: number;
   releasedAt?: string;
+  payload?: Record<string, unknown>;
 }
 
 function dailyPayload(seed: SeededRevision): Record<string, unknown> {
@@ -98,6 +100,7 @@ function dailyPayload(seed: SeededRevision): Record<string, unknown> {
     },
     cellsTruncated: false,
     cells: [],
+    ...seed.payload,
   };
 }
 
@@ -197,8 +200,149 @@ describe("GET /api/v1/community/daily", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
       schemaVersion: "community-daily-read-v1.0",
+      allowanceState: "updating",
       days: [],
     });
+  });
+
+  it("gates merged publication on the whole current safe history and strips plan diagnostics", async () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const priorDay = new Date(
+      Date.parse(`${today}T00:00:00.000Z`) - 24 * 60 * 60 * 1_000,
+    ).toISOString().slice(0, 10);
+    const missingDay = new Date(
+      Date.parse(`${today}T00:00:00.000Z`) - 2 * 24 * 60 * 60 * 1_000,
+    ).toISOString().slice(0, 10);
+    await seedDailyRevision({ day: missingDay, revision: 1 });
+    await seedDailyRevision({
+      day: priorDay,
+      revision: 1,
+      payload: {
+        allowance: {
+          basis: "seven_day_codex_pro20x_trailing_30d",
+          planType: "pro",
+          fitCount: 3,
+          participantCount: 1,
+          centralUsd: 2_000,
+        },
+        capacityByPlanType: {
+          pro: { fitCount: 3, participantCount: 1, medianCapacityNanousd: 1 },
+        },
+      },
+    });
+    const updating = await api(
+      `/api/v1/community/daily?from=${priorDay}&to=${priorDay}`,
+    );
+    const updatingBody = await updating.json<{
+      allowanceState: string;
+      days: Array<{ payload: Record<string, unknown> }>;
+    }>();
+    expect(updatingBody.allowanceState).toBe("updating");
+    expect(updatingBody.days[0]?.payload).not.toHaveProperty("allowance");
+    expect(updatingBody.days[0]?.payload)
+      .not.toHaveProperty("capacityByPlanType");
+
+    const mergedAllowance = {
+      basis:
+        "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+      limitId: "codex",
+      referencePlanType: "pro",
+      normalization: "pro_x1_prolite_x4_plus_x20",
+      windowDurationMinutes: 10_080,
+      trailingDays: 30,
+      qualification: "shared_reset_fit_gates_40pp_span_floor",
+      spanFloorPp: 40,
+      fitCount: 8,
+      participantCount: 4,
+      centralUsd: 2_232,
+      band80Usd: { lowerUsd: 1_900, upperUsd: 2_700 },
+    };
+    await seedDailyRevision({
+      day: today,
+      revision: 1,
+      payload: { allowance: mergedAllowance },
+    });
+
+    const scheduledTime = Date.parse(`${today}T12:00:00.000Z`);
+    const reconciled = await rebuildPendingCommunityDailyAggregates(
+      db(),
+      scheduledTime,
+    );
+    expect(reconciled).toMatchObject({ processed: 3, remaining: false });
+    const updatingState = await db().prepare(
+      `SELECT publication_state, expected_basis, safe_to_day
+         FROM community_allowance_publication_state
+        WHERE singleton = 1`,
+    ).first<{
+      publication_state: string;
+      expected_basis: string;
+      safe_to_day: string;
+    }>();
+    expect(updatingState).toMatchObject({
+      publication_state: "updating",
+      expected_basis:
+        "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+      safe_to_day: today,
+    });
+
+    // Even though the requested day is already on the merged basis, the
+    // scheduled singleton remains updating because the same global scan found
+    // old and missing blocks elsewhere in the current safe window. The public
+    // request reads that singleton and its one requested day only.
+    const mixed = await api(
+      `/api/v1/community/daily?from=${today}&to=${today}`,
+    );
+    const mixedBody = await mixed.json<{
+      allowanceState: string;
+      days: Array<{ payload: Record<string, unknown> }>;
+    }>();
+    expect(mixedBody.allowanceState).toBe("updating");
+    expect(mixedBody.days).toHaveLength(1);
+    expect(mixedBody.days[0]?.payload).not.toHaveProperty("allowance");
+
+    // The next scheduled pass observes the revisions rebuilt by the first
+    // pass, finds no global drift, and moves the singleton to ready.
+    const settled = await rebuildPendingCommunityDailyAggregates(
+      db(),
+      scheduledTime + 60 * 60 * 1_000,
+    );
+    expect(settled).toMatchObject({ processed: 0, remaining: false });
+    const readyState = await db().prepare(
+      `SELECT publication_state FROM community_allowance_publication_state
+        WHERE singleton = 1`,
+    ).first<{ publication_state: string }>();
+    expect(readyState?.publication_state).toBe("ready");
+
+    const ready = await api(
+      `/api/v1/community/daily?from=${today}&to=${today}`,
+    );
+    const readyBody = await ready.json<{
+      allowanceState: string;
+      days: Array<{ payload: Record<string, unknown> }>;
+    }>();
+    expect(readyBody.allowanceState).toBe("ready");
+    expect(readyBody.days[0]?.payload.allowance).toMatchObject({
+      basis:
+        "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d",
+      fitCount: 0,
+      participantCount: 0,
+      centralUsd: null,
+    });
+    expect(readyBody.days[0]?.payload).not.toHaveProperty("capacityByPlanType");
+
+    const stateBefore = await db().prepare(
+      `SELECT changed_at FROM community_allowance_publication_state
+        WHERE singleton = 1`,
+    ).first<{ changed_at: string }>();
+    await rebuildPendingCommunityDailyAggregates(
+      db(),
+      scheduledTime + 2 * 60 * 60 * 1_000,
+    );
+    const stateAfter = await db().prepare(
+      `SELECT changed_at FROM community_allowance_publication_state
+        WHERE singleton = 1`,
+    ).first<{ changed_at: string }>();
+    expect(stateAfter?.changed_at).toBe(stateBefore?.changed_at);
   });
 
   it("bounds the range to valid calendar days spanning at most 366 days", async () => {

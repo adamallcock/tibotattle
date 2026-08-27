@@ -190,6 +190,37 @@ test("history gaps distinguish loading, unavailable evidence, and a new series",
   ], "contributingAccountsTotalBounded"), false);
 });
 
+test("accepted-account card prefers exact cached gauges over bounded upload rows", async () => {
+  const { contributingAccountsCardEvidence } = await importAdminModule();
+  const boundedOverview = {
+    total: 10,
+    bounded: true,
+    acceptedLast30Days: 8,
+  };
+  assert.deepEqual(
+    contributingAccountsCardEvidence(boundedOverview, [{
+      metrics: {
+        contributingAccountsTotal: 10,
+        contributingAccountsTotalBounded: 0,
+      },
+    }]),
+    {
+      total: 10,
+      totalBounded: false,
+      exact: true,
+    },
+  );
+  assert.deepEqual(
+    contributingAccountsCardEvidence(boundedOverview, []),
+    {
+      total: 10,
+      totalBounded: true,
+      exact: false,
+    },
+    "loading or unavailable cache retains the truthful bounded fallback",
+  );
+});
+
 test("sparkline inspection exposes dated values for pointer and keyboard input", async () => {
   const previousDocument = globalThis.document;
   const documentRef = initDocument();

@@ -9,8 +9,6 @@ import {
   compact,
   createDomHelpers,
   dateTimeFormatter,
-  formatAge,
-  formatLocal,
   formatUtcCalendarDay,
   numberFormatter,
 } from "./ui-format.js";
@@ -41,7 +39,6 @@ const COMMUNITY_DAILY_COLUMN_KEYS = Object.freeze([
   "community.daily.quotaObservations",
   "community.daily.contributingDevices",
   "community.metric.combinedOutput",
-  "community.released",
 ]);
 // Header indexes that carry numbers; they right-align with tabular digits so
 // magnitudes line up down a column.
@@ -534,18 +531,18 @@ function appendCommunityDailyChart({ documentRef, container, series, t }) {
 }
 
 /**
- * Renders the day-partitioned community series: the latest published
- * revision per day inside the requested year window. Revision freshness is
- * first-class — every row carries its revision and release time, and the
- * headline names the latest published day's revision and age — because a day
- * here is never sealed: late contributions replace it with a new revision.
+ * Renders the day-partitioned community series. Publication revisions remain
+ * part of the read contract, but the reader-facing summary describes the
+ * activity itself: its latest day, current contributors, turns and output.
+ * Late contributions still replace a day's published aggregate behind the
+ * scenes, which the concise disclosure below explains without exposing
+ * operational revision metadata as a headline metric.
  */
 export function renderCommunityDailySeries({
   documentRef,
   container,
   stateNode = null,
   payload,
-  now = Date.now(),
 }) {
   const { clear, node } = createDomHelpers(documentRef);
   const locale = documentRef?.documentElement?.lang ?? "en-US";
@@ -566,19 +563,47 @@ export function renderCommunityDailySeries({
   }
 
   const latest = series.days[series.days.length - 1];
+  const sumSafeTotal = (field) => {
+    let total = 0;
+    for (const day of series.days) {
+      const next = total + day.totals[field];
+      if (!Number.isSafeInteger(next)) return null;
+      total = next;
+    }
+    return total;
+  };
+  const usageEvents = sumSafeTotal("usageEvents");
+  const outputTokens = sumSafeTotal("outputCombinedTokens");
+  const historyDays = compact(series.days.length);
   const quality = node("dl", "snapshot-quality-grid");
-  for (const [term, value] of [
-    [t("community.daily.latestDay"), formatUtcCalendarDay(latest.day)],
-    [t("community.daily.revision"), `r${latest.revision}`],
-    [t("community.released"), formatLocal(latest.releasedAt)],
+  for (const [term, value, detail] of [
     [
-      t("community.daily.revisionAge"),
-      formatAge(Math.max(0, (now - Date.parse(latest.releasedAt)) / 1_000)),
+      t("community.daily.activityThrough"),
+      formatUtcCalendarDay(latest.day),
+      t("community.daily.activityThroughDetail"),
     ],
-    [t("community.daily.publishedDays"), compact(series.days.length)],
+    [
+      t("community.daily.contributorsThatDay"),
+      compact(latest.totals.contributingParticipants),
+      t("community.daily.contributorsThatDayDetail"),
+    ],
+    [
+      t("community.daily.turnsCounted"),
+      compact(usageEvents),
+      t("community.daily.turnsCountedDetail", { days: historyDays }),
+    ],
+    [
+      t("community.daily.outputTokensCounted"),
+      compact(outputTokens),
+      t("community.daily.outputTokensCountedDetail", { days: historyDays }),
+    ],
   ]) {
     const item = node("div");
-    item.append(node("dt", "", term), node("dd", "", value));
+    item.append(
+      node("dt", "", term),
+      node("dd", "", value),
+      node("small", "", detail),
+    );
     quality.append(item);
   }
   container.append(quality);
@@ -640,7 +665,6 @@ export function renderCommunityDailySeries({
       formatQuotaObservations(day.totals.quotaObservations),
       formatContributingDevices(day.totals.contributingDevices),
       formatOutputTokens(day.totals.outputCombinedTokens),
-      formatLocal(day.releasedAt),
     ];
     cells.forEach((value, index) => {
       const td = documentRef.createElement("td");
@@ -1021,6 +1045,16 @@ export function renderCommunityAllowanceSection({
       node("p", "", t(COMMUNITY_ALLOWANCE_STATE_KEYS[series.state])),
     );
     return series.state;
+  }
+
+  if (series.allowanceState === "updating") {
+    setChip("community.allowance.updating", false);
+    container.append(node(
+      "p",
+      "",
+      t("community.allowance.updatingCopy"),
+    ));
+    return "allowance_updating";
   }
 
   const model = buildCommunityAllowanceChartModel(series, { rangeDays });

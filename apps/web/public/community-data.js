@@ -275,26 +275,24 @@ export function communityDailyWindow(nowMs = Date.now()) {
   return { from, to };
 }
 
-// The allowance block is additive on community-daily-aggregate-v1.0: older
-// published revisions never carried it, so a missing or invalid block is
-// per-day-absent (`allowance: null`), never `unsupported_schema`. Only the
-// exact published basis is interpreted; a different basis is a different
-// claim this client does not understand and therefore does not render.
-// The basis is pinned to one plan cohort by plan_type — the page's copy names
-// the Codex Pro (20x) plan (plan_type "pro", which IS the 20x tier), so a block
-// on any other plan_type (or a pooled, cohort-less basis) must not render under
-// that copy. planVariant is not a cohort key (the plan itself is the multiplier;
-// pro = 20x, prolite = 5x); the basis keeps its legacy "pro20x" spelling as an
-// opaque, exact-matched tag.
-export const COMMUNITY_ALLOWANCE_BASIS = "seven_day_codex_pro20x_trailing_30d";
-export const COMMUNITY_ALLOWANCE_PLAN_TYPE = "pro";
+// The allowance block is additive on community-daily-aggregate-v1.0. Only the
+// exact merged methodology is interpreted: supported personal-plan fits are
+// normalized into one Pro 20x-equivalent summary before the median and range
+// are calculated. Old Pro-only blocks and any future methodology are per-day
+// absent, never silently relabelled under the merged copy.
+export const COMMUNITY_ALLOWANCE_BASIS =
+  "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d";
+export const COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE = "pro";
+export const COMMUNITY_ALLOWANCE_NORMALIZATION =
+  "pro_x1_prolite_x4_plus_x20";
 
 function normalizedDailyAllowance(candidate) {
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
     return null;
   }
   if (candidate.basis !== COMMUNITY_ALLOWANCE_BASIS
-      || candidate.planType !== COMMUNITY_ALLOWANCE_PLAN_TYPE) {
+      || candidate.referencePlanType !== COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE
+      || candidate.normalization !== COMMUNITY_ALLOWANCE_NORMALIZATION) {
     return null;
   }
   const fitCount = finite(candidate.fitCount, null);
@@ -397,6 +395,7 @@ export function normalizeCommunityDailySeries(payload) {
   if (payload.schemaVersion !== COMMUNITY_DAILY_READ_SCHEMA_VERSION
       || from === null
       || to === null
+      || !["ready", "updating"].includes(payload.allowanceState)
       || !Array.isArray(payload.days)
       || payload.days.length > COMMUNITY_DAILY_WINDOW_DAYS) {
     return { state: "unsupported_schema", days: [] };
@@ -416,6 +415,7 @@ export function normalizeCommunityDailySeries(payload) {
     state: days.length === 0 ? "none_published" : "published",
     from,
     to,
+    allowanceState: payload.allowanceState,
     days,
   };
 }
