@@ -8,7 +8,30 @@ export type SupportedQuotaWindowDurationMinutes = QuotaWindowDurationMinutes;
 export const FIVE_HOUR_WINDOW_MINUTES: 300;
 export const SEVEN_DAY_WINDOW_MINUTES: 10080;
 export const MAX_QUOTA_WINDOW_DURATION_MINUTES: 525600;
+export const MAX_QUOTA_LIMIT_DISPLAY_NAME_LENGTH: 80;
+export const CODEX_PRIMARY_LIMIT_ID: "codex";
+export const CODEX_SPARK_LIMIT_ID: "codex_bengalfox";
+export const CODEX_SPARK_RESERVED_LIMIT_ID: "codex-spark";
+export const CODEX_SPARK_LIMIT_IDS: readonly ["codex_bengalfox", "codex-spark"];
+export const QUOTA_LIMIT_DISPLAY_ALIASES: Readonly<{
+  codex: "Codex";
+  codex_bengalfox: "Spark";
+  "codex-spark": "Spark";
+}>;
+export const QUOTA_WINDOW_KINDS: readonly [
+  "codex_five_hour",
+  "codex_seven_day",
+  "codex_provider_reported",
+  "spark_five_hour",
+  "spark_seven_day",
+  "spark_other",
+  "other",
+];
 export const SUPPORTED_QUOTA_WINDOW_DURATIONS: readonly [300, 10080];
+export function sanitizeQuotaLimitId(value: unknown): string;
+export function sanitizeQuotaLimitDisplayName(value: unknown): string | null;
+export function quotaLimitDisplayAlias(limitId: unknown): string | null;
+export function isSparkQuotaLimitId(value: unknown): boolean;
 export function isValidQuotaWindowDuration(value: number): boolean;
 export function isSupportedQuotaWindowDuration(
   value: number,
@@ -25,7 +48,15 @@ export function selectPrimaryQuotaWindow<T extends QuotaWindowSelectionInput>(
   windows: readonly T[] | null | undefined,
 ): T | null;
 export function formatQuotaWindowDuration(value: number): string | null;
-export function quotaWindowLabel(limitId: string, durationMinutes: number): string;
+export function classifyQuotaWindowKind(
+  limitId: unknown,
+  durationMinutes: number | null | undefined,
+): typeof QUOTA_WINDOW_KINDS[number];
+export function quotaWindowLabel(
+  limitId: unknown,
+  durationMinutes: number | null | undefined,
+  limitName?: unknown,
+): string;
 
 export type QuotaSlot =
   | "primary"

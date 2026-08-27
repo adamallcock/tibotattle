@@ -96,8 +96,11 @@ jobs:
       - name: Check release documentation
         run: node ./scripts/check-release-notes.mjs
 
+      - name: Check the checked-in Codex contract
+        run: npm run codex:contract:check
+
       - name: Test release evidence and attestation contracts
-        run: node --test test/release-workflow-policy.test.js test/release-evidence.test.js test/release-attestation-action.test.js test/release-sbom-action.test.js
+        run: node --test test/codex-contract-drift.test.js test/release-workflow-policy.test.js test/release-evidence.test.js test/release-attestation-action.test.js test/release-sbom-action.test.js
 
       - name: Test public verification documentation
         run: node --test apps/web/test/community-site.test.mjs

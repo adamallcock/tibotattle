@@ -56,6 +56,7 @@ Run the release preflight before tagging:
 ~~~bash
 node scripts/check-release-notes.mjs
 npm test
+npm run codex:contract:release:check
 npm run product:worker:check
 npm run architecture:check
 cd apps/worker && npx vitest run

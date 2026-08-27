@@ -61,8 +61,30 @@ async function fixture({ replayTool = false } = {}) {
   // must nevertheless resolve to fast/priority and the second to standard.
   const parent = [
     JSON.stringify({ timestamp: "2026-07-24T12:00:00.000Z", type: "session_meta", payload: { id: "PRIVATE_PARENT" } }),
+    // Current Codex appends same-thread metadata updates (for example, git or
+    // memory-mode changes) instead of rewriting the canonical head record.
+    JSON.stringify({ timestamp: "2026-07-24T12:00:00.001Z", type: "session_meta", payload: { id: "PRIVATE_PARENT", memory_mode: "enabled" } }),
     "",
     JSON.stringify({ timestamp: "2026-07-24T12:00:00.010Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } }),
+    JSON.stringify({
+      timestamp: "2026-07-24T12:00:00.020Z",
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: null,
+        rate_limits: {
+          limit_id: "codex",
+          limit_name: "Codex allowance",
+          primary: null,
+          secondary: null,
+          credits: { has_credits: true, unlimited: false, balance: null },
+          individual_limit: null,
+          spend_control_reached: false,
+          plan_type: "pro",
+          rate_limit_reached_type: null,
+        },
+      },
+    }),
     JSON.stringify({ timestamp: "2026-07-24T12:02:00.000Z", type: "event_msg", payload: { type: "thread_settings_applied", thread_settings: { service_tier: "standard" } } }),
     JSON.stringify({ timestamp: "2026-07-24T12:01:00.000Z", type: "event_msg", payload: { type: "thread_settings_applied", thread_settings: { service_tier: "priority" } } }),
     JSON.stringify({ timestamp: "2026-07-24T12:01:01.000Z", type: "event_msg", payload: { type: "task_started", turn_id: "PRIVATE_PARENT_TASK" } }),
@@ -182,6 +204,7 @@ test("checkpoint scanner has byte-for-byte logical parity with the legacy scanne
     assert.equal(quotaSnapshots.length, 8, "two slots for each non-replayed token snapshot");
     assert.deepEqual(legacy.diagnostics, [
       { code: "fork_replay_events_skipped", count: 1 },
+      { code: "last_only_events", count: 1 },
       { code: "malformed_lines", count: 1 },
     ]);
     assert.deepEqual(usageEvents.map((item) => item.record.speedMode).sort(), [

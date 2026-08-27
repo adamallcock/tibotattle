@@ -34,6 +34,7 @@ maintainer runs, and CI-visible regressions in them block merge:
 
 ```bash
 npm test                       # core suite (serial by design)
+npm run codex:contract:check   # checked-in Codex plan/name contract parity
 npm run product:worker:check   # hosted-service worker checks
 npm run product:macos:test     # retained macOS release gate (arm64 + Node v26.2.0)
 npm run architecture:check     # ownership/boundary enforcement

@@ -34,10 +34,22 @@ const COMPOSITION_EXPORTS = Object.freeze([
   "solveNonNegativeLeastSquares",
 ]);
 const WINDOW_EXPORTS = Object.freeze([
+  "classifyQuotaWindowKind",
+  "CODEX_PRIMARY_LIMIT_ID",
+  "CODEX_SPARK_LIMIT_ID",
+  "CODEX_SPARK_LIMIT_IDS",
+  "CODEX_SPARK_RESERVED_LIMIT_ID",
   "FIVE_HOUR_WINDOW_MINUTES",
   "formatQuotaWindowDuration",
+  "isSparkQuotaLimitId",
   "MAX_QUOTA_WINDOW_DURATION_MINUTES",
+  "MAX_QUOTA_LIMIT_DISPLAY_NAME_LENGTH",
+  "QUOTA_LIMIT_DISPLAY_ALIASES",
+  "QUOTA_WINDOW_KINDS",
+  "quotaLimitDisplayAlias",
   "quotaWindowLabel",
+  "sanitizeQuotaLimitDisplayName",
+  "sanitizeQuotaLimitId",
   "SEVEN_DAY_WINDOW_MINUTES",
   "SUPPORTED_QUOTA_WINDOW_DURATIONS",
   "isValidQuotaWindowDuration",
@@ -55,7 +67,10 @@ const SOURCE_HASHES = Object.freeze({
     // this byte-identity receipt remained on the pre-correction digest.
     "d15a78931e10c8bccf82ea262f722ea84b5fd02d0cb3c9fd37b18dbd169fa3f0",
   "quota-windows.js":
-    "fbf4bdcfb8417efcc2cdf3d7e3e92f1302048e523d6722b06eb9c47b44861366",
+    // Re-pinned for the reviewed local-only quota display-name contract:
+    // bounded provider copy cannot affect identity, calibration, or export,
+    // and an invalid duration cannot inherit a known limit's display kind.
+    "a5bb5c759351892f101e0e69fe71f9391b4b22ed533d75f74ce41f6de71e9597",
   // Re-pinned with the slot-identity change: `slot` left TRACK_KEYS because
   // track compatibility is judged by (limit, duration) — the provider's
   // primary/secondary slots are UI roles that flipped for the weekly window

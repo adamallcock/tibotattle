@@ -35,8 +35,18 @@ function window({
   usedPercent = 12.34,
   windowDurationMins = 10_080,
   resetsAt = 1_784_854_800,
+  limitName = null,
 } = {}) {
-  return { provider: "openai_codex", planType, limitId, slot, usedPercent, windowDurationMins, resetsAt };
+  return {
+    provider: "openai_codex",
+    planType,
+    limitId,
+    slot,
+    usedPercent,
+    windowDurationMins,
+    resetsAt,
+    ...(limitName === null ? {} : { limitName }),
+  };
 }
 
 function accountScope(available = true) {
@@ -135,7 +145,7 @@ function safeFailure(expected) {
 test("freezes a complete-line prefix and emits only provider-neutral quota candidates", async () => {
   const first = quotaRecord({
     windows: [
-      window(),
+      window({ limitName: "Codex allowance" }),
       window({ slot: "secondary", usedPercent: 56, windowDurationMins: 300, resetsAt: 1_784_800_000 }),
     ],
   });
@@ -155,8 +165,52 @@ test("freezes a complete-line prefix and emits only provider-neutral quota candi
     const serialized = JSON.stringify(result);
     for (const forbidden of [
       "PRIVATE-CANARY", "eventKey", "officialDailyTokens", "officialUsageSummary",
-      "lifetimeTokens", "987654321", "123456789", value.path,
+      "lifetimeTokens", "987654321", "123456789", "Codex allowance", "limitName", value.path,
     ]) assert.equal(serialized.includes(forbidden), false, forbidden);
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});
+
+test("collector export drops local names and unreviewed pools without losing reviewed windows", async () => {
+  const value = await fixture([
+    quotaRecord({
+      windows: [
+        window({ limitName: "Codex allowance" }),
+        window({
+          limitId: "future_alpha",
+          limitName: "Future Alpha",
+          usedPercent: 20,
+          windowDurationMins: 1_440,
+        }),
+      ],
+    }),
+    quotaRecord({
+      at: "2026-07-23T12:01:00.000Z",
+      windows: [window({
+        limitId: "future_beta",
+        limitName: "Future Beta",
+        usedPercent: 30,
+        windowDurationMins: 43_200,
+      })],
+    }),
+  ]);
+  try {
+    const result = await scanCodexCollectorExportSource(await planFor(value));
+    assert.equal(result.complete, true);
+    assert.equal(result.candidates.length, 1);
+    assert.equal(result.candidates[0].limitId, "codex");
+    const serialized = JSON.stringify(result);
+    for (const forbidden of [
+      "limitName",
+      "Codex allowance",
+      "Future Alpha",
+      "Future Beta",
+      "future_alpha",
+      "future_beta",
+    ]) {
+      assert.equal(serialized.includes(forbidden), false, forbidden);
+    }
   } finally {
     await rm(value.root, { recursive: true, force: true });
   }

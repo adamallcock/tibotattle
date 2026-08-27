@@ -1,7 +1,8 @@
 import {
   canonicalComponentAvailability,
   canonicalComponents,
-  canonicalRateLimitWindows,
+  canonicalRateLimitSnapshot,
+  codexSessionMetaIdentity,
   cumulativeSnapshotKey,
   deltaComponentPresence,
   extractToolObservations,
@@ -288,6 +289,7 @@ function toolSnapshotKey(secret, line) {
 
 async function scanRecordPhase({ workspace, source, checkpoint, secret, bounds, resourceGuard, failpoint, maximumLinesPerBatch }) {
   const handle = await openVerifiedCodexExportSource(source, { resourceGuard });
+  const expectedSessionId = source.rolloutInfo?.lineage?.sessionId ?? null;
   const sourceScopeId = deriveSessionScopeId(
     secret,
     source.rolloutInfo?.lineage?.sessionId ?? source.rolloutInfo?.rolloutKey ?? source.sourceKey,
@@ -364,7 +366,12 @@ async function scanRecordPhase({ workspace, source, checkpoint, secret, bounds, 
       }
 
       if (record.type === "session_meta") {
-        if (state.sessionMetaSeen) contentInvalid();
+        const sessionMetaId = codexSessionMetaIdentity(record.payload);
+        if (sessionMetaId === null
+            || (!state.sessionMetaSeen && expectedSessionId !== null
+              && sessionMetaId !== expectedSessionId)) {
+          contentInvalid();
+        }
         state.sessionMetaSeen = true;
       } else if (record.type === "turn_context") {
         if (typeof record.payload?.model === "string") {
@@ -450,10 +457,11 @@ async function scanRecordPhase({ workspace, source, checkpoint, secret, bounds, 
           }
           batch.diagnostics.add("unattributed_fork_replay_events_skipped");
         } else {
-          const windows = canonicalRateLimitWindows(record.payload?.rate_limits);
+          const rateLimitSnapshot = canonicalRateLimitSnapshot(record.payload?.rate_limits);
+          const windows = rateLimitSnapshot?.windows ?? [];
           if (record.payload?.rate_limits === null || record.payload?.rate_limits === undefined) {
             batch.diagnostics.add("missing_rate_limit_records");
-          } else if (windows.length === 0) {
+          } else if (rateLimitSnapshot === null) {
             batch.diagnostics.add("malformed_rate_limit_records");
             contentInvalid();
           }

@@ -42,6 +42,7 @@ import {
   createBrowserLocalization,
 } from "./localization.js";
 import {
+  TELEMETRY_PLAN_DISPLAY_NAMES,
   TELEMETRY_PLAN_TYPES,
 } from "./telemetry-shared.generated.js";
 import {
@@ -1149,6 +1150,11 @@ function renderQuotaCards(data) {
     isSparkQuotaLimitId(window?.limitId)
       && isValidQuotaWindowDuration(finite(window?.durationMinutes))
   ));
+  const otherWindows = data.quotaWindows.filter((window) => (
+    !isPrimaryCodexQuotaWindow(window)
+      && !isSparkQuotaLimitId(window?.limitId)
+      && isValidQuotaWindowDuration(finite(window?.durationMinutes))
+  ));
   const primaryWindow = selectPrimaryCodexQuotaWindow(normalWindows);
   const normalOrderedWindows = primaryWindow === null
     ? normalWindows
@@ -1164,7 +1170,19 @@ function renderQuotaCards(data) {
   const sparkOrderedWindows = [...sparkWindows].sort((left, right) => (
     finite(left.durationMinutes) - finite(right.durationMinutes)
   ));
-  const windows = [...sparkOrderedWindows, ...normalOrderedWindows];
+  // Unknown pools stay out of both headline selection and calibration, but a
+  // bounded local observation should not disappear. Technical ids only keep
+  // separate future pools distinct; they are never rendered as copy.
+  const otherOrderedWindows = [...otherWindows].sort((left, right) => (
+    String(left.limitId).localeCompare(String(right.limitId))
+      || finite(left.durationMinutes) - finite(right.durationMinutes)
+      || String(left.slot).localeCompare(String(right.slot))
+  ));
+  const windows = [
+    ...sparkOrderedWindows,
+    ...normalOrderedWindows,
+    ...otherOrderedWindows,
+  ];
   if (!windows.length) {
     const card = node("article", "metric-card insufficient");
     const header = node("div", "metric-card-header");
@@ -1290,6 +1308,18 @@ function localizedQuotaWindowLabel(window) {
       && isValidQuotaWindowDuration(duration)) {
     return t("dashboard.quota.windowProviderReported", {
       duration: localizedQuotaWindowDuration(duration),
+    });
+  }
+  if (isValidQuotaWindowDuration(duration)) {
+    const localizedDuration = localizedQuotaWindowDuration(duration);
+    if (window?.limitName) {
+      return t("dashboard.quota.windowNamedObserved", {
+        name: window.limitName,
+        duration: localizedDuration,
+      });
+    }
+    return t("dashboard.quota.windowOtherDuration", {
+      duration: localizedDuration,
     });
   }
   return t("dashboard.quota.windowOther");
@@ -1911,16 +1941,9 @@ const SHARE_CARD_WINDOW_KEYS = Object.freeze({
 // "unknown" is Codex's sentinel for an unnamed plan and is deliberately
 // absent, so it — like any unmapped or empty reading — draws no chip.
 const SHARE_CARD_PLAN_LABELS = Object.freeze({
-  free: "Free",
-  go: "Go",
-  plus: "Plus",
-  pro: "Pro (20×)",
-  prolite: "Pro Lite (5×)",
-  business: "Business",
-  enterprise: "Enterprise",
-  ent26: "Enterprise",
-  team: "Team",
-  edu: "Edu",
+  ...TELEMETRY_PLAN_DISPLAY_NAMES,
+  pro: `${TELEMETRY_PLAN_DISPLAY_NAMES.pro} (20×)`,
+  prolite: `${TELEMETRY_PLAN_DISPLAY_NAMES.prolite} (5×)`,
   self_serve_business_prolite: "Business · Pro Lite (5×)",
   self_serve_business_usage_based: "Business · usage-based",
   enterprise_cbp_automation: "Enterprise · automation",

@@ -104,8 +104,10 @@ export function createCodexLogScanner(options) {
 export {
   canonicalComponentAvailability,
   canonicalComponents,
+  canonicalRateLimitSnapshot,
   canonicalRateLimitWindows,
   classifyToolCall,
+  codexSessionMetaIdentity,
   createLeadingRateLimitGate,
   createSnapshotLineage,
   cumulativeSnapshotKey,

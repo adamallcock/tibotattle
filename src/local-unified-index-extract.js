@@ -1,4 +1,6 @@
 import {
+  canonicalRateLimitSnapshot,
+  codexSessionMetaIdentity,
   cumulativeSnapshotKey,
   extractToolObservations,
 } from "./providers/codex/logs.js";
@@ -145,7 +147,7 @@ export function rolloutContentQuarantineReason(outcome) {
     return "codex_rollout_content_invalid";
   }
   if (Number(outcome?.diagnostics?.sourceStartedAtOffset ?? -1) === 0
-      && Number(outcome?.diagnostics?.sessionMetaRecords ?? 0) !== 1) {
+      && Number(outcome?.diagnostics?.sessionMetaRecords ?? 0) < 1) {
     return "codex_rollout_content_invalid";
   }
   return null;
@@ -213,32 +215,20 @@ function safeClassification(value) {
     : null;
 }
 
-function quotaWindows(rateLimits, observedAtMs) {
-  if (!rateLimits || typeof rateLimits !== "object") return [];
-  const limitId = safeClassification(rateLimits.limit_id) ?? "unknown";
-  const planType = safeClassification(rateLimits.plan_type);
-  const windows = [];
-  for (const slot of ["primary", "secondary"]) {
-    const window = rateLimits[slot];
-    if (!window || typeof window !== "object") continue;
-    const usedPercent = window.used_percent;
-    const durationMins = window.window_minutes;
-    const resetsAt = window.resets_at;
-    if (!Number.isFinite(usedPercent) || usedPercent < 0 || usedPercent > 100) continue;
-    if (!Number.isSafeInteger(durationMins) || durationMins < 1) continue;
-    windows.push({
+function quotaSnapshot(rateLimits, observedAtMs) {
+  const snapshot = canonicalRateLimitSnapshot(rateLimits);
+  if (snapshot === null) return null;
+  return {
+    windows: snapshot.windows.map((window) => ({
       observedAtMs,
-      limitId,
-      slot,
-      planType,
-      usedPercent,
-      resetsAtMs: Number.isSafeInteger(resetsAt) && resetsAt > 0
-        ? resetsAt * 1_000
-        : null,
-      durationMins,
-    });
-  }
-  return windows;
+      limitId: window.limitId,
+      slot: window.slot,
+      planType: window.planType,
+      usedPercent: window.usedPercent,
+      resetsAtMs: window.resetsAt * 1_000,
+      durationMins: window.windowDurationMins,
+    })),
+  };
 }
 
 // A truncated prefix cannot be handed to JSON.parse. Rather than dropping the
@@ -601,7 +591,7 @@ export async function extractRolloutUsage(path, {
 
       if (record.type === "session_meta") {
         diagnostics.sessionMetaRecords += 1;
-        if (startOffset > 0 || diagnostics.sessionMetaRecords > 1) {
+        if (codexSessionMetaIdentity(record.payload) === null) {
           diagnostics.unexpectedSessionMetaRecords += 1;
           diagnostics.malformedAccountingRecords += 1;
         }
@@ -782,10 +772,11 @@ export async function extractRolloutUsage(path, {
       } else {
         usage = last;
       }
-      const quota = quotaWindows(record.payload?.rate_limits, observedAtMs);
+      const normalizedQuota = quotaSnapshot(record.payload?.rate_limits, observedAtMs);
+      const quota = normalizedQuota?.windows ?? [];
       if (record.payload?.rate_limits !== null
           && record.payload?.rate_limits !== undefined
-          && quota.length === 0) {
+          && normalizedQuota === null) {
         diagnostics.malformedRateLimitRecords += 1;
       }
       if ((!usage || (usage.input_tokens === 0 && usage.output_tokens === 0))

@@ -4,7 +4,10 @@ import {
   classifyQuotaWindowKind,
   isSparkQuotaLimitId,
   normalizeDashboardPayload,
+  quotaLimitDisplayAlias,
   quotaWindowLabel,
+  sanitizeQuotaLimitDisplayName,
+  sanitizeQuotaLimitId,
   CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
   CODEX_PRIMARY_LIMIT_ID,
   CODEX_SPARK_LIMIT_ID,
@@ -14,8 +17,14 @@ import {
   QUOTA_WINDOW_KINDS,
 } from "../public/data-client.js";
 import {
+  quotaLimitDisplayAlias as sharedQuotaLimitDisplayAlias,
+  sanitizeQuotaLimitDisplayName as sharedSanitizeQuotaLimitDisplayName,
+  sanitizeQuotaLimitId as sharedSanitizeQuotaLimitId,
+} from "../../../packages/quota-analysis/index.js";
+import {
   SUPPORTED_LOCALES,
   translate,
+  translatePlural,
 } from "../public/localization.js";
 
 // The provider re-introduced the 5-hour "Codex Spark" allowance window on
@@ -44,12 +53,12 @@ test("window kinds map from technical identity alone, including the returned 5-h
     // distinct kinds on the same separate limit.
     [CODEX_SPARK_LIMIT_ID, CODEX_FIVE_HOUR_ALLOWANCE_MINUTES, "spark_five_hour"],
     [CODEX_SPARK_LIMIT_ID, CODEX_WEEKLY_ALLOWANCE_MINUTES, "spark_seven_day"],
-    // A novel or unparseable Spark duration keeps the generic Spark kind
-    // rather than borrowing a named duration (525,600 minutes was the Spark
-    // limit's original observed shape).
+    // A novel valid Spark duration keeps the generic Spark kind rather than
+    // borrowing a named duration (525,600 minutes was the Spark limit's
+    // original observed shape). Invalid durations remain unclassified.
     [CODEX_SPARK_LIMIT_ID, 525_600, "spark_other"],
-    [CODEX_SPARK_LIMIT_ID, 0, "spark_other"],
-    [CODEX_SPARK_LIMIT_ID, null, "spark_other"],
+    [CODEX_SPARK_LIMIT_ID, 0, "other"],
+    [CODEX_SPARK_LIMIT_ID, null, "other"],
     // The reserved marketing token classifies identically to the wire id.
     [CODEX_SPARK_RESERVED_LIMIT_ID, CODEX_FIVE_HOUR_ALLOWANCE_MINUTES, "spark_five_hour"],
     [CODEX_SPARK_RESERVED_LIMIT_ID, CODEX_WEEKLY_ALLOWANCE_MINUTES, "spark_seven_day"],
@@ -77,14 +86,66 @@ test("fixed window labels name the Spark durations and keep honest generic fallb
   assert.equal(quotaWindowLabel("codex_bengalfox", 300), "Spark five-hour allowance");
   assert.equal(quotaWindowLabel("codex_bengalfox", 10_080), "Spark seven-day allowance");
   assert.equal(quotaWindowLabel("codex-spark", 300), "Spark five-hour allowance");
-  // Unfamiliar Spark durations stay generically Spark; a Spark window is
-  // never presented as the weekly or five-hour normal Codex allowance.
+  // Unfamiliar valid Spark durations stay generically Spark; an invalid
+  // duration remains unnamed, and neither is presented as a normal Codex
+  // allowance.
   assert.equal(quotaWindowLabel("codex_bengalfox", 525_600), "Spark allowance");
-  assert.equal(quotaWindowLabel("codex_bengalfox", null), "Spark allowance");
-  // Unknown limits keep the pre-existing honest fallback.
-  assert.equal(quotaWindowLabel("unknown", 300), "Other observed allowance");
-  assert.equal(quotaWindowLabel(null, 10_080), "Other observed allowance");
+  assert.equal(quotaWindowLabel("codex_bengalfox", null), "Other observed allowance");
+  // Unknown limits gain a duration fallback without borrowing a known pool.
+  assert.equal(quotaWindowLabel("unknown", 300), "Other observed 5-hour allowance");
+  assert.equal(quotaWindowLabel(null, 10_080), "Other observed 7-day allowance");
+  assert.equal(
+    quotaWindowLabel("future_pool", 43_200, "Future Pool"),
+    "Future Pool · 30-day allowance",
+  );
   assert.equal(quotaWindowLabel("codex", null), "Other observed allowance");
+});
+
+test("browser limit sanitizers match the canonical runtime-neutral contract", () => {
+  const ids = [
+    "codex",
+    "codex_bengalfox",
+    "future_pool:v2",
+    "unknown",
+    "",
+    " future_pool",
+    "future/pool",
+    "_future",
+    "x".repeat(65),
+    null,
+  ];
+  for (const value of ids) {
+    assert.equal(
+      sanitizeQuotaLimitId(value),
+      sharedSanitizeQuotaLimitId(value),
+      String(value),
+    );
+  }
+  const names = [
+    "GPT-5.3-Codex-Spark",
+    "  Future Pool  ",
+    "未来额度",
+    "Account alice@example.com",
+    "https://example.com/limit",
+    "Future\nPool",
+    "<Future Pool>",
+    "x".repeat(81),
+    null,
+  ];
+  for (const value of names) {
+    assert.equal(
+      sanitizeQuotaLimitDisplayName(value),
+      sharedSanitizeQuotaLimitDisplayName(value),
+      String(value),
+    );
+  }
+  for (const limitId of ["codex", "codex_bengalfox", "codex-spark", "future_pool"]) {
+    assert.equal(
+      quotaLimitDisplayAlias(limitId),
+      sharedQuotaLimitDisplayAlias(limitId),
+      limitId,
+    );
+  }
 });
 
 test("Spark window titles are translated in every supported locale", () => {
@@ -109,12 +170,75 @@ test("Spark window titles are translated in every supported locale", () => {
       "zh-Hans": "其他观测到的额度",
       es: "Otra asignación observada",
     },
+    "dashboard.quota.windowOtherDuration": {
+      "en-US": "Other observed 30-day allowance",
+      "zh-Hans": "其他观测到的 30 天额度",
+      es: "Otra asignación observada de 30 días",
+    },
+    "dashboard.quota.windowNamedObserved": {
+      "en-US": "Future Pool · 30-day allowance",
+      "zh-Hans": "Future Pool · 30 天额度",
+      es: "Future Pool · asignación de 30 días",
+    },
   };
   for (const [key, byLocale] of Object.entries(expected)) {
     for (const locale of SUPPORTED_LOCALES) {
-      assert.equal(translate(key, {}, locale), byLocale[locale], `${key} ${locale}`);
+      const values = key === "dashboard.quota.windowOtherDuration"
+        ? { duration: translatePlural("quota.durationDay", 30, {}, locale) }
+        : key === "dashboard.quota.windowNamedObserved"
+          ? {
+              name: "Future Pool",
+              duration: translatePlural("quota.durationDay", 30, {}, locale),
+            }
+          : {};
+      assert.equal(translate(key, values, locale), byLocale[locale], `${key} ${locale}`);
     }
   }
+});
+
+test("future pools remain distinct and use only bounded local display metadata", () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    status: "live",
+    quotaWindows: [
+      {
+        limitId: "future_alpha",
+        limitName: "Future Alpha",
+        slot: "primary",
+        durationMinutes: 1_440,
+        usedPercent: 10,
+      },
+      {
+        limitId: "future_beta",
+        limitName: "Account alice@example.com",
+        slot: "primary",
+        durationMinutes: 43_200,
+        usedPercent: 20,
+      },
+      {
+        limitId: "future/pool",
+        limitName: "Future Gamma",
+        slot: "primary",
+        durationMinutes: 300,
+        usedPercent: 30,
+      },
+    ],
+  });
+
+  assert.deepEqual(
+    result.quotaWindows.map((window) => [
+      window.limitId,
+      window.limitName,
+      window.label,
+    ]),
+    [
+      ["future_alpha", "Future Alpha", "Future Alpha · 1-day allowance"],
+      ["future_beta", null, "Other observed 30-day allowance"],
+      ["unknown", "Future Gamma", "Future Gamma · 5-hour allowance"],
+    ],
+  );
+  assert.equal(new Set(result.quotaWindows.map((window) => window.limitId)).size, 3);
+  assert.equal(result.quotaWindows.some((window) => window.limitId === "codex"), false);
 });
 
 test("the observed three-window wire shape normalizes into distinctly named windows", () => {

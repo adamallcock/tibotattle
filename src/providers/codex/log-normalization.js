@@ -1,4 +1,8 @@
 import { normalizeProviderPlanType } from "./plan-normalization.js";
+import {
+  sanitizeProviderQuotaLimitDisplayName,
+  sanitizeProviderQuotaLimitId,
+} from "./quota-metadata.js";
 import { normalizeProviderQuotaWindow } from "./quota-normalization.js";
 
 const COMPONENT_KEYS = [
@@ -116,29 +120,73 @@ export function canonicalComponentAvailability(presence, raw) {
   };
 }
 
-function safeClassification(value) {
-  return typeof value === "string" && /^[a-zA-Z0-9._:-]{1,64}$/.test(value) ? value : "unknown";
+const UUID_VALUE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+
+function normalizeSessionIdentity(value) {
+  if (typeof value !== "string" || value.length === 0) return null;
+  return UUID_VALUE.test(value) ? value.toLowerCase() : value;
 }
 
-export function canonicalRateLimitWindows(rateLimits) {
-  if (!rateLimits || typeof rateLimits !== "object") return [];
-  const limitId = safeClassification(rateLimits.limit_id);
+export function codexSessionMetaIdentity(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  // Codex's `id` is the stable thread identity. `session_id` is a separate
+  // runtime-session identity and is only the compatibility fallback for old
+  // records that predate the stable thread field.
+  return normalizeSessionIdentity(payload.id)
+    ?? normalizeSessionIdentity(payload.session_id);
+}
+
+function validOptionalRateLimitField(rateLimits, key, predicate) {
+  if (!Object.hasOwn(rateLimits, key) || rateLimits[key] === null) return true;
+  return predicate(rateLimits[key]);
+}
+
+/**
+ * Normalize one complete Codex rate-limit snapshot. A snapshot may contain
+ * credits or spend-control state without either rolling window; Codex emits
+ * those windowless updates intentionally. Invalid window objects still fail
+ * closed so accounting corruption cannot be mistaken for a sparse update.
+ */
+export function canonicalRateLimitSnapshot(rateLimits) {
+  if (!rateLimits || typeof rateLimits !== "object" || Array.isArray(rateLimits)) return null;
+  const recognizedFields = [
+    "limit_id", "limit_name", "primary", "secondary", "credits",
+    "individual_limit", "spend_control_reached", "plan_type",
+    "rate_limit_reached_type",
+  ];
+  if (!recognizedFields.some((key) => Object.hasOwn(rateLimits, key))
+      || !validOptionalRateLimitField(rateLimits, "limit_id", (value) => typeof value === "string")
+      || !validOptionalRateLimitField(rateLimits, "limit_name", (value) => typeof value === "string")
+      || !validOptionalRateLimitField(rateLimits, "credits", (value) => typeof value === "object" && !Array.isArray(value))
+      || !validOptionalRateLimitField(rateLimits, "individual_limit", (value) => typeof value === "object" && !Array.isArray(value))
+      || !validOptionalRateLimitField(rateLimits, "spend_control_reached", (value) => typeof value === "boolean")
+      || !validOptionalRateLimitField(rateLimits, "plan_type", (value) => typeof value === "string")
+      || !validOptionalRateLimitField(rateLimits, "rate_limit_reached_type", (value) => typeof value === "string")) {
+    return null;
+  }
+  const limitId = sanitizeProviderQuotaLimitId(rateLimits.limit_id);
+  const limitName = sanitizeProviderQuotaLimitDisplayName(rateLimits.limit_name);
   const planType = normalizeProviderPlanType(rateLimits.plan_type);
   const windows = [];
   for (const slot of ["primary", "secondary"]) {
     const window = rateLimits[slot];
-    if (!window || typeof window !== "object") continue;
+    if (window === null || window === undefined) continue;
     const normalized = normalizeProviderQuotaWindow(window);
-    if (normalized === null) continue;
+    if (normalized === null) return null;
     windows.push({
       provider: "openai_codex",
       planType,
       limitId,
+      ...(limitName === null ? {} : { limitName }),
       slot,
       ...normalized,
     });
   }
-  return windows;
+  return { windows };
+}
+
+export function canonicalRateLimitWindows(rateLimits) {
+  return canonicalRateLimitSnapshot(rateLimits)?.windows ?? [];
 }
 
 /**

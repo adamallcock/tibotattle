@@ -290,6 +290,8 @@ test("safe plan normalization retains canonical labels and fails closed for arbi
   for (const [planType, expected] of [
     ["go", "go"],
     ["edu", "edu"],
+    ["edu_plus", "edu_plus"],
+    ["edu_pro", "edu_pro"],
     ["prolite", "prolite"],
     ["arbitrary-plan-name", "unknown"],
   ]) {

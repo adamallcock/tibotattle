@@ -5,6 +5,10 @@ import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import { deriveOpenAIAccountScope, sanitizeAccountScope } from "./account-scope.js";
 import { normalizeProviderPlanType } from "./plan-normalization.js";
+import {
+  sanitizeProviderQuotaLimitDisplayName,
+  sanitizeProviderQuotaLimitId,
+} from "./quota-metadata.js";
 import { normalizeProviderQuotaWindow } from "./quota-normalization.js";
 import { RELEASE_VERSION } from "../../../config/release-manifest.js";
 
@@ -288,11 +292,11 @@ function sanitizeLimitWindow(window) {
   return normalizeProviderQuotaWindow(window);
 }
 
-export function sanitizeRateLimit(limit) {
-  if (!limit) return null;
+export function sanitizeRateLimit(limit, fallbackLimitId = "unknown") {
+  if (!limit || typeof limit !== "object" || Array.isArray(limit)) return null;
   return {
-    limitId: limit.limitId,
-    limitName: limit.limitName ?? null,
+    limitId: sanitizeProviderQuotaLimitId(limit.limitId ?? fallbackLimitId),
+    limitName: sanitizeProviderQuotaLimitDisplayName(limit.limitName),
     primary: sanitizeLimitWindow(limit.primary),
     secondary: sanitizeLimitWindow(limit.secondary),
     planType: normalizeProviderPlanType(limit.planType),
@@ -326,10 +330,18 @@ export function sanitizeCodexAccountSnapshot(snapshot, capturedAt, {
     throw new Error(raw?.error?.message ?? "Codex did not return a canonical rate-limit snapshot");
   }
   const canonical = sanitizeRateLimit(raw.rateLimits);
+  if (canonical === null) {
+    throw new Error("Codex returned a malformed canonical rate-limit snapshot");
+  }
   const byLimitId = Object.fromEntries(
-    Object.entries(raw.rateLimitsByLimitId ?? {}).map(([id, limit]) => [id, sanitizeRateLimit(limit)]),
+    Object.entries(raw.rateLimitsByLimitId ?? {}).flatMap(([id, limit]) => {
+      const sanitized = sanitizeRateLimit(limit, id);
+      return sanitized === null ? [] : [[sanitized.limitId, sanitized]];
+    }),
   );
-  if (!byLimitId[canonical.limitId]) byLimitId[canonical.limitId] = canonical;
+  if (!Object.hasOwn(byLimitId, canonical.limitId)) {
+    byLimitId[canonical.limitId] = canonical;
+  }
 
   const usage = snapshot.accountUsage;
   const dailyUsageBuckets = Array.isArray(usage?.dailyUsageBuckets)

@@ -742,6 +742,24 @@ test("local companion relays bounded durations and selects a deterministic prima
             resetsAt: 1_784_980_800,
           },
           {
+            limitId: "future_alpha",
+            limitName: "Future Alpha",
+            slot: "primary",
+            planType: "plus",
+            usedPercent: 61,
+            windowDurationMins: 1_440,
+            resetsAt: 1_784_980_800,
+          },
+          {
+            limitId: "future_beta",
+            limitName: "Account alice@example.com",
+            slot: "primary",
+            planType: "plus",
+            usedPercent: 62,
+            windowDurationMins: 43_200,
+            resetsAt: 1_784_980_800,
+          },
+          {
             limitId: "codex",
             slot: "primary",
             planType: "pro",
@@ -780,8 +798,16 @@ test("local companion relays bounded durations and selects a deterministic prima
         ["codex", "primary", 300, "prolite"],
         ["codex", "secondary", 10_080, "pro"],
         ["codex_bengalfox", "primary", 43_200, "edu"],
+        ["future_alpha", "primary", 1_440, "plus"],
+        ["future_beta", "primary", 43_200, "plus"],
       ],
     );
+    assert.equal(windows.find((window) => window.limitId === "future_alpha").limitName, "Future Alpha");
+    assert.equal(
+      Object.hasOwn(windows.find((window) => window.limitId === "future_beta"), "limitName"),
+      false,
+    );
+    assert.equal(new Set(windows.map((window) => window.limitId)).has("unknown"), false);
     assert.equal(snapshot.overview.quotaWindows[0].durationMinutes, 43_200);
     assert.equal(
       JSON.stringify(snapshot).includes("monthly"),

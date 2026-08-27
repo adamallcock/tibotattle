@@ -216,6 +216,8 @@ export const WEB_MESSAGES = Object.freeze({
   "dashboard.quota.spark": ["Spark · separate limit", "Spark · 独立额度", "Spark · límite separado"],
   "dashboard.quota.windowProviderReported": ["Provider-reported {duration} window", "提供方报告的 {duration} 窗口", "Ventana de {duration} informada por el proveedor"],
   "dashboard.quota.windowOther": ["Other observed allowance", "其他观测到的额度", "Otra asignación observada"],
+  "dashboard.quota.windowOtherDuration": ["Other observed {duration} allowance", "其他观测到的 {duration}额度", "Otra asignación observada de {duration}"],
+  "dashboard.quota.windowNamedObserved": ["{name} · {duration} allowance", "{name} · {duration}额度", "{name} · asignación de {duration}"],
   "dashboard.quota.providerPlan": ["Provider-reported plan: {plan}", "提供方报告的方案：{plan}", "Plan informado por el proveedor: {plan}"],
   "dashboard.quota.providerPlanUnavailable": ["Provider-reported plan unavailable", "提供方报告的方案不可用", "Plan informado por el proveedor no disponible"],
   "shareCard.showInFinder": ["Show in Finder", "在访达中显示", "Mostrar en Finder"],

@@ -251,6 +251,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/providers/codex/log-sources.js",
   "src/providers/codex/logs.js",
   "src/providers/codex/plan-normalization.js",
+  "src/providers/codex/quota-metadata.js",
   "src/providers/codex/quota-normalization.js",
   "src/providers/codex/surface-classification.js",
   "src/providers/codex/tier-normalization.js",

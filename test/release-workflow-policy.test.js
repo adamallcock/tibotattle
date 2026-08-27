@@ -9,12 +9,52 @@ import {
 
 test("checked-in GitHub workflows pin actions and avoid unsafe release triggers", async () => {
   const result = await checkReleaseWorkflowPolicy();
+  assert.ok(result.files.includes(".github/workflows/codex-contract-drift.yml"));
   assert.ok(result.files.includes(".github/workflows/osv-scanner.yml"));
   assert.ok(result.files.includes(".github/workflows/windows-portability.yml"));
 });
 
+test("Codex drift monitoring is read-only, immutable, and cannot rewrite the ledger", async () => {
+  const workflow = await readFile(new URL(
+    "../.github/workflows/codex-contract-drift.yml",
+    import.meta.url,
+  ), "utf8");
+
+  assert.match(workflow, /pull_request:/u);
+  assert.match(workflow, /push:\n\s+branches:\n\s+- main/u);
+  assert.match(workflow, /schedule:\n\s+- cron: "17 5 \* \* \*"/u);
+  assert.match(workflow, /workflow_dispatch:/u);
+  assert.match(workflow, /^permissions:\n  contents: read$/mu);
+  assert.doesNotMatch(workflow, /^\s+[a-z-]+: write$/mu);
+
+  assert.match(
+    workflow,
+    /actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1/u,
+  );
+  assert.match(
+    workflow,
+    /actions\/setup-node@820762786026740c76f36085b0efc47a31fe5020/u,
+  );
+  assert.match(
+    workflow,
+    /actions\/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02/u,
+  );
+  assert.match(workflow, /persist-credentials: false/u);
+  assert.match(workflow, /package-manager-cache: false/u);
+
+  assert.match(workflow, /if: github\.event_name != 'pull_request'/u);
+  assert.match(workflow, /git ls-remote --refs https:\/\/github\.com\/openai\/codex\.git/u);
+  assert.match(workflow, /--source-revision "\$\{\{ steps\.upstream-source\.outputs\.revision \}\}"/u);
+  assert.match(workflow, /--binary "standalone_latest=/u);
+  assert.match(workflow, /npm install[\s\S]*--ignore-scripts[\s\S]*"@openai\/codex@\$codex_version"/u);
+  assert.match(workflow, /--report "\$RUNNER_TEMP\/codex-contract-live\.json"/u);
+  assert.match(workflow, /if: always\(\)[\s\S]*if-no-files-found: error/u);
+  assert.doesNotMatch(workflow, /--update-ledger/u);
+});
+
 test("setup-node never initializes a package-manager cache before pnpm exists", async () => {
   for (const workflowPath of [
+    ".github/workflows/codex-contract-drift.yml",
     ".github/workflows/release-trust-policy.yml",
     ".github/workflows/windows-portability.yml",
   ]) {

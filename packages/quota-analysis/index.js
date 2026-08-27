@@ -32,10 +32,22 @@ export {
 } from "./src/model-composition.js";
 
 export {
+  classifyQuotaWindowKind,
+  CODEX_PRIMARY_LIMIT_ID,
+  CODEX_SPARK_LIMIT_ID,
+  CODEX_SPARK_LIMIT_IDS,
+  CODEX_SPARK_RESERVED_LIMIT_ID,
   FIVE_HOUR_WINDOW_MINUTES,
   formatQuotaWindowDuration,
+  isSparkQuotaLimitId,
   MAX_QUOTA_WINDOW_DURATION_MINUTES,
+  MAX_QUOTA_LIMIT_DISPLAY_NAME_LENGTH,
+  QUOTA_LIMIT_DISPLAY_ALIASES,
+  QUOTA_WINDOW_KINDS,
+  quotaLimitDisplayAlias,
   quotaWindowLabel,
+  sanitizeQuotaLimitDisplayName,
+  sanitizeQuotaLimitId,
   selectPrimaryQuotaWindow,
   SEVEN_DAY_WINDOW_MINUTES,
   SUPPORTED_QUOTA_WINDOW_DURATIONS,

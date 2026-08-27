@@ -4,6 +4,7 @@ import {
   normalizeDashboardPayload,
   normalizeParticipantStats,
 } from "../public/data-client.js";
+import { TELEMETRY_PLAN_TYPES } from "../public/telemetry-shared.generated.js";
 
 test("web timeline normalization retains canonical plans and maps arbitrary strings to unknown", () => {
   const normalized = normalizeDashboardPayload({
@@ -44,18 +45,7 @@ test("web timeline normalization retains canonical plans and maps arbitrary stri
 });
 
 test("web quota windows expose only known provider plan types as plan evidence", () => {
-  const knownPlanTypes = [
-    "free",
-    "go",
-    "plus",
-    "pro",
-    "prolite",
-    "business",
-    "enterprise",
-    "edu",
-    "team",
-    "unknown",
-  ];
+  const knownPlanTypes = [...TELEMETRY_PLAN_TYPES];
   const normalized = normalizeDashboardPayload({
     quotaWindows: [
       ...knownPlanTypes.map((planType, index) => ({
