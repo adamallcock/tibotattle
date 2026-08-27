@@ -109,7 +109,8 @@ const FAILURE_REASONS = new Set([
   "community_invalid",
   "network_boundary_invalid",
   "network_external_invalid",
-  "network_mutation_invalid",
+  "network_identity_mutation_invalid",
+  "network_contribution_mutation_invalid",
   "relaunch_persistence_invalid",
   "relaunch_refresh_invalid",
   "quit_invalid",
@@ -801,9 +802,14 @@ export function createNetworkBoundaryObserver(cdp, expectedOrigin) {
       }
       if (parsed.origin === expectedOrigin
           && request?.method !== "GET"
-          && (parsed.pathname.startsWith("/api/local/contribution/")
-            || parsed.pathname.startsWith("/api/local/identity/"))) {
-        violation ??= "local_mutation";
+          && parsed.pathname.startsWith("/api/local/contribution/")
+          && parsed.pathname !== "/api/local/contribution/sync-next") {
+        violation ??= "local_contribution_mutation";
+      }
+      if (parsed.origin === expectedOrigin
+          && request?.method !== "GET"
+          && parsed.pathname.startsWith("/api/local/identity/")) {
+        violation ??= "local_identity_mutation";
       }
     } catch {
       violation ??= "invalid_url";
@@ -2170,8 +2176,10 @@ async function runQa(options) {
     if (networkViolation !== null) {
       const reason = networkViolation === "external_http"
         ? "network_external_invalid"
-        : networkViolation === "local_mutation"
-          ? "network_mutation_invalid"
+        : networkViolation === "local_identity_mutation"
+          ? "network_identity_mutation_invalid"
+          : networkViolation === "local_contribution_mutation"
+            ? "network_contribution_mutation_invalid"
           : "network_boundary_invalid";
       fail("REAL_HISTORY_QA_NETWORK_BOUNDARY_INVALID", "parity", reason);
     }

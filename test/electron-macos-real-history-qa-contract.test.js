@@ -628,12 +628,17 @@ test("real-history network boundary rejects external traffic and local contribut
   let finish = createNetworkBoundaryObserver(cdp, "http://127.0.0.1:4321");
   observe({ method: "POST", url: "http://127.0.0.1:4321/api/local/refresh" });
   observe({ method: "POST", url: "http://127.0.0.1:4321/api/local/refresh/cancel" });
+  observe({ method: "POST", url: "http://127.0.0.1:4321/api/local/contribution/sync-next" });
   assert.equal(finish(), null);
 
   finish = createNetworkBoundaryObserver(cdp, "http://127.0.0.1:4321");
   observe({ method: "GET", url: "http://127.0.0.1:4321/api/local/contribution/sync-status" });
   observe({ method: "POST", url: "http://127.0.0.1:4321/api/local/contribution/prepare" });
-  assert.equal(finish(), "local_mutation");
+  assert.equal(finish(), "local_contribution_mutation");
+
+  finish = createNetworkBoundaryObserver(cdp, "http://127.0.0.1:4321");
+  observe({ method: "POST", url: "http://127.0.0.1:4321/api/local/identity/hosted-signin-handoff" });
+  assert.equal(finish(), "local_identity_mutation");
 
   finish = createNetworkBoundaryObserver(cdp, "http://127.0.0.1:4321");
   observe({ method: "GET", url: "https://tibotattle.com/api/health" });

@@ -5421,7 +5421,8 @@ export function createPreparedLocalCompanionServer({
       if (selectedMacosLocalQa
           && request.method !== "GET"
           && (path.startsWith("/api/local/contribution/")
-            || path.startsWith("/api/local/identity/"))) {
+            || path.startsWith("/api/local/identity/"))
+          && path !== "/api/local/contribution/sync-next") {
         sendError(response, 403, "macos_local_qa_mutation_forbidden");
         return;
       }

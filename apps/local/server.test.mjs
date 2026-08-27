@@ -614,6 +614,21 @@ test("macOS Electron local QA disables credential and contribution boundaries", 
     assert.equal(health.capabilities.incrementalContributionSync, false);
     assert.equal(networkCalls, 0);
 
+    const preview = await fetch(
+      `${origin}/api/local/contribution/sync-next`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: origin,
+          "X-Usage-Monitor-Local": "1",
+        },
+        body: "{}",
+      },
+    );
+    assert.equal(preview.status, 200);
+    assert.equal(networkCalls, 0);
+
     for (const path of [
       "/api/local/contribution/prepare",
       "/api/local/identity/reset",
