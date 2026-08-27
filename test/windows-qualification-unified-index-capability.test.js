@@ -107,7 +107,8 @@ function resourceManifest() {
     Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8")))
     .map((path) => ({
       bytes: 1,
-      kind: path.startsWith("apps/electron/")
+      kind: path === "config/deployment-endpoints.js"
+        || path.startsWith("apps/electron/")
         || path === "src/desktop-shell-status.js"
         || path === "src/platform/windows-credential-manager-probe.js"
         ? "electron_shell"
@@ -162,9 +163,14 @@ async function fixture() {
     USAGE_MONITOR_STATE_ROOT: STATE_ROOT,
   };
   await import("node:fs/promises").then(({ mkdir }) => mkdir(resourceRoot));
+  const manifest = resourceManifest();
+  assert.equal(
+    manifest.files.find(({ path }) => path === "config/deployment-endpoints.js")?.kind,
+    "electron_shell",
+  );
   await writeFile(
     join(resourceRoot, "electron-runtime-manifest.json"),
-    `${JSON.stringify(resourceManifest())}\n`,
+    `${JSON.stringify(manifest)}\n`,
   );
   const adapter = createWindowsFilesystemAdapter({
     platform: "win32",
