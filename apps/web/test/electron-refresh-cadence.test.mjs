@@ -141,3 +141,34 @@ test("requestRefresh signals start only after acceptance and settles only for ac
   assert.ok(settledGuard > started, "refreshSettled must be guarded by accepted Electron work");
   assert.ok(settled > settledGuard, "refreshSettled must run from the terminal cleanup path");
 });
+
+test("bounded continuation re-enables the elapsed timer after a terminal-looking pass", () => {
+  const continuationStart = appSource.indexOf(
+    "      if (refreshNeedsContinuation({",
+  );
+  const timeoutStart = appSource.indexOf(
+    '      if (outcome === "failed"\n          && refresh.errorCode === "refresh_timed_out")',
+  );
+  assert.ok(continuationStart >= 0, "bounded continuation branch must exist");
+  assert.ok(timeoutStart > continuationStart, "timeout branch must follow continuation handling");
+  const continuationBlock = appSource.slice(continuationStart, timeoutStart);
+  assert.match(
+    continuationBlock,
+    /outcome = "running";\s*latestOutcome = "running";\s*continue;/u,
+    "accepted continuation must resume the renderer display timer",
+  );
+});
+
+test("timeout settling re-enables the elapsed timer while the companion finishes", () => {
+  const timeoutStart = appSource.indexOf(
+    '      if (outcome === "failed"\n          && refresh.errorCode === "refresh_timed_out")',
+  );
+  const timeoutEnd = appSource.indexOf("    }\n    cancelled = outcome ===", timeoutStart);
+  assert.ok(timeoutStart >= 0, "timeout settling branch must exist");
+  assert.ok(timeoutEnd > timeoutStart, "timeout settling branch must be bounded");
+  assert.match(
+    appSource.slice(timeoutStart, timeoutEnd),
+    /outcome = "running";\s*latestOutcome = "running";/u,
+    "timeout settling must keep the renderer elapsed timer alive",
+  );
+});

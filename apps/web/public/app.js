@@ -11661,6 +11661,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
           }
         }
         outcome = "running";
+        latestOutcome = "running";
         continue;
       }
       if (outcome === "failed"
@@ -11671,6 +11672,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
           timeoutSettlementNoted = true;
         }
         outcome = "running";
+        latestOutcome = "running";
       }
     }
     cancelled = outcome === "cancelled";
