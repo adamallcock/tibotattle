@@ -449,6 +449,94 @@ function assertPublicEntryClaimBoundary(html, label = "public entry") {
   }
 }
 
+function assertPublishedPlatformSelectorContract(html) {
+  const panelStarts = Object.fromEntries(
+    ["macos", "windows", "linux"].map((platform) => {
+      const marker = `id="platform-panel-${platform}"`;
+      const index = html.indexOf(marker);
+      assert.notEqual(index, -1, `published index includes the ${platform} panel`);
+      return [platform, index];
+    }),
+  );
+  assert.ok(panelStarts.macos < panelStarts.windows, "macOS panel precedes Windows");
+  assert.ok(panelStarts.windows < panelStarts.linux, "Windows panel precedes Linux");
+  const panelsEnd = html.indexOf('<a class="community-inline"', panelStarts.linux);
+  assert.notEqual(panelsEnd, -1, "platform panels end before the community link");
+
+  const panels = {
+    macos: html.slice(panelStarts.macos, panelStarts.windows),
+    windows: html.slice(panelStarts.windows, panelStarts.linux),
+    linux: html.slice(panelStarts.linux, panelsEnd),
+  };
+
+  assert.match(html, /id="platform-selector"[^>]*role="tablist"/u);
+  for (const platform of ["macos", "windows", "linux"]) {
+    assert.match(
+      html,
+      new RegExp(
+        `id="platform-tab-${platform}"[\\s\\S]*?role="tab"[\\s\\S]*?aria-controls="platform-panel-${platform}"`,
+        "u",
+      ),
+    );
+    assert.match(
+      panels[platform],
+      new RegExp(
+        `role="tabpanel"[\\s\\S]*?aria-labelledby="platform-tab-${platform}"`,
+        "u",
+      ),
+    );
+  }
+
+  for (const macOnlyId of [
+    "installer-link",
+    "installer-unavailable-action",
+    "homebrew-install",
+    "installer-details",
+    "installer-sha256-copy",
+    "download-assurance",
+  ]) {
+    assert.equal(
+      html.split(`id="${macOnlyId}"`).length - 1,
+      1,
+      `${macOnlyId} is unique in the published index`,
+    );
+    assert.ok(
+      panels.macos.includes(`id="${macOnlyId}"`),
+      `${macOnlyId} belongs only to the macOS panel`,
+    );
+  }
+  assert.match(panels.macos, /Download for macOS/u);
+  assert.match(panels.macos, /brew install --cask adamallcock\/tap\/tibotattle/u);
+  assert.match(panels.macos, /Developer ID signed and Apple notarized\./u);
+
+  for (const [platform, issue] of [["windows", 3], ["linux", 4]]) {
+    const panel = panels[platform];
+    const displayName = platform === "windows" ? "Windows" : "Linux";
+    assert.match(panel, /Not yet available/u);
+    assert.match(
+      panel,
+      new RegExp(`There is no published ${displayName} build yet\\.`, "u"),
+    );
+    assert.match(
+      panel,
+      new RegExp(
+        `href="https://github\\.com/adamallcock/tibotattle/issues/${issue}"`,
+        "u",
+      ),
+    );
+    assert.equal(
+      panel.match(/<a\b/gu)?.length ?? 0,
+      1,
+      `${displayName} exposes only its roadmap issue link`,
+    );
+    assert.doesNotMatch(panel, /<button\b|\bDownload\b/iu);
+    assert.doesNotMatch(
+      panel,
+      /\b(?:winget|choco(?:latey)?|scoop|powershell|appimage|flatpak|snap|apt(?:-get)?|dnf|yum|pacman)\b|\.(?:exe|msi|msix|deb|rpm)\b/iu,
+    );
+  }
+}
+
 test("release-site build verifies artifacts and materializes complete public metadata", async (t) => {
   const value = await fixture();
   t.after(() => rm(value.root, { recursive: true, force: true }));
@@ -1023,6 +1111,7 @@ test("checked-in public source satisfies the complete release contract", async (
   const docsHtml = await readFile(join(value.output, "docs.html"), "utf8");
   const privacyHtml = await readFile(join(value.output, "privacy.html"), "utf8");
   assertPublicEntryClaimBoundary(html);
+  assertPublishedPlatformSelectorContract(html);
   assert.equal(communityHtml, html, "the community route output stays identical to the index");
   assert.equal(fallbackHtml, html, "the fallback output stays identical to the index");
   assert.match(html, /id="installer-compatibility"/u);
