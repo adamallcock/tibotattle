@@ -19,6 +19,7 @@ import {
   createControlPlaneObserver,
   createNetworkBoundaryObserver,
   createRefreshObserver,
+  localQaCommunityParitySnapshotValid,
   parseRealHistoryArguments,
   realHistoryDashboardReadySnapshotValid,
   releaseRealHistoryRefreshGate,
@@ -796,6 +797,41 @@ test("real-history parity helpers reject blank model metrics, hidden advanced mo
   assert.equal(communityParitySnapshotValid(community, {
     capabilities: { ...health.capabilities, incrementalContributionSync: false },
   }), false);
+
+  const localHealth = {
+    capabilities: {
+      centralServiceProxy: false,
+      contributionDevicePairing: false,
+      incrementalContributionSync: false,
+    },
+    serviceReachability: "not_configured",
+    serviceReachabilityProven: false,
+  };
+  const localCommunity = {
+    ...community,
+    googleButtonEnabled: false,
+    appleButtonEnabled: false,
+    noServiceCopy: true,
+    noServiceNoticeCount: 1,
+  };
+  assert.equal(
+    localQaCommunityParitySnapshotValid(localCommunity, localHealth),
+    true,
+  );
+  assert.equal(
+    localQaCommunityParitySnapshotValid({
+      ...localCommunity,
+      noServiceNoticeCount: 2,
+    }, localHealth),
+    false,
+  );
+  assert.equal(
+    localQaCommunityParitySnapshotValid({
+      ...localCommunity,
+      googleButtonEnabled: true,
+    }, localHealth),
+    false,
+  );
 });
 
 test("source contract preserves the real profile and bounds every health poll", async () => {

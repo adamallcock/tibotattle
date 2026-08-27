@@ -1774,6 +1774,28 @@ export function communityParitySnapshotValid(
     && snapshot?.noServiceCopy === false;
 }
 
+export function localQaCommunityParitySnapshotValid(
+  snapshot,
+  health,
+  { requirePartialDetail = false } = {},
+) {
+  return health?.capabilities?.centralServiceProxy !== true
+    && health?.serviceReachability === "not_configured"
+    && snapshot?.route === "#community"
+    && snapshot?.pageVisible === true
+    && snapshot?.journeyStageCount === 2
+    && snapshot?.indexTerminal === true
+    && snapshot?.indexDetail === true
+    && (!requirePartialDetail || snapshot?.partialHistoryDetail === true)
+    && snapshot?.googleButton === true
+    && snapshot?.appleButton === true
+    && snapshot?.googleButtonEnabled === false
+    && snapshot?.appleButtonEnabled === false
+    && snapshot?.currentLayout === true
+    && snapshot?.noServiceCopy === true
+    && snapshot?.noServiceNoticeCount === 1;
+}
+
 async function assertUsage(session) {
   const usage = await waitFor(async () => session.cdp.evaluate(`(() => {
     const visible = ${visibleInRenderer.toString()};
@@ -1884,21 +1906,30 @@ async function assertCommunity(session, health, terminalStatus) {
         && visible(document.querySelector('#incremental-consent'))
         && (document.querySelector('#incremental-consent')?.textContent?.trim() ?? '').length > 0,
       noServiceCopy: pageText.includes('no contribution service'),
+      noServiceNoticeCount: [
+        document.querySelector('#identity-google-unavailable'),
+        document.querySelector('#identity-apple-unavailable'),
+      ].filter((element) => visible(element)
+        && (element?.textContent?.toLowerCase() ?? '').includes('no contribution service')).length,
     };
   })()`), REAL_HISTORY_QA_TIMEOUTS.uiMs, "real-history Community parity");
-  const valid = communityParitySnapshotValid(community, health, {
+  const serviceConfigured = health?.capabilities?.centralServiceProxy === true;
+  const valid = (serviceConfigured
+    ? communityParitySnapshotValid
+    : localQaCommunityParitySnapshotValid)(community, health, {
     requirePartialDetail: terminalStatus === "degraded",
   });
   if (!valid) fail("REAL_HISTORY_QA_COMMUNITY_INVALID", "parity", "community_invalid");
   return Object.freeze({
     pageVisible: true,
-    serviceConfigured: true,
-    serviceReachability: "ok",
-    serviceReachabilityProven: true,
+    serviceConfigured,
+    serviceReachability: health.serviceReachability,
+    serviceReachabilityProven: health.serviceReachabilityProven,
     journeyStageCount: community.journeyStageCount,
     currentLayout: true,
     providerControls: true,
-    providerControlsEnabled: community.googleButtonEnabled === true
+    providerControlsEnabled: serviceConfigured
+      && community.googleButtonEnabled === true
       && community.appleButtonEnabled === true,
     indexTerminal: true,
     partialHistoryDetail: community.partialHistoryDetail,
