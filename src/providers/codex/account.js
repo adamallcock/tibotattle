@@ -18,6 +18,7 @@ export {
   codexAppServerChildEnv,
   deriveOpenAIAccountScopeWithSecretLoader,
   findCodexBinary,
+  inspectCodexBinary,
   readCodexAccountSnapshot,
   sanitizeCodexAccountSnapshot,
   sanitizeCodexAccountSnapshotWithSecretLoader,

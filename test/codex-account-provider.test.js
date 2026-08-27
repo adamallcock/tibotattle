@@ -13,6 +13,7 @@ const EXPECTED_PUBLIC_EXPORTS = [
   "deriveOpenAIAccountScope",
   "deriveOpenAIAccountScopeWithSecretLoader",
   "findCodexBinary",
+  "inspectCodexBinary",
   "readCodexAccountSnapshot",
   "sanitizeAccountScope",
   "sanitizeCodexAccountSnapshot",
@@ -31,6 +32,50 @@ test("Codex account facade exposes only reviewed exports with exact identities",
     );
   }
   assert.equal(accountFacade.OPENAI_ACCOUNT_SCOPE_PREFIX, undefined);
+});
+
+test("Codex binary diagnostics preserve selection precedence without exposing paths", async () => {
+  const privateOverride = "/private/codex-builds/review/codex";
+  const diagnostic = await accountFacade.inspectCodexBinary({
+    environment: { CODEX_BIN: privateOverride },
+    accessFile: async (candidate) => {
+      assert.equal(candidate, privateOverride);
+    },
+    readVersion: async (candidate) => {
+      assert.equal(candidate, privateOverride);
+      return "codex-cli 0.149.1\n";
+    },
+  });
+
+  assert.deepEqual(diagnostic, {
+    schemaVersion: "codex-binary-diagnostic-v0.1",
+    source: "environment_override",
+    versionStatus: "available",
+    version: "0.149.1",
+  });
+  assert.equal(JSON.stringify(diagnostic).includes(privateOverride), false);
+});
+
+test("Codex binary diagnostics fail closed on malformed or unavailable versions", async () => {
+  const diagnostic = await accountFacade.inspectCodexBinary({
+    environment: {},
+    accessFile: async () => {
+      const error = new Error("missing");
+      error.code = "ENOENT";
+      throw error;
+    },
+    readVersion: async (candidate) => {
+      assert.equal(candidate, "codex");
+      return "private warning with /Users/someone/project";
+    },
+  });
+
+  assert.deepEqual(diagnostic, {
+    schemaVersion: "codex-binary-diagnostic-v0.1",
+    source: "path",
+    versionStatus: "unavailable",
+    version: null,
+  });
 });
 
 test("rate-limit sanitation retains provider duration and fails closed on plan evidence", () => {
