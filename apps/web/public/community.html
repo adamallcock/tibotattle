@@ -97,8 +97,10 @@
         aria-atomic="true"
       ></p>
       <a class="header-download" href="#download">
-        <img src="./apple.svg" alt="" width="14" height="14">
-        <span class="header-download-label" id="header-download-label">Get the Mac app</span>
+        <svg class="header-download-icon" viewBox="0 0 20 20" width="14" height="14" aria-hidden="true">
+          <path d="M10 2v10m0 0 4-4m-4 4L6 8M3 15.5h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path>
+        </svg>
+        <span class="header-download-label" id="header-download-label" data-i18n="installer.headerDownload">Get the app</span>
       </a>
     </header>
 
@@ -109,112 +111,197 @@
           <p class="hero-lede">
             TiboTattle turns your seven-day Codex allowance into an
             API-price-equivalent estimate, shows how it changes over time, and
-            calculates your personal dashboard on your Mac.
+            calculates your personal dashboard locally on your computer.
           </p>
 
           <div
             class="install-cluster"
             id="download"
-            aria-label="Get TiboTattle for Mac"
-            data-i18n-aria-label="aria.getTiboTattleForMac"
+            role="region"
+            aria-label="Choose your TiboTattle platform"
+            data-i18n-aria-label="aria.choosePlatform"
           >
-            <div class="install-actions">
-              <a
-                class="button mac-download-button"
-                id="installer-link"
-                hidden
-              >
-                <img class="download-platform-icon" src="./apple.svg" alt="" width="22" height="22">
-                Download for macOS
-              </a>
+            <div
+              class="platform-selector"
+              id="platform-selector"
+              role="tablist"
+              aria-label="Choose your platform"
+              data-i18n-aria-label="aria.choosePlatform"
+              hidden
+            >
               <button
-                class="button mac-download-button"
-                id="installer-unavailable-action"
+                class="platform-tab"
+                id="platform-tab-macos"
                 type="button"
-                aria-describedby="installer-unavailable"
-                disabled
+                role="tab"
+                aria-selected="true"
+                aria-controls="platform-panel-macos"
+                data-platform="macos"
+                tabindex="0"
               >
-                <img class="download-platform-icon" src="./apple.svg" alt="" width="22" height="22">
-                Download for macOS
+                <span data-i18n="installer.platform.macos">macOS</span>
               </button>
-              <div
-                class="homebrew-install"
-                id="homebrew-install"
-                role="group"
-                aria-label="Install with Homebrew"
-                data-i18n-aria-label="aria.installWithHomebrew"
-                hidden
-              >
-                <span class="homebrew-prompt" aria-hidden="true">$</span>
-                <code id="homebrew-install-command" data-i18n-skip>brew install --cask adamallcock/tap/tibotattle</code>
-                <button
-                  class="homebrew-copy-button"
-                  id="homebrew-copy-button"
-                  type="button"
-                  aria-label="Copy Homebrew install command"
-                  aria-describedby="homebrew-copy-status"
-                  data-i18n-aria-label="aria.copyHomebrewCommand"
-                >
-                  <span id="homebrew-copy-label" data-i18n="installer.homebrew.copy">Copy</span>
-                </button>
-              </div>
-              <span
-                class="sr-only"
-                id="homebrew-copy-status"
-                role="status"
-                aria-live="polite"
-                aria-atomic="true"
-              ></span>
-              <span class="installer-unavailable" id="installer-unavailable">
-                Public download coming soon.
-              </span>
-            </div>
-            <div class="installer-details installer-details-compact" id="installer-details" hidden>
-              <span class="installer-summary">
-                <span id="installer-version"></span>
-                <span class="installer-summary-divider" aria-hidden="true">·</span>
-                <span id="installer-compatibility"></span>
-              </span>
               <button
-                class="installer-checksum-copy"
-                id="installer-sha256-copy"
+                class="platform-tab"
+                id="platform-tab-windows"
                 type="button"
-                aria-label="Copy the published SHA-256 checksum"
-                aria-describedby="installer-sha256-copy-status"
-                data-i18n-aria-label="aria.copyInstallerSha256"
+                role="tab"
+                aria-selected="false"
+                aria-controls="platform-panel-windows"
+                data-platform="windows"
+                tabindex="-1"
               >
-                <span id="installer-sha256-copy-label" data-i18n="installer.sha256.copy">Copy SHA-256</span>
+                <span data-i18n="installer.platform.windows">Windows</span>
               </button>
-              <code
-                class="installer-checksum-fallback"
-                id="installer-sha256"
-                aria-label="SHA-256 checksum"
-                data-i18n-aria-label="aria.installerSha256"
-                data-i18n-skip
-                hidden
-              ></code>
-              <span class="sr-only" id="installer-size" aria-hidden="true"></span>
-              <span
-                class="sr-only"
-                id="installer-sha256-copy-status"
-                role="status"
-                aria-live="polite"
-                aria-atomic="true"
-              ></span>
+              <button
+                class="platform-tab"
+                id="platform-tab-linux"
+                type="button"
+                role="tab"
+                aria-selected="false"
+                aria-controls="platform-panel-linux"
+                data-platform="linux"
+                tabindex="-1"
+              >
+                <span data-i18n="installer.platform.linux">Linux</span>
+              </button>
             </div>
-            <nav class="installer-links" id="installer-links" aria-label="Release information" data-i18n-aria-label="aria.releaseInformation" hidden>
-              <a id="release-notes-link" href="" hidden>Release notes</a>
-              <a id="privacy-link" href="" hidden>Privacy</a>
-              <a id="security-link" href="" hidden>Security</a>
-              <a id="support-link" href="" hidden>Support</a>
-            </nav>
-          </div>
 
-          <p class="download-assurance" id="download-assurance" hidden>
-            <span class="download-assurance-mark" aria-hidden="true"></span>
-            <strong data-i18n="installer.assurance.message">Developer ID signed and Apple notarized.</strong>
-            <a href="./docs.html#download-security" data-i18n="installer.assurance.details">Security and verification</a>
-          </p>
+            <section
+              class="platform-panel"
+              id="platform-panel-macos"
+              role="tabpanel"
+              aria-labelledby="platform-tab-macos"
+              data-platform-panel="macos"
+              tabindex="0"
+            >
+              <div class="install-actions">
+                <a
+                  class="button mac-download-button"
+                  id="installer-link"
+                  hidden
+                >
+                  <img class="download-platform-icon" src="./apple.svg" alt="" width="22" height="22">
+                  Download for macOS
+                </a>
+                <button
+                  class="button mac-download-button"
+                  id="installer-unavailable-action"
+                  type="button"
+                  aria-describedby="installer-unavailable"
+                  disabled
+                >
+                  <img class="download-platform-icon" src="./apple.svg" alt="" width="22" height="22">
+                  Download for macOS
+                </button>
+                <div
+                  class="homebrew-install"
+                  id="homebrew-install"
+                  role="group"
+                  aria-label="Install with Homebrew"
+                  data-i18n-aria-label="aria.installWithHomebrew"
+                  hidden
+                >
+                  <span class="homebrew-prompt" aria-hidden="true">$</span>
+                  <code id="homebrew-install-command" data-i18n-skip>brew install --cask adamallcock/tap/tibotattle</code>
+                  <button
+                    class="homebrew-copy-button"
+                    id="homebrew-copy-button"
+                    type="button"
+                    aria-label="Copy Homebrew install command"
+                    aria-describedby="homebrew-copy-status"
+                    data-i18n-aria-label="aria.copyHomebrewCommand"
+                  >
+                    <span id="homebrew-copy-label" data-i18n="installer.homebrew.copy">Copy</span>
+                  </button>
+                </div>
+                <span
+                  class="sr-only"
+                  id="homebrew-copy-status"
+                  role="status"
+                  aria-live="polite"
+                  aria-atomic="true"
+                ></span>
+                <span class="installer-unavailable" id="installer-unavailable">
+                  Public download coming soon.
+                </span>
+              </div>
+              <div class="installer-details installer-details-compact" id="installer-details" hidden>
+                <span class="installer-summary">
+                  <span id="installer-version"></span>
+                  <span class="installer-summary-divider" aria-hidden="true">·</span>
+                  <span id="installer-compatibility"></span>
+                </span>
+                <button
+                  class="installer-checksum-copy"
+                  id="installer-sha256-copy"
+                  type="button"
+                  aria-label="Copy the published SHA-256 checksum"
+                  aria-describedby="installer-sha256-copy-status"
+                  data-i18n-aria-label="aria.copyInstallerSha256"
+                >
+                  <span id="installer-sha256-copy-label" data-i18n="installer.sha256.copy">Copy SHA-256</span>
+                </button>
+                <code
+                  class="installer-checksum-fallback"
+                  id="installer-sha256"
+                  aria-label="SHA-256 checksum"
+                  data-i18n-aria-label="aria.installerSha256"
+                  data-i18n-skip
+                  hidden
+                ></code>
+                <span class="sr-only" id="installer-size" aria-hidden="true"></span>
+                <span
+                  class="sr-only"
+                  id="installer-sha256-copy-status"
+                  role="status"
+                  aria-live="polite"
+                  aria-atomic="true"
+                ></span>
+              </div>
+              <nav class="installer-links" id="installer-links" aria-label="Release information" data-i18n-aria-label="aria.releaseInformation" hidden>
+                <a id="release-notes-link" href="" hidden>Release notes</a>
+                <a id="privacy-link" href="" hidden>Privacy</a>
+                <a id="security-link" href="" hidden>Security</a>
+                <a id="support-link" href="" hidden>Support</a>
+              </nav>
+              <p class="download-assurance" id="download-assurance" hidden>
+                <span class="download-assurance-mark" aria-hidden="true"></span>
+                <strong data-i18n="installer.assurance.message">Developer ID signed and Apple notarized.</strong>
+                <a href="./docs.html#download-security" data-i18n="installer.assurance.details">Security and verification</a>
+              </p>
+            </section>
+
+            <section
+              class="platform-panel platform-unavailable-panel"
+              id="platform-panel-windows"
+              role="tabpanel"
+              aria-labelledby="platform-tab-windows"
+              data-platform-panel="windows"
+              tabindex="0"
+              hidden
+            >
+              <p class="platform-availability" data-i18n="installer.availability.notYetAvailable">Not yet available</p>
+              <h2 data-i18n="installer.windows.unavailableTitle">Windows is not yet available</h2>
+              <p data-i18n="installer.windows.unavailableCopy">There is no published Windows build yet.</p>
+              <a href="https://github.com/adamallcock/tibotattle/issues/3" data-i18n="installer.windows.trackSupport">Track Windows support</a>
+            </section>
+
+            <section
+              class="platform-panel platform-unavailable-panel"
+              id="platform-panel-linux"
+              role="tabpanel"
+              aria-labelledby="platform-tab-linux"
+              data-platform-panel="linux"
+              tabindex="0"
+              hidden
+            >
+              <p class="platform-availability" data-i18n="installer.availability.notYetAvailable">Not yet available</p>
+              <h2 data-i18n="installer.linux.unavailableTitle">Linux is not yet available</h2>
+              <p data-i18n="installer.linux.unavailableCopy">There is no published Linux build yet.</p>
+              <a href="https://github.com/adamallcock/tibotattle/issues/4" data-i18n="installer.linux.trackSupport">Track Linux support</a>
+            </section>
+          </div>
 
           <a class="community-inline" href="#community">
             <span class="community-dot" aria-hidden="true"></span>
@@ -314,7 +401,7 @@
       >
         <article>
           <span class="feature-step" aria-hidden="true">1</span>
-          <h2>Install the Mac app</h2>
+          <h2 data-i18n="installer.installDesktop">Install the desktop app</h2>
           <p>Open TiboTattle and let it calculate your Codex usage locally.</p>
         </article>
         <article>
