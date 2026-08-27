@@ -349,6 +349,24 @@ const WINDOWS_FILESYSTEM_DEVELOPMENT_ENV =
 const WINDOWS_ELECTRON_QUALIFICATION_ENV =
   "USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION";
 const WINDOWS_ELECTRON_QUALIFICATION_MARKER = "windows-electron-v1";
+export const MACOS_ELECTRON_LOCAL_QA_TEST_LANE =
+  "macos-electron-local-qa-v1";
+
+export function macosElectronLocalQaEnabled({
+  environment = process.env,
+  platform = process.platform,
+} = {}) {
+  return platform === "darwin"
+    && environment?.USAGE_MONITOR_TEST_LANE
+      === MACOS_ELECTRON_LOCAL_QA_TEST_LANE;
+}
+
+export function macosElectronLocalQaAccountObservationSelection() {
+  return Object.freeze({
+    mode: "macos_electron_local_qa",
+    loadAccountObservationSecret: null,
+  });
+}
 // Fixed journey names. Anything else is refused, so no free-form label can
 // ever be written to the log.
 const DIAGNOSTIC_SURFACES = new Set([
@@ -3669,6 +3687,7 @@ export function createLocalCompanionServer(options = {}) {
       || Array.isArray(environment)) {
     throw new TypeError("environment must be an object");
   }
+  const macosLocalQa = macosElectronLocalQaEnabled({ environment });
   const parentWatchdogPid = configuredParentWatchdogPid(environment);
   const homeDirectory = configuredHomeDirectory(environment);
   // A malformed provider path must not make the ordinary disabled companion
@@ -3781,10 +3800,9 @@ export function createLocalCompanionServer(options = {}) {
       windowsQualificationResourceRoot: installation.resourceRoot,
     },
   );
-  const legacyContributionDeviceStateCandidate = Object.hasOwn(
-    options,
-    "legacyContributionDeviceStateFile",
-  )
+  const legacyContributionDeviceStateCandidate = macosLocalQa
+    ? null
+    : Object.hasOwn(options, "legacyContributionDeviceStateFile")
     ? options.legacyContributionDeviceStateFile
     : process.platform === "darwin"
         && !Object.hasOwn(options, "contributionDeviceBackendFactory")
@@ -3872,6 +3890,10 @@ export function createLocalCompanionServer(options = {}) {
     legacyContributionDeviceStateFile,
     preparedContributionDirectory,
     contributionPreparationOptions: selectedPreparationOptions,
+    macosLocalQa,
+    ...(macosLocalQa
+      ? { centralOrigin: null, contributionServiceOrigin: null }
+      : {}),
     windowsFilesystemAdapter,
     windowsQualificationModeContext,
     windowsProtectedStateStore: windowsStateComposition.protectedStateStore,
@@ -3927,6 +3949,7 @@ export function createPreparedLocalCompanionServer({
   windowsMetadataExportContext = null,
   windowsMetadataBundleVerificationContext = null,
   parentWatchdogPid,
+  macosLocalQa,
   // Explicit reversible authority switch. Unified is the normal authority;
   // legacy is retained only for an explicit rollback selection.
   accountingSourceMode =
@@ -3971,6 +3994,7 @@ export function createPreparedLocalCompanionServer({
   claudeShadowControllerFactory = createClaudeDesktopShadowController,
   claudeShadowController,
   refreshRunner,
+  refreshRunnerFactory = createLocalCollectorRefreshRunner,
   onboardingProvider = null,
   refreshTimeoutMs = defaultLocalCompanionRefreshTimeoutMs(),
   centralOrigin = environment.USAGE_MONITOR_CENTRAL_ORIGIN ?? null,
@@ -4047,6 +4071,21 @@ export function createPreparedLocalCompanionServer({
   if (!environment || typeof environment !== "object"
       || Array.isArray(environment)) {
     throw new TypeError("environment must be an object");
+  }
+  const selectedMacosLocalQa = macosElectronLocalQaEnabled({ environment });
+  if (macosLocalQa !== undefined && macosLocalQa !== selectedMacosLocalQa) {
+    throw new TypeError("macosLocalQa must match the exact environment lane");
+  }
+  if (selectedMacosLocalQa
+      && (centralOrigin !== null
+        || contributionServiceOrigin !== null
+        || legacyContributionDeviceStateFile !== null)) {
+    throw new TypeError(
+      "macOS Electron local QA requires disabled external and legacy services",
+    );
+  }
+  if (typeof refreshRunnerFactory !== "function") {
+    throw new TypeError("refreshRunnerFactory must be a function");
   }
   if (codexHomes === null || codexHomes === undefined) {
     if (typeof codexHome !== "string" || codexHome.length < 1) {
@@ -4289,13 +4328,19 @@ export function createPreparedLocalCompanionServer({
     });
   }
   if (refreshRunner === undefined) {
-    refreshRunner = createLocalCollectorRefreshRunner({
+    refreshRunner = refreshRunnerFactory({
       ...(codexHomes.length > 1
         ? { codexHomes, primaryCodexHome }
         : { codexHome }),
       stateFile: statePaths.collectorStateFile,
       accountObservationOperationLockFile:
         statePaths.accountObservationLockFile,
+      ...(selectedMacosLocalQa
+        ? {
+          selectAccountObservationSecret:
+            macosElectronLocalQaAccountObservationSelection,
+        }
+        : {}),
       windowsFilesystemAdapter,
       windowsProtectedStateStore,
       windowsSqliteStateSessionFactory,
@@ -5371,6 +5416,13 @@ export function createPreparedLocalCompanionServer({
       const acceptsQueryString = path === "/api/local/timeline/window-breakdown";
       if (url.hash !== "" || (url.search !== "" && !acceptsQueryString)) {
         sendError(response, 400, "invalid_request");
+        return;
+      }
+      if (selectedMacosLocalQa
+          && request.method !== "GET"
+          && (path.startsWith("/api/local/contribution/")
+            || path.startsWith("/api/local/identity/"))) {
+        sendError(response, 403, "macos_local_qa_mutation_forbidden");
         return;
       }
       if (centralProxy.handles(path)) {

@@ -68,6 +68,9 @@ import {
   loadCompanionWindowsFilesystemAdapter,
   LOCAL_COMPANION_ELECTRON_REFRESH_TIMEOUT_MS,
   LOCAL_COMPANION_NODE_REFRESH_TIMEOUT_MS,
+  MACOS_ELECTRON_LOCAL_QA_TEST_LANE,
+  macosElectronLocalQaAccountObservationSelection,
+  macosElectronLocalQaEnabled,
   resolveClaudeDesktopShadowConfiguration,
   startLocalCompanionServer,
 } from "./server.js";
@@ -93,6 +96,56 @@ const DEVELOPMENT_COVERAGE = Object.freeze({
 });
 const REVIEW_JOB_ID = "11111111-1111-4111-8111-111111111111";
 const REVIEW_SHA256 = "a".repeat(64);
+
+test("macOS Electron local QA selection is exact and Keychain-free", () => {
+  assert.equal(macosElectronLocalQaEnabled({
+    environment: { USAGE_MONITOR_TEST_LANE: MACOS_ELECTRON_LOCAL_QA_TEST_LANE },
+    platform: "darwin",
+  }), true);
+  assert.equal(macosElectronLocalQaEnabled({
+    environment: { USAGE_MONITOR_TEST_LANE: MACOS_ELECTRON_LOCAL_QA_TEST_LANE },
+    platform: "linux",
+  }), false);
+  assert.equal(macosElectronLocalQaEnabled({
+    environment: { USAGE_MONITOR_TEST_LANE: "windows-electron-smoke" },
+    platform: "darwin",
+  }), false);
+  assert.deepEqual(macosElectronLocalQaAccountObservationSelection(), {
+    mode: "macos_electron_local_qa",
+    loadAccountObservationSecret: null,
+  });
+  assert.throws(
+    () => createPreparedLocalCompanionServer({
+      environment: {
+        USAGE_MONITOR_TEST_LANE: MACOS_ELECTRON_LOCAL_QA_TEST_LANE,
+      },
+      macosLocalQa: false,
+    }),
+    /must match the exact environment lane/u,
+  );
+  assert.throws(
+    () => createPreparedLocalCompanionServer({
+      environment: {},
+      macosLocalQa: true,
+    }),
+    /must match the exact environment lane/u,
+  );
+  for (const override of [
+    { centralOrigin: "https://central.example" },
+    { contributionServiceOrigin: "https://contribution.example" },
+    { legacyContributionDeviceStateFile: "/tmp/legacy-binding.json" },
+  ]) {
+    assert.throws(
+      () => createPreparedLocalCompanionServer({
+        environment: {
+          USAGE_MONITOR_TEST_LANE: MACOS_ELECTRON_LOCAL_QA_TEST_LANE,
+        },
+        ...override,
+      }),
+      /requires disabled external and legacy services/u,
+    );
+  }
+});
 
 test("Electron companions receive a bounded cold-index refresh window", () => {
   assert.equal(
@@ -509,6 +562,82 @@ async function fixture() {
   );
   return { root, resourceRoot, stateRoot, codexHome, staticRoot };
 }
+
+test("macOS Electron local QA disables credential and contribution boundaries", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("macOS-only companion composition");
+    return;
+  }
+  const files = await fixture();
+  const environment = {
+    HOME: files.root,
+    CODEX_HOME: files.codexHome,
+    USAGE_MONITOR_STATE_ROOT: files.stateRoot,
+    USAGE_MONITOR_TEST_LANE: MACOS_ELECTRON_LOCAL_QA_TEST_LANE,
+  };
+  let app = null;
+  let refreshOptions = null;
+  let networkCalls = 0;
+  try {
+    app = await startLocalCompanionServer({
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      dataStore: fakeStore(),
+      refreshRunnerFactory: (options) => {
+        refreshOptions = options;
+        return async () => ({});
+      },
+      centralOrigin: "https://central.example",
+      contributionServiceOrigin: "https://contribution.example",
+      centralFetch: async () => {
+        networkCalls += 1;
+        throw new Error("network must remain disabled");
+      },
+      legacyContributionDeviceStateFile: "relative-path-must-be-ignored",
+      environment,
+      port: 0,
+    });
+    assert.equal(typeof refreshOptions?.selectAccountObservationSecret, "function");
+    assert.deepEqual(refreshOptions.selectAccountObservationSecret(), {
+      mode: "macos_electron_local_qa",
+      loadAccountObservationSecret: null,
+    });
+    const origin = `http://127.0.0.1:${app.port}`;
+    const health = await fetch(`${origin}/api/local/health`).then(
+      (response) => response.json(),
+    );
+    assert.equal(health.capabilities.centralServiceProxy, false);
+    assert.equal(health.capabilities.centralParticipantRelay, false);
+    assert.equal(health.capabilities.contributionDevicePairing, false);
+    assert.equal(health.capabilities.incrementalContributionSync, false);
+    assert.equal(networkCalls, 0);
+
+    for (const path of [
+      "/api/local/contribution/prepare",
+      "/api/local/identity/reset",
+    ]) {
+      const response = await fetch(`${origin}${path}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: origin,
+          "X-Usage-Monitor-Local": "1",
+        },
+        body: "{}",
+      });
+      assert.equal(response.status, 403);
+      assert.equal(
+        (await response.json()).error.code,
+        "macos_local_qa_mutation_forbidden",
+      );
+    }
+  } finally {
+    await app?.close();
+    await rm(files.root, { recursive: true });
+  }
+});
 
 test("production authority defaults unified and keeps legacy as explicit rollback", () => {
   assert.equal(configuredAccountingSourceMode({}), "unified");
