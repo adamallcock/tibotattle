@@ -908,11 +908,16 @@ test("the installer checksum action copies only a complete SHA-256 digest", asyn
   );
 });
 
-test("the public hero keeps equal columns and a bounded stacked preview", async () => {
+test("the public hero keeps equal top-aligned columns and a bounded stacked preview", async () => {
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
   assert.match(
     styles,
     /grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/u,
+  );
+  assert.match(
+    styles,
+    /\.community-site \.product-hero \{[\s\S]*?align-items: start;/u,
+    "OS panel height changes must not vertically recenter the community graph",
   );
   assert.match(styles, /@media \(max-width: 1120px\)/u);
   assert.match(styles, /width: min\(100%, 620px\);/u);
