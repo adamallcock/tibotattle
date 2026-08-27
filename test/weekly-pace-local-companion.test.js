@@ -11,6 +11,7 @@ import {
 } from "../src/local-collector-state.js";
 import {
   projectWeeklyPaceForecast,
+  projectWeeklyPaceOutlook,
   weeklyPaceSnapshotsFromCollectorRecord,
 } from "../src/weekly-pace-projection.js";
 import {
@@ -112,9 +113,42 @@ test("local companion sends a private account-scoped pace ETA as a safe public p
       hoursToExhaustion: 1.75,
       hoursToReset: 167.5,
     });
+    assert.deepEqual(snapshot.weekly.paceOutlook, {
+      schemaVersion: "local-weekly-pace-outlook-v0.1",
+      status: "available",
+      standing: "over",
+      critical: true,
+      earlyEstimate: true,
+      remainingPercent: 70,
+      resetsAt: "2026-08-10T12:00:00.000Z",
+      observationCount: 2,
+      elapsedHours: 0.25,
+      rates: {
+        activePercentagePointsPerHour: 40,
+        overallPercentagePointsPerHour: 40,
+        headlinePercentagePointsPerHour: 40,
+        sustainablePercentagePointsPerHour: 0.417910447761194,
+        ratio: 95.71428571428572,
+      },
+      projection: {
+        hoursToReset: 167.5,
+        coveredHours: 1.75,
+        dryHours: 165.75,
+        sparePercent: 0,
+        projectedExhaustionAt: "2026-08-03T14:15:00.000Z",
+      },
+      track: {
+        coveredFraction: 0.010447761194029851,
+        activeExhaustionFraction: null,
+      },
+    });
     const serialized = JSON.stringify(snapshot);
     assert.equal(serialized.includes(accountScope("A").scopeId), false);
     assert.equal(serialized.includes("accountScope"), false);
+    assert.doesNotMatch(
+      JSON.stringify(snapshot.weekly.paceOutlook),
+      /account|scope|path|credit|redeem|token|provider/iu,
+    );
   } finally {
     await rm(root, { recursive: true });
   }
@@ -184,6 +218,35 @@ test("local companion retains one safe observation as a non-predictive waiting s
       hoursToExhaustion: null,
       hoursToReset: 167.75,
     });
+    assert.deepEqual(snapshot.weekly.paceOutlook, {
+      schemaVersion: "local-weekly-pace-outlook-v0.1",
+      status: "collecting",
+      standing: null,
+      critical: false,
+      earlyEstimate: false,
+      remainingPercent: 80,
+      resetsAt: "2026-08-10T12:00:00.000Z",
+      observationCount: 1,
+      elapsedHours: 0,
+      rates: {
+        activePercentagePointsPerHour: null,
+        overallPercentagePointsPerHour: null,
+        headlinePercentagePointsPerHour: null,
+        sustainablePercentagePointsPerHour: null,
+        ratio: null,
+      },
+      projection: {
+        hoursToReset: 167.5,
+        coveredHours: null,
+        dryHours: null,
+        sparePercent: null,
+        projectedExhaustionAt: null,
+      },
+      track: {
+        coveredFraction: null,
+        activeExhaustionFraction: null,
+      },
+    });
   } finally {
     await rm(root, { recursive: true });
   }
@@ -216,6 +279,7 @@ test("the projection the companion publishes survives the browser boundary", () 
     observations: snapshots,
     nowMs: NOW,
   });
+  const outlook = projectWeeklyPaceOutlook({ forecast, nowMs: NOW });
 
   // Dense polling with one moving interval: the two rates must be far apart,
   // or this fixture is not exercising the thing it exists to protect.
@@ -223,7 +287,8 @@ test("the projection the companion publishes survives the browser boundary", () 
   assert.equal(forecast.pace.overallPercentagePointsPerHour, 0.25);
 
   const normalized = normalizeDashboardPayload({
-    weekly: { paceForecast: forecast },
+    weekly: { paceForecast: forecast, paceOutlook: outlook },
   });
   assert.deepEqual(normalized.weekly.paceForecast, forecast);
+  assert.deepEqual(normalized.weekly.paceOutlook, outlook);
 });

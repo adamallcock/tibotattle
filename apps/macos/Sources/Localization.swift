@@ -269,6 +269,23 @@ enum TiboTattleLocalization {
         case menuBarPopupPositionAbove = "menuBarPopup.positionAbove"
         case menuBarPopupPositionSummary = "menuBarPopup.positionSummary"
         case menuBarPopupPositionDisclaimer = "menuBarPopup.positionDisclaimer"
+        case menuBarPopupWeeklyPace = "menuBarPopup.weeklyPace"
+        case menuBarPopupPaceCollecting = "menuBarPopup.paceCollecting"
+        case menuBarPopupPaceUnder = "menuBarPopup.paceUnder"
+        case menuBarPopupPaceOn = "menuBarPopup.paceOn"
+        case menuBarPopupPaceOver = "menuBarPopup.paceOver"
+        case menuBarPopupPaceCritical = "menuBarPopup.paceCritical"
+        case menuBarPopupPaceCollectingDetail = "menuBarPopup.paceCollectingDetail"
+        case menuBarPopupPaceRatioOutcome = "menuBarPopup.paceRatioOutcome"
+        case menuBarPopupPaceDryBeforeReset = "menuBarPopup.paceDryBeforeReset"
+        case menuBarPopupPaceSpareAtReset = "menuBarPopup.paceSpareAtReset"
+        case menuBarPopupPaceReachesReset = "menuBarPopup.paceReachesReset"
+        case menuBarPopupPaceNow = "menuBarPopup.paceNow"
+        case menuBarPopupPaceResetIn = "menuBarPopup.paceResetIn"
+        case menuBarPopupPaceEvidenceOne = "menuBarPopup.paceEvidenceOne"
+        case menuBarPopupPaceEvidenceMany = "menuBarPopup.paceEvidenceMany"
+        case menuBarPopupPaceEarlyEstimate = "menuBarPopup.paceEarlyEstimate"
+        case menuBarPopupPaceActiveMarker = "menuBarPopup.paceActiveMarker"
         case menuBarPopupLocalUsage = "menuBarPopup.localUsage"
         case menuBarPopupPeriodLastSevenDays = "menuBarPopup.periodLastSevenDays"
         case menuBarPopupPeriodLastThirtyDays = "menuBarPopup.periodLastThirtyDays"
@@ -831,6 +848,40 @@ enum TiboTattleLocalization {
                 "%@ used · %@ of the window elapsed"
             case .menuBarPopupPositionDisclaimer:
                 "Compares use with time elapsed · not a forecast"
+            case .menuBarPopupWeeklyPace:
+                "Weekly pace"
+            case .menuBarPopupPaceCollecting:
+                "Collecting pace"
+            case .menuBarPopupPaceUnder:
+                "Under sustainable pace"
+            case .menuBarPopupPaceOn:
+                "Near sustainable pace"
+            case .menuBarPopupPaceOver:
+                "Over sustainable pace"
+            case .menuBarPopupPaceCritical:
+                "Well over sustainable pace"
+            case .menuBarPopupPaceCollectingDetail:
+                "One compatible local observation; a trend needs another."
+            case .menuBarPopupPaceRatioOutcome:
+                "%@× sustainable · %@"
+            case .menuBarPopupPaceDryBeforeReset:
+                "about %@ before reset with none left"
+            case .menuBarPopupPaceSpareAtReset:
+                "about %@ left at reset"
+            case .menuBarPopupPaceReachesReset:
+                "projected to reach reset"
+            case .menuBarPopupPaceNow:
+                "Now"
+            case .menuBarPopupPaceResetIn:
+                "Reset in %@"
+            case .menuBarPopupPaceEvidenceOne:
+                "1 compatible local observation · waiting for another"
+            case .menuBarPopupPaceEvidenceMany:
+                "%@ compatible local observations · estimate can change"
+            case .menuBarPopupPaceEarlyEstimate:
+                "Early estimate · %@"
+            case .menuBarPopupPaceActiveMarker:
+                "%@ · marker shows recent active-use pace"
             case .menuBarPopupLocalUsage:
                 "Local usage"
             case .menuBarPopupPeriodLastSevenDays:

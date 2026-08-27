@@ -9,7 +9,8 @@ struct MenuBarPopoverPresentationContract: Equatable {
     let contentHeight: CGFloat
     let containsScrollView: Bool
     let visibleAllowanceLaneCount: Int
-    let weeklyPositionVisible: Bool
+    let weeklyPaceVisible: Bool
+    let weeklyPaceState: MenuBarPopoverPaceState?
     let selectedHistoryRange: MenuBarHistoryRange
     let dailyBarCount: Int
     let historyVisible: Bool
@@ -47,19 +48,25 @@ private enum MenuBarPopoverHistoryState {
     case available
 }
 
-private enum MenuBarPopoverPositionState {
-    case below
+enum MenuBarPopoverPaceState: Equatable {
+    case collecting
+    case under
     case on
-    case above
+    case over
+    case critical
 
     var color: NSColor {
         switch self {
-        case .below:
+        case .collecting:
+            return .secondaryLabelColor
+        case .under:
             return .systemGreen
         case .on:
             return NativeBrandPalette.accent
-        case .above:
+        case .over:
             return .systemOrange
+        case .critical:
+            return .systemRed
         }
     }
 }
@@ -175,146 +182,294 @@ private final class MenuBarAllowanceTrackView: NSView {
     }
 }
 
-/// Two rows on one 0...100 scale: elapsed window share and observed allowance
-/// use. This is intentionally a position comparison, not a projection.
-private final class MenuBarWeeklyPositionView: NSView {
-    private var elapsedPercent = 0
-    private var usedPercent = 0
-    private var elapsedLabel = ""
-    private var usedLabel = ""
-    private var stateLabel = ""
-    private var disclaimer = ""
-    private var state: MenuBarPopoverPositionState = .on
+/// A time-to-reset track whose standing and geometry come entirely from the
+/// companion's shared weekly projection. Native code adds wording and draws
+/// the supplied fractions; it never reclassifies pace from raw observations.
+private final class MenuBarWeeklyPaceView: NSView {
+    private final class TrackView: NSView {
+        var state: MenuBarPopoverPaceState = .collecting
+        var coveredFraction: CGFloat?
+        var activeFraction: CGFloat?
+
+        override var intrinsicContentSize: NSSize {
+            NSSize(width: NSView.noIntrinsicMetric, height: 10)
+        }
+
+        override func draw(_ dirtyRect: NSRect) {
+            super.draw(dirtyRect)
+            let track = NSRect(
+                x: 0,
+                y: max(0, (bounds.height - 8) / 2),
+                width: bounds.width,
+                height: 8
+            )
+            NSColor.quaternaryLabelColor.setFill()
+            NSBezierPath(roundedRect: track, xRadius: 4, yRadius: 4).fill()
+
+            if let coveredFraction {
+                let width = coveredFraction > 0
+                    ? max(2, track.width * coveredFraction)
+                    : 0
+                if width > 0 {
+                    state.color.setFill()
+                    NSBezierPath(
+                        roundedRect: NSRect(
+                            x: track.minX,
+                            y: track.minY,
+                            width: width,
+                            height: track.height
+                        ),
+                        xRadius: 4,
+                        yRadius: 4
+                    ).fill()
+                }
+            } else {
+                state.color.withAlphaComponent(0.28).setFill()
+                for index in 0..<8 {
+                    let dot = NSRect(
+                        x: track.minX + CGFloat(index) * track.width / 8,
+                        y: track.midY - 1,
+                        width: 2,
+                        height: 2
+                    )
+                    NSBezierPath(ovalIn: dot).fill()
+                }
+            }
+
+            if let activeFraction {
+                let x = track.minX + track.width * activeFraction
+                let marker = NSBezierPath()
+                marker.move(to: NSPoint(x: x, y: track.minY - 1))
+                marker.line(to: NSPoint(x: x, y: track.maxY + 1))
+                NSColor.labelColor.setStroke()
+                marker.lineWidth = 1.5
+                marker.stroke()
+            }
+
+            NSColor.secondaryLabelColor.setStroke()
+            let resetMarker = NSBezierPath()
+            resetMarker.move(to: NSPoint(x: track.maxX, y: track.minY - 1))
+            resetMarker.line(to: NSPoint(x: track.maxX, y: track.maxY + 1))
+            resetMarker.lineWidth = 1
+            resetMarker.stroke()
+        }
+    }
+
+    private let stateLabel = NSTextField(labelWithString: "")
+    private let detailLabel = NSTextField(wrappingLabelWithString: "")
+    private let trackView = TrackView()
+    private let nowLabel = NSTextField(labelWithString: "")
+    private let resetLabel = NSTextField(labelWithString: "")
+    private let evidenceLabel = NSTextField(wrappingLabelWithString: "")
+    private(set) var presentationState: MenuBarPopoverPaceState?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
+
+        stateLabel.font = .systemFont(ofSize: 11.5, weight: .semibold)
+        detailLabel.font = .systemFont(ofSize: 10.5, weight: .regular)
+        detailLabel.textColor = .secondaryLabelColor
+        detailLabel.maximumNumberOfLines = 2
+        nowLabel.font = .systemFont(ofSize: 9.5, weight: .medium)
+        nowLabel.textColor = .secondaryLabelColor
+        resetLabel.font = .systemFont(ofSize: 9.5, weight: .medium)
+        resetLabel.textColor = .secondaryLabelColor
+        resetLabel.alignment = .right
+        evidenceLabel.font = .systemFont(ofSize: 9.5, weight: .regular)
+        evidenceLabel.textColor = .tertiaryLabelColor
+        evidenceLabel.maximumNumberOfLines = 2
+
+        let endpointLabels = NSStackView(views: [nowLabel, resetLabel])
+        endpointLabels.translatesAutoresizingMaskIntoConstraints = false
+        endpointLabels.orientation = .horizontal
+        endpointLabels.alignment = .firstBaseline
+        endpointLabels.distribution = .fillEqually
+        let content = NSStackView(
+            views: [
+                stateLabel,
+                detailLabel,
+                trackView,
+                endpointLabels,
+                evidenceLabel,
+            ]
+        )
+        content.translatesAutoresizingMaskIntoConstraints = false
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 3
+        addSubview(content)
+        for child in [
+            stateLabel,
+            detailLabel,
+            trackView,
+            endpointLabels,
+            evidenceLabel,
+        ] {
+            child.widthAnchor.constraint(equalTo: content.widthAnchor)
+                .isActive = true
+        }
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: trailingAnchor),
+            content.topAnchor.constraint(equalTo: topAnchor),
+            content.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
         setAccessibilityElement(true)
         setAccessibilityRole(.group)
-        heightAnchor.constraint(equalToConstant: 77).isActive = true
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { nil }
 
     func configure(
-        position: WeeklyWindowPosition,
-        state: MenuBarPopoverPositionState,
-        stateLabel: String,
-        disclaimer: String
+        outlook: MenuBarWeeklyPaceOutlook,
+        now: Date
     ) {
-        elapsedPercent = min(100, max(0, position.elapsedPercent))
-        usedPercent = min(100, max(0, position.usedPercent))
-        elapsedLabel = TiboTattleLocalization.string(.menuBarPopupPositionElapsed)
-        usedLabel = TiboTattleLocalization.string(.menuBarPopupPositionUsed)
-        self.state = state
-        self.stateLabel = stateLabel
-        self.disclaimer = disclaimer
-        let positionSummary = TiboTattleLocalization.format(
-            .menuBarPopupPositionSummary,
-            TiboTattleLocalization.percentString(usedPercent),
-            TiboTattleLocalization.percentString(elapsedPercent)
+        let state: MenuBarPopoverPaceState
+        if outlook.status == .collecting {
+            state = .collecting
+        } else {
+            switch outlook.standing {
+            case .under:
+                state = .under
+            case .on:
+                state = .on
+            case .over:
+                state = outlook.critical ? .critical : .over
+            case .none:
+                state = .collecting
+            }
+        }
+        presentationState = state
+        stateLabel.stringValue = stateTitle(state)
+        stateLabel.textColor = state.color
+        detailLabel.stringValue = detail(outlook, state: state)
+        nowLabel.stringValue = TiboTattleLocalization.string(
+            .menuBarPopupPaceNow
         )
-        let summary = TiboTattleLocalization.format(
-            .menuBarPopupUsageSummary,
-            stateLabel,
-            positionSummary
+        let reset = resetCountdown(outlook.resetsAt, now: now)
+            ?? TiboTattleLocalization.string(.menuBarPopupResetUnavailable)
+        resetLabel.stringValue = TiboTattleLocalization.format(
+            .menuBarPopupPaceResetIn,
+            reset
         )
-        toolTip = "\(summary) \(disclaimer)"
+        evidenceLabel.stringValue = evidence(outlook)
+        trackView.state = state
+        trackView.coveredFraction = outlook.track.coveredFraction.map {
+            CGFloat(min(1, max(0, $0)))
+        }
+        trackView.activeFraction = outlook.track.activeExhaustionFraction.map {
+            CGFloat(min(1, max(0, $0)))
+        }
+        trackView.needsDisplay = true
+
+        let summary = "\(stateLabel.stringValue). \(detailLabel.stringValue)"
+        toolTip = "\(summary) \(evidenceLabel.stringValue)"
         setAccessibilityLabel(
-            TiboTattleLocalization.string(.menuBarPopupWeeklyPosition)
+            TiboTattleLocalization.string(.menuBarPopupWeeklyPace)
         )
         setAccessibilityValue(summary)
-        setAccessibilityHelp(disclaimer)
-        needsDisplay = true
+        setAccessibilityHelp(evidenceLabel.stringValue)
     }
 
-    override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        let labelAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 10.5, weight: .medium),
-            .foregroundColor: NSColor.secondaryLabelColor,
-        ]
-        let valueAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .medium),
-            .foregroundColor: NSColor.labelColor,
-        ]
-        let stateAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
-            .foregroundColor: state.color,
-        ]
-        let disclaimerAttributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 9.5, weight: .regular),
-            .foregroundColor: NSColor.tertiaryLabelColor,
-        ]
+    private func stateTitle(_ state: MenuBarPopoverPaceState) -> String {
+        switch state {
+        case .collecting:
+            TiboTattleLocalization.string(.menuBarPopupPaceCollecting)
+        case .under:
+            TiboTattleLocalization.string(.menuBarPopupPaceUnder)
+        case .on:
+            TiboTattleLocalization.string(.menuBarPopupPaceOn)
+        case .over:
+            TiboTattleLocalization.string(.menuBarPopupPaceOver)
+        case .critical:
+            TiboTattleLocalization.string(.menuBarPopupPaceCritical)
+        }
+    }
 
-        stateLabel.draw(
-            at: NSPoint(x: 0, y: bounds.maxY - 15),
-            withAttributes: stateAttributes
-        )
-        disclaimer.draw(
-            at: NSPoint(x: 0, y: 1),
-            withAttributes: disclaimerAttributes
-        )
-
-        drawTrack(
-            y: 43,
-            label: elapsedLabel,
-            percent: elapsedPercent,
-            fill: .secondaryLabelColor,
-            labelAttributes: labelAttributes,
-            valueAttributes: valueAttributes
-        )
-        drawTrack(
-            y: 22,
-            label: usedLabel,
-            percent: usedPercent,
-            fill: state.color,
-            labelAttributes: labelAttributes,
-            valueAttributes: valueAttributes
+    private func detail(
+        _ outlook: MenuBarWeeklyPaceOutlook,
+        state: MenuBarPopoverPaceState
+    ) -> String {
+        guard state != .collecting,
+              let ratio = outlook.rates.ratio
+        else {
+            return TiboTattleLocalization.string(
+                .menuBarPopupPaceCollectingDetail
+            )
+        }
+        let ratioText = TiboTattleLocalization.decimalNumberFormatter(
+            maximumFractionDigits: 2
+        ).string(from: NSNumber(value: ratio)) ?? String(format: "%.2f", ratio)
+        let outcome: String
+        if let dryHours = outlook.projection.dryHours, dryHours > 0.01 {
+            outcome = TiboTattleLocalization.format(
+                .menuBarPopupPaceDryBeforeReset,
+                duration(hours: dryHours)
+            )
+        } else if let spare = outlook.projection.sparePercent, spare > 0.05 {
+            outcome = TiboTattleLocalization.format(
+                .menuBarPopupPaceSpareAtReset,
+                TiboTattleLocalization.percentString(Int(spare.rounded()))
+            )
+        } else {
+            outcome = TiboTattleLocalization.string(
+                .menuBarPopupPaceReachesReset
+            )
+        }
+        return TiboTattleLocalization.format(
+            .menuBarPopupPaceRatioOutcome,
+            ratioText,
+            outcome
         )
     }
 
-    private func drawTrack(
-        y: CGFloat,
-        label: String,
-        percent: Int,
-        fill: NSColor,
-        labelAttributes: [NSAttributedString.Key: Any],
-        valueAttributes: [NSAttributedString.Key: Any]
-    ) {
-        let labelWidth: CGFloat = 52
-        let valueWidth: CGFloat = 34
-        let gap: CGFloat = 8
-        let track = NSRect(
-            x: labelWidth,
-            y: y,
-            width: max(1, bounds.width - labelWidth - valueWidth - gap),
-            height: 7
+    private func evidence(_ outlook: MenuBarWeeklyPaceOutlook) -> String {
+        if outlook.status == .collecting {
+            return TiboTattleLocalization.string(
+                .menuBarPopupPaceEvidenceOne
+            )
+        }
+        let observations = TiboTattleLocalization.format(
+            .menuBarPopupPaceEvidenceMany,
+            TiboTattleLocalization.integerString(outlook.observationCount)
         )
-        label.draw(at: NSPoint(x: 0, y: y - 3), withAttributes: labelAttributes)
-        let value = TiboTattleLocalization.percentString(percent)
-        let valueSize = value.size(withAttributes: valueAttributes)
-        value.draw(
-            at: NSPoint(x: bounds.maxX - valueSize.width, y: y - 3),
-            withAttributes: valueAttributes
-        )
-        NSColor.quaternaryLabelColor.setFill()
-        NSBezierPath(roundedRect: track, xRadius: 3.5, yRadius: 3.5).fill()
-        let fillWidth = percent > 0 ? max(2, track.width * CGFloat(percent) / 100) : 0
-        guard fillWidth > 0 else { return }
-        fill.setFill()
-        NSBezierPath(
-            roundedRect: NSRect(
-                x: track.minX,
-                y: track.minY,
-                width: fillWidth,
-                height: track.height
-            ),
-            xRadius: 3.5,
-            yRadius: 3.5
-        ).fill()
+        let withEstimate = outlook.earlyEstimate
+            ? TiboTattleLocalization.format(
+                .menuBarPopupPaceEarlyEstimate,
+                observations
+            )
+            : observations
+        return outlook.track.activeExhaustionFraction == nil
+            ? withEstimate
+            : TiboTattleLocalization.format(
+                .menuBarPopupPaceActiveMarker,
+                withEstimate
+            )
+    }
+
+    private func duration(hours: Double) -> String {
+        let totalMinutes = max(1, Int((hours * 60).rounded()))
+        let days = totalMinutes / (24 * 60)
+        let remainingHours = (totalMinutes % (24 * 60)) / 60
+        let minutes = totalMinutes % 60
+        if days > 0 {
+            return TiboTattleLocalization.format(
+                .menuBarResetDaysHours,
+                days,
+                remainingHours
+            )
+        }
+        if remainingHours > 0 {
+            return TiboTattleLocalization.format(
+                .menuBarResetHoursMinutes,
+                remainingHours,
+                minutes
+            )
+        }
+        return TiboTattleLocalization.format(.menuBarResetMinutes, minutes)
     }
 }
 
@@ -542,7 +697,7 @@ final class MenuBarPopoverViewController: NSViewController {
     private let weeklySection = NSStackView()
     private let weeklySeparator = MenuBarPopoverSeparator()
     private let weeklyTitleLabel = NSTextField(labelWithString: "")
-    private let weeklyPositionView = MenuBarWeeklyPositionView()
+    private let weeklyPaceView = MenuBarWeeklyPaceView()
     private let historyTitleLabel = NSTextField(labelWithString: "")
     private let rangeControl = NSSegmentedControl()
     private let historyHeadlineLabel = NSTextField(labelWithString: "")
@@ -659,7 +814,7 @@ final class MenuBarPopoverViewController: NSViewController {
             .nativeDashboardAllowance
         )
         weeklyTitleLabel.stringValue = TiboTattleLocalization.string(
-            .menuBarPopupWeeklyPosition
+            .menuBarPopupWeeklyPace
         )
         historyTitleLabel.stringValue = TiboTattleLocalization.string(
             .menuBarPopupLocalUsage
@@ -706,7 +861,10 @@ final class MenuBarPopoverViewController: NSViewController {
             contentHeight: view.bounds.height,
             containsScrollView: containsScrollView(view),
             visibleAllowanceLaneCount: visibleAllowanceLaneCount,
-            weeklyPositionVisible: !weeklySection.isHidden,
+            weeklyPaceVisible: !weeklySection.isHidden,
+            weeklyPaceState: weeklySection.isHidden
+                ? nil
+                : weeklyPaceView.presentationState,
             selectedHistoryRange: selectedRange,
             dailyBarCount: historyChart.days.count,
             historyVisible: historyState == .available,
@@ -883,8 +1041,8 @@ final class MenuBarPopoverViewController: NSViewController {
         weeklySection.alignment = .leading
         weeklySection.spacing = 7
         weeklySection.addArrangedSubview(weeklyTitleLabel)
-        weeklySection.addArrangedSubview(weeklyPositionView)
-        weeklyPositionView.widthAnchor.constraint(equalTo: weeklySection.widthAnchor)
+        weeklySection.addArrangedSubview(weeklyPaceView)
+        weeklyPaceView.widthAnchor.constraint(equalTo: weeklySection.widthAnchor)
             .isActive = true
         return section
     }
@@ -1080,32 +1238,8 @@ final class MenuBarPopoverViewController: NSViewController {
             allowanceStateStack.setAccessibilityHelp(stateCopy.body)
         }
 
-        let weeklyLane = lanes.first(where: {
-            $0.durationMinutes == CodexQuotaWindowDuration.sevenDayMinutes
-        })
-        if let weeklyLane, let position = weeklyWindowPosition(weeklyLane) {
-            let positionState = weeklyPositionState(position)
-            let stateText: String
-            switch positionState {
-            case .below:
-                stateText = TiboTattleLocalization.string(
-                    .menuBarPopupPositionBelow
-                )
-            case .on:
-                stateText = TiboTattleLocalization.string(.menuBarPopupPositionOn)
-            case .above:
-                stateText = TiboTattleLocalization.string(
-                    .menuBarPopupPositionAbove
-                )
-            }
-            weeklyPositionView.configure(
-                position: position,
-                state: positionState,
-                stateLabel: stateText,
-                disclaimer: TiboTattleLocalization.string(
-                    .menuBarPopupPositionDisclaimer
-                )
-            )
+        if let outlook = snapshot.currentWeeklyPaceOutlook(now: now) {
+            weeklyPaceView.configure(outlook: outlook, now: now)
             weeklySection.isHidden = false
             weeklySeparator.isHidden = false
         } else {
@@ -1285,15 +1419,6 @@ final class MenuBarPopoverViewController: NSViewController {
                 TiboTattleLocalization.string(.menuBarNoVerifiedQuota)
             )
         }
-    }
-
-    private func weeklyPositionState(
-        _ position: WeeklyWindowPosition
-    ) -> MenuBarPopoverPositionState {
-        let difference = position.usedPercent - position.elapsedPercent
-        if difference <= -2 { return .below }
-        if difference >= 2 { return .above }
-        return .on
     }
 
     private func configureFocusOrder() {

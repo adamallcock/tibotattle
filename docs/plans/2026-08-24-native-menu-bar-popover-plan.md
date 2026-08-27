@@ -13,7 +13,8 @@ Replace the left-click status-item menu with a focused native AppKit popover
 that answers three questions from current local evidence:
 
 1. How much of each observed Codex allowance window remains?
-2. Is weekly allowance use above, aligned with, or below elapsed-time share?
+2. Is the observed weekly allowance trend under, near, or over the sustainable
+   pace needed to reach the current reset?
 3. What did locally observed usage look like over the last 7 or 30 calendar
    days?
 
@@ -26,9 +27,12 @@ window remains the full-detail surface.
   controls.
 - No account email, account selector, plan badge, provider account identifier,
   or sign-in credential handling.
-- No new endpoint, persistence, export field, community field, log field, or
-  background process. The popover reads the existing loopback overview through
-  the existing ephemeral no-cookie, no-cache reader.
+- No new persistence, export field, community field, log field, or background
+  process. The popover reads the existing loopback overview plus one narrow
+  read-only `/api/local/weekly-pace-outlook` projection through the existing
+  ephemeral no-cookie, no-cache reader. That route re-projects the retained
+  strict forecast against request time without rerunning accounting or cloning
+  and serializing the full weekly analysis.
 - Ordinary quota-window reset times remain visible only while their own
   observation is current. These are allowance-window facts, not reset credits.
 - Cost is always labelled API-price equivalent and never subscription billing.
@@ -39,16 +43,19 @@ window remains the full-detail surface.
 
 - Left-click toggles one transient `NSPopover`; right-click or Control-click
   opens the existing native `NSMenu`.
-- Fixed 400 pt width, content-driven height, no scroll view. The 640 pt height
-  used by deterministic captures is a fixture size, not a runtime invariant.
+- Fixed 400 pt width, content-driven height, and no scroll view. Deterministic
+  captures measure the rendered content rather than imposing a runtime height.
 - Header: product mark/name, freshness text, and native more-actions button.
 - Allowance: exactly two fresh-only tracks—the five-hour window and the
   seven-day window—with reset times when observed. There is no generic credit,
   balance, or reset-credit row.
-- Weekly position: two same-scale rows for `Elapsed` and `Used`, plus a textual
-  `Below even pace`, `On even pace`, or `Above even pace` classification. This
-  is explicitly a one-observation position comparison, not an exhaustion
-  forecast.
+- Weekly pace: the companion's existing multi-observation forecast produces a
+  closed, privacy-safe outlook with `Under`, `Near`, `Over`, or `Well over
+  sustainable pace`, plus the precomputed portion of time to reset that the
+  allowance should cover. One compatible observation renders `Collecting
+  pace`; native code never invents a trend. A recent-active-use marker appears
+  only when the shared projection says that rate would exhaust materially
+  sooner than the headline trend.
 - Local history: native 7d/30d segmented selector and daily local-calendar
   token bars. The selected period also shows its observed token total, event
   count, and API-price equivalent when pricing coverage supports that claim.
@@ -64,10 +71,16 @@ window remains the full-detail surface.
 - A quota lane is numeric only when it is a normal Codex lane, has valid finite
   complementary percentages, has its own observation and reset timestamp, is
   inside the companion freshness window, and has not reset yet.
-- Weekly position uses the lane's observed timestamp for both elapsed and used
-  markers. Whole-percent classification allows only a one-point rounding band:
-  differences at or below -2 are below, -1 through 1 are aligned, and at or
-  above 2 are above.
+- The weekly pace outlook reuses `quota-pace-forecast-v0.2` through the
+  companion-side `local-weekly-pace-outlook-v0.1` presentation projection.
+  Sustainable-pace standing, critical state, covered/dry hours, spare percent,
+  projected exhaustion, and track geometry are computed once in shared
+  JavaScript and consumed by both web and native surfaces. Swift performs exact
+  schema validation and binds the result to the live weekly lane's reset and
+  remaining percentage; it does not maintain a competing forecast formula.
+  Both overview and forecast selection prefer a present `primary` weekly slot
+  and use `secondary` only as the deterministic fallback, so transitional
+  dual-slot payloads cannot hide an otherwise valid outlook.
 - Accounting periods are the exact rolling `24h`, `7d`, and `30d` rows. The UI
   says `Last 24 hours`, never `Today`.
 - Daily charts aggregate existing 15-minute buckets by local civil day using
@@ -82,7 +95,7 @@ window remains the full-detail surface.
 ## Implementation slices
 
 1. Add pure popup accounting and daily-history projections and fixtures.
-2. Add the AppKit popover view controller and custom allowance, position, and
+2. Add the AppKit popover view controller and custom allowance, pace, and
    chart views.
 3. Route status-item clicks, synchronize the popover with the existing status
    snapshot, and preserve the native right-click menu and shortcuts.
@@ -101,7 +114,9 @@ window remains the full-detail surface.
 - Selector, headline, chart, axis labels, tooltip/accessibility summary, and
   coverage copy update together.
 - Stale/unavailable quota never exposes an old percentage, reset countdown, or
-  weekly-position value.
+  weekly-pace value. An invalid, unavailable, mismatched, expired, or
+  out-of-order pace response hides only that section and cannot blank valid
+  allowance or accounting evidence.
 - Unavailable accounting never appears as `$0.00`, `0 tokens`, or empty bars.
 - No popup source, localized copy, accessibility label, fixture, or screenshot
   contains reset-credit availability/detail/expiry, purchase, or redemption
@@ -112,18 +127,30 @@ window remains the full-detail surface.
   Reduce Transparency remain usable.
 - Semantic routing tests cover left-click popover and right/Control-click menu
   intent. Packaged validation covers native wiring, `Command-R`, Escape,
-  dismissal/focus behavior, polling, freshness expiry, and action ownership;
-  it does not claim operating-system mouse-injection coverage.
+  dismissal/focus behavior, pure freshness/projection boundary decisions, and
+  action ownership. Source contracts cover the sequenced overview/outlook poll
+  and stale-response guards; this does not claim wall-clock scheduler or
+  operating-system mouse-injection coverage.
 
 ## Final validation receipt
 
-- Focused macOS source lane: passed, including all 46 active source tests and
-  six localization tests; three artifact-only tests were intentionally skipped.
-- Compiled menu-bar contract: passed exact-lane, per-lane freshness, malformed
-  input, DST, overlap, coverage, pricing, routing, Escape, and refresh states.
-- Deterministic visual smoke: passed 11 PNGs covering 7d/30d, light/dark,
-  English/Spanish/Simplified Chinese, partial pricing, fully unpriced, and
-  unavailable states.
-- Full macOS lane: 57 passed, 0 failed, 0 cancelled, 0 skipped. The final run
-  used macOS `caffeinate` after two earlier host-suspension clock jumps tripped
-  packaging watchdogs; the same affected paths also passed focused warm runs.
+- Focused macOS source lane: 50 passed and three artifact-only tests skipped;
+  the separate localization command passed all six tests.
+- Reproducible packaged-app test: passed under macOS `caffeinate`, including
+  exact-lane selection, per-lane freshness, malformed input, DST, overlap,
+  coverage, pricing, routing, Escape, projection expiry, and refresh states.
+- Deterministic visual smoke: passed 15 content-driven PNGs covering 7d/30d,
+  light/dark, English/Spanish/Simplified Chinese, collecting/under/on/over/
+  critical pace, partial pricing, fully unpriced, and unavailable states.
+- Current-code compatibility: all 75 unified-index tests, 52 companion/outlook
+  boundary tests, 33 browser/pace tests, and three real child-process tests
+  passed. The process lane includes a restart from an exact populated
+  production-era v9 schema into authoritative v11 without losing its owner,
+  events, or token totals.
+- The repository-wide run reached 3,619 tests (3,543 passed, 60 skipped, 16
+  failed). Its failures were outside this feature: missing optional build
+  dependencies in the isolated worktree, existing localization/source-receipt
+  drift, and sandboxed packaging/loopback constraints. The relevant lanes above
+  were rerun green after the final fixes. A redundant full DMG/updater rerun was
+  stopped after the reproducible packaged-app path passed; this is not a
+  release or publication receipt.

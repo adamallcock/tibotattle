@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
 const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
 const paceSource = appSource.match(
-  /function renderWeeklyPaceForecast[\s\S]*?\n\}\n\nfunction renderWeekly\(data\)/u,
+  /function weeklyPaceOutlookPresentation[\s\S]*?\n\}\n\nfunction renderWeekly\(data\)/u,
 )?.[0] ?? "";
 
 function sliceDeclaration(name) {
@@ -22,10 +22,9 @@ function sliceConstant(name) {
   return source;
 }
 
-// The classification is pure arithmetic over numbers the payload already
-// carries, so it is exercised directly rather than asserted about as text. The
-// slice keeps the test bound to the shipped source: app.js is a boot script
-// with no exports, and a copy of the maths here could drift from it silently.
+// Older companions do not carry the shared paceOutlook DTO. Keep exercising
+// the compatibility classifier directly so that upgrade path cannot drift
+// while all current output moves through the shared projection.
 const pace = new Function(
   "finite",
   "formatDecimal",
@@ -178,6 +177,7 @@ test("too short an observation span falls back to the active rate", () => {
 });
 
 test("weekly pace forecast is an optional, allowance-scoped dashboard surface", () => {
+  assert.match(paceSource, /data\?\.weekly\?\.paceOutlook/u);
   assert.match(paceSource, /data\?\.weekly\?\.paceForecast/u);
   assert.match(paceSource, /weekly-pace-forecast/u);
   assert.match(paceSource, /status === "available"/u);
@@ -199,6 +199,134 @@ test("weekly pace forecast is an optional, allowance-scoped dashboard surface", 
     /forecast\.observationCount[\s\S]*?paceIntervals === null \? null : paceIntervals \+ 1/u,
   );
   assert.doesNotMatch(paceSource, /probability|tokens/iu);
+});
+
+test("current browser output binds the shared outlook without reclassifying it", () => {
+  const outlookSource = sliceDeclaration("weeklyPaceOutlookPresentation");
+  const selectionSource = sliceDeclaration("weeklyPacePresentation");
+  const trackSource = sliceDeclaration("weeklyPaceTrack");
+
+  assert.match(selectionSource, /data\?\.weekly\?\.paceOutlook/u);
+  assert.match(
+    selectionSource,
+    /weeklyPaceOutlookPresentation[\s\S]*?legacyWeeklyPaceForecastPresentation/u,
+  );
+  assert.match(outlookSource, /outlook\.standing/u);
+  assert.match(outlookSource, /outlook\.critical/u);
+  assert.match(outlookSource, /outlook\.rates\?\.ratio/u);
+  assert.match(outlookSource, /outlook\.projection\?\.coveredHours/u);
+  assert.match(outlookSource, /outlook\.projection\?\.dryHours/u);
+  assert.match(outlookSource, /outlook\.projection\?\.sparePercent/u);
+  assert.match(outlookSource, /outlook\.projection\?\.projectedExhaustionAt/u);
+  assert.match(outlookSource, /trackGeometry: outlook\.track/u);
+  assert.doesNotMatch(outlookSource, /weeklyPaceStanding|PACE_ON_TRACK|PACE_CRITICAL/u);
+
+  // Shared geometry decides both marks. The remaining/active division exists
+  // solely on the guarded legacy path.
+  assert.match(trackSource, /hasSharedGeometry[\s\S]*?coveredFraction/u);
+  assert.match(trackSource, /hasSharedGeometry[\s\S]*?activeExhaustionFraction/u);
+  assert.match(
+    trackSource,
+    /const remaining = hasSharedGeometry \? null : finite\(remainingPercent\)/u,
+  );
+  assert.match(
+    trackSource,
+    /const active = hasSharedGeometry \? null : finite\(activePace\)/u,
+  );
+});
+
+test("shared outlook values survive the browser presentation binding unchanged", () => {
+  const bindOutlook = new Function(
+    "forecastTimestamp",
+    "firstFiniteForecastNumber",
+    "PACE_STATE_LABELS",
+    `${sliceDeclaration("weeklyPaceOutlookPresentation")}
+    return weeklyPaceOutlookPresentation;`,
+  )(
+    (value) => typeof value === "string" ? Date.parse(value) : null,
+    (...values) => values.find(
+      (value) => typeof value === "number" && Number.isFinite(value),
+    ) ?? null,
+    { under: "Under pace", on: "On pace", over: "Over pace" },
+  );
+  const track = {
+    coveredFraction: .25,
+    activeExhaustionFraction: .1,
+  };
+  const outlook = {
+    status: "available",
+    standing: "over",
+    critical: true,
+    earlyEstimate: false,
+    remainingPercent: 25,
+    resetsAt: "2026-08-05T12:30:00.000Z",
+    observationCount: 4,
+    elapsedHours: 2,
+    rates: {
+      activePercentagePointsPerHour: 5,
+      overallPercentagePointsPerHour: 2,
+      headlinePercentagePointsPerHour: 2,
+      sustainablePercentagePointsPerHour: .5,
+      ratio: 4,
+    },
+    projection: {
+      hoursToReset: 50,
+      coveredHours: 12.5,
+      dryHours: 37.5,
+      sparePercent: 0,
+      projectedExhaustionAt: "2026-08-04T01:00:00.000Z",
+    },
+    track,
+  };
+  const presentation = bindOutlook(
+    outlook,
+    { status: "available" },
+    Date.parse("2026-08-03T12:30:00.000Z"),
+  );
+  assert.deepEqual(presentation.standing, {
+    state: "over",
+    critical: true,
+    ratio: 4,
+    sustainable: .5,
+    coveredHours: 12.5,
+    dryHours: 37.5,
+    sparePercent: 0,
+  });
+  assert.equal(presentation.paceState, "over");
+  assert.equal(
+    presentation.projectedEtaAt,
+    Date.parse("2026-08-04T01:00:00.000Z"),
+  );
+  assert.strictEqual(presentation.trackGeometry, track);
+
+  let sharedCalls = 0;
+  let legacyCalls = 0;
+  const select = new Function(
+    "weeklyPaceOutlookPresentation",
+    "legacyWeeklyPaceForecastPresentation",
+    `${sliceDeclaration("weeklyPacePresentation")}
+    return weeklyPacePresentation;`,
+  )(
+    () => {
+      sharedCalls += 1;
+      return "shared";
+    },
+    () => {
+      legacyCalls += 1;
+      return "legacy";
+    },
+  );
+  assert.equal(select({ weekly: { paceOutlook: outlook } }, 0), "shared");
+  assert.equal(sharedCalls, 1);
+  assert.equal(legacyCalls, 0);
+  assert.equal(
+    select({ weekly: { paceOutlook: null, paceForecast: {} } }, 0),
+    "shared",
+  );
+  assert.equal(sharedCalls, 2);
+  assert.equal(legacyCalls, 0);
+  assert.equal(select({ weekly: { paceForecast: {} } }, 0), "legacy");
+  assert.equal(legacyCalls, 1);
 });
 
 test("the standing drives the card's class and is also stated in words", () => {

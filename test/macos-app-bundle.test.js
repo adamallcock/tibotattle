@@ -162,6 +162,13 @@ const MENU_BAR_POPUP_MODEL_SOURCE = join(
   "Sources",
   "MenuBarPopupModel.swift",
 );
+const MENU_BAR_PACE_OUTLOOK_SOURCE = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "Sources",
+  "MenuBarPaceOutlook.swift",
+);
 const NATIVE_BRAND_PALETTE_SOURCE = join(
   REPOSITORY_ROOT,
   "apps",
@@ -2495,10 +2502,13 @@ test("dashboard sidebar resizes for real, wears the brand palette, and the title
 });
 
 test("menu-bar status item degrades honestly and never invents allowance evidence", async () => {
-  const [source, popupSource, modelSource] = await Promise.all([
+  const [source, popupSource, modelSource, paceSource, localizationSource, appSource] = await Promise.all([
     readFile(MENU_BAR_STATUS_SOURCE, "utf8"),
     readFile(MENU_BAR_POPOVER_SOURCE, "utf8"),
     readFile(MENU_BAR_POPUP_MODEL_SOURCE, "utf8"),
+    readFile(MENU_BAR_PACE_OUTLOOK_SOURCE, "utf8"),
+    readFile(LOCALIZATION_SOURCE, "utf8"),
+    readFile(SWIFT_SOURCE, "utf8"),
   ]);
   assert.match(source, /import AppKit/u);
   // Variable-length item with the branded app mark, sized for the native
@@ -2771,18 +2781,177 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
     /nextEvidencePresentationBoundary\([\s\S]*?staleAfterSeconds: snapshot\.staleAfterSeconds/u,
   );
 
+  // Weekly pace is one closed, content-free DTO produced by the companion's
+  // canonical projection. Swift accepts only the exact versioned shape and
+  // validates its internal arithmetic before binding it to the current weekly
+  // lane. It never derives a competing forecast from raw allowance values.
+  assert.match(
+    paceSource,
+    /struct MenuBarWeeklyPaceOutlook: Equatable/u,
+  );
+  assert.match(
+    paceSource,
+    /private static let schemaVersion = "local-weekly-pace-outlook-v0\.1"/u,
+  );
+  for (const exactObjectGuard of [
+    /Set\(outlook\.keys\) == topLevelKeys/u,
+    /Set\(rawRates\.keys\) == rateKeys/u,
+    /Set\(rawProjection\.keys\) == projectionKeys/u,
+    /Set\(rawTrack\.keys\) == trackKeys/u,
+  ]) {
+    assert.match(paceSource, exactObjectGuard);
+  }
+  assert.match(
+    paceSource,
+    /CFGetTypeID\(number\) == CFBooleanGetTypeID\(\)/u,
+  );
+  assert.match(
+    paceSource,
+    /CFGetTypeID\(number\) != CFBooleanGetTypeID\(\)/u,
+  );
+  assert.match(
+    paceSource,
+    /formatter\.string\(from: date\) == text/u,
+  );
+  assert.match(
+    paceSource,
+    /approximatelyEqual\(\s*sustainable,\s*remainingPercent \/ hoursToReset\s*\)/u,
+  );
+  assert.match(paceSource, /standingMatchesRatio\(standing, ratio: ratio\)/u);
+  assert.match(
+    paceSource,
+    /critical == \(standing == \.over && ratio >= 2\)/u,
+  );
+  assert.match(
+    paceSource,
+    /func isBound\(to lane: ObservedQuotaLane, now: Date\) -> Bool \{[\s\S]*?lane\.durationMinutes == CodexQuotaWindowDuration\.sevenDayMinutes[\s\S]*?abs\(laneReset\.timeIntervalSince\(resetsAt\)\) < 0\.001[\s\S]*?abs\(lane\.remainingPercent - remainingPercent\) <= 0\.001[\s\S]*?resetsAt > now/u,
+  );
+  assert.match(
+    source,
+    /func currentWeeklyPaceOutlook\([\s\S]*?currentLanes\(now: now\)[\s\S]*?outlook\.isBound\(to: weeklyLane, now: now\)/u,
+  );
+  assert.match(
+    source,
+    /let preferredSlot = slot == "primary"/u,
+  );
+  assert.match(
+    appSource,
+    /dualWeeklySnapshot\.currentWeeklyPaceOutlook\(now: now\) != nil/u,
+  );
+
+  // The extra read shares the existing ephemeral, loopback-only transport. It
+  // begins only after a valid overview supplies the lane to bind against.
+  const weeklyPaceReader = source.match(
+    /func readWeeklyPaceOutlook\([\s\S]*?(?=\n    func readAnalysisActivity\()/u,
+  )?.[0] ?? "";
+  assert.ok(weeklyPaceReader, "weekly pace reader should be present");
+  assert.match(
+    weeklyPaceReader,
+    /path: "\/api\/local\/weekly-pace-outlook"/u,
+  );
+  assert.match(
+    weeklyPaceReader,
+    /maximumBytes: Self\.maximumPaceOutlookResponseBytes/u,
+  );
+  assert.match(
+    weeklyPaceReader,
+    /MenuBarWeeklyPaceOutlookProjection\.decode\(\$0\)/u,
+  );
+  assert.match(source, /URLSessionConfiguration\.ephemeral/u);
+  assert.match(
+    source,
+    /self\.snapshot\.lanes = overview\.lanes[\s\S]*?self\.reader\.readWeeklyPaceOutlook\(base: dashboardURL\)/u,
+  );
+
+  // Opening either native surface can supersede an in-flight cadence poll.
+  // Every callback is generation-, URL-, and sequence-bound, and the next poll
+  // is scheduled only after both activity and overview-plus-outlook legs settle.
+  assert.match(source, /private var pollSequence: UInt64 = 0/u);
+  assert.match(source, /pollSequence &\+= 1\s*\n\s*let sequence = pollSequence/u);
+  assert.ok(
+    (source.match(/self\.pollSequence == sequence/gu) ?? []).length >= 3,
+    "every asynchronous poll leg should reject superseded responses",
+  );
+  const pollCoordinator = source.match(
+    /private func finishPollLeg\([\s\S]*?(?=\n    private func schedulePoll\()/u,
+  )?.[0] ?? "";
+  assert.ok(pollCoordinator, "two-leg poll coordinator should be present");
+  assert.match(pollCoordinator, /pollActivityFinished = true/u);
+  assert.match(pollCoordinator, /pollEvidenceFinished = true/u);
+  assert.match(
+    pollCoordinator,
+    /if pollActivityFinished && pollEvidenceFinished \{\s*schedulePoll\(\)/u,
+  );
+  assert.match(source, /finishPollLeg\(\.activity, sequence: sequence\)/u);
+  const weeklyPaceCompletion = source.match(
+    /self\.reader\.readWeeklyPaceOutlook\(base: dashboardURL\) \{[\s\S]*?self\.finishPollLeg\(\.evidence, sequence: sequence\)\s*\n\s*\}/u,
+  )?.[0] ?? "";
+  assert.ok(weeklyPaceCompletion, "weekly pace completion should be present");
+  assert.match(
+    weeklyPaceCompletion,
+    /else \{\s*self\.snapshot\.weeklyPaceOutlook = nil/u,
+  );
+  assert.doesNotMatch(
+    weeklyPaceCompletion,
+    /invalidateObservedEvidence|snapshot\.lanes =|snapshot\.history =|snapshot\.evidence =|snapshot\.phase =/u,
+    "an optional pace failure must not erase independently valid allowance or history",
+  );
+
+  // Forecast claims expire at reset or, for over-pace states, the earlier
+  // projected exhaustion instant. Freshness and exact-lane binding are checked
+  // again at render time so no cached prediction survives changed evidence.
+  assert.match(
+    paceSource,
+    /var nextPresentationBoundary: Date \{[\s\S]*?standing == \.over[\s\S]*?return min\(resetsAt, exhaustion\)[\s\S]*?return resetsAt/u,
+  );
+  assert.match(
+    source,
+    /let outlookBoundaries = weeklyPaceOutlook\.map \{\s*\[\$0\.nextPresentationBoundary\]/u,
+  );
+  assert.match(
+    source,
+    /if snapshot\.currentWeeklyPaceOutlook\(now: now\) == nil \{\s*snapshot\.weeklyPaceOutlook = nil/u,
+  );
+  assert.match(
+    source,
+    /weeklyPaceOutlook: snapshot\.weeklyPaceOutlook,/u,
+  );
+
   // The rich popup is a real AppKit surface with fixed width, no scroll view,
-  // two native history ranges, and an explicit non-forecast position visual.
+  // two native history ranges, and the companion-projected weekly pace states.
   assert.match(popupSource, /final class MenuBarPopoverViewController: NSViewController/u);
   assert.match(popupSource, /static let width: CGFloat = 400/u);
   assert.doesNotMatch(popupSource, /NSScrollView\s*\(/u);
   assert.match(popupSource, /let rangeControl = NSSegmentedControl\(\)/u);
   assert.match(modelSource, /case sevenDays = "7d"/u);
   assert.match(modelSource, /case thirtyDays = "30d"/u);
-  assert.match(popupSource, /MenuBarWeeklyPositionView/u);
-  assert.match(popupSource, /difference <= -2/u);
-  assert.match(popupSource, /difference >= 2/u);
-  assert.match(popupSource, /menuBarPopupPositionDisclaimer/u);
+  assert.match(popupSource, /private final class MenuBarWeeklyPaceView: NSView/u);
+  assert.match(
+    popupSource,
+    /enum MenuBarPopoverPaceState: Equatable \{[\s\S]*?case collecting[\s\S]*?case under[\s\S]*?case on[\s\S]*?case over[\s\S]*?case critical/u,
+  );
+  assert.match(
+    popupSource,
+    /func configure\(\s*outlook: MenuBarWeeklyPaceOutlook,[\s\S]*?outlook\.status == \.collecting[\s\S]*?switch outlook\.standing[\s\S]*?outlook\.critical \? \.critical : \.over/u,
+  );
+  assert.match(
+    popupSource,
+    /trackView\.coveredFraction = outlook\.track\.coveredFraction/u,
+  );
+  assert.match(
+    popupSource,
+    /trackView\.activeFraction = outlook\.track\.activeExhaustionFraction/u,
+  );
+  assert.match(
+    popupSource,
+    /let weeklyPaceVisible: Bool\s*\n\s*let weeklyPaceState: MenuBarPopoverPaceState\?/u,
+  );
+  assert.match(
+    popupSource,
+    /if let outlook = snapshot\.currentWeeklyPaceOutlook\(now: now\) \{[\s\S]*?weeklyPaceView\.configure\(outlook: outlook, now: now\)[\s\S]*?weeklySection\.isHidden = false[\s\S]*?else \{[\s\S]*?weeklySection\.isHidden = true/u,
+  );
+  assert.doesNotMatch(popupSource, /MenuBarWeeklyPositionView/u);
+  assert.doesNotMatch(popupSource, /weeklyWindowPosition|difference <= -2|difference >= 2/u);
   assert.match(popupSource, /MenuBarDailyTokenBarsView/u);
   assert.match(popupSource, /day\.totalTokens/u);
   assert.match(popupSource, /day\.evidence == \.partial[\s\S]*?drawPartialBar/u);
@@ -2819,14 +2988,54 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
     .filter((line) => line.includes('"menuBarPopup.'))
     .join("\n"))
     .join("\n");
+  const weeklyPaceLocalizationKeys = [
+    ["menuBarPopupWeeklyPace", "menuBarPopup.weeklyPace"],
+    ["menuBarPopupPaceCollecting", "menuBarPopup.paceCollecting"],
+    ["menuBarPopupPaceUnder", "menuBarPopup.paceUnder"],
+    ["menuBarPopupPaceOn", "menuBarPopup.paceOn"],
+    ["menuBarPopupPaceOver", "menuBarPopup.paceOver"],
+    ["menuBarPopupPaceCritical", "menuBarPopup.paceCritical"],
+    ["menuBarPopupPaceCollectingDetail", "menuBarPopup.paceCollectingDetail"],
+    ["menuBarPopupPaceRatioOutcome", "menuBarPopup.paceRatioOutcome"],
+    ["menuBarPopupPaceDryBeforeReset", "menuBarPopup.paceDryBeforeReset"],
+    ["menuBarPopupPaceSpareAtReset", "menuBarPopup.paceSpareAtReset"],
+    ["menuBarPopupPaceReachesReset", "menuBarPopup.paceReachesReset"],
+    ["menuBarPopupPaceNow", "menuBarPopup.paceNow"],
+    ["menuBarPopupPaceResetIn", "menuBarPopup.paceResetIn"],
+    ["menuBarPopupPaceEvidenceOne", "menuBarPopup.paceEvidenceOne"],
+    ["menuBarPopupPaceEvidenceMany", "menuBarPopup.paceEvidenceMany"],
+    ["menuBarPopupPaceEarlyEstimate", "menuBarPopup.paceEarlyEstimate"],
+    ["menuBarPopupPaceActiveMarker", "menuBarPopup.paceActiveMarker"],
+  ];
+  for (const [swiftKey, catalogKey] of weeklyPaceLocalizationKeys) {
+    assert.equal(
+      localizationSource.includes(`case ${swiftKey} = "${catalogKey}"`),
+      true,
+      swiftKey,
+    );
+    assert.equal(
+      localizationSource.includes(`case .${swiftKey}:`),
+      true,
+      `${swiftKey} English fallback`,
+    );
+    for (const [index, catalog] of popupCatalogs.entries()) {
+      assert.equal(
+        catalog.includes(`"${catalogKey}" = `),
+        true,
+        `${catalogKey} locale ${index}`,
+      );
+    }
+  }
   for (const privacyForbidden of [
     /reset.?credit/iu,
     /redeem/iu,
     /buy.?credit/iu,
     /account.?email/iu,
   ]) {
+    assert.doesNotMatch(source, privacyForbidden);
     assert.doesNotMatch(popupSource, privacyForbidden);
     assert.doesNotMatch(modelSource, privacyForbidden);
+    assert.doesNotMatch(paceSource, privacyForbidden);
     assert.doesNotMatch(popupLocalization, privacyForbidden);
   }
 
@@ -5457,6 +5666,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/macos/Sources/KeychainBroker.swift",
     "apps/macos/Sources/Localization.swift",
     "apps/macos/Sources/LoginItemManager.swift",
+    "apps/macos/Sources/MenuBarPaceOutlook.swift",
     "apps/macos/Sources/MenuBarPopover.swift",
     "apps/macos/Sources/MenuBarPopupModel.swift",
     "apps/macos/Sources/MenuBarStatus.swift",
@@ -6584,7 +6794,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       menuBarSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT popover=true width=400 bars=7,30 pace=used-vs-elapsed native_actions=true states=live,starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q routing=left-popover,right-menu,control-menu dismissal=escape,transient,same-app,deactivation weekly_position=fresh-only history=authoritative,coverage-named,fail-closed pricing=complete,partial,unavailable model=dst,overlap,future,per-lane reset_credits=absent analysis_title=live-fallback$/mu,
+      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT popover=true width=400 bars=7,30 pace=canonical-outlook native_actions=true states=live,starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q routing=left-popover,right-menu,control-menu dismissal=escape,transient,same-app,deactivation weekly_position=factual-menu-only pace_outlook=collecting,under,on,over,critical,fail-closed history=authoritative,coverage-named,fail-closed pricing=complete,partial,unavailable model=dst,overlap,future,per-lane reset_credits=absent analysis_title=live-fallback$/mu,
     );
     const analysisProgressSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),
@@ -6613,10 +6823,10 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       popupRenderSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_MENU_BAR_POPOVER_RENDER locales=en,es,zh-Hans appearances=light,dark ranges=7d,30d states=live,partial-pricing,unpriced,unavailable width=400 source=synthetic-content-free$/mu,
+      /^USAGE_MONITOR_MACOS_MENU_BAR_POPOVER_RENDER locales=en,es,zh-Hans appearances=light,dark ranges=7d,30d states=live,pace-collecting,pace-under,pace-on,pace-over,pace-critical,partial-pricing,unpriced,unavailable width=400 source=synthetic-content-free$/mu,
     );
     const popupRenders = (await readdir(popupRenderDirectory)).sort();
-    assert.equal(popupRenders.length, 11);
+    assert.equal(popupRenders.length, 15);
     assert.equal(
       popupRenders.includes("menu-bar-popover-en-30d-light.png"),
       true,
@@ -6637,6 +6847,14 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       popupRenders.includes("menu-bar-popover-es-unavailable-light.png"),
       true,
     );
+    for (const paceState of ["collecting", "under", "on", "critical"]) {
+      assert.equal(
+        popupRenders.includes(
+          `menu-bar-popover-en-pace-${paceState}-light.png`,
+        ),
+        true,
+      );
+    }
     const popupRenderDigests = new Map();
     for (const popupRender of popupRenders) {
       const renderBytes = await readFile(join(popupRenderDirectory, popupRender));
@@ -6683,6 +6901,17 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.notEqual(
       popupRenderDigests.get("menu-bar-popover-es-unpriced-light.png"),
       popupRenderDigests.get("menu-bar-popover-es-unavailable-light.png"),
+    );
+    const paceRenderNames = [
+      "menu-bar-popover-en-light.png",
+      "menu-bar-popover-en-pace-collecting-light.png",
+      "menu-bar-popover-en-pace-under-light.png",
+      "menu-bar-popover-en-pace-on-light.png",
+      "menu-bar-popover-en-pace-critical-light.png",
+    ];
+    assert.equal(
+      new Set(paceRenderNames.map((name) => popupRenderDigests.get(name))).size,
+      paceRenderNames.length,
     );
     const quotaNotificationSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),

@@ -486,6 +486,7 @@ const API_ROUTES = new Set([
   "/api/local/claude/quota",
   "/api/local/gradient",
   "/api/local/weekly",
+  "/api/local/weekly-pace-outlook",
   "/api/local/quality",
   "/api/local/reports",
   "/api/local/timeline/window-breakdown",
@@ -5697,6 +5698,19 @@ export function createPreparedLocalCompanionServer({
         send(response, 200, {
           schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
           weekly: dataStore.getWeekly(),
+        });
+        return;
+      }
+      if (path === "/api/local/weekly-pace-outlook") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        send(response, 200, {
+          schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+          weekly: {
+            paceOutlook: dataStore.getWeeklyPaceOutlook(),
+          },
         });
         return;
       }

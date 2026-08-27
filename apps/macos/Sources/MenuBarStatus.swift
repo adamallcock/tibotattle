@@ -337,6 +337,10 @@ struct MenuBarStatusSnapshot: Equatable {
     var observedAt: Date?
     var failureSummary: String?
     var history: MenuBarHistorySnapshot = .unavailable
+    /// Shared companion-side weekly forecast presentation. This remains
+    /// ephemeral and is rendered only while it binds to the exact current
+    /// seven-day allowance observation.
+    var weeklyPaceOutlook: MenuBarWeeklyPaceOutlook?
     /// The companion's declared freshness window is retained only in memory
     /// so each lane can be checked against its own observation timestamp.
     var staleAfterSeconds: Double?
@@ -378,6 +382,21 @@ struct MenuBarStatusSnapshot: Equatable {
     func currentPrimaryLane(now: Date = Date()) -> ObservedQuotaLane? {
         let current = currentLanes(now: now)
         return current.first(where: \.isPrimary) ?? current.first
+    }
+
+    func currentWeeklyPaceOutlook(
+        now: Date = Date()
+    ) -> MenuBarWeeklyPaceOutlook? {
+        guard let outlook = weeklyPaceOutlook,
+              let weeklyLane = currentLanes(now: now).first(where: {
+                  $0.durationMinutes
+                    == CodexQuotaWindowDuration.sevenDayMinutes
+              }),
+              outlook.isBound(to: weeklyLane, now: now)
+        else {
+            return nil
+        }
+        return outlook
     }
 
     /// True only when the companion has published a loopback dashboard.
@@ -622,6 +641,7 @@ func resetCountdown(_ date: Date?, now: Date = Date()) -> String? {
 func nextEvidencePresentationBoundary(
     lanes: [ObservedQuotaLane],
     staleAfterSeconds: Double?,
+    weeklyPaceOutlook: MenuBarWeeklyPaceOutlook? = nil,
     now: Date
 ) -> Date? {
     let freshnessLimit = staleAfterSeconds ?? defaultStaleAfterSeconds
@@ -630,7 +650,10 @@ func nextEvidencePresentationBoundary(
         return observedAt.addingTimeInterval(freshnessLimit)
     }
     let resetBoundaries = lanes.compactMap(\.resetAt)
-    return (freshnessBoundaries + resetBoundaries)
+    let outlookBoundaries = weeklyPaceOutlook.map {
+        [$0.nextPresentationBoundary]
+    } ?? []
+    return (freshnessBoundaries + resetBoundaries + outlookBoundaries)
         .filter { $0 > now }
         .min()
 }
@@ -757,9 +780,10 @@ enum LocalCompanionOverviewProjection {
                 isPrimary: false
             )
             let slot = row["slot"] as? String ?? ""
-            let preferredSlot = duration == fiveHourWindowDurationMinutes
-                ? slot == "primary"
-                : slot == "secondary"
+            // Match the canonical JS forecast exactly: primary wins whenever
+            // both transitional slot representations are present. Secondary
+            // remains the deterministic fallback when primary is absent.
+            let preferredSlot = slot == "primary"
             return Candidate(
                 lane: lane,
                 durationMinutes: duration,
@@ -868,6 +892,7 @@ final class LocalCompanionEvidenceReader {
     // adapter can reuse this already-audited, loopback-only transport without
     // opening a second session or adding any network route.
     static let maximumResponseBytes = 32 * 1_024 * 1_024
+    static let maximumPaceOutlookResponseBytes = 64 * 1_024
     let session: URLSession
 
     init() {
@@ -901,6 +926,30 @@ final class LocalCompanionEvidenceReader {
                 LocalCompanionOverviewProjection.decode($0)
             }
             DispatchQueue.main.async { completion(overview) }
+        }
+        task.resume()
+    }
+
+    func readWeeklyPaceOutlook(
+        base: URL,
+        completion: @escaping (MenuBarWeeklyPaceOutlook?) -> Void
+    ) {
+        guard let url = loopbackEndpoint(
+            base,
+            path: "/api/local/weekly-pace-outlook"
+        )
+        else {
+            completion(nil)
+            return
+        }
+        let task = session.dataTask(with: request(url, method: "GET")) {
+            data, response, _ in
+            let outlook = Self.acceptedPayload(
+                data,
+                response,
+                maximumBytes: Self.maximumPaceOutlookResponseBytes
+            ).flatMap { MenuBarWeeklyPaceOutlookProjection.decode($0) }
+            DispatchQueue.main.async { completion(outlook) }
         }
         task.resume()
     }
@@ -1025,11 +1074,13 @@ final class LocalCompanionEvidenceReader {
 
     static func acceptedPayload(
         _ data: Data?,
-        _ response: URLResponse?
+        _ response: URLResponse?,
+        maximumBytes: Int = maximumResponseBytes
     ) -> Data? {
         guard let data,
               (response as? HTTPURLResponse)?.statusCode == 200,
-              data.count <= maximumResponseBytes
+              maximumBytes > 0,
+              data.count <= maximumBytes
         else {
             return nil
         }
@@ -1173,6 +1224,12 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
     private var snapshot = MenuBarStatusSnapshot()
     private var dashboardURL: URL?
     private var companionGeneration: UInt64 = 0
+    /// Separates overlapping polls within one companion generation. Opening
+    /// the popup can request an immediate refresh while an earlier loopback
+    /// read is still in flight; only the newest response may update the UI.
+    private var pollSequence: UInt64 = 0
+    private var pollActivityFinished = false
+    private var pollEvidenceFinished = false
     private var overviewResponseHealthy = false
     private var observedEvidenceExpiresAt: Date?
     private var evidenceExpiryWorkItem: DispatchWorkItem?
@@ -1687,11 +1744,16 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
     private func pollNow() {
         guard !stopped, let dashboardURL else { return }
         let generation = companionGeneration
+        pollSequence &+= 1
+        let sequence = pollSequence
+        pollActivityFinished = false
+        pollEvidenceFinished = false
         cancelPoll()
         reader.readAnalysisActivity(base: dashboardURL) { [weak self] activity in
             guard let self,
                   !self.stopped,
                   self.companionGeneration == generation,
+                  self.pollSequence == sequence,
                   self.dashboardURL == dashboardURL
             else {
                 return
@@ -1715,12 +1777,13 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
                 break
             }
             self.render()
-            self.schedulePoll()
+            self.finishPollLeg(.activity, sequence: sequence)
         }
         reader.readOverview(base: dashboardURL) { [weak self] overview in
             guard let self,
                   !self.stopped,
                   self.companionGeneration == generation,
+                  self.pollSequence == sequence,
                   self.dashboardURL == dashboardURL
             else {
                 return
@@ -1737,6 +1800,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
                         .menuBarQuotaEvidenceUnavailable
                     )
                 self.render()
+                self.finishPollLeg(.evidence, sequence: sequence)
                 return
             }
             self.overviewResponseHealthy = true
@@ -1752,6 +1816,10 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
             self.observedEvidenceExpiresAt = freshnessExpiry
             self.snapshot.evidence = LocalCompanionOverviewProjection
                 .evidence(for: overview)
+            let now = Date()
+            if self.snapshot.currentWeeklyPaceOutlook(now: now) == nil {
+                self.snapshot.weeklyPaceOutlook = nil
+            }
             self.scheduleEvidenceExpiry()
             if self.snapshot.phase == .unavailable {
                 self.snapshot.phase = .ready
@@ -1759,6 +1827,54 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
             }
             self.render()
             self.refreshStaleEvidenceIfNeeded()
+            self.reader.readWeeklyPaceOutlook(base: dashboardURL) {
+                [weak self] outlook in
+                guard let self,
+                      !self.stopped,
+                      self.companionGeneration == generation,
+                      self.pollSequence == sequence,
+                      self.dashboardURL == dashboardURL
+                else {
+                    return
+                }
+                let now = Date()
+                if let outlook,
+                   let weeklyLane = self.snapshot.currentLanes(now: now)
+                    .first(where: {
+                        $0.durationMinutes
+                            == CodexQuotaWindowDuration.sevenDayMinutes
+                    }),
+                   outlook.isBound(to: weeklyLane, now: now) {
+                    self.snapshot.weeklyPaceOutlook = outlook
+                } else {
+                    self.snapshot.weeklyPaceOutlook = nil
+                }
+                self.scheduleEvidenceExpiry()
+                self.render()
+                self.finishPollLeg(.evidence, sequence: sequence)
+            }
+        }
+    }
+
+    private enum PollLeg {
+        case activity
+        case evidence
+    }
+
+    /// The active cadence starts only after both the refresh-status read and
+    /// the overview-plus-outlook read have settled. Otherwise a five-second
+    /// analysis poll can invalidate every slower (but still bounded) weekly
+    /// response before it is allowed to render.
+    private func finishPollLeg(_ leg: PollLeg, sequence: UInt64) {
+        guard !stopped, pollSequence == sequence else { return }
+        switch leg {
+        case .activity:
+            pollActivityFinished = true
+        case .evidence:
+            pollEvidenceFinished = true
+        }
+        if pollActivityFinished && pollEvidenceFinished {
+            schedulePoll()
         }
     }
 
@@ -1825,16 +1941,21 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
         snapshot.observedAt = nil
         snapshot.evidence = .none
         snapshot.history = .unavailable
+        snapshot.weeklyPaceOutlook = nil
         snapshot.staleAfterSeconds = nil
         observedEvidenceExpiresAt = nil
     }
 
     private func expireCachedEvidenceIfNeeded() {
-        guard snapshot.evidence == .live,
-              let observedEvidenceExpiresAt,
-              Date() >= observedEvidenceExpiresAt
-        else { return }
-        snapshot.evidence = .stale
+        let now = Date()
+        if snapshot.evidence == .live,
+           let observedEvidenceExpiresAt,
+           now >= observedEvidenceExpiresAt {
+            snapshot.evidence = .stale
+        }
+        if snapshot.currentWeeklyPaceOutlook(now: now) == nil {
+            snapshot.weeklyPaceOutlook = nil
+        }
     }
 
     /// Freshness and every observed lane reset are exact presentation
@@ -1849,6 +1970,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
         guard let nextBoundary = nextEvidencePresentationBoundary(
             lanes: snapshot.lanes,
             staleAfterSeconds: snapshot.staleAfterSeconds,
+            weeklyPaceOutlook: snapshot.weeklyPaceOutlook,
             now: now
         )
         else { return }
