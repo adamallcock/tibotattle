@@ -272,9 +272,13 @@ import {
   type TelemetryV1ChunkRow,
 } from "./telemetry-v1-repository";
 import {
-  readPublishedCommunityDailyAggregates,
+  readPublishedCommunityDailyAggregatesWithAllowanceState,
   rebuildPendingCommunityDailyAggregates,
 } from "./community-daily-aggregates";
+import {
+  COMMUNITY_ALLOWANCE_BASIS,
+  COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS,
+} from "./community-allowance";
 import {
   captureAdminMetricSnapshot,
   readCachedAdminMetricsHistory,
@@ -3283,12 +3287,30 @@ async function handleCommunityDaily(
   if (rangeDays < 1 || rangeDays > COMMUNITY_DAILY_MAX_RANGE_DAYS) {
     throw new ApiError(400, "BODY_INVALID");
   }
-  const rows = await readPublishedCommunityDailyAggregates(
+  // The one public data SELECT reads only this requested precomputed range and
+  // joins the scheduled allowance-publication singleton. Interactive requests
+  // never rescan global history or write readiness state.
+  const read = await readPublishedCommunityDailyAggregatesWithAllowanceState(
     env.USAGE_MONITOR_DB,
     from,
     to,
   );
-  const days = rows.map((row) => {
+  const today = new Date().toISOString().slice(0, 10);
+  const todayStartMs = Date.parse(`${today}T00:00:00.000Z`);
+  const mergedHistoryFrom = new Date(
+    todayStartMs
+      - (COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS - 1)
+        * MILLISECONDS_PER_DAY,
+  ).toISOString().slice(0, 10);
+  const allowanceState = read.allowancePublicationState?.publication_state
+      === "ready"
+      && read.allowancePublicationState.expected_basis
+        === COMMUNITY_ALLOWANCE_BASIS
+      && read.allowancePublicationState.safe_from_day === mergedHistoryFrom
+      && read.allowancePublicationState.safe_to_day === today
+    ? "ready"
+    : "updating";
+  const days = read.rows.map((row) => {
     let payload: unknown;
     try {
       payload = JSON.parse(row.payload_json);
@@ -3304,11 +3326,32 @@ async function handleCommunityDaily(
       payload,
     };
   });
+  for (const day of days) {
+    if (typeof day.payload !== "object"
+        || day.payload === null
+        || Array.isArray(day.payload)) continue;
+    const publicPayload = { ...day.payload as Record<string, unknown> };
+    // Historical revisions carried a per-plan diagnostic object. It remains
+    // private admin evidence and is never part of the public combined system.
+    delete publicPayload.capacityByPlanType;
+    const allowance = publicPayload.allowance;
+    const allowanceBasis = typeof allowance === "object"
+        && allowance !== null
+        && !Array.isArray(allowance)
+      ? (allowance as Record<string, unknown>).basis
+      : null;
+    if (allowanceState !== "ready"
+        || allowanceBasis !== COMMUNITY_ALLOWANCE_BASIS) {
+      delete publicPayload.allowance;
+    }
+    day.payload = publicPayload;
+  }
   return jsonResponse(
     {
       schemaVersion: "community-daily-read-v1.0",
       from,
       to,
+      allowanceState,
       days,
     },
     200,

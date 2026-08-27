@@ -1,7 +1,10 @@
 import { APP_PRICE_REGISTRY_MANIFEST } from "@app-usagemonitor/accounting";
 import { SEVEN_DAY_WINDOW_MINUTES } from "@app-usagemonitor/quota-analysis";
 import { accountScopedQuotaAnalysis } from "./quota-analysis";
-import { accountScopedQuotaAnalysisV1 } from "./quota-analysis-v1";
+import {
+  V1_ANALYSIS_WINDOW_DAYS,
+  accountScopedQuotaAnalysisV1,
+} from "./quota-analysis-v1";
 
 /**
  * The community allowance series: for a UTC day, the fitted seven-day Codex
@@ -23,22 +26,22 @@ import { accountScopedQuotaAnalysisV1 } from "./quota-analysis-v1";
  * community figure and the numbers people screenshot from their own app are
  * the same methodology. `spanFloorPp` carries the floor explicitly.
  *
- * Plan-cohort discipline, matching the weekly snapshots' cohort keying: an
- * allowance is a property of one plan, so mixing plan cohorts would publish
- * a median of two different products the moment a second cohort contributes.
- * The series is therefore pinned to a single cohort by `plan_type` ALONE —
- * the plan Codex reports IS the plan (pro = 20x, prolite = 5x); we never
- * invent a multiplier "variant". `COMMUNITY_ALLOWANCE_BASIS` and the block's
- * emitted `planVariant` are now FROZEN OPAQUE wire tags, retained byte-for-byte
- * only for the website's exact-match render gate, NOT cohort selectors.
- * Widening beyond one cohort means publishing per-cohort blocks under new
- * basis strings, never pooling.
+ * Personal-plan fits are normalized to one Pro 20x-equivalent basis before
+ * they are combined. This is the same deliberately narrow merge trial shown
+ * in the private admin dashboard: Pro stays unchanged, Pro 5x is multiplied
+ * by four, and Plus by twenty. Unsupported or unknown plan labels do not enter
+ * the estimate. The public wire carries only the resulting combined summary;
+ * plan-specific diagnostics remain private admin evidence.
  */
 
-export const COMMUNITY_ALLOWANCE_BASIS = "seven_day_codex_pro20x_trailing_30d";
-export const COMMUNITY_ALLOWANCE_PLAN_TYPE = "pro";
-export const COMMUNITY_ALLOWANCE_PLAN_VARIANT = "pro-20x";
+export const COMMUNITY_ALLOWANCE_BASIS =
+  "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d";
+export const COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE = "pro";
+export const COMMUNITY_ALLOWANCE_NORMALIZATION =
+  "pro_x1_prolite_x4_plus_x20";
 export const COMMUNITY_ALLOWANCE_TRAILING_DAYS = 30;
+export const COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS =
+  V1_ANALYSIS_WINDOW_DAYS - COMMUNITY_ALLOWANCE_TRAILING_DAYS;
 export const COMMUNITY_ALLOWANCE_QUALIFICATION =
   "shared_reset_fit_gates_40pp_span_floor";
 // The same observed-span floor the app's public share card names ("40pp
@@ -59,6 +62,24 @@ const NANOUSD_PER_USD = 1_000_000_000;
 // for v1 usage (records carry it null) + drop no-observation records, so the
 // OpenAI context-sensitive pricer no longer refuses every reset.
 const FIT_ADAPTER_VERSION = "v1-fit-5";
+
+export const COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG = Object.freeze([
+  Object.freeze({ planType: "pro", label: "Pro 20x", multiplier: 1 }),
+  Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 4 }),
+  Object.freeze({ planType: "plus", label: "Plus", multiplier: 20 }),
+] as const);
+
+export type CommunityAllowancePersonalPlanType =
+  (typeof COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG)[number]["planType"];
+
+const COMMUNITY_ALLOWANCE_PERSONAL_PLAN_BY_TYPE = new Map<string, {
+  readonly planType: CommunityAllowancePersonalPlanType;
+  readonly label: string;
+  readonly multiplier: number;
+}>(COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG.map((plan) => [
+  plan.planType,
+  plan,
+]));
 
 // One canonical source-selection CTE feeds both the scheduled collector and
 // the admin cache reader. A participant with both corpora is selected through
@@ -84,9 +105,8 @@ const COMMUNITY_ALLOWANCE_PARTICIPANT_SOURCES_CTE = `participant_sources AS (
 export interface CommunityAllowanceFit {
   participantId: string;
   // The Codex plan_type this fit was observed on (pro, prolite, plus, ...).
-  // The published band filters to "pro"; the full set feeds the per-plan_type
-  // capacity monitor. The plan itself is the multiplier (pro = 20x, prolite =
-  // 5x), so no separate variant is needed.
+  // The public summary admits only the explicitly configured personal plans
+  // and normalizes them to the reference plan; no separate variant is needed.
   planType: string;
   capacityNanousd: number;
   lastObservedAt: string;
@@ -95,8 +115,8 @@ export interface CommunityAllowanceFit {
 export interface CommunityDailyAllowance {
   basis: typeof COMMUNITY_ALLOWANCE_BASIS;
   limitId: "codex";
-  planType: typeof COMMUNITY_ALLOWANCE_PLAN_TYPE;
-  planVariant: typeof COMMUNITY_ALLOWANCE_PLAN_VARIANT;
+  referencePlanType: typeof COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE;
+  normalization: typeof COMMUNITY_ALLOWANCE_NORMALIZATION;
   windowDurationMinutes: number;
   trailingDays: number;
   qualification: typeof COMMUNITY_ALLOWANCE_QUALIFICATION;
@@ -105,6 +125,16 @@ export interface CommunityDailyAllowance {
   participantCount: number;
   centralUsd: number | null;
   band80Usd: { lowerUsd: number; upperUsd: number } | null;
+}
+
+export interface CommunityAllowanceSummary {
+  readonly fitCount: number;
+  readonly participantCount: number;
+  readonly centralUsd: number | null;
+  readonly band80Usd: {
+    readonly lowerUsd: number;
+    readonly upperUsd: number;
+  } | null;
 }
 
 interface AnalysisResetFit {
@@ -149,6 +179,33 @@ function usd(nanousd: number): number {
   // noise; canonical JSON then hashes identically across rebuilds of the
   // same sources.
   return Math.round((nanousd / NANOUSD_PER_USD + Number.EPSILON) * 10_000) / 10_000;
+}
+
+/**
+ * Shared summary primitive for the public combined series and the private
+ * admin comparison. Keeping the quantiles and currency rounding here ensures
+ * the two views cannot silently diverge while the merge is reviewed.
+ */
+export function summarizeCommunityAllowanceFits(
+  fits: readonly CommunityAllowanceFit[],
+  multiplier: number | ((fit: CommunityAllowanceFit) => number),
+): CommunityAllowanceSummary {
+  const capacities = fits.map((fit) => {
+    const factor = typeof multiplier === "function" ? multiplier(fit) : multiplier;
+    return fit.capacityNanousd * factor;
+  });
+  const central = quantile(capacities, 0.5);
+  const lower = quantile(capacities, 0.1);
+  const upper = quantile(capacities, 0.9);
+  return Object.freeze({
+    fitCount: fits.length,
+    participantCount: new Set(fits.map((fit) => fit.participantId)).size,
+    centralUsd: central === null ? null : usd(central),
+    band80Usd: fits.length >= MINIMUM_FITS_FOR_BAND
+        && lower !== null && upper !== null
+      ? Object.freeze({ lowerUsd: usd(lower), upperUsd: usd(upper) })
+      : null,
+  });
 }
 
 /**
@@ -461,31 +518,24 @@ export function summarizeCommunityAllowanceDay(
   const windowStartMs = windowEndMs
     - COMMUNITY_ALLOWANCE_TRAILING_DAYS * MILLISECONDS_PER_DAY;
   const qualifying = fits.filter((fit) => {
-    // The published band is a single plan cohort — plan_type "pro" (20x).
-    if (fit.planType !== COMMUNITY_ALLOWANCE_PLAN_TYPE) return false;
+    if (!COMMUNITY_ALLOWANCE_PERSONAL_PLAN_BY_TYPE.has(fit.planType)) return false;
     const observedMs = Date.parse(fit.lastObservedAt);
     return observedMs > windowStartMs && observedMs <= windowEndMs;
   });
-  const capacities = qualifying.map((fit) => fit.capacityNanousd);
-  const central = quantile(capacities, 0.5);
-  const lower = quantile(capacities, 0.1);
-  const upper = quantile(capacities, 0.9);
+  const summary = summarizeCommunityAllowanceFits(qualifying, (fit) => (
+    COMMUNITY_ALLOWANCE_PERSONAL_PLAN_BY_TYPE.get(fit.planType)?.multiplier
+      ?? 0
+  ));
   return {
     basis: COMMUNITY_ALLOWANCE_BASIS,
     limitId: "codex",
-    planType: COMMUNITY_ALLOWANCE_PLAN_TYPE,
-    planVariant: COMMUNITY_ALLOWANCE_PLAN_VARIANT,
+    referencePlanType: COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE,
+    normalization: COMMUNITY_ALLOWANCE_NORMALIZATION,
     windowDurationMinutes: SEVEN_DAY_WINDOW_MINUTES,
     trailingDays: COMMUNITY_ALLOWANCE_TRAILING_DAYS,
     qualification: COMMUNITY_ALLOWANCE_QUALIFICATION,
     spanFloorPp: COMMUNITY_ALLOWANCE_SPAN_FLOOR_PP,
-    fitCount: qualifying.length,
-    participantCount: new Set(qualifying.map((fit) => fit.participantId)).size,
-    centralUsd: central === null ? null : usd(central),
-    band80Usd: qualifying.length >= MINIMUM_FITS_FOR_BAND
-        && lower !== null && upper !== null
-      ? { lowerUsd: usd(lower), upperUsd: usd(upper) }
-      : null,
+    ...summary,
   };
 }
 

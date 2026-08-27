@@ -81,6 +81,7 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     // rebuilt by scheduled maintenance. Interactive admin requests read these
     // cache rows instead of event or per-account analysis tables.
     "0039_admin_metrics_history_cache.sql",
+    "0040_community_allowance_publication_state.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",

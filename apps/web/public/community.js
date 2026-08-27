@@ -51,10 +51,11 @@ const publicRequestIdPattern =
 let lastCommunityDailyPayload = null;
 let lastCommunityDailyFailure = null;
 let communityDailySettled = false;
-// The allowance range selection: 30/90 calendar days or null for the whole
+// The allowance range selection: 30 calendar days or null for the whole
 // published series. Re-rendering is purely client-side — the year window is
 // already fetched — so a range change never issues a request.
-let allowanceRangeDays = null;
+let allowanceRangeDays = 30;
+let allowanceDialogReturnFocus = null;
 const communityClient = new PublicCommunityClient();
 
 function publicErrorCode(candidate) {
@@ -235,32 +236,114 @@ function wireInstallerChecksumCopy() {
 
 function renderCommunityAllowanceResult(payload) {
   const container = $("#community-allowance-result");
-  if (!container) return;
-  renderCommunityAllowanceSection({
+  if (!container) return "service_unavailable";
+  const state = renderCommunityAllowanceSection({
     documentRef: document,
     container,
     stateNode: $("#community-allowance-state"),
     payload,
     rangeDays: allowanceRangeDays,
   });
+  updateAllowanceDialogAvailability(state);
+  if ($("#community-allowance-dialog")?.open) {
+    renderCommunityAllowanceDialogResult(payload);
+  }
+  return state;
+}
+
+function renderCommunityAllowanceDialogResult(payload) {
+  const container = $("#community-allowance-dialog-result");
+  if (!container) return "service_unavailable";
+  return renderCommunityAllowanceSection({
+    documentRef: document,
+    container,
+    payload,
+    rangeDays: allowanceRangeDays,
+  });
+}
+
+function allowanceDialogSupported() {
+  const dialog = $("#community-allowance-dialog");
+  return typeof dialog?.showModal === "function"
+    && typeof dialog?.close === "function";
+}
+
+function updateAllowanceDialogAvailability(state) {
+  const launcher = $("#community-allowance-expand");
+  const dialog = $("#community-allowance-dialog");
+  const available = state === "published" && allowanceDialogSupported();
+  if (launcher) launcher.hidden = !available;
+  if (!available && dialog?.open) dialog.close();
+}
+
+function syncAllowanceRangeControls() {
+  for (const controls of document.querySelectorAll("[data-allowance-range-controls]")) {
+    for (const candidate of controls.querySelectorAll("button[data-range-days]")) {
+      const candidateRange = candidate.dataset.rangeDays === ""
+        ? null
+        : Number(candidate.dataset.rangeDays);
+      const active = candidateRange === allowanceRangeDays;
+      candidate.classList.toggle("active", active);
+      candidate.setAttribute("aria-pressed", String(active));
+    }
+  }
+}
+
+function selectAllowanceRange(value) {
+  const rangeDays = value === "" ? null : Number(value);
+  if (rangeDays !== null && rangeDays !== 30) return;
+  allowanceRangeDays = rangeDays;
+  syncAllowanceRangeControls();
+  if (communityDailySettled) {
+    renderCommunityAllowanceResult(lastCommunityDailyPayload);
+  }
 }
 
 function wireAllowanceRangeControls() {
-  const controls = $("#community-allowance-range-controls");
-  if (!controls) return;
-  controls.addEventListener("click", (event) => {
-    const button = event.target?.closest?.("button[data-range-days]");
-    if (!button) return;
-    allowanceRangeDays = button.dataset.rangeDays === ""
-      ? null
-      : Number(button.dataset.rangeDays);
-    for (const candidate of controls.querySelectorAll("button[data-range-days]")) {
-      candidate.classList.toggle("active", candidate === button);
-      candidate.setAttribute("aria-pressed", String(candidate === button));
+  for (const controls of document.querySelectorAll("[data-allowance-range-controls]")) {
+    if (controls.dataset.allowanceRangeBound === "true") continue;
+    controls.dataset.allowanceRangeBound = "true";
+    controls.addEventListener("click", (event) => {
+      const button = event.target?.closest?.("button[data-range-days]");
+      if (!button || !controls.contains(button)) return;
+      selectAllowanceRange(button.dataset.rangeDays);
+    });
+  }
+  syncAllowanceRangeControls();
+}
+
+function wireAllowanceDialog() {
+  const launcher = $("#community-allowance-expand");
+  const dialog = $("#community-allowance-dialog");
+  const closeButton = $("#community-allowance-dialog-close");
+  if (!launcher || !dialog || !closeButton || !allowanceDialogSupported()) {
+    if (launcher) launcher.hidden = true;
+    return;
+  }
+  launcher.addEventListener("click", () => {
+    if (!communityDailySettled || dialog.open) return;
+    renderCommunityAllowanceDialogResult(lastCommunityDailyPayload);
+    syncAllowanceRangeControls();
+    allowanceDialogReturnFocus = launcher;
+    dialog.showModal();
+    document.documentElement.classList.add("community-chart-modal-open");
+    closeButton.focus();
+  });
+  closeButton.addEventListener("click", () => dialog.close());
+  dialog.addEventListener("click", (event) => {
+    if (event.target === dialog) dialog.close();
+  });
+  dialog.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    dialog.close();
+  });
+  dialog.addEventListener("close", () => {
+    document.documentElement.classList.remove("community-chart-modal-open");
+    if (!allowanceDialogReturnFocus?.hidden) {
+      allowanceDialogReturnFocus?.focus?.();
     }
-    if (communityDailySettled) {
-      renderCommunityAllowanceResult(lastCommunityDailyPayload);
-    }
+    allowanceDialogReturnFocus = null;
   });
 }
 
@@ -315,6 +398,7 @@ if (typeof document !== "undefined") {
   wireHomebrewInstallCommand();
   wireInstallerChecksumCopy();
   wireAllowanceRangeControls();
+  wireAllowanceDialog();
   void loadCommunityDailySeries();
   window.addEventListener("tibotattle:locale-change", (event) => {
     setFormattingLocale(event.detail?.formatLocale ?? localization.formatLocale());

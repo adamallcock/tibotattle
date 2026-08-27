@@ -56,7 +56,7 @@ let infoHintSequence = 0;
 
 const INFO_HINTS = Object.freeze({
   "Approved community accounts": "Approved identities that are currently active and allowed to contribute. This includes approved accounts that have not yet sent accepted data.",
-  "Accounts with accepted data": "Distinct approved accounts with at least one accepted whole contribution or incremental chunk. The caption shows how many were active in the trailing 30 days.",
+  "Accounts with accepted data": "Distinct accounts with retained accepted whole contributions or incremental chunks. The exact current value and recent history come from the scheduled aggregate cache, independently of the overview's bounded newest-row sample.",
   "Approved last 24h": "Identities first approved during the trailing 24 hours. The caption gives the corresponding trailing seven-day count.",
   "Current incremental chunks": "Accepted incremental journal chunks that have not been superseded. The caption includes every retained chunk row, including older superseded rows.",
   "Accepted uploads last 24h": "Accepted whole contributions plus incremental chunks received during the trailing 24 hours. One account can send many uploads.",
@@ -947,6 +947,26 @@ function metricGaugeEvidence(key, boundedKey, currentlyBounded = false) {
       || gaugeHistoryIsBounded(snapshots, boundedKey),
   };
 }
+
+/**
+ * Prefer the scheduled exact contributor gauges over the overview's bounded
+ * newest-row sample. Browser refreshes still perform only the singleton cache
+ * read; the overview remains a truthful fallback while that cache is loading
+ * or when an older cached snapshot lacks the additive gauge.
+ */
+export function contributingAccountsCardEvidence(contributors, snapshots) {
+  const latestMetrics = snapshots?.at?.(-1)?.metrics ?? {};
+  const cachedTotal = latestMetrics.contributingAccountsTotal;
+  const cachedBounded = latestMetrics.contributingAccountsTotalBounded === 1;
+  const exactTotal = Number.isSafeInteger(cachedTotal)
+    && cachedTotal >= 0
+    && !cachedBounded;
+  return Object.freeze({
+    total: exactTotal ? cachedTotal : contributors.total,
+    totalBounded: exactTotal ? false : contributors.bounded,
+    exact: exactTotal,
+  });
+}
 function renderGrowth(history) {
   const container = $("#growth-cards");
   const badge = $("#growth-status");
@@ -1129,12 +1149,16 @@ export function isCurrentLoadGeneration(requestGeneration, currentGeneration) {
 function renderCounts(overview) {
   const counts = overview.counts;
   const contributors = counts.contributions.contributingAccounts;
+  const contributorEvidence = contributingAccountsCardEvidence(
+    contributors,
+    state.metricsHistory?.gauges?.snapshots ?? [],
+  );
   const quarantine = overview.quarantine;
   const quarantineDue = quarantine.dueReferenced + quarantine.dueUnreferenced;
   const contributorHistory = metricGaugeEvidence(
     "contributingAccountsTotal",
     "contributingAccountsTotalBounded",
-    contributors.bounded,
+    contributorEvidence.totalBounded,
   );
   const pendingHistory = metricGaugeEvidence(
     "quarantinePendingObjects",
@@ -1145,8 +1169,10 @@ function renderCounts(overview) {
     ["Approved community accounts", count(counts.participants.active, counts.participants.bounded), `${count(counts.participants.total, counts.participants.bounded)} total identities`, metricGaugePoints("participantsActive")],
     {
       label: "Accounts with accepted data",
-      value: count(contributors.total, contributors.bounded),
-      detail: `${count(contributors.acceptedLast30Days, contributors.bounded)} active in the last 30 days`,
+      value: count(contributorEvidence.total, contributorEvidence.totalBounded),
+      detail: contributorEvidence.exact
+        ? "Exact scheduled aggregate · refreshed hourly"
+        : `${count(contributors.acceptedLast30Days, contributors.bounded)} sent data in the last 30 days`,
       points: contributorHistory.points,
       historyUnavailable: contributorHistory.unavailable,
     },

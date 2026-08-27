@@ -229,14 +229,32 @@
               <img src="./tibotattle-icon.png" alt="" width="32" height="32">
               <strong>TiboTattle</strong>
             </span>
-            <span class="community-window-context" data-i18n="community.hero.context">Community view</span>
+            <span class="community-window-actions">
+              <span class="community-window-context" data-i18n="community.hero.context">Community view</span>
+              <button
+                class="community-window-expand"
+                id="community-allowance-expand"
+                type="button"
+                aria-haspopup="dialog"
+                aria-controls="community-allowance-dialog"
+                aria-label="Expand community allowance chart"
+                data-i18n-aria-label="aria.expandCommunityAllowanceChart"
+                title="Expand community allowance chart"
+                data-i18n-title="aria.expandCommunityAllowanceChart"
+                hidden
+              >
+                <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+                  <path d="M3 8V3h5M12 3h5v5M17 12v5h-5M8 17H3v-5"></path>
+                </svg>
+              </button>
+            </span>
           </div>
           <div class="community-window-content">
             <div class="community-allowance hero-community-allowance" id="community-allowance-figure">
               <div class="activity-heading">
                 <div>
-                  <h2 id="community-allowance-heading" data-i18n="community.allowance.heading">Fitted seven-day allowance</h2>
-                  <p data-i18n="community.allowance.heroCopy">Fitted estimates, plausible ranges, and per-day evidence across contributing Codex Pro (20x) accounts, valued at API prices.</p>
+                  <h2 id="community-allowance-heading" data-i18n="community.allowance.heading">Combined Pro 20x-equivalent allowance</h2>
+                  <p data-i18n="community.allowance.heroCopy">One combined estimate across contributing personal-plan accounts, normalized to a Pro 20x equivalent and valued at API prices.</p>
                 </div>
                 <div class="allowance-controls">
                   <span class="evidence-chip neutral" id="community-allowance-state">
@@ -245,13 +263,13 @@
                   <div
                     class="segmented-control"
                     id="community-allowance-range-controls"
+                    data-allowance-range-controls
                     role="group"
                     aria-label="Allowance estimate date range"
                     data-i18n-aria-label="aria.allowanceRange"
                   >
-                    <button type="button" data-range-days="30" aria-pressed="false">30d</button>
-                    <button type="button" data-range-days="90" aria-pressed="false">90d</button>
-                    <button type="button" data-range-days="" class="active" aria-pressed="true">All</button>
+                    <button type="button" data-range-days="30" class="active" aria-pressed="true">30d</button>
+                    <button type="button" data-range-days="" aria-pressed="false">All</button>
                   </div>
                 </div>
               </div>
@@ -270,12 +288,12 @@
         aria-labelledby="community-method-summary"
       >
         <details class="community-method">
-          <summary id="community-method-summary">See community activity details</summary>
+          <summary id="community-method-summary" data-i18n="community.daily.activitySummary">See community activity</summary>
           <div class="community-method-body">
             <div class="activity-heading">
               <div>
-                <h3>Daily activity series</h3>
-                <p>Delayed daily totals for the past year. Each day shows its latest published revision.</p>
+                <h3 data-i18n="community.daily.activityHeading">Community activity over time</h3>
+                <p data-i18n="community.daily.activityCopy">Delayed, aggregate daily totals from optional contributions. This public view includes no prompts, responses, or account details.</p>
               </div>
               <span class="evidence-chip neutral" id="community-daily-state">
                 Checking daily series
@@ -311,6 +329,52 @@
         </article>
       </section>
     </main>
+
+    <dialog
+      class="community-chart-dialog"
+      id="community-allowance-dialog"
+      aria-labelledby="community-allowance-dialog-title"
+      aria-describedby="community-allowance-dialog-copy"
+    >
+      <div class="community-chart-dialog-surface">
+        <header class="community-chart-dialog-header">
+          <div>
+            <span class="community-chart-dialog-eyebrow" data-i18n="community.allowance.dialogEyebrow">Community view</span>
+            <h2 id="community-allowance-dialog-title" data-i18n="community.allowance.dialogTitle">Explore community allowance history</h2>
+            <p id="community-allowance-dialog-copy" data-i18n="community.allowance.dialogCopy">A larger view of the same published estimate. Hover, tap, or use the arrow keys to inspect a day.</p>
+          </div>
+          <button
+            class="community-chart-dialog-close"
+            id="community-allowance-dialog-close"
+            type="button"
+            aria-label="Close expanded community allowance chart"
+            data-i18n-aria-label="aria.closeCommunityAllowanceChart"
+          >
+            <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false">
+              <path d="M4 4l12 12M16 4L4 16"></path>
+            </svg>
+            <span data-i18n="community.allowance.dialogClose">Close</span>
+          </button>
+        </header>
+        <div class="community-chart-dialog-toolbar">
+          <span data-i18n="community.allowance.dialogRange">Time range</span>
+          <div
+            class="segmented-control"
+            id="community-allowance-dialog-range-controls"
+            data-allowance-range-controls
+            role="group"
+            aria-label="Allowance estimate date range"
+            data-i18n-aria-label="aria.allowanceRange"
+          >
+            <button type="button" data-range-days="30" class="active" aria-pressed="true">30d</button>
+            <button type="button" data-range-days="" aria-pressed="false">All</button>
+          </div>
+        </div>
+        <div class="result-summary community-chart-dialog-result" id="community-allowance-dialog-result">
+          <p>Checking for published allowance estimates…</p>
+        </div>
+      </div>
+    </dialog>
 
     <footer data-i18n-legacy-root>
       <div class="footer-copy">
