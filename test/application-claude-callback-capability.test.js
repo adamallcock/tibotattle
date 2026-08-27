@@ -136,6 +136,22 @@ test("production backend selection is host- and port-driven", () => {
   assert.equal(constructions, 1);
 });
 
+test("Windows production selection remains closed until callback state is qualified", () => {
+  let constructions = 0;
+  assert.throws(
+    () => selectProductionClaudeCallbackBackend({
+      platform: "win32",
+      architecture: "x64",
+      createBackend() {
+        constructions += 1;
+        return backendFixture();
+      },
+    }),
+    fixedError("invalid_configuration"),
+  );
+  assert.equal(constructions, 0);
+});
+
 test("production backend selection collapses hostile upstream errors", () => {
   const canary = "PRIVATE-CLAUDE-CALLBACK-UPSTREAM";
   assert.throws(

@@ -68,6 +68,7 @@
     <title>TiboTattle</title>
     <link rel="stylesheet" href="./styles.css">
     <script type="module" src="./app.js"></script>
+    <script type="module" src="./desktop-shell.js"></script>
   </head>
   <body class="first-run" data-i18n-root>
     <a class="skip-link" href="#main" data-i18n-legacy-root>Skip to monitoring dashboard</a>
@@ -77,28 +78,101 @@
         <img class="brand-icon" src="./tibotattle-icon.png" alt="">
         <span>TiboTattle</span>
       </a>
-      <div class="top-actions">
+      <div
+        class="top-actions"
+        role="toolbar"
+        aria-label="Dashboard toolbar"
+        data-i18n-aria-label="aria.dashboardToolbar"
+      >
+        <button
+          class="button button-quiet electron-only-control electron-sidebar-toggle"
+          id="electron-sidebar-toggle"
+          type="button"
+          data-electron-only
+          aria-controls="dashboard-sidebar"
+          aria-expanded="true"
+          aria-label="Hide sidebar"
+          data-i18n-aria-label="electron.shell.hideSidebar"
+          title="Hide sidebar"
+          data-i18n-title="electron.shell.hideSidebar"
+        >
+          <span class="electron-sidebar-glyph" aria-hidden="true"></span>
+          <span
+            class="electron-sidebar-toggle-label"
+            data-i18n="electron.shell.hideSidebar"
+          >Hide sidebar</span>
+        </button>
         <label class="language-picker">
           <span class="sr-only" data-i18n="language.label">Language</span>
           <select data-language-picker aria-label="Language"></select>
         </label>
         <p class="sr-only" data-language-announcement role="status" aria-live="polite" aria-atomic="true"></p>
         <span class="history-index-badge" id="history-index-badge" hidden></span>
-        <span class="state-pill state-connecting" id="global-state">
+        <span
+          class="electron-toolbar-status electron-only-control"
+          data-electron-only
+          role="group"
+          aria-label="Allowance unavailable"
+          data-i18n-aria-label="electron.shell.allowanceUnavailable"
+        >
+          <span class="electron-toolbar-brand" aria-hidden="true">
+            <img src="./tibotattle-icon.png" alt="">
+          </span>
+          <span
+            class="electron-toolbar-allowance"
+            id="electron-toolbar-allowance"
+            data-available="false"
+            aria-label="Allowance unavailable"
+            data-i18n-aria-label="electron.shell.allowanceUnavailable"
+            title="Allowance unavailable"
+            data-i18n-title="electron.shell.allowanceUnavailable"
+          >—</span>
+        </span>
+        <span
+          class="state-pill state-connecting"
+          id="global-state"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          aria-relevant="text"
+        >
           <span class="state-dot" aria-hidden="true"></span>
           Connecting
         </span>
-        <button class="button button-secondary compact" id="refresh-button" type="button" disabled>
+        <button
+          class="button button-secondary compact electron-refresh-control"
+          id="refresh-button"
+          type="button"
+          disabled
+          aria-busy="false"
+        >
           Analyze local usage
         </button>
         <button class="button button-quiet compact" id="cancel-refresh" type="button" hidden>
           Cancel
         </button>
+        <button
+          class="button button-quiet compact electron-only-control"
+          id="electron-share-button"
+          type="button"
+          data-electron-only
+        data-i18n="electron.shell.share">Share</button>
+        <button
+          class="button button-quiet compact electron-only-control"
+          id="electron-settings-button"
+          type="button"
+          data-electron-only
+        data-i18n="electron.menu.settings">Settings…</button>
       </div>
     </header>
 
     <div class="dashboard-shell" data-i18n-legacy-root>
-      <aside class="dashboard-sidebar" aria-label="Dashboard navigation" data-i18n-aria-label="aria.dashboardNavigation">
+      <aside
+        class="dashboard-sidebar"
+        id="dashboard-sidebar"
+        aria-label="Dashboard navigation"
+        data-i18n-aria-label="aria.dashboardNavigation"
+      >
         <nav class="primary-nav" aria-label="Dashboard sections" data-i18n-aria-label="aria.dashboardSections">
           <a href="#overview" data-nav="overview" data-requires-evidence>Overview</a>
           <a href="#weekly" data-nav="weekly" data-requires-evidence>Allowance</a>
@@ -108,7 +182,7 @@
         </nav>
       </aside>
       <div class="dashboard-content">
-    <main id="main">
+    <main id="main" tabindex="-1">
       <section
         class="dashboard-boot-state"
         id="dashboard-boot-state"
@@ -128,7 +202,6 @@
           </p>
         </div>
       </section>
-
       <div class="page-heading" data-dashboard-page="overview">
         <div>
           <p class="eyebrow">Local evidence dashboard</p>
@@ -156,6 +229,17 @@
         <div class="notice-actions">
           <button class="button button-quiet" id="connection-check" type="button">Check again</button>
           <button class="button button-quiet" id="demo-button" type="button">Explore labeled demo</button>
+        </div>
+      </div>
+
+      <div class="notice notice-warning" id="source-coverage-notice" role="status" data-dashboard-page="overview" hidden>
+        <div>
+          <strong id="source-coverage-title">Codex source coverage is partial</strong>
+          <p id="source-coverage-copy">
+            Some configured or previously indexed activity could not be
+            refreshed. Any last-known indexed history is retained, but totals
+            may be incomplete until coverage recovers.
+          </p>
         </div>
       </div>
 
@@ -244,8 +328,8 @@
             Check again
           </button>
           <p id="setup-note">
-            A useful headline often appears in seconds. The first deep pass can
-            take a few minutes; later updates are normally faster. Work stops or
+            A useful headline can appear in seconds. The first deep pass may
+            take longer; later updates are normally faster. Work stops or
             checkpoints at a fixed bound, so a large Codex history may continue
             in another pass. You may close the browser tab; keep the Usage
             Monitor app open while analysis runs.
@@ -464,11 +548,16 @@
           and nothing private is on it. The reference still travels in the
           saved file name only.
         -->
-        <article class="panel share-panel" id="share-panel">
+        <article
+          class="panel share-panel"
+          id="share-panel"
+          aria-labelledby="share-panel-title"
+          tabindex="-1"
+        >
           <div class="panel-heading">
             <div>
               <p class="panel-kicker">Share</p>
-              <h3>A results card you can post</h3>
+              <h3 id="share-panel-title">A results card you can post</h3>
             </div>
           </div>
           <p class="annotation">

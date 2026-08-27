@@ -113,6 +113,57 @@ function captureStorage(storage) {
   return Object.freeze(captured);
 }
 
+function captureWindowsPreparedContributionContext(
+  context,
+  isContext,
+) {
+  if (context === null || context === undefined) return null;
+  if (typeof context !== "object" || Array.isArray(context)) {
+    throw new TypeError(
+      "Windows prepared contribution context must be an object",
+    );
+  }
+  if (typeof isContext !== "function") {
+    throw new TypeError(
+      "Windows prepared contribution context validator is required",
+    );
+  }
+  let branded = false;
+  try {
+    branded = Reflect.apply(isContext, undefined, [context]);
+  } catch {
+    branded = false;
+  }
+  if (branded !== true) {
+    throw new TypeError("Windows prepared contribution context is invalid");
+  }
+  const captured = {};
+  for (const name of [
+    "verifyPreparedContributionSet",
+    "loadVerifiedPreparedContribution",
+  ]) {
+    let value;
+    try {
+      value = context[name];
+    } catch {
+      throw new TypeError("Windows prepared contribution context is invalid");
+    }
+    captured[name] = requireFunction(
+      value,
+      `Windows prepared contribution context ${name}`,
+    );
+  }
+  return Object.freeze(captured);
+}
+
+async function failClosedWindowsPreparedContribution() {
+  fail("prepared_root_invalid");
+}
+
+async function failClosedWindowsPreparedSyncEntry() {
+  fail("prepared_root_invalid");
+}
+
 function iso(value = new Date()) {
   const date = value instanceof Date ? value : new Date(value);
   if (!Number.isFinite(date.getTime())) fail("configuration_invalid");
@@ -1202,7 +1253,16 @@ export function createLocalContributionSyncQueueContext({
   verifyPreparedSet,
   loadPreparedContribution,
   syncPreparedEntry,
+  platform = process.platform,
+  windowsSqliteStateSessionFactory = null,
+  windowsPreparedArtifactStorage = null,
+  windowsPreparedContributionContext = null,
+  isWindowsPreparedContributionContext = null,
+  windowsSyncPreparedEntry = null,
 } = {}) {
+  if (typeof platform !== "string" || platform.length < 1) {
+    throw new TypeError("platform must be a non-empty string");
+  }
   const storageFactory = requireFunction(createStorage, "createStorage");
   const storage = Reflect.apply(storageFactory, undefined, [{
     createError: (code) => new ContributionSyncQueueError(code),
@@ -1211,19 +1271,54 @@ export function createLocalContributionSyncQueueContext({
     maximumQueueBytes: MAX_QUEUE_BYTES,
     maximumQueueJobs: MAX_QUEUE_JOBS,
     jobStates: JOB_STATES,
+    platform,
+    windowsSqliteStateSessionFactory,
+    windowsPreparedArtifactStorage,
   }]);
+  const baseSyncPreparedEntry = requireFunction(
+    syncPreparedEntry,
+    "syncPreparedEntry",
+  );
+  const windowsPrepared = platform === "win32"
+    ? captureWindowsPreparedContributionContext(
+      windowsPreparedContributionContext,
+      isWindowsPreparedContributionContext,
+    )
+    : null;
+  const selectedVerifyPreparedSet = platform === "win32"
+    ? windowsPrepared?.verifyPreparedContributionSet
+      ?? failClosedWindowsPreparedContribution
+    : requireFunction(verifyPreparedSet, "verifyPreparedSet");
+  const selectedLoadPreparedContribution = platform === "win32"
+    ? windowsPrepared?.loadVerifiedPreparedContribution
+      ?? failClosedWindowsPreparedContribution
+    : requireFunction(
+      loadPreparedContribution,
+      "loadPreparedContribution",
+    );
+  let selectedSyncPreparedEntry;
+  if (platform !== "win32") {
+    selectedSyncPreparedEntry = baseSyncPreparedEntry;
+  } else if (windowsSyncPreparedEntry !== null) {
+    selectedSyncPreparedEntry = requireFunction(
+      windowsSyncPreparedEntry,
+      "windowsSyncPreparedEntry",
+    );
+  } else if (windowsPrepared !== null) {
+    selectedSyncPreparedEntry = (options) => baseSyncPreparedEntry({
+      ...options,
+      platform,
+      loadContribution: windowsPrepared.loadVerifiedPreparedContribution,
+    });
+  } else {
+    selectedSyncPreparedEntry = failClosedWindowsPreparedSyncEntry;
+  }
   const runtime = Object.freeze({
     storage: captureStorage(storage),
     resolvePath: requireFunction(resolvePath, "resolvePath"),
-    verifyPreparedSet: requireFunction(
-      verifyPreparedSet,
-      "verifyPreparedSet",
-    ),
-    loadPreparedContribution: requireFunction(
-      loadPreparedContribution,
-      "loadPreparedContribution",
-    ),
-    syncPreparedEntry: requireFunction(syncPreparedEntry, "syncPreparedEntry"),
+    verifyPreparedSet: selectedVerifyPreparedSet,
+    loadPreparedContribution: selectedLoadPreparedContribution,
+    syncPreparedEntry: selectedSyncPreparedEntry,
   });
   return Object.freeze({
     ACCEPTED_ARTIFACT_MAXIMUM_AGE_DAYS,

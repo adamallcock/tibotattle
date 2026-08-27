@@ -9,6 +9,9 @@
  * Split endpoint aliases are supported while the local server evolves:
  *   /api/local/{onboarding,overview,gradient,weekly,quality,reports}
  *
+ * Electron quick-result contract:
+ *   GET  /api/local/quick-overview
+ *
  * Central contribution contract:
  *   POST /api/v1/contributions
  *   POST /api/v1/me/contributions/read
@@ -98,7 +101,7 @@ export const LOCAL_CONTRIBUTION_PREPARATION_RESULT_VERSION =
   "local-contribution-preparation-result-v0.1";
 export const LOCAL_CONTRIBUTION_DEVICE_PAIRING_VERSION =
   "local-contribution-device-pairing-v0.1";
-export const LOCAL_ONBOARDING_SCHEMA_VERSION = "local-onboarding-v0.2";
+export const LOCAL_ONBOARDING_SCHEMA_VERSION = "local-onboarding-v0.3";
 export const LOCAL_COMPANION_SCHEMA_VERSION = "local-companion-v0.1";
 const MAXIMUM_ONBOARDING_ROLLOUT_FILES = 100;
 
@@ -575,6 +578,11 @@ export function normalizeLocalOnboarding(payload) {
   const unavailable = Object.freeze({
     state: "unavailable",
     sourceStatus: "unavailable",
+    sourceAvailability: "unavailable",
+    configuredCodexRoots: 0,
+    availableCodexRoots: 0,
+    emptyCodexRoots: 0,
+    unavailableCodexRoots: 0,
     sessionsReadable: false,
     archivedSessionsReadable: false,
     rolloutFilesPresent: false,
@@ -596,6 +604,11 @@ export function normalizeLocalOnboarding(payload) {
       || !["ready", "needs_attention"].includes(payload.status)
       || !hasExactKeys(payload.source, [
         "status",
+        "availability",
+        "configuredRoots",
+        "availableRoots",
+        "emptyRoots",
+        "unavailableRoots",
         "sessionsReadable",
         "archivedSessionsReadable",
         "rolloutFilesPresent",
@@ -617,6 +630,29 @@ export function normalizeLocalOnboarding(payload) {
         "session_directories_unreadable",
         "no_rollout_files"
       ].includes(payload.source.status)
+      || !["ready", "partial", "unavailable"].includes(
+        payload.source.availability
+      )
+      || !Number.isSafeInteger(payload.source.configuredRoots)
+      || payload.source.configuredRoots < 1
+      || payload.source.configuredRoots > 8
+      || !Number.isSafeInteger(payload.source.availableRoots)
+      || payload.source.availableRoots < 0
+      || payload.source.availableRoots > payload.source.configuredRoots
+      || !Number.isSafeInteger(payload.source.emptyRoots)
+      || payload.source.emptyRoots < 0
+      || payload.source.emptyRoots > payload.source.availableRoots
+      || !Number.isSafeInteger(payload.source.unavailableRoots)
+      || payload.source.unavailableRoots < 0
+      || payload.source.unavailableRoots
+        !== payload.source.configuredRoots - payload.source.availableRoots
+      || payload.source.availability !== (
+        payload.source.availableRoots === 0
+          ? "unavailable"
+          : payload.source.unavailableRoots > 0
+            ? "partial"
+            : "ready"
+      )
       || typeof payload.source.sessionsReadable !== "boolean"
       || typeof payload.source.archivedSessionsReadable !== "boolean"
       || typeof payload.source.rolloutFilesPresent !== "boolean"
@@ -647,6 +683,7 @@ export function normalizeLocalOnboarding(payload) {
         && payload.source.rolloutFilesPresent)
       || payload.status !== (
         payload.source.status === "ready"
+        && payload.source.availability !== "unavailable"
         && payload.state.status === "ready"
         && payload.capabilities.explicitRefresh
           ? "ready"
@@ -657,6 +694,11 @@ export function normalizeLocalOnboarding(payload) {
   return Object.freeze({
     state: payload.status,
     sourceStatus: payload.source.status,
+    sourceAvailability: payload.source.availability,
+    configuredCodexRoots: payload.source.configuredRoots,
+    availableCodexRoots: payload.source.availableRoots,
+    emptyCodexRoots: payload.source.emptyRoots,
+    unavailableCodexRoots: payload.source.unavailableRoots,
     sessionsReadable: payload.source.sessionsReadable,
     archivedSessionsReadable: payload.source.archivedSessionsReadable,
     rolloutFilesPresent: payload.source.rolloutFilesPresent,
@@ -667,6 +709,69 @@ export function normalizeLocalOnboarding(payload) {
     explicitRefresh: payload.capabilities.explicitRefresh,
     customCodexHomeConfigured:
       payload.capabilities.customCodexHomeConfigured
+  });
+}
+
+/**
+ * Validate the aggregate, path-free source coverage attached to a completed
+ * local refresh. `null` means the receipt is absent or malformed; callers keep
+ * their prior truthful state rather than interpreting that as recovered
+ * coverage.
+ */
+export function normalizeLocalRootCoverage(payload) {
+  if (!payload
+      || typeof payload !== "object"
+      || Array.isArray(payload)
+      || !hasExactKeys(payload, [
+        "status",
+        "configuredRoots",
+        "availableRoots",
+        "emptyRoots",
+        "unavailableRoots",
+        "retainedHistory",
+        "unavailableOwnerSources",
+        "ambiguousSources"
+      ])) return null;
+  const configuredRoots = payload.configuredRoots;
+  const availableRoots = payload.availableRoots;
+  const emptyRoots = payload.emptyRoots;
+  const unavailableRoots = payload.unavailableRoots;
+  const unavailableOwnerSources = payload.unavailableOwnerSources;
+  const ambiguousSources = payload.ambiguousSources;
+  if (!Number.isSafeInteger(configuredRoots)
+      || configuredRoots < 1
+      || configuredRoots > 8
+      || !Number.isSafeInteger(availableRoots)
+      || availableRoots < 0
+      || availableRoots > configuredRoots
+      || !Number.isSafeInteger(emptyRoots)
+      || emptyRoots < 0
+      || emptyRoots > availableRoots
+      || !Number.isSafeInteger(unavailableRoots)
+      || unavailableRoots < 0
+      || availableRoots + unavailableRoots !== configuredRoots
+      || typeof payload.retainedHistory !== "boolean"
+      || !Number.isSafeInteger(unavailableOwnerSources)
+      || unavailableOwnerSources < 0
+      || !Number.isSafeInteger(ambiguousSources)
+      || ambiguousSources < 0
+      || !["ready", "partial", "unavailable"].includes(payload.status)
+      || (payload.status === "unavailable"
+        && (availableRoots !== 0 || payload.retainedHistory !== true))
+      || (payload.status !== "unavailable" && availableRoots === 0)
+      || (payload.status === "ready"
+        && (unavailableRoots !== 0
+          || unavailableOwnerSources !== 0
+          || ambiguousSources !== 0))) return null;
+  return Object.freeze({
+    status: payload.status,
+    configuredRoots,
+    availableRoots,
+    emptyRoots,
+    unavailableRoots,
+    retainedHistory: payload.retainedHistory,
+    unavailableOwnerSources,
+    ambiguousSources
   });
 }
 
@@ -5522,6 +5627,39 @@ async function fetchJson(fetchImpl, url, options = {}) {
   return response.status === 204 ? null : response.json();
 }
 
+export const LOCAL_REFRESH_STATUS_TIMEOUT_MS = 4_000;
+const LOCAL_REFRESH_STATUS_TIMEOUT_MAX_MS = 30_000;
+export const LOCAL_REFRESH_CANCEL_TIMEOUT_MS = 8_000;
+const LOCAL_REFRESH_CANCEL_TIMEOUT_MAX_MS = 30_000;
+export const LOCAL_REFRESH_MAX_TRANSIENT_STATUS_FAILURES = 8;
+
+/**
+ * The browser owns the foreground refresh loop, so a status request can fail
+ * transiently while the companion is busy with synchronous accounting work.
+ * Electron keeps retrying those reads until its immutable operation deadline;
+ * the ordinary browser/native path retains the historical eight-failure stop.
+ */
+export function shouldAbortRefreshStatusPolling({
+  isElectron = false,
+  consecutiveFailures = 0,
+  operationDeadlineMs = null,
+  now = () => Date.now(),
+} = {}) {
+  if (typeof now !== "function"
+      || !Number.isSafeInteger(consecutiveFailures)
+      || consecutiveFailures < 0
+      || (operationDeadlineMs !== null
+        && (!Number.isSafeInteger(operationDeadlineMs)
+          || operationDeadlineMs < 0))) {
+    throw new TypeError("Refresh status polling inputs are invalid.");
+  }
+  if (operationDeadlineMs !== null && now() >= operationDeadlineMs) {
+    return true;
+  }
+  return isElectron !== true
+    && consecutiveFailures >= LOCAL_REFRESH_MAX_TRANSIENT_STATUS_FAILURES;
+}
+
 export function normalizeBackendReadiness(payload) {
   const unavailable = Object.freeze({
     state: "unavailable",
@@ -5592,13 +5730,31 @@ export function normalizeBackendReadiness(payload) {
 }
 
 export class LocalCompanionClient {
-  constructor({ fetchImpl = globalThis.fetch } = {}) {
+  constructor({
+    fetchImpl = globalThis.fetch,
+    refreshStatusTimeoutMs = LOCAL_REFRESH_STATUS_TIMEOUT_MS,
+    refreshCancelTimeoutMs = LOCAL_REFRESH_CANCEL_TIMEOUT_MS,
+  } = {}) {
     // Browser-native fetch is receiver-sensitive: invoked as a property of
     // this client it throws "Illegal invocation" (WebKit: "Can only call
     // Window.fetch on instances of Window") before any request leaves the
     // page. Hold a detached wrapper so every method may call
     // this.fetchImpl(...) directly.
     this.fetchImpl = (...args) => fetchImpl(...args);
+    this.refreshStatusTimeoutMs = Number.isFinite(refreshStatusTimeoutMs)
+      && refreshStatusTimeoutMs > 0
+      ? Math.min(
+        LOCAL_REFRESH_STATUS_TIMEOUT_MAX_MS,
+        Math.max(1, Math.trunc(refreshStatusTimeoutMs)),
+      )
+      : LOCAL_REFRESH_STATUS_TIMEOUT_MS;
+    this.refreshCancelTimeoutMs = Number.isFinite(refreshCancelTimeoutMs)
+      && refreshCancelTimeoutMs > 0
+      ? Math.min(
+        LOCAL_REFRESH_CANCEL_TIMEOUT_MAX_MS,
+        Math.max(1, Math.trunc(refreshCancelTimeoutMs)),
+      )
+      : LOCAL_REFRESH_CANCEL_TIMEOUT_MS;
     // Set once the companion has answered 404/405 for the consolidated
     // endpoint, so the negotiation is not repeated on every later load.
     this.consolidatedUnavailable = false;
@@ -5636,6 +5792,17 @@ export class LocalCompanionClient {
     return normalizeDashboardPayload({}, fragments);
   }
 
+  // The Electron quick-result phase must not ask the companion to serialize
+  // the full dashboard while the unified index is still accounting. Keep this
+  // as a separate, fixed same-origin capability: there is deliberately no
+  // fallback to load(), because falling back would put the expensive full
+  // projection back on the Electron control path.
+  async loadQuick() {
+    return normalizeDashboardPayload(
+      await fetchJson(this.fetchImpl, `${LOCAL_ROOT}/quick-overview`),
+    );
+  }
+
   health() {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/health`);
   }
@@ -5661,8 +5828,29 @@ export class LocalCompanionClient {
     });
   }
 
-  refreshStatus() {
-    return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh`);
+  async refreshStatus({ timeoutMs = this.refreshStatusTimeoutMs } = {}) {
+    // The UI's elapsed clock is independent of this request, but the polling
+    // loop still needs a bounded answer so it can enter its explicit
+    // reconnecting state instead of awaiting one starved companion request
+    // forever.
+    const timeout = Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? Math.min(
+        this.refreshStatusTimeoutMs,
+        Math.max(1, Math.trunc(timeoutMs)),
+      )
+      : this.refreshStatusTimeoutMs;
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(
+      () => controller.abort(),
+      timeout,
+    );
+    try {
+      return await fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh`, {
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
   }
 
   /**
@@ -5691,14 +5879,30 @@ export class LocalCompanionClient {
   }
 
   async cancelRefresh() {
-    return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh/cancel`, {
+    const controller = new AbortController();
+    let timeoutHandle = null;
+    const request = fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh/cancel`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-Usage-Monitor-Local": "1"
       },
+      signal: controller.signal,
       body: JSON.stringify({})
     });
+    const deadline = new Promise((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        controller.abort();
+        const error = new Error("The cancellation request timed out.");
+        error.code = "refresh_cancel_timed_out";
+        reject(error);
+      }, this.refreshCancelTimeoutMs);
+    });
+    try {
+      return await Promise.race([request, deadline]);
+    } finally {
+      if (timeoutHandle !== null) clearTimeout(timeoutHandle);
+    }
   }
 
   async contributionSyncStatus() {

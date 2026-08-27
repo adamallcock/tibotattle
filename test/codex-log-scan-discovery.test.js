@@ -936,11 +936,79 @@ test("complete-coverage consumers stop before emitting records from a mixed part
   }
 });
 
+test("complete-coverage consumers stop before emitting records when one root is unavailable", async () => {
+  const fixture = await emptyCanonicalHome();
+  let usageCallbacks = 0;
+  try {
+    await writeRecent(
+      join(fixture.sessions, canonicalName("2026-07-30T11-00-00", THREAD_A)),
+      rollout([
+        canonicalMeta({ id: THREAD_A }),
+        {
+          timestamp: "2026-07-30T11:00:01.000Z",
+          type: "turn_context",
+          payload: { model: "gpt-5.6-sol" },
+        },
+        {
+          timestamp: "2026-07-30T11:01:00.000Z",
+          type: "event_msg",
+          payload: {
+            type: "token_count",
+            info: {
+              total_token_usage: {
+                input_tokens: 10,
+                cached_input_tokens: 0,
+                output_tokens: 1,
+                reasoning_output_tokens: 0,
+                total_tokens: 11,
+              },
+              last_token_usage: {
+                input_tokens: 10,
+                cached_input_tokens: 0,
+                output_tokens: 1,
+                reasoning_output_tokens: 0,
+                total_tokens: 11,
+              },
+            },
+          },
+        },
+      ]),
+    );
+    await assert.rejects(
+      scanCodexLogEvents({
+        codexHomes: [fixture.codexHome, join(fixture.codexHome, "offline")],
+        startAt: START_AT,
+        endAt: END_AT,
+        requireCompleteDiscovery: true,
+        onUsage() { usageCallbacks += 1; },
+      }),
+      (error) => {
+        assert.equal(error?.name, "CodexRolloutCoverageError");
+        assert.equal(error?.code, "codex_rollout_roots_unavailable");
+        assert.deepEqual(error?.coverage, {
+          configuredRootCount: 2,
+          availableRootCount: 1,
+          unavailableRootCount: 1,
+        });
+        return true;
+      },
+    );
+    assert.equal(usageCallbacks, 0);
+  } finally {
+    await rm(fixture.codexHome, { recursive: true, force: true });
+  }
+});
+
 test("Codex SQLite selected heads are owner-controlled hints and stale or missing hints fall back safely", async () => {
   const fixture = await emptyCanonicalHome();
   const databaseFile = join(fixture.codexHome, "state_5.sqlite");
   try {
     assert.equal(await readCodexSelectedRolloutNames(fixture.codexHome), null);
+    if (process.platform === "win32") {
+      // Windows has no owner-only POSIX mode proof. Do not create or chmod an
+      // optional SQLite hint there; canonical metadata is the safe fallback.
+      return;
+    }
     const database = new DatabaseSync(databaseFile);
     database.exec("CREATE TABLE threads(id TEXT, rollout_path TEXT)");
     database.prepare("INSERT INTO threads(id, rollout_path) VALUES (?, ?)").run(

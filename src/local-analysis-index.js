@@ -2546,6 +2546,13 @@ export async function refreshLocalAnalysisIndex({
     signal,
     discoveryLimits,
   });
+  const discoveryFailureCode = infos.discoveryFailureCodes?.[0] ?? null;
+  if (typeof discoveryFailureCode === "string"
+      && discoveryFailureCode.startsWith("codex_log_discovery_")) {
+    const error = new Error("Codex log discovery stopped at a resource limit");
+    error.code = discoveryFailureCode;
+    throw error;
+  }
   let existing = null;
   try {
     existing = openExistingIndex(indexFile, { requireComplete: false });

@@ -47,6 +47,36 @@ function workspaceOptions(value, name) {
   };
 }
 
+test("bundle rejects mixed or malformed plural Codex root configuration", async () => {
+  const base = {
+    startAt: R7_FIXTURE_START_AT,
+    endAt: R7_FIXTURE_END_AT,
+    secret: R7_FIXTURE_SECRET,
+    resourceGuard: guard(),
+  };
+  for (const roots of [["/private/second"], []]) {
+    await assert.rejects(
+      createExportSourcePlanBundle({
+        ...base,
+        codexHome: "/private/one",
+        codexHomes: roots,
+      }),
+      (error) => error instanceof ExportSourcePlanBundleError
+        && error.code === "export_source_plan_bundle_configuration",
+    );
+  }
+  for (const roots of [[], ["/private/one", "/private/one"]]) {
+    await assert.rejects(
+      createExportSourcePlanBundle({
+        ...base,
+        codexHomes: roots,
+      }),
+      (error) => error instanceof ExportSourcePlanBundleError
+        && error.code === "export_source_plan_bundle_configuration",
+    );
+  }
+});
+
 test("one private bundle creates two fresh workspaces from the same frozen prefixes", async () => {
   const value = await frozenFixture();
   try {

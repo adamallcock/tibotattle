@@ -690,6 +690,7 @@ async function scanCodexSafeRecords({
   startAt,
   endAt,
   codexHome,
+  codexHomes,
   secret,
   activityMarkers = [],
   onRecord,
@@ -716,6 +717,7 @@ async function scanCodexSafeRecords({
     startAt: bounds.startAt,
     endAt: bounds.endAt,
     codexHome,
+    codexHomes,
     sourceScopeForRollout: (rawScope) => deriveSessionScopeId(secret, rawScope),
     onToolCall(event) {
       if (!event.sourceScopeId) throw new Error("Missing privacy-safe session scope for tool event");

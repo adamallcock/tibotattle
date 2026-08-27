@@ -18,13 +18,6 @@ import {
   preparedContributionContext,
 } from "./prepared-contribution-compatibility-internal.js";
 
-const {
-  publishPreparedContributionFile,
-  publishPreparedContributionManifest,
-  verifyPreparedContributionFiles,
-  verifyPreparedContributionSet,
-} = preparedContributionContext;
-
 export {
   TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
   TELEMETRY_CONTRIBUTION_VERSION,
@@ -37,12 +30,50 @@ function fixedError(code) {
   return error;
 }
 
+function capturePreparedContributionContext(context) {
+  if (context === null
+      || typeof context !== "object"
+      || Array.isArray(context)) {
+    throw fixedError("prepared_context_invalid");
+  }
+  const captured = {};
+  for (const name of [
+    "publishPreparedContributionFile",
+    "publishPreparedContributionManifest",
+    "verifyPreparedContributionFiles",
+    "verifyPreparedContributionSet",
+  ]) {
+    let value;
+    try {
+      value = context[name];
+    } catch {
+      throw fixedError("prepared_context_invalid");
+    }
+    if (typeof value !== "function") {
+      throw fixedError("prepared_context_invalid");
+    }
+    captured[name] = value;
+  }
+  if (context.ensureDirectory !== undefined
+      && typeof context.ensureDirectory !== "function") {
+    throw fixedError("prepared_context_invalid");
+  }
+  return Object.freeze({
+    ...captured,
+    ensureDirectory: context.ensureDirectory ?? null,
+  });
+}
+
 export async function materializeTelemetryContributions({
   bundleFile,
   receiptFile,
   outputDirectory,
   failpoint = async () => {},
   signal = null,
+  preparedContributionContext: configuredPreparedContributionContext =
+    preparedContributionContext,
+  isPreparedContributionContext = null,
+  loadVerifiedSource = loadVerifiedLocalMetadataBundleFiles,
 } = {}) {
   if (!outputDirectory) throw fixedError("output_required");
   if (typeof failpoint !== "function") throw fixedError("failpoint_invalid");
@@ -53,7 +84,30 @@ export async function materializeTelemetryContributions({
     throw fixedError("signal_invalid");
   }
   signal?.throwIfAborted?.();
-  const verified = await loadVerifiedLocalMetadataBundleFiles({
+  const selectedContext = capturePreparedContributionContext(
+    configuredPreparedContributionContext,
+  );
+  if (isPreparedContributionContext !== null
+      && typeof isPreparedContributionContext !== "function") {
+    throw fixedError("prepared_context_invalid");
+  }
+  let preparedContextValid = true;
+  if (isPreparedContributionContext !== null) {
+    try {
+      preparedContextValid = isPreparedContributionContext(
+        configuredPreparedContributionContext,
+      ) === true;
+    } catch {
+      preparedContextValid = false;
+    }
+  }
+  if (!preparedContextValid) {
+    throw fixedError("prepared_context_invalid");
+  }
+  if (typeof loadVerifiedSource !== "function") {
+    throw fixedError("source_verifier_invalid");
+  }
+  const verified = await loadVerifiedSource({
     bundleFile,
     receiptFile,
   });
@@ -62,18 +116,29 @@ export async function materializeTelemetryContributions({
   if (contributions.length > MAX_PREPARED_CONTRIBUTION_BATCHES) {
     throw fixedError("batch_count_invalid");
   }
-  const directory = resolve(outputDirectory);
-  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const outputPath = selectedContext.ensureDirectory !== null
+    ? outputDirectory
+    : resolve(outputDirectory);
+  const directory = selectedContext.ensureDirectory !== null
+    ? await selectedContext.ensureDirectory(outputPath)
+    : outputPath;
+  if (selectedContext.ensureDirectory !== null) {
+    if (directory === null || directory === undefined) {
+      throw fixedError("prepared_context_invalid");
+    }
+  } else {
+    await mkdir(outputPath, { recursive: true, mode: 0o700 });
+  }
   signal?.throwIfAborted?.();
   const files = [];
   for (const [index, contribution] of contributions.entries()) {
     signal?.throwIfAborted?.();
     const content = stableJson(contribution);
     const file = join(
-      directory,
+      outputPath,
       `telemetry-contribution-${String(index + 1).padStart(6, "0")}.json`,
     );
-    const published = await publishPreparedContributionFile({
+    const published = await selectedContext.publishPreparedContributionFile({
       directory,
       name: basename(file),
       content,
@@ -93,7 +158,7 @@ export async function materializeTelemetryContributions({
     });
     signal?.throwIfAborted?.();
   }
-  const manifestFiles = await verifyPreparedContributionFiles({
+  const manifestFiles = await selectedContext.verifyPreparedContributionFiles({
     directory,
     files: files.map((file) => ({
       basename: file.basename,
@@ -112,7 +177,7 @@ export async function materializeTelemetryContributions({
   };
   await failpoint("before_manifest", { batchCount: contributions.length });
   signal?.throwIfAborted?.();
-  const publishedManifest = await publishPreparedContributionManifest({
+  const publishedManifest = await selectedContext.publishPreparedContributionManifest({
     directory,
     manifest,
     builderVersion: TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
@@ -123,7 +188,7 @@ export async function materializeTelemetryContributions({
   signal?.throwIfAborted?.();
   await failpoint("after_manifest", { batchCount: contributions.length });
   signal?.throwIfAborted?.();
-  await verifyPreparedContributionSet({
+  await selectedContext.verifyPreparedContributionSet({
     directory,
     builderVersion: TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
   });
@@ -133,7 +198,7 @@ export async function materializeTelemetryContributions({
     builderVersion: TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
     sourcePrivacyVerdict: verified.summary.verdict,
     sourceTransportReady: verified.summary.transportReady,
-    outputDirectory: directory,
+    outputDirectory: outputPath,
     batchCount: contributions.length,
     files,
     preparedSet: {

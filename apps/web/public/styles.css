@@ -124,6 +124,118 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 }
 [hidden] { display: none !important; }
 
+/* The native AppKit shell owns its own toolbar. These two controls are
+ * present in shared dashboard markup only so Electron can reveal the
+ * corresponding desktop actions after its preload marker lands. */
+.electron-only-control { display: none !important; }
+html.electron-dashboard .electron-only-control,
+body.electron-dashboard .electron-only-control { display: inline-flex !important; }
+
+/* Electron mirrors the native AppKit glanceable status control in the shared
+ * page toolbar. The number is deliberately a separate, text-readable node:
+ * the state pill can say Fresh/Needs refresh while this compact value remains
+ * either a directly observed percentage or an unavailable dash. */
+.electron-toolbar-status {
+  display: inline-flex;
+  align-items: center;
+  gap: .42rem;
+  min-height: 37px;
+  padding: .3rem .62rem .3rem .44rem;
+  color: var(--green-text);
+  border: 1px solid rgba(23, 79, 69, .18);
+  border-radius: var(--radius-pill);
+  background: var(--green-soft);
+}
+.electron-toolbar-brand {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 25px;
+  height: 25px;
+  border-radius: var(--radius-round);
+  overflow: hidden;
+}
+.electron-toolbar-brand img {
+  display: block;
+  width: 25px;
+  height: 25px;
+  border-radius: var(--radius-round);
+}
+.electron-toolbar-allowance {
+  display: inline-flex;
+  align-items: center;
+  min-width: 2.25rem;
+  color: inherit;
+  font-size: .76rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: var(--weight-bold);
+  letter-spacing: .025em;
+  line-height: 1;
+  white-space: nowrap;
+}
+.electron-toolbar-allowance[data-available="false"] {
+  color: var(--muted);
+}
+.electron-sidebar-toggle {
+  flex: 0 0 auto;
+  gap: .48rem;
+}
+.electron-sidebar-glyph {
+  position: relative;
+  display: inline-block;
+  width: 1.05rem;
+  height: .86rem;
+  border: 1.5px solid currentColor;
+  border-radius: 2px;
+}
+.electron-sidebar-glyph::after {
+  position: absolute;
+  inset-block: 1px;
+  inset-inline-start: 4px;
+  border-inline-start: 1.5px solid currentColor;
+  content: "";
+}
+.electron-refresh-control::before {
+  display: inline-block;
+  content: "↻";
+  font-size: 1.08rem;
+  font-weight: var(--weight-regular);
+  line-height: 1;
+}
+.electron-refresh-control[aria-busy="true"]::before {
+  animation: electron-refresh-spin 1.05s linear infinite;
+}
+@keyframes electron-refresh-spin {
+  to { transform: rotate(360deg); }
+}
+html.electron-dashboard .electron-refresh-control,
+body.electron-dashboard .electron-refresh-control {
+  max-width: min(20rem, 28vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+html.electron-dashboard:has(#global-state.state-stale) .electron-toolbar-status,
+body.electron-dashboard:has(#global-state.state-stale) .electron-toolbar-status {
+  color: var(--amber);
+  border-color: rgba(154, 106, 36, .25);
+  background: var(--amber-soft);
+}
+html.electron-dashboard:has(#global-state.state-updating) .electron-toolbar-status,
+body.electron-dashboard:has(#global-state.state-updating) .electron-toolbar-status {
+  color: var(--amber);
+  border-color: rgba(154, 106, 36, .25);
+  background: var(--amber-soft);
+}
+html.electron-dashboard:has(#global-state.state-insufficient) .electron-toolbar-status,
+html.electron-dashboard:has(#global-state.state-offline) .electron-toolbar-status,
+body.electron-dashboard:has(#global-state.state-insufficient) .electron-toolbar-status,
+body.electron-dashboard:has(#global-state.state-offline) .electron-toolbar-status {
+  color: var(--rust);
+  border-color: rgba(169, 73, 47, .25);
+  background: var(--rust-soft);
+}
+
 .skip-link {
   position: fixed;
   z-index: 100;
@@ -135,6 +247,22 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
   border-radius: var(--radius-sm);
 }
 .skip-link:focus { top: 1rem; }
+.skip-link:focus-visible {
+  outline: 3px solid var(--blue);
+  outline-offset: 3px;
+}
+.share-panel:focus {
+  outline: 3px solid var(--blue);
+  outline-offset: 4px;
+}
+.share-panel:focus:not(:focus-visible) {
+  outline-color: rgba(49, 95, 132, .45);
+}
+.share-panel:focus-visible,
+#main:focus-visible {
+  outline: 3px solid var(--blue);
+  outline-offset: 4px;
+}
 .sr-only {
   position: absolute;
   width: 1px;
@@ -219,6 +347,27 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .primary-nav a:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 .dashboard-content { min-width: 0; -webkit-user-select: text; user-select: text; }
 [data-dashboard-page][hidden] { display: none !important; }
+
+/* Electron keeps the web sidebar, but its native-style View > Toggle Sidebar
+   command must be able to collapse it without changing the native AppKit
+   document. The zero-width column preserves the dashboard content width and
+   the hidden/inert sidebar cannot retain keyboard focus while collapsed. */
+html.electron-dashboard .dashboard-shell.sidebar-collapsed,
+body.electron-dashboard .dashboard-shell.sidebar-collapsed {
+  display: grid;
+  grid-template-columns: 0 minmax(0, 1fr);
+}
+html.electron-dashboard .dashboard-shell.sidebar-collapsed .dashboard-sidebar,
+body.electron-dashboard .dashboard-shell.sidebar-collapsed .dashboard-sidebar {
+  width: 0;
+  min-width: 0;
+  min-height: 0;
+  padding-inline: 0;
+  overflow: hidden;
+  visibility: hidden;
+  border-inline-end: 0;
+  pointer-events: none;
+}
 
 /* The packaged Mac app supplies a real AppKit header and sidebar. Keep this
    document focused on the selected, readable report instead of rendering a
@@ -2688,6 +2837,12 @@ footer p { margin: 0; }
   .topbar .history-index-badge { display: none; }
   /* Only the crowded top toolbar sheds its compact buttons on narrow screens. */
   .topbar .button.compact { display: none; }
+  /* Keep Electron's primary refresh action visible; Share and Settings remain
+     available from the native app menu when the toolbar is crowded. */
+  html.electron-dashboard .topbar #refresh-button.electron-refresh-control,
+  body.electron-dashboard .topbar #refresh-button.electron-refresh-control {
+    display: inline-flex !important;
+  }
   .dashboard-sidebar { padding-inline: 14px; }
   .page-heading, .section-heading, .section-heading.split, .weekly-hero, .weekly-pace-forecast, .setup-card, .companion-setup, .contribution-cta { grid-template-columns: 1fr; gap: 24px; }
   .companion-setup-actions { grid-column: 1; }
@@ -2753,6 +2908,13 @@ footer p { margin: 0; }
     gap: .45rem;
     font-size: .67rem;
   }
+  .electron-sidebar-toggle-label { display: none; }
+  .electron-sidebar-toggle { min-width: 44px; padding-inline: .65rem; }
+  .electron-toolbar-status { gap: .25rem; padding-inline: .34rem; }
+  .electron-toolbar-brand,
+  .electron-toolbar-brand img { width: 21px; height: 21px; }
+  html.electron-dashboard .electron-refresh-control,
+  body.electron-dashboard .electron-refresh-control { max-width: 7.5rem; }
   .primary-nav a {
     flex: 0 0 auto;
     min-width: 62px;
@@ -2776,6 +2938,73 @@ footer p { margin: 0; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation: none !important; transition: none !important; }
+}
+
+/* Windows High Contrast and other high-contrast modes must retain a visible
+   focus boundary even when the theme removes our cream/green palette. The
+   system colors are intentionally used here so the browser maps them to the
+   user's selected contrast pair instead of leaving low-contrast hard-coded
+   colors behind. */
+@media (forced-colors: active), (prefers-contrast: more) {
+  body { color: CanvasText; background: Canvas; }
+  .topbar,
+  .dashboard-sidebar,
+  .panel,
+  .metric-card,
+  .share-preview,
+  .state-pill,
+  .button,
+  .language-picker select {
+    border-color: CanvasText;
+    forced-color-adjust: auto;
+  }
+  .topbar,
+  .dashboard-sidebar,
+  .panel,
+  .metric-card,
+  .share-preview,
+  .language-picker select,
+  .button-secondary,
+  .button-quiet {
+    color: CanvasText;
+    background: Canvas;
+  }
+  .button-primary,
+  .skip-link {
+    color: HighlightText;
+    background: Highlight;
+    border-color: Highlight;
+  }
+  .state-pill,
+  .state-live,
+  .state-local,
+  .state-updating,
+  .state-setup,
+  .state-stale,
+  .state-insufficient,
+  .state-offline,
+  .state-demo,
+  .state-connecting {
+    color: CanvasText;
+    background: Canvas;
+  }
+  .state-dot { background: CanvasText; }
+  .electron-toolbar-status,
+  .electron-toolbar-allowance {
+    color: CanvasText;
+    background: Canvas;
+    border-color: CanvasText;
+  }
+  button:focus-visible,
+  input:focus-visible,
+  select:focus-visible,
+  a:focus-visible,
+  summary:focus-visible,
+  .share-panel:focus,
+  #main:focus {
+    outline: 3px solid Highlight;
+    outline-offset: 3px;
+  }
 }
 
 /*

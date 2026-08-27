@@ -42,6 +42,83 @@ function requireObject(configuration, name) {
   return value;
 }
 
+const WINDOWS_REVIEW_PAIR_STORAGE_CONTRACT_VERSION =
+  "windows-review-pair-storage-v1";
+const WINDOWS_REVIEW_PAIR_STORAGE_METHODS = Object.freeze([
+  "writeReviewPair",
+  "readReviewPair",
+  "recoverReviewPairTransactions",
+  "recoverOwnerOnlyPairTransactions",
+  "writeOwnerOnlyPairNoClobber",
+  "readOwnerOnlyLocalMetadataBundlePair",
+]);
+
+function requireOptionalPort(configuration, name) {
+  if (!configuration || typeof configuration !== "object"
+      || Array.isArray(configuration) || isProxy(configuration)) {
+    throw new TypeError("local metadata export configuration is required");
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(configuration, name);
+  if (!descriptor) return undefined;
+  if (!Object.hasOwn(descriptor, "value")
+      || typeof descriptor.value !== "function"
+      || isProxy(descriptor.value)) {
+    throw new TypeError(`local metadata export configuration.${name} must be a function`);
+  }
+  return descriptor.value;
+}
+
+function ownValue(object, name, message) {
+  const descriptor = Object.getOwnPropertyDescriptor(object, name);
+  if (!descriptor || !Object.hasOwn(descriptor, "value")) {
+    throw new TypeError(message);
+  }
+  return descriptor.value;
+}
+
+function reviewPairStoragePort(configuration) {
+  const descriptor = Object.getOwnPropertyDescriptor(configuration, "reviewPairStorage");
+  if (!descriptor) return undefined;
+  if (!Object.hasOwn(descriptor, "value")) {
+    throw new TypeError("Windows review pair storage is invalid");
+  }
+  const storage = descriptor.value;
+  if (!storage || typeof storage !== "object" || Array.isArray(storage)
+      || isProxy(storage)) {
+    throw new TypeError("Windows review pair storage is invalid");
+  }
+
+  const validator = requireOptionalPort(configuration, "reviewPairStorageValidator");
+  if (!validator) {
+    throw new TypeError("Windows review pair storage validator is required");
+  }
+  let reviewed;
+  try {
+    reviewed = Reflect.apply(validator, undefined, [storage]);
+  } catch {
+    throw new TypeError("Windows review pair storage is invalid");
+  }
+  if (reviewed !== true) throw new TypeError("Windows review pair storage is invalid");
+
+  if (ownValue(storage, "contractVersion", "Windows review pair storage is invalid")
+      !== WINDOWS_REVIEW_PAIR_STORAGE_CONTRACT_VERSION) {
+    throw new TypeError("Windows review pair storage is invalid");
+  }
+  for (const name of WINDOWS_REVIEW_PAIR_STORAGE_METHODS) {
+    const value = ownValue(storage, name, "Windows review pair storage is invalid");
+    if (typeof value !== "function" || isProxy(value)) {
+      throw new TypeError("Windows review pair storage is invalid");
+    }
+  }
+  return Object.freeze({
+    writeOwnerOnlyPairNoClobber: ownValue(
+      storage,
+      "writeOwnerOnlyPairNoClobber",
+      "Windows review pair storage is invalid",
+    ),
+  });
+}
+
 function boundedIso(value, field) {
   const timestamp = Date.parse(value);
   if (!Number.isFinite(timestamp)) throw new Error(`${field} must be an ISO timestamp`);
@@ -78,9 +155,16 @@ export function createLocalMetadataExportContext(configuration = {}) {
   const randomBundleId = requirePort(configuration, "randomBundleId");
   const resolvePath = requirePort(configuration, "resolvePath");
   const sha256Hex = requirePort(configuration, "sha256Hex");
-  const writeOwnerOnlyPairNoClobber = requirePort(configuration, "writeOwnerOnlyPairNoClobber");
+  const configuredWriter = requireOptionalPort(configuration, "writeOwnerOnlyPairNoClobber");
   const clock = requirePort(configuration, "clock");
   const rss = requirePort(configuration, "rss");
+  const selectedPlatform = platformName();
+  const reviewedWindowsPairStorage = selectedPlatform === "windows"
+    ? reviewPairStoragePort(configuration)
+    : undefined;
+  if (selectedPlatform !== "windows" && !configuredWriter) {
+    throw new TypeError("local metadata export configuration.writeOwnerOnlyPairNoClobber must be a function");
+  }
   const scanner = createLocalCodexLogScanner(codexLogPorts);
   const checkpointState = createCodexCheckpointStateContext({ createHash, isProxy });
   const safeRecords = createSafeRecordsContext({
@@ -119,6 +203,7 @@ export function createLocalMetadataExportContext(configuration = {}) {
     startAt,
     endAt,
     codexHome,
+    codexHomes,
     secret,
     activityMarkers = [],
     createdAt = new Date().toISOString(),
@@ -150,6 +235,7 @@ export function createLocalMetadataExportContext(configuration = {}) {
       startAt: bounds.startAt,
       endAt: bounds.endAt,
       codexHome,
+      codexHomes,
       secret,
       activityMarkers,
       onRecord({ recordType, record }) {
@@ -211,10 +297,27 @@ export function createLocalMetadataExportContext(configuration = {}) {
     ].join("\n");
   }
 
-  async function writeLocalMetadataBundle({ bundle, receipt, outputFile, receiptFile } = {}) {
+  async function writeLocalMetadataBundle({
+    bundle,
+    receipt,
+    outputFile,
+    receiptFile,
+    reviewPairStorage,
+    reviewPairStorageValidator,
+  } = {}) {
     if (!outputFile || !receiptFile) throw new Error("outputFile and receiptFile are required");
     const output = resolvePath(outputFile);
     const receiptOutput = resolvePath(receiptFile);
+    const operationReviewPairStorage = reviewPairStorage === undefined
+      ? undefined
+      : reviewPairStoragePort({ reviewPairStorage, reviewPairStorageValidator });
+    const writeOwnerOnlyPairNoClobber = operationReviewPairStorage?.writeOwnerOnlyPairNoClobber
+      ?? (selectedPlatform === "windows"
+        ? reviewedWindowsPairStorage?.writeOwnerOnlyPairNoClobber
+        : configuredWriter);
+    if (typeof writeOwnerOnlyPairNoClobber !== "function") {
+      throw new TypeError("Windows review pair storage writer is required");
+    }
     await writeOwnerOnlyPairNoClobber({
       firstPath: output,
       firstContent: stableJson(bundle),

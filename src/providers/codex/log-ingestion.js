@@ -14,6 +14,7 @@ export function createCodexLogIngestion({
     startAt,
     endAt,
     codexHome,
+    codexHomes,
     onUsage = () => {},
     onRateLimitSnapshot,
     onToolCall,
@@ -46,6 +47,7 @@ export function createCodexLogIngestion({
     throwIfAborted(signal);
     const rolloutInfos = suppliedRolloutInfos ?? await sources.discoverCodexRolloutInfos({
       codexHome,
+      codexHomes,
       startAt: new Date(Math.min(startMs, activeCutoffMs)).toISOString(),
       endAt,
       resourceGuard,
@@ -65,6 +67,32 @@ export function createCodexLogIngestion({
         skippedSourceBytes: Number(discoveryReceipt.skippedSourceBytes ?? 0),
         skippedThreadCount: Number(discoveryReceipt.skippedThreadCount ?? 0),
         reasonCounts: Object.freeze({ ...discoveryReceipt.reasonCounts }),
+      });
+      throw error;
+    }
+    const rootCoverageDescriptor = Object.getOwnPropertyDescriptor(
+      rolloutInfos,
+      "rootCoverage",
+    );
+    const rootCoverage = rootCoverageDescriptor
+      && Object.hasOwn(rootCoverageDescriptor, "value")
+      ? rootCoverageDescriptor.value
+      : null;
+    if (requireCompleteDiscovery
+        && rootCoverageDescriptor !== undefined
+        && rootCoverage?.status !== "ready") {
+      const safeCount = (value) => Number.isSafeInteger(value) && value >= 0
+        ? value
+        : 0;
+      const error = new Error(
+        "Codex rollout root coverage is incomplete; local metadata export stopped",
+      );
+      error.name = "CodexRolloutCoverageError";
+      error.code = "codex_rollout_roots_unavailable";
+      error.coverage = Object.freeze({
+        configuredRootCount: safeCount(rootCoverage?.configuredRoots),
+        availableRootCount: safeCount(rootCoverage?.availableRoots),
+        unavailableRootCount: safeCount(rootCoverage?.unavailableRoots),
       });
       throw error;
     }

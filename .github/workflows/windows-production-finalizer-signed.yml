@@ -1,0 +1,1245 @@
+name: Windows production finalizer signed candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Exact successful Windows portability canary run ID.
+        required: true
+        type: string
+      source_revision:
+        description: Exact 40-character source commit used by that canary.
+        required: true
+        type: string
+      source_ref:
+        description: Source branch; this workflow accepts refs/heads/main only.
+        required: true
+        type: string
+      production_confirmation:
+        description: Type the exact confirmation phrase to authorize a signed candidate.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: windows-production-finalizer-signed-${{ inputs.source_revision }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare unsigned Windows candidate manifest
+    runs-on: windows-2025
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      preparation-handoff-chunk-count: ${{ steps.prepare_handoff.outputs.manifest-chunk-count }}
+      preparation-handoff-manifest-bytes: ${{ steps.prepare_handoff.outputs.manifest-bytes }}
+      preparation-handoff-encoded-bytes: ${{ steps.prepare_handoff.outputs.manifest-encoded-bytes }}
+      preparation-handoff-sha256: ${{ steps.prepare_handoff.outputs.manifest-sha256 }}
+      preparation-source-run-attempt: ${{ steps.prepare_handoff.outputs.source-run-attempt }}
+      preparation-workflow-run-id: ${{ steps.prepare_handoff.outputs.workflow-run-id }}
+      preparation-workflow-run-attempt: ${{ steps.prepare_handoff.outputs.workflow-run-attempt }}
+      preparation-handoff-chunk-00: ${{ steps.prepare_handoff.outputs.manifest-chunk-00 }}
+      preparation-handoff-chunk-01: ${{ steps.prepare_handoff.outputs.manifest-chunk-01 }}
+      preparation-handoff-chunk-02: ${{ steps.prepare_handoff.outputs.manifest-chunk-02 }}
+      preparation-handoff-chunk-03: ${{ steps.prepare_handoff.outputs.manifest-chunk-03 }}
+      preparation-handoff-chunk-04: ${{ steps.prepare_handoff.outputs.manifest-chunk-04 }}
+      preparation-handoff-chunk-05: ${{ steps.prepare_handoff.outputs.manifest-chunk-05 }}
+      preparation-handoff-chunk-06: ${{ steps.prepare_handoff.outputs.manifest-chunk-06 }}
+      preparation-handoff-chunk-07: ${{ steps.prepare_handoff.outputs.manifest-chunk-07 }}
+      preparation-handoff-chunk-08: ${{ steps.prepare_handoff.outputs.manifest-chunk-08 }}
+      preparation-handoff-chunk-09: ${{ steps.prepare_handoff.outputs.manifest-chunk-09 }}
+      preparation-handoff-chunk-10: ${{ steps.prepare_handoff.outputs.manifest-chunk-10 }}
+      preparation-handoff-chunk-11: ${{ steps.prepare_handoff.outputs.manifest-chunk-11 }}
+      preparation-handoff-chunk-12: ${{ steps.prepare_handoff.outputs.manifest-chunk-12 }}
+      preparation-handoff-chunk-13: ${{ steps.prepare_handoff.outputs.manifest-chunk-13 }}
+      preparation-handoff-chunk-14: ${{ steps.prepare_handoff.outputs.manifest-chunk-14 }}
+      preparation-handoff-chunk-15: ${{ steps.prepare_handoff.outputs.manifest-chunk-15 }}
+    env:
+      CI: "1"
+
+    steps:
+      - name: Validate prepare dispatch context before checkout
+        shell: pwsh
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          FINALIZER_DISPATCH_CONTEXT_REF: ${{ github.ref }}
+          FINALIZER_DISPATCH_CONTEXT_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:SOURCE_RUN_ID -cnotmatch '^[1-9][0-9]{0,19}$' -or
+              $env:SOURCE_REVISION -cnotmatch '^[0-9a-f]{40}$' -or
+              $env:SOURCE_REF -cne 'refs/heads/main' -or
+              $env:FINALIZER_DISPATCH_CONTEXT_REF -cne 'refs/heads/main' -or
+              $env:FINALIZER_DISPATCH_CONTEXT_SHA -cne $env:SOURCE_REVISION) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_DISPATCH_CONTEXT_INVALID'
+            exit 1
+          }
+          "TIBOTATTLE_VALIDATED_FINALIZER_REF=$($env:FINALIZER_DISPATCH_CONTEXT_REF)" >> $env:GITHUB_ENV
+          "TIBOTATTLE_VALIDATED_FINALIZER_SHA=$($env:FINALIZER_DISPATCH_CONTEXT_SHA)" >> $env:GITHUB_ENV
+
+      - name: Fetch and statically validate prepare source provenance before checkout
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-production-prepare-source'
+          if (Test-Path -LiteralPath $root) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_SOURCE_ROOT_EXISTS'; exit 1 }
+          New-Item -ItemType Directory -Path $root -Force:$false | Out-Null
+          $runPath = Join-Path $root 'source-run.json'
+          $artifactListPath = Join-Path $root 'source-artifact-list.json'
+          $runText = gh api --method GET --header 'Accept: application/vnd.github+json' "/repos/adamallcock/tibotattle/actions/runs/$($env:SOURCE_RUN_ID)"
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_SOURCE_RUN_FETCH_FAILED'; exit 1 }
+          $runText | Set-Content -LiteralPath $runPath -Encoding utf8 -NoNewline
+          $artifactText = gh api --method GET --header 'Accept: application/vnd.github+json' "/repos/adamallcock/tibotattle/actions/runs/$($env:SOURCE_RUN_ID)/artifacts?per_page=100&page=1"
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_SOURCE_ARTIFACT_LIST_FETCH_FAILED'; exit 1 }
+          $artifactText | Set-Content -LiteralPath $artifactListPath -Encoding utf8 -NoNewline
+          try {
+            foreach ($path in @($runPath, $artifactListPath)) {
+              $metadata = Get-Item -LiteralPath $path -Force
+              if ($metadata -isnot [IO.FileInfo] -or $metadata.PSIsContainer -or
+                  ($metadata.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne [IO.FileAttributes]::None -or
+                  $metadata.Length -le 0 -or $metadata.Length -gt 524288) { throw 'bounded source metadata' }
+            }
+            $sourceRun = Get-Content -LiteralPath $runPath -Raw | ConvertFrom-Json
+            $artifactList = Get-Content -LiteralPath $artifactListPath -Raw | ConvertFrom-Json
+            if ($null -eq $sourceRun -or $sourceRun -is [array] -or $null -eq $artifactList -or $artifactList -is [array]) { throw 'source metadata shape' }
+            $sourcePath = [string]$sourceRun.path
+            $sourceRef = if ($sourceRun.PSObject.Properties.Name -contains 'ref') { [string]$sourceRun.ref } else { $env:SOURCE_REF }
+            $artifactRows = @($artifactList.artifacts)
+            $paginationKeys = @('continuation_token', 'cursor', 'has_more', 'incomplete_results', 'link', 'next', 'next_page', 'page', 'per_page')
+            $paginationPresent = @($paginationKeys | Where-Object { $artifactList.PSObject.Properties.Name -contains $_ })
+            $pathIsPortability = $sourcePath -ceq '.github/workflows/windows-portability.yml' -or $sourcePath -ceq '.github/workflows/windows-portability.yml@refs/heads/main'
+            if ([string]$sourceRun.id -cne $env:SOURCE_RUN_ID -or [string]$sourceRun.head_sha -cne $env:SOURCE_REVISION -or
+                [string]$sourceRun.repository.full_name -cne 'adamallcock/tibotattle' -or -not $pathIsPortability -or
+                [string]$sourceRun.head_branch -cne 'main' -or $sourceRef -cne $env:SOURCE_REF -or
+                [string]$sourceRun.event -cne 'workflow_dispatch' -or [string]$sourceRun.status -cne 'completed' -or
+                [string]$sourceRun.conclusion -cne 'success' -or [int64]$sourceRun.run_attempt -lt 1 -or
+                [int64]$sourceRun.run_attempt -gt 9007199254740991 -or [int64]$artifactList.total_count -lt 0 -or
+                [int64]$artifactList.total_count -gt 100 -or $artifactRows.Count -ne [int64]$artifactList.total_count -or
+                $paginationPresent.Count -ne 0) { throw 'source provenance mismatch' }
+          } catch { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_SOURCE_PROVENANCE_INVALID'; exit 1 }
+          "TIBOTATTLE_PREPARE_SOURCE_RUN_METADATA_PATH=$runPath" >> $env:GITHUB_ENV
+          "TIBOTATTLE_PREPARE_SOURCE_ARTIFACT_LIST_PATH=$artifactListPath" >> $env:GITHUB_ENV
+
+      - name: Check out exact prepare source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_revision }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify prepare checkout is exact and clean
+        shell: pwsh
+        env:
+          EXPECTED_REVISION: ${{ inputs.source_revision }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((git rev-parse --verify HEAD).Trim() -cne $env:EXPECTED_REVISION) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_CHECKOUT_REVISION_MISMATCH'
+            exit 1
+          }
+          git diff --quiet
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_CHECKOUT_DIRTY'; exit 1 }
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_CHECKOUT_INDEX_DIRTY'; exit 1 }
+          $untracked = @(git ls-files --others --exclude-standard)
+          if ($LASTEXITCODE -ne 0 -or $untracked.Count -ne 0) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_CHECKOUT_UNTRACKED'
+            exit 1
+          }
+
+      - name: Install pinned Node.js for prepare
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Activate pinned Corepack and pnpm for prepare
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm install --global corepack@0.34.0 --force *> $null
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_COREPACK_INSTALL_FAILED'; exit 1 }
+          corepack enable *> $null
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_COREPACK_ENABLE_FAILED'; exit 1 }
+          corepack prepare pnpm@11.9.0 --activate *> $null
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_PNPM_ACTIVATION_FAILED'; exit 1 }
+          if ((corepack --version).Trim() -cne '0.34.0' -or
+              (node --version).Trim() -cne 'v26.2.0' -or
+              (pnpm --version).Trim() -cne '11.9.0') {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_TOOLCHAIN_VERSION_MISMATCH'
+            exit 1
+          }
+
+      - name: Install locked dependencies for prepare
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_DEPENDENCY_INSTALL_FAILED'; exit 1 }
+
+      - name: Verify exact prepare package version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          try {
+            $package = Get-Content -LiteralPath 'package.json' -Raw | ConvertFrom-Json
+            $releaseVersion = node --input-type=module -e 'import { RELEASE_VERSION } from "./config/release-manifest.js"; process.stdout.write(RELEASE_VERSION)' 2>$null
+          } catch {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_PACKAGE_METADATA_INVALID'
+            exit 1
+          }
+          if ($package.name -cne 'app-usagemonitor' -or $package.type -cne 'module' -or
+              $package.version -cne $releaseVersion -or
+              $releaseVersion -cnotmatch '^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$') {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_PACKAGE_VERSION_INVALID'
+            exit 1
+          }
+          "TIBOTATTLE_PACKAGE_VERSION=$releaseVersion" >> $env:GITHUB_ENV
+
+      - name: Select prepare source qualification evidence
+        shell: pwsh
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidenceRoot = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-production-prepare-source-evidence'
+          if (Test-Path -LiteralPath $evidenceRoot) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_SOURCE_EVIDENCE_ROOT_EXISTS'; exit 1 }
+          New-Item -ItemType Directory -Path $evidenceRoot -Force:$false | Out-Null
+          node ./scripts/select-windows-finalizer-source-evidence.mjs --run-metadata $env:TIBOTATTLE_PREPARE_SOURCE_RUN_METADATA_PATH --artifact-list $env:TIBOTATTLE_PREPARE_SOURCE_ARTIFACT_LIST_PATH --output-root $evidenceRoot --repository adamallcock/tibotattle --revision $env:SOURCE_REVISION --ref $env:SOURCE_REF --run-id $env:SOURCE_RUN_ID
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_SOURCE_EVIDENCE_SELECTION_FAILED'; exit 1 }
+          "TIBOTATTLE_PREPARE_SOURCE_EVIDENCE_ROOT=$evidenceRoot" >> $env:GITHUB_ENV
+
+      - name: Parse prepare source artifact IDs and verify absent destinations
+        id: prepare_source_artifacts
+        shell: pwsh
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $selection = Get-Content -LiteralPath (Join-Path $env:TIBOTATTLE_PREPARE_SOURCE_EVIDENCE_ROOT 'selection-receipt.json') -Raw | ConvertFrom-Json
+          $warmId = [string]$selection.download.artifactIds.warm
+          $cleanId = [string]$selection.download.artifactIds.clean
+          if ($selection.status -cne 'WINDOWS_FINALIZER_SOURCE_EVIDENCE_SELECTED' -or [string]$selection.download.runId -cne $env:SOURCE_RUN_ID -or
+              $warmId -notmatch '^[1-9][0-9]{0,19}$' -or $cleanId -notmatch '^[1-9][0-9]{0,19}$' -or $warmId -ceq $cleanId) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_SOURCE_ARTIFACT_ID_INVALID'; exit 1
+          }
+          $warmRoot = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-production-prepare-receipts/warm'
+          $cleanRoot = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-production-prepare-receipts/clean'
+          if ((Test-Path -LiteralPath $warmRoot) -or (Test-Path -LiteralPath $cleanRoot)) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_RECEIPT_DESTINATION_EXISTS'; exit 1 }
+          if ($selection.download.action -cne 'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c' -or
+              $selection.download.artifactExpectation -cne 'direct-v7' -or $selection.download.githubToken -cne '${{ github.token }}' -or
+              $selection.download.repository -cne 'adamallcock/tibotattle' -or $selection.download.destinationMustBeAbsentBeforeDownload -ne $true -or
+              $selection.download.digestMismatch -cne 'error' -or $selection.download.mergeMultiple -ne $false) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_SELECTED_DOWNLOAD_POLICY_INVALID'; exit 1
+          }
+          "warm-id=$warmId" >> $env:GITHUB_OUTPUT
+          "clean-id=$cleanId" >> $env:GITHUB_OUTPUT
+
+      - name: Download prepare warm qualification receipt
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.prepare_source_artifacts.outputs.warm-id }}
+          github-token: ${{ github.token }}
+          repository: adamallcock/tibotattle
+          run-id: ${{ inputs.source_run_id }}
+          path: ${{ runner.temp }}/tibotattle-windows-production-prepare-receipts/warm
+          merge-multiple: false
+          digest-mismatch: error
+          skip-decompress: false
+
+      - name: Download prepare clean qualification receipt
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.prepare_source_artifacts.outputs.clean-id }}
+          github-token: ${{ github.token }}
+          repository: adamallcock/tibotattle
+          run-id: ${{ inputs.source_run_id }}
+          path: ${{ runner.temp }}/tibotattle-windows-production-prepare-receipts/clean
+          merge-multiple: false
+          digest-mismatch: error
+          skip-decompress: false
+
+      - name: Verify prepare qualification handoff and receipt files
+        shell: pwsh
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Get-ReceiptPath([string]$root, [string]$mode) {
+            $files = @(Get-ChildItem -LiteralPath $root -File -Force)
+            if ($files.Count -ne 1 -or $files[0].Name -cnotmatch "^tibotattle-windows-electron-qualification-[1-9][0-9]*-[1-9][0-9]*-[0-9a-f]{40}-$mode\.json$") { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_DOWNLOADED_RECEIPT_INVALID'; exit 1 }
+            return $files[0].FullName
+          }
+          $warmReceipt = Get-ReceiptPath (Join-Path $env:RUNNER_TEMP 'tibotattle-windows-production-prepare-receipts/warm') 'warm'
+          $cleanReceipt = Get-ReceiptPath (Join-Path $env:RUNNER_TEMP 'tibotattle-windows-production-prepare-receipts/clean') 'clean'
+          $handoffPath = Join-Path $env:RUNNER_TEMP 'windows-production-finalizer-prepare-qualification-handoff.json'
+          if (Test-Path -LiteralPath $handoffPath) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_QUALIFICATION_HANDOFF_EXISTS'; exit 1 }
+          node ./scripts/verify-windows-finalizer-qualification-handoff.mjs --output $handoffPath --repository adamallcock/tibotattle --revision $env:SOURCE_REVISION --ref $env:SOURCE_REF --run-metadata (Join-Path $env:TIBOTATTLE_PREPARE_SOURCE_EVIDENCE_ROOT 'run-metadata.json') --warm-receipt $warmReceipt --clean-receipt $cleanReceipt --warm-artifact (Join-Path $env:TIBOTATTLE_PREPARE_SOURCE_EVIDENCE_ROOT 'warm-artifact.json') --clean-artifact (Join-Path $env:TIBOTATTLE_PREPARE_SOURCE_EVIDENCE_ROOT 'clean-artifact.json')
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_QUALIFICATION_HANDOFF_FAILED'; exit 1 }
+          "TIBOTATTLE_PREPARE_QUALIFICATION_HANDOFF_PATH=$handoffPath" >> $env:GITHUB_ENV
+
+      - name: Build unsigned Windows binding and stage prepare tree
+        shell: pwsh
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $npmCommand = (Get-Command npm.cmd).Source
+          $nodeRoot = Split-Path $npmCommand -Parent
+          $nodeGypScript = Join-Path $nodeRoot 'node_modules\npm\node_modules\node-gyp\bin\node-gyp.js'
+          $bindingPath = Join-Path $env:GITHUB_WORKSPACE 'native/windows-filesystem/build/Release/windows_filesystem.node'
+          $qualificationPath = Join-Path $env:GITHUB_WORKSPACE 'native/windows-filesystem/build/Release/windows_filesystem_qualification.node'
+          if (-not (Test-Path -LiteralPath $nodeGypScript -PathType Leaf) -or (Test-Path -LiteralPath $qualificationPath)) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_BINDING_INPUT_INVALID'; exit 1
+          }
+          node $nodeGypScript rebuild --directory native/windows-filesystem *> $null
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $bindingPath -PathType Leaf) -or (Test-Path -LiteralPath $qualificationPath)) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_BINDING_BUILD_FAILED'; exit 1
+          }
+          node ./scripts/build-windows-filesystem-manifest.mjs *> $null
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_BINDING_MANIFEST_FAILED'; exit 1 }
+          $manifestPath = "$bindingPath.manifest.json"
+          if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_BINDING_MANIFEST_MISSING'; exit 1 }
+          $stagePath = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/windows-x64/app'
+          if (Test-Path -LiteralPath $stagePath) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_STAGE_EXISTS'; exit 1 }
+          New-Item -ItemType Directory -Path (Split-Path $stagePath -Parent) -Force:$false | Out-Null
+          node ./scripts/build-electron-app.mjs --target win32 --profile windows-production --version $env:TIBOTATTLE_PACKAGE_VERSION --output $stagePath --windows-binding $bindingPath --windows-manifest $manifestPath
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $stagePath -PathType Container)) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_STAGE_FAILED'; exit 1 }
+          "TIBOTATTLE_PREPARE_STAGE_PATH=$stagePath" >> $env:GITHUB_ENV
+          "TIBOTATTLE_PREPARE_BINDING_MANIFEST_PATH=$manifestPath" >> $env:GITHUB_ENV
+
+      - name: Validate provenance and build content-free prepare manifest
+        id: prepare_handoff
+        shell: pwsh
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $handoffPath = Join-Path $env:RUNNER_TEMP 'windows-production-finalizer-preparation-handoff.json'
+          if (Test-Path -LiteralPath $handoffPath) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_HANDOFF_EXISTS'; exit 1 }
+          $sourceRunMetadataPath = Join-Path $env:TIBOTATTLE_PREPARE_SOURCE_EVIDENCE_ROOT 'run-metadata.json'
+          try { $sourceRunMetadata = Get-Content -LiteralPath $sourceRunMetadataPath -Raw | ConvertFrom-Json }
+          catch { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_SOURCE_RUN_METADATA_INVALID'; exit 1 }
+          $sourceRunAttempt = [string]$sourceRunMetadata.runAttempt
+          if ($sourceRunAttempt -cnotmatch '^[1-9][0-9]{0,19}$') {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_SOURCE_RUN_ATTEMPT_INVALID'; exit 1
+          }
+          node ./scripts/build-windows-production-finalizer-preparation-handoff.mjs `
+            --output $handoffPath `
+            --source-revision $env:SOURCE_REVISION `
+            --source-ref $env:SOURCE_REF `
+            --source-run-id $env:SOURCE_RUN_ID `
+            --source-run-attempt $sourceRunAttempt `
+            --workflow-run-id $env:GITHUB_RUN_ID `
+            --workflow-run-attempt $env:GITHUB_RUN_ATTEMPT `
+            --source-handoff $env:TIBOTATTLE_PREPARE_QUALIFICATION_HANDOFF_PATH `
+            --staging-root $env:TIBOTATTLE_PREPARE_STAGE_PATH `
+            --package-json (Join-Path $env:GITHUB_WORKSPACE 'package.json') `
+            --lockfile (Join-Path $env:GITHUB_WORKSPACE 'pnpm-lock.yaml') *> $null
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_HANDOFF_FAILED'; exit 1 }
+          $transport = Join-Path $env:GITHUB_WORKSPACE 'scripts/windows-preparation-manifest-transport.ps1'
+          if (-not (Test-Path -LiteralPath $transport -PathType Leaf)) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_TRANSPORT_MISSING'; exit 1 }
+          & $transport -Mode Encode -InputPath $handoffPath -OutputFile $env:GITHUB_OUTPUT
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_TRANSPORT_FAILED'; exit 1 }
+          "source-run-attempt=$sourceRunAttempt" >> $env:GITHUB_OUTPUT
+          "workflow-run-id=$env:GITHUB_RUN_ID" >> $env:GITHUB_OUTPUT
+          "workflow-run-attempt=$env:GITHUB_RUN_ATTEMPT" >> $env:GITHUB_OUTPUT
+
+      - name: Remove prepare tree and verify clean checkout
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($path in @(
+            (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/windows-x64'),
+            (Join-Path $env:GITHUB_WORKSPACE 'native/windows-filesystem/build'),
+            (Join-Path $env:RUNNER_TEMP 'tibotattle-windows-production-prepare-source'),
+            (Join-Path $env:RUNNER_TEMP 'tibotattle-windows-production-prepare-source-evidence'),
+            (Join-Path $env:RUNNER_TEMP 'tibotattle-windows-production-prepare-receipts'),
+            (Join-Path $env:RUNNER_TEMP 'windows-production-finalizer-prepare-qualification-handoff.json'),
+            (Join-Path $env:RUNNER_TEMP 'windows-production-finalizer-preparation-handoff.json')
+          )) {
+            if (Test-Path -LiteralPath $path) {
+              $item = Get-Item -LiteralPath $path -Force
+              if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne [IO.FileAttributes]::None) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_CLEANUP_REPARSE'; exit 1 }
+              Remove-Item -LiteralPath $path -Recurse -Force
+            }
+          }
+          git diff --quiet
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_CHECKOUT_DIRTY_AFTER_CLEANUP'; exit 1 }
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_CHECKOUT_INDEX_DIRTY_AFTER_CLEANUP'; exit 1 }
+          $untracked = @(git ls-files --others --exclude-standard)
+          if ($LASTEXITCODE -ne 0 -or $untracked.Count -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARE_CHECKOUT_UNTRACKED_AFTER_CLEANUP'; exit 1 }
+
+  sign:
+    name: Windows signed candidate (unpublished)
+    needs: prepare
+    runs-on: windows-2025
+    environment: windows-production-signing
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      CI: "1"
+
+    steps:
+      - name: Validate exact dispatch inputs and explicit confirmation
+        shell: pwsh
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          FINALIZER_DISPATCH_CONTEXT_REF: ${{ github.ref }}
+          FINALIZER_DISPATCH_CONTEXT_SHA: ${{ github.sha }}
+          PRODUCTION_CONFIRMATION: ${{ inputs.production_confirmation }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:SOURCE_RUN_ID -cnotmatch '^[1-9][0-9]{0,19}$' -or
+              $env:SOURCE_REVISION -cnotmatch '^[0-9a-f]{40}$' -or
+              $env:SOURCE_REF -cne 'refs/heads/main' -or
+              $env:FINALIZER_DISPATCH_CONTEXT_REF -cne 'refs/heads/main' -or
+              $env:FINALIZER_DISPATCH_CONTEXT_SHA -cne $env:SOURCE_REVISION -or
+              $env:PRODUCTION_CONFIRMATION -cne 'I UNDERSTAND THIS SIGNS A WINDOWS CANDIDATE') {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_DISPATCH_INPUT_INVALID'
+            exit 1
+          }
+          "TIBOTATTLE_VALIDATED_FINALIZER_REF=$($env:FINALIZER_DISPATCH_CONTEXT_REF)" >> $env:GITHUB_ENV
+          "TIBOTATTLE_VALIDATED_FINALIZER_SHA=$($env:FINALIZER_DISPATCH_CONTEXT_SHA)" >> $env:GITHUB_ENV
+
+      - name: Fetch and statically validate exact source provenance before checkout
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-production-signed-source'
+          if (Test-Path -LiteralPath $root) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_SOURCE_ROOT_EXISTS'
+            exit 1
+          }
+          New-Item -ItemType Directory -Path $root -Force:$false | Out-Null
+          $runPath = Join-Path $root 'source-run.json'
+          $artifactListPath = Join-Path $root 'source-artifact-list.json'
+          $runText = gh api --method GET --header 'Accept: application/vnd.github+json' "/repos/adamallcock/tibotattle/actions/runs/$($env:SOURCE_RUN_ID)"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_SOURCE_RUN_FETCH_FAILED'
+            exit 1
+          }
+          $runText | Set-Content -LiteralPath $runPath -Encoding utf8 -NoNewline
+          $artifactText = gh api --method GET --header 'Accept: application/vnd.github+json' "/repos/adamallcock/tibotattle/actions/runs/$($env:SOURCE_RUN_ID)/artifacts?per_page=100&page=1"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_SOURCE_ARTIFACT_LIST_FETCH_FAILED'
+            exit 1
+          }
+          $artifactText | Set-Content -LiteralPath $artifactListPath -Encoding utf8 -NoNewline
+          try {
+            foreach ($path in @($runPath, $artifactListPath)) {
+              $metadata = Get-Item -LiteralPath $path -Force
+              if ($metadata -isnot [System.IO.FileInfo] -or
+                  $metadata.PSIsContainer -or
+                  ($metadata.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne [System.IO.FileAttributes]::None -or
+                  $metadata.Length -le 0 -or
+                  $metadata.Length -gt 524288) {
+                throw 'bounded source metadata'
+              }
+            }
+            $sourceRun = Get-Content -LiteralPath $runPath -Raw | ConvertFrom-Json
+            $artifactList = Get-Content -LiteralPath $artifactListPath -Raw | ConvertFrom-Json
+            if ($null -eq $sourceRun -or $sourceRun -is [array] -or
+                $null -eq $artifactList -or $artifactList -is [array]) {
+              throw 'source metadata shape'
+            }
+            $sourcePath = [string]$sourceRun.path
+            $sourceRef = if ($sourceRun.PSObject.Properties.Name -contains 'ref') {
+              [string]$sourceRun.ref
+            } else {
+              $env:SOURCE_REF
+            }
+            $artifactRows = @($artifactList.artifacts)
+            $paginationKeys = @('continuation_token', 'cursor', 'has_more', 'incomplete_results', 'link', 'next', 'next_page', 'page', 'per_page')
+            $paginationPresent = @($paginationKeys | Where-Object { $artifactList.PSObject.Properties.Name -contains $_ })
+            $pathIsPortability = $sourcePath -ceq '.github/workflows/windows-portability.yml' -or
+              $sourcePath -ceq '.github/workflows/windows-portability.yml@refs/heads/main'
+            if ([string]$sourceRun.id -cne $env:SOURCE_RUN_ID -or
+                [string]$sourceRun.head_sha -cne $env:SOURCE_REVISION -or
+                [string]$sourceRun.repository.full_name -cne 'adamallcock/tibotattle' -or
+                -not $pathIsPortability -or
+                [string]$sourceRun.head_branch -cne 'main' -or
+                $sourceRef -cne $env:SOURCE_REF -or
+                [string]$sourceRun.event -cne 'workflow_dispatch' -or
+                [string]$sourceRun.status -cne 'completed' -or
+                [string]$sourceRun.conclusion -cne 'success' -or
+                [int64]$sourceRun.run_attempt -lt 1 -or
+                [int64]$sourceRun.run_attempt -gt 9007199254740991 -or
+                [int64]$artifactList.total_count -lt 0 -or
+                [int64]$artifactList.total_count -gt 100 -or
+                $artifactRows.Count -ne [int64]$artifactList.total_count -or
+                $paginationPresent.Count -ne 0) {
+              throw 'source provenance mismatch'
+            }
+          } catch {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_SOURCE_PROVENANCE_INVALID'
+            exit 1
+          }
+          "TIBOTATTLE_SOURCE_RUN_METADATA_PATH=$runPath" >> $env:GITHUB_ENV
+          "TIBOTATTLE_SOURCE_ARTIFACT_LIST_PATH=$artifactListPath" >> $env:GITHUB_ENV
+
+      - name: Check out the exact source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_revision }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify exact clean checkout
+        shell: pwsh
+        env:
+          EXPECTED_REVISION: ${{ inputs.source_revision }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((git rev-parse --verify HEAD).Trim() -cne $env:EXPECTED_REVISION) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_CHECKOUT_REVISION_MISMATCH'
+            exit 1
+          }
+          git diff --quiet
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_CHECKOUT_DIRTY'; exit 1 }
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_CHECKOUT_INDEX_DIRTY'; exit 1 }
+          $untracked = @(git ls-files --others --exclude-standard)
+          if ($LASTEXITCODE -ne 0 -or $untracked.Count -ne 0) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_CHECKOUT_UNTRACKED'
+            exit 1
+          }
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Activate pinned Corepack and pnpm
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm install --global corepack@0.34.0 --force *> $null
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_COREPACK_INSTALL_FAILED'; exit 1 }
+          corepack enable *> $null
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_COREPACK_ENABLE_FAILED'; exit 1 }
+          corepack prepare pnpm@11.9.0 --activate *> $null
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PNPM_ACTIVATION_FAILED'; exit 1 }
+          if ((corepack --version).Trim() -cne '0.34.0' -or
+              (node --version).Trim() -cne 'v26.2.0' -or
+              (pnpm --version).Trim() -cne '11.9.0') {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_TOOLCHAIN_VERSION_MISMATCH'
+            exit 1
+          }
+
+      - name: Validate exact nonsecret signing environment before release config import
+        shell: pwsh
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          AZURE_CODE_SIGNING_ACCOUNT_NAME: ${{ vars.AZURE_CODE_SIGNING_ACCOUNT_NAME }}
+          AZURE_CODE_SIGNING_PROFILE_NAME: ${{ vars.AZURE_CODE_SIGNING_PROFILE_NAME }}
+          AZURE_CODE_SIGNING_ENDPOINT: ${{ vars.AZURE_CODE_SIGNING_ENDPOINT }}
+          AZURE_CODE_SIGNING_PUBLISHER_NAME: ${{ vars.AZURE_CODE_SIGNING_PUBLISHER_NAME }}
+          AZURE_CODE_SIGNING_TIMESTAMP_URL: ${{ vars.AZURE_CODE_SIGNING_TIMESTAMP_URL }}
+          AZURE_CODE_SIGNING_SUBJECT_SHA256: ${{ vars.AZURE_CODE_SIGNING_SUBJECT_SHA256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = [ordered]@{
+            AZURE_CLIENT_ID = 'b7f8b18a-4338-40cb-a53a-6a05499be330'
+            AZURE_TENANT_ID = '485c1020-7234-4307-88ee-67294114f087'
+            AZURE_SUBSCRIPTION_ID = '8f6118f5-3c88-433d-a2c2-9f4b2aef8b23'
+            AZURE_CODE_SIGNING_ACCOUNT_NAME = 'tibotattlesigning'
+            AZURE_CODE_SIGNING_PROFILE_NAME = 'tibotattle-windows-public'
+            AZURE_CODE_SIGNING_ENDPOINT = 'https://eus.codesigning.azure.net/'
+            AZURE_CODE_SIGNING_PUBLISHER_NAME = 'Adam Allcock'
+            AZURE_CODE_SIGNING_TIMESTAMP_URL = 'http://timestamp.acs.microsoft.com'
+          }
+          foreach ($name in $expected.Keys) {
+            if ([Environment]::GetEnvironmentVariable($name, 'Process') -cne $expected[$name]) {
+              Write-Error 'WINDOWS_SIGNED_FINALIZER_SIGNING_ENVIRONMENT_INVALID'
+              exit 1
+            }
+          }
+          $subjectHash = [Environment]::GetEnvironmentVariable('AZURE_CODE_SIGNING_SUBJECT_SHA256', 'Process')
+          if ($subjectHash -cnotmatch '^[0-9a-f]{64}$') {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_CERTIFICATE_SUBJECT_SHA256_INVALID'
+            exit 1
+          }
+          "TIBOTATTLE_VALIDATED_CERTIFICATE_SUBJECT_SHA256=$subjectHash" >> $env:GITHUB_ENV
+
+      - name: Confirm forbidden credential environment is absent
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $forbidden = @(
+            'CSC_LINK', 'WIN_CSC_LINK', 'CSC_KEY_PASSWORD', 'WIN_CSC_KEY_PASSWORD',
+            'CSC_NAME', 'CSC_IDENTITY_AUTO_DISCOVERY', 'CSC_FOR_PULL_REQUEST',
+            'CSC_CERTIFICATE_FILE', 'CSC_CERTIFICATE_PASSWORD', 'WIN_CERTIFICATE_FILE',
+            'WIN_CERTIFICATE_PASSWORD', 'AZURE_CLIENT_ID', 'AZURE_TENANT_ID',
+            'AZURE_SUBSCRIPTION_ID', 'AZURE_CLIENT_SECRET', 'AZURE_CLIENT_CERTIFICATE_PATH',
+            'AZURE_CLIENT_CERTIFICATE_PASSWORD', 'AZURE_USERNAME', 'AZURE_PASSWORD',
+            'AZURE_FEDERATED_TOKEN_FILE', 'AZURE_CODE_SIGNING_ACCOUNT_NAME',
+            'AZURE_CODE_SIGNING_PROFILE_NAME', 'AZURE_CODE_SIGNING_ENDPOINT',
+            'AZURE_CODE_SIGNING_PUBLISHER_NAME', 'AZURE_CODE_SIGNING_TIMESTAMP_URL',
+            'AZURE_CREDENTIALS', 'ARM_CLIENT_ID', 'ARM_TENANT_ID', 'ARM_SUBSCRIPTION_ID',
+            'ARM_CLIENT_SECRET', 'ARM_CLIENT_CERTIFICATE_PATH', 'ARM_CLIENT_CERTIFICATE_PASSWORD',
+            'ARM_USERNAME', 'ARM_PASSWORD', 'ARM_FEDERATED_TOKEN_FILE',
+            'TIBOTATTLE_WINDOWS_PFX_PATH'
+          )
+          $present = @([Environment]::GetEnvironmentVariables('Process').Keys | ForEach-Object { [string]$_ })
+          foreach ($name in $forbidden) {
+            if ($present -contains $name) { Write-Error 'WINDOWS_SIGNED_FINALIZER_FORBIDDEN_ENVIRONMENT_PRESENT'; exit 1 }
+          }
+          foreach ($name in $present) {
+            if ($name -cmatch '(?:^|_)(?:WIN_)?CSC(?:_|$)' -or
+                $name -cmatch '(?:^|_)(?:PFX|P12)(?:_|$)' -or
+                $name -cmatch '(?:^|_)(?:AZURE|ARM)_(?:CLIENT_SECRET|CLIENT_CERTIFICATE|FEDERATED_TOKEN)(?:_|$)') {
+              Write-Error 'WINDOWS_SIGNED_FINALIZER_FORBIDDEN_ENVIRONMENT_PATTERN_PRESENT'
+              exit 1
+            }
+          }
+
+      - name: Verify exact package version before production staging
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          try {
+            $package = Get-Content -LiteralPath 'package.json' -Raw | ConvertFrom-Json
+            $releaseVersion = node --input-type=module -e 'import { RELEASE_VERSION } from "./config/release-manifest.js"; process.stdout.write(RELEASE_VERSION)' 2>$null
+          } catch {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_PACKAGE_METADATA_INVALID'
+            exit 1
+          }
+          if ($package.name -cne 'app-usagemonitor' -or
+              $package.type -cne 'module' -or
+              $package.version -cne $releaseVersion -or
+              $releaseVersion -cnotmatch '^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$') {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_PACKAGE_VERSION_INVALID'
+            exit 1
+          }
+          "TIBOTATTLE_PACKAGE_VERSION=$releaseVersion" >> $env:GITHUB_ENV
+
+      - name: Create fresh fixed production and attempt roots
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $productionRoot = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/windows-x64'
+          if (Test-Path -LiteralPath $productionRoot) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_PRODUCTION_ROOT_EXISTS'
+            exit 1
+          }
+          $attemptRoot = Join-Path $env:RUNNER_TEMP ("tibotattle-windows-production-finalizer-signed-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)")
+          if (Test-Path -LiteralPath $attemptRoot) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_ATTEMPT_ROOT_EXISTS'
+            exit 1
+          }
+          $azureConfigRoot = Join-Path $attemptRoot 'azure-config'
+          New-Item -ItemType Directory -Path $productionRoot -Force:$false | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $productionRoot 'evidence') -Force:$false | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $productionRoot 'artifacts') -Force:$false | Out-Null
+          New-Item -ItemType Directory -Path $attemptRoot -Force:$false | Out-Null
+          New-Item -ItemType Directory -Path $azureConfigRoot -Force:$false | Out-Null
+          "TIBOTATTLE_PRODUCTION_ROOT=$productionRoot" >> $env:GITHUB_ENV
+          "TIBOTATTLE_APP_ROOT=$(Join-Path $productionRoot 'app')" >> $env:GITHUB_ENV
+          "TIBOTATTLE_EVIDENCE_ROOT=$(Join-Path $productionRoot 'evidence')" >> $env:GITHUB_ENV
+          "TIBOTATTLE_ARTIFACTS_ROOT=$(Join-Path $productionRoot 'artifacts')" >> $env:GITHUB_ENV
+          "TIBOTATTLE_SIGNED_ATTEMPT_ROOT=$attemptRoot" >> $env:GITHUB_ENV
+
+      - name: Select source evidence after checkout
+        shell: pwsh
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidenceRoot = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-production-signed-source-evidence'
+          if (Test-Path -LiteralPath $evidenceRoot) { Write-Error 'WINDOWS_SIGNED_FINALIZER_SOURCE_EVIDENCE_ROOT_EXISTS'; exit 1 }
+          New-Item -ItemType Directory -Path $evidenceRoot -Force:$false | Out-Null
+          node ./scripts/select-windows-finalizer-source-evidence.mjs `
+            --run-metadata $env:TIBOTATTLE_SOURCE_RUN_METADATA_PATH `
+            --artifact-list $env:TIBOTATTLE_SOURCE_ARTIFACT_LIST_PATH `
+            --output-root $evidenceRoot `
+            --repository adamallcock/tibotattle `
+            --revision $env:SOURCE_REVISION `
+            --ref $env:SOURCE_REF `
+            --run-id $env:SOURCE_RUN_ID
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_SOURCE_EVIDENCE_SELECTION_FAILED'; exit 1 }
+          "TIBOTATTLE_SOURCE_EVIDENCE_ROOT=$evidenceRoot" >> $env:GITHUB_ENV
+
+      - name: Parse selected source artifact IDs
+        id: select_source_artifacts
+        shell: pwsh
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $selection = Get-Content -LiteralPath (Join-Path $env:TIBOTATTLE_SOURCE_EVIDENCE_ROOT 'selection-receipt.json') -Raw | ConvertFrom-Json
+          $warmId = [string]$selection.download.artifactIds.warm
+          $cleanId = [string]$selection.download.artifactIds.clean
+          if ($selection.status -cne 'WINDOWS_FINALIZER_SOURCE_EVIDENCE_SELECTED' -or
+              [string]$selection.download.runId -cne $env:SOURCE_RUN_ID -or
+              $warmId -notmatch '^[1-9][0-9]{0,19}$' -or
+              $cleanId -notmatch '^[1-9][0-9]{0,19}$' -or
+              $warmId -ceq $cleanId) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_SOURCE_ARTIFACT_ID_INVALID'
+            exit 1
+          }
+          "warm-id=$warmId" >> $env:GITHUB_OUTPUT
+          "clean-id=$cleanId" >> $env:GITHUB_OUTPUT
+
+      - name: Verify exact selected download policy and absent roots
+        shell: pwsh
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $selection = Get-Content -LiteralPath (Join-Path $env:TIBOTATTLE_SOURCE_EVIDENCE_ROOT 'selection-receipt.json') -Raw | ConvertFrom-Json
+          $warmRoot = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-production-finalizer-receipts/warm'
+          $cleanRoot = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-production-finalizer-receipts/clean'
+          if ((Test-Path -LiteralPath $warmRoot) -or (Test-Path -LiteralPath $cleanRoot)) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_RECEIPT_DESTINATION_EXISTS'
+            exit 1
+          }
+          if ($selection.download.action -cne 'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c' -or
+              $selection.download.artifactExpectation -cne 'direct-v7' -or
+              $selection.download.githubToken -cne '${{ github.token }}' -or
+              $selection.download.repository -cne 'adamallcock/tibotattle' -or
+              [string]$selection.download.runId -cne $env:SOURCE_RUN_ID -or
+              $selection.download.destinationMustBeAbsentBeforeDownload -ne $true -or
+              $selection.download.digestMismatch -cne 'error' -or
+              $selection.download.mergeMultiple -ne $false -or
+              $selection.download.destinations.warm -cne '${{ runner.temp }}/tibotattle-windows-production-finalizer-receipts/warm' -or
+              $selection.download.destinations.clean -cne '${{ runner.temp }}/tibotattle-windows-production-finalizer-receipts/clean') {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_SELECTED_DOWNLOAD_POLICY_INVALID'
+            exit 1
+          }
+
+      - name: Download warm source qualification receipt
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.select_source_artifacts.outputs.warm-id }}
+          github-token: ${{ github.token }}
+          repository: adamallcock/tibotattle
+          run-id: ${{ inputs.source_run_id }}
+          path: ${{ runner.temp }}/tibotattle-windows-production-finalizer-receipts/warm
+          merge-multiple: false
+          digest-mismatch: error
+          skip-decompress: false
+
+      - name: Download clean source qualification receipt
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ steps.select_source_artifacts.outputs.clean-id }}
+          github-token: ${{ github.token }}
+          repository: adamallcock/tibotattle
+          run-id: ${{ inputs.source_run_id }}
+          path: ${{ runner.temp }}/tibotattle-windows-production-finalizer-receipts/clean
+          merge-multiple: false
+          digest-mismatch: error
+          skip-decompress: false
+
+      - name: Bind and verify exact downloaded source receipts
+        shell: pwsh
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Get-ReceiptPath([string]$root, [string]$mode) {
+            if (-not (Test-Path -LiteralPath $root -PathType Container)) { Write-Error 'WINDOWS_SIGNED_FINALIZER_DOWNLOADED_RECEIPT_MISSING'; exit 1 }
+            $files = @(Get-ChildItem -LiteralPath $root -File -Force)
+            if ($files.Count -ne 1 -or $files[0].Name -cnotmatch "^tibotattle-windows-electron-qualification-[1-9][0-9]*-[1-9][0-9]*-[0-9a-f]{40}-$mode\.json$") {
+              Write-Error 'WINDOWS_SIGNED_FINALIZER_DOWNLOADED_RECEIPT_INVALID'
+              exit 1
+            }
+            return $files[0].FullName
+          }
+          $warmReceipt = Get-ReceiptPath (Join-Path $env:RUNNER_TEMP 'tibotattle-windows-production-finalizer-receipts/warm') 'warm'
+          $cleanReceipt = Get-ReceiptPath (Join-Path $env:RUNNER_TEMP 'tibotattle-windows-production-finalizer-receipts/clean') 'clean'
+          $handoffPath = Join-Path $env:RUNNER_TEMP 'tibotattle-windows-production-signed-handoff.json'
+          if (Test-Path -LiteralPath $handoffPath) { Write-Error 'WINDOWS_SIGNED_FINALIZER_HANDOFF_OUTPUT_EXISTS'; exit 1 }
+          node ./scripts/verify-windows-finalizer-qualification-handoff.mjs `
+            --output $handoffPath `
+            --repository adamallcock/tibotattle `
+            --revision $env:SOURCE_REVISION `
+            --ref $env:SOURCE_REF `
+            --run-metadata (Join-Path $env:TIBOTATTLE_SOURCE_EVIDENCE_ROOT 'run-metadata.json') `
+            --warm-receipt $warmReceipt `
+            --clean-receipt $cleanReceipt `
+            --warm-artifact (Join-Path $env:TIBOTATTLE_SOURCE_EVIDENCE_ROOT 'warm-artifact.json') `
+            --clean-artifact (Join-Path $env:TIBOTATTLE_SOURCE_EVIDENCE_ROOT 'clean-artifact.json')
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_HANDOFF_VERIFICATION_FAILED'; exit 1 }
+          "TIBOTATTLE_FINALIZER_HANDOFF_PATH=$handoffPath" >> $env:GITHUB_ENV
+
+      - name: Install locked dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_DEPENDENCY_INSTALL_FAILED'; exit 1 }
+
+      - name: Build production Windows binding and manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $npmCommand = (Get-Command npm.cmd).Source
+          $nodeRoot = Split-Path $npmCommand -Parent
+          $nodeGypScript = Join-Path $nodeRoot 'node_modules\npm\node_modules\node-gyp\bin\node-gyp.js'
+          $bindingPath = Join-Path $env:GITHUB_WORKSPACE 'native/windows-filesystem/build/Release/windows_filesystem.node'
+          $qualificationPath = Join-Path $env:GITHUB_WORKSPACE 'native/windows-filesystem/build/Release/windows_filesystem_qualification.node'
+          if (-not (Test-Path -LiteralPath $nodeGypScript -PathType Leaf) -or (Test-Path -LiteralPath $qualificationPath)) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_BINDING_INPUT_INVALID'; exit 1
+          }
+          node $nodeGypScript rebuild --directory native/windows-filesystem *> $null
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $bindingPath -PathType Leaf) -or (Test-Path -LiteralPath $qualificationPath)) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_BINDING_BUILD_FAILED'; exit 1
+          }
+          node ./scripts/build-windows-filesystem-manifest.mjs *> $null
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_BINDING_MANIFEST_FAILED'; exit 1 }
+          $manifestPath = "$bindingPath.manifest.json"
+          if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { Write-Error 'WINDOWS_SIGNED_FINALIZER_BINDING_MANIFEST_MISSING'; exit 1 }
+          "TIBOTATTLE_WINDOWS_BINDING_PATH=$bindingPath" >> $env:GITHUB_ENV
+          "TIBOTATTLE_WINDOWS_BINDING_MANIFEST_PATH=$manifestPath" >> $env:GITHUB_ENV
+
+      - name: Stage fresh production Windows Electron app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path -LiteralPath $env:TIBOTATTLE_APP_ROOT) { Write-Error 'WINDOWS_SIGNED_FINALIZER_APP_ROOT_EXISTS'; exit 1 }
+          node ./scripts/build-electron-app.mjs `
+            --target win32 `
+            --profile windows-production `
+            --version $env:TIBOTATTLE_PACKAGE_VERSION `
+            --output $env:TIBOTATTLE_APP_ROOT `
+            --windows-binding $env:TIBOTATTLE_WINDOWS_BINDING_PATH `
+            --windows-manifest $env:TIBOTATTLE_WINDOWS_BINDING_MANIFEST_PATH
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $env:TIBOTATTLE_APP_ROOT -PathType Container)) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_APP_STAGE_FAILED'; exit 1
+          }
+
+      - name: Revalidate carried prepare manifest chunks and rebuilt tree before Azure login
+        shell: pwsh
+        env:
+          PREPARATION_HANDOFF_CHUNK_COUNT: ${{ needs.prepare.outputs.preparation-handoff-chunk-count }}
+          PREPARATION_HANDOFF_MANIFEST_BYTES: ${{ needs.prepare.outputs.preparation-handoff-manifest-bytes }}
+          PREPARATION_HANDOFF_ENCODED_BYTES: ${{ needs.prepare.outputs.preparation-handoff-encoded-bytes }}
+          PREPARATION_HANDOFF_SHA256: ${{ needs.prepare.outputs.preparation-handoff-sha256 }}
+          PREPARATION_HANDOFF_CHUNK_00: ${{ needs.prepare.outputs.preparation-handoff-chunk-00 }}
+          PREPARATION_HANDOFF_CHUNK_01: ${{ needs.prepare.outputs.preparation-handoff-chunk-01 }}
+          PREPARATION_HANDOFF_CHUNK_02: ${{ needs.prepare.outputs.preparation-handoff-chunk-02 }}
+          PREPARATION_HANDOFF_CHUNK_03: ${{ needs.prepare.outputs.preparation-handoff-chunk-03 }}
+          PREPARATION_HANDOFF_CHUNK_04: ${{ needs.prepare.outputs.preparation-handoff-chunk-04 }}
+          PREPARATION_HANDOFF_CHUNK_05: ${{ needs.prepare.outputs.preparation-handoff-chunk-05 }}
+          PREPARATION_HANDOFF_CHUNK_06: ${{ needs.prepare.outputs.preparation-handoff-chunk-06 }}
+          PREPARATION_HANDOFF_CHUNK_07: ${{ needs.prepare.outputs.preparation-handoff-chunk-07 }}
+          PREPARATION_HANDOFF_CHUNK_08: ${{ needs.prepare.outputs.preparation-handoff-chunk-08 }}
+          PREPARATION_HANDOFF_CHUNK_09: ${{ needs.prepare.outputs.preparation-handoff-chunk-09 }}
+          PREPARATION_HANDOFF_CHUNK_10: ${{ needs.prepare.outputs.preparation-handoff-chunk-10 }}
+          PREPARATION_HANDOFF_CHUNK_11: ${{ needs.prepare.outputs.preparation-handoff-chunk-11 }}
+          PREPARATION_HANDOFF_CHUNK_12: ${{ needs.prepare.outputs.preparation-handoff-chunk-12 }}
+          PREPARATION_HANDOFF_CHUNK_13: ${{ needs.prepare.outputs.preparation-handoff-chunk-13 }}
+          PREPARATION_HANDOFF_CHUNK_14: ${{ needs.prepare.outputs.preparation-handoff-chunk-14 }}
+          PREPARATION_HANDOFF_CHUNK_15: ${{ needs.prepare.outputs.preparation-handoff-chunk-15 }}
+          PREPARATION_SOURCE_RUN_ATTEMPT: ${{ needs.prepare.outputs.preparation-source-run-attempt }}
+          PREPARATION_WORKFLOW_RUN_ID: ${{ needs.prepare.outputs.preparation-workflow-run-id }}
+          PREPARATION_WORKFLOW_RUN_ATTEMPT: ${{ needs.prepare.outputs.preparation-workflow-run-attempt }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $attemptHandoffPath = Join-Path $env:TIBOTATTLE_SIGNED_ATTEMPT_ROOT 'windows-production-finalizer-preparation-handoff.json'
+          $transport = Join-Path $env:GITHUB_WORKSPACE 'scripts/windows-preparation-manifest-transport.ps1'
+          if (-not (Test-Path -LiteralPath $transport -PathType Leaf)) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARATION_TRANSPORT_MISSING'; exit 1 }
+          & $transport -Mode Decode -OutputPath $attemptHandoffPath -ExpectedSha256 $env:PREPARATION_HANDOFF_SHA256
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARATION_TRANSPORT_FAILED'; exit 1 }
+          $sourceRunMetadataPath = Join-Path $env:TIBOTATTLE_SOURCE_EVIDENCE_ROOT 'run-metadata.json'
+          try { $sourceRunMetadata = Get-Content -LiteralPath $sourceRunMetadataPath -Raw | ConvertFrom-Json }
+          catch { Write-Error 'WINDOWS_SIGNED_FINALIZER_SOURCE_RUN_METADATA_INVALID'; exit 1 }
+          if ([string]$sourceRunMetadata.databaseId -cne $env:SOURCE_RUN_ID -or
+              [string]$sourceRunMetadata.runAttempt -cne $env:PREPARATION_SOURCE_RUN_ATTEMPT -or
+              [string]$sourceRunMetadata.headSha -cne $env:SOURCE_REVISION -or
+              [string]$sourceRunMetadata.ref -cne $env:SOURCE_REF) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_SOURCE_RUN_ATTEMPT_MISMATCH'; exit 1
+          }
+          node ./scripts/build-windows-production-finalizer-preparation-handoff.mjs `
+            --verify `
+            --manifest $attemptHandoffPath `
+            --source-revision $env:SOURCE_REVISION `
+            --source-ref $env:SOURCE_REF `
+            --source-run-id $env:SOURCE_RUN_ID `
+            --source-run-attempt $env:PREPARATION_SOURCE_RUN_ATTEMPT `
+            --workflow-run-id $env:PREPARATION_WORKFLOW_RUN_ID `
+            --workflow-run-attempt $env:PREPARATION_WORKFLOW_RUN_ATTEMPT `
+            --staging-root (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/windows-x64/app') `
+            --package-json (Join-Path $env:GITHUB_WORKSPACE 'package.json') `
+            --lockfile (Join-Path $env:GITHUB_WORKSPACE 'pnpm-lock.yaml') `
+            --expected-sha256 $env:PREPARATION_HANDOFF_SHA256 *> $null
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARATION_REBUILD_MISMATCH'; exit 1 }
+          $evidenceHandoffPath = Join-Path $env:TIBOTATTLE_EVIDENCE_ROOT 'windows-production-finalizer-preparation-handoff.json'
+          if (Test-Path -LiteralPath $evidenceHandoffPath) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_PREPARATION_MANIFEST_PREEXISTS'; exit 1
+          }
+          [IO.File]::Copy($attemptHandoffPath, $evidenceHandoffPath, $false)
+          "TIBOTATTLE_PREPARATION_HANDOFF_SHA256=$env:PREPARATION_HANDOFF_SHA256" >> $env:GITHUB_ENV
+
+      - name: Seed canonical fixed evidence inputs without clobbering
+        shell: pwsh
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+          FINALIZER_DISPATCH_CONTEXT_REF: ${{ github.ref }}
+          FINALIZER_DISPATCH_CONTEXT_SHA: ${{ github.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $seed = @'
+          import { open, readFile } from "node:fs/promises";
+          import { join } from "node:path";
+          const root = process.env.TIBOTATTLE_EVIDENCE_ROOT;
+          const source = process.env.TIBOTATTLE_SOURCE_EVIDENCE_ROOT;
+          const workspace = process.env.GITHUB_WORKSPACE;
+          const revision = process.env.SOURCE_REVISION;
+          const dispatchRef = process.env.FINALIZER_DISPATCH_CONTEXT_REF;
+          const dispatchSha = process.env.FINALIZER_DISPATCH_CONTEXT_SHA;
+          const validatedRef = process.env.TIBOTATTLE_VALIDATED_FINALIZER_REF;
+          const validatedSha = process.env.TIBOTATTLE_VALIDATED_FINALIZER_SHA;
+          if (dispatchRef !== "refs/heads/main" ||
+              !/^[0-9a-f]{40}$/u.test(dispatchSha ?? "") ||
+              dispatchSha !== revision ||
+              validatedRef !== dispatchRef ||
+              validatedSha !== dispatchSha) {
+            throw new Error("WINDOWS_SIGNED_FINALIZER_DISPATCH_CONTEXT_BINDING_INVALID");
+          }
+          const writeNew = async (path, bytes) => {
+            const handle = await open(path, "wx", 0o600);
+            try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
+          };
+          const copy = async (sourcePath, destination) => writeNew(destination, await readFile(sourcePath));
+          const stable = (value) => Array.isArray(value) ? value.map(stable) : value && typeof value === "object"
+            ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])])) : value;
+          const json = (value) => Buffer.from(`${JSON.stringify(stable(value))}\n`, "utf8");
+          await copy(join(source, "selection-receipt.json"), join(root, "selection-receipt.json"));
+          await copy(process.env.TIBOTATTLE_FINALIZER_HANDOFF_PATH, join(root, "windows-finalizer-handoff-v2.json"));
+          await copy(join(source, "run-metadata.json"), join(root, "source-run.json"));
+          await copy(join(workspace, "package.json"), join(root, "package.json"));
+          await writeNew(join(root, "policy.json"), json({
+            certificateProfileName: "tibotattle-windows-public",
+            codeSigningAccountName: "tibotattlesigning",
+            certificateSubjectSha256: process.env.TIBOTATTLE_VALIDATED_CERTIFICATE_SUBJECT_SHA256,
+            endpoint: "https://eus.codesigning.azure.net/",
+            publisher: "Adam Allcock",
+            timestampRfc3161: "http://timestamp.acs.microsoft.com",
+          }));
+          await writeNew(join(root, "finalizer.json"), json({
+            event: "workflow_dispatch",
+            headSha: validatedSha,
+            ref: validatedRef,
+            repository: "adamallcock/tibotattle",
+            run: Number(process.env.GITHUB_RUN_ID),
+            runAttempt: Number(process.env.GITHUB_RUN_ATTEMPT),
+            workflow: ".github/workflows/windows-production-finalizer-signed.yml",
+          }));
+          '@
+          node --input-type=module -e $seed
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_EVIDENCE_SEED_FAILED'; exit 1 }
+
+      - name: Build native pre-sign input offline
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node ./scripts/build-windows-native-presign-input.mjs `
+            --evidence-root $env:TIBOTATTLE_EVIDENCE_ROOT `
+            --handoff windows-finalizer-handoff-v2.json `
+            --output windows-native-presign-input.json `
+            --certificate-subject-sha256 $env:TIBOTATTLE_VALIDATED_CERTIFICATE_SUBJECT_SHA256 *> $null
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PRESIGN_INPUT_FAILED'; exit 1 }
+
+      - name: Install and verify exact TrustedSigning module
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Install-Module -Name TrustedSigning -RequiredVersion 0.5.0 -Scope CurrentUser -Force -AllowClobber -Repository PSGallery
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_TRUSTEDSIGNING_INSTALL_FAILED'; exit 1 }
+          node ./scripts/verify-windows-trusted-signing-preflight.mjs
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_TRUSTEDSIGNING_PREFLIGHT_FAILED'; exit 1 }
+
+      # This is the only job with id-token: write. The protected environment is
+      # reviewed before this late login, after the reviewed-source boundary,
+      # preparation-manifest match, and all offline evidence gates.
+      - name: Establish Azure CLI session late after offline gates
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3.0.1
+        env:
+          AZURE_CONFIG_DIR: ${{ runner.temp }}/tibotattle-windows-production-finalizer-signed-${{ github.run_id }}-${{ github.run_attempt }}/azure-config
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          audience: api://AzureADTokenExchange
+          enable-AzPSSession: false
+
+      - name: Verify Azure certificate subject after login before signing
+        shell: pwsh
+        env:
+          AZURE_CONFIG_DIR: ${{ runner.temp }}/tibotattle-windows-production-finalizer-signed-${{ github.run_id }}-${{ github.run_attempt }}/azure-config
+          AZURE_CODE_SIGNING_SUBJECT_SHA256: ${{ vars.AZURE_CODE_SIGNING_SUBJECT_SHA256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedHash = [Environment]::GetEnvironmentVariable('AZURE_CODE_SIGNING_SUBJECT_SHA256', 'Process')
+          $validatedHash = [Environment]::GetEnvironmentVariable('TIBOTATTLE_VALIDATED_CERTIFICATE_SUBJECT_SHA256', 'Process')
+          if ($expectedHash -cnotmatch '^[0-9a-f]{64}$' -or $expectedHash -cne $validatedHash) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_CERTIFICATE_SUBJECT_SHA256_INVALID'; exit 1
+          }
+          $preflightPath = Join-Path $env:TIBOTATTLE_EVIDENCE_ROOT 'certificate-subject-preflight.json'
+          if (Test-Path -LiteralPath $preflightPath) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_CERTIFICATE_SUBJECT_PREFLIGHT_PREEXISTS'; exit 1
+          }
+          node ./scripts/verify-windows-production-certificate-subject-preflight.mjs --expected-subject-sha256 $expectedHash *> $preflightPath
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_CERTIFICATE_SUBJECT_PREFLIGHT_FAILED'; exit 1
+          }
+          $metadata = Get-Item -LiteralPath $preflightPath -Force
+          if ($metadata -isnot [IO.FileInfo] -or $metadata.Length -le 0 -or $metadata.Length -gt 8192 -or
+              (($metadata.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne [IO.FileAttributes]::None)) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_CERTIFICATE_SUBJECT_PREFLIGHT_RECEIPT_INVALID'; exit 1
+          }
+          try { $result = Get-Content -LiteralPath $preflightPath -Raw | ConvertFrom-Json }
+          catch { Write-Error 'WINDOWS_SIGNED_FINALIZER_CERTIFICATE_SUBJECT_PREFLIGHT_RECEIPT_INVALID'; exit 1 }
+          $resultKeys = @($result.PSObject.Properties.Name | Sort-Object)
+          if ($resultKeys -join ',' -cne 'algorithm,status,subjectSha256,subjectUtf8Bytes' -or
+              $result.status -cne 'WINDOWS_CERTIFICATE_SUBJECT_PREFLIGHT_PASSED' -or
+              $result.algorithm -cne 'sha256-utf8-subject-dn-v1' -or
+              $result.subjectSha256 -cne $expectedHash -or
+              [int]$result.subjectUtf8Bytes -le 0 -or [int]$result.subjectUtf8Bytes -gt 4096) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_CERTIFICATE_SUBJECT_PREFLIGHT_RECEIPT_INVALID'; exit 1
+          }
+          $policy = Get-Content -LiteralPath (Join-Path $env:TIBOTATTLE_EVIDENCE_ROOT 'policy.json') -Raw | ConvertFrom-Json
+          $presignInput = Get-Content -LiteralPath (Join-Path $env:TIBOTATTLE_EVIDENCE_ROOT 'windows-native-presign-input.json') -Raw | ConvertFrom-Json
+          if ($policy.certificateSubjectSha256 -cne $result.subjectSha256 -or
+              $presignInput.certificateSubjectSha256 -cne $result.subjectSha256) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_CERTIFICATE_SUBJECT_BINDING_MISMATCH'; exit 1
+          }
+          "TIBOTATTLE_CERTIFICATE_SUBJECT_PREFLIGHT_PATH=$preflightPath" >> $env:GITHUB_ENV
+
+      - name: Native pre-sign fixed Windows modules
+        shell: pwsh
+        env:
+          AZURE_CONFIG_DIR: ${{ runner.temp }}/tibotattle-windows-production-finalizer-signed-${{ github.run_id }}-${{ github.run_attempt }}/azure-config
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node ./scripts/windows-native-presign.mjs --input (Join-Path $env:TIBOTATTLE_EVIDENCE_ROOT 'windows-native-presign-input.json')
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_NATIVE_PRESIGN_FAILED'; exit 1 }
+          $nativeReceipt = Join-Path $env:TIBOTATTLE_EVIDENCE_ROOT ("windows-native-presign-$($env:SOURCE_REVISION).json")
+          if (-not (Test-Path -LiteralPath $nativeReceipt -PathType Leaf)) { Write-Error 'WINDOWS_SIGNED_FINALIZER_NATIVE_PRESIGN_RECEIPT_MISSING'; exit 1 }
+
+      - name: Build authority input offline
+        shell: pwsh
+        env:
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node ./scripts/build-windows-production-finalizer-authority-input.mjs `
+            --evidence-root $env:TIBOTATTLE_EVIDENCE_ROOT `
+            --staging-root $env:TIBOTATTLE_APP_ROOT `
+            --selection selection-receipt.json `
+            --handoff windows-finalizer-handoff-v2.json `
+            --preparation-handoff windows-production-finalizer-preparation-handoff.json `
+            --native-presign ("windows-native-presign-$($env:SOURCE_REVISION).json") `
+            --checkout-package-json package.json `
+            --source-run-metadata source-run.json `
+            --policy policy.json `
+            --finalizer-metadata finalizer.json `
+            --output authority-input.json
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_AUTHORITY_INPUT_FAILED'; exit 1 }
+
+      - name: Run closed authority driver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node ./scripts/run-windows-production-finalizer-authority.mjs --options (Join-Path $env:TIBOTATTLE_EVIDENCE_ROOT 'authority-input.json')
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_AUTHORITY_DRIVER_FAILED'; exit 1 }
+          if (-not (Test-Path -LiteralPath (Join-Path $env:TIBOTATTLE_EVIDENCE_ROOT 'authority.json') -PathType Leaf)) { Write-Error 'WINDOWS_SIGNED_FINALIZER_AUTHORITY_MISSING'; exit 1 }
+
+      - name: Build signed NSIS x64 candidate with electron-builder 26.15.7
+        shell: pwsh
+        env:
+          AZURE_CONFIG_DIR: ${{ runner.temp }}/tibotattle-windows-production-finalizer-signed-${{ github.run_id }}-${{ github.run_attempt }}/azure-config
+          TIBOTATTLE_ELECTRON_TARGET: win32
+          TIBOTATTLE_ELECTRON_SIGNING_MODE: azure-trusted-signing
+          TIBOTATTLE_ELECTRON_AZURE_PUBLISHER_NAME: ${{ vars.AZURE_CODE_SIGNING_PUBLISHER_NAME }}
+          TIBOTATTLE_ELECTRON_AZURE_ENDPOINT: ${{ vars.AZURE_CODE_SIGNING_ENDPOINT }}
+          TIBOTATTLE_ELECTRON_AZURE_CODE_SIGNING_ACCOUNT_NAME: ${{ vars.AZURE_CODE_SIGNING_ACCOUNT_NAME }}
+          TIBOTATTLE_ELECTRON_AZURE_CERTIFICATE_PROFILE_NAME: ${{ vars.AZURE_CODE_SIGNING_PROFILE_NAME }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = Get-Content -LiteralPath package.json -Raw | ConvertFrom-Json
+          $env:TIBOTATTLE_ELECTRON_VERSION = [string]$package.version
+          $builderVersion = (pnpm exec electron-builder --version).Trim()
+          if ($builderVersion -cne '26.15.7') { Write-Error 'WINDOWS_SIGNED_FINALIZER_ELECTRON_BUILDER_VERSION_MISMATCH'; exit 1 }
+          pnpm exec electron-builder --config apps/electron/electron-builder.release.config.cjs --win nsis --x64 --publish never
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_ELECTRON_BUILDER_FAILED'; exit 1 }
+          $ledgerPath = Join-Path $env:TIBOTATTLE_EVIDENCE_ROOT 'windows-signing-operation-ledger.json'
+          if (-not (Test-Path -LiteralPath $ledgerPath -PathType Leaf)) { Write-Error 'WINDOWS_SIGNED_FINALIZER_SIGNING_LEDGER_MISSING'; exit 1 }
+          $ledger = Get-Content -LiteralPath $ledgerPath -Raw | ConvertFrom-Json
+          if ($ledger.schemaVersion -cne 'tibotattle-windows-signing-operation-ledger-v1' -or
+              $ledger.status -cne 'WINDOWS_SIGNING_OPERATION_LEDGER_RECORDED' -or
+              [int]$ledger.classes.node -ne 0 -or
+              [int]$ledger.classes.unexpected -ne 0) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_SIGNING_LEDGER_INVALID'
+            exit 1
+          }
+
+      - name: Verify fixed packaged artifact CLI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node ./scripts/verify-windows-production-packaged-artifact.mjs
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PACKAGED_ARTIFACT_FAILED'; exit 1 }
+          if (-not (Test-Path -LiteralPath (Join-Path $env:TIBOTATTLE_EVIDENCE_ROOT 'packaged-artifact-receipt.json') -PathType Leaf)) { Write-Error 'WINDOWS_SIGNED_FINALIZER_PACKAGED_RECEIPT_MISSING'; exit 1 }
+
+      - name: Run native Authenticode, installer, and aggregate receipt CLI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $authenticodePath = Join-Path $env:TIBOTATTLE_EVIDENCE_ROOT 'authenticode-inventory.json'
+          $installerPath = Join-Path $env:TIBOTATTLE_EVIDENCE_ROOT 'installer-receipt.json'
+          $finalPath = Join-Path $env:TIBOTATTLE_EVIDENCE_ROOT 'windows-production-finalizer-receipt.json'
+          if ((Test-Path -LiteralPath $authenticodePath) -or
+              (Test-Path -LiteralPath $installerPath) -or
+              (Test-Path -LiteralPath $finalPath)) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_AGGREGATE_OUTPUT_PREEXISTS'
+            exit 1
+          }
+          # This one process collects and brands native Authenticode evidence,
+          # derives installer evidence from that exact object, and joins the
+          # package ledger/PE inventory into the final receipt. Serialized
+          # Authenticode input is never trusted as native proof.
+          node ./scripts/build-windows-production-finalizer-receipt.mjs
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_AGGREGATE_RECEIPT_FAILED'; exit 1 }
+          if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) { Write-Error 'WINDOWS_SIGNED_FINALIZER_INSTALLER_RECEIPT_MISSING'; exit 1 }
+          if (-not (Test-Path -LiteralPath $finalPath -PathType Leaf)) { Write-Error 'WINDOWS_SIGNED_FINALIZER_RECEIPT_MISSING'; exit 1 }
+          if (Test-Path -LiteralPath $authenticodePath) { Write-Error 'WINDOWS_SIGNED_FINALIZER_SERIALIZED_AUTHENTICODE_UNEXPECTED'; exit 1 }
+
+      - name: Verify aggregate receipt is unpublished and installed lifecycle is not_run
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $receiptPath = Join-Path $env:TIBOTATTLE_EVIDENCE_ROOT 'windows-production-finalizer-receipt.json'
+          if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) { Write-Error 'WINDOWS_SIGNED_FINALIZER_RECEIPT_MISSING'; exit 1 }
+          $receipt = Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
+          if ($receipt.production.ready -ne $false -or
+              $receipt.production.enabled -ne $false -or
+              $receipt.production.distribution -cne 'unpublished' -or
+              @($receipt.installedLifecycle.PSObject.Properties | Where-Object { $_.Value -cne 'not_run' }).Count -ne 0) {
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_RECEIPT_POSTURE_INVALID'
+            exit 1
+          }
+
+      - name: Remove exact attempt and signed candidate roots; verify clean checkout
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # This gate removes only exact, resolved attempt roots. It rejects
+          # observable reparse points; native reparse/race qualification remains
+          # a separate Windows production gate and is not inferred here.
+          $workspaceParent = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
+          $runnerTempParent = [IO.Path]::GetFullPath($env:RUNNER_TEMP)
+          $attemptRoot = [IO.Path]::GetFullPath((Join-Path $runnerTempParent ("tibotattle-windows-production-finalizer-signed-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)")))
+          $targets = @(
+            # The production root includes the fixed certificate-subject-preflight.json leaf.
+            [pscustomobject]@{ Path = [IO.Path]::GetFullPath((Join-Path $workspaceParent '.release-build/electron-production/windows-x64')); Parent = $workspaceParent },
+            [pscustomobject]@{ Path = [IO.Path]::GetFullPath((Join-Path $workspaceParent 'native/windows-filesystem/build')); Parent = $workspaceParent },
+            [pscustomobject]@{ Path = [IO.Path]::GetFullPath((Join-Path $runnerTempParent 'tibotattle-windows-production-signed-source')); Parent = $runnerTempParent },
+            [pscustomobject]@{ Path = [IO.Path]::GetFullPath((Join-Path $runnerTempParent 'tibotattle-windows-production-signed-source-evidence')); Parent = $runnerTempParent },
+            [pscustomobject]@{ Path = [IO.Path]::GetFullPath((Join-Path $runnerTempParent 'tibotattle-windows-production-finalizer-receipts')); Parent = $runnerTempParent },
+            [pscustomobject]@{ Path = [IO.Path]::GetFullPath((Join-Path $runnerTempParent 'tibotattle-windows-production-signed-handoff.json')); Parent = $runnerTempParent },
+            [pscustomobject]@{ Path = [IO.Path]::GetFullPath((Join-Path $runnerTempParent 'windows-production-finalizer-preparation-handoff-rebuilt.json')); Parent = $runnerTempParent },
+            [pscustomobject]@{ Path = [IO.Path]::GetFullPath((Join-Path $attemptRoot 'azure-config')); Parent = $attemptRoot },
+            [pscustomobject]@{ Path = $attemptRoot; Parent = $runnerTempParent }
+          )
+          function Test-CleanupPathUnderParent([string]$path, [string]$parent) {
+            if (-not [IO.Path]::IsPathFullyQualified($path) -or -not [IO.Path]::IsPathFullyQualified($parent)) { return $false }
+            $fullPath = [IO.Path]::GetFullPath($path)
+            $fullParent = [IO.Path]::GetFullPath($parent).TrimEnd([char[]]'\\/')
+            if ($fullPath -ceq $fullParent) { return $false }
+            return $fullPath.StartsWith("$fullParent\", [StringComparison]::OrdinalIgnoreCase)
+          }
+          function Test-CleanupTarget([pscustomobject]$target) {
+            if (-not (Test-CleanupPathUnderParent $target.Path $target.Parent)) { return $false }
+            if (-not (Test-Path -LiteralPath $target.Path)) { return $true }
+            try {
+              $item = Get-Item -LiteralPath $target.Path -Force -ErrorAction Stop
+              $resolved = (Resolve-Path -LiteralPath $target.Path -ErrorAction Stop).ProviderPath
+              if ($resolved -cne $target.Path -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne [IO.FileAttributes]::None)) { return $false }
+              if ($item.Name -cmatch '(?i)(?:\.replaced(?:$|[.-])|\.replacement(?:$|[.-])|invalidated)') { return $false }
+              if ($item.PSIsContainer) {
+                foreach ($child in @(Get-ChildItem -LiteralPath $target.Path -Force -Recurse -ErrorAction Stop)) {
+                  if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne [IO.FileAttributes]::None -or
+                      $child.Name -cmatch '(?i)(?:\.replaced(?:$|[.-])|\.replacement(?:$|[.-])|invalidated)') { return $false }
+                }
+              }
+              return $true
+            } catch {
+              return $false
+            }
+          }
+          $unsafe = @()
+          foreach ($target in $targets) {
+            if (-not (Test-CleanupTarget $target)) { $unsafe += $target.Path }
+          }
+          foreach ($target in $targets) {
+            if ($unsafe -contains $target.Path -or -not (Test-Path -LiteralPath $target.Path)) { continue }
+            if (-not (Test-CleanupTarget $target)) { $unsafe += $target.Path; continue }
+            try {
+              Remove-Item -LiteralPath $target.Path -Recurse -Force -ErrorAction Stop
+            } catch {
+              $unsafe += $target.Path
+            }
+          }
+          if ($unsafe.Count -gt 0) {
+            Write-Output 'WINDOWS_SIGNED_FINALIZER_CLEANUP_REQUIRED'
+            Write-Error 'WINDOWS_SIGNED_FINALIZER_CLEANUP_REQUIRED'
+            exit 1
+          }
+          foreach ($target in $targets) {
+            if (Test-Path -LiteralPath $target.Path) { Write-Error 'WINDOWS_SIGNED_FINALIZER_CLEANUP_INCOMPLETE'; exit 1 }
+          }
+          Write-Output 'WINDOWS_SIGNED_FINALIZER_CLEANUP_PASSED'
+          git diff --quiet
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_CHECKOUT_DIRTY_AFTER_CLEANUP'; exit 1 }
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_CHECKOUT_INDEX_DIRTY_AFTER_CLEANUP'; exit 1 }
+          $untracked = @(git ls-files --others --exclude-standard)
+          if ($LASTEXITCODE -ne 0 -or $untracked.Count -ne 0) { Write-Error 'WINDOWS_SIGNED_FINALIZER_CHECKOUT_UNTRACKED_AFTER_CLEANUP'; exit 1 }

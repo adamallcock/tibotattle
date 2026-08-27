@@ -27,6 +27,20 @@ async function fixture({ incompleteTail = false } = {}) {
   return { home, path, complete: `${lines.join("\n")}\n` };
 }
 
+async function writeRollout(home, name, sessionId, timestamp) {
+  const sessions = join(home, "sessions");
+  await mkdir(sessions, { recursive: true });
+  await mkdir(join(home, "archived_sessions"), { recursive: true });
+  const contents = `${JSON.stringify({
+    timestamp,
+    type: "session_meta",
+    payload: { id: sessionId },
+  })}\n`;
+  const path = join(sessions, name);
+  await writeFile(path, contents);
+  return { path, contents };
+}
+
 function safeFailure(code) {
   return (error) => {
     assert.equal(error instanceof ExportSourcePlanError, true);
@@ -72,6 +86,111 @@ test("source plan freezes a complete source and allows later appends", async () 
   }
 });
 
+test("multi-root source plans contain the union once and ignore root input order", async () => {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-source-plan-roots-"));
+  const first = join(root, "first");
+  const second = join(root, "second");
+  try {
+    await writeRollout(
+      first,
+      "rollout-2026-07-24T12-00-00-first.jsonl",
+      "10000000-0000-4000-8000-000000000001",
+      "2026-07-24T12:00:00.000Z",
+    );
+    await writeRollout(
+      second,
+      "rollout-2026-07-24T12-05-00-second.jsonl",
+      "10000000-0000-4000-8000-000000000002",
+      "2026-07-24T12:05:00.000Z",
+    );
+    const options = {
+      startAt: "2026-07-24T11:00:00.000Z",
+      endAt: "2026-07-24T13:00:00.000Z",
+    };
+    const forward = await createCodexExportSourcePlan({
+      ...options,
+      codexHomes: [first, second],
+    });
+    const reversed = await createCodexExportSourcePlan({
+      ...options,
+      codexHomes: [second, first],
+    });
+    assert.equal(forward.sources.length, 2);
+    assert.deepEqual(
+      forward.sources.map((source) => source.sourceKey),
+      reversed.sources.map((source) => source.sourceKey),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("source planning refuses unavailable roots and resume refuses a missing frozen source", async () => {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-source-plan-coverage-"));
+  const first = join(root, "first");
+  const second = join(root, "second");
+  const offline = join(root, "second-offline");
+  const missing = join(root, "missing");
+  const options = {
+    startAt: "2026-07-24T11:00:00.000Z",
+    endAt: "2026-07-24T13:00:00.000Z",
+  };
+  try {
+    await writeRollout(
+      first,
+      "rollout-2026-07-24T12-00-00-first.jsonl",
+      "10000000-0000-4000-8000-000000000011",
+      "2026-07-24T12:00:00.000Z",
+    );
+    await writeRollout(
+      second,
+      "rollout-2026-07-24T12-05-00-second.jsonl",
+      "10000000-0000-4000-8000-000000000012",
+      "2026-07-24T12:05:00.000Z",
+    );
+    await assert.rejects(
+      createCodexExportSourcePlan({ ...options, codexHomes: [missing] }),
+      safeFailure("export_source_codex_rollout_roots_unavailable"),
+    );
+    await assert.rejects(
+      createCodexExportSourcePlan({ ...options, codexHomes: [first, missing] }),
+      safeFailure("export_source_codex_rollout_roots_unavailable"),
+    );
+
+    const plan = await createCodexExportSourcePlan({
+      ...options,
+      codexHomes: [first, second],
+    });
+    await rename(second, offline);
+    await assert.rejects(
+      resolveCodexExportSourcePlan(plan, { codexHomes: [first, second] }),
+      safeFailure("export_source_source_missing"),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("identical rollout replicas across roots enter a source plan once", async () => {
+  const root = await mkdtemp(join(tmpdir(), "usage-monitor-source-plan-replicas-"));
+  const first = join(root, "first");
+  const second = join(root, "second");
+  const name = "rollout-2026-07-24T12-00-00-replica.jsonl";
+  const sessionId = "10000000-0000-4000-8000-000000000003";
+  try {
+    await writeRollout(first, name, sessionId, "2026-07-24T12:00:00.000Z");
+    await writeRollout(second, name, sessionId, "2026-07-24T12:00:00.000Z");
+    const plan = await createCodexExportSourcePlan({
+      codexHomes: [first, second],
+      startAt: "2026-07-24T11:00:00.000Z",
+      endAt: "2026-07-24T13:00:00.000Z",
+    });
+    assert.equal(plan.sources.length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("source plan detects prefix mutation and truncation with content-free errors", async () => {
   for (const mutation of [
     (value) => writeFile(value.path, value.complete.replace("private-session", "changed-session")),
@@ -107,6 +226,57 @@ test("source plan resolves an archive move by privacy-safe source key", async ()
     assert.equal(resolved.sourcePlanSha256, plan.sourcePlanSha256);
   } finally {
     await rm(value.home, { recursive: true, force: true });
+  }
+});
+
+test("plural source-plan resume accepts only a byte-proven replacement replica", async () => {
+  const root = await mkdtemp(join(
+    tmpdir(),
+    "usage-monitor-source-plan-resume-replica-",
+  ));
+  const first = join(root, "first");
+  const second = join(root, "second");
+  const name = "rollout-2026-07-24T12-00-00-resume-replica.jsonl";
+  const sessionId = "10000000-0000-4000-8000-000000000004";
+  try {
+    await writeRollout(
+      first,
+      name,
+      sessionId,
+      "2026-07-24T12:00:00.000Z",
+    );
+    const replacement = await writeRollout(
+      second,
+      name,
+      sessionId,
+      "2026-07-24T12:00:00.000Z",
+    );
+    const plan = await createCodexExportSourcePlan({
+      codexHome: first,
+      startAt: "2026-07-24T11:00:00.000Z",
+      endAt: "2026-07-24T13:00:00.000Z",
+    });
+
+    await rm(first, { recursive: true, force: true });
+    const resolved = await resolveCodexExportSourcePlan(plan, {
+      codexHomes: [first, second],
+    });
+    assert.equal(resolved.sources.length, 1);
+    assert.equal(resolved.sources[0].path, replacement.path);
+    assert.equal(resolved.sourcePlanSha256, plan.sourcePlanSha256);
+
+    await writeFile(
+      replacement.path,
+      replacement.contents.replace(sessionId, "changed-private-session"),
+    );
+    await assert.rejects(
+      resolveCodexExportSourcePlan(plan, {
+        codexHomes: [first, second],
+      }),
+      safeFailure("export_source_source_changed"),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 

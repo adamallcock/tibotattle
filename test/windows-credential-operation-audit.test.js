@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import {
   chmod,
+  mkdir,
   mkdtemp,
   readFile,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -18,13 +20,25 @@ import {
   WINDOWS_CREDENTIAL_OPERATION_AUDIT_MAXIMUM_TERMINAL_ROWS,
   WINDOWS_CREDENTIAL_OPERATION_AUDIT_SCHEMA_VERSION,
   WindowsCredentialOperationAuditError,
+  configureDatabase,
   createWindowsCredentialOperationAuditStore,
   defaultWindowsCredentialOperationAuditFile,
   isWindowsCredentialOperationAuditError,
   isWindowsCredentialOperationAuditStore,
 } from "../src/platform/windows-credential-operation-audit.js";
+import { createWindowsCredentialAuditFileGuardContext } from "../src/platform/windows-credential-audit-file-guard.js";
+import { loadWindowsFilesystemBinding } from "../src/platform/windows-filesystem.js";
 
 const PAIR = WINDOWS_CREDENTIAL_OPERATION_AUDIT_CAPABILITY_PAIRS[0];
+const NATIVE_WINDOWS = process.platform === "win32" && process.arch === "x64";
+const NATIVE_SKIP = NATIVE_WINDOWS ? false : "native Windows x64 only";
+
+async function nativeProtectedAuditRoot(prefix) {
+  const parent = await mkdtemp(join(tmpdir(), prefix));
+  const root = join(parent, "protected-state");
+  loadWindowsFilesystemBinding().ensureDirectory(root);
+  return { parent, root };
+}
 
 function leaseId(index) {
   return `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
@@ -103,6 +117,36 @@ test("audit store is branded and creates a fixed SQLite schema", async () => wit
   }
   assert.equal(WINDOWS_CREDENTIAL_OPERATION_AUDIT_SCHEMA_VERSION, "windows-credential-operation-audit-v1");
 }));
+
+test("audit database configures and verifies the durable SQLite restrictions", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-audit-pragmas-"));
+  const filePath = join(root, "audit.sqlite");
+  const database = new DatabaseSync(filePath);
+  try {
+    configureDatabase(database);
+    assert.equal(database.prepare("PRAGMA journal_mode").get().journal_mode, "persist");
+    assert.equal(Number(database.prepare("PRAGMA synchronous").get().synchronous), 2);
+    assert.equal(Number(database.prepare("PRAGMA foreign_keys").get().foreign_keys), 1);
+    assert.equal(Number(database.prepare("PRAGMA trusted_schema").get().trusted_schema), 0);
+    assert.equal(Number(database.prepare("PRAGMA temp_store").get().temp_store), 2);
+    assert.equal(Number(database.prepare("PRAGMA mmap_size").get().mmap_size), 0);
+  } finally {
+    database.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("audit database fails closed when SQLite refuses the requested journal mode", () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    assert.throws(
+      () => configureDatabase(database),
+      auditError("journal_mode_refused"),
+    );
+  } finally {
+    database.close();
+  }
+});
 
 test("prepare and settle persist only fixed, content-free operation metadata", async () => withStore(async ({ filePath, store }) => {
   const prepared = store.prepare({
@@ -396,3 +440,196 @@ test("audit store close is idempotent and branded operations fail after close", 
   assert.throws(() => store.read(), auditError("closed"));
   assert.throws(() => store.prepare({}), auditError("closed"));
 }));
+
+test("audit store retains an open SQLite connection after close failure for a retry", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-audit-close-failure-"));
+  const filePath = join(root, "audit.sqlite");
+  const originalClose = DatabaseSync.prototype.close;
+  let closeAttempts = 0;
+  DatabaseSync.prototype.close = function injectedCloseFailure() {
+    closeAttempts += 1;
+    if (closeAttempts === 1) throw new Error("DO-NOT-LEAK-close-failure");
+    return originalClose.call(this);
+  };
+  let store;
+  try {
+    store = createWindowsCredentialOperationAuditStore({ filePath });
+    assert.throws(() => store.close(), auditError("unavailable"));
+    assert.equal(store.closed, false);
+    assert.throws(() => store.read(), auditError("closed"));
+    store.close();
+    assert.equal(store.closed, true);
+    assert.equal(closeAttempts, 2);
+  } finally {
+    DatabaseSync.prototype.close = originalClose;
+    if (store !== undefined && !store.closed) {
+      try {
+        store.close();
+      } catch {
+        // Preserve the primary assertion failure while restoring the fixture.
+      }
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("guarded audit close closes SQLite before releasing the native identity guard", {
+  skip: NATIVE_SKIP,
+}, async () => {
+  const { parent, root } = await nativeProtectedAuditRoot(
+    "tibotattle-windows-audit-guarded-",
+  );
+  const filePath = join(root, "private", "windows-credential-operation-audit-v1.sqlite");
+  const movedPath = `${filePath}.moved`;
+  const guardContext = createWindowsCredentialAuditFileGuardContext();
+  const store = createWindowsCredentialOperationAuditStore({
+    filePath,
+    fileGuardContext: guardContext,
+  });
+  try {
+    store.prepare({
+      leaseId: leaseId(77),
+      owner: PAIR.owner,
+      capability: PAIR.capability,
+      operation: "create",
+    });
+    // The guard remains active while SQLite is open, so path replacement is
+    // denied. close() must close SQLite first and release the guard second.
+    await assert.rejects(rename(filePath, movedPath));
+    store.close();
+    await rename(filePath, movedPath);
+    await rename(movedPath, filePath);
+  } finally {
+    store.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("guarded audit close retains opaque guards when native release fails", {
+  skip: NATIVE_SKIP,
+}, async () => {
+  const { parent, root } = await nativeProtectedAuditRoot(
+    "tibotattle-windows-audit-release-failure-",
+  );
+  const filePath = join(root, "private", "windows-credential-operation-audit-v1.sqlite");
+  const native = loadWindowsFilesystemBinding();
+  const capturedGuards = [];
+  let releaseAttempts = 0;
+  const binding = {
+    ...native,
+    acquireCredentialAuditFileGuard(path) {
+      const result = native.acquireCredentialAuditFileGuard(path);
+      capturedGuards.push(result.guard);
+      return result;
+    },
+    releaseCredentialAuditFileGuard() {
+      releaseAttempts += 1;
+      throw new Error("DO-NOT-LEAK-release-failure");
+    },
+  };
+  const guardContext = createWindowsCredentialAuditFileGuardContext({
+    platform: "win32",
+    architecture: "x64",
+    binding,
+  });
+  const store = createWindowsCredentialOperationAuditStore({
+    filePath,
+    fileGuardContext: guardContext,
+  });
+  try {
+    assert.throws(() => store.close(), auditError("unavailable"));
+    assert.equal(store.closed, false);
+    assert.equal(releaseAttempts, 2);
+    assert.equal(capturedGuards.length, 2);
+    // A retained read/share handle is not a guaranteed path-rename barrier
+    // once SQLite has closed. The durable guarantee here is that the opaque
+    // native guards remain issued and the store stays permanently fail-closed;
+    // productionSafe remains false until a stronger post-close primitive is
+    // designed and qualified.
+    assert.throws(() => store.close(), auditError("unavailable"));
+  } finally {
+    try {
+      store.close();
+    } catch {
+      // The context intentionally marks a failed release lease as foreign.
+    }
+    for (const guard of [...capturedGuards].reverse()) {
+      try {
+        native.releaseCredentialAuditFileGuard(guard);
+      } catch {
+        // A guard may have been released by a partially successful context.
+      }
+    }
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("guarded corrupt-database cleanup retains the native guard when SQLite close fails", {
+  skip: NATIVE_SKIP,
+}, async () => {
+  const { parent, root } = await nativeProtectedAuditRoot(
+    "tibotattle-windows-audit-corrupt-",
+  );
+  const privateRoot = join(root, "private");
+  const filePath = join(privateRoot, "windows-credential-operation-audit-v1.sqlite");
+  const movedPath = `${filePath}.moved`;
+  const native = loadWindowsFilesystemBinding();
+  native.ensureDirectory(privateRoot);
+  // A Node-created child is not guaranteed to inherit the reviewed owner-only
+  // DACL from this non-inheriting directory. Create the corrupt fixture
+  // through the same native primitive that the audit guard validates.
+  native.createFile(filePath, Buffer.from("DO-NOT-LEAK-corrupt-sqlite"));
+  const capturedGuards = [];
+  let releaseAttempts = 0;
+  const binding = {
+    ...native,
+    acquireCredentialAuditFileGuard(path) {
+      const result = native.acquireCredentialAuditFileGuard(path);
+      capturedGuards.push(result.guard);
+      return result;
+    },
+    releaseCredentialAuditFileGuard(guard) {
+      releaseAttempts += 1;
+      return native.releaseCredentialAuditFileGuard(guard);
+    },
+  };
+  const guardContext = createWindowsCredentialAuditFileGuardContext({
+    platform: "win32",
+    architecture: "x64",
+    binding,
+  });
+  const originalClose = DatabaseSync.prototype.close;
+  let failedDatabase;
+  DatabaseSync.prototype.close = function injectedCloseFailure() {
+    failedDatabase = this;
+    throw new Error("DO-NOT-LEAK-corrupt-close-failure");
+  };
+  try {
+    assert.throws(
+      () => createWindowsCredentialOperationAuditStore({
+        filePath,
+        fileGuardContext: guardContext,
+      }),
+      auditError("schema_invalid"),
+    );
+    assert.equal(releaseAttempts, 0);
+    await assert.rejects(rename(filePath, movedPath));
+  } finally {
+    DatabaseSync.prototype.close = originalClose;
+    if (failedDatabase !== undefined) {
+      try {
+        originalClose.call(failedDatabase);
+      } catch {
+        // The injected close failure is already covered by the assertion.
+      }
+    }
+    for (const guard of [...capturedGuards].reverse()) {
+      try {
+        native.releaseCredentialAuditFileGuard(guard);
+      } catch {
+        // A guard may have been released by an earlier implementation.
+      }
+    }
+    await rm(parent, { recursive: true, force: true });
+  }
+});

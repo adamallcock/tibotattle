@@ -1,6 +1,6 @@
 ---
 title: Windows portability qualification environments
-date: 2026-08-17
+date: 2026-08-18
 type: runbook
 status: qualified-and-restorable
 ---
@@ -18,6 +18,7 @@ fixtures; none should be pointed at a real Codex or Claude home.
 | macOS host | macOS 26.5.2 arm64, Node v26.2.0, pnpm 11.9.0 |
 | Linux | Colima/Docker arm64; `node:26.2.0-bookworm-slim` pinned by OCI digest; Corepack 0.34.0; pnpm 11.9.0 |
 | Native Windows | Microsoft Windows Server 2025 x64; runner image `windows-2025-vs2026` version `20260810.198.2`; Node 26.2.0; Corepack 0.34.0; pnpm 11.9.0 |
+| Native Windows plus WSL2 | Manual canary definition: `windows-2025`, disposable `Ubuntu-24.04` WSL2 installed by pinned `Vampire/setup-wsl` v7.0.0; no completed run is recorded yet |
 | Local Windows development | UTM 4.7.5 installed at `/Applications/UTM.app`; no Windows guest installed |
 
 The Linux lane is useful portability evidence but cannot establish Windows
@@ -57,6 +58,35 @@ To recover the environment, reinstall Docker Desktop or Colima, start the
 daemon, and rerun the two commands. The Dockerfile is the environment
 definition; no long-lived container state is required.
 
+### Linux Electron GUI smoke
+
+Build the pinned Debian-based Electron image, then run the GUI smoke with no
+network access:
+
+```bash
+pnpm container:electron-linux:build
+pnpm container:electron-linux:test
+```
+
+The image uses Debian Bookworm arm64, Node 26.2.0, pnpm 11.9.0, Electron
+43.2.0, and Xvfb with TCP listening disabled. The build needs network access
+for the pinned base image, locked dependencies, and Electron runtime; the
+test command uses `--network none`, `--init`, and synthetic disposable
+`HOME`, `CODEX_HOME`, Claude configuration, and state directories. The
+package script also supplies `--cap-add=SYS_ADMIN`, a disposable test-only
+allowance needed by Chromium's sandbox namespace under the default Colima
+seccomp profile; it does not grant the image network access or persist any
+state.
+
+The smoke proves source Electron on Linux can launch the real dashboard and
+companion, observe the loopback health endpoint, reload the renderer, and
+invoke the exact gated main-process `requestQuit()` path via `SIGUSR2`, ending
+with Electron exit code 0 and no remaining companion descendant. It is
+development smoke evidence only. It does not qualify a Linux package,
+installer, signer, updater, credential backend, desktop-manager integration,
+cross-distro behavior, or Windows filesystem/ACL/Credential Manager/SQLite
+support. Never point this lane at a real user home or credential store.
+
 ## Native Windows x64 lane
 
 The workflow is manual-only so an unreviewed branch cannot consume runner time
@@ -79,6 +109,43 @@ The latest completed qualification is
 [run 32085366833](https://github.com/adamallcock/tibotattle/actions/runs/32085366833):
 restored/primed-store job `95556686783` and clean-store job `95556687033` both
 passed on revision `b8811349b5b38df0319684ebc0b4377f9d404c94`.
+
+### Opt-in Windows plus WSL2 multi-root canary
+
+The same manual workflow contains a separate, default-off WSL2 job. Dispatch
+it only for a reviewed immutable revision and opt in explicitly. The harness
+also fails closed anywhere except a GitHub-hosted native Windows x64 runner, so
+its destructive cleanup cannot unregister a local or self-hosted distribution:
+
+```bash
+gh workflow run windows-portability.yml \
+  --repo adamallcock/tibotattle \
+  --ref <reviewed-branch-or-sha> \
+  -f wsl2_multi_root=true
+```
+
+The job installs locked workspace dependencies and a disposable
+`Ubuntu-24.04` WSL2 distribution. Its synthetic fixture combines a Windows
+primary `.codex` root with the explicit
+`\\wsl$\Ubuntu-24.04\root\.codex` activity root. It verifies combined history,
+the primary-versus-activity split, stopped-distribution partial coverage and
+last-known-good retention, path-free public output, and recovery without
+duplicate events or physical-owner rebinding. Every command and refresh has a
+bounded timeout; the distribution is unregistered in an `always()` cleanup
+step.
+
+The legacy `\\wsl$` share is intentional for this canary. It must be absent
+while the distribution is stopped; the job checks that the refresh does not
+wake it. `\\wsl.localhost` is not used because its Windows 11 behavior cannot
+establish the no-auto-start condition. A runner that activates the distribution
+when the scanner touches `\\wsl$` fails qualification rather than masking the
+behavior.
+
+No WSL run receipt exists at the time of this edit. Passing this job would
+qualify only the synthetic multi-root lifecycle on that exact runner and
+revision. It would not qualify an installed Windows folder picker, Codex-root
+DACL policy, reparse-point race safety, long-path behavior, signing, installer,
+updater, or production Windows support.
 
 ## Local UTM lane
 
@@ -107,6 +174,9 @@ not satisfy the native Windows x64 acceptance gate.
   root and assert their removal.
 - The Credential Manager probe uses a random service/account pair and confirms
   deletion before reporting success.
+- The opt-in WSL2 canary deletes its synthetic Windows state and always runs
+  `wsl --unregister Ubuntu-24.04`; never point that job at a persistent or
+  user-owned distribution.
 - Containers are removed automatically by `docker run --rm`.
 - UTM can be removed later with `brew uninstall --cask utm`, but removal is not
   part of this milestone and may leave separately created guests intact.

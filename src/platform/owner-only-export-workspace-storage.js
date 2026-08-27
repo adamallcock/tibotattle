@@ -204,6 +204,58 @@ function fail(code) {
   throw new ExportWorkspaceError(code);
 }
 
+const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+const MAX_SIGNED_INTEGER_BIGINT = (1n << 63n) - 1n;
+const MIN_SIGNED_INTEGER_BIGINT = -(1n << 63n);
+const UINT64_MODULUS_BIGINT = 1n << 64n;
+const MAX_IDENTITY_BIGINT = UINT64_MODULUS_BIGINT - 1n;
+const DECIMAL_IDENTITY_PATTERN = /^(?:0|[1-9][0-9]*)$/u;
+const SIGNED_DECIMAL_IDENTITY_PATTERN = /^-?(?:0|[1-9][0-9]*)$/u;
+
+function parseIdentity(value) {
+  if (typeof value === "bigint") return value;
+  if (Number.isSafeInteger(value) && value >= 0) return BigInt(value);
+  if (typeof value === "string" && DECIMAL_IDENTITY_PATTERN.test(value)) {
+    try { return BigInt(value); } catch { /* fall through to the schema error */ }
+  }
+  fail("schema");
+}
+
+function formatIdentity(value) {
+  if (value < 0n || value > MAX_IDENTITY_BIGINT) fail("schema");
+  return value <= MAX_SAFE_INTEGER_BIGINT ? Number(value) : value.toString(10);
+}
+
+function encodeStoredIdentity(value) {
+  const parsed = parseIdentity(value);
+  if (parsed > MAX_IDENTITY_BIGINT) fail("schema");
+  // Keep the v4 STRICT INTEGER schema while preserving Windows' unsigned
+  // 64-bit file IDs: the high half is stored in SQLite's signed int64 range.
+  return parsed <= MAX_SIGNED_INTEGER_BIGINT ? parsed : parsed - UINT64_MODULUS_BIGINT;
+}
+
+function normalizeStoredIdentity(value) {
+  let parsed;
+  if (typeof value === "bigint") parsed = value;
+  else if (Number.isSafeInteger(value)) parsed = BigInt(value);
+  else if (typeof value === "string" && SIGNED_DECIMAL_IDENTITY_PATTERN.test(value)) {
+    try { parsed = BigInt(value); } catch { /* fall through to the schema error */ }
+  }
+  if (parsed === undefined || parsed < MIN_SIGNED_INTEGER_BIGINT || parsed > MAX_SIGNED_INTEGER_BIGINT) {
+    fail("schema");
+  }
+  return formatIdentity(parsed < 0n ? parsed + UINT64_MODULUS_BIGINT : parsed);
+}
+
+function isNormalizedIdentity(value) {
+  try {
+    formatIdentity(parseIdentity(value));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function descriptorWorkspaceCeiling(descriptor, requested) {
   const persisted = descriptor.resourceLimits.maximumWorkspaceBytes;
   if (requested === undefined) return persisted;
@@ -663,6 +715,7 @@ function buildWorkspaceApi(database, directory, {
     JOIN supplemental_source_plan p USING(source_key)
     WHERE c.source_key = ?
   `);
+  selectSupplementalCheckpoint.setReadBigInts(true);
 
   function insertSafeRecordEnvelope(envelope) {
     const shape = RECORD_TYPE[envelope?.recordType];
@@ -720,8 +773,8 @@ function buildWorkspaceApi(database, directory, {
     const binding = row.binding_kind === "file_prefix"
       ? {
         kind: "file_prefix",
-        device: Number(row.device),
-        inode: Number(row.inode),
+        device: normalizeStoredIdentity(row.device),
+        inode: normalizeStoredIdentity(row.inode),
         birthtimeMs: Number(row.birthtime_ms),
         prefixBytes: Number(row.prefix_bytes),
         prefixSha256: row.prefix_sha256,
@@ -737,7 +790,8 @@ function buildWorkspaceApi(database, directory, {
     if (!binding || !validSha256(row.source_key)
         || (row.last_batch_sha256 !== null && !validSha256(row.last_batch_sha256))) fail("schema");
     if ((binding.kind === "file_prefix"
-        && (!safeCount(binding.device) || !safeCount(binding.inode) || !safeCount(binding.birthtimeMs)
+        && (!isNormalizedIdentity(binding.device) || !isNormalizedIdentity(binding.inode)
+          || !safeCount(binding.birthtimeMs)
           || !safeCount(binding.prefixBytes) || !validSha256(binding.prefixSha256)))
       || (binding.kind === "frozen_inventory"
         && (!safeCount(binding.inventoryEntries) || !safeCount(binding.inventoryBytes)
@@ -805,20 +859,22 @@ function buildWorkspaceApi(database, directory, {
     },
     loadSupplementalSourcePlan() {
       const descriptor = this.getDescriptor();
-      const sources = [...database.prepare(`
+      const statement = database.prepare(`
         SELECT ordinal, source_key, kind, binding_kind, device, inode, birthtime_ms,
                prefix_bytes, prefix_sha256, inventory_entries, inventory_bytes, inventory_sha256,
                parser_version, initial_cursor_json
         FROM supplemental_source_plan ORDER BY ordinal
-      `).iterate()].map((row) => ({
+      `);
+      statement.setReadBigInts(true);
+      const sources = [...statement.iterate()].map((row) => ({
         ordinal: Number(row.ordinal),
         sourceKey: row.source_key,
         kind: row.kind,
         parserVersion: row.parser_version,
         binding: row.binding_kind === "file_prefix" ? {
           kind: "file_prefix",
-          device: Number(row.device),
-          inode: Number(row.inode),
+          device: normalizeStoredIdentity(row.device),
+          inode: normalizeStoredIdentity(row.inode),
           birthtimeMs: Number(row.birthtime_ms),
           prefixBytes: Number(row.prefix_bytes),
           prefixSha256: row.prefix_sha256,
@@ -878,7 +934,7 @@ function buildWorkspaceApi(database, directory, {
       return row ? checkpointFromRow(row) : null;
     },
     loadNextSupplementalSourceCheckpoint() {
-      const row = database.prepare(`
+      const statement = database.prepare(`
         SELECT c.source_key, c.status, c.cursor_json, c.checkpoint_seq, c.last_batch_sha256,
                c.parser_version AS checkpoint_parser_version,
                p.ordinal, p.kind, p.binding_kind, p.device, p.inode, p.birthtime_ms,
@@ -888,7 +944,9 @@ function buildWorkspaceApi(database, directory, {
         JOIN supplemental_source_plan p USING(source_key)
         WHERE p.scan_status = 'pending' AND c.status = 'pending'
         ORDER BY p.ordinal LIMIT 1
-      `).get();
+      `);
+      statement.setReadBigInts(true);
+      const row = statement.get();
       return row ? supplementalCheckpointFromRow(row) : null;
     },
     hasPendingSupplementalSources() {
@@ -1674,8 +1732,8 @@ async function createExportWorkspace({
           source.sourceKey,
           source.kind,
           source.binding.kind,
-          isFilePrefix ? source.binding.device : null,
-          isFilePrefix ? source.binding.inode : null,
+          isFilePrefix ? encodeStoredIdentity(source.binding.device) : null,
+          isFilePrefix ? encodeStoredIdentity(source.binding.inode) : null,
           isFilePrefix ? source.binding.birthtimeMs : null,
           isFilePrefix ? source.binding.prefixBytes : null,
           isFilePrefix ? source.binding.prefixSha256 : null,

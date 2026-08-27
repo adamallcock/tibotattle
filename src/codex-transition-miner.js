@@ -1236,6 +1236,7 @@ export async function mineCodexTransitions({
   endAt,
   offline = false,
   codexHome,
+  codexHomes,
   priceCards = null,
   includeSnapshotIntervals = true,
   windowDurationMins = null,
@@ -1254,6 +1255,7 @@ export async function mineCodexTransitions({
     startAt,
     endAt,
     codexHome,
+    codexHomes,
     onUsage(event) {
       rawUsageEvents.push({ ...event, timestampMs: Date.parse(event.timestamp), sequence: sequence++ });
     },

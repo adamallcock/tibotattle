@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -13,6 +14,7 @@ import {
   createDeferredAccountingRebuildRecorder,
   createLocalCollectorRefreshRunner,
   createTerminalRefreshFailureRecorder,
+  LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS,
   LocalCompanionRefreshController,
 } from "../src/local-companion-refresh.js";
 import {
@@ -31,6 +33,23 @@ import {
 import {
   REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
 } from "../src/replay-safe-accounting-cache.js";
+import {
+  WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS,
+  createWindowsFilesystemAdapter,
+} from "../src/platform/windows-filesystem.js";
+import {
+  createWindowsQualificationModeContext,
+  WINDOWS_QUALIFICATION_REQUIRED_RESOURCE_PATHS,
+  WINDOWS_QUALIFICATION_MODE_ACCOUNTING_SOURCE_MODE,
+  WINDOWS_QUALIFICATION_MODE_ENVIRONMENT_VALUE,
+  WINDOWS_QUALIFICATION_MODE_ENVIRONMENT_VARIABLE,
+  WINDOWS_QUALIFICATION_MODE_TEST_LANE,
+  WINDOWS_QUALIFICATION_MODE_TEST_LANE_ENVIRONMENT_VARIABLE,
+} from "../src/platform/windows-qualification-mode.js";
+import {
+  createWindowsQualificationStateSessionFactory,
+  currentLocalCollectorStateSessionBoundary,
+} from "../src/platform/index.js";
 
 const COMPLETE_INDEX = Object.freeze({
   mode: "recent_7d",
@@ -115,6 +134,236 @@ const FRESH_NOTIFICATION_EVIDENCE = Object.freeze({
     resetAt: "2026-07-30T12:00:00.000Z",
     resetProofKind: "provider_reported_schedule_only",
   })]),
+});
+
+const WINDOWS_REFRESH_QUALIFICATION_MANIFEST_PATHS = Object.freeze([
+  ...WINDOWS_QUALIFICATION_REQUIRED_RESOURCE_PATHS,
+  "native/windows-filesystem/build/Release/windows_filesystem.node",
+  "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
+  "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node",
+].sort((left, right) => Buffer.from(left).compare(Buffer.from(right))));
+
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function windowsRefreshQualificationManifest() {
+  const files = WINDOWS_REFRESH_QUALIFICATION_MANIFEST_PATHS.map((path) => {
+    const value = Buffer.from(path, "utf8");
+    return {
+      bytes: value.byteLength,
+      kind: path === "config/deployment-endpoints.js"
+        || path.startsWith("apps/electron/")
+        ? "electron_shell"
+        : path.startsWith("apps/web/")
+        ? "dashboard_asset"
+          : path === "apps/local/server.js"
+            ? "companion_source"
+            : path === "src/desktop-shell-status.js"
+              || path === "src/platform/windows-credential-manager-probe.js"
+              ? "electron_shell"
+            : path.startsWith("native/")
+              ? "windows_native_binding"
+              : "third_party_dependency",
+      path,
+      sha256: sha256(value),
+    };
+  });
+  const payloadHash = createHash("sha256");
+  let payloadBytes = 0;
+  for (const row of files) {
+    payloadBytes += row.bytes;
+    payloadHash.update(`F\0${row.path}\0${row.bytes}\0${row.sha256}\0${row.kind}\0`);
+  }
+  const binding = files.find((row) => row.path.endsWith(
+    "native/windows-filesystem/build/Release/windows_filesystem.node",
+  ));
+  return {
+    architecture: "x64",
+    dashboardRoot: "apps/web/public",
+    entrypoint: "apps/electron/main.js",
+    files,
+    payload: {
+      bytes: payloadBytes,
+      sha256: payloadHash.digest("hex"),
+    },
+    releaseVersion: "0.1.0-test",
+    schemaVersion: "usage-monitor-electron-runtime-v0.1",
+    target: "win32",
+    windowsBinding: {
+      binding: {
+        bytes: binding.bytes,
+        path: binding.path,
+        sha256: binding.sha256,
+      },
+      included: true,
+      manifest: {
+        path: "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
+      },
+      status: "included_unverified",
+      verified: false,
+    },
+  };
+}
+
+function windowsRefreshQualificationBinding() {
+  const identity = {
+    volumeSerialNumber: "0000000000000001",
+    fileId: "00112233445566778899aabbccddeeff",
+    linkCount: 1,
+  };
+  return {
+    contractVersion: "windows-filesystem-v1",
+    securityContractVersion: "windows-filesystem-security-v1",
+    credentialAuditFileGuardContractVersion:
+      "windows-credential-audit-file-guard-v1",
+    sqliteStateLeaseContractVersion: "windows-sqlite-state-lease-v1",
+    credentialMutexContractVersion: "windows-credential-mutex-v1",
+    companionInstanceMutexContractVersion:
+      "windows-companion-instance-mutex-v1",
+    preparedArtifactContractVersion: "windows-prepared-artifact-v1",
+    productionSafe: false,
+    pathWalkRaceSafe: false,
+    credentialMutexSafe: true,
+    companionInstanceMutexSafe: false,
+    credentialAuditFileGuardSafe: true,
+    sqliteStateLeaseSafe: false,
+    preparedArtifactSafe: false,
+    ...Object.fromEntries(
+      WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS.map((method) => [
+        method,
+        () => undefined,
+      ]),
+    ),
+    inspectPath: () => ({
+      identity,
+      isDirectory: true,
+      isRegularFile: false,
+      isReparsePoint: false,
+      finalPathResolved: true,
+    }),
+  };
+}
+
+async function createWindowsRefreshQualificationFixture() {
+  const root = await mkdtemp(join(tmpdir(), "local-refresh-windows-qualification-"));
+  const resourceRoot = join(root, "resources");
+  await mkdir(resourceRoot, { recursive: true });
+  await writeFile(
+    join(resourceRoot, "electron-runtime-manifest.json"),
+    `${JSON.stringify(windowsRefreshQualificationManifest())}\n`,
+  );
+  const temporaryRoot =
+    "C:\\Users\\runner\\AppData\\Local\\Temp\\tibotattle-refresh";
+  const stateRoot = `${temporaryRoot}\\state`;
+  const home = `${temporaryRoot}\\home`;
+  const environment = {
+    [WINDOWS_QUALIFICATION_MODE_ENVIRONMENT_VARIABLE]:
+      WINDOWS_QUALIFICATION_MODE_ENVIRONMENT_VALUE,
+    [WINDOWS_QUALIFICATION_MODE_TEST_LANE_ENVIRONMENT_VARIABLE]:
+      WINDOWS_QUALIFICATION_MODE_TEST_LANE,
+    USAGE_MONITOR_ACCOUNTING_SOURCE_MODE:
+      WINDOWS_QUALIFICATION_MODE_ACCOUNTING_SOURCE_MODE,
+    TEMP: temporaryRoot,
+    HOME: home,
+    USERPROFILE: home,
+    CODEX_HOME: `${home}\\.codex`,
+    CLAUDE_CONFIG_DIR: `${home}\\.claude`,
+    USAGE_MONITOR_RESOURCE_ROOT: resourceRoot,
+    USAGE_MONITOR_STATE_ROOT: stateRoot,
+  };
+  const adapter = createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding: windowsRefreshQualificationBinding(),
+  });
+  const context = createWindowsQualificationModeContext({
+    platform: "win32",
+    architecture: "x64",
+    adapter,
+    environment,
+    resourceRoot,
+    stateRoot,
+  });
+  return {
+    root,
+    adapter,
+    context,
+    resourceRoot,
+    stateRoot,
+  };
+}
+
+async function withNativeWindowsX64(callback) {
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  const originalArchitecture = Object.getOwnPropertyDescriptor(process, "arch");
+  const changedPlatform = process.platform !== "win32";
+  const changedArchitecture = process.arch !== "x64";
+  if (changedPlatform) {
+    Object.defineProperty(process, "platform", {
+      ...originalPlatform,
+      value: "win32",
+    });
+  }
+  if (changedArchitecture) {
+    Object.defineProperty(process, "arch", {
+      ...originalArchitecture,
+      value: "x64",
+    });
+  }
+  try {
+    return await callback();
+  } finally {
+    if (changedPlatform) Object.defineProperty(process, "platform", originalPlatform);
+    if (changedArchitecture) Object.defineProperty(process, "arch", originalArchitecture);
+  }
+}
+
+async function withNonWindowsPlatform(callback) {
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  const changedPlatform = process.platform !== "darwin";
+  if (changedPlatform) {
+    Object.defineProperty(process, "platform", {
+      ...originalPlatform,
+      value: "darwin",
+    });
+  }
+  try {
+    return await callback();
+  } finally {
+    if (changedPlatform) Object.defineProperty(process, "platform", originalPlatform);
+  }
+}
+
+function qualificationRefreshResult() {
+  return {
+    rolloutRecordsWritten: 0,
+    filesDiscovered: 0,
+    refresh: {
+      attempted: false,
+      recordWritten: false,
+      errorCode: null,
+    },
+    indexing: COMPLETE_INDEX,
+  };
+}
+
+test("refresh controller accepts the bounded Electron cold-index ceiling", () => {
+  const dependencies = {
+    runner: async () => ({}),
+    dataStore: { async reload() {} },
+  };
+  assert.doesNotThrow(() => new LocalCompanionRefreshController({
+    ...dependencies,
+    timeoutMs: LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS,
+  }));
+  assert.throws(
+    () => new LocalCompanionRefreshController({
+      ...dependencies,
+      timeoutMs: LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS + 1,
+    }),
+    /7,200,000/u,
+  );
 });
 
 test("local refresh exposes only the closed fresh direct-provider notification receipt", async (t) => {
@@ -428,6 +677,151 @@ test("local refresh routes collector, credential lock, and accounting writes ben
   }
 });
 
+test("local refresh rejects forged and copied Windows adapters before runCollector", async () => {
+  let runCollectorCalls = 0;
+  const forged = Object.freeze({
+    productionSafe: true,
+    pathWalkRaceSafe: true,
+  });
+  const copied = { ...forged };
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+  try {
+    for (const windowsFilesystemAdapter of [null, forged, copied]) {
+      const runner = createLocalCollectorRefreshRunner({
+        windowsFilesystemAdapter,
+        runCollector: async () => {
+          runCollectorCalls += 1;
+          throw new Error("runCollector must not be called");
+        },
+      });
+      await assert.rejects(
+        runner(),
+        (error) => error.code === "local_collector_state_unavailable"
+          && error.message === "local_collector_state_unavailable",
+      );
+    }
+  } finally {
+    Object.defineProperty(process, "platform", originalPlatform);
+  }
+  assert.equal(runCollectorCalls, 0);
+});
+
+test("win32 qualification refresh reaches runCollector only with the exact branded binding", async () => {
+  const fixture = await createWindowsRefreshQualificationFixture();
+  const qualificationSessionFactory = createWindowsQualificationStateSessionFactory({
+    platform: "win32",
+    architecture: "x64",
+    windowsFilesystemAdapter: fixture.adapter,
+    windowsQualificationModeContext: fixture.context,
+    stateRoot: fixture.stateRoot,
+    resourceRoot: fixture.resourceRoot,
+  });
+  let runCollectorCalls = 0;
+  try {
+    await withNativeWindowsX64(async () => {
+      const runner = createLocalCollectorRefreshRunner({
+        windowsFilesystemAdapter: fixture.adapter,
+        windowsSqliteStateSessionFactory: qualificationSessionFactory,
+        windowsQualificationModeContext: fixture.context,
+        stateRoot: fixture.stateRoot,
+        resourceRoot: fixture.resourceRoot,
+        selectAccountObservationSecret: () => ({
+          loadAccountObservationSecret: null,
+        }),
+        runCollector: async () => {
+          runCollectorCalls += 1;
+          const boundary = currentLocalCollectorStateSessionBoundary();
+          assert.equal(boundary?.windowsFilesystemAdapter, fixture.adapter);
+          assert.equal(boundary?.windowsQualificationModeContext, fixture.context);
+          assert.equal(boundary?.stateRoot, fixture.stateRoot);
+          assert.equal(boundary?.resourceRoot, fixture.resourceRoot);
+          return qualificationRefreshResult();
+        },
+      });
+      await runner();
+    });
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+  assert.equal(runCollectorCalls, 1);
+});
+
+test("win32 qualification refresh rejects absent, copied, and mismatched context while production stays gated", async () => {
+  const fixture = await createWindowsRefreshQualificationFixture();
+  const qualificationSessionFactory = createWindowsQualificationStateSessionFactory({
+    platform: "win32",
+    architecture: "x64",
+    windowsFilesystemAdapter: fixture.adapter,
+    windowsQualificationModeContext: fixture.context,
+    stateRoot: fixture.stateRoot,
+    resourceRoot: fixture.resourceRoot,
+  });
+  const candidates = [
+    ["production null context", {
+      windowsQualificationModeContext: null,
+    }],
+    ["copied context", {
+      windowsQualificationModeContext: Object.freeze({ ...fixture.context }),
+    }],
+    ["mismatched state root", {
+      windowsQualificationModeContext: fixture.context,
+      stateRoot: `${fixture.stateRoot}\\other`,
+    }],
+    ["mismatched resource root", {
+      windowsQualificationModeContext: fixture.context,
+      resourceRoot: `${fixture.resourceRoot}-other`,
+    }],
+  ];
+  try {
+    await withNativeWindowsX64(async () => {
+      for (const [label, overrides] of candidates) {
+        let runCollectorCalls = 0;
+        const runner = createLocalCollectorRefreshRunner({
+          windowsFilesystemAdapter: fixture.adapter,
+          windowsSqliteStateSessionFactory: qualificationSessionFactory,
+          windowsQualificationModeContext: fixture.context,
+          stateRoot: fixture.stateRoot,
+          resourceRoot: fixture.resourceRoot,
+          ...overrides,
+          selectAccountObservationSecret: () => ({
+            loadAccountObservationSecret: null,
+          }),
+          runCollector: async () => {
+            runCollectorCalls += 1;
+            return qualificationRefreshResult();
+          },
+        });
+        await assert.rejects(
+          runner(),
+          (error) => error?.code === "local_collector_state_unavailable",
+          label,
+        );
+        assert.equal(runCollectorCalls, 0, label);
+      }
+    });
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("macOS and Linux refresh retain the no-adapter collector path", async () => {
+  let runCollectorCalls = 0;
+  await withNonWindowsPlatform(async () => {
+    const runner = createLocalCollectorRefreshRunner({
+      selectAccountObservationSecret: () => ({
+        loadAccountObservationSecret: null,
+      }),
+      runCollector: async () => {
+        runCollectorCalls += 1;
+        return qualificationRefreshResult();
+      },
+    });
+    await runner();
+  });
+  assert.equal(runCollectorCalls, 1);
+});
+
 test("local refresh starts a bounded archive index only after the foreground result is safe", async () => {
   const controller = new AbortController();
   const clock = () => Date.parse("2026-07-23T12:00:00.000Z");
@@ -542,6 +936,238 @@ test("unified accounting mode never advances the legacy archive and passes expli
   );
   assert.equal(result.archiveIndex, undefined);
   assert.equal(result.accounting.sourceMode, "unified");
+});
+
+test("multi-root refresh uses one primary live profile and forwards every activity root", async () => {
+  const codexHomes = ["/private/primary-codex", "/private/secondary-codex"];
+  let collectorOptions = null;
+  let unifiedOptions = null;
+  let accountingOptions = null;
+  let baselineReads = 0;
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    codexHomes,
+    primaryCodexHome: codexHomes[0],
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async (options) => {
+      collectorOptions = options;
+      return {
+        rolloutRecordsWritten: 1,
+        filesDiscovered: 1,
+        refresh: { attempted: false, recordWritten: false, errorCode: null },
+        indexing: COMPLETE_INDEX,
+      };
+    },
+    recordCodexSpeedBaseline: async () => {
+      baselineReads += 1;
+      return [{ mode: "fast" }];
+    },
+    refreshUnifiedIndex: async (options) => {
+      unifiedOptions = options;
+      return {
+        status: "ingested",
+        generation: {
+          id: 17,
+          fingerprint: "r".repeat(64),
+          status: "complete",
+          discoveryComplete: true,
+          diagnosticsComplete: true,
+          usageProvenanceComplete: true,
+          sourceOrderComplete: true,
+          quotaProvenanceComplete: true,
+          toolProvenanceComplete: true,
+        },
+        rootCoverage: {
+          status: "partial",
+          configuredRoots: 2,
+          availableRoots: 2,
+          emptyRoots: 0,
+          unavailableRoots: 0,
+          retainedHistory: false,
+          ambiguousSources: 1,
+          privateRoot: codexHomes[1],
+        },
+      };
+    },
+    refreshAccounting: async (options) => {
+      accountingOptions = options;
+      return {
+        generatedAt: "2026-07-23T12:00:00.000Z",
+        periods: [{ id: "7d", events: 3 }],
+        diagnostics: {},
+        sourceDescriptor: { fallbackCount: 0 },
+      };
+    },
+  });
+
+  const result = await runner();
+
+  assert.equal(collectorOptions.codexHome, codexHomes[0]);
+  assert.equal(collectorOptions.skipRolloutIngestion, true);
+  assert.deepEqual(unifiedOptions.codexHomes, codexHomes);
+  assert.equal(Object.hasOwn(unifiedOptions, "codexHome"), false);
+  assert.equal(Object.hasOwn(unifiedOptions, "primaryCodexHome"), false);
+  assert.deepEqual(accountingOptions.codexHomes, codexHomes);
+  assert.equal(Object.hasOwn(accountingOptions, "codexHome"), false);
+  assert.equal(Object.hasOwn(accountingOptions, "primaryCodexHome"), false);
+  assert.equal(baselineReads, 0);
+  assert.deepEqual(result.unifiedIndex.rootCoverage, {
+    status: "partial",
+    configuredRoots: 2,
+    availableRoots: 2,
+    emptyRoots: 0,
+    unavailableRoots: 0,
+    retainedHistory: false,
+    unavailableOwnerSources: 0,
+    ambiguousSources: 1,
+  });
+  assert.equal(JSON.stringify(result).includes("/private/"), false);
+});
+
+test("all-unavailable roots without retained history cannot publish an empty corpus", async () => {
+  let accountingRuns = 0;
+  const codexHomes = ["/private/primary-codex", "/private/offline-codex"];
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    codexHomes,
+    primaryCodexHome: codexHomes[0],
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 0,
+      filesDiscovered: 0,
+      refresh: { attempted: false, recordWritten: false, errorCode: null },
+      indexing: COMPLETE_INDEX,
+    }),
+    refreshUnifiedIndex: async () => ({
+      status: "ingested",
+      generation: {
+        id: 1,
+        fingerprint: "u".repeat(64),
+        status: "complete",
+        discoveryComplete: true,
+        diagnosticsComplete: true,
+        usageProvenanceComplete: true,
+        sourceOrderComplete: true,
+        quotaProvenanceComplete: true,
+        toolProvenanceComplete: true,
+      },
+      totalUsageEvents: 0,
+      rootCoverage: {
+        status: "unavailable",
+        configuredRoots: 2,
+        availableRoots: 0,
+        emptyRoots: 0,
+        unavailableRoots: 2,
+        retainedHistory: false,
+      },
+    }),
+    refreshAccounting: async () => {
+      accountingRuns += 1;
+      return REUSABLE_ACCOUNTING_CACHE;
+    },
+  });
+
+  const result = await runner();
+
+  assert.deepEqual(result.unifiedIndex, {
+    status: "failed",
+    errorCode: "local_unified_index_roots_unavailable",
+  });
+  assert.equal(accountingRuns, 0);
+  assert.equal(result.accounting.status, "unavailable");
+  assert.equal(Object.hasOwn(result.unifiedIndex, "totalUsageEvents"), false);
+});
+
+test("all-unavailable roots may serve an authoritative retained generation", async () => {
+  let accountingRuns = 0;
+  const codexHomes = ["/private/primary-codex", "/private/offline-codex"];
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    codexHomes,
+    primaryCodexHome: codexHomes[0],
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 1,
+      filesDiscovered: 0,
+      refresh: { attempted: false, recordWritten: false, errorCode: null },
+      indexing: COMPLETE_INDEX,
+    }),
+    refreshUnifiedIndex: async () => ({
+      status: "ingested",
+      unchanged: true,
+      generation: {
+        id: 4,
+        fingerprint: "l".repeat(64),
+        status: "complete",
+        discoveryComplete: true,
+        diagnosticsComplete: true,
+        usageProvenanceComplete: true,
+        sourceOrderComplete: true,
+        quotaProvenanceComplete: true,
+        toolProvenanceComplete: true,
+      },
+      totalUsageEvents: 9,
+      rootCoverage: {
+        status: "unavailable",
+        configuredRoots: 2,
+        availableRoots: 0,
+        emptyRoots: 0,
+        unavailableRoots: 2,
+        retainedHistory: true,
+        unavailableOwnerSources: 3,
+        ambiguousSources: 0,
+      },
+    }),
+    refreshAccounting: async () => {
+      accountingRuns += 1;
+      return {
+        generatedAt: "2026-07-23T12:00:00.000Z",
+        periods: [{ id: "7d", events: 9 }],
+        diagnostics: {},
+        sourceDescriptor: { fallbackCount: 0 },
+      };
+    },
+  });
+
+  const result = await runner();
+
+  assert.equal(result.unifiedIndex.status, "ingested");
+  assert.equal(result.unifiedIndex.totalUsageEvents, 9);
+  assert.deepEqual(result.unifiedIndex.rootCoverage, {
+    status: "unavailable",
+    configuredRoots: 2,
+    availableRoots: 0,
+    emptyRoots: 0,
+    unavailableRoots: 2,
+    retainedHistory: true,
+    unavailableOwnerSources: 3,
+    ambiguousSources: 0,
+  });
+  assert.equal(accountingRuns, 1);
+});
+
+test("multi-root refresh requires an explicit primary and unified authority", () => {
+  assert.throws(
+    () => createLocalCollectorRefreshRunner({
+      accountingSourceMode: "unified",
+      codexHomes: ["/private/one", "/private/two"],
+    }),
+    /primaryCodexHome is required/u,
+  );
+  assert.throws(
+    () => createLocalCollectorRefreshRunner({
+      accountingSourceMode: "legacy",
+      codexHomes: ["/private/one", "/private/two"],
+      primaryCodexHome: "/private/one",
+    }),
+    /require unified accounting mode/u,
+  );
 });
 
 test("tool-only partial coverage does not block complete usage accounting", async () => {
@@ -961,6 +1587,41 @@ test("unified mode fails closed when the authoritative generation is missing or 
     {
       name: "missing generation",
       unifiedIndex: { status: "ingested" },
+      expectedUnifiedIndex: {
+        status: "failed",
+        errorCode: "local_unified_index_generation_invalid",
+      },
+      expectedAccountingError: "accounting_unified_source_unavailable",
+      expectedCoverage: "unavailable",
+      expectedGeneration: null,
+      expectedFingerprint: null,
+    },
+    {
+      name: "ready root coverage with an unavailable owner",
+      unifiedIndex: {
+        status: "ingested",
+        generation: {
+          id: 6,
+          fingerprint: "a".repeat(64),
+          status: "complete",
+          discoveryComplete: true,
+          diagnosticsComplete: true,
+          usageProvenanceComplete: true,
+          sourceOrderComplete: true,
+          quotaProvenanceComplete: true,
+          toolProvenanceComplete: true,
+        },
+        rootCoverage: {
+          status: "ready",
+          configuredRoots: 1,
+          availableRoots: 1,
+          emptyRoots: 0,
+          unavailableRoots: 0,
+          retainedHistory: true,
+          unavailableOwnerSources: 1,
+          ambiguousSources: 0,
+        },
+      },
       expectedUnifiedIndex: {
         status: "failed",
         errorCode: "local_unified_index_generation_invalid",
@@ -2677,7 +3338,9 @@ test("cancellation after the early headline does not start the normal continuati
 });
 
 test("refresh controller reloads a quick result while deep accounting continues", async () => {
-  let reloads = 0;
+  let fullReloads = 0;
+  let quickReloads = 0;
+  let quickProgress = null;
   let releaseAccounting;
   const accountingGate = new Promise((resolve) => {
     releaseAccounting = resolve;
@@ -2709,7 +3372,11 @@ test("refresh controller reloads a quick result while deep accounting continues"
     },
     dataStore: {
       async reload() {
-        reloads += 1;
+        fullReloads += 1;
+      },
+      async reloadQuick({ progress }) {
+        quickReloads += 1;
+        quickProgress = progress;
       },
     },
     clock: () => Date.parse("2026-07-23T12:00:00.000Z"),
@@ -2724,7 +3391,12 @@ test("refresh controller reloads a quick result while deep accounting continues"
   assert.equal(quick.status, "running");
   assert.equal(quick.progress.phase, "quick_result");
   assert.equal(quick.quickResultAt, "2026-07-23T12:00:00.000Z");
-  assert.equal(reloads, 1);
+  assert.equal(quickReloads, 1);
+  assert.deepEqual(quickProgress, {
+    ...COMPLETE_INDEX,
+    phase: "quick_result",
+  });
+  assert.equal(fullReloads, 0);
 
   releaseAccounting();
   for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -2732,7 +3404,8 @@ test("refresh controller reloads a quick result while deep accounting continues"
     await new Promise((resolve) => setImmediate(resolve));
   }
   assert.equal(controller.getStatus().status, "succeeded");
-  assert.equal(reloads, 2);
+  assert.equal(quickReloads, 1);
+  assert.equal(fullReloads, 1);
 });
 
 test("refresh controller keeps a bounded-pause headline observable after the pass settles", async () => {
@@ -2777,7 +3450,7 @@ test("refresh controller keeps a bounded-pause headline observable after the pas
   assert.equal(reloads, 2);
 });
 
-test("refresh controller cancels bounded work and preserves safe progress", async () => {
+test("refresh controller cancels bounded work without reloading the last-good dashboard", async () => {
   let observedAbort = false;
   let reloads = 0;
   const controller = new LocalCompanionRefreshController({
@@ -2826,7 +3499,7 @@ test("refresh controller cancels bounded work and preserves safe progress", asyn
   assert.equal(status.errorCode, "refresh_cancelled");
   assert.equal(status.progress.status, "bounded_pause");
   assert.equal(status.progress.recordsWritten, 2);
-  assert.equal(reloads, 1);
+  assert.equal(reloads, 0);
   assert.equal(controller.cancel(), false);
 });
 

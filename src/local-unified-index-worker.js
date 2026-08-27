@@ -24,8 +24,6 @@ import { withStableRolloutSource } from "./rollout-source-snapshot.js";
 // buffer from a rollout file is ever posted; the batch below carries integers,
 // a model identifier and a tier classification, nothing that can hold content.
 
-const BATCH_EVENTS = 5_000;
-
 function validSource(value) {
   return value !== null
     && typeof value === "object"
@@ -44,6 +42,14 @@ async function run() {
     throw new Error("unified index worker input is invalid");
   }
   const maximumLineBytes = workerData?.maximumLineBytes;
+  // The host writes each received batch through synchronous node:sqlite calls.
+  // Keep that main-thread turn bounded so the companion can service
+  // health/status/cancel requests between batches. Transaction commits remain
+  // governed independently by the host's larger commitRows setting.
+  const batchEvents = workerData?.batchEvents;
+  if (!Number.isSafeInteger(batchEvents) || batchEvents < 1 || batchEvents > 500) {
+    throw new Error("unified index worker batch bound is invalid");
+  }
 
   for (const members of components) {
     // `createLineageSnapshots` wants lineage-shaped members; the wire form is
@@ -126,7 +132,7 @@ async function run() {
           cursor = null,
           quarantineReason = null,
         ) => {
-          const seedKeys = snapshotSeedKeys.splice(0, BATCH_EVENTS);
+          const seedKeys = snapshotSeedKeys.splice(0, batchEvents);
           parentPort.postMessage({
             type: "batch",
             rolloutKey,
@@ -150,7 +156,7 @@ async function run() {
           snapshotKeys = [];
           snapshotResetPending = false;
         };
-        while (snapshotSeedKeys.length > BATCH_EVENTS) {
+        while (snapshotSeedKeys.length > batchEvents) {
           flush(source.rolloutKey, false, null);
         }
         const outcome = await withStableRolloutSource(source, (stableSource) => (
@@ -165,7 +171,7 @@ async function run() {
               collector.add(key);
               snapshotKeys.push(key);
               if (events.length + boundaries.length + tools.length
-                  + snapshotKeys.length >= BATCH_EVENTS) {
+                  + snapshotKeys.length >= batchEvents) {
                 flush(source.rolloutKey, false, null);
               }
             },
@@ -180,19 +186,19 @@ async function run() {
           ...(maximumLineBytes === undefined ? {} : { maximumLineBytes }),
           onEvent: (event) => {
             events.push(event);
-            if (events.length + boundaries.length + tools.length >= BATCH_EVENTS) {
+            if (events.length + boundaries.length + tools.length >= batchEvents) {
               flush(source.rolloutKey, false, null);
             }
           },
           onBoundary: (event) => {
             boundaries.push(event);
-            if (events.length + boundaries.length + tools.length >= BATCH_EVENTS) {
+            if (events.length + boundaries.length + tools.length >= batchEvents) {
               flush(source.rolloutKey, false, null);
             }
           },
             onTool: (event) => {
             tools.push(event);
-            if (events.length + boundaries.length + tools.length >= BATCH_EVENTS) {
+            if (events.length + boundaries.length + tools.length >= batchEvents) {
               flush(source.rolloutKey, false, null);
             }
             },

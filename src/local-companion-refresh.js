@@ -15,6 +15,12 @@ import {
   REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
   readReplaySafeAccountingCache,
 } from "./replay-safe-accounting-cache.js";
+import {
+  assertWindowsFilesystemProductionSafe,
+  isWindowsFilesystemAdapter,
+  isWindowsQualificationModeContextFor,
+  withLocalCollectorStateSessionBoundary,
+} from "./platform/index.js";
 
 const PUBLIC_REFRESH_ERROR_CODES = new Set([
   "app_server_unavailable",
@@ -143,6 +149,7 @@ const UNIFIED_INDEX_PUBLIC_ERROR_CODES = new Set([
   "local_unified_index_meta_invalid",
   "local_unified_index_missing",
   "local_unified_index_publication_durability_uncertain",
+  "local_unified_index_roots_unavailable",
   "local_unified_index_schema_invalid",
   "local_unified_index_secondary_indexes_failed",
   "local_unified_index_secondary_indexes_missing",
@@ -390,6 +397,63 @@ function safeCollectorErrorCode(code) {
   return PUBLIC_REFRESH_ERROR_CODES.has(code) ? code : "collection_failed";
 }
 
+function fixedWindowsCollectorStateUnavailable() {
+  const error = new Error("local_collector_state_unavailable");
+  error.code = "local_collector_state_unavailable";
+  return error;
+}
+
+function assertWindowsCollectorFilesystemBoundary({
+  adapter,
+  windowsQualificationModeContext = null,
+  stateRoot = null,
+  resourceRoot = null,
+} = {}) {
+  if (process.platform === "win32" && adapter === null) {
+    throw fixedWindowsCollectorStateUnavailable();
+  }
+  if (adapter === null) return;
+  // A shape-compatible object, or a copied native adapter, is not an
+  // authenticated boundary. The central module brands only adapters it
+  // created, and its production assertion remains disabled until the native
+  // state/JOURNAL/WAL sidecars are qualified.
+  if (!isWindowsFilesystemAdapter(adapter)) {
+    throw fixedWindowsCollectorStateUnavailable();
+  }
+  if (windowsQualificationModeContext !== null) {
+    let qualificationBinding = false;
+    try {
+      qualificationBinding = isWindowsQualificationModeContextFor({
+        context: windowsQualificationModeContext,
+        adapter,
+        stateRoot,
+        resourceRoot,
+      }) === true
+        && windowsQualificationModeContext.qualificationOnly === true
+        && windowsQualificationModeContext.productionSafe === false
+        && adapter.productionSafe === false
+        && adapter.sqliteStateLeaseSafe === false;
+    } catch {
+      qualificationBinding = false;
+    }
+    if (!qualificationBinding) throw fixedWindowsCollectorStateUnavailable();
+    return;
+  }
+  try {
+    assertWindowsFilesystemProductionSafe(adapter);
+  } catch {
+    throw fixedWindowsCollectorStateUnavailable();
+  }
+  // The current adapter deliberately reports sqliteStateLeaseSafe=false, so
+  // this remains a fail-closed gate today.  Once the native lease and its
+  // sidecar qualification are positively proven, the state-session boundary
+  // below becomes the only Windows database path.
+  if (process.platform === "win32"
+      && adapter.sqliteStateLeaseSafe !== true) {
+    throw fixedWindowsCollectorStateUnavailable();
+  }
+}
+
 function safeCount(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
@@ -517,7 +581,57 @@ function unifiedGenerationAuthoritative(value) {
     && generation.diagnosticsComplete === true
     && generation.usageProvenanceComplete === true
     && generation.sourceOrderComplete === true
-    && generation.quotaProvenanceComplete === true;
+    && generation.quotaProvenanceComplete === true
+    && (value.rootCoverage?.status !== "unavailable"
+      || value.rootCoverage?.retainedHistory === true);
+}
+
+function publicRootCoverage(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const configuredRoots = value.configuredRoots;
+  const availableRoots = value.availableRoots;
+  const emptyRoots = value.emptyRoots;
+  const unavailableRoots = value.unavailableRoots;
+  const unavailableOwnerSources = value.unavailableOwnerSources ?? 0;
+  const ambiguousSources = value.ambiguousSources ?? 0;
+  if (!Number.isSafeInteger(configuredRoots)
+      || configuredRoots < 1
+      || configuredRoots > 8
+      || !Number.isSafeInteger(availableRoots)
+      || availableRoots < 0
+      || availableRoots > configuredRoots
+      || !Number.isSafeInteger(emptyRoots)
+      || emptyRoots < 0
+      || emptyRoots > availableRoots
+      || !Number.isSafeInteger(unavailableRoots)
+      || unavailableRoots < 0
+      || availableRoots + unavailableRoots !== configuredRoots
+      || !Number.isSafeInteger(unavailableOwnerSources)
+      || unavailableOwnerSources < 0
+      || !Number.isSafeInteger(ambiguousSources)
+      || ambiguousSources < 0
+      || typeof value.retainedHistory !== "boolean") {
+    return null;
+  }
+  const status = value.status;
+  if (!["ready", "partial", "unavailable"].includes(status)
+      || (status === "unavailable" && availableRoots !== 0)
+      || (status !== "unavailable" && availableRoots === 0)
+      || (status === "ready" && (unavailableRoots !== 0
+        || unavailableOwnerSources !== 0
+        || ambiguousSources !== 0))) {
+    return null;
+  }
+  return Object.freeze({
+    status,
+    configuredRoots,
+    availableRoots,
+    emptyRoots,
+    unavailableRoots,
+    retainedHistory: value.retainedHistory,
+    unavailableOwnerSources,
+    ambiguousSources,
+  });
 }
 
 function safeAccountingUnavailableCode(value) {
@@ -862,10 +976,75 @@ function runClaudeUsageShadowRefresh(refreshClaudeUsageShadow, signal) {
   });
 }
 
+function normalizedRefreshCodexRoots({
+  codexHome,
+  codexHomes,
+  primaryCodexHome,
+  accountingSourceMode,
+}) {
+  const selectedCodexHomes = codexHomes === null || codexHomes === undefined
+    ? [codexHome ?? join(homedir(), ".codex")]
+    : codexHomes;
+  if (!Array.isArray(selectedCodexHomes)
+      || selectedCodexHomes.length < 1
+      || selectedCodexHomes.length > 8
+      || selectedCodexHomes.some((value) => (
+        typeof value !== "string" || value.length < 1
+      ))
+      || new Set(selectedCodexHomes).size !== selectedCodexHomes.length) {
+    throw new TypeError(
+      "codexHomes must contain between one and eight unique non-empty paths",
+    );
+  }
+  if (selectedCodexHomes.length > 1 && primaryCodexHome === null) {
+    throw new TypeError(
+      "primaryCodexHome is required when codexHomes contains multiple paths",
+    );
+  }
+  const selectedPrimaryCodexHome = primaryCodexHome
+    ?? (selectedCodexHomes.length === 1
+      ? selectedCodexHomes[0]
+      : null);
+  if (!selectedCodexHomes.includes(selectedPrimaryCodexHome)) {
+    throw new TypeError("primaryCodexHome must identify one configured codexHomes path");
+  }
+  if (codexHome !== null && codexHome !== undefined
+      && codexHome !== selectedPrimaryCodexHome) {
+    throw new TypeError("codexHome must match primaryCodexHome");
+  }
+  if (selectedCodexHomes.length > 1 && accountingSourceMode !== "unified") {
+    throw new TypeError("multiple Codex homes require unified accounting mode");
+  }
+  return Object.freeze({
+    codexHomes: Object.freeze([...selectedCodexHomes]),
+    primaryCodexHome: selectedPrimaryCodexHome,
+  });
+}
+
 export function createLocalCollectorRefreshRunner({
-  codexHome = join(homedir(), ".codex"),
+  codexHome = null,
+  codexHomes = null,
+  primaryCodexHome = null,
   stateFile = null,
   accountObservationOperationLockFile = null,
+  // A qualified Windows filesystem boundary is deliberately carried through
+  // the composition root even while the current collector still uses Node's
+  // SQLite path. The native adapter presently cannot pin SQLite's journal/WAL
+  // sidecars; keeping this value explicit prevents a later caller from
+  // silently falling back to POSIX checks while that prerequisite is closed.
+  windowsFilesystemAdapter = null,
+  // Windows SQLite must be opened through the native lease/session seam. This
+  // is qualification-only plumbing until sqliteStateLeaseSafe is true; the
+  // current production refresh remains fail-closed on Windows.
+  windowsProtectedStateStore = null,
+  windowsSqliteStateSessionFactory = null,
+  // The qualification context is a capability, not a readiness override. It
+  // is independently checked against the adapter and roots before it enters
+  // the collector boundary; production continues through the assertion above.
+  windowsQualificationModeContext = null,
+  stateRoot = null,
+  resourceRoot = null,
+  windowsSqliteStateStaging = null,
   selectAccountObservationSecret = selectProductionAccountObservationSecret,
   runCollector = runCollectorOnce,
   readAccountingCache = readReplaySafeAccountingCache,
@@ -923,6 +1102,14 @@ export function createLocalCollectorRefreshRunner({
   if (!["unified", "legacy"].includes(accountingSourceMode)) {
     throw new TypeError("accountingSourceMode must be unified or legacy");
   }
+  const selectedCodexRoots = normalizedRefreshCodexRoots({
+    codexHome,
+    codexHomes,
+    primaryCodexHome,
+    accountingSourceMode,
+  });
+  const selectedCodexHomes = selectedCodexRoots.codexHomes;
+  const selectedPrimaryCodexHome = selectedCodexRoots.primaryCodexHome;
   if (refreshArchiveIndex !== null && typeof refreshArchiveIndex !== "function") {
     throw new TypeError("refreshArchiveIndex must be a function or null");
   }
@@ -932,6 +1119,25 @@ export function createLocalCollectorRefreshRunner({
   if (recordCodexSpeedBaseline !== null
       && typeof recordCodexSpeedBaseline !== "function") {
     throw new TypeError("recordCodexSpeedBaseline must be a function or null");
+  }
+  if (windowsFilesystemAdapter !== null
+      && (typeof windowsFilesystemAdapter !== "object"
+        || Array.isArray(windowsFilesystemAdapter))) {
+    throw new TypeError("windowsFilesystemAdapter must be an object or null");
+  }
+  if (windowsSqliteStateSessionFactory !== null
+      && typeof windowsSqliteStateSessionFactory !== "function") {
+    throw new TypeError("windowsSqliteStateSessionFactory must be a function or null");
+  }
+  if (windowsProtectedStateStore !== null
+      && (typeof windowsProtectedStateStore !== "object"
+        || Array.isArray(windowsProtectedStateStore))) {
+    throw new TypeError("windowsProtectedStateStore must be an object or null");
+  }
+  if (windowsSqliteStateStaging !== null
+      && (typeof windowsSqliteStateStaging !== "object"
+        || Array.isArray(windowsSqliteStateStaging))) {
+    throw new TypeError("windowsSqliteStateStaging must be an object or null");
   }
   for (const [name, value] of Object.entries({
     stateFile,
@@ -976,6 +1182,15 @@ export function createLocalCollectorRefreshRunner({
         || typeof signal.addEventListener !== "function")) {
       throw new TypeError("signal must be an AbortSignal or null");
     }
+    // Validate the optional native boundary before recording a refresh receipt
+    // or invoking the collector. The current SQLite state path still creates
+    // journal/WAL/SHM sidecars that are not covered by the Windows adapter.
+    assertWindowsCollectorFilesystemBoundary({
+      adapter: windowsFilesystemAdapter,
+      windowsQualificationModeContext,
+      stateRoot,
+      resourceRoot,
+    });
     // A refresh failure that reaches the app collapses to one generic code,
     // and companion stderr is deliberately discarded. Stamp every escaping
     // error with the pipeline step it left from, so the refresh status can
@@ -989,7 +1204,13 @@ export function createLocalCollectorRefreshRunner({
       throw error;
     };
     try {
-      return await (async () => {
+      return await withLocalCollectorStateSessionBoundary({
+        windowsFilesystemAdapter,
+        windowsSqliteStateSessionFactory,
+        windowsQualificationModeContext,
+        stateRoot,
+        resourceRoot,
+      }, async () => {
     // Legacy is an explicit rollback authority, never an error fallback. Stamp
     // the attempted use before any collector/accounting work so a later
     // failure still leaves a durable, bounded receipt in owner-only state.
@@ -1013,7 +1234,7 @@ export function createLocalCollectorRefreshRunner({
     // here is never allowed to block collection: it simply leaves those turns
     // to the stated preference, or unknown.
     let declaredSpeedBaselines = [];
-    if (recordCodexSpeedBaseline !== null) {
+    if (recordCodexSpeedBaseline !== null && selectedCodexHomes.length === 1) {
       try {
         const recorded = await recordCodexSpeedBaseline();
         if (Array.isArray(recorded)) declaredSpeedBaselines = recorded;
@@ -1034,13 +1255,19 @@ export function createLocalCollectorRefreshRunner({
           : {
             operationLockFile:
               accountObservationOperationLockFile,
+            ...(windowsFilesystemAdapter === null
+              ? {}
+              : { windowsFilesystemAdapter }),
           },
       );
     } catch {
       selection = { loadAccountObservationSecret: null };
     }
     const collectorOptions = {
-      codexHome,
+      // The collector's app-server/quota pass belongs to exactly one stable
+      // primary profile. Unified rollout activity is advanced separately from
+      // every configured root below.
+      codexHome: selectedPrimaryCodexHome,
       ...(stateFile === null ? {} : { stateFile }),
       staleAfterMs: 0,
       refreshStale: true,
@@ -1064,6 +1291,9 @@ export function createLocalCollectorRefreshRunner({
       maximumRecordBatchSize: 500,
       maximumRecentEventKeys: 5_000,
       loadAccountObservationSecret: selection.loadAccountObservationSecret,
+      ...(windowsFilesystemAdapter === null
+        ? {}
+        : { windowsFilesystemAdapter }),
     };
     // The headline pass uses the collector's ordinary atomic SQLite state
     // transaction with a much smaller read budget. It therefore publishes
@@ -1145,11 +1375,32 @@ export function createLocalCollectorRefreshRunner({
       // to the bounded window and says so.
       try {
         unifiedIndex = publicUnifiedIndexResult(await refreshUnifiedIndex({
-          codexHome,
+          ...(selectedCodexHomes.length > 1
+            ? { codexHomes: selectedCodexHomes }
+            : { codexHome: selectedPrimaryCodexHome }),
           ...(unifiedIndexFile === null ? {} : { indexFile: unifiedIndexFile }),
           ...(unifiedIndexSecretFile === null
             ? {}
             : { secretFile: unifiedIndexSecretFile }),
+          ...(windowsSqliteStateSessionFactory === null
+            ? {}
+            : { windowsSqliteStateSessionFactory }),
+          ...(windowsProtectedStateStore === null
+            ? {}
+            : { windowsProtectedStateStore }),
+          ...(windowsFilesystemAdapter === null
+            ? {}
+            : { windowsFilesystemAdapter }),
+          ...(windowsQualificationModeContext === null
+            ? {}
+            : {
+              windowsQualificationModeContext,
+              stateRoot,
+              resourceRoot,
+            }),
+          ...(windowsSqliteStateStaging === null
+            ? {}
+            : { windowsSqliteStateStaging }),
           signal,
         }));
       } catch (error) {
@@ -1228,7 +1479,9 @@ export function createLocalCollectorRefreshRunner({
         let rebuilt = null;
         try {
           rebuilt = await refreshAccounting({
-            codexHome,
+            ...(selectedCodexHomes.length > 1
+              ? { codexHomes: selectedCodexHomes }
+              : { codexHome: selectedPrimaryCodexHome }),
             ...(stateFile === null ? {} : { stateFile }),
             now: clock,
             sourceMode: accountingSourceMode,
@@ -1360,7 +1613,7 @@ export function createLocalCollectorRefreshRunner({
         status: "scanning",
       });
       archiveIndex = await refreshArchiveIndex({
-        codexHome,
+        codexHome: selectedPrimaryCodexHome,
         ...(archiveIndexFile === null ? {} : { indexFile: archiveIndexFile }),
         ...(archiveIndexSecretFile === null
           ? {}
@@ -1452,7 +1705,7 @@ export function createLocalCollectorRefreshRunner({
         ? {}
         : { indexing: publicIndexingResult(result.indexing) }),
     };
-      })();
+      });
     } catch (error) {
       stampStep(error);
     }
@@ -1474,6 +1727,27 @@ function publicUnifiedIndexResult(value) {
     return {
       status: "failed",
       errorCode: "local_unified_index_generation_invalid",
+    };
+  }
+  const hasRootCoverage = Object.hasOwn(value, "rootCoverage");
+  const rootCoverage = hasRootCoverage
+    ? publicRootCoverage(value.rootCoverage)
+    : null;
+  if (hasRootCoverage && rootCoverage === null) {
+    return {
+      status: "failed",
+      errorCode: "local_unified_index_generation_invalid",
+    };
+  }
+  if (rootCoverage?.status === "unavailable"
+      && rootCoverage.retainedHistory !== true) {
+    // Never turn a temporarily unreachable set of configured roots into a
+    // successful empty corpus. A retained generation may still be served, but
+    // without that evidence the refresh stays unavailable and preserves the
+    // prior dashboard snapshot.
+    return {
+      status: "failed",
+      errorCode: "local_unified_index_roots_unavailable",
     };
   }
   const counts = {};
@@ -1498,6 +1772,7 @@ function publicUnifiedIndexResult(value) {
     status: "ingested",
     unchanged: value.unchanged === true,
     generation,
+    ...(rootCoverage === null ? {} : { rootCoverage }),
     ...counts,
     wallMs: Number.isFinite(value.wallMs) && value.wallMs >= 0
       ? Math.round(value.wallMs)
@@ -1763,6 +2038,15 @@ function unifiedIndexDegradation(result) {
   return null;
 }
 
+// The native/browser default remains five minutes, but Electron can own a
+// private cold index that is materially larger than the native app's already
+// warmed state. The largest measured production-equivalent pass completed in
+// about 50 minutes, so keep a two-hour ceiling: enough recovery margin for a
+// large first ingest while still making a hung refresh fail closed.
+export const LOCAL_COMPANION_ELECTRON_REFRESH_TIMEOUT_MS = 2 * 60 * 60_000;
+export const LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS =
+  LOCAL_COMPANION_ELECTRON_REFRESH_TIMEOUT_MS;
+
 export class LocalCompanionRefreshController {
   #abortController = null;
   #cancelRequested = false;
@@ -1801,8 +2085,10 @@ export class LocalCompanionRefreshController {
     if (!dataStore || typeof dataStore.reload !== "function") {
       throw new TypeError("dataStore.reload must be a function");
     }
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 5 * 60_000) {
-      throw new TypeError("timeoutMs must be between 1,000 and 300,000");
+    if (!Number.isSafeInteger(timeoutMs)
+        || timeoutMs < 1_000
+        || timeoutMs > LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS) {
+      throw new TypeError("timeoutMs must be between 1,000 and 7,200,000");
     }
     if (typeof createRefreshId !== "function") {
       throw new TypeError("createRefreshId must be a function");
@@ -1933,7 +2219,14 @@ export class LocalCompanionRefreshController {
               && projected.phase === "quick_result"
               && !this.#cancelRequested) {
             try {
-              await this.#dataStore.reload({ purpose: "quick" });
+              if (typeof this.#dataStore.reloadQuick === "function") {
+                await this.#dataStore.reloadQuick({ progress: projected });
+              } else {
+                // Compatibility seam for narrowly injected test/legacy
+                // stores. Production LocalCompanionDataStore implements the
+                // scalar-only path above; never add this fallback there.
+                await this.#dataStore.reload({ purpose: "quick" });
+              }
               quickResultAt = new Date(this.#clock()).toISOString();
             } catch {
               // Keep the previous good dashboard. Deep accounting can still
@@ -1950,11 +2243,11 @@ export class LocalCompanionRefreshController {
       }))
       .then(async (result) => {
         if (this.#cancelRequested) {
-          try {
-            await this.#dataStore.reload({ purpose: "full" });
-          } catch {
-            // Cancellation preserves the last good dashboard snapshot.
-          }
+          // Cancellation must not wait for a full dashboard projection. On a
+          // large history that projection can take tens of seconds, making a
+          // successfully acknowledged Cancel look frozen. The data store
+          // already owns the last verified snapshot; retain it unchanged and
+          // publish the terminal state as soon as bounded work settles.
           this.#state = {
             status: "cancelled",
             refreshId: this.#state.refreshId,

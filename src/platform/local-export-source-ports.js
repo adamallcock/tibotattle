@@ -23,7 +23,12 @@ const DEFAULT_CLAUDE_STATUS_MAX_RECORDS = 20_000;
 const DEFAULT_CLAUDE_STATUS_MAX_LEDGER_BYTES = 32 * 1024 * 1024;
 const MAX_CLAUDE_STATUS_RECORD_BYTES = 4096;
 const NOFOLLOW = constants.O_NOFOLLOW ?? 0;
-const CLAUDE_STATE_ENVIRONMENT_KEYS = Object.freeze(["LOCALAPPDATA", "XDG_STATE_HOME"]);
+const CLAUDE_STATE_ENVIRONMENT_KEYS = Object.freeze([
+  "CLAUDE_CONFIG_DIR",
+  "LOCALAPPDATA",
+  "USERPROFILE",
+  "XDG_STATE_HOME",
+]);
 const CODEX_ENVIRONMENT_KEYS = Object.freeze(["CODEX_HOME"]);
 
 export function localPlatformName() {
@@ -272,6 +277,8 @@ export function createLocalExportSourcePorts(configuration = {}) {
     currentUid,
     defaultClaudeStatusStateDirectory,
     defaultHomeDirectory: homeDirectory,
+    claudeConfigDirectory: environment.CLAUDE_CONFIG_DIR,
+    userProfile: environment.USERPROFILE,
     deriveAccountScopeId,
     deriveEventOccurrenceId,
     deriveMarkerOccurrenceId,

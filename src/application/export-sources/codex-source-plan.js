@@ -24,6 +24,12 @@ const {
 
 function fail(code) { throw new ExportSourcePlanError(code); }
 
+function assertReadyRootCoverage(infos) {
+  if (infos.rootCoverage?.status !== "ready") {
+    fail("codex_rollout_roots_unavailable");
+  }
+}
+
 function sourceKey(rolloutKey) {
   return createHash("sha256")
     .update("app-usagemonitor/codex-source-key/v1\0")
@@ -94,16 +100,24 @@ const { planDigest } = createSourcePlanSummaryContract();
 
 async function createCodexExportSourcePlan({
   codexHome,
+  codexHomes,
   startAt,
   endAt,
   resourceGuard = null,
 } = {}) {
-  const infos = await discoverCodexRolloutInfos({ codexHome, startAt, endAt, resourceGuard });
+  const infos = await discoverCodexRolloutInfos({
+    codexHome,
+    codexHomes,
+    startAt,
+    endAt,
+    resourceGuard,
+  });
   const discovery = codexRolloutDiscoveryReceipt(infos);
   if (discovery.status === "partial") {
     fail(Object.keys(discovery.reasonCounts).sort()[0]
       ?? "codex_rollout_generation_ambiguous");
   }
+  assertReadyRootCoverage(infos);
   // The resumable checkpoint schema can inherit a whole inline parent, but it
   // cannot represent an exact physical-history cutoff. Never approximate a
   // paginated continuation by replaying a removed suffix or starting its
@@ -225,6 +239,7 @@ async function verifyCodexExportSourceHandle(source, handle, {
 
 async function resolveCodexExportSourcePlan(plan, {
   codexHome,
+  codexHomes,
   resourceGuard = null,
 } = {}) {
   if (!plan || plan.schemaVersion !== EXPORT_SOURCE_PLAN_VERSION || !Array.isArray(plan.sources)) {
@@ -232,6 +247,7 @@ async function resolveCodexExportSourcePlan(plan, {
   }
   const infos = await discoverCodexRolloutInfos({
     codexHome,
+    codexHomes,
     startAt: plan.startAt,
     endAt: plan.endAt,
     resourceGuard,
@@ -241,6 +257,10 @@ async function resolveCodexExportSourcePlan(plan, {
     fail(Object.keys(discovery.reasonCounts).sort()[0]
       ?? "codex_rollout_generation_ambiguous");
   }
+  // The initial plan already froze the complete source inventory. A root may
+  // disappear during resume when every planned logical source is still
+  // available as a byte-proven replica; the exact map and prefix verification
+  // below fail closed if even one frozen source cannot be resolved.
   if (infos.some((info) => info.lineage?.historyMode === "paginated")) {
     fail("codex_rollout_checkpoint_history_unsupported");
   }
@@ -256,6 +276,14 @@ async function resolveCodexExportSourcePlan(plan, {
     return {
       ...source,
       path: info.path,
+      // The frozen capability is logical key + byte prefix, not one inode.
+      // Bind the verified open to the currently discovered physical candidate
+      // and then prove the entire frozen prefix below. This permits an
+      // active/archive move or an exact replica without weakening TOCTOU
+      // identity checks on the handle that will actually be read.
+      dev: info.dev,
+      ino: info.ino,
+      birthtimeMs: Math.trunc(info.birthtimeMs),
       rolloutInfo: { ...info, size: source.prefixBytes },
     };
   });

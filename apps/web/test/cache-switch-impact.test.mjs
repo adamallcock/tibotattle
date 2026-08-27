@@ -838,6 +838,316 @@ test("cache-switch mobile cards carry their translated column labels", async () 
   );
 });
 
+test("single-turn evidence keeps every advanced cache module visible without figures", async () => {
+  const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const element = (tagName, className = "", textContent = "") => ({
+    tagName,
+    className,
+    textContent,
+    children: [],
+    hidden: true,
+    open: true,
+    append(...items) { this.children.push(...items); },
+  });
+  const clear = (target) => { target.children.length = 0; };
+  const localizedNode = (tagName, className, key) => element(tagName, className, key);
+  const paginate = (rows) => ({
+    rows,
+    start: 0,
+    end: rows.length,
+    total: rows.length,
+    pageCount: 1,
+  });
+
+  const switchDisclosure = element("details");
+  const switchRows = element("tbody");
+  const switchStart = source.indexOf("function renderAccountingCacheSwitchDetails(impact) {");
+  const switchEnd = source.indexOf("\nfunction appendCacheContinuityAllowance", switchStart);
+  assert.ok(switchStart >= 0 && switchEnd > switchStart, "switch renderer is available");
+  const renderSwitch = Function(
+    "$",
+    "clear",
+    "node",
+    "localizedNode",
+    "paginateCacheImpactRows",
+    "cacheSwitchTablePagination",
+    "renderCacheImpactPagination",
+    `${source.slice(switchStart, switchEnd)}\nreturn renderAccountingCacheSwitchDetails;`,
+  )(
+    (selector) => ({
+      "#cache-switch-details": switchDisclosure,
+      "#cache-switch-rows": switchRows,
+    })[selector] ?? null,
+    clear,
+    element,
+    localizedNode,
+    paginate,
+    { page: 0, signature: "" },
+    () => {},
+  );
+
+  const reuseOutcome = element("section");
+  const reuseSummary = element("div");
+  const reuseBadge = element("div");
+  reuseOutcome.querySelector = (selector) => ({
+    ".cache-reuse-summary": reuseSummary,
+    ".cache-reuse-real-data": reuseBadge,
+  })[selector] ?? null;
+  const reuseRaster = element("div");
+  const reuseEmpty = element("p");
+  const reuseStart = source.indexOf("function renderAccountingCacheReuseOutcome(impact) {");
+  const reuseEnd = source.indexOf("\nfunction selectCacheReuseBucketFromPointer", reuseStart);
+  assert.ok(reuseStart >= 0 && reuseEnd > reuseStart, "reuse renderer is available");
+  const renderReuse = Function(
+    "$",
+    "cacheReuseOutcomeBuckets",
+    "setLocalizedText",
+    `let cacheReuseCurrentImpact = null;
+     let cacheReuseRenderedPeriodId = null;
+     let cacheReuseSelectedBucketIndex = 2;
+     ${source.slice(reuseStart, reuseEnd)}
+     return renderAccountingCacheReuseOutcome;`,
+  )(
+    (selector) => ({
+      "#cache-reuse-outcome": reuseOutcome,
+      "#cache-reuse-raster": reuseRaster,
+      "#cache-reuse-empty": reuseEmpty,
+    })[selector] ?? null,
+    () => null,
+    (target, key) => { target.textContent = key; },
+  );
+
+  const continuityDisclosure = element("details");
+  const continuityRows = element("tbody");
+  const continuityStart = source.indexOf("function renderAccountingCacheContinuityDetails(impact) {");
+  const continuityEnd = source.indexOf("\nfunction sideChatConfigurationDescription", continuityStart);
+  assert.ok(
+    continuityStart >= 0 && continuityEnd > continuityStart,
+    "continuity renderer is available",
+  );
+  const renderContinuity = Function(
+    "$",
+    "clear",
+    "node",
+    "localizedNode",
+    "renderAccountingCacheReuseOutcome",
+    "paginateCacheImpactRows",
+    "cacheContinuityTablePagination",
+    "renderCacheImpactPagination",
+    `${source.slice(continuityStart, continuityEnd)}\nreturn renderAccountingCacheContinuityDetails;`,
+  )(
+    (selector) => ({
+      "#cache-continuity-details": continuityDisclosure,
+      "#cache-continuity-rows": continuityRows,
+    })[selector] ?? null,
+    clear,
+    element,
+    localizedNode,
+    renderReuse,
+    paginate,
+    { page: 0, signature: "" },
+    () => {},
+  );
+
+  // This is the same evidence shape a one-turn synthetic profile produces:
+  // no adjacent configuration change or follow-up return can qualify.
+  renderSwitch(null);
+  renderContinuity(null);
+
+  assert.equal(switchDisclosure.hidden, false);
+  assert.equal(switchRows.children.length, 1);
+  assert.equal(
+    switchRows.children[0].children[0].textContent,
+    "accounting.cacheSwitch.detailsUnavailable",
+  );
+  assert.equal(switchRows.children[0].children[0].colSpan, 5);
+  assert.equal(continuityDisclosure.hidden, false);
+  assert.equal(continuityRows.children.length, 1);
+  assert.equal(
+    continuityRows.children[0].children[0].textContent,
+    "accounting.cacheContinuity.detailsUnavailable",
+  );
+  assert.equal(continuityRows.children[0].children[0].colSpan, 6);
+  assert.equal(reuseOutcome.hidden, false);
+  assert.equal(reuseSummary.hidden, true);
+  assert.equal(reuseBadge.hidden, true);
+  assert.equal(reuseRaster.hidden, true);
+  assert.equal(reuseEmpty.hidden, false);
+  assert.equal(
+    reuseEmpty.textContent,
+    "accounting.cacheContinuity.outcome.insufficientEvidence",
+  );
+  assert.doesNotMatch(reuseEmpty.textContent, /0(?:%|\.|,|\b)/u);
+});
+
+test("available advanced cache evidence continues to render its real rows and reuse values", async () => {
+  const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const element = (tagName, className = "", textContent = "") => ({
+    tagName,
+    className,
+    textContent,
+    children: [],
+    hidden: true,
+    open: false,
+    append(...items) { this.children.push(...items); },
+  });
+  const clear = (target) => { target.children.length = 0; };
+  const paginate = (rows) => ({
+    rows,
+    start: 0,
+    end: rows.length,
+    total: rows.length,
+    pageCount: 1,
+  });
+
+  const continuityDisclosure = element("details");
+  const continuityRows = element("tbody");
+  const continuityStart = source.indexOf("function renderAccountingCacheContinuityDetails(impact) {");
+  const continuityEnd = source.indexOf("\nfunction sideChatConfigurationDescription", continuityStart);
+  const reuseCalls = [];
+  const renderContinuity = Function(
+    "$",
+    "clear",
+    "node",
+    "rawNode",
+    "localizedNode",
+    "renderAccountingCacheReuseOutcome",
+    "paginateCacheImpactRows",
+    "cacheContinuityTablePagination",
+    "cacheImpactTableSignature",
+    "renderCacheImpactPagination",
+    "formatLocal",
+    "formatCacheContinuityGap",
+    "cacheContinuityConfigurationDescription",
+    "formatCount",
+    "formatApiMoney",
+    `${source.slice(continuityStart, continuityEnd)}\nreturn renderAccountingCacheContinuityDetails;`,
+  )(
+    (selector) => ({
+      "#cache-continuity-details": continuityDisclosure,
+      "#cache-continuity-rows": continuityRows,
+    })[selector] ?? null,
+    clear,
+    element,
+    element,
+    (tagName, className, key) => element(tagName, className, key),
+    (impact) => reuseCalls.push(impact),
+    paginate,
+    { page: 0, signature: "" },
+    () => "continuity",
+    () => {},
+    (value) => value,
+    (seconds) => `${seconds}s`,
+    () => "GPT-5.6 Sol · high",
+    String,
+    (value) => `$${value.toFixed(2)}`,
+  );
+  const impact = {
+    status: "available",
+    periodId: "7d",
+    recent: [{
+      observedAt: "Aug 16, 11:33 AM EDT",
+      gapSeconds: 45,
+      configuration: { model: "gpt-5.6-sol", reasoningEffort: "high" },
+      previousCacheReadTokens: 8_000,
+      currentCacheReadTokens: 1_000,
+      lostCacheTokens: 7_000,
+      estimatedPremiumUsd: 0.5,
+    }],
+  };
+  renderContinuity(impact);
+  assert.equal(continuityDisclosure.hidden, false);
+  assert.equal(reuseCalls[0], impact);
+  assert.equal(continuityRows.children.length, 1);
+  assert.deepEqual(
+    continuityRows.children[0].children.map((cell) => cell.textContent),
+    ["Aug 16, 11:33 AM EDT", "45s", "GPT-5.6 Sol · high", "8000 → 1000", "7000", "$0.50"],
+  );
+
+  const reuseOutcome = element("section");
+  const reuseSummary = element("div");
+  const reuseBadge = element("div");
+  reuseOutcome.querySelector = (selector) => ({
+    ".cache-reuse-summary": reuseSummary,
+    ".cache-reuse-real-data": reuseBadge,
+  })[selector] ?? null;
+  const reuseRaster = element("div");
+  const reuseEmpty = element("p");
+  const values = {};
+  const reuseStart = source.indexOf("function renderAccountingCacheReuseOutcome(impact) {");
+  const reuseEnd = source.indexOf("\nfunction selectCacheReuseBucketFromPointer", reuseStart);
+  const renderReuse = Function(
+    "$",
+    "cacheReuseOutcomeBuckets",
+    "cacheReusePercent",
+    "setRawText",
+    "cacheContinuityStandardMetricValue",
+    "setLocalizedText",
+    "formatCount",
+    "chooseCacheReuseMarkUnit",
+    "drawCacheReuseRaster",
+    "ensureCacheReuseResizeObserver",
+    `const CACHE_REUSE_DEFAULT_BUCKET_INDEX = 2;
+     let cacheReuseCurrentImpact = null;
+     let cacheReuseRenderedPeriodId = null;
+     let cacheReuseSelectedBucketIndex = 2;
+     ${source.slice(reuseStart, reuseEnd)}
+     return renderAccountingCacheReuseOutcome;`,
+  )(
+    (selector) => ({
+      "#cache-reuse-outcome": reuseOutcome,
+      "#cache-reuse-raster": reuseRaster,
+      "#cache-reuse-empty": reuseEmpty,
+      "#cache-reuse-more-percent": { id: "more" },
+      "#cache-reuse-less-percent": { id: "less" },
+      "#cache-reuse-overhead": { id: "overhead" },
+      "#cache-reuse-more-count": { id: "more-count" },
+      "#cache-reuse-less-count": { id: "less-count" },
+      "#cache-reuse-explanation": { id: "explanation" },
+    })[selector] ?? null,
+    () => [{ id: "two_to_five_minutes" }],
+    (part, whole) => `${part}/${whole}`,
+    (target, value) => { values[target.id] = value; },
+    () => "$0.50",
+    (target, key, args = {}) => { values[target.id ?? "empty"] = { key, args }; },
+    String,
+    () => 100,
+    () => {},
+    () => {},
+  );
+  renderReuse({
+    periodId: "7d",
+    comparableReturns: 2,
+    reusedMoreThanHalfReturns: 1,
+    reusedHalfOrLessReturns: 1,
+    matchedOrExceededReturns: 1,
+    reusedBetweenHalfAndPreviousReturns: 0,
+  });
+  assert.equal(reuseOutcome.hidden, false);
+  assert.equal(reuseSummary.hidden, false);
+  assert.equal(reuseBadge.hidden, false);
+  assert.equal(reuseRaster.hidden, false);
+  assert.equal(reuseEmpty.hidden, true);
+  assert.deepEqual(values, {
+    more: "1/2",
+    less: "1/2",
+    overhead: "$0.50",
+    "more-count": {
+      key: "accounting.cacheContinuity.outcome.followUps",
+      args: { count: "1" },
+    },
+    "less-count": {
+      key: "accounting.cacheContinuity.outcome.followUps",
+      args: { count: "1" },
+    },
+    explanation: {
+      key: "accounting.cacheContinuity.outcome.howToRead",
+      args: { percent: "1/2", matched: "1", between: "0" },
+    },
+    empty: { key: "accounting.cacheContinuity.outcome.noData", args: {} },
+  });
+});
+
 test("accounting tables page ten rows and reset for a changed set", async () => {
   const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const start = source.indexOf("const CACHE_IMPACT_TABLE_PAGE_SIZE = 10;");
@@ -1060,6 +1370,10 @@ test("cache-impact UI copy has three-locale parity and collapsed evidence tables
       /accounting\.cacheSwitch/u,
     );
     assert.doesNotMatch(
+      translate("accounting.cacheSwitch.detailsUnavailable", {}, locale),
+      /accounting\.cacheSwitch/u,
+    );
+    assert.doesNotMatch(
       translate("accounting.cacheSwitch.column.lostTokens", {}, locale),
       /accounting\.cacheSwitch/u,
     );
@@ -1070,6 +1384,10 @@ test("cache-impact UI copy has three-locale parity and collapsed evidence tables
       upper: "2",
     }, "en"),
     /may combine accounts/u,
+  );
+  assert.match(
+    translate("accounting.cacheSwitch.detailsUnavailable", {}, "en"),
+    /Not enough eligible local evidence/u,
   );
   for (const locale of SUPPORTED_LOCALES) {
     assert.doesNotMatch(
@@ -1131,9 +1449,25 @@ test("cache-impact UI copy has three-locale parity and collapsed evidence tables
       "Ver las caídas grandes de caché recientes",
     ],
   );
+  assert.match(
+    translate("accounting.cacheContinuity.detailsUnavailable", {}, "en"),
+    /Not enough eligible local evidence/u,
+  );
+  assert.match(
+    translate("accounting.cacheContinuity.outcome.insufficientEvidence", {}, "en"),
+    /No percentages or estimates are shown/u,
+  );
   for (const locale of SUPPORTED_LOCALES) {
     assert.doesNotMatch(
       translate("accounting.cacheContinuity.metricExplanation", {}, locale),
+      /accounting\.cacheContinuity/u,
+    );
+    assert.doesNotMatch(
+      translate("accounting.cacheContinuity.detailsUnavailable", {}, locale),
+      /accounting\.cacheContinuity/u,
+    );
+    assert.doesNotMatch(
+      translate("accounting.cacheContinuity.outcome.insufficientEvidence", {}, locale),
       /accounting\.cacheContinuity/u,
     );
     assert.doesNotMatch(

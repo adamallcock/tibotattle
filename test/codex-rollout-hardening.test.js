@@ -1041,7 +1041,7 @@ test("source mutation outranks a simultaneous parser failure", async () => {
   }
 });
 
-test("unreadable discovery roots propagate instead of publishing an empty corpus", async () => {
+test("unreadable discovery roots report unavailable coverage for publication guards", async () => {
   const denied = Object.assign(new Error("denied"), { code: "EACCES" });
   const sources = createCodexLogSources({
     filesystem: {
@@ -1053,11 +1053,25 @@ test("unreadable discovery roots propagate instead of publishing an empty corpus
     },
     lineReader: { readBoundedUtf8Lines: async function* lines() {} },
   });
-  await assert.rejects(sources.discoverCodexRolloutInfos({
+  const infos = await sources.discoverCodexRolloutInfos({
     codexHome: "/codex",
     startAt: "1970-01-01T00:00:00.000Z",
     selectedRolloutNames: new Map(),
-  }), (error) => error === denied);
+  });
+  assert.deepEqual(infos, []);
+  assert.deepEqual(infos.rootCoverage, {
+    status: "unavailable",
+    configuredRoots: 1,
+    availableRoots: 0,
+    emptyRoots: 0,
+    unavailableRoots: 1,
+    retainedHistory: false,
+    unavailableOwnerSources: 0,
+    ambiguousSources: 0,
+  });
+  assert.equal(infos.configuredRootOwnerKeys.length, 1);
+  assert.deepEqual(infos.availableRootOwnerKeys, []);
+  assert.deepEqual(infos.unavailableRootOwnerKeys, infos.configuredRootOwnerKeys);
 });
 
 test("resource-limit and cancellation control errors escape lineage validation", async (t) => {

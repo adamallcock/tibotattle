@@ -1,0 +1,596 @@
+/*
+ * The settings window deliberately shares the dashboard's paper, ink, and
+ * green language while keeping its own layout. Native macOS Settings uses a
+ * compact toolbar and grouped controls; this is the cross-platform equivalent
+ * for Electron, where the renderer owns the content area on Windows and Linux.
+ */
+
+.electron-settings-page {
+  min-width: 620px;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 92% 2%, rgba(45, 116, 102, .1), transparent 28rem),
+    var(--paper);
+}
+
+.electron-settings-page .skip-link {
+  z-index: 50;
+}
+
+.electron-settings-page #settings-content:focus {
+  outline: 3px solid var(--blue);
+  outline-offset: 4px;
+}
+
+.settings-window {
+  width: min(960px, calc(100% - 48px));
+  margin: 0 auto;
+  padding: 48px 0 56px;
+}
+
+.settings-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-6);
+  padding-bottom: var(--space-7);
+}
+
+.settings-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-4);
+}
+
+.settings-brand-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: var(--radius-round);
+  box-shadow: 0 6px 18px rgba(23, 79, 69, .16);
+}
+
+.settings-header h1,
+.settings-panel-heading h2 {
+  margin: 0;
+  font-family: var(--serif);
+  font-weight: var(--weight-display);
+  letter-spacing: -.02em;
+}
+
+.settings-header h1 {
+  font-size: clamp(2rem, 4vw, 2.7rem);
+  line-height: 1.08;
+}
+
+.settings-lede,
+.settings-panel-heading > p:last-child {
+  max-width: 60ch;
+  margin: var(--space-2) 0 0;
+  color: var(--muted);
+}
+
+.settings-bridge-status {
+  flex: 0 1 250px;
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  color: var(--green);
+  background: var(--green-soft);
+  border: 1px solid rgba(23, 79, 69, .16);
+  border-radius: var(--radius-pill);
+  font-size: .82rem;
+  line-height: 1.35;
+  text-align: center;
+}
+
+.settings-bridge-status.is-unavailable,
+.settings-status.is-unavailable {
+  color: var(--rust);
+  background: var(--rust-soft);
+  border-color: rgba(151, 64, 42, .16);
+}
+
+.settings-bridge-status.is-ready {
+  color: var(--green);
+}
+
+.settings-tabs {
+  display: flex;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  background: rgba(236, 230, 218, .74);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+}
+
+.settings-tab {
+  min-height: 42px;
+  flex: 1 1 0;
+  padding: 0 var(--space-4);
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-weight: var(--weight-medium);
+}
+
+.settings-tab:hover {
+  color: var(--ink);
+  background: rgba(255, 254, 249, .56);
+}
+
+.settings-tab[aria-selected="true"] {
+  color: var(--green);
+  background: var(--surface-raised);
+  border-color: var(--line);
+  box-shadow: var(--shadow-card);
+}
+
+.settings-panels {
+  margin-top: var(--space-7);
+}
+
+.settings-panel[hidden] {
+  display: none;
+}
+
+.settings-panel-heading {
+  margin-bottom: var(--space-5);
+}
+
+.settings-panel-heading h2 {
+  font-size: 2rem;
+  line-height: 1.1;
+}
+
+.settings-card {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-6);
+  margin-top: var(--space-4);
+  padding: var(--space-6);
+  background: var(--surface-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-card);
+}
+
+.settings-roots-card {
+  display: block;
+}
+
+.settings-roots-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-6);
+}
+
+.settings-roots-heading > .settings-actions {
+  flex: 0 0 auto;
+}
+
+.settings-roots-status {
+  min-height: 1.35em;
+  margin: var(--space-4) 0 0 !important;
+  color: var(--rust);
+  font-size: .86rem;
+}
+
+.settings-roots-list {
+  display: grid;
+  gap: var(--space-3);
+  margin-top: var(--space-5);
+}
+
+.settings-root-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-4);
+  align-items: start;
+  padding: var(--space-4);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+
+.settings-root-card[data-primary="true"] {
+  border-color: rgba(23, 79, 69, .38);
+  box-shadow: inset 3px 0 var(--green);
+}
+
+.settings-root-card h4 {
+  margin: 0;
+  color: var(--ink);
+  font-size: .96rem;
+  font-weight: var(--weight-semibold);
+}
+
+.settings-root-path {
+  display: block;
+  margin-top: var(--space-2);
+  color: var(--ink);
+  font-size: .88rem;
+  overflow-wrap: anywhere;
+}
+
+.settings-root-role {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  color: var(--muted);
+  font-size: .78rem;
+}
+
+.settings-root-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.6rem;
+  padding: 0 var(--space-2);
+  color: var(--green);
+  background: var(--green-soft);
+  border-radius: var(--radius-pill);
+  font-weight: var(--weight-semibold);
+}
+
+.settings-root-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.settings-root-actions .button {
+  min-height: 36px;
+  padding-inline: var(--space-3);
+  font-size: .8rem;
+}
+
+.settings-root-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 36px;
+  padding: 0 var(--space-3);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  font-size: .8rem;
+  font-weight: var(--weight-medium);
+}
+
+.settings-root-primary:has(input:checked) {
+  color: var(--green);
+  background: var(--green-soft);
+  border-color: rgba(23, 79, 69, .25);
+}
+
+.settings-root-primary input {
+  accent-color: var(--green);
+}
+
+.settings-root-primary input:focus-visible,
+.settings-root-actions .button:focus-visible {
+  outline: 3px solid rgba(49, 95, 132, .42);
+  outline-offset: 2px;
+}
+
+.settings-root-actions .button:disabled,
+.settings-root-primary:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: .54;
+}
+
+.settings-card-copy {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.settings-card h3 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: var(--weight-semibold);
+}
+
+.settings-card p {
+  max-width: 62ch;
+  margin: var(--space-2) 0 0;
+  color: var(--muted);
+  font-size: .9rem;
+}
+
+.settings-value {
+  display: block;
+  margin-top: var(--space-3);
+  color: var(--ink);
+  font-size: .88rem;
+  font-weight: var(--weight-medium);
+  overflow-wrap: anywhere;
+}
+
+.settings-field {
+  display: grid;
+  flex: 0 0 min(280px, 40%);
+  gap: var(--space-2);
+  color: var(--muted);
+  font-size: .82rem;
+  font-weight: var(--weight-medium);
+}
+
+.settings-field select {
+  min-height: 40px;
+  padding: 0 var(--space-3);
+  color: var(--ink);
+  background: var(--surface-raised);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+}
+
+.settings-actions,
+.settings-control-column {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.settings-control-column {
+  flex: 0 0 min(430px, 52%);
+}
+
+.settings-card > .settings-actions {
+  flex: 0 0 auto;
+}
+
+.settings-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--hit-target);
+  color: var(--ink);
+  cursor: pointer;
+  font-size: .9rem;
+  font-weight: var(--weight-medium);
+}
+
+.settings-switch input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.settings-switch-track {
+  display: inline-flex;
+  align-items: center;
+  width: 42px;
+  height: 24px;
+  padding: 3px;
+  background: var(--paper-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-pill);
+  transition: background .16s ease, border-color .16s ease;
+}
+
+.settings-switch-track > span {
+  width: 16px;
+  height: 16px;
+  background: var(--surface-raised);
+  border-radius: var(--radius-round);
+  box-shadow: 0 1px 3px rgba(23, 33, 30, .2);
+  transition: transform .16s ease;
+}
+
+.settings-switch input:checked + .settings-switch-track {
+  background: var(--green-2);
+  border-color: var(--green-2);
+}
+
+.settings-switch input:checked + .settings-switch-track > span {
+  transform: translateX(18px);
+}
+
+.settings-switch input:focus-visible + .settings-switch-track {
+  outline: 3px solid rgba(49, 95, 132, .42);
+  outline-offset: 3px;
+}
+
+.settings-switch input:disabled + .settings-switch-track,
+.settings-switch:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: .56;
+}
+
+.settings-radio-group {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.settings-radio-group label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--hit-target);
+  padding: var(--space-2) var(--space-3);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  font-size: .86rem;
+}
+
+.settings-radio-group label:has(input:checked) {
+  color: var(--green);
+  background: var(--green-soft);
+  border-color: rgba(23, 79, 69, .25);
+}
+
+.settings-radio-group label:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: .54;
+}
+
+.settings-status {
+  margin-bottom: 0 !important;
+}
+
+.settings-about-brand {
+  align-items: center;
+  justify-content: flex-start;
+}
+
+.settings-about-icon {
+  width: 64px;
+  height: 64px;
+  border-radius: var(--radius-round);
+}
+
+.settings-project-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin-top: var(--space-5);
+}
+
+.settings-project-links a {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--hit-target);
+  padding: var(--space-2) var(--space-3);
+  color: var(--green);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  font-size: .88rem;
+  font-weight: var(--weight-medium);
+  text-decoration: none;
+}
+
+.settings-project-links a:hover {
+  background: var(--green-soft);
+}
+
+.settings-operation-status {
+  min-height: 1.5em;
+  margin: var(--space-4) 0 0;
+  color: var(--rust);
+  font-size: .88rem;
+}
+
+@media (max-width: 760px) {
+  .electron-settings-page {
+    min-width: 0;
+  }
+
+  .settings-window {
+    width: min(100% - 32px, 640px);
+    padding-top: 28px;
+  }
+
+  .settings-header,
+  .settings-card,
+  .settings-roots-heading,
+  .settings-root-card {
+    flex-direction: column;
+  }
+
+  .settings-root-card {
+    display: block;
+  }
+
+  .settings-bridge-status,
+  .settings-field,
+  .settings-control-column {
+    width: 100%;
+    flex-basis: auto;
+  }
+
+  .settings-actions,
+  .settings-control-column,
+  .settings-radio-group,
+  .settings-root-actions {
+    justify-content: flex-start;
+  }
+
+  .settings-actions .button {
+    flex: 1 1 auto;
+  }
+}
+
+/* Keep the settings window operable in Windows High Contrast and other
+   explicit high-contrast modes. System colors follow the user's selected
+   contrast pair and the focus ring remains visible on both tabs and controls. */
+@media (forced-colors: active), (prefers-contrast: more) {
+  .electron-settings-page,
+  .settings-card,
+  .settings-tabs,
+  .settings-field select,
+  .settings-tab,
+  .settings-project-links a {
+    color: CanvasText;
+    background: Canvas;
+    border-color: CanvasText;
+  }
+  .settings-bridge-status,
+  .settings-status,
+  .settings-value,
+  .settings-lede,
+  .settings-panel-heading > p:last-child,
+  .settings-card p {
+    color: CanvasText;
+  }
+  .settings-root-card,
+  .settings-root-primary,
+  .settings-root-actions .button {
+    color: CanvasText;
+    background: Canvas;
+    border-color: CanvasText;
+  }
+  .settings-root-path,
+  .settings-root-role,
+  .settings-roots-status {
+    color: CanvasText;
+  }
+  .settings-tab[aria-selected="true"],
+  .settings-radio-group label:has(input:checked),
+  .settings-root-card[data-primary="true"],
+  .settings-root-primary:has(input:checked),
+  .settings-switch input:checked + .settings-switch-track {
+    color: HighlightText;
+    background: Highlight;
+    border-color: Highlight;
+  }
+  .settings-switch-track,
+  .settings-switch-track > span {
+    border-color: CanvasText;
+    background: Canvas;
+  }
+  .settings-switch input:checked + .settings-switch-track > span {
+    background: HighlightText;
+  }
+  .settings-tab:focus-visible,
+  .settings-field select:focus-visible,
+  .settings-switch input:focus-visible + .settings-switch-track,
+  .settings-project-links a:focus-visible,
+  .settings-root-primary:focus-visible,
+  .settings-root-actions .button:focus-visible,
+  .electron-settings-page #settings-content:focus {
+    outline: 3px solid Highlight;
+    outline-offset: 3px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .settings-switch-track,
+  .settings-switch-track > span {
+    transition: none;
+  }
+}

@@ -615,11 +615,30 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     source.indexOf("private func showFirstRunDisclosure"),
     source.indexOf("private func startCompanion"),
   );
+  const companionProcessSource = source.slice(
+    source.indexOf("private final class CompanionProcess"),
+    source.indexOf("private struct LocalKeychainResetResult"),
+  );
   assert.match(source, /import AppKit/u);
   assert.match(source, /"USAGE_MONITOR_PORT": "0"/u);
   assert.match(source, /"USAGE_MONITOR_RESOURCE_ROOT"/u);
   assert.match(source, /"USAGE_MONITOR_STATE_ROOT"/u);
-  assert.match(source, /"CODEX_HOME": codexHome\.path/u);
+  assert.match(
+    source,
+    /for root in configuration\.roots \{[\s\S]*?arguments\.append\("--codex-home"\)[\s\S]*?arguments\.append\(root\.url\.path\)[\s\S]*?arguments\.append\("--primary-codex-home"\)/u,
+  );
+  assert.match(
+    companionProcessSource,
+    /trailing: codexHomeLaunchArguments\(codexHomeConfiguration\)/u,
+  );
+  assert.match(
+    companionProcessSource,
+    /"CODEX_HOME": codexHomeConfiguration\.url\.path/u,
+  );
+  assert.doesNotMatch(
+    companionProcessSource,
+    /"CODEX_HOME"[^\n]*(?:joined|separator|delimiter)/iu,
+  );
   assert.match(source, /"USAGE_MONITOR_CENTRAL_ORIGIN"/u);
   assert.match(source, /UsageMonitorCentralOriginMode/u);
   assert.match(source, /BundledProduct\.publicWebsiteOrigin/u);
@@ -645,7 +664,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(
     source,
-    /title: TiboTattleLocalization\.string\(\.settingsChooseCodexFolder\)/u,
+    /title: TiboTattleLocalization\.string\(\.settingsAddCodexFolder\)/u,
   );
   assert.match(
     source,
@@ -682,6 +701,59 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(source, /companionStartupTimeoutSeconds/u);
   assert.match(source, /NSOpenPanel/u);
   assert.match(source, /launcher-settings-v1\.json/u);
+  assert.match(source, /usage-monitor-launcher-settings-v2/u);
+  assert.match(source, /usage-monitor-launcher-settings-v1/u);
+  assert.match(source, /private let maximumCodexActivityRoots = 8/u);
+  assert.match(source, /let activityRoots: \[LauncherActivityRoot\]/u);
+  assert.match(source, /let primaryRootId: UUID/u);
+  assert.match(
+    source,
+    /Set\(configuration\.roots\.map\(\\\.id\)\)\.count == configuration\.roots\.count/u,
+  );
+  assert.match(
+    source,
+    /Set\(object\.keys\) == \[[\s\S]*?"schemaVersion", "activityRoots", "primaryRootId"/u,
+  );
+  assert.match(
+    source,
+    /Set\(root\.keys\) == \["rootId", "path", "enabled"\]/u,
+  );
+  assert.match(
+    source,
+    /settings\.activityRoots\.allSatisfy\(\{ root in[\s\S]*?root\.enabled[\s\S]*?\.path == root\.path/u,
+  );
+  assert.match(
+    source,
+    /private func validatedUnavailablePersistedCodexHome[\s\S]*?finalStatus != 0, errno == ENOENT[\s\S]*?\(metadata\.st_mode & S_IFMT\) != S_IFLNK/u,
+  );
+  const configurationValidationSource = source.slice(
+    source.indexOf("private func validatedCodexHomeConfiguration"),
+    source.indexOf("private func writeCodexHomeConfiguration"),
+  );
+  assert.match(
+    configurationValidationSource,
+    /root\.id == defaultCodexActivityRootID[\s\S]*?root\.url\.path == defaultHome\.path/u,
+  );
+  assert.match(
+    configurationValidationSource,
+    /validatedCustomCodexHome\(root\.url\)[\s\S]*?validatedUnavailablePersistedCodexHome/u,
+  );
+  assert.doesNotMatch(
+    configurationValidationSource,
+    /validatedURL = defaultHome/u,
+  );
+  assert.match(
+    source,
+    /unavailableAllowedRootIDs: Set\(\s*settings\.activityRoots\.map\(\\\.rootId\)\s*\)/u,
+  );
+  assert.match(
+    source,
+    /private func removeCodexHome[\s\S]*?configuration\.primaryRootID != rootID/u,
+  );
+  assert.match(source, /--codex-home-settings-reload-smoke-test/u);
+  assert.match(source, /--codex-home-reachability-smoke-test/u);
+  assert.match(source, /--codex-home-restart-gate-smoke-test/u);
+  assert.match(source, /--codex-home-quit-during-stop-smoke-test/u);
   assert.match(source, /settingsCodexFolderDefaultLocation/u);
   // A rejected Codex-home selection must answer as an alert at the
   // frontmost Settings window: the main window's failure surface sits
@@ -706,11 +778,65 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     /catch \{\s*presentCodexHomeSelectionRejection\(error\)\s*\}/u,
   );
   assert.doesNotMatch(codexHomeSelectionSource, /showFailure/u);
-  // The Settings summary names the selected folder, tilde-abbreviated;
-  // Data & Diagnostics keeps paths_included: false and never renders it.
+  assert.match(source, /func addCodexHomeFromSettings/u);
+  assert.match(codexHomeSelectionSource, /func removeCodexHomeFromSettings/u);
+  assert.match(codexHomeSelectionSource, /func setPrimaryCodexHomeFromSettings/u);
+  assert.match(
+    codexHomeSelectionSource,
+    /removeCodexHomeFromSettings[\s\S]*?includingPrimary: false/u,
+  );
+  assert.match(
+    localizationSource,
+    /Removing this folder stops future reading but retains imported history/iu,
+  );
+  assert.match(
+    localizationSource,
+    /Add 1–8 folders only when you intend[\s\S]*cannot verify account equivalence/iu,
+  );
   assert.match(
     source,
-    /\.settingsCodexFolderCustomSelectedPath,\s*\(configuration\.url\.path as NSString\)\.abbreviatingWithTildeInPath/u,
+    /private func codexActivityRootReachability[\s\S]*?\.ready[\s\S]*?\.temporarilyUnavailable[\s\S]*?\.invalid/u,
+  );
+  assert.match(
+    source,
+    /settingsUseDefaultCodexHomeButton\?\.isEnabled = controlsEnabled/u,
+  );
+  assert.match(
+    source,
+    /private struct CodexHomeRestartGate[\s\S]*?case \.stopping:[\s\S]*?return \.none[\s\S]*?case \.starting:[\s\S]*?restartRequestedWhileStarting = true/u,
+  );
+  assert.match(
+    source,
+    /private func restartCompanionAfterCodexHomeChange[\s\S]*?codexHomeRestartGate\.requestRestart\(\)[\s\S]*?stopCurrentCompanionForCodexHomeRestart/u,
+  );
+  assert.match(source, /private var stoppingCompanion: CompanionProcess\?/u);
+  assert.match(
+    source,
+    /private func stopCurrentCompanionForCodexHomeRestart[\s\S]*?stoppingCompanion = previous[\s\S]*?previous\.stop[\s\S]*?stoppingCompanion === previous[\s\S]*?stoppingCompanion = nil[\s\S]*?codexHomeRestartCompanionStopped/u,
+  );
+  assert.match(
+    source,
+    /private func codexHomeRestartCompanionStopped[\s\S]*?guard !quitting else \{ return \}/u,
+  );
+  const terminationSource = source.slice(
+    source.indexOf("func applicationShouldTerminate"),
+    source.indexOf("// Sign in with Apple"),
+  );
+  assert.match(
+    terminationSource,
+    /let ownedCompanion = companionToAwaitOnTermination\([\s\S]*?stopping: stoppingCompanion[\s\S]*?codexHomeRestartGate\.cancel\(\)[\s\S]*?ownedCompanion\.stop/u,
+  );
+  assert.match(
+    terminationSource,
+    /func applicationWillTerminate[\s\S]*?companionToAwaitOnTermination\([\s\S]*?stopping: stoppingCompanion[\s\S]*?ownedCompanion\.stop/u,
+  );
+  assert.doesNotMatch(source, /codexHomeButton|showCodexHomeOptions/u);
+  // Settings may name every selected folder, tilde-abbreviated; Data &
+  // Diagnostics keeps paths_included/identifiers_included false and never
+  // renders either paths or stable local root IDs.
+  assert.match(
+    source,
+    /\.settingsCodexFolderPrimarySelectedPath[\s\S]*?\(root\.url\.path as NSString\)\.abbreviatingWithTildeInPath/u,
   );
   const lifecycleDiagnosticsSource = source.slice(
     source.indexOf("private struct LifecycleDiagnostics"),
@@ -719,7 +845,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(lifecycleDiagnosticsSource, /codexHomeMode: CodexHomeMode/u);
   assert.doesNotMatch(
     lifecycleDiagnosticsSource,
-    /abbreviatingWithTildeInPath|url\.path/u,
+    /abbreviatingWithTildeInPath|url\.path|primaryRootID|activityRoots/u,
   );
   assert.match(
     source,
@@ -833,7 +959,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(
     source,
-    /guard !quitting, retryAllowed, firstRunAcknowledged else \{ return \}/u,
+    /guard !quitting, retryAllowed, firstRunAcknowledged,[\s\S]*?!codexHomeRestartGate\.isInFlight[\s\S]*?else \{ return \}/u,
   );
   assert.match(
     source,
@@ -1009,7 +1135,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(
     settingsSource,
-    /settingsControlRow\(\[chooseSource, useDefaultSource\]\)/u,
+    /settingsControlColumn\(\[\s*settingsControlRow\(\[addSource, removeSource\]\),\s*settingsControlRow\(\[setPrimarySource, useDefaultSource\]\),\s*\]\)/u,
   );
   assert.match(settingsSource, /settingsControlRow\(\[openNotifications\]\)/u);
   assert.match(settingsSource, /settingsControlRow\(\[checkForUpdates\]\)/u);
@@ -1018,6 +1144,10 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     /settingsControlColumn\(\[\s*openLoginItems,\s*refreshLoginItemStatus,\s*removePendingLoginItem,\s*\]\)/u,
   );
   for (const bare of [
+    "addSource",
+    "removeSource",
+    "setPrimarySource",
+    "useDefaultSource",
     "openLoginItems",
     "refreshLoginItemStatus",
     "removePendingLoginItem",
@@ -1439,6 +1569,88 @@ test("native update disclosure routes settings to About in every catalog", async
     assert.equal(disclosureLines.length, 2, locale);
     assert.equal(disclosureLines.every((line) => line.includes(about)), true, locale);
     assert.equal(disclosureLines.some((line) => line.includes(general)), false, locale);
+  }
+});
+
+test("multi-root settings and retained-history warning ship in every native catalog", async () => {
+  const expectations = [
+    {
+      locale: "en",
+      retainedHistory: "retains imported history",
+      sameAccount: "one Codex user/account",
+      cannotVerify: "cannot verify account equivalence",
+      settingsGeneral: "Settings → General",
+    },
+    {
+      locale: "es",
+      retainedHistory: "conserva el historial importado",
+      sameAccount: "un mismo usuario o una misma cuenta de Codex",
+      cannotVerify: "no puede verificar que las cuentas sean equivalentes",
+      settingsGeneral: "Configuración → General",
+    },
+    {
+      locale: "zh-Hans",
+      retainedHistory: "保留已导入的历史记录",
+      sameAccount: "同一个 Codex 用户/账户",
+      cannotVerify: "无法验证账户是否相同",
+      settingsGeneral: "“设置”→“通用”",
+    },
+  ];
+  const requiredKeys = [
+    "settings.addCodexFolder",
+    "settings.removeCodexFolder",
+    "settings.setPrimaryCodexFolder",
+    "settings.codexFolderActivitySelectedPath",
+    "settings.codexFolderPathWithStatus",
+    "settings.codexFolderPrimarySelectedPath",
+    "settings.codexFolderStatusInvalid",
+    "settings.codexFolderStatusReady",
+    "settings.codexFolderStatusTemporarilyUnavailable",
+    "dialog.removeCodexFolderDescription",
+    "dialog.resetCodexFoldersDescription",
+    "dialog.setPrimaryCodexFolderDescription",
+  ];
+  for (const {
+    locale,
+    retainedHistory,
+    sameAccount,
+    cannotVerify,
+    settingsGeneral,
+  } of expectations) {
+    const catalog = await readFile(
+      join(
+        REPOSITORY_ROOT,
+        "apps",
+        "macos",
+        "Resources",
+        `${locale}.lproj`,
+        "Localizable.strings",
+      ),
+      "utf8",
+    );
+    for (const key of requiredKeys) {
+      assert.match(
+        catalog,
+        new RegExp(`^"${key.replaceAll(".", "\\.")}" = ".+";$`, "mu"),
+        `${locale}: ${key}`,
+      );
+    }
+    const removalLine = catalog.split(/\r?\n/u).find((line) =>
+      line.startsWith('"dialog.removeCodexFolderDescription"'));
+    assert.notEqual(removalLine, undefined, locale);
+    assert.equal(removalLine.includes(retainedHistory), true, locale);
+    const intentLine = catalog.split(/\r?\n/u).find((line) =>
+      line.startsWith('"settings.codexFolderSummary"'));
+    assert.notEqual(intentLine, undefined, locale);
+    assert.equal(intentLine.includes(sameAccount), true, locale);
+    assert.equal(intentLine.includes(cannotVerify), true, locale);
+    const recoveryLine = catalog.split(/\r?\n/u).find((line) =>
+      line.startsWith('"launcher.recoveryChooseCodexHome"'));
+    assert.notEqual(recoveryLine, undefined, locale);
+    assert.equal(recoveryLine.includes(settingsGeneral), true, locale);
+    assert.equal(recoveryLine.includes("Codex Source"), false, locale);
+    assert.equal(recoveryLine.includes("Codex 来源"), false, locale);
+    assert.equal(recoveryLine.includes("Origen de Codex"), false, locale);
   }
 });
 
@@ -6749,12 +6961,16 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       "Usage Monitor",
     );
     const customCodexHome = join(temporaryRoot, "custom-codex-home");
+    const secondaryCodexHome = join(temporaryRoot, "secondary-codex-home");
     await mkdir(settingsHome, { mode: 0o700 });
     await mkdir(customCodexHome, { mode: 0o700 });
     await mkdir(join(customCodexHome, "sessions"), { mode: 0o700 });
+    await mkdir(secondaryCodexHome, { mode: 0o700 });
+    await mkdir(join(secondaryCodexHome, "sessions"), { mode: 0o700 });
     const settingsSmoke = spawnSync(launcher, [
       "--codex-home-settings-smoke-test",
       customCodexHome,
+      secondaryCodexHome,
     ], {
       cwd: temporaryRoot,
       encoding: "utf8",
@@ -6773,20 +6989,126 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.equal(
       settingsSmoke.stdout,
-      "USAGE_MONITOR_MACOS_CODEX_HOME_READY mode=custom persisted=true path_exposed=false\n",
+      "USAGE_MONITOR_MACOS_CODEX_HOME_READY roots=2 primary_stable=true primary_removal_refused=true add=true reset=true persisted=true argv=repeatable path_exposed=false\n",
     );
     const settingsFile = join(
       settingsRoot,
       "launcher-settings-v1.json",
     );
+    const persistedSettings = JSON.parse(await readFile(settingsFile, "utf8"));
+    assert.equal(
+      persistedSettings.schemaVersion,
+      "usage-monitor-launcher-settings-v2",
+    );
+    assert.deepEqual(
+      persistedSettings.activityRoots.map(({ path }) => path),
+      [customCodexHome, secondaryCodexHome],
+    );
+    assert.equal(persistedSettings.activityRoots.length, 2);
+    assert.equal(
+      persistedSettings.primaryRootId,
+      persistedSettings.activityRoots[1].rootId,
+    );
+    assert.equal(
+      persistedSettings.activityRoots.every(({ enabled }) => enabled === true),
+      true,
+    );
+    for (const { rootId } of persistedSettings.activityRoots) {
+      assert.match(
+        rootId,
+        /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/iu,
+      );
+    }
+    assert.equal(new Set(
+      persistedSettings.activityRoots.map(({ rootId }) => rootId),
+    ).size, 2);
+    assert.equal((await stat(settingsFile)).mode & 0o777, 0o600);
+
+    const assertUnavailableRootReloads = async (
+      unavailableRoot,
+      primaryUnavailable,
+    ) => {
+      const parkedRoot = `${unavailableRoot}-temporarily-parked`;
+      await rename(unavailableRoot, parkedRoot);
+      try {
+        const reload = spawnSync(launcher, [
+          "--codex-home-settings-reload-smoke-test",
+        ], {
+          cwd: temporaryRoot,
+          encoding: "utf8",
+          timeout: 5_000,
+          env: {
+            HOME: settingsHome,
+            LANG: "en_US.UTF-8",
+            PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+            TMPDIR: tmpdir(),
+          },
+        });
+        assert.equal(reload.status, 0, reload.stderr || reload.stdout);
+        assert.equal(
+          reload.stdout,
+          "USAGE_MONITOR_MACOS_CODEX_HOME_RELOAD_READY roots=2 unavailable=1 "
+            + `primary_unavailable=${primaryUnavailable} `
+            + "argv=retained path_exposed=false\n",
+        );
+        assert.equal(reload.stdout.includes(unavailableRoot), false);
+      } finally {
+        await rename(parkedRoot, unavailableRoot);
+      }
+    };
+    await assertUnavailableRootReloads(customCodexHome, false);
+    await assertUnavailableRootReloads(secondaryCodexHome, true);
     assert.deepEqual(
       JSON.parse(await readFile(settingsFile, "utf8")),
-      {
-        codexHome: customCodexHome,
-        schemaVersion: "usage-monitor-launcher-settings-v1",
-      },
+      persistedSettings,
     );
-    assert.equal((await stat(settingsFile)).mode & 0o777, 0o600);
+
+    const refusedDuplicate = spawnSync(launcher, [
+      "--codex-home-settings-smoke-test",
+      customCodexHome,
+      customCodexHome,
+    ], {
+      cwd: temporaryRoot,
+      encoding: "utf8",
+      timeout: 5_000,
+      env: {
+        HOME: settingsHome,
+        LANG: "en_US.UTF-8",
+        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+        TMPDIR: tmpdir(),
+      },
+    });
+    assert.equal(refusedDuplicate.status, 1);
+    assert.deepEqual(
+      JSON.parse(await readFile(settingsFile, "utf8")),
+      persistedSettings,
+    );
+
+    const excessCodexHomes = [customCodexHome, secondaryCodexHome];
+    for (let index = 0; index < 7; index += 1) {
+      const path = join(temporaryRoot, `excess-codex-home-${index}`);
+      await mkdir(path, { mode: 0o700 });
+      excessCodexHomes.push(path);
+    }
+    const refusedNinthRoot = spawnSync(launcher, [
+      "--codex-home-settings-smoke-test",
+      ...excessCodexHomes,
+    ], {
+      cwd: temporaryRoot,
+      encoding: "utf8",
+      timeout: 5_000,
+      env: {
+        HOME: settingsHome,
+        LANG: "en_US.UTF-8",
+        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+        TMPDIR: tmpdir(),
+      },
+    });
+    assert.equal(refusedNinthRoot.status, 1);
+    assert.deepEqual(
+      JSON.parse(await readFile(settingsFile, "utf8")),
+      persistedSettings,
+    );
 
     const aliasedCodexHome = join(temporaryRoot, "aliased-codex-home");
     await symlink(customCodexHome, aliasedCodexHome);
@@ -6809,6 +7131,86 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       refusedAlias.stderr,
       "macOS Codex home settings smoke failed\n",
     );
+    const reachabilitySmoke = spawnSync(launcher, [
+      "--codex-home-reachability-smoke-test",
+      customCodexHome,
+      join(temporaryRoot, "health-unavailable-codex-home"),
+      aliasedCodexHome,
+    ], {
+      cwd: temporaryRoot,
+      encoding: "utf8",
+      timeout: 5_000,
+      env: {
+        HOME: settingsHome,
+        LANG: "en_US.UTF-8",
+        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+        TMPDIR: tmpdir(),
+      },
+    });
+    assert.equal(
+      reachabilitySmoke.status,
+      0,
+      reachabilitySmoke.stderr || reachabilitySmoke.stdout,
+    );
+    assert.equal(
+      reachabilitySmoke.stdout,
+      "USAGE_MONITOR_MACOS_CODEX_HOME_REACHABILITY "
+        + "ready=1 temporarily_unavailable=1 invalid=1 "
+        + "native_only=true path_exposed=false\n",
+    );
+    assert.equal(reachabilitySmoke.stdout.includes(customCodexHome), false);
+    assert.equal(reachabilitySmoke.stdout.includes(aliasedCodexHome), false);
+
+    const restartGateSmoke = spawnSync(launcher, [
+      "--codex-home-restart-gate-smoke-test",
+    ], {
+      cwd: temporaryRoot,
+      encoding: "utf8",
+      timeout: 5_000,
+      env: {
+        HOME: settingsHome,
+        LANG: "en_US.UTF-8",
+        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+        TMPDIR: tmpdir(),
+      },
+    });
+    assert.equal(
+      restartGateSmoke.status,
+      0,
+      restartGateSmoke.stderr || restartGateSmoke.stdout,
+    );
+    assert.equal(
+      restartGateSmoke.stdout,
+      "USAGE_MONITOR_MACOS_CODEX_HOME_RESTART_GATE "
+        + "coalesced=true serialized=true starts=2 "
+        + "controls=disabled-until-terminal "
+        + "quit_cancels_restart=true\n",
+    );
+
+    const quitDuringStopSmoke = spawnSync(launcher, [
+      "--codex-home-quit-during-stop-smoke-test",
+    ], {
+      cwd: temporaryRoot,
+      encoding: "utf8",
+      timeout: 30_000,
+      env: {
+        HOME: settingsHome,
+        LANG: "en_US.UTF-8",
+        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+        TMPDIR: tmpdir(),
+      },
+    });
+    assert.equal(
+      quitDuringStopSmoke.status,
+      0,
+      quitDuringStopSmoke.stderr || quitDuringStopSmoke.stdout,
+    );
+    assert.equal(
+      quitDuringStopSmoke.stdout,
+      "USAGE_MONITOR_MACOS_CODEX_HOME_QUIT_DURING_STOP "
+        + "stopped=true requested=true active_nil=true "
+        + "restart_cancelled=true path_exposed=false\n",
+    );
     await writeFile(settingsFile, "", { mode: 0o600 });
     const repairedSettings = spawnSync(launcher, [
       "--codex-home-settings-smoke-test",
@@ -6830,6 +7232,21 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       repairedSettings.stderr || repairedSettings.stdout,
     );
     assert.equal((await stat(settingsFile)).mode & 0o777, 0o600);
+    const repairedSettingsDocument = JSON.parse(
+      await readFile(settingsFile, "utf8"),
+    );
+    assert.equal(
+      repairedSettingsDocument.schemaVersion,
+      "usage-monitor-launcher-settings-v2",
+    );
+    assert.deepEqual(
+      repairedSettingsDocument.activityRoots.map(({ path }) => path),
+      [customCodexHome],
+    );
+    assert.equal(
+      repairedSettingsDocument.primaryRootId,
+      repairedSettingsDocument.activityRoots[0].rootId,
+    );
 
     // The ownership predicate itself: a root-owned directory passes every
     // other validation step (canonical path, directory, world-readable), so
@@ -6859,12 +7276,146 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       // the visible Settings summary re-reads exactly this file.
       assert.deepEqual(
         JSON.parse(await readFile(settingsFile, "utf8")),
-        {
-          codexHome: customCodexHome,
-          schemaVersion: "usage-monitor-launcher-settings-v1",
-        },
+        repairedSettingsDocument,
       );
     }
+
+    const migrationHome = join(temporaryRoot, "legacy-settings-home");
+    const migrationSettingsRoot = join(
+      migrationHome,
+      "Library",
+      "Application Support",
+      "Usage Monitor",
+    );
+    await mkdir(migrationSettingsRoot, { recursive: true, mode: 0o700 });
+    await chmod(migrationSettingsRoot, 0o700);
+    const migrationSettingsFile = join(
+      migrationSettingsRoot,
+      "launcher-settings-v1.json",
+    );
+    await writeFile(
+      migrationSettingsFile,
+      `${JSON.stringify({
+        codexHome: customCodexHome,
+        schemaVersion: "usage-monitor-launcher-settings-v1",
+      })}\n`,
+      { mode: 0o600 },
+    );
+    await chmod(migrationSettingsFile, 0o600);
+    const migrationSmoke = spawnSync(launcher, [
+      "--codex-home-settings-migration-smoke-test",
+    ], {
+      cwd: temporaryRoot,
+      encoding: "utf8",
+      timeout: 5_000,
+      env: {
+        HOME: migrationHome,
+        LANG: "en_US.UTF-8",
+        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+        TMPDIR: tmpdir(),
+      },
+    });
+    assert.equal(
+      migrationSmoke.status,
+      0,
+      migrationSmoke.stderr || migrationSmoke.stdout,
+    );
+    assert.equal(
+      migrationSmoke.stdout,
+      "USAGE_MONITOR_MACOS_CODEX_HOME_MIGRATED roots=1 primary_stable=true owner_only=true path_exposed=false\n",
+    );
+    assert.equal(migrationSmoke.stdout.includes(customCodexHome), false);
+    const migratedSettings = JSON.parse(
+      await readFile(migrationSettingsFile, "utf8"),
+    );
+    assert.equal(
+      migratedSettings.schemaVersion,
+      "usage-monitor-launcher-settings-v2",
+    );
+    assert.deepEqual(
+      migratedSettings.activityRoots.map(({ path }) => path),
+      [customCodexHome],
+    );
+    assert.equal(
+      migratedSettings.primaryRootId,
+      migratedSettings.activityRoots[0].rootId,
+    );
+    assert.equal(migratedSettings.activityRoots[0].enabled, true);
+    assert.equal((await stat(migrationSettingsFile)).mode & 0o777, 0o600);
+
+    const unavailableMigrationHome = join(
+      temporaryRoot,
+      "legacy-unavailable-settings-home",
+    );
+    const unavailableMigrationSettingsRoot = join(
+      unavailableMigrationHome,
+      "Library",
+      "Application Support",
+      "Usage Monitor",
+    );
+    await mkdir(unavailableMigrationSettingsRoot, {
+      recursive: true,
+      mode: 0o700,
+    });
+    await chmod(unavailableMigrationSettingsRoot, 0o700);
+    const unavailableMigrationSettingsFile = join(
+      unavailableMigrationSettingsRoot,
+      "launcher-settings-v1.json",
+    );
+    const unavailableLegacyCodexHome = join(
+      temporaryRoot,
+      "temporarily-unavailable-legacy-codex",
+    );
+    await writeFile(
+      unavailableMigrationSettingsFile,
+      `${JSON.stringify({
+        codexHome: unavailableLegacyCodexHome,
+        schemaVersion: "usage-monitor-launcher-settings-v1",
+      })}\n`,
+      { mode: 0o600 },
+    );
+    await chmod(unavailableMigrationSettingsFile, 0o600);
+    const unavailableMigrationSmoke = spawnSync(launcher, [
+      "--codex-home-settings-migration-smoke-test",
+    ], {
+      cwd: temporaryRoot,
+      encoding: "utf8",
+      timeout: 5_000,
+      env: {
+        HOME: unavailableMigrationHome,
+        LANG: "en_US.UTF-8",
+        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+        TMPDIR: tmpdir(),
+      },
+    });
+    assert.equal(
+      unavailableMigrationSmoke.status,
+      0,
+      unavailableMigrationSmoke.stderr || unavailableMigrationSmoke.stdout,
+    );
+    assert.equal(
+      unavailableMigrationSmoke.stdout,
+      "USAGE_MONITOR_MACOS_CODEX_HOME_MIGRATED roots=1 primary_stable=true owner_only=true path_exposed=false\n",
+    );
+    const unavailableMigratedSettings = JSON.parse(
+      await readFile(unavailableMigrationSettingsFile, "utf8"),
+    );
+    assert.equal(
+      unavailableMigratedSettings.schemaVersion,
+      "usage-monitor-launcher-settings-v2",
+    );
+    assert.deepEqual(
+      unavailableMigratedSettings.activityRoots.map(({ path }) => path),
+      [unavailableLegacyCodexHome],
+    );
+    assert.equal(
+      unavailableMigratedSettings.primaryRootId,
+      unavailableMigratedSettings.activityRoots[0].rootId,
+    );
+    assert.equal(
+      (await stat(unavailableMigrationSettingsFile)).mode & 0o777,
+      0o600,
+    );
 
     const firstRunHome = join(temporaryRoot, "first-run-home");
     await mkdir(firstRunHome, { mode: 0o700 });

@@ -283,6 +283,34 @@ test("unexplained noncanonical rollouts claiming one session fail once with a fi
   }
 });
 
+test("local metadata export refuses an all-unavailable Codex root set", async () => {
+  const root = await mkdtemp(join(tmpdir(), "app-usagemonitor-unavailable-roots-"));
+  try {
+    await assert.rejects(
+      buildLocalMetadataBundle({
+        startAt: "2026-07-24T11:59:00.000Z",
+        endAt: "2026-07-24T12:03:00.000Z",
+        codexHomes: [join(root, "missing")],
+        secret: SECRET,
+        bundleId: BUNDLE_ID,
+        createdAt: CREATED_AT,
+      }),
+      (error) => {
+        assert.equal(error?.name, "CodexRolloutCoverageError");
+        assert.equal(error?.code, "codex_rollout_roots_unavailable");
+        assert.deepEqual(error?.coverage, {
+          configuredRootCount: 1,
+          availableRootCount: 0,
+          unavailableRootCount: 1,
+        });
+        return true;
+      },
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("missing source token components remain unavailable rather than becoming observed zero", async () => {
   const home = await mkdtemp(join(tmpdir(), "app-usagemonitor-missing-components-"));
   await mkdir(join(home, "sessions"), { recursive: true });

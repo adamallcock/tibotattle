@@ -4,6 +4,12 @@ import { lstat, open } from "node:fs/promises";
 import { TextDecoder } from "node:util";
 
 const DEFAULT_MAXIMUM_BYTES = 1024 * 1024;
+// Windows does not provide a portable O_NOFOLLOW open flag.  The caller still
+// brackets the descriptor read with bigint lstat/stat identity checks, while
+// POSIX hosts retain the kernel no-follow protection.
+const NO_FOLLOW_FLAG = process.platform === "win32"
+  ? 0
+  : (constants.O_NOFOLLOW ?? 0);
 
 function fixedFailure(message) {
   const error = new Error(message);
@@ -98,7 +104,7 @@ export async function captureStableUtf8Source(path, {
 
       handle = await open(
         path,
-        constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+        constants.O_RDONLY | NO_FOLLOW_FLAG,
       );
       const preHandle = await handle.stat({ bigint: true });
       if (!isSingleRegularFile(preHandle, maximumBytes)

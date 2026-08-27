@@ -6,6 +6,7 @@ import {
 import { classifySessionSurface } from "./surface-classification.js";
 
 const MAXIMUM_ACTIVE_APPEND_PROOF_BYTES = 8 * 1024 * 1024;
+const MAXIMUM_CONCURRENT_ROOT_SCANS = 2;
 const MAXIMUM_ROLLOUT_LINEAGE_BYTES = 1024 * 1024;
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const UUID_VALUE = new RegExp(`^${UUID}$`, "iu");
@@ -131,6 +132,12 @@ function createDiscoveryLimiter(limits) {
   };
 }
 
+function isDiscoveryLimitError(error) {
+  return error?.name === "CodexLogDiscoveryLimitError"
+    || (typeof error?.code === "string"
+      && error.code.startsWith("codex_log_discovery_"));
+}
+
 export class CodexLogSourceChangedError extends Error {
   constructor() {
     super("Codex log source changed during scan; retry");
@@ -164,7 +171,93 @@ function sameSourceState(left, right) {
     && left.ctimeMs === right.ctimeMs;
 }
 
+function isDirectFilesystemObject(stats, typeMethod) {
+  try {
+    return typeof stats?.[typeMethod] === "function"
+      && stats[typeMethod]() === true
+      && typeof stats.isSymbolicLink === "function"
+      && stats.isSymbolicLink() === false;
+  } catch {
+    return false;
+  }
+}
+
+function isDirectDirectory(stats) {
+  return isDirectFilesystemObject(stats, "isDirectory");
+}
+
+function isDirectFile(stats) {
+  return isDirectFilesystemObject(stats, "isFile");
+}
+
+function rethrowDiscoveryControlError(error) {
+  rethrowScannerControlError(error);
+  if (error?.name === "CodexLogDiscoveryLimitError"
+      || (typeof error?.code === "string"
+        && error.code.startsWith("codex_log_discovery_"))) throw error;
+}
+
 export function createCodexLogSources({ filesystem, lineReader }) {
+  function ambiguousRolloutIdentity() {
+    const error = new Error("Ambiguous duplicate Codex rollout identity across roots");
+    error.code = "codex_rollout_identity_ambiguous";
+    return error;
+  }
+
+  function opaqueRootOwnerKey(value) {
+    return filesystem.createSha256()
+      .update("app-usagemonitor/codex-root-owner/v1\0")
+      .update(value)
+      .digest("hex");
+  }
+
+  function normalizeCodexHomes(codexHome, codexHomes) {
+    if (codexHome !== null && codexHome !== undefined
+        && codexHomes !== null && codexHomes !== undefined) {
+      throw new TypeError("codexHome and codexHomes are mutually exclusive");
+    }
+    const values = codexHomes === null || codexHomes === undefined
+      ? [codexHome ?? filesystem.defaultCodexHome()]
+      : codexHomes;
+    if (!Array.isArray(values) || values.length < 1 || values.length > 8) {
+      throw new TypeError("codexHomes must contain between 1 and 8 roots");
+    }
+    const roots = values.map((value) => {
+      const descriptor = typeof value === "string"
+        ? { path: value, id: value }
+        : value;
+      if (!descriptor || typeof descriptor !== "object" || Array.isArray(descriptor)
+          || typeof descriptor.path !== "string" || descriptor.path.length < 1) {
+        throw new TypeError("each Codex home must be a path or root descriptor");
+      }
+      const identity = descriptor.id ?? descriptor.rootId ?? descriptor.path;
+      if (typeof identity !== "string" || identity.length < 1) {
+        throw new TypeError("Codex root descriptor identity must be a non-empty string");
+      }
+      return Object.freeze({
+        path: descriptor.path,
+        rootOwnerKey: opaqueRootOwnerKey(identity),
+      });
+    });
+    const byOwner = new Map();
+    const byPath = new Map();
+    for (const root of roots) {
+      const owner = byOwner.get(root.rootOwnerKey);
+      if (owner !== undefined) {
+        throw new TypeError("Codex root descriptor identities must be unique");
+      }
+      const pathOwner = byPath.get(root.path);
+      if (pathOwner !== undefined) {
+        throw new TypeError("Codex home paths must be unique");
+      }
+      byOwner.set(root.rootOwnerKey, root);
+      byPath.set(root.path, root.rootOwnerKey);
+    }
+    return [...byOwner.values()].sort((left, right) => (
+      left.rootOwnerKey.localeCompare(right.rootOwnerKey)
+    ));
+  }
+
   function boundedScannerLines(
     source,
     resourceGuard,
@@ -410,48 +503,205 @@ export function createCodexLogSources({ filesystem, lineReader }) {
     discoveryLimiter = null,
   ) {
     const files = [];
-    async function walk(directory) {
+    let rootOpened = false;
+    let unsafeFailure = false;
+    let unsafeAlias = false;
+    let discoveryFailureCode = null;
+    async function lstatDirectory(directory, {
+      allowMissing = false,
+      expected = null,
+    } = {}) {
+      let metadata;
+      try {
+        metadata = await filesystem.lstatPath(directory);
+      } catch (error) {
+        rethrowDiscoveryControlError(error);
+        if (allowMissing && error?.code === "ENOENT") return null;
+        unsafeFailure = true;
+        return null;
+      }
+      if (!isDirectDirectory(metadata)
+          || (expected !== null && !sameSourceIdentity(metadata, expected))) {
+        unsafeAlias = true;
+        return null;
+      }
+      return metadata;
+    }
+
+    async function lstatEntry(path) {
+      let metadata;
+      try {
+        metadata = await filesystem.lstatPath(path);
+      } catch (error) {
+        rethrowDiscoveryControlError(error);
+        unsafeFailure = true;
+        return null;
+      }
+      if (metadata?.isSymbolicLink?.() === true) {
+        unsafeAlias = true;
+        return null;
+      }
+      return metadata;
+    }
+
+    async function walk(directory, depth = 0) {
       throwIfAborted(signal);
+      const directoryBefore = await lstatDirectory(directory, {
+        allowMissing: depth === 0,
+      });
+      if (directoryBefore === null) return;
       let entries;
       try {
         entries = await filesystem.openDirectory(directory);
       } catch (error) {
-        // Both Codex roots are optional on a fresh install. Absence is an empty
-        // source set; every other filesystem failure means coverage is unknown
-        // and must stop the pass rather than masquerading as an empty corpus.
-        if (error?.code === "ENOENT") return;
-        throw error;
+        rethrowDiscoveryControlError(error);
+        // A missing top-level tree was handled by the lstat above. Failure
+        // after a successful type check means the tree changed or became
+        // unreadable, so a partial inventory cannot be admitted.
+        unsafeFailure = true;
+        return;
       }
-      for await (const entry of entries) {
-        throwIfAborted(signal);
-        discoveryLimiter?.observeDirectoryEntry();
-        resourceGuard?.observeDirectoryEntry();
-        const path = filesystem.joinPath(directory, entry.name);
-        if (entry.isDirectory()) {
-          await walk(path);
-        } else if (entry.isFile()
-            && (entry.name.endsWith(".jsonl")
-              || entry.name.endsWith(".jsonl.zst"))) {
+      if (depth === 0) rootOpened = true;
+      try {
+        for await (const entry of entries) {
           throwIfAborted(signal);
-          discoveryLimiter?.observeRolloutFile();
-          const metadata = await filesystem.statPath(path);
-          // Discovery walks bounded history to resolve ancestry, but charges
-          // selected sources once before parsing.
-          resourceGuard?.checkRuntime();
-          files.push({
-            path,
-            dev: metadata.dev,
-            mtimeMs: metadata.mtimeMs,
-            ctimeMs: metadata.ctimeMs,
-            size: metadata.size,
-            ino: metadata.ino,
-            birthtimeMs: metadata.birthtimeMs,
-          });
+          discoveryLimiter?.observeDirectoryEntry();
+          resourceGuard?.observeDirectoryEntry();
+          const path = filesystem.joinPath(directory, entry.name);
+          if (entry.isSymbolicLink?.() === true) {
+            unsafeAlias = true;
+            break;
+          }
+          if (entry.isDirectory()) {
+            const metadata = await lstatEntry(path);
+            if (metadata === null) break;
+            if (!isDirectDirectory(metadata)) {
+              unsafeAlias = true;
+              break;
+            }
+            await walk(path, depth + 1);
+            if (unsafeFailure || unsafeAlias || discoveryFailureCode !== null) break;
+          } else if (entry.name.endsWith(".jsonl")
+              || entry.name.endsWith(".jsonl.zst")) {
+            const metadata = await lstatEntry(path);
+            if (metadata === null) break;
+            if (!isDirectFile(metadata)) {
+              unsafeAlias = true;
+              break;
+            }
+            throwIfAborted(signal);
+            discoveryLimiter?.observeRolloutFile();
+            // Discovery walks bounded history to resolve ancestry, but charges
+            // selected sources once before parsing.
+            resourceGuard?.checkRuntime();
+            files.push({
+              path,
+              dev: metadata.dev,
+              mtimeMs: metadata.mtimeMs,
+              ctimeMs: metadata.ctimeMs,
+              size: metadata.size,
+              ino: metadata.ino,
+              birthtimeMs: metadata.birthtimeMs,
+            });
+          }
         }
+      } catch (error) {
+        if (isDiscoveryLimitError(error)) {
+          // The limit is root-local. Discard this root's entire inventory and
+          // let other fully scanned roots advance; incremental ingestion will
+          // retain this owner's accepted last-known-good facts.
+          unsafeFailure = true;
+          discoveryFailureCode = error.code;
+        } else {
+          rethrowDiscoveryControlError(error);
+          unsafeFailure = true;
+        }
+      }
+      if (!unsafeAlias) {
+        await lstatDirectory(directory, { expected: directoryBefore });
       }
     }
     await walk(root);
-    return files;
+    if (!unsafeFailure && !unsafeAlias && discoveryFailureCode === null) {
+      // Revalidate every candidate after its containing tree has been walked.
+      // This closes static alias/replacement gaps before any rollout content
+      // is read. It is intentionally not a claim of handle-relative race
+      // safety: the parser's later read still occurs in a separate operation.
+      for (const info of files) {
+        const metadata = await lstatEntry(info.path);
+        if (metadata === null) break;
+        if (!isDirectFile(metadata) || !sameSourceIdentity(metadata, info)) {
+          unsafeAlias = true;
+          break;
+        }
+      }
+    }
+    return {
+      files,
+      rootOpened,
+      unsafeFailure,
+      unsafeAlias,
+      discoveryFailureCode,
+    };
+  }
+
+  async function hashRolloutPrefix(info, prefixBytes, resourceGuard, signal) {
+    if (!Number.isSafeInteger(prefixBytes) || prefixBytes < 0) {
+      throw ambiguousRolloutIdentity();
+    }
+    let handle;
+    try {
+      handle = await filesystem.openReadOnlyNoFollow(info.path);
+      const before = await handle.stat();
+      assertActiveSourceStats(before, info);
+      if (!sameSourceState(before, info)) sourceChanged();
+      const digest = await hashActiveSourcePrefix(
+        handle,
+        prefixBytes,
+        resourceGuard,
+        signal,
+      );
+      const after = await handle.stat();
+      assertActiveSourceStats(after, before);
+      const pathStats = await statActiveSourcePath(info.path, after);
+      if (!sameSourceState(before, after) || !sameSourceState(after, pathStats)) {
+        sourceChanged();
+      }
+      return digest;
+    } catch (error) {
+      rethrowDiscoveryControlError(error);
+      throw ambiguousRolloutIdentity();
+    } finally {
+      await handle?.close().catch(() => {});
+    }
+  }
+
+  async function assertReplicaPrefixCompatibility(group, resourceGuard, signal) {
+    if (group.length < 2) return;
+    const longest = group[0];
+    const longestPrefixBySize = new Map();
+    for (const candidate of group.slice(1)) {
+      const prefixBytes = Number(candidate.size);
+      let longestPrefix = longestPrefixBySize.get(prefixBytes);
+      if (longestPrefix === undefined) {
+        longestPrefix = await hashRolloutPrefix(
+          longest,
+          prefixBytes,
+          resourceGuard,
+          signal,
+        );
+        longestPrefixBySize.set(prefixBytes, longestPrefix);
+      }
+      const candidateDigest = await hashRolloutPrefix(
+        candidate,
+        prefixBytes,
+        resourceGuard,
+        signal,
+      );
+      if (candidateDigest !== longestPrefix) {
+        throw ambiguousRolloutIdentity();
+      }
+    }
   }
 
   async function readRolloutLineage(path, {
@@ -548,7 +798,8 @@ export function createCodexLogSources({ filesystem, lineReader }) {
   }
 
   async function discoverCodexRolloutInfos({
-    codexHome = filesystem.defaultCodexHome(),
+    codexHome = null,
+    codexHomes = null,
     startAt,
     endAt = null,
     resourceGuard = null,
@@ -558,81 +809,202 @@ export function createCodexLogSources({ filesystem, lineReader }) {
   }) {
     if (!validAbortSignal(signal)) throw new TypeError("signal must be an AbortSignal or null");
     throwIfAborted(signal);
-    if (selectedRolloutNames === undefined) {
-      selectedRolloutNames = await filesystem.readSelectedRolloutNames(codexHome);
-    }
-    if (selectedRolloutNames !== null && !(selectedRolloutNames instanceof Map)) {
+    const roots = normalizeCodexHomes(codexHome, codexHomes);
+    if (selectedRolloutNames !== undefined
+        && selectedRolloutNames !== null
+        && !(selectedRolloutNames instanceof Map)) {
       throw new TypeError("selectedRolloutNames must be a Map or null");
     }
-    throwIfAborted(signal);
-    const discoveryLimiter = createDiscoveryLimiter(discoveryLimits);
     const cutoffMs = new Date(startAt).getTime();
     const endMs = endAt === null ? Number.POSITIVE_INFINITY : new Date(endAt).getTime();
-    const [active, archived] = await Promise.all([
-      collectJsonlFileInfos(
-        filesystem.joinPath(codexHome, "sessions"),
-        resourceGuard,
-        signal,
-        discoveryLimiter,
-      ),
-      collectJsonlFileInfos(
-        filesystem.joinPath(codexHome, "archived_sessions"),
-        resourceGuard,
-        signal,
-        discoveryLimiter,
-      ),
-    ]);
-    throwIfAborted(signal);
-    // Preserve every representation until its identity and content have been
-    // compared. Selecting the active path by basename here used to hide a
-    // divergent archived sibling before the integrity checks could see it.
-    const representations = [
-      ...archived.map((info) => [rolloutKey(info.path), { ...info, location: "archive" }]),
-      ...active.map((info) => [rolloutKey(info.path), { ...info, location: "active" }]),
-    ];
-    const all = await mapWithConcurrency(representations, 16, async ([key, info]) => {
+    async function scanRoot(root) {
+      let rootBefore;
+      try {
+        rootBefore = await filesystem.lstatPath(root.path);
+      } catch (error) {
+        rethrowDiscoveryControlError(error);
+        return {
+          candidates: [],
+          available: false,
+          empty: false,
+          partial: false,
+          rootOwnerKey: root.rootOwnerKey,
+          discoveryFailureCode: null,
+        };
+      }
+      if (!isDirectDirectory(rootBefore)) {
+        return {
+          candidates: [],
+          available: false,
+          empty: false,
+          partial: false,
+          rootOwnerKey: root.rootOwnerKey,
+          discoveryFailureCode: null,
+        };
+      }
+      const rootSelectedRolloutNames = selectedRolloutNames === undefined
+        ? await filesystem.readSelectedRolloutNames(root.path)
+        : selectedRolloutNames;
+      if (rootSelectedRolloutNames !== null
+          && !(rootSelectedRolloutNames instanceof Map)) {
+        throw new TypeError("selectedRolloutNames must be a Map or null");
+      }
       throwIfAborted(signal);
-      const filename = parseCodexRolloutFilename(info.path);
-      const lineage = filename?.compressed === true
-        ? {
-          sessionId: filename.threadId,
-          parentId: null,
-          isFork: false,
-          isInlineFork: false,
-          historyMode: "legacy",
-          historyBase: null,
-          startOrdinal: 0,
-          surfaceClassification: classifySessionSurface(null),
-        }
-        : await readRolloutLineage(info.path, {
+      // Active and archived trees share one ceiling within a root, while
+      // independent roots cannot consume or abort each other's allowance.
+      const discoveryLimiter = createDiscoveryLimiter(discoveryLimits);
+      const [active, archived] = await Promise.all([
+        collectJsonlFileInfos(
+          filesystem.joinPath(root.path, "sessions"),
           resourceGuard,
-          // Session metadata is the first Codex rollout record. Bound damaged
-          // files that never provide it to a generous metadata-only ceiling,
-          // so discovery can quarantine the source without streaming an
-          // arbitrarily large file first.
-          // The total metadata search bound and the caller's per-line bound
-          // are independent controls. Capping the whole search at
-          // `maximumLineBytes` turns an intentional line-limit failure into a
-          // misleading missing-lineage quarantine before the reader can emit
-          // its fixed `line_bytes` error.
-          maximumTotalBytes: MAXIMUM_ROLLOUT_LINEAGE_BYTES,
           signal,
-        });
+          discoveryLimiter,
+        ),
+        collectJsonlFileInfos(
+          filesystem.joinPath(root.path, "archived_sessions"),
+          resourceGuard,
+          signal,
+          discoveryLimiter,
+        ),
+      ]);
+      let rootStillDirect = false;
+      try {
+        const rootAfter = await filesystem.lstatPath(root.path);
+        rootStillDirect = isDirectDirectory(rootAfter)
+          && sameSourceIdentity(rootAfter, rootBefore);
+      } catch (error) {
+        rethrowDiscoveryControlError(error);
+      }
+      if (!rootStillDirect || active.unsafeAlias || archived.unsafeAlias) {
+        // Treat an alias, type mismatch, or replaced configured root as
+        // unavailable. With another healthy root this produces aggregate
+        // partial coverage; alone it produces unavailable coverage. Never
+        // admit any candidate from the affected root.
+        return {
+          candidates: [],
+          available: false,
+          empty: false,
+          partial: false,
+          rootOwnerKey: root.rootOwnerKey,
+          discoveryFailureCode: active.discoveryFailureCode
+            ?? archived.discoveryFailureCode,
+        };
+      }
+      const unsafeFailure = active.unsafeFailure || archived.unsafeFailure;
+      const emptyHomePresent = !unsafeFailure
+        && !active.rootOpened
+        && !archived.rootOpened;
+      const discoveryFailureCode = active.discoveryFailureCode
+        ?? archived.discoveryFailureCode;
+      if (unsafeFailure) {
+        // Do not duplicate a partial inventory in a map that can never be
+        // admitted. The arrays are released with this root result, while the
+        // fixed failure code remains available to legacy single-root callers.
+        return {
+          candidates: [],
+          available: active.rootOpened || archived.rootOpened || emptyHomePresent,
+          empty: false,
+          partial: active.rootOpened || archived.rootOpened || emptyHomePresent,
+          rootOwnerKey: root.rootOwnerKey,
+          discoveryFailureCode,
+        };
+      }
+      // Preserve active and archived representations until main's generation
+      // integrity checks have compared them. Cross-root replicas are resolved
+      // later, after lineage has established their immutable source identity.
+      const candidates = [];
+      for (const info of archived.files) {
+        candidates.push([rolloutKey(info.path), {
+          ...info,
+          location: "archive",
+          rootOwnerKey: root.rootOwnerKey,
+          selectedRolloutNames: rootSelectedRolloutNames,
+        }]);
+      }
+      for (const info of active.files) {
+        candidates.push([rolloutKey(info.path), {
+          ...info,
+          location: "active",
+          rootOwnerKey: root.rootOwnerKey,
+          selectedRolloutNames: rootSelectedRolloutNames,
+        }]);
+      }
       return {
-        ...info,
-        rolloutKey: key,
-        canonicalFilename: filename !== null,
-        compressed: filename?.compressed === true,
-        threadId: filename?.threadId ?? lineage.sessionId ?? null,
-        rolloutId: filename?.rolloutId ?? null,
-        sourceIdentity: filename?.rolloutId ?? key,
-        replacement: filename?.replacement === true,
-        selectedHead: filename !== null
-          && selectedRolloutNames?.get(filename.threadId)
-            === sourceName(info.path),
-        lineage,
+        // Never admit a subset from a root whose traversal became unsafe.
+        // Incremental ingestion can retain the last-known-good generation.
+        candidates,
+        available: active.rootOpened || archived.rootOpened || emptyHomePresent,
+        empty: (active.rootOpened || archived.rootOpened || emptyHomePresent)
+          && candidates.length === 0,
+        partial: false,
+        rootOwnerKey: root.rootOwnerKey,
+        discoveryFailureCode: null,
       };
-    });
+    }
+    const rootResults = await mapWithConcurrency(
+      roots,
+      MAXIMUM_CONCURRENT_ROOT_SCANS,
+      scanRoot,
+    );
+    throwIfAborted(signal);
+    const availableRoots = rootResults.filter((result) => result.available).length;
+    const unavailableRoots = roots.length - availableRoots;
+    const baseRootCoverage = {
+      status: availableRoots === 0
+        ? "unavailable"
+        : unavailableRoots > 0 || rootResults.some((result) => result.partial)
+          ? "partial"
+          : "ready",
+      configuredRoots: roots.length,
+      availableRoots,
+      emptyRoots: rootResults.filter((result) => result.empty).length,
+      unavailableRoots,
+      retainedHistory: false,
+      unavailableOwnerSources: 0,
+      ambiguousSources: 0,
+    };
+    const all = await mapWithConcurrency(
+      rootResults.flatMap((result) => result.candidates),
+      16,
+      async ([key, info]) => {
+        throwIfAborted(signal);
+        const filename = parseCodexRolloutFilename(info.path);
+        const lineage = filename?.compressed === true
+          ? {
+            sessionId: filename.threadId,
+            parentId: null,
+            isFork: false,
+            isInlineFork: false,
+            historyMode: "legacy",
+            historyBase: null,
+            startOrdinal: 0,
+            surfaceClassification: classifySessionSurface(null),
+          }
+          : await readRolloutLineage(info.path, {
+            resourceGuard,
+            maximumTotalBytes: MAXIMUM_ROLLOUT_LINEAGE_BYTES,
+            signal,
+          });
+        const {
+          selectedRolloutNames: rootSelectedRolloutNames,
+          ...physicalInfo
+        } = info;
+        return {
+          ...physicalInfo,
+          rolloutKey: key,
+          canonicalFilename: filename !== null,
+          compressed: filename?.compressed === true,
+          threadId: filename?.threadId ?? lineage.sessionId ?? null,
+          rolloutId: filename?.rolloutId ?? null,
+          sourceIdentity: filename?.rolloutId ?? key,
+          replacement: filename?.replacement === true,
+          selectedHead: filename !== null
+            && rootSelectedRolloutNames?.get(filename.threadId)
+              === sourceName(info.path),
+          lineage,
+        };
+      },
+    );
     throwIfAborted(signal);
 
     // Validate the physical and logical graphs before selecting a time
@@ -643,6 +1015,8 @@ export function createCodexLogSources({ filesystem, lineReader }) {
       ?? info.lineage?.sessionId
       ?? `source:${info.rolloutKey}`;
     const groups = new Map();
+    const ambiguousRolloutKeys = new Set();
+    const ambiguousSourceIdentities = new Set();
     for (const info of all) {
       const groupKey = groupKeyFor(info);
       const group = groups.get(groupKey) ?? [];
@@ -665,6 +1039,43 @@ export function createCodexLogSources({ filesystem, lineReader }) {
           groupKey,
           "codex_rollout_lineage_invalid",
         );
+      }
+    }
+    function rememberAmbiguousRepresentations(representations) {
+      for (const key of new Set(representations.map((info) => info.rolloutKey))) {
+        ambiguousRolloutKeys.add(key);
+      }
+      const sourceIdentities = new Set(
+        representations.map((info) => info.sourceIdentity).filter((value) => (
+          typeof value === "string" && value.length > 0
+        )),
+      );
+      if (sourceIdentities.size === 1) {
+        ambiguousSourceIdentities.add([...sourceIdentities][0]);
+      }
+      for (const info of representations) {
+        const groupKey = groupKeyFor(info);
+        if (!invalidGroupReason.has(groupKey)) {
+          invalidGroupReason.set(
+            groupKey,
+            "codex_rollout_generation_ambiguous",
+          );
+        }
+      }
+    }
+    const representationsByRolloutKey = new Map();
+    for (const info of all) {
+      const representations = representationsByRolloutKey.get(info.rolloutKey) ?? [];
+      representations.push(info);
+      representationsByRolloutKey.set(info.rolloutKey, representations);
+    }
+    for (const representations of representationsByRolloutKey.values()) {
+      if (new Set(representations.map((info) => info.rootOwnerKey)).size < 2) continue;
+      const declaredSessions = new Set(
+        representations.map((info) => info.lineage?.sessionId ?? null),
+      );
+      if (declaredSessions.size !== 1 || declaredSessions.has(null)) {
+        rememberAmbiguousRepresentations(representations);
       }
     }
     // Canonical filename mismatches are grouped by the filename's thread id so
@@ -713,10 +1124,10 @@ export function createCodexLogSources({ filesystem, lineReader }) {
       }
     }
 
-    // Collapse only byte-identical representations of the same physical
-    // source. A legacy/noncanonical file still works when it is the sole
-    // source for a thread, but two distinct noncanonical sources have no
-    // immutable rollout identity with which to prove ordering or uniqueness.
+    // Active/archive siblings within one root must remain byte-identical.
+    // Across roots, the same immutable rollout may legitimately lag, so accept
+    // only a raw-byte prefix chain and choose its longest deterministic owner.
+    // This is collision proof, not a general event-deduplication system.
     for (const [groupKey, group] of groups) {
       const bySourceIdentity = new Map();
       for (const info of group) {
@@ -726,36 +1137,77 @@ export function createCodexLogSources({ filesystem, lineReader }) {
       }
       for (const sameSource of bySourceIdentity.values()) {
         if (sameSource.length < 2) continue;
-        let digests;
-        try {
-          // Keep file-descriptor and hash-buffer pressure constant even if a
-          // damaged directory contains thousands of copies of one rollout.
-          digests = [];
-          for (const representation of sameSource) {
-            digests.push(await digestSource(representation));
+        const byOwner = new Map();
+        for (const representation of sameSource) {
+          const ownerRepresentations = byOwner.get(representation.rootOwnerKey) ?? [];
+          ownerRepresentations.push(representation);
+          byOwner.set(representation.rootOwnerKey, ownerRepresentations);
+        }
+        const ownerRepresentatives = [];
+        for (const ownerGroup of byOwner.values()) {
+          if (ownerGroup.length > 1) {
+            let digests;
+            try {
+              // Keep descriptor pressure constant even for a damaged directory
+              // containing many active/archive copies of the same generation.
+              digests = [];
+              for (const representation of ownerGroup) {
+                digests.push(await digestSource(representation));
+              }
+            } catch (error) {
+              rethrowScannerControlError(error);
+              invalidGroupReason.set(
+                groupKey,
+                "codex_rollout_generation_ambiguous",
+              );
+              break;
+            }
+            if (new Set(digests).size !== 1) {
+              invalidGroupReason.set(
+                groupKey,
+                "codex_rollout_generation_ambiguous",
+              );
+              break;
+            }
           }
-        } catch (error) {
-          rethrowScannerControlError(error);
-          invalidGroupReason.set(
-            groupKey,
-            "codex_rollout_generation_ambiguous",
-          );
-          break;
+          const orderedWithinOwner = ownerGroup.toSorted((left, right) => (
+            (left.location === "active" ? 0 : 1)
+              - (right.location === "active" ? 0 : 1)
+            || left.rolloutKey.localeCompare(right.rolloutKey)
+            || left.path.localeCompare(right.path)
+          ));
+          ownerRepresentatives.push(orderedWithinOwner[0]);
+          for (const duplicate of orderedWithinOwner.slice(1)) {
+            duplicateRepresentations.add(duplicate);
+          }
         }
-        if (new Set(digests).size !== 1) {
-          invalidGroupReason.set(
-            groupKey,
-            "codex_rollout_generation_ambiguous",
-          );
-          break;
-        }
-        const ordered = sameSource.toSorted((left, right) => (
-          (left.location === "active" ? 0 : 1)
-            - (right.location === "active" ? 0 : 1)
-          || left.rolloutKey.localeCompare(right.rolloutKey)
+        if (invalidGroupReason.get(groupKey) === "codex_rollout_generation_ambiguous"
+            || ownerRepresentatives.length < 2) continue;
+        const orderedAcrossOwners = ownerRepresentatives.toSorted((left, right) => (
+          right.size - left.size
+          || (left.location === right.location ? 0 : left.location === "active" ? -1 : 1)
+          || left.rootOwnerKey.localeCompare(right.rootOwnerKey)
           || left.path.localeCompare(right.path)
         ));
-        for (const duplicate of ordered.slice(1)) {
+        if (new Set(orderedAcrossOwners.map((info) => info.rolloutKey)).size !== 1) {
+          rememberAmbiguousRepresentations(orderedAcrossOwners);
+          continue;
+        }
+        try {
+          await assertReplicaPrefixCompatibility(
+            orderedAcrossOwners,
+            resourceGuard,
+            signal,
+          );
+        } catch (error) {
+          if (error?.code !== "codex_rollout_identity_ambiguous") throw error;
+          rememberAmbiguousRepresentations(orderedAcrossOwners);
+          continue;
+        }
+        const winner = orderedAcrossOwners[0];
+        winner.selectedHead = orderedAcrossOwners.some((info) => info.selectedHead === true);
+        winner.physicalCandidates = Object.freeze(orderedAcrossOwners);
+        for (const duplicate of orderedAcrossOwners.slice(1)) {
           duplicateRepresentations.add(duplicate);
         }
       }
@@ -1221,6 +1673,73 @@ export function createCodexLogSources({ filesystem, lineReader }) {
       quarantineFingerprint: hashString(JSON.stringify(quarantineMaterial)),
     });
     DISCOVERY_RECEIPTS.set(result, receipt);
+    const selectedAmbiguousRolloutKeys = [...ambiguousRolloutKeys].filter((key) => (
+      quarantined.some((info) => info.rolloutKey === key)
+    ));
+    const selectedAmbiguousSourceIdentities = [...ambiguousSourceIdentities].filter((identity) => (
+      quarantined.some((info) => info.sourceIdentity === identity)
+    ));
+    const ambiguousSources = selectedAmbiguousRolloutKeys.length;
+    const rootCoverage = Object.freeze({
+      ...baseRootCoverage,
+      status: ambiguousSources > 0 && baseRootCoverage.status === "ready"
+        ? "partial"
+        : baseRootCoverage.status,
+      ambiguousSources,
+    });
+    Object.defineProperties(result, {
+      rootCoverage: {
+        value: rootCoverage,
+        enumerable: false,
+        configurable: false,
+        writable: false,
+      },
+      configuredRootOwnerKeys: {
+        value: Object.freeze(roots.map((root) => root.rootOwnerKey)),
+        enumerable: false,
+        configurable: false,
+        writable: false,
+      },
+      availableRootOwnerKeys: {
+        value: Object.freeze(rootResults
+          .filter((root) => root.available && !root.partial)
+          .map((root) => root.rootOwnerKey)),
+        enumerable: false,
+        configurable: false,
+        writable: false,
+      },
+      unavailableRootOwnerKeys: {
+        value: Object.freeze(rootResults
+          .filter((root) => !root.available || root.partial)
+          .map((root) => root.rootOwnerKey)),
+        enumerable: false,
+        configurable: false,
+        writable: false,
+      },
+      ambiguousRolloutKeys: {
+        // Basename fallback for pre-lineage cursors.
+        value: Object.freeze(selectedAmbiguousRolloutKeys),
+        enumerable: false,
+        configurable: false,
+        writable: false,
+      },
+      ambiguousSourceIdentities: {
+        // Immutable identity lets the unified index retain canonical LKG
+        // ownership without rebinding a newly ambiguous replica.
+        value: Object.freeze(selectedAmbiguousSourceIdentities),
+        enumerable: false,
+        configurable: false,
+        writable: false,
+      },
+      discoveryFailureCodes: {
+        value: Object.freeze(rootResults
+          .map((root) => root.discoveryFailureCode)
+          .filter((code) => typeof code === "string")),
+        enumerable: false,
+        configurable: false,
+        writable: false,
+      },
+    });
     return result;
   }
 
@@ -1260,8 +1779,18 @@ export function createCodexLogSources({ filesystem, lineReader }) {
     };
   }
 
-  async function codexLogSourceFingerprint({ codexHome, startAt, endAt, includeSourcePaths = false }) {
-    const rolloutInfos = await discoverCodexRolloutInfos({ codexHome, startAt });
+  async function codexLogSourceFingerprint({
+    codexHome,
+    codexHomes = null,
+    startAt,
+    endAt,
+    includeSourcePaths = false,
+  }) {
+    const rolloutInfos = await discoverCodexRolloutInfos({
+      codexHome,
+      codexHomes,
+      startAt,
+    });
     const summary = summarizeCodexRolloutSources(rolloutInfos, { endAt });
     if (includeSourcePaths) {
       const endMs = Date.parse(endAt);

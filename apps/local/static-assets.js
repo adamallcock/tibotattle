@@ -7,6 +7,22 @@ export const LOCAL_COMPANION_STATIC_FILES = Object.freeze({
     file: "index.html",
     type: "text/html; charset=utf-8",
   }),
+  "/electron-settings.html": Object.freeze({
+    file: "electron-settings.html",
+    type: "text/html; charset=utf-8",
+  }),
+  "/electron-settings.js": Object.freeze({
+    file: "electron-settings.js",
+    type: "text/javascript; charset=utf-8",
+  }),
+  "/electron-settings.css": Object.freeze({
+    file: "electron-settings.css",
+    type: "text/css; charset=utf-8",
+  }),
+  "/desktop-shell.js": Object.freeze({
+    file: "desktop-shell.js",
+    type: "text/javascript; charset=utf-8",
+  }),
   "/app.js": Object.freeze({
     file: "app.js",
     type: "text/javascript; charset=utf-8",
