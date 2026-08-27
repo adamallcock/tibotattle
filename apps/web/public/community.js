@@ -31,6 +31,8 @@ setFormattingLocale(localization.formatLocale());
 setMessageLocale(localization.locale());
 export const HOMEBREW_INSTALL_COMMAND =
   "brew install --cask adamallcock/tap/tibotattle";
+export const PUBLIC_PLATFORMS = Object.freeze(["macos", "windows", "linux"]);
+const PUBLIC_PLATFORM_STORAGE_KEY = "tibotattle.download-platform.v1";
 // Resolve generated copy from the document language at render time. The
 // browser localizer updates that attribute before emitting its locale-change
 // event, which keeps a rerender from observing a stale closure during a live
@@ -57,6 +59,163 @@ let communityDailySettled = false;
 let allowanceRangeDays = 30;
 let allowanceDialogReturnFocus = null;
 const communityClient = new PublicCommunityClient();
+
+function normalizePublicPlatform(candidate) {
+  if (typeof candidate !== "string") return null;
+  const normalized = candidate.trim().toLowerCase();
+  return PUBLIC_PLATFORMS.includes(normalized) ? normalized : null;
+}
+
+/**
+ * Coarse browser-reported platform detection is used only to choose the first
+ * visible tab. It never redirects, hides alternatives, starts a download, or
+ * claims that the app is installed. Unknown and mobile platforms return null.
+ */
+export function detectPublicPlatform({
+  userAgentDataPlatform = "",
+  userAgent = "",
+  maxTouchPoints = 0,
+} = {}) {
+  const platformHint = String(userAgentDataPlatform).toLowerCase();
+  const userAgentHint = String(userAgent);
+  const isAndroid = /android/iu.test(userAgentHint);
+  const isChromeOS = /cros/iu.test(userAgentHint);
+  const isIPadMasqueradingAsMac = maxTouchPoints > 1
+    && /macintosh|mac os x/iu.test(userAgentHint);
+
+  if (/windows|win32/iu.test(platformHint)) return "windows";
+  if (/macos|macintosh|macintel|darwin/iu.test(platformHint)) {
+    return isIPadMasqueradingAsMac ? null : "macos";
+  }
+  if (/linux|x11/iu.test(platformHint)) {
+    return isAndroid || isChromeOS ? null : "linux";
+  }
+
+  if (/windows nt|windows/iu.test(userAgentHint)) return "windows";
+  if (isAndroid || isChromeOS) return null;
+  if (/macintosh|mac os x/iu.test(userAgentHint)) {
+    return isIPadMasqueradingAsMac ? null : "macos";
+  }
+  if (/linux|x11/iu.test(userAgentHint)) return "linux";
+  return null;
+}
+
+/** Explicit URL and saved choices outrank the low-confidence browser hint. */
+export function resolveInitialPublicPlatform({
+  urlPlatform = null,
+  savedPlatform = null,
+  detectedPlatform = null,
+} = {}) {
+  return normalizePublicPlatform(urlPlatform)
+    ?? normalizePublicPlatform(savedPlatform)
+    ?? normalizePublicPlatform(detectedPlatform)
+    ?? "macos";
+}
+
+function browserSessionStorage() {
+  try {
+    return globalThis.sessionStorage ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function readSavedPublicPlatform(storage = browserSessionStorage()) {
+  try {
+    return normalizePublicPlatform(storage?.getItem(PUBLIC_PLATFORM_STORAGE_KEY));
+  } catch {
+    return null;
+  }
+}
+
+function savePublicPlatform(platform, storage = browserSessionStorage()) {
+  try {
+    storage?.setItem(PUBLIC_PLATFORM_STORAGE_KEY, platform);
+  } catch {
+    // Storage can be blocked by the browser. Selection still works in-memory.
+  }
+}
+
+function publicPlatformFromUrl(search = globalThis.location?.search ?? "") {
+  try {
+    return normalizePublicPlatform(new URLSearchParams(search).get("platform"));
+  } catch {
+    return null;
+  }
+}
+
+export function wirePublicPlatformSelector(documentRef = document, {
+  navigatorRef = globalThis.navigator,
+  locationRef = globalThis.location,
+  storage = browserSessionStorage(),
+} = {}) {
+  const selector = documentRef.querySelector("#platform-selector");
+  if (!selector || selector.dataset.platformBound === "true") return null;
+  const tabs = [...selector.querySelectorAll('[role="tab"][data-platform]')];
+  const panels = new Map(
+    [...documentRef.querySelectorAll("[data-platform-panel]")]
+      .map((panel) => [panel.dataset.platformPanel, panel]),
+  );
+  if (
+    tabs.length !== PUBLIC_PLATFORMS.length
+    || PUBLIC_PLATFORMS.some((platform) => !panels.has(platform))
+  ) return null;
+
+  const selectPlatform = (candidate, { focus = false, persist = false } = {}) => {
+    const platform = normalizePublicPlatform(candidate);
+    if (!platform) return false;
+    for (const tab of tabs) {
+      const active = tab.dataset.platform === platform;
+      tab.setAttribute("aria-selected", String(active));
+      tab.setAttribute("tabindex", active ? "0" : "-1");
+      if (active && focus) tab.focus();
+    }
+    for (const [panelPlatform, panel] of panels) {
+      panel.hidden = panelPlatform !== platform;
+    }
+    documentRef.documentElement.dataset.downloadPlatform = platform;
+    if (persist) savePublicPlatform(platform, storage);
+    return true;
+  };
+
+  selector.dataset.platformBound = "true";
+  selector.addEventListener("click", (event) => {
+    const tab = event.target?.closest?.('[role="tab"][data-platform]');
+    if (!tab || !selector.contains(tab)) return;
+    selectPlatform(tab.dataset.platform, { persist: true });
+  });
+  selector.addEventListener("keydown", (event) => {
+    const tab = event.target?.closest?.('[role="tab"][data-platform]');
+    if (!tab || !selector.contains(tab)) return;
+    const currentIndex = tabs.indexOf(tab);
+    const targetIndex = {
+      "ArrowLeft": (currentIndex - 1 + tabs.length) % tabs.length,
+      "ArrowRight": (currentIndex + 1) % tabs.length,
+      "Home": 0,
+      "End": tabs.length - 1,
+    }[event.key];
+    if (targetIndex === undefined) return;
+    event.preventDefault();
+    selectPlatform(tabs[targetIndex].dataset.platform, {
+      focus: true,
+      persist: true,
+    });
+  });
+
+  const detectedPlatform = detectPublicPlatform({
+    userAgentDataPlatform: navigatorRef?.userAgentData?.platform ?? "",
+    userAgent: navigatorRef?.userAgent ?? "",
+    maxTouchPoints: navigatorRef?.maxTouchPoints ?? 0,
+  });
+  const initialPlatform = resolveInitialPublicPlatform({
+    urlPlatform: publicPlatformFromUrl(locationRef?.search ?? ""),
+    savedPlatform: readSavedPublicPlatform(storage),
+    detectedPlatform,
+  });
+  selectPlatform(initialPlatform);
+  selector.hidden = false;
+  return initialPlatform;
+}
 
 function publicErrorCode(candidate) {
   return typeof candidate === "string" && publicErrorCodePattern.test(candidate)
@@ -101,10 +260,11 @@ function renderPublicInstallerJourney() {
     formatLocale: getFormattingLocale(),
     translateMessage: t,
   });
-  localization.setLegacyText(
-    $("#header-download-label"),
-    release ? "Download" : "Get the Mac app",
-  );
+  const headerDownloadLabel = $("#header-download-label");
+  if (headerDownloadLabel) {
+    headerDownloadLabel.dataset.i18n = "installer.headerDownload";
+    headerDownloadLabel.textContent = t("installer.headerDownload");
+  }
   const homebrewInstall = $("#homebrew-install");
   if (homebrewInstall) homebrewInstall.hidden = release === null;
   const checksumCopy = $("#installer-sha256-copy");
@@ -395,6 +555,7 @@ async function loadCommunityDailySeries() {
 
 if (typeof document !== "undefined") {
   renderPublicInstallerJourney();
+  wirePublicPlatformSelector();
   wireHomebrewInstallCommand();
   wireInstallerChecksumCopy();
   wireAllowanceRangeControls();

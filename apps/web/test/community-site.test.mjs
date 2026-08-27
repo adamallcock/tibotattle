@@ -22,6 +22,9 @@ import {
   HOMEBREW_INSTALL_COMMAND,
   copyInstallerChecksum,
   copyHomebrewInstallCommand,
+  detectPublicPlatform,
+  resolveInitialPublicPlatform,
+  wirePublicPlatformSelector,
 } from "../public/community.js";
 import {
   compactMacOSVersion,
@@ -107,6 +110,120 @@ function fakeDocument(metaContent = {}) {
     },
     byId,
   };
+}
+
+function openingTagForId(html, id) {
+  const match = html.match(new RegExp(`<[^>]+\\bid="${id}"[^>]*>`, "u"));
+  assert.ok(match, `${id} has an opening tag`);
+  return match[0];
+}
+
+class FakePlatformNode {
+  constructor({ dataset = {}, hidden = false } = {}) {
+    this.attributes = new Map();
+    this.dataset = { ...dataset };
+    this.hidden = hidden;
+    this.focusCount = 0;
+    this.listeners = new Map();
+  }
+
+  addEventListener(type, listener) {
+    this.listeners.set(type, listener);
+  }
+
+  dispatch(type, event) {
+    this.listeners.get(type)?.(event);
+  }
+
+  setAttribute(name, value) {
+    this.attributes.set(name, value);
+  }
+
+  focus() {
+    this.focusCount += 1;
+  }
+
+  closest(selector) {
+    return selector === '[role="tab"][data-platform]' && this.dataset.platform
+      ? this
+      : null;
+  }
+}
+
+function fakePlatformSelectorDocument({ missingPanel = null } = {}) {
+  const platforms = ["macos", "windows", "linux"];
+  const tabs = new Map(platforms.map((platform) => [
+    platform,
+    new FakePlatformNode({ dataset: { platform } }),
+  ]));
+  const panels = new Map(platforms
+    .filter((platform) => platform !== missingPanel)
+    .map((platform) => [
+      platform,
+      new FakePlatformNode({
+        dataset: { platformPanel: platform },
+        hidden: platform !== "macos",
+      }),
+    ]));
+  const selector = new FakePlatformNode({ hidden: true });
+  selector.querySelectorAll = (query) => query === '[role="tab"][data-platform]'
+    ? [...tabs.values()]
+    : [];
+  selector.contains = (candidate) => [...tabs.values()].includes(candidate);
+  const documentRef = {
+    documentElement: { dataset: {} },
+    querySelector(query) {
+      return query === "#platform-selector" ? selector : null;
+    },
+    querySelectorAll(query) {
+      return query === "[data-platform-panel]" ? [...panels.values()] : [];
+    },
+  };
+  return { documentRef, panels, selector, tabs };
+}
+
+function recordingStorage(initial = {}) {
+  const values = new Map(Object.entries(initial));
+  const reads = [];
+  const writes = [];
+  return {
+    getItem(key) {
+      reads.push(key);
+      return values.get(key) ?? null;
+    },
+    reads,
+    setItem(key, value) {
+      writes.push([key, value]);
+      values.set(key, value);
+    },
+    values,
+    writes,
+  };
+}
+
+function assertPlatformSelection(fixture, selectedPlatform) {
+  assert.equal(
+    fixture.documentRef.documentElement.dataset.downloadPlatform,
+    selectedPlatform,
+  );
+  assert.equal(fixture.selector.hidden, false);
+  for (const platform of ["macos", "windows", "linux"]) {
+    assert.equal(
+      fixture.tabs.get(platform).attributes.get("aria-selected"),
+      String(platform === selectedPlatform),
+      `${platform} aria-selected`,
+    );
+    assert.equal(
+      fixture.tabs.get(platform).attributes.get("tabindex"),
+      platform === selectedPlatform ? "0" : "-1",
+      `${platform} tabindex`,
+    );
+    assert.equal(
+      fixture.panels.get(platform).hidden,
+      platform !== selectedPlatform,
+      `${platform} panel visibility`,
+    );
+  }
 }
 
 function publishedSnapshot(overrides = {}) {
@@ -270,6 +387,24 @@ test("the public site presents only the install call to action and the community
     /<nav\s+class="primary-nav"\s+aria-label="Site sections"(?:\s[^>]*)?>/u,
   );
   assert.match(html, /aria-labelledby="install-title"/u);
+  const tablist = openingTagForId(html, "platform-selector");
+  assert.match(tablist, /\brole="tablist"/u);
+  assert.match(tablist, /\baria-label="Choose your platform"/u);
+  assert.match(tablist, /\bhidden(?:\s|>)/u);
+  for (const platform of ["macos", "windows", "linux"]) {
+    const tab = openingTagForId(html, `platform-tab-${platform}`);
+    assert.match(tab, /\brole="tab"/u);
+    assert.match(tab, new RegExp(`\\baria-controls="platform-panel-${platform}"`, "u"));
+    const panel = openingTagForId(html, `platform-panel-${platform}`);
+    assert.match(panel, /\brole="tabpanel"/u);
+    assert.match(panel, new RegExp(`\\baria-labelledby="platform-tab-${platform}"`, "u"));
+    assert.match(panel, /\btabindex="0"/u);
+  }
+  assert.doesNotMatch(
+    openingTagForId(html, "platform-panel-macos"),
+    /\bhidden(?:\s|>)/u,
+    "macOS remains the usable no-JavaScript fallback",
+  );
   assert.match(html, /aria-labelledby="community-method-summary"/u);
   assert.match(
     await readFile(new URL("../public/styles.css", import.meta.url), "utf8"),
@@ -334,12 +469,35 @@ test("the public community client exposes only the read-only daily request", asy
   );
 });
 
-test("the first visit leads with the product, Mac download action, and daily community view", async () => {
+test("the first visit leads with the product, platform choice, and daily community view", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   assert.match(html, /<h1 id="install-title">What the Codex allowance is really worth\.<\/h1>/u);
   assert.match(html, /turns your seven-day Codex allowance into an\s+API-price-equivalent estimate/u);
-  assert.match(html, /calculates your personal dashboard on your Mac\./u);
+  assert.match(html, /calculates your personal dashboard locally on your computer\./u);
+  assert.doesNotMatch(html, /calculates your personal dashboard on your Mac\./u);
+  assert.match(html, /id="header-download-label"[^>]*>\s*Get the app\s*<\/span>/u);
+  assert.doesNotMatch(html, /Get the Mac app/u);
+  for (const [platform, label] of [
+    ["macos", "macOS"],
+    ["windows", "Windows"],
+    ["linux", "Linux"],
+  ]) {
+    const start = html.indexOf(`id="platform-tab-${platform}"`);
+    const end = html.indexOf("</button>", start);
+    assert.ok(start >= 0 && end > start, `${label} tab is complete`);
+    assert.match(html.slice(start, end), new RegExp(`>${label}<\\/span>`, "u"));
+    assert.doesNotMatch(
+      html.slice(start, end),
+      /<small\b/u,
+      `${label} keeps availability detail in its panel instead of the selector`,
+    );
+  }
   assert.match(html, /Download for macOS/u);
+  assert.equal(
+    html.match(/Download for macOS/gu)?.length,
+    2,
+    "the verified and unavailable macOS actions retain their platform-specific labels",
+  );
   assert.match(html, /Copy SHA-256/u);
   assert.match(
     html,
@@ -354,7 +512,8 @@ test("the first visit leads with the product, Mac download action, and daily com
   );
   assert.doesNotMatch(html, /The community signal|Personal dashboards and contributions stay in the Mac app\./u);
   assert.doesNotMatch(html, /community-estimate-summary|community-daily-panel-state|community-daily-status/u);
-  assert.match(html, /Install the Mac app/u);
+  assert.match(html, /Install the desktop app/u);
+  assert.doesNotMatch(html, /Install the Mac app/u);
   assert.match(html, /See your week/u);
   assert.match(html, /Share only if you choose/u);
   assert.match(html, /<section class="product-hero"[^>]*id="install"/u);
@@ -397,6 +556,306 @@ test("the first visit leads with the product, Mac download action, and daily com
     html,
     /best guess|privacy[- ]reviewed|privacy and quality checks/u,
   );
+});
+
+test("platform tabs keep the live macOS release separate from honest unavailable panels", async () => {
+  const html = await readFile(SITE_HTML, "utf8");
+  const macosStart = html.indexOf('id="platform-panel-macos"');
+  const windowsStart = html.indexOf('id="platform-panel-windows"');
+  const linuxStart = html.indexOf('id="platform-panel-linux"');
+  const panelsEnd = html.indexOf('class="community-inline"', linuxStart);
+
+  assert.ok(macosStart >= 0, "macOS panel exists");
+  assert.ok(windowsStart > macosStart, "Windows panel follows macOS");
+  assert.ok(linuxStart > windowsStart, "Linux panel follows Windows");
+  assert.ok(panelsEnd > linuxStart, "platform panels end before community activity");
+
+  const macosPanel = html.slice(macosStart, windowsStart);
+  const windowsPanel = html.slice(windowsStart, linuxStart);
+  const linuxPanel = html.slice(linuxStart, panelsEnd);
+
+  assert.match(macosPanel, /id="installer-link"/u);
+  assert.match(macosPanel, /id="homebrew-install"/u);
+  assert.match(macosPanel, /id="installer-sha256-copy"/u);
+  assert.match(macosPanel, /Developer ID signed and Apple notarized\./u);
+
+  for (const [platform, panel] of [
+    ["Windows", windowsPanel],
+    ["Linux", linuxPanel],
+  ]) {
+    assert.match(panel, new RegExp(`${platform} is not yet available`, "u"));
+    assert.match(panel, /Not yet available/u);
+    assert.doesNotMatch(panel, /id="installer-|id="homebrew-|brew install/iu);
+    assert.doesNotMatch(panel, /Download for|\.dmg\b|\.exe\b|\.msi\b|AppImage/iu);
+    assert.doesNotMatch(panel, /<a\b[^>]*class="[^"]*\bbutton\b/iu);
+    assert.doesNotMatch(panel, /<button\b[^>]*disabled/iu);
+  }
+  assert.match(windowsPanel, /tibotattle\/issues\/3/u);
+  assert.match(linuxPanel, /tibotattle\/issues\/4/u);
+
+  const macosTab = openingTagForId(html, "platform-tab-macos");
+  assert.match(macosTab, /\baria-selected="true"/u);
+  assert.match(macosTab, /\btabindex="0"/u);
+  for (const platform of ["windows", "linux"]) {
+    const tab = openingTagForId(html, `platform-tab-${platform}`);
+    assert.match(tab, /\baria-selected="false"/u);
+    assert.match(tab, /\btabindex="-1"/u);
+    assert.match(openingTagForId(html, `platform-panel-${platform}`), /\bhidden(?:\s|>)/u);
+  }
+});
+
+test("platform detection is conservative and explicit choices take precedence", () => {
+  assert.equal(
+    detectPublicPlatform({
+      userAgentDataPlatform: "Windows",
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    }),
+    "windows",
+  );
+  assert.equal(
+    detectPublicPlatform({ userAgentDataPlatform: "macOS", userAgent: "" }),
+    "macos",
+  );
+  assert.equal(
+    detectPublicPlatform({ userAgentDataPlatform: "Linux", userAgent: "" }),
+    "linux",
+  );
+  assert.equal(
+    detectPublicPlatform({
+      userAgentDataPlatform: "",
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    }),
+    "windows",
+  );
+  assert.equal(
+    detectPublicPlatform({
+      userAgentDataPlatform: "",
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    }),
+    "macos",
+  );
+  assert.equal(
+    detectPublicPlatform({
+      userAgentDataPlatform: "",
+      userAgent: "Mozilla/5.0 (X11; Linux x86_64)",
+    }),
+    "linux",
+  );
+  assert.equal(
+    detectPublicPlatform({
+      userAgentDataPlatform: "",
+      userAgent: "Mozilla/5.0 (Linux; Android 15; Pixel 9)",
+    }),
+    null,
+    "Android's Linux token must not imply Linux desktop availability",
+  );
+  assert.equal(
+    detectPublicPlatform({ userAgentDataPlatform: "Chrome OS", userAgent: "" }),
+    null,
+  );
+  assert.equal(
+    detectPublicPlatform({
+      userAgentDataPlatform: "macOS",
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+      maxTouchPoints: 5,
+    }),
+    null,
+    "an iPad presenting a desktop Mac user agent must not select macOS",
+  );
+  assert.equal(
+    detectPublicPlatform({
+      userAgentDataPlatform: "Linux",
+      userAgent: "Mozilla/5.0 (X11; CrOS x86_64 16093.68.0)",
+    }),
+    null,
+    "a ChromeOS Linux token must not select a Linux desktop build",
+  );
+
+  assert.equal(
+    resolveInitialPublicPlatform({
+      urlPlatform: "linux",
+      savedPlatform: "windows",
+      detectedPlatform: "macos",
+    }),
+    "linux",
+  );
+  assert.equal(
+    resolveInitialPublicPlatform({
+      urlPlatform: "not-a-platform",
+      savedPlatform: "windows",
+      detectedPlatform: "macos",
+    }),
+    "windows",
+  );
+  assert.equal(
+    resolveInitialPublicPlatform({
+      urlPlatform: null,
+      savedPlatform: "invalid",
+      detectedPlatform: "linux",
+    }),
+    "linux",
+  );
+  assert.equal(
+    resolveInitialPublicPlatform({
+      urlPlatform: null,
+      savedPlatform: null,
+      detectedPlatform: null,
+    }),
+    "macos",
+    "macOS remains the truthful default when no desktop platform can be inferred",
+  );
+});
+
+test("the platform selector applies URL state and persists only user interaction", () => {
+  const storageKey = "tibotattle.download-platform.v1";
+  const storage = recordingStorage({ [storageKey]: "windows" });
+  const fixture = fakePlatformSelectorDocument();
+  assert.equal(
+    wirePublicPlatformSelector(fixture.documentRef, {
+      navigatorRef: {
+        userAgentData: { platform: "macOS" },
+        userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+        maxTouchPoints: 0,
+      },
+      locationRef: { search: "?campaign=homepage&platform=linux" },
+      storage,
+    }),
+    "linux",
+  );
+  assert.equal(fixture.selector.dataset.platformBound, "true");
+  assert.deepEqual(storage.reads, [storageKey]);
+  assert.deepEqual(storage.writes, [], "initial selection is never persisted");
+  assertPlatformSelection(fixture, "linux");
+
+  fixture.selector.dispatch("click", { target: fixture.tabs.get("windows") });
+  assertPlatformSelection(fixture, "windows");
+  assert.deepEqual(storage.writes, [[storageKey, "windows"]]);
+
+  function press(platform, key, expectedPlatform) {
+    let prevented = 0;
+    fixture.selector.dispatch("keydown", {
+      key,
+      preventDefault() {
+        prevented += 1;
+      },
+      target: fixture.tabs.get(platform),
+    });
+    assert.equal(prevented, 1, `${key} prevents native scrolling`);
+    assertPlatformSelection(fixture, expectedPlatform);
+    assert.ok(
+      fixture.tabs.get(expectedPlatform).focusCount > 0,
+      `${key} moves focus to ${expectedPlatform}`,
+    );
+  }
+
+  press("windows", "ArrowRight", "linux");
+  press("linux", "ArrowRight", "macos");
+  press("macos", "ArrowLeft", "linux");
+  press("linux", "Home", "macos");
+  press("macos", "End", "linux");
+  assert.deepEqual(
+    storage.writes.map(([, value]) => value),
+    ["windows", "linux", "macos", "linux", "macos", "linux"],
+  );
+});
+
+test("platform inference reveals the selector without writing session state", () => {
+  const storage = recordingStorage();
+  const fixture = fakePlatformSelectorDocument();
+  assert.equal(
+    wirePublicPlatformSelector(fixture.documentRef, {
+      navigatorRef: {
+        userAgentData: { platform: "Windows" },
+        userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+      },
+      locationRef: { search: "" },
+      storage,
+    }),
+    "windows",
+  );
+  assertPlatformSelection(fixture, "windows");
+  assert.deepEqual(storage.writes, []);
+});
+
+test("mobile Mac and ChromeOS hints fall back safely through the wired selector", () => {
+  for (const [label, navigatorRef] of [
+    ["iPad", {
+      userAgentData: { platform: "macOS" },
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+      maxTouchPoints: 5,
+    }],
+    ["ChromeOS", {
+      userAgentData: { platform: "Linux" },
+      userAgent: "Mozilla/5.0 (X11; CrOS x86_64 16093.68.0)",
+      maxTouchPoints: 0,
+    }],
+  ]) {
+    const storage = recordingStorage();
+    const fixture = fakePlatformSelectorDocument();
+    assert.equal(
+      wirePublicPlatformSelector(fixture.documentRef, {
+        navigatorRef,
+        locationRef: { search: "" },
+        storage,
+      }),
+      "macos",
+      label,
+    );
+    assertPlatformSelection(fixture, "macos");
+    assert.deepEqual(storage.writes, [], label);
+  }
+});
+
+test("the selector tolerates unavailable or throwing storage", () => {
+  const throwingStorage = {
+    getItem() {
+      throw new Error("storage blocked");
+    },
+    setItem() {
+      throw new Error("storage blocked");
+    },
+  };
+  for (const [label, storage] of [
+    ["unavailable", null],
+    ["throwing", throwingStorage],
+  ]) {
+    const fixture = fakePlatformSelectorDocument();
+    assert.equal(
+      wirePublicPlatformSelector(fixture.documentRef, {
+        navigatorRef: {
+          userAgentData: { platform: "Windows" },
+          userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        },
+        locationRef: { search: "" },
+        storage,
+      }),
+      "windows",
+      label,
+    );
+    assertPlatformSelection(fixture, "windows");
+    assert.doesNotThrow(() => fixture.selector.dispatch("click", {
+      target: fixture.tabs.get("linux"),
+    }));
+    assertPlatformSelection(fixture, "linux");
+  }
+});
+
+test("a malformed platform selector fails closed before binding", () => {
+  const fixture = fakePlatformSelectorDocument({ missingPanel: "linux" });
+  const storage = recordingStorage();
+  assert.equal(
+    wirePublicPlatformSelector(fixture.documentRef, {
+      navigatorRef: { userAgentData: { platform: "Linux" } },
+      locationRef: { search: "?platform=linux" },
+      storage,
+    }),
+    null,
+  );
+  assert.equal(fixture.selector.hidden, true);
+  assert.equal(fixture.selector.dataset.platformBound, undefined);
+  assert.equal(fixture.documentRef.documentElement.dataset.downloadPlatform, undefined);
+  assert.deepEqual(storage.reads, []);
+  assert.deepEqual(storage.writes, []);
 });
 
 test("the Homebrew action copies only the fixed first-party tap command", async () => {
@@ -484,6 +943,29 @@ test("the Homebrew command stays bounded and readable at narrow widths", async (
     /\.community-site \.homebrew-install code \{[\s\S]*?font-size: \.6rem;/u,
     "the long fixed command uses the deliberately smaller desktop type size",
   );
+});
+
+test("the platform selector stays a quiet compact line above the active download", async () => {
+  const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
+  const selectorRule = styles.match(/\.community-site \.platform-selector \{([^}]*)\}/u)?.[1] ?? "";
+  const tabRule = styles.match(/\.community-site \.platform-tab \{([^}]*)\}/u)?.[1] ?? "";
+  const selectedRule = styles.match(/\.community-site \.platform-tab\[aria-selected="true"\] \{([^}]*)\}/u)?.[1] ?? "";
+
+  assert.match(selectorRule, /display: inline-flex;/u);
+  assert.match(selectorRule, /flex-wrap: nowrap;/u);
+  assert.match(selectorRule, /width: auto;/u);
+  assert.match(selectorRule, /border: 0;/u);
+  assert.match(selectorRule, /background: transparent;/u);
+  assert.match(selectorRule, /box-shadow: none;/u);
+  assert.match(tabRule, /min-height: 32px;/u);
+  assert.match(
+    styles,
+    /\.community-site \.platform-tab \+ \.platform-tab \{\s*border-inline-start: 1px solid/u,
+  );
+  assert.match(selectedRule, /border-bottom-color: var\(--site-green-bright\);/u);
+  assert.match(selectedRule, /font-weight: var\(--weight-bold\);/u);
+  assert.match(selectedRule, /background: transparent;/u);
+  assert.match(selectedRule, /box-shadow: none;/u);
 });
 
 test("the public header and footer stay compact on narrow screens", async () => {
