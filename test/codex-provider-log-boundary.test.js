@@ -32,7 +32,6 @@ const PROVIDER_PUBLIC_EXPORTS = [
   "classifyToolCall",
   "codexSessionMetaIdentity",
   "codexRolloutDiscoveryReceipt",
-  "codexSessionMetaIdentity",
   "createCodexLogScanner",
   "createLeadingRateLimitGate",
   "createSnapshotLineage",

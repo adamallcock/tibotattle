@@ -62,8 +62,36 @@ test("the legacy path is implementation-free and macOS packaging excludes keytar
   );
   assert.doesNotMatch(
     buildSource,
-    /DYNAMIC_EXTERNAL_BY_FILE|keytar\.node|"@github\/keytar": "7\.10\.6"/u,
+    /DYNAMIC_EXTERNAL_BY_FILE|"@github\/keytar": "7\.10\.6"/u,
   );
+  const currentNormalizationStart = buildSource.indexOf(
+    "const NORMALIZED_MACH_O_PATHS",
+  );
+  const retiredCompatibilityStart = buildSource.indexOf(
+    "const RETIRED_PREVIEW_NORMALIZED_MACH_O_PATHS",
+  );
+  const noCompatibilityStart = buildSource.indexOf(
+    "const NO_COMPATIBILITY_NORMALIZED_MACH_O_PATHS",
+  );
+  assert.notEqual(currentNormalizationStart, -1);
+  assert.notEqual(retiredCompatibilityStart, -1);
+  assert.notEqual(noCompatibilityStart, -1);
+  assert.ok(retiredCompatibilityStart > currentNormalizationStart);
+  assert.ok(noCompatibilityStart > retiredCompatibilityStart);
+  const currentNormalizationSource = buildSource.slice(
+    currentNormalizationStart,
+    retiredCompatibilityStart,
+  );
+  assert.doesNotMatch(currentNormalizationSource, /@github\/keytar|keytar\.node/u);
+  const retiredCompatibilitySource = buildSource.slice(
+    retiredCompatibilityStart,
+    noCompatibilityStart,
+  );
+  assert.match(
+    retiredCompatibilitySource,
+    /Contents\/Resources\/app\/node_modules\/@github\/keytar\/prebuilds\/darwin-arm64\/keytar\.node/u,
+  );
+  assert.equal(buildSource.match(/keytar\.node/gu)?.length, 1);
   assert.doesNotMatch(
     buildSource.slice(
       buildSource.indexOf("const EXPECTED_EXTERNAL_SPECIFIERS"),
