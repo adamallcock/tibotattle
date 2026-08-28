@@ -7224,7 +7224,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       analysisProgressSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_ANALYSIS_PROGRESS_CONTRACT phases=allowlisted archive=scanning unified=scanning counts=bounded quick_result=evidence-gated contradictory=generic unknown=generic free_text=ignored idle=unchanged percent=false eta=false$/mu,
+      /^USAGE_MONITOR_MACOS_ANALYSIS_PROGRESS_CONTRACT phases=allowlisted archive=scanning unified=scanning counts=bounded quick_result=evidence-gated contradictory=generic unknown=generic free_text=ignored idle=unchanged terminal=automatic-backoff percent=false eta=false$/mu,
     );
     const popupRenderDirectory = join(temporaryRoot, "menu-bar-popover-render");
     const popupRenderSmoke = spawnSync(
