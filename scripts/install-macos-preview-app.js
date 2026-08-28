@@ -16,7 +16,10 @@ import {
   resolve,
 } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PRODUCT_BRAND } from "../config/product-brand.js";
+import {
+  PREVIEW_PRODUCT_BRAND,
+  PRODUCT_BRAND,
+} from "../config/product-brand.js";
 import {
   MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
   validateMacOSPreviewApp,
@@ -24,6 +27,10 @@ import {
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const SYSTEM_APPLICATIONS_TARGET = join(
+  "/Applications",
+  PREVIEW_PRODUCT_BRAND.bundleName,
+);
+const STABLE_SYSTEM_APPLICATIONS_TARGET = join(
   "/Applications",
   PRODUCT_BRAND.bundleName,
 );
@@ -48,6 +55,7 @@ export const MACOS_PREVIEW_INSTALL_CODES = Object.freeze({
   SOURCE_NAME_INVALID: "MACOS_PREVIEW_INSTALL_SOURCE_NAME_INVALID",
   SOURCE_TARGET_CONFLICT: "MACOS_PREVIEW_INSTALL_SOURCE_TARGET_CONFLICT",
   STAGE_FAILED: "MACOS_PREVIEW_INSTALL_STAGE_FAILED",
+  STABLE_TARGET_FORBIDDEN: "MACOS_PREVIEW_INSTALL_STABLE_TARGET_FORBIDDEN",
   TARGET_INVALID: "MACOS_PREVIEW_INSTALL_TARGET_INVALID",
   TARGET_MISSING: "MACOS_PREVIEW_INSTALL_TARGET_MISSING",
   TARGET_NAME_INVALID: "MACOS_PREVIEW_INSTALL_TARGET_NAME_INVALID",
@@ -92,7 +100,7 @@ function escapeRegularExpression(value) {
 }
 
 function backupPrefix() {
-  return `${PRODUCT_BRAND.bundleName}.backup-`;
+  return `${PREVIEW_PRODUCT_BRAND.bundleName}.backup-`;
 }
 
 function backupName(timestamp, suffix = 0) {
@@ -114,7 +122,7 @@ export function getMacOSPreviewInstallTargetPaths(homeDirectory = homedir()) {
   const selectedHome = pathValue(homeDirectory, "Home directory");
   return Object.freeze([
     SYSTEM_APPLICATIONS_TARGET,
-    join(selectedHome, "Applications", PRODUCT_BRAND.bundleName),
+    join(selectedHome, "Applications", PREVIEW_PRODUCT_BRAND.bundleName),
   ]);
 }
 
@@ -162,10 +170,20 @@ export function validateMacOSPreviewTargetPath(
     "Preview application target",
     MACOS_PREVIEW_INSTALL_CODES.TARGET_UNSAFE,
   );
-  if (basename(selected) !== PRODUCT_BRAND.bundleName) {
+  const stableTargets = new Set([
+    STABLE_SYSTEM_APPLICATIONS_TARGET,
+    join(resolve(homeDirectory), "Applications", PRODUCT_BRAND.bundleName),
+  ]);
+  if (stableTargets.has(selected)) {
+    throw fail(
+      MACOS_PREVIEW_INSTALL_CODES.STABLE_TARGET_FORBIDDEN,
+      `Refusing to replace stable ${PRODUCT_BRAND.bundleName}; previews install as ${PREVIEW_PRODUCT_BRAND.bundleName}`,
+    );
+  }
+  if (basename(selected) !== PREVIEW_PRODUCT_BRAND.bundleName) {
     throw fail(
       MACOS_PREVIEW_INSTALL_CODES.TARGET_NAME_INVALID,
-      `Preview application target must be named ${PRODUCT_BRAND.bundleName}`,
+      `Preview application target must be named ${PREVIEW_PRODUCT_BRAND.bundleName}`,
     );
   }
   const allowed = normalizeAllowedTargetPaths(allowedTargetPaths, homeDirectory);
@@ -205,7 +223,7 @@ export function validateMacOSPreviewBackupPath(
       || !validName.test(basename(selected))) {
     throw fail(
       MACOS_PREVIEW_INSTALL_CODES.BACKUP_INVALID,
-      `Backup must be a timestamped ${PRODUCT_BRAND.bundleName} sibling of the target`,
+      `Backup must be a timestamped ${PREVIEW_PRODUCT_BRAND.bundleName} sibling of the target`,
     );
   }
   return selected;
@@ -217,10 +235,10 @@ function validateSourcePath(sourcePath) {
     "Preview application source",
     MACOS_PREVIEW_INSTALL_CODES.SOURCE_INVALID,
   );
-  if (basename(selected) !== PRODUCT_BRAND.bundleName) {
+  if (basename(selected) !== PREVIEW_PRODUCT_BRAND.bundleName) {
     throw fail(
       MACOS_PREVIEW_INSTALL_CODES.SOURCE_NAME_INVALID,
-      `Preview application source must be named ${PRODUCT_BRAND.bundleName}`,
+      `Preview application source must be named ${PREVIEW_PRODUCT_BRAND.bundleName}`,
     );
   }
   return selected;
@@ -494,7 +512,7 @@ export async function installMacOSPreviewApp({
     try {
       stageRoot = await fileSystem.mkdtemp(join(
         parent,
-        `.${PRODUCT_BRAND.bundleName}.preview-stage-`,
+        `.${PREVIEW_PRODUCT_BRAND.bundleName}.preview-stage-`,
       ));
       await assertRealDirectory(stageRoot, fileSystem, {
         missingCode: MACOS_PREVIEW_INSTALL_CODES.STAGE_FAILED,
@@ -511,7 +529,7 @@ export async function installMacOSPreviewApp({
       );
     }
 
-    const stagedApp = join(stageRoot, PRODUCT_BRAND.bundleName);
+    const stagedApp = join(stageRoot, PREVIEW_PRODUCT_BRAND.bundleName);
     try {
       await fileSystem.cp(source, stagedApp, {
         recursive: true,
@@ -659,9 +677,9 @@ export async function installMacOSPreviewApp({
 export function usage() {
   return [
     "Usage:",
-    `  node scripts/install-macos-preview-app.js --app <${PRODUCT_BRAND.bundleName} path> \\`,
+    `  node scripts/install-macos-preview-app.js --app <${PREVIEW_PRODUCT_BRAND.bundleName} path> \\`,
     `    --target ${SYSTEM_APPLICATIONS_TARGET} --replace --confirm-system-install`,
-    `  node scripts/install-macos-preview-app.js --app <${PRODUCT_BRAND.bundleName} path> \\`,
+    `  node scripts/install-macos-preview-app.js --app <${PREVIEW_PRODUCT_BRAND.bundleName} path> \\`,
     "    --user-applications --replace",
     "",
     "The target is restricted to /Applications or the current user's ~/Applications.",
@@ -775,7 +793,7 @@ export function parseMacOSPreviewInstallArguments(
   if (confirmSystemInstall && !requiresMacOSSystemInstallConfirmation(selectedTarget)) {
     throw fail(
       MACOS_PREVIEW_INSTALL_CODES.ARGUMENTS_INVALID,
-      "--confirm-system-install is valid only with --target /Applications/TiboTattle.app",
+      `--confirm-system-install is valid only with --target ${SYSTEM_APPLICATIONS_TARGET}`,
     );
   }
   assertMacOSSystemInstallConfirmation(selectedTarget, confirmSystemInstall);

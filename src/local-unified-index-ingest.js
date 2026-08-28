@@ -27,11 +27,14 @@ import {
 import { createHistoryBaseSeedResolver } from "./local-unified-index-history.js";
 import { withStableRolloutSource } from "./rollout-source-snapshot.js";
 import {
+  assertLocalUnifiedIndexNotNewer,
   assertSafeLocalUnifiedIndexTarget,
   createUnifiedIndexWriter,
   beginUnifiedIndexGeneration,
   defaultLocalUnifiedIndexPath,
   defaultLocalUnifiedIndexSecretPath,
+  LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION,
+  LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION,
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
   LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
   LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION,
@@ -53,6 +56,44 @@ const {
   discoverCodexRolloutInfos,
 } = localCodexLogScanner;
 const MINIMUM_AUTOMATIC_PARALLEL_BACKFILL_BYTES = 1024 * 1024 * 1024;
+const LOCAL_UNIFIED_INDEX_APPLICATION_ID = 0x554d5549;
+const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION = "local-unified-index-v1";
+
+function assertKnownLocalUnifiedIndexIdentity(database) {
+  const compatibility = assertLocalUnifiedIndexNotNewer(database, {
+    readOnly: false,
+  });
+  let schemaVersion;
+  try {
+    schemaVersion = database.prepare(
+      "SELECT value FROM meta WHERE key = 'schema_version'",
+    ).get()?.value ?? null;
+  } catch {
+    throw fixedError("local_unified_index_schema_invalid");
+  }
+  const migratable = Number.isSafeInteger(compatibility.userVersion)
+    && compatibility.userVersion >= 1
+    && compatibility.userVersion < LOCAL_UNIFIED_INDEX_USER_VERSION
+    && [
+      LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+      LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+    ].includes(schemaVersion);
+  const currentCompatibilitySupported = !compatibility.metadataPartial
+    && (!compatibility.metadataPresent
+      || (compatibility.formatUserVersion === LOCAL_UNIFIED_INDEX_USER_VERSION
+        && compatibility.minimumReaderUserVersion
+          === LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION
+        && compatibility.minimumWriterUserVersion
+          === LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION));
+  const current = compatibility.userVersion === LOCAL_UNIFIED_INDEX_USER_VERSION
+    && schemaVersion === LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
+    && currentCompatibilitySupported;
+  if (compatibility.applicationId !== LOCAL_UNIFIED_INDEX_APPLICATION_ID
+      || (!migratable && !current)) {
+    throw fixedError("local_unified_index_schema_invalid");
+  }
+  return compatibility;
+}
 
 // Incremental ingest: advance the live unified index by exactly the bytes the
 // rollout corpus grew since the last pass.
@@ -239,9 +280,46 @@ export async function ingestLocalUnifiedIndexIncrement({
   }
   const startedAt = performance.now();
   const resolvedIndexFile = resolve(indexFile);
-  await assertSafeLocalUnifiedIndexTarget(resolvedIndexFile, {
-    allowMissing: true,
-  });
+  const existingIndexMetadata = await assertSafeLocalUnifiedIndexTarget(
+    resolvedIndexFile,
+    {
+      allowMissing: true,
+    },
+  );
+  let coldRebuildReason = null;
+  // Inspect only the SQLite header/meta needed to identify a pre-current index.
+  // The normal reader intentionally rejects old source-identity contracts;
+  // this narrow preflight must detect them before a device salt is created or
+  // a writable clone can retain old rollout-key facts beside current
+  // rollout-id/snapshot facts.
+  if (existingIndexMetadata !== null) {
+    let raw;
+    try {
+      raw = new DatabaseSync(resolvedIndexFile, {
+        readOnly: true,
+        timeout: 5_000,
+      });
+      const userVersion = Number(raw.prepare(
+        "PRAGMA user_version",
+      ).get()?.user_version);
+      // Prove this is a known current or migratable TiboTattle index before
+      // readOrCreateDeviceSalt can mutate the identity domain. Merely checking
+      // for N+1 metadata is insufficient: an unrelated SQLite file has no
+      // compatibility metadata and would otherwise pass this preflight.
+      assertKnownLocalUnifiedIndexIdentity(raw);
+      if (userVersion !== LOCAL_UNIFIED_INDEX_USER_VERSION) {
+        coldRebuildReason = "source_identity_changed";
+      }
+    } catch (error) {
+      if (error?.code === "local_unified_index_schema_newer"
+          || error?.code === "local_unified_index_schema_invalid") {
+        throw error;
+      }
+      throw fixedError("local_unified_index_schema_invalid");
+    } finally {
+      raw?.close();
+    }
+  }
   const deviceSalt = await readOrCreateDeviceSalt(
     secretFile ?? defaultLocalUnifiedIndexSecretPath(resolvedIndexFile),
   );
@@ -255,30 +333,6 @@ export async function ingestLocalUnifiedIndexIncrement({
   const discovery = codexRolloutDiscoveryReceipt(infos);
   const discoveredAt = performance.now();
   const sourceBytes = discovery.discoveredSourceBytes;
-  let coldRebuildReason = null;
-  // Inspect only the SQLite header/meta needed to identify a pre-current index.
-  // The normal reader intentionally rejects old source-identity contracts;
-  // this narrow preflight must detect them before a writable clone can retain
-  // old rollout-key facts beside current rollout-id/snapshot facts.
-  try {
-    const raw = new DatabaseSync(resolvedIndexFile, {
-      readOnly: true,
-      timeout: 5_000,
-    });
-    try {
-      const userVersion = Number(raw.prepare(
-        "PRAGMA user_version",
-      ).get()?.user_version);
-      if (userVersion !== LOCAL_UNIFIED_INDEX_USER_VERSION) {
-        coldRebuildReason = "source_identity_changed";
-      }
-    } finally {
-      raw.close();
-    }
-  } catch {
-    // A missing index is handled by the normal staged creation path. Other
-    // unreadable files retain the existing fixed-error behavior below.
-  }
   // Read-only preflight avoids cloning/publishing when every current source
   // is byte-for-byte unchanged. A same-size mtime change is deliberately a
   // rescan (classifySource's conservative race policy), so this reads no

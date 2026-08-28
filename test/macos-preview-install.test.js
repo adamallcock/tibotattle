@@ -23,7 +23,10 @@ import {
   parseMacOSPreviewInstallArguments,
   requiresMacOSSystemInstallConfirmation,
 } from "../scripts/install-macos-preview-app.js";
-import { PRODUCT_BRAND } from "../config/product-brand.js";
+import {
+  PREVIEW_PRODUCT_BRAND,
+  PRODUCT_BRAND,
+} from "../config/product-brand.js";
 
 const PREVIEW_CHANNEL = "preview_distribution";
 
@@ -32,8 +35,8 @@ async function makeFixture() {
     await mkdtemp(join(tmpdir(), "tibotattle-preview-install-")),
   );
   const applications = join(root, "Applications");
-  const source = join(root, "build", PRODUCT_BRAND.bundleName);
-  const target = join(applications, PRODUCT_BRAND.bundleName);
+  const source = join(root, "build", PREVIEW_PRODUCT_BRAND.bundleName);
+  const target = join(applications, PREVIEW_PRODUCT_BRAND.bundleName);
   await mkdir(join(source, "Contents", "Resources"), { recursive: true });
   await mkdir(join(
     source,
@@ -120,9 +123,9 @@ test("preview CLI requires the explicit replacement opt-in", () => {
   assert.throws(
     () => parseMacOSPreviewInstallArguments([
       "--app",
-      "/tmp/TiboTattle.app",
+      "/tmp/TiboTattle Preview.app",
       "--target",
-      "/Applications/TiboTattle.app",
+      "/Applications/TiboTattle Preview.app",
     ]),
     {
       code: MACOS_PREVIEW_INSTALL_CODES.REPLACE_REQUIRED,
@@ -135,9 +138,9 @@ test("preview CLI requires an unmistakable confirmation before targeting system 
   assert.throws(
     () => parseMacOSPreviewInstallArguments([
       "--app",
-      "/tmp/TiboTattle.app",
+      "/tmp/TiboTattle Preview.app",
       "--target",
-      "/Applications/TiboTattle.app",
+      "/Applications/TiboTattle Preview.app",
       "--replace",
     ]),
     {
@@ -147,14 +150,14 @@ test("preview CLI requires an unmistakable confirmation before targeting system 
   );
   const parsed = parseMacOSPreviewInstallArguments([
     "--app",
-    "/tmp/TiboTattle.app",
+    "/tmp/TiboTattle Preview.app",
     "--target",
-    "/Applications/TiboTattle.app",
+    "/Applications/TiboTattle Preview.app",
     "--replace",
     "--confirm-system-install",
   ]);
   assert.equal(parsed.confirmSystemInstall, true);
-  assert.equal(parsed.targetPath, "/Applications/TiboTattle.app");
+  assert.equal(parsed.targetPath, "/Applications/TiboTattle Preview.app");
   assert.equal(requiresMacOSSystemInstallConfirmation(parsed.targetPath), true);
 });
 
@@ -167,15 +170,40 @@ test("the preview installation command includes the required system confirmation
     packageDefinition.scripts["product:macos:preview:install"],
     /--confirm-system-install/u,
   );
+  assert.match(
+    packageDefinition.scripts["product:macos:preview:install"],
+    /TiboTattle Preview\.app/u,
+  );
+  assert.doesNotMatch(
+    packageDefinition.scripts["product:macos:preview:install"],
+    /--target "\/Applications\/TiboTattle\.app"/u,
+  );
+});
+
+test("preview installer refuses the stable application path", () => {
+  assert.throws(
+    () => parseMacOSPreviewInstallArguments([
+      "--app",
+      "/tmp/TiboTattle Preview.app",
+      "--target",
+      `/Applications/${PRODUCT_BRAND.bundleName}`,
+      "--replace",
+      "--confirm-system-install",
+    ]),
+    {
+      code: MACOS_PREVIEW_INSTALL_CODES.STABLE_TARGET_FORBIDDEN,
+      message: /Refusing to replace stable/u,
+    },
+  );
 });
 
 test("programmatic system installation refuses before it inspects a source", async () => {
   await assert.rejects(
     () => installMacOSPreviewApp({
-      allowedTargetPaths: ["/Applications/TiboTattle.app"],
+      allowedTargetPaths: ["/Applications/TiboTattle Preview.app"],
       replace: true,
-      sourcePath: "/tmp/TiboTattle.app",
-      targetPath: "/Applications/TiboTattle.app",
+      sourcePath: "/tmp/TiboTattle Preview.app",
+      targetPath: "/Applications/TiboTattle Preview.app",
       validator: fixtureValidator(),
     }),
     {
@@ -196,7 +224,7 @@ test("preview CLI rejects a source with a non-canonical app name", () => {
     ]),
     {
       code: MACOS_PREVIEW_INSTALL_CODES.SOURCE_NAME_INVALID,
-      message: new RegExp(PRODUCT_BRAND.bundleName, "u"),
+      message: new RegExp(PREVIEW_PRODUCT_BRAND.bundleName, "u"),
     },
   );
 });
@@ -205,9 +233,9 @@ test("preview CLI rejects arbitrary destructive targets but exposes safe user Ap
   assert.throws(
     () => parseMacOSPreviewInstallArguments([
       "--app",
-      "/tmp/TiboTattle.app",
+      "/tmp/TiboTattle Preview.app",
       "--target",
-      "/tmp/TiboTattle.app",
+      "/tmp/TiboTattle Preview.app",
       "--replace",
     ]),
     {
@@ -216,7 +244,7 @@ test("preview CLI rejects arbitrary destructive targets but exposes safe user Ap
   );
   const parsed = parseMacOSPreviewInstallArguments([
     "--app",
-    "/tmp/TiboTattle.app",
+    "/tmp/TiboTattle Preview.app",
     "--user-applications",
     "--replace",
   ], { homeDirectory: "/Users/example" });
@@ -237,7 +265,7 @@ test("installer stages and activates a preview when the target is absent", async
     );
     assert.deepEqual(
       (await readdir(fixture.applications)).filter((name) =>
-        name.startsWith(`.${PRODUCT_BRAND.bundleName}.preview-stage-`)),
+        name.startsWith(`.${PREVIEW_PRODUCT_BRAND.bundleName}.preview-stage-`)),
       [],
     );
     assert.equal(await readFile(
@@ -270,7 +298,7 @@ test("installer moves an existing target to an app-specific timestamped backup",
     const result = await installMacOSPreviewApp(fixtureOptions(fixture));
     assert.match(
       result.backupPath,
-      new RegExp(`${PRODUCT_BRAND.bundleName}\\.backup-2026-08-03T19-04-05-006Z$`, "u"),
+      new RegExp(`${PREVIEW_PRODUCT_BRAND.bundleName}\\.backup-2026-08-03T19-04-05-006Z$`, "u"),
     );
     assert.equal(
       await readFile(join(result.backupPath, "Contents", "Resources", "fixture.txt"), "utf8"),
@@ -288,7 +316,11 @@ test("installer moves an existing target to an app-specific timestamped backup",
 
 test("installer rejects an existing target symlink without touching its referent", async () => {
   const fixture = await makeFixture();
-  const realTarget = join(fixture.root, "real-target", PRODUCT_BRAND.bundleName);
+  const realTarget = join(
+    fixture.root,
+    "real-target",
+    PREVIEW_PRODUCT_BRAND.bundleName,
+  );
   try {
     await mkdir(join(realTarget, "Contents", "Resources"), { recursive: true });
     await writeFile(
@@ -315,7 +347,7 @@ test("installer rejects a symlink collision at the generated backup path", async
   const fixture = await makeFixture();
   const backup = join(
     fixture.applications,
-    `${PRODUCT_BRAND.bundleName}.backup-2026-08-03T19-04-05-006Z`,
+    `${PREVIEW_PRODUCT_BRAND.bundleName}.backup-2026-08-03T19-04-05-006Z`,
   );
   try {
     await cp(fixture.source, fixture.target, { recursive: true });
@@ -354,7 +386,7 @@ test("installer restores the previous app when activation fails", async () => {
       realpath: async (path) => path,
       rename: async (from, to) => {
         if (to === fixture.target
-            && from.includes(`.${PRODUCT_BRAND.bundleName}.preview-stage-`)) {
+            && from.includes(`.${PREVIEW_PRODUCT_BRAND.bundleName}.preview-stage-`)) {
           const error = new Error("injected activation failure");
           error.code = "EIO";
           throw error;

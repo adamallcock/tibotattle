@@ -116,6 +116,10 @@ git push origin vX.Y.Z
 Do not sign from a branch that is ahead of or different from the tag. The
 source identity later recorded in the release evidence descriptor must be the
 same version, tag, commit, and repository URL.
+The stable release gate accepts only the exact annotated `vX.Y.Z` tag for the
+bundle's short version. An internal-dogfood source tag, lightweight tag, tag
+alias, dirty checkout, or second matching stable version tag is not a stable
+release source.
 
 ## 2. Build, sign, notarize, staple, and freeze the DMG
 
@@ -130,7 +134,7 @@ design.
 rm -rf .release-build/macos-production
 export USAGE_MONITOR_DEVELOPER_ID_APPLICATION="Developer ID Application: … (…)"
 export USAGE_MONITOR_NOTARY_PROFILE="…"
-export USAGE_MONITOR_BUNDLE_VERSION="X.Y.Z"
+export USAGE_MONITOR_BUNDLE_VERSION="1024"
 export USAGE_MONITOR_SPARKLE_FRAMEWORK=".release-deps/Sparkle.framework"
 export USAGE_MONITOR_SPARKLE_APPCAST_URL="https://updates.tibotattle.com/appcast.xml"
 export USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY="jhgPwmvWLMr7TGURJUoi6sXias7YP1F+hejZawKVTGw="
@@ -141,6 +145,17 @@ node scripts/release-macos-app.js \
   --prepare-candidate \
   --previous-stable-manifest "<path to P.Q.R .release.json>"
 ~~~
+
+For the 0.1.17 stable release, `CFBundleShortVersionString` remains `0.1.17`
+and the owner-reviewed signed `CFBundleVersion` is exactly `1024`. It follows
+the isolated 0.1.17 dogfood allocation `1023` and the last shared-identity
+dogfood build `1022`. The checked-in allocation is authoritative; the
+`USAGE_MONITOR_BUNDLE_VERSION` value above is only an exact assertion and
+cannot select or override a different build. A future stable version must add
+and test a new monotonic channel allocation before the release path will run.
+The separate `TiboTattle Preview.app` identity may use the deterministic
+preview epoch (`2000.1.17` for 0.1.17); it does not participate in stable
+Sparkle ordering.
 
 Codesign may prompt for Keychain access once; choose **Always Allow** on the
 release machine. The finalizer validates Developer ID signing, hardened

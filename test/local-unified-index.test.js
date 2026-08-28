@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   appendFile,
+  chmod,
   lstat,
   mkdir,
   mkdtemp,
@@ -40,7 +41,10 @@ import {
   createUnifiedIndexWriter,
   beginUnifiedIndexGeneration,
   inspectLocalUnifiedIndex,
+  LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION,
+  LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION,
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_USER_VERSION,
   localDigest,
   openLocalUnifiedIndex,
   OUTCOMES,
@@ -2936,6 +2940,805 @@ test("a version-1 index can be opened through the additive v10 schema migration"
     writable.prepare("SELECT COUNT(*) AS c FROM generation_issue").get();
     writable.prepare("SELECT COUNT(*) AS c FROM generation_issue_group").get();
     writable.close();
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("the schema-8 index shipped by v0.1.16 migrates transactionally to v10", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-v016-schema8.jsonl": [
+      sessionMeta("session-v016-schema8"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const shipped = new DatabaseSync(indexFile);
+    const before = Number(shipped.prepare(
+      "SELECT COUNT(*) AS count FROM usage_event",
+    ).get().count);
+    // Recreate the exact schema widenings that were absent from the tagged
+    // v0.1.16 source: schema 8 had no compatibility metadata, generation
+    // issue tables, skipped-source attestation, physical cursor identity, or
+    // the three malformed-record diagnostic codes.
+    shipped.exec(`
+      BEGIN IMMEDIATE;
+      DROP TABLE generation_issue_group;
+      DROP TABLE generation_issue;
+      ALTER TABLE index_generation DROP COLUMN skipped_thread_count;
+      ALTER TABLE index_generation DROP COLUMN skipped_source_bytes;
+      ALTER TABLE index_generation DROP COLUMN skipped_source_count;
+      ALTER TABLE source_cursor DROP COLUMN quarantine_code;
+      ALTER TABLE source_cursor DROP COLUMN source_state_token;
+      ALTER TABLE source_cursor DROP COLUMN source_identity_token;
+      ALTER TABLE source_cursor DROP COLUMN source_ctime_ms;
+      ALTER TABLE source_cursor DROP COLUMN source_birthtime_ms;
+      ALTER TABLE source_cursor DROP COLUMN source_ino;
+      ALTER TABLE source_cursor DROP COLUMN source_dev;
+      ALTER TABLE source_diagnostic RENAME TO source_diagnostic_v10;
+      CREATE TABLE source_diagnostic(
+        generation_id INTEGER NOT NULL REFERENCES index_generation ON DELETE CASCADE,
+        source_local BLOB NOT NULL CHECK(length(source_local) = 32),
+        code TEXT NOT NULL CHECK(code IN (
+          'relevantLines', 'malformedLines', 'malformedTimestamps',
+          'partialLines', 'salvagedRecords', 'turnContexts', 'tokenCounts',
+          'forkReplayEventsSkipped', 'unattributedForkReplayEventsSkipped',
+          'cumulativeCounterRegressions', 'tierEvents', 'modelSeededFromLineage',
+          'tierSeededFromLineage', 'modelMissing', 'oversizedLines',
+          'contradictedLeadingSnapshotsSkipped', 'toolRecords', 'toolEvents',
+          'toolRecordsSkipped', 'toolSourceHistoryUnavailable')),
+        count INTEGER NOT NULL CHECK(count >= 0),
+        PRIMARY KEY(generation_id, source_local, code)) STRICT, WITHOUT ROWID;
+      INSERT INTO source_diagnostic(generation_id, source_local, code, count)
+        SELECT generation_id, source_local, code, count
+        FROM source_diagnostic_v10
+        WHERE code NOT IN (
+          'malformedAccountingRecords',
+          'malformedUsageRecords',
+          'malformedRateLimitRecords');
+      DROP TABLE source_diagnostic_v10;
+      UPDATE parser_version
+        SET parser_version = 'unified-rollout-typed-v8';
+      DELETE FROM meta WHERE key LIKE 'compatibility_%';
+      PRAGMA user_version=8;
+      COMMIT;
+    `);
+    assert.equal(
+      Number(shipped.prepare("PRAGMA user_version").get().user_version),
+      8,
+    );
+    assert.equal(shipped.prepare(
+      "SELECT value FROM meta WHERE key = 'schema_version'",
+    ).get().value, "local-unified-index-v2");
+    assert.deepEqual(shipped.prepare(
+      "SELECT parser_version FROM parser_version ORDER BY id",
+    ).all().map((row) => row.parser_version), ["unified-rollout-typed-v8"]);
+    assert.equal(Number(shipped.prepare(`
+      SELECT COUNT(*) AS count FROM meta WHERE key LIKE 'compatibility_%'
+    `).get().count), 0);
+    assert.equal(shipped.prepare(
+      "SELECT name FROM sqlite_master WHERE name = 'generation_issue'",
+    ).get(), undefined);
+    assert.equal(shipped.prepare(
+      "SELECT sql FROM sqlite_master WHERE name = 'source_diagnostic'",
+    ).get().sql.includes("malformedAccountingRecords"), false);
+    shipped.close();
+
+    const migrated = openLocalUnifiedIndex(indexFile, { readOnly: false });
+    try {
+      assert.equal(
+        Number(migrated.prepare("PRAGMA user_version").get().user_version),
+        LOCAL_UNIFIED_INDEX_USER_VERSION,
+      );
+      assert.equal(Number(migrated.prepare(
+        "SELECT COUNT(*) AS count FROM usage_event",
+      ).get().count), before);
+      const generationColumns = new Set(migrated.prepare(
+        "PRAGMA table_info(index_generation)",
+      ).all().map((column) => column.name));
+      for (const column of [
+        "skipped_source_count",
+        "skipped_source_bytes",
+        "skipped_thread_count",
+      ]) {
+        assert.ok(generationColumns.has(column), `migration restored ${column}`);
+      }
+      const cursorColumns = new Set(migrated.prepare(
+        "PRAGMA table_info(source_cursor)",
+      ).all().map((column) => column.name));
+      for (const column of [
+        "source_dev",
+        "source_ino",
+        "source_birthtime_ms",
+        "source_ctime_ms",
+        "source_identity_token",
+        "source_state_token",
+        "quarantine_code",
+      ]) {
+        assert.ok(cursorColumns.has(column), `migration restored ${column}`);
+      }
+      migrated.prepare("SELECT COUNT(*) AS count FROM generation_issue").get();
+      migrated.prepare(
+        "SELECT COUNT(*) AS count FROM generation_issue_group",
+      ).get();
+      assert.equal(migrated.prepare(
+        "SELECT sql FROM sqlite_master WHERE name = 'source_diagnostic'",
+      ).get().sql.includes("malformedAccountingRecords"), true);
+      const compatibility = Object.fromEntries(migrated.prepare(`
+        SELECT key, value FROM meta WHERE key LIKE 'compatibility_%'
+      `).all().map((row) => [row.key, row.value]));
+      assert.deepEqual(compatibility, {
+        compatibility_format_user_version: String(LOCAL_UNIFIED_INDEX_USER_VERSION),
+        compatibility_minimum_reader_user_version:
+          String(LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION),
+        compatibility_minimum_writer_user_version:
+          String(LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION),
+      });
+    } finally {
+      migrated.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a version-9 index migrates transactionally to v10 with compatibility metadata", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-v9.jsonl": [
+      sessionMeta("session-v9"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const old = new DatabaseSync(indexFile);
+    const before = Number(old.prepare(
+      "SELECT COUNT(*) AS count FROM usage_event",
+    ).get().count);
+    old.exec(`
+      BEGIN IMMEDIATE;
+      ALTER TABLE source_cursor DROP COLUMN quarantine_code;
+      ALTER TABLE source_cursor DROP COLUMN source_state_token;
+      ALTER TABLE source_cursor DROP COLUMN source_identity_token;
+      ALTER TABLE source_cursor DROP COLUMN source_ctime_ms;
+      ALTER TABLE source_cursor DROP COLUMN source_birthtime_ms;
+      ALTER TABLE source_cursor DROP COLUMN source_ino;
+      ALTER TABLE source_cursor DROP COLUMN source_dev;
+      DELETE FROM meta WHERE key LIKE 'compatibility_%';
+      PRAGMA user_version=9;
+      COMMIT;
+    `);
+    old.close();
+
+    const migrated = openLocalUnifiedIndex(indexFile, { readOnly: false });
+    try {
+      assert.equal(
+        Number(migrated.prepare("PRAGMA user_version").get().user_version),
+        LOCAL_UNIFIED_INDEX_USER_VERSION,
+      );
+      assert.equal(Number(migrated.prepare(
+        "SELECT COUNT(*) AS count FROM usage_event",
+      ).get().count), before);
+      const cursorColumns = new Set(migrated.prepare(
+        "PRAGMA table_info(source_cursor)",
+      ).all().map((column) => column.name));
+      for (const column of [
+        "source_dev",
+        "source_ino",
+        "source_birthtime_ms",
+        "source_ctime_ms",
+        "source_identity_token",
+        "source_state_token",
+        "quarantine_code",
+      ]) {
+        assert.ok(cursorColumns.has(column), `migration restored ${column}`);
+      }
+      const compatibility = Object.fromEntries(migrated.prepare(`
+        SELECT key, value FROM meta WHERE key LIKE 'compatibility_%'
+      `).all().map((row) => [row.key, row.value]));
+      assert.deepEqual(compatibility, {
+        compatibility_format_user_version: String(LOCAL_UNIFIED_INDEX_USER_VERSION),
+        compatibility_minimum_reader_user_version:
+          String(LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION),
+        compatibility_minimum_writer_user_version:
+          String(LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION),
+      });
+    } finally {
+      migrated.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a pre-metadata v10 index remains readable and is stamped on its next writable open", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-v10-transition.jsonl": [
+      sessionMeta("session-v10-transition"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const old = new DatabaseSync(indexFile);
+    old.prepare("DELETE FROM meta WHERE key LIKE 'compatibility_%'").run();
+    old.close();
+
+    const readOnly = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    assert.equal(Number(readOnly.prepare(
+      "SELECT COUNT(*) AS count FROM usage_event",
+    ).get().count), 1);
+    readOnly.close();
+    const unstamped = new DatabaseSync(indexFile, { readOnly: true });
+    assert.equal(Number(unstamped.prepare(`
+      SELECT COUNT(*) AS count FROM meta WHERE key LIKE 'compatibility_%'
+    `).get().count), 0, "read-only compatibility does not mutate the index");
+    unstamped.close();
+
+    const writable = openLocalUnifiedIndex(indexFile, { readOnly: false });
+    assert.equal(Number(writable.prepare(`
+      SELECT COUNT(*) AS count FROM meta WHERE key LIKE 'compatibility_%'
+    `).get().count), 3);
+    writable.close();
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a failed v9 to v10 migration rolls back its widening and version stamp", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-v9-rollback.jsonl": [
+      sessionMeta("session-v9-rollback"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const old = new DatabaseSync(indexFile);
+    old.exec(`
+      BEGIN IMMEDIATE;
+      ALTER TABLE source_cursor DROP COLUMN quarantine_code;
+      DELETE FROM meta WHERE key LIKE 'compatibility_%';
+      CREATE TRIGGER reject_compatibility_stamp
+      BEFORE INSERT ON meta
+      WHEN NEW.key = 'compatibility_format_user_version'
+      BEGIN
+        SELECT RAISE(ABORT, 'fixture rejects compatibility stamp');
+      END;
+      PRAGMA user_version=9;
+      COMMIT;
+    `);
+    const before = Number(old.prepare(
+      "SELECT COUNT(*) AS count FROM usage_event",
+    ).get().count);
+    old.close();
+
+    assert.throws(
+      () => openLocalUnifiedIndex(indexFile, { readOnly: false }),
+      (error) => error?.code === "local_unified_index_unavailable",
+    );
+
+    const retained = new DatabaseSync(indexFile, { readOnly: true });
+    try {
+      assert.equal(Number(
+        retained.prepare("PRAGMA user_version").get().user_version,
+      ), 9);
+      assert.equal(Number(retained.prepare(
+        "SELECT COUNT(*) AS count FROM usage_event",
+      ).get().count), before);
+      assert.ok(!retained.prepare("PRAGMA table_info(source_cursor)").all()
+        .some((column) => column.name === "quarantine_code"));
+      assert.equal(Number(retained.prepare(`
+        SELECT COUNT(*) AS count FROM meta WHERE key LIKE 'compatibility_%'
+      `).get().count), 0);
+    } finally {
+      retained.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("writable opens refuse unrelated SQLite files byte-for-byte", async (t) => {
+  for (const fixture of ["foreign-application", "spoofed-application-id"]) {
+    await t.test(fixture, async () => {
+      const root = await mkdtemp(join(tmpdir(), `unified-index-unrelated-${fixture}-`));
+      const indexFile = join(root, "unrelated.sqlite");
+      try {
+        const { DatabaseSync } = await import("node:sqlite");
+        const unrelated = new DatabaseSync(indexFile);
+        unrelated.exec(`
+          CREATE TABLE unrelated_record(id INTEGER PRIMARY KEY, value TEXT);
+          INSERT INTO unrelated_record(value) VALUES ('must survive');
+          PRAGMA user_version=1;
+          ${fixture === "spoofed-application-id"
+            ? "PRAGMA application_id=0x554d5549;"
+            : ""}
+        `);
+        unrelated.close();
+        await chmod(indexFile, 0o600);
+        const before = await readFile(indexFile);
+
+        for (const options of [
+          { readOnly: false },
+          { readOnly: false, create: true },
+        ]) {
+          assert.throws(
+            () => openLocalUnifiedIndex(indexFile, options),
+            (error) => error?.code === "local_unified_index_schema_invalid",
+          );
+          assert.deepEqual(await readFile(indexFile), before);
+        }
+
+        const retained = new DatabaseSync(indexFile, { readOnly: true });
+        const retainedRows = retained.prepare(
+          "SELECT id, value FROM unrelated_record",
+        ).all();
+        assert.equal(retainedRows.length, 1);
+        assert.equal(retainedRows[0].id, 1);
+        assert.equal(retainedRows[0].value, "must survive");
+        retained.close();
+      } finally {
+        await rm(root, { recursive: true });
+      }
+    });
+  }
+});
+
+test("symlinks to a migratable v9 index are refused without touching the target", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-symlink-v9.jsonl": [
+      sessionMeta("session-symlink-v9"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const targetFile = join(root, "index.sqlite");
+  const linkFile = join(root, "index-via-link.sqlite");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const legacy = new DatabaseSync(targetFile);
+    legacy.exec(`
+      BEGIN IMMEDIATE;
+      ALTER TABLE source_cursor DROP COLUMN quarantine_code;
+      DELETE FROM meta WHERE key LIKE 'compatibility_%';
+      PRAGMA user_version=9;
+      COMMIT;
+    `);
+    legacy.close();
+    await symlink(targetFile, linkFile);
+    const targetBefore = await readFile(targetFile);
+
+    for (const options of [
+      { readOnly: true },
+      { readOnly: false },
+      { readOnly: false, create: true },
+      { readOnly: false, create: true, staging: true },
+    ]) {
+      assert.throws(
+        () => openLocalUnifiedIndex(linkFile, options),
+        (error) => error?.code === "local_unified_index_file_invalid",
+      );
+      assert.deepEqual(await readFile(targetFile), targetBefore);
+    }
+
+    const retained = new DatabaseSync(targetFile, { readOnly: true });
+    assert.equal(Number(retained.prepare(
+      "PRAGMA user_version",
+    ).get().user_version), 9);
+    assert.equal(retained.prepare("PRAGMA table_info(source_cursor)").all()
+      .some((column) => column.name === "quarantine_code"), false);
+    retained.close();
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a symlinked parent directory is never traversed for index opens or creation", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-parent-link.jsonl": [
+      sessionMeta("session-parent-link"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const realParent = join(root, "real-index-parent");
+  const linkedParent = join(root, "linked-index-parent");
+  const targetFile = join(realParent, "index.sqlite");
+  const linkedExistingFile = join(linkedParent, "index.sqlite");
+  const linkedNewFile = join(linkedParent, "new.sqlite");
+  const realNewFile = join(realParent, "new.sqlite");
+  try {
+    await mkdir(realParent, { mode: 0o700 });
+    await rebuildLocalUnifiedIndex({
+      codexHome: root,
+      indexFile: targetFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      workerCount: 1,
+    });
+    await symlink(realParent, linkedParent);
+    const targetBefore = await readFile(targetFile);
+
+    for (const options of [
+      { readOnly: true },
+      { readOnly: false },
+      { readOnly: false, create: true },
+      { readOnly: false, staging: true },
+    ]) {
+      assert.throws(
+        () => openLocalUnifiedIndex(linkedExistingFile, options),
+        (error) => error?.code === "local_unified_index_file_invalid",
+      );
+      assert.deepEqual(await readFile(targetFile), targetBefore);
+    }
+
+    for (const options of [
+      { readOnly: false, create: true },
+      { readOnly: false, create: true, staging: true },
+      {
+        readOnly: false,
+        create: true,
+        staging: true,
+        deferSecondaryIndexes: true,
+      },
+    ]) {
+      assert.throws(
+        () => openLocalUnifiedIndex(linkedNewFile, options),
+        (error) => error?.code === "local_unified_index_file_invalid",
+      );
+      await assert.rejects(
+        lstat(realNewFile),
+        (error) => error?.code === "ENOENT",
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("an N+1 index is refused by readers and ingest without mutating it", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-newer.jsonl": [
+      sessionMeta("session-newer"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const newer = new DatabaseSync(indexFile);
+    const nextVersion = LOCAL_UNIFIED_INDEX_USER_VERSION + 1;
+    const stamp = newer.prepare(`
+      INSERT INTO meta(key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `);
+    stamp.run("compatibility_format_user_version", String(nextVersion));
+    stamp.run("compatibility_minimum_reader_user_version", String(nextVersion));
+    stamp.run("compatibility_minimum_writer_user_version", String(nextVersion));
+    newer.exec(`PRAGMA user_version=${nextVersion}`);
+    newer.close();
+    const before = await readFile(indexFile);
+
+    for (const readOnly of [true, false]) {
+      assert.throws(
+        () => openLocalUnifiedIndex(indexFile, { readOnly }),
+        (error) => {
+          assert.equal(error?.code, "local_unified_index_schema_newer");
+          assert.deepEqual(error?.compatibility, {
+            accessMode: readOnly ? "read" : "write",
+            databaseUserVersion: nextVersion,
+            formatUserVersion: nextVersion,
+            supportedUserVersion: LOCAL_UNIFIED_INDEX_USER_VERSION,
+            minimumReaderUserVersion: nextVersion,
+            minimumWriterUserVersion: nextVersion,
+            requiredUserVersion: nextVersion,
+            requirements: [
+              { requirement: "pragma_user_version", version: nextVersion },
+              { requirement: "format_user_version", version: nextVersion },
+              {
+                requirement: readOnly
+                  ? "minimum_reader_user_version"
+                  : "minimum_writer_user_version",
+                version: nextVersion,
+              },
+            ],
+          });
+          return true;
+        },
+      );
+      assert.deepEqual(await readFile(indexFile), before);
+    }
+
+    await assert.rejects(
+      ingestLocalUnifiedIndexIncrement({
+        codexHome: root,
+        indexFile,
+        secretFile: join(root, "salt"),
+        contractVersion: CONTRACT,
+      }),
+      (error) => error?.code === "local_unified_index_schema_newer",
+    );
+    assert.deepEqual(await readFile(indexFile), before);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("ingest refuses an N+1 index before creating an absent device salt", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-newer-no-salt.jsonl": [
+      sessionMeta("session-newer-no-salt"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const secretFile = join(root, "salt");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const nextVersion = LOCAL_UNIFIED_INDEX_USER_VERSION + 1;
+    const newer = new DatabaseSync(indexFile);
+    const stamp = newer.prepare(`
+      INSERT INTO meta(key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `);
+    stamp.run("compatibility_format_user_version", String(nextVersion));
+    stamp.run("compatibility_minimum_reader_user_version", String(nextVersion));
+    stamp.run("compatibility_minimum_writer_user_version", String(nextVersion));
+    newer.exec(`PRAGMA user_version=${nextVersion}`);
+    newer.close();
+    await rm(secretFile);
+    await assert.rejects(lstat(secretFile), (error) => error?.code === "ENOENT");
+    const before = await readFile(indexFile);
+
+    await assert.rejects(
+      ingestLocalUnifiedIndexIncrement({
+        codexHome: root,
+        indexFile,
+        secretFile,
+        contractVersion: CONTRACT,
+      }),
+      (error) => error?.code === "local_unified_index_schema_newer",
+    );
+
+    await assert.rejects(lstat(secretFile), (error) => error?.code === "ENOENT");
+    assert.deepEqual(await readFile(indexFile), before);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("ingest refuses a foreign index before creating an absent device salt", async () => {
+  const root = await mkdtemp(join(tmpdir(), "unified-index-foreign-no-salt-"));
+  const indexFile = join(root, "index.sqlite");
+  const secretFile = join(root, "salt");
+  try {
+    const { DatabaseSync } = await import("node:sqlite");
+    const foreign = new DatabaseSync(indexFile);
+    foreign.exec(`
+      CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      INSERT INTO meta(key, value) VALUES
+        ('schema_version', 'local-unified-index-v2'),
+        ('compatibility_format_user_version', '10'),
+        ('compatibility_minimum_reader_user_version', '10'),
+        ('compatibility_minimum_writer_user_version', '10');
+      PRAGMA application_id=1234;
+      PRAGMA user_version=10;
+    `);
+    foreign.close();
+    await chmod(indexFile, 0o600);
+    const before = await readFile(indexFile);
+
+    await assert.rejects(
+      ingestLocalUnifiedIndexIncrement({
+        codexHome: root,
+        indexFile,
+        secretFile,
+        contractVersion: CONTRACT,
+      }),
+      (error) => error?.code === "local_unified_index_schema_invalid",
+    );
+
+    await assert.rejects(lstat(secretFile), (error) => error?.code === "ENOENT");
+    assert.deepEqual(await readFile(indexFile), before);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("metadata-only N+1 requirements refuse each access mode without mutation", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-metadata-newer.jsonl": [
+      sessionMeta("session-metadata-newer"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const nextVersion = LOCAL_UNIFIED_INDEX_USER_VERSION + 1;
+    const newer = new DatabaseSync(indexFile);
+    const stamp = newer.prepare(`
+      INSERT INTO meta(key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `);
+    // PRAGMA remains v10: only the explicit compatibility contract moves.
+    stamp.run("compatibility_format_user_version", String(nextVersion));
+    stamp.run("compatibility_minimum_reader_user_version", String(nextVersion));
+    stamp.run("compatibility_minimum_writer_user_version", String(nextVersion));
+    newer.close();
+    const before = await readFile(indexFile);
+
+    for (const readOnly of [true, false]) {
+      assert.throws(
+        () => openLocalUnifiedIndex(indexFile, { readOnly }),
+        (error) => {
+          assert.equal(error?.code, "local_unified_index_schema_newer");
+          assert.equal(error?.compatibility?.accessMode, readOnly ? "read" : "write");
+          assert.equal(
+            error?.compatibility?.databaseUserVersion,
+            LOCAL_UNIFIED_INDEX_USER_VERSION,
+          );
+          assert.equal(error?.compatibility?.formatUserVersion, nextVersion);
+          assert.equal(error?.compatibility?.requiredUserVersion, nextVersion);
+          assert.deepEqual(
+            error?.compatibility?.requirements.map((entry) => entry.requirement),
+            [
+              "format_user_version",
+              readOnly
+                ? "minimum_reader_user_version"
+                : "minimum_writer_user_version",
+            ],
+          );
+          return true;
+        },
+      );
+      assert.deepEqual(await readFile(indexFile), before);
+    }
+
+    await assert.rejects(
+      ingestLocalUnifiedIndexIncrement({
+        codexHome: root,
+        indexFile,
+        secretFile: join(root, "salt"),
+        contractVersion: CONTRACT,
+      }),
+      (error) => error?.code === "local_unified_index_schema_newer"
+        && error?.compatibility?.accessMode === "write",
+    );
+    assert.deepEqual(await readFile(indexFile), before);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("partial or malformed compatibility metadata is refused without mutation", async (t) => {
+  for (const fixture of ["partial", "malformed"]) {
+    await t.test(fixture, async () => {
+      const { root } = await corpus({
+        [`rollout-2026-07-25T00-00-00-compatibility-${fixture}.jsonl`]: [
+          sessionMeta(`session-compatibility-${fixture}`),
+          turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+          tokenCount(
+            "2026-07-25T00:00:01.000Z",
+            usage(100, 10),
+            usage(100, 10),
+          ),
+        ],
+      });
+      const indexFile = join(root, "index.sqlite");
+      try {
+        await build(root);
+        const { DatabaseSync } = await import("node:sqlite");
+        const database = new DatabaseSync(indexFile);
+        if (fixture === "partial") {
+          database.prepare(`
+            DELETE FROM meta
+            WHERE key = 'compatibility_minimum_writer_user_version'
+          `).run();
+        } else {
+          database.prepare(`
+            UPDATE meta SET value = 'not-a-version'
+            WHERE key = 'compatibility_format_user_version'
+          `).run();
+        }
+        database.close();
+        const before = await readFile(indexFile);
+
+        for (const readOnly of [true, false]) {
+          assert.throws(
+            () => openLocalUnifiedIndex(indexFile, { readOnly }),
+            (error) => error?.code === "local_unified_index_schema_invalid",
+          );
+          assert.deepEqual(await readFile(indexFile), before);
+        }
+        await assert.rejects(
+          ingestLocalUnifiedIndexIncrement({
+            codexHome: root,
+            indexFile,
+            secretFile: join(root, "salt"),
+            contractVersion: CONTRACT,
+          }),
+          (error) => error?.code === "local_unified_index_schema_invalid",
+        );
+        assert.deepEqual(await readFile(indexFile), before);
+      } finally {
+        await rm(root, { recursive: true });
+      }
+    });
+  }
+});
+
+test("minimum reader and writer metadata are enforced for their access modes", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-access-newer.jsonl": [
+      sessionMeta("session-access-newer"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const { DatabaseSync } = await import("node:sqlite");
+    const nextVersion = LOCAL_UNIFIED_INDEX_USER_VERSION + 1;
+    const database = new DatabaseSync(indexFile);
+    database.prepare(`
+      UPDATE meta SET value = ?
+      WHERE key = 'compatibility_minimum_reader_user_version'
+    `).run(String(nextVersion));
+    database.close();
+    const readerBefore = await readFile(indexFile);
+    assert.throws(
+      () => openLocalUnifiedIndex(indexFile, { readOnly: true }),
+      (error) => error?.code === "local_unified_index_schema_newer"
+        && error?.compatibility?.requirements.some((entry) => (
+          entry.requirement === "minimum_reader_user_version"
+        )),
+    );
+    assert.deepEqual(await readFile(indexFile), readerBefore);
+
+    // A separate writer-only fixture proves the writable preflight chooses the
+    // writer requirement and refuses before configureDatabase can touch bytes.
+    const writer = new DatabaseSync(indexFile);
+    writer.prepare(`
+      UPDATE meta SET value = ?
+      WHERE key = 'compatibility_minimum_reader_user_version'
+    `).run(String(LOCAL_UNIFIED_INDEX_USER_VERSION));
+    writer.prepare(`
+      UPDATE meta SET value = ?
+      WHERE key = 'compatibility_minimum_writer_user_version'
+    `).run(String(nextVersion));
+    writer.close();
+    const writerBefore = await readFile(indexFile);
+    assert.throws(
+      () => openLocalUnifiedIndex(indexFile, { readOnly: false }),
+      (error) => error?.code === "local_unified_index_schema_newer"
+        && error?.compatibility?.requirements.some((entry) => (
+          entry.requirement === "minimum_writer_user_version"
+        )),
+    );
+    assert.deepEqual(await readFile(indexFile), writerBefore);
   } finally {
     await rm(root, { recursive: true });
   }

@@ -384,6 +384,22 @@ test("unified reader errors map to closed content-free accounting codes", async 
       expectedGeneration: "generation-test-1",
       now: () => NOW,
       scan: async () => {
+        const error = new Error("private newer-schema detail");
+        error.code = "local_unified_index_schema_newer";
+        throw error;
+      },
+    }),
+    (error) => (
+      error?.code === "local_unified_index_schema_newer"
+      && error?.message === "local_unified_index_schema_newer"
+    ),
+  );
+  await assert.rejects(
+    buildReplaySafeAccountingCache({
+      sourceMode: "unified",
+      expectedGeneration: "generation-test-1",
+      now: () => NOW,
+      scan: async () => {
         const error = new Error("private path and row contents");
         error.code = "local_unified_index_row_invalid";
         throw error;

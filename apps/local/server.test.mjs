@@ -44,11 +44,13 @@ import {
   buildTelemetryContributionsFromBundle,
 } from "../../src/telemetry-contribution-builder.js";
 import {
+  PREVIEW_PRODUCT_BRAND,
   PRODUCT_BRAND,
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../config/product-brand.js";
 import {
   configuredAccountingSourceMode,
+  configuredSemanticOpenTarget,
   createCentralOutboundFetch,
   createLocalCompanionServer,
   resolveClaudeDesktopShadowConfiguration,
@@ -61,6 +63,28 @@ const DEVELOPMENT_COVERAGE = Object.freeze({
 });
 const REVIEW_JOB_ID = "11111111-1111-4111-8111-111111111111";
 const REVIEW_SHA256 = "a".repeat(64);
+
+test("semantic open target is stable by default and accepts only reviewed identities", () => {
+  assert.equal(configuredSemanticOpenTarget({}), PRODUCT_BRAND.appOpenURL);
+  assert.equal(
+    configuredSemanticOpenTarget({
+      USAGE_MONITOR_APP_OPEN_URL: PREVIEW_PRODUCT_BRAND.appOpenURL,
+    }),
+    PREVIEW_PRODUCT_BRAND.appOpenURL,
+  );
+  for (const value of [
+    "",
+    "https://attacker.example/open",
+    "usagemonitor-preview://other",
+  ]) {
+    assert.throws(
+      () => configuredSemanticOpenTarget({
+        USAGE_MONITOR_APP_OPEN_URL: value,
+      }),
+      /must match a reviewed product identity/u,
+    );
+  }
+});
 
 function exactReviewContribution() {
   return buildTelemetryContributionsFromBundle({
@@ -504,6 +528,37 @@ test("loopback server exposes only fixed API, static, and report routes", async 
       `<meta content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}"><meta content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}">`,
     );
     assert.equal((await fetch(`${base}/index.html`)).status, 404);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("preview companion stamps only the preview semantic-open route", async () => {
+  const files = await fixture();
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    environment: {
+      ...process.env,
+      USAGE_MONITOR_APP_OPEN_URL: PREVIEW_PRODUCT_BRAND.appOpenURL,
+    },
+    refreshRunner: async () => ({}),
+    port: 0,
+  });
+  try {
+    const page = await fetch(`http://127.0.0.1:${app.port}/`);
+    assert.equal(page.status, 200);
+    const body = await page.text();
+    assert.match(body, new RegExp(PREVIEW_PRODUCT_BRAND.appOpenURL, "u"));
+    assert.doesNotMatch(body, new RegExp(PRODUCT_BRAND.appOpenURL, "u"));
+    assert.doesNotMatch(
+      body,
+      new RegExp(SEMANTIC_OPEN_TARGET_PLACEHOLDER, "u"),
+    );
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });

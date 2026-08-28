@@ -142,6 +142,10 @@ async function runtimeSourceUrls(relativeDirectory) {
       // closed. This mirrors collectR7ReleaseEvidenceRuntimeSourcePaths in
       // src/r7-release-evidence-schema.js.
       if (name.startsWith(".")) continue;
+      // Scoped AGENTS.md files are repository policy rather than benchmark
+      // runtime. Ignore only this exact basename so arbitrary Markdown inside
+      // an attested runtime tree continues to fail closed.
+      if (name === "AGENTS.md") continue;
       if (metadata.isDirectory()) {
         await visit(new URL(`${name}/`, directory));
       } else if (name === "AGENTS.md") {
@@ -536,10 +540,16 @@ async function prepareCallbackFixture(root) {
   };
 }
 
-function deterministicOperationProjection(operation) {
+export function projectR7DeterministicOperation(operation) {
   const {
     durableElapsedMs: _durableElapsedMs,
     durablePeakRssBytes: _durablePeakRssBytes,
+    // Workspace reservations include the serialized durable resource batch.
+    // Its volatile elapsed/RSS digit width can therefore move this high-water
+    // mark by a few bytes even when every content and lifecycle result is
+    // identical. Keep the measured value in the receipt and ceiling checks,
+    // but exclude it from the content-determinism projection.
+    workspaceHighWaterBytes: _workspaceHighWaterBytes,
     ...deterministicEvidence
   } = operation.evidence;
   return {
@@ -657,7 +667,7 @@ async function runLifecyclePass(root, fixture, options) {
     cleanupInventoryEntryCount: cleanupInventory.entryCount,
     deterministicProjectionSha256: sha256(stableJson({
       fixtureEvidence: fixture.evidence,
-      operations: operations.map(deterministicOperationProjection),
+      operations: operations.map(projectR7DeterministicOperation),
     })),
   };
 }

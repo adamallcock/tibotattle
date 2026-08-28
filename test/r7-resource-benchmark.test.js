@@ -9,6 +9,7 @@ import {
   R7_SELECTION_RULE_VERSION,
   cleanupR7OwnedTree,
   inventoryR7OwnedTree,
+  projectR7DeterministicOperation,
   runR7BenchmarkWorker,
   runR7SmokeBenchmark,
   runR7SmokeEvidence,
@@ -39,6 +40,7 @@ test("R7 smoke provenance binds shared and package runtime sources", async () =>
     return decodeURIComponent(url.href.slice(repositoryRoot.href.length));
   });
   assert.equal(new Set(paths).size, paths.length);
+  assert.equal(paths.some((path) => path.endsWith("/AGENTS.md")), false);
   for (const expected of [
     "packages/accounting/index.js",
     "packages/accounting/package.json",
@@ -66,6 +68,40 @@ const EXPECTED_OPERATIONS = [
   "complete_set_delete_recovery",
   "complete_set_delete",
 ];
+
+test("R7 content determinism excludes volatile workspace-reservation width", () => {
+  const operation = {
+    operation: "source_scan",
+    status: "completed",
+    failureCode: null,
+    evidence: {
+      operationEvidenceSha256: "ab".repeat(32),
+      sourcePlanSha256: "cd".repeat(32),
+      durableElapsedMs: 9,
+      durablePeakRssBytes: 99_999_999,
+      workspaceHighWaterBytes: 1_239_080,
+    },
+  };
+  const widerVolatileBatch = {
+    ...operation,
+    evidence: {
+      ...operation.evidence,
+      durableElapsedMs: 10,
+      durablePeakRssBytes: 100_000_000,
+      workspaceHighWaterBytes: operation.evidence.workspaceHighWaterBytes + 8,
+    },
+  };
+
+  assert.deepEqual(
+    projectR7DeterministicOperation(operation),
+    projectR7DeterministicOperation(widerVolatileBatch),
+  );
+  assert.notEqual(
+    operation.evidence.workspaceHighWaterBytes,
+    widerVolatileBatch.evidence.workspaceHighWaterBytes,
+    "the measured resource metric remains available outside the projection",
+  );
+});
 
 test("R7 worker retains allow-listed subsystem codes and discards arbitrary errors", async (t) => {
   const parent = await mkdtemp(join(tmpdir(), "usage-monitor-r7-fixed-code-"));

@@ -70,6 +70,13 @@ export const DEPLOYMENT_ENDPOINTS = Object.freeze({
   sparkle: Object.freeze({
     appcastURL: new URL("/appcast.xml", sparkleUpdateOriginURL).href,
     origin: sparkleUpdateOriginURL.origin,
+    // Preview is a separately identified client and must never consume the
+    // stable appcast. Keeping the dedicated path in the reviewed endpoint
+    // manifest prevents the native build and deployment checks from drifting.
+    previewAppcastURL: new URL(
+      "/preview/appcast.xml",
+      sparkleUpdateOriginURL,
+    ).href,
     r2Bucket: "tibotattle-updates",
   }),
 });
@@ -107,6 +114,12 @@ export function assertDeploymentEndpoints(
   if (endpoints.sparkle?.appcastURL
       !== new URL("/appcast.xml", reviewedSparkleOrigin).href) {
     throw new TypeError("Sparkle appcast URL must be derived from its origin");
+  }
+  if (endpoints.sparkle?.previewAppcastURL
+      !== new URL("/preview/appcast.xml", reviewedSparkleOrigin).href) {
+    throw new TypeError(
+      "Sparkle preview appcast URL must be derived from its origin",
+    );
   }
   if (typeof endpoints.sparkle?.r2Bucket !== "string"
       || !/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/u.test(

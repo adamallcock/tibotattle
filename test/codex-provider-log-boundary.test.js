@@ -30,6 +30,7 @@ const PROVIDER_PUBLIC_EXPORTS = [
   "canonicalRateLimitWindows",
   "classifySessionSurface",
   "classifyToolCall",
+  "codexSessionMetaIdentity",
   "codexRolloutDiscoveryReceipt",
   "codexSessionMetaIdentity",
   "createCodexLogScanner",
@@ -89,6 +90,12 @@ const LEGACY_PURE_PROVIDER_BINDINGS = [
   "sameUsage",
   "subtractUsage",
   "tokenComponentPresence",
+];
+
+const PROVIDER_NORMALIZATION_BINDINGS = [
+  ...LEGACY_PURE_PROVIDER_BINDINGS,
+  "canonicalRateLimitSnapshot",
+  "codexSessionMetaIdentity",
 ];
 
 const TIER_PROVIDER_BINDINGS = [
@@ -171,7 +178,7 @@ test("the local Node composition exposes only bound scanner operations", () => {
 });
 
 test("the Codex log facade re-exports each pure provider binding by identity", () => {
-  for (const binding of LEGACY_PURE_PROVIDER_BINDINGS) {
+  for (const binding of PROVIDER_NORMALIZATION_BINDINGS) {
     assert.equal(
       providerLogs[binding],
       providerNormalization[binding],

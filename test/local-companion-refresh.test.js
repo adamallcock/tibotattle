@@ -2944,6 +2944,10 @@ test("refresh controller exposes only allowlisted unified-index failure codes", 
       expected: "local_unified_index_file_changed",
     },
     {
+      input: "local_unified_index_schema_newer",
+      expected: "local_unified_index_schema_newer",
+    },
+    {
       input: "local_unified_index_private_path_detail",
       expected: "local_unified_index_refresh_failed",
     },

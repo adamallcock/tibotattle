@@ -53,6 +53,90 @@ const SECURITY_PATH = "/usr/bin/security";
 // errSecItemNotFound surfaces from the security CLI as exit status 44.
 const SECURITY_ITEM_NOT_FOUND_STATUS = 44;
 
+const EXPORT_IDENTITY_KEYCHAIN_NAMESPACE_ENVIRONMENT_VARIABLE =
+  "USAGE_MONITOR_KEYCHAIN_NAMESPACE";
+const EXPORT_IDENTITY_KEYCHAIN_ACCOUNT_ENVIRONMENT_VARIABLE =
+  "USAGE_MONITOR_KEYCHAIN_ACCOUNT";
+
+const STABLE_KEYCHAIN_IDENTITY = Object.freeze({
+  namespace: "app-usagemonitor",
+  account: "installation",
+});
+const PREVIEW_KEYCHAIN_IDENTITY = Object.freeze({
+  namespace: "app-usagemonitor.preview",
+  account: "preview-installation",
+});
+
+// The central capability module remains the only source of service suffixes
+// and logical capability membership. Channel selection changes only the
+// reviewed namespace/account pair, and only after the native bundle has
+// supplied one of the two exact identities below.
+function remapKeychainCapabilities(capabilities, identity) {
+  return Object.freeze(Object.fromEntries(
+    Object.entries(capabilities).map(([name, pair]) => {
+      const stablePrefix = `${STABLE_KEYCHAIN_IDENTITY.namespace}.`;
+      if (pair.account !== STABLE_KEYCHAIN_IDENTITY.account
+          || !pair.service.startsWith(stablePrefix)) {
+        throw new TypeError("Keychain capability identity is not canonical");
+      }
+      return [
+        name,
+        Object.freeze({
+          service: `${identity.namespace}.${pair.service.slice(stablePrefix.length)}`,
+          account: identity.account,
+        }),
+      ];
+    }),
+  ));
+}
+
+const PREVIEW_EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES =
+  remapKeychainCapabilities(
+    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
+    PREVIEW_KEYCHAIN_IDENTITY,
+  );
+const PREVIEW_MACOS_APP_KEYCHAIN_CAPABILITIES =
+  remapKeychainCapabilities(
+    MACOS_APP_KEYCHAIN_CAPABILITIES,
+    PREVIEW_KEYCHAIN_IDENTITY,
+  );
+
+function selectedKeychainIdentity(environment) {
+  if (!environment || typeof environment !== "object"
+      || Array.isArray(environment)) {
+    fail("invalid_configuration");
+  }
+  const namespace =
+    environment[EXPORT_IDENTITY_KEYCHAIN_NAMESPACE_ENVIRONMENT_VARIABLE];
+  const account =
+    environment[EXPORT_IDENTITY_KEYCHAIN_ACCOUNT_ENVIRONMENT_VARIABLE];
+  if (namespace === undefined && account === undefined) {
+    return STABLE_KEYCHAIN_IDENTITY;
+  }
+  if (namespace === STABLE_KEYCHAIN_IDENTITY.namespace
+      && account === STABLE_KEYCHAIN_IDENTITY.account) {
+    return STABLE_KEYCHAIN_IDENTITY;
+  }
+  if (namespace === PREVIEW_KEYCHAIN_IDENTITY.namespace
+      && account === PREVIEW_KEYCHAIN_IDENTITY.account) {
+    return PREVIEW_KEYCHAIN_IDENTITY;
+  }
+  fail("invalid_configuration");
+}
+
+/**
+ * Select one of the two reviewed Keychain identities injected by the native
+ * bundle. No service or account string supplied by an operator is ever used
+ * directly: the environment can only select an exact, sealed pair, and local
+ * development with neither value present retains the historical stable pair.
+ */
+export function exportIdentityKeychainCapabilitiesForEnvironment(
+  environment = process.env,
+) {
+  return selectedKeychainIdentity(environment) === STABLE_KEYCHAIN_IDENTITY
+    ? EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES
+    : PREVIEW_EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES;
+}
 const ERROR_CODES = new Set([
   "unsupported_platform",
   "unsupported_architecture",
@@ -294,23 +378,17 @@ export function loadExportIdentityKeychainBinding(options = {}) {
   }
 }
 
-function capabilityPair(capability) {
-  if (capability === EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity) {
-    return EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity;
-  }
-  if (capability === EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation) {
-    return EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation;
-  }
-  if (capability === EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.claudeSessionPseudonym) {
-    return EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.claudeSessionPseudonym;
-  }
-  if (capability === EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice) {
-    return EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice;
-  }
-  if (capability === EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp) {
-    return EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp;
+function capabilityName(capability, capabilitySet) {
+  for (const name of Object.keys(capabilitySet)) {
+    if (capability === capabilitySet[name]) return name;
   }
   fail("invalid_capability");
+}
+
+function capabilityPair(capability) {
+  return EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES[
+    capabilityName(capability, EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES)
+  ];
 }
 
 function attributeCapabilityPair(capability) {
@@ -318,6 +396,50 @@ function attributeCapabilityPair(capability) {
     if (capability === pair) return pair;
   }
   return capabilityPair(capability);
+}
+
+// Attribute-addressed helpers operate on an already selected physical pair.
+// Only central semantic tokens or objects from the selected preview set are
+// accepted; a caller can never smuggle an arbitrary service/account object
+// into `security`.
+function selectedAttributeCapabilityPair(capability, environment) {
+  const identity = selectedKeychainIdentity(environment);
+  if (identity === STABLE_KEYCHAIN_IDENTITY) {
+    return attributeCapabilityPair(capability);
+  }
+  for (const name of Object.keys(EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES)) {
+    if (capability === EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES[name]) {
+      return PREVIEW_EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES[name];
+    }
+  }
+  for (const name of Object.keys(MACOS_APP_KEYCHAIN_CAPABILITIES)) {
+    if (capability === MACOS_APP_KEYCHAIN_CAPABILITIES[name]) {
+      return PREVIEW_MACOS_APP_KEYCHAIN_CAPABILITIES[name];
+    }
+  }
+  for (const selectedCapabilities of [
+    PREVIEW_EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
+    PREVIEW_MACOS_APP_KEYCHAIN_CAPABILITIES,
+  ]) {
+    for (const name of Object.keys(selectedCapabilities)) {
+      if (capability === selectedCapabilities[name]) {
+        return selectedCapabilities[name];
+      }
+    }
+  }
+  fail("invalid_capability");
+}
+
+function backendCapabilityPair(capability, selectedCapabilities) {
+  // Runtime callers use the historical stable objects as semantic tokens.
+  // The sealed native environment selects their physical namespace. Preview
+  // objects are deliberately not accepted through this runtime API, so one
+  // channel can never ask a backend configured for the other to cross over.
+  const name = capabilityName(
+    capability,
+    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
+  );
+  return Object.freeze({ name, pair: selectedCapabilities[name] });
 }
 
 function copySecret(secret) {
@@ -424,11 +546,15 @@ export function createExportIdentityKeychainBackend(options = {}) {
     // local-review callers retain the audited keytar binding without pulling
     // a network-capable socket module into the offline review artifact.
     loadBrokerBinding = () => null,
+    environment = process.env,
   } = options;
   if (typeof loadBinding !== "function"
       || typeof loadBrokerBinding !== "function") fail("invalid_configuration");
+  const configuredCapabilities =
+    exportIdentityKeychainCapabilitiesForEnvironment(environment);
   const durableMint = normalizeDurableAccess(durableAccess);
   let selectedBinding = binding;
+  let selectedCapabilities = configuredCapabilities;
   if (selectedBinding === undefined) {
     try {
       // A broker announcement is authoritative: every packaged-app
@@ -436,7 +562,17 @@ export function createExportIdentityKeychainBackend(options = {}) {
       // app. A malformed or dead announcement must fail closed and may never
       // fall back to keytar, which would recreate the duplicate native stack
       // (and its update-fragile ACL) inside the bundle.
-      selectedBinding = loadBrokerBinding() ?? loadBinding();
+      const brokerBinding = loadBrokerBinding();
+      if (brokerBinding !== null && brokerBinding !== undefined) {
+        selectedBinding = brokerBinding;
+        // Broker bindings address logical capabilities. The signed app owns
+        // channel-specific physical attributes, so passing remapped pairs
+        // across the private wire would both duplicate policy and fail the
+        // broker's closed capability check.
+        selectedCapabilities = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES;
+      } else {
+        selectedBinding = loadBinding();
+      }
     } catch (error) {
       if (error instanceof ExportIdentityKeychainError) throw error;
       fail("binding_unavailable");
@@ -457,9 +593,9 @@ export function createExportIdentityKeychainBackend(options = {}) {
   // durable access is configured; if that invocation is unavailable or fails,
   // it falls back to keytar's default ACL so availability never regresses below
   // today's behaviour. Every other capability always uses keytar.
-  async function writeSecret(pair, secretString) {
+  async function writeSecret(name, pair, secretString) {
     if (durableMint !== null
-        && pair === EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice) {
+        && name === "contributionDevice") {
       let status;
       try {
         const outcome = durableMint.runCommand(
@@ -486,12 +622,12 @@ export function createExportIdentityKeychainBackend(options = {}) {
   }
 
   async function describe(capability) {
-    capabilityPair(capability);
+    backendCapabilityPair(capability, selectedCapabilities);
     return Object.freeze({ backend: "macos_keychain", status: "available" });
   }
 
   async function readInternal(capability, invalidCode = "stored_value_invalid") {
-    const pair = capabilityPair(capability);
+    const { pair } = backendCapabilityPair(capability, selectedCapabilities);
     const stored = await invoke("getPassword", pair.service, pair.account);
     if (stored === null) return null;
     return decodeStoredSecret(stored, invalidCode);
@@ -508,7 +644,10 @@ export function createExportIdentityKeychainBackend(options = {}) {
   }
 
   async function createIfMissing(capability, generatedSecret) {
-    const pair = capabilityPair(capability);
+    const { name, pair } = backendCapabilityPair(
+      capability,
+      selectedCapabilities,
+    );
     let generated = null;
     let existing = null;
     let readback = null;
@@ -516,7 +655,7 @@ export function createExportIdentityKeychainBackend(options = {}) {
       generated = copySecret(generatedSecret);
       existing = await readInternal(capability);
       if (existing !== null) return "existing";
-      await writeSecret(pair, generated.toString("base64url"));
+      await writeSecret(name, pair, generated.toString("base64url"));
       readback = await readInternal(capability, "readback_mismatch");
       if (readback === null || !sameSecret(readback, generated)) fail("readback_mismatch");
       return "created";
@@ -528,7 +667,7 @@ export function createExportIdentityKeychainBackend(options = {}) {
   }
 
   async function replaceExact(capability, expectedSecret, replacementSecret) {
-    const pair = capabilityPair(capability);
+    const { pair } = backendCapabilityPair(capability, selectedCapabilities);
     let expected = null;
     let replacement = null;
     let current = null;
@@ -552,7 +691,7 @@ export function createExportIdentityKeychainBackend(options = {}) {
   }
 
   async function deleteExact(capability, expectedSecret) {
-    const pair = capabilityPair(capability);
+    const { pair } = backendCapabilityPair(capability, selectedCapabilities);
     let expected = null;
     let current = null;
     let readback = null;
@@ -583,8 +722,11 @@ export function createExportIdentityKeychainBackend(options = {}) {
  * a read cannot (verified live 2026-08-10 against a credential the updated
  * app could no longer read).
  */
-export function exportIdentityKeychainAttributeDeleteArguments(capability) {
-  const pair = attributeCapabilityPair(capability);
+export function exportIdentityKeychainAttributeDeleteArguments(
+  capability,
+  environment = process.env,
+) {
+  const pair = selectedAttributeCapabilityPair(capability, environment);
   return Object.freeze([
     "delete-generic-password",
     "-s",
@@ -601,8 +743,11 @@ export function exportIdentityKeychainAttributeDeleteArguments(capability) {
  * like the attribute delete — it needs neither the native binding nor the
  * item's access control list, and it cannot raise the partition/ACL dialog.
  */
-export function exportIdentityKeychainAttributeProbeArguments(capability) {
-  const pair = attributeCapabilityPair(capability);
+export function exportIdentityKeychainAttributeProbeArguments(
+  capability,
+  environment = process.env,
+) {
+  const pair = selectedAttributeCapabilityPair(capability, environment);
   return Object.freeze([
     "find-generic-password",
     "-s",
@@ -636,11 +781,12 @@ export function deleteExportIdentityKeychainItemByAttributes(
     fail("invalid_configuration");
   }
   const {
+    environment = process.env,
     platform = process.platform,
     runCommand = defaultRunAttributeDeleteCommand,
   } = options;
   const commandArguments =
-    exportIdentityKeychainAttributeDeleteArguments(capability);
+    exportIdentityKeychainAttributeDeleteArguments(capability, environment);
   if (platform !== "darwin") fail("unsupported_platform");
   if (typeof runCommand !== "function") fail("invalid_configuration");
   let outcome;
@@ -673,11 +819,12 @@ export function exportIdentityKeychainItemPresenceByAttributes(
     fail("invalid_configuration");
   }
   const {
+    environment = process.env,
     platform = process.platform,
     runCommand = defaultRunAttributeDeleteCommand,
   } = options;
   const commandArguments =
-    exportIdentityKeychainAttributeProbeArguments(capability);
+    exportIdentityKeychainAttributeProbeArguments(capability, environment);
   if (platform !== "darwin" || typeof runCommand !== "function") {
     return "unknown";
   }

@@ -2124,7 +2124,16 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
         .events,
       3,
     );
-    assert.equal(toolPartialSnapshot.overview.tools.total, 0);
+    assert.equal(toolPartialSnapshot.overview.tools.status, "unavailable");
+    assert.equal(
+      toolPartialSnapshot.overview.tools.reason,
+      "typed_tool_history_partial",
+    );
+    assert.equal(toolPartialSnapshot.overview.tools.total, null);
+    assert.equal(toolPartialSnapshot.overview.activity.toolEvents, null);
+    assert.ok(Object.values(toolPartialSnapshot.overview.tools.counts).every(
+      (value) => value === null,
+    ));
     assert.ok(toolPartialSnapshot.overview.warnings.some((warning) => (
       warning.includes("typed tool history is partial")
     )));
@@ -2410,7 +2419,9 @@ test("unified mode with no valid generation withholds the provisional collector 
     );
     assert.equal(snapshot.overview.pricing.totalCostUsd, 0);
     assert.equal(snapshot.overview.pricing.eventCount, 0);
-    assert.equal(snapshot.overview.tools.total, 0);
+    assert.equal(snapshot.overview.tools.status, "unavailable");
+    assert.equal(snapshot.overview.tools.total, null);
+    assert.equal(snapshot.overview.activity.toolEvents, null);
     assert.deepEqual(snapshot.overview.collector.exportableCoveredAt, {
       startAt: null,
       endAt: null,

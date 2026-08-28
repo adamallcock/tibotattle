@@ -114,6 +114,7 @@ import {
   selectProductionAccountObservationSecret,
 } from "../../src/account-observation-production.js";
 import {
+  PREVIEW_PRODUCT_BRAND,
   PRODUCT_BRAND,
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../config/product-brand.js";
@@ -693,8 +694,8 @@ export async function readRecentDiagnosticReferences({
  * is kept; when it cannot — the exact disease this route cures — the
  * credential is deleted by its fixed attributes instead, which never needs
  * the secret (verified live 2026-08-10). Only local things are removed: the
- * app-usagemonitor.contribution-device.v1 / installation Keychain entry and
- * the binding state file (plus its pre-rename legacy twin, whose leftover
+ * this bundle's sealed contribution-device Keychain entries and the binding
+ * state file (plus its pre-rename legacy twin, whose leftover
  * would otherwise wedge the next pairing). It contacts no network, revokes
  * no hosted device, and deletes no contributed metadata; the hosted side is
  * unaware of it.
@@ -1518,7 +1519,23 @@ async function readFixedFile(root, file, maximumBytes) {
   return readFile(path);
 }
 
-function stampSemanticOpenTarget(body) {
+const ALLOWED_SEMANTIC_OPEN_TARGETS = new Set([
+  PRODUCT_BRAND.appOpenURL,
+  PREVIEW_PRODUCT_BRAND.appOpenURL,
+]);
+
+export function configuredSemanticOpenTarget(environment = process.env) {
+  const value = environment?.USAGE_MONITOR_APP_OPEN_URL
+    ?? PRODUCT_BRAND.appOpenURL;
+  if (typeof value !== "string" || !ALLOWED_SEMANTIC_OPEN_TARGETS.has(value)) {
+    throw new Error(
+      "USAGE_MONITOR_APP_OPEN_URL must match a reviewed product identity",
+    );
+  }
+  return value;
+}
+
+function stampSemanticOpenTarget(body, semanticOpenTarget) {
   const source = body.toString("utf8");
   const first = source.indexOf(SEMANTIC_OPEN_TARGET_PLACEHOLDER);
   if (first < 0
@@ -1533,7 +1550,7 @@ function stampSemanticOpenTarget(body) {
   return Buffer.from(
     source.replace(
       SEMANTIC_OPEN_TARGET_PLACEHOLDER,
-      PRODUCT_BRAND.appOpenURL,
+      semanticOpenTarget,
     ),
   );
 }
@@ -1553,8 +1570,10 @@ function stampReleaseVersion(body) {
   return Buffer.from(source.replace(RELEASE_VERSION_PLACEHOLDER, RELEASE_VERSION));
 }
 
-function stampLocalDashboard(body) {
-  return stampReleaseVersion(stampSemanticOpenTarget(body));
+function stampLocalDashboard(body, semanticOpenTarget) {
+  return stampReleaseVersion(
+    stampSemanticOpenTarget(body, semanticOpenTarget),
+  );
 }
 
 function finiteNonNegativeInteger(value) {
@@ -2318,6 +2337,7 @@ export function createLocalCompanionServer(options = {}) {
       || Array.isArray(environment)) {
     throw new TypeError("environment must be an object");
   }
+  const semanticOpenTarget = configuredSemanticOpenTarget(environment);
   const parentWatchdogPid = configuredParentWatchdogPid(environment);
   const homeDirectory = configuredHomeDirectory(environment);
   // A malformed provider path must not make the ordinary disabled companion
@@ -2439,6 +2459,7 @@ export function createLocalCompanionServer(options = {}) {
     contributionPreparationOptions: selectedPreparationOptions,
     parentWatchdogPid,
     homeDirectory,
+    semanticOpenTarget,
     ...claudeShadowConfiguration,
   });
 }
@@ -2455,6 +2476,7 @@ function createPreparedLocalCompanionServer({
   claudeProjectDirectory,
   diagnosticsLogFile,
   parentWatchdogPid,
+  semanticOpenTarget,
   // Explicit reversible authority switch. Unified is the normal authority;
   // legacy is retained only for an explicit rollback selection.
   accountingSourceMode =
@@ -2472,6 +2494,7 @@ function createPreparedLocalCompanionServer({
     configFile: join(codexHome, "config.toml"),
   }),
   dataStore = new LocalCompanionDataStore({
+    snapshotFile: statePaths.authoritativeDashboardSnapshotFile,
     builder: async ({ purpose = "full" } = {}) => buildLocalCompanionSnapshot({
       root: resourceRoot,
       collectorStateFile: statePaths.collectorStateFile,
@@ -4268,7 +4291,7 @@ function createPreparedLocalCompanionServer({
             MAX_STATIC_BYTES,
           );
           const body = staticFile.file === "index.html"
-            ? stampLocalDashboard(source)
+            ? stampLocalDashboard(source, semanticOpenTarget)
             : source;
           send(response, 200, body, staticFile.type);
         } catch {

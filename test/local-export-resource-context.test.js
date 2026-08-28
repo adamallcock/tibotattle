@@ -69,6 +69,7 @@ const PLATFORM_PUBLIC_EXPORTS = Object.freeze([
   "encodeParticipantSecret",
   "exportIdentityKeychainAttributeDeleteArguments",
   "exportIdentityKeychainAttributeProbeArguments",
+  "exportIdentityKeychainCapabilitiesForEnvironment",
   "exportIdentityKeychainItemPresenceByAttributes",
   "inspectParticipantSecret",
   "keytarSignedBindingRequirement",

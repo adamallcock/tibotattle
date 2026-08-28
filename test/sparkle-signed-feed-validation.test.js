@@ -165,6 +165,32 @@ test("works without a public key (structure-only) and without dmg context", () =
   assert.equal(validated.bundleVersion, "1");
 });
 
+test("signed-feed and publisher gates reject out-of-contract bundle versions", () => {
+  for (const bundleVersion of [
+    "0",
+    "0.1.16",
+    "0.1.17",
+    "0.2.0",
+    "01",
+    "12345",
+    "1.100",
+    "1.2.100",
+    "1.2.3.4",
+  ]) {
+    const text = officialSignedAppcastText({ bundleVersion });
+    assert.throws(
+      () => validate(text),
+      { code: "SPARKLE_SIGNED_FEED_SHAPE_INVALID" },
+      bundleVersion,
+    );
+    assert.throws(
+      () => validateCandidateAppcastShape(text, "stable"),
+      { code: "SPARKLE_UPDATE_APPCAST_OBJECT_PATH_INVALID" },
+      bundleVersion,
+    );
+  }
+});
+
 test("rejects a title tampered after signing (envelope no longer verifies)", () => {
   // Same-length swap: the declared trailer length still matches, so the
   // named failure is specifically the Ed25519 envelope.

@@ -35,7 +35,10 @@ import {
   assertDeploymentEndpoints,
   DEPLOYMENT_ENDPOINTS,
 } from "../config/deployment-endpoints.js";
-import { PRODUCT_BRAND } from "../config/product-brand.js";
+import {
+  PREVIEW_PRODUCT_BRAND,
+  PRODUCT_BRAND,
+} from "../config/product-brand.js";
 import {
   assertReleaseChannelConfiguration,
   resolveReleaseChannel,
@@ -49,6 +52,10 @@ import {
   normalizeMacOSUpdaterConfiguration,
   normalizeMacOSUpdaterMetadata,
 } from "./macos-updater-core.js";
+import {
+  deriveEpochMacOSBundleVersion,
+  isAppleMacOSBundleVersion,
+} from "./macos-bundle-version.js";
 import {
   readVerifiedTelemetryBrowserMirror,
 } from "./generate-telemetry-browser-mirror.js";
@@ -87,9 +94,23 @@ const WEB_MODULE_ROOT = join(
 const PINNED_NODE_VERSION = "v26.2.0";
 const PINNED_NODE_ARCHITECTURE = "arm64";
 const MINIMUM_MACOS_VERSION = "14.0";
-const BUNDLE_VERSION = "1";
 const PACKAGE_NAME = "app-usagemonitor";
 const SHORT_VERSION = RELEASE_VERSION;
+// Unsigned development and separately identified Preview builds use a
+// deterministic first-component epoch. Signed stable-identity builds instead
+// receive an explicit channel allocation from macos-release-core, so a preview
+// can never advance or strand the stable Sparkle line.
+export function deriveMacOSBundleVersion(releaseVersion = SHORT_VERSION) {
+  const derived = deriveEpochMacOSBundleVersion(releaseVersion);
+  if (derived === null) {
+    fail(
+      "Release version cannot be converted to the reviewed Apple-compatible macOS bundle-version epoch",
+      "MACOS_BUNDLE_VERSION_DERIVATION_FAILED",
+    );
+  }
+  return derived;
+}
+const BUNDLE_VERSION = deriveMacOSBundleVersion();
 const LOOPBACK_HOST = "127.0.0.1";
 const CENTRAL_ORIGIN_MODE_NONE = "not_configured";
 const CENTRAL_ORIGIN_MODE_HTTPS = "production_https";
@@ -119,6 +140,16 @@ const NORMALIZED_MACH_O_PATHS = new Set([
     (path) => `${SPARKLE_FRAMEWORK_PREFIX}/${path}`,
   ),
 ]);
+// Preview bundles built before the broker-only Keychain boundary carried this
+// one native addon. It was part of the reviewed normalization set at build
+// time, so a still-valid older Preview manifest must be checked using that
+// same signature-independent representation before it can be replaced. Keep
+// this separate from NORMALIZED_MACH_O_PATHS: new inventories are derived only
+// from the current source/runtime graph and must never restore retired keytar.
+const RETIRED_PREVIEW_NORMALIZED_MACH_O_PATHS = new Set([
+  "Contents/Resources/app/node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
+]);
+const NO_COMPATIBILITY_NORMALIZED_MACH_O_PATHS = new Set();
 const ICON_ASSET = join(
   REPOSITORY_ROOT,
   "apps",
@@ -141,7 +172,7 @@ const DEFAULT_PREVIEW_STAGING_ROOT = join(
 );
 const DEFAULT_PREVIEW_OUTPUT = join(
   DEFAULT_PREVIEW_STAGING_ROOT,
-  PRODUCT_BRAND.bundleName,
+  PREVIEW_PRODUCT_BRAND.bundleName,
 );
 const DEFAULT_PREVIEW_FRAMEWORK = join(
   REPOSITORY_ROOT,
@@ -174,12 +205,35 @@ const MACOS_RELEASE_BUILD_AUTHORIZATION = Symbol(
 // an external channel (including internal-dogfood).
 export const MACOS_PREVIEW_PUBLIC_CONFIGURATION = Object.freeze({
   centralOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
-  sparkleAppcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
+  // Preview may exercise the public service, but it must never read stable's
+  // appcast. This dedicated path can remain unpublished; a missing preview
+  // feed is safer than silently offering a stable replacement.
+  sparkleAppcastURL: DEPLOYMENT_ENDPOINTS.sparkle.previewAppcastURL,
   sparklePublicEdKey: "jhgPwmvWLMr7TGURJUoi6sXias7YP1F+hejZawKVTGw=",
 });
+const MACOS_PREVIEW_APPCAST_PATH = "/preview/appcast.xml";
 
 export const MACOS_PREVIEW_DISTRIBUTION_CHANNEL =
   DISTRIBUTION_CHANNEL_PREVIEW;
+
+function assertMacOSPreviewAppcastBoundary(value) {
+  let selected;
+  try {
+    selected = new URL(value);
+  } catch {
+    fail(
+      "Preview distribution requires the reviewed /preview/appcast.xml path",
+      "MACOS_PREVIEW_FEED_PATH_INVALID",
+    );
+  }
+  if (selected.pathname !== MACOS_PREVIEW_APPCAST_PATH) {
+    fail(
+      "Preview distribution requires the reviewed /preview/appcast.xml path",
+      "MACOS_PREVIEW_FEED_PATH_INVALID",
+    );
+  }
+  return value;
+}
 
 export const MACOS_WEB_MODULE_ENTRYPOINTS = Object.freeze([
   "apps/web/public/app.js",
@@ -379,6 +433,33 @@ function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function normalizeSealedMacOSReleaseSource(source, { required }) {
+  if (!required) {
+    if (source !== null) {
+      fail(
+        "Only external release builds may seal release source identity",
+        "MACOS_RELEASE_SOURCE_FORBIDDEN",
+      );
+    }
+    return null;
+  }
+  if (!source || typeof source !== "object" || Array.isArray(source)
+      || Object.keys(source).sort().join(",") !== "commit,tag"
+      || typeof source.commit !== "string"
+      || !/^[0-9a-f]{40,64}$/u.test(source.commit)
+      || typeof source.tag !== "string"
+      || !/^[0-9A-Za-z][0-9A-Za-z._/-]{0,127}$/u.test(source.tag)
+      || source.tag.includes("..")
+      || source.tag.startsWith("/")
+      || source.tag.endsWith("/")) {
+    fail(
+      "External release build source identity is invalid",
+      "MACOS_RELEASE_SOURCE_INVALID",
+    );
+  }
+  return Object.freeze({ commit: source.commit, tag: source.tag });
+}
+
 export function normalizeMacOSCentralOrigin(
   value,
   { allowLoopbackCentralOrigin = false } = {},
@@ -466,11 +547,9 @@ function normalizeMacOSReleaseChannelOrigin(channel) {
 }
 
 export function normalizeMacOSBundleVersion(value = BUNDLE_VERSION) {
-  if (typeof value !== "string"
-      || !/^(?:0|[1-9][0-9]{0,8})(?:\.(?:0|[1-9][0-9]{0,8})){0,2}$/u
-        .test(value)) {
+  if (!isAppleMacOSBundleVersion(value)) {
     fail(
-      "Bundle version must contain one to three non-negative decimal components",
+      "Bundle version must use an Apple-compatible positive 1-4 digit major and optional 1-2 digit minor and patch components",
     );
   }
   return value;
@@ -1642,6 +1721,7 @@ function infoPlist(centralService, {
   bundleVersion,
   distribution,
   iconIncluded,
+  productBrand,
   publicWebsiteOrigin = DEPLOYMENT_ENDPOINTS.public.origin,
   releaseChannelName,
   updater,
@@ -1698,15 +1778,15 @@ function infoPlist(centralService, {
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleDisplayName</key>
-  <string>${xmlString(PRODUCT_BRAND.displayName)}</string>
+  <string>${xmlString(productBrand.displayName)}</string>
   <key>CFBundleExecutable</key>
-  <string>${xmlString(PRODUCT_BRAND.executableName)}</string>
+  <string>${xmlString(productBrand.executableName)}</string>
   <key>CFBundleIdentifier</key>
-  <string>${xmlString(PRODUCT_BRAND.bundleIdentifier)}</string>
+  <string>${xmlString(productBrand.bundleIdentifier)}</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
-  <string>${xmlString(PRODUCT_BRAND.displayName)}</string>
+  <string>${xmlString(productBrand.displayName)}</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
@@ -1720,30 +1800,34 @@ function infoPlist(centralService, {
       <string>Viewer</string>
       <key>CFBundleURLName</key>
       <string>${xmlString(
-        `${PRODUCT_BRAND.bundleIdentifier}.${PRODUCT_BRAND.appOpenHost}`,
+        `${productBrand.bundleIdentifier}.${productBrand.appOpenHost}`,
       )}</string>
       <key>CFBundleURLSchemes</key>
       <array>
-        <string>${xmlString(PRODUCT_BRAND.appOpenScheme)}</string>
+        <string>${xmlString(productBrand.appOpenScheme)}</string>
       </array>
     </dict>
   </array>
   <key>UsageMonitorAppOpenHost</key>
-  <string>${xmlString(PRODUCT_BRAND.appOpenHost)}</string>
+  <string>${xmlString(productBrand.appOpenHost)}</string>
   <key>UsageMonitorAppOpenScheme</key>
-  <string>${xmlString(PRODUCT_BRAND.appOpenScheme)}</string>
+  <string>${xmlString(productBrand.appOpenScheme)}</string>
   <key>UsageMonitorAppOpenURL</key>
-  <string>${xmlString(PRODUCT_BRAND.appOpenURL)}</string>
+  <string>${xmlString(productBrand.appOpenURL)}</string>
   <key>UsageMonitorBundleName</key>
-  <string>${xmlString(PRODUCT_BRAND.bundleName)}</string>
+  <string>${xmlString(productBrand.bundleName)}</string>
   <key>UsageMonitorMonitoredAppBundleIdentifier</key>
-  <string>${xmlString(PRODUCT_BRAND.monitoredAppBundleIdentifier)}</string>
+  <string>${xmlString(productBrand.monitoredAppBundleIdentifier)}</string>
   <key>UsageMonitorMonitoredAppDisplayName</key>
-  <string>${xmlString(PRODUCT_BRAND.monitoredAppDisplayName)}</string>
+  <string>${xmlString(productBrand.monitoredAppDisplayName)}</string>
   <key>UsageMonitorNodeRuntimeMode</key>
   <string>standard</string>
   <key>UsageMonitorStateDirectoryName</key>
-  <string>${xmlString(PRODUCT_BRAND.stateDirectoryName)}</string>
+  <string>${xmlString(productBrand.stateDirectoryName)}</string>
+  <key>UsageMonitorKeychainNamespace</key>
+  <string>${xmlString(productBrand.keychainNamespace)}</string>
+  <key>UsageMonitorKeychainAccount</key>
+  <string>${xmlString(productBrand.keychainAccount)}</string>
   <key>LSApplicationCategoryType</key>
   <string>public.app-category.utilities</string>
   <key>LSMinimumSystemVersion</key>
@@ -2493,7 +2577,36 @@ async function normalizedMachOBytes(file) {
   }
 }
 
-async function bundleInventory(appBundle, manifestPath, updater) {
+function previewCompatibilityNormalizedMachOPaths(manifest) {
+  const files = manifest?.payload?.files;
+  if (!Array.isArray(files)) {
+    return NO_COMPATIBILITY_NORMALIZED_MACH_O_PATHS;
+  }
+  const retiredEntries = files.filter((entry) =>
+    RETIRED_PREVIEW_NORMALIZED_MACH_O_PATHS.has(entry?.path));
+  if (retiredEntries.length === 0) {
+    return NO_COMPATIBILITY_NORMALIZED_MACH_O_PATHS;
+  }
+  if (retiredEntries.length !== RETIRED_PREVIEW_NORMALIZED_MACH_O_PATHS.size
+      || retiredEntries.some((entry) =>
+        entry.normalization !== "mach_o_without_code_signature")) {
+    fail(
+      "Preview application uses an invalid retired Mach-O normalization",
+      "MACOS_PAYLOAD_INTEGRITY_FAILED",
+    );
+  }
+  return RETIRED_PREVIEW_NORMALIZED_MACH_O_PATHS;
+}
+
+async function bundleInventory(
+  appBundle,
+  manifestPath,
+  updater,
+  {
+    compatibilityNormalizedMachOPaths =
+      NO_COMPATIBILITY_NORMALIZED_MACH_O_PATHS,
+  } = {},
+) {
   const links = [];
   const files = (await walkFiles(appBundle, appBundle, {
     allowPinnedSparkleLinks: updater.enabled,
@@ -2520,6 +2633,7 @@ async function bundleInventory(appBundle, manifestPath, updater) {
     const path = relative(appBundle, file).split(sep).join("/");
     const metadata = await lstat(file);
     const normalization = NORMALIZED_MACH_O_PATHS.has(path)
+        || compatibilityNormalizedMachOPaths.has(path)
       ? "mach_o_without_code_signature"
       : "raw";
     const bytes = normalization === "mach_o_without_code_signature"
@@ -2641,9 +2755,9 @@ export async function validateMacOSPreviewApp(appPath) {
     );
   }
   const selected = resolve(appPath);
-  if (basename(selected) !== PRODUCT_BRAND.bundleName) {
+  if (basename(selected) !== PREVIEW_PRODUCT_BRAND.bundleName) {
     fail(
-      `Preview application must be named ${PRODUCT_BRAND.bundleName}`,
+      `Preview application must be named ${PREVIEW_PRODUCT_BRAND.bundleName}`,
       "MACOS_PREVIEW_METADATA_INVALID",
     );
   }
@@ -2672,7 +2786,14 @@ export async function validateMacOSPreviewApp(appPath) {
   }
   if (manifest?.schemaVersion !== MANIFEST_SCHEMA
       || manifest.application?.bundleIdentifier
-        !== PRODUCT_BRAND.bundleIdentifier) {
+        !== PREVIEW_PRODUCT_BRAND.bundleIdentifier
+      || manifest.application?.name !== PREVIEW_PRODUCT_BRAND.displayName
+      || manifest.runtime?.stateRoot
+        !== `~/Library/Application Support/${PREVIEW_PRODUCT_BRAND.stateDirectoryName}`
+      || manifest.runtime?.keychain?.namespace
+        !== PREVIEW_PRODUCT_BRAND.keychainNamespace
+      || manifest.runtime?.keychain?.account
+        !== PREVIEW_PRODUCT_BRAND.keychainAccount) {
     fail(
       "Preview application build manifest has an unexpected identity",
       "MACOS_PREVIEW_METADATA_INVALID",
@@ -2681,6 +2802,9 @@ export async function validateMacOSPreviewApp(appPath) {
   const release = manifest.release;
   if (release?.channel !== DISTRIBUTION_CHANNEL_PREVIEW
       || release.channelName !== DISTRIBUTION_CHANNEL_PREVIEW
+      || release.appOpenScheme !== PREVIEW_PRODUCT_BRAND.appOpenScheme
+      || release.appOpenHost !== PREVIEW_PRODUCT_BRAND.appOpenHost
+      || release.appOpenURL !== PREVIEW_PRODUCT_BRAND.appOpenURL
       || release.previewDistributionRequested !== true
       || release.externalDistributionRequested !== false
       || release.previewOriginValidated !== true
@@ -2694,13 +2818,20 @@ export async function validateMacOSPreviewApp(appPath) {
     );
   }
   const plist = readMacOSInfoPlist(join(selected, "Contents", "Info.plist"));
-  if (plist.CFBundleIdentifier !== PRODUCT_BRAND.bundleIdentifier
-      || plist.CFBundleDisplayName !== PRODUCT_BRAND.displayName
-      || plist.CFBundleName !== PRODUCT_BRAND.displayName
-      || plist.UsageMonitorBundleName !== PRODUCT_BRAND.bundleName
-      || plist.UsageMonitorAppOpenScheme !== PRODUCT_BRAND.appOpenScheme
-      || plist.UsageMonitorAppOpenHost !== PRODUCT_BRAND.appOpenHost
-      || plist.UsageMonitorAppOpenURL !== PRODUCT_BRAND.appOpenURL
+  if (plist.CFBundleIdentifier !== PREVIEW_PRODUCT_BRAND.bundleIdentifier
+      || plist.CFBundleDisplayName !== PREVIEW_PRODUCT_BRAND.displayName
+      || plist.CFBundleName !== PREVIEW_PRODUCT_BRAND.displayName
+      || plist.UsageMonitorBundleName !== PREVIEW_PRODUCT_BRAND.bundleName
+      || plist.UsageMonitorAppOpenScheme
+        !== PREVIEW_PRODUCT_BRAND.appOpenScheme
+      || plist.UsageMonitorAppOpenHost !== PREVIEW_PRODUCT_BRAND.appOpenHost
+      || plist.UsageMonitorAppOpenURL !== PREVIEW_PRODUCT_BRAND.appOpenURL
+      || plist.UsageMonitorStateDirectoryName
+        !== PREVIEW_PRODUCT_BRAND.stateDirectoryName
+      || plist.UsageMonitorKeychainNamespace
+        !== PREVIEW_PRODUCT_BRAND.keychainNamespace
+      || plist.UsageMonitorKeychainAccount
+        !== PREVIEW_PRODUCT_BRAND.keychainAccount
       || plist.UsageMonitorPublicWebsiteOrigin
         !== DEPLOYMENT_ENDPOINTS.public.origin
       || plist.UsageMonitorBuildChannel !== DISTRIBUTION_CHANNEL_PREVIEW
@@ -2741,6 +2872,13 @@ export async function validateMacOSPreviewApp(appPath) {
     appcastURL: plist.SUFeedURL,
     publicEdKey: plist.SUPublicEDKey,
   });
+  if (updaterMetadata.appcastURL === DEPLOYMENT_ENDPOINTS.sparkle.appcastURL) {
+    fail(
+      "Preview application cannot use the stable Sparkle appcast",
+      "MACOS_PREVIEW_STABLE_FEED_FORBIDDEN",
+    );
+  }
+  assertMacOSPreviewAppcastBoundary(updaterMetadata.appcastURL);
   const frameworkPath = join(
     selected,
     ...SPARKLE_FRAMEWORK_PREFIX.split("/"),
@@ -2834,7 +2972,10 @@ export async function validateMacOSPreviewApp(appPath) {
     );
   }
   await privacyCheck(selected, updater);
-  const payload = await bundleInventory(selected, manifestPath, updater);
+  const payload = await bundleInventory(selected, manifestPath, updater, {
+    compatibilityNormalizedMachOPaths:
+      previewCompatibilityNormalizedMachOPaths(manifest),
+  });
   if (stableJson(payload) !== stableJson(manifest.payload)) {
     fail(
       "Preview application payload does not match its build manifest",
@@ -2847,11 +2988,12 @@ export async function validateMacOSPreviewApp(appPath) {
     bundleIdentifier: plist.CFBundleIdentifier,
     bundleVersion: plist.CFBundleVersion,
     channel: DISTRIBUTION_CHANNEL_PREVIEW,
+    shortVersion: plist.CFBundleShortVersionString,
     updaterEnabled: true,
   });
 }
 
-async function verifyExistingBuildTarget(output) {
+async function verifyExistingBuildTarget(output, productBrand = PRODUCT_BRAND) {
   let metadata;
   try {
     metadata = await lstat(output);
@@ -2873,12 +3015,12 @@ async function verifyExistingBuildTarget(output) {
     manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   } catch {
     fail(
-      `Refusing to replace an app without a valid ${PRODUCT_BRAND.displayName} build marker`,
+      `Refusing to replace an app without a valid ${productBrand.displayName} build marker`,
     );
   }
   if (manifest.schemaVersion !== MANIFEST_SCHEMA
       || manifest.application?.bundleIdentifier
-        !== PRODUCT_BRAND.bundleIdentifier) {
+        !== productBrand.bundleIdentifier) {
     fail("Refusing to replace an app with an unexpected build marker");
   }
   return true;
@@ -2913,7 +3055,8 @@ async function readReplaceableLegacyPreviewManifest(output) {
     const release = manifest?.release;
     const updater = release?.updater;
     const legacyManifestBoundary = manifest?.schemaVersion === MANIFEST_SCHEMA
-      && manifest.application?.bundleIdentifier === PRODUCT_BRAND.bundleIdentifier
+      && manifest.application?.bundleIdentifier
+        === PREVIEW_PRODUCT_BRAND.bundleIdentifier
       && manifest.application?.signing === "ad_hoc_developer_bundle"
       && release?.channel === DISTRIBUTION_CHANNEL_PREVIEW
       && release.channelName === undefined
@@ -2930,10 +3073,10 @@ async function readReplaceableLegacyPreviewManifest(output) {
       && updater.requiresSignedFeed === true
       && updater.verifyBeforeExtraction === true;
     const legacyPlistBoundary = plist.CFBundleIdentifier
-        === PRODUCT_BRAND.bundleIdentifier
-      && plist.CFBundleDisplayName === PRODUCT_BRAND.displayName
-      && plist.CFBundleName === PRODUCT_BRAND.displayName
-      && plist.UsageMonitorBundleName === PRODUCT_BRAND.bundleName
+        === PREVIEW_PRODUCT_BRAND.bundleIdentifier
+      && plist.CFBundleDisplayName === PREVIEW_PRODUCT_BRAND.displayName
+      && plist.CFBundleName === PREVIEW_PRODUCT_BRAND.displayName
+      && plist.UsageMonitorBundleName === PREVIEW_PRODUCT_BRAND.bundleName
       && plist.UsageMonitorBuildChannel === DISTRIBUTION_CHANNEL_PREVIEW
       && plist.UsageMonitorReleaseChannel === undefined
       && plist.UsageMonitorPreviewDistribution === true
@@ -2966,7 +3109,7 @@ async function archiveLegacyPreviewApp(output, manifest) {
   }), "utf8")).slice(0, 16);
   const archivePath = join(
     retiredRoot,
-    `${PRODUCT_BRAND.displayName}-legacy-preview-${fingerprint}.app`,
+    `${PREVIEW_PRODUCT_BRAND.displayName}-legacy-preview-${fingerprint}.app`,
   );
   try {
     await rename(output, archivePath);
@@ -3036,7 +3179,10 @@ export function validateMacOSPreviewOutputPath(
     );
   }
   const selectedStagingRoot = resolve(stagingRoot);
-  if (selected !== join(selectedStagingRoot, PRODUCT_BRAND.bundleName)) {
+  if (selected !== join(
+    selectedStagingRoot,
+    PREVIEW_PRODUCT_BRAND.bundleName,
+  )) {
     fail(
       "Preview builds must use the reviewed staging bundle path",
       "MACOS_PREVIEW_OUTPUT_FORBIDDEN",
@@ -3045,10 +3191,14 @@ export function validateMacOSPreviewOutputPath(
   return selected;
 }
 
-async function prepareOutput(output, { channel, previewStagingRoot }) {
-  if (basename(output) !== PRODUCT_BRAND.bundleName) {
+async function prepareOutput(output, {
+  channel,
+  previewStagingRoot,
+  productBrand,
+}) {
+  if (basename(output) !== productBrand.bundleName) {
     fail(
-      `Output must end with the exact bundle name ${PRODUCT_BRAND.bundleName}`,
+      `Output must end with the exact bundle name ${productBrand.bundleName}`,
     );
   }
   const parent = dirname(output);
@@ -3232,6 +3382,13 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
     sparklePublicEdKey = sparklePublicEdKey
       ?? environment.USAGE_MONITOR_PREVIEW_SPARKLE_PUBLIC_ED_KEY
       ?? MACOS_PREVIEW_PUBLIC_CONFIGURATION.sparklePublicEdKey;
+    if (sparkleAppcastURL === DEPLOYMENT_ENDPOINTS.sparkle.appcastURL) {
+      fail(
+        "Preview distribution cannot use the stable Sparkle appcast",
+        "MACOS_PREVIEW_STABLE_FEED_FORBIDDEN",
+      );
+    }
+    assertMacOSPreviewAppcastBoundary(sparkleAppcastURL);
   }
   if (!output) fail("--output is required");
   return {
@@ -3257,7 +3414,9 @@ async function buildApplication(stageApp, centralService, {
   buildProfile,
   distribution,
   iconAssets,
+  productBrand,
   publicWebsiteOrigin,
+  releaseSource,
   releaseChannelName,
   updater,
 }) {
@@ -3291,6 +3450,7 @@ async function buildApplication(stageApp, centralService, {
       bundleVersion,
       distribution,
       iconIncluded: iconAssets !== null,
+      productBrand,
       publicWebsiteOrigin,
       releaseChannelName,
       updater,
@@ -3298,7 +3458,7 @@ async function buildApplication(stageApp, centralService, {
   );
   await writeGeneratedFile(join(contents, "PkgInfo"), "APPL????");
   await compileLauncher(
-    join(executables, PRODUCT_BRAND.executableName),
+    join(executables, productBrand.executableName),
     updater,
     swiftSources,
     { buildProfile },
@@ -3342,21 +3502,21 @@ async function buildApplication(stageApp, centralService, {
   const manifest = {
     schemaVersion: MANIFEST_SCHEMA,
     application: {
-      bundleIdentifier: PRODUCT_BRAND.bundleIdentifier,
+      bundleIdentifier: productBrand.bundleIdentifier,
       bundleVersion,
       executable: {
         integrity: "strict_codesign",
         path: SIGNED_EXECUTABLE_PATH,
       },
       minimumMacOSVersion: MINIMUM_MACOS_VERSION,
-      name: PRODUCT_BRAND.displayName,
+      name: productBrand.displayName,
       shortVersion: SHORT_VERSION,
       signing: "ad_hoc_developer_bundle",
     },
     release: {
-      appOpenHost: PRODUCT_BRAND.appOpenHost,
-      appOpenScheme: PRODUCT_BRAND.appOpenScheme,
-      appOpenURL: PRODUCT_BRAND.appOpenURL,
+      appOpenHost: productBrand.appOpenHost,
+      appOpenScheme: productBrand.appOpenScheme,
+      appOpenURL: productBrand.appOpenURL,
       channel: distribution.channel,
       channelName: releaseChannelName,
       externalDistributionRequested: distribution.externalDistribution,
@@ -3370,6 +3530,7 @@ async function buildApplication(stageApp, centralService, {
       previewOriginValidated: distribution.previewOriginValidated,
       requiresDeveloperIDAndNotarization:
         distribution.externalDistribution,
+      ...(releaseSource === null ? {} : { source: releaseSource }),
       updater: {
         appcastURL: updater.appcastURL,
         automaticChecks: updater.automaticChecks,
@@ -3396,9 +3557,13 @@ async function buildApplication(stageApp, centralService, {
         mode: centralService.mode,
       },
       entrypoint: "Contents/Resources/app/apps/local/server.js",
+      keychain: {
+        account: productBrand.keychainAccount,
+        namespace: productBrand.keychainNamespace,
+      },
       node,
       stateRoot:
-        `~/Library/Application Support/${PRODUCT_BRAND.stateDirectoryName}`,
+        `~/Library/Application Support/${productBrand.stateDirectoryName}`,
       resourceRoot: "Contents/Resources/app",
     },
     privacyBoundary: {
@@ -3501,6 +3666,7 @@ export async function buildMacOSApp({
   sparkleFramework = null,
   sparkleAppcastURL = null,
   sparklePublicEdKey = null,
+  releaseSource = null,
   releaseAuthorization = null,
 }) {
   const selectedBuildProfile = normalizeMacOSBuildProfile(buildProfile);
@@ -3529,6 +3695,10 @@ export async function buildMacOSApp({
       "MACOS_EXTERNAL_BUILD_RELEASE_CORE_REQUIRED",
     );
   }
+  const sealedReleaseSource = normalizeSealedMacOSReleaseSource(
+    releaseSource,
+    { required: externalDistribution },
+  );
   if (externalDistribution && centralOrigin !== null) {
     const configuredCentralService = normalizeMacOSCentralOrigin(
       centralOrigin,
@@ -3563,6 +3733,9 @@ export async function buildMacOSApp({
     previewDistribution,
     releaseChannel: selectedReleaseChannel ?? releaseChannel,
   });
+  const productBrand = distribution.previewDistribution
+    ? PREVIEW_PRODUCT_BRAND
+    : PRODUCT_BRAND;
   const releaseChannelName = selectedReleaseChannel?.name
     ?? distribution.channel;
   if (selectedBuildProfile === MACOS_BUILD_PROFILE_TEST
@@ -3572,6 +3745,16 @@ export async function buildMacOSApp({
       "MACOS_TEST_BUILD_DISTRIBUTION_FORBIDDEN",
     );
   }
+  if (distribution.previewDistribution
+      && sparkleAppcastURL === DEPLOYMENT_ENDPOINTS.sparkle.appcastURL) {
+    fail(
+      "Preview distribution cannot use the stable Sparkle appcast",
+      "MACOS_PREVIEW_STABLE_FEED_FORBIDDEN",
+    );
+  }
+  if (distribution.previewDistribution) {
+    assertMacOSPreviewAppcastBoundary(sparkleAppcastURL);
+  }
   const updater = await normalizeMacOSUpdaterConfiguration({
     appcastURL: selectedReleaseChannel?.sparkle.appcastURL
       ?? sparkleAppcastURL,
@@ -3580,6 +3763,16 @@ export async function buildMacOSApp({
     frameworkPath: sparkleFramework,
     publicEdKey: sparklePublicEdKey,
   });
+  if (distribution.previewDistribution
+      && updater.appcastURL === DEPLOYMENT_ENDPOINTS.sparkle.appcastURL) {
+    fail(
+      "Preview distribution cannot use the stable Sparkle appcast",
+      "MACOS_PREVIEW_STABLE_FEED_FORBIDDEN",
+    );
+  }
+  if (distribution.previewDistribution) {
+    assertMacOSPreviewAppcastBoundary(updater.appcastURL);
+  }
   const selectedPublicEdKeySha256 =
     selectedReleaseChannel?.sparkle.publicEdKeySha256 ?? null;
   if (selectedPublicEdKeySha256 !== null
@@ -3602,6 +3795,7 @@ export async function buildMacOSApp({
   const outputParent = await prepareOutput(selectedOutput, {
     channel: distribution.channel,
     previewStagingRoot,
+    productBrand,
   });
   if (externalDistribution) {
     await assertMacOSExternalBuildOutputIsFresh(selectedOutput);
@@ -3609,15 +3803,17 @@ export async function buildMacOSApp({
   const temporaryRoot = await mkdtemp(
     join(outputParent, ".usage-monitor-macos-build-"),
   );
-  const stagedApp = join(temporaryRoot, PRODUCT_BRAND.bundleName);
+  const stagedApp = join(temporaryRoot, productBrand.bundleName);
   try {
     const manifest = await buildApplication(stagedApp, centralService, {
       bundleVersion: selectedBundleVersion,
       buildProfile: selectedBuildProfile,
       distribution,
       iconAssets,
+      productBrand,
       publicWebsiteOrigin: selectedReleaseChannel?.publicWebsiteOrigin
         ?? DEPLOYMENT_ENDPOINTS.public.origin,
+      releaseSource: sealedReleaseSource,
       releaseChannelName,
       updater,
     });
@@ -3626,7 +3822,7 @@ export async function buildMacOSApp({
       await installMacOSExternalBuildOutput(stagedApp, selectedOutput);
     } else {
       let legacyPreviewArchive = null;
-      if (await verifyExistingBuildTarget(selectedOutput)) {
+      if (await verifyExistingBuildTarget(selectedOutput, productBrand)) {
         if (distribution.previewDistribution) {
           if (replacePreviewOutput !== true) {
             fail(
@@ -3665,6 +3861,8 @@ export async function buildMacOSApp({
       }
     }
     return Object.freeze({
+      bundleIdentifier: manifest.application.bundleIdentifier,
+      bundleName: productBrand.bundleName,
       output: selectedOutput,
       payloadSha256: manifest.payload.payloadSha256,
       totalBytes: manifest.payload.totalBytes,
@@ -3721,7 +3919,10 @@ async function readMacOSReleaseBuildPreflight({
     previousManifest: previousStableManifest,
     stableBootstrap,
   });
-  releaseCore.readMacOSReleaseSourceProvenance();
+  const source = releaseCore.readMacOSReleaseSourceProvenance({
+    channel: releaseChannel,
+    expectedVersion: SHORT_VERSION,
+  });
   releaseCore.readMacOSReleaseCredentials(environment);
   if (centralOrigin !== buildConfiguration.productionOrigin
       || bundleVersion !== buildConfiguration.bundleVersion
@@ -3733,7 +3934,12 @@ async function readMacOSReleaseBuildPreflight({
       "MACOS_EXTERNAL_BUILD_PREFLIGHT_MISMATCH",
     );
   }
-  return Object.freeze({ buildConfiguration, releaseCore, updater });
+  return Object.freeze({
+    buildConfiguration,
+    releaseCore,
+    source: Object.freeze({ commit: source.commit, tag: source.tag }),
+    updater,
+  });
 }
 
 async function assertMacOSReleaseBuildPreflight(options) {
@@ -3746,8 +3952,9 @@ async function assertMacOSReleaseBuildPreflight(options) {
       "MACOS_EXTERNAL_BUILD_PREFLIGHT_REQUIRED",
     );
   }
-  const { buildConfiguration, releaseCore, updater } =
+  const preflight =
     await readMacOSReleaseBuildPreflight(options);
+  const { buildConfiguration, releaseCore, source, updater } = preflight;
   const inspectedCandidate = await releaseCore.inspectMacOSApp(
     candidateAppPath,
     {
@@ -3759,12 +3966,15 @@ async function assertMacOSReleaseBuildPreflight(options) {
         !== buildConfiguration.productionOrigin
       || inspectedCandidate.bundleVersion !== buildConfiguration.bundleVersion
       || inspectedCandidate.plist.SUFeedURL !== updater.appcastURL
-      || inspectedCandidate.plist.SUPublicEDKey !== updater.publicEdKey) {
+      || inspectedCandidate.plist.SUPublicEDKey !== updater.publicEdKey
+      || JSON.stringify(inspectedCandidate.buildManifest.release?.source)
+        !== JSON.stringify(source)) {
     fail(
       "External distribution build options do not match the release-core preflight",
       "MACOS_EXTERNAL_BUILD_PREFLIGHT_MISMATCH",
     );
   }
+  return preflight;
 }
 
 /**
@@ -3774,9 +3984,10 @@ async function assertMacOSReleaseBuildPreflight(options) {
  * but intentionally has no existing candidate to inspect yet.
  */
 export async function buildMacOSReleaseCandidate(options) {
-  await readMacOSReleaseBuildPreflight(options);
+  const preflight = await readMacOSReleaseBuildPreflight(options);
   return buildMacOSApp({
     ...options,
+    releaseSource: preflight.source,
     releaseAuthorization: MACOS_RELEASE_BUILD_AUTHORIZATION,
   });
 }
@@ -3788,9 +3999,10 @@ export async function buildMacOSReleaseCandidate(options) {
  * candidate preflight prevents a direct import from skipping those gates.
  */
 export async function buildMacOSAppForRelease(options) {
-  await assertMacOSReleaseBuildPreflight(options);
+  const preflight = await assertMacOSReleaseBuildPreflight(options);
   return buildMacOSApp({
     ...options,
+    releaseSource: preflight.source,
     releaseAuthorization: MACOS_RELEASE_BUILD_AUTHORIZATION,
   });
 }
@@ -3835,7 +4047,8 @@ async function main(argv) {
     sparkleAppcastURL,
     sparklePublicEdKey,
   });
-  console.log(`${PRODUCT_BRAND.bundleName}: built`);
+  console.log(`${result.bundleName}: built`);
+  console.log(`Bundle identifier: ${result.bundleIdentifier}`);
   console.log(`Output: ${result.output}`);
   console.log(`Payload SHA-256: ${result.payloadSha256}`);
   console.log(`Source SHA-256: ${result.sourceSha256}`);

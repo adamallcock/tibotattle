@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PRODUCT_BRAND } from "../config/product-brand.js";
+import { PREVIEW_PRODUCT_BRAND } from "../config/product-brand.js";
 import {
   getReleaseChannel,
   INTERNAL_DOGFOOD_RELEASE_CHANNEL,
@@ -15,6 +15,10 @@ import {
   normalizeMacOSCentralOrigin,
   validateMacOSPreviewApp,
 } from "./build-macos-app.js";
+import {
+  isAppleMacOSBundleVersion,
+  isLegacyZeroFirstMacOSBundleVersion,
+} from "./macos-bundle-version.js";
 import { normalizeMacOSUpdaterMetadata } from "./macos-updater-core.js";
 import { inspectMacOSApp } from "./macos-release-core.js";
 
@@ -25,7 +29,7 @@ const DEFAULT_PREVIEW_APP_PATH = join(
   ".release-build",
   "macos-preview",
   "current",
-  PRODUCT_BRAND.bundleName,
+  PREVIEW_PRODUCT_BRAND.bundleName,
 );
 const PLIST_MAX_BYTES = 1024 * 1024;
 const MAX_APPCAST_BYTES = 1024 * 1024;
@@ -362,15 +366,20 @@ function parsePlistJSON(path) {
   return parsed;
 }
 
+export function readMacOSInfoPlist(appPath) {
+  const selected = normalizeAppPath(appPath);
+  return parsePlistJSON(join(selected, "Contents", "Info.plist"));
+}
+
 export function readMacOSPreviewInfoPlist(appPath) {
   const selected = normalizeAppPath(appPath);
-  if (basename(selected) !== PRODUCT_BRAND.bundleName) {
+  if (basename(selected) !== PREVIEW_PRODUCT_BRAND.bundleName) {
     throw remoteError(
       MACOS_PREVIEW_REMOTE_CODES.PLIST_INVALID,
-      `Preview application must be named ${PRODUCT_BRAND.bundleName}`,
+      `Preview application must be named ${PREVIEW_PRODUCT_BRAND.bundleName}`,
     );
   }
-  return parsePlistJSON(join(selected, "Contents", "Info.plist"));
+  return readMacOSInfoPlist(selected);
 }
 
 export async function readMacOSPreviewBuildManifest(appPath) {
@@ -688,7 +697,7 @@ export async function readMacOSPreviewPublicMetadata(
     channel,
     channelPolicy = null,
     readBuildManifest = readMacOSPreviewBuildManifest,
-    readInfoPlist = readMacOSPreviewInfoPlist,
+    readInfoPlist = readMacOSInfoPlist,
   } = {},
 ) {
   const selected = normalizeAppPath(appPath);
@@ -1588,7 +1597,10 @@ function publicArtifactURL(value) {
     && selected.href === value;
 }
 
-function contentAddressedArtifact(value, { objectPrefix = "releases" } = {}) {
+function contentAddressedArtifact(value, {
+  allowLegacyZeroFirstBundleVersion = false,
+  objectPrefix = "releases",
+} = {}) {
   if (!publicArtifactURL(value)) return null;
   const selected = new URL(value);
   const segments = selected.pathname.slice(1).split("/");
@@ -1602,9 +1614,11 @@ function contentAddressedArtifact(value, { objectPrefix = "releases" } = {}) {
   const versionIndex = prefixSegments.length;
   if (segments.length !== versionIndex + 3
       || !prefixSegments.every((segment, index) => segments[index] === segment)
-      || !/^(?:0|[1-9][0-9]{0,8})(?:\.(?:0|[1-9][0-9]{0,8})){0,2}$/u.test(
-        segments[versionIndex] ?? "",
-      )
+      || (!isAppleMacOSBundleVersion(segments[versionIndex] ?? "")
+        && !(allowLegacyZeroFirstBundleVersion
+          && isLegacyZeroFirstMacOSBundleVersion(
+            segments[versionIndex] ?? "",
+          )))
       || !/^[a-f0-9]{64}$/u.test(segments[versionIndex + 1] ?? "")
       || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(?:dmg|delta)$/u.test(
         segments[versionIndex + 2] ?? "",
@@ -1629,6 +1643,7 @@ function validSparkleSignatureShape(value) {
 }
 
 function validateAppcastStructure(value, {
+  allowLegacyZeroFirstBundleVersion = false,
   expectedArtifactOrigin = null,
   expectedArtifactURL = null,
   expectedArtifactPrefix = "releases",
@@ -1636,6 +1651,9 @@ function validateAppcastStructure(value, {
   requireContentAddressed = false,
   requireSingleFullDmg = false,
 } = {}) {
+  const acceptsExactLegacyBundleVersion =
+    allowLegacyZeroFirstBundleVersion
+    && isLegacyZeroFirstMacOSBundleVersion(expectedBundleVersion);
   const root = parseXMLDocument(value);
   if (root.name !== "rss"
       || root.attributes.get("version") !== "2.0"
@@ -1695,6 +1713,7 @@ function validateAppcastStructure(value, {
       const length = attributes.get("length");
       const lengthNumber = Number(length);
       const contentAddress = contentAddressedArtifact(artifactURL, {
+        allowLegacyZeroFirstBundleVersion: acceptsExactLegacyBundleVersion,
         objectPrefix: expectedArtifactPrefix,
       });
       if (!publicArtifactURL(artifactURL)
@@ -2177,7 +2196,7 @@ export async function verifyMacOSPreviewRemote({
   remoteFeedPreflight = false,
   getReleaseChannelImpl = getReleaseChannel,
   inspectMacOSAppImpl = inspectMacOSApp,
-  readInfoPlist = readMacOSPreviewInfoPlist,
+  readInfoPlist = readMacOSInfoPlist,
   readBuildManifest = readMacOSPreviewBuildManifest,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   validatePreviewApp = validateMacOSPreviewApp,
@@ -2299,6 +2318,9 @@ export async function verifyMacOSPreviewRemote({
     endpointConfiguration.appcastURL,
     {
       ...requestOptions,
+      allowLegacyZeroFirstBundleVersion:
+        channel === STABLE_RELEASE_CHANNEL
+        && isLegacyZeroFirstMacOSBundleVersion(local.bundleVersion),
       expectedArtifactOrigin: remoteFeedPreflight ? appcastOrigin : null,
       expectedArtifactURL: namedRelease
         ? null
@@ -2760,7 +2782,7 @@ export async function runMacOSPreviewRemoteCLI(
     const options = parseMacOSPreviewRemoteArguments(argv, environment);
     if (options.help) {
       writeLine(stdout, "Usage: node scripts/verify-macos-preview-remote.js [options]");
-      writeLine(stdout, "  --app PATH          Preview TiboTattle.app to validate");
+      writeLine(stdout, "  --app PATH          TiboTattle Preview.app to validate");
       writeLine(stdout, "  --channel NAME      stable, internal-dogfood, preview_distribution, or development");
       writeLine(stdout, "  --live              Perform bounded remote feed preflight checks");
       writeLine(stdout, "  --central-origin URL  Preview compatibility endpoint only");

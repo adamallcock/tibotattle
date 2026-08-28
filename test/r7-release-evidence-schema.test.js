@@ -156,6 +156,14 @@ test("reviewed R7 runtime source trees reject unsupported files and symlinks", a
       "export const adapter = true;\n",
     );
     await writeFile(
+      join(temporaryRoot, "src", "AGENTS.md"),
+      "# Scoped source policy\n",
+    );
+    await writeFile(
+      join(temporaryRoot, "src", "providers", "AGENTS.md"),
+      "# Scoped provider policy\n",
+    );
+    await writeFile(
       join(
         temporaryRoot,
         "packages",

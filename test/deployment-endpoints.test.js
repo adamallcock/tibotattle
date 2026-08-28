@@ -19,6 +19,10 @@ test("reviewed deployment endpoint manifest is internally coherent", () => {
     DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
     `${DEPLOYMENT_ENDPOINTS.sparkle.origin}/appcast.xml`,
   );
+  assert.equal(
+    DEPLOYMENT_ENDPOINTS.sparkle.previewAppcastURL,
+    `${DEPLOYMENT_ENDPOINTS.sparkle.origin}/preview/appcast.xml`,
+  );
   assert.deepEqual(
     DEPLOYMENT_ENDPOINTS.public.routeHosts,
     ["tibotattle.com", "www.tibotattle.com"],
@@ -118,6 +122,10 @@ test("checked-in deployment endpoint consumers match the reviewed manifest", asy
   const checked = await checkDeploymentEndpointConsumers();
   assert.equal(checked.publicOrigin, DEPLOYMENT_ENDPOINTS.public.origin);
   assert.equal(checked.appcastURL, DEPLOYMENT_ENDPOINTS.sparkle.appcastURL);
+  assert.equal(
+    checked.previewAppcastURL,
+    DEPLOYMENT_ENDPOINTS.sparkle.previewAppcastURL,
+  );
   assert.equal(checked.r2Bucket, DEPLOYMENT_ENDPOINTS.sparkle.r2Bucket);
   assert.deepEqual(checked.workerSparkleReleaseContract, {
     channel: "stable",

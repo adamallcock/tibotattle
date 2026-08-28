@@ -1845,6 +1845,191 @@ test("missing numeric evidence stays missing instead of becoming zero", () => {
   assert.equal(result.pricing.coveragePercent, null);
 });
 
+test("newer-schema accounting remains a terminal unavailable state across the browser boundary", async () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    activity: { toolEvents: null },
+    timeline: {
+      usage: [],
+      history: {
+        status: "unavailable",
+        reason: "local_unified_index_schema_newer",
+        boundedDays: 31,
+      },
+    },
+    accounting: {
+      projection: {
+        status: "unavailable",
+        reason: "local_unified_index_schema_newer",
+        terminal: true,
+      },
+      accountingCacheStatus: "unavailable",
+      toolClasses: {
+        status: "unavailable",
+        reason: "typed_tool_history_partial",
+        total: null,
+        counts: {
+          apply_patch: null,
+          local_shell: null,
+          other: null,
+          subagent: null,
+          tool_gateway: null,
+        },
+      },
+      events: 0,
+      totalTokens: 0,
+      apiPriceEquivalentUsd: 0,
+    },
+  });
+  assert.deepEqual(result.accounting.projection, {
+    status: "unavailable",
+    reason: "local_unified_index_schema_newer",
+    terminal: true,
+    retainedAt: null,
+    coveredAt: null,
+  });
+  assert.equal(result.timeline.history.status, "unavailable");
+  assert.equal(
+    result.timeline.history.reason,
+    "local_unified_index_schema_newer",
+  );
+  assert.equal(result.timeline.history.usageEvents, null);
+  assert.equal(result.activity.toolEvents, null);
+  assert.equal(result.accounting.toolClasses.total, null);
+  assert.ok(Object.values(result.accounting.toolClasses.counts).every(
+    (value) => value === null,
+  ));
+
+  const appSource = await readFile(
+    new URL("../public/app.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(appSource, /function accountingRequiresNewerBuild\(data\)/u);
+  assert.match(appSource, /projection\.status !== "available"/u);
+  assert.match(appSource, /accountingIsUnavailable\(data\).*activePoints\.length === 0/u);
+  assert.match(appSource, /unavailable && visiblePoints\.length === 0[\s\S]*?"—"/u);
+  assert.ok(
+    appSource.includes('if (projection.status === "unavailable") return null;'),
+    "share-card accounting selection closes on terminal unavailable data",
+  );
+  assert.ok(
+    appSource.includes('&& finite(totalCostUsd, 0) <= 0'),
+    "a retained zero cost is withheld rather than shared as measured evidence",
+  );
+  assert.ok(
+    appSource.includes('t("share.detail.newerBuildRequired")'),
+    "the shared-card unavailable state names the required newer build",
+  );
+  assert.ok(
+    appSource.includes('"share.detail.lastVerifiedNewerBuild"'),
+    "retained share-card evidence is labeled last verified and names the newer build",
+  );
+});
+
+test("a contradictory available accounting attestation fails closed", () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    accounting: {
+      projection: {
+        status: "available",
+        reason: "local_unified_index_schema_newer",
+        terminal: true,
+      },
+      events: 0,
+      totalTokens: 0,
+      apiPriceEquivalentUsd: 0,
+    },
+  });
+  assert.deepEqual(result.accounting.projection, {
+    status: "unavailable",
+    reason: "local_unified_index_unavailable",
+    terminal: true,
+    retainedAt: null,
+    coveredAt: null,
+  });
+});
+
+test("real local accounting without an authority attestation renders unavailable", async () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    accounting: {
+      events: 0,
+      totalTokens: 0,
+      apiPriceEquivalentUsd: 0,
+    },
+  });
+  assert.deepEqual(result.accounting.projection, {
+    status: "unavailable",
+    reason: "local_unified_index_unavailable",
+    terminal: true,
+    retainedAt: null,
+    coveredAt: null,
+  });
+
+  const appSource = await readFile(
+    new URL("../public/app.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    appSource,
+    /if \(projection\.status !== "available"\)[\s\S]*?\$\("#cost-total"\)\.textContent = retainedEvidence[\s\S]*?: "—";/u,
+    "an unavailable real-local projection must render a dash, not its zero placeholders",
+  );
+});
+
+test("retained accounting provenance admits only reviewed reason codes", () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    timeline: {
+      history: {
+        status: "partial",
+        reason: "typed_tool_history_partial",
+        coveredAt: {
+          startAt: "2026-08-01T00:00:00.000Z",
+          endAt: "2026-08-27T00:00:00.000Z",
+        },
+        usageEvents: 12,
+        sourceCount: 3,
+        indexBytes: 42,
+      },
+    },
+    accounting: {
+      projection: {
+        status: "retained",
+        reason: "private path /Users/example",
+        terminal: true,
+        retainedAt: "2026-08-27T00:00:00.000Z",
+      },
+      staleServe: {
+        stale: true,
+        reason: "local_unified_index_schema_newer",
+        schemaVersion: "local-replay-safe-accounting-v0.12",
+        computedAt: "2026-08-27T00:00:00.000Z",
+        coveredAt: {
+          startAt: "2026-08-01T00:00:00.000Z",
+          endAt: "2026-08-27T00:00:00.000Z",
+        },
+        periods: [{
+          periodId: "7d",
+          periodLabel: "Last 7 days",
+          events: 12,
+          totalTokens: 123,
+          apiPriceEquivalentUsd: 1.25,
+        }],
+      },
+    },
+  });
+  assert.equal(
+    result.accounting.projection.reason,
+    "local_unified_index_unavailable",
+  );
+  assert.equal(
+    result.accounting.staleServe.reason,
+    "local_unified_index_schema_newer",
+  );
+  assert.equal(result.timeline.history.reason, "typed_tool_history_partial");
+});
+
 test("new accounting caveats survive the closed dashboard normalizer", () => {
   const result = normalizeDashboardPayload({
     mode: "real_local_evidence",

@@ -1325,8 +1325,67 @@ function localizedQuotaWindowLabel(window) {
   return t("dashboard.quota.windowOther");
 }
 
+function dashboardAccountingProjection(data) {
+  return data?.accounting?.projection ?? {
+    status: "available",
+    reason: null,
+    terminal: false,
+  };
+}
+
+function accountingRequiresNewerBuild(data) {
+  return dashboardAccountingProjection(data).reason
+    === "local_unified_index_schema_newer";
+}
+
+function accountingIsUnavailable(data) {
+  return dashboardAccountingProjection(data).status === "unavailable";
+}
+
+function projectionUnavailableCopyKey(data) {
+  return accountingRequiresNewerBuild(data)
+    ? "accounting.projection.newerBuild"
+    : "accounting.projection.unavailable";
+}
+
 function renderPricing(data) {
   const pricing = data.pricing;
+  const projection = dashboardAccountingProjection(data);
+  const retainedPeriod = projection.status === "retained"
+    ? staleAccountingServePeriod(data) ?? data.accounting
+    : null;
+  const retainedEvidence = retainedPeriod !== null
+    && finite(retainedPeriod.apiPriceEquivalentUsd, 0) > 0;
+  if (projection.status !== "available") {
+    setLocalizedText(
+      $("#cost-period"),
+      retainedEvidence
+        ? "accounting.projection.lastVerifiedPeriod"
+        : "accounting.projection.periodUnavailable",
+      retainedEvidence ? { period: retainedPeriod.periodLabel } : {},
+    );
+    setLocalizedText(
+      $("#cost-metric-kicker"),
+      retainedEvidence
+        ? "accounting.projection.lastVerifiedMetric"
+        : "accounting.projection.metricUnavailable",
+    );
+    $("#cost-metric-kicker").title = t(projectionUnavailableCopyKey(data));
+    $("#cost-total").textContent = retainedEvidence
+      ? formatApiMoney(retainedPeriod.apiPriceEquivalentUsd)
+      : "—";
+    renderHistoryProgress(data);
+    const list = $("#cost-components");
+    clear(list);
+    list.append(node(
+      "p",
+      "empty-inline",
+      t(retainedEvidence
+        ? "accounting.projection.retainedComponents"
+        : projectionUnavailableCopyKey(data)),
+    ));
+    return;
+  }
   const fastMode = pricing.fastMode;
   setRawText($("#cost-period"), pricing.periodLabel);
   // The headline is the quota-weighted figure whenever a weighting exists;
@@ -2199,11 +2258,16 @@ function buildShareCard(data, {
   const isDemo = data?.mode === "demo";
   const headlineDate = shareCardHeadlineDate(data, history);
   const pricing = data?.pricing ?? {};
+  const projection = dashboardAccountingProjection(data);
+  const accountingEvidenceAvailable = projection.status === "available"
+    || (projection.status === "retained" && activity !== null);
   // The activity figure follows the usage chart's selected date range
   // (owner-directed, 2026-08-10) whenever the accounting periods carry that
   // range; the pricing fallback preserves the old 7-day-selected behavior
   // for payloads without per-period accounting (the demo fixture among them).
-  const fastMode = activity?.fastMode ?? pricing.fastMode ?? {};
+  const fastMode = accountingEvidenceAvailable
+    ? activity?.fastMode ?? pricing.fastMode ?? {}
+    : {};
   // The share card's third figure is specifically the weekly reset fit. Do
   // not substitute the older general-gradient summary here: both are API-price
   // equivalents, but their evidence source and denominator are different.
@@ -2217,11 +2281,15 @@ function buildShareCard(data, {
   // the quota cards use. "" leaves the header chip off entirely.
   const planLabel = shareCardPlan(data?.quotaWindows ?? []);
 
-  const weighted = activity !== null
-    ? activity.quotaWeightedTotalCostUsd
-    : finite(pricing.quotaWeightedTotalCostUsd);
+  const weighted = !accountingEvidenceAvailable
+    ? null
+    : activity !== null
+      ? activity.quotaWeightedTotalCostUsd
+      : finite(pricing.quotaWeightedTotalCostUsd);
   const useWeighted = weighted !== null && fastMode.weightingStatus !== "unknown";
-  const spend = useWeighted
+  const spend = !accountingEvidenceAvailable
+    ? null
+    : useWeighted
     ? weighted
     : activity !== null
       ? activity.totalCostUsd
@@ -2281,7 +2349,20 @@ function buildShareCard(data, {
       // The "event-time API equivalent" caption is gone (owner-directed,
       // 2026-08-10): the detail line states the selected range and nothing
       // else.
-      detail: spend === null ? t("share.detail.noPricedUsage") : period,
+      detail: spend !== null
+        ? projection.status === "retained"
+          ? t(
+            projection.reason === "local_unified_index_schema_newer"
+              ? "share.detail.lastVerifiedNewerBuild"
+              : "share.detail.lastVerifiedPeriod",
+            { period },
+          )
+          : period
+        : projection.reason === "local_unified_index_schema_newer"
+          ? t("share.detail.newerBuildRequired")
+          : projection.status !== "available"
+            ? t("share.detail.accountingUnavailable")
+            : t("share.detail.noPricedUsage"),
     },
   ];
 
@@ -2293,19 +2374,21 @@ function buildShareCard(data, {
   if (isDemo) {
     caveats.push(t("share.caveat.demo"));
   }
-  if (excluded > 0) {
+  if (spend !== null && excluded > 0) {
     caveats.push(t("share.caveat.unweighted", {
       amount: formatMoney(excluded, 2),
     }));
   }
-  if (fastMode.weightingStatus === "unknown") {
+  if (spend !== null && fastMode.weightingStatus === "unknown") {
     caveats.push(t("share.caveat.noWeighted"));
-  } else if (fastMode.weightingStatus !== "complete") {
+  } else if (spend !== null && fastMode.weightingStatus !== "complete") {
     caveats.push(t("share.caveat.fastPartial"));
   }
   // The caveat qualifies the figure actually printed, so it reads the same
   // selected range the activity stat does.
-  const coverage = activity !== null
+  const coverage = spend === null
+    ? null
+    : activity !== null
     ? activity.coveragePercent
     : finite(pricing.coveragePercent);
   if (coverage !== null && coverage < 100) {
@@ -3049,6 +3132,8 @@ const SHARE_CARD_RANGE_PERIODS = Object.freeze({
 });
 
 function shareCardActivitySelection(data, rangeDays) {
+  const projection = dashboardAccountingProjection(data);
+  if (projection.status === "unavailable") return null;
   const selected = SHARE_CARD_RANGE_PERIODS[rangeDays]
     ?? { id: "all", labelKey: "share.period.allRecorded" };
   const period = (Array.isArray(data?.accounting?.periods)
@@ -3056,13 +3141,19 @@ function shareCardActivitySelection(data, rangeDays) {
     : []).find((row) => row?.periodId === selected.id) ?? null;
   if (period === null) return null;
   const events = finite(period.events, 0);
+  const totalCostUsd = finite(period.apiPriceEquivalentUsd);
+  const quotaWeightedTotalCostUsd = finite(
+    period.quotaWeightedApiPriceEquivalentUsd,
+  );
+  if (projection.status === "retained"
+      && finite(totalCostUsd, 0) <= 0
+      && finite(quotaWeightedTotalCostUsd, 0) <= 0) return null;
   const priced = finite(period.pricingCoverage?.fullyPricedEvents, 0)
     + finite(period.pricingCoverage?.partiallyPricedEvents, 0);
   return {
     labelKey: selected.labelKey,
-    totalCostUsd: finite(period.apiPriceEquivalentUsd),
-    quotaWeightedTotalCostUsd:
-      finite(period.quotaWeightedApiPriceEquivalentUsd),
+    totalCostUsd,
+    quotaWeightedTotalCostUsd,
     fastMode: period.fastMode ?? {},
     coveragePercent: events > 0
       ? Number(((priced / events) * 100).toFixed(6))
@@ -4197,6 +4288,7 @@ function renderUsageTimeline(data) {
   const unit = t(usageGroupingUnitKey());
   const quotaComparable = timelineCalibrationCapacity(data) !== null;
   const axisLabels = usageChartAxisLabels(activeUsageGrouping, quotaComparable);
+  const unavailable = accountingIsUnavailable(data);
   setLocalizedText(
     $("#usage-cost-legend-label"),
     quotaComparable
@@ -4217,6 +4309,14 @@ function renderUsageTimeline(data) {
   if (!visiblePoints.length) {
     shell.hidden = true;
     empty.hidden = false;
+    empty.querySelector("strong").textContent = unavailable
+      ? t(accountingRequiresNewerBuild(data)
+        ? "chart.usage.newerBuildTitle"
+        : "chart.usage.unavailableTitle")
+      : t("chart.usage.emptyTitle");
+    empty.querySelector("p").textContent = unavailable
+      ? t(projectionUnavailableCopyKey(data))
+      : t("chart.usage.emptyCopy");
   } else {
     shell.hidden = false;
     empty.hidden = true;
@@ -4275,15 +4375,19 @@ function renderUsageTimeline(data) {
   // The plotted weighted series already renders a missing interval as a gap.
   // Its summary must do the same: adding only finite points would publish a
   // deceptively partial allowance-facing aggregate.
-  const total = completeUsageTimelineTotal(
-    visiblePoints,
-    quotaComparable ? "quotaWeightedCostUsd" : "standardApiCostUsd",
-  );
+  const total = unavailable && visiblePoints.length === 0
+    ? null
+    : completeUsageTimelineTotal(
+      visiblePoints,
+      quotaComparable ? "quotaWeightedCostUsd" : "standardApiCostUsd",
+    );
   for (const [name, explanation, value] of [
     [
       "Time intervals",
       "The number of displayed hour, day, or week intervals.",
-      compact(visiblePoints.length)
+      unavailable && visiblePoints.length === 0
+        ? "—"
+        : compact(visiblePoints.length)
     ],
     [
       quotaComparable
@@ -4292,7 +4396,7 @@ function renderUsageTimeline(data) {
       quotaComparable
         ? "Standard API prices adjusted by the observed or selected Codex speed mode, compared only with a capacity fitted on the same basis. It is not a bill."
         : "A Standard-rate accounting series. Provider allowance is hidden because no matching weighted capacity is available.",
-      total === null ? "Unavailable" : formatApiMoney(total)
+      total === null ? "—" : formatApiMoney(total)
     ]
   ]) {
     const item = node("div");
@@ -4534,15 +4638,22 @@ function renderTimeline(data) {
     });
   const empty = $("#timeline-empty");
   const shell = $("#timeline-chart");
+  const unavailable = accountingIsUnavailable(data);
   if (!visiblePoints.length || (usingLive && matchedVisible.length === 0)) {
     shell.hidden = true;
     empty.hidden = false;
-    empty.querySelector("strong").textContent = visiblePoints.length
-      ? t("dashboard.timeline.notComparableYet")
-      : tPlural("dashboard.timeline.series", 0, { window: windowLabel });
-    empty.querySelector("p").textContent = visiblePoints.length
-      ? t("dashboard.timeline.noBracket", { window: windowLabel })
-      : t("dashboard.timeline.missingData");
+    empty.querySelector("strong").textContent = unavailable
+      ? t(accountingRequiresNewerBuild(data)
+        ? "dashboard.timeline.newerBuildTitle"
+        : "dashboard.timeline.unavailableTitle")
+      : visiblePoints.length
+        ? t("dashboard.timeline.notComparableYet")
+        : tPlural("dashboard.timeline.series", 0, { window: windowLabel });
+    empty.querySelector("p").textContent = unavailable
+      ? t(projectionUnavailableCopyKey(data))
+      : visiblePoints.length
+        ? t("dashboard.timeline.noBracket", { window: windowLabel })
+        : t("dashboard.timeline.missingData");
   } else {
     empty.hidden = true;
     shell.hidden = false;
@@ -4588,7 +4699,7 @@ function renderTimeline(data) {
     activeCalibrationRangeDays,
   );
   renderTimelineSummary(data, visiblePoints, visibleBaselinePoints, usingLive);
-  renderTimelineConfidence(points, visiblePoints, usingLive, viewport);
+  renderTimelineConfidence(data, points, visiblePoints, usingLive, viewport);
   renderResiduals(data, visiblePoints, viewport);
   // The divergence panel reads the whole selected calibration range, not the
   // zoomed viewport: it answers "across this range, where did observed and
@@ -4620,8 +4731,19 @@ function describeTimelineExclusions(activePoints) {
   return described === "" ? t("dashboard.timeline.noExclusions") : described;
 }
 
-function renderTimelineConfidence(allPoints, visiblePoints, usingLive, viewport) {
+function renderTimelineConfidence(
+  data,
+  allPoints,
+  visiblePoints,
+  usingLive,
+  viewport,
+) {
   const element = $("#timeline-confidence");
+  if (accountingIsUnavailable(data)) {
+    element.classList.add("low");
+    setLocalizedText(element, projectionUnavailableCopyKey(data));
+    return;
+  }
   const activePoints = visiblePoints.filter((point) => point.status !== "inactive");
   const matched = activePoints.filter((point) => point.observed !== null && point.expected !== null).length;
   const excluded = activePoints.length - matched;
@@ -4789,6 +4911,7 @@ function renderTimelineSummary(
   const activePoints = points.filter((row) => row.status !== "inactive");
   const matched = activePoints.filter((row) => row.observed !== null && row.expected !== null);
   const live = usingLive;
+  const unavailable = accountingIsUnavailable(data) && activePoints.length === 0;
   const liveMae = matched.length
     ? matched.reduce((sum, row) => sum + Math.abs(row.observed - row.expected), 0) / matched.length
     : null;
@@ -4819,7 +4942,7 @@ function renderTimelineSummary(
     [
       "Matched windows",
       "Windows with both observed quota movement and a comparable cost-implied movement.",
-      compact(matched.length),
+      unavailable ? "—" : compact(matched.length),
     ],
     [
       "Mean absolute error",
@@ -9328,7 +9451,7 @@ function staleAccountingServePeriod(data) {
  * alert — the replaced red withheld-cache banner over-alarmed a routine
  * update recalculation.
  */
-function renderStaleServeNote(element, active) {
+function renderStaleServeNote(element, active, reason = null) {
   if (!element) return;
   if (!active) {
     element.hidden = true;
@@ -9338,9 +9461,13 @@ function renderStaleServeNote(element, active) {
   element.hidden = false;
   setLocalizedText(
     element,
-    accountingRebuildRetrying()
-      ? "accounting.staleServe.retrying"
-      : "accounting.staleServe.recalculating",
+    reason === "local_unified_index_schema_newer"
+      ? "accounting.staleServe.newerBuild"
+      : reason === "current_projection_unavailable"
+        ? "accounting.staleServe.lastVerified"
+        : accountingRebuildRetrying()
+          ? "accounting.staleServe.retrying"
+          : "accounting.staleServe.recalculating",
   );
 }
 
@@ -9355,7 +9482,8 @@ function renderAccountingRebuildDeferral(data, { staleServeShown = false } = {})
   // likewise not an empty view — its own label already folds the retry state
   // in — so the deferral banner stays down rather than doubling the message.
   const cacheMissing = data?.accounting?.accountingCacheStatus === "unavailable";
-  if (!persistent || !cacheMissing || staleServeShown) {
+  const terminalProjection = dashboardAccountingProjection(data).terminal === true;
+  if (!persistent || !cacheMissing || staleServeShown || terminalProjection) {
     element.hidden = true;
     setRawText(element, "");
     return;
@@ -9368,25 +9496,66 @@ function renderAccountingRebuildDeferral(data, { staleServeShown = false } = {})
 
 function renderAccounting(data) {
   syncAccountingPeriodControls(data);
+  const projection = dashboardAccountingProjection(data);
   // The prior-version figures stand in only while the current channels are
   // genuinely empty: no current cache AND no events from any live source for
   // the selected period. The moment a current source serves (unified index or
   // a fresh cache), it wins and the stale label leaves this section.
   const livePeriod = accountingPeriod(data);
-  const staleRow = data?.accounting?.accountingCacheStatus === "unavailable"
-      && (livePeriod === null || livePeriod.events === 0)
+  const staleRow = projection.status !== "available"
+      && data?.accounting?.accountingCacheStatus === "unavailable"
+      && (livePeriod === null || finite(livePeriod.events, 0) === 0)
     ? staleAccountingServePeriod(data)
     : null;
-  renderStaleServeNote($("#accounting-stale-serve"), staleRow !== null);
+  const retainedEvidence = projection.status === "retained"
+    && ((staleRow !== null
+      && (finite(staleRow.events, 0) > 0
+        || finite(staleRow.totalTokens, 0) > 0
+        || finite(staleRow.apiPriceEquivalentUsd, 0) > 0))
+      || (livePeriod !== null
+        && (finite(livePeriod.events, 0) > 0
+          || finite(livePeriod.totalTokens, 0) > 0
+          || finite(livePeriod.apiPriceEquivalentUsd, 0) > 0)));
+  renderStaleServeNote(
+    $("#accounting-stale-serve"),
+    retainedEvidence,
+    projection.reason,
+  );
   renderAccountingRebuildDeferral(data, {
-    staleServeShown: staleRow !== null,
+    staleServeShown: retainedEvidence,
   });
   const accounting = livePeriod;
-  if (accounting === null) {
-    clear($("#accounting-summary"));
-    clear($("#accounting-component-counts"));
-    clear($("#accounting-component-costs"));
-    clear($("#accounting-models"));
+  if (accounting === null || (projection.status !== "available" && !retainedEvidence)) {
+    const summary = $("#accounting-summary");
+    clear(summary);
+    for (const [label, explanation] of [
+      [
+        t("accounting.projection.metricUnavailable"),
+        t(projectionUnavailableCopyKey(data)),
+      ],
+      ["Tokens", t(projectionUnavailableCopyKey(data))],
+    ]) {
+      const card = node("article", "metric-card compact-metric");
+      const metricLabel = node("span", "metric-name");
+      metricLabel.append(informationLabel(label, explanation));
+      card.append(
+        metricLabel,
+        node("strong", "metric-value", "—"),
+        node("p", "", t(projectionUnavailableCopyKey(data))),
+      );
+      summary.append(card);
+    }
+    renderAccountingComponentBars("#accounting-component-counts", [], {
+      emptyMessage: t("accounting.projection.componentsUnavailable"),
+      valueFor: () => 0,
+      displayValue: () => "—",
+    });
+    renderAccountingComponentBars("#accounting-component-costs", [], {
+      emptyMessage: t("accounting.projection.componentsUnavailable"),
+      valueFor: () => 0,
+      displayValue: () => "—",
+    });
+    renderAccountingModels(data.accounting, { unavailable: true });
     renderAccountingCacheSwitchDetails(null);
     renderAccountingCacheContinuityDetails(null);
     renderAccountingSideChatDetails(null);
@@ -9404,19 +9573,27 @@ function renderAccounting(data) {
   // Stale substitution serves the version-stable Standard-price scalar and
   // labels itself as previous-version output; quota weighting belongs to the
   // current pipeline and is not reconstructed from an old artifact.
-  const headlineRows = staleRow !== null
+  const headlineRows = projection.status === "retained"
     ? [
       [
         t("accounting.staleServe.metricLabel"),
         "A public API-price measuring stick for the usage observed locally. It is not a bill or a subscription limit.",
-        formatApiMoney(staleRow.apiPriceEquivalentUsd),
-        staleRow.periodLabel,
+        finite((staleRow ?? accounting).apiPriceEquivalentUsd, 0) > 0
+          ? formatApiMoney((staleRow ?? accounting).apiPriceEquivalentUsd)
+          : "—",
+        t("accounting.projection.lastVerifiedPeriod", {
+          period: (staleRow ?? accounting).periodLabel,
+        }),
       ],
       [
         "Tokens",
         "The tokens attached to those usage changes during the selected time period.",
-        compact(staleRow.totalTokens),
-        staleRow.periodLabel,
+        finite((staleRow ?? accounting).totalTokens, 0) > 0
+          ? compact((staleRow ?? accounting).totalTokens)
+          : "—",
+        t("accounting.projection.lastVerifiedPeriod", {
+          period: (staleRow ?? accounting).periodLabel,
+        }),
       ],
     ]
     : [
@@ -9519,7 +9696,9 @@ function renderAccounting(data) {
     .map(([key, tokens]) => ({ key, tokens }))
     .sort((left, right) => right.tokens - left.tokens);
   renderAccountingComponentBars("#accounting-component-counts", componentCountRows, {
-    emptyMessage: "No token-component accounting in this period.",
+    emptyMessage: projection.status === "retained" && staleRow !== null
+      ? t("accounting.projection.retainedComponents")
+      : "No token-component accounting in this period.",
     valueFor: (row) => row.tokens,
     displayValue: (row) => compact(row.tokens)
   });
@@ -9533,7 +9712,9 @@ function renderAccounting(data) {
     .filter((row) => row.tokens > 0 || row.costUsd > 0)
     .sort((left, right) => right.costUsd - left.costUsd || right.tokens - left.tokens);
   renderAccountingComponentBars("#accounting-component-costs", componentCostRows, {
-    emptyMessage: "No component costs were priced in this period.",
+    emptyMessage: projection.status === "retained" && staleRow !== null
+      ? t("accounting.projection.retainedComponents")
+      : "No component costs were priced in this period.",
     valueFor: (row) => row.costUsd,
     displayValue: (row) => row.costUsd > 0
       ? formatApiMoney(row.costUsd)
@@ -9541,7 +9722,9 @@ function renderAccounting(data) {
     titleFor: (row) => `${compact(row.tokens)} tokens`,
   });
 
-  renderAccountingModels(accounting);
+  renderAccountingModels(accounting, {
+    unavailable: projection.status === "retained" && staleRow !== null,
+  });
   renderAccountingCacheSwitchDetails(cacheSwitchImpact);
   renderAccountingCacheContinuityDetails(cacheContinuityImpact);
   renderAccountingSideChatDetails(sideChatEstimates);
@@ -9757,7 +9940,7 @@ function modelComponentRow(model, key, labelKey, totals) {
   return row;
 }
 
-function renderAccountingModels(accounting) {
+function renderAccountingModels(accounting, { unavailable = false } = {}) {
   const models = $("#accounting-models");
   if (!models) return;
   clear(models);
@@ -9780,7 +9963,13 @@ function renderAccountingModels(accounting) {
   );
   if (!modelRows.length) {
     const row = node("tr");
-    const cell = localizedNode("td", "empty-cell", "accounting.model.noneInPeriod");
+    const cell = localizedNode(
+      "td",
+      "empty-cell",
+      unavailable
+        ? "accounting.model.unavailable"
+        : "accounting.model.noneInPeriod",
+    );
     cell.colSpan = 6;
     row.append(cell);
     models.append(row);

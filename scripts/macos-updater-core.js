@@ -351,9 +351,9 @@ export async function normalizeMacOSUpdaterConfiguration({
   });
   return Object.freeze({
     appcastURL: metadata.appcastURL,
-    // A preview client shares the normal bundle identifier so it can exercise
-    // the same OAuth callback registration. It must never silently consume a
-    // production-signed update merely because it was opened for testing.
+    // Preview has a separate bundle, URL scheme, and state root. It retains
+    // manual compatibility checks, but must never silently consume an update
+    // merely because it was opened for testing.
     automaticChecks: externalDistribution,
     automaticUpdatesEnabledByDefault: externalDistribution,
     allowsAutomaticUpdateOptIn: externalDistribution,

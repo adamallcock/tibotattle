@@ -8,6 +8,7 @@ import {
 } from "../scripts/validate-macos-install.js";
 
 const APP_PATH = resolve("TiboTattle.app");
+const PREVIEW_APP_PATH = resolve("TiboTattle Preview.app");
 const DMG_PATH = resolve("TiboTattle.dmg");
 
 test("production installed-app validation requires and resolves a named channel", () => {
@@ -24,6 +25,7 @@ test("production installed-app validation requires and resolves a named channel"
     {
       appPath: APP_PATH,
       channel: "stable",
+      distribution: "release",
       dmgPath: null,
       production: true,
     },
@@ -44,6 +46,7 @@ test("production DMG and release validation also require an explicit channel", (
     {
       appPath: null,
       channel: "stable",
+      distribution: "release",
       dmgPath: resolve(
         ".release-build/macos-release",
         RELEASE_MANIFEST.macOS.arm64DmgFileName,
@@ -69,6 +72,7 @@ test("development validation remains non-release when an explicit stable channel
     {
       appPath: APP_PATH,
       channel: "stable",
+      distribution: "development",
       dmgPath: null,
       production: false,
     },
@@ -93,6 +97,94 @@ test("the resolved channel is passed into installed-app validation and mismatche
   );
   assert.deepEqual(calls, [{
     appPath: APP_PATH,
-    options: { channel: "stable", production: true },
+    options: {
+      channel: "stable",
+      distribution: "release",
+      production: true,
+    },
   }]);
+});
+
+test("preview validation requires its isolated distribution channel and mode", () => {
+  assert.throws(
+    () => parseArguments([
+      "--app", PREVIEW_APP_PATH, "--preview", "--channel", "stable",
+    ]),
+    /--preview requires --channel preview_distribution/u,
+  );
+  assert.throws(
+    () => parseArguments([
+      "--app", PREVIEW_APP_PATH, "--preview", "--development",
+      "--channel", "preview_distribution",
+    ]),
+    /mutually exclusive/u,
+  );
+  assert.deepEqual(
+    parseArguments([
+      "--app", PREVIEW_APP_PATH, "--preview",
+      "--channel", "preview_distribution",
+    ]),
+    {
+      appPath: PREVIEW_APP_PATH,
+      channel: "preview_distribution",
+      distribution: "preview",
+      dmgPath: null,
+      production: false,
+    },
+  );
+  assert.deepEqual(
+    parseArguments([
+      "--dmg", DMG_PATH, "--preview", "--channel", "preview_distribution",
+    ]),
+    {
+      appPath: null,
+      channel: "preview_distribution",
+      distribution: "preview",
+      dmgPath: DMG_PATH,
+      production: false,
+    },
+  );
+});
+
+test("preview app validation cannot fall through to the stable validator", async () => {
+  const sentinel = Object.assign(new Error("preview checked"), {
+    code: "PREVIEW_CHECKED",
+  });
+  await assert.rejects(
+    main([
+      "--app", PREVIEW_APP_PATH, "--preview",
+      "--channel", "preview_distribution",
+    ], {
+      validateInstalledMacOSApp: async () => assert.fail(
+        "stable validator must not inspect a preview app",
+      ),
+      validateMacOSPreviewApp: async (appPath) => {
+        assert.equal(appPath, PREVIEW_APP_PATH);
+        throw sentinel;
+      },
+    }),
+    { code: "PREVIEW_CHECKED" },
+  );
+});
+
+test("preview DMG validation carries the preview distribution boundary", async () => {
+  const sentinel = Object.assign(new Error("preview DMG checked"), {
+    code: "PREVIEW_DMG_CHECKED",
+  });
+  await assert.rejects(
+    main([
+      "--dmg", DMG_PATH, "--preview", "--channel", "preview_distribution",
+    ], {
+      validateMacOSDMG: async (dmgPath, options) => {
+        assert.equal(dmgPath, DMG_PATH);
+        assert.deepEqual(options, {
+          channel: "preview_distribution",
+          distribution: "preview",
+          production: false,
+        });
+        throw sentinel;
+      },
+    }),
+    { code: "PREVIEW_DMG_CHECKED" },
+  );
 });

@@ -33,6 +33,15 @@ private enum BundledProduct {
         return value
     }
 
+    private static func requiredBool(_ key: String) -> Bool {
+        guard let value = Bundle.main.object(
+            forInfoDictionaryKey: key
+        ) as? Bool else {
+            fatalError("Missing or invalid bundled product setting: \(key)")
+        }
+        return value
+    }
+
     private static func requiredHTTPSOrigin(_ key: String) -> String {
         let value = requiredString(key)
         guard let components = URLComponents(string: value),
@@ -50,6 +59,7 @@ private enum BundledProduct {
     }
 
     static let displayName = requiredString("CFBundleDisplayName")
+    static let bundleIdentifier = requiredString("CFBundleIdentifier")
     static let bundleName = requiredString("UsageMonitorBundleName")
     static let appOpenScheme =
         requiredString("UsageMonitorAppOpenScheme").lowercased()
@@ -64,6 +74,32 @@ private enum BundledProduct {
     }()
     static let stateDirectoryName =
         requiredDirectoryName("UsageMonitorStateDirectoryName")
+    static let buildChannel = requiredString("UsageMonitorBuildChannel")
+    static let releaseChannel = requiredString("UsageMonitorReleaseChannel")
+    static let isPreviewDistribution =
+        requiredBool("UsageMonitorPreviewDistribution")
+    static let updaterEnabled = requiredBool("UsageMonitorUpdaterEnabled")
+    private static let keychainIdentity: (namespace: String, account: String) = {
+        let namespace = requiredString("UsageMonitorKeychainNamespace")
+        let account = requiredString("UsageMonitorKeychainAccount")
+        let expected: (namespace: String, account: String)
+        switch bundleIdentifier {
+        case "com.usagemonitor.local":
+            expected = ("app-usagemonitor", "installation")
+        case "com.usagemonitor.local.preview":
+            expected = ("app-usagemonitor.preview", "preview-installation")
+        default:
+            fatalError("Invalid bundled product Keychain identity")
+        }
+        guard namespace == expected.namespace,
+              account == expected.account
+        else {
+            fatalError("Invalid bundled product Keychain identity")
+        }
+        return expected
+    }()
+    static let keychainNamespace = keychainIdentity.namespace
+    static let keychainAccount = keychainIdentity.account
     static let monitoredAppDisplayName =
         requiredString("UsageMonitorMonitoredAppDisplayName")
     static let monitoredAppBundleIdentifier =
@@ -71,6 +107,205 @@ private enum BundledProduct {
     static let nodeRuntimeMode = requiredString("UsageMonitorNodeRuntimeMode")
     static let publicWebsiteOrigin =
         requiredHTTPSOrigin("UsageMonitorPublicWebsiteOrigin")
+
+    /// Bundle signatures seal Info.plist, but launch still treats the plist as
+    /// an input rather than allowing individually well-formed settings to be
+    /// recombined into an unreviewed runtime. In particular, a Preview bundle
+    /// must never select stable state, semantic-open registration, Keychain
+    /// items, or updater behavior.
+    private static let runtimeIdentityValidated: Void = {
+        let expectedIdentity: (
+            displayName: String,
+            bundleName: String,
+            appOpenScheme: String,
+            appOpenHost: String,
+            appOpenURL: String,
+            stateDirectoryName: String,
+            keychainNamespace: String,
+            keychainAccount: String
+        )
+        switch bundleIdentifier {
+        case "com.usagemonitor.local":
+            expectedIdentity = (
+                "TiboTattle",
+                "TiboTattle.app",
+                "usagemonitor",
+                "open",
+                "usagemonitor://open",
+                "Usage Monitor",
+                "app-usagemonitor",
+                "installation"
+            )
+        case "com.usagemonitor.local.preview":
+            expectedIdentity = (
+                "TiboTattle Preview",
+                "TiboTattle Preview.app",
+                "usagemonitor-preview",
+                "open",
+                "usagemonitor-preview://open",
+                "Usage Monitor Preview",
+                "app-usagemonitor.preview",
+                "preview-installation"
+            )
+        default:
+            fatalError("Invalid bundled runtime identity")
+        }
+
+        guard displayName == expectedIdentity.displayName,
+              bundleName == expectedIdentity.bundleName,
+              appOpenScheme == expectedIdentity.appOpenScheme,
+              appOpenHost == expectedIdentity.appOpenHost,
+              appOpenURL == expectedIdentity.appOpenURL,
+              stateDirectoryName == expectedIdentity.stateDirectoryName,
+              keychainNamespace == expectedIdentity.keychainNamespace,
+              keychainAccount == expectedIdentity.keychainAccount
+        else {
+            fatalError("Invalid bundled runtime identity")
+        }
+        validateSemanticOpenRegistration()
+
+        switch (
+            bundleIdentifier,
+            buildChannel,
+            releaseChannel,
+            isPreviewDistribution
+        ) {
+        case (
+            "com.usagemonitor.local",
+            "development",
+            "development",
+            false
+        ):
+            validateDevelopmentUpdaterPolicy()
+        case (
+            "com.usagemonitor.local",
+            "production",
+            "stable",
+            false
+        ):
+            validateDistributionUpdaterPolicy(
+                expectedAppcastURL:
+                    "https://updates.tibotattle.com/appcast.xml",
+                requiredAppcastPath: "/appcast.xml",
+                automaticUpdates: true
+            )
+        case (
+            "com.usagemonitor.local",
+            "internal-dogfood",
+            "internal-dogfood",
+            false
+        ):
+            validateDistributionUpdaterPolicy(
+                expectedAppcastURL:
+                    "https://dogfood-updates.tibotattle.com/"
+                    + "internal-dogfood/appcast.xml",
+                requiredAppcastPath: "/internal-dogfood/appcast.xml",
+                automaticUpdates: true
+            )
+        case (
+            "com.usagemonitor.local.preview",
+            "preview_distribution",
+            "preview_distribution",
+            true
+        ):
+            // Preview may target another deliberately reviewed deployment,
+            // so its host is not compiled in. Its canonical feed path and
+            // manual-only behavior remain an invariant of the bundle ID.
+            validateDistributionUpdaterPolicy(
+                expectedAppcastURL: nil,
+                requiredAppcastPath: "/preview/appcast.xml",
+                automaticUpdates: false
+            )
+        default:
+            fatalError("Invalid bundled runtime identity")
+        }
+    }()
+
+    private static func validateSemanticOpenRegistration() {
+        guard let urlTypes = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleURLTypes"
+        ) as? [[String: Any]],
+              urlTypes.count == 1,
+              let urlType = urlTypes.first,
+              Set(urlType.keys) == Set([
+                  "CFBundleTypeRole",
+                  "CFBundleURLName",
+                  "CFBundleURLSchemes",
+              ]),
+              urlType["CFBundleTypeRole"] as? String == "Viewer",
+              urlType["CFBundleURLName"] as? String
+                == "\(bundleIdentifier).\(appOpenHost)",
+              let registeredSchemes =
+                urlType["CFBundleURLSchemes"] as? [String],
+              registeredSchemes == [appOpenScheme]
+        else {
+            fatalError("Invalid bundled runtime identity")
+        }
+    }
+
+    private static func validateDevelopmentUpdaterPolicy() {
+        guard !updaterEnabled else {
+            fatalError("Invalid bundled runtime identity")
+        }
+        for key in [
+            "SUEnableAutomaticChecks",
+            "SUAllowsAutomaticUpdates",
+            "SUAutomaticallyUpdate",
+            "SUFeedURL",
+            "SUPublicEDKey",
+            "SURequireSignedFeed",
+            "SUVerifyUpdateBeforeExtraction",
+            "UsageMonitorUpdaterFrameworkVersion",
+        ] where Bundle.main.object(forInfoDictionaryKey: key) != nil {
+            fatalError("Invalid bundled runtime identity")
+        }
+    }
+
+    private static func validateDistributionUpdaterPolicy(
+        expectedAppcastURL: String?,
+        requiredAppcastPath: String,
+        automaticUpdates: Bool
+    ) {
+        guard updaterEnabled,
+              requiredBool("SUEnableAutomaticChecks") == automaticUpdates,
+              requiredBool("SUAllowsAutomaticUpdates") == automaticUpdates,
+              requiredBool("SUAutomaticallyUpdate") == automaticUpdates,
+              requiredBool("SURequireSignedFeed"),
+              requiredBool("SUVerifyUpdateBeforeExtraction"),
+              requiredString("UsageMonitorUpdaterFrameworkVersion") == "2.9.3"
+        else {
+            fatalError("Invalid bundled runtime identity")
+        }
+
+        let appcast = requiredString("SUFeedURL")
+        guard let components = URLComponents(string: appcast),
+              components.scheme?.lowercased() == "https",
+              let host = components.host?.lowercased(),
+              !host.isEmpty,
+              !["127.0.0.1", "localhost", "::1"].contains(host),
+              components.user == nil,
+              components.password == nil,
+              components.percentEncodedPath == requiredAppcastPath,
+              components.query == nil,
+              components.fragment == nil,
+              components.url?.absoluteString == appcast,
+              expectedAppcastURL == nil || appcast == expectedAppcastURL
+        else {
+            fatalError("Invalid bundled runtime identity")
+        }
+
+        let publicKey = requiredString("SUPublicEDKey")
+        guard let publicKeyBytes = Data(base64Encoded: publicKey),
+              publicKeyBytes.count == 32,
+              publicKeyBytes.base64EncodedString() == publicKey
+        else {
+            fatalError("Invalid bundled runtime identity")
+        }
+    }
+
+    static func validateRuntimeIdentity() {
+        _ = runtimeIdentityValidated
+    }
 }
 
 private let loopbackHost = "127.0.0.1"
@@ -479,9 +714,7 @@ private enum NativeForegroundRefreshScheduler {
 @MainActor
 private final class AppUpdater: NSObject {
     private static var bundledUpdaterEnabled: Bool {
-        Bundle.main.object(
-            forInfoDictionaryKey: "UsageMonitorUpdaterEnabled"
-        ) as? Bool == true
+        BundledProduct.updaterEnabled
     }
 
     private(set) var state: AppUpdaterState
@@ -498,12 +731,7 @@ private final class AppUpdater: NSObject {
     /// still requires this bundle's enabled flag and fresh feed evidence; no
     /// channel name is treated as proof that an endpoint is safe to use.
     static var isPreviewDistribution: Bool {
-        Bundle.main.object(
-            forInfoDictionaryKey: "UsageMonitorPreviewDistribution"
-        ) as? Bool == true
-        || Bundle.main.object(
-            forInfoDictionaryKey: "UsageMonitorBuildChannel"
-        ) as? String == "preview_distribution"
+        BundledProduct.isPreviewDistribution
     }
 
     private static var appcastURL: URL? {
@@ -541,18 +769,24 @@ private final class AppUpdater: NSObject {
     }
 
     var allowsAutomaticUpdateOptIn: Bool {
-        controller?.updater.allowsAutomaticUpdates == true
+        !Self.isPreviewDistribution
+            && controller?.updater.allowsAutomaticUpdates == true
     }
 
     var automaticUpdatesEnabled: Bool {
-        controller?.updater.automaticallyDownloadsUpdates == true
+        !Self.isPreviewDistribution
+            && controller?.updater.automaticallyDownloadsUpdates == true
     }
 
     /// Automatic-update controls remain disabled until the endpoint and the
-    /// latest check both have a truthful state. This prevents a configured
-    /// but unavailable feed from looking ready merely because Sparkle exists.
+    /// latest check both have a truthful state, and until this build's sealed
+    /// Sparkle policy actually permits the preference. This prevents preview
+    /// builds from presenting a switch whose setter must refuse the change.
     var canConfigureAutomaticUpdates: Bool {
-        guard isAvailable, feedIsReachable else { return false }
+        guard isAvailable,
+              feedIsReachable,
+              allowsAutomaticUpdateOptIn
+        else { return false }
         return ![.checking, .failed].contains(state)
     }
 
@@ -567,6 +801,15 @@ private final class AppUpdater: NSObject {
     }
 
     var settingsSummary: String {
+        if isAvailable && !allowsAutomaticUpdateOptIn {
+            return Self.isPreviewDistribution
+                ? TiboTattleLocalization.string(
+                    .settingsUpdateDisclosurePreview
+                )
+                : TiboTattleLocalization.string(
+                    .settingsAutomaticUpdatesUnavailable
+                )
+        }
         switch state {
         case .unavailable:
             return TiboTattleLocalization.string(
@@ -712,7 +955,8 @@ private final class AppUpdater: NSObject {
     }
 
     func setAutomaticUpdatesEnabled(_ enabled: Bool) {
-        guard let updater = controller?.updater,
+        guard !Self.isPreviewDistribution,
+              let updater = controller?.updater,
               updater.allowsAutomaticUpdates,
               feedIsReachable
         else {
@@ -1773,7 +2017,10 @@ private final class CompanionProcess {
         // If the broker cannot be created (descriptor exhaustion), the
         // companion runs without one and its own explained pairing path
         // remains the net.
-        let broker = try? ContributionDeviceKeychainBroker()
+        let broker = try? ContributionDeviceKeychainBroker(
+            namespace: BundledProduct.keychainNamespace,
+            account: BundledProduct.keychainAccount
+        )
         child.standardInput = broker?.childEndpoint ?? FileHandle.nullDevice
         child.standardOutput = standardOutput
         child.standardError = standardError
@@ -1785,6 +2032,10 @@ private final class CompanionProcess {
             "NODE_ENV": "production",
             "USAGE_MONITOR_PARENT_PID": String(getpid()),
             "USAGE_MONITOR_PORT": "0",
+            "USAGE_MONITOR_APP_OPEN_URL": BundledProduct.appOpenURL,
+            "USAGE_MONITOR_KEYCHAIN_NAMESPACE":
+                BundledProduct.keychainNamespace,
+            "USAGE_MONITOR_KEYCHAIN_ACCOUNT": BundledProduct.keychainAccount,
             "USAGE_MONITOR_RESOURCE_ROOT": resources.resourceRoot.path,
             "USAGE_MONITOR_STATE_ROOT": stateRoot.path,
             "CODEX_HOME": codexHome.path,
@@ -7236,6 +7487,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 "HOME": homeDirectory.path,
                 "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
                 "NODE_ENV": "production",
+                "USAGE_MONITOR_KEYCHAIN_NAMESPACE":
+                    BundledProduct.keychainNamespace,
+                "USAGE_MONITOR_KEYCHAIN_ACCOUNT":
+                    BundledProduct.keychainAccount,
                 "USAGE_MONITOR_STATE_ROOT": stateRoot.path,
             ]
             for name in ["LANG", "LC_ALL", "TMPDIR"] {
@@ -9999,6 +10254,7 @@ private struct UsageMonitorMain {
         if arguments.contains("--login-item-contract-smoke-test") {
             exit(LoginItemContractSmokeTest.run())
         }
+        BundledProduct.validateRuntimeIdentity()
         if arguments.contains("--keychain-broker-contract-smoke-test") {
             exit(ContributionDeviceKeychainBroker.runContractSmokeTest())
         }
