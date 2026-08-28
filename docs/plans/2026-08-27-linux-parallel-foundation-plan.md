@@ -2,7 +2,7 @@
 title: Linux parallel foundation implementation plan
 date: 2026-08-27
 type: plan
-status: foundation-validation
+status: foundation-complete-r7-evidence-blocked
 base_revision: 1a953486da85062861581473eb28114a89771136
 owners:
   - desktop
@@ -150,3 +150,21 @@ converted into passing local evidence.
   support/publication claim is enabled.
 - Existing macOS/Windows code and qualification tests remain unchanged or pass
   their relevant regression suites.
+
+## Result — 2026-08-27
+
+All four dormant foundations and their focused tests are implemented. Colima
+was repaired, and the final network-disabled ARM64 source GUI smoke passed from
+exact revision `1e84f14d35c1785c7000dcfc86681d9a18e50d04` in image
+`sha256:1ecc1f49104fd191031fa78eda54a02dea6a073f71feb3603a0f54d97476451d`.
+The native AMD64 workflow remains unrun, and every production selector,
+runtime-staging, AppImage, installed-lifecycle, and support gate remains
+closed.
+
+The full root suite passed 3,685 of 3,755 tests with 68 explicit skips. Its two
+failures are the protected R7 receipts invalidated by the intended source
+change. Two exact-runtime regeneration attempts failed closed on a pre-existing
+duplicate `session_meta` record in private local history. No private history or
+evidence contract was mutated to force that gate green. See the
+[verification receipt](../receipts/2026-08-27-linux-parallel-foundation-receipt.md)
+for the complete evidence and remaining production gates.
