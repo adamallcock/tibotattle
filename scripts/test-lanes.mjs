@@ -358,6 +358,7 @@ export async function runPreflight() {
     "./tools/operations/fix-doc-links.mjs",
     "--check",
   ]);
+  await runNodeTests(["test/agent-guidance.test.js"]);
 }
 
 async function runNodeTests(arguments_, { environment = process.env } = {}) {
@@ -478,7 +479,7 @@ function usage() {
   console.log(`Usage: node scripts/test-lanes.mjs <lane> [options]
 
 Lanes:
-  preflight       Validate selected test files, tracked/untracked whitespace, and docs links.
+  preflight       Validate selected tests, whitespace, docs links, and agent guidance.
   portable        Run the explicit platform-neutral Node, web, and companion manifest.
   fast            Run fast macOS source/configuration checks.
   changed         Select conservative lanes from branch plus active-worktree paths.

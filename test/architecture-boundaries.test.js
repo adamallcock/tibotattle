@@ -1257,11 +1257,17 @@ for (const fixture of [
     packageDirectory: "accounting",
     packageName: "@fixture/accounting",
   },
+  {
+    app: "local-review",
+    packageDirectory: "identity-core",
+    packageName: "@fixture/identity-core",
+    source: "local-review/cli.js",
+  },
 ]) {
   test(`rejects an unapproved package root from the ${fixture.app} app`, async () => {
     await withFixtureTree(
       {
-        [`apps/${fixture.app}/src/index.js`]:
+        [fixture.source ?? `apps/${fixture.app}/src/index.js`]:
           `import "${fixture.packageName}";`,
         [`packages/${fixture.packageDirectory}/index.js`]:
           "export const dependency = true;",
