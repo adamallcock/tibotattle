@@ -17,12 +17,12 @@ below pass and the owner explicitly approves that change.
 | Repository | Visibility | Responsibility |
 | --- | --- | --- |
 | [`tibotattle`](https://github.com/adamallcock/tibotattle) | private during transition; public only after release approval | The complete, buildable macOS/local client; public-safe shared contracts; client tests; release workflow; release verification instructions. |
-| `app-usagemonitor` (the private service repository during transition) | private | Cloudflare Worker, D1 migrations, Cloud Run containment service, operator/admin UI, infrastructure configuration, operational scripts, private test fixtures, and service release credentials. |
+| `app-usagemonitor` (the private service repository during transition) | private | Cloudflare Worker, D1 migrations, R2 configuration, operator/admin UI, operational scripts, private test fixtures, and service release credentials. |
 
 The private client source history was created on 2026-08-02 as a single,
 history-free root commit (`c912c52b6febcc1d7e433a822aec3a96f9977317`) from a
 verified 273-file allow-list export. It contains no private Git history,
-Worker/Cloud Run code, deployment configuration, operator UI, credentials, or
+Worker code, deployment configuration, operator UI, credentials, or
 raw usage data. Its independent dependency install, complete client test suite
 (294 passed, 1 intentionally skipped), and macOS bundle suite (27 passed, 1
 intentionally skipped) passed before the seed was pushed.
@@ -71,8 +71,8 @@ The private repository retains at least:
 
 - `apps/worker/`, including D1 migrations, worker tests, deployment scripts,
   generated binding declarations, and private service configuration;
-- `apps/cloud-run/`, service templates, cloud resource configuration, and
-  containment tests;
+- Worker deployment configuration, cloud resource configuration, and private
+  service tests;
 - operator/admin assets and all privileged operational tooling;
 - raw fixtures, receipts, local observations, incident material, and any
   documentation that exposes internal identifiers or operating procedures; and

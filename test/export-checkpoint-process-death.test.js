@@ -4,9 +4,13 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createLocalExportWorkspace, inspectLocalExportWorkspace } from "../src/export-set-controller.js";
-import { openExportWorkspace } from "../src/export-workspace.js";
+import { localExportSourcePipeline, localExportWorkspace } from
+  "../src/local-node-runtime.js";
 import { stableJson } from "../src/storage.js";
+
+const { createLocalExportWorkspace, inspectLocalExportWorkspace } =
+  localExportSourcePipeline.controller;
+const { openExportWorkspace } = localExportWorkspace;
 
 const SECRET = Buffer.alloc(32, 83);
 const START_AT = "2026-07-24T11:00:00.000Z";

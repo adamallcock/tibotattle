@@ -488,6 +488,7 @@ const SAFE_INJECTED_BACKEND_ERROR_CODES = new Set([
   "export_identity_keychain_operation_failed",
   "export_identity_keychain_locked",
   "export_identity_keychain_denied",
+  "export_identity_keychain_migration_required",
   "export_identity_keychain_readback_mismatch",
 ]);
 

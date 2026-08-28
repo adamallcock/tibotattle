@@ -18,13 +18,12 @@ please read this page before opening an issue or pull request.
 
 ## Install
 
-The root workspace uses pnpm; the worker and Cloud Run apps keep their own
-npm lockfiles. Install all three:
+The root workspace uses pnpm; the Worker keeps its own npm lockfile. Install
+both dependency sets:
 
 ```bash
 pnpm install
 npm --prefix apps/worker ci
-npm --prefix apps/cloud-run ci
 ```
 
 ## Verification gates
@@ -63,9 +62,8 @@ The hosted community-aggregate service at [tibotattle.com](https://tibotattle.co
 is operated by the maintainer. The deploy scripts in this repository target
 the owner's Cloudflare account; they will not work from a fork as-is. Forks
 that want their own hosted service must provision their own Cloudflare
-resources per `apps/worker/wrangler.jsonc` (and their own Cloud Run
-resources for `apps/cloud-run`). Nothing in the local app requires the
-hosted service: local analysis works fully offline.
+resources per `apps/worker/wrangler.jsonc`. Nothing in the local app requires
+the hosted service: local analysis works fully offline.
 
 Production writes to the owner's account (`wrangler deploy --env production`,
 `wrangler d1 migrations apply --remote`, and any D1 `DELETE`/`UPDATE`) are an

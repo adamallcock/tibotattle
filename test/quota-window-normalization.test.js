@@ -5,8 +5,8 @@ import test from "node:test";
 import {
   formatQuotaWindowDuration,
   quotaWindowLabel,
-  selectPrimaryQuotaWindow,
 } from "@app-usagemonitor/quota-analysis";
+import { selectPrimaryQuotaWindow } from "../packages/quota-analysis/src/quota-windows.js";
 import {
   canonicalRateLimitSnapshot,
   canonicalRateLimitWindows,

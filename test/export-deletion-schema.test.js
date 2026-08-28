@@ -29,7 +29,7 @@ import {
   validateExportDeletionJournal,
   validateExportDeletionPreflight,
   validateExportDeletionReceipt,
-} from "../src/export-deletion-schema.js";
+} from "../src/export/index.js";
 
 const { setManifest, chunkArtifact, workspaceSqliteJournal, workspaceSqliteWal,
   workspaceSqliteShm, workspaceDatabase, chunkReceipt, setManifestReceipt } = EXPORT_DELETION_INVENTORY_ROLES;

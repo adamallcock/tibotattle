@@ -13,8 +13,8 @@ USAGE_MONITOR_PORT=8791 node ./apps/local/server.js
 
 Then open `http://127.0.0.1:8791/`.
 
-To let the personal loopback dashboard read public central-service health and
-thresholded community results:
+To let the personal loopback dashboard read central-service health and use the
+fixed hosted identity/participation relay:
 
 ```bash
 USAGE_MONITOR_PORT=8791 \
@@ -24,21 +24,20 @@ USAGE_MONITOR_PORT=8791 \
 
 `USAGE_MONITOR_CENTRAL_ORIGIN` is fixed at startup. It must be either explicit
 development loopback (`http://127.0.0.1:<port>`) or a non-loopback HTTPS
-origin. The relay permits the reviewed public API plus an exact
-participant-lifecycle allowlist for enrollment, uploads, personal statistics,
-contribution history, support-only recovery/export/security routes, and
-deletion. The ordinary product does not expose the support-only routes as a
-consumer recovery or account-management journey. The relay cannot proxy an
-arbitrary host, path, query, content type, cookie, CSRF value, authorization
-value, redirect, or upstream response.
+origin. The credential-free relay permits only `GET /api/health`. The separate
+participant allowlist contains nine current browser operations: enrollment;
+Google and Apple sign-in start/result; session; logout; hosted deletion; and
+device-pairing creation. Collector device sync and upload use their own fixed
+hosted client rather than widening the browser relay. Neither relay can proxy
+an arbitrary host, path, query, content type, cookie, CSRF value,
+authorization value, redirect, or upstream response.
 
 The participant relay is intentionally narrow rather than a generic reverse
 proxy. It validates bounded JSON request and response bodies, forwards only the
-fixed TiboTattle session cookie, accepts CSRF and one-use upload
-authorization values only in their expected routes and formats, and rejects
-unexpected upstream cookies. This lets the local dashboard exercise the full
-disposable backend lifecycle from one origin without exposing raw logs or
-granting arbitrary network access.
+fixed TiboTattle session cookie and route-appropriate CSRF value, rejects
+incoming `Authorization`, and rejects unexpected upstream cookies. This lets
+the local dashboard complete its current identity/deletion journey from one
+origin without exposing raw logs or granting arbitrary network access.
 
 ## Native macOS developer app
 
@@ -278,28 +277,19 @@ under **Data & Diagnostics…** and are not contribution steps.
 
 ## Local API
 
-- `GET /api/local/health`
-- `GET /api/local/onboarding`
-- `GET /api/local/overview`
-- `GET /api/local/gradient`
-- `GET /api/local/weekly`
-- `GET /api/local/quality`
-- `GET /api/local/reports`
-- `GET|POST /api/local/refresh`
-- `POST /api/local/refresh/cancel`
-- `GET /api/local/contribution/preview`
-- `POST /api/local/contribution/prepare`
-- `GET /api/local/contribution/sync-next`
-- `POST /api/local/contribution/sync-inspect-exact`
-- `POST /api/local/contribution/sync-once`
-- `GET /api/ready` through the fixed central relay when configured
-- the fixed central public and participant routes under `/api/v1/*` when a
-  loopback central origin is configured
+The complete route-by-route inventory lives in the maintained
+[TiboTattle API surface reference](../../docs/reference/2026-08-26-api-surface-reference.md).
+It covers all local companion paths, fixed report routes, the credential-free
+central relay, and the separately allowlisted participant relay. A source-parity
+test fails if an exact route allowlist changes without the reference changing
+with it.
 
-Refresh and preparation POSTs require the exact same origin, JSON, and
-`X-Usage-Monitor-Local: 1`. Detailed reports and browser assets use fixed
-allowlists. Every API response is `no-store`, and no CORS permission is
-emitted.
+Local mutations require the exact same origin and
+`X-Usage-Monitor-Local: 1`; handlers with bodies additionally enforce closed
+JSON contracts. Detailed reports and browser assets use fixed allowlists.
+Every API response is `no-store`, and no CORS permission is emitted. The
+companion's `/api/local/contribution/sync-next` operation is `POST`; use the
+canonical reference rather than retaining a partial route list here.
 
 ## Development identity override
 

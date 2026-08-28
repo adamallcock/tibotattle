@@ -3,17 +3,20 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
+import { localMetadataExport, localSafeRecords } from
+  "../src/local-node-runtime.js";
+import { createExportResourceGuard } from "../src/export-resource-policy.js";
+import { stableJson } from "../src/storage.js";
+
+const {
   normalizeActivityMarker,
   normalizeClaudeStatusQuotaSnapshots,
   normalizeCodexCollectorQuotaCandidate,
   normalizeCodexQuotaSnapshot,
   scanCodexSafeRecords,
   summarizeActivityMarkerPlan,
-} from "../src/export-safe-records.js";
-import { buildLocalMetadataBundle } from "../src/metadata-exporter.js";
-import { createExportResourceGuard } from "../src/export-resource-policy.js";
-import { stableJson } from "../src/storage.js";
+} = localSafeRecords;
+const { buildLocalMetadataBundle } = localMetadataExport;
 
 const SECRET = Buffer.alloc(32, 37);
 const CLAUDE_OCCURRENCE = `claude-ledger-occurrence:v1:${"G".repeat(43)}`;

@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SCRIPT = fileURLToPath(new URL("../scripts/generate-social-preview.js", import.meta.url));
@@ -46,15 +47,15 @@ test("the social-preview generator refuses unusable output targets", () => {
   assert.match(danglingValue.output, /requires a value/u);
 });
 
-test("an existing card is never overwritten without --replace", async () => {
-  // Any existing file will do; the check happens before the browser launches.
-  assert.ok(existsSync(SCRIPT));
-  const guarded = run(["--output", SCRIPT.replace(/\.js$/u, ".png")]);
-  // Either it does not exist (arg checks pass, browser work begins) or it does
-  // and we get the overwrite refusal. Only the refusal path is asserted here.
-  if (guarded.output.includes("SOCIAL_PREVIEW_OUTPUT_EXISTS")) {
-    assert.equal(guarded.status, 1);
-  }
+test("an existing card is never overwritten without --replace", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "tibotattle-social-preview-test-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const output = join(directory, "card.png");
+  await writeFile(output, "existing-card");
+
+  const guarded = run(["--output", output]);
+  assert.equal(guarded.status, 1);
+  assert.match(guarded.output, /SOCIAL_PREVIEW_OUTPUT_EXISTS/u);
 });
 
 // The two defects that shipped in the first version of this script. Both were

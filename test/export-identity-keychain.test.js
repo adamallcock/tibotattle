@@ -19,6 +19,9 @@ import {
   keytarSignedBindingVerificationArguments,
   loadExportIdentityKeychainBinding,
 } from "../src/export-identity-keychain.js";
+import {
+  MACOS_APP_KEYCHAIN_CAPABILITIES,
+} from "../src/platform/keychain-capabilities.js";
 
 const require = createRequire(import.meta.url);
 const EXPORT_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity;
@@ -353,6 +356,7 @@ test("locked and denied native failures map to distinct fixed content-free codes
     ["ERR_KEYCHAIN_DENIED", "denied"],
     ["errSecAuthFailed", "denied"],
     [-25293, "denied"],
+    ["KEYCHAIN_MIGRATION_REQUIRED", "migration_required"],
   ]) {
     const binding = memoryBinding();
     binding.getPassword = async () => {
@@ -552,6 +556,18 @@ test("attribute delete constructs the exact security invocation and never needs 
     "-a",
     "installation",
   ]);
+  assert.deepEqual(
+    [...exportIdentityKeychainAttributeDeleteArguments(
+      MACOS_APP_KEYCHAIN_CAPABILITIES.exportIdentity,
+    )],
+    [
+      "delete-generic-password",
+      "-s",
+      "app-usagemonitor.export-identity.app.v1",
+      "-a",
+      "installation",
+    ],
+  );
   const invocations = [];
   const outcome = deleteExportIdentityKeychainItemByAttributes(DEVICE_CAPABILITY, {
     platform: "darwin",

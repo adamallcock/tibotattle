@@ -6,16 +6,13 @@ import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { handleRequest } from "../src/index";
 
 /**
- * Both hot paths once reached `telemetry_records` with a correlated subquery
- * filtered on `origin_contribution_id`, and the cost of each was set by the
- * size of the whole table rather than by the size of the request: the ingest
- * finalize UPDATE re-derived four server-pricing aggregates that way, and the
- * dashboard contribution list re-counted accepted records once per listed row,
- * up to a hundred times per load.
+ * The ingest hot path once reached `telemetry_records` with a correlated
+ * subquery filtered on `origin_contribution_id`, and its cost was set by the
+ * size of the whole table rather than by the size of the request.
  *
- * These tests hold both paths to the property that actually removed the cost —
- * that neither of them reads `telemetry_records` at all — and, separately, to
- * the weaker plan-level property that nothing they do issue degrades into a
+ * These tests hold that path to the property that actually removed the cost —
+ * that it does not read `telemetry_records` at all — and, separately, to the
+ * weaker plan-level property that nothing it issues degrades into a
  * full or `record_kind`-wide scan of that table.
  *
  * The plan check alone would not have caught either original defect as the
@@ -424,11 +421,45 @@ async function contribute(
   runtimeEnv = bindings(),
 ): Promise<Response> {
   const raw = JSON.stringify(await encrypt(telemetryFixture(suffix)));
-  const authorization = await api("/api/v1/me/upload-authorizations", {
+  const pairingResponse = await api("/api/v1/me/device-pairings", {
     method: "POST",
     headers: {
       cookie: participant.cookie,
       "x-usage-monitor-csrf": participant.csrfToken,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      consentVersion: "ongoing-privacy-safe-telemetry-v0.1",
+      ongoingUpload: true,
+    }),
+  }, runtimeEnv);
+  expect(pairingResponse.status).toBe(201);
+  const pairing = await pairingResponse.json<{ pairingCode: string }>();
+  const deviceId = crypto.randomUUID();
+  const rawSecret = crypto.getRandomValues(new Uint8Array(32));
+  const deviceSecret = encodeBase64Url(rawSecret);
+  const prefix = new TextEncoder().encode(
+    `app-usagemonitor/device/v1\0${deviceId}\0`,
+  );
+  const secretInput = new Uint8Array(prefix.byteLength + rawSecret.byteLength);
+  secretInput.set(prefix);
+  secretInput.set(rawSecret, prefix.byteLength);
+  const deviceSecretHash = await sha256Hex(secretInput);
+  secretInput.fill(0);
+  rawSecret.fill(0);
+  const claimed = await api("/api/v1/device-pairings/claim", {
+    method: "POST",
+    headers: {
+      authorization: `Pairing ${pairing.pairingCode}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ deviceId, deviceSecretHash }),
+  }, runtimeEnv);
+  expect(claimed.status).toBe(201);
+  const authorization = await api("/api/v1/device/upload-authorizations", {
+    method: "POST",
+    headers: {
+      authorization: `Device um_device_${deviceId}.${deviceSecret}`,
       "content-type": "application/json",
     },
     body: JSON.stringify({
@@ -450,20 +481,6 @@ async function contribute(
   }, runtimeEnv);
   expect(accepted.status).toBe(202);
   return accepted;
-}
-
-async function personalProfile(
-  participant: Participant,
-  sink: IssuedQuery[],
-): Promise<Response> {
-  const base = (env as TestBindings).USAGE_MONITOR_DB;
-  const response = await api(
-    "/api/v1/me",
-    { headers: { cookie: participant.cookie } },
-    bindings({ USAGE_MONITOR_DB: recordingDb(base, sink) }),
-  );
-  expect(response.status).toBe(200);
-  return response;
 }
 
 beforeAll(async () => {
@@ -521,40 +538,6 @@ describe("telemetry_records is never scanned by a hot path", () => {
     expect(reads).toEqual([]);
   });
 
-  it("serves /api/v1/me without reading telemetry_records", async () => {
-    const participant = await enrollTelemetry();
-    await contribute(participant, "a");
-    await contribute(participant, "b");
-
-    const issued: IssuedQuery[] = [];
-    await personalProfile(participant, issued);
-
-    expect(issued.length).toBeGreaterThan(0);
-    const touching = issued
-      .filter((entry) => referencesTelemetryRecords(entry.query))
-      .map((entry) => entry.query.replace(/\s+/gu, " ").trim());
-    expect(touching).toEqual([]);
-  });
-
-  it("keeps /api/v1/me query count flat as contributions accumulate", async () => {
-    const participant = await enrollTelemetry();
-    await contribute(participant, "a");
-    const single: IssuedQuery[] = [];
-    await personalProfile(participant, single);
-
-    for (const suffix of ["b", "c", "d", "e"]) {
-      await contribute(participant, suffix);
-    }
-    const many: IssuedQuery[] = [];
-    const profile = await personalProfile(participant, many);
-
-    // Five contributions are listed, so the read-time count the dashboard used
-    // to run per listed row would show up here as four extra statements.
-    const body = await profile.json<{ contributions: unknown[] }>();
-    expect(body.contributions).toHaveLength(5);
-    expect(many.length).toBe(single.length);
-  });
-
   it("plans no full or record_kind-wide scan of telemetry_records", async () => {
     const base = (env as TestBindings).USAGE_MONITOR_DB;
     const participant = await enrollTelemetry();
@@ -565,14 +548,7 @@ describe("telemetry_records is never scanned by a hot path", () => {
       "a",
       bindings({ USAGE_MONITOR_DB: recordingDb(base, ingest) }),
     );
-    await contribute(participant, "b");
-    const profile: IssuedQuery[] = [];
-    await personalProfile(participant, profile);
-
-    const planned = [
-      ...await planAll(base, ingest),
-      ...await planAll(base, profile),
-    ];
+    const planned = await planAll(base, ingest);
     expect(planned.length).toBeGreaterThan(0);
 
     // An EXPLAIN that failed to run is not a passing assertion, it is an

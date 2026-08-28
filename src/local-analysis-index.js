@@ -26,15 +26,16 @@ import {
   canonicalComponents,
   createLeadingRateLimitGate,
   deltaComponentPresence,
-  discoverCodexRolloutInfos,
   sameUsage,
   subtractUsage,
-} from "./codex-log-scan.js";
+} from "./providers/codex/logs.js";
+import { localCodexLogScanner } from "./local-node-runtime.js";
 import { stableJson } from "./export/index.js";
 import { validAbortSignal } from "./valid-abort-signal.js";
 
 export const LOCAL_ANALYSIS_INDEX_SCHEMA_VERSION =
   "local-analysis-index-v5";
+const { discoverCodexRolloutInfos } = localCodexLogScanner;
 // Bumped when extraction or index semantics change. v3 gated quota admission;
 // v4 stops the chunk reader from rebuilding a record out of a reused buffer, so
 // every index built before it is missing whichever records happened to straddle

@@ -3,10 +3,7 @@ import { copyFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-import {
-  codexRolloutDiscoveryReceipt,
-  discoverCodexRolloutInfos,
-} from "./codex-log-scan.js";
+import { localCodexLogScanner } from "./local-node-runtime.js";
 import {
   createLineageSnapshots,
   extractRolloutUsage,
@@ -51,6 +48,10 @@ import {
 } from "./local-unified-index.js";
 
 const MAXIMUM_COLD_BACKFILL_WORKERS = 10;
+const {
+  codexRolloutDiscoveryReceipt,
+  discoverCodexRolloutInfos,
+} = localCodexLogScanner;
 const MINIMUM_AUTOMATIC_PARALLEL_BACKFILL_BYTES = 1024 * 1024 * 1024;
 
 // Incremental ingest: advance the live unified index by exactly the bytes the

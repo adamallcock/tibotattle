@@ -38,7 +38,6 @@ The premise that `src/` contains about 30 one-off files is incorrect:
 | `apps/local/` | 2 JavaScript files | 5,400 | Loopback companion and its large integration test |
 | `apps/macos/` | 2 source files | 2,800 | Native launcher, lifecycle, onboarding, and updater shell |
 | `apps/worker/` | 64 TypeScript/JavaScript files | 41,900 | Central API, persistence, ingestion, aggregation, and operations |
-| `apps/cloud-run/` | 8 code files | 1,300 | Cloud Run runtime adapter |
 | `packages/accounting/` | 5 runtime/type files | 1,500 | Runtime-neutral exact API-price-equivalent accounting |
 | `test/` | 122 test files | 41,100 | Root behavior, integration, privacy, and release tests |
 
@@ -142,7 +141,6 @@ apps/
   macos/                 native delivery adapter and Swift package
   web/                   browser UI only
   worker/                edge API delivery adapter and infrastructure
-  cloud-run/             Cloud Run delivery adapter
 
 packages/
   accounting/            price registry and exact cost calculation
@@ -619,7 +617,7 @@ macOS bundle-discovery guarantees.
 - `packages/telemetry-contract` now owns v0.1/v0.2 telemetry validation,
   normalization, closed allowlists, envelope validation, fixed content-free
   errors, and canonical v0.2 JSON Schemas behind one reviewed package export.
-- Root, local, browser, Worker, and contained Cloud Run compatibility tests use
+- Root, local, browser, and Worker compatibility tests use
   the same frozen golden, legacy-ID, malformed, hostile-object, and
   content-bearing fixtures. Cryptography, HTTP, participant authorization,
   persistence, and filesystem behavior remain in their runtime adapters.

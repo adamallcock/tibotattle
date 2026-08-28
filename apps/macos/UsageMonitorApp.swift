@@ -1706,6 +1706,10 @@ private struct CompanionResources {
 }
 
 private final class CompanionProcess {
+    private static let activeInstanceErrorCodes: Set<String> = [
+        "automatic_contribution_instance_active",
+        "automatic_contribution_retirement_instance_active",
+    ]
     private let centralService: CentralServiceConfiguration?
     private let codexHome: URL
     private let lock = NSLock()
@@ -1885,7 +1889,12 @@ private final class CompanionProcess {
         if pendingStandardError.utf8.count > 8_192 {
             pendingStandardError = String(pendingStandardError.suffix(4_096))
         }
-        if pendingStandardError.contains("automatic_contribution_instance_active") {
+        let diagnosticTokens = pendingStandardError.split { character in
+            !character.isLetter && !character.isNumber && character != "_"
+        }
+        if diagnosticTokens.contains(where: {
+            Self.activeInstanceErrorCodes.contains(String($0))
+        }) {
             activeInstanceDetected = true
         }
         lock.unlock()
@@ -7495,7 +7504,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 // the one-time result, so no provider host is ever asked of this web view and
 // no browser tab has to be kept open to finish.
 
-private func endpointReportsReady(_ url: URL) -> Bool {
+private func endpointReportsHealthy(_ url: URL) -> Bool {
     let completed = DispatchSemaphore(value: 0)
     let stateLock = NSLock()
     var passed = false
@@ -7510,7 +7519,7 @@ private func endpointReportsReady(_ url: URL) -> Bool {
            let data,
            let object = try? JSONSerialization.jsonObject(with: data)
                 as? [String: Any],
-           object["status"] as? String == "ready" {
+           object["status"] as? String == "ok" {
             passed = true
         }
         stateLock.unlock()
@@ -7629,8 +7638,8 @@ private enum SmokeTest {
         _ = health.wait(timeout: .now() + .seconds(7))
         session.invalidateAndCancel()
 
-        let centralWasReady = !requireCentralService || endpointReportsReady(
-            selectedURL.appendingPathComponent("api/ready")
+        let centralWasHealthy = !requireCentralService || endpointReportsHealthy(
+            selectedURL.appendingPathComponent("api/health")
         )
         companion.stop { stopped.signal() }
         let stoppedCleanly =
@@ -7644,15 +7653,15 @@ private enum SmokeTest {
             )
             return 1
         }
-        guard centralWasReady else {
+        guard centralWasHealthy else {
             FileHandle.standardError.write(
-                Data("macOS smoke: central readiness check failed\n".utf8)
+                Data("macOS smoke: central health check failed\n".utf8)
             )
             return 1
         }
         if requireCentralService {
             print(
-                "USAGE_MONITOR_MACOS_CENTRAL_SMOKE_READY "
+                "USAGE_MONITOR_MACOS_CENTRAL_SMOKE_HEALTHY "
                     + "host=\(loopbackHost) "
                     + "port=\(selectedURL.port ?? 0) "
                     + "central=\(centralService?.mode.rawValue ?? "invalid")"
@@ -9999,6 +10008,9 @@ private struct UsageMonitorMain {
         // constructing the production login-item adapter.
         if arguments.contains("--login-item-contract-smoke-test") {
             exit(LoginItemContractSmokeTest.run())
+        }
+        if arguments.contains("--keychain-broker-contract-smoke-test") {
+            exit(ContributionDeviceKeychainBroker.runContractSmokeTest())
         }
         let semanticOpenTarget = SemanticOpenTarget(
             scheme: BundledProduct.appOpenScheme,

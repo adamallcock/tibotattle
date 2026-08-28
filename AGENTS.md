@@ -26,7 +26,6 @@ outcomes over tutorials or canned examples.
 | Browser dashboard or public web UI | `apps/web/AGENTS.md` |
 | Native macOS, app bundles, updater, or signing | `apps/macos/AGENTS.md` |
 | Hosted Worker, D1/R2, auth, or deployment | `apps/worker/AGENTS.md` |
-| Contained Cloud Run experiment or Google Cloud IAM | `apps/cloud-run/AGENTS.md` |
 | Standalone local-review CLI, artifact, install, or deletion | `local-review/AGENTS.md` |
 | Exact accounting or price semantics | `packages/accounting/AGENTS.md` |
 | Pseudonym derivation or identity continuity | `packages/identity-core/AGENTS.md` |
@@ -128,8 +127,8 @@ and updated authoritative documentation.
 
 ## Validation
 
-- Use pnpm for the root workspace. The Worker and Cloud Run apps have independent
-  npm lockfiles. Do not mix lockfile ownership.
+- Use pnpm for the root workspace. The Worker app has an independent npm
+  lockfile. Do not mix lockfile ownership.
 - Root tooling requires Node.js 22.13 or newer. Native macOS bundle work requires
   macOS arm64 and exactly Node.js 26.2.0; unsupported environments must fail
   honestly rather than produce partial proof.

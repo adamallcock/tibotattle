@@ -1997,36 +1997,60 @@ test("foreground re-reads account scope before attributing a rate-limit notifica
   let currentEmail = "first.owner@example.test";
   let credentialLoads = 0;
   let nowMs = Date.parse("2026-07-23T00:01:00.000Z");
+  let accountReads = 0;
+  let activeClient;
+  let foreground;
+  let hardStop;
+  let markInitialAccountRead;
+  const initialAccountRead = new Promise((resolve) => { markInitialAccountRead = resolve; });
+  let markNotificationAccountRead;
+  const notificationAccountRead = new Promise((resolve) => { markNotificationAccountRead = resolve; });
   class SwitchingClient extends EventEmitter {
-    async start() {
-      setTimeout(() => {
-        currentEmail = "second.owner@example.test";
-        nowMs = Date.parse("2026-07-23T00:01:02.000Z");
-        this.emit("rateLimitsUpdated", appPayload(3));
-        setTimeout(() => {
-          appendFile(fixture.rollout, `${tokenRecord("2026-07-23T00:01:02.000Z", usage(10), usage(10), 3)}\n`);
-        }, 5);
-      }, 10);
-    }
+    async start() {}
     async readRateLimits() { return appPayload(2); }
-    async readAccount() { return { account: { email: currentEmail, planType: "pro" } }; }
+    async readAccount() {
+      accountReads += 1;
+      const account = { account: { email: currentEmail, planType: "pro" } };
+      if (accountReads === 1) markInitialAccountRead();
+      if (accountReads === 2) markNotificationAccountRead();
+      return account;
+    }
     async readAccountUsage() { return { dailyUsageBuckets: [] }; }
     close() {}
   }
   try {
-    const hardStop = setTimeout(() => controller.abort(), 10_000);
-    const foreground = runCollectorForeground({
+    hardStop = setTimeout(() => controller.abort(), 10_000);
+    foreground = runCollectorForeground({
       ...fixture,
       signal: controller.signal,
       staleAfterMs: 0,
       reconciliationMs: 20,
-      appServerFactory: () => new SwitchingClient(),
+      appServerFactory: () => {
+        activeClient = new SwitchingClient();
+        return activeClient;
+      },
       loadAccountObservationSecret: async () => {
         credentialLoads += 1;
         return Buffer.from(secret);
       },
       clock: () => nowMs,
     });
+    await Promise.race([
+      initialAccountRead,
+      foreground.then(() => {
+        throw new Error("collector stopped before the initial account read");
+      }),
+    ]);
+    currentEmail = "second.owner@example.test";
+    nowMs = Date.parse("2026-07-23T00:01:02.000Z");
+    activeClient.emit("rateLimitsUpdated", appPayload(3));
+    await Promise.race([
+      notificationAccountRead,
+      foreground.then(() => {
+        throw new Error("collector stopped before the notification account re-read");
+      }),
+    ]);
+    await appendFile(fixture.rollout, `${tokenRecord("2026-07-23T00:01:02.000Z", usage(10), usage(10), 3)}\n`);
     for (let attempt = 0; attempt < 500; attempt += 1) {
       const pending = await readLines(fixture.dataFile);
       if (pending.some((record) => record.kind === "codex_rollout_usage_snapshot")) break;
@@ -2045,6 +2069,9 @@ test("foreground re-reads account scope before attributing a rate-limit notifica
     assert.ok(credentialLoads >= 2, "initial read and notification must independently reload the account capability");
     assert.equal(JSON.stringify(records).includes("owner@example.test"), false);
   } finally {
+    clearTimeout(hardStop);
+    controller.abort();
+    await foreground?.catch(() => {});
     await rm(fixture.root, { recursive: true });
   }
 });
@@ -2149,9 +2176,14 @@ test("foreground coalesces a notification burst to one pending payload and re-re
   }
 });
 
-test("foreground notification processing preserves locked and unavailable credential reasons", async () => {
+test("foreground notification processing preserves credential recovery reasons", async () => {
   for (const [credentialCode, expectedReason, diagnostic] of [
     ["account_observation_credential_locked", "credential_locked", "accountCredentialLocked"],
+    [
+      "account_observation_credential_migration_required",
+      "credential_migration_required",
+      "accountCredentialMigrationRequired",
+    ],
     ["account_observation_credential_unavailable", "credential_unavailable", "accountCredentialUnavailable"],
   ]) {
     const fixture = await collectorFixture();
@@ -2159,6 +2191,11 @@ test("foreground notification processing preserves locked and unavailable creden
     let activeClient;
     let credentialLoads = 0;
     let foreground;
+    let hardStop;
+    let markClientStarted;
+    const clientStarted = new Promise((resolve) => {
+      markClientStarted = resolve;
+    });
     class CredentialStateClient extends EventEmitter {
       async start() {}
       async readRateLimits() { return appPayload(2); }
@@ -2167,6 +2204,7 @@ test("foreground notification processing preserves locked and unavailable creden
       close() {}
     }
     try {
+      hardStop = setTimeout(() => controller.abort(), 10_000);
       foreground = runCollectorForeground({
         ...fixture,
         signal: controller.signal,
@@ -2174,6 +2212,7 @@ test("foreground notification processing preserves locked and unavailable creden
         reconciliationMs: 60_000,
         appServerFactory: () => {
           activeClient = new CredentialStateClient();
+          markClientStarted();
           return activeClient;
         },
         loadAccountObservationSecret: async () => {
@@ -2185,6 +2224,12 @@ test("foreground notification processing preserves locked and unavailable creden
         },
         clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
       });
+      await Promise.race([
+        clientStarted,
+        foreground.then(() => {
+          throw new Error("collector stopped before the credential-state client started");
+        }),
+      ]);
       for (let attempt = 0; attempt < 500; attempt += 1) {
         const records = await readLines(fixture.dataFile);
         if (records.some((record) => record.source === "app_server_read")) break;
@@ -2207,6 +2252,7 @@ test("foreground notification processing preserves locked and unavailable creden
       assert.equal(JSON.stringify({ notification, diagnostics: result.diagnostics })
         .includes("DO-NOT-LEAK-foreground-credential"), false);
     } finally {
+      clearTimeout(hardStop);
       controller.abort();
       await foreground?.catch(() => {});
       await rm(fixture.root, { recursive: true });

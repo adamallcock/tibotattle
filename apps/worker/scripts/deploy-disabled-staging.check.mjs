@@ -33,7 +33,7 @@ function containedHealth() {
     },
     capabilities: {
       encryptedUpload: false,
-      delayedAggregateStats: false,
+      communityDaily: false,
       ongoingDeviceUploadRegistration: false,
     },
   };

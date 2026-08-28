@@ -112,32 +112,15 @@ const TIMELINE_WEIGHTING_STATUS_CODE = Object.freeze({
   unknown: 2,
 });
 
-const REPORTS = Object.freeze([
-  {
-    id: "gradient",
-    title: "Cost versus quota gradient",
-    href: "/reports/gradient",
-    file: "2026-07-24-simple-quota-gradient-report.html",
-  },
-  {
-    id: "weekly",
-    title: "Seven-day calibration",
-    href: "/reports/weekly",
-    file: "2026-07-24-weekly-7-day-calibration-report.html",
-  },
-  {
-    id: "quality",
-    title: "Monitoring quality",
-    href: "/reports/quality",
-    file: "2026-07-24-monitoring-quality-report.html",
-  },
-  {
-    id: "multi_surface",
-    title: "Multi-surface account usage",
-    href: "/reports/multi-surface",
-    file: "2026-07-24-codex-work-account-usage-report.html",
-  },
-]);
+// These operator pages are direct HTML routes, not a browser data projection.
+// Keep the fixed route-to-file map beside the snapshot builder so the local
+// server can serve the reviewed pages without scanning or publishing an index.
+export const LOCAL_COMPANION_REPORT_FILES = Object.freeze({
+  "/reports/gradient": "2026-07-24-simple-quota-gradient-report.html",
+  "/reports/weekly": "2026-07-24-weekly-7-day-calibration-report.html",
+  "/reports/quality": "2026-07-24-monitoring-quality-report.html",
+  "/reports/multi-surface": "2026-07-24-codex-work-account-usage-report.html",
+});
 
 const ARTIFACTS = Object.freeze({
   gradient: Object.freeze({
@@ -1844,19 +1827,6 @@ function summarizeUsage(records, nowMs) {
   return periods.map((period) => finalizeUsagePeriod(period.summary));
 }
 
-async function reportProjection(root) {
-  return Promise.all(REPORTS.map(async ({ file, ...report }) => {
-    try {
-      const reportPath = await resolveLocalLegacyReportReadPath(root, file);
-      const metadata = await lstat(reportPath);
-      if (metadata.isSymbolicLink() || !metadata.isFile()) throw new Error("not_file");
-      return { ...report, status: "available", updatedAt: metadata.mtime.toISOString() };
-    } catch {
-      return { ...report, status: "unavailable", updatedAt: null };
-    }
-  }));
-}
-
 // Accounting period identifiers mapped to their trailing window. "all" has no
 // bound and is deliberately absent rather than given a sentinel duration.
 const FAST_MODE_PERIOD_WINDOW_MS = Object.freeze({
@@ -2562,7 +2532,7 @@ export async function buildLocalCompanionSnapshot({
   if (typeof allowDevelopmentArtifactFallback !== "boolean") {
     throw new TypeError("allowDevelopmentArtifactFallback must be a boolean");
   }
-  const [gradient, quality, collector, reports] = await Promise.all([
+  const [gradient, quality, collector] = await Promise.all([
     projectArtifact(root, "gradient"),
     projectArtifact(root, "quality"),
     readCollectorProjection(collectorStateFile, nowMs, {
@@ -2576,7 +2546,6 @@ export async function buildLocalCompanionSnapshot({
         && !unifiedAvailable,
       declaredSpeedBaselines,
     }),
-    reportProjection(root),
   ]);
   // Serve-stale-labeled (2026-08-19): when the prior cache was refused ONLY
   // because the accounting semantics version changed — the state every
@@ -3400,7 +3369,6 @@ export async function buildLocalCompanionSnapshot({
     gradient,
     weekly,
     quality,
-    reports,
   };
 }
 
@@ -3731,15 +3699,4 @@ export class LocalCompanionDataStore {
     return structuredClone(this.#required().quality);
   }
 
-  getReports() {
-    return {
-      schemaVersion: this.#required().schemaVersion,
-      reports: structuredClone(this.#required().reports),
-    };
-  }
 }
-
-export const LOCAL_COMPANION_REPORTS = REPORTS.map(({ file: _file, ...report }) => Object.freeze(report));
-export const LOCAL_COMPANION_REPORT_FILES = Object.freeze(
-  Object.fromEntries(REPORTS.map((report) => [report.href, report.file])),
-);

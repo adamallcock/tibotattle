@@ -18,7 +18,7 @@ Two distinct surfaces share this repository:
   works fully offline. Issues that break the privacy model — content leaving
   the machine without consent, prompts/responses/paths entering derived
   artifacts, loopback exposure — are in scope and treated as high priority.
-- **Hosted contribution service** (`apps/worker`, `apps/cloud-run`, served at
+- **Hosted contribution service** (`apps/worker`, served at
   [tibotattle.com](https://tibotattle.com)): operated by the maintainer.
   Issues affecting the hosted aggregates, contributor pseudonymity, or the
   upload/deletion endpoints are in scope. Please do not run disruptive

@@ -33,6 +33,7 @@ import {
   runBackendLifecycle,
 } from "../src/retention";
 import {
+  telemetryContributionAdmission,
   telemetryContributionAdmissionWindow,
 } from "../src/telemetry-repository";
 import { warmAdminMetricsHistoryCache } from "../src/admin-metrics-history";
@@ -66,10 +67,6 @@ interface EnrollmentResponse {
 let publicJwkJson = "";
 let privateJwkJson = "";
 let keyId = "";
-
-function recoveryAttemptId(): string {
-  return `um_recovery_attempt_${encodeBase64Url(crypto.getRandomValues(new Uint8Array(32)))}`;
-}
 
 function testBindings(
   overrides: Partial<
@@ -220,22 +217,6 @@ async function setCollectionControls(
   return flags;
 }
 
-function contributionResource(
-  participant: EnrollmentResponse,
-  contributionId: string,
-  operation: "read" | "delete",
-  runtimeEnv = testBindings(),
-): Promise<Response> {
-  return api(`/api/v1/me/contributions/${operation}`, {
-    method: "POST",
-    headers: {
-      ...personalHeaders(participant, { csrf: true }),
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ contributionId }),
-  }, runtimeEnv);
-}
-
 async function enroll(): Promise<EnrollmentResponse> {
   const response = await api("/api/v1/enroll", {
     method: "POST",
@@ -345,27 +326,6 @@ async function encryptRaw(
   };
 }
 
-async function registerUpload(
-  participant: EnrollmentResponse,
-  rawEnvelope: string,
-  runtimeEnv = testBindings(),
-): Promise<{ uploadAuthorization: string; expiresAt: string }> {
-  const response = await api("/api/v1/me/upload-authorizations", {
-    method: "POST",
-    headers: {
-      ...personalHeaders(participant, { csrf: true }),
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      envelopeDigest: await sha256Hex(rawEnvelope),
-      contentLengthBytes: new TextEncoder().encode(rawEnvelope).byteLength,
-      contentType: "application/json",
-    }),
-  }, runtimeEnv);
-  expect(response.status).toBe(201);
-  return response.json<{ uploadAuthorization: string; expiresAt: string }>();
-}
-
 interface PairedDevice {
   deviceId: string;
   deviceSecret: string;
@@ -391,6 +351,7 @@ async function deviceSecretHash(
 
 async function pairDevice(
   participant: EnrollmentResponse,
+  runtimeEnv = testBindings(),
 ): Promise<PairedDevice> {
   const pairingResponse = await api("/api/v1/me/device-pairings", {
     method: "POST",
@@ -402,7 +363,7 @@ async function pairDevice(
       consentVersion: "ongoing-privacy-safe-telemetry-v0.1",
       ongoingUpload: true,
     }),
-  });
+  }, runtimeEnv);
   expect(pairingResponse.status).toBe(201);
   const pairing = await pairingResponse.json<{
     pairingCode: string;
@@ -422,7 +383,7 @@ async function pairDevice(
       "content-type": "application/json",
     },
     body: JSON.stringify({ deviceId, deviceSecretHash: hashedDeviceSecret }),
-  });
+  }, runtimeEnv);
   expect(claimed.status).toBe(201);
   await expect(claimed.json()).resolves.toEqual({
     deviceId,
@@ -440,6 +401,7 @@ async function pairDevice(
 async function registerDeviceUpload(
   device: PairedDevice,
   rawEnvelope: string,
+  runtimeEnv = testBindings(),
 ): Promise<{ uploadAuthorization: string; expiresAt: string }> {
   const response = await api("/api/v1/device/upload-authorizations", {
     method: "POST",
@@ -452,9 +414,24 @@ async function registerDeviceUpload(
       contentLengthBytes: new TextEncoder().encode(rawEnvelope).byteLength,
       contentType: "application/json",
     }),
-  });
+  }, runtimeEnv);
   expect(response.status).toBe(201);
   return response.json<{ uploadAuthorization: string; expiresAt: string }>();
+}
+
+const pairedDevices = new Map<string, PairedDevice>();
+
+async function registerUpload(
+  participant: EnrollmentResponse,
+  rawEnvelope: string,
+  runtimeEnv = testBindings(),
+): Promise<{ uploadAuthorization: string; expiresAt: string }> {
+  let device = pairedDevices.get(participant.participantId);
+  if (device === undefined) {
+    device = await pairDevice(participant, runtimeEnv);
+    pairedDevices.set(participant.participantId, device);
+  }
+  return registerDeviceUpload(device, rawEnvelope, runtimeEnv);
 }
 
 async function uploadEnvelope(
@@ -664,6 +641,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
+  pairedDevices.clear();
   await reset();
   const bindings = env as TestBindings;
   await applyD1Migrations(bindings.USAGE_MONITOR_DB, bindings.TEST_MIGRATIONS);
@@ -922,7 +900,7 @@ describe("synthetic usage monitor service", () => {
     expect(expired.status).toBe(401);
   });
 
-  it("requires same-origin CSRF for session mutations and issues no authority on failure", async () => {
+  it("requires same-origin enrollment and keeps retired session upload minting absent", async () => {
     const crossOrigin = await api("/api/v1/enroll", {
       method: "POST",
       headers: {
@@ -970,7 +948,10 @@ describe("synthetic usage monitor service", () => {
         headers,
         body: registrationBody,
       });
-      expect(rejected.status).toBe(403);
+      expect(rejected.status).toBe(404);
+      await expect(rejected.json()).resolves.toMatchObject({
+        error: { code: "NOT_FOUND" },
+      });
     }
     const authorizationCount = await testBindings().USAGE_MONITOR_DB.prepare(
       "SELECT COUNT(*) AS total FROM upload_authorizations",
@@ -998,7 +979,7 @@ describe("synthetic usage monitor service", () => {
     const uploadReadsPersonal = await api("/api/v1/me", {
       headers: { authorization: `Upload ${authorization.uploadAuthorization}` },
     });
-    expect(uploadReadsPersonal.status).toBe(401);
+    expect(uploadReadsPersonal.status).toBe(405);
 
     const wrongScope = await api("/api/v1/contributions", {
       method: "POST",
@@ -1046,7 +1027,7 @@ describe("synthetic usage monitor service", () => {
     expect(personal.headers.get("cache-control")).toBe("no-store");
     for (const secretPrefix of [
       "um_session_",
-      "um_upload_",
+      "um_device_upload_",
       "um_recovery_",
       "um_csrf_",
       "__Host-usage_monitor_session",
@@ -1060,9 +1041,9 @@ describe("synthetic usage monitor service", () => {
     const expiredRaw = JSON.stringify(await encrypt(telemetryFixture("a"), true));
     const expiredAuthorization = await registerUpload(expiredParticipant, expiredRaw);
     const expiredId = expiredAuthorization.uploadAuthorization
-      .match(/^um_upload_([^.]+)\./u)?.[1];
+      .match(/^um_device_upload_([^.]+)\./u)?.[1];
     await testBindings().USAGE_MONITOR_DB.prepare(
-      "UPDATE upload_authorizations SET expires_at = ? WHERE id = ?",
+      "UPDATE device_upload_authorizations SET expires_at = ? WHERE id = ?",
     ).bind(new Date(Date.now() - 1_000).toISOString(), expiredId).run();
     const expired = await api("/api/v1/contributions", {
       method: "POST",
@@ -1097,8 +1078,8 @@ describe("synthetic usage monitor service", () => {
     ]);
     expect(responses.map((response) => response.status).sort()).toEqual([202, 401]);
     const state = await testBindings().USAGE_MONITOR_DB.prepare(
-      "SELECT state, consumed_contribution_id FROM upload_authorizations WHERE id = ?",
-    ).bind(authorization.uploadAuthorization.match(/^um_upload_([^.]+)\./u)?.[1])
+      "SELECT state, consumed_contribution_id FROM device_upload_authorizations WHERE id = ?",
+    ).bind(authorization.uploadAuthorization.match(/^um_device_upload_([^.]+)\./u)?.[1])
       .first<{ state: string; consumed_contribution_id: string | null }>();
     expect(state?.state).toBe("consumed");
     expect(state?.consumed_contribution_id).toMatch(/^contribution:/u);
@@ -1141,9 +1122,9 @@ describe("synthetic usage monitor service", () => {
     await putReached;
 
     const authorizationId = authorization.uploadAuthorization
-      .match(/^um_upload_([^.]+)\./u)?.[1];
+      .match(/^um_device_upload_([^.]+)\./u)?.[1];
     const inFlight = await testBindings().USAGE_MONITOR_DB.prepare(
-      "SELECT state FROM upload_authorizations WHERE id = ?",
+      "SELECT state FROM device_upload_authorizations WHERE id = ?",
     ).bind(authorizationId).first<{ state: string }>();
     expect(inFlight?.state).toBe("consuming");
 
@@ -1153,7 +1134,7 @@ describe("synthetic usage monitor service", () => {
     });
     expect(reset.status).toBe(200);
     const stillConsuming = await testBindings().USAGE_MONITOR_DB.prepare(
-      "SELECT state FROM upload_authorizations WHERE id = ?",
+      "SELECT state FROM device_upload_authorizations WHERE id = ?",
     ).bind(authorizationId).first<{ state: string }>();
     expect(stillConsuming?.state).toBe("consuming");
 
@@ -1176,20 +1157,20 @@ describe("synthetic usage monitor service", () => {
     const receipt = await accepted.json<{ contributionId: string }>();
     const audited = await testBindings().USAGE_MONITOR_DB.prepare(
       `SELECT u.state, u.consumed_contribution_id,
-              t.upload_authorization_id
-         FROM upload_authorizations u
+              t.device_upload_authorization_id
+         FROM device_upload_authorizations u
          JOIN telemetry_contributions t
-           ON t.upload_authorization_id = u.id
+           ON t.device_upload_authorization_id = u.id
         WHERE u.id = ?`,
     ).bind(authorizationId).first<{
       state: string;
       consumed_contribution_id: string;
-      upload_authorization_id: string;
+      device_upload_authorization_id: string;
     }>();
     expect(audited).toEqual({
       state: "consumed",
       consumed_contribution_id: receipt.contributionId,
-      upload_authorization_id: authorizationId,
+      device_upload_authorization_id: authorizationId,
     });
   });
 
@@ -1229,9 +1210,9 @@ describe("synthetic usage monitor service", () => {
     }, testBindings({ QUARANTINE: pausedBucket }));
     await putReached;
     const authorizationId = authorization.uploadAuthorization
-      .match(/^um_upload_([^.]+)\./u)?.[1];
+      .match(/^um_device_upload_([^.]+)\./u)?.[1];
     await testBindings().USAGE_MONITOR_DB.prepare(
-      `UPDATE upload_authorizations
+      `UPDATE device_upload_authorizations
           SET consume_lease_expires_at = ?
         WHERE id = ? AND state = 'consuming'`,
     ).bind(new Date(Date.now() - 1_000).toISOString(), authorizationId).run();
@@ -1245,7 +1226,7 @@ describe("synthetic usage monitor service", () => {
     expect(persisted?.total).toBe(0);
     expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
     const state = await testBindings().USAGE_MONITOR_DB.prepare(
-      "SELECT state, consumed_contribution_id FROM upload_authorizations WHERE id = ?",
+      "SELECT state, consumed_contribution_id FROM device_upload_authorizations WHERE id = ?",
     ).bind(authorizationId).first<{
       state: string;
       consumed_contribution_id: string | null;
@@ -1259,7 +1240,7 @@ describe("synthetic usage monitor service", () => {
     expect(deletion.status).toBe(200);
   });
 
-  it("security reset revokes uploads and rotates recovery while logout revokes the session", async () => {
+  it("security reset revokes device authority while logout revokes the session", async () => {
     const participant = await enrollTelemetry();
     const pendingRaw = JSON.stringify(await encrypt(telemetryFixture("a"), true));
     const pending = await registerUpload(participant, pendingRaw);
@@ -1314,12 +1295,12 @@ describe("synthetic usage monitor service", () => {
       body: devicePendingRaw,
     });
     expect(revokedDeviceUpload.status).toBe(401);
-    const oldRecovery = await api("/api/v1/recover", {
+    const retiredRecovery = await api("/api/v1/recover", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ recoveryCode: participant.recoveryCode, recoveryAttemptId: recoveryAttemptId() }),
+      body: JSON.stringify({ recoveryCode: participant.recoveryCode }),
     });
-    expect(oldRecovery.status).toBe(401);
+    expect(retiredRecovery.status).toBe(404);
 
     const noCsrfLogout = await api("/api/v1/logout", {
       method: "POST",
@@ -1720,7 +1701,7 @@ describe("synthetic usage monitor service", () => {
     expect(eligible?.total).toBe(1);
   });
 
-  it("separates coarse and per-client enrollment, sign-in, and recovery limits without identifiers", async () => {
+  it("separates coarse and per-client enrollment, sign-in, and device limits without identifiers", async () => {
     const limiterKeys: string[] = [];
     const allowedLimiter = {
       async limit(input: { key: string }): Promise<{ success: boolean }> {
@@ -1758,21 +1739,6 @@ describe("synthetic usage monitor service", () => {
       }));
       expect(enrollment.status).toBe(429);
 
-      const participant = await enroll();
-      const recovery = await api("/api/v1/recover", {
-        method: "POST",
-        headers: {
-          "cf-connecting-ip": "PRIVATE_IP_CANARY",
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ recoveryCode: participant.recoveryCode, recoveryAttemptId: recoveryAttemptId() }),
-      }, testBindings({
-        ENROLLMENT_RATE_LIMIT: allowedLimiter,
-        RECOVERY_RATE_LIMIT: allowedLimiter,
-        CLIENT_ATTEMPT_RATE_LIMIT: clientBlockedLimiter,
-        IDENTITY_LINK_SECRET: "rate-limit-secret-for-tests-0123456789abcdef",
-      }));
-      expect(recovery.status).toBe(429);
       const signInStart = await api("/api/v1/identity/google/start", {
         method: "POST",
         headers: {
@@ -1809,17 +1775,16 @@ describe("synthetic usage monitor service", () => {
     expect(limiterKeys).toContain(
       "usage-monitor:enrollment:global",
     );
-    expect(limiterKeys).toContain("usage-monitor:recovery:global");
     expect(limiterKeys).toContain("usage-monitor:sign_in_start:global");
     expect(limiterKeys).toContain("usage-monitor:device_disconnect:global");
     const clientKeys = limiterKeys.filter((key) => key.includes(":client:"));
-    expect(clientKeys).toHaveLength(4);
+    expect(clientKeys).toHaveLength(3);
     for (const key of clientKeys) {
       expect(key).toMatch(/:client:[0-9a-f]{64}$/u);
       expect(key).not.toContain("PRIVATE_IP_CANARY");
       expect(key).not.toContain("203.0.113.9");
     }
-    expect(new Set(clientKeys).size).toBe(4);
+    expect(new Set(clientKeys).size).toBe(3);
     expect(warnings.join("\n")).not.toContain("PRIVATE_PATH_CANARY");
     expect(warnings.join("\n")).not.toContain("PRIVATE_CAPABILITY_CANARY");
     const attemptsTable = await testBindings().USAGE_MONITOR_DB.prepare(
@@ -1829,8 +1794,9 @@ describe("synthetic usage monitor service", () => {
     expect(attemptsTable?.total).toBe(0);
   });
 
-  it("limits upload authorization before parsing the body and never places a participant identifier in the rate key", async () => {
-    const participant = await enroll();
+  it("limits device upload authorization before parsing the body and never places a participant identifier in the rate key", async () => {
+    const participant = await enrollTelemetry();
+    const device = await pairDevice(participant);
     const limiterKeys: string[] = [];
     const allowedLimiter = {
       async limit(input: { key: string }): Promise<{ success: boolean }> {
@@ -1845,10 +1811,10 @@ describe("synthetic usage monitor service", () => {
       },
     } satisfies RateLimit;
 
-    const response = await api("/api/v1/me/upload-authorizations", {
+    const response = await api("/api/v1/device/upload-authorizations", {
       method: "POST",
       headers: {
-        ...personalHeaders(participant, { csrf: true }),
+        authorization: `Device ${device.authorization}`,
         "content-type": "application/json",
       },
       // A limiter rejection must win over this malformed request body.
@@ -1875,8 +1841,8 @@ describe("synthetic usage monitor service", () => {
   });
 
   it("returns the shared-ingress retry deadline without consuming a token that could not enter", async () => {
-    const participant = await enroll();
-    const rawEnvelope = JSON.stringify(await encrypt(syntheticFixture()));
+    const participant = await enrollTelemetry();
+    const rawEnvelope = JSON.stringify(await encrypt(telemetryFixture("f"), true));
     const authorization = await registerUpload(participant, rawEnvelope);
     const blockedBudget = {
       getByName() {
@@ -1916,14 +1882,12 @@ describe("synthetic usage monitor service", () => {
       body: rawEnvelope,
     });
     expect(replay.status).toBe(202);
-    await expect(replay.json()).resolves.toMatchObject({
-      status: "accepted_synthetic",
-    });
+    await expect(replay.json()).resolves.toMatchObject({ status: "accepted" });
   });
 
   it("sheds a valid-looking public upload before its body is consumed or token claimed", async () => {
-    const participant = await enroll();
-    const rawEnvelope = JSON.stringify(await encrypt(syntheticFixture()));
+    const participant = await enrollTelemetry();
+    const rawEnvelope = JSON.stringify(await encrypt(telemetryFixture("e"), true));
     const authorization = await registerUpload(participant, rawEnvelope);
     const allowedLimiter = {
       async limit(): Promise<{ success: boolean }> { return { success: true }; },
@@ -1987,14 +1951,15 @@ describe("synthetic usage monitor service", () => {
   });
 
   it("does not issue upload tokens or report traffic ready when ingress is misconfigured", async () => {
-    const participant = await enroll();
+    const participant = await enrollTelemetry();
+    const device = await pairDevice(participant);
     const broken = testBindings({
       UPLOAD_INGRESS_QUEUE_MODE: "queues" as unknown as Env["UPLOAD_INGRESS_QUEUE_MODE"],
     });
-    const registration = await api("/api/v1/me/upload-authorizations", {
+    const registration = await api("/api/v1/device/upload-authorizations", {
       method: "POST",
       headers: {
-        ...personalHeaders(participant, { csrf: true }),
+        authorization: `Device ${device.authorization}`,
         "content-type": "application/json",
       },
       body: JSON.stringify({
@@ -2015,16 +1980,17 @@ describe("synthetic usage monitor service", () => {
   });
 
   it("maps a failed upload admission binding to a retryable service response", async () => {
-    const participant = await enroll();
+    const participant = await enrollTelemetry();
+    const device = await pairDevice(participant);
     const unavailable = {
       async limit(): Promise<{ success: boolean }> {
         throw new Error("rate binding unavailable");
       },
     } satisfies RateLimit;
-    const response = await api("/api/v1/me/upload-authorizations", {
+    const response = await api("/api/v1/device/upload-authorizations", {
       method: "POST",
       headers: {
-        ...personalHeaders(participant, { csrf: true }),
+        authorization: `Device ${device.authorization}`,
         "content-type": "application/json",
       },
       body: "{",
@@ -2099,8 +2065,7 @@ describe("synthetic usage monitor service", () => {
         encryptedUpload: true,
         serverValidation: true,
         idempotentDeduplication: true,
-        participantStats: true,
-        delayedAggregateStats: true,
+        communityDaily: true,
         participantExport: true,
         participantDeletion: true,
         boundedQuarantineRetention: true,
@@ -2129,63 +2094,6 @@ describe("synthetic usage monitor service", () => {
     await expect(response.json()).resolves.toMatchObject({
       error: { code: "DEPLOYMENT_SOURCE_COMMIT_INVALID" },
     });
-  });
-
-  it("edge-cache-enables only published immutable community snapshots", async () => {
-    const publicReadKeys: string[] = [];
-    const blockedPublicReadLimiter = {
-      async limit(input: { key: string }): Promise<{ success: boolean }> {
-        publicReadKeys.push(input.key);
-        return { success: false };
-      },
-    } satisfies RateLimit;
-    const limited = await api("/api/v1/stats/aggregate", {}, testBindings({
-      PUBLIC_READ_RATE_LIMIT: blockedPublicReadLimiter,
-    }));
-    expect(limited.status).toBe(429);
-    expect(limited.headers.get("cache-control")).toBe("no-store");
-    expect(publicReadKeys).toEqual([
-      expect.stringMatching(/^usage-monitor:public_aggregate_read:client:[0-9a-f]{64}$/u),
-    ]);
-
-    const unavailable = await api("/api/v1/stats/aggregate");
-    expect(unavailable.status).toBe(200);
-    expect(unavailable.headers.get("cache-control")).toBe("no-store");
-    expect(unavailable.headers.get("etag")).toBeNull();
-
-    await seedPublishedSnapshotWithNoCells();
-    const published = await api("/api/v1/stats/aggregate");
-    expect(published.status).toBe(200);
-    const etag = published.headers.get("etag");
-    expect(etag).toBe('"community-snapshot-community-weekly:2026-07-20-r1"');
-    expect(published.headers.get("cache-control")).toBe(
-      "public, max-age=0, must-revalidate, s-maxage=60",
-    );
-
-    const conditional = await api("/api/v1/community/insights", {
-      headers: { "if-none-match": etag! },
-    });
-    expect(conditional.status).toBe(304);
-    expect(await conditional.text()).toBe("");
-    expect(conditional.headers.get("etag")).toBe(etag);
-
-    const participant = await enroll();
-    const personal = await api("/api/v1/me", {
-      headers: personalHeaders(participant),
-    });
-    expect(personal.status).toBe(200);
-    expect(personal.headers.get("cache-control")).toBe("no-store");
-    const unauthenticatedAdmin = await api("/api/v1/admin/overview");
-    expect(unauthenticatedAdmin.status).toBe(503);
-    expect(unauthenticatedAdmin.headers.get("cache-control")).toBe("no-store");
-  });
-
-  it("does not cache suppressed community snapshots", async () => {
-    await seedSealedSuppressedSnapshot();
-    const response = await api("/api/v1/stats/aggregate");
-    expect(response.status).toBe(200);
-    expect(response.headers.get("cache-control")).toBe("no-store");
-    expect(response.headers.get("etag")).toBeNull();
   });
 
   it("keeps operations owner-gated and exposes only bounded audited controls", async () => {
@@ -2748,32 +2656,18 @@ describe("synthetic usage monitor service", () => {
       contentLengthBytes: new TextEncoder().encode(rawEnvelope).byteLength,
       contentType: "application/json",
     });
-    for (const [path, headers] of [
-      [
-        "/api/v1/me/upload-authorizations",
-        {
-          ...personalHeaders(participant, { csrf: true }),
-          "content-type": "application/json",
-        },
-      ],
-      [
-        "/api/v1/device/upload-authorizations",
-        {
-          authorization: `Device ${device.authorization}`,
-          "content-type": "application/json",
-        },
-      ],
-    ] as const) {
-      const response = await api(path, {
-        method: "POST",
-        headers,
-        body: registrationBody,
-      });
-      expect(response.status).toBe(503);
-      await expect(response.json()).resolves.toMatchObject({
-        error: { code: "UPLOAD_REGISTRATION_DISABLED" },
-      });
-    }
+    const blockedRegistration = await api("/api/v1/device/upload-authorizations", {
+      method: "POST",
+      headers: {
+        authorization: `Device ${device.authorization}`,
+        "content-type": "application/json",
+      },
+      body: registrationBody,
+    });
+    expect(blockedRegistration.status).toBe(503);
+    await expect(blockedRegistration.json()).resolves.toMatchObject({
+      error: { code: "UPLOAD_REGISTRATION_DISABLED" },
+    });
 
     await setCollectionControls({ uploadRegistration: true });
     const authorization = await registerUpload(participant, rawEnvelope);
@@ -2816,24 +2710,19 @@ describe("synthetic usage monitor service", () => {
       error: { code: "COLLECTION_ENROLLMENT_DISABLED" },
     });
 
-    for (const path of ["/api/v1/me/stats", "/api/v1/me/export"]) {
-      const response = await api(path, {
-        headers: personalHeaders(participant),
-      });
-      expect(response.status).toBe(200);
-    }
+    const participantExport = await api("/api/v1/me/export", {
+      headers: personalHeaders(participant),
+    });
+    expect(participantExport.status).toBe(200);
 
     await setCollectionControls({ publication: false });
-    for (const path of [
-      "/api/v1/stats/aggregate",
-      "/api/v1/community/insights",
-    ]) {
-      const response = await api(path);
-      expect(response.status).toBe(503);
-      await expect(response.json()).resolves.toMatchObject({
-        error: { code: "PUBLICATION_DISABLED" },
-      });
-    }
+    const communityDaily = await api(
+      "/api/v1/community/daily?from=2026-07-01&to=2026-07-02",
+    );
+    expect(communityDaily.status).toBe(503);
+    await expect(communityDaily.json()).resolves.toMatchObject({
+      error: { code: "PUBLICATION_DISABLED" },
+    });
 
     await setCollectionControls({
       enrollment: false,
@@ -2854,7 +2743,7 @@ describe("synthetic usage monitor service", () => {
       },
       capabilities: {
         encryptedUpload: false,
-        participantStats: true,
+        communityDaily: false,
         participantExport: true,
         participantDeletion: true,
         ongoingDeviceUploadRegistration: false,
@@ -2906,7 +2795,7 @@ describe("synthetic usage monitor service", () => {
           body: rawEnvelope,
         },
       ],
-      ["/api/v1/stats/aggregate", {}],
+      ["/api/v1/community/daily?from=2026-07-01&to=2026-07-02", {}],
     ] as const) {
       const response = await api(path, init);
       expect(response.status).toBe(503);
@@ -2915,10 +2804,10 @@ describe("synthetic usage monitor service", () => {
       });
     }
 
-    const personalStats = await api("/api/v1/me/stats", {
+    const session = await api("/api/v1/session", {
       headers: personalHeaders(participant),
     });
-    expect(personalStats.status).toBe(200);
+    expect(session.status).toBe(200);
     const deleted = await api("/api/v1/me", {
       method: "DELETE",
       headers: personalHeaders(participant, { csrf: true }),
@@ -2927,284 +2816,54 @@ describe("synthetic usage monitor service", () => {
     expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
   });
 
-  it("accepts the real browser envelope, replays, exports, and deletes it", async () => {
+  it("keeps retired browser upload, recovery, profile, and contribution-resource routes absent", async () => {
     const participant = await enroll();
-    const envelope = await createSyntheticEnvelope({
-      publicJwk: JSON.parse(publicJwkJson) as JsonWebKey,
-      keyId,
-      cryptoImpl: crypto,
-    });
-    const contribution = await uploadEnvelope(participant, envelope);
-    expect(contribution.status).toBe(202);
-    const accepted = await contribution.json<{
-      contributionId: string;
-      status: string;
-    }>();
-    expect(accepted.status).toBe("accepted_synthetic");
-
-    const replay = await uploadEnvelope(participant, envelope);
-    expect(replay.status).toBe(202);
-    expect(replay.headers.get("idempotency-replayed")).toBe("true");
-    await expect(replay.json()).resolves.toEqual(accepted);
-
-    const me = await api("/api/v1/me", {
-      headers: personalHeaders(participant),
-    });
-    expect(me.status).toBe(200);
-    await expect(me.json()).resolves.toMatchObject({
-      schemaVersion: "participant-profile-v0.2",
-      participantId: participant.participantId,
-      contributionCount: 1,
-      latestContribution: {
-        contributionId: accepted.contributionId,
-        quarantine: {
-          state: "retained",
-          canonicalMetadataRetained: true,
-        },
+    const envelope = JSON.stringify(await encrypt(syntheticFixture()));
+    const legacyUpload = `um_upload_${crypto.randomUUID()}.${"a".repeat(43)}`;
+    const rejectedUpload = await api("/api/v1/contributions", {
+      method: "POST",
+      headers: {
+        authorization: `Upload ${legacyUpload}`,
+        "content-type": "application/json",
       },
-      historyPolicy: {
-        maximumItems: 101,
-        quarantineRetentionMilliseconds: null,
-        canonicalMetadataRetainedAfterQuarantine: true,
-        clientSoftwareVersion: "unavailable_in_transport",
-      },
+      body: envelope,
+    });
+    expect(rejectedUpload.status).toBe(401);
+    await expect(rejectedUpload.json()).resolves.toMatchObject({
+      error: { code: "UPLOAD_AUTH_INVALID" },
     });
 
-    const exported = await api("/api/v1/me/export", {
-      headers: personalHeaders(participant),
-    });
-    expect(exported.status).toBe(200);
-    await expect(exported.json()).resolves.toMatchObject({
-      schemaVersion: "participant-export-v0.2",
-      syntheticOnly: true,
-      contributions: [{ fixtureId: "codex-weekly-demo-v0.1" }],
-    });
-    expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(1);
+    for (const [path, method] of [
+      ["/api/v1/recover", "POST"],
+      ["/api/v1/me/upload-authorizations", "POST"],
+      ["/api/v1/me/contributions/read", "POST"],
+      ["/api/v1/me/contributions/delete", "POST"],
+      ["/api/v1/me/stats", "GET"],
+      ["/api/v1/me/insights", "GET"],
+      ["/api/v1/stats/aggregate", "GET"],
+      ["/api/v1/community/insights", "GET"],
+    ] as const) {
+      const response = await api(path, {
+        method,
+        headers: method === "GET"
+          ? personalHeaders(participant)
+          : {
+            ...personalHeaders(participant, { csrf: true }),
+            "content-type": "application/json",
+          },
+        ...(method === "POST" ? { body: "{}" } : {}),
+      });
+      expect(response.status, `${method} ${path}`).toBe(404);
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "NOT_FOUND" },
+      });
+    }
 
-    const deleted = await api("/api/v1/me", {
-      method: "DELETE",
-      headers: personalHeaders(participant, { csrf: true }),
-    });
-    expect(deleted.status).toBe(200);
-    await expect(deleted.json()).resolves.toMatchObject({
-      deleted: true,
-      participantId: participant.participantId,
-      contributionsDeleted: 1,
-    });
-    expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
-    const participantCount = await testBindings().USAGE_MONITOR_DB.prepare(
-      "SELECT COUNT(*) AS total FROM participants",
+    const stored = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM contributions",
     ).first<{ total: number }>();
-    expect(participantCount?.total).toBe(0);
-
-    const oldAccess = await api("/api/v1/me", {
-      headers: personalHeaders(participant),
-    });
-    expect(oldAccess.status).toBe(401);
-    const repeatedDelete = await api("/api/v1/me", {
-      method: "DELETE",
-      headers: personalHeaders(participant, { csrf: true }),
-    });
-    expect(repeatedDelete.status).toBe(401);
+    expect(stored?.total).toBe(0);
   });
-
-  it("rejects real, mutated, oversized, and unauthenticated contributions", async () => {
-    const participant = await enroll();
-    const realEnvelope = {
-      ...(await encrypt(syntheticFixture())),
-      synthetic: false,
-    };
-    const real = await uploadEnvelope(participant, realEnvelope);
-    expect(real.status).toBe(400);
-    await expect(real.json()).resolves.toMatchObject({
-      error: { code: "SYNTHETIC_REQUIRED" },
-    });
-
-    const mutatedFixture = syntheticFixture();
-    mutatedFixture.accounting.estimatedApiCostUsd = "12.840001";
-    const mutated = await uploadEnvelope(participant, await encrypt(mutatedFixture));
-    expect(mutated.status).toBe(400);
-    await expect(mutated.json()).resolves.toMatchObject({
-      error: { code: "SYNTHETIC_RECORD_INVALID" },
-    });
-
-    const extraPlaintext = await uploadEnvelope(
-      participant,
-      await encrypt({
-        ...syntheticFixture(),
-        prompt: "rejected-after-decryption",
-      }),
-    );
-    expect(extraPlaintext.status).toBe(400);
-    await expect(extraPlaintext.json()).resolves.toMatchObject({
-      error: { code: "SYNTHETIC_RECORD_INVALID" },
-    });
-
-    const unauthenticated = await api("/api/v1/contributions", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(await encrypt(syntheticFixture())),
-    });
-    expect(unauthenticated.status).toBe(401);
-
-    const oversized = await api("/api/v1/contributions", {
-      method: "POST",
-      headers: {
-        authorization: "Upload PRIVATE_UPLOAD_CANARY",
-        "content-length": "9999999",
-        "content-type": "application/json",
-      },
-      body: "{}",
-    });
-    expect(oversized.status).toBe(413);
-
-    const wrongContentType = await api("/api/v1/contributions", {
-      method: "POST",
-      headers: {
-        authorization: "Upload PRIVATE_UPLOAD_CANARY",
-        "content-type": "text/plain",
-      },
-      body: "{}",
-    });
-    expect(wrongContentType.status).toBe(415);
-
-    const malformedJson = await api("/api/v1/contributions", {
-      method: "POST",
-      headers: {
-        authorization: "Upload PRIVATE_UPLOAD_CANARY",
-        "content-type": "application/json",
-      },
-      body: "{",
-    });
-    // An unauthenticated header is rejected before a public request's JSON is
-    // parsed; malformed bodies cannot become an unlimited CPU work surface.
-    expect(malformedJson.status).toBe(401);
-
-    const extraEnvelope = {
-      ...(await encrypt(syntheticFixture())),
-      prompt: "rejected-before-decryption",
-    };
-    const extraEnvelopeResponse = await uploadEnvelope(participant, extraEnvelope);
-    expect(extraEnvelopeResponse.status).toBe(400);
-    await expect(extraEnvelopeResponse.json()).resolves.toMatchObject({
-      error: { code: "ENVELOPE_INVALID" },
-    });
-
-    const unknownKeyEnvelope = {
-      ...(await encrypt(syntheticFixture())),
-      keyId: "key:unknown",
-    };
-    const unknownKey = await uploadEnvelope(participant, unknownKeyEnvelope);
-    expect(unknownKey.status).toBe(400);
-    await expect(unknownKey.json()).resolves.toMatchObject({
-      error: { code: "KEY_ID_INVALID" },
-    });
-  });
-
-  it("accepts one contribution only and rejects a distinct valid envelope", async () => {
-    const participant = await enroll();
-    const first = await uploadEnvelope(participant, await encrypt(syntheticFixture()));
-    expect(first.status).toBe(202);
-
-    const distinct = await uploadEnvelope(participant, await encrypt(syntheticFixture()));
-    expect(distinct.status).toBe(429);
-    await expect(distinct.json()).resolves.toMatchObject({
-      error: { code: "CONTRIBUTION_LIMIT_REACHED" },
-    });
-  });
-
-  it("uses recovery once to rotate recovery, sessions, and upload authority", async () => {
-    const participant = await enroll();
-    const attemptId = recoveryAttemptId();
-    const pendingRaw = JSON.stringify(await encrypt(syntheticFixture()));
-    const pendingUpload = await registerUpload(participant, pendingRaw);
-    const recovered = await api("/api/v1/recover", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ recoveryCode: participant.recoveryCode, recoveryAttemptId: attemptId }),
-    });
-    expect(recovered.status).toBe(200);
-    const replacement = await enrollmentFrom(recovered);
-    expect(replacement.participantId).toBe(participant.participantId);
-    expect(replacement.recoveryCode).not.toBe(participant.recoveryCode);
-    expect(replacement.cookie).not.toBe(participant.cookie);
-
-    const oldAccess = await api("/api/v1/me", {
-      headers: personalHeaders(participant),
-    });
-    expect(oldAccess.status).toBe(401);
-    const newAccess = await api("/api/v1/me", {
-      headers: personalHeaders(replacement),
-    });
-    expect(newAccess.status).toBe(200);
-    const revokedUpload = await api("/api/v1/contributions", {
-      method: "POST",
-      headers: {
-        authorization: `Upload ${pendingUpload.uploadAuthorization}`,
-        "content-type": "application/json",
-      },
-      body: pendingRaw,
-    });
-    expect(revokedUpload.status).toBe(401);
-
-    const unboundReplay = await api("/api/v1/recover", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        recoveryCode: participant.recoveryCode,
-        recoveryAttemptId: recoveryAttemptId(),
-      }),
-    });
-    expect(unboundReplay.status).toBe(401);
-    const codeAlone = await api("/api/v1/recover", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ recoveryCode: participant.recoveryCode }),
-    });
-    expect(codeAlone.status).toBe(400);
-
-    const replay = await api("/api/v1/recover", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ recoveryCode: participant.recoveryCode, recoveryAttemptId: attemptId }),
-    });
-    expect(replay.status).toBe(200);
-    const replayed = await enrollmentFrom(replay);
-    expect(replayed).toEqual(replacement);
-    const secondReplay = await api("/api/v1/recover", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ recoveryCode: participant.recoveryCode, recoveryAttemptId: attemptId }),
-    });
-    expect(secondReplay.status).toBe(200);
-    expect(await enrollmentFrom(secondReplay)).toEqual(replacement);
-    const exhausted = await api("/api/v1/recover", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ recoveryCode: participant.recoveryCode, recoveryAttemptId: attemptId }),
-    });
-    expect(exhausted.status).toBe(401);
-    const retryReceipt = await testBindings().USAGE_MONITOR_DB.prepare(
-      `SELECT replay_count, length(old_recovery_token_hash) AS hash_bytes
-         FROM recovery_retry_receipts WHERE old_recovery_token_id = ?`,
-    ).bind(participant.recoveryCode.match(/^um_recovery_([^.]+)\./u)?.[1])
-      .first<{ replay_count: number; hash_bytes: number }>();
-    expect(retryReceipt).toEqual({ replay_count: 2, hash_bytes: 32 });
-
-    const invalid = await api("/api/v1/recover", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        recoveryCode: `um_recovery_${crypto.randomUUID()}.${"A".repeat(43)}`,
-      recoveryAttemptId: recoveryAttemptId(),
-        }),
-    });
-    expect(invalid.status).toBe(401);
-    await expect(invalid.json()).resolves.toMatchObject({
-      error: { code: "AUTH_INVALID" },
-    });
-  });
-
   it("renews bounded telemetry admission without refunding deleted batches", async () => {
     const participant = await enrollTelemetry();
     const expectedWindow = telemetryContributionAdmissionWindow(
@@ -3225,11 +2884,10 @@ describe("synthetic usage monitor service", () => {
       new Date().toISOString(),
     ).run();
 
-    const exhaustedProfile = await api("/api/v1/me", {
-      headers: personalHeaders(participant),
-    });
-    await expect(exhaustedProfile.json()).resolves.toMatchObject({
-      contributionAdmission: {
+    await expect(telemetryContributionAdmission(
+      testBindings().USAGE_MONITOR_DB,
+      participant.participantId,
+    )).resolves.toMatchObject({
         schemaVersion: "telemetry-contribution-admission-v0.1",
         state: "exhausted",
         window: {
@@ -3243,7 +2901,6 @@ describe("synthetic usage monitor service", () => {
         remainingBatches: 0,
         maximumBatches: 100,
         slotRefundPolicy: "not_refunded_by_contribution_deletion",
-      },
     });
     const blocked = await uploadEnvelope(
       participant,
@@ -3289,28 +2946,21 @@ describe("synthetic usage monitor service", () => {
     );
     expect(accepted.status).toBe(202);
     const acceptedBody = await accepted.json<{ contributionId: string }>();
-    const deleted = await contributionResource(
-      participant,
-      acceptedBody.contributionId,
-      "delete",
-    );
-    expect(deleted.status).toBe(200);
-
-    const afterDeletion = await api("/api/v1/me", {
-      headers: personalHeaders(participant),
-    });
-    await expect(afterDeletion.json()).resolves.toMatchObject({
-      contributionCount: 0,
-      totalContributionCount: 0,
-      historyPolicy: {
-        maximumItems: 101,
-        truncated: false,
-      },
-      contributionAdmission: {
+    const deleted = await testBindings().USAGE_MONITOR_DB.prepare(
+      "DELETE FROM telemetry_contributions WHERE id = ? AND participant_id = ?",
+    ).bind(acceptedBody.contributionId, participant.participantId).run();
+    expect(deleted.meta.changes).toBeGreaterThanOrEqual(1);
+    const remaining = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM telemetry_contributions WHERE id = ?",
+    ).bind(acceptedBody.contributionId).first<{ total: number }>();
+    expect(remaining?.total).toBe(0);
+    await expect(telemetryContributionAdmission(
+      testBindings().USAGE_MONITOR_DB,
+      participant.participantId,
+    )).resolves.toMatchObject({
         state: "available",
         acceptedBatches: 1,
         remainingBatches: 99,
-      },
     });
   });
 
@@ -3396,535 +3046,6 @@ describe("synthetic usage monitor service", () => {
     ))).toBe(true);
   });
 
-  it("ingests closed telemetry, deduplicates overlaps, and isolates participant data", async () => {
-    const participant = await enrollTelemetry();
-    const firstEnvelope = await encrypt(telemetryFixture("a"), true);
-    const first = await uploadEnvelope(participant, firstEnvelope);
-    expect(first.status).toBe(202);
-    const accepted = await first.json<{
-      contributionId: string;
-      recordCounts: { accepted: number; deduplicated: number };
-      accountingVerification: string;
-    }>();
-    expect(accepted.recordCounts).toMatchObject({ accepted: 2, deduplicated: 0 });
-    expect(accepted.accountingVerification).toBe("server_repriced");
-    const repriced = await testBindings().USAGE_MONITOR_DB.prepare(
-      `SELECT server_cost_usd, server_cost_nanousd, server_pricing_status,
-              server_pricing_method_version, server_price_registry_sha256,
-              server_price_card_ids, server_price_basis, server_price_epoch_basis,
-              server_price_event_time, server_tier_basis, server_api_service_tier,
-              speed_mode, api_service_tier
-         FROM telemetry_records
-        WHERE participant_id = ? AND record_kind = 'usage'`,
-    ).bind(participant.participantId).first<{
-      server_cost_usd: string;
-      server_cost_nanousd: number;
-      server_pricing_status: string;
-      server_pricing_method_version: string;
-      server_price_registry_sha256: string;
-      server_price_card_ids: string;
-      server_price_basis: string;
-      server_price_epoch_basis: string;
-      server_price_event_time: string;
-      server_tier_basis: string;
-      server_api_service_tier: string;
-      speed_mode: string;
-      api_service_tier: string;
-    }>();
-    expect(repriced).toMatchObject({
-      server_cost_usd: "0.0032",
-      server_cost_nanousd: 3_200_000,
-      server_pricing_status: "fully_priced",
-      server_pricing_method_version: "server-api-price-equivalent-v0.2",
-      server_price_basis: "historical_api_prices",
-      server_price_epoch_basis: "event_time_when_registry_has_effective_evidence",
-      server_price_event_time: "2026-07-25T12:05:00.000Z",
-      server_tier_basis: "subscription_standard_counterfactual",
-      server_api_service_tier: "standard",
-      speed_mode: "fast",
-      api_service_tier: "priority",
-    });
-    expect(repriced?.server_price_registry_sha256).toMatch(/^[a-f0-9]{64}$/u);
-    expect(repriced?.server_price_card_ids).toBe(
-      '["openai:gpt-5.6-sol:standard:short:official-observed-2026-08-01"]',
-    );
-
-    const replay = await uploadEnvelope(participant, firstEnvelope);
-    expect(replay.headers.get("idempotency-replayed")).toBe("true");
-
-    const overlap = telemetryFixture("a");
-    Reflect.set(overlap, "createdAt", "2026-07-25T13:01:00.000Z");
-    Reflect.set(overlap, "activityMarkers", [{
-      schemaVersion: "export-activity-marker-v0.1",
-      observedTime: "2026-07-25T12:20:00.000Z",
-      surface: "controlled_experiment",
-      state: "pulse",
-      agenticPoolCoupling: "depends_on_experiment_surface",
-      planType: "pro",
-      planVariant: "pro-20x",
-      markerId: `marker:v2:${"d".repeat(64)}`,
-    }]);
-    const second = await uploadEnvelope(participant, await encrypt(overlap, true));
-    expect(second.status).toBe(202);
-    const secondAccepted = await second.json<{ contributionId: string; recordCounts: object }>();
-    expect(secondAccepted).toMatchObject({
-      recordCounts: { accepted: 1, deduplicated: 2 },
-    });
-    expect(secondAccepted.contributionId).not.toBe(accepted.contributionId);
-
-    const stats = await api("/api/v1/me/stats", {
-      headers: personalHeaders(participant),
-    });
-    expect(stats.status).toBe(200);
-    const personal = await stats.json<Record<string, unknown>>();
-    expect(personal).toMatchObject({
-      participantId: participant.participantId,
-      totals: {
-        contributions: 2,
-        usageEvents: 1,
-        quotaSnapshots: 1,
-        activityMarkers: 1,
-        inputCacheReadTokens: 900,
-        apiPriceEquivalentUsd: "0.0032",
-        priceVerification: "server_repriced",
-      },
-      quotaGradients: [{
-        status: "not_testable",
-        reason: "account_continuity_not_transmitted",
-        verification: "server_repriced",
-      }],
-    });
-
-    const profileResponse = await api("/api/v1/me", {
-      headers: personalHeaders(participant),
-    });
-    const profileText = await profileResponse.text();
-    const profile = JSON.parse(profileText) as {
-      contributionCount: number;
-      contributions: Array<Record<string, unknown>>;
-    };
-    expect(profile).toMatchObject({
-      schemaVersion: "participant-profile-v0.2",
-      contributionCount: 2,
-      contributions: [
-        {
-          contributionId: accepted.contributionId,
-          status: "accepted",
-          synthetic: false,
-          schemaVersion: "telemetry-contribution-v0.1",
-          transportSchemaVersion: "telemetry-contribution-v0.1",
-          coveredAt: {
-            startAt: "2026-07-25T12:00:00.000Z",
-            endAt: "2026-07-25T12:30:00.000Z",
-          },
-          clientPlatform: "macos",
-          serverAccounting: {
-            apiPriceEquivalentUsd: "0.0032",
-            priceBasis: "historical_api_prices",
-            priceEpochBasis: "event_time_when_registry_has_effective_evidence",
-            eventTimeRange: {
-              startAt: "2026-07-25T12:05:00.000Z",
-              endAt: "2026-07-25T12:05:00.000Z",
-            },
-          },
-          recordCounts: { declared: 2, accepted: 2, deduplicated: 0 },
-          quarantine: {
-            state: "retained",
-            scheduledDeletionAt: null,
-            deletedAt: null,
-            canonicalMetadataRetained: true,
-          },
-        },
-        {
-          contributionId: secondAccepted.contributionId,
-          recordCounts: { declared: 3, accepted: 1, deduplicated: 2 },
-        },
-      ],
-    });
-
-    const contributionRows = await testBindings().USAGE_MONITOR_DB.prepare(
-      `SELECT id, declared_record_count, accepted_record_count,
-              server_priced_event_count,
-              server_partially_priced_event_count,
-              server_unpriced_event_count, server_price_basis,
-              server_price_epoch_basis, server_price_event_time_start,
-              server_price_event_time_end
-         FROM telemetry_contributions
-        WHERE participant_id = ?
-        ORDER BY created_at, id`,
-    ).bind(participant.participantId).all<{
-      id: string;
-      declared_record_count: number;
-      accepted_record_count: number;
-      server_priced_event_count: number;
-      server_partially_priced_event_count: number;
-      server_unpriced_event_count: number;
-      server_price_basis: string;
-      server_price_epoch_basis: string;
-      server_price_event_time_start: string;
-      server_price_event_time_end: string;
-    }>();
-    expect(contributionRows.results).toMatchObject([
-      {
-        id: accepted.contributionId,
-        declared_record_count: 2,
-        accepted_record_count: 2,
-        server_priced_event_count: 1,
-        server_unpriced_event_count: 0,
-        server_price_basis: "historical_api_prices",
-        server_price_epoch_basis: "event_time_when_registry_has_effective_evidence",
-        server_price_event_time_start: "2026-07-25T12:05:00.000Z",
-        server_price_event_time_end: "2026-07-25T12:05:00.000Z",
-      },
-      {
-        id: secondAccepted.contributionId,
-        declared_record_count: 3,
-        accepted_record_count: 1,
-        server_priced_event_count: 0,
-      },
-    ]);
-
-    const baseDb = testBindings().USAGE_MONITOR_DB;
-    const profileQueries: string[] = [];
-    const profileDb = d1PrepareProxy(baseDb, (query) => {
-      profileQueries.push(query);
-      return baseDb.prepare(query);
-    });
-    const boundedProfile = await api("/api/v1/me", {
-      headers: personalHeaders(participant),
-    }, testBindings({ USAGE_MONITOR_DB: profileDb }));
-    expect(boundedProfile.status).toBe(200);
-    expect(profileQueries.some((query) => (
-      query.includes("origin_contribution_id")
-    ))).toBe(false);
-
-    await baseDb.prepare(
-      `UPDATE telemetry_contributions
-          SET accepted_record_count = NULL,
-              server_pricing_method_version = NULL,
-              server_price_registry_version = NULL,
-              server_price_registry_sha256 = NULL
-        WHERE id = ? AND participant_id = ?`,
-    ).bind(accepted.contributionId, participant.participantId).run();
-    const repairQueries: string[] = [];
-    const repairDb = d1PrepareProxy(baseDb, (query) => {
-      repairQueries.push(query);
-      return baseDb.prepare(query);
-    });
-    const repairedProfile = await api("/api/v1/me", {
-      headers: personalHeaders(participant),
-    }, testBindings({ USAGE_MONITOR_DB: repairDb }));
-    expect(repairedProfile.status).toBe(200);
-    const repairedBody = await repairedProfile.json<{
-      contributions: Array<{ contributionId: string; recordCounts: object }>;
-    }>();
-    expect(repairedBody.contributions[0]).toMatchObject({
-      contributionId: accepted.contributionId,
-      recordCounts: { declared: 2, accepted: 2, deduplicated: 0 },
-    });
-    expect(repairQueries.some((query) => (
-      query.includes("accepted_record_count IS NULL")
-        && query.includes("RETURNING *")
-    ))).toBe(true);
-
-    for (const forbidden of [
-      "r2_key", "plaintext_digest", "envelope_digest", "datasetId",
-      "accountTrackId", "eligibilityUnitId", "recoveryCode", "csrfToken",
-      "\"accounting\"", "registrySha256",
-    ]) {
-      expect(profileText).not.toContain(forbidden);
-    }
-
-    const contribution = await contributionResource(
-      participant,
-      accepted.contributionId,
-      "read",
-    );
-    expect(contribution.status).toBe(200);
-    await expect(contribution.json()).resolves.toMatchObject({
-      contributionId: accepted.contributionId,
-      records: [{ kind: "usage" }, { kind: "quota" }],
-    });
-    const invalidContributionRead = await api(
-      "/api/v1/me/contributions/read",
-      {
-        method: "POST",
-        headers: {
-          ...personalHeaders(participant, { csrf: true }),
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          contributionId: accepted.contributionId,
-          unexpected: true,
-        }),
-      },
-    );
-    expect(invalidContributionRead.status).toBe(400);
-    const identifierBearingLegacyRoute = await api(
-      `/api/v1/contributions/${encodeURIComponent(accepted.contributionId)}`,
-      { headers: personalHeaders(participant) },
-    );
-    expect(identifierBearingLegacyRoute.status).toBe(404);
-
-    const stranger = await enrollTelemetry();
-    const isolated = await contributionResource(
-      stranger,
-      accepted.contributionId,
-      "read",
-    );
-    expect(isolated.status).toBe(404);
-    const strangerProfile = await api("/api/v1/me", {
-      headers: personalHeaders(stranger),
-    });
-    const strangerProfileText = await strangerProfile.text();
-    expect(JSON.parse(strangerProfileText)).toMatchObject({
-      schemaVersion: "participant-profile-v0.2",
-      contributionCount: 0,
-      contributions: [],
-    });
-    expect(strangerProfileText).not.toContain(accepted.contributionId);
-    const strangerDelete = await contributionResource(
-      stranger,
-      accepted.contributionId,
-      "delete",
-    );
-    expect(strangerDelete.status).toBe(404);
-
-    const community = await api("/api/v1/community/insights");
-    await expect(community.json()).resolves.toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.3",
-      releaseStatus: "not_yet_published",
-      reason: "stable_snapshot_unavailable",
-    });
-
-    const stored = await testBindings().USAGE_MONITOR_DB.prepare(
-      "SELECT id FROM telemetry_contributions WHERE participant_id = ? ORDER BY created_at, id",
-    ).bind(participant.participantId).all<{ id: string }>();
-    expect(stored.results.map((row) => row.id)).toContain(secondAccepted.contributionId);
-
-    const deleted = await contributionResource(
-      participant,
-      accepted.contributionId,
-      "delete",
-    );
-    expect(deleted.status).toBe(200);
-    const afterDelete = await api("/api/v1/me/stats", {
-      headers: personalHeaders(participant),
-    });
-    await expect(afterDelete.json()).resolves.toMatchObject({
-      totals: { contributions: 1, usageEvents: 1, quotaSnapshots: 1, activityMarkers: 1 },
-    });
-    const profileAfterDelete = await api("/api/v1/me", {
-      headers: personalHeaders(participant),
-    });
-    const profileAfterDeleteText = await profileAfterDelete.text();
-    expect(JSON.parse(profileAfterDeleteText)).toMatchObject({
-      contributionCount: 1,
-      contributions: [{
-        contributionId: secondAccepted.contributionId,
-      }],
-    });
-    expect(profileAfterDeleteText).not.toContain(accepted.contributionId);
-    const surviving = await contributionResource(
-      participant,
-      secondAccepted.contributionId,
-      "read",
-    );
-    await expect(surviving.json()).resolves.toMatchObject({
-      records: [{ kind: "usage" }, { kind: "quota" }, { kind: "activity" }],
-    });
-  });
-
-  it("persists January history as priced with pre-repricing window provenance", async () => {
-    const participant = await enrollTelemetry();
-    const january = telemetryFixture("e");
-    Reflect.set(january, "createdAt", "2026-01-15T12:30:00.000Z");
-    Reflect.set(january, "coveredAt", {
-      startAt: "2026-01-15T12:00:00.000Z",
-      endAt: "2026-01-15T12:30:00.000Z",
-    });
-    Reflect.set(january, "providerPolicyEpoch", "openai_pre_agentic_pool_2026_07_09");
-    const usage = Reflect.get(january, "usageEvents") as Array<Record<string, unknown>>;
-    usage[0]!.eventTime = "2026-01-15T12:05:00.000Z";
-    usage[0]!.accounting = {
-      estimatedApiCostUsd: null,
-      pricingCoveragePercent: 0,
-      unknownBillableUnits: 0,
-      priceBasis: "unpriced",
-    };
-    Reflect.set(january, "accounting", {
-      estimatedApiCostUsd: null,
-      pricedEventCoveragePercent: 0,
-      unknownModelEventCount: 0,
-      unknownBillableUnits: 0,
-      priceBasis: "unpriced",
-    });
-    const quota = Reflect.get(january, "quotaSnapshots") as Array<Record<string, unknown>>;
-    quota[0]!.observedTime = "2026-01-15T12:10:00.000Z";
-    quota[0]!.receivedTime = "2026-01-15T12:10:01.000Z";
-    quota[0]!.resetsAt = "2026-01-22T12:00:00.000Z";
-
-    const uploaded = await uploadEnvelope(
-      participant,
-      await encrypt(january, true),
-    );
-    expect(uploaded.status).toBe(202);
-    const row = await testBindings().USAGE_MONITOR_DB.prepare(
-      `SELECT server_cost_usd, server_pricing_status, server_price_basis,
-              server_price_epoch_basis, server_price_event_time,
-              server_price_card_ids
-         FROM telemetry_records
-        WHERE participant_id = ? AND record_kind = 'usage'`,
-    ).bind(participant.participantId).first<{
-      server_cost_usd: string;
-      server_pricing_status: string;
-      server_price_basis: string;
-      server_price_epoch_basis: string;
-      server_price_event_time: string;
-      server_price_card_ids: string;
-    }>();
-    // The reviewed GPT-5.6 Sol card carries no vendor-effective boundary, so a
-    // January instant is inside its validity window and is priced from it.
-    expect(row).toEqual({
-      server_cost_usd: "0.0032",
-      server_pricing_status: "fully_priced",
-      server_price_basis: "historical_api_prices",
-      server_price_epoch_basis: "event_time_when_registry_has_effective_evidence",
-      server_price_event_time: "2026-01-15T12:05:00.000Z",
-      server_price_card_ids:
-        '["openai:gpt-5.6-sol:standard:short:official-observed-2026-08-01"]',
-    });
-
-    const profile = await api("/api/v1/me", {
-      headers: personalHeaders(participant),
-    });
-    await expect(profile.json()).resolves.toMatchObject({
-      contributions: [{
-        serverAccounting: {
-          apiPriceEquivalentUsd: "0.0032",
-          priceBasis: "historical_api_prices",
-          priceEpochBasis: "event_time_when_registry_has_effective_evidence",
-          eventTimeRange: {
-            startAt: "2026-01-15T12:05:00.000Z",
-            endAt: "2026-01-15T12:05:00.000Z",
-          },
-          verification: "server_repriced",
-        },
-      }],
-    });
-  });
-
-  it("refuses a rolling quota conversion when account continuity was not transmitted", async () => {
-    const participant = await enrollTelemetry();
-    const first = await uploadEnvelope(
-      participant,
-      await encrypt(telemetryFixture("a"), true),
-    );
-    expect(first.status).toBe(202);
-
-    const second = telemetryFixture("b");
-    Reflect.set(second, "createdAt", "2026-07-25T14:00:00.000Z");
-    Reflect.set(second, "coveredAt", {
-      startAt: "2026-07-25T13:00:00.000Z",
-      endAt: "2026-07-25T13:30:00.000Z",
-    });
-    const usage = Reflect.get(second, "usageEvents") as Array<Record<string, unknown>>;
-    usage[0]!.eventTime = "2026-07-25T13:05:00.000Z";
-    const quota = Reflect.get(second, "quotaSnapshots") as Array<Record<string, unknown>>;
-    quota[0]!.observedTime = "2026-07-25T13:10:00.000Z";
-    quota[0]!.receivedTime = "2026-07-25T13:10:01.000Z";
-    quota[0]!.usedPercent = 33;
-    const uploaded = await uploadEnvelope(
-      participant,
-      await encrypt(second, true),
-    );
-    expect(uploaded.status).toBe(202);
-
-    const response = await api("/api/v1/me/stats", {
-      headers: personalHeaders(participant),
-    });
-    expect(response.status).toBe(200);
-    const stats = await response.json<{
-      totals: { apiPriceEquivalentUsd: string };
-      rollingQuotaMovement: {
-        status: string;
-        reason: string;
-        accountContinuity: string;
-        rows: unknown[];
-      };
-    }>();
-    // Both July events are priced from the reviewed registry; the rolling
-    // quota conversion is refused on account continuity, not on price cover.
-    expect(stats.totals.apiPriceEquivalentUsd).toBe("0.0064");
-    expect(stats.rollingQuotaMovement).toMatchObject({
-      status: "not_testable",
-      reason: "account_continuity_not_transmitted",
-      accountContinuity: "not_transmitted",
-      rows: [],
-    });
-  });
-
-  it("does not label unbackfilled legacy rows as server repriced", async () => {
-    const participant = await enrollTelemetry();
-    const uploaded = await uploadEnvelope(
-      participant,
-      await encrypt(telemetryFixture("a"), true),
-    );
-    expect(uploaded.status).toBe(202);
-    const accepted = await uploaded.json<{ contributionId: string }>();
-    await testBindings().USAGE_MONITOR_DB.batch([
-      testBindings().USAGE_MONITOR_DB.prepare(
-        `UPDATE telemetry_records
-            SET server_cost_usd = NULL,
-                server_cost_nanousd = NULL,
-                server_pricing_status = NULL,
-                server_pricing_method_version = NULL,
-                server_price_registry_version = NULL,
-                server_price_registry_sha256 = NULL
-          WHERE participant_id = ? AND record_kind = 'usage'`,
-      ).bind(participant.participantId),
-      testBindings().USAGE_MONITOR_DB.prepare(
-        `UPDATE telemetry_contributions
-            SET server_cost_nanousd = 0,
-                server_pricing_method_version = NULL,
-                server_price_registry_version = NULL,
-                server_price_registry_sha256 = NULL
-          WHERE id = ? AND participant_id = ?`,
-      ).bind(accepted.contributionId, participant.participantId),
-    ]);
-
-    const stats = await api("/api/v1/me/stats", {
-      headers: personalHeaders(participant),
-    });
-    await expect(stats.json()).resolves.toMatchObject({
-      totals: {
-        usageEvents: 1,
-        apiPriceEquivalentUsd: null,
-        priceVerification: "server_repricing_unavailable_for_legacy_records",
-      },
-      byModel: [{
-        apiPriceEquivalentUsd: null,
-        priceVerification: "server_repricing_unavailable_for_legacy_records",
-      }],
-      daily: [{
-        apiPriceEquivalentUsd: null,
-        priceVerification: "server_repricing_unavailable_for_legacy_records",
-      }],
-    });
-
-    const contribution = await contributionResource(
-      participant,
-      accepted.contributionId,
-      "read",
-    );
-    await expect(contribution.json()).resolves.toMatchObject({
-      serverAccounting: {
-        apiPriceEquivalentUsd: null,
-        verification: "server_repricing_unavailable",
-      },
-    });
-  });
-
   it("rejects privacy canaries and inconsistent accounting after decryption", async () => {
     const participant = await enrollTelemetry();
     const otherwiseValidEnvelope = JSON.stringify(await encrypt(telemetryFixture("d"), true));
@@ -3970,43 +3091,6 @@ describe("synthetic usage monitor service", () => {
     });
     expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
   });
-
-  it("never serves the old live aggregate when no stable snapshot exists", async () => {
-    for (const suffix of ["a", "b", "c"]) {
-      const participant = await enrollTelemetry();
-      const response = await uploadEnvelope(
-        participant,
-        await encrypt(telemetryFixture(suffix), true),
-      );
-      expect(response.status).toBe(202);
-    }
-    const response = await api("/api/v1/stats/aggregate");
-    expect(response.status).toBe(200);
-    const body = await response.json<Record<string, unknown>>();
-    expect(body).toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.3",
-      releaseStatus: "not_yet_published",
-      reason: "stable_snapshot_unavailable",
-    });
-    expect(JSON.stringify(body)).not.toContain("participantCount");
-    expect(JSON.stringify(body)).not.toContain("totals");
-    await expect(buildCommunityWeeklySnapshot(
-      testBindings().USAGE_MONITOR_DB,
-      Date.parse("2026-07-29T00:00:00.000Z"),
-    )).resolves.toMatchObject({ state: "built" });
-    const sealedSuppressionText = await (
-      await api("/api/v1/stats/aggregate")
-    ).text();
-    expect(JSON.parse(sealedSuppressionText)).toMatchObject({
-      releaseStatus: "suppressed",
-      reason: "privacy_release_policy_not_met",
-      immutable: true,
-      nonOverlapping: true,
-      cells: [],
-    });
-    expect(sealedSuppressionText).not.toContain("participantCount");
-  });
-
   it("isolates an allowance-preview cache failure from scheduled maintenance", async () => {
     await testBindings().USAGE_MONITOR_DB.prepare(
       "DROP TABLE admin_community_allowance_preview_cache",
@@ -4026,7 +3110,6 @@ describe("synthetic usage monitor service", () => {
     expect(retention?.state).not.toBe("failed");
     expect(retention?.maintenance_lease_token).toBeNull();
   });
-
   it("uses the scheduled event time and waitUntil to seal a weekly snapshot", async () => {
     const waits: Promise<unknown>[] = [];
     worker.scheduled?.(
@@ -4133,588 +3216,6 @@ describe("synthetic usage monitor service", () => {
     expect(finalCounts).toEqual({ snapshots: 6, rebuilds: 0 });
   });
 
-  it("seals, serves, protects, and withdraws a clipped weekly snapshot", async () => {
-    let participantToDelete: EnrollmentResponse | null = null;
-    let contributionToDelete = "";
-    const cohort: EnrollmentResponse[] = [];
-    const unmeteredLimiter = {
-      limit: async () => ({ success: true }),
-    } as unknown as RateLimit;
-    const openCohortEnv = identityBindings({
-      ENROLLMENT_MODE: "open" as Env["ENROLLMENT_MODE"],
-      ENROLLMENT_RATE_LIMIT: unmeteredLimiter,
-      CLIENT_ATTEMPT_RATE_LIMIT: unmeteredLimiter,
-    });
-    for (let index = 0; index < 20; index += 1) {
-      const participant = await enrollMatureOpenCohortParticipant(
-        index,
-        openCohortEnv,
-      );
-      cohort.push(participant);
-      participantToDelete ??= participant;
-      const contribution = await uploadTelemetryAt(
-        participant,
-        telemetryFixture("a"),
-        "2026-07-25T23:59:59.000Z",
-      );
-      // The second accepted day deliberately repeats the observed occurrence.
-      // It proves the participant's two-day contribution cadence without
-      // doubling the cell metric being exercised below.
-      await uploadTelemetryAt(
-        participant,
-        telemetryFixture("a"),
-        "2026-07-26T23:59:59.000Z",
-      );
-      if (index === 0) contributionToDelete = contribution.contributionId;
-    }
-    for (let index = 0; index < 2; index += 1) {
-      const grant = await issueTestGrant();
-      const enrolled = await enrollWithGrant(grant, inviteOnlyBindings({
-        ENROLLMENT_RATE_LIMIT: unmeteredLimiter,
-      }));
-      expect(enrolled.status).toBe(201);
-      const smallCohortParticipant = await enrollmentFrom(enrolled);
-      const fixture = telemetryFixture("a");
-      const quotaRows = Reflect.get(fixture, "quotaSnapshots") as Array<Record<string, unknown>>;
-      for (const quotaRow of quotaRows) {
-        Reflect.set(quotaRow, "planVariant", "pro-5x");
-      }
-      const smallCohortContribution = await uploadEnvelope(
-        smallCohortParticipant,
-        await encrypt(fixture, true),
-      );
-      expect(smallCohortContribution.status).toBe(202);
-      const smallCohortBody = await smallCohortContribution.json<{
-        contributionId: string;
-      }>();
-      await testBindings().USAGE_MONITOR_DB.prepare(
-        "UPDATE telemetry_contributions SET created_at = ? WHERE id = ?",
-      ).bind(
-        "2026-07-28T23:59:59.000Z",
-        smallCohortBody.contributionId,
-      ).run();
-    }
-    const cutoffContribution = await uploadEnvelope(
-      cohort[0]!,
-      await encrypt(telemetryFixture("b"), true),
-    );
-    expect(cutoffContribution.status).toBe(202);
-    const cutoffContributionBody = await cutoffContribution.json<{
-      contributionId: string;
-    }>();
-    await testBindings().USAGE_MONITOR_DB.prepare(
-      "UPDATE telemetry_contributions SET created_at = ? WHERE id = ?",
-    ).bind(
-      "2026-07-29T00:00:00.000Z",
-      cutoffContributionBody.contributionId,
-    ).run();
-    await testBindings().USAGE_MONITOR_DB.prepare(
-      `UPDATE telemetry_records
-          SET input_uncached_tokens = 9000000,
-              output_reasoning_tokens = NULL,
-              tool_units = 2000
-        WHERE participant_id = ? AND record_kind = 'usage'`,
-    ).bind(cohort[0]!.participantId).run();
-    const scheduledTime = Date.parse("2026-07-29T00:00:00.000Z");
-    expect(communityWeekForScheduledTime(scheduledTime)).toEqual({
-      startAt: "2026-07-20T00:00:00.000Z",
-      endAt: "2026-07-27T00:00:00.000Z",
-      cutoffAt: "2026-07-29T00:00:00.000Z",
-    });
-    const built = await Promise.all([
-      buildCommunityWeeklySnapshot(testBindings().USAGE_MONITOR_DB, scheduledTime),
-      buildCommunityWeeklySnapshot(testBindings().USAGE_MONITOR_DB, scheduledTime),
-    ]);
-    expect(built.filter((result) => result.state === "built")).toHaveLength(1);
-    expect(built.every((result) => [
-      "built", "existing", "lease_unavailable",
-    ].includes(result.state))).toBe(true);
-    const response = await api("/api/v1/stats/aggregate");
-    const publishedText = await response.text();
-    const published = JSON.parse(publishedText) as Record<string, unknown>;
-    expect(published).toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.3",
-      releaseStatus: "published",
-      immutable: true,
-      nonOverlapping: true,
-      period: {
-        startAt: "2026-07-20T00:00:00.000Z",
-        endAt: "2026-07-27T00:00:00.000Z",
-      },
-      ingestionCutoffAt: "2026-07-29T00:00:00.000Z",
-      releasedAt: "2026-07-29T00:00:00.000Z",
-      cells: [{
-        provider: "openai_codex",
-        planType: "pro",
-        planVariant: "pro-20x",
-        modelId: "gpt-5.6-sol",
-        metrics: {
-          usageEvents: {
-            status: "released",
-            value: 20,
-            unit: "events_rounded_down",
-          },
-          inputUncachedTokens: {
-            status: "released",
-            value: 5_000_000,
-            unit: "tokens_rounded_down",
-          },
-          inputCacheWriteTokens: {
-            status: "released",
-            value: 0,
-            unit: "tokens_rounded_down",
-          },
-          outputCombinedTokens: { status: "suppressed" },
-          outputReasoningTokens: { status: "suppressed" },
-          toolUnits: {
-            status: "released",
-            value: 1_090,
-            unit: "tool_units_rounded_down",
-          },
-        },
-      }],
-    });
-    for (const forbidden of [
-      "participantCount", "participant_id", "estimatedApiCost", "eligibility:",
-      "occurrence_id", "model:v1:", "record_json",
-    ]) {
-      expect(publishedText).not.toContain(forbidden);
-    }
-    expect((published as { cells: unknown[] }).cells).toHaveLength(1);
-    expect(publishedText).not.toContain("pro-5x");
-    const privateStatsResponse = await api("/api/v1/me/stats", {
-      headers: personalHeaders(participantToDelete!),
-    });
-    expect(privateStatsResponse.status).toBe(200);
-    const privateStatsText = await privateStatsResponse.text();
-    const privateStats = JSON.parse(privateStatsText) as Record<string, unknown>;
-    expect(privateStats).toMatchObject({
-      communityComparison: {
-        schemaVersion: "participant-community-comparison-v0.2",
-        status: "ready",
-        snapshotId: "community-weekly:2026-07-20",
-        snapshotRevision: 1,
-        interpretation: "own_clipped_contribution_vs_public_rounded_total",
-        participantPlanCohort: { planType: "pro", planVariant: "pro-20x" },
-        cells: [{
-          provider: "openai_codex",
-          planType: "pro",
-          planVariant: "pro-20x",
-          cohortMatchesParticipant: true,
-          modelId: "gpt-5.6-sol",
-          participantHasActivity: true,
-          metrics: {
-            usageEvents: {
-              status: "comparable",
-              participantClippedValue: 1,
-              communityRoundedValue: 20,
-              unit: "events",
-            },
-            inputUncachedTokens: {
-              status: "comparable",
-              participantClippedValue: 5_000_000,
-              communityRoundedValue: 5_000_000,
-              unit: "tokens",
-            },
-            inputCacheReadTokens: {
-              status: "comparable",
-              participantClippedValue: 900,
-              communityRoundedValue: 0,
-              unit: "tokens",
-            },
-            outputReasoningTokens: {
-              status: "community_not_released",
-            },
-            toolUnits: {
-              status: "comparable",
-              participantClippedValue: 1_000,
-              communityRoundedValue: 1_090,
-              unit: "units",
-            },
-          },
-        }],
-      },
-    });
-    for (const forbidden of [
-      "participantCount", "eligibilityUnitId", "eligibility:",
-      "average", "percentile", "accountTrackId",
-    ]) {
-      expect(privateStatsText).not.toContain(forbidden);
-    }
-    const sealed = await testBindings().USAGE_MONITOR_DB.prepare(
-      `SELECT snapshot_id, revision, source_mutation_epoch, payload_json,
-              payload_sha256, release_state
-         FROM community_weekly_snapshots`,
-    ).all();
-    expect(sealed.results).toHaveLength(1);
-    expect(Reflect.get(sealed.results[0]!, "payload_json")).toBe(publishedText);
-    expect(Reflect.get(sealed.results[0]!, "payload_sha256")).toBe(
-      await sha256Hex(publishedText),
-    );
-    await testBindings().USAGE_MONITOR_DB.prepare(
-      `UPDATE telemetry_records
-          SET input_uncached_tokens = input_uncached_tokens + 99999
-        WHERE participant_id = ? AND occurrence_id = ?`,
-    ).bind(cohort[0]!.participantId, `event:v2:${"b".repeat(64)}`).run();
-    await expect(
-      buildCommunityWeeklySnapshot(testBindings().USAGE_MONITOR_DB, scheduledTime),
-    ).resolves.toMatchObject({ state: "existing" });
-    expect(await (await api("/api/v1/stats/aggregate")).text()).toBe(publishedText);
-    await expect(testBindings().USAGE_MONITOR_DB.prepare(
-      `UPDATE community_weekly_snapshots SET payload_json = '{}'`,
-    ).run()).rejects.toThrow();
-    await expect(testBindings().USAGE_MONITOR_DB.prepare(
-      "DELETE FROM community_weekly_snapshots",
-    ).run()).rejects.toThrow();
-
-    const deleted = await contributionResource(
-      participantToDelete!,
-      contributionToDelete,
-      "delete",
-    );
-    expect(deleted.status).toBe(200);
-    const withdrawn = await api("/api/v1/stats/aggregate");
-    const withdrawnText = await withdrawn.text();
-    expect(JSON.parse(withdrawnText)).toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.3",
-      releaseStatus: "withdrawn",
-      reason: "source_data_withdrawn",
-      immutable: true,
-      nonOverlapping: true,
-    });
-    expect(withdrawnText).not.toContain("\"cells\"");
-    const withdrawnPrivateStats = await (
-      await api("/api/v1/me/stats", {
-        headers: personalHeaders(participantToDelete!),
-      })
-    ).json<Record<string, unknown>>();
-    expect(withdrawnPrivateStats).toMatchObject({
-      communityComparison: {
-        schemaVersion: "participant-community-comparison-v0.2",
-        status: "not_testable",
-        reason: "community_snapshot_not_released",
-        snapshotRevision: 1,
-        cells: [],
-      },
-    });
-    const queued = await testBindings().USAGE_MONITOR_DB.prepare(
-      `SELECT week_start, requested_epoch
-         FROM community_weekly_snapshot_rebuilds`,
-    ).all();
-    expect(queued.results).toHaveLength(1);
-    await expect(testBindings().USAGE_MONITOR_DB.prepare(
-      `UPDATE community_weekly_snapshots
-          SET release_state = 'published',
-              withdrawn_at = NULL,
-              withdrawal_epoch = NULL`,
-    ).run()).rejects.toThrow();
-    const rebuilt = await rebuildPendingCommunityWeeklySnapshots(
-      testBindings().USAGE_MONITOR_DB,
-      scheduledTime + 60 * 60 * 1000,
-    );
-    expect(rebuilt).toMatchObject({
-      processed: 1,
-      remaining: false,
-      snapshotIds: ["community-weekly:2026-07-20:r2"],
-    });
-    const rebuiltResponse = await api("/api/v1/stats/aggregate");
-    const rebuiltText = await rebuiltResponse.text();
-    expect(JSON.parse(rebuiltText)).toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.3",
-      snapshotId: "community-weekly:2026-07-20:r2",
-      snapshotRevision: 2,
-      releaseStatus: "suppressed",
-      releasedAt: "2026-07-29T01:00:00.000Z",
-      reason: "privacy_release_policy_not_met",
-      immutable: true,
-      nonOverlapping: true,
-      cells: [],
-    });
-    expect(rebuiltText).not.toContain("participantCount");
-    const revisions = await testBindings().USAGE_MONITOR_DB.prepare(
-      `SELECT snapshot_id, revision, source_mutation_epoch, payload_json,
-              payload_sha256, release_state
-         FROM community_weekly_snapshots
-        ORDER BY revision`,
-    ).all();
-    expect(revisions.results).toHaveLength(2);
-    expect(revisions.results[0]).toEqual({
-      ...sealed.results[0],
-      release_state: "withdrawn",
-    });
-    expect(revisions.results[1]).toMatchObject({
-      snapshot_id: "community-weekly:2026-07-20:r2",
-      revision: 2,
-      release_state: "suppressed",
-    });
-    expect(
-      Number(Reflect.get(revisions.results[1]!, "source_mutation_epoch")),
-    ).toBeGreaterThan(
-      Number(Reflect.get(revisions.results[0]!, "source_mutation_epoch")),
-    );
-    const rebuildQueue = await testBindings().USAGE_MONITOR_DB.prepare(
-      "SELECT COUNT(*) AS total FROM community_weekly_snapshot_rebuilds",
-    ).first<{ total: number }>();
-    expect(rebuildQueue?.total).toBe(0);
-    await expect(
-      buildCommunityWeeklySnapshot(testBindings().USAGE_MONITOR_DB, scheduledTime),
-    ).resolves.toMatchObject({
-      state: "existing",
-      snapshotId: "community-weekly:2026-07-20:r2",
-    });
-  });
-
-  it("keeps an absent-plan cohort explicitly unknown, published separately from a known plan cohort", async () => {
-    // Two disjoint 20-participant cohorts sharing the same provider and
-    // model: one with the usual quota evidence ("pro"/"pro-20x"), one whose
-    // quota evidence is pushed outside the aggregation window so it has no
-    // in-window plan reading at all. If cohorts were ever blended by
-    // omitting plan from the grouping key, this would collapse into a single
-    // 40-participant cell instead of two 20-participant cells.
-    //
-    // v0.3 public aggregates require distinct open-enrollment provider
-    // accounts, a mature account age, and two accepted collection days. Keep
-    // the test's large cohort explicit about each of those requirements.
-    const unmeteredLimiter = {
-      limit: async () => ({ success: true }),
-    } as unknown as RateLimit;
-    const bulkEnrollBindings = identityBindings({
-      ENROLLMENT_MODE: "open" as Env["ENROLLMENT_MODE"],
-      ENROLLMENT_RATE_LIMIT: unmeteredLimiter,
-      CLIENT_ATTEMPT_RATE_LIMIT: unmeteredLimiter,
-    });
-    let identityIndex = 10_000;
-    async function enrollEligible(): Promise<EnrollmentResponse> {
-      const participant = await enrollMatureOpenCohortParticipant(
-        identityIndex,
-        bulkEnrollBindings,
-      );
-      identityIndex += 1;
-      return participant;
-    }
-
-    for (let index = 0; index < 20; index += 1) {
-      const known = await enrollEligible();
-      await uploadTelemetryAt(
-        known,
-        telemetryFixture("a"),
-        "2026-07-25T23:59:59.000Z",
-      );
-      await uploadTelemetryAt(
-        known,
-        telemetryFixture("a"),
-        "2026-07-26T23:59:59.000Z",
-      );
-
-      const unknown = await enrollEligible();
-      await uploadTelemetryAt(
-        unknown,
-        telemetryFixture("a"),
-        "2026-07-25T23:59:59.000Z",
-      );
-      await uploadTelemetryAt(
-        unknown,
-        telemetryFixture("a"),
-        "2026-07-26T23:59:59.000Z",
-      );
-      await testBindings().USAGE_MONITOR_DB.batch([
-        // No in-window quota evidence for this participant: their usage
-        // event stays in-window, but their quota snapshot is pushed years
-        // outside it, so participant_plans finds nothing to COALESCE from.
-        testBindings().USAGE_MONITOR_DB.prepare(
-          `UPDATE telemetry_records SET observed_at = '2000-01-01T00:00:00.000Z'
-            WHERE participant_id = ? AND record_kind = 'quota'`,
-        ).bind(unknown.participantId),
-      ]);
-    }
-
-    const scheduledTime = Date.parse("2026-07-29T00:00:00.000Z");
-    await expect(buildCommunityWeeklySnapshot(
-      testBindings().USAGE_MONITOR_DB,
-      scheduledTime,
-    )).resolves.toMatchObject({ state: "built" });
-
-    const response = await api("/api/v1/stats/aggregate");
-    const body = await response.json<{
-      releaseStatus: string;
-      cells: Array<Record<string, unknown>>;
-    }>();
-    expect(body.releaseStatus).toBe("published");
-    expect(body.cells).toHaveLength(2);
-
-    const knownCell = body.cells.find((cell) => cell.planType === "pro");
-    const unknownCell = body.cells.find((cell) => cell.planType === "unknown");
-    expect(knownCell).toMatchObject({
-      provider: "openai_codex",
-      planType: "pro",
-      planVariant: "pro-20x",
-      modelId: "gpt-5.6-sol",
-      metrics: { usageEvents: { status: "released", value: 20 } },
-    });
-    expect(unknownCell).toMatchObject({
-      provider: "openai_codex",
-      planType: "unknown",
-      planVariant: "unknown",
-      modelId: "gpt-5.6-sol",
-      metrics: { usageEvents: { status: "released", value: 20 } },
-    });
-  });
-
-  it("resolves a participant's own plan cohort to unknown when in-window quota evidence conflicts", async () => {
-    await seedPublishedSnapshotWithNoCells();
-    const participant = await enrollTelemetry();
-
-    const first = await uploadEnvelope(
-      participant,
-      await encrypt(telemetryFixture("a"), true),
-    );
-    expect(first.status).toBe(202);
-    const firstBody = await first.json<{ contributionId: string }>();
-
-    const conflictingFixture = telemetryFixture("b");
-    const conflictingQuota = Reflect.get(conflictingFixture, "quotaSnapshots") as
-      Array<Record<string, unknown>>;
-    Reflect.set(conflictingQuota[0]!, "planType", "team");
-    Reflect.set(conflictingQuota[0]!, "planVariant", "unknown");
-    const second = await uploadEnvelope(
-      participant,
-      await encrypt(conflictingFixture, true),
-    );
-    expect(second.status).toBe(202);
-    const secondBody = await second.json<{ contributionId: string }>();
-
-    await testBindings().USAGE_MONITOR_DB.batch([
-      testBindings().USAGE_MONITOR_DB.prepare(
-        "UPDATE telemetry_contributions SET created_at = ? WHERE id = ?",
-      ).bind("2026-07-28T23:59:59.000Z", firstBody.contributionId),
-      testBindings().USAGE_MONITOR_DB.prepare(
-        "UPDATE telemetry_contributions SET created_at = ? WHERE id = ?",
-      ).bind("2026-07-28T23:59:59.000Z", secondBody.contributionId),
-    ]);
-
-    const stats = await api("/api/v1/me/stats", {
-      headers: personalHeaders(participant),
-    });
-    expect(stats.status).toBe(200);
-    const body = await stats.json<{
-      communityComparison: {
-        status: string;
-        participantPlanCohort: { planType: string; planVariant: string };
-      };
-    }>();
-    expect(body.communityComparison).toMatchObject({
-      status: "ready",
-      participantPlanCohort: { planType: "unknown", planVariant: "unknown" },
-    });
-  });
-
-  it("withdraws a sealed snapshot before a contribution R2 deletion can fail", async () => {
-    const participant = await enrollTelemetry();
-    const uploaded = await uploadEnvelope(
-      participant,
-      await encrypt(telemetryFixture("a"), true),
-    );
-    expect(uploaded.status).toBe(202);
-    const { contributionId } = await uploaded.json<{ contributionId: string }>();
-    await seedSealedSuppressedSnapshot();
-
-    const baseBucket = testBindings().QUARANTINE;
-    const failingBucket = new Proxy(baseBucket, {
-      get(target, property) {
-        if (property === "delete") {
-          return async (..._keys: Parameters<R2Bucket["delete"]>) => {
-            throw new Error("injected contribution R2 deletion failure");
-          };
-        }
-        const value = Reflect.get(target, property);
-        return typeof value === "function" ? value.bind(target) : value;
-      },
-    });
-    const failed = await contributionResource(
-      participant,
-      contributionId,
-      "delete",
-      testBindings({ QUARANTINE: failingBucket }),
-    );
-    expect(failed.status).toBe(500);
-    const row = await testBindings().USAGE_MONITOR_DB.prepare(
-      "SELECT status FROM telemetry_contributions WHERE id = ?",
-    ).bind(contributionId).first<{ status: string }>();
-    expect(row?.status).toBe("deleting");
-    const withdrawn = await api("/api/v1/stats/aggregate");
-    const withdrawnText = await withdrawn.text();
-    expect(JSON.parse(withdrawnText)).toMatchObject({
-      releaseStatus: "withdrawn",
-      immutable: true,
-      nonOverlapping: true,
-    });
-    expect(withdrawnText).not.toContain("\"cells\"");
-
-    const retried = await contributionResource(
-      participant,
-      contributionId,
-      "delete",
-    );
-    expect(retried.status).toBe(200);
-  });
-
-  it("does not let local-open participants unlock invite-only community aggregates", async () => {
-    for (const suffix of ["a", "b", "c"]) {
-      const participant = await enrollTelemetry();
-      const response = await uploadEnvelope(
-        participant,
-        await encrypt(telemetryFixture(suffix), true),
-      );
-      expect(response.status).toBe(202);
-    }
-    const suppressed = await api(
-      "/api/v1/community/insights",
-      {},
-      inviteOnlyBindings(),
-    );
-    await expect(suppressed.json()).resolves.toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.3",
-      releaseStatus: "not_yet_published",
-      reason: "stable_snapshot_unavailable",
-    });
-
-    let invitedParticipant: EnrollmentResponse | null = null;
-    for (const suffix of ["d", "e", "f"]) {
-      const grant = await issueTestGrant();
-      const enrolled = await enrollWithGrant(grant);
-      expect(enrolled.status).toBe(201);
-      const participant = await enrollmentFrom(enrolled);
-      invitedParticipant ??= participant;
-      const contribution = await uploadEnvelope(
-        participant,
-        await encrypt(telemetryFixture(suffix), true),
-      );
-      expect(contribution.status).toBe(202);
-    }
-    const community = await api(
-      "/api/v1/community/insights",
-      {},
-      inviteOnlyBindings(),
-    );
-    const communityText = await community.text();
-    expect(JSON.parse(communityText)).toMatchObject({
-      schemaVersion: "community-weekly-snapshot-v0.3",
-      releaseStatus: "not_yet_published",
-      reason: "stable_snapshot_unavailable",
-    });
-    for (const forbidden of ["eligibility:", "um_invite_", "grant_id"]) {
-      expect(communityText).not.toContain(forbidden);
-    }
-
-    const exported = await api("/api/v1/me/export", {
-      headers: personalHeaders(invitedParticipant!),
-    });
-    const exportText = await exported.text();
-    for (const forbidden of ["eligibility:", "um_invite_", "grant_id"]) {
-      expect(exportText).not.toContain(forbidden);
-    }
-  });
-
   it("conditions concurrent deletion loser effects and preserves the winning retry session", async () => {
     const participant = await enrollTelemetry();
     const contribution = await uploadEnvelope(
@@ -4762,12 +3263,10 @@ describe("synthetic usage monitor service", () => {
     expect(responses.filter((response) => response.status === 500)).toHaveLength(1);
     expect(responses.filter((response) => [401, 409].includes(response.status))).toHaveLength(1);
     expect(deleteCalls).toBe(1);
-    const withdrawnSnapshot = await api("/api/v1/stats/aggregate");
-    await expect(withdrawnSnapshot.json()).resolves.toMatchObject({
-      releaseStatus: "withdrawn",
-      immutable: true,
-      nonOverlapping: true,
-    });
+    const withdrawnSnapshot = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT release_state FROM community_weekly_snapshots",
+    ).first<{ release_state: string }>();
+    expect(withdrawnSnapshot?.release_state).toBe("withdrawn");
 
     const state = await testBindings().USAGE_MONITOR_DB.prepare(
       "SELECT state, deletion_session_id FROM participants WHERE id = ?",
@@ -4783,7 +3282,7 @@ describe("synthetic usage monitor service", () => {
     const losingParticipant = winningParticipant === participant
       ? otherParticipant
       : participant;
-    const otherRejected = await api("/api/v1/me", {
+    const otherRejected = await api("/api/v1/session", {
       headers: personalHeaders(losingParticipant),
     });
     expect(otherRejected.status).toBe(401);
@@ -4797,47 +3296,9 @@ describe("synthetic usage monitor service", () => {
     });
     expect(uploadRejected.status).toBe(401);
 
-    await testBindings().USAGE_MONITOR_DB.prepare(
-      `UPDATE web_sessions SET expires_at = ?
-        WHERE id = ?`,
-    ).bind("2020-01-01T00:00:00.000Z", state?.deletion_session_id).run();
-    const expiredRetry = await api("/api/v1/me", {
-      method: "DELETE",
-      headers: personalHeaders(winningParticipant, { csrf: true }),
-    });
-    expect(expiredRetry.status).toBe(401);
-
-    const recoveredResponse = await api("/api/v1/recover", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        recoveryCode: participant.recoveryCode,
-        recoveryAttemptId: recoveryAttemptId(),
-      }),
-    });
-    expect(recoveredResponse.status).toBe(200);
-    const deletionOnly = await enrollmentFrom(recoveredResponse);
-    const personalRead = await api("/api/v1/me/stats", {
-      headers: personalHeaders(deletionOnly),
-    });
-    expect(personalRead.status).toBe(401);
-    const uploadRegistration = await api("/api/v1/me/upload-authorizations", {
-      method: "POST",
-      headers: {
-        ...personalHeaders(deletionOnly, { csrf: true }),
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        envelopeDigest: "a".repeat(64),
-        contentLengthBytes: 1,
-        contentType: "application/json",
-      }),
-    });
-    expect(uploadRegistration.status).toBe(401);
-
     const retried = await api("/api/v1/me", {
       method: "DELETE",
-      headers: personalHeaders(deletionOnly, { csrf: true }),
+      headers: personalHeaders(winningParticipant, { csrf: true }),
     });
     expect(retried.status).toBe(200);
     await expect(retried.json()).resolves.toMatchObject({
@@ -4854,7 +3315,7 @@ describe("synthetic usage monitor service", () => {
     const personalRead = await api("/api/v1/me", {
       headers: { authorization: `Device ${device.authorization}` },
     });
-    expect(personalRead.status).toBe(401);
+    expect(personalRead.status).toBe(405);
 
     const listed = await api("/api/v1/me/devices", {
       headers: personalHeaders(participant),
@@ -4894,13 +3355,10 @@ describe("synthetic usage monitor service", () => {
     });
     expect(reused.status).toBe(401);
 
-    const stats = await api("/api/v1/me/stats", {
-      headers: personalHeaders(participant),
-    });
-    expect(stats.status).toBe(200);
-    await expect(stats.json()).resolves.toMatchObject({
-      totals: { contributions: 1 },
-    });
+    const contributionCount = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM telemetry_contributions WHERE participant_id = ?",
+    ).bind(participant.participantId).first<{ total: number }>();
+    expect(contributionCount?.total).toBe(1);
 
     const pendingRaw = JSON.stringify(await encrypt(telemetryFixture("e"), true));
     const pending = await registerDeviceUpload(device, pendingRaw);
@@ -4973,85 +3431,6 @@ describe("synthetic usage monitor service", () => {
     }
   });
 
-  it("rejects cookie-bearing pairing claims and revokes device authority on recovery", async () => {
-    const participant = await enrollTelemetry();
-    const pairingResponse = await api("/api/v1/me/device-pairings", {
-      method: "POST",
-      headers: {
-        ...personalHeaders(participant, { csrf: true }),
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        consentVersion: "ongoing-privacy-safe-telemetry-v0.1",
-        ongoingUpload: true,
-      }),
-    });
-    const pairing = await pairingResponse.json<{ pairingCode: string }>();
-    const deviceId = "11111111-1111-4111-8111-111111111111";
-    const rawDeviceSecret = new Uint8Array(32).fill(37);
-    const deviceSecret = encodeBase64Url(rawDeviceSecret);
-    const hashedDeviceSecret = await deviceSecretHash(deviceId, rawDeviceSecret);
-    expect(hashedDeviceSecret).toBe(
-      "1ec2f641ad37bc1446708db769a3f6d86911bc17240912bc2f60a5b1113d66ec",
-    );
-    rawDeviceSecret.fill(0);
-    const cookieClaim = await api("/api/v1/device-pairings/claim", {
-      method: "POST",
-      headers: {
-        authorization: `Pairing ${pairing.pairingCode}`,
-        cookie: participant.cookie,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ deviceId, deviceSecretHash: hashedDeviceSecret }),
-    });
-    expect(cookieClaim.status).toBe(401);
-    const claim = await api("/api/v1/device-pairings/claim", {
-      method: "POST",
-      headers: {
-        authorization: `Pairing ${pairing.pairingCode}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ deviceId, deviceSecretHash: hashedDeviceSecret }),
-    });
-    expect(claim.status).toBe(201);
-    const replay = await api("/api/v1/device-pairings/claim", {
-      method: "POST",
-      headers: {
-        authorization: `Pairing ${pairing.pairingCode}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ deviceId, deviceSecretHash: hashedDeviceSecret }),
-    });
-    expect(replay.status).toBe(201);
-
-    const recovered = await api("/api/v1/recover", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        recoveryCode: participant.recoveryCode,
-        recoveryAttemptId: recoveryAttemptId(),
-      }),
-    });
-    expect(recovered.status).toBe(200);
-    const denied = await api("/api/v1/device/upload-authorizations", {
-      method: "POST",
-      headers: {
-        authorization: `Device um_device_${deviceId}.${deviceSecret}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({
-        envelopeDigest: "a".repeat(64),
-        contentLengthBytes: 1,
-        contentType: "application/json",
-      }),
-    });
-    expect(denied.status).toBe(401);
-    const state = await testBindings().USAGE_MONITOR_DB.prepare(
-      "SELECT state FROM device_credentials WHERE id = ?",
-    ).bind(deviceId).first<{ state: string }>();
-    expect(state?.state).toBe("revoked");
-  });
-
   it("deletes every telemetry object and database row with the participant", async () => {
     const participant = await enrollTelemetry();
     for (const suffix of ["a", "b"]) {
@@ -5117,29 +3496,6 @@ describe("synthetic usage monitor service", () => {
     ).bind(receipt.contributionId, participant.participantId)
       .first<{ quarantine_deleted_at: string | null }>();
     expect(retained?.quarantine_deleted_at).toBeNull();
-    const stats = await api("/api/v1/me/stats", {
-      headers: personalHeaders(participant),
-    });
-    expect(stats.status).toBe(200);
-    await expect(stats.json()).resolves.toMatchObject({
-      totals: { contributions: 1 },
-    });
-    const profile = await api("/api/v1/me", {
-      headers: personalHeaders(participant),
-    });
-    await expect(profile.json()).resolves.toMatchObject({
-      schemaVersion: "participant-profile-v0.2",
-      contributionCount: 1,
-      contributions: [{
-        contributionId: receipt.contributionId,
-        quarantine: {
-          state: "retained",
-          scheduledDeletionAt: null,
-          deletedAt: null,
-          canonicalMetadataRetained: true,
-        },
-      }],
-    });
   });
 
   it("retains indeterminate telemetry quarantine objects after committed ingest accounting fails", async () => {
@@ -5391,7 +3747,7 @@ describe("synthetic usage monitor service", () => {
       Date.parse("2026-07-25T00:00:00.000Z"),
     );
 
-    const deniedBeforeReplay = await api("/api/v1/me/stats", {
+    const deniedBeforeReplay = await api("/api/v1/session", {
       headers: personalHeaders(participant),
     });
     expect(deniedBeforeReplay.status).toBe(401);
@@ -5530,7 +3886,7 @@ describe("synthetic usage monitor service", () => {
       });
     });
 
-    it("requires identity for production enrollment and recovery", async () => {
+    it("requires identity for production enrollment and keeps recovery retired", async () => {
       const production = identityBindings({
         ENVIRONMENT: "production" as Env["ENVIRONMENT"],
         ENROLLMENT_MODE: "open" as Env["ENROLLMENT_MODE"],
@@ -5552,12 +3908,11 @@ describe("synthetic usage monitor service", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           recoveryCode: "um_recovery_x.y",
-          recoveryAttemptId: recoveryAttemptId(),
         }),
       }, production);
-      expect(recovery.status).toBe(401);
+      expect(recovery.status).toBe(404);
       expect(await recovery.json()).toMatchObject({
-        error: { code: "IDENTITY_REQUIRED" },
+        error: { code: "NOT_FOUND" },
       });
     });
 

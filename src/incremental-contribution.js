@@ -20,8 +20,8 @@ export {
   TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
 } from "./contribution/telemetry-v1-chunks.js";
 
-// Exact composition surface, mirroring automatic-contribution.js: the
-// scheduling and consent state machine is application-owned; this file
+// Exact composition surface: the scheduling and consent state machine is
+// application-owned; this file
 // supplies the owner-only settings storage port.
 const storage = createOwnerOnlyAutomaticContributionStorageContext({
   createError: (code) => new IncrementalContributionSyncError(

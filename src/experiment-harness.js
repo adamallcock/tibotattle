@@ -9,7 +9,7 @@ import {
   sanitizeCodexAccountSnapshot,
 } from "./providers/codex/account.js";
 import { scanAndPriceCodexLogs } from "./codex-local-usage-analysis.js";
-import { scanCodexLogEvents } from "./codex-log-scan.js";
+import { localCodexLogScanner } from "./local-node-runtime.js";
 import { stableJson } from "./export/index.js";
 import { subscriptionSpeedSensitivity } from "./application/index.js";
 import { validateTierDeclaration } from "./providers/codex/logs.js";
@@ -20,6 +20,7 @@ import {
 } from "@app-usagemonitor/accounting";
 
 const MANIFEST_SCHEMA_VERSION = "0.3";
+const { scanCodexLogEvents } = localCodexLogScanner;
 const RESULT_SCHEMA_VERSION = "0.3";
 const ALLOWED_MODES = new Set(["dry", "sample", "live"]);
 const ALLOWED_CACHE_STATES = new Set(["uncached", "repeat_expected", "unspecified"]);

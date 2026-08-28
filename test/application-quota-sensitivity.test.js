@@ -22,7 +22,6 @@ const APPLICATION_PUBLIC_EXPORTS = [
   "ClaudeCallbackCapabilityError",
   "createClaudeCallbackCapabilityContext",
   "createExportCompatibilityContext",
-  "createLocalAutomaticContributionContext",
   "createLocalContributionSyncQueueContext",
   "createLocalExportArtifactStorageContext",
   "createLocalExportDeletion",

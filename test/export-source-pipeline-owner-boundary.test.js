@@ -8,7 +8,8 @@ import * as application from "../src/application/index.js";
 import * as applicationOwner from "../src/application/export-sources/index.js";
 import * as platform from "../src/platform/index.js";
 import * as platformOwner from "../src/platform/local-export-source-ports.js";
-import { exportSourcePipelineCompatibility as pipeline } from "../src/export-source-pipeline-compatibility-internal.js";
+import { localExportSourcePipeline as pipeline } from
+  "../src/local-node-runtime.js";
 import { runLocalReview } from "../local-review/cli.js";
 
 const ROOT = resolve(import.meta.dirname, "..");
@@ -525,11 +526,11 @@ test("owner dependency closure and local-review composition remain explicit", as
   assert.match(localReviewSource, /createLocalExportSourcePorts/u);
 });
 
-test("compatibility singleton imports without source discovery or local state", () => {
+test("local Node runtime imports without source discovery or local state", () => {
   const missing = resolve(ROOT, ".tmp-does-not-exist-export-source-import");
   const imported = spawnSync(process.execPath, [
     "--input-type=module", "-e",
-    "await import('./src/export-source-pipeline-compatibility-internal.js'); console.log('imported')",
+    "await import('./src/local-node-runtime.js'); console.log('imported')",
   ], {
     cwd: ROOT,
     encoding: "utf8",

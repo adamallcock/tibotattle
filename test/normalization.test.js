@@ -21,14 +21,18 @@ import { defaultContaminationFile, defaultInferenceFile, defaultTransitionFile, 
 import { scanAndPriceCodexLogs } from "../src/codex-local-usage-analysis.js";
 import {
   classifyToolCall,
-  appendedRolloutSourcesAreAfterEnd,
   canonicalComponentAvailability,
   createSnapshotLineage,
   extractToolObservations,
-  hasForkReplayPrefix,
   normalizeTokenUsage,
+} from "../src/providers/codex/logs.js";
+import { localCodexLogScanner } from "../src/local-node-runtime.js";
+
+const {
+  appendedRolloutSourcesAreAfterEnd,
+  hasForkReplayPrefix,
   scanCodexLogEvents,
-} from "../src/codex-log-scan.js";
+} = localCodexLogScanner;
 
 test("fork snapshot lineage shares ancestors instead of copying their keys", () => {
   const chain = [];

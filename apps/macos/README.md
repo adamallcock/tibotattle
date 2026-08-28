@@ -14,6 +14,27 @@ fails closed unless production service configuration, approved artwork,
 Developer ID signing, Apple notarization, stapling, Gatekeeper assessment, and
 a clean-profile smoke all succeed.
 
+For the native/loopback launch contract, fixed URL scheme, WKWebView messages,
+Keychain broker, Codex subprocess protocol, platform APIs, and system diagram,
+see the canonical
+[TiboTattle API surface reference](../../docs/reference/2026-08-26-api-surface-reference.md).
+
+The packaged companion reaches Keychain only through the app's private
+protocol-v2 socket broker. Its closed capability enum covers export identity,
+account observation, Claude-session pseudonym, and contribution device; no
+service/account string crosses the wire. The current packaged-companion graph
+uses the export-identity, account-observation, and contribution-device
+mappings; the Claude callback remains a standalone CLI/local-review
+composition. A legacy `.v1` item is copied to the app-owned `.app.v1` item,
+read back, and only then deleted. A denied prompt returns
+`migration_required` and preserves the legacy item. The packaged runtime will
+not prompt for that capability again in the same app process. Quit and reopen
+TiboTattle before repeating the initiating action; restart is the only retry
+boundary, and reset or deletion is not recovery for this condition. All four
+adapters retain a content-free migration-required diagnostic. The packaged
+runtime excludes `@github/keytar`; standalone CLI/local-review tooling retains
+that compatibility backend.
+
 ## Consumer lifecycle in the app
 
 1. Launch **TiboTattle.app**.
@@ -402,8 +423,8 @@ The release command:
    candidate, and discards the candidate bytes;
 4. signs Sparkle's Installer XPC, Downloader XPC (preserving its entitlement),
    Autoupdate helper, Updater app, and framework in the upstream-documented
-   inside-out order, followed by keytar, embedded Node, the native launcher,
-   and the outer app;
+   inside-out order, followed by embedded Node, the native launcher, and the
+   outer app;
 5. applies hardened runtime and a minimal, reviewed Node runtime entitlement
    file;
 6. verifies the complete Developer ID signature;

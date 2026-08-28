@@ -33,6 +33,7 @@ export {
   CONTRIBUTION_DEVICE_READER_CODE_IDENTIFIER,
   CONTRIBUTION_DEVICE_READER_TEAM_IDENTIFIER,
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
+  MACOS_APP_KEYCHAIN_CAPABILITIES,
   ExportIdentityKeychainError,
   KEYTAR_DARWIN_ARM64_SHA256,
   KEYTAR_SIGNING_CODE_IDENTIFIER,
@@ -49,6 +50,10 @@ export {
   keytarSignedBindingVerificationArguments,
   loadExportIdentityKeychainBinding,
 } from "./export-identity-keychain.js";
+export {
+  MACOS_KEYCHAIN_BROKER_CAPABILITY_NAMES,
+  macOSKeychainBrokerCapabilityName,
+} from "./keychain-capabilities.js";
 // The contribution-device Keychain broker is deliberately absent: it lives at
 // src/contribution-device-keychain-broker.js with the other contribution
 // modules, not under this owner. This barrel is the reviewed platform-adapter

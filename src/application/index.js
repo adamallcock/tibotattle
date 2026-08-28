@@ -13,9 +13,6 @@ export {
   createLocalExportResourceContext,
 } from "./local-export-resource-context.js";
 export {
-  createLocalAutomaticContributionContext,
-} from "./local-automatic-contribution.js";
-export {
   createLocalContributionSyncQueueContext,
 } from "./local-contribution-sync-queue.js";
 export {

@@ -36,7 +36,8 @@ const LIMIT_IDS = new Set(["codex", "codex-spark"]);
 const SOURCES = new Set(["app_server_read", "app_server_notification"]);
 const SLOTS = new Set(["primary", "secondary"]);
 const ACCOUNT_UNAVAILABLE_REASONS = new Set([
-  "missing_account", "malformed_subject", "missing_secret", "credential_locked", "credential_unavailable",
+  "missing_account", "malformed_subject", "missing_secret", "credential_locked",
+  "credential_migration_required", "credential_unavailable",
 ]);
 const MAXIMUM_WINDOW_MINUTES = 366 * 24 * 60;
 const RECORD_KEYS = Object.freeze([

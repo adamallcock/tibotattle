@@ -6,7 +6,6 @@ import test from "node:test";
 import * as quotaAnalysis from "@app-usagemonitor/quota-analysis";
 
 const TRACK_EXPORTS = Object.freeze([
-  "QUOTA_TRACK_POLICY",
   "buildResetEvidence",
   "continuityKey",
   "resetKey",
@@ -15,14 +14,11 @@ const CALIBRATION_EXPORTS = Object.freeze([
   "QUOTA_CALIBRATION_POLICY",
   "analyzeQuotaCalibration",
   "fitResetCapacity",
-  "forecastCapacityFromPriorResets",
 ]);
 const ROLLING_EXPORTS = Object.freeze([
-  "QUOTA_ROLLING_POLICY",
   "buildRollingQuotaComparisons",
 ]);
 const PACE_EXPORTS = Object.freeze([
-  "QUOTA_PACE_POLICY",
   "analyzeQuotaPace",
 ]);
 const COMPOSITION_EXPORTS = Object.freeze([
@@ -31,7 +27,6 @@ const COMPOSITION_EXPORTS = Object.freeze([
   "buildCompositionObservations",
   "calibrateCompositionCapacities",
   "compositionExpectedPp",
-  "solveNonNegativeLeastSquares",
 ]);
 const WINDOW_EXPORTS = Object.freeze([
   "classifyQuotaWindowKind",
@@ -51,10 +46,8 @@ const WINDOW_EXPORTS = Object.freeze([
   "sanitizeQuotaLimitDisplayName",
   "sanitizeQuotaLimitId",
   "SEVEN_DAY_WINDOW_MINUTES",
-  "SUPPORTED_QUOTA_WINDOW_DURATIONS",
   "isValidQuotaWindowDuration",
   "isSupportedQuotaWindowDuration",
-  "selectPrimaryQuotaWindow",
 ]);
 const SOURCE_HASHES = Object.freeze({
   "quota-calibration.js":

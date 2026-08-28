@@ -2,11 +2,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   EXPORT_CHECKPOINT_PARSER_VERSION,
+} from "../src/export/index.js";
+import { localCodexCheckpointState } from
+  "../src/local-node-runtime.js";
+
+const {
   createEmptyCodexCheckpointState,
   digestCodexCheckpointState,
   normalizeCodexCheckpointState,
   serializeCodexCheckpointState,
-} from "../src/export-checkpoint-state.js";
+} = localCodexCheckpointState;
 
 function stateWithCumulativeTotals() {
   const value = createEmptyCodexCheckpointState();

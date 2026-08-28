@@ -44,7 +44,6 @@ update has been produced.
 | Private loopback dashboard | Personal analysis, local results, contribution review, contribution receipt/status, and optional delayed community comparison | Raw Codex content and source paths are not served to the browser |
 | Hosted website | Acquisition, verified download metadata, documentation, and delayed public aggregates | A webpage cannot read local Codex files or replace the personal dashboard |
 | Cloudflare Worker | Disabled-first contribution service, private calculations, delayed aggregate publication, retention, and deletion | No public deployment or authorized participant collection |
-| Contained Cloud Run/GCS experiment | Collection-disabled liveness, private-object readiness, and IAM/deployment research | No participant metadata store or ingest API; not the pilot backend |
 
 The shared dashboard source can render the appropriate hosted or loopback
 state, but authority does not move with the HTML. Local collection stays in the
@@ -471,16 +470,6 @@ An authorized owner must:
 9. separately authorize invitation issuance, collection activation, and any
    real participant.
 
-The contained Cloud Run/GCS experiment is not a shortcut around those gates.
-Its checked-in template still contains exactly three resource placeholders:
-runtime service account, immutable container image digest, and private bucket.
-It additionally needs an authorized Google Cloud project, API/billing
-acceptance, private bucket and readiness marker, scoped workload identity,
-rendered configuration, direct and effective IAM review, and deployment
-authorization. Even then, it remains collection-disabled until a metadata
-store implements the existing isolation, deduplication, deletion, restore, and
-aggregate contracts.
-
 ## Other human-only release gates
 
 No repository-only action can safely complete these:
@@ -536,9 +525,6 @@ No repository-only action can safely complete these:
   [`scripts/macos-release-core.js`](../../scripts/macos-release-core.js)
 - Cloudflare readiness gate:
   [`apps/worker/scripts/staging-readiness-lib.mjs`](../../apps/worker/scripts/staging-readiness-lib.mjs)
-- Contained Cloud Run boundary:
-  [Cloud Run runbook](../../apps/cloud-run/README.md)
-
 The earlier
 [end-to-end pilot readiness report](./2026-07-29-end-to-end-pilot-readiness-report.md)
 is retained as a historical snapshot and is explicitly superseded by this

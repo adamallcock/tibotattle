@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   createTelemetryEnvelope,
   validateAccountScopedTelemetryContribution,
@@ -32,6 +32,7 @@ const HOUR_MS = 3_600_000;
 let cookie = "";
 let csrfToken = "";
 let participantId = "";
+let deviceAuthorization = "";
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -209,9 +210,10 @@ async function upload(payload, key) {
   });
   const serialized = JSON.stringify(envelope);
   const registration = expectStatus(
-    await request("/api/v1/me/upload-authorizations", {
+    await request("/api/v1/device/upload-authorizations", {
       method: "POST",
-      csrf: true,
+      includeCookie: false,
+      authorization: `Device ${deviceAuthorization}`,
       body: JSON.stringify({
         envelopeDigest: sha256(serialized),
         contentLengthBytes: Buffer.byteLength(serialized, "utf8"),
@@ -227,6 +229,37 @@ async function upload(payload, key) {
     authorization: `Upload ${registration.uploadAuthorization}`,
     body: serialized,
   });
+}
+
+async function claimDevice(pairing) {
+  if (typeof pairing?.pairingCode !== "string") {
+    throw new Error("Enrollment did not issue a device pairing authority.");
+  }
+  const deviceId = randomUUID();
+  const rawSecret = randomBytes(32);
+  const encodedSecret = rawSecret.toString("base64url");
+  let deviceSecretHash;
+  try {
+    deviceSecretHash = createHash("sha256")
+      .update("app-usagemonitor/device/v1\0")
+      .update(deviceId)
+      .update("\0")
+      .update(rawSecret)
+      .digest("hex");
+  } finally {
+    rawSecret.fill(0);
+  }
+  expectStatus(
+    await request("/api/v1/device-pairings/claim", {
+      method: "POST",
+      includeCookie: false,
+      authorization: `Pairing ${pairing.pairingCode}`,
+      body: JSON.stringify({ deviceId, deviceSecretHash }),
+    }),
+    201,
+    "Device pairing claim",
+  );
+  return `um_device_${deviceId}.${encodedSecret}`;
 }
 
 async function cleanup() {
@@ -252,6 +285,7 @@ try {
       body: JSON.stringify({
         consentVersion: "privacy-safe-telemetry-v0.2",
         syntheticOnly: false,
+        deviceBootstrap: true,
       }),
     }),
     201,
@@ -262,6 +296,7 @@ try {
   if (!/^participant:/u.test(participantId) || !cookie || !csrfToken) {
     throw new Error("Enrollment did not establish the anonymous session contract.");
   }
+  deviceAuthorization = await claimDevice(enrollment.pairing);
   const accountTrackId = `account-track:v1:${sha256(
     `usage-monitor/local-preview-smoke/v1\0${participantId}\0openai_codex`,
   )}`;
@@ -284,19 +319,6 @@ try {
     contributionIds.push(receipt.contributionId);
   }
 
-  const statsResult = await request("/api/v1/me/insights");
-  const stats = expectStatus(statsResult, 200, "Private insights");
-  const track = stats?.accountScopedQuotaAnalysis?.tracks?.[0];
-  if (stats?.totals?.usageEvents !== 36
-      || stats?.totals?.quotaSnapshots !== 40
-      || stats?.totals?.priceVerification !== "server_repriced"
-      || stats?.totals?.apiPriceEquivalentUsd === "35964"
-      || stats?.accountScopedQuotaAnalysis?.status !== "ready"
-      || track?.calibration?.tracks?.[0]?.estimatedResetCount !== 4
-      || track?.rolling?.status !== "conditional_comparison") {
-    throw new Error("Private account-scoped calibration did not recompute correctly.");
-  }
-
   const exportedResult = await request("/api/v1/me/export");
   const exported = expectStatus(exportedResult, 200, "Participant export");
   if (exported?.contributions?.length !== 4
@@ -305,7 +327,7 @@ try {
     throw new Error("Participant export was incomplete or exposed an authority.");
   }
 
-  const communityResult = await request("/api/v1/community/insights");
+  const communityResult = await request("/api/v1/community/daily");
   expectStatus(communityResult, 200, "Community output");
   if (communityResult.text.includes("accountTrackId")
       || communityResult.text.includes(accountTrackId)
@@ -332,8 +354,6 @@ try {
     contributions: 4,
     usageEvents: 36,
     quotaSnapshots: 40,
-    qualifiedResetEstimates: 4,
-    rollingComparisonStatus: "conditional_comparison",
     serverRepriced: true,
     participantExportVerified: true,
     communityFieldExclusionVerified: true,

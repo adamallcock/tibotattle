@@ -11,8 +11,12 @@ import {
   createClaudeStatusWorkspaceSource,
 } from "../src/claude-statusline-workspace-source.js";
 import { createSupplementalSourcePlan } from "../src/export-supplemental-source-plan.js";
-import { openExportWorkspace } from "../src/export-workspace.js";
-import { createLocalExportWorkspace, resumeLocalExportWorkspace } from "../src/export-set-controller.js";
+import { localExportSourcePipeline, localExportWorkspace } from
+  "../src/local-node-runtime.js";
+
+const { openExportWorkspace } = localExportWorkspace;
+const { createLocalExportWorkspace, resumeLocalExportWorkspace } =
+  localExportSourcePipeline.controller;
 
 const SECRET = Buffer.alloc(32, 97);
 const SESSION_SECRET = Buffer.alloc(32, 98);

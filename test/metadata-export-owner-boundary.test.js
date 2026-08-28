@@ -12,9 +12,11 @@ import {
   createCodexCheckpointStateContext,
   createSafeRecordsContext,
 } from "../src/export/index.js";
-import * as legacyCheckpoint from "../src/export-checkpoint-state.js";
-import * as legacySafeRecords from "../src/export-safe-records.js";
-import * as legacyMetadata from "../src/metadata-exporter.js";
+import {
+  localCodexCheckpointState,
+  localMetadataExport,
+  localSafeRecords,
+} from "../src/local-node-runtime.js";
 import { createLocalCodexLogPorts } from "../src/platform/index.js";
 import { CODEX_COLLECTOR_CANDIDATE_VERSION as collectorCandidateVersion } from "../src/codex-collector-export-source.js";
 import { extractEsmImports } from "../scripts/lib/esm-imports.mjs";
@@ -39,31 +41,29 @@ const SAFE_RECORD_EXPORTS = [
   "usageEventIdentitySubject",
 ].sort();
 
-test("metadata export owners expose only their reviewed factories and exact legacy APIs", () => {
+test("metadata export owners expose reviewed factories and exact runtime contexts", () => {
   assert.equal(typeof createLocalMetadataExportContext, "function");
   assert.equal(typeof createSafeRecordsContext, "function");
   assert.equal(typeof createCodexCheckpointStateContext, "function");
   assert.equal(CODEX_COLLECTOR_CANDIDATE_VERSION, collectorCandidateVersion);
-  assert.deepEqual(Object.keys(legacySafeRecords).sort(), SAFE_RECORD_EXPORTS);
-  assert.deepEqual(Object.keys(legacyCheckpoint).sort(), [
-    "EXPORT_CHECKPOINT_PARSER_VERSION",
+  assert.deepEqual(Object.keys(localSafeRecords).sort(), SAFE_RECORD_EXPORTS);
+  assert.deepEqual(Object.keys(localCodexCheckpointState).sort(), [
     "createEmptyCodexCheckpointState",
     "digestCodexCheckpointState",
     "normalizeCodexCheckpointState",
     "serializeCodexCheckpointState",
   ]);
-  assert.deepEqual(Object.keys(legacyMetadata).sort(), [
+  assert.deepEqual(Object.keys(localMetadataExport).sort(), [
     "buildLocalMetadataBundle",
-    "quotaObservationIdentitySubject",
-    "quotaStateIdentitySubject",
     "renderMetadataExportPreview",
-    "usageEventIdentitySubject",
     "writeLocalMetadataBundle",
   ]);
   const checkpoint = createCodexCheckpointStateContext({ createHash, isProxy });
   assert.equal(
     checkpoint.serializeCodexCheckpointState(checkpoint.createEmptyCodexCheckpointState()),
-    legacyCheckpoint.serializeCodexCheckpointState(legacyCheckpoint.createEmptyCodexCheckpointState()),
+    localCodexCheckpointState.serializeCodexCheckpointState(
+      localCodexCheckpointState.createEmptyCodexCheckpointState(),
+    ),
   );
   assert.equal(typeof createLocalCodexLogPorts().filesystem.openReadOnlyNoFollow, "function");
 });

@@ -12,26 +12,15 @@ const EXPECTED_ROUTES = [
   { pathname: "/api/v1/identity/google/result", methods: ["POST"] },
   { pathname: "/api/v1/identity/apple/start", methods: ["POST"] },
   { pathname: "/api/v1/identity/apple/result", methods: ["POST"] },
-  { pathname: "/api/v1/recover", methods: ["POST"] },
   { pathname: "/api/v1/session", methods: ["GET"] },
   { pathname: "/api/v1/logout", methods: ["POST"] },
-  { pathname: "/api/v1/me", methods: ["GET", "DELETE"] },
-  { pathname: "/api/v1/me/stats", methods: ["GET"] },
-  { pathname: "/api/v1/me/insights", methods: ["GET"] },
-  { pathname: "/api/v1/me/export", methods: ["GET"] },
-  { pathname: "/api/v1/me/security-reset", methods: ["POST"] },
-  { pathname: "/api/v1/me/upload-authorizations", methods: ["POST"] },
+  { pathname: "/api/v1/me", methods: ["DELETE"] },
   { pathname: "/api/v1/me/device-pairings", methods: ["POST"] },
-  { pathname: "/api/v1/me/devices", methods: ["GET"] },
-  { pathname: "/api/v1/me/devices/revoke", methods: ["POST"] },
-  { pathname: "/api/v1/me/contributions/read", methods: ["POST"] },
-  { pathname: "/api/v1/me/contributions/delete", methods: ["POST"] },
-  { pathname: "/api/v1/contributions", methods: ["POST"] },
 ];
 
 test("participant relay route policy preserves the exact allowlist", () => {
-  assert.equal(EXPECTED_ROUTES.length, 20);
-  assert.equal(PARTICIPANT_RELAY_ROUTE_POLICY.length, 20);
+  assert.equal(EXPECTED_ROUTES.length, 9);
+  assert.equal(PARTICIPANT_RELAY_ROUTE_POLICY.length, 9);
   assert.deepEqual(PARTICIPANT_RELAY_ROUTE_POLICY, EXPECTED_ROUTES);
   assert.equal(Object.isFrozen(PARTICIPANT_RELAY_ROUTE_POLICY), true);
   for (const policy of PARTICIPANT_RELAY_ROUTE_POLICY) {
@@ -53,6 +42,17 @@ test("participant relay route policy keeps route matching exact", () => {
     "/api/v1/identity/google/callback",
     "/api/v1/identity/google/exchange",
     "/api/v1/device/upload-authorizations",
+    "/api/v1/recover",
+    "/api/v1/me/stats",
+    "/api/v1/me/insights",
+    "/api/v1/me/export",
+    "/api/v1/me/security-reset",
+    "/api/v1/me/upload-authorizations",
+    "/api/v1/me/devices",
+    "/api/v1/me/devices/revoke",
+    "/api/v1/me/contributions/read",
+    "/api/v1/me/contributions/delete",
+    "/api/v1/contributions",
     "/api/v1/contributions/contribution:private",
     "",
   ]) {

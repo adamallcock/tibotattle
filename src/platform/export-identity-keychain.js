@@ -3,6 +3,15 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { isAbsolute, sep } from "node:path";
+import {
+  EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
+  MACOS_APP_KEYCHAIN_CAPABILITIES,
+} from "./keychain-capabilities.js";
+
+export {
+  EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
+  MACOS_APP_KEYCHAIN_CAPABILITIES,
+} from "./keychain-capabilities.js";
 
 const require = createRequire(import.meta.url);
 const SECRET_BYTES = 32;
@@ -44,36 +53,6 @@ const SECURITY_PATH = "/usr/bin/security";
 // errSecItemNotFound surfaces from the security CLI as exit status 44.
 const SECURITY_ITEM_NOT_FOUND_STATUS = 44;
 
-export const EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES = Object.freeze({
-  exportIdentity: Object.freeze({
-    service: "app-usagemonitor.export-identity.v1",
-    account: "installation",
-  }),
-  accountObservation: Object.freeze({
-    service: "app-usagemonitor.account-observation.v1",
-    account: "installation",
-  }),
-  claudeSessionPseudonym: Object.freeze({
-    service: "app-usagemonitor.claude-session-pseudonym.v1",
-    account: "installation",
-  }),
-  contributionDevice: Object.freeze({
-    service: "app-usagemonitor.contribution-device.v1",
-    account: "installation",
-  }),
-  // The app-managed storage generation of the contribution-device credential:
-  // minted by the signed TiboTattle.app via SecItemAdd (an app-created item
-  // never raises the partition/ACL dialog for its creator) and served to the
-  // companion over the app's Keychain broker channel. A different service
-  // string, not a marker attribute, separates the generations so app-side
-  // code can never accidentally decrypt a `security`-CLI-minted `.v1` item —
-  // that read is exactly the partition prompt the broker exists to eliminate.
-  contributionDeviceApp: Object.freeze({
-    service: "app-usagemonitor.contribution-device.app.v1",
-    account: "installation",
-  }),
-});
-
 const ERROR_CODES = new Set([
   "unsupported_platform",
   "unsupported_architecture",
@@ -86,6 +65,7 @@ const ERROR_CODES = new Set([
   "operation_failed",
   "locked",
   "denied",
+  "migration_required",
   "readback_mismatch",
 ]);
 
@@ -333,6 +313,13 @@ function capabilityPair(capability) {
   fail("invalid_capability");
 }
 
+function attributeCapabilityPair(capability) {
+  for (const pair of Object.values(MACOS_APP_KEYCHAIN_CAPABILITIES)) {
+    if (capability === pair) return pair;
+  }
+  return capabilityPair(capability);
+}
+
 function copySecret(secret) {
   if (!Buffer.isBuffer(secret) || secret.byteLength !== SECRET_BYTES) fail("invalid_secret");
   return Buffer.from(secret);
@@ -385,6 +372,7 @@ function nativeFailureCode(error) {
   }
   if (LOCKED_ERROR_CODES.has(code)) return "locked";
   if (DENIED_ERROR_CODES.has(code)) return "denied";
+  if (code === "KEYCHAIN_MIGRATION_REQUIRED") return "migration_required";
   // The audited keytar native binding exposes Security.framework failures as
   // message-only Napi errors. Match only exact platform strings; never include
   // an upstream message in the public error.
@@ -431,13 +419,24 @@ export function createExportIdentityKeychainBackend(options = {}) {
     // read access; every other capability, and the readback of this one, still
     // go through keytar unchanged.
     durableAccess = null,
+    // The reusable backend is deliberately broker-agnostic. A packaged-app
+    // composition root injects its private socket binding; standalone CLI and
+    // local-review callers retain the audited keytar binding without pulling
+    // a network-capable socket module into the offline review artifact.
+    loadBrokerBinding = () => null,
   } = options;
-  if (typeof loadBinding !== "function") fail("invalid_configuration");
+  if (typeof loadBinding !== "function"
+      || typeof loadBrokerBinding !== "function") fail("invalid_configuration");
   const durableMint = normalizeDurableAccess(durableAccess);
   let selectedBinding = binding;
   if (selectedBinding === undefined) {
     try {
-      selectedBinding = loadBinding();
+      // A broker announcement is authoritative: every packaged-app
+      // capability goes through the one private channel owned by the signed
+      // app. A malformed or dead announcement must fail closed and may never
+      // fall back to keytar, which would recreate the duplicate native stack
+      // (and its update-fragile ACL) inside the bundle.
+      selectedBinding = loadBrokerBinding() ?? loadBinding();
     } catch (error) {
       if (error instanceof ExportIdentityKeychainError) throw error;
       fail("binding_unavailable");
@@ -585,7 +584,7 @@ export function createExportIdentityKeychainBackend(options = {}) {
  * app could no longer read).
  */
 export function exportIdentityKeychainAttributeDeleteArguments(capability) {
-  const pair = capabilityPair(capability);
+  const pair = attributeCapabilityPair(capability);
   return Object.freeze([
     "delete-generic-password",
     "-s",
@@ -603,7 +602,7 @@ export function exportIdentityKeychainAttributeDeleteArguments(capability) {
  * item's access control list, and it cannot raise the partition/ACL dialog.
  */
 export function exportIdentityKeychainAttributeProbeArguments(capability) {
-  const pair = capabilityPair(capability);
+  const pair = attributeCapabilityPair(capability);
   return Object.freeze([
     "find-generic-password",
     "-s",

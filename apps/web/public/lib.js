@@ -311,41 +311,6 @@ export function contributionBatchAdmission({
   });
 }
 
-export async function runReviewedContributionGate({
-  reviewToken,
-  hasPendingAutomaticConsent,
-  runReviewedSend,
-  enableAutomaticContribution,
-} = {}) {
-  if (typeof reviewToken !== "string"
-      || reviewToken.length === 0
-      || typeof hasPendingAutomaticConsent !== "boolean"
-      || typeof runReviewedSend !== "function"
-      || typeof enableAutomaticContribution !== "function") {
-    throw new TypeError("Reviewed contribution gate inputs are invalid.");
-  }
-  const result = await runReviewedSend(reviewToken);
-  const accepted =
-    result?.status === "completed"
-    && Number.isSafeInteger(result.accepted)
-    && result.accepted > 0;
-  let automatic = null;
-  let automaticError = null;
-  if (accepted && hasPendingAutomaticConsent) {
-    try {
-      automatic = await enableAutomaticContribution();
-    } catch (error) {
-      automaticError = error;
-    }
-  }
-  return Object.freeze({
-    accepted,
-    automatic,
-    automaticError,
-    result,
-  });
-}
-
 export function createRefreshPollingBudget({
   now = () => Date.now(),
   windowMs = 6 * 60 * 1_000,

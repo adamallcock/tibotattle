@@ -45,11 +45,11 @@ import {
   installClaudeCallback,
   uninstallClaudeCallback,
 } from "./claude-callback-lifecycle.js";
-import { createLocalExportWorkspace } from "./export-set-controller.js";
 import {
-  EXPORT_SET_MANIFEST_BASENAME,
-  materializeLocalExportSet,
-} from "./export-set-materializer.js";
+  localExportSetMaterialization,
+  localExportSourcePipeline,
+} from "./local-node-runtime.js";
+import { EXPORT_SET_MANIFEST_BASENAME } from "./export/index.js";
 import { planLocalExportDeletion } from "./export-deletion.js";
 import { deleteLocalExport } from "./export-deletion-executor.js";
 import { planLocalExportWorkspaceDiscard } from "./export-workspace-discard.js";
@@ -60,6 +60,9 @@ import { exportSetChunkBasenames } from "./export-set-schema.js";
 
 export const R7_RELEASE_SYNTHETIC_EVIDENCE_VERSION =
   "g1-r7-release-synthetic-evidence-v0.1";
+
+const { createLocalExportWorkspace } = localExportSourcePipeline.controller;
+const { materializeLocalExportSet } = localExportSetMaterialization;
 
 const SECRET_HEX = Buffer.alloc(32, 0x71).toString("hex");
 const PROFILE_CONFIGURATION = Object.freeze({

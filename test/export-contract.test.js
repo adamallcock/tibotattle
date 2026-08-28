@@ -4,9 +4,11 @@ import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildExportCompatibilityTuple, exportCompatibilityTuple } from "../src/export-contract.js";
-import { buildLocalMetadataBundle } from "../src/metadata-exporter.js";
+import { localMetadataExport } from "../src/local-node-runtime.js";
 import { verifyPrivacySafeBundle } from "../src/export-privacy.js";
 import { stableJson } from "../src/storage.js";
+
+const { buildLocalMetadataBundle } = localMetadataExport;
 
 const SECRET = Buffer.alloc(32, 17);
 const BUNDLE_ID = `bundle:v1:${"4".repeat(64)}`;

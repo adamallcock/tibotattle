@@ -19,6 +19,7 @@ const EXPECTED_EXPORTS = Object.freeze([
   "KEYTAR_DARWIN_ARM64_SHA256",
   "KEYTAR_SIGNING_CODE_IDENTIFIER",
   "KEYTAR_SIGNING_TEAM_IDENTIFIER",
+  "MACOS_APP_KEYCHAIN_CAPABILITIES",
   "contributionDeviceDurableAddArguments",
   "contributionDeviceReaderRequirement",
   "contributionDeviceReaderRequirementVerificationArguments",
@@ -40,7 +41,7 @@ test("legacy Keychain exports are exact identities of the platform owner", () =>
   }
 });
 
-test("the legacy path is implementation-free and macOS packaging follows the platform owner", async () => {
+test("the legacy path is implementation-free and macOS packaging excludes keytar", async () => {
   const legacySource = await readFile(
     resolve(REPOSITORY_ROOT, "src/export-identity-keychain.js"),
     "utf8",
@@ -58,12 +59,15 @@ test("the legacy path is implementation-free and macOS packaging follows the pla
     resolve(REPOSITORY_ROOT, "scripts/build-macos-app.js"),
     "utf8",
   );
-  assert.match(
-    buildSource,
-    /"src\/platform\/export-identity-keychain\.js": "@github\/keytar"/u,
-  );
   assert.doesNotMatch(
     buildSource,
-    /"src\/export-identity-keychain\.js": "@github\/keytar"/u,
+    /DYNAMIC_EXTERNAL_BY_FILE|keytar\.node|"@github\/keytar": "7\.10\.6"/u,
+  );
+  assert.doesNotMatch(
+    buildSource.slice(
+      buildSource.indexOf("const EXPECTED_EXTERNAL_SPECIFIERS"),
+      buildSource.indexOf("const WORKSPACE_RUNTIME_PACKAGE_EXTERNALS"),
+    ),
+    /@github\/keytar/u,
   );
 });

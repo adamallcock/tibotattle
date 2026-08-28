@@ -1414,7 +1414,7 @@ test("missing and malformed artifacts fail closed while collector evidence remai
       snapshot.weekly.errorCode,
       "allowance_capacity_cache_unavailable",
     );
-    assert.equal(snapshot.reports.every((report) => report.status === "unavailable"), true);
+    assert.equal(Object.hasOwn(snapshot, "reports"), false);
     assert.equal(snapshot.overview.collector.indexingState, "not_started");
   } finally {
     await rm(root, { recursive: true });

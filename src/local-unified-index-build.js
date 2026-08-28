@@ -5,8 +5,8 @@ import { Worker } from "node:worker_threads";
 import {
   codexRolloutDiscoveryReceipt,
   createLeadingRateLimitGate,
-  discoverCodexRolloutInfos,
-} from "./codex-log-scan.js";
+} from "./providers/codex/logs.js";
+import { localCodexLogScanner } from "./local-node-runtime.js";
 import { recognizedExportModelId } from "./export/index.js";
 import {
   createLineageSnapshots,
@@ -52,6 +52,7 @@ import {
 // leaves the previous index untouched and costs only the work done so far.
 
 const MAXIMUM_WORKERS = 10;
+const { discoverCodexRolloutInfos } = localCodexLogScanner;
 
 const CODEX_BILLING_SURFACE = "chatgpt_subscription";
 

@@ -4,7 +4,7 @@ import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { scanCodexLogEvents } from "./codex-log-scan.js";
+import { localCodexLogScanner } from "./local-node-runtime.js";
 import {
   defaultLocalUnifiedIndexPath,
   openLocalUnifiedIndex,
@@ -116,6 +116,7 @@ import { fastQuotaMultiplier } from "./application/index.js";
 // components silently absent.
 export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
   "local-replay-safe-accounting-v0.12";
+const { scanCodexLogEvents } = localCodexLogScanner;
 const ALLOWANCE_CAPACITY_SCHEMA_VERSION =
   "codex-primary-allowance-capacity-v0.1";
 const ALLOWANCE_SCENARIO_CANDIDATES = Object.freeze({

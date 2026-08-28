@@ -15,7 +15,6 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { verifyPrivacySafeBundle } from "../src/export-privacy.js";
-import { createLocalExportWorkspace } from "../src/export-set-controller.js";
 import {
   EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_1,
   EXPORT_SET_MANIFEST_RECEIPT_VERSION_V0_2,
@@ -29,9 +28,13 @@ import {
 import {
   EXPORT_SET_MANIFEST_BASENAME,
   EXPORT_SET_MANIFEST_RECEIPT_BASENAME,
-  materializeLocalExportSet,
-} from "../src/export-set-materializer.js";
-import { ExportSetVerificationError, verifyLocalExportSet } from "../src/export-set-verifier.js";
+  ExportSetVerificationError,
+} from "../src/export/index.js";
+import {
+  localExportSetMaterialization,
+  localExportSetVerification,
+  localExportSourcePipeline,
+} from "../src/local-node-runtime.js";
 import { stableJson } from "../src/storage.js";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -53,6 +56,10 @@ import {
 import {
   createExportSetVerificationStorageContext,
 } from "../src/platform/index.js";
+
+const { createLocalExportWorkspace } = localExportSourcePipeline.controller;
+const { materializeLocalExportSet } = localExportSetMaterialization;
+const { verifyLocalExportSet } = localExportSetVerification;
 
 const SECRET = Buffer.alloc(32, 67);
 

@@ -106,6 +106,37 @@ test("existing output remains visible when Keychain is locked", async () => {
   assert.equal(diagnostic.value().includes("PRIVATE-UPSTREAM"), false);
 });
 
+test("legacy Keychain migration reports the restart-required Claude code", async () => {
+  const output = outputSink();
+  const diagnostic = outputSink();
+  const migrationRequired = backend();
+  migrationRequired.read = async () => {
+    const error = new Error("PRIVATE-UPSTREAM-MIGRATION");
+    error.code = "export_identity_keychain_migration_required";
+    throw error;
+  };
+  const result = await runClaudeCallback({
+    stdin: Readable.from([payload()]),
+    stdout: output.sink,
+    stderr: diagnostic.sink,
+    backend: migrationRequired,
+    readRuntimeConfiguration: async () => ({
+      previousCommand: "printf 'existing status'",
+    }),
+    capturedAt: CAPTURED_AT,
+  });
+  assert.deepEqual(result, {
+    status: "existing_status_only",
+    monitorErrorCode: "claude_callback_credential_migration_required",
+  });
+  assert.equal(output.value(), "existing status");
+  assert.equal(
+    diagnostic.value(),
+    "Claude monitor unavailable [claude_callback_credential_migration_required]\n",
+  );
+  assert.equal(diagnostic.value().includes("PRIVATE-UPSTREAM"), false);
+});
+
 test("malformed callback input preserves existing output and zeroizes leased secret bytes", async () => {
   const output = outputSink();
   const diagnostic = outputSink();

@@ -335,12 +335,20 @@ test("accepts read and notification sources and explicitly leaves unavailable ac
       source: "app_server_read",
       account: { ...accountScope(false), reason: "credential_locked" },
     }),
+    quotaRecord({
+      at: "2026-07-23T12:04:00.000Z",
+      source: "app_server_read",
+      account: {
+        ...accountScope(false),
+        reason: "credential_migration_required",
+      },
+    }),
   ]);
   try {
     const result = await scanCodexCollectorExportSource(await planFor(value));
-    assert.deepEqual(result.candidates.map((candidate) => candidate.source), ["app_server_read", "app_server_notification", "app_server_read", "app_server_read"]);
-    assert.deepEqual(result.candidates.map((candidate) => candidate.accountScopeSubject), [ACCOUNT_SCOPE, "unattributed", "unattributed", "unattributed"]);
-    assert.deepEqual(result.candidates.map((candidate) => candidate.sessionScopeId), [null, null, null, null]);
+    assert.deepEqual(result.candidates.map((candidate) => candidate.source), ["app_server_read", "app_server_notification", "app_server_read", "app_server_read", "app_server_read"]);
+    assert.deepEqual(result.candidates.map((candidate) => candidate.accountScopeSubject), [ACCOUNT_SCOPE, "unattributed", "unattributed", "unattributed", "unattributed"]);
+    assert.deepEqual(result.candidates.map((candidate) => candidate.sessionScopeId), [null, null, null, null, null]);
   } finally {
     await rm(value.root, { recursive: true, force: true });
   }

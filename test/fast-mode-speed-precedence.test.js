@@ -15,12 +15,14 @@ import { test } from "node:test";
 
 import {
   FAST_MODE_QUOTA_MULTIPLIERS,
-  SPEED_MODE_PROVENANCE_VALUES,
-  fastModeModelFamily,
   fastModeModelFamilyKey,
   fastModeQuotaMultiplier,
   resolveEffectiveSpeedMode,
 } from "@app-usagemonitor/accounting";
+import {
+  SPEED_MODE_PROVENANCE_VALUES,
+  fastModeModelFamily,
+} from "../packages/accounting/src/subscription-speed.js";
 
 test("the provenance vocabulary matches the documented five-step order", () => {
   assert.deepEqual([...SPEED_MODE_PROVENANCE_VALUES], [

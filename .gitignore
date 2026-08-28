@@ -35,7 +35,6 @@ staging/
 !.dev.vars.example
 .wrangler/
 .wrangler-dry-run/
-apps/cloud-run/service.rendered.yaml
 *.pem
 *.key
 *.p12

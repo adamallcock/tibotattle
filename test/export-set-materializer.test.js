@@ -10,17 +10,24 @@ import {
   ExportCompressionError,
   EXPORT_GZIP_PROFILE,
 } from "../src/export-compression.js";
-import { createLocalExportWorkspace } from "../src/export-set-controller.js";
 import {
   combinedSourcePlanCommitment,
   EXPORT_SET_MANIFEST_BASENAME,
   EXPORT_SET_MANIFEST_RECEIPT_BASENAME,
   ExportSetError,
-  materializeLocalExportSet,
-} from "../src/export-set-materializer.js";
+} from "../src/export/index.js";
 import { exportSetChunkBasenames, validateExportSetManifest } from "../src/export-set-schema.js";
-import { verifyLocalExportSet } from "../src/export-set-verifier.js";
-import { openExportWorkspace } from "../src/export-workspace.js";
+import {
+  localExportSetMaterialization,
+  localExportSetVerification,
+  localExportSourcePipeline,
+  localExportWorkspace,
+} from "../src/local-node-runtime.js";
+
+const { createLocalExportWorkspace } = localExportSourcePipeline.controller;
+const { materializeLocalExportSet } = localExportSetMaterialization;
+const { verifyLocalExportSet } = localExportSetVerification;
+const { openExportWorkspace } = localExportWorkspace;
 
 const SECRET = Buffer.alloc(32, 61);
 const PRIVATE_MATERIALIZER_CANARY = "PRIVATE_MATERIALIZER_PROMPT_DO_NOT_EXPORT";

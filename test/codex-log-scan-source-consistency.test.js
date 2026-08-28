@@ -10,11 +10,14 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  CodexLogSourceChangedError,
+import { localCodexLogScanner } from "../src/local-node-runtime.js";
+import { CodexLogSourceChangedError } from
+  "../src/providers/codex/logs.js";
+
+const {
   discoverCodexRolloutInfos,
   scanCodexLogEvents,
-} from "../src/codex-log-scan.js";
+} = localCodexLogScanner;
 
 const START_AT = "2026-07-24T11:00:00.000Z";
 const END_AT = "2026-07-24T13:00:00.000Z";

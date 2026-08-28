@@ -6,7 +6,7 @@ import {
   canonicalRateLimitWindows,
   normalizeTokenUsage,
   tokenComponentPresence,
-} from "./codex-log-scan.js";
+} from "./providers/codex/logs.js";
 import { recognizedExportModelId } from "./export/index.js";
 import { normalizeProviderTier } from "./providers/codex/logs.js";
 

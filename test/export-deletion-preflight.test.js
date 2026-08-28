@@ -4,15 +4,25 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createLocalExportWorkspace } from "../src/export-set-controller.js";
-import { combinedSourcePlanCommitment, materializeLocalExportSet } from "../src/export-set-materializer.js";
+import { combinedSourcePlanCommitment } from "../src/export/index.js";
+import {
+  localExportSetMaterialization,
+  localExportSourcePipeline,
+  localExportWorkspace,
+} from "../src/local-node-runtime.js";
 import {
   buildLocalExportDeletionPlan,
   ExportDeletionError,
   planLocalExportDeletion,
 } from "../src/export-deletion.js";
-import { validateExportDeletionJournal, validateExportDeletionPreflight } from "../src/export-deletion-schema.js";
-import { openExportWorkspace } from "../src/export-workspace.js";
+import {
+  validateExportDeletionJournal,
+  validateExportDeletionPreflight,
+} from "../src/export/index.js";
+
+const { createLocalExportWorkspace } = localExportSourcePipeline.controller;
+const { materializeLocalExportSet } = localExportSetMaterialization;
+const { openExportWorkspace } = localExportWorkspace;
 
 function usage(tokens) {
   return {

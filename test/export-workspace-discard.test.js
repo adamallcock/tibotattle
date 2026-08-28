@@ -12,13 +12,8 @@ import { DatabaseSync } from "node:sqlite";
 import { exportCompatibilityTuple } from "../src/export-contract.js";
 import { deriveParticipantId } from "../src/export-identity.js";
 import { createCodexExportSourcePlan } from "../src/export-source-plan.js";
-import { createLocalExportWorkspace } from "../src/export-set-controller.js";
-import {
-  buildExportWorkspaceDescriptor,
-  createExportWorkspace,
-  inspectExportWorkspaceDiscardState,
-  openExportWorkspace,
-} from "../src/export-workspace.js";
+import { localExportSourcePipeline, localExportWorkspace } from
+  "../src/local-node-runtime.js";
 import {
   buildLocalExportWorkspaceDiscardPlan,
   ExportWorkspaceDiscardError,
@@ -36,6 +31,14 @@ import {
   validateExportWorkspaceDiscardReceipt,
 } from "../src/export-workspace-discard-schema.js";
 import { stableJson } from "../src/storage.js";
+
+const {
+  buildExportWorkspaceDescriptor,
+  createExportWorkspace,
+  inspectExportWorkspaceDiscardState,
+  openExportWorkspace,
+} = localExportWorkspace;
+const { createLocalExportWorkspace } = localExportSourcePipeline.controller;
 
 const PRIVATE_PROMPT = "PRIVATE_WORKSPACE_DISCARD_PROMPT";
 const PRIVATE_SESSION = "PRIVATE_WORKSPACE_DISCARD_SESSION";
@@ -750,7 +753,7 @@ test("workspace discard implementation contains no recursive deletion primitive"
     "src/export-workspace-discard-executor.js",
     "src/export-workspace-discard-schema.js",
     "src/application/local-export-workspace-discard.js",
-    "src/export-workspace-discard-compatibility-internal.js",
+    "src/local-node-runtime.js",
     "src/platform/owner-only-export-workspace-discard-preflight.js",
     "src/platform/owner-only-export-workspace-discard-storage.js",
   ];

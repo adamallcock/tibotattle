@@ -19,8 +19,10 @@ import {
   installClaudeCallback,
   uninstallClaudeCallback,
 } from "./claude-callback-lifecycle.js";
-import { createLocalExportWorkspace } from "./export-set-controller.js";
-import { materializeLocalExportSet } from "./export-set-materializer.js";
+import {
+  localExportSetMaterialization,
+  localExportSourcePipeline,
+} from "./local-node-runtime.js";
 import { planLocalExportDeletion } from "./export-deletion.js";
 import { deleteLocalExport } from "./export-deletion-executor.js";
 import { planLocalExportWorkspaceDiscard } from "./export-workspace-discard.js";
@@ -61,6 +63,8 @@ import { stableJson } from "./storage.js";
 
 export const R7_BENCHMARK_PROTOCOL_VERSION = "g1-r7-resource-benchmark-v0.1";
 export const R7_SELECTION_RULE_VERSION = "g1-r7-ceiling-selection-v0.1";
+const { createLocalExportWorkspace } = localExportSourcePipeline.controller;
+const { materializeLocalExportSet } = localExportSetMaterialization;
 const WORKER = new URL("../scripts/r7-resource-benchmark-worker.js", import.meta.url);
 const REPOSITORY_ROOT = new URL("../", import.meta.url);
 const INTENTIONAL_CHECKPOINT = Symbol("r7-intentional-checkpoint");
@@ -131,17 +135,17 @@ async function runtimeSourceUrls(relativeDirectory) {
       if (metadata.isSymbolicLink()) {
         throw new TypeError("R7 benchmark runtime source contains a symlink");
       }
-      // Operating-system metadata is not runtime source and must not be
-      // attested as such, but neither should its presence fail the smoke
-      // gate: `.DS_Store` reappears whenever anyone opens the folder in
-      // Finder. No runtime module in these trees is a dotfile, and OS
-      // metadata always is, so skipping dotfiles excludes the noise without
-      // widening what the digest is allowed to cover. This mirrors
-      // collectR7ReleaseEvidenceRuntimeSourcePaths in
+      // Operating-system metadata and repository-scoped agent guidance are
+      // not runtime source and must not be attested as such. Keep both
+      // exclusions exact: symlinks were rejected above, directories still
+      // recurse, and every other non-JavaScript file continues to fail
+      // closed. This mirrors collectR7ReleaseEvidenceRuntimeSourcePaths in
       // src/r7-release-evidence-schema.js.
       if (name.startsWith(".")) continue;
       if (metadata.isDirectory()) {
         await visit(new URL(`${name}/`, directory));
+      } else if (name === "AGENTS.md") {
+        continue;
       } else if (metadata.isFile()
           && (name.endsWith(".js") || name.endsWith(".mjs"))) {
         urls.push(url);

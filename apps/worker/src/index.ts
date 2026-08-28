@@ -30,13 +30,11 @@ import {
   ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
   BACKEND_LIFECYCLE_STALE_MILLISECONDS,
   JSON_HEADERS,
-  MAX_PARTICIPANT_PROFILE_HISTORY_ITEMS,
   MAX_REQUEST_BYTES,
   MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT,
   ONGOING_INCREMENTAL_TELEMETRY_CONSENT_VERSION,
   ONGOING_TELEMETRY_CONSENT_VERSION,
   ONGOING_ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
-  QUARANTINE_RETENTION_MILLISECONDS,
   TELEMETRY_CONSENT_VERSION,
 } from "./constants";
 import {
@@ -67,8 +65,6 @@ import {
 } from "./admin-ui";
 import {
   buildCommunityWeeklySnapshot,
-  readLatestCommunityWeeklySnapshot,
-  readParticipantCommunityComparison,
   rebuildPendingCommunityWeeklySnapshots,
 } from "./community-snapshots";
 import {
@@ -106,7 +102,6 @@ import {
   assertDeletionOwner,
   contributionCount,
   contributionForResponse,
-  contributionHistoryMetadata,
   enroll,
   envelopeDigest,
   existingContribution,
@@ -117,7 +112,6 @@ import {
   participantIdentityLinkKeyForDeletion,
   participantIdentityLinkState,
   reattachParticipantByLinkKey,
-  recoverAccess,
   revokeSession,
   securityReset,
 } from "./repository";
@@ -174,41 +168,31 @@ import {
 import {
   matchWorkerRoute,
   type ApiWorkerRouteId,
+  type WorkerRouteMatch,
+  type WorkerRouteMethod,
 } from "./route-registry";
 import { handleSparkleAppcastGuard } from "./sparkle-appcast-guard";
 import {
   assertAdminCsrf,
   assertCsrf,
   assertSameOrigin,
-  abandonUploadAuthorization,
   authenticateSession,
-  claimUploadAuthorization,
   clearedSessionCookie,
-  createUploadAuthorizationMaterial,
   hasSessionCookie,
-  recordUploadReceipt,
   sessionCookie,
-  storeUploadAuthorization,
   type SessionPrincipal,
 } from "./session";
 import {
   type TelemetryContributionAdmission,
-  deleteTelemetryContribution,
   existingTelemetryContribution,
   insertTelemetryContribution,
-  listRecentTelemetryContributions,
-  markTelemetryContributionDeleting,
-  personalStats,
-  telemetryContributionById,
   telemetryContributionAdmission,
   telemetryContributionCount,
   telemetryContributionPage,
-  telemetryContributionHistoryMetadata,
   telemetryContributionMetadata,
   telemetryContributionR2KeyPage,
   telemetryEnvelopeDigest,
   telemetryPlaintextDigest,
-  telemetryRecordsForContribution,
 } from "./telemetry-repository";
 
 // Wrangler discovers Durable Object classes through the Worker module's named
@@ -335,8 +319,8 @@ async function readBoundedJson(
   }
 }
 
-const UPLOAD_AUTHORIZATION_HEADER =
-  /^Upload um_(?:device_)?upload_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/u;
+const DEVICE_UPLOAD_AUTHORIZATION_HEADER =
+  /^Upload um_device_upload_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/u;
 
 /**
  * Reject requests that cannot possibly be a contribution before spending a
@@ -362,7 +346,7 @@ function contributionRequestPreflight(request: Request): string {
   }
   if (!request.body) throw new ApiError(400, "BODY_INVALID");
   if (typeof authorization !== "string"
-      || !UPLOAD_AUTHORIZATION_HEADER.test(authorization)) {
+      || !DEVICE_UPLOAD_AUTHORIZATION_HEADER.test(authorization)) {
     throw new ApiError(401, "UPLOAD_AUTH_INVALID");
   }
   return authorization;
@@ -406,10 +390,22 @@ async function readBoundedForm(
   }
 }
 
-function methodNotAllowed(allowed: string[]): never {
+function methodNotAllowed(allowed: readonly string[]): never {
   const error = new ApiError(405, "METHOD_NOT_ALLOWED");
-  Object.defineProperty(error, "allowed", { value: allowed });
+  Object.defineProperty(error, "allowed", {
+    value: Object.freeze([...allowed]),
+  });
   throw error;
+}
+
+function assertWorkerRouteMethod(
+  request: Request,
+  route: Extract<WorkerRouteMatch, { kind: "exact" }>,
+): void {
+  if (route.methods === "all") return;
+  if (!route.methods.includes(request.method as WorkerRouteMethod)) {
+    methodNotAllowed(route.methods);
+  }
 }
 
 function allowedHeader(error: ApiError): HeadersInit | undefined {
@@ -1510,45 +1506,6 @@ function handleRetiredAppleDomainAssociation(): never {
   throw new ApiError(404, "NOT_FOUND");
 }
 
-async function handleRecover(request: Request, env: Env): Promise<Response> {
-  if (request.method !== "POST") methodNotAllowed(["POST"]);
-  assertSameOrigin(request);
-  configuredEnrollmentMode(env);
-  if (identityRequired(env)) {
-    // Hosted identity is mandatory outside development: signing in again
-    // reattaches the same participant, replacing the recovery-code flow.
-    throw new ApiError(401, "IDENTITY_REQUIRED");
-  }
-  assertAdmissionBindings(env);
-  await assertAttemptAllowed(
-    env.RECOVERY_RATE_LIMIT,
-    env.CLIENT_ATTEMPT_RATE_LIMIT,
-    request,
-    env,
-    "recovery",
-  );
-  const body = await readBoundedJson(request);
-  if (typeof body.value !== "object"
-    || body.value === null
-    || Array.isArray(body.value)
-    || Object.keys(body.value).length !== 2
-    || !Object.hasOwn(body.value, "recoveryCode")
-    || !Object.hasOwn(body.value, "recoveryAttemptId")) {
-    throw new ApiError(400, "BODY_INVALID");
-  }
-  const recovered = await recoverAccess(
-    env.USAGE_MONITOR_DB,
-    Reflect.get(body.value, "recoveryCode"),
-    Reflect.get(body.value, "recoveryAttemptId"),
-  );
-  return jsonResponse({
-    participantId: recovered.participantId,
-    csrfToken: recovered.csrfToken,
-    recoveryCode: recovered.recoveryCode,
-    consentVersion: recovered.consentVersion,
-  }, 200, { "set-cookie": sessionCookie(recovered.session) });
-}
-
 async function personalSession(
   request: Request,
   env: Env,
@@ -1617,50 +1574,6 @@ async function handleSecurityReset(request: Request, env: Env): Promise<Response
     csrfToken: session.csrfToken,
     consentVersion: session.consentVersion,
   }, 200, { vary: "Cookie" });
-}
-
-async function handleUploadAuthorization(request: Request, env: Env): Promise<Response> {
-  if (request.method !== "POST") methodNotAllowed(["POST"]);
-  assertAdmissionBindings(env);
-  assertUploadAuthorizationBindings(env);
-  assertUploadIngressConfiguration(env);
-  await assertCollectionControl(
-    env.USAGE_MONITOR_DB,
-    "uploadRegistration",
-  );
-  const session = await personalSession(request, env);
-  assertCsrf(request, session);
-  await assertUploadAuthorizationAllowed(
-    env.UPLOAD_AUTHORIZATION_RATE_LIMIT,
-    env.UPLOAD_PRINCIPAL_RATE_LIMIT,
-    session.participantId,
-    env,
-  );
-  await probeUploadIngressBudget(env);
-  const body = await readBoundedJson(request);
-  if (typeof body.value !== "object"
-      || body.value === null
-      || Array.isArray(body.value)
-      || Object.keys(body.value).length !== 3
-      || typeof Reflect.get(body.value, "envelopeDigest") !== "string"
-      || !/^[0-9a-f]{64}$/u.test(Reflect.get(body.value, "envelopeDigest") as string)
-      || !Number.isSafeInteger(Reflect.get(body.value, "contentLengthBytes"))
-      || (Reflect.get(body.value, "contentLengthBytes") as number) <= 0
-      || (Reflect.get(body.value, "contentLengthBytes") as number) > MAX_REQUEST_BYTES
-      || Reflect.get(body.value, "contentType") !== "application/json") {
-    throw new ApiError(400, "BODY_INVALID");
-  }
-  const authorization = await createUploadAuthorizationMaterial(
-    session.participantId,
-    session.sessionId,
-    Reflect.get(body.value, "envelopeDigest") as string,
-    Reflect.get(body.value, "contentLengthBytes") as number,
-  );
-  await storeUploadAuthorization(env.USAGE_MONITOR_DB, authorization);
-  return jsonResponse({
-    uploadAuthorization: authorization.encoded,
-    expiresAt: authorization.expiresAt,
-  }, 201, { vary: "Cookie" });
 }
 
 async function handleDevicePairing(request: Request, env: Env): Promise<Response> {
@@ -2546,7 +2459,7 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
   let claimed: {
     authorizationId: string;
     participantId: string;
-    authorizationKind: "session" | "device";
+    authorizationKind: "device";
   } | null = null;
   try {
     const body = await readBoundedJson(request, bodyReadPolicy);
@@ -2556,17 +2469,11 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
     const scopeDigest = await sha256Hex(body.bytes);
     await heartbeat.assertActive();
     await assertCollectionControl(env.USAGE_MONITOR_DB, "processing");
-    claimed = authorizationHeader.startsWith("Upload um_device_upload_")
-      ? await claimDeviceUploadAuthorization(
-        env.USAGE_MONITOR_DB,
-        authorizationHeader,
-        { envelopeDigest: scopeDigest, bodyBytes, contentType },
-      )
-      : await claimUploadAuthorization(
-        env.USAGE_MONITOR_DB,
-        authorizationHeader,
-        { envelopeDigest: scopeDigest, bodyBytes, contentType },
-      );
+    claimed = await claimDeviceUploadAuthorization(
+      env.USAGE_MONITOR_DB,
+      authorizationHeader,
+      { envelopeDigest: scopeDigest, bodyBytes, contentType },
+    );
     await heartbeat.assertActive();
     if (!hasExactEnvelopeKeyOccurrences(body.raw)) {
       throw new ApiError(400, "ENVELOPE_INVALID");
@@ -2594,29 +2501,20 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
     if (typeof receipt.contributionId !== "string") {
       throw new ApiError(500, "INTERNAL_ERROR");
     }
-    if (claimed.authorizationKind === "device") {
-      await recordDeviceUploadReceipt(
-        env.USAGE_MONITOR_DB,
-        claimed.authorizationId,
-        receipt.contributionId,
-      );
-    } else {
-      await recordUploadReceipt(
-        env.USAGE_MONITOR_DB,
-        claimed.authorizationId,
-        receipt.contributionId,
-      );
-    }
+    await recordDeviceUploadReceipt(
+      env.USAGE_MONITOR_DB,
+      claimed.authorizationId,
+      receipt.contributionId,
+    );
     completed = true;
     return response;
   } finally {
     try {
       if (!completed && claimed !== null) {
-        if (claimed.authorizationKind === "device") {
-          await abandonDeviceUploadAuthorization(env.USAGE_MONITOR_DB, claimed.authorizationId);
-        } else {
-          await abandonUploadAuthorization(env.USAGE_MONITOR_DB, claimed.authorizationId);
-        }
+        await abandonDeviceUploadAuthorization(
+          env.USAGE_MONITOR_DB,
+          claimed.authorizationId,
+        );
       }
     } catch {
       // Preserve the original client-visible status and leave a redacted
@@ -2639,59 +2537,6 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
       }
     }
   }
-}
-
-async function handleMe(request: Request, env: Env): Promise<Response> {
-  if (request.method !== "GET") methodNotAllowed(["GET"]);
-  const session = await personalSession(request, env);
-  const [
-    contributions,
-    telemetryContributions,
-    telemetryTotal,
-    contributionAdmission,
-  ] = await Promise.all([
-    listContributions(env.USAGE_MONITOR_DB, session.participantId),
-    listRecentTelemetryContributions(
-      env.USAGE_MONITOR_DB,
-      session.participantId,
-      MAX_PARTICIPANT_PROFILE_HISTORY_ITEMS
-        - MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT,
-    ),
-    telemetryContributionCount(env.USAGE_MONITOR_DB, session.participantId),
-    telemetryContributionAdmission(
-      env.USAGE_MONITOR_DB,
-      session.participantId,
-    ),
-  ]);
-  const history = ([
-    ...contributions.map(contributionHistoryMetadata),
-    ...telemetryContributions.map(telemetryContributionHistoryMetadata),
-  ] as Array<{ contributionId: string; createdAt: string }>).sort(
-    (left, right) => left.createdAt.localeCompare(right.createdAt)
-      || left.contributionId.localeCompare(right.contributionId),
-  );
-  return jsonResponse({
-    schemaVersion: "participant-profile-v0.2",
-    participantId: session.participantId,
-    createdAt: session.participantCreatedAt,
-    consentVersion: session.consentVersion,
-    syntheticOnly: session.consentVersion === "synthetic-preview-v0.1",
-    contributionCount: history.length,
-    totalContributionCount: contributions.length + telemetryTotal,
-    latestContribution: history[history.length - 1] ?? null,
-    contributions: history,
-    contributionAdmission,
-    historyPolicy: {
-      maximumItems: MAX_PARTICIPANT_PROFILE_HISTORY_ITEMS,
-      returnedItems: history.length,
-      totalItems: contributions.length + telemetryTotal,
-      truncated: contributions.length + telemetryTotal > history.length,
-      order: "oldest_to_newest_within_recent_window",
-      quarantineRetentionMilliseconds: QUARANTINE_RETENTION_MILLISECONDS,
-      canonicalMetadataRetainedAfterQuarantine: true,
-      clientSoftwareVersion: "unavailable_in_transport",
-    },
-  }, 200, { vary: "Cookie" });
 }
 
 async function handleExport(request: Request, env: Env): Promise<Response> {
@@ -2888,23 +2733,6 @@ async function handleDelete(request: Request, env: Env): Promise<Response> {
     contributionsDeleted: contributions.length + telemetryTotal
       + telemetryV1Total,
   }, 200, { "set-cookie": clearedSessionCookie(), vary: "Cookie" });
-}
-
-async function handleStats(request: Request, env: Env): Promise<Response> {
-  if (request.method !== "GET") methodNotAllowed(["GET"]);
-  const session = await personalSession(request, env);
-  const [stats, communityComparison] = await Promise.all([
-    personalStats(env.USAGE_MONITOR_DB, session.participantId),
-    readParticipantCommunityComparison(
-      env.USAGE_MONITOR_DB,
-      session.participantId,
-    ),
-  ]);
-  return jsonResponse(
-    { ...stats, communityComparison },
-    200,
-    { vary: "Cookie" },
-  );
 }
 
 const ADMIN_ACTIONS = new Set<AdminAction>([
@@ -3222,31 +3050,6 @@ async function handleAdminAction(
   );
 }
 
-async function handleCommunityStats(request: Request, env: Env): Promise<Response> {
-  if (request.method !== "GET") methodNotAllowed(["GET"]);
-  await assertCollectionControl(env.USAGE_MONITOR_DB, "publication");
-  await assertPublicAggregateReadAllowed(env.PUBLIC_READ_RATE_LIMIT, request, env);
-  const snapshot = await readLatestCommunityWeeklySnapshot(env.USAGE_MONITOR_DB);
-  if (!snapshot.cacheable) {
-    return new Response(snapshot.payloadJson, {
-      headers: { ...JSON_HEADERS, "cache-control": "no-store" },
-    });
-  }
-  const etag = `"community-snapshot-${snapshot.snapshotId}-r${snapshot.revision}"`;
-  const headers = new Headers({
-    ...JSON_HEADERS,
-    // A released payload is sealed to this revision. Keep browsers
-    // revalidating the mutable `latest` route, while allowing a shared edge
-    // cache to retain this immutable revision briefly.
-    "cache-control": "public, max-age=0, must-revalidate, s-maxage=60",
-    etag,
-  });
-  if (request.headers.get("if-none-match") === etag) {
-    return new Response(null, { status: 304, headers });
-  }
-  return new Response(snapshot.payloadJson, { headers });
-}
-
 const COMMUNITY_DAILY_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
 const COMMUNITY_DAILY_MAX_RANGE_DAYS = 366;
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -3360,65 +3163,6 @@ async function handleCommunityDaily(
     // shared lifetime keeps the read cheap without pinning a stale revision.
     { "cache-control": "public, max-age=300" },
   );
-}
-
-const CONTRIBUTION_ID_PATTERN =
-  /^contribution:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
-
-async function handleContributionResource(
-  request: Request,
-  env: Env,
-  operation: "read" | "delete",
-): Promise<Response> {
-  if (request.method !== "POST") methodNotAllowed(["POST"]);
-  const session = await personalSession(request, env);
-  assertCsrf(request, session);
-  const body = await readBoundedJson(request);
-  if (typeof body.value !== "object"
-      || body.value === null
-      || Array.isArray(body.value)
-      || Object.keys(body.value).length !== 1
-      || typeof Reflect.get(body.value, "contributionId") !== "string"
-      || !CONTRIBUTION_ID_PATTERN.test(
-        Reflect.get(body.value, "contributionId") as string,
-      )) {
-    throw new ApiError(400, "BODY_INVALID");
-  }
-  const contributionId = Reflect.get(body.value, "contributionId") as string;
-  const row = await telemetryContributionById(
-    env.USAGE_MONITOR_DB,
-    session.participantId,
-    contributionId,
-  );
-  if (!row) throw new ApiError(404, "NOT_FOUND");
-  if (operation === "read") {
-    const records = await telemetryRecordsForContribution(
-      env.USAGE_MONITOR_DB,
-      session.participantId,
-      contributionId,
-    );
-    return jsonResponse({
-      ...telemetryContributionMetadata(row),
-      records: records.flatMap((record) => {
-        const value = parseStoredRecordJson(record.record_json);
-        return value ? [{ kind: record.record_kind, value }] : [];
-      }),
-    }, 200, { vary: "Cookie" });
-  }
-  if (!await markTelemetryContributionDeleting(
-    env.USAGE_MONITOR_DB,
-    session.participantId,
-    contributionId,
-  )) {
-    throw new ApiError(409, "CONTRIBUTION_DELETE_CONFLICT");
-  }
-  await env.QUARANTINE.delete(row.r2_key);
-  await deleteTelemetryContribution(
-    env.USAGE_MONITOR_DB,
-    session.participantId,
-    contributionId,
-  );
-  return jsonResponse({ deleted: true, contributionId }, 200, { vary: "Cookie" });
 }
 
 type LifecycleReadinessState =
@@ -3559,8 +3303,6 @@ async function routeApi(
       return handleIdentityAppleCallback(request, env);
     case "identity_apple_result":
       return handleIdentityAppleResult(request, env);
-    case "recover":
-      return handleRecover(request, env);
     case "session":
       return handleSession(request, env);
     case "logout":
@@ -3575,8 +3317,6 @@ async function routeApi(
       return handleAdminAction(request, env);
     case "security_reset":
       return handleSecurityReset(request, env);
-    case "upload_authorization":
-      return handleUploadAuthorization(request, env);
     case "device_pairing":
       return handleDevicePairing(request, env);
     case "device_pairing_claim":
@@ -3599,21 +3339,12 @@ async function routeApi(
       return handleEnvelopeKey(request, env);
     case "contributions":
       return handleContribution(request, env);
-    case "contribution_read":
-      return handleContributionResource(request, env, "read");
-    case "contribution_delete":
-      return handleContributionResource(request, env, "delete");
     case "participant_export":
       return handleExport(request, env);
-    case "participant_stats":
-      return handleStats(request, env);
-    case "community_stats":
-      return handleCommunityStats(request, env);
     case "community_daily":
       return handleCommunityDaily(request, env);
     case "participant":
-      if (request.method === "DELETE") return handleDelete(request, env);
-      return handleMe(request, env);
+      return handleDelete(request, env);
   }
   return unreachableApiRoute(routeId);
 }
@@ -3651,9 +3382,11 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         const adminUi = adminUiResponse(request.method, url.pathname);
         if (adminUi !== null) return adminUi;
         if (route.kind === "exact" && route.id === "admin_overview") {
+          assertWorkerRouteMethod(request, route);
           return noStore(await handleAdminOverview(request, env, { identityKey }));
         }
         if (route.kind === "exact" && route.id === "admin_metrics_history") {
+          assertWorkerRouteMethod(request, route);
           return noStore(
             await handleAdminMetricsHistory(request, env, { identityKey }),
           );
@@ -3669,6 +3402,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           );
         }
         if (route.kind === "exact" && route.id === "admin_action") {
+          assertWorkerRouteMethod(request, route);
           return noStore(await handleAdminAction(request, env, { identityKey }));
         }
       } else if (isAdminSurfacePath(url.pathname)
@@ -3679,6 +3413,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
             || route.id === "admin_action"))) {
         throw new ApiError(404, "NOT_FOUND");
       }
+    }
+    if (route.kind === "exact") {
+      // The reviewed registry is the common method envelope for every exact
+      // route. Handler-local checks remain defense in depth and may narrow a
+      // branch, but no undocumented method can reach one of them.
+      assertWorkerRouteMethod(request, route);
     }
     if (route.id === "ready") {
       return noStore(await handleReady(request, env));
@@ -3769,8 +3509,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           encryptedUpload: collectionControls.processing,
           serverValidation: true,
           idempotentDeduplication: true,
-          participantStats: true,
-          delayedAggregateStats: collectionControls.publication,
+          communityDaily: collectionControls.publication,
           participantExport: true,
           participantDeletion: true,
           boundedQuarantineRetention: true,
@@ -3784,7 +3523,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (route.id === "unknown_api") throw new ApiError(404, "NOT_FOUND");
     if (route.id !== "asset") {
       const response = await routeApi(request, env, route.id);
-      return route.id === "community_stats" || route.id === "community_daily"
+      return route.id === "community_daily"
         ? response
         : noStore(response);
     }

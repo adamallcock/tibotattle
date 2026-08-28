@@ -379,29 +379,37 @@ test("malformed backend and generated buffers are erased before failure", async 
   }
 });
 
-test("a locked Keychain backend remains distinct without exposing its native error", async () => {
+test("locked and migration-required Keychain states remain distinct and content-free", async () => {
   const root = await mkdtemp(join(tmpdir(), "app-usagemonitor-account-keychain-locked-"));
   const canary = "DO-NOT-LEAK-native-keychain-lock";
-  const backend = {
-    async read() {
-      const error = new Error(canary);
-      error.code = "export_identity_keychain_locked";
-      throw error;
-    },
-    async createIfMissing() { return "created"; },
-  };
   try {
-    const load = createAccountObservationSecretLoader({
-      backend,
-      capability: ACCOUNT_CAPABILITY,
-      operationLockFile: join(root, "operation.lock"),
-    });
-    await assert.rejects(load(), (error) => {
-      assert.equal(error.code, "account_observation_credential_locked");
-      assert.equal(error.message, "Account observation credential is unavailable");
-      assert.equal(`${error.stack}\n${JSON.stringify(error)}`.includes(canary), false);
-      return true;
-    });
+    for (const [upstreamCode, expectedCode] of [
+      ["export_identity_keychain_locked", "account_observation_credential_locked"],
+      [
+        "export_identity_keychain_migration_required",
+        "account_observation_credential_migration_required",
+      ],
+    ]) {
+      const backend = {
+        async read() {
+          const error = new Error(canary);
+          error.code = upstreamCode;
+          throw error;
+        },
+        async createIfMissing() { return "created"; },
+      };
+      const load = createAccountObservationSecretLoader({
+        backend,
+        capability: ACCOUNT_CAPABILITY,
+        operationLockFile: join(root, `${expectedCode}.lock`),
+      });
+      await assert.rejects(load(), (error) => {
+        assert.equal(error.code, expectedCode);
+        assert.equal(error.message, "Account observation credential is unavailable");
+        assert.equal(`${error.stack}\n${JSON.stringify(error)}`.includes(canary), false);
+        return true;
+      });
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -549,13 +557,17 @@ test("doctor, register, capture, and collector CLI paths share the injected prod
   }
 });
 
-test("doctor reports locked and unavailable account credentials as distinct content-free states", async () => {
+test("doctor reports credential recovery states as distinct content-free codes", async () => {
   const lines = [];
   const originalLog = console.log;
   console.log = (...values) => { lines.push(values.join(" ")); };
   try {
     for (const [code, expected] of [
       ["account_observation_credential_locked", "credential_locked"],
+      [
+        "account_observation_credential_migration_required",
+        "credential_migration_required",
+      ],
       ["account_observation_credential_unavailable", "credential_unavailable"],
     ]) {
       lines.length = 0;

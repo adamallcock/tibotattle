@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
 
-import { scanCodexLogEvents } from "../src/codex-log-scan.js";
+import { localCodexLogScanner } from "../src/local-node-runtime.js";
 import {
   lineageComponents,
   rebuildLocalUnifiedIndex,
@@ -27,6 +27,8 @@ import {
 import { withStableRolloutSource } from "../src/rollout-source-snapshot.js";
 import { createCodexLogSources } from "../src/providers/codex/log-sources.js";
 import { createLocalCodexLogPorts } from "../src/platform/local-codex-log-ports.js";
+
+const { scanCodexLogEvents } = localCodexLogScanner;
 
 const CONTRACT = "usage-event-v0.2";
 const THREAD = "11111111-1111-4111-8111-111111111111";

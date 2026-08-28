@@ -13,10 +13,12 @@ import {
   verifyClaudeTranscriptExportSource,
 } from "../src/claude-transcript-export-source.js";
 import { createExportResourceGuard } from "../src/export-resource-policy.js";
-import { normalizeClaudeTranscriptUsageCandidate } from "../src/export-safe-records.js";
+import { localSafeRecords } from "../src/local-node-runtime.js";
 import {
   parseClaudeTranscriptRecord,
 } from "../src/application/export-sources/claude-transcript-record.js";
+
+const { normalizeClaudeTranscriptUsageCandidate } = localSafeRecords;
 
 const SECRET = Buffer.alloc(32, 71);
 const START_AT = "2026-07-24T12:00:00.000Z";

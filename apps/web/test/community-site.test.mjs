@@ -583,7 +583,7 @@ test("platform tabs keep the live macOS release separate from honest unavailable
     ["Windows", windowsPanel],
     ["Linux", linuxPanel],
   ]) {
-    assert.match(panel, new RegExp(`${platform} is not yet available`, "u"));
+    assert.match(panel, new RegExp(`TiboTattle for ${platform} is not available yet\\.`, "u"));
     assert.match(panel, /Not yet available/u);
     assert.doesNotMatch(panel, /id="installer-|id="homebrew-|brew install/iu);
     assert.doesNotMatch(panel, /Download for|\.dmg\b|\.exe\b|\.msi\b|AppImage/iu);

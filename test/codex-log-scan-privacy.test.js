@@ -3,10 +3,12 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import {
+import { localCodexLogScanner } from "../src/local-node-runtime.js";
+
+const {
   codexLogSourceFingerprint,
   scanCodexLogEvents,
-} from "../src/codex-log-scan.js";
+} = localCodexLogScanner;
 
 const START_AT = "2000-01-01T00:00:00.000Z";
 const END_AT = "2100-01-01T00:00:00.000Z";

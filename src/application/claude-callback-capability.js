@@ -9,6 +9,7 @@ const ERROR_CODES = new Set([
   "invalid_configuration",
   "credential_locked",
   "credential_denied",
+  "credential_migration_required",
   "credential_unavailable",
   "credential_missing",
   "credential_conflict",
@@ -56,6 +57,9 @@ function translate(error) {
   }
   if (code === "export_identity_keychain_locked") fail("credential_locked");
   if (code === "export_identity_keychain_denied") fail("credential_denied");
+  if (code === "export_identity_keychain_migration_required") {
+    fail("credential_migration_required");
+  }
   fail("credential_unavailable");
 }
 

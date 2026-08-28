@@ -112,7 +112,7 @@ no remote mutation or deployment has occurred.
 ### Track E: integrated verification
 
 - Focused tests per track.
-- Full UI, local, Worker, Cloud Run, and macOS suites.
+- Full UI, local, Worker, and macOS suites.
 - Browser verification of clean/no-Codex, real-local, contribution, recovery,
   deletion, and return flows.
 - Resource, performance, crash, restart, and privacy-canary checks.

@@ -4,8 +4,8 @@ import { dirname, relative, resolve, sep } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import * as legacyScanner from "../src/codex-log-scan.js";
 import * as codexLocalUsageAnalysis from "../src/codex-local-usage-analysis.js";
+import { localCodexLogScanner } from "../src/local-node-runtime.js";
 import * as providerNormalization from "../src/providers/codex/log-normalization.js";
 import * as providerLogs from "../src/providers/codex/logs.js";
 import * as providerSurface from "../src/providers/codex/surface-classification.js";
@@ -26,10 +26,12 @@ const PROVIDER_PUBLIC_EXPORTS = [
   "CodexLogSourceChangedError",
   "canonicalComponentAvailability",
   "canonicalComponents",
+  "canonicalRateLimitSnapshot",
   "canonicalRateLimitWindows",
   "classifySessionSurface",
   "classifyToolCall",
   "codexRolloutDiscoveryReceipt",
+  "codexSessionMetaIdentity",
   "createCodexLogScanner",
   "createLeadingRateLimitGate",
   "createSnapshotLineage",
@@ -47,31 +49,16 @@ const PROVIDER_PUBLIC_EXPORTS = [
   "validateTierDeclaration",
 ].sort();
 
-const LEGACY_SCANNER_EXPORTS = [
-  "CodexLogSourceChangedError",
+const RUNTIME_SCANNER_OPERATIONS = [
   "appendedRolloutSourcesAreAfterEnd",
-  "canonicalComponentAvailability",
-  "canonicalComponents",
-  "canonicalRateLimitWindows",
-  "classifyToolCall",
   "codexLogSourceFingerprint",
   "codexRolloutDiscoveryReceipt",
-  "createLeadingRateLimitGate",
-  "createSnapshotLineage",
-  "cumulativeSnapshotKey",
-  "deltaComponentPresence",
   "discoverCodexRolloutInfos",
   "discoverCodexRollouts",
-  "extractToolObservations",
   "hasForkReplayPrefix",
-  "normalizeTokenUsage",
   "readRolloutLineage",
-  "sameUsage",
-  "scanAndPriceCodexLogs",
   "scanCodexLogEvents",
-  "subtractUsage",
   "summarizeCodexRolloutSources",
-  "tokenComponentPresence",
 ].sort();
 
 const BOUND_SCANNER_OPERATIONS = [
@@ -89,8 +76,10 @@ const BOUND_SCANNER_OPERATIONS = [
 const LEGACY_PURE_PROVIDER_BINDINGS = [
   "canonicalComponentAvailability",
   "canonicalComponents",
+  "canonicalRateLimitSnapshot",
   "canonicalRateLimitWindows",
   "classifyToolCall",
+  "codexSessionMetaIdentity",
   "createLeadingRateLimitGate",
   "createSnapshotLineage",
   "cumulativeSnapshotKey",
@@ -172,27 +161,13 @@ test("only the application scanner composition owner references the provider fac
   assert.deepEqual(references, ["src/application/local-codex-log-scanner.js"]);
 });
 
-test("the root Codex scanner preserves its legacy API plus reviewed rollout identities", () => {
+test("the local Node composition exposes only bound scanner operations", () => {
   assert.deepEqual(
-    Object.keys(legacyScanner).sort(),
-    LEGACY_SCANNER_EXPORTS,
+    Object.keys(localCodexLogScanner).sort(),
+    RUNTIME_SCANNER_OPERATIONS,
   );
-  assert.equal(
-    legacyScanner.scanAndPriceCodexLogs,
-    codexLocalUsageAnalysis.scanAndPriceCodexLogs,
-    "the exact legacy pricing binding remains application-owned",
-  );
-  for (const binding of LEGACY_PURE_PROVIDER_BINDINGS) {
-    assert.equal(
-      legacyScanner[binding],
-      providerLogs[binding],
-      `${binding} must be the provider binding, not a duplicate wrapper`,
-    );
-  }
-  assert.equal(
-    legacyScanner.CodexLogSourceChangedError,
-    providerLogs.CodexLogSourceChangedError,
-  );
+  assert.equal(Object.hasOwn(localCodexLogScanner, "scanAndPriceCodexLogs"), false);
+  assert.equal(typeof codexLocalUsageAnalysis.scanAndPriceCodexLogs, "function");
 });
 
 test("the Codex log facade re-exports each pure provider binding by identity", () => {

@@ -1,4 +1,4 @@
-import { exportSourcePipelineCompatibility as pipeline } from "./export-source-pipeline-compatibility-internal.js";
+import { localExportSourcePipeline as pipeline } from "./local-node-runtime.js";
 
 export const {
   CLAUDE_TRANSCRIPT_SOURCE_CURSOR_VERSION,

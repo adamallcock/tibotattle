@@ -304,23 +304,54 @@ export const LEGACY_STORAGE_DIRECT_IMPORTERS = Object.freeze([
 ]);
 
 /**
- * Removed compatibility forwarders. This is intentionally an exact, permanent
- * absence ledger: unlike migration debt, neither the files nor imports into
- * them may be reintroduced or baselined.
+ * Removed production modules and compatibility forwarders. This is an exact,
+ * permanent absence ledger: unlike migration debt, neither the files nor
+ * imports into them may be reintroduced or baselined.
  */
 export const RETIRED_PRODUCTION_SOURCE_PATHS = Object.freeze([
   "shared/quota-calibration.js",
   "shared/quota-rolling.js",
   "shared/quota-tracks.js",
+  "src/application/local-automatic-contribution.js",
+  "src/automatic-contribution.js",
+  "src/claude-desktop-quota-refresh.js",
+  "src/claude-desktop-quota-state.js",
+  "src/codex-log-scan.js",
+  "src/contribution/recurrence-policy.js",
+  "src/contribution-sync-queue.js",
   "src/cost-ledger.js",
+  "src/export-checkpoint-state.js",
+  "src/export-deletion-compatibility-internal.js",
+  "src/export-deletion-schema.js",
   "src/export-registries.js",
+  "src/export-safe-records.js",
+  "src/export-set-materializer.js",
+  "src/export-source-pipeline-compatibility-internal.js",
   "src/export-versions.js",
+  "src/export-workspace-compatibility-internal.js",
+  "src/export-workspace-discard-compatibility-internal.js",
+  "src/export-workspace-lock-compatibility-internal.js",
+  "src/export-workspace-lock.js",
+  "src/export-workspace.js",
   "src/local-api-pricing.js",
+  "src/metadata-exporter.js",
   "src/price-registry.js",
   "src/tier-semantics.js",
 ]);
 const RETIRED_PRODUCTION_SOURCE_PATH_SET = new Set(
   RETIRED_PRODUCTION_SOURCE_PATHS,
+);
+
+/**
+ * Entire retired product trees. Any descendant is forbidden, including a new
+ * filename that never existed in the removed implementation. This keeps a
+ * removed deployment architecture from returning under a fresh entrypoint.
+ */
+export const RETIRED_PRODUCTION_TREE_PATHS = Object.freeze([
+  "apps/cloud-run",
+]);
+const RETIRED_PRODUCTION_TREE_PATH_SET = new Set(
+  RETIRED_PRODUCTION_TREE_PATHS,
 );
 
 export const CURRENT_ARCHITECTURE_BOUNDARY_BASELINE = Object.freeze(
@@ -443,10 +474,8 @@ function sourceOwnerDependencyDirectionViolation(importer, target) {
     if (importerLocation.appName === "web") {
       return destinationLocation.kind === "src";
     }
-    if (
-      new Set(["cloud-run", "macos"]).has(importerLocation.appName)
-      && OWNED_SOURCE_OWNER_KINDS.has(destinationOwner.kind)
-    ) {
+    if (importerLocation.appName === "macos"
+        && OWNED_SOURCE_OWNER_KINDS.has(destinationOwner.kind)) {
       return true;
     }
     if (
@@ -890,8 +919,12 @@ function sourceTargetCandidates(target) {
 }
 
 function retiredProductionSourceTarget(target) {
-  return sourceTargetCandidates(target).find((candidate) =>
-    RETIRED_PRODUCTION_SOURCE_PATH_SET.has(candidate)) ?? null;
+  const exactTarget = sourceTargetCandidates(target).find((candidate) =>
+    RETIRED_PRODUCTION_SOURCE_PATH_SET.has(candidate));
+  if (exactTarget) return exactTarget;
+  return [...RETIRED_PRODUCTION_TREE_PATH_SET].find((retiredTree) => (
+    target === retiredTree || target.startsWith(`${retiredTree}/`)
+  )) ?? null;
 }
 
 async function pathContainsSymbolicLink(rootDirectory, relativePath) {
@@ -1149,7 +1182,10 @@ export async function checkArchitectureBoundaries({
   const productionFiles = new Set(files);
   let importCount = 0;
 
-  for (const retiredPath of RETIRED_PRODUCTION_SOURCE_PATHS) {
+  for (const retiredPath of [
+    ...RETIRED_PRODUCTION_SOURCE_PATHS,
+    ...RETIRED_PRODUCTION_TREE_PATHS,
+  ]) {
     try {
       await lstat(join(absoluteRoot, retiredPath));
       detectedViolations.push({

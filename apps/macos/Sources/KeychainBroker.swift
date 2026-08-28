@@ -2,85 +2,172 @@ import Foundation
 import Security
 
 /// Creation can fail only on descriptor exhaustion; the launcher treats it
-/// as "spawn without a broker", where the shipped first-pairing guidance
-/// remains the net, rather than refusing to start the product.
+/// as "spawn without a broker" and the companion reports a bounded native
+/// credential-unavailable state rather than refusing to start the product.
 struct ContributionDeviceKeychainBrokerUnavailable: Error {}
 
-/// The app-side Keychain broker for the spawned companion.
-///
-/// The first-pairing macOS dialog exists because the companion's Node
-/// runtime read back a credential the `security` CLI minted, so macOS
-/// treated the reader as a stranger to the item (design note
-/// docs/design/2026-08-19-first-pairing-keychain-prompt.md, trigger chain).
-/// This broker is the structural fix's app half: fresh contribution-device
-/// credentials are minted, read, replaced, and deleted by this signed app
-/// via SecItem — an app-created login-keychain item never prompts its own
-/// creator — and the companion obtains the secret over a private socketpair
-/// it received as standard input at spawn, holding it in memory only.
-///
-/// The channel is kernel-held: only the spawned child owns the peer end,
-/// nothing about the broker crosses argv, and the environment carries only
-/// the descriptor number. The wire protocol carries no service or account, so
-/// the companion cannot name any other Keychain item through it. One
-/// newline-terminated JSON frame per request or response, answered strictly
-/// in order; any deviation — an oversized or unparsable frame, an
-/// uncorrelatable identifier — fails the channel closed, and the companion
-/// surfaces the same coded, recoverable pairing errors it uses today.
-///
-/// The trust boundary is the kernel-held channel itself. The item's ACL names
-/// this signed app and nothing else (see `designatedReaderAccess()`), so the
-/// secret is decryptable only by this app; every other same-user process — the
-/// companion included — can obtain it only by asking over a socketpair end it
-/// must already hold. Earlier revisions also trusted `runtime/bin/node`, which
-/// made the claim false: node is a world-executable general-purpose
-/// interpreter inside the bundle, so any same-user process could execute it,
-/// satisfy the designated requirement, and read the secret silently. That
-/// entry existed for the one-shot Identity & Device Reset helper, which now
-/// clears this generation by its fixed attributes instead — an
-/// attribute-addressed delete never decrypts the item, so it consults no ACL
-/// (verified live on a fresh account, 2026-08-20).
-///
-/// What this is still NOT: proof against an attacker who can modify the
-/// installed bundle or debug this process. A designated-requirement ACL binds
-/// to a code signature, not to a channel the OS enforces per-process.
-final class ContributionDeviceKeychainBroker {
-    /// The app-managed storage generation. The legacy
-    /// app-usagemonitor.contribution-device.v1 item (minted companion-side
-    /// through the security CLI) is deliberately unreachable from this
-    /// broker: decrypting it from the app would raise exactly the
-    /// partition-list prompt the broker exists to eliminate. Migration
-    /// happens companion-side at the next credential rotation, never by the
-    /// app touching the legacy item.
-    static let service = "app-usagemonitor.contribution-device.app.v1"
+/// The only Keychain capabilities the companion can address. Service and
+/// account strings never cross the wire; this signed app owns the mapping.
+private enum BrokerKeychainCapability: String, CaseIterable {
+    case exportIdentity = "export_identity"
+    case accountObservation = "account_observation"
+    case claudeSessionPseudonym = "claude_session_pseudonym"
+    case contributionDevice = "contribution_device"
+
     static let account = "installation"
+
+    var modernService: String {
+        switch self {
+        case .exportIdentity:
+            return "app-usagemonitor.export-identity.app.v1"
+        case .accountObservation:
+            return "app-usagemonitor.account-observation.app.v1"
+        case .claudeSessionPseudonym:
+            return "app-usagemonitor.claude-session-pseudonym.app.v1"
+        case .contributionDevice:
+            return "app-usagemonitor.contribution-device.app.v1"
+        }
+    }
+
+    var legacyService: String {
+        switch self {
+        case .exportIdentity:
+            return "app-usagemonitor.export-identity.v1"
+        case .accountObservation:
+            return "app-usagemonitor.account-observation.v1"
+        case .claudeSessionPseudonym:
+            return "app-usagemonitor.claude-session-pseudonym.v1"
+        case .contributionDevice:
+            return "app-usagemonitor.contribution-device.v1"
+        }
+    }
+}
+
+/// App-side broker for the closed set of Keychain capabilities the packaged
+/// companion is permitted to address. The protocol maps four capabilities;
+/// the current packaged-companion runtime graph consumes export identity,
+/// account observation, and contribution device. Claude callback uses the
+/// same fixed mapping from the standalone CLI/local-review composition.
+///
+/// The channel is a kernel-held socketpair: only the spawned companion owns
+/// the peer descriptor, no secret enters argv or the environment, and each
+/// request names one closed logical capability rather than arbitrary Keychain
+/// attributes. All reads, Keychain operations, writes, and teardown are
+/// serialized on one queue.
+///
+/// New items are stored under `.app.v1` services with an ACL that trusts this
+/// signed app and nothing else. On first use of an older keytar-backed item,
+/// the broker reads the modern generation first. Only when it is absent and a
+/// fixed legacy item is present does the app permit one interactive legacy
+/// read for that capability in this process. It writes the exact secret to the
+/// modern item, reads it back, and only then deletes the legacy item. A denied
+/// migration leaves the legacy item untouched and returns
+/// `migration_required`; no value, service, account, or native error text is
+/// logged or returned. That capability is not prompted again in the same app
+/// process. Quitting and reopening the signed app creates the only authorized
+/// retry boundary; the wire deliberately exposes no prompt-reset operation.
+///
+/// Protocol v2 requires a fixed capability. Protocol v1 remains accepted only
+/// for the historical contribution-device-only client and maps to that one
+/// capability; it cannot widen authority.
+final class ContributionDeviceKeychainBroker {
     static let environmentVariable = "USAGE_MONITOR_KEYCHAIN_BROKER_FD"
-    private static let protocolVersion = 1
-    // A legitimate frame is under 128 bytes (the credential is 43 base64url
-    // characters); the cap exists to fail the channel closed on anything
-    // that is not this protocol.
+    private static let protocolVersion = 2
+    private static let legacyProtocolVersion = 1
     private static let maximumFrameBytes = 4_096
-    // Stored secrets are exactly keytar's stored string form: 43 base64url
-    // characters (32 bytes). Anything else is refused before Keychain I/O.
     private static let storedSecretPattern = "^[A-Za-z0-9_-]{43}$"
+    private static let nativeSmokeArguments = Set([
+        "--app-link-smoke-test",
+        "--central-smoke-test",
+        "--codex-home-settings-smoke-test",
+        "--diagnostics-smoke-test",
+        "--first-run-contract-smoke-test",
+        "--jitless-smoke-test",
+        "--keychain-broker-contract-smoke-test",
+        "--keychain-reset-contract-smoke-test",
+        "--login-item-contract-smoke-test",
+        "--menu-bar-contract-smoke-test",
+        "--native-dashboard-chrome-smoke-test",
+        "--native-dashboard-layout-smoke-test",
+        "--native-dashboard-sidebar-recovery-smoke-test",
+        "--native-refresh-settings-contract-smoke-test",
+        "--native-settings-layout-smoke-test",
+        "--quota-notification-contract-smoke-test",
+        "--smoke-test",
+        "--updater-contract-smoke-test",
+        "--updater-feed-contract-smoke-test",
+        "--watchdog-smoke-test",
+    ])
+
+    /// One app-process owner for interactive legacy reads. A companion retry
+    /// creates a fresh broker instance while this signed app is still alive,
+    /// so instance-local state would permit another prompt without the
+    /// explicit quit-and-reopen boundary. The lock also closes the brief
+    /// overlap in which an old companion and its replacement both exist.
+    private final class MigrationPromptState {
+        private let lock = NSLock()
+        private var attempted = Set<BrokerKeychainCapability>()
+
+        func claimInteractiveRead(
+            _ capability: BrokerKeychainCapability
+        ) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return attempted.insert(capability).inserted
+        }
+    }
+
+    private static let processMigrationPromptState = MigrationPromptState()
 
     private let queue = DispatchQueue(
-        label: "usage-monitor.contribution-device-keychain-broker"
+        label: "usage-monitor.keychain-broker"
     )
     private let parentDescriptor: Int32
     private var readSource: DispatchSourceRead?
     private var childHandle: FileHandle?
     private var pendingInput = Data()
     private var closed = false
+    private let migrationPromptState: MigrationPromptState
+    /// Process-memory implementation used only by terminal native contract
+    /// probes. It models both generations and records the exact operation
+    /// order, so the compiled broker can exercise migration and rollback
+    /// without touching the developer's login Keychain. It is injected by the
+    /// dedicated contract probe; other native smoke modes also receive an
+    /// empty instance because an isolated HOME does not isolate Keychain.
+    private final class EphemeralSmokeStorage {
+        var modern = [BrokerKeychainCapability: String]()
+        var legacy = [BrokerKeychainCapability: String]()
+        var deniedLegacyReads = Set<BrokerKeychainCapability>()
+        var failedMigrationReadbacks = Set<BrokerKeychainCapability>()
+        var migratedWrites = Set<BrokerKeychainCapability>()
+        var trace = [String]()
+    }
 
-    init() throws {
+    private let ephemeralSmokeStorage: EphemeralSmokeStorage?
+
+    convenience init() throws {
+        try self.init(smokeStorage: nil, migrationPromptState: nil)
+    }
+
+    private init(
+        smokeStorage: EphemeralSmokeStorage?,
+        migrationPromptState injectedMigrationPromptState:
+            MigrationPromptState? = nil
+    ) throws {
+        let isNativeSmoke = !Self.nativeSmokeArguments.isDisjoint(
+            with: CommandLine.arguments.dropFirst()
+        )
+        let selectedSmokeStorage = smokeStorage
+            ?? (isNativeSmoke ? EphemeralSmokeStorage() : nil)
+        ephemeralSmokeStorage = selectedSmokeStorage
+        migrationPromptState = injectedMigrationPromptState
+            ?? (selectedSmokeStorage == nil
+                ? Self.processMigrationPromptState
+                : MigrationPromptState())
         var endpoints: [Int32] = [-1, -1]
         guard socketpair(AF_UNIX, SOCK_STREAM, 0, &endpoints) == 0 else {
             throw ContributionDeviceKeychainBrokerUnavailable()
         }
-        // Neither raw descriptor may leak into any other spawned child: the
-        // companion receives its endpoint only as the dup2'd standard input
-        // (dup2 clears the close-on-exec flag on the new descriptor), and a
-        // dead peer must surface as a write error, never a fatal SIGPIPE.
         for descriptor in endpoints {
             _ = fcntl(descriptor, F_SETFD, FD_CLOEXEC)
             var noSignal: Int32 = 1
@@ -98,11 +185,6 @@ final class ContributionDeviceKeychainBroker {
             fileDescriptor: endpoints[1],
             closeOnDealloc: true
         )
-        // A dispatch read source serialized on the broker queue: every read,
-        // Keychain operation, response write, and the teardown share one
-        // queue, and the cancellation handler is the only closer of the
-        // parent descriptor — after cancellation no event handler can still
-        // be in flight, so a read can never race the close.
         let descriptor = parentDescriptor
         let source = DispatchSource.makeReadSource(
             fileDescriptor: descriptor,
@@ -118,14 +200,10 @@ final class ContributionDeviceKeychainBroker {
         source.resume()
     }
 
-    /// The endpoint the spawn hands to the companion as standard input.
     var childEndpoint: FileHandle? {
         queue.sync { childHandle }
     }
 
-    /// The parent must drop its copy of the child's endpoint right after a
-    /// successful spawn so the channel reaches end-of-file when the
-    /// companion exits.
     func closeChildEndpoint() {
         queue.async { [weak self] in
             guard let self, let handle = self.childHandle else { return }
@@ -144,9 +222,14 @@ final class ContributionDeviceKeychainBroker {
         guard !closed else { return }
         closed = true
         pendingInput.removeAll()
+        ephemeralSmokeStorage?.modern.removeAll()
+        ephemeralSmokeStorage?.legacy.removeAll()
+        ephemeralSmokeStorage?.deniedLegacyReads.removeAll()
+        ephemeralSmokeStorage?.failedMigrationReadbacks.removeAll()
+        ephemeralSmokeStorage?.migratedWrites.removeAll()
+        ephemeralSmokeStorage?.trace.removeAll()
         if let source = readSource {
             readSource = nil
-            // The cancellation handler closes the parent descriptor.
             source.cancel()
         }
         if let child = childHandle {
@@ -160,7 +243,6 @@ final class ContributionDeviceKeychainBroker {
         var buffer = [UInt8](repeating: 0, count: Self.maximumFrameBytes)
         let received = read(parentDescriptor, &buffer, buffer.count)
         if received == 0 {
-            // End-of-file: the companion exited.
             teardown()
             return
         }
@@ -186,27 +268,66 @@ final class ContributionDeviceKeychainBroker {
         }
     }
 
+    private func requestCapability(
+        _ request: [String: Any],
+        version: Int
+    ) -> BrokerKeychainCapability? {
+        if version == Self.legacyProtocolVersion {
+            guard request["capability"] == nil else { return nil }
+            return .contributionDevice
+        }
+        guard version == Self.protocolVersion,
+              let raw = request["capability"] as? String
+        else { return nil }
+        return BrokerKeychainCapability(rawValue: raw)
+    }
+
+    private func requestShapeIsValid(
+        _ request: [String: Any],
+        version: Int,
+        operation: String
+    ) -> Bool {
+        guard ["get", "set", "delete"].contains(operation) else {
+            return false
+        }
+        var expected = Set(["v", "id", "op"])
+        if version == Self.protocolVersion { expected.insert("capability") }
+        if operation == "set" { expected.insert("secret") }
+        return Set(request.keys) == expected
+    }
+
     private func handleFrame(_ frame: Data) {
         guard let parsed = try? JSONSerialization.jsonObject(with: frame),
               let request = parsed as? [String: Any],
               let version = request["v"] as? Int,
               let identifier = request["id"] as? Int,
-              identifier > 0
+              identifier > 0,
+              let operation = request["op"] as? String,
+              requestShapeIsValid(
+                  request,
+                  version: version,
+                  operation: operation
+              ),
+              let capability = requestCapability(request, version: version)
         else {
-            // Without a trustworthy identifier no response can be
-            // correlated; the only honest answer is a closed channel.
-            teardown()
+            if let parsed = try? JSONSerialization.jsonObject(with: frame),
+               let request = parsed as? [String: Any],
+               let identifier = request["id"] as? Int,
+               identifier > 0 {
+                respond([
+                    "id": identifier,
+                    "ok": false,
+                    "code": "invalid_request",
+                ])
+            } else {
+                teardown()
+            }
             return
         }
-        guard version == Self.protocolVersion,
-              let operation = request["op"] as? String
-        else {
-            respond(["id": identifier, "ok": false, "code": "invalid_request"])
-            return
-        }
+
         switch operation {
         case "get":
-            switch readSecret() {
+            switch readOrMigrateSecret(capability) {
             case .value(let stored):
                 respond([
                     "id": identifier,
@@ -218,10 +339,7 @@ final class ContributionDeviceKeychainBroker {
             }
         case "set":
             guard let secret = request["secret"] as? String,
-                  secret.range(
-                      of: Self.storedSecretPattern,
-                      options: .regularExpression
-                  ) != nil
+                  isValidStoredSecret(secret)
             else {
                 respond([
                     "id": identifier,
@@ -230,13 +348,13 @@ final class ContributionDeviceKeychainBroker {
                 ])
                 return
             }
-            if let code = storeSecret(secret) {
+            if let code = storeSecret(secret, capability: capability) {
                 respond(["id": identifier, "ok": false, "code": code])
             } else {
                 respond(["id": identifier, "ok": true])
             }
         case "delete":
-            if let code = deleteSecret() {
+            if let code = deleteSecret(capability: capability) {
                 respond(["id": identifier, "ok": false, "code": code])
             } else {
                 respond(["id": identifier, "ok": true])
@@ -267,9 +385,6 @@ final class ContributionDeviceKeychainBroker {
                 )
                 if written <= 0 {
                     if errno == EINTR { continue }
-                    // EAGAIN on a response this small means the companion
-                    // stopped draining entirely; failing the channel closed
-                    // is the honest outcome for that state too.
                     return false
                 }
                 offset += written
@@ -281,36 +396,38 @@ final class ContributionDeviceKeychainBroker {
 
     // MARK: - Keychain operations (login keychain, app-created items)
 
-    // The data-protection keychain would remove ACL semantics entirely, but
-    // its entitlement requires provisioning-profile-backed signing this
-    // Developer ID app does not carry; the login keychain needs none, and an
-    // item this app creates is readable by this app without any prompt.
+    private enum Generation {
+        case modern
+        case legacy
+    }
 
-    private func baseQuery() -> [String: Any] {
+    private func baseQuery(
+        _ capability: BrokerKeychainCapability,
+        generation: Generation
+    ) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.service,
-            kSecAttrAccount as String: Self.account,
+            kSecAttrService as String: generation == .modern
+                ? capability.modernService
+                : capability.legacyService,
+            kSecAttrAccount as String: BrokerKeychainCapability.account,
         ]
     }
 
-    /// Every SecItem call runs with securityd's user interaction suppressed.
-    ///
-    /// This queue serializes socket reads, Keychain calls, responses, and
-    /// teardown, so a SecItem call that blocks blocks the whole broker. A
-    /// locked login keychain or an ACL/partition mismatch would otherwise put
-    /// up a modal dialog and block exactly there: the companion's per-request
-    /// timeout then poisons its transport permanently, and the user who
-    /// answers that dialog correctly still finds the channel dead. Suppressed,
-    /// those states return errSecInteractionNotAllowed at once, which maps to
-    /// "locked" → the companion's existing recoverable
-    /// contribution_device_credential_locked surface. This is what makes "zero
-    /// dialogs" a structural property rather than an expectation.
-    private func withoutUserInteraction<T>(_ body: () -> T) -> T {
-        // Deprecated since 10.10 with no replacement for the login keychain;
-        // the data-protection keychain, which needs entitlements this
-        // Developer ID app cannot carry, is the only API that supersedes it.
-        SecKeychainSetUserInteractionAllowed(false)
+    private func isValidStoredSecret(_ stored: String) -> Bool {
+        stored.range(
+            of: Self.storedSecretPattern,
+            options: .regularExpression
+        ) != nil
+    }
+
+    /// Suppression is the default. Only the one fixed legacy migration read
+    /// calls this with `true`; no modern operation can display a prompt.
+    private func withUserInteraction<T>(
+        _ allowed: Bool,
+        _ body: () -> T
+    ) -> T {
+        SecKeychainSetUserInteractionAllowed(allowed)
         defer { SecKeychainSetUserInteractionAllowed(true) }
         return body()
     }
@@ -331,12 +448,38 @@ final class ContributionDeviceKeychainBroker {
         case failure(String)
     }
 
-    private func readSecret() -> ReadOutcome {
-        var query = baseQuery()
+    private func readSecret(
+        _ capability: BrokerKeychainCapability,
+        generation: Generation,
+        allowInteraction: Bool = false
+    ) -> ReadOutcome {
+        if let smoke = ephemeralSmokeStorage {
+            let generationName = generation == .modern ? "modern" : "legacy"
+            smoke.trace.append(
+                "read:\(generationName):\(capability.rawValue):"
+                    + "interactive=\(allowInteraction)"
+            )
+            if generation == .legacy,
+               allowInteraction,
+               smoke.deniedLegacyReads.contains(capability) {
+                return .failure("denied")
+            }
+            if generation == .modern,
+               smoke.migratedWrites.contains(capability),
+               smoke.failedMigrationReadbacks.contains(capability) {
+                return .failure("operation_failed")
+            }
+            return .value(
+                generation == .modern
+                    ? smoke.modern[capability]
+                    : smoke.legacy[capability]
+            )
+        }
+        var query = baseQuery(capability, generation: generation)
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         query[kSecReturnData as String] = true
         var item: CFTypeRef?
-        let status = withoutUserInteraction {
+        let status = withUserInteraction(allowInteraction) {
             SecItemCopyMatching(query as CFDictionary, &item)
         }
         if status == errSecItemNotFound { return .value(nil) }
@@ -345,37 +488,111 @@ final class ContributionDeviceKeychainBroker {
         }
         guard let data = item as? Data,
               let stored = String(data: data, encoding: .utf8),
-              stored.range(
-                  of: Self.storedSecretPattern,
-                  options: .regularExpression
-              ) != nil
+              isValidStoredSecret(stored)
         else {
             return .failure("operation_failed")
         }
         return .value(stored)
     }
 
-    /// The access object minted onto every fresh item: this app alone, matched
-    /// by designated requirement (the same stable team + identifier match the
-    /// `-T` mint relied on), so a re-signed same-team update keeps access.
-    ///
-    /// Exactly one entry, deliberately. `runtime/bin/node` was trusted here
-    /// until 2026-08-20, for the one-shot Identity & Device Reset helper's
-    /// keytar read; that entry was also the one thing that made the broker's
-    /// stated boundary untrue, because node is a world-executable
-    /// general-purpose interpreter any same-user process can run to satisfy
-    /// the requirement. The helper now clears this generation with
-    /// `security delete-generic-password -s … -a …`, which addresses the item
-    /// by attribute and never decrypts it, so no ACL is consulted and no
-    /// dialog is reachable (owner-verified live on a fresh account,
-    /// 2026-08-20 — release-gate item 8 had predicted the opposite). Nothing
-    /// else outside this app ever needs to decrypt the item: the live
-    /// companion asks this broker, and the reset and disconnect routes reach
-    /// the same broker through the running app.
-    ///
-    /// Adding a second trusted application here re-opens that hole. Anything
-    /// new that needs the secret must come through the broker instead.
-    private func designatedReaderAccess() -> SecAccess? {
+    private enum PresenceOutcome {
+        case present
+        case missing
+        case failure(String)
+    }
+
+    private func legacyPresence(
+        _ capability: BrokerKeychainCapability
+    ) -> PresenceOutcome {
+        if let smoke = ephemeralSmokeStorage {
+            smoke.trace.append("presence:legacy:\(capability.rawValue)")
+            return smoke.legacy[capability] == nil ? .missing : .present
+        }
+        var query = baseQuery(capability, generation: .legacy)
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        query[kSecReturnAttributes as String] = true
+        var item: CFTypeRef?
+        let status = withUserInteraction(false) {
+            SecItemCopyMatching(query as CFDictionary, &item)
+        }
+        if status == errSecItemNotFound { return .missing }
+        if status == errSecSuccess { return .present }
+        return .failure(Self.failureCode(status))
+    }
+
+    private func readOrMigrateSecret(
+        _ capability: BrokerKeychainCapability
+    ) -> ReadOutcome {
+        switch readSecret(capability, generation: .modern) {
+        case .value(let stored) where stored != nil:
+            return .value(stored)
+        case .failure(let code):
+            return .failure(code)
+        case .value:
+            break
+        }
+        // A caller cannot manufacture another interactive prompt in this app
+        // process. Restarting the signed app is the explicit retry boundary.
+        switch legacyPresence(capability) {
+        case .missing:
+            return .value(nil)
+        case .failure(let code):
+            return .failure(code)
+        case .present:
+            break
+        }
+        guard migrationPromptState.claimInteractiveRead(capability) else {
+            return .failure("migration_required")
+        }
+
+        let legacy: String
+        switch readSecret(
+            capability,
+            generation: .legacy,
+            allowInteraction: true
+        ) {
+        case .value(let stored):
+            guard let stored else { return .value(nil) }
+            legacy = stored
+        case .failure(let code):
+            if code == "denied" {
+                return .failure("migration_required")
+            }
+            return .failure(code)
+        }
+
+        let created: Bool
+        switch addMigratedSecret(legacy, capability: capability) {
+        case .created:
+            created = true
+        case .existingExact:
+            created = false
+        case .failure(let code):
+            return .failure(code)
+        }
+
+        switch readSecret(capability, generation: .modern) {
+        case .value(let readback) where readback == legacy:
+            break
+        default:
+            if created { _ = deleteSecret(capability: capability) }
+            return .failure("operation_failed")
+        }
+
+        let legacyDelete = deleteItem(
+            capability,
+            generation: .legacy
+        )
+        guard legacyDelete == nil else {
+            if created { _ = deleteSecret(capability: capability) }
+            return .failure("operation_failed")
+        }
+        return .value(legacy)
+    }
+
+    private func designatedReaderAccess(
+        _ label: String
+    ) -> SecAccess? {
         var trustedSelf: SecTrustedApplication?
         guard SecTrustedApplicationCreateFromPath(nil, &trustedSelf)
             == errSecSuccess,
@@ -385,7 +602,7 @@ final class ContributionDeviceKeychainBroker {
         }
         var access: SecAccess?
         guard SecAccessCreate(
-            Self.service as CFString,
+            label as CFString,
             [appTrust] as CFArray,
             &access
         ) == errSecSuccess else {
@@ -394,63 +611,454 @@ final class ContributionDeviceKeychainBroker {
         return access
     }
 
-    private func storeSecret(_ stored: String) -> String? {
-        let data = Data(stored.utf8)
-        // Never mint an item whose trust this app cannot state: a missing
-        // access object fails the mint closed rather than letting the system
-        // pick a default ACL nobody reasoned about.
-        guard let access = designatedReaderAccess() else {
+    private func attributes(
+        _ stored: String,
+        capability: BrokerKeychainCapability
+    ) -> [String: Any]? {
+        guard let access = designatedReaderAccess(capability.modernService)
+        else { return nil }
+        var selected = baseQuery(capability, generation: .modern)
+        selected[kSecAttrLabel as String] = capability.modernService
+        selected[kSecValueData as String] = Data(stored.utf8)
+        selected[kSecAttrAccess as String] = access
+        return selected
+    }
+
+    private enum MigrationWriteOutcome {
+        case created
+        case existingExact
+        case failure(String)
+    }
+
+    private func addMigratedSecret(
+        _ stored: String,
+        capability: BrokerKeychainCapability
+    ) -> MigrationWriteOutcome {
+        if let smoke = ephemeralSmokeStorage {
+            smoke.trace.append("add-migrated:modern:\(capability.rawValue)")
+            if let existing = smoke.modern[capability] {
+                return existing == stored
+                    ? .existingExact
+                    : .failure("operation_failed")
+            }
+            smoke.modern[capability] = stored
+            smoke.migratedWrites.insert(capability)
+            return .created
+        }
+        guard let selected = attributes(stored, capability: capability) else {
+            return .failure("operation_failed")
+        }
+        let status = withUserInteraction(false) {
+            SecItemAdd(selected as CFDictionary, nil)
+        }
+        if status == errSecSuccess { return .created }
+        guard status == errSecDuplicateItem else {
+            return .failure(Self.failureCode(status))
+        }
+        switch readSecret(capability, generation: .modern) {
+        case .value(let existing) where existing == stored:
+            return .existingExact
+        case .failure(let code):
+            return .failure(code)
+        default:
+            return .failure("operation_failed")
+        }
+    }
+
+    private func storeSecret(
+        _ stored: String,
+        capability: BrokerKeychainCapability
+    ) -> String? {
+        if let smoke = ephemeralSmokeStorage {
+            smoke.trace.append("store:modern:\(capability.rawValue)")
+            smoke.modern[capability] = stored
+            smoke.migratedWrites.remove(capability)
+            return nil
+        }
+        guard let selected = attributes(stored, capability: capability) else {
             return "operation_failed"
         }
-        var attributes = baseQuery()
-        attributes[kSecAttrLabel as String] = Self.service
-        attributes[kSecValueData as String] = data
-        attributes[kSecAttrAccess as String] = access
-        return withoutUserInteraction {
-            let status = SecItemAdd(attributes as CFDictionary, nil)
+        return withUserInteraction(false) {
+            let status = SecItemAdd(selected as CFDictionary, nil)
             if status == errSecSuccess { return nil }
             guard status == errSecDuplicateItem else {
                 return Self.failureCode(status)
             }
-            // Not SecItemUpdate: Apple's implementation answers an update that
-            // hits errSecVerifyFailed by silently recreating the item through
-            // _ReplaceKeychainItem → SecKeychainItemCreateFromContent with
-            // initialAccess = NULL (OSX/libsecurity_keychain/lib/SecItem.cpp),
-            // which swaps this app-only ACL for the system default one — a
-            // silent widening nobody would observe, since this app keeps
-            // access either way. Adding kSecAttrAccess to the update
-            // dictionary does not reliably prevent it. Delete-then-add
-            // re-establishes the ACL on every write, and the silent ~25-day
-            // rotation takes this path every single time.
-            //
-            // Safe because this branch is only reachable behind a completed
-            // compare-and-swap read: the companion decrypted this item
-            // microseconds ago on this same serialized queue, so the keychain
-            // is demonstrably unlocked, and the rotation that drove the write
-            // already has the service's commit for the replacement — the
-            // stored value is worthless either way. A delete that lands before
-            // a failing add therefore reaches the same recoverable state as a
-            // failing update: no readable credential, credential_missing, and
-            // the existing re-pair ceremony.
-            let removal = SecItemDelete(baseQuery() as CFDictionary)
+            // Never SecItemUpdate: a verify failure can make it silently
+            // recreate the item with a default (wider) ACL.
+            let removal = SecItemDelete(
+                baseQuery(capability, generation: .modern) as CFDictionary
+            )
             guard removal == errSecSuccess || removal == errSecItemNotFound
-            else {
-                return Self.failureCode(removal)
-            }
-            let replacement = SecItemAdd(attributes as CFDictionary, nil)
+            else { return Self.failureCode(removal) }
+            let replacement = SecItemAdd(selected as CFDictionary, nil)
             return replacement == errSecSuccess
                 ? nil
                 : Self.failureCode(replacement)
         }
     }
 
-    private func deleteSecret() -> String? {
-        let status = withoutUserInteraction {
-            SecItemDelete(baseQuery() as CFDictionary)
+    private func deleteItem(
+        _ capability: BrokerKeychainCapability,
+        generation: Generation
+    ) -> String? {
+        if let smoke = ephemeralSmokeStorage {
+            let generationName = generation == .modern ? "modern" : "legacy"
+            smoke.trace.append(
+                "delete:\(generationName):\(capability.rawValue)"
+            )
+            if generation == .modern {
+                smoke.modern.removeValue(forKey: capability)
+                smoke.migratedWrites.remove(capability)
+            } else {
+                smoke.legacy.removeValue(forKey: capability)
+            }
+            return nil
+        }
+        let status = withUserInteraction(false) {
+            SecItemDelete(
+                baseQuery(capability, generation: generation) as CFDictionary
+            )
         }
         if status == errSecSuccess || status == errSecItemNotFound {
             return nil
         }
         return Self.failureCode(status)
+    }
+
+    private func deleteSecret(
+        capability: BrokerKeychainCapability
+    ) -> String? {
+        return deleteItem(capability, generation: .modern)
+    }
+
+    // MARK: - Compiled native contract probe
+
+    private struct SmokeFailure: Error {
+        let message: String
+    }
+
+    private static func requireSmoke(
+        _ condition: @autoclosure () -> Bool,
+        _ message: String
+    ) throws {
+        guard condition() else { throw SmokeFailure(message: message) }
+    }
+
+    private static func smokeResponse(
+        _ broker: ContributionDeviceKeychainBroker,
+        _ request: [String: Any]
+    ) throws -> [String: Any] {
+        guard let endpoint = broker.childEndpoint else {
+            throw SmokeFailure(message: "missing child endpoint")
+        }
+        var frame = try JSONSerialization.data(withJSONObject: request)
+        frame.append(0x0A)
+        try endpoint.write(contentsOf: frame)
+
+        var response = Data()
+        while response.count <= Self.maximumFrameBytes {
+            var descriptor = pollfd(
+                fd: endpoint.fileDescriptor,
+                events: Int16(POLLIN | POLLHUP | POLLERR),
+                revents: 0
+            )
+            let ready = poll(&descriptor, 1, 2_000)
+            guard ready > 0, descriptor.revents & Int16(POLLIN) != 0 else {
+                throw SmokeFailure(message: "broker response timed out")
+            }
+            var byte: UInt8 = 0
+            let count = withUnsafeMutableBytes(of: &byte) { buffer in
+                read(endpoint.fileDescriptor, buffer.baseAddress, 1)
+            }
+            guard count == 1 else {
+                throw SmokeFailure(message: "broker response closed early")
+            }
+            if byte == 0x0A {
+                guard let parsed = try JSONSerialization.jsonObject(
+                    with: response
+                ) as? [String: Any] else {
+                    throw SmokeFailure(message: "broker response was not an object")
+                }
+                return parsed
+            }
+            response.append(byte)
+        }
+        throw SmokeFailure(message: "broker response exceeded frame limit")
+    }
+
+    private static func requireSuccess(
+        _ response: [String: Any],
+        id: Int,
+        secret: String? = nil
+    ) throws {
+        try requireSmoke(response["id"] as? Int == id, "response id drifted")
+        try requireSmoke(response["ok"] as? Bool == true, "request failed")
+        if let secret {
+            try requireSmoke(
+                response["secret"] as? String == secret,
+                "response secret drifted"
+            )
+        }
+    }
+
+    private static func requireFailure(
+        _ response: [String: Any],
+        id: Int,
+        code: String
+    ) throws {
+        try requireSmoke(response["id"] as? Int == id, "response id drifted")
+        try requireSmoke(response["ok"] as? Bool == false, "failure became success")
+        try requireSmoke(
+            response["code"] as? String == code,
+            "failure code drifted"
+        )
+    }
+
+    private static func requireMalformedFrameClosure(
+        _ broker: ContributionDeviceKeychainBroker
+    ) throws {
+        guard let endpoint = broker.childEndpoint else {
+            throw SmokeFailure(message: "missing malformed-frame endpoint")
+        }
+        let duplicateDescriptor = dup(endpoint.fileDescriptor)
+        guard duplicateDescriptor >= 0 else {
+            throw SmokeFailure(message: "could not duplicate smoke endpoint")
+        }
+        let observer = FileHandle(
+            fileDescriptor: duplicateDescriptor,
+            closeOnDealloc: true
+        )
+        try endpoint.write(contentsOf: Data("{not-json}\n".utf8))
+        var descriptor = pollfd(
+            fd: observer.fileDescriptor,
+            events: Int16(POLLIN | POLLHUP | POLLERR),
+            revents: 0
+        )
+        let ready = poll(&descriptor, 1, 2_000)
+        guard ready > 0 else {
+            throw SmokeFailure(message: "malformed frame did not close broker")
+        }
+        if descriptor.revents & Int16(POLLHUP | POLLERR) != 0 { return }
+        var byte: UInt8 = 0
+        let count = withUnsafeMutableBytes(of: &byte) { buffer in
+            read(observer.fileDescriptor, buffer.baseAddress, 1)
+        }
+        try requireSmoke(count == 0, "malformed frame produced a response")
+    }
+
+    /// Runs the compiled Swift implementation over its real socketpair while
+    /// substituting only the Keychain store. No production Keychain API is
+    /// reached. This is deliberately terminal and cannot turn into an app
+    /// runtime mode.
+    static func runContractSmokeTest() -> Int32 {
+        do {
+            var identifier = 1
+            let capabilityStorage = EphemeralSmokeStorage()
+            let capabilityBroker = try ContributionDeviceKeychainBroker(
+                smokeStorage: capabilityStorage
+            )
+            defer { capabilityBroker.shutdown() }
+            for (offset, capability) in BrokerKeychainCapability.allCases
+                .enumerated() {
+                let scalar = UnicodeScalar(65 + offset)!
+                let secret = String(repeating: Character(scalar), count: 43)
+                let setResponse = try smokeResponse(capabilityBroker, [
+                    "v": 2,
+                    "id": identifier,
+                    "op": "set",
+                    "capability": capability.rawValue,
+                    "secret": secret,
+                ])
+                try requireSuccess(setResponse, id: identifier)
+                identifier += 1
+                let getResponse = try smokeResponse(capabilityBroker, [
+                    "v": 2,
+                    "id": identifier,
+                    "op": "get",
+                    "capability": capability.rawValue,
+                ])
+                try requireSuccess(getResponse, id: identifier, secret: secret)
+                identifier += 1
+                let deleteResponse = try smokeResponse(capabilityBroker, [
+                    "v": 2,
+                    "id": identifier,
+                    "op": "delete",
+                    "capability": capability.rawValue,
+                ])
+                try requireSuccess(deleteResponse, id: identifier)
+                identifier += 1
+            }
+
+            let v1Secret = String(repeating: "V", count: 43)
+            try requireSuccess(
+                try smokeResponse(capabilityBroker, [
+                    "v": 1,
+                    "id": identifier,
+                    "op": "set",
+                    "secret": v1Secret,
+                ]),
+                id: identifier
+            )
+            identifier += 1
+            try requireSuccess(
+                try smokeResponse(capabilityBroker, [
+                    "v": 1,
+                    "id": identifier,
+                    "op": "get",
+                ]),
+                id: identifier,
+                secret: v1Secret
+            )
+            identifier += 1
+            try requireSuccess(
+                try smokeResponse(capabilityBroker, [
+                    "v": 1,
+                    "id": identifier,
+                    "op": "delete",
+                ]),
+                id: identifier
+            )
+
+            let migratedSecret = String(repeating: "M", count: 43)
+            let migrationStorage = EphemeralSmokeStorage()
+            migrationStorage.legacy[.exportIdentity] = migratedSecret
+            let migrationBroker = try ContributionDeviceKeychainBroker(
+                smokeStorage: migrationStorage
+            )
+            defer { migrationBroker.shutdown() }
+            try requireSuccess(
+                try smokeResponse(migrationBroker, [
+                    "v": 2,
+                    "id": 101,
+                    "op": "get",
+                    "capability": BrokerKeychainCapability.exportIdentity.rawValue,
+                ]),
+                id: 101,
+                secret: migratedSecret
+            )
+            try requireSmoke(
+                migrationStorage.modern[.exportIdentity] == migratedSecret,
+                "migration did not commit modern item"
+            )
+            try requireSmoke(
+                migrationStorage.legacy[.exportIdentity] == nil,
+                "migration did not retire legacy item"
+            )
+            try requireSmoke(
+                migrationStorage.trace == [
+                    "read:modern:export_identity:interactive=false",
+                    "presence:legacy:export_identity",
+                    "read:legacy:export_identity:interactive=true",
+                    "add-migrated:modern:export_identity",
+                    "read:modern:export_identity:interactive=false",
+                    "delete:legacy:export_identity",
+                ],
+                "migration operation order drifted"
+            )
+
+            let deniedSecret = String(repeating: "D", count: 43)
+            let deniedStorage = EphemeralSmokeStorage()
+            deniedStorage.legacy[.accountObservation] = deniedSecret
+            deniedStorage.deniedLegacyReads.insert(.accountObservation)
+            let deniedPromptState = MigrationPromptState()
+            let deniedBroker = try ContributionDeviceKeychainBroker(
+                smokeStorage: deniedStorage,
+                migrationPromptState: deniedPromptState
+            )
+            defer { deniedBroker.shutdown() }
+            try requireFailure(
+                try smokeResponse(deniedBroker, [
+                    "v": 2,
+                    "id": 201,
+                    "op": "get",
+                    "capability": BrokerKeychainCapability
+                        .accountObservation.rawValue,
+                ]),
+                id: 201,
+                code: "migration_required"
+            )
+            // A companion restart constructs a second broker while the signed
+            // app process stays alive. Inject the same app-lifetime prompt
+            // owner to prove that replacement cannot raise another dialog.
+            let relaunchedDeniedBroker = try ContributionDeviceKeychainBroker(
+                smokeStorage: deniedStorage,
+                migrationPromptState: deniedPromptState
+            )
+            defer { relaunchedDeniedBroker.shutdown() }
+            try requireFailure(
+                try smokeResponse(relaunchedDeniedBroker, [
+                    "v": 2,
+                    "id": 202,
+                    "op": "get",
+                    "capability": BrokerKeychainCapability
+                        .accountObservation.rawValue,
+                ]),
+                id: 202,
+                code: "migration_required"
+            )
+            try requireSmoke(
+                deniedStorage.legacy[.accountObservation] == deniedSecret
+                    && deniedStorage.modern[.accountObservation] == nil,
+                "denied migration changed stored state"
+            )
+            try requireSmoke(
+                deniedStorage.trace.filter {
+                    $0 == "read:legacy:account_observation:interactive=true"
+                }.count == 1,
+                "denied migration prompted more than once"
+            )
+
+            let rollbackSecret = String(repeating: "R", count: 43)
+            let rollbackStorage = EphemeralSmokeStorage()
+            rollbackStorage.legacy[.claudeSessionPseudonym] = rollbackSecret
+            rollbackStorage.failedMigrationReadbacks.insert(
+                .claudeSessionPseudonym
+            )
+            let rollbackBroker = try ContributionDeviceKeychainBroker(
+                smokeStorage: rollbackStorage
+            )
+            defer { rollbackBroker.shutdown() }
+            try requireFailure(
+                try smokeResponse(rollbackBroker, [
+                    "v": 2,
+                    "id": 301,
+                    "op": "get",
+                    "capability": BrokerKeychainCapability
+                        .claudeSessionPseudonym.rawValue,
+                ]),
+                id: 301,
+                code: "operation_failed"
+            )
+            try requireSmoke(
+                rollbackStorage.legacy[.claudeSessionPseudonym]
+                    == rollbackSecret
+                    && rollbackStorage.modern[.claudeSessionPseudonym] == nil,
+                "failed readback did not roll back modern state"
+            )
+
+            let malformedBroker = try ContributionDeviceKeychainBroker(
+                smokeStorage: EphemeralSmokeStorage()
+            )
+            try requireMalformedFrameClosure(malformedBroker)
+
+            print(
+                "USAGE_MONITOR_MACOS_KEYCHAIN_BROKER_CONTRACT "
+                    + "protocols=v1,v2 capabilities=4 "
+                    + "migration=success,denied-preserved,readback-rollback "
+                    + "malformed=closed keychain_access=0"
+            )
+            return 0
+        } catch let failure as SmokeFailure {
+            FileHandle.standardError.write(
+                Data("Keychain broker contract failed: \(failure.message)\n".utf8)
+            )
+            return 1
+        } catch {
+            FileHandle.standardError.write(
+                Data("Keychain broker contract failed\n".utf8)
+            )
+            return 1
+        }
     }
 }

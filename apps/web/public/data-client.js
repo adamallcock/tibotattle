@@ -1,24 +1,16 @@
 /**
  * Browser data boundary.
  *
- * Preferred local companion contract:
- *   GET  /api/local/v1/status
- *   GET  /api/local/v1/dashboard
+ * Local companion contract:
+ *   GET  /api/local/{onboarding,overview,gradient,weekly,quality}
  *   POST /api/local/refresh
  *
- * Split endpoint aliases are supported while the local server evolves:
- *   /api/local/{onboarding,overview,gradient,weekly,quality,reports}
- *
- * Central contribution contract:
- *   POST /api/v1/contributions
- *   POST /api/v1/me/contributions/read
- *   POST /api/v1/me/contributions/delete
- *   GET  /api/v1/me
- *   GET  /api/v1/me/stats
- *   GET  /api/v1/stats/aggregate
- *   POST /api/v1/me/device-pairings
- *   GET  /api/v1/me/devices
- *   POST /api/v1/me/devices/revoke
+ * Hosted browser-session contract:
+ *   GET  /api/v1/session
+ *   POST /api/v1/enroll and /api/v1/logout
+ *   POST /api/v1/identity/{google,apple}/{start,result}
+*   POST /api/v1/me/device-pairings
+ *   DELETE /api/v1/me
  *
  * The normalizers below accept complete, partial, stale, and insufficient
  * responses, but never silently turn a failure into real-looking data.
@@ -66,6 +58,8 @@ const SAFE_QUOTA_LIMIT_DISPLAY_NAME =
 export function isSparkQuotaLimitId(value) {
   return CODEX_SPARK_LIMIT_IDS.includes(value);
 }
+// Parse-only compatibility for historical readiness fixtures. The public
+// browser relay no longer forwards /api/ready.
 const BACKEND_LIFECYCLE_STATES = new Set([
   "never_run",
   "running",
@@ -101,8 +95,6 @@ export const CONTRIBUTION_SYNC_PREVIEW_SCHEMA_VERSION =
   "contribution-sync-preview-v0.1";
 export const CONTRIBUTION_SYNC_RUN_SCHEMA_VERSION =
   "contribution-sync-run-v0.1";
-export const AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION =
-  "automatic-contribution-status-v0.1";
 export const LOCAL_CONTRIBUTION_PREPARATION_RESULT_VERSION =
   "local-contribution-preparation-result-v0.1";
 export const LOCAL_CONTRIBUTION_DEVICE_PAIRING_VERSION =
@@ -121,6 +113,8 @@ const PARTICIPANT_COMPARISON_METRIC_UNITS = Object.freeze({
   outputCombinedTokens: "tokens",
   toolUnits: "units"
 });
+// Parse-only compatibility for historical deletion receipts. No current
+// browser method calls the retired granular contribution-delete endpoint.
 const CONTRIBUTION_ID_PATTERN =
   /^contribution:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const PARTICIPANT_ID_PATTERN =
@@ -245,6 +239,7 @@ const LOCAL_PREPARATION_ERROR_CODES = new Set([
   "coverage_unavailable",
   "coverage_invalid",
   "identity_unavailable",
+  "identity_migration_required",
   "no_safe_records",
   "export_too_large",
   "privacy_verification_failed",
@@ -807,7 +802,7 @@ const INCREMENTAL_SYNC_DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
 // Where a macOS Keychain dialog is still reachable for this install. An
 // unreadable or absent answer means "pairing" — today's guidance, shown to
 // everyone — so a companion that cannot say never silently withholds it.
-const INCREMENTAL_SYNC_KEYCHAIN_PROMPTS = ["pairing", "rotation", "none"];
+const INCREMENTAL_SYNC_KEYCHAIN_PROMPTS = ["pairing", "migration", "none"];
 
 export function normalizeIncrementalContributionSyncStatus(payload) {
   const keychainPrompt =
@@ -900,223 +895,6 @@ export function normalizeIncrementalContributionSyncStatus(payload) {
     lastAttemptAt,
     nextAttemptAt,
     lastOutcome
-  });
-}
-
-export function normalizeAutomaticContributionStatus(payload) {
-  const unavailable = Object.freeze({
-    state: "unavailable",
-    enabled: false,
-    intervalHours: 6,
-    consentCurrent: false,
-    firstReviewComplete: false,
-    firstReviewedAcceptedAt: "",
-    requiredConsent: null,
-    consentedAt: "",
-    lastAttemptAt: "",
-    lastSuccessAt: "",
-    nextAttemptAt: "",
-    lastOutcome: null,
-    foregroundOnly: true,
-    daemonInstalled: false
-  });
-  const exactKeys = [
-    "schemaVersion",
-    "status",
-    "enabled",
-    "intervalHours",
-    "consentCurrent",
-    "firstReviewComplete",
-    "firstReviewedAcceptedAt",
-    "requiredConsent",
-    "consentedAt",
-    "lastAttemptAt",
-    "lastSuccessAt",
-    "nextAttemptAt",
-    "lastOutcome",
-    "foregroundOnly",
-    "daemonInstalled",
-    "networkActivity",
-    "includesContent",
-    "includesPaths",
-    "includesIdentifiers",
-    "includesCredentials"
-  ];
-  const states = new Set([
-    "not_configured",
-    "disabled",
-    "first_review_required",
-    "scheduled",
-    "running",
-    "paused",
-    "consent_required",
-    "failed"
-  ]);
-  if (!hasExactKeys(payload, exactKeys)
-      || payload.schemaVersion !== AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION
-      || !states.has(payload.status)
-      || typeof payload.enabled !== "boolean"
-      || payload.intervalHours !== 6
-      || typeof payload.consentCurrent !== "boolean"
-      || typeof payload.firstReviewComplete !== "boolean"
-      || payload.foregroundOnly !== true
-      || payload.daemonInstalled !== false
-      || payload.networkActivity !== false
-      || payload.includesContent !== false
-      || payload.includesPaths !== false
-      || payload.includesIdentifiers !== false
-      || payload.includesCredentials !== false) {
-    return unavailable;
-  }
-
-  const requiredConsentKeys = [
-    "telemetrySchemaVersion",
-    "fieldDictionaryVersion",
-    "privacyContractVersion",
-    "destinationOrigin"
-  ];
-  const requiredConsent = payload.requiredConsent;
-  const destination = text(requiredConsent?.destinationOrigin, "");
-  let validDestination = requiredConsent?.destinationOrigin === null;
-  if (destination) {
-    try {
-      const origin = new URL(destination);
-      const production = origin.protocol === "https:"
-        && !origin.port
-        && origin.hostname !== "localhost"
-        && origin.hostname !== "127.0.0.1";
-      const localDevelopment = origin.protocol === "http:"
-        && origin.hostname === "127.0.0.1"
-        && /^[1-9][0-9]{0,4}$/u.test(origin.port)
-        && Number(origin.port) <= 65_535;
-      validDestination = (production || localDevelopment)
-        && !origin.username
-        && !origin.password
-        && origin.pathname === "/"
-        && !origin.search
-        && !origin.hash
-        && origin.origin === destination;
-    } catch {
-      validDestination = false;
-    }
-  }
-  if (!hasExactKeys(requiredConsent, requiredConsentKeys)
-      || requiredConsent.telemetrySchemaVersion !== "telemetry-contribution-v0.1"
-      || requiredConsent.fieldDictionaryVersion
-        !== "telemetry-v0.1-registry-2026-08-06.1"
-      || requiredConsent.privacyContractVersion
-        !== "ongoing-privacy-safe-telemetry-v0.1"
-      || !validDestination
-      || (payload.status === "not_configured"
-        ? requiredConsent.destinationOrigin !== null
-        : requiredConsent.destinationOrigin === null)) {
-    return unavailable;
-  }
-
-  const alwaysEnabledStates = new Set(["scheduled", "running", "paused"]);
-  const neverEnabledStates = new Set([
-    "not_configured",
-    "disabled",
-    "first_review_required",
-    "consent_required"
-  ]);
-  if (payload.enabled !== payload.consentCurrent
-      || (alwaysEnabledStates.has(payload.status) && !payload.enabled)
-      || (neverEnabledStates.has(payload.status) && payload.enabled)) {
-    return unavailable;
-  }
-
-  const timestamp = (value) => {
-    if (value === null) return "";
-    const selected = text(value, "");
-    return selected
-      && Number.isFinite(Date.parse(selected))
-      && new Date(Date.parse(selected)).toISOString() === selected
-      ? selected
-      : null;
-  };
-  const consentedAt = timestamp(payload.consentedAt);
-  const firstReviewedAcceptedAt = timestamp(payload.firstReviewedAcceptedAt);
-  const lastAttemptAt = timestamp(payload.lastAttemptAt);
-  const lastSuccessAt = timestamp(payload.lastSuccessAt);
-  const nextAttemptAt = timestamp(payload.nextAttemptAt);
-  if ([
-    consentedAt,
-    firstReviewedAcceptedAt,
-    lastAttemptAt,
-    lastSuccessAt,
-    nextAttemptAt
-  ]
-    .some((value) => value === null)) {
-    return unavailable;
-  }
-  const statusMayLackFirstReview = new Set([
-    "not_configured",
-    "failed",
-    "first_review_required"
-  ]);
-  if (payload.firstReviewComplete !== Boolean(firstReviewedAcceptedAt)
-      || (payload.firstReviewComplete
-        && ["not_configured", "first_review_required"].includes(payload.status))
-      || (!payload.firstReviewComplete
-        && !statusMayLackFirstReview.has(payload.status))) {
-    return unavailable;
-  }
-
-  let lastOutcome = null;
-  if (payload.lastOutcome !== null) {
-    const outcomeCodesByStatus = new Map([
-      ["succeeded", new Set(["accepted", "completed"])],
-      ["skipped", new Set(["no_new_evidence"])],
-      ["failed", new Set([
-        "retry_scheduled",
-        "delivery_rejected",
-        "preparation_failed",
-        "publication_incomplete",
-        "upload_failed",
-        "run_timeout"
-      ])],
-      ["paused", new Set([
-        "queue_paused",
-        "privacy_verification_failed",
-        "identity_unavailable"
-      ])]
-    ]);
-    const at = timestamp(payload.lastOutcome?.at);
-    if (!hasExactKeys(payload.lastOutcome, ["status", "code", "at"])
-        || !outcomeCodesByStatus
-          .get(payload.lastOutcome.status)
-          ?.has(payload.lastOutcome.code)
-        || !at) {
-      return unavailable;
-    }
-    lastOutcome = Object.freeze({
-      status: payload.lastOutcome.status,
-      code: payload.lastOutcome.code,
-      at
-    });
-  }
-
-  return Object.freeze({
-    state: payload.status,
-    enabled: payload.enabled,
-    intervalHours: 6,
-    consentCurrent: payload.consentCurrent,
-    firstReviewComplete: payload.firstReviewComplete,
-    firstReviewedAcceptedAt,
-    requiredConsent: Object.freeze({
-      telemetrySchemaVersion: requiredConsent.telemetrySchemaVersion,
-      fieldDictionaryVersion: requiredConsent.fieldDictionaryVersion,
-      privacyContractVersion: requiredConsent.privacyContractVersion,
-      destinationOrigin: requiredConsent.destinationOrigin
-    }),
-    consentedAt,
-    lastAttemptAt,
-    lastSuccessAt,
-    nextAttemptAt,
-    lastOutcome,
-    foregroundOnly: true,
-    daemonInstalled: false
   });
 }
 
@@ -5417,7 +5195,6 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
   const state = mode === "demo"
     ? "demo"
     : safeState(freshness?.status ?? overview?.status ?? overview?.evidenceStatus ?? payload?.status, "insufficient");
-  const reportsPayload = payload?.reports ?? fragments.reports ?? {};
   const quotaWindows = quotaRows.map((window, index) => normalizeQuota({
     ...window,
     observedAt: window?.observedAt ?? quota?.observedAt,
@@ -5539,14 +5316,7 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
     },
     gradient: normalizeGradient(payload?.gradient ?? fragments.gradient),
     weekly: normalizeWeekly(payload?.weekly ?? fragments.weekly),
-    quality: normalizeQuality(payload?.quality ?? fragments.quality),
-    reports: array(reportsPayload?.reports ?? reportsPayload).slice(0, 20).map((report) => ({
-      id: text(report?.id, ""),
-      title: text(report?.title, "Detailed report"),
-      href: text(report?.href, ""),
-      updatedAt: text(report?.updatedAt ?? report?.modifiedAt, ""),
-      status: safeState(report?.status, "live")
-    })).filter((report) => report.href.startsWith("/") && !report.href.startsWith("//"))
+    quality: normalizeQuality(payload?.quality ?? fragments.quality)
   };
 }
 
@@ -5648,34 +5418,10 @@ export class LocalCompanionClient {
     // page. Hold a detached wrapper so every method may call
     // this.fetchImpl(...) directly.
     this.fetchImpl = (...args) => fetchImpl(...args);
-    // Set once the companion has answered 404/405 for the consolidated
-    // endpoint, so the negotiation is not repeated on every later load.
-    this.consolidatedUnavailable = false;
   }
 
   async load() {
-    // The consolidated endpoint is a supported companion capability, not dead
-    // code, so the probe stays. What does not need to stay is re-asking on
-    // every single load: a companion that serves only the split fragments
-    // answered 404 the first time and will answer 404 every time, and each
-    // repeat cost two round-trips and put two errors in the console where they
-    // masked real ones. The answer is remembered for the life of this client,
-    // which is a page load - a companion that gains the endpoint is picked up
-    // on the next one.
-    if (!this.consolidatedUnavailable) {
-      try {
-        const [status, dashboard] = await Promise.all([
-          fetchJson(this.fetchImpl, `${LOCAL_ROOT}/v1/status`).catch(() => null),
-          fetchJson(this.fetchImpl, `${LOCAL_ROOT}/v1/dashboard`)
-        ]);
-        return normalizeDashboardPayload({ ...dashboard, status: dashboard?.status ?? status?.status });
-      } catch (error) {
-        if (![404, 405].includes(error.status)) throw error;
-        this.consolidatedUnavailable = true;
-      }
-    }
-
-    const paths = ["overview", "gradient", "weekly", "quality", "reports"];
+    const paths = ["overview", "gradient", "weekly", "quality"];
     const settled = await Promise.allSettled(paths.map((path) => fetchJson(this.fetchImpl, `${LOCAL_ROOT}/${path}`)));
     const fragments = Object.fromEntries(settled.map((result, index) => [
       paths[index],
@@ -5833,76 +5579,6 @@ export class LocalCompanionClient {
       throw new Error("The local companion did not clear the sign-in handoff.");
     }
     return normalized;
-  }
-
-  async automaticContributionStatus() {
-    try {
-      return normalizeAutomaticContributionStatus(
-        await fetchJson(
-          this.fetchImpl,
-          `${LOCAL_ROOT}/contribution/automatic-settings`
-        )
-      );
-    } catch {
-      return normalizeAutomaticContributionStatus(null);
-    }
-  }
-
-  async enableAutomaticContribution(requiredConsent) {
-    const normalized = normalizeAutomaticContributionStatus({
-      schemaVersion: AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION,
-      status: "first_review_required",
-      enabled: false,
-      intervalHours: 6,
-      consentCurrent: false,
-      firstReviewComplete: false,
-      firstReviewedAcceptedAt: null,
-      requiredConsent,
-      consentedAt: null,
-      lastAttemptAt: null,
-      lastSuccessAt: null,
-      nextAttemptAt: null,
-      lastOutcome: null,
-      foregroundOnly: true,
-      daemonInstalled: false,
-      networkActivity: false,
-      includesContent: false,
-      includesPaths: false,
-      includesIdentifiers: false,
-      includesCredentials: false
-    });
-    if (normalized.state === "unavailable"
-        || normalized.requiredConsent?.destinationOrigin === null) {
-      throw new TypeError("Automatic contribution consent is invalid.");
-    }
-    const response = await this.fetchImpl(
-      `${LOCAL_ROOT}/contribution/automatic-enable`,
-      {
-        method: "POST",
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/json",
-          "X-Usage-Monitor-Local": "1"
-        },
-        body: JSON.stringify({
-          intervalHours: 6,
-          consent: normalized.requiredConsent
-        })
-      }
-    );
-    const payload = await response.json().catch(() => null);
-    if (!response.ok) {
-      throw localCompanionRequestError(response, payload);
-    }
-    return normalizeAutomaticContributionStatus(payload);
-  }
-
-  async disableAutomaticContribution() {
-    return normalizeAutomaticContributionStatus(
-      await this.localContributionMutation("automatic-disable", {
-        reason: "user_request"
-      })
-    );
   }
 
   /**
@@ -6122,12 +5798,6 @@ export class LocalCompanionClient {
     });
   }
 
-  async runContributionSyncOnce(reviewToken) {
-    return normalizeContributionSyncRun(
-      await this.localContributionMutation("sync-once", { reviewToken })
-    );
-  }
-
   async prepareContribution(options = {}) {
     if (!options
         || typeof options !== "object"
@@ -6172,13 +5842,6 @@ export class LocalCompanionClient {
     return normalizeLocalContributionPreparation(payload);
   }
 
-  async setContributionSyncPaused(paused) {
-    return normalizeContributionSyncStatus(
-      await this.localContributionMutation(
-        paused ? "sync-pause" : "sync-resume"
-      )
-    );
-  }
 }
 
 export class CommunityClient {
@@ -6192,7 +5855,6 @@ export class CommunityClient {
     this.fetchImpl = (...args) => fetchImpl(...args);
     this.getCsrfToken = getCsrfToken;
     this.getParticipantId = getParticipantId;
-    this.pendingRecovery = null;
   }
 
   sessionOptions(options = {}) {
@@ -6215,18 +5877,6 @@ export class CommunityClient {
 
   health() {
     return fetchJson(this.fetchImpl, "/api/health");
-  }
-
-  async readiness() {
-    const response = await this.fetchImpl("/api/ready", {
-      headers: { Accept: "application/json" }
-    });
-    if (![200, 503].includes(response.status)) {
-      const error = new Error(`Request failed (${response.status}).`);
-      error.status = response.status;
-      throw error;
-    }
-    return normalizeBackendReadiness(await response.json().catch(() => null));
   }
 
   session() {
@@ -6301,127 +5951,6 @@ export class CommunityClient {
     return readHostedSignInResult(this.fetchImpl, "apple", state, verifier);
   }
 
-  async recover(recoveryCode) {
-    if (this.pendingRecovery?.recoveryCode !== recoveryCode) {
-      const bytes = globalThis.crypto.getRandomValues(new Uint8Array(32));
-      const secret = btoa(String.fromCharCode(...bytes))
-        .replaceAll("+", "-")
-        .replaceAll("/", "_")
-        .replace(/=+$/u, "");
-      this.pendingRecovery = {
-        recoveryCode,
-        recoveryAttemptId: `um_recovery_attempt_${secret}`
-      };
-    }
-    try {
-      const result = await fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/recover`, {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(this.pendingRecovery)
-      });
-      this.pendingRecovery = null;
-      return result;
-    } catch (error) {
-      if (Number.isInteger(error?.status) && error.status < 500) {
-        this.pendingRecovery = null;
-      }
-      throw error;
-    }
-  }
-
-  envelopeKey() {
-    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/envelope-key`);
-  }
-
-  registerUpload({ envelopeDigest, contentLengthBytes, contentType = "application/json" }) {
-    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/upload-authorizations`, this.mutationOptions({
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ envelopeDigest, contentLengthBytes, contentType })
-    }));
-  }
-
-  contributeSerialized(serializedEnvelope, uploadAuthorization) {
-    if (typeof uploadAuthorization !== "string" || uploadAuthorization.length === 0) {
-      throw new Error("A one-use upload authorization is required.");
-    }
-    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/contributions`, {
-      method: "POST",
-      credentials: "omit",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Upload ${uploadAuthorization}`
-      },
-      body: serializedEnvelope
-    });
-  }
-
-  contribution(contributionId) {
-    return fetchJson(
-      this.fetchImpl,
-      `${CENTRAL_ROOT}/me/contributions/read`,
-      this.mutationOptions({
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contributionId })
-      })
-    );
-  }
-
-  deleteContribution(contributionId) {
-    if (typeof contributionId !== "string"
-        || !CONTRIBUTION_ID_PATTERN.test(contributionId)) {
-      throw new Error("Choose a valid contribution.");
-    }
-    return fetchJson(
-      this.fetchImpl,
-      `${CENTRAL_ROOT}/me/contributions/delete`,
-      this.mutationOptions({
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contributionId })
-      })
-    ).then((payload) => normalizeContributionDeletionReceipt(payload, contributionId));
-  }
-
-  async personalStats() {
-    try {
-      return await fetchJson(
-        this.fetchImpl,
-        `${CENTRAL_ROOT}/me/stats`,
-        this.sessionOptions()
-      );
-    } catch (error) {
-      if (error.status !== 404) throw error;
-      return fetchJson(
-        this.fetchImpl,
-        `${CENTRAL_ROOT}/me/insights`,
-        this.sessionOptions()
-      );
-    }
-  }
-
-  participantProfile() {
-    return fetchJson(
-      this.fetchImpl,
-      `${CENTRAL_ROOT}/me`,
-      this.sessionOptions()
-    );
-  }
-
-  async communityStats() {
-    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/stats/aggregate`);
-  }
-
-  participantExport() {
-    return fetchJson(
-      this.fetchImpl,
-      `${CENTRAL_ROOT}/me/export`,
-      this.sessionOptions()
-    );
-  }
-
   async deleteParticipant() {
     const payload = await fetchJson(
       this.fetchImpl,
@@ -6452,29 +5981,6 @@ export class CommunityClient {
     }));
   }
 
-  devices() {
-    return fetchJson(
-      this.fetchImpl,
-      `${CENTRAL_ROOT}/me/devices`,
-      this.sessionOptions()
-    );
-  }
-
-  revokeDevice(deviceId) {
-    if (typeof deviceId !== "string" || !/^[0-9a-f-]{36}$/u.test(deviceId)) {
-      throw new Error("Choose a valid paired device.");
-    }
-    return fetchJson(
-      this.fetchImpl,
-      `${CENTRAL_ROOT}/me/devices/revoke`,
-      this.mutationOptions({
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ deviceId })
-      })
-    );
-  }
-
   logout() {
     return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/logout`, this.mutationOptions({
       method: "POST",
@@ -6483,13 +5989,6 @@ export class CommunityClient {
     }));
   }
 
-  securityReset() {
-    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/security-reset`, this.mutationOptions({
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: "{}"
-    }));
-  }
 }
 
 export function demoDashboard({ now = new Date().toISOString() } = {}) {
@@ -6873,13 +6372,6 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
         { priority: "P0", title: "Integer quota display", evidence: "Quota observations are rounded to whole percentage points." },
         { priority: "P1", title: "Shared agentic surfaces", evidence: "Work, Workspace Agents, and Voice task work may draw from the same pool." },
         { priority: "P1", title: "Fast-mode attribution", evidence: "Historical records do not always identify the subscription speed tier." }
-      ]
-    },
-    reports: {
-      reports: [
-        { id: "gradient", title: "Full gradient report", href: "/reports/simple-quota-gradient", status: "demo" },
-        { id: "weekly", title: "Weekly calibration report", href: "/reports/weekly-calibration", status: "demo" },
-        { id: "quality", title: "Monitoring quality report", href: "/reports/monitoring-quality", status: "demo" }
       ]
     }
   });
