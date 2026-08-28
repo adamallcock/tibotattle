@@ -1194,6 +1194,62 @@
     {
       "classification": "build_release_operation",
       "owner": "electron_packaging",
+      "canonicalPath": "scripts/build-electron-linux-container.mjs",
+      "stableAlias": "container:electron-linux:build",
+      "stableAliasReason": null,
+      "additionalAliases": [
+        "container:electron-linux:build:amd64"
+      ],
+      "callers": [
+        ".github/workflows/linux-portability.yml",
+        "package.json#scripts.container:electron-linux:build",
+        "package.json#scripts.container:electron-linux:build:amd64",
+        "test/linux-portability-workflow.test.js"
+      ],
+      "decision": "retain_as_development_qualification_entrypoint",
+      "provenance": "docs/plans/2026-08-27-linux-parallel-foundation-plan.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "platform_security",
+      "canonicalPath": "scripts/qualify-linux-secret-service.mjs",
+      "stableAlias": "test:linux:credentials",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/linux-portability.yml",
+        "package.json#scripts.test:linux:credentials",
+        "scripts/run-linux-secret-service-qualification.mjs",
+        "test/linux-secret-service-qualification.test.js"
+      ],
+      "decision": "retain_as_development_qualification_entrypoint",
+      "provenance": "docs/plans/2026-08-27-linux-parallel-foundation-plan.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "platform_security",
+      "canonicalPath": "scripts/run-linux-secret-service-qualification.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The supervisor is the fixed in-container entry point behind the AMD64 credential command, not a host-side Node alias.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/linux-portability.yml",
+        "containers/electron-linux-amd64/Dockerfile",
+        "package.json#scripts.container:electron-linux:test:credentials:amd64",
+        "test/linux-secret-service-supervisor.test.js"
+      ],
+      "decision": "retain_as_development_qualification_entrypoint",
+      "provenance": "docs/plans/2026-08-27-linux-parallel-foundation-plan.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
       "canonicalPath": "scripts/smoke-electron-linux.mjs",
       "stableAlias": "smoke:electron:linux",
       "stableAliasReason": null,

@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1.7
 
-# This exact arm64 child digest from the reviewed Node 26.2.0 Bookworm OCI
-# index is the Apple-Silicon/Colima development lane. Native x86_64 evidence
-# requires its own reviewed image pin; local QEMU execution is not evidence.
-# Debian package indexes and the exact-version npm/Electron downloads below
-# remain mutable online build inputs. This is a bounded development smoke
-# environment, not a reproducible production artifact.
-FROM node:26.2.0-bookworm-slim@sha256:445b8cda0ec3563106c5a62b4663b3831314ecc81d2645a774b308f203f25cf0
+# This exact amd64 child digest was selected from the reviewed Node 26.2.0
+# Bookworm-slim OCI index on 2026-08-27. This lane must run natively on a
+# GitHub-hosted x86_64 Linux runner; QEMU or cross-architecture execution is
+# not qualification evidence. Debian indexes and the exact-version
+# npm/Electron downloads below remain mutable online build inputs, so this is
+# a bounded development smoke rather than a reproducible release artifact.
+FROM node:26.2.0-bookworm-slim@sha256:ba2f9edd0785ee291c1a5287764cb41fdb7922336f878993f9d58622613e67a8
 
 ARG TIBOTATTLE_QUALIFICATION_REVISION
 LABEL org.opencontainers.image.revision="${TIBOTATTLE_QUALIFICATION_REVISION}"
@@ -28,7 +28,9 @@ WORKDIR /workspace
 RUN apt-get update \
   && apt-get install --yes --no-install-recommends \
     ca-certificates \
+    dbus-daemon \
     fonts-liberation \
+    gnome-keyring \
     libasound2 \
     libatk-bridge2.0-0 \
     libatk1.0-0 \
@@ -42,6 +44,7 @@ RUN apt-get update \
     libgtk-3-0 \
     libnss3 \
     libpango-1.0-0 \
+    libsecret-1-0 \
     libx11-xcb1 \
     libxcb-dri3-0 \
     libxcomposite1 \
@@ -62,25 +65,33 @@ RUN apt-get update \
 # Copy lock/manifests first so the dependency layer is cacheable. The paired
 # Dockerfile.dockerignore excludes the checkout's .git, node_modules, release
 # output, reports, and unrelated applications from the build context.
-COPY --chown=node:node package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-COPY --chown=node:node packages ./packages
-COPY --chown=node:node patches ./patches
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY packages ./packages
+COPY patches ./patches
 RUN pnpm install --frozen-lockfile
 # `allowBuilds` intentionally blocks Electron's package install hook in the
 # repository. Fetch the exact locked Linux Electron artifact during the image
 # build instead; the test phase then has no package-manager or network work.
 RUN node node_modules/electron/install.js
 
-COPY --chown=node:node apps/electron ./apps/electron
-COPY --chown=node:node apps/local ./apps/local
-COPY --chown=node:node apps/web/public ./apps/web/public
-COPY --chown=node:node config ./config
-COPY --chown=node:node contracts ./contracts
-COPY --chown=node:node generated ./generated
-COPY --chown=node:node schemas ./schemas
-COPY --chown=node:node src ./src
-COPY --chown=node:node scripts/smoke-electron-linux.mjs ./scripts/smoke-electron-linux.mjs
-RUN chown -R node:node /workspace \
+COPY apps/electron ./apps/electron
+COPY apps/local ./apps/local
+COPY apps/web/public ./apps/web/public
+COPY config ./config
+COPY contracts ./contracts
+COPY generated ./generated
+COPY schemas ./schemas
+COPY src ./src
+COPY scripts/smoke-electron-linux.mjs ./scripts/smoke-electron-linux.mjs
+COPY scripts/qualify-linux-secret-service.mjs ./scripts/qualify-linux-secret-service.mjs
+COPY scripts/run-linux-secret-service-qualification.mjs ./scripts/run-linux-secret-service-qualification.mjs
+# Docker build steps and unqualified COPY directives run as root, so the
+# reviewed keytar closure is root-owned without an expensive recursive
+# metadata rewrite over the pnpm store.
+RUN install --directory --owner=root --group=root --mode=0755 /usr/local/share/tibotattle \
+  && printf 'tibotattle-linux-secret-service-qualification-v1\n' > /usr/local/share/tibotattle/linux-secret-service-qualification-v1 \
+  && chown root:root /usr/local/share/tibotattle/linux-secret-service-qualification-v1 \
+  && chmod 0444 /usr/local/share/tibotattle/linux-secret-service-qualification-v1 \
   && chown root:root /workspace/node_modules/electron/dist/chrome-sandbox \
   && chmod 4755 /workspace/node_modules/electron/dist/chrome-sandbox
 
