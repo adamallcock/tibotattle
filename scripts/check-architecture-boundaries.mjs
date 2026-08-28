@@ -12,6 +12,10 @@ import {
 } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  ARCHITECTURE_APPLICATIONS,
+  ARCHITECTURE_APPLICATION_ROOTS,
+} from "./lib/application-layout-policy.mjs";
 import { extractEsmImports } from "./lib/esm-imports.mjs";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
@@ -120,22 +124,16 @@ const SOURCE_OWNER_ALLOWED_PACKAGES = new Map([
     "quota-analysis",
   ])],
 ]);
-const APP_ALLOWED_PACKAGES = new Map([
-  ["cloud-run", new Set(["telemetry-contract"])],
-  ["local", new Set([
-    "accounting",
-    "quota-analysis",
-    "telemetry-contract",
-  ])],
-  ["local-review", new Set()],
-  ["macos", new Set()],
-  ["web", new Set()],
-  ["worker", new Set([
-    "accounting",
-    "quota-analysis",
-    "telemetry-contract",
-  ])],
-]);
+const APP_ALLOWED_PACKAGES = new Map(
+  ARCHITECTURE_APPLICATIONS.map(({ allowedPackages, name }) => [
+    name,
+    new Set(allowedPackages),
+  ]),
+);
+const APPLICATIONS_BY_ROOT = Object.freeze(
+  [...ARCHITECTURE_APPLICATIONS]
+    .sort((left, right) => right.root.length - left.root.length),
+);
 const NON_BASELINABLE_ARCHITECTURE_CATEGORIES = new Set([
   "contribution_owner_public_entrypoint",
   "production_import_cycle",
@@ -362,18 +360,20 @@ function sourceLocation(relativePath) {
       topLevel: "shared",
     };
   }
+  const application = APPLICATIONS_BY_ROOT.find(({ root }) =>
+    relativePath === root || relativePath.startsWith(`${root}/`));
+  if (application) {
+    return {
+      appName: application.name,
+      kind: "app",
+      topLevel: application.root.split("/")[0],
+    };
+  }
   if (segments[0] === "apps" && segments.length >= 2) {
     return {
       appName: segments[1],
       kind: "app",
       topLevel: "apps",
-    };
-  }
-  if (segments[0] === "local-review") {
-    return {
-      appName: "local-review",
-      kind: "app",
-      topLevel: "local-review",
     };
   }
   if (segments[0] === "scripts" || segments[0] === "tools") {
@@ -625,13 +625,15 @@ async function collectProductionSourceFiles(rootDirectory) {
     }
   }
 
-  for (const rootName of [
+  const productionRoots = new Set([
     "apps",
-    "local-review",
     "packages",
     "shared",
     "src",
-  ]) {
+    ...ARCHITECTURE_APPLICATION_ROOTS.filter((root) =>
+      root !== "apps" && !root.startsWith("apps/")),
+  ]);
+  for (const rootName of productionRoots) {
     await visit(join(rootDirectory, rootName));
   }
   return files.sort();
