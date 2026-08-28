@@ -319,14 +319,48 @@ async function upload(
 ): Promise<Response> {
   const envelope = await encrypt(value);
   const raw = JSON.stringify(envelope);
+  const pairingResponse = await api("/api/v1/me/device-pairings", {
+    method: "POST",
+    headers: {
+      cookie: participant.cookie,
+      "content-type": "application/json",
+      "x-usage-monitor-csrf": participant.csrfToken,
+    },
+    body: JSON.stringify({
+      consentVersion: "ongoing-privacy-safe-telemetry-v0.2",
+      ongoingUpload: true,
+    }),
+  });
+  expect(pairingResponse.status).toBe(201);
+  const pairing = await pairingResponse.json<{ pairingCode: string }>();
+  const deviceId = crypto.randomUUID();
+  const rawSecret = crypto.getRandomValues(new Uint8Array(32));
+  const deviceSecret = encodeBase64Url(rawSecret);
+  const prefix = new TextEncoder().encode(
+    `app-usagemonitor/device/v1\0${deviceId}\0`,
+  );
+  const secretInput = new Uint8Array(prefix.byteLength + rawSecret.byteLength);
+  secretInput.set(prefix);
+  secretInput.set(rawSecret, prefix.byteLength);
+  const deviceSecretHash = await sha256Hex(secretInput);
+  secretInput.fill(0);
+  rawSecret.fill(0);
+  const claimed = await api("/api/v1/device-pairings/claim", {
+    method: "POST",
+    headers: {
+      authorization: `Pairing ${pairing.pairingCode}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ deviceId, deviceSecretHash }),
+  });
+  expect(claimed.status).toBe(201);
   const authorizationResponse = await api(
-    "/api/v1/me/upload-authorizations",
+    "/api/v1/device/upload-authorizations",
     {
       method: "POST",
       headers: {
-        cookie: participant.cookie,
+        authorization: `Device um_device_${deviceId}.${deviceSecret}`,
         "content-type": "application/json",
-        "x-usage-monitor-csrf": participant.csrfToken,
       },
       body: JSON.stringify({
         envelopeDigest: await sha256Hex(raw),

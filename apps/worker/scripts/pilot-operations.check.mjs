@@ -421,7 +421,7 @@ function fakeRemote({
       },
       capabilities: {
         encryptedUpload: active,
-        delayedAggregateStats: false,
+        communityDaily: false,
         ongoingDeviceUploadRegistration: active,
       },
     };
@@ -1303,7 +1303,7 @@ test("inspection rejects D1 and live-runtime control disagreement", async () => 
         },
         capabilities: {
           encryptedUpload: false,
-          delayedAggregateStats: false,
+          communityDaily: false,
           ongoingDeviceUploadRegistration: false,
         },
       });

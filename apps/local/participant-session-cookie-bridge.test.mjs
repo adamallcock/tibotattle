@@ -91,32 +91,25 @@ test("a malformed jar cookie is never forwarded when nothing is captured", () =>
   assert.equal(bridge.cookieForRequest(42), null);
 });
 
-test("only the proof, recovery, and Upload routes are exempt from the captured session", () => {
-  // The device-pairing mint and the rest of the session-authenticated family
-  // take the captured session.
+test("only retained one-use identity-proof routes are exempt from the captured session", () => {
+  // The device-pairing mint and the other retained session-authenticated
+  // routes take the captured session.
   for (const path of [
     "/api/v1/session",
     "/api/v1/logout",
     "/api/v1/me",
-    "/api/v1/me/stats",
     "/api/v1/me/device-pairings",
-    "/api/v1/me/upload-authorizations",
-    "/api/v1/me/devices/revoke",
-    "/api/v1/me/contributions/delete",
   ]) {
     assert.equal(participantRelayPathUsesSessionCookie(path), true, path);
   }
-  // The routes that authenticate with a proof, a recovery code, or a one-use
-  // Upload authorization keep exactly the jar's own cookie — the Upload channel
-  // must never carry the session secret.
+  // The retained routes that authenticate with a one-use identity proof keep
+  // exactly the jar's own cookie.
   for (const path of [
     "/api/v1/enroll",
     "/api/v1/identity/google/start",
     "/api/v1/identity/google/result",
     "/api/v1/identity/apple/start",
     "/api/v1/identity/apple/result",
-    "/api/v1/recover",
-    "/api/v1/contributions",
   ]) {
     assert.equal(participantRelayPathUsesSessionCookie(path), false, path);
   }

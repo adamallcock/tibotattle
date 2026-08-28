@@ -8,7 +8,8 @@ import * as application from "../src/application/index.js";
 import * as applicationOwner from "../src/application/local-export-set-materialization.js";
 import * as exported from "../src/export/index.js";
 import * as owner from "../src/export/set-materialization.js";
-import * as legacy from "../src/export-set-materializer.js";
+import { localExportSetMaterialization } from
+  "../src/local-node-runtime.js";
 import {
   createSupplementalSourcePlan,
   createExportSetMaterializationContract,
@@ -271,9 +272,11 @@ const MATERIALIZE_OPTIONS = Object.freeze({
   secret: "secret",
 });
 
-test("materializer flat shim has exactly seven bindings and preserves owner identity", () => {
-  assert.deepEqual(Object.keys(legacy).sort(), [...FLAT].sort());
-  for (const name of FLAT.slice(0, -1)) assert.equal(legacy[name], exported[name], name);
+test("materializer runtime exposes one operation and pure bindings stay export-owned", () => {
+  assert.deepEqual(Object.keys(localExportSetMaterialization), ["materializeLocalExportSet"]);
+  for (const name of FLAT.slice(0, -1)) {
+    assert.equal(Object.hasOwn(exported, name), true, name);
+  }
   assert.equal(application.createLocalExportSetMaterialization, applicationOwner.createLocalExportSetMaterialization);
   assert.equal(exported.createExportSetMaterializationContract, owner.createExportSetMaterializationContract);
 });
@@ -311,7 +314,7 @@ test("materialization contracts reject hostile configuration and preserve missin
   }), /configuration/u);
   assert.throws(() => summarizeExportSourcePlan(new Proxy({}, { get() { touched += 1; throw new Error("trap"); } })), /source_changed/u);
   assert.throws(() => createSupplementalSourcePlan(new Proxy({}, { get() { touched += 1; throw new Error("trap"); } })), /schema/u);
-  await assert.rejects(legacy.materializeLocalExportSet(), /Export workspace directory is required/u);
+  await assert.rejects(localExportSetMaterialization.materializeLocalExportSet(), /Export workspace directory is required/u);
   assert.equal(touched, 0);
 });
 

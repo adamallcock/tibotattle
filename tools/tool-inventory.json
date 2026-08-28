@@ -349,6 +349,7 @@
       "callers": [
         "package.json#scripts.tools:root-workspace:check",
         "package.json#scripts.test:preflight",
+        "test/agent-guidance.test.js",
         "test/root-workspace-hygiene.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
@@ -513,6 +514,22 @@
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
       "provenanceReason": "Preview installer is a test-covered macOS release operation with operator guidance but no separate dated provenance artifact.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "repository_architecture",
+      "canonicalPath": "scripts/lib/application-layout-policy.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Shared application-layout policy is imported by repository gates and is not a command entry point.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/check-architecture-boundaries.mjs",
+        "test/agent-guidance.test.js"
+      ],
+      "decision": "retain_as_internal_tooling_support",
+      "provenance": null,
+      "provenanceReason": "Internal repository-layout policy has no standalone output artifact.",
       "legacyPaths": []
     },
     {

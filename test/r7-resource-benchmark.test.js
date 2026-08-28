@@ -51,6 +51,7 @@ test("R7 smoke provenance binds shared and package runtime sources", async () =>
   ]) {
     assert.equal(paths.includes(expected), true, expected);
   }
+  assert.equal(paths.some((path) => path.endsWith("/AGENTS.md")), false);
 });
 
 const EXPECTED_OPERATIONS = [

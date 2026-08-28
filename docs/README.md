@@ -27,6 +27,7 @@ signing, artifacts, an appcast, or updater infrastructure is operational.
 | [`runbooks/2026-08-04-open-enrollment-controlled-release.md`](./runbooks/2026-08-04-open-enrollment-controlled-release.md) | Account-gated contribution release path; external authorization remains an owner action |
 | [`runbooks/2026-08-13-community-allowance-band-diagnosis.md`](./runbooks/2026-08-13-community-allowance-band-diagnosis.md) | Diagnose a missing or stale public allowance band through fit-cache and aggregate state; production writes remain owner-run |
 | [`runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md`](./runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md) | When retained R7 receipts go stale (any workload-source change) and the exact dual-runtime regeneration procedure, including the fresh-checkout 0600 guard |
+| [`runbooks/2026-08-27-hosted-api-retirement-data-gates.md`](./runbooks/2026-08-27-hosted-api-retirement-data-gates.md) | Owner-run read-only D1 checks that must precede any future removal of historical recovery, session-upload, contribution, or statistics schema after source-route retirement |
 | [`decisions/2026-08-15-homebrew-distribution-and-macos-support.md`](./decisions/2026-08-15-homebrew-distribution-and-macos-support.md) | First-party Homebrew tap, update automation, uninstall boundary, and supported macOS floor |
 | [`goals/2026-08-17-four-day-windows-readiness-goal.md`](./goals/2026-08-17-four-day-windows-readiness-goal.md) | Bounded portable-core qualification for issue #3; explicitly not Windows support |
 | [`runbooks/2026-08-17-windows-portability-environments.md`](./runbooks/2026-08-17-windows-portability-environments.md) | Restore macOS, network-isolated Linux, native Windows x64, and optional UTM development lanes |
@@ -42,6 +43,13 @@ rather than current operational authority. Treat receipts, audits, reports,
 and QA artifacts as point-in-time evidence; dated plans and decisions preserve
 historical intent unless explicitly linked above. Read each document's status
 and date before relying on it for a fresh state claim.
+
+## Maintained architecture reference
+
+| Path | Use |
+|---|---|
+| [`reference/2026-08-26-api-surface-reference.md`](./reference/2026-08-26-api-surface-reference.md) | Canonical diagrams and complete source-backed inventory of loopback, hosted, relay, native, process, binding, package, schema, and external-service APIs; implemented source is kept distinct from deployment or release proof |
+| [`reviews/2026-08-26-api-lifecycle-review.md`](./reviews/2026-08-26-api-lifecycle-review.md) | Evidence and implementation record for the seven completed source-level API retirement/consolidation actions, including explicit installed-release and hosted-data gates |
 
 ## Records and supporting material
 
@@ -59,7 +67,7 @@ and date before relying on it for a fresh state claim.
 | [`research/`](./research/) | Source notes and supporting research artifacts |
 | [`qa/`](./qa/) | Browser and native visual QA receipts and screenshots |
 | [`design/`](./design/) | Product and visual design briefs |
-| [`reference/`](./reference/) | Historical product and implementation references, including the relocated full product reference |
+| [`reference/`](./reference/) | Maintained API surface reference plus historical product and implementation references, including the relocated full product reference |
 | [`runbooks/`](./runbooks/) | Operator runbooks and handoff notes; use the current entry points above |
 
 The repository root [`README.md`](../README.md) remains the primary product and developer entry point.

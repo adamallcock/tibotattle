@@ -600,6 +600,13 @@ locked or access is unavailable, preparation fails closed and the dashboard
 asks the user to unlock or allow access. It never silently replaces the
 identity or falls back to a new plaintext credential.
 
+If the signed app finds only the preserved legacy generation and its one
+interactive migration read is declined, preparation returns the distinct
+content-free `identity_migration_required` code. The dashboard tells the user
+to quit and reopen TiboTattle before choosing **Check again** and allowing the
+migration. Restart is the only retry boundary; reset, deletion, and rotation
+are not recovery for this condition.
+
 If macOS reports the login Keychain as locked or denies access, the safe first
 step is to open Keychain Access, unlock the `login` Keychain, and retry. Do not
 reset the Keychain, delete the item, or rotate the identity merely to clear an
@@ -1017,7 +1024,7 @@ and the [Worker runbook](../../apps/worker/README.md). The earlier
 [synthetic vertical-slice plan](../plans/2026-07-25-synthetic-consumer-vertical-slice-plan.md)
 is retained only as a superseded historical record.
 
-The [G1 resource-bounded export-set plan](../plans/2026-07-24-g1-resource-bounded-export-set-plan.md) defines the local milestone; the [measured R7 verification](../receipts/2026-07-25-g1-r7-measured-release-verification-receipt.md) records the completed dual-runtime evidence package, while the [R7 ceiling decision](../decisions/2026-07-25-g1-r7-release-ceiling-decision.md) explains why policy promotion remains open. The [compressed export-set receipt](../receipts/2026-07-24-g1-compressed-export-set-verification-receipt.md) and [local deletion receipt](../receipts/2026-07-24-g1-local-export-deletion-verification-receipt.md) record the verified representation and lifecycle boundaries; and the earlier [disk-backed](../receipts/2026-07-24-g1-disk-backed-export-set-receipt.md) and [resource/identity](../receipts/2026-07-24-g1-resource-identity-protection-receipt.md) receipts preserve prior checkpoints. The [complete end-to-end goal](../goals/2026-07-24-end-to-end-multi-user-usage-monitor-goal.md) defines the critical path and production finish criteria; the [multi-user privacy expansion plan](../plans/2026-07-24-multi-user-privacy-expansion-plan.md) contains the supporting architecture.
+The [G1 resource-bounded export-set plan](../plans/2026-07-24-g1-resource-bounded-export-set-plan.md) defines the local milestone; the [measured R7 verification](../receipts/2026-07-25-g1-r7-measured-release-verification-receipt.md) records the completed dual-runtime evidence package, while the [R7 ceiling decision](../decisions/2026-07-25-g1-r7-release-ceiling-decision.md) explains why policy promotion remains open. The [compressed export-set receipt](../receipts/2026-07-24-g1-compressed-export-set-verification-receipt.md) and [local deletion receipt](../receipts/2026-07-24-g1-local-export-deletion-verification-receipt.md) record the verified representation and lifecycle boundaries; and the earlier [disk-backed](../receipts/2026-07-24-g1-disk-backed-export-set-receipt.md) and [resource/identity](../receipts/2026-07-24-g1-resource-identity-protection-receipt.md) receipts preserve prior checkpoints. The [complete end-to-end goal](../goals/2026-07-24-end-to-end-multi-user-usage-monitor-goal.md) defines the critical path and production finish criteria; the [multi-user privacy expansion plan](../plans/2026-07-24-multi-user-privacy-expansion-plan.md) is retained as superseded historical research whose privacy constraints remain applicable.
 
 ## Account switching and local secret handling
 
@@ -1036,7 +1043,7 @@ node ./src/cli.js register-account --alias account-secondary --default-plan pro-
 node ./src/cli.js collect-once --stale-after-ms 0
 ```
 
-This creates a different stable pseudonymous scope for future observations. The collector provisionally assigns the scope only to new rollout receipts within five minutes of a fresh account marker; it does not backfill identity across older rollouts. Historical account attribution therefore remains unavailable rather than silently assigning all old data to whichever account is currently signed in. If Keychain is actively locked, `doctor` reports `credential_locked`; if the credential backend is denied, malformed, or otherwise unavailable, it reports `credential_unavailable`. Collection still records the quota snapshot safely as unattributed and increments the matching content-free diagnostic; it never invents an account scope or falls back to a process environment secret. `register-account` fails safely until the credential is available.
+This creates a different stable pseudonymous scope for future observations. The collector provisionally assigns the scope only to new rollout receipts within five minutes of a fresh account marker; it does not backfill identity across older rollouts. Historical account attribution therefore remains unavailable rather than silently assigning all old data to whichever account is currently signed in. If Keychain is actively locked, `doctor` reports `credential_locked`; if a preserved legacy credential needs an app-owned migration, it reports `credential_migration_required` and the operator must quit and reopen TiboTattle before retrying the initiating action; if the credential backend is denied, malformed, or otherwise unavailable, it reports `credential_unavailable`. Collection still records the quota snapshot safely as unattributed and increments the matching content-free diagnostic; it never invents an account scope or falls back to a process environment secret. `register-account` fails safely until the credential is available.
 
 Snapshot reports, interval inference, and weekly reset history include pseudonymous account scope and specific plan variant in their grouping keys. Known accounts and plan eras therefore cannot be pooled. Raw historical transition rows explicitly remain `unattributed` / `unknown`; prospective collector crosschecks accept only records matching the current pseudonymous scope and label their partial-marker time coverage.
 

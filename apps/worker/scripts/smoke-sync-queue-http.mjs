@@ -18,10 +18,8 @@ import {
 import {
   removeContributionDeviceCapability,
 } from "../../../src/contribution-device-capability.js";
-import {
-  inspectContributionSyncQueue,
-  runContributionSyncQueueOnce,
-} from "../../../src/contribution-sync-queue.js";
+import { localContributionSyncQueue } from
+  "../../../src/local-node-runtime.js";
 import {
   PREPARED_CONTRIBUTION_SET_VERSION,
   publishPreparedContributionFile,
@@ -34,6 +32,11 @@ import { stableJson } from "../../../src/storage.js";
 import {
   validateTelemetryContribution,
 } from "../../web/public/lib.js";
+
+const {
+  inspectContributionSyncQueue,
+  runContributionSyncQueueOnce,
+} = localContributionSyncQueue;
 
 function optionValue(name, fallback = null) {
   const index = process.argv.indexOf(name);
@@ -335,13 +338,17 @@ try {
   if (restarted.processed !== 0 || restarted.queue.counts.accepted !== 1) {
     throw new Error("A restarted queue replayed an accepted job.");
   }
-  const privateStats = expect(
-    await request("/api/v1/me/stats"),
+  const participantExport = expect(
+    await request("/api/v1/me/export"),
     200,
-    "Private statistics",
+    "Participant export",
   );
-  if (privateStats?.totals?.usageEvents !== parsed.usageEvents.length) {
-    throw new Error("Private statistics did not reflect the queued contribution.");
+  if (participantExport?.contributions?.length !== 1
+      || participantExport.contributions[0]?.records?.length
+        !== parsed.usageEvents.length
+          + parsed.quotaSnapshots.length
+          + parsed.activityMarkers.length) {
+    throw new Error("Participant export did not reflect the queued contribution.");
   }
 
   const devices = expect(

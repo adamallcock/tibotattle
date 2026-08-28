@@ -9,10 +9,13 @@ import { join } from "node:path";
 
 import {
   CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_FD_ENV,
+  CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_PROTOCOL_VERSION,
+  MACOS_KEYCHAIN_BROKER_CAPABILITY_NAMES,
   ContributionDeviceKeychainBrokerError,
   contributionDeviceKeychainBrokerConfiguration,
   createContributionDeviceKeychainBrokerBinding,
   createContributionDeviceKeychainBrokerTransport,
+  createMacOSKeychainBrokerBinding,
 } from "../src/contribution-device-keychain-broker.js";
 import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
@@ -33,6 +36,8 @@ import { startLocalCompanionServer } from "../apps/local/server.js";
 
 const LEGACY_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice;
 const APP_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp;
+const WIRE_DEVICE_CAPABILITY =
+  MACOS_KEYCHAIN_BROKER_CAPABILITY_NAMES.contributionDevice;
 const ORIGIN = "https://usage.example";
 const DEVICE_ID = "11111111-1111-4111-8111-111111111111";
 
@@ -219,13 +224,31 @@ test("transport frames requests in order and settles strictly matching responses
       return channel;
     },
   });
-  const first = transport.request({ op: "get" });
-  const second = transport.request({ op: "set", secret: encodedSecret(0x41) });
+  const first = transport.request({
+    op: "get",
+    capability: WIRE_DEVICE_CAPABILITY,
+  });
+  const second = transport.request({
+    op: "set",
+    capability: WIRE_DEVICE_CAPABILITY,
+    secret: encodedSecret(0x41),
+  });
   assert.deepEqual(
     channel.written.map((frame) => JSON.parse(frame)),
     [
-      { v: 1, id: 1, op: "get" },
-      { v: 1, id: 2, op: "set", secret: encodedSecret(0x41) },
+      {
+        v: CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_PROTOCOL_VERSION,
+        id: 1,
+        op: "get",
+        capability: WIRE_DEVICE_CAPABILITY,
+      },
+      {
+        v: CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_PROTOCOL_VERSION,
+        id: 2,
+        op: "set",
+        capability: WIRE_DEVICE_CAPABILITY,
+        secret: encodedSecret(0x41),
+      },
     ],
   );
   for (const frame of channel.written) {
@@ -251,6 +274,7 @@ test("transport rejects malformed operations before anything reaches the wire", 
     { op: "set" },
     { op: "set", secret: "short" },
     { op: "get", secret: encodedSecret(0x41) },
+    { op: "get", capability: "arbitrary_item" },
   ]) {
     await assert.rejects(
       transport.request(operation),
@@ -266,11 +290,14 @@ test("transport failures are coded and permanent: mismatch, oversize, error, tim
     fd: 3,
     connect: () => mismatch,
   });
-  const pendingMismatch = mismatched.request({ op: "get" });
+  const pendingMismatch = mismatched.request({
+    op: "get",
+    capability: WIRE_DEVICE_CAPABILITY,
+  });
   mismatch.respond({ id: 99, ok: true, secret: null });
   await assert.rejects(pendingMismatch, assertBrokerError("broker_protocol"));
   await assert.rejects(
-    mismatched.request({ op: "get" }),
+    mismatched.request({ op: "get", capability: WIRE_DEVICE_CAPABILITY }),
     assertBrokerError("broker_protocol"),
   );
   assert.equal(mismatch.destroyed, true);
@@ -280,7 +307,10 @@ test("transport failures are coded and permanent: mismatch, oversize, error, tim
     fd: 3,
     connect: () => oversize,
   });
-  const pendingOversize = oversized.request({ op: "get" });
+  const pendingOversize = oversized.request({
+    op: "get",
+    capability: WIRE_DEVICE_CAPABILITY,
+  });
   oversize.emit("data", "A".repeat(5_000));
   await assert.rejects(pendingOversize, assertBrokerError("broker_protocol"));
 
@@ -289,7 +319,10 @@ test("transport failures are coded and permanent: mismatch, oversize, error, tim
     fd: 3,
     connect: () => erroring,
   });
-  const pendingError = errored.request({ op: "get" });
+  const pendingError = errored.request({
+    op: "get",
+    capability: WIRE_DEVICE_CAPABILITY,
+  });
   erroring.emit("error", new Error("must not escape"));
   await assert.rejects(pendingError, assertBrokerError("broker_unavailable"));
 
@@ -300,11 +333,11 @@ test("transport failures are coded and permanent: mismatch, oversize, error, tim
     timeoutMs: 20,
   });
   await assert.rejects(
-    timingOut.request({ op: "get" }),
+    timingOut.request({ op: "get", capability: WIRE_DEVICE_CAPABILITY }),
     assertBrokerError("broker_timeout"),
   );
   await assert.rejects(
-    timingOut.request({ op: "get" }),
+    timingOut.request({ op: "get", capability: WIRE_DEVICE_CAPABILITY }),
     assertBrokerError("broker_timeout"),
   );
 
@@ -312,7 +345,7 @@ test("transport failures are coded and permanent: mismatch, oversize, error, tim
     fd: null,
   });
   await assert.rejects(
-    unannounced.request({ op: "get" }),
+    unannounced.request({ op: "get", capability: WIRE_DEVICE_CAPABILITY }),
     assertBrokerError("broker_unavailable"),
   );
 });
@@ -321,6 +354,7 @@ test("wire rejections keep the locked and denied identities and collapse the res
   for (const [wireCode, errorCode] of [
     ["locked", "KEYCHAIN_LOCKED"],
     ["denied", "KEYCHAIN_DENIED"],
+    ["migration_required", "KEYCHAIN_MIGRATION_REQUIRED"],
     ["operation_failed", "broker_rejected"],
     ["invalid_request", "broker_rejected"],
   ]) {
@@ -329,7 +363,10 @@ test("wire rejections keep the locked and denied identities and collapse the res
       fd: 3,
       connect: () => channel,
     });
-    const pending = transport.request({ op: "get" });
+    const pending = transport.request({
+      op: "get",
+      capability: WIRE_DEVICE_CAPABILITY,
+    });
     channel.respond({ id: 1, ok: false, code: wireCode });
     await assert.rejects(pending, assertBrokerError(errorCode));
   }
@@ -385,6 +422,93 @@ test("binding fails closed on a malformed stored value from the app", async () =
     binding.getPassword(APP_CAPABILITY.service, APP_CAPABILITY.account),
     assertBrokerError("broker_protocol"),
   );
+});
+
+test("the general broker binding exposes exactly four logical capabilities and no Keychain attributes", async () => {
+  const stored = new Map();
+  const requests = [];
+  const transport = {
+    async request(operation) {
+      requests.push({ ...operation });
+      if (operation.op === "get") {
+        return { ok: true, secret: stored.get(operation.capability) ?? null };
+      }
+      if (operation.op === "set") {
+        stored.set(operation.capability, operation.secret);
+        return { ok: true };
+      }
+      stored.delete(operation.capability);
+      return { ok: true };
+    },
+  };
+  const binding = createMacOSKeychainBrokerBinding({ transport });
+  const capabilities = [
+    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity,
+    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation,
+    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.claudeSessionPseudonym,
+    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice,
+  ];
+  for (const [index, capability] of capabilities.entries()) {
+    const secret = encodedSecret(0x51 + index);
+    assert.equal(
+      await binding.getPassword(capability.service, capability.account),
+      null,
+    );
+    await binding.setPassword(capability.service, capability.account, secret);
+    assert.equal(
+      await binding.getPassword(capability.service, capability.account),
+      secret,
+    );
+  }
+  await assert.rejects(
+    binding.getPassword("arbitrary.service", "installation"),
+    assertBrokerError("invalid_configuration"),
+  );
+  assert.deepEqual(
+    new Set(requests.map(({ capability }) => capability)),
+    new Set(Object.values(MACOS_KEYCHAIN_BROKER_CAPABILITY_NAMES)),
+  );
+  for (const request of requests) {
+    assert.equal("service" in request || "account" in request, false);
+  }
+});
+
+test("the packaged backend selects an announced broker and never constructs keytar", async () => {
+  const stored = new Map();
+  const transport = {
+    async request(operation) {
+      if (operation.op === "get") {
+        return { ok: true, secret: stored.get(operation.capability) ?? null };
+      }
+      if (operation.op === "set") {
+        stored.set(operation.capability, operation.secret);
+        return { ok: true };
+      }
+      stored.delete(operation.capability);
+      return { ok: true };
+    },
+  };
+  const binding = createMacOSKeychainBrokerBinding({ transport });
+  let keytarLoads = 0;
+  const backend = createExportIdentityKeychainBackend({
+    loadBrokerBinding: () => binding,
+    loadBinding: () => {
+      keytarLoads += 1;
+      throw new Error("must not load");
+    },
+  });
+  for (const [index, capability] of [
+    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity,
+    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation,
+    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.claudeSessionPseudonym,
+    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice,
+  ].entries()) {
+    assert.equal(
+      await backend.createIfMissing(capability, Buffer.alloc(32, 0x61 + index)),
+      "created",
+    );
+  }
+  assert.equal(keytarLoads, 0);
 });
 
 async function temporaryStateFile() {
@@ -1203,15 +1327,15 @@ test("the Keychain guidance surface names only where a dialog is reachable", () 
     }),
     "none",
   );
-  // Brokered over a legacy item: the dialog moved to the rotation that
-  // retires it, and an unreadable probe must land on the same guidance.
+  // Brokered over a legacy item: the dialog moved to the next protected read
+  // that migrates it, and an unreadable probe must land on the same guidance.
   for (const presence of ["present", "unknown"]) {
     assert.equal(
       contributionDeviceKeychainPromptSurface({
         environment: announced,
         probeLegacyCredential: () => presence,
       }),
-      "rotation",
+      "migration",
     );
   }
   assert.equal(
@@ -1221,7 +1345,7 @@ test("the Keychain guidance surface names only where a dialog is reachable", () 
         throw new Error("probe failed");
       },
     }),
-    "rotation",
+    "migration",
   );
   // A malformed announcement is still an install with no usable broker, and
   // the detection itself never reaches the Keychain in that case.

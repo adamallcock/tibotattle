@@ -3,8 +3,13 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildLocalMetadataBundle, writeLocalMetadataBundle } from "../src/metadata-exporter.js";
+import { localMetadataExport } from "../src/local-node-runtime.js";
 import { stableJson } from "../src/storage.js";
+
+const {
+  buildLocalMetadataBundle,
+  writeLocalMetadataBundle,
+} = localMetadataExport;
 
 const SECRET = Buffer.alloc(32, 11);
 const BUNDLE_ID = `bundle:v1:${"c".repeat(64)}`;

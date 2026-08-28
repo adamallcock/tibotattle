@@ -34,7 +34,6 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
     assert.equal(verified.files.includes(CLIENT_MANIFEST_FILE), true);
     assert.equal(verified.files.some((path) => path === ".git" || path.startsWith(".git/")), false);
     assert.equal(verified.files.some((path) => path.startsWith("apps/worker/")), false);
-    assert.equal(verified.files.some((path) => path.startsWith("apps/cloud-run/")), false);
     assert.equal(verified.files.some((path) => path.startsWith("apps/web/public/admin")), false);
     assert.equal(verified.files.length, created.fileCount);
 

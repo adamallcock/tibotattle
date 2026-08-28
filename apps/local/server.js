@@ -28,10 +28,9 @@ import {
 } from "../../src/local-unified-window-breakdown.js";
 import { TELEMETRY_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
 import {
-  AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS,
-  acquireAutomaticContributionInstanceLock,
-  createAutomaticContributionController,
-} from "../../src/automatic-contribution.js";
+  acquireAutomaticContributionRetirementLock,
+  retireAutomaticContributionState,
+} from "../../src/automatic-contribution-retirement.js";
 import {
   TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
   createIncrementalContributionSyncController,
@@ -55,27 +54,13 @@ import {
   createDeferredAccountingRebuildRecorder,
   createLocalCollectorRefreshRunner,
   createTerminalRefreshFailureRecorder,
-  publicClaudeQuotaResult,
 } from "../../src/local-companion-refresh.js";
-import {
-  readOrCreateClaudeDesktopQuotaSecret,
-  refreshClaudeDesktopQuota,
-} from "../../src/claude-desktop-quota-refresh.js";
-import {
-  readClaudeDesktopQuotaProjection,
-} from "../../src/claude-desktop-quota-state.js";
 import {
   createClaudeDesktopShadowController,
 } from "../../src/claude-desktop-shadow-controller.js";
 import {
-  inspectExactNextContributionSyncUpload,
-  inspectContributionSyncQueue,
-  inspectNextContributionSyncUpload,
-  retireAcceptedContributionArtifacts,
-  retireSupersededPendingContributionArtifacts,
-  runContributionSyncQueueOnce,
-  setContributionSyncPaused,
-} from "../../src/contribution-sync-queue.js";
+  localContributionSyncQueue,
+} from "../../src/local-node-runtime.js";
 import {
   CONTRIBUTION_DEVICE_KEYCHAIN_PROMPT_SURFACES,
   contributionDeviceKeychainPromptSurface,
@@ -87,11 +72,13 @@ import {
 } from "../../src/contribution-device-capability.js";
 import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
+  createExportIdentityKeychainBackend,
   deleteExportIdentityKeychainItemByAttributes,
 } from "../../src/platform/export-identity-keychain.js";
 import {
   contributionDeviceKeychainBrokerConfiguration,
   createContributionDeviceKeychainBrokerTransport,
+  createMacOSKeychainBrokerBindingFromEnvironment,
 } from "../../src/contribution-device-keychain-broker.js";
 import {
   claimContributionDevicePairing,
@@ -124,6 +111,9 @@ import {
   selectProductionParticipantIdentity,
 } from "../../src/export-identity-production.js";
 import {
+  selectProductionAccountObservationSecret,
+} from "../../src/account-observation-production.js";
+import {
   PRODUCT_BRAND,
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../config/product-brand.js";
@@ -149,6 +139,14 @@ import {
   participantRelayPathUsesSessionCookie,
 } from "./transport/participant-session-cookie-bridge.js";
 
+const {
+  inspectExactNextContributionSyncUpload,
+  inspectContributionSyncQueue,
+  inspectNextContributionSyncUpload,
+  retireSupersededPendingContributionArtifacts,
+  setContributionSyncPaused,
+} = localContributionSyncQueue;
+
 const LOOPBACK_HOST = "127.0.0.1";
 const LOCAL_COMPANION_MODULE_FILE = fileURLToPath(import.meta.url);
 const DEFAULT_RESOURCE_ROOT = resolve(
@@ -165,14 +163,8 @@ const PARENT_WATCHDOG_EXIT_GRACE_MS = 1_000;
 const MAX_REQUEST_BODY_BYTES = 1_024;
 const MAX_STATIC_BYTES = 2 * 1024 * 1024;
 const MAX_REPORT_BYTES = 4 * 1024 * 1024;
-const LOCAL_SYNC_MAXIMUM_JOBS = 10;
-const LOCAL_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES = 16 * 1024 * 1024;
-const LOCAL_AUTOMATIC_SYNC_MAXIMUM_JOBS = 100;
-const LOCAL_AUTOMATIC_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES =
-  64 * 1024 * 1024;
 const MAX_PARTICIPANT_RELAY_REQUEST_BYTES = 2 * 1024 * 1024;
 const MAX_PARTICIPANT_RELAY_RESPONSE_BYTES = 4 * 1024 * 1024;
-const MAX_PARTICIPANT_EXPORT_RESPONSE_BYTES = 192 * 1024 * 1024;
 const PARTICIPANT_RELAY_TIMEOUT_MS = 15_000;
 // Outbound pre-warm to the contribution service (owner-reported 15.23s cold
 // call, 2026-08-10). This is the outbound twin of v0.1.6's inbound keep-alive
@@ -194,6 +186,13 @@ const PARTICIPANT_RELAY_TIMEOUT_MS = 15_000;
 // emitting a long `Keep-Alive: timeout=` response header; the pre-warm below is
 // the dependency-free half that removes the measured cold handshake.
 const CENTRAL_PREWARM_TIMEOUT_MS = 10_000;
+
+function createAppAwareKeychainBackend(environment) {
+  return createExportIdentityKeychainBackend({
+    loadBrokerBinding: () =>
+      createMacOSKeychainBrokerBindingFromEnvironment(environment),
+  });
+}
 
 /**
  * Wrap the outbound central fetch with a startup pre-warm, engaged only for the
@@ -363,8 +362,6 @@ const SESSION_COOKIE_VALUE = /^[A-Za-z0-9_.-]{0,384}$/u;
 const SET_COOKIE_VALUE =
   /^__Host-usage_monitor_session=[A-Za-z0-9_.-]{0,384}; Path=\/; Max-Age=[0-9]+; Secure; HttpOnly; SameSite=Strict$/u;
 const CSRF_VALUE = /^[A-Za-z0-9_-]{1,384}$/u;
-const UPLOAD_AUTHORIZATION_VALUE =
-  /^Upload um_(?:upload|device_upload)_[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}$/u;
 const REPORT_ROUTES = createLocalCompanionReportRoutes(
   LOCAL_COMPANION_REPORT_FILES,
 );
@@ -376,15 +373,12 @@ const API_ROUTES = new Set([
   "/api/local/identity/hosted-signin-handoff",
   "/api/local/onboarding",
   "/api/local/overview",
-  "/api/local/claude/quota",
   "/api/local/gradient",
   "/api/local/weekly",
   "/api/local/quality",
-  "/api/local/reports",
   "/api/local/timeline/window-breakdown",
   "/api/local/refresh",
   "/api/local/refresh/cancel",
-  "/api/local/contribution/preview",
   "/api/local/contribution/prepare",
   "/api/local/contribution/sync-status",
   "/api/local/contribution/sync-next",
@@ -392,12 +386,6 @@ const API_ROUTES = new Set([
   "/api/local/contribution/device-disconnect",
   "/api/local/contribution/device-credential-reset",
   "/api/local/contribution/sync-inspect-exact",
-  "/api/local/contribution/sync-once",
-  "/api/local/contribution/sync-pause",
-  "/api/local/contribution/sync-resume",
-  "/api/local/contribution/automatic-settings",
-  "/api/local/contribution/automatic-enable",
-  "/api/local/contribution/automatic-disable",
   "/api/local/contribution/incremental-status",
   "/api/local/contribution/incremental-approve",
   "/api/local/contribution/incremental-run",
@@ -405,14 +393,13 @@ const API_ROUTES = new Set([
 ]);
 
 // Routes that do not read the Codex dashboard snapshot must answer while that
-// snapshot is still being built (or even if it fails): readiness, diagnostics,
-// and the separately persisted native Claude quota projection.
+// snapshot is still being built (or even if it fails): readiness and
+// diagnostics.
 const SNAPSHOT_INDEPENDENT_API_ROUTES = new Set([
   "/api/local/health",
   "/api/local/diagnostics/contribution",
   "/api/local/diagnostics/note",
   "/api/local/identity/hosted-signin-handoff",
-  "/api/local/claude/quota",
 ]);
 
 
@@ -518,6 +505,20 @@ function contributionDeviceRecoveryRequired(error) {
 function contributionDeviceKeychainLocked(error) {
   try {
     return error?.code === "contribution_device_credential_locked";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A legacy Keychain item that the signed app could not migrate because the
+ * one permitted interactive read was declined. The broker leaves that item
+ * untouched, so clearing or resetting it would destroy the rollback path.
+ */
+function contributionDeviceKeychainMigrationRequired(error) {
+  try {
+    return error?.code ===
+      "contribution_device_credential_migration_required";
   } catch {
     return false;
   }
@@ -962,8 +963,8 @@ function createParticipantRelay({
       const jarCookie = participantSessionCookie(request.headers.cookie);
       // Session-authenticated routes (session, logout, /me/* including the
       // device-pairing mint) take the bridge's freshest captured session so the
-      // enroll -> mint sequence never races the WKWebView jar commit. The
-      // proof/recovery/Upload routes keep exactly the jar's own cookie.
+      // enroll -> mint sequence never races the WKWebView jar commit. Identity
+      // handoff and enrollment routes keep exactly the jar's own cookie.
       const cookie = participantRelayPathUsesSessionCookie(path)
         ? sessionCookieBridge.cookieForRequest(jarCookie)
         : jarCookie;
@@ -977,12 +978,7 @@ function createParticipantRelay({
       }
       const authorization = request.headers.authorization;
       if (authorization !== undefined) {
-        if (path !== "/api/v1/contributions"
-            || typeof authorization !== "string"
-            || !UPLOAD_AUTHORIZATION_VALUE.test(authorization)) {
-          throw fixedRelayError("central_participant_authorization_invalid");
-        }
-        headers.Authorization = authorization;
+        throw fixedRelayError("central_participant_authorization_invalid");
       }
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -1008,9 +1004,7 @@ function createParticipantRelay({
       }
       const responseBody = await boundedParticipantRelayResponse(
         upstream,
-        path === "/api/v1/me/export"
-          ? MAX_PARTICIPANT_EXPORT_RESPONSE_BYTES
-          : MAX_PARTICIPANT_RELAY_RESPONSE_BYTES,
+        MAX_PARTICIPANT_RELAY_RESPONSE_BYTES,
       );
       try {
         JSON.parse(responseBody.toString("utf8"));
@@ -1451,91 +1445,6 @@ async function authorizeContributionPreparation(request, response) {
   }
 }
 
-async function readAutomaticContributionEnableRequest(request) {
-  const contentType = request.headers["content-type"];
-  if (typeof contentType !== "string"
-      || !/^application\/json(?:\s*;\s*charset=utf-8)?$/iu.test(contentType)) {
-    const error = new Error("unsupported_media_type");
-    error.code = "unsupported_media_type";
-    throw error;
-  }
-  const declaredLength = Number(request.headers["content-length"]);
-  if (Number.isFinite(declaredLength)
-      && declaredLength > MAX_REQUEST_BODY_BYTES) {
-    const error = new Error("request_too_large");
-    error.code = "request_too_large";
-    throw error;
-  }
-  let bytes = 0;
-  const chunks = [];
-  for await (const chunk of request) {
-    bytes += chunk.length;
-    if (bytes > MAX_REQUEST_BODY_BYTES) {
-      const error = new Error("request_too_large");
-      error.code = "request_too_large";
-      throw error;
-    }
-    chunks.push(chunk);
-  }
-  let value;
-  try {
-    value = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-  } catch {
-    const error = new Error("invalid_json");
-    error.code = "invalid_json";
-    throw error;
-  }
-  const consent = value?.consent;
-  if (!value
-      || typeof value !== "object"
-      || Array.isArray(value)
-      || Object.keys(value).sort().join("\0") !== "consent\0intervalHours"
-      || value.intervalHours !== AUTOMATIC_CONTRIBUTION_INTERVAL_HOURS
-      || !consent
-      || typeof consent !== "object"
-      || Array.isArray(consent)
-      || Object.keys(consent).sort().join("\0")
-        !== "destinationOrigin\0fieldDictionaryVersion\0privacyContractVersion\0telemetrySchemaVersion"
-      || ![
-        consent.telemetrySchemaVersion,
-        consent.fieldDictionaryVersion,
-        consent.privacyContractVersion,
-        consent.destinationOrigin,
-      ].every((entry) => typeof entry === "string"
-        && entry.length > 0
-        && entry.length <= 2_048)) {
-    const error = new Error("invalid_request");
-    error.code = "invalid_request";
-    throw error;
-  }
-  return Object.freeze({
-    intervalHours: value.intervalHours,
-    consent: Object.freeze({
-      telemetrySchemaVersion: consent.telemetrySchemaVersion,
-      fieldDictionaryVersion: consent.fieldDictionaryVersion,
-      privacyContractVersion: consent.privacyContractVersion,
-      destinationOrigin: consent.destinationOrigin,
-    }),
-  });
-}
-
-async function authorizeAutomaticContributionEnable(request, response) {
-  if (!sameOrigin(request)
-      || request.headers["x-usage-monitor-local"] !== "1") {
-    sendError(response, 403, "automatic_contribution_not_authorized");
-    return null;
-  }
-  try {
-    return await readAutomaticContributionEnableRequest(request);
-  } catch (error) {
-    const status = error.code === "unsupported_media_type"
-      ? 415
-      : error.code === "request_too_large" ? 413 : 400;
-    sendError(response, status, error.code ?? "invalid_request");
-    return null;
-  }
-}
-
 async function authorizeReviewedContributionMutation(
   request,
   response,
@@ -1654,36 +1563,6 @@ function finiteNonNegativeInteger(value) {
 
 function isNonNegativeInteger(value) {
   return Number.isSafeInteger(value) && value >= 0;
-}
-
-function previewProjection(value) {
-  const counts = value?.counts ?? {};
-  const coveredAt = value?.coveredAt ?? {};
-  const accounting = value?.accounting ?? {};
-  return {
-    schemaVersion: "telemetry-contribution-v0.1",
-    status: value?.status === "available" ? "available" : "not_configured",
-    synthetic: false,
-    coveredAt: {
-      startAt: typeof coveredAt.startAt === "string" ? coveredAt.startAt : null,
-      endAt: typeof coveredAt.endAt === "string" ? coveredAt.endAt : null,
-    },
-    counts: {
-      usageEvents: finiteNonNegativeInteger(counts.usageEvents),
-      quotaSnapshots: finiteNonNegativeInteger(counts.quotaSnapshots),
-      activityMarkers: finiteNonNegativeInteger(counts.activityMarkers),
-    },
-    accounting: {
-      basis: accounting.basis === "api_price_equivalent_not_subscription_allowance"
-        ? accounting.basis
-        : "api_price_equivalent_not_subscription_allowance",
-      fullyPricedEvents: finiteNonNegativeInteger(accounting.fullyPricedEvents),
-      partiallyPricedEvents: finiteNonNegativeInteger(accounting.partiallyPricedEvents),
-      unpricedEvents: finiteNonNegativeInteger(accounting.unpricedEvents),
-    },
-    includesFullRows: false,
-    remoteSendEnabled: false,
-  };
 }
 
 function nullableInstant(value) {
@@ -1880,39 +1759,6 @@ function syncExactReviewProjection(
   };
 }
 
-function syncRunProjection(value) {
-  const allowedStates = new Set(["completed", "paused", "interrupted"]);
-  const numericFields = [
-    "discoveredSets",
-    "enqueued",
-    "processed",
-    "accepted",
-    "retryable",
-    "rejected",
-    "reservedUploadBytes",
-  ];
-  const valid = allowedStates.has(value?.status)
-    && typeof value?.bandwidthLimited === "boolean"
-    && numericFields.every((name) => isNonNegativeInteger(value?.[name]));
-  return {
-    schemaVersion: "contribution-sync-run-v0.1",
-    status: valid ? value.status : "unavailable",
-    discoveredSets: valid ? value.discoveredSets : 0,
-    newlyQueued: valid ? value.enqueued : 0,
-    processed: valid ? value.processed : 0,
-    accepted: valid ? value.accepted : 0,
-    retryable: valid ? value.retryable : 0,
-    rejected: valid ? value.rejected : 0,
-    reservedUploadBytes: valid ? value.reservedUploadBytes : 0,
-    bandwidthLimited: valid ? value.bandwidthLimited : false,
-    queue: syncStatusProjection(value?.queue),
-    includesContent: false,
-    includesPaths: false,
-    includesIdentifiers: false,
-    includesCredentials: false,
-  };
-}
-
 const INCREMENTAL_SYNC_OUTCOME_CODE = /^[a-z][a-z0-9_]{0,63}$/u;
 const INCREMENTAL_SYNC_DAY = /^\d{4}-\d{2}-\d{2}$/u;
 
@@ -1987,7 +1833,7 @@ function deviceUnavailableIncrementalRunOutcome() {
  *
  * `keychainPrompt` rides along because this is the projection the ceremony
  * already polls: it names where a macOS Keychain dialog is still reachable
- * ("pairing", "rotation", "none") so the dashboard can withhold guidance from
+ * ("pairing", "migration", "none") so the dashboard can withhold guidance from
  * the installs that can never see one. It is a fixed vocabulary, never a
  * path, an identifier, or a credential fact.
  */
@@ -2159,6 +2005,7 @@ const PREPARATION_ERROR_CODES = new Set([
   "coverage_unavailable",
   "coverage_invalid",
   "identity_unavailable",
+  "identity_migration_required",
   "no_safe_records",
   "export_too_large",
   "privacy_verification_failed",
@@ -2289,7 +2136,8 @@ function preparationErrorStatus(code) {
       || code === "consent_already_current") return 409;
   if (code === "export_too_large") return 413;
   if (code === "coverage_unavailable"
-      || code === "identity_unavailable") return 503;
+      || code === "identity_unavailable"
+      || code === "identity_migration_required") return 503;
   if (code === "coverage_invalid"
       || code === "no_safe_records"
       || code === "privacy_verification_failed") return 422;
@@ -2669,9 +2517,6 @@ function createPreparedLocalCompanionServer({
     fromMs,
     toMs,
   }),
-  claudeQuotaProvider = () => readClaudeDesktopQuotaProjection(
-    statePaths.claudeDesktopQuotaStateFile,
-  ),
   // This is a programmatic, development-only gate: no environment variable,
   // settings control, route, or UI surface enables Claude usage collection.
   // A caller must explicitly opt into the production-shaped local shadow.
@@ -2689,22 +2534,13 @@ function createPreparedLocalCompanionServer({
     stateFile: statePaths.collectorStateFile,
     accountObservationOperationLockFile:
       statePaths.accountObservationLockFile,
+    selectAccountObservationSecret: (options = {}) =>
+      selectProductionAccountObservationSecret({
+        ...options,
+        createKeychainBackend: () =>
+          createAppAwareKeychainBackend(environment),
+      }),
     refreshAccounting: refreshReplaySafeAccountingCache,
-    refreshClaudeQuota: async ({ signal }) => {
-      const secret = await readOrCreateClaudeDesktopQuotaSecret(
-        statePaths.claudeDesktopQuotaSecretFile,
-      );
-      try {
-        return await refreshClaudeDesktopQuota({
-          statePath: statePaths.claudeDesktopQuotaStateFile,
-          homeDirectory,
-          secret,
-          signal,
-        });
-      } finally {
-        secret.fill(0);
-      }
-    },
     refreshClaudeUsageShadow: claudeShadowEnabled
       ? ({ signal }) => claudeShadowController.refresh({ signal })
       : null,
@@ -2747,10 +2583,10 @@ function createPreparedLocalCompanionServer({
   refreshTimeoutMs = 300_000,
   centralOrigin = environment.USAGE_MONITOR_CENTRAL_ORIGIN ?? null,
   centralFetch = globalThis.fetch,
-  contributionPreviewProvider = async () => ({ status: "not_configured" }),
   contributionPreparationRunner = null,
   contributionPreparationOptions = {},
-  contributionPreparationCreateKeychainBackend = undefined,
+  contributionPreparationCreateKeychainBackend = () =>
+    createAppAwareKeychainBackend(environment),
   developmentExportSecretFile =
     environment[DEVELOPMENT_IDENTITY_FILE_ENV] ?? null,
   developmentIdentityOptIn =
@@ -2766,8 +2602,8 @@ function createPreparedLocalCompanionServer({
   // broker channel (a socketpair end on the named descriptor): fresh
   // contribution-device credentials are then minted and read by the app —
   // the structural fix for the first-pairing Keychain dialog — while legacy
-  // items keep their companion-side keytar path until the rotation-time
-  // migration. Without the announcement (development, tests, Windows) the
+  // items migrate through the signed app on their next protected read.
+  // Without the announcement (development, tests, Windows) the
   // production keytar backend stays authoritative, exactly as before. The
   // transport is shared across backend constructions: the channel is one
   // kernel socketpair whose lifetime is the app's.
@@ -2808,13 +2644,12 @@ function createPreparedLocalCompanionServer({
   hostedSignInHandoffController = null,
   contributionSyncNextProvider = null,
   contributionSyncExactReviewProvider = null,
-  contributionSyncOnceRunner = null,
-  automaticContributionRetirementRunner = null,
   supersededContributionRetirementRunner = null,
   contributionSyncPauseSetter = null,
-  contributionSyncTimeoutMs = 60_000,
-  automaticContributionController = null,
-  automaticContributionOptions = {},
+  automaticContributionStateRetirementRunner =
+    retireAutomaticContributionState,
+  automaticContributionRetirementLockAcquirer =
+    acquireAutomaticContributionRetirementLock,
   incrementalContributionController = null,
   onError = () => {},
 } = {}) {
@@ -2834,9 +2669,6 @@ function createPreparedLocalCompanionServer({
       || typeof claudeShadowController.refresh !== "function") {
     throw new TypeError("Claude shadow controller configuration is invalid");
   }
-  if (typeof contributionPreviewProvider !== "function") {
-    throw new TypeError("contributionPreviewProvider must be a function");
-  }
   if (contributionPreparationRunner !== null
       && typeof contributionPreparationRunner !== "function") {
     throw new TypeError(
@@ -2853,23 +2685,6 @@ function createPreparedLocalCompanionServer({
     throw new TypeError(
       "contributionPreparationCreateKeychainBackend must be a function",
     );
-  }
-  if (!automaticContributionOptions
-      || typeof automaticContributionOptions !== "object"
-      || Array.isArray(automaticContributionOptions)) {
-    throw new TypeError("automaticContributionOptions must be an object");
-  }
-  if (automaticContributionController !== null
-      && (!automaticContributionController
-        || typeof automaticContributionController !== "object"
-        || typeof automaticContributionController.start !== "function"
-        || typeof automaticContributionController.stop !== "function"
-        || typeof automaticContributionController.inspect !== "function"
-        || typeof automaticContributionController.enable !== "function"
-        || typeof automaticContributionController.disable !== "function"
-        || typeof automaticContributionController
-          .recordReviewedManualAcceptance !== "function")) {
-    throw new TypeError("automaticContributionController is invalid");
   }
   const developmentIdentity = resolveDevelopmentIdentityConfiguration({
     file: developmentExportSecretFile,
@@ -2926,17 +2741,12 @@ function createPreparedLocalCompanionServer({
         && typeof contributionSyncNextProvider !== "function")
       || (contributionSyncExactReviewProvider !== null
         && typeof contributionSyncExactReviewProvider !== "function")
-      || (contributionSyncOnceRunner !== null
-        && typeof contributionSyncOnceRunner !== "function")
-      || (automaticContributionRetirementRunner !== null
-        && typeof automaticContributionRetirementRunner !== "function")
       || (supersededContributionRetirementRunner !== null
         && typeof supersededContributionRetirementRunner !== "function")
       || (contributionSyncPauseSetter !== null
         && typeof contributionSyncPauseSetter !== "function")
-      || !Number.isSafeInteger(contributionSyncTimeoutMs)
-      || contributionSyncTimeoutMs < 1_000
-      || contributionSyncTimeoutMs > 5 * 60_000) {
+      || typeof automaticContributionStateRetirementRunner !== "function"
+      || typeof automaticContributionRetirementLockAcquirer !== "function") {
     throw new TypeError("contribution sync controls are invalid");
   }
   const nextContribution = contributionSyncNextProvider
@@ -3114,32 +2924,6 @@ function createPreparedLocalCompanionServer({
         directory: preparedContributionDirectory,
         queueFile: contributionQueueFile,
       }));
-  const runContributionPass = contributionSyncOnceRunner
-    ?? (preparedContributionDirectory === null
-        || contributionServiceOrigin === null
-      ? async () => null
-      : async ({
-        signal,
-        reviewedJob,
-        preparedSetId,
-        maximumJobs = LOCAL_SYNC_MAXIMUM_JOBS,
-        maximumReservedUploadBytes =
-          LOCAL_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES,
-      }) => {
-        const backend = await createContributionDeviceBackend();
-        return runContributionSyncQueueOnce({
-          directory: preparedContributionDirectory,
-          origin: contributionServiceOrigin,
-          backend,
-          queueFile: contributionQueueFile,
-          stateFile: statePaths.contributionDeviceStateFile,
-          maximumJobs,
-          maximumReservedUploadBytes,
-          reviewedJob,
-          preparedSetId,
-          signal,
-        });
-      });
   const setContributionPaused = contributionSyncPauseSetter
     ?? (({ paused }) => setContributionSyncPaused({
       paused,
@@ -3153,10 +2937,6 @@ function createPreparedLocalCompanionServer({
     disconnectContributionDevice !== null;
   const syncExactReviewConfigured = preparedContributionDirectory !== null
     || contributionSyncExactReviewProvider !== null;
-  const syncDeliveryConfigured =
-    (preparedContributionDirectory !== null
-      && contributionServiceOrigin !== null)
-    || contributionSyncOnceRunner !== null;
   const runContributionPreparation = contributionPreparationRunner
     ?? createLocalContributionPreparationRunner({
       ...contributionPreparationOptions,
@@ -3183,24 +2963,6 @@ function createPreparedLocalCompanionServer({
   });
   let contributionPreparationInProgress = false;
   let contributionSyncInProgress = false;
-  const runAutomaticContributionRetirement =
-    automaticContributionRetirementRunner
-    ?? (preparedContributionDirectory === null
-      ? async () => ({
-        retiredSets: 0,
-        retiredJobs: 0,
-        interrupted: false,
-        networkActivity: false,
-      })
-      : ({ protectedPreparedSetIds, signal }) =>
-        retireAcceptedContributionArtifacts({
-          preparedSpoolDirectory: preparedContributionDirectory,
-          reviewArchiveDirectory:
-            contributionPreparationOptions.reviewArchiveDirectory,
-          queueFile: contributionQueueFile,
-          protectedPreparedSetIds,
-          signal,
-        }));
   const runSupersededContributionRetirement =
     supersededContributionRetirementRunner
     ?? (preparedContributionDirectory === null
@@ -3218,53 +2980,6 @@ function createPreparedLocalCompanionServer({
           queueFile: contributionQueueFile,
           signal,
         }));
-  const runAutomaticContributionPreparation = async (request) => {
-    if (contributionPreparationInProgress) {
-      const error = new Error("preparation_in_progress");
-      error.code = "preparation_in_progress";
-      throw error;
-    }
-    contributionPreparationInProgress = true;
-    try {
-      return await runContributionPreparation(request);
-    } finally {
-      contributionPreparationInProgress = false;
-    }
-  };
-  const runAutomaticContributionUpload = async ({
-    signal,
-    preparedSetId,
-  }) => {
-    if (contributionSyncInProgress || contributionDeviceDisconnectInProgress) {
-      const error = new Error("sync_in_progress");
-      error.code = "sync_in_progress";
-      error.retryable = true;
-      throw error;
-    }
-    contributionSyncInProgress = true;
-    try {
-      return await runContributionPass({
-        signal,
-        preparedSetId,
-        maximumJobs: LOCAL_AUTOMATIC_SYNC_MAXIMUM_JOBS,
-        maximumReservedUploadBytes:
-          LOCAL_AUTOMATIC_SYNC_MAXIMUM_RESERVED_UPLOAD_BYTES,
-      });
-    } finally {
-      contributionSyncInProgress = false;
-    }
-  };
-  const automaticContribution = automaticContributionController
-    ?? createAutomaticContributionController({
-      ...automaticContributionOptions,
-      settingsFile: statePaths.automaticContributionSettingsFile,
-      destinationOrigin: syncDeliveryConfigured
-        ? contributionServiceOrigin
-        : null,
-      prepareRunner: runAutomaticContributionPreparation,
-      uploadRunner: runAutomaticContributionUpload,
-      maintenanceRunner: runAutomaticContributionRetirement,
-    });
   if (incrementalContributionController !== null
       && (!incrementalContributionController
         || typeof incrementalContributionController !== "object"
@@ -3409,9 +3124,10 @@ function createPreparedLocalCompanionServer({
       // Bounded cleanup only; the queue converges on a later pass.
     }
   };
-  let automaticContributionInstanceLock = null;
-  let automaticContributionInstanceLockRelease = null;
-  let automaticContributionShutdown = null;
+  let automaticContributionRetirementLock = null;
+  let automaticContributionRetirementLockRelease = null;
+  let automaticContributionRetirement = null;
+  let contributionRuntimeShutdown = null;
   let instanceLockPromise = null;
   let snapshotPromise = null;
   // Building the first snapshot reads the whole retained collector state, which
@@ -3420,30 +3136,29 @@ function createPreparedLocalCompanionServer({
   // read routes project from actually exists yet. It is reported verbatim by
   // /api/local/health rather than being smoothed into "ready".
   let snapshotState = { status: "building", errorCode: null };
-  const releaseAutomaticContributionInstanceLock = () => {
-    if (automaticContributionInstanceLockRelease !== null) {
-      return automaticContributionInstanceLockRelease;
+  const releaseAutomaticContributionRetirementLock = () => {
+    if (automaticContributionRetirementLockRelease !== null) {
+      return automaticContributionRetirementLockRelease;
     }
-    const lock = automaticContributionInstanceLock;
-    automaticContributionInstanceLock = null;
-    automaticContributionInstanceLockRelease = Promise.resolve(
+    const lock = automaticContributionRetirementLock;
+    automaticContributionRetirementLock = null;
+    automaticContributionRetirementLockRelease = Promise.resolve(
       lock?.release(),
     );
-    return automaticContributionInstanceLockRelease;
+    return automaticContributionRetirementLockRelease;
   };
-  const shutdownAutomaticContribution = () => {
-    if (automaticContributionShutdown === null) {
-      automaticContributionShutdown = (async () => {
-        await automaticContribution.stop();
+  const shutdownContributionRuntime = () => {
+    if (contributionRuntimeShutdown === null) {
+      contributionRuntimeShutdown = (async () => {
         try {
           await incrementalContribution?.stop();
         } catch {
           onError("incremental_contribution_stop_failed");
         }
-        await releaseAutomaticContributionInstanceLock();
+        await releaseAutomaticContributionRetirementLock();
       })();
     }
-    return automaticContributionShutdown;
+    return contributionRuntimeShutdown;
   };
   // Single-instance exclusion is cheap (one lock file) and must still be
   // decided before this process is allowed to accept requests, so it stays on
@@ -3451,17 +3166,26 @@ function createPreparedLocalCompanionServer({
   const acquireInstanceLock = () => {
     if (instanceLockPromise === null) {
       instanceLockPromise = (async () => {
-        automaticContributionInstanceLock =
-          await acquireAutomaticContributionInstanceLock({
+        automaticContributionRetirementLock =
+          await automaticContributionRetirementLockAcquirer({
             lockFile: statePaths.automaticContributionLockFile,
           });
+        try {
+          automaticContributionRetirement =
+            await automaticContributionStateRetirementRunner({
+              settingsFile: statePaths.automaticContributionSettingsFile,
+            });
+        } catch (error) {
+          await releaseAutomaticContributionRetirementLock().catch(() => {});
+          throw error;
+        }
       })();
     }
     return instanceLockPromise;
   };
   // Resolved the moment the outcome of the first build is known. A failing
-  // build still finishes stopping automatic contribution before it rethrows -
-  // the instance lock must outlive that cleanup - but a request waiting to read
+  // build still finishes stopping the contribution runtime before it rethrows;
+  // the retirement lock must outlive that cleanup, but a request waiting to read
   // the snapshot is answered as soon as the answer exists, not held behind
   // someone else's teardown.
   let announceSnapshotOutcome = null;
@@ -3473,9 +3197,8 @@ function createPreparedLocalCompanionServer({
       snapshotPromise = (async () => {
         try {
           await dataStore.initialize();
-          await automaticContribution.start();
-          // v1.0 incremental sync starts beside the v0.1 scheduler; a
-          // failure here must never take the v0.1 path or the snapshot down.
+          // The v1.0 incremental sync remains the only contribution scheduler.
+          // A failure here must never take the local dashboard down.
           try {
             await incrementalContribution?.start();
           } catch {
@@ -3495,7 +3218,7 @@ function createPreparedLocalCompanionServer({
               : "snapshot_unavailable",
           };
           announceSnapshotOutcome();
-          await shutdownAutomaticContribution().catch(() => {});
+          await shutdownContributionRuntime().catch(() => {});
           throw error;
         }
       })();
@@ -3750,9 +3473,7 @@ function createPreparedLocalCompanionServer({
           remoteUploadEnabled: false,
           capabilities: {
             localDashboard: true,
-            claudeDesktopQuota: true,
             explicitRefresh: true,
-            contributionPreview: true,
             contributionPreparation: true,
             contributionPreparationIdentityMode:
               developmentIdentity.mode,
@@ -3763,7 +3484,6 @@ function createPreparedLocalCompanionServer({
             contributionDeviceDisconnect:
               contributionDeviceDisconnectConfigured,
             contributionSyncExactReview: syncExactReviewConfigured,
-            contributionSyncActions: syncDeliveryConfigured,
             incrementalContributionSync: incrementalSyncCapability,
             centralServiceProxy: centralProxy.enabled,
             centralParticipantRelay: participantRelay.enabled,
@@ -3862,22 +3582,6 @@ function createPreparedLocalCompanionServer({
         send(response, 200, dataStore.getOverview());
         return;
       }
-      if (path === "/api/local/claude/quota") {
-        if (request.method !== "GET") {
-          sendError(response, 405, "method_not_allowed");
-          return;
-        }
-        let quota = null;
-        try {
-          quota = await claudeQuotaProvider();
-        } catch {
-          // The route never carries filesystem diagnostics. A missing,
-          // inaccessible, or invalid local state collapses to the same closed
-          // content-free projection as a malformed injected provider.
-        }
-        send(response, 200, publicClaudeQuotaResult(quota));
-        return;
-      }
       if (path === "/api/local/gradient") {
         if (request.method !== "GET") {
           sendError(response, 405, "method_not_allowed");
@@ -3909,14 +3613,6 @@ function createPreparedLocalCompanionServer({
           schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
           quality: dataStore.getQuality(),
         });
-        return;
-      }
-      if (path === "/api/local/reports") {
-        if (request.method !== "GET") {
-          sendError(response, 405, "method_not_allowed");
-          return;
-        }
-        send(response, 200, dataStore.getReports());
         return;
       }
       if (path === "/api/local/timeline/window-breakdown") {
@@ -3958,20 +3654,6 @@ function createPreparedLocalCompanionServer({
           schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
           breakdown,
         });
-        return;
-      }
-      if (path === "/api/local/contribution/preview") {
-        if (request.method !== "GET") {
-          sendError(response, 405, "method_not_allowed");
-          return;
-        }
-        let preview;
-        try {
-          preview = await contributionPreviewProvider();
-        } catch {
-          preview = { status: "not_configured" };
-        }
-        send(response, 200, previewProjection(preview));
         return;
       }
       if (path === "/api/local/contribution/prepare") {
@@ -4033,93 +3715,6 @@ function createPreparedLocalCompanionServer({
           );
         } finally {
           contributionPreparationInProgress = false;
-        }
-        return;
-      }
-      if (path === "/api/local/contribution/automatic-settings") {
-        if (request.method !== "GET") {
-          sendError(response, 405, "method_not_allowed");
-          return;
-        }
-        try {
-          send(response, 200, await automaticContribution.inspect());
-        } catch {
-          sendError(
-            response,
-            500,
-            "automatic_contribution_settings_unavailable",
-          );
-        }
-        return;
-      }
-      if (path === "/api/local/contribution/automatic-enable") {
-        if (request.method !== "POST") {
-          sendError(response, 405, "method_not_allowed");
-          return;
-        }
-        const enableRequest = await authorizeAutomaticContributionEnable(
-          request,
-          response,
-        );
-        if (enableRequest === null) return;
-        try {
-          send(
-            response,
-            200,
-            await automaticContribution.enable(enableRequest),
-          );
-        } catch (error) {
-          const code = error?.code;
-          if (code === "automatic_contribution_not_configured") {
-            sendError(
-              response,
-              409,
-              "automatic_contribution_not_configured",
-            );
-          } else if (
-            code === "automatic_contribution_first_review_required"
-          ) {
-            sendError(
-              response,
-              409,
-              "automatic_contribution_first_review_required",
-            );
-          } else if (
-            code === "automatic_contribution_consent_binding_mismatch"
-          ) {
-            sendError(
-              response,
-              409,
-              "automatic_contribution_consent_binding_mismatch",
-            );
-          } else {
-            sendError(
-              response,
-              500,
-              "automatic_contribution_settings_unavailable",
-            );
-          }
-        }
-        return;
-      }
-      if (path === "/api/local/contribution/automatic-disable") {
-        if (request.method !== "POST") {
-          sendError(response, 405, "method_not_allowed");
-          return;
-        }
-        if (!await authorizeLocalMutation(
-          request,
-          response,
-          "automatic_contribution_not_authorized",
-        )) return;
-        try {
-          send(response, 200, await automaticContribution.disable());
-        } catch {
-          sendError(
-            response,
-            500,
-            "automatic_contribution_settings_unavailable",
-          );
         }
         return;
       }
@@ -4335,7 +3930,7 @@ function createPreparedLocalCompanionServer({
         }
         send(response, 200, syncNextProjection(preview, {
           previewConfigured: syncPreviewConfigured,
-          deliveryConfigured: syncDeliveryConfigured,
+          deliveryConfigured: false,
         }));
         return;
       }
@@ -4407,8 +4002,12 @@ function createPreparedLocalCompanionServer({
         } catch (error) {
           const recoveryRequired =
             contributionDeviceRecoveryRequired(error);
-          // Two recovery causes keep their own code because the reset
-          // ceremony is the wrong instruction for them. Denied is the one the
+          const migrationRequired =
+            contributionDeviceKeychainMigrationRequired(error);
+          // Three Keychain causes keep their own code because the reset
+          // ceremony is the wrong instruction for them. Migration-required
+          // means the old item was preserved after the one interactive read
+          // was declined. Denied is the one the
           // user acted on directly — Deny (or cancel) in the macOS access
           // dialog the mint's read-back raises — so the dashboard can say
           // which dialog to answer differently. Locked is the one where
@@ -4418,16 +4017,20 @@ function createPreparedLocalCompanionServer({
           const keychainAccessDenied =
             error?.code === "contribution_device_credential_denied";
           const keychainLocked = contributionDeviceKeychainLocked(error);
+          let errorCode = "contribution_device_pairing_failed";
+          if (migrationRequired) {
+            errorCode = "contribution_device_keychain_migration_required";
+          } else if (recoveryRequired) {
+            errorCode = keychainAccessDenied
+              ? "contribution_device_keychain_access_denied"
+              : keychainLocked
+                ? "contribution_device_keychain_locked"
+                : "contribution_device_recovery_required";
+          }
           sendError(
             response,
-            recoveryRequired ? 409 : 502,
-            recoveryRequired
-              ? keychainAccessDenied
-                ? "contribution_device_keychain_access_denied"
-                : keychainLocked
-                  ? "contribution_device_keychain_locked"
-                  : "contribution_device_recovery_required"
-              : "contribution_device_pairing_failed",
+            recoveryRequired || migrationRequired ? 409 : 502,
+            errorCode,
           );
         }
         return;
@@ -4573,112 +4176,6 @@ function createPreparedLocalCompanionServer({
         }));
         return;
       }
-      if (path === "/api/local/contribution/sync-once") {
-        if (request.method !== "POST") {
-          sendError(response, 405, "method_not_allowed");
-          return;
-        }
-        const reviewToken = await authorizeReviewedContributionMutation(
-          request,
-          response,
-          "sync_not_authorized",
-        );
-        if (reviewToken === null) return;
-        const authorization = consumeReviewedContributionAuthorization(
-          reviewToken,
-        );
-        if (authorization === null) {
-          sendError(response, 409, "review_expired_or_changed");
-          return;
-        }
-        if (contributionSyncInProgress || contributionDeviceDisconnectInProgress) {
-          sendError(response, 409, "sync_in_progress");
-          return;
-        }
-        contributionSyncInProgress = true;
-        const controller = new AbortController();
-        const timeout = setTimeout(
-          () => controller.abort(),
-          contributionSyncTimeoutMs,
-        );
-        let result;
-        try {
-          result = await runContributionPass({
-            signal: controller.signal,
-            reviewedJob: authorization.reviewedJob,
-          });
-        } catch (error) {
-          // A leftover device credential is a precisely known local fault with
-          // its own repair. Reporting it as a generic delivery failure would
-          // send the user looking at the service and the network instead. A
-          // locked keychain is the one member of that family that needs no
-          // repair — it is a paused upload, not a broken credential — so it
-          // keeps its own code here too.
-          const recoveryRequired = contributionDeviceRecoveryRequired(error);
-          sendError(
-            response,
-            recoveryRequired ? 409 : 502,
-            recoveryRequired
-              ? contributionDeviceKeychainLocked(error)
-                ? "contribution_device_keychain_locked"
-                : "contribution_device_recovery_required"
-              : "sync_failed",
-          );
-          return;
-        } finally {
-          clearTimeout(timeout);
-          contributionSyncInProgress = false;
-        }
-        if (result === null) {
-          sendError(response, 503, "sync_not_configured");
-          return;
-        }
-        if (result.status === "completed"
-            && Number.isSafeInteger(result.accepted)
-            && result.accepted > 0) {
-          try {
-            await automaticContribution.recordReviewedManualAcceptance({
-              status: result.status,
-              accepted: result.accepted,
-              preparedSet: result.preparedSet,
-            });
-          } catch {
-            // Delivery already succeeded. Never misreport it as failed or invite
-            // a duplicate send merely because the optional scheduler receipt
-            // could not be persisted; automatic enablement remains closed.
-            onError("automatic_contribution_bootstrap_persist_failed");
-          }
-        }
-        send(response, 200, syncRunProjection(result));
-        return;
-      }
-      if (path === "/api/local/contribution/sync-pause"
-          || path === "/api/local/contribution/sync-resume") {
-        if (request.method !== "POST") {
-          sendError(response, 405, "method_not_allowed");
-          return;
-        }
-        if (!await authorizeLocalMutation(
-          request,
-          response,
-          "sync_control_not_authorized",
-        )) return;
-        if (contributionSyncInProgress || contributionDeviceDisconnectInProgress) {
-          sendError(response, 409, "sync_in_progress");
-          return;
-        }
-        let status;
-        try {
-          status = await setContributionPaused({
-            paused: path.endsWith("sync-pause"),
-          });
-        } catch {
-          sendError(response, 500, "sync_control_failed");
-          return;
-        }
-        send(response, 200, syncStatusProjection(status));
-        return;
-      }
       if (path === "/api/local/refresh") {
         if (request.method === "GET") {
           send(response, 200, {
@@ -4797,8 +4294,8 @@ function createPreparedLocalCompanionServer({
   server.keepAliveTimeout = 90_000;
   server.headersTimeout = 95_000;
   server.once("close", () => {
-    void shutdownAutomaticContribution().catch(() => {
-      onError("automatic_contribution_lock_release_failed");
+    void shutdownContributionRuntime().catch(() => {
+      onError("automatic_contribution_retirement_lock_release_failed");
     });
   });
 
@@ -4806,7 +4303,6 @@ function createPreparedLocalCompanionServer({
     server,
     dataStore,
     refresh,
-    automaticContribution,
     centralOutbound,
     [PARENT_WATCHDOG_PID]: parentWatchdogPid,
     async initialize() {
@@ -4816,7 +4312,12 @@ function createPreparedLocalCompanionServer({
     acquireInstanceLock,
     buildSnapshot,
     snapshotStatus: () => ({ ...snapshotState }),
-    shutdownAutomaticContribution,
+    automaticContributionRetirement: () => (
+      automaticContributionRetirement === null
+        ? null
+        : { ...automaticContributionRetirement }
+    ),
+    shutdownContributionRuntime,
   };
 }
 
@@ -4866,12 +4367,12 @@ export async function startLocalCompanionServer({
   } catch (error) {
     parentWatchdog.stop();
     await closeHttpServer(app.server).catch(() => {});
-    await app.shutdownAutomaticContribution().catch(() => {});
+    await app.shutdownContributionRuntime().catch(() => {});
     throw error;
   }
   // Started behind the open port. The read routes await this same promise, and
   // a failure is surfaced through `snapshotReady` rather than being swallowed:
-  // it still stops automatic contribution and releases the instance lock.
+  // it still stops contribution activity and releases the retirement lock.
   const snapshotReady = app.buildSnapshot();
   snapshotReady.catch(() => {});
   // Warm the outbound connection to the contribution service off the hot path
@@ -4887,7 +4388,7 @@ export async function startLocalCompanionServer({
     close: async () => {
       parentWatchdog.stop();
       await closeHttpServer(app.server);
-      await app.shutdownAutomaticContribution();
+      await app.shutdownContributionRuntime();
     },
   };
 }

@@ -7,11 +7,10 @@ import { join, relative } from "node:path";
 import { sanitizeClaudeStatusline } from "../src/claude-statusline.js";
 import { writeClaudeStatusSnapshot } from "../src/claude-statusline-storage.js";
 import {
-  createLocalExportWorkspace,
-  inspectLocalExportWorkspace,
-  resumeLocalExportWorkspace,
-} from "../src/export-set-controller.js";
-import { materializeLocalExportSet } from "../src/export-set-materializer.js";
+  localExportSetMaterialization,
+  localExportSourcePipeline,
+  localExportWorkspace,
+} from "../src/local-node-runtime.js";
 import { planLocalExportDeletion } from "../src/export-deletion.js";
 import { deleteLocalExport, recoverLocalExportDeletion } from "../src/export-deletion-executor.js";
 import { planLocalExportWorkspaceDiscard } from "../src/export-workspace-discard.js";
@@ -19,8 +18,15 @@ import {
   discardLocalExportWorkspace,
   recoverLocalExportWorkspaceDiscard,
 } from "../src/export-workspace-discard-executor.js";
-import { openExportWorkspace } from "../src/export-workspace.js";
 import { stableJson } from "../src/storage.js";
+
+const {
+  createLocalExportWorkspace,
+  inspectLocalExportWorkspace,
+  resumeLocalExportWorkspace,
+} = localExportSourcePipeline.controller;
+const { materializeLocalExportSet } = localExportSetMaterialization;
+const { openExportWorkspace } = localExportWorkspace;
 
 const SECRET = Buffer.alloc(32, 117);
 const CLAUDE_SESSION_SECRET = Buffer.alloc(32, 118);

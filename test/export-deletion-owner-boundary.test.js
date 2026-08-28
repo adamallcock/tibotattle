@@ -5,11 +5,11 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { createLocalExportDeletion } from "../src/application/index.js";
+import * as exportOwner from "../src/export/index.js";
 import { stableJson } from "../src/export/index.js";
-import { LEGACY_EXPORT_DELETION_INTERNAL } from "../src/export-deletion-compatibility-internal.js";
 import * as deletionShim from "../src/export-deletion.js";
 import * as executorShim from "../src/export-deletion-executor.js";
-import * as schemaShim from "../src/export-deletion-schema.js";
+import { localExportDeletion } from "../src/local-node-runtime.js";
 import {
   createOwnerOnlyExportDeletionPreflightInspector,
   createOwnerOnlyExportDeletionStorage,
@@ -109,15 +109,15 @@ function fixedErrorCode(code) {
   return (error) => error?.code === code && !String(error.message).includes(CANARY);
 }
 
-test("deletion compatibility shims retain their exact historical surfaces and one internal singleton", () => {
+test("deletion facades retain their exact surfaces over the local runtime", () => {
   assert.deepEqual(Object.keys(deletionShim).sort(), [...DELETION_EXPORTS].sort());
   assert.deepEqual(Object.keys(executorShim).sort(), [...EXECUTOR_EXPORTS].sort());
-  assert.deepEqual(Object.keys(schemaShim).sort(), [...SCHEMA_EXPORTS].sort());
+  for (const name of SCHEMA_EXPORTS) assert.equal(name in exportOwner, true, name);
   for (const name of DELETION_EXPORTS.filter((name) => !name.startsWith("EXPORT_"))) {
-    assert.equal(deletionShim[name], LEGACY_EXPORT_DELETION_INTERNAL[name]);
+    assert.equal(deletionShim[name], localExportDeletion[name]);
   }
   for (const name of EXECUTOR_EXPORTS) {
-    assert.equal(executorShim[name], LEGACY_EXPORT_DELETION_INTERNAL[name]);
+    assert.equal(executorShim[name], localExportDeletion[name]);
   }
   assert.equal("deleteLocalExport" in deletionShim, false);
   assert.equal("buildLocalExportDeletionPlan" in executorShim, false);

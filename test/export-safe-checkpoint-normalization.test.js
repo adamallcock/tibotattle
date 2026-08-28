@@ -1,12 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {
+import { localSafeRecords } from "../src/local-node-runtime.js";
+import { stableJson } from "../src/storage.js";
+
+const {
   createEmptySafeToolClassCounts,
   normalizeCodexUsageEvent,
   safeExportModelDeclaration,
   safeToolCountFieldForScannerToolClass,
-} from "../src/export-safe-records.js";
-import { stableJson } from "../src/storage.js";
+} = localSafeRecords;
 
 const SECRET = Buffer.alloc(32, 9);
 

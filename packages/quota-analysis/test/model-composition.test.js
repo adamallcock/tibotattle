@@ -7,8 +7,8 @@ import {
   buildCompositionObservations,
   calibrateCompositionCapacities,
   compositionExpectedPp,
-  solveNonNegativeLeastSquares,
 } from "../index.js";
+import { solveNonNegativeLeastSquares } from "../src/model-composition.js";
 
 const HOUR_MS = 60 * 60 * 1_000;
 const GRAIN_MS = MODEL_COMPOSITION_POLICY.grainMs;

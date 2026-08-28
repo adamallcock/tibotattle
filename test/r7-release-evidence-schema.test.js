@@ -233,6 +233,20 @@ test("reviewed R7 runtime source trees reject unsupported files and symlinks", a
     );
     await rm(osMetadata);
 
+    const agentGuidance = join(temporaryRoot, "src", "providers", "AGENTS.md");
+    await writeFile(agentGuidance, "repository-scoped guidance\n");
+    assert.equal(
+      collectR7ReleaseEvidenceRuntimeSourcePaths({ repositoryRoot }).includes(
+        "src/providers/AGENTS.md",
+      ),
+      false,
+    );
+    assert.equal(
+      collectR7ReleaseEvidenceRuntimeSourcePaths({ repositoryRoot }).length,
+      8,
+    );
+    await rm(agentGuidance);
+
     const unsupported = join(
       temporaryRoot,
       "packages",

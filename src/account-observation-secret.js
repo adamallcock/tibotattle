@@ -56,10 +56,14 @@ async function invokeBackend(backend, method, ...args) {
     } catch {
       // Hostile backend errors are collapsed below.
     }
-    fail(code === "export_identity_keychain_locked"
-      || code === "windows_credential_manager_locked"
-      ? "account_observation_credential_locked"
-      : "account_observation_credential_unavailable");
+    if (code === "export_identity_keychain_locked"
+        || code === "windows_credential_manager_locked") {
+      fail("account_observation_credential_locked");
+    }
+    if (code === "export_identity_keychain_migration_required") {
+      fail("account_observation_credential_migration_required");
+    }
+    fail("account_observation_credential_unavailable");
   }
 }
 

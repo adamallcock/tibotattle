@@ -2,17 +2,19 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { calculateCost, compilePriceCatalog } from "runcost/browser";
 import {
-  ANTHROPIC_OFFICIAL_PRICE_CARDS,
   APP_OFFICIAL_PRICE_CARDS,
   APP_PRICE_REGISTRY_MANIFEST,
+  OPENAI_PRICE_EVIDENCE_START_DATE,
+} from "../packages/accounting/index.js";
+import {
+  ANTHROPIC_OFFICIAL_PRICE_CARDS,
   APP_PRICE_REGISTRY_SHA256,
   NORMALIZED_PRICE_EVIDENCE_ROWS,
   OPENAI_OFFICIAL_PRICE_CARDS,
-  OPENAI_PRICE_EVIDENCE_START_DATE,
   PROVIDER_TOOL_PRICE_CARDS,
   addOfficialPriceRegistry,
   validateOfficialPriceRegistry,
-} from "../packages/accounting/index.js";
+} from "../packages/accounting/src/price-registry.js";
 import { sha256Json } from "./helpers/pricing-hash.js";
 
 function price({ provider, model, tier = "standard", pricedAt = "2026-07-26", components, totalInputTokens }) {

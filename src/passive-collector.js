@@ -16,8 +16,8 @@ import {
   canonicalRateLimitWindows,
   classifyToolCall,
   normalizeTokenUsage,
-  readRolloutLineage,
-} from "./codex-log-scan.js";
+} from "./providers/codex/logs.js";
+import { localCodexLogScanner } from "./local-node-runtime.js";
 import {
   normalizeProviderTier,
   unknownCodexTier,
@@ -38,6 +38,7 @@ import {
 import { SPARK_QUOTA_LIMIT_IDS } from "./local-companion-usage-model.js";
 
 const CHECKPOINT_SCHEMA_VERSION = "0.3";
+const { readRolloutLineage } = localCodexLogScanner;
 const RECORD_SCHEMA_VERSION = "0.3";
 const MAX_RECENT_EVENT_KEYS = 5_000;
 const MAX_ACCOUNT_SCOPE_MARKER_AGE_MS = 5 * 60_000;
@@ -125,6 +126,7 @@ const DIAGNOSTIC_COUNT_FIELDS = Object.freeze([
   "rolloutRecordBatchesWritten",
   "appServerRecordsWritten",
   "accountCredentialLocked",
+  "accountCredentialMigrationRequired",
   "accountCredentialUnavailable",
   "tierSettingEvents",
   "tierSettingOmissions",
@@ -212,6 +214,7 @@ function emptyCheckpoint(nowIso, backfill, backfillSinceAt = null) {
       rolloutRecordBatchesWritten: 0,
       appServerRecordsWritten: 0,
       accountCredentialLocked: 0,
+      accountCredentialMigrationRequired: 0,
       accountCredentialUnavailable: 0,
       appServerErrorCounts: {},
       ingestionErrorCounts: {},
@@ -1387,6 +1390,10 @@ async function appendAppRecord({ payload, source, checkpoint, clock, commitRecor
   if (Object.hasOwn(payload ?? {}, "accountScope")) {
     if (record.accountScope.reason === "credential_locked") {
       checkpoint.diagnostics.accountCredentialLocked = (checkpoint.diagnostics.accountCredentialLocked ?? 0) + 1;
+    }
+    if (record.accountScope.reason === "credential_migration_required") {
+      checkpoint.diagnostics.accountCredentialMigrationRequired =
+        (checkpoint.diagnostics.accountCredentialMigrationRequired ?? 0) + 1;
     }
     if (record.accountScope.reason === "credential_unavailable") {
       checkpoint.diagnostics.accountCredentialUnavailable = (checkpoint.diagnostics.accountCredentialUnavailable ?? 0) + 1;

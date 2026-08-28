@@ -1,4 +1,4 @@
-import { scanCodexLogEvents } from "./codex-log-scan.js";
+import { localCodexLogScanner } from "./local-node-runtime.js";
 import { validAbortSignal } from "./valid-abort-signal.js";
 import {
   fastQuotaMultiplier,
@@ -13,6 +13,7 @@ import {
 } from "@app-usagemonitor/accounting";
 
 const SCHEMA_VERSION = "0.3";
+const { scanCodexLogEvents } = localCodexLogScanner;
 export const PARSER_VERSION = "0.3.2";
 const ESTIMATOR_VERSION = "provider-neutral-api-price-equivalent-v0.2";
 const COMPONENT_NAMES = [

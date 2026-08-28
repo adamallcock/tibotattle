@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { scanCodexLogEvents } from "../src/codex-log-scan.js";
+import { localCodexLogScanner } from "../src/local-node-runtime.js";
 import { extractRolloutUsage } from "../src/local-unified-index-extract.js";
 import { rebuildLocalUnifiedIndex } from "../src/local-unified-index-build.js";
 import { openLocalUnifiedIndex } from "../src/local-unified-index.js";
+
+const { scanCodexLogEvents } = localCodexLogScanner;
 
 // Regression fixture for the interleaved-cumulative-stream pathology,
 // reproduced from the live corpus (~/.codex sessions from Jun 16): within a

@@ -303,13 +303,13 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  // 80 records / 82 executable paths: the release-documentation and Codex
-  // contract gates are reviewed repository operations invoked by CI and the
-  // release runbooks.
+  // 81 records / 83 executable paths: the release-documentation, Codex, and
+  // repository-layout contract gates are reviewed repository operations
+  // invoked by CI, tests, and the release runbooks.
   // Keep these exact so any future executable still requires an ownership
   // decision.
-  assert.equal(result.records, 80);
-  assert.equal(result.candidates.length, 82);
+  assert.equal(result.records, 81);
+  assert.equal(result.candidates.length, 83);
   assert.ok(result.aliases >= 25);
 });
 

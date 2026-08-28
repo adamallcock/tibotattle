@@ -44,6 +44,7 @@ const ERROR_CODES = new Set([
   "device_id_invalid",
   "credential_locked",
   "credential_denied",
+  "credential_migration_required",
   "credential_unavailable",
   "credential_missing",
   "credential_conflict",
@@ -91,6 +92,9 @@ function translateBackendFailure(error) {
   }
   if (code === "export_identity_keychain_locked") fail("credential_locked");
   if (code === "export_identity_keychain_denied") fail("credential_denied");
+  if (code === "export_identity_keychain_migration_required") {
+    fail("credential_migration_required");
+  }
   fail("credential_unavailable");
 }
 
@@ -437,7 +441,7 @@ const APP_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceA
 
 export const CONTRIBUTION_DEVICE_KEYCHAIN_PROMPT_SURFACES = Object.freeze([
   "pairing",
-  "rotation",
+  "migration",
   "none",
 ]);
 
@@ -454,12 +458,13 @@ export const CONTRIBUTION_DEVICE_KEYCHAIN_PROMPT_SURFACES = Object.freeze([
  * - `pairing`: no broker announcement (development, a standalone companion, or
  *   an app that could not create the channel). The companion still mints
  *   through the `security` CLI and reads it back, so today's copy is exact.
- * - `rotation`: brokered, but the credential is still the legacy `.v1` item.
- *   The dialog moved with the migration; it can only appear at the rotation
- *   that retires that item, never at pairing.
+ * - `migration`: brokered, but the credential is still the legacy `.v1`
+ *   item. The one permitted interactive read can appear on the next use that
+ *   needs the credential; a successful read is copied exactly into app-owned
+ *   storage before the legacy item is retired.
  * - `none`: brokered with no legacy item. No dialog exists to explain.
  *
- * An indeterminate probe answers `rotation`: conditional guidance that turns
+ * An indeterminate probe answers `migration`: conditional guidance that turns
  * out to be unnecessary costs one sentence, while withholding it from an
  * install that does raise a dialog is the harm this exists to prevent.
  */
@@ -484,7 +489,7 @@ export function contributionDeviceKeychainPromptSurface({
   } catch {
     presence = "unknown";
   }
-  return presence === "missing" ? "none" : "rotation";
+  return presence === "missing" ? "none" : "migration";
 }
 
 function assertBackendSecret(value) {

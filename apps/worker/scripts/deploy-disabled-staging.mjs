@@ -102,7 +102,7 @@ function closedHealth(value) {
     && value?.contracts?.accountScopedContribution
       ?.externalParticipantsAuthorized === false
     && value?.capabilities?.encryptedUpload === false
-    && value?.capabilities?.delayedAggregateStats === false
+    && value?.capabilities?.communityDaily === false
     && value?.capabilities?.ongoingDeviceUploadRegistration === false;
 }
 

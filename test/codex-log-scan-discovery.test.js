@@ -10,16 +10,18 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { localCodexLogScanner } from "../src/local-node-runtime.js";
 import {
+  readCodexSelectedRolloutNames,
+} from "../src/platform/local-codex-thread-store.js";
+
+const {
   codexLogSourceFingerprint,
   codexRolloutDiscoveryReceipt,
   discoverCodexRolloutInfos,
   scanCodexLogEvents,
-} from "../src/codex-log-scan.js";
-import {
-  readCodexSelectedRolloutNames,
-} from "../src/platform/local-codex-thread-store.js";
-import { DatabaseSync } from "node:sqlite";
+} = localCodexLogScanner;
 
 const START_AT = "2026-07-30T10:00:00.000Z";
 const END_AT = "2026-07-30T15:00:00.000Z";

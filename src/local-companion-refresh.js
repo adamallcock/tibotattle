@@ -21,22 +21,6 @@ const PUBLIC_REFRESH_ERROR_CODES = new Set([
   "malformed_output",
   "temporary_disconnect",
 ]);
-const CLAUDE_QUOTA_PROVIDER = "anthropic_claude_code";
-const CLAUDE_QUOTA_AUTHORITY = "claude_desktop_plan_history";
-const CLAUDE_QUOTA_STATUSES = new Set(["available", "stale", "unavailable"]);
-const CLAUDE_QUOTA_SOURCE_STATUSES = new Set([
-  "present",
-  "missing_suspected",
-  "inaccessible",
-  "partial",
-]);
-const CLAUDE_QUOTA_FRESHNESS = new Set(["fresh", "stale"]);
-const CLAUDE_QUOTA_COVERAGE = new Set(["complete", "partial", "unavailable"]);
-const CLAUDE_QUOTA_METERS = new Set([
-  "five_hour",
-  "seven_day_all_models",
-  "extra_usage",
-]);
 const RECENT_INDEX_WINDOW_MS = 7 * 24 * 60 * 60 * 1_000;
 const EARLY_HEADLINE_RECENT_RUN_BYTES = 128 * 1024 * 1024;
 // The first pass exists to make the dashboard useful quickly on machines with
@@ -798,42 +782,6 @@ function mergeCollectorPasses(early, continued, now = Date.now()) {
   };
 }
 
-function failedClaudeQuotaResult() {
-  return {
-    schemaVersion: "local-claude-quota-v0.1",
-    provider: CLAUDE_QUOTA_PROVIDER,
-    authority: CLAUDE_QUOTA_AUTHORITY,
-    status: "failed",
-    errorCode: "claude_quota_refresh_failed",
-    includesContent: false,
-    includesPaths: false,
-    includesIdentifiers: false,
-  };
-}
-
-function runClaudeQuotaRefresh(refreshClaudeQuota, signal) {
-  if (refreshClaudeQuota === null) return Promise.resolve(null);
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (value) => {
-      if (settled) return;
-      settled = true;
-      signal?.removeEventListener?.("abort", abort);
-      resolve(value);
-    };
-    const abort = () => finish(failedClaudeQuotaResult());
-    if (signal?.aborted === true) {
-      abort();
-      return;
-    }
-    signal?.addEventListener?.("abort", abort, { once: true });
-    Promise.resolve()
-      .then(() => refreshClaudeQuota({ signal }))
-      .then((value) => finish(publicClaudeQuotaResult(value)))
-      .catch(() => finish(failedClaudeQuotaResult()));
-  });
-}
-
 // The Claude usage shadow is deliberately an internal side effect: it runs
 // beside the production refresh when explicitly injected, but contributes no
 // field to the loopback response and therefore cannot become an accidental UI
@@ -870,10 +818,6 @@ export function createLocalCollectorRefreshRunner({
   runCollector = runCollectorOnce,
   readAccountingCache = readReplaySafeAccountingCache,
   refreshAccounting = null,
-  // Native Claude plan quota is a separate source and store. Start it beside
-  // the Codex collector so either provider can advance without feeding paths,
-  // transcripts, or identities into the other callback.
-  refreshClaudeQuota = null,
   // Disabled unless an explicit production-shaped shadow controller is
   // injected. Its result is intentionally not part of the public refresh
   // projection; only its provider-isolated local stores are advanced.
@@ -912,9 +856,6 @@ export function createLocalCollectorRefreshRunner({
   }
   if (refreshAccounting !== null && typeof refreshAccounting !== "function") {
     throw new TypeError("refreshAccounting must be a function or null");
-  }
-  if (refreshClaudeQuota !== null && typeof refreshClaudeQuota !== "function") {
-    throw new TypeError("refreshClaudeQuota must be a function or null");
   }
   if (refreshClaudeUsageShadow !== null
       && typeof refreshClaudeUsageShadow !== "function") {
@@ -1021,7 +962,6 @@ export function createLocalCollectorRefreshRunner({
         declaredSpeedBaselines = [];
       }
     }
-    const claudeQuotaPromise = runClaudeQuotaRefresh(refreshClaudeQuota, signal);
     const claudeUsageShadowPromise = runClaudeUsageShadowRefresh(
       refreshClaudeUsageShadow,
       signal,
@@ -1371,7 +1311,6 @@ export function createLocalCollectorRefreshRunner({
       });
     }
     refreshStep = "assemble";
-    const claudeQuota = await claudeQuotaPromise;
     await claudeUsageShadowPromise;
     const unifiedCollectorPauseSoftened = accountingSourceMode === "unified"
       && unifiedAccountingReady
@@ -1447,7 +1386,6 @@ export function createLocalCollectorRefreshRunner({
         ? {}
         : { accountingRebuildDeferred }),
       ...(unifiedIndex === null ? {} : { unifiedIndex }),
-      ...(claudeQuota === null ? {} : { claudeQuota }),
       ...(publicIndexingResult(result?.indexing) === null
         ? {}
         : { indexing: publicIndexingResult(result.indexing) }),
@@ -1505,111 +1443,6 @@ function publicUnifiedIndexResult(value) {
   };
 }
 
-/**
- * Closed, content-free Claude quota projection for refresh receipts and the
- * loopback consumer route. Unknown native meters remain counted but their
- * keyed identities never cross this boundary.
- */
-export function publicClaudeQuotaResult(value) {
-  if (value?.schemaVersion === "local-claude-quota-v0.1"
-      && value.provider === CLAUDE_QUOTA_PROVIDER
-      && value.authority === CLAUDE_QUOTA_AUTHORITY
-      && value.status === "failed") {
-    return {
-      schemaVersion: "local-claude-quota-v0.1",
-      provider: CLAUDE_QUOTA_PROVIDER,
-      authority: CLAUDE_QUOTA_AUTHORITY,
-      status: "failed",
-      errorCode: value.errorCode === "claude_quota_refresh_failed"
-        ? value.errorCode : "claude_quota_projection_invalid",
-      includesContent: false,
-      includesPaths: false,
-      includesIdentifiers: false,
-    };
-  }
-  const projection = value?.projection ?? (
-    value?.schemaVersion === "local-claude-quota-v0.1"
-      ? {
-        ...value,
-        source: {
-          status: value.sourceStatus,
-          lastSuccessAtMs: value.lastSuccessAtMs,
-        },
-      }
-      : value
-  );
-  if (!projection || projection.provider !== CLAUDE_QUOTA_PROVIDER
-      || projection.authority !== CLAUDE_QUOTA_AUTHORITY
-      || !CLAUDE_QUOTA_STATUSES.has(projection.status)
-      || !CLAUDE_QUOTA_SOURCE_STATUSES.has(projection.source?.status)
-      || !CLAUDE_QUOTA_FRESHNESS.has(projection.freshness)
-      || !CLAUDE_QUOTA_COVERAGE.has(projection.coverage?.state)) {
-    return {
-      schemaVersion: "local-claude-quota-v0.1",
-      provider: CLAUDE_QUOTA_PROVIDER,
-      authority: CLAUDE_QUOTA_AUTHORITY,
-      status: "failed",
-      errorCode: "claude_quota_projection_invalid",
-      includesContent: false,
-      includesPaths: false,
-      includesIdentifiers: false,
-    };
-  }
-  const windows = [];
-  if (!Array.isArray(projection.windows)) {
-    return publicClaudeQuotaResult(null);
-  }
-  for (const window of projection.windows) {
-    if (!window || !CLAUDE_QUOTA_METERS.has(window.meterId)
-        || typeof window.utilizationPercent !== "number"
-        || !Number.isFinite(window.utilizationPercent)
-        || window.utilizationPercent < 0 || window.utilizationPercent > 100
-        || !Number.isSafeInteger(window.observedAtMs) || window.observedAtMs < 0
-        || (window.resetsAtMs !== null
-          && (!Number.isSafeInteger(window.resetsAtMs) || window.resetsAtMs < 0))) {
-      return publicClaudeQuotaResult(null);
-    }
-    windows.push({
-      meterId: window.meterId,
-      utilizationPercent: window.utilizationPercent,
-      remainingPercent: 100 - window.utilizationPercent,
-      observedAtMs: window.observedAtMs,
-      resetsAtMs: window.resetsAtMs,
-      windowDurationMinutes: Number.isSafeInteger(window.windowDurationMinutes)
-          && window.windowDurationMinutes > 0
-        ? window.windowDurationMinutes
-        : null,
-    });
-  }
-  return {
-    schemaVersion: "local-claude-quota-v0.1",
-    provider: CLAUDE_QUOTA_PROVIDER,
-    authority: CLAUDE_QUOTA_AUTHORITY,
-    status: projection.status,
-    sourceStatus: projection.source.status,
-    freshness: projection.freshness,
-    lastSuccessAtMs: Number.isSafeInteger(projection.source.lastSuccessAtMs)
-        && projection.source.lastSuccessAtMs >= 0
-      ? projection.source.lastSuccessAtMs
-      : null,
-    coverage: {
-      state: projection.coverage.state,
-      gapCount: safeCount(projection.coverage.gapCount),
-    },
-    counts: {
-      observations: safeCount(projection.counts?.observations),
-      points: safeCount(projection.counts?.points),
-      accounts: safeCount(projection.counts?.accounts),
-      meters: safeCount(projection.counts?.meters),
-      unknownMeters: safeCount(projection.counts?.unknownMeters),
-    },
-    windows,
-    includesContent: false,
-    includesPaths: false,
-    includesIdentifiers: false,
-  };
-}
-
 function publicRefreshResult(result, now = Date.now()) {
   const projected = {
     rolloutRecordsWritten: Number.isSafeInteger(result?.rolloutRecordsWritten)
@@ -1633,9 +1466,6 @@ function publicRefreshResult(result, now = Date.now()) {
   }
   const indexing = publicIndexingResult(result?.indexing);
   if (indexing !== null) projected.indexing = indexing;
-  if (result?.claudeQuota !== undefined) {
-    projected.claudeQuota = publicClaudeQuotaResult(result.claudeQuota);
-  }
   const legacyRefreshUse = publicLegacyRefreshUse(result?.legacyRefreshUse);
   if (legacyRefreshUse !== null) {
     projected.legacyRefreshUse = legacyRefreshUse;

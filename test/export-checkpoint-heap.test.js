@@ -13,12 +13,12 @@ const PRIVATE_CANARY = "BOUNDED_HEAP_PRIVATE_ARGUMENT_DO_NOT_EXPORT";
 const START_AT = "2026-07-24T11:00:00.000Z";
 const END_AT = "2026-07-24T13:00:00.000Z";
 const CREATED_AT = "2026-07-24T13:00:00.000Z";
-const CONTROLLER_MODULE = new URL("../src/export-set-controller.js", import.meta.url).href;
-const WORKSPACE_MODULE = new URL("../src/export-workspace.js", import.meta.url).href;
+const LOCAL_RUNTIME_MODULE = new URL("../src/local-node-runtime.js", import.meta.url).href;
 
 const HEAP_WORKER = String.raw`
-const { createLocalExportWorkspace } = await import(process.env.HEAP_CONTROLLER_MODULE);
-const { openExportWorkspace } = await import(process.env.HEAP_WORKSPACE_MODULE);
+const runtime = await import(process.env.HEAP_LOCAL_RUNTIME_MODULE);
+const { createLocalExportWorkspace } = runtime.localExportSourcePipeline.controller;
+const { openExportWorkspace } = runtime.localExportWorkspace;
 const secret = Buffer.from(process.env.HEAP_SECRET_HEX, "hex");
 const options = {
   directory: process.env.HEAP_WORKSPACE_DIRECTORY,
@@ -208,8 +208,7 @@ function runHeapWorker(value, { checkpointLinesPerBatch } = {}) {
     timeout: 45_000,
     env: {
       ...process.env,
-      HEAP_CONTROLLER_MODULE: CONTROLLER_MODULE,
-      HEAP_WORKSPACE_MODULE: WORKSPACE_MODULE,
+        HEAP_LOCAL_RUNTIME_MODULE: LOCAL_RUNTIME_MODULE,
       HEAP_WORKSPACE_DIRECTORY: value.workspace,
       HEAP_CODEX_HOME: value.home,
       HEAP_SECRET_HEX: SECRET.toString("hex"),

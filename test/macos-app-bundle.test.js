@@ -317,7 +317,6 @@ async function sha256File(path) {
 const NORMALIZED_TEST_CODE_PATHS = new Set([
   "Contents/MacOS/TiboTattle",
   "Contents/Resources/runtime/bin/node",
-  "Contents/Resources/app/node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
   ...SPARKLE_MACH_O_PATHS.map(
     (path) => `Contents/Frameworks/Sparkle.framework/${path}`,
   ),
@@ -727,7 +726,18 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(source, /case companionAlreadyRunning/u);
   assert.match(source, /UM_MACOS_COMPANION_ALREADY_RUNNING/u);
-  assert.match(source, /automatic_contribution_instance_active/u);
+  assert.match(
+    source,
+    /activeInstanceErrorCodes: Set<String> = \[[\s\S]*?"automatic_contribution_instance_active"[\s\S]*?"automatic_contribution_retirement_instance_active"[\s\S]*?\]/u,
+  );
+  assert.match(
+    source,
+    /diagnosticTokens = pendingStandardError\.split[\s\S]*?Self\.activeInstanceErrorCodes\.contains\(String\(\$0\)\)/u,
+  );
+  assert.doesNotMatch(
+    source,
+    /pendingStandardError\.contains\("automatic_contribution(?:_retirement)?_instance_active"\)/u,
+  );
   assert.match(
     source,
     /anotherInstanceIsActive\s*\? LauncherError\.companionAlreadyRunning/u,
@@ -2593,57 +2603,15 @@ test("targeted local Keychain reset removes only exact local capabilities and re
     "contribution-device-binding-v1.json",
   );
   const exportResidue = join(stateRoot, "export-participant-secret");
-  const stored = new Map([
-    // Both contribution-device storage generations: the app-minted broker
-    // item and the companion-minted legacy item are one credential surface
-    // and the reset must clear whichever exist. Only the legacy item is
-    // reachable through the decrypting backend — the app-minted item's ACL
-    // names the signed app alone, so this helper never reads it and the map
-    // below deliberately offers no way to.
-    [
-      "app-usagemonitor.contribution-device.v1",
-      Buffer.alloc(32, 0x31),
-    ],
-    [
-      "app-usagemonitor.export-identity.v1",
-      Buffer.alloc(32, 0x32),
-    ],
-    [
-      "app-usagemonitor.account-observation.v1",
-      Buffer.alloc(32, 0x33),
-    ],
-  ]);
-  // The app-minted generation, addressed only by service and account. An
-  // attribute delete never decrypts, so nothing here is a secret.
+  // Every retired and app-owned generation is represented only by attributes;
+  // the reset helper never loads a native binding or decrypts a value.
   const attributeItems = new Set([
+    "app-usagemonitor.contribution-device.v1",
     "app-usagemonitor.contribution-device.app.v1",
-  ]);
-  const partialStored = new Map([
-    [
-      "app-usagemonitor.contribution-device.v1",
-      Buffer.alloc(32, 0x41),
-    ],
-    [
-      "app-usagemonitor.export-identity.v1",
-      Buffer.alloc(32, 0x42),
-    ],
+    "app-usagemonitor.export-identity.v1",
+    "app-usagemonitor.export-identity.app.v1",
   ]);
   const calls = [];
-  const backend = {
-    async read(capability) {
-      calls.push(["read", capability.service]);
-      const value = stored.get(capability.service);
-      return value ? Buffer.from(value) : null;
-    },
-    async deleteExact(capability, expected) {
-      calls.push(["deleteExact", capability.service]);
-      const current = stored.get(capability.service);
-      if (!current || !current.equals(expected)) return "conflict";
-      current.fill(0);
-      stored.delete(capability.service);
-      return "deleted";
-    },
-  };
   const attributeProbe = (capability) => {
     calls.push(["attributeProbe", capability.service]);
     return attributeItems.has(capability.service) ? "present" : "missing";
@@ -2662,7 +2630,6 @@ test("targeted local Keychain reset removes only exact local capabilities and re
     await writeFile(retained, "{\"retained\":true}\n", { mode: 0o600 });
 
     const result = await resetLocalKeychainIdentityAndDevice({
-      backend,
       stateRoot,
       attributeProbe,
       attributeDelete,
@@ -2686,28 +2653,21 @@ test("targeted local Keychain reset removes only exact local capabilities and re
         deviceRevoked: false,
       },
     });
-    // The app-minted generation is cleared by attribute and the legacy one by
-    // exact value. The helper must never decrypt the app generation: reading
-    // it would require the very node trusted-application entry that
-    // `designatedReaderAccess()` no longer mints, and a keytar read of an item
-    // this process is not trusted for is precisely what raises a dialog.
+    // Both generations are fixed attribute deletes. No runtime can ask for a
+    // stored secret, so the broker-less helper has no keytar dependency.
     assert.deepEqual(
       calls.filter(([method]) => method === "attributeDelete"),
-      [["attributeDelete", "app-usagemonitor.contribution-device.app.v1"]],
-    );
-    assert.deepEqual(
-      calls.filter(([method]) => method === "deleteExact"),
       [
-        ["deleteExact", "app-usagemonitor.contribution-device.v1"],
-        ["deleteExact", "app-usagemonitor.export-identity.v1"],
+        ["attributeDelete", "app-usagemonitor.contribution-device.v1"],
+        ["attributeDelete", "app-usagemonitor.contribution-device.app.v1"],
+        ["attributeDelete", "app-usagemonitor.export-identity.v1"],
+        ["attributeDelete", "app-usagemonitor.export-identity.app.v1"],
       ],
     );
     assert.equal(
-      calls.some(([method, service]) =>
-        method === "read"
-        && service === "app-usagemonitor.contribution-device.app.v1"),
+      calls.some(([method]) => method === "read" || method === "deleteExact"),
       false,
-      "the app-minted generation is never decrypted",
+      "no Keychain generation is decrypted",
     );
     // Every attribute probe is a preflight: none may run after the first
     // mutation, so the read-only phase stays complete before anything changes.
@@ -2715,16 +2675,11 @@ test("targeted local Keychain reset removes only exact local capabilities and re
       calls.findLast(([method]) => method === "attributeProbe") !== undefined
         && calls.indexOf(calls.findLast(([method]) =>
           method === "attributeProbe"))
-          < calls.findIndex(([method]) =>
-            method === "attributeDelete" || method === "deleteExact"),
+          < calls.findIndex(([method]) => method === "attributeDelete"),
       true,
       "attribute probes complete before any deletion",
     );
     assert.equal(attributeItems.size, 0);
-    assert.equal(
-      stored.has("app-usagemonitor.account-observation.v1"),
-      true,
-    );
     assert.equal(await readFile(retained, "utf8"), "{\"retained\":true}\n");
     await assert.rejects(lstat(deviceState), { code: "ENOENT" });
     await assert.rejects(lstat(exportResidue), { code: "ENOENT" });
@@ -2739,22 +2694,13 @@ test("targeted local Keychain reset removes only exact local capabilities and re
     const partialDeletes = [];
     const partial = await resetLocalKeychainIdentityAndDevice({
       stateRoot,
-      backend: {
-        async read(capability) {
-          const value = partialStored.get(capability.service);
-          return value ? Buffer.from(value) : null;
-        },
-        async deleteExact(capability) {
-          partialDeletes.push(capability.service);
-          const error = new Error("must not escape");
-          error.code = "export_identity_keychain_locked";
-          throw error;
-        },
+      attributeProbe: () => "present",
+      attributeDelete: (capability) => {
+        partialDeletes.push(capability.service);
+        const error = new Error("must not escape");
+        error.code = "export_identity_keychain_locked";
+        throw error;
       },
-      // This install predates the app generation: the attribute leg is a
-      // clean miss, and the locked legacy delete is what makes it partial.
-      attributeProbe: () => "missing",
-      attributeDelete: () => "missing",
     });
     assert.deepEqual(partial, {
       schemaVersion: "usage-monitor-local-keychain-reset-v1",
@@ -2786,7 +2732,6 @@ test("targeted local Keychain reset removes only exact local capabilities and re
     await symlink(unsafeTarget, deviceState);
     await assert.rejects(
       resetLocalKeychainIdentityAndDevice({
-        backend,
         stateRoot,
         attributeProbe,
         attributeDelete,
@@ -2795,28 +2740,41 @@ test("targeted local Keychain reset removes only exact local capabilities and re
     );
     assert.equal(await readFile(unsafeTarget, "utf8"), "outside");
   } finally {
-    for (const secret of stored.values()) secret.fill(0);
-    for (const secret of partialStored.values()) secret.fill(0);
     await rm(temporaryRoot, { recursive: true, force: true });
   }
 });
 
-test("the app Keychain broker mints the contribution credential app-side over the spawn socketpair", async () => {
+test("the app Keychain broker owns a closed capability set and migrates legacy items safely", async () => {
   const [source, brokerSource] = await Promise.all([
     readFile(SWIFT_SOURCE, "utf8"),
     readFile(KEYCHAIN_BROKER_SOURCE, "utf8"),
   ]);
 
-  // The Swift storage generation and channel announcement stay in lockstep
-  // with the companion-side broker client.
-  const appCapability = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp;
-  assert.equal(
-    brokerSource.includes(`static let service = "${appCapability.service}"`),
-    true,
+  assert.match(
+    brokerSource,
+    /case exportIdentity = "export_identity"[\s\S]*?case accountObservation = "account_observation"[\s\S]*?case claudeSessionPseudonym = "claude_session_pseudonym"[\s\S]*?case contributionDevice = "contribution_device"/u,
   );
-  assert.equal(
-    brokerSource.includes(`static let account = "${appCapability.account}"`),
-    true,
+  for (const service of [
+    "app-usagemonitor.export-identity.app.v1",
+    "app-usagemonitor.account-observation.app.v1",
+    "app-usagemonitor.claude-session-pseudonym.app.v1",
+    "app-usagemonitor.contribution-device.app.v1",
+    "app-usagemonitor.export-identity.v1",
+    "app-usagemonitor.account-observation.v1",
+    "app-usagemonitor.claude-session-pseudonym.v1",
+    "app-usagemonitor.contribution-device.v1",
+  ]) {
+    assert.equal(brokerSource.includes(`"${service}"`), true, service);
+  }
+  assert.match(brokerSource, /private static let protocolVersion = 2/u);
+  assert.match(brokerSource, /private static let legacyProtocolVersion = 1/u);
+  assert.match(
+    brokerSource,
+    /guard request\["capability"\] == nil else \{ return nil \}[\s\S]*?return \.contributionDevice/u,
+  );
+  assert.match(
+    brokerSource,
+    /BrokerKeychainCapability\(rawValue: raw\)/u,
   );
   assert.equal(
     brokerSource.includes(
@@ -2825,17 +2783,11 @@ test("the app Keychain broker mints the contribution credential app-side over th
     true,
   );
 
-  // The channel is a kernel socketpair: close-on-exec on both raw ends, a
-  // dead peer surfaces as a write error rather than SIGPIPE, and frames are
-  // bounded so anything that is not this protocol fails the channel closed.
   assert.match(brokerSource, /socketpair\(AF_UNIX, SOCK_STREAM, 0, &endpoints\)/u);
   assert.match(brokerSource, /F_SETFD, FD_CLOEXEC/u);
   assert.match(brokerSource, /SO_NOSIGPIPE/u);
   assert.match(brokerSource, /maximumFrameBytes = 4_096/u);
   assert.match(brokerSource, /storedSecretPattern = "\^\[A-Za-z0-9_-\]\{43\}\$"/u);
-  // Reads, Keychain operations, and teardown share one dispatch queue, and
-  // only the read source's cancellation handler closes the descriptor — a
-  // read can therefore never race the close.
   assert.match(
     brokerSource,
     /DispatchSource\.makeReadSource\(\s*fileDescriptor: descriptor,\s*queue: queue\s*\)/u,
@@ -2845,121 +2797,81 @@ test("the app Keychain broker mints the contribution credential app-side over th
     /source\.setCancelHandler \{\s*close\(descriptor\)\s*\}/u,
   );
 
-  // Mint and read happen through SecItem in the login keychain; the
-  // data-protection keychain is rejected until the app carries the
-  // provisioning-profile entitlement it requires.
-  assert.match(brokerSource, /SecItemAdd\(/u);
-  assert.match(brokerSource, /SecItemCopyMatching\(/u);
-  assert.match(brokerSource, /SecItemDelete\(/u);
-  assert.doesNotMatch(brokerSource, /kSecUseDataProtectionKeychain/u);
-  // Never SecItemUpdate: Apple's implementation answers an update that hits
-  // errSecVerifyFailed by recreating the item with a DEFAULT access control
-  // list (_ReplaceKeychainItem → SecKeychainItemCreateFromContent with
-  // initialAccess = NULL), silently widening the app-only ACL to the system
-  // default — a change nothing would observe, because this app keeps access
-  // either way. Every ~25-day rotation takes the duplicate path, so the
-  // replacement must be a delete followed by an add that carries the access
-  // object again.
   assert.doesNotMatch(brokerSource, /SecItemUpdate\(/u);
+  assert.doesNotMatch(brokerSource, /kSecUseDataProtectionKeychain/u);
   assert.match(
     brokerSource,
-    /guard status == errSecDuplicateItem else \{\s*return Self\.failureCode\(status\)\s*\}/u,
+    /readSecret\(capability, generation: \.modern\)[\s\S]*?legacyPresence\(capability\)/u,
   );
   assert.match(
     brokerSource,
-    /let removal = SecItemDelete\(baseQuery\(\) as CFDictionary\)[\s\S]*?let replacement = SecItemAdd\(attributes as CFDictionary, nil\)/u,
+    /generation: \.legacy,\s*allowInteraction: true/u,
+  );
+  assert.match(
+    brokerSource,
+    /addMigratedSecret\(legacy, capability: capability\)[\s\S]*?readSecret\(capability, generation: \.modern\)[\s\S]*?deleteItem\(\s*capability,\s*generation: \.legacy/u,
+  );
+  assert.match(
+    brokerSource,
+    /if created \{ _ = deleteSecret\(capability: capability\) \}[\s\S]*?return \.failure\("operation_failed"\)/u,
+  );
+  assert.match(
+    brokerSource,
+    /private static let processMigrationPromptState = MigrationPromptState\(\)/u,
+  );
+  assert.match(
+    brokerSource,
+    /func claimInteractiveRead[\s\S]*?lock\.lock\(\)[\s\S]*?attempted\.insert\(capability\)\.inserted/u,
+  );
+  assert.match(
+    brokerSource,
+    /migrationPromptState = injectedMigrationPromptState[\s\S]*?Self\.processMigrationPromptState/u,
+  );
+  assert.match(
+    brokerSource,
+    /guard migrationPromptState\.claimInteractiveRead\(capability\) else \{[\s\S]*?return \.failure\("migration_required"\)/u,
+  );
+  assert.match(
+    brokerSource,
+    /let deniedPromptState = MigrationPromptState\(\)[\s\S]*?let deniedBroker[\s\S]*?let relaunchedDeniedBroker[\s\S]*?migrationPromptState: deniedPromptState/u,
+  );
+  assert.match(
+    brokerSource,
+    /private static let nativeSmokeArguments = Set\(\[[\s\S]*?"--keychain-broker-contract-smoke-test"[\s\S]*?"--smoke-test"[\s\S]*?\]\)/u,
+  );
+  assert.match(
+    brokerSource,
+    /!Self\.nativeSmokeArguments\.isDisjoint\(\s*with: CommandLine\.arguments\.dropFirst\(\)\s*\)/u,
+  );
+  assert.doesNotMatch(brokerSource, /hasSuffix\("-smoke-test"\)/u);
+  assert.match(
+    brokerSource,
+    /private init\([\s\S]*?smokeStorage: EphemeralSmokeStorage\?[\s\S]*?migrationPromptState injectedMigrationPromptState:[\s\S]*?MigrationPromptState\? = nil[\s\S]*?\) throws[\s\S]*?ephemeralSmokeStorage = selectedSmokeStorage/u,
+  );
+  assert.match(
+    brokerSource,
+    /static func runContractSmokeTest\(\) -> Int32[\s\S]*?smokeResponse\(capabilityBroker,[\s\S]*?"v": 1[\s\S]*?migrationStorage\.legacy\[\.exportIdentity\][\s\S]*?deniedStorage\.deniedLegacyReads\.insert\(\.accountObservation\)[\s\S]*?failedMigrationReadbacks\.insert\([\s\S]*?requireMalformedFrameClosure/u,
+  );
+  assert.match(
+    source,
+    /arguments\.contains\("--keychain-broker-contract-smoke-test"\)[\s\S]*?ContributionDeviceKeychainBroker\.runContractSmokeTest\(\)/u,
   );
 
-  // No SecItem call may raise a dialog. This queue serializes reads, Keychain
-  // work, responses, and teardown, so a modal prompt would block the channel
-  // until the companion's timeout poisoned its transport permanently — the
-  // user answering correctly would find it already dead. Suppressed, those
-  // states return errSecInteractionNotAllowed and take the existing locked
-  // path instead.
-  assert.match(
-    brokerSource,
-    /SecKeychainSetUserInteractionAllowed\(false\)\s*\n\s*defer \{ SecKeychainSetUserInteractionAllowed\(true\) \}/u,
-  );
-  // Every SecItem call site sits after the withoutUserInteraction that opens
-  // its enclosing function, so none can be added outside the suppression.
-  for (const call of ["SecItemCopyMatching(", "SecItemAdd(", "SecItemDelete("]) {
-    let index = brokerSource.indexOf(call);
-    assert.notEqual(index, -1, call);
-    while (index !== -1) {
-      const preceding = brokerSource.slice(0, index);
-      assert.equal(
-        preceding.lastIndexOf("withoutUserInteraction")
-          > preceding.lastIndexOf("private func "),
-        true,
-        `${call} at ${index} is outside withoutUserInteraction`,
-      );
-      index = brokerSource.indexOf(call, index + call.length);
-    }
-  }
-  // Items address only the app-managed service; the legacy `.v1` item is
-  // structurally unreachable from app-side code.
-  assert.match(brokerSource, /kSecAttrService as String: Self\.service/u);
-
-  // Every fresh item trusts THIS APP AND NOTHING ELSE by designated
-  // requirement, and a mint without that access object fails closed.
-  //
-  // This is the broker's whole confidentiality claim, so it is pinned
-  // exactly. `runtime/bin/node` was in this list until 2026-08-20 for the
-  // reset helper's keytar read, and while it was, the claim was false: node
-  // is a world-executable general-purpose interpreter inside the bundle, so
-  // ANY same-user process could run it, satisfy the designated requirement,
-  // and read the credential silently. The reset helper now clears the
-  // app-minted generation by attribute (never decrypting, so never consulting
-  // an ACL), which is what allows exactly one entry here.
-  assert.match(
-    brokerSource,
-    /SecTrustedApplicationCreateFromPath\(nil, &trustedSelf\)/u,
-  );
   const accessSource = brokerSource.slice(
     brokerSource.indexOf("private func designatedReaderAccess"),
-    brokerSource.indexOf("private func storeSecret"),
+    brokerSource.indexOf("private func attributes"),
   );
-  assert.notEqual(accessSource, "");
-  // Exactly one trusted application is created, and the array handed to
-  // SecAccessCreate holds exactly that one.
   assert.equal(
     accessSource.match(/SecTrustedApplicationCreateFromPath\(/gu)?.length,
     1,
   );
-  assert.match(
-    accessSource,
-    /SecAccessCreate\(\s*Self\.service as CFString,\s*\[appTrust\] as CFArray,\s*&access\s*\)/u,
-  );
-  // Nothing in the broker may name a second reader: no node runtime path may
-  // reach the access object, by any route.
-  assert.doesNotMatch(brokerSource, /nodeRuntimePath/u);
-  assert.doesNotMatch(brokerSource, /trustedReader/u);
+  assert.match(accessSource, /\[appTrust\] as CFArray/u);
+  assert.doesNotMatch(accessSource, /nodeRuntimePath|trustedReader/u);
   assert.match(brokerSource, /kSecAttrAccess as String/u);
-  assert.match(
-    brokerSource,
-    /guard let access = designatedReaderAccess\(\) else \{\s*return "operation_failed"/u,
-  );
 
-  // Failure classification keeps the companion's locked/denied identities.
-  assert.match(
-    brokerSource,
-    /case errSecInteractionNotAllowed:\s*return "locked"/u,
-  );
-  assert.match(
-    brokerSource,
-    /case errSecAuthFailed, errSecUserCanceled:\s*return "denied"/u,
-  );
-
-  // Spawn wiring: the companion's standard input is the broker endpoint, the
-  // environment names only the descriptor, the parent drops its copy of the
-  // child end after the spawn, and termination tears the broker down.
   assert.match(
     source,
     /child\.standardInput = broker\?\.childEndpoint \?\? FileHandle\.nullDevice/u,
-  );
-  assert.match(
-    source,
-    /let broker = try\? ContributionDeviceKeychainBroker\(\)/u,
   );
   assert.match(
     source,
@@ -2971,113 +2883,45 @@ test("the app Keychain broker mints the contribution credential app-side over th
     source.indexOf("func stop(completion:"),
   );
   assert.match(terminationSource, /broker\?\.shutdown\(\)/u);
-
-  // The one-shot reset helper runs without a broker: its standard input
-  // stays the null device and its environment never announces a channel.
-  const resetHelperSource = source.slice(
-    source.indexOf("private func launchLocalKeychainResetHelper"),
-    source.indexOf("private func finishLocalKeychainReset"),
-  );
-  assert.match(
-    resetHelperSource,
-    /child\.standardInput = FileHandle\.nullDevice/u,
-  );
-  assert.equal(
-    resetHelperSource.includes(CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_FD_ENV),
-    false,
-  );
 });
 
-test("the app-minted credential's only reader is the app, and the reset helper needs no ACL", async () => {
-  // The load-bearing pair, pinned together because either half alone is a
-  // trap. The app-only ACL is only safe while nothing outside the app needs
-  // to decrypt the item; the reset helper is the only such candidate, and it
-  // is a broker-less node process (pinned above: null stdin, no announcement).
-  // If someone re-adds the app generation to the helper's decrypting list, its
-  // keytar read would fail or prompt on every reset — so this test fails
-  // instead, naming the fix.
-  const [brokerSource, helperSource] = await Promise.all([
-    readFile(KEYCHAIN_BROKER_SOURCE, "utf8"),
-    readFile(
-      new URL("../apps/macos/reset-local-keychain.js", import.meta.url),
-      "utf8",
-    ),
-  ]);
-  const appService =
-    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp.service;
-  const legacyService =
-    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice.service;
-
-  // One trusted application on the app-minted item, and it is this app.
-  const accessSource = brokerSource.slice(
-    brokerSource.indexOf("private func designatedReaderAccess"),
-    brokerSource.indexOf("private func storeSecret"),
+test("the broker-less reset helper deletes fixed legacy and app generations without keytar", async () => {
+  const helperSource = await readFile(
+    new URL("../apps/macos/reset-local-keychain.js", import.meta.url),
+    "utf8",
   );
-  assert.equal(
-    accessSource.match(/SecTrustedApplicationCreateFromPath\(/gu)?.length,
-    1,
-  );
-  assert.match(
-    accessSource,
-    /SecTrustedApplicationCreateFromPath\(nil, &trustedSelf\)/u,
-  );
-  assert.match(accessSource, /\[appTrust\] as CFArray/u);
-
-  // The helper's target table: the app generation is attribute-addressed
-  // only, the legacy generation keeps its decrypting read + exact delete.
   const targets = helperSource.match(
     /const TARGETS = Object\.freeze\(\[([\s\S]*?)\n\]\);/u,
   )?.[1];
-  assert.ok(targets, "the reset helper's target table is available");
-  const decrypting = targets.slice(
-    targets.indexOf("capabilities: Object.freeze(["),
-    targets.indexOf("attributeCapabilities: Object.freeze(["),
-  );
-  assert.equal(decrypting.includes("contributionDeviceApp"), false);
-  assert.equal(decrypting.includes("contributionDevice,"), true);
-  assert.match(
-    targets,
-    /attributeCapabilities: Object\.freeze\(\[\s*EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES\.contributionDeviceApp,\s*\]\)/u,
-  );
-  // The helper reaches the attribute-addressed platform operations, which are
-  // the ones that never decrypt.
-  assert.match(
-    helperSource,
-    /deleteExportIdentityKeychainItemByAttributes,\s*\n\s*exportIdentityKeychainItemPresenceByAttributes,/u,
-  );
+  assert.ok(targets);
+  for (const capability of [
+    "EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice",
+    "EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp",
+    "EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity",
+    "MACOS_APP_KEYCHAIN_CAPABILITIES.exportIdentity",
+  ]) {
+    assert.equal(targets.includes(capability), true, capability);
+  }
+  assert.doesNotMatch(helperSource, /createExportIdentityKeychainBackend|deleteExact\(|\.read\(/u);
   assert.match(
     helperSource,
     /attributeProbe = exportIdentityKeychainItemPresenceByAttributes,\s*\n\s*attributeDelete = deleteExportIdentityKeychainItemByAttributes,/u,
   );
-
-  // Those operations address the item by service and account and carry no
-  // -w/-g, which is what makes them decryption-free — the property the whole
-  // arrangement rests on (owner-verified live on a fresh account 2026-08-20:
-  // the attribute delete of an app-minted item succeeds with no prompt).
-  for (const [args, service] of [
-    [
-      exportIdentityKeychainAttributeDeleteArguments(
-        EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp,
-      ),
-      appService,
-    ],
-    [
-      exportIdentityKeychainAttributeProbeArguments(
-        EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp,
-      ),
-      appService,
-    ],
+  for (const capability of [
+    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice,
+    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp,
   ]) {
-    assert.deepEqual(args.slice(1), ["-s", service, "-a", "installation"]);
-    assert.equal(args.includes("-w"), false);
-    assert.equal(args.includes("-g"), false);
+    for (const args of [
+      exportIdentityKeychainAttributeDeleteArguments(capability),
+      exportIdentityKeychainAttributeProbeArguments(capability),
+    ]) {
+      assert.deepEqual(
+        args.slice(1),
+        ["-s", capability.service, "-a", capability.account],
+      );
+      assert.equal(args.includes("-w") || args.includes("-g"), false);
+    }
   }
-  assert.equal(
-    exportIdentityKeychainAttributeDeleteArguments(
-      EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice,
-    )[2],
-    legacyService,
-  );
 });
 
 test("reviewed dogfood is configured with shared service and isolated updates", () => {
@@ -4649,7 +4493,6 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
     for (const relativePath of [
       "Contents/MacOS/TiboTattle",
       "Contents/Resources/runtime/bin/node",
-      "Contents/Resources/app/node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
       "Contents/Resources/AppIcon.icns",
       "Contents/Resources/licenses/app-icon-provenance.txt",
       `Contents/Resources/licenses/sparkle-${SPARKLE_VERSION}.txt`,
@@ -4775,49 +4618,6 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
     );
     await writeBuildManifest();
 
-    // The synthetic keytar.node staged above is not the audited npm
-    // artifact, and Developer ID signing must refuse to sign it: the
-    // runtime loader trusts a signed binding through its designated
-    // requirement, so the byte audit has to happen here, before signing.
-    await assert.rejects(
-      developerIDSignMacOSApp(app, {
-        commandRunner: (command) => {
-          if (command === "/usr/bin/security") {
-            return { stderr: "", stdout: `1) HASH "${identity}"\n` };
-          }
-          return { stderr: "", stdout: "" };
-        },
-        identity,
-      }),
-      { code: "MACOS_KEYTAR_BINDING_UNAUDITED" },
-    );
-
-    // With the audited bytes staged, signing proceeds — and additionally
-    // proves the signed binding against the exact designated requirement
-    // the runtime loader tests.
-    const rootRequire = createRequire(join(REPOSITORY_ROOT, "package.json"));
-    const keytarBindingPath = join(
-      app,
-      "Contents",
-      "Resources",
-      "app",
-      "node_modules",
-      "@github",
-      "keytar",
-      "prebuilds",
-      "darwin-arm64",
-      "keytar.node",
-    );
-    await chmod(keytarBindingPath, 0o700);
-    await copyFile(
-      rootRequire.resolve(
-        "@github/keytar/prebuilds/darwin-arm64/keytar.node",
-      ),
-      keytarBindingPath,
-    );
-    await chmod(keytarBindingPath, 0o555);
-    await writeBuildManifest();
-
     const calls = [];
     const runner = (command, arguments_, options = {}) => {
       calls.push({ arguments_, command, options });
@@ -4844,7 +4644,7 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
     const signing = calls.filter(({ command, arguments_ }) =>
       command === "/usr/bin/codesign"
       && arguments_.includes("--sign"));
-    assert.equal(signing.length, 9);
+    assert.equal(signing.length, 8);
     assert.match(signing[0].arguments_.at(-1), /Installer\.xpc$/u);
     assert.match(signing[1].arguments_.at(-1), /Downloader\.xpc$/u);
     assert.equal(
@@ -4856,16 +4656,15 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
     assert.match(signing[2].arguments_.at(-1), /Versions\/B\/Autoupdate$/u);
     assert.match(signing[3].arguments_.at(-1), /Updater\.app$/u);
     assert.match(signing[4].arguments_.at(-1), /Sparkle\.framework$/u);
-    assert.match(signing[5].arguments_.at(-1), /keytar\.node$/u);
-    assert.match(signing[6].arguments_.at(-1), /runtime\/bin\/node$/u);
+    assert.match(signing[5].arguments_.at(-1), /runtime\/bin\/node$/u);
     assert.match(
-      signing[6].arguments_[
-        signing[6].arguments_.indexOf("--entitlements") + 1
+      signing[5].arguments_[
+        signing[5].arguments_.indexOf("--entitlements") + 1
       ],
       /NodeRuntime\.entitlements$/u,
     );
-    assert.match(signing[7].arguments_.at(-1), /MacOS\/TiboTattle$/u);
-    assert.equal(signing[8].arguments_.at(-1), app);
+    assert.match(signing[6].arguments_.at(-1), /MacOS\/TiboTattle$/u);
+    assert.equal(signing[7].arguments_.at(-1), app);
     for (const call of signing) {
       assert.equal(call.arguments_.includes("--options"), true);
       assert.equal(call.arguments_.includes("runtime"), true);
@@ -4878,22 +4677,18 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
       && arguments_.includes("--verify"));
     assert.equal(verify.arguments_.includes("--deep"), true);
     assert.equal(verify.arguments_.includes("--strict"), true);
-    // The freshly signed binding is proven against the exact requirement
-    // the runtime loader will test on every launch: same team, same
-    // identifier, nothing build-specific.
+    // The packaged app has no keytar native addon or designated-requirement
+    // verification path; only the signed Swift app touches Keychain.
     const requirementVerify = calls.find(({ command, arguments_ }) =>
       command === "/usr/bin/codesign"
       && arguments_.some((argument) =>
         typeof argument === "string" && argument.startsWith("-R=")));
-    assert.deepEqual(requirementVerify.arguments_, [
-      "--verify",
-      "--strict",
-      "-R=anchor apple generic"
-        + ' and certificate leaf[subject.OU] = "43RTH622SB"'
-        + ' and identifier "keytar"',
-      "--",
-      keytarBindingPath,
-    ]);
+    assert.equal(requirementVerify, undefined);
+    assert.equal(
+      signing.some(({ arguments_ }) =>
+        arguments_.at(-1).endsWith("keytar.node")),
+      false,
+    );
 
     const dmg = join(temporaryRoot, "TiboTattle.dmg");
     await writeFile(dmg, "signed-DMG-fixture");
@@ -5069,7 +4864,6 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "@app-usagemonitor/identity-core",
     "@app-usagemonitor/quota-analysis",
     "@app-usagemonitor/telemetry-contract",
-    "@github/keytar",
     "ajv",
     "runcost/browser",
   ]);
@@ -5993,7 +5787,6 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
           name: "@app-usagemonitor/telemetry-contract",
           version: RELEASE_VERSION,
         },
-        { name: "@github/keytar", version: "7.10.6" },
         { name: "ajv", version: "8.20.0" },
         { name: "fast-deep-equal", version: "3.1.3" },
         { name: "fast-uri", version: "3.1.5" },
@@ -6235,6 +6028,20 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       loginItemSmoke.stdout,
       /^USAGE_MONITOR_MACOS_LOGIN_ITEM_CONTRACT fake=true register=affirmative-only unregister=explicit status=enabled,not-registered,requires-approval,unavailable outcomes=confirmed,requires-approval,not-confirmed,unavailable,failed pending_removal=true real_service_calls=0 daemon=false$/mu,
     );
+    const keychainBrokerSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--keychain-broker-contract-smoke-test"],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(
+      keychainBrokerSmoke.status,
+      0,
+      keychainBrokerSmoke.stderr || keychainBrokerSmoke.stdout,
+    );
+    assert.match(
+      keychainBrokerSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_KEYCHAIN_BROKER_CONTRACT protocols=v1,v2 capabilities=4 migration=success,denied-preserved,readback-rollback malformed=closed keychain_access=0$/mu,
+    );
     const menuBarSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),
       ["--menu-bar-contract-smoke-test"],
@@ -6445,9 +6252,9 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       "--input-type=module",
       "--eval",
       [
-        "import { LOCAL_API_PRICING_METHOD_VERSION }",
+        "import { apiPriceResolutionSummary }",
         "from '@app-usagemonitor/accounting';",
-        "process.stdout.write(LOCAL_API_PRICING_METHOD_VERSION);",
+        "process.stdout.write(apiPriceResolutionSummary().methodVersion);",
       ].join(" "),
     ], {
       cwd: join(outputA, "Contents", "Resources", "app"),
@@ -6536,7 +6343,6 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       );
     }
     for (const relativePath of [
-      "Contents/Resources/app/node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
       "Contents/Resources/runtime/bin/node",
       "Contents/MacOS/TiboTattle",
     ]) {
@@ -7344,7 +7150,7 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
   }
 });
 
-macOSArtifactTest("signed app relays central readiness to an explicitly connected loopback lab", {
+macOSArtifactTest("signed app relays central health to an explicitly connected loopback lab", {
   skip: BUILD_SUPPORTED ? false : "requires pinned macOS arm64 Node v26.2.0 builder",
   timeout: 60_000,
 }, async () => {
@@ -7356,12 +7162,12 @@ macOSArtifactTest("signed app relays central readiness to an explicitly connecte
   const requests = [];
   const central = createServer((request, response) => {
     requests.push(`${request.method} ${request.url}`);
-    if (request.method === "GET" && request.url === "/api/ready") {
+    if (request.method === "GET" && request.url === "/api/health") {
       response.writeHead(200, {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
       });
-      response.end(JSON.stringify({ status: "ready" }));
+      response.end(JSON.stringify({ status: "ok" }));
       return;
     }
     response.writeHead(404, { "Content-Type": "application/json" });
@@ -7446,9 +7252,9 @@ macOSArtifactTest("signed app relays central readiness to an explicitly connecte
     assert.equal(smoke.signal, null);
     assert.match(
       smoke.stdout,
-      /^USAGE_MONITOR_MACOS_CENTRAL_SMOKE_READY host=127\.0\.0\.1 port=[0-9]+ central=development_loopback$/mu,
+      /^USAGE_MONITOR_MACOS_CENTRAL_SMOKE_HEALTHY host=127\.0\.0\.1 port=[0-9]+ central=development_loopback$/mu,
     );
-    assert.deepEqual(requests, ["GET /api/ready"]);
+    assert.deepEqual(requests, ["GET /api/health"]);
 
     const productionOrigin = "https://usage-monitor.example";
     const productionBuild = spawnSync(process.execPath, [

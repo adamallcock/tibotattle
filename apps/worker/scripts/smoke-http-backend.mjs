@@ -6,7 +6,6 @@ import {
   createTelemetryEnvelope,
   validateTelemetryContribution,
 } from "../../web/public/lib.js";
-import { assertDerivedCommunityExpectations } from "./smoke-http-backend-lib.mjs";
 
 function optionValue(name, fallback = null) {
   const index = process.argv.indexOf(name);
@@ -122,6 +121,7 @@ class ParticipantSession {
     this.csrfToken = null;
     this.recoveryCode = null;
     this.bootstrapPairing = null;
+    this.device = null;
     this.created = false;
     this.deleted = false;
   }
@@ -158,9 +158,11 @@ let preserveParticipants = false;
 const COMMUNITY_SNAPSHOT_PARTICIPANTS = 20;
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1000;
 
-async function writeParticipantAccessFile(path, recoveryCode) {
-  if (typeof recoveryCode !== "string" || !recoveryCode.startsWith("um_recovery_")) {
-    throw new Error("The retained participant did not have a valid recovery capability.");
+async function writeParticipantAccessFile(path, session) {
+  if (typeof session?.cookie !== "string"
+      || !session.cookie.startsWith("__Host-usage_monitor_session=")
+      || typeof session?.csrfToken !== "string") {
+    throw new Error("The retained participant did not have a valid session capability.");
   }
   const flags = process.platform === "win32"
     ? constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL
@@ -169,9 +171,10 @@ async function writeParticipantAccessFile(path, recoveryCode) {
   try {
     handle = await open(path, flags, 0o600);
     await handle.writeFile(`${JSON.stringify({
-      schemaVersion: "local-backend-lab-access-v0.1",
+      schemaVersion: "local-backend-lab-access-v0.2",
       origin: origin.origin,
-      recoveryCode,
+      sessionCookie: session.cookie,
+      csrfToken: session.csrfToken,
       createdAt: new Date().toISOString(),
       warning: "Owner-only disposable local-development capability. Do not share.",
     }, null, 2)}\n`, "utf8");
@@ -364,7 +367,7 @@ async function triggerScheduledSnapshot(scheduledTime) {
 
 async function enrollParticipant(
   inviteCode = null,
-  { deviceBootstrap = false } = {},
+  { deviceBootstrap = true } = {},
 ) {
   const session = new ParticipantSession();
   const body = {
@@ -423,27 +426,8 @@ async function enrollParticipant(
   if (probe.csrfToken !== session.csrfToken) {
     throw new Error("The session probe did not preserve its CSRF binding.");
   }
+  if (deviceBootstrap) session.device = await pairDevice(session);
   return session;
-}
-
-async function registerUpload(session, serializedEnvelope) {
-  const body = JSON.stringify({
-    envelopeDigest: sha256Hex(serializedEnvelope),
-    contentLengthBytes: Buffer.byteLength(serializedEnvelope, "utf8"),
-    contentType: "application/json",
-  });
-  const result = await request("/api/v1/me/upload-authorizations", {
-    method: "POST",
-    session,
-    csrf: true,
-    body,
-  });
-  const registration = expectStatus(result, 201, "Upload registration");
-  if (typeof registration?.uploadAuthorization !== "string"
-      || !registration.uploadAuthorization.startsWith("um_upload_")) {
-    throw new Error("The upload registration did not return a one-use authority.");
-  }
-  return registration.uploadAuthorization;
 }
 
 async function pairDevice(session, pairing = session.bootstrapPairing) {
@@ -523,45 +507,14 @@ async function uploadFromDevice(device, serializedEnvelope) {
 }
 
 async function upload(session, serializedEnvelope) {
-  const authorization = await registerUpload(session, serializedEnvelope);
-  const result = await request("/api/v1/contributions", {
-    method: "POST",
-    body: serializedEnvelope,
-    authorization: `Upload ${authorization}`,
-  });
-  return { authorization, result };
-}
-
-async function recover(session) {
-  const oldRecoveryCode = session.recoveryCode;
-  const recoveryAttemptId = `um_recovery_attempt_${randomBytes(32).toString("base64url")}`;
-  const recovered = await request("/api/v1/recover", {
-    method: "POST",
-    session,
-    body: JSON.stringify({ recoveryCode: oldRecoveryCode, recoveryAttemptId }),
-    originValue: origin.origin,
-  });
-  const value = expectStatus(recovered, 200, "Recovery");
-  if (typeof value?.csrfToken !== "string"
-      || typeof value?.recoveryCode !== "string"
-      || value.recoveryCode === oldRecoveryCode) {
-    throw new Error("Recovery did not rotate both session and recovery authority.");
+  if (!session.device) {
+    throw new Error("The participant has no active upload device.");
   }
-  session.csrfToken = value.csrfToken;
-  session.recoveryCode = value.recoveryCode;
-  session.lastRecoveryAttemptId = recoveryAttemptId;
-  return oldRecoveryCode;
+  return uploadFromDevice(session.device, serializedEnvelope);
 }
 
 async function cleanupParticipant(session) {
   if (!session.created || session.deleted) return;
-  if (!session.cookie && session.recoveryCode) {
-    try {
-      await recover(session);
-    } catch {
-      return;
-    }
-  }
   if (!session.cookie || !session.csrfToken) return;
   try {
     const deletion = await request("/api/v1/me", {
@@ -618,17 +571,6 @@ try {
     { deviceBootstrap: true },
   );
 
-  const missingCsrf = await request("/api/v1/me/upload-authorizations", {
-    method: "POST",
-    session: primary,
-    body: JSON.stringify({
-      envelopeDigest: sha256Hex(serializedEnvelope),
-      contentLengthBytes: Buffer.byteLength(serializedEnvelope, "utf8"),
-      contentType: "application/json",
-    }),
-  });
-  expectStatus(missingCsrf, 403, "Missing-CSRF registration");
-
   const sessionOnlyUpload = await request("/api/v1/contributions", {
     method: "POST",
     session: primary,
@@ -636,7 +578,7 @@ try {
   });
   expectStatus(sessionOnlyUpload, 401, "Session-only upload");
 
-  const device = await pairDevice(primary);
+  const device = primary.device;
   const first = await uploadFromDevice(device, serializedEnvelope);
   const accepted = expectStatus(first.result, 202, "Contribution upload");
   if (accepted.accountingVerification !== "server_repriced") {
@@ -661,7 +603,10 @@ try {
     throw new Error("The replay did not preserve canonical repricing.");
   }
 
-  const conflictSafeAuthorization = await registerUpload(primary, serializedEnvelope);
+  const conflictSafeAuthorization = await registerDeviceUpload(
+    device,
+    serializedEnvelope,
+  );
   expectErrorCode(
     await request("/api/v1/contributions", {
       method: "POST",
@@ -781,8 +726,8 @@ try {
     "Oversized contribution request",
   );
 
-  const uploadOnlyPersonal = await request("/api/v1/me/stats", {
-    authorization: `Upload ${await registerUpload(primary, serializedEnvelope)}`,
+  const uploadOnlyPersonal = await request("/api/v1/me/export", {
+    authorization: `Upload ${await registerDeviceUpload(device, serializedEnvelope)}`,
   });
   expectStatus(uploadOnlyPersonal, 401, "Upload-only personal read");
 
@@ -837,91 +782,6 @@ try {
     activityMarkers: contribution.activityMarkers.length,
   };
   const expectedTotal = expected.usageEvents + expected.quotaSnapshots + expected.activityMarkers;
-  const contributionStatus = expectStatus(
-    await request("/api/v1/me/contributions/read", {
-      method: "POST",
-      session: primary,
-      csrf: true,
-      body: JSON.stringify({ contributionId: accepted.contributionId }),
-    }),
-    200,
-    "Contribution status",
-  );
-  const personal = expectStatus(
-    await request("/api/v1/me/stats", { session: primary }),
-    200,
-    "Personal statistics",
-  );
-  const participantProfile = expectStatus(
-    await request("/api/v1/me", { session: primary }),
-    200,
-    "Participant contribution history",
-  );
-  const unavailable = expectStatus(
-    await request("/api/v1/stats/aggregate"),
-    200,
-    "Unavailable aggregate snapshot",
-  );
-  const historyItem = participantProfile.contributions?.[0];
-  const historyCreatedAt = Date.parse(historyItem?.createdAt);
-  // Retention is disabled: the service must publish a null window and a null
-  // per-contribution schedule rather than a date it will never act on.
-  const historyScheduledDeletionAt =
-    historyItem?.quarantine?.scheduledDeletionAt ?? null;
-  const serializedProfile = JSON.stringify(participantProfile);
-  if (contributionStatus.recordCounts?.accepted !== expectedTotal
-      || contributionStatus.serverAccounting?.verification !== "server_repriced"
-      || typeof contributionStatus.serverAccounting?.methodVersion !== "string"
-      || !/^[a-f0-9]{64}$/u.test(
-        contributionStatus.serverAccounting?.registrySha256 ?? "",
-      )
-      || personal.totals?.usageEvents !== expected.usageEvents
-      || personal.totals?.quotaSnapshots !== expected.quotaSnapshots
-      || personal.totals?.activityMarkers !== expected.activityMarkers
-      || personal.totals?.priceVerification !== "server_repriced"
-      || participantProfile.schemaVersion !== "participant-profile-v0.2"
-      || participantProfile.contributionCount !== 1
-      || participantProfile.historyPolicy?.maximumItems !== 101
-      || participantProfile.historyPolicy?.quarantineRetentionMilliseconds
-        !== null
-      || participantProfile.historyPolicy?.canonicalMetadataRetainedAfterQuarantine !== true
-      || participantProfile.historyPolicy?.clientSoftwareVersion
-        !== "unavailable_in_transport"
-      || historyItem?.contributionId !== accepted.contributionId
-      || historyItem?.schemaVersion !== "telemetry-contribution-v0.1"
-      || historyItem?.status !== "accepted"
-      || historyItem?.synthetic !== false
-      || historyItem?.recordCounts?.declared !== expectedTotal
-      || historyItem?.recordCounts?.accepted !== expectedTotal
-      || historyItem?.recordCounts?.deduplicated !== 0
-      || historyItem?.serverAccounting?.verification !== "server_repriced"
-      || historyItem?.quarantine?.state !== "retained"
-      || historyItem?.quarantine?.deletedAt !== null
-      || historyItem?.quarantine?.canonicalMetadataRetained !== true
-      || !Number.isFinite(historyCreatedAt)
-      || historyScheduledDeletionAt !== null
-      || [
-        "r2_key",
-        "plaintext_digest",
-        "envelope_digest",
-        "datasetId",
-        "accountTrackId",
-        "eligibilityUnitId",
-        "recoveryCode",
-        "csrfToken",
-        "\"accounting\"",
-        "registrySha256",
-        "priceBasis",
-      ].some((forbidden) => serializedProfile.includes(forbidden))
-      || unavailable.releaseStatus !== "not_yet_published"
-      || unavailable.immutable !== true
-      || unavailable.nonOverlapping !== true
-      || Object.hasOwn(unavailable, "participantCount")) {
-    throw new Error(
-      "Initial ingest, private history, and recomputed statistics did not match the contribution.",
-    );
-  }
-
   for (let index = 1; index < COMMUNITY_SNAPSHOT_PARTICIPANTS; index += 1) {
     const cohortSession = await enrollParticipant(inviteCodes[index] ?? null);
     expectStatus(
@@ -932,55 +792,21 @@ try {
   }
 
   await triggerScheduledSnapshot(scheduledTime);
-  const aggregateResult = await request("/api/v1/stats/aggregate");
-  const aggregate = expectStatus(
-    aggregateResult,
+  const communityDay = contribution.coveredAt.endAt.slice(0, 10);
+  const communityDaily = expectStatus(
+    await request(
+      `/api/v1/community/daily?from=${communityDay}&to=${communityDay}`,
+    ),
     200,
-    "Published aggregate snapshot",
+    "Community daily output",
   );
-  const aggregateAliasResult = await request("/api/v1/community/insights");
-  const aggregateAlias = expectStatus(
-    aggregateAliasResult,
-    200,
-    "Published aggregate snapshot alias",
-  );
-  const serializedAggregate = JSON.stringify(aggregate);
-  if (aggregate.releaseStatus !== "published"
-      || aggregate.immutable !== true
-      || aggregate.nonOverlapping !== true
-      || !Array.isArray(aggregate.cells)
-      || aggregate.cells.length < 1
-      || aggregateResult.text !== aggregateAliasResult.text
-      || JSON.stringify(aggregateAlias) !== serializedAggregate
-      || ["participantCount", "participantId", "modelFingerprint", "estimatedApiCostUsd"]
-        .some((forbidden) => serializedAggregate.includes(forbidden))) {
-    throw new Error(
-      `${COMMUNITY_SNAPSHOT_PARTICIPANTS} distinct participants did not produce`
-      + " a stable privacy-safe snapshot.",
-    );
+  const serializedCommunityDaily = JSON.stringify(communityDaily);
+  if (communityDaily.schemaVersion !== "community-daily-read-v1.0"
+      || !Array.isArray(communityDaily.days)
+      || ["participantId", "accountTrackId", "modelFingerprint"]
+        .some((forbidden) => serializedCommunityDaily.includes(forbidden))) {
+    throw new Error("The daily community output violated its public contract.");
   }
-  const comparisonStats = expectStatus(
-    await request("/api/v1/me/stats", { session: primary }),
-    200,
-    "Private community comparison",
-  );
-  const comparison = comparisonStats.communityComparison;
-  const serializedComparison = JSON.stringify(comparison);
-  if (comparison?.schemaVersion !== "participant-community-comparison-v0.1"
-      || comparison.status !== "ready"
-      || comparison.snapshotRevision !== 1
-      || ["participantCount", "eligibilityUnitId", "accountTrackId", "percentile", "average"]
-        .some((forbidden) => serializedComparison.includes(forbidden))) {
-    throw new Error(
-      "The authenticated same-week comparison did not preserve clipped-versus-rounded privacy semantics.",
-    );
-  }
-  assertDerivedCommunityExpectations({
-    contribution,
-    participantCount: COMMUNITY_SNAPSHOT_PARTICIPANTS,
-    comparisonCells: comparison.cells,
-    aggregateCells: aggregate.cells,
-  });
 
   const participantExport = expectStatus(
     await request("/api/v1/me/export", { session: primary }),
@@ -996,7 +822,7 @@ try {
   }
 
   if (retainInspectionState) {
-    await writeParticipantAccessFile(participantAccessFile, primary.recoveryCode);
+    await writeParticipantAccessFile(participantAccessFile, primary);
     preserveParticipants = true;
     process.stdout.write(`${JSON.stringify({
       status: "passed_inspectable",
@@ -1013,13 +839,7 @@ try {
       outOfRangeTimestampRejected: true,
       serverValidation: true,
       canonicalServerRepricing: true,
-      personalStatisticsRecomputed: true,
-      authenticatedContributionHistory: true,
-      aggregateUnavailableBeforeSchedule: true,
-      aggregatePublishedAtTwenty: true,
-      aggregateStoredBytesStableAcrossAliases: true,
-      authenticatedWeeklyComparison: true,
-      comparisonAvoidsAverageAndPercentile: true,
+      communityDailyVerified: true,
       participantExportVerified: true,
       generatedContentFreeFixture: generatedFixture,
       authorityIsolation: true,
@@ -1030,53 +850,25 @@ try {
       participantsRetainedForInspection: COMMUNITY_SNAPSHOT_PARTICIPANTS,
     }, null, 2)}\n`);
   } else {
-  const oldCookie = primary.cookie;
-  const oldRecoveryCode = await recover(primary);
-  const replacementCookie = primary.cookie;
-  const replacementCsrf = primary.csrfToken;
-  const replacementRecovery = primary.recoveryCode;
-  const oldSession = new ParticipantSession();
-  oldSession.cookie = oldCookie;
-  expectStatus(
-    await request("/api/v1/me/stats", { session: oldSession }),
-    401,
-    "Pre-recovery session",
-  );
-  for (let retryNumber = 1; retryNumber <= 2; retryNumber += 1) {
-    const retrySession = new ParticipantSession();
-    const retried = expectStatus(
-      await request("/api/v1/recover", {
-        method: "POST",
-        session: retrySession,
-        body: JSON.stringify({
-          recoveryCode: oldRecoveryCode,
-          recoveryAttemptId: primary.lastRecoveryAttemptId,
-        }),
-        originValue: origin.origin,
-      }),
-      200,
-      `Lost-response recovery retry ${retryNumber}`,
-    );
-    if (retrySession.cookie !== replacementCookie
-        || retried.csrfToken !== replacementCsrf
-        || retried.recoveryCode !== replacementRecovery) {
-      throw new Error("A lost-response recovery retry changed replacement authority.");
-    }
-  }
-  expectStatus(
-    await request("/api/v1/recover", {
+  const replacementPairing = expectStatus(
+    await request("/api/v1/me/device-pairings", {
       method: "POST",
+      session: primary,
+      csrf: true,
       body: JSON.stringify({
-        recoveryCode: oldRecoveryCode,
-        recoveryAttemptId: primary.lastRecoveryAttemptId,
+        consentVersion: "ongoing-privacy-safe-telemetry-v0.1",
+        ongoingUpload: true,
       }),
-      originValue: origin.origin,
     }),
-    401,
-    "Exhausted recovery retry",
+    201,
+    "Replacement device pairing",
   );
-
-  const pendingUpload = await registerUpload(primary, serializedEnvelope);
+  primary.device = await pairDevice(primary, replacementPairing);
+  const pendingUpload = await registerDeviceUpload(
+    primary.device,
+    serializedEnvelope,
+  );
+  const previousCsrfToken = primary.csrfToken;
   const reset = expectStatus(
     await request("/api/v1/me/security-reset", {
       method: "POST",
@@ -1087,10 +879,9 @@ try {
     200,
     "Security reset",
   );
-  if (typeof reset.recoveryCode !== "string" || reset.recoveryCode === primary.recoveryCode) {
-    throw new Error("Security reset did not rotate the recovery authority.");
+  if (reset.reset !== true || reset.csrfToken !== previousCsrfToken) {
+    throw new Error("Security reset did not preserve the active session contract.");
   }
-  primary.recoveryCode = reset.recoveryCode;
   primary.csrfToken = reset.csrfToken;
   expectStatus(
     await request("/api/v1/contributions", {
@@ -1102,92 +893,7 @@ try {
     "Pre-reset upload authority",
   );
 
-  const logout = await request("/api/v1/logout", {
-    method: "POST",
-    session: primary,
-    csrf: true,
-    body: "{}",
-  });
-  expectStatus(logout, 200, "Logout");
-  assertSessionCookie(logout.response.headers.get("set-cookie"), { cleared: true });
-  if (primary.cookie !== null) throw new Error("Logout did not clear the local cookie jar.");
-  await recover(primary);
-
-  const contributionDeletion = expectStatus(
-    await request("/api/v1/me/contributions/delete", {
-      method: "POST",
-      session: primary,
-      csrf: true,
-      body: JSON.stringify({ contributionId: accepted.contributionId }),
-    }),
-    200,
-    "Contribution deletion",
-  );
-  if (contributionDeletion.deleted !== true) {
-    throw new Error("Contribution deletion did not complete.");
-  }
-  const historyAfterContributionDeletion = expectStatus(
-    await request("/api/v1/me", { session: primary }),
-    200,
-    "Contribution history after deletion",
-  );
-  if (historyAfterContributionDeletion.schemaVersion !== "participant-profile-v0.2"
-      || historyAfterContributionDeletion.contributionCount !== 0
-      || !Array.isArray(historyAfterContributionDeletion.contributions)
-      || historyAfterContributionDeletion.contributions.length !== 0
-      || historyAfterContributionDeletion.latestContribution !== null) {
-    throw new Error(
-      "Contribution deletion did not remove the batch from private history.",
-    );
-  }
-  const withdrawn = expectStatus(
-    await request("/api/v1/stats/aggregate"),
-    200,
-    "Withdrawn aggregate snapshot",
-  );
-  const serializedWithdrawn = JSON.stringify(withdrawn);
-  if (withdrawn.releaseStatus !== "withdrawn"
-      || withdrawn.immutable !== true
-      || withdrawn.nonOverlapping !== true
-      || ["cells", "participantCount", "participantId", "modelFingerprint"]
-        .some((forbidden) => serializedWithdrawn.includes(forbidden))) {
-    throw new Error("Contribution deletion did not withdraw the published snapshot safely.");
-  }
-  const withdrawnComparisonStats = expectStatus(
-    await request("/api/v1/me/stats", { session: primary }),
-    200,
-    "Withdrawn private comparison",
-  );
-  if (withdrawnComparisonStats.communityComparison?.status !== "not_testable"
-      || withdrawnComparisonStats.communityComparison?.reason
-        !== "community_snapshot_not_released"
-      || withdrawnComparisonStats.communityComparison?.cells?.length !== 0) {
-    throw new Error(
-      "The private comparison did not fail closed after snapshot withdrawal.",
-    );
-  }
-
-  await triggerScheduledSnapshot(scheduledTime + 60 * 60 * 1000);
-  const rebuilt = expectStatus(
-    await request("/api/v1/stats/aggregate"),
-    200,
-    "Rebuilt aggregate snapshot",
-  );
-  const serializedRebuilt = JSON.stringify(rebuilt);
-  if (rebuilt.releaseStatus !== "suppressed"
-      || rebuilt.snapshotRevision !== 2
-      || rebuilt.immutable !== true
-      || rebuilt.nonOverlapping !== true
-      || !Array.isArray(rebuilt.cells)
-      || rebuilt.cells.length !== 0
-      || ["participantCount", "participantId", "modelFingerprint"]
-        .some((forbidden) => serializedRebuilt.includes(forbidden))) {
-    throw new Error(
-      "The deletion rebuild did not publish a privacy-suppressed second revision.",
-    );
-  }
-
-  for (const [index, session] of sessions.entries()) {
+  for (const session of sessions) {
     const deletion = expectStatus(
       await request("/api/v1/me", {
         method: "DELETE",
@@ -1197,29 +903,10 @@ try {
       200,
       "Participant deletion",
     );
-    const expectedDeletedContributions = index === 0 ? 0 : 1;
-    if (deletion.deleted !== true
-        || deletion.contributionsDeleted !== expectedDeletedContributions) {
+    if (deletion.deleted !== true || deletion.contributionsDeleted !== 1) {
       throw new Error("Participant deletion did not remove the expected contribution.");
     }
     session.deleted = true;
-  }
-
-  await triggerScheduledSnapshot(scheduledTime + 2 * 60 * 60 * 1000);
-  const fullyDeletedRebuild = expectStatus(
-    await request("/api/v1/stats/aggregate"),
-    200,
-    "Fully deleted cohort aggregate rebuild",
-  );
-  if (fullyDeletedRebuild.releaseStatus !== "suppressed"
-      || fullyDeletedRebuild.snapshotRevision !== 3
-      || fullyDeletedRebuild.immutable !== true
-      || fullyDeletedRebuild.nonOverlapping !== true
-      || !Array.isArray(fullyDeletedRebuild.cells)
-      || fullyDeletedRebuild.cells.length !== 0) {
-    throw new Error(
-      "Participant deletion did not rebuild the aggregate without deleted sources.",
-    );
   }
 
   process.stdout.write(`${JSON.stringify({
@@ -1237,26 +924,12 @@ try {
     outOfRangeTimestampRejected: true,
     serverValidation: true,
     canonicalServerRepricing: true,
-    personalStatisticsRecomputed: true,
-    authenticatedContributionHistory: true,
-    historyUpdatedAfterContributionDeletion: true,
-    aggregateUnavailableBeforeSchedule: true,
-    aggregatePublishedAtTwenty: true,
-    aggregateStoredBytesStableAcrossAliases: true,
-    authenticatedWeeklyComparison: true,
-    comparisonAvoidsAverageAndPercentile: true,
-    aggregateWithdrawnOnContributionDeletion: true,
-    aggregateRebuiltAfterDeletion: true,
-    aggregateRevisionAfterDeletion: 2,
-    aggregateRebuiltAfterParticipantDeletion: true,
-    aggregateFinalRevision: 3,
+    communityDailyVerified: true,
     generatedContentFreeFixture: generatedFixture,
     authorityIsolation: true,
     devicePairingAndUpload: true,
     deviceRevocation: true,
-    recoveryRotated: true,
     securityResetRevokedUpload: true,
-    logoutClearedCookie: true,
     participantsDeleted: COMMUNITY_SNAPSHOT_PARTICIPANTS,
   }, null, 2)}\n`);
   }

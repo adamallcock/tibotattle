@@ -4,16 +4,16 @@ import {
 } from "../contribution/telemetry-v1-chunks.js";
 
 // The incremental full-history sync controller: consent-once, then sync
-// passes run on the automatic-contribution cadence (6 hours with bounded
+// passes run on a six-hour cadence with bounded
 // dither — daily-or-finer by construction) without further user action. A
 // pass that leaves work pending reschedules within a minute; an exhausted
 // chunk-admission budget backs off to the service's next window; a device
 // the service no longer recognises pauses the schedule exactly as the v0.1
 // queue pauses, until the device is paired again.
 //
-// This is additive beside the v0.1 prepared-set scheduler, not a change to
-// it: the v0.1 consent record, settings schema and recurrence policy are
-// untouched, and the two consents are independent by design.
+// The legacy prepared-set scheduler is retired. Its settings are replaced by
+// a content-free downgrade tombstone before this controller can start; this
+// v1 consent and schedule are the sole automatic contribution authority.
 
 export const INCREMENTAL_CONTRIBUTION_SETTINGS_SCHEMA_VERSION =
   "incremental-contribution-sync-settings-v1.0";

@@ -2433,7 +2433,6 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .manual-contribution code { font-family: var(--mono, ui-monospace, monospace); }
 .evidence-disclosure { display: block; }
-.evidence-disclosure .report-links { justify-content: flex-start; }
 
 /* Consumer hierarchy: the default journey is allowance, one trend, and one
    weekly estimate. Technical evidence remains available through disclosure. */

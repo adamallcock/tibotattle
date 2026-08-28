@@ -8,8 +8,10 @@ import {
   selectCacheValidationBaseline,
   validateLocalHistoryCacheProvenance,
 } from "../src/cli.js";
-import { codexLogSourceFingerprint } from "../src/codex-log-scan.js";
+import { localCodexLogScanner } from "../src/local-node-runtime.js";
 import { writeJsonOwnerOnlyAtomic } from "../src/storage.js";
+
+const { codexLogSourceFingerprint } = localCodexLogScanner;
 
 const START_AT = "2026-07-01T00:00:00.000Z";
 const END_AT = "2026-08-01T00:00:00.000Z";

@@ -27,7 +27,6 @@ export const QUOTA_WINDOW_KINDS: readonly [
   "spark_other",
   "other",
 ];
-export const SUPPORTED_QUOTA_WINDOW_DURATIONS: readonly [300, 10080];
 export function sanitizeQuotaLimitId(value: unknown): string;
 export function sanitizeQuotaLimitDisplayName(value: unknown): string | null;
 export function quotaLimitDisplayAlias(limitId: unknown): string | null;
@@ -44,9 +43,6 @@ export interface QuotaWindowSelectionInput {
   durationMinutes?: number;
   windowDurationMins?: number;
 }
-export function selectPrimaryQuotaWindow<T extends QuotaWindowSelectionInput>(
-  windows: readonly T[] | null | undefined,
-): T | null;
 export function formatQuotaWindowDuration(value: number): string | null;
 export function classifyQuotaWindowKind(
   limitId: unknown,
@@ -295,11 +291,6 @@ export interface QuotaRollingComparisons {
   comparisons: QuotaRollingComparison[];
 }
 
-export const QUOTA_TRACK_POLICY: Readonly<{
-  supportedDurationsMinutes: readonly [300, 10080];
-  maximumReceiptLagMs: number;
-}>;
-
 export const QUOTA_CALIBRATION_POLICY: Readonly<{
   minimumBoundaries: number;
   minimumDisplayedSpanPp: number;
@@ -312,11 +303,6 @@ export const QUOTA_CALIBRATION_POLICY: Readonly<{
   minimumScoredResetsForEmpiricalError: number;
 }>;
 
-export const QUOTA_ROLLING_POLICY: Readonly<{
-  rollingHours: readonly [1, 2, 3];
-  maximumEndpointBracketMs: number;
-}>;
-
 export function continuityKey(row: QuotaContinuityInput): string;
 export function resetKey(row: QuotaResetIdentityInput): string;
 export function buildResetEvidence(
@@ -325,10 +311,6 @@ export function buildResetEvidence(
 export function fitResetCapacity(
   input: QuotaResetEvidence,
 ): QuotaResetCalibration;
-export function forecastCapacityFromPriorResets(
-  priorResetFits: readonly QuotaResetCalibration[],
-  currentResetFit: QuotaResetCalibration,
-): PriorCapacityForecast | null;
 export function analyzeQuotaCalibration(
   input: QuotaTrackEvidence,
 ): QuotaCalibration;
@@ -401,17 +383,6 @@ export interface QuotaPaceForecast {
   hoursToExhaustion: number | null;
   hoursToReset: number | null;
 }
-
-export const QUOTA_PACE_POLICY: Readonly<{
-  schemaVersion: "quota-pace-forecast-v0.2";
-  method: "median_adjacent_quota_slope";
-  /** Which rate `etaAt`, `hoursToExhaustion` and `status` are derived from. */
-  etaBasis: "overall_percentage_points_per_hour";
-  windowDurationMinutes: 10080;
-  maximumReceiptLagMs: number;
-  maximumPacePpPerHour: number;
-  minimumObservations: 2;
-}>;
 
 export function analyzeQuotaPace(input: {
   currentSnapshot: QuotaPaceSnapshotInput;

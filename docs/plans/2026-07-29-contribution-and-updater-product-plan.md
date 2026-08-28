@@ -315,12 +315,6 @@ streams, verify the pilot schema and fully contained collection-control row,
 approve the production domain/origin, and authorize disabled-first deployment.
 Only a later human decision may activate invitations or real-user collection.
 
-The contained Cloud Run/GCS experiment remains collection-disabled and is not
-the pilot backend. Its template still requires an authorized project, private
-bucket, readiness marker, runtime service account, immutable image digest,
-Cloud Run API/billing, rendered configuration, IAM review, and deployment
-authorization.
-
 The separate release gates are an approved first-party source license, final
 privacy/consent/support text and jurisdictions, final icon and rights,
 Developer ID and notarization credentials, a protected Sparkle private key,

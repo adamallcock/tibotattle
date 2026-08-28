@@ -3,9 +3,13 @@ import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createLocalExportWorkspace, resumeLocalExportWorkspace } from "../src/export-set-controller.js";
-import { openExportWorkspace } from "../src/export-workspace.js";
+import { localExportSourcePipeline, localExportWorkspace } from
+  "../src/local-node-runtime.js";
 import { stableJson } from "../src/storage.js";
+
+const { openExportWorkspace } = localExportWorkspace;
+const { createLocalExportWorkspace, resumeLocalExportWorkspace } =
+  localExportSourcePipeline.controller;
 
 const SECRET = Buffer.alloc(32, 121);
 const START = "2026-07-24T12:00:00.000Z";

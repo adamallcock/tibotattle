@@ -25,11 +25,9 @@ import {
   verifyLocalMetadataBundleFiles,
 } from "../src/bundle-verifier.js";
 import {
-  writeLocalMetadataBundle,
-} from "../src/metadata-exporter.js";
-import {
-  discoverCommittedPreparedSets,
-} from "../src/contribution-sync-queue.js";
+  localContributionSyncQueue,
+  localMetadataExport,
+} from "../src/local-node-runtime.js";
 import {
   TELEMETRY_CONTRIBUTION_BUILDER_VERSION,
 } from "../src/telemetry-contribution-builder.js";
@@ -40,6 +38,9 @@ import {
 import {
   createExportResourceGuard,
 } from "../src/export-resource-policy.js";
+
+const { writeLocalMetadataBundle } = localMetadataExport;
+const { discoverCommittedPreparedSets } = localContributionSyncQueue;
 
 const COVERAGE = Object.freeze({
   startAt: "2026-07-24T21:00:00.000Z",
@@ -802,6 +803,31 @@ test("coverage, owner-only directories, runner injection, and public errors fail
     );
   } finally {
     await chmod(files.preparedSpoolDirectory, 0o700).catch(() => {});
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("a preserved legacy identity keeps its restart-required recovery code", async () => {
+  const files = await fixture();
+  const privateCanary = "DO-NOT-LEAK-legacy-identity-migration";
+  try {
+    await assert.rejects(
+      runPreparation(files, UUID_ONE, {
+        selectIdentity() {
+          const error = new Error(privateCanary);
+          error.code = "export_identity_keychain_migration_required";
+          throw error;
+        },
+      }),
+      (error) => {
+        assert.equal(error.code, "identity_migration_required");
+        const projected = projectLocalContributionPreparationError(error);
+        assert.equal(projected.errorCode, "identity_migration_required");
+        assert.equal(JSON.stringify(projected).includes(privateCanary), false);
+        return true;
+      },
+    );
+  } finally {
     await rm(files.root, { recursive: true });
   }
 });

@@ -3,7 +3,12 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ExportWorkspaceLockError, withExportWorkspaceLease } from "../src/export-workspace-lock.js";
+import { localExportWorkspace } from "../src/local-node-runtime.js";
+
+const {
+  ExportWorkspaceLockError,
+  withExportWorkspaceLease,
+} = localExportWorkspace;
 
 test("workspace lease excludes a concurrent owner and releases after completion", async () => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-workspace-lock-"));

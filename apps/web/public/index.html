@@ -1226,8 +1226,8 @@
 
               Exactly one of these two paragraphs is shown, or neither: a build
               whose signed app brokers the Keychain raises no dialog at all,
-              and one that is only migrating a legacy credential meets it at
-              renewal rather than here. renderIncrementalConsent() picks from
+              and one that is only migrating a legacy credential meets it on
+              its next protected read. renderIncrementalConsent() picks from
               the companion's reported keychainPrompt surface; the visible
               default below is the unbrokered case, so a companion that never
               answers renders exactly today's page.
@@ -1237,10 +1237,11 @@
               keychain. If macOS asks for permission, choose Always Allow so
               background uploads keep working.
             </p>
-            <p class="annotation" id="incremental-keychain-rotation-note" hidden>
-              This Mac's upload credential moves into TiboTattle's own keychain
-              storage at its next renewal. If macOS asks for permission then,
-              choose Always Allow so background uploads keep working.
+            <p class="annotation" id="incremental-keychain-migration-note" hidden>
+              This Mac still has an upload credential from an older build.
+              TiboTattle moves it into app-owned keychain storage the next time
+              it is needed. If macOS asks then, allow TiboTattle to continue;
+              declining leaves the old credential untouched and pauses uploads.
             </p>
             <p class="participant-action-status" id="incremental-consent-status" role="status" hidden></p>
             <!--

@@ -380,11 +380,16 @@ async function loadAccountObservationSecretSafely(loadAccountObservationSecret) 
     }
     return { secret, unavailableReason: null };
   } catch (error) {
+    let unavailableReason = "credential_unavailable";
+    if (error?.code === "account_observation_credential_locked") {
+      unavailableReason = "credential_locked";
+    } else if (error?.code
+        === "account_observation_credential_migration_required") {
+      unavailableReason = "credential_migration_required";
+    }
     return {
       secret: null,
-      unavailableReason: error?.code === "account_observation_credential_locked"
-        ? "credential_locked"
-        : "credential_unavailable",
+      unavailableReason,
     };
   }
 }

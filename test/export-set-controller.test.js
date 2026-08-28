@@ -8,12 +8,14 @@ import { spawnSync } from "node:child_process";
 import { parseArgs } from "../src/cli.js";
 import { sanitizeClaudeStatusline } from "../src/claude-statusline.js";
 import { writeClaudeStatusSnapshot } from "../src/claude-statusline-storage.js";
-import {
+import { localExportSourcePipeline, localExportWorkspace } from
+  "../src/local-node-runtime.js";
+const {
   createLocalExportWorkspace,
   inspectLocalExportWorkspace,
   resumeLocalExportWorkspace,
-} from "../src/export-set-controller.js";
-import { ExportWorkspaceError, openExportWorkspace } from "../src/export-workspace.js";
+} = localExportSourcePipeline.controller;
+const { ExportWorkspaceError, openExportWorkspace } = localExportWorkspace;
 
 const SECRET = Buffer.alloc(32, 53);
 
@@ -613,29 +615,39 @@ test("a malformed Codex speed setting poisons a checkpoint workspace", async () 
   }
 });
 
-test("duplicate Codex session metadata poisons a checkpoint workspace", async () => {
+test("copied Codex session metadata keeps a checkpoint workspace valid", async () => {
   const value = await fixture();
   try {
-    const meta = JSON.stringify({
+    const firstMeta = JSON.stringify({
       timestamp: "2026-07-24T12:00:00.000Z",
       type: "session_meta",
       payload: { id: "PRIVATE_SESSION" },
     });
-    await writeFile(value.source, `${meta}\n${meta}\n`);
-    await assert.rejects(createLocalExportWorkspace({
+    const copiedMeta = JSON.stringify({
+      timestamp: "2026-07-24T12:00:00.001Z",
+      type: "session_meta",
+      payload: { id: "COPIED_PRIVATE_SESSION" },
+    });
+    await writeFile(value.source, `${firstMeta}\n${copiedMeta}\n`);
+    const result = await createLocalExportWorkspace({
       directory: value.workspace,
       startAt: "2026-07-24T11:00:00.000Z",
       endAt: "2026-07-24T13:00:00.000Z",
       createdAt: "2026-07-24T13:00:00.000Z",
       codexHome: value.home,
       secret: SECRET,
-    }), (error) => error?.code
-      === "export_source_codex_rollout_content_invalid");
+    });
+    assert.equal(result.status.scanComplete, true);
+    assert.deepEqual(result.status.recordCounts, {
+      usageEvents: 0,
+      quotaSnapshots: 0,
+      activityMarkers: 0,
+    });
     const inspected = await inspectLocalExportWorkspace({
       directory: value.workspace,
     });
-    assert.equal(inspected.poisoned, true);
-    assert.equal(inspected.scanComplete, false);
+    assert.equal(inspected.poisoned, false);
+    assert.equal(inspected.scanComplete, true);
   } finally {
     await rm(value.root, { recursive: true, force: true });
   }

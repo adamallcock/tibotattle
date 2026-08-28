@@ -10356,6 +10356,8 @@ async function prepareIncrementalReviewInstance() {
 // Fixed sentences for the silent preparation's own failure codes. They speak
 // on the approve card, so each names the reader's actual next action there.
 const INCREMENTAL_PREPARATION_ERROR_COPY = {
+  identity_migration_required:
+    "TiboTattle preserved an older local identity because its move into app-owned keychain storage was not allowed. Quit and reopen TiboTattle, then choose Check again and allow the migration when macOS asks. Do not reset, delete, or rotate the identity. No upload occurred.",
   identity_unavailable:
     "The local Keychain identity is unavailable. Open Keychain Access, select the login Keychain, unlock it, then choose Check again. Do not reset, delete, rotate, or broaden access to the identity. No upload occurred.",
   coverage_unavailable:
@@ -10688,8 +10690,8 @@ async function loadLocalDashboard() {
 // The "preparation identity" Keychain notice left with the prepare surface it
 // annotated (owner-directed, 2026-08-08). The one case that still matters —
 // the login Keychain is unreachable, so the silent review bootstrap will
-// fail — speaks through that bootstrap's own identity_unavailable sentence
-// on the approve card.
+// fail — speaks through that bootstrap's own identity_unavailable or
+// identity_migration_required sentence on the approve card.
 
 function renderDashboardSkeleton() {
   const container = $("#quota-cards");
@@ -11343,6 +11345,8 @@ const LOCAL_COMPANION_ERROR_COPY = {
   // its local record are both intact and become readable the moment the
   // keychain is unlocked. Uploads pause; nothing needs clearing or re-pairing.
   contribution_device_keychain_locked: CONTRIBUTION_DEVICE_KEYCHAIN_LOCKED_COPY,
+  contribution_device_keychain_migration_required:
+    "TiboTattle left this Mac's older upload credential untouched because its move into app-owned keychain storage was not allowed. Nothing was uploaded. Quit and reopen TiboTattle, then return here and approve again; allow TiboTattle to continue when macOS asks. Do not reset or delete the credential.",
   unsupported_media_type:
     "The local companion rejected this request format. Nothing was uploaded; reload TiboTattle and try again.",
   request_too_large:
@@ -11421,20 +11425,6 @@ const LOCAL_COMPANION_ERROR_COPY = {
     "This Mac could not be disconnected. It may still be able to upload; try again, or reopen TiboTattle first.",
   contribution_device_disconnect_cleanup_pending:
     "This Mac stopped uploading, but clearing its local credential has not finished. Reopen TiboTattle and check again.",
-  automatic_contribution_not_authorized:
-    "TiboTattle refused this automatic contribution change because it did not come from the local dashboard. Nothing was changed.",
-  automatic_contribution_not_configured:
-    "This build has no automatic contribution to configure. Local reporting is unaffected.",
-  automatic_contribution_first_review_required:
-    "Automatic contribution cannot start until you have reviewed and sent one contribution by hand. Nothing was uploaded.",
-  automatic_contribution_consent_binding_mismatch:
-    "The stored automatic contribution consent no longer matches this build, so nothing runs automatically. Nothing was uploaded; consent again to resume.",
-  automatic_contribution_settings_unavailable:
-    "TiboTattle could not read the automatic contribution setting. Nothing runs automatically until it can, and nothing was uploaded.",
-  automatic_contribution_bootstrap_persist_failed:
-    "TiboTattle could not store the automatic contribution setting, so it stays off. Nothing was uploaded.",
-  automatic_contribution_lock_release_failed:
-    "A background contribution pass did not release its lock cleanly. Reopen TiboTattle before trying again; nothing was uploaded.",
   loopback_required:
     "This request has to come from the local dashboard on this Mac. Nothing was changed. Open TiboTattle and try again.",
   host_not_allowed:
@@ -12504,13 +12494,13 @@ function renderIncrementalConsent() {
   }
   // Keychain guidance is shown only where a dialog can be raised: at the
   // connect step for an unbrokered companion, at the migrating credential's
-  // next renewal for a brokered one, and nowhere at all for a fresh brokered
+  // next protected read for a brokered one, and nowhere for a fresh brokered
   // install (S3, red-team review of PR #34).
   const keychainSurface = keychainPromptSurface();
   const pairingNote = $("#incremental-keychain-pairing-note");
-  const rotationNote = $("#incremental-keychain-rotation-note");
+  const migrationNote = $("#incremental-keychain-migration-note");
   if (pairingNote) pairingNote.hidden = keychainSurface !== "pairing";
-  if (rotationNote) rotationNote.hidden = keychainSurface !== "rotation";
+  if (migrationNote) migrationNote.hidden = keychainSurface !== "migration";
   // The review the approve gate requires, on screen: the verified prepared
   // instance's own facts. They come from the same queue item the one-use
   // token was minted for, and they leave with approval — the card then
@@ -12651,8 +12641,8 @@ function boundedOutcomeDetailCode(payload) {
 /**
  * Where this install can still meet a macOS Keychain dialog, as the companion
  * reports it: "pairing" (the companion mints its own credential, so the
- * connect step can raise one), "rotation" (the app brokers the Keychain but a
- * legacy credential still has to migrate, and that is when a dialog appears),
+ * connect step can raise one), "migration" (the app brokers the Keychain but
+ * a legacy credential still has to migrate on its next protected read),
  * or "none" (brokered with nothing to migrate — no dialog exists).
  *
  * "pairing" is the default before the first projection lands and whenever the
@@ -12661,7 +12651,7 @@ function boundedOutcomeDetailCode(payload) {
  */
 function keychainPromptSurface() {
   const reported = incrementalSyncStatus?.keychainPrompt;
-  return reported === "rotation" || reported === "none" ? reported : "pairing";
+  return reported === "migration" || reported === "none" ? reported : "pairing";
 }
 
 /**
@@ -13559,7 +13549,8 @@ const CONTRIBUTION_CONNECT_STEPS = Object.freeze({
     // is reachable at this step at all, so naming a process the reader will
     // never see would be a warning about nothing (S3, red-team review of
     // PR #34). The remaining case — a legacy item migrating — meets its
-    // dialog at rotation, and the approve card's own annotation carries it.
+    // dialog on its next protected read, and the approve card's annotation
+    // carries that guidance.
     brokeredProgress: "Connecting this Mac as an upload-only device…",
     stopped: "Connecting stopped at step 3 of 3, pairing this Mac as an upload-only device.",
     failure:

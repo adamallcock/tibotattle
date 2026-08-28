@@ -64,9 +64,7 @@ function codeLinesTouchingStdin(source) {
 // parameter default, a module-scope read, an `isTTY` probe — is the silent
 // breakage this file exists to catch, so it must fail here rather than in a
 // user's pairing ceremony.
-const PERMITTED_STDIN_LINES = new Map([
-  ["src/claude-statusline.js", ["await runClaudeStatusline({ stdin: process.stdin });"]],
-]);
+const PERMITTED_STDIN_LINES = new Map();
 
 /**
  * Descriptor 0 belongs to the Keychain broker, not to standard input.

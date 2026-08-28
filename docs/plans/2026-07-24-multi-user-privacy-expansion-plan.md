@@ -2,10 +2,16 @@
 title: Multi-User Privacy-Centric Expansion Plan
 date: 2026-07-24
 type: plan
-status: active
+status: superseded
 ---
 
 # Multi-User Privacy-Centric Expansion Plan
+
+> Superseded on 2026-08-26. This document is retained as historical design
+> research. Its privacy invariants remain applicable, but its proposed Google
+> Cloud deployment is not part of TiboTattle's implemented architecture. The
+> current hosted contract is the Cloudflare Worker/D1/R2 surface documented in
+> the [API surface reference](../reference/2026-08-26-api-surface-reference.md).
 
 ## Outcome
 

@@ -116,7 +116,7 @@ The program began on July 24, 2026, from a substantial local foundation:
 - adversarial and property-based privacy tests; and
 - 182 passing Node tests plus a successful real one-hour local dry run at the original baseline.
 
-Branch `agent/privacy-exporter-phase1` at commit `8cb6b03` is the historical local-exporter starting point, not the current branch or test count. The [multi-user expansion plan](../plans/2026-07-24-multi-user-privacy-expansion-plan.md) and [telemetry privacy contract](../governance/2026-07-24-telemetry-privacy-contract.md) remain authoritative supporting documents. This goal organizes them into an execution program and adds finish criteria; it does not weaken their restrictions. Where an older identity or phase description conflicts with this goal, the stricter separation and gate ordering here govern: telemetry seeds never authenticate bundles, enrollments, recovery, pairing, or notifications; telemetry seeds are never copied between devices; and public output cannot precede G7, G8, and G9.
+Branch `agent/privacy-exporter-phase1` at commit `8cb6b03` is the historical local-exporter starting point, not the current branch or test count. The [multi-user expansion plan](../plans/2026-07-24-multi-user-privacy-expansion-plan.md) is retained as historical design research: its privacy restrictions remain applicable, but its proposed deployment architecture is superseded by the implemented Worker contract. The [telemetry privacy contract](../governance/2026-07-24-telemetry-privacy-contract.md) remains authoritative. This goal organizes those privacy constraints into an execution program and adds finish criteria; it does not weaken their restrictions. Where an older identity or phase description conflicts with this goal, the stricter separation and gate ordering here govern: telemetry seeds never authenticate bundles, enrollments, recovery, pairing, or notifications; telemetry seeds are never copied between devices; and public output cannot precede G7, G8, and G9.
 
 The live implementation checkpoint is maintained in the [G1 local-only release route](../governance/2026-07-24-g1-local-release-route.md). Dated progress sections below are append-only milestone evidence and may contain then-current open lists; the live route supersedes those lists without rewriting history.
 
@@ -498,7 +498,9 @@ registered -> uploading -> uploaded -> decrypting -> validating
 
 #### Infrastructure
 
-- Manage Cloud Run, Storage, Eventarc, Firestore or equivalent job state, KMS/Secret Manager, service accounts, network/egress controls, budgets, alerts, lifecycle, and audit logging through infrastructure-as-code.
+- Manage Worker bindings, D1 databases, R2 buckets, Durable Objects, rate limits,
+  secrets, network/egress controls, budgets, alerts, lifecycle, and audit logging
+  through infrastructure-as-code.
 - Use separate least-privilege identities for enrollment, upload registration, decryption/validation, canonical writes, aggregation, deletion, and public publishing.
 
 #### Minimum incident readiness before real upload
@@ -526,7 +528,10 @@ No real participant may be invited to upload and no real participant bundle may 
 - Development credentials cannot decrypt production; key-rotation and retired-key rejection drills pass.
 - Pilot jurisdiction/IP-handling controls and minimum incident drills pass, and a named human explicitly authorizes real-user collection.
 - The targeted external pre-pilot review is complete and has no unresolved critical/high finding.
-- Inspect actual Cloud Run, Storage, CDN/edge, audit, trace, and security logs during the pilot fixture run; document unavoidable network metadata, prove it is minimized/short-retained, and verify it is never converted to geography or joined to telemetry.
+- Inspect actual Worker, R2, CDN/edge, audit, trace, and security logs during the
+  pilot fixture run; document unavoidable network metadata, prove it is
+  minimized/short-retained, and verify it is never converted to geography or
+  joined to telemetry.
 
 ## Stage 5 — Canonical metadata and provenance ledger
 
@@ -1194,7 +1199,7 @@ capacity run, platform resource/cost measurement, decompression attacks,
 |---|---|---|
 | Initial supported platforms | Before G1 release | macOS arm64 only, explicitly labeled |
 | Application-layer encryption library and envelope format | Before G4 | No upload |
-| GCP project, region, data residency, and operator identity | Before G3 consent finalization | No enrollment |
+| Cloudflare account, region/jurisdiction, data residency, and operator identity | Before G3 consent finalization | No enrollment |
 | Recovery credential versus public-key/passkey design | Before G3 | High-entropy recovery code with slow verifier |
 | Exact timestamp necessity versus minute bucketing | During G1/G7 fixtures, before G4 | Exact restricted timestamps, no public exposure |
 | Session pseudonym necessity | Before telemetry v1 freeze | Retain restricted session pseudonym |

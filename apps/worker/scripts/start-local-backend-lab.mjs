@@ -1,12 +1,10 @@
 import { spawn, spawnSync } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
 import {
   chmodSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  renameSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -304,71 +302,35 @@ function assertDeletedLifecycle(storage, r2ObjectCount) {
 async function probePersistedParticipant(origin, participantAccessFile) {
   const access = JSON.parse(readFileSync(participantAccessFile, "utf8"));
   if (access?.origin !== origin
-      || typeof access?.recoveryCode !== "string"
-      || !access.recoveryCode.startsWith("um_recovery_")) {
+      || access?.schemaVersion !== "local-backend-lab-access-v0.2"
+      || typeof access?.sessionCookie !== "string"
+      || !access.sessionCookie.startsWith("__Host-usage_monitor_session=")
+      || typeof access?.csrfToken !== "string") {
     throw new Error("The retained participant access file was invalid");
   }
-  const recoveredResponse = await fetch(`${origin}/api/v1/recover`, {
-    method: "POST",
+  const exportResponse = await fetch(`${origin}/api/v1/me/export`, {
     headers: {
       Accept: "application/json",
-      "Content-Type": "application/json",
-      Origin: origin,
-    },
-    body: JSON.stringify({
-      recoveryCode: access.recoveryCode,
-      recoveryAttemptId:
-        `um_recovery_attempt_${randomBytes(32).toString("base64url")}`,
-    }),
-    redirect: "error",
-    signal: AbortSignal.timeout(5_000),
-  });
-  const recovered = await recoveredResponse.json();
-  const cookie = recoveredResponse.headers.get("set-cookie")?.split(";", 1)[0];
-  if (!recoveredResponse.ok
-      || typeof recovered?.csrfToken !== "string"
-      || typeof recovered?.recoveryCode !== "string"
-      || !recovered.recoveryCode.startsWith("um_recovery_")
-      || typeof cookie !== "string"
-      || !cookie.startsWith("__Host-usage_monitor_session=")) {
-    throw new Error("The retained participant could not recover after restart");
-  }
-  const statsResponse = await fetch(`${origin}/api/v1/me/stats`, {
-    headers: {
-      Accept: "application/json",
-      Cookie: cookie,
+      Cookie: access.sessionCookie,
     },
     redirect: "error",
     signal: AbortSignal.timeout(5_000),
   });
-  const stats = await statsResponse.json();
-  if (!statsResponse.ok
-      || stats?.schemaVersion !== "participant-stats-v0.2"
-      || stats?.totals?.contributions !== 1
-      || !Number.isSafeInteger(stats?.totals?.usageEvents)
-      || stats.totals.usageEvents < 1
-      || stats?.totals?.priceVerification !== "server_repriced") {
-    throw new Error("Private persisted statistics did not survive restart");
+  const participantExport = await exportResponse.json();
+  const records = participantExport?.contributions?.[0]?.records;
+  if (!exportResponse.ok
+      || participantExport?.schemaVersion !== "participant-export-v0.2"
+      || participantExport?.contributions?.length !== 1
+      || !Array.isArray(records)
+      || records.length < 1) {
+    throw new Error("The participant export did not survive restart");
   }
-
-  const replacement = `${participantAccessFile}.${randomUUID()}.next`;
-  writeFileSync(replacement, `${JSON.stringify({
-    ...access,
-    recoveryCode: recovered.recoveryCode,
-    rotatedAfterRestartAt: new Date().toISOString(),
-  }, null, 2)}\n`, {
-    encoding: "utf8",
-    flag: "wx",
-    mode: 0o600,
-  });
-  renameSync(replacement, participantAccessFile);
   return {
-    participantRecovered: true,
-    privateStatsRestored: true,
-    canonicalServerRepricingRestored: true,
-    contributions: stats.totals.contributions,
-    usageEvents: stats.totals.usageEvents,
-    replacementRecoveryCapabilityStoredOwnerOnly: true,
+    participantSessionRestored: true,
+    participantExportRestored: true,
+    contributions: participantExport.contributions.length,
+    records: records.length,
+    sessionCapabilityStoredOwnerOnly: true,
   };
 }
 
@@ -525,20 +487,12 @@ try {
         canonicalServerRepricing: smoke.canonicalServerRepricing,
         atomicEnrollmentPairing: smoke.devicePairingAndUpload,
         deviceRevocation: smoke.deviceRevocation,
-        personalStatisticsRecomputed: smoke.personalStatisticsRecomputed,
-        aggregatePublishedAtTwenty: smoke.aggregatePublishedAtTwenty,
-        authenticatedWeeklyComparison: smoke.authenticatedWeeklyComparison,
+        communityDailyVerified: smoke.communityDailyVerified,
         participantExportVerified: smoke.participantExportVerified,
       },
       destructiveLifecycle: {
-        individualContributionDeletion:
-          lifecycleSmoke.historyUpdatedAfterContributionDeletion,
         fullParticipantDeletion:
           lifecycleSmoke.participantsDeleted === lifecycleSmoke.participants,
-        aggregateWithdrawnOnDeletion:
-          lifecycleSmoke.aggregateWithdrawnOnContributionDeletion,
-        aggregateRebuiltWithoutDeletedSources:
-          lifecycleSmoke.aggregateRebuiltAfterParticipantDeletion,
         d1: lifecycleStorage.database,
         deletionLedger: lifecycleStorage.deletionLedger,
         directLocalR2ObjectCount: lifecycleR2ObjectCount,
@@ -579,16 +533,13 @@ try {
         d1LifecycleVerified: true,
         r2LifecycleVerified: lifecycleR2ObjectCount === 0
           && restartedR2ObjectCount === r2ObjectCount,
-        privateStatisticsVerified: smoke.personalStatisticsRecomputed,
-        aggregateStatisticsVerified: smoke.aggregatePublishedAtTwenty,
+        communityDailyVerified: smoke.communityDailyVerified,
         participantExportVerified: smoke.participantExportVerified,
-        individualContributionDeletionVerified:
-          lifecycleSmoke.historyUpdatedAfterContributionDeletion,
         fullParticipantDeletionVerified:
           lifecycleSmoke.participantsDeleted === lifecycleSmoke.participants,
         persistedRestartVerified:
-          persistedRestart.participantRecovered
-          && persistedRestart.privateStatsRestored,
+          persistedRestart.participantSessionRestored
+          && persistedRestart.participantExportRestored,
       },
     },
     sourceMode: options.source.mode,
@@ -609,7 +560,7 @@ try {
     : {
         ...receipt,
         receiptFile,
-        note: "The recovery code is only in the owner-only participant access file.",
+        note: "The session capability is only in the owner-only participant access file.",
   };
   process.stdout.write(`${JSON.stringify(publicOutput, null, 2)}\n`);
   if (exitAfterReceipt) {

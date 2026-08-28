@@ -248,14 +248,41 @@ async function upload(
 ): Promise<{ response: Response; envelope: object }> {
   const envelope = await encrypt(value);
   const raw = JSON.stringify(envelope);
+  const pairingResponse = await api("/api/v1/me/device-pairings", {
+    method: "POST",
+    headers: {
+      cookie: participant.cookie,
+      "content-type": "application/json",
+      "x-usage-monitor-csrf": participant.csrfToken,
+    },
+    body: JSON.stringify({
+      consentVersion: "ongoing-privacy-safe-telemetry-v0.2",
+      ongoingUpload: true,
+    }),
+  });
+  expect(pairingResponse.status).toBe(201);
+  const pairing = await pairingResponse.json<{ pairingCode: string }>();
+  const deviceId = crypto.randomUUID();
+  const rawSecret = crypto.getRandomValues(new Uint8Array(32));
+  const deviceSecret = encodeBase64Url(rawSecret);
+  const secretHash = await deviceSecretHash(deviceId, rawSecret);
+  rawSecret.fill(0);
+  const claimed = await api("/api/v1/device-pairings/claim", {
+    method: "POST",
+    headers: {
+      authorization: `Pairing ${pairing.pairingCode}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ deviceId, deviceSecretHash: secretHash }),
+  });
+  expect(claimed.status).toBe(201);
   const authorizationResponse = await api(
-    "/api/v1/me/upload-authorizations",
+    "/api/v1/device/upload-authorizations",
     {
       method: "POST",
       headers: {
-        cookie: participant.cookie,
+        authorization: `Device um_device_${deviceId}.${deviceSecret}`,
         "content-type": "application/json",
-        "x-usage-monitor-csrf": participant.csrfToken,
       },
       body: JSON.stringify({
         envelopeDigest: await sha256Hex(raw),
@@ -394,27 +421,6 @@ describe("account-scoped local HTTP ingestion", () => {
     expect(stored?.server_cost_usd).not.toBe("999.000000");
     expect(await bindings().QUARANTINE.head(stored!.r2_key)).not.toBeNull();
 
-    const stats = await api("/api/v1/me/insights", {
-      headers: { cookie: participant.cookie },
-    });
-    expect(stats.status).toBe(200);
-    await expect(stats.json()).resolves.toMatchObject({
-      totals: {
-        usageEvents: 1,
-        quotaSnapshots: 1,
-        priceVerification: "server_repriced",
-      },
-      accountScopedQuotaAnalysis: {
-        status: "ready",
-        tracks: [{
-          continuity: {
-            accountTrackId: TRACK_A,
-            windowDurationMinutes: 10_080,
-          },
-        }],
-      },
-    });
-
     const exported = await api("/api/v1/me/export", {
       headers: { cookie: participant.cookie },
     });
@@ -422,14 +428,12 @@ describe("account-scoped local HTTP ingestion", () => {
     const exportText = await exported.text();
     expect(exportText).toContain(TRACK_A);
 
-    const deleted = await api("/api/v1/me/contributions/delete", {
-      method: "POST",
+    const deleted = await api("/api/v1/me", {
+      method: "DELETE",
       headers: {
         cookie: participant.cookie,
-        "content-type": "application/json",
         "x-usage-monitor-csrf": participant.csrfToken,
       },
-      body: JSON.stringify({ contributionId: receipt.contributionId }),
     });
     expect(deleted.status).toBe(200);
     expect(await bindings().QUARANTINE.head(stored!.r2_key)).toBeNull();
@@ -526,7 +530,7 @@ describe("account-scoped local HTTP ingestion", () => {
     });
     expect(accepted.status).toBe(202);
 
-    const denied = await api("/api/v1/me/insights", {
+    const denied = await api("/api/v1/me/export", {
       headers: {
         authorization: `Device um_device_${deviceId}.${deviceSecret}`,
       },

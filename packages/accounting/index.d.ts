@@ -177,35 +177,15 @@ export interface PriceUsageOptions {
   pricingContext?: PricingContext;
 }
 
-export const APP_PRICE_REGISTRY_OBSERVED_AT: string;
-export const APP_PRICE_REGISTRY_VERSION: string;
-export const OFFICIAL_PRICE_SOURCE_URLS: Readonly<Record<string, string>>;
-export const OPENAI_LONG_CONTEXT_SOURCE_URLS: readonly string[];
-export const NORMALIZED_PRICE_EVIDENCE_ROWS: Readonly<Record<string, unknown>>;
-export const OPENAI_OFFICIAL_PRICE_CARDS: readonly PriceCard[];
 export const OPENAI_PRICE_EVIDENCE_START_DATE: string;
-export const ANTHROPIC_OFFICIAL_PRICE_CARDS: readonly PriceCard[];
-export const PROVIDER_TOOL_PRICE_CARDS: readonly PriceCard[];
 export const APP_OFFICIAL_PRICE_CARDS: readonly PriceCard[];
-export const APP_PRICE_REGISTRY_SHA256: string;
 export const APP_PRICE_REGISTRY_MANIFEST: OfficialPriceRegistryManifest;
-export const LOCAL_API_PRICING_METHOD_VERSION: string;
 
 export function addUsdStrings(...values: Array<string | number>): DecimalString;
 export function priceUsageEvent(
   event: NormalizedUsageEvent,
   options?: PriceUsageOptions,
 ): PriceUsageResult;
-export function aggregateCostResults(
-  results: readonly PriceUsageResult[],
-): AggregateCostResult;
-export function validateOfficialPriceRegistry(
-  cards?: readonly PriceCard[],
-): readonly PriceCard[];
-export function addOfficialPriceRegistry(
-  resolution?: Readonly<Record<string, unknown>> | null,
-  cards?: readonly PriceCard[],
-): Record<string, unknown>;
 
 export interface CodexUsageEvent {
   model: string;
@@ -240,9 +220,6 @@ export function priceClaudeUsageRecord(
   record: ClaudeUsageRecord,
   options?: LocalPricingOptions,
 ): PriceUsageResult;
-export function codexProviderBillableToolUnits(
-  serverBillableUnits: Readonly<Record<string, unknown>> | null | undefined,
-): NormalizedUsageEvent["billableToolUnits"];
 export function priceCodexProviderToolUnits(
   serverBillableUnits: Readonly<Record<string, unknown>> | null | undefined,
   options?: Pick<LocalPricingOptions, "priceCards" | "priceEpochBasis" | "eventTime">,
@@ -250,10 +227,6 @@ export function priceCodexProviderToolUnits(
 export function aggregateLocalApiPriceResults(
   results: readonly PriceUsageResult[],
 ): AggregateCostResult;
-export function summarizeClaudeApiPriceRecords(
-  records: readonly ClaudeUsageRecord[],
-  options?: LocalPricingOptions,
-): AggregateCostResult & Readonly<Record<string, unknown>>;
 export function costWarningCodes(result: PriceUsageResult): string[];
 export function apiPriceResolutionSummary(options?: {
   priceCards?: readonly PriceCard[] | null;
@@ -381,15 +354,9 @@ export const FAST_MODE_MODEL_FAMILY_KEYS: readonly FastModeModelFamilyKey[];
 export const OBSERVED_SPEED_MODE_KEYS: readonly ObservedSpeedMode[];
 export const FAST_MODE_PREFERENCE_VALUES: readonly FastModePreference[];
 export const DEFAULT_FAST_MODE_PREFERENCE: FastModePreference;
-export const SPEED_MODE_PROVENANCE_VALUES: readonly SpeedModeProvenance[];
 export const CODEX_SPEED_MODE_DECLARATION: CodexSpeedModeDeclaration;
 export const QUOTA_WEIGHTED_API_PRICE_METRIC: QuotaWeightedApiPriceMetric;
-export const FAST_MODE_RESIDUAL_INFERENCE_THRESHOLDS: Readonly<
-  Record<string, number>
->;
-export const FAST_MODE_RESIDUAL_INFERENCE_REASON_CODES: readonly string[];
 
-export function fastModeModelFamily(model: unknown): FastModeModelFamily | null;
 export function fastModeModelFamilyKey(model: unknown): FastModeModelFamilyKey;
 export function fastModeQuotaMultiplier(model: unknown): number | null;
 export function isFastModePreference(value: unknown): value is FastModePreference;
@@ -400,11 +367,6 @@ export function resolveEffectiveSpeedMode(input?: {
   preference?: string;
   inferredMode?: string;
 }): { mode: ObservedSpeedMode; provenance: SpeedModeProvenance };
-export function quotaWeightedApiPriceEquivalent(input?: {
-  apiPriceEquivalentUsd?: number;
-  model?: string;
-  mode?: string;
-}): { usd: number | null; multiplier: number | null; status: string };
 export function summarizeQuotaWeightedAccounting(input?: {
   speedWeighting?: SpeedWeightingCrossing | null;
   declaredSpeedWeighting?: SpeedWeightingCrossing | null;

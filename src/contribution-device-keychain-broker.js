@@ -1,6 +1,14 @@
 import { Socket } from "node:net";
 
-import { EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES } from "./export-identity-keychain.js";
+import {
+  EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
+  MACOS_KEYCHAIN_BROKER_CAPABILITY_NAMES,
+  macOSKeychainBrokerCapabilityName,
+} from "./platform/index.js";
+
+export {
+  MACOS_KEYCHAIN_BROKER_CAPABILITY_NAMES,
+} from "./platform/index.js";
 
 // The signed macOS app announces its Keychain broker by naming the file
 // descriptor it dup2'd onto the spawned companion — the app's end of a
@@ -10,26 +18,31 @@ import { EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES } from "./export-identity-keychai
 // environment.
 export const CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_FD_ENV =
   "USAGE_MONITOR_KEYCHAIN_BROKER_FD";
-export const CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_PROTOCOL_VERSION = 1;
+export const CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_PROTOCOL_VERSION = 2;
 
 // One request or response per newline-terminated JSON frame. The credential
-// is 43 base64url characters, so a legitimate frame is under 128 bytes; the
+// is 43 base64url characters, so a legitimate frame is under 256 bytes; the
 // cap exists to fail the channel closed on anything that is not this
 // protocol.
 const MAXIMUM_FRAME_BYTES = 4_096;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const STORED_SECRET_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const WIRE_OPERATIONS = new Set(["get", "set", "delete"]);
+const WIRE_CAPABILITIES = new Set(
+  Object.values(MACOS_KEYCHAIN_BROKER_CAPABILITY_NAMES),
+);
 
-// KEYCHAIN_LOCKED and KEYCHAIN_DENIED are deliberately the exact code strings
-// the export-identity Keychain backend already classifies as locked/denied,
-// so a brokered failure keeps today's contribution_device_credential_locked /
-// _denied surfaces. Every broker-specific code maps to operation_failed —
-// which the capability layer reports as credential_unavailable, the same
-// coded, recoverable pairing failure a broken native binding produces today.
+// KEYCHAIN_LOCKED, KEYCHAIN_DENIED, and KEYCHAIN_MIGRATION_REQUIRED are the
+// exact fixed codes the export-identity backend classifies. Migration remains
+// distinct so the product can ask the user to quit and reopen the signed app,
+// which is the broker's only authorized retry boundary, instead of offering a
+// destructive credential reset or looping another prompt in this process.
+// Other broker failures collapse to the existing credential-unavailable
+// surface.
 const ERROR_CODES = new Set([
   "KEYCHAIN_LOCKED",
   "KEYCHAIN_DENIED",
+  "KEYCHAIN_MIGRATION_REQUIRED",
   "broker_unavailable",
   "broker_timeout",
   "broker_protocol",
@@ -76,6 +89,13 @@ function defaultConnect({ fd }) {
   return new Socket({ fd, readable: true, writable: true });
 }
 
+// A dup2'd socketpair descriptor has exactly one byte stream. The local server
+// already constructs the contribution-device adapter explicitly, while other
+// packaged capabilities discover the broker through their default backend;
+// caching here makes those call paths share the one ordered reader instead of
+// wrapping the same descriptor in competing Socket instances.
+const sharedDefaultTransports = new Map();
+
 /**
  * One shared request/response channel over the app-held socketpair end.
  * Requests are answered strictly in order; any deviation — a timeout, an
@@ -94,6 +114,12 @@ export function createContributionDeviceKeychainBrokerTransport({
       || typeof connect !== "function"
       || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000) {
     fail("invalid_configuration");
+  }
+  const shared = connect === defaultConnect
+    && timeoutMs === DEFAULT_REQUEST_TIMEOUT_MS
+    && fd !== null;
+  if (shared && sharedDefaultTransports.has(fd)) {
+    return sharedDefaultTransports.get(fd);
   }
   let socket = null;
   let poisonedCode = null;
@@ -148,6 +174,12 @@ export function createContributionDeviceKeychainBrokerTransport({
         entry.reject(new ContributionDeviceKeychainBrokerError("KEYCHAIN_DENIED"));
         return;
       }
+      if (frame.code === "migration_required") {
+        entry.reject(new ContributionDeviceKeychainBrokerError(
+          "KEYCHAIN_MIGRATION_REQUIRED",
+        ));
+        return;
+      }
       entry.reject(new ContributionDeviceKeychainBrokerError("broker_rejected"));
       return;
     }
@@ -197,6 +229,7 @@ export function createContributionDeviceKeychainBrokerTransport({
   async function request(operation) {
     if (!operation || typeof operation !== "object" || Array.isArray(operation)
         || !WIRE_OPERATIONS.has(operation.op)
+        || !WIRE_CAPABILITIES.has(operation.capability)
         || (operation.op === "set"
           && (typeof operation.secret !== "string"
             || !STORED_SECRET_PATTERN.test(operation.secret)))
@@ -211,6 +244,7 @@ export function createContributionDeviceKeychainBrokerTransport({
       v: CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_PROTOCOL_VERSION,
       id,
       op: operation.op,
+      capability: operation.capability,
       ...(operation.op === "set" ? { secret: operation.secret } : {}),
     })}\n`;
     return new Promise((resolve, reject) => {
@@ -224,35 +258,41 @@ export function createContributionDeviceKeychainBrokerTransport({
     });
   }
 
-  return Object.freeze({ request });
+  const transport = Object.freeze({ request });
+  if (shared) sharedDefaultTransports.set(fd, transport);
+  return transport;
 }
 
 /**
  * The keytar-shaped adapter the export-identity Keychain backend accepts as
- * an injected binding: the audited compare-and-swap, read-back, and
- * zeroization logic runs unchanged while every actual Keychain touch happens
- * inside the signed app. Deliberately single-purpose: the wire protocol
- * carries no service or account, and this binding refuses any capability
- * other than the app-managed contribution-device generation, so the
- * companion cannot address any other Keychain item through the broker.
+ * an injected binding: compare-and-swap, read-back, and zeroization logic runs
+ * unchanged while every actual Keychain touch happens inside the signed app.
+ * The wire carries only one of four fixed logical names, never a service or
+ * account, so companion input cannot expand the native app's authority.
  */
-export function createContributionDeviceKeychainBrokerBinding({
+export function createMacOSKeychainBrokerBinding({
   transport,
 } = {}) {
   if (!transport || typeof transport !== "object"
       || typeof transport.request !== "function") {
     fail("invalid_configuration");
   }
-  const pair = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp;
-  function assertPair(service, account) {
-    if (service !== pair.service || account !== pair.account) {
+  function capabilityName(service, account) {
+    const matches = Object.values(EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES)
+      .filter((capability) => (
+        capability.service === service && capability.account === account
+      ));
+    if (matches.length !== 1) {
       fail("invalid_configuration");
     }
+    const name = macOSKeychainBrokerCapabilityName(matches[0]);
+    if (name === null) fail("invalid_configuration");
+    return name;
   }
   return Object.freeze({
     async getPassword(service, account) {
-      assertPair(service, account);
-      const response = await transport.request({ op: "get" });
+      const capability = capabilityName(service, account);
+      const response = await transport.request({ op: "get", capability });
       const stored = response?.secret;
       if (stored === null || stored === undefined) return null;
       if (typeof stored !== "string" || !STORED_SECRET_PATTERN.test(stored)) {
@@ -261,16 +301,69 @@ export function createContributionDeviceKeychainBrokerBinding({
       return stored;
     },
     async setPassword(service, account, value) {
-      assertPair(service, account);
+      const capability = capabilityName(service, account);
       if (typeof value !== "string" || !STORED_SECRET_PATTERN.test(value)) {
         fail("invalid_configuration");
       }
-      await transport.request({ op: "set", secret: value });
+      await transport.request({ op: "set", capability, secret: value });
     },
     async deletePassword(service, account) {
-      assertPair(service, account);
-      await transport.request({ op: "delete" });
+      const capability = capabilityName(service, account);
+      await transport.request({ op: "delete", capability });
       return true;
     },
   });
+}
+
+/**
+ * Compatibility adapter retained for the contribution-device capability.
+ * Unlike the general binding, this surface refuses every other logical
+ * capability even though the shared wire transport can serve them.
+ */
+export function createContributionDeviceKeychainBrokerBinding(options = {}) {
+  const binding = createMacOSKeychainBrokerBinding(options);
+  const allowed = new Set([
+    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp,
+  ]);
+  function assertPair(service, account) {
+    const capability = [...allowed].find((candidate) => (
+      candidate.service === service && candidate.account === account
+    ));
+    if (capability === undefined) fail("invalid_configuration");
+  }
+  return Object.freeze({
+    async getPassword(service, account) {
+      assertPair(service, account);
+      return binding.getPassword(service, account);
+    },
+    async setPassword(service, account, value) {
+      assertPair(service, account);
+      return binding.setPassword(service, account, value);
+    },
+    async deletePassword(service, account) {
+      assertPair(service, account);
+      return binding.deletePassword(service, account);
+    },
+  });
+}
+
+/** One cached transport per inherited descriptor; a socketpair has one reader. */
+const sharedBindings = new Map();
+
+export function createMacOSKeychainBrokerBindingFromEnvironment(
+  environment = process.env,
+) {
+  const configuration = contributionDeviceKeychainBrokerConfiguration(
+    environment,
+  );
+  if (configuration === null) return null;
+  const key = configuration.fd;
+  if (!sharedBindings.has(key)) {
+    sharedBindings.set(key, createMacOSKeychainBrokerBinding({
+      transport: createContributionDeviceKeychainBrokerTransport(
+        configuration,
+      ),
+    }));
+  }
+  return sharedBindings.get(key);
 }

@@ -34,7 +34,6 @@ import {
   parseJsonWithUniqueObjectKeys,
   isContributionReviewableQueueState,
   refreshNeedsContinuation,
-  runReviewedContributionGate,
   ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION,
   ENVELOPE_SCHEMA_VERSION,
   safeApiError,
@@ -45,7 +44,6 @@ import {
   validateTelemetryContribution
 } from "../public/lib.js";
 import {
-  AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION,
   CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
   CODEX_PRIMARY_LIMIT_ID,
   CODEX_SPARK_LIMIT_ID,
@@ -67,7 +65,6 @@ import {
   normalizeIncrementalContributionSyncStatus,
   normalizeContributionDeletionReceipt,
   normalizeBackendReadiness,
-  normalizeAutomaticContributionStatus,
   normalizeLocalContributionDevicePairing,
   normalizeLocalContributionPreparation,
   normalizeLocalOnboarding,
@@ -1007,63 +1004,6 @@ test("quota timeline lookup parses supported dashboard bounds only once", () => 
   assert.equal(last?.row.id, quotaRowCount - 1);
   assert.equal(last?.timestampMs, startMs + (quotaRowCount - 1) * 60_000);
   assert.equal(observedAtReads, quotaRowCount);
-});
-
-test("reviewed contribution must be accepted before recurring contribution can be enabled", async () => {
-  const calls = [];
-  let resolveSend;
-  const acceptedSend = new Promise((resolve) => {
-    resolveSend = resolve;
-  });
-  const running = runReviewedContributionGate({
-    reviewToken: "review-token",
-    hasPendingAutomaticConsent: true,
-    runReviewedSend: async (token) => {
-      calls.push(["send", token]);
-      return acceptedSend;
-    },
-    enableAutomaticContribution: async () => {
-      calls.push(["enable"]);
-      return { status: "scheduled" };
-    },
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(calls, [["send", "review-token"]]);
-  resolveSend({ status: "completed", accepted: 1 });
-  const accepted = await running;
-  assert.equal(accepted.accepted, true);
-  assert.deepEqual(calls, [["send", "review-token"], ["enable"]]);
-  assert.deepEqual(accepted.automatic, { status: "scheduled" });
-
-  for (const result of [
-    { status: "completed", accepted: 0 },
-    { status: "interrupted", accepted: 1 },
-    { status: "completed", accepted: -1 },
-  ]) {
-    let enabled = false;
-    const rejected = await runReviewedContributionGate({
-      reviewToken: "review-token",
-      hasPendingAutomaticConsent: true,
-      runReviewedSend: async () => result,
-      enableAutomaticContribution: async () => {
-        enabled = true;
-      },
-    });
-    assert.equal(rejected.accepted, false);
-    assert.equal(enabled, false);
-  }
-
-  let enabledWithoutConsent = false;
-  const noConsent = await runReviewedContributionGate({
-    reviewToken: "review-token",
-    hasPendingAutomaticConsent: false,
-    runReviewedSend: async () => ({ status: "completed", accepted: 1 }),
-    enableAutomaticContribution: async () => {
-      enabledWithoutConsent = true;
-    },
-  });
-  assert.equal(noConsent.accepted, true);
-  assert.equal(enabledWithoutConsent, false);
 });
 
 test("refresh polling budget gives each accepted continuation a fresh window", () => {
@@ -2425,8 +2365,7 @@ test("local split overview contract derives quota and seven-day pricing without 
         }
       ],
       pricing: { apiServiceTier: "standard" }
-    },
-    reports: { reports: [{ id: "weekly", title: "Weekly", href: "/reports/weekly", modifiedAt: "2026-07-25T12:00:00Z" }] }
+    }
   });
   assert.equal(result.state, "live");
   assert.equal(result.quotaWindows[0].remainingPercent, 61);
@@ -2434,7 +2373,7 @@ test("local split overview contract derives quota and seven-day pricing without 
   assert.equal(result.pricing.totalCostUsd, 511.64);
   assert.equal(result.pricing.coveragePercent, 55.014);
   assert.equal(result.pricing.components.length, 2);
-  assert.equal(result.reports[0].updatedAt, "2026-07-25T12:00:00Z");
+  assert.equal(Object.hasOwn(result, "reports"), false);
 });
 
 test("demo data is labeled demo at the contract root and has multiple useful sections", () => {
@@ -2452,26 +2391,11 @@ test("demo data is labeled demo at the contract root and has multiple useful sec
   assert.ok(result.quality.opportunities.length > 2);
 });
 
-test("local client prefers consolidated dashboard and falls back to split endpoints", async () => {
+test("local client requests only implemented split endpoints", async () => {
   const calls = [];
-  const consolidated = new LocalCompanionClient({
+  const client = new LocalCompanionClient({
     fetchImpl: async (url) => {
       calls.push(url);
-      return new Response(JSON.stringify({
-        schemaVersion: "local-dashboard-v0.1",
-        status: "ready",
-        quotaWindows: []
-      }), { status: 200, headers: { "Content-Type": "application/json" } });
-    }
-  });
-  assert.equal((await consolidated.load()).state, "live");
-  assert.ok(calls.includes("/api/local/v1/dashboard"));
-
-  const split = new LocalCompanionClient({
-    fetchImpl: async (url) => {
-      if (url.endsWith("/v1/dashboard") || url.endsWith("/v1/status")) {
-        return new Response("", { status: 404 });
-      }
       if (url.endsWith("/overview")) {
         return new Response(JSON.stringify({ schemaVersion: "split", status: "insufficient" }), {
           status: 200,
@@ -2481,7 +2405,13 @@ test("local client prefers consolidated dashboard and falls back to split endpoi
       return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
     }
   });
-  assert.equal((await split.load()).schemaVersion, "split");
+  assert.equal((await client.load()).schemaVersion, "split");
+  assert.deepEqual(calls, [
+    "/api/local/overview",
+    "/api/local/gradient",
+    "/api/local/weekly",
+    "/api/local/quality"
+  ]);
 });
 
 test("local refresh uses the closed same-origin contract and exposes polling", async () => {
@@ -2804,266 +2734,23 @@ test("the local OAuth recovery client is fixed-route, exact-shape, and fail clos
   assert.deepEqual(JSON.parse(calls[2].options.body), { action: "clear" });
 });
 
-function automaticContributionStatusFixture(overrides = {}) {
-  return {
-    schemaVersion: AUTOMATIC_CONTRIBUTION_STATUS_SCHEMA_VERSION,
-    status: "disabled",
-    enabled: false,
-    intervalHours: 6,
-    consentCurrent: false,
-    firstReviewComplete: true,
-    firstReviewedAcceptedAt: "2026-07-29T11:59:00.000Z",
-    requiredConsent: {
-      telemetrySchemaVersion: "telemetry-contribution-v0.1",
-      fieldDictionaryVersion: "telemetry-v0.1-registry-2026-08-06.1",
-      privacyContractVersion: "ongoing-privacy-safe-telemetry-v0.1",
-      destinationOrigin: "https://contribute.example.test"
-    },
-    consentedAt: null,
-    lastAttemptAt: null,
-    lastSuccessAt: null,
-    nextAttemptAt: null,
-    lastOutcome: null,
-    foregroundOnly: true,
-    daemonInstalled: false,
-    networkActivity: false,
-    includesContent: false,
-    includesPaths: false,
-    includesIdentifiers: false,
-    includesCredentials: false,
-    ...overrides
-  };
-}
-
-test("automatic contribution settings are fixed, foreground-only, and fail closed", () => {
-  const scheduled = normalizeAutomaticContributionStatus(
-    automaticContributionStatusFixture({
-      status: "scheduled",
-      enabled: true,
-      consentCurrent: true,
-      consentedAt: "2026-07-29T12:00:00.000Z",
-      lastAttemptAt: "2026-07-29T12:01:00.000Z",
-      lastSuccessAt: "2026-07-29T12:01:00.000Z",
-      nextAttemptAt: "2026-07-29T18:01:00.000Z",
-      lastOutcome: {
-        status: "succeeded",
-        code: "accepted",
-        at: "2026-07-29T12:01:00.000Z"
-      }
-    })
-  );
-  assert.equal(scheduled.state, "scheduled");
-  assert.equal(scheduled.enabled, true);
-  assert.equal(scheduled.intervalHours, 6);
-  assert.equal(scheduled.foregroundOnly, true);
-  assert.equal(scheduled.daemonInstalled, false);
-  assert.equal(
-    scheduled.requiredConsent.destinationOrigin,
-    "https://contribute.example.test"
-  );
-  assert.deepEqual(scheduled.lastOutcome, {
-    status: "succeeded",
-    code: "accepted",
-    at: "2026-07-29T12:01:00.000Z"
-  });
-
-  const publicationRecovery = normalizeAutomaticContributionStatus(
-    automaticContributionStatusFixture({
-      status: "scheduled",
-      enabled: true,
-      consentCurrent: true,
-      consentedAt: "2026-07-29T12:00:00.000Z",
-      lastAttemptAt: "2026-07-29T12:01:00.000Z",
-      nextAttemptAt: "2026-07-29T18:01:00.000Z",
-      lastOutcome: {
-        status: "failed",
-        code: "publication_incomplete",
-        at: "2026-07-29T12:01:00.000Z"
-      }
-    })
-  );
-  assert.equal(publicationRecovery.state, "scheduled");
-  assert.equal(
-    publicationRecovery.lastOutcome.code,
-    "publication_incomplete"
-  );
-
-  const localDevelopment = normalizeAutomaticContributionStatus(
-    automaticContributionStatusFixture({
-      status: "consent_required",
-      requiredConsent: {
-        telemetrySchemaVersion: "telemetry-contribution-v0.1",
-        fieldDictionaryVersion: "telemetry-v0.1-registry-2026-08-06.1",
-        privacyContractVersion: "ongoing-privacy-safe-telemetry-v0.1",
-        destinationOrigin: "http://127.0.0.1:8791"
-      }
-    })
-  );
-  assert.equal(localDevelopment.state, "consent_required");
-
-  const firstReviewRequired = normalizeAutomaticContributionStatus(
-    automaticContributionStatusFixture({
-      status: "first_review_required",
-      firstReviewComplete: false,
-      firstReviewedAcceptedAt: null
-    })
-  );
-  assert.equal(firstReviewRequired.state, "first_review_required");
-  assert.equal(firstReviewRequired.firstReviewComplete, false);
-  assert.equal(firstReviewRequired.firstReviewedAcceptedAt, "");
-  assert.equal(
-    normalizeAutomaticContributionStatus(
-      automaticContributionStatusFixture({
-        status: "failed",
-        firstReviewComplete: false,
-        firstReviewedAcceptedAt: null
-      })
-    ).state,
-    "failed"
-  );
-  assert.equal(
-    normalizeAutomaticContributionStatus(
-      automaticContributionStatusFixture({
-        status: "not_configured",
-        firstReviewComplete: false,
-        firstReviewedAcceptedAt: null,
-        requiredConsent: {
-          telemetrySchemaVersion: "telemetry-contribution-v0.1",
-          fieldDictionaryVersion: "telemetry-v0.1-registry-2026-08-06.1",
-          privacyContractVersion: "ongoing-privacy-safe-telemetry-v0.1",
-          destinationOrigin: null
-        }
-      })
-    ).state,
-    "not_configured"
-  );
-
-  for (const invalid of [
-    automaticContributionStatusFixture({ extra: true }),
-    automaticContributionStatusFixture({ intervalHours: 4 }),
-    automaticContributionStatusFixture({ includesIdentifiers: true }),
-    automaticContributionStatusFixture({
-      status: "scheduled",
-      enabled: false,
-      consentCurrent: true
-    }),
-    automaticContributionStatusFixture({
-      lastOutcome: {
-        status: "succeeded",
-        code: "retry_scheduled",
-        at: "2026-07-29T12:01:00.000Z"
-      }
-    }),
-    automaticContributionStatusFixture({
-      firstReviewComplete: false
-    }),
-    automaticContributionStatusFixture({
-      status: "first_review_required"
-    }),
-    automaticContributionStatusFixture({
-      requiredConsent: {
-        telemetrySchemaVersion: "telemetry-contribution-v0.1",
-        fieldDictionaryVersion: "telemetry-v0.1-registry-2026-08-06.1",
-        privacyContractVersion: "ongoing-privacy-safe-telemetry-v0.1",
-        destinationOrigin: "https://contribute.example.test/collect"
-      }
-    })
-  ]) {
-    assert.equal(normalizeAutomaticContributionStatus(invalid).state, "unavailable");
-  }
-});
-
-test("automatic contribution client uses only fixed local status, enable, and disable routes", async () => {
-  const requiredConsent = automaticContributionStatusFixture().requiredConsent;
+test("the browser client no longer exposes automatic contribution controls", () => {
   const calls = [];
   const client = new LocalCompanionClient({
-    fetchImpl: async (url, options = {}) => {
-      calls.push({ url, options });
-      const payload = url.endsWith("/automatic-enable")
-        ? automaticContributionStatusFixture({
-            status: "scheduled",
-            enabled: true,
-            consentCurrent: true,
-            consentedAt: "2026-07-29T12:00:00.000Z",
-            nextAttemptAt: "2026-07-29T18:00:00.000Z"
-          })
-        : automaticContributionStatusFixture();
-      return new Response(JSON.stringify(payload), {
-        status: 200,
-        headers: { "Content-Type": "application/json" }
-      });
+    fetchImpl: async (...args) => {
+      calls.push(args);
+      throw new Error("retired automatic contribution route was called");
     }
   });
 
-  assert.equal((await client.automaticContributionStatus()).state, "disabled");
-  assert.equal(
-    (await client.enableAutomaticContribution(requiredConsent)).state,
-    "scheduled"
-  );
-  assert.equal((await client.disableAutomaticContribution()).state, "disabled");
-  assert.deepEqual(
-    calls.map(({ url }) => url),
-    [
-      "/api/local/contribution/automatic-settings",
-      "/api/local/contribution/automatic-enable",
-      "/api/local/contribution/automatic-disable"
-    ]
-  );
-  assert.deepEqual(
-    JSON.parse(calls[1].options.body),
-    { intervalHours: 6, consent: requiredConsent }
-  );
-  assert.deepEqual(
-    JSON.parse(calls[2].options.body),
-    { reason: "user_request" }
-  );
-  assert.equal(calls[1].options.headers["X-Usage-Monitor-Local"], "1");
-  assert.equal(calls[2].options.headers["X-Usage-Monitor-Local"], "1");
-  await assert.rejects(
-    client.enableAutomaticContribution({
-      ...requiredConsent,
-      destinationOrigin: "https://contribute.example.test/collect"
-    }),
-    /consent is invalid/u
-  );
-
-  const reviewLockedClient = new LocalCompanionClient({
-    fetchImpl: async () => new Response(JSON.stringify({
-      schemaVersion: "local-companion-v0.1",
-      error: { code: "automatic_contribution_first_review_required" }
-    }), {
-      status: 409,
-      headers: { "Content-Type": "application/json" }
-    })
-  });
-  await assert.rejects(
-    reviewLockedClient.enableAutomaticContribution(requiredConsent),
-    (error) => (
-      error.status === 409
-      && error.code === "automatic_contribution_first_review_required"
-    )
-  );
-  const malformedReviewLockedClient = new LocalCompanionClient({
-    fetchImpl: async () => new Response(JSON.stringify({
-      schemaVersion: "local-companion-v0.1",
-      error: {
-        code: "automatic_contribution_first_review_required",
-        privateDetail: "must not be trusted"
-      }
-    }), {
-      status: 409,
-      headers: { "Content-Type": "application/json" }
-    })
-  });
-  await assert.rejects(
-    malformedReviewLockedClient.enableAutomaticContribution(requiredConsent),
-    (error) => error.status === 409 && error.code === undefined
-  );
+  assert.equal(client.automaticContributionStatus, undefined);
+  assert.equal(client.enableAutomaticContribution, undefined);
+  assert.equal(client.disableAutomaticContribution, undefined);
+  assert.deepEqual(calls, []);
 });
 
-test("local sync preview and actions keep privileged values behind loopback", async () => {
+test("local reviewed-queue and device pairing stay behind fixed loopback routes", async () => {
   const privateCanary = "/Users/private/telemetry-secret.json";
-  const reviewToken = "r".repeat(43);
   const previewPayload = {
     schemaVersion: CONTRIBUTION_SYNC_PREVIEW_SCHEMA_VERSION,
     status: "available",
@@ -3149,24 +2836,6 @@ test("local sync preview and actions keep privileged values behind loopback", as
   });
 
   const calls = [];
-  const statusPayload = {
-    schemaVersion: CONTRIBUTION_SYNC_STATUS_SCHEMA_VERSION,
-    status: "available",
-    paused: true,
-    counts: {
-      pending: 1,
-      inFlight: 0,
-      accepted: 0,
-      retryable: 0,
-      rejected: 0
-    },
-    dueNow: 1,
-    nextAttemptAt: "2026-07-26T13:00:00.000Z",
-    lastAcceptedAt: null,
-    includesContent: false,
-    includesPaths: false,
-    includesCredentials: false
-  };
   const pairedPayload = {
     schemaVersion: "local-contribution-device-pairing-v0.1",
     status: "paired",
@@ -3182,11 +2851,7 @@ test("local sync preview and actions keep privileged values behind loopback", as
   const client = new LocalCompanionClient({
     fetchImpl: async (url, options = {}) => {
       calls.push({ url, options });
-      const body = url.endsWith("device-pair")
-        ? pairedPayload
-        : url.endsWith("sync-next")
-        ? previewPayload
-        : url.endsWith("sync-once") ? runPayload : statusPayload;
+      const body = url.endsWith("device-pair") ? pairedPayload : previewPayload;
       return new Response(JSON.stringify(body), {
         status: 200,
         headers: { "Content-Type": "application/json" }
@@ -3200,13 +2865,11 @@ test("local sync preview and actions keep privileged values behind loopback", as
     (await client.pairContributionDevice(pairingCode)).status,
     "paired"
   );
-  assert.equal((await client.runContributionSyncOnce(reviewToken)).accepted, 1);
-  assert.equal((await client.setContributionSyncPaused(true)).state, "paused");
+  assert.equal(client.runContributionSyncOnce, undefined);
+  assert.equal(client.setContributionSyncPaused, undefined);
   assert.deepEqual(calls.map((call) => call.url), [
     "/api/local/contribution/sync-next",
-    "/api/local/contribution/device-pair",
-    "/api/local/contribution/sync-once",
-    "/api/local/contribution/sync-pause"
+    "/api/local/contribution/device-pair"
   ]);
   for (const call of calls) {
     assert.equal(call.options.method, "POST");
@@ -3214,8 +2877,6 @@ test("local sync preview and actions keep privileged values behind loopback", as
   }
   assert.equal(calls[0].options.body, "{}");
   assert.equal(calls[1].options.body, JSON.stringify({ pairingCode }));
-  assert.equal(calls[2].options.body, JSON.stringify({ reviewToken }));
-  assert.equal(calls[3].options.body, "{}");
 });
 
 test("the local review bootstrap is independent of delivery scheduling", () => {
@@ -3620,6 +3281,25 @@ test("local contribution preparation exposes only verified bounded results", asy
       && !JSON.stringify(error).includes(privateCanary)
   );
 
+  const migrationClient = new LocalCompanionClient({
+    fetchImpl: async () => new Response(JSON.stringify({
+      schemaVersion: "local-contribution-preparation-error-v0.1",
+      status: "failed",
+      errorCode: "identity_migration_required",
+      privatePath: privateCanary,
+    }), {
+      status: 503,
+      headers: { "Content-Type": "application/json" },
+    }),
+  });
+  await assert.rejects(
+    migrationClient.prepareContribution(),
+    (error) => error.code === "identity_migration_required"
+      && error.message === "Request failed (503)."
+      && error.detail === null
+      && !JSON.stringify(error).includes(privateCanary),
+  );
+
   // export_too_large classifies a whole family of ceilings. The bound the
   // companion named must reach the reader's error, and nothing else may.
   const boundedClient = (detail) => new LocalCompanionClient({
@@ -3660,7 +3340,7 @@ test("local contribution preparation exposes only verified bounded results", asy
   }
 });
 
-test("community adapter separates cookie sessions from one-use upload authority", async () => {
+test("community adapter exposes only the current browser-session routes", async () => {
   const calls = [];
   const participantId = "participant:00000000-0000-4000-8000-000000000001";
   const client = new CommunityClient({
@@ -3676,65 +3356,47 @@ test("community adapter separates cookie sessions from one-use upload authority"
       });
     }
   });
+  await client.health();
   await client.session();
-  await client.registerUpload({
-    envelopeDigest: "a".repeat(64),
-    contentLengthBytes: 123,
-    contentType: "application/json"
-  });
-  await client.contributeSerialized(
-    JSON.stringify({ schemaVersion: TELEMETRY_ENVELOPE_SCHEMA_VERSION }),
-    "one-use-upload"
-  );
-  await client.personalStats();
-  await client.communityStats();
-  await client.participantExport();
   await client.deleteParticipant();
   await client.createDevicePairing();
-  await client.devices();
-  await client.revokeDevice("00000000-0000-4000-8000-000000000001");
   await client.logout();
-  await client.securityReset();
-  assert.equal(calls[0].url, "/api/v1/session");
-  assert.equal(calls[0].options.credentials, "same-origin");
-  assert.equal(calls[1].url, "/api/v1/me/upload-authorizations");
-  assert.equal(calls[1].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
+  assert.equal(calls[0].url, "/api/health");
+  assert.equal(calls[1].url, "/api/v1/session");
   assert.equal(calls[1].options.credentials, "same-origin");
-  assert.equal(calls[2].url, "/api/v1/contributions");
-  assert.equal(calls[2].options.headers.Authorization, "Upload one-use-upload");
-  assert.equal(calls[2].options.credentials, "omit");
-  assert.equal(calls[3].url, "/api/v1/me/stats");
-  assert.equal(calls[3].options.credentials, "same-origin");
-  assert.equal(calls[4].url, "/api/v1/stats/aggregate");
-  assert.equal(calls[5].url, "/api/v1/me/export");
-  assert.equal(calls[6].url, "/api/v1/me");
-  assert.equal(calls[6].options.method, "DELETE");
-  assert.equal(calls[6].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
-  assert.equal(calls[7].url, "/api/v1/me/device-pairings");
-  assert.equal(calls[7].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
+  assert.equal(calls[2].url, "/api/v1/me");
+  assert.equal(calls[2].options.method, "DELETE");
+  assert.equal(calls[2].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
+  assert.equal(calls[3].url, "/api/v1/me/device-pairings");
+  assert.equal(calls[3].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
   // Re-pinned 2026-08-08 (v1.0 wiring): a telemetry participant's pairing now
   // requests the v1.0 incremental consent identifier. The companion's CLAIM
   // of this pairing is what records the server-side consent-once grant that
   // v1.0 chunk uploads are verified against; the v0.1 identifier here left
   // production refusing every upload with 403 TELEMETRY_CONSENT_INVALID.
-  assert.match(calls[7].options.body, /ongoing-privacy-safe-telemetry-v1\.0/);
-  assert.doesNotMatch(calls[7].options.body, /ongoing-privacy-safe-telemetry-v0\.1/);
-  assert.equal(calls[8].url, "/api/v1/me/devices");
-  assert.equal(calls[9].url, "/api/v1/me/devices/revoke");
-  assert.equal(calls[9].options.method, "POST");
-  assert.equal(calls[9].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
-  assert.match(calls[9].options.body, /00000000-0000-4000-8000-000000000001/);
-  assert.equal(calls[10].url, "/api/v1/logout");
-  assert.equal(calls[11].url, "/api/v1/me/security-reset");
-  await client.health();
-  await client.readiness();
+  assert.match(calls[3].options.body, /ongoing-privacy-safe-telemetry-v1\.0/);
+  assert.doesNotMatch(calls[3].options.body, /ongoing-privacy-safe-telemetry-v0\.1/);
+  assert.equal(calls[4].url, "/api/v1/logout");
   await client.enroll("um_invite_test");
-  await client.recover("um_recovery_test");
-  assert.equal(calls[12].url, "/api/health");
-  assert.equal(calls[13].url, "/api/ready");
-  assert.match(calls[14].options.body, /privacy-safe-telemetry-v0\.1/);
-  assert.match(calls[14].options.body, /um_invite_test/);
-  assert.match(calls[15].options.body, /um_recovery_test/);
+  assert.match(calls[5].options.body, /privacy-safe-telemetry-v0\.1/);
+  assert.match(calls[5].options.body, /um_invite_test/);
+  for (const retired of [
+    "readiness",
+    "recover",
+    "registerUpload",
+    "contributeSerialized",
+    "contribution",
+    "deleteContribution",
+    "personalStats",
+    "participantProfile",
+    "communityStats",
+    "participantExport",
+    "devices",
+    "revokeDevice",
+    "securityReset"
+  ]) {
+    assert.equal(typeof client[retired], "undefined", retired);
+  }
 });
 
 test("community enrollment can atomically request one upload-only device pairing", async () => {
@@ -4495,28 +4157,7 @@ test("backend readiness accepts fail-closed 503 state without calling it ready",
       lifecycleStaleAfterMilliseconds: 3_600_000
     }
   };
-  let fetchReceiver = "not-called";
-  const client = new CommunityClient({
-    fetchImpl: async function fetchReadiness() {
-      fetchReceiver = this;
-      return new Response(JSON.stringify(payload), {
-        status: 503,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
-  });
-  assert.deepEqual(await client.readiness(), {
-    state: "not_ready",
-    lifecycle: "stale",
-    lifecycleFresh: false,
-    quarantineRetentionComplete: true,
-    restoreReplayComplete: true,
-    aggregateRebuildComplete: false,
-    maintenanceCycleMatched: false,
-    quarantineReconciliation: "running",
-    quarantineReconciliationComplete: false
-  });
-  assert.equal(fetchReceiver, undefined);
+  assert.equal(typeof CommunityClient.prototype.readiness, "undefined");
   const ready = {
     ...payload,
     status: "ready",
@@ -4555,36 +4196,9 @@ test("backend readiness accepts fail-closed 503 state without calling it ready",
   );
 });
 
-test("contribution read and deletion keep identifiers out of request URLs", async () => {
-  const calls = [];
-  const contributionId = "contribution:00000000-0000-4000-8000-000000000001";
-  const client = new CommunityClient({
-    getCsrfToken: () => "csrf-confirmation",
-    fetchImpl: async (url, options) => {
-      calls.push({ url, options });
-      const payload = url.endsWith("/delete")
-        ? { deleted: true, contributionId }
-        : { ok: true };
-      return new Response(JSON.stringify(payload), {
-        status: 200,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
-  });
-
-  await client.contribution(contributionId);
-  await client.deleteContribution(contributionId);
-
-  assert.deepEqual(calls.map((call) => call.url), [
-    "/api/v1/me/contributions/read",
-    "/api/v1/me/contributions/delete"
-  ]);
-  for (const call of calls) {
-    assert.equal(call.options.method, "POST");
-    assert.equal(call.options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
-    assert.equal(JSON.parse(call.options.body).contributionId, contributionId);
-    assert.equal(call.url.includes(contributionId), false);
-  }
+test("retired granular contribution methods are absent from the browser adapter", () => {
+  assert.equal(typeof CommunityClient.prototype.contribution, "undefined");
+  assert.equal(typeof CommunityClient.prototype.deleteContribution, "undefined");
 });
 
 test("deletion receipts fail closed before the UI can claim success", async () => {
@@ -4661,10 +4275,6 @@ test("deletion receipts fail closed before the UI can claim success", async () =
       headers: { "Content-Type": "application/json" }
     })
   });
-  await assert.rejects(
-    malformedClient.deleteContribution(contributionId),
-    /invalid contribution deletion receipt/
-  );
   await assert.rejects(
     malformedClient.deleteParticipant(),
     /invalid participant deletion receipt/
@@ -5070,28 +4680,7 @@ test("participant history keeps lifecycle and provenance bounded and private", a
     "unknown",
   );
 
-  const calls = [];
-  const client = new CommunityClient({
-    fetchImpl: async (url, options = {}) => {
-      calls.push({ url, options });
-      return new Response(JSON.stringify(profile), {
-        status: 200,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
-  });
-  await client.participantProfile();
-  assert.deepEqual(calls, [{
-    url: "/api/v1/me",
-    options: {
-      credentials: "same-origin",
-      headers: { Accept: "application/json" }
-    }
-  }]);
-  assert.throws(
-    () => client.deleteContribution("not-a-contribution"),
-    /valid contribution/
-  );
+  assert.equal(typeof CommunityClient.prototype.participantProfile, "undefined");
 });
 
 test("participant results fail closed for unverifiable prices and honest not-testable movement", () => {
@@ -6937,6 +6526,23 @@ test("a locked login keychain reads as a paused upload, never as a broken creden
   }
 });
 
+test("a declined legacy Keychain migration preserves the credential and never offers reset", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  assert.match(
+    appSource,
+    /contribution_device_keychain_migration_required:\n\s*"TiboTattle left this Mac's older upload credential untouched/u,
+  );
+  assert.match(appSource, /Quit and reopen TiboTattle/u);
+  assert.match(appSource, /Do not reset or delete the credential/u);
+  const recoveryClassifier = appSource.match(
+    /function contributionDeviceRecoveryIsRequired\(error\) \{([\s\S]*?)\n\}\n/u,
+  )?.[1] ?? "";
+  assert.doesNotMatch(
+    recoveryClassifier,
+    /contribution_device_keychain_migration_required/u,
+  );
+});
+
 test("the approve card shows one verified review instance before one explicit approval", async () => {
   // Re-pinned 2026-08-08 (owner-directed): the concise review moved onto the
   // approve-once card. The GATE is the contract and survives the removed
@@ -7366,7 +6972,7 @@ test("service request ids survive rejection so both sides of a failure can be jo
     }),
   });
   await assert.rejects(
-    failing({ error: { code: "INTERNAL_ERROR", requestId } }).personalStats(),
+    failing({ error: { code: "INTERNAL_ERROR", requestId } }).session(),
     (error) => error.status === 500
       && error.code === "INTERNAL_ERROR"
       && error.requestId === requestId,
@@ -7375,11 +6981,11 @@ test("service request ids survive rejection so both sides of a failure can be jo
   // no code to branch on and no request id to show.
   await assert.rejects(
     failing({ error: { code: "sorry, it broke", requestId: "private-value" } })
-      .personalStats(),
+      .session(),
     (error) => error.code === undefined && error.requestId === undefined,
   );
   await assert.rejects(
-    failing("not json at all").personalStats(),
+    failing("not json at all").session(),
     (error) => error.status === 500
       && error.code === undefined
       && error.requestId === undefined,
@@ -7549,7 +7155,7 @@ test("clients never invoke browser-native fetch with themselves as receiver", as
   );
   assert.equal(receiverStrictFetch.calls.length, 1);
 
-  function receiverStrictReady(url, options = {}) {
+  function receiverStrictHealth(url, options = {}) {
     if (this !== undefined && this !== globalThis) {
       throw new TypeError("Illegal invocation");
     }
@@ -7558,11 +7164,8 @@ test("clients never invoke browser-native fetch with themselves as receiver", as
       checks: {},
     }), { status: 200, headers: { "Content-Type": "application/json" } }));
   }
-  const community = new CommunityClient({ fetchImpl: receiverStrictReady });
-  // The stub's minimal body normalizes to the fail-closed unavailable shape;
-  // what matters here is that the request was made at all instead of dying
-  // on the receiver check.
-  assert.equal((await community.readiness()).state, "unavailable");
+  const community = new CommunityClient({ fetchImpl: receiverStrictHealth });
+  assert.deepEqual(await community.health(), { status: "ready", checks: {} });
 });
 
 test("the device credential repair is explicit, local-only, and fails closed", async () => {
@@ -8248,7 +7851,7 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
   )?.[1] ?? "";
   assert.match(
     promptSurface,
-    /reported === "rotation" \|\| reported === "none" \? reported : "pairing"/u,
+    /reported === "migration" \|\| reported === "none" \? reported : "pairing"/u,
   );
   // Re-pinned 2026-08-08 (owner-directed, second round): queue_refresh left
   // with the separate connect flow — the merged ceremony's invisible
@@ -8266,6 +7869,11 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
     /local_preparation: Object\.freeze\(\{|local_review: Object\.freeze\(\{|queue_refresh: Object\.freeze\(\{/u,
   );
   assert.match(appSource, /INCREMENTAL_PREPARATION_ERROR_COPY = \{/u);
+  assert.match(appSource, /identity_migration_required:/u);
+  assert.match(
+    appSource,
+    /identity_migration_required:[\s\S]{0,500}Quit and reopen TiboTattle[\s\S]{0,500}Do not reset, delete, or rotate the identity/u,
+  );
   assert.match(appSource, /identity_unavailable:/u);
   assert.match(appSource, /coverage_unavailable:/u);
   for (const code of [

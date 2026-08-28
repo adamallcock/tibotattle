@@ -12,7 +12,9 @@ import {
   verifyCodexExportSourcePlan,
   verifyCodexExportSourceHandle,
 } from "../src/export-source-plan.js";
-import { scanCodexSafeRecords } from "../src/export-safe-records.js";
+import { localSafeRecords } from "../src/local-node-runtime.js";
+
+const { scanCodexSafeRecords } = localSafeRecords;
 
 async function fixture({ incompleteTail = false } = {}) {
   const home = await mkdtemp(join(tmpdir(), "usage-monitor-source-plan-"));

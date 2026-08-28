@@ -13,7 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { scanCodexLogEvents } from "../src/codex-log-scan.js";
+import { localCodexLogScanner } from "../src/local-node-runtime.js";
 import { recognizedExportModelId } from "../src/export/index.js";
 import {
   configureDatabase,
@@ -30,6 +30,8 @@ import {
 import {
   writeLocalCollectorAccountingCache,
 } from "../src/local-collector-state.js";
+
+const { scanCodexLogEvents } = localCodexLogScanner;
 
 const START_AT = "2026-07-24T11:55:00.000Z";
 const END_AT = "2026-07-24T12:10:00.000Z";

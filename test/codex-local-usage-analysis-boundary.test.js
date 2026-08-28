@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import * as codexLocalUsageAnalysis from "../src/codex-local-usage-analysis.js";
-import * as codexLogScanner from "../src/codex-log-scan.js";
+import { localCodexLogScanner } from "../src/local-node-runtime.js";
 import { extractEsmImports } from "../scripts/lib/esm-imports.mjs";
 
 const START_AT = "2026-07-30T00:00:00.000Z";
@@ -154,30 +154,26 @@ async function createCodexRolloutFixture() {
   return { codexHome, rolloutPath };
 }
 
-test("Codex pricing analysis has one public entry point and stays out of the scanner", async () => {
+test("Codex pricing analysis has one public entry point and stays out of the scanner owner", async () => {
   assert.deepEqual(
     Object.keys(codexLocalUsageAnalysis),
     ["scanAndPriceCodexLogs"],
   );
-  assert.equal(
-    codexLogScanner.scanAndPriceCodexLogs,
-    codexLocalUsageAnalysis.scanAndPriceCodexLogs,
-    "the scanner preserves the legacy application-owned pricing binding",
-  );
+  assert.equal(Object.hasOwn(localCodexLogScanner, "scanAndPriceCodexLogs"), false);
 
   const scannerSource = await readFile(
-    new URL("../src/codex-log-scan.js", import.meta.url),
+    new URL("../src/application/local-codex-log-scanner.js", import.meta.url),
     "utf8",
   );
   const forbiddenImports = (await extractEsmImports(scannerSource, {
-    sourceName: "src/codex-log-scan.js",
+    sourceName: "src/application/local-codex-log-scanner.js",
   }))
     .map(({ specifier }) => specifier)
     .filter(isForbiddenScannerImport);
   assert.deepEqual(
     forbiddenImports,
     [],
-    "the Codex scanner must remain independent from every pricing/accounting entry point",
+    "the Codex scanner owner must remain independent from every pricing/accounting entry point",
   );
 });
 

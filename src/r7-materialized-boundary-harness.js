@@ -1,10 +1,12 @@
 import { chmod, lstat, mkdtemp, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildLocalMetadataBundle } from "./metadata-exporter.js";
-import { createLocalExportWorkspace } from "./export-set-controller.js";
-import { materializeLocalExportSet } from "./export-set-materializer.js";
-import { verifyLocalExportSet } from "./export-set-verifier.js";
+import {
+  localExportSetMaterialization,
+  localExportSetVerification,
+  localExportSourcePipeline,
+  localMetadataExport,
+} from "./local-node-runtime.js";
 import {
   compressExportBytes,
   decompressExportBytes,
@@ -34,6 +36,11 @@ import { cleanupR7OwnedTree, inventoryR7OwnedTree } from "./r7-resource-benchmar
 
 export const R7_MATERIALIZED_BOUNDARY_HARNESS_VERSION =
   "g1-r7-materialized-boundary-integration-v0.3";
+
+const { buildLocalMetadataBundle } = localMetadataExport;
+const { createLocalExportWorkspace } = localExportSourcePipeline.controller;
+const { materializeLocalExportSet } = localExportSetMaterialization;
+const { verifyLocalExportSet } = localExportSetVerification;
 
 const FIXED_BUNDLE_ID = `bundle:v1:${"6".repeat(64)}`;
 const EXECUTED_STATUSES = new Set(["passed", "rejected"]);

@@ -115,7 +115,6 @@ const CODE_RESOURCES_PATH = "Contents/_CodeSignature/CodeResources";
 const NORMALIZED_MACH_O_PATHS = new Set([
   SIGNED_EXECUTABLE_PATH,
   "Contents/Resources/runtime/bin/node",
-  "Contents/Resources/app/node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
   ...SPARKLE_MACH_O_PATHS.map(
     (path) => `${SPARKLE_FRAMEWORK_PREFIX}/${path}`,
   ),
@@ -203,14 +202,10 @@ const EXPECTED_EXTERNAL_SPECIFIERS = Object.freeze([
   "@app-usagemonitor/identity-core",
   "@app-usagemonitor/quota-analysis",
   "@app-usagemonitor/telemetry-contract",
-  "@github/keytar",
   "ajv",
   "runcost/browser",
 ]);
 
-const DYNAMIC_EXTERNAL_BY_FILE = Object.freeze({
-  "src/platform/export-identity-keychain.js": "@github/keytar",
-});
 const WORKSPACE_RUNTIME_PACKAGE_EXTERNALS = Object.freeze({
   "@app-usagemonitor/accounting": Object.freeze(["runcost/browser"]),
 });
@@ -220,7 +215,6 @@ const PINNED_PACKAGES = Object.freeze({
   "@app-usagemonitor/identity-core": RELEASE_VERSION,
   "@app-usagemonitor/quota-analysis": RELEASE_VERSION,
   "@app-usagemonitor/telemetry-contract": RELEASE_VERSION,
-  "@github/keytar": "7.10.6",
   ajv: "8.20.0",
   "fast-deep-equal": "3.1.3",
   "fast-uri": "3.1.5",
@@ -238,8 +232,6 @@ const PINNED_PACKAGES = Object.freeze({
 // Bump a value here only through a reviewed dependency update, alongside the
 // version above.
 const PINNED_PACKAGE_TREE_DIGESTS = Object.freeze({
-  "@github/keytar":
-    "0a09b62fbf597c176747009631e671c0625530132a471b6a1aa47153edf131be",
   ajv: "7fecaf9a9ff3f41dabc7f7d762c7fecb8384c38a3c0dd4e6da0f3b3ef04569ca",
   "fast-deep-equal":
     "6c98665ed0585630ce02fbf064e6ed854f8e6546cb1e534158dbfbc18e05aa85",
@@ -689,8 +681,6 @@ export async function collectMacOSRuntimeGraph(entrypoint = ENTRYPOINT) {
     files.add(file);
     if (![".js", ".mjs"].includes(extname(file))) continue;
     const source = await readFile(file, "utf8");
-    const dynamicExternal = DYNAMIC_EXTERNAL_BY_FILE[repositoryRelative(file)];
-    if (dynamicExternal) external.add(dynamicExternal);
     for (const sourcePattern of SOURCE_PATTERNS) {
       // A build can run alongside another isolated build in the artifact
       // reproducibility check. RegExp instances with the global flag carry
@@ -1625,34 +1615,12 @@ async function copyRuntimeDependencies(appRoot, workspaceRuntimePackages) {
     );
   }
 
-  const keytarPackage = rootRequire.resolve("@github/keytar/package.json");
-  const keytar = await pinnedPackage("@github/keytar", keytarPackage);
-  const keytarRoot = dirname(keytarPackage);
-  for (const relativePath of [
-    "package.json",
-    "LICENSE.md",
-    "prebuilds/darwin-arm64/keytar.node",
-  ]) {
-    await copyRegularFile(
-      join(keytarRoot, ...relativePath.split("/")),
-      join(
-        appRoot,
-        "node_modules",
-        "@github",
-        "keytar",
-        ...relativePath.split("/"),
-      ),
-      relativePath.endsWith(".node") ? 0o555 : 0o444,
-    );
-  }
-
   return [
     ...workspaceRuntimePackages.map(({ license, name, version }) => ({
       license,
       name,
       version,
     })),
-    keytar,
     ajv,
     ...transitive,
     runcost,
@@ -2246,7 +2214,6 @@ async function copyLicenses(resourcesRoot, updater) {
   const rootRequire = createRequire(join(REPOSITORY_ROOT, "package.json"));
   const packageLicenses = [
     ["ajv", rootRequire.resolve("ajv/package.json")],
-    ["@github-keytar", rootRequire.resolve("@github/keytar/package.json")],
   ];
   const ajvRequire = createRequire(packageLicenses[0][1]);
   for (const name of [

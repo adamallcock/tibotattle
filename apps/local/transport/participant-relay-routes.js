@@ -14,24 +14,10 @@ export const PARTICIPANT_RELAY_ROUTE_POLICY = Object.freeze([
   defineParticipantRelayRoute("/api/v1/identity/google/result", ["POST"]),
   defineParticipantRelayRoute("/api/v1/identity/apple/start", ["POST"]),
   defineParticipantRelayRoute("/api/v1/identity/apple/result", ["POST"]),
-  defineParticipantRelayRoute("/api/v1/recover", ["POST"]),
   defineParticipantRelayRoute("/api/v1/session", ["GET"]),
   defineParticipantRelayRoute("/api/v1/logout", ["POST"]),
-  defineParticipantRelayRoute("/api/v1/me", ["GET", "DELETE"]),
-  defineParticipantRelayRoute("/api/v1/me/stats", ["GET"]),
-  defineParticipantRelayRoute("/api/v1/me/insights", ["GET"]),
-  defineParticipantRelayRoute("/api/v1/me/export", ["GET"]),
-  defineParticipantRelayRoute("/api/v1/me/security-reset", ["POST"]),
-  defineParticipantRelayRoute(
-    "/api/v1/me/upload-authorizations",
-    ["POST"],
-  ),
+  defineParticipantRelayRoute("/api/v1/me", ["DELETE"]),
   defineParticipantRelayRoute("/api/v1/me/device-pairings", ["POST"]),
-  defineParticipantRelayRoute("/api/v1/me/devices", ["GET"]),
-  defineParticipantRelayRoute("/api/v1/me/devices/revoke", ["POST"]),
-  defineParticipantRelayRoute("/api/v1/me/contributions/read", ["POST"]),
-  defineParticipantRelayRoute("/api/v1/me/contributions/delete", ["POST"]),
-  defineParticipantRelayRoute("/api/v1/contributions", ["POST"]),
 ]);
 
 const PARTICIPANT_RELAY_ROUTES = new Map();

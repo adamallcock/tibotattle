@@ -69,13 +69,12 @@ Requirements: macOS 14 or later on arm64, Node.js ≥ 22.13 for the repository t
 build itself requires exactly Node v26.2.0 on macOS arm64: it fails on any
 other runtime rather than producing an unverifiable bundle.
 
-The root workspace uses pnpm; the worker and Cloud Run apps keep their own
-npm lockfiles (only needed for the hosted-service checks and the full gates):
+The root workspace uses pnpm; the Worker keeps its own npm lockfile, which is
+needed only for hosted-service checks and the full gates:
 
 ```bash
 pnpm install
 npm --prefix apps/worker ci
-npm --prefix apps/cloud-run ci
 ```
 
 Build and open the self-contained desktop app:
@@ -164,8 +163,8 @@ compatibility fallback until they are explicitly migrated.
 | Path | Contents |
 | --- | --- |
 | `apps/macos`, `apps/local`, `apps/web` | Desktop app shell, loopback companion server, and browser dashboard |
-| `apps/worker`, `apps/cloud-run` | Optional hosted contribution service (off by default) |
-| `packages/` | Workspace packages: accounting, quota analysis, telemetry contract, identity core |
+| `apps/worker` | Optional hosted contribution service (off by default) |
+| `packages/` | Workspace packages: accounting, quota analysis, telemetry contract, identity core, and i18n |
 | `src/` | Product source: `application/`, `platform/`, `export/`, `contribution/`, `reporting/`, `providers/` owners plus compatibility roots |
 | `docs/` | Reference, decisions, plans, receipts, and historical goal documents |
 | `local-review/` | Reproducible standalone review artifact tooling |
@@ -179,6 +178,12 @@ the deploy scripts in this repository target the owner's Cloudflare account.
 Forks that want their own hosted service must provision their own resources
 per `apps/worker/wrangler.jsonc`; the local app never requires the hosted
 service.
+
+For the complete engineering map of loopback and hosted HTTP routes, native
+bridges, child-process protocols, Cloudflare bindings, workspace package APIs,
+schemas, and third-party services, see the maintained
+[TiboTattle API surface reference](docs/reference/2026-08-26-api-surface-reference.md).
+Its source-parity check is `npm run docs:api:check`.
 
 ## Development
 

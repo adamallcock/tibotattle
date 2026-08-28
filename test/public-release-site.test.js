@@ -515,7 +515,14 @@ function assertPublishedPlatformSelectorContract(html) {
     assert.match(panel, /Not yet available/u);
     assert.match(
       panel,
-      new RegExp(`There is no published ${displayName} build yet\\.`, "u"),
+      new RegExp(`TiboTattle for ${displayName} is not available yet\\.`, "u"),
+    );
+    assert.match(
+      panel,
+      new RegExp(
+        `Follow the ${displayName} support work for progress\\. A download will appear only after the ${displayName} release passes its platform and release checks\\.`,
+        "u",
+      ),
     );
     assert.match(
       panel,
@@ -529,7 +536,7 @@ function assertPublishedPlatformSelectorContract(html) {
       1,
       `${displayName} exposes only its roadmap issue link`,
     );
-    assert.doesNotMatch(panel, /<button\b|\bDownload\b/iu);
+    assert.doesNotMatch(panel, /<button\b/iu);
     assert.doesNotMatch(
       panel,
       /\b(?:winget|choco(?:latey)?|scoop|powershell|appimage|flatpak|snap|apt(?:-get)?|dnf|yum|pacman)\b|\.(?:exe|msi|msix|deb|rpm)\b/iu,

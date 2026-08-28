@@ -4,14 +4,21 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { populateCheckpointedCodexSources } from "../src/codex-export-checkpoint-scan.js";
-import { createLocalExportWorkspace } from "../src/export-set-controller.js";
 import { exportCompatibilityTuple } from "../src/export-contract.js";
 import { deriveParticipantId } from "../src/export-identity.js";
 import { createExportResourceGuard } from "../src/export-resource-policy.js";
-import { scanCodexSafeRecords, summarizeActivityMarkerPlan } from "../src/export-safe-records.js";
 import { createCodexExportSourcePlan } from "../src/export-source-plan.js";
-import { buildExportWorkspaceDescriptor, createExportWorkspace } from "../src/export-workspace.js";
+import {
+  localExportSourcePipeline,
+  localExportWorkspace,
+  localSafeRecords,
+} from "../src/local-node-runtime.js";
 import { stableJson } from "../src/storage.js";
+
+const { createLocalExportWorkspace } = localExportSourcePipeline.controller;
+const { buildExportWorkspaceDescriptor, createExportWorkspace } =
+  localExportWorkspace;
+const { scanCodexSafeRecords, summarizeActivityMarkerPlan } = localSafeRecords;
 
 const SECRET = Buffer.alloc(32, 81);
 const START_AT = "2026-07-24T11:55:00.000Z";

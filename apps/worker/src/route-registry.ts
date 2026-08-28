@@ -1,6 +1,22 @@
-interface WorkerRouteDefinition {
+export type WorkerRouteMethod = "GET" | "POST" | "DELETE";
+
+export type WorkerRouteAuthority =
+  | "none"
+  | "public"
+  | "enrollment"
+  | "handoff"
+  | "session"
+  | "device"
+  | "upload"
+  | "pairing_code"
+  | "admin"
+  | "operator";
+
+export interface WorkerRouteDefinition {
   readonly pathname: string;
   readonly id: string;
+  readonly methods: readonly WorkerRouteMethod[] | "all";
+  readonly authority: WorkerRouteAuthority;
 }
 
 const EXACT_WORKER_ROUTE_DEFINITIONS = [
@@ -10,63 +26,138 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
   {
     pathname: "/.well-known/apple-developer-domain-association.txt",
     id: "apple_domain_association",
+    methods: "all",
+    authority: "none",
   },
-  { pathname: "/api/health", id: "health" },
-  { pathname: "/api/ready", id: "ready" },
-  { pathname: "/api/v1/enroll", id: "enroll" },
+  {
+    pathname: "/api/health",
+    id: "health",
+    methods: ["GET"],
+    authority: "public",
+  },
+  {
+    pathname: "/api/ready",
+    id: "ready",
+    methods: ["GET"],
+    authority: "public",
+  },
+  {
+    pathname: "/api/v1/enroll",
+    id: "enroll",
+    methods: ["POST"],
+    authority: "enrollment",
+  },
   {
     pathname: "/api/v1/internal/release/appcast",
     id: "sparkle_appcast_guard",
+    methods: ["POST"],
+    authority: "operator",
   },
   // Both hosted providers use the same three-route handoff: the dashboard
   // starts a sign-in, the provider redirects to this service's own callback,
   // and the dashboard reads the one-time result back keyed by an unguessable
   // state. Nothing about a sign-in ever returns to a client-owned redirect.
-  { pathname: "/api/v1/identity/google/start", id: "identity_google_start" },
+  {
+    pathname: "/api/v1/identity/google/start",
+    id: "identity_google_start",
+    methods: ["POST"],
+    authority: "handoff",
+  },
   {
     pathname: "/api/v1/identity/google/callback",
     id: "identity_google_callback",
+    methods: ["GET"],
+    authority: "handoff",
   },
-  { pathname: "/api/v1/identity/google/result", id: "identity_google_result" },
-  { pathname: "/api/v1/identity/apple/start", id: "identity_apple_start" },
+  {
+    pathname: "/api/v1/identity/google/result",
+    id: "identity_google_result",
+    methods: ["POST"],
+    authority: "handoff",
+  },
+  {
+    pathname: "/api/v1/identity/apple/start",
+    id: "identity_apple_start",
+    methods: ["POST"],
+    authority: "handoff",
+  },
   {
     pathname: "/api/v1/identity/apple/callback",
     id: "identity_apple_callback",
+    methods: ["POST"],
+    authority: "handoff",
   },
-  { pathname: "/api/v1/identity/apple/result", id: "identity_apple_result" },
-  { pathname: "/api/v1/recover", id: "recover" },
-  { pathname: "/api/v1/session", id: "session" },
-  { pathname: "/api/v1/logout", id: "logout" },
-  { pathname: "/api/v1/admin/overview", id: "admin_overview" },
-  { pathname: "/api/v1/admin/metrics/history", id: "admin_metrics_history" },
+  {
+    pathname: "/api/v1/identity/apple/result",
+    id: "identity_apple_result",
+    methods: ["POST"],
+    authority: "handoff",
+  },
+  {
+    pathname: "/api/v1/session",
+    id: "session",
+    methods: ["GET"],
+    authority: "session",
+  },
+  {
+    pathname: "/api/v1/logout",
+    id: "logout",
+    methods: ["POST"],
+    authority: "session",
+  },
+  {
+    pathname: "/api/v1/admin/overview",
+    id: "admin_overview",
+    methods: ["GET"],
+    authority: "admin",
+  },
+  {
+    pathname: "/api/v1/admin/metrics/history",
+    id: "admin_metrics_history",
+    methods: ["GET"],
+    authority: "admin",
+  },
   {
     pathname: "/api/v1/admin/community/allowance-preview",
     id: "admin_community_allowance_preview",
+    methods: ["GET"],
+    authority: "admin",
   },
-  { pathname: "/api/v1/admin/action", id: "admin_action" },
+  {
+    pathname: "/api/v1/admin/action",
+    id: "admin_action",
+    methods: ["POST"],
+    authority: "admin",
+  },
   {
     pathname: "/api/v1/me/security-reset",
     id: "security_reset",
-  },
-  {
-    pathname: "/api/v1/me/upload-authorizations",
-    id: "upload_authorization",
+    methods: ["POST"],
+    authority: "session",
   },
   {
     pathname: "/api/v1/me/device-pairings",
     id: "device_pairing",
+    methods: ["POST"],
+    authority: "session",
   },
   {
     pathname: "/api/v1/device-pairings/claim",
     id: "device_pairing_claim",
+    methods: ["POST"],
+    authority: "pairing_code",
   },
   {
     pathname: "/api/v1/device/upload-authorizations",
     id: "device_upload_authorization",
+    methods: ["POST"],
+    authority: "device",
   },
   {
     pathname: "/api/v1/device/disconnect",
     id: "device_disconnect",
+    methods: ["POST"],
+    authority: "device",
   },
   {
     // Silent auto-renewal: a valid, unexpired device bearer rotates its own
@@ -74,66 +165,62 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
     // 30-day credential never lapses under active use.
     pathname: "/api/v1/device/credential/renew",
     id: "device_credential_renew",
+    methods: ["POST"],
+    authority: "device",
   },
   {
     pathname: "/api/v1/device/sync/state",
     id: "device_sync_state",
+    methods: ["GET"],
+    authority: "device",
   },
   {
     pathname: "/api/v1/device/sync/manifest",
     id: "device_sync_manifest",
+    methods: ["GET"],
+    authority: "device",
   },
   {
     pathname: "/api/v1/me/devices",
     id: "participant_devices",
+    methods: ["GET"],
+    authority: "session",
   },
   {
     pathname: "/api/v1/me/devices/revoke",
     id: "participant_device_revocation",
+    methods: ["POST"],
+    authority: "session",
   },
   {
     pathname: "/api/v1/envelope-key",
     id: "envelope_key",
+    methods: ["GET"],
+    authority: "public",
   },
   {
     pathname: "/api/v1/contributions",
     id: "contributions",
-  },
-  {
-    pathname: "/api/v1/me/contributions/read",
-    id: "contribution_read",
-  },
-  {
-    pathname: "/api/v1/me/contributions/delete",
-    id: "contribution_delete",
+    methods: ["POST"],
+    authority: "upload",
   },
   {
     pathname: "/api/v1/me/export",
     id: "participant_export",
-  },
-  {
-    pathname: "/api/v1/me/stats",
-    id: "participant_stats",
-  },
-  {
-    pathname: "/api/v1/me/insights",
-    id: "participant_stats",
-  },
-  {
-    pathname: "/api/v1/stats/aggregate",
-    id: "community_stats",
-  },
-  {
-    pathname: "/api/v1/community/insights",
-    id: "community_stats",
+    methods: ["GET"],
+    authority: "session",
   },
   {
     pathname: "/api/v1/community/daily",
     id: "community_daily",
+    methods: ["GET"],
+    authority: "public",
   },
   {
     pathname: "/api/v1/me",
     id: "participant",
+    methods: ["DELETE"],
+    authority: "session",
   },
 ] as const satisfies readonly WorkerRouteDefinition[];
 
@@ -145,6 +232,10 @@ export const WORKER_ROUTE_POLICY: readonly Readonly<WorkerRouteDefinition>[] =
     Object.freeze({
       pathname: definition.pathname,
       id: definition.id,
+      methods: definition.methods === "all"
+        ? "all"
+        : Object.freeze([...definition.methods]),
+      authority: definition.authority,
     })
   ));
 
@@ -159,6 +250,8 @@ export type WorkerRouteMatch =
       kind: "exact";
       id: ExactWorkerRouteId;
       routeClass: ExactWorkerRouteId;
+      methods: readonly WorkerRouteMethod[] | "all";
+      authority: WorkerRouteAuthority;
     }>
   | Readonly<{
       kind: "unknown_api";
@@ -180,6 +273,10 @@ for (const definition of EXACT_WORKER_ROUTE_DEFINITIONS) {
     kind: "exact",
     id: definition.id,
     routeClass: definition.id,
+    methods: definition.methods === "all"
+      ? "all"
+      : Object.freeze([...definition.methods]),
+    authority: definition.authority,
   }));
 }
 

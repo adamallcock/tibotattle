@@ -33,23 +33,17 @@
 
 const SESSION_COOKIE_NAME = "__Host-usage_monitor_session";
 
-// Relay routes that authenticate with something OTHER than the session cookie —
-// the one-use hosted identity proof (enroll, identity start/result), a recovery
-// code (recover), or a one-use Upload authorization (contributions). These are
-// forwarded with exactly the jar's own cookie and never the captured session:
-// /api/v1/contributions in particular carries an Upload authorization with
-// credentials omitted, so it must never carry the session secret. Every other
-// relay route (session, logout, and the whole /me/* family — including the
-// device-pairing mint) authenticates with the session cookie and takes the
-// bridge's captured session.
+// Relay routes that authenticate with the one-use hosted identity proof rather
+// than the session cookie. They are forwarded with exactly the jar's own
+// cookie. Every other retained relay route (session, logout, account deletion,
+// and the device-pairing mint) authenticates with the session cookie and takes
+// the bridge's captured session.
 const SESSION_EXEMPT_RELAY_PATHS = Object.freeze(new Set([
   "/api/v1/enroll",
   "/api/v1/identity/google/start",
   "/api/v1/identity/google/result",
   "/api/v1/identity/apple/start",
   "/api/v1/identity/apple/result",
-  "/api/v1/recover",
-  "/api/v1/contributions",
 ]));
 
 /**

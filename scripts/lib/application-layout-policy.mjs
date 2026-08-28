@@ -1,10 +1,5 @@
 const APPLICATION_DEFINITIONS = [
   {
-    name: "cloud-run",
-    root: "apps/cloud-run",
-    allowedPackages: ["telemetry-contract"],
-  },
-  {
     name: "local",
     root: "apps/local",
     allowedPackages: [

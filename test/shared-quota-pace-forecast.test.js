@@ -3,8 +3,8 @@ import test from "node:test";
 
 import {
   analyzeQuotaPace,
-  QUOTA_PACE_POLICY,
 } from "@app-usagemonitor/quota-analysis";
+import { QUOTA_PACE_POLICY } from "../packages/quota-analysis/src/quota-pace-forecast.js";
 
 const RESET = "2026-08-08T00:00:00.000Z";
 const TRACK = {

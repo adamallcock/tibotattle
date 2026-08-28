@@ -608,124 +608,54 @@ production operator command and approval boundary exist.
 
 ## API
 
-- `GET /api/health`
-- `GET /api/ready`
-- `POST /api/v1/enroll`
-- `POST /api/v1/recover`
-- `GET /api/v1/session`
-- `POST /api/v1/logout`
-- `POST /api/v1/me/security-reset`
-- `POST /api/v1/me/upload-authorizations`
-- `POST /api/v1/me/device-pairings`
-- `POST /api/v1/device-pairings/claim`
-- `GET /api/v1/me/devices`
-- `POST /api/v1/me/devices/revoke`
-- `POST /api/v1/device/upload-authorizations`
-- `GET /api/v1/envelope-key`
-- `POST /api/v1/contributions`
-- `POST /api/v1/me/contributions/read`
-- `POST /api/v1/me/contributions/delete`
-- `GET /api/v1/me`
-- `GET /api/v1/me/stats` (alias: `/api/v1/me/insights`)
-- `GET /api/v1/community/insights` (alias: `/api/v1/stats/aggregate`)
-- `GET /api/v1/me/export`
-- `DELETE /api/v1/me`
+The complete route registry, method map, authority classes, aliases, query
+bounds, runtime bindings, and identity/device/upload sequence are documented in
+the maintained
+[TiboTattle API surface reference](../../docs/reference/2026-08-26-api-surface-reference.md).
+That reference is checked directly against `src/route-registry.ts`, so newer
+identity, admin, device-sync, daily-community, credential-renewal, and appcast
+guard routes cannot disappear behind a stale partial list here.
 
-Personal endpoints accept only a short-lived D1-backed web session delivered
-as a Secure, HttpOnly, SameSite=Strict `__Host-` cookie. Session-authenticated
+Session endpoints accept only a short-lived D1-backed web session delivered as
+a Secure, HttpOnly, SameSite=Strict `__Host-` cookie. Session-authenticated
 mutations also require the exact same origin and a session-bound CSRF value.
 No reusable personal credential is placed in browser storage or returned as an
 access token.
 
-Contribution upload is a separate authority class. A session first registers
-one exact encrypted digest, byte length, and `application/json` content type.
-The returned five-minute `Upload` authorization is hash-only in D1 and can be
-used once for that exact body. The upload request omits the personal cookie,
-and neither authority is accepted in the other's routes.
+Contribution upload is a separate authority class. The current collector uses
+its locally held device bearer to mint one exact digest-, byte-, content-type-,
+and principal-bound Upload authorization. That five-minute authority is
+hash-only in D1 and can be used once for the exact encrypted body. The upload
+request omits the personal cookie; session-backed upload-authority minting has
+been retired, and neither authority substitutes for the other.
 
-An enrolled participant can also create a short-lived, one-use pairing code for
-a local collector. The collector generates its device UUID and 32-byte secret
-locally, stores the secret in macOS Keychain, and sends only the
-domain-separated credential hash while claiming the pairing. The resulting
-device authority can register only an exact digest-and-byte-bound one-use
-upload authorization. It cannot read participant statistics, export data,
-create another device, revoke devices, reset security, recover a participant,
-or delete anything. The participant portal lists and revokes devices; recovery,
-security reset, and deletion revoke device upload authority as part of their
-normal lifecycle.
+An enrolled participant can create a short-lived, one-use pairing code. The
+collector generates its device UUID and 32-byte secret locally, stores the
+secret in the app-owned macOS Keychain item, and sends only a domain-separated
+credential hash while claiming the pairing. Device authority can synchronize,
+renew or disconnect itself, and mint Upload authority; it cannot read session
+controls, export data, manage other devices, or delete hosted participation.
 
-Recovery rotates the recovery code, revokes every prior web session and unused
-upload authorization, and creates a replacement session. To survive a lost
-successful HTTP response, the old recovery presentation can reproduce the
-same replacement material at most twice for five minutes only when paired
-with the identical independent high-entropy recovery-attempt value. The old
-code alone or a different attempt value cannot replay it. The retry receipt
-stores only hashes, opaque identifiers, and a derivation nonce.
-If deletion has already started and the winning session expires or is lost,
-the latest recovery code creates a `deletion_only` session. That session
-cannot read, export, reset, or upload; it can only finish deletion.
-Security reset preserves only the current session while rotating recovery and
-revoking other sessions/uploads. Logout clears the cookie even when it is
-already stale. Contributions are encrypted with a fresh AES-GCM key; the data
-key is wrapped with the published RSA-OAEP-256 key. Only the opaque envelope
-is retained in R2 quarantine. Validated closed metadata is stored in D1.
+The current public product series is `GET /api/v1/community/daily`. The
+v1-aware `DELETE /api/v1/me` remains the whole-account privacy deletion path;
+`GET /api/v1/me`, legacy personal statistics, weekly aggregate, recovery,
+session upload authorization, and granular legacy contribution read/delete
+routes have been retired. Hosted export, security reset, and selected-device
+management remain exact Worker session surfaces but are not granted through
+the loopback participant relay.
 
-The real test contract is:
+Contributions are encrypted with a fresh AES-GCM key and the data key is
+wrapped with the published RSA-OAEP-256 key. Only the opaque envelope is held
+in R2 quarantine; validated closed metadata is stored in D1. Uploaded API-cost
+values remain `client_declared_unverified` diagnostics, while canonical cost is
+recalculated from validated token metadata with price/method provenance.
 
-- envelope schema `telemetry-envelope-v0.1`, with exactly
-  `schemaVersion`, `synthetic`, `keyId`, `wrappedKey`, `iv`, and `ciphertext`;
-- plaintext schema `telemetry-contribution-v0.1`, with at most 200 rows total
-  (and at most 100 activity rows);
-- no client participant, account, or session pseudonym;
-- occurrence IDs are used only for participant-scoped overlap deduplication;
-- model fingerprints remain participant-scoped and are never emitted from
-  community APIs;
-- uploaded API-cost values remain `client_declared_unverified` diagnostics;
-- canonical personal cost is recalculated by the Worker from validated token
-  metadata and stored with price-card, method, registry-version, registry-hash,
-  coverage, and unpriced-reason provenance; and
-- Codex subscription Fast remains separate and never selects API Priority.
-  Subscription usage uses a labeled Standard API counterfactual, while an exact
-  Standard, Batch, Flex, or Priority tier is honored only for an API-billed
-  surface.
-
-`GET /api/v1/me/stats` returns `participant-stats-v0.2`. Its
-`apiPriceEquivalentUsd` is server-repriced. The private analysis machinery can
-build bounded one-, two-, and three-hour UTC windows only after account
-continuity, monotonic fresh quota observations, and complete server pricing are
-available. The current transport intentionally omits account scope, so
-`rollingQuotaMovement` fails closed with
-`reason: account_continuity_not_transmitted` rather than publishing a
-participant-wide conversion. Client tool-class counts are never priced as
-provider tool calls because the transport does not contain an exact
-provider-billable tool-unit field.
-
-When a weekly community revision is published, the same authenticated response
-also includes `participant-community-comparison-v0.1`. It recomputes only that
-participant's accepted, eligible records inside the snapshot's fixed period and
-cutoff, applies the same per-cell clipping caps, and pairs those private values
-only with metrics already released in the immutable public payload. Suppressed
-community metrics do not expose a participant value. A withdrawn, suppressed,
-malformed, or unavailable revision returns a fixed not-testable state. The
-projection contains no cohort count, eligibility identifier, account track,
-average, percentile, threshold distance, or share calculation.
-
-In `invite_only` mode, only participants admitted with distinct one-time
-invitation grants count toward community snapshots. Local-open participants
-cannot unlock a public cell. Each snapshot covers one non-overlapping UTC week,
-uses a fixed 48-hour ingestion cutoff, and requires at least twenty independent
-eligible participants in every released provider/model cell. Metrics are
-clipped per participant before summation, rounded down, and independently
-suppressed when they lack support. No exact cohort count, exact metric support,
-model fingerprint, or client-declared cost is released. Public reads return
-only sealed stored bytes; they never compute live aggregate totals.
-Deleting a contribution first marks its D1 row as `deleting`, atomically
-withdraws snapshots, and only then removes its opaque R2 object and cascades
-its D1 rows. A failed object deletion is retryable without restoring public
-snapshot access.
-Deleting a participant removes every R2 object before deleting the participant
-and all dependent D1 rows, including its private eligibility relation. Either
-deletion first withdraws all sealed snapshots and cancels active builders.
+Historical migrations and legacy D1 columns are deliberately retained after
+route retirement. Any future schema removal must first pass the owner-run,
+read-only checks in the
+[hosted API retirement data-gate runbook](../../docs/runbooks/2026-08-27-hosted-api-retirement-data-gates.md)
+and use a separately authorized forward migration. Source tests do not establish
+the live row counts or deployed Worker revision.
 
 ## Production gate
 
