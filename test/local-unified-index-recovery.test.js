@@ -144,6 +144,30 @@ async function prepareFixture(fixture, extra = {}) {
   });
 }
 
+function replaceApplicationId(indexFile, applicationId = 0x554d4149) {
+  const database = new DatabaseSync(indexFile);
+  try {
+    database.exec(`PRAGMA application_id=${applicationId}`);
+    assert.equal(
+      Number(database.prepare("PRAGMA application_id").get()?.application_id),
+      applicationId,
+    );
+    assert.equal(
+      database.prepare(
+        "SELECT value FROM meta WHERE key = 'schema_version'",
+      ).get()?.value,
+      "local-unified-index-v2",
+    );
+    assert.equal(
+      Number(database.prepare("SELECT COUNT(*) AS count FROM usage_event")
+        .get().count),
+      1,
+    );
+  } finally {
+    database.close();
+  }
+}
+
 test("copy-first recovery preserves the source until an explicitly confirmed apply", async () => {
   const root = await mkdtemp(join(tmpdir(), "unified-index-recovery-"));
   const sessions = join(root, "sessions", "2026", "07", "25");
@@ -344,6 +368,73 @@ test("preparation refuses a source that changes during the online backup", async
     );
   } finally {
     await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("recovery rejects spoofed TiboTattle schemas with another SQLite application id", async (t) => {
+  await t.test("prepare creates no backup or recovery directory", async () => {
+    const fixture = await recoveryFixture(
+      "unified-index-recovery-foreign-prepare-",
+    );
+    try {
+      replaceApplicationId(fixture.indexFile);
+      const sourceBefore = await readFile(fixture.indexFile);
+
+      await assert.rejects(
+        prepareFixture(fixture),
+        (error) => error?.code
+          === "local_unified_index_recovery_application_id_invalid",
+      );
+
+      assert.deepEqual(await readFile(fixture.indexFile), sourceBefore);
+      await assert.rejects(
+        lstat(fixture.recoveryDir),
+        (error) => error?.code === "ENOENT",
+      );
+    } finally {
+      await rm(fixture.root, { recursive: true });
+    }
+  });
+
+  for (const target of ["source", "candidate"]) {
+    await t.test(`apply preserves both files and refuses the ${target}`, async () => {
+      const fixture = await recoveryFixture(
+        `unified-index-recovery-foreign-apply-${target}-`,
+      );
+      try {
+        await prepareFixture(fixture);
+        replaceApplicationId(target === "source"
+          ? fixture.indexFile
+          : fixture.candidateFile);
+        const sourceBefore = await readFile(fixture.indexFile);
+        const candidateBefore = await readFile(fixture.candidateFile);
+
+        await assert.rejects(
+          applyLocalUnifiedIndexRecovery({
+            indexFile: fixture.indexFile,
+            candidateFile: fixture.candidateFile,
+            receiptFile: fixture.receiptFile,
+            confirmIndex: fixture.indexFile,
+            confirmAppStopped: true,
+          }),
+          (error) => error?.code
+            === "local_unified_index_recovery_application_id_invalid",
+        );
+
+        assert.deepEqual(await readFile(fixture.indexFile), sourceBefore);
+        assert.deepEqual(await readFile(fixture.candidateFile), candidateBefore);
+        await assert.rejects(
+          lstat(fixture.prePublishRollbackFile),
+          (error) => error?.code === "ENOENT",
+        );
+        await assert.rejects(
+          lstat(defaultLocalUnifiedIndexRecoveryLockPath(fixture.indexFile)),
+          (error) => error?.code === "ENOENT",
+        );
+      } finally {
+        await rm(fixture.root, { recursive: true });
+      }
+    });
   }
 });
 

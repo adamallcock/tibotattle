@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
   CLIENT_MANIFEST_FILE,
+  CLIENT_MACOS_FILES,
   CLIENT_REPOSITORY_NAME,
   CLIENT_SOURCE_FILES,
   createClientExport,
@@ -15,6 +16,17 @@ import {
   validateAllowlist,
   validateExportDirectory,
 } from "../scripts/export-tibotattle.mjs";
+
+test("client export includes the native menu-bar source closure", () => {
+  for (const path of [
+    "apps/macos/Sources/MenuBarPaceOutlook.swift",
+    "apps/macos/Sources/MenuBarPopover.swift",
+    "apps/macos/Sources/MenuBarPopupModel.swift",
+    "apps/macos/Sources/NativeBrandPalette.swift",
+  ]) {
+    assert.equal(CLIENT_MACOS_FILES.includes(path), true, path);
+  }
+});
 
 test("client exporter creates a history-free, verified allow-list artifact", async () => {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-export-test-"));

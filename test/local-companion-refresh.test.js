@@ -13,6 +13,8 @@ import {
   createDeferredAccountingRebuildRecorder,
   createLocalCollectorRefreshRunner,
   createTerminalRefreshFailureRecorder,
+  LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS,
+  LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS,
   LocalCompanionRefreshController,
 } from "../src/local-companion-refresh.js";
 import {
@@ -66,6 +68,52 @@ const PAUSED_INDEX = Object.freeze({
     startAt: "2026-07-16T12:00:00.000Z",
     endAt: null,
   },
+});
+
+test("refresh controller admits the bounded fresh-index ceiling", () => {
+  const dependencies = {
+    runner: async () => ({}),
+    dataStore: { async reload() {} },
+  };
+  assert.equal(
+    LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS,
+    2 * 60 * 60_000,
+  );
+  assert.doesNotThrow(() => new LocalCompanionRefreshController({
+    ...dependencies,
+    timeoutMs: LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS,
+  }));
+  assert.throws(
+    () => new LocalCompanionRefreshController({
+      ...dependencies,
+      timeoutMs: LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS + 1,
+    }),
+    /7,200,000/u,
+  );
+});
+
+test("refresh controller resolves a fresh-state timeout for each run", async () => {
+  let selections = 0;
+  const controller = new LocalCompanionRefreshController({
+    runner: async () => ({}),
+    dataStore: { async reload() {} },
+    timeoutMs: 5 * 60_000,
+    timeoutMsForRun() {
+      selections += 1;
+      return selections === 1
+        ? LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS
+        : 5 * 60_000;
+    },
+  });
+  assert.equal(controller.start(), true);
+  while (controller.isRunning()) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(controller.start(), true);
+  while (controller.isRunning()) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(selections, 2);
 });
 
 const REUSABLE_ACCOUNTING_CACHE = Object.freeze({
@@ -2211,6 +2259,133 @@ test("local refresh publishes a quick-result boundary before deep accounting", a
   assert.equal(result.accounting.refreshStatus, "rebuilt");
 });
 
+test("unified-index progress replaces quick result with bounded deep counts", async () => {
+  const progress = [];
+  const generation = {
+    id: 19,
+    fingerprint: "deep-progress-generation",
+    status: "complete",
+    discoveryComplete: true,
+    diagnosticsComplete: true,
+    usageProvenanceComplete: true,
+    sourceOrderComplete: true,
+    quotaProvenanceComplete: true,
+    toolProvenanceComplete: true,
+  };
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    codexHome: "/private/codex-home",
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 1,
+      filesDiscovered: 9,
+      refresh: {
+        attempted: true,
+        recordWritten: true,
+        errorCode: null,
+      },
+      indexing: COMPLETE_INDEX,
+    }),
+    refreshUnifiedIndex: async ({ onProgress }) => {
+      await onProgress({
+        sources: 12,
+        sourcesScanned: 4,
+        usageEvents: 27,
+        sourceBytes: 8_000,
+        privatePath: "/private/must-not-escape",
+      });
+      return { status: "ingested", generation };
+    },
+  });
+
+  await runner({ onProgress: (value) => progress.push(value) });
+
+  assert.deepEqual(progress, [
+    { ...COMPLETE_INDEX, phase: "quick_result" },
+    {
+      kind: "unified_index",
+      status: "scanning",
+      phase: "rollout_index",
+      filesDiscovered: 0,
+      filesSelected: 0,
+      filesProcessed: 0,
+      recordsWritten: 0,
+    },
+    {
+      kind: "unified_index",
+      status: "scanning",
+      phase: "rollout_index",
+      filesDiscovered: 12,
+      filesSelected: 12,
+      filesProcessed: 4,
+      recordsWritten: 27,
+    },
+  ]);
+  assert.equal(JSON.stringify(progress).includes("must-not-escape"), false);
+  assert.equal(JSON.stringify(progress).includes("sourceBytes"), false);
+});
+
+test("unified-index progress rejects malformed and broadened payloads", async () => {
+  const progress = [];
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    codexHome: "/private/codex-home",
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 1,
+      filesDiscovered: 9,
+      refresh: { attempted: true, recordWritten: true, errorCode: null },
+      indexing: COMPLETE_INDEX,
+    }),
+    refreshUnifiedIndex: async ({ onProgress }) => {
+      const valid = {
+        kind: "unified_index",
+        status: "scanning",
+        phase: "rollout_index",
+        filesDiscovered: 12,
+        filesSelected: 10,
+        filesProcessed: 4,
+        recordsWritten: 27,
+      };
+      await onProgress({ ...valid, privatePath: "/must/not/escape" });
+      await onProgress({ ...valid, recordsWritten: -1 });
+      await onProgress({ ...valid, filesSelected: 13 });
+      await onProgress({ ...valid, filesProcessed: 11 });
+      await onProgress(valid);
+      return {
+        status: "ingested",
+        generation: {
+          id: 20,
+          fingerprint: "bounded-worker-progress",
+          status: "complete",
+          discoveryComplete: true,
+          diagnosticsComplete: true,
+          usageProvenanceComplete: true,
+          sourceOrderComplete: true,
+          quotaProvenanceComplete: true,
+          toolProvenanceComplete: true,
+        },
+      };
+    },
+  });
+
+  await runner({ onProgress: (value) => progress.push(value) });
+  assert.deepEqual(progress.slice(-1), [{
+    kind: "unified_index",
+    status: "scanning",
+    phase: "rollout_index",
+    filesDiscovered: 12,
+    filesSelected: 10,
+    filesProcessed: 4,
+    recordsWritten: 27,
+  }]);
+  assert.equal(progress.length, 3);
+});
+
 test("partial recent coverage publishes a quick result before deep accounting", async () => {
   const progress = [];
   let rebuilds = 0;
@@ -2778,7 +2953,7 @@ test("refresh controller keeps a bounded-pause headline observable after the pas
   assert.equal(reloads, 2);
 });
 
-test("refresh controller cancels bounded work and preserves safe progress", async () => {
+test("refresh controller cancels bounded work without reloading deep state", async () => {
   let observedAbort = false;
   let reloads = 0;
   const controller = new LocalCompanionRefreshController({
@@ -2827,12 +3002,52 @@ test("refresh controller cancels bounded work and preserves safe progress", asyn
   assert.equal(status.errorCode, "refresh_cancelled");
   assert.equal(status.progress.status, "bounded_pause");
   assert.equal(status.progress.recordsWritten, 2);
-  assert.equal(reloads, 1);
+  assert.equal(reloads, 0);
   assert.equal(controller.cancel(), false);
+});
+
+test("cancel during terminal projection aborts reload and cannot publish success", async () => {
+  let projectionStarted;
+  const enteredProjection = new Promise((resolve) => {
+    projectionStarted = resolve;
+  });
+  let observedSignal = null;
+  let reloadSettled = false;
+  const controller = new LocalCompanionRefreshController({
+    runner: async () => ({ indexing: COMPLETE_INDEX }),
+    dataStore: {
+      reload: ({ purpose, signal }) => new Promise((resolve, reject) => {
+        assert.equal(purpose, "full");
+        observedSignal = signal;
+        projectionStarted();
+        signal.addEventListener("abort", () => {
+          reloadSettled = true;
+          const error = new Error("local_companion_snapshot_reload_aborted");
+          error.code = "local_companion_snapshot_reload_aborted";
+          reject(error);
+        }, { once: true });
+      }),
+    },
+  });
+
+  assert.equal(controller.start(), true);
+  await enteredProjection;
+  assert.equal(observedSignal?.aborted, false);
+  assert.equal(controller.cancel(), true);
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (!controller.isRunning()) break;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  assert.equal(reloadSettled, true);
+  assert.equal(observedSignal.aborted, true);
+  assert.equal(controller.getStatus().status, "cancelled");
+  assert.equal(controller.getStatus().errorCode, "refresh_cancelled");
 });
 
 test("refresh controller publishes bounded progress and reloads after success", async () => {
   let reloads = 0;
+  const reloadOptions = [];
   let release;
   const gate = new Promise((resolve) => {
     release = resolve;
@@ -2896,8 +3111,9 @@ test("refresh controller publishes bounded progress and reloads after success", 
       };
     },
     dataStore: {
-      async reload() {
+      async reload(options) {
         reloads += 1;
+        reloadOptions.push(options);
       },
     },
     clock: () => Date.parse("2026-07-23T12:00:00.000Z"),
@@ -2935,6 +3151,9 @@ test("refresh controller publishes bounded progress and reloads after success", 
     118_712_104_546,
   );
   assert.equal(reloads, 1);
+  assert.deepEqual(reloadOptions[0].unifiedProjectionReuse, {
+    generationFingerprint: `generation-v2-${"a".repeat(64)}`,
+  });
 });
 
 test("refresh controller exposes only allowlisted unified-index failure codes", async () => {
@@ -3074,7 +3293,7 @@ test("refresh controller classifies transition-derivation limits as fixed safety
   assert.equal(JSON.stringify(status).includes("private transition detail"), false);
 });
 
-test("refresh timeout aborts collector work and retains only safe progress", async () => {
+test("refresh timeout aborts collector work without reloading deep state", async () => {
   let observedAbort = false;
   let reloads = 0;
   const controller = new LocalCompanionRefreshController({
@@ -3118,7 +3337,7 @@ test("refresh timeout aborts collector work and retains only safe progress", asy
   assert.equal(status.progress.status, "bounded_pause");
   assert.equal(status.progress.recordsWritten, 2);
   assert.equal(status.result.indexing.status, "bounded_pause");
-  assert.equal(reloads, 1);
+  assert.equal(reloads, 0);
   assert.equal(JSON.stringify(status).includes("/private/"), false);
 });
 

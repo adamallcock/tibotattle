@@ -113,6 +113,7 @@ final class ContributionDeviceKeychainBroker {
         "--native-dashboard-sidebar-recovery-smoke-test",
         "--native-refresh-settings-contract-smoke-test",
         "--native-settings-layout-smoke-test",
+        "--native-weekly-pace-projection-contract-smoke-test",
         "--quota-notification-contract-smoke-test",
         "--smoke-test",
         "--updater-contract-smoke-test",

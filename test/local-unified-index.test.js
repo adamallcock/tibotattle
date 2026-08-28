@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   appendFile,
   chmod,
+  copyFile,
   lstat,
   mkdir,
   mkdtemp,
@@ -13,9 +14,11 @@ import {
   utimes,
   writeFile,
 } from "node:fs/promises";
+import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { Worker } from "node:worker_threads";
 
 import { readCacheImpacts } from "../src/cache-switch-impact.js";
 import { readLocalUnifiedCompanionProjection } from "../src/local-unified-companion-source.js";
@@ -23,9 +26,17 @@ import { createLocalUnifiedAccountingSource } from "../src/local-unified-account
 
 import {
   balanceComponents,
+  createLocalUnifiedIndexWorkerBatchControl,
+  createLocalUnifiedIndexProgressPump,
+  defaultRebuildWorkerCount,
+  LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS,
+  LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW,
   lineageComponents,
+  localUnifiedIndexStageFile,
+  localUnifiedIndexWorkerBatchControlSnapshot,
   modelDeclaration,
   rebuildLocalUnifiedIndex,
+  releaseLocalUnifiedIndexWorkerBatch,
 } from "../src/local-unified-index-build.js";
 import {
   extractRolloutUsage,
@@ -40,6 +51,7 @@ import {
   createLocalUnifiedIndexSecondaryIndexes,
   createUnifiedIndexWriter,
   beginUnifiedIndexGeneration,
+  defaultLocalUnifiedIndexRecoveryLockPath,
   inspectLocalUnifiedIndex,
   LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION,
   LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION,
@@ -49,6 +61,7 @@ import {
   openLocalUnifiedIndex,
   OUTCOMES,
   outcomeOrdinal,
+  publishStagedUnifiedIndex,
   readUnifiedIndexAggregate,
   readUnifiedIndexGenerationDescriptor,
   REASONING_EFFORTS,
@@ -58,6 +71,102 @@ import {
 import { readLocalUnifiedWindowBreakdown } from "../src/local-unified-window-breakdown.js";
 
 const CONTRACT = "usage-event-v0.2";
+
+test("worker batches bound synchronous companion write turns", () => {
+  assert.equal(LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS, 500);
+  assert.equal(LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW, 2);
+});
+
+test("progress pump retains one latest snapshot across many small sources", async () => {
+  let releaseFirst;
+  let markStarted;
+  const started = new Promise((resolve) => {
+    markStarted = resolve;
+  });
+  const firstBlocked = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  const delivered = [];
+  const pump = createLocalUnifiedIndexProgressPump(async (progress) => {
+    delivered.push(progress.sourcesScanned);
+    if (progress.sourcesScanned === 1) {
+      markStarted();
+      await firstBlocked;
+    }
+  });
+
+  pump.offer({ sourcesScanned: 1 });
+  await started;
+  for (let source = 2; source <= 5_000; source += 1) {
+    pump.offer({ sourcesScanned: source });
+  }
+  assert.deepEqual(delivered, [1]);
+  releaseFirst();
+  await pump.drain();
+  assert.deepEqual(delivered, [1, 5_000]);
+});
+
+test("progress pump drains its final snapshot before propagating callback failure", async () => {
+  const expected = new Error("synthetic progress failure");
+  const delivered = [];
+  const pump = createLocalUnifiedIndexProgressPump((progress) => {
+    delivered.push(progress.sourcesScanned);
+    if (progress.sourcesScanned === 1) throw expected;
+  });
+  pump.offer({ sourcesScanned: 1 });
+  pump.offer({ sourcesScanned: 2 });
+  await assert.rejects(pump.drain(), (error) => error === expected);
+  assert.deepEqual(delivered, [1, 2]);
+});
+
+test("direct rebuild bounds callbacks across many small sources", async () => {
+  const sourceCount = 160;
+  const files = Object.fromEntries(Array.from({ length: sourceCount }, (_, index) => {
+    const sessionId = `00000000-0000-4000-8000-${(index + 1)
+      .toString(16).padStart(12, "0")}`;
+    return [
+      canonicalRolloutName("2026-07-25T00-00-00", sessionId),
+      [
+        sessionMeta(sessionId),
+        turnContext("2026-07-25T00:00:00.500Z", "gpt-5.6-sol"),
+        tokenCount("2026-07-25T00:00:01.000Z", usage(index + 1), usage(1)),
+      ],
+    ];
+  }));
+  const { root } = await corpus(files);
+  const progress = [];
+  try {
+    const result = await build(root, {
+      workerCount: 1,
+      onProgress: (value) => progress.push(value.sourcesScanned),
+    });
+    assert.equal(result.sourcesScanned, sourceCount);
+    assert.equal(progress[0], 0);
+    assert.equal(progress.at(-1), sourceCount);
+    assert.ok(
+      progress.length < sourceCount / 4,
+      `${progress.length} callbacks were not bounded relative to ${sourceCount} sources`,
+    );
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("automatic rebuild workers reserve the companion and outer worker CPUs", () => {
+  for (const [parallelism, expected] of [
+    [1, 1],
+    [3, 1],
+    [4, 1],
+    [5, 2],
+    [8, 5],
+    [9, 6],
+    [64, 6],
+  ]) {
+    assert.equal(defaultRebuildWorkerCount(parallelism), expected, `${parallelism} CPUs`);
+  }
+  assert.throws(() => defaultRebuildWorkerCount(0), /positive safe integer/u);
+  assert.throws(() => defaultRebuildWorkerCount(1.5), /positive safe integer/u);
+});
 const THREAD_ONE = "11111111-1111-4111-8111-111111111111";
 const THREAD_TWO = "22222222-2222-4222-8222-222222222222";
 const ROLLOUT_TWO = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -228,6 +337,332 @@ async function build(root, extra = {}) {
     ...extra,
   });
 }
+
+function promiseWithin(promise, timeoutMs, message) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+async function abortWhenStageGenerationFinalizes(
+  stageFile,
+  controller,
+  { timeoutMs = 2_000 } = {},
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    let database = null;
+    try {
+      database = openLocalUnifiedIndex(stageFile, { readOnly: true });
+      const status = database.prepare(`
+        SELECT status FROM index_generation
+        ORDER BY id DESC LIMIT 1`).get()?.status ?? null;
+      if (["complete", "partial"].includes(status)) {
+        controller.abort();
+        return status;
+      }
+    } catch {
+      // The stage is absent, incomplete, or momentarily locked. It becomes a
+      // readable terminal generation only after the writer's final commit.
+    } finally {
+      try {
+        database?.close();
+      } catch {
+        // A failed read-only probe does not own the writer or publication.
+      }
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error("stage generation did not finalize before publication");
+}
+
+async function waitForBatchControl(control, predicate, message) {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const snapshot = localUnifiedIndexWorkerBatchControlSnapshot(control);
+    if (predicate(snapshot)) return snapshot;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(message);
+}
+
+function parserWorkerData(source, batchControl) {
+  return {
+    batchEvents: LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS,
+    batchControl: batchControl.buffer,
+    batchWindow: LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW,
+    components: [[{
+      path: source.path,
+      size: source.size,
+      sessionId: THREAD_ONE,
+      parentId: null,
+      isFork: false,
+      isInlineFork: false,
+      historyMode: "legacy",
+      historyBase: null,
+      startOrdinal: 0,
+      rolloutId: null,
+      rolloutKey: source.path,
+      dev: source.dev,
+      ino: source.ino,
+      birthtimeMs: source.birthtimeMs,
+      mtimeMs: source.mtimeMs,
+      ctimeMs: source.ctimeMs,
+    }]],
+  };
+}
+
+test("parser worker blocks at its acknowledgement window and resumes without deadlock", async () => {
+  const startMs = Date.parse("2026-07-25T00:00:01.000Z");
+  const { root, sessions } = await corpus({
+    [canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE)]: [
+      sessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T00:00:00.500Z", "gpt-5.6-sol"),
+      ...Array.from({ length: 1_600 }, (_, index) => tokenCount(
+        new Date(startMs + index).toISOString(),
+        usage(index + 1),
+        usage(1),
+      )),
+    ],
+  });
+  const path = join(
+    sessions,
+    canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE),
+  );
+  const source = { path, ...await stat(path) };
+  const control = createLocalUnifiedIndexWorkerBatchControl();
+  const batches = [];
+  let acknowledge = false;
+  const worker = new Worker(
+    new URL("../src/local-unified-index-worker.js", import.meta.url),
+    { workerData: parserWorkerData(source, control), execArgv: [] },
+  );
+  worker.on("message", (message) => {
+    if (message.type !== "batch") return;
+    batches.push(message);
+    if (acknowledge) releaseLocalUnifiedIndexWorkerBatch(control);
+  });
+  const exited = new Promise((resolve, reject) => {
+    worker.once("error", reject);
+    worker.once("exit", resolve);
+  });
+  try {
+    const blocked = await waitForBatchControl(
+      control,
+      (snapshot) => snapshot.waitCount > 0
+        && snapshot.outstanding === LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW
+        && batches.length === LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW,
+      "parser did not block at its acknowledgement window",
+    );
+    assert.deepEqual(blocked, {
+      credits: 0,
+      outstanding: 2,
+      peakOutstanding: 2,
+      waitCount: blocked.waitCount,
+      window: 2,
+    });
+
+    acknowledge = true;
+    for (let index = 0; index < blocked.outstanding; index += 1) {
+      releaseLocalUnifiedIndexWorkerBatch(control);
+    }
+    assert.equal(
+      await promiseWithin(exited, 2_000, "acknowledged parser worker did not exit"),
+      0,
+    );
+    assert.equal(batches.reduce((sum, batch) => sum + batch.events.length, 0), 1_600);
+    assert.equal(batches.at(-1).final, true);
+    const finished = localUnifiedIndexWorkerBatchControlSnapshot(control);
+    assert.equal(finished.outstanding, 0);
+    assert.equal(finished.credits, finished.window);
+    assert.equal(finished.peakOutstanding, finished.window);
+  } finally {
+    if (worker.threadId !== -1) await worker.terminate();
+    await rm(root, { recursive: true });
+  }
+});
+
+test("blocked parser termination and pre-batch failure do not await credits", async () => {
+  const startMs = Date.parse("2026-07-25T00:00:01.000Z");
+  const { root, sessions } = await corpus({
+    [canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE)]: [
+      sessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T00:00:00.500Z", "gpt-5.6-sol"),
+      ...Array.from({ length: 1_600 }, (_, index) => tokenCount(
+        new Date(startMs + index).toISOString(),
+        usage(index + 1),
+        usage(1),
+      )),
+    ],
+  });
+  const path = join(
+    sessions,
+    canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE),
+  );
+  const source = { path, ...await stat(path) };
+  const blockedControl = createLocalUnifiedIndexWorkerBatchControl();
+  const blockedWorker = new Worker(
+    new URL("../src/local-unified-index-worker.js", import.meta.url),
+    { workerData: parserWorkerData(source, blockedControl), execArgv: [] },
+  );
+  let failedWorker = null;
+  try {
+    await waitForBatchControl(
+      blockedControl,
+      (snapshot) => snapshot.waitCount > 0
+        && snapshot.outstanding === LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW,
+      "parser did not reach the blocked state before termination",
+    );
+    const terminationCode = await promiseWithin(
+      blockedWorker.terminate(),
+      2_000,
+      "blocked parser worker did not terminate",
+    );
+    assert.notEqual(terminationCode, 0);
+
+    const failedControl = createLocalUnifiedIndexWorkerBatchControl({
+      initialCredits: 0,
+    });
+    failedWorker = new Worker(
+      new URL("../src/local-unified-index-worker.js", import.meta.url),
+      {
+        workerData: {
+          batchEvents: LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS,
+          batchControl: failedControl.buffer,
+          batchWindow: LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW,
+          components: null,
+        },
+        execArgv: [],
+      },
+    );
+    let failureMessage = null;
+    failedWorker.on("message", (message) => {
+      failureMessage = message;
+    });
+    const failedExit = new Promise((resolve, reject) => {
+      failedWorker.once("error", reject);
+      failedWorker.once("exit", resolve);
+    });
+    assert.equal(
+      await promiseWithin(failedExit, 2_000, "invalid parser worker did not exit"),
+      1,
+    );
+    assert.equal(failureMessage?.type, "failed");
+    assert.deepEqual(localUnifiedIndexWorkerBatchControlSnapshot(failedControl), {
+      credits: 0,
+      outstanding: 0,
+      peakOutstanding: 0,
+      waitCount: 0,
+      window: 2,
+    });
+  } finally {
+    if (blockedWorker.threadId !== -1) await blockedWorker.terminate();
+    if (failedWorker !== null && failedWorker.threadId !== -1) {
+      await failedWorker.terminate();
+    }
+    await rm(root, { recursive: true });
+  }
+});
+
+test("direct rebuild reports record progress before a large source completes", async () => {
+  const startMs = Date.parse("2026-07-25T00:00:01.000Z");
+  const lines = [
+    sessionMeta(THREAD_ONE),
+    turnContext("2026-07-25T00:00:00.500Z", "gpt-5.6-sol"),
+    ...Array.from({ length: 600 }, (_, index) => tokenCount(
+      new Date(startMs + index).toISOString(),
+      usage(index + 1),
+      usage(1),
+    )),
+  ];
+  const { root } = await corpus({
+    [canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE)]: lines,
+  });
+  const progress = [];
+  try {
+    const result = await build(root, {
+      workerCount: 1,
+      onProgress(value) {
+        progress.push({
+          sources: value.sources,
+          sourcesScanned: value.sourcesScanned,
+          usageEvents: value.usageEvents,
+        });
+      },
+    });
+    assert.equal(result.usageEvents, 600);
+    assert.deepEqual(progress[0], {
+      sources: 1,
+      sourcesScanned: 0,
+      usageEvents: 0,
+    });
+    assert.ok(
+      progress.some((value) => (
+        value.sourcesScanned === 0 && value.usageEvents > 0
+      )),
+      "record count must prove direct work inside a source before it completes",
+    );
+    assert.deepEqual(progress.at(-1), {
+      sources: 1,
+      sourcesScanned: 1,
+      usageEvents: 600,
+    });
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("parallel rebuild reports record progress before a large source completes", async () => {
+  const startMs = Date.parse("2026-07-25T00:00:01.000Z");
+  const lines = [
+    sessionMeta(THREAD_ONE),
+    turnContext("2026-07-25T00:00:00.500Z", "gpt-5.6-sol"),
+    ...Array.from({ length: 600 }, (_, index) => tokenCount(
+      new Date(startMs + index).toISOString(),
+      usage(index + 1),
+      usage(1),
+    )),
+  ];
+  const { root } = await corpus({
+    [canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE)]: lines,
+  });
+  const progress = [];
+  try {
+    const result = await build(root, {
+      workerCount: 2,
+      onProgress(value) {
+        progress.push({
+          sources: value.sources,
+          sourcesScanned: value.sourcesScanned,
+          usageEvents: value.usageEvents,
+        });
+      },
+    });
+    assert.equal(result.usageEvents, 600);
+    assert.deepEqual(progress[0], {
+      sources: 1,
+      sourcesScanned: 0,
+      usageEvents: 0,
+    });
+    assert.ok(
+      progress.some((value) => (
+        value.sourcesScanned === 0 && value.usageEvents > 0
+      )),
+      "record count must prove work inside a source before it completes",
+    );
+    assert.deepEqual(progress.at(-1), {
+      sources: 1,
+      sourcesScanned: 1,
+      usageEvents: 600,
+    });
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
 
 const SECONDARY_INDEX_NAMES = [
   "usage_event_observed",
@@ -2743,6 +3178,200 @@ test("a rotated pre-tool source withholds tools without blocking accounting", as
       "tool_provenance_incomplete",
     );
     assert.equal(unchanged.generation.toolProvenanceComplete, false);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("an abort after rebuild close cannot cross the pre-rename publication boundary", async () => {
+  const { root, sessions } = await corpus({
+    "rollout-2026-07-25T00-00-00-late-rebuild-abort.jsonl": [
+      sessionMeta("session-late-rebuild-abort"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const sourceFile = join(
+    sessions,
+    "rollout-2026-07-25T00-00-00-late-rebuild-abort.jsonl",
+  );
+  const attemptToken = "9".repeat(32);
+  const stageFile = localUnifiedIndexStageFile(
+    indexFile,
+    "building",
+    attemptToken,
+  );
+  try {
+    const built = await build(root);
+    const before = await readFile(indexFile);
+    await appendFile(
+      sourceFile,
+      `${tokenCountTotalOnly("2026-07-25T00:00:02.000Z", usage(150, 15))}\n`,
+    );
+    const controller = new AbortController();
+    let abortQueued = false;
+    let confirmAbort;
+    const abortedAtPublication = new Promise((resolve) => {
+      confirmAbort = resolve;
+    });
+    const pending = rebuildLocalUnifiedIndex({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      attemptToken,
+      signal: controller.signal,
+      onProgress(progress) {
+        if (abortQueued || progress.sourcesScanned !== 1) return;
+        abortQueued = true;
+        setImmediate(() => {
+          controller.abort();
+          confirmAbort();
+        });
+      },
+    });
+    await Promise.all([
+      assert.rejects(
+        pending,
+        (error) => error?.code === "local_unified_index_aborted",
+      ),
+      abortedAtPublication,
+    ]);
+    assert.deepEqual(await readFile(indexFile), before);
+    await assert.rejects(() => stat(stageFile), { code: "ENOENT" });
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.equal(
+        Number(database.prepare(
+          "SELECT value FROM meta WHERE key = 'current_generation_id'",
+        ).get().value),
+        built.generation.id,
+      );
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a recovery lock acquired during target validation blocks staged publication", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-recovery-publication-race.jsonl": [
+      sessionMeta("session-recovery-publication-race"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const stageFile = join(root, "candidate.sqlite");
+  const recoveryLockFile = defaultLocalUnifiedIndexRecoveryLockPath(indexFile);
+  try {
+    await build(root);
+    const publishedBefore = await readFile(indexFile);
+    await copyFile(indexFile, stageFile);
+
+    const controller = new AbortController();
+    let abortedReads = 0;
+    let resolveLockAcquired;
+    const lockAcquired = new Promise((resolve) => {
+      resolveLockAcquired = resolve;
+    });
+    Object.defineProperty(controller.signal, "aborted", {
+      configurable: true,
+      get() {
+        abortedReads += 1;
+        // The third read is the pre-validation cancellation check. Queueing a
+        // microtask here lets assertSafeLocalUnifiedIndexTarget start and yield
+        // on its asynchronous lstat before the recovery owner acquires its
+        // owner-only lock. This deterministically exercises the former gap
+        // between the pre-validation lock check and the final rename.
+        if (abortedReads === 3) {
+          queueMicrotask(() => {
+            writeFileSync(recoveryLockFile, "recovery owns publication\n", {
+              flag: "wx",
+              mode: 0o600,
+            });
+            resolveLockAcquired();
+          });
+        }
+        return false;
+      },
+    });
+
+    await assert.rejects(
+      publishStagedUnifiedIndex(stageFile, indexFile, {
+        signal: controller.signal,
+      }),
+      (error) => error?.code === "local_unified_index_recovery_in_progress",
+    );
+    await lockAcquired;
+    assert.ok(abortedReads >= 4);
+    assert.deepEqual(await readFile(indexFile), publishedBefore);
+    assert.deepEqual(await readFile(stageFile), publishedBefore);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("an abort during incremental close cannot publish its finalized stage", async () => {
+  const { root, sessions } = await corpus({
+    "rollout-2026-07-25T00-00-00-late-incremental-abort.jsonl": [
+      sessionMeta("session-late-incremental-abort"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const sourceFile = join(
+    sessions,
+    "rollout-2026-07-25T00-00-00-late-incremental-abort.jsonl",
+  );
+  const attemptToken = "8".repeat(32);
+  const stageFile = localUnifiedIndexStageFile(
+    indexFile,
+    "incremental",
+    attemptToken,
+  );
+  try {
+    const built = await build(root);
+    const before = await readFile(indexFile);
+    await appendFile(
+      sourceFile,
+      `${tokenCountTotalOnly("2026-07-25T00:00:02.000Z", usage(150, 15))}\n`,
+    );
+    const controller = new AbortController();
+    const monitor = abortWhenStageGenerationFinalizes(stageFile, controller);
+    const pending = ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      attemptToken,
+      signal: controller.signal,
+    });
+    const [, stagedStatus] = await Promise.all([
+      assert.rejects(
+        pending,
+        (error) => error?.code === "local_unified_index_aborted",
+      ),
+      monitor,
+    ]);
+    assert.equal(stagedStatus, "complete");
+    assert.deepEqual(await readFile(indexFile), before);
+    await assert.rejects(() => stat(stageFile), { code: "ENOENT" });
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.equal(
+        Number(database.prepare(
+          "SELECT value FROM meta WHERE key = 'current_generation_id'",
+        ).get().value),
+        built.generation.id,
+      );
+    } finally {
+      database.close();
+    }
   } finally {
     await rm(root, { recursive: true });
   }

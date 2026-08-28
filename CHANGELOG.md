@@ -38,9 +38,13 @@ remains accountable for release wording, validation, signing, and publication.
 
 This candidate section combines direct post-v0.1.16 work with merged pull
 requests through [PR #78](https://github.com/adamallcock/tibotattle/pull/78), audited on
-2026-08-27. PRs #73, #74, and #75 are not part of this native macOS candidate.
-The candidate does not include the Electron application or unfinished Claude
-Code usage-monitoring integration work. The
+2026-08-27. PRs #73 and #74 are not part of this native macOS candidate. PR #75
+is not merged wholesale; a native subset of its menu-bar and weekly-pace work
+is ported without its Electron or multi-root changes. The candidate does not
+include the Electron application or unfinished Claude Code usage-monitoring
+integration work. Claude-related carryover is limited to dormant local/export
+compatibility scaffolding already on `main` and removal of the inactive quota
+route; 0.1.17 does not collect, display, or claim Claude Code usage. The
 [merged-main comparison](https://github.com/adamallcock/tibotattle/compare/v0.1.16...main)
 is the public branch-history view; PR links identify reviewed merges, while
 unlinked items are direct commits. Nothing in this section is a
@@ -75,6 +79,10 @@ published-release claim.
 - Adds maintained architecture, privacy/data, API, CLI, schema, platform,
   operations, recovery, status, and user documentation; removes superseded
   planning and status prose from the active tree.
+- Adds a native left-click menu-bar popover with current Five-hour and seven-day
+  allowance lanes, fail-closed 7/30-day usage history, and a weekly pace outlook;
+  right-click and Control-click retain the native actions menu (native subset of
+  [PR #75](https://github.com/adamallcock/tibotattle/pull/75)).
 
 ### Changed
 
@@ -107,6 +115,10 @@ published-release claim.
   refusal and may touch SQLite journal mode before rejecting the schema.
 - Persists the last authoritative dashboard snapshot across launch, keeping
   verified retained figures visible and labelled while fresh analysis advances.
+- Moves macOS unified-index work off the loopback event loop, uses the existing
+  bounded parallel rebuild for a missing index, and forwards strict content-free
+  file progress so health, status, and cancellation remain responsive during a
+  large first pass.
 - Releases the native readiness gate after the primary dashboard render instead
   of waiting for every secondary load ([PR #60](https://github.com/adamallcock/tibotattle/pull/60)).
 - Makes Codex `thread_source` a compatibility and attribution signal without
@@ -126,6 +138,12 @@ published-release claim.
   ([PR #57](https://github.com/adamallcock/tibotattle/pull/57)).
 - Replaces misleading loading warnings when retained figures remain visible
   during a recalculation.
+- Replaces the unconditional “Headline ready” refresh claim with neutral local
+  summary/progress copy, and keeps native and browser polling attached through
+  the bounded fresh-index build window.
+- Keeps cancellation and timeout terminal handling from starting another full
+  data-store reload, preserves the last published generation, and reclaims only
+  old, exactly identified abandoned staging files on a later safe retry.
 - Prevents network-path requests from turning the canonical-host redirect into
   an external redirect.
 - Opens the Share card from its macOS toolbar control

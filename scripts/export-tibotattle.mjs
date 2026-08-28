@@ -193,6 +193,8 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/local-legacy-report-storage.js",
   "src/local-unified-accounting-source.js",
   "src/local-unified-companion-source.js",
+  "src/local-unified-companion-off-main-worker.js",
+  "src/local-unified-companion-off-main.js",
   // Reviewed 2026-08-10: pure windowed repricing over the local index for
   // the divergence panel's per-period cost mix — no content, paths, or
   // identifiers beyond what the companion already exports.
@@ -201,6 +203,8 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/local-unified-index-extract.js",
   "src/local-unified-index-history.js",
   "src/local-unified-index-ingest.js",
+  "src/local-unified-index-off-main-worker.js",
+  "src/local-unified-index-off-main.js",
   "src/local-unified-index-worker.js",
   "src/local-unified-index.js",
   "src/passive-collector.js",
@@ -287,7 +291,11 @@ export const CLIENT_MACOS_FILES = Object.freeze([
   "apps/macos/Assets/README.md",
   "apps/macos/NodeRuntime.entitlements",
   "apps/macos/README.md",
+  "apps/macos/Sources/MenuBarPaceOutlook.swift",
+  "apps/macos/Sources/MenuBarPopover.swift",
+  "apps/macos/Sources/MenuBarPopupModel.swift",
   "apps/macos/Sources/MenuBarStatus.swift",
+  "apps/macos/Sources/NativeBrandPalette.swift",
   "apps/macos/Sources/SemanticOpenTarget.swift",
   "apps/macos/UsageMonitorApp.swift",
   "apps/macos/reset-local-keychain.js",

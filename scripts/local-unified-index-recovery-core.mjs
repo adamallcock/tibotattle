@@ -28,6 +28,7 @@ import {
   assertSafeLocalUnifiedIndexParentPath,
   assertSafeLocalUnifiedIndexTarget,
   defaultLocalUnifiedIndexRecoveryLockPath,
+  LOCAL_UNIFIED_INDEX_APPLICATION_ID,
   LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION,
   LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION,
   LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
@@ -50,6 +51,7 @@ const RECOVERY_LOCK_SCHEMA_VERSION = "local-unified-index-recovery-lock-v1";
 const MAX_RECOVERY_LOCK_BYTES = 4 * 1024;
 const SQLITE_HEADER_BYTES = 100;
 const SQLITE_HEADER_MAGIC = Buffer.from("SQLite format 3\0", "utf8");
+const SQLITE_APPLICATION_ID_OFFSET = 68;
 const SQLITE_LIVE_SIDECAR_SUFFIXES = Object.freeze([
   "-wal",
   "-shm",
@@ -341,6 +343,15 @@ function assertRollbackJournalHeader(header) {
   }
   if (header[18] !== 1 || header[19] !== 1) {
     throw fixedError("local_unified_index_recovery_journal_state_invalid");
+  }
+  // SQLite stores application_id as an unsigned big-endian integer at header
+  // offset 68. Bind the non-opening prepare/apply preflight to TiboTattle's
+  // exact database identity before any recovery artifact can be created or any
+  // candidate can be published. Schema markers and table names are not an
+  // identity boundary because an unrelated SQLite file can reproduce them.
+  if (header.readUInt32BE(SQLITE_APPLICATION_ID_OFFSET)
+      !== LOCAL_UNIFIED_INDEX_APPLICATION_ID) {
+    throw fixedError("local_unified_index_recovery_application_id_invalid");
   }
 }
 
@@ -754,17 +765,19 @@ export async function validateLocalUnifiedIndexRecoveryBackup({ backupFile }) {
     if (quickCheck !== "ok") {
       throw fixedError("local_unified_index_recovery_backup_integrity_failed");
     }
+    const applicationId = Number(
+      database.prepare("PRAGMA application_id").get()?.application_id,
+    );
     const backupSchemaVersion = schemaVersion(database);
     const usageEvents = rowCount(database, "usage_event");
-    if (!["local-unified-index-v1", LOCAL_UNIFIED_INDEX_SCHEMA_VERSION]
+    if (applicationId !== LOCAL_UNIFIED_INDEX_APPLICATION_ID
+        || !["local-unified-index-v1", LOCAL_UNIFIED_INDEX_SCHEMA_VERSION]
       .includes(backupSchemaVersion) || usageEvents === null) {
       throw fixedError("local_unified_index_recovery_backup_schema_invalid");
     }
     return Object.freeze({
       quickCheck,
-      applicationId: Number(
-        database.prepare("PRAGMA application_id").get()?.application_id,
-      ),
+      applicationId,
       userVersion: Number(
         database.prepare("PRAGMA user_version").get()?.user_version,
       ),

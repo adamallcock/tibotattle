@@ -20,6 +20,7 @@ import {
   serviceRequestId,
   createQuotaTimelineLookup,
   createRefreshPollingBudget,
+  LOCAL_REFRESH_POLLING_WINDOW_MS,
   createSyntheticEnvelope,
   createTelemetryEnvelope,
   detectDeviationPeriods,
@@ -33,6 +34,7 @@ import {
   DEVIATION_MAX_PERIODS,
   parseJsonWithUniqueObjectKeys,
   isContributionReviewableQueueState,
+  refreshQuickResultStatus,
   refreshNeedsContinuation,
   ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION,
   ENVELOPE_SCHEMA_VERSION,
@@ -1036,11 +1038,36 @@ test("refresh polling budget gives each accepted continuation a fresh window", (
 
 test("default local analysis permits only two bounded continuations", () => {
   const budget = createRefreshPollingBudget();
+  assert.equal(LOCAL_REFRESH_POLLING_WINDOW_MS, 121 * 60 * 1_000);
   assert.equal(budget.canContinue(), true);
   assert.equal(budget.noteContinuation(), true);
   assert.equal(budget.noteContinuation(), true);
   assert.equal(budget.canContinue(), false);
   assert.equal(budget.noteContinuation(), false);
+});
+
+test("quick-result progress never turns a loaded no-numbers overview into a headline claim", () => {
+  const noNumbersOverview = {
+    state: "insufficient",
+    quotaWindows: [],
+    accounting: { status: "unavailable" },
+  };
+
+  assert.deepEqual(noNumbersOverview.quotaWindows, []);
+  assert.equal(
+    refreshQuickResultStatus({
+      dashboardLoaded: true,
+      elapsedLabel: "7s",
+    }),
+    "Local summary updated · checking full history…",
+  );
+  assert.equal(
+    refreshQuickResultStatus({
+      dashboardLoaded: false,
+      elapsedLabel: "7s",
+    }),
+    "Preparing local summary… 7s",
+  );
 });
 
 test("contribution admission uses participant allowance without inventing an unknown limit", () => {
@@ -5185,8 +5212,11 @@ test("local analysis exposes quick results and cancel-safe progress", async () =
   assert.match(appSource, /phase === "quick_result"/u);
   assert.match(appSource, /await loadQuickResultDashboard\(\)/u);
   assert.match(appSource, /renderDashboard\(data\)/u);
-  assert.match(appSource, /Headline ready; finishing deeper accounting/u);
-  assert.match(appSource, /finishing deeper accounting/u);
+  assert.match(appSource, /refreshQuickResultStatus\(\{/u);
+  assert.doesNotMatch(appSource, /Verified summary ready|Preparing verified summary/u);
+  assert.match(appSource, /kind === "unified_index"/u);
+  assert.match(appSource, /Scanning local history/u);
+  assert.doesNotMatch(appSource, /Headline ready; finishing deeper accounting/u);
   assert.match(appSource, /Local analysis cancelled/u);
   assert.match(appSource, /Verified existing results were kept/u);
   assert.match(appSource, /preserving a resumable local checkpoint/u);

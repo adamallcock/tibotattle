@@ -81,6 +81,24 @@ grep -E "^ℹ (tests|pass|fail)" preflight.log; echo "exit=$ec"
 
 Expect `fail 0`. A green-looking terminal is not a green suite.
 
+### 0.1.17 local-state migration gate
+
+Before signing the 0.1.17 internal-dogfood candidate, rehearse the current
+schema-8/9 to schema-10 migration against a consistent disposable copy of the
+stable unified index and its matching device salt. Keep the installed app
+stopped while taking the copy, leave the live source read-only, and compare
+SQLite integrity, generation metadata, row counts, aggregate token/cost ranges,
+and source-cursor coverage before and after migration. Follow the canonical
+[local unified-index recovery runbook](./2026-08-27-local-unified-index-recovery.md)
+for compatibility and preservation rules.
+
+The isolated `preview_distribution` app cannot satisfy this gate: it creates a
+fresh schema-10 index under `Usage Monitor Preview` and may test a full rebuild,
+but it cannot read or migrate stable state. The signed same-identity
+`internal-dogfood` installation is the later in-place upgrade proof. Never copy
+the live stable database into Preview, relabel `PRAGMA user_version`, delete the
+index, or reopen a migrated schema-10 index with shipped 0.1.16.
+
 **The failure class to expect after a batch of merges** is a *pin* that was
 never updated: a reviewed public-API list, a pinned action SHA, a byte-identity
 digest, a root-workspace allowlist, or an exact `deepEqual` on an exported

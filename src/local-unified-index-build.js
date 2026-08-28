@@ -52,6 +52,175 @@ import {
 // leaves the previous index untouched and costs only the work done so far.
 
 const MAXIMUM_WORKERS = 10;
+const MAXIMUM_AUTOMATIC_WORKERS = 6;
+const AUTOMATIC_WORKER_RESERVED_PARALLELISM = 3;
+// A received worker batch is written through synchronous node:sqlite calls.
+// Bound that one host turn independently from the writer's commit cadence so
+// loopback health, progress, and cancellation can run between batches.
+export const LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS = 500;
+// `postMessage` itself has no producer-side queue bound. Two shared credits let
+// one parser overlap extraction with one synchronous host write without ever
+// retaining more than two structured-clone batches (1,000 records) per lane.
+export const LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW = 2;
+
+const WORKER_BATCH_CREDITS = 0;
+const WORKER_BATCH_OUTSTANDING = 1;
+const WORKER_BATCH_PEAK_OUTSTANDING = 2;
+const WORKER_BATCH_WAIT_COUNT = 3;
+const WORKER_BATCH_WINDOW = 4;
+const WORKER_BATCH_CONTROL_LENGTH = 5;
+
+function assertWorkerBatchControl(control) {
+  if (!(control instanceof Int32Array)
+      || !(control.buffer instanceof SharedArrayBuffer)
+      || control.length !== WORKER_BATCH_CONTROL_LENGTH) {
+    throw new TypeError("worker batch control is invalid");
+  }
+  return control;
+}
+
+export function createLocalUnifiedIndexWorkerBatchControl({
+  initialCredits = LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW,
+} = {}) {
+  if (!Number.isSafeInteger(initialCredits)
+      || initialCredits < 0
+      || initialCredits > LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW) {
+    throw new TypeError(
+      `initialCredits must be between 0 and ${LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW}`,
+    );
+  }
+  const control = new Int32Array(new SharedArrayBuffer(
+    Int32Array.BYTES_PER_ELEMENT * WORKER_BATCH_CONTROL_LENGTH,
+  ));
+  Atomics.store(control, WORKER_BATCH_CREDITS, initialCredits);
+  Atomics.store(
+    control,
+    WORKER_BATCH_WINDOW,
+    LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW,
+  );
+  return control;
+}
+
+export function localUnifiedIndexWorkerBatchControlSnapshot(control) {
+  const view = assertWorkerBatchControl(control);
+  return {
+    credits: Atomics.load(view, WORKER_BATCH_CREDITS),
+    outstanding: Atomics.load(view, WORKER_BATCH_OUTSTANDING),
+    peakOutstanding: Atomics.load(view, WORKER_BATCH_PEAK_OUTSTANDING),
+    waitCount: Atomics.load(view, WORKER_BATCH_WAIT_COUNT),
+    window: Atomics.load(view, WORKER_BATCH_WINDOW),
+  };
+}
+
+export function releaseLocalUnifiedIndexWorkerBatch(control) {
+  const view = assertWorkerBatchControl(control);
+  while (true) {
+    const outstanding = Atomics.load(view, WORKER_BATCH_OUTSTANDING);
+    if (outstanding < 1) {
+      throw new Error("worker batch acknowledgement is unbalanced");
+    }
+    if (Atomics.compareExchange(
+      view,
+      WORKER_BATCH_OUTSTANDING,
+      outstanding,
+      outstanding - 1,
+    ) === outstanding) break;
+  }
+  const credits = Atomics.add(view, WORKER_BATCH_CREDITS, 1) + 1;
+  const window = Atomics.load(view, WORKER_BATCH_WINDOW);
+  if (credits > window) {
+    Atomics.sub(view, WORKER_BATCH_CREDITS, 1);
+    Atomics.add(view, WORKER_BATCH_OUTSTANDING, 1);
+    throw new Error("worker batch acknowledgement exceeds its window");
+  }
+  Atomics.notify(view, WORKER_BATCH_CREDITS, 1);
+}
+
+/**
+ * Deliver content-free progress with constant retained state. While one
+ * callback is in flight, newer snapshots replace the single pending slot.
+ * Callback failures are remembered but do not prevent the newest/final
+ * snapshot from being offered; drain then rethrows the first failure, matching
+ * the former promise-chain contract without retaining one closure per source.
+ */
+export function createLocalUnifiedIndexProgressPump(onProgress) {
+  if (typeof onProgress !== "function") {
+    throw new TypeError("onProgress must be a function");
+  }
+  let pending = null;
+  let running = false;
+  let runner = null;
+  let failure = null;
+
+  const run = async () => {
+    while (pending !== null) {
+      const progress = pending;
+      pending = null;
+      try {
+        await onProgress(progress);
+      } catch (error) {
+        failure ??= error;
+      }
+    }
+  };
+  const start = () => {
+    if (running || pending === null) return;
+    running = true;
+    runner = run().finally(() => {
+      running = false;
+      if (pending !== null) start();
+    });
+  };
+
+  return Object.freeze({
+    offer(progress) {
+      pending = progress;
+      start();
+    },
+    async drain() {
+      while (running || pending !== null) {
+        if (!running) start();
+        const active = runner;
+        if (active !== null) await active;
+      }
+      if (failure !== null) throw failure;
+    },
+  });
+}
+
+// An off-main attempt owns one immutable, parent-generated token. The narrow
+// shape lets the bounded abandoned-stage scanner distinguish a terminated
+// same-process worker from the currently admitted retry without globbing by
+// token prefix. Direct callers leave the token unset and retain the legacy
+// PID/timestamp stage-name contract.
+export const LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN = /^[0-9a-f]{32}$/u;
+
+export function validateLocalUnifiedIndexAttemptToken(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string"
+      || !LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN.test(value)) {
+    throw fixedError("local_unified_index_attempt_token_invalid");
+  }
+  return value;
+}
+
+export function localUnifiedIndexStageFile(
+  indexFile,
+  kind,
+  attemptToken = null,
+) {
+  if (typeof indexFile !== "string" || indexFile.length < 1) {
+    throw fixedError("local_unified_index_worker_options_invalid");
+  }
+  if (kind !== "building" && kind !== "incremental") {
+    throw fixedError("local_unified_index_worker_options_invalid");
+  }
+  const resolvedIndexFile = resolve(indexFile);
+  const token = validateLocalUnifiedIndexAttemptToken(attemptToken);
+  return token === null
+    ? `${resolvedIndexFile}.${kind}-${process.pid}-${Date.now().toString(36)}`
+    : `${resolvedIndexFile}.${kind}-${process.pid}-${token}`;
+}
 const { discoverCodexRolloutInfos } = localCodexLogScanner;
 
 const CODEX_BILLING_SURFACE = "chatgpt_subscription";
@@ -541,7 +710,10 @@ export function createEventSink({
         partial: event.partial === true,
       });
       add(source, "usageEvents");
-      if (counts.usageEvents % 50_000 === 0) onCounts?.(counts);
+      if (onCounts !== null && onCounts !== undefined
+          && counts.usageEvents % LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS === 0) {
+        onCounts(counts);
+      }
     },
     writeBoundary(source, event) {
       writer.writeUsageEventBoundary({
@@ -605,11 +777,15 @@ export function createEventSink({
 
 async function runWorkerLane(lane, laneIndex, { maximumLineBytes, signal, onBatch }) {
   return new Promise((settle, fail) => {
+    const batchControl = createLocalUnifiedIndexWorkerBatchControl();
     const worker = new Worker(
       new URL("./local-unified-index-worker.js", import.meta.url),
       {
         workerData: {
           maximumLineBytes,
+          batchEvents: LOCAL_UNIFIED_INDEX_WORKER_BATCH_EVENTS,
+          batchControl: batchControl.buffer,
+          batchWindow: LOCAL_UNIFIED_INDEX_WORKER_BATCH_WINDOW,
           components: lane.components.map((members) => members.map((info) => ({
             path: info.path,
             size: Number(info.size ?? 0),
@@ -641,6 +817,7 @@ async function runWorkerLane(lane, laneIndex, { maximumLineBytes, signal, onBatc
     let failed = null;
     const abort = () => worker.terminate();
     signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
     worker.on("message", (message) => {
       if (message.type === "batch") {
         try {
@@ -648,6 +825,8 @@ async function runWorkerLane(lane, laneIndex, { maximumLineBytes, signal, onBatc
         } catch (error) {
           failed = error;
           worker.terminate();
+        } finally {
+          releaseLocalUnifiedIndexWorkerBatch(batchControl);
         }
         return;
       }
@@ -686,6 +865,7 @@ export async function rebuildLocalUnifiedIndex({
   commitRows = 10_000,
   deferSecondaryIndexes = true,
   maximumLineBytes,
+  attemptToken = null,
   signal = null,
   onProgress = null,
   discoveryLimits = null,
@@ -703,6 +883,10 @@ export async function rebuildLocalUnifiedIndex({
   if (typeof deferSecondaryIndexes !== "boolean") {
     throw new TypeError("deferSecondaryIndexes must be a boolean");
   }
+  if (onProgress !== null && typeof onProgress !== "function") {
+    throw new TypeError("onProgress must be a function or null");
+  }
+  validateLocalUnifiedIndexAttemptToken(attemptToken);
   const startedAt = performance.now();
   const resolvedIndexFile = resolve(indexFile);
   await assertSafeLocalUnifiedIndexTarget(resolvedIndexFile, {
@@ -722,7 +906,11 @@ export async function rebuildLocalUnifiedIndex({
   const discoveredAt = performance.now();
   const sourceBytes = discovery.discoveredSourceBytes;
 
-  const stageFile = `${resolvedIndexFile}.building-${process.pid}-${Date.now().toString(36)}`;
+  const stageFile = localUnifiedIndexStageFile(
+    resolvedIndexFile,
+    "building",
+    attemptToken,
+  );
   await removeIfPresent(stageFile);
   let database = null;
   let generation = null;
@@ -764,7 +952,7 @@ export async function rebuildLocalUnifiedIndex({
       deviceSalt,
       accountScopeId,
       generationId: generation.generationId,
-      onCounts: null,
+      onCounts: () => queueProgress(),
     });
   } catch (error) {
     try {
@@ -804,19 +992,20 @@ export async function rebuildLocalUnifiedIndex({
   const sourceOrdinals = new Map(
     allSources.map((info, ordinal) => [info, ordinal]),
   );
-  let progressTail = Promise.resolve();
-  let progressFailure = null;
-  function queueProgress() {
+  const progressPump = onProgress === null
+    ? null
+    : createLocalUnifiedIndexProgressPump(onProgress);
+  let lastQueuedProgressAt = -Infinity;
+  function queueProgress({ force = false } = {}) {
     if (onProgress === null) return;
+    const now = performance.now();
+    if (!force && now - lastQueuedProgressAt < 1_000) return;
+    lastQueuedProgressAt = now;
     const progress = {
       ...diagnostics,
       usageEvents: sink.counts.usageEvents,
     };
-    progressTail = progressTail
-      .then(() => onProgress(progress))
-      .catch((error) => {
-        progressFailure ??= error;
-      });
+    progressPump.offer(progress);
   }
   const sourceState = new Map();
   function stateFor(info) {
@@ -1035,6 +1224,13 @@ export async function rebuildLocalUnifiedIndex({
   });
 
   try {
+    // Discovery and schema setup can take observable time before the first
+    // source completes. Publish the known content-free inventory immediately,
+    // then keep large single-source scans visibly moving below.
+    await onProgress?.({
+      ...diagnostics,
+      usageEvents: sink.counts.usageEvents,
+    });
     if (workerCount === 1) {
       // Iterated by lineage component, exactly as the worker lanes are, so the
       // ancestor snapshot sets a fork needs are alive when it is scanned and
@@ -1051,10 +1247,7 @@ export async function rebuildLocalUnifiedIndex({
                 state,
                 "codex_rollout_lineage_invalid",
               );
-              await onProgress?.({
-                ...diagnostics,
-                usageEvents: sink.counts.usageEvents,
-              });
+              queueProgress();
               continue;
             }
             const logicalSeed = seedFor(info);
@@ -1123,10 +1316,7 @@ export async function rebuildLocalUnifiedIndex({
                 quarantineReason,
                 sourceDiagnostics,
               );
-              await onProgress?.({
-                ...diagnostics,
-                usageEvents: sink.counts.usageEvents,
-              });
+              queueProgress();
               continue;
             }
             state.finalModel = outcome.finalModel;
@@ -1159,7 +1349,7 @@ export async function rebuildLocalUnifiedIndex({
               mtimeMs: Math.floor(Number(info.mtimeMs ?? 0)),
               diagnosticsComplete: true,
             });
-            await onProgress?.({ ...diagnostics, usageEvents: sink.counts.usageEvents });
+            queueProgress();
           }
         } finally {
           snapshots.release();
@@ -1255,12 +1445,21 @@ export async function rebuildLocalUnifiedIndex({
               diagnosticsComplete: true,
             });
             queueProgress();
+            return;
           }
+          // One large rollout can take minutes to close. The worker's bounded
+          // batches already contain content-free counts, so publish them at a
+          // one-second maximum cadence without exposing source identity.
+          queueProgress();
         },
       })));
-      await progressTail;
-      if (progressFailure !== null) throw progressFailure;
     }
+    // A forced final offer overwrites any stale pending snapshot, while an
+    // already in-flight callback is allowed to settle normally. Thus every
+    // rebuild publishes its initial and final state with at most two retained
+    // progress objects regardless of source count or callback latency.
+    queueProgress({ force: true });
+    await progressPump?.drain();
 
     const scannedAt = performance.now();
     if (signal?.aborted) throw fixedError("local_unified_index_aborted");
@@ -1324,7 +1523,8 @@ export async function rebuildLocalUnifiedIndex({
       generation.generationId,
     );
     const closed = await writer.close({ integrityCheck: true, fsyncPath: null });
-    await publishStagedUnifiedIndex(stageFile, resolvedIndexFile);
+    if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+    await publishStagedUnifiedIndex(stageFile, resolvedIndexFile, { signal });
     return {
       status: "built",
       indexFile: resolvedIndexFile,
@@ -1358,8 +1558,14 @@ export async function rebuildLocalUnifiedIndex({
   }
 }
 
-export function defaultRebuildWorkerCount() {
-  return Math.min(MAXIMUM_WORKERS, Math.max(1, availableParallelism() - 2));
+export function defaultRebuildWorkerCount(parallelism = availableParallelism()) {
+  if (!Number.isSafeInteger(parallelism) || parallelism < 1) {
+    throw new TypeError("parallelism must be a positive safe integer");
+  }
+  return Math.min(
+    MAXIMUM_AUTOMATIC_WORKERS,
+    Math.max(1, parallelism - AUTOMATIC_WORKER_RESERVED_PARALLELISM),
+  );
 }
 
 export function rebuildSourceLabel(info) {

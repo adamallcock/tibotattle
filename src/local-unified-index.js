@@ -5,8 +5,16 @@ import {
   randomBytes,
 } from "node:crypto";
 import { closeSync, constants, lstatSync, openSync } from "node:fs";
-import { chmod, lstat, mkdir, open, rename, unlink } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  open,
+  opendir,
+  rename,
+  unlink,
+} from "node:fs/promises";
+import { basename, dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 // The one local index.
@@ -32,7 +40,8 @@ import { DatabaseSync } from "node:sqlite";
 //   * `scope_local` is the same construction over the local account scope id.
 
 export const LOCAL_UNIFIED_INDEX_SCHEMA_VERSION = "local-unified-index-v2";
-const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION = "local-unified-index-v1";
+export const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION =
+  "local-unified-index-v1";
 
 // Stamped onto every row. A parser change re-scans only the affected rows'
 // source files; rows whose rollout files have rotated away keep their
@@ -108,7 +117,8 @@ export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
 export const LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION =
   "unified-rollout-typed-v10-partial";
 
-const INDEX_APPLICATION_ID = 0x554d5549;
+export const LOCAL_UNIFIED_INDEX_APPLICATION_ID = 0x554d5549;
+const INDEX_APPLICATION_ID = LOCAL_UNIFIED_INDEX_APPLICATION_ID;
 // Version 2 (2026-08-07) widens version 1 with the two incremental-ingest
 // tables below: `source_cursor` and `lineage_snapshot`. Version 3 (2026-08-07)
 // adds `session_identity`, the raw provider-issued session UUID beside its
@@ -2981,13 +2991,30 @@ export function createUnifiedIndexWriter(database, {
 export async function publishStagedUnifiedIndex(
   stageFile,
   indexFile,
-  { allowRecoveryLock = false } = {},
+  { allowRecoveryLock = false, signal = null } = {},
 ) {
+  if (signal !== null
+      && (typeof signal !== "object" || typeof signal.aborted !== "boolean")) {
+    throw new TypeError("signal must be an AbortSignal or null");
+  }
+  if (signal?.aborted) throw fixedError("local_unified_index_aborted");
   if (!allowRecoveryLock) assertLocalUnifiedIndexRecoveryUnlocked(indexFile);
   await chmod(stageFile, 0o600);
   await syncFile(stageFile);
+  // A rebuild close can be entirely synchronous. Yield once after the durable
+  // stage fsync so an already-queued cancellation becomes observable before
+  // final target validation; never yield after validation or the signal check.
+  await new Promise((resolvePromise) => setImmediate(resolvePromise));
+  if (signal?.aborted) throw fixedError("local_unified_index_aborted");
   if (!allowRecoveryLock) assertLocalUnifiedIndexRecoveryUnlocked(indexFile);
   await assertSafeLocalUnifiedIndexTarget(indexFile, { allowMissing: true });
+  // Target validation yields to the event loop. Recovery can acquire its lock
+  // while that validation is in flight, so re-check exclusion after the await
+  // and adjacent to the atomic rename. No asynchronous boundary remains after
+  // this cancellation/lock pair; neither an abort nor a newly acquired recovery
+  // lock can therefore be missed because target verification was suspended.
+  if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+  if (!allowRecoveryLock) assertLocalUnifiedIndexRecoveryUnlocked(indexFile);
   await rename(stageFile, indexFile);
   try {
     await syncDirectoryPath(dirname(resolve(indexFile)));
@@ -3010,6 +3037,344 @@ export async function removeIfPresent(path) {
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
+}
+
+// Cooperative abort removes its own stage. A hard worker termination cannot
+// run that catch path, so a bounded scanner reclaims only old, exact stage
+// names whose process/attempt owner is proven inactive.
+export const LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_MIN_AGE_MS =
+  2 * 60 * 60_000;
+export const LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_SCAN_LIMIT = 64;
+const LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN = /^[0-9a-f]{32}$/u;
+
+function localUnifiedIndexStageOwner(name, indexName) {
+  for (const kind of ["building", "incremental"]) {
+    const prefix = `${indexName}.${kind}-`;
+    if (!name.startsWith(prefix)) continue;
+    const match = /^([1-9][0-9]*)-([0-9a-z]+)$/u.exec(
+      name.slice(prefix.length),
+    );
+    if (match === null) return null;
+    const pid = Number(match[1]);
+    return Number.isSafeInteger(pid)
+      ? {
+        pid,
+        attemptToken: LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN.test(match[2])
+          ? match[2]
+          : null,
+      }
+      : null;
+  }
+  return null;
+}
+
+function processAppearsAlive(pid) {
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
+// A filename cursor must re-enumerate from the beginning to discover that its
+// remembered entry was deleted. Retain the bounded directory stream itself so
+// every pass performs at most scanLimit raw reads and resumes at the next OS
+// directory entry. The product owns one index; the cap only contains injected
+// callers/tests and every handle is closed at EOF or eviction.
+const abandonedStageDirectoryScans = new Map();
+const MAX_ABANDONED_STAGE_DIRECTORY_SCANS = 64;
+
+async function closeAbandonedStageDirectoryScan(indexFile, state) {
+  if (abandonedStageDirectoryScans.get(indexFile) === state) {
+    abandonedStageDirectoryScans.delete(indexFile);
+  }
+  try {
+    await state.handle.close();
+  } catch {
+    // A directory stream can already be closed after an iteration/read error.
+  }
+}
+
+async function abandonedStageDirectoryScan(
+  directory,
+  indexFile,
+  scanLimit,
+  openDirectory,
+  directoryChain,
+) {
+  let state = abandonedStageDirectoryScans.get(indexFile) ?? null;
+  if (state !== null
+      && (state.directory !== directory
+        || state.openDirectory !== openDirectory
+        || !sameLocalUnifiedIndexDirectoryChain(
+          state.directoryChain,
+          directoryChain,
+        ))) {
+    await closeAbandonedStageDirectoryScan(indexFile, state);
+    state = null;
+  }
+  if (state === null) {
+    let handle;
+    try {
+      handle = await openDirectory(directory, {
+        bufferSize: Math.min(scanLimit, 32),
+      });
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    }
+    state = { directory, directoryChain, handle, openDirectory };
+    abandonedStageDirectoryScans.set(indexFile, state);
+    while (abandonedStageDirectoryScans.size
+        > MAX_ABANDONED_STAGE_DIRECTORY_SCANS) {
+      const oldestIndexFile = abandonedStageDirectoryScans.keys().next().value;
+      const oldest = abandonedStageDirectoryScans.get(oldestIndexFile);
+      await closeAbandonedStageDirectoryScan(oldestIndexFile, oldest);
+    }
+  } else {
+    // Map insertion order is the eviction order; touching a live scan keeps it
+    // from being evicted by unrelated injected index paths.
+    abandonedStageDirectoryScans.delete(indexFile);
+    abandonedStageDirectoryScans.set(indexFile, state);
+  }
+  return state;
+}
+
+async function rotatingLocalUnifiedIndexStageNames(
+  directory,
+  indexFile,
+  indexName,
+  scanLimit,
+  openDirectory,
+  directoryChain,
+) {
+  const state = await abandonedStageDirectoryScan(
+    directory,
+    indexFile,
+    scanLimit,
+    openDirectory,
+    directoryChain,
+  );
+  if (state === null) return null;
+  const selected = [];
+  for (let enumerated = 0; enumerated < scanLimit; enumerated += 1) {
+    let entry;
+    try {
+      entry = await state.handle.read();
+    } catch (error) {
+      await closeAbandonedStageDirectoryScan(indexFile, state);
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    }
+    if (entry === null) {
+      await closeAbandonedStageDirectoryScan(indexFile, state);
+      break;
+    }
+    const name = entry.name;
+    if (localUnifiedIndexStageOwner(name, indexName) === null) continue;
+    selected.push(name);
+  }
+  return selected;
+}
+
+/**
+ * Remove only the two stage names an exact, confirmed-terminated off-main
+ * attempt could own. The unguessable token, current PID, safe directory chain,
+ * and owner-only single-link file checks make this narrower than an abandoned
+ * stage scan; anything uncertain is retained for later diagnosis.
+ */
+export async function removeExactLocalUnifiedIndexAttemptStages(
+  indexFile,
+  attemptToken,
+) {
+  if (typeof indexFile !== "string" || indexFile.length < 1) {
+    throw new TypeError("indexFile must be a non-empty string");
+  }
+  if (typeof attemptToken !== "string"
+      || !LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN.test(attemptToken)) {
+    throw new TypeError("attemptToken must be a 32-character hex token");
+  }
+  const resolvedIndexFile = resolve(indexFile);
+  const directoryChain = assertSafeLocalUnifiedIndexParentPath(
+    resolvedIndexFile,
+  );
+  let inspected = 0;
+  let removed = 0;
+  let skipped = 0;
+  for (const kind of ["building", "incremental"]) {
+    const candidate = `${resolvedIndexFile}.${kind}-${process.pid}-${attemptToken}`;
+    let metadata;
+    try {
+      metadata = await lstat(candidate);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      skipped += 1;
+      continue;
+    }
+    inspected += 1;
+    if (!ownerOnlyRegularFile(metadata)) {
+      skipped += 1;
+      continue;
+    }
+    let verified;
+    try {
+      recheckLocalUnifiedIndexDirectoryChain(
+        resolvedIndexFile,
+        directoryChain,
+      );
+      verified = await lstat(candidate);
+      recheckLocalUnifiedIndexDirectoryChain(
+        resolvedIndexFile,
+        directoryChain,
+      );
+    } catch {
+      skipped += 1;
+      continue;
+    }
+    if (!sameLocalUnifiedIndexTarget(metadata, verified)) {
+      skipped += 1;
+      continue;
+    }
+    try {
+      await unlink(candidate);
+      removed += 1;
+    } catch (error) {
+      if (error?.code !== "ENOENT") skipped += 1;
+    }
+  }
+  return Object.freeze({ inspected, removed, skipped });
+}
+
+export async function removeAbandonedLocalUnifiedIndexStages(
+  indexFile,
+  {
+    nowMs = Date.now(),
+    minimumAgeMs = LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_MIN_AGE_MS,
+    scanLimit = LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_SCAN_LIMIT,
+    platform = process.platform,
+    isProcessAlive = processAppearsAlive,
+    activeAttemptToken = null,
+    openDirectory = opendir,
+  } = {},
+) {
+  if (typeof indexFile !== "string" || indexFile.length < 1) {
+    throw new TypeError("indexFile must be a non-empty string");
+  }
+  if (!Number.isFinite(nowMs) || !Number.isFinite(minimumAgeMs)
+      || minimumAgeMs < 60_000) {
+    throw new TypeError("abandoned stage age is invalid");
+  }
+  if (!Number.isSafeInteger(scanLimit) || scanLimit < 1 || scanLimit > 256) {
+    throw new TypeError("abandoned stage scan limit is invalid");
+  }
+  if (typeof isProcessAlive !== "function") {
+    throw new TypeError("isProcessAlive must be a function");
+  }
+  if (typeof openDirectory !== "function") {
+    throw new TypeError("openDirectory must be a function");
+  }
+  if (activeAttemptToken !== null
+      && (typeof activeAttemptToken !== "string"
+        || !LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN.test(activeAttemptToken))) {
+    throw new TypeError(
+      "activeAttemptToken must be null or a 32-character hex token",
+    );
+  }
+  // Windows state remains behind its separately qualified native capability.
+  if (platform === "win32") {
+    return Object.freeze({ inspected: 0, removed: 0, skipped: 0 });
+  }
+
+  const resolvedIndexFile = resolve(indexFile);
+  const directory = dirname(resolvedIndexFile);
+  const indexName = basename(resolvedIndexFile);
+  const directoryChain = assertSafeLocalUnifiedIndexParentPath(
+    resolvedIndexFile,
+  );
+  const names = await rotatingLocalUnifiedIndexStageNames(
+    directory,
+    resolvedIndexFile,
+    indexName,
+    scanLimit,
+    openDirectory,
+    directoryChain,
+  );
+  if (names === null) {
+    return Object.freeze({ inspected: 0, removed: 0, skipped: 0 });
+  }
+
+  let inspected = 0;
+  let removed = 0;
+  let skipped = 0;
+  for (const name of names) {
+    inspected += 1;
+    const owner = localUnifiedIndexStageOwner(name, indexName);
+    const pid = owner?.pid ?? null;
+    const candidate = resolve(directory, name);
+    if (pid === null || dirname(candidate) !== directory) {
+      skipped += 1;
+      continue;
+    }
+    let metadata;
+    try {
+      recheckLocalUnifiedIndexDirectoryChain(
+        resolvedIndexFile,
+        directoryChain,
+      );
+      metadata = await lstat(candidate);
+      recheckLocalUnifiedIndexDirectoryChain(
+        resolvedIndexFile,
+        directoryChain,
+      );
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      skipped += 1;
+      continue;
+    }
+    if (!ownerOnlyRegularFile(metadata)
+        || !Number.isFinite(metadata.mtimeMs)
+        || nowMs - metadata.mtimeMs < minimumAgeMs) {
+      skipped += 1;
+      continue;
+    }
+    const ownerIsAlive = owner.attemptToken !== null
+      && pid === process.pid
+      && activeAttemptToken !== null
+      ? owner.attemptToken === activeAttemptToken
+      : isProcessAlive(pid);
+    if (ownerIsAlive) {
+      skipped += 1;
+      continue;
+    }
+    let verified;
+    try {
+      recheckLocalUnifiedIndexDirectoryChain(
+        resolvedIndexFile,
+        directoryChain,
+      );
+      verified = await lstat(candidate);
+      recheckLocalUnifiedIndexDirectoryChain(
+        resolvedIndexFile,
+        directoryChain,
+      );
+    } catch {
+      skipped += 1;
+      continue;
+    }
+    if (!sameLocalUnifiedIndexTarget(metadata, verified)) {
+      skipped += 1;
+      continue;
+    }
+    try {
+      await unlink(candidate);
+      removed += 1;
+    } catch (error) {
+      if (error?.code !== "ENOENT") skipped += 1;
+    }
+  }
+  return Object.freeze({ inspected, removed, skipped });
 }
 
 const EMPTY_INSPECTION = Object.freeze({

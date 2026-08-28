@@ -159,6 +159,7 @@ const ARCHIVE_INDEX_ERROR_CODES = new Set([
   "archive_index_unavailable",
 ]);
 const ARCHIVE_INDEX_PROGRESS_KIND = "archive_index";
+const UNIFIED_INDEX_PROGRESS_KIND = "unified_index";
 const REFRESH_FAILURE_STEPS = new Set([
   "collector",
   "accounting",
@@ -739,8 +740,66 @@ function publicArchiveIndexProgress(value) {
     : null;
 }
 
+// Unified ingestion reports an internal diagnostics object after each source.
+// Project only bounded counts into refresh status: paths, source bytes,
+// quarantine details, and parser counters remain inside the companion.
+function publicUnifiedIndexProgress(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const publicKeys = [
+    "filesDiscovered",
+    "filesProcessed",
+    "filesSelected",
+    "kind",
+    "phase",
+    "recordsWritten",
+    "status",
+  ];
+  if (value.kind === UNIFIED_INDEX_PROGRESS_KIND) {
+    if (!hasExactKeys(value, publicKeys)
+        || value.status !== "scanning"
+        || value.phase !== "rollout_index"
+        || ![
+          value.filesDiscovered,
+          value.filesSelected,
+          value.filesProcessed,
+          value.recordsWritten,
+        ].every((count) => Number.isSafeInteger(count) && count >= 0)
+        || value.filesSelected > value.filesDiscovered
+        || value.filesProcessed > value.filesSelected) return null;
+    return {
+      kind: UNIFIED_INDEX_PROGRESS_KIND,
+      status: "scanning",
+      phase: "rollout_index",
+      filesDiscovered: value.filesDiscovered,
+      filesSelected: value.filesSelected,
+      filesProcessed: value.filesProcessed,
+      recordsWritten: value.recordsWritten,
+    };
+  }
+  if (![
+    "sources",
+    "sourcesScanned",
+    "usageEvents",
+    "insertedUsageEvents",
+  ].some((key) => Object.hasOwn(value, key))) return null;
+  const filesDiscovered = safeCount(value.sources);
+  const filesProcessed = safeCount(value.sourcesScanned);
+  if (filesProcessed > filesDiscovered) return null;
+  return {
+    kind: UNIFIED_INDEX_PROGRESS_KIND,
+    status: "scanning",
+    phase: "rollout_index",
+    filesDiscovered,
+    filesSelected: filesDiscovered,
+    filesProcessed,
+    recordsWritten: safeCount(value.usageEvents ?? value.insertedUsageEvents),
+  };
+}
+
 function publicRefreshProgress(value) {
-  return publicIndexingResult(value) ?? publicArchiveIndexProgress(value);
+  return publicIndexingResult(value)
+    ?? publicArchiveIndexProgress(value)
+    ?? publicUnifiedIndexProgress(value);
 }
 
 function terminalRefreshProgress(value) {
@@ -1079,6 +1138,22 @@ export function createLocalCollectorRefreshRunner({
     if (accountingSourceMode === "unified"
         && refreshUnifiedIndex !== null
         && signal?.aborted !== true) {
+      const publishUnifiedIndexProgress = onProgress === null
+        ? null
+        : async (value) => {
+          if (signal?.aborted === true) return;
+          const progress = publicUnifiedIndexProgress(value);
+          if (progress !== null) await onProgress(progress);
+        };
+      // Leave the misleading quick-result phase as soon as deep ingestion
+      // starts, even before discovery has produced its first measured count.
+      if (publishUnifiedIndexProgress !== null) {
+        await publishUnifiedIndexProgress({
+          sources: 0,
+          sourcesScanned: 0,
+          usageEvents: 0,
+        });
+      }
       // The unified index advances by its cursors, so this ordinarily reads
       // only appended bytes. It runs BEFORE accounting so the full-history
       // calibration corpus the accounting rebuild reads from the index
@@ -1092,6 +1167,9 @@ export function createLocalCollectorRefreshRunner({
           ...(unifiedIndexSecretFile === null
             ? {}
             : { secretFile: unifiedIndexSecretFile }),
+          ...(publishUnifiedIndexProgress === null
+            ? {}
+            : { onProgress: publishUnifiedIndexProgress }),
           signal,
         }));
       } catch (error) {
@@ -1572,6 +1650,15 @@ function publicRefreshResult(result, now = Date.now()) {
   return projected;
 }
 
+function reusableUnifiedProjection(result) {
+  const unified = result?.unifiedIndex;
+  const fingerprint = unified?.generation?.fingerprint;
+  if (unified?.unchanged !== true
+      || typeof fingerprint !== "string"
+      || !/^generation-v2-[0-9a-f]{64}$/u.test(fingerprint)) return null;
+  return { generationFingerprint: fingerprint };
+}
+
 function unifiedIndexDegradation(result) {
   const unified = result?.unifiedIndex;
   if (unified?.status === "failed") {
@@ -1595,6 +1682,14 @@ function unifiedIndexDegradation(result) {
   return null;
 }
 
+// A fresh unified index can require a full retained-history scan. Keep that
+// first publication bounded, but do not apply its two-hour recovery window to
+// ordinary cursor-based incremental refreshes.
+export const LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS =
+  2 * 60 * 60_000;
+export const LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS =
+  LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS;
+
 export class LocalCompanionRefreshController {
   #abortController = null;
   #cancelRequested = false;
@@ -1609,11 +1704,13 @@ export class LocalCompanionRefreshController {
   #runner;
   #state;
   #timeoutMs;
+  #timeoutMsForRun;
 
   constructor({
     runner,
     dataStore,
     timeoutMs = 5 * 60_000,
+    timeoutMsForRun = null,
     clock = () => Date.now(),
     createRefreshId = randomUUID,
     // Observer for terminal refresh failures. Receives only the bounded
@@ -1633,8 +1730,13 @@ export class LocalCompanionRefreshController {
     if (!dataStore || typeof dataStore.reload !== "function") {
       throw new TypeError("dataStore.reload must be a function");
     }
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 5 * 60_000) {
-      throw new TypeError("timeoutMs must be between 1,000 and 300,000");
+    if (!Number.isSafeInteger(timeoutMs)
+        || timeoutMs < 1_000
+        || timeoutMs > LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS) {
+      throw new TypeError("timeoutMs must be between 1,000 and 7,200,000");
+    }
+    if (timeoutMsForRun !== null && typeof timeoutMsForRun !== "function") {
+      throw new TypeError("timeoutMsForRun must be a function or null");
     }
     if (typeof createRefreshId !== "function") {
       throw new TypeError("createRefreshId must be a function");
@@ -1648,6 +1750,7 @@ export class LocalCompanionRefreshController {
     this.#runner = runner;
     this.#dataStore = dataStore;
     this.#timeoutMs = timeoutMs;
+    this.#timeoutMsForRun = timeoutMsForRun;
     this.#clock = clock;
     this.#createRefreshId = createRefreshId;
     this.#onTerminalFailure = onTerminalFailure;
@@ -1729,6 +1832,16 @@ export class LocalCompanionRefreshController {
 
   start() {
     if (this.#inFlight !== null) return false;
+    const selectedTimeoutMs = this.#timeoutMsForRun === null
+      ? this.#timeoutMs
+      : this.#timeoutMsForRun();
+    if (!Number.isSafeInteger(selectedTimeoutMs)
+        || selectedTimeoutMs < 1_000
+        || selectedTimeoutMs > LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS) {
+      throw new TypeError(
+        "timeoutMsForRun must return between 1,000 and 7,200,000",
+      );
+    }
     const startedAt = this.#clock();
     const refreshId = this.#createRefreshId();
     if (typeof refreshId !== "string"
@@ -1765,7 +1878,10 @@ export class LocalCompanionRefreshController {
               && projected.phase === "quick_result"
               && !this.#cancelRequested) {
             try {
-              await this.#dataStore.reload({ purpose: "quick" });
+              await this.#dataStore.reload({
+                purpose: "quick",
+                signal: controller.signal,
+              });
               quickResultAt = new Date(this.#clock()).toISOString();
             } catch {
               // Keep the previous good dashboard. Deep accounting can still
@@ -1782,11 +1898,9 @@ export class LocalCompanionRefreshController {
       }))
       .then(async (result) => {
         if (this.#cancelRequested) {
-          try {
-            await this.#dataStore.reload({ purpose: "full" });
-          } catch {
-            // Cancellation preserves the last good dashboard snapshot.
-          }
+          // The data store already owns the last verified snapshot. A cancel
+          // must become terminal as soon as worker shutdown is confirmed,
+          // rather than entering another potentially expensive projection.
           this.#state = {
             status: "cancelled",
             refreshId: this.#state.refreshId,
@@ -1803,12 +1917,9 @@ export class LocalCompanionRefreshController {
           return;
         }
         if (timedOut) {
-          try {
-            await this.#dataStore.reload({ purpose: "full" });
-          } catch {
-            // The timeout remains authoritative; the last good dashboard
-            // snapshot is already retained by the data store.
-          }
+          // As with cancellation, retain the prior authoritative snapshot.
+          // The worker promise settles only after cooperative exit or hard
+          // termination, so no partial staged database is made readable here.
           this.#state = {
             status: "failed",
             refreshId: this.#state.refreshId,
@@ -1826,7 +1937,11 @@ export class LocalCompanionRefreshController {
           this.#notifyTerminalFailure();
           return;
         }
-        await this.#dataStore.reload({ purpose: "full" });
+        await this.#dataStore.reload({
+          purpose: "full",
+          signal: controller.signal,
+          unifiedProjectionReuse: reusableUnifiedProjection(result),
+        });
         const finalProgress = publicIndexingResult(result?.indexing);
         const degradation = unifiedIndexDegradation(result);
         this.#state = {
@@ -1869,7 +1984,10 @@ export class LocalCompanionRefreshController {
           // that content-free coverage receipt while retaining the previous
           // foreground result.
           try {
-            await this.#dataStore.reload({ purpose: "full" });
+            await this.#dataStore.reload({
+              purpose: "full",
+              signal: controller.signal,
+            });
           } catch {
             // Keep the prior good dashboard if the receipt reload is unavailable.
           }
@@ -1920,7 +2038,7 @@ export class LocalCompanionRefreshController {
       // The timeout IS the terminal failure the user sees, and a hung runner
       // may never settle — file the trail entry now, not at settlement.
       this.#notifyTerminalFailure();
-    }, this.#timeoutMs);
+    }, selectedTimeoutMs);
     timeout.unref?.();
     this.#inFlight = work;
     return true;

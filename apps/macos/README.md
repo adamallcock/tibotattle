@@ -54,17 +54,30 @@ that compatibility backend.
    foreground application and installs no `LSUIElement` agent. The compact
    title shows the primary observed quota lane only while the companion reports
    fresh verified evidence; stale, unobserved, starting, and failed states all
-   show a neutral `–`, and an in-progress pass shows `…`. The menu lists every
-   supported observed quota lane. It hides stale percentages and reset times,
-   and shows a reset countdown only for fresh verified evidence. Its disabled
-   rows name the observation and freshness state, so the menu bar never
-   displays a number it cannot justify. The item offers one primary **Open
-   TiboTattle** destination, state-aware **Analyze/Update Local Usage**, and
-   **Quit TiboTattle**; Quit uses the same graceful shutdown as the window's own
-   Quit control.
-5. The dashboard renders its initial local state, then the native launcher
-   starts one automatic bounded refresh after first paint. **Refresh usage** is
-   available for later explicit passes.
+   show a neutral `–`. An in-progress pass keeps the fresh current number when
+   one is available and shows `…` only while no current lane can be shown.
+   Left-click opens a
+   transient native popover with fresh-only five-hour and seven-day allowance
+   tracks, the shared weekly pace forecast expressed as under, near, or over
+   sustainable pace with a now-to-reset coverage track, and coverage-aware
+   local-calendar usage bars for 7 or 30 days. The pace reading is shown only
+   after compatible local quota observations bind to the exact current weekly
+   reset; one observation is named as collecting, never promoted to a trend.
+   The bars use
+   observed tokens; dollar figures are explicitly Standard API-price
+   equivalents, not a subscription bill, and disappear when pricing evidence
+   cannot support them. Missing evidence is a named gap, never a zero. The
+   popover forecast is an ephemeral, strict projection from the companion's
+   narrow read-only weekly-pace endpoint. Request-time geometry is recalculated
+   from the retained strict forecast without rerunning accounting; it is never
+   stored, logged, exported, or added to community data. It contains no account
+   identity, plan claim, purchase flow, reset credits, or redemption action.
+   Right-click or Control-click opens the native action menu with **Open
+   TiboTattle**, state-aware **Analyze/Update Local
+   Usage**, Settings, About, update checks when available, and **Quit
+   TiboTattle**. Quit uses the same graceful shutdown as the window's own Quit
+   control.
+5. Choose **Open TiboTattle** and explicitly start local analysis.
 6. If the companion fails or exits, choose **Retry**. The app does not require
    a relaunch for ordinary recovery.
 7. Choose **Data & Diagnostics…** to see and copy a fixed, path-free diagnostic
@@ -266,9 +279,14 @@ it is deliberately isolated from the stable client:
 The command stages the bundle at
 `.release-build/macos-preview/current/TiboTattle Preview.app`, validates those
 boundaries, and reports its local path, integrity information, channel, and
-updater mode. Launching or replacing a preview therefore does not migrate,
-overwrite, read, reset, migrate, or delete stable application or Keychain
-state. The native plist seals the reviewed namespace/account pair to the
+updater mode. A newly installed Preview therefore starts without the stable
+app's derived index and must build its own schema-10 index from readable local
+source history. It is suitable for isolated product smoke, not for proving an
+in-place stable-data migration or immediate continuity of stable dashboard
+figures; use the signed `internal-dogfood` lane for that release gate, or
+rehearse migration against a disposable copy. Launching or replacing a preview
+does not migrate, overwrite, read, reset, or delete stable application or
+Keychain state. The native plist seals the reviewed namespace/account pair to the
 preview bundle identifier, and the companion accepts only that complete pair
 or stable's historical pair; arbitrary service/account input is rejected.
 

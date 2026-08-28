@@ -73,7 +73,9 @@ import {
   BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT,
 } from "./reporting/index.js";
 import {
+  isExactWeeklyPaceForecast,
   projectWeeklyPaceForecast,
+  projectWeeklyPaceOutlook,
   weeklyPaceSnapshotsFromCollectorRecord,
 } from "./weekly-pace-projection.js";
 import {
@@ -1440,6 +1442,7 @@ async function readCollectorProjection(
     throw fixedError("collector_unavailable");
   }
   if (state.status === "missing") {
+    const paceForecast = projectWeeklyPaceForecast({ nowMs });
     return {
       status: "missing",
       recordCount: 0,
@@ -1459,7 +1462,8 @@ async function readCollectorProjection(
         sparkQuota: [],
       },
       recordCounts: { usage: 0, quota: 0, tools: 0, other: 0 },
-      paceForecast: projectWeeklyPaceForecast({ nowMs }),
+      paceForecast,
+      paceOutlook: projectWeeklyPaceOutlook({ forecast: paceForecast, nowMs }),
     };
   }
   const periods = [
@@ -1641,6 +1645,7 @@ async function readCollectorProjection(
     observations: weeklyPaceSnapshots,
     nowMs,
   });
+  const paceOutlook = projectWeeklyPaceOutlook({ forecast: paceForecast, nowMs });
   const projection = {
     status: "available",
     recordCount,
@@ -1676,6 +1681,7 @@ async function readCollectorProjection(
     },
     recordCounts,
     paceForecast,
+    paceOutlook,
   };
   return projection;
 }
@@ -2412,6 +2418,9 @@ export async function buildLocalCompanionSnapshot({
   developmentSideChatHistoricalGapTimeZone = "America/New_York",
   developmentSideChatHistoricalGapAssumedSpeed = "fast",
   sideChatHistoricalGapCollector = collectHistoricalSideChatGapProbe,
+  unifiedProjectionReader = readLocalUnifiedCompanionProjection,
+  unifiedProjectionReuse = null,
+  signal = null,
   now = () => Date.now(),
 } = {}) {
   const nowMs = now();
@@ -2434,6 +2443,15 @@ export async function buildLocalCompanionSnapshot({
   }
   if (typeof sideChatEstimateCollector !== "function") {
     throw new TypeError("sideChatEstimateCollector must be a function");
+  }
+  if (typeof unifiedProjectionReader !== "function") {
+    throw new TypeError("unifiedProjectionReader must be a function");
+  }
+  if (signal !== null
+      && (typeof signal !== "object"
+        || typeof signal.aborted !== "boolean"
+        || typeof signal.addEventListener !== "function")) {
+    throw new TypeError("signal must be an AbortSignal or null");
   }
   if (developmentSideChatHistoricalGapDate !== null
       && (typeof developmentSideChatHistoricalGapDate !== "string"
@@ -2509,12 +2527,15 @@ export async function buildLocalCompanionSnapshot({
       accountingSourceMode === "legacy"
         ? readLocalArchiveAccountingPeriod({ indexFile: archiveIndexFile })
         : Promise.resolve({ status: "unavailable", period: null }),
-      readLocalUnifiedCompanionProjection({
-        indexFile: unifiedIndexFile,
-        nowMs,
-        declaredSpeedBaselines,
-        mode: unifiedProjectionMode,
-      }),
+      unifiedProjectionReader(
+        {
+          indexFile: unifiedIndexFile,
+          nowMs,
+          declaredSpeedBaselines,
+          mode: unifiedProjectionMode,
+        },
+        { signal, reuse: unifiedProjectionReuse },
+      ),
       sideChatEstimatePromise,
       sideChatHistoricalGapPromise,
     ]);
@@ -2713,6 +2734,7 @@ export async function buildLocalCompanionSnapshot({
   const weekly = {
     ...weeklyBase,
     paceForecast: collector.paceForecast,
+    paceOutlook: collector.paceOutlook,
   };
   const collectorLatestRecordAt = collector.latestRecordAt;
   const unifiedLatestExportableMs = accountingSourceMode === "unified"
@@ -3594,7 +3616,13 @@ function accountingEvidenceRows(accounting) {
 // so a newly added projection surface cannot reintroduce this class silently.
 const PROJECTION_SURFACES = Object.freeze([
   { path: Object.freeze(["gradient"]), rows: datasetRows },
-  { path: Object.freeze(["weekly"]), rows: datasetRows },
+  {
+    path: Object.freeze(["weekly"]),
+    rows: datasetRows,
+    // Calibration/history may be retained through a deferred generation, but
+    // these account-scoped quota readings must remain from the incoming build.
+    preserveIncomingKeys: Object.freeze(["paceForecast", "paceOutlook"]),
+  },
   { path: Object.freeze(["overview", "usage"]), rows: usagePeriodRows },
   { path: Object.freeze(["overview", "timeline", "usage"]), rows: arrayRows },
   { path: Object.freeze(["overview", "timeline", "sparkUsage"]), rows: arrayRows },
@@ -3688,7 +3716,22 @@ export class LocalCompanionDataStore {
   }
 
   async reload(options) {
+    const signal = options?.signal ?? null;
+    if (signal !== null
+        && (typeof signal !== "object"
+          || typeof signal.aborted !== "boolean"
+          || typeof signal.addEventListener !== "function")) {
+      throw new TypeError("options.signal must be an AbortSignal or null");
+    }
+    if (signal?.aborted === true) {
+      throw fixedError("local_companion_snapshot_reload_aborted");
+    }
     const candidate = await this.#builder(options);
+    // Cancellation may arrive while an off-main projection is finishing. Do
+    // not publish the candidate after the controller has cancelled its run.
+    if (signal?.aborted === true) {
+      throw fixedError("local_companion_snapshot_reload_aborted");
+    }
     if (!candidate || candidate.schemaVersion !== LOCAL_COMPANION_SCHEMA_VERSION) {
       throw fixedError("snapshot_invalid");
     }
@@ -3847,13 +3890,25 @@ export class LocalCompanionDataStore {
     const retained = this.#snapshot;
     if (retained === null) return next;
     let usageEvidenceRetained = false;
-    for (const { path, rows } of PROJECTION_SURFACES) {
+    for (const { path, rows, preserveIncomingKeys = [] }
+      of PROJECTION_SURFACES) {
       const key = path[path.length - 1];
       const nextParent = surfaceParent(next, path);
       const retainedParent = surfaceParent(retained, path);
       if (nextParent === null || retainedParent === null) continue;
       if (rows(nextParent[key]) === 0 && rows(retainedParent[key]) > 0) {
-        nextParent[key] = structuredClone(retainedParent[key]);
+        const incoming = nextParent[key];
+        const replacement = structuredClone(retainedParent[key]);
+        for (const incomingKey of preserveIncomingKeys) {
+          if (incoming !== null
+              && typeof incoming === "object"
+              && Object.hasOwn(incoming, incomingKey)) {
+            replacement[incomingKey] = structuredClone(incoming[incomingKey]);
+          } else {
+            delete replacement[incomingKey];
+          }
+        }
+        nextParent[key] = replacement;
         if (path.length === 2 && path[0] === "overview" && path[1] === "usage") {
           usageEvidenceRetained = true;
         }
@@ -3941,8 +3996,29 @@ export class LocalCompanionDataStore {
     return structuredClone(this.#required().gradient);
   }
 
-  getWeekly() {
-    return structuredClone(this.#required().weekly);
+  getWeekly({ nowMs = Date.now() } = {}) {
+    const weekly = structuredClone(this.#required().weekly);
+    if (isExactWeeklyPaceForecast(weekly?.paceForecast)) {
+      weekly.paceOutlook = projectWeeklyPaceOutlook({
+        forecast: weekly.paceForecast,
+        nowMs,
+      });
+    }
+    return weekly;
+  }
+
+  // Re-project request-time reset geometry from the strict small forecast;
+  // this neither reruns accounting nor clones the large weekly datasets.
+  getWeeklyPaceOutlook({ nowMs = Date.now() } = {}) {
+    const weekly = this.#required().weekly;
+    if (isExactWeeklyPaceForecast(weekly?.paceForecast)) {
+      return projectWeeklyPaceOutlook({
+        forecast: weekly.paceForecast,
+        nowMs,
+      });
+    }
+    const outlook = weekly?.paceOutlook;
+    return outlook === undefined ? null : structuredClone(outlook);
   }
 
   getQuality() {

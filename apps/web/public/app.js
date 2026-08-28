@@ -26,6 +26,7 @@ import {
   diagnosticSurface,
   historyIndexContinuationDecision,
   isContributionReviewableQueueState,
+  refreshQuickResultStatus,
   refreshNeedsContinuation,
   serviceRequestId,
   withContributionReviewDeadline,
@@ -11045,6 +11046,8 @@ async function requestRefresh({ autoContinue = false } = {}) {
       finalUnifiedIndex = refresh.result?.unifiedIndex ?? finalUnifiedIndex;
       const progress = refresh.progress ?? refresh.result?.indexing ?? null;
       const archiveScanning = progress?.kind === "archive_index";
+      const unifiedIndexScanning = progress?.kind === "unified_index"
+        && progress?.phase === "rollout_index";
       if (archiveScanning && !archiveHistoryScanActive) {
         archiveHistoryScanActive = true;
         if (dashboard) renderPricing(dashboard);
@@ -11074,7 +11077,12 @@ async function requestRefresh({ autoContinue = false } = {}) {
         : archiveScanning
           ? `Indexing archive history… ${elapsedLabel}`
         : progress?.phase === "quick_result"
-          ? `Headline ready; finishing deeper accounting… ${elapsedLabel}`
+          ? refreshQuickResultStatus({
+              dashboardLoaded: quickResultLoaded,
+              elapsedLabel,
+            })
+        : unifiedIndexScanning && (selected === null || selected === 0)
+          ? `Scanning local history… ${elapsedLabel}`
         : processed !== null && selected !== null
         ? selected > 0 && processed >= selected
           ? `Calculating usage and allowance… ${elapsedLabel}`

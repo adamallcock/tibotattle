@@ -1710,6 +1710,51 @@ test("data store retains its last good snapshot when a reload fails", async () =
   assert.equal(store.getOverview().marker, "last-good");
 });
 
+test("an aborted candidate cannot publish after its projection completes", async () => {
+  let calls = 0;
+  let releaseCandidate;
+  let candidateStarted;
+  const candidateGate = new Promise((resolve) => {
+    releaseCandidate = resolve;
+  });
+  const candidateEntered = new Promise((resolve) => {
+    candidateStarted = resolve;
+  });
+  const snapshot = (marker) => ({
+    schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+    mode: "real_local_evidence",
+    generatedAt: "2026-07-25T12:00:00.000Z",
+    overview: { marker },
+    gradient: {},
+    weekly: {},
+    quality: {},
+    reports: [],
+  });
+  const store = new LocalCompanionDataStore({
+    builder: async () => {
+      calls += 1;
+      if (calls === 1) return snapshot("last-good");
+      candidateStarted();
+      await candidateGate;
+      return snapshot("must-not-publish");
+    },
+  });
+  await store.reload();
+  const controller = new AbortController();
+  const reload = store.reload({
+    purpose: "full",
+    signal: controller.signal,
+  });
+  await candidateEntered;
+  controller.abort();
+  releaseCandidate();
+  await assert.rejects(
+    reload,
+    (error) => error?.code === "local_companion_snapshot_reload_aborted",
+  );
+  assert.equal(store.getOverview().marker, "last-good");
+});
+
 test("a deferred quick reload keeps the projection surfaces it cannot rebuild", async () => {
   // A quick reload is answered with a DEFERRED unified projection, whose
   // gradient/weekly datasets come back as empty arrays rather than absent.
@@ -1760,6 +1805,67 @@ test("a deferred quick reload keeps the projection surfaces it cannot rebuild", 
   await emptying.reload({ purpose: "full" });
   assert.equal(emptying.getGradient().datasets.rolling.length, 0);
   assert.equal(emptying.getWeekly().datasets.weekly_values.length, 0);
+});
+
+test("weekly pace reads re-project the strict forecast at request time", async () => {
+  const nowMs = Date.parse("2026-08-03T12:00:00.000Z");
+  const resetsAt = new Date(nowMs + 100 * 60 * 60_000).toISOString();
+  const forecast = {
+    schemaVersion: "local-weekly-pace-forecast-v0.2",
+    status: "will_reach_reset_first",
+    currentUsedPercent: 50,
+    remainingPercent: 50,
+    resetsAt,
+    pace: {
+      method: "median_adjacent_quota_slope",
+      sampleCount: 2,
+      elapsedHours: 2,
+      movementPp: 0.4,
+      activePercentagePointsPerHour: 0.2,
+      overallPercentagePointsPerHour: 0.2,
+    },
+    observationCount: 3,
+    etaAt: null,
+    hoursToExhaustion: null,
+    hoursToReset: 100,
+  };
+  let builds = 0;
+  const store = new LocalCompanionDataStore({
+    builder: async () => {
+      builds += 1;
+      return {
+        schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+        mode: "real_local_evidence",
+        generatedAt: new Date(nowMs).toISOString(),
+        overview: {},
+        gradient: {},
+        weekly: {
+          datasets: {},
+          paceForecast: forecast,
+          paceOutlook: { marker: "must-not-be-served" },
+        },
+        quality: {},
+        reports: [],
+      };
+    },
+  });
+  await store.reload();
+
+  const initial = store.getWeeklyPaceOutlook({ nowMs });
+  const oneHourLater = store.getWeeklyPaceOutlook({
+    nowMs: nowMs + 60 * 60_000,
+  });
+  assert.equal(builds, 1);
+  assert.equal(initial.status, "available");
+  assert.equal(initial.standing, "under");
+  assert.equal(initial.projection.hoursToReset, 100);
+  assert.equal(oneHourLater.projection.hoursToReset, 99);
+  assert.ok(oneHourLater.projection.sparePercent > initial.projection.sparePercent);
+  assert.deepEqual(
+    store.getWeekly({ nowMs: nowMs + 60 * 60_000 }).paceOutlook,
+    oneHourLater,
+  );
+  assert.doesNotMatch(JSON.stringify(oneHourLater), /marker|account|path/iu);
 });
 
 test("the unified index removes the 31-day ceiling and keeps fork replay out of the headline", async () => {
@@ -2254,6 +2360,33 @@ test("a deferred unified projection publishes a loading history receipt", async 
     assert.ok(snapshot.overview.warnings.some((warning) => (
       warning.includes("Full indexed history is loading")
     )));
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("snapshot construction delegates the selected unified projection mode", async () => {
+  const root = await fixtureRoot();
+  const calls = [];
+  const controller = new AbortController();
+  try {
+    await buildLocalCompanionSnapshot({
+      root,
+      unifiedProjectionMode: "deferred",
+      unifiedProjectionReader: async (options, controls) => {
+        calls.push({ options, controls });
+        return readLocalUnifiedCompanionProjection(options);
+      },
+      signal: controller.signal,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].options.mode, "deferred");
+    assert.equal(
+      calls[0].options.nowMs,
+      Date.parse("2026-07-25T12:00:00.000Z"),
+    );
+    assert.equal(calls[0].controls.signal, controller.signal);
   } finally {
     await rm(root, { recursive: true });
   }

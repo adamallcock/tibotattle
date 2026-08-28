@@ -15,6 +15,7 @@ import {
   createEventSink,
   defaultRebuildWorkerCount,
   lineageComponents,
+  localUnifiedIndexStageFile,
   persistingCollector,
   rebuildLocalUnifiedIndex,
   sourceIdentityForInfo,
@@ -22,6 +23,7 @@ import {
   sourcePhysicalIdentityToken,
   sourcePhysicalStateToken,
   surfaceRow,
+  validateLocalUnifiedIndexAttemptToken,
   writeCursorForOutcome,
 } from "./local-unified-index-build.js";
 import { createHistoryBaseSeedResolver } from "./local-unified-index-history.js";
@@ -44,6 +46,7 @@ import {
   recoverUnifiedIndexGenerations,
   readOrCreateDeviceSalt,
   readUnifiedIndexGenerationDescriptor,
+  removeAbandonedLocalUnifiedIndexStages,
   removeIfPresent,
   sessionLocal,
   snapshotLocal,
@@ -260,6 +263,8 @@ export async function ingestLocalUnifiedIndexIncrement({
   commitRows = 10_000,
   maximumLineBytes,
   coldBackfillWorkerCount = null,
+  coldRebuildIfMissing = false,
+  attemptToken = null,
   signal = null,
   onProgress = null,
   discoveryLimits = null,
@@ -278,6 +283,10 @@ export async function ingestLocalUnifiedIndexIncrement({
       `coldBackfillWorkerCount must be null or between 1 and ${MAXIMUM_COLD_BACKFILL_WORKERS}`,
     );
   }
+  if (typeof coldRebuildIfMissing !== "boolean") {
+    throw new TypeError("coldRebuildIfMissing must be a boolean");
+  }
+  validateLocalUnifiedIndexAttemptToken(attemptToken);
   const startedAt = performance.now();
   const resolvedIndexFile = resolve(indexFile);
   const existingIndexMetadata = await assertSafeLocalUnifiedIndexTarget(
@@ -286,7 +295,11 @@ export async function ingestLocalUnifiedIndexIncrement({
       allowMissing: true,
     },
   );
-  let coldRebuildReason = null;
+  let coldRebuildReason = process.platform !== "win32"
+      && existingIndexMetadata === null
+      && coldRebuildIfMissing
+    ? "missing_index"
+    : null;
   // Inspect only the SQLite header/meta needed to identify a pre-current index.
   // The normal reader intentionally rejects old source-identity contracts;
   // this narrow preflight must detect them before a device salt is created or
@@ -320,6 +333,9 @@ export async function ingestLocalUnifiedIndexIncrement({
       raw?.close();
     }
   }
+  await removeAbandonedLocalUnifiedIndexStages(resolvedIndexFile, {
+    activeAttemptToken: attemptToken,
+  });
   const deviceSalt = await readOrCreateDeviceSalt(
     secretFile ?? defaultLocalUnifiedIndexSecretPath(resolvedIndexFile),
   );
@@ -591,6 +607,7 @@ export async function ingestLocalUnifiedIndexIncrement({
       workerCount,
       commitRows,
       maximumLineBytes,
+      attemptToken,
       signal,
       onProgress,
       discoveryLimits,
@@ -614,7 +631,11 @@ export async function ingestLocalUnifiedIndexIncrement({
       totalBoundaryLinks: rebuilt.boundaryLinks ?? 0,
     };
   }
-  const stageFile = `${resolvedIndexFile}.incremental-${process.pid}-${Date.now().toString(36)}`;
+  const stageFile = localUnifiedIndexStageFile(
+    resolvedIndexFile,
+    "incremental",
+    attemptToken,
+  );
   await removeIfPresent(stageFile);
   let database = null;
   let writer = null;
@@ -1682,7 +1703,8 @@ export async function ingestLocalUnifiedIndexIncrement({
       fsyncPath: stageFile,
     });
     writer = null;
-    await publishStagedUnifiedIndex(stageFile, resolvedIndexFile);
+    if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+    await publishStagedUnifiedIndex(stageFile, resolvedIndexFile, { signal });
     return {
       status: "ingested",
       indexFile: resolvedIndexFile,
