@@ -1683,10 +1683,10 @@ function unifiedIndexDegradation(result) {
 }
 
 // A fresh unified index can require a full retained-history scan. Keep that
-// first publication bounded, but do not apply its two-hour recovery window to
+// first publication bounded, but do not apply its four-hour recovery window to
 // ordinary cursor-based incremental refreshes.
 export const LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS =
-  2 * 60 * 60_000;
+  4 * 60 * 60_000;
 export const LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS =
   LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS;
 
@@ -1733,7 +1733,7 @@ export class LocalCompanionRefreshController {
     if (!Number.isSafeInteger(timeoutMs)
         || timeoutMs < 1_000
         || timeoutMs > LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS) {
-      throw new TypeError("timeoutMs must be between 1,000 and 7,200,000");
+      throw new TypeError("timeoutMs must be between 1,000 and 14,400,000");
     }
     if (timeoutMsForRun !== null && typeof timeoutMsForRun !== "function") {
       throw new TypeError("timeoutMsForRun must be a function or null");
@@ -1839,7 +1839,7 @@ export class LocalCompanionRefreshController {
         || selectedTimeoutMs < 1_000
         || selectedTimeoutMs > LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS) {
       throw new TypeError(
-        "timeoutMsForRun must return between 1,000 and 7,200,000",
+        "timeoutMsForRun must return between 1,000 and 14,400,000",
       );
     }
     const startedAt = this.#clock();

@@ -113,7 +113,7 @@ function writeTimeoutClassifierIndex(indexFile, {
 
 test("refresh timeout classifier grants the cold window only to missing or proven migratable indexes", async () => {
   const root = await mkdtemp(join(tmpdir(), "local-timeout-classifier-"));
-  const freshTimeoutMs = 2 * 60 * 60_000;
+  const freshTimeoutMs = 14_400_000;
   const incrementalTimeoutMs = LOCAL_COMPANION_INCREMENTAL_REFRESH_TIMEOUT_MS;
   try {
     const missing = join(root, "missing.sqlite");
@@ -304,7 +304,7 @@ test("large legacy timeout classification never runs a synchronous integrity sca
     const startedAt = performance.now();
     assert.equal(
       localCompanionRefreshTimeoutForUnifiedIndex(indexFile, { openDatabase }),
-      2 * 60 * 60_000,
+      14_400_000,
     );
     const elapsedMs = performance.now() - startedAt;
     assert.equal(integrityScans, 0);

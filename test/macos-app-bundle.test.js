@@ -2013,7 +2013,7 @@ test("native refresh progress stays fixed-vocabulary and count-bounded", async (
   );
   assert.match(
     source,
-    /nativeRefreshMaximumPollSeconds = 2 \* 60 \* 60 \+ 60[\s\S]*?remainingAttempts: Self\.nativeRefreshMaximumPollAttempts/u,
+    /nativeRefreshMaximumPollSeconds = 4 \* 60 \* 60 \+ 60[\s\S]*?remainingAttempts: Self\.nativeRefreshMaximumPollAttempts/u,
   );
   assert.match(
     source,

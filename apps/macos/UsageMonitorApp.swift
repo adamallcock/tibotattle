@@ -3899,7 +3899,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     /// Opaque companion token for the particular refresh this surface started
     /// or joined. It is never persisted or exposed in UI/notification text.
     private var nativeRefreshID: String?
-    // A missing unified index receives the companion's bounded two-hour cold
+    // A missing unified index receives the companion's bounded four-hour cold
     // rebuild window. Keep native progress attached through that same window
     // plus one minute for cooperative worker shutdown and the terminal read;
     // the former 120 polls stopped after about 90 seconds and could label a
@@ -3909,7 +3909,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     /// attached until its terminal receipt without keeping the ordinary
     /// sub-second progress cadence alive indefinitely.
     private static let nativeRefreshSettlementPollIntervalMilliseconds = 5_000
-    private static let nativeRefreshMaximumPollSeconds = 2 * 60 * 60 + 60
+    private static let nativeRefreshMaximumPollSeconds = 4 * 60 * 60 + 60
     private static let nativeRefreshMaximumPollAttempts =
         nativeRefreshMaximumPollSeconds * 1_000
         / nativeRefreshPollIntervalMilliseconds

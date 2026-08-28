@@ -77,7 +77,11 @@ test("refresh controller admits the bounded fresh-index ceiling", () => {
   };
   assert.equal(
     LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS,
-    2 * 60 * 60_000,
+    14_400_000,
+  );
+  assert.equal(
+    LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS,
+    14_400_000,
   );
   assert.doesNotThrow(() => new LocalCompanionRefreshController({
     ...dependencies,
@@ -88,8 +92,13 @@ test("refresh controller admits the bounded fresh-index ceiling", () => {
       ...dependencies,
       timeoutMs: LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS + 1,
     }),
-    /7,200,000/u,
+    /14,400,000/u,
   );
+  const dynamicallyInvalid = new LocalCompanionRefreshController({
+    ...dependencies,
+    timeoutMsForRun: () => LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS + 1,
+  });
+  assert.throws(() => dynamicallyInvalid.start(), /14,400,000/u);
 });
 
 test("refresh controller resolves a fresh-state timeout for each run", async () => {
