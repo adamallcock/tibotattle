@@ -87,6 +87,7 @@ import {
   assertStableSparkleKeyContinuity,
   developerIDSignMacOSApp,
   developerIDSignMacOSDMG,
+  expectedMacOSPayloadNormalization,
   inspectMacOSApp,
   packageMacOSDMG,
   prepareMacOSReleaseCandidate,
@@ -242,6 +243,20 @@ function macOSArtifactTest(name, options, body) {
       : options.skip,
   }, body);
 }
+
+test("release validation retains historical signed native payload normalization", () => {
+  assert.equal(
+    expectedMacOSPayloadNormalization(
+      "Contents/Resources/app/node_modules/@github/keytar/"
+        + "prebuilds/darwin-arm64/keytar.node",
+    ),
+    "mach_o_without_code_signature",
+  );
+  assert.equal(
+    expectedMacOSPayloadNormalization("Contents/Resources/app/index.js"),
+    "raw",
+  );
+});
 
 test("reviewed product brand owns the native bundle and semantic-open identity", () => {
   assert.equal(Object.isFrozen(PRODUCT_BRAND), true);

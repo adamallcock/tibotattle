@@ -86,6 +86,23 @@ const NODE_ENTITLEMENTS = join(
 const APP_EXECUTABLE =
   `Contents/MacOS/${PRODUCT_BRAND.executableName}`;
 const NODE_EXECUTABLE = "Contents/Resources/runtime/bin/node";
+// Stable releases through 0.1.16 carried the signed Keytar native binding.
+// New builds no longer include it, but the release-site builder must continue
+// to validate the already-published artifact without treating its normalized
+// Mach-O inventory entry as raw bytes.
+const LEGACY_NORMALIZED_MACH_O_PATHS = Object.freeze([
+  [
+    "Contents",
+    "Resources",
+    "app",
+    "node_modules",
+    "@github",
+    "keytar",
+    "prebuilds",
+    "darwin-arm64",
+    "keytar.node",
+  ].join("/"),
+]);
 const SPARKLE_FRAMEWORK_PREFIX =
   "Contents/Frameworks/Sparkle.framework";
 const BASE_NORMALIZED_MACH_O_PATHS = Object.freeze([
@@ -100,7 +117,15 @@ const SPARKLE_NORMALIZED_MACH_O_PATHS = Object.freeze(
 const NORMALIZED_MACH_O_PATHS = new Set([
   ...BASE_NORMALIZED_MACH_O_PATHS,
   ...SPARKLE_NORMALIZED_MACH_O_PATHS,
+  ...LEGACY_NORMALIZED_MACH_O_PATHS,
 ]);
+
+export function expectedMacOSPayloadNormalization(path) {
+  return NORMALIZED_MACH_O_PATHS.has(path)
+    ? "mach_o_without_code_signature"
+    : "raw";
+}
+
 const REQUIRED_SIGNED_RELEASE_ASSURANCES = Object.freeze([
   "appNotarizationAccepted",
   "appTicketStapled",
@@ -665,9 +690,7 @@ async function verifyMacOSBuildPayload(appPath, manifest) {
       );
     }
     previousPath = entry.path;
-    const expectedNormalization = NORMALIZED_MACH_O_PATHS.has(entry.path)
-      ? "mach_o_without_code_signature"
-      : "raw";
+    const expectedNormalization = expectedMacOSPayloadNormalization(entry.path);
     if (!Number.isSafeInteger(entry.bytes)
         || entry.bytes < 0
         || typeof entry.mode !== "string"
