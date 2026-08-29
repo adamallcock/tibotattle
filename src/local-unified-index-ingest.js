@@ -61,6 +61,12 @@ const {
 const MINIMUM_AUTOMATIC_PARALLEL_BACKFILL_BYTES = 1024 * 1024 * 1024;
 const LOCAL_UNIFIED_INDEX_APPLICATION_ID = 0x554d5549;
 const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION = "local-unified-index-v1";
+// Physical v10 already carries the current rollout identity, snapshot,
+// quarantine, parser, and logical-schema semantics. Schema v11 adds only the
+// required cleanup indexes, so it can migrate on the staged incremental copy.
+// Versions through v9 still require the existing cold rebuild because their
+// fact or cursor semantics changed.
+const MINIMUM_ADDITIVE_INDEX_MIGRATION_USER_VERSION = 10;
 
 function assertKnownLocalUnifiedIndexIdentity(database) {
   const compatibility = assertLocalUnifiedIndexNotNewer(database, {
@@ -320,7 +326,7 @@ export async function ingestLocalUnifiedIndexIncrement({
       // for N+1 metadata is insufficient: an unrelated SQLite file has no
       // compatibility metadata and would otherwise pass this preflight.
       assertKnownLocalUnifiedIndexIdentity(raw);
-      if (userVersion !== LOCAL_UNIFIED_INDEX_USER_VERSION) {
+      if (userVersion < MINIMUM_ADDITIVE_INDEX_MIGRATION_USER_VERSION) {
         coldRebuildReason = "source_identity_changed";
       }
     } catch (error) {

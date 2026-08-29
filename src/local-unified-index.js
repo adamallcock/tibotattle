@@ -133,16 +133,18 @@ const INDEX_APPLICATION_ID = LOCAL_UNIFIED_INDEX_APPLICATION_ID;
 // generation-bound tool facts and widens the closed diagnostic vocabulary.
 // Each widening is additive except that closed diagnostic CHECK widening,
 // which is rebuilt transactionally while preserving every existing row.
-export const LOCAL_UNIFIED_INDEX_USER_VERSION = 10;
+// Version 11 (2026-08-28) makes the source- and quota-keyed usage indexes
+// required schema. Runtime quarantine cleanup needs both to remain bounded
+// after a deferred-index cold load.
+export const LOCAL_UNIFIED_INDEX_USER_VERSION = 11;
 const INDEX_USER_VERSION = LOCAL_UNIFIED_INDEX_USER_VERSION;
-const MIGRATABLE_USER_VERSIONS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+const MIGRATABLE_USER_VERSIONS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
 // Compatibility is persisted separately from PRAGMA user_version so a newer
 // writer can describe the oldest reader and writer that understand its
-// semantics.  The current format intentionally requires v10 for both: the v9
-// to v10 widening changes source-snapshot and quarantine authority, not just
-// optional columns.
-export const LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION = 10;
-export const LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION = 10;
+// semantics. The current format intentionally requires v11 for both: cleanup
+// query-plan bounds are part of safe staged publication, not optional tuning.
+export const LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION = 11;
+export const LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION = 11;
 const COMPATIBILITY_META_KEYS = Object.freeze({
   formatUserVersion: "compatibility_format_user_version",
   minimumReaderUserVersion: "compatibility_minimum_reader_user_version",
@@ -603,6 +605,10 @@ const SECONDARY_INDEX_SCHEMA = `
     ON usage_event(observed_at_ms);
   CREATE INDEX IF NOT EXISTS usage_event_session
     ON usage_event(session_local);
+  CREATE INDEX IF NOT EXISTS usage_event_source
+    ON usage_event(source_local);
+  CREATE INDEX IF NOT EXISTS usage_event_quota_observation
+    ON usage_event(quota_observation_id);
   CREATE INDEX IF NOT EXISTS usage_event_boundary_session
     ON usage_event_boundary(session_local);
   CREATE INDEX IF NOT EXISTS usage_event_replay_order
@@ -622,6 +628,8 @@ const SECONDARY_INDEX_SCHEMA = `
 const SECONDARY_INDEX_NAMES = Object.freeze([
   "usage_event_observed",
   "usage_event_session",
+  "usage_event_source",
+  "usage_event_quota_observation",
   "usage_event_boundary_session",
   "usage_event_replay_order",
   "quota_occurrence_canonical",
@@ -1092,9 +1100,8 @@ function compatibilityInteger(value) {
 
 /**
  * Read the bounded compatibility header without changing the database.
- * Missing metadata is accepted only as a transitional state for v10 files
- * created before these explicit keys shipped; the next writable open stamps
- * all three keys atomically.
+ * Missing metadata is accepted only on a recognized physical schema version;
+ * the next writable open migrates and stamps all three keys atomically.
  */
 export function readLocalUnifiedIndexCompatibility(database) {
   const applicationId = Number(
@@ -2490,6 +2497,11 @@ export function createUnifiedIndexWriter(database, {
     },
 
     deleteSourceFacts(sourceLocalKey, sessionLocalKey = null) {
+      // Source cleanup touches every large fact table and may probe canonical
+      // quota ownership once per affected observation. Schema v11 makes the
+      // supporting secondary indexes a precondition so no caller can
+      // accidentally reintroduce an unbounded scan on a deferred-index stage.
+      assertSecondaryIndexes(database);
       begin();
       const affectedQuotaIds = statements.affectedQuotaForSource
         .all(sourceLocalKey).map((row) => Number(row.id));

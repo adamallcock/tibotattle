@@ -15,11 +15,15 @@ part of this procedure.
 ## Choose the least invasive repair
 
 For a healthy index written by an older supported schema, the normal repair is
-to install a trusted compatible TiboTattle upgrade. The application migrates
-the index forward in one transaction and preserves its generation and rows.
-The shipped 0.1.16 app wrote schema 8; newer pre-release code may have written
-schema 9. The 0.1.17 migration accepts either supported predecessor as
-applicable and moves it to schema 10.
+to install a trusted compatible TiboTattle upgrade. The shipped 0.1.16 app wrote
+schema 8; newer pre-release code may have written schema 9 or schema 10. The
+application recognizes each supported predecessor read-only before choosing
+its staged path. Schema 8 and 9 predate the current source-identity contract,
+so normal ingestion rebuilds schema 11 from readable raw history and atomically
+publishes only a validated stage. Schema 10 already has current identity and
+parser semantics, so the app clones it and adds the schema-11 indexes without
+rescanning its sources, preserving its existing rows and generation through
+the migration.
 Schema changes between releases are ordinary embedded-database maintenance;
 silent downgrade, stamping old metadata onto a newer schema, or sharing one
 database between unrelated app channels is not.
@@ -29,16 +33,16 @@ minimum-reader requirement opens the file read-only, returns
 `local_unified_index_schema_newer`, and leaves the bytes unchanged. Install a
 newer compatible build.
 
-Do **not** reopen a migrated schema-10 index with shipped 0.1.16. That binary
-opens the database writable, may change SQLite journal mode before validation,
+Do **not** reopen a migrated schema-10 or schema-11 index with shipped 0.1.16.
+That binary opens the database writable, may change SQLite journal mode before validation,
 and returns only its older generic schema rejection. It does not implement the
 typed, byte-preserving newer-schema refusal described above. If rollback is
 required after migration, keep the app stopped and use the preserved
 pre-migration copy, a newer compatible build, or the explicit recovery process;
 do not point 0.1.16 at the migrated live index merely because it is signed.
 
-Use the explicit recovery command only when the normal transactional migration
-cannot complete, validation finds a derived-index problem, or an owner has
+Use the explicit recovery command only when the normal staged upgrade cannot
+complete, validation finds a derived-index problem, or an owner has
 chosen to rebuild the index from retained source history. Recovery is not a
 cache-clear button and never authorizes deletion of raw history, collector
 state, unrelated build residue, or rollback artifacts.
@@ -189,11 +193,11 @@ a separate explicit operation, not an automatic response to a failed refresh.
 
 ## Expected data-loss boundary
 
-A normal supported migration is lossless for the index rows it accepts and
-rolls back as one transaction on failure. Copy-first recovery preserves the
-original index twice before replacement: the consistent source backup and the
-exact pre-publish live copy. Rebuilding a derived index can omit only source
-events that are already absent, quarantined, malformed, or outside the
-collector's supported contract; validation reports partial generation reasons
-instead of presenting fabricated completeness. Raw source history is never
+A normal schema-10 additive migration is lossless for the index rows it accepts
+and rolls back as one transaction on failure. A normal schema-8/9 staged rebuild
+can omit only source events that are already absent, quarantined, malformed, or
+outside the collector's supported contract; validation reports partial
+generation reasons instead of presenting fabricated completeness. Copy-first
+recovery preserves the original index twice before replacement: the consistent
+source backup and the exact pre-publish live copy. Raw source history is never
 deleted by this command.

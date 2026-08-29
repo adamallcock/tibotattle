@@ -280,7 +280,7 @@ The command stages the bundle at
 `.release-build/macos-preview/current/TiboTattle Preview.app`, validates those
 boundaries, and reports its local path, integrity information, channel, and
 updater mode. A newly installed Preview therefore starts without the stable
-app's derived index and must build its own schema-10 index from readable local
+app's derived index and must build its own schema-11 index from readable local
 source history. It is suitable for isolated product smoke, not for proving an
 in-place stable-data migration or immediate continuity of stable dashboard
 figures; use the signed `internal-dogfood` lane for that release gate, or

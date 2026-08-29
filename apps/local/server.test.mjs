@@ -140,6 +140,19 @@ test("refresh timeout classifier grants the cold window only to missing or prove
         expected: freshTimeoutMs,
       },
       {
+        name: "schema10-v2.sqlite",
+        options: {
+          userVersion: 10,
+          schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+          compatibility: {
+            compatibility_format_user_version: "10",
+            compatibility_minimum_reader_user_version: "10",
+            compatibility_minimum_writer_user_version: "10",
+          },
+        },
+        expected: freshTimeoutMs,
+      },
+      {
         name: "current.sqlite",
         options: {
           userVersion: LOCAL_UNIFIED_INDEX_USER_VERSION,

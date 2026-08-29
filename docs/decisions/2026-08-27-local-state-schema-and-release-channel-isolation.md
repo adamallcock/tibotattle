@@ -7,6 +7,11 @@ status: accepted
 
 # Local state schema and macOS release-channel isolation
 
+> **Current schema amendment:** the Preview/stable identity boundary in this
+> decision remains current. Its schema-10 target is a predecessor to the
+> accepted [schema-11 cleanup-index decision](./2026-08-28-local-unified-index-v11-cleanup-indexes.md),
+> which is the physical format for the final 0.1.17 candidate.
+
 ## Context
 
 An ad-hoc `preview_distribution` build of TiboTattle 0.1.16 was installed at
@@ -30,7 +35,8 @@ healthy generation with 623,104 usage events, 842,959 quota occurrences, and
 800,028 typed tool facts. A transactional schema 9 to 10 migration and a
 generation-bound accounting rebuild on the copy preserved those counts. The
 shipping upgrade path must also begin from the schema-8 format actually emitted
-by 0.1.16; current migration code accepts schema 8 or 9 as applicable.
+by 0.1.16. This decision accepted schema 8 or 9 as recognized transition
+inputs; the final schema-11 candidate additionally accepts schema 10.
 
 ## Decision
 
@@ -63,7 +69,9 @@ preview may not read, migrate, reset, delete, write, or claim stable state.
 minimum-writer versions in its metadata. Compatibility-aware code inspects both
 layers through a read-only handle before opening an existing file writable.
 
-- A known older version migrates forward inside one transaction.
+- A known older version is never modified in place. The app either migrates a
+  staged copy transactionally or, when source-identity semantics changed,
+  rebuilds a validated current-schema stage from readable raw history.
 - A newer format or a reader/writer requirement above the running binary is a
   typed `local_unified_index_schema_newer` outcome.
 - A newer-schema refusal is byte-for-byte non-mutating. The app never stamps
@@ -79,6 +87,10 @@ lacks the typed newer-schema outcome and may touch SQLite journal mode before
 its generic rejection. Rollback therefore uses a preserved pre-migration copy,
 a newer compatible build, or the explicit receipt-bound recovery path; it does
 not point 0.1.16 at migrated v10 state.
+
+The same boundary applies after the final schema-11 migration. Schema 10 is a
+supported input to the newer compatibility-aware migration; it is no longer
+the final 0.1.17 physical format.
 
 This is normal embedded-database practice: forward migrations are expected;
 silent downgrade and arbitrary cross-version writes are not.
@@ -137,11 +149,11 @@ grammar.
 
 ## Consequences
 
-- Installing a stable compatible upgrade preserves and migrates local data;
-  no reset or database deletion is expected.
+- Installing a stable compatible upgrade advances local data through a staged
+  migration or staged rebuild; no reset or database deletion is expected.
 - Compatibility-aware builds report a newer index actionably and, when
   available, may show a clearly retained projection. Shipped 0.1.16 is excluded
-  from this guarantee and must not be reopened against migrated schema 10.
+  from this guarantee and must not be reopened against migrated schema 10 or 11.
 - Development and preview work can no longer overwrite or silently share the
   stable application or its state.
 - Source fixes, a locally built artifact, signed installation, appcast
@@ -154,3 +166,4 @@ grammar.
 - [macOS stable release runbook](../runbooks/macos-stable-release-runbook.md)
 - [Unified local index schema](../design/2026-08-06-unified-local-index-schema.md)
 - [Local unified-index recovery](../runbooks/2026-08-27-local-unified-index-recovery.md)
+- [Local unified index v11 cleanup indexes](./2026-08-28-local-unified-index-v11-cleanup-indexes.md)

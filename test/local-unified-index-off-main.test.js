@@ -34,6 +34,8 @@ import {
   localUnifiedIndexStageFile,
 } from "../src/local-unified-index-build.js";
 import {
+  LOCAL_UNIFIED_INDEX_USER_VERSION,
+  openLocalUnifiedIndex,
   removeExactLocalUnifiedIndexAttemptStages,
   removeAbandonedLocalUnifiedIndexStages,
 } from "../src/local-unified-index.js";
@@ -121,6 +123,24 @@ test("native unified ingestion completes a cold rebuild and forwards progress", 
     assert.equal(result.workerCount, 1);
     assert.equal(result.sourcesScanned, 1);
     assert.equal(progress.length > 0, true);
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), {
+      readOnly: true,
+    });
+    try {
+      assert.equal(Number(database.prepare(
+        "PRAGMA user_version",
+      ).get().user_version), LOCAL_UNIFIED_INDEX_USER_VERSION);
+      assert.deepEqual(database.prepare(`
+        SELECT name FROM sqlite_master
+        WHERE type = 'index' AND name IN (
+          'usage_event_source', 'usage_event_quota_observation')
+        ORDER BY name`).all().map((row) => row.name), [
+        "usage_event_quota_observation",
+        "usage_event_source",
+      ]);
+    } finally {
+      database.close();
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -177,6 +197,58 @@ test("the Darwin cold default leaves an existing index on incremental ingest", {
     assert.equal(second.rebuildReason, undefined);
     assert.equal(second.sourcesResumed, 1);
     assert.equal(second.sourcesRescanned, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Darwin off-main ingestion migrates v10 indexes without a cold rebuild", {
+  skip: process.platform !== "darwin",
+}, async () => {
+  const root = await createRolloutRoot("unified-index-off-main-v10-");
+  const indexFile = join(root, "index.sqlite");
+  try {
+    const first = await ingestLocalUnifiedIndexOffMain({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(first.rebuilt, true);
+
+    const old = openLocalUnifiedIndex(indexFile, { readOnly: false });
+    old.exec(`
+      BEGIN IMMEDIATE;
+      DROP INDEX usage_event_source;
+      DROP INDEX usage_event_quota_observation;
+      UPDATE meta SET value = '10'
+      WHERE key IN (
+        'compatibility_format_user_version',
+        'compatibility_minimum_reader_user_version',
+        'compatibility_minimum_writer_user_version');
+      PRAGMA user_version=10;
+      COMMIT;
+    `);
+    old.close();
+
+    const migrated = await ingestLocalUnifiedIndexOffMain({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(migrated.rebuilt, undefined);
+    assert.equal(migrated.rebuildReason, undefined);
+    assert.equal(migrated.sourcesScanned, 0);
+    assert.equal(migrated.totalUsageEvents, 1);
+    const current = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.equal(Number(current.prepare(
+        "PRAGMA user_version",
+      ).get().user_version), LOCAL_UNIFIED_INDEX_USER_VERSION);
+    } finally {
+      current.close();
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -1144,6 +1144,12 @@ export async function rebuildLocalUnifiedIndex({
 
   const invalidRolloutIds = new Set();
   const invalidSessionIds = new Set();
+  // One entry at most per discovered source. Runtime quarantine can be
+  // detected only after that source has already emitted facts, but a cold
+  // stage intentionally has no secondary indexes while parser lanes load.
+  // Retain only the bounded metadata needed to remove and cursor the source
+  // after those indexes exist; no record content is kept here.
+  const pendingQuarantineCleanup = new Map();
   function dependencyUnavailable(info) {
     const baseId = info.lineage?.historyBase?.rolloutId ?? null;
     if (baseId !== null && invalidRolloutIds.has(baseId)) return true;
@@ -1159,23 +1165,46 @@ export async function rebuildLocalUnifiedIndex({
     }
   }
 
-  function quarantineSource(info, state, reason, sourceDiagnostics = {}) {
-    writer.deleteSourceFacts(state.sourceLocal, state.sessionLocal);
+  function writeQuarantineCursor(info, state, reason) {
+    if (reason !== "codex_rollout_content_invalid"
+        && reason !== "codex_rollout_tail_incomplete"
+        && reason !== "codex_rollout_lineage_invalid") return;
+    writeCursorForOutcome(writer, deviceSalt, info, state, {
+      nextOffset: 0,
+      finalModel: null,
+      finalEffort: null,
+      finalTierRaw: null,
+      finalTierObservedAtMs: null,
+      finalTotals: null,
+      turnContextSeen: false,
+      snapshotsPersisted: false,
+      quarantineCode: reason,
+    });
+  }
+
+  function quarantineSource(
+    info,
+    state,
+    reason,
+    sourceDiagnostics = {},
+    { factsMayExist = true } = {},
+  ) {
     sink.discardSource(state);
-    if (reason === "codex_rollout_content_invalid"
-        || reason === "codex_rollout_tail_incomplete"
-        || reason === "codex_rollout_lineage_invalid") {
-      writeCursorForOutcome(writer, deviceSalt, info, state, {
-        nextOffset: 0,
-        finalModel: null,
-        finalEffort: null,
-        finalTierRaw: null,
-        finalTierObservedAtMs: null,
-        finalTotals: null,
-        turnContextSeen: false,
-        snapshotsPersisted: false,
-        quarantineCode: reason,
+    markUnavailable(info);
+    if (deferSecondaryIndexes && factsMayExist) {
+      pendingQuarantineCleanup.set(state.sourceLocal.toString("hex"), {
+        info,
+        state,
+        reason,
       });
+    } else {
+      // Discovery/dependency quarantines have emitted no staged facts and can
+      // write their terminal cursor immediately. Runtime quarantines clean up
+      // immediately only when the database already has its secondary indexes.
+      if (factsMayExist) {
+        writer.deleteSourceFacts(state.sourceLocal, state.sessionLocal);
+      }
+      writeQuarantineCursor(info, state, reason);
     }
     writer.writeSourceDiagnostics(state.sourceLocal, sourceDiagnostics);
     writer.writeGenerationSource({
@@ -1190,7 +1219,6 @@ export async function rebuildLocalUnifiedIndex({
       diagnosticsComplete: true,
     });
     recordRuntimeIssue(info, reason, state);
-    markUnavailable(info);
   }
 
   const bySessionId = new Map();
@@ -1246,6 +1274,8 @@ export async function rebuildLocalUnifiedIndex({
                 info,
                 state,
                 "codex_rollout_lineage_invalid",
+                {},
+                { factsMayExist: false },
               );
               queueProgress();
               continue;
@@ -1419,6 +1449,7 @@ export async function rebuildLocalUnifiedIndex({
                 state,
                 message.quarantineReason,
                 sourceDiagnostics,
+                { factsMayExist: sourceWasScanned },
               );
               queueProgress();
               return;
@@ -1470,6 +1501,23 @@ export async function rebuildLocalUnifiedIndex({
       // depend on them.
       writer.flush();
       createLocalUnifiedIndexSecondaryIndexes(database);
+      if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+      // Cleanup begins only after schema-v11's exact supporting indexes exist.
+      // Failed generation rows and public progress were already updated when
+      // quarantine was detected, but no bad fact can reach finalization.
+      for (const cleanup of pendingQuarantineCleanup.values()) {
+        if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+        writer.deleteSourceFacts(
+          cleanup.state.sourceLocal,
+          cleanup.state.sessionLocal,
+        );
+        writeQuarantineCursor(
+          cleanup.info,
+          cleanup.state,
+          cleanup.reason,
+        );
+      }
+      writer.flush();
     }
     writer.writeMeta("source_count", discovery.discoveredSourceCount);
     writer.writeMeta("source_bytes", sourceBytes);
