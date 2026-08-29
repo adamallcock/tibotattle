@@ -47,6 +47,10 @@ test("checked-in staging configuration is closed and intentionally unprovisioned
 
 test("migration inventory is exact and rejects missing or unreviewed files", () => {
   const inventory = structuredClone(EXPECTED_STAGING_MIGRATIONS);
+  assert.equal(
+    inventory.USAGE_MONITOR_DB.at(-1),
+    "0041_community_model_composition_cache.sql",
+  );
   assert.deepEqual(validateStagingMigrationInventory(inventory), {
     ok: true,
     code: null,

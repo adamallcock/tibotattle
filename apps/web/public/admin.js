@@ -6,7 +6,11 @@ import {
   projectAdminMetricsHistory,
   projectAdminOverview,
 } from "./admin-client.js";
-import { formatNumber, formatReportingTime } from "./ui-format.js";
+import {
+  formatModelName,
+  formatNumber,
+  formatReportingTime,
+} from "./ui-format.js";
 
 const state = {
   csrfToken: "",
@@ -20,6 +24,7 @@ const state = {
   allowancePreview: null,
   allowanceMode: "combined",
   allowancePlanFilter: null,
+  allowanceModelFilter: null,
   allowanceRangeDays: 30,
   notificationPreferences: null,
   metricsHistory: undefined,
@@ -2190,9 +2195,10 @@ function scheduleRefresh({ retry = false } = {}) {
 const ADMIN_ALLOWANCE_DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
 const ADMIN_ALLOWANCE_CHART_WIDTH = 960;
 const ADMIN_ALLOWANCE_CHART_HEIGHT = 300;
+const ADMIN_ALLOWANCE_MODES = new Set(["combined", "plans", "model"]);
 const ADMIN_ALLOWANCE_PLAN_STYLES = Object.freeze({
   pro: Object.freeze({ label: "Pro 20x", className: "pro" }),
-  prolite: Object.freeze({ label: "Pro 5x → 20x", className: "prolite" }),
+  prolite: Object.freeze({ label: "ProLite → Pro 20x", className: "prolite" }),
   plus: Object.freeze({ label: "Plus → 20x", className: "plus" }),
 });
 
@@ -2236,12 +2242,15 @@ function adminAllowanceSegments(points) {
 export function adminAllowanceChartModel(preview, {
   mode = "combined",
   planFilter = null,
+  modelFilter = null,
   rangeDays = 30,
   width = ADMIN_ALLOWANCE_CHART_WIDTH,
   height = ADMIN_ALLOWANCE_CHART_HEIGHT,
 } = {}) {
   if (!preview || !Array.isArray(preview.days) || preview.days.length === 0
-      || (mode !== "combined" && mode !== "plans")) {
+      || !Array.isArray(preview.plans)
+      || !Array.isArray(preview.models)
+      || (mode !== "combined" && mode !== "plans" && mode !== "model")) {
     return null;
   }
   const anchor = preview.days.at(-1).day;
@@ -2257,19 +2266,33 @@ export function adminAllowanceChartModel(preview, {
     key: plan.planType,
     ...ADMIN_ALLOWANCE_PLAN_STYLES[plan.planType],
   }));
+  const modelSeries = preview.models.map((model, index) => ({
+    key: model.modelId,
+    label: formatModelName(model.modelId),
+    className: `model-${index}`,
+  }));
   const activePlanFilter = mode === "plans"
     && planSeries.some((plan) => plan.key === planFilter)
     ? planFilter
     : null;
+  const activeModelFilter = mode === "model"
+    && modelSeries.some((model) => model.key === modelFilter)
+    ? modelFilter
+    : null;
   const legendSeries = mode === "combined"
     ? [{ key: "combined", label: "Combined", className: "combined" }]
-    : planSeries;
-  const series = activePlanFilter === null
-    ? legendSeries
-    : planSeries.filter((plan) => plan.key === activePlanFilter);
-  const summaryFor = (day, key) => (
-    key === "combined" ? day.combined : day.byPlanType[key]
-  );
+    : mode === "plans"
+      ? planSeries
+      : modelSeries;
+  const series = mode === "plans" && activePlanFilter !== null
+    ? planSeries.filter((plan) => plan.key === activePlanFilter)
+    : mode === "model" && activeModelFilter !== null
+      ? modelSeries.filter((model) => model.key === activeModelFilter)
+      : legendSeries;
+  const summaryFor = (day, key) => {
+    if (mode === "combined") return day.combined;
+    return mode === "plans" ? day.byPlanType[key] : day.byModelId[key];
+  };
   let visibleValueCount = 0;
   const valueCandidates = [];
   for (const day of days) {
@@ -2279,9 +2302,9 @@ export function adminAllowanceChartModel(preview, {
         visibleValueCount += 1;
       }
     }
-    // Keep the numerical y-axis fixed while the operator switches between
-    // Combined and By plan. Otherwise the same vertical movement could appear
-    // larger merely because a different series changed the automatic scale.
+    // Keep the numerical y-axis fixed while the operator switches between all
+    // three views. Otherwise the same vertical movement could appear larger
+    // merely because a different series changed the automatic scale.
     if (day.combined.centralUsd !== null) {
       valueCandidates.push(day.combined.centralUsd);
       if (day.combined.band80Usd !== null) {
@@ -2300,8 +2323,20 @@ export function adminAllowanceChartModel(preview, {
         );
       }
     }
+    for (const model of preview.models) {
+      const summary = day.byModelId[model.modelId];
+      const central = summary?.centralUsd;
+      if (central !== null && central !== undefined) valueCandidates.push(central);
+      if (summary?.band80Usd !== null && summary?.band80Usd !== undefined) {
+        valueCandidates.push(
+          summary.band80Usd.lowerUsd,
+          summary.band80Usd.upperUsd,
+        );
+      }
+    }
   }
-  if (visibleValueCount === 0 || valueCandidates.length === 0) return null;
+  if ((visibleValueCount === 0 && mode !== "model")
+      || valueCandidates.length === 0) return null;
   const margin = { top: 16, right: 24, bottom: 34, left: 64 };
   const plot = {
     top: margin.top,
@@ -2333,8 +2368,10 @@ export function adminAllowanceChartModel(preview, {
       return [{
         day: day.day,
         value: summary.centralUsd,
-        fitCount: summary.fitCount,
-        participantCount: summary.participantCount,
+        ...(mode === "model" ? {} : {
+          fitCount: summary.fitCount,
+          participantCount: summary.participantCount,
+        }),
         x: x(day.day),
         y: y(summary.centralUsd),
       }];
@@ -2377,6 +2414,8 @@ export function adminAllowanceChartModel(preview, {
     tickLabelStyle: days.length > 45 ? "month" : "day",
     mode,
     activePlanFilter,
+    activeModelFilter,
+    visibleValueCount,
     legendSeries,
     series: modeledSeries,
     bandSeries,
@@ -2391,6 +2430,15 @@ export function toggleAdminAllowancePlanFilter(
 ) {
   if (!plans.some((plan) => plan.planType === selectedPlanType)) return null;
   return currentPlanType === selectedPlanType ? null : selectedPlanType;
+}
+
+export function toggleAdminAllowanceModelFilter(
+  currentModelId,
+  selectedModelId,
+  models,
+) {
+  if (!models.some((model) => model.modelId === selectedModelId)) return null;
+  return currentModelId === selectedModelId ? null : selectedModelId;
 }
 function adminAllowanceSvg(tag, className = "", attributes = {}) {
   const element = document.createElementNS(SVG_NAMESPACE, tag);
@@ -2409,6 +2457,12 @@ function latestAllowanceSummary(preview, key) {
   return null;
 }
 
+function latestModelAllowanceSummary(preview, modelId) {
+  const latest = preview.days.at(-1);
+  const summary = latest?.byModelId[modelId];
+  return summary === undefined ? null : { day: latest.day, summary };
+}
+
 function allowanceUsd(value) {
   return new Intl.NumberFormat(undefined, {
     style: "currency",
@@ -2424,37 +2478,54 @@ function allowanceCountLabel(value, singular) {
 function appendAdminAllowanceLegend(figure, model) {
   const legend = document.createElement("div");
   legend.className = "admin-allowance-legend";
-  if (model.mode === "plans") {
+  const filterType = model.mode === "plans"
+    ? "plan"
+    : model.mode === "model"
+      ? "model"
+      : null;
+  const activeFilter = filterType === "plan"
+    ? model.activePlanFilter
+    : model.activeModelFilter;
+  if (filterType !== null) {
     legend.classList.add("admin-allowance-legend-interactive");
-    if (model.activePlanFilter !== null) {
+    if (activeFilter !== null) {
       legend.classList.add("admin-allowance-legend-filtered");
     }
     legend.setAttribute("role", "group");
-    legend.setAttribute("aria-label", "Filter allowance chart by plan");
+    legend.setAttribute(
+      "aria-label",
+      `Filter allowance chart by ${filterType}`,
+    );
   }
   for (const series of model.legendSeries) {
-    const item = document.createElement(model.mode === "plans" ? "button" : "span");
-    if (model.mode === "plans") {
-      const selected = model.activePlanFilter === series.key;
+    const item = document.createElement(filterType === null ? "span" : "button");
+    if (filterType !== null) {
+      const selected = activeFilter === series.key;
       item.type = "button";
       item.className = "admin-allowance-legend-button";
-      item.dataset.allowancePlan = series.key;
+      if (filterType === "plan") item.dataset.allowancePlan = series.key;
+      else item.dataset.allowanceModel = series.key;
       item.setAttribute("aria-pressed", String(selected));
       item.setAttribute(
         "aria-label",
-        selected ? `Show all plans` : `Show only ${series.label}`,
+        selected
+          ? `Show all ${filterType === "plan" ? "plans" : "models"}`
+          : `Show only ${series.label}`,
       );
       item.title = selected
-        ? "Show all plans"
+        ? `Show all ${filterType === "plan" ? "plans" : "models"}`
         : `Filter chart to ${series.label}`;
     }
     const swatch = document.createElement("span");
     swatch.className = model.mode === "plans"
       ? `admin-allowance-plan-key admin-allowance-plan-key-${series.className}`
-      : `admin-allowance-swatch admin-allowance-swatch-${series.className}`;
+      : model.mode === "model"
+        ? `admin-allowance-model-key admin-allowance-model-key-${series.className}`
+        : `admin-allowance-swatch admin-allowance-swatch-${series.className}`;
     swatch.setAttribute("aria-hidden", "true");
     const label = document.createElement("span");
     label.textContent = series.label;
+    if (model.mode === "model") label.title = series.key;
     item.append(swatch, label);
     legend.append(item);
   }
@@ -2475,29 +2546,42 @@ function appendAdminAllowanceChart(container, preview) {
   const model = adminAllowanceChartModel(preview, {
     mode: state.allowanceMode,
     planFilter: state.allowancePlanFilter,
+    modelFilter: state.allowanceModelFilter,
     rangeDays: state.allowanceRangeDays,
   });
   if (model === null) {
     const empty = document.createElement("p");
     empty.className = "admin-allowance-empty";
-    empty.textContent = "No qualifying fits in this range.";
+    empty.textContent = state.allowanceMode === "model"
+      ? "Unavailable"
+      : "No qualifying fits in this range.";
     container.append(empty);
     return;
   }
   const figure = document.createElement("div");
   figure.className = "community-daily-chart community-allowance-chart";
-  if (model.activePlanFilter !== null) {
+  if (model.activePlanFilter !== null || model.activeModelFilter !== null) {
     figure.classList.add("community-allowance-chart-filtered");
   }
   appendAdminAllowanceLegend(figure, model);
+  if (model.mode === "model" && model.visibleValueCount === 0) {
+    const empty = document.createElement("p");
+    empty.className = "admin-allowance-chart-empty";
+    empty.textContent = "Unavailable";
+    figure.append(empty);
+  }
   const svg = adminAllowanceSvg("svg", "", {
     viewBox: `0 0 ${model.width} ${model.height}`,
     role: "img",
     "aria-label": state.allowanceMode === "combined"
       ? "Combined Pro 20x-equivalent community allowance by day"
-      : model.activePlanFilter === null
-        ? "Pro 20x-equivalent community allowance by plan and day"
-        : `${model.series[0].label} Pro 20x-equivalent community allowance by day`,
+      : state.allowanceMode === "plans"
+        ? model.activePlanFilter === null
+          ? "Pro 20x-equivalent community allowance by plan and day"
+          : `${model.series[0].label} Pro 20x-equivalent community allowance by day`
+        : model.activeModelFilter === null
+          ? "Equivalent Pro 20x API value by single-model scenario and day"
+          : `Equivalent Pro 20x API value if all usage were ${model.series[0].label}, by day`,
   });
   for (const tick of model.dollarTicks) {
     svg.append(adminAllowanceSvg("line", "chart-grid", {
@@ -2567,19 +2651,30 @@ function appendAdminAllowanceChart(container, preview) {
       }
     }
     for (const point of series.points) {
+      const pointEvidence = model.mode === "model"
+        ? ""
+        : [
+          allowanceCountLabel(point.participantCount, "account"),
+          allowanceCountLabel(point.fitCount, "fit"),
+        ].join(", ");
+      const ariaLabel = `${series.label}, ${point.day}: ${allowanceUsd(point.value)}`;
       const dot = adminAllowanceSvg(
         "circle",
         `admin-allowance-dot admin-allowance-dot-${series.className}`,
         {
           cx: point.x,
           cy: point.y,
-          r: Math.min(6, 2.4 + Math.sqrt(point.fitCount)),
+          r: model.mode === "model"
+            ? 4
+            : Math.min(6, 2.4 + Math.sqrt(point.fitCount)),
           tabindex: 0,
-          "aria-label": `${series.label}, ${point.day}: ${allowanceUsd(point.value)}, ${allowanceCountLabel(point.participantCount, "account")}, ${allowanceCountLabel(point.fitCount, "fit")}`,
+          "aria-label": pointEvidence ? `${ariaLabel}, ${pointEvidence}` : ariaLabel,
         },
       );
       const title = adminAllowanceSvg("title");
-      title.textContent = `${series.label} · ${point.day} · ${allowanceUsd(point.value)} · ${allowanceCountLabel(point.participantCount, "account")} · ${allowanceCountLabel(point.fitCount, "fit")}`;
+      title.textContent = pointEvidence
+        ? `${series.label} · ${point.day} · ${allowanceUsd(point.value)} · ${pointEvidence}`
+        : `${series.label} · ${point.day} · ${allowanceUsd(point.value)}`;
       dot.append(title);
       svg.append(dot);
     }
@@ -2654,6 +2749,52 @@ function appendPlanAllowanceSummaries(container, preview) {
   container.append(list);
 }
 
+function appendModelAllowanceSummaries(container, preview) {
+  const list = document.createElement("div");
+  list.className = "admin-allowance-model-summaries";
+  for (const model of preview.models) {
+    const latest = latestModelAllowanceSummary(preview, model.modelId);
+    if (latest === null) continue;
+    const modelName = formatModelName(model.modelId);
+    const { summary } = latest;
+    const item = document.createElement("div");
+    item.className = "admin-allowance-model-summary";
+    if (state.allowanceModelFilter === model.modelId) {
+      item.classList.add("admin-allowance-model-summary-selected");
+    }
+    const label = document.createElement("span");
+    label.textContent = modelName;
+    label.title = model.modelId;
+    const value = document.createElement("strong");
+    value.textContent = summary.status === "fitted"
+      ? allowanceUsd(summary.centralUsd)
+      : "Unavailable";
+    const scenario = document.createElement("small");
+    scenario.className = "admin-allowance-model-scenario";
+    scenario.textContent = `Equivalent Pro 20x API value if all usage were ${modelName}.`;
+    const date = document.createElement("small");
+    date.className = "admin-allowance-model-date";
+    date.textContent = latest.day;
+    item.append(label, value, scenario, date);
+    list.append(item);
+  }
+  container.append(list);
+}
+
+function appendModelAllowanceEvidence(container) {
+  const panel = document.createElement("div");
+  panel.className = "admin-allowance-model-evidence";
+  const heading = document.createElement("p");
+  heading.className = "admin-allowance-model-evidence-heading";
+  heading.textContent = "Model value basis";
+  const basis = document.createElement("p");
+  basis.textContent = "Each point is the Pro 20x-equivalent API value if all usage were that model.";
+  const normalization = document.createElement("p");
+  normalization.textContent = "Plan normalization: Pro ×1 · ProLite ×4 · Plus ×20.";
+  panel.append(heading, basis, normalization);
+  container.append(panel);
+}
+
 function appendAllowanceCoverage(container, coverage) {
   const panel = document.createElement("div");
   panel.className = "admin-allowance-coverage";
@@ -2716,12 +2857,19 @@ function renderAdminCommunityAllowance(preview) {
   if (!preview.plans.some((plan) => plan.planType === state.allowancePlanFilter)) {
     state.allowancePlanFilter = null;
   }
+  if (!preview.models.some((model) => model.modelId === state.allowanceModelFilter)) {
+    state.allowanceModelFilter = null;
+  }
   if (state.allowanceMode === "combined") {
     appendCombinedAllowanceSummary(container, preview);
-  } else {
+    appendAllowanceCoverage(container, preview.coverage);
+  } else if (state.allowanceMode === "plans") {
     appendPlanAllowanceSummaries(container, preview);
+    appendAllowanceCoverage(container, preview.coverage);
+  } else {
+    appendModelAllowanceSummaries(container, preview);
+    appendModelAllowanceEvidence(container);
   }
-  appendAllowanceCoverage(container, preview.coverage);
   appendAdminAllowanceChart(container, preview);
   renderAdminAllowanceControls();
 }
@@ -2937,7 +3085,7 @@ if (isAdminPage) {
   window.addEventListener("focus", updateNotificationControls);
   $("#admin-community-mode-controls").addEventListener("click", (event) => {
     const button = event.target.closest("button[data-allowance-mode]");
-    if (!button) return;
+    if (!button || !ADMIN_ALLOWANCE_MODES.has(button.dataset.allowanceMode)) return;
     state.allowanceMode = button.dataset.allowanceMode;
     renderAdminCommunityAllowance(state.allowancePreview);
   });
@@ -2950,13 +3098,22 @@ if (isAdminPage) {
     renderAdminCommunityAllowance(state.allowancePreview);
   });
   $("#admin-community-allowance-result").addEventListener("click", (event) => {
-    const button = event.target.closest("button[data-allowance-plan]");
-    if (!button || state.allowancePreview === null) return;
-    state.allowancePlanFilter = toggleAdminAllowancePlanFilter(
-      state.allowancePlanFilter,
-      button.dataset.allowancePlan,
-      state.allowancePreview.plans,
-    );
+    const planButton = event.target.closest("button[data-allowance-plan]");
+    const modelButton = event.target.closest("button[data-allowance-model]");
+    if ((!planButton && !modelButton) || state.allowancePreview === null) return;
+    if (planButton) {
+      state.allowancePlanFilter = toggleAdminAllowancePlanFilter(
+        state.allowancePlanFilter,
+        planButton.dataset.allowancePlan,
+        state.allowancePreview.plans,
+      );
+    } else {
+      state.allowanceModelFilter = toggleAdminAllowanceModelFilter(
+        state.allowanceModelFilter,
+        modelButton.dataset.allowanceModel,
+        state.allowancePreview.models,
+      );
+    }
     renderAdminCommunityAllowance(state.allowancePreview);
   });
   $("#sync-distribution").addEventListener("click", async () => {

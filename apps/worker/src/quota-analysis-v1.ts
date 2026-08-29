@@ -1,7 +1,8 @@
 import {
-  QUOTA_CALIBRATION_POLICY,
+  MODEL_COMPOSITION_POLICY,
   SEVEN_DAY_WINDOW_MINUTES,
   analyzeQuotaCalibration,
+  buildCompositionObservations,
   buildResetEvidence,
   isSupportedQuotaWindowDuration,
 } from "@app-usagemonitor/quota-analysis";
@@ -50,9 +51,10 @@ import type { TelemetryUsageEvent } from "./telemetry-validation";
  *
  *   - QUOTA: one SQL query that reuses the winning-device dedupe, windows to the
  *     trailing horizon snapped to whole reset cycles, pre-filters to the only
- *     track the consumer keeps (limit_id='codex', window=10080), drops reset
- *     groups the shared calibration always refuses (the fitable HAVING), and
- *     collapses each flat used_percent run to its endpoints via LAG/LEAD. A
+ *     track the consumer keeps (limit_id='codex', window=10080), and collapses
+ *     each flat used_percent run to its endpoints via LAG/LEAD. Retaining even
+ *     scalar-ineligible groups lets the composition kernel pool their smaller
+ *     honest crossings under its own evidence gates. A
  *     boundary is emitted only on a strict used_percent increase and anchors
  *     lowerCost on the LAST row of the preceding run and upperCost on the FIRST
  *     row of the new run, so keeping both run endpoints is byte-identical for
@@ -63,6 +65,8 @@ import type { TelemetryUsageEvent } from "./telemetry-validation";
  *     flag). `cumulativeCostAt` samples cost only at boundary anchor timestamps,
  *     which are all retained grid points, so the summed buckets reproduce every
  *     boundary cost exactly while collapsing ~306k events to a few hundred rows.
+ *     The same pass additionally retains bounded 2h model-cost bins for the
+ *     admin-only composition fit; a partial/unpriced constituent voids its bin.
  *
  * The returned object omits `evidence` and `rolling` (the community consumer
  * reads only `track.continuity.planType`/`planVariant` and
@@ -94,15 +98,6 @@ const USAGE_PAGE_SIZE = 5_000;
 // Identical purpose to the v0.2 path: reject a high-cardinality corpus before
 // any per-track analysis rather than let distinct-seed count multiply the cost.
 const MAX_CONTINUITY_TRACKS = 256;
-
-// The SQL fitable HAVING drops reset groups the shared calibration ALWAYS
-// refuses: a group with fewer than `minimumBoundaries` distinct used_percent can
-// never reach MINIMUM_BOUNDARIES (too_few_boundaries), and a group whose
-// used_percent range is below `minimumDisplayedSpanPp` can never reach
-// MINIMUM_SPAN_PP (insufficient_displayed_span). Derived from the package policy
-// (never hardcoded) so the SQL tracks the calibration gates by construction.
-const MINIMUM_BOUNDARIES = QUOTA_CALIBRATION_POLICY.minimumBoundaries;
-const MINIMUM_DISPLAYED_SPAN_PP = QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp;
 
 // The exact SLOT_VALUES / SAFE_TOKEN the shared quota-tracks validators enforce
 // (packages/quota-analysis/src/quota-tracks.js). v1 BOUNDED_TOKEN permits
@@ -317,7 +312,11 @@ function buildPricingEvent(
 function priceV1UsageRecord(
   recordJson: string,
   observedAt: string,
-): { costNanousd: number; pricingStatus: PricingStatus } | null {
+): {
+  costNanousd: number;
+  pricingStatus: PricingStatus;
+  modelId: string;
+} | null {
   const rec = parseStoredRecordJson(recordJson);
   if (rec === null) return null;
   const pricingEvent = buildPricingEvent(rec, observedAt);
@@ -326,6 +325,7 @@ function priceV1UsageRecord(
   return {
     costNanousd: priced.costNanousd,
     pricingStatus: priced.coverageStatus as PricingStatus,
+    modelId: pricingEvent.modelId,
   };
 }
 
@@ -487,20 +487,19 @@ const WINNER_FILTER_SQL =
  * the index range scan, and `resets_at >= :resetsAtCutoff` (cutoff + one weekly
  * window) includes a reset only when its ENTIRE first..last series is within the
  * window, so a cycle straddling the cutoff is excluded wholesale rather than
- * read partially and mis-fit. The fitable HAVING drops reset groups the shared
- * calibration always refuses; the LAG/LEAD collapse keeps every row that differs
+ * read partially and mis-fit. The LAG/LEAD collapse keeps every row that differs
  * from its predecessor OR successor — the first and last row of every flat
  * used_percent run — because a boundary anchors lowerCost on the last row of the
- * preceding run and upperCost on the first row of the new run. The partition
- * INCLUDES slot (an eligible multi-slot reset has time-disjoint slots); the
- * fitable GROUP BY EXCLUDES slot (= the shared resetKey).
+ * preceding run and upperCost on the first row of the new run. We deliberately
+ * retain reset groups below the scalar reset-fit span/boundary floors: the model
+ * composition kernel pools honest two-hour crossings across weekly pools and
+ * applies its own observation/identification gates, so scalar pre-filtering
+ * would discard valid model evidence. Scalar calibration still applies its
+ * existing gates after this lossless reduction.
  */
 // Binds (in order): winnersJson, participantId, observedAt cutoff, resetsAt
-// cutoff, window minutes, minimum boundaries, minimum span, row limit. Anonymous
-// `?` because the leading json_each winner filter binds one parameter and fixed
-// numbering across the CTE chain buys nothing. `scoped` is MATERIALIZED so its
-// winner-filtered index scan runs once rather than being re-evaluated by both
-// `fitable` and `survivors`.
+// cutoff, window minutes, row limit. Anonymous `?` because the leading
+// json_each winner filter binds one parameter and fixed numbering buys nothing.
 const QUOTA_DOWNSAMPLE_SQL = `WITH scoped AS MATERIALIZED (
     SELECT r.occurrence_id AS occurrence_id,
            r.observed_at AS observed_at,
@@ -528,31 +527,11 @@ const QUOTA_DOWNSAMPLE_SQL = `WITH scoped AS MATERIALIZED (
        AND r.plan_type IS NOT NULL
        AND r.plan_variant IS NOT NULL
   ),
-  fitable AS (
-    SELECT provider, plan_type, plan_variant, limit_id,
-           window_duration_minutes, resets_at
-      FROM scoped
-     GROUP BY provider, plan_type, plan_variant, limit_id,
-              window_duration_minutes, resets_at
-    HAVING COUNT(DISTINCT used_percent) >= ?
-       AND (MAX(used_percent) - MIN(used_percent)) >= ?
-  ),
-  survivors AS (
-    SELECT s.*
-      FROM scoped s
-      JOIN fitable f
-        ON f.provider = s.provider
-       AND f.plan_type = s.plan_type
-       AND f.plan_variant = s.plan_variant
-       AND f.limit_id = s.limit_id
-       AND f.window_duration_minutes = s.window_duration_minutes
-       AND f.resets_at = s.resets_at
-  ),
   marked AS (
-    SELECT survivors.*,
+    SELECT scoped.*,
            LAG(used_percent) OVER win AS prev_up,
            LEAD(used_percent) OVER win AS next_up
-      FROM survivors
+      FROM scoped
     WINDOW win AS (
       PARTITION BY provider, plan_type, plan_variant, limit_id,
                    window_duration_minutes, resets_at, slot
@@ -634,6 +613,37 @@ interface BucketAccumulator {
   placementMs: number;
 }
 
+export type V1ModelCompositionPlanType = "pro" | "prolite" | "plus";
+
+export interface V1ModelCompositionObservation {
+  readonly planType: V1ModelCompositionPlanType;
+  readonly binStartMs: number;
+  readonly ppDelta: number;
+  readonly costByModel: Readonly<Record<string, number>>;
+}
+
+export interface V1AnalysisWithComposition {
+  readonly analysis: object;
+  readonly compositionObservations: readonly V1ModelCompositionObservation[];
+}
+
+interface CompositionUsageAccumulator {
+  readonly costsByBin: Map<number, Map<string, number>>;
+  readonly invalidBins: Set<number>;
+}
+
+interface BucketedUsageResult {
+  readonly usageEvents: UsageEventPartial[];
+  readonly composition: CompositionUsageAccumulator;
+}
+
+function compositionModelId(modelId: string): string {
+  // Work Mode is a routing alias of Sol in the reviewed price registry. Keep
+  // the quota-credit calibration at the underlying model family while leaving
+  // opaque routes such as codex-auto-review in the folded "other" column.
+  return modelId === "gpt-5.6-sol-wm" ? "gpt-5.6-sol" : modelId;
+}
+
 /**
  * Stream the windowed usage (keyset-paginated), reprice each event, and fold it
  * into synthetic per-bucket rows aligned to the retained quota grid. Returns the
@@ -649,7 +659,7 @@ async function readAndBucketUsage(
   gridByProvider: Map<string, ProviderGrid>,
   maxWindowedUsageRows: number,
   winners: WinningDeviceRow[],
-): Promise<UsageEventPartial[] | "limit_exceeded"> {
+): Promise<BucketedUsageResult | "limit_exceeded"> {
   const winnersJsonArg = winnersJson(winners);
   // Per provider: strictly-interior events keyed by their ceiling grid instant,
   // and grid-exact events kept as their own singleton at that instant (the
@@ -658,6 +668,10 @@ async function readAndBucketUsage(
   // are not — the singleton-split preserves that distinction).
   const buckets = new Map<string, Map<number, BucketAccumulator>>();
   const singletons = new Map<string, Map<number, BucketAccumulator>>();
+  const composition: CompositionUsageAccumulator = {
+    costsByBin: new Map(),
+    invalidBins: new Set(),
+  };
 
   let total = 0;
   let cursorObs = observedAtCutoff;
@@ -688,9 +702,38 @@ async function readAndBucketUsage(
       // matched window (matchedUsage requires observedAt <= lastObserved <=
       // maxG), so they change no fit — drop them.
       if (eMs > grid.sortedMs[grid.sortedMs.length - 1]!) continue;
+      const compositionBinStartMs = row.provider === "openai_codex"
+        ? Math.floor(eMs / MODEL_COMPOSITION_POLICY.grainMs)
+          * MODEL_COMPOSITION_POLICY.grainMs
+        : null;
       const priced = priceV1UsageRecord(row.record_json, row.observed_at);
-      if (priced === null) continue;
+      if (priced === null) {
+        // The scalar analyzer deliberately applies ingest-style DROP semantics
+        // to an event it cannot shape. Composition is stricter: quota movement
+        // in this bin may still include that event, so its missing model cost
+        // makes the entire bin unusable rather than silently zero-cost.
+        if (compositionBinStartMs !== null) {
+          composition.invalidBins.add(compositionBinStartMs);
+        }
+        continue;
+      }
       const fullyPriced = priced.pricingStatus === "fully_priced";
+      if (compositionBinStartMs !== null) {
+        if (!fullyPriced) {
+          // A partially priced bin cannot train on its visible dollars while
+          // attributing the full quota movement. Exclude the entire bin later.
+          composition.invalidBins.add(compositionBinStartMs);
+        } else if (priced.costNanousd > 0) {
+          const costs = composition.costsByBin.get(compositionBinStartMs)
+            ?? new Map<string, number>();
+          const modelId = compositionModelId(priced.modelId);
+          costs.set(
+            modelId,
+            (costs.get(modelId) ?? 0) + priced.costNanousd / 1_000_000_000,
+          );
+          composition.costsByBin.set(compositionBinStartMs, costs);
+        }
+      }
       if (grid.set.has(eMs)) {
         const providerSingletons = singletons.get(row.provider)
           ?? new Map<number, BucketAccumulator>();
@@ -750,7 +793,77 @@ async function readAndBucketUsage(
       ));
     }
   }
-  return usageEvents;
+  return { usageEvents, composition };
+}
+
+function buildV1CompositionObservationCorpus(
+  quotaSnapshots: readonly QuotaSnapshotInput[],
+  composition: CompositionUsageAccumulator,
+): V1ModelCompositionObservation[] {
+  const usageRows: Array<{
+    observedAtMs: number;
+    model: string;
+    costUsd: number;
+  }> = [];
+  for (const [binStartMs, costs] of composition.costsByBin) {
+    for (const [model, costUsd] of costs) {
+      usageRows.push({ observedAtMs: binStartMs, model, costUsd });
+    }
+  }
+  const codexQuotaSnapshots = quotaSnapshots.filter(
+    (snapshot) => snapshot.provider === "openai_codex",
+  );
+  const planTypesByBin = new Map<number, Set<string>>();
+  for (const snapshot of codexQuotaSnapshots) {
+    const observedAtMs = Date.parse(snapshot.observedAt);
+    if (!Number.isFinite(observedAtMs)) continue;
+    const binStartMs = Math.floor(
+      observedAtMs / MODEL_COMPOSITION_POLICY.grainMs,
+    ) * MODEL_COMPOSITION_POLICY.grainMs;
+    const planTypes = planTypesByBin.get(binStartMs) ?? new Set<string>();
+    planTypes.add(snapshot.planType);
+    planTypesByBin.set(binStartMs, planTypes);
+  }
+  const ambiguousPlanBins = new Set(
+    [...planTypesByBin]
+      .filter(([, planTypes]) => planTypes.size > 1)
+      .map(([binStartMs]) => binStartMs),
+  );
+  const quotaRows = codexQuotaSnapshots
+    .map((snapshot) => ({
+      observedAtMs: Date.parse(snapshot.observedAt),
+      planType: snapshot.planType,
+      resetsAtMs: Date.parse(snapshot.resetsAt),
+      usedPercent: snapshot.usedPercent,
+    }));
+  const built = buildCompositionObservations({ usageRows, quotaRows });
+  return built.observations
+    // Feeding all plan pools above lets the kernel void a bin where multiple
+    // plans move. Only explicitly normalized personal plans reach the admin
+    // estimator; preserving the plan here lets that caller scale every row to
+    // Pro 20x before participant balancing and community pooling.
+    .filter((observation): observation is typeof observation & {
+      planType: V1ModelCompositionPlanType;
+    } => (observation.planType === "pro"
+      || observation.planType === "prolite"
+      || observation.planType === "plus")
+      && !composition.invalidBins.has(observation.binStartMs)
+      // Redundant with the shared kernel's ambiguity refusal by design: usage
+      // has no plan tag, so a transition bin containing readings from two plan
+      // eras cannot inherit either era's Pro-equivalent multiplier.
+      && !ambiguousPlanBins.has(observation.binStartMs))
+    .map((observation) => ({
+      planType: observation.planType,
+      binStartMs: observation.binStartMs,
+      ppDelta: observation.ppDelta,
+      costByModel: Object.fromEntries(
+        Object.entries(observation.costByModel)
+          .filter(([, cost]) => typeof cost === "number"
+            && Number.isFinite(cost) && cost >= 0)
+          .sort(([left], [right]) => left.localeCompare(right)),
+      ),
+    }))
+    .sort((left, right) => left.binStartMs - right.binStartMs);
 }
 
 async function synthUsageRow(
@@ -874,11 +987,11 @@ function runV1SeedLoop(
  * No client-declared cost is accepted as the analytical cost basis: every usage
  * event is repriced from tokens by the shared server pricer.
  */
-export async function accountScopedQuotaAnalysisV1(
+export async function accountScopedQuotaAnalysisV1WithComposition(
   db: D1Database,
   participantId: string,
   options: V1AnalysisOptions = {},
-): Promise<object> {
+): Promise<V1AnalysisWithComposition> {
   const nowMs = options.nowMs ?? Date.now();
   const maxDownsampledQuotaRows =
     options.maxDownsampledQuotaRows ?? MAX_DOWNSAMPLED_QUOTA_ROWS;
@@ -896,7 +1009,10 @@ export async function accountScopedQuotaAnalysisV1(
   // No winners means no analyzable records.
   const winners = await loadWinningDevices(db, participantId);
   if (winners.length === 0) {
-    return notTestable("supported_quota_track_unavailable");
+    return {
+      analysis: notTestable("supported_quota_track_unavailable"),
+      compositionObservations: [],
+    };
   }
 
   const quotaResult = await db.prepare(QUOTA_DOWNSAMPLE_SQL).bind(
@@ -905,16 +1021,20 @@ export async function accountScopedQuotaAnalysisV1(
     observedAtCutoff,
     resetsAtCutoff,
     SEVEN_DAY_WINDOW_MINUTES,
-    MINIMUM_BOUNDARIES,
-    MINIMUM_DISPLAYED_SPAN_PP,
     maxDownsampledQuotaRows + 1,
   ).all<DownsampledQuotaRow>();
 
   if (quotaResult.results.length > maxDownsampledQuotaRows) {
-    return notTestable("downsampled_quota_limit_exceeded");
+    return {
+      analysis: notTestable("downsampled_quota_limit_exceeded"),
+      compositionObservations: [],
+    };
   }
   if (quotaResult.results.length === 0) {
-    return notTestable("supported_quota_track_unavailable");
+    return {
+      analysis: notTestable("supported_quota_track_unavailable"),
+      compositionObservations: [],
+    };
   }
 
   const datasetId = await v1DatasetId(participantId);
@@ -931,11 +1051,14 @@ export async function accountScopedQuotaAnalysisV1(
     if (snapshot) quotaSnapshots.push(snapshot);
   }
   if (quotaSnapshots.length === 0) {
-    return notTestable("supported_quota_track_unavailable");
+    return {
+      analysis: notTestable("supported_quota_track_unavailable"),
+      compositionObservations: [],
+    };
   }
 
   const gridByProvider = buildGridByProvider(quotaSnapshots);
-  const usageEvents = await readAndBucketUsage(
+  const usageResult = await readAndBucketUsage(
     db,
     participantId,
     datasetId,
@@ -945,11 +1068,37 @@ export async function accountScopedQuotaAnalysisV1(
     maxWindowedUsageRows,
     winners,
   );
-  if (usageEvents === "limit_exceeded") {
-    return notTestable("windowed_usage_limit_exceeded");
+  if (usageResult === "limit_exceeded") {
+    return {
+      analysis: notTestable("windowed_usage_limit_exceeded"),
+      compositionObservations: [],
+    };
   }
 
-  return runV1SeedLoop(datasets, quotaSnapshots, usageEvents);
+  return {
+    analysis: runV1SeedLoop(
+      datasets,
+      quotaSnapshots,
+      usageResult.usageEvents,
+    ),
+    compositionObservations: buildV1CompositionObservationCorpus(
+      quotaSnapshots,
+      usageResult.composition,
+    ),
+  };
+}
+
+export async function accountScopedQuotaAnalysisV1(
+  db: D1Database,
+  participantId: string,
+  options: V1AnalysisOptions = {},
+): Promise<object> {
+  const result = await accountScopedQuotaAnalysisV1WithComposition(
+    db,
+    participantId,
+    options,
+  );
+  return result.analysis;
 }
 
 /**
@@ -974,8 +1123,6 @@ export async function downsampleQuotaForTest(
     observedAtCutoff,
     resetsAtCutoff,
     SEVEN_DAY_WINDOW_MINUTES,
-    MINIMUM_BOUNDARIES,
-    MINIMUM_DISPLAYED_SPAN_PP,
     MAX_DOWNSAMPLED_QUOTA_ROWS + 1,
   ).all<DownsampledQuotaRow>();
   return result.results;

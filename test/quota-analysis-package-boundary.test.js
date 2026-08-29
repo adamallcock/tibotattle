@@ -92,7 +92,10 @@ const SOURCE_HASHES = Object.freeze({
     // suppressing the whole per-model fit. The executable kernel changed in
     // b8f43f0 (#45) while this byte-identity receipt stayed on the
     // pre-correction digest.
-    "a948dbf22e813e7bb3042cd7715c8573ebe26934a17dfda54500df53d894b035",
+    // Re-pinned for the admin cohort estimator: mixed-plan bins are now
+    // discarded and an explicitly requested model can be evaluated below the
+    // generic discovery floor while retaining the fit-identification checks.
+    "f940ca0ee5e3dc6f19d1edd02244567e9a2194414526ffd242b9376d8180bfc4",
 });
 
 test("quota analysis exposes one exact runtime-neutral package root", async () => {

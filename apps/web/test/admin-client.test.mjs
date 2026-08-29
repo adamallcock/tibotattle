@@ -27,6 +27,18 @@ function emptyAllowanceSummary() {
   };
 }
 
+function emptyModelSummary(status = "insufficient_evidence") {
+  return {
+    status,
+    contributingParticipantCount: 0,
+    eligibleParticipantCount: 2,
+    observationCount: 0,
+    apiCostShare: null,
+    centralUsd: null,
+    band80Usd: null,
+  };
+}
+
 function allowancePreviewPayload() {
   const fromMs = Date.parse("2026-06-15T00:00:00.000Z");
   const days = Array.from({ length: 70 }, (_, index) => ({
@@ -36,6 +48,11 @@ function allowancePreviewPayload() {
       pro: emptyAllowanceSummary(),
       prolite: emptyAllowanceSummary(),
       plus: emptyAllowanceSummary(),
+    },
+    byModelId: {
+      "gpt-5.6-sol": emptyModelSummary(),
+      "gpt-5.6-terra": emptyModelSummary(),
+      "gpt-5.6-luna": emptyModelSummary("no_usage"),
     },
   }));
   days.at(-1).combined = {
@@ -64,8 +81,37 @@ function allowancePreviewPayload() {
       band80Usd: { lowerUsd: 1_700, upperUsd: 2_100 },
     },
   };
+  days.at(-1).byModelId = {
+    "gpt-5.6-sol": {
+      status: "fitted",
+      contributingParticipantCount: 3,
+      eligibleParticipantCount: 4,
+      observationCount: 594,
+      apiCostShare: 0.73,
+      centralUsd: 2_424,
+      band80Usd: null,
+    },
+    "gpt-5.6-terra": {
+      status: "fitted",
+      contributingParticipantCount: 2,
+      eligibleParticipantCount: 3,
+      observationCount: 221,
+      apiCostShare: 0.19,
+      centralUsd: 1_102,
+      band80Usd: null,
+    },
+    "gpt-5.6-luna": {
+      status: "insufficient_evidence",
+      contributingParticipantCount: 0,
+      eligibleParticipantCount: 2,
+      observationCount: 37,
+      apiCostShare: 0.008,
+      centralUsd: null,
+      band80Usd: null,
+    },
+  };
   return {
-    schemaVersion: "admin-community-allowance-preview-v0.1",
+    schemaVersion: "admin-community-allowance-preview-v0.2",
     generatedAt: "2026-08-23T10:30:00.000Z",
     from: "2026-06-15",
     to: "2026-08-23",
@@ -79,6 +125,20 @@ function allowancePreviewPayload() {
       { planType: "prolite", label: "Pro 5x", multiplier: 4 },
       { planType: "plus", label: "Plus", multiplier: 20 },
     ],
+    models: [
+      { modelId: "gpt-5.6-sol" },
+      { modelId: "gpt-5.6-terra" },
+      { modelId: "gpt-5.6-luna" },
+    ],
+    modelEvidence: {
+      basis: "pro20x_single_model_api_value_trailing_30d",
+      qualification: "pooled_target_identified_halves_personal_plans",
+      planNormalization: "pro_x1_prolite_x4_plus_x20",
+      aggregation: "participant_balanced_pooled_fit",
+      apiPriceBasis: "event_time_standard_api_counterfactual",
+      speedBasis: "observed_subscription_speed_mix_unadjusted",
+      sourceCorpus: "telemetry_v1_only",
+    },
     days,
   };
 }
@@ -142,9 +202,34 @@ test("admin allowance preview projects the fixed merge trial contract", () => {
     centralUsd: 2_100,
     band80Usd: { lowerUsd: 1_800, upperUsd: 2_400 },
   });
+  assert.deepEqual(preview.models.map((model) => model.modelId), [
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+  ]);
+  assert.deepEqual(preview.days.at(-1).byModelId["gpt-5.6-luna"], {
+    status: "insufficient_evidence",
+    contributingParticipantCount: 0,
+    eligibleParticipantCount: 2,
+    observationCount: 37,
+    apiCostShare: 0.008,
+    centralUsd: null,
+    band80Usd: null,
+  });
   assert.equal(Object.isFrozen(preview), true);
   assert.equal(Object.isFrozen(preview.days), true);
   assert.equal(Object.isFrozen(preview.days.at(-1).byPlanType), true);
+  assert.equal(Object.isFrozen(preview.days.at(-1).byModelId), true);
+  assert.equal(Object.isFrozen(preview.modelEvidence), true);
+  assert.deepEqual(preview.modelEvidence, {
+    basis: "pro20x_single_model_api_value_trailing_30d",
+    qualification: "pooled_target_identified_halves_personal_plans",
+    planNormalization: "pro_x1_prolite_x4_plus_x20",
+    aggregation: "participant_balanced_pooled_fit",
+    apiPriceBasis: "event_time_standard_api_counterfactual",
+    speedBasis: "observed_subscription_speed_mix_unadjusted",
+    sourceCorpus: "telemetry_v1_only",
+  });
 });
 
 test("admin allowance preview validates additive upload-to-merge coverage", () => {
@@ -223,6 +308,42 @@ test("admin allowance preview rejects drifted factors, chronology, and evidence"
     (payload) => { payload.days.at(-1).combined.band80Usd = null; },
     (payload) => { payload.days[0].combined.participantCount = 1; },
     (payload) => { delete payload.days.at(-1).byPlanType.plus; },
+    (payload) => { payload.days.at(-1).modelEstimate = 2_000; },
+    (payload) => { payload.models.reverse(); },
+    (payload) => { payload.models[0].label = "Sol"; },
+    (payload) => { delete payload.modelEvidence.speedBasis; },
+    (payload) => { payload.modelEvidence.basis = "single_model_value"; },
+    (payload) => { payload.modelEvidence.qualification = "all_plans"; },
+    (payload) => { delete payload.modelEvidence.planNormalization; },
+    (payload) => { payload.modelEvidence.planNormalization = "none"; },
+    (payload) => { delete payload.modelEvidence.aggregation; },
+    (payload) => { payload.modelEvidence.aggregation = "per_account_median"; },
+    (payload) => { payload.modelEvidence.apiPriceBasis = "latest_api_prices"; },
+    (payload) => { payload.modelEvidence.speedBasis = "speed_normalized"; },
+    (payload) => { payload.modelEvidence.sourceCorpus = "all_telemetry"; },
+    (payload) => { delete payload.days.at(-1).byModelId["gpt-5.6-luna"]; },
+    (payload) => {
+      payload.days.at(-1).byModelId["gpt-5.6-sol"].apiCostShare = 1.01;
+    },
+    (payload) => {
+      payload.days.at(-1).byModelId["gpt-5.6-sol"].band80Usd = {
+        lowerUsd: 2_300,
+        upperUsd: 2_550,
+      };
+    },
+    (payload) => {
+      const luna = payload.days.at(-1).byModelId["gpt-5.6-luna"];
+      luna.centralUsd = 0;
+    },
+    (payload) => {
+      payload.days.at(-1).byModelId["gpt-5.6-luna"].status = "estimated";
+    },
+    (payload) => {
+      payload.days.at(-1).byModelId["gpt-5.6-luna"].status = "below_cost_share_floor";
+    },
+    (payload) => {
+      payload.days.at(-1).byModelId["gpt-5.6-terra"].label = "Terra";
+    },
   ];
   for (const mutate of mutations) {
     const payload = allowancePreviewPayload();
@@ -232,6 +353,20 @@ test("admin allowance preview rejects drifted factors, chronology, and evidence"
       /ADMIN_ALLOWANCE_PREVIEW_INVALID/u,
     );
   }
+});
+
+test("admin allowance preview rejects a fitted zero and keeps unavailable null", () => {
+  const payload = allowancePreviewPayload();
+  payload.days.at(-1).byModelId["gpt-5.6-terra"].centralUsd = 0;
+  assert.throws(
+    () => projectAdminAllowancePreview(payload),
+    /ADMIN_ALLOWANCE_PREVIEW_INVALID/u,
+  );
+  assert.equal(
+    projectAdminAllowancePreview(allowancePreviewPayload())
+      .days.at(-1).byModelId["gpt-5.6-luna"].centralUsd,
+    null,
+  );
 });
 
 test("admin overview fixture projects to the renderer's explicit contract", async () => {

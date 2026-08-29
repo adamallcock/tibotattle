@@ -151,7 +151,19 @@
 .admin-allowance-plan-summary strong { display: block; margin-top: 4px; font-family: var(--serif); font-size: 1.55rem; font-weight: 500; }
 .admin-allowance-plan-summary small { color: var(--muted); font-size: .68rem; }
 .admin-allowance-plan-summary .admin-allowance-plan-range { display: block; margin-top: 5px; }
+.admin-allowance-model-summaries { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 18px; }
+.admin-allowance-model-summary { padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: rgba(255, 254, 249, .72); }
+.admin-allowance-model-summary-selected { border-color: rgba(31, 90, 73, .42); box-shadow: 0 0 0 2px rgba(31, 90, 73, .08); }
+.admin-allowance-model-summary > span { display: block; color: var(--muted); font-size: .64rem; font-weight: 760; letter-spacing: .05em; text-transform: uppercase; }
+.admin-allowance-model-summary strong { display: block; margin-top: 4px; font-family: var(--serif); font-size: 1.55rem; font-weight: 500; }
+.admin-allowance-model-summary small { display: block; margin-top: 5px; color: var(--muted); font-size: .68rem; line-height: 1.45; }
+.admin-allowance-model-summary .admin-allowance-model-scenario { color: var(--ink); }
+.admin-allowance-model-summary .admin-allowance-model-date { font-variant-numeric: tabular-nums; }
+.admin-allowance-model-evidence { display: grid; gap: 4px; margin-top: 16px; padding: 10px 12px; border-left: 3px solid rgba(79, 70, 132, .4); color: var(--muted); background: rgba(79, 70, 132, .06); font-size: .67rem; line-height: 1.45; overflow-wrap: anywhere; }
+.admin-allowance-model-evidence p { margin: 0; }
+.admin-allowance-model-evidence .admin-allowance-model-evidence-heading { color: var(--ink); font-size: .7rem; font-weight: 720; }
 .admin-allowance-empty { margin: 22px 0 0; color: var(--muted); font-size: .78rem; }
+.admin-allowance-chart-empty { margin: 5px 0 8px; color: var(--muted); font-size: .7rem; }
 .admin-allowance-legend { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 0 0 8px; color: var(--muted); font-size: .68rem; }
 .admin-allowance-legend > span { display: inline-flex; gap: 7px; align-items: center; }
 .admin-allowance-legend-interactive { gap: 5px; }
@@ -170,22 +182,39 @@
 .admin-allowance-plan-key-pro { --allowance-plan-color: #1f5a49; --allowance-plan-band: rgba(31, 90, 73, .14); }
 .admin-allowance-plan-key-prolite { --allowance-plan-color: #4f6f9b; --allowance-plan-band: rgba(79, 111, 155, .14); }
 .admin-allowance-plan-key-plus { --allowance-plan-color: #a06a26; --allowance-plan-band: rgba(160, 106, 38, .14); }
+.admin-allowance-model-key { position: relative; width: 19px; height: 10px; }
+.admin-allowance-model-key::after { position: absolute; top: 4px; right: 0; left: 0; height: 2px; border-radius: 999px; background: var(--allowance-model-line); content: ""; }
+.admin-allowance-model-key-model-0 { --allowance-model-line: #70476d; }
+.admin-allowance-model-key-model-1 { --allowance-model-line: repeating-linear-gradient(to right, #2f6f88 0 6px, transparent 6px 9px); }
+.admin-allowance-model-key-model-2 { --allowance-model-line: repeating-linear-gradient(to right, #ad5737 0 2px, transparent 2px 5px); }
 .admin-allowance-band-area { fill: rgba(23, 89, 70, .13); stroke: none; }
 .admin-allowance-band-mark { stroke: rgba(23, 89, 70, .3); stroke-width: 2; }
 .admin-allowance-band-area-pro { fill: rgba(31, 90, 73, .11); }
 .admin-allowance-band-area-prolite { fill: rgba(79, 111, 155, .11); }
 .admin-allowance-band-area-plus { fill: rgba(160, 106, 38, .11); }
+.admin-allowance-band-area-model-0 { fill: rgba(112, 71, 109, .1); }
+.admin-allowance-band-area-model-1 { fill: rgba(47, 111, 136, .1); }
+.admin-allowance-band-area-model-2 { fill: rgba(173, 87, 55, .1); }
 .admin-allowance-band-mark-pro { stroke: rgba(31, 90, 73, .38); }
 .admin-allowance-band-mark-prolite { stroke: rgba(79, 111, 155, .38); }
 .admin-allowance-band-mark-plus { stroke: rgba(160, 106, 38, .38); }
+.admin-allowance-band-mark-model-0 { stroke: rgba(112, 71, 109, .42); }
+.admin-allowance-band-mark-model-1 { stroke: rgba(47, 111, 136, .42); }
+.admin-allowance-band-mark-model-2 { stroke: rgba(173, 87, 55, .42); }
 .admin-allowance-line { fill: none; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
 .admin-allowance-line-combined, .admin-allowance-line-pro { stroke: #1f5a49; }
 .admin-allowance-line-prolite { stroke: #4f6f9b; }
 .admin-allowance-line-plus { stroke: #a06a26; }
+.admin-allowance-line-model-0 { stroke: #70476d; }
+.admin-allowance-line-model-1 { stroke: #2f6f88; stroke-dasharray: 8 5; }
+.admin-allowance-line-model-2 { stroke: #ad5737; stroke-dasharray: 2 5; }
 .admin-allowance-dot { stroke: var(--surface-quiet); stroke-width: 1.4; }
 .admin-allowance-dot-combined, .admin-allowance-dot-pro { fill: #1f5a49; }
 .admin-allowance-dot-prolite { fill: #4f6f9b; }
 .admin-allowance-dot-plus { fill: #a06a26; }
+.admin-allowance-dot-model-0 { fill: #70476d; }
+.admin-allowance-dot-model-1 { fill: #2f6f88; }
+.admin-allowance-dot-model-2 { fill: #ad5737; }
 .admin-allowance-dot:focus { outline: none; stroke: var(--ink); stroke-width: 2.5; }
 @media (max-width: 800px) {
   .admin-card-grid, .admin-two-column { grid-template-columns: 1fr 1fr; }
@@ -209,7 +238,7 @@
   .admin-section-actions { justify-content: start; }
   .admin-community-view .community-window-content { padding: 18px; }
   .admin-allowance-controls { justify-content: start; }
-  .admin-allowance-plan-summaries { grid-template-columns: 1fr; }
+  .admin-allowance-plan-summaries, .admin-allowance-model-summaries { grid-template-columns: 1fr; }
   .admin-attention-item { grid-template-columns: auto minmax(0, 1fr); align-items: start; }
   .admin-attention-dot { margin-top: 5px; }
   .admin-attention-link { grid-column: 2; justify-self: start; }

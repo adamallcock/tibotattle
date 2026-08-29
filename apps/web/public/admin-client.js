@@ -1,7 +1,7 @@
 const ADMIN_OVERVIEW_SCHEMA_VERSION = "admin-overview-v0.3";
 const ADMIN_ACTION_SCHEMA_VERSION = "admin-action-v0.1";
 const ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION =
-  "admin-community-allowance-preview-v0.1";
+  "admin-community-allowance-preview-v0.2";
 const ADMIN_ALLOWANCE_PREVIEW_BASIS =
   "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview";
 const ADMIN_ALLOWANCE_PREVIEW_DAYS = 70;
@@ -13,6 +13,27 @@ const ADMIN_ALLOWANCE_PREVIEW_PLANS = Object.freeze([
   Object.freeze({ planType: "pro", label: "Pro 20x", multiplier: 1 }),
   Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 4 }),
   Object.freeze({ planType: "plus", label: "Plus", multiplier: 20 }),
+]);
+const ADMIN_ALLOWANCE_PREVIEW_MODELS = Object.freeze([
+  Object.freeze({ modelId: "gpt-5.6-sol" }),
+  Object.freeze({ modelId: "gpt-5.6-terra" }),
+  Object.freeze({ modelId: "gpt-5.6-luna" }),
+]);
+const ADMIN_ALLOWANCE_MODEL_EVIDENCE = Object.freeze({
+  basis: "pro20x_single_model_api_value_trailing_30d",
+  qualification: "pooled_target_identified_halves_personal_plans",
+  planNormalization: "pro_x1_prolite_x4_plus_x20",
+  aggregation: "participant_balanced_pooled_fit",
+  apiPriceBasis: "event_time_standard_api_counterfactual",
+  speedBasis: "observed_subscription_speed_mix_unadjusted",
+  sourceCorpus: "telemetry_v1_only",
+});
+const ADMIN_ALLOWANCE_MODEL_STATUSES = new Set([
+  "fitted",
+  "no_usage",
+  "insufficient_observations",
+  "unstable_fit",
+  "insufficient_evidence",
 ]);
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
 const ADMIN_ACTIONS = new Set([
@@ -89,6 +110,19 @@ function positiveNumber(value, code) {
   return value;
 }
 
+function nonnegativeNumber(value, code) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    invalid(code);
+  }
+  return value;
+}
+
+function fraction(value, code) {
+  const projected = nonnegativeNumber(value, code);
+  if (projected > 1) invalid(code);
+  return projected;
+}
+
 function array(value, code) {
   if (!Array.isArray(value)) invalid(code);
   return value;
@@ -120,6 +154,15 @@ function boundedArray(value, maximum, code) {
   const values = array(value, code);
   if (values.length > maximum) invalid(code);
   return values;
+}
+
+function exactRecord(value, expectedKeys, code) {
+  const projected = record(value, code);
+  if (Object.keys(projected).sort().join("|")
+      !== [...expectedKeys].sort().join("|")) {
+    invalid(code);
+  }
+  return projected;
 }
 
 function projectAllowancePreviewCoverage(value) {
@@ -194,6 +237,60 @@ function projectAllowancePreviewSummary(value) {
   });
 }
 
+function projectAllowancePreviewModelSummary(value) {
+  const code = "ADMIN_ALLOWANCE_PREVIEW_INVALID";
+  const summary = exactRecord(value, [
+    "status",
+    "contributingParticipantCount",
+    "eligibleParticipantCount",
+    "observationCount",
+    "apiCostShare",
+    "centralUsd",
+    "band80Usd",
+  ], code);
+  const status = enumValue(summary.status, ADMIN_ALLOWANCE_MODEL_STATUSES, code);
+  const contributingParticipantCount = count(
+    summary.contributingParticipantCount,
+    code,
+  );
+  const eligibleParticipantCount = count(summary.eligibleParticipantCount, code);
+  const observationCount = count(summary.observationCount, code);
+  const apiCostShare = summary.apiCostShare === null
+    ? null
+    : fraction(summary.apiCostShare, code);
+  if (status !== "fitted") {
+    if (contributingParticipantCount !== 0
+        || summary.centralUsd !== null
+        || summary.band80Usd !== null) {
+      invalid(code);
+    }
+    return Object.freeze({
+      status,
+      contributingParticipantCount: 0,
+      eligibleParticipantCount,
+      observationCount,
+      apiCostShare,
+      centralUsd: null,
+      band80Usd: null,
+    });
+  }
+  if (contributingParticipantCount < 1
+      || contributingParticipantCount > eligibleParticipantCount
+      || summary.band80Usd !== null) {
+    invalid(code);
+  }
+  const centralUsd = positiveNumber(summary.centralUsd, code);
+  return Object.freeze({
+    status,
+    contributingParticipantCount,
+    eligibleParticipantCount,
+    observationCount,
+    apiCostShare,
+    centralUsd,
+    band80Usd: null,
+  });
+}
+
 /**
  * Fail-closed projection for the owner-only merge trial. The public client does
  * not understand this schema and remains pinned to the published Pro cohort.
@@ -223,11 +320,49 @@ export function projectAdminAllowancePreview(value) {
     return expected;
   });
   if (plans.length !== ADMIN_ALLOWANCE_PREVIEW_PLANS.length) invalid(code);
+  const models = array(preview.models, code).map((value, index) => {
+    const model = exactRecord(value, ["modelId"], code);
+    const expected = ADMIN_ALLOWANCE_PREVIEW_MODELS[index];
+    if (!expected || model.modelId !== expected.modelId) invalid(code);
+    return expected;
+  });
+  if (models.length !== ADMIN_ALLOWANCE_PREVIEW_MODELS.length) invalid(code);
+  const modelEvidence = exactRecord(preview.modelEvidence, [
+    "basis",
+    "qualification",
+    "planNormalization",
+    "aggregation",
+    "apiPriceBasis",
+    "speedBasis",
+    "sourceCorpus",
+  ], code);
+  if (modelEvidence.basis !== ADMIN_ALLOWANCE_MODEL_EVIDENCE.basis
+      || modelEvidence.qualification
+        !== ADMIN_ALLOWANCE_MODEL_EVIDENCE.qualification
+      || modelEvidence.planNormalization
+        !== ADMIN_ALLOWANCE_MODEL_EVIDENCE.planNormalization
+      || modelEvidence.aggregation
+        !== ADMIN_ALLOWANCE_MODEL_EVIDENCE.aggregation
+      || modelEvidence.apiPriceBasis
+        !== ADMIN_ALLOWANCE_MODEL_EVIDENCE.apiPriceBasis
+      || modelEvidence.speedBasis !== ADMIN_ALLOWANCE_MODEL_EVIDENCE.speedBasis
+      || modelEvidence.sourceCorpus
+        !== ADMIN_ALLOWANCE_MODEL_EVIDENCE.sourceCorpus) {
+    invalid(code);
+  }
   const expectedPlanKeys = ADMIN_ALLOWANCE_PREVIEW_PLANS
     .map((plan) => plan.planType)
     .sort();
+  const expectedModelKeys = ADMIN_ALLOWANCE_PREVIEW_MODELS
+    .map((model) => model.modelId)
+    .sort();
   const days = array(preview.days, code).map((value, index) => {
-    const day = record(value, code);
+    const day = exactRecord(value, [
+      "day",
+      "combined",
+      "byPlanType",
+      "byModelId",
+    ], code);
     const dayValue = calendarDay(day.day, code);
     const expectedDay = new Date(
       Date.parse(`${from}T00:00:00.000Z`) + index * 24 * 60 * 60 * 1000,
@@ -237,6 +372,10 @@ export function projectAdminAllowancePreview(value) {
     if (Object.keys(byPlanType).sort().join("|") !== expectedPlanKeys.join("|")) {
       invalid(code);
     }
+    const byModelId = record(day.byModelId, code);
+    if (Object.keys(byModelId).sort().join("|") !== expectedModelKeys.join("|")) {
+      invalid(code);
+    }
     return Object.freeze({
       day: dayValue,
       combined: projectAllowancePreviewSummary(day.combined),
@@ -244,6 +383,12 @@ export function projectAdminAllowancePreview(value) {
         ADMIN_ALLOWANCE_PREVIEW_PLANS.map((plan) => [
           plan.planType,
           projectAllowancePreviewSummary(byPlanType[plan.planType]),
+        ]),
+      )),
+      byModelId: Object.freeze(Object.fromEntries(
+        ADMIN_ALLOWANCE_PREVIEW_MODELS.map((model) => [
+          model.modelId,
+          projectAllowancePreviewModelSummary(byModelId[model.modelId]),
         ]),
       )),
     });
@@ -264,6 +409,8 @@ export function projectAdminAllowancePreview(value) {
     qualification: preview.qualification,
     spanFloorPp: 40,
     plans: Object.freeze(plans),
+    models: Object.freeze(models),
+    modelEvidence: ADMIN_ALLOWANCE_MODEL_EVIDENCE,
     days: Object.freeze(days),
     coverage: projectAllowancePreviewCoverage(preview.coverage),
   });

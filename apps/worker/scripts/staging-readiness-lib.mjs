@@ -82,6 +82,9 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     // cache rows instead of event or per-account analysis tables.
     "0039_admin_metrics_history_cache.sql",
     "0040_community_allowance_publication_state.sql",
+    // Adds bounded v1 model-composition evidence beside the private allowance
+    // fit cache plus an hourly retry gate for scheduled admin projection.
+    "0041_community_model_composition_cache.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",

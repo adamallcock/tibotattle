@@ -1,13 +1,21 @@
 import {
+  calibrateCompositionCapacities,
+} from "@app-usagemonitor/quota-analysis";
+import {
+  COMMUNITY_ALLOWANCE_NORMALIZATION,
   COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG,
   COMMUNITY_ALLOWANCE_QUALIFICATION,
   COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS,
   COMMUNITY_ALLOWANCE_SPAN_FLOOR_PP,
   COMMUNITY_ALLOWANCE_TRAILING_DAYS,
+  collectCommunityAllowanceCorpus,
   readCachedCommunityAllowanceCorpus,
   summarizeCommunityAllowanceFits,
 } from "./community-allowance";
-import type { CommunityAllowanceFit } from "./community-allowance";
+import type {
+  CommunityAllowanceFit,
+  CommunityModelCompositionObservation,
+} from "./community-allowance";
 import { ApiError } from "./errors";
 
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -22,7 +30,7 @@ const PREVIEW_CACHE_MAX_AGE_MILLISECONDS = 2 * 60 * 60 * 1_000;
 const PREVIEW_CACHE_MAX_FUTURE_SKEW_MILLISECONDS = 5 * 60 * 1_000;
 
 export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_SCHEMA_VERSION =
-  "admin-community-allowance-preview-v0.1";
+  "admin-community-allowance-preview-v0.2";
 export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_BASIS =
   "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview";
 
@@ -38,8 +46,26 @@ export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS =
 export const ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG =
   COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG;
 
+export const ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG = Object.freeze([
+  Object.freeze({ modelId: "gpt-5.6-sol" }),
+  Object.freeze({ modelId: "gpt-5.6-terra" }),
+  Object.freeze({ modelId: "gpt-5.6-luna" }),
+] as const);
+
+export const ADMIN_COMMUNITY_MODEL_EVIDENCE = Object.freeze({
+  basis: "pro20x_single_model_api_value_trailing_30d",
+  qualification: "pooled_target_identified_halves_personal_plans",
+  planNormalization: COMMUNITY_ALLOWANCE_NORMALIZATION,
+  aggregation: "participant_balanced_pooled_fit",
+  apiPriceBasis: "event_time_standard_api_counterfactual",
+  speedBasis: "observed_subscription_speed_mix_unadjusted",
+  sourceCorpus: "telemetry_v1_only",
+} as const);
+
 type AdminCommunityAllowancePlanType =
   (typeof ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG)[number]["planType"];
+type AdminCommunityAllowanceModelId =
+  (typeof ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG)[number]["modelId"];
 
 export interface AdminCommunityAllowanceSummary {
   readonly fitCount: number;
@@ -58,6 +84,27 @@ export interface AdminCommunityAllowancePreviewDay {
     AdminCommunityAllowancePlanType,
     AdminCommunityAllowanceSummary
   >>;
+  readonly byModelId: Readonly<Record<
+    AdminCommunityAllowanceModelId,
+    AdminCommunityModelSummary
+  >>;
+}
+
+export type AdminCommunityModelStatus =
+  | "fitted"
+  | "no_usage"
+  | "insufficient_observations"
+  | "unstable_fit"
+  | "insufficient_evidence";
+
+export interface AdminCommunityModelSummary {
+  readonly status: AdminCommunityModelStatus;
+  readonly contributingParticipantCount: number;
+  readonly eligibleParticipantCount: number;
+  readonly observationCount: number;
+  readonly apiCostShare: number | null;
+  readonly centralUsd: number | null;
+  readonly band80Usd: null;
 }
 
 export interface AdminCommunityAllowanceCoverage {
@@ -82,6 +129,8 @@ export interface AdminCommunityAllowancePreview {
   readonly qualification: typeof COMMUNITY_ALLOWANCE_QUALIFICATION;
   readonly spanFloorPp: typeof COMMUNITY_ALLOWANCE_SPAN_FLOOR_PP;
   readonly plans: typeof ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG;
+  readonly models: typeof ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG;
+  readonly modelEvidence: typeof ADMIN_COMMUNITY_MODEL_EVIDENCE;
   readonly coverage: AdminCommunityAllowanceCoverage;
   readonly days: readonly AdminCommunityAllowancePreviewDay[];
 }
@@ -108,6 +157,10 @@ function validCount(value: unknown): value is number {
 
 function validFiniteNonNegative(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function validFinitePositive(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
 }
 
 function validIsoTimestamp(value: unknown): value is string {
@@ -156,6 +209,48 @@ function validSummary(value: unknown): value is AdminCommunityAllowanceSummary {
     && summary.centralUsd <= band.upperUsd;
 }
 
+const ADMIN_COMMUNITY_MODEL_STATUSES = new Set<AdminCommunityModelStatus>([
+  "fitted",
+  "no_usage",
+  "insufficient_observations",
+  "unstable_fit",
+  "insufficient_evidence",
+]);
+
+function validModelSummary(value: unknown): value is AdminCommunityModelSummary {
+  const summary = record(value);
+  if (summary === null || !exactKeys(summary, [
+    "status",
+    "contributingParticipantCount",
+    "eligibleParticipantCount",
+    "observationCount",
+    "apiCostShare",
+    "centralUsd",
+    "band80Usd",
+  ]) || typeof summary.status !== "string"
+      || !ADMIN_COMMUNITY_MODEL_STATUSES.has(
+        summary.status as AdminCommunityModelStatus,
+      )
+      || !validCount(summary.contributingParticipantCount)
+      || !validCount(summary.eligibleParticipantCount)
+      || !validCount(summary.observationCount)
+      || summary.contributingParticipantCount > summary.eligibleParticipantCount
+      || !(summary.apiCostShare === null
+        || (validFiniteNonNegative(summary.apiCostShare)
+          && summary.apiCostShare <= 1))) {
+    return false;
+  }
+  if (summary.status !== "fitted") {
+    return summary.contributingParticipantCount === 0
+      && summary.centralUsd === null
+      && summary.band80Usd === null;
+  }
+  return summary.contributingParticipantCount > 0
+    && summary.contributingParticipantCount === summary.eligibleParticipantCount
+    && validFinitePositive(summary.centralUsd)
+    && summary.band80Usd === null;
+}
+
 function validCachedAdminCommunityAllowancePreview(
   value: unknown,
   storedGeneratedAt: string,
@@ -174,6 +269,8 @@ function validCachedAdminCommunityAllowancePreview(
     "qualification",
     "spanFloorPp",
     "plans",
+    "models",
+    "modelEvidence",
     "coverage",
     "days",
   ]) || preview.schemaVersion !== ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_SCHEMA_VERSION
@@ -205,6 +302,38 @@ function validCachedAdminCommunityAllowancePreview(
         || plan.multiplier !== expected.multiplier) {
       return false;
     }
+  }
+
+  if (!Array.isArray(preview.models)
+      || preview.models.length !== ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.length) {
+    return false;
+  }
+  for (const [index, expected] of ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.entries()) {
+    const model = record(preview.models[index]);
+    if (model === null || !exactKeys(model, ["modelId"])
+        || model.modelId !== expected.modelId) return false;
+  }
+  const modelEvidence = record(preview.modelEvidence);
+  if (modelEvidence === null || !exactKeys(modelEvidence, [
+    "basis",
+    "qualification",
+    "planNormalization",
+    "aggregation",
+    "apiPriceBasis",
+    "speedBasis",
+    "sourceCorpus",
+  ]) || modelEvidence.basis !== ADMIN_COMMUNITY_MODEL_EVIDENCE.basis
+      || modelEvidence.qualification
+        !== ADMIN_COMMUNITY_MODEL_EVIDENCE.qualification
+      || modelEvidence.planNormalization
+        !== ADMIN_COMMUNITY_MODEL_EVIDENCE.planNormalization
+      || modelEvidence.aggregation !== ADMIN_COMMUNITY_MODEL_EVIDENCE.aggregation
+      || modelEvidence.apiPriceBasis
+        !== ADMIN_COMMUNITY_MODEL_EVIDENCE.apiPriceBasis
+      || modelEvidence.speedBasis !== ADMIN_COMMUNITY_MODEL_EVIDENCE.speedBasis
+      || modelEvidence.sourceCorpus
+        !== ADMIN_COMMUNITY_MODEL_EVIDENCE.sourceCorpus) {
+    return false;
   }
 
   const coverage = record(preview.coverage);
@@ -251,7 +380,7 @@ function validCachedAdminCommunityAllowancePreview(
     const expectedDay = new Date(fromEpoch + index * MILLISECONDS_PER_DAY)
       .toISOString().slice(0, 10);
     if (day === null
-        || !exactKeys(day, ["day", "combined", "byPlanType"])
+        || !exactKeys(day, ["day", "combined", "byPlanType", "byModelId"])
         || day.day !== expectedDay
         || !validSummary(day.combined)) {
       return false;
@@ -269,6 +398,13 @@ function validCachedAdminCommunityAllowancePreview(
       if (!validSummary(summary)) return false;
       summaries.push(summary);
     }
+    const byModel = record(day.byModelId);
+    if (byModel === null || !exactKeys(
+      byModel,
+      ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.map((model) => model.modelId),
+    ) || ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.some(
+      (model) => !validModelSummary(byModel[model.modelId]),
+    )) return false;
     const fitCount = summaries.reduce((sum, summary) => sum + summary.fitCount, 0);
     const participantCount = summaries.reduce(
       (sum, summary) => sum + summary.participantCount,
@@ -298,8 +434,142 @@ function summarizeFits(
   return summarizeCommunityAllowanceFits(fits, multiplier);
 }
 
+function rounded(value: number, places: number): number {
+  const scale = 10 ** places;
+  return Math.round((value + Number.EPSILON) * scale) / scale;
+}
+
+function summarizeModels(
+  observations: readonly CommunityModelCompositionObservation[],
+): Readonly<Record<
+  AdminCommunityAllowanceModelId,
+  AdminCommunityModelSummary
+>> {
+  // Normalize each plan-era row before it enters the pooled fit. This puts Pro
+  // (1x), ProLite (4x), and Plus (20x) quota movement on one Pro
+  // 20x-equivalent cost basis before participant balancing. Unsupported plans
+  // never enter the design matrix.
+  const planMultiplier = new Map<string, number>(
+    ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG.map((plan) => [
+      plan.planType,
+      plan.multiplier,
+    ]),
+  );
+  const normalizedObservations = observations.flatMap((observation) => {
+    const multiplier = planMultiplier.get(observation.planType);
+    if (multiplier === undefined) return [];
+    return [Object.freeze({
+      ...observation,
+      costByModel: Object.freeze(Object.fromEntries(
+        Object.entries(observation.costByModel).map(([modelId, cost]) => [
+          modelId,
+          cost * multiplier,
+        ]),
+      )),
+    })];
+  });
+  const byParticipant = new Map<string, CommunityModelCompositionObservation[]>();
+  for (const observation of normalizedObservations) {
+    const bucket = byParticipant.get(observation.participantId);
+    if (bucket) bucket.push(observation);
+    else byParticipant.set(observation.participantId, [observation]);
+  }
+  // The target is a community estimate: normalized rows from every contributor
+  // jointly clear the shared observation gate. Weight both sides of each
+  // account's rows by 1/sqrt(row count), preserving the capacity equation while
+  // giving each account equal total squared-error influence. Participant IDs
+  // remain attached only long enough to report target-specific contributor
+  // coverage; no account-level coefficient or identifier leaves this function.
+  const balancedObservations = [...byParticipant.values()].flatMap((rows) => {
+    const weight = 1 / Math.sqrt(rows.length);
+    return rows.map((observation) => ({
+      binStartMs: observation.binStartMs,
+      ppDelta: observation.ppDelta * weight,
+      costByModel: Object.fromEntries(
+        Object.entries(observation.costByModel).map(([modelId, cost]) => [
+          modelId,
+          cost * weight,
+        ]),
+      ),
+    }));
+  });
+  // Fit each displayed target independently. The target must still improve the
+  // adjusted pooled fit and retain a positive coefficient in both interleaved
+  // evidence halves. The admin estimate deliberately does not impose the
+  // shared package's generic numeric drift ceiling: the production-sized Luna
+  // corpus is identified in both halves, but sparse enough for that sensitivity
+  // measure to hide it. Untargeted slivers retain the generic fold-to-other
+  // policy in each target's fit, and the package default remains unchanged.
+  const fitsByModel = new Map(
+    ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.map(({ modelId }) => [
+      modelId,
+      calibrateCompositionCapacities(balancedObservations, {
+        forcedModels: [modelId],
+        maxSplitHalfCapacityDriftFraction: Number.POSITIVE_INFINITY,
+      }),
+    ]),
+  );
+  let totalCost = 0;
+  const totalCostByModel = new Map<string, number>();
+  for (const observation of normalizedObservations) {
+    for (const [modelId, cost] of Object.entries(observation.costByModel)) {
+      if (!Number.isFinite(cost) || cost < 0) continue;
+      totalCost += cost;
+      totalCostByModel.set(modelId, (totalCostByModel.get(modelId) ?? 0) + cost);
+    }
+  }
+  const result = Object.fromEntries(
+    ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.map(({ modelId }) => {
+      const fit = fitsByModel.get(modelId)!;
+      const eligibleParticipantIds = [...byParticipant.entries()]
+        .filter(([, rows]) => rows.some((row) => (
+          (row.costByModel[modelId] ?? 0) > 0
+        )))
+        .map(([participantId]) => participantId);
+      const observationCount = normalizedObservations.filter((observation) => (
+        (observation.costByModel[modelId] ?? 0) > 0
+      )).length;
+      const apiCostShare = totalCost > 0
+        ? rounded((totalCostByModel.get(modelId) ?? 0) / totalCost, 6)
+        : null;
+      const capacity = fit.status === "fitted"
+        ? fit.capacityUsdByModel?.[modelId]
+        : null;
+      const fitted = typeof capacity === "number" && Number.isFinite(capacity)
+        && capacity > 0;
+      let status: AdminCommunityModelStatus;
+      if (fitted) {
+        status = "fitted";
+      } else if (eligibleParticipantIds.length === 0) {
+        status = "no_usage";
+      } else if (fit.status === "insufficient_observations") {
+        status = "insufficient_observations";
+      } else if (fit.status === "fallback_blended") {
+        status = "unstable_fit";
+      } else {
+        status = "insufficient_evidence";
+      }
+      const summary: AdminCommunityModelSummary = Object.freeze({
+        status,
+        contributingParticipantCount: fitted ? eligibleParticipantIds.length : 0,
+        eligibleParticipantCount: eligibleParticipantIds.length,
+        observationCount,
+        apiCostShare,
+        centralUsd: fitted ? rounded(capacity, 4) : null,
+        // This is one pooled community fit, not a distribution of independent
+        // participant fits, so a between-participant q10-q90 band would be
+        // fabricated. Preserve explicit unavailability.
+        band80Usd: null,
+      });
+      return [modelId, summary];
+    }),
+  ) as Record<AdminCommunityAllowanceModelId, AdminCommunityModelSummary>;
+  return Object.freeze(result);
+}
+
 function previewDay(
   fits: readonly CommunityAllowanceFit[],
+  modelObservations: readonly CommunityModelCompositionObservation[],
   day: string,
 ): AdminCommunityAllowancePreviewDay {
   const dayStartMs = Date.parse(`${day}T00:00:00.000Z`);
@@ -313,6 +583,10 @@ function previewDay(
     const observedMs = Date.parse(fit.lastObservedAt);
     return observedMs > windowStartMs && observedMs <= windowEndMs;
   });
+  const modelObservationsInWindow = modelObservations.filter((observation) => (
+    observation.binStartMs >= windowStartMs
+      && observation.binStartMs < windowEndMs
+  ));
   const planConfig = new Map(
     ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG.map((plan) => [plan.planType, plan]),
   );
@@ -335,6 +609,7 @@ function previewDay(
         ?? 0
     )),
     byPlanType: Object.freeze(byPlanType),
+    byModelId: summarizeModels(modelObservationsInWindow),
   });
 }
 
@@ -349,6 +624,7 @@ export function buildAdminCommunityAllowancePreview(
   participantIds: readonly string[] = [
     ...new Set(fits.map((fit) => fit.participantId)),
   ],
+  modelObservations: readonly CommunityModelCompositionObservation[] = [],
 ): AdminCommunityAllowancePreview {
   if (!Number.isFinite(nowMs)) {
     throw new Error("invalid admin community allowance preview time");
@@ -366,6 +642,11 @@ export function buildAdminCommunityAllowancePreview(
   const cohortSet = new Set(cohort);
   if (fits.some((fit) => !cohortSet.has(fit.participantId))) {
     throw new Error("admin community allowance fit outside preview cohort");
+  }
+  if (modelObservations.some((observation) => (
+    !cohortSet.has(observation.participantId)
+  ))) {
+    throw new Error("admin community model observation outside preview cohort");
   }
   const windowEndMs = toStartMs + MILLISECONDS_PER_DAY;
   const windowStartMs = windowEndMs
@@ -420,6 +701,7 @@ export function buildAdminCommunityAllowancePreview(
     { length: ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS },
     (_, index) => previewDay(
       fits,
+      modelObservations,
       new Date(fromStartMs + index * MILLISECONDS_PER_DAY)
         .toISOString()
         .slice(0, 10),
@@ -436,6 +718,8 @@ export function buildAdminCommunityAllowancePreview(
     qualification: COMMUNITY_ALLOWANCE_QUALIFICATION,
     spanFloorPp: COMMUNITY_ALLOWANCE_SPAN_FLOOR_PP,
     plans: ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG,
+    models: ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG,
+    modelEvidence: ADMIN_COMMUNITY_MODEL_EVIDENCE,
     coverage,
     days: Object.freeze(days),
   });
@@ -456,6 +740,7 @@ export async function buildAdminCommunityAllowancePreviewFromSource(
       corpus.fits,
       nowMs,
       corpus.participantIds,
+      corpus.modelObservations,
     );
 }
 
@@ -516,10 +801,14 @@ export interface AdminCommunityAllowancePreviewCacheResult {
 
 /**
  * Scheduled-only cache materialization. A valid fresh singleton self-throttles
- * the source read. Otherwise maintenance builds the real preview from the
- * existing validated SELECT-only fit-cache path and atomically replaces one
- * bounded aggregate row. Every failure is reported as data, never thrown into
- * the retention/publication maintenance pass.
+ * the source read. Otherwise maintenance first tries the validated fit cache;
+ * if a chunk epoch or adapter migration made it stale, an atomic hourly retry
+ * gate admits the scheduled collector independently of the public-publication
+ * gate. The fresh in-memory corpus can include legacy plan fits while its model
+ * evidence remains explicitly v1-only. The browser path never invokes this
+ * collector. A successful projection atomically replaces one bounded aggregate
+ * row. Every failure is reported as data, never thrown into the
+ * retention/publication maintenance pass.
  */
 export async function warmAdminCommunityAllowancePreviewCache(
   db: D1Database,
@@ -557,10 +846,37 @@ export async function warmAdminCommunityAllowancePreviewCache(
       }
     }
 
-    const preview = await buildAdminCommunityAllowancePreviewFromSource(
+    let preview = await buildAdminCommunityAllowancePreviewFromSource(
       db,
       nowEpoch,
     );
+    if (preview === null) {
+      // Claim the expensive recovery attempt before touching raw evidence.
+      // This table is introduced with the model-cache migration, so a partially
+      // deployed schema fails closed without entering a per-minute reprice loop.
+      const retryCutoff = new Date(
+        nowEpoch - PREVIEW_CACHE_MIN_INTERVAL_MILLISECONDS,
+      ).toISOString();
+      const retry = await db.prepare(
+        `UPDATE admin_community_allowance_preview_refresh_state
+            SET last_attempted_at = ?1
+          WHERE singleton = 1 AND last_attempted_at <= ?2`,
+      ).bind(new Date(nowEpoch).toISOString(), retryCutoff).run();
+      if (retry.meta.changes !== 1) {
+        return { code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" };
+      }
+      // The adapter version and chunk epoch are part of every v1 participant's
+      // evidence-cache key. Fresh collection also supplies any v0.2-selected
+      // plan fits directly, so a legacy account does not suppress the whole
+      // preview merely because it has no v1 model-composition evidence.
+      const corpus = await collectCommunityAllowanceCorpus(db, nowEpoch);
+      preview = buildAdminCommunityAllowancePreview(
+        corpus.fits,
+        nowEpoch,
+        corpus.participantIds,
+        corpus.modelObservations,
+      );
+    }
     if (preview === null) {
       return { code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" };
     }

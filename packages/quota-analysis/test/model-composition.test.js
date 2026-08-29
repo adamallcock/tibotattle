@@ -203,6 +203,41 @@ test("models below the cost-share floor fold into the other column", () => {
   );
 });
 
+test("forced target models fit below the discovery floor while other slivers fold", () => {
+  const observations = Array.from({ length: 72 }, (_, index) => {
+    const sol = index % 3 === 0 ? 20 + index % 5
+      : index % 3 === 2 ? 12 + index % 3 : 0;
+    const terra = index % 3 === 1 ? 9 + index % 4
+      : index % 3 === 2 ? 5 + index % 2 : 0;
+    const luna = 0.03 + ((index * 7) % 11) * 0.02;
+    const autoReview = 0.01 + ((index * 5) % 7) * 0.003;
+    return {
+      binStartMs: index * GRAIN_MS,
+      ppDelta: sol * 100 / 2_500
+        + terra * 100 / 900
+        + luna * 100 / 650
+        + autoReview * 100 / 1_800,
+      costByModel: {
+        "gpt-5.6-sol": sol,
+        "gpt-5.6-terra": terra,
+        "gpt-5.6-luna": luna,
+        "codex-auto-review": autoReview,
+      },
+    };
+  });
+
+  const fit = calibrateCompositionCapacities(observations, {
+    forcedModels: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+  });
+
+  assert.ok(fit.modelCostShares["gpt-5.6-luna"] < 0.03);
+  assert.equal(fit.status, "fitted");
+  assert.equal(fit.capacityUsdByModel["gpt-5.6-luna"], 650);
+  assert.equal(Object.hasOwn(fit.capacityUsdByModel, "codex-auto-review"), false);
+  assert.equal(Object.hasOwn(fit.capacityUsdByModel, "other"), true);
+  assert.equal(fit.identification.splitHalfIdentified, true);
+});
+
 test("expected movement sums per-model cost over the fitted capacities", () => {
   const calibration = {
     capacityUsdByModel: { "gpt-5.6-sol": 2_500, "gpt-5.6-terra": 900 },
@@ -287,6 +322,7 @@ test("observations pair envelope movement with the bin's per-model cost", () => 
     ],
   });
   assert.equal(observations.length, 2);
+  assert.equal(observations[0].planType, "pro");
   assert.equal(observations[0].ppDelta, 3);
   assert.deepEqual(observations[0].costByModel, {
     "gpt-5.6-sol": 40,
@@ -437,4 +473,20 @@ test("a bin where two pools both move is voided as unattributable", () => {
     usageRows: [usageRow(0.5, "gpt-5.6-sol", 30)],
   });
   assert.equal(observations.length, 0);
+});
+
+test("a bin containing two plan eras is voided even when only one pool moves", () => {
+  const { observations, voidedBinCount } = buildCompositionObservations({
+    quotaRows: [
+      quotaReading(0.1, 10, { planType: "pro" }),
+      quotaReading(1, 12, { planType: "pro" }),
+      // A first reading for the next, unsupported era does not move its pool,
+      // but usage in this bin is untagged and cannot inherit Pro's multiplier.
+      quotaReading(1.5, 0, { planType: "team", resetsAtMs: 900 * HOUR_MS }),
+    ],
+    usageRows: [usageRow(0.5, "gpt-5.6-sol", 20)],
+  });
+
+  assert.equal(observations.length, 0);
+  assert.equal(voidedBinCount, 1);
 });

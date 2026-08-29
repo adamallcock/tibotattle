@@ -20,6 +20,7 @@ signing, artifacts, an appcast, or updater infrastructure is operational.
 | [`runbooks/2026-08-04-owner-release-execution.md`](./runbooks/2026-08-04-owner-release-execution.md) | Owner-run release sequence; fail-closed until each external gate is observed |
 | [`runbooks/2026-08-05-internal-dogfood-versus-release-readiness.md`](./runbooks/2026-08-05-internal-dogfood-versus-release-readiness.md) | First-read boundary for the installed ad-hoc preview, future signed `internal-dogfood`, and stable; not a release claim |
 | [`plans/2026-08-05-provider-reported-quota-windows.md`](./plans/2026-08-05-provider-reported-quota-windows.md) | Current provider-reported quota-window implementation and plan-evidence boundary; not release authorization |
+| [`decisions/2026-08-28-admin-model-value-cohort-estimator.md`](./decisions/2026-08-28-admin-model-value-cohort-estimator.md) | Owner-only participant-balanced model-value estimator, personal-plan normalization, and claim boundary |
 | [`runbooks/2026-08-04-staging-release-verification.md`](./runbooks/2026-08-04-staging-release-verification.md) | Credential-free production-containment observer and live-proof boundary |
 | [`runbooks/2026-08-04-disabled-staging-readiness-boundary.md`](./runbooks/2026-08-04-disabled-staging-readiness-boundary.md) | Static and owner-authorized staging checks; staging remains unprovisioned until verified |
 | [`runbooks/2026-08-04-internal-update-rehearsal.md`](./runbooks/2026-08-04-internal-update-rehearsal.md) | Disposable-profile N→N+1 rehearsal; not signing or feed-publication proof |

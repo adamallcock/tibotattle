@@ -388,3 +388,77 @@ export function analyzeQuotaPace(input: {
   currentSnapshot: QuotaPaceSnapshotInput;
   observations: readonly QuotaPaceSnapshotInput[];
 }): QuotaPaceForecast;
+
+export interface ModelCompositionUsageRow {
+  observedAtMs: number;
+  model: string;
+  costUsd: number;
+}
+
+export interface ModelCompositionQuotaRow {
+  observedAtMs: number;
+  planType: string;
+  resetsAtMs: number;
+  usedPercent: number;
+}
+
+export interface ModelCompositionObservation {
+  binStartMs: number;
+  poolKey: string;
+  planType: string;
+  segmentIndex: number;
+  ppDelta: number;
+  costByModel: Record<string, number>;
+}
+
+export const MODEL_COMPOSITION_POLICY: Readonly<{
+  grainMs: number;
+  poolToleranceMs: number;
+  resetDropPp: number;
+  maxCrossingElapsedMs: number;
+  minimumModelCostShare: number;
+  minimumObservations: number;
+  otherModelKey: "other";
+  maxSplitHalfCapacityDriftFraction: number;
+}>;
+
+export function buildCompositionObservations(input?: {
+  usageRows?: readonly ModelCompositionUsageRow[];
+  quotaRows?: readonly ModelCompositionQuotaRow[];
+}, options?: Partial<Pick<typeof MODEL_COMPOSITION_POLICY,
+  "grainMs" | "poolToleranceMs" | "resetDropPp" | "maxCrossingElapsedMs"
+>>): {
+  observations: ModelCompositionObservation[];
+  voidedBinCount: number;
+  poolCount: number;
+};
+
+export interface ModelCompositionFit {
+  observationCount: number;
+  totalCostUsd: number | null;
+  modelCostShares: Record<string, number>;
+  status: "fitted" | "fallback_blended" | "insufficient_observations";
+  capacityUsdByModel: Record<string, number | null> | null;
+  singleConstantUsd: number | null;
+  r2: number | null;
+  singleConstantR2: number | null;
+  solverConverged: boolean | null;
+  identification?: {
+    adjustedR2: number | null;
+    singleConstantAdjustedR2: number | null;
+    splitHalfIdentified: boolean;
+    splitHalfMaxCapacityDriftFraction: number | null;
+  };
+}
+
+export function calibrateCompositionCapacities(
+  observations: readonly ModelCompositionObservation[] | readonly {
+    binStartMs: number;
+    ppDelta: number;
+    costByModel: Readonly<Record<string, number>>;
+  }[],
+  options?: Partial<Pick<typeof MODEL_COMPOSITION_POLICY,
+    "minimumModelCostShare" | "minimumObservations"
+    | "otherModelKey" | "maxSplitHalfCapacityDriftFraction"
+  >> & { forcedModels?: readonly string[] },
+): ModelCompositionFit;

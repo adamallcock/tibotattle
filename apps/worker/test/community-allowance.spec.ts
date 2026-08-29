@@ -5,6 +5,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { handleRequest } from "../src/index";
 import {
+  collectCommunityAllowanceCorpus,
   collectCommunityAllowanceFits,
   summarizeCommunityAllowanceDay,
   summarizeCommunityCapacityByPlanType,
@@ -13,6 +14,7 @@ import type { CommunityAllowanceFit } from "../src/community-allowance";
 import {
   accountScopedQuotaAnalysisV1,
   accountScopedQuotaAnalysisV1FullReferenceForTest,
+  accountScopedQuotaAnalysisV1WithComposition,
   downsampleQuotaForTest,
   MAX_DOWNSAMPLED_QUOTA_ROWS,
   MAX_WINDOWED_USAGE_ROWS,
@@ -937,6 +939,12 @@ function v1PriceableUsageJson(): string {
   });
 }
 
+function v1PriceableUsageJsonForModel(modelId: string): string {
+  const value = JSON.parse(v1PriceableUsageJson()) as Record<string, unknown>;
+  value.modelId = modelId;
+  return JSON.stringify(value);
+}
+
 // A usage record_json the server pricer fails closed on (unknown model), so
 // its reset refuses via incomplete_server_pricing instead of fabricating.
 function v1UnpriceableUsageJson(): string {
@@ -1208,6 +1216,18 @@ describe("community allowance from the v1.0 chunk corpus", () => {
     const first = await collectCommunityAllowanceFits(db());
     expect(first.length).toBeGreaterThanOrEqual(3);
 
+    // A shape-invalid hit is a recomputable miss, not a reason to clear the
+    // current cache key and strand the corrupt row forever.
+    await db().prepare(
+      "UPDATE community_allowance_fit_cache SET fits_json = '{}' WHERE participant_id = ?",
+    ).bind(participantId).run();
+    const repaired = await collectCommunityAllowanceFits(db());
+    expect(repaired).toEqual(first);
+    const repairedCache = await db().prepare(
+      "SELECT fits_json FROM community_allowance_fit_cache WHERE participant_id = ?",
+    ).bind(participantId).first<{ fits_json: string }>();
+    expect(JSON.parse(repairedCache!.fits_json)).toEqual(first);
+
     // Delete the record view but leave the chunk journal untouched: the cache
     // key (chunk count, newest created_at, revision sum) is unchanged, so a
     // recompute would find nothing yet the collector returns the same fits.
@@ -1225,44 +1245,132 @@ describe("community allowance from the v1.0 chunk corpus", () => {
     expect(await collectCommunityAllowanceFits(db())).toHaveLength(0);
   });
 
-  it("analyzes a dual v0.2 + v1 participant through the v0.2 path", async () => {
+  it("keeps dual-source scalar precedence while including v1 composition once", async () => {
     const participant = await enrolledParticipant();
-    const accepted = await upload(participant, calibratableContribution());
-    expect(accepted.status, await accepted.clone().text()).toBe(202);
-
-    // Give the same participant a v1 chunk so both sources exist. MIN(source)
-    // pins the participant to v0.2; the v1 branch is never analyzed. The v1
-    // chunk carries no quota series, so had the v1 path run it would yield no
-    // fit — the single v0.2 fit below proves the v0.2 path was taken.
+    // Start with a complete v1-only corpus and warm that source's cache row.
     await seedV1Session(participant.participantId, "v1-session-dual");
     await seedV1Device(participant.participantId, "v1-device-dual",
       "v1-session-dual");
-    await seedV1Chunk({
-      participantId: participant.participantId,
-      deviceId: "v1-device-dual",
-      stream: "usage",
-      chunkDay: "2026-07-25",
-      seq: 0,
-      createdAt: "2026-07-25T20:00:00.000Z",
-      records: [{
-        occurrence_id: "u-dual-0",
-        observed_at: "2026-07-25T12:00:00.000Z",
-        provider: "openai_codex",
-        model_id: "gpt-5.6-sol",
-        record_json: v1PriceableUsageJson(),
-      }],
-    });
+    await seedThreeV1Resets(
+      participant.participantId,
+      "v1-device-dual",
+      5,
+      "dual",
+    );
+    const directV1 = await accountScopedQuotaAnalysisV1WithComposition(
+      db(),
+      participant.participantId,
+    );
+    expect(directV1.compositionObservations.length).toBeGreaterThan(0);
+    const expectedModelObservations = directV1.compositionObservations.map(
+      (observation) => ({
+        participantId: participant.participantId,
+        ...observation,
+      }),
+    );
+    const v1Only = await collectCommunityAllowanceCorpus(db());
+    expect(v1Only.fits.length).toBeGreaterThanOrEqual(3);
+    expect(v1Only.modelObservations).toEqual(expectedModelObservations);
+    const v1Cache = await db().prepare(
+      `SELECT cache_key
+         FROM community_allowance_fit_cache
+        WHERE participant_id = ?`,
+    ).bind(participant.participantId).first<{ cache_key: string }>();
+    expect(v1Cache!.cache_key).toMatch(/:v1$/u);
 
-    const fits = await collectCommunityAllowanceFits(db());
-    expect(fits).toHaveLength(1);
-    expect(fits[0]!.participantId).toBe(participant.participantId);
-    expect(fits[0]!.lastObservedAt).toBe("2026-07-25T12:40:00.000Z");
+    // Adding accepted v0.2 evidence changes only the scalar source, not the v1
+    // chunk epoch. Source identity in the cache key must force a miss here so
+    // the old v1 scalar fits cannot leak into the dual-source result.
+    const accepted = await upload(participant, calibratableContribution());
+    expect(accepted.status, await accepted.clone().text()).toBe(202);
 
-    // No fit cache row is written for a v0.2-source participant.
+    const first = await collectCommunityAllowanceCorpus(db());
+    expect(first.fits).toHaveLength(1);
+    expect(first.fits[0]!.participantId).toBe(participant.participantId);
+    expect(first.fits[0]!.lastObservedAt)
+      .toBe("2026-07-25T12:40:00.000Z");
+    expect(first.modelObservations).toEqual(expectedModelObservations);
+
+    // Dual-source rows cache their independent v1 model corpus. The cached
+    // fits stay unusable by the SELECT-only reader because their v0.2 scalar
+    // epoch cannot be proved from the v1 chunk key.
     const cached = await db().prepare(
-      "SELECT COUNT(*) AS total FROM community_allowance_fit_cache",
-    ).first<{ total: number }>();
-    expect(cached?.total).toBe(0);
+      `SELECT cache_key, fits_json, model_observations_json
+         FROM community_allowance_fit_cache
+        WHERE participant_id = ?`,
+    ).bind(participant.participantId).first<{
+      cache_key: string;
+      fits_json: string;
+      model_observations_json: string;
+    }>();
+    expect(cached!.cache_key).toMatch(/:v0\.2$/u);
+    expect(JSON.parse(cached!.fits_json)).toEqual(first.fits);
+    expect(JSON.parse(cached!.model_observations_json))
+      .toEqual(expectedModelObservations);
+
+    // Removing only the record view leaves the v1 chunk epoch unchanged. A
+    // second collection therefore proves the composition is reused once from
+    // cache while the v0.2 scalar fit is recomputed independently.
+    await db().prepare(
+      "DELETE FROM telemetry_v1_records WHERE participant_id = ?",
+    ).bind(participant.participantId).run();
+    const second = await collectCommunityAllowanceCorpus(db());
+    expect(second.fits).toEqual(first.fits);
+    expect(second.modelObservations).toEqual(expectedModelObservations);
+  });
+
+  it("invalidates dual-source scalar fits when the last v0.2 contribution is deleted", async () => {
+    const participant = await enrolledParticipant();
+    const accepted = await upload(participant, calibratableContribution());
+    expect(accepted.status, await accepted.clone().text()).toBe(202);
+    await seedV1Session(participant.participantId, "v1-session-source-flip");
+    await seedV1Device(
+      participant.participantId,
+      "v1-device-source-flip",
+      "v1-session-source-flip",
+    );
+    await seedThreeV1Resets(
+      participant.participantId,
+      "v1-device-source-flip",
+      5,
+      "source-flip",
+    );
+
+    const dual = await collectCommunityAllowanceCorpus(db());
+    expect(dual.fits).toHaveLength(1);
+    const dualCache = await db().prepare(
+      `SELECT cache_key
+         FROM community_allowance_fit_cache
+        WHERE participant_id = ?`,
+    ).bind(participant.participantId).first<{ cache_key: string }>();
+    expect(dualCache!.cache_key).toMatch(/:v0\.2$/u);
+
+    // This mirrors the supported deletion lifecycle's database transition:
+    // mark the accepted whole contribution deleting, then remove its row.
+    // The current v1 chunks remain untouched, so only the scalar source changes.
+    await db().prepare(
+      `UPDATE telemetry_contributions
+          SET status = 'deleting'
+        WHERE participant_id = ? AND status = 'accepted'`,
+    ).bind(participant.participantId).run();
+    await db().prepare(
+      `DELETE FROM telemetry_contributions
+        WHERE participant_id = ? AND status = 'deleting'`,
+    ).bind(participant.participantId).run();
+
+    const v1Only = await collectCommunityAllowanceCorpus(db());
+    expect(v1Only.fits.length).toBeGreaterThanOrEqual(3);
+    expect(v1Only.modelObservations.length).toBeGreaterThan(0);
+    const v1Cache = await db().prepare(
+      `SELECT cache_key, fits_json
+         FROM community_allowance_fit_cache
+        WHERE participant_id = ?`,
+    ).bind(participant.participantId).first<{
+      cache_key: string;
+      fits_json: string;
+    }>();
+    expect(v1Cache!.cache_key).toMatch(/:v1$/u);
+    expect(JSON.parse(v1Cache!.fits_json)).toEqual(v1Only.fits);
   });
 });
 
@@ -1846,10 +1954,10 @@ describe("v1 analyzer scale fix — fit-preserving reduction", () => {
     expect(usageCount).toBeLessThan(MAX_WINDOWED_USAGE_ROWS);
   });
 
-  it("the SQL fitable HAVING tracks the shared calibration policy, not a hardcoded 8/5", async () => {
-    // Behavioural coupling: a reset group with one fewer than the policy's
-    // minimum distinct used_percent is dropped by the downsample; the minimum
-    // survives.
+  it("retains compact quota crossings below the scalar fit gate for composition evidence", async () => {
+    // Composition identifies model coefficients across many weekly pools and
+    // therefore must see compact crossings even when one reset alone has one
+    // fewer boundary than the scalar reset fitter requires.
     const minBoundaries = QUOTA_CALIBRATION_POLICY.minimumBoundaries;
     const below = await newV1Participant("having-below");
     const at = await newV1Participant("having-at");
@@ -1895,9 +2003,221 @@ describe("v1 analyzer scale fix — fit-preserving reduction", () => {
     await makeLevels(below, "v1-device-having-below", minBoundaries - 1);
     await makeLevels(at, "v1-device-having-at", minBoundaries);
 
-    expect(await downsampleQuotaForTest(db(), below, SCALE_NOW)).toHaveLength(0);
-    expect(
-      (await downsampleQuotaForTest(db(), at, SCALE_NOW)).length,
-    ).toBeGreaterThan(0);
+    const belowRows = await downsampleQuotaForTest(db(), below, SCALE_NOW);
+    const atRows = await downsampleQuotaForTest(db(), at, SCALE_NOW);
+    expect(belowRows.length).toBeGreaterThan(0);
+    expect(atRows.length).toBeGreaterThan(belowRows.length);
+
+    const belowAnalysis = await accountScopedQuotaAnalysisV1(
+      db(),
+      below,
+      { nowMs: SCALE_NOW },
+    ) as AnalysisLike;
+    expect(belowAnalysis.status).toBe("ready");
+    const belowResets = allResets(belowAnalysis);
+    expect(belowResets.some((reset) => (
+      reset.status === "conditional_estimate"
+    ))).toBe(false);
+  });
+
+  it("retains personal-plan model bins with plan eras and excludes unsupported plans", async () => {
+    const participantId = await newV1Participant("composition");
+    const device = "v1-device-composition";
+    const baseMs = SCALE_NOW - 20 * DAY_MS;
+    const quota: V1SeedRecord[] = [];
+    const usage: V1SeedRecord[] = [];
+    const proResetsAt = new Date(baseMs + 7 * DAY_MS).toISOString();
+    for (let index = 0; index < 30; index += 1) {
+      const binStartMs = baseMs + index * 2 * 60 * MINUTE_MS;
+      for (const [offsetMinutes, extraPp] of [[10, 0], [100, 1]] as const) {
+        quota.push({
+          occurrence_id: `q-composition-pro-${index}-${offsetMinutes}`,
+          observed_at: new Date(
+            binStartMs + offsetMinutes * MINUTE_MS,
+          ).toISOString(),
+          provider: "openai_codex",
+          plan_type: "pro",
+          plan_variant: "unknown",
+          limit_id: "codex",
+          slot: "seven_day",
+          used_percent: 10 + index * 2 + extraPp,
+          window_duration_minutes: 10_080,
+          resets_at: proResetsAt,
+        });
+      }
+      const modelId = index === 5
+        ? "unknown"
+        : index === 7
+          ? "gpt-5.6-sol-wm"
+          : index % 2 === 0 ? "gpt-5.6-sol" : "gpt-5.6-terra";
+      usage.push({
+        occurrence_id: `u-composition-pro-${index}`,
+        observed_at: new Date(binStartMs + 60 * MINUTE_MS).toISOString(),
+        provider: "openai_codex",
+        model_id: modelId,
+        record_json: index === 6
+          ? "{"
+          : modelId === "unknown"
+          ? v1UnpriceableUsageJson()
+          : v1PriceableUsageJsonForModel(modelId),
+      });
+    }
+
+    // Later personal-plan eras preserve their source plan for row-level Pro
+    // 20x normalization. Unsupported eras are still fed through the kernel so
+    // overlapping cross-plan movement remains ambiguous, then excluded.
+    const plusStartMs = baseMs + 80 * 60 * MINUTE_MS;
+    const plusResetsAt = new Date(plusStartMs + 7 * DAY_MS).toISOString();
+    for (let index = 0; index < 6; index += 1) {
+      const binStartMs = plusStartMs + index * 2 * 60 * MINUTE_MS;
+      quota.push({
+        occurrence_id: `q-composition-plus-${index}-a`,
+        observed_at: new Date(binStartMs + 10 * MINUTE_MS).toISOString(),
+        provider: "openai_codex",
+        plan_type: "plus",
+        plan_variant: "unknown",
+        limit_id: "codex",
+        slot: "seven_day",
+        used_percent: 10 + index * 2,
+        window_duration_minutes: 10_080,
+        resets_at: plusResetsAt,
+      }, {
+        occurrence_id: `q-composition-plus-${index}-b`,
+        observed_at: new Date(binStartMs + 100 * MINUTE_MS).toISOString(),
+        provider: "openai_codex",
+        plan_type: "plus",
+        plan_variant: "unknown",
+        limit_id: "codex",
+        slot: "seven_day",
+        used_percent: 11 + index * 2,
+        window_duration_minutes: 10_080,
+        resets_at: plusResetsAt,
+      });
+      usage.push({
+        occurrence_id: `u-composition-plus-${index}`,
+        observed_at: new Date(binStartMs + 60 * MINUTE_MS).toISOString(),
+        provider: "openai_codex",
+        model_id: "gpt-5.6-sol",
+        record_json: v1PriceableUsageJson(),
+      });
+    }
+
+    const ambiguousPlusBinStartMs = Math.floor(
+      (plusStartMs + 100 * MINUTE_MS) / (2 * 60 * MINUTE_MS),
+    ) * 2 * 60 * MINUTE_MS;
+    const transitionResetsAt = new Date(
+      ambiguousPlusBinStartMs + 8 * DAY_MS,
+    ).toISOString();
+    for (const offsetMinutes of [20, 40]) {
+      quota.push({
+        occurrence_id: `q-composition-transition-team-${offsetMinutes}`,
+        observed_at: new Date(
+          ambiguousPlusBinStartMs + offsetMinutes * MINUTE_MS,
+        ).toISOString(),
+        provider: "openai_codex",
+        plan_type: "team",
+        plan_variant: "unknown",
+        limit_id: "codex",
+        slot: "seven_day",
+        used_percent: 0,
+        window_duration_minutes: 10_080,
+        resets_at: transitionResetsAt,
+      });
+    }
+
+    const additionalPlanBlocks = [
+      { planType: "prolite", startHours: 100 },
+      { planType: "team", startHours: 120 },
+      { planType: "unknown", startHours: 140 },
+    ] as const;
+    for (const { planType, startHours } of additionalPlanBlocks) {
+      const blockStartMs = baseMs + startHours * 60 * MINUTE_MS;
+      const resetsAt = new Date(blockStartMs + 7 * DAY_MS).toISOString();
+      for (let index = 0; index < 6; index += 1) {
+        const binStartMs = blockStartMs + index * 2 * 60 * MINUTE_MS;
+        quota.push({
+          occurrence_id: `q-composition-${planType}-${index}-a`,
+          observed_at: new Date(binStartMs + 10 * MINUTE_MS).toISOString(),
+          provider: "openai_codex",
+          plan_type: planType,
+          plan_variant: "unknown",
+          limit_id: "codex",
+          slot: "seven_day",
+          used_percent: 10 + index * 2,
+          window_duration_minutes: 10_080,
+          resets_at: resetsAt,
+        }, {
+          occurrence_id: `q-composition-${planType}-${index}-b`,
+          observed_at: new Date(binStartMs + 100 * MINUTE_MS).toISOString(),
+          provider: "openai_codex",
+          plan_type: planType,
+          plan_variant: "unknown",
+          limit_id: "codex",
+          slot: "seven_day",
+          used_percent: 11 + index * 2,
+          window_duration_minutes: 10_080,
+          resets_at: resetsAt,
+        });
+        usage.push({
+          occurrence_id: `u-composition-${planType}-${index}`,
+          observed_at: new Date(binStartMs + 60 * MINUTE_MS).toISOString(),
+          provider: "openai_codex",
+          model_id: "gpt-5.6-sol",
+          record_json: v1PriceableUsageJson(),
+        });
+      }
+    }
+
+    const byDay = (records: V1SeedRecord[]) => Map.groupBy(
+      records,
+      (record) => record.observed_at.slice(0, 10),
+    );
+    for (const [day, rows] of byDay(quota)) {
+      await seedChunkedRecords(participantId, device, "quota", day, rows);
+    }
+    for (const [day, rows] of byDay(usage)) {
+      await seedChunkedRecords(participantId, device, "usage", day, rows);
+    }
+
+    const result = await accountScopedQuotaAnalysisV1WithComposition(
+      db(),
+      participantId,
+      { nowMs: SCALE_NOW },
+    );
+    expect(result.compositionObservations.length).toBeGreaterThanOrEqual(24);
+    expect([...new Set(result.compositionObservations.map(
+      (observation) => observation.planType,
+    ))].sort()).toEqual(["plus", "pro", "prolite"]);
+    expect(result.compositionObservations.some((observation) => (
+      observation.planType === "plus"
+    ))).toBe(true);
+    expect(result.compositionObservations.some((observation) => (
+      observation.planType === "prolite"
+    ))).toBe(true);
+    expect(result.compositionObservations.some((observation) => (
+      observation.binStartMs === ambiguousPlusBinStartMs
+    ))).toBe(false);
+    const firstUnsupportedStartMs = baseMs + 120 * 60 * MINUTE_MS;
+    expect(result.compositionObservations.every((observation) => (
+      observation.binStartMs < firstUnsupportedStartMs
+    ))).toBe(true);
+    const invalidBin = Math.floor(
+      (baseMs + 5 * 2 * 60 * MINUTE_MS) / (2 * 60 * MINUTE_MS),
+    ) * 2 * 60 * MINUTE_MS;
+    expect(result.compositionObservations.some((observation) => (
+      observation.binStartMs === invalidBin
+    ))).toBe(false);
+    const malformedBin = Math.floor(
+      (baseMs + 6 * 2 * 60 * MINUTE_MS) / (2 * 60 * MINUTE_MS),
+    ) * 2 * 60 * MINUTE_MS;
+    expect(result.compositionObservations.some((observation) => (
+      observation.binStartMs === malformedBin
+    ))).toBe(false);
+    const modelIds = new Set(result.compositionObservations.flatMap(
+      (observation) => Object.keys(observation.costByModel),
+    ));
+    expect(modelIds).toContain("gpt-5.6-sol");
+    expect(modelIds).toContain("gpt-5.6-terra");
+    expect(modelIds).not.toContain("gpt-5.6-sol-wm");
   });
 });

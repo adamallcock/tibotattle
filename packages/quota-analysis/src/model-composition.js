@@ -147,7 +147,12 @@ export function buildCompositionObservations({
     const poolKey = clusterKeyByReset.get(`${row.planType}\0${row.resetsAtMs}`);
     let pool = pools.get(poolKey);
     if (pool === undefined) {
-      pool = { key: poolKey, segments: [], pendingDrop: null };
+      pool = {
+        key: poolKey,
+        planType: row.planType,
+        segments: [],
+        pendingDrop: null,
+      };
       pools.set(poolKey, pool);
     }
     const segment = pool.segments.at(-1);
@@ -207,6 +212,20 @@ export function buildCompositionObservations({
   // Crossings -> bins, voiding smeared crossings and ambiguous bins.
   const entries = new Map();
   const voidedBins = new Set();
+  const plansByReadingBin = new Map();
+  for (const reading of readings) {
+    const bin = Math.floor(reading.observedAtMs / grainMs) * grainMs;
+    const plans = plansByReadingBin.get(bin) ?? new Set();
+    plans.add(reading.planType);
+    plansByReadingBin.set(bin, plans);
+  }
+  for (const [bin, plans] of plansByReadingBin) {
+    // Usage events have no plan tag. Even when only one pool moves, a bin that
+    // contains readings from two plan eras can mix old-plan and new-plan spend;
+    // no single normalization multiplier can be assigned honestly. Unknown and
+    // unsupported plans participate in this ambiguity check too.
+    if (plans.size > 1) voidedBins.add(bin);
+  }
   for (const pool of pools.values()) {
     for (const [segmentIndex, segment] of pool.segments.entries()) {
       for (const crossing of segment.crossings) {
@@ -223,6 +242,7 @@ export function buildCompositionObservations({
         if (entry === undefined) {
           entry = {
             poolKey: pool.key,
+            planType: pool.planType,
             segmentIndex,
             binStartMs: lastBin,
             ppDelta: 0,
@@ -427,6 +447,11 @@ function round(value, places = 6) {
  * - all fall back to `singleConstantUsd`, which is always emitted when any
  *   usable observation exists.
  *
+ * `forcedModels` lets a caller nominate an already-known target model as a
+ * named column below the generic discovery floor. The target still has to be
+ * present in the corpus and pass every observation-count, adjusted-fit, and
+ * split-half stability gate. Unforced slivers continue to fold into `other`.
+ *
  * A model NNLS zeroes out keeps `null` capacity (its cost showed no quota
  * consumption at this grain); `compositionExpectedPp` prices such cost at the
  * caller's fallback constant rather than pretending it is free.
@@ -437,7 +462,14 @@ export function calibrateCompositionCapacities(observations, {
   otherModelKey = MODEL_COMPOSITION_POLICY.otherModelKey,
   maxSplitHalfCapacityDriftFraction =
     MODEL_COMPOSITION_POLICY.maxSplitHalfCapacityDriftFraction,
+  forcedModels = [],
 } = {}) {
+  if (!Array.isArray(forcedModels)
+      || forcedModels.some((model) => typeof model !== "string"
+        || model.length === 0)) {
+    throw new TypeError("forcedModels must be an array of non-empty strings");
+  }
+  const forcedModelSet = new Set(forcedModels);
   const usable = (Array.isArray(observations) ? observations : [])
     .filter((observation) => observation
       && finitePositive(observation.ppDelta)
@@ -500,7 +532,8 @@ export function calibrateCompositionCapacities(observations, {
     };
   }
   const fittedModels = Object.entries(totalsByModel)
-    .filter(([, cost]) => cost / totalCost >= minimumModelCostShare)
+    .filter(([model, cost]) => forcedModelSet.has(model)
+      || cost / totalCost >= minimumModelCostShare)
     .map(([model]) => model)
     .sort();
   const { columns, rows } = designFor(usable, fittedModels, otherModelKey);
@@ -527,11 +560,13 @@ export function calibrateCompositionCapacities(observations, {
   // corpus. A genuinely identified capacity reappears near its full-fit
   // value in every half that actually CARRIES the model's cost; a
   // near-collinear noise split lands wherever each half's noise points. A
-  // half holding less than the share floor of a model's cost is absence of
-  // evidence, not instability, and is skipped for that model (a corpus of
-  // alternating pure-model bins must not fail on its own alternation). Only
-  // NAMED fitted models are held to this — the folded "other" sliver never
-  // carries enough cost for its drift to matter.
+  // half holding less than the share floor of a discovered model's cost is
+  // absence of evidence, not instability, and is skipped for that model (a
+  // corpus of alternating pure-model bins must not fail on its own
+  // alternation). Explicit forced targets are checked in every half that
+  // carries any of their cost. Only NAMED fitted models are held to this —
+  // the folded "other" sliver never carries enough cost for its drift to
+  // matter.
   const ordered = [...usable].sort((left, right) => (
     (Number.isFinite(left.binStartMs) ? left.binStartMs : 0)
       - (Number.isFinite(right.binStartMs) ? right.binStartMs : 0)
@@ -553,8 +588,10 @@ export function calibrateCompositionCapacities(observations, {
       if (!fittedModels.includes(model)) continue;
       if (!(solution[index] > 1e-9)) continue;
       if (!(halfTotalCost > 0)
-          || halfColumnCosts[index]
-            < minimumModelCostShare * halfTotalCost) continue;
+          || (forcedModelSet.has(model)
+            ? !(halfColumnCosts[index] > 0)
+            : halfColumnCosts[index]
+              < minimumModelCostShare * halfTotalCost)) continue;
       if (!halfFit.converged || !(halfFit.solution[index] > 1e-9)) {
         splitHalfIdentified = false;
         continue;

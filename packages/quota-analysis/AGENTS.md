@@ -11,8 +11,12 @@ guidance first.
 - Preserve quota family, window duration, reset identity, account scope, plan era,
   observation time, freshness, coverage, speed/billing basis, and uncertainty
   wherever they affect comparability.
-- Never pool distinct accounts, plans, reset windows, quota families, or pricing
-  bases. Never use future reset observations to fit or label an earlier forecast.
+- Never pool distinct accounts for account-level inference, or pool plans, reset
+  windows, quota families, or pricing bases. A cross-account cohort estimator is
+  allowed only when an accepted product decision explicitly scopes it to an
+  aggregate surface, preserves participant boundaries, balances participant
+  influence, and makes the aggregation basis part of the output contract. Never
+  use future reset observations to fit or label an earlier forecast.
 - Unknown control state, hidden usage, missing coverage, integer-display lag,
   conflicting constraints, wide intervals, and change points remain explicit
   non-identifiability or uncertainty, not cleaned data.
