@@ -14,6 +14,13 @@ const STABLE_VERSION_PATTERN = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$
 const RELEASE_NOTE_FILENAME_PATTERN = /^((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))\.md$/u;
 const CHANGELOG_ENTRY_PATTERN = /^## \[((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))\](?:\(([^)]+)\))?(?: - (\S+))?\s*$/gmu;
 const CHANGELOG_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/u;
+const PINNED_LEGACY_STABLE_TAG = Object.freeze({
+  annotatedObjectName: "b0aa8f8a307f10c84e37f905012523a1696401cc",
+  publishedObjectName: "3b3a852abad643095c296550a827ed448b3720fa",
+  publishedObjectType: "commit",
+  sourceCommit: "151adec996c9a0f621819f89777ac5a05f1df8b6",
+  version: "0.1.10",
+});
 
 function issue(code, path, detail) {
   return { code, detail, path };
@@ -59,7 +66,7 @@ async function discoverStableTags(rootDirectory) {
       "-C",
       rootDirectory,
       "for-each-ref",
-      "--format=%(refname:short)%09%(objecttype)",
+      "--format=%(refname:short)%09%(objecttype)%09%(objectname)%09%(*objectname)",
       "refs/tags/v*",
     ],
     { encoding: "utf8" },
@@ -69,13 +76,46 @@ async function discoverStableTags(rootDirectory) {
     .map((line) => line.trim())
     .filter(Boolean)
     .map((line) => {
-      const [tag, objectType] = line.split("\t");
+      const [tag, objectType, objectName, peeledObjectName = ""] = line.split("\t");
       return {
+        objectName,
         objectType,
+        peeledObjectName,
         version: normalizeStableVersion(tag),
       };
     })
     .filter((record) => record.version !== null);
+}
+
+export function classifyStableTagRecord(record) {
+  const version = normalizeStableVersion(record?.version);
+  if (version === null) return "invalid";
+  if (version === PINNED_LEGACY_STABLE_TAG.version) {
+    if (record.objectType === "tag") {
+      return record.objectName === PINNED_LEGACY_STABLE_TAG.annotatedObjectName
+        && record.peeledObjectName === PINNED_LEGACY_STABLE_TAG.sourceCommit
+        ? "annotated"
+        : "invalid";
+    }
+    return record.objectType === PINNED_LEGACY_STABLE_TAG.publishedObjectType
+      && record.objectName === PINNED_LEGACY_STABLE_TAG.publishedObjectName
+      ? "pinned_legacy"
+      : "invalid";
+  }
+  return record.objectType === "tag" ? "annotated" : "invalid";
+}
+
+function sourceRevision(version) {
+  return version === PINNED_LEGACY_STABLE_TAG.version
+    ? PINNED_LEGACY_STABLE_TAG.sourceCommit
+    : "v" + version;
+}
+
+function sourceUrl(version) {
+  return version !== PINNED_LEGACY_STABLE_TAG.version
+    ? REPOSITORY_WEB_URL + "/tree/v" + version
+    : REPOSITORY_WEB_URL + "/commit/"
+      + PINNED_LEGACY_STABLE_TAG.sourceCommit;
 }
 
 function parseChangelog(source) {
@@ -134,13 +174,16 @@ function addIssue(issues, seenIssues, code, path, detail) {
 
 /**
  * Validate the repository-local release history without requiring network
- * access. Annotated stable Git tags supply the published-version set; the
- * package version is included separately so release preparation is checked
- * before the next tag exists. tagVersions is injectable for deterministic
- * fixture tests that do not create a Git repository.
+ * access. Annotated stable Git tags and exact pinned historical anomalies
+ * supply the published-version set; the package version is included separately
+ * so release preparation is checked before the next tag exists. tagVersions is
+ * injectable for deterministic fixture tests that do not create a Git
+ * repository. tagRecords injects exact Git-ref records for tag-classification
+ * fixtures.
  */
 export async function checkReleaseNotes({
   rootDirectory = DEFAULT_REPOSITORY_ROOT,
+  tagRecords = null,
   tagVersions = null,
 } = {}) {
   const absoluteRoot = resolve(rootDirectory);
@@ -183,22 +226,46 @@ export async function checkReleaseNotes({
   }
 
   let annotatedStableTagCount = null;
+  let acceptedLegacyTagExceptions = [];
+  let pinnedLegacyTagRecordCount = null;
   let stableTagVersions = [];
   if (tagVersions === null) {
     try {
-      const stableTags = await discoverStableTags(absoluteRoot);
+      const stableTags = tagRecords === null
+        ? await discoverStableTags(absoluteRoot)
+        : tagRecords
+          .map((record) => ({
+            ...record,
+            version: normalizeStableVersion(record?.version),
+          }))
+          .filter((record) => record.version !== null);
+      pinnedLegacyTagRecordCount = stableTags.filter(
+        (record) => record.version === PINNED_LEGACY_STABLE_TAG.version,
+      ).length;
       stableTagVersions = stableTags.map((record) => record.version);
-      annotatedStableTagCount = stableTags
-        .filter((record) => record.objectType === "tag")
+      const classifiedTags = stableTags.map((record) => ({
+        classification: classifyStableTagRecord(record),
+        record,
+      }));
+      annotatedStableTagCount = classifiedTags
+        .filter(({ classification }) => classification === "annotated")
         .length;
-      for (const record of stableTags) {
-        if (record.objectType === "tag") continue;
+      for (const { classification, record } of classifiedTags) {
+        if (classification === "annotated") continue;
+        if (classification === "pinned_legacy") {
+          acceptedLegacyTagExceptions.push({
+            objectName: record.objectName,
+            sourceCommit: PINNED_LEGACY_STABLE_TAG.sourceCommit,
+            version: record.version,
+          });
+          continue;
+        }
         addIssue(
           issues,
           seenIssues,
           "stable_tag_not_annotated",
           "refs/tags/v" + record.version,
-          "Published stable tags must be annotated provenance records.",
+          "Published stable tags must be annotated provenance records or match an exact pinned historical anomaly.",
         );
       }
     } catch (error) {
@@ -216,6 +283,8 @@ export async function checkReleaseNotes({
       .filter((version) => version !== null);
   }
   stableTagVersions = [...new Set(stableTagVersions)].sort(compareVersions);
+  acceptedLegacyTagExceptions = acceptedLegacyTagExceptions
+    .sort((left, right) => compareVersions(left.version, right.version));
 
   const changelogPath = join(absoluteRoot, "CHANGELOG.md");
   const changelogSource = await readOptionalText(changelogPath);
@@ -279,7 +348,7 @@ export async function checkReleaseNotes({
       );
     }
     const releaseUrl = REPOSITORY_WEB_URL + "/releases/tag/v" + entry.version;
-    const tagUrl = REPOSITORY_WEB_URL + "/tree/v" + entry.version;
+    const expectedSourceUrl = sourceUrl(entry.version);
     if (!entry.section.includes("**Provenance:**")) {
       addIssue(
         issues,
@@ -298,20 +367,33 @@ export async function checkReleaseNotes({
         "Version " + entry.version + " must link to " + releaseUrl + ".",
       );
     }
-    if (!entry.section.includes(tagUrl)) {
+    if (!entry.section.includes(expectedSourceUrl)) {
       addIssue(
         issues,
         seenIssues,
         "invalid_source_tag_provenance",
         "CHANGELOG.md",
-        "Version " + entry.version + " must link to " + tagUrl + ".",
+        "Version " + entry.version + " must link to " + expectedSourceUrl + ".",
+      );
+    }
+    if (
+      entry.version === PINNED_LEGACY_STABLE_TAG.version
+      && !entry.section.includes(PINNED_LEGACY_STABLE_TAG.publishedObjectName)
+    ) {
+      addIssue(
+        issues,
+        seenIssues,
+        "missing_tag_anomaly_provenance",
+        "CHANGELOG.md",
+        "Version " + entry.version + " must disclose pinned published object "
+          + PINNED_LEGACY_STABLE_TAG.publishedObjectName + ".",
       );
     }
     const olderEntry = parsedChangelog.entries[index + 1] ?? null;
     const historyUrl = olderEntry === null
-      ? REPOSITORY_WEB_URL + "/commits/v" + entry.version
-      : REPOSITORY_WEB_URL + "/compare/v" + olderEntry.version
-        + "...v" + entry.version;
+      ? REPOSITORY_WEB_URL + "/commits/" + sourceRevision(entry.version)
+      : REPOSITORY_WEB_URL + "/compare/" + sourceRevision(olderEntry.version)
+        + "..." + sourceRevision(entry.version);
     if (!entry.section.includes(historyUrl)) {
       addIssue(
         issues,
@@ -361,6 +443,24 @@ export async function checkReleaseNotes({
   const noteVersions = releaseNotes === null
     ? []
     : [...releaseNotes.keys()].sort(compareVersions);
+
+  if (
+    tagVersions === null
+    && (
+      releaseNotes?.has(PINNED_LEGACY_STABLE_TAG.version)
+      || changelogEntries.has(PINNED_LEGACY_STABLE_TAG.version)
+    )
+    && pinnedLegacyTagRecordCount !== 1
+  ) {
+    addIssue(
+      issues,
+      seenIssues,
+      "pinned_legacy_tag_record_count",
+      "refs/tags/v" + PINNED_LEGACY_STABLE_TAG.version,
+      "The pinned historical anomaly requires exactly one discovered tag record; found "
+        + pinnedLegacyTagRecordCount + ".",
+    );
+  }
 
   for (const [version, source] of releaseNotes ?? []) {
     if (source.trim().length === 0) {
@@ -435,6 +535,7 @@ export async function checkReleaseNotes({
   );
   return {
     annotatedStableTagCount,
+    acceptedLegacyTagExceptions,
     changelogVersions: [...changelogEntries.keys()],
     issues,
     noteVersions,
@@ -453,6 +554,12 @@ export function formatReleaseNotesReport(result) {
       ...(result.annotatedStableTagCount === null
         ? []
         : ["Annotated stable tags: " + result.annotatedStableTagCount]),
+      ...(result.acceptedLegacyTagExceptions.length === 0
+        ? []
+        : result.acceptedLegacyTagExceptions.map((exception) =>
+            "Pinned legacy tag exception: v" + exception.version + " "
+              + exception.objectName + " -> source " + exception.sourceCommit
+          )),
       "Release notes covered: " + result.noteVersions.length,
       "Changelog entries covered: " + result.changelogVersions.length,
     ].join("\n");

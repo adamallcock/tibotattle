@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   checkReleaseNotes,
+  classifyStableTagRecord,
   formatReleaseNotesReport,
 } from "../scripts/check-release-notes.mjs";
 
@@ -23,6 +24,9 @@ const REPOSITORY_ROOT = resolve(
   "..",
 );
 const REPOSITORY_WEB_URL = "https://github.com/adamallcock/tibotattle";
+const LEGACY_TAG_OBJECT = "3b3a852abad643095c296550a827ed448b3720fa";
+const LEGACY_TAG_SOURCE = "151adec996c9a0f621819f89777ac5a05f1df8b6";
+const LOCAL_ANNOTATED_TAG_OBJECT = "b0aa8f8a307f10c84e37f905012523a1696401cc";
 const execFile = promisify(execFileCallback);
 
 function provenanceLines(version, olderVersion = null) {
@@ -93,19 +97,166 @@ async function populateCompleteFixture(rootDirectory) {
   ]);
 }
 
+async function populateLegacyTagFixture(rootDirectory) {
+  await mkdir(join(rootDirectory, "release-notes"), { recursive: true });
+  await Promise.all([
+    writeFile(
+      join(rootDirectory, "package.json"),
+      JSON.stringify({ version: "0.1.10" }) + "\n",
+      "utf8",
+    ),
+    writeFile(
+      join(rootDirectory, "CHANGELOG.md"),
+      [
+        "# Changelog",
+        "",
+        "## Provenance and acknowledgements",
+        "",
+        "The sole historical tag anomaly is exact and pinned.",
+        "",
+        "## [Unreleased]",
+        "",
+        "## [0.1.10](./release-notes/0.1.10.md) - 2026-08-12",
+        "",
+        `**Provenance:** [GitHub release](${REPOSITORY_WEB_URL}/releases/tag/v0.1.10) ·`,
+        `[source commit](${REPOSITORY_WEB_URL}/commit/${LEGACY_TAG_SOURCE}) ·`,
+        `[source history](${REPOSITORY_WEB_URL}/commits/${LEGACY_TAG_SOURCE})`,
+        "",
+        `Historical published object: ${LEGACY_TAG_OBJECT}.`,
+        "",
+      ].join("\n"),
+      "utf8",
+    ),
+    writeFile(
+      join(rootDirectory, "release-notes", "0.1.10.md"),
+      "# Product 0.1.10\n",
+      "utf8",
+    ),
+  ]);
+}
+
 test("the current repository covers every stable tag and package version", async () => {
   const result = await checkReleaseNotes({ rootDirectory: REPOSITORY_ROOT });
   assert.equal(result.ok, true, formatReleaseNotesReport(result));
   assert.match(result.packageVersion, /^\d+\.\d+\.\d+$/u);
   assert.equal(result.stableTagVersions.includes("0.1.0"), true);
+  assert.equal(result.stableTagVersions.includes("0.1.10"), true);
   assert.equal(result.stableTagVersions.includes("0.1.16"), true);
   assert.equal(
-    result.annotatedStableTagCount,
+    result.annotatedStableTagCount + result.acceptedLegacyTagExceptions.length,
     result.stableTagVersions.length,
+  );
+  assert.equal(
+    result.acceptedLegacyTagExceptions.every(
+      (exception) => exception.version === "0.1.10"
+        && exception.objectName === LEGACY_TAG_OBJECT
+        && exception.sourceCommit === LEGACY_TAG_SOURCE,
+    ),
+    true,
   );
   assert.equal(result.noteVersions.length >= 17, true);
   assert.equal(result.noteVersions.length, result.changelogVersions.length);
   assert.equal(result.noteVersions.includes(result.packageVersion), true);
+});
+
+test("only the exact protected v0.1.10 anomaly is pinned", () => {
+  assert.equal(
+    classifyStableTagRecord({
+      objectName: LEGACY_TAG_OBJECT,
+      objectType: "commit",
+      version: "v0.1.10",
+    }),
+    "pinned_legacy",
+  );
+  assert.equal(
+    classifyStableTagRecord({
+      objectName: LEGACY_TAG_OBJECT.replace(/^3/u, "4"),
+      objectType: "commit",
+      version: "v0.1.10",
+    }),
+    "invalid",
+  );
+  assert.equal(
+    classifyStableTagRecord({
+      objectName: LEGACY_TAG_OBJECT,
+      objectType: "commit",
+      version: "v0.1.11",
+    }),
+    "invalid",
+  );
+  assert.equal(
+    classifyStableTagRecord({
+      objectName: LOCAL_ANNOTATED_TAG_OBJECT,
+      objectType: "tag",
+      peeledObjectName: LEGACY_TAG_SOURCE,
+      version: "v0.1.10",
+    }),
+    "annotated",
+  );
+  assert.equal(
+    classifyStableTagRecord({
+      objectName: LOCAL_ANNOTATED_TAG_OBJECT,
+      objectType: "tag",
+      peeledObjectName: LEGACY_TAG_SOURCE.replace(/^1/u, "2"),
+      version: "v0.1.10",
+    }),
+    "invalid",
+  );
+});
+
+test("the exact published anomaly passes visibly and drift fails closed", async () => {
+  await withReleaseFixture(async (rootDirectory) => {
+    await populateLegacyTagFixture(rootDirectory);
+    const exactRecord = {
+      objectName: LEGACY_TAG_OBJECT,
+      objectType: "commit",
+      peeledObjectName: "",
+      version: "v0.1.10",
+    };
+    const accepted = await checkReleaseNotes({
+      rootDirectory,
+      tagRecords: [exactRecord],
+    });
+    assert.equal(accepted.ok, true, formatReleaseNotesReport(accepted));
+    assert.equal(accepted.annotatedStableTagCount, 0);
+    assert.deepEqual(accepted.acceptedLegacyTagExceptions, [{
+      objectName: LEGACY_TAG_OBJECT,
+      sourceCommit: LEGACY_TAG_SOURCE,
+      version: "0.1.10",
+    }]);
+    assert.match(
+      formatReleaseNotesReport(accepted),
+      new RegExp(
+        `Pinned legacy tag exception: v0\\.1\\.10 ${LEGACY_TAG_OBJECT} -> source ${LEGACY_TAG_SOURCE}`,
+        "u",
+      ),
+    );
+
+    const drifted = await checkReleaseNotes({
+      rootDirectory,
+      tagRecords: [{
+        ...exactRecord,
+        objectName: LEGACY_TAG_OBJECT.replace(/^3/u, "4"),
+      }],
+    });
+    assert.equal(drifted.ok, false);
+    assert.equal(
+      drifted.issues.some((entry) => entry.code === "stable_tag_not_annotated"),
+      true,
+    );
+
+    const missing = await checkReleaseNotes({
+      rootDirectory,
+      tagRecords: [],
+    });
+    assert.equal(missing.ok, false);
+    assert.equal(
+      missing.issues.some(
+        (entry) => entry.code === "pinned_legacy_tag_record_count",
+      ),
+      true,
+    );
+  });
 });
 
 test("release trust CI gates every release-documentation change", async () => {

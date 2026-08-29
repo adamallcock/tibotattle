@@ -8,9 +8,11 @@ version labels; it does not imply API stability before 1.0.
 
 - A release heading links to its checked-in notes. The date is the UTC calendar
   date on which the public GitHub Release was published.
-- Every released entry links to the public GitHub Release, the annotated source
-  tag, and the exact comparison with the preceding stable tag. The GitHub
-  Release remains canonical for published artifacts and release evidence.
+- Every released entry links to the public GitHub Release, its exact source
+  revision, and the comparison with the preceding release source. Stable tags
+  are annotated except for the protected historical v0.1.10 anomaly recorded
+  below. The GitHub Release remains canonical for published artifacts and
+  release evidence.
 - Pull-request and issue links provide review and attribution context. They do
   not imply that an issue was closed or that a source-only change shipped in an
   installed build; open or source-only boundaries are stated explicitly.
@@ -195,7 +197,7 @@ accounting ([PR #33](https://github.com/adamallcock/tibotattle/pull/33),
 
 **Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.11) ·
 [annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.11) ·
-[changes since v0.1.10](https://github.com/adamallcock/tibotattle/compare/v0.1.10...v0.1.11)
+[changes since the v0.1.10 source commit](https://github.com/adamallcock/tibotattle/compare/151adec996c9a0f621819f89777ac5a05f1df8b6...v0.1.11)
 
 - Makes contribution backfill recover from stalls, adds readable allowance
   chart details, and hardens the community estimate.
@@ -203,8 +205,14 @@ accounting ([PR #33](https://github.com/adamallcock/tibotattle/pull/33),
 ## [0.1.10](./release-notes/0.1.10.md) - 2026-08-12
 
 **Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.10) ·
-[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.10) ·
-[changes since v0.1.9](https://github.com/adamallcock/tibotattle/compare/v0.1.9...v0.1.10)
+[source commit](https://github.com/adamallcock/tibotattle/commit/151adec996c9a0f621819f89777ac5a05f1df8b6) ·
+[changes since v0.1.9](https://github.com/adamallcock/tibotattle/compare/v0.1.9...151adec996c9a0f621819f89777ac5a05f1df8b6)
+
+**Historical tag anomaly:** the protected published `v0.1.10` ref is a legacy
+lightweight tag that resolves to the v0.1.9 source commit
+`3b3a852abad643095c296550a827ed448b3720fa`. The v0.1.10 version-bump source is
+`151adec996c9a0f621819f89777ac5a05f1df8b6`, which the source and comparison
+links above use without rewriting published tag history.
 
 - Makes contribution backfill drain steadily and adds signed-update credential
   recovery.
