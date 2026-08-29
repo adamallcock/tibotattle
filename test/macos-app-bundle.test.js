@@ -246,10 +246,7 @@ function macOSArtifactTest(name, options, body) {
 
 test("release validation retains historical signed native payload normalization", () => {
   assert.equal(
-    expectedMacOSPayloadNormalization(
-      "Contents/Resources/app/node_modules/@github/keytar/"
-        + "prebuilds/darwin-arm64/keytar.node",
-    ),
+    expectedMacOSPayloadNormalization(LEGACY_KEYTAR_TEST_PATH),
     "mach_o_without_code_signature",
   );
   assert.equal(
@@ -329,9 +326,13 @@ async function sha256File(path) {
   return createHash("sha256").update(await readFile(path)).digest("hex");
 }
 
+const LEGACY_KEYTAR_TEST_PATH =
+  "Contents/Resources/app/node_modules/@github/keytar/"
+  + "prebuilds/darwin-arm64/keytar.node";
 const NORMALIZED_TEST_CODE_PATHS = new Set([
   "Contents/MacOS/TiboTattle",
   "Contents/Resources/runtime/bin/node",
+  LEGACY_KEYTAR_TEST_PATH,
   ...SPARKLE_MACH_O_PATHS.map(
     (path) => `Contents/Frameworks/Sparkle.framework/${path}`,
   ),
@@ -4508,6 +4509,7 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
     for (const relativePath of [
       "Contents/MacOS/TiboTattle",
       "Contents/Resources/runtime/bin/node",
+      LEGACY_KEYTAR_TEST_PATH,
       "Contents/Resources/AppIcon.icns",
       "Contents/Resources/licenses/app-icon-provenance.txt",
       `Contents/Resources/licenses/sparkle-${SPARKLE_VERSION}.txt`,
@@ -4630,6 +4632,29 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
         },
         payload: await testPayloadInventory(app, temporaryRoot),
       }),
+    );
+    await writeBuildManifest();
+
+    await inspectMacOSApp(app, { requireExternalDistribution: true });
+    const buildManifestPath = join(resources, "build-manifest.json");
+    const wrongNormalizationManifest = JSON.parse(
+      await readFile(buildManifestPath, "utf8"),
+    );
+    const legacyKeytarEntry = wrongNormalizationManifest.payload.files.find(
+      ({ path }) => path === LEGACY_KEYTAR_TEST_PATH,
+    );
+    assert.equal(
+      legacyKeytarEntry?.normalization,
+      "mach_o_without_code_signature",
+    );
+    legacyKeytarEntry.normalization = "raw";
+    await writeFile(
+      buildManifestPath,
+      JSON.stringify(wrongNormalizationManifest),
+    );
+    await assert.rejects(
+      inspectMacOSApp(app, { requireExternalDistribution: true }),
+      { code: "MACOS_PAYLOAD_INTEGRITY_FAILED" },
     );
     await writeBuildManifest();
 
