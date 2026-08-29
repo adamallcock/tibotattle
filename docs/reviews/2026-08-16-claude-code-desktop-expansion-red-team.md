@@ -2,7 +2,7 @@
 title: Claude Code Desktop Expansion Red-Team Review
 date: 2026-08-16
 type: review
-status: phase-0-only; architecture revised
+status: historical-evidence
 reviewers:
   - local-retention-forensics
   - official-source-research
@@ -11,6 +11,11 @@ reviewers:
 ---
 
 # Verdict
+
+> **Point-in-time review, not current release authorization.** The reviewed
+> expansion was later superseded, and its shipping plan-history/state/route
+> chain was removed. This review is retained only as design evidence; use the
+> maintained architecture and privacy references for current behavior.
 
 **Proceed to Phase 0: yes.**
 

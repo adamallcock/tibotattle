@@ -28,7 +28,7 @@
 "nativeDashboard.progressQuotaRefresh" = "正在刷新额度…";
 "nativeDashboard.progressSaving" = "正在保存分析进度…";
 "nativeDashboard.refreshUsage" = "刷新";
-"nativeDashboard.refreshUsageTooltip" = "立即更新本地使用情况。只会读取这台 Mac 上选定的 Codex 文件夹。";
+"nativeDashboard.refreshUsageTooltip" = "从所选 Codex 会话文件夹，以及本地 Codex 帐户、额度、配置和运行谱系来源中更新。所有处理都留在这台 Mac 上。";
 "nativeDashboard.share" = "分享";
 "nativeDashboard.showSidebar" = "显示边栏";
 "nativeDashboard.shareTooltip" = "打开本地分享卡片。";
@@ -96,7 +96,7 @@
 "settings.checkForUpdates" = "检查更新";
 "settings.chooseCodexFolder" = "选择 Codex 文件夹…";
 "settings.codexFolder" = "Codex 文件夹";
-"settings.codexFolderSummary" = "TiboTattle 只读取此位置下的 sessions 和 archived_sessions 文件夹。除非你的 Codex 数据位于其他位置，否则请使用默认值。";
+"settings.codexFolderSummary" = "此设置只控制 sessions 和 archived_sessions 来源。刷新还会使用首次设置中披露的本地 Codex 帐户、额度、配置和运行谱系来源。";
 "settings.general" = "通用";
 "settings.generalSummary" = "TiboTattle 打开时会刷新本地用量。原始日志保留在这台 Mac 上。";
 "settings.github" = "GitHub";
@@ -109,9 +109,6 @@
 "settings.languageSystem" = "跟随系统";
 "settings.openDashboard" = "打开仪表板";
 "settings.openNotifications" = "打开通知设置";
-"settings.previewUpdatesPending" = "此预览版使用实时的 TiboTattle 更新源。首个已签名发行版尚未发布，因此暂时无法发现更新。";
-"settings.previewUpdatesPendingMessage" = "此预览版已连接到实时 TiboTattle 服务，但已签名更新源尚未发布。本地分析不受影响。已签名发行版可用后请再次检查。";
-"settings.previewUpdatesPendingTitle" = "更新尚未发布";
 "settings.useDefault" = "使用默认值";
 "settings.version" = "版本 %@（%@）";
 "settings.website" = "TiboTattle 网站";
@@ -122,7 +119,7 @@
 "launcher.dataDiagnostics" = "数据与诊断…";
 "launcher.detailPreparingLocalDashboard" = "正在准备私有本地仪表板及其有界的前台更新。";
 "launcher.failureDetails" = "%@ 代码：%@。%@";
-"launcher.firstRunDisclosure" = "%@ 会在应用打开时更新本地 %@ 元数据。首次分析会在设置后开始；后续检查会复用同一个有界的本地伴随程序。\n\n读取：所选 %@ 会话文件夹中的时间戳、模型和速度标签、令牌计数器、工具类别和额度快照。\n\n存储：仅含无内容索引、缓存计算、设置，以及在你的仅所有者 %@ 应用数据文件夹中准备的任何贡献。\n\n社区贡献是可选的。在你审阅无内容字段并明确发送贡献前，它会保持关闭。\n\n%@\n\n绝不贡献：提示词、回复、文件路径、仓库、命令、凭据、电子邮件或帐户名称。\n\n分析运行时请保持应用打开。你可以关闭并重新打开 TiboTattle 窗口；退出应用会停止当前分析并保留已完成的检查点。你可以选择是否在登录时打开应用。TiboTattle 不会安装 LaunchAgent 或守护进程。";
+"launcher.firstRunDisclosure" = "%@ 会在应用打开时更新本地 %@ 使用和额度证据。首次分析会在设置后开始；后续检查会复用同一个有界的本地伴随程序。\n\n本地读取：所选 %@ sessions 和 archived_sessions 文件夹中的使用元数据；用于运行谱系的 state_5.sqlite；用于服务层级设置的 config.toml；以及已安装 Codex app-server 的 account/read、account/rateLimits/read 和 account/usage/read 方法。来源记录只在本地处理；提示词和回复文本绝不会保留在 TiboTattle 的派生状态中。\n\n存储：仅含无内容索引、缓存计算、设置，以及在你的仅所有者 %@ 应用数据文件夹中准备的任何贡献。现有假名身份和设备凭据仍保留在 macOS 钥匙串中。\n\n社区贡献是可选的。在你审阅无内容字段并明确发送贡献前，它会保持关闭。\n\n本地额度通知默认也处于关闭状态。如果在“设置 → 通知”中启用，它们只使用前台刷新得到的最新提供商额度证据，不会增加后台轮询。\n\n%@\n\n绝不贡献：提示词、回复、文件路径、仓库、命令、凭据、电子邮件或帐户名称。\n\n分析运行时请保持应用打开。你可以关闭并重新打开 TiboTattle 窗口；退出应用会停止当前分析并保留已完成的检查点。\n\n%@";
 "launcher.getStarted" = "开始使用";
 "launcher.loadingPrivateDashboard" = "仅从这台 Mac 加载私有本地仪表板。";
 "launcher.needsAttention" = "需要关注";
@@ -142,7 +139,7 @@
 
 "dialog.chooseCodexHomeFolder" = "选择你的 Codex 主文件夹";
 "dialog.chooseCodexHomeFolderMessage" = "选择包含 Codex sessions 或 archived_sessions 的文件夹。";
-"dialog.codexFolderDescription" = "当前：%@ \n\n%@ 只会在仅所有者可访问的应用设置中保存自定义文件夹。诊断永远不会复制其路径。本地伴随程序只会读取所选 Codex 主目录下的 sessions 和 archived_sessions 文件夹。";
+"dialog.codexFolderDescription" = "当前：%@ \n\n%@ 只会在仅所有者可访问的应用设置中保存自定义文件夹。诊断永远不会复制其路径。此选择只控制 sessions 和 archived_sessions 来源；其他本地刷新来源已在首次设置和隐私指南中披露。";
 "dialog.copyDiagnostics" = "拷贝诊断信息";
 "dialog.customCodexFolder" = "自定义 Codex 文件夹";
 "dialog.dataAndDiagnostics" = "%@ 数据与诊断";

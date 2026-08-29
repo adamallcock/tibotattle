@@ -127,10 +127,25 @@
         <article class="resource-card" id="start">
           <h2>Start on your Mac</h2>
           <p>
-            Check the public home page for download availability. When a signed
-            Mac release is published, move TiboTattle to Applications and open
-            it. The app hosts its private dashboard in its own window; this
-            public website never scans your Codex files or accepts uploads.
+            Install the current signed release from the public home page,
+            Homebrew, or GitHub Releases. On first launch, read the complete
+            local-source disclosure, choose whether TiboTattle starts at login,
+            and select <strong>Get Started</strong>. The app hosts its private
+            dashboard in its own window; this public website never scans local
+            files or accepts contributions.
+          </p>
+        </article>
+        <article class="resource-card" id="local-sources">
+          <h2>What Refresh reads</h2>
+          <p>
+            Refresh processes usage metadata from the selected Codex
+            <code>sessions</code> and <code>archived_sessions</code> folders. It
+            also reads <code>state_5.sqlite</code> for rollout lineage,
+            <code>config.toml</code> for service-tier settings, the installed
+            Codex app-server <code>account/read</code>,
+            <code>account/rateLimits/read</code>, and
+            <code>account/usage/read</code> methods. Processing and derived
+            personal results stay on this Mac.
           </p>
         </article>
         <article class="resource-card" id="weekly-value">
@@ -141,12 +156,49 @@
             <li>Allowance metadata and uncertainty when the evidence supports it.</li>
           </ul>
         </article>
-        <article class="resource-card" id="local-first">
-          <h2>Local by default</h2>
+        <article class="resource-card" id="evidence-states">
+          <h2>Gaps are not zero</h2>
           <p>
-            Personal scans, pricing, and dashboard history stay on your Mac.
-            Sign-in and community contribution are optional and are not needed
-            to inspect your local usage.
+            <strong>Unknown</strong>, <strong>unavailable</strong>,
+            <strong>stale</strong>, <strong>partial</strong>, and
+            <strong>unattributed</strong> are different evidence states. A
+            retained last-good value keeps its timestamp and source. TiboTattle
+            does not smooth missing history or turn absent coverage into zero.
+          </p>
+        </article>
+        <article class="resource-card" id="refresh-recovery">
+          <h2>Refresh and recovery</h2>
+          <p>
+            The first deep pass is bounded, cancellable, and resumable. Closing
+            the window keeps the app and companion running; quitting stops the
+            pass and preserves completed checkpoints. If indexing reports an
+            incompatible schema or integrity problem, preserve the original
+            state and seek support—do not delete the only index or change its
+            SQLite version.
+          </p>
+        </article>
+        <article class="resource-card" id="local-first">
+          <h2>Local state and uninstall</h2>
+          <p>
+            Personal indexes, settings, cached calculations, and prepared
+            contributions live in the owner-only
+            <code>~/Library/Application Support/Usage Monitor</code> state root.
+            Ordinary uninstall preserves that state. Homebrew
+            <code>--zap</code> removes the app's local state and preferences but
+            deliberately leaves Codex data and TiboTattle Keychain identities
+            alone; identity reset and hosted deletion are separate actions.
+          </p>
+        </article>
+        <article class="resource-card" id="sharing-lifecycle">
+          <h2>Optional contribution</h2>
+          <p>
+            Local use needs no account. Contribution stays off until you review
+            the exact content-free fields and explicitly send them. Google or
+            Apple sign-in is used only to establish one pseudonymous person;
+            the service stores an irreversible identity hash, not a name or
+            email. The app can disconnect this Mac from contribution and can
+            delete the complete hosted participation; those actions do not
+            alter local analysis.
           </p>
         </article>
         <article class="resource-card" id="community-evidence">
@@ -155,6 +207,37 @@
             The public site is read-only and does not enroll contributors. It may
             show a delayed community activity snapshot only after aggregate
             evidence passes privacy, support, and quality checks. Activity totals alone are never presented as an allowance.
+          </p>
+        </article>
+        <article class="resource-card" id="updates">
+          <h2>Updates and channels</h2>
+          <p>
+            Signed releases use the Sparkle feed at
+            <code>updates.tibotattle.com</code>. Manual checks are always under
+            <strong>Settings → About</strong>; automatic downloads can also be
+            changed there. Development builds have no updater and preview
+            builds use manual checks only. A source build, preview, installed
+            release, and published update are separate evidence gates.
+          </p>
+        </article>
+        <article class="resource-card" id="support">
+          <h2>Get support safely</h2>
+          <p>
+            Use <a href="https://github.com/adamallcock/tibotattle/issues" target="_blank" rel="noreferrer">GitHub Issues</a>
+            for ordinary bugs and the repository's private Security Advisory
+            form for vulnerabilities. Include the app version, install channel,
+            evidence state, and fixed diagnostic code. Never paste prompts,
+            responses, credentials, account identifiers, or real session paths.
+          </p>
+        </article>
+        <article class="resource-card" id="platforms">
+          <h2>Platform support</h2>
+          <p>
+            The published product currently supports macOS 14 or later on Apple
+            silicon. Windows and Linux source, contract, container, or native
+            experiments are preparation evidence only; neither platform is a
+            supported install until a release lists and qualifies its own final
+            artifact.
           </p>
         </article>
       </div>

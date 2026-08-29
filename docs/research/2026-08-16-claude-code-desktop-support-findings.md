@@ -2,10 +2,15 @@
 title: Claude Code Desktop Support Findings
 date: 2026-08-16
 type: research
-status: phase-0-preparation-implemented-current-evidence
+status: historical-evidence
 ---
 
 # Claude Code Desktop support findings
+
+> **Point-in-time research, not a shipping-source contract.** The passive
+> source findings below explain the experiment, but current installed refresh
+> no longer reads Claude plan history or transcript trees. Use the maintained
+> architecture and local-data/privacy references for current behavior.
 
 ## Outcome
 
@@ -38,8 +43,10 @@ promising optional forward-capture source, not historical recovery, quota/reset 
 or guaranteed delivery. It requires an exact-build smoke, explicit user configuration,
 privacy filtering, gap tracking, and transcript reconciliation before product use.
 
-The implementation sequence is in the
-[Claude Code Desktop Expansion Plan](../plans/2026-08-16-claude-code-desktop-expansion-plan.md).
+The experimental implementation sequence was later superseded and is not a
+shipping contract. Current product behavior is defined by the
+[system architecture](../reference/system-architecture.md) and
+[local-data and privacy reference](../reference/local-data-and-privacy.md).
 The adversarial findings and test matrix are in the
 [red-team review](../reviews/2026-08-16-claude-code-desktop-expansion-red-team.md).
 

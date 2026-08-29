@@ -2,7 +2,7 @@
 title: TiboTattle macOS Login Item lifecycle
 date: 2026-08-03
 type: decision-record
-status: implemented
+status: complete
 ---
 
 # TiboTattle macOS Login Item lifecycle

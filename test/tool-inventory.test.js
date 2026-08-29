@@ -303,13 +303,13 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  // 81 records / 83 executable paths: the release-documentation, Codex, and
-  // repository-layout contract gates are reviewed repository operations
-  // invoked by CI, tests, and the release runbooks.
+  // 83 records / 85 executable paths: documentation governance, the shared
+  // application-layout policy, and the rebuild argument contract are now
+  // explicit reviewed repository operations.
   // Keep these exact so any future executable still requires an ownership
   // decision.
-  assert.equal(result.records, 81);
-  assert.equal(result.candidates.length, 83);
+  assert.equal(result.records, 83);
+  assert.equal(result.candidates.length, 85);
   assert.ok(result.aliases >= 25);
 });
 
@@ -446,7 +446,7 @@ test("the inventory checker fails closed for every required ownership condition"
   }
 });
 
-test("docs-link aliases target the canonical tool and the legacy shim is behavior-identical", async () => {
+test("the docs fixer alias targets its canonical tool and the legacy shim is behavior-identical", async () => {
   const packageManifest = JSON.parse(
     await readFile(join(REPOSITORY_ROOT, "package.json"), "utf8"),
   );
@@ -454,11 +454,6 @@ test("docs-link aliases target the canonical tool and the legacy shim is behavio
     packageManifest.scripts["docs:links:fix"],
     "node ./tools/operations/fix-doc-links.mjs",
   );
-  assert.equal(
-    packageManifest.scripts["docs:links:check"],
-    "node ./tools/operations/fix-doc-links.mjs --check",
-  );
-
   const canonicalRoot = await mkdtemp(
     join(tmpdir(), "usage-monitor-doc-links-canonical-"),
   );

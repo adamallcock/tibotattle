@@ -1,73 +1,87 @@
 # Documentation index
 
-Program documentation lives here, grouped by document type. Dated filenames are
-preserved for traceability; a date alone does not make a document current.
+This index separates maintained truth from point-in-time evidence. Start with
+the current authorities below. A dated filename does not make a document
+current, and source, local runtime, native app, installed artifact, CI, release,
+updater, and public deployment remain separate evidence gates.
 
-For present-day work, start with the maintained entry points below and read the
-status and boundary at the top of each document. These paths describe local
-checks and owner-only gates; they do not establish that remote deployment,
-signing, artifacts, an appcast, or updater infrastructure is operational.
+When maintained behavior changes, update the affected authority in the same
+change. Git-remove obsolete instructions, plans, reports, and handoffs once
+they no longer have enduring audit, recovery, decision, or release value. Git
+history is the default archive; do not keep wrong prose in the working tree as
+an informal archive.
 
-## Current authoritative operational entry points
+## Current authoritative documentation
 
-| Path | Use |
-|---|---|
-| [`verify-release.md`](./verify-release.md) | User-facing verification for direct and Store artifacts; v1 evidence fields are explicit nullable claims, and only a release-specific complete non-null set is the attested profile/path |
-| [`decisions/2026-08-18-cross-platform-release-trust.md`](./decisions/2026-08-18-cross-platform-release-trust.md) | Cross-platform release-evidence decision, nullable v1 manifest, native platform trust boundaries, artifact subjects, and staged rollout |
-| [`runbooks/2026-08-18-cross-platform-release-publication.md`](./runbooks/2026-08-18-cross-platform-release-publication.md) | Activation-gated common publication order, nullable final-byte evidence, artifact-specific attestations, and immutable GitHub release handoff |
-| [`runbooks/macos-stable-release-runbook.md`](./runbooks/macos-stable-release-runbook.md) | Canonical macOS build, signing, notarization, Sparkle, Homebrew, website, and release-publication sequence |
-| [`plans/2026-08-14-mac-app-store-compatibility-plan.md`](./plans/2026-08-14-mac-app-store-compatibility-plan.md) | Active Store feasibility and dual-distribution plan; not a Store-readiness or submission claim |
-| [`runbooks/2026-08-04-owner-release-execution.md`](./runbooks/2026-08-04-owner-release-execution.md) | Owner-run release sequence; fail-closed until each external gate is observed |
-| [`runbooks/2026-08-05-internal-dogfood-versus-release-readiness.md`](./runbooks/2026-08-05-internal-dogfood-versus-release-readiness.md) | First-read boundary for the installed ad-hoc preview, future signed `internal-dogfood`, and stable; not a release claim |
-| [`plans/2026-08-05-provider-reported-quota-windows.md`](./plans/2026-08-05-provider-reported-quota-windows.md) | Current provider-reported quota-window implementation and plan-evidence boundary; not release authorization |
-| [`runbooks/2026-08-04-staging-release-verification.md`](./runbooks/2026-08-04-staging-release-verification.md) | Credential-free production-containment observer and live-proof boundary |
-| [`runbooks/2026-08-04-disabled-staging-readiness-boundary.md`](./runbooks/2026-08-04-disabled-staging-readiness-boundary.md) | Static and owner-authorized staging checks; staging remains unprovisioned until verified |
-| [`runbooks/2026-08-04-internal-update-rehearsal.md`](./runbooks/2026-08-04-internal-update-rehearsal.md) | Disposable-profile N→N+1 rehearsal; not signing or feed-publication proof |
-| [`runbooks/2026-08-02-r2-sparkle-update-publisher.md`](./runbooks/2026-08-02-r2-sparkle-update-publisher.md) | Local Sparkle/R2 publication contract; remote feed readiness still requires owner evidence |
-| [`runbooks/2026-08-04-open-enrollment-controlled-release.md`](./runbooks/2026-08-04-open-enrollment-controlled-release.md) | Account-gated contribution release path; external authorization remains an owner action |
-| [`runbooks/2026-08-13-community-allowance-band-diagnosis.md`](./runbooks/2026-08-13-community-allowance-band-diagnosis.md) | Diagnose a missing or stale public allowance band through fit-cache and aggregate state; production writes remain owner-run |
-| [`runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md`](./runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md) | When retained R7 receipts go stale (any workload-source change) and the exact dual-runtime regeneration procedure, including the fresh-checkout 0600 guard |
-| [`runbooks/2026-08-27-hosted-api-retirement-data-gates.md`](./runbooks/2026-08-27-hosted-api-retirement-data-gates.md) | Owner-run read-only D1 checks that must precede any future removal of historical recovery, session-upload, contribution, or statistics schema after source-route retirement |
-| [`decisions/2026-08-15-homebrew-distribution-and-macos-support.md`](./decisions/2026-08-15-homebrew-distribution-and-macos-support.md) | First-party Homebrew tap, update automation, uninstall boundary, and supported macOS floor |
-| [`goals/2026-08-17-four-day-windows-readiness-goal.md`](./goals/2026-08-17-four-day-windows-readiness-goal.md) | Bounded portable-core qualification for issue #3; explicitly not Windows support |
-| [`runbooks/2026-08-17-windows-portability-environments.md`](./runbooks/2026-08-17-windows-portability-environments.md) | Restore macOS, network-isolated Linux, native Windows x64, and optional UTM development lanes |
+| Area | Authority | Boundary |
+|---|---|---|
+| Status | [Current product and release status](./current-status.md) | Commit- and date-stamped source, live-service, published-release, updater, and support snapshot; reverify before relying on it later |
+| User help | [User guide](./user-guide.md) | Installation, first run, uncertainty, refresh/recovery, optional contribution, data, updates, and support |
+| Architecture | [System architecture](./reference/system-architecture.md) | Current components, trust boundaries, stores, identities, and data flow |
+| Privacy | [Local data, network, and privacy](./reference/local-data-and-privacy.md) | Exact source reads, local and hosted stores, Keychain, network, retention, deletion, and uninstall boundaries |
+| Calibration semantics | [Composition-aware expected-line contract](./design/composition-aware-expected-line.md) | Maintained model-mix, saturation, reset, and lineage carry-forward interpretation; not a provider capacity claim |
+| APIs | [API and integration surface](./reference/api-surface.md) | Stable entry point for the source-checked HTTP, native, process, package, schema, binding, and external-service inventory |
+| Detailed API inventory | [Source-backed API surface reference](./reference/2026-08-26-api-surface-reference.md) | Complete inventory maintained with source-parity tests; implemented source is not deployment or release proof |
+| Commands | [Command-line reference](./reference/cli-reference.md) | Source-checked `usage-monitor` command inventory and safety classes |
+| Schemas | [Schema and contract lifecycle](./reference/schema-contracts.md) | Canonical owners, mirrors, generators, versioning, and retirement |
+| Local index | [Unified local index schema](./reference/unified-index-schema.md) | Current schema family, physical/parser versions, tables, generation, and migration rules |
+| Local recovery | [Unified index preservation and recovery](./runbooks/unified-index-recovery.md) | Preservation-first diagnosis and candidate rebuild; never relabel or destroy the only index |
+| Sidebar recovery | [Collapsed dashboard sidebar rescue](./runbooks/sidebar-stranded-collapsed-rescue.md) | Current 0.1.16 recovery for persisted collapsed navigation; removes only exact window-geometry defaults |
+| Platform support | [Platform support and qualification](./reference/platform-support.md) | macOS support and the evidence ladder Windows/Linux must satisfy before any claim |
+| Production | [Production service operations](./runbooks/production-operations.md) | Read-only observation, deploy/migration gates, containment, rollback, and recovery boundaries |
+| Community diagnostics | [Community allowance-band diagnosis](./runbooks/2026-08-13-community-allowance-band-diagnosis.md) | Current fit-cache and aggregate diagnosis; production writes remain owner-run |
+| Retired hosted APIs | [Hosted API retirement data gates](./runbooks/2026-08-27-hosted-api-retirement-data-gates.md) | Owner-run read-only D1 checks required before any future deletion of data retained after source-route retirement |
+| Release verification | [Verify a TiboTattle release](./verify-release.md) | User-facing checksum, native trust, manifest, and evidence verification |
+| Release trust | [Cross-platform release trust](./decisions/2026-08-18-cross-platform-release-trust.md) | Common evidence decision and artifact-specific native trust requirements |
+| Release publication | [Cross-platform release publication](./runbooks/2026-08-18-cross-platform-release-publication.md) | Activation-gated multi-platform evidence and immutable publication order; not a support claim |
+| macOS release | [macOS stable release](./runbooks/macos-stable-release-runbook.md) | Canonical build, signing, notarization, Sparkle, Homebrew, website, and GitHub release sequence |
+| macOS distribution | [Homebrew distribution and macOS support](./decisions/2026-08-15-homebrew-distribution-and-macos-support.md) | First-party tap, uninstall boundary, and supported macOS floor |
+| Public-site preview | [Public site local preview](./runbooks/2026-08-17-public-site-local-preview.md) | Maintained local rendering/inspection path; not deployment proof |
+| Web-only release | [Web-only release](./runbooks/2026-08-17-web-only-release.md) | Maintained website publication lane and its release boundaries |
+| Windows readiness | [Windows portability environments](./runbooks/2026-08-17-windows-portability-environments.md) | Development/qualification environments only; Windows remains unsupported |
+| R7 evidence | [R7 release-evidence receipt maintenance](./runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md) | Staleness rule and protected dual-runtime regeneration; not a routine documentation check |
 
-For macOS, `macos-stable-release-runbook.md` is the authority for artifact
-publication and the immutable GitHub release ordering. The older
-`2026-08-04-owner-release-execution.md` remains authoritative only for its
-service/appcast and intake operations; its stable-release section does not
-supersede the canonical publication sequence.
+## Lifecycle evidence
 
-Documents not listed above remain records, evidence, or supporting context
-rather than current operational authority. Treat receipts, audits, reports,
-and QA artifacts as point-in-time evidence; dated plans and decisions preserve
-historical intent unless explicitly linked above. Read each document's status
-and date before relying on it for a fresh state claim.
+The [API lifecycle review](./reviews/2026-08-26-api-lifecycle-review.md) records
+the source-level removals merged in PR #78. It is an implementation record, not
+an assertion that an installed release or deployed service has already adopted
+those removals.
 
-## Maintained architecture reference
+Documents not listed as authorities are records or supporting context, not
+current operational instructions:
 
-| Path | Use |
-|---|---|
-| [`reference/2026-08-26-api-surface-reference.md`](./reference/2026-08-26-api-surface-reference.md) | Canonical diagrams and complete source-backed inventory of loopback, hosted, relay, native, process, binding, package, schema, and external-service APIs; implemented source is kept distinct from deployment or release proof |
-| [`reviews/2026-08-26-api-lifecycle-review.md`](./reviews/2026-08-26-api-lifecycle-review.md) | Evidence and implementation record for the seven completed source-level API retirement/consolidation actions, including explicit installed-release and hosted-data gates |
+- **Decisions** remain only when the accepted contract still explains or
+  constrains the current system.
+- **Receipts and QA** prove only the exact checkout, command, environment,
+  artifact, and date they name. Retain them only for an enduring release,
+  recovery, compliance, or regression purpose.
+- **Audits, reviews, investigations, research, and reports** remain only when
+  their findings still have audit or recovery value.
+- **Plans and goals** describe intended work, never implementation or release
+  state. Delete completed, abandoned, or superseded plans after durable results
+  are incorporated into code, tests, decisions, and maintained authorities.
+- **Design records** remain only for durable product rationale; current
+  implementation status comes from source and the authorities above.
 
-## Records and supporting material
+Every retained dated Markdown record requires `title`, `date`, `type`, and
+`status` frontmatter. Status `current`, `canonical`, `maintained`, or
+`operational` is valid only for a document listed in this index.
 
-| Folder | Contents |
-|---|---|
-| [`v0.3/`](./v0.3/) | Usage Monitor v0.3 goal, final validation, and milestone decision records |
-| [`goals/`](./goals/) | Program-level goals and completion criteria |
-| [`plans/`](./plans/) | Implementation and release plans |
-| [`decisions/`](./decisions/) | Decision records outside the v0.3 milestone set |
-| [`receipts/`](./receipts/) | Verification, validation, and checkpoint receipts |
-| [`governance/`](./governance/) | Risk register, control traceability, privacy contract, preregistrations |
-| [`reports/`](./reports/) | Consolidated readiness and status reports |
-| [`audits/`](./audits/) | Journey audits and gap reviews |
-| [`reviews/`](./reviews/) | Point-in-time implementation, architecture, and reconciliation reviews |
-| [`research/`](./research/) | Source notes and supporting research artifacts |
-| [`qa/`](./qa/) | Browser and native visual QA receipts and screenshots |
-| [`design/`](./design/) | Product and visual design briefs |
-| [`reference/`](./reference/) | Maintained API surface reference plus historical product and implementation references, including the relocated full product reference |
-| [`runbooks/`](./runbooks/) | Operator runbooks and handoff notes; use the current entry points above |
+## Maintenance workflow
 
-The repository root [`README.md`](../README.md) remains the primary product and developer entry point.
+1. Search every tracked file for affected document paths and basenames, including
+   current authorities, READMEs, public docs, disclosures, templates, scripts,
+   comments, fixtures, ignore files, and security allowlists.
+2. Update code-derived documentation tests and generated mirrors with the
+   source change.
+3. Delete superseded prose and repair every inbound link; do not add an
+   `archive` folder merely to avoid deletion.
+4. Run `npm run docs:check` and `npm run test:preflight`, then the owning
+   contract or release gate.
+5. Re-read rendered Markdown and distinguish source, runtime, artifact, release,
+   updater, and deployment claims before reporting completion.
+
+The repository root [README.md](../README.md),
+[CONTRIBUTING.md](../CONTRIBUTING.md), [SUPPORT.md](../SUPPORT.md), and
+[SECURITY.md](../SECURITY.md) are the maintained public/developer entry points.

@@ -2,7 +2,7 @@
 title: Community allowance band — diagnosis runbook
 date: 2026-08-13
 type: runbook
-status: operational
+status: maintained
 ---
 
 # Community allowance band: "it is null / not drawing"

@@ -1,6 +1,6 @@
 ---
 title: Verify a TiboTattle release
-date: 2026-08-18
+date: 2026-08-28
 type: guide
 status: current
 ---
@@ -24,19 +24,22 @@ software is vulnerability-free or universally “safe.”
 
 ## Current availability boundary
 
-The public website currently exposes only the macOS download lane, and it may
-remain unavailable until a signed release is published. Release v0.1.12
-predates the v1 evidence policy: verify it with its published SHA-256 and
-Apple's native signature/notarization checks, but do not infer a GitHub
-source-to-binary attestation that it does not publish. Windows and Linux are
-qualification targets in the repository's cross-platform release plan; a
-Windows or Linux build is not a supported release merely because code or a
-plan exists. For releases published under the v1 policy, treat the release
-page and its release manifest as the source of truth: if a platform,
-architecture, format, channel, native assurance, or digest is not listed
-there, do not download or describe that artifact as an official TiboTattle
-release. Evidence fields may be explicitly `null`; that means the release
-makes no claim for that evidence, not that the artifact is unofficial.
+The latest source-backed availability snapshot records public stable release
+`v0.1.16`, published 2026-08-21 for macOS 14 or later on Apple silicon. Its
+GitHub release includes the DMG, appcast, release manifest, checksums, and this
+guide; the public appcast advertised the same `0.1.16` DMG. Recheck the
+[current status](./current-status.md) and release endpoints before relying on
+that snapshot. Endpoint availability is not fresh proof of the downloaded
+artifact's Apple signature or notarization, so perform the checks in Section 3.
+
+Windows and Linux remain unsupported. Source, plans, contract tests, or
+simulated qualification do not make a build an official supported release.
+For releases published under the v1 policy, treat the release page and its
+release manifest as the source of truth: if a platform, architecture, format,
+channel, native assurance, or digest is not listed there, do not download or
+describe that artifact as an official TiboTattle release. Evidence fields may
+be explicitly `null`; that means the release makes no claim for that evidence,
+not that the artifact is unofficial.
 
 ### Important: v0.1.12 is a legacy release
 

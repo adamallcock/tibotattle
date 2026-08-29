@@ -1,22 +1,23 @@
 # TiboTattle
 
-Privacy-first, local-only monitoring for coding-agent usage. TiboTattle
-reads the session metadata that Codex already stores on your Mac, reconstructs
-your usage at standard API prices, and compares it with the quota movement your
-provider reports — so you can see where your allowance stands, what a week of
-work would have cost at API prices, and how well token cost explains your quota
-consumption.
+Privacy-first, local-first monitoring for coding-agent usage. TiboTattle
+processes local Codex usage metadata and provider-reported quota evidence to
+show where your allowance stands, what observed work would have cost at
+standard API prices, and where the available evidence does not support a
+confident answer.
 
-Everything runs locally. Raw logs never leave your machine, and no prompt,
-response, file path, or raw account identifier ever enters any derived
-artifact.
+Personal analysis runs locally and works without an account. Raw source logs do
+not leave your machine, and prompts, responses, file paths, and raw account
+identifiers do not enter TiboTattle's derived artifacts. The optional hosted
+community contribution service is a separate, off-by-default capability with
+an exact local review and explicit send step.
 
 
 > **The name:** TiboTattle is named with affection for the Codex community and
 > its patron saint of quota resets. It is not affiliated with or endorsed by
 > OpenAI or Thibault Sottiaux, and we will happily rename it if asked. Your
-> tokens tattle only to you: everything runs locally and nothing leaves your
-> Mac without your explicit, reviewed consent.
+> tokens tattle only to you: personal analysis stays local and nothing is
+> contributed without your explicit, reviewed consent.
 
 ## What it shows
 
@@ -129,7 +130,7 @@ for the provenance and future-locale policy.
   an enabled item. This starts the normal app at login; it does not install a
   daemon, LaunchAgent, privileged helper, or separate background worker.
 - Optional macOS allowance notifications are **off by default** and local-only.
-  If enabled in **Settings → General**, they are evaluated only after the
+  If enabled in **Settings → Notifications**, they are evaluated only after the
   existing foreground refresh receives fresh direct provider quota evidence.
   Stale, inferred, mixed-source, unknown, unobserved, forecast, and
   log-derived state never notifies; turning the same switch off immediately
@@ -140,6 +141,13 @@ for the provenance and future-locale policy.
 - The dashboard binds to loopback only. The packaged app's network behavior is
   audited at build time (zero JavaScript and zero native network attempts in
   offline mode).
+- A normal refresh reads more than the selected session folders. It processes
+  metadata from the selected Codex `sessions` and `archived_sessions` folders;
+  reads `state_5.sqlite` for rollout lineage and `config.toml` for service-tier
+  settings; invokes the installed Codex binary's local `app-server` methods
+  `account/read`, `account/rateLimits/read`, and `account/usage/read`. Source
+  records are processed locally; prompt and response text is not retained in
+  derived state.
 - Contribution to the optional hosted community-aggregate service is **off by
   default**, requires an explicit review of the exact retained metadata, and is
   pseudonymous and content-free. Hosted deletion is always available.
@@ -166,7 +174,7 @@ compatibility fallback until they are explicitly migrated.
 | `apps/worker` | Optional hosted contribution service (off by default) |
 | `packages/` | Workspace packages: accounting, quota analysis, telemetry contract, identity core, and i18n |
 | `src/` | Product source: `application/`, `platform/`, `export/`, `contribution/`, `reporting/`, `providers/` owners plus compatibility roots |
-| `docs/` | Reference, decisions, plans, receipts, and historical goal documents |
+| `docs/` | Maintained references and runbooks plus retained dated decisions and evidence |
 | `local-review/` | Reproducible standalone review artifact tooling |
 
 Despite the name, `local-review/` is committed developer tooling that builds a
@@ -182,7 +190,7 @@ service.
 For the complete engineering map of loopback and hosted HTTP routes, native
 bridges, child-process protocols, Cloudflare bindings, workspace package APIs,
 schemas, and third-party services, see the maintained
-[TiboTattle API surface reference](docs/reference/2026-08-26-api-surface-reference.md).
+[TiboTattle API surface reference](docs/reference/api-surface.md).
 Its source-parity check is `npm run docs:api:check`.
 
 ## Development
@@ -201,8 +209,8 @@ pnpm container:portable:test
 ```
 
 These commands are preparation evidence only. The shipping application remains
-macOS-only; see the [four-day Windows readiness goal](docs/goals/2026-08-17-four-day-windows-readiness-goal.md)
-for the native Windows gate and the work still required before a support claim.
+macOS-only. See the [current status matrix](docs/current-status.md) for the
+separate source, native, installed, release, updater, and platform gates.
 
 ```bash
 npm run product:check
@@ -238,24 +246,30 @@ each build has a separate output and compiler scratch directory. Measure the
 local lanes with `npm run test:benchmark` (or `test:benchmark:release` to
 include the retained release gate).
 
-`npm run architecture:check` enforces the ownership boundaries. The complete
-command catalog, privacy boundary documentation, and operational detail live in
-the [full product reference](docs/reference/product-reference.md).
+`npm run architecture:check` enforces ownership boundaries. Maintained current
+references are deliberately split by authority:
 
-Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the
-workflow and gates, and [SECURITY.md](SECURITY.md) for how to report
-vulnerabilities privately.
+- [system architecture](docs/reference/system-architecture.md);
+- [local data and privacy](docs/reference/local-data-and-privacy.md);
+- [API surface](docs/reference/api-surface.md);
+- [CLI commands](docs/reference/cli-reference.md); and
+- [production operations](docs/runbooks/production-operations.md).
+
+Contributions are welcome—see [CONTRIBUTING.md](CONTRIBUTING.md) for the
+workflow and gates. For help, start with [SUPPORT.md](SUPPORT.md); report
+vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
 ## Status
 
-This is an early, personal-pilot release. The current published version and
-its user-facing history are listed in the [changelog](CHANGELOG.md) and on the
+TiboTattle is a published macOS product with an operational optional hosted
+service. The current published version and user-facing history are listed in
+the [changelog](CHANGELOG.md) and on the
 [GitHub Releases page](https://github.com/adamallcock/tibotattle/releases).
 TiboTattle is not a provider-authoritative billing dashboard: quota estimates
-carry explicit uncertainty, and unknown models or tiers stay explicit unknowns
-rather than silently defaulted. See
-[docs/reports](docs/reports/2026-07-29-end-to-end-pilot-readiness-report.md)
-for the current verification boundary.
+carry explicit uncertainty, and unknown models or tiers remain explicit rather
+than silently defaulted. The maintained [current status matrix](docs/current-status.md)
+records source, live-service, installed-artifact, public-release, updater, and
+platform qualification separately.
 
 ## License
 

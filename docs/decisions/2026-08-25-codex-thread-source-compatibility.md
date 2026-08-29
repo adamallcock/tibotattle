@@ -2,7 +2,7 @@
 title: Codex thread-source compatibility and binary diagnostics
 date: 2026-08-25
 type: decision-record
-status: implemented
+status: complete
 ---
 
 # Codex thread-source compatibility and binary diagnostics

@@ -9,6 +9,16 @@ Do not open a public issue for a security problem.
 You should receive an acknowledgement within a few days. There is **no bounty
 program**; reports are handled on a best-effort basis by the maintainer.
 
+## Supported versions
+
+Security fixes target the latest published stable release and current source.
+Older releases may be investigated, but users should expect to upgrade to the
+latest stable build for a fix. Development and preview builds are test
+artifacts, not supported distribution channels. The current release and
+platform availability are recorded on the
+[GitHub Releases page](https://github.com/adamallcock/tibotattle/releases) and
+in the [current status matrix](docs/current-status.md).
+
 ## Scope
 
 Two distinct surfaces share this repository:
@@ -23,6 +33,11 @@ Two distinct surfaces share this repository:
   Issues affecting the hosted aggregates, contributor pseudonymity, or the
   upload/deletion endpoints are in scope. Please do not run disruptive
   testing (load, enumeration, or exhaustion) against the live service.
+The local refresh reads selected Codex session folders, local Codex
+configuration and lineage state, the installed Codex app-server account/quota
+methods, and owner-only derived state. Undisclosed source access, retention of
+prompt/response content, unsafe derived artifacts, unintended network
+transmission, or a bypass of contribution review/consent is in scope.
 
 ## Do not include session content in reports
 
@@ -46,3 +61,7 @@ confirms exact bytes; it is not, by itself, a safety or source-provenance claim.
 Source-to-binary provenance is claimed only when a trusted hosted workflow
 generated/finalized and cryptographically verified the exact final bytes for
 that release.
+
+For non-security troubleshooting, use [SUPPORT.md](SUPPORT.md). Security
+Advisories are the only private reporting channel documented by this project;
+do not send secrets or private session material through public issues.

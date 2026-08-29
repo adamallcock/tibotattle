@@ -2,7 +2,7 @@
 title: Windows filesystem and credential security contract
 date: 2026-08-17
 type: research
-status: implementation-in-progress
+status: active
 ---
 
 # Windows filesystem and credential security contract

@@ -2,10 +2,21 @@
 title: Claude Desktop Durable Ledger Decision
 date: 2026-08-16
 type: decision-record
-status: accepted-for-production-shadow; user-facing-gates-open
+status: complete
 ---
 
 # Claude Desktop durable ledger decision
+
+> **Current boundary (source `52399658`, reviewed 2026-08-27):** this record
+> preserves the provider-isolated prototype decision and its measured evidence;
+> it does not describe a shipping Claude product surface. PR #78 retired the
+> experimental local Claude quota route and quota-state integration. The
+> installed companion currently exposes no Claude source setting, route, UI, or
+> upload surface. Use the maintained
+> [architecture](../reference/system-architecture.md),
+> [API inventory](../reference/api-surface.md), and
+> [privacy inventory](../reference/local-data-and-privacy.md) for current
+> product behavior.
 
 ## Decision
 
@@ -26,12 +37,11 @@ unclassified new row.
 The Phase 0 implementation is
 [`src/claude-desktop-ledger-prototype.js`](../../src/claude-desktop-ledger-prototype.js).
 It proves the lifecycle contract but is not yet wired into the installed application.
-Native quota parsing now has a separate quota-state/refresh path in the local companion
-and a closed `/api/local/claude/quota` projection:
-[`src/claude-desktop-plan-history.js`](../../src/claude-desktop-plan-history.js) reads
-the authoritative native plan history, and accepted revisions survive source rollover
-in [`src/claude-desktop-quota-state.js`](../../src/claude-desktop-quota-state.js).
-The installed macOS menu/dashboard does not consume that route yet. Separately,
+At this decision's snapshot, an experimental local-companion quota-state path and
+closed quota route had also been implemented. Those integration files and the route
+were later retired. The remaining
+[`src/claude-desktop-plan-history.js`](../../src/claude-desktop-plan-history.js) reader
+is used by prototype and benchmark code, not by the installed refresh. Separately,
 [`src/claude-desktop-pricing.js`](../../src/claude-desktop-pricing.js) prices a rich
 canonical winner through the existing registry and is exercised by the prototype
 ledger/incremental path with a separate replay-safe summary cache. It has no production
@@ -151,10 +161,10 @@ tombstone while deleting only rebuildable canonical/pricing artifacts, preventin
 source re-import from resurrecting deleted periods.
 
 User-facing production still requires backend/account attribution, capture-window
-migration, installed-app authorization and cancellation/progress evidence, an installed
-quota-route consumer, a database-footprint decision, and reviewed product projections.
-The existing local-companion quota plumbing, disabled shadow controller, bounded
-pricing cache, and prototype usage ledger are not a user-facing Claude support claim.
+migration, installed-app authorization and cancellation/progress evidence, a reviewed
+shipping quota boundary, a database-footprint decision, and reviewed product
+projections. The retired quota experiment, disabled shadow controller, bounded pricing
+cache, and prototype usage ledger are not a user-facing Claude support claim.
 
 The disabled production wiring now propagates custom Claude configuration and an
 explicit/current project independently from installed resources, while disabled mode

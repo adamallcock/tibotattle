@@ -1,0 +1,165 @@
+---
+title: Unified Index Preservation and Recovery
+date: 2026-08-27
+type: runbook
+status: maintained
+last_verified_commit: 52399658
+---
+
+# Unified index preservation and recovery
+
+Use this runbook for `local_unified_index_schema_invalid`, integrity failures,
+an app that can no longer open its index, or a suspected interrupted migration.
+It is preservation-first: recovery must never destroy the only copy of facts
+whose rollout source may already have rotated away.
+
+## Hard prohibitions
+
+Do not:
+
+- edit `PRAGMA user_version` or `meta.schema_version` to make a reader accept a
+  file;
+- delete, truncate, vacuum, or rebuild over the only index;
+- wipe Application Support or use **Erase local data** as diagnosis;
+- open a newer index with an older app/reader in writable mode;
+- copy only the database while losing its device salt and surrounding
+  provenance; or
+- assume a visible 30-day chart is the retention horizon.
+
+If an exact destructive replacement is eventually needed, it requires a
+separate reviewed decision after the copy and candidate are verified.
+
+## 1. Freeze the writer
+
+Quit TiboTattle and confirm no companion or rebuild process still owns the
+state root. Do not kill a process while it is publishing unless it is truly
+stuck; the normal cancellation path preserves completed checkpoints.
+
+For an installed app, the expected state root is:
+
+```text
+~/Library/Application Support/Usage Monitor
+```
+
+Standalone developer/CLI runs may use a configured root or the platform
+`app-usagemonitor` default. Resolve the exact path from the failing runtime;
+never guess between them.
+
+## 2. Preserve the exact state
+
+Create a new owner-only recovery directory outside the live state root. Copy,
+without moving or modifying the originals:
+
+- `local-unified-index-v1.sqlite`;
+- `local-unified-index-device-salt-v1`;
+- `local-collector-state-v1.sqlite`;
+- relevant fixed-code diagnostics; and
+- the app version, source commit (if a source checkout), state-root path, file
+  sizes, mtimes, and SHA-256 digests.
+
+If SQLite sidecars exist while every writer is stopped, preserve them too.
+Keep private paths/digests in the local recovery record, not a public issue.
+
+## 3. Inspect the copy only
+
+Run SQLite checks against the copied database:
+
+```sql
+PRAGMA query_only = ON;
+PRAGMA quick_check;
+PRAGMA application_id;
+PRAGMA user_version;
+SELECT value FROM meta WHERE key = 'schema_version';
+SELECT value FROM meta WHERE key = 'status';
+```
+
+Record exact output. `quick_check = ok` proves page-level consistency, not
+semantic compatibility or complete source coverage.
+
+Compare the copy with the current constants in `src/local-unified-index.js`:
+
+- schema family `local-unified-index-v2`;
+- `user_version` 10;
+- parser `unified-rollout-typed-v10`; and
+- source identity `codex-immutable-rollout-v1`.
+
+## 4. Classify before acting
+
+| Observation | Classification | Next action |
+| --- | --- | --- |
+| Integrity passes; version is newer than this reader | Reader downgrade/mismatch | Install or build the newer compatible reader. Do not change the database. |
+| Integrity passes; version 1-9 and legacy family is recognized | Supported forward migration | Rehearse the current reader against a second copy, then inspect generation/coverage before considering live recovery. |
+| Integrity passes; version/family/application id is unexpected | Wrong file, unsupported format, or metadata corruption | Preserve and escalate. Do not relabel. |
+| Integrity fails | Physical corruption | Preserve original and all sidecars; attempt extraction or rebuild only into separate candidates. |
+| Schema opens but generation is partial/incomplete | Source/provenance problem | Inspect generation issues and retained last-good facts; do not equate it with database corruption. |
+| App opens an older copy but current live file fails | Likely forward incompatibility or publication/migration issue | Keep both; compare versions and generation descriptors without overwriting either. |
+
+## 5. Rehearse a source rebuild separately
+
+Only after preserving the original, build to a new explicit destination:
+
+```bash
+npm run index:rebuild -- \
+  --index /absolute/private/recovery/candidate.sqlite \
+  --codex-home /absolute/path/to/the/selected/codex-home \
+  --workers 1
+```
+
+This command is not a dry run. It atomically publishes over the **selected
+candidate path**, so choose a new path that contains no evidence. Unknown,
+duplicate, missing, and malformed options fail before source/destination access.
+
+Start with one worker as the reference implementation. A broader worker count
+is a performance choice, not a different recovery meaning.
+
+The command's JSON inspection receipt must show:
+
+- a valid schema/version;
+- `PRAGMA quick_check` success;
+- a complete or explicitly understood partial generation;
+- discovered/indexed/skipped counts and bytes; and
+- no unexplained source quarantine.
+
+## 6. Compare retained evidence
+
+A rebuild can only reconstruct sources that still exist. Compare the candidate
+with the preserved original copy for:
+
+- earliest/latest usage and quota timestamps;
+- usage/quota/tool counts;
+- source and generation counts;
+- skipped/quarantined source reasons;
+- account/model/speed coverage; and
+- facts whose source rollout has rotated away.
+
+If the candidate loses old facts, it is not an equivalent recovery even when
+its schema is current and integrity passes. Prefer forward recovery of the
+preserved original copy or retain both for an explicit merge design.
+
+## 7. Replacement is a separate gate
+
+Do not replace the live index during diagnosis. A reviewed replacement plan
+must identify:
+
+- exact live and candidate paths and digests;
+- app/reader version that will reopen it;
+- whether local collector/cache state must be rebuilt or invalidated;
+- how the original remains recoverable;
+- a post-restart dashboard and generation inspection; and
+- rollback behavior if publication durability is uncertain.
+
+Move the old live state to a recoverable local archive/Trash only when the user
+has explicitly authorized that exact replacement. Never use recursive deletion
+or a wildcard against Application Support.
+
+## 8. Close with a private receipt
+
+Record the failure code, versions, integrity result, preserved digests, actions,
+candidate receipt, evidence comparison, post-restart result, and remaining
+gaps. Redact usernames, home paths, account identities, and private evidence
+from public issues.
+
+If the root cause was a schema or recovery-document mismatch, update
+[`../reference/unified-index-schema.md`](../reference/unified-index-schema.md),
+the relevant tests, and this runbook in the same change. Delete obsolete
+recovery notes rather than leaving competing instructions.

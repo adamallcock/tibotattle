@@ -317,9 +317,6 @@ enum TiboTattleLocalization {
         case settingsNotificationsResetDetail = "settings.notificationsResetDetail"
         case settingsOpenDashboard = "settings.openDashboard"
         case settingsOpenNotifications = "settings.openNotifications"
-        case settingsPreviewUpdatesPending = "settings.previewUpdatesPending"
-        case settingsPreviewUpdatesPendingMessage = "settings.previewUpdatesPendingMessage"
-        case settingsPreviewUpdatesPendingTitle = "settings.previewUpdatesPendingTitle"
         case firstRunLoginItemDisclosure = "firstRun.loginItemDisclosure"
         case settingsContinue = "settings.continue"
         case settingsContinueWithoutLogin = "settings.continueWithoutLogin"
@@ -382,7 +379,7 @@ enum TiboTattleLocalization {
             case .dialogChooseCodexHomeFolderMessage:
                 "Choose the folder that contains Codex sessions or archived_sessions."
             case .dialogCodexFolderDescription:
-                "Current: %@\n\n%@ stores a custom folder only in owner-only app settings. Diagnostics never copy its path. The local companion reads only the sessions and archived_sessions folders beneath the selected Codex home."
+                "Current: %@\n\n%@ stores a custom folder only in owner-only app settings. Diagnostics never copy its path. This choice controls the sessions and archived_sessions source only; other local refresh sources are disclosed at first run and in the privacy guide."
             case .dialogCopyDiagnostics:
                 "Copy Diagnostics"
             case .dialogCustomCodexFolder:
@@ -506,7 +503,7 @@ enum TiboTattleLocalization {
             case .launcherFailureDetails:
                 "%@ Code: %@. %@"
             case .launcherFirstRunDisclosure:
-                "%@ updates local %@ metadata while the app is open. The first pass starts after setup; later checks reuse the same bounded local companion.\n\nReads: timestamps, model and speed labels, token counters, tool categories, and quota snapshots from the selected %@ sessions folders.\n\nStores: content-free indexes, cached calculations, settings, and any prepared contribution in your owner-only %@ app-data folder.\n\nCommunity contribution is optional. It stays off until you review the content-free fields and explicitly send a contribution.\n\n%@\n\nNever contributed: prompts, responses, file paths, repositories, commands, credentials, emails, or account names.\n\nKeep the app open while analysis runs. You may close and reopen the TiboTattle window; quitting the app stops the current pass and preserves completed checkpoints. You can choose whether the app opens at login. TiboTattle installs no LaunchAgent or daemon."
+                "%@ updates local %@ usage and quota evidence while the app is open. The first pass starts after setup; later checks reuse the same bounded local companion.\n\nReads locally: usage metadata from the selected %@ sessions and archived_sessions folders; state_5.sqlite for rollout lineage; config.toml for service-tier settings; and the installed Codex app-server account/read, account/rateLimits/read, and account/usage/read methods. Source records are processed locally; prompt and response text is never retained in TiboTattle's derived state.\n\nStores: content-free indexes, cached calculations, settings, and any prepared contribution in your owner-only %@ app-data folder. Existing pseudonymous identities and device credentials remain in the macOS Keychain.\n\nCommunity contribution is optional. It stays off until you review the content-free fields and explicitly send a contribution.\n\nLocal allowance notifications are also off by default. If enabled in Settings → Notifications, they use only fresh provider-reported quota evidence from foreground refreshes; they add no background polling.\n\n%@\n\nNever contributed: prompts, responses, file paths, repositories, commands, credentials, emails, or account names.\n\nKeep the app open while analysis runs. You may close and reopen the TiboTattle window; quitting the app stops the current pass and preserves completed checkpoints.\n\n%@"
             case .launcherGetStarted:
                 "Get Started"
             case .launcherLoadingPrivateDashboard:
@@ -624,7 +621,7 @@ enum TiboTattleLocalization {
             case .nativeDashboardRefreshUsage:
                 "Refresh"
             case .nativeDashboardRefreshUsageTooltip:
-                "Update local usage now. This reads only the selected Codex folders on this Mac."
+                "Update from selected Codex session folders and local Codex account, quota, configuration, and rollout-lineage sources. Processing stays on this Mac."
             case .nativeDashboardShare:
                 "Share"
             case .nativeDashboardShareTooltip:
@@ -778,7 +775,7 @@ enum TiboTattleLocalization {
             case .settingsCodexFolderDefaultLocation:
                 "Default location (~/.codex)"
             case .settingsCodexFolderSummary:
-                "TiboTattle reads only the sessions and archived_sessions folders below this location. Use the default unless your Codex data lives somewhere else."
+                "This setting controls the sessions and archived_sessions source only. Refresh also uses the local Codex account, quota, configuration, and rollout-lineage sources disclosed at first run."
             case .settingsGeneral:
                 "General"
             case .settingsGeneralSummary:
@@ -863,14 +860,8 @@ enum TiboTattleLocalization {
                 "Open Dashboard"
             case .settingsOpenNotifications:
                 "Open Notification Settings"
-            case .settingsPreviewUpdatesPending:
-                "This preview uses the live TiboTattle update feed. The first signed release has not been published yet, so updates cannot be discovered."
-            case .settingsPreviewUpdatesPendingMessage:
-                "This preview is connected to the live TiboTattle service, but the signed update feed has not been published yet. Local analysis is unaffected. Check again after a signed release is available."
-            case .settingsPreviewUpdatesPendingTitle:
-                "Updates aren't published yet"
             case .firstRunLoginItemDisclosure:
-                "By default, first-run setup preselects Start TiboTattle at login. TiboTattle adds a macOS login item only after you click Get Started; it uses no LaunchAgent, daemon, privileged helper, or hidden persistent process."
+                "By default, first-run setup preselects Start TiboTattle at login. TiboTattle adds a macOS login item only after you click Get Started; it uses no LaunchAgent or daemon and no privileged helper or hidden persistent process."
             case .settingsContinue:
                 "Continue"
             case .settingsContinueWithoutLogin:
@@ -938,9 +929,9 @@ enum TiboTattleLocalization {
             case .settingsUpdateCheckUnavailableTitle:
                 "Couldn't check for updates"
             case .settingsUpdateDisclosureAutomaticOff:
-                "Signed app updates are available from About → Check for Updates. Automatic downloads are currently off; you can turn them on in Settings → General when available."
+                "Signed app updates are available from About → Check for Updates. Automatic downloads are currently off; you can turn them on in Settings → About when available."
             case .settingsUpdateDisclosureAutomaticOn:
-                "Signed app updates are checked automatically. By default, a verified update downloads in the background and installs when you quit; you can turn that off in Settings → General."
+                "Signed app updates are checked automatically. By default, a verified update downloads in the background and installs when you quit; you can turn that off in Settings → About."
             case .settingsUpdateDisclosureDevelopment:
                 "This development build does not include update checks. Signed releases installed in Applications can check for updates from About."
             case .settingsUpdateDisclosurePreview:

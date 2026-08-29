@@ -1,6 +1,13 @@
-# Design note: the first-pairing Keychain prompt
+---
+title: First-pairing Keychain prompt
+date: 2026-08-19
+type: design
+status: complete
+---
 
-Date: 2026-08-19. Status: option 3 implemented — copy and ordering fixes
+# The first-pairing Keychain prompt
+
+Option 3 is implemented — copy and ordering fixes
 shipped on `fix/first-pairing-keychain-ux`; the structural elimination
 (Swift-app credential minting over a spawn-time broker channel) is built on
 `feat/swift-keychain-broker` and documented in "Implementation" below, with

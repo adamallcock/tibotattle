@@ -8,8 +8,9 @@ import { TELEMETRY_PLAN_TYPES } from "./telemetry-validation";
 import type { TelemetryEnvelope } from "./telemetry-validation";
 
 /**
- * telemetry-contribution-v1.0: incremental full-history contribution chunks
- * (docs/design/2026-08-07-incremental-contribution-model.md).
+ * telemetry-contribution-v1.0: incremental full-history contribution chunks.
+ * The maintained contract lifecycle is documented in
+ * docs/reference/schema-contracts.md.
  *
  * The v1.0 contract package freeze is a parallel deliverable; until it lands,
  * this module is the worker-side closed-schema authority for the chunk

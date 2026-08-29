@@ -9,8 +9,9 @@ import {
   exportModelProvider,
 } from "../export/index.js";
 
-// telemetry-contribution-v1.0 chunk derivation over the local unified index
-// (docs/design/2026-08-07-incremental-contribution-model.md).
+// telemetry-contribution-v1.0 chunk derivation over the local unified index.
+// Maintained lifecycle and privacy boundaries live in
+// docs/reference/schema-contracts.md and docs/reference/local-data-and-privacy.md.
 //
 // History is deterministically partitioned client-side: per stream, per UTC
 // day, ordered by a total order any two scans reproduce, split into segments

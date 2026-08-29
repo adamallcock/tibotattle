@@ -5,6 +5,15 @@ artifacts into the functional TiboTattle dashboard. It does not send raw
 Codex logs, accept arbitrary source paths, or expose raw account/session
 pseudonyms to the browser.
 
+A normal refresh processes metadata from the selected Codex `sessions` and
+`archived_sessions` folders. It also reads the selected Codex home's
+`state_5.sqlite` for rollout lineage and `config.toml` for service-tier
+settings, and invokes the installed Codex binary's local `app-server` methods
+`account/read`, `account/rateLimits/read`, and `account/usage/read`. Source
+records are processed locally; prompt and response text is never retained in
+the companion's derived state. See the maintained
+[local data and privacy reference](../../docs/reference/local-data-and-privacy.md).
+
 ## Run
 
 ```bash
@@ -51,12 +60,13 @@ open ".release-build/macos/TiboTattle.app"
 ```
 
 The native window starts the loopback companion on an ephemeral port and opens
-the same real dashboard. It does not install a daemon, Login Item,
-LaunchAgent, browser extension, or background uploader. The ordinary
-development/ad-hoc build also contains no updater framework and performs no
-updater networking. A separately gated external-distribution build can embed
-the pinned Sparkle 2.9.3 framework; automatic download and install-on-quit are
-still off until the user opts in. Closing the app stops its companion; a
+the same real dashboard. First-run may register the normal TiboTattle app as a
+macOS Login Item only after the user confirms the visibly preselected choice;
+it installs no daemon, LaunchAgent, browser extension, privileged helper, or
+separate background uploader. Development/ad-hoc builds contain no updater.
+Signed stable releases embed the pinned Sparkle framework, enable automatic
+downloads by default, and expose that switch under **Settings → About**.
+Closing the app stops its companion; a
 parent-death watchdog also prevents the bundled child from surviving a forced
 launcher termination. External preparation is repeatable: an existing exact
 pinned framework is independently verified and reused, while an alias or
@@ -77,14 +87,10 @@ node ./scripts/build-macos-app.js \
 ```
 
 Plain HTTP is accepted only for the exact `127.0.0.1` host, with an explicit
-port and the explicit development flag. A future production build instead
-uses a fixed non-loopback HTTPS origin and no development flag:
-
-```bash
-node ./scripts/build-macos-app.js \
-  --output ".release-build/macos-production/TiboTattle.app" \
-  --central-origin https://usage-monitor.example
-```
+port and the explicit development flag. Preview and production builds derive
+the reviewed HTTPS origin from
+[`config/deployment-endpoints.js`](../../config/deployment-endpoints.js); the
+generic builder cannot accept an independent production origin.
 
 The normalized origin and its mode are sealed into `Info.plist`; the native
 launcher validates them again and passes only that value into its closed child
@@ -95,16 +101,18 @@ configured and the connection mode, not its origin.
 
 The HTTPS configuration and exact participant relay are covered by local
 contract tests, but they are not evidence that a particular hosted deployment
-exists or is ready. Consumer enrollment, contribution history, uploads, and
-deletion, plus the support-only recovery and export routes, still require a
-live disabled-first hosted smoke before a production claim.
+or installed app is healthy. Track source, preview, installed, live-service,
+release, and updater evidence separately in
+[`docs/current-status.md`](../../docs/current-status.md).
 
 On first use:
 
 1. open the dashboard from the native window;
 2. review whether local Codex metadata and writable installed state are
    available;
-3. choose **Analyze local usage** to start one bounded, cancellable job;
+3. let the native launcher start one bounded, cancellable refresh after the
+   dashboard's first paint, or choose **Analyze local usage** in a standalone
+   browser development session;
 4. keep reading as TiboTattle automatically continues bounded slices under
    that original action, or choose **Cancel** and resume later; and
 5. review the privacy-safe local results; then
@@ -143,8 +151,7 @@ The existing export resource guard is applied to source files and bytes,
 directory entries, elapsed time, line size, and RSS, including a 1.5 GiB
 accounting RSS ceiling. A violation becomes fixed
 `refresh_resource_limited`; the browser retains the useful headline or prior
-result and explains that deep analysis stopped at its safety limit. This is
-safe for the pilot.
+result and explains that deep analysis stopped at its safety limit.
 
 A separate archive-accounting SQLite index now makes all-history coverage
 explicit. Its first scheduled source parse is 128 MiB; later resumptions may
@@ -218,10 +225,12 @@ node ./apps/local/server.js
 ```
 
 Mutable installed state is confined to the owner-only
-`~/Library/Application Support/TiboTattle` directory. App resources stay
-inside the bundle. The current artifact is only ad-hoc signed for local
-development; it is not Developer ID signed, notarized, packaged as a
-publishable DMG, or ready for unreviewed public installation.
+`~/Library/Application Support/Usage Monitor` directory. The neutral machine
+identity is intentional and remains stable across display-name changes. App
+resources stay inside the bundle. Development output is ad-hoc signed; current
+public releases are separately Developer ID signed, notarized, packaged, and
+qualified through the retained release gates. A source build never inherits
+those release claims.
 
 ## Product and contribution boundary
 
@@ -240,8 +249,9 @@ Contribution is off by default. The affirmative path requires:
 5. a terminally accepted first upload before recurring contribution can start.
 
 After those gates, the app may attempt one bounded update every six hours while
-it is open. No daemon, Login Item, LaunchAgent, or separate background process
-continues after the app exits. The recurring range begins from an owner-only
+it is open. The optional Login Item starts the normal app; no daemon,
+LaunchAgent, or separate background process continues after the app exits. The
+recurring range begins from an owner-only
 accepted-through watermark bound to the exact destination and contribution
 contract, includes a fixed one-hour overlap for replay-safe server
 deduplication, and covers at most 24 hours per prepared pass. A partial,
@@ -278,7 +288,7 @@ under **Data & Diagnostics…** and are not contribution steps.
 ## Local API
 
 The complete route-by-route inventory lives in the maintained
-[TiboTattle API surface reference](../../docs/reference/2026-08-26-api-surface-reference.md).
+[TiboTattle API surface reference](../../docs/reference/api-surface.md).
 It covers all local companion paths, fixed report routes, the credential-free
 central relay, and the separately allowlisted participant relay. A source-parity
 test fails if an exact route allowlist changes without the reference changing

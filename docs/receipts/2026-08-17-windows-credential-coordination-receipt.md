@@ -2,7 +2,7 @@
 title: Windows credential coordination qualification receipt
 date: 2026-08-17
 type: receipt
-status: qualified-foundation-production-blocked
+status: complete
 ---
 
 # Windows credential coordination qualification receipt

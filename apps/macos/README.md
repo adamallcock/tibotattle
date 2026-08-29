@@ -1,23 +1,17 @@
----
-title: TiboTattle macOS Release Runbook
-date: 2026-07-29
-type: runbook
-status: implemented-foundation
----
+# Native macOS app
 
-# TiboTattle macOS release runbook
-
-This directory contains the native foreground launcher and the release
-contracts for a self-contained Usage Monitor app. The ordinary developer build
-is usable locally but is not a public installer. The external-distribution path
-fails closed unless production service configuration, approved artwork,
-Developer ID signing, Apple notarization, stapling, Gatekeeper assessment, and
-a clean-profile smoke all succeed.
+This directory contains TiboTattle's supported native foreground launcher and
+macOS release contracts. Public stable releases are signed, notarized, packaged,
+and published through the retained external-distribution gates. A local source
+or development build is usable for development but does not inherit those
+release claims. The canonical operator sequence is the
+[macOS stable release runbook](../../docs/runbooks/macos-stable-release-runbook.md);
+this README documents the maintained component and user lifecycle.
 
 For the native/loopback launch contract, fixed URL scheme, WKWebView messages,
 Keychain broker, Codex subprocess protocol, platform APIs, and system diagram,
 see the canonical
-[TiboTattle API surface reference](../../docs/reference/2026-08-26-api-surface-reference.md).
+[TiboTattle API surface reference](../../docs/reference/api-surface.md).
 
 The packaged companion reaches Keychain only through the app's private
 protocol-v2 socket broker. Its closed capability enum covers export identity,
@@ -39,10 +33,13 @@ that compatibility backend.
 
 1. Launch **TiboTattle.app**.
 2. On the first launch, review the one-time **Get Started** disclosure. It
-   explains exactly which Codex metadata can be read after an explicit Analyze
-   action, what owner-only local state is retained, which content is excluded,
-   how optional contribution stays off, and what happens when the browser or
-   app closes. The accessible native **Start TiboTattle at login** control is
+   names every normal local source: selected Codex `sessions` and
+   `archived_sessions`, `state_5.sqlite`, `config.toml`, the installed Codex
+   app-server methods `account/read`, `account/rateLimits/read`, and
+   `account/usage/read`. It also explains what owner-only derived state is
+   retained, which content is excluded, how optional contribution stays off,
+   and what happens when the window or app closes. The
+   accessible native **Start TiboTattle at login** control is
    visibly preselected. Choosing **Get Started** is the affirmative action
    that may register the native Login Item; clearing it continues without a
    Login Item. The acknowledgement is an owner-only local receipt; moving
@@ -65,7 +62,9 @@ that compatibility backend.
    TiboTattle** destination, state-aware **Analyze/Update Local Usage**, and
    **Quit TiboTattle**; Quit uses the same graceful shutdown as the window's own
    Quit control.
-5. Choose **Open TiboTattle** and explicitly start local analysis.
+5. The dashboard renders its initial local state, then the native launcher
+   starts one automatic bounded refresh after first paint. **Refresh usage** is
+   available for later explicit passes.
 6. If the companion fails or exits, choose **Retry**. The app does not require
    a relaunch for ordinary recovery.
 7. Choose **Data & Diagnostics…** to see and copy a fixed, path-free diagnostic
@@ -77,7 +76,7 @@ that compatibility backend.
    only `default` or `custom`, never the path.
 9. Choose **About TiboTattle** → **Check for Updates** to check a signed
    production appcast. Automatic update downloads are controlled by one native
-   switch in **Settings…** → **General**. Developer and ad-hoc builds contain
+   switch in **Settings…** → **About**. Developer and ad-hoc builds contain
    no updater framework and perform no update networking.
 10. **Settings…** → **Notifications** contains **Local allowance
    notifications**. It is off by default; enabling it is the only action that
@@ -180,7 +179,7 @@ those require the hosted privacy workflow. It does not claim secure erasure.
 After the reset, future contribution activity uses a new identity and requires
 pairing again.
 
-The ordinary uninstall journey is simply: quit Usage Monitor and move
+The ordinary uninstall journey is simply: quit TiboTattle and move
 **TiboTattle.app** to Trash. Advanced local cleanup is kept under
 **Data & Diagnostics…** rather than presented as part of normal onboarding.
 
@@ -325,9 +324,9 @@ node ./scripts/verify-macos-preview-remote.js \
   --live
 ```
 
-If the central service is healthy but the appcast is not yet published, the
-command exits non-zero and says so plainly. That is an external release-input
-gap, not a claim that Sparkle has updated the preview client.
+If the configured preview feed has no qualifying appcast entry, the command
+exits non-zero and says so plainly. That is an external release-input gap, not
+a claim that Sparkle has updated the preview client.
 
 ## External-distribution build gate
 
@@ -346,7 +345,7 @@ npm run product:macos:updater:prepare
 
 The generic builder rejects `--external-distribution` entirely, including when
 the old environment marker is supplied or a similar CLI marker is attempted.
-Build the release candidate only through `product:macos:release`, which performs
+Build a later stable release candidate only through `product:macos:release`, which performs
 the continuity and source-provenance checks before calling the external-build
 API. The appcast public key is public; the matching private update-signing key
 must not enter the repository or release host:
@@ -355,19 +354,13 @@ must not enter the repository or release host:
 npm run product:macos:release -- \
   --channel stable \
   --prepare-candidate \
-  --stable-bootstrap
-```
-
-`--stable-bootstrap` is an explicit first-stable-release decision. For every
-later stable release, replace it with the manifest from the immediately
-previous stable release so the gate can prove version continuity:
-
-```bash
-npm run product:macos:release -- \
-  --channel stable \
-  --prepare-candidate \
   --previous-stable-manifest "/path/to/previous-stable-release.json"
 ```
+
+`--stable-bootstrap` is retained only as the historical first-stable-release
+decision and is not the normal current path. Every later stable release must
+use the manifest from the immediately previous stable release so the gate can
+prove version continuity.
 
 The command rejects a missing origin, HTTP, loopback, credentials, paths,
 queries, fragments, missing artwork, missing provenance, placeholder
@@ -398,12 +391,11 @@ export USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY='REPLACE_WITH_32_BYTE_BASE64_PUBLIC_K
 npm run product:macos:release -- \
   --channel stable \
   --prepare-candidate \
-  --stable-bootstrap
+  --previous-stable-manifest "/path/to/previous-stable-release.json"
 ```
 
-For a later stable release, use `--previous-stable-manifest` in place of
-`--stable-bootstrap`, as shown above. The two options are mutually exclusive;
-the release command refuses to guess which continuity policy applies.
+The continuity options are mutually exclusive; the release command refuses to
+guess which policy applies.
 
 `config/deployment-endpoints.js` is the reviewed source for the public origin
 and Sparkle appcast. Legacy `USAGE_MONITOR_PRODUCTION_ORIGIN` and
@@ -443,19 +435,19 @@ operator explicitly supplies `--replace`.
 
 ## Signed replacement and rollback contract
 
-Production Usage Monitor builds use the pinned Sparkle 2.9.3 framework. Sparkle
+Production TiboTattle builds use the pinned Sparkle 2.9.3 framework. Sparkle
 checks one exact HTTPS appcast automatically and exposes a user-initiated
 **Check for Updates** action. Every published artifact must carry an Ed25519
 signature made by the offline update key as well as the existing Developer ID
 and notarization assurances. Automatic update downloads are on by default in a
 signed release. The user can turn them off with the native **Automatic
-updates** switch in **Settings…** → **General** and can always use **Check for
-Updates** from About. A manual signed-DMG replacement remains the fallback.
+updates** switch in **Settings…** → **About** and can always use **Check for
+Updates** there. A manual signed-DMG replacement remains the fallback.
 
 Every new `usage-monitor-macos-release-v0.2` manifest records the fixed
 `usage-monitor-macos-signed-replacement-v1` contract:
 
-- quit Usage Monitor before replacing the app in `/Applications`;
+- quit TiboTattle before replacing the app in `/Applications`;
 - require the candidate bundle version to be strictly newer;
 - require both candidate and rollback DMGs to have complete Developer ID,
   hardened-runtime, notarization, stapling, Gatekeeper, and clean-profile
@@ -547,15 +539,16 @@ disposable-VM rehearsal:
      --rehearsal "docs/receipts/YYYY-MM-DD-macos-login-item-release-rehearsal.json"
    ```
 
-## Human-only gates
+## Protected per-release inputs and gates
 
-The repository cannot complete these without an authorized person:
+The repository cannot complete a new release without an authorized person. A
+previously published release does not satisfy these gates for later bytes:
 
 - approve final icon artwork and its distribution rights;
 - supply and authorize an Apple Developer Program team and Developer ID
   Application certificate;
 - create the `notarytool` Keychain credential profile;
-- approve the production HTTPS service origin;
+- verify the reviewed production HTTPS service origin;
 - create and protect a Sparkle Ed25519 update-signing key outside the
   repository and hosting environment;
 - approve and publish the exact HTTPS appcast URL;
@@ -567,7 +560,7 @@ The repository cannot complete these without an authorized person:
   copy; and
 - authorize external distribution.
 
-The repository implements and tests the fail-closed updater build boundary, but
-cannot claim a live update until an authorized operator supplies the appcast,
-public key, matching private signing key, Developer ID identity, notarization
-profile, and a previously installed signed release for an update rehearsal.
+The repository implements and tests the fail-closed updater build boundary.
+Current source, signed candidate, notarization, publication, feed availability,
+installed upgrade, and rollback rehearsal remain separate gates recorded in
+the [current status matrix](../../docs/current-status.md).

@@ -2,7 +2,7 @@
 title: macOS stable release
 date: 2026-08-18
 type: runbook
-status: canonical
+status: maintained
 ---
 
 # macOS stable release runbook (canonical)

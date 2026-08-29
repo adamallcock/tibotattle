@@ -10,7 +10,10 @@
 //
 // Usage:
 //   node scripts/rebuild-local-unified-index.mjs [--index <file>] [--workers N]
-//                                                [--codex-home <dir>] [--dry-run]
+//                                                [--codex-home <dir>]
+//
+// This command publishes a rebuilt index atomically. It has no dry-run mode;
+// unknown and duplicate options fail before any source or destination is opened.
 
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -24,15 +27,17 @@ import {
   defaultLocalUnifiedIndexPath,
 } from "../src/local-unified-index.js";
 import { TELEMETRY_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
+import { parseRebuildLocalUnifiedIndexOptions } from "./rebuild-local-unified-index-options.mjs";
 
-function option(name, fallback = null) {
-  const at = process.argv.indexOf(`--${name}`);
-  return at < 0 || at + 1 >= process.argv.length ? fallback : process.argv[at + 1];
-}
-
-const indexFile = option("index", defaultLocalUnifiedIndexPath());
-const codexHome = option("codex-home", process.env.CODEX_HOME ?? join(homedir(), ".codex"));
-const workers = Number(option("workers", String(defaultRebuildWorkerCount())));
+const {
+  indexFile,
+  codexHome,
+  workers,
+} = parseRebuildLocalUnifiedIndexOptions(process.argv.slice(2), {
+  defaultIndexFile: defaultLocalUnifiedIndexPath(),
+  defaultCodexHome: process.env.CODEX_HOME ?? join(homedir(), ".codex"),
+  defaultWorkers: defaultRebuildWorkerCount(),
+});
 
 let peakRss = 0;
 const sample = setInterval(() => {
@@ -44,7 +49,7 @@ const result = await rebuildLocalUnifiedIndex({
   codexHome,
   indexFile,
   contractVersion: TELEMETRY_SCHEMA_VERSION,
-  workerCount: Number.isSafeInteger(workers) ? workers : 1,
+  workerCount: workers,
   onProgress: process.stdout.isTTY
     ? (progress) => {
       process.stdout.write(
