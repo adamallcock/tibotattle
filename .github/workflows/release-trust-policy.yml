@@ -17,6 +17,8 @@ on:
       - "scripts/macos-release-core.js"
       - "scripts/build-public-release-site.js"
       - "scripts/validate-release-sbom.mjs"
+      - "tools/operations/validate-documentation.mjs"
+      - "test/documentation-governance.test.js"
       - "test/release-*.test.js"
       - "test/macos-app-bundle.test.js"
       - "test/public-release-site.test.js"
@@ -45,6 +47,8 @@ on:
       - "scripts/macos-release-core.js"
       - "scripts/build-public-release-site.js"
       - "scripts/validate-release-sbom.mjs"
+      - "tools/operations/validate-documentation.mjs"
+      - "test/documentation-governance.test.js"
       - "test/release-*.test.js"
       - "test/macos-app-bundle.test.js"
       - "test/public-release-site.test.js"
@@ -73,6 +77,7 @@ jobs:
       - name: Check out the selected revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Install pinned Node.js
@@ -105,5 +110,5 @@ jobs:
       - name: Test public verification documentation
         run: node --test apps/web/test/community-site.test.mjs
 
-      - name: Check documentation links
-        run: npm run docs:links:check
+      - name: Check documentation governance
+        run: npm run docs:check
