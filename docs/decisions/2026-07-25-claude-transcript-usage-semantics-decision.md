@@ -2,7 +2,7 @@
 title: Claude Transcript Usage Semantics Decision
 date: 2026-07-25
 type: decision-record
-status: accepted
+status: complete
 ---
 
 # Claude Transcript Usage Semantics Decision

@@ -2,10 +2,17 @@
 title: Claude Desktop Phase 0 Preparation Implementation Receipt
 date: 2026-08-16
 type: receipt
-status: production-shadow-preparation; user-facing-gates-open
+status: historical-evidence
 ---
 
 # Claude Desktop Phase 0 preparation implementation receipt
+
+> **Point-in-time evidence, not current product behavior.** PR #78 later
+> removed the shipping Claude plan-history refresh, quota-state store, and
+> `/api/local/claude/quota` route recorded below. The separately installed
+> managed Claude callback and hard-disabled qualification seam have different
+> boundaries. Use the maintained architecture and privacy references for the
+> installed app.
 
 ## Implemented
 

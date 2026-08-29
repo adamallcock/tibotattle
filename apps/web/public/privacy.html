@@ -60,11 +60,37 @@
           </p>
         </article>
         <article class="resource-card" id="app">
-          <h2>Mac app</h2>
+          <h2>Local source inventory</h2>
           <p>
-            TiboTattle reads content-free usage and quota metadata locally.
-            Personal scans, API-equivalent pricing, and dashboard history stay
-            on the Mac that calculated them.
+            TiboTattle processes metadata in the selected Codex
+            <code>sessions</code> and <code>archived_sessions</code> folders. It
+            also reads Codex <code>state_5.sqlite</code> for rollout lineage,
+            <code>config.toml</code> for service-tier settings, the installed
+            Codex app-server <code>account/read</code>,
+            <code>account/rateLimits/read</code>, and
+            <code>account/usage/read</code> methods.
+          </p>
+        </article>
+        <article class="resource-card" id="local-processing">
+          <h2>Local processing and storage</h2>
+          <p>
+            Source records are parsed on your Mac. Prompts and response text may
+            exist in Codex's own rollout files, but TiboTattle does not retain
+            them in derived state. It stores content-free indexes, settings,
+            cached calculations, checkpoints, and prepared contributions in the
+            owner-only <code>Usage Monitor</code> Application Support root.
+            Pseudonymous identity and device credentials use the macOS Keychain.
+          </p>
+        </article>
+        <article class="resource-card" id="network">
+          <h2>Processes and network</h2>
+          <p>
+            The app starts a loopback-only local companion and the installed
+            Codex binary's local <code>app-server</code> subprocess. Local
+            analysis works offline. Network access is limited to explicit
+            capabilities such as signed update checks, hosted sign-in,
+            contribution, deletion, and public aggregate reads; the website
+            cannot reach the loopback dashboard.
           </p>
         </article>
         <article class="resource-card" id="contribution">
@@ -77,6 +103,18 @@
             personal dashboard history.
           </p>
         </article>
+        <article class="resource-card" id="hosted-identity">
+          <h2>Hosted identity and data</h2>
+          <p>
+            Google or Apple sign-in establishes a one-person account boundary.
+            The service stores an irreversible identity hash, never the
+            provider's name or email. Accepted contributions are closed,
+            content-free telemetry. Validated closed metadata is stored in
+            Cloudflare D1, while R2 holds only bounded encrypted quarantine
+            objects. Admin operations are exposed only on the Access-protected
+            admin host.
+          </p>
+        </article>
         <article class="resource-card" id="publication">
           <h2>Community publication</h2>
           <p>
@@ -84,6 +122,39 @@
             account, rounded, and withheld unless enough eligible provider
             accounts pass privacy and quality review. Failed or weak evidence
             stays unavailable.
+          </p>
+        </article>
+        <article class="resource-card" id="retention-deletion">
+          <h2>Retention and deletion</h2>
+          <p>
+            The local display window is not a retention limit: accumulated
+            owner-only evidence remains until you run an explicit local erase.
+            Local erase, Keychain identity reset, disconnecting this Mac, and
+            complete hosted participant deletion are separate actions with
+            separate confirmations. Complete hosted deletion removes
+            contributed usage and account records and stops this Mac's upload
+            authority; it does not alter local analysis.
+          </p>
+        </article>
+        <article class="resource-card" id="uninstall">
+          <h2>Uninstall boundaries</h2>
+          <p>
+            Ordinary app or Homebrew uninstall preserves local analysis state.
+            Homebrew <code>--zap</code> removes the app's Application Support,
+            cache, WebKit, and preference state, but not <code>~/.codex</code>,
+            Keychain identities, or data already contributed. Use the app's
+            explicit identity and hosted privacy controls for those separate
+            lifecycles.
+          </p>
+        </article>
+        <article class="resource-card wide" id="excluded-content">
+          <h2>What never enters a contribution</h2>
+          <p>
+            Contributions exclude prompts, responses, commands, repository and
+            file paths, URLs, credentials, emails, account names, raw account
+            identifiers, and arbitrary metadata. Unknown fields are omitted by
+            closed schemas. If validation cannot prove a record safe, upload is
+            refused rather than partially redacted or guessed.
           </p>
         </article>
       </div>

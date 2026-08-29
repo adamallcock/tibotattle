@@ -2,7 +2,7 @@
 title: Web-only production release lane
 date: 2026-08-17
 type: runbook
-status: active
+status: maintained
 ---
 
 # Web-only production release lane

@@ -20,9 +20,10 @@ import {
   reasoningEffortName,
 } from "./local-unified-index.js";
 
-// The telemetry-contribution-v1.0 sync engine: one bounded pass of the
-// cursor protocol (docs/design/2026-08-07-incremental-contribution-model.md
-// section 3). Strictly sequential, oldest day first, one envelope in flight.
+// The telemetry-contribution-v1.0 sync engine: one bounded pass of the cursor
+// protocol. Maintained route and contract inventories live in
+// docs/reference/api-surface.md and docs/reference/schema-contracts.md.
+// Strictly sequential, oldest day first, one envelope in flight.
 //
 // The service is authoritative for what it accepted; this engine re-derives
 // the local truth per pass and never trusts a cached cursor: one cheap

@@ -1,5 +1,11 @@
 # Windows native security adapter
 
+This is a fail-closed readiness component, not a supported Windows product
+lane. The current published application remains macOS-only; source compilation,
+native unit tests, a valid sidecar, or an approved mutex capability cannot by
+itself establish installed Windows, packaging, signing, updater, or release
+support. See the [current status matrix](../../docs/current-status.md).
+
 This directory contains the reviewed Windows-only filesystem and credential
 mutex boundary for private TiboTattle state. The binding is deliberately a
 small C N-API module;

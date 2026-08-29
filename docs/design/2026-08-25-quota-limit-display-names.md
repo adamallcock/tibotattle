@@ -2,7 +2,7 @@
 title: Forward-compatible quota limit display names
 date: 2026-08-25
 type: decision-record
-status: implemented
+status: complete
 ---
 
 # Forward-compatible quota limit display names

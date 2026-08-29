@@ -34,8 +34,10 @@ function driftReconcileFromDay(nowMs: number): string {
 }
 
 /**
- * Day-partitioned community aggregates for telemetry-contribution-v1.0
- * (docs/design/2026-08-07-incremental-contribution-model.md, section 4).
+ * Day-partitioned community aggregates for telemetry-contribution-v1.0.
+ * Maintained publication and operational boundaries live in
+ * docs/reference/api-surface.md and
+ * docs/runbooks/2026-08-13-community-allowance-band-diagnosis.md.
  *
  * This deliberately reuses the revisioned pattern migration 0012 established
  * for weekly snapshots — published revisions are immutable rows, recomputation

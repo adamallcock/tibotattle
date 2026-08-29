@@ -2,7 +2,7 @@
 title: Public Upload Ingress Admission Decision
 date: 2026-08-04
 type: decision-record
-status: implemented-pending-live-validation
+status: complete
 ---
 
 # Public upload ingress admission decision
@@ -87,15 +87,14 @@ so a future change cannot silently turn on an incomplete asynchronous path.
 
 ## Rollout and operating limits
 
-No hosted deployment is implied by this change. Before an enabled public
-rollout, dry-run both staging and production configuration. The staging gate
-now verifies all ingress variables, all eight Rate Limit bindings, the Durable
-Object binding, and its migration; post-deploy `/api/ready` performs a
-non-consuming Durable Object RPC. Begin with Queue mode still disabled and
-the stated 8 / 120 / 16 / 90-second limits. Run a staged concurrent-upload
-profile against the actual Worker/D1/R2 region mix before increasing any of
-them. A Rate Limit rejection or ingress-budget rejection is an overload
-signal, not an error to automatically retry at full speed.
+Source configuration and deployment state are separate evidence gates. The
+staging gate verifies all ingress variables, all eight Rate Limit bindings,
+the Durable Object binding, and its migration; post-deploy `/api/ready`
+performs a non-consuming Durable Object RPC. Queue mode remains disabled. Run
+a staged concurrent-upload profile against the actual Worker/D1/R2 region mix
+before increasing the stated 8 / 120 / 16 / 90-second limits. A Rate Limit or
+ingress-budget rejection is an overload signal, not permission to retry at
+full speed.
 
 The code emits redacted structured events for request failures, token-abandon
 failures, and lease-release failures. It does **not** yet establish production

@@ -2,7 +2,7 @@
 title: macOS stable release
 date: 2026-08-18
 type: runbook
-status: canonical
+status: maintained
 ---
 
 # macOS stable release runbook (canonical)
@@ -97,6 +97,14 @@ the new constant.
 The macOS finalizer requires an empty tree (including untracked files) and an
 exact annotated tag. The tag must identify the reviewed release commit and be
 protected by the repository's version-tag rules.
+
+The sole historical exception is the pre-policy `v0.1.10` published ref. It is
+a protected lightweight tag at
+`3b3a852abad643095c296550a827ed448b3720fa`, while the v0.1.10
+version-bump source is `151adec996c9a0f621819f89777ac5a05f1df8b6`. The release
+documentation checker accepts only that exact pair and reports it separately
+from annotated tags. This closed exception does not authorize another
+lightweight tag: every new stable tag must remain annotated and protected.
 
 ~~~bash
 git status --porcelain=v1 --untracked-files=all   # must print nothing

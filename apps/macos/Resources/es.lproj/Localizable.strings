@@ -28,7 +28,7 @@
 "nativeDashboard.progressQuotaRefresh" = "Actualizando el límite…";
 "nativeDashboard.progressSaving" = "Guardando el progreso del análisis…";
 "nativeDashboard.refreshUsage" = "Actualizar";
-"nativeDashboard.refreshUsageTooltip" = "Actualiza ahora el uso local. Solo lee las carpetas de Codex seleccionadas en este Mac.";
+"nativeDashboard.refreshUsageTooltip" = "Actualiza desde las carpetas de sesiones de Codex seleccionadas y las fuentes locales de cuenta, límite, configuración y linaje de ejecuciones de Codex. El procesamiento permanece en este Mac.";
 "nativeDashboard.share" = "Compartir";
 "nativeDashboard.showSidebar" = "Mostrar barra lateral";
 "nativeDashboard.shareTooltip" = "Abrir la tarjeta local para compartir.";
@@ -96,7 +96,7 @@
 "settings.checkForUpdates" = "Buscar actualizaciones";
 "settings.chooseCodexFolder" = "Elegir carpeta de Codex…";
 "settings.codexFolder" = "Carpeta de Codex";
-"settings.codexFolderSummary" = "TiboTattle solo lee las carpetas sessions y archived_sessions bajo esta ubicación. Usa el valor predeterminado salvo que tus datos de Codex estén en otro lugar.";
+"settings.codexFolderSummary" = "Esta opción solo controla el origen sessions y archived_sessions. La actualización también usa las fuentes locales de cuenta, límite, configuración y linaje de ejecuciones de Codex explicadas en la configuración inicial.";
 "settings.general" = "General";
 "settings.generalSummary" = "El uso local se actualiza mientras TiboTattle está abierto. Los registros sin procesar permanecen en este Mac.";
 "settings.github" = "GitHub";
@@ -109,9 +109,6 @@
 "settings.languageSystem" = "Sistema";
 "settings.openDashboard" = "Abrir panel";
 "settings.openNotifications" = "Abrir ajustes de notificaciones";
-"settings.previewUpdatesPending" = "Esta vista previa usa el canal de actualizaciones activo de TiboTattle. La primera versión firmada aún no se ha publicado, por lo que no se pueden detectar actualizaciones.";
-"settings.previewUpdatesPendingMessage" = "Esta vista previa está conectada al servicio activo de TiboTattle, pero el canal de actualizaciones firmado aún no se ha publicado. El análisis local no se ve afectado. Vuelve a comprobarlo cuando haya una versión firmada disponible.";
-"settings.previewUpdatesPendingTitle" = "Las actualizaciones aún no se han publicado";
 "settings.useDefault" = "Usar predeterminado";
 "settings.version" = "Versión %@ (%@)";
 "settings.website" = "Sitio web de TiboTattle";
@@ -122,7 +119,7 @@
 "launcher.dataDiagnostics" = "Datos y diagnósticos…";
 "launcher.detailPreparingLocalDashboard" = "Preparando el panel local privado y su actualización limitada en primer plano.";
 "launcher.failureDetails" = "%@ Código: %@. %@";
-"launcher.firstRunDisclosure" = "%@ actualiza metadatos locales de %@ mientras la app está abierta. El primer análisis comienza después de la configuración; las comprobaciones posteriores reutilizan el mismo acompañante local limitado.\n\nLee: marcas de tiempo, etiquetas de modelo y velocidad, contadores de tokens, categorías de herramientas e instantáneas de límite de las carpetas de sesiones de %@ seleccionadas.\n\nGuarda: índices sin contenido, cálculos en caché, configuración y cualquier contribución preparada en tu carpeta de datos de %@, disponible solo para el propietario.\n\nLa contribución a la comunidad es opcional. Permanece desactivada hasta que revises los campos sin contenido y envíes explícitamente una contribución.\n\n%@\n\nNunca se contribuyen: indicaciones, respuestas, rutas de archivos, repositorios, comandos, credenciales, correos electrónicos ni nombres de cuenta.\n\nMantén la app abierta mientras se ejecuta el análisis. Puedes cerrar y volver a abrir la ventana de TiboTattle; salir de la app detiene el análisis actual y conserva los puntos de control completados. Puedes elegir si la app se abre al iniciar sesión. TiboTattle no instala ningún LaunchAgent ni demonio.";
+"launcher.firstRunDisclosure" = "%@ actualiza evidencia local de uso y límite de %@ mientras la app está abierta. El primer análisis comienza después de la configuración; las comprobaciones posteriores reutilizan el mismo acompañante local limitado.\n\nLee localmente: metadatos de uso de las carpetas sessions y archived_sessions de %@ seleccionadas; state_5.sqlite para el linaje de ejecuciones; config.toml para la configuración del nivel de servicio; y los métodos account/read, account/rateLimits/read y account/usage/read del app-server de Codex instalado. Los registros de origen se procesan localmente; el texto de indicaciones y respuestas nunca se conserva en el estado derivado de TiboTattle.\n\nGuarda: índices sin contenido, cálculos en caché, configuración y cualquier contribución preparada en tu carpeta de datos de %@, disponible solo para el propietario. Las identidades seudónimas y credenciales de dispositivo existentes permanecen en el Llavero de macOS.\n\nLa contribución a la comunidad es opcional. Permanece desactivada hasta que revises los campos sin contenido y envíes explícitamente una contribución.\n\nLas notificaciones locales de límite también están desactivadas de forma predeterminada. Si las activas en Ajustes → Notificaciones, solo usan evidencia de límite nueva y comunicada por el proveedor durante actualizaciones en primer plano; no añaden consultas en segundo plano.\n\n%@\n\nNunca se contribuyen: indicaciones, respuestas, rutas de archivos, repositorios, comandos, credenciales, correos electrónicos ni nombres de cuenta.\n\nMantén la app abierta mientras se ejecuta el análisis. Puedes cerrar y volver a abrir la ventana de TiboTattle; salir de la app detiene el análisis actual y conserva los puntos de control completados.\n\n%@";
 "launcher.getStarted" = "Comenzar";
 "launcher.loadingPrivateDashboard" = "Cargando el panel local privado solo desde este Mac.";
 "launcher.needsAttention" = "Requiere atención";
@@ -142,7 +139,7 @@
 
 "dialog.chooseCodexHomeFolder" = "Elige tu carpeta de inicio de Codex";
 "dialog.chooseCodexHomeFolderMessage" = "Elige la carpeta que contiene sesiones de Codex o archived_sessions.";
-"dialog.codexFolderDescription" = "Actual: %@\n\n%@ guarda una carpeta personalizada solo en la configuración de la app disponible para el propietario. Los diagnósticos nunca copian su ruta. El acompañante local solo lee las carpetas sessions y archived_sessions bajo el inicio de Codex seleccionado.";
+"dialog.codexFolderDescription" = "Actual: %@\n\n%@ guarda una carpeta personalizada solo en la configuración de la app disponible para el propietario. Los diagnósticos nunca copian su ruta. Esta opción solo controla el origen sessions y archived_sessions; las otras fuentes locales de actualización se explican en la configuración inicial y en la guía de privacidad.";
 "dialog.copyDiagnostics" = "Copiar diagnósticos";
 "dialog.customCodexFolder" = "Carpeta de Codex personalizada";
 "dialog.dataAndDiagnostics" = "Datos y diagnósticos de %@";

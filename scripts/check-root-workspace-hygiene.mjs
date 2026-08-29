@@ -28,6 +28,7 @@ export const ROOT_WORKSPACE_POLICY = Object.freeze({
     "LICENSE",
     "README.md",
     "SECURITY.md",
+    "SUPPORT.md",
     "package.json",
     "pnpm-lock.yaml",
     "pnpm-workspace.yaml",

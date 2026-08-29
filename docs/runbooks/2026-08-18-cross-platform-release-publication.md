@@ -2,7 +2,7 @@
 title: Cross-platform release publication
 date: 2026-08-18
 type: runbook
-status: activation-gated
+status: maintained
 ---
 
 # Cross-platform release publication runbook

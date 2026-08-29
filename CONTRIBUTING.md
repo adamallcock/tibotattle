@@ -28,12 +28,20 @@ npm --prefix apps/worker ci
 
 ## Verification gates
 
-Run these before sending a pull request. They are the same gates the
-maintainer runs, and CI-visible regressions in them block merge:
+The authoritative complete repository gate is `npm run check`. It composes
+root tests with architecture, Codex-contract, tool-inventory, documentation,
+schema-mirror, UI, release-site, local companion, Worker, native macOS, and
+local-review runtime checks. Some lanes require
+macOS arm64, exactly Node v26.2.0, or independently installed app dependencies;
+report an environment-blocked lane explicitly.
+
+Use focused gates while iterating, then run the broadest applicable set before
+sending a pull request:
 
 ```bash
 npm test                       # core suite (serial by design)
 npm run codex:contract:check   # checked-in Codex plan/name contract parity
+npm run docs:check             # maintained docs, links, status, and current authority
 npm run product:worker:check   # hosted-service worker checks
 npm run product:macos:test     # retained macOS release gate (arm64 + Node v26.2.0)
 npm run architecture:check     # ownership/boundary enforcement
@@ -94,3 +102,16 @@ The tracked root layout is an explicit allowlist enforced by
 `scripts/check-root-workspace-hygiene.mjs` (run inside `npm test`). Adding a
 new root-level file or directory is an intentional project-layout decision
 and must update `ROOT_WORKSPACE_POLICY` in the same commit.
+
+## Keep maintained documentation current
+
+Undated READMEs and the maintained entries in `docs/README.md` are current
+contracts, not historical notes. A behavior, interface, data-access, privacy,
+route, command, storage, setting, platform, release, operations, or support
+change must update or delete every affected root, component, public, and
+maintained document in the same pull request.
+
+Use `git rm` for obsolete instructions instead of leaving contradictory prose.
+Retain a dated evidence document only when it has an enduring audit, recovery,
+decision, or release reason and accurate title, date, type, and lifecycle
+status. Update the source-derived documentation tests with the same change.

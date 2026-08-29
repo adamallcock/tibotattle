@@ -2,7 +2,7 @@
 title: Windows security and production credentials milestone
 date: 2026-08-17
 type: goal
-status: in-progress
+status: active
 ---
 
 # Windows security and production credentials milestone

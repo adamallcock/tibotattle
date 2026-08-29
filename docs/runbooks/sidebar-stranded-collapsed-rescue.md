@@ -1,7 +1,16 @@
+---
+title: Rescue a stranded collapsed dashboard sidebar
+date: 2026-08-22
+type: runbook
+status: active
+---
+
 # Rescue: the dashboard sidebar is collapsed and will not come back
 
-Applies to TiboTattle **0.1.16 and earlier**. Builds after that carry the fix
-described at the bottom and need none of this.
+Applies to the published TiboTattle **0.1.16 and earlier**. The reviewed source
+after 0.1.16 carries the fix described at the bottom, but as of 2026-08-27 no
+0.1.17 stable artifact has been published. Installed 0.1.16 users need the
+manual rescue below until a fixed release is actually available.
 
 ## What the person sees
 
@@ -32,12 +41,12 @@ navigate and no way back.
 The persisted geometry is a single user-defaults key. Deleting it discards the
 collapsed state; the next launch lays the sidebar out fresh.
 
-### Easiest option: update the app
+### Update after a fixed release is published
 
-Updating to 0.1.17 or later fixes this by itself — that build reopens a
-stranded sidebar once on first launch, and from then on carries a toolbar
-button and a ⌃⌘S menu command. Anyone willing to wait for the update needs
-none of the steps below.
+The source intended for 0.1.17 reopens a stranded sidebar once on first launch
+and then carries a toolbar button and a ⌃⌘S menu command. Do not direct users
+to update until the public release and appcast actually advertise a fixed
+version. On the currently published 0.1.16 release, use the steps below.
 
 ### Manual rescue, step by step
 
@@ -86,7 +95,7 @@ smoke with a forged collapsed autosave:
 | after deleting the autosave key | sidebar restored, 188pt |
 | after deleting both keys | sidebar restored at the designed 216pt |
 
-## The fix (0.1.17 and later)
+## The source fix intended for 0.1.17
 
 Three changes, so this state is neither reachable-without-recovery nor sticky:
 

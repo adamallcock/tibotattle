@@ -2,7 +2,7 @@
 title: Public Community Seven-Day Estimate Gate
 date: 2026-08-03
 type: decision-record
-status: gated
+status: complete
 ---
 
 # Public community seven-day estimate gate

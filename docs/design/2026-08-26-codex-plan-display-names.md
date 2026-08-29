@@ -2,7 +2,7 @@
 title: Codex plan and seat contract synchronization
 date: 2026-08-26
 type: decision-record
-status: implemented
+status: complete
 ---
 
 # Codex plan and seat contract synchronization

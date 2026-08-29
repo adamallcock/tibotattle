@@ -2,7 +2,7 @@
 title: Web Report and Native Toolbar Boundary
 date: 2026-08-03
 type: decision-record
-status: accepted
+status: complete
 ---
 
 # Web report and native toolbar boundary

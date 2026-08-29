@@ -57,13 +57,16 @@ Expected effort after the feasibility proof is approximately 9–15 focused
 engineering/product days. A native file-broker or substantial companion rewrite
 would add roughly 3–6 weeks and is outside this plan without a new decision.
 
-## Verified baseline on 2026-08-14
+## Historical baseline observed on 2026-08-14
 
-The current macOS product is an arm64, macOS 13+ AppKit/WKWebView application
+At that checkpoint, the macOS product was documented as an arm64, macOS 13+
+AppKit/WKWebView application
 with a bundled Node 26 runtime, bundled JavaScript companion, native `keytar`
 dependency, a loopback HTTP server, optional hosted contribution/account flows,
 an owner-controlled `SMAppService` login item, and Sparkle in the direct
-distribution bundle.
+distribution bundle. This is historical evidence, not the current support
+floor: the reviewed builder and published 0.1.16 contract now require macOS
+14.0 or later on Apple silicon.
 
 The important Store gaps are:
 
@@ -188,7 +191,8 @@ These decisions are deliberately deferred until local feasibility succeeds:
    explicit, reviewable import for valuable local state. Do not use broad
    temporary file exceptions or silently move direct-channel data.
 5. **Architecture and OS floor.** Recommended initial scope: retain arm64 and
-   macOS 13+; add universal/Intel only if demand justifies its separate native
+   the currently enforced macOS 14.0+ floor; add universal/Intel only if demand
+   justifies its separate native
    dependency and QA cost.
 
 ## Phase 1: prove the sandboxed local product

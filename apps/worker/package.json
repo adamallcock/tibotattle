@@ -1,6 +1,7 @@
 {
   "name": "@app-usagemonitor/synthetic-worker",
   "version": "0.1.0",
+  "description": "TiboTattle public site and optional privacy-safe contribution service on Cloudflare Workers.",
   "private": true,
   "type": "module",
   "scripts": {

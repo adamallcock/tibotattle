@@ -2,7 +2,7 @@
 title: Homebrew Distribution and macOS Support
 date: 2026-08-15
 type: decision-record
-status: implemented
+status: maintained
 ---
 
 # Homebrew distribution and macOS support

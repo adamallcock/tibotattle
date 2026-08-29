@@ -1,6 +1,6 @@
 {
   "schemaVersion": "tool-inventory-v0.1",
-  "reviewedAt": "2026-08-26",
+  "reviewedAt": "2026-08-27",
   "scope": "Executable and executable-adjacent sources under root scripts/** and tools/**, legacy root report builders and verifiers, and product contribution preparation.",
   "records": [
     {
@@ -8,14 +8,14 @@
       "owner": "local_analysis",
       "canonicalPath": "scripts/benchmark-local-analysis-pipeline.mjs",
       "stableAlias": null,
-      "stableAliasReason": "Research benchmark is invoked from its dated performance receipt, not as a supported product command.",
+      "stableAliasReason": "Research benchmark is exercised by focused tests and is not a supported product command.",
       "additionalAliases": [],
       "callers": [
-        "docs/receipts/2026-07-29-local-analysis-performance-receipt.md"
+        "test/benchmark-local-analysis-pipeline.test.mjs"
       ],
       "decision": "retain_and_relocate_after_inventory",
-      "provenance": "docs/receipts/2026-07-29-local-analysis-performance-receipt.md",
-      "provenanceReason": null,
+      "provenance": null,
+      "provenanceReason": "The obsolete performance receipt was removed; focused tests retain the benchmark contract without a narrative artifact.",
       "legacyPaths": []
     },
     {
@@ -23,17 +23,16 @@
       "owner": "local_analysis",
       "canonicalPath": "scripts/benchmark-local-index-retirement.mjs",
       "stableAlias": null,
-      "stableAliasReason": "Synthetic cutover qualification is invoked by its focused regression and retirement plan rather than as a supported product command.",
+      "stableAliasReason": "Synthetic cutover qualification is invoked by focused regression tests rather than as a supported product command.",
       "additionalAliases": [],
       "callers": [
         "scripts/benchmark-local-analysis-pipeline.mjs",
         "test/benchmark-local-analysis-pipeline.test.mjs",
-        "test/local-index-retirement-qualification.test.js",
-        "docs/plans/2026-08-17-local-analysis-index-retirement-plan.md"
+        "test/local-index-retirement-qualification.test.js"
       ],
       "decision": "retain_as_retirement_qualification_gate",
-      "provenance": "docs/plans/2026-08-17-local-analysis-index-retirement-plan.md",
-      "provenanceReason": null,
+      "provenance": null,
+      "provenanceReason": "The completed retirement plan was removed; focused tests retain the cutover qualification contract.",
       "legacyPaths": []
     },
     {
@@ -60,16 +59,15 @@
       "owner": "local_review_release",
       "canonicalPath": "scripts/build-local-review-artifact.js",
       "stableAlias": null,
-      "stableAliasReason": "Internal release builder is called by policy tests and release documentation rather than a stable public command.",
+      "stableAliasReason": "Internal release builder is called by policy tests rather than a stable public command.",
       "additionalAliases": [],
       "callers": [
         "scripts/verify-local-review-runtime.js",
-        "test/local-review-build-policy.test.js",
-        "docs/governance/2026-07-25-g0-control-traceability-matrix.md"
+        "test/local-review-build-policy.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
-      "provenance": "docs/governance/2026-07-25-g0-control-traceability-matrix.md",
-      "provenanceReason": null,
+      "provenance": null,
+      "provenanceReason": "The obsolete control matrix was removed; the builder is retained by its runtime verifier and policy tests.",
       "legacyPaths": []
     },
     {
@@ -315,7 +313,6 @@
         "test/codex-contract-drift.test.js",
         "CONTRIBUTING.md",
         "docs/design/2026-08-26-codex-plan-display-names.md",
-        "docs/runbooks/2026-08-04-owner-release-execution.md",
         "docs/runbooks/macos-stable-release-runbook.md"
       ],
       "decision": "retain_as_upstream_contract_quality_gate",
@@ -331,12 +328,11 @@
       "stableAliasReason": "Internal signing readiness check is exercised by its focused test and is not a supported end-user command.",
       "additionalAliases": [],
       "callers": [
-        "test/local-review-signing-readiness.test.js",
-        "docs/governance/2026-07-25-g0-control-traceability-matrix.md"
+        "test/local-review-signing-readiness.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
-      "provenance": "docs/governance/2026-07-25-g0-control-traceability-matrix.md",
-      "provenanceReason": null,
+      "provenance": null,
+      "provenanceReason": "The obsolete control matrix was removed; focused signing-readiness tests retain this internal check.",
       "legacyPaths": []
     },
     {
@@ -402,8 +398,8 @@
         "test/weekly-pace-macos-runtime.test.js"
       ],
       "decision": "retain_until_client_repository_cutover",
-      "provenance": "docs/decisions/2026-08-02-public-client-private-service-provenance-decision.md",
-      "provenanceReason": null,
+      "provenance": null,
+      "provenanceReason": "The completed public/private repository decision was removed; exporter boundary tests retain the current contract.",
       "legacyPaths": []
     },
     {
@@ -478,11 +474,10 @@
         "package.json#scripts.telemetry:generate",
         "package.json#scripts.telemetry:check",
         "test/telemetry-contract.test.js",
-        "docs/governance/2026-07-25-g0-control-traceability-matrix.md",
-        "docs/receipts/2026-07-24-g1-exporter-hardening-receipt.md"
+        "docs/reference/schema-contracts.md"
       ],
       "decision": "retain_and_relocate_after_inventory",
-      "provenance": "docs/receipts/2026-07-24-g1-exporter-hardening-receipt.md",
+      "provenance": "docs/reference/schema-contracts.md",
       "provenanceReason": null,
       "legacyPaths": []
     },
@@ -509,7 +504,7 @@
       "callers": [
         "package.json#scripts.product:macos:preview:install",
         "test/macos-preview-install.test.js",
-        "docs/plans/2026-08-03-native-first-macos-client-migration-plan.md"
+        "apps/macos/README.md"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
@@ -607,8 +602,8 @@
         "test/local-review-network-audit.test.js"
       ],
       "decision": "retain_as_internal_release_support",
-      "provenance": "docs/governance/2026-07-25-g0-control-traceability-matrix.md",
-      "provenanceReason": null,
+      "provenance": null,
+      "provenanceReason": "The obsolete control matrix was removed; the smoke launcher and focused test retain this preload contract.",
       "legacyPaths": []
     },
     {
@@ -631,10 +626,10 @@
         "test/macos-app-bundle.test.js",
         "test/public-release-site.test.js",
         "test/publish-sparkle-update.test.js",
-        "docs/reports/2026-07-29-consumer-contribution-and-updater-verification-report.md"
+        "docs/runbooks/macos-stable-release-runbook.md"
       ],
       "decision": "retain_as_internal_release_support",
-      "provenance": "docs/reports/2026-07-29-consumer-contribution-and-updater-verification-report.md",
+      "provenance": "docs/runbooks/macos-stable-release-runbook.md",
       "provenanceReason": null,
       "legacyPaths": []
     },
@@ -646,7 +641,7 @@
       "stableAliasReason": "Shared updater module is imported by build/release commands and tests, not invoked directly.",
       "additionalAliases": [],
       "callers": [
-        "docs/reports/2026-07-29-consumer-contribution-and-updater-verification-report.md",
+        "docs/runbooks/macos-stable-release-runbook.md",
         "scripts/build-macos-app.js",
         "scripts/generate-sparkle-appcast.js",
         "scripts/macos-release-core.js",
@@ -659,7 +654,7 @@
         "test/publish-sparkle-update.test.js"
       ],
       "decision": "retain_as_internal_release_support",
-      "provenance": "docs/reports/2026-07-29-consumer-contribution-and-updater-verification-report.md",
+      "provenance": "docs/runbooks/macos-stable-release-runbook.md",
       "provenanceReason": null,
       "legacyPaths": []
     },
@@ -687,15 +682,11 @@
       "additionalAliases": [],
       "callers": [
         "package.json#scripts.evaluate:minimization",
-        "test/minimization-ablation.test.js",
-        "docs/decisions/2026-07-25-g1-data-minimization-ablation-decision.md",
-        "docs/governance/2026-07-24-g1-local-release-route.md",
-        "docs/governance/2026-07-25-g0-control-traceability-matrix.md",
-        "docs/receipts/2026-07-26-prospective-account-evidence-verification-receipt.md"
+        "test/minimization-ablation.test.js"
       ],
       "decision": "retain_at_provenance_bound_canonical_path",
-      "provenance": "docs/receipts/2026-07-26-prospective-account-evidence-verification-receipt.md",
-      "provenanceReason": "The dated receipt records this exact direct command path; relocating it would rewrite historical command provenance or require a stale-path exception.",
+      "provenance": null,
+      "provenanceReason": "The obsolete preregistration and receipts were removed; the stable alias and focused test retain this research command.",
       "legacyPaths": []
     },
     {
@@ -754,7 +745,7 @@
       "additionalAliases": [],
       "callers": [
         "apps/worker/scripts/check-deployment-endpoints.mjs",
-        "docs/runbooks/2026-08-02-r2-sparkle-update-publisher.md",
+        "docs/runbooks/macos-stable-release-runbook.md",
         "package.json#scripts.product:macos:publish-update",
         "scripts/generate-sparkle-appcast.js",
         "test/generate-sparkle-appcast-stable-feed.test.js",
@@ -764,7 +755,7 @@
         "test/sparkle-signed-feed-validation.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
-      "provenance": "docs/runbooks/2026-08-02-r2-sparkle-update-publisher.md",
+      "provenance": "docs/runbooks/macos-stable-release-runbook.md",
       "provenanceReason": null,
       "legacyPaths": []
     },
@@ -812,10 +803,27 @@
       "stableAliasReason": null,
       "additionalAliases": [],
       "callers": [
-        "package.json"
+        "package.json#scripts.index:rebuild",
+        "docs/reference/unified-index-schema.md"
       ],
       "decision": "retain_and_relocate_after_inventory",
-      "provenance": "docs/design/2026-08-06-unified-local-index-schema.md",
+      "provenance": "docs/reference/unified-index-schema.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "shipped_product_operation",
+      "owner": "local_analysis",
+      "canonicalPath": "scripts/rebuild-local-unified-index-options.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Pure argument parser is imported by the index rebuild operation and focused tests, not invoked directly.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/rebuild-local-unified-index.mjs",
+        "test/rebuild-local-unified-index-options.test.js"
+      ],
+      "decision": "retain_as_rebuild_argument_contract",
+      "provenance": "docs/reference/unified-index-schema.md",
       "provenanceReason": null,
       "legacyPaths": []
     },
@@ -829,10 +837,10 @@
       "callers": [
         "package.json#scripts.benchmark:r7:release:regenerate",
         "test/r7-release-evidence-regeneration.test.js",
-        "docs/reports/2026-07-29-end-to-end-pilot-readiness-report.md"
+        "docs/runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md"
       ],
       "decision": "retain_without_modification_until_final_r7_regeneration",
-      "provenance": "docs/reports/2026-07-29-end-to-end-pilot-readiness-report.md",
+      "provenance": "docs/runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md",
       "provenanceReason": null,
       "legacyPaths": []
     },
@@ -875,12 +883,11 @@
       "stableAliasReason": "Internal packaged-artifact smoke is invoked by release verification, not a public command.",
       "additionalAliases": [],
       "callers": [
-        "scripts/verify-local-review-runtime.js",
-        "docs/governance/2026-07-25-g0-control-traceability-matrix.md"
+        "scripts/verify-local-review-runtime.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
-      "provenance": "docs/governance/2026-07-25-g0-control-traceability-matrix.md",
-      "provenanceReason": null,
+      "provenance": null,
+      "provenanceReason": "The obsolete control matrix was removed; the aggregate runtime verifier retains this internal smoke contract.",
       "legacyPaths": []
     },
     {
@@ -994,7 +1001,7 @@
         "docs/runbooks/2026-08-17-windows-portability-environments.md"
       ],
       "decision": "retain_as_internal_test_support",
-      "provenance": "docs/goals/2026-08-17-four-day-windows-readiness-goal.md",
+      "provenance": "docs/runbooks/2026-08-17-windows-portability-environments.md",
       "provenanceReason": null,
       "legacyPaths": []
     },
@@ -1012,10 +1019,10 @@
         "package.json#scripts.product:macos:validate:release",
         "test/validate-macos-install.test.js",
         "apps/macos/README.md",
-        "docs/reports/2026-07-29-end-to-end-pilot-readiness-report.md"
+        "docs/runbooks/macos-stable-release-runbook.md"
       ],
       "decision": "retain_and_relocate_after_inventory",
-      "provenance": "docs/reports/2026-07-29-end-to-end-pilot-readiness-report.md",
+      "provenance": "docs/runbooks/macos-stable-release-runbook.md",
       "provenanceReason": null,
       "legacyPaths": []
     },
@@ -1079,7 +1086,6 @@
         "package.json#scripts.product:macos:preview:remote:live",
         "apps/macos/README.md",
         "apps/worker/scripts/release-readiness-lib.mjs",
-        "docs/runbooks/2026-08-04-internal-update-rehearsal.md",
         "test/macos-preview-remote.test.js",
         "test/verify-macos-preview-remote.test.js"
       ],
@@ -1128,12 +1134,11 @@
       "stableAliasReason": null,
       "additionalAliases": [],
       "callers": [
-        "package.json#scripts.build:quality-report-data",
-        "docs/research/2026-07-24-monitoring-quality-source-notes.md"
+        "package.json#scripts.build:quality-report-data"
       ],
       "decision": "retain_and_relocate_to_tools_reports_after_inventory",
-      "provenance": "docs/research/2026-07-24-monitoring-quality-source-notes.md",
-      "provenanceReason": null,
+      "provenance": null,
+      "provenanceReason": "The obsolete source note was removed; the stable report-builder alias remains the maintained entry point.",
       "legacyPaths": []
     },
     {
@@ -1221,12 +1226,11 @@
       "additionalAliases": [],
       "callers": [
         "package.json#scripts.fix:report-width",
-        "test/fix-portable-report-width.test.js",
-        "docs/research/2026-07-24-monitoring-quality-source-notes.md"
+        "test/fix-portable-report-width.test.js"
       ],
       "decision": "retain_and_relocate_to_tools_reports_after_inventory",
-      "provenance": "docs/research/2026-07-24-monitoring-quality-source-notes.md",
-      "provenanceReason": null,
+      "provenance": null,
+      "provenanceReason": "The obsolete source note was removed; the stable alias and focused test retain this repair tool.",
       "legacyPaths": []
     },
     {
@@ -1267,12 +1271,9 @@
       "canonicalPath": "tools/operations/fix-doc-links.mjs",
       "stableAlias": "docs:links:fix",
       "stableAliasReason": null,
-      "additionalAliases": [
-        "docs:links:check"
-      ],
+      "additionalAliases": [],
       "callers": [
         "package.json#scripts.docs:links:fix",
-        "package.json#scripts.docs:links:check",
         "scripts/fix-doc-links.mjs"
       ],
       "decision": "retain_with_forwarding_legacy_path",
@@ -1281,6 +1282,29 @@
       "legacyPaths": [
         "scripts/fix-doc-links.mjs"
       ]
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "repository_operations",
+      "canonicalPath": "tools/operations/validate-documentation.mjs",
+      "stableAlias": "docs:check",
+      "stableAliasReason": null,
+      "additionalAliases": [
+        "docs:links:check"
+      ],
+      "callers": [
+        ".github/workflows/documentation-policy.yml",
+        ".github/workflows/release-trust-policy.yml",
+        "package.json#scripts.check",
+        "package.json#scripts.docs:check",
+        "package.json#scripts.docs:links:check",
+        "scripts/test-lanes.mjs",
+        "test/documentation-governance.test.js"
+      ],
+      "decision": "retain_as_documentation_truth_and_lifecycle_gate",
+      "provenance": null,
+      "provenanceReason": "Live machine-checking gate has no separate dated output artifact.",
+      "legacyPaths": []
     },
     {
       "classification": "historical_research_report",
@@ -1293,12 +1317,11 @@
         "package.json#scripts.build:prospective-transitions",
         "scripts/build-prospective-collector-transitions.js",
         "test/prospective-collector-cli.test.js",
-        "test/prospective-collector-tool-parity.test.js",
-        "docs/receipts/2026-07-26-prospective-account-evidence-verification-receipt.md"
+        "test/prospective-collector-tool-parity.test.js"
       ],
       "decision": "retain_with_forwarding_legacy_path_and_research_provenance",
-      "provenance": "docs/receipts/2026-07-26-prospective-account-evidence-verification-receipt.md",
-      "provenanceReason": null,
+      "provenance": null,
+      "provenanceReason": "The obsolete prospective-account receipt was removed; the stable alias, legacy shim, and focused parity tests retain this report builder.",
       "legacyPaths": [
         "scripts/build-prospective-collector-transitions.js"
       ]

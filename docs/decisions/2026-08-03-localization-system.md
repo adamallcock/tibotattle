@@ -2,7 +2,7 @@
 title: TiboTattle cross-surface localization system
 date: 2026-08-03
 type: decision-record
-status: implemented
+status: complete
 ---
 
 # TiboTattle cross-surface localization system

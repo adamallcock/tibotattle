@@ -2,15 +2,17 @@
 
 Notable user-facing changes to TiboTattle are recorded here, newest first. The
 layout keeps an explicit `Unreleased` boundary and uses SemVer-compatible
-version labels; it does not imply API stability for this early pilot.
+version labels; it does not imply API stability before 1.0.
 
 ## Provenance and acknowledgements
 
 - A release heading links to its checked-in notes. The date is the UTC calendar
   date on which the public GitHub Release was published.
-- Every released entry links to the public GitHub Release, the annotated source
-  tag, and the exact comparison with the preceding stable tag. The GitHub
-  Release remains canonical for published artifacts and release evidence.
+- Every released entry links to the public GitHub Release, its exact source
+  revision, and the comparison with the preceding release source. Stable tags
+  are annotated except for the protected historical v0.1.10 anomaly recorded
+  below. The GitHub Release remains canonical for published artifacts and
+  release evidence.
 - Pull-request and issue links provide review and attribution context. They do
   not imply that an issue was closed or that a source-only change shipped in an
   installed build; open or source-only boundaries are stated explicitly.
@@ -33,15 +35,19 @@ remains accountable for release wording, validation, signing, and publication.
 ## [Unreleased]
 
 This section combines direct post-v0.1.16 work with merged pull requests through
-[PR #64](https://github.com/adamallcock/tibotattle/pull/64), audited on
-2026-08-23. The [merged-main comparison](https://github.com/adamallcock/tibotattle/compare/v0.1.16...main)
+[PR #78](https://github.com/adamallcock/tibotattle/pull/78), audited against
+`main` commit `52399658f28303f6af00259f921c2c46a881978f` on 2026-08-27. The
+[merged-main comparison](https://github.com/adamallcock/tibotattle/compare/v0.1.16...main)
 is the public branch-history view; PR links identify reviewed merges, while
 unlinked items are direct commits. Nothing in this section is a
 published-release claim.
 
 ### Added
 
-- Adds admin metrics history with daily sparklines and 24-hour deltas.
+- Adds admin metrics history with daily sparklines, 24-hour deltas, allowance
+  lineage, and plan cohort filters
+  ([PR #67](https://github.com/adamallcock/tibotattle/pull/67),
+  [PR #68](https://github.com/adamallcock/tibotattle/pull/68)).
 - Adds a dedicated admin Plan cohorts card with current headcount and measured
   allowance capacity per plan.
 - Adds native progress and boot-state feedback while the local dashboard becomes
@@ -51,6 +57,18 @@ published-release claim.
   ([PR #62](https://github.com/adamallcock/tibotattle/pull/62)).
 - Adds a cache-reuse outcome view that distinguishes warm, switched, and
   post-compaction behavior ([PR #64](https://github.com/adamallcock/tibotattle/pull/64)).
+- Adds a merged public community-allowance homepage and a compact platform
+  download selector, while keeping unsupported platform boundaries explicit
+  ([PR #70](https://github.com/adamallcock/tibotattle/pull/70),
+  [PR #72](https://github.com/adamallcock/tibotattle/pull/72)).
+- Adds source-backed human-readable Codex plan and quota-window names plus a
+  drift ledger and CI check ([PR #71](https://github.com/adamallcock/tibotattle/pull/71)).
+- Adds progressive repository agent guidance with scoped instructions and
+  machine-checked architecture ownership
+  ([PR #77](https://github.com/adamallcock/tibotattle/pull/77)).
+- Adds maintained architecture, privacy/data, API, CLI, schema, platform,
+  operations, recovery, status, and user documentation; removes superseded
+  planning and status prose from the active tree.
 
 ### Changed
 
@@ -58,6 +76,15 @@ published-release claim.
   retired admin cards that permanently reported zero.
 - Releases the native readiness gate after the primary dashboard render instead
   of waiting for every secondary load ([PR #60](https://github.com/adamallcock/tibotattle/pull/60)).
+- Makes Codex `thread_source` a compatibility and attribution signal without
+  treating it as usage or cost evidence
+  ([PR #69](https://github.com/adamallcock/tibotattle/pull/69)).
+- Establishes a provenance-backed changelog and checked release-note contract
+  ([PR #66](https://github.com/adamallcock/tibotattle/pull/66)).
+- Retires the unused Cloud Run experiment, legacy hosted account routes, and
+  the shipping Claude Desktop plan-history path; adds a source-checked API
+  lifecycle reference for the remaining interfaces
+  ([PR #78](https://github.com/adamallcock/tibotattle/pull/78)).
 
 ### Fixed
 
@@ -79,6 +106,13 @@ published-release claim.
   [PR #61](https://github.com/adamallcock/tibotattle/pull/61)).
 - Gives native dashboard startup failures phase-specific, actionable diagnostics
   ([PR #63](https://github.com/adamallcock/tibotattle/pull/63)).
+- Hardens paginated Codex rollout discovery and ingestion so generations,
+  checkpoints, truncation, and partial pages remain replay-safe
+  ([PR #65](https://github.com/adamallcock/tibotattle/pull/65)).
+- Gives the resident archive accounting projection its own memory ceiling
+  ([PR #49](https://github.com/adamallcock/tibotattle/pull/49)).
+- Top-aligns the homepage comparison graph with its title across platform-tab
+  changes ([PR #76](https://github.com/adamallcock/tibotattle/pull/76)).
 
 ### Release tooling
 
@@ -163,7 +197,7 @@ accounting ([PR #33](https://github.com/adamallcock/tibotattle/pull/33),
 
 **Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.11) ·
 [annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.11) ·
-[changes since v0.1.10](https://github.com/adamallcock/tibotattle/compare/v0.1.10...v0.1.11)
+[changes since the v0.1.10 source commit](https://github.com/adamallcock/tibotattle/compare/151adec996c9a0f621819f89777ac5a05f1df8b6...v0.1.11)
 
 - Makes contribution backfill recover from stalls, adds readable allowance
   chart details, and hardens the community estimate.
@@ -171,8 +205,14 @@ accounting ([PR #33](https://github.com/adamallcock/tibotattle/pull/33),
 ## [0.1.10](./release-notes/0.1.10.md) - 2026-08-12
 
 **Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.10) ·
-[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.10) ·
-[changes since v0.1.9](https://github.com/adamallcock/tibotattle/compare/v0.1.9...v0.1.10)
+[source commit](https://github.com/adamallcock/tibotattle/commit/151adec996c9a0f621819f89777ac5a05f1df8b6) ·
+[changes since v0.1.9](https://github.com/adamallcock/tibotattle/compare/v0.1.9...151adec996c9a0f621819f89777ac5a05f1df8b6)
+
+**Historical tag anomaly:** the protected published `v0.1.10` ref is a legacy
+lightweight tag that resolves to the v0.1.9 source commit
+`3b3a852abad643095c296550a827ed448b3720fa`. The v0.1.10 version-bump source is
+`151adec996c9a0f621819f89777ac5a05f1df8b6`, which the source and comparison
+links above use without rewriting published tag history.
 
 - Makes contribution backfill drain steadily and adds signed-update credential
   recovery.

@@ -3879,25 +3879,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             .launcherWelcome,
             BundledProduct.displayName
         )
-        alert.informativeText = """
-        \(BundledProduct.displayName) updates local \(BundledProduct.monitoredAppDisplayName) metadata while the app is open. The first pass starts after setup; later checks reuse the same bounded local companion.
-
-        Reads: timestamps, model and speed labels, token counters, tool categories, and quota snapshots from the selected \(BundledProduct.monitoredAppDisplayName) sessions folders.
-
-        Stores: content-free indexes, cached calculations, settings, and any prepared contribution in your owner-only \(BundledProduct.displayName) app-data folder.
-
-        Community contribution is optional. It stays off until you review the content-free fields and explicitly send a contribution.
-
-        Local allowance notifications are also off by default. If you later enable them in Settings, threshold and reset alerts stay on this Mac and evaluate only fresh provider-reported quota observations from the existing foreground refresh. A reset alert uses the provider-reported reset time and fires once when the next refresh arrives at or after it; an observed reset identity strengthens dedupe when available. They do not add a timer, daemon, login item, or background network polling.
-
-        \(updater.firstRunUpdatesDisclosure)
-
-        Never contributed: prompts, responses, file paths, repositories, commands, credentials, emails, or account names.
-
-        Keep the app open while analysis runs. You may close and reopen the TiboTattle window; quitting the app stops the current pass and preserves completed checkpoints.
-
-        \(TiboTattleLocalization.string(.firstRunLoginItemDisclosure))
-        """
+        alert.informativeText = TiboTattleLocalization.format(
+            .launcherFirstRunDisclosure,
+            BundledProduct.displayName,
+            BundledProduct.monitoredAppDisplayName,
+            BundledProduct.monitoredAppDisplayName,
+            BundledProduct.displayName,
+            updater.firstRunUpdatesDisclosure,
+            TiboTattleLocalization.string(.firstRunLoginItemDisclosure)
+        )
         let startAtLogin = NSButton(
             checkboxWithTitle: TiboTattleLocalization.string(
                 .settingsStartAtLogin
