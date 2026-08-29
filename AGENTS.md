@@ -99,8 +99,12 @@ and updated authoritative documentation.
 - Parallelize independent investigation or validation when useful, with explicit
   file ownership and integration boundaries. Verify delegated conclusions before
   relying on release- or privacy-sensitive claims.
-- Update tests, generated outputs, schemas, public types, and maintained docs in
-  the same change when their contract changes.
+- Update tests, generated outputs, schemas, public types, current READMEs, and
+  maintained docs in the same change when their contract changes. Git-remove
+  obsolete docs unless explicit audit, recovery, or release value justifies a
+  dated snapshot; never leave known-wrong guidance in place for history alone.
+- When deleting or moving docs, search old path and basename across tracked files;
+  repair or remove matches in comments, fixtures, and security allowlists.
 
 ## Architecture and code
 
@@ -189,9 +193,7 @@ Flag changes that:
 
 - Keep the root file under 200 lines and the deepest root-to-scope instruction
   chain comfortably below Codex's default 32 KiB project-doc limit.
-- Add nested guidance only for a stable, materially different local contract.
-  Put procedures and volatile detail in maintained READMEs or runbooks.
+- Add nested guidance only for stable local contracts; keep procedures in runbooks.
 - State each rule once, prefer durable principles to examples, and remove stale
   guidance when the code or authority changes.
-- Keep `test/agent-guidance.test.js` aligned with the scope map and instruction
-  budget whenever guidance files are added, moved, or removed.
+- Keep `test/agent-guidance.test.js` aligned with guidance scope and budgets.

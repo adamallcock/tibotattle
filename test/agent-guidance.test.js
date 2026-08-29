@@ -149,3 +149,37 @@ test("scoped guidance remains concise and within the project-doc budget", async 
     );
   }
 });
+
+test("agent guidance requires current documentation and removal of obsolete guidance", async () => {
+  const [rootGuidance, documentationGuidance] = await Promise.all([
+    readRepositoryFile("AGENTS.md"),
+    readRepositoryFile("docs/AGENTS.md"),
+  ]);
+
+  assert.match(
+    rootGuidance,
+    /current READMEs[\s\S]*same change[\s\S]*Git-remove[\s\S]*obsolete docs/u,
+  );
+  assert.match(
+    rootGuidance,
+    /old path and basename[\s\S]*security allowlists/u,
+  );
+  assert.match(documentationGuidance, /Git history is the default archive/u);
+  assert.match(
+    documentationGuidance,
+    /Retain historical evidence only when its audit, recovery, or release value is[\s\S]*enduring/u,
+  );
+  assert.match(
+    documentationGuidance,
+    /root README, component READMEs, public docs,[\s\S]*every stale statement/u,
+  );
+  assert.match(
+    documentationGuidance,
+    /old[\s\S]*path and basename[\s\S]*ignore files[\s\S]*security allowlists/u,
+  );
+  assert.match(
+    documentationGuidance,
+    /`current`, `canonical`, `maintained`, and[\s\S]*`operational` status[\s\S]*invalid unless the document is indexed/u,
+  );
+  assert.match(documentationGuidance, /npm run docs:check/u);
+});

@@ -355,10 +355,12 @@ export async function runPreflight() {
   await runCommand("git", ["diff", "--cached", "--check"]);
   await checkUntrackedWhitespace();
   await runCommand(process.execPath, [
-    "./tools/operations/fix-doc-links.mjs",
-    "--check",
+    "./tools/operations/validate-documentation.mjs",
   ]);
-  await runNodeTests(["test/agent-guidance.test.js"]);
+  await runNodeTests([
+    "test/documentation-governance.test.js",
+    "test/agent-guidance.test.js",
+  ]);
 }
 
 async function runNodeTests(arguments_, { environment = process.env } = {}) {
@@ -479,7 +481,7 @@ function usage() {
   console.log(`Usage: node scripts/test-lanes.mjs <lane> [options]
 
 Lanes:
-  preflight       Validate selected tests, whitespace, docs links, and agent guidance.
+  preflight       Validate selected tests, whitespace, docs governance, and agent guidance.
   portable        Run the explicit platform-neutral Node, web, and companion manifest.
   fast            Run fast macOS source/configuration checks.
   changed         Select conservative lanes from branch plus active-worktree paths.

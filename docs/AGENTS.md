@@ -19,8 +19,9 @@ Scope: all files under `docs/`. Apply the repository root guidance first.
 - Put durable material in the existing purpose-based folder. Use a dated,
   kebab-case filename for new plans, research, runbooks, specs, reviews, decisions,
   reports, and receipts unless that category has a stronger convention.
-- Use frontmatter only where the surrounding category already supports it. Do
-  not add it to root READMEs or rewrite a historical document for uniformity.
+- Every retained dated document needs `title`, `date`, `type`, and `status`
+  frontmatter, with the date matching its filename. Root and component READMEs
+  remain exempt unless their own format requires metadata.
 - Lead with status, scope, claim boundary, and current authority. Separate verified
   facts, implementation state, live observations, assumptions, decisions, and
   open gates.
@@ -36,9 +37,15 @@ Scope: all files under `docs/`. Apply the repository root guidance first.
 
 ## Evidence and history
 
-- Do not rewrite a receipt, decision, audit, or QA record to imply that a later
-  result existed at the recorded time. Add a new dated record or explicit
-  correction/supersession link.
+- Git-remove obsolete plans, handoffs, reports, and guidance once they no longer
+  help current work. Do not keep a file merely because it is dated or was once
+  useful; Git history is the default archive.
+- Retain historical evidence only when its audit, recovery, or release value is
+  enduring. Its frontmatter and opening boundary must identify the snapshot
+  date plus the relevant version, revision, environment, or artifact when known.
+- Do not rewrite retained receipts, decisions, audits, or QA records to imply
+  that a later result existed at the recorded time. Add a new dated record only
+  when the new evidence itself has enduring value.
 - A test receipt proves only the named checkout, environment, command, and time.
   A source review does not prove a live service; a browser capture does not prove
   a native app; a release manifest with null evidence fields does not prove the
@@ -52,13 +59,20 @@ Scope: all files under `docs/`. Apply the repository root guidance first.
 
 ## Maintenance and validation
 
-- Update inbound and outbound links when moving or superseding documents. Do not
-  reorganize the docs tree without auditing scripts, READMEs, and hardcoded paths.
-- Add a maintained entry to `docs/README.md` only when it truly becomes current
-  authority; otherwise keep it in the appropriate records category.
-- Run `npm run test:preflight` for documentation changes. Also run
-  `npm run docs:links:check` when links or paths change, while recognizing that it
-  checks the repository's normalized-link contract rather than every external URL.
+- When behavior, interfaces, commands, privacy boundaries, release state, or
+  support claims change, search the root README, component READMEs, public docs,
+  current docs, and agent guidance for the affected names and update or delete
+  every stale statement in the same change.
+- When deleting or moving documents, search all tracked files for both the old
+  path and basename. Repair inbound links and remove stale references from
+  scripts, comments, fixtures, ignore files, and security allowlists.
+- `docs/README.md` is the validated current-authority index. Add an entry only
+  when the target is maintained current authority; remove it in the same change
+  when that ceases to be true. `current`, `canonical`, `maintained`, and
+  `operational` status markers are invalid unless the document is indexed there.
+- Run `npm run docs:check` and `npm run test:preflight` for documentation changes.
+  The local link gate validates repository targets and Markdown anchors but does
+  not make external-URL availability claims.
 - Run the owning contract or release-trust tests when documentation changes a
   machine-checked path, schema, workflow, manifest, or operational assertion.
 - Re-read the rendered Markdown for hierarchy, tables, links, and claim clarity

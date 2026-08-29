@@ -105,6 +105,27 @@ test("native catalogs have complete language parity and preserve placeholders", 
       );
     }
   }
+  for (const [locale, catalog] of catalogs) {
+    const disclosure = catalog.get("launcher.firstRunDisclosure");
+    for (const sourceMarker of [
+      "state_5.sqlite",
+      "config.toml",
+      "account/read",
+      "account/rateLimits/read",
+      "account/usage/read",
+    ]) {
+      assert.match(
+        disclosure,
+        new RegExp(sourceMarker.replaceAll("/", "\\/"), "u"),
+        `${locale} first-run disclosure names ${sourceMarker}`,
+      );
+    }
+    assert.doesNotMatch(
+      disclosure,
+      /plan-usage-history\.json/u,
+      `${locale} first-run disclosure omits the retired Claude Desktop plan-history source`,
+    );
+  }
   assert.equal(english.get("settings.language"), "Language");
   assert.equal(
     english.get("settings.languageSummary"),
@@ -175,6 +196,22 @@ test("native catalogs have complete language parity and preserve placeholders", 
   assert.match(swiftSource, /case nativeDashboardFresh =/u);
   assert.match(swiftSource, /case nativeDashboardNeedsRefresh =/u);
   assert.match(appSource, /settingsUpdateDisclosureDevelopment/u);
+  assert.match(
+    appSource,
+    /alert\.informativeText = TiboTattleLocalization\.format\([\s\S]*?\.launcherFirstRunDisclosure[\s\S]*?updater\.firstRunUpdatesDisclosure[\s\S]*?\.firstRunLoginItemDisclosure/u,
+  );
+  assert.doesNotMatch(
+    appSource,
+    /Reads: timestamps, model and speed labels/u,
+  );
+  assert.match(
+    swiftSource,
+    /settingsUpdateDisclosureAutomaticOn:[\s\S]*Settings → About/u,
+  );
+  assert.doesNotMatch(
+    swiftSource,
+    /settingsUpdateDisclosureAutomatic(?:On|Off):[\s\S]{0,420}Settings → General/u,
+  );
   assert.match(appSource, /launcherErrorInvalidCentralService/u);
   assert.match(appSource, /launcherRecoveryReinstall/u);
   assert.match(appSource, /nativeDashboardCurrentEvidenceTooltip/u);
