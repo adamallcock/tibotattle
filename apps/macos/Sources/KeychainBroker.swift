@@ -14,31 +14,52 @@ private enum BrokerKeychainCapability: String, CaseIterable {
     case claudeSessionPseudonym = "claude_session_pseudonym"
     case contributionDevice = "contribution_device"
 
-    static let account = "installation"
-
-    var modernService: String {
+    private var serviceStem: String {
         switch self {
-        case .exportIdentity:
-            return "app-usagemonitor.export-identity.app.v1"
-        case .accountObservation:
-            return "app-usagemonitor.account-observation.app.v1"
-        case .claudeSessionPseudonym:
-            return "app-usagemonitor.claude-session-pseudonym.app.v1"
-        case .contributionDevice:
-            return "app-usagemonitor.contribution-device.app.v1"
+        case .exportIdentity: return "export-identity"
+        case .accountObservation: return "account-observation"
+        case .claudeSessionPseudonym: return "claude-session-pseudonym"
+        case .contributionDevice: return "contribution-device"
         }
     }
 
-    var legacyService: String {
+    func modernService(for identity: BrokerKeychainIdentity) -> String {
+        "\(identity.namespace).\(serviceStem).app.v1"
+    }
+
+    func legacyService(for identity: BrokerKeychainIdentity) -> String {
+        "\(identity.namespace).\(serviceStem).v1"
+    }
+}
+
+/// The bundle may select only one of these reviewed storage identities. An
+/// arbitrary plist or environment value can never become a Keychain address.
+private enum BrokerKeychainIdentity {
+    case stable
+    case preview
+
+    init?(namespace: String, account: String) {
+        switch (namespace, account) {
+        case ("app-usagemonitor", "installation"):
+            self = .stable
+        case ("app-usagemonitor.preview", "preview-installation"):
+            self = .preview
+        default:
+            return nil
+        }
+    }
+
+    var namespace: String {
         switch self {
-        case .exportIdentity:
-            return "app-usagemonitor.export-identity.v1"
-        case .accountObservation:
-            return "app-usagemonitor.account-observation.v1"
-        case .claudeSessionPseudonym:
-            return "app-usagemonitor.claude-session-pseudonym.v1"
-        case .contributionDevice:
-            return "app-usagemonitor.contribution-device.v1"
+        case .stable: return "app-usagemonitor"
+        case .preview: return "app-usagemonitor.preview"
+        }
+    }
+
+    var account: String {
+        switch self {
+        case .stable: return "installation"
+        case .preview: return "preview-installation"
         }
     }
 }
@@ -92,6 +113,7 @@ final class ContributionDeviceKeychainBroker {
         "--native-dashboard-sidebar-recovery-smoke-test",
         "--native-refresh-settings-contract-smoke-test",
         "--native-settings-layout-smoke-test",
+        "--native-weekly-pace-projection-contract-smoke-test",
         "--quota-notification-contract-smoke-test",
         "--smoke-test",
         "--updater-contract-smoke-test",
@@ -122,6 +144,7 @@ final class ContributionDeviceKeychainBroker {
     private let queue = DispatchQueue(
         label: "usage-monitor.keychain-broker"
     )
+    private let keychainIdentity: BrokerKeychainIdentity
     private let parentDescriptor: Int32
     private var readSource: DispatchSourceRead?
     private var childHandle: FileHandle?
@@ -145,15 +168,27 @@ final class ContributionDeviceKeychainBroker {
 
     private let ephemeralSmokeStorage: EphemeralSmokeStorage?
 
-    convenience init() throws {
-        try self.init(smokeStorage: nil, migrationPromptState: nil)
+    convenience init(namespace: String, account: String) throws {
+        guard let identity = BrokerKeychainIdentity(
+            namespace: namespace,
+            account: account
+        ) else {
+            throw ContributionDeviceKeychainBrokerUnavailable()
+        }
+        try self.init(
+            smokeStorage: nil,
+            migrationPromptState: nil,
+            keychainIdentity: identity
+        )
     }
 
     private init(
         smokeStorage: EphemeralSmokeStorage?,
         migrationPromptState injectedMigrationPromptState:
-            MigrationPromptState? = nil
+            MigrationPromptState? = nil,
+        keychainIdentity: BrokerKeychainIdentity = .stable
     ) throws {
+        self.keychainIdentity = keychainIdentity
         let isNativeSmoke = !Self.nativeSmokeArguments.isDisjoint(
             with: CommandLine.arguments.dropFirst()
         )
@@ -408,9 +443,9 @@ final class ContributionDeviceKeychainBroker {
         [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: generation == .modern
-                ? capability.modernService
-                : capability.legacyService,
-            kSecAttrAccount as String: BrokerKeychainCapability.account,
+                ? capability.modernService(for: keychainIdentity)
+                : capability.legacyService(for: keychainIdentity),
+            kSecAttrAccount as String: keychainIdentity.account,
         ]
     }
 
@@ -615,10 +650,11 @@ final class ContributionDeviceKeychainBroker {
         _ stored: String,
         capability: BrokerKeychainCapability
     ) -> [String: Any]? {
-        guard let access = designatedReaderAccess(capability.modernService)
+        let service = capability.modernService(for: keychainIdentity)
+        guard let access = designatedReaderAccess(service)
         else { return nil }
         var selected = baseQuery(capability, generation: .modern)
-        selected[kSecAttrLabel as String] = capability.modernService
+        selected[kSecAttrLabel as String] = service
         selected[kSecValueData as String] = Data(stored.utf8)
         selected[kSecAttrAccess as String] = access
         return selected

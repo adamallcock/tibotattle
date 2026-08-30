@@ -20,6 +20,9 @@ import {
   serviceRequestId,
   createQuotaTimelineLookup,
   createRefreshPollingBudget,
+  HISTORY_INFORMATIONAL_GAP_MAX_SHARE,
+  historyCoverageNoticeKind,
+  LOCAL_REFRESH_POLLING_WINDOW_MS,
   createSyntheticEnvelope,
   createTelemetryEnvelope,
   detectDeviationPeriods,
@@ -33,6 +36,7 @@ import {
   DEVIATION_MAX_PERIODS,
   parseJsonWithUniqueObjectKeys,
   isContributionReviewableQueueState,
+  refreshQuickResultStatus,
   refreshNeedsContinuation,
   ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION,
   ENVELOPE_SCHEMA_VERSION,
@@ -1036,11 +1040,36 @@ test("refresh polling budget gives each accepted continuation a fresh window", (
 
 test("default local analysis permits only two bounded continuations", () => {
   const budget = createRefreshPollingBudget();
+  assert.equal(LOCAL_REFRESH_POLLING_WINDOW_MS, 121 * 60 * 1_000);
   assert.equal(budget.canContinue(), true);
   assert.equal(budget.noteContinuation(), true);
   assert.equal(budget.noteContinuation(), true);
   assert.equal(budget.canContinue(), false);
   assert.equal(budget.noteContinuation(), false);
+});
+
+test("quick-result progress never turns a loaded no-numbers overview into a headline claim", () => {
+  const noNumbersOverview = {
+    state: "insufficient",
+    quotaWindows: [],
+    accounting: { status: "unavailable" },
+  };
+
+  assert.deepEqual(noNumbersOverview.quotaWindows, []);
+  assert.equal(
+    refreshQuickResultStatus({
+      dashboardLoaded: true,
+      elapsedLabel: "7s",
+    }),
+    "Local summary updated · checking full history…",
+  );
+  assert.equal(
+    refreshQuickResultStatus({
+      dashboardLoaded: false,
+      elapsedLabel: "7s",
+    }),
+    "Preparing local summary… 7s",
+  );
 });
 
 test("contribution admission uses participant allowance without inventing an unknown limit", () => {
@@ -1162,6 +1191,64 @@ test("history auto-continuation stops on terminal gaps and unchanged receipts", 
   assert.equal(historyIndexContinuationDecision({
     history: { ...history, status: "complete" },
   }).shouldContinue, false);
+});
+
+test("terminal history gaps are informational only when small, coherent, and fully accounted", () => {
+  const accountingProjection = { status: "available" };
+  const history = {
+    status: "partial",
+    phase: "partial_terminal",
+    sourceCount: 7_156,
+    indexedSourceCount: 7_142,
+    pendingSourceCount: 0,
+    skippedSourceCount: 14,
+  };
+  assert.equal(HISTORY_INFORMATIONAL_GAP_MAX_SHARE, 0.01);
+  assert.equal(historyCoverageNoticeKind({
+    history,
+    accountingProjection,
+  }), "info");
+  assert.equal(historyCoverageNoticeKind({
+    history: {
+      ...history,
+      sourceCount: 100,
+      indexedSourceCount: 99,
+      skippedSourceCount: 1,
+    },
+    accountingProjection,
+  }), "info");
+  assert.equal(historyCoverageNoticeKind({
+    history: {
+      ...history,
+      sourceCount: 100,
+      indexedSourceCount: 98,
+      skippedSourceCount: 2,
+    },
+    accountingProjection,
+  }), "warning");
+  assert.equal(historyCoverageNoticeKind({
+    history: {
+      ...history,
+      sourceCount: 14,
+      indexedSourceCount: 0,
+      skippedSourceCount: 14,
+    },
+    accountingProjection,
+  }), "warning");
+  for (const status of ["retained", "unavailable"]) {
+    assert.equal(historyCoverageNoticeKind({
+      history,
+      accountingProjection: { status },
+    }), "warning");
+  }
+  assert.equal(historyCoverageNoticeKind({
+    history: { ...history, pendingSourceCount: 1 },
+    accountingProjection,
+  }), "warning");
+  assert.equal(historyCoverageNoticeKind({
+    history: { ...history, indexedSourceCount: 7_141 },
+    accountingProjection,
+  }), "warning");
 });
 
 function communitySnapshot() {
@@ -1843,6 +1930,191 @@ test("missing numeric evidence stays missing instead of becoming zero", () => {
   assert.equal(result.quotaWindows[0].remainingPercent, null);
   assert.equal(result.pricing.totalCostUsd, null);
   assert.equal(result.pricing.coveragePercent, null);
+});
+
+test("newer-schema accounting remains a terminal unavailable state across the browser boundary", async () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    activity: { toolEvents: null },
+    timeline: {
+      usage: [],
+      history: {
+        status: "unavailable",
+        reason: "local_unified_index_schema_newer",
+        boundedDays: 31,
+      },
+    },
+    accounting: {
+      projection: {
+        status: "unavailable",
+        reason: "local_unified_index_schema_newer",
+        terminal: true,
+      },
+      accountingCacheStatus: "unavailable",
+      toolClasses: {
+        status: "unavailable",
+        reason: "typed_tool_history_partial",
+        total: null,
+        counts: {
+          apply_patch: null,
+          local_shell: null,
+          other: null,
+          subagent: null,
+          tool_gateway: null,
+        },
+      },
+      events: 0,
+      totalTokens: 0,
+      apiPriceEquivalentUsd: 0,
+    },
+  });
+  assert.deepEqual(result.accounting.projection, {
+    status: "unavailable",
+    reason: "local_unified_index_schema_newer",
+    terminal: true,
+    retainedAt: null,
+    coveredAt: null,
+  });
+  assert.equal(result.timeline.history.status, "unavailable");
+  assert.equal(
+    result.timeline.history.reason,
+    "local_unified_index_schema_newer",
+  );
+  assert.equal(result.timeline.history.usageEvents, null);
+  assert.equal(result.activity.toolEvents, null);
+  assert.equal(result.accounting.toolClasses.total, null);
+  assert.ok(Object.values(result.accounting.toolClasses.counts).every(
+    (value) => value === null,
+  ));
+
+  const appSource = await readFile(
+    new URL("../public/app.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(appSource, /function accountingRequiresNewerBuild\(data\)/u);
+  assert.match(appSource, /projection\.status !== "available"/u);
+  assert.match(appSource, /accountingIsUnavailable\(data\).*activePoints\.length === 0/u);
+  assert.match(appSource, /unavailable && visiblePoints\.length === 0[\s\S]*?"—"/u);
+  assert.ok(
+    appSource.includes('if (projection.status === "unavailable") return null;'),
+    "share-card accounting selection closes on terminal unavailable data",
+  );
+  assert.ok(
+    appSource.includes('&& finite(totalCostUsd, 0) <= 0'),
+    "a retained zero cost is withheld rather than shared as measured evidence",
+  );
+  assert.ok(
+    appSource.includes('t("share.detail.newerBuildRequired")'),
+    "the shared-card unavailable state names the required newer build",
+  );
+  assert.ok(
+    appSource.includes('"share.detail.lastVerifiedNewerBuild"'),
+    "retained share-card evidence is labeled last verified and names the newer build",
+  );
+});
+
+test("a contradictory available accounting attestation fails closed", () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    accounting: {
+      projection: {
+        status: "available",
+        reason: "local_unified_index_schema_newer",
+        terminal: true,
+      },
+      events: 0,
+      totalTokens: 0,
+      apiPriceEquivalentUsd: 0,
+    },
+  });
+  assert.deepEqual(result.accounting.projection, {
+    status: "unavailable",
+    reason: "local_unified_index_unavailable",
+    terminal: true,
+    retainedAt: null,
+    coveredAt: null,
+  });
+});
+
+test("real local accounting without an authority attestation renders unavailable", async () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    accounting: {
+      events: 0,
+      totalTokens: 0,
+      apiPriceEquivalentUsd: 0,
+    },
+  });
+  assert.deepEqual(result.accounting.projection, {
+    status: "unavailable",
+    reason: "local_unified_index_unavailable",
+    terminal: true,
+    retainedAt: null,
+    coveredAt: null,
+  });
+
+  const appSource = await readFile(
+    new URL("../public/app.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    appSource,
+    /if \(projection\.status !== "available"\)[\s\S]*?\$\("#cost-total"\)\.textContent = retainedEvidence[\s\S]*?: "—";/u,
+    "an unavailable real-local projection must render a dash, not its zero placeholders",
+  );
+});
+
+test("retained accounting provenance admits only reviewed reason codes", () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    timeline: {
+      history: {
+        status: "partial",
+        reason: "typed_tool_history_partial",
+        coveredAt: {
+          startAt: "2026-08-01T00:00:00.000Z",
+          endAt: "2026-08-27T00:00:00.000Z",
+        },
+        usageEvents: 12,
+        sourceCount: 3,
+        indexBytes: 42,
+      },
+    },
+    accounting: {
+      projection: {
+        status: "retained",
+        reason: "private path /Users/example",
+        terminal: true,
+        retainedAt: "2026-08-27T00:00:00.000Z",
+      },
+      staleServe: {
+        stale: true,
+        reason: "local_unified_index_schema_newer",
+        schemaVersion: "local-replay-safe-accounting-v0.12",
+        computedAt: "2026-08-27T00:00:00.000Z",
+        coveredAt: {
+          startAt: "2026-08-01T00:00:00.000Z",
+          endAt: "2026-08-27T00:00:00.000Z",
+        },
+        periods: [{
+          periodId: "7d",
+          periodLabel: "Last 7 days",
+          events: 12,
+          totalTokens: 123,
+          apiPriceEquivalentUsd: 1.25,
+        }],
+      },
+    },
+  });
+  assert.equal(
+    result.accounting.projection.reason,
+    "local_unified_index_unavailable",
+  );
+  assert.equal(
+    result.accounting.staleServe.reason,
+    "local_unified_index_schema_newer",
+  );
+  assert.equal(result.timeline.history.reason, "typed_tool_history_partial");
 });
 
 test("new accounting caveats survive the closed dashboard normalizer", () => {
@@ -5000,8 +5272,11 @@ test("local analysis exposes quick results and cancel-safe progress", async () =
   assert.match(appSource, /phase === "quick_result"/u);
   assert.match(appSource, /await loadQuickResultDashboard\(\)/u);
   assert.match(appSource, /renderDashboard\(data\)/u);
-  assert.match(appSource, /Headline ready; finishing deeper accounting/u);
-  assert.match(appSource, /finishing deeper accounting/u);
+  assert.match(appSource, /refreshQuickResultStatus\(\{/u);
+  assert.doesNotMatch(appSource, /Verified summary ready|Preparing verified summary/u);
+  assert.match(appSource, /kind === "unified_index"/u);
+  assert.match(appSource, /Scanning local history/u);
+  assert.doesNotMatch(appSource, /Headline ready; finishing deeper accounting/u);
   assert.match(appSource, /Local analysis cancelled/u);
   assert.match(appSource, /Verified existing results were kept/u);
   assert.match(appSource, /preserving a resumable local checkpoint/u);
@@ -5114,6 +5389,16 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
     styles,
     /\.topbar \.history-index-badge \{ display: none; \}/u,
     "the later evidence-card rule cannot re-show the toolbar badge",
+  );
+  assert.match(
+    styles,
+    /\.index-progress \{\n  display: grid;/u,
+    "the in-card history progress treatment owns the full-width layout",
+  );
+  assert.doesNotMatch(
+    styles,
+    /\.history-index-badge \{\n  display: grid;/u,
+    "the compact toolbar badge cannot inherit the in-card progress layout",
   );
   assert.match(
     styles,
@@ -8923,6 +9208,12 @@ test("self-resolving degraded notes are classed informational and keep the quiet
     styles,
     /\.evidence-warning\.progress,\n\.evidence-warning\.informational \{\n  border-inline-start-color: var\(--blue\);/u,
   );
+  assert.match(
+    "Local analysis complete with limited history coverage",
+    informational,
+  );
+  assert.match(appSource, /historyCoverageNoticeKind\(\{/u);
+  assert.doesNotMatch("known gap", informational);
 
   // The self-resolving sentences the companion actually publishes. Each must
   // exist verbatim in the companion source and fall inside the matcher's
@@ -8974,6 +9265,12 @@ test("self-resolving degraded notes are classed informational and keep the quiet
       + " forked child sessions inherited.",
     "Usage accounting is complete, but typed tool history is partial. Tool"
       + " totals are withheld rather than reported as zero.",
+    "Indexed-history totals include ${historyCoverage.indexedSourceCount} of"
+      + " ${historyCoverage.sourceCount} verified sources."
+      + " ${historyCoverage.skippedSourceCount} sources across"
+      + " ${historyCoverage.skippedThreadCount} threads did not pass local"
+      + " validation. This is a material coverage gap; missing usage remains"
+      + " unavailable rather than zero.",
   ];
   for (const sentence of alertSentences) {
     assert.ok(

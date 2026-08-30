@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   appendFile,
@@ -12,6 +13,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import {
   dirname,
   join,
@@ -23,13 +25,17 @@ import test from "node:test";
 
 import {
   LOCAL_REVIEW_IDENTITY_CORE_RUNTIME_FILES,
+  LOCAL_REVIEW_WORKSPACE_RUNTIME_FILES,
   assertLocalReviewIdentityCoreRuntimeInventory,
+  assertLocalReviewWorkspaceRuntimeInventory,
   calculateLocalReviewSourceInputDigest,
   captureLocalReviewIdentityCoreRuntime,
+  captureLocalReviewWorkspaceRuntime,
   collectStaticGraph,
   isForbiddenLocalReviewSource,
   localReviewArtifactPackageMetadata,
   stageLocalReviewIdentityCoreRuntime,
+  stageLocalReviewWorkspaceRuntime,
 } from "../scripts/build-local-review-artifact.js";
 
 const REPOSITORY_ROOT = resolve(
@@ -412,6 +418,146 @@ test("local-review identity-core capture rejects resolver mismatch and unsafe ru
       /runtime source is not a stable regular UTF-8 file: src\/pseudonym\.js/u,
     );
     assert.equal(growFailpointCalls, 3);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("local-review stages every admitted workspace package for isolated runtime imports", async () => {
+  const root = await mkdtemp(join(tmpdir(), "local-review-workspace-runtime-"));
+  try {
+    const graph = await collectStaticGraph(join(REPOSITORY_ROOT, "local-review", "cli.js"));
+    const names = graph.external.filter((name) => name.startsWith("@app-usagemonitor/"));
+    assert.deepEqual(names, Object.keys(LOCAL_REVIEW_WORKSPACE_RUNTIME_FILES));
+    const captures = [];
+    for (const name of names) {
+      const capture = await captureLocalReviewWorkspaceRuntime({ name });
+      captures.push(capture);
+      const rows = await stageLocalReviewWorkspaceRuntime(root, capture);
+      assert.deepEqual(capture.files.map(({ relativeFile }) => relativeFile),
+        LOCAL_REVIEW_WORKSPACE_RUNTIME_FILES[name]);
+      assert.equal(assertLocalReviewWorkspaceRuntimeInventory(rows, capture), true);
+      assert.throws(() => assertLocalReviewWorkspaceRuntimeInventory(rows.slice(1), capture),
+        /inventory is incomplete/u);
+      assert.throws(() => assertLocalReviewWorkspaceRuntimeInventory(
+        rows.map((row, index) => index === 0 ? { ...row, sha256: "0".repeat(64) } : row), capture),
+      /did not retain captured bytes/u);
+      await assert.rejects(stageLocalReviewWorkspaceRuntime(root, capture), { code: "EEXIST" });
+      for (const file of capture.files) {
+        assert.equal(await readFile(join(root, "node_modules", name, file.relativeFile), "utf8"),
+          file.sourceText);
+      }
+    }
+    // This cwd is outside the checkout: omitted dependencies cannot silently
+    // resolve through the repository's node_modules in a source-only test.
+    const output = execFileSync(process.execPath, ["--input-type=module", "--eval", `
+      import { deriveExportPseudonym } from "@app-usagemonitor/identity-core";
+      import { isValidQuotaWindowDuration } from "@app-usagemonitor/quota-analysis";
+      import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
+      if (typeof deriveExportPseudonym !== "function"
+          || !isValidQuotaWindowDuration(300)
+          || !Array.isArray(TELEMETRY_PLAN_TYPES)) throw new Error("runtime closure incomplete");
+      process.stdout.write("runtime closure complete");
+    `], { cwd: root, env: {}, encoding: "utf8" });
+    assert.equal(output, "runtime closure complete");
+    const digestOptions = {
+      graph: { files: [] },
+      identityCoreRuntime: captures[0],
+      workspaceRuntimes: captures.slice(1),
+    };
+    const completeDigest = await calculateLocalReviewSourceInputDigest(digestOptions);
+    assert.notEqual(completeDigest, await calculateLocalReviewSourceInputDigest({
+      ...digestOptions, workspaceRuntimes: [],
+    }));
+    await assert.rejects(calculateLocalReviewSourceInputDigest({
+      ...digestOptions, workspaceRuntimes: [captures[0]],
+    }), /duplicate workspace packages/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("local-review workspace captures bind provenance to the bytes staged after source mutation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "local-review-workspace-capture-"));
+  try {
+    const identityCoreRuntime = await captureLocalReviewIdentityCoreRuntime();
+    for (const name of ["@app-usagemonitor/quota-analysis", "@app-usagemonitor/telemetry-contract"]) {
+      const packageDirectory = name.split("/")[1];
+      const packageRoot = join(root, packageDirectory);
+      for (const relativeFile of LOCAL_REVIEW_WORKSPACE_RUNTIME_FILES[name]) {
+        const destination = join(packageRoot, relativeFile);
+        await mkdir(dirname(destination), { recursive: true });
+        await copyFile(join(REPOSITORY_ROOT, "packages", packageDirectory, relativeFile), destination);
+      }
+      const captureOptions = {
+        name, packageRoot, resolvePackageEntrypoint: () => join(packageRoot, "index.js"),
+      };
+      const capture = await captureLocalReviewWorkspaceRuntime(captureOptions);
+      const digestOptions = {
+        graph: { files: [] }, identityCoreRuntime, workspaceRuntimes: [capture],
+        readSource: async (path) => {
+          assert.equal(path.startsWith(packageRoot), false);
+          return readFile(path);
+        },
+      };
+      const before = await calculateLocalReviewSourceInputDigest(digestOptions);
+      await appendFile(join(packageRoot, "index.js"), "// changed after capture\n");
+      assert.equal(await calculateLocalReviewSourceInputDigest(digestOptions), before);
+      const fresh = await captureLocalReviewWorkspaceRuntime(captureOptions);
+      assert.notEqual(await calculateLocalReviewSourceInputDigest({
+        ...digestOptions, workspaceRuntimes: [fresh],
+      }), before);
+      const staged = join(root, `staged-${packageDirectory}`);
+      await stageLocalReviewWorkspaceRuntime(staged, capture);
+      assert.equal(await readFile(join(staged, "node_modules", name, "index.js"), "utf8"),
+        capture.files[0].sourceText);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("local-review workspace capture rejects unknown identities and dependency-closure growth", async () => {
+  await assert.rejects(captureLocalReviewWorkspaceRuntime({ name: "@unreviewed/package" }),
+    /capture options are invalid/u);
+  const root = await mkdtemp(join(tmpdir(), "local-review-workspace-guards-"));
+  const name = "@app-usagemonitor/telemetry-contract";
+  const packageRoot = join(root, "telemetry-contract");
+  const options = { name, packageRoot, resolvePackageEntrypoint: () => join(packageRoot, "index.js") };
+  try {
+    for (const relativeFile of LOCAL_REVIEW_WORKSPACE_RUNTIME_FILES[name]) {
+      const destination = join(packageRoot, relativeFile);
+      await mkdir(dirname(destination), { recursive: true });
+      await copyFile(join(REPOSITORY_ROOT, "packages", "telemetry-contract", relativeFile), destination);
+    }
+    const entry = join(packageRoot, "index.js");
+    const original = await readFile(entry, "utf8");
+    for (const dependency of [
+      'import "node:https";\n',
+      'import "./unstaged.js";\n',
+      'import "@unreviewed/package";\n',
+      'const specifier = "./src/constants.js"; import(specifier);\n',
+    ]) {
+      await writeFile(entry, `${original}\n${dependency}`);
+      await assert.rejects(captureLocalReviewWorkspaceRuntime(options),
+        /runtime closure contains an unreviewed dependency/u);
+    }
+    await writeFile(entry, original);
+    const manifestPath = join(packageRoot, "package.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    for (const changed of [
+      { ...manifest, version: "0.0.0" },
+      { ...manifest, name: "@unreviewed/package" },
+      { ...manifest, type: "commonjs" },
+      { ...manifest, dependencies: { "unreviewed": "1.0.0" } },
+    ]) {
+      await writeFile(manifestPath, JSON.stringify(changed));
+      await assert.rejects(captureLocalReviewWorkspaceRuntime(options), /Pinned package mismatch/u);
+    }
+    await writeFile(manifestPath, JSON.stringify(manifest));
+    await rm(join(packageRoot, "src/constants.js"));
+    await assert.rejects(captureLocalReviewWorkspaceRuntime(options),
+      /runtime source is not a stable regular UTF-8 file/u);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

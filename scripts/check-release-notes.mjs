@@ -134,11 +134,25 @@ function parseChangelog(source) {
       entries[index + 1]?.index ?? source.length,
     );
   }
+  const unreleased = /^## \[Unreleased\]\s*$/mu.exec(source);
+  let unreleasedSection = null;
+  if (unreleased !== null) {
+    const contentStart = unreleased.index + unreleased[0].length;
+    const remainder = source.slice(contentStart);
+    const nextHeading = /^##\s+/mu.exec(remainder);
+    unreleasedSection = source.slice(
+      unreleased.index,
+      nextHeading === null
+        ? source.length
+        : contentStart + nextHeading.index,
+    );
+  }
   return {
     entries,
     hasProvenanceAndAcknowledgements:
       /^## Provenance and acknowledgements\s*$/mu.test(source),
-    hasUnreleased: /^## \[Unreleased\]\s*$/mu.test(source),
+    hasUnreleased: unreleased !== null,
+    unreleasedSection,
   };
 }
 
@@ -293,6 +307,7 @@ export async function checkReleaseNotes({
         entries: [],
         hasProvenanceAndAcknowledgements: false,
         hasUnreleased: false,
+        unreleasedSection: null,
       }
     : parseChangelog(changelogSource);
   if (changelogSource === null) {
@@ -326,6 +341,7 @@ export async function checkReleaseNotes({
   }
 
   const changelogEntries = new Map();
+  const stableTagVersionSet = new Set(stableTagVersions);
   for (let index = 0; index < parsedChangelog.entries.length; index += 1) {
     const entry = parsedChangelog.entries[index];
     const expectedLink = "./release-notes/" + entry.version + ".md";
@@ -414,6 +430,16 @@ export async function checkReleaseNotes({
     } else {
       changelogEntries.set(entry.version, entry);
     }
+    if (!stableTagVersionSet.has(entry.version)) {
+      addIssue(
+        issues,
+        seenIssues,
+        "unpublished_changelog_entry",
+        "CHANGELOG.md",
+        "Version " + entry.version
+          + " has no stable Git tag and must remain under Unreleased.",
+      );
+    }
   }
   for (let index = 1; index < parsedChangelog.entries.length; index += 1) {
     const previous = parsedChangelog.entries[index - 1].version;
@@ -474,10 +500,7 @@ export async function checkReleaseNotes({
     }
   }
 
-  const requiredVersions = new Set([
-    ...stableTagVersions,
-    ...noteVersions,
-  ]);
+  const requiredVersions = new Set(stableTagVersions);
   if (packageVersion !== null) requiredVersions.add(packageVersion);
 
   for (const version of [...requiredVersions].sort(compareVersions)) {
@@ -487,10 +510,10 @@ export async function checkReleaseNotes({
         seenIssues,
         "missing_release_note",
         "release-notes/" + version + ".md",
-        "Stable version " + version + " requires a checked-in notes file.",
+        "Version " + version + " requires a checked-in notes file.",
       );
     }
-    if (!changelogEntries.has(version)) {
+    if (stableTagVersionSet.has(version) && !changelogEntries.has(version)) {
       addIssue(
         issues,
         seenIssues,
@@ -499,6 +522,17 @@ export async function checkReleaseNotes({
         "Stable version " + version + " requires a dated linked entry.",
       );
     }
+  }
+
+  for (const version of noteVersions) {
+    if (version === packageVersion || stableTagVersionSet.has(version)) continue;
+    addIssue(
+      issues,
+      seenIssues,
+      "orphan_release_note",
+      "release-notes/" + version + ".md",
+      "Release notes must describe the package candidate or an existing stable tag.",
+    );
   }
 
   for (const version of changelogEntries.keys()) {
@@ -513,17 +547,32 @@ export async function checkReleaseNotes({
     }
   }
 
-  if (
-    packageVersion !== null
-    && parsedChangelog.entries.length > 0
-    && parsedChangelog.entries[0].version !== packageVersion
-  ) {
+  const packageVersionIsTagged = packageVersion !== null
+    && stableTagVersionSet.has(packageVersion);
+  if (packageVersion !== null && !packageVersionIsTagged) {
+    const candidateNotesLink = "./release-notes/" + packageVersion + ".md";
+    if (!parsedChangelog.unreleasedSection?.includes(candidateNotesLink)) {
+      addIssue(
+        issues,
+        seenIssues,
+        "missing_unreleased_candidate_link",
+        "CHANGELOG.md",
+        "Unreleased must link to candidate notes " + candidateNotesLink + ".",
+      );
+    }
+  }
+
+  const latestStableVersion = stableTagVersions.at(-1) ?? null;
+  if (latestStableVersion !== null
+      && parsedChangelog.entries.length > 0
+      && parsedChangelog.entries[0].version !== latestStableVersion) {
     addIssue(
       issues,
       seenIssues,
       "latest_changelog_version",
       "CHANGELOG.md",
-      "The first released entry must match package version " + packageVersion + ".",
+      "The first released entry must match latest stable tag v"
+        + latestStableVersion + ".",
     );
   }
 
@@ -598,8 +647,9 @@ function usage() {
     "Usage: node ./scripts/check-release-notes.mjs [--root <directory>]",
     "",
     "Require provenance and Unreleased sections, one dated changelog entry",
-    "with release/tag/history links per stable version, and one non-empty",
-    "release-notes/X.Y.Z.md file per version.",
+    "with release/tag/history links per tagged stable version, and one",
+    "non-empty release-notes/X.Y.Z.md file for each stable or package",
+    "candidate. Untagged package work must remain linked from Unreleased.",
   ].join("\n");
 }
 

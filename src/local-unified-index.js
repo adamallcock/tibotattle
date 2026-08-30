@@ -4,9 +4,17 @@ import {
   createSecretKey,
   randomBytes,
 } from "node:crypto";
-import { constants, lstatSync } from "node:fs";
-import { chmod, lstat, mkdir, open, rename, unlink } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { closeSync, constants, lstatSync, openSync } from "node:fs";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  open,
+  opendir,
+  rename,
+  unlink,
+} from "node:fs/promises";
+import { basename, dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 // The one local index.
@@ -32,7 +40,8 @@ import { DatabaseSync } from "node:sqlite";
 //   * `scope_local` is the same construction over the local account scope id.
 
 export const LOCAL_UNIFIED_INDEX_SCHEMA_VERSION = "local-unified-index-v2";
-const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION = "local-unified-index-v1";
+export const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION =
+  "local-unified-index-v1";
 
 // Stamped onto every row. A parser change re-scans only the affected rows'
 // source files; rows whose rollout files have rotated away keep their
@@ -95,7 +104,12 @@ const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION = "local-unified-index-v1";
 // with physical identity and the quarantine reason persisted in the cursor so
 // an unchanged damaged rollout terminates cheaply and a changed one retries
 // from byte zero.
-export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v10";
+//
+// v11 (2026-08-29): an invalid quota window is withheld at record level while
+// valid usage, tool, and quota facts from the same source remain available.
+// A paginated replacement without history_base resets the selected lineage
+// snapshot generation at the source-start boundary accepted by Codex.
+export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v11";
 export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
   "codex-immutable-rollout-v1";
 
@@ -106,9 +120,10 @@ export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
 // degraded row is recorded. Kept in lockstep with the main constant: salvaged
 // rows run the same delta derivation.
 export const LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION =
-  "unified-rollout-typed-v10-partial";
+  "unified-rollout-typed-v11-partial";
 
-const INDEX_APPLICATION_ID = 0x554d5549;
+export const LOCAL_UNIFIED_INDEX_APPLICATION_ID = 0x554d5549;
+const INDEX_APPLICATION_ID = LOCAL_UNIFIED_INDEX_APPLICATION_ID;
 // Version 2 (2026-08-07) widens version 1 with the two incremental-ingest
 // tables below: `source_cursor` and `lineage_snapshot`. Version 3 (2026-08-07)
 // adds `session_identity`, the raw provider-issued session UUID beside its
@@ -123,9 +138,23 @@ const INDEX_APPLICATION_ID = 0x554d5549;
 // generation-bound tool facts and widens the closed diagnostic vocabulary.
 // Each widening is additive except that closed diagnostic CHECK widening,
 // which is rebuilt transactionally while preserving every existing row.
-export const LOCAL_UNIFIED_INDEX_USER_VERSION = 10;
+// Version 11 (2026-08-28) makes the source- and quota-keyed usage indexes
+// required schema. Runtime quarantine cleanup needs both to remain bounded
+// after a deferred-index cold load.
+export const LOCAL_UNIFIED_INDEX_USER_VERSION = 11;
 const INDEX_USER_VERSION = LOCAL_UNIFIED_INDEX_USER_VERSION;
-const MIGRATABLE_USER_VERSIONS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+const MIGRATABLE_USER_VERSIONS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+// Compatibility is persisted separately from PRAGMA user_version so a newer
+// writer can describe the oldest reader and writer that understand its
+// semantics. The current format intentionally requires v11 for both: cleanup
+// query-plan bounds are part of safe staged publication, not optional tuning.
+export const LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION = 11;
+export const LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION = 11;
+const COMPATIBILITY_META_KEYS = Object.freeze({
+  formatUserVersion: "compatibility_format_user_version",
+  minimumReaderUserVersion: "compatibility_minimum_reader_user_version",
+  minimumWriterUserVersion: "compatibility_minimum_writer_user_version",
+});
 const SECRET_BYTES = 32;
 const MAX_SECRET_BYTES = 256;
 const DEFAULT_COMMIT_ROWS = 10_000;
@@ -581,6 +610,10 @@ const SECONDARY_INDEX_SCHEMA = `
     ON usage_event(observed_at_ms);
   CREATE INDEX IF NOT EXISTS usage_event_session
     ON usage_event(session_local);
+  CREATE INDEX IF NOT EXISTS usage_event_source
+    ON usage_event(source_local);
+  CREATE INDEX IF NOT EXISTS usage_event_quota_observation
+    ON usage_event(quota_observation_id);
   CREATE INDEX IF NOT EXISTS usage_event_boundary_session
     ON usage_event_boundary(session_local);
   CREATE INDEX IF NOT EXISTS usage_event_replay_order
@@ -600,6 +633,8 @@ const SECONDARY_INDEX_SCHEMA = `
 const SECONDARY_INDEX_NAMES = Object.freeze([
   "usage_event_observed",
   "usage_event_session",
+  "usage_event_source",
+  "usage_event_quota_observation",
   "usage_event_boundary_session",
   "usage_event_replay_order",
   "quota_occurrence_canonical",
@@ -614,6 +649,33 @@ function fixedError(code) {
   return error;
 }
 
+function schemaNewerError(compatibility, { readOnly = false } = {}) {
+  const accessRequirement = readOnly
+    ? compatibility.minimumReaderUserVersion
+    : compatibility.minimumWriterUserVersion;
+  const requirements = [
+    ["pragma_user_version", compatibility.userVersion],
+    ["format_user_version", compatibility.formatUserVersion],
+    [readOnly ? "minimum_reader_user_version" : "minimum_writer_user_version",
+      accessRequirement],
+  ].filter(([, version]) => Number.isSafeInteger(version)
+    && version > INDEX_USER_VERSION);
+  const error = fixedError("local_unified_index_schema_newer");
+  error.compatibility = Object.freeze({
+    accessMode: readOnly ? "read" : "write",
+    databaseUserVersion: compatibility.userVersion,
+    formatUserVersion: compatibility.formatUserVersion,
+    supportedUserVersion: INDEX_USER_VERSION,
+    minimumReaderUserVersion: compatibility.minimumReaderUserVersion,
+    minimumWriterUserVersion: compatibility.minimumWriterUserVersion,
+    requiredUserVersion: Math.max(...requirements.map(([, version]) => version)),
+    requirements: Object.freeze(requirements.map(([requirement, version]) => (
+      Object.freeze({ requirement, version })
+    ))),
+  });
+  return error;
+}
+
 export function defaultLocalUnifiedIndexPath(root = process.cwd()) {
   return resolve(root, ".usage-monitor", "local-unified-index-v1.sqlite");
 }
@@ -624,6 +686,10 @@ export function defaultLocalUnifiedIndexSecretPath(
   return resolve(dirname(resolve(indexFile)), "local-unified-index-device-salt-v1");
 }
 
+export function defaultLocalUnifiedIndexRecoveryLockPath(indexFile) {
+  return `${resolve(indexFile)}.recovery.lock`;
+}
+
 function ownerOnlyRegularFile(metadata) {
   return metadata.isFile()
     && !metadata.isSymbolicLink()
@@ -632,13 +698,86 @@ function ownerOnlyRegularFile(metadata) {
     && (process.platform === "win32" || (metadata.mode & 0o077) === 0);
 }
 
-export async function assertSafeLocalUnifiedIndexTarget(
+function safeDirectoryComponent(metadata, { trustedBoundary = false } = {}) {
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) return false;
+  if (typeof process.getuid !== "function" || process.platform === "win32") {
+    return true;
+  }
+  const currentUid = process.getuid();
+  if (metadata.uid === currentUid) {
+    // Read/execute sharing is harmless; only the owner may replace children.
+    return (metadata.mode & 0o022) === 0;
+  }
+  if (!trustedBoundary || metadata.uid !== 0) return false;
+  // Root-owned ancestors are a trust boundary. A sticky root-owned temporary
+  // directory is also safe because other users cannot replace our child.
+  return (metadata.mode & 0o022) === 0 || (metadata.mode & 0o1000) !== 0;
+}
+
+function captureSafeLocalUnifiedIndexDirectoryChain(indexFile) {
+  const chain = [];
+  let directory = dirname(resolve(indexFile));
+  while (true) {
+    let metadata;
+    try {
+      metadata = lstatSync(directory);
+    } catch {
+      throw fixedError("local_unified_index_file_invalid");
+    }
+    const ownedByCurrentUser = typeof process.getuid !== "function"
+      || metadata.uid === process.getuid();
+    const parent = dirname(directory);
+    const trustedBoundary = !ownedByCurrentUser || parent === directory;
+    if (!safeDirectoryComponent(metadata, { trustedBoundary })) {
+      throw fixedError("local_unified_index_file_invalid");
+    }
+    chain.push(Object.freeze({
+      path: directory,
+      dev: metadata.dev,
+      ino: metadata.ino,
+      uid: metadata.uid,
+      mode: metadata.mode,
+    }));
+    if (trustedBoundary) break;
+    directory = parent;
+  }
+  return Object.freeze(chain);
+}
+
+function sameLocalUnifiedIndexDirectoryChain(left, right) {
+  return left.length === right.length && left.every((entry, index) => (
+    entry.path === right[index].path
+      && entry.dev === right[index].dev
+      && entry.ino === right[index].ino
+      && entry.uid === right[index].uid
+      && entry.mode === right[index].mode
+  ));
+}
+
+function recheckLocalUnifiedIndexDirectoryChain(indexFile, expected) {
+  const current = captureSafeLocalUnifiedIndexDirectoryChain(indexFile);
+  if (!sameLocalUnifiedIndexDirectoryChain(expected, current)) {
+    throw fixedError("local_unified_index_file_invalid");
+  }
+  return current;
+}
+
+export function assertSafeLocalUnifiedIndexParentPath(
   indexFile,
-  { allowMissing = true } = {},
+  expectedDirectoryChain = null,
 ) {
+  const current = captureSafeLocalUnifiedIndexDirectoryChain(indexFile);
+  if (expectedDirectoryChain !== null
+      && !sameLocalUnifiedIndexDirectoryChain(expectedDirectoryChain, current)) {
+    throw fixedError("local_unified_index_file_invalid");
+  }
+  return current;
+}
+
+function safeLocalUnifiedIndexTargetSync(indexFile, { allowMissing = false } = {}) {
   let metadata;
   try {
-    metadata = await lstat(resolve(indexFile));
+    metadata = lstatSync(resolve(indexFile));
   } catch (error) {
     if (allowMissing && error?.code === "ENOENT") return null;
     if (error?.code?.startsWith("local_unified_index_")) throw error;
@@ -647,6 +786,64 @@ export async function assertSafeLocalUnifiedIndexTarget(
   if (!ownerOnlyRegularFile(metadata)) {
     throw fixedError("local_unified_index_file_invalid");
   }
+  return metadata;
+}
+
+function sameLocalUnifiedIndexTarget(left, right) {
+  return ownerOnlyRegularFile(left)
+    && ownerOnlyRegularFile(right)
+    && left.dev === right.dev
+    && left.ino === right.ino;
+}
+
+function reserveNewLocalUnifiedIndexTarget(indexFile, expectedDirectoryChain) {
+  recheckLocalUnifiedIndexDirectoryChain(indexFile, expectedDirectoryChain);
+  let descriptor;
+  try {
+    descriptor = openSync(
+      resolve(indexFile),
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL
+        | (constants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      throw fixedError("local_unified_index_file_invalid");
+    }
+    throw fixedError("local_unified_index_unavailable");
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+  const directoryChain = recheckLocalUnifiedIndexDirectoryChain(
+    indexFile,
+    expectedDirectoryChain,
+  );
+  return Object.freeze({
+    metadata: safeLocalUnifiedIndexTargetSync(indexFile),
+    directoryChain,
+  });
+}
+
+export async function assertSafeLocalUnifiedIndexTarget(
+  indexFile,
+  { allowMissing = true } = {},
+) {
+  const directoryChain = captureSafeLocalUnifiedIndexDirectoryChain(indexFile);
+  let metadata;
+  try {
+    metadata = await lstat(resolve(indexFile));
+  } catch (error) {
+    if (allowMissing && error?.code === "ENOENT") {
+      recheckLocalUnifiedIndexDirectoryChain(indexFile, directoryChain);
+      return null;
+    }
+    if (error?.code?.startsWith("local_unified_index_")) throw error;
+    throw fixedError("local_unified_index_unavailable");
+  }
+  if (!ownerOnlyRegularFile(metadata)) {
+    throw fixedError("local_unified_index_file_invalid");
+  }
+  recheckLocalUnifiedIndexDirectoryChain(indexFile, directoryChain);
   return metadata;
 }
 
@@ -679,6 +876,21 @@ export async function readOrCreateDeviceSalt(
   } finally {
     await handle?.close();
   }
+  const secret = await readExistingDeviceSalt(secretFile);
+  await chmod(secretFile, 0o600);
+  return secret;
+}
+
+/**
+ * Read an existing device salt without creating directories, changing mode,
+ * or otherwise mutating the path. Recovery preparation uses this stricter
+ * operation so a missing or damaged live identity cannot be silently repaired
+ * while constructing a candidate.
+ */
+export async function readExistingDeviceSalt(
+  secretFile = defaultLocalUnifiedIndexSecretPath(),
+) {
+  const directoryChain = captureSafeLocalUnifiedIndexDirectoryChain(secretFile);
   let readHandle;
   try {
     readHandle = await open(
@@ -691,9 +903,17 @@ export async function readOrCreateDeviceSalt(
         || metadata.size > MAX_SECRET_BYTES) {
       throw fixedError("local_unified_index_secret_invalid");
     }
-    const buffer = Buffer.alloc(metadata.size);
-    await readHandle.read(buffer, 0, buffer.length, 0);
-    await chmod(secretFile, 0o600);
+    const buffer = await readHandle.readFile();
+    const finalMetadata = await readHandle.stat();
+    if (buffer.length !== metadata.size
+        || finalMetadata.dev !== metadata.dev
+        || finalMetadata.ino !== metadata.ino
+        || finalMetadata.size !== metadata.size
+        || finalMetadata.mtimeMs !== metadata.mtimeMs
+        || finalMetadata.ctimeMs !== metadata.ctimeMs) {
+      throw fixedError("local_unified_index_secret_invalid");
+    }
+    recheckLocalUnifiedIndexDirectoryChain(secretFile, directoryChain);
     return buffer;
   } catch (error) {
     if (error?.code?.startsWith("local_unified_index_")) throw error;
@@ -863,6 +1083,7 @@ function initializeSchema(database, { deferSecondaryIndexes = false } = {}) {
   `);
   database.prepare("INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)")
     .run("schema_version", LOCAL_UNIFIED_INDEX_SCHEMA_VERSION);
+  stampDatabaseCompatibility(database);
 }
 
 function tableColumns(database, tableName) {
@@ -874,6 +1095,176 @@ function tableExists(database, tableName) {
   return database.prepare(
     "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?",
   ).get(tableName) !== undefined;
+}
+
+function compatibilityInteger(value) {
+  if (typeof value !== "string" || !/^[1-9][0-9]*$/u.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+/**
+ * Read the bounded compatibility header without changing the database.
+ * Missing metadata is accepted only on a recognized physical schema version;
+ * the next writable open migrates and stamps all three keys atomically.
+ */
+export function readLocalUnifiedIndexCompatibility(database) {
+  const applicationId = Number(
+    database.prepare("PRAGMA application_id").get()?.application_id,
+  );
+  const userVersion = Number(
+    database.prepare("PRAGMA user_version").get()?.user_version,
+  );
+  const values = new Map();
+  try {
+    if (tableExists(database, "meta")) {
+      for (const row of database.prepare(`
+        SELECT key, value FROM meta
+        WHERE key IN (?, ?, ?)
+      `).all(
+        COMPATIBILITY_META_KEYS.formatUserVersion,
+        COMPATIBILITY_META_KEYS.minimumReaderUserVersion,
+        COMPATIBILITY_META_KEYS.minimumWriterUserVersion,
+      )) {
+        values.set(row.key, row.value);
+      }
+    }
+  } catch {
+    // A future schema may reshape metadata. PRAGMA application_id and
+    // user_version remain sufficient to make the conservative typed refusal;
+    // current-version validation below still rejects a malformed meta table.
+  }
+  const formatUserVersion = compatibilityInteger(
+    values.get(COMPATIBILITY_META_KEYS.formatUserVersion),
+  );
+  const minimumReaderUserVersion = compatibilityInteger(
+    values.get(COMPATIBILITY_META_KEYS.minimumReaderUserVersion),
+  );
+  const minimumWriterUserVersion = compatibilityInteger(
+    values.get(COMPATIBILITY_META_KEYS.minimumWriterUserVersion),
+  );
+  const metadataPartial = values.size > 0 && values.size < 3;
+  const metadataMalformed = values.size === 3
+    && [formatUserVersion, minimumReaderUserVersion, minimumWriterUserVersion]
+      .some((value) => value === null);
+  return Object.freeze({
+    applicationId,
+    userVersion,
+    formatUserVersion,
+    minimumReaderUserVersion: minimumReaderUserVersion ?? userVersion,
+    minimumWriterUserVersion: minimumWriterUserVersion ?? userVersion,
+    metadataPresent: values.size === 3,
+    metadataPartial,
+    metadataMalformed,
+  });
+}
+
+function stampDatabaseCompatibility(database) {
+  const upsert = database.prepare(`
+    INSERT INTO meta(key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `);
+  upsert.run(
+    COMPATIBILITY_META_KEYS.formatUserVersion,
+    String(INDEX_USER_VERSION),
+  );
+  upsert.run(
+    COMPATIBILITY_META_KEYS.minimumReaderUserVersion,
+    String(LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION),
+  );
+  upsert.run(
+    COMPATIBILITY_META_KEYS.minimumWriterUserVersion,
+    String(LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION),
+  );
+}
+
+/**
+ * Reject a database produced by a newer writer before a writable connection
+ * changes journal/header state.  The application id gate prevents an
+ * unrelated SQLite file with a high user_version being misdiagnosed as one of
+ * our indexes.
+ */
+export function assertLocalUnifiedIndexNotNewer(
+  database,
+  { readOnly = false } = {},
+) {
+  const compatibility = readLocalUnifiedIndexCompatibility(database);
+  if (compatibility.applicationId === INDEX_APPLICATION_ID
+      && (compatibility.metadataPartial || compatibility.metadataMalformed)) {
+    throw fixedError("local_unified_index_schema_invalid");
+  }
+  const accessRequirement = readOnly
+    ? compatibility.minimumReaderUserVersion
+    : compatibility.minimumWriterUserVersion;
+  if (compatibility.applicationId === INDEX_APPLICATION_ID
+      && (compatibility.userVersion > INDEX_USER_VERSION
+        || compatibility.formatUserVersion > INDEX_USER_VERSION
+        || accessRequirement > INDEX_USER_VERSION)) {
+    throw schemaNewerError(compatibility, { readOnly });
+  }
+  return compatibility;
+}
+
+function currentCompatibilityIsSupported(compatibility) {
+  return !compatibility.metadataPartial
+    && (!compatibility.metadataPresent
+      || (compatibility.formatUserVersion === INDEX_USER_VERSION
+        && compatibility.minimumReaderUserVersion
+          === LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION
+        && compatibility.minimumWriterUserVersion
+          === LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION));
+}
+
+/**
+ * A writable SQLite connection can alter journal/header bytes before schema
+ * validation. Existing files therefore have to prove that they are one of our
+ * recognized current or migratable schemas through this read-only handle.
+ */
+function assertWritableLocalUnifiedIndexPreflight(database) {
+  const compatibility = assertLocalUnifiedIndexNotNewer(database, {
+    readOnly: false,
+  });
+  if (compatibility.applicationId !== INDEX_APPLICATION_ID) {
+    throw fixedError("local_unified_index_schema_invalid");
+  }
+  let schemaVersion;
+  try {
+    schemaVersion = database.prepare(
+      "SELECT value FROM meta WHERE key = 'schema_version'",
+    ).get()?.value ?? null;
+  } catch {
+    throw fixedError("local_unified_index_schema_invalid");
+  }
+  const legacy = MIGRATABLE_USER_VERSIONS.has(compatibility.userVersion)
+    && compatibility.userVersion < INDEX_USER_VERSION
+    // Pre-release v7-v9 databases already carried the v2 schema marker while
+    // their physical tables were still widened transactionally by later user
+    // versions. Both known markers are therefore legitimate migration roots.
+    && [
+      LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+      LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+    ].includes(schemaVersion);
+  const current = compatibility.userVersion === INDEX_USER_VERSION
+    && schemaVersion === LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
+    && currentCompatibilityIsSupported(compatibility);
+  if (!legacy && !current) {
+    throw fixedError("local_unified_index_schema_invalid");
+  }
+  return compatibility;
+}
+
+export function assertLocalUnifiedIndexRecoveryUnlocked(indexFile) {
+  try {
+    const metadata = lstatSync(defaultLocalUnifiedIndexRecoveryLockPath(indexFile));
+    if (!ownerOnlyRegularFile(metadata)) {
+      throw fixedError("local_unified_index_recovery_lock_invalid");
+    }
+    throw fixedError("local_unified_index_recovery_in_progress");
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    if (error?.code?.startsWith("local_unified_index_")) throw error;
+    throw fixedError("local_unified_index_recovery_lock_invalid");
+  }
 }
 
 function addColumnIfMissing(database, tableName, columnName, definition) {
@@ -992,12 +1383,8 @@ function validateDatabase(database, {
   readOnly = false,
   deferSecondaryIndexes = false,
 } = {}) {
-  const applicationId = Number(
-    database.prepare("PRAGMA application_id").get().application_id,
-  );
-  const userVersion = Number(
-    database.prepare("PRAGMA user_version").get().user_version,
-  );
+  const compatibility = assertLocalUnifiedIndexNotNewer(database, { readOnly });
+  const { applicationId, userVersion } = compatibility;
   const schema = database.prepare(
     "SELECT value FROM meta WHERE key = 'schema_version'",
   ).get();
@@ -1008,18 +1395,24 @@ function validateDatabase(database, {
     && schema?.value === LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION;
   const current = userVersion === INDEX_USER_VERSION
     && schema?.value === LOCAL_UNIFIED_INDEX_SCHEMA_VERSION;
+  const compatibilityCurrent = currentCompatibilityIsSupported(compatibility);
   const acceptable = readOnly ? (legacy || current) : current;
-  if (applicationId !== INDEX_APPLICATION_ID || !acceptable) {
+  if (applicationId !== INDEX_APPLICATION_ID || !acceptable
+      || (current && !compatibilityCurrent)) {
     throw fixedError("local_unified_index_schema_invalid");
   }
   if (current && !deferSecondaryIndexes) assertSecondaryIndexes(database);
-  return { userVersion, schemaVersion: schema?.value ?? null, legacy };
+  return {
+    ...compatibility,
+    schemaVersion: schema?.value ?? null,
+    legacy,
+  };
 }
 
 function migrateDatabase(database, { deferSecondaryIndexes = false } = {}) {
-  const userVersion = Number(
-    database.prepare("PRAGMA user_version").get().user_version,
-  );
+  const { userVersion } = assertLocalUnifiedIndexNotNewer(database, {
+    readOnly: false,
+  });
   if (!MIGRATABLE_USER_VERSIONS.has(userVersion)) {
     throw fixedError("local_unified_index_schema_invalid");
   }
@@ -1063,6 +1456,7 @@ function migrateDatabase(database, { deferSecondaryIndexes = false } = {}) {
       "INSERT INTO meta(key, value) VALUES (?, ?) "
         + "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
     ).run("schema_version", LOCAL_UNIFIED_INDEX_SCHEMA_VERSION);
+    stampDatabaseCompatibility(database);
     database.exec(`PRAGMA user_version=${INDEX_USER_VERSION}`);
     database.exec("COMMIT");
   } catch (error) {
@@ -1080,33 +1474,125 @@ export function openLocalUnifiedIndex(indexFile, {
   create = false,
   staging = false,
   deferSecondaryIndexes = false,
+  allowRecoveryLock = false,
 } = {}) {
+  const resolvedIndexFile = resolve(indexFile);
+  let directoryChain = captureSafeLocalUnifiedIndexDirectoryChain(
+    resolvedIndexFile,
+  );
   if (deferSecondaryIndexes && (readOnly || !create || !staging)) {
     throw fixedError("local_unified_index_deferred_indexes_invalid");
   }
   if (deferSecondaryIndexes) {
-    try {
-      lstatSync(resolve(indexFile));
+    const existingStage = safeLocalUnifiedIndexTargetSync(resolvedIndexFile, {
+      allowMissing: true,
+    });
+    if (existingStage !== null) {
       throw fixedError("local_unified_index_deferred_indexes_requires_new_stage");
-    } catch (error) {
-      if (error?.code === "ENOENT") {
-        // The stage is genuinely new. DatabaseSync creates it below.
-      } else if (error?.code?.startsWith("local_unified_index_")) {
-        throw error;
-      } else {
-        throw fixedError("local_unified_index_unavailable");
-      }
     }
   }
   let database;
+  let preflight;
+  let existedBeforeOpen = false;
+  let targetMetadata = null;
   try {
-    database = new DatabaseSync(indexFile, { readOnly, timeout: 5_000 });
+    if (!allowRecoveryLock) {
+      assertLocalUnifiedIndexRecoveryUnlocked(resolvedIndexFile);
+    }
+    // Refuse symlinks, hard links, non-owner files and shared modes before any
+    // SQLite handle is opened. Missing writable/create targets are atomically
+    // reserved as owner-only regular files, closing the creation substitution
+    // window within the cooperative same-user boundary.
+    targetMetadata = safeLocalUnifiedIndexTargetSync(resolvedIndexFile, {
+      allowMissing: true,
+    });
+    directoryChain = recheckLocalUnifiedIndexDirectoryChain(
+      resolvedIndexFile,
+      directoryChain,
+    );
+    existedBeforeOpen = targetMetadata !== null;
+    if (deferSecondaryIndexes && existedBeforeOpen) {
+      throw fixedError("local_unified_index_deferred_indexes_requires_new_stage");
+    }
+    // SQLite may rewrite journal/header state as soon as a writable connection
+    // is configured. Inspect an existing file through a separate read-only
+    // handle first so an older binary's refusal of N+1 state is byte-for-byte
+    // non-mutating.
+    if (!readOnly) {
+      if (existedBeforeOpen) {
+        directoryChain = recheckLocalUnifiedIndexDirectoryChain(
+          resolvedIndexFile,
+          directoryChain,
+        );
+        preflight = new DatabaseSync(resolvedIndexFile, {
+          readOnly: true,
+          timeout: 5_000,
+        });
+        const preflightMetadata = safeLocalUnifiedIndexTargetSync(
+          resolvedIndexFile,
+        );
+        directoryChain = recheckLocalUnifiedIndexDirectoryChain(
+          resolvedIndexFile,
+          directoryChain,
+        );
+        if (!sameLocalUnifiedIndexTarget(targetMetadata, preflightMetadata)) {
+          throw fixedError("local_unified_index_file_invalid");
+        }
+        assertWritableLocalUnifiedIndexPreflight(preflight);
+        const validatedMetadata = safeLocalUnifiedIndexTargetSync(
+          resolvedIndexFile,
+        );
+        directoryChain = recheckLocalUnifiedIndexDirectoryChain(
+          resolvedIndexFile,
+          directoryChain,
+        );
+        if (!sameLocalUnifiedIndexTarget(
+          preflightMetadata,
+          validatedMetadata,
+        )) {
+          throw fixedError("local_unified_index_file_invalid");
+        }
+        preflight.close();
+        preflight = null;
+        targetMetadata = validatedMetadata;
+      } else if (!create) {
+        throw fixedError("local_unified_index_unavailable");
+      } else {
+        const reservation = reserveNewLocalUnifiedIndexTarget(
+          resolvedIndexFile,
+          directoryChain,
+        );
+        targetMetadata = reservation.metadata;
+        directoryChain = reservation.directoryChain;
+      }
+    } else if (!existedBeforeOpen) {
+      throw fixedError("local_unified_index_unavailable");
+    }
+    directoryChain = recheckLocalUnifiedIndexDirectoryChain(
+      resolvedIndexFile,
+      directoryChain,
+    );
+    database = new DatabaseSync(resolvedIndexFile, { readOnly, timeout: 5_000 });
+    const openedMetadata = safeLocalUnifiedIndexTargetSync(resolvedIndexFile);
+    directoryChain = recheckLocalUnifiedIndexDirectoryChain(
+      resolvedIndexFile,
+      directoryChain,
+    );
+    if (!sameLocalUnifiedIndexTarget(targetMetadata, openedMetadata)) {
+      throw fixedError("local_unified_index_file_invalid");
+    }
+    if (!allowRecoveryLock) {
+      assertLocalUnifiedIndexRecoveryUnlocked(resolvedIndexFile);
+    }
     configureDatabase(database, { readOnly, staging });
-    if (create) initializeSchema(database, { deferSecondaryIndexes });
+    if (create && !existedBeforeOpen) {
+      initializeSchema(database, { deferSecondaryIndexes });
+    }
     if (!readOnly) migrateDatabase(database, { deferSecondaryIndexes });
     validateDatabase(database, { readOnly, deferSecondaryIndexes });
     return database;
   } catch (error) {
+    if (preflight?.isOpen) preflight.close();
     if (database?.isOpen) database.close();
     if (error?.code?.startsWith("local_unified_index_")) throw error;
     throw fixedError("local_unified_index_unavailable");
@@ -2016,6 +2502,11 @@ export function createUnifiedIndexWriter(database, {
     },
 
     deleteSourceFacts(sourceLocalKey, sessionLocalKey = null) {
+      // Source cleanup touches every large fact table and may probe canonical
+      // quota ownership once per affected observation. Schema v11 makes the
+      // supporting secondary indexes a precondition so no caller can
+      // accidentally reintroduce an unbounded scan on a deferred-index stage.
+      assertSecondaryIndexes(database);
       begin();
       const affectedQuotaIds = statements.affectedQuotaForSource
         .all(sourceLocalKey).map((row) => Number(row.id));
@@ -2514,10 +3005,33 @@ export function createUnifiedIndexWriter(database, {
  * fsynced first, so a crash mid-publish leaves either the old index or the new
  * one, never a torn mixture.
  */
-export async function publishStagedUnifiedIndex(stageFile, indexFile) {
+export async function publishStagedUnifiedIndex(
+  stageFile,
+  indexFile,
+  { allowRecoveryLock = false, signal = null } = {},
+) {
+  if (signal !== null
+      && (typeof signal !== "object" || typeof signal.aborted !== "boolean")) {
+    throw new TypeError("signal must be an AbortSignal or null");
+  }
+  if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+  if (!allowRecoveryLock) assertLocalUnifiedIndexRecoveryUnlocked(indexFile);
   await chmod(stageFile, 0o600);
   await syncFile(stageFile);
+  // A rebuild close can be entirely synchronous. Yield once after the durable
+  // stage fsync so an already-queued cancellation becomes observable before
+  // final target validation; never yield after validation or the signal check.
+  await new Promise((resolvePromise) => setImmediate(resolvePromise));
+  if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+  if (!allowRecoveryLock) assertLocalUnifiedIndexRecoveryUnlocked(indexFile);
   await assertSafeLocalUnifiedIndexTarget(indexFile, { allowMissing: true });
+  // Target validation yields to the event loop. Recovery can acquire its lock
+  // while that validation is in flight, so re-check exclusion after the await
+  // and adjacent to the atomic rename. No asynchronous boundary remains after
+  // this cancellation/lock pair; neither an abort nor a newly acquired recovery
+  // lock can therefore be missed because target verification was suspended.
+  if (signal?.aborted) throw fixedError("local_unified_index_aborted");
+  if (!allowRecoveryLock) assertLocalUnifiedIndexRecoveryUnlocked(indexFile);
   await rename(stageFile, indexFile);
   try {
     await syncDirectoryPath(dirname(resolve(indexFile)));
@@ -2542,9 +3056,349 @@ export async function removeIfPresent(path) {
   }
 }
 
+// Cooperative abort removes its own stage. A hard worker termination cannot
+// run that catch path, so a bounded scanner reclaims only old, exact stage
+// names whose process/attempt owner is proven inactive.
+export const LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_MIN_AGE_MS =
+  2 * 60 * 60_000;
+export const LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_SCAN_LIMIT = 64;
+const LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN = /^[0-9a-f]{32}$/u;
+
+function localUnifiedIndexStageOwner(name, indexName) {
+  for (const kind of ["building", "incremental"]) {
+    const prefix = `${indexName}.${kind}-`;
+    if (!name.startsWith(prefix)) continue;
+    const match = /^([1-9][0-9]*)-([0-9a-z]+)$/u.exec(
+      name.slice(prefix.length),
+    );
+    if (match === null) return null;
+    const pid = Number(match[1]);
+    return Number.isSafeInteger(pid)
+      ? {
+        pid,
+        attemptToken: LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN.test(match[2])
+          ? match[2]
+          : null,
+      }
+      : null;
+  }
+  return null;
+}
+
+function processAppearsAlive(pid) {
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
+// A filename cursor must re-enumerate from the beginning to discover that its
+// remembered entry was deleted. Retain the bounded directory stream itself so
+// every pass performs at most scanLimit raw reads and resumes at the next OS
+// directory entry. The product owns one index; the cap only contains injected
+// callers/tests and every handle is closed at EOF or eviction.
+const abandonedStageDirectoryScans = new Map();
+const MAX_ABANDONED_STAGE_DIRECTORY_SCANS = 64;
+
+async function closeAbandonedStageDirectoryScan(indexFile, state) {
+  if (abandonedStageDirectoryScans.get(indexFile) === state) {
+    abandonedStageDirectoryScans.delete(indexFile);
+  }
+  try {
+    await state.handle.close();
+  } catch {
+    // A directory stream can already be closed after an iteration/read error.
+  }
+}
+
+async function abandonedStageDirectoryScan(
+  directory,
+  indexFile,
+  scanLimit,
+  openDirectory,
+  directoryChain,
+) {
+  let state = abandonedStageDirectoryScans.get(indexFile) ?? null;
+  if (state !== null
+      && (state.directory !== directory
+        || state.openDirectory !== openDirectory
+        || !sameLocalUnifiedIndexDirectoryChain(
+          state.directoryChain,
+          directoryChain,
+        ))) {
+    await closeAbandonedStageDirectoryScan(indexFile, state);
+    state = null;
+  }
+  if (state === null) {
+    let handle;
+    try {
+      handle = await openDirectory(directory, {
+        bufferSize: Math.min(scanLimit, 32),
+      });
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    }
+    state = { directory, directoryChain, handle, openDirectory };
+    abandonedStageDirectoryScans.set(indexFile, state);
+    while (abandonedStageDirectoryScans.size
+        > MAX_ABANDONED_STAGE_DIRECTORY_SCANS) {
+      const oldestIndexFile = abandonedStageDirectoryScans.keys().next().value;
+      const oldest = abandonedStageDirectoryScans.get(oldestIndexFile);
+      await closeAbandonedStageDirectoryScan(oldestIndexFile, oldest);
+    }
+  } else {
+    // Map insertion order is the eviction order; touching a live scan keeps it
+    // from being evicted by unrelated injected index paths.
+    abandonedStageDirectoryScans.delete(indexFile);
+    abandonedStageDirectoryScans.set(indexFile, state);
+  }
+  return state;
+}
+
+async function rotatingLocalUnifiedIndexStageNames(
+  directory,
+  indexFile,
+  indexName,
+  scanLimit,
+  openDirectory,
+  directoryChain,
+) {
+  const state = await abandonedStageDirectoryScan(
+    directory,
+    indexFile,
+    scanLimit,
+    openDirectory,
+    directoryChain,
+  );
+  if (state === null) return null;
+  const selected = [];
+  for (let enumerated = 0; enumerated < scanLimit; enumerated += 1) {
+    let entry;
+    try {
+      entry = await state.handle.read();
+    } catch (error) {
+      await closeAbandonedStageDirectoryScan(indexFile, state);
+      if (error?.code === "ENOENT") return null;
+      throw error;
+    }
+    if (entry === null) {
+      await closeAbandonedStageDirectoryScan(indexFile, state);
+      break;
+    }
+    const name = entry.name;
+    if (localUnifiedIndexStageOwner(name, indexName) === null) continue;
+    selected.push(name);
+  }
+  return selected;
+}
+
+/**
+ * Remove only the two stage names an exact, confirmed-terminated off-main
+ * attempt could own. The unguessable token, current PID, safe directory chain,
+ * and owner-only single-link file checks make this narrower than an abandoned
+ * stage scan; anything uncertain is retained for later diagnosis.
+ */
+export async function removeExactLocalUnifiedIndexAttemptStages(
+  indexFile,
+  attemptToken,
+) {
+  if (typeof indexFile !== "string" || indexFile.length < 1) {
+    throw new TypeError("indexFile must be a non-empty string");
+  }
+  if (typeof attemptToken !== "string"
+      || !LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN.test(attemptToken)) {
+    throw new TypeError("attemptToken must be a 32-character hex token");
+  }
+  const resolvedIndexFile = resolve(indexFile);
+  const directoryChain = assertSafeLocalUnifiedIndexParentPath(
+    resolvedIndexFile,
+  );
+  let inspected = 0;
+  let removed = 0;
+  let skipped = 0;
+  for (const kind of ["building", "incremental"]) {
+    const candidate = `${resolvedIndexFile}.${kind}-${process.pid}-${attemptToken}`;
+    let metadata;
+    try {
+      metadata = await lstat(candidate);
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      skipped += 1;
+      continue;
+    }
+    inspected += 1;
+    if (!ownerOnlyRegularFile(metadata)) {
+      skipped += 1;
+      continue;
+    }
+    let verified;
+    try {
+      recheckLocalUnifiedIndexDirectoryChain(
+        resolvedIndexFile,
+        directoryChain,
+      );
+      verified = await lstat(candidate);
+      recheckLocalUnifiedIndexDirectoryChain(
+        resolvedIndexFile,
+        directoryChain,
+      );
+    } catch {
+      skipped += 1;
+      continue;
+    }
+    if (!sameLocalUnifiedIndexTarget(metadata, verified)) {
+      skipped += 1;
+      continue;
+    }
+    try {
+      await unlink(candidate);
+      removed += 1;
+    } catch (error) {
+      if (error?.code !== "ENOENT") skipped += 1;
+    }
+  }
+  return Object.freeze({ inspected, removed, skipped });
+}
+
+export async function removeAbandonedLocalUnifiedIndexStages(
+  indexFile,
+  {
+    nowMs = Date.now(),
+    minimumAgeMs = LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_MIN_AGE_MS,
+    scanLimit = LOCAL_UNIFIED_INDEX_ABANDONED_STAGE_SCAN_LIMIT,
+    platform = process.platform,
+    isProcessAlive = processAppearsAlive,
+    activeAttemptToken = null,
+    openDirectory = opendir,
+  } = {},
+) {
+  if (typeof indexFile !== "string" || indexFile.length < 1) {
+    throw new TypeError("indexFile must be a non-empty string");
+  }
+  if (!Number.isFinite(nowMs) || !Number.isFinite(minimumAgeMs)
+      || minimumAgeMs < 60_000) {
+    throw new TypeError("abandoned stage age is invalid");
+  }
+  if (!Number.isSafeInteger(scanLimit) || scanLimit < 1 || scanLimit > 256) {
+    throw new TypeError("abandoned stage scan limit is invalid");
+  }
+  if (typeof isProcessAlive !== "function") {
+    throw new TypeError("isProcessAlive must be a function");
+  }
+  if (typeof openDirectory !== "function") {
+    throw new TypeError("openDirectory must be a function");
+  }
+  if (activeAttemptToken !== null
+      && (typeof activeAttemptToken !== "string"
+        || !LOCAL_UNIFIED_INDEX_ATTEMPT_TOKEN_PATTERN.test(activeAttemptToken))) {
+    throw new TypeError(
+      "activeAttemptToken must be null or a 32-character hex token",
+    );
+  }
+  // Windows state remains behind its separately qualified native capability.
+  if (platform === "win32") {
+    return Object.freeze({ inspected: 0, removed: 0, skipped: 0 });
+  }
+
+  const resolvedIndexFile = resolve(indexFile);
+  const directory = dirname(resolvedIndexFile);
+  const indexName = basename(resolvedIndexFile);
+  const directoryChain = assertSafeLocalUnifiedIndexParentPath(
+    resolvedIndexFile,
+  );
+  const names = await rotatingLocalUnifiedIndexStageNames(
+    directory,
+    resolvedIndexFile,
+    indexName,
+    scanLimit,
+    openDirectory,
+    directoryChain,
+  );
+  if (names === null) {
+    return Object.freeze({ inspected: 0, removed: 0, skipped: 0 });
+  }
+
+  let inspected = 0;
+  let removed = 0;
+  let skipped = 0;
+  for (const name of names) {
+    inspected += 1;
+    const owner = localUnifiedIndexStageOwner(name, indexName);
+    const pid = owner?.pid ?? null;
+    const candidate = resolve(directory, name);
+    if (pid === null || dirname(candidate) !== directory) {
+      skipped += 1;
+      continue;
+    }
+    let metadata;
+    try {
+      recheckLocalUnifiedIndexDirectoryChain(
+        resolvedIndexFile,
+        directoryChain,
+      );
+      metadata = await lstat(candidate);
+      recheckLocalUnifiedIndexDirectoryChain(
+        resolvedIndexFile,
+        directoryChain,
+      );
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      skipped += 1;
+      continue;
+    }
+    if (!ownerOnlyRegularFile(metadata)
+        || !Number.isFinite(metadata.mtimeMs)
+        || nowMs - metadata.mtimeMs < minimumAgeMs) {
+      skipped += 1;
+      continue;
+    }
+    const ownerIsAlive = owner.attemptToken !== null
+      && pid === process.pid
+      && activeAttemptToken !== null
+      ? owner.attemptToken === activeAttemptToken
+      : isProcessAlive(pid);
+    if (ownerIsAlive) {
+      skipped += 1;
+      continue;
+    }
+    let verified;
+    try {
+      recheckLocalUnifiedIndexDirectoryChain(
+        resolvedIndexFile,
+        directoryChain,
+      );
+      verified = await lstat(candidate);
+      recheckLocalUnifiedIndexDirectoryChain(
+        resolvedIndexFile,
+        directoryChain,
+      );
+    } catch {
+      skipped += 1;
+      continue;
+    }
+    if (!sameLocalUnifiedIndexTarget(metadata, verified)) {
+      skipped += 1;
+      continue;
+    }
+    try {
+      await unlink(candidate);
+      removed += 1;
+    } catch (error) {
+      if (error?.code !== "ENOENT") skipped += 1;
+    }
+  }
+  return Object.freeze({ inspected, removed, skipped });
+}
+
 const EMPTY_INSPECTION = Object.freeze({
   status: "missing",
   schemaVersion: null,
+  userVersion: null,
+  compatibility: null,
   usageEvents: 0,
   quotaObservations: 0,
   toolClassRows: 0,
@@ -2568,6 +3422,7 @@ export async function inspectLocalUnifiedIndex({
   let database;
   try {
     database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    const compatibility = readLocalUnifiedIndexCompatibility(database);
     const usage = database.prepare(`
       SELECT COUNT(*) AS events,
              COUNT(DISTINCT session_local) AS sessions,
@@ -2587,6 +3442,8 @@ export async function inspectLocalUnifiedIndex({
     return {
       status: "available",
       schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+      userVersion: compatibility.userVersion,
+      compatibility,
       usageEvents: Number(usage?.events ?? 0),
       quotaObservations: Number(
         database.prepare("SELECT COUNT(*) AS c FROM quota_observation").get()?.c ?? 0,

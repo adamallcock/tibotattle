@@ -22,6 +22,7 @@
  * mirror update.
  */
 import { createPublicKey, verify } from "node:crypto";
+import { isAppleMacOSBundleVersion } from "./macos-bundle-version.js";
 
 /**
  * Mirrors `trailer` in parseOfficialSignedSparkleAppcast
@@ -35,8 +36,6 @@ export const SPARKLE_SIGNED_FEED_TRAILER_PATTERN = /<!-- sparkle-signatures:\ned
  */
 export const OFFICIAL_SIGNED_SPARKLE_APPCAST_PATTERN = /^<\?xml version="1\.0" standalone="yes"\?><!-- sparkle-sign-warning:\n[^\u0000\r]*?--><rss xmlns:sparkle="http:\/\/www\.andymatuschak\.org\/xml-namespaces\/sparkle" version="2\.0">\s*<channel>\s*<title>([^<&\r\n]{1,128})<\/title>\s*<item>\s*<title>([^<&\r\n]{1,64})<\/title>\s*<pubDate>([^<&\r\n]{1,64})<\/pubDate>\s*<sparkle:version>([^<&\r\n]{1,32})<\/sparkle:version>\s*<sparkle:shortVersionString>([^<&\r\n]{1,32})<\/sparkle:shortVersionString>\s*<sparkle:minimumSystemVersion>([0-9]+(?:\.[0-9]+){1,2})<\/sparkle:minimumSystemVersion>\s*<sparkle:hardwareRequirements>arm64<\/sparkle:hardwareRequirements>\s*<enclosure\b([^>]*?)>\s*<\/enclosure\s*>\s*<\/item>\s*<\/channel>\s*<\/rss>$/u;
 
-const BUNDLE_VERSION_PATTERN =
-  /^(?:0|[1-9][0-9]{0,8})(?:\.(?:0|[1-9][0-9]{0,8})){0,2}$/u;
 const SHORT_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/u;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 const SAFE_ARTIFACT_FILE_NAME_PATTERN =
@@ -286,7 +285,7 @@ export function validateSignedSparkleFeed({
     minimumSystemVersion,
     attributeSource,
   ] = official;
-  if (!BUNDLE_VERSION_PATTERN.test(bundleVersion ?? "")
+  if (!isAppleMacOSBundleVersion(bundleVersion)
       || !SHORT_VERSION_PATTERN.test(shortVersion ?? "")) {
     fail(
       "Signed appcast bundle or short version is not canonical",

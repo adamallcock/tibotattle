@@ -34,9 +34,19 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-This section combines direct post-v0.1.16 work with merged pull requests through
-[PR #78](https://github.com/adamallcock/tibotattle/pull/78), audited against
-`main` commit `52399658f28303f6af00259f921c2c46a881978f` on 2026-08-27. The
+**Candidate notes:** [0.1.17](./release-notes/0.1.17.md)
+
+This candidate section combines direct post-v0.1.16 work with merged pull
+requests through [PR #78](https://github.com/adamallcock/tibotattle/pull/78), audited on
+2026-08-27. PRs #73 and #74 are not part of this native macOS candidate. PR #75
+is not merged wholesale; a native subset of its menu-bar and weekly-pace work
+is ported without its Electron or multi-root changes. Separately, this candidate
+advances the local index to schema 11 only for the measured cleanup-index fix;
+it does not import PR #75's broader schema work. The candidate does not include
+the Electron application or unfinished Claude Code usage-monitoring integration
+work. Claude-related carryover is limited to dormant local/export compatibility
+scaffolding already on `main` and removal of the inactive quota route; 0.1.17
+does not collect, display, or claim Claude Code usage. The
 [merged-main comparison](https://github.com/adamallcock/tibotattle/compare/v0.1.16...main)
 is the public branch-history view; PR links identify reviewed merges, while
 unlinked items are direct commits. Nothing in this section is a
@@ -44,12 +54,14 @@ published-release claim.
 
 ### Added
 
-- Adds admin metrics history with daily sparklines, 24-hour deltas, allowance
-  lineage, and plan cohort filters
+- Adds admin metrics history with daily sparklines, 24-hour deltas, cached
+  history, allowance lineage, plan cohort filters, and alert controls
   ([PR #67](https://github.com/adamallcock/tibotattle/pull/67),
   [PR #68](https://github.com/adamallcock/tibotattle/pull/68)).
 - Adds a dedicated admin Plan cohorts card with current headcount and measured
-  allowance capacity per plan.
+  allowance capacity per plan, plus plan-scoped merge previews
+  ([PR #67](https://github.com/adamallcock/tibotattle/pull/67),
+  [PR #68](https://github.com/adamallcock/tibotattle/pull/68)).
 - Adds native progress and boot-state feedback while the local dashboard becomes
   ready ([PR #58](https://github.com/adamallcock/tibotattle/pull/58),
   [PR #59](https://github.com/adamallcock/tibotattle/pull/59)).
@@ -69,11 +81,50 @@ published-release claim.
 - Adds maintained architecture, privacy/data, API, CLI, schema, platform,
   operations, recovery, status, and user documentation; removes superseded
   planning and status prose from the active tree.
+- Adds a native left-click menu-bar popover with current Five-hour and seven-day
+  allowance lanes, fail-closed 7/30-day usage history, and a weekly pace outlook;
+  right-click and Control-click retain the native actions menu (native subset of
+  [PR #75](https://github.com/adamallcock/tibotattle/pull/75)).
 
 ### Changed
 
 - Declares external participation accurately in production and removes two
   retired admin cards that permanently reported zero.
+- Bounds the resident legacy archive projection independently from the
+  short-lived rebuild process, avoiding an inherited multi-gigabyte memory
+  allowance during fallback accounting
+  ([PR #49](https://github.com/adamallcock/tibotattle/pull/49)).
+- Supports Codex's valid paginated and reverted multi-rollout thread lineage
+  without dropping or double-counting retained history
+  ([PR #65](https://github.com/adamallcock/tibotattle/pull/65)).
+- Keeps new or unreviewed Codex thread-source labels privacy-safe and adds the
+  selected Codex binary and version to `usage-monitor doctor`
+  ([PR #69](https://github.com/adamallcock/tibotattle/pull/69)).
+- Synchronizes Codex plan and quota contracts, including human-readable plan
+  names, the Five-hour allowance label, and distinct observed quota pools
+  ([PR #71](https://github.com/adamallcock/tibotattle/pull/71)).
+- Completes the API lifecycle cleanup by removing the retired Cloud Run/GCS
+  experiment, unused hosted and loopback surfaces, the inactive automatic
+  contribution scheduler, and the unfinished Claude quota route while retaining
+  the reviewed local-native, Worker, export, and direct-report boundaries
+  ([PR #78](https://github.com/adamallcock/tibotattle/pull/78)).
+- Recognizes the schema-8 index shipped by 0.1.16 and supported pre-release
+  schema-9 state after a read-only compatibility preflight, then rebuilds a
+  schema-11 stage from readable raw history because those formats predate the
+  current source-identity contract. A schema-10 index instead receives the
+  additive schema-11 cleanup indexes on a staged copy without rescanning its
+  sources. Neither path replaces the live index until validation succeeds.
+  This build refuses a newer schema before mutation and reports it as
+  unavailable rather than empty.
+- Makes the rollback boundary explicit: after migration to schema 10 or 11, do
+  not reopen the index with 0.1.16. That shipped binary lacks the typed read-only
+  refusal and may touch SQLite journal mode before rejecting the schema.
+- Persists the last authoritative dashboard snapshot across launch, keeping
+  verified retained figures visible and labelled while fresh analysis advances.
+- Moves macOS unified-index work off the loopback event loop, uses the existing
+  bounded parallel rebuild for a missing index, and forwards strict content-free
+  file progress so health, status, and cancellation remain responsive during a
+  large first pass.
 - Releases the native readiness gate after the primary dashboard render instead
   of waiting for every secondary load ([PR #60](https://github.com/adamallcock/tibotattle/pull/60)).
 - Makes Codex `thread_source` a compatibility and attribution signal without
@@ -93,6 +144,24 @@ published-release claim.
   ([PR #57](https://github.com/adamallcock/tibotattle/pull/57)).
 - Replaces misleading loading warnings when retained figures remain visible
   during a recalculation.
+- Retains valid usage, tool, and quota facts when one provider quota window is
+  malformed, while withholding that invalid observation with an explicit
+  diagnostic rather than presenting it as zero.
+- Accepts a selected paginated Codex replacement that begins a new segment
+  without `history_base`, and clears the replaced lineage snapshot set before
+  later forks are evaluated.
+- Presents verified partial history as a quieter coverage limitation and keeps
+  the compact toolbar badge separate from the in-page progress panel; hard
+  refresh failures retain the error treatment.
+- Defers cleanup of a source rejected late in a fresh rebuild until the required
+  indexes exist, preventing repeated full-table scans from consuming the cold
+  build's safety window.
+- Replaces the unconditional “Headline ready” refresh claim with neutral local
+  summary/progress copy, and keeps native and browser polling attached through
+  the bounded fresh-index build window.
+- Keeps cancellation and timeout terminal handling from starting another full
+  data-store reload, preserves the last published generation, and reclaims only
+  old, exactly identified abandoned staging files on a later safe retry.
 - Prevents network-path requests from turning the canonical-host redirect into
   an external redirect.
 - Opens the Share card from its macOS toolbar control
@@ -118,6 +187,22 @@ published-release claim.
 
 - Verifies that the rendered social preview is the exact asset selected for the
   release ([PR #52](https://github.com/adamallcock/tibotattle/pull/52)).
+- Adds checked-in, provenance-linked release notes and changelog validation
+  ([PR #66](https://github.com/adamallcock/tibotattle/pull/66)).
+- Adds a release-gated drift check for the reviewed Codex plan and quota
+  contracts ([PR #71](https://github.com/adamallcock/tibotattle/pull/71)).
+- Adds an explicit copy-first prepare/apply recovery path for a local unified
+  index that cannot be migrated normally; recovery validates an isolated copy
+  before any replacement is offered.
+- Gives Preview its own app, bundle, semantic-open, local-state, Keychain,
+  preferences, and Sparkle-feed identities, preventing preview installation or
+  updates from replacing stable state.
+- Allocates build 1023 to the 0.1.17 internal-dogfood candidate and build 1024
+  to stable, and requires a clean checkout with exactly one matching annotated
+  channel tag at `HEAD` before signed release tooling can proceed.
+- Establishes scoped, machine-checked repository guidance for coding agents and
+  the root layout they may extend
+  ([PR #77](https://github.com/adamallcock/tibotattle/pull/77)).
 
 ### Related open issues
 

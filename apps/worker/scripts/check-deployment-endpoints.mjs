@@ -290,7 +290,7 @@ export function validateDeploymentEndpointConsumers({
   if (MACOS_PREVIEW_PUBLIC_CONFIGURATION.centralOrigin
       !== endpoints.public.origin
       || MACOS_PREVIEW_PUBLIC_CONFIGURATION.sparkleAppcastURL
-        !== endpoints.sparkle.appcastURL) {
+        !== endpoints.sparkle.previewAppcastURL) {
     fail("macOS preview defaults must match config/deployment-endpoints.js");
   }
   if (APPROVED_R2_BUCKET !== endpoints.sparkle.r2Bucket
@@ -323,6 +323,7 @@ export function validateDeploymentEndpointConsumers({
   }
   return Object.freeze({
     appcastURL: endpoints.sparkle.appcastURL,
+    previewAppcastURL: endpoints.sparkle.previewAppcastURL,
     publicOrigin: endpoints.public.origin,
     r2Bucket: endpoints.sparkle.r2Bucket,
   });

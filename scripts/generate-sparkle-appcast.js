@@ -76,6 +76,10 @@ import {
   SPARKLE_TOOLS_DIRECTORY_NAME,
   inspectPinnedSparkleTools,
 } from "./macos-updater-core.js";
+import {
+  compareAppleMacOSBundleVersions,
+  isAppleMacOSBundleVersion,
+} from "./macos-bundle-version.js";
 import { resolveReleaseChannel } from "../config/release-channels.js";
 import { validateCandidateAppcastShape } from "./publish-sparkle-update.js";
 import { validateSignedSparkleFeed } from "./sparkle-signed-feed-validation.js";
@@ -96,8 +100,6 @@ export const DEFAULT_MAX_DELTAS = 2;
 export const FULL_ENCLOSURE_CONTENT_TYPE = "application/x-apple-diskimage";
 export const DELTA_ENCLOSURE_CONTENT_TYPE = "application/octet-stream";
 
-const BUNDLE_VERSION_PATTERN =
-  /^(?:0|[1-9][0-9]{0,8})(?:\.(?:0|[1-9][0-9]{0,8})){0,2}$/u;
 const SAFE_DMG_FILE_NAME_PATTERN =
   /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.dmg$/u;
 const SAFE_DELTA_FILE_NAME_PATTERN =
@@ -135,13 +137,11 @@ function sha256(value) {
 }
 
 function compareBundleVersions(left, right) {
-  const leftParts = left.split(".").map(Number).concat([0, 0]).slice(0, 3);
-  const rightParts = right.split(".").map(Number).concat([0, 0]).slice(0, 3);
-  for (let index = 0; index < 3; index += 1) {
-    if (leftParts[index] < rightParts[index]) return -1;
-    if (leftParts[index] > rightParts[index]) return 1;
+  const comparison = compareAppleMacOSBundleVersions(left, right);
+  if (comparison === null) {
+    fail("Sparkle bundle version is not Apple-compatible");
   }
-  return 0;
+  return comparison;
 }
 
 function runTool(path, toolArguments, { label, timeout }) {
@@ -271,8 +271,7 @@ export async function readAppBundleVersion(appPath) {
   } catch {
     fail(`App bundle Info.plist is not readable: ${plistPath}`);
   }
-  if (typeof plist?.CFBundleVersion !== "string"
-      || !BUNDLE_VERSION_PATTERN.test(plist.CFBundleVersion)) {
+  if (!isAppleMacOSBundleVersion(plist?.CFBundleVersion)) {
     fail(`App bundle Info.plist has an invalid CFBundleVersion: ${plistPath}`);
   }
   return plist.CFBundleVersion;
@@ -398,7 +397,7 @@ export async function discoverRetainedVersions({
   const versions = [];
   for (const entry of entries) {
     if (entry.name.startsWith(".")) continue;
-    if (!entry.isDirectory() || !BUNDLE_VERSION_PATTERN.test(entry.name)) {
+    if (!entry.isDirectory() || !isAppleMacOSBundleVersion(entry.name)) {
       fail(
         `Retained archive contains an unexpected entry: ${join(channelDirectory, entry.name)}; repair or delete it`,
         "SPARKLE_APPCAST_RETAINED_ARCHIVE_INVALID",
@@ -466,7 +465,7 @@ export async function retainCandidateArchive({
   const entries = (await readdir(channelDirectory, { withFileTypes: true }))
     .filter((entry) => entry.isDirectory()
       && !entry.name.startsWith(".")
-      && BUNDLE_VERSION_PATTERN.test(entry.name))
+      && isAppleMacOSBundleVersion(entry.name))
     .map((entry) => entry.name)
     .sort((left, right) => compareBundleVersions(right, left));
   const pruned = entries.slice(maxRetained);
@@ -703,8 +702,8 @@ export function parseGenerateSparkleAppcastArguments(argv) {
       fail(`${flag} is required`);
     }
   }
-  if (!BUNDLE_VERSION_PATTERN.test(options.bundleVersion)) {
-    fail("--bundle-version must contain one to three decimal components");
+  if (!isAppleMacOSBundleVersion(options.bundleVersion)) {
+    fail("--bundle-version must be an Apple-compatible CFBundleVersion");
   }
   if (options.shortVersion !== null
       && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(options.shortVersion)) {

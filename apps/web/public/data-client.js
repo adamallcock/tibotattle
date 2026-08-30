@@ -3547,9 +3547,95 @@ function normalizeAllowanceCapacityScenario(value, scenario) {
   };
 }
 
+const LOCAL_ACCOUNTING_PROJECTION_REASONS = new Set([
+  "cache_accounting_semantics_outdated",
+  "current_projection_unavailable",
+  "local_unified_index_deferred",
+  "local_unified_index_generation_invalid",
+  "local_unified_index_generation_mismatch",
+  "local_unified_index_missing",
+  "local_unified_index_schema_invalid",
+  "local_unified_index_schema_newer",
+  "local_unified_index_unavailable",
+  "typed_tool_history_partial",
+  "unified_index_generation_incomplete",
+  "unified_index_partial"
+]);
+
+function safeLocalProjectionReason(value, fallback) {
+  return LOCAL_ACCOUNTING_PROJECTION_REASONS.has(value) ? value : fallback;
+}
+
+function normalizeAccountingProjection(value, {
+  allowImplicitDemoProjection = false
+} = {}) {
+  // Only the synthetic demo contract may omit this attestation. Real local
+  // evidence must fail closed: otherwise a mixed-version or truncated
+  // response can turn placeholder zeroes into apparently measured usage.
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    if (!allowImplicitDemoProjection) {
+      return {
+        status: "unavailable",
+        reason: "local_unified_index_unavailable",
+        terminal: true,
+        retainedAt: null,
+        coveredAt: null
+      };
+    }
+    return {
+      status: "available",
+      reason: null,
+      terminal: false,
+      retainedAt: null,
+      coveredAt: null
+    };
+  }
+  const status = ["available", "retained", "unavailable"].includes(value.status)
+    ? value.status
+    : "unavailable";
+  if (status === "available"
+      && value.reason === null
+      && value.terminal === false) {
+    return {
+      status,
+      reason: null,
+      terminal: false,
+      retainedAt: null,
+      coveredAt: null
+    };
+  }
+  // `available` is an attestation, not a display preference. A contradictory
+  // or incomplete attestation must not make placeholder zeroes look like
+  // measured evidence merely because its status string survived validation.
+  if (status === "available") {
+    return {
+      status: "unavailable",
+      reason: "local_unified_index_unavailable",
+      terminal: true,
+      retainedAt: null,
+      coveredAt: null
+    };
+  }
+  const startAt = canonicalInstant(value?.coveredAt?.startAt);
+  const endAt = canonicalInstant(value?.coveredAt?.endAt);
+  return {
+    status,
+    reason: safeLocalProjectionReason(
+      value.reason,
+      "local_unified_index_unavailable"
+    ),
+    terminal: value.terminal === true,
+    retainedAt: canonicalInstant(value.retainedAt),
+    coveredAt: startAt !== null && endAt !== null
+        && Date.parse(startAt) <= Date.parse(endAt)
+      ? { startAt, endAt }
+      : null
+  };
+}
+
 // Staleness provenance attached to projections served from the previous app
 // version's cache while the current rebuild runs. Normalized as a closed
-// shape (flag, semantic version, computed-at, covered span) or null; a block
+// shape (flag, reason, semantic version, computed-at, covered span) or null; a block
 // missing its identity is dropped rather than shown as an unlabeled serve.
 function normalizeStaleProvenance(value) {
   if (value?.stale !== true) return null;
@@ -3558,12 +3644,50 @@ function normalizeStaleProvenance(value) {
   if (schemaVersion === "" || computedAt === "") return null;
   return {
     stale: true,
+    reason: safeLocalProjectionReason(
+      value.reason,
+      "cache_accounting_semantics_outdated"
+    ),
     schemaVersion,
     computedAt,
     coveredAt: {
       startAt: text(value.coveredAt?.startAt, ""),
       endAt: text(value.coveredAt?.endAt, "")
     }
+  };
+}
+
+function normalizeTimelineHistory(value) {
+  const status = ["complete", "partial", "loading", "unavailable"]
+    .includes(value?.status)
+    ? value.status
+    : "unavailable";
+  const reason = status === "complete"
+    ? null
+    : safeLocalProjectionReason(
+      value?.reason,
+      status === "loading"
+        ? "local_unified_index_deferred"
+        : "local_unified_index_unavailable"
+    );
+  const startAt = canonicalInstant(value?.coveredAt?.startAt);
+  const endAt = canonicalInstant(value?.coveredAt?.endAt);
+  const evidenceAvailable = ["complete", "partial"].includes(status);
+  return {
+    status,
+    reason,
+    source: text(value?.source, ""),
+    coveredAt: startAt !== null && endAt !== null
+        && Date.parse(startAt) <= Date.parse(endAt)
+      ? { startAt, endAt }
+      : null,
+    generatedAt: canonicalInstant(value?.generatedAt),
+    usageEvents: evidenceAvailable ? count(value?.usageEvents, null) : null,
+    sourceCount: evidenceAvailable ? count(value?.sourceCount, null) : null,
+    indexBytes: evidenceAvailable ? count(value?.indexBytes, null) : null,
+    boundedDays: status === "unavailable"
+      ? count(value?.boundedDays, null)
+      : null
   };
 }
 
@@ -3666,7 +3790,8 @@ function normalizeLocalTimeline(value = {}) {
     usage,
     calibrationUsage,
     allowanceCapacity: normalizeAllowanceCapacity(value.allowanceCapacity),
-    quota
+    quota,
+    history: normalizeTimelineHistory(value.history)
   };
 }
 
@@ -4609,7 +4734,9 @@ function normalizeStaleAccountingServe(value) {
   return { ...provenance, periods };
 }
 
-function normalizeLocalAccounting(value = {}) {
+function normalizeLocalAccounting(value = {}, {
+  allowImplicitDemoProjection = false
+} = {}) {
   const models = normalizeLocalModelUsage(value.byModel);
   // Both allowance tracks in one list, each row stating which track it belongs
   // to. The local report already publishes this; dropping it here is what left
@@ -4618,6 +4745,9 @@ function normalizeLocalAccounting(value = {}) {
     ? normalizeLocalModelUsage(value.modelUsage)
     : [...models, ...normalizeLocalModelUsage(value?.spark?.byModel)];
   const normalized = {
+    projection: normalizeAccountingProjection(value.projection, {
+      allowImplicitDemoProjection
+    }),
     periodId: ["24h", "7d", "30d", "all", "history"].includes(value.periodId)
       ? value.periodId
       : "all",
@@ -4690,13 +4820,27 @@ function normalizeLocalAccounting(value = {}) {
       ),
       unattributedEvents: count(value?.accountAttribution?.unattributedEvents, 0)
     },
-    toolClasses: {
-      total: count(value?.toolClasses?.total, 0),
-      counts: Object.fromEntries(
-        ["apply_patch", "local_shell", "other", "subagent", "tool_gateway"]
-          .map((key) => [key, count(value?.toolClasses?.counts?.[key], 0)])
-      )
-    },
+    toolClasses: value?.toolClasses?.status === "unavailable"
+      ? {
+        status: "unavailable",
+        reason: value.toolClasses.reason === "typed_tool_history_partial"
+          ? "typed_tool_history_partial"
+          : "unified_usage_projection_unavailable",
+        total: null,
+        counts: Object.fromEntries(
+          ["apply_patch", "local_shell", "other", "subagent", "tool_gateway"]
+            .map((key) => [key, null])
+        )
+      }
+      : {
+        status: "available",
+        reason: null,
+        total: count(value?.toolClasses?.total, 0),
+        counts: Object.fromEntries(
+          ["apply_patch", "local_shell", "other", "subagent", "tool_gateway"]
+            .map((key) => [key, count(value?.toolClasses?.counts?.[key], 0)])
+        )
+      },
     apiPriceCounterfactualTier: value.apiPriceCounterfactualTier === "standard"
       ? "standard"
       : "unknown",
@@ -4836,6 +4980,11 @@ function normalizeHistoryCoverage(value = {}) {
     "archive_disk_space",
     "archive_storage_unavailable",
     "archive_index_unavailable",
+    "local_unified_index_generation_invalid",
+    "local_unified_index_missing",
+    "local_unified_index_schema_invalid",
+    "local_unified_index_schema_newer",
+    "local_unified_index_unavailable",
   ].includes(value?.errorCode)
     ? value.errorCode
     : null;
@@ -5295,7 +5444,9 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
       }
     },
     timeline: normalizeLocalTimeline(overview?.timeline),
-    accounting: normalizeLocalAccounting(overview?.accounting),
+    accounting: normalizeLocalAccounting(overview?.accounting, {
+      allowImplicitDemoProjection: mode === "demo"
+    }),
     monitoringGaps: normalizeMonitoringGaps(overview?.monitoringGaps),
     artifactStatus: {
       gradient: {

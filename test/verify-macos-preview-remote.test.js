@@ -13,7 +13,8 @@ import {
   writeMacOSPreviewRemoteReceipt,
 } from "../scripts/verify-macos-preview-remote.js";
 
-const APP_PATH = "/tmp/TiboTattle.app";
+const APP_PATH = "/tmp/TiboTattle Preview.app";
+const STABLE_APP_PATH = "/tmp/TiboTattle.app";
 const BUNDLE_VERSION = "42";
 const CENTRAL_ORIGIN = "https://central.example.test";
 const APPCAST_URL = "https://updates.example.test/appcast.xml";
@@ -168,7 +169,7 @@ function injectedDependencies(overrides = {}) {
     readBuildManifest: async () => MANIFEST,
     readInfoPlist: async () => PLIST,
     validatePreviewApp: async () => ({
-      bundleIdentifier: "com.usagemonitor.local",
+      bundleIdentifier: "com.usagemonitor.local.preview",
       bundleVersion: BUNDLE_VERSION,
       channel: "preview_distribution",
       updaterEnabled: true,
@@ -233,7 +234,7 @@ test("named stable verification uses policy endpoints and never claims native ac
   const calls = [];
   let inspectedOptions;
   const result = await verifyMacOSPreviewRemote({
-    appPath: APP_PATH,
+    appPath: STABLE_APP_PATH,
     channel: "stable",
     clock: clock(),
     fetchImpl: async (url, options) => {
@@ -253,7 +254,7 @@ test("named stable verification uses policy endpoints and never claims native ac
       return STABLE_POLICY;
     },
     inspectMacOSAppImpl: async (path, options) => {
-      assert.equal(path, APP_PATH);
+      assert.equal(path, STABLE_APP_PATH);
       inspectedOptions = options;
       return {
         bundleIdentifier: "com.usagemonitor.local",
@@ -285,6 +286,49 @@ test("named stable verification uses policy endpoints and never claims native ac
     STABLE_APPCAST_URL,
     STABLE_ARTIFACT_URL,
   ]);
+});
+
+test("named stable verification can observe the exact legacy migration source", async () => {
+  const legacyVersion = "0.1.16";
+  const legacyArtifactURL = STABLE_ARTIFACT_URL.replace(
+    `/${BUNDLE_VERSION}/`,
+    `/${legacyVersion}/`,
+  );
+  const legacyAppcast = STABLE_APPCAST
+    .replaceAll(STABLE_ARTIFACT_URL, legacyArtifactURL)
+    .replaceAll(`sparkle:version="${BUNDLE_VERSION}"`,
+      `sparkle:version="${legacyVersion}"`);
+  const result = await verifyMacOSPreviewRemote({
+    appPath: STABLE_APP_PATH,
+    channel: "stable",
+    clock: clock(),
+    fetchImpl: async (url) => {
+      if (url === `${STABLE_CENTRAL_ORIGIN}/api/health`) {
+        return response(200, '{"status":"ok"}', url, "application/json");
+      }
+      if (url === `${STABLE_CENTRAL_ORIGIN}/api/ready`) {
+        return response(200, '{"status":"ready"}', url, "application/json");
+      }
+      if (url === STABLE_APPCAST_URL) {
+        return response(200, legacyAppcast, url);
+      }
+      if (url === legacyArtifactURL) return artifactResponse(url);
+      assert.fail(`unexpected policy URL: ${url}`);
+    },
+    getReleaseChannelImpl: () => STABLE_POLICY,
+    inspectMacOSAppImpl: async () => ({
+      bundleIdentifier: "com.usagemonitor.local",
+      bundleVersion: legacyVersion,
+    }),
+    live: true,
+    readBuildManifest: async () => STABLE_MANIFEST,
+    readInfoPlist: async () => STABLE_PLIST,
+    remoteFeedPreflight: true,
+  });
+  assert.equal(result.appcast.valid, true);
+  assert.equal(result.appcast.enclosures[0].version, legacyVersion);
+  assert.equal(result.artifact.valid, true);
+  assert.equal(result.remotePublicationReadback.passed, true);
 });
 
 test("named release channels reject endpoint overrides before local or remote work", async () => {

@@ -71,10 +71,9 @@ async function populateCompleteFixture(rootDirectory) {
         "",
         "## [Unreleased]",
         "",
-        "## [1.2.0](./release-notes/1.2.0.md) - 2026-08-23",
+        "**Candidate notes:** [1.2.0](./release-notes/1.2.0.md)",
         "",
-        ...provenanceLines("1.2.0", "1.1.0"),
-        "- Current release.",
+        "- Candidate work remains unreleased.",
         "",
         "## [1.1.0](./release-notes/1.1.0.md) - 2026-08-22",
         "",
@@ -155,8 +154,9 @@ test("the current repository covers every stable tag and package version", async
     true,
   );
   assert.equal(result.noteVersions.length >= 17, true);
-  assert.equal(result.noteVersions.length, result.changelogVersions.length);
+  assert.equal(result.noteVersions.length, result.changelogVersions.length + 1);
   assert.equal(result.noteVersions.includes(result.packageVersion), true);
+  assert.equal(result.changelogVersions.includes(result.packageVersion), false);
 });
 
 test("only the exact protected v0.1.10 anomaly is pinned", () => {
@@ -290,6 +290,39 @@ test("release preparation covers the package version before its tag exists", asy
     });
     assert.equal(result.ok, true, formatReleaseNotesReport(result));
     assert.deepEqual(result.stableTagVersions, ["1.1.0"]);
+    assert.deepEqual(result.changelogVersions, ["1.1.0"]);
+    assert.equal(result.noteVersions.includes("1.2.0"), true);
+  });
+});
+
+test("an untagged package candidate cannot claim a dated public release", async () => {
+  await withReleaseFixture(async (rootDirectory) => {
+    await populateCompleteFixture(rootDirectory);
+    const changelogPath = join(rootDirectory, "CHANGELOG.md");
+    const changelog = await readFile(changelogPath, "utf8");
+    await writeFile(
+      changelogPath,
+      changelog.replace(
+        "**Candidate notes:** [1.2.0](./release-notes/1.2.0.md)\n\n- Candidate work remains unreleased.",
+        [
+          "## [1.2.0](./release-notes/1.2.0.md) - 2026-08-23",
+          "",
+          ...provenanceLines("1.2.0", "1.1.0"),
+          "- Premature public claim.",
+        ].join("\n"),
+      ),
+      "utf8",
+    );
+    const result = await checkReleaseNotes({
+      rootDirectory,
+      tagVersions: ["v1.1.0"],
+    });
+    assert.equal(result.ok, false);
+    assert.equal(
+      result.issues.some((entry) =>
+        entry.code === "unpublished_changelog_entry"),
+      true,
+    );
   });
 });
 
@@ -302,8 +335,8 @@ test("missing or drifted release provenance fails closed", async () => {
       changelogPath,
       changelog
         .replace("## Provenance and acknowledgements", "## About releases")
-        .replace("/releases/tag/v1.2.0", "/releases/tag/v9.9.9")
-        .replace("/compare/v1.1.0...v1.2.0", "/compare/v1.0.0...v1.2.0"),
+        .replace("/releases/tag/v1.1.0", "/releases/tag/v9.9.9")
+        .replace("/commits/v1.1.0", "/commits/v1.0.0"),
       "utf8",
     );
     const result = await checkReleaseNotes({
@@ -359,8 +392,7 @@ test("missing historical notes and changelog entries fail closed", async () => {
         "",
         "## [Unreleased]",
         "",
-        "## [1.2.0](./release-notes/1.2.0.md) - 2026-08-23",
-        "",
+        "**Candidate notes:** [1.2.0](./release-notes/1.2.0.md)",
       ].join("\n"),
       "utf8",
     );

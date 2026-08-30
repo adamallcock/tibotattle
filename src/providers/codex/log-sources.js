@@ -496,6 +496,8 @@ export function createCodexLogSources({ filesystem, lineReader }) {
             endByteOffset: rawBase.end_byte_offset,
           }
           : null;
+        const startOrdinalValid = Number.isSafeInteger(record.ordinal)
+          && record.ordinal >= 0;
         return {
           sessionId,
           parentId,
@@ -503,10 +505,8 @@ export function createCodexLogSources({ filesystem, lineReader }) {
           isInlineFork: parentId !== null && historyMode !== "paginated",
           historyMode,
           historyBase,
-          startOrdinal: Number.isSafeInteger(record.ordinal)
-              && record.ordinal >= 0
-            ? record.ordinal
-            : 0,
+          startOrdinal: startOrdinalValid ? record.ordinal : 0,
+          startOrdinalValid,
           surfaceClassification,
         };
       } catch {
@@ -521,6 +521,7 @@ export function createCodexLogSources({ filesystem, lineReader }) {
       historyMode: "legacy",
       historyBase: null,
       startOrdinal: 0,
+      startOrdinalValid: false,
       surfaceClassification: classifySessionSurface(null),
     };
   }
@@ -602,6 +603,7 @@ export function createCodexLogSources({ filesystem, lineReader }) {
           historyMode: "legacy",
           historyBase: null,
           startOrdinal: 0,
+          startOrdinalValid: false,
           surfaceClassification: classifySessionSurface(null),
         }
         : await readRolloutLineage(info.path, {
@@ -922,9 +924,14 @@ export function createCodexLogSources({ filesystem, lineReader }) {
       const groupKey = groupKeyFor(info);
       if (invalidGroupReason.has(groupKey)) continue;
       const base = info.lineage?.historyBase ?? null;
+      const noBaseSegmentReset = base === null
+        && info.lineage?.startOrdinalValid === true
+        && info.lineage.startOrdinal === 0;
       if (info.replacement
           && (info.lineage?.historyMode !== "paginated"
-            || invalidBaseShape(base))) {
+            || (base === null
+              ? !noBaseSegmentReset
+              : invalidBaseShape(base)))) {
         invalidGroupReason.set(groupKey, "codex_rollout_lineage_invalid");
         continue;
       }

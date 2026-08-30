@@ -26,6 +26,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
 import {
+  PREVIEW_PRODUCT_BRAND,
   PRODUCT_BRAND,
   validateStateDirectoryName,
 } from "../config/product-brand.js";
@@ -62,6 +63,7 @@ import {
   collectVerifiedMacOSWebModuleGraph,
   captureMacOSWorkspaceRuntimePackages,
   calculateMacOSSourceInputDigest,
+  deriveMacOSBundleVersion,
   assertMacOSWebModuleInventory,
   assertMacOSWorkspaceRuntimePackageInventory,
   assertMacOSExternalBuildOutputIsFresh,
@@ -88,6 +90,7 @@ import {
   developerIDSignMacOSApp,
   developerIDSignMacOSDMG,
   inspectMacOSApp,
+  isMacOSReleaseSourceTagForChannel,
   packageMacOSDMG,
   prepareMacOSReleaseCandidate,
   readMacOSReleaseSourceProvenance,
@@ -103,6 +106,9 @@ import {
   validateMacOSLoginItemReleaseRehearsal,
 } from "../scripts/macos-release-core.js";
 import {
+  resolveSignedMacOSBundleVersion,
+} from "../scripts/macos-bundle-version.js";
+import {
   parseArguments as parseMacOSDMGArguments,
 } from "../scripts/package-macos-dmg.js";
 import {
@@ -117,8 +123,10 @@ import {
 } from "../apps/macos/reset-local-keychain.js";
 import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
+  deleteExportIdentityKeychainItemByAttributes,
   exportIdentityKeychainAttributeDeleteArguments,
   exportIdentityKeychainAttributeProbeArguments,
+  exportIdentityKeychainItemPresenceByAttributes,
 } from "../src/export-identity-keychain.js";
 import {
   CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_FD_ENV,
@@ -127,6 +135,16 @@ import {
 const REPOSITORY_ROOT = resolve(
   dirname(fileURLToPath(import.meta.url)),
   "..",
+);
+const DERIVED_MACOS_BUNDLE_VERSION = deriveMacOSBundleVersion();
+const INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION =
+  resolveSignedMacOSBundleVersion(
+    RELEASE_VERSION,
+    INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+  );
+const STABLE_SIGNED_BUNDLE_VERSION = resolveSignedMacOSBundleVersion(
+  RELEASE_VERSION,
+  STABLE_RELEASE_CHANNEL,
 );
 const SWIFT_SOURCE = join(
   REPOSITORY_ROOT,
@@ -147,6 +165,34 @@ const MENU_BAR_STATUS_SOURCE = join(
   "macos",
   "Sources",
   "MenuBarStatus.swift",
+);
+const MENU_BAR_POPOVER_SOURCE = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "Sources",
+  "MenuBarPopover.swift",
+);
+const MENU_BAR_POPUP_MODEL_SOURCE = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "Sources",
+  "MenuBarPopupModel.swift",
+);
+const MENU_BAR_PACE_OUTLOOK_SOURCE = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "Sources",
+  "MenuBarPaceOutlook.swift",
+);
+const NATIVE_BRAND_PALETTE_SOURCE = join(
+  REPOSITORY_ROOT,
+  "apps",
+  "macos",
+  "Sources",
+  "NativeBrandPalette.swift",
 );
 const KEYCHAIN_BROKER_SOURCE = join(
   REPOSITORY_ROOT,
@@ -254,6 +300,8 @@ test("reviewed product brand owns the native bundle and semantic-open identity",
     appOpenHost: "open",
     appOpenURL: "usagemonitor://open",
     stateDirectoryName: "Usage Monitor",
+    keychainNamespace: "app-usagemonitor",
+    keychainAccount: "installation",
     monitoredAppDisplayName: "Codex",
     monitoredAppBundleIdentifier: "com.openai.codex",
   });
@@ -261,6 +309,32 @@ test("reviewed product brand owns the native bundle and semantic-open identity",
     PRODUCT_BRAND.appOpenURL,
     `${PRODUCT_BRAND.appOpenScheme}://${PRODUCT_BRAND.appOpenHost}`,
   );
+  assert.equal(Object.isFrozen(PREVIEW_PRODUCT_BRAND), true);
+  assert.deepEqual(PREVIEW_PRODUCT_BRAND, {
+    displayName: "TiboTattle Preview",
+    bundleName: "TiboTattle Preview.app",
+    executableName: "TiboTattle",
+    bundleIdentifier: "com.usagemonitor.local.preview",
+    appOpenScheme: "usagemonitor-preview",
+    appOpenHost: "open",
+    appOpenURL: "usagemonitor-preview://open",
+    stateDirectoryName: "Usage Monitor Preview",
+    keychainNamespace: "app-usagemonitor.preview",
+    keychainAccount: "preview-installation",
+    monitoredAppDisplayName: "Codex",
+    monitoredAppBundleIdentifier: "com.openai.codex",
+  });
+  for (const key of [
+    "bundleName",
+    "bundleIdentifier",
+    "appOpenScheme",
+    "appOpenURL",
+    "stateDirectoryName",
+    "keychainNamespace",
+    "keychainAccount",
+  ]) {
+    assert.notEqual(PREVIEW_PRODUCT_BRAND[key], PRODUCT_BRAND[key], key);
+  }
 });
 
 test("state directory branding rejects filesystem aliases", () => {
@@ -271,6 +345,78 @@ test("state directory branding rejects filesystem aliases", () => {
       /Invalid product-brand value: stateDirectoryName/u,
     );
   }
+});
+
+test("native launch binds each bundle ID to one reviewed runtime identity", async () => {
+  const source = await readFile(SWIFT_SOURCE, "utf8");
+  const launchValidation = source.indexOf(
+    "BundledProduct.validateRuntimeIdentity()",
+  );
+  const semanticOpenConstruction = source.indexOf(
+    "let semanticOpenTarget = SemanticOpenTarget(",
+    launchValidation,
+  );
+  const keychainBrokerSmoke = source.indexOf(
+    'if arguments.contains("--keychain-broker-contract-smoke-test")',
+    launchValidation,
+  );
+  assert.notEqual(launchValidation, -1);
+  assert.equal(keychainBrokerSmoke > launchValidation, true);
+  assert.equal(semanticOpenConstruction > launchValidation, true);
+
+  assert.match(
+    source,
+    /case "com\.usagemonitor\.local":[\s\S]*?"TiboTattle"[\s\S]*?"usagemonitor:\/\/open"[\s\S]*?"Usage Monitor"[\s\S]*?"app-usagemonitor"[\s\S]*?"installation"/u,
+  );
+  assert.match(
+    source,
+    /case "com\.usagemonitor\.local\.preview":[\s\S]*?"TiboTattle Preview"[\s\S]*?"usagemonitor-preview:\/\/open"[\s\S]*?"Usage Monitor Preview"[\s\S]*?"app-usagemonitor\.preview"[\s\S]*?"preview-installation"/u,
+  );
+  assert.match(
+    source,
+    /bundleIdentifier,[\s\S]*buildChannel,[\s\S]*releaseChannel,[\s\S]*isPreviewDistribution/u,
+  );
+  assert.match(
+    source,
+    /"com\.usagemonitor\.local",\s*"development",\s*"development",\s*false[\s\S]*validateDevelopmentUpdaterPolicy/u,
+  );
+  assert.match(
+    source,
+    /"com\.usagemonitor\.local\.preview",\s*"preview_distribution",\s*"preview_distribution",\s*true[\s\S]*requiredAppcastPath: "\/preview\/appcast\.xml"[\s\S]*automaticUpdates: false/u,
+  );
+  assert.equal(
+    source.includes(DEPLOYMENT_ENDPOINTS.sparkle.appcastURL),
+    true,
+  );
+  const dogfoodAppcast = new URL(
+    getReleaseChannel(INTERNAL_DOGFOOD_RELEASE_CHANNEL).sparkle.appcastURL,
+  );
+  assert.equal(source.includes(`${dogfoodAppcast.origin}/`), true);
+  assert.equal(source.includes(dogfoodAppcast.pathname), true);
+  assert.equal(
+    source.includes(`requiredString("UsageMonitorUpdaterFrameworkVersion") == "${SPARKLE_VERSION}"`),
+    true,
+  );
+  assert.match(
+    source,
+    /requiredBool\("SUEnableAutomaticChecks"\) == automaticUpdates[\s\S]*requiredBool\("SUAllowsAutomaticUpdates"\) == automaticUpdates[\s\S]*requiredBool\("SUAutomaticallyUpdate"\) == automaticUpdates[\s\S]*requiredBool\("SURequireSignedFeed"\)[\s\S]*requiredBool\("SUVerifyUpdateBeforeExtraction"\)/u,
+  );
+  assert.match(
+    source,
+    /components\.percentEncodedPath == requiredAppcastPath[\s\S]*expectedAppcastURL == nil \|\| appcast == expectedAppcastURL/u,
+  );
+  assert.match(
+    source,
+    /publicKeyBytes\.count == 32[\s\S]*publicKeyBytes\.base64EncodedString\(\) == publicKey/u,
+  );
+  assert.match(
+    source,
+    /forInfoDictionaryKey: "CFBundleURLTypes"[\s\S]*urlTypes\.count == 1[\s\S]*Set\(urlType\.keys\) == Set\(\[[\s\S]*"CFBundleTypeRole"[\s\S]*"CFBundleURLName"[\s\S]*"CFBundleURLSchemes"/u,
+  );
+  assert.match(
+    source,
+    /urlType\["CFBundleTypeRole"\] as\? String == "Viewer"[\s\S]*urlType\["CFBundleURLName"\] as\? String[\s\S]*"\\\(bundleIdentifier\)\.\\\(appOpenHost\)"[\s\S]*registeredSchemes == \[appOpenScheme\]/u,
+  );
 });
 
 test("local-companion readiness stays machine-readable across rebrands", async () => {
@@ -321,6 +467,12 @@ const NORMALIZED_TEST_CODE_PATHS = new Set([
     (path) => `Contents/Frameworks/Sparkle.framework/${path}`,
   ),
 ]);
+const RETIRED_PREVIEW_KEYTAR_PATH =
+  "Contents/Resources/app/node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node";
+const LEGACY_PREVIEW_NORMALIZED_TEST_CODE_PATHS = new Set([
+  ...NORMALIZED_TEST_CODE_PATHS,
+  RETIRED_PREVIEW_KEYTAR_PATH,
+]);
 
 function canonicalizeTestMachO(bytes) {
   assert.equal(
@@ -355,8 +507,13 @@ function canonicalizeTestMachO(bytes) {
   return canonical;
 }
 
-async function testPayloadBytes(path, relativePath, temporaryRoot) {
-  if (!NORMALIZED_TEST_CODE_PATHS.has(relativePath)) {
+async function testPayloadBytes(
+  path,
+  relativePath,
+  temporaryRoot,
+  normalizedCodePaths = NORMALIZED_TEST_CODE_PATHS,
+) {
+  if (!normalizedCodePaths.has(relativePath)) {
     return readFile(path);
   }
   const normalizationRoot = await mkdtemp(
@@ -376,25 +533,28 @@ async function testPayloadBytes(path, relativePath, temporaryRoot) {
   }
 }
 
-async function testPayloadInventory(app, temporaryRoot) {
+async function testPayloadInventory(
+  app,
+  temporaryRoot,
+  { normalizedCodePaths = NORMALIZED_TEST_CODE_PATHS } = {},
+) {
   const walked = await walk(app);
   const files = walked.filter(({ relativePath, entry }) =>
     entry.isFile()
-    && ![
-      "Contents/Resources/build-manifest.json",
-      "Contents/_CodeSignature/CodeResources",
-    ].includes(relativePath));
+    && relativePath !== "Contents/Resources/build-manifest.json"
+    && !relativePath.split("/").includes("_CodeSignature"));
   const aggregate = createHash("sha256");
   const inventory = [];
   let totalBytes = 0;
   for (const file of files) {
-    const normalization = NORMALIZED_TEST_CODE_PATHS.has(file.relativePath)
+    const normalization = normalizedCodePaths.has(file.relativePath)
       ? "mach_o_without_code_signature"
       : "raw";
     const bytes = await testPayloadBytes(
       file.path,
       file.relativePath,
       temporaryRoot,
+      normalizedCodePaths,
     );
     const metadata = await lstat(file.path);
     const entry = {
@@ -776,6 +936,12 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     source,
     /requiredDirectoryName\("UsageMonitorStateDirectoryName"\)/u,
   );
+  assert.match(source, /requiredString\("UsageMonitorKeychainNamespace"\)/u);
+  assert.match(source, /requiredString\("UsageMonitorKeychainAccount"\)/u);
+  assert.match(
+    source,
+    /case "com\.usagemonitor\.local":[\s\S]*?\("app-usagemonitor", "installation"\)[\s\S]*?case "com\.usagemonitor\.local\.preview":[\s\S]*?\("app-usagemonitor\.preview", "preview-installation"\)/u,
+  );
   assert.match(source, /value != "\."[\s\S]*value != "\.\."/u);
   assert.match(source, /!value\.contains\("\/"\)/u);
   assert.doesNotMatch(source, /appOpenScheme\s*=\s*"usagemonitor"/u);
@@ -885,6 +1051,10 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     /var settingsSummary: String \{([\s\S]*?)\n    \}\n\n    private func setState/u,
   )?.[1];
   assert.ok(updaterSummary, "updater summary source should be present");
+  assert.match(
+    updaterSummary,
+    /if isAvailable && !allowsAutomaticUpdateOptIn[\s\S]*settingsUpdateDisclosurePreview[\s\S]*settingsAutomaticUpdatesUnavailable/u,
+  );
   const readySummary = updaterSummary.match(
     /case \.ready:([\s\S]*?)case \.checking:/u,
   )?.[1];
@@ -912,6 +1082,18 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     /didAbortWithError[\s\S]*stateForUpdaterAbort\([\s\S]*errorDomain: updaterError\.domain[\s\S]*errorCode: updaterError\.code/u,
   );
   assert.match(source, /controller\.checkForUpdates\(sender\)/u);
+  assert.match(
+    source,
+    /var canConfigureAutomaticUpdates: Bool \{[\s\S]*guard isAvailable,[\s\S]*feedIsReachable,[\s\S]*allowsAutomaticUpdateOptIn[\s\S]*!\[\.checking, \.failed\]\.contains\(state\)/u,
+  );
+  assert.match(
+    source,
+    /var allowsAutomaticUpdateOptIn: Bool \{[\s\S]*!Self\.isPreviewDistribution[\s\S]*updater\.allowsAutomaticUpdates == true/u,
+  );
+  assert.match(
+    source,
+    /func setAutomaticUpdatesEnabled\(_ enabled: Bool\) \{[\s\S]*guard !Self\.isPreviewDistribution,[\s\S]*updater\.allowsAutomaticUpdates,[\s\S]*feedIsReachable/u,
+  );
   assert.match(source, /runtimeStateDescription/u);
   assert.match(
     source,
@@ -938,6 +1120,18 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     /settingsUpdateDisclosureAutomaticOn/u,
   );
   assert.match(source, /updater\.automaticallyDownloadsUpdates = enabled/u);
+  assert.match(
+    source,
+    /"USAGE_MONITOR_APP_OPEN_URL": BundledProduct\.appOpenURL/u,
+  );
+  assert.match(
+    source,
+    /"USAGE_MONITOR_KEYCHAIN_NAMESPACE":\s*BundledProduct\.keychainNamespace/u,
+  );
+  assert.match(
+    source,
+    /"USAGE_MONITOR_KEYCHAIN_ACCOUNT": BundledProduct\.keychainAccount/u,
+  );
   assert.match(source, /NSSwitch\(\)/u);
   assert.match(
     source,
@@ -1265,11 +1459,11 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(source, /button\.isBordered = false/u);
   assert.doesNotMatch(source, /\.systemYellow|\.systemGreen/u);
-  // The colorway mirrors the title's own precedence: a running refresh,
-  // then a terminal failure, then an incomplete index, then evidence.
+  // The colorway mirrors the title's own precedence: a running refresh and
+  // attested partial coverage are amber; hard failures remain rust.
   assert.match(
     source,
-    /private func nativeToolbarStatusColor\([\s\S]*?if isRefreshing \{[\s\S]*?return \.busy[\s\S]*?if nativeRefreshFailure != nil \{[\s\S]*?return \.failed[\s\S]*?!coverage\.isComplete \{[\s\S]*?return \.busy[\s\S]*?case \.live:[\s\S]*?return \.fresh/u,
+    /private func nativeToolbarStatusColor\([\s\S]*?if isRefreshing \{[\s\S]*?return \.busy[\s\S]*?coverage\.partialTerminal \{[\s\S]*?return \.busy[\s\S]*?if nativeRefreshFailure != nil \{[\s\S]*?return \.failed[\s\S]*?!coverage\.isComplete \{[\s\S]*?return \.busy[\s\S]*?case \.live:[\s\S]*?return \.fresh/u,
   );
   assert.match(source, /nativeStatusPill\?\.colorway = colorway/u);
   assert.match(source, /nativeDashboardFresh/u);
@@ -1377,8 +1571,12 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.equal(
     source.match(/setActivationPolicy\(\.accessory\)/gu)?.length,
-    5,
+    6,
     "only isolated AppKit smoke modes may use accessory activation",
+  );
+  assert.match(
+    source,
+    /static func render\(outputDirectory: String\) -> Int32 \{[\s\S]*?application\.setActivationPolicy\(\.accessory\)/u,
   );
   // The sidebar-recovery and interaction-safety smokes build real AppKit or
   // WebKit objects in windows they never bring forward.
@@ -1765,16 +1963,75 @@ test("native refresh progress stays fixed-vocabulary and count-bounded", async (
   assert.match(progressProjection, /case quotaRefresh = "quota_refresh"/u);
   assert.match(progressProjection, /case quickResult = "quick_result"/u);
   assert.match(progressProjection, /case archiveIndex = "archive_index"/u);
+  assert.match(
+    progressProjection,
+    /func nativeToolbarTitle\(\s*hasUsableHeadlineEvidence: Bool = false\s*\)[\s\S]*?case \.quickResult:[\s\S]*?hasUsableHeadlineEvidence[\s\S]*?nativeDashboardProgressQuickResult[\s\S]*?nativeDashboardProgressAnalyzing/u,
+  );
   assert.doesNotMatch(progressProjection, /\b(?:percentage|percent|eta)\b/iu);
   assert.match(activityDecoder, /maximumProgressCount = 1_000_000_000/u);
+  assert.match(
+    menuBarStatusSource,
+    /enum LocalAnalysisTerminalOutcome:[\s\S]*?case succeeded[\s\S]*?case degraded[\s\S]*?case cancelled[\s\S]*?case failed[\s\S]*?automaticRefreshSuppressed/u,
+  );
+  assert.match(
+    menuBarStatusSource,
+    /automaticRefreshInFlight = false[\s\S]*?outcome\.automaticRefreshSuppressed[\s\S]*?automaticRefreshSuppressed = suppressed/u,
+  );
+  assert.match(
+    menuBarStatusSource,
+    /refreshStaleEvidenceIfNeeded\(\)[\s\S]*?!automaticRefreshSuppressed/u,
+  );
+  const manualRefresh = menuBarStatusSource.match(
+    /@objc private func analyzeLocalUsage\(\)[\s\S]*?(?=\n    @objc private func quit)/u,
+  )?.[0] ?? "";
+  assert.ok(manualRefresh, "manual menu-bar refresh action is present");
+  assert.doesNotMatch(manualRefresh, /automaticRefreshSuppressed/u);
   assert.match(activityDecoder, /doubleValue\.rounded\(\.towardZero\)/u);
   assert.match(activityDecoder, /progress\["phase"\]/u);
   assert.match(activityDecoder, /progress\["kind"\][\s\S]*?"archive_index"/u);
+  assert.match(
+    activityDecoder,
+    /progress\["kind"\][\s\S]*?"unified_index"[\s\S]*?Set\(progress\.keys\) == expectedKeys[\s\S]*?filesProcessed <= filesSelected[\s\S]*?filesSelected <= filesDiscovered/u,
+  );
+  for (const field of [
+    "filesDiscovered",
+    "filesSelected",
+    "filesProcessed",
+    "recordsWritten",
+  ]) {
+    assert.match(activityDecoder, new RegExp(`progress\\["${field}"\\]`, "u"));
+  }
+  assert.match(activityDecoder, /guard progress\["kind"\] == nil/u);
   assert.doesNotMatch(activityDecoder, /progress\["message"\]/u);
   assert.match(
     refreshPoll,
-    /case let \.running\(_, progress\):[\s\S]*?progress\?\.nativeToolbarTitle[\s\S]*?pollNativeRefresh/u,
+    /case let \.running\(_, progress\):[\s\S]*?progress\?\.nativeToolbarTitle\(\s*hasUsableHeadlineEvidence: false\s*\)[\s\S]*?pollNativeRefresh/u,
   );
+  assert.match(
+    source,
+    /quick_result` is only a collector checkpoint[\s\S]*?hasUsableHeadlineEvidence: false/u,
+  );
+  assert.match(
+    source,
+    /nativeRefreshMaximumPollSeconds = 4 \* 60 \* 60 \+ 60[\s\S]*?remainingAttempts: Self\.nativeRefreshMaximumPollAttempts/u,
+  );
+  assert.match(
+    source,
+    /let pollIntervalMilliseconds = remainingAttempts > 0\s*\n\s*\? Self\.nativeRefreshPollIntervalMilliseconds\s*\n\s*: Self\.nativeRefreshSettlementPollIntervalMilliseconds/u,
+  );
+  assert.match(
+    refreshPoll,
+    /if remainingAttempts <= 0 \{[\s\S]*?launcherDashboardTakingLonger[\s\S]*?isRefreshing: true,[\s\S]*?refreshEnabled: false[\s\S]*?remainingAttempts: 0[\s\S]*?return/u,
+  );
+  assert.match(
+    source,
+    /nativeRefreshSettlementPollIntervalMilliseconds = 5_000/u,
+  );
+  assert.match(
+    refreshPoll,
+    /case \.none:[\s\S]*?nativeEvidenceState = \.readFailed[\s\S]*?isRefreshing: true,[\s\S]*?refreshEnabled: false[\s\S]*?remainingAttempts: max\(0, remainingAttempts - 1\)[\s\S]*?return/u,
+  );
+  assert.doesNotMatch(source, /remainingAttempts: 120/u);
   assert.match(source, /--native-analysis-progress-contract-smoke-test/u);
 });
 
@@ -2017,12 +2274,13 @@ test("toolbar pill narrates index progress, terminal gaps, and refresh failure w
     source,
     /private enum NativeToolbarStatusText \{[\s\S]*?decimalNumberFormatter\(\s*maximumFractionDigits: 0\s*\)/u,
   );
-  // Failure identity first, then real indexing progress, outrank the
-  // evidence prose; complete coverage plus a non-failed refresh restores
-  // the existing "Fresh"/"Stale"/"Status" vocabulary untouched.
+  // An attested partial-coverage result is named before a generic failure;
+  // hard failure identity and real indexing progress still outrank the
+  // evidence prose. Complete coverage plus a non-failed refresh restores the
+  // existing "Fresh"/"Stale"/"Status" vocabulary untouched.
   assert.match(
     source,
-    /private func nativeToolbarEvidenceTitle\(fallback: String\) -> String \{[\s\S]*?if let failure = nativeRefreshFailure \{[\s\S]*?if let coverage = nativeHistoryIndexingCoverage, !coverage\.isComplete \{[\s\S]*?switch nativeEvidenceState \{/u,
+    /private func nativeToolbarEvidenceTitle\(fallback: String\) -> String \{[\s\S]*?coverage\.partialTerminal \{[\s\S]*?NativeToolbarStatusText\.historyPartial[\s\S]*?if let failure = nativeRefreshFailure \{[\s\S]*?if let coverage = nativeHistoryIndexingCoverage, !coverage\.isComplete \{[\s\S]*?switch nativeEvidenceState \{/u,
   );
   // The step vocabulary is closed on the client as well: an unrecognized
   // step renders as plain "Refresh failed".
@@ -2046,9 +2304,8 @@ test("toolbar pill narrates index progress, terminal gaps, and refresh failure w
     /guard \["failed", "degraded"\]\.contains\(status\) else \{\s*return \.notFailed\s*\}/u,
   );
   assert.match(source, /let sourceNoun = skippedSourceCount == 1 \? "source" : "sources"/u);
-  assert.match(source, /let threadNoun = skippedThreadCount == 1 \? "thread" : "threads"/u);
   assert.equal(source.includes(
-    '"History partial: \\(skippedSourceCount) \\(sourceNoun), \\(skippedThreadCount) \\(threadNoun) skipped"',
+    '"History coverage · \\(skippedSourceCount) \\(sourceNoun) unavailable"',
   ), true);
   assert.match(source, /history\["phase"\] as\? String\s*== "partial_terminal"/u);
   assert.match(
@@ -2091,7 +2348,10 @@ test("toolbar pill narrates index progress, terminal gaps, and refresh failure w
 });
 
 test("dashboard sidebar resizes for real, wears the brand palette, and the titlebar carries the brand row", async () => {
-  const source = await readFile(SWIFT_SOURCE, "utf8");
+  const [source, palette] = await Promise.all([
+    readFile(SWIFT_SOURCE, "utf8"),
+    readFile(NATIVE_BRAND_PALETTE_SOURCE, "utf8"),
+  ]);
   // 1. The divider is a real control. AppKit applies a divider drag at
   // priority 490 (dragThatCannotResizeWindow); the previous .defaultHigh
   // (750) holding priority outranked the user's own drag, which is the
@@ -2180,8 +2440,8 @@ test("dashboard sidebar resizes for real, wears the brand palette, and the title
   );
   // 2. The sidebar and report carry the exact light and Forest Ink tokens over
   // native material instead of inheriting the user's unrelated system accent.
-  const nativeBrandPalette = source.match(
-    /private enum NativeBrandPalette \{[\s\S]*?\n\}/u,
+  const nativeBrandPalette = palette.match(
+    /enum NativeBrandPalette \{[\s\S]*?\n\}/u,
   )?.[0];
   assert.ok(nativeBrandPalette, "native brand palette should be present");
   assert.match(
@@ -2265,7 +2525,14 @@ test("dashboard sidebar resizes for real, wears the brand palette, and the title
 });
 
 test("menu-bar status item degrades honestly and never invents allowance evidence", async () => {
-  const source = await readFile(MENU_BAR_STATUS_SOURCE, "utf8");
+  const [source, popupSource, modelSource, paceSource, localizationSource, appSource] = await Promise.all([
+    readFile(MENU_BAR_STATUS_SOURCE, "utf8"),
+    readFile(MENU_BAR_POPOVER_SOURCE, "utf8"),
+    readFile(MENU_BAR_POPUP_MODEL_SOURCE, "utf8"),
+    readFile(MENU_BAR_PACE_OUTLOOK_SOURCE, "utf8"),
+    readFile(LOCALIZATION_SOURCE, "utf8"),
+    readFile(SWIFT_SOURCE, "utf8"),
+  ]);
   assert.match(source, /import AppKit/u);
   // Variable-length item with the branded app mark, sized for the native
   // status bar rather than a generic system chart glyph.
@@ -2326,7 +2593,7 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   // available; stale, absent, starting, and failed states remain non-numeric.
   assert.match(
     source,
-    /if companionReachable,\s*evidence == \.live,\s*let lane = primaryLane \{\s*return TiboTattleLocalization\.percentString\(\s*lane\.roundedRemainingPercent\s*\)/u,
+    /if companionReachable,\s*let lane = currentPrimaryLane\(\) \{\s*return TiboTattleLocalization\.percentString\(\s*lane\.roundedRemainingPercent\s*\)/u,
   );
   assert.match(
     source,
@@ -2347,7 +2614,10 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
     /TiboTattleLocalization\.string\(\.menuBarLocalEvidenceStale\)/u,
   );
   assert.match(source, /func resetCountdown\(_ date: Date\?, now: Date = Date\(\)\) -> String\?/u);
-  assert.match(source, /guard companionReachable, evidence == \.live else/u);
+  assert.match(source, /func laneIsCurrent\(_ lane: ObservedQuotaLane,[\s\S]*?evidence == \.live/u);
+  assert.match(source, /now\.timeIntervalSince\(observedAt\) >= 0/u);
+  assert.match(source, /now\.timeIntervalSince\(observedAt\) <= freshnessLimit/u);
+  assert.match(source, /let resetAt = lane\.resetAt,[\s\S]*?resetAt > now/u);
 
   // Only the normal Codex allowance track is projected with fixed
   // privacy-safe labels; a separate product can never become the title.
@@ -2358,7 +2628,7 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.match(source, /private let codexPrimaryLimitId = "codex"/u);
   assert.match(
     source,
-    /private let supportedCodexAllowanceWindowDurations\s*=\s*\n\s*1\.\.\.CodexQuotaWindowDuration\.maximumMinutes/u,
+    /private let supportedCodexAllowanceWindowDurations: Set<Int> = \[[\s\S]*?fiveHourWindowDurationMinutes,[\s\S]*?weeklyWindowDurationMinutes,[\s\S]*?\]/u,
   );
   assert.match(source, /let candidates = rows\.compactMap/u);
   assert.match(source, /guard Self\.isSupportedCodexAllowance\(/u);
@@ -2381,16 +2651,18 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
     source,
     /return TiboTattleLocalization\.string\(\.menuBarSevenDayAllowance\)/u,
   );
-  assert.match(source, /left\.durationMinutes > right\.durationMinutes/u);
-  assert.match(source, /left\.isExplicitPrimary != right\.isExplicitPrimary/u);
+  assert.match(source, /candidates\.filter \{ \$0\.durationMinutes == duration \}/u);
+  assert.match(source, /left\.preferredSlot != right\.preferredSlot/u);
+  assert.match(source, /left\.observedAt > right\.observedAt/u);
   assert.match(source, /return left\.stableKey < right\.stableKey/u);
-  assert.match(source, /isPrimary: index == 0/u);
-  assert.match(source, /TiboTattleLocalization\.quotaWindowLabel\(/u);
+  assert.match(source, /isPrimary: candidate\.durationMinutes\s*\n\s*== weeklyWindowDurationMinutes/u);
+  assert.doesNotMatch(source, /TiboTattleLocalization\.quotaWindowLabel\(/u);
+  assert.match(source, /abs\(\(remaining \+ used\) - 100\) <= 0\.001/u);
   assert.match(source, /let observedAt = lanes\.compactMap\(\\\.observedAt\)\.max\(\)/u);
   assert.doesNotMatch(source, /codex_bengalfox|Secondary observed allowance|Observed quota lane/u);
   assert.match(
     source,
-    /guard overview\.freshnessStatus == "live" else \{ return \.stale \}/u,
+    /guard overview\.evidenceAvailable,[\s\S]*?overview\.freshnessStatus == "live"[\s\S]*?else \{ return \.stale \}/u,
   );
 
   // Menu contract: every information lane is a standard native text item.
@@ -2442,44 +2714,86 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.doesNotMatch(source, /openDashboardItem/u);
   assert.match(
     source,
-    /analyzeItem\.isEnabled = snapshot\.phase == \.ready\s*\n\s*\|\| \(snapshot\.phase == \.unavailable && dashboardURL != nil\)/u,
+    /analyzeItem\.isEnabled = snapshot\.analysisAvailable[\s\S]*?snapshot\.phase == \.ready \|\| snapshot\.phase == \.unavailable/u,
   );
 
-  // Keep the standard NSStatusItem menu lifecycle intact. Escape and app
-  // deactivation both cancel native menu tracking, and every action clears
-  // tracking before it can open another app surface.
-  assert.match(source, /statusItem\.menu = menu/u);
+  // Left-click owns one transient popover. Right-click or Control-click opens
+  // the same standard native actions menu; assigning statusItem.menu would
+  // consume the left click and make this routing impossible.
+  assert.doesNotMatch(source, /statusItem\.menu = menu/u);
+  assert.match(source, /popover\.behavior = \.transient/u);
+  assert.match(source, /popover\.contentViewController = popoverController/u);
+  assert.match(source, /button\.target = self/u);
+  assert.match(source, /button\.action = #selector\(statusItemActivated\)/u);
   assert.match(
     source,
-    /NSEvent\.addLocalMonitorForEvents\(matching: \.keyDown\)[\s\S]*?event\.keyCode == 53[\s\S]*?self\.dismissMenu\(\)/u,
+    /button\.sendAction\(on: \[\.leftMouseUp, \.rightMouseUp\]\)/u,
   );
   assert.match(
     source,
-    /NSEvent\.addLocalMonitorForEvents\([\s\S]*?\.leftMouseDown[\s\S]*?event\.window[\s\S]*?NSApp\.windows\.contains[\s\S]*?self\.dismissMenu\(\)/u,
+    /func menuBarStatusActivationIntent\([\s\S]*?eventType == \.rightMouseUp[\s\S]*?modifierFlags\.contains\(\.control\)/u,
+  );
+  assert.match(source, /popover\.show\([\s\S]*?preferredEdge: \.minY/u);
+  assert.match(source, /menu\.popUp\(positioning: nil, at: screenPoint, in: nil\)/u);
+  assert.match(source, /func popoverDidClose\(_ notification: Notification\)/u);
+  const showActionMenu = source.match(
+    /private func showActionMenu\(from anchor: NSView\)[\s\S]*?(?=\n    func popoverDidClose)/u,
+  )?.[0] ?? "";
+  const popoverDidClose = source.match(
+    /func popoverDidClose\(_ notification: Notification\)[\s\S]*?(?=\n    \/\/\/ AppKit normally)/u,
+  )?.[0] ?? "";
+  assert.match(
+    showActionMenu,
+    /defersPopoverRefreshUntilMenuCloses = popover\.isShown\s*\n\s*popover\.performClose\(nil\)/u,
+  );
+  assert.match(
+    popoverDidClose,
+    /guard !stopped else \{ return \}[\s\S]*?suppressesNextPopoverCloseRefresh[\s\S]*?return[\s\S]*?defersPopoverRefreshUntilMenuCloses[\s\S]*?refreshAfterMenuCloses = true[\s\S]*?return[\s\S]*?refreshStaleEvidenceIfNeeded\(\)/u,
+  );
+
+  // Escape and app deactivation dismiss the active transient surface, and
+  // every action clears both surfaces before changing focus or ownership.
+  assert.match(
+    source,
+    /NSEvent\.addLocalMonitorForEvents\(matching: \.keyDown\)[\s\S]*?menuBarShouldDismissForEscape[\s\S]*?isPopoverShown: self\.popover\.isShown[\s\S]*?self\.dismissSurfaces\(\)/u,
   );
   assert.match(
     source,
-    /NSApplication\.didResignActiveNotification[\s\S]*?self\?\.dismissMenu\(\)/u,
+    /NSEvent\.addLocalMonitorForEvents\([\s\S]*?\.leftMouseDown[\s\S]*?event\.window[\s\S]*?NSApp\.windows\.contains[\s\S]*?self\.dismissSurfaces\(\)/u,
   );
-  assert.match(source, /private func dismissMenu\(\) \{\s*menu\.cancelTracking\(\)/u);
   assert.match(
     source,
-    /func shutDown\(\) \{[\s\S]*?dismissMenu\(\)[\s\S]*?removeInteractionMonitoring\(\)/u,
+    /NSApplication\.didResignActiveNotification[\s\S]*?self\?\.dismissSurfaces\(\)/u,
+  );
+  assert.match(
+    source,
+    /private func dismissSurfaces\(suppressRefresh: Bool = false\) \{[\s\S]*?suppressRefresh[\s\S]*?menu\.cancelTracking\(\)[\s\S]*?popover\.performClose\(nil\)/u,
+  );
+  assert.match(
+    source,
+    /func shutDown\(\) \{[\s\S]*?dismissSurfaces\(\)[\s\S]*?removeInteractionMonitoring\(\)/u,
   );
   for (const action of [
     "openTiboTattle",
     "analyzeLocalUsage",
-    "quit",
     "showSettings",
     "showAbout",
     "checkForUpdates",
   ]) {
     assert.match(
       source,
-      new RegExp(`@objc private func ${action}\\(\\) \\{[\\s\\S]*?dismissMenu\\(\\)`, "u"),
+      new RegExp(`@objc private func ${action}\\(\\) \\{[\\s\\S]*?dismissSurfaces\\(\\)`, "u"),
       action,
     );
   }
+  assert.match(
+    source,
+    /@objc private func quit\(\) \{\s*dismissSurfaces\(suppressRefresh: true\)\s*\n\s*actions\.quit\(\)/u,
+  );
+  assert.match(
+    source,
+    /func shutDown\(\) \{[\s\S]*?stopped = true\s*\n\s*dismissSurfaces\(\)/u,
+  );
 
   // Restart/failure/read errors clear numeric evidence before rendering. A
   // callback from an older URL or start cannot cross the generation boundary.
@@ -2499,12 +2813,290 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   );
   assert.match(
     source,
-    /func menuDidClose\(_ menu: NSMenu\) \{[\s\S]*?structuralRebuildPending[\s\S]*?render\(\)/u,
+    /func menuDidClose\(_ menu: NSMenu\) \{[\s\S]*?suppressesNextMenuCloseRefresh = false[\s\S]*?defersPopoverRefreshUntilMenuCloses = false[\s\S]*?structuralRebuildPending[\s\S]*?render\(\)/u,
   );
   assert.match(source, /if isMenuTracking && structureChanged/u);
   assert.match(source, /structuralRebuildPending = true/u);
   assert.match(source, /deferredLaneTitle/u);
   assert.match(source, /private func expireCachedEvidenceIfNeeded\(\)/u);
+  assert.match(source, /private func scheduleEvidenceExpiry\(\)/u);
+  assert.match(
+    source,
+    /nextEvidencePresentationBoundary\([\s\S]*?staleAfterSeconds: snapshot\.staleAfterSeconds/u,
+  );
+
+  // Weekly pace is one closed, content-free DTO produced by the companion's
+  // canonical projection. Swift accepts only the exact versioned shape and
+  // validates its internal arithmetic before binding it to the current weekly
+  // lane. It never derives a competing forecast from raw allowance values.
+  assert.match(
+    paceSource,
+    /struct MenuBarWeeklyPaceOutlook: Equatable/u,
+  );
+  assert.match(
+    paceSource,
+    /private static let schemaVersion = "local-weekly-pace-outlook-v0\.1"/u,
+  );
+  for (const exactObjectGuard of [
+    /Set\(outlook\.keys\) == topLevelKeys/u,
+    /Set\(rawRates\.keys\) == rateKeys/u,
+    /Set\(rawProjection\.keys\) == projectionKeys/u,
+    /Set\(rawTrack\.keys\) == trackKeys/u,
+  ]) {
+    assert.match(paceSource, exactObjectGuard);
+  }
+  assert.match(
+    paceSource,
+    /CFGetTypeID\(number\) == CFBooleanGetTypeID\(\)/u,
+  );
+  assert.match(
+    paceSource,
+    /CFGetTypeID\(number\) != CFBooleanGetTypeID\(\)/u,
+  );
+  assert.match(
+    paceSource,
+    /formatter\.string\(from: date\) == text/u,
+  );
+  assert.match(
+    paceSource,
+    /approximatelyEqual\(\s*sustainable,\s*remainingPercent \/ hoursToReset\s*\)/u,
+  );
+  assert.match(paceSource, /standingMatchesRatio\(standing, ratio: ratio\)/u);
+  assert.match(
+    paceSource,
+    /critical == \(standing == \.over && ratio >= 2\)/u,
+  );
+  assert.match(
+    paceSource,
+    /func isBound\(to lane: ObservedQuotaLane, now: Date\) -> Bool \{[\s\S]*?lane\.durationMinutes == CodexQuotaWindowDuration\.sevenDayMinutes[\s\S]*?abs\(laneReset\.timeIntervalSince\(resetsAt\)\) < 0\.001[\s\S]*?abs\(lane\.remainingPercent - remainingPercent\) <= 0\.001[\s\S]*?resetsAt > now/u,
+  );
+  assert.match(
+    source,
+    /func currentWeeklyPaceOutlook\([\s\S]*?currentLanes\(now: now\)[\s\S]*?outlook\.isBound\(to: weeklyLane, now: now\)/u,
+  );
+  assert.match(
+    source,
+    /let preferredSlot = slot == "primary"/u,
+  );
+  assert.match(
+    appSource,
+    /dualWeeklySnapshot\.currentWeeklyPaceOutlook\(now: now\) != nil/u,
+  );
+  const crossSurfacePaceSmoke = appSource.match(
+    /private enum NativeWeeklyPaceProjectionContractSmokeTest \{[\s\S]*?(?=\n\}\n\n\/\/\/ Exercises the real AppKit status item)/u,
+  )?.[0] ?? "";
+  assert.ok(
+    crossSurfacePaceSmoke,
+    "the JS-to-Swift weekly pace contract smoke should be present",
+  );
+  assert.match(
+    crossSurfacePaceSmoke,
+    /MenuBarWeeklyPaceOutlookProjection\.decode\(data\)[\s\S]*?outlook\.status == \.available[\s\S]*?outlook\.isBound\(to: exactLane, now: now\)[\s\S]*?rejectsSchemaMutation\(data\)/u,
+  );
+  assert.match(
+    appSource,
+    /of: "--native-weekly-pace-projection-contract-smoke-test"[\s\S]*?BundledProduct\.buildChannel == "development"[\s\S]*?NativeWeeklyPaceProjectionContractSmokeTest\.run/u,
+  );
+
+  // The extra read shares the existing ephemeral, loopback-only transport. It
+  // begins only after a valid overview supplies the lane to bind against.
+  const weeklyPaceReader = source.match(
+    /func readWeeklyPaceOutlook\([\s\S]*?(?=\n    func readAnalysisActivity\()/u,
+  )?.[0] ?? "";
+  assert.ok(weeklyPaceReader, "weekly pace reader should be present");
+  assert.match(
+    weeklyPaceReader,
+    /path: "\/api\/local\/weekly-pace-outlook"/u,
+  );
+  assert.match(
+    weeklyPaceReader,
+    /maximumBytes: Self\.maximumPaceOutlookResponseBytes/u,
+  );
+  assert.match(
+    weeklyPaceReader,
+    /MenuBarWeeklyPaceOutlookProjection\.decode\(\$0\)/u,
+  );
+  assert.match(source, /URLSessionConfiguration\.ephemeral/u);
+  assert.match(
+    source,
+    /self\.snapshot\.lanes = overview\.lanes[\s\S]*?self\.reader\.readWeeklyPaceOutlook\(base: dashboardURL\)/u,
+  );
+
+  // Opening either native surface can supersede an in-flight cadence poll.
+  // Every callback is generation-, URL-, and sequence-bound, and the next poll
+  // is scheduled only after both activity and overview-plus-outlook legs settle.
+  assert.match(source, /private var pollSequence: UInt64 = 0/u);
+  assert.match(source, /pollSequence &\+= 1\s*\n\s*let sequence = pollSequence/u);
+  assert.ok(
+    (source.match(/self\.pollSequence == sequence/gu) ?? []).length >= 3,
+    "every asynchronous poll leg should reject superseded responses",
+  );
+  const pollCoordinator = source.match(
+    /private func finishPollLeg\([\s\S]*?(?=\n    private func schedulePoll\()/u,
+  )?.[0] ?? "";
+  assert.ok(pollCoordinator, "two-leg poll coordinator should be present");
+  assert.match(pollCoordinator, /pollActivityFinished = true/u);
+  assert.match(pollCoordinator, /pollEvidenceFinished = true/u);
+  assert.match(
+    pollCoordinator,
+    /if pollActivityFinished && pollEvidenceFinished \{\s*schedulePoll\(\)/u,
+  );
+  assert.match(source, /finishPollLeg\(\.activity, sequence: sequence\)/u);
+  const weeklyPaceCompletion = source.match(
+    /self\.reader\.readWeeklyPaceOutlook\(base: dashboardURL\) \{[\s\S]*?self\.finishPollLeg\(\.evidence, sequence: sequence\)\s*\n\s*\}/u,
+  )?.[0] ?? "";
+  assert.ok(weeklyPaceCompletion, "weekly pace completion should be present");
+  assert.match(
+    weeklyPaceCompletion,
+    /else \{\s*self\.snapshot\.weeklyPaceOutlook = nil/u,
+  );
+  assert.doesNotMatch(
+    weeklyPaceCompletion,
+    /invalidateObservedEvidence|snapshot\.lanes =|snapshot\.history =|snapshot\.evidence =|snapshot\.phase =/u,
+    "an optional pace failure must not erase independently valid allowance or history",
+  );
+
+  // Forecast claims expire at reset or, for over-pace states, the earlier
+  // projected exhaustion instant. Freshness and exact-lane binding are checked
+  // again at render time so no cached prediction survives changed evidence.
+  assert.match(
+    paceSource,
+    /var nextPresentationBoundary: Date \{[\s\S]*?standing == \.over[\s\S]*?return min\(resetsAt, exhaustion\)[\s\S]*?return resetsAt/u,
+  );
+  assert.match(
+    source,
+    /let outlookBoundaries = weeklyPaceOutlook\.map \{\s*\[\$0\.nextPresentationBoundary\]/u,
+  );
+  assert.match(
+    source,
+    /if snapshot\.currentWeeklyPaceOutlook\(now: now\) == nil \{\s*snapshot\.weeklyPaceOutlook = nil/u,
+  );
+  assert.match(
+    source,
+    /weeklyPaceOutlook: snapshot\.weeklyPaceOutlook,/u,
+  );
+
+  // The rich popup is a real AppKit surface with fixed width, no scroll view,
+  // two native history ranges, and the companion-projected weekly pace states.
+  assert.match(popupSource, /final class MenuBarPopoverViewController: NSViewController/u);
+  assert.match(popupSource, /static let width: CGFloat = 400/u);
+  assert.doesNotMatch(popupSource, /NSScrollView\s*\(/u);
+  assert.match(popupSource, /let rangeControl = NSSegmentedControl\(\)/u);
+  assert.match(modelSource, /case sevenDays = "7d"/u);
+  assert.match(modelSource, /case thirtyDays = "30d"/u);
+  assert.match(popupSource, /private final class MenuBarWeeklyPaceView: NSView/u);
+  assert.match(
+    popupSource,
+    /enum MenuBarPopoverPaceState: Equatable \{[\s\S]*?case collecting[\s\S]*?case under[\s\S]*?case on[\s\S]*?case over[\s\S]*?case critical/u,
+  );
+  assert.match(
+    popupSource,
+    /func configure\(\s*outlook: MenuBarWeeklyPaceOutlook,[\s\S]*?outlook\.status == \.collecting[\s\S]*?switch outlook\.standing[\s\S]*?outlook\.critical \? \.critical : \.over/u,
+  );
+  assert.match(
+    popupSource,
+    /trackView\.coveredFraction = outlook\.track\.coveredFraction/u,
+  );
+  assert.match(
+    popupSource,
+    /trackView\.activeFraction = outlook\.track\.activeExhaustionFraction/u,
+  );
+  assert.match(
+    popupSource,
+    /let weeklyPaceVisible: Bool\s*\n\s*let weeklyPaceState: MenuBarPopoverPaceState\?/u,
+  );
+  assert.match(
+    popupSource,
+    /if let outlook = snapshot\.currentWeeklyPaceOutlook\(now: now\) \{[\s\S]*?weeklyPaceView\.configure\(outlook: outlook, now: now\)[\s\S]*?weeklySection\.isHidden = false[\s\S]*?else \{[\s\S]*?weeklySection\.isHidden = true/u,
+  );
+  assert.doesNotMatch(popupSource, /MenuBarWeeklyPositionView/u);
+  assert.doesNotMatch(popupSource, /weeklyWindowPosition|difference <= -2|difference >= 2/u);
+  assert.match(popupSource, /MenuBarDailyTokenBarsView/u);
+  assert.match(popupSource, /day\.totalTokens/u);
+  assert.match(popupSource, /day\.evidence == \.partial[\s\S]*?drawPartialBar/u);
+  assert.match(popupSource, /menuBarPopupNotSubscriptionBill/u);
+  assert.match(popupSource, /menuBarPopupCoverageMixed/u);
+  assert.match(popupSource, /menuBarPopupCoverageAccessible/u);
+  assert.match(popupSource, /historyCoverageLabel\.isHidden = historyChart\.coverageState == \.complete/u);
+  assert.match(popupSource, /refreshButton\.isEnabled = snapshot\.analysisAvailable/u);
+  assert.match(popupSource, /selectHistoryRangeForSmokeTest/u);
+  assert.match(popupSource, /renderPNG\(to url: URL, appearance: NSAppearance\.Name\)/u);
+
+  // Accounting is independently fail-closed. Calendar-day aggregation uses
+  // Calendar arithmetic for DST, preserves gaps, and admits authoritative
+  // zeros only inside complete coverage.
+  assert.match(modelSource, /freshness\["accountingStatus"\] as\? String == "available"/u);
+  assert.match(modelSource, /sourceMode != "unified"[\s\S]*?generationMatched/u);
+  assert.match(modelSource, /enum Evidence: Equatable \{[\s\S]*?case available[\s\S]*?case partial[\s\S]*?case unavailable/u);
+  assert.match(modelSource, /calendar\.date\([\s\S]*?byAdding: \.day/u);
+  assert.match(modelSource, /let fullCivilDayCovered/u);
+  assert.match(modelSource, /guard !matching\.isEmpty else/u);
+  assert.match(modelSource, /source != "insufficient_evidence"/u);
+  const popupCatalogs = await Promise.all(
+    ["en", "es", "zh-Hans"].map((locale) => readFile(join(
+      REPOSITORY_ROOT,
+      "apps",
+      "macos",
+      "Resources",
+      `${locale}.lproj`,
+      "Localizable.strings",
+    ), "utf8")),
+  );
+  const popupLocalization = popupCatalogs.map((catalog) => catalog
+    .split("\n")
+    .filter((line) => line.includes('"menuBarPopup.'))
+    .join("\n"))
+    .join("\n");
+  const weeklyPaceLocalizationKeys = [
+    ["menuBarPopupWeeklyPace", "menuBarPopup.weeklyPace"],
+    ["menuBarPopupPaceCollecting", "menuBarPopup.paceCollecting"],
+    ["menuBarPopupPaceUnder", "menuBarPopup.paceUnder"],
+    ["menuBarPopupPaceOn", "menuBarPopup.paceOn"],
+    ["menuBarPopupPaceOver", "menuBarPopup.paceOver"],
+    ["menuBarPopupPaceCritical", "menuBarPopup.paceCritical"],
+    ["menuBarPopupPaceCollectingDetail", "menuBarPopup.paceCollectingDetail"],
+    ["menuBarPopupPaceRatioOutcome", "menuBarPopup.paceRatioOutcome"],
+    ["menuBarPopupPaceDryBeforeReset", "menuBarPopup.paceDryBeforeReset"],
+    ["menuBarPopupPaceSpareAtReset", "menuBarPopup.paceSpareAtReset"],
+    ["menuBarPopupPaceReachesReset", "menuBarPopup.paceReachesReset"],
+    ["menuBarPopupPaceNow", "menuBarPopup.paceNow"],
+    ["menuBarPopupPaceResetIn", "menuBarPopup.paceResetIn"],
+    ["menuBarPopupPaceEvidenceOne", "menuBarPopup.paceEvidenceOne"],
+    ["menuBarPopupPaceEvidenceMany", "menuBarPopup.paceEvidenceMany"],
+    ["menuBarPopupPaceEarlyEstimate", "menuBarPopup.paceEarlyEstimate"],
+    ["menuBarPopupPaceActiveMarker", "menuBarPopup.paceActiveMarker"],
+  ];
+  for (const [swiftKey, catalogKey] of weeklyPaceLocalizationKeys) {
+    assert.equal(
+      localizationSource.includes(`case ${swiftKey} = "${catalogKey}"`),
+      true,
+      swiftKey,
+    );
+    assert.equal(
+      localizationSource.includes(`case .${swiftKey}:`),
+      true,
+      `${swiftKey} English fallback`,
+    );
+    for (const [index, catalog] of popupCatalogs.entries()) {
+      assert.equal(
+        catalog.includes(`"${catalogKey}" = `),
+        true,
+        `${catalogKey} locale ${index}`,
+      );
+    }
+  }
+  for (const privacyForbidden of [
+    /reset.?credit/iu,
+    /redeem/iu,
+    /buy.?credit/iu,
+    /account.?email/iu,
+  ]) {
+    assert.doesNotMatch(source, privacyForbidden);
+    assert.doesNotMatch(popupSource, privacyForbidden);
+    assert.doesNotMatch(modelSource, privacyForbidden);
+    assert.doesNotMatch(paceSource, privacyForbidden);
+    assert.doesNotMatch(popupLocalization, privacyForbidden);
+  }
 
   // The analyze item drives the companion's own refresh route with the exact
   // same-origin proof the dashboard button sends.
@@ -2744,6 +3336,59 @@ test("targeted local Keychain reset removes only exact local capabilities and re
   }
 });
 
+test("preview Keychain reset addresses no stable credential pair", async () => {
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-preview-keychain-reset-"),
+  );
+  const stateRoot = join(temporaryRoot, "state");
+  const calls = [];
+  try {
+    await mkdir(stateRoot, { mode: 0o700 });
+    const result = await resetLocalKeychainIdentityAndDevice({
+      stateRoot,
+      keychainEnvironment: {
+        USAGE_MONITOR_KEYCHAIN_NAMESPACE: "app-usagemonitor.preview",
+        USAGE_MONITOR_KEYCHAIN_ACCOUNT: "preview-installation",
+      },
+      attributeProbe(capability, options) {
+        return exportIdentityKeychainItemPresenceByAttributes(capability, {
+          ...options,
+          platform: "darwin",
+          runCommand(command, arguments_) {
+            calls.push(["attributeProbe", command, ...arguments_]);
+            return { status: 44 };
+          },
+        });
+      },
+      attributeDelete(capability, options) {
+        return deleteExportIdentityKeychainItemByAttributes(capability, {
+          ...options,
+          platform: "darwin",
+          runCommand(command, arguments_) {
+            calls.push(["attributeDelete", command, ...arguments_]);
+            return { status: 44 };
+          },
+        });
+      },
+    });
+    assert.equal(result.status, "reset");
+    assert.ok(calls.length > 0);
+    for (const [, command, operation, serviceFlag, service, accountFlag, account]
+      of calls) {
+      assert.equal(command, "/usr/bin/security");
+      assert.match(operation, /^(?:find|delete)-generic-password$/u);
+      assert.equal(serviceFlag, "-s");
+      assert.equal(accountFlag, "-a");
+      assert.match(service, /^app-usagemonitor\.preview\./u);
+      assert.equal(account, "preview-installation");
+      assert.equal(service.startsWith("app-usagemonitor.contribution"), false);
+      assert.equal(service.startsWith("app-usagemonitor.export"), false);
+    }
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
 test("the app Keychain broker owns a closed capability set and migrates legacy items safely", async () => {
   const [source, brokerSource] = await Promise.all([
     readFile(SWIFT_SOURCE, "utf8"),
@@ -2754,17 +3399,17 @@ test("the app Keychain broker owns a closed capability set and migrates legacy i
     brokerSource,
     /case exportIdentity = "export_identity"[\s\S]*?case accountObservation = "account_observation"[\s\S]*?case claudeSessionPseudonym = "claude_session_pseudonym"[\s\S]*?case contributionDevice = "contribution_device"/u,
   );
-  for (const service of [
-    "app-usagemonitor.export-identity.app.v1",
-    "app-usagemonitor.account-observation.app.v1",
-    "app-usagemonitor.claude-session-pseudonym.app.v1",
-    "app-usagemonitor.contribution-device.app.v1",
-    "app-usagemonitor.export-identity.v1",
-    "app-usagemonitor.account-observation.v1",
-    "app-usagemonitor.claude-session-pseudonym.v1",
-    "app-usagemonitor.contribution-device.v1",
+  for (const serviceStem of [
+    "export-identity",
+    "account-observation",
+    "claude-session-pseudonym",
+    "contribution-device",
   ]) {
-    assert.equal(brokerSource.includes(`"${service}"`), true, service);
+    assert.equal(
+      brokerSource.includes(`"${serviceStem}"`),
+      true,
+      serviceStem,
+    );
   }
   assert.match(brokerSource, /private static let protocolVersion = 2/u);
   assert.match(brokerSource, /private static let legacyProtocolVersion = 1/u);
@@ -2775,6 +3420,20 @@ test("the app Keychain broker owns a closed capability set and migrates legacy i
   assert.match(
     brokerSource,
     /BrokerKeychainCapability\(rawValue: raw\)/u,
+  );
+  // The native bundle selects only one of two reviewed Keychain identities;
+  // neither plist text nor a companion request becomes an arbitrary address.
+  assert.match(
+    brokerSource,
+    /case \("app-usagemonitor", "installation"\):\s*self = \.stable/u,
+  );
+  assert.match(
+    brokerSource,
+    /case \("app-usagemonitor\.preview", "preview-installation"\):\s*self = \.preview/u,
+  );
+  assert.match(
+    brokerSource,
+    /"\\\(identity\.namespace\)\.\\\(serviceStem\)\.app\.v1"/u,
   );
   assert.equal(
     brokerSource.includes(
@@ -2841,6 +3500,10 @@ test("the app Keychain broker owns a closed capability set and migrates legacy i
   );
   assert.match(
     brokerSource,
+    /"--native-weekly-pace-projection-contract-smoke-test"/u,
+  );
+  assert.match(
+    brokerSource,
     /!Self\.nativeSmokeArguments\.isDisjoint\(\s*with: CommandLine\.arguments\.dropFirst\(\)\s*\)/u,
   );
   assert.doesNotMatch(brokerSource, /hasSuffix\("-smoke-test"\)/u);
@@ -2875,6 +3538,10 @@ test("the app Keychain broker owns a closed capability set and migrates legacy i
   );
   assert.match(
     source,
+    /let broker = try\? ContributionDeviceKeychainBroker\(\s*namespace: BundledProduct\.keychainNamespace,\s*account: BundledProduct\.keychainAccount\s*\)/u,
+  );
+  assert.match(
+    source,
     /if broker\?\.childEndpoint != nil \{\s*environment\[\s*ContributionDeviceKeychainBroker\.environmentVariable\s*\] = "0"/u,
   );
   assert.match(source, /broker\?\.closeChildEndpoint\(\)/u);
@@ -2883,6 +3550,28 @@ test("the app Keychain broker owns a closed capability set and migrates legacy i
     source.indexOf("func stop(completion:"),
   );
   assert.match(terminationSource, /broker\?\.shutdown\(\)/u);
+  // The one-shot reset helper runs without a broker: its standard input
+  // stays the null device and its environment never announces a channel.
+  const resetHelperSource = source.slice(
+    source.indexOf("private func launchLocalKeychainResetHelper"),
+    source.indexOf("private func finishLocalKeychainReset"),
+  );
+  assert.match(
+    resetHelperSource,
+    /child\.standardInput = FileHandle\.nullDevice/u,
+  );
+  assert.equal(
+    resetHelperSource.includes(CONTRIBUTION_DEVICE_KEYCHAIN_BROKER_FD_ENV),
+    false,
+  );
+  assert.match(
+    resetHelperSource,
+    /"USAGE_MONITOR_KEYCHAIN_NAMESPACE":\s*BundledProduct\.keychainNamespace/u,
+  );
+  assert.match(
+    resetHelperSource,
+    /"USAGE_MONITOR_KEYCHAIN_ACCOUNT":\s*BundledProduct\.keychainAccount/u,
+  );
 });
 
 test("the broker-less reset helper deletes fixed legacy and app generations without keytar", async () => {
@@ -2906,6 +3595,10 @@ test("the broker-less reset helper deletes fixed legacy and app generations with
   assert.match(
     helperSource,
     /attributeProbe = exportIdentityKeychainItemPresenceByAttributes,\s*\n\s*attributeDelete = deleteExportIdentityKeychainItemByAttributes,/u,
+  );
+  assert.match(
+    helperSource,
+    /keychainEnvironment = undefined[\s\S]*?Object\.freeze\(\{ environment: keychainEnvironment \}\)/u,
   );
   for (const capability of [
     EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice,
@@ -3018,7 +3711,7 @@ test("generic external builders reject env and CLI marker spoofing", async () =>
         externalDistribution: true,
         releaseChannel: STABLE_RELEASE_CHANNEL,
       }),
-      { code: "MACOS_BUNDLE_VERSION_REQUIRED" },
+      { code: "MACOS_UPDATER_REQUIRED_FOR_DISTRIBUTION" },
     );
     await assert.rejects(lstat(output), { code: "ENOENT" });
   } finally {
@@ -3079,7 +3772,7 @@ test("release authorization is programmatic and does not apply to development or
   ], {
     USAGE_MONITOR_PREVIEW_CENTRAL_ORIGIN: "https://preview.usage.example",
     USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL:
-      "https://updates.usage.example/appcast.xml",
+      "https://updates.usage.example/preview/appcast.xml",
     USAGE_MONITOR_PREVIEW_SPARKLE_PUBLIC_ED_KEY:
       Buffer.alloc(32, 4).toString("base64"),
   });
@@ -3142,13 +3835,18 @@ test("generic DMG packaging requires an explicit visible non-release mode", () =
       distribution: "development",
     },
   );
-  assert.deepEqual(
-    parseMacOSDMGArguments([
-      "--app",
-      ".release-build/macos-preview/current/TiboTattle.app",
-      "--preview",
-    ]).distribution,
-    "preview",
+  const previewDMG = parseMacOSDMGArguments([
+    "--app",
+    ".release-build/macos-preview/current/TiboTattle Preview.app",
+    "--preview",
+  ]);
+  assert.equal(previewDMG.distribution, "preview");
+  assert.equal(
+    previewDMG.output,
+    resolve(
+      `.release-build/macos/TiboTattle Preview-${RELEASE_VERSION}`
+        + "-macOS-arm64-preview.dmg",
+    ),
   );
   assert.throws(
     () => parseMacOSDMGArguments([
@@ -3189,7 +3887,6 @@ test("stable external bundle inputs remain bound to the reviewed production poli
   );
   assert.deepEqual(
     readMacOSReleaseBuildConfiguration({
-      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
       USAGE_MONITOR_PRODUCTION_ORIGIN: DEPLOYMENT_ENDPOINTS.public.origin,
       USAGE_MONITOR_SPARKLE_APPCAST_URL:
         DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
@@ -3198,7 +3895,7 @@ test("stable external bundle inputs remain bound to the reviewed production poli
         Buffer.alloc(32, 1).toString("base64"),
     }, STABLE_RELEASE_CHANNEL),
     {
-      bundleVersion: "42.7",
+      bundleVersion: STABLE_SIGNED_BUNDLE_VERSION,
       productionOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
       provisioningProfile: null,
       sparkleAppcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
@@ -3279,11 +3976,86 @@ test("development and preview builds treat the release-channel policy as optiona
 });
 
 test("macOS release metadata validates versions, production mode, and Keychain references", async () => {
-  assert.equal(normalizeMacOSBundleVersion(), "1");
-  for (const value of ["1", "1.2", "1.2.3", "0.0.0", "123456789"]) {
+  assert.equal(normalizeMacOSBundleVersion(), DERIVED_MACOS_BUNDLE_VERSION);
+  assert.equal(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION, "1023");
+  assert.equal(STABLE_SIGNED_BUNDLE_VERSION, "1024");
+  assert.equal(
+    compareMacOSBundleVersions(
+      INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION,
+      "1022",
+    ) > 0,
+    true,
+  );
+  assert.equal(
+    compareMacOSBundleVersions(
+      STABLE_SIGNED_BUNDLE_VERSION,
+      INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION,
+    ) > 0,
+    true,
+  );
+  assert.equal(
+    resolveSignedMacOSBundleVersion("0.1.18", STABLE_RELEASE_CHANNEL),
+    null,
+    "a future signed version requires an explicit owner-reviewed allocation",
+  );
+  assert.equal(deriveMacOSBundleVersion("0.1.17"), "2000.1.17");
+  assert.equal(
+    compareMacOSBundleVersions(deriveMacOSBundleVersion("0.1.17"), "1") > 0,
+    true,
+  );
+  assert.equal(
+    compareMacOSBundleVersions(
+      deriveMacOSBundleVersion("0.1.17"),
+      "1022",
+    ) > 0,
+    true,
+    "the migration epoch must not strand the installed legacy dogfood build",
+  );
+  for (const [earlier, later] of [
+    ["0.1.17", "0.1.18"],
+    ["0.1.99", "0.2.0"],
+    ["0.99.99", "1.0.0"],
+  ]) {
+    assert.equal(
+      compareMacOSBundleVersions(
+        deriveMacOSBundleVersion(earlier),
+        deriveMacOSBundleVersion(later),
+      ) < 0,
+      true,
+      `${earlier} must remain ordered before ${later}`,
+    );
+  }
+  assert.equal(deriveMacOSBundleVersion("0.0.0"), "2000.0.0");
+  assert.equal(deriveMacOSBundleVersion("7999.99.99"), "9999.99.99");
+  for (const releaseVersion of [
+    "8000.0.0",
+    "9999.0.1",
+    "0.100.1",
+    "0.1.100",
+    "0.1.17-beta.1",
+  ]) {
+    assert.throws(
+      () => deriveMacOSBundleVersion(releaseVersion),
+      { code: "MACOS_BUNDLE_VERSION_DERIVATION_FAILED" },
+      releaseVersion,
+    );
+  }
+  for (const value of ["1", "1.2", "1.2.3", "1234", "1234.99.99"]) {
     assert.equal(normalizeMacOSBundleVersion(value), value);
   }
-  for (const value of ["", "01", "1.", "1.2.3.4", "-1", "1a"]) {
+  for (const value of [
+    "",
+    "0",
+    "0.0.0",
+    "01",
+    "1.",
+    "1.2.3.4",
+    "12345",
+    "1.100",
+    "1.2.100",
+    "-1",
+    "1a",
+  ]) {
     assert.throws(
       () => normalizeMacOSBundleVersion(value),
       { code: "MACOS_APP_BUILD_FAILED" },
@@ -3349,8 +4121,11 @@ test("macOS release metadata validates versions, production mode, and Keychain r
     { code: "MACOS_DISTRIBUTION_CHANNEL_CONFLICT" },
   );
   assert.equal(
-    validateMacOSPreviewOutputPath(".release-build/macos-preview/current/TiboTattle.app")
-      .endsWith("/.release-build/macos-preview/current/TiboTattle.app"),
+    validateMacOSPreviewOutputPath(
+      ".release-build/macos-preview/current/TiboTattle Preview.app",
+    ).endsWith(
+      "/.release-build/macos-preview/current/TiboTattle Preview.app",
+    ),
     true,
   );
   assert.throws(
@@ -3359,7 +4134,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   );
   assert.throws(
     () => validateMacOSPreviewOutputPath(
-      ".release-build/macos-preview/other/TiboTattle.app",
+      ".release-build/macos-preview/other/TiboTattle Preview.app",
     ),
     { code: "MACOS_PREVIEW_OUTPUT_FORBIDDEN" },
   );
@@ -3398,7 +4173,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   );
   assert.deepEqual(
     readMacOSReleaseBuildConfiguration({
-      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+      USAGE_MONITOR_BUNDLE_VERSION: STABLE_SIGNED_BUNDLE_VERSION,
       USAGE_MONITOR_PRODUCTION_ORIGIN: DEPLOYMENT_ENDPOINTS.public.origin,
       USAGE_MONITOR_SPARKLE_APPCAST_URL:
         DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
@@ -3407,7 +4182,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
         Buffer.alloc(32, 1).toString("base64"),
     }),
     {
-      bundleVersion: "42.7",
+      bundleVersion: STABLE_SIGNED_BUNDLE_VERSION,
       productionOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
       // Absent when no provisioning profile is supplied. Restricted
       // entitlements are the only reason to embed one, and Developer ID
@@ -3420,7 +4195,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   );
   assert.deepEqual(
     readMacOSReleaseBuildConfiguration({
-      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+      USAGE_MONITOR_BUNDLE_VERSION: STABLE_SIGNED_BUNDLE_VERSION,
       USAGE_MONITOR_PROVISIONING_PROFILE:
         "/tmp/embedded.provisionprofile",
       USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
@@ -3428,7 +4203,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
         Buffer.alloc(32, 1).toString("base64"),
     }),
     {
-      bundleVersion: "42.7",
+      bundleVersion: STABLE_SIGNED_BUNDLE_VERSION,
       productionOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
       // A supplied profile reaches the release as an exact path, because it
       // is copied into the bundle before signing so the signature seals it.
@@ -3442,7 +4217,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   // release embeds the same file whatever directory the build was invoked in.
   assert.equal(
     readMacOSReleaseBuildConfiguration({
-      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+      USAGE_MONITOR_BUNDLE_VERSION: STABLE_SIGNED_BUNDLE_VERSION,
       USAGE_MONITOR_PROVISIONING_PROFILE:
         "release/embedded.provisionprofile",
       USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
@@ -3456,7 +4231,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   for (const unusable of ["", "release/embedded\0.provisionprofile"]) {
     assert.throws(
       () => readMacOSReleaseBuildConfiguration({
-        USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+        USAGE_MONITOR_BUNDLE_VERSION: STABLE_SIGNED_BUNDLE_VERSION,
         USAGE_MONITOR_PROVISIONING_PROFILE: unusable,
         USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
         USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
@@ -3467,7 +4242,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   }
   assert.throws(
     () => readMacOSReleaseBuildConfiguration({
-      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+      USAGE_MONITOR_BUNDLE_VERSION: STABLE_SIGNED_BUNDLE_VERSION,
       USAGE_MONITOR_PRODUCTION_ORIGIN: "http://usage.example",
       USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
       USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
@@ -3482,11 +4257,11 @@ test("macOS release metadata validates versions, production mode, and Keychain r
       USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
         Buffer.alloc(32, 1).toString("base64"),
     }),
-    { code: "MACOS_BUNDLE_VERSION_REQUIRED" },
+    { code: "MACOS_BUNDLE_VERSION_MISMATCH" },
   );
   assert.throws(
     () => readMacOSReleaseBuildConfiguration({
-      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+      USAGE_MONITOR_BUNDLE_VERSION: STABLE_SIGNED_BUNDLE_VERSION,
       USAGE_MONITOR_PRODUCTION_ORIGIN: "https://usage.example",
       USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
       USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY:
@@ -3496,7 +4271,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   );
   assert.throws(
     () => readMacOSReleaseBuildConfiguration({
-      USAGE_MONITOR_BUNDLE_VERSION: "42.7",
+      USAGE_MONITOR_BUNDLE_VERSION: STABLE_SIGNED_BUNDLE_VERSION,
       USAGE_MONITOR_SPARKLE_APPCAST_URL:
         "https://updates.example/appcast.xml",
       USAGE_MONITOR_SPARKLE_FRAMEWORK: "/tmp/Sparkle.framework",
@@ -3555,7 +4330,7 @@ test("preview CLI inputs are opt-in and development parsing ignores preview envi
   const environment = {
     USAGE_MONITOR_PREVIEW_CENTRAL_ORIGIN: "https://preview.usage.example",
     USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL:
-      "https://updates.usage.example/appcast.xml",
+      "https://updates.usage.example/preview/appcast.xml",
     USAGE_MONITOR_PREVIEW_SPARKLE_PUBLIC_ED_KEY:
       Buffer.alloc(32, 4).toString("base64"),
   };
@@ -3600,8 +4375,9 @@ test("preview CLI inputs are opt-in and development parsing ignores preview envi
     "/.release-deps/Sparkle.framework",
   ), true);
   assert.equal(preview.output.endsWith(
-    "/.release-build/macos-preview/current/TiboTattle.app",
+    "/.release-build/macos-preview/current/TiboTattle Preview.app",
   ), true);
+  assert.equal(preview.bundleVersion, DERIVED_MACOS_BUNDLE_VERSION);
   assert.throws(
     () => parseMacOSBuildArguments([
       "--preview-distribution",
@@ -3619,7 +4395,56 @@ test("preview CLI inputs are opt-in and development parsing ignores preview envi
   );
   assert.equal(
     defaultPreview.sparkleAppcastURL,
+    DEPLOYMENT_ENDPOINTS.sparkle.previewAppcastURL,
+  );
+  assert.notEqual(
+    defaultPreview.sparkleAppcastURL,
     DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
+  );
+  assert.throws(
+    () => parseMacOSBuildArguments([
+      "--preview-distribution",
+    ], {
+      USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL:
+        DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
+    }),
+    { code: "MACOS_PREVIEW_STABLE_FEED_FORBIDDEN" },
+  );
+  for (const appcastURL of [
+    "https://updates.tibotattle.com/%61ppcast.xml",
+    "https://updates.usage.example/appcast.xml",
+    "https://updates.usage.example/preview/%61ppcast.xml",
+  ]) {
+    assert.throws(
+      () => parseMacOSBuildArguments([
+        "--preview-distribution",
+      ], {
+        USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL: appcastURL,
+      }),
+      { code: "MACOS_PREVIEW_FEED_PATH_INVALID" },
+      appcastURL,
+    );
+  }
+  const isolatedRoot = join(tmpdir(), "tibotattle-preview-feed-boundary");
+  await assert.rejects(
+    buildMacOSApp({
+      centralOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
+      output: join(isolatedRoot, PREVIEW_PRODUCT_BRAND.bundleName),
+      previewDistribution: true,
+      previewStagingRoot: isolatedRoot,
+      sparkleAppcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
+    }),
+    { code: "MACOS_PREVIEW_STABLE_FEED_FORBIDDEN" },
+  );
+  await assert.rejects(
+    buildMacOSApp({
+      centralOrigin: DEPLOYMENT_ENDPOINTS.public.origin,
+      output: join(isolatedRoot, PREVIEW_PRODUCT_BRAND.bundleName),
+      previewDistribution: true,
+      previewStagingRoot: isolatedRoot,
+      sparkleAppcastURL: "https://updates.tibotattle.com/%61ppcast.xml",
+    }),
+    { code: "MACOS_PREVIEW_FEED_PATH_INVALID" },
   );
   assert.equal(
     defaultPreview.sparklePublicEdKey,
@@ -3629,11 +4454,11 @@ test("preview CLI inputs are opt-in and development parsing ignores preview envi
     parseMacOSBuildArguments([
       "--validate-preview",
       "--app",
-      ".release-build/macos-preview/current/TiboTattle.app",
+      ".release-build/macos-preview/current/TiboTattle Preview.app",
     ], environment),
     {
       appPath: resolve(
-        ".release-build/macos-preview/current/TiboTattle.app",
+        ".release-build/macos-preview/current/TiboTattle Preview.app",
       ),
       validatePreview: true,
     },
@@ -3683,7 +4508,7 @@ test("preview CLI inputs are opt-in and development parsing ignores preview envi
     () => parseMacOSBuildArguments([
       "--validate-preview",
       "--app",
-      ".release-build/macos-preview/current/TiboTattle.app",
+      ".release-build/macos-preview/current/TiboTattle Preview.app",
       "--test-build",
     ], environment),
     { code: "MACOS_PREVIEW_VALIDATION_ARGUMENTS_INVALID" },
@@ -3894,6 +4719,11 @@ test("signed updater replacement contract validates upgrade and rollback artifac
     channel: createReleaseChannelProvenance(STABLE_RELEASE_CHANNEL, {
       publicEdKeySha256: sparklePublicKeySha256,
     }),
+    source: {
+      commit: "a".repeat(40),
+      repository: "https://github.com/adamallcock/tibotattle",
+      tag: `v${RELEASE_VERSION}`,
+    },
     assurances: { ...assurances },
     updater: {
       appcastURL: "https://usage.example/appcast.xml",
@@ -3921,6 +4751,28 @@ test("signed updater replacement contract validates upgrade and rollback artifac
     "UsageMonitor-candidate.dmg",
     candidateBytes,
   );
+  const legacyStableManifest = {
+    ...previousManifest,
+    application: {
+      ...previousManifest.application,
+      bundleVersion: "0.1.16",
+      shortVersion: "0.1.16",
+    },
+  };
+  delete legacyStableManifest.source;
+  const epochCandidateManifest = {
+    ...candidateManifest,
+    application: {
+      ...candidateManifest.application,
+      bundleVersion: deriveMacOSBundleVersion("0.1.16"),
+      shortVersion: "0.1.16",
+    },
+    source: {
+      commit: "b".repeat(40),
+      repository: "https://github.com/adamallcock/tibotattle",
+      tag: "v0.1.16",
+    },
+  };
   const previousManifestPath = join(
     temporaryRoot,
     "UsageMonitor-previous.dmg.release.json",
@@ -3982,6 +4834,73 @@ test("signed updater replacement contract validates upgrade and rollback artifac
         previousBundleVersion: "10",
       },
     );
+    assert.deepEqual(
+      assertStableSparkleKeyContinuity({
+        candidateBundleVersion:
+          epochCandidateManifest.application.bundleVersion,
+        candidatePublicEdKeySha256: sparklePublicKeySha256,
+        channel: STABLE_RELEASE_CHANNEL,
+        previousManifest: legacyStableManifest,
+      }),
+      {
+        mode: "previous_manifest",
+        policy: "previous_stable_manifest_required",
+        previousBundleVersion: "0.1.16",
+      },
+    );
+    assert.doesNotThrow(() => validateMacOSSignedReplacementPair({
+      previousManifest: legacyStableManifest,
+      candidateManifest: epochCandidateManifest,
+    }));
+    for (const rejectedLegacySource of ["0.1.17", "0.2.0"]) {
+      const rejectedManifest = {
+        ...legacyStableManifest,
+        application: {
+          ...legacyStableManifest.application,
+          bundleVersion: rejectedLegacySource,
+          shortVersion: rejectedLegacySource,
+        },
+        source: {
+          commit: "a".repeat(40),
+          repository: "https://github.com/adamallcock/tibotattle",
+          tag: `v${rejectedLegacySource}`,
+        },
+      };
+      assert.throws(
+        () => assertStableSparkleKeyContinuity({
+          candidateBundleVersion:
+            epochCandidateManifest.application.bundleVersion,
+          candidatePublicEdKeySha256: sparklePublicKeySha256,
+          channel: STABLE_RELEASE_CHANNEL,
+          previousManifest: rejectedManifest,
+        }),
+        { code: "MACOS_STABLE_PREVIOUS_MANIFEST_INVALID" },
+        rejectedLegacySource,
+      );
+      assert.throws(
+        () => validateMacOSSignedReplacementPair({
+          previousManifest: rejectedManifest,
+          candidateManifest: epochCandidateManifest,
+        }),
+        { code: "MACOS_REPLACEMENT_VERSION_INVALID" },
+        rejectedLegacySource,
+      );
+    }
+    assert.throws(
+      () => validateMacOSSignedReplacementPair({
+        previousManifest: epochCandidateManifest,
+        candidateManifest: {
+          ...legacyStableManifest,
+          source: {
+            commit: "a".repeat(40),
+            repository: "https://github.com/adamallcock/tibotattle",
+            tag: "v0.1.16",
+          },
+        },
+      }),
+      { code: "MACOS_REPLACEMENT_VERSION_INVALID" },
+      "the legacy zero-first form must never be accepted as a new candidate",
+    );
     assert.doesNotThrow(() => validateMacOSSignedReplacementPair({
       previousManifest: {
         ...previousManifest,
@@ -4023,6 +4942,60 @@ test("signed updater replacement contract validates upgrade and rollback artifac
         candidateManifest,
       }),
       { code: "MACOS_RELEASE_SOURCE_INVALID" },
+    );
+    const dogfoodChannel = getReleaseChannel(
+      INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+    );
+    const dogfoodManifest = (manifest, bundleVersion, rc) => ({
+      ...manifest,
+      application: {
+        ...manifest.application,
+        bundleVersion,
+      },
+      channel: createReleaseChannelProvenance(
+        INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+        {
+          publicEdKeySha256: dogfoodChannel.sparkle.publicEdKeySha256,
+        },
+      ),
+      source: {
+        repository: "https://github.com/adamallcock/tibotattle",
+        tag: `tibotattle-internal-dogfood-${RELEASE_VERSION}`
+          + `-rc${rc}-source-20260827`,
+        commit: "c".repeat(40),
+      },
+      updater: {
+        ...manifest.updater,
+        appcastURL: dogfoodChannel.sparkle.appcastURL,
+        publicEdKeySha256: dogfoodChannel.sparkle.publicEdKeySha256,
+      },
+    });
+    const previousDogfoodManifest = dogfoodManifest(
+      previousManifest,
+      "1022",
+      1,
+    );
+    const candidateDogfoodManifest = dogfoodManifest(
+      candidateManifest,
+      INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION,
+      2,
+    );
+    assert.doesNotThrow(() => validateMacOSSignedReplacementPair({
+      previousManifest: previousDogfoodManifest,
+      candidateManifest: candidateDogfoodManifest,
+    }));
+    assert.throws(
+      () => validateMacOSSignedReplacementPair({
+        previousManifest: previousDogfoodManifest,
+        candidateManifest: {
+          ...candidateDogfoodManifest,
+          source: {
+            ...candidateDogfoodManifest.source,
+            tag: `v${RELEASE_VERSION}`,
+          },
+        },
+      }),
+      { code: "MACOS_RELEASE_SOURCE_VERSION_MISMATCH" },
     );
     assert.deepEqual(
       assertStableSparkleKeyContinuity({
@@ -4097,13 +5070,63 @@ test("signed updater replacement contract validates upgrade and rollback artifac
     assert.deepEqual(validatedArtifacts, [
       [
         join(temporaryRoot, previousManifest.artifact.fileName),
-        { production: true },
+        {
+          allowLegacyUnsealedSource: false,
+          channel: STABLE_RELEASE_CHANNEL,
+          production: true,
+        },
       ],
       [
         join(temporaryRoot, candidateManifest.artifact.fileName),
-        { production: true },
+        {
+          allowLegacyUnsealedSource: false,
+          channel: STABLE_RELEASE_CHANNEL,
+          production: true,
+        },
       ],
     ]);
+    await writeFile(
+      previousManifestPath,
+      JSON.stringify(legacyStableManifest),
+    );
+    await writeFile(
+      candidateManifestPath,
+      JSON.stringify(epochCandidateManifest),
+    );
+    const legacyValidatedArtifacts = [];
+    await validateMacOSSignedReplacementArtifacts({
+      previousReleaseManifestPath: previousManifestPath,
+      candidateReleaseManifestPath: candidateManifestPath,
+      async validateArtifact(path, options) {
+        legacyValidatedArtifacts.push([path, options]);
+      },
+    });
+    assert.deepEqual(legacyValidatedArtifacts, [
+      [
+        join(temporaryRoot, legacyStableManifest.artifact.fileName),
+        {
+          allowLegacyUnsealedSource: true,
+          channel: STABLE_RELEASE_CHANNEL,
+          production: true,
+        },
+      ],
+      [
+        join(temporaryRoot, epochCandidateManifest.artifact.fileName),
+        {
+          allowLegacyUnsealedSource: false,
+          channel: STABLE_RELEASE_CHANNEL,
+          production: true,
+        },
+      ],
+    ]);
+    await writeFile(
+      previousManifestPath,
+      JSON.stringify(previousManifest),
+    );
+    await writeFile(
+      candidateManifestPath,
+      JSON.stringify(candidateManifest),
+    );
     const command = spawnSync(process.execPath, [
       join(REPOSITORY_ROOT, "scripts", "validate-macos-replacement.js"),
       "--help",
@@ -4310,7 +5333,40 @@ test("signed updater replacement contract validates upgrade and rollback artifac
   }
 });
 
-test("signed macOS releases require a clean, annotated source tag and minimal Node entitlements", async () => {
+test("signed macOS source tags are strict and channel-specific", () => {
+  const dogfoodTag =
+    `tibotattle-internal-dogfood-${RELEASE_VERSION}`
+    + "-rc1-source-20260827";
+  assert.equal(isMacOSReleaseSourceTagForChannel(RELEASE_MANIFEST.tag, {
+    channel: STABLE_RELEASE_CHANNEL,
+    expectedVersion: RELEASE_VERSION,
+  }), true);
+  assert.equal(isMacOSReleaseSourceTagForChannel(dogfoodTag, {
+    channel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+    expectedVersion: RELEASE_VERSION,
+  }), true);
+  for (const tag of [
+    `tibotattle-internal-dogfood-${RELEASE_VERSION}-rc01-source-20260827`,
+    `tibotattle-internal-dogfood-${RELEASE_VERSION}-rc1-source-20260230`,
+    `tibotattle-internal-dogfood-${RELEASE_VERSION}-rc1/source-20260827`,
+    "tibotattle-internal-dogfood-9.9.9-rc1-source-20260827",
+  ]) {
+    assert.equal(isMacOSReleaseSourceTagForChannel(tag, {
+      channel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+      expectedVersion: RELEASE_VERSION,
+    }), false, tag);
+  }
+  assert.equal(isMacOSReleaseSourceTagForChannel(dogfoodTag, {
+    channel: STABLE_RELEASE_CHANNEL,
+    expectedVersion: RELEASE_VERSION,
+  }), false);
+  assert.equal(isMacOSReleaseSourceTagForChannel(RELEASE_MANIFEST.tag, {
+    channel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+    expectedVersion: RELEASE_VERSION,
+  }), false);
+});
+
+test("signed macOS releases require a clean, annotated channel source tag and minimal Node entitlements", async () => {
   const temporaryRoot = await mkdtemp(
     join(await realpath(tmpdir()), "usage-monitor-release-provenance-test-"),
   );
@@ -4360,6 +5416,67 @@ test("signed macOS releases require a clean, annotated source tag and minimal No
       }),
       { code: "MACOS_RELEASE_SOURCE_VERSION_MISMATCH" },
     );
+
+    const dogfoodTag =
+      `tibotattle-internal-dogfood-${RELEASE_VERSION}`
+      + "-rc1-source-20260827";
+    execFileSync("/usr/bin/git", ["tag", "-a", dogfoodTag, "-m", "dogfood source"], {
+      cwd: temporaryRoot,
+    });
+    assert.equal(
+      readMacOSReleaseSourceProvenance({
+        repositoryRoot: temporaryRoot,
+        channel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+        expectedVersion: RELEASE_VERSION,
+      }).tag,
+      dogfoodTag,
+    );
+    assert.equal(
+      readMacOSReleaseSourceProvenance({
+        repositoryRoot: temporaryRoot,
+        channel: STABLE_RELEASE_CHANNEL,
+        expectedVersion: RELEASE_VERSION,
+      }).tag,
+      RELEASE_MANIFEST.tag,
+      "the stable tag remains unambiguous when the tested commit also has a dogfood source tag",
+    );
+    execFileSync("/usr/bin/git", [
+      "tag",
+      "-a",
+      `tibotattle-internal-dogfood-${RELEASE_VERSION}-rc2-source-20260827`,
+      "-m",
+      "ambiguous dogfood source",
+    ], { cwd: temporaryRoot });
+    assert.throws(
+      () => readMacOSReleaseSourceProvenance({
+        repositoryRoot: temporaryRoot,
+        channel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+        expectedVersion: RELEASE_VERSION,
+      }),
+      { code: "MACOS_RELEASE_PROVENANCE_INVALID" },
+    );
+    execFileSync("/usr/bin/git", [
+      "tag",
+      "-d",
+      `tibotattle-internal-dogfood-${RELEASE_VERSION}-rc2-source-20260827`,
+    ], { cwd: temporaryRoot, stdio: "ignore" });
+    execFileSync("/usr/bin/git", ["tag", "-d", dogfoodTag], {
+      cwd: temporaryRoot,
+      stdio: "ignore",
+    });
+    execFileSync("/usr/bin/git", ["tag", dogfoodTag], { cwd: temporaryRoot });
+    assert.throws(
+      () => readMacOSReleaseSourceProvenance({
+        repositoryRoot: temporaryRoot,
+        channel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+        expectedVersion: RELEASE_VERSION,
+      }),
+      { code: "MACOS_RELEASE_TAG_REQUIRED" },
+    );
+    execFileSync("/usr/bin/git", ["tag", "-d", dogfoodTag], {
+      cwd: temporaryRoot,
+      stdio: "ignore",
+    });
 
     execFileSync("/usr/bin/git", [
       "remote",
@@ -4558,6 +5675,8 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
         UsageMonitorMonitoredAppDisplayName:
           PRODUCT_BRAND.monitoredAppDisplayName,
         UsageMonitorStateDirectoryName: PRODUCT_BRAND.stateDirectoryName,
+        UsageMonitorKeychainNamespace: PRODUCT_BRAND.keychainNamespace,
+        UsageMonitorKeychainAccount: PRODUCT_BRAND.keychainAccount,
         UsageMonitorUpdaterEnabled: true,
         UsageMonitorUpdaterFrameworkVersion: SPARKLE_VERSION,
         SUAllowsAutomaticUpdates: true,
@@ -4569,7 +5688,7 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
         SUVerifyUpdateBeforeExtraction: true,
       }),
     );
-    const writeBuildManifest = async () => await writeFile(
+    const writeBuildManifest = async ({ includeSource = true } = {}) => await writeFile(
       join(resources, "build-manifest.json"),
       JSON.stringify({
         schemaVersion: "usage-monitor-macos-app-build-v0.1",
@@ -4594,6 +5713,12 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
             )
             .digest("hex"),
           requiresDeveloperIDAndNotarization: true,
+          ...(includeSource ? {
+            source: {
+              commit: "a".repeat(40),
+              tag: "v0.0.1",
+            },
+          } : {}),
           updater: {
             appcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
             automaticChecks: true,
@@ -4615,6 +5740,30 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
         },
         payload: await testPayloadInventory(app, temporaryRoot),
       }),
+    );
+    await writeBuildManifest();
+
+    assert.deepEqual(
+      (await inspectMacOSApp(app, {
+        requireExternalDistribution: true,
+      })).source,
+      { commit: "a".repeat(40), tag: "v0.0.1" },
+    );
+    const buildManifestPath = join(resources, "build-manifest.json");
+    const mismatchedSourceManifest = JSON.parse(
+      await readFile(buildManifestPath, "utf8"),
+    );
+    mismatchedSourceManifest.release.source = {
+      commit: "b".repeat(40),
+      tag: "v0.0.2",
+    };
+    await writeFile(
+      buildManifestPath,
+      JSON.stringify(mismatchedSourceManifest),
+    );
+    await assert.rejects(
+      inspectMacOSApp(app, { requireExternalDistribution: true }),
+      { code: "MACOS_RELEASE_SOURCE_INVALID" },
     );
     await writeBuildManifest();
 
@@ -4917,7 +6066,11 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/macos/Sources/KeychainBroker.swift",
     "apps/macos/Sources/Localization.swift",
     "apps/macos/Sources/LoginItemManager.swift",
+    "apps/macos/Sources/MenuBarPaceOutlook.swift",
+    "apps/macos/Sources/MenuBarPopover.swift",
+    "apps/macos/Sources/MenuBarPopupModel.swift",
     "apps/macos/Sources/MenuBarStatus.swift",
+    "apps/macos/Sources/NativeBrandPalette.swift",
     "apps/macos/Sources/QuotaNotifications.swift",
     "apps/macos/Sources/SemanticOpenTarget.swift",
     "apps/macos/UsageMonitorApp.swift",
@@ -6050,11 +7203,14 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.equal(
       menuBarSmoke.status,
       0,
-      menuBarSmoke.stderr || menuBarSmoke.stdout,
+      menuBarSmoke.error?.message
+        ?? (menuBarSmoke.stderr
+          || menuBarSmoke.stdout
+          || `signal=${menuBarSmoke.signal ?? "none"}`),
     );
     assert.match(
       menuBarSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT native_rows=true titles=true states=starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q dismissal=native,escape,same-app,deactivation weekly_position=fresh-only analysis_title=live-fallback$/mu,
+      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT popover=true width=400 bars=7,30 pace=canonical-outlook native_actions=true states=live,starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q routing=left-popover,right-menu,control-menu dismissal=escape,transient,same-app,deactivation weekly_position=factual-menu-only pace_outlook=collecting,under,on,over,critical,fail-closed history=authoritative,coverage-named,fail-closed pricing=complete,partial,unavailable model=dst,overlap,future,per-lane reset_credits=absent analysis_title=live-fallback$/mu,
     );
     const analysisProgressSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),
@@ -6068,7 +7224,110 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       analysisProgressSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_ANALYSIS_PROGRESS_CONTRACT phases=allowlisted archive=scanning counts=bounded contradictory=generic unknown=generic free_text=ignored idle=unchanged percent=false eta=false$/mu,
+      /^USAGE_MONITOR_MACOS_ANALYSIS_PROGRESS_CONTRACT phases=allowlisted archive=scanning unified=scanning counts=bounded quick_result=evidence-gated contradictory=generic unknown=generic free_text=ignored idle=unchanged terminal=automatic-backoff percent=false eta=false$/mu,
+    );
+    const popupRenderDirectory = join(temporaryRoot, "menu-bar-popover-render");
+    const popupRenderSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--menu-bar-popover-render-smoke-test", popupRenderDirectory],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(
+      popupRenderSmoke.status,
+      0,
+      popupRenderSmoke.stderr || popupRenderSmoke.stdout,
+    );
+    assert.match(
+      popupRenderSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_MENU_BAR_POPOVER_RENDER locales=en,es,zh-Hans appearances=light,dark ranges=7d,30d states=live,pace-collecting,pace-under,pace-on,pace-over,pace-critical,partial-pricing,unpriced,unavailable width=400 source=synthetic-content-free$/mu,
+    );
+    const popupRenders = (await readdir(popupRenderDirectory)).sort();
+    assert.equal(popupRenders.length, 15);
+    assert.equal(
+      popupRenders.includes("menu-bar-popover-en-30d-light.png"),
+      true,
+    );
+    assert.equal(
+      popupRenders.includes("menu-bar-popover-zh-Hans-dark.png"),
+      true,
+    );
+    assert.equal(
+      popupRenders.includes("menu-bar-popover-es-partial-pricing-light.png"),
+      true,
+    );
+    assert.equal(
+      popupRenders.includes("menu-bar-popover-es-unpriced-light.png"),
+      true,
+    );
+    assert.equal(
+      popupRenders.includes("menu-bar-popover-es-unavailable-light.png"),
+      true,
+    );
+    for (const paceState of ["collecting", "under", "on", "critical"]) {
+      assert.equal(
+        popupRenders.includes(
+          `menu-bar-popover-en-pace-${paceState}-light.png`,
+        ),
+        true,
+      );
+    }
+    const popupRenderDigests = new Map();
+    for (const popupRender of popupRenders) {
+      const renderBytes = await readFile(join(popupRenderDirectory, popupRender));
+      assert.ok(
+        renderBytes.length > 1_000,
+        popupRender,
+      );
+      assert.equal(
+        renderBytes.subarray(0, 8).toString("hex"),
+        "89504e470d0a1a0a",
+        popupRender,
+      );
+      assert.equal(renderBytes.readUInt32BE(16), 800, popupRender);
+      const pixelHeight = renderBytes.readUInt32BE(20);
+      assert.ok(pixelHeight >= 600, popupRender);
+      if (!popupRender.includes("unavailable")) {
+        assert.ok(pixelHeight >= 1_000, popupRender);
+      }
+      popupRenderDigests.set(
+        popupRender,
+        createHash("sha256").update(renderBytes).digest("hex"),
+      );
+    }
+    assert.notEqual(
+      popupRenderDigests.get("menu-bar-popover-en-light.png"),
+      popupRenderDigests.get("menu-bar-popover-en-dark.png"),
+    );
+    assert.notEqual(
+      popupRenderDigests.get("menu-bar-popover-en-light.png"),
+      popupRenderDigests.get("menu-bar-popover-en-30d-light.png"),
+    );
+    assert.notEqual(
+      popupRenderDigests.get("menu-bar-popover-en-light.png"),
+      popupRenderDigests.get("menu-bar-popover-es-light.png"),
+    );
+    assert.notEqual(
+      popupRenderDigests.get("menu-bar-popover-es-light.png"),
+      popupRenderDigests.get("menu-bar-popover-zh-Hans-light.png"),
+    );
+    assert.notEqual(
+      popupRenderDigests.get("menu-bar-popover-es-partial-pricing-light.png"),
+      popupRenderDigests.get("menu-bar-popover-es-unpriced-light.png"),
+    );
+    assert.notEqual(
+      popupRenderDigests.get("menu-bar-popover-es-unpriced-light.png"),
+      popupRenderDigests.get("menu-bar-popover-es-unavailable-light.png"),
+    );
+    const paceRenderNames = [
+      "menu-bar-popover-en-light.png",
+      "menu-bar-popover-en-pace-collecting-light.png",
+      "menu-bar-popover-en-pace-under-light.png",
+      "menu-bar-popover-en-pace-on-light.png",
+      "menu-bar-popover-en-pace-critical-light.png",
+    ];
+    assert.equal(
+      new Set(paceRenderNames.map((name) => popupRenderDigests.get(name))).size,
+      paceRenderNames.length,
     );
     const quotaNotificationSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),
@@ -6413,6 +7672,14 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.equal(
       plistJson.UsageMonitorStateDirectoryName,
       PRODUCT_BRAND.stateDirectoryName,
+    );
+    assert.equal(
+      plistJson.UsageMonitorKeychainNamespace,
+      PRODUCT_BRAND.keychainNamespace,
+    );
+    assert.equal(
+      plistJson.UsageMonitorKeychainAccount,
+      PRODUCT_BRAND.keychainAccount,
     );
     assert.equal(
       plistJson.UsageMonitorMonitoredAppDisplayName,
@@ -6928,9 +8195,12 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
   }
 });
 
-macOSArtifactTest("preview distribution builds retain the normal identity and reject production validation", {
+macOSArtifactTest("preview distribution builds use an isolated identity and reject production validation", {
   skip: BUILD_SUPPORTED ? false : "requires pinned macOS arm64 Node v26.2.0 builder",
-  timeout: 120_000,
+  // This performs two complete preview builds plus DMG packaging. A warm
+  // arm64 development host can legitimately approach two minutes, so retain
+  // enough margin for CI load without weakening any build assertion.
+  timeout: 240_000,
 }, async (context) => {
   const preparedFramework = join(
     REPOSITORY_ROOT,
@@ -6949,7 +8219,11 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
   const temporaryRoot = await mkdtemp(
     join(await realpath(tmpdir()), "usage-monitor-macos-preview-test-"),
   );
-  const output = join(temporaryRoot, "preview", "TiboTattle.app");
+  const output = join(
+    temporaryRoot,
+    "preview",
+    PREVIEW_PRODUCT_BRAND.bundleName,
+  );
   const publicEdKey = Buffer.alloc(32, 9).toString("base64");
   try {
     const build = await buildMacOSApp({
@@ -6958,7 +8232,7 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
       output,
       previewDistribution: true,
       previewStagingRoot: dirname(output),
-      sparkleAppcastURL: "https://updates.usage.example/appcast.xml",
+      sparkleAppcastURL: "https://updates.usage.example/preview/appcast.xml",
       sparkleFramework: preparedFramework,
       sparklePublicEdKey: publicEdKey,
     });
@@ -6982,8 +8256,20 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
       "Resources",
       "build-manifest.json",
     ), "utf8"));
-    assert.equal(manifest.application.bundleIdentifier, PRODUCT_BRAND.bundleIdentifier);
+    assert.equal(
+      manifest.application.bundleIdentifier,
+      PREVIEW_PRODUCT_BRAND.bundleIdentifier,
+    );
+    assert.equal(manifest.application.name, PREVIEW_PRODUCT_BRAND.displayName);
     assert.equal(manifest.application.bundleVersion, "42");
+    assert.equal(
+      manifest.runtime.stateRoot,
+      `~/Library/Application Support/${PREVIEW_PRODUCT_BRAND.stateDirectoryName}`,
+    );
+    assert.deepEqual(manifest.runtime.keychain, {
+      account: PREVIEW_PRODUCT_BRAND.keychainAccount,
+      namespace: PREVIEW_PRODUCT_BRAND.keychainNamespace,
+    });
     assert.equal(manifest.release.channel, MACOS_PREVIEW_DISTRIBUTION_CHANNEL);
     assert.equal(
       manifest.release.channelName,
@@ -6994,9 +8280,10 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
     assert.equal(manifest.release.requiresDeveloperIDAndNotarization, false);
     assert.deepEqual(await validateMacOSPreviewApp(output), {
       appPath: resolve(output),
-      bundleIdentifier: PRODUCT_BRAND.bundleIdentifier,
+      bundleIdentifier: PREVIEW_PRODUCT_BRAND.bundleIdentifier,
       bundleVersion: "42",
       channel: MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+      shortVersion: RELEASE_VERSION,
       updaterEnabled: true,
     });
     const previewDMG = join(
@@ -7012,9 +8299,23 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
     assert.equal(packagedPreview.distribution, "preview");
     assert.equal(packagedPreview.output, previewDMG);
     assert.equal(packagedPreview.bytes > 0, true);
+    assert.deepEqual(
+      await validateMacOSDMG(previewDMG, {
+        distribution: "preview",
+        expectedBundleIdentifier: PREVIEW_PRODUCT_BRAND.bundleIdentifier,
+        expectedBundleVersion: "42",
+        expectedShortVersion: RELEASE_VERSION,
+        production: false,
+      }),
+      {
+        bundleIdentifier: PREVIEW_PRODUCT_BRAND.bundleIdentifier,
+        production: false,
+        shortVersion: RELEASE_VERSION,
+      },
+    );
     await assert.rejects(
       inspectMacOSApp(output, { requireExternalDistribution: true }),
-      { code: "MACOS_UPDATER_CONFIGURATION_INVALID" },
+      { code: "MACOS_RELEASE_FAILED" },
     );
     const plist = JSON.parse(execFileSync("/usr/bin/plutil", [
       "-convert",
@@ -7023,7 +8324,30 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
       "-",
       join(output, "Contents", "Info.plist"),
     ], { encoding: "utf8" }));
-    assert.equal(plist.CFBundleIdentifier, PRODUCT_BRAND.bundleIdentifier);
+    assert.equal(
+      plist.CFBundleIdentifier,
+      PREVIEW_PRODUCT_BRAND.bundleIdentifier,
+    );
+    assert.equal(
+      plist.CFBundleDisplayName,
+      PREVIEW_PRODUCT_BRAND.displayName,
+    );
+    assert.equal(
+      plist.UsageMonitorAppOpenURL,
+      PREVIEW_PRODUCT_BRAND.appOpenURL,
+    );
+    assert.equal(
+      plist.UsageMonitorStateDirectoryName,
+      PREVIEW_PRODUCT_BRAND.stateDirectoryName,
+    );
+    assert.equal(
+      plist.UsageMonitorKeychainNamespace,
+      PREVIEW_PRODUCT_BRAND.keychainNamespace,
+    );
+    assert.equal(
+      plist.UsageMonitorKeychainAccount,
+      PREVIEW_PRODUCT_BRAND.keychainAccount,
+    );
     assert.equal(
       plist.UsageMonitorPublicWebsiteOrigin,
       DEPLOYMENT_ENDPOINTS.public.origin,
@@ -7054,6 +8378,126 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
       updaterSmoke.stdout,
       /^USAGE_MONITOR_MACOS_UPDATER_CONTRACT runtime=sparkle_2_9_3_enabled state=feed_unverified$/mu,
     );
+    const previewPlistPath = join(output, "Contents", "Info.plist");
+    const pristinePreviewPlist = await readFile(previewPlistPath);
+    const previewLauncher = join(output, "Contents", "MacOS", "TiboTattle");
+    const rejectedRuntimeIdentityMutations = [
+      {
+        label: "stable state directory",
+        replacements: [
+          [
+            "UsageMonitorStateDirectoryName",
+            "-string",
+            PRODUCT_BRAND.stateDirectoryName,
+          ],
+        ],
+      },
+      {
+        label: "stable semantic-open target",
+        replacements: [
+          [
+            "UsageMonitorAppOpenScheme",
+            "-string",
+            PRODUCT_BRAND.appOpenScheme,
+          ],
+          ["UsageMonitorAppOpenURL", "-string", PRODUCT_BRAND.appOpenURL],
+        ],
+      },
+      {
+        label: "stable LaunchServices registration",
+        replacements: [
+          [
+            "CFBundleURLTypes.0.CFBundleURLName",
+            "-string",
+            `${PRODUCT_BRAND.bundleIdentifier}.${PRODUCT_BRAND.appOpenHost}`,
+          ],
+          [
+            "CFBundleURLTypes.0.CFBundleURLSchemes.0",
+            "-string",
+            PRODUCT_BRAND.appOpenScheme,
+          ],
+        ],
+      },
+      {
+        label: "alternate LaunchServices registration",
+        replacements: [
+          [
+            "CFBundleURLTypes.0.CFBundleURLSchemes.0",
+            "-string",
+            "alternate-preview",
+          ],
+        ],
+      },
+      {
+        label: "malformed LaunchServices registration",
+        replacements: [
+          [
+            "CFBundleURLTypes.0.CFBundleURLSchemes",
+            "-string",
+            PREVIEW_PRODUCT_BRAND.appOpenScheme,
+          ],
+        ],
+      },
+      {
+        label: "stable build channel",
+        replacements: [
+          ["UsageMonitorBuildChannel", "-string", "production"],
+          ["UsageMonitorReleaseChannel", "-string", STABLE_RELEASE_CHANNEL],
+        ],
+      },
+      {
+        label: "non-preview marker",
+        replacements: [
+          ["UsageMonitorPreviewDistribution", "-bool", "false"],
+        ],
+      },
+      {
+        label: "stable appcast",
+        replacements: [
+          ["SUFeedURL", "-string", DEPLOYMENT_ENDPOINTS.sparkle.appcastURL],
+        ],
+      },
+      {
+        label: "automatic preview updates",
+        replacements: [
+          ["SUEnableAutomaticChecks", "-bool", "true"],
+          ["SUAllowsAutomaticUpdates", "-bool", "true"],
+          ["SUAutomaticallyUpdate", "-bool", "true"],
+        ],
+      },
+    ];
+    try {
+      await chmod(previewPlistPath, 0o644);
+      for (const mutation of rejectedRuntimeIdentityMutations) {
+        await writeFile(previewPlistPath, pristinePreviewPlist);
+        for (const [key, type, value] of mutation.replacements) {
+          execFileSync("/usr/bin/plutil", [
+            "-replace",
+            key,
+            type,
+            value,
+            previewPlistPath,
+          ]);
+        }
+        const rejectedLaunch = spawnSync(
+          previewLauncher,
+          ["--updater-contract-smoke-test"],
+          { encoding: "utf8" },
+        );
+        assert.equal(
+          rejectedLaunch.status !== 0 || rejectedLaunch.signal !== null,
+          true,
+          mutation.label,
+        );
+        assert.match(
+          `${rejectedLaunch.stderr}\n${rejectedLaunch.stdout}`,
+          /Invalid bundled runtime identity/u,
+          mutation.label,
+        );
+      }
+    } finally {
+      await writeFile(previewPlistPath, pristinePreviewPlist);
+    }
     const failedFeedSmoke = spawnSync(
       join(output, "Contents", "MacOS", "TiboTattle"),
       ["--updater-feed-contract-smoke-test", "404"],
@@ -7089,12 +8533,137 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
         output,
         previewDistribution: true,
         previewStagingRoot: dirname(output),
-        sparkleAppcastURL: "https://updates.usage.example/appcast.xml",
+        sparkleAppcastURL: "https://updates.usage.example/preview/appcast.xml",
         sparkleFramework: preparedFramework,
         sparklePublicEdKey: publicEdKey,
       }),
       { code: "MACOS_PREVIEW_REPLACE_REQUIRED" },
     );
+    const retiredKeytarPath = join(
+      output,
+      ...RETIRED_PREVIEW_KEYTAR_PATH.split("/"),
+    );
+    await mkdir(dirname(retiredKeytarPath), {
+      recursive: true,
+      mode: 0o755,
+    });
+    await copyFile(previewLauncher, retiredKeytarPath);
+    await chmod(retiredKeytarPath, 0o555);
+    const retiredPayloadManifestPath = join(
+      output,
+      "Contents",
+      "Resources",
+      "build-manifest.json",
+    );
+    await chmod(retiredPayloadManifestPath, 0o644);
+    const retiredPayloadManifest = JSON.parse(await readFile(
+      retiredPayloadManifestPath,
+      "utf8",
+    ));
+    retiredPayloadManifest.payload = await testPayloadInventory(
+      output,
+      temporaryRoot,
+      { normalizedCodePaths: LEGACY_PREVIEW_NORMALIZED_TEST_CODE_PATHS },
+    );
+    const pristineRetiredPayloadManifest = JSON.stringify(
+      retiredPayloadManifest,
+    );
+    await writeFile(
+      retiredPayloadManifestPath,
+      pristineRetiredPayloadManifest,
+    );
+    execFileSync("/usr/bin/codesign", [
+      "--force",
+      "--sign",
+      "-",
+      "--options",
+      "runtime",
+      "--timestamp=none",
+      output,
+    ], { stdio: "ignore" });
+    assert.deepEqual(await validateMacOSPreviewApp(output), {
+      appPath: resolve(output),
+      bundleIdentifier: PREVIEW_PRODUCT_BRAND.bundleIdentifier,
+      bundleVersion: "42",
+      channel: MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+      shortVersion: RELEASE_VERSION,
+      updaterEnabled: true,
+    });
+
+    const invalidNormalizationManifest = JSON.parse(
+      pristineRetiredPayloadManifest,
+    );
+    const retiredKeytarEntry = invalidNormalizationManifest.payload.files
+      .find(({ path }) => path === RETIRED_PREVIEW_KEYTAR_PATH);
+    assert.notEqual(retiredKeytarEntry, undefined);
+    retiredKeytarEntry.normalization = "raw";
+    await writeFile(
+      retiredPayloadManifestPath,
+      JSON.stringify(invalidNormalizationManifest),
+    );
+    await assert.rejects(
+      validateMacOSPreviewApp(output),
+      { code: "MACOS_PAYLOAD_INTEGRITY_FAILED" },
+    );
+    await writeFile(
+      retiredPayloadManifestPath,
+      pristineRetiredPayloadManifest,
+    );
+
+    const pristineRetiredKeytar = await readFile(retiredKeytarPath);
+    const retiredKeytarMode = (await lstat(retiredKeytarPath)).mode & 0o777;
+    await chmod(retiredKeytarPath, 0o755);
+    await appendFile(retiredKeytarPath, "tampered");
+    await assert.rejects(
+      validateMacOSPreviewApp(output),
+      {
+        code: "MACOS_APP_BUILD_FAILED",
+        message: /codesign failed/u,
+      },
+    );
+    await writeFile(retiredKeytarPath, pristineRetiredKeytar);
+    await chmod(retiredKeytarPath, retiredKeytarMode);
+    execFileSync("/usr/bin/codesign", [
+      "--force",
+      "--sign",
+      "-",
+      "--options",
+      "runtime",
+      "--timestamp=none",
+      output,
+    ], { stdio: "ignore" });
+    await validateMacOSPreviewApp(output);
+
+    await buildMacOSApp({
+      bundleVersion: "42",
+      centralOrigin: "https://preview.usage.example",
+      output,
+      previewDistribution: true,
+      previewStagingRoot: dirname(output),
+      replacePreviewOutput: true,
+      sparkleAppcastURL: "https://updates.usage.example/preview/appcast.xml",
+      sparkleFramework: preparedFramework,
+      sparklePublicEdKey: publicEdKey,
+    });
+    await assert.rejects(
+      lstat(retiredKeytarPath),
+      { code: "ENOENT" },
+    );
+    const replacementManifest = JSON.parse(await readFile(
+      retiredPayloadManifestPath,
+      "utf8",
+    ));
+    assert.equal(
+      replacementManifest.payload.files.some(
+        ({ path }) => path === RETIRED_PREVIEW_KEYTAR_PATH,
+      ),
+      false,
+    );
+    await assert.rejects(
+      lstat(join(dirname(output), "retired")),
+      { code: "ENOENT" },
+    );
+
     const legacyManifestPath = join(
       output,
       "Contents",
@@ -7122,20 +8691,24 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
       previewDistribution: true,
       previewStagingRoot: dirname(output),
       replacePreviewOutput: true,
-      sparkleAppcastURL: "https://updates.usage.example/appcast.xml",
+      sparkleAppcastURL: "https://updates.usage.example/preview/appcast.xml",
       sparkleFramework: preparedFramework,
       sparklePublicEdKey: publicEdKey,
     });
     assert.deepEqual(await validateMacOSPreviewApp(output), {
       appPath: resolve(output),
-      bundleIdentifier: PRODUCT_BRAND.bundleIdentifier,
+      bundleIdentifier: PREVIEW_PRODUCT_BRAND.bundleIdentifier,
       bundleVersion: "42",
       channel: MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+      shortVersion: RELEASE_VERSION,
       updaterEnabled: true,
     });
     const retired = await readdir(join(dirname(output), "retired"));
     assert.equal(retired.length, 1);
-    assert.match(retired[0], /^TiboTattle-legacy-preview-[a-f0-9]{16}\.app$/u);
+    assert.match(
+      retired[0],
+      /^TiboTattle Preview-legacy-preview-[a-f0-9]{16}\.app$/u,
+    );
     const archivedManifest = JSON.parse(await readFile(join(
       dirname(output),
       "retired",
@@ -7152,7 +8725,10 @@ macOSArtifactTest("preview distribution builds retain the normal identity and re
 
 macOSArtifactTest("signed app relays central health to an explicitly connected loopback lab", {
   skip: BUILD_SUPPORTED ? false : "requires pinned macOS arm64 Node v26.2.0 builder",
-  timeout: 60_000,
+  // The contract builds and signs both loopback and production variants.
+  // Keep the child and overall budgets above observed full-app compile time;
+  // the readiness and origin assertions below remain independently bounded.
+  timeout: 180_000,
 }, async () => {
   const temporaryRoot = await mkdtemp(
     join(await realpath(tmpdir()), "usage-monitor-macos-central-test-"),
@@ -7191,7 +8767,7 @@ macOSArtifactTest("signed app relays central health to an explicitly connected l
     ], {
       cwd: REPOSITORY_ROOT,
       encoding: "utf8",
-      timeout: 30_000,
+      timeout: 90_000,
     });
     assert.equal(build.status, 0, build.stderr || build.stdout);
     assert.match(build.stdout, /^Central service: development_loopback$/mu);
@@ -7266,7 +8842,7 @@ macOSArtifactTest("signed app relays central health to an explicitly connected l
     ], {
       cwd: REPOSITORY_ROOT,
       encoding: "utf8",
-      timeout: 30_000,
+      timeout: 90_000,
     });
     assert.equal(
       productionBuild.status,

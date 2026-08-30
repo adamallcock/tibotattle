@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cp, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -17,6 +17,9 @@ test("telemetry contract wrapper validates an exact package copy", async () => {
   const directory = await mkdtemp(join(tmpdir(), "telemetry-contract-copy-"));
   const installedRoot = join(directory, "installed");
   await cp(SOURCE_ROOT, installedRoot, { recursive: true });
+  // npm installs only files declared by the package manifest. Keep the
+  // synthetic installed copy faithful when scoped guidance is present.
+  await rm(join(installedRoot, "AGENTS.md"));
 
   const receipt = await checkLocalTelemetryContractPackage({
     sourceRoot: SOURCE_ROOT.pathname,
@@ -33,6 +36,7 @@ test("telemetry contract wrapper rejects a stale installed source", async () => 
   const directory = await mkdtemp(join(tmpdir(), "telemetry-contract-stale-"));
   const installedRoot = join(directory, "installed");
   await cp(SOURCE_ROOT, installedRoot, { recursive: true });
+  await rm(join(installedRoot, "AGENTS.md"));
   const selected = join(installedRoot, "src", "constants.js");
   await writeFile(
     selected,

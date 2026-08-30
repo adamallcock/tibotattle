@@ -24,7 +24,7 @@ an informal archive.
 | Detailed API inventory | [Source-backed API surface reference](./reference/2026-08-26-api-surface-reference.md) | Complete inventory maintained with source-parity tests; implemented source is not deployment or release proof |
 | Commands | [Command-line reference](./reference/cli-reference.md) | Source-checked `usage-monitor` command inventory and safety classes |
 | Schemas | [Schema and contract lifecycle](./reference/schema-contracts.md) | Canonical owners, mirrors, generators, versioning, and retirement |
-| Local index | [Unified local index schema](./reference/unified-index-schema.md) | Current schema family, physical/parser versions, tables, generation, and migration rules |
+| Local index | [Unified local index schema](./reference/unified-index-schema.md) | Current schema family, physical/parser versions, tables, generation, and migration rules; includes the accepted schema-11 cleanup indexes |
 | Local recovery | [Unified index preservation and recovery](./runbooks/unified-index-recovery.md) | Preservation-first diagnosis and candidate rebuild; never relabel or destroy the only index |
 | Sidebar recovery | [Collapsed dashboard sidebar rescue](./runbooks/sidebar-stranded-collapsed-rescue.md) | Current 0.1.16 recovery for persisted collapsed navigation; removes only exact window-geometry defaults |
 | Platform support | [Platform support and qualification](./reference/platform-support.md) | macOS support and the evidence ladder Windows/Linux must satisfy before any claim |

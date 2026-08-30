@@ -88,6 +88,7 @@
         "scripts/macos-release-core.js",
         "scripts/build-public-release-site.js",
         "scripts/install-macos-preview-app.js",
+        "scripts/validate-macos-install.js",
         "scripts/verify-macos-preview-remote.js",
         "test/browser-module-serving-parity.test.js",
         "test/macos-app-bundle.test.js",
@@ -609,6 +610,27 @@
     {
       "classification": "build_release_operation",
       "owner": "macos_release",
+      "canonicalPath": "scripts/macos-bundle-version.js",
+      "stableAlias": null,
+      "stableAliasReason": "Internal Apple bundle-version grammar, migration epoch, and comparator shared by macOS release tools; it is not a standalone command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/build-macos-app.js",
+        "scripts/generate-sparkle-appcast.js",
+        "scripts/macos-release-core.js",
+        "scripts/publish-sparkle-update.js",
+        "scripts/sparkle-signed-feed-validation.js",
+        "scripts/verify-macos-preview-remote.js",
+        "test/macos-app-bundle.test.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/decisions/2026-08-27-local-state-schema-and-release-channel-isolation.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
       "canonicalPath": "scripts/macos-release-core.js",
       "stableAlias": null,
       "stableAliasReason": "Shared release module is imported by macOS release commands and tests, not invoked directly.",
@@ -793,6 +815,22 @@
       "decision": "retain_without_modification_until_r7_source_freeze",
       "provenance": null,
       "provenanceReason": "R7 receipts bind this worker through source inventory, but no dated narrative artifact directly identifies the worker path.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "shipped_product_operation",
+      "owner": "local_analysis",
+      "canonicalPath": "scripts/local-unified-index-recovery-core.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Internal recovery helper imported by the supported index rebuild command and its focused regression; it is not invoked directly.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/rebuild-local-unified-index.mjs",
+        "test/local-unified-index-recovery.test.js"
+      ],
+      "decision": "retain_as_internal_product_support",
+      "provenance": "docs/runbooks/2026-08-27-local-unified-index-recovery.md",
+      "provenanceReason": null,
       "legacyPaths": []
     },
     {

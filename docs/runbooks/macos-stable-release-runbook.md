@@ -81,6 +81,26 @@ grep -E "^ℹ (tests|pass|fail)" preflight.log; echo "exit=$ec"
 
 Expect `fail 0`. A green-looking terminal is not a green suite.
 
+### 0.1.17 local-state migration gate
+
+Before signing the 0.1.17 internal-dogfood candidate, rehearse the applicable
+schema-11 transition against a consistent disposable copy of the stable unified
+index and its matching device salt. Schema 8/9 must take the normal staged
+rebuild from readable raw history; schema 10 must take the additive staged
+migration without a source rescan. Keep the installed app stopped while taking
+the copy, leave the live source read-only, and compare SQLite integrity,
+generation metadata, row counts, aggregate token/cost ranges, and source-cursor
+coverage before and after the transition. Follow the canonical
+[local unified-index recovery runbook](./unified-index-recovery.md)
+for compatibility and preservation rules.
+
+The isolated `preview_distribution` app cannot satisfy this gate: it creates a
+fresh schema-11 index under `Usage Monitor Preview` and may test a full rebuild,
+but it cannot read or migrate stable state. The signed same-identity
+`internal-dogfood` installation is the later in-place upgrade proof. Never copy
+the live stable database into Preview, relabel `PRAGMA user_version`, delete the
+index, or reopen a migrated schema-10 or schema-11 index with shipped 0.1.16.
+
 **The failure class to expect after a batch of merges** is a *pin* that was
 never updated: a reviewed public-API list, a pinned action SHA, a byte-identity
 digest, a root-workspace allowlist, or an exact `deepEqual` on an exported
@@ -116,6 +136,10 @@ git push origin vX.Y.Z
 Do not sign from a branch that is ahead of or different from the tag. The
 source identity later recorded in the release evidence descriptor must be the
 same version, tag, commit, and repository URL.
+The stable release gate accepts only the exact annotated `vX.Y.Z` tag for the
+bundle's short version. An internal-dogfood source tag, lightweight tag, tag
+alias, dirty checkout, or second matching stable version tag is not a stable
+release source.
 
 ## 2. Build, sign, notarize, staple, and freeze the DMG
 
@@ -130,7 +154,7 @@ design.
 rm -rf .release-build/macos-production
 export USAGE_MONITOR_DEVELOPER_ID_APPLICATION="Developer ID Application: … (…)"
 export USAGE_MONITOR_NOTARY_PROFILE="…"
-export USAGE_MONITOR_BUNDLE_VERSION="X.Y.Z"
+export USAGE_MONITOR_BUNDLE_VERSION="1024"
 export USAGE_MONITOR_SPARKLE_FRAMEWORK=".release-deps/Sparkle.framework"
 export USAGE_MONITOR_SPARKLE_APPCAST_URL="https://updates.tibotattle.com/appcast.xml"
 export USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY="jhgPwmvWLMr7TGURJUoi6sXias7YP1F+hejZawKVTGw="
@@ -141,6 +165,17 @@ node scripts/release-macos-app.js \
   --prepare-candidate \
   --previous-stable-manifest "<path to P.Q.R .release.json>"
 ~~~
+
+For the 0.1.17 stable release, `CFBundleShortVersionString` remains `0.1.17`
+and the owner-reviewed signed `CFBundleVersion` is exactly `1024`. It follows
+the isolated 0.1.17 dogfood allocation `1023` and the last shared-identity
+dogfood build `1022`. The checked-in allocation is authoritative; the
+`USAGE_MONITOR_BUNDLE_VERSION` value above is only an exact assertion and
+cannot select or override a different build. A future stable version must add
+and test a new monotonic channel allocation before the release path will run.
+The separate `TiboTattle Preview.app` identity may use the deterministic
+preview epoch (`2000.1.17` for 0.1.17); it does not participate in stable
+Sparkle ordering.
 
 Codesign may prompt for Keychain access once; choose **Always Allow** on the
 release machine. The finalizer validates Developer ID signing, hardened

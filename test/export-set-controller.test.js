@@ -652,3 +652,36 @@ test("copied Codex session metadata keeps a checkpoint workspace valid", async (
     await rm(value.root, { recursive: true, force: true });
   }
 });
+
+test("malformed appended Codex session metadata poisons a checkpoint workspace", async () => {
+  const value = await fixture();
+  try {
+    const meta = JSON.stringify({
+      timestamp: "2026-07-24T12:00:00.000Z",
+      type: "session_meta",
+      payload: { id: "PRIVATE_SESSION" },
+    });
+    const malformedMeta = JSON.stringify({
+      timestamp: "2026-07-24T12:00:01.000Z",
+      type: "session_meta",
+      payload: { cwd: "/private/session" },
+    });
+    await writeFile(value.source, `${meta}\n${malformedMeta}\n`);
+    await assert.rejects(createLocalExportWorkspace({
+      directory: value.workspace,
+      startAt: "2026-07-24T11:00:00.000Z",
+      endAt: "2026-07-24T13:00:00.000Z",
+      createdAt: "2026-07-24T13:00:00.000Z",
+      codexHome: value.home,
+      secret: SECRET,
+    }), (error) => error?.code
+      === "export_source_codex_rollout_content_invalid");
+    const inspected = await inspectLocalExportWorkspace({
+      directory: value.workspace,
+    });
+    assert.equal(inspected.poisoned, true);
+    assert.equal(inspected.scanComplete, false);
+  } finally {
+    await rm(value.root, { recursive: true, force: true });
+  }
+});

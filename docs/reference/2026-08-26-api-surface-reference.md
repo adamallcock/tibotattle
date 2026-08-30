@@ -39,7 +39,7 @@ Those remain separate verification gates in the relevant runbooks.
 
 | Surface | Boundary | Implemented surface |
 |---|---|---:|
-| Local companion API | Browser/native shell → loopback Node companion | 23 paths, 26 method/path operations |
+| Local companion API | Browser/native shell → loopback Node companion | 24 paths, 27 method/path operations |
 | Local report pages | Browser → fixed loopback report allowlist | 4 `GET` paths |
 | Central public relay | Loopback companion → configured hosted origin | 1 fixed `GET` path |
 | Participant relay | Loopback companion → configured hosted origin | 9 paths, 9 method/path operations |
@@ -163,6 +163,7 @@ hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
 | `GET` | `/api/local/overview` | Personal dashboard headline and evidence coverage |
 | `GET` | `/api/local/gradient` | Quota-versus-cost gradient report data |
 | `GET` | `/api/local/weekly` | Weekly calibration report data |
+| `GET` | `/api/local/weekly-pace-outlook` | Privacy-safe weekly allowance pace projection bound to the current observed window |
 | `GET` | `/api/local/quality` | Monitoring-quality report data |
 | `GET` | `/api/local/timeline/window-breakdown` | Bounded indexed timeline breakdown for `from` and `to` epoch-millisecond bounds |
 | `GET`, `POST` | `/api/local/refresh` | Inspect refresh state or start one bounded local refresh |

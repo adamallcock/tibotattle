@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PRODUCT_BRAND } from "../config/product-brand.js";
+import {
+  PREVIEW_PRODUCT_BRAND,
+  PRODUCT_BRAND,
+} from "../config/product-brand.js";
 import { RELEASE_MANIFEST } from "../config/release-manifest.js";
 import { packageMacOSDMG } from "./macos-release-core.js";
 
@@ -37,7 +40,10 @@ export function parseArguments(argv) {
       "one explicit non-release mode is required: --development or --preview",
     );
   }
-  const defaultFileName = `${PRODUCT_BRAND.displayName}-${RELEASE_MANIFEST.version}`
+  const productBrand = distribution === "preview"
+    ? PREVIEW_PRODUCT_BRAND
+    : PRODUCT_BRAND;
+  const defaultFileName = `${productBrand.displayName}-${RELEASE_MANIFEST.version}`
     + `-macOS-arm64-${distribution}.dmg`;
   return {
     appPath,

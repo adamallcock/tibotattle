@@ -48,6 +48,9 @@ struct LocalCompanionOverview: Equatable {
     let freshnessStatus: String
     let staleAfterSeconds: Double?
     let evidenceAvailable: Bool
+    /// Accounting and timeline evidence keep their own authority gate. A
+    /// fresh quota observation must never make missing history look current.
+    let history: MenuBarHistorySnapshot
 }
 
 struct LocalContributionDiagnosticReference: Equatable {
@@ -209,7 +212,13 @@ struct LocalAnalysisProgress: Equatable {
     let filesSelected: Int?
     let filesProcessed: Int?
 
-    var nativeToolbarTitle: String {
+    /// `quick_result` is only a collector checkpoint. It can name a headline
+    /// as ready only when the caller has independently matched a usable,
+    /// numeric overview snapshot to the active refresh. A refresh receipt by
+    /// itself is never that proof.
+    func nativeToolbarTitle(
+        hasUsableHeadlineEvidence: Bool = false
+    ) -> String {
         switch phase {
         case .discovering:
             return TiboTattleLocalization.string(
@@ -236,7 +245,9 @@ struct LocalAnalysisProgress: Equatable {
             )
         case .quickResult:
             return TiboTattleLocalization.string(
-                .nativeDashboardProgressQuickResult
+                hasUsableHeadlineEvidence
+                    ? .nativeDashboardProgressQuickResult
+                    : .nativeDashboardProgressAnalyzing
             )
         case .complete:
             return TiboTattleLocalization.string(
@@ -261,8 +272,34 @@ struct LocalAnalysisProgress: Equatable {
 /// Whether an explicit local analysis pass is running, from whichever surface
 /// started it. The dashboard and the menu bar share one controller in the
 /// companion, so the menu bar can never start a second concurrent pass.
+enum LocalAnalysisTerminalOutcome: String, Equatable {
+    case idle
+    case succeeded
+    case degraded
+    case cancelled
+    case failed
+
+    /// `nil` preserves the current policy before any pass has completed.
+    /// Only a clean success re-enables automatic stale-evidence refresh. A
+    /// degraded, cancelled, or failed cold build must wait for an explicit
+    /// retry instead of restarting for up to two hours on every idle poll.
+    var automaticRefreshSuppressed: Bool? {
+        switch self {
+        case .idle:
+            return nil
+        case .succeeded:
+            return false
+        case .degraded, .cancelled, .failed:
+            return true
+        }
+    }
+}
+
 enum LocalAnalysisActivity: Equatable {
-    case idle(refreshID: String?)
+    case idle(
+        refreshID: String?,
+        outcome: LocalAnalysisTerminalOutcome
+    )
     case running(refreshID: String?, progress: LocalAnalysisProgress?)
 }
 
@@ -297,6 +334,10 @@ struct NativeMenuPresentationContract: Equatable {
     let settingsShortcut: String
     let quitShortcut: String
     let usesNativeStatusItemMenu: Bool
+    let statusItemButtonRoutesClicks: Bool
+    let popoverIsTransient: Bool
+    let popoverContentWidth: CGFloat
+    let popoverContainsScrollView: Bool
     let escapeDismissalMonitorInstalled: Bool
     let sameAppClickAwayMonitorInstalled: Bool
     let appDeactivationDismissalObserverInstalled: Bool
@@ -329,12 +370,67 @@ struct MenuBarStatusSnapshot: Equatable {
     var lanes: [ObservedQuotaLane] = []
     var observedAt: Date?
     var failureSummary: String?
+    var history: MenuBarHistorySnapshot = .unavailable
+    /// Shared companion-side weekly forecast presentation. This remains
+    /// ephemeral and is rendered only while it binds to the exact current
+    /// seven-day allowance observation.
+    var weeklyPaceOutlook: MenuBarWeeklyPaceOutlook?
+    /// The companion's declared freshness window is retained only in memory
+    /// so each lane can be checked against its own observation timestamp.
+    var staleAfterSeconds: Double?
+    /// True only while the current companion URL can accept the existing
+    /// local-analysis action. An unavailable surface with no companion must
+    /// not present a button that silently does nothing.
+    var analysisAvailable = false
 
     /// Mirrors the dashboard's primary selection across the normal Codex
     /// allowance track. Other provider products are rejected while decoding,
     /// so they cannot become a fallback for the compact title.
     var primaryLane: ObservedQuotaLane? {
         lanes.first(where: \.isPrimary) ?? lanes.first
+    }
+
+    /// A lane can make a numeric claim only while its own observation is
+    /// inside the companion's freshness window and its exact provider window
+    /// has not reset. A newer sibling lane can never keep an older one live.
+    func laneIsCurrent(_ lane: ObservedQuotaLane, now: Date = Date()) -> Bool {
+        let freshnessLimit = staleAfterSeconds ?? defaultStaleAfterSeconds
+        guard companionReachable,
+              evidence == .live,
+              lane.remainingPercent.isFinite,
+              lane.remainingPercent >= 0,
+              lane.remainingPercent <= 100,
+              let observedAt = lane.observedAt,
+              now.timeIntervalSince(observedAt) >= 0,
+              now.timeIntervalSince(observedAt) <= freshnessLimit,
+              let resetAt = lane.resetAt,
+              resetAt > now
+        else { return false }
+        return true
+    }
+
+    func currentLanes(now: Date = Date()) -> [ObservedQuotaLane] {
+        lanes.filter { laneIsCurrent($0, now: now) }
+    }
+
+    func currentPrimaryLane(now: Date = Date()) -> ObservedQuotaLane? {
+        let current = currentLanes(now: now)
+        return current.first(where: \.isPrimary) ?? current.first
+    }
+
+    func currentWeeklyPaceOutlook(
+        now: Date = Date()
+    ) -> MenuBarWeeklyPaceOutlook? {
+        guard let outlook = weeklyPaceOutlook,
+              let weeklyLane = currentLanes(now: now).first(where: {
+                  $0.durationMinutes
+                    == CodexQuotaWindowDuration.sevenDayMinutes
+              }),
+              outlook.isBound(to: weeklyLane, now: now)
+        else {
+            return nil
+        }
+        return outlook
     }
 
     /// True only when the companion has published a loopback dashboard.
@@ -349,8 +445,7 @@ struct MenuBarStatusSnapshot: Equatable {
     /// which case applies.
     var title: String {
         if companionReachable,
-           evidence == .live,
-           let lane = primaryLane {
+           let lane = currentPrimaryLane() {
             return TiboTattleLocalization.percentString(
                 lane.roundedRemainingPercent
             )
@@ -372,16 +467,17 @@ struct MenuBarStatusSnapshot: Equatable {
         guard !lanes.isEmpty else {
             return TiboTattleLocalization.string(.menuBarNoVerifiedAllowance)
         }
-        guard companionReachable, evidence == .live else {
+        let current = currentLanes()
+        guard !current.isEmpty else {
             return TiboTattleLocalization.string(
                 .menuBarLastObservationNotCurrent
             )
         }
-        return lanes.count == 1
+        return current.count == 1
             ? TiboTattleLocalization.string(.menuBarVerifiedAllowanceOne)
             : TiboTattleLocalization.format(
                 .menuBarVerifiedAllowanceMany,
-                lanes.count
+                current.count
             )
     }
 
@@ -427,7 +523,7 @@ struct MenuBarStatusSnapshot: Equatable {
     /// follow the same rule, so the menu never turns a historic reset into a
     /// current claim.
     func laneSummary(_ lane: ObservedQuotaLane, now: Date = Date()) -> String {
-        guard companionReachable, evidence == .live else {
+        guard laneIsCurrent(lane, now: now) else {
             return TiboTattleLocalization.format(
                 .menuBarQuotaLastObserved,
                 lane.label
@@ -483,8 +579,10 @@ private let fiveHourWindowDurationMinutes =
     CodexQuotaWindowDuration.fiveHourMinutes
 private let weeklyWindowDurationMinutes =
     CodexQuotaWindowDuration.sevenDayMinutes
-private let supportedCodexAllowanceWindowDurations =
-    1...CodexQuotaWindowDuration.maximumMinutes
+private let supportedCodexAllowanceWindowDurations: Set<Int> = [
+    fiveHourWindowDurationMinutes,
+    weeklyWindowDurationMinutes,
+]
 private let defaultStaleAfterSeconds: Double = 30 * 60
 
 /// A one-observation, non-predictive comparison for the seven-day allowance.
@@ -571,11 +669,62 @@ func resetCountdown(_ date: Date?, now: Date = Date()) -> String? {
     return TiboTattleLocalization.format(.menuBarResetMinutes, minutes)
 }
 
+/// The next instant at which an on-screen numeric claim can change validity.
+/// This is pure so the packaged semantic smoke can prove the five-hour lane
+/// expires independently of a still-current weekly lane.
+func nextEvidencePresentationBoundary(
+    lanes: [ObservedQuotaLane],
+    staleAfterSeconds: Double?,
+    weeklyPaceOutlook: MenuBarWeeklyPaceOutlook? = nil,
+    now: Date
+) -> Date? {
+    let freshnessLimit = staleAfterSeconds ?? defaultStaleAfterSeconds
+    let freshnessBoundaries = lanes.compactMap { lane -> Date? in
+        guard let observedAt = lane.observedAt else { return nil }
+        return observedAt.addingTimeInterval(freshnessLimit)
+    }
+    let resetBoundaries = lanes.compactMap(\.resetAt)
+    let outlookBoundaries = weeklyPaceOutlook.map {
+        [$0.nextPresentationBoundary]
+    } ?? []
+    return (freshnessBoundaries + resetBoundaries + outlookBoundaries)
+        .filter { $0 > now }
+        .min()
+}
+
+enum MenuBarStatusActivationIntent: Equatable {
+    case popover
+    case actionMenu
+}
+
+/// AppKit event routing expressed as a pure decision before it is wired to the
+/// real status button. Control-click follows the native context-menu path.
+func menuBarStatusActivationIntent(
+    eventType: NSEvent.EventType?,
+    modifierFlags: NSEvent.ModifierFlags
+) -> MenuBarStatusActivationIntent {
+    eventType == .rightMouseUp || modifierFlags.contains(.control)
+        ? .actionMenu
+        : .popover
+}
+
+func menuBarShouldDismissForEscape(
+    keyCode: UInt16,
+    isMenuTracking: Bool,
+    isPopoverShown: Bool
+) -> Bool {
+    keyCode == 53 && (isMenuTracking || isPopoverShown)
+}
+
 /// Pure projection of the companion's overview payload. Kept free of AppKit so
 /// it stays trivially reviewable, and free of any fallback that would invent a
 /// value when a field is missing or malformed.
 enum LocalCompanionOverviewProjection {
-    static func decode(_ data: Data) -> LocalCompanionOverview? {
+    static func decode(
+        _ data: Data,
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) -> LocalCompanionOverview? {
         guard let root = try? JSONSerialization.jsonObject(with: data)
             as? [String: Any]
         else {
@@ -594,6 +743,14 @@ enum LocalCompanionOverviewProjection {
         }
 
         let freshness = root["freshness"] as? [String: Any]
+        let staleAfter = (freshness?["staleAfterSeconds"] as? NSNumber)
+            .flatMap { number -> Double? in
+                guard CFGetTypeID(number) != CFBooleanGetTypeID() else {
+                    return nil
+                }
+                let value = number.doubleValue
+                return value.isFinite && value >= 0 ? value : nil
+            }
         let quota = root["quota"] as? [String: Any]
         let rows = root["quotaWindows"] as? [[String: Any]]
             ?? quota?["windows"] as? [[String: Any]]
@@ -601,15 +758,28 @@ enum LocalCompanionOverviewProjection {
         struct Candidate {
             let lane: ObservedQuotaLane
             let durationMinutes: Int
-            let isExplicitPrimary: Bool
+            let preferredSlot: Bool
+            let observedAt: Date
             let stableKey: String
         }
         let candidates = rows.compactMap { row -> Candidate? in
-            guard let number = row["remainingPercent"] as? NSNumber else {
+            guard let remainingNumber = row["remainingPercent"] as? NSNumber,
+                  CFGetTypeID(remainingNumber) != CFBooleanGetTypeID(),
+                  let usedNumber = row["usedPercent"] as? NSNumber,
+                  CFGetTypeID(usedNumber) != CFBooleanGetTypeID()
+            else {
                 return nil
             }
-            let remaining = number.doubleValue
-            guard remaining.isFinite, remaining >= 0, remaining <= 100 else {
+            let remaining = remainingNumber.doubleValue
+            let used = usedNumber.doubleValue
+            guard remaining.isFinite,
+                  used.isFinite,
+                  remaining >= 0,
+                  remaining <= 100,
+                  used >= 0,
+                  used <= 100,
+                  abs((remaining + used) - 100) <= 0.001
+            else {
                 return nil
             }
             let limitId = row["limitId"] as? String ?? "unknown"
@@ -624,25 +794,35 @@ enum LocalCompanionOverviewProjection {
             }
             let resetAtText = row["resetAt"] as? String ?? ""
             let observedAtText = row["observedAt"] as? String ?? ""
+            guard let resetAt = timestamp(resetAtText),
+                  let observedAt = timestamp(observedAtText),
+                  observedAt <= now,
+                  resetAt > observedAt,
+                  resetAt.timeIntervalSince(observedAt)
+                    <= TimeInterval(duration * 60)
+            else {
+                return nil
+            }
             let lane = ObservedQuotaLane(
                 label: laneLabel(durationMinutes: duration),
                 remainingPercent: remaining,
                 durationMinutes: duration,
-                resetAt: timestamp(resetAtText),
-                observedAt: timestamp(row["observedAt"]),
+                resetAt: resetAt,
+                observedAt: observedAt,
                 // This marker is replaced after the bounded selection below;
                 // it denotes the selected status lane, not an inferred plan.
                 isPrimary: false
             )
             let slot = row["slot"] as? String ?? ""
+            // Match the canonical JS forecast exactly: primary wins whenever
+            // both transitional slot representations are present. Secondary
+            // remains the deterministic fallback when primary is absent.
+            let preferredSlot = slot == "primary"
             return Candidate(
                 lane: lane,
                 durationMinutes: duration,
-                // Preserve the current seven-day preference, while honoring a
-                // provider's explicit primary slot when equal durations tie.
-                isExplicitPrimary: duration == weeklyWindowDurationMinutes
-                    || slot == "primary"
-                    || (row["isPrimary"] as? Bool) == true,
+                preferredSlot: preferredSlot,
+                observedAt: observedAt,
                 stableKey: [
                     slot,
                     resetAtText,
@@ -651,30 +831,37 @@ enum LocalCompanionOverviewProjection {
                 ].joined(separator: "\u{0}")
             )
         }
-        let lanes = candidates.sorted { left, right in
-            if left.durationMinutes != right.durationMinutes {
-                return left.durationMinutes > right.durationMinutes
-            }
-            if left.isExplicitPrimary != right.isExplicitPrimary {
-                return left.isExplicitPrimary
-            }
-            return left.stableKey < right.stableKey
-        }.enumerated().map { index, candidate in
+        let selected = supportedCodexAllowanceWindowDurations.compactMap {
+            duration -> Candidate? in
+            candidates.filter { $0.durationMinutes == duration }.sorted {
+                left, right in
+                if left.preferredSlot != right.preferredSlot {
+                    return left.preferredSlot
+                }
+                if left.observedAt != right.observedAt {
+                    return left.observedAt > right.observedAt
+                }
+                return left.stableKey < right.stableKey
+            }.first
+        }
+        let lanes = selected.sorted {
+            $0.durationMinutes > $1.durationMinutes
+        }.map { candidate in
             ObservedQuotaLane(
                 label: candidate.lane.label,
                 remainingPercent: candidate.lane.remainingPercent,
                 durationMinutes: candidate.lane.durationMinutes,
                 resetAt: candidate.lane.resetAt,
                 observedAt: candidate.lane.observedAt,
-                // The first valid, longest normal Codex lane is the compact
-                // status primary. Generic long windows remain visible here.
-                isPrimary: index == 0
+                // Weekly is the compact status lane when it exists; the
+                // five-hour lane remains independently visible below it.
+                isPrimary: candidate.durationMinutes
+                    == weeklyWindowDurationMinutes
             )
         }
         // Never borrow the aggregate timestamp from a separate quota product:
         // freshness must be evidence from the normal Codex allowance itself.
         let observedAt = lanes.compactMap(\.observedAt).max()
-        let staleAfter = freshness?["staleAfterSeconds"] as? Double
         return LocalCompanionOverview(
             lanes: lanes,
             observedAt: observedAt,
@@ -682,7 +869,12 @@ enum LocalCompanionOverviewProjection {
                 ?? root["status"] as? String
                 ?? "unavailable",
             staleAfterSeconds: staleAfter.map { max(0, $0) },
-            evidenceAvailable: root["evidenceStatus"] as? String == "available"
+            evidenceAvailable: root["evidenceStatus"] as? String == "available",
+            history: MenuBarHistoryProjection.decode(
+                root: root,
+                now: now,
+                calendar: calendar
+            )
         )
     }
 
@@ -692,10 +884,13 @@ enum LocalCompanionOverviewProjection {
         now: Date = Date()
     ) -> MenuBarStatusSnapshot.Evidence {
         guard !overview.lanes.isEmpty else { return .none }
-        guard overview.freshnessStatus == "live" else { return .stale }
+        guard overview.evidenceAvailable,
+              overview.freshnessStatus == "live"
+        else { return .stale }
         guard let observedAt = overview.observedAt else { return .stale }
         let limit = overview.staleAfterSeconds ?? defaultStaleAfterSeconds
-        return now.timeIntervalSince(observedAt) <= limit ? .live : .stale
+        let age = now.timeIntervalSince(observedAt)
+        return age >= 0 && age <= limit ? .live : .stale
     }
 
     /// The compact menu intentionally ignores local-only provider display
@@ -718,12 +913,8 @@ enum LocalCompanionOverviewProjection {
         if durationMinutes == fiveHourWindowDurationMinutes {
             return TiboTattleLocalization.string(.menuBarFiveHourAllowance)
         }
-        if durationMinutes == weeklyWindowDurationMinutes {
-            return TiboTattleLocalization.string(.menuBarSevenDayAllowance)
-        }
-        return TiboTattleLocalization.quotaWindowLabel(
-            durationMinutes: durationMinutes
-        )
+        // The caller has already admitted only the exact two-duration set.
+        return TiboTattleLocalization.string(.menuBarSevenDayAllowance)
     }
 }
 
@@ -735,6 +926,7 @@ final class LocalCompanionEvidenceReader {
     // adapter can reuse this already-audited, loopback-only transport without
     // opening a second session or adding any network route.
     static let maximumResponseBytes = 32 * 1_024 * 1_024
+    static let maximumPaceOutlookResponseBytes = 64 * 1_024
     let session: URLSession
 
     init() {
@@ -764,10 +956,34 @@ final class LocalCompanionEvidenceReader {
         let task = session.dataTask(with: request(url, method: "GET")) {
             data, response, _ in
             let payload = Self.acceptedPayload(data, response)
-            let overview = payload.flatMap(
-                LocalCompanionOverviewProjection.decode
-            )
+            let overview = payload.flatMap {
+                LocalCompanionOverviewProjection.decode($0)
+            }
             DispatchQueue.main.async { completion(overview) }
+        }
+        task.resume()
+    }
+
+    func readWeeklyPaceOutlook(
+        base: URL,
+        completion: @escaping (MenuBarWeeklyPaceOutlook?) -> Void
+    ) {
+        guard let url = loopbackEndpoint(
+            base,
+            path: "/api/local/weekly-pace-outlook"
+        )
+        else {
+            completion(nil)
+            return
+        }
+        let task = session.dataTask(with: request(url, method: "GET")) {
+            data, response, _ in
+            let outlook = Self.acceptedPayload(
+                data,
+                response,
+                maximumBytes: Self.maximumPaceOutlookResponseBytes
+            ).flatMap { MenuBarWeeklyPaceOutlookProjection.decode($0) }
+            DispatchQueue.main.async { completion(outlook) }
         }
         task.resume()
     }
@@ -892,11 +1108,13 @@ final class LocalCompanionEvidenceReader {
 
     static func acceptedPayload(
         _ data: Data?,
-        _ response: URLResponse?
+        _ response: URLResponse?,
+        maximumBytes: Int = maximumResponseBytes
     ) -> Data? {
         guard let data,
               (response as? HTTPURLResponse)?.statusCode == 200,
-              data.count <= maximumResponseBytes
+              maximumBytes > 0,
+              data.count <= maximumBytes
         else {
             return nil
         }
@@ -912,12 +1130,17 @@ final class LocalCompanionEvidenceReader {
             return nil
         }
         let refreshID = decodeRefreshID(refresh)
-        return ["running", "cancelling"].contains(status)
-            ? .running(
+        if ["running", "cancelling"].contains(status) {
+            return .running(
                 refreshID: refreshID,
                 progress: decodeProgress(refresh["progress"])
             )
-            : .idle(refreshID: refreshID)
+        }
+        guard let outcome = LocalAnalysisTerminalOutcome(rawValue: status)
+        else {
+            return nil
+        }
+        return .idle(refreshID: refreshID, outcome: outcome)
     }
 
     private static func decodeProgress(_ value: Any?) -> LocalAnalysisProgress? {
@@ -932,6 +1155,44 @@ final class LocalCompanionEvidenceReader {
                 filesProcessed: nil
             )
         }
+        if progress["kind"] as? String == "unified_index" {
+            let expectedKeys: Set<String> = [
+                "kind",
+                "status",
+                "phase",
+                "filesDiscovered",
+                "filesSelected",
+                "filesProcessed",
+                "recordsWritten",
+            ]
+            guard Set(progress.keys) == expectedKeys,
+                  progress["status"] as? String == "scanning",
+                  progress["phase"] as? String == "rollout_index",
+                  let filesDiscovered = decodeProgressCount(
+                    progress["filesDiscovered"]
+                  ),
+                  let filesSelected = decodeProgressCount(
+                    progress["filesSelected"]
+                  ),
+                  let filesProcessed = decodeProgressCount(
+                    progress["filesProcessed"]
+                  ),
+                  decodeProgressCount(progress["recordsWritten"]) != nil,
+                  filesProcessed <= filesSelected,
+                  filesSelected <= filesDiscovered
+            else {
+                return nil
+            }
+            return LocalAnalysisProgress(
+                phase: .rolloutIndex,
+                filesSelected: filesSelected,
+                filesProcessed: filesProcessed
+            )
+        }
+        // Generic collector checkpoints have no `kind`. A future deep worker
+        // kind must be reviewed above rather than falling through by reusing a
+        // familiar phase string.
+        guard progress["kind"] == nil else { return nil }
         guard let rawPhase = progress["phase"] as? String,
               let phase = LocalAnalysisProgress.Phase(rawValue: rawPhase),
               phase != .archiveIndex
@@ -948,7 +1209,9 @@ final class LocalCompanionEvidenceReader {
     private static let maximumProgressCount = 1_000_000_000
 
     private static func decodeProgressCount(_ value: Any?) -> Int? {
-        guard let number = value as? NSNumber, !(value is Bool) else {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID()
+        else {
             return nil
         }
         let doubleValue = number.doubleValue
@@ -987,7 +1250,7 @@ final class LocalCompanionEvidenceReader {
 /// compact title honest. Actions are injected so the launcher keeps sole
 /// ownership of the companion lifecycle and the shutdown path.
 @MainActor
-final class MenuBarStatusController: NSObject, NSMenuDelegate {
+final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate {
     struct Actions {
         /// Brings the actual TiboTattle window forward and opens its embedded
         /// dashboard when the loopback companion is ready.
@@ -1021,6 +1284,8 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     private let productName: String
     private let brandBirdTemplate: NSImage?
     private let reader = LocalCompanionEvidenceReader()
+    private let popover = NSPopover()
+    private var popoverController: MenuBarPopoverViewController!
     private let allowanceItem = NSMenuItem()
     private let evidenceItem = NSMenuItem()
     private let menu = NSMenu()
@@ -1038,11 +1303,19 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     private var snapshot = MenuBarStatusSnapshot()
     private var dashboardURL: URL?
     private var companionGeneration: UInt64 = 0
+    /// Separates overlapping polls within one companion generation. Opening
+    /// the popup can request an immediate refresh while an earlier loopback
+    /// read is still in flight; only the newest response may update the UI.
+    private var pollSequence: UInt64 = 0
+    private var pollActivityFinished = false
+    private var pollEvidenceFinished = false
     private var overviewResponseHealthy = false
     private var observedEvidenceExpiresAt: Date?
+    private var evidenceExpiryWorkItem: DispatchWorkItem?
     private var pendingPoll: DispatchWorkItem?
     private var lastAutomaticRefreshAt: Date?
     private var automaticRefreshInFlight = false
+    private var automaticRefreshSuppressed = false
     private var notificationEvaluationAwaitingRefresh = false
     /// The opaque companion run token links a terminal receipt to the exact
     /// existing refresh that this menu action observed. A missing or changed
@@ -1050,6 +1323,12 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     private var notificationEvaluationRefreshID: String?
     private var isMenuTracking = false
     private var refreshAfterMenuCloses = false
+    /// Closing the popover to reveal the action menu must defer stale-evidence
+    /// work until menu tracking ends. Quit uses the two one-shot suppressions
+    /// so neither AppKit close callback can start work during termination.
+    private var defersPopoverRefreshUntilMenuCloses = false
+    private var suppressesNextPopoverCloseRefresh = false
+    private var suppressesNextMenuCloseRefresh = false
     private var structuralRebuildPending = false
     private var renderedLaneLabels: [String] = []
     private var escapeMonitor: Any?
@@ -1068,6 +1347,21 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             withLength: NSStatusItem.variableLength
         )
         super.init()
+
+        popover.behavior = .transient
+        popover.delegate = self
+        popoverController = MenuBarPopoverViewController(
+            productName: productName,
+            brandImage: NSApp.applicationIconImage,
+            actions: MenuBarPopoverViewController.Actions(
+                openTiboTattle: { [weak self] in self?.openTiboTattle() },
+                refresh: { [weak self] in self?.analyzeLocalUsage() },
+                showMore: { [weak self] anchor in
+                    self?.showActionMenu(from: anchor)
+                }
+            )
+        )
+        popover.contentViewController = popoverController
         installInteractionMonitoring()
 
         // Explicit enablement: information rows must stay unclickable, and
@@ -1134,7 +1428,6 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         quitItem.keyEquivalentModifierMask = [.command]
         menu.addItem(quitItem)
 
-        statusItem.menu = menu
         if let button = statusItem.button {
             button.image = Self.statusGlyph(
                 productName: productName,
@@ -1149,6 +1442,9 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
                 ofSize: NSFont.systemFontSize,
                 weight: .regular
             )
+            button.target = self
+            button.action = #selector(statusItemActivated)
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
         render()
     }
@@ -1161,10 +1457,12 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         overviewResponseHealthy = false
         invalidateObservedEvidence()
         automaticRefreshInFlight = false
+        automaticRefreshSuppressed = false
         notificationEvaluationAwaitingRefresh = false
         notificationEvaluationRefreshID = nil
         lastAutomaticRefreshAt = nil
         snapshot.phase = .ready
+        snapshot.analysisAvailable = true
         snapshot.failureSummary = nil
         render()
         pollNow()
@@ -1178,11 +1476,13 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         cancelPoll()
         overviewResponseHealthy = false
         automaticRefreshInFlight = false
+        automaticRefreshSuppressed = false
         notificationEvaluationAwaitingRefresh = false
         notificationEvaluationRefreshID = nil
         lastAutomaticRefreshAt = nil
         invalidateObservedEvidence()
         snapshot.phase = .starting
+        snapshot.analysisAvailable = false
         snapshot.failureSummary = nil
         render()
     }
@@ -1197,11 +1497,13 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         cancelPoll()
         overviewResponseHealthy = false
         automaticRefreshInFlight = false
+        automaticRefreshSuppressed = false
         notificationEvaluationAwaitingRefresh = false
         notificationEvaluationRefreshID = nil
         lastAutomaticRefreshAt = nil
         invalidateObservedEvidence()
         snapshot.phase = .unavailable
+        snapshot.analysisAvailable = false
         snapshot.failureSummary = summary
         render()
     }
@@ -1213,12 +1515,16 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         structuralRebuildPending = false
         notificationEvaluationAwaitingRefresh = false
         notificationEvaluationRefreshID = nil
-        dismissMenu()
+        // Delegate callbacks caused by the programmatic close observe this
+        // before they can consider starting another companion refresh.
         stopped = true
+        dismissSurfaces()
         companionGeneration &+= 1
         cancelPoll()
         reader.invalidate()
         removeInteractionMonitoring()
+        popover.delegate = nil
+        popover.contentViewController = nil
         statusItem.menu = nil
         NSStatusBar.system.removeStatusItem(statusItem)
     }
@@ -1245,6 +1551,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             .menuQuitProduct,
             productName
         )
+        popoverController.refreshLocalization()
         render()
     }
 
@@ -1264,6 +1571,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     /// are ordinary titled menu items rather than zero-frame custom views.
     func nativePresentationContract() -> NativeMenuPresentationContract {
         let informationItems = [allowanceItem, evidenceItem]
+        let popup = popoverController.nativePresentationContract()
         return NativeMenuPresentationContract(
             informationRowsAreNative: informationItems.allSatisfy {
                 $0.view == nil && !$0.isEnabled
@@ -1279,11 +1587,88 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             settingsShortcut: settingsItem.keyEquivalent,
             quitShortcut: quitItem.keyEquivalent,
             usesNativeStatusItemMenu: statusItem.menu === menu,
+            statusItemButtonRoutesClicks:
+                statusItem.button?.target === self
+                    && statusItem.button?.action == #selector(statusItemActivated),
+            popoverIsTransient: popover.behavior == .transient,
+            popoverContentWidth: popup.contentWidth,
+            popoverContainsScrollView: popup.containsScrollView,
             escapeDismissalMonitorInstalled: escapeMonitor != nil,
             sameAppClickAwayMonitorInstalled: localMouseMonitor != nil,
             appDeactivationDismissalObserverInstalled:
                 appDeactivationObserver != nil
         )
+    }
+
+    /// Left-click is the glanceable instrument; right-click and Control-click
+    /// retain the complete native action menu. Keeping `statusItem.menu`
+    /// detached is what lets both interactions coexist on one ordinary
+    /// NSStatusItem.
+    @objc private func statusItemActivated(_ sender: NSStatusBarButton) {
+        guard !stopped else { return }
+        let event = NSApp.currentEvent
+        let intent = menuBarStatusActivationIntent(
+            eventType: event?.type,
+            modifierFlags: event?.modifierFlags ?? []
+        )
+        if intent == .actionMenu {
+            showActionMenu(from: sender)
+            return
+        }
+
+        if popover.isShown {
+            dismissSurfaces()
+            return
+        }
+        menu.cancelTracking()
+        isMenuTracking = false
+        popoverController.update(snapshot: snapshot)
+        popover.show(
+            relativeTo: sender.bounds,
+            of: sender,
+            preferredEdge: .minY
+        )
+        sender.highlight(true)
+        pollNow()
+    }
+
+    /// Opens the one existing NSMenu from either the status button or the
+    /// popover's more button. The screen-space anchor survives closing the
+    /// popover, so the menu never depends on a view that AppKit just removed.
+    private func showActionMenu(from anchor: NSView) {
+        guard !stopped else { return }
+        let windowPoint = anchor.convert(
+            NSPoint(x: anchor.bounds.midX, y: anchor.bounds.minY - 4),
+            to: nil
+        )
+        let screenPoint = anchor.window?.convertPoint(toScreen: windowPoint)
+        defersPopoverRefreshUntilMenuCloses = popover.isShown
+        popover.performClose(nil)
+        statusItem.button?.highlight(true)
+        render()
+        if let screenPoint {
+            menu.popUp(positioning: nil, at: screenPoint, in: nil)
+        } else {
+            menu.popUp(
+                positioning: nil,
+                at: NSPoint(x: anchor.bounds.midX, y: anchor.bounds.minY - 4),
+                in: anchor
+            )
+        }
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        statusItem.button?.highlight(false)
+        guard !stopped else { return }
+        if suppressesNextPopoverCloseRefresh {
+            suppressesNextPopoverCloseRefresh = false
+            return
+        }
+        if defersPopoverRefreshUntilMenuCloses {
+            refreshAfterMenuCloses = true
+            return
+        }
+        refreshStaleEvidenceIfNeeded()
     }
 
     /// AppKit normally dismisses an `NSStatusItem` menu for both Escape and an
@@ -1293,29 +1678,36 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     private func installInteractionMonitoring() {
         escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) {
             [weak self] event in
-            guard event.keyCode == 53,
-                  let self,
-                  self.isMenuTracking
+            guard let self,
+                  menuBarShouldDismissForEscape(
+                    keyCode: event.keyCode,
+                    isMenuTracking: self.isMenuTracking,
+                    isPopoverShown: self.popover.isShown
+                  )
             else {
                 return event
             }
-            self.dismissMenu()
+            self.dismissSurfaces()
             return nil
         }
         localMouseMonitor = NSEvent.addLocalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
         ) { [weak self] event in
             guard let self,
-                  self.isMenuTracking,
+                  self.isMenuTracking || self.popover.isShown,
                   let eventWindow = event.window,
                   NSApp.windows.contains(where: { $0 === eventWindow })
             else {
                 return event
             }
+            if self.popover.isShown,
+               eventWindow === self.popover.contentViewController?.view.window {
+                return event
+            }
             // The menu's own window is not an application window, so native
             // menu-item clicks continue through AppKit. A click in any of the
             // app's windows is an unambiguous same-app click-away.
-            self.dismissMenu()
+            self.dismissSurfaces()
             return event
         }
         appDeactivationObserver = NotificationCenter.default.addObserver(
@@ -1323,7 +1715,9 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             object: NSApp,
             queue: .main
         ) { [weak self] _ in
-            self?.dismissMenu()
+            MainActor.assumeIsolated {
+                self?.dismissSurfaces()
+            }
         }
     }
 
@@ -1342,12 +1736,20 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         }
     }
 
-    /// Ends the current native menu tracking session before focus or app
-    /// ownership changes. Calling this while the menu is already closed is
-    /// harmless and keeps every menu action on the same path.
-    private func dismissMenu() {
+    /// Ends whichever transient menu-bar surface is open before focus or app
+    /// ownership changes. Calling it while both are closed is harmless and
+    /// keeps popover buttons and native menu items on one action path.
+    private func dismissSurfaces(suppressRefresh: Bool = false) {
+        if suppressRefresh {
+            refreshAfterMenuCloses = false
+            defersPopoverRefreshUntilMenuCloses = false
+            suppressesNextMenuCloseRefresh = isMenuTracking
+            suppressesNextPopoverCloseRefresh = popover.isShown
+        }
         menu.cancelTracking()
         isMenuTracking = false
+        popover.performClose(nil)
+        statusItem.button?.highlight(false)
     }
 
     // MARK: - NSMenuDelegate
@@ -1357,6 +1759,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         // begins tracking. Reads below are asynchronous; their completions may
         // update existing titles but cannot mutate the open menu's structure.
         isMenuTracking = false
+        suppressesNextMenuCloseRefresh = false
         structuralRebuildPending = false
         render()
         isMenuTracking = true
@@ -1364,12 +1767,19 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     }
 
     func menuDidClose(_ menu: NSMenu) {
+        let suppressRefresh = suppressesNextMenuCloseRefresh
+        suppressesNextMenuCloseRefresh = false
+        defersPopoverRefreshUntilMenuCloses = false
         isMenuTracking = false
+        statusItem.button?.highlight(false)
         if structuralRebuildPending {
             structuralRebuildPending = false
             render()
         }
-        guard refreshAfterMenuCloses else { return }
+        guard !suppressRefresh, refreshAfterMenuCloses else {
+            refreshAfterMenuCloses = false
+            return
+        }
         refreshAfterMenuCloses = false
         refreshStaleEvidenceIfNeeded()
     }
@@ -1377,7 +1787,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     // MARK: - Actions
 
     @objc private func openTiboTattle() {
-        dismissMenu()
+        dismissSurfaces()
         actions.openTiboTattle()
     }
 
@@ -1388,7 +1798,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         else {
             return
         }
-        dismissMenu()
+        dismissSurfaces()
         let generation = companionGeneration
         // Optimistic only in the direction that disables the control; the real
         // state is confirmed by the response and the poll that follows.
@@ -1424,22 +1834,22 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     }
 
     @objc private func quit() {
-        dismissMenu()
+        dismissSurfaces(suppressRefresh: true)
         actions.quit()
     }
 
     @objc private func showSettings() {
-        dismissMenu()
+        dismissSurfaces()
         actions.showSettings()
     }
 
     @objc private func showAbout() {
-        dismissMenu()
+        dismissSurfaces()
         actions.showAbout()
     }
 
     @objc private func checkForUpdates() {
-        dismissMenu()
+        dismissSurfaces()
         actions.checkForUpdates?()
     }
 
@@ -1448,11 +1858,16 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     private func pollNow() {
         guard !stopped, let dashboardURL else { return }
         let generation = companionGeneration
+        pollSequence &+= 1
+        let sequence = pollSequence
+        pollActivityFinished = false
+        pollEvidenceFinished = false
         cancelPoll()
         reader.readAnalysisActivity(base: dashboardURL) { [weak self] activity in
             guard let self,
                   !self.stopped,
                   self.companionGeneration == generation,
+                  self.pollSequence == sequence,
                   self.dashboardURL == dashboardURL
             else {
                 return
@@ -1460,9 +1875,13 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             switch activity {
             case .running:
                 self.snapshot.phase = .analyzing
-            case let .idle(refreshID):
+            case let .idle(refreshID, outcome):
                 if self.overviewResponseHealthy {
                     self.snapshot.phase = .ready
+                }
+                self.automaticRefreshInFlight = false
+                if let suppressed = outcome.automaticRefreshSuppressed {
+                    self.automaticRefreshSuppressed = suppressed
                 }
                 if self.notificationEvaluationAwaitingRefresh {
                     self.notificationEvaluationAwaitingRefresh = false
@@ -1476,12 +1895,13 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
                 break
             }
             self.render()
-            self.schedulePoll()
+            self.finishPollLeg(.activity, sequence: sequence)
         }
         reader.readOverview(base: dashboardURL) { [weak self] overview in
             guard let self,
                   !self.stopped,
                   self.companionGeneration == generation,
+                  self.pollSequence == sequence,
                   self.dashboardURL == dashboardURL
             else {
                 return
@@ -1498,24 +1918,81 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
                         .menuBarQuotaEvidenceUnavailable
                     )
                 self.render()
+                self.finishPollLeg(.evidence, sequence: sequence)
                 return
             }
             self.overviewResponseHealthy = true
             self.snapshot.lanes = overview.lanes
             self.snapshot.observedAt = overview.observedAt
-            self.observedEvidenceExpiresAt = overview.observedAt.map {
+            self.snapshot.history = overview.history
+            self.snapshot.staleAfterSeconds = overview.staleAfterSeconds
+            let freshnessExpiry = overview.observedAt.map {
                 $0.addingTimeInterval(
                     overview.staleAfterSeconds ?? defaultStaleAfterSeconds
                 )
             }
+            self.observedEvidenceExpiresAt = freshnessExpiry
             self.snapshot.evidence = LocalCompanionOverviewProjection
                 .evidence(for: overview)
+            let now = Date()
+            if self.snapshot.currentWeeklyPaceOutlook(now: now) == nil {
+                self.snapshot.weeklyPaceOutlook = nil
+            }
+            self.scheduleEvidenceExpiry()
             if self.snapshot.phase == .unavailable {
                 self.snapshot.phase = .ready
                 self.snapshot.failureSummary = nil
             }
             self.render()
             self.refreshStaleEvidenceIfNeeded()
+            self.reader.readWeeklyPaceOutlook(base: dashboardURL) {
+                [weak self] outlook in
+                guard let self,
+                      !self.stopped,
+                      self.companionGeneration == generation,
+                      self.pollSequence == sequence,
+                      self.dashboardURL == dashboardURL
+                else {
+                    return
+                }
+                let now = Date()
+                if let outlook,
+                   let weeklyLane = self.snapshot.currentLanes(now: now)
+                    .first(where: {
+                        $0.durationMinutes
+                            == CodexQuotaWindowDuration.sevenDayMinutes
+                    }),
+                   outlook.isBound(to: weeklyLane, now: now) {
+                    self.snapshot.weeklyPaceOutlook = outlook
+                } else {
+                    self.snapshot.weeklyPaceOutlook = nil
+                }
+                self.scheduleEvidenceExpiry()
+                self.render()
+                self.finishPollLeg(.evidence, sequence: sequence)
+            }
+        }
+    }
+
+    private enum PollLeg {
+        case activity
+        case evidence
+    }
+
+    /// The active cadence starts only after both the refresh-status read and
+    /// the overview-plus-outlook read have settled. Otherwise a five-second
+    /// analysis poll can invalidate every slower (but still bounded) weekly
+    /// response before it is allowed to render.
+    private func finishPollLeg(_ leg: PollLeg, sequence: UInt64) {
+        guard !stopped, pollSequence == sequence else { return }
+        switch leg {
+        case .activity:
+            pollActivityFinished = true
+        case .evidence:
+            pollEvidenceFinished = true
+        }
+        if pollActivityFinished && pollEvidenceFinished {
+            schedulePoll()
         }
     }
 
@@ -1557,9 +2034,10 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
         renderQuotaLanes()
         openTiboTattleItem.isEnabled = true
         analyzeItem.title = snapshot.analysisActionTitle
-        analyzeItem.isEnabled = snapshot.phase == .ready
-            || (snapshot.phase == .unavailable && dashboardURL != nil)
+        analyzeItem.isEnabled = snapshot.analysisAvailable
+            && (snapshot.phase == .ready || snapshot.phase == .unavailable)
         quitItem.isEnabled = true
+        popoverController.update(snapshot: snapshot)
         guard let button = statusItem.button else { return }
         button.image = Self.statusGlyph(
             productName: productName,
@@ -1575,18 +2053,68 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     }
 
     private func invalidateObservedEvidence() {
+        evidenceExpiryWorkItem?.cancel()
+        evidenceExpiryWorkItem = nil
         snapshot.lanes = []
         snapshot.observedAt = nil
         snapshot.evidence = .none
+        snapshot.history = .unavailable
+        snapshot.weeklyPaceOutlook = nil
+        snapshot.staleAfterSeconds = nil
         observedEvidenceExpiresAt = nil
     }
 
     private func expireCachedEvidenceIfNeeded() {
-        guard snapshot.evidence == .live,
-              let observedEvidenceExpiresAt,
-              Date() > observedEvidenceExpiresAt
+        let now = Date()
+        if snapshot.evidence == .live,
+           let observedEvidenceExpiresAt,
+           now >= observedEvidenceExpiresAt {
+            snapshot.evidence = .stale
+        }
+        if snapshot.currentWeeklyPaceOutlook(now: now) == nil {
+            snapshot.weeklyPaceOutlook = nil
+        }
+    }
+
+    /// Freshness and every observed lane reset are exact presentation
+    /// boundaries. Re-render at the boundary even if the ordinary one-minute
+    /// poll has not fired, so an open popover never carries a percentage into
+    /// a new provider window.
+    private func scheduleEvidenceExpiry() {
+        evidenceExpiryWorkItem?.cancel()
+        evidenceExpiryWorkItem = nil
+        guard snapshot.evidence == .live else { return }
+        let now = Date()
+        guard let nextBoundary = nextEvidencePresentationBoundary(
+            lanes: snapshot.lanes,
+            staleAfterSeconds: snapshot.staleAfterSeconds,
+            weeklyPaceOutlook: snapshot.weeklyPaceOutlook,
+            now: now
+        )
         else { return }
-        snapshot.evidence = .stale
+        let delay = nextBoundary.timeIntervalSince(now)
+        guard delay > 0 else {
+            expireCachedEvidenceIfNeeded()
+            render()
+            return
+        }
+        let generation = companionGeneration
+        let work = DispatchWorkItem { [weak self] in
+            guard let self,
+                  !self.stopped,
+                  self.companionGeneration == generation
+            else { return }
+            self.evidenceExpiryWorkItem = nil
+            self.expireCachedEvidenceIfNeeded()
+            self.render()
+            self.scheduleEvidenceExpiry()
+            self.refreshStaleEvidenceIfNeeded()
+        }
+        evidenceExpiryWorkItem = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + delay,
+            execute: work
+        )
     }
 
     private func configure(
@@ -1697,8 +2225,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     ) -> StatusGlyphState {
         if snapshot.phase == .analyzing { return .analyzing }
         guard snapshot.phase == .ready else { return .unavailable }
-        guard snapshot.evidence == .live,
-              let lane = snapshot.primaryLane
+        guard let lane = snapshot.currentPrimaryLane()
         else {
             return snapshot.evidence == .stale ? .stale : .unavailable
         }
@@ -1889,6 +2416,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
     private func refreshStaleEvidenceIfNeeded() {
         guard !stopped,
               !automaticRefreshInFlight,
+              !automaticRefreshSuppressed,
               snapshot.phase == .ready,
               snapshot.evidence == .stale,
               !snapshot.lanes.isEmpty,
@@ -1921,14 +2449,17 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate {
             self.automaticRefreshInFlight = false
             switch result {
             case let .started(refreshID), let .alreadyRunning(refreshID):
+                self.automaticRefreshInFlight = true
                 self.snapshot.phase = .analyzing
                 self.notificationEvaluationAwaitingRefresh = true
                 self.notificationEvaluationRefreshID = refreshID
             case .rejected:
+                self.automaticRefreshSuppressed = true
                 self.snapshot.phase = self.dashboardURL == nil
                     ? .unavailable
                     : .ready
             case .unreachable:
+                self.automaticRefreshSuppressed = true
                 self.overviewResponseHealthy = false
                 self.invalidateObservedEvidence()
                 self.snapshot.phase = .unavailable

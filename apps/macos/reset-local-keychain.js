@@ -221,6 +221,7 @@ function baseResult() {
  */
 export async function resetLocalKeychainIdentityAndDevice({
   stateRoot,
+  keychainEnvironment = undefined,
   // Injected only so tests can drive them; production always runs the fixed
   // `security` CLI attribute paths.
   attributeProbe = exportIdentityKeychainItemPresenceByAttributes,
@@ -228,6 +229,9 @@ export async function resetLocalKeychainIdentityAndDevice({
 } = {}) {
   const selectedProbe = assertAttributeOperation(attributeProbe);
   const selectedAttributeDelete = assertAttributeOperation(attributeDelete);
+  const keychainOptions = keychainEnvironment === undefined
+    ? undefined
+    : Object.freeze({ environment: keychainEnvironment });
   const selectedStateRoot = await inspectStateRoot(stateRoot);
   const inspectedFiles = new Map();
   const result = baseResult();
@@ -244,7 +248,9 @@ export async function resetLocalKeychainIdentityAndDevice({
     for (const capability of target.attributeCapabilities) {
       let presence;
       try {
-        presence = await selectedProbe(capability);
+        presence = keychainOptions === undefined
+          ? await selectedProbe(capability)
+          : await selectedProbe(capability, keychainOptions);
       } catch {
         presence = "unknown";
       }
@@ -289,7 +295,9 @@ export async function resetLocalKeychainIdentityAndDevice({
     for (const capability of target.attributeCapabilities) {
       let outcome;
       try {
-        outcome = await selectedAttributeDelete(capability);
+        outcome = keychainOptions === undefined
+          ? await selectedAttributeDelete(capability)
+          : await selectedAttributeDelete(capability, keychainOptions);
       } catch (error) {
         result.status = "partial";
         result.failureCode = fixedFailureCode(error);
@@ -321,6 +329,7 @@ async function main() {
   }
   const stateRoot = process.env.USAGE_MONITOR_STATE_ROOT;
   const result = await resetLocalKeychainIdentityAndDevice({
+    keychainEnvironment: process.env,
     stateRoot,
   });
   process.stdout.write(`${JSON.stringify(result)}\n`);

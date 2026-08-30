@@ -54,17 +54,30 @@ that compatibility backend.
    foreground application and installs no `LSUIElement` agent. The compact
    title shows the primary observed quota lane only while the companion reports
    fresh verified evidence; stale, unobserved, starting, and failed states all
-   show a neutral `–`, and an in-progress pass shows `…`. The menu lists every
-   supported observed quota lane. It hides stale percentages and reset times,
-   and shows a reset countdown only for fresh verified evidence. Its disabled
-   rows name the observation and freshness state, so the menu bar never
-   displays a number it cannot justify. The item offers one primary **Open
-   TiboTattle** destination, state-aware **Analyze/Update Local Usage**, and
-   **Quit TiboTattle**; Quit uses the same graceful shutdown as the window's own
-   Quit control.
-5. The dashboard renders its initial local state, then the native launcher
-   starts one automatic bounded refresh after first paint. **Refresh usage** is
-   available for later explicit passes.
+   show a neutral `–`. An in-progress pass keeps the fresh current number when
+   one is available and shows `…` only while no current lane can be shown.
+   Left-click opens a
+   transient native popover with fresh-only five-hour and seven-day allowance
+   tracks, the shared weekly pace forecast expressed as under, near, or over
+   sustainable pace with a now-to-reset coverage track, and coverage-aware
+   local-calendar usage bars for 7 or 30 days. The pace reading is shown only
+   after compatible local quota observations bind to the exact current weekly
+   reset; one observation is named as collecting, never promoted to a trend.
+   The bars use
+   observed tokens; dollar figures are explicitly Standard API-price
+   equivalents, not a subscription bill, and disappear when pricing evidence
+   cannot support them. Missing evidence is a named gap, never a zero. The
+   popover forecast is an ephemeral, strict projection from the companion's
+   narrow read-only weekly-pace endpoint. Request-time geometry is recalculated
+   from the retained strict forecast without rerunning accounting; it is never
+   stored, logged, exported, or added to community data. It contains no account
+   identity, plan claim, purchase flow, reset credits, or redemption action.
+   Right-click or Control-click opens the native action menu with **Open
+   TiboTattle**, state-aware **Analyze/Update Local
+   Usage**, Settings, About, update checks when available, and **Quit
+   TiboTattle**. Quit uses the same graceful shutdown as the window's own Quit
+   control.
+5. Choose **Open TiboTattle** and explicitly start local analysis.
 6. If the companion fails or exits, choose **Retry**. The app does not require
    a relaunch for ordinary recovery.
 7. Choose **Data & Diagnostics…** to see and copy a fixed, path-free diagnostic
@@ -251,24 +264,46 @@ workflow, test requirements, and the future-locale checklist are in
 ## Preview distribution build
 
 Use the explicit preview channel when a local test client must exercise an
-approved deployed HTTPS central service while retaining the normal
-`com.usagemonitor.local` bundle identity for OAuth callbacks. It is not a
-production release. The command stages the bundle at
-`.release-build/macos-preview/current/TiboTattle.app`, validates it, and
-reports its local path, integrity information, channel, and updater mode.
+approved deployed HTTPS central service. It is not a production release, and
+it is deliberately isolated from the stable client:
+
+- app and bundle identity: `TiboTattle Preview.app` and
+  `com.usagemonitor.local.preview`;
+- semantic-open route: `usagemonitor-preview://open`;
+- local state root: `~/Library/Application Support/Usage Monitor Preview`;
+- Keychain namespace/account: `app-usagemonitor.preview.*` and
+  `preview-installation`, never stable's existing `app-usagemonitor.*` /
+  `installation` pairs; and
+- update feed: `/preview/appcast.xml`, never stable's `/appcast.xml`.
+
+The command stages the bundle at
+`.release-build/macos-preview/current/TiboTattle Preview.app`, validates those
+boundaries, and reports its local path, integrity information, channel, and
+updater mode. A newly installed Preview therefore starts without the stable
+app's derived index and must build its own schema-11 index from readable local
+source history. It is suitable for isolated product smoke, not for proving an
+in-place stable-data migration or immediate continuity of stable dashboard
+figures; use the signed `internal-dogfood` lane for that release gate, or
+rehearse migration against a disposable copy. Launching or replacing a preview
+does not migrate, overwrite, read, reset, or delete stable application or
+Keychain state. The native plist seals the reviewed namespace/account pair to the
+preview bundle identifier, and the companion accepts only that complete pair
+or stable's historical pair; arbitrary service/account input is rejected.
 
 The preview command prepares the pinned framework and, by default, uses the
-same public central-service origin, signed-feed URL, and Sparkle public key as
-the installed TiboTattle client. That makes the ordinary local QA build a real
-client of the deployed service rather than a no-service development bundle.
-No private release credential is embedded or read.
+same public central-service origin as the installed TiboTattle client, but a
+separate preview appcast path. That makes the ordinary local QA build a real
+client of the deployed service without enrolling it in stable updates. The
+preview feed may remain unpublished; in that state manual update checks report
+unavailable and automatic update opt-in remains disabled. No private release
+credential is embedded or read.
 
 An operator may override those **public** values only when deliberately testing
 another reviewed deployed environment:
 
 ```bash
 export USAGE_MONITOR_PREVIEW_CENTRAL_ORIGIN='https://APPROVED-DEPLOYED-HOST'
-export USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL='https://APPROVED-DEPLOYED-HOST/appcast.xml'
+export USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL='https://APPROVED-DEPLOYED-HOST/preview/appcast.xml'
 export USAGE_MONITOR_PREVIEW_SPARKLE_PUBLIC_ED_KEY='BASE64_32_BYTE_PUBLIC_KEY='
 npm run product:macos:preview
 ```
@@ -281,16 +316,20 @@ variable or `--output`. A different Sparkle framework can be supplied with
 `USAGE_MONITOR_PREVIEW_SPARKLE_FRAMEWORK`. The build rejects HTTP, IP-literal
 and loopback origins, credentials and URL decorations,
 malformed public keys, unverified Sparkle trees, and `/Applications` output
-paths. The private Sparkle update-signing key is not an input to this build and
-must never be placed in the repository or bundle.
+paths. It also rejects stable's exact appcast URL even when supplied through an
+override, including percent-encoded or slash aliases. The private Sparkle
+update-signing key is not an input to this build
+and must never be placed in the repository or bundle.
 
 The resulting marker is `preview_distribution` in both the build manifest and
 `UsageMonitorBuildChannel`, with `UsageMonitorPreviewDistribution=true` and
 `externalDistributionRequested=false`. The central-service runtime key remains
 `production_https` so the existing launcher accepts the approved deployed
-origin; the separate channel marker prevents the artifact from being treated
-as a production release. Preview builds make **manual** updater checks only:
-they never automatically check, download, or install an update.
+origin; the separate channel marker, app identity, state root, semantic-open
+route, and feed prevent the artifact from being treated as a production
+release. Preview builds make **manual** updater checks only: the Automatic
+updates switch is disabled and its detail text explains that previews never
+automatically check, download, or install an update.
 
 After validation, install it only through the guarded replacement command:
 
@@ -298,11 +337,13 @@ After validation, install it only through the guarded replacement command:
 npm run product:macos:preview:install
 ```
 
-That command accepts only `/Applications/TiboTattle.app` (or an explicit
-per-user Applications target), validates the staged preview before and after
-copying it, and moves an existing app to a timestamped sibling backup rather
-than deleting it. It requires the explicit `--replace` flag; no preview build
-or validation command copies into `/Applications` on its own.
+That command accepts only `/Applications/TiboTattle Preview.app` (or the exact
+per-user preview Applications target) and explicitly refuses either stable
+`TiboTattle.app` location. It validates the staged preview before and after
+copying it, and moves an existing preview to a timestamped sibling backup
+rather than deleting it. It requires the explicit `--replace` flag; no preview
+build or validation command copies into `/Applications` on its own. The stable
+application and `Usage Monitor` state directory remain untouched.
 
 Validate the staged preview without network access by default:
 
@@ -319,7 +360,7 @@ Run it only when checking the published service boundary:
 npm run product:macos:preview:remote:live
 # or verify the installed preview directly
 node ./scripts/verify-macos-preview-remote.js \
-  --app "/Applications/TiboTattle.app" \
+  --app "/Applications/TiboTattle Preview.app" \
   --channel preview_distribution \
   --live
 ```
@@ -327,6 +368,30 @@ node ./scripts/verify-macos-preview-remote.js \
 If the configured preview feed has no qualifying appcast entry, the command
 exits non-zero and says so plainly. That is an external release-input gap, not
 a claim that Sparkle has updated the preview client.
+
+## macOS bundle-version allocation
+
+`CFBundleShortVersionString` remains the user-facing package version. The
+Sparkle ordering key, `CFBundleVersion`, is explicitly allocated for signed
+builds that retain the stable bundle identifier. The 0.1.17 internal-dogfood
+build is `1023`; the 0.1.17 stable final is `1024`. These clear the observed
+shared-identity dogfood build `1022`, and stable orders after the tested
+dogfood candidate. A future signed version/channel must add a reviewed
+monotonic allocation before release tooling will run.
+
+Release tooling accepts `USAGE_MONITOR_BUNDLE_VERSION` only when it exactly
+matches the checked-in channel allocation, and the signed stable path still
+requires the candidate to compare strictly newer than the immediately previous
+stable manifest. The exact historical stable `0.x.y` form may be read only as a
+previous stable migration source whose bundle and marketing versions match;
+new candidates and appcasts must use the strict positive-first Apple form.
+Preview has a different bundle identifier and feed, so it retains the
+deterministic epoch `(2000 + major).minor.patch` for local ordering; preview
+package `0.1.17` therefore uses `2000.1.17` without stranding or advancing the
+stable line. Both paths enforce
+[Apple's `CFBundleVersion` component limits](https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html):
+a positive one-to-four-digit first component and optional one-to-two-digit
+second and third components.
 
 ## External-distribution build gate
 
@@ -369,6 +434,12 @@ framework symlinks, a non-HTTPS appcast, or a malformed Ed25519 public key.
 Developer builds reject all updater inputs. The candidate remains ad-hoc signed
 until the release command completes.
 
+The release source must be clean and exactly annotated for its channel. Stable
+accepts only `vX.Y.Z` matching the short version. Internal dogfood accepts only
+`tibotattle-internal-dogfood-X.Y.Z-rcN-source-YYYYMMDD`, with a positive
+non-zero-padded `N` and a real calendar date. Lightweight tags, aliases, wrong
+versions, and multiple matching channel tags at HEAD fail closed.
+
 ## Developer ID and notarization
 
 The release operator must first make a `Developer ID Application` identity
@@ -385,7 +456,6 @@ process environment:
 ```bash
 export USAGE_MONITOR_DEVELOPER_ID_APPLICATION='Developer ID Application: APPROVED OWNER (TEAMID1234)'
 export USAGE_MONITOR_NOTARY_PROFILE='usage-monitor-notary'
-export USAGE_MONITOR_BUNDLE_VERSION='1'
 export USAGE_MONITOR_SPARKLE_FRAMEWORK="$PWD/.release-deps/Sparkle.framework"
 export USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY='REPLACE_WITH_32_BYTE_BASE64_PUBLIC_KEY='
 npm run product:macos:release -- \
@@ -394,11 +464,17 @@ npm run product:macos:release -- \
   --previous-stable-manifest "/path/to/previous-stable-release.json"
 ```
 
-The continuity options are mutually exclusive; the release command refuses to
-guess which policy applies.
+For a later stable release, use `--previous-stable-manifest` in place of
+`--stable-bootstrap`, as shown above. The two options are mutually exclusive;
+the release command refuses to guess which continuity policy applies.
+`USAGE_MONITOR_BUNDLE_VERSION` is optional as an operator assertion only; when
+present it must exactly equal the checked-in allocation for the selected
+signed release version and channel (`1023` for 0.1.17 internal dogfood,
+`1024` for 0.1.17 stable).
 
 `config/deployment-endpoints.js` is the reviewed source for the public origin
-and Sparkle appcast. Legacy `USAGE_MONITOR_PRODUCTION_ORIGIN` and
+and the distinct stable and preview Sparkle appcasts. Legacy
+`USAGE_MONITOR_PRODUCTION_ORIGIN` and
 `USAGE_MONITOR_SPARKLE_APPCAST_URL` values are accepted only when they exactly
 match that manifest, so an independent release-time endpoint cannot slip in.
 

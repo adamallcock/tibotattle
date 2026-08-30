@@ -311,9 +311,15 @@ export function contributionBatchAdmission({
   });
 }
 
+// A fresh native index has a two-hour server-side cold-build bound. Keep the
+// browser attached for that bound plus one minute so progress and Cancel stay
+// usable; this does not extend the companion's own deadline, and ordinary
+// existing-index refreshes still settle at their five-minute server bound.
+export const LOCAL_REFRESH_POLLING_WINDOW_MS = 121 * 60 * 1_000;
+
 export function createRefreshPollingBudget({
   now = () => Date.now(),
-  windowMs = 6 * 60 * 1_000,
+  windowMs = LOCAL_REFRESH_POLLING_WINDOW_MS,
   settlementGraceMs = 30 * 1_000,
   maximumContinuations = 2
 } = {}) {
@@ -350,6 +356,27 @@ export function createRefreshPollingBudget({
   });
 }
 
+/**
+ * Describe the quick-result phase without claiming that the loaded overview
+ * contains a numeric headline. A successful overview response can still be a
+ * truthful unavailable/withheld state, so transport success alone must never
+ * become "headline ready" or "verified numbers" copy.
+ */
+export function refreshQuickResultStatus({
+  dashboardLoaded = false,
+  elapsedLabel = "",
+} = {}) {
+  if (dashboardLoaded) {
+    return "Local summary updated · checking full history…";
+  }
+  const boundedElapsedLabel = typeof elapsedLabel === "string"
+    ? elapsedLabel.trim()
+    : "";
+  return boundedElapsedLabel.length > 0
+    ? `Preparing local summary… ${boundedElapsedLabel}`
+    : "Preparing local summary…";
+}
+
 export function refreshNeedsContinuation({
   outcome,
   errorCode = null,
@@ -369,6 +396,43 @@ function historyProgressToken(value) {
   return typeof value === "string" && /^[A-Za-z0-9._:-]{1,128}$/u.test(value)
     ? value
     : null;
+}
+
+export const HISTORY_INFORMATIONAL_GAP_MAX_SHARE = 0.01;
+
+/**
+ * A terminal history gap may use the quiet informational treatment only when
+ * the published receipt is coherent, current accounting is available, and
+ * the excluded share is immaterial. Everything else remains a warning.
+ */
+export function historyCoverageNoticeKind({
+  history = null,
+  accountingProjection = null,
+} = {}) {
+  const sourceCount = historyProgressNumber(history?.sourceCount);
+  const indexedSourceCount = historyProgressNumber(
+    history?.indexedSourceCount,
+  );
+  const pendingSourceCount = historyProgressNumber(
+    history?.pendingSourceCount,
+  );
+  const skippedSourceCount = historyProgressNumber(
+    history?.skippedSourceCount,
+  );
+  const informational = history?.status === "partial"
+    && history?.phase === "partial_terminal"
+    && accountingProjection?.status === "available"
+    && sourceCount !== null
+    && sourceCount > 0
+    && indexedSourceCount !== null
+    && indexedSourceCount > 0
+    && pendingSourceCount === 0
+    && skippedSourceCount !== null
+    && skippedSourceCount > 0
+    && indexedSourceCount + skippedSourceCount === sourceCount
+    && skippedSourceCount / sourceCount
+      <= HISTORY_INFORMATIONAL_GAP_MAX_SHARE;
+  return informational ? "info" : "warning";
 }
 
 /**

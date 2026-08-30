@@ -27,7 +27,10 @@ import {
   sep,
 } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PRODUCT_BRAND } from "../config/product-brand.js";
+import {
+  PREVIEW_PRODUCT_BRAND,
+  PRODUCT_BRAND,
+} from "../config/product-brand.js";
 import {
   assertDeploymentEndpoints,
   DEPLOYMENT_ENDPOINTS,
@@ -35,6 +38,7 @@ import {
 import {
   assertReleaseChannelPublication,
   createReleaseChannelProvenance,
+  INTERNAL_DOGFOOD_RELEASE_CHANNEL,
   STABLE_RELEASE_CHANNEL,
   STABLE_SPARKLE_BOOTSTRAP_MODE,
   STABLE_SPARKLE_KEY_CONTINUITY_MODE,
@@ -52,6 +56,16 @@ import {
   buildMacOSReleaseCandidate,
   validateMacOSPreviewApp,
 } from "./build-macos-app.js";
+import {
+  compareAppleMacOSBundleVersionToPrevious,
+  compareAppleMacOSBundleVersions,
+  isAppleMacOSBundleVersion,
+  isLegacyZeroFirstMacOSBundleVersion,
+  LEGACY_STABLE_MACOS_BUNDLE_VERSION,
+  parseAppleMacOSBundleVersion,
+  resolveSignedMacOSBundleVersion,
+} from "./macos-bundle-version.js";
+import { RELEASE_VERSION } from "../config/release-manifest.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
@@ -59,6 +73,12 @@ const BUILD_MANIFEST_SCHEMA = "usage-monitor-macos-app-build-v0.1";
 const RELEASE_MANIFEST_SCHEMA = "usage-monitor-macos-release-v0.2";
 const PUBLIC_RELEASE_SOURCE_REPOSITORY =
   "https://github.com/adamallcock/tibotattle";
+const RELEASE_SOURCE_VERSION_PATTERN =
+  /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
+const STABLE_RELEASE_SOURCE_TAG_PATTERN =
+  /^v((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))$/u;
+const INTERNAL_DOGFOOD_SOURCE_TAG_PATTERN =
+  /^tibotattle-internal-dogfood-((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))-rc([1-9][0-9]{0,3})-source-(20[0-9]{2})(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])$/u;
 const STABLE_RELEASE_MANIFEST_MAX_BYTES = 1024 * 1024;
 const PUBLIC_KEY_FINGERPRINT_PATTERN = /^[a-f0-9]{64}$/u;
 const REPLACEMENT_CONTRACT_SCHEMA =
@@ -182,7 +202,7 @@ function requiredReleaseGitOutput(repositoryRoot, arguments_, code) {
   return String(result.stdout ?? "").trim();
 }
 
-function normalizePublicReleaseSourceOrigin(origin) {
+export function normalizePublicReleaseSourceOrigin(origin) {
   if (typeof origin !== "string" || origin.length === 0
       || origin.trim() !== origin || /[\s\0]/u.test(origin)
       || origin.includes("?") || origin.includes("#")) {
@@ -266,6 +286,63 @@ function validateMacOSReleaseSource(source, label = "Release source") {
   });
 }
 
+function validateSealedMacOSReleaseSource(source, {
+  channel,
+  expectedVersion,
+  label = "Release application source",
+} = {}) {
+  if (!source || typeof source !== "object" || Array.isArray(source)
+      || Object.keys(source).sort().join(",") !== "commit,tag"
+      || typeof source.commit !== "string"
+      || !/^[0-9a-f]{40,64}$/u.test(source.commit)
+      || !isMacOSReleaseSourceTagForChannel(source.tag, {
+        channel,
+        expectedVersion,
+      })) {
+    fail(
+      `${label} is not a sealed channel source identity`,
+      "MACOS_RELEASE_SOURCE_INVALID",
+    );
+  }
+  return Object.freeze({ commit: source.commit, tag: source.tag });
+}
+
+function isCalendarSourceDate(year, month, day) {
+  const value = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+  return value.getUTCFullYear() === Number(year)
+    && value.getUTCMonth() === Number(month) - 1
+    && value.getUTCDate() === Number(day);
+}
+
+/**
+ * Stable artifacts are bound to their canonical public version tag. Internal
+ * dogfood artifacts use a separate immutable annotated source tag so a tested
+ * candidate does not prematurely claim the final stable release tag.
+ */
+export function isMacOSReleaseSourceTagForChannel(tag, {
+  channel = STABLE_RELEASE_CHANNEL,
+  expectedVersion = null,
+} = {}) {
+  if (typeof tag !== "string"
+      || (expectedVersion !== null
+        && (typeof expectedVersion !== "string"
+          || !RELEASE_SOURCE_VERSION_PATTERN.test(expectedVersion)))) {
+    return false;
+  }
+  if (channel === STABLE_RELEASE_CHANNEL) {
+    const match = STABLE_RELEASE_SOURCE_TAG_PATTERN.exec(tag);
+    return match !== null
+      && (expectedVersion === null || match[1] === expectedVersion);
+  }
+  if (channel === INTERNAL_DOGFOOD_RELEASE_CHANNEL) {
+    const match = INTERNAL_DOGFOOD_SOURCE_TAG_PATTERN.exec(tag);
+    return match !== null
+      && (expectedVersion === null || match[1] === expectedVersion)
+      && isCalendarSourceDate(match[3], match[4], match[5]);
+  }
+  return false;
+}
+
 /**
  * A notarized DMG must name an immutable source revision. Refuse a dirty,
  * lightweight-tagged, or untagged checkout instead of relying on the local
@@ -273,8 +350,18 @@ function validateMacOSReleaseSource(source, label = "Release source") {
  */
 export function readMacOSReleaseSourceProvenance({
   repositoryRoot = REPOSITORY_ROOT,
-  expectedVersion = null,
+  expectedVersion = RELEASE_VERSION,
+  channel = STABLE_RELEASE_CHANNEL,
 } = {}) {
+  const releaseChannel = resolveOperationalReleaseChannel(channel);
+  if (expectedVersion !== null
+      && (typeof expectedVersion !== "string"
+        || !RELEASE_SOURCE_VERSION_PATTERN.test(expectedVersion))) {
+    fail(
+      "Release source version is invalid",
+      "MACOS_RELEASE_SOURCE_VERSION_MISMATCH",
+    );
+  }
   const root = resolve(repositoryRoot);
   const status = releaseGit(
     root,
@@ -318,17 +405,40 @@ export function readMacOSReleaseSourceProvenance({
   if (!/^[0-9a-f]{40,64}$/u.test(commit)) {
     fail("Release source commit is invalid", "MACOS_RELEASE_PROVENANCE_INVALID");
   }
-  const tag = requiredReleaseGitOutput(
-    root,
-    ["describe", "--exact-match", "--tags", "HEAD"],
-    "MACOS_RELEASE_TAG_REQUIRED",
-  );
-  if (!/^[0-9A-Za-z][0-9A-Za-z._/-]{0,127}$/u.test(tag)
-      || tag.includes("..")
-      || tag.startsWith("/")
-      || tag.endsWith("/")) {
-    fail("Release source tag is invalid", "MACOS_RELEASE_PROVENANCE_INVALID");
+  const tagResult = releaseGit(root, ["tag", "--points-at", "HEAD"]);
+  if (tagResult.error || tagResult.status !== 0) {
+    fail(
+      "Unable to establish signed-release source tags",
+      "MACOS_RELEASE_PROVENANCE_INVALID",
+    );
   }
+  const tags = String(tagResult.stdout ?? "")
+    .split(/\r?\n/u)
+    .filter((tag) => tag.length > 0);
+  if (tags.length === 0) {
+    fail(
+      "A signed release requires an annotated Git tag",
+      "MACOS_RELEASE_TAG_REQUIRED",
+    );
+  }
+  const matchingTags = tags.filter((tag) =>
+    isMacOSReleaseSourceTagForChannel(tag, {
+      channel: releaseChannel.name,
+      expectedVersion,
+    }));
+  if (matchingTags.length === 0) {
+    fail(
+      `Release source tag does not match the ${releaseChannel.name} version policy`,
+      "MACOS_RELEASE_SOURCE_VERSION_MISMATCH",
+    );
+  }
+  if (matchingTags.length !== 1) {
+    fail(
+      `Release source has ambiguous ${releaseChannel.name} version tags`,
+      "MACOS_RELEASE_PROVENANCE_INVALID",
+    );
+  }
+  const [tag] = matchingTags;
   const objectType = requiredReleaseGitOutput(
     root,
     ["for-each-ref", "--format=%(objecttype)", `refs/tags/${tag}`],
@@ -349,16 +459,6 @@ export function readMacOSReleaseSourceProvenance({
     fail(
       "Release tag does not identify HEAD",
       "MACOS_RELEASE_PROVENANCE_INVALID",
-    );
-  }
-  if (expectedVersion !== null
-      && (typeof expectedVersion !== "string"
-        || !/^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:[-+][0-9A-Za-z.-]+)?$/u
-          .test(expectedVersion)
-        || tag !== `v${expectedVersion}`)) {
-    fail(
-      "Release source tag does not identify the app version",
-      "MACOS_RELEASE_SOURCE_VERSION_MISMATCH",
     );
   }
   return validateMacOSReleaseSource({
@@ -883,6 +983,10 @@ function hasExpectedProductBrand(plist) {
     && plist.UsageMonitorBundleName === PRODUCT_BRAND.bundleName
     && plist.UsageMonitorStateDirectoryName
       === PRODUCT_BRAND.stateDirectoryName
+    && plist.UsageMonitorKeychainNamespace
+      === PRODUCT_BRAND.keychainNamespace
+    && plist.UsageMonitorKeychainAccount
+      === PRODUCT_BRAND.keychainAccount
     && plist.UsageMonitorMonitoredAppDisplayName
       === PRODUCT_BRAND.monitoredAppDisplayName
     && plist.UsageMonitorMonitoredAppBundleIdentifier
@@ -980,9 +1084,17 @@ async function validateUpdaterBoundary(appPath, plist, manifest, {
 }
 
 export async function inspectMacOSApp(appPath, {
+  allowLegacyUnsealedSource = false,
   channel = "stable",
   requireExternalDistribution = false,
 } = {}) {
+  if (typeof allowLegacyUnsealedSource !== "boolean"
+      || (allowLegacyUnsealedSource && !requireExternalDistribution)) {
+    fail(
+      "Legacy unsealed source compatibility requires external artifact validation",
+      "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
+    );
+  }
   const selected = resolve(appPath);
   if (basename(selected) !== APP_NAME) {
     fail(`Application bundle must be named ${APP_NAME}`);
@@ -1016,6 +1128,7 @@ export async function inspectMacOSApp(appPath, {
   await validateUpdaterBoundary(selected, plist, manifest, {
     required: requireExternalDistribution,
   });
+  let sealedSource = null;
   for (const relativePath of [
     APP_EXECUTABLE,
     NODE_EXECUTABLE,
@@ -1024,6 +1137,27 @@ export async function inspectMacOSApp(appPath, {
   }
   if (requireExternalDistribution) {
     const releaseChannel = resolveOperationalReleaseChannel(channel);
+    const exactLegacyUnsealedSource = allowLegacyUnsealedSource
+      && releaseChannel.name === STABLE_RELEASE_CHANNEL
+      && plist.CFBundleVersion === LEGACY_STABLE_MACOS_BUNDLE_VERSION
+      && plist.CFBundleShortVersionString
+        === LEGACY_STABLE_MACOS_BUNDLE_VERSION;
+    if (allowLegacyUnsealedSource && !exactLegacyUnsealedSource) {
+      fail(
+        "Legacy unsealed source compatibility applies only to the exact 0.1.16 stable rollback artifact",
+        "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
+      );
+    }
+    sealedSource = exactLegacyUnsealedSource
+        && manifest.release?.source === undefined
+      ? null
+      : validateSealedMacOSReleaseSource(
+        manifest.release?.source,
+        {
+          channel: releaseChannel.name,
+          expectedVersion: plist.CFBundleShortVersionString,
+        },
+      );
     const centralOrigin = validateProductionOrigin(plist, {
       channel: releaseChannel.name,
       expectedMode: releaseChannel.serviceOriginMode,
@@ -1097,6 +1231,7 @@ export async function inspectMacOSApp(appPath, {
     bundleVersion: plist.CFBundleVersion,
     executablePath: join(selected, ...APP_EXECUTABLE.split("/")),
     plist,
+    source: sealedSource,
     shortVersion: plist.CFBundleShortVersionString,
   });
 }
@@ -1131,7 +1266,17 @@ export function readMacOSReleaseBuildConfiguration(
     : `the reviewed ${releaseChannel.name} channel`;
   const configuredProductionOrigin =
     environment.USAGE_MONITOR_PRODUCTION_ORIGIN;
-  const bundleVersion = environment.USAGE_MONITOR_BUNDLE_VERSION;
+  const bundleVersion = resolveSignedMacOSBundleVersion(
+    RELEASE_VERSION,
+    releaseChannel.name,
+  );
+  if (bundleVersion === null) {
+    fail(
+      `No signed macOS bundle version is allocated for ${releaseChannel.name} ${RELEASE_VERSION}`,
+      "MACOS_SIGNED_BUNDLE_VERSION_UNPLANNED",
+    );
+  }
+  const configuredBundleVersion = environment.USAGE_MONITOR_BUNDLE_VERSION;
   const sparkleFramework =
     environment.USAGE_MONITOR_SPARKLE_FRAMEWORK;
   const configuredSparkleAppcastURL =
@@ -1179,12 +1324,11 @@ export function readMacOSReleaseBuildConfiguration(
       "MACOS_RELEASE_ENDPOINTS_MISMATCH",
     );
   }
-  if (typeof bundleVersion !== "string"
-      || !/^(?:0|[1-9][0-9]{0,8})(?:\.(?:0|[1-9][0-9]{0,8})){0,2}$/u
-        .test(bundleVersion)) {
+  if (configuredBundleVersion !== undefined
+      && configuredBundleVersion !== bundleVersion) {
     fail(
-      "USAGE_MONITOR_BUNDLE_VERSION must contain one to three non-negative decimal components",
-      "MACOS_BUNDLE_VERSION_REQUIRED",
+      `USAGE_MONITOR_BUNDLE_VERSION must equal the allocated ${releaseChannel.name} release value ${bundleVersion}`,
+      "MACOS_BUNDLE_VERSION_MISMATCH",
     );
   }
   const provisioningProfile = environment.USAGE_MONITOR_PROVISIONING_PROFILE;
@@ -1231,25 +1375,23 @@ export function readMacOSReleaseBuildConfiguration(
 }
 
 function macOSBundleVersionParts(value) {
-  if (typeof value !== "string"
-      || !/^(?:0|[1-9][0-9]{0,8})(?:\.(?:0|[1-9][0-9]{0,8})){0,2}$/u
-        .test(value)) {
+  const parts = parseAppleMacOSBundleVersion(value);
+  if (parts === null) {
     fail(
       "Replacement contract contains an invalid bundle version",
       "MACOS_REPLACEMENT_VERSION_INVALID",
     );
   }
-  return value.split(".").map(Number).concat([0, 0]).slice(0, 3);
+  return parts;
 }
 
 export function compareMacOSBundleVersions(left, right) {
-  const leftParts = macOSBundleVersionParts(left);
-  const rightParts = macOSBundleVersionParts(right);
-  for (let index = 0; index < 3; index += 1) {
-    if (leftParts[index] < rightParts[index]) return -1;
-    if (leftParts[index] > rightParts[index]) return 1;
+  const comparison = compareAppleMacOSBundleVersions(left, right);
+  if (comparison === null) {
+    macOSBundleVersionParts(left);
+    macOSBundleVersionParts(right);
   }
-  return 0;
+  return comparison;
 }
 
 export function createMacOSSignedReplacementContract() {
@@ -1316,7 +1458,9 @@ function validateSignedReleaseChannel(manifest, label) {
   return channelName;
 }
 
-function validateSignedReleaseManifest(manifest, label) {
+function validateSignedReleaseManifest(manifest, label, {
+  allowLegacyStableMigrationSource = false,
+} = {}) {
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)
       || manifest.schemaVersion !== RELEASE_MANIFEST_SCHEMA
       || manifest.application?.bundleIdentifier !== BUNDLE_IDENTIFIER
@@ -1352,20 +1496,62 @@ function validateSignedReleaseManifest(manifest, label) {
       "MACOS_REPLACEMENT_MANIFEST_INVALID",
     );
   }
+  const channelName = manifest.channel === undefined
+    ? null
+    : validateSignedReleaseChannel(manifest, label);
+  const bundleVersion = manifest.application.bundleVersion;
+  const legacyStableMigrationSource =
+    allowLegacyStableMigrationSource
+    && isLegacyZeroFirstMacOSBundleVersion(bundleVersion);
+  if (manifest.source === undefined && !legacyStableMigrationSource) {
+    fail(
+      `${label} is missing required source provenance`,
+      "MACOS_RELEASE_SOURCE_INVALID",
+    );
+  }
   if (manifest.source !== undefined) {
     validateMacOSReleaseSource(manifest.source, label);
-    if (manifest.source.tag !== `v${manifest.application.shortVersion}`) {
+    if (channelName !== null
+        && !isMacOSReleaseSourceTagForChannel(manifest.source.tag, {
+          channel: channelName,
+          expectedVersion: manifest.application.shortVersion,
+        })) {
       fail(
-        `${label} source tag does not identify the application version`,
+        `${label} source tag does not identify its channel and application version`,
         "MACOS_RELEASE_SOURCE_VERSION_MISMATCH",
       );
     }
   }
-  if (manifest.channel !== undefined) {
-    validateSignedReleaseChannel(manifest, label);
+  if (legacyStableMigrationSource) {
+    if (channelName !== STABLE_RELEASE_CHANNEL
+        || manifest.application.shortVersion !== bundleVersion) {
+      fail(
+        `${label} legacy zero-first bundle version is allowed only for its exact stable marketing-version migration source`,
+        "MACOS_REPLACEMENT_VERSION_INVALID",
+      );
+    }
+  } else {
+    macOSBundleVersionParts(bundleVersion);
   }
-  macOSBundleVersionParts(manifest.application.bundleVersion);
   return manifest;
+}
+
+function compareCandidateToPreviousBundleVersion(candidate, previous) {
+  const comparison = compareAppleMacOSBundleVersionToPrevious(
+    candidate,
+    previous,
+  );
+  if (comparison === null) {
+    macOSBundleVersionParts(candidate);
+    if (!isLegacyZeroFirstMacOSBundleVersion(previous)) {
+      macOSBundleVersionParts(previous);
+    }
+    fail(
+      "Previous release contains an invalid legacy bundle version",
+      "MACOS_REPLACEMENT_VERSION_INVALID",
+    );
+  }
+  return comparison;
 }
 
 /**
@@ -1458,9 +1644,7 @@ export function assertStableSparkleKeyContinuity({
     }
     return Object.freeze({ mode: "not_required" });
   }
-  if (typeof candidateBundleVersion !== "string"
-      || !/^(?:0|[1-9][0-9]{0,8})(?:\.(?:0|[1-9][0-9]{0,8})){0,2}$/u
-        .test(candidateBundleVersion)
+  if (!isAppleMacOSBundleVersion(candidateBundleVersion)
       || typeof candidatePublicEdKeySha256 !== "string"
       || !PUBLIC_KEY_FINGERPRINT_PATTERN.test(candidatePublicEdKeySha256)) {
     fail(
@@ -1494,6 +1678,7 @@ export function assertStableSparkleKeyContinuity({
     previous = validateSignedReleaseManifest(
       previousManifest,
       "Previous stable release",
+      { allowLegacyStableMigrationSource: true },
     );
     const previousChannel = validateSignedReleaseChannel(
       previous,
@@ -1508,7 +1693,7 @@ export function assertStableSparkleKeyContinuity({
       "MACOS_STABLE_PREVIOUS_MANIFEST_INVALID",
     );
   }
-  if (compareMacOSBundleVersions(
+  if (compareCandidateToPreviousBundleVersion(
     candidateBundleVersion,
     previous.application.bundleVersion,
   ) <= 0) {
@@ -1538,6 +1723,7 @@ export function validateMacOSSignedReplacementPair({
   const previous = validateSignedReleaseManifest(
     previousManifest,
     "Previous release",
+    { allowLegacyStableMigrationSource: true },
   );
   const candidate = validateSignedReleaseManifest(
     candidateManifest,
@@ -1571,7 +1757,7 @@ export function validateMacOSSignedReplacementPair({
       "MACOS_REPLACEMENT_BUNDLE_MISMATCH",
     );
   }
-  if (compareMacOSBundleVersions(
+  if (compareCandidateToPreviousBundleVersion(
     candidate.application.bundleVersion,
     previous.application.bundleVersion,
   ) <= 0) {
@@ -1600,6 +1786,7 @@ export function validateMacOSSignedReplacementPair({
 async function readReplacementReleaseArtifact(
   manifestPath,
   label,
+  { allowLegacyStableMigrationSource = false } = {},
 ) {
   const selectedManifest = resolve(manifestPath);
   await regularPath(selectedManifest);
@@ -1612,7 +1799,9 @@ async function readReplacementReleaseArtifact(
       "MACOS_REPLACEMENT_MANIFEST_INVALID",
     );
   }
-  validateSignedReleaseManifest(manifest, label);
+  validateSignedReleaseManifest(manifest, label, {
+    allowLegacyStableMigrationSource,
+  });
   const artifact = join(dirname(selectedManifest), manifest.artifact.fileName);
   const metadata = await regularPath(artifact);
   if (metadata.size !== manifest.artifact.bytes
@@ -1649,13 +1838,21 @@ export async function validateMacOSSignedReleaseArtifact({
     releaseManifestPath,
     "Public installer",
   );
+  const candidateChannelName = validateSignedReleaseChannel(
+    candidate.manifest,
+    "Public installer",
+  );
   if (artifactPath !== null && resolve(artifactPath) !== candidate.artifact) {
     fail(
       "Public installer path does not match the release manifest artifact",
       "MACOS_RELEASE_ARTIFACT_PATH_MISMATCH",
     );
   }
-  await validateArtifact(candidate.artifact, { production: true });
+  await validateArtifact(candidate.artifact, {
+    allowLegacyUnsealedSource: false,
+    channel: candidateChannelName,
+    production: true,
+  });
   return Object.freeze({
     artifact: Object.freeze({
       path: candidate.artifact,
@@ -1682,6 +1879,7 @@ export async function validateMacOSSignedReplacementArtifacts({
   const previous = await readReplacementReleaseArtifact(
     previousReleaseManifestPath,
     "Previous release",
+    { allowLegacyStableMigrationSource: true },
   );
   const candidate = await readReplacementReleaseArtifact(
     candidateReleaseManifestPath,
@@ -1691,8 +1889,22 @@ export async function validateMacOSSignedReplacementArtifacts({
     previousManifest: previous.manifest,
     candidateManifest: candidate.manifest,
   });
-  await validateArtifact(previous.artifact, { production: true });
-  await validateArtifact(candidate.artifact, { production: true });
+  const previousIsExactLegacyStable =
+    previous.manifest.channel.name === STABLE_RELEASE_CHANNEL
+    && previous.manifest.application.bundleVersion
+      === LEGACY_STABLE_MACOS_BUNDLE_VERSION
+    && previous.manifest.application.shortVersion
+      === LEGACY_STABLE_MACOS_BUNDLE_VERSION;
+  await validateArtifact(previous.artifact, {
+    allowLegacyUnsealedSource: previousIsExactLegacyStable,
+    channel: previous.manifest.channel.name,
+    production: true,
+  });
+  await validateArtifact(candidate.artifact, {
+    allowLegacyUnsealedSource: false,
+    channel: candidate.manifest.channel.name,
+    production: true,
+  });
   return Object.freeze({
     ...contract,
     previousArtifact: previous.artifact,
@@ -1958,7 +2170,10 @@ export async function packageMacOSDMG({
     join(outputParent, ".usage-monitor-dmg-"),
   );
   const staging = join(temporaryRoot, "volume");
-  const stagedApp = join(staging, APP_NAME);
+  const packagedProductBrand = distribution === DMG_DISTRIBUTIONS.preview
+    ? PREVIEW_PRODUCT_BRAND
+    : PRODUCT_BRAND;
+  const stagedApp = join(staging, packagedProductBrand.bundleName);
   const temporaryDMG = join(
     temporaryRoot,
     `${PRODUCT_BRAND.executableName}.dmg`,
@@ -1993,7 +2208,7 @@ export async function packageMacOSDMG({
       "-srcfolder",
       staging,
       "-volname",
-      PRODUCT_BRAND.displayName,
+      packagedProductBrand.displayName,
       "-fs",
       "HFS+",
       "-format",
@@ -2255,6 +2470,7 @@ function parseMacOSDeveloperIDNativeTrust(signature) {
 }
 
 export async function validateInstalledMacOSApp(appPath, {
+  allowLegacyUnsealedSource = false,
   channel = "stable",
   expectedBundleIdentifier = null,
   expectedBundleVersion = null,
@@ -2262,6 +2478,7 @@ export async function validateInstalledMacOSApp(appPath, {
   production = true,
 } = {}) {
   const inspected = await inspectMacOSApp(appPath, {
+    allowLegacyUnsealedSource,
     channel,
     requireExternalDistribution: production,
   });
@@ -2363,6 +2580,7 @@ export async function validateInstalledMacOSApp(appPath, {
     production,
     shortVersion: inspected.shortVersion,
   };
+  if (production) result.source = inspected.source;
   if (nativeTrust !== null) {
     result.developerIdAuthority = nativeTrust.developerIdAuthority;
     result.teamIdentifier = nativeTrust.teamIdentifier;
@@ -2371,12 +2589,30 @@ export async function validateInstalledMacOSApp(appPath, {
 }
 
 export async function validateMacOSDMG(path, {
+  allowLegacyUnsealedSource = false,
   channel = "stable",
+  distribution = null,
   expectedBundleIdentifier = null,
   expectedBundleVersion = null,
   expectedShortVersion = null,
   production = true,
 } = {}) {
+  const selectedDistribution = distribution ?? (
+    production ? DMG_DISTRIBUTIONS.release : DMG_DISTRIBUTIONS.development
+  );
+  if (typeof allowLegacyUnsealedSource !== "boolean"
+      || (allowLegacyUnsealedSource && !production)
+      || !Object.values(DMG_DISTRIBUTIONS).includes(selectedDistribution)
+      || production !== (selectedDistribution === DMG_DISTRIBUTIONS.release)) {
+    fail(
+      "DMG validation distribution does not match its production policy",
+      "MACOS_DMG_DISTRIBUTION_INVALID",
+    );
+  }
+  const expectedProductBrand = selectedDistribution
+      === DMG_DISTRIBUTIONS.preview
+    ? PREVIEW_PRODUCT_BRAND
+    : PRODUCT_BRAND;
   const selected = resolve(path);
   await regularPath(selected);
   runMacOSReleaseCommand("/usr/bin/hdiutil", ["verify", selected], {
@@ -2412,24 +2648,48 @@ export async function validateMacOSDMG(path, {
     const names = (await readdir(attached.mountPoint)).sort();
     if (names.length !== 2
         || names[0] !== "Applications"
-        || names[1] !== APP_NAME) {
+        || names[1] !== expectedProductBrand.bundleName) {
       fail(
-        `DMG layout must contain only Applications and ${APP_NAME}`,
+        `DMG layout must contain only Applications and ${expectedProductBrand.bundleName}`,
       );
     }
     await validateMacOSApplicationsLink(
       join(attached.mountPoint, "Applications"),
     );
-    const installedApp = join(isolatedRoot, "Applications", APP_NAME);
+    const installedApp = join(
+      isolatedRoot,
+      "Applications",
+      expectedProductBrand.bundleName,
+    );
     await mkdir(dirname(installedApp), { recursive: true, mode: 0o755 });
     runMacOSReleaseCommand("/usr/bin/ditto", [
       "--noqtn",
-      join(attached.mountPoint, APP_NAME),
+      join(attached.mountPoint, expectedProductBrand.bundleName),
       installedApp,
     ], {
       failureMessage: "Mounted application copy failed",
     });
+    if (selectedDistribution === DMG_DISTRIBUTIONS.preview) {
+      const inspectedPreview = await validateMacOSPreviewApp(installedApp);
+      if ((expectedBundleIdentifier !== null
+          && inspectedPreview.bundleIdentifier !== expectedBundleIdentifier)
+          || (expectedBundleVersion !== null
+            && inspectedPreview.bundleVersion !== expectedBundleVersion)
+          || (expectedShortVersion !== null
+            && inspectedPreview.shortVersion !== expectedShortVersion)) {
+        fail(
+          "Installed preview metadata does not match the expected artifact",
+          "MACOS_RELEASE_ARTIFACT_METADATA_MISMATCH",
+        );
+      }
+      return Object.freeze({
+        bundleIdentifier: inspectedPreview.bundleIdentifier,
+        production: false,
+        shortVersion: inspectedPreview.shortVersion,
+      });
+    }
     return await validateInstalledMacOSApp(installedApp, {
+      allowLegacyUnsealedSource,
       channel,
       expectedBundleIdentifier,
       expectedBundleVersion,
@@ -2579,8 +2839,16 @@ export async function releaseMacOSApp({
     requireExternalDistribution: true,
   });
   const source = readMacOSReleaseSourceProvenance({
+    channel: releaseChannel.name,
     expectedVersion: inspectedCandidate.shortVersion,
   });
+  if (inspectedCandidate.source?.commit !== source.commit
+      || inspectedCandidate.source?.tag !== source.tag) {
+    fail(
+      "Reviewed candidate is sealed to a different release source",
+      "MACOS_RELEASE_CANDIDATE_SOURCE_MISMATCH",
+    );
+  }
   if (inspectedCandidate.plist.UsageMonitorCentralOrigin
         !== buildConfiguration.productionOrigin
       || inspectedCandidate.bundleVersion
@@ -2649,7 +2917,11 @@ export async function releaseMacOSApp({
         || inspected.buildManifest.payload?.payloadSha256
           !== inspectedCandidate.buildManifest.payload?.payloadSha256
         || inspected.buildManifest.payload?.totalBytes
-          !== inspectedCandidate.buildManifest.payload?.totalBytes) {
+          !== inspectedCandidate.buildManifest.payload?.totalBytes
+        || inspected.source?.commit !== source.commit
+        || inspected.source?.tag !== source.tag
+        || inspected.source?.commit !== inspectedCandidate.source?.commit
+        || inspected.source?.tag !== inspectedCandidate.source?.tag) {
       fail(
         "Reviewed candidate is not reproducible from the checked-out source and approved release inputs",
         "MACOS_RELEASE_CANDIDATE_NOT_REPRODUCIBLE",
@@ -2702,10 +2974,17 @@ export async function releaseMacOSApp({
       notaryProfile: credentials.notaryProfile,
     });
     stapleAndValidate(stagedDMG);
-    await validateMacOSDMG(stagedDMG, {
+    const validatedDMG = await validateMacOSDMG(stagedDMG, {
       channel: releaseChannel.name,
       production: true,
     });
+    if (validatedDMG.source?.commit !== source.commit
+        || validatedDMG.source?.tag !== source.tag) {
+      fail(
+        "Packaged DMG is sealed to a different release source",
+        "MACOS_RELEASE_ARTIFACT_SOURCE_MISMATCH",
+      );
+    }
 
     const outputExists = await assertReplaceableReleaseTarget(
       selectedOutput,

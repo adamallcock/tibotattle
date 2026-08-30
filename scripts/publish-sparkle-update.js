@@ -30,9 +30,17 @@ import {
 } from "../config/release-channels.js";
 import {
   assertStableSparkleKeyContinuity,
+  isMacOSReleaseSourceTagForChannel,
+  normalizePublicReleaseSourceOrigin,
   readStableReleaseManifest,
   validateMacOSDMG,
 } from "./macos-release-core.js";
+import {
+  compareAppleMacOSBundleVersionToPrevious,
+  compareAppleMacOSBundleVersions,
+  isAppleMacOSBundleVersion,
+  isLegacyZeroFirstMacOSBundleVersion,
+} from "./macos-bundle-version.js";
 import {
   hasSparkleSignedFeedTrailer,
   validateSignedSparkleFeed,
@@ -81,8 +89,6 @@ const MAX_APPCAST_BYTES = 1024 * 1024;
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_DMG_BYTES = 10 * 1024 * 1024 * 1024;
 const PUBLIC_READBACK_TIMEOUT_MS = 30_000;
-const BUNDLE_VERSION_PATTERN =
-  /^(?:0|[1-9][0-9]{0,8})(?:\.(?:0|[1-9][0-9]{0,8})){0,2}$/u;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 const ED25519_PUBLIC_KEY_PATTERN = /^[A-Za-z0-9+/]{43}=$/u;
 const ED25519_SIGNATURE_PATTERN = /^[A-Za-z0-9+/]{86}==$/u;
@@ -111,11 +117,220 @@ const WRANGLER_DIAGNOSTIC_STREAM_LIMIT = 2000;
 // missing-object classifier and the failure diagnostic both read the text
 // with the SGR escapes removed.
 const ANSI_ESCAPE_PATTERN = /\u001B\[[0-9;]*m/gu;
+const PUBLIC_SOURCE_REPOSITORY =
+  "https://github.com/adamallcock/tibotattle";
+const SOURCE_GIT_TIMEOUT_MS = 30_000;
 
 function fail(message, code = "SPARKLE_UPDATE_PUBLICATION_INVALID") {
   const error = new Error(message);
   error.code = code;
   throw error;
+}
+
+function defaultRunSourceGit(repositoryRoot, arguments_) {
+  const remoteLookup = arguments_[0] === "ls-remote";
+  return spawnSync("/usr/bin/git", [
+    ...(remoteLookup ? [] : ["-C", repositoryRoot]),
+    ...arguments_,
+  ], {
+    cwd: remoteLookup ? tmpdir() : undefined,
+    encoding: "utf8",
+    env: {
+      GCM_INTERACTIVE: "Never",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_OPTIONAL_LOCKS: "0",
+      GIT_TERMINAL_PROMPT: "0",
+      HOME: process.env.HOME,
+      LANG: process.env.LANG ?? "en_US.UTF-8",
+      PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+      ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}),
+    },
+    maxBuffer: 1024 * 1024,
+    timeout: SOURCE_GIT_TIMEOUT_MS,
+  });
+}
+
+function sourceGitOutput(
+  runSourceGit,
+  repositoryRoot,
+  arguments_,
+  { code, message },
+) {
+  const result = runSourceGit(repositoryRoot, arguments_);
+  if (!result || result.error || result.status !== 0) {
+    fail(message, code);
+  }
+  return String(result.stdout ?? "").trim();
+}
+
+/**
+ * Independently resolve the immutable Git objects named by a packaged release
+ * manifest. A manifest is only a claim: publication must prove that its exact
+ * channel tag is annotated and peels to the recorded commit in the publishing
+ * checkout. This deliberately does not require HEAD to remain on the packaged
+ * commit, so an operator may publish an already-built candidate from a newer
+ * clean checkout without weakening its source identity.
+ */
+export function verifyReleaseManifestSourceProvenance(source, {
+  channel,
+  expectedVersion,
+  repositoryRoot = REPOSITORY_ROOT,
+  runSourceGit = defaultRunSourceGit,
+} = {}) {
+  const releaseChannel = resolveReleaseChannel(channel);
+  if (!source || typeof source !== "object" || Array.isArray(source)
+      || Object.keys(source).sort().join(",") !== "commit,repository,tag"
+      || source.repository !== PUBLIC_SOURCE_REPOSITORY
+      || typeof source.commit !== "string"
+      || !/^[0-9a-f]{40,64}$/u.test(source.commit)
+      || !isMacOSReleaseSourceTagForChannel(source.tag, {
+        channel: releaseChannel.name,
+        expectedVersion,
+      })
+      || typeof repositoryRoot !== "string"
+      || repositoryRoot.length === 0
+      || repositoryRoot.includes("\0")
+      || typeof runSourceGit !== "function") {
+    fail(
+      `Release manifest source does not match the ${releaseChannel.name} tag policy`,
+      "SPARKLE_UPDATE_SOURCE_MISMATCH",
+    );
+  }
+  const root = resolve(repositoryRoot);
+  const tagReference = `refs/tags/${source.tag}`;
+  const origins = sourceGitOutput(
+    runSourceGit,
+    root,
+    ["config", "--get-all", "remote.origin.url"],
+    {
+      code: "SPARKLE_UPDATE_SOURCE_ORIGIN_REQUIRED",
+      message: "Release publication requires a configured source origin",
+    },
+  ).split(/\r?\n/u).map((origin) => origin.trim()).filter(Boolean);
+  if (origins.length !== 1
+      || normalizePublicReleaseSourceOrigin(origins[0])
+        !== source.repository) {
+    fail(
+      "Release publication requires the canonical public TiboTattle origin",
+      "SPARKLE_UPDATE_SOURCE_ORIGIN_INVALID",
+    );
+  }
+  const objectType = sourceGitOutput(
+    runSourceGit,
+    root,
+    ["cat-file", "-t", tagReference],
+    {
+      code: "SPARKLE_UPDATE_SOURCE_TAG_REQUIRED",
+      message: "Release source tag is unavailable in the publishing checkout",
+    },
+  );
+  if (objectType !== "tag") {
+    fail(
+      "Release source tag must be an annotated Git tag",
+      "SPARKLE_UPDATE_SOURCE_TAG_REQUIRED",
+    );
+  }
+  const tagObject = sourceGitOutput(
+    runSourceGit,
+    root,
+    ["rev-parse", "--verify", tagReference],
+    {
+      code: "SPARKLE_UPDATE_SOURCE_PROVENANCE_INVALID",
+      message: "Release source tag object cannot be resolved",
+    },
+  );
+  const taggedCommit = sourceGitOutput(
+    runSourceGit,
+    root,
+    ["rev-parse", "--verify", `${tagReference}^{commit}`],
+    {
+      code: "SPARKLE_UPDATE_SOURCE_PROVENANCE_INVALID",
+      message: "Release source tag does not peel to a commit",
+    },
+  );
+  if (!/^[0-9a-f]{40,64}$/u.test(tagObject)
+      || !/^[0-9a-f]{40,64}$/u.test(taggedCommit)) {
+    fail(
+      "Release source tag resolved to a non-canonical Git object",
+      "SPARKLE_UPDATE_SOURCE_PROVENANCE_INVALID",
+    );
+  }
+  if (taggedCommit !== source.commit) {
+    fail(
+      "Release source tag does not identify the manifest source commit",
+      "SPARKLE_UPDATE_SOURCE_MISMATCH",
+    );
+  }
+  const matchingTags = sourceGitOutput(
+    runSourceGit,
+    root,
+    ["tag", "--points-at", source.commit],
+    {
+      code: "SPARKLE_UPDATE_SOURCE_PROVENANCE_INVALID",
+      message: "Release source tags cannot be enumerated",
+    },
+  ).split(/\r?\n/u).filter((tag) =>
+    isMacOSReleaseSourceTagForChannel(tag, {
+      channel: releaseChannel.name,
+      expectedVersion,
+    }));
+  if (matchingTags.length !== 1 || matchingTags[0] !== source.tag) {
+    fail(
+      `Release source has ambiguous ${releaseChannel.name} version tags`,
+      "SPARKLE_UPDATE_SOURCE_AMBIGUOUS",
+    );
+  }
+  const remoteRows = sourceGitOutput(
+    runSourceGit,
+    root,
+    [
+      "ls-remote",
+      "--tags",
+      source.repository,
+      tagReference,
+      `${tagReference}^{}`,
+    ],
+    {
+      code: "SPARKLE_UPDATE_SOURCE_REMOTE_UNAVAILABLE",
+      message: "Canonical release source tag could not be resolved remotely",
+    },
+  );
+  const remoteObjects = new Map();
+  for (const row of remoteRows === "" ? [] : remoteRows.split(/\r?\n/u)) {
+    const match = /^([0-9a-f]{40,64})\t(.+)$/u.exec(row);
+    if (match === null
+        || (match[2] !== tagReference
+          && match[2] !== `${tagReference}^{}`)
+        || remoteObjects.has(match[2])) {
+      fail(
+        "Canonical remote release tag response is ambiguous",
+        "SPARKLE_UPDATE_SOURCE_REMOTE_INVALID",
+      );
+    }
+    remoteObjects.set(match[2], match[1]);
+  }
+  if (remoteObjects.size !== 2
+      || !remoteObjects.has(tagReference)
+      || !remoteObjects.has(`${tagReference}^{}`)) {
+    fail(
+      "Canonical remote release tag must be an annotated Git tag",
+      "SPARKLE_UPDATE_SOURCE_REMOTE_TAG_REQUIRED",
+    );
+  }
+  if (remoteObjects.get(tagReference) !== tagObject
+      || remoteObjects.get(`${tagReference}^{}`) !== source.commit) {
+    fail(
+      "Local and canonical remote release source tags do not agree",
+      "SPARKLE_UPDATE_SOURCE_REMOTE_MISMATCH",
+    );
+  }
+  return Object.freeze({
+    commit: source.commit,
+    repository: source.repository,
+    tag: source.tag,
+    tagObject,
+  });
 }
 
 function defaultPublicFetch(...arguments_) {
@@ -279,7 +494,7 @@ function validateReleaseManifest(
   if (manifest.schemaVersion !== RELEASE_MANIFEST_SCHEMA
       || manifest.application?.bundleIdentifier !== PRODUCT_BRAND.bundleIdentifier
       || typeof manifest.application?.bundleVersion !== "string"
-      || !BUNDLE_VERSION_PATTERN.test(manifest.application.bundleVersion)
+      || !isAppleMacOSBundleVersion(manifest.application.bundleVersion)
       || typeof manifest.application?.shortVersion !== "string"
       || manifest.application.shortVersion.length === 0
       || typeof manifest.artifact?.fileName !== "string"
@@ -305,6 +520,18 @@ function validateReleaseManifest(
     fail(
       `Release manifest channel provenance does not match ${channel.name}`,
       "SPARKLE_UPDATE_CHANNEL_MISMATCH",
+    );
+  }
+  if (manifest.source?.repository !== PUBLIC_SOURCE_REPOSITORY
+      || typeof manifest.source?.commit !== "string"
+      || !/^[0-9a-f]{40,64}$/u.test(manifest.source.commit)
+      || !isMacOSReleaseSourceTagForChannel(manifest.source?.tag, {
+        channel: channel.name,
+        expectedVersion: manifest.application.shortVersion,
+      })) {
+    fail(
+      `Release manifest source does not match the ${channel.name} tag policy`,
+      "SPARKLE_UPDATE_SOURCE_MISMATCH",
     );
   }
   if (!SHA256_PATTERN.test(manifest.updater?.publicEdKeySha256 ?? "")) {
@@ -395,7 +622,9 @@ function validatePublishedDownloadURL(value, channel) {
   return selected.href;
 }
 
-function parsePublishedObjectKey(value, channel) {
+function parsePublishedObjectKey(value, channel, {
+  allowLegacyStablePrevious = false,
+} = {}) {
   let selected;
   try {
     selected = new URL(value);
@@ -409,7 +638,12 @@ function parsePublishedObjectKey(value, channel) {
       || segments.length !== versionIndex + 3
       || segments.slice(0, versionIndex).join("/")
         !== channel.sparkle.objectPrefix
-      || !BUNDLE_VERSION_PATTERN.test(segments[versionIndex] ?? "")
+      || (!isAppleMacOSBundleVersion(segments[versionIndex] ?? "")
+        && !(allowLegacyStablePrevious
+          && channel.name === "stable"
+          && isLegacyZeroFirstMacOSBundleVersion(
+            segments[versionIndex] ?? "",
+          )))
       || !SHA256_PATTERN.test(segments[versionIndex + 1] ?? "")
       || !SAFE_RELEASE_OBJECT_FILE_NAME_PATTERN.test(
         segments[versionIndex + 2] ?? "",
@@ -428,16 +662,16 @@ function parsePublishedObjectKey(value, channel) {
 }
 
 function compareBundleVersions(left, right) {
-  const leftParts = left.split(".").map(Number).concat([0, 0]).slice(0, 3);
-  const rightParts = right.split(".").map(Number).concat([0, 0]).slice(0, 3);
-  for (let index = 0; index < 3; index += 1) {
-    if (leftParts[index] < rightParts[index]) return -1;
-    if (leftParts[index] > rightParts[index]) return 1;
+  const comparison = compareAppleMacOSBundleVersions(left, right);
+  if (comparison === null) {
+    fail("Sparkle bundle version is not Apple-compatible");
   }
-  return 0;
+  return comparison;
 }
 
-function appcastEnclosures(text, channel) {
+function appcastEnclosures(text, channel, {
+  allowLegacyStablePrevious = false,
+} = {}) {
   if (text.includes("<!DOCTYPE") || text.includes("<!ENTITY")) {
     fail("Appcast must not contain a document type or entity declaration");
   }
@@ -469,7 +703,9 @@ function appcastEnclosures(text, channel) {
   return matches.map((match) => {
     const attributes = parseEnclosureAttributes(match.attributes);
     const url = validatePublishedDownloadURL(attributes.get("url"), channel);
-    const object = parsePublishedObjectKey(url, channel);
+    const object = parsePublishedObjectKey(url, channel, {
+      allowLegacyStablePrevious,
+    });
     const length = attributes.get("length");
     const lengthNumber = Number(length);
     if (!/^(?:0|[1-9][0-9]*)$/u.test(length ?? "")
@@ -485,8 +721,11 @@ function appcastEnclosures(text, channel) {
       fail("Appcast enclosure and item Sparkle versions disagree");
     }
     const version = attributeVersion ?? match.itemVersion;
-    if (typeof version !== "string"
-        || !BUNDLE_VERSION_PATTERN.test(version)
+    const acceptedVersion = isAppleMacOSBundleVersion(version)
+      || (allowLegacyStablePrevious
+        && channel.name === "stable"
+        && isLegacyZeroFirstMacOSBundleVersion(version));
+    if (!acceptedVersion
         || object.bundleVersion !== version) {
       fail(
         "Appcast enclosure version must match its immutable object path",
@@ -495,7 +734,7 @@ function appcastEnclosures(text, channel) {
     }
     const deltaFrom = attributes.get("sparkle:deltaFrom");
     if (deltaFrom !== undefined
-        && (!BUNDLE_VERSION_PATTERN.test(deltaFrom)
+        && (!isAppleMacOSBundleVersion(deltaFrom)
           || compareBundleVersions(deltaFrom, version) >= 0)) {
       fail(
         "Appcast delta source must be an older bundle version",
@@ -1451,8 +1690,28 @@ function assertAppcastStateUnchanged(expected, observed, key) {
   }
 }
 
-function highestAppcastVersion(text, channel) {
-  const enclosures = appcastEnclosures(text, channel);
+function highestAppcastVersion(text, channel, {
+  allowLegacyStablePrevious = false,
+} = {}) {
+  const enclosures = appcastEnclosures(text, channel, {
+    allowLegacyStablePrevious,
+  });
+  const legacyEnclosures = enclosures.filter(
+    ({ version }) => isLegacyZeroFirstMacOSBundleVersion(version),
+  );
+  if (legacyEnclosures.length > 0) {
+    if (!allowLegacyStablePrevious
+        || channel.name !== "stable"
+        || enclosures.length !== 1
+        || legacyEnclosures.length !== 1
+        || legacyEnclosures[0].deltaFrom !== undefined) {
+      fail(
+        "A legacy zero-first live stable appcast must contain exactly one full enclosure",
+        "SPARKLE_UPDATE_APPCAST_VERSION_MISMATCH",
+      );
+    }
+    return legacyEnclosures[0].version;
+  }
   return enclosures.reduce(
     (highest, enclosure) => highest === null
       || compareBundleVersions(enclosure.version, highest) > 0
@@ -1856,11 +2115,15 @@ export async function publishSparkleUpdate({
   dmgPath,
   publish = false,
   releaseManifestPath,
+  sourceRepositoryRoot = REPOSITORY_ROOT,
   previousStableManifestPath = null,
   replaceAppcast = false,
   sparklePublicEdKey,
   stableBootstrap = false,
   runWrangler = defaultRunWrangler,
+  // Low-level Git command seam for deterministic failure-path specs. The
+  // provenance policy itself is not injectable and the CLI always uses Git.
+  runSourceGit = defaultRunSourceGit,
   // Injectable like runWrangler so specs exercise the bounded retry without
   // spending its backoff.
   sleep = sleepFor,
@@ -1873,10 +2136,14 @@ export async function publishSparkleUpdate({
       || (previousStableManifestPath !== null
         && typeof previousStableManifestPath !== "string")
       || typeof runWrangler !== "function"
+      || typeof runSourceGit !== "function"
       || typeof sleep !== "function"
       || typeof fetchPublic !== "function"
       || typeof fetchGuard !== "function"
       || typeof validateDMG !== "function"
+      || typeof sourceRepositoryRoot !== "string"
+      || sourceRepositoryRoot.length === 0
+      || sourceRepositoryRoot.includes("\0")
       || !appcastPolicy || typeof appcastPolicy !== "object"
       || appcastPolicy.schemaVersion
         !== CANONICAL_STABLE_APPCAST_POLICY.schemaVersion) {
@@ -1940,13 +2207,33 @@ export async function publishSparkleUpdate({
     normalizedSparklePublicKey,
     releaseChannel,
   );
-  await validateDMG(dmg.path, {
+  const sourceProvenance = verifyReleaseManifestSourceProvenance(
+    manifest.manifest.source,
+    {
+      channel: releaseChannel.name,
+      expectedVersion: manifest.manifest.application.shortVersion,
+      repositoryRoot: sourceRepositoryRoot,
+      runSourceGit,
+    },
+  );
+  const validatedDMG = await validateDMG(dmg.path, {
     expectedBundleIdentifier: manifest.manifest.application.bundleIdentifier,
     expectedBundleVersion: manifest.bundleVersion,
     expectedShortVersion: manifest.manifest.application.shortVersion,
     channel: releaseChannel.name,
     production: true,
   });
+  if (!validatedDMG || typeof validatedDMG !== "object"
+      || Array.isArray(validatedDMG)
+      || validatedDMG.source?.commit !== manifest.manifest.source.commit
+      || validatedDMG.source?.tag !== manifest.manifest.source.tag
+      || Object.keys(validatedDMG.source ?? {}).sort().join(",")
+        !== "commit,tag") {
+    fail(
+      "Signed DMG source identity does not match the release manifest",
+      "SPARKLE_UPDATE_ARTIFACT_SOURCE_MISMATCH",
+    );
+  }
   const dmgWithSha256 = await readFileWithSha256(dmg.path);
   if (dmgWithSha256.bytes.length !== dmg.size) {
     fail("DMG changed while it was being validated");
@@ -2043,12 +2330,28 @@ export async function publishSparkleUpdate({
       path: releaseManifest.path,
       sha256: releaseManifestWithSha256.sha256,
     }),
+    source: sourceProvenance,
     published: publish,
     resumed: false,
     status: publish ? "pending" : PUBLICATION_STATUS_VALIDATED,
     verified: false,
   });
   if (!publish) return publication;
+  const recheckedSourceProvenance = verifyReleaseManifestSourceProvenance(
+    manifest.manifest.source,
+    {
+      channel: releaseChannel.name,
+      expectedVersion: manifest.manifest.application.shortVersion,
+      repositoryRoot: sourceRepositoryRoot,
+      runSourceGit,
+    },
+  );
+  if (recheckedSourceProvenance.tagObject !== sourceProvenance.tagObject) {
+    fail(
+      "Release source tag changed after publication validation",
+      "SPARKLE_UPDATE_SOURCE_CHANGED",
+    );
+  }
   const normalizedAppcastAtomicGuard = injectedAppcastAtomicGuard
     ?? (normalizedAppcastAtomicGuardEndpoint === null
       ? null
@@ -2139,10 +2442,12 @@ export async function publishSparkleUpdate({
       const currentEnclosures = appcastEnclosures(
         currentAppcast.content.toString("utf8"),
         releaseChannel,
+        { allowLegacyStablePrevious: true },
       );
       const currentVersion = highestAppcastVersion(
         currentAppcast.content.toString("utf8"),
         releaseChannel,
+        { allowLegacyStablePrevious: true },
       );
       // A same-version --replace-appcast is permitted only as a document-only
       // re-publication (for example re-signing the feed for Sparkle's signed
@@ -2150,7 +2455,10 @@ export async function publishSparkleUpdate({
       // byte-for-byte so the immutable artifact state cannot drift under a
       // version that installed clients have already observed.
       const sameVersion = currentVersion !== null
-        && compareBundleVersions(manifest.bundleVersion, currentVersion) === 0;
+        && compareAppleMacOSBundleVersionToPrevious(
+          manifest.bundleVersion,
+          currentVersion,
+        ) === 0;
       const fullEnclosureFor = (enclosures) => enclosures.filter(
         (enclosure) => enclosure.version === manifest.bundleVersion
           && enclosure.deltaFrom === undefined,
@@ -2170,7 +2478,10 @@ export async function publishSparkleUpdate({
           === candidateFullEnclosures[0].signature;
       if (!documentOnlyReplacement
           && (currentVersion === null
-            || compareBundleVersions(manifest.bundleVersion, currentVersion) <= 0)) {
+            || compareAppleMacOSBundleVersionToPrevious(
+              manifest.bundleVersion,
+              currentVersion,
+            ) <= 0)) {
         if (sameVersion && liveFullEnclosures.length !== 1) {
           fail(
             "Live appcast has an ambiguous candidate-version publication state",
@@ -2202,6 +2513,20 @@ export async function publishSparkleUpdate({
       temporaryRoot,
     });
     if (!resumedPublication) {
+      const beforeWriteSourceProvenance =
+        verifyReleaseManifestSourceProvenance(manifest.manifest.source, {
+          channel: releaseChannel.name,
+          expectedVersion: manifest.manifest.application.shortVersion,
+          repositoryRoot: sourceRepositoryRoot,
+          runSourceGit,
+        });
+      if (beforeWriteSourceProvenance.tagObject
+          !== sourceProvenance.tagObject) {
+        fail(
+          "Release source tag changed before publication mutation",
+          "SPARKLE_UPDATE_SOURCE_CHANGED",
+        );
+      }
       for (const immutableObject of immutableObjects) {
         if (immutableObject.remote !== null) continue;
         await putObject({
@@ -2227,6 +2552,20 @@ export async function publishSparkleUpdate({
         appcastBeforeWrite,
         publication.appcast.key,
       );
+      const beforeAppcastSourceProvenance =
+        verifyReleaseManifestSourceProvenance(manifest.manifest.source, {
+          channel: releaseChannel.name,
+          expectedVersion: manifest.manifest.application.shortVersion,
+          repositoryRoot: sourceRepositoryRoot,
+          runSourceGit,
+        });
+      if (beforeAppcastSourceProvenance.tagObject
+          !== sourceProvenance.tagObject) {
+        fail(
+          "Release source tag changed before appcast publication",
+          "SPARKLE_UPDATE_SOURCE_CHANGED",
+        );
+      }
       await putAppcastWithAtomicGuard({
         atomicAppcastGuard: normalizedAppcastAtomicGuard,
         bucket,

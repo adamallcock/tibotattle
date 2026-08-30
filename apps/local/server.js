@@ -4,7 +4,8 @@ import { constants, lstatSync } from "node:fs";
 import { lstat, open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   LOCAL_COMPANION_REPORT_FILES,
   LOCAL_COMPANION_SCHEMA_VERSION,
@@ -21,8 +22,19 @@ import {
   refreshLocalArchiveAccountingIndex,
 } from "../../src/local-archive-accounting-index.js";
 import {
-  ingestLocalUnifiedIndexIncrement,
-} from "../../src/local-unified-index-ingest.js";
+  ingestLocalUnifiedIndexOffMain,
+} from "../../src/local-unified-index-off-main.js";
+import {
+  readLocalUnifiedCompanionProjectionOffMain,
+} from "../../src/local-unified-companion-off-main.js";
+import {
+  LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+  LOCAL_UNIFIED_INDEX_APPLICATION_ID,
+  LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+  LOCAL_UNIFIED_INDEX_USER_VERSION,
+  readLocalUnifiedIndexCompatibility,
+  readUnifiedIndexGenerationDescriptor,
+} from "../../src/local-unified-index.js";
 import {
   readLocalUnifiedWindowBreakdown,
 } from "../../src/local-unified-window-breakdown.js";
@@ -50,6 +62,7 @@ import {
 } from "../../src/codex-speed-baseline.js";
 import { createLocalCentralProxy } from "../../src/local-companion-central-proxy.js";
 import {
+  LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS,
   LocalCompanionRefreshController,
   createDeferredAccountingRebuildRecorder,
   createLocalCollectorRefreshRunner,
@@ -114,6 +127,7 @@ import {
   selectProductionAccountObservationSecret,
 } from "../../src/account-observation-production.js";
 import {
+  PREVIEW_PRODUCT_BRAND,
   PRODUCT_BRAND,
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../config/product-brand.js";
@@ -186,6 +200,301 @@ const PARTICIPANT_RELAY_TIMEOUT_MS = 15_000;
 // emitting a long `Keep-Alive: timeout=` response header; the pre-warm below is
 // the dependency-free half that removes the measured cold handshake.
 const CENTRAL_PREWARM_TIMEOUT_MS = 10_000;
+export const LOCAL_COMPANION_INCREMENTAL_REFRESH_TIMEOUT_MS = 5 * 60_000;
+
+function ownerOnlyRegularUnifiedIndex(metadata) {
+  return metadata.isFile()
+    && !metadata.isSymbolicLink()
+    && metadata.nlink === 1
+    && (typeof process.getuid !== "function" || metadata.uid === process.getuid())
+    && (process.platform === "win32" || (metadata.mode & 0o077) === 0);
+}
+
+function unchangedUnifiedIndexTarget(before, after) {
+  return ownerOnlyRegularUnifiedIndex(before)
+    && ownerOnlyRegularUnifiedIndex(after)
+    && before.dev === after.dev
+    && before.ino === after.ino
+    && before.size === after.size
+    && before.mtimeMs === after.mtimeMs
+    && before.ctimeMs === after.ctimeMs;
+}
+
+function localUnifiedIndexHasSidecar(indexFile, inspect) {
+  for (const suffix of ["-wal", "-shm", "-journal"]) {
+    try {
+      inspect(`${indexFile}${suffix}`);
+      return true;
+    } catch (error) {
+      if (error?.code !== "ENOENT") return true;
+    }
+  }
+  return false;
+}
+
+function openImmutableLocalUnifiedIndex(indexFile) {
+  const immutableUrl = pathToFileURL(indexFile);
+  immutableUrl.searchParams.set("immutable", "1");
+  return new DatabaseSync(immutableUrl.href, {
+    readOnly: true,
+    timeout: 1_000,
+  });
+}
+
+function inspectMigratableLocalUnifiedIndex(indexFile, inspect, openDatabase) {
+  let before;
+  try {
+    before = inspect(indexFile);
+  } catch {
+    return false;
+  }
+  if (!ownerOnlyRegularUnifiedIndex(before)
+      || localUnifiedIndexHasSidecar(indexFile, inspect)) {
+    return false;
+  }
+
+  let database;
+  let migratable = false;
+  try {
+    database = openDatabase(indexFile);
+    database.exec("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;");
+    const compatibility = readLocalUnifiedIndexCompatibility(database);
+    if (compatibility.applicationId !== LOCAL_UNIFIED_INDEX_APPLICATION_ID
+        || !Number.isSafeInteger(compatibility.userVersion)
+        || compatibility.userVersion < 1
+        || compatibility.userVersion >= LOCAL_UNIFIED_INDEX_USER_VERSION
+        || compatibility.metadataPartial
+        || compatibility.metadataMalformed
+        || (compatibility.metadataPresent && [
+          compatibility.formatUserVersion,
+          compatibility.minimumReaderUserVersion,
+          compatibility.minimumWriterUserVersion,
+        ].some((version) => !Number.isSafeInteger(version)
+          || version < 1
+          || version > LOCAL_UNIFIED_INDEX_USER_VERSION))) {
+      return false;
+    }
+    const schemaVersion = database.prepare(
+      "SELECT value FROM meta WHERE key = 'schema_version'",
+    ).get()?.value ?? null;
+    if (![LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+      LOCAL_UNIFIED_INDEX_SCHEMA_VERSION].includes(schemaVersion)) {
+      return false;
+    }
+    // Deliberately do not run quick_check here. On an 800 MB retained index it
+    // scans the database synchronously before POST /refresh can answer, which
+    // also blocks health and cancellation. This main-thread selector proves
+    // only bounded compatibility metadata; the off-main ingestion worker owns
+    // full schema, integrity, migration, and publication validation.
+    migratable = true;
+  } catch {
+    migratable = false;
+  } finally {
+    try {
+      database?.close();
+    } catch {
+      migratable = false;
+    }
+  }
+  if (!migratable || localUnifiedIndexHasSidecar(indexFile, inspect)) {
+    return false;
+  }
+  try {
+    return unchangedUnifiedIndexTarget(before, inspect(indexFile));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Select the refresh deadline from the index's actual state at the start of
+ * each run. An exact missing target or a read-only-proven migratable schema
+ * gets the bounded cold-build window. Current, future, clearly corrupt,
+ * foreign, or otherwise uncertain state keeps the normal deadline.
+ */
+export function localCompanionRefreshTimeoutForUnifiedIndex(
+  indexFile,
+  {
+    existingTimeoutMs = LOCAL_COMPANION_INCREMENTAL_REFRESH_TIMEOUT_MS,
+    freshTimeoutMs = LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS,
+    inspect = lstatSync,
+    openDatabase = openImmutableLocalUnifiedIndex,
+  } = {},
+) {
+  if (typeof indexFile !== "string" || indexFile.length < 1) {
+    throw new TypeError("indexFile must be a non-empty string");
+  }
+  if (typeof inspect !== "function") {
+    throw new TypeError("inspect must be a function");
+  }
+  if (typeof openDatabase !== "function") {
+    throw new TypeError("openDatabase must be a function");
+  }
+  for (const [name, value] of Object.entries({
+    existingTimeoutMs,
+    freshTimeoutMs,
+  })) {
+    if (!Number.isSafeInteger(value)
+        || value < 1_000
+        || value > LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS) {
+      throw new TypeError(`${name} is outside the refresh timeout bound`);
+    }
+  }
+  const resolvedIndexFile = resolve(indexFile);
+  try {
+    inspect(resolvedIndexFile);
+  } catch (error) {
+    return error?.code === "ENOENT" ? freshTimeoutMs : existingTimeoutMs;
+  }
+  return inspectMigratableLocalUnifiedIndex(
+    resolvedIndexFile,
+    inspect,
+    openDatabase,
+  )
+    ? freshTimeoutMs
+    : existingTimeoutMs;
+}
+
+const LOCAL_UNIFIED_PROJECTION_FUTURE_TOLERANCE_MS = 5 * 60_000;
+const LOCAL_UNIFIED_PROJECTION_PERIOD_MS = Object.freeze([
+  24 * 60 * 60_000,
+  7 * 24 * 60 * 60_000,
+  30 * 24 * 60 * 60_000,
+]);
+
+async function localUnifiedProjectionValidUntil({
+  indexFile,
+  generationFingerprint,
+  nowMs,
+  inspect = lstat,
+  openDatabase = openImmutableLocalUnifiedIndex,
+} = {}) {
+  let before;
+  let database;
+  try {
+    before = await inspect(indexFile);
+    if (!ownerOnlyRegularUnifiedIndex(before)) return nowMs;
+    database = openDatabase(indexFile);
+    database.exec("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;");
+    const generation = readUnifiedIndexGenerationDescriptor(database);
+    if (generation?.fingerprint !== generationFingerprint) return nowMs;
+    const boundaries = [];
+    for (const durationMs of LOCAL_UNIFIED_PROJECTION_PERIOD_MS) {
+      const rawObservedAt = database.prepare(`
+        SELECT MIN(observed_at_ms) AS observed_at_ms
+        FROM usage_event
+        WHERE observed_at_ms > ?
+      `).get(nowMs - durationMs)?.observed_at_ms;
+      const observedAt = rawObservedAt === null || rawObservedAt === undefined
+        ? null
+        : Number(rawObservedAt);
+      if (Number.isSafeInteger(observedAt)) {
+        // Period membership uses >= at its lower bound, so the row expires on
+        // the first integer millisecond after this exact equality.
+        boundaries.push(observedAt + durationMs + 1);
+      }
+    }
+    for (const table of ["usage_event", "quota_observation"]) {
+      const rawObservedAt = database.prepare(`
+        SELECT MIN(observed_at_ms) AS observed_at_ms
+        FROM ${table}
+        WHERE observed_at_ms > ?
+      `).get(nowMs + LOCAL_UNIFIED_PROJECTION_FUTURE_TOLERANCE_MS)
+        ?.observed_at_ms;
+      const observedAt = rawObservedAt === null || rawObservedAt === undefined
+        ? null
+        : Number(rawObservedAt);
+      if (Number.isSafeInteger(observedAt)) {
+        boundaries.push(
+          observedAt - LOCAL_UNIFIED_PROJECTION_FUTURE_TOLERANCE_MS,
+        );
+      }
+    }
+    const after = await inspect(indexFile);
+    if (!unchangedUnifiedIndexTarget(before, after)) return nowMs;
+    return boundaries.length === 0
+      ? Number.POSITIVE_INFINITY
+      : Math.min(...boundaries.filter((value) => value > nowMs));
+  } catch {
+    return nowMs;
+  } finally {
+    try {
+      database?.close();
+    } catch {
+      // A cache-validity failure simply forces the reviewed full reader.
+    }
+  }
+}
+
+/**
+ * Reuse one immutable, generation-bound projection until the next exact
+ * time-window boundary. A cold start, changed generation, changed declared
+ * baseline, unavailable result, or uncertain validity check always falls
+ * through to the reviewed off-main reader.
+ */
+export function createCachedLocalUnifiedProjectionReader({
+  reader = readLocalUnifiedCompanionProjectionOffMain,
+  validUntil = localUnifiedProjectionValidUntil,
+} = {}) {
+  if (typeof reader !== "function") throw new TypeError("reader must be a function");
+  if (typeof validUntil !== "function") {
+    throw new TypeError("validUntil must be a function");
+  }
+  let cached = null;
+  return async (options, controls = {}) => {
+    const baselineKey = JSON.stringify(
+      Array.isArray(options?.declaredSpeedBaselines)
+        ? options.declaredSpeedBaselines
+        : [],
+    );
+    const expectedFingerprint = controls?.reuse?.generationFingerprint ?? null;
+    const nowMs = options?.nowMs;
+    if (controls?.signal?.aborted === true) {
+      const error = new Error("local_unified_companion_projection_aborted");
+      error.code = "local_unified_companion_projection_aborted";
+      throw error;
+    }
+    if (options?.mode === "full"
+        && cached !== null
+        && expectedFingerprint === cached.generationFingerprint
+        && options.indexFile === cached.indexFile
+        && baselineKey === cached.baselineKey
+        && Number.isFinite(nowMs)
+        && nowMs >= cached.projectedAtMs
+        && nowMs < cached.validUntilMs) {
+      return structuredClone(cached.projection);
+    }
+
+    const projection = await reader(options, controls);
+    // Startup/quick deferred reads are intentionally cheap and do not say
+    // anything about the still-valid completed projection cached beside them.
+    if (options?.mode !== "full") return projection;
+    cached = null;
+    const generationFingerprint = projection?.generation?.fingerprint;
+    if (options?.mode === "full"
+        && projection?.status === "available"
+        && typeof generationFingerprint === "string"
+        && /^generation-v2-[0-9a-f]{64}$/u.test(generationFingerprint)
+        && Number.isFinite(nowMs)) {
+      const validUntilMs = await validUntil({
+        indexFile: options.indexFile,
+        generationFingerprint,
+        nowMs,
+      });
+      if (validUntilMs > nowMs) {
+        cached = {
+          indexFile: options.indexFile,
+          generationFingerprint,
+          baselineKey,
+          projectedAtMs: nowMs,
+          validUntilMs,
+          projection: structuredClone(projection),
+        };
+      }
+    }
+    return projection;
+  };
+}
 
 function createAppAwareKeychainBackend(environment) {
   return createExportIdentityKeychainBackend({
@@ -375,6 +684,7 @@ const API_ROUTES = new Set([
   "/api/local/overview",
   "/api/local/gradient",
   "/api/local/weekly",
+  "/api/local/weekly-pace-outlook",
   "/api/local/quality",
   "/api/local/timeline/window-breakdown",
   "/api/local/refresh",
@@ -693,8 +1003,8 @@ export async function readRecentDiagnosticReferences({
  * is kept; when it cannot — the exact disease this route cures — the
  * credential is deleted by its fixed attributes instead, which never needs
  * the secret (verified live 2026-08-10). Only local things are removed: the
- * app-usagemonitor.contribution-device.v1 / installation Keychain entry and
- * the binding state file (plus its pre-rename legacy twin, whose leftover
+ * this bundle's sealed contribution-device Keychain entries and the binding
+ * state file (plus its pre-rename legacy twin, whose leftover
  * would otherwise wedge the next pairing). It contacts no network, revokes
  * no hosted device, and deletes no contributed metadata; the hosted side is
  * unaware of it.
@@ -1518,7 +1828,23 @@ async function readFixedFile(root, file, maximumBytes) {
   return readFile(path);
 }
 
-function stampSemanticOpenTarget(body) {
+const ALLOWED_SEMANTIC_OPEN_TARGETS = new Set([
+  PRODUCT_BRAND.appOpenURL,
+  PREVIEW_PRODUCT_BRAND.appOpenURL,
+]);
+
+export function configuredSemanticOpenTarget(environment = process.env) {
+  const value = environment?.USAGE_MONITOR_APP_OPEN_URL
+    ?? PRODUCT_BRAND.appOpenURL;
+  if (typeof value !== "string" || !ALLOWED_SEMANTIC_OPEN_TARGETS.has(value)) {
+    throw new Error(
+      "USAGE_MONITOR_APP_OPEN_URL must match a reviewed product identity",
+    );
+  }
+  return value;
+}
+
+function stampSemanticOpenTarget(body, semanticOpenTarget) {
   const source = body.toString("utf8");
   const first = source.indexOf(SEMANTIC_OPEN_TARGET_PLACEHOLDER);
   if (first < 0
@@ -1533,7 +1859,7 @@ function stampSemanticOpenTarget(body) {
   return Buffer.from(
     source.replace(
       SEMANTIC_OPEN_TARGET_PLACEHOLDER,
-      PRODUCT_BRAND.appOpenURL,
+      semanticOpenTarget,
     ),
   );
 }
@@ -1553,8 +1879,10 @@ function stampReleaseVersion(body) {
   return Buffer.from(source.replace(RELEASE_VERSION_PLACEHOLDER, RELEASE_VERSION));
 }
 
-function stampLocalDashboard(body) {
-  return stampReleaseVersion(stampSemanticOpenTarget(body));
+function stampLocalDashboard(body, semanticOpenTarget) {
+  return stampReleaseVersion(
+    stampSemanticOpenTarget(body, semanticOpenTarget),
+  );
 }
 
 function finiteNonNegativeInteger(value) {
@@ -2318,6 +2646,7 @@ export function createLocalCompanionServer(options = {}) {
       || Array.isArray(environment)) {
     throw new TypeError("environment must be an object");
   }
+  const semanticOpenTarget = configuredSemanticOpenTarget(environment);
   const parentWatchdogPid = configuredParentWatchdogPid(environment);
   const homeDirectory = configuredHomeDirectory(environment);
   // A malformed provider path must not make the ordinary disabled companion
@@ -2439,6 +2768,7 @@ export function createLocalCompanionServer(options = {}) {
     contributionPreparationOptions: selectedPreparationOptions,
     parentWatchdogPid,
     homeDirectory,
+    semanticOpenTarget,
     ...claudeShadowConfiguration,
   });
 }
@@ -2455,6 +2785,7 @@ function createPreparedLocalCompanionServer({
   claudeProjectDirectory,
   diagnosticsLogFile,
   parentWatchdogPid,
+  semanticOpenTarget,
   // Explicit reversible authority switch. Unified is the normal authority;
   // legacy is retained only for an explicit rollback selection.
   accountingSourceMode =
@@ -2471,8 +2802,14 @@ function createPreparedLocalCompanionServer({
     ledgerFile: statePaths.codexSpeedBaselineFile,
     configFile: join(codexHome, "config.toml"),
   }),
+  unifiedProjectionReader = createCachedLocalUnifiedProjectionReader(),
   dataStore = new LocalCompanionDataStore({
-    builder: async ({ purpose = "full" } = {}) => buildLocalCompanionSnapshot({
+    snapshotFile: statePaths.authoritativeDashboardSnapshotFile,
+    builder: async ({
+      purpose = "full",
+      signal = null,
+      unifiedProjectionReuse = null,
+    } = {}) => buildLocalCompanionSnapshot({
       root: resourceRoot,
       collectorStateFile: statePaths.collectorStateFile,
       archiveIndexFile: accountingSourceMode === "legacy"
@@ -2484,6 +2821,9 @@ function createPreparedLocalCompanionServer({
       unifiedProjectionMode: ["startup", "quick"].includes(purpose)
         ? "deferred"
         : "full",
+      unifiedProjectionReader,
+      unifiedProjectionReuse,
+      signal,
       allowDevelopmentArtifactFallback:
         environment.USAGE_MONITOR_DEVELOPMENT_ARTIFACT_FALLBACK === "1",
       includeDevelopmentSideChatEstimates:
@@ -2562,7 +2902,7 @@ function createPreparedLocalCompanionServer({
       : null,
     // Advance the unified index by its cursors on every foreground refresh:
     // an ordinary pass reads only the bytes the rollout corpus grew.
-    refreshUnifiedIndex: (options) => ingestLocalUnifiedIndexIncrement({
+    refreshUnifiedIndex: (options) => ingestLocalUnifiedIndexOffMain({
       ...options,
       contractVersion: TELEMETRY_SCHEMA_VERSION,
     }),
@@ -2580,7 +2920,11 @@ function createPreparedLocalCompanionServer({
       typeof environment.CODEX_HOME === "string"
       && environment.CODEX_HOME.length > 0,
   }),
-  refreshTimeoutMs = 300_000,
+  refreshTimeoutMs = LOCAL_COMPANION_INCREMENTAL_REFRESH_TIMEOUT_MS,
+  refreshTimeoutMsForRun = () => localCompanionRefreshTimeoutForUnifiedIndex(
+    statePaths.unifiedIndexFile,
+    { existingTimeoutMs: refreshTimeoutMs },
+  ),
   centralOrigin = environment.USAGE_MONITOR_CENTRAL_ORIGIN ?? null,
   centralFetch = globalThis.fetch,
   contributionPreparationRunner = null,
@@ -3237,6 +3581,7 @@ function createPreparedLocalCompanionServer({
     runner: refreshRunner,
     dataStore,
     timeoutMs: refreshTimeoutMs,
+    timeoutMsForRun: refreshTimeoutMsForRun,
     // Five hours of refresh_resource_limited loops once left zero local
     // trail: the terminal classification lived only in this controller's
     // in-memory state. Every terminal refresh failure now files one bounded,
@@ -3601,6 +3946,19 @@ function createPreparedLocalCompanionServer({
         send(response, 200, {
           schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
           weekly: dataStore.getWeekly(),
+        });
+        return;
+      }
+      if (path === "/api/local/weekly-pace-outlook") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        send(response, 200, {
+          schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+          weekly: {
+            paceOutlook: dataStore.getWeeklyPaceOutlook(),
+          },
         });
         return;
       }
@@ -4268,7 +4626,7 @@ function createPreparedLocalCompanionServer({
             MAX_STATIC_BYTES,
           );
           const body = staticFile.file === "index.html"
-            ? stampLocalDashboard(source)
+            ? stampLocalDashboard(source, semanticOpenTarget)
             : source;
           send(response, 200, body, staticFile.type);
         } catch {

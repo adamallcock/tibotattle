@@ -339,6 +339,42 @@ test("--account refuses unsafe names and combination with --ed-key-file", async 
   }
 });
 
+test("appcast CLI rejects bundle versions outside Apple's component bounds", () => {
+  const argumentsFor = (bundleVersion) => [
+    "--channel", "stable",
+    "--app", "/tmp/TiboTattle.app",
+    "--dmg", "/tmp/TiboTattle.dmg",
+    "--bundle-version", bundleVersion,
+  ];
+  for (const bundleVersion of [
+    "0",
+    "0.1.16",
+    "0.1.17",
+    "0.2.0",
+    "01",
+    "12345",
+    "1.100",
+    "1.2.100",
+    "1.2.3.4",
+  ]) {
+    assert.throws(
+      () => parseGenerateSparkleAppcastArguments(
+        argumentsFor(bundleVersion),
+      ),
+      /Apple-compatible CFBundleVersion/u,
+      bundleVersion,
+    );
+  }
+  for (const bundleVersion of ["1", "1.2", "1.2.3", "1234.99.99"]) {
+    assert.equal(
+      parseGenerateSparkleAppcastArguments(
+        argumentsFor(bundleVersion),
+      ).bundleVersion,
+      bundleVersion,
+    );
+  }
+});
+
 test("stable path passes --ed-key-file through to the official tool", async () => {
   const fixture = await createStableFixture();
   const keyFilePath = join(fixture.root, "test-sparkle-ed-key");

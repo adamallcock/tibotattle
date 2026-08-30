@@ -18,6 +18,7 @@ const allowanceBasisId = (scenario) =>
 
 const STALE_PROVENANCE = {
   stale: true,
+  reason: "cache_accounting_semantics_outdated",
   schemaVersion: "local-replay-safe-accounting-v0.11",
   computedAt: "2026-08-19T11:00:00.000Z",
   coveredAt: {

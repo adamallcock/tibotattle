@@ -20,6 +20,10 @@ import {
   verifyPublishedInstallerRemote,
 } from "../scripts/build-public-release-site.js";
 import {
+  createReleaseChannelProvenance,
+  STABLE_RELEASE_CHANNEL,
+} from "../config/release-channels.js";
+import {
   createMacOSSignedReplacementContract,
 } from "../scripts/macos-release-core.js";
 import { SPARKLE_VERSION } from "../scripts/macos-updater-core.js";
@@ -177,6 +181,9 @@ async function fixture() {
       dmgNotarizationAccepted: true,
       dmgTicketStapled: true,
     },
+    channel: createReleaseChannelProvenance(STABLE_RELEASE_CHANNEL, {
+      publicEdKeySha256: "b".repeat(64),
+    }),
     updater: {
       appcastURL: "https://updates.tibotattle.com/appcast.xml",
       automaticChecks: true,
@@ -564,7 +571,11 @@ test("release-site build verifies artifacts and materializes complete public met
   assert.equal(result.fileCount, 13);
   assert.deepEqual(validatedArtifacts, [[
     value.installerPath,
-    { production: true },
+    {
+      allowLegacyUnsealedSource: false,
+      channel: STABLE_RELEASE_CHANNEL,
+      production: true,
+    },
   ]]);
   assert.deepEqual(verifiedPublishedInstallers, [{
     expectedBytes: value.installerBytes.length,

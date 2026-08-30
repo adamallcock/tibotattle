@@ -2,6 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import {
+  PREVIEW_PRODUCT_BRAND,
+  PRODUCT_BRAND,
+} from "../config/product-brand.js";
+import {
   CONTRIBUTION_DEVICE_READER_CODE_IDENTIFIER,
   CONTRIBUTION_DEVICE_READER_TEAM_IDENTIFIER,
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
@@ -15,6 +19,7 @@ import {
   createExportIdentityKeychainBackend,
   deleteExportIdentityKeychainItemByAttributes,
   exportIdentityKeychainAttributeDeleteArguments,
+  exportIdentityKeychainCapabilitiesForEnvironment,
   keytarSignedBindingRequirement,
   keytarSignedBindingVerificationArguments,
   loadExportIdentityKeychainBinding,
@@ -28,6 +33,10 @@ const EXPORT_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity;
 const ACCOUNT_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation;
 const CLAUDE_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.claudeSessionPseudonym;
 const DEVICE_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDevice;
+const PREVIEW_KEYCHAIN_ENVIRONMENT = Object.freeze({
+  USAGE_MONITOR_KEYCHAIN_NAMESPACE: "app-usagemonitor.preview",
+  USAGE_MONITOR_KEYCHAIN_ACCOUNT: "preview-installation",
+});
 
 function credentialKey(service, account) {
   return `${service}\u0000${account}`;
@@ -99,6 +108,111 @@ test("capabilities are frozen public constants with separate fixed credential pa
   assert.notDeepEqual(EXPORT_CAPABILITY, DEVICE_CAPABILITY);
   assert.notDeepEqual(ACCOUNT_CAPABILITY, DEVICE_CAPABILITY);
   assert.notDeepEqual(CLAUDE_CAPABILITY, DEVICE_CAPABILITY);
+});
+
+test("preview selects only its sealed Keychain pair while stable remains byte-compatible", async () => {
+  const preview = exportIdentityKeychainCapabilitiesForEnvironment(
+    PREVIEW_KEYCHAIN_ENVIRONMENT,
+  );
+  assert.deepEqual(preview.exportIdentity, {
+    service: "app-usagemonitor.preview.export-identity.v1",
+    account: "preview-installation",
+  });
+  assert.equal(PRODUCT_BRAND.keychainNamespace, "app-usagemonitor");
+  assert.equal(PRODUCT_BRAND.keychainAccount, "installation");
+  assert.equal(
+    PREVIEW_PRODUCT_BRAND.keychainNamespace,
+    "app-usagemonitor.preview",
+  );
+  assert.equal(
+    PREVIEW_PRODUCT_BRAND.keychainAccount,
+    "preview-installation",
+  );
+  assert.deepEqual(preview.contributionDeviceApp, {
+    service: "app-usagemonitor.preview.contribution-device.app.v1",
+    account: "preview-installation",
+  });
+  assert.equal(Object.isFrozen(preview), true);
+  assert.notEqual(preview.exportIdentity, EXPORT_CAPABILITY);
+
+  const stableStored = encoded(41);
+  const previewStored = encoded(42);
+  const binding = memoryBinding([
+    [EXPORT_CAPABILITY, stableStored],
+    [preview.exportIdentity, previewStored],
+  ]);
+  const stableBackend = createExportIdentityKeychainBackend({
+    binding,
+    environment: {},
+  });
+  const previewBackend = createExportIdentityKeychainBackend({
+    binding,
+    environment: PREVIEW_KEYCHAIN_ENVIRONMENT,
+  });
+  assert.deepEqual(await stableBackend.read(EXPORT_CAPABILITY), Buffer.alloc(32, 41));
+  assert.deepEqual(await previewBackend.read(EXPORT_CAPABILITY), Buffer.alloc(32, 42));
+  await previewBackend.deleteExact(EXPORT_CAPABILITY, Buffer.alloc(32, 42));
+  assert.deepEqual(await stableBackend.read(EXPORT_CAPABILITY), Buffer.alloc(32, 41));
+  assert.equal(await previewBackend.read(EXPORT_CAPABILITY), null);
+  await assert.rejects(
+    stableBackend.read(preview.exportIdentity),
+    assertKeychainError("invalid_capability"),
+  );
+  assert.deepEqual(
+    [...exportIdentityKeychainAttributeDeleteArguments(
+      preview.contributionDeviceApp,
+      PREVIEW_KEYCHAIN_ENVIRONMENT,
+    )],
+    [
+      "delete-generic-password",
+      "-s",
+      "app-usagemonitor.preview.contribution-device.app.v1",
+      "-a",
+      "preview-installation",
+    ],
+  );
+  assert.deepEqual(
+    [...exportIdentityKeychainAttributeDeleteArguments(
+      EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp,
+      PREVIEW_KEYCHAIN_ENVIRONMENT,
+    )],
+    [
+      "delete-generic-password",
+      "-s",
+      "app-usagemonitor.preview.contribution-device.app.v1",
+      "-a",
+      "preview-installation",
+    ],
+  );
+  assert.throws(
+    () => exportIdentityKeychainAttributeDeleteArguments(
+      preview.contributionDeviceApp,
+      {},
+    ),
+    assertKeychainError("invalid_capability"),
+  );
+
+  for (const environment of [
+    {
+      USAGE_MONITOR_KEYCHAIN_NAMESPACE: "app-usagemonitor.preview",
+    },
+    {
+      USAGE_MONITOR_KEYCHAIN_ACCOUNT: "preview-installation",
+    },
+    {
+      USAGE_MONITOR_KEYCHAIN_NAMESPACE: "app-usagemonitor.preview",
+      USAGE_MONITOR_KEYCHAIN_ACCOUNT: "installation",
+    },
+    {
+      USAGE_MONITOR_KEYCHAIN_NAMESPACE: "arbitrary",
+      USAGE_MONITOR_KEYCHAIN_ACCOUNT: "arbitrary",
+    },
+  ]) {
+    assert.throws(
+      () => exportIdentityKeychainCapabilitiesForEnvironment(environment),
+      assertKeychainError("invalid_configuration"),
+    );
+  }
 });
 
 test("native loader accepts only the exact audited darwin-arm64 prebuild", () => {

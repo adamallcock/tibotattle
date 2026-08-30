@@ -231,6 +231,15 @@ export function localCompanionStatePaths(stateRoot) {
       "private",
       "hosted-signin-handoff-v1.json",
     ),
+    // A bounded, generation-matched dashboard receipt used only when the
+    // current build cannot read its local history. It never replaces the
+    // unified index and lives under the same owner-only private boundary as
+    // the other local companion preferences.
+    authoritativeDashboardSnapshotFile: join(
+      selected,
+      "private",
+      "authoritative-dashboard-snapshot-v1.json",
+    ),
     fastModePreferenceFile: join(
       selected,
       "private",

@@ -15,13 +15,25 @@ import {
   readdir,
   rm,
   symlink,
+  truncate,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { pathToFileURL } from "node:url";
 import {
   LOCAL_COMPANION_SCHEMA_VERSION,
 } from "../../src/local-companion-data.js";
+import {
+  ingestLocalUnifiedIndexOffMain,
+} from "../../src/local-unified-index-off-main.js";
+import {
+  LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+  LOCAL_UNIFIED_INDEX_APPLICATION_ID,
+  LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+  LOCAL_UNIFIED_INDEX_USER_VERSION,
+} from "../../src/local-unified-index.js";
 import {
   LocalContributionPreparationError,
 } from "../../src/local-contribution-preparation.js";
@@ -43,14 +55,20 @@ import {
 import {
   buildTelemetryContributionsFromBundle,
 } from "../../src/telemetry-contribution-builder.js";
+import { TELEMETRY_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
 import {
+  PREVIEW_PRODUCT_BRAND,
   PRODUCT_BRAND,
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../config/product-brand.js";
 import {
   configuredAccountingSourceMode,
+  configuredSemanticOpenTarget,
+  createCachedLocalUnifiedProjectionReader,
   createCentralOutboundFetch,
   createLocalCompanionServer,
+  LOCAL_COMPANION_INCREMENTAL_REFRESH_TIMEOUT_MS,
+  localCompanionRefreshTimeoutForUnifiedIndex,
   resolveClaudeDesktopShadowConfiguration,
   startLocalCompanionServer,
 } from "./server.js";
@@ -61,6 +79,396 @@ const DEVELOPMENT_COVERAGE = Object.freeze({
 });
 const REVIEW_JOB_ID = "11111111-1111-4111-8111-111111111111";
 const REVIEW_SHA256 = "a".repeat(64);
+
+function writeTimeoutClassifierIndex(indexFile, {
+  applicationId = LOCAL_UNIFIED_INDEX_APPLICATION_ID,
+  userVersion,
+  schemaVersion,
+  compatibility = null,
+}) {
+  const database = new DatabaseSync(indexFile);
+  try {
+    database.exec(`
+      PRAGMA application_id=${applicationId};
+      PRAGMA user_version=${userVersion};
+      CREATE TABLE meta(
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      ) STRICT, WITHOUT ROWID;
+    `);
+    database.prepare("INSERT INTO meta(key, value) VALUES (?, ?)")
+      .run("schema_version", schemaVersion);
+    if (compatibility !== null) {
+      const insert = database.prepare(
+        "INSERT INTO meta(key, value) VALUES (?, ?)",
+      );
+      for (const [key, value] of Object.entries(compatibility)) {
+        insert.run(key, value);
+      }
+    }
+  } finally {
+    database.close();
+  }
+}
+
+test("refresh timeout classifier grants the cold window only to missing or proven migratable indexes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "local-timeout-classifier-"));
+  const freshTimeoutMs = 14_400_000;
+  const incrementalTimeoutMs = LOCAL_COMPANION_INCREMENTAL_REFRESH_TIMEOUT_MS;
+  try {
+    const missing = join(root, "missing.sqlite");
+    assert.equal(
+      localCompanionRefreshTimeoutForUnifiedIndex(missing),
+      freshTimeoutMs,
+    );
+
+    const fixtures = [
+      {
+        name: "schema8-v1.sqlite",
+        options: {
+          userVersion: 8,
+          schemaVersion: LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+        },
+        expected: freshTimeoutMs,
+      },
+      {
+        name: "schema9-v2.sqlite",
+        options: {
+          userVersion: 9,
+          schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+        },
+        expected: freshTimeoutMs,
+      },
+      {
+        name: "schema10-v2.sqlite",
+        options: {
+          userVersion: 10,
+          schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+          compatibility: {
+            compatibility_format_user_version: "10",
+            compatibility_minimum_reader_user_version: "10",
+            compatibility_minimum_writer_user_version: "10",
+          },
+        },
+        expected: freshTimeoutMs,
+      },
+      {
+        name: "current.sqlite",
+        options: {
+          userVersion: LOCAL_UNIFIED_INDEX_USER_VERSION,
+          schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+        },
+        expected: incrementalTimeoutMs,
+      },
+      {
+        name: "foreign.sqlite",
+        options: {
+          applicationId: 0x12345678,
+          userVersion: 9,
+          schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+        },
+        expected: incrementalTimeoutMs,
+      },
+      {
+        name: "newer.sqlite",
+        options: {
+          userVersion: LOCAL_UNIFIED_INDEX_USER_VERSION + 1,
+          schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+        },
+        expected: incrementalTimeoutMs,
+      },
+      {
+        name: "malformed-metadata.sqlite",
+        options: {
+          userVersion: 9,
+          schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+          compatibility: {
+            compatibility_format_user_version: "not-a-version",
+            compatibility_minimum_reader_user_version: "9",
+            compatibility_minimum_writer_user_version: "9",
+          },
+        },
+        expected: incrementalTimeoutMs,
+      },
+    ];
+    for (const fixture of fixtures) {
+      const indexFile = join(root, fixture.name);
+      writeTimeoutClassifierIndex(indexFile, fixture.options);
+      await chmod(indexFile, 0o600);
+      const beforeBytes = await readFile(indexFile);
+      const beforeNames = await readdir(root);
+      assert.equal(
+        localCompanionRefreshTimeoutForUnifiedIndex(indexFile),
+        fixture.expected,
+        fixture.name,
+      );
+      assert.deepEqual(await readFile(indexFile), beforeBytes, fixture.name);
+      assert.deepEqual(await readdir(root), beforeNames, fixture.name);
+    }
+
+    const corrupt = join(root, "corrupt.sqlite");
+    await writeFile(corrupt, Buffer.from("not a sqlite database", "utf8"), {
+      mode: 0o600,
+    });
+    const corruptBefore = await readFile(corrupt);
+    assert.equal(
+      localCompanionRefreshTimeoutForUnifiedIndex(corrupt),
+      incrementalTimeoutMs,
+    );
+    assert.deepEqual(await readFile(corrupt), corruptBefore);
+
+    const unreadable = join(root, "unreadable.sqlite");
+    writeTimeoutClassifierIndex(unreadable, {
+      userVersion: 9,
+      schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+    });
+    await chmod(unreadable, 0o000);
+    assert.equal(
+      localCompanionRefreshTimeoutForUnifiedIndex(unreadable),
+      incrementalTimeoutMs,
+    );
+
+    const directory = join(root, "directory.sqlite");
+    await mkdir(directory);
+    assert.equal(
+      localCompanionRefreshTimeoutForUnifiedIndex(directory),
+      incrementalTimeoutMs,
+    );
+
+    const symlinkTarget = join(root, "symlink-target.sqlite");
+    writeTimeoutClassifierIndex(symlinkTarget, {
+      userVersion: 9,
+      schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+    });
+    await chmod(symlinkTarget, 0o600);
+    const linkedIndex = join(root, "linked.sqlite");
+    await symlink(symlinkTarget, linkedIndex);
+    assert.equal(
+      localCompanionRefreshTimeoutForUnifiedIndex(linkedIndex),
+      incrementalTimeoutMs,
+    );
+
+    const sidecarIndex = join(root, "sidecar.sqlite");
+    writeTimeoutClassifierIndex(sidecarIndex, {
+      userVersion: 9,
+      schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+    });
+    await chmod(sidecarIndex, 0o600);
+    await writeFile(`${sidecarIndex}-wal`, "", { mode: 0o600 });
+    assert.equal(
+      localCompanionRefreshTimeoutForUnifiedIndex(sidecarIndex),
+      incrementalTimeoutMs,
+    );
+
+    assert.throws(
+      () => localCompanionRefreshTimeoutForUnifiedIndex(missing, {
+        freshTimeoutMs: freshTimeoutMs + 1,
+      }),
+      /outside the refresh timeout bound/u,
+    );
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("large legacy timeout classification never runs a synchronous integrity scan", async () => {
+  const root = await mkdtemp(join(tmpdir(), "local-timeout-large-index-"));
+  const indexFile = join(root, "schema9-large.sqlite");
+  const sparseSize = 800 * 1024 * 1024;
+  try {
+    writeTimeoutClassifierIndex(indexFile, {
+      userVersion: 9,
+      schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+    });
+    await chmod(indexFile, 0o600);
+    await truncate(indexFile, sparseSize);
+    const before = await lstat(indexFile);
+    const beforeNames = await readdir(root);
+    let integrityScans = 0;
+    const openDatabase = (selectedFile) => {
+      const immutableUrl = pathToFileURL(selectedFile);
+      immutableUrl.searchParams.set("immutable", "1");
+      const database = new DatabaseSync(immutableUrl.href, {
+        readOnly: true,
+        timeout: 1_000,
+      });
+      return {
+        exec: (sql) => database.exec(sql),
+        prepare(sql) {
+          if (/\b(?:quick_check|integrity_check)\b/u.test(sql)) {
+            integrityScans += 1;
+            return {
+              all() {
+                Atomics.wait(
+                  new Int32Array(new SharedArrayBuffer(4)),
+                  0,
+                  0,
+                  750,
+                );
+                return [{ quick_check: "ok" }];
+              },
+            };
+          }
+          return database.prepare(sql);
+        },
+        close: () => database.close(),
+      };
+    };
+    const startedAt = performance.now();
+    assert.equal(
+      localCompanionRefreshTimeoutForUnifiedIndex(indexFile, { openDatabase }),
+      14_400_000,
+    );
+    const elapsedMs = performance.now() - startedAt;
+    assert.equal(integrityScans, 0);
+    assert.equal(elapsedMs < 250, true, `classification took ${elapsedMs}ms`);
+    const after = await lstat(indexFile);
+    assert.equal(after.size, sparseSize);
+    assert.deepEqual(
+      {
+        dev: after.dev,
+        ino: after.ino,
+        size: after.size,
+        mtimeMs: after.mtimeMs,
+        ctimeMs: after.ctimeMs,
+      },
+      {
+        dev: before.dev,
+        ino: before.ino,
+        size: before.size,
+        mtimeMs: before.mtimeMs,
+        ctimeMs: before.ctimeMs,
+      },
+    );
+    assert.deepEqual(await readdir(root), beforeNames);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("unchanged unified projections reuse only within exact generation, time, and baseline bounds", async () => {
+  const generationA = `generation-v2-${"a".repeat(64)}`;
+  const generationB = `generation-v2-${"b".repeat(64)}`;
+  let selectedGeneration = generationA;
+  let reads = 0;
+  const validityChecks = [];
+  const reader = createCachedLocalUnifiedProjectionReader({
+    reader: async (options) => {
+      reads += 1;
+      if (options.mode === "deferred") {
+        return { status: "deferred", generation: null };
+      }
+      return {
+        status: "available",
+        generation: { fingerprint: selectedGeneration },
+        usage: [{ marker: reads }],
+      };
+    },
+    validUntil: async (options) => {
+      validityChecks.push(options);
+      return options.nowMs + 100;
+    },
+  });
+  const options = (nowMs, baselines, mode = "full") => ({
+    indexFile: "/private/index.sqlite",
+    nowMs,
+    declaredSpeedBaselines: baselines,
+    mode,
+  });
+  const reuse = (generationFingerprint) => ({
+    reuse: { generationFingerprint },
+  });
+
+  const cold = await reader(options(100, [{ startAt: 1, mode: "standard" }]));
+  assert.equal(reads, 1);
+  assert.equal(cold.usage[0].marker, 1);
+
+  const unchanged = await reader(
+    options(150, [{ startAt: 1, mode: "standard" }]),
+    reuse(generationA),
+  );
+  assert.equal(reads, 1);
+  assert.equal(unchanged.usage[0].marker, 1);
+  // A caller cannot mutate the retained cache through a returned clone.
+  unchanged.usage[0].marker = 999;
+
+  const clockMovedBack = await reader(
+    options(99, [{ startAt: 1, mode: "standard" }]),
+    reuse(generationA),
+  );
+  assert.equal(reads, 2);
+  assert.equal(clockMovedBack.usage[0].marker, 2);
+
+  const baselineChanged = await reader(
+    options(151, [{ startAt: 1, mode: "fast" }]),
+    reuse(generationA),
+  );
+  assert.equal(reads, 3);
+  assert.equal(baselineChanged.usage[0].marker, 3);
+
+  const timeBoundaryReached = await reader(
+    options(251, [{ startAt: 1, mode: "fast" }]),
+    reuse(generationA),
+  );
+  assert.equal(reads, 4);
+  assert.equal(timeBoundaryReached.usage[0].marker, 4);
+
+  selectedGeneration = generationB;
+  const changedGeneration = await reader(
+    options(252, [{ startAt: 1, mode: "fast" }]),
+    reuse(generationB),
+  );
+  assert.equal(reads, 5);
+  assert.equal(changedGeneration.generation.fingerprint, generationB);
+
+  const deferred = await reader(
+    options(253, [{ startAt: 1, mode: "fast" }], "deferred"),
+    reuse(generationB),
+  );
+  assert.equal(reads, 6);
+  assert.equal(deferred.status, "deferred");
+  assert.equal(validityChecks.length, 5);
+
+  const afterDeferred = await reader(
+    options(254, [{ startAt: 1, mode: "fast" }]),
+    reuse(generationB),
+  );
+  assert.equal(reads, 6);
+  assert.equal(afterDeferred.usage[0].marker, 5);
+
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    reader(
+      options(255, [{ startAt: 1, mode: "fast" }]),
+      { ...reuse(generationB), signal: controller.signal },
+    ),
+    (error) => error?.code === "local_unified_companion_projection_aborted",
+  );
+  assert.equal(reads, 6);
+});
+
+test("semantic open target is stable by default and accepts only reviewed identities", () => {
+  assert.equal(configuredSemanticOpenTarget({}), PRODUCT_BRAND.appOpenURL);
+  assert.equal(
+    configuredSemanticOpenTarget({
+      USAGE_MONITOR_APP_OPEN_URL: PREVIEW_PRODUCT_BRAND.appOpenURL,
+    }),
+    PREVIEW_PRODUCT_BRAND.appOpenURL,
+  );
+  for (const value of [
+    "",
+    "https://attacker.example/open",
+    "usagemonitor-preview://other",
+  ]) {
+    assert.throws(
+      () => configuredSemanticOpenTarget({
+        USAGE_MONITOR_APP_OPEN_URL: value,
+      }),
+      /must match a reviewed product identity/u,
+    );
+  }
+});
 
 function exactReviewContribution() {
   return buildTelemetryContributionsFromBundle({
@@ -121,6 +529,35 @@ function exactReviewContribution() {
 
 function fakeStore() {
   let reloads = 0;
+  const paceOutlook = {
+    schemaVersion: "local-weekly-pace-outlook-v0.1",
+    status: "unavailable",
+    standing: null,
+    critical: false,
+    earlyEstimate: false,
+    remainingPercent: null,
+    resetsAt: null,
+    observationCount: 0,
+    elapsedHours: null,
+    rates: {
+      activePercentagePointsPerHour: null,
+      overallPercentagePointsPerHour: null,
+      headlinePercentagePointsPerHour: null,
+      sustainablePercentagePointsPerHour: null,
+      ratio: null,
+    },
+    projection: {
+      hoursToReset: null,
+      coveredHours: null,
+      dryHours: null,
+      sparePercent: null,
+      projectedExhaustionAt: null,
+    },
+    track: {
+      coveredFraction: null,
+      activeExhaustionFraction: null,
+    },
+  };
   return {
     async initialize() {},
     async reload() {
@@ -138,6 +575,9 @@ function fakeStore() {
     },
     getWeekly() {
       return { status: "available", datasets: { summary: [{ median_weekly_value_usd: 100 }] } };
+    },
+    getWeeklyPaceOutlook() {
+      return structuredClone(paceOutlook);
     },
     getQuality() {
       return { status: "available", datasets: { summary: [{ known_speed_fraction: 0.8 }] } };
@@ -207,6 +647,50 @@ async function fixture() {
     );
   }
   return { root, resourceRoot, stateRoot, codexHome, staticRoot };
+}
+
+function unifiedIndexRolloutFixture() {
+  const threadId = "11111111-1111-4111-8111-111111111111";
+  return [
+    {
+      timestamp: "2026-08-24T00:00:00.000Z",
+      type: "session_meta",
+      payload: {
+        id: threadId,
+        session_id: threadId,
+        thread_source: "user",
+        originator: "codex_cli_rs",
+      },
+    },
+    {
+      timestamp: "2026-08-24T00:00:01.000Z",
+      type: "turn_context",
+      payload: {
+        turn_id: "turn-1",
+        model: "gpt-5.6-sol",
+        effort: "high",
+      },
+    },
+    {
+      timestamp: "2026-08-24T00:00:02.000Z",
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: {
+          total_token_usage: {
+            input_tokens: 10,
+            output_tokens: 2,
+            total_tokens: 12,
+          },
+          last_token_usage: {
+            input_tokens: 10,
+            output_tokens: 2,
+            total_tokens: 12,
+          },
+        },
+      },
+    },
+  ].map((value) => JSON.stringify(value)).join("\n") + "\n";
 }
 
 test("production authority defaults unified and keeps legacy as explicit rollback", () => {
@@ -402,6 +886,16 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     assert.equal(overview.status, 200);
     assert.equal((await overview.json()).mode, "real_local_evidence");
 
+    const paceOutlook = await fetch(`${base}/api/local/weekly-pace-outlook`);
+    assert.equal(paceOutlook.status, 200);
+    assert.equal(
+      (await paceOutlook.json()).weekly.paceOutlook.schemaVersion,
+      "local-weekly-pace-outlook-v0.1",
+    );
+    assert.equal((await fetch(`${base}/api/local/weekly-pace-outlook`, {
+      method: "POST",
+    })).status, 405);
+
     const page = await fetch(`${base}/`);
     assert.equal(page.status, 200);
     const pageBody = await page.text();
@@ -504,6 +998,37 @@ test("loopback server exposes only fixed API, static, and report routes", async 
       `<meta content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}"><meta content="${SEMANTIC_OPEN_TARGET_PLACEHOLDER}">`,
     );
     assert.equal((await fetch(`${base}/index.html`)).status, 404);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("preview companion stamps only the preview semantic-open route", async () => {
+  const files = await fixture();
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    environment: {
+      ...process.env,
+      USAGE_MONITOR_APP_OPEN_URL: PREVIEW_PRODUCT_BRAND.appOpenURL,
+    },
+    refreshRunner: async () => ({}),
+    port: 0,
+  });
+  try {
+    const page = await fetch(`http://127.0.0.1:${app.port}/`);
+    assert.equal(page.status, 200);
+    const body = await page.text();
+    assert.match(body, new RegExp(PREVIEW_PRODUCT_BRAND.appOpenURL, "u"));
+    assert.doesNotMatch(body, new RegExp(PRODUCT_BRAND.appOpenURL, "u"));
+    assert.doesNotMatch(
+      body,
+      new RegExp(SEMANTIC_OPEN_TARGET_PLACEHOLDER, "u"),
+    );
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });
@@ -1485,7 +2010,7 @@ test("loopback refresh publishes a rollout quarantine as degraded verified cover
   }
 });
 
-test("server exposes an authorized bounded refresh cancellation", async () => {
+test("server exposes an authorized cancellation without reloading deep state", async () => {
   const files = await fixture();
   const store = fakeStore();
   let observedAbort = false;
@@ -1576,7 +2101,7 @@ test("server exposes an authorized bounded refresh cancellation", async () => {
     assert.equal(observedAbort, true);
     assert.equal(status.refresh.errorCode, "refresh_cancelled");
     assert.equal(status.refresh.progress.status, "bounded_pause");
-    assert.equal(store.reloads, 1);
+    assert.equal(store.reloads, 0);
 
     const duplicateCancel = await fetch(`${base}/api/local/refresh/cancel`, {
       method: "POST",
@@ -1590,6 +2115,123 @@ test("server exposes an authorized bounded refresh cancellation", async () => {
     );
   } finally {
     await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("Darwin loopback stays responsive and cancels a real off-main cold ingest without publication", {
+  skip: process.platform !== "darwin",
+  timeout: 15_000,
+}, async () => {
+  const files = await fixture();
+  const store = fakeStore();
+  const progressReached = deferred();
+  const releaseProgress = deferred();
+  const indexFile = join(files.stateRoot, "local-unified-index-v1.sqlite");
+  const secretFile = join(
+    files.stateRoot,
+    "local-unified-index-device-salt-v1",
+  );
+  const sessions = join(files.codexHome, "sessions", "2026", "08", "24");
+  const rolloutFile = join(
+    sessions,
+    "rollout-2026-08-24T00-00-00-11111111-1111-4111-8111-111111111111.jsonl",
+  );
+  let heldProgress = false;
+  let app;
+  try {
+    await mkdir(sessions, { recursive: true, mode: 0o700 });
+    await writeFile(rolloutFile, unifiedIndexRolloutFixture(), { mode: 0o600 });
+    app = await startLocalCompanionServer({
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      dataStore: store,
+      refreshRunner: ({ signal, onProgress }) => (
+        ingestLocalUnifiedIndexOffMain({
+          codexHome: files.codexHome,
+          indexFile,
+          secretFile,
+          contractVersion: TELEMETRY_SCHEMA_VERSION,
+          signal,
+          onProgress: async (progress) => {
+            await onProgress(progress);
+            if (heldProgress) return;
+            heldProgress = true;
+            progressReached.resolve();
+            await releaseProgress.promise;
+          },
+        })
+      ),
+      port: 0,
+    });
+    await app.snapshotReady;
+    const base = `http://127.0.0.1:${app.port}`;
+    const authorizedHeaders = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const started = await fetch(`${base}/api/local/refresh`, {
+      method: "POST",
+      headers: authorizedHeaders,
+      body: "{}",
+    });
+    assert.equal(started.status, 202);
+    await progressReached.promise;
+    await waitFor(async () => (await readdir(files.stateRoot))
+      .some((name) => name.startsWith(
+        "local-unified-index-v1.sqlite.building-",
+      )), 3_000);
+
+    const health = await fetch(`${base}/api/local/health`, {
+      signal: AbortSignal.timeout(1_000),
+    });
+    assert.equal(health.status, 200);
+    assert.equal((await health.json()).status, "ready");
+    const whileRunning = await fetch(`${base}/api/local/refresh`, {
+      signal: AbortSignal.timeout(1_000),
+    });
+    assert.equal(whileRunning.status, 200);
+    const runningPayload = await whileRunning.json();
+    assert.equal(runningPayload.refresh.status, "running");
+    assert.equal(runningPayload.refresh.progress.kind, "unified_index");
+    await assert.rejects(
+      lstat(indexFile),
+      (error) => error?.code === "ENOENT",
+    );
+
+    const cancelling = await fetch(`${base}/api/local/refresh/cancel`, {
+      method: "POST",
+      headers: authorizedHeaders,
+      body: "{}",
+    });
+    assert.equal(cancelling.status, 202);
+    assert.equal((await cancelling.json()).refresh.status, "cancelling");
+    await waitFor(async () => {
+      const payload = await fetch(`${base}/api/local/refresh`)
+        .then((response) => response.json());
+      return payload.refresh.status === "cancelled";
+    }, 5_000);
+    const terminal = await fetch(`${base}/api/local/refresh`)
+      .then((response) => response.json());
+    assert.equal(terminal.refresh.errorCode, "refresh_cancelled");
+    assert.equal(store.reloads, 0);
+    await assert.rejects(
+      lstat(indexFile),
+      (error) => error?.code === "ENOENT",
+    );
+    assert.deepEqual(
+      (await readdir(files.stateRoot)).filter((name) => (
+        name.startsWith("local-unified-index-v1.sqlite.building-")
+        || name.startsWith("local-unified-index-v1.sqlite.incremental-")
+      )),
+      [],
+    );
+  } finally {
+    releaseProgress.resolve();
+    await app?.close();
     await rm(files.root, { recursive: true });
   }
 });

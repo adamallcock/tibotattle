@@ -45,6 +45,7 @@ export {
   deleteExportIdentityKeychainItemByAttributes,
   exportIdentityKeychainAttributeDeleteArguments,
   exportIdentityKeychainAttributeProbeArguments,
+  exportIdentityKeychainCapabilitiesForEnvironment,
   exportIdentityKeychainItemPresenceByAttributes,
   keytarSignedBindingRequirement,
   keytarSignedBindingVerificationArguments,

@@ -143,6 +143,7 @@ const ACCOUNTING_SOURCE_ERROR_CODES = Object.freeze({
   local_unified_index_file_invalid: "accounting_unified_index_unavailable",
   local_unified_index_file_changed: "accounting_unified_generation_changed",
   local_unified_index_schema_invalid: "accounting_unified_index_incompatible",
+  local_unified_index_schema_newer: "local_unified_index_schema_newer",
   local_unified_index_compatibility_invalid: "accounting_unified_index_incompatible",
   local_unified_index_meta_invalid: "accounting_unified_index_invalid",
   local_unified_index_row_invalid: "accounting_unified_index_invalid",

@@ -46,6 +46,11 @@ import {
   defaultLocalUnifiedIndexPath,
 } from "./local-unified-index.js";
 import {
+  isAuthoritativeDashboardSnapshot,
+  readAuthoritativeDashboardSnapshot,
+  writeAuthoritativeDashboardSnapshot,
+} from "./local-authoritative-dashboard-snapshot.js";
+import {
   readLocalUnifiedCompanionProjection,
 } from "./local-unified-companion-source.js";
 import {
@@ -68,7 +73,9 @@ import {
   BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT,
 } from "./reporting/index.js";
 import {
+  isExactWeeklyPaceForecast,
   projectWeeklyPaceForecast,
+  projectWeeklyPaceOutlook,
   weeklyPaceSnapshotsFromCollectorRecord,
 } from "./weekly-pace-projection.js";
 import {
@@ -98,6 +105,7 @@ const RECENT_COLLECTOR_PERIOD_LABEL =
 const MAX_REPLAY_SAFE_CACHE_AGE_MS = 30 * 60 * 1_000;
 const MAX_COLLECTOR_LIVE_AGE_MS = MAX_REPLAY_SAFE_CACHE_AGE_MS;
 const MAX_WEEKLY_PACE_OBSERVATIONS = 8_192;
+export const INFORMATIONAL_HISTORY_GAP_MAX_SHARE = 0.01;
 const ALLOWANCE_CAPACITY_SCHEMA_VERSION =
   "codex-primary-allowance-capacity-v0.1";
 const ALLOWANCE_SCENARIOS = Object.freeze([
@@ -111,6 +119,40 @@ const TIMELINE_WEIGHTING_STATUS_CODE = Object.freeze({
   partial: 1,
   unknown: 2,
 });
+
+export function isInformationalTerminalHistoryGap(historyCoverage) {
+  const sourceCount = Number.isSafeInteger(historyCoverage?.sourceCount)
+      && historyCoverage.sourceCount >= 0
+    ? historyCoverage.sourceCount
+    : null;
+  const indexedSourceCount = Number.isSafeInteger(
+    historyCoverage?.indexedSourceCount,
+  ) && historyCoverage.indexedSourceCount >= 0
+    ? historyCoverage.indexedSourceCount
+    : null;
+  const pendingSourceCount = Number.isSafeInteger(
+    historyCoverage?.pendingSourceCount,
+  ) && historyCoverage.pendingSourceCount >= 0
+    ? historyCoverage.pendingSourceCount
+    : null;
+  const skippedSourceCount = Number.isSafeInteger(
+    historyCoverage?.skippedSourceCount,
+  ) && historyCoverage.skippedSourceCount >= 0
+    ? historyCoverage.skippedSourceCount
+    : null;
+  return historyCoverage?.status === "partial"
+    && historyCoverage?.phase === "partial_terminal"
+    && sourceCount !== null
+    && sourceCount > 0
+    && indexedSourceCount !== null
+    && indexedSourceCount > 0
+    && pendingSourceCount === 0
+    && skippedSourceCount !== null
+    && skippedSourceCount > 0
+    && indexedSourceCount + skippedSourceCount === sourceCount
+    && skippedSourceCount / sourceCount
+      <= INFORMATIONAL_HISTORY_GAP_MAX_SHARE;
+}
 
 // These operator pages are direct HTML routes, not a browser data projection.
 // Keep the fixed route-to-file map beside the snapshot builder so the local
@@ -903,12 +945,64 @@ function staleReplaySafeProvenance(staleCache) {
   }
   return {
     stale: true,
+    reason: staleCache.reason === "local_unified_index_schema_newer"
+      ? "local_unified_index_schema_newer"
+      : "cache_accounting_semantics_outdated",
     schemaVersion: staleCache.schemaVersion,
     computedAt: staleCache.computedAt,
     coveredAt: {
       startAt: staleCache.coveredAt?.startAt ?? null,
       endAt: staleCache.coveredAt?.endAt ?? null,
     },
+  };
+}
+
+/**
+ * A validated unified replay-safe cache is an immutable receipt for the
+ * generation that produced it. If the current index is newer than this build
+ * can read, that cache cannot be promoted to current authority, but its
+ * bounded period scalars remain safe to serve as a plainly labeled last
+ * verified projection. Generic read failures stay withheld: only the typed
+ * newer-schema case proves that the problem is reader compatibility rather
+ * than corruption.
+ */
+function lastAuthoritativeReplaySafeCache(read, reason) {
+  const cache = read?.cache;
+  const descriptor = cache?.sourceDescriptor;
+  const generation = descriptor?.generation;
+  const generationFingerprint = descriptor?.generationFingerprint;
+  const hasGeneration = (
+    (typeof generation === "string" && generation.length > 0)
+    || (Number.isSafeInteger(generation) && generation >= 1)
+    || (typeof generationFingerprint === "string"
+      && generationFingerprint.length > 0)
+  );
+  if (reason !== "local_unified_index_schema_newer"
+      || !["available", "stale"].includes(read?.status)
+      || cache === null
+      || typeof cache !== "object"
+      || descriptor?.mode !== "unified"
+      || descriptor?.contextBehavior !== "legacy_zero"
+      || descriptor?.fallbackCount !== 0
+      || !["complete", "partial"].includes(descriptor?.coverageStatus)
+      || !hasGeneration
+      || typeof cache.schemaVersion !== "string"
+      || cache.schemaVersion.length === 0
+      || !Number.isFinite(Date.parse(cache.generatedAt ?? ""))
+      || !Number.isFinite(Date.parse(cache.coveredAt?.startAt ?? ""))
+      || !Number.isFinite(Date.parse(cache.coveredAt?.endAt ?? ""))) {
+    return null;
+  }
+  return {
+    stale: true,
+    reason,
+    schemaVersion: cache.schemaVersion,
+    computedAt: cache.generatedAt,
+    coveredAt: {
+      startAt: cache.coveredAt.startAt,
+      endAt: cache.coveredAt.endAt,
+    },
+    cache,
   };
 }
 
@@ -1383,6 +1477,7 @@ async function readCollectorProjection(
     throw fixedError("collector_unavailable");
   }
   if (state.status === "missing") {
+    const paceForecast = projectWeeklyPaceForecast({ nowMs });
     return {
       status: "missing",
       recordCount: 0,
@@ -1402,7 +1497,8 @@ async function readCollectorProjection(
         sparkQuota: [],
       },
       recordCounts: { usage: 0, quota: 0, tools: 0, other: 0 },
-      paceForecast: projectWeeklyPaceForecast({ nowMs }),
+      paceForecast,
+      paceOutlook: projectWeeklyPaceOutlook({ forecast: paceForecast, nowMs }),
     };
   }
   const periods = [
@@ -1584,6 +1680,7 @@ async function readCollectorProjection(
     observations: weeklyPaceSnapshots,
     nowMs,
   });
+  const paceOutlook = projectWeeklyPaceOutlook({ forecast: paceForecast, nowMs });
   const projection = {
     status: "available",
     recordCount,
@@ -1619,6 +1716,7 @@ async function readCollectorProjection(
     },
     recordCounts,
     paceForecast,
+    paceOutlook,
   };
   return projection;
 }
@@ -1802,6 +1900,17 @@ function summarizeToolClasses(records) {
     total += 1;
   }
   return { total, counts };
+}
+
+function unavailableToolClasses(reason) {
+  return {
+    status: "unavailable",
+    reason,
+    total: null,
+    counts: Object.fromEntries(
+      [...KNOWN_TOOL_CLASSES].map((toolClass) => [toolClass, null]),
+    ),
+  };
 }
 
 function summarizeUsage(records, nowMs) {
@@ -2193,6 +2302,8 @@ const UNIFIED_WITHHELD_MISSING_WARNING =
   "The unified local index has not been built yet. Usage totals and timelines remain unavailable until a complete generation-bound publication is available.";
 const UNIFIED_WITHHELD_UNREADABLE_WARNING =
   "The unified local index is unavailable. Usage totals and timelines remain unavailable until a complete generation-bound publication is available.";
+const UNIFIED_SCHEMA_NEWER_WARNING =
+  "This local history was created by a newer TiboTattle build. This build cannot refresh its usage totals or timelines; install a compatible newer build. The retained local history has not been deleted.";
 const HISTORY_TOTALS_HIDDEN_WARNING =
   "History indexing is still advancing. Complete historical totals stay hidden until an indexed aggregate is available.";
 export const RETAINED_EVIDENCE_RELABELED_WARNINGS = Object.freeze([
@@ -2262,6 +2373,7 @@ function unifiedHistoryState({ cache, unified, cacheErrorCode }) {
       : typeof cacheErrorCode === "string"
         ? cacheErrorCode
         : "accounting_unified_history_unavailable";
+  const terminalUnavailable = !available && unified?.status === "unavailable";
   return {
     accounting: available
       ? {
@@ -2282,7 +2394,11 @@ function unifiedHistoryState({ cache, unified, cacheErrorCode }) {
       status: available && !partialTerminal ? "complete" : "partial",
       phase: partialTerminal
         ? "partial_terminal"
-        : available ? "complete" : cache === null ? "not_started" : "unavailable",
+        : available
+          ? "complete"
+          : terminalUnavailable
+            ? "invalid"
+            : cache === null ? "not_started" : "unavailable",
       errorCode,
       generatedAt: available ? history.coverage.generatedAt : null,
       coveredAt,
@@ -2337,6 +2453,9 @@ export async function buildLocalCompanionSnapshot({
   developmentSideChatHistoricalGapTimeZone = "America/New_York",
   developmentSideChatHistoricalGapAssumedSpeed = "fast",
   sideChatHistoricalGapCollector = collectHistoricalSideChatGapProbe,
+  unifiedProjectionReader = readLocalUnifiedCompanionProjection,
+  unifiedProjectionReuse = null,
+  signal = null,
   now = () => Date.now(),
 } = {}) {
   const nowMs = now();
@@ -2359,6 +2478,15 @@ export async function buildLocalCompanionSnapshot({
   }
   if (typeof sideChatEstimateCollector !== "function") {
     throw new TypeError("sideChatEstimateCollector must be a function");
+  }
+  if (typeof unifiedProjectionReader !== "function") {
+    throw new TypeError("unifiedProjectionReader must be a function");
+  }
+  if (signal !== null
+      && (typeof signal !== "object"
+        || typeof signal.aborted !== "boolean"
+        || typeof signal.addEventListener !== "function")) {
+    throw new TypeError("signal must be an AbortSignal or null");
   }
   if (developmentSideChatHistoricalGapDate !== null
       && (typeof developmentSideChatHistoricalGapDate !== "string"
@@ -2434,12 +2562,15 @@ export async function buildLocalCompanionSnapshot({
       accountingSourceMode === "legacy"
         ? readLocalArchiveAccountingPeriod({ indexFile: archiveIndexFile })
         : Promise.resolve({ status: "unavailable", period: null }),
-      readLocalUnifiedCompanionProjection({
-        indexFile: unifiedIndexFile,
-        nowMs,
-        declaredSpeedBaselines,
-        mode: unifiedProjectionMode,
-      }),
+      unifiedProjectionReader(
+        {
+          indexFile: unifiedIndexFile,
+          nowMs,
+          declaredSpeedBaselines,
+          mode: unifiedProjectionMode,
+        },
+        { signal, reuse: unifiedProjectionReuse },
+      ),
       sideChatEstimatePromise,
       sideChatHistoricalGapPromise,
     ]);
@@ -2560,7 +2691,10 @@ export async function buildLocalCompanionSnapshot({
     replaySafeAccounting.errorCode === "cache_accounting_semantics_outdated"
       && replaySafeAccounting.staleCache !== undefined
       ? replaySafeAccounting.staleCache
-      : null;
+      : lastAuthoritativeReplaySafeCache(
+        initialReplaySafeAccounting,
+        unified.errorCode,
+      );
   const staleProvenance = staleReplaySafe === null
     ? null
     : staleReplaySafeProvenance(staleReplaySafe);
@@ -2606,6 +2740,24 @@ export async function buildLocalCompanionSnapshot({
   const staleServeActive = staleAccountingServe !== null
     || allowanceWeekly.stale !== undefined
     || allowanceCapacity.stale !== undefined;
+  const accountingProjectionReason = unifiedAccountingWithheld
+    ? unified.status === "deferred"
+      ? "local_unified_index_deferred"
+      : unified.status === "missing"
+        ? "local_unified_index_missing"
+        : unified.errorCode ?? replaySafeAccounting.errorCode
+          ?? "local_unified_index_unavailable"
+    : null;
+  const accountingProjection = {
+    status: unifiedAccountingWithheld
+      ? staleAccountingServe === null ? "unavailable" : "retained"
+      : "available",
+    reason: accountingProjectionReason,
+    terminal: unifiedAccountingWithheld
+      && unified.status === "unavailable",
+    retainedAt: staleAccountingServe?.computedAt ?? null,
+    coveredAt: staleAccountingServe?.coveredAt ?? null,
+  };
   // Retained report artifacts are Standard-priced. They remain available as
   // diagnostic reports, but cannot stand in for a quota-weighted allowance
   // capacity when the matching live scenario is unavailable.
@@ -2617,6 +2769,7 @@ export async function buildLocalCompanionSnapshot({
   const weekly = {
     ...weeklyBase,
     paceForecast: collector.paceForecast,
+    paceOutlook: collector.paceOutlook,
   };
   const collectorLatestRecordAt = collector.latestRecordAt;
   const unifiedLatestExportableMs = accountingSourceMode === "unified"
@@ -2798,6 +2951,13 @@ export async function buildLocalCompanionSnapshot({
   const timelineHistory = unifiedAvailable
     ? {
       status: unified.indexStatus === "complete" ? "complete" : "partial",
+      ...(unified.indexStatus === "partial"
+        ? {
+          reason: unified.toolCoverageStatus === "partial"
+            ? "typed_tool_history_partial"
+            : "unified_index_partial",
+        }
+        : {}),
       coveredAt: unified.coveredAt,
       usageEvents: unified.usageEvents,
       generatedAt: unified.generatedAt,
@@ -2834,7 +2994,11 @@ export async function buildLocalCompanionSnapshot({
   // them only in unified authority mode; legacy rollback keeps its collector
   // projection exactly as before.
   const tools = accountingSourceMode === "unified"
-    ? unifiedAvailable ? unified.tools : summarizeToolClasses([])
+    ? unifiedAvailable
+      ? unified.toolCoverageStatus === "partial"
+        ? unavailableToolClasses("typed_tool_history_partial")
+        : unified.tools
+      : unavailableToolClasses("unified_usage_projection_unavailable")
     : collector.tools;
   const exportableCoveredAt = accountingSourceMode === "unified"
     ? unifiedAvailable
@@ -2904,7 +3068,9 @@ export async function buildLocalCompanionSnapshot({
         ? UNIFIED_WITHHELD_PARTIAL_WARNING
         : unified.status === "missing"
           ? UNIFIED_WITHHELD_MISSING_WARNING
-          : UNIFIED_WITHHELD_UNREADABLE_WARNING);
+          : unified.errorCode === "local_unified_index_schema_newer"
+            ? UNIFIED_SCHEMA_NEWER_WARNING
+            : UNIFIED_WITHHELD_UNREADABLE_WARNING);
   } else if (!unifiedAvailable) {
     if (unified.status === "deferred") {
       warnings.push(UNIFIED_DEFERRED_LOADING_WARNING);
@@ -2965,11 +3131,22 @@ export async function buildLocalCompanionSnapshot({
     );
   }
   if (historyCoverage.status !== "complete") {
-    warnings.push(historyAccounting.status === "available"
-      ? historyCoverage.phase === "partial_terminal"
-        ? `Indexed-history totals include ${historyCoverage.indexedSourceCount} verified sources; ${historyCoverage.skippedSourceCount} sources across ${historyCoverage.skippedThreadCount} threads were quarantined after a local integrity check. The missing portion is a known gap, not zero usage.`
-        : `Indexed-history totals currently cover ${historyCoverage.indexedSourceCount}/${historyCoverage.sourceCount} discovered sources and expand as later foreground refreshes advance the index.`
-      : HISTORY_TOTALS_HIDDEN_WARNING);
+    if (historyAccounting.status === "available") {
+      if (historyCoverage.phase === "partial_terminal") {
+        warnings.push(isInformationalTerminalHistoryGap(historyCoverage)
+          ? `Indexed-history totals include ${historyCoverage.indexedSourceCount} of ${historyCoverage.sourceCount} verified sources. ${historyCoverage.skippedSourceCount} sources across ${historyCoverage.skippedThreadCount} threads did not pass local validation, so this result has limited history coverage; missing usage remains unavailable rather than zero.`
+          : `Indexed-history totals include ${historyCoverage.indexedSourceCount} of ${historyCoverage.sourceCount} verified sources. ${historyCoverage.skippedSourceCount} sources across ${historyCoverage.skippedThreadCount} threads did not pass local validation. This is a material coverage gap; missing usage remains unavailable rather than zero.`);
+      } else {
+        warnings.push(
+          `Indexed-history totals currently cover ${historyCoverage.indexedSourceCount}/${historyCoverage.sourceCount} discovered sources and expand as later foreground refreshes advance the index.`,
+        );
+      }
+    } else if (historyCoverage.phase !== "invalid") {
+      // A read failure is terminal for this refresh. Saying it is "still
+      // advancing" would send the reader to wait for a pass that has already
+      // ended; the typed unified-index warning above names that state instead.
+      warnings.push(HISTORY_TOTALS_HIDDEN_WARNING);
+    }
   } else if (historyAccounting.status !== "available") {
     warnings.push(
       "Historical sources are indexed, but their aggregate is temporarily unavailable and is not substituted with a recent-window total.",
@@ -3069,6 +3246,7 @@ export async function buildLocalCompanionSnapshot({
         history: timelineHistory,
       },
       accounting: {
+        projection: accountingProjection,
         sourceMode: accountingSourceMode,
         readerVersion: accountingDescriptor?.readerVersion ?? null,
         compatibilityBehavior:
@@ -3437,6 +3615,7 @@ function availableStatusRows(surface) {
 // Usage-and-costs page renders — and may be retained through a
 // non-authoritative window under the standard gate.
 const ACCOUNTING_TRUTH_FIELDS = Object.freeze([
+  "projection",
   "sourceMode",
   "readerVersion",
   "compatibilityBehavior",
@@ -3478,7 +3657,13 @@ function accountingEvidenceRows(accounting) {
 // so a newly added projection surface cannot reintroduce this class silently.
 const PROJECTION_SURFACES = Object.freeze([
   { path: Object.freeze(["gradient"]), rows: datasetRows },
-  { path: Object.freeze(["weekly"]), rows: datasetRows },
+  {
+    path: Object.freeze(["weekly"]),
+    rows: datasetRows,
+    // Calibration/history may be retained through a deferred generation, but
+    // these account-scoped quota readings must remain from the incoming build.
+    preserveIncomingKeys: Object.freeze(["paceForecast", "paceOutlook"]),
+  },
   { path: Object.freeze(["overview", "usage"]), rows: usagePeriodRows },
   { path: Object.freeze(["overview", "timeline", "usage"]), rows: arrayRows },
   { path: Object.freeze(["overview", "timeline", "sparkUsage"]), rows: arrayRows },
@@ -3517,20 +3702,77 @@ export const RETAINED_PROJECTION_SURFACE_PATHS = Object.freeze(
 
 export class LocalCompanionDataStore {
   #builder;
+  #snapshotFile;
+  #snapshotReader;
+  #snapshotWriter;
+  #snapshotNow;
+  #snapshotWriteIntervalMs;
+  #lastSnapshotPersistedAt = null;
   #snapshot = null;
 
-  constructor({ builder = buildLocalCompanionSnapshot } = {}) {
+  constructor({
+    builder = buildLocalCompanionSnapshot,
+    snapshotFile = null,
+    snapshotReader = readAuthoritativeDashboardSnapshot,
+    snapshotWriter = writeAuthoritativeDashboardSnapshot,
+    snapshotNow = () => Date.now(),
+    snapshotWriteIntervalMs = 60 * 60 * 1_000,
+  } = {}) {
     if (typeof builder !== "function") throw new TypeError("builder must be a function");
+    if (snapshotFile !== null && typeof snapshotFile !== "string") {
+      throw new TypeError("snapshotFile must be a string or null");
+    }
+    if (typeof snapshotReader !== "function") {
+      throw new TypeError("snapshotReader must be a function");
+    }
+    if (typeof snapshotWriter !== "function") {
+      throw new TypeError("snapshotWriter must be a function");
+    }
+    if (typeof snapshotNow !== "function") {
+      throw new TypeError("snapshotNow must be a function");
+    }
+    if (!Number.isSafeInteger(snapshotWriteIntervalMs)
+        || snapshotWriteIntervalMs < 1) {
+      throw new TypeError("snapshotWriteIntervalMs must be a positive integer");
+    }
     this.#builder = builder;
+    this.#snapshotFile = snapshotFile;
+    this.#snapshotReader = snapshotReader;
+    this.#snapshotWriter = snapshotWriter;
+    this.#snapshotNow = snapshotNow;
+    this.#snapshotWriteIntervalMs = snapshotWriteIntervalMs;
   }
 
   async initialize(options) {
-    if (this.#snapshot === null) await this.reload(options);
+    if (this.#snapshot === null) {
+      const restored = await this.#restoreLastAuthoritativeSnapshot();
+      try {
+        await this.reload(options);
+      } catch (error) {
+        if (!restored) throw error;
+        this.#markRestoredSnapshotUnavailable();
+      }
+    }
     return this.getOverview();
   }
 
   async reload(options) {
+    const signal = options?.signal ?? null;
+    if (signal !== null
+        && (typeof signal !== "object"
+          || typeof signal.aborted !== "boolean"
+          || typeof signal.addEventListener !== "function")) {
+      throw new TypeError("options.signal must be an AbortSignal or null");
+    }
+    if (signal?.aborted === true) {
+      throw fixedError("local_companion_snapshot_reload_aborted");
+    }
     const candidate = await this.#builder(options);
+    // Cancellation may arrive while an off-main projection is finishing. Do
+    // not publish the candidate after the controller has cancelled its run.
+    if (signal?.aborted === true) {
+      throw fixedError("local_companion_snapshot_reload_aborted");
+    }
     if (!candidate || candidate.schemaVersion !== LOCAL_COMPANION_SCHEMA_VERSION) {
       throw fixedError("snapshot_invalid");
     }
@@ -3538,7 +3780,86 @@ export class LocalCompanionDataStore {
       structuredClone(candidate),
       options,
     );
+    await this.#persistAuthoritativeSnapshot(candidate);
     return this.getOverview();
+  }
+
+  async #restoreLastAuthoritativeSnapshot() {
+    if (this.#snapshotFile === null) return false;
+    let retained;
+    try {
+      retained = await this.#snapshotReader({
+        snapshotFile: this.#snapshotFile,
+      });
+    } catch {
+      return false;
+    }
+    const persistedAt = Date.parse(retained?.savedAt ?? "");
+    if (!retained || !Number.isFinite(persistedAt)
+        || !isAuthoritativeDashboardSnapshot(retained.snapshot)) {
+      return false;
+    }
+    this.#snapshot = structuredClone(retained.snapshot);
+    this.#lastSnapshotPersistedAt = persistedAt;
+    return true;
+  }
+
+  async #persistAuthoritativeSnapshot(candidate) {
+    if (this.#snapshotFile === null
+        || !isAuthoritativeDashboardSnapshot(candidate)) return;
+    let nowMs;
+    try {
+      nowMs = this.#snapshotNow();
+    } catch {
+      return;
+    }
+    if (!Number.isFinite(nowMs)) return;
+    if (this.#lastSnapshotPersistedAt !== null
+        && nowMs >= this.#lastSnapshotPersistedAt
+        && nowMs - this.#lastSnapshotPersistedAt
+          < this.#snapshotWriteIntervalMs) return;
+    try {
+      const written = await this.#snapshotWriter({
+        snapshotFile: this.#snapshotFile,
+        snapshot: candidate,
+        now: () => nowMs,
+      });
+      if (written === true) this.#lastSnapshotPersistedAt = nowMs;
+    } catch {
+      // Dashboard publication is authoritative without the optional retained
+      // receipt. A full disk, interrupted write, or tightened permissions may
+      // disable cross-launch fallback, but must not make the live dashboard
+      // fail after its source has already passed the authority gate.
+    }
+  }
+
+  #markRestoredSnapshotUnavailable() {
+    const accounting = this.#snapshot?.overview?.accounting;
+    if (accounting && typeof accounting === "object") {
+      accounting.generationMatched = false;
+      accounting.accountingCacheStatus = "unavailable";
+      accounting.projection = {
+        status: "retained",
+        reason: "current_projection_unavailable",
+        terminal: true,
+        retainedAt: accounting.generatedAt
+          ?? accounting.coveredAt?.endAt
+          ?? this.#snapshot.generatedAt
+          ?? null,
+        coveredAt: accounting.coveredAt ?? null,
+      };
+    }
+    const warnings = this.#snapshot?.overview?.warnings;
+    const message =
+      "Showing the last verified local usage projection because the current local history could not be read. The retained local history has not been deleted.";
+    if (this.#snapshot?.overview && typeof this.#snapshot.overview === "object") {
+      this.#snapshot.overview.warnings = [
+        message,
+        ...(Array.isArray(warnings)
+          ? warnings.filter((warning) => warning !== message)
+          : []),
+      ];
+    }
   }
 
   // A quick reload exists to surface fast-moving figures (quota, pace) as soon
@@ -3610,13 +3931,25 @@ export class LocalCompanionDataStore {
     const retained = this.#snapshot;
     if (retained === null) return next;
     let usageEvidenceRetained = false;
-    for (const { path, rows } of PROJECTION_SURFACES) {
+    for (const { path, rows, preserveIncomingKeys = [] }
+      of PROJECTION_SURFACES) {
       const key = path[path.length - 1];
       const nextParent = surfaceParent(next, path);
       const retainedParent = surfaceParent(retained, path);
       if (nextParent === null || retainedParent === null) continue;
       if (rows(nextParent[key]) === 0 && rows(retainedParent[key]) > 0) {
-        nextParent[key] = structuredClone(retainedParent[key]);
+        const incoming = nextParent[key];
+        const replacement = structuredClone(retainedParent[key]);
+        for (const incomingKey of preserveIncomingKeys) {
+          if (incoming !== null
+              && typeof incoming === "object"
+              && Object.hasOwn(incoming, incomingKey)) {
+            replacement[incomingKey] = structuredClone(incoming[incomingKey]);
+          } else {
+            delete replacement[incomingKey];
+          }
+        }
+        nextParent[key] = replacement;
         if (path.length === 2 && path[0] === "overview" && path[1] === "usage") {
           usageEvidenceRetained = true;
         }
@@ -3624,6 +3957,19 @@ export class LocalCompanionDataStore {
     }
     if (this.#retainAccountingEvidence(next, retained)) {
       usageEvidenceRetained = true;
+      const projection = next?.overview?.accounting?.projection;
+      if (projection && typeof projection === "object") {
+        const previousAccounting = retained?.overview?.accounting;
+        next.overview.accounting.projection = {
+          ...projection,
+          status: "retained",
+          retainedAt: previousAccounting?.generatedAt
+            ?? previousAccounting?.coveredAt?.endAt
+            ?? retained.generatedAt
+            ?? null,
+          coveredAt: previousAccounting?.coveredAt ?? null,
+        };
+      }
     }
     if (usageEvidenceRetained) this.#relabelRetainedWarnings(next);
     return next;
@@ -3691,8 +4037,29 @@ export class LocalCompanionDataStore {
     return structuredClone(this.#required().gradient);
   }
 
-  getWeekly() {
-    return structuredClone(this.#required().weekly);
+  getWeekly({ nowMs = Date.now() } = {}) {
+    const weekly = structuredClone(this.#required().weekly);
+    if (isExactWeeklyPaceForecast(weekly?.paceForecast)) {
+      weekly.paceOutlook = projectWeeklyPaceOutlook({
+        forecast: weekly.paceForecast,
+        nowMs,
+      });
+    }
+    return weekly;
+  }
+
+  // Re-project request-time reset geometry from the strict small forecast;
+  // this neither reruns accounting nor clones the large weekly datasets.
+  getWeeklyPaceOutlook({ nowMs = Date.now() } = {}) {
+    const weekly = this.#required().weekly;
+    if (isExactWeeklyPaceForecast(weekly?.paceForecast)) {
+      return projectWeeklyPaceOutlook({
+        forecast: weekly.paceForecast,
+        nowMs,
+      });
+    }
+    const outlook = weekly?.paceOutlook;
+    return outlook === undefined ? null : structuredClone(outlook);
   }
 
   getQuality() {

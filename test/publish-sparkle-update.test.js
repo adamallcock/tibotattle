@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
 import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -22,7 +23,8 @@ import {
   CANONICAL_UPDATE_ORIGIN,
   IMMUTABLE_CACHE_CONTROL,
   parseSparkleUpdatePublisherArguments,
-  publishSparkleUpdate as publishSparkleUpdateRaw,
+  publishSparkleUpdate as publishSparkleUpdateProduction,
+  verifyReleaseManifestSourceProvenance,
 } from "../scripts/publish-sparkle-update.js";
 
 const TEST_KEY_PAIR = generateKeyPairSync("ed25519");
@@ -44,6 +46,121 @@ function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function fixtureSourceGit(source) {
+  const tagObject = sha256(`annotated:${source.tag}`).slice(0, 40);
+  const tagReference = `refs/tags/${source.tag}`;
+  return (_repositoryRoot, arguments_) => {
+    let stdout;
+    if (arguments_[0] === "config"
+        && arguments_[1] === "--get-all"
+        && arguments_[2] === "remote.origin.url") {
+      stdout = "https://github.com/adamallcock/tibotattle\n";
+    } else if (arguments_[0] === "cat-file"
+        && arguments_[1] === "-t"
+        && arguments_[2] === tagReference) {
+      stdout = "tag\n";
+    } else if (arguments_[0] === "rev-parse"
+        && arguments_[1] === "--verify"
+        && arguments_[2] === tagReference) {
+      stdout = `${tagObject}\n`;
+    } else if (arguments_[0] === "rev-parse"
+        && arguments_[1] === "--verify"
+        && arguments_[2] === `${tagReference}^{commit}`) {
+      stdout = `${source.commit}\n`;
+    } else if (arguments_[0] === "tag"
+        && arguments_[1] === "--points-at"
+        && arguments_[2] === source.commit) {
+      stdout = `${source.tag}\n`;
+    } else if (arguments_[0] === "ls-remote"
+        && arguments_[1] === "--tags"
+        && arguments_[2] === source.repository
+        && arguments_[3] === tagReference
+        && arguments_[4] === `${tagReference}^{}`) {
+      stdout = `${tagObject}\t${tagReference}\n`
+        + `${source.commit}\t${tagReference}^{}\n`;
+    } else {
+      return { status: 1, stderr: "unexpected synthetic Git command" };
+    }
+    return { status: 0, stderr: "", stdout };
+  };
+}
+
+function sourceGitWithRemote(sourceRepository, {
+  remoteCommit = sourceRepository.source.commit,
+  remoteTagObject = git(sourceRepository.root, [
+    "rev-parse",
+    `refs/tags/${sourceRepository.source.tag}`,
+  ]),
+  remoteTagPresent = true,
+} = {}) {
+  const tagReference = `refs/tags/${sourceRepository.source.tag}`;
+  return (repositoryRoot, arguments_) => {
+    if (arguments_[0] === "ls-remote") {
+      return {
+        status: 0,
+        stderr: "",
+        stdout: remoteTagPresent
+          ? `${remoteTagObject}\t${tagReference}\n`
+            + `${remoteCommit}\t${tagReference}^{}\n`
+          : "",
+      };
+    }
+    try {
+      return {
+        status: 0,
+        stderr: "",
+        stdout: execFileSync(
+          "/usr/bin/git",
+          ["-C", repositoryRoot, ...arguments_],
+          { encoding: "utf8" },
+        ),
+      };
+    } catch (error) {
+      return {
+        error,
+        status: error.status ?? 1,
+        stderr: String(error.stderr ?? ""),
+        stdout: String(error.stdout ?? ""),
+      };
+    }
+  };
+}
+
+async function fixtureSourceForManifest(releaseManifestPath) {
+  let source = {
+    commit: "a".repeat(40),
+    repository: "https://github.com/adamallcock/tibotattle",
+    tag: `v${RELEASE_VERSION}`,
+  };
+  try {
+    source = JSON.parse(await readFile(releaseManifestPath, "utf8")).source;
+  } catch {
+    // Invalid-path option tests fail before source inspection. Retain a closed
+    // synthetic identity so their intended argument boundary remains focused.
+  }
+  return Object.freeze({
+    runSourceGit: fixtureSourceGit(source),
+    source: Object.freeze({ commit: source.commit, tag: source.tag }),
+  });
+}
+
+async function publishSparkleUpdateRaw(options) {
+  const fixtureSource = await fixtureSourceForManifest(
+    options.releaseManifestPath,
+  );
+  const injectedValidateDMG = options.validateDMG ?? (async () => null);
+  return publishSparkleUpdateProduction({
+    ...options,
+    runSourceGit: options.runSourceGit
+      ?? fixtureSource.runSourceGit,
+    validateDMG: async (...arguments_) => {
+      const result = await injectedValidateDMG(...arguments_);
+      if (result && typeof result === "object" && result.source) return result;
+      return { source: fixtureSource.source };
+    },
+  });
+}
+
 async function publishSparkleUpdate(options) {
   return publishSparkleUpdateRaw({
     atomicAppcastGuard: options.atomicAppcastGuard
@@ -55,6 +172,46 @@ async function publishSparkleUpdate(options) {
     stableBootstrap: true,
     ...options,
   });
+}
+
+function git(repositoryRoot, arguments_) {
+  return execFileSync("/usr/bin/git", ["-C", repositoryRoot, ...arguments_], {
+    encoding: "utf8",
+  }).trim();
+}
+
+async function createTaggedSourceRepository({
+  tag = `v${RELEASE_VERSION}`,
+} = {}) {
+  const root = await mkdtemp(
+    join(await realpath(tmpdir()), "tibotattle-publisher-source-test-"),
+  );
+  git(root, ["init", "-q"]);
+  git(root, ["config", "user.email", "publisher-test@example.invalid"]);
+  git(root, ["config", "user.name", "Publisher provenance test"]);
+  git(root, [
+    "remote",
+    "add",
+    "origin",
+    "https://github.com/adamallcock/tibotattle",
+  ]);
+  const markerPath = join(root, "source-marker.txt");
+  await writeFile(markerPath, "first source revision\n");
+  git(root, ["add", "source-marker.txt"]);
+  git(root, ["commit", "-q", "-m", "source revision"]);
+  const commit = git(root, ["rev-parse", "HEAD"]);
+  git(root, ["tag", "-a", tag, "-m", "release source"]);
+  return {
+    cleanup: () => rm(root, { recursive: true, force: true }),
+    commit,
+    markerPath,
+    root,
+    source: {
+      commit,
+      repository: "https://github.com/adamallcock/tibotattle",
+      tag,
+    },
+  };
 }
 
 /**
@@ -80,6 +237,7 @@ async function createReleaseFixture({
   mutateAppcast = (value) => value,
   mutateSignedAppcast = (value) => value,
   mutateManifest = (value) => value,
+  shortVersion = RELEASE_VERSION,
 } = {}) {
   const root = await mkdtemp(
     join(await realpath(tmpdir()), "tibotattle-r2-publisher-test-"),
@@ -97,7 +255,7 @@ async function createReleaseFixture({
     application: {
       bundleIdentifier: "com.usagemonitor.local",
       bundleVersion,
-      shortVersion: RELEASE_VERSION,
+      shortVersion,
     },
     artifact: { bytes: dmgbBytes.length, fileName, sha256: digest },
     channel: {
@@ -119,7 +277,7 @@ async function createReleaseFixture({
     source: {
       commit: "a".repeat(40),
       repository: "https://github.com/adamallcock/tibotattle",
-      tag: `v${RELEASE_VERSION}`,
+      tag: `v${shortVersion}`,
     },
     assurances: {
       appNotarizationAccepted: true,
@@ -160,10 +318,10 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
     <channel>
         <title>TiboTattle</title>
         <item>
-            <title>${RELEASE_VERSION}</title>
+            <title>${shortVersion}</title>
             <pubDate>Wed, 05 Aug 2026 14:55:05 -0400</pubDate>
             <sparkle:version>${bundleVersion}</sparkle:version>
-            <sparkle:shortVersionString>${RELEASE_VERSION}</sparkle:shortVersionString>
+            <sparkle:shortVersionString>${shortVersion}</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
             <enclosure url="${artifactURL}" length="${dmgbBytes.length}" type="application/octet-stream" sparkle:edSignature="${signature}"></enclosure>
@@ -549,7 +707,12 @@ async function createDogfoodReleaseFixture({
       },
     },
     replacement: createMacOSSignedReplacementContract(),
-    source: { commit: "a".repeat(40), tag: "v0.1.1" },
+    source: {
+      commit: "a".repeat(40),
+      repository: "https://github.com/adamallcock/tibotattle",
+      tag: `tibotattle-internal-dogfood-${RELEASE_VERSION}`
+        + "-rc1-source-20260827",
+    },
     assurances: {
       appNotarizationAccepted: true,
       appTicketStapled: true,
@@ -709,6 +872,349 @@ test("validates an explicitly supplied canonical signed update without invoking 
       expectedShortVersion: RELEASE_VERSION,
       production: true,
     }]]);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("publisher rechecks the release manifest's channel-specific source tag", async () => {
+  const fixture = await createReleaseFixture({
+    mutateManifest: (value) => ({
+      ...value,
+      source: {
+        ...value.source,
+        tag: `tibotattle-internal-dogfood-${RELEASE_VERSION}`
+          + "-rc1-source-20260827",
+      },
+    }),
+  });
+  try {
+    await assert.rejects(
+      publishSparkleUpdate({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: fixture.dmgPath,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        runWrangler: async () => assert.fail(
+          "source-tag mismatch must fail before Wrangler",
+        ),
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_SOURCE_MISMATCH" },
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("publisher independently binds an annotated source tag and manifest to the exact DMG", async () => {
+  const sourceRepository = await createTaggedSourceRepository();
+  const fixture = await createReleaseFixture({
+    mutateManifest: (value) => ({
+      ...value,
+      source: sourceRepository.source,
+    }),
+  });
+  try {
+    const publication = await publishSparkleUpdateProduction({
+      appcastPath: fixture.appcastPath,
+      bucket: APPROVED_R2_BUCKET,
+      channel: "stable",
+      dmgPath: fixture.dmgPath,
+      releaseManifestPath: fixture.releaseManifestPath,
+      runSourceGit: sourceGitWithRemote(sourceRepository),
+      sourceRepositoryRoot: sourceRepository.root,
+      sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+      stableBootstrap: true,
+      runWrangler: async () => assert.fail("dry run must not call Wrangler"),
+      validateDMG: async () => ({
+        source: {
+          commit: sourceRepository.source.commit,
+          tag: sourceRepository.source.tag,
+        },
+      }),
+    });
+    assert.deepEqual(publication.source, {
+      ...sourceRepository.source,
+      tagObject: git(sourceRepository.root, [
+        "rev-parse",
+        `refs/tags/${sourceRepository.source.tag}`,
+      ]),
+    });
+    assert.equal(
+      publication.manifest.key,
+      `releases/1/${publication.artifact.sha256}/release-manifest.json`,
+    );
+    assert.equal(publication.artifact.sha256, sha256(fixture.dmgBytes));
+  } finally {
+    await fixture.cleanup();
+    await sourceRepository.cleanup();
+  }
+});
+
+test("publisher rejects a valid-looking annotated source tag that names the wrong commit", async () => {
+  const sourceRepository = await createTaggedSourceRepository();
+  await writeFile(sourceRepository.markerPath, "second source revision\n");
+  git(sourceRepository.root, ["add", "source-marker.txt"]);
+  git(sourceRepository.root, ["commit", "-q", "-m", "later source revision"]);
+  const laterCommit = git(sourceRepository.root, ["rev-parse", "HEAD"]);
+  const fixture = await createReleaseFixture({
+    mutateManifest: (value) => ({
+      ...value,
+      source: {
+        ...sourceRepository.source,
+        commit: laterCommit,
+      },
+    }),
+  });
+  try {
+    await assert.rejects(
+      publishSparkleUpdateProduction({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: fixture.dmgPath,
+        releaseManifestPath: fixture.releaseManifestPath,
+        sourceRepositoryRoot: sourceRepository.root,
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        stableBootstrap: true,
+        runWrangler: async () => assert.fail(
+          "wrong-commit source provenance must fail before Wrangler",
+        ),
+        validateDMG: async () => assert.fail(
+          "wrong-commit source provenance must fail before DMG validation",
+        ),
+      }),
+      { code: "SPARKLE_UPDATE_SOURCE_MISMATCH" },
+    );
+  } finally {
+    await fixture.cleanup();
+    await sourceRepository.cleanup();
+  }
+});
+
+test("publisher refuses a source tag object that changes after local validation", async () => {
+  const fixture = await createReleaseFixture();
+  const source = JSON.parse(
+    await readFile(fixture.releaseManifestPath, "utf8"),
+  ).source;
+  const stableSourceGit = fixtureSourceGit(source);
+  let tagObjectReads = 0;
+  let currentTagObject = null;
+  const changingSourceGit = (repositoryRoot, arguments_) => {
+    if (arguments_[0] === "rev-parse"
+        && arguments_[1] === "--verify"
+        && arguments_[2] === `refs/tags/${source.tag}`) {
+      tagObjectReads += 1;
+      currentTagObject = tagObjectReads === 1
+        ? "b".repeat(40)
+        : "c".repeat(40);
+      return {
+        status: 0,
+        stderr: "",
+        stdout: `${currentTagObject}\n`,
+      };
+    }
+    if (arguments_[0] === "ls-remote") {
+      const tagReference = `refs/tags/${source.tag}`;
+      return {
+        status: 0,
+        stderr: "",
+        stdout: `${currentTagObject}\t${tagReference}\n`
+          + `${source.commit}\t${tagReference}^{}\n`,
+      };
+    }
+    return stableSourceGit(repositoryRoot, arguments_);
+  };
+  try {
+    await assert.rejects(
+      publishSparkleUpdateRaw({
+        appcastPath: fixture.appcastPath,
+        bucket: APPROVED_R2_BUCKET,
+        channel: "stable",
+        dmgPath: fixture.dmgPath,
+        publish: true,
+        releaseManifestPath: fixture.releaseManifestPath,
+        runSourceGit: changingSourceGit,
+        runWrangler: async () => assert.fail(
+          "changed source tag must fail before Wrangler",
+        ),
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        stableBootstrap: true,
+        validateDMG: async () => {},
+      }),
+      { code: "SPARKLE_UPDATE_SOURCE_CHANGED" },
+    );
+    assert.equal(tagObjectReads, 2);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("source provenance verification rejects missing and lightweight release tags", async () => {
+  for (const kind of ["missing", "lightweight"]) {
+    const sourceRepository = await createTaggedSourceRepository();
+    try {
+      git(sourceRepository.root, ["tag", "-d", sourceRepository.source.tag]);
+      if (kind === "lightweight") {
+        git(sourceRepository.root, [
+          "tag",
+          sourceRepository.source.tag,
+          sourceRepository.source.commit,
+        ]);
+      }
+      assert.throws(
+        () => verifyReleaseManifestSourceProvenance(
+          sourceRepository.source,
+          {
+            channel: "stable",
+            expectedVersion: RELEASE_VERSION,
+            repositoryRoot: sourceRepository.root,
+          },
+        ),
+        { code: "SPARKLE_UPDATE_SOURCE_TAG_REQUIRED" },
+        kind,
+      );
+    } finally {
+      await sourceRepository.cleanup();
+    }
+  }
+});
+
+test("source provenance verification rejects ambiguous channel tags", async () => {
+  const primaryTag = `tibotattle-internal-dogfood-${RELEASE_VERSION}`
+    + "-rc1-source-20260827";
+  const sourceRepository = await createTaggedSourceRepository({
+    tag: primaryTag,
+  });
+  try {
+    git(sourceRepository.root, [
+      "tag",
+      "-a",
+      `tibotattle-internal-dogfood-${RELEASE_VERSION}`
+        + "-rc2-source-20260827",
+      "-m",
+      "ambiguous release source",
+      sourceRepository.commit,
+    ]);
+    assert.throws(
+      () => verifyReleaseManifestSourceProvenance(
+        sourceRepository.source,
+        {
+          channel: "internal-dogfood",
+          expectedVersion: RELEASE_VERSION,
+          repositoryRoot: sourceRepository.root,
+        },
+      ),
+      { code: "SPARKLE_UPDATE_SOURCE_AMBIGUOUS" },
+    );
+  } finally {
+    await sourceRepository.cleanup();
+  }
+});
+
+test("source provenance verification rejects a non-canonical publishing origin", async () => {
+  const sourceRepository = await createTaggedSourceRepository();
+  try {
+    git(sourceRepository.root, [
+      "remote",
+      "set-url",
+      "origin",
+      "https://github.com/example/tibotattle",
+    ]);
+    assert.throws(
+      () => verifyReleaseManifestSourceProvenance(
+        sourceRepository.source,
+        {
+          channel: "stable",
+          expectedVersion: RELEASE_VERSION,
+          repositoryRoot: sourceRepository.root,
+          runSourceGit: sourceGitWithRemote(sourceRepository),
+        },
+      ),
+      { code: "SPARKLE_UPDATE_SOURCE_ORIGIN_INVALID" },
+    );
+  } finally {
+    await sourceRepository.cleanup();
+  }
+});
+
+test("source provenance verification rejects a local-only forged release tag", async () => {
+  const sourceRepository = await createTaggedSourceRepository();
+  try {
+    assert.throws(
+      () => verifyReleaseManifestSourceProvenance(
+        sourceRepository.source,
+        {
+          channel: "stable",
+          expectedVersion: RELEASE_VERSION,
+          repositoryRoot: sourceRepository.root,
+          runSourceGit: sourceGitWithRemote(sourceRepository, {
+            remoteTagPresent: false,
+          }),
+        },
+      ),
+      { code: "SPARKLE_UPDATE_SOURCE_REMOTE_TAG_REQUIRED" },
+    );
+  } finally {
+    await sourceRepository.cleanup();
+  }
+});
+
+test("source provenance verification rejects remote and local tag drift", async () => {
+  const sourceRepository = await createTaggedSourceRepository();
+  try {
+    for (const remote of [
+      { remoteTagObject: "d".repeat(40) },
+      { remoteCommit: "e".repeat(40) },
+    ]) {
+      assert.throws(
+        () => verifyReleaseManifestSourceProvenance(
+          sourceRepository.source,
+          {
+            channel: "stable",
+            expectedVersion: RELEASE_VERSION,
+            repositoryRoot: sourceRepository.root,
+            runSourceGit: sourceGitWithRemote(sourceRepository, remote),
+          },
+        ),
+        { code: "SPARKLE_UPDATE_SOURCE_REMOTE_MISMATCH" },
+      );
+    }
+  } finally {
+    await sourceRepository.cleanup();
+  }
+});
+
+test("publisher rejects an unrelated valid dogfood source sealed into the signed DMG", async () => {
+  const fixture = await createDogfoodReleaseFixture({
+    deltaSources: [],
+    officialSignedFeed: true,
+  });
+  try {
+    await assert.rejects(
+      publishSparkleUpdateRaw({
+        appcastPath: fixture.appcastPath,
+        bucket: fixture.bucket,
+        channel: "internal-dogfood",
+        dmgPath: fixture.dmgPath,
+        releaseManifestPath: fixture.releaseManifestPath,
+        runWrangler: async () => assert.fail(
+          "artifact-source mismatch must fail before Wrangler",
+        ),
+        sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+        validateDMG: async () => ({
+          source: {
+            commit: "f".repeat(40),
+            tag: `tibotattle-internal-dogfood-${RELEASE_VERSION}`
+              + "-rc2-source-20260827",
+          },
+        }),
+      }),
+      { code: "SPARKLE_UPDATE_ARTIFACT_SOURCE_MISMATCH" },
+    );
   } finally {
     await fixture.cleanup();
   }
@@ -1508,11 +2014,11 @@ test("retries after artifact and manifest publication and writes the appcast las
 });
 
 test("recovers an appcast written before public readback failed without writing again", async () => {
-  const fixture = await createReleaseFixture();
-  const previous = await createReleaseFixture({ bundleVersion: "0" });
+  const fixture = await createReleaseFixture({ bundleVersion: "2" });
+  const previous = await createReleaseFixture({ bundleVersion: "1" });
   const digest = sha256(fixture.dmgBytes);
-  const artifactObjectPath = `${APPROVED_R2_BUCKET}/releases/1/${digest}/${RELEASE_MANIFEST.macOS.arm64DmgFileName}`;
-  const manifestObjectPath = `${APPROVED_R2_BUCKET}/releases/1/${digest}/release-manifest.json`;
+  const artifactObjectPath = `${APPROVED_R2_BUCKET}/releases/2/${digest}/${RELEASE_MANIFEST.macOS.arm64DmgFileName}`;
+  const manifestObjectPath = `${APPROVED_R2_BUCKET}/releases/2/${digest}/release-manifest.json`;
   const appcastObjectPath = `${APPROVED_R2_BUCKET}/appcast.xml`;
   const runner = statefulRemoteObjectRunner();
   const publicReadback = publicReadbackFixture(fixture);
@@ -1751,8 +2257,8 @@ test("fails closed on a successful remote read with no materialized object", asy
 });
 
 test("requires an explicit appcast replacement after immutable preflight passes", async () => {
-  const current = await createReleaseFixture({ bundleVersion: "0" });
-  const fixture = await createReleaseFixture();
+  const current = await createReleaseFixture({ bundleVersion: "1" });
+  const fixture = await createReleaseFixture({ bundleVersion: "2" });
   const runner = statefulRemoteObjectRunner({
     objects: new Map([[`${APPROVED_R2_BUCKET}/appcast.xml`, await readFile(current.appcastPath)]]),
   });
@@ -1780,18 +2286,64 @@ test("requires an explicit appcast replacement after immutable preflight passes"
   }
 });
 
+test("replaces one live legacy zero-first stable feed with the epoch candidate", async () => {
+  const current = await createReleaseFixture({
+    bundleVersion: "0.1.16",
+    shortVersion: "0.1.16",
+  });
+  const candidate = await createReleaseFixture({
+    bundleVersion: "2000.1.16",
+    shortVersion: "0.1.16",
+  });
+  const runner = statefulRemoteObjectRunner({
+    objects: new Map([
+      [
+        `${APPROVED_R2_BUCKET}/appcast.xml`,
+        await readFile(current.appcastPath),
+      ],
+    ]),
+  });
+  const publicReadback = publicReadbackFixture(candidate);
+  try {
+    const publication = await publishSparkleUpdate({
+      appcastPath: candidate.appcastPath,
+      bucket: APPROVED_R2_BUCKET,
+      channel: "stable",
+      dmgPath: candidate.dmgPath,
+      fetchPublic: publicReadback.fetch,
+      previousStableManifestPath: current.releaseManifestPath,
+      publish: true,
+      releaseManifestPath: candidate.releaseManifestPath,
+      replaceAppcast: true,
+      runWrangler: runner.run,
+      sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+      stableBootstrap: false,
+      validateDMG: async () => {},
+    });
+    assert.equal(publication.published, true);
+    assert.deepEqual(
+      runner.objects.get(`${APPROVED_R2_BUCKET}/appcast.xml`),
+      await readFile(candidate.appcastPath),
+    );
+  } finally {
+    await current.cleanup();
+    await candidate.cleanup();
+  }
+});
+
 test("rejects stable appcast history before any remote mutation", async () => {
   const olderBytes = Buffer.from("older-release");
   const olderDigest = sha256(olderBytes);
   const olderFileName = "TiboTattle-0.1.0-macOS-arm64.dmg";
-  const olderURL = `${CANONICAL_UPDATE_ORIGIN}/releases/0/${olderDigest}/${olderFileName}`;
+  const olderURL = `${CANONICAL_UPDATE_ORIGIN}/releases/1/${olderDigest}/${olderFileName}`;
   const fixture = await createReleaseFixture({
+    bundleVersion: "2",
     mutateAppcast: (value) => value.replace(
       "</channel>",
       `${appcastEnclosure({
         bytes: olderBytes,
         url: olderURL,
-        version: "0",
+        version: "1",
       })}</channel>`,
     ),
   });
@@ -1905,8 +2457,8 @@ test("rejects an equal-version live appcast whose enclosure differs before any r
 });
 
 test("rejects an ambiguous equal-version live appcast before any remote mutation", async () => {
-  const candidate = await createReleaseFixture();
-  const previous = await createReleaseFixture({ bundleVersion: "0" });
+  const candidate = await createReleaseFixture({ bundleVersion: "2" });
+  const previous = await createReleaseFixture({ bundleVersion: "1" });
   const candidateAppcast = await readFile(candidate.appcastPath, "utf8");
   const duplicateItem = candidateAppcast.match(/<item>[\s\S]*?<\/item>/u)?.[0];
   assert.equal(typeof duplicateItem, "string");
@@ -1942,13 +2494,13 @@ test("rejects an ambiguous equal-version live appcast before any remote mutation
 });
 
 test("verifies an exact appcast retry without overwriting or reporting a new publish", async () => {
-  const fixture = await createReleaseFixture();
-  const previous = await createReleaseFixture({ bundleVersion: "0" });
+  const fixture = await createReleaseFixture({ bundleVersion: "2" });
+  const previous = await createReleaseFixture({ bundleVersion: "1" });
   const digest = sha256(fixture.dmgBytes);
   const runner = statefulRemoteObjectRunner({
     objects: new Map([
-      [`${APPROVED_R2_BUCKET}/releases/1/${digest}/${RELEASE_MANIFEST.macOS.arm64DmgFileName}`, fixture.dmgBytes],
-      [`${APPROVED_R2_BUCKET}/releases/1/${digest}/release-manifest.json`, await readFile(fixture.releaseManifestPath)],
+      [`${APPROVED_R2_BUCKET}/releases/2/${digest}/${RELEASE_MANIFEST.macOS.arm64DmgFileName}`, fixture.dmgBytes],
+      [`${APPROVED_R2_BUCKET}/releases/2/${digest}/release-manifest.json`, await readFile(fixture.releaseManifestPath)],
       [`${APPROVED_R2_BUCKET}/appcast.xml`, await readFile(fixture.appcastPath)],
     ]),
   });

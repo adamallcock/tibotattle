@@ -332,6 +332,134 @@ test("canonical replacement rollouts retain stable thread and immutable rollout 
   }
 });
 
+test("a selected paginated replacement may reset lineage at a segment start without a history base", async () => {
+  const fixture = await emptyCanonicalHome("codex-paginated-reset-");
+  try {
+    const originalPath = join(
+      fixture.sessions,
+      canonicalName("2026-07-30T10-00-00", THREAD_A),
+    );
+    const replacementName = canonicalName(
+      "2026-07-30T11-00-00",
+      THREAD_A,
+      ROLLOUT_A2,
+    );
+    const replacementPath = join(fixture.sessions, replacementName);
+    const childPath = join(
+      fixture.sessions,
+      canonicalName("2026-07-30T12-00-00", THREAD_B),
+    );
+    const resetMeta = canonicalMeta({ id: THREAD_A });
+    resetMeta.payload.history_mode = "paginated";
+
+    await writeRecent(originalPath, rollout([canonicalMeta({ id: THREAD_A })]));
+    await writeRecent(replacementPath, rollout([resetMeta]));
+    await writeRecent(childPath, rollout([
+      canonicalMeta({ id: THREAD_B, parentId: THREAD_A }),
+    ]));
+
+    const infos = await discoverCodexRolloutInfos({
+      codexHome: fixture.codexHome,
+      startAt: START_AT,
+      endAt: END_AT,
+      selectedRolloutNames: new Map([[THREAD_A, replacementName]]),
+    });
+    assert.deepEqual(infos.map((info) => info.path), [
+      originalPath,
+      replacementPath,
+      childPath,
+    ]);
+    const replacement = infos.find((info) => info.rolloutId === ROLLOUT_A2);
+    assert.equal(replacement?.replacement, true);
+    assert.equal(replacement?.selectedHead, true);
+    assert.equal(replacement?.resolvedHead, true);
+    assert.equal(replacement?.lineage.historyMode, "paginated");
+    assert.equal(replacement?.lineage.historyBase, null);
+    const receipt = codexRolloutDiscoveryReceipt(infos);
+    assert.equal(receipt.status, "complete");
+    assert.equal(receipt.skippedSourceCount, 0);
+    assert.deepEqual(receipt.quarantined, []);
+  } finally {
+    await rm(fixture.codexHome, { recursive: true, force: true });
+  }
+});
+
+test("a no-base paginated replacement away from the segment start remains invalid", async () => {
+  const fixture = await emptyCanonicalHome("codex-paginated-reset-offset-");
+  try {
+    const replacementName = canonicalName(
+      "2026-07-30T11-00-00",
+      THREAD_A,
+      ROLLOUT_A2,
+    );
+    const resetMeta = canonicalMeta({ id: THREAD_A, ordinal: 1 });
+    resetMeta.payload.history_mode = "paginated";
+    await writeRecent(join(
+      fixture.sessions,
+      canonicalName("2026-07-30T10-00-00", THREAD_A),
+    ), rollout([canonicalMeta({ id: THREAD_A })]));
+    await writeRecent(
+      join(fixture.sessions, replacementName),
+      rollout([resetMeta]),
+    );
+
+    const infos = await discoverCodexRolloutInfos({
+      codexHome: fixture.codexHome,
+      startAt: START_AT,
+      endAt: END_AT,
+      selectedRolloutNames: new Map([[THREAD_A, replacementName]]),
+    });
+    assert.equal(infos.length, 0);
+    assert.deepEqual(codexRolloutDiscoveryReceipt(infos).reasonCounts, {
+      codex_rollout_lineage_invalid: 1,
+    });
+  } finally {
+    await rm(fixture.codexHome, { recursive: true, force: true });
+  }
+});
+
+test("a no-base paginated replacement must explicitly prove its segment-start ordinal", async (t) => {
+  for (const [label, mutate] of [
+    ["missing ordinal", (metadata) => { delete metadata.ordinal; }],
+    ["malformed ordinal", (metadata) => { metadata.ordinal = "0"; }],
+  ]) {
+    await t.test(label, async () => {
+      const fixture = await emptyCanonicalHome(`codex-paginated-reset-${label.replace(/ /gu, "-")}-`);
+      try {
+        const replacementName = canonicalName(
+          "2026-07-30T11-00-00",
+          THREAD_A,
+          ROLLOUT_A2,
+        );
+        const resetMeta = canonicalMeta({ id: THREAD_A });
+        resetMeta.payload.history_mode = "paginated";
+        mutate(resetMeta);
+        await writeRecent(join(
+          fixture.sessions,
+          canonicalName("2026-07-30T10-00-00", THREAD_A),
+        ), rollout([canonicalMeta({ id: THREAD_A })]));
+        await writeRecent(
+          join(fixture.sessions, replacementName),
+          rollout([resetMeta]),
+        );
+
+        const infos = await discoverCodexRolloutInfos({
+          codexHome: fixture.codexHome,
+          startAt: START_AT,
+          endAt: END_AT,
+          selectedRolloutNames: new Map([[THREAD_A, replacementName]]),
+        });
+        assert.equal(infos.length, 0);
+        assert.deepEqual(codexRolloutDiscoveryReceipt(infos).reasonCounts, {
+          codex_rollout_lineage_invalid: 1,
+        });
+      } finally {
+        await rm(fixture.codexHome, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 test("UUID identities and logical parent references are case-insensitive", async () => {
   const fixture = await emptyCanonicalHome("codex-uppercase-identity-");
   try {
