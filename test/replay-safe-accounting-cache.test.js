@@ -833,8 +833,8 @@ test("projects replay-safe diagnostics and aggregates costs, dimensions, and 15-
         .map(([family, cell]) => [speed, family, cell.events])
     )),
     [
-      ["standard", "gpt-5.6", 1],
-      ["fast", "gpt-5.6", 1],
+      ["standard", "gpt-5.6-sol", 1],
+      ["fast", "gpt-5.6-terra", 1],
       ["unknown", "unsupported", 1],
     ],
   );
@@ -848,8 +848,8 @@ test("projects replay-safe diagnostics and aggregates costs, dimensions, and 15-
     latest.events,
   );
   assert.equal(
-    latest.speedWeighting.fast["gpt-5.6"].apiPriceEquivalentUsd
-      + latest.speedWeighting.standard["gpt-5.6"].apiPriceEquivalentUsd
+    latest.speedWeighting.fast["gpt-5.6-terra"].apiPriceEquivalentUsd
+      + latest.speedWeighting.standard["gpt-5.6-sol"].apiPriceEquivalentUsd
       + latest.speedWeighting.unknown.unsupported.apiPriceEquivalentUsd,
     latest.apiPriceEquivalentUsd,
   );
@@ -2785,6 +2785,29 @@ test("cache validation requires weighted and bounded timeline evidence so older 
     (await readReplaySafeAccountingCache({ cacheFile })).errorCode,
     "cache_invalid",
   );
+});
+
+test("replay cache rejects the old prefix-priced version and unreviewed model crossing keys", async () => {
+  const cache = await buildReplaySafeAccountingCache({
+    now: () => NOW,
+    scan: scanner([usageEvent({
+      timestamp: new Date(NOW).toISOString(),
+      components: { input_uncached_tokens: 1_000 },
+    })]),
+  });
+  assert.equal(cache.schemaVersion, "local-replay-safe-accounting-v0.13");
+  assert.doesNotThrow(() => assertReplaySafeAccountingCache(cache));
+  const oldVersion = structuredClone(cache);
+  oldVersion.schemaVersion = "local-replay-safe-accounting-v0.12";
+  assert.throws(() => assertReplaySafeAccountingCache(oldVersion));
+  for (const model of ["gpt-5.6", "gpt-5.5-pro", "gpt-5.5-future"]) {
+    const invalidCrossing = structuredClone(cache);
+    invalidCrossing.timeline[0].speedWeighting.unknown ??= {};
+    invalidCrossing.timeline[0].speedWeighting.unknown[model] = {
+      events: 1, apiPriceEquivalentUsd: 1,
+    };
+    assert.throws(() => assertReplaySafeAccountingCache(invalidCrossing), model);
+  }
 });
 
 test("a replay cache from an older official price registry is withheld", async () => {

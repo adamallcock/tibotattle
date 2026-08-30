@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readdir, readFile } from "node:fs/promises";
 import { environmentForWorkload, runExperiment, validateExperimentManifest } from "../src/experiment-harness.js";
+import { subscriptionSpeedSensitivity } from "../src/application/index.js";
 
 const PRICE_CARDS = [{
   schema_version: "0.1",
@@ -79,7 +80,12 @@ function accountSnapshot(percent, reset = 1784854800) {
 
 function localUsage(cost = 1) {
   return {
-    runcost: { totalUsd: cost, byModel: { "gpt-test": { events: 1 } }, warningCounts: {} },
+    runcost: {
+      totalUsd: cost,
+      byModel: { "gpt-test": { events: 1, costUsd: cost } },
+      warningCounts: {},
+      subscriptionSpeedSensitivity: subscriptionSpeedSensitivity({ "gpt-test": { costUsd: cost } }),
+    },
     components: { input_uncached_tokens: 1000, output_text_tokens: 10 },
     toolCallsByClass: {},
     diagnostics: { pricedEvents: 1, usageBearingRollouts: 1, concurrentLocalUsageDetected: false },
@@ -233,6 +239,11 @@ test("a bounded live pilot captures before and after evidence without content", 
   assert.equal(workloadRuns, 1);
   assert.equal(result.quotaChanges[0].displayedMovement, 1);
   assert.equal(result.measuredLocal.apiPricedUsd, 1);
+  assert.deepEqual(result.measuredLocal.subscriptionSpeedSensitivity, {
+    ...localUsage(1).runcost.subscriptionSpeedSensitivity,
+    observedSpeedMode: "standard",
+    selectedScenario: "standard",
+  });
   assert.equal(result.concurrencyEvidence.concurrentLocalUsageDetected, false);
   assert.deepEqual(scanOptions.excludeSessionIds, ["controller-session-secret"]);
   assert.equal(result.concurrencyEvidence.controllerExclusionApplied, true);

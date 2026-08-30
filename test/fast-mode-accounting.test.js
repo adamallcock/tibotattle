@@ -48,7 +48,19 @@ test("published Priority (Fast) API price ratios are derived, sourced, and dated
   // and 2.5x for GPT-5.5 - notably NOT the superseded credit-rate statement's
   // 2.5x for GPT-5.6.
   assert.deepEqual({ ...FAST_MODE_QUOTA_MULTIPLIERS }, {
-    "gpt-5.6": 2,
+    "gpt-4.1": 1.75,
+    "gpt-4.1-mini": 1.75,
+    "gpt-4.1-nano": 2,
+    "gpt-4o": 1.7,
+    "gpt-5": 2,
+    "gpt-5-mini": 1.8,
+    "gpt-5.1": 2,
+    "gpt-5.1-codex": 2,
+    "gpt-5.2": 2,
+    "gpt-5.4-mini": 2,
+    "gpt-5.6-luna": 2,
+    "gpt-5.6-sol": 2,
+    "gpt-5.6-terra": 2,
     "gpt-5.5": 2.5,
     "gpt-5.4": 2,
   });
@@ -96,21 +108,23 @@ test("published Priority (Fast) API price ratios are derived, sourced, and dated
     priority: "fast",
     default: "standard",
   });
-  assert.match(FAST_MODE_MULTIPLIER_SOURCE.statement, /2x .*2\.5x/u);
+  assert.match(FAST_MODE_MULTIPLIER_SOURCE.statement, /exact registered models/u);
 });
 
 test("model families match exactly and unsupported models stay an explicit null", () => {
-  assert.equal(fastModeModelFamily("gpt-5.6-sol"), "gpt-5.6");
-  assert.equal(fastModeQuotaMultiplier("gpt-5.6"), 2);
+  assert.equal(fastModeModelFamily("gpt-5.6-sol"), "gpt-5.6-sol");
+  assert.equal(fastModeQuotaMultiplier("gpt-5.6-sol"), 2);
   assert.equal(fastModeQuotaMultiplier("gpt-5.6-sol"), 2);
   assert.equal(fastModeQuotaMultiplier("gpt-5.5-codex"), 2.5);
-  assert.equal(fastModeQuotaMultiplier("gpt-5.4-codex"), 2);
+  assert.equal(fastModeQuotaMultiplier("gpt-5.4-codex"), null);
   // Never a silent published claim: a model outside the ratio families and a
   // near-miss name both resolve to null, and the weighting layers apply the
   // disclosed assumed multiplier instead.
-  for (const model of ["gpt-5.60", "gpt-5.4future", "gpt-4.1", "gpt-5", null]) {
+  for (const model of ["gpt-5.60", "gpt-5.4future", "gpt-5.6", "gpt-5.5-pro", null]) {
     assert.equal(fastModeQuotaMultiplier(model), null);
   }
+  assert.equal(fastModeQuotaMultiplier("gpt-4.1"), 1.75);
+  assert.equal(fastModeQuotaMultiplier("gpt-5"), 2);
 });
 
 test("effective mode resolves observed, then declared, then the scenario default", () => {
@@ -153,6 +167,8 @@ test("weighting multiplies only Fast events and discloses assumed ratios", () =>
       apiPriceEquivalentUsd: 4,
       model: "gpt-5.6-sol",
       mode: "fast",
+      eventTime: "2026-08-30T00:00:00.000Z",
+      totalInputContextTokens: 1_000,
     }),
     { usd: 8, multiplier: 2, status: "fast_weighted" },
   );
@@ -161,6 +177,8 @@ test("weighting multiplies only Fast events and discloses assumed ratios", () =>
       apiPriceEquivalentUsd: 4,
       model: "gpt-5.5",
       mode: "fast",
+      eventTime: "2026-08-30T00:00:00.000Z",
+      totalInputContextTokens: 1_000,
     }),
     { usd: 10, multiplier: 2.5, status: "fast_weighted" },
   );
@@ -177,7 +195,7 @@ test("weighting multiplies only Fast events and discloses assumed ratios", () =>
   assert.deepEqual(
     quotaWeightedApiPriceEquivalent({
       apiPriceEquivalentUsd: 4,
-      model: "gpt-4.1",
+      model: "gpt-5.5-pro",
       mode: "fast",
     }),
     { usd: 8, multiplier: 2, status: "fast_weighted_assumed_ratio" },
@@ -185,7 +203,7 @@ test("weighting multiplies only Fast events and discloses assumed ratios", () =>
   assert.deepEqual(
     quotaWeightedApiPriceEquivalent({
       apiPriceEquivalentUsd: 4,
-      model: "gpt-5.6",
+      model: "gpt-5.6-sol",
       mode: "unknown",
     }),
     { usd: null, multiplier: null, status: "unknown_mode" },
@@ -195,7 +213,7 @@ test("weighting multiplies only Fast events and discloses assumed ratios", () =>
 test("observed Fast is weighted at the published Priority ratio", () => {
   const summary = summarizeQuotaWeightedAccounting({
     speedWeighting: crossing([
-      ["fast", "gpt-5.6", 4, 10],
+      ["fast", "gpt-5.6-sol", 4, 10],
       ["standard", "gpt-5.4", 2, 5],
     ]),
   });
@@ -203,7 +221,7 @@ test("observed Fast is weighted at the published Priority ratio", () => {
   // 10 x 2 observed Fast + 5 observed Standard.
   assert.equal(summary.quotaWeightedApiPriceEquivalentUsd, 25);
   assert.equal(summary.weightingStatus, "complete");
-  assert.deepEqual({ ...summary.appliedMultipliers }, { "gpt-5.6": 2 });
+  assert.deepEqual({ ...summary.appliedMultipliers }, { "gpt-5.6-sol": 2 });
   assert.equal(summary.coverage.observedEvents, 6);
   assert.equal(summary.coverage.assumedEvents, 0);
   assert.equal(summary.coverage.unknownEvents, 0);
@@ -247,9 +265,9 @@ test("an unrecorded mode follows the scenario and never silently drops Fast doll
 test("coverage partitions provenance while inference remains an assumed overlap", () => {
   const summary = summarizeQuotaWeightedAccounting({
     speedWeighting: crossing([
-      ["fast", "gpt-5.6", 2, 4],
-      ["standard", "gpt-5.6", 2, 4],
-      ["unknown", "gpt-5.6", 6, 12],
+      ["fast", "gpt-5.6-sol", 2, 4],
+      ["standard", "gpt-5.6-sol", 2, 4],
+      ["unknown", "gpt-5.6-sol", 6, 12],
     ]),
     inferredFastEvents: 4,
     inference: { status: "inferred", inferredFastWindowCount: 2 },
@@ -282,7 +300,7 @@ test("coverage partitions provenance while inference remains an assumed overlap"
 
 test("inferred event counts clamp to the no-evidence bucket without subtracting it", () => {
   const summary = summarizeQuotaWeightedAccounting({
-    speedWeighting: crossing([["unknown", "gpt-5.6", 3, 6]]),
+    speedWeighting: crossing([["unknown", "gpt-5.6-sol", 3, 6]]),
     inferredFastEvents: 99,
   });
   assert.equal(summary.coverage.inferredEvents, 3);
@@ -342,7 +360,7 @@ test("residual inference marks a window Fast only at a published multiple", () =
   assert.equal(plain.reasonCode, "ratio_matches_no_published_multiple");
 });
 
-test("the tolerance band keeps the two published multiples disjoint", () => {
+test("the 2x and 2.5x tolerance bands remain disjoint", () => {
   const tolerance =
     FAST_MODE_RESIDUAL_INFERENCE_THRESHOLDS.relativeToleranceOfPublishedMultiple;
   // A shared band would let one ratio claim both 2x and 2.5x.
@@ -365,6 +383,18 @@ test("the tolerance band keeps the two published multiples disjoint", () => {
     2,
   );
   assert.equal(result.windows.find((row) => row.id === "between").mode, "unknown");
+});
+
+test("overlapping 1.7x, 1.75x, and 1.8x bands stay explicitly ambiguous", () => {
+  const result = inferFastModeFromCalibrationWindows([
+    window("a", 100), window("b", 100), window("c", 100),
+    window("overlap", 100 / 1.75, { knownSpeedFraction: null, fastFractionOfKnown: null }),
+  ]);
+  const overlap = result.windows.find((row) => row.id === "overlap");
+  assert.equal(overlap.mode, "unknown");
+  assert.equal(overlap.matchedMultiple, null);
+  assert.equal(overlap.reasonCode, "ratio_matches_more_than_one_published_multiple");
+  assert.equal(result.inferredFastWindowCount, 0);
 });
 
 test("inference refuses to run without enough matched signal", () => {
@@ -414,7 +444,7 @@ test("inference refuses to run without enough matched signal", () => {
 
 const CONFIG_WITH_SECRETS = [
   "# Codex configuration",
-  'model = "gpt-5.6"',
+  'model = "gpt-5.6-sol"',
   'service_tier = "priority"',
   "",
   "[mcp_servers.internal]",
@@ -455,7 +485,7 @@ test("only the root-table service_tier key is ever read from the Codex config", 
     // by construction because the scan stops at the first table header.
     const serialized = JSON.stringify(declaration);
     for (const forbidden of [
-      "gpt-5.6",
+      "gpt-5.6-sol",
       "secret-tool",
       "sk-do-not-read-me",
       "API_TOKEN",
@@ -493,7 +523,7 @@ test("a missing, unreadable, or unrecognised declaration fails closed", async ()
   }
 
   for (const [label, contents] of [
-    ["no key at all", 'model = "gpt-5.6"\n'],
+    ["no key at all", 'model = "gpt-5.6-sol"\n'],
     ["key only inside a table", '[profile]\nservice_tier = "priority"\n'],
     ["unquoted value", "service_tier = priority\n"],
     ["non-scalar value", 'service_tier = { name = "priority" }\n'],
@@ -668,10 +698,10 @@ test("an observation always beats a declared baseline", () => {
   // instead of by the assumed-Standard default.
   const summary = summarizeQuotaWeightedAccounting({
     speedWeighting: crossing([
-      ["fast", "gpt-5.6", 4, 8],
-      ["unknown", "gpt-5.6", 6, 12],
+      ["fast", "gpt-5.6-sol", 4, 8],
+      ["unknown", "gpt-5.6-sol", 6, 12],
     ]),
-    declaredSpeedWeighting: crossing([["fast", "gpt-5.6", 6, 12]]),
+    declaredSpeedWeighting: crossing([["fast", "gpt-5.6-sol", 6, 12]]),
   });
   assert.equal(summary.coverage.observedEvents, 4);
   assert.equal(summary.coverage.declaredFromConfigEvents, 6);
@@ -699,8 +729,8 @@ test("an observation always beats a declared baseline", () => {
   // A declared crossing claiming more than the log left unobserved is
   // inconsistent, so it is discarded whole rather than trusted in part.
   const overclaimed = summarizeQuotaWeightedAccounting({
-    speedWeighting: crossing([["unknown", "gpt-5.6", 2, 4]]),
-    declaredSpeedWeighting: crossing([["fast", "gpt-5.6", 5, 10]]),
+    speedWeighting: crossing([["unknown", "gpt-5.6-sol", 2, 4]]),
+    declaredSpeedWeighting: crossing([["fast", "gpt-5.6-sol", 5, 10]]),
   });
   assert.equal(overclaimed.coverage.declaredFromConfigEvents, 0);
   assert.equal(overclaimed.coverage.assumedEvents, 2);

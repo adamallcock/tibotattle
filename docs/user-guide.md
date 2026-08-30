@@ -48,12 +48,25 @@ Display windows do not delete older local history. The dashboard may show a
 shorter horizon while the local index retains the evidence needed for replay,
 corrections, and longer-term views.
 
+Switching and cache-drop overheads estimate the API-equivalent premium in
+observed comparisons, not a proven cause or a bill. A labelled covered subtotal
+includes only comparisons with usable ordering and prices. Sessions whose
+request order cannot be proven, and comparisons without prices, remain excluded
+and disclosed; that subtotal is not the whole-period total or a percentage of
+your allowance. A subtotal with no priceable comparisons stays unavailable,
+not a zero-valued placeholder.
+
 ## Refresh, progress, and recovery
 
 Use Refresh to request a new local analysis pass. The app keeps verified prior
 figures visible while newer data is being reconciled where the evidence permits.
 Do not repeatedly relaunch during first-run indexing; that can make progress
 appear to restart even when source data is intact.
+
+After source scanning, **Calculating accounting…** means the app is calculating
+and preparing the updated dashboard. It replaces the file counter: a small
+number of changed files does not mean all the unchanged files are being read
+again. Only the terminal refresh status establishes completion.
 
 If the dashboard stays blank or reports a schema/index error:
 

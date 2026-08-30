@@ -165,26 +165,26 @@ test("garbage values are never coerced into a mode or a scenario", () => {
 // ---------------------------------------------------------------------------
 // Priority (Fast) price ratios: exact values, exact family membership, and an
 // explicit null - never a silent published claim - for anything outside the
-// three ratio families. The weighting layers apply the disclosed assumed
+// registered Priority models. The weighting layers apply the disclosed assumed
 // multiplier to those instead.
 // ---------------------------------------------------------------------------
 
 test("the bare published family names each resolve to their exact ratio", () => {
-  assert.equal(Object.is(fastModeQuotaMultiplier("gpt-5.6"), 2), true);
+  assert.equal(Object.is(fastModeQuotaMultiplier("gpt-5.6-sol"), 2), true);
   assert.equal(Object.is(fastModeQuotaMultiplier("gpt-5.5"), 2.5), true);
   assert.equal(Object.is(fastModeQuotaMultiplier("gpt-5.4"), 2), true);
-  assert.equal(fastModeModelFamily("gpt-5.6"), "gpt-5.6");
+  assert.equal(fastModeModelFamily("gpt-5.6-sol"), "gpt-5.6-sol");
   assert.equal(fastModeModelFamily("gpt-5.5"), "gpt-5.5");
   assert.equal(fastModeModelFamily("gpt-5.4"), "gpt-5.4");
 });
 
-test("a model outside the three ratio families is an explicit null, never 1x", () => {
+test("an unregistered model or missing Priority model is an explicit null, never 1x", () => {
   for (const model of [
     "gpt-5.6future",
     "gpt-5.60",
     "gpt-5.40",
-    "gpt-4.1",
-    "gpt-4o",
+    "gpt-5.6",
+    "gpt-5.5-pro",
     "o3",
     "",
     "GPT-5.6",
@@ -196,30 +196,42 @@ test("a model outside the three ratio families is an explicit null, never 1x", (
     assert.equal(multiplier, null, `expected null for ${JSON.stringify(model)}`);
     assert.notEqual(multiplier, 1, `must not silently default to 1x for ${JSON.stringify(model)}`);
   }
-  // A "-" suffixed variant of a real family DOES count as a member, however
-  // the suffix continues, because family matching is "exact name, then
-  // end-of-string or a '-' boundary" - the suffix content itself is not
-  // validated further.
+  // A suffix is eligible only if its exact model or reviewed alias has a
+  // Priority card. Invented variants must not borrow a nearby model's rate.
   assert.equal(fastModeQuotaMultiplier("gpt-5.6-sol"), 2);
-  assert.equal(fastModeQuotaMultiplier("gpt-5.4-turbo-preview-not-real"), 2);
+  assert.equal(fastModeQuotaMultiplier("gpt-5.4-turbo-preview-not-real"), null);
+  assert.equal(fastModeQuotaMultiplier("gpt-4.1"), 1.75);
+  assert.equal(fastModeQuotaMultiplier("gpt-4o"), 1.7);
   // ...but a bare numeric continuation of the family name does not, because
-  // it is a different, unpublished model, not a "-" suffix of "gpt-5.6" -
+  // it is a different, unpublished model, not a "-" suffix of "gpt-5.6-sol" -
   // there is no boundary character between the family name and the extra
   // digit.
   assert.equal(fastModeQuotaMultiplier("gpt-5.60"), null);
 });
 
 test("fastModeModelFamilyKey buckets unsupported models explicitly rather than dropping them", () => {
-  assert.equal(fastModeModelFamilyKey("gpt-5.6"), "gpt-5.6");
+  assert.equal(fastModeModelFamilyKey("gpt-5.6-sol"), "gpt-5.6-sol");
   assert.equal(fastModeModelFamilyKey("gpt-5.5-codex"), "gpt-5.5");
-  assert.equal(fastModeModelFamilyKey("gpt-5.4-codex"), "gpt-5.4");
-  assert.equal(fastModeModelFamilyKey("gpt-4.1"), "unsupported");
+  assert.equal(fastModeModelFamilyKey("gpt-5.4-codex"), "unsupported");
+  assert.equal(fastModeModelFamilyKey("gpt-4.1"), "gpt-4.1");
   assert.equal(fastModeModelFamilyKey(null), "unsupported");
 });
 
-test("the ratio map holds exactly the three published Priority price ratios", () => {
+test("the ratio map holds every registered published Priority model", () => {
   assert.deepEqual({ ...FAST_MODE_QUOTA_MULTIPLIERS }, {
-    "gpt-5.6": 2,
+    "gpt-4.1": 1.75,
+    "gpt-4.1-mini": 1.75,
+    "gpt-4.1-nano": 2,
+    "gpt-4o": 1.7,
+    "gpt-5": 2,
+    "gpt-5-mini": 1.8,
+    "gpt-5.1": 2,
+    "gpt-5.1-codex": 2,
+    "gpt-5.2": 2,
+    "gpt-5.4-mini": 2,
+    "gpt-5.6-luna": 2,
+    "gpt-5.6-sol": 2,
+    "gpt-5.6-terra": 2,
     "gpt-5.5": 2.5,
     "gpt-5.4": 2,
   });

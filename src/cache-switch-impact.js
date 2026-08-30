@@ -346,17 +346,31 @@ function declaredCodexSpeed(row, declaredSpeedBaselines) {
   return declaredSpeedModeAt(declaredSpeedBaselines, observedMs) ?? "unknown";
 }
 
-function addPremiumCrossing(summary, row, premiumNanos, declaredSpeedBaselines) {
+function premiumCrossingFor(row, premiumNanos, declaredSpeedBaselines) {
+  // Unpriced comparisons remain in the coverage counts, never as zero-dollar
+  // members of the priced subtotal or its speed-provenance denominator.
+  if (premiumNanos === null) return null;
   const observedSpeed = observedCodexSpeed(row);
-  const family = fastModeModelFamilyKey(row?.model_id);
-  const premiumUsd = premiumNanos === null
-    ? 0
-    : Number(nanosToUsdString(premiumNanos));
+  const family = fastModeModelFamilyKey(row?.model_id, {
+    eventTime: new Date(Number(row.observed_at_ms)).toISOString(),
+    totalInputContextTokens: currentInputTokens(row),
+  });
+  return {
+    observedSpeed,
+    family,
+    premiumUsd: Number(nanosToUsdString(premiumNanos)),
+    declaredSpeed: observedSpeed === "unknown"
+      ? declaredCodexSpeed(row, declaredSpeedBaselines)
+      : "unknown",
+  };
+}
+
+function addPremiumCrossing(summary, contribution) {
+  if (contribution === null) return;
+  const { observedSpeed, family, premiumUsd, declaredSpeed } = contribution;
   const observedCell = summary.speedWeighting[observedSpeed][family];
   observedCell.events += 1;
   observedCell.apiPriceEquivalentUsd += premiumUsd;
-  if (observedSpeed !== "unknown") return;
-  const declaredSpeed = declaredCodexSpeed(row, declaredSpeedBaselines);
   if (declaredSpeed === "unknown") return;
   const declaredCell = summary.declaredSpeedWeighting[declaredSpeed][family];
   declaredCell.events += 1;
@@ -440,6 +454,23 @@ function finalizePremiumWeighting(summary, completeCoverage) {
       "unresolved_as_standard",
     ).basisFamilyId,
     scenarios,
+  };
+}
+
+function finalizeCoveredSubtotal(summary) {
+  if (summary.pricedDrops === 0) return null;
+  const exact = nanosToUsdString(summary.premiumNanos);
+  return {
+    scope: "covered_priced_drops",
+    pricedDrops: summary.pricedDrops,
+    standardApiPremiumUsd: Number(exact),
+    standardApiPremiumUsdExact: exact,
+    // Crossings contain only priced drops. This is an explicit subset, not a
+    // way to grant complete coverage or an allowance share to the full period.
+    allowanceWeighting: finalizePremiumWeighting({
+      ...summary,
+      unpricedDrops: 0,
+    }, true),
   };
 }
 
@@ -553,6 +584,7 @@ function finalizeSummary(summary) {
     estimatedPremiumUsdExact: premiumExact,
     standardApiPremiumUsd: premiumExact === null ? null : Number(premiumExact),
     allowanceWeighting: finalizePremiumWeighting(summary, completeCoverage),
+    coveredSubtotal: finalizeCoveredSubtotal(summary),
   };
 }
 
@@ -713,6 +745,7 @@ function finalizeContinuitySummary(summary) {
     estimatedPremiumUsdExact: premiumExact,
     standardApiPremiumUsd: premiumExact === null ? null : Number(premiumExact),
     allowanceWeighting: finalizePremiumWeighting(summary, completeCoverage),
+    coveredSubtotal: finalizeCoveredSubtotal(summary),
   };
 }
 
@@ -805,6 +838,7 @@ export function analyzeCacheSwitchRows(rows, {
       lostCacheTokens,
     } = drop;
     const premiumNanos = premiumFor(row, lostCacheTokens, pricer);
+    const premiumCrossing = premiumCrossingFor(row, premiumNanos, baselines);
     const detail = detailFor(
       row,
       changeType,
@@ -817,13 +851,8 @@ export function analyzeCacheSwitchRows(rows, {
     for (const period of applicablePeriods) {
       addDrop(period.summary, lostCacheTokens, premiumNanos);
       addDrop(period.byChangeType[changeType], lostCacheTokens, premiumNanos);
-      addPremiumCrossing(period.summary, row, premiumNanos, baselines);
-      addPremiumCrossing(
-        period.byChangeType[changeType],
-        row,
-        premiumNanos,
-        baselines,
-      );
+      addPremiumCrossing(period.summary, premiumCrossing);
+      addPremiumCrossing(period.byChangeType[changeType], premiumCrossing);
       retainRecent(period, detail);
     }
   }
@@ -936,6 +965,7 @@ export function analyzeCacheContinuityRows(rows, {
     const drop = materialDropFor(row);
     if (drop === null) continue;
     const premiumNanos = premiumFor(row, drop.lostCacheTokens, pricer);
+    const premiumCrossing = premiumCrossingFor(row, premiumNanos, baselines);
     const detail = continuityDetailFor(
       row,
       gapBand,
@@ -945,7 +975,7 @@ export function analyzeCacheContinuityRows(rows, {
     );
     for (const summary of targets) {
       addContinuityDrop(summary, drop.lostCacheTokens, premiumNanos);
-      addPremiumCrossing(summary, row, premiumNanos, baselines);
+      addPremiumCrossing(summary, premiumCrossing);
     }
     for (const period of applicablePeriods) retainContinuityRecent(period, detail);
   }

@@ -8,7 +8,7 @@ export const CODEX_PRIMARY_ALLOWANCE_UNRESOLVED_SCENARIOS = Object.freeze([
 ]);
 
 const CODEX_PRIMARY_ALLOWANCE_BASIS_FAMILY_ID =
-  "codex_primary:speed_priced_api_equivalent:v2:priority_price_ratio_2026_08_30:event_time:observed_declared_scenario";
+  "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario";
 
 // One local constructor owns the identity used to couple a weighted timeline
 // numerator with the weekly capacity fitted from the same speed scenario. The
@@ -23,7 +23,7 @@ export function codexPrimaryAllowanceBasis(unresolvedScenario) {
   }
   return Object.freeze({
     metric: "speed_priced_api_equivalent",
-    version: 2,
+    version: 3,
     multiplierRegistryRecordedAt: FAST_MODE_MULTIPLIER_SOURCE.recordedAt,
     priceEpochBasis: "event_time_when_registry_has_effective_evidence",
     speedResolutionPolicy: "observed_declared_preference_unknown_v1",

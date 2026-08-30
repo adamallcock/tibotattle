@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { FAST_MODE_QUOTA_MULTIPLIERS } from "@app-usagemonitor/accounting";
 import {
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../../config/product-brand.js";
@@ -2112,7 +2113,7 @@ test("retained accounting provenance admits only reviewed reason codes", () => {
       staleServe: {
         stale: true,
         reason: "local_unified_index_schema_newer",
-        schemaVersion: "local-replay-safe-accounting-v0.12",
+        schemaVersion: "local-replay-safe-accounting-v0.13",
         computedAt: "2026-08-27T00:00:00.000Z",
         coveredAt: {
           startAt: "2026-08-01T00:00:00.000Z",
@@ -2188,7 +2189,7 @@ test("the closed accounting normalizer keeps the speed-priced metric and its cov
       apiPriceEquivalentUsd: 20,
       quotaWeightedApiPriceEquivalentUsd: 34,
       speedWeighting: {
-        fast: { "gpt-5.6": { events: 4, apiPriceEquivalentUsd: 8 } },
+        fast: { "gpt-5.6-sol": { events: 4, apiPriceEquivalentUsd: 8 } },
         standard: { "gpt-5.4": { events: 2, apiPriceEquivalentUsd: 4 } },
         unknown: { unsupported: { events: 4, apiPriceEquivalentUsd: 8 } }
       },
@@ -2198,7 +2199,7 @@ test("the closed accounting normalizer keeps the speed-priced metric and its cov
         standardApiPriceEquivalentUsd: 20,
         unweightedUnknownApiPriceEquivalentUsd: 8,
         weightingStatus: "partial",
-        appliedMultipliers: { "gpt-5.6": 2.5 },
+        appliedMultipliers: { "gpt-5.6-sol": 2.5 },
         coverage: {
           totalEvents: 10,
           observedEvents: 6,
@@ -2230,6 +2231,7 @@ test("the closed accounting normalizer keeps the speed-priced metric and its cov
   assert.deepEqual(accounting.fastMode.coverage, {
     totalEvents: 10,
     observedEvents: 6,
+    declaredFromConfigEvents: 0,
     assumedEvents: 4,
     inferredEvents: 3,
     unknownEvents: 0,
@@ -2241,18 +2243,51 @@ test("the closed accounting normalizer keeps the speed-priced metric and its cov
       + accounting.fastMode.coverage.unknownEvents);
   // The multipliers and the metric name are stated by this page, never taken
   // from the server, and inference can never be reported as weighted.
-  assert.deepEqual(accounting.fastMode.multipliers, {
-    "gpt-5.6": 2,
-    "gpt-5.5": 2.5,
-    "gpt-5.4": 2
-  });
+  assert.deepEqual(accounting.fastMode.multipliers, { ...FAST_MODE_QUOTA_MULTIPLIERS });
   assert.equal(accounting.fastMode.metricLabel, "Speed-priced API-price equivalent");
   assert.equal(accounting.fastMode.inference.appliedToWeighting, false);
   assert.equal(accounting.fastMode.inference.inferredFastWindows, 2);
   assert.equal(accounting.fastMode.logRecordsTierChangesOnly, true);
-  assert.equal(accounting.speedWeighting.fast["gpt-5.6"].events, 4);
+  assert.equal(accounting.speedWeighting.fast["gpt-5.6-sol"].events, 4);
   assert.equal(accounting.speedWeighting.unknown.unsupported.apiPriceEquivalentUsd, 8);
   assert.equal(accounting.speedWeighting.fast["gpt-5.5"].events, 0);
+});
+
+test("config-only speed provenance survives normalization and appears in the rendered coverage sentence", async () => {
+  const result = normalizeDashboardPayload({
+    mode: "real_local_evidence",
+    status: "live",
+    accounting: {
+      fastMode: {
+        coverage: {
+          totalEvents: 4,
+          observedEvents: 0,
+          declaredFromConfigEvents: 4,
+          assumedEvents: 0,
+          inferredEvents: 0,
+          unknownEvents: 0,
+          observedSharePercent: 0,
+          unknownSharePercent: 0
+        }
+      }
+    }
+  });
+  assert.equal(result.accounting.fastMode.coverage.declaredFromConfigEvents, 4);
+  const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const match = source.match(/function fastModeCoverageSentence\(fastMode\) \{[\s\S]*?\n\}/u);
+  assert.ok(match);
+  const render = new Function("t", "compact", "formatPercent", "formatApiMoney",
+    `${match[0]}; return fastModeCoverageSentence;`)(
+    (key, values) => translate(key, values, "en"),
+    String, (value) => `${value}%`, String,
+  );
+  assert.match(render(result.accounting.fastMode), /4 declared by timestamped Codex config/u);
+  for (const locale of SUPPORTED_LOCALES) {
+    const sentence = translate("accounting.fastMode.declaredFromConfig", { count: "4" }, locale);
+    assert.ok(sentence.includes("4"));
+    assert.ok(sentence.includes("Codex"));
+    assert.notEqual(sentence, "accounting.fastMode.declaredFromConfig");
+  }
 });
 
 test("an absent or hostile Fast-mode projection degrades to an explicit unknown", () => {
@@ -2454,7 +2489,7 @@ test("web timeline expands the compact weighted tuple and rejects encoding drift
   const encoding = {
     schemaVersion: "quota-weighted-timeline-v0.1",
     basisFamilyId:
-      "codex_primary:speed_priced_api_equivalent:v2:priority_price_ratio_2026_08_30:event_time:observed_declared_scenario",
+      "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario",
     scenarioOrder: [
       "unresolved_as_standard",
       "unresolved_as_fast"
@@ -9490,7 +9525,7 @@ test("the inspection list keeps every row and restarts paging when the selection
 // ---------------------------------------------------------------------------
 
 const TEST_ALLOWANCE_BASIS_FAMILY =
-  "codex_primary:speed_priced_api_equivalent:v2:priority_price_ratio_2026_08_30:event_time:observed_declared_scenario";
+  "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario";
 const testAllowanceBasisId = (scenario) =>
   `${TEST_ALLOWANCE_BASIS_FAMILY}:${scenario}`;
 const testAllowanceWeighting = (selectedUsd, { available = true } = {}) => ({

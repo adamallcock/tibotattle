@@ -306,6 +306,10 @@ export function usageProjection(record, declaredSpeed = "unknown", pricer = null
     : [];
   return {
     model,
+    fastModeFamily: fastModeModelFamilyKey(model, {
+      eventTime: record.observedAt,
+      standardPriceCardIds: priceCardIds,
+    }),
     modelPricingStatus: modelPricingStatus(record.model),
     modelAllowanceTrack: codexModelAllowanceTrack(record.model),
     modelApiPriceEquivalentApplicable:
@@ -385,8 +389,11 @@ export function newUsagePeriod(id, label, { includeSpark = true } = {}) {
 }
 
 function addSpeedWeighting(crossing, projection) {
-  const speed = crossing[projection.speed] ? projection.speed : "unknown";
-  const cell = crossing[speed][fastModeModelFamilyKey(projection.model)];
+  const speed = OBSERVED_SPEED_MODE_KEYS.includes(projection.speed)
+    ? projection.speed : "unknown";
+  const family = projection.fastModeFamily ?? "unsupported";
+  const row = crossing[speed] ??= {};
+  const cell = row[family] ??= { events: 0, apiPriceEquivalentUsd: 0 };
   cell.events += 1;
   cell.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
 }
@@ -396,8 +403,9 @@ function addDeclaredSpeedWeighting(crossing, projection) {
   // events the log left unobserved; everything else is left unattributed.
   if (projection.declaredSpeed !== "standard"
       && projection.declaredSpeed !== "fast") return;
-  const cell =
-    crossing[projection.declaredSpeed][fastModeModelFamilyKey(projection.model)];
+  const family = projection.fastModeFamily ?? "unsupported";
+  const row = crossing[projection.declaredSpeed] ??= {};
+  const cell = row[family] ??= { events: 0, apiPriceEquivalentUsd: 0 };
   cell.events += 1;
   cell.apiPriceEquivalentUsd += projection.apiPriceEquivalentUsd;
 }
@@ -596,8 +604,10 @@ function newTimelineBucket(startMs) {
     totalTokens: 0,
     components: emptyComponents(),
     apiPriceEquivalentUsd: 0,
-    speedWeighting: emptySpeedWeightingCrossing(),
-    declaredSpeedWeighting: emptySpeedWeightingCrossing(),
+    // Timeline cells are sparse, as in the replay-safe cache. Registry model
+    // additions must not multiply retained/transmitted empty cells per bucket.
+    speedWeighting: {},
+    declaredSpeedWeighting: {},
     fullyPricedEvents: 0,
     partiallyPricedEvents: 0,
     unpricedEvents: 0,

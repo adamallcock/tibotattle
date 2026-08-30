@@ -12,7 +12,7 @@ import { SUPPORTED_LOCALES, translate } from "../public/localization.js";
 // unlabeled block is dropped rather than rendered as current.
 
 const ALLOWANCE_BASIS_FAMILY =
-  "codex_primary:speed_priced_api_equivalent:v2:priority_price_ratio_2026_08_30:event_time:observed_declared_scenario";
+  "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario";
 const allowanceBasisId = (scenario) =>
   `${ALLOWANCE_BASIS_FAMILY}:${scenario}`;
 

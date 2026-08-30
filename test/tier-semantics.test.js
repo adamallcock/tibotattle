@@ -69,10 +69,14 @@ test("Fast sensitivity applies published Priority price ratios and never selects
   assert.equal(fastQuotaMultiplier("gpt-5.6-sol"), 2);
   assert.equal(fastQuotaMultiplier("gpt-5.5-codex"), 2.5);
   assert.equal(fastQuotaMultiplier("gpt-5.4"), 2);
-  assert.equal(fastQuotaMultiplier("gpt-4.1"), null);
+  assert.equal(fastQuotaMultiplier("gpt-4.1"), 1.75);
   const result = subscriptionSpeedSensitivity({
-    "gpt-5.6-sol": { costUsd: 10 },
-    "gpt-5.4": { costUsd: 5 },
+    "gpt-5.6-sol": { costUsd: 10, priceEvidence: {
+      eventTime: "2026-08-30T00:00:00.000Z", totalInputContextTokens: 1_000,
+    } },
+    "gpt-5.4": { costUsd: 5, priceEvidence: {
+      eventTime: "2026-08-30T00:00:00.000Z", totalInputContextTokens: 1_000,
+    } },
   });
   assert.equal(result.selectedScenario, null);
   assert.equal(result.scenarios.standard.weightedStandardApiEquivalentUsd, 15);

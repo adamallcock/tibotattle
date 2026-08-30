@@ -188,6 +188,19 @@ the scan counter for that stage; only a terminal refresh receipt establishes
 the outcome. Unknown progress kinds, extra fields, and arbitrary server prose
 are not admitted by the native projection.
 
+The switch- and cache-continuity impact projections distinguish whole-period
+totals from the priced comparisons that remain usable when coverage is partial.
+Their `coveredSubtotal` is either `null` or a closed object with
+`scope: "covered_priced_drops"`, positive `pricedDrops`, a nonnegative
+`standardApiPremiumUsd` and exact decimal `standardApiPremiumUsdExact`, plus
+the existing `allowanceWeighting` shape scoped only to those priced drops.
+It is derived from the complete exact accumulator, not the capped recent list,
+and is available on period and breakdown projections. A missing price or
+unprovable session order still withholds the whole-period money/allowance
+claim. Clients must identify the subtotal's scope and must not substitute it
+into `allowanceImpact` or hide excluded sessions. No priced observations means
+`coveredSubtotal: null`, not a zero-valued placeholder.
+
 When contribution preparation encounters a preserved legacy export identity
 whose one interactive migration read was declined, it returns the fixed
 `identity_migration_required` code. The dashboard directs the user to quit and

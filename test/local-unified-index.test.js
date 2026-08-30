@@ -22,6 +22,7 @@ import test from "node:test";
 import { Worker } from "node:worker_threads";
 
 import { readCacheImpacts } from "../src/cache-switch-impact.js";
+import { buildLocalCompanionSnapshot } from "../src/local-companion-data.js";
 import { readLocalUnifiedCompanionProjection } from "../src/local-unified-companion-source.js";
 import { createLocalUnifiedAccountingSource } from "../src/local-unified-accounting-source.js";
 
@@ -2744,6 +2745,7 @@ test("cache adjacency follows exact source order and exposes incomplete order co
           assert.equal(period.coverageStatus, "incomplete");
           assert.equal(period.estimatedPremiumUsd, null);
           assert.equal(period.estimatedPremiumUsdExact, null);
+          assert.equal(period.coveredSubtotal, null);
         }
         const switchPeriod = impacts.cacheSwitchImpact.periods.find(
           (candidate) => candidate.periodId === "24h",
@@ -2862,8 +2864,113 @@ test("ordering coverage is period-scoped and ignores sessions without adjacency"
         switchThirty.byChangeType.reasoning_only.estimatedPremiumUsd,
         0,
       );
+      assert.equal(switchThirty.coveredSubtotal.scope, "covered_priced_drops");
+      assert.equal(switchThirty.coveredSubtotal.pricedDrops, 1);
+      assert.equal(switchThirty.coveredSubtotal.standardApiPremiumUsdExact, "0");
     } finally {
       database.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("covered cache subtotals survive a multi-source session exclusion through companion projection", async () => {
+  const nowMs = Date.parse("2026-07-25T12:00:00.000Z");
+  const turnAt = (timestamp, effort, totalInput, totalCached, cached) => [
+    turnContext(timestamp, "gpt-5.6-sol", effort),
+    tokenCount(timestamp, usage(totalInput, 0, totalCached), usage(1_200, 0, cached)),
+  ];
+  const { root } = await corpus({
+    "rollout-2026-07-25T10-00-00-covered.jsonl": [
+      sessionMeta("session-covered"),
+      ...turnAt("2026-07-25T10:00:00.000Z", "high", 1_200, 1_000, 1_000),
+      ...turnAt("2026-07-25T10:01:00.000Z", "max", 2_400, 1_000, 0),
+      ...turnAt("2026-07-25T10:02:00.000Z", "max", 3_600, 2_000, 1_000),
+      ...turnAt("2026-07-25T10:03:00.000Z", "max", 4_800, 2_000, 0),
+    ],
+    "rollout-2026-07-25T11-00-00-part-a.jsonl": [
+      sessionMeta("session-part-a"),
+      ...turnAt("2026-07-25T11:00:00.000Z", "high", 1_200, 1_000, 1_000),
+      ...turnAt("2026-07-25T11:01:00.000Z", "max", 2_400, 1_000, 0),
+    ],
+    "rollout-2026-07-25T11-10-00-part-b.jsonl": [
+      sessionMeta("session-part-b"),
+      ...turnAt("2026-07-25T11:10:00.000Z", "high", 1_200, 1_000, 1_000),
+      ...turnAt("2026-07-25T11:11:00.000Z", "max", 2_400, 1_000, 0),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    await build(root);
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: false });
+    try {
+      // Synthetic retained structure: both source-local offsets remain valid,
+      // but they cannot order one session across two coordinate systems.
+      database.prepare(`
+        UPDATE usage_event SET session_local = (
+          SELECT session_local FROM usage_event WHERE observed_at_ms = ? LIMIT 1
+        ) WHERE observed_at_ms >= ?`).run(
+        Date.parse("2026-07-25T11:00:00.000Z"),
+        Date.parse("2026-07-25T11:10:00.000Z"),
+      );
+      const coverage = database.prepare(`
+        SELECT COUNT(*) AS events, COUNT(source_id) AS sourced,
+               COUNT(source_offset) AS ordered, COUNT(DISTINCT source_id) AS sources
+        FROM usage_event WHERE observed_at_ms >= ?`).get(
+        Date.parse("2026-07-25T11:00:00.000Z"),
+      );
+      assert.deepEqual({ ...coverage }, { events: 4, sourced: 4, ordered: 4, sources: 2 });
+      const impacts = readCacheImpacts(database, {
+        nowMs,
+        pricer: (_event, components) => ({
+          coverageStatus: "fully_priced",
+          totalUsd: String(components.input_uncached_tokens),
+        }),
+      });
+      for (const projection of [impacts.cacheSwitchImpact, impacts.cacheContinuityImpact]) {
+        for (const period of projection.periods) {
+          assert.equal(period.orderingCoverageGaps, 1, period.periodId);
+          assert.equal(period.coverageStatus, "incomplete", period.periodId);
+          assert.equal(period.cacheReadDrops, 1, period.periodId);
+          assert.equal(period.pricedDrops, 1, period.periodId);
+          assert.equal(period.estimatedPremiumUsd, null, period.periodId);
+          assert.equal(period.standardApiPremiumUsd, null, period.periodId);
+          assert.equal(period.allowanceWeighting.status, "unavailable", period.periodId);
+          assert.equal(period.coveredSubtotal.standardApiPremiumUsdExact, "1000", period.periodId);
+          assert.equal(period.recent.length, 1, period.periodId);
+        }
+      }
+    } finally {
+      database.close();
+    }
+
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      unifiedIndexFile: indexFile,
+      allowDevelopmentArtifactFallback: false,
+      now: () => nowMs,
+    });
+    for (const key of ["cacheSwitchImpact", "cacheContinuityImpact"]) {
+      const impact = snapshot.overview.accounting[key];
+      assert.equal(impact.status, "available", key);
+      assert.equal(impact.periodId, "7d", key);
+      assert.equal(impact.orderingCoverageGaps, 1, key);
+      assert.equal(impact.estimatedPremiumUsd, null, key);
+      assert.equal(impact.allowanceWeighting.status, "unavailable", key);
+      assert.equal(impact.allowanceImpact.status, "unavailable", key);
+      assert.equal(impact.allowanceImpact.medianPercentagePoints, null, key);
+      assert.equal(impact.coveredSubtotal.scope, "covered_priced_drops", key);
+      assert.equal(impact.coveredSubtotal.pricedDrops, 1, key);
+      assert.ok(impact.coveredSubtotal.standardApiPremiumUsd > 0, key);
+      assert.equal(impact.coveredSubtotal.allowanceWeighting.status, "complete", key);
+      assert.equal(impact.coveredSubtotal.allowanceWeighting.selectedPremiumUsd,
+        impact.coveredSubtotal.standardApiPremiumUsd, key);
+      for (const period of impact.periods) {
+        assert.deepEqual(period.coveredSubtotal, impact.coveredSubtotal, key);
+        assert.equal(period.allowanceImpact.status, "unavailable", key);
+      }
+      assert.doesNotMatch(JSON.stringify(impact), /session-covered|session-part|source_id|source_offset/u);
     }
   } finally {
     await rm(root, { recursive: true });

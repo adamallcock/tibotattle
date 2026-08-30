@@ -7744,25 +7744,36 @@ function renderAccountingComponentBars(containerSelector, rows, {
 }
 
 function cacheSwitchMetricValue(impact) {
-  if (impact?.status !== "available") return "—";
-  const weighting = impact.allowanceWeighting;
+  const cost = cacheImpactCostView(impact);
+  if (cost === null) return "—";
+  const weighting = cost.allowanceWeighting;
+  const display = (value) => cost.isSubtotal
+    ? t("accounting.cacheImpact.subtotalValue", { amount: value })
+    : value;
   if (weighting?.status === "complete") {
     const premium = finite(weighting.selectedPremiumUsd, null);
-    return premium === null ? "—" : formatApiMoney(premium);
+    return premium === null ? "—" : display(formatApiMoney(premium));
   }
   if (weighting?.status === "range") {
     const lower = finite(weighting.rangePremiumUsd?.lower, null);
     const upper = finite(weighting.rangePremiumUsd?.upper, null);
     return lower === null || upper === null
       ? "—"
-      : `${formatApiMoney(lower)}–${formatApiMoney(upper)}`;
+      : display(`${formatApiMoney(lower)}–${formatApiMoney(upper)}`);
+  }
+  if (cost.isSubtotal && cost.standardApiPremiumUsd !== null) {
+    return display(formatApiMoney(cost.standardApiPremiumUsd));
   }
   return "—";
 }
 
 function cacheContinuityStandardMetricValue(impact) {
-  const standard = finite(impact?.standardApiPremiumUsd, null);
-  return standard === null ? "—" : formatApiMoney(standard);
+  const cost = cacheImpactCostView(impact);
+  if (cost === null || cost.standardApiPremiumUsd === null) return "—";
+  const amount = formatApiMoney(cost.standardApiPremiumUsd);
+  return cost.isSubtotal
+    ? t("accounting.cacheImpact.subtotalValue", { amount })
+    : amount;
 }
 
 function cacheContinuityMetricValue(impact) {
@@ -7773,8 +7784,62 @@ function cacheContinuityMetricValue(impact) {
 }
 
 function cacheContinuityUsesStandardFallback(impact) {
-  return cacheSwitchMetricValue(impact) === "—"
-    && finite(impact?.standardApiPremiumUsd, null) !== null;
+  const cost = cacheImpactCostView(impact);
+  return cost !== null && cost.standardApiPremiumUsd !== null
+    && !["complete", "range"].includes(cost.allowanceWeighting?.status);
+}
+
+function cacheImpactCostView(impact) {
+  if (impact?.status !== "available") return null;
+  // No compared requests is not an observed zero-dollar overhead.
+  if (impact.cacheReadDrops === 0
+      && (impact.proximateConfigurationChanges ?? impact.comparableReturns) === 0) {
+    return null;
+  }
+  const isSubtotal = impact.coverageStatus === "incomplete"
+    || impact.unpricedDrops > 0;
+  const selected = isSubtotal ? impact.coveredSubtotal : impact;
+  if (!selected || (isSubtotal
+      && (selected.scope !== "covered_priced_drops"
+        || !Number.isSafeInteger(selected.pricedDrops)
+        || selected.pricedDrops <= 0
+        || selected.pricedDrops !== impact.pricedDrops))) return null;
+  return {
+    isSubtotal,
+    pricedDrops: selected.pricedDrops,
+    standardApiPremiumUsd: finite(selected.standardApiPremiumUsd, null),
+    allowanceWeighting: selected.allowanceWeighting,
+  };
+}
+
+function appendCacheImpactSubtotalNote(container, impact) {
+  const cost = cacheImpactCostView(impact);
+  if (cost === null || !cost.isSubtotal) return false;
+  container.append(
+    document.createTextNode(" "),
+    localizedNode("span", "", "accounting.cacheImpact.subtotalScope", {
+      priced: formatCount(cost.pricedDrops),
+    }),
+  );
+  if (cost.standardApiPremiumUsd !== null) {
+    container.append(
+      document.createTextNode(" "),
+      localizedNode("span", "", cacheContinuityUsesStandardFallback(impact)
+        ? "accounting.cacheImpact.subtotalStandardOnly"
+        : "accounting.cacheImpact.subtotalStandard", {
+        amount: formatApiMoney(cost.standardApiPremiumUsd),
+      }),
+    );
+  }
+  if (finite(impact.unpricedDrops, 0) > 0) {
+    container.append(
+      document.createTextNode(" "),
+      localizedNode("span", "", "accounting.cacheImpact.subtotalUnpriced", {
+        unpriced: formatCount(impact.unpricedDrops),
+      }),
+    );
+  }
+  return true;
 }
 
 function formatCacheSwitchPercentagePoints(value) {
@@ -7809,6 +7874,7 @@ function appendCacheSwitchMetricNote(container, impact) {
         ordering: formatCount(ordering),
       },
     ));
+    appendCacheImpactSubtotalNote(container, impact);
     return;
   }
   const drops = finite(impact.cacheReadDrops, 0);
@@ -7847,6 +7913,8 @@ function appendCacheSwitchMetricNote(container, impact) {
       );
     }
   }
+  if (appendCacheImpactSubtotalNote(container, impact)) return;
+  if (cacheImpactCostView(impact) === null) return;
   if (finite(impact.standardApiPremiumUsd, null) !== null) {
     container.append(
       document.createTextNode(" "),
@@ -8132,6 +8200,8 @@ function appendCacheContinuityMetricNote(container, impact) {
       ),
     );
   }
+  if (appendCacheImpactSubtotalNote(container, impact)) return;
+  if (cacheImpactCostView(impact) === null) return;
   if (impact.coverageStatus === "complete"
       && finite(impact.unpricedDrops, 0) === 0) {
     const standardFallback = cacheContinuityUsesStandardFallback(impact);
@@ -8542,13 +8612,27 @@ function renderCacheReuseReadout(bucket, width, selectedRange,
     "accounting.cacheContinuity.outcome.readoutLost",
     { tokens: formatCount(bucket.lostCacheTokens) },
   );
+  const subtotalScope = !completeCoverage
+    || bucket.coverageStatus !== "complete" || bucket.unpricedDrops > 0;
+  // A global ordering gap has no honest bucket assignment. It withholds the
+  // period total, not the independently admitted comparisons in this bucket.
+  const premium = bucket.comparableReturns === 0 ? null
+    : subtotalScope
+      ? bucket.coveredSubtotal?.standardApiPremiumUsd
+        ?? (bucket.coverageStatus === "complete" && bucket.unpricedDrops === 0
+          ? bucket.estimatedPremiumUsd : null)
+      : bucket.estimatedPremiumUsd;
   setLocalizedText(
     $("#cache-reuse-readout-api"),
-    "accounting.cacheContinuity.outcome.readoutApi",
+    subtotalScope
+      ? "accounting.cacheContinuity.outcome.readoutSubtotal"
+      : "accounting.cacheContinuity.outcome.readoutApi",
     {
-      amount: !completeCoverage || bucket.estimatedPremiumUsd === null
+      amount: premium === null || premium === undefined
         ? t("accounting.cacheContinuity.premiumUnavailable")
-        : formatApiMoney(bucket.estimatedPremiumUsd),
+        : formatApiMoney(premium),
+      priced: formatCount(bucket.pricedDrops),
+      unpriced: formatCount(bucket.unpricedDrops),
     },
   );
   const stage = $("#cache-reuse-raster-stage");
@@ -10120,6 +10204,9 @@ function fastModeCoverageSentence(fastMode) {
   const parts = [
     t("accounting.fastMode.observed", {
       count: compact(coverage.observedEvents),
+    }),
+    t("accounting.fastMode.declaredFromConfig", {
+      count: compact(coverage.declaredFromConfigEvents),
     }),
     t("accounting.fastMode.stated", {
       count: compact(coverage.assumedEvents),

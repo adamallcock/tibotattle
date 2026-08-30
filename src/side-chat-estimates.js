@@ -7,12 +7,12 @@ import { DatabaseSync } from "node:sqlite";
 import {
   APP_PRICE_REGISTRY_MANIFEST,
   DEFAULT_UNRESOLVED_SPEED_SCENARIO,
+  FAST_MODE_ASSUMED_MULTIPLIER,
   emptySpeedWeightingCrossing,
   fastModeModelFamilyKey,
   priceCodexUsageEvent,
   summarizeQuotaWeightedAccounting,
 } from "@app-usagemonitor/accounting";
-import { fastQuotaMultiplier } from "./application/index.js";
 import { codexPrimaryAllowanceBasis } from "./codex-primary-allowance-basis.js";
 import { declaredSpeedModeAt } from "./codex-speed-baseline.js";
 import { recognizedCodexModelId } from "./export/index.js";
@@ -36,7 +36,7 @@ export const SIDE_CHAT_ESTIMATE_SCHEMA_VERSION =
 export const SIDE_CHAT_ESTIMATE_PARSER_VERSION =
   "desktop-fork-logs2-active-context-v0.3";
 export const SIDE_CHAT_HISTORICAL_GAP_SCHEMA_VERSION =
-  "development-side-chat-historical-gap-v0.2";
+  "development-side-chat-historical-gap-v0.3";
 
 const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 const UUID_PATTERN = new RegExp(`^${UUID}$`, "iu");
@@ -461,11 +461,11 @@ function emptyHistoricalGapSpeedSummary() {
   };
 }
 
-function addHistoricalGapWeighting(crossing, speed, model, cost) {
+function addHistoricalGapWeighting(crossing, speed, family, cost) {
   const speedKey = ["standard", "fast", "unknown"].includes(speed)
     ? speed
     : "unknown";
-  const cell = crossing[speedKey][fastModeModelFamilyKey(model)];
+  const cell = crossing[speedKey][family];
   cell.events += 1;
   cell.apiPriceEquivalentUsd += cost;
 }
@@ -618,10 +618,14 @@ function historicalGapExactUsage(database, {
     const speed = historicalGapSpeedKey(projection.speed);
     bySpeed[speed].events += 1;
     bySpeed[speed].totalTokens += projection.totalTokens;
+    const family = fastModeModelFamilyKey(projection.model, {
+      eventTime: observedAt,
+      standardPriceCardIds: priced?.selectedPriceCardIds ?? [],
+    });
     addHistoricalGapWeighting(
       speedWeighting,
       projection.speed,
-      projection.model,
+      family,
       pricedCompletely ? cost : 0,
     );
     if (projection.speed === "unknown"
@@ -629,7 +633,7 @@ function historicalGapExactUsage(database, {
       addHistoricalGapWeighting(
         declaredSpeedWeighting,
         declaredMode,
-        projection.model,
+        family,
         pricedCompletely ? cost : 0,
       );
     }
@@ -742,10 +746,10 @@ export async function collectHistoricalSideChatGapProbe({
       return unavailable("side_chat_historical_gap_model_ambiguous");
     }
     const assumedMissingModel = exactUsage.observedModels[0];
-    const missingMultiplier = fastQuotaMultiplier(assumedMissingModel);
-    if (!Number.isFinite(missingMultiplier) || missingMultiplier < 1) {
-      return unavailable("side_chat_historical_gap_speed_weighting_incomplete");
-    }
+    // The missing events are hypothetical: their input context and exact
+    // price epoch were never observed. A model-capability ratio would claim
+    // unsupported evidence, so this backcast uses the disclosed fallback.
+    const missingMultiplier = FAST_MODE_ASSUMED_MULTIPLIER;
     const weighting = exactUsage.allowanceWeighting;
     const minimumMovement = quota.minimumMovementPercentagePoints;
     const maximumMovement = quota.maximumMovementPercentagePoints;
@@ -838,6 +842,7 @@ export async function collectHistoricalSideChatGapProbe({
         assumedMissingModel,
         modelAssumption: "only_exact_model_observed_that_day",
         fastQuotaMultiplier: missingMultiplier,
+        fastQuotaMultiplierSource: "assumed_missing_event_context",
         allowanceComparison: {
           status: comparisonStatus,
           basisFamilyId: calibration.basisFamilyId,
@@ -1522,7 +1527,12 @@ function estimatedTimeline(calls, declaredSpeedBaselines = []) {
       0,
     );
     bucket.apiPriceEquivalentUsd += call.estimatedApiPriceEquivalentUsd;
-    const family = fastModeModelFamilyKey(call.model);
+    const family = fastModeModelFamilyKey(call.model, {
+      eventTime: new Date(call.observedAtMs).toISOString(),
+      totalInputContextTokens: call.point.components.input_uncached_tokens
+        + call.point.components.input_cache_read_tokens
+        + call.point.components.input_cache_write_tokens,
+    });
     const weightingCell = bucket.speedWeighting.unknown[family];
     weightingCell.events += 1;
     weightingCell.apiPriceEquivalentUsd +=

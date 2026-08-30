@@ -1930,6 +1930,7 @@ tbody tr:last-child td { border-bottom: 0; }
    remaining cards occupying two thirds of the width with a hole where the
    third used to be. The row now fills whatever cards it is given. */
 .accounting-summary { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.accounting-summary > .accounting-speed-coverage { grid-column: 1 / -1; margin: 0; }
 .compact-metric { min-height: 150px; }
 .compact-metric .metric-value { margin: 16px 0 8px; font-size: 2rem; }
 .accounting-component-grid { margin-bottom: 18px; }
@@ -2670,8 +2671,9 @@ footer p { margin: 0; }
      its own row. `:last-child` on its own also stretched the second of two
      cards, which is why the Spark allowance rendered double the width of the
      primary allowance beside it at this breakpoint. In a two-column grid the
-     last child is alone exactly when its position is odd. */
-  .metric-grid > :last-child:nth-child(odd) { grid-column: 1 / -1; }
+     last child is alone exactly when its position is odd. The accounting grid
+     also contains a full-width disclosure, so child parity is not card parity. */
+  .metric-grid:not(.accounting-summary) > :last-child:nth-child(odd) { grid-column: 1 / -1; }
 }
 
 @media (max-width: 760px) {

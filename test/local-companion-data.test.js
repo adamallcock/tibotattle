@@ -31,7 +31,7 @@ import {
   readLocalCollectorAccountingCache,
   writeLocalCollectorAccountingCache,
 } from "../src/local-collector-state.js";
-import { emptySpeedWeightingCrossing } from "@app-usagemonitor/accounting";
+import { emptySpeedWeightingCrossing, FAST_MODE_QUOTA_MULTIPLIERS } from "@app-usagemonitor/accounting";
 import {
   openLocalUnifiedIndex,
   readUnifiedIndexGenerationDescriptor,
@@ -321,11 +321,7 @@ test("local companion builds a closed real-data projection without identifiers o
     assert.equal(fastMode.unresolvedScenario, "unresolved_as_standard");
     assert.equal(fastMode.logObservability.sessionBaselineRecorded, false);
     assert.equal(fastMode.metricLabel, "Speed-priced API-price equivalent");
-    assert.deepEqual(fastMode.multipliers, {
-      "gpt-5.6": 2,
-      "gpt-5.5": 2.5,
-      "gpt-5.4": 2,
-    });
+    assert.deepEqual(fastMode.multipliers, { ...FAST_MODE_QUOTA_MULTIPLIERS });
     assert.equal(fastMode.multiplierSource.recordedAt, "2026-08-30");
     assert.deepEqual(fastMode.coverage, {
       totalEvents: 2,
@@ -433,7 +429,7 @@ test("development side-chat estimates adjust only the calibration timeline", asy
       lastSeenAt: "2026-07-25T12:00:00.000Z",
     }];
     const estimatedSpeedWeighting = emptySpeedWeightingCrossing();
-    estimatedSpeedWeighting.unknown["gpt-5.6"] = {
+    estimatedSpeedWeighting.unknown["gpt-5.6-sol"] = {
       events: 2,
       apiPriceEquivalentUsd: 1.25,
     };
@@ -506,7 +502,7 @@ test("development side-chat estimates adjust only the calibration timeline", asy
       {
         schemaVersion: "quota-weighted-timeline-v0.1",
         basisFamilyId:
-          "codex_primary:speed_priced_api_equivalent:v2:priority_price_ratio_2026_08_30:event_time:observed_declared_scenario",
+          "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario",
         scenarioOrder: [
           "unresolved_as_standard",
           "unresolved_as_fast",

@@ -39,6 +39,8 @@ import {
   costWarningCodes,
   emptySpeedWeightingCrossing,
   fastModeModelFamilyKey,
+  FAST_MODE_ASSUMED_MULTIPLIER,
+  FAST_MODE_QUOTA_MULTIPLIERS,
   priceCodexUsageEvent,
   APP_PRICE_REGISTRY_MANIFEST,
 } from "@app-usagemonitor/accounting";
@@ -69,7 +71,6 @@ import {
   BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT,
   projectBoundedWeeklyCalibrationSummary,
 } from "./reporting/index.js";
-import { fastQuotaMultiplier } from "./application/index.js";
 
 // v0.4 added per-model allowance-track and API-price-applicability state, and
 // the combined `modelUsage` row set. v0.5 (2026-08-08) sources the weekly
@@ -114,8 +115,11 @@ import { fastQuotaMultiplier } from "./application/index.js";
 // holds only its totals, and the missing cells cannot be recovered by dividing
 // them, so the cache is withheld and rebuilt rather than served with the
 // components silently absent.
+// v0.13 (2026-08-30): speed crossings use canonical registered models and
+// event-qualified Priority cards. Old prefix-family crossings cannot recover
+// the model/context/epoch eligibility, so they must be rebuilt, not relabeled.
 export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
-  "local-replay-safe-accounting-v0.12";
+  "local-replay-safe-accounting-v0.13";
 const { scanCodexLogEvents } = localCodexLogScanner;
 const ALLOWANCE_CAPACITY_SCHEMA_VERSION =
   "codex-primary-allowance-capacity-v0.1";
@@ -1313,6 +1317,10 @@ function eventProjection(event, price) {
   return {
     timestamp: event.timestamp,
     model,
+    fastModeFamily: fastModeModelFamilyKey(model, {
+      eventTime: event.timestamp,
+      standardPriceCardIds: priced.selectedPriceCardIds ?? [],
+    }),
     modelPricingStatus: codexModelPricingStatus(event.model),
     modelAllowanceTrack: codexModelAllowanceTrack(event.model),
     modelApiPriceEquivalentApplicable:
@@ -1352,9 +1360,12 @@ function transitionUsageProjection(event, projection) {
       : 0
   ));
   const costUsd = Number(projection.priced.totalUsd);
-  const multiplier = fastQuotaMultiplier(projection.model);
+  const multiplier = FAST_MODE_QUOTA_MULTIPLIERS[projection.fastModeFamily] ?? null;
+  // The scenario retains the owner-approved assumed ratio when Priority
+  // context/date evidence is missing. The period crossing reports that
+  // Standard cost separately in the explicit unsupported/assumed bucket.
   const fastWeightedEquivalentUsd =
-    multiplier === null ? null : costUsd * multiplier;
+    costUsd * (multiplier ?? FAST_MODE_ASSUMED_MULTIPLIER);
   const effectiveSpeed = ["standard", "fast"].includes(projection.speed)
     ? projection.speed
     : ["standard", "fast"].includes(projection.declaredSpeed)
@@ -1973,8 +1984,12 @@ function projectWeeklyPaceForecast(rows, endMs) {
 function addSpeedWeighting(crossing, event) {
   // "fast", "standard" and "unknown" are the only observed values; anything
   // else collapses to unknown rather than being treated as Standard.
-  const speed = crossing[event.speed] ? event.speed : "unknown";
-  const cell = crossing[speed][fastModeModelFamilyKey(event.model)];
+  const speed = ["standard", "fast", "unknown"].includes(event.speed)
+    ? event.speed : "unknown";
+  const row = crossing[speed] ??= {};
+  const cell = row[event.fastModeFamily ?? "unsupported"] ??= {
+    events: 0, apiPriceEquivalentUsd: 0,
+  };
   cell.events += 1;
   cell.apiPriceEquivalentUsd += event.apiPriceEquivalentUsd;
 }
@@ -1985,7 +2000,10 @@ function addDeclaredSpeedWeighting(crossing, event) {
   if (event.declaredSpeed !== "standard" && event.declaredSpeed !== "fast") {
     return;
   }
-  const cell = crossing[event.declaredSpeed][fastModeModelFamilyKey(event.model)];
+  const row = crossing[event.declaredSpeed] ??= {};
+  const cell = row[event.fastModeFamily ?? "unsupported"] ??= {
+    events: 0, apiPriceEquivalentUsd: 0,
+  };
   cell.events += 1;
   cell.apiPriceEquivalentUsd += event.apiPriceEquivalentUsd;
 }
@@ -2001,8 +2019,8 @@ function finalizeSpeedWeighting(crossing) {
 }
 
 function compactSpeedWeighting(crossing) {
-  // Timeline buckets overwhelmingly occupy one or two of the twelve possible
-  // speed/model-family cells. Persist only those cells; readers validate the
+  // Timeline buckets overwhelmingly occupy one or two of the closed
+  // speed/model cells. Persist only those cells; readers validate the
   // allowed sparse keys and treat absence as an exact zero.
   const compact = {};
   for (const [speed, families] of Object.entries(crossing)) {
@@ -2311,8 +2329,8 @@ function newTimelineBucket(startMs) {
     usageEvents: 0,
     totalTokens: 0,
     apiPriceEquivalentUsd: 0,
-    speedWeighting: emptySpeedWeightingCrossing(),
-    declaredSpeedWeighting: emptySpeedWeightingCrossing(),
+    speedWeighting: {},
+    declaredSpeedWeighting: {},
     components: emptyComponents(),
     pricingCoverage: {
       fullyPricedEvents: 0,

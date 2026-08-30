@@ -27,10 +27,13 @@ const SUBSCRIPTION_SPEED_EXPORTS = Object.freeze([
   "FAST_MODE_QUOTA_MULTIPLIERS",
   "OBSERVED_SPEED_MODE_KEYS",
   "QUOTA_WEIGHTED_API_PRICE_METRIC",
+  "SPEED_MODE_PROVENANCE_VALUES",
+  "deriveFastModePriorityRatiosFromRegistry",
   "emptySpeedWeightingCrossing",
   "fastModeModelFamilyKey",
   "fastModeQuotaMultiplier",
   "inferFastModeFromCalibrationWindows",
+  "quotaWeightedApiPriceEquivalent",
   "resolveEffectiveSpeedMode",
   "summarizeQuotaWeightedAccounting",
 ]);

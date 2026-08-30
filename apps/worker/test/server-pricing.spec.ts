@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { APP_OFFICIAL_PRICE_CARDS } from "@app-usagemonitor/accounting";
+import {
+  APP_OFFICIAL_PRICE_CARDS,
+  priceCodexUsageEvent,
+  quotaWeightedApiPriceEquivalent,
+  resolveEffectiveSpeedMode,
+  type SpeedModeProvenance,
+} from "@app-usagemonitor/accounting";
 import {
   priceTelemetryUsageEvent,
   SERVER_PRICING_METHOD_VERSION,
@@ -62,6 +68,16 @@ function fixture(overrides: Partial<TelemetryUsageEvent> = {}): TelemetryUsageEv
   };
 }
 
+// Exercise the pricing kernel's complete reviewed registry independently of
+// telemetry's deliberately narrower canonical-model ingestion allowlist. This
+// test-only cast does not make an alias or extra registry model ingestible.
+function registryModelPricingFixture(
+  modelId: string,
+  overrides: Omit<Partial<TelemetryUsageEvent>, "modelId"> = {},
+): TelemetryUsageEvent {
+  return { ...fixture(overrides), modelId } as TelemetryUsageEvent;
+}
+
 interface PriceCardValidity {
   effective: { from?: string; to?: string };
   vendorEffectiveFrom: string | null;
@@ -117,6 +133,69 @@ function validateIngestibleEvent(event: TelemetryUsageEvent): TelemetryUsageEven
 }
 
 describe("server pricing", () => {
+  it("prices every registry Priority model, alias and epoch identically to the local kernel", () => {
+    let checked = 0;
+    for (const card of APP_OFFICIAL_PRICE_CARDS.filter(
+      (entry) => entry.provider === "openai" && entry.service_tier === "priority",
+    )) {
+      const eventTime = `${card.effective?.from ?? card.effective?.to ?? "2026-08-30"}T12:00:00.000Z`;
+      const totalInputContextTokens = card.metadata?.total_input_context_band === "long"
+        ? 272_000 : 4_000;
+      const tokens = Object.fromEntries(card.components
+        .filter((component) => component.usage_component.endsWith("_tokens"))
+        .map((component) => [component.usage_component, 1_000]));
+      for (const modelId of [card.model, ...(card.aliases ?? [])]) {
+        const localEvent = { model: modelId, timestamp: eventTime, totalInputContextTokens, components: tokens };
+        const standard = priceCodexUsageEvent(localEvent, { apiServiceTier: "standard" });
+        const priority = priceCodexUsageEvent(localEvent, { apiServiceTier: "priority" });
+        const event = registryModelPricingFixture(modelId, { eventTime, totalInputContextTokens, components: {
+          inputUncachedTokens: tokens.input_uncached_tokens ?? 0,
+          inputCacheReadTokens: tokens.input_cache_read_tokens ?? 0,
+          inputCacheWriteTokens: tokens.input_cache_write_tokens ?? 0,
+          inputCacheWrite5mTokens: null,
+          inputCacheWrite1hTokens: null,
+          outputTextTokens: tokens.output_text_tokens ?? 0,
+          outputReasoningTokens: 0,
+          outputCombinedTokens: null,
+        } });
+        const worker = priceTelemetryUsageEvent(event);
+        const localWeighted = quotaWeightedApiPriceEquivalent({
+          apiPriceEquivalentUsd: Number(standard.totalUsd), model: modelId, mode: "fast",
+          eventTime, totalInputContextTokens, standardPriceCardIds: standard.selectedPriceCardIds,
+        });
+        expect(worker.coverageStatus, card.id).toBe("fully_priced");
+        expect(worker.tierBasis, card.id).toBe("subscription_speed_priority_price_ratio");
+        expect(Number(worker.exactCostUsd), `${card.id}/${modelId}`).toBe(Number(priority.totalUsd));
+        expect(Number(worker.exactCostUsd), `${card.id}/${modelId}`).toBe(localWeighted.usd);
+        checked += 1;
+      }
+    }
+    expect(checked).toBe(26);
+    const provenance: SpeedModeProvenance = "assumed_fast_scenario";
+    expect(resolveEffectiveSpeedMode({ unresolvedScenario: "unresolved_as_fast" }).provenance).toBe(provenance);
+  });
+
+  it("discloses missing-model and missing-context Priority assumptions instead of borrowing a prefix rate", () => {
+    for (const event of [
+      registryModelPricingFixture("gpt-5.5-pro", { components: {
+        ...fixture().components, inputCacheReadTokens: 0,
+      } }),
+      fixture({ modelId: "gpt-5.5", totalInputContextTokens: 272_000 }),
+      fixture({ modelId: "gpt-5.6-sol", eventTime: "2026-08-20T23:59:59.999Z", totalInputContextTokens: 272_000 }),
+    ]) {
+      const result = priceTelemetryUsageEvent(event);
+      expect(result.coverageStatus).toBe("fully_priced");
+      expect(result.tierBasis).toBe("subscription_speed_assumed_priority_ratio");
+      expect(result.speedMultiplier).toBe(2);
+      const standard = priceTelemetryUsageEvent({ ...event, speedMode: "standard" });
+      expect(Number(result.exactCostUsd)).toBe(Number(standard.exactCostUsd) * 2);
+    }
+    const missing = priceTelemetryUsageEvent(registryModelPricingFixture("gpt-5.6-sol-wm", { totalInputContextTokens: null }));
+    expect(missing.coverageStatus).toBe("unpriced");
+    expect(missing.unpricedReasonCodes).toContain("total_input_context_missing");
+    expect(SERVER_PRICING_METHOD_VERSION).toBe("server-api-price-equivalent-v0.4");
+  });
+
   it("matches the frozen accounting kernel projection on supported fixtures", () => {
     expect(parityFixture.schemaVersion).toBe("accounting-parity-fixture-v0.1");
     expect(parityFixture.cases).toHaveLength(6);

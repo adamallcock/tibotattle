@@ -233,13 +233,18 @@ export function apiPriceResolutionSummary(options?: {
   apiServiceTier?: string;
 }): Readonly<Record<string, unknown>>;
 
-export type FastModeModelFamily = "gpt-5.6" | "gpt-5.5" | "gpt-5.4";
+export type FastModeModelFamily =
+  | "gpt-4.1" | "gpt-4.1-mini" | "gpt-4.1-nano" | "gpt-4o"
+  | "gpt-5" | "gpt-5-mini" | "gpt-5.1" | "gpt-5.1-codex" | "gpt-5.2"
+  | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.5"
+  | "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra";
 export type FastModeModelFamilyKey = FastModeModelFamily | "unsupported";
 export type ObservedSpeedMode = "standard" | "fast" | "unknown";
 export type SpeedModeProvenance =
   | "observed"
   | "declared_codex_config"
   | "assumed_standard_default"
+  | "assumed_fast_scenario"
   | "inferred"
   | "unknown";
 
@@ -363,11 +368,20 @@ export const SPEED_MODE_PROVENANCE_VALUES: readonly SpeedModeProvenance[];
 export const CODEX_SPEED_MODE_DECLARATION: CodexSpeedModeDeclaration;
 export const QUOTA_WEIGHTED_API_PRICE_METRIC: QuotaWeightedApiPriceMetric;
 
-export function fastModeModelFamilyKey(model: unknown): FastModeModelFamilyKey;
-export function fastModeQuotaMultiplier(model: unknown): number | null;
+export interface FastModePriceEvidence {
+  eventTime?: string | null;
+  totalInputContextTokens?: number | null;
+  standardPriceCardIds?: readonly string[];
+}
+export function fastModeModelFamilyKey(
+  model: unknown, evidence?: FastModePriceEvidence,
+): FastModeModelFamilyKey;
+export function fastModeQuotaMultiplier(
+  model: unknown, evidence?: FastModePriceEvidence,
+): number | null;
 export function deriveFastModePriorityRatiosFromRegistry(
-  cards?: readonly Record<string, unknown>[],
-): Readonly<Record<FastModeModelFamily, number>>;
+  cards?: readonly PriceCard[],
+): Readonly<Record<string, number>>;
 export function emptySpeedWeightingCrossing(): SpeedWeightingCrossing;
 export const DEFAULT_UNRESOLVED_SPEED_SCENARIO: UnresolvedSpeedScenario;
 export function resolveEffectiveSpeedMode(input?: {
@@ -379,6 +393,9 @@ export function quotaWeightedApiPriceEquivalent(input?: {
   apiPriceEquivalentUsd?: number;
   model?: string;
   mode?: string;
+  eventTime?: string | null;
+  totalInputContextTokens?: number | null;
+  standardPriceCardIds?: readonly string[];
 }): { usd: number | null; multiplier: number | null; status: string };
 export function summarizeQuotaWeightedAccounting(input?: {
   speedWeighting?: SpeedWeightingCrossing | null;

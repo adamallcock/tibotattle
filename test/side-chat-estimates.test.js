@@ -197,11 +197,11 @@ test("side-chat estimator detects only anchored children and prices warm then po
       result.timeline[0].usageEvents,
     );
     assert.equal(
-      result.timeline[0].declaredSpeedWeighting.fast["gpt-5.6"].events,
+      result.timeline[0].declaredSpeedWeighting.fast["gpt-5.6-sol"].events,
       1,
     );
     assert.equal(
-      result.timeline[0].declaredSpeedWeighting.fast["gpt-5.6"]
+      result.timeline[0].declaredSpeedWeighting.fast["gpt-5.6-sol"]
         .apiPriceEquivalentUsd,
       result.recent[0].estimatedApiPriceEquivalentUsd,
     );
@@ -590,6 +590,7 @@ test("historical side-chat gap probe keeps exact usage separate from its quota-r
       result.estimate.exactCostImpliedMedianRangePercentagePoints.upper,
     );
     assert.equal(result.estimate.fastQuotaMultiplier, 2);
+    assert.equal(result.estimate.fastQuotaMultiplierSource, "assumed_missing_event_context");
     assert.equal(result.estimate.includedInExactUsage, false);
     assert.equal(result.estimate.includedInCalibrationTimeline, false);
     assert.equal(result.estimate.independentlyObserved, false);

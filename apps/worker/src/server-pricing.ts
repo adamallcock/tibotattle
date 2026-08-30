@@ -7,13 +7,13 @@ import {
 } from "@app-usagemonitor/accounting";
 import type { TelemetryUsageEvent } from "./telemetry-validation";
 
-// v0.3 (2026-08-30): Codex subscription Fast events are priced at the
+// v0.4 (2026-08-30): Codex subscription Fast events are priced at the
 // published Priority (Fast) API rate - the Standard counterfactual multiplied
-// by the model family's Priority/Standard price ratio (proven uniform per
+// by the exact model's eligible Priority/Standard price ratio (proven uniform per
 // component by the accounting package), or by the disclosed assumed 2x when
 // no Priority rate is published. Standard and unknown speed stay the plain
 // Standard counterfactual, as does every claude_subscription event.
-export const SERVER_PRICING_METHOD_VERSION = "server-api-price-equivalent-v0.3";
+export const SERVER_PRICING_METHOD_VERSION = "server-api-price-equivalent-v0.4";
 
 type PricingStatus = "fully_priced" | "partially_priced" | "unpriced";
 export type ServerPriceBasis = "historical_api_prices" | "unpriced";
@@ -45,14 +45,10 @@ export interface ServerPricingResult {
   speedMultiplier: number | null;
 }
 
-const CONTEXT_SENSITIVE_OPENAI_MODELS = new Set([
-  "gpt-5.4",
-  "gpt-5.5",
-  "gpt-5.5-codex",
-  "gpt-5.6-luna",
-  "gpt-5.6-sol",
-  "gpt-5.6-terra",
-]);
+const CONTEXT_SENSITIVE_OPENAI_MODELS = new Set(APP_OFFICIAL_PRICE_CARDS
+  .filter((card) => card.provider === "openai"
+    && card.metadata?.total_input_context_band != null)
+  .flatMap((card) => [card.model, ...(card.aliases ?? [])]));
 const MAX_PARTICIPANT_USAGE_EVENTS = 20_000;
 const MAX_SAFE_EVENT_NANOUSD = Math.floor(
   Number.MAX_SAFE_INTEGER / MAX_PARTICIPANT_USAGE_EVENTS,
@@ -117,7 +113,10 @@ function tierForEvent(row: TelemetryUsageEvent): {
     // instead would strand models and epochs without a published Priority row
     // as unpriced and poison whole resets in the community fit.
     if (row.billingSurface === "chatgpt_subscription" && row.speedMode === "fast") {
-      const publishedRatio = fastModeQuotaMultiplier(row.modelId);
+      const publishedRatio = fastModeQuotaMultiplier(row.modelId, {
+        eventTime: row.eventTime,
+        totalInputContextTokens: row.totalInputContextTokens,
+      });
       return {
         apiServiceTier: "standard",
         tierBasis: publishedRatio === null

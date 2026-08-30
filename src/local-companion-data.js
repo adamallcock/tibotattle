@@ -1141,7 +1141,45 @@ function cacheAllowanceScenario(premium, capacity) {
   };
 }
 
+function projectCacheCoveredSubtotal(value, pricedDrops) {
+  if (value?.scope !== "covered_priced_drops"
+      || !Number.isSafeInteger(pricedDrops) || pricedDrops <= 0
+      || value.pricedDrops !== pricedDrops
+      || !Number.isFinite(value.standardApiPremiumUsd)
+      || value.standardApiPremiumUsd < 0
+      || typeof value.standardApiPremiumUsdExact !== "string"
+      || value.standardApiPremiumUsdExact.length > 64
+      || !/^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/u.test(value.standardApiPremiumUsdExact)
+      || Number(value.standardApiPremiumUsdExact) !== value.standardApiPremiumUsd) {
+    return null;
+  }
+  return {
+    scope: "covered_priced_drops",
+    pricedDrops,
+    standardApiPremiumUsd: value.standardApiPremiumUsd,
+    standardApiPremiumUsdExact: value.standardApiPremiumUsdExact,
+    allowanceWeighting: projectCachePremiumWeighting(value.allowanceWeighting),
+  };
+}
+
+function projectCacheImpactBreakdown(value) {
+  return Object.fromEntries(Object.entries(value ?? {}).map(([key, summary]) => [
+    key,
+    {
+      ...summary,
+      coveredSubtotal: projectCacheCoveredSubtotal(
+        summary.coveredSubtotal,
+        summary.pricedDrops,
+      ),
+    },
+  ]));
+}
+
 export function cacheSwitchAllowanceImpact(period, allowanceCapacity) {
+  if (period?.coverageStatus === "incomplete" || period?.unpricedDrops > 0) {
+    return unavailableCacheSwitchAllowance(period.coverageStatus === "incomplete"
+      ? "weighting_evidence_incomplete" : "price_coverage_incomplete");
+  }
   // The retained capacity estimate is weekly. Applying that denominator to a
   // 24-hour, 30-day, or all-history premium would manufacture a percentage of
   // one week's allowance from a differently sized numerator.
@@ -1256,7 +1294,12 @@ function cacheSwitchImpactProjection(
     const allowanceWeighting = projectCachePremiumWeighting(
       period.allowanceWeighting,
     );
-    const projected = { ...period, allowanceWeighting };
+    const projected = {
+      ...period,
+      allowanceWeighting,
+      coveredSubtotal: projectCacheCoveredSubtotal(period.coveredSubtotal, period.pricedDrops),
+      byChangeType: projectCacheImpactBreakdown(period.byChangeType),
+    };
     return {
       ...projected,
       allowanceImpact: cacheSwitchAllowanceImpact(
@@ -1304,6 +1347,7 @@ function cacheSwitchImpactProjection(
     estimatedPremiumUsdExact: selected.estimatedPremiumUsdExact,
     standardApiPremiumUsd: selected.standardApiPremiumUsd,
     allowanceWeighting: selected.allowanceWeighting,
+    coveredSubtotal: selected.coveredSubtotal,
     byChangeType: selected.byChangeType,
     recent: selected.recent,
     allowanceImpact: selected.allowanceImpact,
@@ -1340,7 +1384,13 @@ function cacheContinuityImpactProjection(
     const allowanceWeighting = projectCachePremiumWeighting(
       period.allowanceWeighting,
     );
-    const projected = { ...period, allowanceWeighting };
+    const projected = {
+      ...period,
+      allowanceWeighting,
+      coveredSubtotal: projectCacheCoveredSubtotal(period.coveredSubtotal, period.pricedDrops),
+      byGapBand: projectCacheImpactBreakdown(period.byGapBand),
+      byOutcomeBucket: projectCacheImpactBreakdown(period.byOutcomeBucket),
+    };
     return {
       ...projected,
       allowanceImpact: cacheSwitchAllowanceImpact(
@@ -1392,6 +1442,7 @@ function cacheContinuityImpactProjection(
     estimatedPremiumUsdExact: selected.estimatedPremiumUsdExact,
     standardApiPremiumUsd: selected.standardApiPremiumUsd,
     allowanceWeighting: selected.allowanceWeighting,
+    coveredSubtotal: selected.coveredSubtotal,
     postCompactionRequests: selected.postCompactionRequests,
     postCompactionCacheReadDrops: selected.postCompactionCacheReadDrops,
     byGapBand: selected.byGapBand,

@@ -620,6 +620,7 @@ test("older parser coverage withholds both continuity and switch premiums", () =
   assert.equal(continuity.uncoveredReturns, 1);
   assert.equal(continuity.cacheReadDrops, 0);
   assert.equal(continuity.estimatedPremiumUsd, null);
+  assert.equal(continuity.coveredSubtotal, null);
 
   const oldSwitch = row({
     parser_version: "unified-rollout-typed-v2",
@@ -633,7 +634,131 @@ test("older parser coverage withholds both continuity and switch premiums", () =
   assert.equal(switched.uncoveredConfigurationChanges, 1);
   assert.equal(switched.cacheReadDrops, 0);
   assert.equal(switched.estimatedPremiumUsd, null);
+  assert.equal(switched.coveredSubtotal, null);
 });
+
+for (const [name, analyze, makeRow, premiumNanos] of [
+  ["switch", analyzeCacheSwitchRows, row, 9_400],
+  ["continuity", analyzeCacheContinuityRows, continuityRow, 9_000],
+]) {
+  test(`${name} covered subtotal survives an excluded comparison without becoming the period total`, () => {
+    const period = analyze([
+      makeRow({ codex_speed_mode: "fast" }),
+      makeRow({ parser_version: "unified-rollout-typed-v2" }),
+    ], { nowMs: NOW_MS, pricer: fullyPriced }).periods.find(
+      (candidate) => candidate.periodId === "7d",
+    );
+    assert.equal(period.coverageStatus, "incomplete");
+    assert.equal(period.cacheReadDrops, 1);
+    assert.equal(period.estimatedPremiumUsd, null);
+    assert.equal(period.standardApiPremiumUsd, null);
+    assert.equal(period.allowanceWeighting.status, "unavailable");
+    assert.equal(period.coveredSubtotal.scope, "covered_priced_drops");
+    assert.equal(period.coveredSubtotal.pricedDrops, 1);
+    assert.equal(period.coveredSubtotal.standardApiPremiumUsdExact, usdFromNanos(premiumNanos));
+    for (const scenario of Object.values(period.coveredSubtotal.allowanceWeighting.scenarios)) {
+      assert.equal(scenario.status, "complete");
+      assert.equal(scenario.quotaWeightedPremiumUsd, premiumNanos * 2 / 1_000_000_000);
+      assert.equal(scenario.observedSpeedDrops, 1);
+      assert.equal(scenario.pricedDrops, 1);
+    }
+    const partitions = name === "switch"
+      ? [period.byChangeType]
+      : [period.byGapBand, period.byOutcomeBucket];
+    for (const partition of partitions) {
+      const covered = Object.values(partition).filter((part) => part.coveredSubtotal !== null);
+      assert.equal(covered.length, 1);
+      assert.deepEqual(covered[0].coveredSubtotal, period.coveredSubtotal);
+      assert.equal(covered[0].estimatedPremiumUsd, null);
+    }
+    assert.equal(period.recent.length, 1);
+  });
+
+  test(`${name} subtotal excludes partial prices on either side and never invents an unpriced zero`, () => {
+    for (const unpricedSide of ["actual", "counterfactual", "both"]) {
+      const unpricedAt = NOW_MS - 30_000;
+      const pricer = (event, components) => {
+        const omit = event.timestamp === new Date(unpricedAt).toISOString()
+          && (unpricedSide === "both"
+            || (unpricedSide === "actual" && components.input_cache_read_tokens === 0)
+            || (unpricedSide === "counterfactual" && components.input_cache_read_tokens > 0));
+        return omit
+          ? { coverageStatus: "partially_priced", totalUsd: "0" }
+          : fullyPriced(event, components);
+      };
+      const good = makeRow({ codex_speed_mode: "standard" });
+      const unknownPrice = makeRow({ observed_at_ms: unpricedAt, codex_speed_mode: "fast" });
+      const period = analyze([good, unknownPrice], { nowMs: NOW_MS, pricer }).periods.find(
+        (candidate) => candidate.periodId === "7d",
+      );
+      assert.equal(period.coverageStatus, "complete", unpricedSide);
+      assert.equal(period.cacheReadDrops, 2, unpricedSide);
+      assert.equal(period.pricedDrops, 1, unpricedSide);
+      assert.equal(period.unpricedDrops, 1, unpricedSide);
+      assert.equal(period.estimatedPremiumUsd, null, unpricedSide);
+      assert.equal(period.allowanceWeighting.status, "unavailable", unpricedSide);
+      assert.equal(period.coveredSubtotal.standardApiPremiumUsdExact, usdFromNanos(premiumNanos));
+      for (const scenario of Object.values(period.coveredSubtotal.allowanceWeighting.scenarios)) {
+        assert.equal(scenario.pricedDrops, 1, unpricedSide);
+        assert.equal(scenario.observedSpeedDrops, 1, unpricedSide);
+        assert.equal(scenario.quotaWeightedPremiumUsd, premiumNanos / 1_000_000_000, unpricedSide);
+      }
+      const allUnpriced = analyze([unknownPrice], { nowMs: NOW_MS, pricer }).periods.find(
+        (candidate) => candidate.periodId === "7d",
+      );
+      assert.equal(allUnpriced.coveredSubtotal, null, unpricedSide);
+      assert.equal(allUnpriced.estimatedPremiumUsd, null, unpricedSide);
+    }
+    for (const rows of [[], [makeRow({ previous_tokens_in_cache_read: 0 })]]) {
+      const period = analyze(rows, { nowMs: NOW_MS, pricer: fullyPriced }).periods[0];
+      assert.equal(period.cacheReadDrops, 0);
+      assert.equal(period.coveredSubtotal, null);
+    }
+    // A fully priced zero is different from absent or partial pricing.
+    const free = analyze([makeRow()], {
+      nowMs: NOW_MS,
+      pricer: () => ({ coverageStatus: "fully_priced", totalUsd: "0" }),
+    }).periods[0];
+    assert.equal(free.coveredSubtotal.pricedDrops, 1);
+    assert.equal(free.coveredSubtotal.standardApiPremiumUsd, 0);
+    assert.equal(free.coveredSubtotal.standardApiPremiumUsdExact, "0");
+  });
+
+  test(`${name} subtotal uses all exact admitted drops, not the capped recent rows or another period`, () => {
+    const numberOfDrops = MAX_CACHE_SWITCH_RECENT_DETAILS + 7;
+    const rows = Array.from({ length: numberOfDrops }, (_, index) => makeRow({
+      observed_at_ms: NOW_MS - (index + 1) * 60_000,
+      previous_observed_at_ms: NOW_MS - (index + 2) * 60_000,
+    }));
+    const oldAt = NOW_MS - 20 * 24 * 60 * 60_000;
+    rows.push(makeRow({
+      observed_at_ms: oldAt,
+      previous_observed_at_ms: oldAt - 60_000,
+    }));
+    rows.push(makeRow({ parser_version: "unified-rollout-typed-v2" }));
+    const result = analyze(rows, { nowMs: NOW_MS, pricer: fullyPriced });
+    for (const period of result.periods) {
+      const expectedDrops = ["24h", "7d"].includes(period.periodId)
+        ? numberOfDrops : numberOfDrops + 1;
+      assert.equal(period.estimatedPremiumUsd, null, period.periodId);
+      assert.equal(period.recent.length, MAX_CACHE_SWITCH_RECENT_DETAILS, period.periodId);
+      assert.equal(period.coveredSubtotal.pricedDrops, expectedDrops, period.periodId);
+      assert.equal(
+        period.coveredSubtotal.standardApiPremiumUsdExact,
+        usdFromNanos(premiumNanos * expectedDrops),
+        period.periodId,
+      );
+      assert.equal(
+        period.coveredSubtotal.allowanceWeighting.scenarios.unresolved_as_standard.pricedDrops,
+        expectedDrops,
+        period.periodId,
+      );
+      assert.ok(period.coveredSubtotal.standardApiPremiumUsd > period.recent.reduce(
+        (sum, detail) => sum + detail.estimatedPremiumUsd, 0,
+      ));
+    }
+  });
+}
 
 test("context contraction and compaction prevent a switch premium", () => {
   const compacted = row({ compaction_between: 1 });
@@ -668,6 +793,24 @@ test("allowance translation couples each weighted premium to its matching capaci
     allowanceCapacity(),
   );
   assert.equal(fixed.status, "complete");
+  for (const [coverageStatus, unpricedDrops, reason] of [
+    ["incomplete", 0, "weighting_evidence_incomplete"],
+    ["complete", 1, "price_coverage_incomplete"],
+  ]) {
+    const subsetPromotedToTotal = cacheSwitchAllowanceImpact({
+      periodId: "7d",
+      coverageStatus,
+      unpricedDrops,
+      allowanceWeighting: fixedWeighting,
+      coveredSubtotal: {
+        scope: "covered_priced_drops",
+        allowanceWeighting: fixedWeighting,
+      },
+    }, allowanceCapacity());
+    assert.equal(subsetPromotedToTotal.status, "unavailable");
+    assert.equal(subsetPromotedToTotal.reason, reason);
+    assert.equal(subsetPromotedToTotal.medianPercentagePoints, null);
+  }
   assert.equal(fixed.selectedScenario, "unresolved_as_standard");
   assert.equal(fixed.medianPercentagePoints, 5);
   assert.deepEqual(

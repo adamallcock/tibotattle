@@ -5,7 +5,7 @@ import test from "node:test";
 import { normalizeDashboardPayload } from "../public/data-client.js";
 
 const ALLOWANCE_BASIS_FAMILY =
-  "codex_primary:speed_priced_api_equivalent:v2:priority_price_ratio_2026_08_30:event_time:observed_declared_scenario";
+  "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario";
 const allowanceBasisId = (scenario) =>
   `${ALLOWANCE_BASIS_FAMILY}:${scenario}`;
 const MATCHED_COHORT_ID =
@@ -209,7 +209,7 @@ function historicalGapProbe(overrides = {}) {
     unknownEvents: 0,
   };
   return {
-    schemaVersion: "development-side-chat-historical-gap-v0.2",
+    schemaVersion: "development-side-chat-historical-gap-v0.3",
     status: "available",
     errorCode: null,
     date: "2026-07-13",
@@ -252,28 +252,28 @@ function historicalGapProbe(overrides = {}) {
         status: "complete",
         basisFamilyId: ALLOWANCE_BASIS_FAMILY,
         selectedScenario: "unresolved_as_standard",
-        selectedUsd: 4.5,
+        selectedUsd: 4,
         scenarios: {
           unresolved_as_standard: {
             basisId: allowanceBasisId("unresolved_as_standard"),
             sourceWeightingStatus: "complete",
-            quotaWeightedUsd: 4.5,
-            coveredSubtotalUsd: 4.5,
+            quotaWeightedUsd: 4,
+            coveredSubtotalUsd: 4,
             coverage: historicalCoverage,
           },
           unresolved_as_fast: {
             basisId: allowanceBasisId("unresolved_as_fast"),
             sourceWeightingStatus: "complete",
-            quotaWeightedUsd: 6,
-            coveredSubtotalUsd: 6,
+            quotaWeightedUsd: 5,
+            coveredSubtotalUsd: 5,
             coverage: historicalCoverage,
           },
         },
         rangeUsd: null,
       },
       quotaWeightedApiPriceEquivalentRangeUsd: {
-        lower: 4.5,
-        upper: 6,
+        lower: 4,
+        upper: 5,
       },
       pricingCoverage: { pricedEvents: 3, unpricedEvents: 0 },
       speedWeightingCoverage: {
@@ -335,40 +335,41 @@ function historicalGapProbe(overrides = {}) {
       assumedMissingSpeed: "fast",
       assumedMissingModel: "gpt-5.6-terra",
       modelAssumption: "only_exact_model_observed_that_day",
-      fastQuotaMultiplier: 2.5,
+      fastQuotaMultiplier: 2,
+      fastQuotaMultiplierSource: "assumed_missing_event_context",
       allowanceComparison: {
         status: "complete",
         basisFamilyId: ALLOWANCE_BASIS_FAMILY,
         selectedScenario: "unresolved_as_standard",
-        selectedExpectedPercentagePoints: 4.5,
+        selectedExpectedPercentagePoints: 4,
         scenarios: {
           unresolved_as_standard: {
             basisId: allowanceBasisId("unresolved_as_standard"),
-            numeratorUsd: 4.5,
+            numeratorUsd: 4,
             capacityUsd: 100,
-            expectedPercentagePoints: 4.5,
+            expectedPercentagePoints: 4,
           },
           unresolved_as_fast: {
             basisId: allowanceBasisId("unresolved_as_fast"),
-            numeratorUsd: 6,
+            numeratorUsd: 5,
             capacityUsd: 250,
-            expectedPercentagePoints: 2.4,
+            expectedPercentagePoints: 2,
           },
         },
         expectedRangePercentagePoints: null,
       },
       exactCostImpliedMedianRangePercentagePoints: {
-        lower: 4.5,
-        upper: 4.5,
+        lower: 4,
+        upper: 4,
       },
       unexplainedMedianRangePercentagePoints: {
-        lower: 15.5,
-        upper: 15.5,
+        lower: 16,
+        upper: 16,
       },
-      impliedMissingStandardApiEquivalentUsd: 6.2,
-      impliedMissingQuotaWeightedApiEquivalentUsd: 15.5,
-      sensitivityRangeUsd: { lower: 4.6, upper: 21.6 },
-      quotaWeightedSensitivityRangeUsd: { lower: 11.5, upper: 54 },
+      impliedMissingStandardApiEquivalentUsd: 8,
+      impliedMissingQuotaWeightedApiEquivalentUsd: 16,
+      sensitivityRangeUsd: { lower: 6, upper: 27.5 },
+      quotaWeightedSensitivityRangeUsd: { lower: 12, upper: 55 },
       includedInExactUsage: false,
       includedInCalibrationTimeline: false,
       independentlyObserved: false,
@@ -689,7 +690,8 @@ test("browser preserves the historical quota-gap backcast but strips private fie
     totalTokens: 101_000,
     standardApiPriceEquivalentUsd: 1,
   });
-  assert.equal(result.estimate.impliedMissingStandardApiEquivalentUsd, 6.2);
+  assert.equal(result.estimate.impliedMissingStandardApiEquivalentUsd, 8);
+  assert.equal(result.estimate.fastQuotaMultiplierSource, "assumed_missing_event_context");
   assert.equal(result.estimate.includedInExactUsage, false);
   assert.equal(JSON.stringify(result).includes("private-child"), false);
 
@@ -704,6 +706,13 @@ test("browser preserves the historical quota-gap backcast but strips private fie
       .sideChatEstimates.historicalGapProbe.status,
     "unavailable",
   );
+  for (const source of [undefined, "published_priority_card", "arbitrary"]) {
+    const invalidSource = historicalGapProbe({ estimate: {
+      ...historicalGapProbe().estimate, fastQuotaMultiplierSource: source,
+    } });
+    assert.equal(normalize(estimate({ historicalGapProbe: invalidSource }))
+      .accounting.sideChatEstimates.historicalGapProbe.status, "unavailable");
+  }
 });
 
 test("side-chat UI keeps exact and adjusted calibration visible and paginates evidence", async () => {
@@ -731,4 +740,5 @@ test("side-chat UI keeps exact and adjusted calibration visible and paginates ev
   assert.match(app, /retained_subset_of_selected_period/u);
   assert.match(app, /historicalGapPeakThreeHourPoint/u);
   assert.match(localization, /cache unobserved/u);
+  assert.match(localization, /explicitly assumes 2x Standard, not a published Priority rate/u);
 });

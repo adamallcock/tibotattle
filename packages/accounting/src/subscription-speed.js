@@ -9,7 +9,7 @@
 // exact uniform multiple of its Standard row on every token component - a
 // relationship deriveFastModePriorityRatiosFromRegistry() re-verifies against
 // the shipped price registry on load - so applying that per-family ratio to a
-// Standard-priced amount equals pricing the same tokens on the Priority card,
+// Standard-priced amount equals pricing the same tokens on an eligible Priority card,
 // including the GPT-5.6 long-context band whose Priority rows the registry
 // carries. This replaced the vendor's credit-rate statement (which claimed
 // 2.5x for GPT-5.6) on 2026-08-30: the published Priority price for the
@@ -46,7 +46,7 @@ export const FAST_MODE_MULTIPLIER_SOURCE = Object.freeze({
   publisher: "openai",
   basis: "published_priority_api_price_ratio_relative_to_standard",
   statement:
-    "Codex Fast mode is the API Priority processing tier, so Fast usage is priced at the published Priority API rates: 2x Standard for the GPT-5.6 and GPT-5.4 families and 2.5x for GPT-5.5, derived from the official price registry and re-verified on load. Models without a published Priority rate use a disclosed assumed 2x, never a silent 1x.",
+    "Codex Fast mode is the API Priority processing tier. Published Priority/Standard ratios are derived for exact registered models and reviewed aliases, then checked against the event's context and price epoch. A model or event context without an eligible Priority card uses a disclosed assumed 2x, never a nearby model or an unavailable rate.",
   recordedAt: FAST_MODE_MULTIPLIER_RECORDED_AT,
   priceRegistryVersion: APP_PRICE_REGISTRY_VERSION,
   appliesTo: "codex_subscription_quota_and_api_price_equivalent",
@@ -65,13 +65,6 @@ export const CODEX_SPEED_MODE_OBSERVABILITY = Object.freeze({
   unobservedMeans:
     "the mode was set before the session began and never switched, so the log holds no tier for those turns",
 });
-
-// The Codex fast-capable model families whose Priority/Standard price ratio
-// is derived from the registry. Codex model variants outside these families
-// (e.g. gpt-5.x-codex) fall to the assumed multiplier below - which equals
-// their published 2x ratio wherever one exists - so the four crossing bucket
-// keys stay stable.
-const FAST_MODE_RATIO_FAMILIES = Object.freeze(["gpt-5.6", "gpt-5.5", "gpt-5.4"]);
 
 function decimalRational(amount) {
   const match = /^(\d+)(?:\.(\d+))?$/u.exec(String(amount));
@@ -97,14 +90,30 @@ function sameRatio(left, right) {
 }
 
 function ratioNumber({ priority, standard }) {
-  return (Number(priority.digits) / 10 ** priority.scale)
-    / (Number(standard.digits) / 10 ** standard.scale);
+  let numerator = priority.digits * 10n ** BigInt(standard.scale);
+  let denominator = standard.digits * 10n ** BigInt(priority.scale);
+  let left = numerator;
+  let right = denominator;
+  while (right !== 0n) [left, right] = [right, left % right];
+  numerator /= left;
+  denominator /= left;
+  return Number(numerator) / Number(denominator);
 }
 
 function tokenComponents(card) {
   return card.components.filter((component) => (
     component.usage_component.endsWith("_tokens")
   ));
+}
+
+function matchingContext(left, right) {
+  return left.model === right.model
+    && left.provider === right.provider
+    && (left.surface ?? null) === (right.surface ?? null)
+    && (left.region ?? null) === (right.region ?? null)
+    && (left.pricing_period ?? null) === (right.pricing_period ?? null)
+    && (left.metadata?.total_input_context_band ?? null)
+      === (right.metadata?.total_input_context_band ?? null);
 }
 
 function effectiveRangesOverlap(left, right) {
@@ -114,30 +123,34 @@ function effectiveRangesOverlap(left, right) {
 }
 
 /**
- * Model family -> published Priority (Fast) API price relative to Standard,
- * proven uniform across every token component, context band, model, and
- * dated price epoch of the family before it is used. A non-uniform registry
+ * Canonical model -> published Priority (Fast) API price relative to Standard,
+ * proven uniform across every token component, eligible context band, and
+ * dated price epoch of that exact model before it is used. A non-uniform registry
  * throws here rather than shipping a wrong multiplier.
  */
 export function deriveFastModePriorityRatiosFromRegistry(
   cards = OPENAI_OFFICIAL_PRICE_CARDS,
 ) {
   const ratios = {};
-  for (const family of FAST_MODE_RATIO_FAMILIES) {
-    const pattern = new RegExp(`^${family.replaceAll(".", "\\.")}(?:$|-)`, "u");
-    const familyCards = cards.filter((card) => pattern.test(card.model));
-    const priorityCards = familyCards.filter((card) => card.service_tier === "priority");
-    if (priorityCards.length === 0) {
-      throw new TypeError(`No published Priority price cards for family ${family}.`);
-    }
+  const openAiCards = cards.filter((card) => card.provider === "openai");
+  const priorityModels = [...new Set(openAiCards.filter(
+    (card) => card.service_tier === "priority",
+  ).map((card) => card.model))].sort();
+  for (const model of priorityModels) {
+    const priorityCards = openAiCards.filter(
+      (card) => card.model === model && card.service_tier === "priority",
+    );
     let reference = null;
     let referenceLabel = null;
     for (const priorityCard of priorityCards) {
-      const standardCards = familyCards.filter((card) => (
+      const priorityComponents = tokenComponents(priorityCard);
+      if (new Set(priorityComponents.map((component) => component.usage_component)).size
+          !== priorityComponents.length) {
+        throw new TypeError(`Duplicate token component name on ${priorityCard.id}.`);
+      }
+      const standardCards = openAiCards.filter((card) => (
         card.service_tier === "standard"
-        && card.model === priorityCard.model
-        && (card.metadata?.total_input_context_band ?? null)
-          === (priorityCard.metadata?.total_input_context_band ?? null)
+        && matchingContext(card, priorityCard)
         && effectiveRangesOverlap(card, priorityCard)
       ));
       if (standardCards.length === 0) {
@@ -146,16 +159,34 @@ export function deriveFastModePriorityRatiosFromRegistry(
         );
       }
       for (const standardCard of standardCards) {
-        const standardAmounts = new Map(tokenComponents(standardCard)
-          .map((component) => [component.usage_component, component.price.amount]));
-        for (const component of tokenComponents(priorityCard)) {
-          const standardAmount = standardAmounts.get(component.usage_component);
-          if (standardAmount === undefined) {
+        const standardTokenComponents = tokenComponents(standardCard);
+        const standardComponents = new Map(standardTokenComponents
+          .map((component) => [component.usage_component, component]));
+        if (standardComponents.size !== standardTokenComponents.length) {
+          throw new TypeError(`Duplicate token component name on ${standardCard.id}.`);
+        }
+        if (standardComponents.size === 0
+            || priorityComponents.length !== standardComponents.size) {
+          throw new TypeError(`Token component coverage differs on ${priorityCard.id}/${standardCard.id}.`);
+        }
+        for (const component of priorityComponents) {
+          const standardComponent = standardComponents.get(component.usage_component);
+          if (standardComponent === undefined) {
             throw new TypeError(
               `${priorityCard.id} prices ${component.usage_component} that ${standardCard.id} does not.`,
             );
           }
-          const pair = ratioPair(component.price.amount, standardAmount);
+          if (component.unit !== standardComponent.unit
+              || component.unit !== "token"
+              || component.price.currency !== "USD"
+              || standardComponent.price.currency !== "USD"
+              || component.price.per !== standardComponent.price.per
+              || (decimalRational(component.price.per)?.digits ?? 0n) <= 0n
+              || JSON.stringify(component.conditions ?? {})
+                !== JSON.stringify(standardComponent.conditions ?? {})) {
+            throw new TypeError(`Token price units or conditions differ on ${priorityCard.id}/${component.usage_component}.`);
+          }
+          const pair = ratioPair(component.price.amount, standardComponent.price.amount);
           if (pair === null) {
             throw new TypeError(
               `Unusable price amounts on ${priorityCard.id}/${component.usage_component}.`,
@@ -166,43 +197,42 @@ export function deriveFastModePriorityRatiosFromRegistry(
             referenceLabel = `${priorityCard.id}/${component.usage_component}`;
           } else if (!sameRatio(reference, pair)) {
             throw new TypeError(
-              `Priority/Standard price ratio is not uniform for ${family}: `
+              `Priority/Standard price ratio is not uniform for ${model}: `
               + `${referenceLabel} vs ${priorityCard.id}/${component.usage_component}.`,
             );
           }
         }
       }
     }
-    ratios[family] = ratioNumber(reference);
+    ratios[model] = ratioNumber(reference);
   }
   return Object.freeze(ratios);
 }
 
-// Model family -> published Priority (Fast) API price ratio over Standard,
+// Canonical model -> published Priority (Fast) API price ratio over Standard,
 // derived from the price registry on load. Any family absent from this map
 // is priced with the disclosed assumed multiplier below, never a silent 1.0.
 export const FAST_MODE_QUOTA_MULTIPLIERS = deriveFastModePriorityRatiosFromRegistry();
 
 // Owner-approved default for Fast usage on a model without a published
 // Priority rate: include it at 2x Standard and disclose the assumption. 2x
-// matches every published GPT-5.6/GPT-5.4-family and Codex-variant Priority
-// row; only GPT-5.5 (2.5x) differs among Codex models.
+// remains an assumption, including when a known model has no Priority card
+// for the actual event context or date.
 export const FAST_MODE_ASSUMED_MULTIPLIER = 2;
 
 export const FAST_MODE_ASSUMED_MULTIPLIER_SOURCE = Object.freeze({
   basis: "assumed_priority_price_ratio_for_models_without_published_priority_rates",
   statement:
-    "Fast usage on a model with no published Priority rate is included at an assumed 2x Standard and reported separately, instead of being excluded or silently counted at 1x.",
+    "Fast usage without an eligible published Priority rate for its exact model, context, and date is included at an assumed 2x Standard and reported separately, instead of being excluded or silently counted at 1x.",
   recordedAt: FAST_MODE_MULTIPLIER_RECORDED_AT,
 });
 
 // Fixed bucket keys for the Standard-priced cost crossing that feeds the
-// weighting. "unsupported" is the explicit bucket for every model outside the
-// three published Fast families.
+// weighting. Canonical models are a closed registry-derived set; aliases fold
+// into their reviewed target, not a prefix family. "unsupported" is the
+// explicit assumed-rate bucket, including uncovered event contexts/epochs.
 export const FAST_MODE_MODEL_FAMILY_KEYS = Object.freeze([
-  "gpt-5.6",
-  "gpt-5.5",
-  "gpt-5.4",
+  ...Object.keys(FAST_MODE_QUOTA_MULTIPLIERS),
   "unsupported",
 ]);
 
@@ -264,7 +294,7 @@ export const QUOTA_WEIGHTED_API_PRICE_METRIC = Object.freeze({
   standardMetricKey: "apiPriceEquivalentUsd",
   standardMetricLabel: "Standard-rate API-price equivalent",
   explainer:
-    "Standard-rate API prices, with increments that ran in Fast mode priced at the published Priority (Fast) API rate for the model family: 2x Standard for GPT-5.6 and GPT-5.4, 2.5x for GPT-5.5, and a disclosed assumed 2x for models without a published Priority rate. It tracks relative quota consumption, not a bill.",
+    "Standard-rate API prices, with Fast increments priced at the published Priority API rate for the exact model, context, and date. Where no eligible Priority rate exists, a disclosed assumed 2x Standard is used. This is a comparison, not a bill.",
 });
 
 // Named thresholds for the secondary residual inference. Every one of these is
@@ -281,9 +311,9 @@ export const FAST_MODE_RESIDUAL_INFERENCE_THRESHOLDS = Object.freeze({
   maximumReferenceFastFractionOfKnown: 0.05,
   minimumReferenceWindows: 3,
   // The observed-to-Standard-predicted movement ratio must land inside this
-  // relative band around a published multiple. 0.10 keeps the 2.0 and 2.5
-  // bands disjoint ([1.8, 2.2] and [2.25, 2.75]), so a window can never match
-  // both; a window matching more than one multiple is reported ambiguous.
+  // relative band around a published multiple. The 1.7, 1.75 and 1.8 ratios
+  // have overlapping bands: a window matching more than one published
+  // multiple is explicitly ambiguous, never attributed to a convenient one.
   relativeToleranceOfPublishedMultiple: 0.1,
 });
 
@@ -294,14 +324,30 @@ export const FAST_MODE_RESIDUAL_INFERENCE_REASON_CODES = Object.freeze([
   "windows_unavailable",
 ]);
 
-const FAST_MODE_FAMILY_PATTERNS = Object.freeze(
-  Object.keys(FAST_MODE_QUOTA_MULTIPLIERS).map((family) => Object.freeze({
-    family,
-    // Exact family, then end-of-name or a "-" suffix. "gpt-5.60" and
-    // "gpt-5.4future" are deliberately not members of any family.
-    pattern: new RegExp(`^${family.replaceAll(".", "\\.")}(?:$|-)`, "u"),
-  })),
-);
+const REGISTERED_MODEL_NAMES = new Map();
+const REGISTERED_STANDARD_CARDS = new Map();
+const REGISTERED_STANDARD_CARDS_BY_MODEL = new Map();
+const REGISTERED_PRIORITY_CARDS = new Map();
+for (const card of OPENAI_OFFICIAL_PRICE_CARDS) {
+  for (const name of [card.model, ...(card.aliases ?? [])]) {
+    const prior = REGISTERED_MODEL_NAMES.get(name);
+    if (prior !== undefined && prior !== card.model) {
+      throw new TypeError(`Ambiguous registered Priority model name: ${name}.`);
+    }
+    REGISTERED_MODEL_NAMES.set(name, card.model);
+  }
+  if (card.service_tier === "standard") {
+    REGISTERED_STANDARD_CARDS.set(card.id, card);
+    const cards = REGISTERED_STANDARD_CARDS_BY_MODEL.get(card.model) ?? [];
+    cards.push(card);
+    REGISTERED_STANDARD_CARDS_BY_MODEL.set(card.model, cards);
+  }
+  if (card.service_tier === "priority") {
+    const cards = REGISTERED_PRIORITY_CARDS.get(card.model) ?? [];
+    cards.push(card);
+    REGISTERED_PRIORITY_CARDS.set(card.model, cards);
+  }
+}
 
 const PUBLISHED_MULTIPLES = Object.freeze(
   [...new Set(Object.values(FAST_MODE_QUOTA_MULTIPLIERS))].sort(
@@ -331,28 +377,67 @@ function median(values) {
 }
 
 /**
- * The published Fast model family a model name belongs to, or null when the
- * model is outside the three families Fast supports.
+ * The exact registered model (including reviewed aliases), or null when no
+ * Priority card supports it. With event evidence, a published classification
+ * additionally requires an eligible context and effective date. Omitting
+ * evidence is a model-capability lookup only, not event-pricing authority.
  */
-export function fastModeModelFamily(model) {
+export function fastModeModelFamily(model, evidence = undefined) {
   if (typeof model !== "string") return null;
-  for (const { family, pattern } of FAST_MODE_FAMILY_PATTERNS) {
-    if (pattern.test(model)) return family;
+  const canonicalModel = REGISTERED_MODEL_NAMES.get(model);
+  if (!Object.hasOwn(FAST_MODE_QUOTA_MULTIPLIERS, canonicalModel ?? "")) return null;
+  if (evidence === undefined) return canonicalModel;
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)
+      || Object.keys(evidence).some((key) => ![
+        "eventTime", "totalInputContextTokens", "standardPriceCardIds",
+      ].includes(key))) return null;
+  const eventTime = evidence.eventTime;
+  if (typeof eventTime !== "string" || eventTime.length > 32
+      || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/u.test(eventTime)
+      || !Number.isFinite(Date.parse(eventTime))) return null;
+  const day = new Date(eventTime).toISOString().slice(0, 10);
+  if (day !== eventTime.slice(0, 10)) return null;
+  const coversDay = (card) => (card.effective?.from ?? "0000-00-00") <= day
+    && day <= (card.effective?.to ?? "9999-99-99");
+  const context = evidence.totalInputContextTokens;
+  const contextProvided = context !== null && context !== undefined;
+  if (contextProvided && (!Number.isSafeInteger(context) || context < 0)) return null;
+  const contextBand = contextProvided ? context >= 272_000 ? "long" : "short" : null;
+  const matchingBand = (card) => {
+    const cardBand = card.metadata?.total_input_context_band ?? null;
+    return cardBand === null || cardBand === contextBand;
+  };
+  const priorityCards = REGISTERED_PRIORITY_CARDS.get(canonicalModel).filter(coversDay);
+  if (evidence.standardPriceCardIds !== undefined) {
+    const ids = evidence.standardPriceCardIds;
+    if (!Array.isArray(ids) || ids.length === 0 || ids.length > 8) return null;
+    for (const id of ids) {
+      const standard = REGISTERED_STANDARD_CARDS.get(id);
+      if (!standard || standard.model !== canonicalModel || !coversDay(standard)
+          || (contextProvided && !matchingBand(standard))
+          || !priorityCards.some((priority) => matchingContext(standard, priority))) {
+        return null;
+      }
+    }
+    return canonicalModel;
   }
-  return null;
+  return priorityCards.some((priority) => matchingBand(priority)
+    && REGISTERED_STANDARD_CARDS_BY_MODEL.get(canonicalModel).some(
+      (standard) => coversDay(standard) && matchingContext(standard, priority),
+    )) ? canonicalModel : null;
 }
 
 /**
- * The published Fast credit rate for a model, or null when the model has no
- * published Fast rate. Callers must treat null as unknown; it is never 1.
+ * The published Priority/Standard price ratio for a registered model (and,
+ * when supplied, its event evidence), or null. Null is never silently 1.
  */
-export function fastModeQuotaMultiplier(model) {
-  const family = fastModeModelFamily(model);
+export function fastModeQuotaMultiplier(model, evidence = undefined) {
+  const family = fastModeModelFamily(model, evidence);
   return family === null ? null : FAST_MODE_QUOTA_MULTIPLIERS[family];
 }
 
-export function fastModeModelFamilyKey(model) {
-  return fastModeModelFamily(model) ?? "unsupported";
+export function fastModeModelFamilyKey(model, evidence = undefined) {
+  return fastModeModelFamily(model, evidence) ?? "unsupported";
 }
 
 /**
@@ -409,6 +494,9 @@ export function quotaWeightedApiPriceEquivalent({
   apiPriceEquivalentUsd,
   model,
   mode,
+  eventTime,
+  totalInputContextTokens,
+  standardPriceCardIds,
 } = {}) {
   if (!finiteNonNegative(apiPriceEquivalentUsd)) {
     return Object.freeze({
@@ -427,7 +515,9 @@ export function quotaWeightedApiPriceEquivalent({
   if (mode !== "fast") {
     return Object.freeze({ usd: null, multiplier: null, status: "unknown_mode" });
   }
-  const multiplier = fastModeQuotaMultiplier(model);
+  const multiplier = fastModeQuotaMultiplier(model, {
+    eventTime, totalInputContextTokens, standardPriceCardIds,
+  });
   if (multiplier === null) {
     return Object.freeze({
       usd: roundUsd(apiPriceEquivalentUsd * FAST_MODE_ASSUMED_MULTIPLIER),
