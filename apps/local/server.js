@@ -3477,19 +3477,41 @@ function createPreparedLocalCompanionServer({
   // converges such installs while keeping the oldest set: it is the instance
   // the approve-once consent was reviewed against. Failures are swallowed —
   // the next launch retries, and delivery state is never touched.
-  const maybeRetireSupersededPreparedSets = async () => {
-    const verdict = await incrementalConsentVerdict();
-    if (verdict?.approved !== true || verdict?.current !== true) return;
-    try {
-      await runSupersededContributionRetirement({});
-    } catch {
-      // Bounded cleanup only; the queue converges on a later pass.
+  let contributionRuntimeStart = null;
+  let contributionRuntimeShutdown = null;
+  let supersededContributionRetirementPending = null;
+  let supersededContributionRetirementRequested = false;
+  const maybeRetireSupersededPreparedSets = () => {
+    if (contributionRuntimeShutdown !== null) return Promise.resolve();
+    supersededContributionRetirementRequested = true;
+    if (supersededContributionRetirementPending === null) {
+      supersededContributionRetirementPending = Promise.resolve().then(async () => {
+        // Overlapping triggers share one writer and at most one queued pass.
+        // Re-read consent on a queued pass: an approval can arrive while the
+        // startup probe is still returning its pre-consent verdict.
+        try {
+          while (supersededContributionRetirementRequested
+              && contributionRuntimeShutdown === null) {
+            supersededContributionRetirementRequested = false;
+            const verdict = await incrementalConsentVerdict();
+            if (contributionRuntimeShutdown !== null) return;
+            if (verdict?.approved !== true || verdict?.current !== true) continue;
+            try {
+              await runSupersededContributionRetirement({});
+            } catch {
+              // Bounded cleanup only; the queue converges on a later pass.
+            }
+          }
+        } finally {
+          supersededContributionRetirementPending = null;
+        }
+      });
     }
+    return supersededContributionRetirementPending;
   };
   let automaticContributionRetirementLock = null;
   let automaticContributionRetirementLockRelease = null;
   let automaticContributionRetirement = null;
-  let contributionRuntimeShutdown = null;
   let instanceLockPromise = null;
   let snapshotPromise = null;
   // Building the first snapshot reads the whole retained collector state, which
@@ -3511,14 +3533,22 @@ function createPreparedLocalCompanionServer({
   };
   const shutdownContributionRuntime = () => {
     if (contributionRuntimeShutdown === null) {
-      contributionRuntimeShutdown = (async () => {
+      // Publish the shutdown fence before calling any asynchronous producer.
+      contributionRuntimeShutdown = Promise.resolve().then(async () => {
+        // A start already in flight can persist settings and arm a timer.
+        // Drain only that start before stopping, never the snapshot promise:
+        // snapshot initialization can itself fail into this shutdown path.
+        await contributionRuntimeStart?.catch(() => {});
         try {
           await incrementalContribution?.stop();
         } catch {
           onError("incremental_contribution_stop_failed");
         }
+        // Retirement includes its consent probe and may still write private
+        // state. Keep the instance lock until that accepted work has settled.
+        await supersededContributionRetirementPending?.catch(() => {});
         await releaseAutomaticContributionRetirementLock();
-      })();
+      });
     }
     return contributionRuntimeShutdown;
   };
@@ -3562,12 +3592,19 @@ function createPreparedLocalCompanionServer({
           // The v1.0 incremental sync remains the only contribution scheduler.
           // A failure here must never take the local dashboard down.
           try {
-            await incrementalContribution?.start();
+            if (contributionRuntimeShutdown === null) {
+              contributionRuntimeStart = Promise.resolve().then(() => {
+                if (contributionRuntimeShutdown === null) {
+                  return incrementalContribution?.start();
+                }
+              });
+              await contributionRuntimeStart;
+            }
           } catch {
             onError("incremental_contribution_start_failed");
           }
-          // Fire-and-forget: superseded v0.1 sets are cleanup, not readiness,
-          // so the snapshot never waits on (or fails with) the pass.
+          // Superseded v0.1 sets are cleanup, not readiness: only shutdown
+          // drains the tracked pass, so the snapshot never waits on it.
           void maybeRetireSupersededPreparedSets().catch(() => {});
           snapshotState = { status: "ready", errorCode: null };
           announceSnapshotOutcome();
