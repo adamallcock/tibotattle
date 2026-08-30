@@ -51,9 +51,6 @@ import {
   runIncrementalContributionSyncOnce,
 } from "../../src/contribution-incremental-sync.js";
 import {
-  createFastModePreferenceController,
-} from "../../src/fast-mode-preference.js";
-import {
   HostedSignInHandoffError,
   createHostedSignInHandoffController,
 } from "../../src/hosted-signin-handoff.js";
@@ -135,9 +132,6 @@ import {
   RELEASE_VERSION,
   RELEASE_VERSION_PLACEHOLDER,
 } from "../../config/release-manifest.js";
-import {
-  FAST_MODE_PREFERENCE_VALUES,
-} from "@app-usagemonitor/accounting";
 import {
   validateTelemetryContribution,
 } from "@app-usagemonitor/telemetry-contract";
@@ -579,7 +573,6 @@ const DIAGNOSTIC_SURFACES = new Set([
   "contribution_prepare",
   "contribution_send",
   "device_credential_reset",
-  "fast_mode_preference",
   "hosted_identity",
   "hosted_privacy",
   "local_refresh",
@@ -699,7 +692,6 @@ const API_ROUTES = new Set([
   "/api/local/contribution/incremental-status",
   "/api/local/contribution/incremental-approve",
   "/api/local/contribution/incremental-run",
-  "/api/local/accounting/fast-mode-preference",
 ]);
 
 // Routes that do not read the Codex dashboard snapshot must answer while that
@@ -1462,31 +1454,6 @@ async function readBoundedJsonObject(request) {
 function boundedRequestStatus(error) {
   if (error?.code === "unsupported_media_type") return 415;
   return error?.code === "request_too_large" ? 413 : 400;
-}
-
-async function authorizeFastModePreference(request, response) {
-  if (!sameOrigin(request)
-      || request.headers["x-usage-monitor-local"] !== "1") {
-    sendError(response, 403, "fast_mode_preference_not_authorized");
-    return null;
-  }
-  let value;
-  try {
-    value = await readBoundedJsonObject(request);
-  } catch (error) {
-    sendError(
-      response,
-      boundedRequestStatus(error),
-      error.code ?? "invalid_request",
-    );
-    return null;
-  }
-  if (Object.keys(value).sort().join("\0") !== "mode"
-      || !FAST_MODE_PREFERENCE_VALUES.includes(value.mode)) {
-    sendError(response, 400, "invalid_request");
-    return null;
-  }
-  return Object.freeze({ mode: value.mode });
 }
 
 async function authorizeDiagnosticNote(request, response) {
@@ -2790,9 +2757,6 @@ function createPreparedLocalCompanionServer({
   // legacy is retained only for an explicit rollback selection.
   accountingSourceMode =
     configuredAccountingSourceMode(environment),
-  fastModePreference = createFastModePreferenceController({
-    settingsFile: statePaths.fastModePreferenceFile,
-  }),
   // The declared Codex speed-mode baseline. Codex records the mode only when
   // it is applied or changed, never at session start, so the baseline lives
   // nowhere but the configuration's top-level `service_tier` key - and only
@@ -2836,11 +2800,6 @@ function createPreparedLocalCompanionServer({
       developmentSideChatHistoricalGapAssumedSpeed:
         environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_SPEED
           ?? "fast",
-      // The owner's stated Codex speed mode. It attributes only the turns that
-      // precede the first recorded tier change in their session; an observed
-      // tier always wins. A missing or unreadable statement degrades to the
-      // Standard default rather than inventing a Fast attribution.
-      fastModePreference: await fastModePreference.readMode(),
       // Timestamped declared baselines. They fill only the turns the rollout
       // log left unobserved and that a reading actually covers; an observed
       // tier always wins, and an unreadable ledger is simply no coverage.
@@ -4215,45 +4174,6 @@ function createPreparedLocalCompanionServer({
           configured: true,
           keychainPrompt: keychainPromptSurface(),
         }));
-        return;
-      }
-      if (path === "/api/local/accounting/fast-mode-preference") {
-        if (request.method === "GET") {
-          try {
-            send(response, 200, await fastModePreference.inspect());
-          } catch {
-            sendError(response, 500, "fast_mode_preference_unavailable");
-          }
-          return;
-        }
-        if (request.method !== "POST") {
-          sendError(response, 405, "method_not_allowed");
-          return;
-        }
-        const selection = await authorizeFastModePreference(request, response);
-        if (selection === null) return;
-        let updated;
-        try {
-          updated = await fastModePreference.select(selection.mode);
-        } catch (error) {
-          sendError(
-            response,
-            error?.code === "fast_mode_preference_invalid" ? 400 : 500,
-            error?.code === "fast_mode_preference_invalid"
-              ? "fast_mode_preference_invalid"
-              : "fast_mode_preference_unavailable",
-          );
-          return;
-        }
-        // The accounting projection is derived from this statement, so the
-        // cached snapshot is rebuilt before the response is acknowledged.
-        try {
-          await dataStore.reload();
-        } catch {
-          // A stale snapshot is not a reason to lose the stored preference;
-          // the next refresh picks it up.
-        }
-        send(response, 200, updated);
         return;
       }
       if (path === "/api/local/contribution/sync-status") {

@@ -56,7 +56,7 @@ test("windowed repricing groups by model and speed with a real priced cost", () 
   assert.equal(summary.byModel.length, 2);
   assert.equal(summary.byModel[0].model, "gpt-5.6-sol");
   assert.equal(summary.byModel[0].events, 2);
-  assert.equal(summary.byModel[0].fastModeMultiplier, 2.5);
+  assert.equal(summary.byModel[0].fastModeMultiplier, 2);
   assert.equal(summary.byModel[1].model, "gpt-5.4-mini");
   assert.equal(summary.byModel[1].events, 1);
 

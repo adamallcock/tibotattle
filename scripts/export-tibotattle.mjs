@@ -174,7 +174,6 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/export/workspace-discard-contract.js",
   "src/export/workspace-discard-schema.js",
   "src/export/workspace-runtime.js",
-  "src/fast-mode-preference.js",
   "src/has-exact-enumerable-keys.js",
   "src/incremental-contribution.js",
   "src/local-analysis-extract-worker.js",

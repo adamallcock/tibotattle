@@ -65,8 +65,8 @@ test("tier declaration rejects cross-surface conflation", () => {
   }), /may not declare an API service tier/);
 });
 
-test("Fast sensitivity applies documented model-specific quota weights and never selects unknown", () => {
-  assert.equal(fastQuotaMultiplier("gpt-5.6-sol"), 2.5);
+test("Fast sensitivity applies published Priority price ratios and never selects unknown", () => {
+  assert.equal(fastQuotaMultiplier("gpt-5.6-sol"), 2);
   assert.equal(fastQuotaMultiplier("gpt-5.5-codex"), 2.5);
   assert.equal(fastQuotaMultiplier("gpt-5.4"), 2);
   assert.equal(fastQuotaMultiplier("gpt-4.1"), null);
@@ -76,13 +76,16 @@ test("Fast sensitivity applies documented model-specific quota weights and never
   });
   assert.equal(result.selectedScenario, null);
   assert.equal(result.scenarios.standard.weightedStandardApiEquivalentUsd, 15);
-  assert.equal(result.scenarios.fast.weightedStandardApiEquivalentUsd, 35);
+  // 10 x 2 + 5 x 2 at the published GPT-5.6 and GPT-5.4 Priority ratios.
+  assert.equal(result.scenarios.fast.weightedStandardApiEquivalentUsd, 30);
 });
 
-test("unsupported Fast models make the total scenario incomplete instead of silently using one times", () => {
+test("unsupported Fast models are included at the disclosed assumed ratio instead of excluded", () => {
   const result = subscriptionSpeedSensitivity({ "future-model": { costUsd: 7 } }, "fast");
   assert.equal(result.selectedScenario, "fast");
-  assert.equal(result.scenarios.fast.complete, false);
-  assert.equal(result.scenarios.fast.weightedStandardApiEquivalentUsd, null);
-  assert.equal(result.scenarios.fast.unsupportedStandardApiEquivalentUsd, 7);
+  assert.equal(result.scenarios.fast.complete, true);
+  // 7 x 2 assumed, with the assumption reported apart.
+  assert.equal(result.scenarios.fast.weightedStandardApiEquivalentUsd, 14);
+  assert.equal(result.scenarios.fast.assumedRatioStandardApiEquivalentUsd, 7);
+  assert.equal(result.scenarios.fast.assumedRatioMultiplier, 2);
 });

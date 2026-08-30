@@ -4,7 +4,7 @@
   "entries": [
     {
       "file": "apps/local/server.test.mjs",
-      "win32BranchCount": 4,
+      "win32BranchCount": 3,
       "classification": "posix-only-assertion",
       "followUp": "Replace omitted owner-mode and development identity assertions with Windows ACL contract tests."
     },

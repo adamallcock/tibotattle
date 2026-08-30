@@ -12,10 +12,11 @@ export {
 export {
   CODEX_SPEED_MODE_DECLARATION,
   CODEX_SPEED_MODE_OBSERVABILITY,
-  DEFAULT_FAST_MODE_PREFERENCE,
+  DEFAULT_UNRESOLVED_SPEED_SCENARIO,
+  FAST_MODE_ASSUMED_MULTIPLIER,
+  FAST_MODE_ASSUMED_MULTIPLIER_SOURCE,
   FAST_MODE_MODEL_FAMILY_KEYS,
   FAST_MODE_MULTIPLIER_SOURCE,
-  FAST_MODE_PREFERENCE_VALUES,
   FAST_MODE_QUOTA_MULTIPLIERS,
   OBSERVED_SPEED_MODE_KEYS,
   QUOTA_WEIGHTED_API_PRICE_METRIC,
@@ -23,7 +24,6 @@ export {
   fastModeModelFamilyKey,
   fastModeQuotaMultiplier,
   inferFastModeFromCalibrationWindows,
-  isFastModePreference,
   resolveEffectiveSpeedMode,
   summarizeQuotaWeightedAccounting,
 } from "./src/subscription-speed.js";

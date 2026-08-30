@@ -264,8 +264,6 @@ let lastReindexProgressReceipt = null;
 // the same GET the page performs on load.
 let incrementalSyncPollTimer = null;
 let incrementalSyncPollCount = 0;
-let fastModePreference = null;
-let fastModePreferenceBusy = false;
 let localOnboarding = null;
 let communityConnectBusy = false;
 // True once this Mac has actually been paired as an upload-only device in
@@ -1390,7 +1388,7 @@ function renderPricing(data) {
   }
   const fastMode = pricing.fastMode;
   setRawText($("#cost-period"), pricing.periodLabel);
-  // The headline is the quota-weighted figure whenever a weighting exists;
+  // The headline is the speed-priced figure whenever a weighting exists;
   // when nothing can be weighted legitimately the label falls back to the
   // Standard-rate name rather than presenting an unweighted number under a
   // weighted heading.
@@ -4044,7 +4042,7 @@ function liveTimelinePoints(
       cumulativeResidual,
       driftReanchor,
       // Kept under the legacy internal key for downstream chart diagnostics,
-      // but this is now the selected quota-weighted amount, never Standard
+      // but this is now the selected speed-priced amount, never Standard
       // dollars paired with a Fast-adjusted capacity.
       apiCostUsd: windowWeightingGaps === 0 ? windowCostUsd : null,
       allowanceWeightedUsd: windowWeightingGaps === 0
@@ -4393,10 +4391,10 @@ function renderUsageTimeline(data) {
     ],
     [
       quotaComparable
-        ? "Quota-weighted API equivalent"
+        ? "Speed-priced API equivalent"
         : "Standard-rate API-price equivalent",
       quotaComparable
-        ? "Standard API prices adjusted by the observed or selected Codex speed mode, compared only with a capacity fitted on the same basis. It is not a bill."
+        ? "Standard API prices with Fast increments priced at the published Priority (Fast) API rate, compared only with a capacity fitted on the same basis. It is not a bill."
         : "A Standard-rate accounting series. Provider allowance is hidden because no matching weighted capacity is available.",
       total === null ? "—" : formatApiMoney(total)
     ]
@@ -4565,7 +4563,7 @@ function selectedTimelinePoints(data) {
               totalEvents: 0,
               observedEvents: 0,
               declaredFromConfigEvents: 0,
-              assumedFromPreferenceEvents: 0,
+              assumedEvents: 0,
               inferredEvents: 0,
               unknownEvents: 0,
               observedSharePercent: null,
@@ -4589,7 +4587,7 @@ function selectedTimelinePoints(data) {
   });
   // Retained gradient artifacts carry only Standard-rate rolling cost. They
   // can remain historical evidence elsewhere, but may never replace the
-  // quota-weighted allowance comparison. An unavailable weighted live series
+  // speed-priced allowance comparison. An unavailable weighted live series
   // therefore stays unavailable instead of silently drawing the old red line.
   const selection = {
     points: livePoints,
@@ -9625,6 +9623,26 @@ function renderAccounting(data) {
     );
     summary.append(card);
   }
+  // Speed-mode attribution disclosure. The former preference control is gone
+  // (the speed mode is Codex's own toggle), so the coverage split and the
+  // diagnostic inference verdict live directly beside the number they explain,
+  // together with any assumed-ratio share.
+  if (staleRow === null) {
+    const attributionNote = node("p", "annotation accounting-speed-coverage");
+    const sentences = [
+      fastModeCoverageSentence(fastMode),
+      fastModeInferenceSentence(fastMode),
+    ];
+    if (fastMode.assumedRatioStandardApiPriceEquivalentUsd > 0) {
+      sentences.push(t("accounting.fastMode.assumedRatio", {
+        amount: formatApiMoney(
+          fastMode.assumedRatioStandardApiPriceEquivalentUsd,
+        ),
+      }));
+    }
+    attributionNote.textContent = sentences.join(" ");
+    summary.append(attributionNote);
+  }
   const cacheSwitchImpact = accounting.cacheSwitchImpact;
   const cacheSwitchCard = node("article", "metric-card compact-metric");
   const cacheSwitchLabel = node("span", "metric-name");
@@ -10103,7 +10121,7 @@ function fastModeCoverageSentence(fastMode) {
       count: compact(coverage.observedEvents),
     }),
     t("accounting.fastMode.stated", {
-      count: compact(coverage.assumedFromPreferenceEvents),
+      count: compact(coverage.assumedEvents),
     }),
     t("accounting.fastMode.inferred", {
       count: compact(coverage.inferredEvents),
@@ -10148,56 +10166,6 @@ function fastModeInferenceSentence(fastMode) {
   });
 }
 
-function renderFastModePreference() {
-  const controls = $("#fast-mode-preference-controls");
-  const coverage = $("#fast-mode-coverage");
-  if (!controls || !coverage) return;
-  const accounting = dashboard === null ? null : accountingPeriod(dashboard);
-  const stated = fastModePreference?.mode
-    ?? accounting?.fastMode?.preference
-    ?? "standard";
-  for (const control of controls.querySelectorAll("[data-fast-mode]")) {
-    const active = control.dataset.fastMode === stated;
-    control.classList.toggle("active", active);
-    control.setAttribute("aria-pressed", String(active));
-    control.disabled = fastModePreferenceBusy;
-  }
-  if (accounting === null) {
-    setProductText(coverage, "Awaiting local evidence.");
-    return;
-  }
-  coverage.textContent = [
-    fastModeCoverageSentence(accounting.fastMode),
-    fastModeInferenceSentence(accounting.fastMode),
-  ].join(" ");
-}
-
-async function selectFastModePreference(mode) {
-  if (fastModePreferenceBusy) return;
-  const status = $("#fast-mode-preference-status");
-  fastModePreferenceBusy = true;
-  status.hidden = false;
-  status.className = "participant-action-status";
-  status.textContent = "Saving your Codex speed mode…";
-  renderFastModePreference();
-  try {
-    fastModePreference = await localClient.selectFastModePreference(mode);
-    status.textContent = fastModePreference.mode === "mixed_unknown"
-      ? "Saved. Increments with an observed tier keep it; the rest stay unknown unless residual inference can label their calibration window."
-      : `Saved. Increments with an observed tier keep it; the rest are now weighted as ${fastModePreference.mode === "fast" ? "Fast" : "Standard"}.`;
-    await refreshDashboardAfterFastModeChange();
-  } catch (error) {
-    await showFailure(status, {
-      surface: "fast_mode_preference",
-      error,
-      fallback:
-        "Your Codex speed mode could not be saved. Nothing was assumed; check the local companion and try again."
-    });
-  } finally {
-    fastModePreferenceBusy = false;
-    renderFastModePreference();
-  }
-}
 
 function renderContributionSyncStatus(status) {
   const value = status ?? {
@@ -10819,12 +10787,11 @@ async function loadLocalDashboard() {
         }
       }
     };
-    const [data, sync, localHealth, onboarding, speedPreference, refreshState] = await Promise.all([
+    const [data, sync, localHealth, onboarding, refreshState] = await Promise.all([
       loadDashboardData(),
       syncState,
       localClient.health().catch(() => null),
       localClient.onboarding().catch(() => null),
-      localClient.fastModePreference().catch(() => null),
       localClient.refreshStatus().catch(() => null)
     ]);
     // A read that did not land says nothing about the companion, so it may not
@@ -10832,7 +10799,6 @@ async function loadLocalDashboard() {
     // follows. Only the unavailable-state decision below reads THIS load's
     // answer, because that is the one it is reporting on.
     if (localHealth !== null) localCompanionHealth = localHealth;
-    fastModePreference = speedPreference;
     if (refreshState !== null) {
       accountingRebuildDeferral =
         refreshState?.refresh?.result?.accountingRebuildDeferred ?? null;
@@ -10905,19 +10871,6 @@ async function loadQuickResultDashboard() {
   const data = await localClient.load();
   renderDashboard(data);
   if (localOnboarding) renderLocalOnboarding(localOnboarding);
-}
-
-/**
- * The accounting projection is derived from the stated speed mode, so the
- * overview is re-read after it changes. A failed re-read leaves the previous
- * numbers on screen rather than blanking them.
- */
-async function refreshDashboardAfterFastModeChange() {
-  try {
-    renderDashboard(await localClient.load());
-  } catch {
-    renderFastModePreference();
-  }
 }
 
 /**
@@ -11569,12 +11522,6 @@ const LOCAL_COMPANION_ERROR_COPY = {
     "The local companion could not complete the contribution pass. Anything not accepted stays queued locally.",
   refresh_in_progress:
     "A local analysis is already running. Wait for it to finish before starting another.",
-  fast_mode_preference_unavailable:
-    "The local companion could not read or write your Codex speed mode. No mode was assumed and the accounting is unchanged.",
-  fast_mode_preference_invalid:
-    "That Codex speed mode is not one this build accepts. Nothing was stored.",
-  fast_mode_preference_not_authorized:
-    "The local companion refused this request because it did not arrive from the local dashboard. Nothing was stored.",
   // Codes the local app can return that previously had no sentence here.
   // Everything below describes this Mac, so none of it sends the reader
   // looking at the network or at the contribution service.

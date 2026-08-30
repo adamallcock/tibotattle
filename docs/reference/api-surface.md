@@ -112,7 +112,6 @@ is never an arbitrary local proxy.
 | `GET` | `/api/local/contribution/incremental-status` | Dashboard | Loopback read | Reads v1 incremental consent/cursor/retry state. | Contribution sync |
 | `POST` | `/api/local/contribution/incremental-approve` | Dashboard | Loopback mutation | Records current consent after exact local review and schedules the first due pass. | Contribution sync |
 | `POST` | `/api/local/contribution/incremental-run` | Dashboard | Loopback mutation | Resets bounded retry backoff and asks the consent-gated controller to run now. | Contribution sync |
-| `GET`, `POST` | `/api/local/accounting/fast-mode-preference` | Dashboard | Loopback mutation | Reads or stores an explicit local accounting mode and rebuilds the derived snapshot. | Accounting |
 
 ## Fixed report pages
 

@@ -174,7 +174,7 @@ test("analyzer classifies effective changes and prices the conservative warm cou
   assert.equal(
     period.allowanceWeighting.scenarios.unresolved_as_fast
       .quotaWeightedPremiumUsd,
-    0.0000235,
+    0.0000188,
   );
   assert.equal(
     period.allowanceWeighting.scenarios.unresolved_as_standard
@@ -242,8 +242,11 @@ test("cache premiums preserve observed speed, then declarations, then scenario f
   const fast = period.allowanceWeighting.scenarios.unresolved_as_fast;
 
   assert.equal(period.standardApiPremiumUsd, 0.0000376);
-  assert.equal(standard.quotaWeightedPremiumUsd, 0.0000658);
-  assert.equal(fast.quotaWeightedPremiumUsd, 0.0000799);
+  // 1x observed Standard + 2x observed Fast + 2x declared Fast + the
+  // scenario-attributed drop: x6 of one drop under the Standard scenario and
+  // x7 under the Fast scenario, at the published GPT-5.6 ratio of 2.
+  assert.equal(standard.quotaWeightedPremiumUsd, 0.0000564);
+  assert.equal(fast.quotaWeightedPremiumUsd, 0.0000658);
   assert.deepEqual([
     standard.observedSpeedDrops,
     standard.declaredSpeedDrops,

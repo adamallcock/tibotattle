@@ -11,7 +11,7 @@ import {
 const ALLOWANCE_INTERPRETATION =
   "conditional_historical_estimate_not_provider_allowance";
 const ALLOWANCE_BASIS_FAMILY_ID =
-  "codex_primary:quota_weighted_api_equivalent:v1:fast_rates_2026_08_01:event_time:observed_declared_scenario";
+  "codex_primary:speed_priced_api_equivalent:v2:priority_price_ratio_2026_08_30:event_time:observed_declared_scenario";
 
 function allowanceBasisId(scenario) {
   return `${ALLOWANCE_BASIS_FAMILY_ID}:${scenario}`;

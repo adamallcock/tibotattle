@@ -46,7 +46,7 @@ function price({ provider, model, tier = "standard", pricedAt = "2026-07-26", co
 
 test("registry validates and preserves exact decimal strings and provenance", () => {
   assert.equal(validateOfficialPriceRegistry(), APP_OFFICIAL_PRICE_CARDS);
-  assert.equal(OPENAI_OFFICIAL_PRICE_CARDS.length, 62);
+  assert.equal(OPENAI_OFFICIAL_PRICE_CARDS.length, 122);
   assert.equal(ANTHROPIC_OFFICIAL_PRICE_CARDS.length, 13);
   const batch54 = OPENAI_OFFICIAL_PRICE_CARDS.find((card) => card.model === "gpt-5.4" && card.service_tier === "batch");
   assert.equal(batch54.components.find((item) => item.usage_component === "input_cache_read_tokens").price.amount, "0.13");
@@ -263,6 +263,95 @@ test("GPT-5.6 context bands apply exact official long multipliers and fail close
   }
 });
 
+test("GPT-5.6 Priority long-context rows price only from their published boundaries", () => {
+  // The Fast (priority) tab first showed long-context rates in the 2026-08-30
+  // review. Terra and Luna rows carry the 2026-07-30 repricing boundary; Sol's
+  // carries its own 2026-08-21 repricing boundary. Before each boundary the
+  // priority long context stays deliberately unpriced (asserted above at the
+  // default 2026-07-26 pricing date).
+  const expected = {
+    "gpt-5.6-terra": { pricedAt: "2026-08-01", total: "44" },
+    "gpt-5.6-luna": { pricedAt: "2026-08-01", total: "4.4" },
+    "gpt-5.6-sol": { pricedAt: "2026-08-22", total: "76" },
+  };
+  for (const [model, { pricedAt, total }] of Object.entries(expected)) {
+    const result = price({
+      provider: "openai",
+      model,
+      tier: "priority",
+      pricedAt,
+      totalInputTokens: 272_000,
+      components: { input_uncached_tokens: 1_000_000, output_text_tokens: 1_000_000 },
+    });
+    assert.equal(result.total, total, `${model}/priority/long/${pricedAt}`);
+    assert.equal(result.warnings.length, 0, `${model}/priority/long/${pricedAt}/warnings`);
+  }
+  const solBeforeBoundary = price({
+    provider: "openai",
+    model: "gpt-5.6-sol",
+    tier: "priority",
+    pricedAt: "2026-08-20",
+    totalInputTokens: 272_000,
+    components: { input_uncached_tokens: 1_000_000 },
+  });
+  assert.equal(solBeforeBoundary.total, "0");
+  assert.ok(solBeforeBoundary.warnings.some((warning) => warning.code === "long_context_rule_missing"));
+});
+
+test("GPT-5.6 Sol pricing changes at the owner-stated August 21 boundary", () => {
+  const components = { input_uncached_tokens: 1_000_000, output_text_tokens: 1_000_000 };
+  const cases = [
+    { tier: "standard", before: "35", after: "24" },
+    { tier: "batch", before: "17.5", after: "12" },
+    { tier: "priority", before: "70", after: "48" },
+  ];
+  for (const { tier, before, after } of cases) {
+    const closed = price({ provider: "openai", model: "gpt-5.6-sol", tier, pricedAt: "2026-08-20", totalInputTokens: 1000, components });
+    const open = price({ provider: "openai", model: "gpt-5.6-sol", tier, pricedAt: "2026-08-21", totalInputTokens: 1000, components });
+    assert.equal(closed.total, before, `sol/${tier}/2026-08-20`);
+    assert.equal(closed.warnings.length, 0, `sol/${tier}/2026-08-20/warnings`);
+    assert.equal(open.total, after, `sol/${tier}/2026-08-21`);
+    assert.equal(open.warnings.length, 0, `sol/${tier}/2026-08-21/warnings`);
+  }
+  // The Flex tab was not captured in the 2026-08-30 review, so Sol flex is
+  // priced through 2026-08-20 and deliberately unpriced afterwards.
+  const flexBefore = price({ provider: "openai", model: "gpt-5.6-sol", tier: "flex", pricedAt: "2026-08-20", totalInputTokens: 1000, components });
+  assert.equal(flexBefore.total, "17.5");
+  const flexAfter = price({ provider: "openai", model: "gpt-5.6-sol", tier: "flex", pricedAt: "2026-08-21", totalInputTokens: 1000, components });
+  assert.equal(flexAfter.total, "0");
+});
+
+test("second-table and Codex variant models price at their reviewed rates", () => {
+  const components = { input_uncached_tokens: 1_000_000, output_text_tokens: 1_000_000 };
+  const expected = [
+    ["gpt-5.2", "standard", "15.75"],
+    ["gpt-5.2", "priority", "31.5"],
+    ["gpt-5.1", "standard", "11.25"],
+    ["gpt-5.1", "priority", "22.5"],
+    ["gpt-5-mini", "priority", "4.05"],
+    ["gpt-5-nano", "standard", "0.45"],
+    ["gpt-4o", "priority", "21.25"],
+    ["o3", "batch", "5"],
+    ["gpt-5.3-codex", "standard", "15.75"],
+    ["gpt-5.2-codex", "standard", "15.75"],
+    ["gpt-5.1-codex", "standard", "11.25"],
+    // Owner-stated Priority row: 2x the Standard rates, matching base gpt-5.1.
+    ["gpt-5.1-codex", "priority", "22.5"],
+    ["gpt-5.1-codex-mini", "standard", "2.25"],
+    ["gpt-5-codex", "standard", "11.25"],
+  ];
+  for (const [model, tier, total] of expected) {
+    const result = price({ provider: "openai", model, tier, totalInputTokens: 1000, components });
+    assert.equal(result.total, total, `${model}/${tier}`);
+    assert.equal(result.warnings.length, 0, `${model}/${tier}/warnings`);
+  }
+  // Batch-only flagship extras keep their uncaptured tiers unpriced.
+  const batchOnly = price({ provider: "openai", model: "gpt-5.4-pro", tier: "batch", totalInputTokens: 1000, components });
+  assert.equal(batchOnly.total, "105");
+  const uncapturedStandard = price({ provider: "openai", model: "gpt-5.4-pro", tier: "standard", totalInputTokens: 1000, components });
+  assert.equal(uncapturedStandard.total, "0");
+});
+
 test("GPT-5.6 Terra and Luna pricing changes at the official July 30 boundary", () => {
   // Sol was not part of the 2026-07-30 repricing; its totals must not move.
   const expected = {
@@ -299,7 +388,7 @@ test("OpenAI service_tier fast is priced only as an explicitly labeled Priority 
   // Subscription speed modes still never reach the engine as API tiers; the
   // worker maps subscription usage to the Standard counterfactual first.
   const expected = {
-    "gpt-5.6-sol": { total: "10", cardSuffix: "short" },
+    "gpt-5.6-sol": { total: "10", cardSuffix: "short-through-2026-08-20" },
     "gpt-5.6-terra": { total: "4", cardSuffix: "short-from-2026-07-30" },
     "gpt-5.6-luna": { total: "0.4", cardSuffix: "short-from-2026-07-30" },
   };
@@ -318,7 +407,7 @@ test("OpenAI service_tier fast is priced only as an explicitly labeled Priority 
       priced_as: "priority",
       fallback: true,
       price_card_ids: [
-        `openai:${model}:priority:${cardSuffix}:official-observed-2026-08-01`,
+        `openai:${model}:priority:${cardSuffix}:official-observed-2026-08-30`,
       ],
     }, model);
   }

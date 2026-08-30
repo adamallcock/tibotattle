@@ -31,11 +31,14 @@ an exact local review and explicit send step.
   explicit uncertainty band.
 - **Timelines** — hourly/daily/weekly usage against allowance, entirely from
   local evidence.
-- **Fast-mode weighting** — Fast turns are counted at the provider's published
-  credit rates rather than as if they were Standard. Codex records the speed
-  mode only when it is applied or changed, so turns before the first change in
-  a session stay an explicit unknown and are excluded from the weighted total
-  instead of being quietly counted at 1x.
+- **Fast-mode pricing** — Codex Fast mode is the API's Priority processing
+  tier, so Fast turns are priced at the provider's published Priority (Fast)
+  API rates: 2x Standard for the GPT-5.6 and GPT-5.4 families, 2.5x for
+  GPT-5.5, and a clearly disclosed assumed 2x for models with no published
+  Priority rate. Codex records the speed mode only when it is applied or
+  changed, so turns before the first change in a session are attributed to
+  Standard as a visible assumption unless a timestamped configuration reading
+  covers them.
 - **A menu bar item** — where the allowance stands without opening the app,
   including a Check for Updates entry in builds that ship the updater.
 

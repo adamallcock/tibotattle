@@ -2385,8 +2385,6 @@ tbody tr:last-child td { border-bottom: 0; }
 .inventory-row:last-child { border-bottom: 0; }
 .inventory-row strong { font-size: .76rem; }
 .inventory-row p { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: .69rem; }
-.fast-mode-preference .segmented-control { margin-top: 10px; }
-.fast-mode-preference .annotation { margin-top: 8px; }
 .empty-inline { color: var(--muted); font-size: .76rem; }
 .advanced-calibration,
 .advanced-diagnostics,

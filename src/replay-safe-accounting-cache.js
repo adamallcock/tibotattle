@@ -1074,9 +1074,9 @@ function newPeriod(id, label, { includeSpark = true } = {}) {
     bySurface: emptyDimension(SURFACES),
     byAgentScope: emptyDimension(AGENT_SCOPES),
     byLineage: emptyDimension(LINEAGE),
-    // Observed speed mode crossed with the model's published Fast credit rate
-    // family. The crossing is what lets the owner's Fast-mode preference be
-    // applied at read time without rebuilding this cache.
+    // Observed speed mode crossed with the model's Priority (Fast) price-
+    // ratio family. The crossing is what lets the published ratio be applied
+    // at read time without rebuilding this cache.
     speedWeighting: emptySpeedWeightingCrossing(),
     // The same crossing, holding only the events the log left UNOBSERVED that
     // a timestamped Codex `service_tier` reading actually covers. Kept apart

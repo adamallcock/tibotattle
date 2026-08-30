@@ -5,11 +5,12 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import {
+  APP_OFFICIAL_PRICE_CARDS,
   CODEX_SPEED_MODE_DECLARATION,
   CODEX_SPEED_MODE_OBSERVABILITY,
-  DEFAULT_FAST_MODE_PREFERENCE,
+  FAST_MODE_ASSUMED_MULTIPLIER,
+  FAST_MODE_ASSUMED_MULTIPLIER_SOURCE,
   FAST_MODE_MULTIPLIER_SOURCE,
-  FAST_MODE_PREFERENCE_VALUES,
   FAST_MODE_QUOTA_MULTIPLIERS,
   QUOTA_WEIGHTED_API_PRICE_METRIC,
   emptySpeedWeightingCrossing,
@@ -20,15 +21,11 @@ import {
 } from "@app-usagemonitor/accounting";
 import {
   FAST_MODE_RESIDUAL_INFERENCE_THRESHOLDS,
+  deriveFastModePriorityRatiosFromRegistry,
   fastModeModelFamily,
   quotaWeightedApiPriceEquivalent,
 } from "../packages/accounting/src/subscription-speed.js";
 
-import {
-  FAST_MODE_PREFERENCE_SCHEMA_VERSION,
-  FastModePreferenceError,
-  createFastModePreferenceController,
-} from "../src/fast-mode-preference.js";
 import {
   CODEX_SPEED_BASELINE_SCHEMA_VERSION,
   createCodexSpeedBaselineController,
@@ -46,15 +43,44 @@ function crossing(cells) {
   return value;
 }
 
-test("published Fast credit rates are frozen, sourced, and dated", () => {
+test("published Priority (Fast) API price ratios are derived, sourced, and dated", () => {
+  // The published Priority API price is 2x Standard for GPT-5.6 and GPT-5.4
+  // and 2.5x for GPT-5.5 - notably NOT the superseded credit-rate statement's
+  // 2.5x for GPT-5.6.
   assert.deepEqual({ ...FAST_MODE_QUOTA_MULTIPLIERS }, {
-    "gpt-5.6": 2.5,
+    "gpt-5.6": 2,
     "gpt-5.5": 2.5,
     "gpt-5.4": 2,
   });
   assert.equal(Object.isFrozen(FAST_MODE_QUOTA_MULTIPLIERS), true);
+  // The map is derived from the price registry and re-deriving it is exact.
+  assert.deepEqual(
+    deriveFastModePriorityRatiosFromRegistry(),
+    { ...FAST_MODE_QUOTA_MULTIPLIERS },
+  );
+  // A registry whose Priority row is not a uniform multiple of Standard is
+  // refused rather than shipped as a wrong multiplier.
+  const skewed = structuredClone(
+    APP_OFFICIAL_PRICE_CARDS.filter((card) => card.provider === "openai"),
+  );
+  const target = skewed.find((card) => (
+    card.model === "gpt-5.5" && card.service_tier === "priority"
+  ));
+  target.components.find(
+    (component) => component.usage_component === "output_text_tokens",
+  ).price.amount = "76";
+  assert.throws(
+    () => deriveFastModePriorityRatiosFromRegistry(skewed),
+    /not uniform/,
+  );
   assert.equal(FAST_MODE_MULTIPLIER_SOURCE.publisher, "openai");
-  assert.equal(FAST_MODE_MULTIPLIER_SOURCE.recordedAt, "2026-08-01");
+  assert.equal(FAST_MODE_MULTIPLIER_SOURCE.recordedAt, "2026-08-30");
+  assert.equal(
+    FAST_MODE_MULTIPLIER_SOURCE.basis,
+    "published_priority_api_price_ratio_relative_to_standard",
+  );
+  assert.equal(FAST_MODE_ASSUMED_MULTIPLIER, 2);
+  assert.equal(FAST_MODE_ASSUMED_MULTIPLIER_SOURCE.recordedAt, "2026-08-30");
   assert.equal(
     FAST_MODE_MULTIPLIER_SOURCE.observability,
     "rollout_thread_settings_changes_only_no_session_baseline",
@@ -70,69 +96,70 @@ test("published Fast credit rates are frozen, sourced, and dated", () => {
     priority: "fast",
     default: "standard",
   });
-  assert.match(FAST_MODE_MULTIPLIER_SOURCE.statement, /2\.5x .*2x/u);
-  assert.deepEqual([...FAST_MODE_PREFERENCE_VALUES], [
-    "standard",
-    "fast",
-    "mixed_unknown",
-  ]);
-  assert.equal(DEFAULT_FAST_MODE_PREFERENCE, "standard");
+  assert.match(FAST_MODE_MULTIPLIER_SOURCE.statement, /2x .*2\.5x/u);
 });
 
-test("model families match exactly and unsupported models stay an explicit unknown", () => {
+test("model families match exactly and unsupported models stay an explicit null", () => {
   assert.equal(fastModeModelFamily("gpt-5.6-sol"), "gpt-5.6");
-  assert.equal(fastModeQuotaMultiplier("gpt-5.6"), 2.5);
+  assert.equal(fastModeQuotaMultiplier("gpt-5.6"), 2);
+  assert.equal(fastModeQuotaMultiplier("gpt-5.6-sol"), 2);
   assert.equal(fastModeQuotaMultiplier("gpt-5.5-codex"), 2.5);
   assert.equal(fastModeQuotaMultiplier("gpt-5.4-codex"), 2);
-  // Never a silent 1.0: a model outside the published Fast families and a
-  // near-miss name both resolve to null.
+  // Never a silent published claim: a model outside the ratio families and a
+  // near-miss name both resolve to null, and the weighting layers apply the
+  // disclosed assumed multiplier instead.
   for (const model of ["gpt-5.60", "gpt-5.4future", "gpt-4.1", "gpt-5", null]) {
     assert.equal(fastModeQuotaMultiplier(model), null);
   }
 });
 
-test("effective mode resolves observed, then preference, then inference, then unknown", () => {
-  // An observed mode beats every stated preference and any inference.
+test("effective mode resolves observed, then declared, then the scenario default", () => {
+  // An observed mode beats a declaration and any scenario.
   assert.deepEqual(
     resolveEffectiveSpeedMode({
       observedMode: "standard",
-      preference: "fast",
-      inferredMode: "fast",
+      declaredMode: "fast",
+      unresolvedScenario: "unresolved_as_fast",
     }),
     { mode: "standard", provenance: "observed" },
   );
-  // An explicit preference beats inference, so inference can never override it.
+  // A covering declaration beats the scenario.
   assert.deepEqual(
     resolveEffectiveSpeedMode({
       observedMode: "unknown",
-      preference: "standard",
-      inferredMode: "fast",
+      declaredMode: "fast",
     }),
-    { mode: "standard", provenance: "assumed_from_preference" },
+    { mode: "fast", provenance: "declared_codex_config" },
   );
-  // Only "mixed_unknown" leaves room for inference.
+  // With no evidence, the default scenario attributes Standard as a visible
+  // assumption, and the fast sensitivity scenario re-attributes the same
+  // residual to Fast.
   assert.deepEqual(
-    resolveEffectiveSpeedMode({
-      observedMode: "unknown",
-      preference: "mixed_unknown",
-      inferredMode: "fast",
-    }),
-    { mode: "fast", provenance: "inferred" },
+    resolveEffectiveSpeedMode({ observedMode: "unknown" }),
+    { mode: "standard", provenance: "assumed_standard_default" },
   );
   assert.deepEqual(
     resolveEffectiveSpeedMode({
       observedMode: "unknown",
-      preference: "mixed_unknown",
+      unresolvedScenario: "unresolved_as_fast",
     }),
-    { mode: "unknown", provenance: "unknown" },
+    { mode: "fast", provenance: "assumed_fast_scenario" },
   );
 });
 
-test("weighting multiplies only Fast events and refuses unknown multipliers", () => {
+test("weighting multiplies only Fast events and discloses assumed ratios", () => {
   assert.deepEqual(
     quotaWeightedApiPriceEquivalent({
       apiPriceEquivalentUsd: 4,
       model: "gpt-5.6-sol",
+      mode: "fast",
+    }),
+    { usd: 8, multiplier: 2, status: "fast_weighted" },
+  );
+  assert.deepEqual(
+    quotaWeightedApiPriceEquivalent({
+      apiPriceEquivalentUsd: 4,
+      model: "gpt-5.5",
       mode: "fast",
     }),
     { usd: 10, multiplier: 2.5, status: "fast_weighted" },
@@ -145,13 +172,15 @@ test("weighting multiplies only Fast events and refuses unknown multipliers", ()
     }),
     { usd: 4, multiplier: 1, status: "standard_rate" },
   );
+  // A Fast amount on a model without a published Priority rate is included at
+  // the assumed multiplier with an assumed status, never excluded.
   assert.deepEqual(
     quotaWeightedApiPriceEquivalent({
       apiPriceEquivalentUsd: 4,
       model: "gpt-4.1",
       mode: "fast",
     }),
-    { usd: null, multiplier: null, status: "unknown_multiplier" },
+    { usd: 8, multiplier: 2, status: "fast_weighted_assumed_ratio" },
   );
   assert.deepEqual(
     quotaWeightedApiPriceEquivalent({
@@ -163,22 +192,22 @@ test("weighting multiplies only Fast events and refuses unknown multipliers", ()
   );
 });
 
-test("observed Fast is weighted even when the owner states Standard", () => {
+test("observed Fast is weighted at the published Priority ratio", () => {
   const summary = summarizeQuotaWeightedAccounting({
     speedWeighting: crossing([
       ["fast", "gpt-5.6", 4, 10],
       ["standard", "gpt-5.4", 2, 5],
     ]),
-    preference: "standard",
   });
   assert.equal(summary.standardApiPriceEquivalentUsd, 15);
-  // 10 x 2.5 observed Fast + 5 observed Standard.
-  assert.equal(summary.quotaWeightedApiPriceEquivalentUsd, 30);
+  // 10 x 2 observed Fast + 5 observed Standard.
+  assert.equal(summary.quotaWeightedApiPriceEquivalentUsd, 25);
   assert.equal(summary.weightingStatus, "complete");
-  assert.deepEqual({ ...summary.appliedMultipliers }, { "gpt-5.6": 2.5 });
+  assert.deepEqual({ ...summary.appliedMultipliers }, { "gpt-5.6": 2 });
   assert.equal(summary.coverage.observedEvents, 6);
-  assert.equal(summary.coverage.assumedFromPreferenceEvents, 0);
+  assert.equal(summary.coverage.assumedEvents, 0);
   assert.equal(summary.coverage.unknownEvents, 0);
+  assert.equal(summary.assumedRatioStandardApiPriceEquivalentUsd, 0);
   assert.equal(summary.metric.key, "quotaWeightedApiPriceEquivalentUsd");
   assert.equal(
     summary.metric.label,
@@ -186,47 +215,42 @@ test("observed Fast is weighted even when the owner states Standard", () => {
   );
 });
 
-test("an unrecorded mode is weighted from the preference and never defaults to one times", () => {
+test("an unrecorded mode follows the scenario and never silently drops Fast dollars", () => {
   const cells = crossing([
     ["unknown", "gpt-5.5", 3, 8],
     ["unknown", "unsupported", 1, 2],
   ]);
   const standard = summarizeQuotaWeightedAccounting({
     speedWeighting: cells,
-    preference: "standard",
   });
+  assert.equal(standard.unresolvedScenario, "unresolved_as_standard");
   assert.equal(standard.quotaWeightedApiPriceEquivalentUsd, 10);
-  assert.equal(standard.coverage.assumedFromPreferenceEvents, 4);
+  assert.equal(standard.coverage.assumedEvents, 4);
   assert.equal(standard.weightingStatus, "complete");
 
   const fast = summarizeQuotaWeightedAccounting({
     speedWeighting: cells,
-    preference: "fast",
+    unresolvedScenario: "unresolved_as_fast",
   });
-  // 8 x 2.5 is weighted; the unsupported model's $2 is excluded rather than
-  // being silently counted at the Standard rate.
-  assert.equal(fast.quotaWeightedApiPriceEquivalentUsd, 20);
-  assert.equal(fast.unweightedUnknownApiPriceEquivalentUsd, 2);
-  assert.equal(fast.weightingStatus, "partial");
-
-  const mixed = summarizeQuotaWeightedAccounting({
-    speedWeighting: cells,
-    preference: "mixed_unknown",
+  // 8 x 2.5 published plus the unsupported model's 2 x 2 assumed ratio: the
+  // Fast dollars are included and the assumption is reported, not excluded.
+  assert.equal(fast.quotaWeightedApiPriceEquivalentUsd, 24);
+  assert.equal(fast.assumedRatioStandardApiPriceEquivalentUsd, 2);
+  assert.equal(fast.unweightedUnknownApiPriceEquivalentUsd, 0);
+  assert.deepEqual({ ...fast.appliedMultipliers }, {
+    "gpt-5.5": 2.5,
+    unsupported: FAST_MODE_ASSUMED_MULTIPLIER,
   });
-  assert.equal(mixed.quotaWeightedApiPriceEquivalentUsd, null);
-  assert.equal(mixed.weightingStatus, "unknown");
-  assert.equal(mixed.coverage.unknownEvents, 4);
-  assert.equal(mixed.coverage.unknownSharePercent, 100);
+  assert.equal(fast.weightingStatus, "complete");
 });
 
-test("coverage partitions provenance while inference remains an unknown overlap", () => {
+test("coverage partitions provenance while inference remains an assumed overlap", () => {
   const summary = summarizeQuotaWeightedAccounting({
     speedWeighting: crossing([
       ["fast", "gpt-5.6", 2, 4],
       ["standard", "gpt-5.6", 2, 4],
       ["unknown", "gpt-5.6", 6, 12],
     ]),
-    preference: "mixed_unknown",
     inferredFastEvents: 4,
     inference: { status: "inferred", inferredFastWindowCount: 2 },
   });
@@ -234,38 +258,40 @@ test("coverage partitions provenance while inference remains an unknown overlap"
     totalEvents: 10,
     observedEvents: 4,
     declaredFromConfigEvents: 0,
-    assumedFromPreferenceEvents: 0,
+    assumedEvents: 6,
     inferredEvents: 4,
-    unknownEvents: 6,
+    unknownEvents: 0,
     observedSharePercent: 40,
-    unknownSharePercent: 60,
+    unknownSharePercent: 0,
   });
   assert.equal(
     summary.coverage.observedEvents
       + summary.coverage.declaredFromConfigEvents
-      + summary.coverage.assumedFromPreferenceEvents
+      + summary.coverage.assumedEvents
       + summary.coverage.unknownEvents,
     summary.coverage.totalEvents,
   );
-  assert.ok(summary.coverage.inferredEvents <= summary.coverage.unknownEvents);
-  // Inference labels windows, so it never moves the weighted total.
+  assert.ok(summary.coverage.inferredEvents
+    <= summary.coverage.assumedEvents + summary.coverage.unknownEvents);
+  // Inference labels windows, so it never moves the weighted total: the six
+  // assumed events stay Standard at 1x in the default scenario.
   assert.equal(summary.inference.appliedToWeighting, false);
   assert.equal(summary.inference.inferredFastWindows, 2);
-  assert.equal(summary.quotaWeightedApiPriceEquivalentUsd, 14);
+  assert.equal(summary.quotaWeightedApiPriceEquivalentUsd, 24);
 });
 
-test("inferred event counts clamp to unknown provenance without subtracting it", () => {
+test("inferred event counts clamp to the no-evidence bucket without subtracting it", () => {
   const summary = summarizeQuotaWeightedAccounting({
     speedWeighting: crossing([["unknown", "gpt-5.6", 3, 6]]),
-    preference: "mixed_unknown",
     inferredFastEvents: 99,
   });
   assert.equal(summary.coverage.inferredEvents, 3);
-  assert.equal(summary.coverage.unknownEvents, 3);
+  assert.equal(summary.coverage.assumedEvents, 3);
+  assert.equal(summary.coverage.unknownEvents, 0);
   assert.equal(
     summary.coverage.observedEvents
       + summary.coverage.declaredFromConfigEvents
-      + summary.coverage.assumedFromPreferenceEvents
+      + summary.coverage.assumedEvents
       + summary.coverage.unknownEvents,
     summary.coverage.totalEvents,
   );
@@ -373,53 +399,6 @@ test("inference refuses to run without enough matched signal", () => {
     }),
   ]);
   assert.equal(thin.windows.some((row) => row.id === "thin"), false);
-});
-
-test("the owner-only preference round-trips and refuses unknown values", async () => {
-  const root = await mkdtemp(join(tmpdir(), "fast-mode-preference-"));
-  try {
-    const settingsFile = join(root, "private", "fast-mode-preference-v0.1.json");
-    const controller = createFastModePreferenceController({ settingsFile });
-    const initial = await controller.inspect();
-    assert.equal(initial.mode, "standard");
-    assert.equal(initial.source, "default");
-    assert.equal(initial.appliesTo, "turns_with_no_observed_tier_only");
-    assert.equal(initial.logObservability.sessionBaselineRecorded, false);
-    assert.deepEqual(initial.multipliers, { ...FAST_MODE_QUOTA_MULTIPLIERS });
-
-    const selected = await controller.select("fast");
-    assert.equal(selected.mode, "fast");
-    assert.equal(selected.source, "stated");
-    assert.equal(selected.schemaVersion, FAST_MODE_PREFERENCE_SCHEMA_VERSION);
-    assert.equal(await controller.readMode(), "fast");
-
-    const stored = JSON.parse(await readFile(settingsFile, "utf8"));
-    assert.deepEqual(Object.keys(stored).sort(), [
-      "mode",
-      "recordedAt",
-      "schemaVersion",
-    ]);
-    assert.equal(stored.schemaVersion, FAST_MODE_PREFERENCE_SCHEMA_VERSION);
-
-    await assert.rejects(
-      () => controller.select("turbo"),
-      (error) => error instanceof FastModePreferenceError
-        && error.code === "fast_mode_preference_invalid",
-    );
-    // The rejected write left the stored statement untouched.
-    assert.equal(await controller.readMode(), "fast");
-
-    // A malformed document is an explicit failure, and the mode reader
-    // degrades to Standard rather than inventing a Fast attribution.
-    await writeFile(settingsFile, "{\"mode\":\"fast\"}\n", { mode: 0o600 });
-    await assert.rejects(
-      () => controller.inspect(),
-      (error) => error.code === "fast_mode_preference_unavailable",
-    );
-    assert.equal(await controller.readMode(), "standard");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
 });
 
 // ---------------------------------------------------------------------------
@@ -660,7 +639,7 @@ test("an observation always beats a declared baseline", () => {
     { ...resolveEffectiveSpeedMode({
       observedMode: "standard",
       declaredMode: "fast",
-      preference: "fast",
+      unresolvedScenario: "unresolved_as_fast",
     }) },
     { mode: "standard", provenance: "observed" },
   );
@@ -668,7 +647,6 @@ test("an observation always beats a declared baseline", () => {
     { ...resolveEffectiveSpeedMode({
       observedMode: "unknown",
       declaredMode: "fast",
-      preference: "standard",
     }) },
     { mode: "fast", provenance: "declared_codex_config" },
   );
@@ -676,9 +654,8 @@ test("an observation always beats a declared baseline", () => {
     { ...resolveEffectiveSpeedMode({
       observedMode: "unknown",
       declaredMode: "unknown",
-      preference: "fast",
     }) },
-    { mode: "fast", provenance: "assumed_from_preference" },
+    { mode: "standard", provenance: "assumed_standard_default" },
   );
   assert.equal(CODEX_SPEED_MODE_DECLARATION.neverBackfillsHistory, true);
   assert.deepEqual(
@@ -687,48 +664,47 @@ test("an observation always beats a declared baseline", () => {
   );
 
   // The same precedence holds through the aggregate. Four observed-Fast events
-  // stay Fast even though the declaration says Standard, and the six
-  // unobserved events are attributed by the declaration instead of by the
-  // owner's stated Standard preference.
+  // stay Fast, and the six unobserved events are attributed by the declaration
+  // instead of by the assumed-Standard default.
   const summary = summarizeQuotaWeightedAccounting({
     speedWeighting: crossing([
       ["fast", "gpt-5.6", 4, 8],
       ["unknown", "gpt-5.6", 6, 12],
     ]),
     declaredSpeedWeighting: crossing([["fast", "gpt-5.6", 6, 12]]),
-    preference: "standard",
   });
   assert.equal(summary.coverage.observedEvents, 4);
   assert.equal(summary.coverage.declaredFromConfigEvents, 6);
-  assert.equal(summary.coverage.assumedFromPreferenceEvents, 0);
+  assert.equal(summary.coverage.assumedEvents, 0);
   assert.equal(summary.coverage.unknownEvents, 0);
   assert.equal(summary.weightingStatus, "complete");
   // Every one of the 20 Standard-priced dollars is weighted at the published
-  // 2.5x, because observation and declaration both say Fast.
-  assert.equal(summary.quotaWeightedApiPriceEquivalentUsd, 50);
+  // 2x, because observation and declaration both say Fast.
+  assert.equal(summary.quotaWeightedApiPriceEquivalentUsd, 40);
 
   // A declaration covering only part of the unobserved remainder leaves the
-  // rest to the stated preference; nothing is silently extended to it.
+  // rest to the scenario default; nothing is silently extended to it.
   const partial = summarizeQuotaWeightedAccounting({
     speedWeighting: crossing([["unknown", "gpt-5.4", 10, 20]]),
     declaredSpeedWeighting: crossing([["fast", "gpt-5.4", 4, 8]]),
-    preference: "mixed_unknown",
   });
   assert.equal(partial.coverage.declaredFromConfigEvents, 4);
-  assert.equal(partial.coverage.unknownEvents, 6);
-  // 8 USD at the published 2.0x; the uncovered 12 USD stays unweighted.
-  assert.equal(partial.quotaWeightedApiPriceEquivalentUsd, 16);
-  assert.equal(partial.unweightedUnknownApiPriceEquivalentUsd, 12);
-  assert.equal(partial.weightingStatus, "partial");
+  assert.equal(partial.coverage.assumedEvents, 6);
+  assert.equal(partial.coverage.unknownEvents, 0);
+  // 8 USD at the published 2.0x plus the uncovered 12 USD assumed Standard.
+  assert.equal(partial.quotaWeightedApiPriceEquivalentUsd, 28);
+  assert.equal(partial.unweightedUnknownApiPriceEquivalentUsd, 0);
+  assert.equal(partial.weightingStatus, "complete");
 
   // A declared crossing claiming more than the log left unobserved is
   // inconsistent, so it is discarded whole rather than trusted in part.
   const overclaimed = summarizeQuotaWeightedAccounting({
     speedWeighting: crossing([["unknown", "gpt-5.6", 2, 4]]),
     declaredSpeedWeighting: crossing([["fast", "gpt-5.6", 5, 10]]),
-    preference: "mixed_unknown",
   });
   assert.equal(overclaimed.coverage.declaredFromConfigEvents, 0);
-  assert.equal(overclaimed.coverage.unknownEvents, 2);
-  assert.equal(overclaimed.quotaWeightedApiPriceEquivalentUsd, null);
+  assert.equal(overclaimed.coverage.assumedEvents, 2);
+  // The discarded declaration degrades to exactly the pre-declaration
+  // behaviour: the residual is assumed Standard at 1x.
+  assert.equal(overclaimed.quotaWeightedApiPriceEquivalentUsd, 4);
 });
