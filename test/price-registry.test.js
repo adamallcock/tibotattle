@@ -46,7 +46,7 @@ function price({ provider, model, tier = "standard", pricedAt = "2026-07-26", co
 
 test("registry validates and preserves exact decimal strings and provenance", () => {
   assert.equal(validateOfficialPriceRegistry(), APP_OFFICIAL_PRICE_CARDS);
-  assert.equal(OPENAI_OFFICIAL_PRICE_CARDS.length, 122);
+  assert.equal(OPENAI_OFFICIAL_PRICE_CARDS.length, 135);
   assert.equal(ANTHROPIC_OFFICIAL_PRICE_CARDS.length, 13);
   const batch54 = OPENAI_OFFICIAL_PRICE_CARDS.find((card) => card.model === "gpt-5.4" && card.service_tier === "batch");
   assert.equal(batch54.components.find((item) => item.usage_component === "input_cache_read_tokens").price.amount, "0.13");
@@ -313,12 +313,11 @@ test("GPT-5.6 Sol pricing changes at the owner-stated August 21 boundary", () =>
     assert.equal(open.total, after, `sol/${tier}/2026-08-21`);
     assert.equal(open.warnings.length, 0, `sol/${tier}/2026-08-21/warnings`);
   }
-  // The Flex tab was not captured in the 2026-08-30 review, so Sol flex is
-  // priced through 2026-08-20 and deliberately unpriced afterwards.
+  // The captured Flex tab prices Sol flex across the boundary as well.
   const flexBefore = price({ provider: "openai", model: "gpt-5.6-sol", tier: "flex", pricedAt: "2026-08-20", totalInputTokens: 1000, components });
   assert.equal(flexBefore.total, "17.5");
   const flexAfter = price({ provider: "openai", model: "gpt-5.6-sol", tier: "flex", pricedAt: "2026-08-21", totalInputTokens: 1000, components });
-  assert.equal(flexAfter.total, "0");
+  assert.equal(flexAfter.total, "12");
 });
 
 test("second-table and Codex variant models price at their reviewed rates", () => {
@@ -345,11 +344,19 @@ test("second-table and Codex variant models price at their reviewed rates", () =
     assert.equal(result.total, total, `${model}/${tier}`);
     assert.equal(result.warnings.length, 0, `${model}/${tier}/warnings`);
   }
-  // Batch-only flagship extras keep their uncaptured tiers unpriced.
-  const batchOnly = price({ provider: "openai", model: "gpt-5.4-pro", tier: "batch", totalInputTokens: 1000, components });
-  assert.equal(batchOnly.total, "105");
-  const uncapturedStandard = price({ provider: "openai", model: "gpt-5.4-pro", tier: "standard", totalInputTokens: 1000, components });
-  assert.equal(uncapturedStandard.total, "0");
+  // The pro models price on Standard/Batch/Flex but carry no priority row:
+  // the page states they do not support Fast mode.
+  const proBatch = price({ provider: "openai", model: "gpt-5.4-pro", tier: "batch", totalInputTokens: 1000, components });
+  assert.equal(proBatch.total, "105");
+  const proStandard = price({ provider: "openai", model: "gpt-5.4-pro", tier: "standard", totalInputTokens: 1000, components });
+  assert.equal(proStandard.total, "210");
+  const proLong = price({ provider: "openai", model: "gpt-5.5-pro", tier: "standard", totalInputTokens: 272_000, components: { input_uncached_tokens: 1_000_000, output_text_tokens: 1_000_000 } });
+  assert.equal(proLong.total, "330");
+  const nanoStandard = price({ provider: "openai", model: "gpt-5.4-nano", tier: "standard", totalInputTokens: 1000, components });
+  assert.equal(nanoStandard.total, "1.45");
+  const proPriority = price({ provider: "openai", model: "gpt-5.4-pro", tier: "priority", totalInputTokens: 1000, components });
+  assert.equal(proPriority.total, "0");
+  assert.ok(proPriority.warnings.some((warning) => warning.code === "service_tier_unsupported"));
 });
 
 test("GPT-5.6 Terra and Luna pricing changes at the official July 30 boundary", () => {
