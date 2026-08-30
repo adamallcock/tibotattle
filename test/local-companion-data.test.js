@@ -13,11 +13,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   LOCAL_COMPANION_SCHEMA_VERSION,
+  INFORMATIONAL_HISTORY_GAP_MAX_SHARE,
   LocalCompanionDataStore,
   RETAINED_EVIDENCE_REFRESH_WARNING,
   RETAINED_EVIDENCE_RELABELED_WARNINGS,
   RETAINED_PROJECTION_SURFACE_PATHS,
   buildLocalCompanionSnapshot,
+  isInformationalTerminalHistoryGap,
 } from "../src/local-companion-data.js";
 import {
   refreshReplaySafeAccountingCache,
@@ -2510,13 +2512,47 @@ test("an attested rollout quarantine publishes verified totals as a terminal gap
       snapshot.overview.usage.find((period) => period.id === "all").events,
       1,
     );
-    assert.ok(snapshot.overview.warnings.some((warning) => (
-      warning.includes("known gap, not zero usage")
-    )));
+    const coverageWarning = snapshot.overview.warnings.find((warning) => (
+      warning.includes("Indexed-history totals include")
+    ));
+    assert.match(coverageWarning, /material coverage gap/u);
+    assert.match(coverageWarning, /unavailable rather than zero/u);
+    assert.doesNotMatch(coverageWarning, /quarantined|known gap/iu);
     assert.equal(JSON.stringify(snapshot).includes(threadGap), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("only coherent terminal history gaps at or below one percent are informational", () => {
+  const coverage = {
+    status: "partial",
+    phase: "partial_terminal",
+    sourceCount: 100,
+    indexedSourceCount: 99,
+    pendingSourceCount: 0,
+    skippedSourceCount: 1,
+  };
+  assert.equal(INFORMATIONAL_HISTORY_GAP_MAX_SHARE, 0.01);
+  assert.equal(isInformationalTerminalHistoryGap(coverage), true);
+  assert.equal(isInformationalTerminalHistoryGap({
+    ...coverage,
+    indexedSourceCount: 98,
+    skippedSourceCount: 2,
+  }), false);
+  assert.equal(isInformationalTerminalHistoryGap({
+    ...coverage,
+    indexedSourceCount: 0,
+    skippedSourceCount: 100,
+  }), false);
+  assert.equal(isInformationalTerminalHistoryGap({
+    ...coverage,
+    pendingSourceCount: 1,
+  }), false);
+  assert.equal(isInformationalTerminalHistoryGap({
+    ...coverage,
+    indexedSourceCount: 98,
+  }), false);
 });
 
 test("unified mode with no valid generation withholds the provisional collector projection", async () => {

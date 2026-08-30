@@ -142,10 +142,13 @@ export function rolloutContentQuarantineReason(outcome) {
     return "codex_rollout_tail_incomplete";
   }
   if (Number(outcome?.diagnostics?.malformedAccountingRecords ?? 0) > 0
-      || Number(outcome?.diagnostics?.malformedUsageRecords ?? 0) > 0
-      || Number(outcome?.diagnostics?.malformedRateLimitRecords ?? 0) > 0) {
+      || Number(outcome?.diagnostics?.malformedUsageRecords ?? 0) > 0) {
     return "codex_rollout_content_invalid";
   }
+  // A malformed provider quota window is bounded to that one observation.
+  // The extractor already omits the invalid window and records its diagnostic;
+  // quarantining the source here would also discard unrelated measured usage
+  // and tool facts from the same otherwise-valid rollout.
   if (Number(outcome?.diagnostics?.sourceStartedAtOffset ?? -1) === 0
       && Number(outcome?.diagnostics?.sessionMetaRecords ?? 0) < 1) {
     return "codex_rollout_content_invalid";
@@ -850,18 +853,37 @@ export function createLineageSnapshots(members) {
   }
   const sets = new Map();
 
+  function suppliesResolvedHistory(info) {
+    const sessionId = info.lineage?.sessionId;
+    if (!sessionId) return false;
+    const generations = bySessionId.get(sessionId) ?? [];
+    const resolved = generations.find(
+      (generation) => generation.resolvedHead === true,
+    );
+    // Legacy/noncanonical single-rollout fixtures have no immutable rollout
+    // identity from which discovery can stamp a head. One generation is still
+    // unambiguous; multiple unresolved generations are never chosen here.
+    return resolved === undefined ? generations.length === 1 : info === resolved;
+  }
+
   return {
-    /** The set this source should record into, or null if nothing inherits. */
+    /**
+     * The selected physical head's set, or null when this generation cannot
+     * supply logical descendants. Unselected generations remain accounting
+     * evidence but must never influence replay suppression.
+     */
     collectorFor(info) {
       const sessionId = info.lineage?.sessionId;
-      if (!sessionId || !referenced.has(sessionId)) return null;
+      if (!sessionId || !referenced.has(sessionId)
+          || !suppliesResolvedHistory(info)) return null;
       const set = sets.get(sessionId) ?? new Set();
       sets.set(sessionId, set);
       return set;
     },
     replaceFor(info, values) {
       const sessionId = info.lineage?.sessionId;
-      if (!sessionId || !referenced.has(sessionId)) return false;
+      if (!sessionId || !referenced.has(sessionId)
+          || !suppliesResolvedHistory(info)) return false;
       const set = sets.get(sessionId) ?? new Set();
       set.clear();
       for (const value of values ?? []) set.add(value);
@@ -878,7 +900,10 @@ export function createLineageSnapshots(members) {
         const set = sets.get(parentId);
         if (set) chain.push(set);
         const parentGenerations = bySessionId.get(parentId) ?? [];
-        parentId = parentGenerations.at(-1)?.lineage?.parentId ?? null;
+        const selected = parentGenerations.find(
+          (generation) => generation.resolvedHead === true,
+        ) ?? parentGenerations.at(-1);
+        parentId = selected?.lineage?.parentId ?? null;
       }
       if (chain.length === 0) return null;
       return { has: (key) => chain.some((set) => set.has(key)) };

@@ -432,13 +432,9 @@ private enum NativeToolbarStatusText {
         return "Refresh failed: \(step)"
     }
 
-    static func historyPartial(
-        skippedSourceCount: Int,
-        skippedThreadCount: Int
-    ) -> String {
+    static func historyPartial(skippedSourceCount: Int) -> String {
         let sourceNoun = skippedSourceCount == 1 ? "source" : "sources"
-        let threadNoun = skippedThreadCount == 1 ? "thread" : "threads"
-        return "History partial: \(skippedSourceCount) \(sourceNoun), \(skippedThreadCount) \(threadNoun) skipped"
+        return "History coverage · \(skippedSourceCount) \(sourceNoun) unavailable"
     }
 }
 
@@ -4686,13 +4682,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     /// The pill's colorway follows nativeToolbarEvidenceTitle's own
-    /// precedence — a running refresh, then a terminal failure, then an
-    /// incomplete history index, and only then the evidence state — so the
-    /// color never claims a state the words do not.
+    /// precedence — a running refresh, an attested partial-coverage result,
+    /// then a hard terminal failure, an incomplete history index, and only
+    /// then the evidence state — so the color never claims a state the words
+    /// do not.
     private func nativeToolbarStatusColor(
         isRefreshing: Bool
     ) -> NativeToolbarStatusColor {
         if isRefreshing {
+            return .busy
+        }
+        if nativeRefreshFailure?.suppressesAutomaticRetry == true,
+           let coverage = nativeHistoryIndexingCoverage,
+           coverage.partialTerminal {
             return .busy
         }
         if nativeRefreshFailure != nil {
@@ -5942,8 +5944,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
            let coverage = nativeHistoryIndexingCoverage,
            coverage.partialTerminal {
             return NativeToolbarStatusText.historyPartial(
-                skippedSourceCount: coverage.skippedSourceCount,
-                skippedThreadCount: coverage.skippedThreadCount
+                skippedSourceCount: coverage.skippedSourceCount
             )
         }
         if let failure = nativeRefreshFailure {
@@ -5954,8 +5955,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         if let coverage = nativeHistoryIndexingCoverage, !coverage.isComplete {
             return coverage.partialTerminal
                 ? NativeToolbarStatusText.historyPartial(
-                    skippedSourceCount: coverage.skippedSourceCount,
-                    skippedThreadCount: coverage.skippedThreadCount
+                    skippedSourceCount: coverage.skippedSourceCount
                 )
                 : NativeToolbarStatusText.indexing(
                     indexedSourceCount: coverage.indexedSourceCount,

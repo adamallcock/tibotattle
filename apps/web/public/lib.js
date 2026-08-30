@@ -398,6 +398,43 @@ function historyProgressToken(value) {
     : null;
 }
 
+export const HISTORY_INFORMATIONAL_GAP_MAX_SHARE = 0.01;
+
+/**
+ * A terminal history gap may use the quiet informational treatment only when
+ * the published receipt is coherent, current accounting is available, and
+ * the excluded share is immaterial. Everything else remains a warning.
+ */
+export function historyCoverageNoticeKind({
+  history = null,
+  accountingProjection = null,
+} = {}) {
+  const sourceCount = historyProgressNumber(history?.sourceCount);
+  const indexedSourceCount = historyProgressNumber(
+    history?.indexedSourceCount,
+  );
+  const pendingSourceCount = historyProgressNumber(
+    history?.pendingSourceCount,
+  );
+  const skippedSourceCount = historyProgressNumber(
+    history?.skippedSourceCount,
+  );
+  const informational = history?.status === "partial"
+    && history?.phase === "partial_terminal"
+    && accountingProjection?.status === "available"
+    && sourceCount !== null
+    && sourceCount > 0
+    && indexedSourceCount !== null
+    && indexedSourceCount > 0
+    && pendingSourceCount === 0
+    && skippedSourceCount !== null
+    && skippedSourceCount > 0
+    && indexedSourceCount + skippedSourceCount === sourceCount
+    && skippedSourceCount / sourceCount
+      <= HISTORY_INFORMATIONAL_GAP_MAX_SHARE;
+  return informational ? "info" : "warning";
+}
+
 /**
  * Decide whether the browser may automatically start another archive-index
  * pass. A terminal partial generation is useful verified evidence, but never

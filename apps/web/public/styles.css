@@ -1144,7 +1144,7 @@ h2 {
  * this before you read the figure". Neither is an error colour, because
  * neither is an error.
  */
-.history-index-badge {
+.index-progress {
   display: grid;
   gap: var(--space-2);
   margin-block: var(--space-4) 0;
@@ -1153,18 +1153,18 @@ h2 {
   border-inline-start: 3px solid var(--blue);
   background: var(--blue-soft);
 }
-.history-index-badge-headline { margin: 0; color: #31536d; font-size: .8rem; font-weight: var(--weight-strong); }
-.history-index-badge-detail { margin: 0; color: #31536d; font-size: .74rem; line-height: 1.5; }
-.history-index-badge-track {
+.index-progress-headline { margin: 0; color: #31536d; font-size: .8rem; font-weight: var(--weight-strong); }
+.index-progress-detail { margin: 0; color: #31536d; font-size: .74rem; line-height: 1.5; }
+.index-progress-track {
   height: 7px;
   overflow: hidden;
   border-radius: var(--radius-pill);
   background: rgba(49, 95, 132, .18);
 }
-.history-index-badge-track i { display: block; height: 100%; border-radius: inherit; background: var(--blue); }
+.index-progress-track i { display: block; height: 100%; border-radius: inherit; background: var(--blue); }
 /* An active pass is the one state where motion is truthful: something really
    is advancing. A paused index stays still rather than implying work. */
-.history-index-badge.active .history-index-badge-track i { animation: index-progress-pulse 1.6s ease-in-out infinite; }
+.index-progress.active .index-progress-track i { animation: index-progress-pulse 1.6s ease-in-out infinite; }
 @keyframes index-progress-pulse { 50% { opacity: .55; } }
 
 .evidence-warnings { display: grid; gap: var(--space-2); margin-block: var(--space-4) 0; padding: 0; list-style: none; }
@@ -1184,7 +1184,7 @@ h2 {
   color: #31536d;
 }
 @media (prefers-reduced-motion: reduce) {
-  .history-index-badge.active .history-index-badge-track i { animation: none; }
+  .index-progress.active .index-progress-track i { animation: none; }
 }
 
 .component-list { display: grid; gap: 10px; }
@@ -4569,8 +4569,8 @@ html[data-theme="dark"] .evidence-warning:not(.progress):not(.informational) {
 
 html[data-theme="dark"] .notice-demo p,
 html[data-theme="dark"] .notice-info p,
-html[data-theme="dark"] .history-index-badge-headline,
-html[data-theme="dark"] .history-index-badge-detail,
+html[data-theme="dark"] .index-progress-headline,
+html[data-theme="dark"] .index-progress-detail,
 html[data-theme="dark"] .evidence-warning.progress,
 html[data-theme="dark"] .evidence-warning.informational,
 html[data-theme="dark"] .plain-result {

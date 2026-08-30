@@ -172,7 +172,7 @@ export const WEB_MESSAGES = Object.freeze({
   "language.changed": ["Language changed to {language}.", "语言已切换为{language}。", "Idioma cambiado a {language}."],
   "status.fresh": ["Fresh", "最新", "Actualizado"],
   "status.indexingHistory": ["Indexing history · {indexed} of {total}", "正在索引历史 · {indexed}/{total}", "Indexando historial · {indexed} de {total}"],
-  "status.historyPartial": ["History partial · {skipped} skipped", "历史记录不完整 · 已跳过 {skipped} 个来源", "Historial parcial · {skipped} fuentes omitidas"],
+  "status.historyPartial": ["History coverage · {skipped} unavailable", "历史覆盖范围 · {skipped} 个来源不可用", "Cobertura del historial · {skipped} no disponibles"],
   "status.running": ["Running", "运行中", "En ejecución"],
   "status.upToDate": ["Up to date", "已是最新", "Actualizado"],
   "status.updating": ["Updating", "正在更新", "Actualizando"],
@@ -267,14 +267,14 @@ export const WEB_MESSAGES = Object.freeze({
     "Tu historial anterior aún no se ha indexado",
   ],
   "dashboard.history.partialHeadline": [
-    "Partial local history · {sources} quarantined",
-    "本地历史记录不完整 · 已隔离 {sources}",
-    "Historial local parcial · {sources} en cuarentena",
+    "Local history available · {sources} unavailable",
+    "本地历史可用 · {sources} 不可用",
+    "Historial local disponible · {sources} no disponibles",
   ],
   "dashboard.history.partialSources": [
-    "Indexed {indexed} of {total} discovered sources ({bytesIndexed} of {bytesTotal}). Verified figures exclude {sources} in quarantine; the gap remains explicit.",
-    "已索引 {total} 个已发现来源中的 {indexed} 个（{bytesIndexed}/{bytesTotal}）。已验证的数字不包含已隔离的 {sources}；该缺口会保持明确标示。",
-    "Fuentes indexadas: {indexed} de {total} ({bytesIndexed} de {bytesTotal}). Las cifras verificadas excluyen {sources} en cuarentena; la brecha permanece explícita.",
+    "Indexed {indexed} of {total} discovered sources ({bytesIndexed} of {bytesTotal}). Verified figures leave out {sources} that did not pass local validation; the coverage limit remains explicit.",
+    "已索引 {total} 个已发现来源中的 {indexed} 个（{bytesIndexed}/{bytesTotal}）。已验证的数字不包含未通过本地验证的 {sources}；覆盖范围限制会保持明确标示。",
+    "Fuentes indexadas: {indexed} de {total} ({bytesIndexed} de {bytesTotal}). Las cifras verificadas no incluyen {sources} que no superaron la validación local; el límite de cobertura permanece explícito.",
   ],
   "dashboard.history.indexingSources": [
     "{indexed} of {total} discovered sources indexed ({bytesIndexed} of {bytesTotal}). Every figure on this page is drawn from that share and will change as the index advances.",
@@ -302,14 +302,14 @@ export const WEB_MESSAGES = Object.freeze({
     "Cargando evidencia parcial verificada…",
   ],
   "refresh.degradedTitle": [
-    "Local analysis finished with a known history gap",
-    "本地分析已完成，但存在已知历史缺口",
-    "El análisis local terminó con una brecha histórica conocida",
+    "Local analysis complete with limited history coverage",
+    "本地分析已完成，历史覆盖范围有限",
+    "Análisis local completo con cobertura de historial limitada",
   ],
   "refresh.degradedCopy": [
-    "Verified totals remain available. TiboTattle quarantined {sources} across {threads} after an integrity check; the missing portion is not shown as zero. Automatic retries have stopped; use the explicit update after the source files change or whenever you want to check again.",
-    "已验证的总计仍然可用。完整性检查后，TiboTattle 隔离了 {threads} 中的 {sources}；缺失部分不会显示为零。自动重试已停止；来源文件发生变化后，或你想再次检查时，请使用明确的更新操作。",
-    "Los totales verificados siguen disponibles. Tras una comprobación de integridad, TiboTattle puso en cuarentena {sources} de {threads}; la parte ausente no se muestra como cero. Los reintentos automáticos se han detenido; usa la actualización explícita cuando cambien los archivos de origen o cuando quieras comprobar de nuevo.",
+    "Verified totals remain available. TiboTattle left out {sources} across {threads} that did not pass local validation; no missing usage is shown as zero. Update again after the source files change, or whenever you want to check.",
+    "已验证的总计仍然可用。TiboTattle 未包含 {threads} 中未通过本地验证的 {sources}；任何缺失用量都不会显示为零。来源文件发生变化后，或你想再次检查时，可以再次更新。",
+    "Los totales verificados siguen disponibles. TiboTattle dejó fuera {sources} de {threads} que no superaron la validación local; ningún uso ausente se muestra como cero. Actualiza de nuevo cuando cambien los archivos de origen o cuando quieras comprobarlo.",
   ],
   "refresh.degradedGenericCopy": [
     "Verified headline evidence remains available, but the unified history step ended in a fixed degraded state ({code}). Automatic retries have stopped; an explicit retry remains available.",
@@ -1425,8 +1425,8 @@ export const WEB_PLURAL_MESSAGES = Object.freeze({
     other: ["{count} affected threads", "受影响的 {count} 个线程", "{count} hilos afectados"],
   }),
   "dashboard.history.partialNote": Object.freeze({
-    one: ["The indexed totals remain usable, but {count} affected thread is a known gap, not zero usage. Retry only after the local rollout files change.", "已索引的总计仍然可用，但受影响的 {count} 个线程是已知缺口，并不代表零使用量。仅在本地 rollout 文件发生变化后重试。", "Los totales indexados siguen siendo utilizables, pero {count} hilo afectado es una brecha conocida, no uso cero. Reinténtalo solo después de que cambien los archivos rollout locales."],
-    other: ["The indexed totals remain usable, but {count} affected threads are a known gap, not zero usage. Retry only after the local rollout files change.", "已索引的总计仍然可用，但受影响的 {count} 个线程是已知缺口，并不代表零使用量。仅在本地 rollout 文件发生变化后重试。", "Los totales indexados siguen siendo utilizables, pero {count} hilos afectados son una brecha conocida, no uso cero. Reinténtalo solo después de que cambien los archivos rollout locales."],
+    one: ["The indexed totals remain usable. {count} affected thread did not pass local validation, so its missing usage remains unavailable rather than zero. You can check again after the local rollout files change.", "已索引的总计仍然可用。受影响的 {count} 个线程未通过本地验证，因此缺失用量保持为不可用，而不是零。本地 rollout 文件发生变化后可以再次检查。", "Los totales indexados siguen siendo utilizables. {count} hilo afectado no superó la validación local, por lo que su uso ausente permanece no disponible en lugar de mostrarse como cero. Puedes comprobarlo de nuevo cuando cambien los archivos rollout locales."],
+    other: ["The indexed totals remain usable. {count} affected threads did not pass local validation, so their missing usage remains unavailable rather than zero. You can check again after the local rollout files change.", "已索引的总计仍然可用。受影响的 {count} 个线程未通过本地验证，因此缺失用量保持为不可用，而不是零。本地 rollout 文件发生变化后可以再次检查。", "Los totales indexados siguen siendo utilizables. {count} hilos afectados no superaron la validación local, por lo que su uso ausente permanece no disponible en lugar de mostrarse como cero. Puedes comprobarlo de nuevo cuando cambien los archivos rollout locales."],
   }),
   "accounting.sideChat.coverageRetentionLimit": Object.freeze({
     one: ["{count} retained side-chat partition reached the local 1,000-row retention limit, so earlier evidence in it may be missing.", "{count} 个保留的侧聊分区已达到本地 1,000 行保留上限，因此其中较早的证据可能缺失。", "{count} partición conservada alcanzó el límite local de 1.000 filas, por lo que puede faltar evidencia anterior."],

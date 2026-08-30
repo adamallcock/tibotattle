@@ -181,11 +181,11 @@ async function run() {
         const historySeed = await historySeeds.resolveSeed(source, {
           includeSnapshots: collector !== null,
         });
-        const snapshotReset = collector !== null && historySeed !== null
-          && snapshots.replaceFor(source, historySeed.seedSnapshots);
+        const snapshotReset = collector !== null
+          && snapshots.replaceFor(source, historySeed?.seedSnapshots ?? []);
         let snapshotResetPending = snapshotReset;
         let snapshotSeedKeys = snapshotReset
-          ? [...historySeed.seedSnapshots]
+          ? [...(historySeed?.seedSnapshots ?? [])]
           : [];
         let events = [];
         let boundaries = [];

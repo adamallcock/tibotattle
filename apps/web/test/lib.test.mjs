@@ -20,6 +20,8 @@ import {
   serviceRequestId,
   createQuotaTimelineLookup,
   createRefreshPollingBudget,
+  HISTORY_INFORMATIONAL_GAP_MAX_SHARE,
+  historyCoverageNoticeKind,
   LOCAL_REFRESH_POLLING_WINDOW_MS,
   createSyntheticEnvelope,
   createTelemetryEnvelope,
@@ -1189,6 +1191,64 @@ test("history auto-continuation stops on terminal gaps and unchanged receipts", 
   assert.equal(historyIndexContinuationDecision({
     history: { ...history, status: "complete" },
   }).shouldContinue, false);
+});
+
+test("terminal history gaps are informational only when small, coherent, and fully accounted", () => {
+  const accountingProjection = { status: "available" };
+  const history = {
+    status: "partial",
+    phase: "partial_terminal",
+    sourceCount: 7_156,
+    indexedSourceCount: 7_142,
+    pendingSourceCount: 0,
+    skippedSourceCount: 14,
+  };
+  assert.equal(HISTORY_INFORMATIONAL_GAP_MAX_SHARE, 0.01);
+  assert.equal(historyCoverageNoticeKind({
+    history,
+    accountingProjection,
+  }), "info");
+  assert.equal(historyCoverageNoticeKind({
+    history: {
+      ...history,
+      sourceCount: 100,
+      indexedSourceCount: 99,
+      skippedSourceCount: 1,
+    },
+    accountingProjection,
+  }), "info");
+  assert.equal(historyCoverageNoticeKind({
+    history: {
+      ...history,
+      sourceCount: 100,
+      indexedSourceCount: 98,
+      skippedSourceCount: 2,
+    },
+    accountingProjection,
+  }), "warning");
+  assert.equal(historyCoverageNoticeKind({
+    history: {
+      ...history,
+      sourceCount: 14,
+      indexedSourceCount: 0,
+      skippedSourceCount: 14,
+    },
+    accountingProjection,
+  }), "warning");
+  for (const status of ["retained", "unavailable"]) {
+    assert.equal(historyCoverageNoticeKind({
+      history,
+      accountingProjection: { status },
+    }), "warning");
+  }
+  assert.equal(historyCoverageNoticeKind({
+    history: { ...history, pendingSourceCount: 1 },
+    accountingProjection,
+  }), "warning");
+  assert.equal(historyCoverageNoticeKind({
+    history: { ...history, indexedSourceCount: 7_141 },
+    accountingProjection,
+  }), "warning");
 });
 
 function communitySnapshot() {
@@ -5332,6 +5392,16 @@ test("timeline keeps time, uncertainty, and primary navigation explicit", async 
   );
   assert.match(
     styles,
+    /\.index-progress \{\n  display: grid;/u,
+    "the in-card history progress treatment owns the full-width layout",
+  );
+  assert.doesNotMatch(
+    styles,
+    /\.history-index-badge \{\n  display: grid;/u,
+    "the compact toolbar badge cannot inherit the in-card progress layout",
+  );
+  assert.match(
+    styles,
     /body:not\(\.community-site\) > \.topbar \.brand > span \{ display: none; \}/u,
     "the local toolbar sheds its wordmark before it can overlap controls",
   );
@@ -9138,6 +9208,12 @@ test("self-resolving degraded notes are classed informational and keep the quiet
     styles,
     /\.evidence-warning\.progress,\n\.evidence-warning\.informational \{\n  border-inline-start-color: var\(--blue\);/u,
   );
+  assert.match(
+    "Local analysis complete with limited history coverage",
+    informational,
+  );
+  assert.match(appSource, /historyCoverageNoticeKind\(\{/u);
+  assert.doesNotMatch("known gap", informational);
 
   // The self-resolving sentences the companion actually publishes. Each must
   // exist verbatim in the companion source and fall inside the matcher's
@@ -9189,6 +9265,12 @@ test("self-resolving degraded notes are classed informational and keep the quiet
       + " forked child sessions inherited.",
     "Usage accounting is complete, but typed tool history is partial. Tool"
       + " totals are withheld rather than reported as zero.",
+    "Indexed-history totals include ${historyCoverage.indexedSourceCount} of"
+      + " ${historyCoverage.sourceCount} verified sources."
+      + " ${historyCoverage.skippedSourceCount} sources across"
+      + " ${historyCoverage.skippedThreadCount} threads did not pass local"
+      + " validation. This is a material coverage gap; missing usage remains"
+      + " unavailable rather than zero.",
   ];
   for (const sentence of alertSentences) {
     assert.ok(

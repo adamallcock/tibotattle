@@ -29,9 +29,9 @@ its distinct quota observations.
 ### Schema 11 is the 0.1.17 physical format
 
 The current physical `PRAGMA user_version`, minimum reader version, and minimum
-writer version are 11. The logical marker remains `local-unified-index-v2`, and
-the parser remains `unified-rollout-typed-v10`; this change affects database
-layout and cleanup ordering, not provider parsing semantics.
+writer version are 11. The logical marker remains `local-unified-index-v2`. At
+adoption the parser remained `unified-rollout-typed-v10`; this physical change
+affected database layout and cleanup ordering, not provider parsing semantics.
 
 Schema 11 adds required indexes for:
 
@@ -85,8 +85,19 @@ internal dogfood proves the installed upgrade path.
 - A successful clean Preview rebuild still does not prove stable-state migration,
   signing, notarization, installation, updater acceptance, or rollback.
 
+## Parser follow-up on 2026-08-29
+
+Parser `unified-rollout-typed-v11` now changes source interpretation without a
+second physical schema change. It omits an invalid quota window at record level
+instead of quarantining unrelated valid facts from the entire rollout, and it
+resets lineage snapshots for a selected paginated replacement that starts with
+no `history_base`. The parser stamp makes still-present sources rescan after an
+additive schema-10-to-11 migration; rotated rows keep their older recorded
+provenance. The schema-11 cleanup-index decision and migration transaction are
+otherwise unchanged.
+
 ## Related documents
 
 - [Local state schema and macOS release-channel isolation](./2026-08-27-local-state-schema-and-release-channel-isolation.md)
-- [Local unified-index recovery](../runbooks/2026-08-27-local-unified-index-recovery.md)
+- [Local unified-index recovery](../runbooks/unified-index-recovery.md)
 - [macOS stable release runbook](../runbooks/macos-stable-release-runbook.md)

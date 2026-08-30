@@ -2,10 +2,14 @@
 title: Local unified index compatibility and recovery
 date: 2026-08-27
 type: runbook
-status: canonical
+status: superseded
 ---
 
 # Local unified index compatibility and recovery
+
+This dated snapshot is superseded by the maintained
+[unified index preservation and recovery runbook](./unified-index-recovery.md).
+Use that authority for current commands and constants.
 
 Use this runbook when TiboTattle reports that the unified local index is
 unavailable or was written by a newer build. The index is derived local state;
@@ -20,10 +24,11 @@ schema 8; newer pre-release code may have written schema 9 or schema 10. The
 application recognizes each supported predecessor read-only before choosing
 its staged path. Schema 8 and 9 predate the current source-identity contract,
 so normal ingestion rebuilds schema 11 from readable raw history and atomically
-publishes only a validated stage. Schema 10 already has current identity and
-parser semantics, so the app clones it and adds the schema-11 indexes without
-rescanning its sources, preserving its existing rows and generation through
-the migration.
+publishes only a validated stage. Schema 10 already has the current physical
+identity contract, so the app clones it and adds the schema-11 indexes without
+rescanning inside the migration transaction. Parser v11 then rescans every
+still-present source to apply record-level quota recovery and segment-start
+lineage resets; rotated rows retain their recorded parser provenance.
 Schema changes between releases are ordinary embedded-database maintenance;
 silent downgrade, stamping old metadata onto a newer schema, or sharing one
 database between unrelated app channels is not.

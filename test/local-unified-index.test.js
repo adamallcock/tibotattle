@@ -17,6 +17,7 @@ import {
 import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { Worker } from "node:worker_threads";
 
@@ -200,6 +201,21 @@ function paginatedSessionMeta(sessionId, {
         forked_from_id: parentId,
         parent_thread_id: parentId,
       }),
+      thread_source: "user",
+      originator: "codex_cli_rs",
+    },
+  });
+}
+
+function paginatedResetSessionMeta(sessionId, { ordinal = 0 } = {}) {
+  return JSON.stringify({
+    ordinal,
+    timestamp: "2026-07-25T00:00:00.000Z",
+    type: "session_meta",
+    payload: {
+      id: sessionId,
+      session_id: sessionId,
+      history_mode: "paginated",
       thread_source: "user",
       originator: "codex_cli_rs",
     },
@@ -1831,6 +1847,220 @@ test("a later inline fork inherits only the selected paginated history snapshots
       assert.equal(Number(totals.output), 50);
     } finally {
       parallelDatabase.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("a no-base paginated replacement resets persisted and worker lineage snapshots", async () => {
+  const originalName = canonicalRolloutName(
+    "2026-07-25T00-00-00",
+    THREAD_ONE,
+  );
+  const replacementName = canonicalRolloutName(
+    "2026-07-25T01-00-00",
+    THREAD_ONE,
+    ROLLOUT_TWO,
+  );
+  const childName = canonicalRolloutName(
+    "2026-07-25T02-00-00",
+    THREAD_TWO,
+  );
+  const { root, sessions } = await corpus({
+    [originalName]: [
+      sessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+      tokenCount("2026-07-25T00:00:02.000Z", usage(300, 30), usage(200, 20)),
+    ],
+    [replacementName]: [
+      paginatedResetSessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T01:00:01.000Z", usage(50, 5), usage(50, 5)),
+    ],
+  });
+  try {
+    const stateFile = join(root, "state_5.sqlite");
+    const state = new DatabaseSync(stateFile);
+    state.exec("CREATE TABLE threads(id TEXT, rollout_path TEXT)");
+    state.prepare("INSERT INTO threads(id, rollout_path) VALUES (?, ?)").run(
+      THREAD_ONE,
+      join(sessions, replacementName),
+    );
+    state.close();
+    await chmod(stateFile, 0o600);
+
+    const initial = await build(root);
+    assert.equal(initial.generation.status, "complete");
+    assert.equal(initial.usageEvents, 3);
+
+    await writeFile(join(sessions, childName), `${[
+      sessionMeta(THREAD_TWO, {
+        parentId: THREAD_ONE,
+        threadSource: "subagent",
+      }),
+      turnContext("2026-07-25T02:00:00.000Z", "gpt-5.6-sol"),
+      // This selected-generation snapshot is inherited and suppressed.
+      tokenCount("2026-07-25T02:00:01.000Z", usage(50, 5), usage(50, 5)),
+      // This matches the replaced physical generation. It is genuinely new
+      // work and must remain after the no-base reset clears that old set.
+      tokenCount("2026-07-25T02:00:02.000Z", usage(300, 30), usage(200, 20)),
+    ].join("\n")}\n`);
+
+    const incremental = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile: join(root, "index.sqlite"),
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(incremental.generation.status, "complete");
+    assert.equal(incremental.totalUsageEvents, 4);
+    assert.equal(incremental.forkReplayEventsSkipped, 1);
+
+    const serial = await rebuildLocalUnifiedIndex({
+      codexHome: root,
+      indexFile: join(root, "serial-reset.sqlite"),
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      workerCount: 1,
+    });
+    assert.equal(serial.generation.status, "complete");
+    assert.equal(serial.usageEvents, 4);
+    assert.equal(serial.forkReplayEventsSkipped, 1);
+
+    const parallel = await rebuildLocalUnifiedIndex({
+      codexHome: root,
+      indexFile: join(root, "parallel-reset.sqlite"),
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      workerCount: 2,
+    });
+    assert.equal(parallel.generation.status, "complete");
+    assert.equal(parallel.usageEvents, 4);
+    assert.equal(parallel.forkReplayEventsSkipped, 1);
+
+    const referenceDatabase = openLocalUnifiedIndex(
+      join(root, "index.sqlite"),
+      { readOnly: true },
+    );
+    const parallelDatabase = openLocalUnifiedIndex(
+      join(root, "parallel-reset.sqlite"),
+      { readOnly: true },
+    );
+    const serialDatabase = openLocalUnifiedIndex(
+      join(root, "serial-reset.sqlite"),
+      { readOnly: true },
+    );
+    try {
+      assert.deepEqual(
+        logicalProjection(serialDatabase),
+        logicalProjection(referenceDatabase),
+      );
+      assert.deepEqual(
+        logicalProjection(parallelDatabase),
+        logicalProjection(referenceDatabase),
+      );
+    } finally {
+      referenceDatabase.close();
+      serialDatabase.close();
+      parallelDatabase.close();
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("lineage snapshots follow the selected original instead of a newer unselected reset", async () => {
+  const originalName = canonicalRolloutName(
+    "2026-07-25T00-00-00",
+    THREAD_ONE,
+  );
+  const replacementName = canonicalRolloutName(
+    "2026-07-25T01-00-00",
+    THREAD_ONE,
+    ROLLOUT_TWO,
+  );
+  const childName = canonicalRolloutName(
+    "2026-07-25T02-00-00",
+    THREAD_TWO,
+  );
+  const { root, sessions } = await corpus({
+    [originalName]: [
+      sessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100), usage(100)),
+    ],
+    [replacementName]: [
+      paginatedResetSessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T01:00:01.000Z", usage(50), usage(50)),
+    ],
+  });
+  try {
+    const stateFile = join(root, "state_5.sqlite");
+    const state = new DatabaseSync(stateFile);
+    state.exec("CREATE TABLE threads(id TEXT, rollout_path TEXT)");
+    state.prepare("INSERT INTO threads(id, rollout_path) VALUES (?, ?)").run(
+      THREAD_ONE,
+      join(sessions, originalName),
+    );
+    state.close();
+    await chmod(stateFile, 0o600);
+
+    const initial = await build(root);
+    assert.equal(initial.generation.status, "complete");
+    assert.equal(initial.usageEvents, 2);
+
+    await writeFile(join(sessions, childName), `${[
+      sessionMeta(THREAD_TWO, {
+        parentId: THREAD_ONE,
+        threadSource: "subagent",
+      }),
+      turnContext("2026-07-25T02:00:00.000Z", "gpt-5.6-sol"),
+      // The explicitly selected original owns this inherited snapshot.
+      tokenCount("2026-07-25T02:00:01.000Z", usage(100), usage(100)),
+      // The unselected replacement reported this snapshot. It is new work on
+      // the selected branch and must not be suppressed by filename order.
+      tokenCount("2026-07-25T02:00:02.000Z", usage(50), usage(50)),
+    ].join("\n")}\n`);
+
+    const incremental = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile: join(root, "index.sqlite"),
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(incremental.generation.status, "complete");
+    assert.equal(incremental.totalUsageEvents, 3);
+    assert.equal(incremental.forkReplayEventsSkipped, 1);
+
+    const parallel = await rebuildLocalUnifiedIndex({
+      codexHome: root,
+      indexFile: join(root, "parallel-selected-original.sqlite"),
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+      workerCount: 2,
+    });
+    assert.equal(parallel.generation.status, "complete");
+    assert.equal(parallel.usageEvents, 3);
+    assert.equal(parallel.forkReplayEventsSkipped, 1);
+
+    for (const indexFile of [
+      join(root, "index.sqlite"),
+      join(root, "parallel-selected-original.sqlite"),
+    ]) {
+      const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+      try {
+        const totals = database.prepare(`
+          SELECT COUNT(*) AS events, SUM(tokens_in_uncached) AS input
+          FROM usage_event
+        `).get();
+        assert.equal(Number(totals.events), 3);
+        assert.equal(Number(totals.input), 200);
+      } finally {
+        database.close();
+      }
     }
   } finally {
     await rm(root, { recursive: true });

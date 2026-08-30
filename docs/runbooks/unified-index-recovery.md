@@ -47,8 +47,8 @@ never guess between them.
 
 ## 2. Preserve the exact state
 
-Create a new owner-only recovery directory outside the live state root. Copy,
-without moving or modifying the originals:
+Create a new owner-only sibling recovery directory inside the live index/state
+directory. Copy, without moving or modifying the originals:
 
 - `local-unified-index-v1.sqlite`;
 - `local-unified-index-device-salt-v1`;
@@ -79,8 +79,8 @@ semantic compatibility or complete source coverage.
 Compare the copy with the current constants in `src/local-unified-index.js`:
 
 - schema family `local-unified-index-v2`;
-- `user_version` 10;
-- parser `unified-rollout-typed-v10`; and
+- `user_version` 11;
+- parser `unified-rollout-typed-v11`; and
 - source identity `codex-immutable-rollout-v1`.
 
 ## 4. Classify before acting
@@ -94,72 +94,75 @@ Compare the copy with the current constants in `src/local-unified-index.js`:
 | Schema opens but generation is partial/incomplete | Source/provenance problem | Inspect generation issues and retained last-good facts; do not equate it with database corruption. |
 | App opens an older copy but current live file fails | Likely forward incompatibility or publication/migration issue | Keep both; compare versions and generation descriptors without overwriting either. |
 
-## 5. Rehearse a source rebuild separately
+## 5. Dry-run the copy-first recovery paths
 
-Only after preserving the original, build to a new explicit destination:
+The maintained recovery command is a prepare/apply workflow. Choose a new
+owner-only recovery directory directly inside the live index directory; it must
+not already exist. Start with the non-writing path check:
 
 ```bash
 npm run index:rebuild -- \
-  --index /absolute/private/recovery/candidate.sqlite \
-  --codex-home /absolute/path/to/the/selected/codex-home \
-  --workers 1
+  --index "/absolute/path/to/Usage Monitor/local-unified-index-v1.sqlite" \
+  --recovery-dir "/absolute/path/to/Usage Monitor/recovery-YYYYMMDD-HHMMSS" \
+  --codex-home "/absolute/path/to/the/selected/codex-home" \
+  --workers 1 \
+  --dry-run
 ```
 
-This command is not a dry run. It atomically publishes over the **selected
-candidate path**, so choose a new path that contains no evidence. Unknown,
-duplicate, missing, and malformed options fail before source/destination access.
+Dry-run validates exact path topology and arguments without creating the
+recovery directory. Review every printed path and the generated apply-command
+shape. Unknown, duplicate, missing, and mode-incompatible options fail before
+source or destination access.
 
-Start with one worker as the reference implementation. A broader worker count
-is a performance choice, not a different recovery meaning.
+## 6. Prepare and inspect a separate candidate
 
-The command's JSON inspection receipt must show:
+Run the same command without `--dry-run`. Preparation does not replace or open
+the live index writable. It refuses WAL or live SQLite sidecars, validates the
+existing device salt without repairing it, creates a consistent backup and
+private salt copy, rebuilds a separate candidate, and verifies schema,
+compatibility, generation, counts, `quick_check`, and foreign keys.
 
-- a valid schema/version;
-- `PRAGMA quick_check` success;
-- a complete or explicitly understood partial generation;
-- discovered/indexed/skipped counts and bytes; and
-- no unexplained source quarantine.
+The immutable owner-only `receipt.json` binds the live source, backup, salt,
+candidate, generation, counts, paths, sizes, and SHA-256 identities. A rebuild
+can reconstruct only sources that still exist, so compare candidate and backup
+for earliest/latest usage and quota timestamps, usage/quota/tool counts,
+source coverage, skipped reasons, and any facts whose rollout has rotated away.
+Do not apply a candidate with an unexplained loss or quarantine.
 
-## 6. Compare retained evidence
+## 7. Apply only the reviewed receipt
 
-A rebuild can only reconstruct sources that still exist. Compare the candidate
-with the preserved original copy for:
+Replacement is a separate explicit operation. Keep the app stopped and use the
+exact `applyCommand` emitted by preparation:
 
-- earliest/latest usage and quota timestamps;
-- usage/quota/tool counts;
-- source and generation counts;
-- skipped/quarantined source reasons;
-- account/model/speed coverage; and
-- facts whose source rollout has rotated away.
+```bash
+npm run index:rebuild -- --apply \
+  --index "/absolute/path/to/Usage Monitor/local-unified-index-v1.sqlite" \
+  --candidate "/absolute/path/to/Usage Monitor/recovery-YYYYMMDD-HHMMSS/candidate.sqlite" \
+  --receipt "/absolute/path/to/Usage Monitor/recovery-YYYYMMDD-HHMMSS/receipt.json" \
+  --confirm-index "/absolute/path/to/Usage Monitor/local-unified-index-v1.sqlite" \
+  --confirm-app-stopped
+```
 
-If the candidate loses old facts, it is not an equivalent recovery even when
-its schema is current and integrity passes. Prefer forward recovery of the
-preserved original copy or retain both for an explicit merge design.
+Apply revalidates every receipt-bound identity, creates and validates an exact
+`pre-publish-live.sqlite` rollback copy, acquires the recovery and SQLite writer
+locks, then atomically replaces the live index. It never auto-removes an
+existing recovery lock. If it reports
+`local_unified_index_recovery_publication_state_uncertain`, keep the app stopped
+and preserve the live file, sidecars exactly as found, receipt, backup, and
+pre-publish copy; do not retry or delete anything.
 
-## 7. Replacement is a separate gate
+## 8. Validate and close with a private receipt
 
-Do not replace the live index during diagnosis. A reviewed replacement plan
-must identify:
-
-- exact live and candidate paths and digests;
-- app/reader version that will reopen it;
-- whether local collector/cache state must be rebuilt or invalidated;
-- how the original remains recoverable;
-- a post-restart dashboard and generation inspection; and
-- rollback behavior if publication durability is uncertain.
-
-Move the old live state to a recoverable local archive/Trash only when the user
-has explicitly authorized that exact replacement. Never use recursive deletion
-or a wildcard against Application Support.
-
-## 8. Close with a private receipt
+Relaunch the compatible app, run an explicit refresh, and verify generation,
+usage, quota, tools, timeline, weekly, and accounting coverage against the
+reviewed receipt. Missing evidence must remain unavailable rather than zero.
+Retain both rollback copies, the private salt copy, and `receipt.json` through
+an agreed observation period; cleanup or rollback requires separate explicit
+authorization.
 
 Record the failure code, versions, integrity result, preserved digests, actions,
-candidate receipt, evidence comparison, post-restart result, and remaining
-gaps. Redact usernames, home paths, account identities, and private evidence
-from public issues.
-
-If the root cause was a schema or recovery-document mismatch, update
+candidate receipt, comparison, post-restart result, and remaining gaps. Redact
+usernames, home paths, account identities, and private evidence from public
+issues. If the cause was a schema or runbook mismatch, update
 [`../reference/unified-index-schema.md`](../reference/unified-index-schema.md),
-the relevant tests, and this runbook in the same change. Delete obsolete
-recovery notes rather than leaving competing instructions.
+the relevant tests, and this runbook together.

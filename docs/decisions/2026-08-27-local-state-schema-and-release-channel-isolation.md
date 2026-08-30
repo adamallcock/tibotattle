@@ -162,8 +162,7 @@ grammar.
 
 ## Related documents
 
-- [TiboTattle release-recovery channel policy](./2026-08-04-release-recovery-channel-policy.md)
 - [macOS stable release runbook](../runbooks/macos-stable-release-runbook.md)
-- [Unified local index schema](../design/2026-08-06-unified-local-index-schema.md)
-- [Local unified-index recovery](../runbooks/2026-08-27-local-unified-index-recovery.md)
+- [Unified local index schema](../reference/unified-index-schema.md)
+- [Local unified-index recovery](../runbooks/unified-index-recovery.md)
 - [Local unified index v11 cleanup indexes](./2026-08-28-local-unified-index-v11-cleanup-indexes.md)

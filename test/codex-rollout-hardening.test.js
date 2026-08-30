@@ -73,6 +73,7 @@ function usage(input) {
 
 function tokenCount(input = 100, {
   last = input,
+  rateLimits = null,
   timestamp = "2026-07-25T00:00:01.000Z",
 } = {}) {
   return JSON.stringify({
@@ -84,6 +85,7 @@ function tokenCount(input = 100, {
         total_token_usage: usage(input),
         ...(last === null ? {} : { last_token_usage: usage(last) }),
       },
+      ...(rateLimits === null ? {} : { rate_limits: rateLimits }),
     },
   });
 }
@@ -213,6 +215,77 @@ test("malformed accounting quarantines one rollout, persists a terminal cursor, 
     } finally {
       database.close();
     }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a malformed quota window withholds only that observation and retains valid source facts", async () => {
+  const invalidQuota = {
+    limit_id: "codex",
+    plan_type: "pro",
+    primary: {
+      used_percent: 12,
+      window_minutes: 0,
+      resets_at: 1_785_258_363,
+    },
+  };
+  const validQuota = {
+    limit_id: "codex",
+    plan_type: "pro",
+    primary: {
+      used_percent: 13,
+      window_minutes: 300,
+      resets_at: 1_785_258_363,
+    },
+  };
+  const { root } = await rolloutHome([
+    sessionMeta(),
+    turnContext(),
+    tokenCount(100, { rateLimits: invalidQuota }),
+    tokenCount(200, {
+      last: 100,
+      rateLimits: validQuota,
+      timestamp: "2026-07-25T00:00:02.000Z",
+    }),
+    "",
+  ].join("\n"));
+  try {
+    const built = await build(root);
+    assert.equal(built.generation.status, "complete");
+    assert.equal(built.generation.blockReason, null);
+    assert.equal(built.usageEvents, 2);
+
+    const database = openLocalUnifiedIndex(join(root, "index.sqlite"), {
+      readOnly: true,
+    });
+    try {
+      assert.equal(Number(database.prepare(
+        "SELECT COUNT(*) AS count FROM usage_event",
+      ).get().count), 2);
+      assert.equal(Number(database.prepare(
+        "SELECT COUNT(*) AS count FROM quota_occurrence",
+      ).get().count), 1);
+      assert.equal(Number(database.prepare(`
+        SELECT COALESCE(SUM(count), 0) AS count
+        FROM source_diagnostic
+        WHERE code = 'malformedRateLimitRecords'
+      `).get().count), 1);
+      assert.equal(database.prepare(
+        "SELECT quarantine_code FROM source_cursor",
+      ).get().quarantine_code, null);
+      assert.equal(database.prepare(
+        "SELECT status FROM generation_source",
+      ).get().status, "complete");
+    } finally {
+      database.close();
+    }
+
+    const unchanged = await ingest(root);
+    assert.equal(unchanged.unchanged, true);
+    assert.equal(unchanged.sourcesScanned, 0);
+    assert.equal(unchanged.totalUsageEvents, 2);
+    assert.equal(unchanged.generation.status, "complete");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

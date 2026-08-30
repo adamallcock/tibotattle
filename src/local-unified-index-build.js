@@ -405,6 +405,7 @@ export function lineageComponents(infos) {
     }
     members.sort((left, right) => (
       depth(left) - depth(right)
+      || Number(left.resolvedHead === true) - Number(right.resolvedHead === true)
       || left.rolloutKey.localeCompare(right.rolloutKey)
     ));
     components.push({
@@ -532,10 +533,11 @@ function replacePersistedSnapshotsFromHistory({
   deviceSalt,
   sessionLocalKey,
 }) {
-  if (collector === null || historySeed === null) return;
-  if (!snapshots.replaceFor(info, historySeed.seedSnapshots)) return;
+  if (collector === null) return;
+  const seedSnapshots = historySeed?.seedSnapshots ?? [];
+  if (!snapshots.replaceFor(info, seedSnapshots)) return;
   writer.clearLineageSnapshots(sessionLocalKey);
-  for (const key of historySeed.seedSnapshots) {
+  for (const key of seedSnapshots) {
     writer.addLineageSnapshot(sessionLocalKey, snapshotLocal(deviceSalt, key));
   }
 }
@@ -796,6 +798,7 @@ async function runWorkerLane(lane, laneIndex, { maximumLineBytes, signal, onBatc
             historyMode: info.lineage?.historyMode ?? "legacy",
             historyBase: info.lineage?.historyBase ?? null,
             startOrdinal: info.lineage?.startOrdinal ?? 0,
+            resolvedHead: info.resolvedHead === true,
             rolloutId: info.rolloutId ?? null,
             rolloutKey: info.rolloutKey,
             dev: info.dev,

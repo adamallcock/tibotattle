@@ -144,6 +144,15 @@ published-release claim.
   ([PR #57](https://github.com/adamallcock/tibotattle/pull/57)).
 - Replaces misleading loading warnings when retained figures remain visible
   during a recalculation.
+- Retains valid usage, tool, and quota facts when one provider quota window is
+  malformed, while withholding that invalid observation with an explicit
+  diagnostic rather than presenting it as zero.
+- Accepts a selected paginated Codex replacement that begins a new segment
+  without `history_base`, and clears the replaced lineage snapshot set before
+  later forks are evaluated.
+- Presents verified partial history as a quieter coverage limitation and keeps
+  the compact toolbar badge separate from the in-page progress panel; hard
+  refresh failures retain the error treatment.
 - Defers cleanup of a source rejected late in a fresh rebuild until the required
   indexes exist, preventing repeated full-table scans from consuming the cold
   build's safety window.

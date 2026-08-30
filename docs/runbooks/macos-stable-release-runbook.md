@@ -91,7 +91,7 @@ migration without a source rescan. Keep the installed app stopped while taking
 the copy, leave the live source read-only, and compare SQLite integrity,
 generation metadata, row counts, aggregate token/cost ranges, and source-cursor
 coverage before and after the transition. Follow the canonical
-[local unified-index recovery runbook](./2026-08-27-local-unified-index-recovery.md)
+[local unified-index recovery runbook](./unified-index-recovery.md)
 for compatibility and preservation rules.
 
 The isolated `preview_distribution` app cannot satisfy this gate: it creates a

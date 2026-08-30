@@ -27,8 +27,8 @@ one another:
 | --- | --- | --- |
 | Stable filename | `local-unified-index-v1.sqlite` | Machine path continuity across app releases. |
 | Schema-family metadata | `local-unified-index-v2` | Logical family stored in `meta.schema_version`. |
-| SQLite `PRAGMA user_version` | `10` | Physical table/index/migration generation. |
-| Parser version | `unified-rollout-typed-v10` | Meaning and provenance of facts extracted from rollout sources. |
+| SQLite `PRAGMA user_version` | `11` | Physical table/index/migration generation. |
+| Parser version | `unified-rollout-typed-v11` | Meaning and provenance of facts extracted from rollout sources. |
 | Source identity version | `codex-immutable-rollout-v1` | Rules for physical rollout identity/generation. |
 
 The application id is a separate SQLite format guard. A file with the wrong
@@ -50,10 +50,21 @@ open.
 | 8 | Source-scoped, generation-bound tool facts and wider closed diagnostic vocabulary. | Still-present sources rescan so current-looking empty tool projections are impossible. |
 | 9 | Stable thread identity separated from immutable rollout identity; rollout-scoped keys and paginated history-base boundaries. | Primary-key semantics changed, so ingest performs a cold staged rebuild rather than mixing v8/v9 facts. |
 | 10 | One opened physical source snapshot per scan; source dev/inode/time identity and quarantine of malformed accounting or unfinished tails. | Changed damaged sources retry from byte zero; unchanged quarantined sources terminate cheaply. |
+| 11 | Required source- and quota-keyed usage indexes. | Schema 10 migrates additively on a staged copy; the indexes bound late source quarantine and orphan quota cleanup. |
 
-Current source can migrate physical versions 1 through 9 forward to 10. A
-newer version is not safe for an older reader. Migrations are transactional and
-forward-only; there is no supported in-place downgrade.
+The format layer can migrate physical versions 1 through 10 forward to 11.
+Normal ingestion cold-rebuilds versions through 9 because their fact or source
+identity semantics differ; schema 10 can take the additive staged migration.
+A newer version is not safe for an older reader. Migrations are transactional
+and forward-only; there is no supported in-place downgrade.
+
+Parser v11 is independent of the physical v11 index layout. It withholds an
+invalid provider quota window at record level while retaining unrelated valid
+usage, tool, and quota facts from that source. It also treats a selected
+paginated replacement with no `history_base` as a segment-start lineage reset,
+so descendants do not inherit snapshots from the replaced physical branch.
+The parser stamp forces still-present v10 sources to rescan; rotated rows retain
+their recorded parser provenance.
 
 ## Current table groups
 
@@ -88,15 +99,19 @@ forward-only; there is no supported in-place downgrade.
 
 Every rebuild or refresh writes a staged generation. A generation records exact
 source counts/bytes, indexed/skipped sources, diagnostics completion, and
-complete/partial status. Sources with ambiguous lineage, invalid content,
-unfinished tails, or other closed issues are quarantined rather than guessed.
+complete/partial status. Sources with ambiguous lineage, malformed accounting,
+unfinished tails, or other closed source-level issues are quarantined rather
+than guessed. A malformed quota observation is omitted with a closed diagnostic
+without discarding other valid facts from that source.
 
-The full rebuild command creates a separate
+The low-level rebuild primitive creates a separate
 `.building-<pid>-<timestamp>` database, performs integrity checks, fsyncs it,
 and atomically renames it over the selected destination. A crash leaves either
-the previous live database or the new one, not a torn mixture. There is no
-automatic backup and no dry-run mode; therefore recovery rehearsal must target
-a separate explicit path.
+the previous live database or the new one, not a torn mixture. The supported
+recovery CLI wraps that primitive in a copy-first prepare/apply workflow,
+creates a bound backup, and provides a non-writing `--dry-run`; follow the
+maintained recovery runbook rather than invoking the primitive as a recovery
+rehearsal.
 
 ## Reader and writer rules
 
@@ -112,9 +127,10 @@ a separate explicit path.
 
 ## Change contract
 
-A schema change requires, in one change:
+A schema or parser change requires, in one change:
 
-- a new `user_version` and parser version when meanings change;
+- a new parser version when extraction meaning changes, and a new
+  `user_version` when the physical format changes;
 - transactional migration and forward/older-reader failure tests;
 - schema, writer, reader, projection, generated contract, and fixture updates;
 - exact recovery implications in

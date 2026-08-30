@@ -105,6 +105,7 @@ const RECENT_COLLECTOR_PERIOD_LABEL =
 const MAX_REPLAY_SAFE_CACHE_AGE_MS = 30 * 60 * 1_000;
 const MAX_COLLECTOR_LIVE_AGE_MS = MAX_REPLAY_SAFE_CACHE_AGE_MS;
 const MAX_WEEKLY_PACE_OBSERVATIONS = 8_192;
+export const INFORMATIONAL_HISTORY_GAP_MAX_SHARE = 0.01;
 const ALLOWANCE_CAPACITY_SCHEMA_VERSION =
   "codex-primary-allowance-capacity-v0.1";
 const ALLOWANCE_SCENARIOS = Object.freeze([
@@ -118,6 +119,40 @@ const TIMELINE_WEIGHTING_STATUS_CODE = Object.freeze({
   partial: 1,
   unknown: 2,
 });
+
+export function isInformationalTerminalHistoryGap(historyCoverage) {
+  const sourceCount = Number.isSafeInteger(historyCoverage?.sourceCount)
+      && historyCoverage.sourceCount >= 0
+    ? historyCoverage.sourceCount
+    : null;
+  const indexedSourceCount = Number.isSafeInteger(
+    historyCoverage?.indexedSourceCount,
+  ) && historyCoverage.indexedSourceCount >= 0
+    ? historyCoverage.indexedSourceCount
+    : null;
+  const pendingSourceCount = Number.isSafeInteger(
+    historyCoverage?.pendingSourceCount,
+  ) && historyCoverage.pendingSourceCount >= 0
+    ? historyCoverage.pendingSourceCount
+    : null;
+  const skippedSourceCount = Number.isSafeInteger(
+    historyCoverage?.skippedSourceCount,
+  ) && historyCoverage.skippedSourceCount >= 0
+    ? historyCoverage.skippedSourceCount
+    : null;
+  return historyCoverage?.status === "partial"
+    && historyCoverage?.phase === "partial_terminal"
+    && sourceCount !== null
+    && sourceCount > 0
+    && indexedSourceCount !== null
+    && indexedSourceCount > 0
+    && pendingSourceCount === 0
+    && skippedSourceCount !== null
+    && skippedSourceCount > 0
+    && indexedSourceCount + skippedSourceCount === sourceCount
+    && skippedSourceCount / sourceCount
+      <= INFORMATIONAL_HISTORY_GAP_MAX_SHARE;
+}
 
 // These operator pages are direct HTML routes, not a browser data projection.
 // Keep the fixed route-to-file map beside the snapshot builder so the local
@@ -3097,9 +3132,15 @@ export async function buildLocalCompanionSnapshot({
   }
   if (historyCoverage.status !== "complete") {
     if (historyAccounting.status === "available") {
-      warnings.push(historyCoverage.phase === "partial_terminal"
-        ? `Indexed-history totals include ${historyCoverage.indexedSourceCount} verified sources; ${historyCoverage.skippedSourceCount} sources across ${historyCoverage.skippedThreadCount} threads were quarantined after a local integrity check. The missing portion is a known gap, not zero usage.`
-        : `Indexed-history totals currently cover ${historyCoverage.indexedSourceCount}/${historyCoverage.sourceCount} discovered sources and expand as later foreground refreshes advance the index.`);
+      if (historyCoverage.phase === "partial_terminal") {
+        warnings.push(isInformationalTerminalHistoryGap(historyCoverage)
+          ? `Indexed-history totals include ${historyCoverage.indexedSourceCount} of ${historyCoverage.sourceCount} verified sources. ${historyCoverage.skippedSourceCount} sources across ${historyCoverage.skippedThreadCount} threads did not pass local validation, so this result has limited history coverage; missing usage remains unavailable rather than zero.`
+          : `Indexed-history totals include ${historyCoverage.indexedSourceCount} of ${historyCoverage.sourceCount} verified sources. ${historyCoverage.skippedSourceCount} sources across ${historyCoverage.skippedThreadCount} threads did not pass local validation. This is a material coverage gap; missing usage remains unavailable rather than zero.`);
+      } else {
+        warnings.push(
+          `Indexed-history totals currently cover ${historyCoverage.indexedSourceCount}/${historyCoverage.sourceCount} discovered sources and expand as later foreground refreshes advance the index.`,
+        );
+      }
     } else if (historyCoverage.phase !== "invalid") {
       // A read failure is terminal for this refresh. Saying it is "still
       // advancing" would send the reader to wait for a pass that has already

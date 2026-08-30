@@ -1459,11 +1459,11 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(source, /button\.isBordered = false/u);
   assert.doesNotMatch(source, /\.systemYellow|\.systemGreen/u);
-  // The colorway mirrors the title's own precedence: a running refresh,
-  // then a terminal failure, then an incomplete index, then evidence.
+  // The colorway mirrors the title's own precedence: a running refresh and
+  // attested partial coverage are amber; hard failures remain rust.
   assert.match(
     source,
-    /private func nativeToolbarStatusColor\([\s\S]*?if isRefreshing \{[\s\S]*?return \.busy[\s\S]*?if nativeRefreshFailure != nil \{[\s\S]*?return \.failed[\s\S]*?!coverage\.isComplete \{[\s\S]*?return \.busy[\s\S]*?case \.live:[\s\S]*?return \.fresh/u,
+    /private func nativeToolbarStatusColor\([\s\S]*?if isRefreshing \{[\s\S]*?return \.busy[\s\S]*?coverage\.partialTerminal \{[\s\S]*?return \.busy[\s\S]*?if nativeRefreshFailure != nil \{[\s\S]*?return \.failed[\s\S]*?!coverage\.isComplete \{[\s\S]*?return \.busy[\s\S]*?case \.live:[\s\S]*?return \.fresh/u,
   );
   assert.match(source, /nativeStatusPill\?\.colorway = colorway/u);
   assert.match(source, /nativeDashboardFresh/u);
@@ -2274,12 +2274,13 @@ test("toolbar pill narrates index progress, terminal gaps, and refresh failure w
     source,
     /private enum NativeToolbarStatusText \{[\s\S]*?decimalNumberFormatter\(\s*maximumFractionDigits: 0\s*\)/u,
   );
-  // Failure identity first, then real indexing progress, outrank the
-  // evidence prose; complete coverage plus a non-failed refresh restores
-  // the existing "Fresh"/"Stale"/"Status" vocabulary untouched.
+  // An attested partial-coverage result is named before a generic failure;
+  // hard failure identity and real indexing progress still outrank the
+  // evidence prose. Complete coverage plus a non-failed refresh restores the
+  // existing "Fresh"/"Stale"/"Status" vocabulary untouched.
   assert.match(
     source,
-    /private func nativeToolbarEvidenceTitle\(fallback: String\) -> String \{[\s\S]*?if let failure = nativeRefreshFailure \{[\s\S]*?if let coverage = nativeHistoryIndexingCoverage, !coverage\.isComplete \{[\s\S]*?switch nativeEvidenceState \{/u,
+    /private func nativeToolbarEvidenceTitle\(fallback: String\) -> String \{[\s\S]*?coverage\.partialTerminal \{[\s\S]*?NativeToolbarStatusText\.historyPartial[\s\S]*?if let failure = nativeRefreshFailure \{[\s\S]*?if let coverage = nativeHistoryIndexingCoverage, !coverage\.isComplete \{[\s\S]*?switch nativeEvidenceState \{/u,
   );
   // The step vocabulary is closed on the client as well: an unrecognized
   // step renders as plain "Refresh failed".
@@ -2303,9 +2304,8 @@ test("toolbar pill narrates index progress, terminal gaps, and refresh failure w
     /guard \["failed", "degraded"\]\.contains\(status\) else \{\s*return \.notFailed\s*\}/u,
   );
   assert.match(source, /let sourceNoun = skippedSourceCount == 1 \? "source" : "sources"/u);
-  assert.match(source, /let threadNoun = skippedThreadCount == 1 \? "thread" : "threads"/u);
   assert.equal(source.includes(
-    '"History partial: \\(skippedSourceCount) \\(sourceNoun), \\(skippedThreadCount) \\(threadNoun) skipped"',
+    '"History coverage · \\(skippedSourceCount) \\(sourceNoun) unavailable"',
   ), true);
   assert.match(source, /history\["phase"\] as\? String\s*== "partial_terminal"/u);
   assert.match(

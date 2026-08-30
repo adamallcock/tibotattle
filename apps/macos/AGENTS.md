@@ -7,10 +7,10 @@ Apply the repository root guidance first.
 
 - Read `apps/macos/README.md` for the implemented lifecycle and
   `docs/runbooks/macos-stable-release-runbook.md` for the current stable release
-  order. For Preview or internal-dogfood work, first read
-  `docs/runbooks/2026-08-05-internal-dogfood-versus-release-readiness.md` so an
-  isolated product smoke is not mistaken for a same-identity upgrade proof.
-  Read only the relevant sections.
+  order. For Preview or internal-dogfood work, read the Preview and dogfood
+  sections of `apps/macos/README.md` plus the state-transition section of the
+  stable runbook, so an isolated product smoke is not mistaken for a
+  same-identity upgrade proof. Read only the relevant sections.
 - Treat Swift shell source, a development bundle, preview distribution, a signed
   and notarized candidate, an installed app, a Sparkle update, and a published
   release as separate artifacts and gates.

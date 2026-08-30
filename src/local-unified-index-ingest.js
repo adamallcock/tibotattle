@@ -1525,10 +1525,10 @@ export async function ingestLocalUnifiedIndexIncrement({
               },
             };
           const startOffset = resuming ? Number(cursor.scanned_bytes) : 0;
-          if (collector !== null && historySeed !== null
-              && snapshots.replaceFor(info, historySeed.seedSnapshots)) {
+          if (!resuming && collector !== null
+              && snapshots.replaceFor(info, historySeed?.seedSnapshots ?? [])) {
             writer.clearLineageSnapshots(state.sessionLocal);
-            for (const key of historySeed.seedSnapshots) {
+            for (const key of historySeed?.seedSnapshots ?? []) {
               writer.addLineageSnapshot(
                 state.sessionLocal,
                 snapshotLocal(deviceSalt, key),

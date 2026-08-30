@@ -24,6 +24,7 @@ import {
   diagnosticErrorCode,
   diagnosticReferenceSentence,
   diagnosticSurface,
+  historyCoverageNoticeKind,
   historyIndexContinuationDecision,
   isContributionReviewableQueueState,
   refreshQuickResultStatus,
@@ -1602,7 +1603,7 @@ const EVIDENCE_WARNING_PROGRESS =
 // sentences and their vocabulary — that state is being replaced wholesale by
 // serve-stale-while-recalculating, and its rendering is owned there.
 const EVIDENCE_WARNING_INFORMATIONAL =
-  /\b(?:loading|started fresh)\b/iu;
+  /\b(?:loading|started fresh|limited history coverage)\b/iu;
 
 function evidenceWarningTarget(message) {
   return EVIDENCE_WARNING_ROUTES
@@ -11151,6 +11152,9 @@ async function requestRefresh({ autoContinue = false } = {}) {
       button.textContent = t("refresh.degradedLoading");
       await loadLocalDashboard();
       lastReindexProgressReceipt = historyProgressReceipt();
+      const history = dashboard?.pricing?.historyCoverage
+        ?? dashboard?.accounting?.historyCoverage
+        ?? null;
       const skipped = finite(
         finalUnifiedIndex?.generation?.skippedSourceCount,
         0,
@@ -11173,7 +11177,10 @@ async function requestRefresh({ autoContinue = false } = {}) {
           : t("refresh.degradedGenericCopy", {
             code: finalFailureCode ?? "unified_index",
           }),
-        kind: "warning",
+        kind: historyCoverageNoticeKind({
+          history,
+          accountingProjection: dashboard?.accounting?.projection,
+        }),
       });
       return;
     }
