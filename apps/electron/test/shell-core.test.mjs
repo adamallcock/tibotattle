@@ -2585,6 +2585,10 @@ test("packaged Electron composition keeps the companion in app.asar and uses phy
   };
   const child = new FakeChild();
   const spawnCalls = [];
+  let resolveCompanionSpawn;
+  const companionSpawned = new Promise((resolve) => {
+    resolveCompanionSpawn = resolve;
+  });
   const launch = launchElectronShell({
     electron: {
       app,
@@ -2623,13 +2627,19 @@ test("packaged Electron composition keeps the companion in app.asar and uses phy
     supervisorOptions: {
       spawnChild(command, args, options) {
         spawnCalls.push({ command, args, options });
+        resolveCompanionSpawn();
         return child;
       },
       startupTimeoutMs: 1_000,
       shutdownTimeoutMs: 1_000,
     },
   });
-  await new Promise((resolveNext) => setImmediate(resolveNext));
+  // Settings initialization performs real filesystem I/O; one event-loop turn
+  // does not prove that composition has reached the injected spawn boundary.
+  await withTestTimeout(
+    Promise.race([companionSpawned, launch]),
+    "packaged_companion_spawn_timeout",
+  );
   assert.equal(spawnCalls.length, 1);
   assert.deepEqual(spawnCalls[0].args, [
     "/private/TiboTattle.app/Contents/Resources/app.asar/apps/local/server.js",
