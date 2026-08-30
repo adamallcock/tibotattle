@@ -34,7 +34,7 @@ test("bounded weekly summary rejects malformed datasets", () => {
   );
 });
 
-test("bounded weekly summaries can pin each quota-weighted scenario", () => {
+test("bounded weekly summaries can pin each speed-priced scenario", () => {
   const reset = Math.floor(
     Date.parse("2026-08-20T00:00:00.000Z") / 1_000,
   );
@@ -191,8 +191,8 @@ function resetTransitions({
 
 test("weekly reset provenance preserves mixed historical card windows", () => {
   const reset = Math.floor(Date.parse("2026-08-03T00:00:00.000Z") / 1_000);
-  const preChangeId = "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-01";
-  const postChangeId = "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-01";
+  const preChangeId = "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-30";
+  const postChangeId = "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-30";
   const transitions = resetTransitions({ reset }).map((row, index) => {
     const eventTime = new Date(
       Date.parse("2026-07-29T14:00:00.000Z") + index * 60 * 60 * 1_000,

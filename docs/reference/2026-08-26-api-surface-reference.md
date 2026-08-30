@@ -178,7 +178,6 @@ hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
 | `GET` | `/api/local/contribution/incremental-status` | Inspect incremental v1 eligibility, watermark, and state |
 | `POST` | `/api/local/contribution/incremental-approve` | Record explicit approval for the incremental contract |
 | `POST` | `/api/local/contribution/incremental-run` | Run one bounded incremental preparation/delivery cycle |
-| `GET`, `POST` | `/api/local/accounting/fast-mode-preference` | Read or set the closed fast-mode accounting preference |
 
 Refresh progress distinguishes source scanning from subsequent calculation.
 Once unified ingestion returns and accounting begins, the count-free receipt

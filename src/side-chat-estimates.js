@@ -6,10 +6,9 @@ import { DatabaseSync } from "node:sqlite";
 
 import {
   APP_PRICE_REGISTRY_MANIFEST,
-  DEFAULT_FAST_MODE_PREFERENCE,
+  DEFAULT_UNRESOLVED_SPEED_SCENARIO,
   emptySpeedWeightingCrossing,
   fastModeModelFamilyKey,
-  isFastModePreference,
   priceCodexUsageEvent,
   summarizeQuotaWeightedAccounting,
 } from "@app-usagemonitor/accounting";
@@ -474,7 +473,6 @@ function addHistoricalGapWeighting(crossing, speed, model, cost) {
 function historicalGapAllowanceWeighting({
   speedWeighting,
   declaredSpeedWeighting,
-  preference,
 }) {
   const summaries = Object.fromEntries([
     "unresolved_as_standard",
@@ -482,7 +480,7 @@ function historicalGapAllowanceWeighting({
   ].map((scenario) => [scenario, summarizeQuotaWeightedAccounting({
     speedWeighting,
     declaredSpeedWeighting,
-    preference: scenario === "unresolved_as_fast" ? "fast" : "standard",
+    unresolvedScenario: scenario,
   })]));
   const scenarios = Object.fromEntries(Object.entries(summaries).map(
     ([scenario, summary]) => {
@@ -503,11 +501,9 @@ function historicalGapAllowanceWeighting({
       }];
     },
   ));
-  const selectedScenario = preference === "mixed_unknown"
-    ? null
-    : preference === "fast"
-      ? "unresolved_as_fast"
-      : "unresolved_as_standard";
+  // The default scenario carries the money; the fast scenario stays visible
+  // as the sensitivity bound in `scenarios`.
+  const selectedScenario = DEFAULT_UNRESOLVED_SPEED_SCENARIO;
   const values = Object.values(scenarios)
     .map((scenario) => scenario.quotaWeightedUsd)
     .filter(Number.isFinite);
@@ -536,7 +532,6 @@ function historicalGapExactUsage(database, {
   startMs,
   endMs,
   declaredSpeedBaselines,
-  preference,
 }) {
   const statement = database.prepare(`
     SELECT u.observed_at_ms, u.session_local,
@@ -648,7 +643,6 @@ function historicalGapExactUsage(database, {
   const allowanceWeighting = historicalGapAllowanceWeighting({
     speedWeighting,
     declaredSpeedWeighting,
-    preference,
   });
   const scenarioValues = Object.values(allowanceWeighting.scenarios)
     .map((scenario) => scenario.quotaWeightedUsd)
@@ -702,7 +696,6 @@ export async function collectHistoricalSideChatGapProbe({
   date,
   timeZone = HISTORICAL_GAP_TIME_ZONE,
   assumedMissingSpeed = "fast",
-  fastModePreference = DEFAULT_FAST_MODE_PREFERENCE,
   declaredSpeedBaselines = [],
 } = {}) {
   if (typeof unifiedIndexFile !== "string" || unifiedIndexFile.length < 1
@@ -710,7 +703,6 @@ export async function collectHistoricalSideChatGapProbe({
       || typeof date !== "string" || !HISTORICAL_GAP_DATE.test(date)
       || timeZone !== HISTORICAL_GAP_TIME_ZONE
       || assumedMissingSpeed !== "fast"
-      || !isFastModePreference(fastModePreference)
       || !Array.isArray(declaredSpeedBaselines)) {
     throw new TypeError("Historical side-chat gap options are invalid");
   }
@@ -736,7 +728,6 @@ export async function collectHistoricalSideChatGapProbe({
       startMs,
       endMs,
       declaredSpeedBaselines,
-      preference: fastModePreference,
     });
     if (exactUsage.events === 0) {
       return unavailable("side_chat_historical_gap_usage_unavailable");

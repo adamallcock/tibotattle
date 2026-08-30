@@ -554,12 +554,12 @@ test("indexed history prices each event at its own effective date before and aft
     costUsd: row.costUsd,
   })), [
     {
-      priceCardId: "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-01",
+      priceCardId: "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-30",
       events: 1,
       costUsd: "2",
     },
     {
-      priceCardId: "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-01",
+      priceCardId: "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-30",
       events: 2,
       costUsd: "5",
     },
@@ -1009,8 +1009,8 @@ test("replay-safe fast pricing plans keep pre-change events on their historical 
   });
   const all = period(cache, "all");
   assert.deepEqual(all.priceCardIds, [
-    "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-01",
-    "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-01",
+    "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-30",
+    "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-30",
   ]);
   assert.deepEqual(all.priceCardBreakdown.map(({ priceCardId, events, costUsd }) => ({
     priceCardId,
@@ -1018,12 +1018,12 @@ test("replay-safe fast pricing plans keep pre-change events on their historical 
     costUsd,
   })), [
     {
-      priceCardId: "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-01",
+      priceCardId: "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-30",
       events: 1,
       costUsd: "2",
     },
     {
-      priceCardId: "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-01",
+      priceCardId: "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-30",
       events: 1,
       costUsd: "2.5",
     },
@@ -1297,7 +1297,7 @@ test("the same lineage-aware scan produces a bounded weekly calibration summary"
   assert.equal(fastCapacity.basis.unresolvedScenario, "unresolved_as_fast");
   assert.equal(
     standardCapacity.basis.multiplierRegistryRecordedAt,
-    "2026-08-01",
+    "2026-08-30",
   );
   assert.equal(
     standardCapacity.calibration.validation.selectedCostBasis,
@@ -1313,7 +1313,8 @@ test("the same lineage-aware scan produces a bounded weekly calibration summary"
     Number((fastCapacity.calibration.estimate.medianApiPriceEquivalentUsd
       / standardCapacity.calibration.estimate.medianApiPriceEquivalentUsd)
       .toFixed(6)),
-    2.5,
+    // The published GPT-5.6 Priority/Standard price ratio.
+    2,
   );
   assert.deepEqual(cache.weeklyCalibration.accountAttribution, {
     status: "historical_unattributed",

@@ -4,13 +4,13 @@ import {
   APP_PRICE_REGISTRY_MANIFEST,
   CODEX_SPEED_MODE_DECLARATION,
   CODEX_SPEED_MODE_OBSERVABILITY,
-  DEFAULT_FAST_MODE_PREFERENCE,
+  DEFAULT_UNRESOLVED_SPEED_SCENARIO,
+  FAST_MODE_ASSUMED_MULTIPLIER_SOURCE,
   FAST_MODE_MULTIPLIER_SOURCE,
   FAST_MODE_QUOTA_MULTIPLIERS,
   OPENAI_PRICE_EVIDENCE_START_DATE,
   QUOTA_WEIGHTED_API_PRICE_METRIC,
   inferFastModeFromCalibrationWindows,
-  isFastModePreference,
   summarizeQuotaWeightedAccounting,
 } from "@app-usagemonitor/accounting";
 import { codexPrimaryAllowanceBasis } from "./codex-primary-allowance-basis.js";
@@ -754,19 +754,12 @@ function projectLiveWeeklyCalibration(cache, cacheReadErrorCode = null) {
 
 function projectSelectedAllowanceWeeklyCalibration(
   cache,
-  preference,
   cacheReadErrorCode = null,
 ) {
   // The ordinary weekly summary is a diagnostic model-selection result.
   // Allowance-facing copy instead uses the forced speed scenario that matches
-  // the timeline numerator. The existing scalar weekly UI cannot safely show
-  // a mixed-unknown pair, so that state remains explicit and unavailable.
-  if (preference === "mixed_unknown") {
-    return unavailableLiveWeekly("allowance_capacity_range_not_renderable");
-  }
-  const scenario = preference === "fast"
-    ? "unresolved_as_fast"
-    : "unresolved_as_standard";
+  // the timeline numerator: the default unresolved-as-Standard scenario.
+  const scenario = DEFAULT_UNRESOLVED_SPEED_SCENARIO;
   const container = cache?.allowanceCapacityByScenario;
   const source = container?.scenarios?.[scenario];
   const expected = codexPrimaryAllowanceBasis(scenario);
@@ -855,7 +848,7 @@ function comparableAllowanceCapacityCohort(left, right) {
     ));
 }
 
-function projectAllowanceCapacity(container, preference) {
+function projectAllowanceCapacity(container) {
   const standardBasis = codexPrimaryAllowanceBasis(
     "unresolved_as_standard",
   );
@@ -888,31 +881,7 @@ function projectAllowanceCapacity(container, preference) {
     const { cohort: _cohort, ...projected } = row;
     return [scenario, projected];
   }));
-  if (preference === "mixed_unknown") {
-    if (!comparableAllowanceCapacityCohort(
-      internal.unresolved_as_standard,
-      internal.unresolved_as_fast,
-    )) {
-      return unavailable(
-        "allowance_capacity_scenarios_not_comparable",
-        scenarios,
-      );
-    }
-    return {
-      status: "range",
-      reason: null,
-      basisFamilyId: standardBasis.basisFamilyId,
-      selectedScenario: null,
-      scenarios,
-      accountAttribution: {
-        status: "historical_unattributed",
-        maySpanMultipleAccounts: true,
-      },
-    };
-  }
-  const selectedScenario = preference === "fast"
-    ? "unresolved_as_fast"
-    : "unresolved_as_standard";
+  const selectedScenario = DEFAULT_UNRESOLVED_SPEED_SCENARIO;
   if (internal[selectedScenario] === null) {
     return unavailable("selected_allowance_capacity_unavailable", scenarios);
   }
@@ -1095,7 +1064,7 @@ function projectCachePremiumScenario(value, scenario, basisFamilyId) {
   };
 }
 
-function projectCachePremiumWeighting(value, preference) {
+function projectCachePremiumWeighting(value) {
   const expectedFamily = codexPrimaryAllowanceBasis(
     "unresolved_as_standard",
   ).basisFamilyId;
@@ -1123,35 +1092,7 @@ function projectCachePremiumWeighting(value, preference) {
       value.basisFamilyId,
     ),
   ]));
-  if (preference === "mixed_unknown") {
-    if (scenarios.unresolved_as_standard === null
-        || scenarios.unresolved_as_fast === null) {
-      return unavailable(
-        value.scenarios?.unresolved_as_standard?.reasonCode
-          ?? value.scenarios?.unresolved_as_fast?.reasonCode
-          ?? "weighting_evidence_incomplete",
-        scenarios,
-      );
-    }
-    const endpoints = ALLOWANCE_SCENARIOS.map(
-      (scenario) => scenarios[scenario].quotaWeightedPremiumUsd,
-    );
-    return {
-      status: "range",
-      reasonCode: null,
-      basisFamilyId: expectedFamily,
-      selectedScenario: null,
-      selectedPremiumUsd: null,
-      scenarios,
-      rangePremiumUsd: {
-        lower: Math.min(...endpoints),
-        upper: Math.max(...endpoints),
-      },
-    };
-  }
-  const selectedScenario = preference === "fast"
-    ? "unresolved_as_fast"
-    : "unresolved_as_standard";
+  const selectedScenario = DEFAULT_UNRESOLVED_SPEED_SCENARIO;
   const selected = scenarios[selectedScenario];
   if (selected === null) {
     return unavailable(
@@ -1294,7 +1235,6 @@ function cacheSwitchImpactProjection(
   impact,
   selectedPeriodId,
   allowanceCapacity,
-  preference,
 ) {
   if (impact?.status !== "available" || !Array.isArray(impact.periods)) {
     return {
@@ -1315,7 +1255,6 @@ function cacheSwitchImpactProjection(
   const periods = impact.periods.map((period) => {
     const allowanceWeighting = projectCachePremiumWeighting(
       period.allowanceWeighting,
-      preference,
     );
     const projected = { ...period, allowanceWeighting };
     return {
@@ -1376,7 +1315,6 @@ function cacheContinuityImpactProjection(
   impact,
   selectedPeriodId,
   allowanceCapacity,
-  preference,
 ) {
   const methodology = {
     minimumGapSeconds: impact?.minimumGapSeconds ?? 0,
@@ -1401,7 +1339,6 @@ function cacheContinuityImpactProjection(
   const periods = impact.periods.map((period) => {
     const allowanceWeighting = projectCachePremiumWeighting(
       period.allowanceWeighting,
-      preference,
     );
     const projected = { ...period, allowanceWeighting };
     return {
@@ -1978,11 +1915,10 @@ function inferredFastEventsInPeriod(inference, periodId, nowMs) {
   return events;
 }
 
-function fastModeProjection(period, { preference, inference, nowMs }) {
+function fastModeProjection(period, { inference, nowMs }) {
   const summary = summarizeQuotaWeightedAccounting({
     speedWeighting: safeSpeedWeighting(period?.speedWeighting),
     declaredSpeedWeighting: safeSpeedWeighting(period?.declaredSpeedWeighting),
-    preference,
     inferredFastEvents: inferredFastEventsInPeriod(
       inference,
       period?.id ?? "all",
@@ -1991,12 +1927,12 @@ function fastModeProjection(period, { preference, inference, nowMs }) {
     inference,
   });
   return {
-    preference: summary.preference,
-    defaultPreference: DEFAULT_FAST_MODE_PREFERENCE,
+    unresolvedScenario: summary.unresolvedScenario,
     // Codex records a tier only when the setting is applied or changed, never
-    // at session start. Observed values forward-fill and always win; the
-    // preference attributes only the turns that precede the first observation
-    // in their session.
+    // at session start. Observed values forward-fill and always win; turns
+    // that precede the first observation in their session and carry no
+    // covering declaration are attributed to Standard as a visible
+    // assumption.
     logObservability: { ...CODEX_SPEED_MODE_OBSERVABILITY },
     // The Codex configuration's `service_tier` key recovers the baseline the
     // log never writes, but only forward from the moment it was read.
@@ -2138,7 +2074,7 @@ function mergeCalibrationUsageTimeline(exactRows, estimatedRows) {
 // quota-weighted amount. The full speed crossing stays server-side. If an old
 // or malformed producer omitted any event/cost from the crossing, the bucket
 // is explicit unknown and carries no usable weighted scalar.
-function quotaWeightedUsageTimeline(rows, { preference, inference }) {
+function quotaWeightedUsageTimeline(rows, { inference }) {
   return rows.map((row) => {
     const speedWeighting = safeSpeedWeighting(row.speedWeighting);
     const declaredSpeedWeighting = safeSpeedWeighting(
@@ -2149,7 +2085,7 @@ function quotaWeightedUsageTimeline(rows, { preference, inference }) {
       summarizeQuotaWeightedAccounting({
         speedWeighting,
         declaredSpeedWeighting,
-        preference: scenario === "unresolved_as_fast" ? "fast" : "standard",
+        unresolvedScenario: scenario,
         inference,
       }),
     ]));
@@ -2173,7 +2109,7 @@ function quotaWeightedUsageTimeline(rows, { preference, inference }) {
           totalEvents: row.usageEvents,
           observedEvents: 0,
           declaredFromConfigEvents: 0,
-          assumedFromPreferenceEvents: 0,
+          assumedEvents: 0,
           inferredEvents: 0,
           unknownEvents: row.usageEvents,
           observedSharePercent: row.usageEvents === 0 ? null : 0,
@@ -2214,7 +2150,7 @@ function quotaWeightedUsageTimeline(rows, { preference, inference }) {
           value.coveredSubtotalUsd,
           coverage.observedEvents,
           coverage.declaredFromConfigEvents,
-          coverage.assumedFromPreferenceEvents,
+          coverage.assumedEvents,
           coverage.inferredEvents,
           coverage.unknownEvents,
         ];
@@ -2223,18 +2159,14 @@ function quotaWeightedUsageTimeline(rows, { preference, inference }) {
   });
 }
 
-function timelineAllowanceWeightingEncoding(preference) {
+function timelineAllowanceWeightingEncoding() {
   return {
     schemaVersion: TIMELINE_ALLOWANCE_WEIGHTING_SCHEMA_VERSION,
     basisFamilyId: codexPrimaryAllowanceBasis(
       "unresolved_as_standard",
     ).basisFamilyId,
     scenarioOrder: [...ALLOWANCE_SCENARIOS],
-    selectedScenario: preference === "mixed_unknown"
-      ? null
-      : preference === "fast"
-        ? "unresolved_as_fast"
-        : "unresolved_as_standard",
+    selectedScenario: DEFAULT_UNRESOLVED_SPEED_SCENARIO,
   };
 }
 
@@ -2436,9 +2368,6 @@ export async function buildLocalCompanionSnapshot({
   // full mode before it becomes authoritative.
   unifiedProjectionMode = "full",
   allowDevelopmentArtifactFallback = false,
-  // Owner-stated Codex speed mode. The composition root reads it from
-  // owner-only local state; an unrecognised value never becomes a silent Fast.
-  fastModePreference = DEFAULT_FAST_MODE_PREFERENCE,
   // Timestamped Codex `service_tier` readings from the owner-only declared
   // baseline ledger. Each covers only the interval it was observed over, so a
   // reading never reaches back before it happened, and an observed tier always
@@ -2470,9 +2399,6 @@ export async function buildLocalCompanionSnapshot({
   const declaredSpeedBaselines = Array.isArray(codexSpeedBaselines)
     ? codexSpeedBaselines
     : [];
-  const selectedFastModePreference = isFastModePreference(fastModePreference)
-    ? fastModePreference
-    : DEFAULT_FAST_MODE_PREFERENCE;
   if (typeof includeDevelopmentSideChatEstimates !== "boolean") {
     throw new TypeError("includeDevelopmentSideChatEstimates must be a boolean");
   }
@@ -2522,7 +2448,6 @@ export async function buildLocalCompanionSnapshot({
         date: developmentSideChatHistoricalGapDate,
         timeZone: developmentSideChatHistoricalGapTimeZone,
         assumedMissingSpeed: developmentSideChatHistoricalGapAssumedSpeed,
-        fastModePreference: selectedFastModePreference,
         declaredSpeedBaselines,
       }))
       .catch(() => unavailableHistoricalSideChatGapProbe(
@@ -2700,12 +2625,10 @@ export async function buildLocalCompanionSnapshot({
     : staleReplaySafeProvenance(staleReplaySafe);
   let allowanceWeekly = projectSelectedAllowanceWeeklyCalibration(
     replaySafeCache,
-    selectedFastModePreference,
     replaySafeAccounting.errorCode,
   );
   let allowanceCapacity = projectAllowanceCapacity(
     replaySafeCache?.allowanceCapacityByScenario,
-    selectedFastModePreference,
   );
   if (staleProvenance !== null) {
     // The stale artifact rides the SAME validating projections as a current
@@ -2716,7 +2639,6 @@ export async function buildLocalCompanionSnapshot({
     // elsewhere in the artifact — which is what makes this serve useful.)
     const staleWeekly = projectSelectedAllowanceWeeklyCalibration(
       staleReplaySafe.cache,
-      selectedFastModePreference,
       null,
     );
     if (staleWeekly.status !== "unavailable") {
@@ -2724,7 +2646,6 @@ export async function buildLocalCompanionSnapshot({
     }
     const staleCapacity = projectAllowanceCapacity(
       staleReplaySafe.cache?.allowanceCapacityByScenario,
-      selectedFastModePreference,
     );
     if (staleCapacity.status !== "unavailable") {
       allowanceCapacity = { ...staleCapacity, stale: staleProvenance };
@@ -2870,19 +2791,16 @@ export async function buildLocalCompanionSnapshot({
     unified.cacheSwitchImpact,
     displayUsage?.id ?? "all",
     allowanceCapacity,
-    selectedFastModePreference,
   );
   const cacheContinuityImpact = cacheContinuityImpactProjection(
     unified.cacheContinuityImpact,
     displayUsage?.id ?? "all",
     allowanceCapacity,
-    selectedFastModePreference,
   );
   const fastModeInference = inferFastModeFromCalibrationWindows(
     fastModeCalibrationWindows(replaySafeCache?.weeklyCalibration),
   );
   const fastModeContext = {
-    preference: selectedFastModePreference,
     inference: fastModeInference,
     nowMs,
   };
@@ -3231,9 +3149,7 @@ export async function buildLocalCompanionSnapshot({
           : replaySafeCache?.bucketMinutes
             ?? collector.timeline.bucketMinutes,
         coveredAt: timelineCoveredAt,
-        allowanceWeightingEncoding: timelineAllowanceWeightingEncoding(
-          selectedFastModePreference,
-        ),
+        allowanceWeightingEncoding: timelineAllowanceWeightingEncoding(),
         usage: exactUsageTimeline,
         ...(includeDevelopmentSideChatEstimates
           ? { calibrationUsage: calibrationUsageTimeline }

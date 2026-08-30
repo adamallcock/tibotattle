@@ -5,6 +5,7 @@ import {
   V1_ANALYSIS_WINDOW_DAYS,
   accountScopedQuotaAnalysisV1,
 } from "./quota-analysis-v1";
+import { SERVER_PRICING_METHOD_VERSION } from "./server-pricing";
 
 /**
  * The community allowance series: for a UTC day, the fitted seven-day Codex
@@ -60,8 +61,18 @@ const NANOUSD_PER_USD = 1_000_000_000;
 // without a chunk change. v1-fit-2: cohort by plan_type alone (dropped the
 // synthesized pro-20x variant pin). v1-fit-3: derive totalInputContextTokens
 // for v1 usage (records carry it null) + drop no-observation records, so the
-// OpenAI context-sensitive pricer no longer refuses every reset.
-const FIT_ADAPTER_VERSION = "v1-fit-5";
+// OpenAI context-sensitive pricer no longer refuses every reset. v1-fit-6:
+// Codex subscription Fast events price at the published Priority (Fast) API
+// rate via the speed ratio (server pricing v0.3), so fits move to the
+// speed-priced basis; the server pricing method version also joins the cache
+// key so future pricing-semantics changes self-invalidate.
+const FIT_ADAPTER_VERSION = "v1-fit-6";
+// The tail of every v1 fit-cache key beyond the participant's chunk epoch.
+// One constant serves the writer and both readers so they can never diverge
+// (a 2026-08-30 regression had the corpus reader expecting one fewer segment,
+// which starved the admin allowance preview).
+const V1_FIT_CACHE_KEY_SUFFIX =
+  `${APP_PRICE_REGISTRY_MANIFEST.sha256}:${FIT_ADAPTER_VERSION}:${SERVER_PRICING_METHOD_VERSION}`;
 
 export const COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG = Object.freeze([
   Object.freeze({ planType: "pro", label: "Pro 20x", multiplier: 1 }),
@@ -253,8 +264,7 @@ export async function collectCommunityAllowanceFits(
             WHERE participant_id = ? AND superseded_at IS NULL`,
         ).bind(row.participant_id).first<{ n: number; newest: string; revsum: number }>();
         v1CacheKey = `${Number(epoch?.n ?? 0)}:${epoch?.newest ?? ""}:`
-          + `${Number(epoch?.revsum ?? 0)}:${APP_PRICE_REGISTRY_MANIFEST.sha256}:`
-          + `${FIT_ADAPTER_VERSION}`;
+          + `${Number(epoch?.revsum ?? 0)}:${V1_FIT_CACHE_KEY_SUFFIX}`;
         const cached = await db.prepare(
           `SELECT fits_json FROM community_allowance_fit_cache
             WHERE participant_id = ? AND cache_key = ?`,
@@ -399,7 +409,7 @@ export async function readCachedCommunityAllowanceCorpus(
                 CAST(COUNT(chunks.participant_id) AS TEXT)
                   || ':' || COALESCE(MAX(chunks.created_at), '')
                   || ':' || CAST(COALESCE(SUM(chunks.revision), 0) AS TEXT)
-                  || ':' || ? || ':' || ? AS expected_cache_key
+                  || ':' || ? AS expected_cache_key
            FROM participant_sources sources
            LEFT JOIN telemetry_v1_chunks chunks
              ON chunks.participant_id = sources.participant_id
@@ -419,8 +429,7 @@ export async function readCachedCommunityAllowanceCorpus(
            ON cache.participant_id = sources.participant_id
         ORDER BY sources.participant_id`,
     ).bind(
-      APP_PRICE_REGISTRY_MANIFEST.sha256,
-      FIT_ADAPTER_VERSION,
+      V1_FIT_CACHE_KEY_SUFFIX,
     ).all<CachedCommunityAllowanceFitRow>();
     if (!Array.isArray(result.results)) return null;
     rows = result.results;

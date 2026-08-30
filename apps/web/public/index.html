@@ -279,13 +279,13 @@
           <article class="panel">
             <div class="panel-heading">
               <div>
-                <p class="panel-kicker" id="cost-metric-kicker">Quota-weighted API-price equivalent</p>
+                <p class="panel-kicker" id="cost-metric-kicker">Speed-priced API-price equivalent</p>
                 <h3>Replay-safe usage cost</h3>
               </div>
             </div>
             <p class="annotation" id="pricing-note">
               Standard-rate API prices applied to non-overlapping local token
-              increments, then multiplied by the published Fast credit rate for
+              increments, then multiplied by the published Priority (Fast) API price ratio for
               increments whose effective mode is Fast. It tracks relative quota
               consumption; it is not a subscription charge or a published dollar limit.
             </p>
@@ -385,7 +385,7 @@
               <p class="annotation" id="calibration-model-shared" hidden></p>
             </details>
             <p class="annotation calibration-explanation" id="calibration-explanation">
-              This fit uses quota-weighted API prices as a measuring stick. It is not a
+              This fit uses speed-priced API prices as a measuring stick. It is not a
               provider-published dollar allowance.
             </p>
           </article>
@@ -403,7 +403,7 @@
 
         <div class="weekly-hero">
           <div>
-            <span id="weekly-estimate-label" data-i18n="weekly.headline.label">Quota-weighted all-data median</span>
+            <span id="weekly-estimate-label" data-i18n="weekly.headline.label">Speed-priced all-data median</span>
             <strong id="weekly-estimate">—</strong>
             <small id="weekly-range">No evidence interval available</small>
           </div>
@@ -580,11 +580,11 @@
           </div>
           <div class="legend calibration-legend" aria-label="Calibration chart legend" data-i18n-aria-label="aria.calibrationLegend">
             <span><i class="legend-dot observed"></i>Observed quota</span>
-            <span><i class="legend-dot expected"></i>Expected from quota-weighted API cost</span>
+            <span><i class="legend-dot expected"></i>Expected from speed-priced API cost</span>
             <span class="legend-group-sep" aria-hidden="true"></span>
             <span><i class="legend-dot area chart-status-missing"></i>Missing quota bracket</span>
             <span><i class="legend-dot area chart-status-reset"></i>Window boundary or track change</span>
-            <span><i class="legend-dot area chart-status-weighting"></i>Quota weighting unavailable</span>
+            <span><i class="legend-dot area chart-status-weighting"></i>Speed pricing unavailable</span>
             <span><i class="legend-dot area chart-status-ambiguous"></i>Movement needs context</span>
             <span><i class="legend-dot area chart-status-saturated"></i>Allowance exhausted</span>
           </div>
@@ -710,7 +710,7 @@
                 <span class="sr-only" id="usage-zoom-status" aria-live="polite"></span>
               </div>
               <div class="legend compact-legend" aria-label="Usage chart legend" data-i18n-aria-label="aria.usageLegend">
-                <span><i class="legend-dot cost"></i><span id="usage-cost-legend-label">Quota-weighted API-equivalent usage</span></span>
+                <span><i class="legend-dot cost"></i><span id="usage-cost-legend-label">Speed-priced API-equivalent usage</span></span>
                 <span id="usage-allowance-legend"><i class="legend-dot allowance"></i>Seven-day allowance remaining</span>
               </div>
             </div>
@@ -744,7 +744,7 @@
             <strong>API pricing is a measuring stick, not your bill.</strong>
             <p>
               Each local usage change uses the public API price that was in
-              effect when it occurred, with the published Fast multiplier when
+              effect when it occurred, with the published Priority (Fast) price ratio when
               applicable. It is an equivalent for comparison, not an invoice.
             </p>
           </div>
