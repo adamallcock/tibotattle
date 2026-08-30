@@ -30,7 +30,11 @@ import {
 import {
   LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
   LOCAL_UNIFIED_INDEX_APPLICATION_ID,
+  LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION,
+  LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARSER_VERSION,
   LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+  LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION,
   LOCAL_UNIFIED_INDEX_USER_VERSION,
   readLocalUnifiedIndexCompatibility,
   readUnifiedIndexGenerationDescriptor,
@@ -50,9 +54,6 @@ import {
 import {
   runIncrementalContributionSyncOnce,
 } from "../../src/contribution-incremental-sync.js";
-import {
-  createFastModePreferenceController,
-} from "../../src/fast-mode-preference.js";
 import {
   HostedSignInHandoffError,
   createHostedSignInHandoffController,
@@ -135,9 +136,6 @@ import {
   RELEASE_VERSION,
   RELEASE_VERSION_PLACEHOLDER,
 } from "../../config/release-manifest.js";
-import {
-  FAST_MODE_PREFERENCE_VALUES,
-} from "@app-usagemonitor/accounting";
 import {
   validateTelemetryContribution,
 } from "@app-usagemonitor/telemetry-contract";
@@ -241,7 +239,60 @@ function openImmutableLocalUnifiedIndex(indexFile) {
   });
 }
 
-function inspectMigratableLocalUnifiedIndex(indexFile, inspect, openDatabase) {
+function publishedParserUpgradeNeedsColdRefresh(database, compatibility, schemaVersion) {
+  // This is a deadline decision, not permission to read or publish facts. The
+  // worker still validates the complete index. Admit only the observed v10 ->
+  // v11 transition; unknown/future parser stamps never earn a longer deadline.
+  if (LOCAL_UNIFIED_INDEX_PARSER_VERSION !== "unified-rollout-typed-v11"
+      || schemaVersion !== LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
+      || !compatibility.metadataPresent
+      || compatibility.formatUserVersion !== LOCAL_UNIFIED_INDEX_USER_VERSION
+      || compatibility.minimumReaderUserVersion
+        !== LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION
+      || compatibility.minimumWriterUserVersion
+        !== LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION) {
+    return false;
+  }
+  const metadata = database.prepare("SELECT value FROM meta WHERE key = ?");
+  if (metadata.get("source_identity_version")?.value
+        !== LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION
+      || metadata.get("contract_version")?.value !== TELEMETRY_SCHEMA_VERSION) {
+    return false;
+  }
+  const generationId = Number(metadata.get("current_generation_id")?.value);
+  if (!Number.isSafeInteger(generationId) || generationId < 1) return false;
+
+  // Follow only the published generation, never a rotated source's older
+  // parser row. Fixed-key/primary-key reads avoid loading meta/issue collections
+  // or scanning facts on the HTTP thread. Terminal predicates mirror the
+  // ingestion worker's supported previous-generation states.
+  const generation = database.prepare(`
+    SELECT p.parser_version, p.contract_version AS parser_contract_version,
+           g.contract_version, g.completed_at_ms
+    FROM index_generation g JOIN parser_version p ON p.id = g.parser_version_id
+    WHERE g.id = ?
+      AND g.discovery_complete = 1 AND g.diagnostics_complete = 1
+      AND g.usage_provenance_complete = 1 AND g.source_order_complete = 1
+      AND g.quota_provenance_complete = 1
+      AND (
+        (g.status = 'complete' AND g.block_reason IS NULL
+          AND g.tool_provenance_complete = 1)
+        OR (g.status = 'partial'
+          AND g.block_reason = 'codex_rollout_sources_quarantined'
+          AND g.skipped_source_count > 0)
+        OR (g.status = 'partial'
+          AND g.block_reason = 'tool_provenance_incomplete'
+          AND g.tool_provenance_complete = 0)
+      )
+  `).get(generationId);
+  return generation?.parser_version === "unified-rollout-typed-v10"
+    && generation.parser_contract_version === TELEMETRY_SCHEMA_VERSION
+    && generation.contract_version === TELEMETRY_SCHEMA_VERSION
+    && Number.isSafeInteger(generation.completed_at_ms)
+    && generation.completed_at_ms >= 0;
+}
+
+function inspectColdRefreshLocalUnifiedIndex(indexFile, inspect, openDatabase) {
   let before;
   try {
     before = inspect(indexFile);
@@ -254,7 +305,7 @@ function inspectMigratableLocalUnifiedIndex(indexFile, inspect, openDatabase) {
   }
 
   let database;
-  let migratable = false;
+  let requiresColdRefresh = false;
   try {
     database = openDatabase(indexFile);
     database.exec("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;");
@@ -262,7 +313,7 @@ function inspectMigratableLocalUnifiedIndex(indexFile, inspect, openDatabase) {
     if (compatibility.applicationId !== LOCAL_UNIFIED_INDEX_APPLICATION_ID
         || !Number.isSafeInteger(compatibility.userVersion)
         || compatibility.userVersion < 1
-        || compatibility.userVersion >= LOCAL_UNIFIED_INDEX_USER_VERSION
+        || compatibility.userVersion > LOCAL_UNIFIED_INDEX_USER_VERSION
         || compatibility.metadataPartial
         || compatibility.metadataMalformed
         || (compatibility.metadataPresent && [
@@ -286,17 +337,18 @@ function inspectMigratableLocalUnifiedIndex(indexFile, inspect, openDatabase) {
     // also blocks health and cancellation. This main-thread selector proves
     // only bounded compatibility metadata; the off-main ingestion worker owns
     // full schema, integrity, migration, and publication validation.
-    migratable = true;
+    requiresColdRefresh = compatibility.userVersion < LOCAL_UNIFIED_INDEX_USER_VERSION
+      || publishedParserUpgradeNeedsColdRefresh(database, compatibility, schemaVersion);
   } catch {
-    migratable = false;
+    requiresColdRefresh = false;
   } finally {
     try {
       database?.close();
     } catch {
-      migratable = false;
+      requiresColdRefresh = false;
     }
   }
-  if (!migratable || localUnifiedIndexHasSidecar(indexFile, inspect)) {
+  if (!requiresColdRefresh || localUnifiedIndexHasSidecar(indexFile, inspect)) {
     return false;
   }
   try {
@@ -308,9 +360,10 @@ function inspectMigratableLocalUnifiedIndex(indexFile, inspect, openDatabase) {
 
 /**
  * Select the refresh deadline from the index's actual state at the start of
- * each run. An exact missing target or a read-only-proven migratable schema
- * gets the bounded cold-build window. Current, future, clearly corrupt,
- * foreign, or otherwise uncertain state keeps the normal deadline.
+ * each run. An exact missing target, read-only-proven migratable schema, or
+ * supported published parser-upgrade rescan gets the bounded cold-build window.
+ * Current-parser, future, clearly corrupt, foreign, or otherwise uncertain
+ * state keeps the normal deadline.
  */
 export function localCompanionRefreshTimeoutForUnifiedIndex(
   indexFile,
@@ -346,7 +399,7 @@ export function localCompanionRefreshTimeoutForUnifiedIndex(
   } catch (error) {
     return error?.code === "ENOENT" ? freshTimeoutMs : existingTimeoutMs;
   }
-  return inspectMigratableLocalUnifiedIndex(
+  return inspectColdRefreshLocalUnifiedIndex(
     resolvedIndexFile,
     inspect,
     openDatabase,
@@ -579,7 +632,6 @@ const DIAGNOSTIC_SURFACES = new Set([
   "contribution_prepare",
   "contribution_send",
   "device_credential_reset",
-  "fast_mode_preference",
   "hosted_identity",
   "hosted_privacy",
   "local_refresh",
@@ -699,7 +751,6 @@ const API_ROUTES = new Set([
   "/api/local/contribution/incremental-status",
   "/api/local/contribution/incremental-approve",
   "/api/local/contribution/incremental-run",
-  "/api/local/accounting/fast-mode-preference",
 ]);
 
 // Routes that do not read the Codex dashboard snapshot must answer while that
@@ -1462,31 +1513,6 @@ async function readBoundedJsonObject(request) {
 function boundedRequestStatus(error) {
   if (error?.code === "unsupported_media_type") return 415;
   return error?.code === "request_too_large" ? 413 : 400;
-}
-
-async function authorizeFastModePreference(request, response) {
-  if (!sameOrigin(request)
-      || request.headers["x-usage-monitor-local"] !== "1") {
-    sendError(response, 403, "fast_mode_preference_not_authorized");
-    return null;
-  }
-  let value;
-  try {
-    value = await readBoundedJsonObject(request);
-  } catch (error) {
-    sendError(
-      response,
-      boundedRequestStatus(error),
-      error.code ?? "invalid_request",
-    );
-    return null;
-  }
-  if (Object.keys(value).sort().join("\0") !== "mode"
-      || !FAST_MODE_PREFERENCE_VALUES.includes(value.mode)) {
-    sendError(response, 400, "invalid_request");
-    return null;
-  }
-  return Object.freeze({ mode: value.mode });
 }
 
 async function authorizeDiagnosticNote(request, response) {
@@ -2790,9 +2816,6 @@ function createPreparedLocalCompanionServer({
   // legacy is retained only for an explicit rollback selection.
   accountingSourceMode =
     configuredAccountingSourceMode(environment),
-  fastModePreference = createFastModePreferenceController({
-    settingsFile: statePaths.fastModePreferenceFile,
-  }),
   // The declared Codex speed-mode baseline. Codex records the mode only when
   // it is applied or changed, never at session start, so the baseline lives
   // nowhere but the configuration's top-level `service_tier` key - and only
@@ -2836,11 +2859,6 @@ function createPreparedLocalCompanionServer({
       developmentSideChatHistoricalGapAssumedSpeed:
         environment.USAGE_MONITOR_DEVELOPMENT_SIDE_CHAT_BACKCAST_SPEED
           ?? "fast",
-      // The owner's stated Codex speed mode. It attributes only the turns that
-      // precede the first recorded tier change in their session; an observed
-      // tier always wins. A missing or unreadable statement degrades to the
-      // Standard default rather than inventing a Fast attribution.
-      fastModePreference: await fastModePreference.readMode(),
       // Timestamped declared baselines. They fill only the turns the rollout
       // log left unobserved and that a reading actually covers; an observed
       // tier always wins, and an unreadable ledger is simply no coverage.
@@ -3459,19 +3477,41 @@ function createPreparedLocalCompanionServer({
   // converges such installs while keeping the oldest set: it is the instance
   // the approve-once consent was reviewed against. Failures are swallowed —
   // the next launch retries, and delivery state is never touched.
-  const maybeRetireSupersededPreparedSets = async () => {
-    const verdict = await incrementalConsentVerdict();
-    if (verdict?.approved !== true || verdict?.current !== true) return;
-    try {
-      await runSupersededContributionRetirement({});
-    } catch {
-      // Bounded cleanup only; the queue converges on a later pass.
+  let contributionRuntimeStart = null;
+  let contributionRuntimeShutdown = null;
+  let supersededContributionRetirementPending = null;
+  let supersededContributionRetirementRequested = false;
+  const maybeRetireSupersededPreparedSets = () => {
+    if (contributionRuntimeShutdown !== null) return Promise.resolve();
+    supersededContributionRetirementRequested = true;
+    if (supersededContributionRetirementPending === null) {
+      supersededContributionRetirementPending = Promise.resolve().then(async () => {
+        // Overlapping triggers share one writer and at most one queued pass.
+        // Re-read consent on a queued pass: an approval can arrive while the
+        // startup probe is still returning its pre-consent verdict.
+        try {
+          while (supersededContributionRetirementRequested
+              && contributionRuntimeShutdown === null) {
+            supersededContributionRetirementRequested = false;
+            const verdict = await incrementalConsentVerdict();
+            if (contributionRuntimeShutdown !== null) return;
+            if (verdict?.approved !== true || verdict?.current !== true) continue;
+            try {
+              await runSupersededContributionRetirement({});
+            } catch {
+              // Bounded cleanup only; the queue converges on a later pass.
+            }
+          }
+        } finally {
+          supersededContributionRetirementPending = null;
+        }
+      });
     }
+    return supersededContributionRetirementPending;
   };
   let automaticContributionRetirementLock = null;
   let automaticContributionRetirementLockRelease = null;
   let automaticContributionRetirement = null;
-  let contributionRuntimeShutdown = null;
   let instanceLockPromise = null;
   let snapshotPromise = null;
   // Building the first snapshot reads the whole retained collector state, which
@@ -3493,14 +3533,22 @@ function createPreparedLocalCompanionServer({
   };
   const shutdownContributionRuntime = () => {
     if (contributionRuntimeShutdown === null) {
-      contributionRuntimeShutdown = (async () => {
+      // Publish the shutdown fence before calling any asynchronous producer.
+      contributionRuntimeShutdown = Promise.resolve().then(async () => {
+        // A start already in flight can persist settings and arm a timer.
+        // Drain only that start before stopping, never the snapshot promise:
+        // snapshot initialization can itself fail into this shutdown path.
+        await contributionRuntimeStart?.catch(() => {});
         try {
           await incrementalContribution?.stop();
         } catch {
           onError("incremental_contribution_stop_failed");
         }
+        // Retirement includes its consent probe and may still write private
+        // state. Keep the instance lock until that accepted work has settled.
+        await supersededContributionRetirementPending?.catch(() => {});
         await releaseAutomaticContributionRetirementLock();
-      })();
+      });
     }
     return contributionRuntimeShutdown;
   };
@@ -3544,12 +3592,19 @@ function createPreparedLocalCompanionServer({
           // The v1.0 incremental sync remains the only contribution scheduler.
           // A failure here must never take the local dashboard down.
           try {
-            await incrementalContribution?.start();
+            if (contributionRuntimeShutdown === null) {
+              contributionRuntimeStart = Promise.resolve().then(() => {
+                if (contributionRuntimeShutdown === null) {
+                  return incrementalContribution?.start();
+                }
+              });
+              await contributionRuntimeStart;
+            }
           } catch {
             onError("incremental_contribution_start_failed");
           }
-          // Fire-and-forget: superseded v0.1 sets are cleanup, not readiness,
-          // so the snapshot never waits on (or fails with) the pass.
+          // Superseded v0.1 sets are cleanup, not readiness: only shutdown
+          // drains the tracked pass, so the snapshot never waits on it.
           void maybeRetireSupersededPreparedSets().catch(() => {});
           snapshotState = { status: "ready", errorCode: null };
           announceSnapshotOutcome();
@@ -4215,45 +4270,6 @@ function createPreparedLocalCompanionServer({
           configured: true,
           keychainPrompt: keychainPromptSurface(),
         }));
-        return;
-      }
-      if (path === "/api/local/accounting/fast-mode-preference") {
-        if (request.method === "GET") {
-          try {
-            send(response, 200, await fastModePreference.inspect());
-          } catch {
-            sendError(response, 500, "fast_mode_preference_unavailable");
-          }
-          return;
-        }
-        if (request.method !== "POST") {
-          sendError(response, 405, "method_not_allowed");
-          return;
-        }
-        const selection = await authorizeFastModePreference(request, response);
-        if (selection === null) return;
-        let updated;
-        try {
-          updated = await fastModePreference.select(selection.mode);
-        } catch (error) {
-          sendError(
-            response,
-            error?.code === "fast_mode_preference_invalid" ? 400 : 500,
-            error?.code === "fast_mode_preference_invalid"
-              ? "fast_mode_preference_invalid"
-              : "fast_mode_preference_unavailable",
-          );
-          return;
-        }
-        // The accounting projection is derived from this statement, so the
-        // cached snapshot is rebuilt before the response is acknowledged.
-        try {
-          await dataStore.reload();
-        } catch {
-          // A stale snapshot is not a reason to lose the stored preference;
-          // the next refresh picks it up.
-        }
-        send(response, 200, updated);
         return;
       }
       if (path === "/api/local/contribution/sync-status") {

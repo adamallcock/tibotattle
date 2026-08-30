@@ -175,6 +175,16 @@ function fakeIncrementalController() {
   };
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 // The immediate-first-pass kicks are fire-and-forget on the response path
 // (2026-08-08), so give the event loop a few turns before counting them.
 async function settleKicks() {
@@ -1648,6 +1658,365 @@ test("an approved consent's startup and approval converge superseded v0.1 sets",
     await settleKicks();
     assert.equal(retirements.length, 2, "an approved startup runs one pass");
   } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("shutdown drains an in-flight superseded-set retirement before releasing its lock or closing", async () => {
+  const files = await fixture();
+  const controller = fakeIncrementalController();
+  await controller.approve();
+  const retirementStarted = deferred();
+  const allowRetirementToFinish = deferred();
+  const retirementFinished = deferred();
+  const stopStarted = deferred();
+  const lifecycle = [];
+  const stop = controller.stop;
+  controller.stop = async () => {
+    await stop();
+    lifecycle.push("stop");
+    stopStarted.resolve();
+  };
+  const marker = join(files.stateRoot, "private", "retirement-finished");
+  const app = await startApp(files, {
+    incrementalContributionController: controller,
+    automaticContributionRetirementLockAcquirer: async () => ({
+      async release() { lifecycle.push("lock-released"); },
+    }),
+    supersededContributionRetirementRunner: async () => {
+      retirementStarted.resolve();
+      await allowRetirementToFinish.promise;
+      await mkdir(join(files.stateRoot, "private"), { recursive: true, mode: 0o700 });
+      await writeFile(marker, "finished", { mode: 0o600 });
+      lifecycle.push("retirement-finished");
+      retirementFinished.resolve();
+    },
+  });
+  let closing;
+  try {
+    await app.snapshotReady;
+    await retirementStarted.promise;
+    closing = app.close().then(() => { lifecycle.push("closed"); });
+    await stopStarted.promise;
+    allowRetirementToFinish.resolve();
+    await closing;
+    await retirementFinished.promise;
+    assert.deepEqual(lifecycle, ["stop", "retirement-finished", "lock-released", "closed"]);
+    assert.equal(await readFile(marker, "utf8"), "finished");
+    assert.equal(controller.calls.stop, 1);
+    await app.close();
+    assert.equal(controller.calls.stop, 1, "shutdown remains idempotent");
+  } finally {
+    allowRetirementToFinish.resolve();
+    await Promise.allSettled([closing, retirementFinished.promise, app.close()].filter(Boolean));
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("shutdown waits for the retirement consent probe and does not launch a late writer", async () => {
+  const files = await fixture();
+  const controller = fakeIncrementalController();
+  await controller.approve();
+  const verdict = await controller.inspect();
+  const probeStarted = deferred();
+  const allowProbeToFinish = deferred();
+  const stopStarted = deferred();
+  const lifecycle = [];
+  let retirements = 0;
+  controller.inspect = async () => {
+    probeStarted.resolve();
+    await allowProbeToFinish.promise;
+    lifecycle.push("probe-finished");
+    return verdict;
+  };
+  const stop = controller.stop;
+  controller.stop = async () => {
+    await stop();
+    lifecycle.push("stop");
+    stopStarted.resolve();
+  };
+  const app = await startApp(files, {
+    incrementalContributionController: controller,
+    automaticContributionRetirementLockAcquirer: async () => ({
+      async release() { lifecycle.push("lock-released"); },
+    }),
+    supersededContributionRetirementRunner: async () => { retirements += 1; },
+  });
+  let closing;
+  try {
+    await app.snapshotReady;
+    await probeStarted.promise;
+    closing = app.close().then(() => { lifecycle.push("closed"); });
+    await stopStarted.promise;
+    allowProbeToFinish.resolve();
+    await closing;
+    assert.deepEqual(lifecycle, ["stop", "probe-finished", "lock-released", "closed"]);
+    assert.equal(retirements, 0, "shutdown forbids a writer starting after the consent probe");
+  } finally {
+    allowProbeToFinish.resolve();
+    await Promise.allSettled([closing, app.close()].filter(Boolean));
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("closing during snapshot initialization never starts contribution or retirement afterward", async () => {
+  const files = await fixture();
+  const controller = fakeIncrementalController();
+  await controller.approve();
+  const initializationStarted = deferred();
+  const allowInitializationToFinish = deferred();
+  let retirements = 0;
+  const app = await startApp(files, {
+    dataStore: {
+      ...fakeStore(),
+      async initialize() {
+        initializationStarted.resolve();
+        await allowInitializationToFinish.promise;
+      },
+    },
+    incrementalContributionController: controller,
+    supersededContributionRetirementRunner: async () => { retirements += 1; },
+  });
+  try {
+    await initializationStarted.promise;
+    // Closing must not wait for the whole snapshot: its failure path itself
+    // shuts down the contribution runtime. No scheduler has started yet.
+    await app.close();
+    assert.equal(controller.calls.start, 0);
+    assert.equal(controller.calls.stop, 1);
+    allowInitializationToFinish.resolve();
+    await app.snapshotReady;
+    assert.equal(controller.calls.start, 0, "late initialization cannot restart a closed runtime");
+    assert.equal(controller.calls.inspect, 0, "closed startup cannot launch a retirement consent probe");
+    assert.equal(retirements, 0);
+    await app.close();
+    assert.equal(controller.calls.stop, 1);
+  } finally {
+    allowInitializationToFinish.resolve();
+    await Promise.allSettled([app.snapshotReady, app.close()]);
+    await rm(files.root, { recursive: true });
+  }
+});
+
+for (const startFails of [false, true]) {
+  test(`shutdown drains an in-flight contribution start ${startFails ? "failure" : "success"} before stopping or releasing its lock`, async () => {
+    const files = await fixture();
+    const controller = fakeIncrementalController();
+    await controller.approve();
+    const startBegan = deferred();
+    const allowStartToFinish = deferred();
+    const lifecycle = [];
+    const errors = [];
+    let scheduled = false;
+    let retirements = 0;
+    controller.start = async () => {
+      controller.calls.start += 1;
+      lifecycle.push("start");
+      startBegan.resolve();
+      await allowStartToFinish.promise;
+      scheduled = true;
+      lifecycle.push("start-finished");
+      if (startFails) throw new Error(PRIVATE_CANARY);
+    };
+    controller.stop = async () => {
+      controller.calls.stop += 1;
+      scheduled = false;
+      lifecycle.push("stop");
+    };
+    const app = await startApp(files, {
+      incrementalContributionController: controller,
+      onError: (code) => errors.push(code),
+      automaticContributionRetirementLockAcquirer: async () => ({
+        async release() { lifecycle.push("lock-released"); },
+      }),
+      supersededContributionRetirementRunner: async () => { retirements += 1; },
+    });
+    let closing;
+    try {
+      await startBegan.promise;
+      const httpClosed = new Promise((resolve) => app.server.once("close", resolve));
+      closing = app.close().then(() => { lifecycle.push("closed"); });
+      await httpClosed;
+      allowStartToFinish.resolve();
+      await Promise.all([closing, app.snapshotReady]);
+      assert.deepEqual(lifecycle, ["start", "start-finished", "stop", "lock-released", "closed"]);
+      assert.equal(scheduled, false, "an in-flight start cannot reactivate the stopped scheduler");
+      assert.equal(controller.calls.start, 1);
+      assert.equal(controller.calls.stop, 1);
+      assert.equal(controller.calls.inspect, 0);
+      assert.equal(retirements, 0);
+      assert.deepEqual(errors, startFails ? ["incremental_contribution_start_failed"] : []);
+      await app.close();
+      assert.equal(controller.calls.stop, 1);
+    } finally {
+      allowStartToFinish.resolve();
+      await Promise.allSettled([closing, app.snapshotReady, app.close()].filter(Boolean));
+      await rm(files.root, { recursive: true });
+    }
+  });
+}
+
+test("a failed retirement remains best-effort but still drains before a failed controller stop releases the lock", async () => {
+  const files = await fixture();
+  const controller = fakeIncrementalController();
+  await controller.approve();
+  const retirementStarted = deferred();
+  const allowRetirementToFail = deferred();
+  const stopStarted = deferred();
+  const lifecycle = [];
+  const errors = [];
+  controller.stop = async () => {
+    lifecycle.push("stop");
+    stopStarted.resolve();
+    throw new Error(PRIVATE_CANARY);
+  };
+  const app = await startApp(files, {
+    incrementalContributionController: controller,
+    onError: (code) => errors.push(code),
+    automaticContributionRetirementLockAcquirer: async () => ({
+      async release() { lifecycle.push("lock-released"); },
+    }),
+    supersededContributionRetirementRunner: async () => {
+      retirementStarted.resolve();
+      await allowRetirementToFail.promise;
+      lifecycle.push("retirement-failed");
+      throw new Error(PRIVATE_CANARY);
+    },
+  });
+  let closing;
+  try {
+    await app.snapshotReady;
+    await retirementStarted.promise;
+    assert.equal(app.snapshotStatus().status, "ready", "cleanup never blocks readiness");
+    closing = app.close().then(() => { lifecycle.push("closed"); });
+    await stopStarted.promise;
+    allowRetirementToFail.resolve();
+    await closing;
+    assert.deepEqual(lifecycle, ["stop", "retirement-failed", "lock-released", "closed"]);
+    assert.deepEqual(errors, ["incremental_contribution_stop_failed"]);
+    await app.close();
+    assert.equal(lifecycle.filter((step) => step === "lock-released").length, 1);
+  } finally {
+    allowRetirementToFail.resolve();
+    await Promise.allSettled([closing, app.close()].filter(Boolean));
+    await rm(files.root, { recursive: true });
+  }
+});
+
+function readyExactReviewProvider() {
+  const payload = exactReviewContribution();
+  return async () => ({
+    schemaVersion: "contribution-sync-exact-review-v0.1",
+    state: "ready",
+    networkActivity: false,
+    discoveredSets: 1,
+    enqueued: 0,
+    payloadBytes: Buffer.byteLength(JSON.stringify(payload), "utf8"),
+    payload,
+    reviewBinding: { jobId: REVIEW_JOB_ID, contributionSha256: REVIEW_SHA256 },
+  });
+}
+
+async function approveExactReview(app) {
+  const base = `http://127.0.0.1:${app.port}`;
+  const headers = {
+    "Content-Type": "application/json",
+    "X-Usage-Monitor-Local": "1",
+    Origin: base,
+  };
+  const reviewResponse = await fetch(`${base}/api/local/contribution/sync-inspect-exact`, {
+    method: "POST", headers, body: "{}",
+  });
+  assert.equal(reviewResponse.status, 200);
+  const review = await reviewResponse.json();
+  const approval = await fetch(`${base}/api/local/contribution/incremental-approve`, {
+    method: "POST", headers, body: JSON.stringify({ reviewToken: review.reviewToken }),
+  });
+  assert.equal(approval.status, 200);
+}
+
+test("overlapping startup and approval retirements share one writer and one queued pass", { timeout: 10_000 }, async () => {
+  const files = await fixture();
+  const controller = fakeIncrementalController();
+  await controller.approve();
+  const firstStarted = deferred();
+  const allowFirstToFinish = deferred();
+  const secondFinished = deferred();
+  let retirements = 0;
+  let running = 0;
+  let maximumRunning = 0;
+  const app = await startApp(files, {
+    incrementalContributionController: controller,
+    contributionSyncExactReviewProvider: readyExactReviewProvider(),
+    supersededContributionRetirementRunner: async () => {
+      retirements += 1;
+      running += 1;
+      maximumRunning = Math.max(maximumRunning, running);
+      if (retirements === 1) {
+        firstStarted.resolve();
+        await allowFirstToFinish.promise;
+      }
+      running -= 1;
+      if (retirements === 2) secondFinished.resolve();
+    },
+  });
+  try {
+    await app.snapshotReady;
+    await firstStarted.promise;
+    await approveExactReview(app);
+    await approveExactReview(app);
+    assert.equal(retirements, 1, "approval never overlaps the active retirement");
+    assert.equal(maximumRunning, 1);
+    allowFirstToFinish.resolve();
+    await secondFinished.promise;
+    await app.close();
+    assert.equal(retirements, 2, "overlapping requests coalesce to one queued pass");
+    assert.equal(maximumRunning, 1);
+  } finally {
+    allowFirstToFinish.resolve();
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("approval while a startup consent probe is pending rechecks consent instead of losing the retirement", { timeout: 10_000 }, async () => {
+  const files = await fixture();
+  const controller = fakeIncrementalController();
+  const inspect = controller.inspect;
+  const probeStarted = deferred();
+  const releasePreConsentVerdict = deferred();
+  const retired = deferred();
+  let firstProbe = true;
+  let retirements = 0;
+  controller.inspect = async () => {
+    const capturedVerdict = await inspect();
+    if (firstProbe) {
+      firstProbe = false;
+      probeStarted.resolve();
+      await releasePreConsentVerdict.promise;
+    }
+    return capturedVerdict;
+  };
+  const app = await startApp(files, {
+    incrementalContributionController: controller,
+    contributionSyncExactReviewProvider: readyExactReviewProvider(),
+    supersededContributionRetirementRunner: async () => {
+      retirements += 1;
+      retired.resolve();
+    },
+  });
+  try {
+    await app.snapshotReady;
+    await probeStarted.promise;
+    await approveExactReview(app);
+    assert.equal(retirements, 0);
+    releasePreConsentVerdict.resolve();
+    await retired.promise;
+    await app.close();
+    assert.equal(retirements, 1, "the queued approval gets the current consent verdict");
+  } finally {
+    releasePreConsentVerdict.resolve();
     await app.close();
     await rm(files.root, { recursive: true });
   }

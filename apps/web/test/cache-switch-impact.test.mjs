@@ -11,7 +11,7 @@ import {
 const ALLOWANCE_INTERPRETATION =
   "conditional_historical_estimate_not_provider_allowance";
 const ALLOWANCE_BASIS_FAMILY_ID =
-  "codex_primary:quota_weighted_api_equivalent:v1:fast_rates_2026_08_01:event_time:observed_declared_scenario";
+  "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario";
 
 function allowanceBasisId(scenario) {
   return `${ALLOWANCE_BASIS_FAMILY_ID}:${scenario}`;
@@ -65,6 +65,17 @@ function unavailablePremiumWeighting(reasonCode = "weighting_evidence_incomplete
       unresolved_as_fast: null,
     },
     rangePremiumUsd: null,
+  };
+}
+
+function coveredSubtotal(standardPremium, pricedDrops, overrides = {}) {
+  return {
+    scope: "covered_priced_drops",
+    pricedDrops,
+    standardApiPremiumUsd: standardPremium,
+    standardApiPremiumUsdExact: String(standardPremium),
+    allowanceWeighting: premiumWeighting(standardPremium, standardPremium * 2, pricedDrops),
+    ...overrides,
   };
 }
 
@@ -361,6 +372,70 @@ function normalizedContinuityImpact(value) {
   }).accounting.cacheContinuityImpact;
 }
 
+function switchSubtotalPeriod({ ordering = 1, unpriced = 0 } = {}) {
+  const selected = period();
+  const pricedDrops = selected.cacheReadDrops - unpriced;
+  const amount = Number((pricedDrops * 0.01).toFixed(9));
+  const subtotal = pricedDrops > 0 ? coveredSubtotal(amount, pricedDrops) : null;
+  const incompleteTotal = ordering > 0 || unpriced > 0;
+  return {
+    ...selected,
+    orderingCoverageGaps: ordering,
+    coverageStatus: ordering > 0 ? "incomplete" : "complete",
+    pricedDrops,
+    unpricedDrops: unpriced,
+    estimatedPremiumUsd: incompleteTotal ? null : amount,
+    standardApiPremiumUsd: incompleteTotal ? null : amount,
+    coveredSubtotal: subtotal,
+    allowanceWeighting: incompleteTotal
+      ? unavailablePremiumWeighting() : premiumWeighting(amount, amount * 2, pricedDrops),
+    allowanceImpact: incompleteTotal ? unavailableAllowanceImpact() : selected.allowanceImpact,
+    byChangeType: {
+      ...selected.byChangeType,
+      model_only: {
+        ...selected.byChangeType.model_only,
+        pricedDrops,
+        unpricedDrops: unpriced,
+        estimatedPremiumUsd: unpriced > 0 ? null : amount,
+        coveredSubtotal: structuredClone(subtotal),
+      },
+    },
+  };
+}
+
+function continuitySubtotalPeriod({ ordering = 1, unpriced = 0 } = {}) {
+  const selected = continuityPeriod();
+  const active = {
+    ...zeroContinuityBreakdown(),
+    sameConfigurationReturns: 1 + unpriced,
+    comparableReturns: 1 + unpriced,
+    reusedHalfOrLessReturns: 1 + unpriced,
+    cacheReadDrops: 1 + unpriced,
+    lostCacheTokens: 8_000 * (1 + unpriced),
+    pricedDrops: 1,
+    unpricedDrops: unpriced,
+    estimatedPremiumUsd: unpriced > 0 ? null : 0.01,
+    coveredSubtotal: coveredSubtotal(0.01, 1),
+  };
+  const incompleteTotal = ordering > 0 || unpriced > 0;
+  return {
+    ...selected,
+    ...active,
+    orderingCoverageGaps: ordering,
+    coverageStatus: ordering > 0 ? "incomplete" : "complete",
+    estimatedPremiumUsd: incompleteTotal ? null : 0.01,
+    standardApiPremiumUsd: incompleteTotal ? null : 0.01,
+    allowanceWeighting: incompleteTotal
+      ? unavailablePremiumWeighting() : premiumWeighting(0.01, 0.02, 1),
+    allowanceImpact: incompleteTotal ? unavailableAllowanceImpact() : selected.allowanceImpact,
+    byGapBand: Object.fromEntries(CONTINUITY_GAP_BANDS.map((key) => [
+      key,
+      key === "under_one_minute" ? structuredClone(active) : zeroContinuityBreakdown(),
+    ])),
+    byOutcomeBucket: continuityOutcomeBuckets(structuredClone(active)),
+  };
+}
+
 test("cache-switch evidence is bounded and projects no local identifiers", () => {
   const result = normalizedImpact(impact());
   assert.equal(result.status, "available");
@@ -612,6 +687,100 @@ test("a mixed-price cache-switch sum stays unavailable instead of looking comple
   assert.equal(result.unpricedDrops, 1);
 });
 
+for (const [name, makePeriod, makeImpact, normalize, partitions] of [
+  ["switch", switchSubtotalPeriod, impact, normalizedImpact, ["byChangeType"]],
+  ["continuity", continuitySubtotalPeriod, continuityImpact, normalizedContinuityImpact,
+    ["byGapBand", "byOutcomeBucket"]],
+]) {
+  test(`${name} normalization retains scoped covered subtotals and keeps whole-period allowance unavailable`, () => {
+    for (const selection of [
+      { ordering: 1, unpriced: 0 },
+      { ordering: 0, unpriced: 1 },
+      { ordering: 1, unpriced: 1 },
+    ]) {
+      const selected = makePeriod(selection);
+      selected.coveredSubtotal.sessionLocal = "must-not-project";
+      selected.coveredSubtotal.allowanceWeighting.accountIdentifier = "must-not-project";
+      // Even a forged whole-period conversion must not reuse the subtotal.
+      selected.allowanceImpact = allowanceImpact(1, 2, 1, { lower: 0.5, upper: 2 });
+      const result = normalize(makeImpact({ ...selected, periods: [selected] }));
+      assert.equal(result.status, "available");
+      assert.equal(result.estimatedPremiumUsd, null);
+      assert.equal(result.standardApiPremiumUsd, null);
+      assert.equal(result.allowanceWeighting.status, "unavailable");
+      assert.equal(result.allowanceImpact.status, "unavailable");
+      assert.equal(result.allowanceImpact.medianPercentagePoints, null);
+      assert.equal(result.coveredSubtotal.scope, "covered_priced_drops");
+      assert.equal(result.coveredSubtotal.pricedDrops, result.pricedDrops);
+      assert.equal(result.coveredSubtotal.standardApiPremiumUsd,
+        selected.coveredSubtotal.standardApiPremiumUsd);
+      assert.equal(result.coveredSubtotal.allowanceWeighting.status, "complete");
+      assert.doesNotMatch(JSON.stringify(result), /must-not-project|sessionLocal|accountIdentifier/u);
+      for (const partition of partitions) {
+        const children = Object.values(result[partition]);
+        assert.equal(children.reduce((sum, child) => sum + (child.coveredSubtotal?.pricedDrops ?? 0), 0),
+          result.pricedDrops);
+        assert.equal(children.filter((child) => child.pricedDrops === 0).every(
+          (child) => child.coveredSubtotal === null,
+        ), true);
+      }
+      assert.deepEqual(result.periods[0].coveredSubtotal, result.coveredSubtotal);
+    }
+  });
+
+  test(`${name} normalization rejects malformed or inconsistent subtotal evidence`, () => {
+    const mutations = [
+      (selected) => { selected.coveredSubtotal.scope = "whole_period"; },
+      (selected) => { selected.coveredSubtotal.pricedDrops = 0; },
+      (selected) => { selected.coveredSubtotal.pricedDrops += 1; },
+      (selected) => { selected.coveredSubtotal.standardApiPremiumUsd = -1; },
+      (selected) => { selected.coveredSubtotal.standardApiPremiumUsd = Infinity; },
+      (selected) => { selected.coveredSubtotal.standardApiPremiumUsd = "0.01"; },
+      (selected) => { selected.coveredSubtotal.standardApiPremiumUsdExact = "-0.01"; },
+      (selected) => { selected.coveredSubtotal.standardApiPremiumUsdExact = "0.0000000001"; },
+      (selected) => { selected.coveredSubtotal.standardApiPremiumUsdExact = "00.01"; },
+      (selected) => { selected.coveredSubtotal.standardApiPremiumUsdExact = "1e-2"; },
+      (selected) => { selected.coveredSubtotal.standardApiPremiumUsdExact = "9".repeat(65); },
+      (selected) => { selected.coveredSubtotal.standardApiPremiumUsdExact = "0.99"; },
+      (selected) => { selected.coveredSubtotal.allowanceWeighting.selectedPremiumUsd = -1; },
+      (selected) => { selected.coveredSubtotal.allowanceWeighting.scenarios.unresolved_as_standard.pricedDrops += 1; },
+      (selected) => { selected.allowanceWeighting = selected.coveredSubtotal.allowanceWeighting; },
+      (selected) => {
+        for (const partition of partitions) {
+          const child = Object.values(selected[partition]).find((part) => part.pricedDrops > 0);
+          child.coveredSubtotal = null;
+        }
+      },
+      (selected) => {
+        // A one-nanodollar disagreement is still not an exact subtotal.
+        selected.coveredSubtotal.standardApiPremiumUsd = Number(
+          (selected.coveredSubtotal.standardApiPremiumUsd + 1e-9).toFixed(9),
+        );
+        selected.coveredSubtotal.standardApiPremiumUsdExact = String(
+          selected.coveredSubtotal.standardApiPremiumUsd,
+        );
+      },
+    ];
+    for (const [index, mutate] of mutations.entries()) {
+      const selected = makePeriod();
+      mutate(selected);
+      const result = normalize(makeImpact({ ...selected, periods: [selected] }));
+      assert.equal(result.status, "unavailable", `mutation ${index}`);
+      assert.equal(result.coveredSubtotal, null, `mutation ${index}`);
+    }
+  });
+}
+
+test("a fully unpriced switch period cannot advertise a zero-dollar covered subtotal", () => {
+  const selected = switchSubtotalPeriod({ ordering: 1, unpriced: 25 });
+  const result = normalizedImpact(impact({ ...selected, periods: [selected] }));
+  assert.equal(result.status, "available");
+  assert.equal(result.coveredSubtotal, null);
+  assert.equal(result.estimatedPremiumUsd, null);
+  selected.coveredSubtotal = coveredSubtotal(0, 0);
+  assert.equal(normalizedImpact(impact({ ...selected, periods: [selected] })).status, "unavailable");
+});
+
 test("non-weekly periods cannot carry a weekly allowance conversion", () => {
   for (const periodId of ["24h", "30d", "all", "history"]) {
     const selected = period({ periodId });
@@ -633,6 +802,7 @@ test("cache-impact money rendering keeps Standard continuity evidence visible", 
   const metricValues = Function(
     "finite",
     "formatApiMoney",
+    "t",
     `${source.slice(start, end)}\nreturn {`
       + " cacheSwitchMetricValue, cacheContinuityStandardMetricValue,"
       + " cacheContinuityMetricValue,"
@@ -642,6 +812,7 @@ test("cache-impact money rendering keeps Standard continuity evidence visible", 
       typeof value === "number" && Number.isFinite(value) ? value : fallback
     ),
     (value) => value > 0 && value < 0.01 ? "<$0.01" : `$${value.toFixed(2)}`,
+    (key, values) => translate(key, values, "en"),
   );
   assert.equal(metricValues.cacheSwitchMetricValue({
     status: "unavailable",
@@ -695,6 +866,42 @@ test("cache-impact money rendering keeps Standard continuity evidence visible", 
     metricValues.cacheContinuityUsesStandardFallback(weightedContinuity),
     false,
   );
+  const subtotal = {
+    ...weightedContinuity,
+    coverageStatus: "incomplete",
+    orderingCoverageGaps: 1,
+    cacheReadDrops: 4,
+    comparableReturns: 10,
+    pricedDrops: 3,
+    unpricedDrops: 1,
+    estimatedPremiumUsd: null,
+    standardApiPremiumUsd: null,
+    allowanceWeighting: unavailablePremiumWeighting(),
+    coveredSubtotal: coveredSubtotal(10, 3, {
+      allowanceWeighting: premiumWeighting(15, 20, 3),
+    }),
+  };
+  assert.equal(metricValues.cacheSwitchMetricValue(subtotal), "Subtotal $15.00");
+  assert.equal(metricValues.cacheContinuityMetricValue(subtotal), "Subtotal $15.00");
+  assert.equal(metricValues.cacheContinuityStandardMetricValue(subtotal), "Subtotal $10.00");
+  assert.equal(metricValues.cacheContinuityUsesStandardFallback(subtotal), false);
+  const standardOnlySubtotal = {
+    ...subtotal,
+    coveredSubtotal: coveredSubtotal(10, 3, {
+      allowanceWeighting: unavailablePremiumWeighting(),
+    }),
+  };
+  assert.equal(metricValues.cacheSwitchMetricValue(standardOnlySubtotal), "Subtotal $10.00");
+  assert.equal(metricValues.cacheContinuityUsesStandardFallback(standardOnlySubtotal), true);
+  for (const unavailable of [
+    { ...subtotal, coveredSubtotal: null, pricedDrops: 0, unpricedDrops: 4 },
+    { ...subtotal, coveredSubtotal: coveredSubtotal(10, 3, { scope: "full_period" }) },
+    { ...weightedContinuity, comparableReturns: 0, cacheReadDrops: 0 },
+  ]) {
+    assert.equal(metricValues.cacheSwitchMetricValue(unavailable), "—");
+    assert.equal(metricValues.cacheContinuityMetricValue(unavailable), "—");
+    assert.equal(metricValues.cacheContinuityStandardMetricValue(unavailable), "—");
+  }
 });
 
 test("a pager is drawn only when there is more than one page to reach", async () => {
@@ -885,6 +1092,8 @@ test("cache-switch incomplete notes distinguish boundary and exact-order gaps", 
     "formatCount",
     "document",
     "formatCacheSwitchPercentagePoints",
+    "appendCacheImpactSubtotalNote",
+    "cacheImpactCostView",
     `${source.slice(start, end)}\nreturn appendCacheSwitchMetricNote;`,
   )(
     (_tag, _className, key) => key,
@@ -894,6 +1103,8 @@ test("cache-switch incomplete notes distinguish boundary and exact-order gaps", 
     String,
     { createTextNode: (value) => value },
     String,
+    () => false,
+    () => ({}),
   );
   const keyFor = (impact) => {
     const children = [];
@@ -934,6 +1145,8 @@ test("cache-continuity notes distinguish unavailable, incomplete, zero, and obse
     "document",
     "appendCacheContinuityAllowance",
     "cacheContinuityUsesStandardFallback",
+    "appendCacheImpactSubtotalNote",
+    "cacheImpactCostView",
     `${source.slice(start, end)}\nreturn appendCacheContinuityMetricNote;`,
   )(
     (_tag, _className, key) => key,
@@ -944,6 +1157,8 @@ test("cache-continuity notes distinguish unavailable, incomplete, zero, and obse
     documentRef,
     (container) => container.append("allowance"),
     () => false,
+    () => false,
+    () => ({}),
   );
   const keysFor = (impact) => {
     const children = [];
@@ -1006,6 +1221,123 @@ test("cache-continuity notes distinguish unavailable, incomplete, zero, and obse
   ]);
 });
 
+test("subtotal notes explain the ordering gap, Standard counterfactual and excluded prices without allowance claims", async () => {
+  const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const helpersStart = source.indexOf("function cacheSwitchMetricValue(impact) {");
+  const switchEnd = source.indexOf("\nfunction cacheSwitchChangeDescription", helpersStart);
+  const continuityStart = source.indexOf("function appendCacheContinuityMetricNote(container, impact) {");
+  const continuityEnd = source.indexOf("\nfunction formatCacheContinuityGap", continuityStart);
+  assert.ok(helpersStart >= 0 && switchEnd > helpersStart && continuityEnd > continuityStart);
+  const appendNotes = Function(
+    "finite", "formatApiMoney", "formatCount", "document", "localizedNode", "t",
+    "appendCacheContinuityAllowance",
+    `${source.slice(helpersStart, switchEnd)}\n${source.slice(continuityStart, continuityEnd)}`
+      + "\nreturn { appendCacheSwitchMetricNote, appendCacheContinuityMetricNote };",
+  )(
+    (value, fallback = null) => typeof value === "number" && Number.isFinite(value) ? value : fallback,
+    (value) => `$${value.toFixed(2)}`,
+    String,
+    { createTextNode: (value) => value },
+    (_tag, _className, key, values) => translate(key, values, "en"),
+    (key, values) => translate(key, values, "en"),
+    () => assert.fail("a subset must not be translated into whole-period allowance"),
+  );
+  for (const [append, selected] of [
+    [appendNotes.appendCacheSwitchMetricNote, switchSubtotalPeriod({ ordering: 1, unpriced: 1 })],
+    [appendNotes.appendCacheContinuityMetricNote, continuitySubtotalPeriod({ ordering: 1, unpriced: 1 })],
+  ]) {
+    const children = [];
+    append({ append: (...items) => children.push(...items) }, { status: "available", ...selected });
+    const text = children.join("");
+    assert.match(text, /Whole-period total unavailable/u);
+    assert.match(text, /Sessions without exact local event order: 1/u);
+    assert.match(text, /Covered\/priced subtotal; included drops: \d+\. Not a whole-period total/u);
+    assert.match(text, /Standard API equivalent for the same covered\/priced drops: \$/u);
+    assert.match(text, /Drops excluded for incomplete prices: 1/u);
+    assert.doesNotMatch(text, /estimate is withheld|1 sessions|1 drops|percentage points|accounting\./u);
+    const standardOnly = [];
+    append({ append: (...items) => standardOnly.push(...items) }, {
+      status: "available",
+      ...selected,
+      coveredSubtotal: {
+        ...selected.coveredSubtotal,
+        allowanceWeighting: unavailablePremiumWeighting(),
+      },
+    });
+    assert.match(standardOnly.join(""), /Subtotal shown at Standard API rates/u);
+    assert.match(standardOnly.join(""), /speed-priced accounting is unavailable/u);
+  }
+  for (const [append, empty] of [
+    [appendNotes.appendCacheSwitchMetricNote, zeroBreakdown()],
+    [appendNotes.appendCacheContinuityMetricNote, zeroContinuityBreakdown()],
+  ]) {
+    const children = [];
+    append({ append: (...items) => children.push(...items) }, {
+      status: "available",
+      ...empty,
+      standardApiPremiumUsd: 0,
+      allowanceWeighting: premiumWeighting(0, 0, 0),
+      allowanceImpact: {
+        status: "complete",
+        medianPercentagePoints: 0,
+        plausibleRangePercentagePoints: null,
+      },
+    });
+    const text = children.join("");
+    assert.match(text, /no material cache-read drop observed/u);
+    assert.doesNotMatch(text, /\$|API equivalent|allowance|percentage|subtotal/iu);
+  }
+});
+
+test("cache chart readout shows valid bucket subtotals despite a global gap and never fabricates an unpriced zero", async () => {
+  const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const start = source.indexOf("function renderCacheReuseReadout(bucket, width, selectedRange,");
+  const end = source.indexOf("\nfunction setCacheReuseReadoutVisible", start);
+  assert.ok(start >= 0 && end > start);
+  const nodes = new Map();
+  const render = Function(
+    "$", "cacheReusePercent", "setLocalizedText", "formatCount", "t", "formatApiMoney",
+    `${source.slice(start, end)}\nreturn renderCacheReuseReadout;`,
+  )(
+    (selector) => {
+      if (selector === "#cache-reuse-raster-stage") return null;
+      if (!nodes.has(selector)) nodes.set(selector, { textContent: "" });
+      return nodes.get(selector);
+    },
+    (count, total) => total === 0 ? "0%" : `${count / total * 100}%`,
+    (element, key, values) => { element.textContent = translate(key, values, "en"); },
+    String,
+    (key, values) => translate(key, values, "en"),
+    (value) => `$${value.toFixed(2)}`,
+  );
+  const moneyText = (bucket, completeCoverage) => {
+    render({
+      labelKey: "accounting.cacheContinuity.outcome.bucket.underOneMinute",
+      ...bucket,
+    }, 600, { start: 100, end: 150 }, completeCoverage);
+    return nodes.get("#cache-reuse-readout-api").textContent;
+  };
+  const good = continuitySubtotalPeriod().byOutcomeBucket.under_one_minute;
+  assert.equal(moneyText(good, true), "Standard API equivalent: $0.01");
+  assert.match(moneyText(good, false), /Covered\/priced subtotal at Standard rates: \$0\.01/u);
+  assert.match(moneyText(good, false), /Whole-period total unavailable/u);
+  const partial = continuitySubtotalPeriod({ ordering: 1, unpriced: 1 })
+    .byOutcomeBucket.under_one_minute;
+  assert.equal(partial.estimatedPremiumUsd, null);
+  assert.match(moneyText(partial, false), /\$0\.01\. Priced drops: 1; unpriced excluded: 1/u);
+  // Exact admitted comparisons in legacy DTO buckets also remain useful;
+  // global ordering gaps are never guessed into a particular time bucket.
+  assert.match(moneyText({ ...good, coveredSubtotal: null }, false), /subtotal.*\$0\.01/u);
+  for (const noPrice of [
+    { ...partial, pricedDrops: 0, unpricedDrops: 2, coveredSubtotal: null },
+    zeroContinuityBreakdown(),
+  ]) {
+    const text = moneyText(noPrice, false);
+    assert.match(text, /Unavailable/u);
+    assert.doesNotMatch(text, /\$0\.00/u);
+  }
+});
+
 test("the history selector reads the analyzer's all-indexed period", async () => {
   const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const start = source.indexOf("function accountingPeriod(data) {");
@@ -1022,7 +1354,20 @@ test("the history selector reads the analyzer's all-indexed period", async () =>
       cacheSwitchImpact: {
         status: "available",
         periodId: "7d",
-        periods: [{ status: "available", periodId: "all", marker: "all-indexed" }],
+        coveredSubtotal: coveredSubtotal(2, 1),
+        periods: [{
+          status: "available", periodId: "all", marker: "all-indexed",
+          coveredSubtotal: coveredSubtotal(25, 4),
+        }],
+      },
+      cacheContinuityImpact: {
+        status: "available",
+        periodId: "7d",
+        coveredSubtotal: coveredSubtotal(3, 1),
+        periods: [{
+          status: "available", periodId: "all",
+          coveredSubtotal: coveredSubtotal(40, 5),
+        }],
       },
       periods: [{ periodId: "history", cacheSwitchImpact: { status: "unavailable" } }],
     },
@@ -1030,6 +1375,10 @@ test("the history selector reads the analyzer's all-indexed period", async () =>
   assert.equal(selected.cacheSwitchImpact.periodId, "all");
   assert.equal(selected.cacheSwitchImpact.marker, "all-indexed");
   assert.equal(selected.cacheSwitchImpact.allowanceImpact.status, "unavailable");
+  assert.equal(selected.cacheSwitchImpact.coveredSubtotal.standardApiPremiumUsd, 25);
+  assert.equal(selected.cacheSwitchImpact.coveredSubtotal.pricedDrops, 4);
+  assert.equal(selected.cacheContinuityImpact.coveredSubtotal.standardApiPremiumUsd, 40);
+  assert.equal(selected.cacheContinuityImpact.coveredSubtotal.pricedDrops, 5);
 });
 
 test("cache-impact UI copy has three-locale parity and collapsed evidence tables", async () => {
@@ -1045,6 +1394,18 @@ test("cache-impact UI copy has three-locale parity and collapsed evidence tables
     expectedLabels,
   );
   for (const locale of SUPPORTED_LOCALES) {
+    for (const key of [
+      "accounting.cacheImpact.subtotalValue",
+      "accounting.cacheImpact.subtotalScope",
+      "accounting.cacheImpact.subtotalStandard",
+      "accounting.cacheImpact.subtotalStandardOnly",
+      "accounting.cacheImpact.subtotalUnpriced",
+      "accounting.cacheContinuity.outcome.readoutSubtotal",
+    ]) {
+      assert.doesNotMatch(translate(key, {
+        amount: "$1.23", priced: "2", unpriced: "1",
+      }, locale), /accounting\.|\{(?:amount|priced|unpriced)\}/u);
+    }
     for (const key of [
       "table.pagination.previous",
       "table.pagination.next",
@@ -1107,7 +1468,7 @@ test("cache-impact UI copy has three-locale parity and collapsed evidence tables
   );
   assert.equal(
     translate("accounting.cacheSwitch.column.apiEquivalent", {}, "en"),
-    "API equivalent",
+    "Standard API equivalent",
   );
 
   const expectedContinuityLabels = [

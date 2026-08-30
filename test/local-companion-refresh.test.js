@@ -2395,6 +2395,207 @@ test("unified-index progress rejects malformed and broadened payloads", async ()
   assert.equal(progress.length, 3);
 });
 
+test("seven changed sources hand off to accounting until the full snapshot is published", async (t) => {
+  const scanSeen = Promise.withResolvers();
+  const releaseScan = Promise.withResolvers();
+  const accountingSeen = Promise.withResolvers();
+  const releaseAccounting = Promise.withResolvers();
+  const projectionSeen = Promise.withResolvers();
+  const releaseProjection = Promise.withResolvers();
+  const reloadPurposes = [];
+  const accountingProgress = { kind: "accounting", status: "calculating" };
+  t.after(() => {
+    releaseScan.resolve();
+    releaseAccounting.resolve();
+    releaseProjection.resolve();
+  });
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    selectAccountObservationSecret: () => ({ loadAccountObservationSecret: null }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 1,
+      filesDiscovered: 9,
+      refresh: { attempted: true, recordWritten: true, errorCode: null },
+      indexing: COMPLETE_INDEX,
+    }),
+    refreshUnifiedIndex: async ({ onProgress }) => {
+      await onProgress({ sources: 7_215, sourcesScanned: 7, usageEvents: 27 });
+      scanSeen.resolve();
+      await releaseScan.promise;
+      return {
+        status: "ingested",
+        generation: {
+          id: 21,
+          fingerprint: "synthetic-accounting-handoff",
+          status: "complete",
+          discoveryComplete: true,
+          diagnosticsComplete: true,
+          usageProvenanceComplete: true,
+          sourceOrderComplete: true,
+          quotaProvenanceComplete: true,
+          toolProvenanceComplete: true,
+        },
+      };
+    },
+    refreshAccounting: async () => {
+      accountingSeen.resolve();
+      await releaseAccounting.promise;
+      return {
+        generatedAt: "2026-07-23T12:00:00.000Z",
+        periods: [{ id: "7d", events: 17 }],
+        diagnostics: {},
+        sourceDescriptor: { fallbackCount: 0 },
+      };
+    },
+  });
+  const controller = new LocalCompanionRefreshController({
+    runner,
+    dataStore: {
+      async reload({ purpose }) {
+        reloadPurposes.push(purpose);
+        if (purpose === "full") {
+          projectionSeen.resolve();
+          await releaseProjection.promise;
+        }
+      },
+    },
+    clock: () => Date.parse("2026-07-23T12:00:00.000Z"),
+  });
+
+  assert.equal(controller.start(), true);
+  await scanSeen.promise;
+  const scanning = controller.getStatus();
+  assert.equal(scanning.status, "running");
+  assert.equal(scanning.progress.filesProcessed, 7);
+  assert.equal(scanning.progress.filesSelected, 7_215);
+  assert.deepEqual(reloadPurposes, ["quick"]);
+
+  releaseScan.resolve();
+  await accountingSeen.promise;
+  const calculating = controller.getStatus();
+  assert.equal(calculating.status, "running");
+  assert.deepEqual(calculating.progress, accountingProgress);
+  assert.equal(calculating.quickResultAt, scanning.quickResultAt);
+  assert.equal(calculating.finishedAt, null);
+  assert.equal(calculating.result, null);
+  assert.deepEqual(reloadPurposes, ["quick"], "stage handoff does not reload a second quick result");
+
+  releaseAccounting.resolve();
+  await projectionSeen.promise;
+  const projecting = controller.getStatus();
+  assert.equal(projecting.status, "running");
+  assert.deepEqual(projecting.progress, accountingProgress);
+  assert.equal(projecting.finishedAt, null);
+  assert.equal(projecting.result, null);
+  assert.deepEqual(reloadPurposes, ["quick", "full"]);
+
+  releaseProjection.resolve();
+  for (let attempt = 0; attempt < 100 && controller.isRunning(); attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  const finished = controller.getStatus();
+  assert.equal(finished.status, "succeeded");
+  assert.deepEqual(finished.progress, COMPLETE_INDEX);
+  assert.equal(finished.result.accounting.status, "replay_safe");
+  assert.deepEqual(reloadPurposes, ["quick", "full"]);
+});
+
+test("accounting progress accepts only its exact count-free work marker", async (t) => {
+  const ready = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  let publish;
+  const reloadPurposes = [];
+  t.after(() => release.resolve({}));
+  const controller = new LocalCompanionRefreshController({
+    runner: async ({ onProgress }) => {
+      publish = onProgress;
+      ready.resolve();
+      return release.promise;
+    },
+    dataStore: { async reload({ purpose }) { reloadPurposes.push(purpose); } },
+  });
+  assert.equal(controller.start(), true);
+  await ready.promise;
+  const valid = { kind: "accounting", status: "calculating" };
+  await publish(valid);
+  for (const invalid of [
+    { kind: "accounting" },
+    { ...valid, status: "complete" },
+    { ...valid, status: "quick_result" },
+    { ...valid, phase: "quick_result" },
+    { ...valid, filesProcessed: 0, filesSelected: 0 },
+    { ...valid, sources: 7_215, sourcesScanned: 7 },
+    { ...valid, message: "synthetic unreviewed text" },
+    { ...COMPLETE_INDEX, ...valid, phase: "quick_result" },
+  ]) {
+    await publish(invalid);
+    assert.deepEqual(controller.getStatus().progress, valid);
+    assert.equal(controller.getStatus().status, "running");
+    assert.equal(controller.getStatus().quickResultAt, null);
+    assert.deepEqual(reloadPurposes, []);
+  }
+  release.resolve({});
+  for (let attempt = 0; attempt < 100 && controller.isRunning(); attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(controller.getStatus().status, "succeeded");
+  assert.equal(controller.getStatus().progress, null);
+  assert.deepEqual(reloadPurposes, ["full"]);
+});
+
+test("accounting work markers never survive failure, cancellation, or timeout as running work", async (t) => {
+  for (const outcome of ["failure", "cancel", "timeout"]) {
+    await t.test(outcome, async (t) => {
+      const entered = Promise.withResolvers();
+      const settled = Promise.withResolvers();
+      const reloadPurposes = [];
+      let signal;
+      t.after(() => settled.resolve({}));
+      const controller = new LocalCompanionRefreshController({
+        runner: async ({ signal: activeSignal, onProgress }) => {
+          signal = activeSignal;
+          await onProgress({ kind: "accounting", status: "calculating" });
+          entered.resolve();
+          return settled.promise;
+        },
+        dataStore: { async reload({ purpose }) { reloadPurposes.push(purpose); } },
+        timeoutMs: 1_000,
+      });
+      assert.equal(controller.start(), true);
+      await entered.promise;
+      assert.equal(controller.getStatus().status, "running");
+      assert.deepEqual(controller.getStatus().progress, {
+        kind: "accounting", status: "calculating",
+      });
+      if (outcome === "failure") {
+        settled.reject(new Error("synthetic accounting failure"));
+      } else if (outcome === "cancel") {
+        assert.equal(controller.cancel(), true);
+        assert.equal(controller.getStatus().status, "cancelling");
+        settled.resolve({});
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, 1_050));
+        assert.equal(controller.getStatus().status, "failed");
+        assert.equal(controller.getStatus().progress, null);
+        settled.resolve({});
+      }
+      for (let attempt = 0; attempt < 100 && controller.isRunning(); attempt += 1) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      const status = controller.getStatus();
+      assert.equal(status.status, outcome === "cancel" ? "cancelled" : "failed");
+      assert.equal(status.errorCode, {
+        failure: "refresh_failed", cancel: "refresh_cancelled", timeout: "refresh_timed_out",
+      }[outcome]);
+      assert.equal(status.progress, null);
+      assert.equal(status.quickResultAt, null);
+      assert.equal(signal.aborted, outcome !== "failure");
+      assert.deepEqual(reloadPurposes, []);
+      assert.equal(JSON.stringify(status).includes("synthetic accounting failure"), false);
+    });
+  }
+});
+
 test("partial recent coverage publishes a quick result before deep accounting", async () => {
   const progress = [];
   let rebuilds = 0;

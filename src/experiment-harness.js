@@ -102,8 +102,9 @@ function projectedComponents(manifest) {
 async function priceProjection(manifest, { offline, priceCards }) {
   const components = projectedComponents(manifest);
   const inputTotal = components.input_uncached_tokens + components.input_cache_read_tokens + components.input_cache_write_tokens;
+  const priceEventTime = new Date().toISOString();
   const priced = priceCodexUsageEvent({
-    timestamp: new Date().toISOString(),
+    timestamp: priceEventTime,
     model: manifest.model,
     raw: { input_tokens: inputTotal },
     components,
@@ -124,7 +125,9 @@ async function priceProjection(manifest, { offline, priceCards }) {
     priceResolution: apiPriceResolutionSummary({ priceCards }),
     tierSemantics: manifest.tierDeclaration,
     subscriptionSpeedSensitivity: subscriptionSpeedSensitivity({
-      [manifest.model]: { costUsd: Number(priced.totalUsd) },
+      [manifest.model]: { costUsd: Number(priced.totalUsd), priceEvidence: {
+        eventTime: priceEventTime, standardPriceCardIds: priced.selectedPriceCardIds,
+      } },
     }, manifest.tierDeclaration.codexSpeedMode),
   };
 }
@@ -397,7 +400,14 @@ export async function runExperiment({
       diagnostics: local.diagnostics,
       observedToolClasses,
       tierSemantics: manifest.tierDeclaration,
-      subscriptionSpeedSensitivity: subscriptionSpeedSensitivity(local.runcost.byModel, manifest.tierDeclaration.codexSpeedMode),
+      // Reuse the scanner's event-qualified token-only scenarios rather than
+      // repricing collapsed model totals (which also include tool charges).
+      subscriptionSpeedSensitivity: {
+        ...local.runcost.subscriptionSpeedSensitivity,
+        observedSpeedMode: manifest.tierDeclaration.codexSpeedMode,
+        selectedScenario: ["standard", "fast"].includes(manifest.tierDeclaration.codexSpeedMode)
+          ? manifest.tierDeclaration.codexSpeedMode : null,
+      },
     },
     concurrencyEvidence: {
       declared: manifest.concurrency,

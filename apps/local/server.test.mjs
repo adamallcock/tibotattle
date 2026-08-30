@@ -31,7 +31,11 @@ import {
 import {
   LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
   LOCAL_UNIFIED_INDEX_APPLICATION_ID,
+  LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION,
+  LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARSER_VERSION,
   LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+  LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION,
   LOCAL_UNIFIED_INDEX_USER_VERSION,
 } from "../../src/local-unified-index.js";
 import {
@@ -105,6 +109,79 @@ function writeTimeoutClassifierIndex(indexFile, {
       for (const [key, value] of Object.entries(compatibility)) {
         insert.run(key, value);
       }
+    }
+  } finally {
+    database.close();
+  }
+}
+
+function writeParserUpgradeTimeoutIndex(indexFile, {
+  parserVersion = "unified-rollout-typed-v10",
+  parserContractVersion = TELEMETRY_SCHEMA_VERSION,
+  generation = {},
+  metadata = {},
+  compatibility = {
+    compatibility_format_user_version: String(LOCAL_UNIFIED_INDEX_USER_VERSION),
+    compatibility_minimum_reader_user_version:
+      String(LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION),
+    compatibility_minimum_writer_user_version:
+      String(LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION),
+  },
+} = {}) {
+  writeTimeoutClassifierIndex(indexFile, {
+    userVersion: LOCAL_UNIFIED_INDEX_USER_VERSION,
+    schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+    compatibility,
+  });
+  const database = new DatabaseSync(indexFile);
+  try {
+    const insertMeta = database.prepare("INSERT INTO meta(key, value) VALUES (?, ?)");
+    for (const [key, value] of Object.entries({
+      source_identity_version: LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION,
+      contract_version: TELEMETRY_SCHEMA_VERSION,
+      // Published ids are historically stored as SQLite numeric text too.
+      current_generation_id: "2.0",
+      ...metadata,
+    })) {
+      if (value !== undefined) insertMeta.run(key, value);
+    }
+    database.exec(`
+      CREATE TABLE parser_version(
+        id INTEGER PRIMARY KEY, parser_version TEXT NOT NULL,
+        contract_version TEXT NOT NULL) STRICT;
+      CREATE TABLE index_generation(
+        id INTEGER PRIMARY KEY, parser_version_id INTEGER NOT NULL,
+        contract_version TEXT NOT NULL, status TEXT NOT NULL, block_reason TEXT,
+        completed_at_ms INTEGER, discovery_complete INTEGER NOT NULL,
+        diagnostics_complete INTEGER NOT NULL, usage_provenance_complete INTEGER NOT NULL,
+        source_order_complete INTEGER NOT NULL, quota_provenance_complete INTEGER NOT NULL,
+        tool_provenance_complete INTEGER NOT NULL, skipped_source_count INTEGER NOT NULL) STRICT;
+    `);
+    const insertParser = database.prepare("INSERT INTO parser_version VALUES (?, ?, ?)");
+    insertParser.run(1, "unified-rollout-typed-v10", TELEMETRY_SCHEMA_VERSION);
+    insertParser.run(2, parserVersion, parserContractVersion);
+    const insertGeneration = database.prepare(`
+      INSERT INTO index_generation VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const defaults = {
+      contractVersion: TELEMETRY_SCHEMA_VERSION,
+      status: "complete",
+      blockReason: null,
+      completedAtMs: 1_000,
+      discoveryComplete: 1,
+      diagnosticsComplete: 1,
+      usageProvenanceComplete: 1,
+      sourceOrderComplete: 1,
+      quotaProvenanceComplete: 1,
+      toolProvenanceComplete: 1,
+      skippedSourceCount: 0,
+    };
+    for (const [id, selected] of [[1, defaults], [2, { ...defaults, ...generation }]]) {
+      insertGeneration.run(id, id, selected.contractVersion, selected.status,
+        selected.blockReason, selected.completedAtMs, selected.discoveryComplete,
+        selected.diagnosticsComplete, selected.usageProvenanceComplete,
+        selected.sourceOrderComplete, selected.quotaProvenanceComplete,
+        selected.toolProvenanceComplete, selected.skippedSourceCount);
     }
   } finally {
     database.close();
@@ -271,7 +348,70 @@ test("refresh timeout classifier grants the cold window only to missing or prove
   }
 });
 
-test("large legacy timeout classification never runs a synchronous integrity scan", async () => {
+test("published v10 parser upgrades receive a cold deadline without extending current or uncertain state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "local-timeout-parser-upgrade-"));
+  const fixtures = [
+    { name: "complete", cold: true },
+    { name: "quarantine-partial", cold: true, generation: {
+      status: "partial", blockReason: "codex_rollout_sources_quarantined", skippedSourceCount: 14,
+    } },
+    { name: "tool-partial", cold: true, generation: {
+      status: "partial", blockReason: "tool_provenance_incomplete", toolProvenanceComplete: 0,
+    } },
+    // Every fixture retains an older parser/generation row. Only publication
+    // provenance may select the deadline, so this stays an ordinary refresh.
+    { name: "current-with-old-history", parserVersion: LOCAL_UNIFIED_INDEX_PARSER_VERSION },
+    { name: "future", parserVersion: "unified-rollout-typed-v12" },
+    { name: "unknown", parserVersion: "unknown-parser" },
+    { name: "partial-parser", parserVersion: "unified-rollout-typed-v10-partial" },
+    { name: "unreviewed-predecessor", parserVersion: "unified-rollout-typed-v9" },
+    { name: "missing-publication", metadata: { current_generation_id: undefined } },
+    { name: "unknown-publication", metadata: { current_generation_id: "99" } },
+    { name: "invalid-publication", metadata: { current_generation_id: "2.5" } },
+    { name: "in-progress", generation: { status: "in_progress", completedAtMs: null } },
+    { name: "failed", generation: { status: "failed" } },
+    { name: "unfinished", generation: { completedAtMs: null } },
+    { name: "unexpected-complete-reason", generation: { blockReason: "unexpected" } },
+    { name: "unknown-partial", generation: { status: "partial", blockReason: "unexpected" } },
+    { name: "empty-quarantine", generation: {
+      status: "partial", blockReason: "codex_rollout_sources_quarantined", skippedSourceCount: 0,
+    } },
+    { name: "contradictory-tools", generation: {
+      status: "partial", blockReason: "tool_provenance_incomplete", toolProvenanceComplete: 1,
+    } },
+    { name: "generation-contract", generation: { contractVersion: "unknown-contract" } },
+    { name: "parser-contract", parserContractVersion: "unknown-contract" },
+    { name: "metadata-contract", metadata: { contract_version: "unknown-contract" } },
+    { name: "source-identity", metadata: { source_identity_version: "unknown-identity" } },
+    { name: "absent-compatibility", compatibility: null },
+    { name: "unsupported-current-compatibility", compatibility: {
+      compatibility_format_user_version: String(LOCAL_UNIFIED_INDEX_USER_VERSION),
+      compatibility_minimum_reader_user_version: "9",
+      compatibility_minimum_writer_user_version: "9",
+    } },
+    ...["discoveryComplete", "diagnosticsComplete", "usageProvenanceComplete",
+      "sourceOrderComplete", "quotaProvenanceComplete", "toolProvenanceComplete"]
+      .map((key) => ({ name: `incomplete-${key}`, generation: { [key]: 0 } })),
+  ];
+  try {
+    for (const fixture of fixtures) {
+      const indexFile = join(root, `${fixture.name}.sqlite`);
+      writeParserUpgradeTimeoutIndex(indexFile, fixture);
+      await chmod(indexFile, 0o600);
+      const beforeBytes = await readFile(indexFile);
+      const beforeNames = await readdir(root);
+      assert.equal(localCompanionRefreshTimeoutForUnifiedIndex(indexFile),
+        fixture.cold === true ? 14_400_000 : LOCAL_COMPANION_INCREMENTAL_REFRESH_TIMEOUT_MS,
+        fixture.name);
+      assert.deepEqual(await readFile(indexFile), beforeBytes, fixture.name);
+      assert.deepEqual(await readdir(root), beforeNames, fixture.name);
+    }
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("large legacy and parser-upgrade timeout classification never scans integrity or fact collections", async () => {
   const root = await mkdtemp(join(tmpdir(), "local-timeout-large-index-"));
   const indexFile = join(root, "schema9-large.sqlite");
   const sparseSize = 800 * 1024 * 1024;
@@ -295,6 +435,8 @@ test("large legacy timeout classification never runs a synchronous integrity sca
       return {
         exec: (sql) => database.exec(sql),
         prepare(sql) {
+          assert.doesNotMatch(sql, /\b(?:usage_event|generation_issue|source_cursor)\b/u);
+          if (/\bFROM meta\b/u.test(sql)) assert.match(sql, /\bWHERE key\b/u);
           if (/\b(?:quick_check|integrity_check)\b/u.test(sql)) {
             integrityScans += 1;
             return {
@@ -341,6 +483,27 @@ test("large legacy timeout classification never runs a synchronous integrity sca
       },
     );
     assert.deepEqual(await readdir(root), beforeNames);
+
+    const parserIndex = join(root, "schema11-parser10-large.sqlite");
+    writeParserUpgradeTimeoutIndex(parserIndex);
+    await chmod(parserIndex, 0o600);
+    await truncate(parserIndex, sparseSize);
+    const parserBefore = await lstat(parserIndex);
+    const parserNamesBefore = await readdir(root);
+    const parserStartedAt = performance.now();
+    assert.equal(
+      localCompanionRefreshTimeoutForUnifiedIndex(parserIndex, { openDatabase }),
+      14_400_000,
+    );
+    const parserElapsedMs = performance.now() - parserStartedAt;
+    assert.equal(integrityScans, 0);
+    assert.equal(parserElapsedMs < 250, true,
+      `parser classification took ${parserElapsedMs}ms`);
+    const parserAfter = await lstat(parserIndex);
+    for (const field of ["dev", "ino", "size", "mtimeMs", "ctimeMs"]) {
+      assert.equal(parserAfter[field], parserBefore[field], field);
+    }
+    assert.deepEqual(await readdir(root), parserNamesBefore);
   } finally {
     await rm(root, { recursive: true });
   }
@@ -4891,130 +5054,6 @@ test("device disconnect failures expose one fixed code without leaking details",
       error: { code: "contribution_device_disconnect_failed" },
     });
     assert.equal(body.includes(privateCanary), false);
-  } finally {
-    await app.close();
-    await rm(files.root, { recursive: true });
-  }
-});
-
-test("the Fast-mode preference is owner-only, fixed-valued, and rebuilds the accounting snapshot", async () => {
-  const files = await fixture();
-  const store = fakeStore();
-  const app = await startLocalCompanionServer({
-    resourceRoot: files.resourceRoot,
-    stateRoot: files.stateRoot,
-    codexHome: files.codexHome,
-    staticRoot: files.staticRoot,
-    dataStore: store,
-    refreshRunner: async () => ({}),
-    port: 0,
-  });
-  try {
-    const base = `http://127.0.0.1:${app.port}`;
-    const headers = {
-      "Content-Type": "application/json",
-      "X-Usage-Monitor-Local": "1",
-      Origin: base,
-    };
-
-    // Nothing stated yet: the Standard default is reported as a default, and
-    // the published rates travel with it so the page never restates them.
-    const initial = await fetch(
-      `${base}/api/local/accounting/fast-mode-preference`,
-    ).then((response) => response.json());
-    assert.equal(initial.schemaVersion, "fast-mode-preference-v0.1");
-    assert.equal(initial.mode, "standard");
-    assert.equal(initial.source, "default");
-    assert.equal(initial.appliesTo, "turns_with_no_observed_tier_only");
-    assert.equal(initial.logObservability.sessionBaselineRecorded, false);
-    assert.deepEqual(initial.availableModes, [
-      "standard",
-      "fast",
-      "mixed_unknown",
-    ]);
-    assert.deepEqual(initial.multipliers, {
-      "gpt-5.6": 2.5,
-      "gpt-5.5": 2.5,
-      "gpt-5.4": 2,
-    });
-
-    // Cross-origin or non-dashboard requests never reach the stored state.
-    const unauthorized = await fetch(
-      `${base}/api/local/accounting/fast-mode-preference`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode: "fast" }),
-      },
-    );
-    assert.equal(unauthorized.status, 403);
-    assert.deepEqual(await unauthorized.json(), {
-      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
-      error: { code: "fast_mode_preference_not_authorized" },
-    });
-
-    // Only the three fixed values are accepted, and only that exact key set.
-    for (const body of [
-      JSON.stringify({ mode: "turbo" }),
-      JSON.stringify({ mode: "fast", extra: 1 }),
-      "{}",
-    ]) {
-      const rejected = await fetch(
-        `${base}/api/local/accounting/fast-mode-preference`,
-        { method: "POST", headers, body },
-      );
-      assert.equal(rejected.status, 400);
-      assert.deepEqual(await rejected.json(), {
-        schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
-        error: { code: "invalid_request" },
-      });
-    }
-
-    const reloadsBefore = store.reloads;
-    const stated = await fetch(
-      `${base}/api/local/accounting/fast-mode-preference`,
-      { method: "POST", headers, body: JSON.stringify({ mode: "fast" }) },
-    );
-    assert.equal(stated.status, 200);
-    const storedProjection = await stated.json();
-    assert.equal(storedProjection.mode, "fast");
-    assert.equal(storedProjection.source, "stated");
-    // The accounting projection is derived from this statement, so the cached
-    // snapshot is rebuilt before the response is acknowledged.
-    assert.equal(store.reloads > reloadsBefore, true);
-
-    const persisted = await fetch(
-      `${base}/api/local/accounting/fast-mode-preference`,
-    ).then((response) => response.json());
-    assert.equal(persisted.mode, "fast");
-    assert.equal(persisted.source, "stated");
-
-    const settingsFile = join(
-      files.stateRoot,
-      "private",
-      "fast-mode-preference-v0.1.json",
-    );
-    const metadata = await lstat(settingsFile);
-    if (process.platform !== "win32") {
-      assert.equal(metadata.mode & 0o077, 0);
-    }
-    const document = JSON.parse(await readFile(settingsFile, "utf8"));
-    assert.deepEqual(Object.keys(document).sort(), [
-      "mode",
-      "recordedAt",
-      "schemaVersion",
-    ]);
-    // Content-free: a stated speed mode and when it was stated, nothing else.
-    assert.equal(JSON.stringify(document).includes(files.stateRoot), false);
-    assert.equal(JSON.stringify(document).includes(files.codexHome), false);
-
-    assert.equal(
-      (await fetch(`${base}/api/local/accounting/fast-mode-preference`, {
-        method: "DELETE",
-        headers,
-      })).status,
-      405,
-    );
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });

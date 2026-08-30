@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { APP_OFFICIAL_PRICE_CARDS } from "@app-usagemonitor/accounting";
+import {
+  APP_OFFICIAL_PRICE_CARDS,
+  priceCodexUsageEvent,
+  quotaWeightedApiPriceEquivalent,
+  resolveEffectiveSpeedMode,
+  type SpeedModeProvenance,
+} from "@app-usagemonitor/accounting";
 import {
   priceTelemetryUsageEvent,
   SERVER_PRICING_METHOD_VERSION,
@@ -62,6 +68,16 @@ function fixture(overrides: Partial<TelemetryUsageEvent> = {}): TelemetryUsageEv
   };
 }
 
+// Exercise the pricing kernel's complete reviewed registry independently of
+// telemetry's deliberately narrower canonical-model ingestion allowlist. This
+// test-only cast does not make an alias or extra registry model ingestible.
+function registryModelPricingFixture(
+  modelId: string,
+  overrides: Omit<Partial<TelemetryUsageEvent>, "modelId"> = {},
+): TelemetryUsageEvent {
+  return { ...fixture(overrides), modelId } as TelemetryUsageEvent;
+}
+
 interface PriceCardValidity {
   effective: { from?: string; to?: string };
   vendorEffectiveFrom: string | null;
@@ -86,13 +102,17 @@ function priceCardValidity(cardId: string): PriceCardValidity {
 }
 
 function validateIngestibleEvent(event: TelemetryUsageEvent): TelemetryUsageEvent {
+  // The envelope window is derived from the event's own instant so parity
+  // fixtures may pin event times in any price epoch (e.g. after the Sol
+  // 2026-08-21 repricing) without failing covered-window validation.
+  const eventMs = Date.parse(event.eventTime);
   const contribution = validateTelemetryContribution({
     schemaVersion: "telemetry-contribution-v0.1",
     synthetic: false,
-    createdAt: "2026-08-01T13:50:00.000Z",
+    createdAt: new Date(eventMs + 3 * 60 * 1000).toISOString(),
     coveredAt: {
-      startAt: "2026-08-01T13:40:00.000Z",
-      endAt: "2026-08-01T13:50:00.000Z",
+      startAt: new Date(eventMs - 7 * 60 * 1000).toISOString(),
+      endAt: new Date(eventMs + 3 * 60 * 1000).toISOString(),
     },
     clientPlatform: "macos",
     providerPolicyEpoch: event.provider === "anthropic_claude_code"
@@ -113,6 +133,69 @@ function validateIngestibleEvent(event: TelemetryUsageEvent): TelemetryUsageEven
 }
 
 describe("server pricing", () => {
+  it("prices every registry Priority model, alias and epoch identically to the local kernel", () => {
+    let checked = 0;
+    for (const card of APP_OFFICIAL_PRICE_CARDS.filter(
+      (entry) => entry.provider === "openai" && entry.service_tier === "priority",
+    )) {
+      const eventTime = `${card.effective?.from ?? card.effective?.to ?? "2026-08-30"}T12:00:00.000Z`;
+      const totalInputContextTokens = card.metadata?.total_input_context_band === "long"
+        ? 272_000 : 4_000;
+      const tokens = Object.fromEntries(card.components
+        .filter((component) => component.usage_component.endsWith("_tokens"))
+        .map((component) => [component.usage_component, 1_000]));
+      for (const modelId of [card.model, ...(card.aliases ?? [])]) {
+        const localEvent = { model: modelId, timestamp: eventTime, totalInputContextTokens, components: tokens };
+        const standard = priceCodexUsageEvent(localEvent, { apiServiceTier: "standard" });
+        const priority = priceCodexUsageEvent(localEvent, { apiServiceTier: "priority" });
+        const event = registryModelPricingFixture(modelId, { eventTime, totalInputContextTokens, components: {
+          inputUncachedTokens: tokens.input_uncached_tokens ?? 0,
+          inputCacheReadTokens: tokens.input_cache_read_tokens ?? 0,
+          inputCacheWriteTokens: tokens.input_cache_write_tokens ?? 0,
+          inputCacheWrite5mTokens: null,
+          inputCacheWrite1hTokens: null,
+          outputTextTokens: tokens.output_text_tokens ?? 0,
+          outputReasoningTokens: 0,
+          outputCombinedTokens: null,
+        } });
+        const worker = priceTelemetryUsageEvent(event);
+        const localWeighted = quotaWeightedApiPriceEquivalent({
+          apiPriceEquivalentUsd: Number(standard.totalUsd), model: modelId, mode: "fast",
+          eventTime, totalInputContextTokens, standardPriceCardIds: standard.selectedPriceCardIds,
+        });
+        expect(worker.coverageStatus, card.id).toBe("fully_priced");
+        expect(worker.tierBasis, card.id).toBe("subscription_speed_priority_price_ratio");
+        expect(Number(worker.exactCostUsd), `${card.id}/${modelId}`).toBe(Number(priority.totalUsd));
+        expect(Number(worker.exactCostUsd), `${card.id}/${modelId}`).toBe(localWeighted.usd);
+        checked += 1;
+      }
+    }
+    expect(checked).toBe(26);
+    const provenance: SpeedModeProvenance = "assumed_fast_scenario";
+    expect(resolveEffectiveSpeedMode({ unresolvedScenario: "unresolved_as_fast" }).provenance).toBe(provenance);
+  });
+
+  it("discloses missing-model and missing-context Priority assumptions instead of borrowing a prefix rate", () => {
+    for (const event of [
+      registryModelPricingFixture("gpt-5.5-pro", { components: {
+        ...fixture().components, inputCacheReadTokens: 0,
+      } }),
+      fixture({ modelId: "gpt-5.5", totalInputContextTokens: 272_000 }),
+      fixture({ modelId: "gpt-5.6-sol", eventTime: "2026-08-20T23:59:59.999Z", totalInputContextTokens: 272_000 }),
+    ]) {
+      const result = priceTelemetryUsageEvent(event);
+      expect(result.coverageStatus).toBe("fully_priced");
+      expect(result.tierBasis).toBe("subscription_speed_assumed_priority_ratio");
+      expect(result.speedMultiplier).toBe(2);
+      const standard = priceTelemetryUsageEvent({ ...event, speedMode: "standard" });
+      expect(Number(result.exactCostUsd)).toBe(Number(standard.exactCostUsd) * 2);
+    }
+    const missing = priceTelemetryUsageEvent(registryModelPricingFixture("gpt-5.6-sol-wm", { totalInputContextTokens: null }));
+    expect(missing.coverageStatus).toBe("unpriced");
+    expect(missing.unpricedReasonCodes).toContain("total_input_context_missing");
+    expect(SERVER_PRICING_METHOD_VERSION).toBe("server-api-price-equivalent-v0.4");
+  });
+
   it("matches the frozen accounting kernel projection on supported fixtures", () => {
     expect(parityFixture.schemaVersion).toBe("accounting-parity-fixture-v0.1");
     expect(parityFixture.cases).toHaveLength(6);
@@ -164,7 +247,7 @@ describe("server pricing", () => {
     });
   });
 
-  it("ignores client cost and keeps subscription Fast separate from API Priority", () => {
+  it("ignores client cost and prices subscription Fast at the Priority ratio over Standard cards", () => {
     const first = priceTelemetryUsageEvent(fixture());
     const second = priceTelemetryUsageEvent(fixture({
       accounting: {
@@ -176,17 +259,32 @@ describe("server pricing", () => {
     }));
 
     expect(first).toEqual(second);
+    // The Standard-card total (0.0032 at the pre-2026-08-21 sol rates) scaled
+    // by the published GPT-5.6 Priority/Standard ratio of 2.
     expect(first).toMatchObject({
-      exactCostUsd: "0.0032",
-      costNanousd: 3_200_000,
+      exactCostUsd: "0.0064",
+      costNanousd: 6_400_000,
       coverageStatus: "fully_priced",
       apiServiceTier: "standard",
-      tierBasis: "subscription_standard_counterfactual",
+      tierBasis: "subscription_speed_priority_price_ratio",
       subscriptionSpeedMode: "fast",
+      speedMultiplier: 2,
       methodVersion: SERVER_PRICING_METHOD_VERSION,
     });
     expect(first.selectedPriceCardIds.join(",")).toContain(":standard:");
     expect(first.selectedPriceCardIds.join(",")).not.toContain(":priority:");
+    // Standard and unknown speed stay the plain counterfactual with no ratio.
+    expect(priceTelemetryUsageEvent(fixture({ speedMode: "standard" }))).toMatchObject({
+      exactCostUsd: "0.0032",
+      costNanousd: 3_200_000,
+      tierBasis: "subscription_standard_counterfactual",
+      speedMultiplier: null,
+    });
+    expect(priceTelemetryUsageEvent(fixture({ speedMode: "unknown" }))).toMatchObject({
+      exactCostUsd: "0.0032",
+      tierBasis: "subscription_standard_counterfactual",
+      speedMultiplier: null,
+    });
   });
 
   it("selects explicit API Flex and Batch while unknown tiers fail closed", () => {
@@ -202,7 +300,7 @@ describe("server pricing", () => {
         apiServiceTier,
         tierBasis: "observed_api_service_tier",
         selectedPriceCardIds: [
-          `openai:gpt-5.6-sol:${apiServiceTier}:short:official-observed-2026-08-01`,
+          `openai:gpt-5.6-sol:${apiServiceTier}:short-through-2026-08-20:official-observed-2026-08-30`,
         ],
       });
     }
@@ -247,8 +345,8 @@ describe("server pricing", () => {
       totalInputContextTokens: 1,
     }));
     expect(priced).toMatchObject({
-      exactCostUsd: "0.000002",
-      costNanousd: 2_000,
+      exactCostUsd: "0.000004",
+      costNanousd: 4_000,
       coverageStatus: "fully_priced",
     });
   });
@@ -354,10 +452,10 @@ describe("server pricing", () => {
     const missing = priceTelemetryUsageEvent(fixture({ eventTime: undefined as unknown as string }));
 
     expect(before.selectedPriceCardIds).toEqual([
-      "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-01",
+      "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-30",
     ]);
     expect(after.selectedPriceCardIds).toEqual([
-      "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-01",
+      "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-30",
     ]);
     expect(before).toMatchObject({
       priceBasis: "historical_api_prices",
@@ -383,12 +481,15 @@ describe("server pricing", () => {
       eventTime: januaryEventTime,
     }));
     expect(priced).toMatchObject({
-      exactCostUsd: "0.0032",
-      costNanousd: 3_200_000,
+      // The fast-subscription fixture doubles the January Standard-card total
+      // via the GPT-5.6 Priority ratio; the selected card itself stays the
+      // pre-repricing Standard card.
+      exactCostUsd: "0.0064",
+      costNanousd: 6_400_000,
       coveragePercent: 100,
       coverageStatus: "fully_priced",
       selectedPriceCardIds: [
-        "openai:gpt-5.6-sol:standard:short:official-observed-2026-08-01",
+        "openai:gpt-5.6-sol:standard:short-through-2026-08-20:official-observed-2026-08-30",
       ],
       unpricedReasonCodes: [],
       priceBasis: "historical_api_prices",
@@ -396,13 +497,14 @@ describe("server pricing", () => {
       priceEpochBasis: "event_time_when_registry_has_effective_evidence",
     });
     expect(priced.unpricedReasonCodes).not.toContain("historical_price_missing");
-    // The selected card carries no vendor-effective boundary in either
-    // direction, so the 2026-08-01 review date is provenance only and never
-    // acts as a lower bound on how far back the model rate may be applied.
+    // Since the 2026-08-21 Sol repricing the selected card closes at the
+    // published vendor boundary, but it stays open backwards: the review date
+    // is provenance only and never acts as a lower bound on how far back the
+    // model rate may be applied, so January history still prices.
     expect(priceCardValidity(priced.selectedPriceCardIds[0]!)).toEqual({
-      effective: {},
+      effective: { to: "2026-08-20" },
       vendorEffectiveFrom: null,
-      vendorEffectiveTo: null,
+      vendorEffectiveTo: "2026-08-20",
     });
     // The identical event inside the reviewed epoch selects the same card at
     // the same rate: event age alone never changes the pricing outcome.
@@ -419,12 +521,14 @@ describe("server pricing", () => {
       eventTime: "2026-01-15T12:00:00.000Z",
     }));
     expect(priced).toMatchObject({
-      exactCostUsd: "0.0016",
-      costNanousd: 1_600_000,
+      // 0.0016 at the pre-repricing terra Standard rates, doubled by the
+      // GPT-5.6 Priority ratio for the fast-subscription fixture.
+      exactCostUsd: "0.0032",
+      costNanousd: 3_200_000,
       coveragePercent: 100,
       coverageStatus: "fully_priced",
       selectedPriceCardIds: [
-        "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-01",
+        "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-30",
       ],
       unpricedReasonCodes: [],
       priceBasis: "historical_api_prices",

@@ -2189,7 +2189,7 @@ const SIDE_CHAT_ESTIMATE_SCHEMA_VERSION =
 const SIDE_CHAT_ESTIMATE_PARSER_VERSION =
   "desktop-fork-logs2-active-context-v0.3";
 const SIDE_CHAT_HISTORICAL_GAP_SCHEMA_VERSION =
-  "development-side-chat-historical-gap-v0.2";
+  "development-side-chat-historical-gap-v0.3";
 const SIDE_CHAT_RECENT_LIMIT = 500;
 const SIDE_CHAT_PERIOD_IDS = new Set(["24h", "7d", "30d", "all"]);
 const SIDE_CHAT_CACHE_ASSUMPTIONS = new Set([
@@ -2254,7 +2254,7 @@ const CACHE_SWITCH_ALLOWANCE_INTERPRETATION =
 const MONITORING_GAP_COPY = Object.freeze({
   quota_snapshots: ["Quota snapshots", "Current provider quota windows and their freshness."],
   account_attribution: ["Account attribution", "Whether quota and usage can be tied safely to one pseudonymous local account scope."],
-  fast_mode: ["Fast-mode accounting", "Codex records the speed mode only when it is applied or changed, never at session start, so turns before the first change in a session carry no recorded tier. An observed tier always wins; a timestamp-covered config declaration comes next, then your stated mode. Window-level inference is diagnostic only and never changes the money. Only an explicit mixed/unknown choice can leave the remainder unknown."],
+  fast_mode: ["Fast-mode accounting", "Codex records the speed mode only when it is applied or changed, never at session start, so turns before the first change in a session carry no recorded tier. An observed tier always wins; a timestamp-covered config declaration comes next, and anything neither covers is attributed to Standard as a visible assumption. Fast increments are priced at the published Priority (Fast) API rate for the model. Window-level inference is diagnostic only and never changes the money."],
   subagents: ["Subagents and child rollouts", "Lineage-aware accounting excludes inherited parent snapshots before attributing genuine child-rollout increments; ambiguous lineage remains unknown."],
   shared_pool_surfaces: ["Work, Workspace Agents, Excel and connected Voice", "These shared-pool surfaces may not write complete local Codex evidence."],
   third_party_auth: ["Third-party ChatGPT-authenticated apps", "No complete local accounting source is available for third-party authenticated apps."],
@@ -2523,6 +2523,48 @@ function normalizeCachePremiumWeighting(value, pricedDrops, standardPremium) {
   };
 }
 
+function normalizeCacheCoveredSubtotal(value, pricedDrops, completePremium) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.scope !== "covered_priced_drops"
+      || !Number.isSafeInteger(pricedDrops) || pricedDrops <= 0
+      || value.pricedDrops !== pricedDrops
+      || typeof value.standardApiPremiumUsd !== "number"
+      || !Number.isFinite(value.standardApiPremiumUsd)
+      || value.standardApiPremiumUsd < 0
+      || typeof value.standardApiPremiumUsdExact !== "string"
+      || value.standardApiPremiumUsdExact.length > 64
+      || !/^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/u.test(value.standardApiPremiumUsdExact)
+      || Number(value.standardApiPremiumUsdExact) !== value.standardApiPremiumUsd
+      || (completePremium !== null
+        && Math.abs(completePremium - value.standardApiPremiumUsd) > 1e-9)) return null;
+  const allowanceWeighting = normalizeCachePremiumWeighting(
+    value.allowanceWeighting, pricedDrops, value.standardApiPremiumUsd
+  );
+  if (allowanceWeighting === null) return null;
+  return {
+    scope: "covered_priced_drops",
+    pricedDrops,
+    standardApiPremiumUsd: value.standardApiPremiumUsd,
+    standardApiPremiumUsdExact: value.standardApiPremiumUsdExact,
+    allowanceWeighting
+  };
+}
+
+function cacheCoveredSubtotalsMatch(total, rows) {
+  if (total.coveredSubtotal === null) return true;
+  if (rows.some((row) => row.pricedDrops > 0 && row.coveredSubtotal === null)) return false;
+  // These strings have already passed the closed, nine-decimal validator.
+  // Compare exact sums, including for amounts that exceed float precision.
+  const nanos = (subtotal) => {
+    const [whole, fraction = ""] = subtotal.standardApiPremiumUsdExact.split(".");
+    return BigInt(whole) * 1_000_000_000n + BigInt(fraction.padEnd(9, "0"));
+  };
+  const sum = rows.reduce((amount, row) => amount + (
+    row.coveredSubtotal === null ? 0n : nanos(row.coveredSubtotal)
+  ), 0n);
+  return sum === nanos(total.coveredSubtotal);
+}
+
 function normalizeCacheSwitchBreakdown(value, includeOrderingCoverage = false) {
   const configurationChanges = count(value?.configurationChanges, null);
   const proximateConfigurationChanges = count(
@@ -2564,15 +2606,18 @@ function normalizeCacheSwitchBreakdown(value, includeOrderingCoverage = false) {
       || (cacheReadDrops === 0 && lostCacheTokens !== 0)
       || (cacheReadDrops > 0 && lostCacheTokens === 0)
       || (cacheReadDrops === 0 && premium !== 0 && premium !== null)
-      // One unpriced drop makes the aggregate premium incomplete, so the
-      // companion withholds the entire money sum instead of presenting the
-      // priced subset as the answer.
+      // Unpriced drops withhold the full-period amount. Any covered/priced
+      // subtotal has its own explicit scope and cannot replace this field.
       || ((unpricedDrops > 0 || coverageStatus === "incomplete")
         && premium !== null)
       || (unpricedDrops === 0 && coverageStatus === "complete"
         && premium === null)) {
     return null;
   }
+  const coveredSubtotal = normalizeCacheCoveredSubtotal(
+    value?.coveredSubtotal, pricedDrops, premium
+  );
+  if (value?.coveredSubtotal != null && coveredSubtotal === null) return null;
   return {
     configurationChanges,
     proximateConfigurationChanges,
@@ -2582,6 +2627,7 @@ function normalizeCacheSwitchBreakdown(value, includeOrderingCoverage = false) {
     cacheReadDrops,
     lostCacheTokens,
     estimatedPremiumUsd: premium,
+    coveredSubtotal,
     pricedDrops,
     unpricedDrops
   };
@@ -2668,12 +2714,15 @@ function normalizeCacheSwitchSummary(value) {
     totals.pricedDrops,
     totals.estimatedPremiumUsd
   );
-  if (allowanceWeighting === null) return null;
+  if (allowanceWeighting === null
+      || (totals.estimatedPremiumUsd === null
+        && allowanceWeighting.status !== "unavailable")) return null;
   const breakdownRows = CACHE_SWITCH_CHANGE_TYPES.map((key) => (
     [key, normalizeCacheSwitchBreakdown(value?.byChangeType?.[key])]
   ));
   if (breakdownRows.some(([, row]) => row === null)) return null;
   const byChangeType = Object.fromEntries(breakdownRows);
+  if (!cacheCoveredSubtotalsMatch(totals, Object.values(byChangeType))) return null;
   for (const field of [
     "configurationChanges",
     "proximateConfigurationChanges",
@@ -2701,7 +2750,9 @@ function normalizeCacheSwitchSummary(value) {
     allowanceWeighting,
     byChangeType,
     recent: normalizeCacheSwitchRecent(value?.recent, totals.cacheReadDrops),
-    allowanceImpact: normalizeCacheSwitchAllowanceImpact(value?.allowanceImpact)
+    allowanceImpact: totals.estimatedPremiumUsd === null
+      ? unavailableAllowanceImpact("weighting_evidence_incomplete")
+      : normalizeCacheSwitchAllowanceImpact(value?.allowanceImpact)
   };
 }
 
@@ -2723,6 +2774,7 @@ function unavailableCacheSwitchImpact(errorCode = null) {
     estimatedPremiumUsd: null,
     standardApiPremiumUsd: null,
     allowanceWeighting: null,
+    coveredSubtotal: null,
     pricedDrops: 0,
     unpricedDrops: 0,
     byChangeType: Object.fromEntries(CACHE_SWITCH_CHANGE_TYPES.map((key) => [key, {
@@ -2846,11 +2898,16 @@ function normalizeCacheContinuityBreakdown(value, includeOrderingCoverage = fals
         && premium === null)) {
     return null;
   }
+  const coveredSubtotal = normalizeCacheCoveredSubtotal(
+    value?.coveredSubtotal, normalized.pricedDrops, premium
+  );
+  if (value?.coveredSubtotal != null && coveredSubtotal === null) return null;
   return {
     ...normalized,
     ...(includeOrderingCoverage ? { orderingCoverageGaps } : {}),
     coverageStatus,
-    estimatedPremiumUsd: premium
+    estimatedPremiumUsd: premium,
+    coveredSubtotal
   };
 }
 
@@ -2911,13 +2968,16 @@ function normalizeCacheContinuitySummary(value) {
     totals.pricedDrops,
     totals.estimatedPremiumUsd
   );
-  if (allowanceWeighting === null) return null;
+  if (allowanceWeighting === null
+      || (totals.estimatedPremiumUsd === null
+        && allowanceWeighting.status !== "unavailable")) return null;
   const byGapBandRows = CACHE_CONTINUITY_GAP_BAND_IDS.map((key) => [
     key,
     normalizeCacheContinuityBreakdown(value?.byGapBand?.[key])
   ]);
   if (byGapBandRows.some(([, row]) => row === null)) return null;
   const byGapBand = Object.fromEntries(byGapBandRows);
+  if (!cacheCoveredSubtotalsMatch(totals, Object.values(byGapBand))) return null;
   for (const field of CACHE_CONTINUITY_BREAKDOWN_FIELDS) {
     if (CACHE_CONTINUITY_GAP_BAND_IDS.reduce(
       (sum, key) => sum + byGapBand[key][field],
@@ -2946,6 +3006,7 @@ function normalizeCacheContinuitySummary(value) {
   });
   if (byOutcomeBucketRows.some(([, row]) => row === null)) return null;
   const byOutcomeBucket = Object.fromEntries(byOutcomeBucketRows);
+  if (!cacheCoveredSubtotalsMatch(totals, Object.values(byOutcomeBucket))) return null;
   for (const field of CACHE_CONTINUITY_BREAKDOWN_FIELDS) {
     if (CACHE_CONTINUITY_OUTCOME_BUCKET_IDS.reduce(
       (sum, key) => sum + byOutcomeBucket[key][field],
@@ -2976,7 +3037,9 @@ function normalizeCacheContinuitySummary(value) {
     byGapBand,
     byOutcomeBucket,
     recent: normalizeCacheContinuityRecent(value?.recent, totals.cacheReadDrops),
-    allowanceImpact: normalizeCacheSwitchAllowanceImpact(value?.allowanceImpact)
+    allowanceImpact: totals.estimatedPremiumUsd === null
+      ? unavailableAllowanceImpact("weighting_evidence_incomplete")
+      : normalizeCacheSwitchAllowanceImpact(value?.allowanceImpact)
   };
 }
 
@@ -3005,6 +3068,7 @@ function unavailableCacheContinuityImpact(errorCode = null) {
     estimatedPremiumUsd: null,
     standardApiPremiumUsd: null,
     allowanceWeighting: null,
+    coveredSubtotal: null,
     pricedDrops: 0,
     unpricedDrops: 0,
     postCompactionRequests: 0,
@@ -3082,27 +3146,43 @@ function normalizeCacheContinuityImpact(value) {
   };
 }
 
-const FAST_MODE_PREFERENCES = Object.freeze(["standard", "fast", "mixed_unknown"]);
-const FAST_MODE_FAMILY_KEYS = Object.freeze(["gpt-5.6", "gpt-5.5", "gpt-5.4", "unsupported"]);
 const OBSERVED_SPEED_KEYS = Object.freeze(["standard", "fast", "unknown"]);
-// Published Fast credit rates, mirrored so the dashboard never has to trust a
-// server-supplied number to explain its own arithmetic.
+// Published Priority (Fast) API price ratios over Standard, mirrored so the
+// dashboard never has to trust a server-supplied number to explain its own
+// arithmetic. Keys are canonical registered models; uncovered model/context/
+// date evidence occupies the separate disclosed assumed-2x bucket.
 const FAST_MODE_MULTIPLIERS = Object.freeze({
-  "gpt-5.6": 2.5,
+  "gpt-4.1": 1.75,
+  "gpt-4.1-mini": 1.75,
+  "gpt-4.1-nano": 2,
+  "gpt-4o": 1.7,
+  "gpt-5": 2,
+  "gpt-5-mini": 1.8,
+  "gpt-5.1": 2,
+  "gpt-5.1-codex": 2,
+  "gpt-5.2": 2,
+  "gpt-5.4": 2,
+  "gpt-5.4-mini": 2,
   "gpt-5.5": 2.5,
-  "gpt-5.4": 2
+  "gpt-5.6-luna": 2,
+  "gpt-5.6-sol": 2,
+  "gpt-5.6-terra": 2
 });
-const FAST_MODE_METRIC_LABEL = "Quota-weighted API-price equivalent";
-const FAST_MODE_METRIC_SHORT_LABEL = "Quota-weighted API equivalent";
+const FAST_MODE_FAMILY_KEYS = Object.freeze([
+  ...Object.keys(FAST_MODE_MULTIPLIERS), "unsupported"
+]);
+const FAST_MODE_ASSUMED_MULTIPLIER = 2;
+const FAST_MODE_METRIC_LABEL = "Speed-priced API-price equivalent";
+const FAST_MODE_METRIC_SHORT_LABEL = "Speed-priced API equivalent";
 const FAST_MODE_STANDARD_METRIC_LABEL = "Standard-rate API-price equivalent";
 const FAST_MODE_METRIC_EXPLAINER =
-  "Standard-rate API prices, multiplied by the published Fast credit rate for events in Fast mode: 2.5x for GPT-5.6 and GPT-5.5, 2x for GPT-5.4. It tracks relative quota consumption, not a bill.";
+  "Standard-rate API prices, with Fast increments priced at the published Priority API rate for the exact model, context, and date. Where no eligible Priority rate exists, a disclosed assumed 2x Standard is used. This is a comparison, not a bill.";
 const ALLOWANCE_SCENARIOS = Object.freeze([
   "unresolved_as_standard",
   "unresolved_as_fast"
 ]);
 const ALLOWANCE_BASIS_FAMILY_ID =
-  "codex_primary:quota_weighted_api_equivalent:v1:fast_rates_2026_08_01:event_time:observed_declared_scenario";
+  "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario";
 const TIMELINE_ALLOWANCE_WEIGHTING_SCHEMA_VERSION =
   "quota-weighted-timeline-v0.1";
 const TIMELINE_WEIGHTING_STATUS_BY_CODE = Object.freeze([
@@ -3123,8 +3203,8 @@ function normalizeAllowanceCoverage(value, usageEvents) {
       value?.declaredFromConfigEvents,
       null
     ),
-    assumedFromPreferenceEvents: count(
-      value?.assumedFromPreferenceEvents,
+    assumedEvents: count(
+      value?.assumedEvents,
       null
     ),
     inferredEvents: count(value?.inferredEvents, null),
@@ -3135,7 +3215,7 @@ function normalizeAllowanceCoverage(value, usageEvents) {
       || coverage.inferredEvents > coverage.unknownEvents
       || coverage.observedEvents
         + coverage.declaredFromConfigEvents
-        + coverage.assumedFromPreferenceEvents
+        + coverage.assumedEvents
         + coverage.unknownEvents !== usageEvents) return null;
   return {
     ...coverage,
@@ -3268,7 +3348,7 @@ function normalizeCompactTimelineAllowanceScenario(
       totalEvents: usageEvents,
       observedEvents: tuple[offset + 3],
       declaredFromConfigEvents: tuple[offset + 4],
-      assumedFromPreferenceEvents: tuple[offset + 5],
+      assumedEvents: tuple[offset + 5],
       inferredEvents: tuple[offset + 6],
       unknownEvents: tuple[offset + 7]
     }
@@ -3339,16 +3419,14 @@ function normalizeFastMode(value) {
   const coverage = value?.coverage ?? {};
   const inference = value?.inference ?? {};
   return {
-    preference: FAST_MODE_PREFERENCES.includes(value?.preference)
-      ? value.preference
-      : "standard",
-    defaultPreference: "standard",
+    unresolvedScenario: value?.unresolvedScenario === "unresolved_as_fast"
+      ? "unresolved_as_fast"
+      : "unresolved_as_standard",
     // Codex records a tier only when the setting is applied or changed, never
     // at session start, so turns before the first change in a session carry no
     // recorded tier. The dashboard states this itself rather than reflecting a
     // server claim.
     logRecordsTierChangesOnly: true,
-    preferenceAppliesTo: "turns_with_no_observed_tier_only",
     metricLabel: FAST_MODE_METRIC_LABEL,
     metricShortLabel: FAST_MODE_METRIC_SHORT_LABEL,
     metricExplainer: FAST_MODE_METRIC_EXPLAINER,
@@ -3369,15 +3447,25 @@ function normalizeFastMode(value) {
     weightingStatus: ["complete", "partial", "unknown"].includes(value?.weightingStatus)
       ? value.weightingStatus
       : "unknown",
-    appliedMultipliers: Object.fromEntries(
-      Object.keys(FAST_MODE_MULTIPLIERS)
-        .filter((family) => finite(value?.appliedMultipliers?.[family], null) !== null)
-        .map((family) => [family, FAST_MODE_MULTIPLIERS[family]])
+    assumedRatioStandardApiPriceEquivalentUsd: nonNegative(
+      value?.assumedRatioStandardApiPriceEquivalentUsd,
+      0
     ),
+    appliedMultipliers: {
+      ...Object.fromEntries(
+        Object.keys(FAST_MODE_MULTIPLIERS)
+          .filter((family) => finite(value?.appliedMultipliers?.[family], null) !== null)
+          .map((family) => [family, FAST_MODE_MULTIPLIERS[family]])
+      ),
+      ...(finite(value?.appliedMultipliers?.unsupported, null) !== null
+        ? { unsupported: FAST_MODE_ASSUMED_MULTIPLIER }
+        : {})
+    },
     coverage: {
       totalEvents: count(coverage.totalEvents, 0),
       observedEvents: count(coverage.observedEvents, 0),
-      assumedFromPreferenceEvents: count(coverage.assumedFromPreferenceEvents, 0),
+      declaredFromConfigEvents: count(coverage.declaredFromConfigEvents, 0),
+      assumedEvents: count(coverage.assumedEvents, 0),
       inferredEvents: count(coverage.inferredEvents, 0),
       unknownEvents: count(coverage.unknownEvents, 0),
       observedSharePercent: nonNegative(coverage.observedSharePercent, null),
@@ -3398,26 +3486,6 @@ function normalizeFastMode(value) {
   };
 }
 
-function normalizeFastModePreference(value) {
-  const mode = FAST_MODE_PREFERENCES.includes(value?.mode)
-    ? value.mode
-    : "standard";
-  return {
-    mode,
-    defaultMode: "standard",
-    availableModes: [...FAST_MODE_PREFERENCES],
-    // "stated" only when the server confirms a stored statement of this exact
-    // shape; anything else reads as the untouched default.
-    source: value?.source === "stated"
-      && value?.schemaVersion === "fast-mode-preference-v0.1"
-      ? "stated"
-      : "default",
-    recordedAt: text(value?.recordedAt, ""),
-    logRecordsTierChangesOnly: true,
-    appliesTo: "turns_with_no_observed_tier_only",
-    multipliers: { ...FAST_MODE_MULTIPLIERS }
-  };
-}
 
 function normalizeAccountingDimension(value, allowedKeys) {
   return Object.fromEntries([...allowedKeys].map((key) => {
@@ -3861,12 +3929,6 @@ function closeNumber(left, right, tolerance = 1e-6) {
     && Math.abs(left - right) <= tolerance;
 }
 
-function historicalGapFastMultiplier(model) {
-  if (model?.startsWith("gpt-5.6-") || model === "gpt-5.5") return 2.5;
-  if (model?.startsWith("gpt-5.4")) return 2;
-  return null;
-}
-
 function normalizeSideChatHistoricalGap(value) {
   if (value?.status !== "available") {
     return unavailableSideChatHistoricalGap(value?.errorCode);
@@ -4230,7 +4292,8 @@ function normalizeSideChatHistoricalGap(value) {
       || assumedMissingModel === null
       || assumedMissingModel !== observedModels[0]
       || estimate?.modelAssumption !== "only_exact_model_observed_that_day"
-      || fastMultiplier !== historicalGapFastMultiplier(assumedMissingModel)
+      || fastMultiplier !== FAST_MODE_ASSUMED_MULTIPLIER
+      || estimate?.fastQuotaMultiplierSource !== "assumed_missing_event_context"
       || comparison?.basisFamilyId !== ALLOWANCE_BASIS_FAMILY_ID
       || comparisonStatus === null
       || comparisonStatus !== allowanceWeighting.status
@@ -4337,6 +4400,7 @@ function normalizeSideChatHistoricalGap(value) {
       assumedMissingModel,
       modelAssumption: "only_exact_model_observed_that_day",
       fastQuotaMultiplier: fastMultiplier,
+      fastQuotaMultiplierSource: "assumed_missing_event_context",
       allowanceComparison: {
         status: comparisonStatus,
         basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
@@ -5732,46 +5796,6 @@ export class LocalCompanionClient {
     return normalized;
   }
 
-  /**
-   * The owner's stated Codex speed mode. Codex records no speed field, so an
-   * unreadable statement reads back as the Standard default rather than an
-   * invented Fast attribution.
-   */
-  async fastModePreference() {
-    try {
-      const response = await this.fetchImpl(
-        `${LOCAL_ROOT}/accounting/fast-mode-preference`,
-        { headers: { Accept: "application/json" } }
-      );
-      if (!response.ok) return normalizeFastModePreference(null);
-      return normalizeFastModePreference(
-        await response.json().catch(() => null)
-      );
-    } catch {
-      return normalizeFastModePreference(null);
-    }
-  }
-
-  async selectFastModePreference(mode) {
-    if (!FAST_MODE_PREFERENCES.includes(mode)) {
-      throw new TypeError("Unsupported Fast-mode preference.");
-    }
-    const response = await this.fetchImpl(
-      `${LOCAL_ROOT}/accounting/fast-mode-preference`,
-      {
-        method: "POST",
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/json",
-          "X-Usage-Monitor-Local": "1"
-        },
-        body: JSON.stringify({ mode })
-      }
-    );
-    const payload = await response.json().catch(() => null);
-    if (!response.ok) throw localCompanionRequestError(response, payload);
-    return normalizeFastModePreference(payload);
-  }
 
   async contributionSyncPreview() {
     try {
@@ -6165,7 +6189,7 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
       });
       rolling.push({
         timestamp,
-        series: "Expected from quota-weighted API cost",
+        series: "Expected from speed-priced API cost",
         quota_change_pp: Number((observed * .82 + Math.cos(index / 4) * .8 * scale).toFixed(2)),
         smoothing_hours: smoothingHours
       });
@@ -6249,7 +6273,7 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
               totalEvents: usageEvents,
               observedEvents: 0,
               declaredFromConfigEvents: 0,
-              assumedFromPreferenceEvents: usageEvents,
+              assumedEvents: usageEvents,
               inferredEvents: 0,
               unknownEvents: 0
             }
@@ -6263,7 +6287,7 @@ export function demoDashboard({ now = new Date().toISOString() } = {}) {
               totalEvents: usageEvents,
               observedEvents: 0,
               declaredFromConfigEvents: 0,
-              assumedFromPreferenceEvents: usageEvents,
+              assumedEvents: usageEvents,
               inferredEvents: 0,
               unknownEvents: 0
             }

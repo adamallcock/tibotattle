@@ -107,14 +107,14 @@ test("application quota sensitivity exposes only its reviewed public API", () =>
 });
 
 test("application quota sensitivity preserves the model multiplier policy", () => {
-  assert.equal(application.fastQuotaMultiplier("gpt-5.6"), 2.5);
-  assert.equal(application.fastQuotaMultiplier("gpt-5.6-sol"), 2.5);
+  assert.equal(application.fastQuotaMultiplier("gpt-5.6"), null);
+  assert.equal(application.fastQuotaMultiplier("gpt-5.6-sol"), 2);
   assert.equal(application.fastQuotaMultiplier("gpt-5.5-codex"), 2.5);
   assert.equal(application.fastQuotaMultiplier("gpt-5.4"), 2);
-  assert.equal(application.fastQuotaMultiplier("gpt-5.4-codex"), 2);
+  assert.equal(application.fastQuotaMultiplier("gpt-5.4-codex"), null);
   assert.equal(application.fastQuotaMultiplier("gpt-5.60"), null);
   assert.equal(application.fastQuotaMultiplier("gpt-5.4future"), null);
-  assert.equal(application.fastQuotaMultiplier("gpt-4.1"), null);
+  assert.equal(application.fastQuotaMultiplier("gpt-4.1"), 1.75);
   assert.equal(application.fastQuotaMultiplier(null), null);
 });
 
@@ -122,28 +122,33 @@ test("application quota sensitivity preserves complete, incomplete, rounding, an
   assert.deepEqual(
     application.subscriptionSpeedSensitivity({
       "future-model": { costUsd: 0.3 },
-      "gpt-5.4": { costUsd: 0.2 },
-      "gpt-5.6-sol": { costUsd: 0.1 },
+      "gpt-5.4": { costUsd: 0.2, priceEvidence: {
+        eventTime: "2026-08-30T00:00:00.000Z", totalInputContextTokens: 1_000,
+      } },
+      "gpt-5.6-sol": { costUsd: 0.1, priceEvidence: {
+        eventTime: "2026-08-30T00:00:00.000Z", totalInputContextTokens: 1_000,
+      } },
       "ignored-infinite": { costUsd: Number.POSITIVE_INFINITY },
       "ignored-negative": { costUsd: -1 },
       "ignored-nonnumeric": { costUsd: "not-a-number" },
     }, "fast"),
     {
       basis:
-        "codex_subscription_speed_multiplier_applied_to_standard_api_equivalent_not_api_cost",
+        "codex_subscription_priority_price_ratio_applied_to_standard_api_equivalent",
       modelMultipliers: {
         "future-model": null,
         "gpt-5.4": 2,
-        "gpt-5.6-sol": 2.5,
+        "gpt-5.6-sol": 2,
       },
       observedSpeedMode: "fast",
       scenarios: {
         fast: {
-          complete: false,
+          complete: true,
           relativeQuotaWeight: "model_specific",
-          supportedWeightedStandardApiEquivalentUsd: 0.65,
-          unsupportedStandardApiEquivalentUsd: 0.3,
-          weightedStandardApiEquivalentUsd: null,
+          // 0.3 x 2 assumed + 0.2 x 2 + 0.1 x 2 published.
+          weightedStandardApiEquivalentUsd: 1.2,
+          assumedRatioStandardApiEquivalentUsd: 0.3,
+          assumedRatioMultiplier: 2,
         },
         standard: {
           complete: true,
@@ -159,16 +164,16 @@ test("application quota sensitivity preserves complete, incomplete, rounding, an
     application.subscriptionSpeedSensitivity(null),
     {
       basis:
-        "codex_subscription_speed_multiplier_applied_to_standard_api_equivalent_not_api_cost",
+        "codex_subscription_priority_price_ratio_applied_to_standard_api_equivalent",
       modelMultipliers: {},
       observedSpeedMode: "unknown",
       scenarios: {
         fast: {
           complete: true,
           relativeQuotaWeight: "model_specific",
-          supportedWeightedStandardApiEquivalentUsd: 0,
-          unsupportedStandardApiEquivalentUsd: 0,
           weightedStandardApiEquivalentUsd: 0,
+          assumedRatioStandardApiEquivalentUsd: 0,
+          assumedRatioMultiplier: 2,
         },
         standard: {
           complete: true,
@@ -183,6 +188,46 @@ test("application quota sensitivity preserves complete, incomplete, rounding, an
     () => application.subscriptionSpeedSensitivity({}, "priority"),
     /^Error: observedSpeedMode is invalid$/u,
   );
+});
+
+test("application sensitivity retains event-qualified model/context mixtures and discloses missing evidence", () => {
+  const byModel = {
+    "gpt-5.5": { costUsd: 3 },
+    "gpt-4.1": { costUsd: 1 },
+  };
+  const result = application.subscriptionSpeedSensitivity(byModel, "fast", {
+    speedWeightingByModel: {
+      "gpt-5.5": { unknown: {
+        "gpt-5.5": { events: 1, apiPriceEquivalentUsd: 1 },
+        unsupported: { events: 1, apiPriceEquivalentUsd: 2 },
+      } },
+      "gpt-4.1": { unknown: {
+        "gpt-4.1": { events: 1, apiPriceEquivalentUsd: 1 },
+      } },
+    },
+  });
+  assert.equal(result.scenarios.standard.weightedStandardApiEquivalentUsd, 4);
+  assert.equal(result.scenarios.fast.weightedStandardApiEquivalentUsd, 8.25);
+  assert.equal(result.scenarios.fast.assumedRatioStandardApiEquivalentUsd, 2);
+  assert.deepEqual(result.modelMultipliers, { "gpt-5.5": null, "gpt-4.1": 1.75 });
+
+  const missing = application.subscriptionSpeedSensitivity(byModel, "fast");
+  assert.equal(missing.scenarios.fast.weightedStandardApiEquivalentUsd, 8);
+  assert.equal(missing.scenarios.fast.assumedRatioStandardApiEquivalentUsd, 4);
+  assert.deepEqual(missing.modelMultipliers, { "gpt-5.5": null, "gpt-4.1": null });
+
+  for (const crossing of [
+    { unknown: { "gpt-4.1": { events: 1, apiPriceEquivalentUsd: 3 } } },
+    { fast: { "gpt-5.5": { events: 1, apiPriceEquivalentUsd: 3 } } },
+    { unknown: { "gpt-5.5": { events: 1, apiPriceEquivalentUsd: 2 } } },
+  ]) {
+    const invalid = application.subscriptionSpeedSensitivity({ "gpt-5.5": { costUsd: 3 } }, "fast", {
+      speedWeightingByModel: { "gpt-5.5": crossing },
+    });
+    assert.equal(invalid.scenarios.fast.weightedStandardApiEquivalentUsd, 6);
+    assert.equal(invalid.scenarios.fast.assumedRatioStandardApiEquivalentUsd, 3);
+    assert.equal(invalid.modelMultipliers["gpt-5.5"], null);
+  }
 });
 
 test("production modules no longer depend on the legacy tier shim", async () => {

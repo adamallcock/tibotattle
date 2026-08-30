@@ -9,6 +9,8 @@ import {
   addUsdStrings,
   apiPriceResolutionSummary,
   costWarningCodes,
+  FAST_MODE_ASSUMED_MULTIPLIER,
+  fastModeModelFamilyKey,
   priceCodexUsageEvent,
 } from "@app-usagemonitor/accounting";
 
@@ -90,8 +92,11 @@ function roundUsd(value) {
 function priceUsageEvent(event, priceCards) {
   const ledger = priceCodexUsageEvent(event, { priceCards });
   const costUsd = Number(ledger.totalUsd);
-  const multiplier = fastQuotaMultiplier(event.model);
-  const fastWeightedEquivalentUsd = multiplier === null ? null : costUsd * multiplier;
+  const multiplier = fastQuotaMultiplier(event.model, {
+    eventTime: event.timestamp,
+    standardPriceCardIds: ledger.selectedPriceCardIds,
+  });
+  const fastWeightedEquivalentUsd = costUsd * (multiplier ?? FAST_MODE_ASSUMED_MULTIPLIER);
   const observedSpeedMode = event.tierSemantics?.codexSpeedMode ?? "unknown";
   const speedMode = ["standard", "fast"].includes(observedSpeedMode)
     ? observedSpeedMode
@@ -1294,11 +1299,19 @@ export async function mineCodexTransitions({
   const usageEventsByModel = {};
   const tokenComponentsByModel = {};
   const costByModel = {};
+  const speedWeightingByModel = {};
   const unpricedModels = new Set();
   for (const event of usageEvents) {
     usageEventsByModel[event.model] = (usageEventsByModel[event.model] ?? 0) + 1;
     const costSummary = costByModel[event.model] ??= { costUsd: 0 };
     costSummary.costUsd += event.costUsd;
+    const family = fastModeModelFamilyKey(event.model, {
+      eventTime: event.timestamp, standardPriceCardIds: event.priceCardIds,
+    });
+    const crossing = speedWeightingByModel[event.model] ??= { unknown: {} };
+    const cell = crossing.unknown[family] ??= { events: 0, apiPriceEquivalentUsd: 0 };
+    cell.events += 1;
+    cell.apiPriceEquivalentUsd += event.costUsd;
     const components = tokenComponentsByModel[event.model] ??= emptyComponents();
     addComponents(components, event.components);
     if (event.pricingCoverageStatus !== "fully_priced" || event.priceCardIds.length === 0) unpricedModels.add(event.model);
@@ -1320,7 +1333,9 @@ export async function mineCodexTransitions({
     pricing: {
       basis: "standard_openai_api_prices_not_codex_subscription_credits",
       tierSemantics: unknownCodexTier(),
-      subscriptionSpeedSensitivity: subscriptionSpeedSensitivity(costByModel),
+      subscriptionSpeedSensitivity: subscriptionSpeedSensitivity(costByModel, "unknown", {
+        speedWeightingByModel,
+      }),
       observedTierSensitivity: {
         complete: quotaWeightedSensitivityComplete,
         lowerWeightedStandardApiEquivalentUsd: quotaWeightedSensitivityComplete ? cumulativeQuotaWeightedLowerUsd : null,

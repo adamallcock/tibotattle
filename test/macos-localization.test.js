@@ -128,6 +128,10 @@ test("native catalogs have complete language parity and preserve placeholders", 
   }
   assert.equal(english.get("settings.language"), "Language");
   assert.equal(
+    english.get("nativeDashboard.progressAccounting"),
+    "Calculating accounting…",
+  );
+  assert.equal(
     english.get("settings.languageSummary"),
     "Uses your Mac language by default.",
   );

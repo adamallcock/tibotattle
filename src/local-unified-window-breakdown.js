@@ -1,5 +1,4 @@
 import {
-  fastModeModelFamilyKey,
   fastModeQuotaMultiplier,
 } from "@app-usagemonitor/accounting";
 import {
@@ -126,9 +125,16 @@ export function summarizeWindowBreakdownRows(rows, { pricer = null } = {}) {
       tokens: 0,
       events: 0,
       unpricedEvents: 0,
-      fastModeFamily: fastModeModelFamilyKey(model),
-      fastModeMultiplier: fastModeQuotaMultiplier(model),
+      fastModeFamily: projection.fastModeFamily,
+      fastModeMultiplier: projection.fastModeFamily === "unsupported"
+        ? null : fastModeQuotaMultiplier(model),
     };
+    // A model aggregate cannot claim one published card basis if any of its
+    // events lacked a matching Priority context or date.
+    if (modelRow.fastModeFamily !== projection.fastModeFamily) {
+      modelRow.fastModeFamily = "unsupported";
+      modelRow.fastModeMultiplier = null;
+    }
     modelRow.costUsd += cost;
     modelRow.tokens += projection.totalTokens;
     modelRow.events += 1;

@@ -269,6 +269,14 @@ test("Codex pricing analysis preserves exact model/day/surface and tool-unit out
       },
     });
 
+    // Tool-call prices remain in the API total but never enter the token-speed
+    // scenario. An unregistered fixture model uses only the disclosed fallback.
+    const sensitivity = result.runcost.subscriptionSpeedSensitivity;
+    assert.equal(sensitivity.scenarios.standard.weightedStandardApiEquivalentUsd, 2.15);
+    assert.equal(sensitivity.scenarios.fast.weightedStandardApiEquivalentUsd, 4.3);
+    assert.equal(sensitivity.scenarios.fast.assumedRatioStandardApiEquivalentUsd, 2.15);
+    assert.equal(sensitivity.modelMultipliers[MODEL], null);
+
     const serialized = JSON.stringify(result);
     for (const privateValue of [
       fixture.codexHome,

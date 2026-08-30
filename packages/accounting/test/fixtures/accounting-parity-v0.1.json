@@ -2,13 +2,13 @@
   "schemaVersion": "accounting-parity-fixture-v0.1",
   "cases": [
     {
-      "id": "openai-subscription-fast-standard-counterfactual",
+      "id": "openai-subscription-standard-counterfactual",
       "kernelEvent": {
         "provider": "openai",
         "model": "gpt-5.6-sol",
         "surface": "openai.responses",
         "apiTier": "standard",
-        "pricedAt": "2026-08-01T13:47:00Z",
+        "pricedAt": "2026-08-30T06:01:00Z",
         "totalInputContextTokens": 1000,
         "components": {
           "inputUncachedTokens": 100,
@@ -23,7 +23,7 @@
         "modelId": "gpt-5.6-sol",
         "modelRecognition": "recognized",
         "billingSurface": "chatgpt_subscription",
-        "speedMode": "fast",
+        "speedMode": "standard",
         "apiServiceTier": "priority",
         "totalInputContextTokens": 1000,
         "components": {
@@ -35,16 +35,17 @@
           "outputTextTokens": 50,
           "outputReasoningTokens": 25,
           "outputCombinedTokens": null
-        }
+        },
+        "eventTime": "2026-08-30T06:01:00.000Z"
       },
       "expected": {
-        "exactCostUsd": "0.0032",
-        "costNanousd": 3200000,
+        "exactCostUsd": "0.00226",
+        "costNanousd": 2260000,
         "coverageStatus": "fully_priced",
         "unknownBillableUnits": 0,
         "unpricedReasonCodes": [],
         "selectedPriceCardIds": [
-          "openai:gpt-5.6-sol:standard:short:official-observed-2026-08-01"
+          "openai:gpt-5.6-sol:standard:short-from-2026-08-21:official-observed-2026-08-30"
         ]
       }
     },
@@ -55,7 +56,7 @@
         "model": "gpt-5.6-sol",
         "surface": "openai.responses",
         "apiTier": "priority",
-        "pricedAt": "2026-08-01T13:47:00Z",
+        "pricedAt": "2026-08-30T06:01:00Z",
         "totalInputContextTokens": 1000,
         "components": {
           "inputUncachedTokens": 100,
@@ -82,16 +83,17 @@
           "outputTextTokens": 50,
           "outputReasoningTokens": 25,
           "outputCombinedTokens": null
-        }
+        },
+        "eventTime": "2026-08-30T06:01:00.000Z"
       },
       "expected": {
-        "exactCostUsd": "0.0064",
-        "costNanousd": 6400000,
+        "exactCostUsd": "0.00452",
+        "costNanousd": 4520000,
         "coverageStatus": "fully_priced",
         "unknownBillableUnits": 0,
         "unpricedReasonCodes": [],
         "selectedPriceCardIds": [
-          "openai:gpt-5.6-sol:priority:short:official-observed-2026-08-01"
+          "openai:gpt-5.6-sol:priority:short-from-2026-08-21:official-observed-2026-08-30"
         ]
       }
     },
@@ -102,7 +104,7 @@
         "model": "gpt-5.6-sol",
         "surface": "openai.responses",
         "apiTier": "standard",
-        "pricedAt": "2026-08-01T13:47:00Z",
+        "pricedAt": "2026-08-30T06:01:00Z",
         "totalInputContextTokens": 271999,
         "components": {
           "inputUncachedTokens": 1000000,
@@ -129,16 +131,17 @@
           "outputTextTokens": 1000000,
           "outputReasoningTokens": 0,
           "outputCombinedTokens": null
-        }
+        },
+        "eventTime": "2026-08-30T06:01:00.000Z"
       },
       "expected": {
-        "exactCostUsd": "35",
-        "costNanousd": 35000000000,
+        "exactCostUsd": "24",
+        "costNanousd": 24000000000,
         "coverageStatus": "fully_priced",
         "unknownBillableUnits": 0,
         "unpricedReasonCodes": [],
         "selectedPriceCardIds": [
-          "openai:gpt-5.6-sol:standard:short:official-observed-2026-08-01"
+          "openai:gpt-5.6-sol:standard:short-from-2026-08-21:official-observed-2026-08-30"
         ]
       }
     },
@@ -149,7 +152,7 @@
         "model": "gpt-5.6-sol",
         "surface": "openai.responses",
         "apiTier": "standard",
-        "pricedAt": "2026-08-01T13:47:00Z",
+        "pricedAt": "2026-08-30T06:01:00Z",
         "totalInputContextTokens": 272000,
         "components": {
           "inputUncachedTokens": 1000000,
@@ -176,16 +179,17 @@
           "outputTextTokens": 1000000,
           "outputReasoningTokens": 0,
           "outputCombinedTokens": null
-        }
+        },
+        "eventTime": "2026-08-30T06:01:00.000Z"
       },
       "expected": {
-        "exactCostUsd": "55",
-        "costNanousd": 55000000000,
+        "exactCostUsd": "38",
+        "costNanousd": 38000000000,
         "coverageStatus": "fully_priced",
         "unknownBillableUnits": 0,
         "unpricedReasonCodes": [],
         "selectedPriceCardIds": [
-          "openai:gpt-5.6-sol:standard:long:official-observed-2026-08-01"
+          "openai:gpt-5.6-sol:standard:long-from-2026-08-21:official-observed-2026-08-30"
         ]
       }
     },
@@ -196,7 +200,7 @@
         "model": "gpt-5.6-terra",
         "surface": "openai.responses",
         "apiTier": "standard",
-        "pricedAt": "2026-08-01T13:47:00Z",
+        "pricedAt": "2026-08-30T06:01:00Z",
         "totalInputContextTokens": 1,
         "components": {
           "inputUncachedTokens": 1,
@@ -223,7 +227,8 @@
           "outputTextTokens": 0,
           "outputReasoningTokens": 0,
           "outputCombinedTokens": null
-        }
+        },
+        "eventTime": "2026-08-30T06:01:00.000Z"
       },
       "expected": {
         "exactCostUsd": "0.000002",
@@ -232,7 +237,7 @@
         "unknownBillableUnits": 0,
         "unpricedReasonCodes": [],
         "selectedPriceCardIds": [
-          "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-01"
+          "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-30"
         ]
       }
     },

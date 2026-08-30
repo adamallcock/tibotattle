@@ -178,7 +178,28 @@ hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
 | `GET` | `/api/local/contribution/incremental-status` | Inspect incremental v1 eligibility, watermark, and state |
 | `POST` | `/api/local/contribution/incremental-approve` | Record explicit approval for the incremental contract |
 | `POST` | `/api/local/contribution/incremental-run` | Run one bounded incremental preparation/delivery cycle |
-| `GET`, `POST` | `/api/local/accounting/fast-mode-preference` | Read or set the closed fast-mode accounting preference |
+
+Refresh progress distinguishes source scanning from subsequent calculation.
+Once unified ingestion returns and accounting begins, the count-free receipt
+is exactly `{ "kind": "accounting", "status": "calculating" }`. It remains a
+running-stage indication during accounting and full snapshot projection, not
+an assertion of available accounting or refresh success. Clients must replace
+the scan counter for that stage; only a terminal refresh receipt establishes
+the outcome. Unknown progress kinds, extra fields, and arbitrary server prose
+are not admitted by the native projection.
+
+The switch- and cache-continuity impact projections distinguish whole-period
+totals from the priced comparisons that remain usable when coverage is partial.
+Their `coveredSubtotal` is either `null` or a closed object with
+`scope: "covered_priced_drops"`, positive `pricedDrops`, a nonnegative
+`standardApiPremiumUsd` and exact decimal `standardApiPremiumUsdExact`, plus
+the existing `allowanceWeighting` shape scoped only to those priced drops.
+It is derived from the complete exact accumulator, not the capped recent list,
+and is available on period and breakdown projections. A missing price or
+unprovable session order still withholds the whole-period money/allowance
+claim. Clients must identify the subtotal's scope and must not substitute it
+into `allowanceImpact` or hide excluded sessions. No priced observations means
+`coveredSubtotal: null`, not a zero-valued placeholder.
 
 When contribution preparation encounters a preserved legacy export identity
 whose one interactive migration read was declined, it returns the fixed

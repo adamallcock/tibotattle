@@ -554,12 +554,12 @@ test("indexed history prices each event at its own effective date before and aft
     costUsd: row.costUsd,
   })), [
     {
-      priceCardId: "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-01",
+      priceCardId: "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-30",
       events: 1,
       costUsd: "2",
     },
     {
-      priceCardId: "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-01",
+      priceCardId: "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-30",
       events: 2,
       costUsd: "5",
     },
@@ -833,8 +833,8 @@ test("projects replay-safe diagnostics and aggregates costs, dimensions, and 15-
         .map(([family, cell]) => [speed, family, cell.events])
     )),
     [
-      ["standard", "gpt-5.6", 1],
-      ["fast", "gpt-5.6", 1],
+      ["standard", "gpt-5.6-sol", 1],
+      ["fast", "gpt-5.6-terra", 1],
       ["unknown", "unsupported", 1],
     ],
   );
@@ -848,8 +848,8 @@ test("projects replay-safe diagnostics and aggregates costs, dimensions, and 15-
     latest.events,
   );
   assert.equal(
-    latest.speedWeighting.fast["gpt-5.6"].apiPriceEquivalentUsd
-      + latest.speedWeighting.standard["gpt-5.6"].apiPriceEquivalentUsd
+    latest.speedWeighting.fast["gpt-5.6-terra"].apiPriceEquivalentUsd
+      + latest.speedWeighting.standard["gpt-5.6-sol"].apiPriceEquivalentUsd
       + latest.speedWeighting.unknown.unsupported.apiPriceEquivalentUsd,
     latest.apiPriceEquivalentUsd,
   );
@@ -1009,8 +1009,8 @@ test("replay-safe fast pricing plans keep pre-change events on their historical 
   });
   const all = period(cache, "all");
   assert.deepEqual(all.priceCardIds, [
-    "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-01",
-    "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-01",
+    "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-30",
+    "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-30",
   ]);
   assert.deepEqual(all.priceCardBreakdown.map(({ priceCardId, events, costUsd }) => ({
     priceCardId,
@@ -1018,12 +1018,12 @@ test("replay-safe fast pricing plans keep pre-change events on their historical 
     costUsd,
   })), [
     {
-      priceCardId: "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-01",
+      priceCardId: "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-30",
       events: 1,
       costUsd: "2",
     },
     {
-      priceCardId: "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-01",
+      priceCardId: "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-30",
       events: 1,
       costUsd: "2.5",
     },
@@ -1297,7 +1297,7 @@ test("the same lineage-aware scan produces a bounded weekly calibration summary"
   assert.equal(fastCapacity.basis.unresolvedScenario, "unresolved_as_fast");
   assert.equal(
     standardCapacity.basis.multiplierRegistryRecordedAt,
-    "2026-08-01",
+    "2026-08-30",
   );
   assert.equal(
     standardCapacity.calibration.validation.selectedCostBasis,
@@ -1313,7 +1313,8 @@ test("the same lineage-aware scan produces a bounded weekly calibration summary"
     Number((fastCapacity.calibration.estimate.medianApiPriceEquivalentUsd
       / standardCapacity.calibration.estimate.medianApiPriceEquivalentUsd)
       .toFixed(6)),
-    2.5,
+    // The published GPT-5.6 Priority/Standard price ratio.
+    2,
   );
   assert.deepEqual(cache.weeklyCalibration.accountAttribution, {
     status: "historical_unattributed",
@@ -2784,6 +2785,29 @@ test("cache validation requires weighted and bounded timeline evidence so older 
     (await readReplaySafeAccountingCache({ cacheFile })).errorCode,
     "cache_invalid",
   );
+});
+
+test("replay cache rejects the old prefix-priced version and unreviewed model crossing keys", async () => {
+  const cache = await buildReplaySafeAccountingCache({
+    now: () => NOW,
+    scan: scanner([usageEvent({
+      timestamp: new Date(NOW).toISOString(),
+      components: { input_uncached_tokens: 1_000 },
+    })]),
+  });
+  assert.equal(cache.schemaVersion, "local-replay-safe-accounting-v0.13");
+  assert.doesNotThrow(() => assertReplaySafeAccountingCache(cache));
+  const oldVersion = structuredClone(cache);
+  oldVersion.schemaVersion = "local-replay-safe-accounting-v0.12";
+  assert.throws(() => assertReplaySafeAccountingCache(oldVersion));
+  for (const model of ["gpt-5.6", "gpt-5.5-pro", "gpt-5.5-future"]) {
+    const invalidCrossing = structuredClone(cache);
+    invalidCrossing.timeline[0].speedWeighting.unknown ??= {};
+    invalidCrossing.timeline[0].speedWeighting.unknown[model] = {
+      events: 1, apiPriceEquivalentUsd: 1,
+    };
+    assert.throws(() => assertReplaySafeAccountingCache(invalidCrossing), model);
+  }
 });
 
 test("a replay cache from an older official price registry is withheld", async () => {

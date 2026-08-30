@@ -127,6 +127,7 @@
 "nativeDashboard.localOnly" = "Local only";
 "nativeDashboard.localOnlyTooltip" = "Analysis and cached results stay on this Mac. Community contribution is optional.";
 "nativeDashboard.overview" = "Overview";
+"nativeDashboard.progressAccounting" = "Calculating accounting…";
 "nativeDashboard.progressAnalyzing" = "Analyzing local history…";
 "nativeDashboard.progressAnalyzingFiles" = "Analyzing %@ of %@ files…";
 "nativeDashboard.progressArchiveIndex" = "Updating older history…";

@@ -206,6 +206,7 @@ struct LocalAnalysisProgress: Equatable {
         case paused
         case prospective
         case archiveIndex = "archive_index"
+        case accounting
     }
 
     let phase: Phase
@@ -264,6 +265,10 @@ struct LocalAnalysisProgress: Equatable {
         case .archiveIndex:
             return TiboTattleLocalization.string(
                 .nativeDashboardProgressArchiveIndex
+            )
+        case .accounting:
+            return TiboTattleLocalization.string(
+                .nativeDashboardProgressAccounting
             )
         }
     }
@@ -1145,6 +1150,18 @@ final class LocalCompanionEvidenceReader {
 
     private static func decodeProgress(_ value: Any?) -> LocalAnalysisProgress? {
         guard let progress = value as? [String: Any] else { return nil }
+        if progress["kind"] as? String == "accounting" {
+            guard Set(progress.keys) == Set(["kind", "status"]),
+                  progress["status"] as? String == "calculating"
+            else {
+                return nil
+            }
+            return LocalAnalysisProgress(
+                phase: .accounting,
+                filesSelected: nil,
+                filesProcessed: nil
+            )
+        }
         if progress["kind"] as? String == "archive_index" {
             guard progress["status"] as? String == "scanning" else {
                 return nil
@@ -1195,7 +1212,8 @@ final class LocalCompanionEvidenceReader {
         guard progress["kind"] == nil else { return nil }
         guard let rawPhase = progress["phase"] as? String,
               let phase = LocalAnalysisProgress.Phase(rawValue: rawPhase),
-              phase != .archiveIndex
+              phase != .archiveIndex,
+              phase != .accounting
         else {
             return nil
         }

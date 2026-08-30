@@ -18,6 +18,7 @@
 "nativeDashboard.localOnly" = "仅限本机";
 "nativeDashboard.localOnlyTooltip" = "分析结果和缓存结果保留在这台 Mac 上。是否贡献给社区由你自行选择。";
 "nativeDashboard.overview" = "概览";
+"nativeDashboard.progressAccounting" = "正在核算用量…";
 "nativeDashboard.progressAnalyzing" = "正在分析本地历史记录…";
 "nativeDashboard.progressAnalyzingFiles" = "正在分析 %@ / %@ 个文件…";
 "nativeDashboard.progressArchiveIndex" = "正在更新较早的历史记录…";

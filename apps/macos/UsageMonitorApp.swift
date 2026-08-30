@@ -8755,6 +8755,52 @@ private enum NativeAnalysisProgressContractSmokeTest {
             return failure("unified index counts")
         }
 
+        let accountingMarker: [String: Any] = [
+            "kind": "accounting",
+            "status": "calculating",
+        ]
+        guard case let .running(_, accountingProgress) = decode(
+            progress: accountingMarker
+        ),
+              accountingProgress == LocalAnalysisProgress(
+                phase: .accounting,
+                filesSelected: nil,
+                filesProcessed: nil
+              ),
+              accountingProgress?.nativeToolbarTitle()
+                == TiboTattleLocalization.string(
+                    .nativeDashboardProgressAccounting
+                ),
+              accountingProgress?.nativeToolbarTitle(
+                hasUsableHeadlineEvidence: true
+              ) == accountingProgress?.nativeToolbarTitle()
+        else {
+            return failure("accounting work stage")
+        }
+        let invalidAccounting: [[String: Any]] = [
+            ["kind": "accounting"],
+            ["kind": "accounting", "status": "complete"],
+            ["kind": "accounting", "status": "calculating", "phase": "quick_result"],
+            ["kind": "accounting", "status": "calculating", "filesProcessed": 7, "filesSelected": 7_215],
+            ["kind": "accounting", "status": "calculating", "message": "unreviewed prose"],
+            ["phase": "accounting"],
+        ]
+        for invalid in invalidAccounting {
+            guard case let .running(_, progress) = decode(progress: invalid),
+                  progress == nil
+            else {
+                return failure("accounting exact-key boundary")
+            }
+        }
+        for outcome in ["succeeded", "degraded", "failed", "cancelled"] {
+            guard let terminal = LocalAnalysisTerminalOutcome(rawValue: outcome),
+                  decode(progress: accountingMarker, status: outcome)
+                    == .idle(refreshID: refreshID, outcome: terminal)
+            else {
+                return failure("accounting terminal boundary")
+            }
+        }
+
         let unifiedZero = decode(progress: [
             "kind": "unified_index",
             "status": "scanning",
@@ -8883,6 +8929,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
         print(
             "USAGE_MONITOR_MACOS_ANALYSIS_PROGRESS_CONTRACT "
                 + "phases=allowlisted archive=scanning unified=scanning "
+                + "accounting=calculating "
                 + "counts=bounded quick_result=evidence-gated "
                 + "contradictory=generic unknown=generic free_text=ignored "
                 + "idle=unchanged terminal=automatic-backoff "

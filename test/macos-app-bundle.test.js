@@ -1963,6 +1963,8 @@ test("native refresh progress stays fixed-vocabulary and count-bounded", async (
   assert.match(progressProjection, /case quotaRefresh = "quota_refresh"/u);
   assert.match(progressProjection, /case quickResult = "quick_result"/u);
   assert.match(progressProjection, /case archiveIndex = "archive_index"/u);
+  assert.match(progressProjection, /case accounting/u);
+  assert.match(progressProjection, /case \.accounting:[\s\S]*?nativeDashboardProgressAccounting/u);
   assert.match(
     progressProjection,
     /func nativeToolbarTitle\(\s*hasUsableHeadlineEvidence: Bool = false\s*\)[\s\S]*?case \.quickResult:[\s\S]*?hasUsableHeadlineEvidence[\s\S]*?nativeDashboardProgressQuickResult[\s\S]*?nativeDashboardProgressAnalyzing/u,
@@ -2002,6 +2004,11 @@ test("native refresh progress stays fixed-vocabulary and count-bounded", async (
     assert.match(activityDecoder, new RegExp(`progress\\["${field}"\\]`, "u"));
   }
   assert.match(activityDecoder, /guard progress\["kind"\] == nil/u);
+  assert.match(
+    activityDecoder,
+    /progress\["kind"\][\s\S]*?"accounting"[\s\S]*?Set\(progress\.keys\) == Set\(\["kind", "status"\]\)[\s\S]*?"calculating"[\s\S]*?phase: \.accounting[\s\S]*?filesSelected: nil[\s\S]*?filesProcessed: nil/u,
+  );
+  assert.match(activityDecoder, /phase != \.accounting/u);
   assert.doesNotMatch(activityDecoder, /progress\["message"\]/u);
   assert.match(
     refreshPoll,
@@ -7224,7 +7231,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       analysisProgressSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_ANALYSIS_PROGRESS_CONTRACT phases=allowlisted archive=scanning unified=scanning counts=bounded quick_result=evidence-gated contradictory=generic unknown=generic free_text=ignored idle=unchanged terminal=automatic-backoff percent=false eta=false$/mu,
+      /^USAGE_MONITOR_MACOS_ANALYSIS_PROGRESS_CONTRACT phases=allowlisted archive=scanning unified=scanning accounting=calculating counts=bounded quick_result=evidence-gated contradictory=generic unknown=generic free_text=ignored idle=unchanged terminal=automatic-backoff percent=false eta=false$/mu,
     );
     const popupRenderDirectory = join(temporaryRoot, "menu-bar-popover-render");
     const popupRenderSmoke = spawnSync(
