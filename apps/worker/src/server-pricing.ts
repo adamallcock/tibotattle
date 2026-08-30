@@ -267,7 +267,15 @@ export function priceTelemetryUsageEvent(row: TelemetryUsageEvent): ServerPricin
   const exactCostUsd = speedMultiplier === null
     ? priced.totalUsd
     : multiplyDecimal(priced.totalUsd, speedMultiplier);
-  const costNanousd = toNanousd(exactCostUsd);
+  let costNanousd: number;
+  try {
+    costNanousd = toNanousd(exactCostUsd);
+  } catch {
+    // A product that cannot be represented in exact nanousd fails closed as
+    // an unpriced event instead of surfacing as an ingest error. Unreachable
+    // with the published ratios and rates, kept as a guard for future rows.
+    return failClosed(row, "event_price_exceeds_exact_nanousd_precision", tier);
+  }
   if (costNanousd > MAX_SAFE_EVENT_NANOUSD) {
     return failClosed(row, "event_price_exceeds_safe_participant_aggregate", tier);
   }

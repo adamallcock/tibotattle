@@ -323,7 +323,9 @@ describe("admin community allowance preview", () => {
       /\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM)\b/iu,
     );
     expect(bindings).toHaveLength(2);
-    expect(bindings[0]).toHaveLength(2);
+    // The single bound value is the shared writer/reader cache-key suffix, so
+    // the two compositions can never diverge again.
+    expect(bindings[0]).toHaveLength(1);
 
     const preview = await buildAdminCommunityAllowancePreviewFromSource(
       database,

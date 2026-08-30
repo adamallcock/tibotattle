@@ -10,7 +10,7 @@ export const OPENAI_PRICE_EVIDENCE_START_DATE = OPENAI_FIRST_OBSERVED_DATE;
 // lower bound on the reviewed model rates.
 const ANTHROPIC_OBSERVED_AT = "2026-07-25T14:18:33Z";
 const PER_MILLION = "1000000";
-export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.5";
+export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.6";
 
 export const OFFICIAL_PRICE_SOURCE_URLS = Object.freeze({
   openai: "https://developers.openai.com/api/docs/pricing",
@@ -70,15 +70,15 @@ const OPENAI_ROWS = Object.freeze([
   // Undated rows remain open to reviewed historical events; the review date
   // is provenance, not an invented model-rate start date.
   //
-  // 2026-08-30 review notes: the official pricing page labels the priority
-  // tier's tab "Fast mode" (OpenAI renamed API Priority processing to Fast
-  // mode on 2026-07-30); "priority" remains this registry's canonical tier
-  // name for those rows. The review was made from owner-supplied captures of
-  // the Standard, Batch, and Fast tabs plus the first-party Codex model
-  // pages. The Flex tab was not captured, so Sol has no post-2026-08-21 flex
-  // row and Sol flex events after that date are deliberately unpriced until
-  // the tab is reviewed. Priority long-context rows exist on the page only
-  // for the GPT-5.6 family; GPT-5.5 / GPT-5.4 / GPT-5.4-mini show "-" there.
+  // 2026-08-30 review notes: the official page states "Priority processing
+  // was renamed Fast mode on July 30, 2026" and accepts either
+  // service_tier "priority" or "fast" on API requests; "priority" remains
+  // this registry's canonical tier name for those rows. The review was made
+  // from owner-supplied captures of all four flagship tabs (Standard, Batch,
+  // Flex, Fast) plus the first-party Codex model pages. Priority long-context
+  // rows exist on the page only for the GPT-5.6 family; GPT-5.5 / GPT-5.4 /
+  // GPT-5.4-mini show "-" there, and the page's pro models and GPT-5.4-nano
+  // do not support Fast mode at all, so none of them carries a priority row.
   ["gpt-5.6-sol", "standard", "5", "0.5", "6.25", "30", "short", "through-2026-08-20"],
   ["gpt-5.6-sol", "standard", "10", "1", "12.5", "45", "long", "through-2026-08-20"],
   ["gpt-5.6-sol", "batch", "2.5", "0.25", "3.125", "15", "short", "through-2026-08-20"],
@@ -86,16 +86,18 @@ const OPENAI_ROWS = Object.freeze([
   ["gpt-5.6-sol", "flex", "2.5", "0.25", "3.125", "15", "short", "through-2026-08-20"],
   ["gpt-5.6-sol", "flex", "5", "0.5", "6.25", "22.5", "long", "through-2026-08-20"],
   ["gpt-5.6-sol", "priority", "10", "1", "12.5", "60", "short", "through-2026-08-20"],
-  // Sol from 2026-08-21: Batch and Fast (priority) rows are read directly
-  // from the captured official tabs. The Standard rows are triangulated from
-  // two independent official relationships that agree exactly - Batch is half
-  // of Standard on every component, and the captured Fast rows are twice the
-  // implied Standard on every component - pending a direct capture of the
-  // Standard tab's flagship table.
+  // Sol from 2026-08-21: every tier is read directly from the captured
+  // official tabs (the Standard rows were first triangulated from Batch x2
+  // == Fast /2 and then confirmed exactly by the captured Standard tab).
+  // The page calls this Sol's promotional pricing, "available at least
+  // through November 21, 2026" - an assurance floor, not a published end
+  // date, so the rows stay open-ended until the vendor publishes a change.
   ["gpt-5.6-sol", "standard", "4", "0.4", "5", "20", "short", "from-2026-08-21"],
   ["gpt-5.6-sol", "standard", "8", "0.8", "10", "30", "long", "from-2026-08-21"],
   ["gpt-5.6-sol", "batch", "2", "0.2", "2.5", "10", "short", "from-2026-08-21"],
   ["gpt-5.6-sol", "batch", "4", "0.4", "5", "15", "long", "from-2026-08-21"],
+  ["gpt-5.6-sol", "flex", "2", "0.2", "2.5", "10", "short", "from-2026-08-21"],
+  ["gpt-5.6-sol", "flex", "4", "0.4", "5", "15", "long", "from-2026-08-21"],
   ["gpt-5.6-sol", "priority", "8", "0.8", "10", "40", "short", "from-2026-08-21"],
   ["gpt-5.6-sol", "priority", "16", "1.6", "20", "60", "long", "from-2026-08-21"],
   ["gpt-5.6-terra", "standard", "2.5", "0.25", "3.125", "15", "short", "through-2026-07-29"],
@@ -166,23 +168,36 @@ const OPENAI_ROWS = Object.freeze([
   ["gpt-4.1", "batch", "1", null, null, "4"],
   ["gpt-4.1", "priority", "3.5", "0.875", null, "14"],
   // Flagship models below the main table, reviewed 2026-08-30 from the
-  // captured Batch tab only; their Standard and Fast rows were not captured,
-  // so those tiers stay deliberately unpriced until reviewed.
-  ["gpt-5.5-pro", "batch", "15", null, null, "90"],
+  // captured Standard, Batch, and Flex tabs. The pro models and GPT-5.4-nano
+  // do not support Fast mode, so they carry no priority row. The pro models
+  // publish long-context Standard rates (and GPT-5.4-pro long Batch/Flex),
+  // while their other long cells and every GPT-5.4-nano long cell read "-".
+  ["gpt-5.5-pro", "standard", "30", null, null, "180", "short"],
+  ["gpt-5.5-pro", "standard", "60", null, null, "270", "long"],
+  ["gpt-5.5-pro", "batch", "15", null, null, "90", "short"],
+  ["gpt-5.5-pro", "flex", "15", null, null, "90", "short"],
+  ["gpt-5.4-nano", "standard", "0.2", "0.02", null, "1.25"],
   ["gpt-5.4-nano", "batch", "0.1", "0.01", null, "0.625"],
+  ["gpt-5.4-nano", "flex", "0.1", "0.01", null, "0.625"],
+  ["gpt-5.4-pro", "standard", "30", null, null, "180", "short"],
+  ["gpt-5.4-pro", "standard", "60", null, null, "270", "long"],
   ["gpt-5.4-pro", "batch", "15", null, null, "90", "short"],
   ["gpt-5.4-pro", "batch", "30", null, null, "135", "long"],
+  ["gpt-5.4-pro", "flex", "15", null, null, "90", "short"],
+  ["gpt-5.4-pro", "flex", "30", null, null, "135", "long"],
   // Non-flagship models from the official pricing page's second table,
   // reviewed 2026-08-30 (Standard and Batch tabs; the Fast tab lists a
   // priority row only for the models that carry one below). A "-" cell on
   // the page is an absent component here, never a zero.
   ["gpt-5.2", "standard", "1.75", "0.175", null, "14"],
   ["gpt-5.2", "batch", "0.875", "0.0875", null, "7"],
+  ["gpt-5.2", "flex", "0.875", "0.0875", null, "7"],
   ["gpt-5.2", "priority", "3.5", "0.35", null, "28"],
   ["gpt-5.2-pro", "standard", "21", null, null, "168"],
   ["gpt-5.2-pro", "batch", "10.5", null, null, "84"],
   ["gpt-5.1", "standard", "1.25", "0.125", null, "10"],
   ["gpt-5.1", "batch", "0.625", "0.0625", null, "5"],
+  ["gpt-5.1", "flex", "0.625", "0.0625", null, "5"],
   ["gpt-5.1", "priority", "2.5", "0.25", null, "20"],
   ["gpt-5-mini", "standard", "0.25", "0.025", null, "2"],
   ["gpt-5-mini", "batch", "0.125", "0.0125", null, "1"],
@@ -274,7 +289,7 @@ export const NORMALIZED_PRICE_EVIDENCE_ROWS = deepFreeze({
 // evidence refresh and checked independently in Node-side registry tests. They
 // are constants here so the production registry has no Node crypto dependency.
 const EVIDENCE_HASHES = Object.freeze({
-  openai: "17aaeb750077949d26ec8b74149d4e85805bfc6ede898e563d268d4c119e970e",
+  openai: "ec99367fb7d91dc68f1501e325384eda7a5cf885c763deebd28e1eff594dad57",
   anthropic: "7653380aa58230fef8a39a17f141fe04bd763ca39390a69671825e6f6109d76e",
 });
 
@@ -541,7 +556,7 @@ export const APP_OFFICIAL_PRICE_CARDS = deepFreeze([
 ]);
 
 export const APP_PRICE_REGISTRY_SHA256 =
-  "45ab781bca313bf1861ae9f00b09dc8b42d3d3658edc997fc991f5a950a22dad";
+  "0a5879e981f20f1d244ef193427cf198199bd5e7fd407eca4c0ae48f11d717ac";
 
 export const APP_PRICE_REGISTRY_MANIFEST = deepFreeze({
   version: APP_PRICE_REGISTRY_VERSION,
