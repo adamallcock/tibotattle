@@ -30,7 +30,11 @@ import {
 import {
   LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
   LOCAL_UNIFIED_INDEX_APPLICATION_ID,
+  LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION,
+  LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARSER_VERSION,
   LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
+  LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION,
   LOCAL_UNIFIED_INDEX_USER_VERSION,
   readLocalUnifiedIndexCompatibility,
   readUnifiedIndexGenerationDescriptor,
@@ -241,7 +245,60 @@ function openImmutableLocalUnifiedIndex(indexFile) {
   });
 }
 
-function inspectMigratableLocalUnifiedIndex(indexFile, inspect, openDatabase) {
+function publishedParserUpgradeNeedsColdRefresh(database, compatibility, schemaVersion) {
+  // This is a deadline decision, not permission to read or publish facts. The
+  // worker still validates the complete index. Admit only the observed v10 ->
+  // v11 transition; unknown/future parser stamps never earn a longer deadline.
+  if (LOCAL_UNIFIED_INDEX_PARSER_VERSION !== "unified-rollout-typed-v11"
+      || schemaVersion !== LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
+      || !compatibility.metadataPresent
+      || compatibility.formatUserVersion !== LOCAL_UNIFIED_INDEX_USER_VERSION
+      || compatibility.minimumReaderUserVersion
+        !== LOCAL_UNIFIED_INDEX_MINIMUM_READER_USER_VERSION
+      || compatibility.minimumWriterUserVersion
+        !== LOCAL_UNIFIED_INDEX_MINIMUM_WRITER_USER_VERSION) {
+    return false;
+  }
+  const metadata = database.prepare("SELECT value FROM meta WHERE key = ?");
+  if (metadata.get("source_identity_version")?.value
+        !== LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION
+      || metadata.get("contract_version")?.value !== TELEMETRY_SCHEMA_VERSION) {
+    return false;
+  }
+  const generationId = Number(metadata.get("current_generation_id")?.value);
+  if (!Number.isSafeInteger(generationId) || generationId < 1) return false;
+
+  // Follow only the published generation, never a rotated source's older
+  // parser row. Fixed-key/primary-key reads avoid loading meta/issue collections
+  // or scanning facts on the HTTP thread. Terminal predicates mirror the
+  // ingestion worker's supported previous-generation states.
+  const generation = database.prepare(`
+    SELECT p.parser_version, p.contract_version AS parser_contract_version,
+           g.contract_version, g.completed_at_ms
+    FROM index_generation g JOIN parser_version p ON p.id = g.parser_version_id
+    WHERE g.id = ?
+      AND g.discovery_complete = 1 AND g.diagnostics_complete = 1
+      AND g.usage_provenance_complete = 1 AND g.source_order_complete = 1
+      AND g.quota_provenance_complete = 1
+      AND (
+        (g.status = 'complete' AND g.block_reason IS NULL
+          AND g.tool_provenance_complete = 1)
+        OR (g.status = 'partial'
+          AND g.block_reason = 'codex_rollout_sources_quarantined'
+          AND g.skipped_source_count > 0)
+        OR (g.status = 'partial'
+          AND g.block_reason = 'tool_provenance_incomplete'
+          AND g.tool_provenance_complete = 0)
+      )
+  `).get(generationId);
+  return generation?.parser_version === "unified-rollout-typed-v10"
+    && generation.parser_contract_version === TELEMETRY_SCHEMA_VERSION
+    && generation.contract_version === TELEMETRY_SCHEMA_VERSION
+    && Number.isSafeInteger(generation.completed_at_ms)
+    && generation.completed_at_ms >= 0;
+}
+
+function inspectColdRefreshLocalUnifiedIndex(indexFile, inspect, openDatabase) {
   let before;
   try {
     before = inspect(indexFile);
@@ -254,7 +311,7 @@ function inspectMigratableLocalUnifiedIndex(indexFile, inspect, openDatabase) {
   }
 
   let database;
-  let migratable = false;
+  let requiresColdRefresh = false;
   try {
     database = openDatabase(indexFile);
     database.exec("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;");
@@ -262,7 +319,7 @@ function inspectMigratableLocalUnifiedIndex(indexFile, inspect, openDatabase) {
     if (compatibility.applicationId !== LOCAL_UNIFIED_INDEX_APPLICATION_ID
         || !Number.isSafeInteger(compatibility.userVersion)
         || compatibility.userVersion < 1
-        || compatibility.userVersion >= LOCAL_UNIFIED_INDEX_USER_VERSION
+        || compatibility.userVersion > LOCAL_UNIFIED_INDEX_USER_VERSION
         || compatibility.metadataPartial
         || compatibility.metadataMalformed
         || (compatibility.metadataPresent && [
@@ -286,17 +343,18 @@ function inspectMigratableLocalUnifiedIndex(indexFile, inspect, openDatabase) {
     // also blocks health and cancellation. This main-thread selector proves
     // only bounded compatibility metadata; the off-main ingestion worker owns
     // full schema, integrity, migration, and publication validation.
-    migratable = true;
+    requiresColdRefresh = compatibility.userVersion < LOCAL_UNIFIED_INDEX_USER_VERSION
+      || publishedParserUpgradeNeedsColdRefresh(database, compatibility, schemaVersion);
   } catch {
-    migratable = false;
+    requiresColdRefresh = false;
   } finally {
     try {
       database?.close();
     } catch {
-      migratable = false;
+      requiresColdRefresh = false;
     }
   }
-  if (!migratable || localUnifiedIndexHasSidecar(indexFile, inspect)) {
+  if (!requiresColdRefresh || localUnifiedIndexHasSidecar(indexFile, inspect)) {
     return false;
   }
   try {
@@ -308,9 +366,10 @@ function inspectMigratableLocalUnifiedIndex(indexFile, inspect, openDatabase) {
 
 /**
  * Select the refresh deadline from the index's actual state at the start of
- * each run. An exact missing target or a read-only-proven migratable schema
- * gets the bounded cold-build window. Current, future, clearly corrupt,
- * foreign, or otherwise uncertain state keeps the normal deadline.
+ * each run. An exact missing target, read-only-proven migratable schema, or
+ * supported published parser-upgrade rescan gets the bounded cold-build window.
+ * Current-parser, future, clearly corrupt, foreign, or otherwise uncertain
+ * state keeps the normal deadline.
  */
 export function localCompanionRefreshTimeoutForUnifiedIndex(
   indexFile,
@@ -346,7 +405,7 @@ export function localCompanionRefreshTimeoutForUnifiedIndex(
   } catch (error) {
     return error?.code === "ENOENT" ? freshTimeoutMs : existingTimeoutMs;
   }
-  return inspectMigratableLocalUnifiedIndex(
+  return inspectColdRefreshLocalUnifiedIndex(
     resolvedIndexFile,
     inspect,
     openDatabase,

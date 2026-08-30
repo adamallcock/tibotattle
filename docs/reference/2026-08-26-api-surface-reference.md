@@ -180,6 +180,15 @@ hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
 | `POST` | `/api/local/contribution/incremental-run` | Run one bounded incremental preparation/delivery cycle |
 | `GET`, `POST` | `/api/local/accounting/fast-mode-preference` | Read or set the closed fast-mode accounting preference |
 
+Refresh progress distinguishes source scanning from subsequent calculation.
+Once unified ingestion returns and accounting begins, the count-free receipt
+is exactly `{ "kind": "accounting", "status": "calculating" }`. It remains a
+running-stage indication during accounting and full snapshot projection, not
+an assertion of available accounting or refresh success. Clients must replace
+the scan counter for that stage; only a terminal refresh receipt establishes
+the outcome. Unknown progress kinds, extra fields, and arbitrary server prose
+are not admitted by the native projection.
+
 When contribution preparation encounters a preserved legacy export identity
 whose one interactive migration read was declined, it returns the fixed
 `identity_migration_required` code. The dashboard directs the user to quit and

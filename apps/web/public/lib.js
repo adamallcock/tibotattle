@@ -377,6 +377,23 @@ export function refreshQuickResultStatus({
     : "Preparing local summary…";
 }
 
+/** A count-free work stage, never proof of fresh or completed accounting. */
+export function refreshAccountingStatus({ progress, elapsedLabel = "" } = {}) {
+  if (progress === null || typeof progress !== "object"
+      || Array.isArray(progress)
+      || Object.keys(progress).length !== 2
+      || !Object.hasOwn(progress, "kind")
+      || !Object.hasOwn(progress, "status")
+      || progress.kind !== "accounting"
+      || progress.status !== "calculating") return null;
+  const boundedElapsedLabel = typeof elapsedLabel === "string"
+    ? elapsedLabel.trim()
+    : "";
+  return boundedElapsedLabel.length > 0
+    ? `Calculating accounting… ${boundedElapsedLabel}`
+    : "Calculating accounting…";
+}
+
 export function refreshNeedsContinuation({
   outcome,
   errorCode = null,

@@ -27,6 +27,7 @@ import {
   historyCoverageNoticeKind,
   historyIndexContinuationDecision,
   isContributionReviewableQueueState,
+  refreshAccountingStatus,
   refreshQuickResultStatus,
   refreshNeedsContinuation,
   serviceRequestId,
@@ -11046,14 +11047,17 @@ async function requestRefresh({ autoContinue = false } = {}) {
       finalFailureCode = refresh.failureCode ?? finalFailureCode;
       finalUnifiedIndex = refresh.result?.unifiedIndex ?? finalUnifiedIndex;
       const progress = refresh.progress ?? refresh.result?.indexing ?? null;
+      const collectorProgress = progress?.kind === undefined;
       const archiveScanning = progress?.kind === "archive_index";
       const unifiedIndexScanning = progress?.kind === "unified_index"
+        && progress?.status === "scanning"
         && progress?.phase === "rollout_index";
       if (archiveScanning && !archiveHistoryScanActive) {
         archiveHistoryScanActive = true;
         if (dashboard) renderPricing(dashboard);
       }
-      if (progress?.phase === "quick_result" && !quickResultLoaded) {
+      if (collectorProgress
+          && progress?.phase === "quick_result" && !quickResultLoaded) {
         try {
           await loadQuickResultDashboard();
           quickResultLoaded = true;
@@ -11069,15 +11073,23 @@ async function requestRefresh({ autoContinue = false } = {}) {
       const elapsedLabel = elapsedSeconds >= 60
         ? `${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s`
         : `${elapsedSeconds}s`;
-      const processed = Number.isSafeInteger(progress?.filesProcessed)
+      const accountingStatus = outcome === "running"
+        ? refreshAccountingStatus({ progress, elapsedLabel })
+        : null;
+      const countedProgress = collectorProgress || unifiedIndexScanning;
+      const processed = countedProgress
+          && Number.isSafeInteger(progress?.filesProcessed)
         ? progress.filesProcessed : null;
-      const selected = Number.isSafeInteger(progress?.filesSelected)
+      const selected = countedProgress
+          && Number.isSafeInteger(progress?.filesSelected)
         ? progress.filesSelected : null;
       button.textContent = outcome === "cancelling"
         ? "Stopping safely…"
+        : accountingStatus !== null
+          ? accountingStatus
         : archiveScanning
           ? `Indexing archive history… ${elapsedLabel}`
-        : progress?.phase === "quick_result"
+        : collectorProgress && progress?.phase === "quick_result"
           ? refreshQuickResultStatus({
               dashboardLoaded: quickResultLoaded,
               elapsedLabel,

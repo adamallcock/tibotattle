@@ -83,6 +83,22 @@ Compare the copy with the current constants in `src/local-unified-index.js`:
 - parser `unified-rollout-typed-v11`; and
 - source identity `codex-immutable-rollout-v1`.
 
+A physical schema-11 index can still need a one-time v10-to-v11 parser rescan.
+The companion grants a proven supported published transition the bounded
+four-hour cold-refresh deadline; ordinary current-parser refreshes keep five
+minutes. Missing, unknown, or inconsistent provenance must not be relabelled to
+obtain that budget.
+
+Index publication and accounting completion are separate stages. If a refresh
+times out after publishing, inspect its published generation and accounting
+receipt separately: valid indexed tokens do not establish that the new
+accounting projection finished. Preserve the index and allow the old run to
+settle before requesting a normal incremental refresh. A low processed-file
+count can mean most sources were reused, not that the whole corpus is being
+rescanned. Once indexing returns, the UI reports accounting calculation without
+retaining the scan's file counter; only the terminal refresh receipt establishes
+success.
+
 ## 4. Classify before acting
 
 | Observation | Classification | Next action |

@@ -18,6 +18,7 @@
 "nativeDashboard.localOnly" = "Solo local";
 "nativeDashboard.localOnlyTooltip" = "El análisis y los resultados en caché permanecen en este Mac. La contribución a la comunidad es opcional.";
 "nativeDashboard.overview" = "Resumen";
+"nativeDashboard.progressAccounting" = "Calculando la contabilidad…";
 "nativeDashboard.progressAnalyzing" = "Analizando el historial local…";
 "nativeDashboard.progressAnalyzingFiles" = "Analizando %@ de %@ archivos…";
 "nativeDashboard.progressArchiveIndex" = "Actualizando el historial anterior…";

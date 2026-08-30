@@ -66,6 +66,15 @@ so descendants do not inherit snapshots from the replaced physical branch.
 The parser stamp forces still-present v10 sources to rescan; rotated rows retain
 their recorded parser provenance.
 
+The foreground companion treats a verified published v10-to-v11 parser upgrade
+as cold work even when the physical schema is already 11. That run receives the
+same bounded four-hour deadline as an absent or supported older-schema index;
+subsequent current-parser refreshes retain the normal five-minute deadline.
+Only the published generation selects this budget. Older parser rows retained
+for rotated sources do not keep extending ordinary refreshes. This metadata-only
+decision does not replace the worker's full compatibility, integrity, or
+publication checks.
+
 ## Current table groups
 
 | Group | Tables | Purpose |

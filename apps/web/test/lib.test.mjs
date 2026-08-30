@@ -36,6 +36,7 @@ import {
   DEVIATION_MAX_PERIODS,
   parseJsonWithUniqueObjectKeys,
   isContributionReviewableQueueState,
+  refreshAccountingStatus,
   refreshQuickResultStatus,
   refreshNeedsContinuation,
   ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION,
@@ -1070,6 +1071,27 @@ test("quick-result progress never turns a loaded no-numbers overview into a head
     }),
     "Preparing local summary… 7s",
   );
+});
+
+test("accounting progress is explicit work, with no source-counter or ready fallback", () => {
+  const progress = { kind: "accounting", status: "calculating" };
+  assert.equal(refreshAccountingStatus({ progress }), "Calculating accounting…");
+  assert.equal(
+    refreshAccountingStatus({ progress, elapsedLabel: "1m 7s" }),
+    "Calculating accounting… 1m 7s",
+  );
+  for (const invalid of [
+    null, [], "accounting",
+    { kind: "accounting" },
+    { ...progress, status: "complete" },
+    { ...progress, phase: "quick_result" },
+    { ...progress, filesProcessed: 7, filesSelected: 7_215 },
+    { ...progress, message: "synthetic unreviewed text" },
+    { kind: "future_worker", status: "calculating" },
+    { phase: "accounting" },
+  ]) {
+    assert.equal(refreshAccountingStatus({ progress: invalid }), null);
+  }
 });
 
 test("contribution admission uses participant allowance without inventing an unknown limit", () => {
@@ -5273,6 +5295,12 @@ test("local analysis exposes quick results and cancel-safe progress", async () =
   assert.match(appSource, /await loadQuickResultDashboard\(\)/u);
   assert.match(appSource, /renderDashboard\(data\)/u);
   assert.match(appSource, /refreshQuickResultStatus\(\{/u);
+  assert.match(appSource, /refreshAccountingStatus\(\{ progress, elapsedLabel \}\)/u);
+  assert.match(appSource, /const accountingStatus = outcome === "running"/u);
+  assert.match(appSource, /const collectorProgress = progress\?\.kind === undefined/u);
+  assert.match(appSource, /if \(collectorProgress\s*&& progress\?\.phase === "quick_result"/u);
+  assert.match(appSource, /const countedProgress = collectorProgress \|\| unifiedIndexScanning/u);
+  assert.match(appSource, /outcome === "cancelling"[\s\S]*?accountingStatus !== null[\s\S]*?archiveScanning/u);
   assert.doesNotMatch(appSource, /Verified summary ready|Preparing verified summary/u);
   assert.match(appSource, /kind === "unified_index"/u);
   assert.match(appSource, /Scanning local history/u);

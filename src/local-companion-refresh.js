@@ -160,6 +160,7 @@ const ARCHIVE_INDEX_ERROR_CODES = new Set([
 ]);
 const ARCHIVE_INDEX_PROGRESS_KIND = "archive_index";
 const UNIFIED_INDEX_PROGRESS_KIND = "unified_index";
+const ACCOUNTING_PROGRESS_KIND = "accounting";
 const REFRESH_FAILURE_STEPS = new Set([
   "collector",
   "accounting",
@@ -797,13 +798,20 @@ function publicUnifiedIndexProgress(value) {
 }
 
 function publicRefreshProgress(value) {
+  if (value?.kind === ACCOUNTING_PROGRESS_KIND) {
+    return hasExactKeys(value, ["kind", "status"])
+        && value.status === "calculating"
+      ? { kind: ACCOUNTING_PROGRESS_KIND, status: "calculating" }
+      : null;
+  }
   return publicIndexingResult(value)
     ?? publicArchiveIndexProgress(value)
     ?? publicUnifiedIndexProgress(value);
 }
 
 function terminalRefreshProgress(value) {
-  return value?.kind === ARCHIVE_INDEX_PROGRESS_KIND ? null : value;
+  return [ARCHIVE_INDEX_PROGRESS_KIND, ACCOUNTING_PROGRESS_KIND]
+    .includes(value?.kind) ? null : value;
 }
 
 function mergeCollectorPasses(early, continued, now = Date.now()) {
@@ -1194,6 +1202,16 @@ export function createLocalCollectorRefreshRunner({
     if (refreshAccounting !== null
         && accountingMayRun
         && unifiedAccountingReady) {
+      if (accountingSourceMode === "unified" && signal?.aborted !== true) {
+        // Cursor reuse means the last scan count can be only a handful of
+        // changed files. It is no longer progress once ingestion has returned.
+        // Keep this count-free stage through accounting and the controller's
+        // full snapshot reload; neither boundary is a completion claim.
+        await onProgress?.({
+          kind: ACCOUNTING_PROGRESS_KIND,
+          status: "calculating",
+        });
+      }
       // A provider quota observation does not alter replay-safe token
       // accounting. Reuse a current cache when no rollout usage record was
       // added, while the collector state continues to supply the fresh quota
@@ -1908,9 +1926,7 @@ export class LocalCompanionRefreshController {
             finishedAt: new Date(this.#clock()).toISOString(),
             result: publicRefreshResult(result, this.#clock()),
             progress: publicIndexingResult(result?.indexing)
-              ?? (this.#state.progress?.kind === ARCHIVE_INDEX_PROGRESS_KIND
-                ? null
-                : this.#state.progress),
+              ?? terminalRefreshProgress(this.#state.progress),
             quickResultAt: this.#state.quickResultAt,
             errorCode: "refresh_cancelled",
           };
@@ -1928,9 +1944,7 @@ export class LocalCompanionRefreshController {
               ?? new Date(this.#clock()).toISOString(),
             result: publicRefreshResult(result, this.#clock()),
             progress: publicIndexingResult(result?.indexing)
-              ?? (this.#state.progress?.kind === ARCHIVE_INDEX_PROGRESS_KIND
-                ? null
-                : this.#state.progress),
+              ?? terminalRefreshProgress(this.#state.progress),
             quickResultAt: this.#state.quickResultAt,
             errorCode: "refresh_timed_out",
           };

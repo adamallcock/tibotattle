@@ -127,7 +127,7 @@ test("test compiler profile builds a development-only launcher that runs", {
     );
     assert.match(
       progressSmoke.stdout,
-      /phases=allowlisted[\s\S]*unified=scanning[\s\S]*counts=bounded[\s\S]*quick_result=evidence-gated[\s\S]*unknown=generic[\s\S]*free_text=ignored/u,
+      /phases=allowlisted[\s\S]*unified=scanning[\s\S]*accounting=calculating[\s\S]*counts=bounded[\s\S]*quick_result=evidence-gated[\s\S]*unknown=generic[\s\S]*free_text=ignored/u,
     );
     const weeklyPaceFixture = join(temporaryRoot, "weekly-pace-outlook.json");
     await writeFile(
