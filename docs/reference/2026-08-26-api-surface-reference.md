@@ -177,7 +177,6 @@ hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
 | `GET` | `/api/local/contribution/incremental-status` | Inspect incremental v1 eligibility, watermark, and state |
 | `POST` | `/api/local/contribution/incremental-approve` | Record explicit approval for the incremental contract |
 | `POST` | `/api/local/contribution/incremental-run` | Run one bounded incremental preparation/delivery cycle |
-| `GET`, `POST` | `/api/local/accounting/fast-mode-preference` | Read or set the closed fast-mode accounting preference |
 
 When contribution preparation encounters a preserved legacy export identity
 whose one interactive migration read was declined, it returns the fixed

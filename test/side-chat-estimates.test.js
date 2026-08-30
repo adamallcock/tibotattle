@@ -577,7 +577,7 @@ test("historical side-chat gap probe keeps exact usage separate from its quota-r
     );
     assert.equal(
       result.exactUsage.allowanceWeighting.scenarios
-        .unresolved_as_standard.coverage.assumedFromPreferenceEvents,
+        .unresolved_as_standard.coverage.assumedEvents,
       1,
     );
     assert.equal(result.estimate.allowanceComparison.status, "complete");
@@ -589,7 +589,7 @@ test("historical side-chat gap probe keeps exact usage separate from its quota-r
       result.estimate.exactCostImpliedMedianRangePercentagePoints.lower,
       result.estimate.exactCostImpliedMedianRangePercentagePoints.upper,
     );
-    assert.equal(result.estimate.fastQuotaMultiplier, 2.5);
+    assert.equal(result.estimate.fastQuotaMultiplier, 2);
     assert.equal(result.estimate.includedInExactUsage, false);
     assert.equal(result.estimate.includedInCalibrationTimeline, false);
     assert.equal(result.estimate.independentlyObserved, false);
@@ -600,31 +600,13 @@ test("historical side-chat gap probe keeps exact usage separate from its quota-r
         .medianWeeklyCapacityUsd,
       250,
     );
-    const fast = await collectHistoricalSideChatGapProbe({
-      unifiedIndexFile: indexFile,
-      collectorStateFile: stateFile,
-      date: "2026-07-13",
-      fastModePreference: "fast",
-    });
-    assert.equal(fast.status, "available");
-    assert.equal(
-      fast.exactUsage.allowanceWeighting.selectedScenario,
-      "unresolved_as_fast",
-    );
+    // The unresolved-as-Fast sensitivity stays visible beside the selected
+    // Standard scenario rather than being selectable by a preference.
     assert.ok(
-      fast.exactUsage.allowanceWeighting.selectedUsd
+      result.exactUsage.allowanceWeighting.scenarios.unresolved_as_fast
+        .quotaWeightedUsd
         > result.exactUsage.allowanceWeighting.selectedUsd,
     );
-    const mixed = await collectHistoricalSideChatGapProbe({
-      unifiedIndexFile: indexFile,
-      collectorStateFile: stateFile,
-      date: "2026-07-13",
-      fastModePreference: "mixed_unknown",
-    });
-    assert.equal(mixed.status, "available");
-    assert.equal(mixed.exactUsage.allowanceWeighting.status, "range");
-    assert.equal(mixed.exactUsage.allowanceWeighting.selectedUsd, null);
-    assert.equal(mixed.estimate.allowanceComparison.status, "range");
     const declared = await collectHistoricalSideChatGapProbe({
       unifiedIndexFile: indexFile,
       collectorStateFile: stateFile,
@@ -643,7 +625,7 @@ test("historical side-chat gap probe keeps exact usage separate from its quota-r
     );
     assert.equal(
       declared.exactUsage.allowanceWeighting.scenarios
-        .unresolved_as_standard.coverage.assumedFromPreferenceEvents,
+        .unresolved_as_standard.coverage.assumedEvents,
       0,
     );
     const serialized = JSON.stringify(result);

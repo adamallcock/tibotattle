@@ -2,12 +2,20 @@
 //
 // SOURCE OF THE MULTIPLIERS
 // -------------------------
-// OpenAI publishes the credit rates that Fast mode consumes relative to the
-// Standard rate: Fast consumes credits at 2.5x the Standard rate for GPT-5.6
-// and GPT-5.5, and at 2x for GPT-5.4, in exchange for a 1.5x speed increase.
-// Fast supports only those three model families. These are the vendor's own
-// published rates recorded on 2026-08-01; they are NOT fitted, estimated, or
-// derived from this monitor's own calibration.
+// Codex Fast mode IS the API's Priority processing tier: the toggle writes
+// `service_tier: "priority"`, and the official pricing page labels the
+// Priority tier's tab "Fast mode". Fast usage is therefore priced at the
+// vendor's published Priority API rates. Every published Priority row is an
+// exact uniform multiple of its Standard row on every token component - a
+// relationship deriveFastModePriorityRatiosFromRegistry() re-verifies against
+// the shipped price registry on load - so applying that per-family ratio to a
+// Standard-priced amount equals pricing the same tokens on the Priority card,
+// including the GPT-5.6 long-context band whose Priority rows the registry
+// carries. This replaced the vendor's credit-rate statement (which claimed
+// 2.5x for GPT-5.6) on 2026-08-30: the published Priority price for the
+// GPT-5.6 family is 2x Standard, and the price registry is the single source
+// of truth. Multipliers are derived, never fitted from this monitor's own
+// calibration.
 //
 // WHAT THE LOGS ACTUALLY OBSERVE
 // ------------------------------
@@ -27,15 +35,21 @@
 // defect. The declared preference below exists only to attribute that
 // pre-first-observation remainder: observation always wins, and anything still
 // unattributed stays an explicit unknown rather than a silent 1.0.
-const FAST_MODE_MULTIPLIER_RECORDED_AT = "2026-08-01";
+import {
+  APP_PRICE_REGISTRY_VERSION,
+  OPENAI_OFFICIAL_PRICE_CARDS,
+} from "./price-registry.js";
+
+const FAST_MODE_MULTIPLIER_RECORDED_AT = "2026-08-30";
 
 export const FAST_MODE_MULTIPLIER_SOURCE = Object.freeze({
   publisher: "openai",
-  basis: "published_fast_mode_credit_rate_relative_to_standard",
+  basis: "published_priority_api_price_ratio_relative_to_standard",
   statement:
-    "Fast mode consumes credits at 2.5x the Standard rate for GPT-5.6 and GPT-5.5, and 2x for GPT-5.4, for a 1.5x speed increase. Fast supports only those three model families.",
+    "Codex Fast mode is the API Priority processing tier, so Fast usage is priced at the published Priority API rates: 2x Standard for the GPT-5.6 and GPT-5.4 families and 2.5x for GPT-5.5, derived from the official price registry and re-verified on load. Models without a published Priority rate use a disclosed assumed 2x, never a silent 1x.",
   recordedAt: FAST_MODE_MULTIPLIER_RECORDED_AT,
-  appliesTo: "codex_subscription_quota_not_api_billing",
+  priceRegistryVersion: APP_PRICE_REGISTRY_VERSION,
+  appliesTo: "codex_subscription_quota_and_api_price_equivalent",
   // Tier changes are observable; the session baseline is not.
   observability: "rollout_thread_settings_changes_only_no_session_baseline",
 });
@@ -52,12 +66,134 @@ export const CODEX_SPEED_MODE_OBSERVABILITY = Object.freeze({
     "the mode was set before the session began and never switched, so the log holds no tier for those turns",
 });
 
-// Model family -> published Fast credit rate relative to Standard. Any family
-// absent from this map is an explicit unknown under Fast, never 1.0.
-export const FAST_MODE_QUOTA_MULTIPLIERS = Object.freeze({
-  "gpt-5.6": 2.5,
-  "gpt-5.5": 2.5,
-  "gpt-5.4": 2,
+// The Codex fast-capable model families whose Priority/Standard price ratio
+// is derived from the registry. Codex model variants outside these families
+// (e.g. gpt-5.x-codex) fall to the assumed multiplier below - which equals
+// their published 2x ratio wherever one exists - so the four crossing bucket
+// keys stay stable.
+const FAST_MODE_RATIO_FAMILIES = Object.freeze(["gpt-5.6", "gpt-5.5", "gpt-5.4"]);
+
+function decimalRational(amount) {
+  const match = /^(\d+)(?:\.(\d+))?$/u.exec(String(amount));
+  if (!match) return null;
+  const fraction = match[2] ?? "";
+  return { digits: BigInt(match[1] + fraction), scale: fraction.length };
+}
+
+// priority/standard as an exact rational; equality is checked by
+// cross-multiplication so decimal string scales never introduce float error.
+function ratioPair(priorityAmount, standardAmount) {
+  const priority = decimalRational(priorityAmount);
+  const standard = decimalRational(standardAmount);
+  if (!priority || !standard || standard.digits === 0n) return null;
+  return { priority, standard };
+}
+
+function sameRatio(left, right) {
+  return left.priority.digits * 10n ** BigInt(left.standard.scale)
+    * right.standard.digits * 10n ** BigInt(right.priority.scale)
+    === right.priority.digits * 10n ** BigInt(right.standard.scale)
+    * left.standard.digits * 10n ** BigInt(left.priority.scale);
+}
+
+function ratioNumber({ priority, standard }) {
+  return (Number(priority.digits) / 10 ** priority.scale)
+    / (Number(standard.digits) / 10 ** standard.scale);
+}
+
+function tokenComponents(card) {
+  return card.components.filter((component) => (
+    component.usage_component.endsWith("_tokens")
+  ));
+}
+
+function effectiveRangesOverlap(left, right) {
+  const from = (card) => card.effective?.from ?? "0000-00-00";
+  const to = (card) => card.effective?.to ?? "9999-99-99";
+  return from(left) <= to(right) && from(right) <= to(left);
+}
+
+/**
+ * Model family -> published Priority (Fast) API price relative to Standard,
+ * proven uniform across every token component, context band, model, and
+ * dated price epoch of the family before it is used. A non-uniform registry
+ * throws here rather than shipping a wrong multiplier.
+ */
+export function deriveFastModePriorityRatiosFromRegistry(
+  cards = OPENAI_OFFICIAL_PRICE_CARDS,
+) {
+  const ratios = {};
+  for (const family of FAST_MODE_RATIO_FAMILIES) {
+    const pattern = new RegExp(`^${family.replaceAll(".", "\\.")}(?:$|-)`, "u");
+    const familyCards = cards.filter((card) => pattern.test(card.model));
+    const priorityCards = familyCards.filter((card) => card.service_tier === "priority");
+    if (priorityCards.length === 0) {
+      throw new TypeError(`No published Priority price cards for family ${family}.`);
+    }
+    let reference = null;
+    let referenceLabel = null;
+    for (const priorityCard of priorityCards) {
+      const standardCards = familyCards.filter((card) => (
+        card.service_tier === "standard"
+        && card.model === priorityCard.model
+        && (card.metadata?.total_input_context_band ?? null)
+          === (priorityCard.metadata?.total_input_context_band ?? null)
+        && effectiveRangesOverlap(card, priorityCard)
+      ));
+      if (standardCards.length === 0) {
+        throw new TypeError(
+          `Priority card ${priorityCard.id} has no overlapping Standard card.`,
+        );
+      }
+      for (const standardCard of standardCards) {
+        const standardAmounts = new Map(tokenComponents(standardCard)
+          .map((component) => [component.usage_component, component.price.amount]));
+        for (const component of tokenComponents(priorityCard)) {
+          const standardAmount = standardAmounts.get(component.usage_component);
+          if (standardAmount === undefined) {
+            throw new TypeError(
+              `${priorityCard.id} prices ${component.usage_component} that ${standardCard.id} does not.`,
+            );
+          }
+          const pair = ratioPair(component.price.amount, standardAmount);
+          if (pair === null) {
+            throw new TypeError(
+              `Unusable price amounts on ${priorityCard.id}/${component.usage_component}.`,
+            );
+          }
+          if (reference === null) {
+            reference = pair;
+            referenceLabel = `${priorityCard.id}/${component.usage_component}`;
+          } else if (!sameRatio(reference, pair)) {
+            throw new TypeError(
+              `Priority/Standard price ratio is not uniform for ${family}: `
+              + `${referenceLabel} vs ${priorityCard.id}/${component.usage_component}.`,
+            );
+          }
+        }
+      }
+    }
+    ratios[family] = ratioNumber(reference);
+  }
+  return Object.freeze(ratios);
+}
+
+// Model family -> published Priority (Fast) API price ratio over Standard,
+// derived from the price registry on load. Any family absent from this map
+// is priced with the disclosed assumed multiplier below, never a silent 1.0.
+export const FAST_MODE_QUOTA_MULTIPLIERS = deriveFastModePriorityRatiosFromRegistry();
+
+// Owner-approved default for Fast usage on a model without a published
+// Priority rate: include it at 2x Standard and disclose the assumption. 2x
+// matches every published GPT-5.6/GPT-5.4-family and Codex-variant Priority
+// row; only GPT-5.5 (2.5x) differs among Codex models.
+export const FAST_MODE_ASSUMED_MULTIPLIER = 2;
+
+export const FAST_MODE_ASSUMED_MULTIPLIER_SOURCE = Object.freeze({
+  basis: "assumed_priority_price_ratio_for_models_without_published_priority_rates",
+  statement:
+    "Fast usage on a model with no published Priority rate is included at an assumed 2x Standard and reported separately, instead of being excluded or silently counted at 1x.",
+  recordedAt: FAST_MODE_MULTIPLIER_RECORDED_AT,
 });
 
 // Fixed bucket keys for the Standard-priced cost crossing that feeds the
@@ -93,34 +229,42 @@ export const CODEX_SPEED_MODE_DECLARATION = Object.freeze({
     "the Codex UI rewrites the configuration file on every toggle, so the key proves only the value at the moment it was read",
 });
 
-// The user preference is the only way a current Codex log can be attributed to
-// a speed mode at all, because the provider stopped recording it.
-export const FAST_MODE_PREFERENCE_VALUES = Object.freeze([
-  "standard",
-  "fast",
-  "mixed_unknown",
-]);
-export const DEFAULT_FAST_MODE_PREFERENCE = "standard";
-
-// How an event's effective mode was decided. These five are distinct
-// everywhere they surface; neither "declared_codex_config" nor "inferred" is
-// ever presented as "observed".
+// How an event's effective mode was decided. These are distinct everywhere
+// they surface; neither "declared_codex_config" nor "inferred" is ever
+// presented as "observed". The speed mode is the Codex UI's own control:
+// observation and the timestamped configuration reading are the evidence, and
+// anything neither covers defaults to Standard as a visible assumption (the
+// owner-stated dashboard preference was removed on 2026-08-30).
 export const SPEED_MODE_PROVENANCE_VALUES = Object.freeze([
   "observed",
   "declared_codex_config",
-  "assumed_from_preference",
+  "assumed_standard_default",
+  "assumed_fast_scenario",
   "inferred",
   "unknown",
 ]);
 
+// The sensitivity axis for turns with no speed evidence at all: the default
+// scenario attributes them to Standard; the fast scenario re-attributes the
+// same residual to Fast so fit couplings can quote both directions. The
+// scenario never overrides an observation or a covering declaration.
+export const UNRESOLVED_SPEED_SCENARIOS = Object.freeze([
+  "unresolved_as_standard",
+  "unresolved_as_fast",
+]);
+export const DEFAULT_UNRESOLVED_SPEED_SCENARIO = "unresolved_as_standard";
+
 export const QUOTA_WEIGHTED_API_PRICE_METRIC = Object.freeze({
+  // The key names are the persisted wire contract and deliberately keep the
+  // legacy "quotaWeighted" spelling; only the labels and basis changed when
+  // the metric moved to published Priority API prices on 2026-08-30.
   key: "quotaWeightedApiPriceEquivalentUsd",
-  label: "Quota-weighted API-price equivalent",
-  shortLabel: "Quota-weighted API equivalent",
+  label: "Speed-priced API-price equivalent",
+  shortLabel: "Speed-priced API equivalent",
   standardMetricKey: "apiPriceEquivalentUsd",
   standardMetricLabel: "Standard-rate API-price equivalent",
   explainer:
-    "Standard-rate API prices, multiplied by the published Fast credit rate for events in Fast mode: 2.5x for GPT-5.6 and GPT-5.5, 2x for GPT-5.4. It tracks relative quota consumption, not a bill.",
+    "Standard-rate API prices, with increments that ran in Fast mode priced at the published Priority (Fast) API rate for the model family: 2x Standard for GPT-5.6 and GPT-5.4, 2.5x for GPT-5.5, and a disclosed assumed 2x for models without a published Priority rate. It tracks relative quota consumption, not a bill.",
 });
 
 // Named thresholds for the secondary residual inference. Every one of these is
@@ -211,10 +355,6 @@ export function fastModeModelFamilyKey(model) {
   return fastModeModelFamily(model) ?? "unsupported";
 }
 
-export function isFastModePreference(value) {
-  return FAST_MODE_PREFERENCE_VALUES.includes(value);
-}
-
 /**
  * Resolution order, strongest evidence first:
  *   1. observed          - the rollout log carried a `thread_settings_applied`
@@ -225,17 +365,18 @@ export function isFastModePreference(value) {
  *                          the session baseline the log never writes, but only
  *                          forward from the reading; callers must not pass a
  *                          declaration for a turn the reading does not cover.
- *   3. assumed_from_preference - no log tier and no covering reading, so the
- *                          owner's stated mode is the only attribution left.
- *   4. inferred          - only when the owner explicitly said mixed_unknown,
- *                          so inference can never override a stated preference.
- *   5. unknown           - nothing legitimate to say; never a silent Standard.
+ *   3. assumed_standard_default - no log tier and no covering reading. The
+ *                          speed mode is the Codex UI's own control, so with
+ *                          no evidence the turn is attributed to Standard as a
+ *                          visible assumption, counted separately from both
+ *                          observation and declaration. Window-level residual
+ *                          inference stays diagnostic-only and never changes
+ *                          the money.
  */
 export function resolveEffectiveSpeedMode({
   observedMode = "unknown",
   declaredMode = "unknown",
-  preference = DEFAULT_FAST_MODE_PREFERENCE,
-  inferredMode = "unknown",
+  unresolvedScenario = DEFAULT_UNRESOLVED_SPEED_SCENARIO,
 } = {}) {
   if (observedMode === "standard" || observedMode === "fast") {
     return Object.freeze({ mode: observedMode, provenance: "observed" });
@@ -246,22 +387,23 @@ export function resolveEffectiveSpeedMode({
       provenance: "declared_codex_config",
     });
   }
-  if (preference === "standard" || preference === "fast") {
+  if (unresolvedScenario === "unresolved_as_fast") {
     return Object.freeze({
-      mode: preference,
-      provenance: "assumed_from_preference",
+      mode: "fast",
+      provenance: "assumed_fast_scenario",
     });
   }
-  if (inferredMode === "fast" || inferredMode === "standard") {
-    return Object.freeze({ mode: inferredMode, provenance: "inferred" });
-  }
-  return Object.freeze({ mode: "unknown", provenance: "unknown" });
+  return Object.freeze({
+    mode: "standard",
+    provenance: "assumed_standard_default",
+  });
 }
 
 /**
- * Quota-weighted API-price equivalent for one Standard-priced amount.
- * Returns an explicit unknown rather than falling back to the Standard amount
- * whenever the mode or the model's published rate is not known.
+ * Speed-priced API-price equivalent for one Standard-priced amount. A Fast
+ * amount on a model without a published Priority rate is included at the
+ * disclosed assumed multiplier rather than excluded; an unknown mode is still
+ * an explicit unknown, never a silent Standard.
  */
 export function quotaWeightedApiPriceEquivalent({
   apiPriceEquivalentUsd,
@@ -288,9 +430,9 @@ export function quotaWeightedApiPriceEquivalent({
   const multiplier = fastModeQuotaMultiplier(model);
   if (multiplier === null) {
     return Object.freeze({
-      usd: null,
-      multiplier: null,
-      status: "unknown_multiplier",
+      usd: roundUsd(apiPriceEquivalentUsd * FAST_MODE_ASSUMED_MULTIPLIER),
+      multiplier: FAST_MODE_ASSUMED_MULTIPLIER,
+      status: "fast_weighted_assumed_ratio",
     });
   }
   return Object.freeze({
@@ -384,16 +526,17 @@ function declaredUnobservedSplit(declaredSpeedWeighting, family, unobserved) {
 export function summarizeQuotaWeightedAccounting({
   speedWeighting,
   declaredSpeedWeighting = null,
-  preference = DEFAULT_FAST_MODE_PREFERENCE,
+  unresolvedScenario = DEFAULT_UNRESOLVED_SPEED_SCENARIO,
   inferredFastEvents = 0,
   inference = null,
 } = {}) {
-  const selectedPreference = isFastModePreference(preference)
-    ? preference
-    : DEFAULT_FAST_MODE_PREFERENCE;
+  const selectedScenario = UNRESOLVED_SPEED_SCENARIOS.includes(unresolvedScenario)
+    ? unresolvedScenario
+    : DEFAULT_UNRESOLVED_SPEED_SCENARIO;
   let standardApiPriceEquivalentUsd = 0;
   let weightedUsd = 0;
   let unweightedUnknownUsd = 0;
+  let assumedRatioStandardUsd = 0;
   let totalEvents = 0;
   let observedEvents = 0;
   let declaredEvents = 0;
@@ -408,7 +551,8 @@ export function summarizeQuotaWeightedAccounting({
     if (resolved.provenance === "observed") observedEvents += cell.events;
     else if (resolved.provenance === "declared_codex_config") {
       declaredEvents += cell.events;
-    } else if (resolved.provenance === "assumed_from_preference") {
+    } else if (resolved.provenance === "assumed_standard_default"
+      || resolved.provenance === "assumed_fast_scenario") {
       assumedEvents += cell.events;
     } else unknownEvents += cell.events;
     if (resolved.mode === "standard") {
@@ -420,7 +564,12 @@ export function summarizeQuotaWeightedAccounting({
         ? null
         : FAST_MODE_QUOTA_MULTIPLIERS[family];
       if (multiplier === null) {
-        unweightedUnknownUsd += cell.apiPriceEquivalentUsd;
+        // No published Priority rate for this model family: include the Fast
+        // amount at the disclosed assumed multiplier and report it apart,
+        // rather than excluding it or silently counting it at 1x.
+        appliedMultipliers.unsupported = FAST_MODE_ASSUMED_MULTIPLIER;
+        assumedRatioStandardUsd += cell.apiPriceEquivalentUsd;
+        weightedUsd += cell.apiPriceEquivalentUsd * FAST_MODE_ASSUMED_MULTIPLIER;
         return;
       }
       appliedMultipliers[family] = multiplier;
@@ -438,7 +587,6 @@ export function summarizeQuotaWeightedAccounting({
         // offered to the resolver for these events.
         attribute(cell, resolveEffectiveSpeedMode({
           observedMode: speed,
-          preference: selectedPreference,
         }), family);
         continue;
       }
@@ -451,19 +599,21 @@ export function summarizeQuotaWeightedAccounting({
         attribute(part.cell, resolveEffectiveSpeedMode({
           observedMode: "unknown",
           declaredMode: part.mode,
-          preference: selectedPreference,
         }), family);
       }
       attribute(split.residual, resolveEffectiveSpeedMode({
         observedMode: "unknown",
-        preference: selectedPreference,
+        unresolvedScenario: selectedScenario,
       }), family);
     }
   }
 
+  // Inference labels events with no per-event evidence, which is exactly the
+  // assumed bucket now that unresolved turns are attributed by scenario
+  // rather than left unknown.
   const reportableInferred = Number.isSafeInteger(inferredFastEvents)
       && inferredFastEvents > 0
-    ? Math.min(inferredFastEvents, unknownEvents)
+    ? Math.min(inferredFastEvents, assumedEvents + unknownEvents)
     : 0;
   const weightingStatus = unweightedUnknownUsd === 0
     ? "complete"
@@ -472,13 +622,19 @@ export function summarizeQuotaWeightedAccounting({
   return Object.freeze({
     metric: QUOTA_WEIGHTED_API_PRICE_METRIC,
     multiplierSource: FAST_MODE_MULTIPLIER_SOURCE,
+    assumedMultiplierSource: FAST_MODE_ASSUMED_MULTIPLIER_SOURCE,
     declarationSource: CODEX_SPEED_MODE_DECLARATION,
-    preference: selectedPreference,
+    unresolvedScenario: selectedScenario,
     standardApiPriceEquivalentUsd: roundUsd(standardApiPriceEquivalentUsd),
     quotaWeightedApiPriceEquivalentUsd: weightingStatus === "unknown"
       ? null
       : roundUsd(weightedUsd),
     unweightedUnknownApiPriceEquivalentUsd: roundUsd(unweightedUnknownUsd),
+    // Standard-priced dollars whose Fast weighting used the assumed
+    // multiplier because the model has no published Priority rate. Included
+    // in the weighted total above; reported here so the assumption is never
+    // invisible.
+    assumedRatioStandardApiPriceEquivalentUsd: roundUsd(assumedRatioStandardUsd),
     weightingStatus,
     appliedMultipliers: Object.freeze({ ...appliedMultipliers }),
     coverage: Object.freeze({
@@ -488,7 +644,9 @@ export function summarizeQuotaWeightedAccounting({
       // reading covers. Kept separate from both observed and assumed so no
       // surface can present a declaration as an observation.
       declaredFromConfigEvents: declaredEvents,
-      assumedFromPreferenceEvents: assumedEvents,
+      // Turns with no evidence at all, attributed by the selected unresolved
+      // scenario (Standard in the default scenario).
+      assumedEvents,
       inferredEvents: reportableInferred,
       // Inference is a window-level label over unresolved events. Keep the
       // full unknown provenance count so the four provenance buckets still

@@ -231,11 +231,6 @@ export function localCompanionStatePaths(stateRoot) {
       "private",
       "hosted-signin-handoff-v1.json",
     ),
-    fastModePreferenceFile: join(
-      selected,
-      "private",
-      "fast-mode-preference-v0.1.json",
-    ),
     codexSpeedBaselineFile: join(
       selected,
       "private",

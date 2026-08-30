@@ -5,6 +5,7 @@ import {
   V1_ANALYSIS_WINDOW_DAYS,
   accountScopedQuotaAnalysisV1,
 } from "./quota-analysis-v1";
+import { SERVER_PRICING_METHOD_VERSION } from "./server-pricing";
 
 /**
  * The community allowance series: for a UTC day, the fitted seven-day Codex
@@ -60,8 +61,12 @@ const NANOUSD_PER_USD = 1_000_000_000;
 // without a chunk change. v1-fit-2: cohort by plan_type alone (dropped the
 // synthesized pro-20x variant pin). v1-fit-3: derive totalInputContextTokens
 // for v1 usage (records carry it null) + drop no-observation records, so the
-// OpenAI context-sensitive pricer no longer refuses every reset.
-const FIT_ADAPTER_VERSION = "v1-fit-5";
+// OpenAI context-sensitive pricer no longer refuses every reset. v1-fit-6:
+// Codex subscription Fast events price at the published Priority (Fast) API
+// rate via the speed ratio (server pricing v0.3), so fits move to the
+// speed-priced basis; the server pricing method version also joins the cache
+// key so future pricing-semantics changes self-invalidate.
+const FIT_ADAPTER_VERSION = "v1-fit-6";
 
 export const COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG = Object.freeze([
   Object.freeze({ planType: "pro", label: "Pro 20x", multiplier: 1 }),
@@ -254,7 +259,7 @@ export async function collectCommunityAllowanceFits(
         ).bind(row.participant_id).first<{ n: number; newest: string; revsum: number }>();
         v1CacheKey = `${Number(epoch?.n ?? 0)}:${epoch?.newest ?? ""}:`
           + `${Number(epoch?.revsum ?? 0)}:${APP_PRICE_REGISTRY_MANIFEST.sha256}:`
-          + `${FIT_ADAPTER_VERSION}`;
+          + `${FIT_ADAPTER_VERSION}:${SERVER_PRICING_METHOD_VERSION}`;
         const cached = await db.prepare(
           `SELECT fits_json FROM community_allowance_fit_cache
             WHERE participant_id = ? AND cache_key = ?`,

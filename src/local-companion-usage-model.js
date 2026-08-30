@@ -365,8 +365,8 @@ export function newUsagePeriod(id, label, { includeSpark = true } = {}) {
     byReasoningEffort: {
       unknown: { events: 0, totalTokens: 0, apiPriceEquivalentUsd: 0 },
     },
-    // Observed speed mode crossed with the model's published Fast credit rate
-    // family, so the owner's Fast-mode preference can be applied at read time.
+    // Observed speed mode crossed with the model's Priority (Fast) price-
+    // ratio family, so the published ratio can be applied at read time.
     speedWeighting: emptySpeedWeightingCrossing(),
     // The same crossing, holding only the events the log left UNOBSERVED that
     // a timestamped Codex `service_tier` reading actually covers.

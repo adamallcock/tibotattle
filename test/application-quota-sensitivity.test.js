@@ -107,8 +107,8 @@ test("application quota sensitivity exposes only its reviewed public API", () =>
 });
 
 test("application quota sensitivity preserves the model multiplier policy", () => {
-  assert.equal(application.fastQuotaMultiplier("gpt-5.6"), 2.5);
-  assert.equal(application.fastQuotaMultiplier("gpt-5.6-sol"), 2.5);
+  assert.equal(application.fastQuotaMultiplier("gpt-5.6"), 2);
+  assert.equal(application.fastQuotaMultiplier("gpt-5.6-sol"), 2);
   assert.equal(application.fastQuotaMultiplier("gpt-5.5-codex"), 2.5);
   assert.equal(application.fastQuotaMultiplier("gpt-5.4"), 2);
   assert.equal(application.fastQuotaMultiplier("gpt-5.4-codex"), 2);
@@ -130,20 +130,21 @@ test("application quota sensitivity preserves complete, incomplete, rounding, an
     }, "fast"),
     {
       basis:
-        "codex_subscription_speed_multiplier_applied_to_standard_api_equivalent_not_api_cost",
+        "codex_subscription_priority_price_ratio_applied_to_standard_api_equivalent",
       modelMultipliers: {
         "future-model": null,
         "gpt-5.4": 2,
-        "gpt-5.6-sol": 2.5,
+        "gpt-5.6-sol": 2,
       },
       observedSpeedMode: "fast",
       scenarios: {
         fast: {
-          complete: false,
+          complete: true,
           relativeQuotaWeight: "model_specific",
-          supportedWeightedStandardApiEquivalentUsd: 0.65,
-          unsupportedStandardApiEquivalentUsd: 0.3,
-          weightedStandardApiEquivalentUsd: null,
+          // 0.3 x 2 assumed + 0.2 x 2 + 0.1 x 2 published.
+          weightedStandardApiEquivalentUsd: 1.2,
+          assumedRatioStandardApiEquivalentUsd: 0.3,
+          assumedRatioMultiplier: 2,
         },
         standard: {
           complete: true,
@@ -159,16 +160,16 @@ test("application quota sensitivity preserves complete, incomplete, rounding, an
     application.subscriptionSpeedSensitivity(null),
     {
       basis:
-        "codex_subscription_speed_multiplier_applied_to_standard_api_equivalent_not_api_cost",
+        "codex_subscription_priority_price_ratio_applied_to_standard_api_equivalent",
       modelMultipliers: {},
       observedSpeedMode: "unknown",
       scenarios: {
         fast: {
           complete: true,
           relativeQuotaWeight: "model_specific",
-          supportedWeightedStandardApiEquivalentUsd: 0,
-          unsupportedStandardApiEquivalentUsd: 0,
           weightedStandardApiEquivalentUsd: 0,
+          assumedRatioStandardApiEquivalentUsd: 0,
+          assumedRatioMultiplier: 2,
         },
         standard: {
           complete: true,

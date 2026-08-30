@@ -316,31 +316,32 @@ test("local companion builds a closed real-data projection without identifiers o
       /only when it is applied or changed, never at session start/u,
     );
     const fastMode = snapshot.overview.accounting.fastMode;
-    assert.equal(fastMode.preference, "standard");
+    assert.equal(fastMode.unresolvedScenario, "unresolved_as_standard");
     assert.equal(fastMode.logObservability.sessionBaselineRecorded, false);
-    assert.equal(fastMode.metricLabel, "Quota-weighted API-price equivalent");
+    assert.equal(fastMode.metricLabel, "Speed-priced API-price equivalent");
     assert.deepEqual(fastMode.multipliers, {
-      "gpt-5.6": 2.5,
+      "gpt-5.6": 2,
       "gpt-5.5": 2.5,
       "gpt-5.4": 2,
     });
-    assert.equal(fastMode.multiplierSource.recordedAt, "2026-08-01");
+    assert.equal(fastMode.multiplierSource.recordedAt, "2026-08-30");
     assert.deepEqual(fastMode.coverage, {
       totalEvents: 2,
       observedEvents: 1,
       declaredFromConfigEvents: 0,
-      assumedFromPreferenceEvents: 1,
+      assumedEvents: 1,
       inferredEvents: 0,
       unknownEvents: 0,
       observedSharePercent: 50,
       unknownSharePercent: 0,
     });
     // The only priced event was observed Fast on a GPT-5.6 model, so the
-    // weighted total is exactly the published 2.5x of the Standard total.
+    // weighted total is exactly the published 2x Priority ratio of the
+    // Standard total.
     assert.equal(
       Math.abs(
         snapshot.overview.accounting.quotaWeightedApiPriceEquivalentUsd
-          - snapshot.overview.accounting.apiPriceEquivalentUsd * 2.5,
+          - snapshot.overview.accounting.apiPriceEquivalentUsd * 2,
       ) < 1e-12,
       true,
     );
@@ -412,7 +413,6 @@ test("development side-chat estimates adjust only the calibration timeline", asy
     const now = () => Date.parse("2026-07-25T12:00:00.000Z");
     const exact = await buildLocalCompanionSnapshot({
       root,
-      fastModePreference: "fast",
       now,
     });
     assert.equal(
@@ -469,7 +469,6 @@ test("development side-chat estimates adjust only the calibration timeline", asy
       root,
       codexHome,
       includeDevelopmentSideChatEstimates: true,
-      fastModePreference: "fast",
       codexSpeedBaselines,
       sideChatEstimateCollector: async (options) => {
         receivedCodexHome = options.codexHome;
@@ -505,18 +504,18 @@ test("development side-chat estimates adjust only the calibration timeline", asy
       {
         schemaVersion: "quota-weighted-timeline-v0.1",
         basisFamilyId:
-          "codex_primary:quota_weighted_api_equivalent:v1:fast_rates_2026_08_01:event_time:observed_declared_scenario",
+          "codex_primary:speed_priced_api_equivalent:v2:priority_price_ratio_2026_08_30:event_time:observed_declared_scenario",
         scenarioOrder: [
           "unresolved_as_standard",
           "unresolved_as_fast",
         ],
-        selectedScenario: "unresolved_as_fast",
+        selectedScenario: "unresolved_as_standard",
       },
     );
     assert.equal(calibrationBucket.allowanceWeighting.length, 16);
     assert.equal(
       calibrationBucket.allowanceWeighting[9],
-      exactBucket.allowanceWeighting[9] + 3.125,
+      exactBucket.allowanceWeighting[9] + 2.5,
     );
     // Fast scenario block: status, weighted USD, covered USD, observed,
     // declared, preference-assumed, inferred, unresolved.
@@ -530,7 +529,6 @@ test("development side-chat estimates adjust only the calibration timeline", asy
       root,
       codexHome,
       includeDevelopmentSideChatEstimates: true,
-      fastModePreference: "fast",
       sideChatEstimateCollector: async () => ({
         ...sideChatEstimates,
         methodology: {
@@ -558,7 +556,6 @@ test("development side-chat estimates adjust only the calibration timeline", asy
       root,
       codexHome,
       includeDevelopmentSideChatEstimates: true,
-      fastModePreference: "fast",
       codexSpeedBaselines,
       developmentSideChatHistoricalGapDate: "2026-07-13",
       sideChatEstimateCollector: async () => ({
@@ -572,7 +569,6 @@ test("development side-chat estimates adjust only the calibration timeline", asy
       },
       now,
     });
-    assert.equal(historicalGapOptions.fastModePreference, "fast");
     assert.deepEqual(
       historicalGapOptions.declaredSpeedBaselines,
       codexSpeedBaselines,
@@ -597,9 +593,9 @@ test("raw rollout history reaches the companion through the archive projection w
     "local-archive-accounting-index-v1-secret",
   );
   const oldTerraCard =
-    "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-01";
+    "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-30";
   const newTerraCard =
-    "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-01";
+    "openai:gpt-5.6-terra:standard:short-from-2026-07-30:official-observed-2026-08-30";
   try {
     await mkdir(sessions, { recursive: true });
     await writeFile(
@@ -910,97 +906,47 @@ test("the stated speed mode attributes unrecorded evidence and never overrides a
       ].map((line) => `${line}\n`).join(""),
       { mode: 0o600 },
     );
-    const build = (fastModePreference) => buildLocalCompanionSnapshot({
+    const snapshot = await buildLocalCompanionSnapshot({
       root,
-      fastModePreference,
       now: () => Date.parse("2026-07-26T12:00:00.000Z"),
     });
 
-    // Each event prices to $5 of Standard-rate API equivalent. Stating
-    // Standard leaves the total exactly where it was before weighting existed.
-    const standard = await build("standard");
-    assert.equal(standard.overview.accounting.apiPriceEquivalentUsd, 10);
+    // Each event prices to $5 of Standard-rate API equivalent. The
+    // unrecorded event is attributed to Standard as a visible assumption, so
+    // the selected total stays at the Standard figure while the
+    // unresolved-as-Fast sensitivity stays visible in the timeline encoding.
+    assert.equal(snapshot.overview.accounting.apiPriceEquivalentUsd, 10);
     assert.equal(
-      standard.overview.accounting.quotaWeightedApiPriceEquivalentUsd,
+      snapshot.overview.accounting.quotaWeightedApiPriceEquivalentUsd,
       10,
     );
-    assert.equal(
-      standard.overview.timeline.usage[0].allowanceWeighting[1],
-      10,
-    );
-    assert.equal(
-      standard.overview.timeline.allowanceWeightingEncoding.selectedScenario,
-      "unresolved_as_standard",
-    );
-
-    // Stating Fast weights only the event whose mode was not recorded; the
-    // observed Standard event keeps its observed weight of one. GPT-5.4's
-    // published Fast rate is 2x, so $5 + $5 x 2 = $15.
-    const fast = await build("fast");
-    assert.equal(
-      fast.overview.accounting.quotaWeightedApiPriceEquivalentUsd,
-      15,
-    );
-    assert.deepEqual(fast.overview.accounting.fastMode.coverage, {
+    assert.deepEqual(snapshot.overview.accounting.fastMode.coverage, {
       totalEvents: 2,
       observedEvents: 1,
       declaredFromConfigEvents: 0,
-      assumedFromPreferenceEvents: 1,
+      assumedEvents: 1,
       inferredEvents: 0,
       unknownEvents: 0,
       observedSharePercent: 50,
       unknownSharePercent: 0,
     });
-    assert.deepEqual(fast.overview.accounting.fastMode.appliedMultipliers, {
-      "gpt-5.4": 2,
-    });
     assert.equal(
-      fast.overview.timeline.usage[0].allowanceWeighting[9],
-      15,
+      snapshot.overview.accounting.fastMode.unresolvedScenario,
+      "unresolved_as_standard",
     );
     assert.equal(
-      fast.overview.timeline.usage[0].allowanceWeighting[11],
-      1,
+      snapshot.overview.timeline.allowanceWeightingEncoding.selectedScenario,
+      "unresolved_as_standard",
     );
+    // Standard-scenario column: both dollars at 1x. Fast-scenario column:
+    // the observed Standard event keeps its observed weight of one while the
+    // assumed event is re-attributed at GPT-5.4's published 2x Priority
+    // ratio, so $5 + $5 x 2 = $15.
+    assert.equal(snapshot.overview.timeline.usage[0].allowanceWeighting[1], 10);
+    assert.equal(snapshot.overview.timeline.usage[0].allowanceWeighting[9], 15);
     assert.equal(
-      fast.overview.timeline.usage[0].allowanceWeighting[13],
-      1,
-    );
-
-    // Stating "not sure" leaves the unrecorded event explicitly unweighted
-    // instead of quietly counting it at the Standard rate.
-    const mixed = await build("mixed_unknown");
-    assert.equal(
-      mixed.overview.accounting.quotaWeightedApiPriceEquivalentUsd,
-      5,
-    );
-    assert.equal(
-      mixed.overview.accounting.fastMode.unweightedUnknownApiPriceEquivalentUsd,
-      5,
-    );
-    assert.equal(mixed.overview.accounting.fastMode.weightingStatus, "partial");
-    assert.equal(
-      mixed.overview.timeline.allowanceWeightingEncoding.selectedScenario,
-      null,
-    );
-    assert.equal(mixed.overview.timeline.usage[0].allowanceWeighting[1], 10);
-    assert.equal(mixed.overview.timeline.usage[0].allowanceWeighting[9], 15);
-    assert.equal(mixed.overview.accounting.fastMode.coverage.unknownEvents, 1);
-    assert.equal(
-      mixed.overview.accounting.fastMode.coverage.unknownSharePercent,
-      50,
-    );
-    assert.equal(
-      mixed.overview.monitoringGaps.find((row) => row.id === "fast_mode").status,
+      snapshot.overview.monitoringGaps.find((row) => row.id === "fast_mode").status,
       "partial",
-    );
-
-    // An unrecognised statement is never treated as Fast.
-    const hostile = await build("turbo");
-    assert.equal(hostile.overview.accounting.fastMode.preference, "standard");
-    assert.equal(
-      hostile.overview.accounting.quotaWeightedApiPriceEquivalentUsd,
-      10,
     );
   } finally {
     await rm(root, { recursive: true });
@@ -1127,9 +1073,9 @@ test("collector fallback keeps mixed event-time price provenance while an old re
   const root = await fixtureRoot();
   const stateFile = join(root, ".usage-monitor", "local-collector-state-v1.sqlite");
   const olderTerraCard =
-    "openai:gpt-5.6-terra:standard:long-through-2026-07-29:official-observed-2026-08-01";
+    "openai:gpt-5.6-terra:standard:long-through-2026-07-29:official-observed-2026-08-30";
   const lowerTerraCard =
-    "openai:gpt-5.6-terra:standard:long-from-2026-07-30:official-observed-2026-08-01";
+    "openai:gpt-5.6-terra:standard:long-from-2026-07-30:official-observed-2026-08-30";
   try {
     const usage = (observedAt) => JSON.stringify({
       schemaVersion: "0.3",
@@ -1260,9 +1206,6 @@ test("a declared Codex baseline fills only the turns it actually covers", async 
 
     const snapshot = await buildLocalCompanionSnapshot({
       root,
-      // "not sure" removes the stated preference as an attribution route, so
-      // anything attributed here came from the declaration alone.
-      fastModePreference: "mixed_unknown",
       codexSpeedBaselines: [{
         mode: "fast",
         firstSeenAt: "2026-07-26T10:00:00.000Z",
@@ -1275,18 +1218,18 @@ test("a declared Codex baseline fills only the turns it actually covers", async 
     assert.equal(fastMode.coverage.totalEvents, 4);
     assert.equal(fastMode.coverage.observedEvents, 1);
     assert.equal(fastMode.coverage.declaredFromConfigEvents, 1);
-    assert.equal(fastMode.coverage.assumedFromPreferenceEvents, 0);
-    assert.equal(fastMode.coverage.unknownEvents, 2);
+    assert.equal(fastMode.coverage.assumedEvents, 2);
+    assert.equal(fastMode.coverage.unknownEvents, 0);
     // Each event prices to $5 of Standard-rate API equivalent: $5 observed
     // Standard plus $5 declared Fast at GPT-5.4's published 2x, with the two
-    // uncovered events left explicitly unweighted rather than counted at 1x.
+    // uncovered events attributed to Standard as a visible assumption.
     assert.equal(snapshot.overview.accounting.apiPriceEquivalentUsd, 20);
     assert.equal(
       snapshot.overview.accounting.quotaWeightedApiPriceEquivalentUsd,
-      15,
+      25,
     );
-    assert.equal(fastMode.unweightedUnknownApiPriceEquivalentUsd, 10);
-    assert.equal(fastMode.weightingStatus, "partial");
+    assert.equal(fastMode.unweightedUnknownApiPriceEquivalentUsd, 0);
+    assert.equal(fastMode.weightingStatus, "complete");
     assert.equal(fastMode.declarationSource.neverBackfillsHistory, true);
     assert.deepEqual(
       [...fastMode.declarationSource.retainedKeys],
@@ -1296,7 +1239,6 @@ test("a declared Codex baseline fills only the turns it actually covers", async 
     // With no declarations at all the same ledger attributes nothing extra.
     const undeclared = await buildLocalCompanionSnapshot({
       root,
-      fastModePreference: "mixed_unknown",
       now: () => Date.parse("2026-07-26T12:00:00.000Z"),
     });
     assert.equal(
@@ -1304,7 +1246,7 @@ test("a declared Codex baseline fills only the turns it actually covers", async 
       0,
     );
     assert.equal(
-      undeclared.overview.accounting.fastMode.coverage.unknownEvents,
+      undeclared.overview.accounting.fastMode.coverage.assumedEvents,
       3,
     );
   } finally {
@@ -1550,7 +1492,7 @@ test("live weekly cache replaces the repo artifact and labels historical account
 });
 
 // The diagnostic weekly fit remains Standard-priced. Until composition is
-// fitted independently on the selected quota-weighted basis, its vector must
+// fitted independently on the selected speed-priced basis, its vector must
 // not leak into an allowance-facing card whose scalar uses Fast weighting.
 test("the Standard diagnostic fitted mix does not leak into the weighted allowance card", async () => {
   const root = await fixtureRoot();

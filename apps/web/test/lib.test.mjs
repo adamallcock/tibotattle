@@ -1883,7 +1883,7 @@ test("the Fast-mode blind spot reports a share instead of a bare not-observed", 
   assert.doesNotMatch(result.monitoringGaps[0].explanation, /NOT OBSERVED/iu);
 });
 
-test("the closed accounting normalizer keeps the quota-weighted metric and its coverage split", () => {
+test("the closed accounting normalizer keeps the speed-priced metric and its coverage split", () => {
   const result = normalizeDashboardPayload({
     mode: "real_local_evidence",
     status: "live",
@@ -1899,7 +1899,7 @@ test("the closed accounting normalizer keeps the quota-weighted metric and its c
         unknown: { unsupported: { events: 4, apiPriceEquivalentUsd: 8 } }
       },
       fastMode: {
-        preference: "mixed_unknown",
+        unresolvedScenario: "unresolved_as_standard",
         quotaWeightedApiPriceEquivalentUsd: 34,
         standardApiPriceEquivalentUsd: 20,
         unweightedUnknownApiPriceEquivalentUsd: 8,
@@ -1908,11 +1908,11 @@ test("the closed accounting normalizer keeps the quota-weighted metric and its c
         coverage: {
           totalEvents: 10,
           observedEvents: 6,
-          assumedFromPreferenceEvents: 0,
+          assumedEvents: 4,
           inferredEvents: 3,
-          unknownEvents: 4,
+          unknownEvents: 0,
           observedSharePercent: 60,
-          unknownSharePercent: 40
+          unknownSharePercent: 0
         },
         inference: {
           status: "inferred",
@@ -1930,35 +1930,32 @@ test("the closed accounting normalizer keeps the quota-weighted metric and its c
   assert.equal(accounting.quotaWeightedApiPriceEquivalentUsd, 34);
   assert.equal(accounting.apiPriceEquivalentUsd, 20);
   assert.equal(accounting.evidenceStartDate, "2026-07-26");
-  assert.equal(accounting.fastMode.preference, "mixed_unknown");
+  assert.equal(accounting.fastMode.unresolvedScenario, "unresolved_as_standard");
   assert.equal(accounting.fastMode.weightingStatus, "partial");
   assert.equal(accounting.fastMode.unweightedUnknownApiPriceEquivalentUsd, 8);
   assert.deepEqual(accounting.fastMode.coverage, {
     totalEvents: 10,
     observedEvents: 6,
-    assumedFromPreferenceEvents: 0,
+    assumedEvents: 4,
     inferredEvents: 3,
-    unknownEvents: 4,
+    unknownEvents: 0,
     observedSharePercent: 60,
-    unknownSharePercent: 40
+    unknownSharePercent: 0
   });
   assert.ok(accounting.fastMode.coverage.inferredEvents
-    <= accounting.fastMode.coverage.unknownEvents);
+    <= accounting.fastMode.coverage.assumedEvents
+      + accounting.fastMode.coverage.unknownEvents);
   // The multipliers and the metric name are stated by this page, never taken
   // from the server, and inference can never be reported as weighted.
   assert.deepEqual(accounting.fastMode.multipliers, {
-    "gpt-5.6": 2.5,
+    "gpt-5.6": 2,
     "gpt-5.5": 2.5,
     "gpt-5.4": 2
   });
-  assert.equal(accounting.fastMode.metricLabel, "Quota-weighted API-price equivalent");
+  assert.equal(accounting.fastMode.metricLabel, "Speed-priced API-price equivalent");
   assert.equal(accounting.fastMode.inference.appliedToWeighting, false);
   assert.equal(accounting.fastMode.inference.inferredFastWindows, 2);
   assert.equal(accounting.fastMode.logRecordsTierChangesOnly, true);
-  assert.equal(
-    accounting.fastMode.preferenceAppliesTo,
-    "turns_with_no_observed_tier_only"
-  );
   assert.equal(accounting.speedWeighting.fast["gpt-5.6"].events, 4);
   assert.equal(accounting.speedWeighting.unknown.unsupported.apiPriceEquivalentUsd, 8);
   assert.equal(accounting.speedWeighting.fast["gpt-5.5"].events, 0);
@@ -1972,11 +1969,14 @@ test("an absent or hostile Fast-mode projection degrades to an explicit unknown"
       events: 3,
       apiPriceEquivalentUsd: 5,
       quotaWeightedApiPriceEquivalentUsd: -12,
-      fastMode: { preference: "turbo", weightingStatus: "definitely" }
+      fastMode: { unresolvedScenario: "turbo", weightingStatus: "definitely" }
     }
   });
   assert.equal(result.accounting.quotaWeightedApiPriceEquivalentUsd, null);
-  assert.equal(result.accounting.fastMode.preference, "standard");
+  assert.equal(
+    result.accounting.fastMode.unresolvedScenario,
+    "unresolved_as_standard",
+  );
   assert.equal(result.accounting.fastMode.weightingStatus, "unknown");
   assert.equal(result.accounting.fastMode.coverage.totalEvents, 0);
   assert.equal(result.accounting.fastMode.inference.status, "not_run");
@@ -2160,7 +2160,7 @@ test("web timeline expands the compact weighted tuple and rejects encoding drift
   const encoding = {
     schemaVersion: "quota-weighted-timeline-v0.1",
     basisFamilyId:
-      "codex_primary:quota_weighted_api_equivalent:v1:fast_rates_2026_08_01:event_time:observed_declared_scenario",
+      "codex_primary:speed_priced_api_equivalent:v2:priority_price_ratio_2026_08_30:event_time:observed_declared_scenario",
     scenarioOrder: [
       "unresolved_as_standard",
       "unresolved_as_fast"
@@ -2198,7 +2198,7 @@ test("web timeline expands the compact weighted tuple and rejects encoding drift
   );
   assert.equal(
     normalized.timeline.usage[0].allowanceWeighting.scenarios
-      .unresolved_as_standard.coverage.assumedFromPreferenceEvents,
+      .unresolved_as_standard.coverage.assumedEvents,
     2
   );
 
@@ -3058,51 +3058,6 @@ return {
         "2026-08-03T00:00:00.000Z|2026-08-03T01:00:00.000Z|100|1",
     });
   }
-});
-
-test("the Fast-mode preference travels on a fixed same-origin local route", async () => {
-  const calls = [];
-  const client = new LocalCompanionClient({
-    fetchImpl: async (url, options = {}) => {
-      calls.push({ url, options });
-      return new Response(JSON.stringify({
-        schemaVersion: "fast-mode-preference-v0.1",
-        mode: "mixed_unknown",
-        source: "stated",
-        recordedAt: "2026-08-01T12:00:00.000Z"
-      }), { status: 200, headers: { "Content-Type": "application/json" } });
-    }
-  });
-  const read = await client.fastModePreference();
-  assert.equal(read.mode, "mixed_unknown");
-  assert.equal(read.source, "stated");
-  const written = await client.selectFastModePreference("fast");
-  assert.equal(written.mode, "mixed_unknown");
-  assert.deepEqual(calls.map((call) => call.url), [
-    "/api/local/accounting/fast-mode-preference",
-    "/api/local/accounting/fast-mode-preference"
-  ]);
-  assert.equal(calls[0].options.method, undefined);
-  assert.equal(calls[1].options.method, "POST");
-  assert.equal(calls[1].options.headers["X-Usage-Monitor-Local"], "1");
-  assert.equal(calls[1].options.body, JSON.stringify({ mode: "fast" }));
-  // A value outside the fixed set never reaches the network.
-  await assert.rejects(
-    () => client.selectFastModePreference("turbo"),
-    TypeError
-  );
-  assert.equal(calls.length, 2);
-
-  // An unreadable preference reads back as the untouched Standard default
-  // rather than an invented Fast attribution.
-  const offline = new LocalCompanionClient({
-    fetchImpl: async () => {
-      throw new Error("companion unreachable");
-    }
-  });
-  const fallback = await offline.fastModePreference();
-  assert.equal(fallback.mode, "standard");
-  assert.equal(fallback.source, "default");
 });
 
 test("local pairing preserves fixed identifier-shaped codes and drops anything else", async () => {
@@ -5289,7 +5244,7 @@ test("the weekly headline is a stable all-data median and says so on screen", as
     1,
     "the across-reset range never moves when a chart control moves",
   );
-  assert.equal(views[0].label, "Quota-weighted all-data median");
+  assert.equal(views[0].label, "Speed-priced all-data median");
   assert.match(views[0].range, /all data/u, "the range names the population it summarizes");
   assert.equal(
     new Set(views.map((view) => view.explanation)).size,
@@ -6006,12 +5961,12 @@ test("weekly details keep reset evidence concise and do not present speed covera
   assert.doesNotMatch(appSource, /function renderWeeklyTrend|function renderWeeklyStats/u);
 });
 
-test("live timeline couples quota-weighted usage to the matching allowance capacity", async () => {
+test("live timeline couples speed-priced usage to the matching allowance capacity", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  assert.match(html, />Expected from quota-weighted API cost</u);
+  assert.match(html, />Expected from speed-priced API cost</u);
   assert.doesNotMatch(html, />Expected from API cost</u);
-  assert.match(html, /id="usage-cost-legend-label">Quota-weighted API-equivalent usage</u);
+  assert.match(html, /id="usage-cost-legend-label">Speed-priced API-equivalent usage</u);
   assert.match(html, /id="usage-allowance-legend"/u);
   assert.match(
     appSource,
@@ -7931,7 +7886,6 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
     "contribution_prepare",
     "automatic_contribution",
     "hosted_identity",
-    "fast_mode_preference",
   ]) {
     assert.ok(surfaces.includes(journey), `${journey} reports failures`);
   }
@@ -9211,7 +9165,7 @@ test("the inspection list keeps every row and restarts paging when the selection
 // ---------------------------------------------------------------------------
 
 const TEST_ALLOWANCE_BASIS_FAMILY =
-  "codex_primary:quota_weighted_api_equivalent:v1:fast_rates_2026_08_01:event_time:observed_declared_scenario";
+  "codex_primary:speed_priced_api_equivalent:v2:priority_price_ratio_2026_08_30:event_time:observed_declared_scenario";
 const testAllowanceBasisId = (scenario) =>
   `${TEST_ALLOWANCE_BASIS_FAMILY}:${scenario}`;
 const testAllowanceWeighting = (selectedUsd, { available = true } = {}) => ({
@@ -9314,7 +9268,7 @@ test("cumulative drift sums non-overlapping buckets and re-anchors at each reset
         startAt: hour(index),
         endAt: hour(index + 1),
         // Standard cost deliberately differs: every allowance-facing result
-        // below must use the quota-weighted $50 instead of this $20.
+        // below must use the speed-priced $50 instead of this $20.
         apiPriceEquivalentUsd: 20,
         allowanceWeighting: testAllowanceWeighting(50),
         usageEvents: 5,

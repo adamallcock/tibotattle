@@ -5,7 +5,7 @@ import test from "node:test";
 import { normalizeDashboardPayload } from "../public/data-client.js";
 
 const ALLOWANCE_BASIS_FAMILY =
-  "codex_primary:quota_weighted_api_equivalent:v1:fast_rates_2026_08_01:event_time:observed_declared_scenario";
+  "codex_primary:speed_priced_api_equivalent:v2:priority_price_ratio_2026_08_30:event_time:observed_declared_scenario";
 const allowanceBasisId = (scenario) =>
   `${ALLOWANCE_BASIS_FAMILY}:${scenario}`;
 const MATCHED_COHORT_ID =
@@ -21,7 +21,7 @@ function allowanceScenario(scenario, quotaWeightedUsd) {
       totalEvents: 1,
       observedEvents: 0,
       declaredFromConfigEvents: 0,
-      assumedFromPreferenceEvents: 1,
+      assumedEvents: 1,
       inferredEvents: 0,
       unknownEvents: 0,
     },
@@ -204,7 +204,7 @@ function historicalGapProbe(overrides = {}) {
     totalEvents: 3,
     observedEvents: 2,
     declaredFromConfigEvents: 0,
-    assumedFromPreferenceEvents: 1,
+    assumedEvents: 1,
     inferredEvents: 0,
     unknownEvents: 0,
   };

@@ -394,11 +394,10 @@ function finalizePremiumScenario(summary, scenario, completeCoverage) {
       "price_coverage_incomplete",
     );
   }
-  const preference = scenario === "unresolved_as_fast" ? "fast" : "standard";
   const weighting = summarizeQuotaWeightedAccounting({
     speedWeighting: summary.speedWeighting,
     declaredSpeedWeighting: summary.declaredSpeedWeighting,
-    preference,
+    unresolvedScenario: scenario,
   });
   if (weighting.weightingStatus !== "complete"
       || !Number.isFinite(weighting.quotaWeightedApiPriceEquivalentUsd)) {
@@ -419,7 +418,7 @@ function finalizePremiumScenario(summary, scenario, completeCoverage) {
     pricedDrops: summary.pricedDrops,
     observedSpeedDrops: weighting.coverage.observedEvents,
     declaredSpeedDrops: weighting.coverage.declaredFromConfigEvents,
-    assumedSpeedDrops: weighting.coverage.assumedFromPreferenceEvents,
+    assumedSpeedDrops: weighting.coverage.assumedEvents,
     unknownSpeedDrops: weighting.coverage.unknownEvents,
   };
 }
