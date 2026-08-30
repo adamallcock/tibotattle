@@ -66,7 +66,7 @@ published API rate for its effective speed mode, end to end:
 ## Evidence
 
 - Owner-supplied captures of the official pricing page (Standard, Batch, and
-  Fast tabs, 2026-08-30 review; registry v0.5) including the GPT-5.6 Sol
+  Fast tabs, 2026-08-30 review; registry v0.5, extended to v0.6 the same day when the Standard and Flex tab captures arrived) including the GPT-5.6 Sol
   repricing effective 2026-08-21 and the first Priority long-context rows.
 - First-party Codex model pages for gpt-5.3-codex, gpt-5.2-codex,
   gpt-5.1-codex, gpt-5.1-codex-mini, and gpt-5-codex.
