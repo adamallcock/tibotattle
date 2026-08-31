@@ -13,6 +13,13 @@ Electron release, or new signed-Preview workflow. Source integration, tests,
 state migration, signing, installation, and native verification are separate
 gates; none is complete merely because an earlier gate passed.
 
+The installed RC2 source is `3d9055fc` (PR #92). The owner's subsequent
+prompt-free Keychain follow-up, its approved reset boundary, and current
+qualification are recorded in the
+[silent-migration decision](../decisions/2026-08-31-silent-keychain-migration.md).
+That candidate remains frozen while the separate account/plan-attribution PR
+is prepared for a later 0.1.17 dogfood; do not combine their R7 evidence.
+
 ## Source boundary
 
 The last installed Preview was built from `b7112217` (PR #80, with #81 already
@@ -65,7 +72,9 @@ included in the retained validation run.
    accounting and cursor coverage. Do not copy Preview state into stable.
 5. Commit and merge the reviewed result, then create one exact annotated
    `tibotattle-internal-dogfood-0.1.17-rcN-source-YYYYMMDD` tag. Use the reviewed
-   channel allocation (build `1023`), clean source and retained release finalizer.
+   channel allocation from `scripts/macos-bundle-version.js`, clean source and
+   retained release finalizer. RC1/RC2 use `1023`; the approved Keychain-migration
+   follow-up uses `1023.1`.
    Signing and notarization are authorized; public updater/release publication
    and hosted deployment are not part of this task.
 6. Install only the verified signed artifact with a recoverable prior-app and

@@ -24,6 +24,7 @@ const LEGACY = Object.freeze({
   ]],
   "export-source-plan-bundle": ["sourcePlanBundle", [
     "EXPORT_SOURCE_PLAN_BUNDLE_VERSION", "ExportSourcePlanBundleError", "createExportSourcePlanBundle",
+    "exportSourcePlanBundleFailureContext",
     "resolveExportSourcePlanBundle", "summarizeExportSourcePlanBundle",
   ]],
   "codex-export-checkpoint-scan": ["codexCheckpoint", [

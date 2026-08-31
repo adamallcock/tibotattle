@@ -2,10 +2,31 @@
 title: First-pairing Keychain prompt
 date: 2026-08-19
 type: design
-status: complete
+status: superseded
 ---
 
 # The first-pairing Keychain prompt
+
+## Historical boundary — superseded 2026-08-31
+
+This record preserves the 0.1.13 build 1015 first-pairing investigation and
+PR #34 / 2026-08-20 app-only ACL observations for regression and security review.
+It is not current product or release guidance. The implementation descriptions,
+"ships today" statements, recommendations, and open checklist below describe
+that historical snapshot, not the 0.1.17 candidate.
+
+The [silent-migration decision](../decisions/2026-08-31-silent-keychain-migration.md),
+[native agent guidance](../../apps/macos/AGENTS.md#prompt-free-keychain-operation),
+and [native Keychain release gate](../runbooks/macos-stable-release-runbook.md#native-keychain-migration-gate)
+supersede this record's prompt and recovery advice. Automatic operation must be
+noninteractive: try bounded silent migration first, then offer a quiet,
+explained, user-initiated approval fallback with Cancel as the default. Do not
+follow the historical Always Allow recommendation, reset credentials to work
+around a prompt, or broaden Keychain protections. An unexpected app prompt blocks
+dogfood replacement and public release; signing-machine provisioning is a
+separate, explicitly authorized operation.
+
+## Original investigation and implementation record
 
 Option 3 is implemented — copy and ordering fixes
 shipped on `fix/first-pairing-keychain-ux`; the structural elimination

@@ -74,6 +74,9 @@ enum TiboTattleLocalization {
         case commonCancel = "common.cancel"
         case commonContinue = "common.continue"
         case commonOK = "common.ok"
+        case dialogApproveKeychainMigration = "dialog.approveKeychainMigration"
+        case dialogKeychainMigrationTitle = "dialog.keychainMigrationTitle"
+        case dialogKeychainMigrationDescription = "dialog.keychainMigrationDescription"
         case dialogChooseCodexHomeFolder = "dialog.chooseCodexHomeFolder"
         case dialogChooseCodexHomeFolderMessage = "dialog.chooseCodexHomeFolderMessage"
         case dialogCodexFolderDescription = "dialog.codexFolderDescription"
@@ -345,6 +348,13 @@ enum TiboTattleLocalization {
         case settingsGeneral = "settings.general"
         case settingsGeneralSummary = "settings.generalSummary"
         case settingsGitHub = "settings.github"
+        case settingsKeychainMigrationTitle = "settings.keychainMigrationTitle"
+        case settingsKeychainMigrationSummary = "settings.keychainMigrationSummary"
+        case settingsKeychainMigrationRetrying = "settings.keychainMigrationRetrying"
+        case settingsKeychainMigrationApproving = "settings.keychainMigrationApproving"
+        case settingsKeychainMigrationDeferred = "settings.keychainMigrationDeferred"
+        case settingsKeychainMigrationReview = "settings.keychainMigrationReview"
+        case settingsKeychainMigrationMenu = "settings.keychainMigrationMenu"
         case settingsLanguage = "settings.language"
         case settingsLanguageEnglish = "settings.languageEnglish"
         case settingsLanguagePickerHint = "settings.languagePickerHint"
@@ -441,6 +451,12 @@ enum TiboTattleLocalization {
                 "Continue"
             case .commonOK:
                 "OK"
+            case .dialogApproveKeychainMigration:
+                "Approve migration"
+            case .dialogKeychainMigrationTitle:
+                "Approve secure Keychain migration?"
+            case .dialogKeychainMigrationDescription:
+                "Saved Keychain keys keep local account matching and your existing contribution identity consistent. This update moves them to app-owned Keychain items without changing their values.\n\nSilent migration could not finish. macOS may ask for your login Keychain password. Enter it only in the macOS dialog; TiboTattle does not receive the password.\n\nApproving this migration does not reset anything or upload data. Existing history is kept. Cancel leaves migration pending."
             case .dialogChooseCodexHomeFolder:
                 "Choose your Codex home folder"
             case .dialogChooseCodexHomeFolderMessage:
@@ -983,6 +999,20 @@ enum TiboTattleLocalization {
                 "Local usage refreshes while TiboTattle is open. Raw logs stay on this Mac."
             case .settingsGitHub:
                 "GitHub"
+            case .settingsKeychainMigrationTitle:
+                "Secure upgrade"
+            case .settingsKeychainMigrationSummary:
+                "Saved Keychain access needs one-time approval to finish this upgrade. Your history is kept; review when you’re ready."
+            case .settingsKeychainMigrationRetrying:
+                "Preparing secure access automatically. No password is needed while these checks run."
+            case .settingsKeychainMigrationApproving:
+                "Finishing the approved Keychain migration… Your existing key values and history are kept."
+            case .settingsKeychainMigrationDeferred:
+                "Migration is still pending for the remaining keys. Nothing has been reset, and local history is kept. You can review again when ready."
+            case .settingsKeychainMigrationReview:
+                "Review migration…"
+            case .settingsKeychainMigrationMenu:
+                "Finish secure upgrade…"
             case .settingsLanguage:
                 "Language"
             case .settingsLanguageEnglish:

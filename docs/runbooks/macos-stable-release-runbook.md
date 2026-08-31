@@ -124,6 +124,56 @@ for a candidate, public installer, or signing path.
 Do not rewrite the old receipt or tag. Preserving this artifact does not prove
 state rollback: a schema-9 backup is already newer than its schema-8 reader.
 
+### Native Keychain migration gate
+
+Unexpected Keychain security prompts block dogfood replacement and public
+release. Normal startup, refresh, background work, and automatic migration must
+not enable Keychain interaction. Preserve the last usable local state when
+access is unavailable; do not erase an identity, weaken access controls, disable
+macOS protections, or move secrets to plaintext to make a candidate appear ready.
+
+The silent-migration source change adds a separately signed native helper to
+the closed payload inventory. Its `node` signing identifier and exact Developer
+ID designated requirement must match the previously shipped Node reader, with
+the same Team ID, hardened runtime, and no helper entitlements. The native app
+keeps its own stable identity. Do not broaden an ACL or restore a general
+interpreter credential reader to make a test pass.
+
+Before qualifying that change, obtain explicit owner authorization for the
+signed synthetic probe described in
+[`test/fixtures/macos-keychain-migration/README.md`](../../test/fixtures/macos-keychain-migration/README.md).
+Its default invocation is inert; `--compile-only` compiles without signing or
+Keychain access. The protected `--run-signed` invocation uses the release signing
+key and creates/deletes only its own validated private fixture Keychain. It must
+prove exact-secret migration, no-clobber adoption, repeated-upgrade continuity,
+unauthorized-peer rejection, bounded helper lifetime, and unchanged default and
+search lists. This approximates historical default ACLs; it does not establish
+every installed user's access controls or a notarized replacement.
+
+The separate installed-candidate check must cover clean installation and a
+same-identity old-to-new upgrade using the exact signed artifacts. Check normal
+launch, refresh, companion restart, locked/unavailable Keychain, exhausted
+retries, partial migration, and denial/cancellation. Confirm no automatic
+Keychain prompt, up to three bounded silent attempts, and the explained native
+**Secure upgrade** fallback only after deliberate approval, with Cancel as the
+default. Keep the old key as a recovery copy; do not treat reset/deletion as
+migration recovery. Verify the separate, deliberate reset waits for all current
+and retiring credential writers, then removes that capability's legacy copy
+before its modern copy, without allowing delayed migration to restore it. The
+implementation and synthetic reset evidence are recorded in the
+[migration decision](../decisions/2026-08-31-silent-keychain-migration.md)
+and do not authorize resetting real credentials during qualification. An
+unsigned smoke or a blocked signed probe is not signed-upgrade evidence.
+
+A second closed previous-only exception accepts the retained 0.1.17 / build
+1023 RC2 DMG, SHA-256
+`125a15da9b0e260ec3797527d6b98e15aa1172e8b6fc8e7942d2a799cc2b29b0`,
+49,574,961 bytes, source `3d9055fc8e58c84f8ba71feb5deb58b52c532138`.
+It predates the helper inventory. Its exact source and normalized payload
+digests remain pinned; it is never rewritten. Only the previous side of the
+replacement validator permits the absent helper. Current candidate inspection,
+signing, and release paths require it.
+
 **The failure class to expect after a batch of merges** is a *pin* that was
 never updated: a reviewed public-API list, a pinned action SHA, a byte-identity
 digest, a root-workspace allowlist, or an exact `deepEqual` on an exported
@@ -191,8 +241,9 @@ node scripts/release-macos-app.js \
 
 For the 0.1.17 stable release, `CFBundleShortVersionString` remains `0.1.17`
 and the owner-reviewed signed `CFBundleVersion` is exactly `1024`. It follows
-the internal-dogfood 0.1.17 allocation `1023` and the last shared-identity
-dogfood build `1022`. The checked-in allocation is authoritative; the
+the internal-dogfood 0.1.17 migration allocation `1023.1`, retained RC2 build
+`1023`, and earlier shared-identity dogfood build `1022`. The checked-in
+allocation is authoritative; the
 `USAGE_MONITOR_BUNDLE_VERSION` value above is only an exact assertion and
 cannot select or override a different build. A future stable version must add
 and test a new monotonic channel allocation before the release path will run.
@@ -200,9 +251,13 @@ The separate `TiboTattle Preview.app` identity may use the deterministic
 preview epoch (`2000.1.17` for 0.1.17); it does not participate in stable
 Sparkle ordering.
 
-Codesign may prompt for Keychain access once; choose **Always Allow** on the
-release machine. The finalizer validates Developer ID signing, hardened
-runtime, notarization, stapling, Gatekeeper, and clean installation. It emits
+Signing-key access on the release machine is a separate owner provisioning
+step, not an end-user permission requirement. If signing requests approval,
+pause for the owner to verify the exact signer and key. Do not automatically
+approve the dialog, recommend blanket Always Allow access, or change Keychain
+ACLs/partitions to unblock an unattended build. The finalizer validates Developer
+ID signing, hardened runtime, notarization, stapling, Gatekeeper, and clean
+installation. It emits
 the final arm64 DMG at:
 
 ~~~text

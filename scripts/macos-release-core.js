@@ -52,6 +52,8 @@ import {
   normalizeMacOSUpdaterConfiguration,
 } from "./macos-updater-core.js";
 import {
+  MACOS_KEYCHAIN_MIGRATION_HELPER,
+  assertMacOSKeychainMigrationManifest,
   buildMacOSAppForRelease,
   buildMacOSReleaseCandidate,
   validateMacOSPreviewApp,
@@ -111,6 +113,7 @@ const SPARKLE_FRAMEWORK_PREFIX =
 const BASE_NORMALIZED_MACH_O_PATHS = Object.freeze([
   APP_EXECUTABLE,
   NODE_EXECUTABLE,
+  MACOS_KEYCHAIN_MIGRATION_HELPER.executable,
 ]);
 const SPARKLE_NORMALIZED_MACH_O_PATHS = Object.freeze(
   SPARKLE_MACH_O_PATHS.map(
@@ -164,6 +167,31 @@ const VERIFIED_LEGACY_DOGFOOD_PREVIOUS_ARTIFACT = Symbol(
   "verified legacy dogfood previous artifact",
 );
 const VERIFIED_LEGACY_DOGFOOD_CAPABILITIES = new WeakSet();
+// This immutable rc2 was installed before the migration helper existed. Only
+// the checksum-verified previous side of a replacement may omit that helper;
+// every newly built/signable/public candidate must carry the current contract.
+const PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE = Object.freeze({
+  artifactSha256:
+    "125a15da9b0e260ec3797527d6b98e15aa1172e8b6fc8e7942d2a799cc2b29b0",
+  artifactBytes: 49_574_961,
+  artifactFileName: "TiboTattle-0.1.17-macOS-arm64.dmg",
+  bundleVersion: "1023",
+  shortVersion: "0.1.17",
+  sourceCommit: "3d9055fc8e58c84f8ba71feb5deb58b52c532138",
+  sourceTag: "tibotattle-internal-dogfood-0.1.17-rc2-source-20260831",
+  sourceSha256:
+    "d18945b354ed3431b49953c2fe756405ccb8b5d46cd866adcc96a640f2344275",
+  payloadSha256:
+    "dad884435aea0d1a471f1a7ff7cfbd908723c6cb26a95823ad600c8ccd1d1a7d",
+  publicEdKeySha256:
+    "77d5717947da768e7e96a1b1e6225d2cae4748a556f109f2a30444a5f41ff3d2",
+  frameworkSha256:
+    "2a43f8c41a29b195982354d7580036c178ed89e3b3e5dc0d8ab295290d91a0ac",
+});
+const VERIFIED_PRE_MIGRATION_PREVIOUS_ARTIFACT = Symbol(
+  "verified pre-migration previous artifact",
+);
+const VERIFIED_PRE_MIGRATION_CAPABILITIES = new WeakSet();
 const REQUIRED_NODE_RUNTIME_ENTITLEMENTS = Object.freeze([
   "com.apple.security.cs.allow-jit",
   "com.apple.security.cs.allow-unsigned-executable-memory",
@@ -203,6 +231,17 @@ function validateLegacyDogfoodPreviousCapability(capability) {
     fail(
       "Legacy dogfood source compatibility requires a verified previous-artifact capability",
       "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
+    );
+  }
+  return true;
+}
+
+function validatePreMigrationPreviousCapability(capability) {
+  if (capability === null) return false;
+  if (!VERIFIED_PRE_MIGRATION_CAPABILITIES.has(capability)) {
+    fail(
+      "Pre-migration helper compatibility requires a verified previous-artifact capability",
+      "MACOS_KEYCHAIN_MIGRATION_COMPATIBILITY_INVALID",
     );
   }
   return true;
@@ -786,10 +825,29 @@ async function verifyMacOSBuildPayload(
   appPath,
   manifest,
   legacyDogfoodPreviousCapability = null,
+  preMigrationPreviousCapability = null,
+  legacyStablePrevious = false,
 ) {
   const legacyDogfoodPrevious = validateLegacyDogfoodPreviousCapability(
     legacyDogfoodPreviousCapability,
   );
+  const preMigrationPrevious = validatePreMigrationPreviousCapability(
+    preMigrationPreviousCapability,
+  );
+  const helperRequired = !legacyDogfoodPrevious
+    && !preMigrationPrevious && !legacyStablePrevious;
+  if (helperRequired) {
+    assertMacOSKeychainMigrationManifest(manifest);
+  } else if (manifest.runtime?.keychainMigrationHelper !== undefined
+      || manifest.inputs?.keychainMigrationHelperSources !== undefined
+      || (Array.isArray(manifest.payload?.files)
+        && manifest.payload.files.some((entry) =>
+          entry?.path === MACOS_KEYCHAIN_MIGRATION_HELPER.executable))) {
+    fail(
+      "Pre-migration previous artifact unexpectedly includes migration-helper state",
+      "MACOS_KEYCHAIN_MIGRATION_COMPATIBILITY_INVALID",
+    );
+  }
   const payload = manifest.payload;
   const updaterEnabled = manifest.release?.updater?.enabled === true;
   if (!payload
@@ -840,12 +898,14 @@ async function verifyMacOSBuildPayload(
     }
     expected.set(entry.path, entry);
   }
+  const selectedBaseMachOPaths = BASE_NORMALIZED_MACH_O_PATHS.filter((path) =>
+    helperRequired || path !== MACOS_KEYCHAIN_MIGRATION_HELPER.executable);
   const requiredMachOPaths = updaterEnabled
     ? [
-      ...BASE_NORMALIZED_MACH_O_PATHS,
+      ...selectedBaseMachOPaths,
       ...SPARKLE_NORMALIZED_MACH_O_PATHS,
     ]
-    : BASE_NORMALIZED_MACH_O_PATHS;
+    : selectedBaseMachOPaths;
   for (const required of [
     ...requiredMachOPaths,
     ...(legacyDogfoodPrevious
@@ -1155,14 +1215,18 @@ async function validateUpdaterBoundary(appPath, plist, manifest, {
 export async function inspectMacOSApp(appPath, {
   allowLegacyUnsealedSource = false,
   [VERIFIED_LEGACY_DOGFOOD_PREVIOUS_ARTIFACT]: legacyDogfoodPreviousCapability = null,
+  [VERIFIED_PRE_MIGRATION_PREVIOUS_ARTIFACT]: preMigrationPreviousCapability = null,
   channel = "stable",
   requireExternalDistribution = false,
 } = {}) {
   const legacyDogfoodPrevious = validateLegacyDogfoodPreviousCapability(
     legacyDogfoodPreviousCapability,
   );
+  const preMigrationPrevious = validatePreMigrationPreviousCapability(
+    preMigrationPreviousCapability,
+  );
   if (typeof allowLegacyUnsealedSource !== "boolean"
-      || ((allowLegacyUnsealedSource || legacyDogfoodPrevious)
+      || ((allowLegacyUnsealedSource || legacyDogfoodPrevious || preMigrationPrevious)
         && !requireExternalDistribution)) {
     fail(
       "Legacy unsealed source compatibility requires external artifact validation",
@@ -1189,7 +1253,35 @@ export async function inspectMacOSApp(appPath, {
       || manifest.application?.bundleIdentifier !== BUNDLE_IDENTIFIER) {
     fail("Application build manifest has an unexpected identity");
   }
-  await verifyMacOSBuildPayload(selected, manifest, legacyDogfoodPreviousCapability);
+  const exactLegacyStablePrevious = allowLegacyUnsealedSource
+    && channel === STABLE_RELEASE_CHANNEL
+    && manifest.application?.bundleVersion === LEGACY_STABLE_MACOS_BUNDLE_VERSION
+    && manifest.application?.shortVersion === LEGACY_STABLE_MACOS_BUNDLE_VERSION
+    && manifest.release?.source === undefined;
+  if (preMigrationPrevious
+      && (channel !== INTERNAL_DOGFOOD_RELEASE_CHANNEL
+        || manifest.application?.bundleVersion !== PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.bundleVersion
+        || manifest.application?.shortVersion !== PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.shortVersion
+        || manifest.release?.source?.commit !== PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.sourceCommit
+        || manifest.release?.source?.tag !== PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.sourceTag
+        || manifest.inputs?.sourceSha256 !== PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.sourceSha256
+        || manifest.payload?.payloadSha256 !== PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.payloadSha256
+        || manifest.release?.updater?.publicEdKeySha256
+          !== PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.publicEdKeySha256
+        || manifest.release?.updater?.frameworkSha256
+          !== PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.frameworkSha256)) {
+    fail(
+      "Pre-migration helper compatibility does not match the exact previous build",
+      "MACOS_KEYCHAIN_MIGRATION_COMPATIBILITY_INVALID",
+    );
+  }
+  await verifyMacOSBuildPayload(
+    selected,
+    manifest,
+    legacyDogfoodPreviousCapability,
+    preMigrationPreviousCapability,
+    exactLegacyStablePrevious,
+  );
   const plistPath = join(selected, "Contents", "Info.plist");
   await regularPath(plistPath);
   const plist = parsePlist(plistPath);
@@ -1206,6 +1298,9 @@ export async function inspectMacOSApp(appPath, {
   for (const relativePath of [
     APP_EXECUTABLE,
     NODE_EXECUTABLE,
+    ...(!legacyDogfoodPrevious && !preMigrationPrevious && !exactLegacyStablePrevious
+      ? [MACOS_KEYCHAIN_MIGRATION_HELPER.executable]
+      : []),
   ]) {
     await regularPath(join(selected, ...relativePath.split("/")));
   }
@@ -1559,6 +1654,7 @@ function validateSignedReleaseChannel(manifest, label) {
 function validateSignedReleaseManifest(manifest, label, {
   allowLegacyStableMigrationSource = false,
   allowLegacyDogfoodPreviousSource = false,
+  allowPreMigrationDogfoodPreviousSource = false,
 } = {}) {
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)
       || manifest.schemaVersion !== RELEASE_MANIFEST_SCHEMA
@@ -1605,6 +1701,14 @@ function validateSignedReleaseManifest(manifest, label, {
     fail(
       "The historical dogfood artifact is allowed only as its exact previous release",
       "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
+    );
+  }
+  if (manifest.artifact.sha256 === PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.artifactSha256
+      && (!allowPreMigrationDogfoodPreviousSource
+        || !isExactPreMigrationDogfoodPreviousRelease(manifest))) {
+    fail(
+      "The pre-migration dogfood artifact is allowed only as its exact previous release",
+      "MACOS_KEYCHAIN_MIGRATION_COMPATIBILITY_INVALID",
     );
   }
   const bundleVersion = manifest.application.bundleVersion;
@@ -1661,6 +1765,26 @@ function isExactLegacyDogfoodPreviousRelease(manifest) {
     && manifest.updater?.appcastURL === manifest.channel.sparkle.appcastURL
     && manifest.updater?.publicEdKeySha256 === legacy.publicEdKeySha256
     && manifest.updater?.frameworkSha256 === legacy.frameworkSha256
+    && manifest.updater?.verifyBeforeExtraction === true;
+}
+
+function isExactPreMigrationDogfoodPreviousRelease(manifest) {
+  const previous = PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE;
+  return manifest?.channel?.name === INTERNAL_DOGFOOD_RELEASE_CHANNEL
+    && manifest.application?.bundleIdentifier === BUNDLE_IDENTIFIER
+    && manifest.application?.bundleVersion === previous.bundleVersion
+    && manifest.application?.shortVersion === previous.shortVersion
+    && manifest.artifact?.sha256 === previous.artifactSha256
+    && manifest.artifact?.bytes === previous.artifactBytes
+    && manifest.artifact?.fileName === previous.artifactFileName
+    && manifest.source?.repository === PUBLIC_RELEASE_SOURCE_REPOSITORY
+    && manifest.source?.commit === previous.sourceCommit
+    && manifest.source?.tag === previous.sourceTag
+    && manifest.build?.sourceSha256 === previous.sourceSha256
+    && manifest.build?.payloadSha256 === previous.payloadSha256
+    && manifest.updater?.appcastURL === manifest.channel.sparkle.appcastURL
+    && manifest.updater?.publicEdKeySha256 === previous.publicEdKeySha256
+    && manifest.updater?.frameworkSha256 === previous.frameworkSha256
     && manifest.updater?.verifyBeforeExtraction === true;
 }
 
@@ -1854,6 +1978,7 @@ export function validateMacOSSignedReplacementPair({
     {
       allowLegacyStableMigrationSource: true,
       allowLegacyDogfoodPreviousSource: true,
+      allowPreMigrationDogfoodPreviousSource: true,
     },
   );
   const candidate = validateSignedReleaseManifest(
@@ -1920,6 +2045,7 @@ async function readReplacementReleaseArtifact(
   {
     allowLegacyStableMigrationSource = false,
     allowLegacyDogfoodPreviousSource = false,
+    allowPreMigrationDogfoodPreviousSource = false,
   } = {},
 ) {
   const selectedManifest = resolve(manifestPath);
@@ -1936,6 +2062,7 @@ async function readReplacementReleaseArtifact(
   validateSignedReleaseManifest(manifest, label, {
     allowLegacyStableMigrationSource,
     allowLegacyDogfoodPreviousSource,
+    allowPreMigrationDogfoodPreviousSource,
   });
   const artifact = join(dirname(selectedManifest), manifest.artifact.fileName);
   const metadata = await regularPath(artifact);
@@ -2017,6 +2144,7 @@ export async function validateMacOSSignedReplacementArtifacts({
     {
       allowLegacyStableMigrationSource: true,
       allowLegacyDogfoodPreviousSource: true,
+      allowPreMigrationDogfoodPreviousSource: true,
     },
   );
   const candidate = await readReplacementReleaseArtifact(
@@ -2039,11 +2167,20 @@ export async function validateMacOSSignedReplacementArtifacts({
   if (previousArtifactCapability !== null) {
     VERIFIED_LEGACY_DOGFOOD_CAPABILITIES.add(previousArtifactCapability);
   }
+  const preMigrationPreviousCapability = isExactPreMigrationDogfoodPreviousRelease(
+    previous.manifest,
+  ) ? Object.freeze({}) : null;
+  if (preMigrationPreviousCapability !== null) {
+    VERIFIED_PRE_MIGRATION_CAPABILITIES.add(preMigrationPreviousCapability);
+  }
   try {
     await validateArtifact(previous.artifact, {
       allowLegacyUnsealedSource: previousIsExactLegacyStable,
       ...(previousArtifactCapability !== null ? {
         [VERIFIED_LEGACY_DOGFOOD_PREVIOUS_ARTIFACT]: previousArtifactCapability,
+      } : {}),
+      ...(preMigrationPreviousCapability !== null ? {
+        [VERIFIED_PRE_MIGRATION_PREVIOUS_ARTIFACT]: preMigrationPreviousCapability,
       } : {}),
       channel: previous.manifest.channel.name,
       production: true,
@@ -2053,6 +2190,9 @@ export async function validateMacOSSignedReplacementArtifacts({
     // the previous-side await settles (including a failed native validation).
     if (previousArtifactCapability !== null) {
       VERIFIED_LEGACY_DOGFOOD_CAPABILITIES.delete(previousArtifactCapability);
+    }
+    if (preMigrationPreviousCapability !== null) {
+      VERIFIED_PRE_MIGRATION_CAPABILITIES.delete(preMigrationPreviousCapability);
     }
   }
   await validateArtifact(candidate.artifact, {
@@ -2077,6 +2217,140 @@ function releaseEnvironment() {
   };
   if (process.env.TMPDIR) environment.TMPDIR = process.env.TMPDIR;
   return environment;
+}
+
+function keychainMigrationSignatureFailure() {
+  fail(
+    "Keychain migration helper does not preserve the approved legacy reader signing boundary",
+    "MACOS_KEYCHAIN_MIGRATION_SIGNATURE_INVALID",
+  );
+}
+
+function normalizedDesignatedRequirement(value) {
+  return value.replace(/\/\*\s*exists\s*\*\//gu, "")
+    .replace(/\s+/gu, " ").trim()
+    // codesign renders this simple identifier without quotes on some versions.
+    // Canonicalize only the reviewed leading Node token, not arbitrary clauses.
+    .replace(/^identifier node(?= and )/u, 'identifier "node"');
+}
+
+function keychainMigrationCodeDescription(description, identifier) {
+  if (typeof description !== "string" || description.length > 128 * 1024) {
+    keychainMigrationSignatureFailure();
+  }
+  const identifiers = [...description.matchAll(/^Identifier=([^\r\n]+)$/gmu)];
+  const requirements = [...description.matchAll(/^designated => ([^\r\n]+)$/gmu)];
+  if (identifiers.length !== 1 || identifiers[0][1] !== identifier
+      || requirements.length !== 1
+      || !/flags=0x[0-9a-f]+\(runtime\)/iu.test(description)) {
+    keychainMigrationSignatureFailure();
+  }
+  let trust;
+  try {
+    trust = parseMacOSDeveloperIDNativeTrust(description);
+  } catch {
+    keychainMigrationSignatureFailure();
+  }
+  return {
+    ...trust,
+    requirement: normalizedDesignatedRequirement(requirements[0][1]),
+    rawRequirement: requirements[0][1],
+  };
+}
+
+/**
+ * Validate the exact default Developer ID requirement used by the legacy Node
+ * reader, not merely membership in its Team. Inputs are captured code-sign
+ * metadata only; the result never exposes identities or requirements.
+ */
+export function validateMacOSKeychainMigrationSignatureDescriptions({
+  application,
+  node,
+  helper,
+  helperEntitlements,
+} = {}) {
+  const appDescription = keychainMigrationCodeDescription(application, BUNDLE_IDENTIFIER);
+  const nodeDescription = keychainMigrationCodeDescription(node, "node");
+  const helperDescription = keychainMigrationCodeDescription(
+    helper,
+    MACOS_KEYCHAIN_MIGRATION_HELPER.signingIdentifier,
+  );
+  const expectedRequirement = `identifier "node" and anchor apple generic `
+    + "and certificate 1[field.1.2.840.113635.100.6.2.6] "
+    + "and certificate leaf[field.1.2.840.113635.100.6.1.13] "
+    + `and certificate leaf[subject.OU] = "${appDescription.teamIdentifier}"`;
+  const emptyEntitlements = typeof helperEntitlements?.stdout === "string"
+    && helperEntitlements.stdout.length <= 128 * 1024
+    && (helperEntitlements.stdout.trim() === ""
+      || /^\s*(?:<\?xml[^?]*\?>\s*)?(?:<!DOCTYPE plist[^>]*>\s*)?<plist version="1\.0">\s*(?:<dict\s*\/>|<dict>\s*<\/dict>)\s*<\/plist>\s*$/u
+        .test(helperEntitlements.stdout));
+  if (nodeDescription.teamIdentifier !== appDescription.teamIdentifier
+      || helperDescription.teamIdentifier !== appDescription.teamIdentifier
+      || nodeDescription.developerIdAuthority !== appDescription.developerIdAuthority
+      || helperDescription.developerIdAuthority !== appDescription.developerIdAuthority
+      || nodeDescription.requirement !== expectedRequirement
+      || helperDescription.requirement !== nodeDescription.requirement
+      || !emptyEntitlements
+      || typeof helperEntitlements?.stderr !== "string"
+      || helperEntitlements.stderr.length > 128 * 1024
+      || /^\s*(?:warning|error):/imu.test(helperEntitlements.stderr)) {
+    keychainMigrationSignatureFailure();
+  }
+  return Object.freeze({
+    legacyNodeDesignatedRequirementMatched: true,
+    sameDeveloperIDTeam: true,
+    helperHardenedRuntime: true,
+    helperEntitlementsAbsent: true,
+  });
+}
+
+export function verifyMacOSKeychainMigrationSignatures(appPath, {
+  commandRunner = runMacOSReleaseCommand,
+  secrets = [],
+} = {}) {
+  const selected = resolve(appPath);
+  const inspect = (relativePath) => {
+    const result = commandRunner("/usr/bin/codesign", [
+      "-d", "-r-", "--verbose=4", join(selected, ...relativePath.split("/")),
+    ], {
+      env: releaseEnvironment(),
+      failureMessage: "Keychain migration signing metadata is unavailable",
+      secrets,
+    });
+    return `${result.stdout}${result.stderr}`;
+  };
+  // A code-sign diagnostic can contain an identity or requirement even when
+  // codesign fails. Keep this boundary's errors content-free in every case.
+  try {
+    const application = inspect(APP_EXECUTABLE);
+    const node = inspect(NODE_EXECUTABLE);
+    const helper = inspect(MACOS_KEYCHAIN_MIGRATION_HELPER.executable);
+    const helperPath = join(selected, ...MACOS_KEYCHAIN_MIGRATION_HELPER.executable.split("/"));
+    const helperEntitlements = commandRunner("/usr/bin/codesign", [
+      "--display", "--entitlements", "-", "--xml", helperPath,
+    ], {
+      env: releaseEnvironment(),
+      failureMessage: "Keychain migration helper entitlement inspection failed",
+      secrets,
+    });
+    const result = validateMacOSKeychainMigrationSignatureDescriptions({
+      application, node, helper, helperEntitlements,
+    });
+    const requirement = keychainMigrationCodeDescription(node, "node").rawRequirement;
+    for (const relativePath of [NODE_EXECUTABLE, MACOS_KEYCHAIN_MIGRATION_HELPER.executable]) {
+      commandRunner("/usr/bin/codesign", [
+        "--verify", "--strict", `-R=${requirement}`,
+        join(selected, ...relativePath.split("/")),
+      ], {
+        env: releaseEnvironment(),
+        failureMessage: "Keychain migration reader requirement verification failed",
+        secrets: [...secrets, requirement],
+      });
+    }
+    return result;
+  } catch {
+    keychainMigrationSignatureFailure();
+  }
 }
 
 export async function developerIDSignMacOSApp(appPath, {
@@ -2122,6 +2396,7 @@ export async function developerIDSignMacOSApp(appPath, {
   const sign = (relativePath, {
     entitlements = null,
     preserveEntitlements = false,
+    identifier = null,
   } = {}) => {
     const arguments_ = [
       "--force",
@@ -2133,6 +2408,9 @@ export async function developerIDSignMacOSApp(appPath, {
     ];
     if (entitlements) {
       arguments_.push("--entitlements", entitlements);
+    }
+    if (identifier !== null) {
+      arguments_.push("--identifier", identifier);
     }
     if (preserveEntitlements) {
       arguments_.push("--preserve-metadata=entitlements");
@@ -2153,6 +2431,12 @@ export async function developerIDSignMacOSApp(appPath, {
   sign(SPARKLE_FRAMEWORK_PREFIX);
   await validateNodeRuntimeEntitlements();
   sign(NODE_EXECUTABLE, { entitlements: NODE_ENTITLEMENTS });
+  // Preserve the legacy Node reader's exact designated identity, but none of
+  // Node's JIT exceptions. The native helper accepts only authenticated local
+  // migration requests; it is not a general Node/keytar credential backend.
+  sign(MACOS_KEYCHAIN_MIGRATION_HELPER.executable, {
+    identifier: MACOS_KEYCHAIN_MIGRATION_HELPER.signingIdentifier,
+  });
   // The app bundle carries no entitlements of its own. Sign in with Apple is
   // a restricted entitlement that a Developer ID provisioning profile does
   // not grant (verified 2026-08-01 against two freshly generated profiles for
@@ -2186,6 +2470,10 @@ export async function developerIDSignMacOSApp(appPath, {
       || !/flags=0x[0-9a-f]+\(runtime\)/iu.test(signature)) {
     fail("Signed application is missing Developer ID hardened runtime");
   }
+  verifyMacOSKeychainMigrationSignatures(inspected.appPath, {
+    commandRunner,
+    secrets,
+  });
   return inspected;
 }
 
@@ -2627,6 +2915,7 @@ function parseMacOSDeveloperIDNativeTrust(signature) {
 export async function validateInstalledMacOSApp(appPath, {
   allowLegacyUnsealedSource = false,
   [VERIFIED_LEGACY_DOGFOOD_PREVIOUS_ARTIFACT]: legacyDogfoodPreviousCapability = null,
+  [VERIFIED_PRE_MIGRATION_PREVIOUS_ARTIFACT]: preMigrationPreviousCapability = null,
   channel = "stable",
   expectedBundleIdentifier = null,
   expectedBundleVersion = null,
@@ -2634,9 +2923,11 @@ export async function validateInstalledMacOSApp(appPath, {
   production = true,
 } = {}) {
   validateLegacyDogfoodPreviousCapability(legacyDogfoodPreviousCapability);
+  validatePreMigrationPreviousCapability(preMigrationPreviousCapability);
   const inspected = await inspectMacOSApp(appPath, {
     allowLegacyUnsealedSource,
     [VERIFIED_LEGACY_DOGFOOD_PREVIOUS_ARTIFACT]: legacyDogfoodPreviousCapability,
+    [VERIFIED_PRE_MIGRATION_PREVIOUS_ARTIFACT]: preMigrationPreviousCapability,
     channel,
     requireExternalDistribution: production,
   });
@@ -2674,6 +2965,9 @@ export async function validateInstalledMacOSApp(appPath, {
       fail("Installed application is not Developer ID hardened");
     }
     nativeTrust = parseMacOSDeveloperIDNativeTrust(signature);
+    if (inspected.buildManifest.runtime?.keychainMigrationHelper !== undefined) {
+      verifyMacOSKeychainMigrationSignatures(inspected.appPath);
+    }
     runMacOSReleaseCommand("/usr/bin/xcrun", [
       "stapler",
       "validate",
@@ -2749,6 +3043,7 @@ export async function validateInstalledMacOSApp(appPath, {
 export async function validateMacOSDMG(path, {
   allowLegacyUnsealedSource = false,
   [VERIFIED_LEGACY_DOGFOOD_PREVIOUS_ARTIFACT]: legacyDogfoodPreviousCapability = null,
+  [VERIFIED_PRE_MIGRATION_PREVIOUS_ARTIFACT]: preMigrationPreviousCapability = null,
   channel = "stable",
   distribution = null,
   expectedBundleIdentifier = null,
@@ -2758,6 +3053,9 @@ export async function validateMacOSDMG(path, {
 } = {}) {
   const legacyDogfoodPrevious = validateLegacyDogfoodPreviousCapability(
     legacyDogfoodPreviousCapability,
+  );
+  const preMigrationPrevious = validatePreMigrationPreviousCapability(
+    preMigrationPreviousCapability,
   );
   const selectedDistribution = distribution ?? (
     production ? DMG_DISTRIBUTIONS.release : DMG_DISTRIBUTIONS.development
@@ -2785,6 +3083,16 @@ export async function validateMacOSDMG(path, {
     fail(
       "Legacy dogfood source compatibility requires the exact previous DMG bytes",
       "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
+    );
+  }
+  if (preMigrationPrevious
+      && (!production || channel !== INTERNAL_DOGFOOD_RELEASE_CHANNEL
+        || metadata.size !== PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.artifactBytes
+        || await sha256File(selected)
+          !== PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.artifactSha256)) {
+    fail(
+      "Pre-migration helper compatibility requires the exact previous DMG bytes",
+      "MACOS_KEYCHAIN_MIGRATION_COMPATIBILITY_INVALID",
     );
   }
   runMacOSReleaseCommand("/usr/bin/hdiutil", ["verify", selected], {
@@ -2863,6 +3171,7 @@ export async function validateMacOSDMG(path, {
     return await validateInstalledMacOSApp(installedApp, {
       allowLegacyUnsealedSource,
       [VERIFIED_LEGACY_DOGFOOD_PREVIOUS_ARTIFACT]: legacyDogfoodPreviousCapability,
+      [VERIFIED_PRE_MIGRATION_PREVIOUS_ARTIFACT]: preMigrationPreviousCapability,
       channel,
       expectedBundleIdentifier,
       expectedBundleVersion,

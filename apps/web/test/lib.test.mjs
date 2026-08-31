@@ -6686,15 +6686,20 @@ test("stale local device conflicts name the leftover credential and offer the re
   assert.match(recoverySource, /action\.href = SEMANTIC_OPEN_TARGET/u);
   assert.match(
     appSource,
-    /error\?\.code === "contribution_device_recovery_required"\s*\n\s*\|\| error\?\.code === "contribution_device_credential_conflict"\s*\n\s*\|\| error\?\.code === "contribution_device_keychain_access_denied"/u,
+    /error\?\.code === "contribution_device_recovery_required"\s*\n\s*\|\| error\?\.code === "contribution_device_credential_conflict";/u,
   );
-  // A denied macOS access dialog reaches the same reset ceremony with its own
-  // sentence (2026-08-19): it names the dialog and the answer — Always Allow
-  // on the next approval — instead of the leftover-credential story.
+  // Denial does not establish an unusable credential and never belongs to
+  // this explicitly confirmed reset ceremony.
   assert.match(
     appSource,
-    /contribution_device_keychain_access_denied:\n\s*"macOS did not let TiboTattle read the upload credential/u,
+    /contribution_device_keychain_access_denied:\n\s*"Uploads are paused because TiboTattle could not access this Mac's upload credential/u,
   );
+  const reset = appSource.match(/async function resetContributionDeviceCredential\([\s\S]*?\n\}/u)?.[0];
+  assert.ok(reset);
+  assert.match(reset, /if \(!window\.confirm\(DEVICE_CREDENTIAL_RESET_CONFIRMATION\)\) return;/u);
+  const confirmationPosition = reset.indexOf("window.confirm(DEVICE_CREDENTIAL_RESET_CONFIRMATION)");
+  const mutationPosition = reset.indexOf("localClient.resetContributionDeviceCredential()");
+  assert.ok(confirmationPosition >= 0 && mutationPosition > confirmationPosition);
   assert.equal(
     (appSource.match(/id = "reset-device-credential"/gu) ?? []).length,
     1,
@@ -6706,8 +6711,8 @@ test("a locked login keychain reads as a paused upload, never as a broken creden
   // fine. What is not fine is telling the user their credential is leftover
   // from an earlier install and handing them a destructive clear — the wrong
   // diagnosis, whose suggested cure forces a needless re-pair for something
-  // their login password fixes. So `locked` leaves the recovery family at the
-  // route and gets its own surface here.
+  // an intact, temporarily unavailable credential. So `locked` leaves the
+  // recovery family at the route and gets its own surface here.
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const lockedMatch = appSource.match(
     /async function renderContributionDeviceKeychainLocked\(status, \{ error \} = \{\}\) \{([\s\S]*?)\n\}\n/u,
@@ -6777,12 +6782,16 @@ test("a locked login keychain reads as a paused upload, never as a broken creden
 
 test("a declined legacy Keychain migration preserves the credential and never offers reset", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  assert.match(
-    appSource,
-    /contribution_device_keychain_migration_required:\n\s*"TiboTattle left this Mac's older upload credential untouched/u,
-  );
-  assert.match(appSource, /Quit and reopen TiboTattle/u);
-  assert.match(appSource, /Do not reset or delete the credential/u);
+  const copy = appSource.match(
+    /contribution_device_keychain_migration_required:\n\s*"([^"]+)"/u,
+  )?.[1];
+  assert.ok(copy, "migration-required recovery copy is present");
+  assert.match(copy, /existing upload credential and local history are unchanged/u);
+  assert.match(copy, /Settings… → General/u);
+  assert.match(copy, /Review migration… under Secure upgrade/u);
+  assert.match(copy, /Nothing was uploaded/u);
+  assert.match(copy, /Do not reset or delete the credential/u);
+  assert.doesNotMatch(copy, /Quit and reopen|when macOS asks|approve again/u);
   const recoveryClassifier = appSource.match(
     /function contributionDeviceRecoveryIsRequired\(error\) \{([\s\S]*?)\n\}\n/u,
   )?.[1] ?? "";
@@ -6790,6 +6799,163 @@ test("a declined legacy Keychain migration preserves the credential and never of
     recoveryClassifier,
     /contribution_device_keychain_migration_required/u,
   );
+});
+
+test("only fixed Keychain recovery is translated before diagnostics", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const allowlist = appSource.match(
+    /const LOCALIZED_KEYCHAIN_RECOVERY_CODES = new Set\(\[([\s\S]*?)\]\);/u,
+  )?.[1] ?? "";
+  assert.deepEqual(
+    [...allowlist.matchAll(/"([^"]+)"/gu)].map(([, code]) => code),
+    [
+      "identity_migration_required",
+      "contribution_device_keychain_migration_required",
+      "contribution_device_keychain_access_denied",
+    ],
+  );
+  const localized = appSource.match(
+    /function localizedKeychainRecoveryExplanation\(explanation, code\) \{([\s\S]*?)\n\}/u,
+  )?.[1] ?? "";
+  assert.match(localized, /LOCALIZED_KEYCHAIN_RECOVERY_CODES\.has\(code\)/u);
+  assert.match(localized, /localization\.translateText\(explanation\)/u);
+  assert.doesNotMatch(localized, /error|reference|requestId|fallback/u);
+  const describe = appSource.match(
+    /async function describeFailure\([\s\S]*?\n\}/u,
+  )?.[0] ?? "";
+  assert.match(
+    describe,
+    /const fixedExplanation = fixedCopy\(messages, code\)[\s\S]*?localizedKeychainRecoveryExplanation\(\s*fixedExplanation,\s*code,[\s\S]*?diagnosticReferenceSentence/u,
+  );
+  assert.match(describe, /localizedKeychainRecoveryExplanation\(\s*fixedExplanation,\s*code,\s*\) \?\? fallback;/u);
+  assert.doesNotMatch(describe, /localization\.translateText\(error|translateText\(fallback/u);
+
+  const fixedCopySource = appSource.match(/function fixedCopy\([\s\S]*?\n\}/u)?.[0];
+  const localizedSource = appSource.match(/function localizedKeychainRecoveryExplanation\([\s\S]*?\n\}/u)?.[0];
+  assert.ok(fixedCopySource);
+  assert.ok(localizedSource);
+  const translationInputs = [];
+  const recordedNotes = [];
+  const identityCopy = appSource.match(/identity_migration_required:\n\s*"([^"]+)"/u)?.[1];
+  const credentialCopy = appSource.match(/contribution_device_keychain_migration_required:\n\s*"([^"]+)"/u)?.[1];
+  const deniedCopy = appSource.match(/contribution_device_keychain_access_denied:\n\s*"([^"]+)"/u)?.[1];
+  assert.ok(identityCopy);
+  assert.ok(credentialCopy);
+  assert.ok(deniedCopy);
+  const describeFixture = new Function("dependencies", `
+    const {
+      localization, localClient, createDiagnosticReference, diagnosticErrorCode,
+      serviceRequestId, diagnosticSurface, diagnosticReferenceSentence,
+      SERVICE_ERROR_COPY, LOCAL_COMPANION_ERROR_COPY,
+    } = dependencies;
+    const LOCALIZED_KEYCHAIN_RECOVERY_CODES = new Set([${allowlist}]);
+    ${fixedCopySource}
+    ${localizedSource}
+    ${describe}
+    return describeFailure;
+  `)({
+    localization: {
+      translateText(text) {
+        translationInputs.push(text);
+        return translateLegacyText(text, "es");
+      },
+    },
+    localClient: {
+      async recordDiagnosticNote(note) {
+        recordedNotes.push(note);
+        return { status: "recorded", reference: note.reference };
+      },
+    },
+    createDiagnosticReference: () => "TT-ABC123",
+    diagnosticErrorCode,
+    serviceRequestId,
+    diagnosticSurface,
+    diagnosticReferenceSentence,
+    SERVICE_ERROR_COPY: {},
+    LOCAL_COMPANION_ERROR_COPY: {
+      contribution_device_keychain_migration_required: credentialCopy,
+      contribution_device_keychain_access_denied: deniedCopy,
+      contribution_device_keychain_locked: "Fixed locked-keychain explanation.",
+    },
+  });
+  const reference = "TT-ABC123";
+  const requestId = "11111111-1111-4111-8111-111111111111";
+  const trailer = diagnosticReferenceSentence({ reference, requestId, writtenToLocalLog: true });
+  for (const [code, copy, messages] of [
+    ["identity_migration_required", identityCopy, { identity_migration_required: identityCopy }],
+    ["contribution_device_keychain_migration_required", credentialCopy, {}],
+    ["contribution_device_keychain_access_denied", deniedCopy, {}],
+  ]) {
+    const result = await describeFixture({
+      surface: DIAGNOSTIC_SURFACES[0],
+      error: { code, requestId, message: "Untrusted raw server message" },
+      messages,
+      fallback: "Untranslated fallback.",
+    });
+    assert.equal(result.text, `${translateLegacyText(copy, "es")} ${trailer}`);
+    assert.equal(result.reference, reference);
+    assert.equal(result.requestId, requestId);
+    assert.equal(result.localNote, "recorded");
+    assert.doesNotMatch(result.text, /Untrusted raw server message|Untranslated fallback/u);
+  }
+  assert.deepEqual(translationInputs, [identityCopy, credentialCopy, deniedCopy]);
+  for (const [code, expected] of [
+    ["contribution_device_keychain_locked", "Fixed locked-keychain explanation."],
+    ["unrecognized_code", "Untranslated fallback."],
+    ["constructor", "Untranslated fallback."],
+    ["identity_migration_required", "Untranslated fallback."],
+  ]) {
+    const result = await describeFixture({
+      surface: DIAGNOSTIC_SURFACES[0],
+      error: { code, requestId, message: "Untrusted raw server message" },
+      fallback: "Untranslated fallback.",
+    });
+    assert.equal(result.text, `${expected} ${trailer}`);
+  }
+  assert.deepEqual(translationInputs, [identityCopy, credentialCopy, deniedCopy], "unrelated errors, fallback, raw errors and diagnostic identifiers never enter translation");
+  assert.equal(recordedNotes.length, 7, "every failure still records its existing diagnostics note");
+});
+
+test("pairing progress stays neutral across every Keychain surface and locale", async () => {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const steps = appSource.match(/const CONTRIBUTION_CONNECT_STEPS = Object\.freeze\(\{[\s\S]*?\n\}\);/u)?.[0];
+  const runner = appSource.match(/async function contributionConnectStep\([\s\S]*?\n\}/u)?.[0];
+  const classifier = appSource.match(/function keychainPromptSurface\([\s\S]*?\n\}/u)?.[0];
+  assert.ok(steps);
+  assert.ok(runner);
+  assert.ok(classifier);
+  for (const locale of SUPPORTED_LOCALES) {
+    for (const projection of [undefined, null, {}, { keychainPrompt: "pairing" },
+      { keychainPrompt: "migration" }, { keychainPrompt: "none" }, { keychainPrompt: "unknown" }]) {
+      const scope = new Function("incrementalSyncStatus", "setProductText", `
+        ${steps}
+        ${runner}
+        ${classifier}
+        return { contributionConnectStep, keychainPromptSurface };
+      `)(projection, (target, text) => { target.textContent = translateLegacyText(text, locale); });
+      assert.equal(scope.keychainPromptSurface(),
+        ["migration", "none"].includes(projection?.keychainPrompt) ? projection.keychainPrompt : "pairing");
+      const status = { hidden: true, className: "participant-action-status error", textContent: "" };
+      const expected = translateLegacyText("Connecting this Mac as an upload-only device…", locale);
+      let ran = false;
+      const result = await scope.contributionConnectStep("device_pairing", status, async () => {
+        ran = true;
+        assert.equal(status.hidden, false);
+        assert.equal(status.className, "participant-action-status");
+        assert.equal(status.textContent, expected, "neutral copy is visible before pairing runs");
+        return "paired";
+      });
+      assert.equal(ran, true);
+      assert.equal(result, "paired");
+      const failure = Object.assign(new Error("Synthetic denied access"), {
+        code: "contribution_device_keychain_access_denied",
+      });
+      await assert.rejects(scope.contributionConnectStep("device_pairing", status, async () => {
+        throw failure;
+      }), (error) => error === failure && error.contributionStep === "device_pairing");
+      assert.equal(status.textContent, expected, "failure tagging does not introduce prompt advice");
+    }
+  }
 });
 
 test("the approve card shows one verified review instance before one explicit approval", async () => {
@@ -6836,13 +7002,10 @@ test("the approve card shows one verified review instance before one explicit ap
   );
   assert.match(html, /See what the community published/u);
   assert.doesNotMatch(appSource, /loadCommunityResults\(\).*renderSharedCommunitySnapshot/su);
-  // The card prepares the reader for the macOS keychain dialog BEFORE the
-  // click that triggers it (2026-08-19, first pairing on a fresh Mac): the
-  // connect step stores the upload credential in the login keychain, and the
-  // OS dialog itself explains nothing.
+  // The card describes storage without preparing or authorizing an OS dialog.
   assert.match(
     html,
-    /Connecting stores this Mac's upload credential in your login\s+keychain\. If macOS asks for permission, choose Always Allow so\s+background uploads keep working\./u,
+    /Connecting stores this Mac's upload credential in your login\s+keychain\. Local reporting and history are unchanged\./u,
   );
 });
 
@@ -8013,7 +8176,11 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
   assert.ok(describe, "the failure describer is available");
   assert.match(
     describe,
-    /const explanation = fixedCopy\(messages, code\)\s*\n\s*\?\? fixedCopy\(SERVICE_ERROR_COPY, code\)\s*\n\s*\?\? fixedCopy\(LOCAL_COMPANION_ERROR_COPY, code\)\s*\n\s*\?\? fallback;/u,
+    /const fixedExplanation = fixedCopy\(messages, code\)\s*\n\s*\?\? fixedCopy\(SERVICE_ERROR_COPY, code\)\s*\n\s*\?\? fixedCopy\(LOCAL_COMPANION_ERROR_COPY, code\);/u,
+  );
+  assert.match(
+    describe,
+    /const explanation = localizedKeychainRecoveryExplanation\(\s*fixedExplanation,\s*code,\s*\) \?\? fallback;/u,
   );
   // The reference is minted per failure and filed against a fixed surface.
   assert.match(describe, /const reference = createDiagnosticReference\(\);/u);
@@ -8064,37 +8231,19 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
   assert.match(connect, /contributionConnectStep\(\s*"service_check"/u);
   assert.match(connect, /contributionConnectStep\(\s*"hosted_enrollment"/u);
   assert.match(connect, /contributionConnectStep\(\s*"device_pairing"/u);
-  // The pairing step is the one that stores the upload credential in the
-  // login keychain, so its progress line — on screen before the macOS access
-  // dialog can appear (2026-08-19, first pairing on a fresh Mac) — must
-  // prepare the reader: what asks, that the requester is the bundled helper
-  // macOS lists as node, and that Always Allow keeps background uploads
-  // working instead of re-prompting every pass.
+  // Connection progress is the same neutral statement for every retained
+  // surface classification, including an unknown or missing broker.
   const pairingStep = appSource.match(
     /device_pairing: Object\.freeze\(\{([\s\S]*?)\}\),/u,
   )?.[1] ?? "";
-  assert.match(pairingStep, /macOS may ask for your login password/u);
-  assert.match(pairingStep, /which macOS lists as node/u);
-  assert.match(
-    pairingStep,
-    /Choose Always Allow so background uploads keep working/u,
-  );
-  // ...and only where a dialog is reachable. A brokered install mints inside
-  // the signed app, so the step must carry a second line that warns about
-  // nothing and never names a process the reader cannot see.
-  const brokeredProgress = pairingStep.match(
-    /brokeredProgress: "([^"]*)"/u,
-  )?.[1] ?? "";
-  assert.equal(brokeredProgress.length > 0, true);
-  assert.doesNotMatch(brokeredProgress, /node/u);
-  assert.doesNotMatch(brokeredProgress, /keychain|Keychain/u);
-  assert.doesNotMatch(brokeredProgress, /Always Allow/u);
+  assert.match(pairingStep, /progress: "Connecting this Mac as an upload-only device…"/u);
+  assert.doesNotMatch(pairingStep, /brokeredProgress|Always Allow|login password/u);
   assert.match(
     appSource,
-    /setProductText\(status, keychainPromptSurface\(\) === "pairing"\s*\n\s*\? step\.progress\s*\n\s*: step\.brokeredProgress \?\? step\.progress\);/u,
+    /setProductText\(status, step\.progress\);/u,
   );
   // The surface is only ever narrowed on a positive statement from the
-  // companion: anything else must keep today's guidance on screen.
+  // companion; the fallback is now neutral connection information.
   const promptSurface = appSource.match(
     /function keychainPromptSurface\(\) \{([\s\S]*?)\n\}/u,
   )?.[1] ?? "";
@@ -8119,10 +8268,16 @@ test("failure copy is chosen from fixed maps and never echoes a server string", 
   );
   assert.match(appSource, /INCREMENTAL_PREPARATION_ERROR_COPY = \{/u);
   assert.match(appSource, /identity_migration_required:/u);
-  assert.match(
-    appSource,
-    /identity_migration_required:[\s\S]{0,500}Quit and reopen TiboTattle[\s\S]{0,500}Do not reset, delete, or rotate the identity/u,
-  );
+  const identityMigrationCopy = appSource.match(
+    /identity_migration_required:\n\s*"([^"]+)"/u,
+  )?.[1];
+  assert.ok(identityMigrationCopy, "identity migration recovery remains explicit");
+  assert.match(identityMigrationCopy, /existing local identity and history are unchanged/u);
+  assert.match(identityMigrationCopy, /Settings… → General/u);
+  assert.match(identityMigrationCopy, /Review migration… under Secure upgrade/u);
+  assert.match(identityMigrationCopy, /No upload occurred/u);
+  assert.match(identityMigrationCopy, /Do not reset, delete, or rotate the identity/u);
+  assert.doesNotMatch(identityMigrationCopy, /Quit and reopen|when macOS asks/u);
   assert.match(appSource, /identity_unavailable:/u);
   assert.match(appSource, /coverage_unavailable:/u);
   for (const code of [
@@ -9321,7 +9476,7 @@ test("a session-rejected repair clears the dead session and renders one sign-in 
   // silent discard (owner-reported, 2026-08-10).
   assert.match(
     appSource,
-    /if \(contributionConnectStepOf\(error\) !== null\s*\n\s*&& contributionSessionWasRejected\(error\)\s*\n\s*&& !contributionSessionMintedWithinRaceWindow\(\)\) \{[\s\S]{0,900}?await renderContributionSessionSignInGate\(status, error\);\s*\n\s*\} else if \(contributionConnectStepOf\(error\) !== null\s*\n\s*\|\| contributionDeviceRecoveryIsRequired\(error\)\s*\n\s*\|\| contributionDeviceKeychainIsLocked\(error\)\) \{/u,
+    /if \(contributionConnectStepOf\(error\) !== null\s*\n\s*&& contributionSessionWasRejected\(error\)\s*\n\s*&& !contributionSessionMintedWithinRaceWindow\(\)\) \{[\s\S]{0,900}?await renderContributionSessionSignInGate\(status, error\);\s*\n\s*\} else if \(contributionConnectStepOf\(error\) !== null\s*\n\s*\|\| contributionDeviceRecoveryIsRequired\(error\)\s*\n\s*\|\| contributionDeviceKeychainIsLocked\(error\)\s*\n\s*\|\| contributionDeviceKeychainAccessIsDenied\(error\)\) \{/u,
   );
 
   // The gate clears every piece of the dead authority — the identity proof,
@@ -10133,6 +10288,7 @@ async function loadContributionCeremony(harness) {
   harness.sessions = [];
   harness.localCalls = [];
   harness.fetchCalls = [];
+  harness.createdNodes = [];
 
   const fakeFetch = async (url, options = {}) => {
     const headers = options.headers ?? {};
@@ -10157,12 +10313,13 @@ async function loadContributionCeremony(harness) {
   const localClient = {
     async pairContributionDevice(code) {
       harness.localCalls.push({ pairContributionDevice: code });
+      if (harness.pairingError) throw harness.pairingError;
       return { status: "paired", expiresAt: "2026-08-09T00:00:00.000Z" };
     },
   };
 
   return Function(
-    "harness", "$", "setProductText", "setLocalizedText",
+    "harness", "$", "setProductText", "setRawText", "setLocalizedText",
     "renderContributionActionState", "renderHostedIdentity",
     "localCompanionHealth", "communityClient", "localClient",
     "loadIncrementalSyncStatus", "scheduleIncrementalSyncStatusPoll",
@@ -10215,6 +10372,9 @@ return {
   approveIncrementalContribution,
   maybeRepairIncrementalAuthorization,
   resumeContributionCeremonyAfterSignIn,
+  reportContributionConnectFailure,
+  contributionDeviceRecoveryIsRequired,
+  contributionDeviceKeychainAccessIsDenied,
   state: () => ({
     hostedIdentity,
     communitySession,
@@ -10229,6 +10389,10 @@ return {
     harness,
     element,
     (target, text) => { target.textContent = text; },
+    (target, text) => {
+      harness.rawTextWrites = (harness.rawTextWrites ?? 0) + 1;
+      target.textContent = text;
+    },
     (target, key, values = {}) => {
       target.localizedKeys.push(key);
       target.textContent = `[${key}] ${JSON.stringify(values)}`;
@@ -10252,9 +10416,68 @@ return {
     },
     (value) => String(value),
     (key) => `[${key}]`,
-    () => ({ append() {}, textContent: "" }),
+    (...args) => {
+      harness.createdNodes.push(args);
+      return { append() {}, textContent: "" };
+    },
   );
 }
+
+test("denied Keychain access pauses the actual ceremony without reset or identity discard", async () => {
+  const session = { csrfToken: "synthetic-live-csrf", participantId: "synthetic-participant", consentVersion: null };
+  const denied = Object.assign(new Error("Untrusted server text must not become guidance"), {
+    code: "contribution_device_keychain_access_denied",
+  });
+  const harness = {
+    identity: null,
+    session,
+    approved: true,
+    grantRejected: true,
+    pairingError: denied,
+    responses: [{ status: 201, payload: { pairingCode: "synthetic-pairing" } }],
+  };
+  const scope = await loadContributionCeremony(harness);
+  await scope.approveIncrementalContribution();
+  const status = harness.elements("#incremental-consent-status");
+  assert.equal(status.hidden, false);
+  assert.equal(status.className, "participant-action-status", "denial is a calm pause, not a reset error");
+  assert.equal(status.textContent, "described", "the pause uses the fixed diagnostic description");
+  assert.equal(harness.rawTextWrites, 1, "the earlier progress translation is retired");
+  assert.deepEqual(harness.localCalls, [{ pairContributionDevice: "synthetic-pairing" }]);
+  assert.equal(harness.fetchCalls.length, 1, "no new pairing or automatic retry is invented");
+  assert.equal(harness.createdNodes.length, 0, "denial creates no reset or approval action");
+  assert.deepEqual(harness.sessions, [], "the existing session is not replaced or cleared");
+  assert.equal(harness.pendingHandoffClears ?? 0, 0);
+  assert.equal(scope.state().communitySession, session);
+  assert.equal(scope.state().incrementalConsentApproved, true);
+  assert.equal(scope.state().communityDevicePairedV1, false, "failed pairing is not reported as connected");
+  assert.equal(scope.state().incrementalConsentBusy, false);
+  assert.deepEqual(harness.describeFailures, [{
+    surface: "contribution_connect",
+    code: "contribution_device_keychain_access_denied",
+    requestId: null,
+  }]);
+  assert.equal(scope.contributionDeviceRecoveryIsRequired(denied), false);
+  assert.equal(scope.contributionDeviceKeychainAccessIsDenied(denied), true);
+  for (const code of ["contribution_device_recovery_required", "contribution_device_credential_conflict"]) {
+    assert.equal(scope.contributionDeviceRecoveryIsRequired({ code }), true, "genuine unusable/conflict recovery remains distinct");
+    assert.equal(scope.contributionDeviceKeychainAccessIsDenied({ code }), false);
+  }
+  const untaggedDenial = { code: denied.code };
+  await scope.reportContributionConnectFailure(status, untaggedDenial, {
+    enrollmentAttemptedWithHostedIdentity: true,
+    enrollmentEstablished: false,
+  });
+  assert.equal(status.className, "participant-action-status");
+  assert.equal(harness.rawTextWrites, 2);
+  assert.equal(harness.createdNodes.length, 0);
+  assert.equal(harness.pendingHandoffClears ?? 0, 0);
+  assert.equal(scope.state().communitySession, session);
+  assert.equal(harness.describeFailures.length, 2, "untagged denial still records its diagnostic code");
+  const unreadableCode = Object.defineProperty({}, "code", { get() { throw new Error("unreadable code"); } });
+  assert.equal(scope.contributionDeviceRecoveryIsRequired(unreadableCode), false);
+  assert.equal(scope.contributionDeviceKeychainAccessIsDenied(unreadableCode), false);
+});
 
 async function settleCeremony(scope, harness, { untilFetchCount }) {
   // A tick with real wall-clock time so the ceremony's bounded cookie-commit

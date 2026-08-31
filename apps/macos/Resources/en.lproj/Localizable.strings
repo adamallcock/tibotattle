@@ -11,6 +11,16 @@
 "menu.selectAll" = "Select All";
 "menu.settings" = "Settings…";
 "menu.view" = "View";
+"dialog.approveKeychainMigration" = "Approve migration";
+"dialog.keychainMigrationTitle" = "Approve secure Keychain migration?";
+"dialog.keychainMigrationDescription" = "Saved Keychain keys keep local account matching and your existing contribution identity consistent. This update moves them to app-owned Keychain items without changing their values.\n\nSilent migration could not finish. macOS may ask for your login Keychain password. Enter it only in the macOS dialog; TiboTattle does not receive the password.\n\nApproving this migration does not reset anything or upload data. Existing history is kept. Cancel leaves migration pending.";
+"settings.keychainMigrationTitle" = "Secure upgrade";
+"settings.keychainMigrationSummary" = "Saved Keychain access needs one-time approval to finish this upgrade. Your history is kept; review when you’re ready.";
+"settings.keychainMigrationRetrying" = "Preparing secure access automatically. No password is needed while these checks run.";
+"settings.keychainMigrationApproving" = "Finishing the approved Keychain migration… Your existing key values and history are kept.";
+"settings.keychainMigrationDeferred" = "Migration is still pending for the remaining keys. Nothing has been reset, and local history is kept. You can review again when ready.";
+"settings.keychainMigrationReview" = "Review migration…";
+"settings.keychainMigrationMenu" = "Finish secure upgrade…";
 "notification.allowanceThresholdBody" = "A fresh provider-reported allowance observation crossed your %d%% usage alert. Open TiboTattle for details.";
 "notification.allowanceTitle" = "Allowance alert";
 "notification.resetBody" = "A provider-reported allowance window reset. Open TiboTattle for details.";

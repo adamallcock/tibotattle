@@ -49,6 +49,8 @@ import {
   MACOS_ACCOUNTING_RUNTIME_FILES,
   MACOS_BUILD_PROFILES,
   MACOS_IDENTITY_CORE_RUNTIME_FILES,
+  MACOS_KEYCHAIN_MIGRATION_HELPER,
+  MACOS_KEYCHAIN_MIGRATION_HELPER_SOURCES,
   MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
   MACOS_QUOTA_ANALYSIS_RUNTIME_FILES,
   MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES,
@@ -463,6 +465,7 @@ async function sha256File(path) {
 }
 
 const NORMALIZED_TEST_CODE_PATHS = new Set([
+  MACOS_KEYCHAIN_MIGRATION_HELPER.executable,
   "Contents/MacOS/TiboTattle",
   "Contents/Resources/runtime/bin/node",
   ...SPARKLE_MACH_O_PATHS.map(
@@ -1011,7 +1014,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   );
   assert.match(
     source,
-    /guard !quitting, retryAllowed, firstRunAcknowledged else \{ return \}/u,
+    /guard !quitting, retryAllowed, firstRunAcknowledged,\s*keychainResetGeneration == nil, keychainResetProcess == nil else \{ return \}/u,
   );
   assert.match(
     source,
@@ -3581,9 +3584,10 @@ test("preview Keychain reset addresses no stable credential pair", async () => {
 });
 
 test("the app Keychain broker owns a closed capability set and migrates legacy items safely", async () => {
-  const [source, brokerSource] = await Promise.all([
+  const [source, brokerSource, migrationSource] = await Promise.all([
     readFile(SWIFT_SOURCE, "utf8"),
     readFile(KEYCHAIN_BROKER_SOURCE, "utf8"),
+    readFile(join(REPOSITORY_ROOT, "apps/macos/Sources/KeychainMigration.swift"), "utf8"),
   ]);
 
   assert.match(
@@ -3657,34 +3661,27 @@ test("the app Keychain broker owns a closed capability set and migrates legacy i
     brokerSource,
     /generation: \.legacy,\s*allowInteraction: true/u,
   );
-  assert.match(
-    brokerSource,
-    /addMigratedSecret\(legacy, capability: capability\)[\s\S]*?readSecret\(capability, generation: \.modern\)[\s\S]*?deleteItem\(\s*capability,\s*generation: \.legacy/u,
+  const automaticMigration = brokerSource.slice(
+    brokerSource.indexOf("private func readOrMigrateSecret"),
+    brokerSource.indexOf("private func readSilentMigration"),
   );
-  assert.match(
-    brokerSource,
-    /if created \{ _ = deleteSecret\(capability: capability\) \}[\s\S]*?return \.failure\("operation_failed"\)/u,
-  );
-  assert.match(
-    brokerSource,
-    /private static let processMigrationPromptState = MigrationPromptState\(\)/u,
-  );
-  assert.match(
-    brokerSource,
-    /func claimInteractiveRead[\s\S]*?lock\.lock\(\)[\s\S]*?attempted\.insert\(capability\)\.inserted/u,
-  );
-  assert.match(
-    brokerSource,
-    /migrationPromptState = injectedMigrationPromptState[\s\S]*?Self\.processMigrationPromptState/u,
-  );
-  assert.match(
-    brokerSource,
-    /guard migrationPromptState\.claimInteractiveRead\(capability\) else \{[\s\S]*?return \.failure\("migration_required"\)/u,
-  );
-  assert.match(
-    brokerSource,
-    /let deniedPromptState = MigrationPromptState\(\)[\s\S]*?let deniedBroker[\s\S]*?let relaunchedDeniedBroker[\s\S]*?migrationPromptState: deniedPromptState/u,
-  );
+  assert.doesNotMatch(automaticMigration, /allowInteraction: true/u);
+  assert.match(automaticMigration, /claimAttempt[\s\S]*?readSilentMigration/u);
+  assert.match(automaticMigration, /\[0, 0\.25, 0\.75\]/u);
+  assert.match(brokerSource, /entry\.retrying, entry\.attempts < 3/u);
+  assert.match(brokerSource, /private static let processMigrationState = MigrationState\(\)/u);
+  assert.match(brokerSource, /migrationState = injectedMigrationState[\s\S]*?Self\.processMigrationState/u);
+  assert.match(brokerSource, /let deniedMigrationState = MigrationState\(\)[\s\S]*?let deniedBroker[\s\S]*?let relaunchedDeniedBroker[\s\S]*?migrationState: deniedMigrationState/u);
+  assert.match(brokerSource, /KeychainMigrationAdoption\.adopt\([\s\S]*?addMigratedSecret\(stored[\s\S]*?readSecret\(capability, generation: \.modern\)[\s\S]*?rollbackMigratedSecret/u);
+  assert.match(brokerSource, /SecItemDelete\(\[kSecValuePersistentRef as String: reference\]/u);
+  assert.match(migrationSource, /guard readBack\(\) == secret else \{\s*if created \{ removeCreated\(\) \}/u);
+  assert.doesNotMatch(migrationSource, /SecItemDelete|SecItemUpdate|allowInteraction: true/u);
+  assert.match(migrationSource, /kSecGuestAttributeAudit/u);
+  assert.match(migrationSource, /audit_token_to_pid\(token\) == expectedPID/u);
+  assert.match(migrationSource, /audit_token_to_euid\(token\) == geteuid\(\)/u);
+  assert.match(migrationSource, /expectedCDHash: expected\.cdhash/u);
+  assert.match(migrationSource, /SecKeychainSetUserInteractionAllowed\(false\) == errSecSuccess/u);
+  assert.match(brokerSource, /SecKeychainGetUserInteractionAllowed\(&previous\)[\s\S]*?SecKeychainSetUserInteractionAllowed\(previous\.boolValue\)/u);
   assert.match(
     brokerSource,
     /private static let nativeSmokeArguments = Set\(\[[\s\S]*?"--keychain-broker-contract-smoke-test"[\s\S]*?"--smoke-test"[\s\S]*?\]\)/u,
@@ -3700,7 +3697,7 @@ test("the app Keychain broker owns a closed capability set and migrates legacy i
   assert.doesNotMatch(brokerSource, /hasSuffix\("-smoke-test"\)/u);
   assert.match(
     brokerSource,
-    /private init\([\s\S]*?smokeStorage: EphemeralSmokeStorage\?[\s\S]*?migrationPromptState injectedMigrationPromptState:[\s\S]*?MigrationPromptState\? = nil[\s\S]*?\) throws[\s\S]*?ephemeralSmokeStorage = selectedSmokeStorage/u,
+    /private init\([\s\S]*?smokeStorage: EphemeralSmokeStorage\?[\s\S]*?migrationState injectedMigrationState:[\s\S]*?MigrationState\? = nil[\s\S]*?\) throws[\s\S]*?ephemeralSmokeStorage = selectedSmokeStorage/u,
   );
   assert.match(
     brokerSource,
@@ -3723,24 +3720,45 @@ test("the app Keychain broker owns a closed capability set and migrates legacy i
   assert.doesNotMatch(accessSource, /nodeRuntimePath|trustedReader/u);
   assert.match(brokerSource, /kSecAttrAccess as String/u);
 
+  const launchSource = source.slice(
+    source.indexOf("    func launch("),
+    source.indexOf("    private func consumeStandardOutput"),
+  );
+  assert.match(launchSource, /child\.standardInput = childEndpoint/u);
+  assert.match(
+    launchSource,
+    /makeBroker: \(\) throws -> ContributionDeviceKeychainBroker = \{\s*try ContributionDeviceKeychainBroker\(\s*namespace: BundledProduct\.keychainNamespace,\s*account: BundledProduct\.keychainAccount\s*\)/u,
+  );
+  assert.match(
+    launchSource,
+    /broker = try makeBroker\(\)\s*\} catch \{\s*throw LauncherError\.companionLaunch\("keychain"\)/u,
+  );
+  assert.match(
+    launchSource,
+    /defer \{\s*if !brokerOwnedByCompanion \{ broker\.shutdown\(\) \}\s*\}\s*guard let childEndpoint = broker\.childEndpoint else \{\s*throw LauncherError\.companionLaunch\("keychain"\)\s*\}\s*let resources = try CompanionResources\.bundled\(\)/u,
+  );
+  assert.match(
+    launchSource,
+    /environment\[\s*ContributionDeviceKeychainBroker\.environmentVariable\s*\] = "0"\s*for name in/u,
+  );
+  assert.match(
+    launchSource,
+    /keychainBroker = broker\s*brokerOwnedByCompanion = true[\s\S]*?try child\.run\(\)[\s\S]*?broker\.closeChildEndpoint\(\)/u,
+  );
+  assert.doesNotMatch(launchSource, /try\? ContributionDeviceKeychainBroker|broker\?\.|FileHandle\.nullDevice/u);
   assert.match(
     source,
-    /child\.standardInput = broker\?\.childEndpoint \?\? FileHandle\.nullDevice/u,
+    /static func verifyKeychainLaunchContract[\s\S]*?case construction, missingEndpoint[\s\S]*?try companion\.launch\(makeBroker:[\s\S]*?throw ContributionDeviceKeychainBrokerUnavailable\(\)[\s\S]*?healthyEndpointObserved = broker\.childEndpoint != nil[\s\S]*?broker\.closeChildEndpoint\(\)[\s\S]*?companion\.process == nil, companion\.keychainBroker == nil[\s\S]*?stoppedCalls == 2/u,
   );
   assert.match(
     source,
-    /let broker = try\? ContributionDeviceKeychainBroker\(\s*namespace: BundledProduct\.keychainNamespace,\s*account: BundledProduct\.keychainAccount\s*\)/u,
+    /arguments\.contains\("--keychain-broker-contract-smoke-test"\)[\s\S]*?guard CompanionProcess\.verifyKeychainLaunchContract\(\) else \{ exit\(1\) \}/u,
   );
-  assert.match(
-    source,
-    /if broker\?\.childEndpoint != nil \{\s*environment\[\s*ContributionDeviceKeychainBroker\.environmentVariable\s*\] = "0"/u,
-  );
-  assert.match(source, /broker\?\.closeChildEndpoint\(\)/u);
   const terminationSource = source.slice(
     source.indexOf("private func didTerminate"),
     source.indexOf("func stop(completion:"),
   );
-  assert.match(terminationSource, /broker\?\.shutdown\(\)/u);
+  assert.match(terminationSource, /broker\.shutdown\(completion: finish\)/u);
   // The one-shot reset helper runs without a broker: its standard input
   // stays the null device and its environment never announces a channel.
   const resetHelperSource = source.slice(
@@ -3763,6 +3781,47 @@ test("the app Keychain broker owns a closed capability set and migrates legacy i
     resetHelperSource,
     /"USAGE_MONITOR_KEYCHAIN_ACCOUNT":\s*BundledProduct\.keychainAccount/u,
   );
+});
+
+test("native full reset drains every retiring writer before deletion or restart", async () => {
+  const [source, broker] = await Promise.all([
+    readFile(SWIFT_SOURCE, "utf8"),
+    readFile(KEYCHAIN_BROKER_SOURCE, "utf8"),
+  ]);
+  const shutdown = broker.slice(broker.indexOf("func shutdown(completion:"), broker.indexOf("private func teardown"));
+  assert.match(shutdown, /queue\.async \{\s*self\.teardown\(\)\s*completion\(\)/u);
+  assert.doesNotMatch(shutdown, /weak self/u);
+  const observe = broker.slice(broker.indexOf("func observe("), broker.indexOf("func removeObserver("));
+  assert.match(observe, /lock\.lock\(\)[\s\S]*?DispatchQueue\.main\.async \{ callback\(current\) \}\s*lock\.unlock\(\)/u);
+
+  const stop = source.slice(source.indexOf("func stop(completion:"), source.indexOf("static func verifyKeychainShutdownContract"));
+  assert.match(stop, /if terminationComplete[\s\S]*?completion\(\)/u);
+  assert.match(stop, /stopCompletions\.append\(completion\)[\s\S]*?stopRetention = self[\s\S]*?guard !terminationInProgress/u);
+  assert.match(stop, /guard let child = process[\s\S]*?didTerminate\(success: true, notifyExit: false\)/u);
+  assert.doesNotMatch(stop, /guard let child = process, child\.isRunning else[\s\S]*?completion\(\)/u);
+  const termination = source.slice(source.indexOf("private func didTerminate"), source.indexOf("func stop(completion:"));
+  assert.match(termination, /terminationInProgress = true[\s\S]*?process = nil[\s\S]*?broker\.shutdown\(completion: finish\)/u);
+  assert.match(termination, /private func finishTermination[\s\S]*?terminationComplete = true[\s\S]*?stopCompletions\.removeAll\(\)[\s\S]*?stopRetention = nil[\s\S]*?completion\(\)/u);
+
+  const retire = source.slice(source.indexOf("private func retireCompanion"), source.indexOf("private func startCompanion"));
+  assert.match(retire, /retiringCompanions\[identifier\] = previous[\s\S]*?previous\.stop[\s\S]*?DispatchQueue\.main\.async[\s\S]*?retiringCompanions\[identifier\] === previous[\s\S]*?removeValue\(forKey: identifier\)[\s\S]*?completion\(\)/u);
+  for (const start of ["private func startCompanion", "@objc private func retryCompanion"]) {
+    const beginning = source.slice(source.indexOf(start), source.indexOf(start) + 500);
+    assert.match(beginning, /keychainResetGeneration == nil, keychainResetProcess == nil/u);
+  }
+  const reset = source.slice(source.indexOf("private func performLocalKeychainReset"), source.indexOf("private func launchLocalKeychainResetHelper"));
+  assert.match(reset, /guard !quitting, keychainResetGeneration == nil, keychainResetProcess == nil/u);
+  assert.match(reset, /keychainResetGeneration = resetGeneration[\s\S]*?companion = nil[\s\S]*?pendingCompanions = retiringCompanions[\s\S]*?pendingCompanions\[ObjectIdentifier\(previous\)\] = previous/u);
+  assert.match(reset, /keychainResetGeneration == resetGeneration[\s\S]*?!self\.quitting, self\.launchGeneration == resetGeneration[\s\S]*?launchLocalKeychainResetHelper\(generation: resetGeneration\)/u);
+  assert.match(reset, /DispatchGroup\(\)[\s\S]*?for previous in pendingCompanions\.values[\s\S]*?stopped\.enter\(\)[\s\S]*?retireCompanion\(previous\) \{ stopped\.leave\(\) \}[\s\S]*?stopped\.notify\(queue: \.main, execute: runReset\)/u);
+  assert.doesNotMatch(reset, /previous\.isRunning|\.wait\(/u);
+  const resetResult = source.slice(source.indexOf("private func launchLocalKeychainResetHelper"), source.indexOf("private func eraseLocalData"));
+  assert.match(resetResult, /self\.keychainResetProcess === terminated[\s\S]*?self\.keychainResetGeneration == generation[\s\S]*?self\.launchGeneration == generation/u);
+  assert.match(resetResult, /result\.runModal\(\)\s*guard !quitting, launchGeneration == generation[\s\S]*?startCompanion\(\)/u);
+  assert.match(source, /static func keychainResetContract\(\)[\s\S]*?guard CompanionProcess\.verifyKeychainShutdownContract\(\)/u);
+  assert.match(source, /enum Phase: CaseIterable \{ case alreadyAbsent, handlerPending, brokerDraining \}/u);
+  assert.match(source, /verifyExternalResetOrder[\s\S]*?callbackCount == 2[\s\S]*?retainedCompanion == nil/u);
+  assert.match(broker, /static func verifyExternalResetOrder[\s\S]*?resetFinished\.wait\(timeout: \.now\(\)\) == \.timedOut[\s\S]*?storage\.modern\.isEmpty && storage\.legacy\.isEmpty/u);
 });
 
 test("the broker-less reset helper deletes fixed legacy and app generations without keytar", async () => {
@@ -4168,8 +4227,12 @@ test("development and preview builds treat the release-channel policy as optiona
 
 test("macOS release metadata validates versions, production mode, and Keychain references", async () => {
   assert.equal(normalizeMacOSBundleVersion(), DERIVED_MACOS_BUNDLE_VERSION);
-  assert.equal(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION, "1023");
+  assert.equal(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION, "1023.1");
   assert.equal(STABLE_SIGNED_BUNDLE_VERSION, "1024");
+  assert.equal(
+    normalizeMacOSBundleVersion(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    "1023.1",
+  );
   assert.equal(
     compareMacOSBundleVersions(
       INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION,
@@ -4178,12 +4241,26 @@ test("macOS release metadata validates versions, production mode, and Keychain r
     true,
   );
   assert.equal(
+    compareMacOSBundleVersions("1023", INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    -1,
+    "the migration dogfood must be strictly newer than the installed RC2",
+  );
+  assert.equal(
     compareMacOSBundleVersions(
       STABLE_SIGNED_BUNDLE_VERSION,
       INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION,
     ) > 0,
     true,
   );
+  for (const unallocated of ["1023", "1023.0", "1023.1.0", "1024", "2000.1.17"]) {
+    assert.throws(
+      () => readMacOSReleaseBuildConfiguration({
+        USAGE_MONITOR_BUNDLE_VERSION: unallocated,
+      }, INTERNAL_DOGFOOD_RELEASE_CHANNEL),
+      { code: "MACOS_BUNDLE_VERSION_MISMATCH" },
+      "operator overrides cannot reuse RC2, alias the allocation, or consume stable/preview builds",
+    );
+  }
   assert.equal(
     resolveSignedMacOSBundleVersion("0.1.18", STABLE_RELEASE_CHANNEL),
     null,
@@ -5670,7 +5747,7 @@ test("legacy dogfood capability rejects Proxy-forged identities before any artif
       ["DMG validation", validateMacOSDMG],
     ]) {
       let symbolReads = 0;
-      let observedSymbol;
+      const observedSymbols = [];
       const baseOptions = {
         allowLegacyUnsealedSource: false,
         channel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
@@ -5681,7 +5758,7 @@ test("legacy dogfood capability rejects Proxy-forged identities before any artif
         get(target, key, receiver) {
           if (typeof key === "symbol") {
             symbolReads += 1;
-            observedSymbol = key;
+            observedSymbols.push(key);
             return forged;
           }
           return Reflect.get(target, key, receiver);
@@ -5694,12 +5771,16 @@ test("legacy dogfood capability rejects Proxy-forged identities before any artif
         { code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" },
         `${name} must reject a supplied non-member identity before path resolution`,
       );
-      assert.equal(symbolReads, 1, "the Proxy exercised the private option read");
-      await assert.rejects(
-        validate(null, { ...baseOptions, [observedSymbol]: forged }),
-        { code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" },
-        `${name} must also reject a forged value replayed with the captured Symbol`,
-      );
+      assert.equal(symbolReads, 2, "both private compatibility reads were exercised");
+      assert.equal(new Set(observedSymbols).size, 2);
+      for (const [index, observedSymbol] of observedSymbols.entries()) {
+        await assert.rejects(
+          validate(null, { ...baseOptions, [observedSymbol]: forged }),
+          { code: index === 0 ? "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID"
+            : "MACOS_KEYCHAIN_MIGRATION_COMPATIBILITY_INVALID" },
+          `${name} must reject a forged value replayed with either captured Symbol`,
+        );
+      }
     }
   }
 });
@@ -6016,6 +6097,7 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
     for (const relativePath of [
       "Contents/MacOS/TiboTattle",
       "Contents/Resources/runtime/bin/node",
+      MACOS_KEYCHAIN_MIGRATION_HELPER.executable,
       "Contents/Resources/AppIcon.icns",
       "Contents/Resources/licenses/app-icon-provenance.txt",
       `Contents/Resources/licenses/sparkle-${SPARKLE_VERSION}.txt`,
@@ -6100,6 +6182,11 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
         schemaVersion: "usage-monitor-macos-app-build-v0.1",
         application: {
           bundleIdentifier: "com.usagemonitor.local",
+        },
+        runtime: { keychainMigrationHelper: { ...MACOS_KEYCHAIN_MIGRATION_HELPER } },
+        inputs: {
+          swiftSources: ["apps/macos/Sources/KeychainMigration.swift", "apps/macos/UsageMonitorApp.swift"],
+          keychainMigrationHelperSources: [...MACOS_KEYCHAIN_MIGRATION_HELPER_SOURCES],
         },
         release: {
           appOpenHost: "open",
@@ -6253,9 +6340,16 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
       }
       if (command === "/usr/bin/codesign"
           && arguments_.includes("-d")) {
+        const identifier = arguments_.at(-1) === app
+          || arguments_.at(-1).endsWith("/MacOS/TiboTattle")
+          ? PRODUCT_BRAND.bundleIdentifier : "node";
         return {
-          stderr:
-            "Authority=Developer ID Application: Example Owner (A1B2C3D4E5)\nflags=0x10000(runtime)\n",
+          stderr: `Identifier=${identifier}\nAuthority=${identity}\n`
+            + "TeamIdentifier=A1B2C3D4E5\nflags=0x10000(runtime)\n"
+            + `designated => identifier "${identifier}" and anchor apple generic `
+            + "and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ "
+            + "and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ "
+            + 'and certificate leaf[subject.OU] = "A1B2C3D4E5"\n',
           stdout: "",
         };
       }
@@ -6268,7 +6362,7 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
     const signing = calls.filter(({ command, arguments_ }) =>
       command === "/usr/bin/codesign"
       && arguments_.includes("--sign"));
-    assert.equal(signing.length, 8);
+    assert.equal(signing.length, 9);
     assert.match(signing[0].arguments_.at(-1), /Installer\.xpc$/u);
     assert.match(signing[1].arguments_.at(-1), /Downloader\.xpc$/u);
     assert.equal(
@@ -6287,8 +6381,12 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
       ],
       /NodeRuntime\.entitlements$/u,
     );
-    assert.match(signing[6].arguments_.at(-1), /MacOS\/TiboTattle$/u);
-    assert.equal(signing[7].arguments_.at(-1), app);
+    assert.equal(signing[6].arguments_.at(-1), join(app, MACOS_KEYCHAIN_MIGRATION_HELPER.executable));
+    assert.equal(signing[6].arguments_[signing[6].arguments_.indexOf("--identifier") + 1], "node");
+    assert.equal(signing[6].arguments_.includes("--entitlements"), false);
+    assert.equal(signing[6].arguments_.includes("--preserve-metadata=entitlements"), false);
+    assert.match(signing[7].arguments_.at(-1), /MacOS\/TiboTattle$/u);
+    assert.equal(signing[8].arguments_.at(-1), app);
     for (const call of signing) {
       assert.equal(call.arguments_.includes("--options"), true);
       assert.equal(call.arguments_.includes("runtime"), true);
@@ -6301,13 +6399,17 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
       && arguments_.includes("--verify"));
     assert.equal(verify.arguments_.includes("--deep"), true);
     assert.equal(verify.arguments_.includes("--strict"), true);
-    // The packaged app has no keytar native addon or designated-requirement
-    // verification path; only the signed Swift app touches Keychain.
-    const requirementVerify = calls.find(({ command, arguments_ }) =>
+    // No keytar/interpreter credential fallback: the narrow helper alone
+    // preserves the exact old Node requirement, verified cryptographically.
+    const requirementVerifications = calls.filter(({ command, arguments_ }) =>
       command === "/usr/bin/codesign"
       && arguments_.some((argument) =>
         typeof argument === "string" && argument.startsWith("-R=")));
-    assert.equal(requirementVerify, undefined);
+    assert.equal(requirementVerifications.length, 2);
+    assert.deepEqual(requirementVerifications.map(({ arguments_ }) => arguments_.at(-1)), [
+      join(app, "Contents/Resources/runtime/bin/node"),
+      join(app, MACOS_KEYCHAIN_MIGRATION_HELPER.executable),
+    ]);
     assert.equal(
       signing.some(({ arguments_ }) =>
         arguments_.at(-1).endsWith("keytar.node")),
@@ -6540,6 +6642,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   );
   assert.deepEqual(swiftSources.relativeFiles, [
     "apps/macos/Sources/KeychainBroker.swift",
+    "apps/macos/Sources/KeychainMigration.swift",
     "apps/macos/Sources/Localization.swift",
     "apps/macos/Sources/LoginItemManager.swift",
     "apps/macos/Sources/MenuBarPaceOutlook.swift",
@@ -7489,6 +7592,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       "apps/macos/Assets/AppIcon.icns",
       "apps/macos/Assets/AppIcon.provenance.txt",
       ...swiftSources.relativeFiles,
+      ...MACOS_KEYCHAIN_MIGRATION_HELPER_SOURCES,
     ]);
     assert.deepEqual(
       manifest.inputs.localizationResources,
@@ -7587,6 +7691,32 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.equal(payloadHash.digest("hex"), manifest.payload.payloadSha256);
     assert.equal(manifest.payload.payloadSha256, first.payloadSha256);
 
+    const migrationHelperPath = join(outputA, MACOS_KEYCHAIN_MIGRATION_HELPER.executable);
+    const retainedHelperPath = join(temporaryRoot, "retained-migration-helper");
+    const migrationHelperBytes = await readFile(migrationHelperPath);
+    assert.ok(migrationHelperBytes.length > 4096, "the real Swift helper must be packaged");
+    await rename(migrationHelperPath, retainedHelperPath);
+    try {
+      await assert.rejects(inspectMacOSApp(outputA), { code: "MACOS_PAYLOAD_INTEGRITY_FAILED" },
+        "a missing built helper must fail installed-payload verification");
+    } finally {
+      await rename(retainedHelperPath, migrationHelperPath);
+    }
+    const changedHelperBytes = Buffer.from(migrationHelperBytes);
+    changedHelperBytes[4096] ^= 1;
+    await chmod(migrationHelperPath, 0o700);
+    try {
+      await writeFile(migrationHelperPath, changedHelperBytes);
+      await chmod(migrationHelperPath, 0o555);
+      await assert.rejects(inspectMacOSApp(outputA), { code: "MACOS_PAYLOAD_INTEGRITY_FAILED" },
+        "a changed built helper must fail its normalized payload digest");
+    } finally {
+      await chmod(migrationHelperPath, 0o700);
+      await writeFile(migrationHelperPath, migrationHelperBytes);
+      await chmod(migrationHelperPath, 0o555);
+    }
+    await assert.doesNotReject(inspectMacOSApp(outputA), "restored helper passes full payload verification");
+
     for (const { entry, relativePath } of bundleFiles) {
       assert.equal(entry.isSymbolicLink(), false, relativePath);
       assert.doesNotMatch(
@@ -7670,8 +7800,20 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       keychainBrokerSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_KEYCHAIN_BROKER_CONTRACT protocols=v1,v2 capabilities=4 migration=success,denied-preserved,readback-rollback malformed=closed keychain_access=0$/mu,
+      /^USAGE_MONITOR_MACOS_KEYCHAIN_BROKER_CONTRACT protocols=v1,v2 capabilities=4 migration=silent,third-attempt,bounded-restart,explicit-only,denied-preserved,conflict-preserved,readback-rollback,retired-cancelled malformed=closed keychain_access=0$/mu,
     );
+    assert.match(
+      keychainBrokerSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_KEYCHAIN_LAUNCH_CONTRACT required=true failures=construction,endpoint child_started=false stop_callbacks=once keychain_access=0$/mu,
+    );
+    const migrationUISmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--native-keychain-migration-ui-contract-smoke-test"],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    assert.equal(migrationUISmoke.status, 0, migrationUISmoke.stderr || migrationUISmoke.stdout);
+    assert.match(migrationUISmoke.stdout,
+      /^USAGE_MONITOR_MACOS_KEYCHAIN_MIGRATION_UI_CONTRACT automatic_prompt=false retrying=quiet cancel=preserved denial=preserved approval=explicit duplicate_ignored=true refresh=transition_only keychain_access=false$/mu);
     const menuBarSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),
       ["--menu-bar-contract-smoke-test"],
@@ -8492,7 +8634,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.equal(
       resetContract.stdout,
-      "USAGE_MONITOR_MACOS_KEYCHAIN_RESET_CONTRACT targets=2 app_state=targeted hosted_mutation=false secure_erasure=false confirmations=2\n",
+      "USAGE_MONITOR_MACOS_KEYCHAIN_RESET_CONTRACT targets=2 app_state=targeted hosted_mutation=false secure_erasure=false confirmations=2 writer_barrier=drained callbacks=once reset_resurrection=false keychain_access=0\n",
     );
 
     await mkdir(smokeHome, { recursive: true, mode: 0o700 });

@@ -77,10 +77,23 @@ TiboTattle keeps separate credential capabilities for:
 The optional managed Claude callback has its own standalone CLI/local-review
 pseudonym capability. It is not exposed by the native app.
 
-The device credential is served to the companion through the signed native
-Keychain broker. A content-free binding/renewal record lives under Application
+These installed-app capabilities are served to the companion through the signed
+native Keychain broker. A content-free binding/renewal record lives under Application
 Support; it is not the credential. Keys are intentionally separate so one
 identity namespace cannot be joined to another by accident.
+
+The [silent native migration change](../decisions/2026-08-31-silent-keychain-migration.md)
+adds a narrow compatibility helper for existing legacy keys. It authenticates
+its native parent, accepts only fixed capabilities, and passes the unchanged
+value over a private descriptor for app-owned storage and exact readback. It
+adds no network destination, diagnostic field, consent, or uploaded data. The
+legacy recovery copy is retained during migration. Automatic attempts cannot
+open a Keychain prompt; only an explained native approval can do so. An explicit
+credential reset removes that capability's legacy copy before its modern copy,
+and waits for retiring companion writers before deletion. A failed deletion
+does not authorize a new identity or inferred success. Signed synthetic
+qualification is recorded in that decision; this source description does not
+qualify an installed upgrade.
 
 **Reset identity and device** is a separate two-step action from local data
 erase. It removes the selected local Keychain capabilities and associated app

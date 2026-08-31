@@ -36,6 +36,7 @@ an informal archive.
 | Release trust | [Cross-platform release trust](./decisions/2026-08-18-cross-platform-release-trust.md) | Common evidence decision and artifact-specific native trust requirements |
 | Release publication | [Cross-platform release publication](./runbooks/2026-08-18-cross-platform-release-publication.md) | Activation-gated multi-platform evidence and immutable publication order; not a support claim |
 | macOS release | [macOS stable release](./runbooks/macos-stable-release-runbook.md) | Canonical build, signing, notarization, Sparkle, Homebrew, website, and GitHub release sequence |
+| macOS credentials | [Silent native Keychain migration](./decisions/2026-08-31-silent-keychain-migration.md) | Accepted prompt-free automatic-operation and explicit fallback contract; source and synthetic qualification do not prove the installed release |
 | macOS distribution | [Homebrew distribution and macOS support](./decisions/2026-08-15-homebrew-distribution-and-macos-support.md) | First-party tap, uninstall boundary, and supported macOS floor |
 | Public-site preview | [Public site local preview](./runbooks/2026-08-17-public-site-local-preview.md) | Maintained local rendering/inspection path; not deployment proof |
 | Web-only release | [Web-only release](./runbooks/2026-08-17-web-only-release.md) | Maintained website publication lane and its release boundaries |

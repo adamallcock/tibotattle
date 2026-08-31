@@ -16,6 +16,11 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import {
+  ExportSourcePlanBundleError,
+  exportSourcePlanBundleFailureContext,
+} from "../src/export-source-plan-bundle.js";
+import { ExportResourceLimitError } from "../src/export-resource-policy.js";
 import { runR7RealHistoryBenchmark } from "../src/r7-real-history-benchmark.js";
 import { buildR7ReleaseDecisionReceipt } from "../src/r7-release-decision.js";
 import {
@@ -82,7 +87,7 @@ const REGENERATION_PHASE_WEIGHTS = [
   0.010, 0.045, 0.005, 0.010, 0.045, 0.005, 0.870, 0.010,
 ];
 
-function createRegenerationProgress() {
+export function createRegenerationProgress({ writeStderr = (line) => process.stderr.write(line) } = {}) {
   const silent = process.env.USAGE_MONITOR_R7_DECISION_CHILD === "1"
     || process.argv.includes("--decision-child");
   const startedAt = Date.now();
@@ -93,7 +98,7 @@ function createRegenerationProgress() {
   const minutes = (ms) => `${(ms / 60_000).toFixed(1)}m`;
   const stamp = () => new Date().toISOString().slice(11, 19);
   const write = (message) => {
-    if (!silent) process.stderr.write(`r7-progress ${stamp()} ${message}\n`);
+    if (!silent) writeStderr(`r7-progress ${stamp()} ${message}\n`);
   };
   const eta = () => {
     if (completedWeight < 0.02) return "";
@@ -104,6 +109,9 @@ function createRegenerationProgress() {
   return {
     plan() {
       write(`plan: 6 profile runs, 1 shared real-history pass, 2 decision rebuilds; prior full runs took 42-59m`);
+    },
+    sourcePlanFrozen() {
+      write("afterSourcePlanFreeze: frozen source plan verified; lifecycle passes starting");
     },
     phaseBegin(label, { heartbeatEveryMs = null, typical = null } = {}) {
       phaseIndex += 1;
@@ -123,6 +131,40 @@ function createRegenerationProgress() {
       write(`[${phaseIndex}/8] completed in ${minutes(Date.now() - phaseStartedAt)}${eta()}`);
     },
   };
+}
+
+export function reportR7SourcePlanFailureContext(error, {
+  writeStderr = (line) => process.stderr.write(line),
+} = {}) {
+  const context = exportSourcePlanBundleFailureContext(error);
+  if (context === null) return false;
+  // The bundle owns and freezes this closed record out-of-band. Never read an
+  // error.context/cause/message/stack here, even for a same-named foreign error.
+  writeStderr(`r7-source-plan-failure operation=${context.operation} source=${context.source} reason=${context.reason}\n`);
+  return true;
+}
+
+export function r7SourcePlanFailureMessage(error) {
+  if (exportSourcePlanBundleFailureContext(error) === null) return null;
+  // A recorded failure is an ordinary, owner-observed object, but its public
+  // fields are still mutable. Reconstruct the fixed primary message from an
+  // accessor-free closed code; never evaluate a message or code getter.
+  const descriptor = Object.getOwnPropertyDescriptor(error, "code");
+  if (descriptor && Object.hasOwn(descriptor, "value")
+      && typeof descriptor.value === "string" && descriptor.value.length <= 128) {
+    for (const [Owner, prefix] of [
+      [ExportSourcePlanBundleError, "export_source_plan_bundle_"],
+      [ExportResourceLimitError, "export_resource_"],
+    ]) {
+      if (!descriptor.value.startsWith(prefix)) continue;
+      try {
+        return new Owner(descriptor.value.slice(prefix.length)).message;
+      } catch {
+        break;
+      }
+    }
+  }
+  return "R7 source-plan operation failed";
 }
 const GENERATION_MARKER_SCHEMA = "usage-monitor-r7-release-evidence-generation-v1";
 const JOURNAL_CREATION_PREFIX = `${INSTALL_JOURNAL_NAME}.creating-`;
@@ -864,6 +906,7 @@ async function writeRealHistoryReceipts({
   startAt,
   endAt,
   staging,
+  afterSourcePlanFreeze,
 }) {
   // The real-history module freezes one shared private plan before using both
   // runtimes. Revalidate both exact path identities immediately before handing
@@ -875,6 +918,7 @@ async function writeRealHistoryReceipts({
     endAt,
     runtimeExecutables: [node24.path, node26.path],
     temporaryRoot: tmpdir(),
+    afterSourcePlanFreeze,
   });
   await assertRuntimeIdentity(node24);
   await assertRuntimeIdentity(node26);
@@ -1609,6 +1653,7 @@ async function main() {
       startAt: options.startat,
       endAt: options.endat,
       staging,
+      afterSourcePlanFreeze: () => progress.sourcePlanFrozen(),
     });
     progress.phaseEnd();
     progress.phaseBegin("decision rebuilds (both runtimes)");
@@ -1667,8 +1712,11 @@ async function main() {
 const DIRECT_ENTRY_PATH = process.argv[1] ? resolve(process.argv[1]) : null;
 if (DIRECT_ENTRY_PATH === fileURLToPath(import.meta.url)) {
   main().catch((error) => {
+    reportR7SourcePlanFailureContext(error);
     usage();
-    process.stderr.write(`${error instanceof Error ? error.message : "R7 regeneration failed"}\n`);
+    const message = r7SourcePlanFailureMessage(error)
+      ?? (error instanceof Error ? error.message : "R7 regeneration failed");
+    process.stderr.write(`${message}\n`);
     process.exitCode = 1;
   });
 }

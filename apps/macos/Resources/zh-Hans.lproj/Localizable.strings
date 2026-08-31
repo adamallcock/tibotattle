@@ -44,6 +44,16 @@
 "menu.selectAll" = "全选";
 "menu.settings" = "设置…";
 "menu.view" = "显示";
+"dialog.approveKeychainMigration" = "批准迁移";
+"dialog.keychainMigrationTitle" = "批准安全钥匙串迁移？";
+"dialog.keychainMigrationDescription" = "钥匙串中保存的密钥可维持本地帐户匹配以及现有贡献身份的一致性。此次更新会将它们移至由本应用拥有的钥匙串项目，但不会改变其值。\n\n静默迁移未能完成。macOS 可能会要求输入登录钥匙串密码。请仅在 macOS 对话框中输入；TiboTattle 不会收到该密码。\n\n批准此次迁移不会重置任何内容，也不会上传数据。现有历史记录会保留。取消后，迁移将保持待处理状态。";
+"settings.keychainMigrationTitle" = "安全升级";
+"settings.keychainMigrationSummary" = "保存的钥匙串访问权限需要一次批准才能完成此次升级。历史记录会保留；你可以在方便时查看。";
+"settings.keychainMigrationRetrying" = "正在自动准备安全访问。检查期间无需输入密码。";
+"settings.keychainMigrationApproving" = "正在完成已批准的钥匙串迁移… 现有密钥值和历史记录会保留。";
+"settings.keychainMigrationDeferred" = "其余密钥仍待迁移。没有重置任何内容，本地历史记录会保留。你可以在方便时再次查看。";
+"settings.keychainMigrationReview" = "查看迁移…";
+"settings.keychainMigrationMenu" = "完成安全升级…";
 "menuBar.analyzeLocalUsage" = "分析本地使用情况";
 "menuBar.analyzingLocalUsage" = "正在分析本地使用情况…";
 "menuBar.allowanceTitle" = "%@ · %@ 额度";
