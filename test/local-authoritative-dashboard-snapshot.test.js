@@ -24,6 +24,8 @@ import {
 import {
   LOCAL_COMPANION_SCHEMA_VERSION,
   LocalCompanionDataStore,
+  RETAINED_EVIDENCE_REFRESH_WARNING,
+  RETAINED_EVIDENCE_RELABELED_WARNINGS,
 } from "../src/local-companion-data.js";
 
 const TOOL_WARNING =
@@ -505,6 +507,146 @@ test("the data store restores only the last authoritative receipt across launche
     });
   } finally {
     await rm(files.root, { recursive: true });
+  }
+});
+
+test("startup retains only valid saved evidence until a full refresh publishes details", async (t) => {
+  for (const receiptStatus of ["valid", "missing", "invalid"]) {
+    await t.test(receiptStatus, async () => {
+      const files = await fixture();
+      try {
+        const previous = authoritativeSnapshot();
+        let receiptBytes = null;
+        if (receiptStatus !== "missing") {
+          assert.equal(await writeAuthoritativeDashboardSnapshot({
+            snapshotFile: files.snapshotFile,
+            snapshot: previous,
+            now: () => Date.parse("2026-08-27T12:01:00.000Z"),
+          }), true);
+          receiptBytes = await readFile(files.snapshotFile, "utf8");
+          if (receiptStatus === "invalid") {
+            const invalid = JSON.parse(receiptBytes);
+            invalid.digest = "0".repeat(64);
+            receiptBytes = JSON.stringify(invalid);
+            await writeFile(files.snapshotFile, receiptBytes, { mode: 0o600 });
+            assert.equal(await readAuthoritativeDashboardSnapshot({
+              snapshotFile: files.snapshotFile,
+            }), null);
+          }
+        }
+
+        const startup = unavailableSnapshot();
+        startup.generatedAt = "2026-08-27T13:05:00.000Z";
+        startup.overview.warnings = [RETAINED_EVIDENCE_RELABELED_WARNINGS[0]];
+        startup.overview.usage = [];
+        startup.overview.activity = {
+          usageEvents: null,
+          totalTokens: null,
+          toolEvents: null,
+        };
+        startup.overview.tools = {
+          status: "unavailable",
+          total: null,
+          counts: Object.fromEntries(TOOL_KEYS.map((key) => [key, null])),
+        };
+        startup.overview.timeline.history = {
+          status: "loading",
+          reason: "unified_index_deferred",
+        };
+        Object.assign(startup.overview.accounting, {
+          generation: 18,
+          generationFingerprint: "generation-fingerprint-18",
+          sourceCoverageStatus: "unavailable",
+          events: null,
+          totalTokens: null,
+          apiPriceEquivalentUsd: null,
+          periods: [],
+          toolClasses: structuredClone(startup.overview.tools),
+        });
+        startup.overview.accounting.projection.reason =
+          "local_unified_index_deferred";
+        startup.overview.accounting.projection.terminal = false;
+
+        const full = authoritativeSnapshot();
+        full.generatedAt = "2026-08-27T13:06:00.000Z";
+        full.overview.accounting.generation = 18;
+        full.overview.accounting.generationFingerprint =
+          "generation-fingerprint-18";
+        full.overview.timeline.usage = [
+          { at: "2026-08-27T11:00:00.000Z", events: 6 },
+          { at: "2026-08-27T12:00:00.000Z", events: 6 },
+        ];
+        full.gradient.datasets.rolling.push({ at: 2 });
+        full.weekly.datasets.weekly_values.push({ sequence: 2 });
+        const purposes = [];
+        const store = new LocalCompanionDataStore({
+          snapshotFile: files.snapshotFile,
+          // The receipt is older than the persistence interval: unchanged
+          // bytes must reflect the authority gate, not a throttled write.
+          snapshotNow: () => Date.parse(full.generatedAt),
+          builder: async ({ purpose = "full" } = {}) => {
+            purposes.push(purpose);
+            return structuredClone(purpose === "startup" ? startup : full);
+          },
+        });
+        await store.initialize({ purpose: "startup" });
+        assert.deepEqual(purposes, ["startup"]);
+        const overview = store.getOverview();
+        assert.equal(overview.generatedAt, startup.generatedAt);
+        assert.equal(overview.accounting.generationMatched, false);
+        assert.equal(overview.accounting.generation, 18);
+        assert.equal(overview.accounting.accountingCacheStatus, "unavailable");
+        assert.equal(
+          overview.accounting.projection.reason,
+          "local_unified_index_deferred",
+        );
+        assert.equal(overview.accounting.projection.terminal, false);
+        if (receiptStatus === "valid") {
+          assert.equal(overview.accounting.projection.status, "retained");
+          assert.equal(
+            overview.accounting.projection.retainedAt,
+            previous.generatedAt,
+          );
+          assert.deepEqual(overview.usage, previous.overview.usage);
+          assert.equal(overview.accounting.events, 12);
+          assert.deepEqual(overview.timeline.usage, previous.overview.timeline.usage);
+          assert.deepEqual(store.getGradient(), previous.gradient);
+          assert.deepEqual(store.getWeekly(), previous.weekly);
+          assert.deepEqual(overview.warnings, [RETAINED_EVIDENCE_REFRESH_WARNING]);
+        } else {
+          assert.equal(overview.accounting.projection.status, "unavailable");
+          assert.equal(overview.accounting.projection.retainedAt, null);
+          assert.equal(overview.accounting.events, null);
+          assert.equal(overview.accounting.totalTokens, null);
+          assert.deepEqual(overview.usage, []);
+          assert.deepEqual(overview.timeline.usage, []);
+          assert.deepEqual(store.getGradient().datasets.rolling, []);
+          assert.deepEqual(store.getWeekly().datasets.weekly_values, []);
+        }
+        if (receiptBytes === null) {
+          await assert.rejects(lstat(files.snapshotFile), { code: "ENOENT" });
+        } else {
+          assert.equal(await readFile(files.snapshotFile, "utf8"), receiptBytes,
+            "startup must not persist a deferred or retained merge as authority");
+        }
+
+        await store.reload({ purpose: "full" });
+        assert.deepEqual(purposes, ["startup", "full"]);
+        assert.deepEqual(store.getOverview(), {
+          schemaVersion: full.schemaVersion,
+          mode: full.mode,
+          generatedAt: full.generatedAt,
+          ...full.overview,
+        });
+        assert.deepEqual(store.getGradient(), full.gradient);
+        assert.deepEqual(store.getWeekly(), full.weekly);
+        assert.deepEqual((await readAuthoritativeDashboardSnapshot({
+          snapshotFile: files.snapshotFile,
+        })).snapshot, full);
+      } finally {
+        await rm(files.root, { recursive: true });
+      }
+    });
   }
 });
 
