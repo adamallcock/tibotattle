@@ -54,6 +54,9 @@ Scope: all files under `docs/`. Apply the repository root guidance first.
   updater availability, installed state, and public deployment as distinct steps.
 - Mark owner-only, credential-gated, hardware-gated, or destructive steps rather
   than writing them as routine agent actions.
+- Retiring self-service controls does not retire owner erasure, privacy-request
+  handling, retention disclosures, or deletion-safe restore. Keep those boundaries
+  truthful without inventing a contact channel, deadline, or legal conclusion.
 - Preserve the distinction between supported, experimentally qualified,
   source-compatible, planned, and untested platforms.
 

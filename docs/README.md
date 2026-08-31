@@ -19,6 +19,7 @@ an informal archive.
 | User help | [User guide](./user-guide.md) | Installation, first run, uncertainty, refresh/recovery, optional contribution, data, updates, and support |
 | Architecture | [System architecture](./reference/system-architecture.md) | Current components, trust boundaries, stores, identities, and data flow |
 | Privacy | [Local data, network, and privacy](./reference/local-data-and-privacy.md) | Exact source reads, local and hosted stores, Keychain, network, retention, deletion, and uninstall boundaries |
+| Hosted erasure | [Self-service deletion retirement](./decisions/2026-08-30-self-service-deletion-retirement.md) | Accepted source contract: confirmed device disconnect, private owner erasure, and retained restore safeguards; not deployment evidence |
 | Calibration semantics | [Composition-aware expected-line contract](./design/composition-aware-expected-line.md) | Maintained model-mix, saturation, reset, and lineage carry-forward interpretation; not a provider capacity claim |
 | APIs | [API and integration surface](./reference/api-surface.md) | Stable entry point for the source-checked HTTP, native, process, package, schema, binding, and external-service inventory |
 | Detailed API inventory | [Source-backed API surface reference](./reference/2026-08-26-api-surface-reference.md) | Complete inventory maintained with source-parity tests; implemented source is not deployment or release proof |
@@ -28,7 +29,7 @@ an informal archive.
 | Local recovery | [Unified index preservation and recovery](./runbooks/unified-index-recovery.md) | Preservation-first diagnosis and candidate rebuild; never relabel or destroy the only index |
 | Sidebar recovery | [Collapsed dashboard sidebar rescue](./runbooks/sidebar-stranded-collapsed-rescue.md) | Current 0.1.16 recovery for persisted collapsed navigation; removes only exact window-geometry defaults |
 | Platform support | [Platform support and qualification](./reference/platform-support.md) | macOS support and the evidence ladder Windows/Linux must satisfy before any claim |
-| Production | [Production service operations](./runbooks/production-operations.md) | Read-only observation, deploy/migration gates, containment, rollback, and recovery boundaries |
+| Production | [Production service operations](./runbooks/production-operations.md) | Read-only observation, deploy/migration gates, private owner erasure, containment, rollback, and recovery boundaries |
 | Community diagnostics | [Community allowance-band diagnosis](./runbooks/2026-08-13-community-allowance-band-diagnosis.md) | Current fit-cache and aggregate diagnosis; production writes remain owner-run |
 | Retired hosted APIs | [Hosted API retirement data gates](./runbooks/2026-08-27-hosted-api-retirement-data-gates.md) | Owner-run read-only D1 checks required before any future deletion of data retained after source-route retirement |
 | Release verification | [Verify a TiboTattle release](./verify-release.md) | User-facing checksum, native trust, manifest, and evidence verification |
@@ -47,6 +48,11 @@ The [API lifecycle review](./reviews/2026-08-26-api-lifecycle-review.md) records
 the source-level removals merged in PR #78. It is an implementation record, not
 an assertion that an installed release or deployed service has already adopted
 those removals.
+
+That review's preserved self-service deletion route is historical. The
+[2026-08-30 decision](./decisions/2026-08-30-self-service-deletion-retirement.md)
+subsequently retires it in source; it does not remove retention/restore
+obligations or establish that the service or installed app has changed.
 
 Documents not listed as authorities are records or supporting context, not
 current operational instructions:

@@ -34,6 +34,14 @@ Scope: all files under `apps/worker/`. Apply the repository root guidance first.
 - Admin, incident, load, collection-control, and deletion pathways are privileged
   operational surfaces. Keep them fail-closed, auditable, and separate from
   ordinary participant capability.
+- Self-service `DELETE /api/v1/me` and individual-contribution deletion are
+  retired: return `404 NOT_FOUND` without participant mutation. Health keeps
+  `participantDeletion: false` and `deletionSafeRestoreReplay: true` distinct.
+- Owner erasure uses only `POST /api/v1/admin/action`, `run_maintenance`, and an
+  explicit confirmed `participantErasure` target behind Access-owner and CSRF
+  checks. Ordinary maintenance must not initiate erasure. Preserve the safe
+  deletion pipeline, resumability, ledger-proven completion, and digest-only
+  audit; retirement does not authorize migrations or retention/tombstone removal.
 
 ## Environment and authorization
 
@@ -60,6 +68,10 @@ Scope: all files under `apps/worker/`. Apply the repository root guidance first.
 - Use the disposable local backend laboratory for HTTP acceptance, queue,
   account-scoped, or incident behavior. Do not aim smoke or load tools at the
   live service without explicit authorization.
+- Network harnesses must validate a separate local owner session and admin
+  authority through `--owner-access-file` before enrollment or other writes.
+  The lab provisions this fixture; never promote a workload participant or
+  treat retired-route refusal as cleanup. This is not a production Access bypass.
 - For schema-dependent changes, validate both pre-migration refusal and
   post-migration behavior locally; report deployment and migration readiness as
   separate outcomes.

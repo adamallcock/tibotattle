@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { test } from "node:test";
 
 const ROOT = new URL("../", import.meta.url);
@@ -12,6 +12,151 @@ function exactStringLiterals(source) {
   return [...source.matchAll(/"([^"\\]*(?:\\.[^"\\]*)*)"/gu)]
     .map(([, value]) => value);
 }
+
+test("maintained Markdown retires self-service promises without implying history loss", async () => {
+  const paths = [
+    "README.md",
+    "SUPPORT.md",
+    "apps/local/README.md",
+    "apps/macos/README.md",
+    "apps/worker/README.md",
+    "docs/user-guide.md",
+    "docs/reference/local-data-and-privacy.md",
+  ];
+  for (const path of paths) {
+    const markdown = await text(path);
+    assert.match(markdown, /Disconnect this Mac/u, `${path} names device disconnect`);
+    assert.doesNotMatch(
+      markdown,
+      /Hosted deletion is always available|request deletion through the product controls|Full deletion control from the app|disclosure retains complete hosted deletion/u,
+      `${path} must not restore a self-service deletion promise`,
+    );
+  }
+  const guide = await text("docs/user-guide.md");
+  assert.match(guide, /It preserves previously contributed hosted\s+history, other devices, and local analysis/u);
+  assert.match(guide, /source change, not a deployed-service or installed-release/u);
+});
+
+test("owner erasure runbook preserves the exact request, retry, and audit contract", async () => {
+  const runbook = await text("docs/runbooks/production-operations.md");
+  const requestBodies = [...runbook.matchAll(/```json\s+([\s\S]*?)\s*```/gu)];
+  assert.equal(requestBodies.length, 1, "the minimal owner procedure has one explicit request body");
+  assert.deepEqual(JSON.parse(requestBodies[0][1]), {
+    action: "run_maintenance",
+    participantErasure: {
+      participantId: "participant:00000000-0000-4000-8000-000000000000",
+      confirmation: "erase_hosted_participant",
+    },
+  });
+  for (const marker of [
+    "POST /api/v1/admin/action",
+    "Cloudflare Access",
+    "pinned owner identity",
+    "x-usage-monitor-admin: 1",
+    'schemaVersion: "admin-action-v0.1"',
+    'task: "participant_erasure"',
+    "operationId",
+    "deleted: true",
+    "alreadyDeleted: false",
+    "alreadyDeleted: true",
+    "contributionsDeleted: null",
+    "unknown historical count, not zero",
+    "unexpired tombstone",
+    "409 PARTICIPANT_DELETING",
+    "older than five minutes",
+    "SHA256('app-usagemonitor/admin-participant-erasure/v1\\0' + participantId)",
+    "participantDeletion: false",
+    "deletionSafeRestoreReplay: true",
+  ]) {
+    assert.ok(runbook.includes(marker), `owner procedure retains ${marker}`);
+  }
+  assert.match(runbook, /without\s+`participantErasure` performs ordinary maintenance only/u);
+  assert.match(runbook, /stale attempt cannot complete after takeover/u);
+  assert.match(runbook, /Restore replay owns `state: 'deleting'` with `deletion_session_id: null`/u);
+  assert.match(runbook, /Cron\s+must not resume non-null owner or legacy deletion fences/u);
+  assert.match(runbook, /restore replay atomically claims only active\s+rows or interrupted restores/u);
+  assert.match(runbook, /Final removal\s+must match the null restore fence or the owner operation UUID/u);
+  assert.match(runbook, /not a claim that production has changed/u);
+});
+
+test("public templates retain security routing without self-service deletion promises", async () => {
+  const issueDirectory = ".github/ISSUE_TEMPLATE/";
+  const issuePaths = (await readdir(new URL(issueDirectory, ROOT), { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && /\.(?:md|ya?ml)$/iu.test(entry.name))
+    .map((entry) => `${issueDirectory}${entry.name}`);
+  const templates = new Map(await Promise.all([
+    ...issuePaths,
+    ".github/PULL_REQUEST_TEMPLATE.md",
+  ].map(async (path) => [path, await text(path)])));
+  for (const [path, template] of templates) {
+    assert.doesNotMatch(
+      template,
+      /upload\/deletion endpoints|Hosted deletion is always available|request deletion through the product controls|Full deletion control from the app/iu,
+      `${path} must not restore self-service deletion guidance`,
+    );
+  }
+  const hosted = templates.get(`${issueDirectory}hosted_service.yml`);
+  assert.match(hosted, /For security\s+problems/u);
+  assert.match(hosted, /private GitHub Security Advisory,\s+not a public issue \(see SECURITY\.md\)/u);
+  for (const boundary of ["contribution uploads", "device disconnect", "private owner erasure", "deletion-safe restore"]) {
+    assert.ok(hosted.includes(boundary), `hosted security guidance covers ${boundary}`);
+  }
+  assert.deepEqual(
+    [...hosted.matchAll(/^    id: ([a-z-]+)$/gmu)].map(([, id]) => id),
+    ["page", "when", "what-happened", "no-session-content"],
+    "the hosted bug form must not gain privacy-intake fields",
+  );
+  assert.match(
+    templates.get(`${issueDirectory}config.yml`),
+    /url: https:\/\/github\.com\/adamallcock\/tibotattle\/security\/advisories\/new/u,
+  );
+});
+
+test("local operation docs preserve owner preflight and durable disconnect intent", async () => {
+  const [runbook, workerReadme, localReadme, workerManifest] = await Promise.all([
+    text("docs/runbooks/production-operations.md"),
+    text("apps/worker/README.md"),
+    text("apps/local/README.md"),
+    text("apps/worker/package.json").then(JSON.parse),
+  ]);
+  for (const command of [
+    "smoke:http", "smoke:account-scoped:http", "smoke:queue:http",
+    "smoke:incident:http", "load:http",
+  ]) {
+    assert.equal(typeof workerManifest.scripts[command], "string");
+    assert.ok(runbook.includes(`\`${command}\``), `local procedure covers ${command}`);
+  }
+  for (const marker of [
+    "--owner-access-file",
+    "LOCAL_OWNER_ACCESS_REQUIRED",
+    "local-backend-owner-access-v0.1",
+    "ADMIN_IDENTITY_LINK_KEY",
+    "ownerAccessFileContainsSecret: true",
+    "ownerErasureVerified",
+  ]) {
+    assert.ok(runbook.includes(marker), `local owner procedure retains ${marker}`);
+  }
+  assert.match(runbook, /admin overview authorization before\s+participant enrollment, ingestion, or incident-control writes/u);
+  assert.match(runbook, /`--profile-only` remains offline\s+and requires no owner file/u);
+  assert.match(runbook, /does not bypass\s+production Cloudflare Access/u);
+  const localAcceptance = runbook.split("### Disposable local HTTP acceptance\n")[1]
+    ?.split("\n## ")[0];
+  assert.ok(localAcceptance, "the runbook has a distinct local acceptance boundary");
+  assert.match(localAcceptance, /serves `apps\/web\/public` directly under `--local`/u);
+  assert.doesNotMatch(localAcceptance, /production:stage-assets/u);
+  assert.match(localAcceptance, /does not change production\/staging asset paths, guarded wrappers/u);
+  for (const readme of [workerReadme, localReadme]) {
+    assert.ok(readme.includes("--owner-access-file"));
+    assert.doesNotMatch(readme, /npm run product:keys:local/u, "the lab provisions isolated keys itself");
+  }
+  for (const marker of ['paused: true', 'pausedReason: "device_disconnected"', 'nextAttemptAt: null']) {
+    assert.ok(localReadme.includes(marker), `local docs disclose ${marker}`);
+  }
+  assert.match(localReadme, /before remote\s+revocation or local credential cleanup/u);
+  assert.match(localReadme, /must not resume delivery/u);
+  assert.match(localReadme, /preserves\s+the credential\/binding for retry/u);
+  assert.match(localReadme, /real Codex home and production credential\s+backend/u);
+});
 
 test("shipping local data sources remain disclosed in every maintained user surface", async () => {
   const [
@@ -111,7 +256,7 @@ test("component READMEs delegate executable route inventories to the canonical r
   const workerRoutesList = [
     ...workerRoutes.matchAll(/pathname:\s*"([^"]+)"/gu),
   ].map(([, route]) => route);
-  assert.equal(workerRoutesList.length, 32, "review Worker route-count changes");
+  assert.equal(workerRoutesList.length, 31, "review Worker route-count changes");
   for (const route of workerRoutesList) {
     assert.ok(apiReference.includes(route), `API reference covers Worker ${route}`);
   }

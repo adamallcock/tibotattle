@@ -1072,7 +1072,7 @@ test("checked-in public source satisfies the complete release contract", async (
   const result = await buildFixtureSite(
     releaseArgs(value, { source: PUBLIC_SOURCE }),
   );
-  assert.equal(result.fileCount, 20);
+  assert.equal(result.fileCount, 21);
   const manifest = JSON.parse(
     await readFile(join(value.output, "release-site-manifest.json"), "utf8"),
   );
@@ -1089,6 +1089,7 @@ test("checked-in public source satisfies the complete release contract", async (
       "community.js",
       "docs.html",
       "github.svg",
+      "i18n.generated.js",
       "index.html",
       "install-cta.js",
       "localization.js",

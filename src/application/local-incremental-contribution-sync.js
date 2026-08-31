@@ -75,6 +75,7 @@ const OUTCOME_STATUSES = new Set(["succeeded", "partial", "failed", "paused"]);
 // one anonymous collision inflated the gap toward an hour).
 const COORDINATION_RETRY_CODES = new Set(["sync_in_progress", "index_busy"]);
 const PAUSED_REASONS = new Set([
+  "device_disconnected",
   "device_unavailable",
   "consent_rejected",
   "authorization_rejected",
@@ -290,6 +291,10 @@ class IncrementalContributionSyncController {
   // later start() call must never defeat a ladder a live process is walking.
   #startupClampConsidered = false;
   #settingsAvailable = true;
+  // Only a failed write of this controller's known-good disconnect pause may
+  // be retried in place. An unreadable settings file must never be replaced
+  // with the initial settings and lose its consent or history.
+  #deviceDisconnectPausePending = false;
   #started = false;
   #timer = null;
   #running = false;
@@ -526,6 +531,29 @@ class IncrementalContributionSyncController {
     return this.#serialize(async () => this.#project());
   }
 
+  async pauseForDeviceDisconnect() {
+    if (!this.#initialized) await this.initialize();
+    return this.#serialize(async () => {
+      this.#generation += 1;
+      this.#clearScheduledTimer();
+      this.#runAbortController?.abort();
+      if (!this.#settingsAvailable && !this.#deviceDisconnectPausePending) {
+        fail("settings_unavailable");
+      }
+      // This is user intent, not an auto-healable missing credential. Keep
+      // consent and every measured outcome/progress field intact; only an
+      // explicit approval or resume may arm delivery again.
+      this.#settings.paused = true;
+      this.#settings.pausedReason = "device_disconnected";
+      this.#settings.nextAttemptAt = null;
+      this.#deviceDisconnectPausePending = true;
+      await this.#persist();
+      this.#settingsAvailable = true;
+      this.#deviceDisconnectPausePending = false;
+      return this.#project();
+    });
+  }
+
   /**
    * The consent-once approval. Records the required v1.0 identifiers with
    * the moment of approval and starts the schedule immediately: after this,
@@ -641,21 +669,38 @@ class IncrementalContributionSyncController {
         this.#schedule();
         return null;
       }
+      const claim = {
+        generation: this.#generation,
+        abortController: new AbortController(),
+      };
       this.#running = true;
+      this.#runAbortController = claim.abortController;
       this.#clearScheduledTimer();
       this.#settings.lastAttemptAt = this.#nowIso();
       try {
         await this.#persist();
       } catch (error) {
         this.#running = false;
+        this.#runAbortController = null;
         throw error;
       }
-      return { generation: this.#generation };
+      return claim;
     });
     if (claim === null) return this.inspect();
 
-    const abortController = new AbortController();
-    this.#runAbortController = abortController;
+    const { abortController } = claim;
+    // A disconnect can serialize immediately after the claim, before the
+    // runner is entered. Its abort authority must already exist at claim time.
+    if (abortController.signal.aborted) {
+      return this.#serialize(async () => {
+        this.#running = false;
+        if (this.#runAbortController === abortController) {
+          this.#runAbortController = null;
+        }
+        this.#schedule();
+        return this.#project();
+      });
+    }
     let timedOut = false;
     let timeout = null;
     // The pass deadline is a hard watchdog, not merely a cooperative abort. A

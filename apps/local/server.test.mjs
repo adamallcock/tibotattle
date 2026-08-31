@@ -1580,6 +1580,9 @@ test("initialization failure retains the retirement lock until idempotent runtim
     async resume() {
       return {};
     },
+    async pauseForDeviceDisconnect() {
+      return {};
+    },
   };
   const baseOptions = {
     resourceRoot: files.resourceRoot,
@@ -1797,14 +1800,20 @@ test("participant relay supports explicit loopback development with exact forwar
       },
       body: "{}",
     })).status, 200);
-    assert.equal((await fetch(`${base}/api/v1/me`, {
+    const retiredDeletion = await fetch(`${base}/api/v1/me`, {
       method: "DELETE",
       headers: {
         Origin: base,
         Cookie: sessionCookie,
         "X-Usage-Monitor-CSRF": "csrf_token",
       },
-    })).status, 200);
+    });
+    assert.equal(retiredDeletion.status, 404);
+    assert.deepEqual(await retiredDeletion.json(), {
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      error: { code: "not_found" },
+    });
+    assert.equal(forwarded.length, 3);
     // Hosted sign-in crosses this relay as a start and a polled result only.
     // Neither carries a code, a verifier, or a redirect: the contribution
     // service owns all three.
@@ -1843,21 +1852,19 @@ test("participant relay supports explicit loopback development with exact forwar
     assert.equal(forwarded[2].headers.Cookie, sessionCookie);
     assert.equal(forwarded[2].headers["X-Usage-Monitor-CSRF"], "csrf_token");
     assert.equal(forwarded[2].body, "{}");
-    assert.equal(forwarded[3].method, "DELETE");
-    assert.equal(forwarded[3].body, null);
     assert.equal(
-      forwarded[4].url,
+      forwarded[3].url,
       "http://127.0.0.1:8792/api/v1/identity/google/start",
     );
-    assert.equal(Object.hasOwn(forwarded[4].headers, "Cookie"), false);
-    assert.equal(forwarded[4].body, "{}");
+    assert.equal(Object.hasOwn(forwarded[3].headers, "Cookie"), false);
+    assert.equal(forwarded[3].body, "{}");
     assert.equal(
-      forwarded[5].url,
+      forwarded[4].url,
       "http://127.0.0.1:8792/api/v1/identity/google/result",
     );
-    assert.equal(Object.hasOwn(forwarded[5].headers, "Cookie"), false);
-    assert.equal(forwarded[5].body.includes("SSSS"), true);
-    assert.equal(forwarded.length, 6);
+    assert.equal(Object.hasOwn(forwarded[4].headers, "Cookie"), false);
+    assert.equal(forwarded[4].body.includes("SSSS"), true);
+    assert.equal(forwarded.length, 5);
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });
@@ -1988,12 +1995,25 @@ test("participant relay blocks unknown authority routes and fails closed", async
     const base = `http://127.0.0.1:${app.port}`;
     for (const path of [
       "/api/v1/admin",
+      "/api/v1/admin/action",
       "/api/v1/device-pairings/claim",
       "/api/v1/device/upload-authorizations",
       "/api/v1/contributions/contribution:00000000-0000-4000-8000-000000000000",
       "/api/v1/me/stats",
     ]) {
       assert.equal((await fetch(`${base}${path}`)).status, 404);
+    }
+    for (const method of ["GET", "POST", "DELETE", "PUT", "PATCH"]) {
+      const retired = await fetch(`${base}/api/v1/me`, {
+        method,
+        // Even malformed ambient authority is not parsed for an unknown route.
+        headers: { Cookie: "invalid", "X-Usage-Monitor-CSRF": "invalid cookie" },
+      });
+      assert.equal(retired.status, 404, method);
+      assert.deepEqual(await retired.json(), {
+        schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+        error: { code: "not_found" },
+      });
     }
     assert.equal(forwarded, 0);
     assert.equal((await fetch(`${base}/api/v1/session`, {

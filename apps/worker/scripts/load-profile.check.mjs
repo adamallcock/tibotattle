@@ -194,6 +194,21 @@ test("network run rejects unsafe admission before requests", () => {
   assert.equal(unpaced.stdout, "");
 });
 
+test("load run reports missing local owner configuration without claiming cleanup", () => {
+  const run = spawnSync(process.execPath, [scriptPath], { encoding: "utf8", timeout: 10_000 });
+  assert.equal(run.status, 1, run.stderr);
+  const receipt = JSON.parse(run.stdout);
+  assert.equal(receipt.schemaVersion, "backend-load-receipt-v0.2");
+  assert.equal(receipt.status, "failed");
+  assert.deepEqual(receipt.failures, [{ code: "LOCAL_OWNER_ACCESS_REQUIRED", count: 1 }]);
+  assert.equal(receipt.counters.enrollments, 0);
+  assert.equal(receipt.counters.participantsErasedByOwner, 0);
+  assert.equal(receipt.counters.participantDeletionRefusalsVerified, 0);
+  assert.equal(receipt.latency.ownerErasure.count, 0);
+  assert.equal(receipt.fullProfileClaim, false);
+  assert.equal(run.stderr, "");
+});
+
 test("runner source exposes only a privacy-bounded receipt output path", () => {
   const source = readFileSync(scriptPath, "utf8");
   assert.doesNotMatch(source, /console\.(?:log|error|warn)/u);

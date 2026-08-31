@@ -5,6 +5,10 @@ import {
   PARTICIPANT_RELAY_ROUTE_POLICY,
   matchParticipantRelayRoute,
 } from "./transport/participant-relay-routes.js";
+import {
+  centralRouteMethods,
+  createLocalCentralProxy,
+} from "../../src/local-companion-central-proxy.js";
 
 const EXPECTED_ROUTES = [
   { pathname: "/api/v1/enroll", methods: ["POST"] },
@@ -14,13 +18,12 @@ const EXPECTED_ROUTES = [
   { pathname: "/api/v1/identity/apple/result", methods: ["POST"] },
   { pathname: "/api/v1/session", methods: ["GET"] },
   { pathname: "/api/v1/logout", methods: ["POST"] },
-  { pathname: "/api/v1/me", methods: ["DELETE"] },
   { pathname: "/api/v1/me/device-pairings", methods: ["POST"] },
 ];
 
 test("participant relay route policy preserves the exact allowlist", () => {
-  assert.equal(EXPECTED_ROUTES.length, 9);
-  assert.equal(PARTICIPANT_RELAY_ROUTE_POLICY.length, 9);
+  assert.equal(EXPECTED_ROUTES.length, 8);
+  assert.equal(PARTICIPANT_RELAY_ROUTE_POLICY.length, 8);
   assert.deepEqual(PARTICIPANT_RELAY_ROUTE_POLICY, EXPECTED_ROUTES);
   assert.equal(Object.isFrozen(PARTICIPANT_RELAY_ROUTE_POLICY), true);
   for (const policy of PARTICIPANT_RELAY_ROUTE_POLICY) {
@@ -33,6 +36,9 @@ test("participant relay route policy preserves the exact allowlist", () => {
 test("participant relay route policy keeps route matching exact", () => {
   for (const pathname of [
     "/api/v1/admin",
+    "/api/v1/admin/action",
+    "/api/v1/me",
+    "/api/v1/me/",
     "/api/v1/enroll/",
     "/api/v1/ENROLL",
     "/api/v1/device-pairings/claim",
@@ -58,4 +64,22 @@ test("participant relay route policy keeps route matching exact", () => {
   ]) {
     assert.equal(matchParticipantRelayRoute(pathname), null, pathname);
   }
+});
+
+test("the central relay cannot bypass participant deletion retirement", async () => {
+  let forwarded = 0;
+  const proxy = createLocalCentralProxy({
+    centralOrigin: "https://usage.example",
+    fetchImpl: async () => { forwarded += 1; },
+  });
+  assert.deepEqual([...centralRouteMethods("/api/health")], ["GET"]);
+  for (const pathname of ["/api/v1/me", "/api/v1/admin/action"]) {
+    assert.equal(centralRouteMethods(pathname), null);
+    assert.equal(proxy.handles(pathname), false);
+    await assert.rejects(
+      proxy.request({ method: "DELETE" }, pathname),
+      { code: "central_route_not_allowed" },
+    );
+  }
+  assert.equal(forwarded, 0);
 });

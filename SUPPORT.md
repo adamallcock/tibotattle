@@ -10,13 +10,31 @@ update to the latest published stable release, read the
 - Use the [bug report form](https://github.com/adamallcock/tibotattle/issues/new?template=bug_report.yml)
   for the macOS app, local dashboard, refresh, updater, or install problems.
 - Use the [hosted-service form](https://github.com/adamallcock/tibotattle/issues/new?template=hosted_service.yml)
-  for `tibotattle.com`, sign-in, contribution, deletion, or community results.
+  for non-sensitive `tibotattle.com`, sign-in, contribution, disconnect, or
+  community-result bugs; it is a public issue form, not a private erasure channel.
 - Use a [private GitHub Security Advisory](https://github.com/adamallcock/tibotattle/security/advisories/new)
   for vulnerabilities, privacy-boundary failures, credential exposure, or a
   way to access another person's data. Do not open a public security issue.
 - Provider billing, subscription, account access, and authoritative quota
   questions belong with the provider. TiboTattle reports observations and
   estimates; it is not the provider's billing system.
+
+## Hosted history and privacy requests
+
+In the [2026-08-30 source contract](docs/decisions/2026-08-30-self-service-deletion-retirement.md),
+**Disconnect this Mac** requires confirmation and stops this device's hosted
+contribution authority without deleting hosted history or local analysis.
+Signing out is not device disconnect. Self-service hosted deletion is retired;
+private hosted erasure is a separately authorized maintainer operation described
+in [production operations](docs/runbooks/production-operations.md#private-owner-participant-erasure).
+Older installed apps and deployed services may not yet match that source.
+
+This retirement does not decide the handling of applicable privacy or erasure
+requests. A dedicated private privacy-request intake channel and completion
+deadline are not documented here. Do not put account identifiers, proof of
+identity, or private request details in public issues. The Security Advisory
+channel above is for security/privacy-boundary failures, not a newly promised
+general erasure-request service.
 
 ## What to include
 

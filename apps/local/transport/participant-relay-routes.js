@@ -16,7 +16,6 @@ export const PARTICIPANT_RELAY_ROUTE_POLICY = Object.freeze([
   defineParticipantRelayRoute("/api/v1/identity/apple/result", ["POST"]),
   defineParticipantRelayRoute("/api/v1/session", ["GET"]),
   defineParticipantRelayRoute("/api/v1/logout", ["POST"]),
-  defineParticipantRelayRoute("/api/v1/me", ["DELETE"]),
   defineParticipantRelayRoute("/api/v1/me/device-pairings", ["POST"]),
 ]);
 

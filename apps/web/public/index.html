@@ -1106,8 +1106,8 @@
               </span>
               <span class="identity-account-copy">
                 <strong id="identity-account-provider">Signed in with Google</strong>
-                <small id="identity-account-detail">
-                  Signing out ends this app's contribution session.
+                <small id="identity-account-detail" data-i18n="contribution.signOutDetail">
+                  Signing out ends this app's hosted session. It does not stop this Mac's uploads; use Disconnect this Mac for that.
                 </small>
               </span>
               <!--
@@ -1265,21 +1265,29 @@
               </button>
             </div>
             <p class="annotation" id="incremental-sync-retry-note" role="status" hidden></p>
-            <!--
-              Deletion honesty (owner-directed 2026-08-08): the card used to
-              state "Deletion removes everything you contributed, always."
-              with no control behind it. The sentence is gone; in its place
-              is the working control — the service's participant deletion
-              (DELETE /api/v1/me) removes accepted chunks and stored uploads
-              and tombstones the account. The button appears only with a live
-              contribution session, because deletion requires one.
-            -->
-            <div class="contribution-cta-buttons incremental-delete-row">
-              <button class="button button-quiet" id="delete-contributions" type="button" hidden>
-                Delete my contributions
+          </section>
+          <section class="contribution-device-controls" id="contribution-device-controls" aria-label="Disconnect this Mac" data-i18n-aria-label="contribution.disconnect.action" hidden>
+            <p class="annotation" id="disconnect-device-description" data-i18n="contribution.disconnect.description">
+              Stop this Mac's uploads without deleting hosted history or local analysis. Signing out does not disconnect this Mac.
+            </p>
+            <div class="contribution-cta-buttons">
+              <button class="button button-quiet" id="disconnect-device" type="button" aria-haspopup="dialog" aria-controls="disconnect-device-dialog" aria-describedby="disconnect-device-description" data-i18n="contribution.disconnect.action">
+                Disconnect this Mac
               </button>
             </div>
+            <p class="participant-action-status" id="disconnect-device-status" role="status" tabindex="-1" hidden></p>
           </section>
+          <dialog class="contribution-disconnect-dialog" id="disconnect-device-dialog" aria-labelledby="disconnect-device-title" aria-describedby="disconnect-device-confirmation">
+            <h2 id="disconnect-device-title" data-i18n="contribution.disconnect.title">Disconnect this Mac?</h2>
+            <p id="disconnect-device-confirmation" data-i18n="contribution.disconnect.confirmation">
+              This revokes this Mac's upload connection and pauses its delivery. Your hosted sign-in, previously contributed history, other devices, and local analysis are kept. Connecting again requires an explicit Review and approve action.
+            </p>
+            <p class="annotation" id="disconnect-device-check" role="status"></p>
+            <div class="contribution-cta-buttons">
+              <button class="button button-secondary" id="disconnect-device-cancel" type="button" data-i18n="contribution.disconnect.cancel" autofocus>Cancel</button>
+              <button class="button button-primary" id="disconnect-device-confirm" type="button" data-i18n="contribution.disconnect.action" disabled>Disconnect this Mac</button>
+            </div>
+          </dialog>
         </div>
 
           <!--

@@ -194,17 +194,11 @@ const EXACT_ROUTES = [
     methods: ["GET"],
     authority: "public",
   },
-  {
-    pathname: "/api/v1/me",
-    id: "participant",
-    methods: ["DELETE"],
-    authority: "session",
-  },
 ] as const satisfies readonly WorkerRouteDefinition[];
 
 describe("Worker route registry", () => {
   it("recognizes every exact route and preserves stable log classifications", () => {
-    expect(EXACT_ROUTES).toHaveLength(32);
+    expect(EXACT_ROUTES).toHaveLength(31);
     expect(WORKER_ROUTE_POLICY).toEqual(EXACT_ROUTES);
     expect(Object.isFrozen(WORKER_ROUTE_POLICY)).toBe(true);
     for (const definition of WORKER_ROUTE_POLICY) {
@@ -230,6 +224,7 @@ describe("Worker route registry", () => {
 
   it("keeps retired API paths absent instead of aliasing or reviving them", () => {
     for (const pathname of [
+      "/api/v1/me",
       "/api/v1/recover",
       "/api/v1/me/upload-authorizations",
       "/api/v1/me/contributions/read",
