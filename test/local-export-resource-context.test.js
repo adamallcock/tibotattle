@@ -89,6 +89,7 @@ const PLATFORM_PUBLIC_EXPORTS = Object.freeze([
   "readBoundedUtf8LineEntries",
   "readBoundedUtf8Lines",
   "readCodexConfigServiceTier",
+  "readCodexLocalThreadMetadata",
   "readExportCompatibilityArtifactSet",
   "readOwnerOnlyLocalMetadataBundlePair",
   "rotateParticipantSecret",

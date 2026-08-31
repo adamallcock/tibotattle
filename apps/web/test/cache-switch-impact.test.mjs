@@ -448,11 +448,13 @@ test("cache-switch evidence is bounded and projects no local identifiers", () =>
     "current",
     "currentCacheReadTokens",
     "estimatedPremiumUsd",
+    "gapSeconds",
     "lostCacheTokens",
     "observedAt",
     "previous",
     "previousCacheReadTokens",
   ]);
+  assert.equal(result.recent[0].gapSeconds, 45);
   assert.deepEqual(Object.keys(result.recent[0].previous).sort(), [
     "model",
     "reasoningEffort",
@@ -993,6 +995,8 @@ test("cache-switch mobile cards carry their translated column labels", async () 
     "node",
     "localizedNode",
     "cacheSwitchDataCell",
+    "cacheDropThreadLinks",
+    "cacheDropThreadCell",
     "formatCount",
     "formatApiMoney",
     "formatLocal",
@@ -1011,6 +1015,8 @@ test("cache-switch mobile cards carry their translated column labels", async () 
     element,
     (tagName, className, key) => element(tagName, className, key),
     cacheSwitchDataCell,
+    { cells: { switch: [] } },
+    () => cacheSwitchDataCell("cache-drop-thread-cell", "Thread unavailable", "accounting.cacheDropThread.column"),
     String,
     (value) => `$${value.toFixed(2)}`,
     (value) => value,
@@ -1036,7 +1042,7 @@ test("cache-switch mobile cards carry their translated column labels", async () 
   assert.deepEqual(
     rows.children[0].children.map((cell) => cell.getAttribute("data-label")),
     [
-      "translated:accounting.cacheSwitch.column.localTime",
+      "translated:accounting.cacheDropThread.column",
       "translated:accounting.cacheSwitch.column.change",
       "translated:accounting.cacheSwitch.column.cacheRead",
       "translated:accounting.cacheSwitch.column.lostTokens",

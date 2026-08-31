@@ -34,7 +34,7 @@ that compatibility backend.
 1. Launch **TiboTattle.app**.
 2. On the first launch, review the one-time **Get Started** disclosure. It
    names every normal local source: selected Codex `sessions` and
-   `archived_sessions`, `state_5.sqlite`, `config.toml`, the installed Codex
+   `archived_sessions`, `state_5.sqlite`, `session_index.jsonl`, `config.toml`, the installed Codex
    app-server methods `account/read`, `account/rateLimits/read`, and
    `account/usage/read`. It also explains what owner-only derived state is
    retained, which content is excluded, how optional contribution stays off,
@@ -162,6 +162,16 @@ resize controls. Its unified toolbar adds only the native affordances that are
 better outside the report: local status, **Refresh usage**, **Share**, and
 **Settings**. **Share** opens the report's existing local share card; it does
 not create a second report or sharing service.
+
+Both recent cache-drop tables offer local **Thread name** links, with separate
+parent and subworker links when ancestry is known. Click or keyboard-activate
+a link to open its canonical `codex://threads/<UUID>` target in Codex. A
+native-owned isolated content world checks the trusted click; the shell then
+revalidates the source main frame, pinned companion origin, and exact target.
+Programmatic navigation and generic new-window requests cannot open Codex, and
+no names or identifiers are logged or persisted by this handoff. Native
+context-menu **Open Link** does not perform this Codex handoff; use the link
+itself. Existing HTTPS and hosted sign-in-return behavior are unchanged.
 
 The toolbar has no independent data authority. **Refresh usage** reuses the
 already-running loopback Node companion and its existing local refresh route.

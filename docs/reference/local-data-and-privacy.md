@@ -9,12 +9,13 @@ last_verified_commit: 52399658
 # Local data, network, and privacy inventory
 
 This is the maintained technical inventory behind TiboTattle's first-run and
-public privacy disclosures. It describes local source reads, derived stores,
-network operations, and intentionally separate removal actions. The baseline
-review commit above predates the
+public privacy disclosures. It describes what the implemented app can read, what
+it derives and stores, which operations use the network, and which removal
+actions are intentionally separate. The baseline review commit above predates the
 [2026-08-30 self-service retirement](../decisions/2026-08-30-self-service-deletion-retirement.md)
-documented here. That update is a source contract, not evidence of an installed
-release or hosted deployment.
+and [local cache-drop thread links](../decisions/2026-08-30-local-cache-drop-thread-links.md)
+documented here. Source changes do not prove that an installed or published
+artifact already contains them, or that the hosted service has been deployed.
 
 The central rule is structural: prompts, responses, reasoning, raw commands,
 credentials, private paths/filenames, emails, account names, and other free
@@ -42,6 +43,7 @@ upload surface that enables them.
 | --- | --- | --- | --- |
 | Managed Claude status-line callback | Explicit standalone CLI install/repair lifecycle | Bounded JSON status input through the managed local broker; projected status/usage fields only. | Managed callback state plus provider-isolated pseudonym capability. This is not an installed-app feature. |
 | Custom Codex home | User chooses a directory in Settings | It replaces the default Codex home anchor; the same fixed subpaths and allowlists apply. | Owner-only launcher setting. |
+| Local cache-drop thread links | Local interactive dashboard, for recent displayed drops only | Read-only bounded `session_index.jsonl` (`id`, `thread_name`, `updated_at`) and `state_5.sqlite` (`id`, explicit `name`, worker nickname, and allowlisted `source.subagent.thread_spawn` ancestry). Never uses prompt-bearing `threads.title`, first messages, or transcripts. | Names and IDs exist only in a separate `no-store`, same-origin local response and transient UI memory. No snapshot/cache/report/share-card/diagnostic/contribution persistence. Clicking hands only the canonical thread UUID to the local Codex URL handler. |
 | Export workspace | Explicit CLI or review flow | Only allowlisted metadata for the selected time range and sources. | Journaled workspace, chunks, manifest, and verification/deletion receipts at explicit paths. |
 | Contribution preparation | Explicit review/consent flow | Closed telemetry schema; exact payload is locally reviewable before first approval. | Prepared spool/review archive and replay-safe sync state under the app state root. |
 

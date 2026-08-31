@@ -1277,6 +1277,101 @@ test("window-breakdown route bounds its range and returns a per-model/speed shap
   }
 });
 
+test("cache-drop thread links are private, transient, query-free local reads", async () => {
+  const files = await fixture();
+  const store = fakeStore();
+  const requests = [];
+  const privateName = "Synthetic local thread name";
+  const threadId = "11111111-1111-4111-8111-111111111111";
+  let fail = false;
+  const overviewBefore = structuredClone(store.getOverview());
+  const payload = {
+    schemaVersion: "local-cache-drop-thread-links-v1",
+    status: "available",
+    generation: "7",
+    entries: [{ kind: "switch", key: "synthetic-anonymous-pair", thread: {
+      id: threadId, name: privateName, nickname: null, parent: null,
+    } }],
+  };
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: store,
+    refreshRunner: async () => ({}),
+    cacheDropThreadLinksProvider: async (options) => {
+      requests.push(options);
+      if (fail) throw new Error(privateName);
+      return payload;
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const route = `${base}/api/local/cache-drop-thread-links`;
+    const headers = { "X-Usage-Monitor-Local": "1" };
+    // Missing header, foreign origin, arbitrary identifiers/paths and methods
+    // are refused before the metadata provider is called.
+    assert.equal((await fetch(route)).status, 403);
+    assert.equal((await fetch(route, { headers: {
+      ...headers, Origin: "https://example.invalid",
+    } })).status, 403);
+    assert.equal((await fetch(`${route}?id=${threadId}`, { headers })).status, 400);
+    assert.equal((await fetch(`${route}?path=elsewhere`, { headers })).status, 400);
+    for (const method of ["POST", "DELETE", "OPTIONS"]) {
+      const response = await fetch(route, { method, headers });
+      assert.equal(response.status, 405);
+      assert.equal(response.headers.get("access-control-allow-origin"), null);
+    }
+    const rebind = await rawRequest({
+      port: app.port, path: "/api/local/cache-drop-thread-links",
+      headers: { ...headers, Host: `example.invalid:${app.port}` },
+    });
+    assert.equal(rebind.status, 403);
+    assert.equal(requests.length, 0);
+
+    // Same-origin browser GETs normally omit Origin; explicit matching Origin
+    // is allowed too. Both reads get an independent current snapshot input.
+    for (const admitted of [headers, { ...headers, Origin: base }]) {
+      const response = await fetch(route, { headers: admitted });
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.equal(response.headers.get("access-control-allow-origin"), null);
+      assert.equal(response.headers.get("referrer-policy"), "no-referrer");
+      assert.deepEqual(await response.json(), payload);
+    }
+    assert.equal(requests.length, 2);
+    assert.deepEqual(requests[0], { overview: overviewBefore });
+    assert.deepEqual(store.getOverview(), overviewBefore);
+    assert.equal(store.reloads, 0);
+    for (const publicRoute of [
+      "/api/local/overview", "/api/local/gradient", "/api/local/weekly",
+      "/api/local/quality", "/reports/gradient", "/reports/weekly",
+    ]) {
+      const response = await fetch(`${base}${publicRoute}`);
+      assert.equal(response.status, 200, publicRoute);
+      const body = await response.text();
+      assert.equal(body.includes(privateName), false, publicRoute);
+      assert.equal(body.includes(threadId), false, publicRoute);
+    }
+
+    // Metadata failures are optional unavailability, not refresh failure or
+    // filesystem diagnostics. In particular, do not echo provider errors.
+    fail = true;
+    const unavailable = await fetch(route, { headers });
+    assert.equal(unavailable.status, 200);
+    assert.deepEqual(await unavailable.json(), {
+      schemaVersion: "local-cache-drop-thread-links-v1",
+      status: "unavailable", generation: null, entries: [],
+    });
+    assert.equal(store.reloads, 0);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
 test("local companion remains usable before Codex is installed", async () => {
   const files = await fixture();
   const app = await startLocalCompanionServer({

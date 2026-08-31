@@ -2634,6 +2634,115 @@ function effectiveCacheSwitchEffort(value) {
   return value === "ultra" ? "max" : value;
 }
 
+// This separate contract is only for interactive local navigation. Never add
+// its names or raw thread identifiers to normalized accounting/report DTOs.
+const LOCAL_CACHE_DROP_THREAD_LINKS_SCHEMA = "local-cache-drop-thread-links-v1";
+const CACHE_DROP_THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const MAX_CACHE_DROP_THREAD_LINKS = 160;
+
+function normalizeAccountingGeneration(value) {
+  if (typeof value !== "number"
+      && (typeof value !== "string" || value.length > 32
+        || !/^[1-9]\d*(?:\.0+)?$/u.test(value))) return null;
+  const numeric = Number(value);
+  return Number.isSafeInteger(numeric) && numeric > 0 ? String(numeric) : null;
+}
+
+/** Mirrors the companion's content-free event-pair key, never an identity. */
+export function cacheDropThreadLookupKey(kind, row) {
+  if (!["switch", "continuity"].includes(kind)
+      || !row || typeof row !== "object" || Array.isArray(row)) return null;
+  const previous = kind === "switch" ? row.previous : row.configuration;
+  const current = kind === "switch" ? row.current : row.configuration;
+  for (const configuration of [previous, current]) {
+    if (!configuration || typeof configuration.model !== "string"
+        || configuration.model.length > 200
+        || !/^[a-zA-Z0-9][a-zA-Z0-9._:/-]*$/u.test(configuration.model)
+        || configuration.reasoningEffort === "unknown"
+        || !LOCAL_REASONING_EFFORTS.has(configuration.reasoningEffort)) return null;
+  }
+  if (typeof row.observedAt !== "string" || row.observedAt.length !== 24
+      || canonicalInstant(row.observedAt) === null
+      || typeof row.gapSeconds !== "number" || !Number.isFinite(row.gapSeconds)
+      || row.gapSeconds < 0
+      || ![row.previousCacheReadTokens, row.currentCacheReadTokens, row.lostCacheTokens]
+        .every((value) => Number.isSafeInteger(value) && value >= 0)
+      || row.lostCacheTokens < 1
+      || row.currentCacheReadTokens > row.previousCacheReadTokens / 2
+      || row.lostCacheTokens > row.previousCacheReadTokens - row.currentCacheReadTokens) return null;
+  const observedMs = Date.parse(row.observedAt);
+  const gapMs = Math.round(row.gapSeconds * 1_000);
+  if (!Number.isSafeInteger(gapMs) || gapMs < 0
+      || gapMs / 1_000 !== row.gapSeconds || observedMs < gapMs) return null;
+  return JSON.stringify([
+    kind, row.observedAt, row.gapSeconds,
+    previous.model, previous.reasoningEffort,
+    current.model, current.reasoningEffort,
+    row.previousCacheReadTokens, row.currentCacheReadTokens, row.lostCacheTokens
+  ]);
+}
+
+function validCacheDropThreadKey(kind, key) {
+  if (typeof key !== "string" || key.length > 2048) return false;
+  let tuple;
+  try { tuple = JSON.parse(key); } catch { return false; }
+  if (!Array.isArray(tuple) || tuple.length !== 10 || tuple[0] !== kind) return false;
+  const previous = { model: tuple[3], reasoningEffort: tuple[4] };
+  const current = { model: tuple[5], reasoningEffort: tuple[6] };
+  return cacheDropThreadLookupKey(kind, {
+    observedAt: tuple[1], gapSeconds: tuple[2], previous, current,
+    configuration: current,
+    previousCacheReadTokens: tuple[7], currentCacheReadTokens: tuple[8],
+    lostCacheTokens: tuple[9]
+  }) === key;
+}
+
+function validLocalThreadName(value, maximum = 512) {
+  return value === null || (typeof value === "string"
+    && value.length > 0 && value.length <= maximum
+    && !/[\u0000-\u001f\u007f-\u009f]/u.test(value));
+}
+
+export function normalizeCacheDropThreadLinks(value) {
+  const unavailable = {
+    schemaVersion: LOCAL_CACHE_DROP_THREAD_LINKS_SCHEMA,
+    status: "unavailable", generation: null, entries: []
+  };
+  if (!hasExactKeys(value, ["schemaVersion", "status", "generation", "entries"])
+      || value.schemaVersion !== LOCAL_CACHE_DROP_THREAD_LINKS_SCHEMA
+      || value.status !== "available"
+      || !Array.isArray(value.entries)
+      || value.entries.length > MAX_CACHE_DROP_THREAD_LINKS) return unavailable;
+  const generation = normalizeAccountingGeneration(value.generation);
+  if (generation === null) return unavailable;
+  const seen = new Set();
+  const entries = [];
+  for (const entry of value.entries) {
+    const thread = entry?.thread;
+    if (!hasExactKeys(entry, ["kind", "key", "thread"])
+        || !validCacheDropThreadKey(entry.kind, entry.key)
+        || seen.has(entry.key)
+        || !hasExactKeys(thread, ["id", "name", "nickname", "parent"])
+        || typeof thread.id !== "string" || !CACHE_DROP_THREAD_ID.test(thread.id)
+        || !validLocalThreadName(thread.name)
+        || !validLocalThreadName(thread.nickname, 80)) return unavailable;
+    const parent = thread.parent;
+    if (parent !== null && (!hasExactKeys(parent, ["id", "name"])
+        || typeof parent.id !== "string" || !CACHE_DROP_THREAD_ID.test(parent.id)
+        || parent.id === thread.id || !validLocalThreadName(parent.name))) return unavailable;
+    seen.add(entry.key);
+    entries.push({
+      kind: entry.kind,
+      key: entry.key,
+      thread: {
+        id: thread.id, name: thread.name, nickname: thread.nickname,
+        parent: parent === null ? null : { id: parent.id, name: parent.name }
+      }
+    });
+  }
+  return { schemaVersion: LOCAL_CACHE_DROP_THREAD_LINKS_SCHEMA, status: "available", generation, entries };
+}
+
 function normalizeCacheSwitchRecent(rows, maximumRows) {
   return array(rows)
     // Bound work before parsing and sorting as well as bounding the output.
@@ -2682,6 +2791,7 @@ function normalizeCacheSwitchRecent(rows, maximumRows) {
       // session, event, path, or rollout fields on a hostile row are dropped.
       return [{
         observedAt,
+        gapSeconds,
         changeType,
         previous,
         current,
@@ -4798,6 +4908,8 @@ function normalizeLocalAccounting(value = {}, {
     ? normalizeLocalModelUsage(value.modelUsage)
     : [...models, ...normalizeLocalModelUsage(value?.spark?.byModel)];
   const normalized = {
+    generation: normalizeAccountingGeneration(value.generation),
+    generationMatched: value.generationMatched === true,
     projection: normalizeAccountingProjection(value.projection, {
       allowImplicitDemoProjection
     }),
@@ -5639,6 +5751,20 @@ export class LocalCompanionClient {
 
   health() {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/health`);
+  }
+
+  async cacheDropThreadLinks() {
+    try {
+      return normalizeCacheDropThreadLinks(await fetchJson(
+        this.fetchImpl, `${LOCAL_ROOT}/cache-drop-thread-links`, {
+          cache: "no-store",
+          headers: { "X-Usage-Monitor-Local": "1" }
+        }
+      ));
+    } catch {
+      // Older companions and missing optional metadata do not fail refresh.
+      return normalizeCacheDropThreadLinks(null);
+    }
   }
 
   async onboarding() {

@@ -7,6 +7,7 @@ import {
   CODEX_PRIMARY_LIMIT_ID,
   CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
   CODEX_WEEKLY_ALLOWANCE_MINUTES,
+  cacheDropThreadLookupKey,
   demoDashboard,
   isValidQuotaWindowDuration,
   normalizeIncrementalContributionSyncStatus,
@@ -107,6 +108,17 @@ const communityClient = new CommunityClient({
 });
 
 let dashboard = null;
+// Private, local-only display enrichment. Thread names never become part of
+// an accounting/dashboard DTO, share card, contribution, or browser storage.
+const cacheDropThreadLinks = {
+  dashboard: null,
+  generation: null,
+  requestToken: 0,
+  loadToken: 0,
+  requested: false,
+  entries: new Map(),
+  cells: { switch: [], continuity: [] },
+};
 // Owner decision 2026-08-06: the calibration rolling comparison window is
 // fixed at three hours. The 15-minute and 1-hour widths the old segmented
 // control offered proved inaccurate, so the chart, its summary tiles, the
@@ -901,6 +913,7 @@ function hideConnectionNotice() {
 }
 
 function renderDashboardUnavailableState(kind) {
+  resetCacheDropThreadLinks();
   const companionCopy = isLoopbackDashboard()
     ? "dashboard.unavailable.companionInAppCopy"
     : "dashboard.unavailable.companionCopy";
@@ -1078,6 +1091,11 @@ function renderLocalOnboarding(value) {
 function renderDashboard(data) {
   dashboardUnavailableState = null;
   dashboard = data;
+  if (!isCacheDropThreadDashboard(data) || data?.accounting?.generationMatched !== true
+      || cacheDropThreadLinks.dashboard !== data
+      || cacheDropThreadLinks.generation !== data?.accounting?.generation) {
+    resetCacheDropThreadLinks(data);
+  }
   if (data.mode === "demo") {
     setJourneyState("demo-mode");
     $("#setup-card").hidden = true;
@@ -1147,6 +1165,9 @@ function renderDashboard(data) {
   renderWeekly(data);
   renderAccounting(data);
   renderCommunityJourney();
+  // This optional lookup must never delay the native readiness marker or the
+  // accounting render. Only the first-column cells are updated when it lands.
+  void loadCacheDropThreadLinks(data);
 }
 
 function renderQuotaCards(data) {
@@ -8023,10 +8044,173 @@ function cacheSwitchDataCell(className, value, labelKey) {
   return cell;
 }
 
+function isCacheDropThreadDashboard(data) {
+  return ["local", "real_local_evidence"].includes(data?.mode);
+}
+
+function cacheDropThreadId(value) {
+  return typeof value === "string"
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value)
+    ? value.toLowerCase()
+    : null;
+}
+
+function cacheDropThreadName(thread) {
+  return typeof thread?.name === "string" && thread.name.trim()
+    ? thread.name.trim()
+    : t("accounting.cacheDropThread.fallback", {
+      id: cacheDropThreadId(thread?.id)?.slice(0, 8) ?? "",
+    });
+}
+
+function cacheDropThreadParts(thread) {
+  const id = cacheDropThreadId(thread?.id);
+  if (id === null) return [];
+  const parentId = cacheDropThreadId(thread.parent?.id);
+  const parent = parentId !== null && parentId !== id ? thread.parent : null;
+  const nickname = typeof thread.nickname === "string"
+    ? thread.nickname.trim()
+    : "";
+  const worker = parent !== null || nickname !== "";
+  const parts = parent === null ? [] : [{
+    name: cacheDropThreadName(parent),
+    href: `codex://threads/${parentId}`,
+    worker: false,
+  }];
+  parts.push({
+    name: worker
+      ? t("accounting.cacheDropThread.subworker", {
+        name: nickname || cacheDropThreadName(thread),
+      })
+      : cacheDropThreadName(thread),
+    href: `codex://threads/${id}`,
+    worker,
+  });
+  return parts;
+}
+
+function fillCacheDropThreadCell(cell, thread, observedAt) {
+  const focused = cell.contains(document.activeElement)
+    ? document.activeElement
+    : null;
+  const focusedHref = focused?.getAttribute("href") ?? null;
+  clear(cell);
+  cell.setAttribute("data-label", t("accounting.cacheDropThread.column"));
+  const time = t("accounting.cacheDropThread.localTime", {
+    time: formatLocal(observedAt),
+  });
+  cell.setAttribute("title", time);
+  const content = rawNode("span", "cache-drop-thread-content", "");
+  const parts = cacheDropThreadParts(thread);
+  if (parts.length === 0) {
+    const unavailable = rawNode("span", "cache-drop-thread-unavailable",
+      t("accounting.cacheDropThread.unavailable"));
+    unavailable.tabIndex = 0;
+    unavailable.setAttribute("title", time);
+    unavailable.setAttribute("aria-label",
+      `${t("accounting.cacheDropThread.unavailable")}. ${time}`);
+    content.append(unavailable);
+  }
+  for (const part of parts) {
+    const link = rawNode("a", "cache-drop-thread-link", part.name);
+    link.href = part.href;
+    link.setAttribute("title", time);
+    link.setAttribute("aria-label", t("accounting.cacheDropThread.open", {
+      name: part.name,
+      time,
+    }));
+    // Suppress any page URL as a referrer when the operating system opens
+    // Codex. No arbitrary upstream URL is ever accepted by this renderer.
+    link.setAttribute("rel", "noreferrer");
+    if (part.worker) {
+      const worker = rawNode("span", "cache-drop-subworker", "");
+      worker.append(document.createTextNode("["), link, document.createTextNode("]"));
+      content.append(document.createTextNode(parts.length > 1 ? " " : ""), worker);
+    } else {
+      content.append(link);
+    }
+  }
+  cell.append(content);
+  if (focused) {
+    const links = [...content.querySelectorAll("a")];
+    const target = links.find((link) => link.getAttribute("href") === focusedHref)
+      ?? links[0]
+      ?? content.querySelector(".cache-drop-thread-unavailable");
+    target?.focus({ preventScroll: true });
+  }
+}
+
+function cacheDropThreadCell(kind, item) {
+  const cell = rawNode("td", "cache-drop-thread-cell", "");
+  fillCacheDropThreadCell(cell,
+    cacheDropThreadLinks.entries.get(cacheDropThreadLookupKey(kind, item)),
+    item.observedAt);
+  cacheDropThreadLinks.cells[kind].push({ cell, item });
+  return cell;
+}
+
+function updateCacheDropThreadCells() {
+  for (const [kind, cells] of Object.entries(cacheDropThreadLinks.cells)) {
+    for (const { cell, item } of cells) {
+      if (!cell.isConnected) continue;
+      fillCacheDropThreadCell(cell,
+        cacheDropThreadLinks.entries.get(cacheDropThreadLookupKey(kind, item)),
+        item.observedAt);
+    }
+  }
+}
+
+function resetCacheDropThreadLinks(data = null) {
+  cacheDropThreadLinks.requestToken += 1;
+  cacheDropThreadLinks.dashboard = data;
+  cacheDropThreadLinks.generation = isCacheDropThreadDashboard(data)
+      && typeof data.accounting?.generation === "string"
+    ? data.accounting.generation
+    : null;
+  cacheDropThreadLinks.requested = false;
+  cacheDropThreadLinks.entries.clear();
+  // Remove old names even when a failed dashboard load leaves its previous
+  // accounting rows visible underneath the unavailable-state notice.
+  updateCacheDropThreadCells();
+  cacheDropThreadLinks.cells = { switch: [], continuity: [] };
+}
+
+async function loadCacheDropThreadLinks(data) {
+  const generation = cacheDropThreadLinks.generation;
+  if (data !== dashboard || data !== cacheDropThreadLinks.dashboard
+      || !isCacheDropThreadDashboard(data) || !isLoopbackDashboard()
+      || generation === null || generation === ""
+      || data.accounting?.generationMatched !== true
+      || cacheDropThreadLinks.requested
+      || typeof localClient.cacheDropThreadLinks !== "function") return;
+  cacheDropThreadLinks.requested = true;
+  const token = ++cacheDropThreadLinks.requestToken;
+  const loadToken = cacheDropThreadLinks.loadToken;
+  try {
+    const result = await localClient.cacheDropThreadLinks();
+    if (token !== cacheDropThreadLinks.requestToken
+        || loadToken !== cacheDropThreadLinks.loadToken
+        || data !== dashboard || data !== cacheDropThreadLinks.dashboard
+        || !isCacheDropThreadDashboard(data) || !isLoopbackDashboard()
+        || generation !== data.accounting?.generation
+        || data.accounting?.generationMatched !== true
+        || result?.status !== "available"
+        || result.generation !== generation) return;
+    cacheDropThreadLinks.entries = new Map(
+      result.entries.map((entry) => [entry.key, entry.thread]),
+    );
+    updateCacheDropThreadCells();
+  } catch {
+    // Older companions and unavailable local metadata are a normal, quiet
+    // fallback. Accounting remains usable and no private lookup error leaks.
+  }
+}
+
 function renderAccountingCacheSwitchDetails(impact) {
   const disclosure = $("#cache-switch-details");
   const rows = $("#cache-switch-rows");
   if (!disclosure || !rows) return;
+  cacheDropThreadLinks.cells.switch = [];
   clear(rows);
   const available = impact?.status === "available";
   disclosure.hidden = !available;
@@ -8065,11 +8249,7 @@ function renderAccountingCacheSwitchDetails(impact) {
   for (const item of page.rows) {
     const row = node("tr");
     row.append(
-      cacheSwitchDataCell(
-        "",
-        formatLocal(item.observedAt),
-        "accounting.cacheSwitch.column.localTime",
-      ),
+      cacheDropThreadCell("switch", item),
       cacheSwitchDataCell(
         "cache-switch-change",
         cacheSwitchChangeDescription(item),
@@ -8957,6 +9137,7 @@ function renderAccountingCacheContinuityDetails(impact) {
   const disclosure = $("#cache-continuity-details");
   const rows = $("#cache-continuity-rows");
   if (!disclosure || !rows) return;
+  cacheDropThreadLinks.cells.continuity = [];
   clear(rows);
   const available = impact?.status === "available";
   disclosure.hidden = !available;
@@ -9000,25 +9181,32 @@ function renderAccountingCacheContinuityDetails(impact) {
   for (const item of page.rows) {
     const row = node("tr");
     row.append(
-      rawNode("td", "", formatLocal(item.observedAt)),
-      rawNode("td", "numeric-cell", formatCacheContinuityGap(item.gapSeconds)),
-      rawNode(
-        "td",
+      cacheDropThreadCell("continuity", item),
+      cacheSwitchDataCell(
+        "numeric-cell", formatCacheContinuityGap(item.gapSeconds),
+        "accounting.cacheContinuity.column.gap",
+      ),
+      cacheSwitchDataCell(
         "cache-switch-change",
         cacheContinuityConfigurationDescription(item),
+        "accounting.cacheContinuity.column.configuration",
       ),
-      rawNode(
-        "td",
+      cacheSwitchDataCell(
         "numeric-cell",
         `${formatCount(item.previousCacheReadTokens)} → ${formatCount(item.currentCacheReadTokens)}`,
+        "accounting.cacheContinuity.column.cacheRead",
       ),
-      rawNode("td", "numeric-cell", formatCount(item.lostCacheTokens)),
-      rawNode(
-        "td",
+      cacheSwitchDataCell(
+        "numeric-cell",
+        formatCount(item.lostCacheTokens),
+        "accounting.cacheContinuity.column.lostTokens",
+      ),
+      cacheSwitchDataCell(
         "model-api-equivalent",
         item.estimatedPremiumUsd === null
           ? "—"
           : formatApiMoney(item.estimatedPremiumUsd),
+        "accounting.cacheContinuity.column.apiEquivalent",
       ),
     );
     rows.append(row);
@@ -10858,6 +11046,7 @@ function markLocalDashboardReady() {
 }
 
 async function loadLocalDashboard() {
+  cacheDropThreadLinks.loadToken += 1;
   const previousBusy = localActionBusy;
   localActionBusy = true;
   const button = $("#refresh-button");
@@ -10964,6 +11153,7 @@ function renderDashboardSkeleton() {
 }
 
 async function loadQuickResultDashboard() {
+  cacheDropThreadLinks.loadToken += 1;
   const data = await localClient.load();
   renderDashboard(data);
   if (localOnboarding) renderLocalOnboarding(localOnboarding);

@@ -185,7 +185,7 @@
 "launcher.dataDiagnostics" = "数据与诊断…";
 "launcher.detailPreparingLocalDashboard" = "正在准备私有本地仪表板及其有界的前台更新。";
 "launcher.failureDetails" = "%@ 代码：%@。%@";
-"launcher.firstRunDisclosure" = "%@ 会在应用打开时更新本地 %@ 使用和额度证据。首次分析会在设置后开始；后续检查会复用同一个有界的本地伴随程序。\n\n本地读取：所选 %@ sessions 和 archived_sessions 文件夹中的使用元数据；用于运行谱系的 state_5.sqlite；用于服务层级设置的 config.toml；以及已安装 Codex app-server 的 account/read、account/rateLimits/read 和 account/usage/read 方法。来源记录只在本地处理；提示词和回复文本绝不会保留在 TiboTattle 的派生状态中。\n\n存储：仅含无内容索引、缓存计算、设置，以及在你的仅所有者 %@ 应用数据文件夹中准备的任何贡献。现有假名身份和设备凭据仍保留在 macOS 钥匙串中。\n\n社区贡献是可选的。在你审阅无内容字段并明确发送贡献前，它会保持关闭。\n\n本地额度通知默认也处于关闭状态。如果在“设置 → 通知”中启用，它们只使用前台刷新得到的最新提供商额度证据，不会增加后台轮询。\n\n%@\n\n绝不贡献：提示词、回复、文件路径、仓库、命令、凭据、电子邮件或帐户名称。\n\n分析运行时请保持应用打开。你可以关闭并重新打开 TiboTattle 窗口；退出应用会停止当前分析并保留已完成的检查点。\n\n%@";
+"launcher.firstRunDisclosure" = "%@ 会在应用打开时更新本地 %@ 使用和额度证据。首次分析会在设置后开始；后续检查会复用同一个有界的本地伴随程序。\n\n本地读取：所选 %@ sessions 和 archived_sessions 文件夹中的使用元数据；用于运行谱系和子任务关系的 state_5.sqlite；用于本地任务显示名称的 session_index.jsonl（名称和链接绝不会加入报告或贡献）；用于服务层级设置的 config.toml；以及已安装 Codex app-server 的 account/read、account/rateLimits/read 和 account/usage/read 方法。来源记录只在本地处理；提示词和回复文本绝不会保留在 TiboTattle 的派生状态中。\n\n存储：仅含无内容索引、缓存计算、设置，以及在你的仅所有者 %@ 应用数据文件夹中准备的任何贡献。现有假名身份和设备凭据仍保留在 macOS 钥匙串中。\n\n社区贡献是可选的。在你审阅无内容字段并明确发送贡献前，它会保持关闭。\n\n本地额度通知默认也处于关闭状态。如果在“设置 → 通知”中启用，它们只使用前台刷新得到的最新提供商额度证据，不会增加后台轮询。\n\n%@\n\n绝不贡献：提示词、回复、文件路径、仓库、命令、凭据、电子邮件或帐户名称。\n\n分析运行时请保持应用打开。你可以关闭并重新打开 TiboTattle 窗口；退出应用会停止当前分析并保留已完成的检查点。\n\n%@";
 "launcher.getStarted" = "开始使用";
 "launcher.loadingPrivateDashboard" = "仅从这台 Mac 加载私有本地仪表板。";
 "launcher.needsAttention" = "需要关注";
