@@ -298,6 +298,7 @@ enum TiboTattleLocalization {
         case menuBarPopupNotSubscriptionBill = "menuBarPopup.notSubscriptionBill"
         case menuBarPopupAccountingUnavailableTitle = "menuBarPopup.accountingUnavailableTitle"
         case menuBarPopupAccountingUnavailableBody = "menuBarPopup.accountingUnavailableBody"
+        case menuBarPopupRetainedHistory = "menuBarPopup.retainedHistory"
         case menuBarPopupNoUsageObserved = "menuBarPopup.noUsageObserved"
         case menuBarPopupStartingTitle = "menuBarPopup.startingTitle"
         case menuBarPopupStartingBody = "menuBarPopup.startingBody"
@@ -888,6 +889,8 @@ enum TiboTattleLocalization {
                 "Local usage history is not available yet"
             case .menuBarPopupAccountingUnavailableBody:
                 "Run a local analysis to build 7-day and 30-day API-price-equivalent history from this Mac."
+            case .menuBarPopupRetainedHistory:
+                "Showing the last completed analysis."
             case .menuBarPopupNoUsageObserved:
                 "No local usage observed in %@."
             case .menuBarPopupStartingTitle:

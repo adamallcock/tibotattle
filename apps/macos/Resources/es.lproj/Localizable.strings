@@ -129,6 +129,7 @@
 "menuBarPopup.notSubscriptionBill" = "No es una factura de suscripción";
 "menuBarPopup.accountingUnavailableTitle" = "El historial de uso local aún no está disponible";
 "menuBarPopup.accountingUnavailableBody" = "Ejecuta un análisis local para crear un historial de equivalencia de precios de la API de 7 y 30 días a partir de este Mac.";
+"menuBarPopup.retainedHistory" = "Se muestra el último análisis completado.";
 "menuBarPopup.noUsageObserved" = "No se ha observado uso local en %@.";
 "menuBarPopup.startingTitle" = "Preparando el uso local";
 "menuBarPopup.startingBody" = "TiboTattle mostrará valores solo después de una observación local reciente.";
