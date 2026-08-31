@@ -33,3 +33,18 @@ CREATE TABLE community_model_composition_days (
   payload_json TEXT NOT NULL CHECK (length(payload_json) <= 16384),
   computed_at TEXT NOT NULL
 ) STRICT;
+
+-- Deletion reaches backward through published history, exactly as 0031's
+-- community_daily_aggregate_participant_withdrawal does for the public daily
+-- aggregates. A day row is a point-in-time cohort snapshot that cannot be
+-- rebuilt "without the deleted source", and with a small cohort a per-model
+-- median can BE one participant's fitted capacity — so the whole retained
+-- series is dropped rather than served on. It regrows forward from the next
+-- warm pass over the surviving corpus.
+CREATE TRIGGER community_model_composition_day_withdrawal
+BEFORE UPDATE OF state ON participants
+FOR EACH ROW
+WHEN OLD.state = 'active' AND NEW.state = 'deleting'
+BEGIN
+  DELETE FROM community_model_composition_days;
+END;

@@ -2294,7 +2294,10 @@ export function adminAllowanceChartModel(preview, {
       // day's identification-passing participant count.
       return {
         centralUsd: summary.capacityUsd,
-        fitCount: modelDay.fittedParticipantCount,
+        // Both counts are this model's own supporting accounts, so the dot
+        // radius and its label describe the series they sit on, not the
+        // day-global cohort.
+        fitCount: summary.participantCount,
         participantCount: summary.participantCount,
         band80Usd: null,
       };

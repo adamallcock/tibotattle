@@ -6,7 +6,10 @@ import {
   accountScopedModelCompositionV1,
   accountScopedQuotaAnalysisV1,
 } from "./quota-analysis-v1";
-import type { V1ModelComposition } from "./quota-analysis-v1";
+import type {
+  V1ModelComposition,
+  V1ModelCompositionResult,
+} from "./quota-analysis-v1";
 import { SERVER_PRICING_METHOD_VERSION } from "./server-pricing";
 
 /**
@@ -610,7 +613,12 @@ export function summarizeCommunityCapacityByPlanType(
 // Bump when the composition adapter's synthesis, pricing basis, or fold
 // changes. Deliberately separate from FIT_ADAPTER_VERSION: a composition
 // change must not invalidate every blended fit cache, and vice versa.
-const COMPOSITION_ADAPTER_VERSION = "v1-composition-1";
+// v1-composition-2: multi-plan windows refuse (plan-multiplier
+// incommensurability), not-fully-priced events void their whole bin, and the
+// cached shape carries latestQuotaObservedAt + poisonedBinCount and includes
+// refusals so a refusing participant stops re-running the raw corpus scan
+// every warm pass.
+const COMPOSITION_ADAPTER_VERSION = "v1-composition-2";
 const COMPOSITION_CACHE_KEY_SUFFIX =
   `${APP_PRICE_REGISTRY_MANIFEST.sha256}:${COMPOSITION_ADAPTER_VERSION}:${SERVER_PRICING_METHOD_VERSION}`;
 // The composition JSON is a per-model vector plus diagnostics — a few hundred
@@ -623,13 +631,19 @@ export interface CommunityModelComposition {
   readonly composition: V1ModelComposition;
 }
 
-function validCachedComposition(value: unknown): value is V1ModelComposition {
+function validCachedComposition(
+  value: unknown,
+): value is V1ModelCompositionResult {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return false;
   }
   const candidate = value as Record<string, unknown>;
+  if (candidate.status === "not_testable") {
+    return typeof candidate.reason === "string";
+  }
   return candidate.status === "ready"
     && typeof candidate.planType === "string"
+    && typeof candidate.latestQuotaObservedAt === "string"
     && typeof candidate.fit === "object" && candidate.fit !== null;
 }
 
@@ -651,6 +665,7 @@ export async function collectCommunityModelCompositions(
   v1ParticipantCount: number;
   unsupportedSourceParticipantCount: number;
   refusedParticipantCount: number;
+  storeAvailable: boolean;
 }> {
   const participants = await db.prepare(
     `WITH ${COMMUNITY_ALLOWANCE_PARTICIPANT_SOURCES_CTE}
@@ -662,12 +677,26 @@ export async function collectCommunityModelCompositions(
   let v1ParticipantCount = 0;
   let unsupportedSourceParticipantCount = 0;
   let refusedParticipantCount = 0;
+  // Without the 0041 store, every warm pass would silently re-run the full
+  // per-participant corpus scan and throw the result away. Probe once and
+  // skip the expensive work entirely; the day series just does not advance
+  // until the migration is applied, which the caller reports rather than
+  // masks.
+  let storeAvailable = true;
+  try {
+    await db.prepare(
+      "SELECT 1 FROM community_model_composition_cache LIMIT 1",
+    ).first();
+  } catch {
+    storeAvailable = false;
+  }
   for (const row of participants.results) {
     if (row.source !== "v1") {
       unsupportedSourceParticipantCount += 1;
       continue;
     }
     v1ParticipantCount += 1;
+    if (!storeAvailable) continue;
     let cacheKey: string | null = null;
     try {
       const epoch = await db.prepare(
@@ -686,7 +715,11 @@ export async function collectCommunityModelCompositions(
       if (cached) {
         const parsed: unknown = JSON.parse(cached.composition_json);
         if (validCachedComposition(parsed)) {
-          compositions.push({ participantId: row.participant_id, composition: parsed });
+          if (parsed.status === "ready") {
+            compositions.push({ participantId: row.participant_id, composition: parsed });
+          } else {
+            refusedParticipantCount += 1;
+          }
           continue;
         }
       }
@@ -696,25 +729,28 @@ export async function collectCommunityModelCompositions(
       // next pass retries the cache.
       cacheKey = null;
     }
-    let composition: V1ModelComposition | null = null;
+    let result: V1ModelCompositionResult;
     try {
-      const result = await accountScopedModelCompositionV1(
+      result = await accountScopedModelCompositionV1(
         db,
         row.participant_id,
         { nowMs },
       );
-      if (result.status === "ready") composition = result;
-      else refusedParticipantCount += 1;
     } catch {
-      // A single participant's analyzer throw never aborts the collector.
+      // A single participant's analyzer throw never aborts the collector —
+      // and, unlike a refusal, is never cached: a transient D1 error must not
+      // become a durable "refused" verdict.
       refusedParticipantCount += 1;
       continue;
     }
-    if (composition === null) continue;
-    compositions.push({ participantId: row.participant_id, composition });
+    if (result.status === "ready") {
+      compositions.push({ participantId: row.participant_id, composition: result });
+    } else {
+      refusedParticipantCount += 1;
+    }
     if (cacheKey !== null) {
       try {
-        const compositionJson = JSON.stringify(composition);
+        const compositionJson = JSON.stringify(result);
         if (new TextEncoder().encode(compositionJson).byteLength
             <= COMPOSITION_CACHE_JSON_LIMIT_BYTES) {
           await db.prepare(
@@ -738,5 +774,6 @@ export async function collectCommunityModelCompositions(
     v1ParticipantCount,
     unsupportedSourceParticipantCount,
     refusedParticipantCount,
+    storeAvailable,
   };
 }

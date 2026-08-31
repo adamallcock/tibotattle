@@ -1062,7 +1062,7 @@ const COMPOSITION_UNKNOWN_MODEL = "unknown";
 
 export interface V1ModelComposition {
   readonly status: "ready";
-  /** The participant's modal plan_type over the retained quota series. */
+  /** The participant's single plan_type over the retained quota series. */
   readonly planType: string;
   readonly fit: CompositionFit;
   readonly voidedBinCount: number;
@@ -1070,6 +1070,10 @@ export interface V1ModelComposition {
   readonly quotaRowCount: number;
   readonly usageEventCount: number;
   readonly unpricedUsageEventCount: number;
+  /** Kernel bins voided because a not-fully-priced event fell inside them. */
+  readonly poisonedBinCount: number;
+  /** Newest retained quota reading; the cohort layer's recency evidence. */
+  readonly latestQuotaObservedAt: string;
 }
 
 export interface V1ModelCompositionRefusal {
@@ -1172,12 +1176,22 @@ export async function accountScopedModelCompositionV1(
   if (quotaRows.length === 0) {
     return { status: "not_testable", reason: "supported_quota_track_unavailable" };
   }
-  let planType = "";
-  let planCount = -1;
-  for (const [candidate, count] of [...planCounts].sort(
-    (left, right) => left[0].localeCompare(right[0]),
-  )) {
-    if (count > planCount) { planType = candidate; planCount = count; }
+  // One plan per window, or no fit at all. The kernel prices every pool with
+  // one shared capacity vector, but a percentage point is worth
+  // plan-multiplier-different dollars per plan — mixing regimes publishes
+  // capacities wrong by up to that ratio (measured 14x on a synthetic
+  // plus-to-pro switch), and the split-half gate cannot see it because both
+  // interleaved halves contain both regimes. The blended path is immune (it
+  // normalizes per fit); this path refuses instead of guessing.
+  if (planCounts.size > 1) {
+    return { status: "not_testable", reason: "multi_plan_window_unsupported" };
+  }
+  const planType = [...planCounts.keys()][0]!;
+  let latestQuotaObservedAtMs = Number.NEGATIVE_INFINITY;
+  for (const row of quotaRows) {
+    if (row.observedAtMs > latestQuotaObservedAtMs) {
+      latestQuotaObservedAtMs = row.observedAtMs;
+    }
   }
 
   // Usage fold: per (kernel bin, model), cost from the shared server pricer.
@@ -1189,6 +1203,7 @@ export async function accountScopedModelCompositionV1(
   }>();
   let usageEventCount = 0;
   let unpricedUsageEventCount = 0;
+  const poisonedBins = new Set<number>();
   let total = 0;
   let cursorObs = observedAtCutoff;
   let cursorId = 0;
@@ -1216,13 +1231,20 @@ export async function accountScopedModelCompositionV1(
       if (!Number.isFinite(observedAtMs)) continue;
       const priced = priceV1UsageRecord(row.record_json, row.observed_at);
       if (priced === null) continue;
+      const eventBinStartMs = Math.floor(observedAtMs / grainMs) * grainMs;
       if (priced.pricingStatus !== "fully_priced") {
+        // The blended path refuses a whole reset over one unpriced event; the
+        // mirror here is voiding the bin. Training on a bin with understated
+        // cost would shift the unpriced model's quota movement onto whatever
+        // priced models co-occur — a systematic bias the split-half gate
+        // passes.
         unpricedUsageEventCount += 1;
+        poisonedBins.add(eventBinStartMs);
         continue;
       }
       usageEventCount += 1;
       const model = priced.modelId ?? COMPOSITION_UNKNOWN_MODEL;
-      const binStartMs = Math.floor(observedAtMs / grainMs) * grainMs;
+      const binStartMs = eventBinStartMs;
       const key = `${binStartMs}\u0000${model}`;
       const existing = costByBinAndModel.get(key);
       if (existing) existing.costNanousd += priced.costNanousd;
@@ -1237,6 +1259,7 @@ export async function accountScopedModelCompositionV1(
   const usageRows: CompositionUsageRow[] = [];
   for (const entry of costByBinAndModel.values()) {
     if (entry.costNanousd <= 0) continue;
+    if (poisonedBins.has(entry.observedAtMs)) continue;
     usageRows.push({
       observedAtMs: entry.observedAtMs,
       model: entry.model,
@@ -1255,5 +1278,7 @@ export async function accountScopedModelCompositionV1(
     quotaRowCount: quotaRows.length,
     usageEventCount,
     unpricedUsageEventCount,
+    poisonedBinCount: poisonedBins.size,
+    latestQuotaObservedAt: new Date(latestQuotaObservedAtMs).toISOString(),
   };
 }

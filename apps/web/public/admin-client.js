@@ -248,10 +248,11 @@ function projectAllowanceModels(value, latestAllowedDay) {
     previousDay = dayValue;
     const fitted = count(day.fittedParticipantCount, code);
     const unstable = count(day.unstableParticipantCount, code);
+    const stale = count(day.staleParticipantCount, code);
     const refused = count(day.refusedParticipantCount, code);
     const v1Count = count(day.v1ParticipantCount, code);
     const unsupported = count(day.unsupportedSourceParticipantCount, code);
-    if (fitted + unstable + refused !== v1Count) invalid(code);
+    if (fitted + unstable + stale + refused !== v1Count) invalid(code);
     const byModel = record(day.byModel, code);
     if (Object.keys(byModel).sort().join("|") !== expectedModelKeys.join("|")) {
       invalid(code);
@@ -268,6 +269,7 @@ function projectAllowanceModels(value, latestAllowedDay) {
       byModel: projectedByModel,
       fittedParticipantCount: fitted,
       unstableParticipantCount: unstable,
+      staleParticipantCount: stale,
       refusedParticipantCount: refused,
       v1ParticipantCount: v1Count,
       unsupportedSourceParticipantCount: unsupported,

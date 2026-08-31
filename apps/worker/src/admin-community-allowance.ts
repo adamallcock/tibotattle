@@ -78,6 +78,10 @@ export interface AdminCommunityModelCompositionDay {
   readonly fittedParticipantCount: number;
   /** Participants whose composition ran but failed identification. */
   readonly unstableParticipantCount: number;
+  /** Cached compositions whose newest quota evidence fell out of the
+   * trailing window — a departed device must age out of the cohort, never
+   * ride a frozen chunk epoch into every future day. */
+  readonly staleParticipantCount: number;
   readonly refusedParticipantCount: number;
   readonly v1ParticipantCount: number;
   readonly unsupportedSourceParticipantCount: number;
@@ -231,12 +235,14 @@ function validModelCompositionDay(
     "byModel",
     "fittedParticipantCount",
     "unstableParticipantCount",
+    "staleParticipantCount",
     "refusedParticipantCount",
     "v1ParticipantCount",
     "unsupportedSourceParticipantCount",
   ]) || !validDay(day.day)
       || !validCount(day.fittedParticipantCount)
       || !validCount(day.unstableParticipantCount)
+      || !validCount(day.staleParticipantCount)
       || !validCount(day.refusedParticipantCount)
       || !validCount(day.v1ParticipantCount)
       || !validCount(day.unsupportedSourceParticipantCount)) {
@@ -244,9 +250,10 @@ function validModelCompositionDay(
   }
   const fitted = day.fittedParticipantCount as number;
   const unstable = day.unstableParticipantCount as number;
+  const stale = day.staleParticipantCount as number;
   const refused = day.refusedParticipantCount as number;
   const v1Count = day.v1ParticipantCount as number;
-  if (fitted + unstable + refused !== v1Count) return false;
+  if (fitted + unstable + stale + refused !== v1Count) return false;
   const byModel = record(day.byModel);
   if (byModel === null || !exactKeys(
     byModel,
@@ -530,9 +537,24 @@ export function buildCommunityModelCompositionDay(
       plan.multiplier,
     ]),
   );
+  const dayEndMs = Date.parse(`${day}T00:00:00.000Z`) + MILLISECONDS_PER_DAY;
+  const recencyFloorMs = dayEndMs
+    - COMMUNITY_ALLOWANCE_TRAILING_DAYS * MILLISECONDS_PER_DAY;
   const normalized: Array<Readonly<Record<string, number>>> = [];
   let unstableParticipantCount = 0;
+  let staleParticipantCount = 0;
   for (const { composition } of collection.compositions) {
+    // The chunk-epoch cache is frozen for a device that stops uploading, so
+    // day membership needs its own recency evidence: the same trailing
+    // window the blended preview uses, against the composition's newest
+    // retained quota reading.
+    const latestMs = Date.parse(composition.latestQuotaObservedAt);
+    if (!Number.isFinite(latestMs)
+        || latestMs <= recencyFloorMs
+        || latestMs > dayEndMs) {
+      staleParticipantCount += 1;
+      continue;
+    }
     const multiplier = planMultiplier.get(composition.planType);
     const vector = composition.fit.capacityUsdByModel;
     if (composition.fit.status !== "fitted"
@@ -566,6 +588,7 @@ export function buildCommunityModelCompositionDay(
     byModel: Object.freeze(byModel),
     fittedParticipantCount: normalized.length,
     unstableParticipantCount,
+    staleParticipantCount,
     refusedParticipantCount: collection.refusedParticipantCount,
     v1ParticipantCount: collection.v1ParticipantCount,
     unsupportedSourceParticipantCount:
@@ -731,8 +754,10 @@ export function buildAdminCommunityAllowancePreview(
 }
 
 /**
- * Scheduled-only preview source. The fit-corpus reader is SELECT-only but may
- * scan the active cache corpus, so browser requests must never call this path.
+ * Scheduled-only preview source. Besides the SELECT-only fit-corpus read it
+ * refreshes the per-model composition caches and upserts today's
+ * community_model_composition_days row, so browser requests must never call
+ * this path.
  */
 export async function buildAdminCommunityAllowancePreviewFromSource(
   db: D1Database,
@@ -747,10 +772,12 @@ export async function buildAdminCommunityAllowancePreviewFromSource(
   let modelDays: AdminCommunityModelCompositionDay[] = [];
   try {
     const collection = await collectCommunityModelCompositions(db, nowMs);
-    await upsertCommunityModelCompositionDay(
-      db,
-      buildCommunityModelCompositionDay(collection, today),
-    );
+    if (collection.storeAvailable) {
+      await upsertCommunityModelCompositionDay(
+        db,
+        buildCommunityModelCompositionDay(collection, today),
+      );
+    }
   } catch {
     // Fall through to the read: stale history beats no history.
   }

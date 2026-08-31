@@ -379,15 +379,19 @@ describe("admin community allowance preview", () => {
     expect(serializedPreview).not.toContain("participant-1");
     expect(serializedPreview).not.toContain("capacityNanousd");
     expect(serializedPreview).not.toContain("lastObservedAt");
-    expect(statements).toHaveLength(9);
+    expect(statements).toHaveLength(11);
     const writes = statements.filter((statement) => (
       /\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM)\b/iu
         .test(statement)
     ));
-    // The per-model day upsert is the scheduled source path's single write;
-    // everything else stays SELECT-only.
-    expect(writes).toHaveLength(1);
+    // Two writes only: the per-participant composition cache row (refusals are
+    // cached too, so a thin participant is not recomputed every warm) and the
+    // per-model day upsert; everything else stays SELECT-only.
+    expect(writes).toHaveLength(2);
     expect(writes[0]!.trimStart()).toMatch(
+      /^INSERT INTO community_model_composition_cache\b/u,
+    );
+    expect(writes[1]!.trimStart()).toMatch(
       /^INSERT INTO community_model_composition_days\b/u,
     );
     expect(preview?.models.days).toEqual([]);
@@ -542,16 +546,19 @@ describe("admin community allowance preview", () => {
       source.database,
       nowEpoch,
     )).resolves.toEqual({ code: "ALLOWANCE_PREVIEW_CACHE_REFRESHED" });
-    expect(source.statements).toHaveLength(9);
+    expect(source.statements).toHaveLength(11);
     const warmWrites = source.statements.filter((statement) => (
       /\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM)\b/iu
         .test(statement)
     ));
-    expect(warmWrites).toHaveLength(2);
+    expect(warmWrites).toHaveLength(3);
     expect(warmWrites[0]!.trimStart()).toMatch(
-      /^INSERT INTO community_model_composition_days\b/u,
+      /^INSERT INTO community_model_composition_cache\b/u,
     );
     expect(warmWrites[1]!.trimStart()).toMatch(
+      /^INSERT INTO community_model_composition_days\b/u,
+    );
+    expect(warmWrites[2]!.trimStart()).toMatch(
       /^INSERT INTO admin_community_allowance_preview_cache\b/u,
     );
     expect(source.statements[0]).toMatch(

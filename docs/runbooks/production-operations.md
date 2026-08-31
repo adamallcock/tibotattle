@@ -22,7 +22,7 @@ the [macOS stable release runbook](./macos-stable-release-runbook.md).
 |---|---|
 | Public and `www` hosts | One production Worker and manifest-verified static release-site assets |
 | Admin host | Same Worker, but admin routes exist only on `admin.tibotattle.com`, behind Cloudflare Access and a Worker-side owner check |
-| Primary durable state | `USAGE_MONITOR_DB` D1 binding; checked-in migrations through `0040_community_allowance_publication_state.sql` in this snapshot |
+| Primary durable state | `USAGE_MONITOR_DB` D1 binding; checked-in migrations through `0041_community_model_composition.sql` in this snapshot |
 | Deletion ledger | Separate `DELETION_LEDGER` D1 binding and migration ledger |
 | Encrypted/quarantined objects | Production `QUARANTINE` R2 binding with explicit deletion/reconciliation and deletion-safe restore rules; automatic age-based deletion is disabled in this source snapshot |
 | Upload admission | `UPLOAD_INGRESS_BUDGET` Durable Object plus explicit rate-limit bindings |

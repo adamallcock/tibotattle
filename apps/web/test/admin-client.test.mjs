@@ -99,6 +99,7 @@ function allowancePreviewPayload() {
         },
         fittedParticipantCount: 1,
         unstableParticipantCount: 0,
+        staleParticipantCount: 0,
         refusedParticipantCount: 0,
         v1ParticipantCount: 1,
         unsupportedSourceParticipantCount: 2,

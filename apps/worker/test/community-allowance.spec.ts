@@ -985,6 +985,7 @@ async function seedV1CalibratableReset(options: {
   stepPp: number;
   tag: string;
   unpriceable?: boolean;
+  planType?: string;
   // Override the nine 10+index*stepPp levels with an explicit used_percent
   // sequence — e.g. one carrying a small backward "noise" dip.
   usedPercents?: number[];
@@ -999,7 +1000,7 @@ async function seedV1CalibratableReset(options: {
       occurrence_id: `q-${options.tag}-${index}`,
       observed_at: new Date(startMs + index * 5 * 60_000).toISOString(),
       provider: "openai_codex",
-      plan_type: "pro",
+      plan_type: options.planType ?? "pro",
       // Real v1 uploads always carry the variant as "unknown" (the client
       // strips it); the band must draw from this shape, cohorting by plan_type.
       plan_variant: "unknown",
@@ -1998,6 +1999,8 @@ describe("per-model composition from the v1.0 chunk corpus", () => {
         quotaRowCount: 9,
         usageEventCount: 8,
         unpricedUsageEventCount: 0,
+        poisonedBinCount: 0,
+        latestQuotaObservedAt: "2026-08-30T12:00:00.000Z",
       },
     });
     const day = buildCommunityModelCompositionDay({
@@ -2019,6 +2022,7 @@ describe("per-model composition from the v1.0 chunk corpus", () => {
     expect(day.day).toBe("2026-08-30");
     expect(day.fittedParticipantCount).toBe(2);
     expect(day.unstableParticipantCount).toBe(1);
+    expect(day.staleParticipantCount).toBe(0);
     expect(day.refusedParticipantCount).toBe(1);
     expect(day.v1ParticipantCount).toBe(4);
     expect(day.unsupportedSourceParticipantCount).toBe(2);
@@ -2038,6 +2042,100 @@ describe("per-model composition from the v1.0 chunk corpus", () => {
       capacityUsd: null,
       participantCount: 0,
     });
+  });
+
+  it("ages a frozen-epoch participant out of the day cohort", () => {
+    const composition = (
+      participantId: string,
+      latestQuotaObservedAt: string,
+    ): CommunityModelComposition => ({
+      participantId,
+      composition: {
+        status: "ready",
+        planType: "pro",
+        fit: {
+          status: "fitted",
+          observationCount: 30,
+          totalCostUsd: 100,
+          modelCostShares: {},
+          capacityUsdByModel: { "gpt-5.6-sol": 2_400 },
+          singleConstantUsd: 2_000,
+          r2: 0.8,
+          singleConstantR2: 0.7,
+          solverConverged: true,
+          identification: {
+            adjustedR2: 0.8,
+            singleConstantAdjustedR2: 0.7,
+            splitHalfIdentified: true,
+            splitHalfMaxCapacityDriftFraction: 0.05,
+          },
+        },
+        voidedBinCount: 0,
+        poolCount: 1,
+        quotaRowCount: 9,
+        usageEventCount: 8,
+        unpricedUsageEventCount: 0,
+        poisonedBinCount: 0,
+        latestQuotaObservedAt,
+      },
+    });
+    const day = buildCommunityModelCompositionDay({
+      compositions: [
+        composition("p-live", "2026-08-29T12:00:00.000Z"),
+        // Newest quota evidence 40 days old: a departed device riding its
+        // frozen chunk-epoch cache. It must not enter the median.
+        composition("p-departed", "2026-07-21T12:00:00.000Z"),
+      ],
+      v1ParticipantCount: 2,
+      unsupportedSourceParticipantCount: 0,
+      refusedParticipantCount: 0,
+    }, "2026-08-30");
+    expect(day.fittedParticipantCount).toBe(1);
+    expect(day.staleParticipantCount).toBe(1);
+    expect(day.byModel["gpt-5.6-sol"]).toEqual({
+      capacityUsd: 2_400,
+      participantCount: 1,
+    });
+  });
+
+  it("refuses a window that spans more than one plan", async () => {
+    const participantId = await seedV1Participant("composition-multiplan");
+    await seedV1Session(participantId, "v1-session-composition-multiplan");
+    await seedV1Device(participantId, "v1-device-composition-multiplan", "v1-session-composition-multiplan");
+    await seedThreeV1Resets(participantId, "v1-device-composition-multiplan", 5, "cmp");
+    // One extra reset on a different plan: a pp is worth plan-multiplier
+    // different dollars, so the kernel would mix incommensurable regimes.
+    await seedV1CalibratableReset({
+      participantId,
+      deviceId: "v1-device-composition-multiplan",
+      day: "2026-07-28",
+      startTime: "2026-07-28T12:00:00.000Z",
+      resetsAt: "2026-08-04T12:00:00.000Z",
+      stepPp: 5,
+      tag: "cmp-plus",
+      planType: "plus",
+    });
+    const result = await accountScopedModelCompositionV1(db(), participantId, {});
+    expect(result.status).toBe("not_testable");
+    if (result.status === "not_testable") {
+      expect(result.reason).toBe("multi_plan_window_unsupported");
+    }
+  });
+
+  it("voids bins that contain a not-fully-priced event", async () => {
+    const participantId = await seedV1Participant("composition-poisoned");
+    await seedV1Session(participantId, "v1-session-composition-poisoned");
+    await seedV1Device(participantId, "v1-device-composition-poisoned", "v1-session-composition-poisoned");
+    await seedThreeV1Resets(participantId, "v1-device-composition-poisoned", 5, "cpo", true);
+    const result = await accountScopedModelCompositionV1(db(), participantId, {});
+    expect(result.status).toBe("ready");
+    if (result.status !== "ready") return;
+    // Every seeded event is unpriceable, so every carrying bin is voided:
+    // nothing trains, nothing is guessed.
+    expect(result.unpricedUsageEventCount).toBeGreaterThan(0);
+    expect(result.poisonedBinCount).toBeGreaterThan(0);
+    expect(result.usageEventCount).toBe(0);
+    expect(result.fit.status).toBe("insufficient_observations");
   });
 
   it("embeds the day series in the scheduled preview and survives the cache validator", async () => {
