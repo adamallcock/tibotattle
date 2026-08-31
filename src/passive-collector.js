@@ -131,6 +131,8 @@ const DIAGNOSTIC_COUNT_FIELDS = Object.freeze([
   "tierSettingEvents",
   "tierSettingOmissions",
   "malformedTierSettingEvents",
+  "forkReplayEventsSkipped",
+  "forkReplayToolCallsSkipped",
 ]);
 const COLLECTOR_RESOURCE_LIMIT_CODES = Object.freeze({
   directory_entries: "collector_resource_directory_entries_limit_exceeded",
@@ -222,6 +224,8 @@ function emptyCheckpoint(nowIso, backfill, backfillSinceAt = null) {
       tierSettingEvents: 0,
       tierSettingOmissions: 0,
       malformedTierSettingEvents: 0,
+      forkReplayEventsSkipped: 0,
+      forkReplayToolCallsSkipped: 0,
       tierSettingCounts: {},
     },
   };
@@ -725,12 +729,20 @@ function rolloutRecord({ record, state, receivedAt, checkpoint }) {
     ? "provisional_fresh_app_server_marker"
     : "unavailable_no_fresh_contemporaneous_marker";
   if (record.type === "turn_context") {
+    // Any own turn_context ends an inline fork's replayed prefix: Codex
+    // writes the inherited history before the child's first genuine turn.
+    state.ownTurnContextSeen = true;
     if (typeof record.payload?.model === "string") state.currentModel = record.payload.model;
     return null;
   }
   if (record.type === "response_item") {
     const type = record.payload?.type;
     if (type !== "function_call" && type !== "custom_tool_call") return null;
+    if (state.isInlineFork === true && state.ownTurnContextSeen !== true) {
+      checkpoint.diagnostics.forkReplayToolCallsSkipped
+        = (checkpoint.diagnostics.forkReplayToolCallsSkipped ?? 0) + 1;
+      return null;
+    }
     const safe = {
       schemaVersion: RECORD_SCHEMA_VERSION,
       kind: "codex_tool_class_event",
@@ -754,6 +766,17 @@ function rolloutRecord({ record, state, receivedAt, checkpoint }) {
   const last = normalizeTokenUsage(info?.last_token_usage);
   if ((info?.total_token_usage && !total) || (info?.last_token_usage && !last)) {
     checkpoint.diagnostics.malformedUsageRecords += 1;
+  }
+  if (state.isInlineFork === true && state.ownTurnContextSeen !== true) {
+    // Replayed parent turns inside an inline fork are not new spend, and
+    // their rate-limit windows carry rewritten timestamps. A skipped row
+    // still rebases the cumulative baseline — without that, the first
+    // genuine post-fork turn would be charged the entire inherited total as
+    // one enormous delta.
+    if (total) state.previousTotals = total;
+    checkpoint.diagnostics.forkReplayEventsSkipped
+      = (checkpoint.diagnostics.forkReplayEventsSkipped ?? 0) + 1;
+    return null;
   }
   let usage = null;
   if (total) {
@@ -972,6 +995,11 @@ export async function ingestRolloutUpdates({
         tailSeeded: initializeAtEnd || boundedRecentTail,
         surfaceClassification: lineage.surfaceClassification,
         lineageDisposition: lineage.surfaceClassification?.lineageDisposition ?? "standalone",
+        isInlineFork: lineage.isInlineFork === true,
+        // Codex writes an inline fork's replayed parent history before the
+        // child's first own `turn_context`; a prelude that already carries a
+        // model therefore proves the fork boundary is behind this cursor.
+        ownTurnContextSeen: seed.currentModel !== null,
       };
       if (boundedRecentTail) {
         const seedLatestMs = Date.parse(seed.latestRelevantAt);
@@ -1014,6 +1042,9 @@ export async function ingestRolloutUpdates({
       const effectiveOffset = file.metadata.size < state.offset ? 0 : state.offset;
       const mainRead = Math.max(0, file.metadata.size - effectiveOffset);
       const lineageRead = state.surfaceClassification
+          && (state.isInlineFork !== undefined
+            || state.lineageDisposition === "standalone"
+            || state.lineageDisposition === "parent_linked")
         ? 0
         : Math.min(file.metadata.size, maximumLineagePrefixBytes);
       const seedRead = state.currentModel === null
@@ -1024,12 +1055,36 @@ export async function ingestRolloutUpdates({
         : 0;
       if (!reserveSourceBytes(mainRead + lineageRead + seedRead)) break;
     }
-    if (!state.surfaceClassification) {
+    if (state.isInlineFork === undefined
+        && (state.lineageDisposition === "standalone"
+          || state.lineageDisposition === "parent_linked")) {
+      // A persisted non-forked disposition already proves this is not an
+      // inline fork, so the pre-upgrade migration costs no I/O here. Without
+      // this, the first post-upgrade run would reserve min(size, 1 MiB) of
+      // budget per tracked file and bounded-pause a large corpus before its
+      // newest — live — files were reached. Only "forked" dispositions need
+      // the re-read below to split inline forks from paginated continuations.
+      state.isInlineFork = false;
+      if (state.ownTurnContextSeen === undefined) {
+        state.ownTurnContextSeen = state.currentModel !== null;
+      }
+      markChanged();
+    }
+    if (!state.surfaceClassification || state.isInlineFork === undefined) {
       const lineage = await readRolloutLineage(file.path, {
         maximumTotalBytes: maximumLineagePrefixBytes,
       });
       state.surfaceClassification = lineage.surfaceClassification;
       state.lineageDisposition = lineage.surfaceClassification?.lineageDisposition ?? "standalone";
+      state.isInlineFork = lineage.isInlineFork === true;
+      if (state.ownTurnContextSeen === undefined) {
+        // A checkpoint from before this field: the cursor has already
+        // consumed some prefix. A known model means at least one own or
+        // replayed turn was seen; treating it as past-the-boundary matches
+        // the tail-seed rule and only ever errs toward counting, for a file
+        // whose replay damage predates the guard anyway.
+        state.ownTurnContextSeen = state.currentModel !== null;
+      }
       markChanged();
     }
     if (file.metadata.size < state.offset) {
@@ -1038,6 +1093,10 @@ export async function ingestRolloutUpdates({
       state.currentModel = null;
       state.tierState = null;
       state.tailSeeded = false;
+      // The rescan walks the replayed fork prefix again from byte zero, so
+      // the boundary must be re-derived — a stale true here would disable
+      // both fork guards for the whole rewritten file.
+      state.ownTurnContextSeen = false;
       checkpoint.diagnostics.filesTruncated += 1;
       markChanged();
     }
@@ -1046,6 +1105,12 @@ export async function ingestRolloutUpdates({
       state.currentModel = seed.currentModel;
       if (state.previousTotals === null) state.previousTotals = seed.previousTotals;
       if (state.tierState === null) state.tierState = seed.tierState;
+      // A model in the prelude implies a turn_context behind the cursor, so
+      // the fork boundary is already resolved. The converse is bounded, not
+      // exact: a giant line can push every turn_context out of the prelude
+      // window, in which case at most one in-flight fork turn is withheld
+      // (counted in forkReplayEventsSkipped) until the next turn_context.
+      if (seed.currentModel !== null) state.ownTurnContextSeen = true;
       state.tailSeeded = true;
       markChanged();
     }

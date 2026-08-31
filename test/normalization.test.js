@@ -561,6 +561,89 @@ test("forked cumulative snapshots are excluded while new fork usage is retained"
   }
 });
 
+test("an inline fork with no reachable parent fails closed instead of charging its replay", async () => {
+  const codexHome = await mkdtemp(join(tmpdir(), "app-usagemonitor-scan-test-"));
+  try {
+    const sessions = join(codexHome, "sessions");
+    await mkdir(sessions, { recursive: true });
+    const usage = (input_tokens, total_tokens = input_tokens) => ({
+      input_tokens,
+      cached_input_tokens: 0,
+      cache_write_input_tokens: 0,
+      output_tokens: 0,
+      reasoning_output_tokens: 0,
+      total_tokens,
+    });
+    const record = (timestamp, total, last) => JSON.stringify({
+      timestamp,
+      type: "event_msg",
+      payload: {
+        type: "token_count",
+        info: { total_token_usage: total, last_token_usage: last },
+      },
+    });
+    const turn = (timestamp) => JSON.stringify({
+      timestamp,
+      type: "turn_context",
+      payload: { model: "gpt-test" },
+    });
+    // The orphan replays an adversarial shape: a turn_context INSIDE the
+    // replayed prefix, which defeats the parser's no-turn-context-yet rule.
+    // With the parent file gone, only failing closed keeps it out of spend.
+    const orphan = [
+      JSON.stringify({ timestamp: "2026-07-23T00:01:00.000Z", type: "session_meta", payload: { id: "orphan-fork", forked_from_id: "vanished-parent" } }),
+      turn("2026-07-23T00:01:00.001Z"),
+      record("2026-07-23T00:01:00.002Z", usage(100), usage(100)),
+      record("2026-07-23T00:01:01.000Z", usage(160), usage(60)),
+    ].join("\n");
+    // The grandchild's parent IS present (the orphan), so it parses normally
+    // — and the orphan's fail-closed pass still collected its own keys,
+    // which include the replayed ancestral prefix. Replay suppression
+    // survives the missing common ancestor.
+    const grandchild = [
+      JSON.stringify({ timestamp: "2026-07-23T00:02:00.000Z", type: "session_meta", payload: { id: "grandchild", forked_from_id: "orphan-fork" } }),
+      turn("2026-07-23T00:02:00.001Z"),
+      record("2026-07-23T00:02:00.002Z", usage(100), usage(100)),
+      record("2026-07-23T00:02:00.003Z", usage(160), usage(60)),
+      record("2026-07-23T00:02:01.000Z", usage(210), usage(50)),
+    ].join("\n");
+    const standalone = [
+      JSON.stringify({ timestamp: "2026-07-23T00:03:00.000Z", type: "session_meta", payload: { id: "standalone" } }),
+      turn("2026-07-23T00:03:00.001Z"),
+      record("2026-07-23T00:03:01.000Z", usage(20), usage(20)),
+    ].join("\n");
+    await writeFile(join(sessions, "rollout-2026-07-23T00-01-00-orphan.jsonl"), `${orphan}\n`);
+    await writeFile(join(sessions, "rollout-2026-07-23T00-02-00-grandchild.jsonl"), `${grandchild}\n`);
+    await writeFile(join(sessions, "rollout-2026-07-23T00-03-00-standalone.jsonl"), `${standalone}\n`);
+    const result = await scanAndPriceCodexLogs({
+      codexHome,
+      startAt: "2026-07-22T23:59:00.000Z",
+      endAt: "2026-07-23T00:04:00.000Z",
+      priceCards: [{
+        schema_version: "0.1",
+        id: "openai:gpt-test:test",
+        provider: "openai",
+        model: "gpt-test",
+        components: [{
+          usage_component: "input_uncached_tokens",
+          unit: "token",
+          price: { amount: "1", currency: "USD", per: "1" },
+        }],
+        source: { name: "test", url: "https://example.invalid/pricing", retrieved_at: "2026-07-23T00:00:00.000Z" },
+      }],
+    });
+    assert.equal(result.diagnostics.lineageParentsMissing, 1);
+    assert.equal(result.diagnostics.forkRolloutsFailedClosed, 1);
+    assert.equal(result.diagnostics.forkReplayEventsSkipped, 2);
+    assert.equal(result.eventCount, 2);
+    assert.equal(result.totalTokens, 70);
+    assert.equal(result.runcost.totalUsd, 70);
+    assert.equal(result.diagnostics.usageBearingRollouts, 2);
+  } finally {
+    await rm(codexHome, { recursive: true });
+  }
+});
+
 test("activity scans can exclude exactly the controller session without exposing its identifier", async () => {
   const codexHome = await mkdtemp(join(tmpdir(), "app-usagemonitor-controller-test-"));
   try {
