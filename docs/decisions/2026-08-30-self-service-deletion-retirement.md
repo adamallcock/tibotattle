@@ -164,6 +164,49 @@ for inspection; no existing user account, data, or installed app was changed.
 No flaky failure was identified in these checks. Full release validation still
 needs attention because the protected evidence/bundling gates above remain.
 
+### Integration follow-up — 2026-08-30
+
+The owner subsequently requested commit, push, PR, merge, and task-local Git
+cleanup. Implementation commit `da8e10d5` and integration commit `dccf5c5d`
+were pushed to [PR #86](https://github.com/adamallcock/tibotattle/pull/86).
+Integration includes main `1e696691` without conflicts. The PR remains **draft**;
+merge and branch/worktree removal are pending validation, not completed.
+
+Fresh checks on `dccf5c5d`:
+
+| Check | Result |
+| --- | --- |
+| GitHub documentation, release-trust policy, and dependency scan | 3/3 passed |
+| Full root `pnpm test` | 3147 total; 3123 passed; 3 failed; 21 existing skips; 469.06 s |
+| Browser gate | 388/388 passed; 8.63 s |
+| Local companion gate | 262/262 passed; 21.17 s |
+| Complete Worker gate | Passed, including 422/422 Worker tests, 174/174 script tests, workspace/type/endpoint checks, and both dry-run bundles |
+| Preflight and architecture | Passed; 115 Markdown files, 614 source/config files, 366 production files, 1439 imports, no debt edges |
+| Isolated synthetic materialized-boundary retry | 2/2 passed; 11.69 s; does not replace the failed full-run result |
+
+The two protected R7 freshness failures still identify stale source provenance.
+The third full-run failure was `R7 materialized boundary isolated run stopped`
+in `test/r7-materialized-boundary-benchmark.test.js`. Its isolated retry passed
+without source or test changes, so this is explicitly **FLAKY**, not a clean
+suite. The benchmark, harness, sampler, watchdog, and test are unchanged from
+main. Concurrent test load was present, but the precise sampler/watchdog cause
+is unresolved; no assertion, timeout, or guard was relaxed.
+
+The first local-companion attempt was interrupted after the sandbox denied
+loopback listeners (`EPERM`). The complete rerun with loopback access passed;
+this is an environment restriction, not a source fix. The Worker dry-run gate
+initially lacked its generated public-asset input. Building that input from the
+committed source, the unchanged already-public social image, and explicit
+unavailable-installer mode allowed the complete gate to pass. Those local
+bundles do not qualify a signed installer or a production deployment.
+
+Protected real-history R7 regeneration requires separate owner authorization,
+which has been requested but not received. No retained R7 receipt was changed.
+The release-coordination task was told to exclude this draft from the current
+dogfood candidate. Full native/artifact qualification and the hosted cutover
+below remain separate gates. Task-started blocked test processes were stopped;
+unrelated worktrees and the primary checkout's two local commits were preserved.
+
 ## Deployment gate
 
 Before a separately authorized production cutover, record aggregate counts of
