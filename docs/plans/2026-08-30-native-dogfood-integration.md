@@ -100,8 +100,10 @@ from 3,225 tests. Two failures were stale protected R7 receipts. The other three
 were permission-fixture setup failures caused by launching tests under an
 owner-only umask; their unchanged test files passed all 35 tests under the
 normal fixture umask. Preserve owner-only log creation separately from the test
-process umask. A final full root run remains required; no assertion, timeout or
-test was weakened.
+process umask. After the context-pricing correction and protected R7
+regeneration, the final full root run exited zero: 3,210 passed, 17 designated
+skips, no failures or cancellations, from 3,227 tests in 410 seconds. No
+assertion, timeout or test was weakened.
 
 Copy-first schema-9 to schema-11 migration and the subsequent accounting
 rebuild completed successfully on `04a88f2c`, with SQLite integrity, generation
@@ -118,8 +120,35 @@ different missing-context fallback from the replay-safe cache. The narrow
 projection correction now passes 155 focused tests, including same-generation
 full-snapshot/history/timeline parity. It preserves the existing `legacy_zero`
 policy and does not change price cards, cache semantics, ingestion or schema.
-The real-copy projection comparison, R7 and final source/artifact checks must
-bind the corrected source.
+The corrected real-copy projection comparison exited zero on `1335a548`:
+all four periods agree on event counts, token components and parent Standard
+API-equivalent totals against the same-generation cache. Existing per-model
+rounding can still differ by one millionth of a dollar; this is not a claim
+that every rounded subfield is byte-identical. Covered overhead subtotals remain
+available and the one local-order coverage gap remains explicit. The final
+companion gate passed 276/276; architecture, installed Codex contract and
+release-note checks also passed. The retained native gate then passed 65/65
+with no skips or cancellations in 197 seconds on this corrected source.
+
+Protected R7 regeneration completed on 2026-08-31 UTC with exit zero after
+approximately 39 minutes. All ten receipts were regenerated and validated;
+freshness tests passed 2/2 separately on the exact pinned Node 24.14.0 and
+26.2.0 runtimes. Outcomes, operation statuses, retained boundary matrices,
+privacy, preservation and network-evidence states are unchanged. Each
+runtime's repeated projections agree, but whole artifact hashes differ across
+runtimes as they did previously. The source-scan projection hashes counts,
+completion and providers, not logical rows; it does not prove baseline
+row-level identity. Source-plan identity, runtime provenance and encoded-byte
+measurements also participate in artifact hashes.
+
+Both R7 decisions remain `release_open`, with 19 unresolved decisions each;
+the retained promotion limits are not waived by fresh receipts or passing
+tests. Three operations recorded one failed RSS sample each while retaining
+successful samples and lifetime-peak enforcement. An unexplained Node 26
+pressure-scan lifetime-RSS increase from 580,190,208 to 1,073,233,920 bytes
+remains below the 1,610,612,736-byte ceiling. Record this measurement drift
+without calling it either a proven regression or harmless noise. This is
+internal-dogfood evidence, not stable-release qualification.
 
 Existing Developer ID and notarization configuration authenticated successfully
 without signing or submission. The prior signed 0.1.16 dogfood DMG and receipt
@@ -127,9 +156,11 @@ were located and its checksum matched. A schema-9 preservation copy alone is
 not a working rollback for an old reader that only supports schema 8; do not
 launch that reader against the newer state. Before normal installed launch,
 check whether existing consent, pairing or a pending sign-in can automatically
-resume contribution. Seek explicit direction if that would violate the
-no-pair/no-upload test boundary; do not alter consent as a workaround.
+resume contribution. Normal installed launch is held for the owner's direction
+about any automatic pairing or upload; do not alter consent as a workaround.
+Credential-free, empty-profile artifact smokes do not qualify real Keychain or
+normal signed-in operation.
 
-No R7 regeneration, signing, installation or release publication has yet been
-completed for this source set. Private state records, comparisons, UI captures
-and release inputs remain local and outside tracked docs.
+Signing, installation and release publication have not yet been completed for
+this source set. Private state records, comparisons, UI captures and release
+inputs remain local and outside tracked docs.
