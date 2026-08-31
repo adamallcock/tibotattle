@@ -9551,6 +9551,157 @@ private enum MenuBarContractSmokeTest {
         )
     }
 
+    private static func retainedHistoryProjectionContract() -> Bool {
+        var calendar = Calendar(identifier: .gregorian)
+        guard let timeZone = TimeZone(identifier: "America/Los_Angeles") else {
+            return false
+        }
+        calendar.timeZone = timeZone
+        let parser = ISO8601DateFormatter()
+        // Re-read two days later, across both midnight and the spring DST
+        // transition. Retained rolling periods must keep their original bars.
+        guard let retainedAt = parser.date(from: "2026-03-08T08:10:00Z"),
+              let now = parser.date(from: "2026-03-10T19:00:00Z")
+        else { return false }
+        var bucket = timelineBucket(
+            startAt: retainedAt.addingTimeInterval(-70 * 60),
+            endAt: retainedAt.addingTimeInterval(-55 * 60)
+        )
+        let coverage = pricingCoverage(fully: 1, partially: 1, unpriced: 1)
+        bucket["usageEvents"] = 3
+        bucket["totalTokens"] = 3_000
+        bucket["apiPriceEquivalentUsd"] = 0.50
+        bucket["pricingCoverage"] = coverage
+        var previous = overviewFixture(
+            now: retainedAt,
+            calendar: calendar,
+            accountingSource: "unified",
+            timelineUsage: [bucket]
+        )
+        guard var accounting = previous["accounting"] as? [String: Any],
+              let timeline = previous["timeline"] as? [String: Any]
+        else { return false }
+        accounting["periods"] = ["24h", "7d", "30d"].map { identifier in
+            var row = periodRow(identifier)
+            row["events"] = 3
+            row["totalTokens"] = 3_000
+            row["apiPriceEquivalentUsd"] = 0.50
+            row["pricingCoverage"] = coverage
+            return row
+        }
+        previous["accounting"] = accounting
+        guard let verified = decodeOverview(
+            previous, now: retainedAt, calendar: calendar
+        ), verified.history.accountingStatus == .current else { return false }
+
+        var retained = previous
+        retained["freshness"] = ["accountingStatus": "unavailable"]
+        accounting["generationMatched"] = false
+        let projection: [String: Any] = [
+            "status": "retained",
+            "reason": "local_unified_index_deferred",
+            "terminal": false,
+            "retainedAt": iso8601(retainedAt),
+            "coveredAt": timeline["coveredAt"]!,
+        ]
+        accounting["projection"] = projection
+        retained["accounting"] = accounting
+        let expected = verified.history.retainingLastVerified()
+        guard let held = decodeOverview(retained, now: now, calendar: calendar),
+              held.history == expected,
+              held.history.lastSevenDays?.totalTokens == 3_000,
+              held.history.lastThirtyDays?.knownAPIPriceEquivalentUSD == 0.50,
+              held.history.lastSevenDays?.pricingCoverage.isComplete == false,
+              held.history.sevenDayHistory.contains(where: {
+                $0.totalTokens == 3_000
+              })
+        else { return false }
+
+        func withProjection(_ value: Any) -> [String: Any] {
+            var root = retained
+            var valueAccounting = accounting
+            valueAccounting["projection"] = value
+            root["accounting"] = valueAccounting
+            return root
+        }
+        var terminal = projection
+        terminal["terminal"] = true
+        guard decodeOverview(
+            withProjection(terminal), now: now, calendar: calendar
+        )?.history == expected else { return false }
+
+        // A marker never overrides malformed provenance, chronology, periods,
+        // or timeline coverage. No generation mismatch alone admits history.
+        var invalidRoots = [withProjection(NSNull())]
+        let invalidFields: [(String, Any)] = [
+            ("status", "unavailable"),
+            ("terminal", "false"),
+            ("terminal", 1),
+            ("retainedAt", NSNull()),
+            ("retainedAt", "not-a-date"),
+            ("retainedAt", iso8601(now.addingTimeInterval(60))),
+            ("coveredAt", ["startAt": NSNull(), "endAt": NSNull()]),
+            ("coveredAt", [
+                "startAt": iso8601(retainedAt),
+                "endAt": iso8601(retainedAt.addingTimeInterval(60)),
+            ]),
+            ("coveredAt", [
+                "startAt": iso8601(retainedAt),
+                "endAt": iso8601(retainedAt.addingTimeInterval(-60)),
+            ]),
+        ]
+        for (key, value) in invalidFields {
+            var invalid = projection
+            invalid[key] = value
+            invalidRoots.append(withProjection(invalid))
+        }
+        for (key, value) in [
+            ("generationMatched", true as Any),
+            ("generationMatched", "false" as Any),
+            ("sourceMode", "legacy" as Any),
+            ("periods", [periodRow("24h")] as Any),
+        ] {
+            var invalid = retained
+            var invalidAccounting = accounting
+            invalidAccounting[key] = value
+            invalid["accounting"] = invalidAccounting
+            invalidRoots.append(invalid)
+        }
+        var missingTimelineCoverage = retained
+        var invalidTimeline = timeline
+        invalidTimeline["coveredAt"] = ["startAt": NSNull(), "endAt": NSNull()]
+        missingTimelineCoverage["timeline"] = invalidTimeline
+        invalidRoots.append(missingTimelineCoverage)
+        return invalidRoots.allSatisfy { root in
+            guard let decoded = decodeOverview(root, now: now, calendar: calendar)
+            else { return false }
+            return decoded.history.accountingStatus == .unavailable
+                && decoded.history.lastSevenDays == nil
+                && decoded.history.lastThirtyDays == nil
+        }
+    }
+
+    private static func mouseDismissalContract() -> Bool {
+        let targets: [MenuBarMouseTarget] = [
+            .popover, .statusItem, .applicationWindow, .outside,
+        ]
+        let cases: [(menu: Bool, popover: Bool, expected: [Bool])] = [
+            (false, false, [false, false, false, false]),
+            (true, false, [false, false, true, false]),
+            (false, true, [false, false, true, true]),
+            (true, true, [false, false, true, true]),
+        ]
+        return cases.allSatisfy { state in
+            zip(targets, state.expected).allSatisfy { target, expected in
+                menuBarShouldDismissForMouse(
+                    target: target,
+                    isMenuTracking: state.menu,
+                    isPopoverShown: state.popover
+                ) == expected
+            }
+        }
+    }
+
     private static func semanticProjectionContract() -> Bool {
         var calendar = Calendar(identifier: .gregorian)
         guard let timeZone = TimeZone(identifier: "America/Los_Angeles") else {
@@ -10059,7 +10210,36 @@ private enum MenuBarContractSmokeTest {
             summary: "The local companion is unavailable for this smoke test."
         )
         let unavailable = controller.nativePresentationContract()
+        // The normal app runs its event loop before any status-button click.
+        // This synchronous smoke must let AppKit attach the real status item
+        // first; a missing or unshowable item still fails the bounded check.
+        application.finishLaunching()
+        let openDeadline = Date().addingTimeInterval(2)
+        var didShowPopover = controller.showPopoverForSmokeTest()
+        while !didShowPopover && Date() < openDeadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.02))
+            didShowPopover = controller.showPopoverForSmokeTest()
+        }
+        let shown = controller.nativePresentationContract()
         controller.shutDown()
+        let stopped = controller.nativePresentationContract()
+        let reopenedAfterShutdown = controller.showPopoverForSmokeTest()
+        let dismissalLifecycleChecks = [
+            ("initial-monitor-absent", !starting.outsideClickAwayMonitorInstalled),
+            ("popover-opened", didShowPopover && shown.popoverIsShown),
+            ("open-monitor-installed", shown.outsideClickAwayMonitorInstalled),
+            ("shutdown-outside-monitor-removed", !stopped.outsideClickAwayMonitorInstalled),
+            ("shutdown-local-monitor-removed", !stopped.sameAppClickAwayMonitorInstalled),
+            ("shutdown-escape-monitor-removed", !stopped.escapeDismissalMonitorInstalled),
+            ("shutdown-observer-removed", !stopped.appDeactivationDismissalObserverInstalled),
+            ("shutdown-cannot-reopen", !reopenedAfterShutdown),
+        ]
+        if let failed = dismissalLifecycleChecks.first(where: { !$0.1 }) {
+            FileHandle.standardError.write(Data(
+                "macOS menu bar dismissal smoke failed: \(failed.0)\n".utf8
+            ))
+            return 1
+        }
         let popup = MenuBarPopoverViewController(
             productName: BundledProduct.displayName,
             brandImage: NSApp.applicationIconImage,
@@ -10073,6 +10253,27 @@ private enum MenuBarContractSmokeTest {
         let sevenDayPopup = popup.nativePresentationContract()
         popup.selectHistoryRangeForSmokeTest(.thirtyDays)
         let thirtyDayPopup = popup.nativePresentationContract()
+        popup.update(snapshot: analyzingLiveSnapshot, now: observedAt)
+        let updatingThirtyDayPopup = popup.nativePresentationContract()
+        popup.selectHistoryRangeForSmokeTest(.sevenDays)
+        let updatingSevenDayPopup = popup.nativePresentationContract()
+        popup.selectHistoryRangeForSmokeTest(.thirtyDays)
+        var readFailureSnapshot = liveSnapshot
+        readFailureSnapshot.invalidateObservedEvidence(keepingHistory: true)
+        readFailureSnapshot.phase = .unavailable
+        popup.update(snapshot: readFailureSnapshot, now: observedAt)
+        let readFailurePopup = popup.nativePresentationContract()
+        let retainedHistory = readFailureSnapshot.history
+        readFailureSnapshot.invalidateObservedEvidence(keepingHistory: true)
+        let repeatedFailurePreservesHistory = readFailureSnapshot.history == retainedHistory
+        popup.update(snapshot: liveSnapshot, now: observedAt)
+        let recoveredPopup = popup.nativePresentationContract()
+        var restartedSnapshot = liveSnapshot
+        restartedSnapshot.invalidateObservedEvidence()
+        popup.update(snapshot: restartedSnapshot, now: observedAt)
+        let restartedPopup = popup.nativePresentationContract()
+        var failedFirstRunSnapshot = MenuBarStatusSnapshot()
+        failedFirstRunSnapshot.invalidateObservedEvidence(keepingHistory: true)
         func historyWithSevenDayCoverage(
             _ coverage: MenuBarPricingCoverage,
             knownCost: Double
@@ -10158,6 +10359,36 @@ private enum MenuBarContractSmokeTest {
               thirtyDayPopup.selectedHistoryRange == .thirtyDays,
               thirtyDayPopup.dailyBarCount == 30,
               thirtyDayPopup.historyVisible,
+              !sevenDayPopup.retainedHistoryDisclosed,
+              updatingThirtyDayPopup.selectedHistoryRange == .thirtyDays,
+              updatingThirtyDayPopup.dailyBarCount == 30,
+              updatingThirtyDayPopup.historyVisible,
+              updatingThirtyDayPopup.retainedHistoryDisclosed,
+              !updatingThirtyDayPopup.refreshActionEnabled,
+              updatingSevenDayPopup.dailyBarCount == 7,
+              updatingSevenDayPopup.historyVisible,
+              updatingSevenDayPopup.retainedHistoryDisclosed,
+              readFailurePopup.selectedHistoryRange == .thirtyDays,
+              readFailurePopup.dailyBarCount == 30,
+              readFailurePopup.historyVisible,
+              readFailurePopup.retainedHistoryDisclosed,
+              readFailurePopup.visibleAllowanceLaneCount == 0,
+              !readFailurePopup.weeklyPaceVisible,
+              readFailurePopup.refreshActionEnabled,
+              retainedHistory == liveSnapshot.history.retainingLastVerified(),
+              readFailureSnapshot.lanes.isEmpty,
+              readFailureSnapshot.observedAt == nil,
+              readFailureSnapshot.evidence == .none,
+              readFailureSnapshot.weeklyPaceOutlook == nil,
+              readFailureSnapshot.staleAfterSeconds == nil,
+              repeatedFailurePreservesHistory,
+              recoveredPopup.selectedHistoryRange == .thirtyDays,
+              recoveredPopup.historyVisible,
+              !recoveredPopup.retainedHistoryDisclosed,
+              restartedSnapshot.history == .unavailable,
+              !restartedPopup.historyVisible,
+              !restartedPopup.retainedHistoryDisclosed,
+              failedFirstRunSnapshot.history == .unavailable,
               sevenDayPopup.pricingState == .completeEquivalent,
               sevenDayPopup.historyCoverageState == .mixed,
               sevenDayPopup.historyCoverageNamed,
@@ -10173,7 +10404,9 @@ private enum MenuBarContractSmokeTest {
                   now: observedAt,
                   weeklyLane: weeklyLane
               ),
-              semanticProjectionContract()
+              semanticProjectionContract(),
+              retainedHistoryProjectionContract(),
+              mouseDismissalContract()
         else {
             FileHandle.standardError.write(
                 Data("macOS menu bar contract smoke failed\\n".utf8)
@@ -10186,14 +10419,163 @@ private enum MenuBarContractSmokeTest {
                 + "native_actions=true states=live,starting,unavailable "
                 + "shortcuts=cmd-r,cmd-comma,cmd-q "
                 + "routing=left-popover,right-menu,control-menu "
-                + "dismissal=escape,transient,same-app,deactivation "
+                + "dismissal=escape,transient,same-app,outside,deactivation "
                 + "weekly_position=factual-menu-only "
                 + "pace_outlook=collecting,under,on,over,critical,fail-closed "
                 + "history=authoritative,coverage-named,fail-closed "
                 + "pricing=complete,partial,unavailable model=dst,overlap,future,per-lane "
-                + "reset_credits=absent analysis_title=live-fallback"
+                + "reset_credits=absent analysis_title=live-fallback "
+                + "history_retention=refresh,failure,source-reset"
         )
         return 0
+    }
+
+    @MainActor
+    private final class InteractionHarnessActions: NSObject {
+        let controller: MenuBarStatusController
+
+        init(controller: MenuBarStatusController) { self.controller = controller }
+
+        @objc func showPopover(_ sender: Any?) {
+            _ = controller.showPopoverForSmokeTest()
+        }
+    }
+
+    /// Data-free, development-only interactive QA. No app delegate, companion,
+    /// user defaults, source files, credentials, or refresh are initialized.
+    static func runInteractionHarness() -> Int32 {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        let controller = MenuBarStatusController(
+            productName: "Menu-bar dismissal test",
+            actions: .init(
+                openTiboTattle: {}, showSettings: {}, showAbout: {},
+                quit: { application.terminate(nil) }
+            )
+        )
+        let target = InteractionHarnessActions(controller: controller)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 180),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.title = "Menu-bar dismissal test — no live data"
+        let showButton = NSButton(
+            title: "Open test popover", target: target,
+            action: #selector(InteractionHarnessActions.showPopover(_:))
+        )
+        let exitButton = NSButton(
+            title: "Finish test", target: application,
+            action: #selector(NSApplication.terminate(_:))
+        )
+        let content = NSStackView(views: [
+            NSTextField(labelWithString: "Temporary native test. No companion or usage data."),
+            showButton, exitButton,
+        ])
+        content.orientation = .vertical
+        content.spacing = 18
+        content.translatesAutoresizingMaskIntoConstraints = false
+        if let root = window.contentView {
+            root.addSubview(content)
+            NSLayoutConstraint.activate([
+                content.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+                content.centerYAnchor.constraint(equalTo: root.centerYAnchor),
+            ])
+        }
+        window.center()
+        window.orderFrontRegardless()
+        var previous: String?
+        let deadline = Date().addingTimeInterval(180)
+        let timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                let state = controller.nativePresentationContract()
+                let line = "MENU_BAR_INTERACTION shown=\(state.popoverIsShown) outside_monitor=\(state.outsideClickAwayMonitorInstalled) active=\(application.isActive)"
+                if line != previous {
+                    FileHandle.standardOutput.write(Data("\(line)\n".utf8))
+                    previous = line
+                }
+                if Date() >= deadline {
+                    controller.shutDown()
+                    window.orderOut(nil)
+                    application.terminate(nil)
+                }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            _ = controller.showPopoverForSmokeTest()
+        }
+        application.run()
+        timer.invalidate()
+        controller.shutDown()
+        window.orderOut(nil)
+        withExtendedLifetime(target) {}
+        return 0
+    }
+
+    /// Development-only, read-only handoff from the companion projection to
+    /// the actual native view. The input is a derived overview, never raw logs;
+    /// stdout reports layout/state facts rather than any private usage values.
+    static func renderOverview(inputPath: String, outputDirectory: String) -> Int32 {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        do {
+            let input = try FileHandle(forReadingFrom: URL(fileURLWithPath: inputPath))
+            defer { try? input.close() }
+            let maximumBytes = 8 * 1_024 * 1_024
+            let now = Date()
+            guard let data = try input.read(upToCount: maximumBytes + 1),
+                  data.count <= maximumBytes,
+                  let overview = LocalCompanionOverviewProjection.decode(data, now: now),
+                  overview.history.accountingStatus != .unavailable
+            else { return 1 }
+            let output = URL(fileURLWithPath: outputDirectory, isDirectory: true)
+            try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+            var snapshot = MenuBarStatusSnapshot()
+            snapshot.evidence = LocalCompanionOverviewProjection.evidence(for: overview, now: now)
+            snapshot.lanes = overview.lanes
+            snapshot.observedAt = overview.observedAt
+            snapshot.staleAfterSeconds = overview.staleAfterSeconds
+            snapshot.history = overview.history
+            snapshot.analysisAvailable = true
+            let popup = MenuBarPopoverViewController(
+                productName: BundledProduct.displayName,
+                brandImage: NSApp.applicationIconImage,
+                actions: MenuBarPopoverViewController.Actions(
+                    openTiboTattle: {}, refresh: {}, showMore: { _ in }
+                )
+            )
+            for (phase, name) in [
+                (MenuBarStatusSnapshot.Phase.ready, "ready"),
+                (.analyzing, "updating"),
+                (.unavailable, "read-failure"),
+            ] {
+                snapshot.phase = phase
+                if phase == .unavailable {
+                    snapshot.invalidateObservedEvidence(keepingHistory: true)
+                }
+                popup.update(snapshot: snapshot, now: now)
+                for range in MenuBarHistoryRange.allCases {
+                    popup.selectHistoryRangeForSmokeTest(range)
+                    let presentation = popup.nativePresentationContract()
+                    guard presentation.historyVisible,
+                          presentation.dailyBarCount == range.dayCount,
+                          presentation.retainedHistoryDisclosed
+                            == (phase != .ready || snapshot.history.accountingStatus == .retained),
+                          phase != .unavailable || presentation.visibleAllowanceLaneCount == 0,
+                          snapshot.history.period(for: range) == overview.history.period(for: range),
+                          snapshot.history.history(for: range) == overview.history.history(for: range)
+                    else { return 1 }
+                    try popup.renderPNG(
+                        to: output.appendingPathComponent("\(name)-\(range.rawValue).png"),
+                        appearance: .aqua
+                    )
+                }
+            }
+            print("USAGE_MONITOR_MACOS_MENU_BAR_OVERVIEW_RENDER ranges=7d,30d states=ready,updating,read-failure history=preserved freshness=labelled current_quota=cleared-on-failure")
+            return 0
+        } catch {
+            FileHandle.standardError.write(Data("macOS menu bar overview render failed\n".utf8))
+            return 1
+        }
     }
 
     static func render(outputDirectory: String) -> Int32 {
@@ -10357,6 +10739,28 @@ private enum MenuBarContractSmokeTest {
                             appearance: appearance
                         )
                     }
+                    var updatingSnapshot = snapshot
+                    updatingSnapshot.phase = .analyzing
+                    updatingSnapshot.history = snapshot.history.retainingLastVerified()
+                    popup.update(snapshot: updatingSnapshot, now: observedAt)
+                    for range in [MenuBarHistoryRange.sevenDays, .thirtyDays] {
+                        popup.selectHistoryRangeForSmokeTest(range)
+                        try popup.renderPNG(
+                            to: output.appendingPathComponent(
+                                "menu-bar-popover-en-updating-\(range.rawValue)-light.png"
+                            ),
+                            appearance: .aqua
+                        )
+                    }
+                    updatingSnapshot.invalidateObservedEvidence(keepingHistory: true)
+                    updatingSnapshot.phase = .unavailable
+                    popup.update(snapshot: updatingSnapshot, now: observedAt)
+                    try popup.renderPNG(
+                        to: output.appendingPathComponent(
+                            "menu-bar-popover-en-read-failure-30d-light.png"
+                        ),
+                        appearance: .aqua
+                    )
                 }
             }
 
@@ -10507,7 +10911,8 @@ private enum MenuBarContractSmokeTest {
                 + "locales=en,es,zh-Hans appearances=light,dark "
                 + "ranges=7d,30d "
                 + "states=live,pace-collecting,pace-under,pace-on,"
-                + "pace-over,pace-critical,partial-pricing,unpriced,unavailable "
+                + "pace-over,pace-critical,partial-pricing,unpriced,unavailable,"
+                + "updating-7d,updating-30d,read-failure-30d "
                 + "width=400 source=synthetic-content-free"
         )
         return 0
@@ -12026,6 +12431,25 @@ private struct UsageMonitorMain {
         if arguments.contains("--menu-bar-contract-smoke-test") {
             exit(MainActor.assumeIsolated {
                 MenuBarContractSmokeTest.run()
+            })
+        }
+        if arguments.contains("--menu-bar-interaction-smoke-test") {
+            guard BundledProduct.buildChannel == "development" else { exit(2) }
+            exit(MainActor.assumeIsolated {
+                MenuBarContractSmokeTest.runInteractionHarness()
+            })
+        }
+        if let overviewRenderIndex = arguments.firstIndex(
+            of: "--menu-bar-overview-render-smoke-test"
+        ) {
+            guard overviewRenderIndex + 2 < arguments.count,
+                  BundledProduct.buildChannel == "development"
+            else { exit(2) }
+            exit(MainActor.assumeIsolated {
+                MenuBarContractSmokeTest.renderOverview(
+                    inputPath: arguments[overviewRenderIndex + 1],
+                    outputDirectory: arguments[overviewRenderIndex + 2]
+                )
             })
         }
         if let renderIndex = arguments.firstIndex(

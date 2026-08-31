@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -81,6 +81,70 @@ async function currentWeeklyPaceFixture() {
   return { weekly: { paceOutlook } };
 }
 
+async function retainedMenuBarOverviewFixture() {
+  const nowMs = Date.now() - 1_000;
+  const generatedAt = new Date(nowMs - 60_000).toISOString();
+  const coveredAt = {
+    startAt: new Date(nowMs - 30 * 24 * 60 * 60_000).toISOString(),
+    endAt: generatedAt,
+  };
+  const pricingCoverage = { fullyPricedEvents: 2, partiallyPricedEvents: 1, unpricedEvents: 1 };
+  const periods = ["24h", "7d", "30d"].map((periodId) => ({
+    periodId, events: 4, totalTokens: 1_000, apiPriceEquivalentUsd: .2, pricingCoverage,
+  }));
+  const bucketEndMs = Math.floor((nowMs - 60_000) / 900_000) * 900_000;
+  let candidate = {
+    schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+    mode: "real_local_evidence",
+    generatedAt,
+    overview: {
+      evidenceStatus: "available",
+      freshness: { status: "live", accountingStatus: "available", staleAfterSeconds: 600 },
+      quotaWindows: [{
+        limitId: "codex", slot: "primary", durationMinutes: 10_080,
+        remainingPercent: 80, usedPercent: 20, observedAt: generatedAt,
+        resetAt: new Date(nowMs + 6 * 24 * 60 * 60_000).toISOString(),
+      }],
+      accounting: {
+        sourceMode: "unified", generation: 1, generationMatched: true,
+        generatedAt, coveredAt, events: 4, periods,
+        projection: { status: "available", reason: null, terminal: false },
+      },
+      usage: periods.map(({ periodId, ...period }) => ({ id: periodId, ...period })),
+      timeline: {
+        source: "unified_local_index", coveredAt, bucketMinutes: 15,
+        history: { status: "complete", coveredAt, generatedAt },
+        usage: [{
+          startAt: new Date(bucketEndMs - 900_000).toISOString(),
+          endAt: new Date(bucketEndMs).toISOString(),
+          usageEvents: 4, totalTokens: 1_000, apiPriceEquivalentUsd: .2, pricingCoverage,
+        }],
+      },
+    },
+    gradient: {}, weekly: {}, quality: {},
+  };
+  const store = new LocalCompanionDataStore({ builder: async () => candidate });
+  await store.reload({ purpose: "full" });
+  candidate = structuredClone(candidate);
+  candidate.generatedAt = new Date(nowMs).toISOString();
+  candidate.overview.freshness.accountingStatus = "unavailable";
+  Object.assign(candidate.overview.quotaWindows[0], {
+    observedAt: candidate.generatedAt, remainingPercent: 75, usedPercent: 25,
+  });
+  Object.assign(candidate.overview.accounting, {
+    generation: 2, generationMatched: false, events: 0, periods: [],
+    generatedAt: candidate.generatedAt, coveredAt: { startAt: null, endAt: null },
+    projection: { status: "unavailable", reason: "local_unified_index_deferred", terminal: false },
+  });
+  candidate.overview.usage = [];
+  Object.assign(candidate.overview.timeline, {
+    source: "insufficient_evidence", coveredAt: { startAt: null, endAt: null },
+    history: { status: "loading" }, usage: [],
+  });
+  await store.reload({ purpose: "quick" });
+  return store.getOverview();
+}
+
 test("test compiler profile builds a development-only launcher that runs", {
   skip: BUILD_SUPPORTED ? false : "requires pinned macOS arm64 Node v26.2.0 builder",
   timeout: 90_000,
@@ -129,6 +193,45 @@ test("test compiler profile builds a development-only launcher that runs", {
       progressSmoke.stdout,
       /phases=allowlisted[\s\S]*unified=scanning[\s\S]*accounting=calculating[\s\S]*counts=bounded[\s\S]*quick_result=evidence-gated[\s\S]*unknown=generic[\s\S]*free_text=ignored/u,
     );
+    const menuBarSmoke = spawnSync(
+      launcher,
+      ["--menu-bar-contract-smoke-test"],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(
+      menuBarSmoke.status,
+      0,
+      menuBarSmoke.error?.message ?? menuBarSmoke.stderr,
+    );
+    assert.match(
+      menuBarSmoke.stdout,
+      /history=authoritative,coverage-named,fail-closed[\s\S]*history_retention=refresh,failure,source-reset/u,
+    );
+    assert.match(
+      menuBarSmoke.stdout,
+      /dismissal=escape,transient,same-app,outside,deactivation/u,
+    );
+    const retainedOverviewFixture = join(temporaryRoot, "retained-menu-bar-overview.json");
+    const retainedOverview = await retainedMenuBarOverviewFixture();
+    assert.equal(retainedOverview.accounting.projection.status, "retained");
+    assert.equal(retainedOverview.accounting.generationMatched, false);
+    const overviewRenderDirectory = join(temporaryRoot, "retained-menu-bar-render");
+    await writeFile(retainedOverviewFixture, `${JSON.stringify(retainedOverview)}\n`, {
+      encoding: "utf8", mode: 0o600,
+    });
+    const overviewRenderSmoke = spawnSync(launcher, [
+      "--menu-bar-overview-render-smoke-test", retainedOverviewFixture, overviewRenderDirectory,
+    ], { encoding: "utf8", timeout: 10_000 });
+    assert.equal(
+      overviewRenderSmoke.status, 0,
+      overviewRenderSmoke.error?.message ?? overviewRenderSmoke.stderr,
+    );
+    assert.match(overviewRenderSmoke.stdout,
+      /USAGE_MONITOR_MACOS_MENU_BAR_OVERVIEW_RENDER ranges=7d,30d states=ready,updating,read-failure history=preserved freshness=labelled current_quota=cleared-on-failure/u);
+    assert.deepEqual((await readdir(overviewRenderDirectory)).sort(),
+      ["ready", "updating", "read-failure"].flatMap((state) => (
+        ["7d", "30d"].map((range) => `${state}-${range}.png`)
+      )).sort());
     const weeklyPaceFixture = join(temporaryRoot, "weekly-pace-outlook.json");
     await writeFile(
       weeklyPaceFixture,

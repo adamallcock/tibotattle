@@ -2632,6 +2632,174 @@ test("a deferred quick reload keeps the usage figures and both usage timelines",
   })();
 });
 
+test("usage timeline retention keeps its matching metadata without retaining current quota lanes", async (t) => {
+  const metadataKeys = [
+    "source", "coveredAt", "bucketMinutes", "history", "allowanceWeightingEncoding",
+  ];
+  const snapshot = ({ generation, matched, populated }) => {
+    const generatedAt = generation === 1
+      ? "2026-08-28T12:00:00.000Z"
+      : "2026-08-28T12:15:00.000Z";
+    const coveredAt = populated
+      ? { startAt: "2026-08-28T00:00:00.000Z", endAt: generatedAt }
+      : { startAt: null, endAt: null };
+    return {
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      mode: "real_local_evidence",
+      generatedAt,
+      overview: {
+        quota: { observedAt: generatedAt, windows: [{ remainingPercent: 90 - generation }] },
+        accounting: {
+          sourceMode: "unified",
+          generation,
+          generationMatched: matched,
+          generationFingerprint: `synthetic-generation-${generation}`,
+          accountingCacheStatus: matched ? "available" : "unavailable",
+          generatedAt,
+          coveredAt,
+          events: populated ? generation : 0,
+          projection: {
+            status: matched ? "current" : "loading",
+            reason: matched ? null : "unified_index_deferred",
+            terminal: matched,
+          },
+        },
+        usage: [{ id: "7d", events: populated ? generation : 0 }],
+        timeline: {
+          source: populated ? "unified_local_index" : "insufficient_evidence",
+          coveredAt,
+          bucketMinutes: generation === 1 ? 15 : 30,
+          history: { status: populated ? "complete" : "loading", coveredAt, generatedAt },
+          allowanceWeightingEncoding: {
+            schemaVersion: "quota-weighted-timeline-v0.1",
+            scenarioOrder: generation === 1
+              ? ["unresolved_as_standard", "unresolved_as_fast"]
+              : ["unresolved_as_fast", "unresolved_as_standard"],
+            selectedScenario: "unresolved_as_standard",
+          },
+          usage: populated ? [{ at: generatedAt, totalTokens: generation * 100 }] : [],
+          quota: [{ at: generatedAt, usedPercent: generation }],
+          sparkQuota: [{ at: generatedAt, usedPercent: generation * 2 }],
+          sparkUsage: [{ at: generatedAt, totalTokens: generation * 10 }],
+          calibrationUsage: [{ at: generatedAt, totalTokens: generation * 20 }],
+          allowanceCapacity: { status: "available", marker: generation },
+          marker: generation,
+        },
+      },
+      gradient: { datasets: {} },
+      weekly: { datasets: {} },
+      quality: {},
+    };
+  };
+  const storeWith = (snapshots) => {
+    let call = 0;
+    return new LocalCompanionDataStore({
+      builder: async () => snapshots[Math.min(call++, snapshots.length - 1)],
+    });
+  };
+
+  for (const purpose of ["startup", "quick", "full"]) {
+    await t.test(`${purpose} retains usage and metadata as one projection`, async () => {
+      const previous = snapshot({ generation: 1, matched: true, populated: true });
+      const incoming = snapshot({ generation: 2, matched: false, populated: false });
+      const unmodified = structuredClone([previous, incoming]);
+      const store = storeWith([previous, incoming]);
+      await store.reload({ purpose: "full" });
+      await store.reload({ purpose });
+      const held = store.getOverview();
+      const expectedTimeline = { ...incoming.overview.timeline, usage: previous.overview.timeline.usage };
+      for (const key of metadataKeys) expectedTimeline[key] = previous.overview.timeline[key];
+      assert.deepEqual(held.timeline, expectedTimeline,
+        "retained usage needs its old metadata; quota, Spark, and other incoming lanes stay fresh");
+      assert.deepEqual(held.quota, incoming.overview.quota);
+      assert.equal(held.generatedAt, incoming.generatedAt);
+      assert.equal(held.accounting.generation, 2);
+      assert.equal(held.accounting.generationMatched, false);
+      assert.equal(held.accounting.generationFingerprint, "synthetic-generation-2");
+      assert.equal(held.accounting.accountingCacheStatus, "unavailable");
+      assert.deepEqual(held.accounting.projection, {
+        ...incoming.overview.accounting.projection,
+        status: "retained",
+        retainedAt: previous.generatedAt,
+        coveredAt: previous.overview.accounting.coveredAt,
+      });
+      assert.deepEqual([previous, incoming], unmodified, "retention must not mutate builder snapshots");
+    });
+  }
+
+  await t.test("missing old metadata is not borrowed from the incoming projection", async () => {
+    const previous = snapshot({ generation: 1, matched: true, populated: true });
+    for (const key of metadataKeys) delete previous.overview.timeline[key];
+    const incoming = snapshot({ generation: 2, matched: false, populated: false });
+    const store = storeWith([previous, incoming]);
+    await store.reload({ purpose: "full" });
+    await store.reload({ purpose: "quick" });
+    const held = store.getOverview();
+    assert.deepEqual(held.timeline.usage, previous.overview.timeline.usage);
+    for (const key of metadataKeys) {
+      assert.equal(Object.hasOwn(held.timeline, key), false, `${key} cannot be invented for old rows`);
+    }
+    assert.deepEqual(held.timeline.quota, incoming.overview.timeline.quota);
+  });
+
+  await t.test("malformed old coverage stays unavailable rather than being repaired from accounting dates", async () => {
+    const previous = snapshot({ generation: 1, matched: true, populated: true });
+    const malformedMetadata = {
+      source: null,
+      coveredAt: { startAt: "not-a-date", endAt: null },
+      bucketMinutes: -1,
+      history: null,
+      allowanceWeightingEncoding: null,
+    };
+    Object.assign(previous.overview.timeline, malformedMetadata);
+    const incoming = snapshot({ generation: 2, matched: false, populated: false });
+    const store = storeWith([previous, incoming]);
+    await store.reload({ purpose: "full" });
+    await store.reload({ purpose: "full" });
+    const held = store.getOverview();
+    assert.deepEqual(held.timeline.usage, previous.overview.timeline.usage);
+    for (const key of metadataKeys) assert.deepEqual(held.timeline[key], malformedMetadata[key]);
+    assert.deepEqual(held.accounting.projection.coveredAt, previous.overview.accounting.coveredAt);
+    assert.notDeepEqual(held.timeline.coveredAt, held.accounting.projection.coveredAt);
+  });
+
+  for (const [name, matched, populated] of [
+    ["authoritative empty", true, false],
+    ["authoritative populated", true, true],
+    ["non-authoritative populated", false, true],
+  ]) {
+    await t.test(`${name} replaces both usage and its metadata`, async () => {
+      const previous = snapshot({ generation: 1, matched: true, populated: true });
+      const incoming = snapshot({ generation: 2, matched, populated });
+      const store = storeWith([previous, incoming]);
+      await store.reload({ purpose: "full" });
+      await store.reload({ purpose: "full" });
+      assert.deepEqual(store.getOverview().timeline, incoming.overview.timeline);
+      assert.deepEqual(store.getOverview().accounting, incoming.overview.accounting);
+    });
+  }
+
+  await t.test("an omitted usage surface does not trigger metadata retention", async () => {
+    const previous = snapshot({ generation: 1, matched: true, populated: true });
+    const incoming = snapshot({ generation: 2, matched: false, populated: false });
+    delete incoming.overview.timeline.usage;
+    const store = storeWith([previous, incoming]);
+    await store.reload({ purpose: "full" });
+    await store.reload({ purpose: "quick" });
+    assert.deepEqual(store.getOverview().timeline, incoming.overview.timeline);
+  });
+
+  await t.test("a first refresh without previous usage cannot manufacture timeline metadata", async () => {
+    const previous = snapshot({ generation: 1, matched: true, populated: false });
+    const incoming = snapshot({ generation: 2, matched: false, populated: false });
+    const store = storeWith([previous, incoming]);
+    await store.reload({ purpose: "startup" });
+    assert.deepEqual(store.getOverview().timeline, previous.overview.timeline);
+    await store.reload({ purpose: "quick" });
+    assert.deepEqual(store.getOverview().timeline, incoming.overview.timeline);
+  });
+});
+
 test("a non-authoritative FULL build keeps the evidence it could not rebuild", async () => {
   // Reproduced 2026-08-21 against the owner's real index (repro-blank.mjs):
   // a full-mode snapshot built while the generation row is not ready — the
@@ -2972,9 +3140,10 @@ test("every surface a withheld projection empties is registered for retention", 
   // values, so enumerating its substitution sites enumerates the class.
   //
   // Two of the eight sites yield real data surfaces as bare empty arrays and
-  // one yields the zeroed placeholder periods; the remaining five yield a
-  // coverage window or a source LABEL, which carry no rows and are meant to
-  // change on a deferred pass. If a new evidence-bearing substitution appears,
+  // one yields the zeroed placeholder periods; the remaining five yield
+  // metadata rather than rows. Usage coverage/source metadata is retained with
+  // the exact usage rows it describes; accounting truth fields remain current.
+  // If a new evidence-bearing substitution appears,
   // this fails until it is registered in PROJECTION_SURFACES — which is the
   // point, because reviewing the retention list is not something anyone
   // remembers to do when adding a surface.

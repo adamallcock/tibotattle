@@ -3632,7 +3632,16 @@ const PROJECTION_SURFACES = Object.freeze([
     preserveIncomingKeys: Object.freeze(["paceForecast", "paceOutlook"]),
   },
   { path: Object.freeze(["overview", "usage"]), rows: usagePeriodRows },
-  { path: Object.freeze(["overview", "timeline", "usage"]), rows: arrayRows },
+  {
+    path: Object.freeze(["overview", "timeline", "usage"]),
+    rows: arrayRows,
+    // Coverage and encoding describe these exact usage rows. Keeping rows
+    // with the deferred build's empty coverage makes native consumers reject
+    // the retained history. Carry only their metadata, not fresh quota lanes.
+    retainSiblingKeys: Object.freeze([
+      "source", "coveredAt", "bucketMinutes", "history", "allowanceWeightingEncoding",
+    ]),
+  },
   { path: Object.freeze(["overview", "timeline", "sparkUsage"]), rows: arrayRows },
   {
     path: Object.freeze(["overview", "timeline", "calibrationUsage"]),
@@ -3898,7 +3907,7 @@ export class LocalCompanionDataStore {
     const retained = this.#snapshot;
     if (retained === null) return next;
     let usageEvidenceRetained = false;
-    for (const { path, rows, preserveIncomingKeys = [] }
+    for (const { path, rows, preserveIncomingKeys = [], retainSiblingKeys = [] }
       of PROJECTION_SURFACES) {
       const key = path[path.length - 1];
       const nextParent = surfaceParent(next, path);
@@ -3917,6 +3926,15 @@ export class LocalCompanionDataStore {
           }
         }
         nextParent[key] = replacement;
+        for (const siblingKey of retainSiblingKeys) {
+          if (Object.hasOwn(retainedParent, siblingKey)) {
+            nextParent[siblingKey] = structuredClone(retainedParent[siblingKey]);
+          } else {
+            // A missing old metadata field must not borrow the incoming
+            // projection's coverage or encoding for unrelated retained rows.
+            delete nextParent[siblingKey];
+          }
+        }
         if (path.length === 2 && path[0] === "overview" && path[1] === "usage") {
           usageEvidenceRetained = true;
         }

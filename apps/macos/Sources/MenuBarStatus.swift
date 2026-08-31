@@ -9,11 +9,13 @@ import Foundation
 // own evidence plus the two actions a background monitor needs at hand.
 //
 // Honesty rules encoded here:
-//   * no number is ever synthesised, interpolated, or carried forward;
+//   * no quota number is ever synthesised, interpolated, or carried forward;
 //   * a number is shown in the menu bar only while the companion itself
 //     reports live evidence inside its own freshness window;
 //   * stale or absent evidence collapses to a neutral placeholder and the
-//     menu explains, in words, why there is no number.
+//     menu explains, in words, why there is no number;
+//   * previous verified history may remain visible with an explicit retained
+//     label, independently of current allowance and forecast authority.
 
 /// One quota lane the local companion actually observed. The menu deliberately
 /// knows only the safe display category, remaining percentage, and reset time;
@@ -341,10 +343,12 @@ struct NativeMenuPresentationContract: Equatable {
     let usesNativeStatusItemMenu: Bool
     let statusItemButtonRoutesClicks: Bool
     let popoverIsTransient: Bool
+    let popoverIsShown: Bool
     let popoverContentWidth: CGFloat
     let popoverContainsScrollView: Bool
     let escapeDismissalMonitorInstalled: Bool
     let sameAppClickAwayMonitorInstalled: Bool
+    let outsideClickAwayMonitorInstalled: Bool
     let appDeactivationDismissalObserverInstalled: Bool
 }
 
@@ -387,6 +391,19 @@ struct MenuBarStatusSnapshot: Equatable {
     /// local-analysis action. An unavailable surface with no companion must
     /// not present a button that silently does nothing.
     var analysisAvailable = false
+
+    /// Current quota/forecast claims cannot survive an unreadable response.
+    /// Historical usage may survive a transient read failure within this
+    /// companion generation, but is explicitly downgraded to retained data.
+    /// Lifecycle/source changes use the default and discard every old value.
+    mutating func invalidateObservedEvidence(keepingHistory: Bool = false) {
+        lanes = []
+        observedAt = nil
+        evidence = .none
+        history = keepingHistory ? history.retainingLastVerified() : .unavailable
+        weeklyPaceOutlook = nil
+        staleAfterSeconds = nil
+    }
 
     /// Mirrors the dashboard's primary selection across the normal Codex
     /// allowance track. Other provider products are rejected while decoding,
@@ -719,6 +736,31 @@ func menuBarShouldDismissForEscape(
     isPopoverShown: Bool
 ) -> Bool {
     keyCode == 53 && (isMenuTracking || isPopoverShown)
+}
+
+enum MenuBarMouseTarget: Equatable, CaseIterable {
+    case popover
+    case statusItem
+    case applicationWindow
+    case outside
+}
+
+/// Popover controls and the status button own their normal actions. Native
+/// menu windows also keep their own tracking; unknown/windowless mouse events
+/// dismiss only the popover, not a separately tracking action menu.
+func menuBarShouldDismissForMouse(
+    target: MenuBarMouseTarget,
+    isMenuTracking: Bool,
+    isPopoverShown: Bool
+) -> Bool {
+    switch target {
+    case .popover, .statusItem:
+        return false
+    case .applicationWindow:
+        return isMenuTracking || isPopoverShown
+    case .outside:
+        return isPopoverShown
+    }
 }
 
 /// Pure projection of the companion's overview payload. Kept free of AppKit so
@@ -1351,6 +1393,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
     private var renderedLaneLabels: [String] = []
     private var escapeMonitor: Any?
     private var localMouseMonitor: Any?
+    private var outsideMouseMonitor: Any?
     private var appDeactivationObserver: NSObjectProtocol?
     private var stopped = false
 
@@ -1609,13 +1652,23 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
                 statusItem.button?.target === self
                     && statusItem.button?.action == #selector(statusItemActivated),
             popoverIsTransient: popover.behavior == .transient,
+            popoverIsShown: popover.isShown,
             popoverContentWidth: popup.contentWidth,
             popoverContainsScrollView: popup.containsScrollView,
             escapeDismissalMonitorInstalled: escapeMonitor != nil,
             sameAppClickAwayMonitorInstalled: localMouseMonitor != nil,
+            outsideClickAwayMonitorInstalled: outsideMouseMonitor != nil,
             appDeactivationDismissalObserverInstalled:
                 appDeactivationObserver != nil
         )
+    }
+
+    /// Packaged native-test seam: show the same popover from the same status
+    /// button without posting synthetic input or starting a companion.
+    func showPopoverForSmokeTest() -> Bool {
+        guard !stopped, let button = statusItem.button else { return false }
+        if !popover.isShown { statusItemActivated(button) }
+        return popover.isShown
     }
 
     /// Left-click is the glanceable instrument; right-click and Control-click
@@ -1646,6 +1699,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
             of: sender,
             preferredEdge: .minY
         )
+        startOutsideClickMonitoring()
         sender.highlight(true)
         pollNow()
     }
@@ -1660,6 +1714,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
             to: nil
         )
         let screenPoint = anchor.window?.convertPoint(toScreen: windowPoint)
+        stopOutsideClickMonitoring()
         defersPopoverRefreshUntilMenuCloses = popover.isShown
         popover.performClose(nil)
         statusItem.button?.highlight(true)
@@ -1675,7 +1730,12 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
         }
     }
 
+    func popoverDidShow(_ notification: Notification) {
+        startOutsideClickMonitoring()
+    }
+
     func popoverDidClose(_ notification: Notification) {
+        stopOutsideClickMonitoring()
         statusItem.button?.highlight(false)
         guard !stopped else { return }
         if suppressesNextPopoverCloseRefresh {
@@ -1711,21 +1771,35 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
         localMouseMonitor = NSEvent.addLocalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
         ) { [weak self] event in
-            guard let self,
-                  self.isMenuTracking || self.popover.isShown,
-                  let eventWindow = event.window,
-                  NSApp.windows.contains(where: { $0 === eventWindow })
+            guard let self, !self.stopped,
+                  self.isMenuTracking || self.popover.isShown
             else {
                 return event
             }
-            if self.popover.isShown,
+            let target: MenuBarMouseTarget
+            if let eventWindow = event.window,
                eventWindow === self.popover.contentViewController?.view.window {
-                return event
+                target = .popover
+            } else if let button = self.statusItem.button,
+                      let eventWindow = event.window,
+                      eventWindow === button.window,
+                      button.bounds.contains(button.convert(event.locationInWindow, from: nil)) {
+                // Do not close on mouse-down and reopen on the button's
+                // mouse-up. Its own action retains toggle/context-menu routing.
+                target = .statusItem
+            } else if let eventWindow = event.window,
+                      NSApp.windows.contains(where: { $0 === eventWindow }) {
+                target = .applicationWindow
+            } else {
+                target = .outside
             }
-            // The menu's own window is not an application window, so native
-            // menu-item clicks continue through AppKit. A click in any of the
-            // app's windows is an unambiguous same-app click-away.
-            self.dismissSurfaces()
+            if menuBarShouldDismissForMouse(
+                target: target,
+                isMenuTracking: self.isMenuTracking,
+                isPopoverShown: self.popover.isShown
+            ) {
+                self.dismissSurfaces()
+            }
             return event
         }
         appDeactivationObserver = NotificationCenter.default.addObserver(
@@ -1739,7 +1813,32 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
         }
     }
 
+    /// A status-item popover can open while the app is already inactive, so
+    /// another application's click need not cause didResignActive. Observe
+    /// mouse-down only while open, ignoring all event content and never
+    /// consuming another application's event or monitoring global keystrokes.
+    private func startOutsideClickMonitoring() {
+        guard !stopped, popover.isShown, outsideMouseMonitor == nil else { return }
+        outsideMouseMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { [weak self] _ in
+            // AppKit delivers event-monitor callbacks on the main thread.
+            MainActor.assumeIsolated {
+                guard let self, !self.stopped, self.popover.isShown else { return }
+                self.dismissSurfaces()
+            }
+        }
+    }
+
+    private func stopOutsideClickMonitoring() {
+        if let outsideMouseMonitor {
+            NSEvent.removeMonitor(outsideMouseMonitor)
+            self.outsideMouseMonitor = nil
+        }
+    }
+
     private func removeInteractionMonitoring() {
+        stopOutsideClickMonitoring()
         if let localMouseMonitor {
             NSEvent.removeMonitor(localMouseMonitor)
             self.localMouseMonitor = nil
@@ -1764,6 +1863,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
             suppressesNextMenuCloseRefresh = isMenuTracking
             suppressesNextPopoverCloseRefresh = popover.isShown
         }
+        stopOutsideClickMonitoring()
         menu.cancelTracking()
         isMenuTracking = false
         popover.performClose(nil)
@@ -1839,7 +1939,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
                     : .ready
             case .unreachable:
                 self.overviewResponseHealthy = false
-                self.invalidateObservedEvidence()
+                self.invalidateObservedEvidence(keepingHistory: true)
                 self.snapshot.phase = .unavailable
                 self.snapshot.failureSummary =
                     TiboTattleLocalization.string(
@@ -1925,11 +2025,11 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
                 return
             }
             guard let overview else {
-                // An unreadable response cannot support the previous number.
-                // Clear it immediately and leave a retryable unavailable state
-                // rather than silently retaining live-looking evidence.
+                // An unreadable response cannot support a current quota or
+                // forecast. Keep prior verified history explicitly labelled
+                // as retained while this same companion remains retryable.
                 self.overviewResponseHealthy = false
-                self.invalidateObservedEvidence()
+                self.invalidateObservedEvidence(keepingHistory: true)
                 self.snapshot.phase = .unavailable
                 self.snapshot.failureSummary =
                     TiboTattleLocalization.string(
@@ -2070,15 +2170,10 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
         )
     }
 
-    private func invalidateObservedEvidence() {
+    private func invalidateObservedEvidence(keepingHistory: Bool = false) {
         evidenceExpiryWorkItem?.cancel()
         evidenceExpiryWorkItem = nil
-        snapshot.lanes = []
-        snapshot.observedAt = nil
-        snapshot.evidence = .none
-        snapshot.history = .unavailable
-        snapshot.weeklyPaceOutlook = nil
-        snapshot.staleAfterSeconds = nil
+        snapshot.invalidateObservedEvidence(keepingHistory: keepingHistory)
         observedEvidenceExpiresAt = nil
     }
 
@@ -2479,7 +2574,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
             case .unreachable:
                 self.automaticRefreshSuppressed = true
                 self.overviewResponseHealthy = false
-                self.invalidateObservedEvidence()
+                self.invalidateObservedEvidence(keepingHistory: true)
                 self.snapshot.phase = .unavailable
                 self.snapshot.failureSummary =
                     TiboTattleLocalization.string(

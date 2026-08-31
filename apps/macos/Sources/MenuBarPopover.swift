@@ -14,6 +14,7 @@ struct MenuBarPopoverPresentationContract: Equatable {
     let selectedHistoryRange: MenuBarHistoryRange
     let dailyBarCount: Int
     let historyVisible: Bool
+    let retainedHistoryDisclosed: Bool
     let partialPricingDisclosed: Bool
     let pricingState: MenuBarPopoverPricingState
     let historyCoverageState: MenuBarPopoverHistoryCoverageState
@@ -704,6 +705,7 @@ final class MenuBarPopoverViewController: NSViewController {
     private let historyTokenLabel = NSTextField(labelWithString: "")
     private let historyEventsLabel = NSTextField(labelWithString: "")
     private let historyPriceLabel = NSTextField(wrappingLabelWithString: "")
+    private let historyFreshnessLabel = NSTextField(wrappingLabelWithString: "")
     private let historyChart = MenuBarDailyTokenBarsView()
     private let historyCoverageLabel = NSTextField(wrappingLabelWithString: "")
     private let historyAvailableStack = NSStackView()
@@ -868,6 +870,8 @@ final class MenuBarPopoverViewController: NSViewController {
             selectedHistoryRange: selectedRange,
             dailyBarCount: historyChart.days.count,
             historyVisible: historyState == .available,
+            retainedHistoryDisclosed: !historyFreshnessLabel.isHidden
+                && !historyFreshnessLabel.stringValue.isEmpty,
             partialPricingDisclosed: partialPricingDisclosed,
             pricingState: pricingState,
             historyCoverageState: historyChart.coverageState,
@@ -953,6 +957,9 @@ final class MenuBarPopoverViewController: NSViewController {
         historyPriceLabel.font = .systemFont(ofSize: 10.5)
         historyPriceLabel.textColor = .secondaryLabelColor
         historyPriceLabel.maximumNumberOfLines = 2
+        historyFreshnessLabel.font = .systemFont(ofSize: 10.5)
+        historyFreshnessLabel.textColor = .secondaryLabelColor
+        historyFreshnessLabel.maximumNumberOfLines = 2
         historyCoverageLabel.font = .systemFont(ofSize: 9.5)
         historyCoverageLabel.textColor = .secondaryLabelColor
         historyCoverageLabel.maximumNumberOfLines = 2
@@ -1086,6 +1093,7 @@ final class MenuBarPopoverViewController: NSViewController {
         historyAvailableStack.alignment = .leading
         historyAvailableStack.spacing = 4
         for child in [
+            historyFreshnessLabel,
             historyHeadlineLabel,
             metrics,
             historyPriceLabel,
@@ -1095,6 +1103,7 @@ final class MenuBarPopoverViewController: NSViewController {
             historyAvailableStack.addArrangedSubview(child)
         }
         for child in [
+            historyFreshnessLabel,
             historyHeadlineLabel,
             metrics,
             historyPriceLabel,
@@ -1250,7 +1259,9 @@ final class MenuBarPopoverViewController: NSViewController {
 
     private func renderHistory(_ history: MenuBarHistorySnapshot) {
         rangeControl.selectedSegment = selectedRange == .sevenDays ? 0 : 1
-        guard history.accountingStatus == .current,
+        historyFreshnessLabel.stringValue = ""
+        historyFreshnessLabel.isHidden = true
+        guard history.accountingStatus != .unavailable,
               let period = history.period(for: selectedRange)
         else {
             historyState = .unavailable
@@ -1281,6 +1292,16 @@ final class MenuBarPopoverViewController: NSViewController {
         historyState = .available
         historyAvailableStack.isHidden = false
         historyUnavailableStack.isHidden = true
+        if history.accountingStatus == .retained
+            || currentSnapshot.phase == .analyzing {
+            historyFreshnessLabel.stringValue = TiboTattleLocalization.string(
+                .menuBarPopupRetainedHistory
+            )
+            historyFreshnessLabel.isHidden = false
+            historyFreshnessLabel.setAccessibilityLabel(
+                historyFreshnessLabel.stringValue
+            )
+        }
         let periodLabel = selectedRange == .sevenDays
             ? TiboTattleLocalization.string(.menuBarPopupPeriodLastSevenDays)
             : TiboTattleLocalization.string(.menuBarPopupPeriodLastThirtyDays)
