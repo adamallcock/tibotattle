@@ -1718,14 +1718,46 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   );
   assert.match(
     source,
-    /decisionHandler\(\.cancel\)\s*\n\s*openExternally\(url\)/u,
+    /decisionHandler\(\.cancel\)\s*\n\s*openExternalNavigation\(navigationAction, url: url\)/u,
   );
   // A second window is never opened in-app; its target is handed straight to
   // the user's browser and this delegate returns nothing.
   assert.match(
     source,
-    /createWebViewWith configuration: WKWebViewConfiguration,[\s\S]*?openExternally\(url\)\s*\n\s*\}\s*\n\s*return nil/u,
+    /createWebViewWith configuration: WKWebViewConfiguration,[\s\S]*?openExternalNavigation\(navigationAction, url: url\)\s*\n\s*\}\s*\n\s*return nil/u,
   );
+  // Neither navigation delegate is a trusted-user attestation. Only the
+  // isolated-content-world click bridge can open Codex; generic navigations
+  // (including script clicks/new windows/downloads) cannot.
+  assert.match(
+    source,
+    /private func openExternalNavigation\([\s\S]*?url\.scheme\?\.lowercased\(\) == "codex" \{\s*(?:\/\/[^\n]*\n\s*)*return\s*\}\s*openExternally\(url\)/u,
+  );
+  assert.match(
+    source,
+    /configuration\.userContentController\.add\(\s*self,\s*contentWorld: Self\.codexThreadLinkWorld,\s*name: "tibotattleCodexThreadLink"/u,
+  );
+  assert.match(
+    source,
+    /source: trustedCodexThreadLinkScript\(\),\s*injectionTime: \.atDocumentStart,\s*forMainFrameOnly: true,\s*in: codexThreadLinkWorld/u,
+  );
+  assert.match(
+    source,
+    /message\.name == "tibotattleCodexThreadLink"[\s\S]*?message\.world === Self\.codexThreadLinkWorld[\s\S]*?payload\.count == 1[\s\S]*?threadId\.count == 36[\s\S]*?CodexThreadOpenTarget\.acceptsNavigation\([\s\S]*?sourceIsMainFrame: frame\.isMainFrame[\s\S]*?sourceURL: frame\.request\.url[\s\S]*?sourceOrigin: \(origin\.protocol, origin\.host, origin\.port\)[\s\S]*?companionPort: allowedPort/u,
+  );
+  assert.match(
+    source,
+    /decidePolicyFor navigationAction: WKNavigationAction,[\s\S]*?if url\.scheme\?\.lowercased\(\) == "codex" \{[\s\S]*?decisionHandler\(\.cancel\)[\s\S]*?openExternalNavigation\(navigationAction, url: url\)[\s\S]*?return[\s\S]*?navigationAction\.shouldPerformDownload/u,
+  );
+  assert.match(
+    source,
+    /private enum CodexThreadOpenTarget[\s\S]*?parts\.scheme == "codex"[\s\S]*?parts\.host == "threads"[\s\S]*?parts\.user == nil[\s\S]*?parts\.password == nil[\s\S]*?parts\.port == nil[\s\S]*?parts\.query == nil[\s\S]*?parts\.fragment == nil[\s\S]*?UUID\(uuidString:[\s\S]*?url\.absoluteString[\s\S]*?identifier\.uuidString\.lowercased\(\)/u,
+  );
+  assert.match(
+    source,
+    /private func openExternalDashboardLink\(_ url: URL\) \{[\s\S]*?if CodexThreadOpenTarget\.accepts\(url\) \{\s*NSWorkspace\.shared\.open\(url\)\s*return/u,
+  );
+  assert.match(source, /let codexThreadLinksSafe = codexThreadPolicyIsSafe\(\)/u);
   assert.match(
     source,
     /private func openExternalDashboardLink\(_ url: URL\) \{[\s\S]*?semanticOpenTarget\.accepts\(url\)[\s\S]*?NSApp\.activate\(ignoringOtherApps: true\)[\s\S]*?url\.scheme\?\.lowercased\(\) == "https"[\s\S]*?url\.user == nil,\s*\n\s*url\.password == nil/u,
@@ -1851,6 +1883,60 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   assert.match(source, /UM_MACOS_DASHBOARD_READY_TIMEOUT/u);
   assert.match(source, /UM_MACOS_DASHBOARD_VIEW_UNAVAILABLE/u);
   assert.match(source, /UM_MACOS_DASHBOARD_DOWNLOAD_FAILED/u);
+});
+
+test("native Codex link bridge requires a trusted click and a canonical thread target", async () => {
+  const source = await readFile(SWIFT_SOURCE, "utf8");
+  const swiftScript = source.match(
+    /private static func trustedCodexThreadLinkScript\(\) -> String \{\s*"""([\s\S]*?)"""/u,
+  )?.[1];
+  assert.ok(swiftScript, "the native-owned isolated click script exists");
+  const messages = [];
+  let listener;
+  let prevented = 0;
+  class Element {
+    constructor(href) { this.href = href; }
+    closest(selector) {
+      assert.equal(selector, "a[href]");
+      return this;
+    }
+    getAttribute(name) {
+      assert.equal(name, "href");
+      return this.href;
+    }
+  }
+  runInNewContext(swiftScript.replaceAll("\\\\", "\\"), {
+    Element,
+    document: { addEventListener(type, callback, capture) {
+      assert.equal(type, "click");
+      assert.equal(capture, true);
+      listener = callback;
+    } },
+    window: { webkit: { messageHandlers: { tibotattleCodexThreadLink: {
+      postMessage: (value) => messages.push(JSON.parse(JSON.stringify(value))),
+    } } } },
+  });
+  const id = "11111111-1111-4111-8111-111111111111";
+  function click(href, isTrusted = true) {
+    listener({
+      target: new Element(href), isTrusted,
+      preventDefault() { prevented += 1; },
+    });
+  }
+  click(`codex://threads/${id}`, false);
+  for (const href of [
+    `https://threads/${id}`, `codex://other/${id}`, `codex://threads/${id}/`,
+    `codex://threads/${id}?query=1`, `codex://threads/${id}#fragment`,
+    `codex://user@threads/${id}`, `codex://threads:123/${id}`,
+    `codex://threads/%31${id.slice(1)}`, `codex://threads/${id}\n`,
+    "codex://threads/not-a-uuid", "codex://threads/11111111-1111-0111-8111-111111111111",
+    "codex://threads/11111111-1111-4111-1111-111111111111", null,
+  ]) click(href);
+  assert.deepEqual(messages, []);
+  assert.equal(prevented, 0);
+  click(`codex://threads/${id}`);
+  assert.deepEqual(messages, [{ threadId: id }]);
+  assert.equal(prevented, 1);
 });
 
 test("native dashboard launch gates its first refresh on the rendered page", async () => {
@@ -7443,7 +7529,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       interactionSafetySmoke.stdout,
-      /^USAGE_MONITOR_MACOS_NATIVE_INTERACTION_SAFETY back=false forward=false reload=true download_link=false open_link=true link_preview=false toolbar_immovable=true settings_tabs_immovable=true settings_delegate=true$/mu,
+      /^USAGE_MONITOR_MACOS_NATIVE_INTERACTION_SAFETY back=false forward=false reload=true download_link=false open_link=true link_preview=false toolbar_immovable=true settings_tabs_immovable=true settings_delegate=true codex_thread_links_safe=true$/mu,
     );
     const generatedFiles = bundleFiles
       .map(({ relativePath }) => relativePath)

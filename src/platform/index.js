@@ -10,6 +10,7 @@ export {
   readCodexConfigServiceTier,
 } from "./codex-config-service-tier.js";
 export { createLocalCodexLogPorts } from "./local-codex-log-ports.js";
+export { readCodexLocalThreadMetadata } from "./local-codex-thread-store.js";
 export {
   createLocalExportSourcePorts,
   localIsProxy,

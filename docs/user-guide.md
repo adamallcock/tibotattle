@@ -24,7 +24,7 @@ launch it normally.
 
 On first launch, the app explains which local sources it may inspect. Those are
 the selected OpenAI Codex session and archived-session directories, the Codex
-state database and local configuration, and content-free account, quota, and
+state database, display-name index and local configuration, and content-free account, quota, and
 usage projections from the installed Codex app-server. The shipping refresh
 does not read Claude or Gemini sources. TiboTattle derives usage/accounting
 metadata; it does not upload prompts, responses, commands, filenames,
@@ -55,6 +55,14 @@ request order cannot be proven, and comparisons without prices, remain excluded
 and disclosed; that subtotal is not the whole-period total or a percentage of
 your allowance. A subtotal with no priceable comparisons stays unavailable,
 not a zero-valued placeholder.
+
+The **Thread name** column in both recent cache-drop tables opens the associated
+Codex thread. A worker row shows a parent-name link and a separate bracketed
+subworker link. Hover a link for the local event time; keyboard users receive
+the same time in its accessible description. If a name is missing, the link
+uses a shortened thread ID. If attribution cannot be proven, it stays unlinked.
+Names are looked up locally and are not included in reports, share cards,
+diagnostics, or community contributions.
 
 ## Refresh, progress, and recovery
 

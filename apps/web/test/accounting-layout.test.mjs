@@ -53,6 +53,7 @@ test("short accounting headings retain Standard-rate context in every locale", a
   const table = html.match(/<table class="cache-continuity-recent-table">[\s\S]*?<\/table>/u)?.[0];
   assert.ok(table);
   assert.equal((table.match(/<th\b/gu) ?? []).length, 5);
+  assert.match(table, /accounting\.cacheDropThread\.column">Thread name<\/th>/u);
   assert.match(table, /column\.configuration">Configuration<\/th>/u);
   assert.doesNotMatch(table, /lostTokens|Estimated lost reuse|Unchanged configuration/u);
   assert.equal((html.match(/<th[^>]+data-i18n-title="accounting\.apiEquivalent\.standardRateBasis"[^>]*>API equivalent<\/th>/gu) ?? []).length, 3);
@@ -79,11 +80,18 @@ test("cache continuity rows and empty states retain five correctly aligned cells
   const element = (tagName, className = "", textContent = "") => ({ tagName, className, textContent, children: [], append(...items) { this.children.push(...items); } });
   const disclosure = { hidden: true, open: false };
   const rows = element("tbody");
+  const linkedItems = [];
   const render = appFunction("renderAccountingCacheContinuityDetails", "sideChatConfigurationDescription", {
     $: (selector) => ({ "#cache-continuity-details": disclosure, "#cache-continuity-rows": rows })[selector] ?? null,
+    cacheDropThreadLinks: { cells: { continuity: [] } },
     clear: (target) => { target.children.length = 0; },
     node: element,
     rawNode: element,
+    cacheSwitchDataCell: (className, textContent) => element("td", className, textContent),
+    cacheDropThreadCell: (kind, item) => {
+      linkedItems.push({ kind, item });
+      return element("td", "cache-drop-thread-cell", "Synthetic thread");
+    },
     localizedNode: (tag, className, key) => element(tag, className, translate(key, {}, "en-US")),
     renderAccountingCacheReuseOutcome: () => {},
     renderCacheImpactPagination: () => {},
@@ -98,8 +106,9 @@ test("cache continuity rows and empty states retain five correctly aligned cells
   const recent = { observedAt: "synthetic time", gapSeconds: 60, previousCacheReadTokens: 100, currentCacheReadTokens: 20, lostCacheTokens: 80, estimatedPremiumUsd: 0.25 };
   render({ status: "available", recent: [recent] });
   assert.equal(disclosure.hidden, false);
+  assert.deepEqual(linkedItems, [{ kind: "continuity", item: recent }]);
   assert.deepEqual(rows.children[0].children.map((cell) => cell.textContent),
-    ["synthetic time", "60s", "GPT-5.6 Sol · High", "100 → 20", "$0.25"]);
+    ["Synthetic thread", "60s", "GPT-5.6 Sol · High", "100 → 20", "$0.25"]);
   render({ status: "available", recent: [{ ...recent, estimatedPremiumUsd: null }] });
   assert.equal(rows.children[0].children.length, 5);
   assert.equal(rows.children[0].children[4].textContent, "—");
