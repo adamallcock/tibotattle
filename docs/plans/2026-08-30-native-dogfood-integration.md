@@ -37,6 +37,10 @@ must remain untouched by integration.
 Take a fresh PR/main snapshot before freezing. Identify newly included source
 explicitly; do not indefinitely follow unrelated active branches.
 
+The selected source set is now frozen through main's `9b121b7d` (#86), including
+#87 and #88, plus this task's compact-accounting changes. Further unrelated PRs
+are not automatically included in the retained validation run.
+
 ## Execution and acceptance
 
 1. Reconcile PRs and local work into an isolated integration checkout. Preserve
@@ -83,6 +87,11 @@ limitation remain distinct from release qualification. On 2026-08-31 UTC the
 exclusion is superseded. Source integration does not retire the live hosted
 endpoint, and the separate owner-access, privacy-intake and retention cutover
 requirements remain in force.
+
+After integrating #86, the combined UI gate passed 412/412 and the companion
+gate passed 274/274. The Worker tests passed 422/422, but its dry-run release
+staging refused concurrent uncommitted documentation edits; the complete gate
+must be rerun from the frozen clean tree. No test was disabled or weakened.
 
 The stable index, matching salt and collector were preserved with verified
 unchanged originals. Copy inspection found physical schema 9, an intact index

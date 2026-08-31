@@ -41,6 +41,7 @@ pull requests, including [PR #80](https://github.com/adamallcock/tibotattle/pull
 [PR #83](https://github.com/adamallcock/tibotattle/pull/83),
 [PR #84](https://github.com/adamallcock/tibotattle/pull/84),
 [PR #85](https://github.com/adamallcock/tibotattle/pull/85),
+[PR #86](https://github.com/adamallcock/tibotattle/pull/86),
 [PR #87](https://github.com/adamallcock/tibotattle/pull/87), and
 [PR #88](https://github.com/adamallcock/tibotattle/pull/88).
 PRs #73 and #74 are not part of this native macOS candidate. PR #75
@@ -123,6 +124,17 @@ published-release claim.
   equivalent table headings whose help retains the Standard-rate basis. The
   cache-continuity table drops the Estimated lost reuse column without changing
   the underlying calculation.
+- Replaces self-service hosted-delete controls with confirmed **Disconnect this
+  Mac**. Disconnect durably pauses this Mac's contribution delivery without
+  deleting hosted history, local analysis, or other devices; signing out is a
+  separate action ([PR #86](https://github.com/adamallcock/tibotattle/pull/86)).
+- Retires `DELETE /api/v1/me` in Worker source while preserving private owner
+  erasure, hosted export, local erase, and deletion-safe restore safeguards.
+  This Worker change is not deployed by the desktop release. Hosted cutover
+  still requires owner-operation preflight, private privacy-request intake and
+  identity verification, and verified retention/backup disclosures; no retention
+  policy change or erasure completion is implied
+  ([PR #86](https://github.com/adamallcock/tibotattle/pull/86)).
 - Completes the API lifecycle cleanup by removing the retired Cloud Run/GCS
   experiment, unused hosted and loopback surfaces, the inactive automatic
   contribution scheduler, and the unfinished Claude quota route while retaining
