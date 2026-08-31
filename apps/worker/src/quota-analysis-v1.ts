@@ -1,11 +1,17 @@
 import {
+  MODEL_COMPOSITION_POLICY,
   QUOTA_CALIBRATION_POLICY,
   SEVEN_DAY_WINDOW_MINUTES,
   analyzeQuotaCalibration,
+  buildCompositionObservations,
   buildResetEvidence,
+  calibrateCompositionCapacities,
   isSupportedQuotaWindowDuration,
 } from "@app-usagemonitor/quota-analysis";
 import type {
+  CompositionFit,
+  CompositionQuotaRow,
+  CompositionUsageRow,
   PricingStatus,
   QuotaSlot,
   QuotaSnapshotInput,
@@ -317,7 +323,7 @@ function buildPricingEvent(
 function priceV1UsageRecord(
   recordJson: string,
   observedAt: string,
-): { costNanousd: number; pricingStatus: PricingStatus } | null {
+): { costNanousd: number; pricingStatus: PricingStatus; modelId: string | null } | null {
   const rec = parseStoredRecordJson(recordJson);
   if (rec === null) return null;
   const pricingEvent = buildPricingEvent(rec, observedAt);
@@ -326,6 +332,9 @@ function priceV1UsageRecord(
   return {
     costNanousd: priced.costNanousd,
     pricingStatus: priced.coverageStatus as PricingStatus,
+    modelId: typeof rec.modelId === "string" && SAFE_TOKEN.test(rec.modelId)
+      ? rec.modelId
+      : null,
   };
 }
 
@@ -1042,4 +1051,209 @@ export async function accountScopedQuotaAnalysisV1FullReferenceForTest(
     });
   }
   return runV1SeedLoop(datasets, quotaSnapshots, usageEvents);
+}
+
+// ---------------------------------------------------------------------------
+// Per-model composition fit
+// ---------------------------------------------------------------------------
+
+const NANOUSD_PER_USD_COMPOSITION = 1_000_000_000;
+const COMPOSITION_UNKNOWN_MODEL = "unknown";
+
+export interface V1ModelComposition {
+  readonly status: "ready";
+  /** The participant's modal plan_type over the retained quota series. */
+  readonly planType: string;
+  readonly fit: CompositionFit;
+  readonly voidedBinCount: number;
+  readonly poolCount: number;
+  readonly quotaRowCount: number;
+  readonly usageEventCount: number;
+  readonly unpricedUsageEventCount: number;
+}
+
+export interface V1ModelCompositionRefusal {
+  readonly status: "not_testable";
+  readonly reason: string;
+}
+
+export type V1ModelCompositionResult =
+  | V1ModelComposition
+  | V1ModelCompositionRefusal;
+
+/**
+ * Per-model NNLS composition fit over a participant's v1 corpus: how many
+ * Pro-plan-relative dollars of each model one hundred weekly percentage
+ * points buys, with the shared kernel's own identification gate deciding
+ * whether the per-model vector is displayable at all.
+ *
+ * Reads the SAME evidence the blended reset fit reads — the winning-device
+ * deduped rows, the lossless run-endpoint quota downsample (whose retained
+ * endpoints are exactly the crossings the kernel's monotone envelope needs),
+ * and per-event server repricing — and differs only in the usage fold: model
+ * identity is preserved, and events are pre-summed per (2h kernel bin, model)
+ * so a ~306k-event corpus reaches the kernel as a few thousand rows.
+ *
+ * Two deliberate divergences from the blended path, both conservative:
+ *   - Only fully priced events contribute cost. The blended path keeps
+ *     partially priced events at zero cost so the RESET refuses via
+ *     incomplete_server_pricing; the composition fit has no per-reset refusal,
+ *     so an unpriced event would silently deflate its model instead. It is
+ *     excluded and counted in unpricedUsageEventCount.
+ *   - The fitable HAVING drops reset groups the shared calibration always
+ *     refuses (<8 distinct percents or <5pp span). Those groups carry at most
+ *     sliver crossings for the kernel too; a jitter-split reset that loses one
+ *     side to the HAVING widens the surviving crossing's bracket and is then
+ *     voided by the kernel's own 3h smear gate.
+ */
+export async function accountScopedModelCompositionV1(
+  db: D1Database,
+  participantId: string,
+  options: V1AnalysisOptions = {},
+): Promise<V1ModelCompositionResult> {
+  const nowMs = options.nowMs ?? Date.now();
+  const maxDownsampledQuotaRows =
+    options.maxDownsampledQuotaRows ?? MAX_DOWNSAMPLED_QUOTA_ROWS;
+  const maxWindowedUsageRows =
+    options.maxWindowedUsageRows ?? MAX_WINDOWED_USAGE_ROWS;
+  const cutoffMs = nowMs - V1_ANALYSIS_WINDOW_MS;
+  const observedAtCutoff = new Date(cutoffMs).toISOString();
+  const resetsAtCutoff = new Date(cutoffMs + SEVEN_DAY_WINDOW_MS).toISOString();
+
+  const winners = await loadWinningDevices(db, participantId);
+  if (winners.length === 0) {
+    return { status: "not_testable", reason: "supported_quota_track_unavailable" };
+  }
+  const winnersJsonArg = winnersJson(winners);
+
+  const quotaResult = await db.prepare(QUOTA_DOWNSAMPLE_SQL).bind(
+    winnersJsonArg,
+    participantId,
+    observedAtCutoff,
+    resetsAtCutoff,
+    SEVEN_DAY_WINDOW_MINUTES,
+    MINIMUM_BOUNDARIES,
+    MINIMUM_DISPLAYED_SPAN_PP,
+    maxDownsampledQuotaRows + 1,
+  ).all<DownsampledQuotaRow>();
+  if (quotaResult.results.length > maxDownsampledQuotaRows) {
+    return { status: "not_testable", reason: "downsampled_quota_limit_exceeded" };
+  }
+
+  // The same DROP-semantics domain prefilter as buildQuotaSnapshotInput,
+  // narrowed to the fields the composition kernel reads. Slot is validated but
+  // deliberately not identity: the kernel pools by (planType, resets_at
+  // cluster) precisely because the weekly window's slot changed roles
+  // historically.
+  const quotaRows: CompositionQuotaRow[] = [];
+  const quotaProviders = new Set<string>();
+  const planCounts = new Map<string, number>();
+  for (const row of quotaResult.results) {
+    if (typeof row.observed_at !== "string" || typeof row.resets_at !== "string") continue;
+    const observedAtMs = Date.parse(row.observed_at);
+    const resetsAtMs = Date.parse(row.resets_at);
+    if (!Number.isFinite(observedAtMs) || !Number.isFinite(resetsAtMs)
+        || resetsAtMs <= observedAtMs) continue;
+    if (typeof row.used_percent !== "number"
+        || !Number.isFinite(row.used_percent)
+        || row.used_percent < 0 || row.used_percent > 100) continue;
+    if (typeof row.slot !== "string" || !SLOT_VALUES.has(row.slot)) continue;
+    if (typeof row.plan_type !== "string" || !SAFE_TOKEN.test(row.plan_type)) continue;
+    if (!SAFE_TOKEN.test(row.provider)) continue;
+    quotaRows.push({
+      observedAtMs,
+      planType: row.plan_type,
+      resetsAtMs,
+      usedPercent: row.used_percent,
+    });
+    quotaProviders.add(row.provider);
+    planCounts.set(row.plan_type, (planCounts.get(row.plan_type) ?? 0) + 1);
+  }
+  if (quotaRows.length === 0) {
+    return { status: "not_testable", reason: "supported_quota_track_unavailable" };
+  }
+  let planType = "";
+  let planCount = -1;
+  for (const [candidate, count] of [...planCounts].sort(
+    (left, right) => left[0].localeCompare(right[0]),
+  )) {
+    if (count > planCount) { planType = candidate; planCount = count; }
+  }
+
+  // Usage fold: per (kernel bin, model), cost from the shared server pricer.
+  // Only providers that carry the retained quota series contribute — cost from
+  // an unrelated provider cannot have debited this pool.
+  const grainMs = MODEL_COMPOSITION_POLICY.grainMs;
+  const costByBinAndModel = new Map<string, {
+    observedAtMs: number; model: string; costNanousd: number;
+  }>();
+  let usageEventCount = 0;
+  let unpricedUsageEventCount = 0;
+  let total = 0;
+  let cursorObs = observedAtCutoff;
+  let cursorId = 0;
+  for (;;) {
+    const page = await db.prepare(USAGE_PAGE_SQL)
+      .bind(
+        winnersJsonArg,
+        participantId,
+        observedAtCutoff,
+        cursorObs,
+        cursorObs,
+        cursorId,
+        USAGE_PAGE_SIZE,
+      )
+      .all<WindowedUsageRow>();
+    const rows = page.results;
+    if (rows.length === 0) break;
+    total += rows.length;
+    if (total > maxWindowedUsageRows) {
+      return { status: "not_testable", reason: "windowed_usage_limit_exceeded" };
+    }
+    for (const row of rows) {
+      if (!SAFE_TOKEN.test(row.provider) || !quotaProviders.has(row.provider)) continue;
+      const observedAtMs = Date.parse(row.observed_at);
+      if (!Number.isFinite(observedAtMs)) continue;
+      const priced = priceV1UsageRecord(row.record_json, row.observed_at);
+      if (priced === null) continue;
+      if (priced.pricingStatus !== "fully_priced") {
+        unpricedUsageEventCount += 1;
+        continue;
+      }
+      usageEventCount += 1;
+      const model = priced.modelId ?? COMPOSITION_UNKNOWN_MODEL;
+      const binStartMs = Math.floor(observedAtMs / grainMs) * grainMs;
+      const key = `${binStartMs}\u0000${model}`;
+      const existing = costByBinAndModel.get(key);
+      if (existing) existing.costNanousd += priced.costNanousd;
+      else costByBinAndModel.set(key, { observedAtMs: binStartMs, model, costNanousd: priced.costNanousd });
+    }
+    if (rows.length < USAGE_PAGE_SIZE) break;
+    const last = rows[rows.length - 1]!;
+    cursorObs = last.observed_at;
+    cursorId = last.id;
+  }
+
+  const usageRows: CompositionUsageRow[] = [];
+  for (const entry of costByBinAndModel.values()) {
+    if (entry.costNanousd <= 0) continue;
+    usageRows.push({
+      observedAtMs: entry.observedAtMs,
+      model: entry.model,
+      costUsd: entry.costNanousd / NANOUSD_PER_USD_COMPOSITION,
+    });
+  }
+
+  const corpus = buildCompositionObservations({ usageRows, quotaRows });
+  const fit = calibrateCompositionCapacities(corpus.observations);
+  return {
+    status: "ready",
+    planType,
+    fit,
+    voidedBinCount: corpus.voidedBinCount,
+    poolCount: corpus.poolCount,
+    quotaRowCount: quotaRows.length,
+    usageEventCount,
+    unpricedUsageEventCount,
+  };
 }

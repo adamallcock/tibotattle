@@ -3,8 +3,10 @@ import { SEVEN_DAY_WINDOW_MINUTES } from "@app-usagemonitor/quota-analysis";
 import { accountScopedQuotaAnalysis } from "./quota-analysis";
 import {
   V1_ANALYSIS_WINDOW_DAYS,
+  accountScopedModelCompositionV1,
   accountScopedQuotaAnalysisV1,
 } from "./quota-analysis-v1";
+import type { V1ModelComposition } from "./quota-analysis-v1";
 import { SERVER_PRICING_METHOD_VERSION } from "./server-pricing";
 
 /**
@@ -599,4 +601,142 @@ export function summarizeCommunityCapacityByPlanType(
     };
   }
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// Per-model composition collection
+// ---------------------------------------------------------------------------
+
+// Bump when the composition adapter's synthesis, pricing basis, or fold
+// changes. Deliberately separate from FIT_ADAPTER_VERSION: a composition
+// change must not invalidate every blended fit cache, and vice versa.
+const COMPOSITION_ADAPTER_VERSION = "v1-composition-1";
+const COMPOSITION_CACHE_KEY_SUFFIX =
+  `${APP_PRICE_REGISTRY_MANIFEST.sha256}:${COMPOSITION_ADAPTER_VERSION}:${SERVER_PRICING_METHOD_VERSION}`;
+// The composition JSON is a per-model vector plus diagnostics — a few hundred
+// bytes. The storage CHECK allows 32 KiB; enforcing half that here keeps a
+// pathological model census from ever reaching the write.
+const COMPOSITION_CACHE_JSON_LIMIT_BYTES = 16 * 1024;
+
+export interface CommunityModelComposition {
+  readonly participantId: string;
+  readonly composition: V1ModelComposition;
+}
+
+function validCachedComposition(value: unknown): value is V1ModelComposition {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  return candidate.status === "ready"
+    && typeof candidate.planType === "string"
+    && typeof candidate.fit === "object" && candidate.fit !== null;
+}
+
+/**
+ * Enumerate every active v1-source participant and collect their per-model
+ * composition fit, through the same chunk-epoch cache discipline as the
+ * blended fit collector above.
+ *
+ * v0.2-source participants are skipped: their at-rest corpus has no
+ * composition reader yet, and a silent blended stand-in would defeat the
+ * point of a per-model view. The admin payload carries the counts so the gap
+ * is visible rather than implied away.
+ */
+export async function collectCommunityModelCompositions(
+  db: D1Database,
+  nowMs: number = Date.now(),
+): Promise<{
+  compositions: CommunityModelComposition[];
+  v1ParticipantCount: number;
+  unsupportedSourceParticipantCount: number;
+  refusedParticipantCount: number;
+}> {
+  const participants = await db.prepare(
+    `WITH ${COMMUNITY_ALLOWANCE_PARTICIPANT_SOURCES_CTE}
+     SELECT participant_id, source
+       FROM participant_sources
+      ORDER BY participant_id`,
+  ).all<{ participant_id: string; source: "v0.2" | "v1" }>();
+  const compositions: CommunityModelComposition[] = [];
+  let v1ParticipantCount = 0;
+  let unsupportedSourceParticipantCount = 0;
+  let refusedParticipantCount = 0;
+  for (const row of participants.results) {
+    if (row.source !== "v1") {
+      unsupportedSourceParticipantCount += 1;
+      continue;
+    }
+    v1ParticipantCount += 1;
+    let cacheKey: string | null = null;
+    try {
+      const epoch = await db.prepare(
+        `SELECT COUNT(*) AS n,
+                COALESCE(MAX(created_at), '') AS newest,
+                COALESCE(SUM(revision), 0) AS revsum
+           FROM telemetry_v1_chunks
+          WHERE participant_id = ? AND superseded_at IS NULL`,
+      ).bind(row.participant_id).first<{ n: number; newest: string; revsum: number }>();
+      cacheKey = `${Number(epoch?.n ?? 0)}:${epoch?.newest ?? ""}:`
+        + `${Number(epoch?.revsum ?? 0)}:${COMPOSITION_CACHE_KEY_SUFFIX}`;
+      const cached = await db.prepare(
+        `SELECT composition_json FROM community_model_composition_cache
+          WHERE participant_id = ? AND cache_key = ?`,
+      ).bind(row.participant_id, cacheKey).first<{ composition_json: string }>();
+      if (cached) {
+        const parsed: unknown = JSON.parse(cached.composition_json);
+        if (validCachedComposition(parsed)) {
+          compositions.push({ participantId: row.participant_id, composition: parsed });
+          continue;
+        }
+      }
+    } catch {
+      // The cache is a pure optimization; migration 0041 may not be applied
+      // yet. cacheKey stays null so the write below is skipped too, and the
+      // next pass retries the cache.
+      cacheKey = null;
+    }
+    let composition: V1ModelComposition | null = null;
+    try {
+      const result = await accountScopedModelCompositionV1(
+        db,
+        row.participant_id,
+        { nowMs },
+      );
+      if (result.status === "ready") composition = result;
+      else refusedParticipantCount += 1;
+    } catch {
+      // A single participant's analyzer throw never aborts the collector.
+      refusedParticipantCount += 1;
+      continue;
+    }
+    if (composition === null) continue;
+    compositions.push({ participantId: row.participant_id, composition });
+    if (cacheKey !== null) {
+      try {
+        const compositionJson = JSON.stringify(composition);
+        if (new TextEncoder().encode(compositionJson).byteLength
+            <= COMPOSITION_CACHE_JSON_LIMIT_BYTES) {
+          await db.prepare(
+            `INSERT INTO community_model_composition_cache (
+               participant_id, cache_key, composition_json, computed_at
+             ) VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             ON CONFLICT(participant_id) DO UPDATE SET
+               cache_key = excluded.cache_key,
+               composition_json = excluded.composition_json,
+               computed_at = excluded.computed_at`,
+          ).bind(row.participant_id, cacheKey, compositionJson).run();
+        }
+      } catch {
+        // Best-effort cache write; a failure just means the next pass
+        // recomputes.
+      }
+    }
+  }
+  return {
+    compositions,
+    v1ParticipantCount,
+    unsupportedSourceParticipantCount,
+    refusedParticipantCount,
+  };
 }

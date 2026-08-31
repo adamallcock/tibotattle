@@ -30,18 +30,39 @@ function cacheDatabase(rows: CacheRow[], { fail = false } = {}) {
   const database = {
     prepare(statement: string) {
       statements.push(statement);
+      const handle = {
+        async first() {
+          if (statement.includes("community_model_composition_cache")) {
+            return null;
+          }
+          if (statement.includes("telemetry_v1_chunks")
+              && statement.includes("COUNT(*)")) {
+            return { n: 0, newest: "", revsum: 0 };
+          }
+          throw new Error("unexpected first query");
+        },
+        async all() {
+          if (fail) throw new Error("cache unavailable");
+          if (statement.includes("day_device_evidence")
+              || statement.includes("community_model_composition_days")) {
+            return { results: [] };
+          }
+          return { results: rows };
+        },
+        async run() {
+          // The per-model day series is the single write this scheduled
+          // source path is allowed; anything else stays a hard failure.
+          if (statement.includes("community_model_composition_days")) {
+            return { meta: { changes: 1 } };
+          }
+          throw new Error("read-only cache reader attempted a write");
+        },
+      };
       return {
+        ...handle,
         bind(...values: unknown[]) {
           bindings.push(values);
-          return {
-            async all() {
-              if (fail) throw new Error("cache unavailable");
-              return { results: rows };
-            },
-            async run() {
-              throw new Error("read-only cache reader attempted a write");
-            },
-          };
+          return handle;
         },
       };
     },
@@ -102,35 +123,53 @@ function previewWarmDatabase(
   const database = {
     prepare(statement: string) {
       statements.push(statement);
+      let bound: unknown[] = [];
+      const handle = {
+        async first() {
+          if (statement.includes("admin_community_allowance_preview_cache")) {
+            return stored;
+          }
+          if (statement.includes("community_model_composition_cache")) {
+            return null;
+          }
+          if (statement.includes("telemetry_v1_chunks")
+              && statement.includes("COUNT(*)")) {
+            return { n: 0, newest: "", revsum: 0 };
+          }
+          throw new Error("unexpected first query");
+        },
+        async all() {
+          if (statement.includes("day_device_evidence")
+              || statement.includes("community_model_composition_days")) {
+            return { results: [] };
+          }
+          if (!/^\s*WITH\b/u.test(statement)) {
+            throw new Error("unexpected corpus query");
+          }
+          return { results: rows };
+        },
+        async run() {
+          if (statement.includes("community_model_composition_days")) {
+            return { meta: { changes: 1 } };
+          }
+          if (!/^\s*INSERT INTO admin_community_allowance_preview_cache\b/u
+            .test(statement)) {
+            throw new Error("unexpected cache write");
+          }
+          if (options.failWrite) throw new Error("cache write unavailable");
+          stored = {
+            generated_at: String(bound[0]),
+            payload_json: String(bound[1]),
+          };
+          return { meta: { changes: 1 } };
+        },
+      };
       return {
+        ...handle,
         bind(...values: unknown[]) {
           bindings.push(values);
-          return {
-            async first() {
-              if (!statement.includes("admin_community_allowance_preview_cache")) {
-                throw new Error("unexpected first query");
-              }
-              return stored;
-            },
-            async all() {
-              if (!/^\s*WITH\b/u.test(statement)) {
-                throw new Error("unexpected corpus query");
-              }
-              return { results: rows };
-            },
-            async run() {
-              if (!/^\s*INSERT INTO admin_community_allowance_preview_cache\b/u
-                .test(statement)) {
-                throw new Error("unexpected cache write");
-              }
-              if (options.failWrite) throw new Error("cache write unavailable");
-              stored = {
-                generated_at: String(values[0]),
-                payload_json: String(values[1]),
-              };
-              return { meta: { changes: 1 } };
-            },
-          };
+          bound = values;
+          return handle;
         },
       };
     },
@@ -340,12 +379,24 @@ describe("admin community allowance preview", () => {
     expect(serializedPreview).not.toContain("participant-1");
     expect(serializedPreview).not.toContain("capacityNanousd");
     expect(serializedPreview).not.toContain("lastObservedAt");
-    expect(statements).toHaveLength(3);
-    expect(statements.every((statement) => (
-      /^WITH\b/u.test(statement.trimStart())
-      && !/\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM)\b/iu
+    expect(statements).toHaveLength(9);
+    const writes = statements.filter((statement) => (
+      /\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM)\b/iu
         .test(statement)
-    ))).toBe(true);
+    ));
+    // The per-model day upsert is the scheduled source path's single write;
+    // everything else stays SELECT-only.
+    expect(writes).toHaveLength(1);
+    expect(writes[0]!.trimStart()).toMatch(
+      /^INSERT INTO community_model_composition_days\b/u,
+    );
+    expect(preview?.models.days).toEqual([]);
+    expect(preview?.models.modelConfig.map((model) => model.modelId)).toEqual([
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
+      "gpt-5.5",
+    ]);
   });
 
   it("reports the production-shaped 8/8/6/5 coverage without exposing IDs", async () => {
@@ -491,7 +542,18 @@ describe("admin community allowance preview", () => {
       source.database,
       nowEpoch,
     )).resolves.toEqual({ code: "ALLOWANCE_PREVIEW_CACHE_REFRESHED" });
-    expect(source.statements).toHaveLength(3);
+    expect(source.statements).toHaveLength(9);
+    const warmWrites = source.statements.filter((statement) => (
+      /\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM)\b/iu
+        .test(statement)
+    ));
+    expect(warmWrites).toHaveLength(2);
+    expect(warmWrites[0]!.trimStart()).toMatch(
+      /^INSERT INTO community_model_composition_days\b/u,
+    );
+    expect(warmWrites[1]!.trimStart()).toMatch(
+      /^INSERT INTO admin_community_allowance_preview_cache\b/u,
+    );
     expect(source.statements[0]).toMatch(
       /^\s*SELECT generated_at, payload_json\s+FROM admin_community_allowance_preview_cache/u,
     );
@@ -499,7 +561,7 @@ describe("admin community allowance preview", () => {
     expect(source.statements[1]).not.toMatch(
       /\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM)\b/iu,
     );
-    expect(source.statements[2]).toMatch(
+    expect(source.statements.at(-1)).toMatch(
       /^\s*INSERT INTO admin_community_allowance_preview_cache\b/u,
     );
     const stored = source.stored();

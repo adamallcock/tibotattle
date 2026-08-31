@@ -598,5 +598,6 @@ test("the owner dashboard keeps the merge trial private and separate from the pu
   assert.doesNotMatch(source, /renderCommunityAllowanceSection/u);
   assert.match(html, /data-allowance-mode="combined"[^>]*>Combined</u);
   assert.match(html, /data-allowance-mode="plans"[^>]*>By plan</u);
+  assert.match(html, /data-allowance-mode="models"[^>]*>By model</u);
   assert.doesNotMatch(html, /same published community graph/u);
 });

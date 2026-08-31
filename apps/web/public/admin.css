@@ -163,6 +163,10 @@
 .admin-allowance-swatch { width: 17px; height: 3px; border-radius: 999px; background: var(--green); }
 .admin-allowance-swatch-band { height: 9px; border-radius: 2px; background: rgba(23, 89, 70, .16); }
 .admin-allowance-swatch-pro { background: #1f5a49; }
+.admin-allowance-swatch-model-sol { background: #6b3fa0; }
+.admin-allowance-swatch-model-terra { background: #2b6cb0; }
+.admin-allowance-swatch-model-luna { background: #c05621; }
+.admin-allowance-swatch-model-gpt55 { background: #4a5568; }
 .admin-allowance-swatch-prolite { background: #4f6f9b; }
 .admin-allowance-swatch-plus { background: #a06a26; }
 .admin-allowance-plan-key { position: relative; width: 19px; height: 10px; border-radius: 2px; background: var(--allowance-plan-band); }
@@ -182,10 +186,18 @@
 .admin-allowance-line-combined, .admin-allowance-line-pro { stroke: #1f5a49; }
 .admin-allowance-line-prolite { stroke: #4f6f9b; }
 .admin-allowance-line-plus { stroke: #a06a26; }
+.admin-allowance-line-model-sol { stroke: #6b3fa0; }
+.admin-allowance-line-model-terra { stroke: #2b6cb0; }
+.admin-allowance-line-model-luna { stroke: #c05621; }
+.admin-allowance-line-model-gpt55 { stroke: #4a5568; }
 .admin-allowance-dot { stroke: var(--surface-quiet); stroke-width: 1.4; }
 .admin-allowance-dot-combined, .admin-allowance-dot-pro { fill: #1f5a49; }
 .admin-allowance-dot-prolite { fill: #4f6f9b; }
 .admin-allowance-dot-plus { fill: #a06a26; }
+.admin-allowance-dot-model-sol { fill: #6b3fa0; }
+.admin-allowance-dot-model-terra { fill: #2b6cb0; }
+.admin-allowance-dot-model-luna { fill: #c05621; }
+.admin-allowance-dot-model-gpt55 { fill: #4a5568; }
 .admin-allowance-dot:focus { outline: none; stroke: var(--ink); stroke-width: 2.5; }
 @media (max-width: 800px) {
   .admin-card-grid, .admin-two-column { grid-template-columns: 1fr 1fr; }

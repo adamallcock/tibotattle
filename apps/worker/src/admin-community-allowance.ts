@@ -4,10 +4,14 @@ import {
   COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS,
   COMMUNITY_ALLOWANCE_SPAN_FLOOR_PP,
   COMMUNITY_ALLOWANCE_TRAILING_DAYS,
+  collectCommunityModelCompositions,
   readCachedCommunityAllowanceCorpus,
   summarizeCommunityAllowanceFits,
 } from "./community-allowance";
-import type { CommunityAllowanceFit } from "./community-allowance";
+import type {
+  CommunityAllowanceFit,
+  CommunityModelComposition,
+} from "./community-allowance";
 import { ApiError } from "./errors";
 
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -22,7 +26,7 @@ const PREVIEW_CACHE_MAX_AGE_MILLISECONDS = 2 * 60 * 60 * 1_000;
 const PREVIEW_CACHE_MAX_FUTURE_SKEW_MILLISECONDS = 5 * 60 * 1_000;
 
 export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_SCHEMA_VERSION =
-  "admin-community-allowance-preview-v0.1";
+  "admin-community-allowance-preview-v0.2";
 export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_BASIS =
   "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview";
 
@@ -37,6 +41,55 @@ export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS =
 
 export const ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG =
   COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG;
+
+// The displayed per-model roster is pinned, exactly like the plan roster: an
+// unlisted model observed in a fit simply does not render (it still shaped the
+// NNLS solution), so a provider adding a model can never inject an unreviewed
+// series into the admin chart.
+export const ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG = Object.freeze([
+  Object.freeze({ modelId: "gpt-5.6-sol", label: "Sol" }),
+  Object.freeze({ modelId: "gpt-5.6-terra", label: "Terra" }),
+  Object.freeze({ modelId: "gpt-5.6-luna", label: "Luna" }),
+  Object.freeze({ modelId: "gpt-5.5", label: "GPT-5.5" }),
+] as const);
+
+export const ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS =
+  "seven_day_codex_pro20x_equivalent_per_model_composition";
+export const ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE =
+  "shared_composition_kernel_identification";
+
+type AdminCommunityAllowanceModelId =
+  (typeof ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG)[number]["modelId"];
+
+export interface AdminCommunityModelSummary {
+  /** Median Pro-20x-equivalent dollars per 100 weekly pp, or null when no
+   * identification-passing fit carries this model. */
+  readonly capacityUsd: number | null;
+  readonly participantCount: number;
+}
+
+export interface AdminCommunityModelCompositionDay {
+  readonly day: string;
+  readonly byModel: Readonly<Record<
+    AdminCommunityAllowanceModelId,
+    AdminCommunityModelSummary
+  >>;
+  /** Participants whose composition passed the kernel's identification gate. */
+  readonly fittedParticipantCount: number;
+  /** Participants whose composition ran but failed identification. */
+  readonly unstableParticipantCount: number;
+  readonly refusedParticipantCount: number;
+  readonly v1ParticipantCount: number;
+  readonly unsupportedSourceParticipantCount: number;
+}
+
+export interface AdminCommunityAllowanceModels {
+  readonly modelConfig: typeof ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG;
+  readonly basis: typeof ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS;
+  readonly gate: typeof ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE;
+  /** Ascending, at most the preview horizon; accrues forward from ship day. */
+  readonly days: readonly AdminCommunityModelCompositionDay[];
+}
 
 type AdminCommunityAllowancePlanType =
   (typeof ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG)[number]["planType"];
@@ -84,6 +137,7 @@ export interface AdminCommunityAllowancePreview {
   readonly plans: typeof ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG;
   readonly coverage: AdminCommunityAllowanceCoverage;
   readonly days: readonly AdminCommunityAllowancePreviewDay[];
+  readonly models: AdminCommunityAllowanceModels;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -156,6 +210,100 @@ function validSummary(value: unknown): value is AdminCommunityAllowanceSummary {
     && summary.centralUsd <= band.upperUsd;
 }
 
+function validModelSummary(value: unknown): value is AdminCommunityModelSummary {
+  const summary = record(value);
+  if (summary === null
+      || !exactKeys(summary, ["capacityUsd", "participantCount"])
+      || !validCount(summary.participantCount)) {
+    return false;
+  }
+  if (summary.capacityUsd === null) return summary.participantCount === 0;
+  return validFiniteNonNegative(summary.capacityUsd)
+    && (summary.participantCount as number) >= 1;
+}
+
+function validModelCompositionDay(
+  value: unknown,
+): value is AdminCommunityModelCompositionDay {
+  const day = record(value);
+  if (day === null || !exactKeys(day, [
+    "day",
+    "byModel",
+    "fittedParticipantCount",
+    "unstableParticipantCount",
+    "refusedParticipantCount",
+    "v1ParticipantCount",
+    "unsupportedSourceParticipantCount",
+  ]) || !validDay(day.day)
+      || !validCount(day.fittedParticipantCount)
+      || !validCount(day.unstableParticipantCount)
+      || !validCount(day.refusedParticipantCount)
+      || !validCount(day.v1ParticipantCount)
+      || !validCount(day.unsupportedSourceParticipantCount)) {
+    return false;
+  }
+  const fitted = day.fittedParticipantCount as number;
+  const unstable = day.unstableParticipantCount as number;
+  const refused = day.refusedParticipantCount as number;
+  const v1Count = day.v1ParticipantCount as number;
+  if (fitted + unstable + refused !== v1Count) return false;
+  const byModel = record(day.byModel);
+  if (byModel === null || !exactKeys(
+    byModel,
+    ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.map((model) => model.modelId),
+  )) {
+    return false;
+  }
+  for (const model of ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG) {
+    const summary = byModel[model.modelId];
+    if (!validModelSummary(summary)) return false;
+    if ((summary.participantCount as number) > fitted) return false;
+  }
+  return true;
+}
+
+function validAdminCommunityAllowanceModels(
+  value: unknown,
+  latestAllowedDay: string,
+): value is AdminCommunityAllowanceModels {
+  const models = record(value);
+  if (models === null || !exactKeys(models, [
+    "modelConfig",
+    "basis",
+    "gate",
+    "days",
+  ]) || models.basis !== ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS
+      || models.gate !== ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE) {
+    return false;
+  }
+  if (!Array.isArray(models.modelConfig)
+      || models.modelConfig.length !== ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.length) {
+    return false;
+  }
+  for (const [index, expected] of ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.entries()) {
+    const model = record(models.modelConfig[index]);
+    if (model === null
+        || !exactKeys(model, ["modelId", "label"])
+        || model.modelId !== expected.modelId
+        || model.label !== expected.label) {
+      return false;
+    }
+  }
+  if (!Array.isArray(models.days)
+      || models.days.length > ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS) {
+    return false;
+  }
+  let previousDay = "";
+  for (const candidate of models.days) {
+    if (!validModelCompositionDay(candidate)) return false;
+    if (candidate.day <= previousDay || candidate.day > latestAllowedDay) {
+      return false;
+    }
+    previousDay = candidate.day;
+  }
+  return true;
+}
+
 function validCachedAdminCommunityAllowancePreview(
   value: unknown,
   storedGeneratedAt: string,
@@ -176,6 +324,7 @@ function validCachedAdminCommunityAllowancePreview(
     "plans",
     "coverage",
     "days",
+    "models",
   ]) || preview.schemaVersion !== ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_SCHEMA_VERSION
       || preview.generatedAt !== storedGeneratedAt
       || !validIsoTimestamp(preview.generatedAt)
@@ -288,7 +437,8 @@ function validCachedAdminCommunityAllowancePreview(
   const latest = record(preview.days.at(-1));
   const latestCombined = record(latest?.combined);
   return latestCombined !== null
-    && latestCombined.participantCount === eligible;
+    && latestCombined.participantCount === eligible
+    && validAdminCommunityAllowanceModels(preview.models, preview.to as string);
 }
 
 function summarizeFits(
@@ -338,6 +488,143 @@ function previewDay(
   });
 }
 
+const EMPTY_ADMIN_ALLOWANCE_MODELS: AdminCommunityAllowanceModels = Object.freeze({
+  modelConfig: ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG,
+  basis: ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS,
+  gate: ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE,
+  days: Object.freeze([]),
+});
+
+function usd4(value: number): number {
+  return Math.round((value + Number.EPSILON) * 10_000) / 10_000;
+}
+
+function medianOf(values: readonly number[]): number | null {
+  if (values.length === 0) return null;
+  const ordered = [...values].sort((left, right) => left - right);
+  const middle = (ordered.length - 1) / 2;
+  const lower = Math.floor(middle);
+  const upper = Math.ceil(middle);
+  return (ordered[lower]! + ordered[upper]!) / 2;
+}
+
+/**
+ * One published day of the per-model series: for each pinned model, the median
+ * across identification-passing participants of that participant's fitted
+ * capacity normalized to the Pro-20x basis by their plan multiplier. A
+ * participant whose plan is not in the personal-plan roster cannot normalize
+ * and is counted unstable rather than silently entering unscaled.
+ */
+export function buildCommunityModelCompositionDay(
+  collection: {
+    compositions: readonly CommunityModelComposition[];
+    v1ParticipantCount: number;
+    unsupportedSourceParticipantCount: number;
+    refusedParticipantCount: number;
+  },
+  day: string,
+): AdminCommunityModelCompositionDay {
+  const planMultiplier = new Map<string, number>(
+    ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG.map((plan) => [
+      plan.planType,
+      plan.multiplier,
+    ]),
+  );
+  const normalized: Array<Readonly<Record<string, number>>> = [];
+  let unstableParticipantCount = 0;
+  for (const { composition } of collection.compositions) {
+    const multiplier = planMultiplier.get(composition.planType);
+    const vector = composition.fit.capacityUsdByModel;
+    if (composition.fit.status !== "fitted"
+        || vector === null
+        || multiplier === undefined) {
+      unstableParticipantCount += 1;
+      continue;
+    }
+    const scaled: Record<string, number> = {};
+    for (const [model, capacity] of Object.entries(vector)) {
+      if (typeof capacity === "number" && Number.isFinite(capacity) && capacity > 0) {
+        scaled[model] = capacity * multiplier;
+      }
+    }
+    normalized.push(scaled);
+  }
+  const byModel = Object.fromEntries(
+    ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.map((model) => {
+      const values = normalized
+        .map((vector) => vector[model.modelId])
+        .filter((value): value is number => value !== undefined);
+      const central = medianOf(values);
+      return [model.modelId, Object.freeze({
+        capacityUsd: central === null ? null : usd4(central),
+        participantCount: values.length,
+      })];
+    }),
+  ) as Record<AdminCommunityAllowanceModelId, AdminCommunityModelSummary>;
+  return Object.freeze({
+    day,
+    byModel: Object.freeze(byModel),
+    fittedParticipantCount: normalized.length,
+    unstableParticipantCount,
+    refusedParticipantCount: collection.refusedParticipantCount,
+    v1ParticipantCount: collection.v1ParticipantCount,
+    unsupportedSourceParticipantCount:
+      collection.unsupportedSourceParticipantCount,
+  });
+}
+
+const MODEL_COMPOSITION_DAY_JSON_LIMIT_BYTES = 16 * 1024;
+
+async function upsertCommunityModelCompositionDay(
+  db: D1Database,
+  payload: AdminCommunityModelCompositionDay,
+): Promise<void> {
+  const payloadJson = JSON.stringify(payload);
+  if (new TextEncoder().encode(payloadJson).byteLength
+      > MODEL_COMPOSITION_DAY_JSON_LIMIT_BYTES) {
+    return;
+  }
+  await db.prepare(
+    `INSERT INTO community_model_composition_days (day, payload_json, computed_at)
+     VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+     ON CONFLICT(day) DO UPDATE SET
+       payload_json = excluded.payload_json,
+       computed_at = excluded.computed_at`,
+  ).bind(payload.day, payloadJson).run();
+}
+
+async function readCommunityModelCompositionDays(
+  db: D1Database,
+  latestAllowedDay: string,
+): Promise<AdminCommunityModelCompositionDay[]> {
+  const rows = await db.prepare(
+    `SELECT day, payload_json
+       FROM community_model_composition_days
+      WHERE day <= ?1 AND length(payload_json) <= ?2
+      ORDER BY day DESC
+      LIMIT ?3`,
+  ).bind(
+    latestAllowedDay,
+    MODEL_COMPOSITION_DAY_JSON_LIMIT_BYTES,
+    ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS,
+  ).all<{ day: string; payload_json: string }>();
+  const days: AdminCommunityModelCompositionDay[] = [];
+  for (const row of rows.results) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.payload_json);
+    } catch {
+      continue;
+    }
+    // A malformed retained row is dropped, never served: the validator would
+    // otherwise fail the whole preview closed over one historical day.
+    if (validModelCompositionDay(parsed) && parsed.day === row.day) {
+      days.push(parsed);
+    }
+  }
+  return days.reverse();
+}
+
 /**
  * Pure, production-shaped preview builder. It intentionally does not mutate or
  * publish community_daily_aggregates: the merged basis remains owner-only
@@ -349,6 +636,7 @@ export function buildAdminCommunityAllowancePreview(
   participantIds: readonly string[] = [
     ...new Set(fits.map((fit) => fit.participantId)),
   ],
+  models: AdminCommunityAllowanceModels = EMPTY_ADMIN_ALLOWANCE_MODELS,
 ): AdminCommunityAllowancePreview {
   if (!Number.isFinite(nowMs)) {
     throw new Error("invalid admin community allowance preview time");
@@ -438,6 +726,7 @@ export function buildAdminCommunityAllowancePreview(
     plans: ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG,
     coverage,
     days: Object.freeze(days),
+    models,
   });
 }
 
@@ -450,13 +739,37 @@ export async function buildAdminCommunityAllowancePreviewFromSource(
   nowMs: number = Date.now(),
 ): Promise<AdminCommunityAllowancePreview | null> {
   const corpus = await readCachedCommunityAllowanceCorpus(db);
-  return corpus === null
-    ? null
-    : buildAdminCommunityAllowancePreview(
-      corpus.fits,
-      nowMs,
-      corpus.participantIds,
+  if (corpus === null) return null;
+  // The per-model series is additive evidence: any failure here (missing 0041
+  // migration, a refusing analyzer) degrades to whatever day rows already
+  // exist — or an empty series — and never withholds the blended preview.
+  const today = new Date(nowMs).toISOString().slice(0, 10);
+  let modelDays: AdminCommunityModelCompositionDay[] = [];
+  try {
+    const collection = await collectCommunityModelCompositions(db, nowMs);
+    await upsertCommunityModelCompositionDay(
+      db,
+      buildCommunityModelCompositionDay(collection, today),
     );
+  } catch {
+    // Fall through to the read: stale history beats no history.
+  }
+  try {
+    modelDays = await readCommunityModelCompositionDays(db, today);
+  } catch {
+    modelDays = [];
+  }
+  return buildAdminCommunityAllowancePreview(
+    corpus.fits,
+    nowMs,
+    corpus.participantIds,
+    Object.freeze({
+      modelConfig: ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG,
+      basis: ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS,
+      gate: ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE,
+      days: Object.freeze(modelDays),
+    }),
+  );
 }
 
 function previewCacheUnavailable(): never {

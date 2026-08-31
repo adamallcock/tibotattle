@@ -65,7 +65,7 @@ function allowancePreviewPayload() {
     },
   };
   return {
-    schemaVersion: "admin-community-allowance-preview-v0.1",
+    schemaVersion: "admin-community-allowance-preview-v0.2",
     generatedAt: "2026-08-23T10:30:00.000Z",
     from: "2026-06-15",
     to: "2026-08-23",
@@ -80,6 +80,30 @@ function allowancePreviewPayload() {
       { planType: "plus", label: "Plus", multiplier: 20 },
     ],
     days,
+    models: {
+      modelConfig: [
+        { modelId: "gpt-5.6-sol", label: "Sol" },
+        { modelId: "gpt-5.6-terra", label: "Terra" },
+        { modelId: "gpt-5.6-luna", label: "Luna" },
+        { modelId: "gpt-5.5", label: "GPT-5.5" },
+      ],
+      basis: "seven_day_codex_pro20x_equivalent_per_model_composition",
+      gate: "shared_composition_kernel_identification",
+      days: [{
+        day: "2026-08-23",
+        byModel: {
+          "gpt-5.6-sol": { capacityUsd: 2_423, participantCount: 1 },
+          "gpt-5.6-terra": { capacityUsd: 1_101, participantCount: 1 },
+          "gpt-5.6-luna": { capacityUsd: null, participantCount: 0 },
+          "gpt-5.5": { capacityUsd: 2_124, participantCount: 1 },
+        },
+        fittedParticipantCount: 1,
+        unstableParticipantCount: 0,
+        refusedParticipantCount: 0,
+        v1ParticipantCount: 1,
+        unsupportedSourceParticipantCount: 2,
+      }],
+    },
   };
 }
 
@@ -131,6 +155,22 @@ function metricsHistoryPayload() {
 test("admin allowance preview projects the fixed merge trial contract", () => {
   const preview = projectAdminAllowancePreview(allowancePreviewPayload());
   assert.equal(preview.days.length, 70);
+  assert.equal(preview.models.days.length, 1);
+  assert.deepEqual(preview.models.days[0].byModel["gpt-5.6-sol"], {
+    capacityUsd: 2_423,
+    participantCount: 1,
+  });
+  assert.deepEqual(preview.models.days[0].byModel["gpt-5.6-luna"], {
+    capacityUsd: null,
+    participantCount: 0,
+  });
+  assert.throws(() => projectAdminAllowancePreview({
+    ...allowancePreviewPayload(),
+    models: undefined,
+  }));
+  const inconsistent = allowancePreviewPayload();
+  inconsistent.models.days[0].fittedParticipantCount = 0;
+  assert.throws(() => projectAdminAllowancePreview(inconsistent));
   assert.deepEqual(preview.plans.map((plan) => [plan.planType, plan.multiplier]), [
     ["pro", 1],
     ["prolite", 4],
