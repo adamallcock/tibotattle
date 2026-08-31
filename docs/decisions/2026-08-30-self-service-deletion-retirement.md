@@ -161,16 +161,18 @@ for inspection; no existing user account, data, or installed app was changed.
   the immutable empty payload and independently requires no published snapshot,
   no participant data, no R2 objects, and the exact tombstone count.
 
-No flaky failure was identified in these checks. Full release validation still
-needs attention because the protected evidence/bundling gates above remain.
+At this implementation checkpoint, no flaky failure had been identified.
+Full release validation still needed attention because the protected
+evidence/bundling gates above remained.
 
 ### Integration follow-up — 2026-08-30
 
 The owner subsequently requested commit, push, PR, merge, and task-local Git
 cleanup. Implementation commit `da8e10d5` and integration commit `dccf5c5d`
 were pushed to [PR #86](https://github.com/adamallcock/tibotattle/pull/86).
-Integration includes main `1e696691` without conflicts. The PR remains **draft**;
-merge and branch/worktree removal are pending validation, not completed.
+Integration included main `1e696691` without conflicts. At that checkpoint the
+PR remained **draft**; merge and branch/worktree removal were pending validation,
+not completed. The subsequent source-merge acceptance below supersedes that hold.
 
 Fresh checks on `dccf5c5d`:
 
@@ -200,12 +202,55 @@ committed source, the unchanged already-public social image, and explicit
 unavailable-installer mode allowed the complete gate to pass. Those local
 bundles do not qualify a signed installer or a production deployment.
 
-Protected real-history R7 regeneration requires separate owner authorization,
-which has been requested but not received. No retained R7 receipt was changed.
-The release-coordination task was told to exclude this draft from the current
-dogfood candidate. Full native/artifact qualification and the hosted cutover
-below remain separate gates. Task-started blocked test processes were stopped;
-unrelated worktrees and the primary checkout's two local commits were preserved.
+Protected real-history R7 regeneration requires separate owner authorization.
+At that checkpoint it had been requested but not received, and the
+release-coordination task was told to exclude the draft from its dogfood
+candidate. No retained R7 receipt was changed. Full native/artifact qualification
+and the hosted cutover below remain separate gates. Task-started blocked test
+processes were stopped; unrelated worktrees and the primary checkout's two local
+commits were preserved.
+
+### Source-merge acceptance — 2026-08-30
+
+The owner explicitly approved proceeding with the source merge without rerunning
+or regenerating R7. Its broad workload fingerprint includes all `src/` files;
+this PR changes the contribution-sync controller within that fingerprint, not
+the R7 benchmark or measurement machinery. The retained-receipt freshness
+failures are stale provenance, not evidence that participant deletion retirement
+failed. They and the synthetic benchmark's **FLAKY** result remain recorded;
+neither the full root suite nor current R7 release evidence is claimed green.
+No assertion, timeout, test selection, or retained receipt was changed to bypass
+a check. Protected regeneration remains a separately authorized release-evidence
+operation, not a condition of this accepted source merge.
+
+Main subsequently advanced with PRs #87 and #88. Integration commits `a9f0c8fa`
+and `7ba7e5c7` preserve their local cache-drop links and native menu-bar fixes.
+The two merge conflicts were the privacy-inventory introduction and API route
+counts. The route-contract test also caught a stale combined documentation
+count; the inventory now matches 24 local paths / 26 method-path operations,
+while the Worker retains 31 registered paths including its non-API negative
+route. The newly added fourth native message handler is also counted.
+
+Additional checks on `7ba7e5c7`:
+
+| Check | Result |
+| --- | --- |
+| Browser gate | 408/408 passed; 8.58 s |
+| Local companion gate | 274/274 passed; 21.34 s |
+| Focused contribution, thread-link, export, and localization tests | 108/108 passed; 5.35 s |
+| Native source gate | Passed: 54 bundle-source tests, 7 native/i18n checks, and 18 preflight checks; 3 designated artifact tests excluded by the source lane |
+| Architecture, browser i18n mirror, and Codex contract | Passed; 369 production files, 1448 imports, no debt edges |
+| Maintained API/privacy contracts and final documentation preflight | 8/8 contract checks and 18/18 preflight checks passed; 116 Markdown files and 615 source/config files |
+
+The focused route tests initially lacked loopback permission (`listen EPERM`);
+the complete 108-test run passed with loopback access and no source/test changes.
+Worker source, tests, and scripts are unchanged from the complete passing
+`dccf5c5d` Worker gate; that earlier evidence is not relabeled as a new run.
+
+The previous draft-only exclusion is superseded for source integration, subject
+to passing CI on the final PR head. It does not qualify a signed native artifact,
+authorize hosted deployment, or resolve the private privacy-request intake and
+cutover requirements below. GitHub's PR record owns the final merge identity.
 
 ## Deployment gate
 
