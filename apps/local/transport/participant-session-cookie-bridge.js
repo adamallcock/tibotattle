@@ -1,3 +1,5 @@
+import { matchParticipantRelayRoute } from "./participant-relay-routes.js";
+
 // The companion relay's session-cookie authority (owner-reported first-sign-in
 // mint failure, 2026-08-11).
 //
@@ -35,8 +37,8 @@ const SESSION_COOKIE_NAME = "__Host-usage_monitor_session";
 
 // Relay routes that authenticate with the one-use hosted identity proof rather
 // than the session cookie. They are forwarded with exactly the jar's own
-// cookie. Every other retained relay route (session, logout, account deletion,
-// and the device-pairing mint) authenticates with the session cookie and takes
+// cookie. Every other retained relay route (session, logout, and the
+// device-pairing mint) authenticates with the session cookie and takes
 // the bridge's captured session.
 const SESSION_EXEMPT_RELAY_PATHS = Object.freeze(new Set([
   "/api/v1/enroll",
@@ -52,7 +54,8 @@ const SESSION_EXEMPT_RELAY_PATHS = Object.freeze(new Set([
  * cookie forwarding they had before this bridge existed.
  */
 export function participantRelayPathUsesSessionCookie(path) {
-  return !SESSION_EXEMPT_RELAY_PATHS.has(path);
+  return matchParticipantRelayRoute(path) !== null
+    && !SESSION_EXEMPT_RELAY_PATHS.has(path);
 }
 
 // The single `name=value` session member the jar sends and the relay forwards

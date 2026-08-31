@@ -3,6 +3,7 @@ import {
   createTelemetryEnvelope,
   validateAccountScopedTelemetryContribution,
 } from "../../web/public/lib.js";
+import { assertRetiredDeletionHealth, createLocalOwnerEraser } from "./local-owner-erasure.mjs";
 
 function optionValue(name, fallback) {
   const index = process.argv.indexOf(name);
@@ -15,7 +16,8 @@ function optionValue(name, fallback) {
 function loopbackOrigin(value) {
   const url = new URL(value);
   if (url.protocol !== "http:"
-      || !["127.0.0.1", "localhost"].includes(url.hostname)) {
+      || !["127.0.0.1", "localhost"].includes(url.hostname)
+      || url.username || url.password) {
     throw new Error("Account-scoped smoke accepts only a loopback HTTP origin.");
   }
   url.pathname = "/";
@@ -33,6 +35,8 @@ let cookie = "";
 let csrfToken = "";
 let participantId = "";
 let deviceAuthorization = "";
+let ownerEraser;
+let erasureSession;
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -263,15 +267,22 @@ async function claimDevice(pairing) {
 }
 
 async function cleanup() {
-  if (!cookie || !csrfToken) return;
-  await request("/api/v1/me", {
-    method: "DELETE",
-    csrf: true,
-  }).catch(() => {});
+  if (!erasureSession || erasureSession.deleted) return;
+  try {
+    await ownerEraser.eraseParticipant(erasureSession, { retry: true });
+  } catch {
+    process.stderr.write("Account-scoped smoke owner cleanup was incomplete; inspect the isolated local backend state.\n");
+    process.exitCode = 1;
+  }
 }
 
 try {
+  ownerEraser = await createLocalOwnerEraser({
+    origin: origin.origin,
+    ownerAccessFile: optionValue("--owner-access-file"),
+  });
   const health = expectStatus(await request("/api/health"), 200, "Health");
+  assertRetiredDeletionHealth(health);
   if (health?.contracts?.accountScopedContribution?.status
       !== "local_preview_loopback_only"
       || health?.contracts?.accountScopedContribution
@@ -296,6 +307,8 @@ try {
   if (!/^participant:/u.test(participantId) || !cookie || !csrfToken) {
     throw new Error("Enrollment did not establish the anonymous session contract.");
   }
+  erasureSession = { participantId, cookie, csrfToken, deleted: false };
+  ownerEraser.trackParticipant(erasureSession);
   deviceAuthorization = await claimDevice(enrollment.pairing);
   const accountTrackId = `account-track:v1:${sha256(
     `usage-monitor/local-preview-smoke/v1\0${participantId}\0openai_codex`,
@@ -335,21 +348,12 @@ try {
     throw new Error("Community output exposed participant-scoped fields.");
   }
 
-  const deletion = expectStatus(
-    await request("/api/v1/me", {
-      method: "DELETE",
-      csrf: true,
-    }),
-    200,
-    "Participant deletion",
-  );
+  await ownerEraser.verifyParticipantRefusal(erasureSession);
+  await ownerEraser.eraseParticipant(erasureSession, { expectedContributions: 4 });
   cookie = "";
   csrfToken = "";
-  if (deletion.contributionsDeleted !== 4) {
-    throw new Error("Participant deletion did not cover every contribution.");
-  }
   process.stdout.write(`${JSON.stringify({
-    schemaVersion: "account-scoped-http-smoke-receipt-v0.1",
+    schemaVersion: "account-scoped-http-smoke-receipt-v0.2",
     status: "passed",
     contributions: 4,
     usageEvents: 36,
@@ -357,7 +361,10 @@ try {
     serverRepriced: true,
     participantExportVerified: true,
     communityFieldExclusionVerified: true,
-    participantDeleted: true,
+    selfServiceDeletionRefused: true,
+    participantStateUnchangedAfterRefusal: true,
+    ownerAuthAndCsrfRequired: true,
+    participantErasedByOwner: true,
     externalParticipantsAuthorized: false,
   }, null, 2)}\n`);
 } finally {

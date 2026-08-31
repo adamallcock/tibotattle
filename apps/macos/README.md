@@ -188,7 +188,12 @@ Before touching Keychain, it stops the companion and validates the two exact
 local residue files. Other indexes, cached analysis, prepared contributions,
 settings, account-observation keys, Claude-session pseudonym keys, and Codex
 logs remain. The action does not revoke a hosted device or delete hosted data;
-those require the hosted privacy workflow. It does not claim secure erasure.
+confirmed **Disconnect this Mac** separately revokes this device's hosted
+authority while preserving hosted/local history. Private owner erasure is
+separate and has no self-service app control under the
+[2026-08-30 source contract](../../docs/decisions/2026-08-30-self-service-deletion-retirement.md).
+This source change is not an installed-release or deployment claim. Local reset
+does not claim secure erasure.
 After the reset, future contribution activity uses a new identity and requires
 pairing again.
 

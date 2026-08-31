@@ -544,9 +544,8 @@ export const DIAGNOSTIC_SURFACES = Object.freeze([
   "hosted_identity",
   "hosted_privacy",
   "local_refresh",
-  // 2026-08-08 (deletion honesty): the "Delete my contributions" action files
-  // its failures like every other journey. The companion accepts the same
-  // fixed name.
+  // Retained for diagnostics from older app versions, not a current
+  // self-service hosted deletion action. The companion accepts the same name.
   "participant_deletion"
 ]);
 const DIAGNOSTIC_SURFACE_SET = new Set(DIAGNOSTIC_SURFACES);

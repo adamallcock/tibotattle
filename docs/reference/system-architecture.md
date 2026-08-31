@@ -112,10 +112,10 @@ Do not collapse these identities:
 | Local session and source keys | Owner-only local SQLite/files | Replay-safe joins and deduplication on one machine. |
 | Export participant secret | Keychain in the installed Mac app | Rotatable pseudonyms for explicitly reviewed exports. |
 | Account observation secret | Keychain | Pseudonymous current account/quota attribution. |
-| Hosted participant/session | D1 plus secure cookie | Website account, export, and deletion lifecycle. |
+| Hosted participant/session | D1 plus secure cookie | Website account, export, and device management; no self-service hosted erasure. |
 | Hosted device credential | Keychain plus content-free local binding; digest/state in D1 | Consent-bound incremental upload authority. |
 | Upload authorization | Short-lived D1 record | One-use contribution delivery. |
-| Admin identity | Cloudflare Access assertion plus configured owner email | Owner-only operations host. |
+| Admin identity | Cloudflare Access assertion plus configured owner email | Owner-only operations host, including explicitly confirmed participant erasure with admin CSRF. |
 | Release credential | Owner-controlled secret/Keychain profile | Appcast/update publication only. |
 
 Raw account identifiers and credentials do not enter contribution payloads,
@@ -135,8 +135,18 @@ diagnostics, public aggregates, or documentation.
    bookkeeping.
 6. Scheduled aggregation publishes only eligible derived cohorts. Missing,
    stale, or unavailable evidence remains explicit rather than becoming zero.
-7. Participant export, complete participant deletion, and device
-   revoke/disconnect are separate, authenticated lifecycles.
+7. Participant export and device revoke/disconnect are separate authenticated
+   lifecycles. Confirmed **Disconnect this Mac** removes this device's authority,
+   not hosted or local history.
+8. Private owner erasure uses the existing admin maintenance action, not a
+   participant session or device capability. It preserves the upload fence,
+   aggregate withdrawal/rebuild, independent tombstone, identity cooldown, R2
+   cleanup, and fenced database removal, with resumable audit-backed attempts.
+
+Self-service `DELETE /api/v1/me` is retired under the
+[2026-08-30 source decision](../decisions/2026-08-30-self-service-deletion-retirement.md).
+The source retirement does not establish deployment, change retention, or
+remove deletion-safe restore; the baseline review commit above predates it.
 
 The full HTTP inventory and authority model is in
 [`api-surface.md`](./api-surface.md).

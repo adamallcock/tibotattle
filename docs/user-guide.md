@@ -90,12 +90,27 @@ is performed against a copy before replacing durable state.
 
 Community participation requires sign-in and explicit consent. Before the first
 upload, TiboTattle presents the derived, allowlisted contribution. Contributions
-are pseudonymous and omit session content. You can pause or disconnect the Mac
-and request deletion through the product controls.
+are pseudonymous and omit session content; pseudonymous does not mean anonymous.
 
 Signing in, pairing a device, local indexing, successful upload, aggregate
-publication, and deletion are separate states. Keep the app’s displayed state
-or sanitized error if support is needed.
+publication, and device disconnect are separate states. Keep the app’s
+displayed state or sanitized error if support is needed.
+
+### Stop sharing from this Mac
+
+Choose **Disconnect this Mac** and review the confirmation. Confirming revokes
+this Mac's hosted contribution authority, clears its local device credential
+and binding, and pauses delivery. It preserves previously contributed hosted
+history, other devices, and local analysis. Signing out only ends the browser
+session; it is not device disconnect.
+
+Self-service hosted deletion is retired under the
+[2026-08-30 source decision](./decisions/2026-08-30-self-service-deletion-retirement.md).
+Private hosted erasure is a separate maintainer operation, not a dashboard
+control. See [support and privacy-request boundaries](../SUPPORT.md#hosted-history-and-privacy-requests).
+This documents the source change, not a deployed-service or installed-release
+update; an older app may still show an old deletion control. A failed request
+is not evidence that any history was erased.
 
 ## Privacy, local data, and uninstall
 
@@ -107,8 +122,10 @@ privacy notice is at `https://tibotattle.com/privacy.html`.
 Uninstalling the app bundle does not imply that accumulated local indexes,
 preferences, logs, or Keychain items were erased. That separation prevents an
 ordinary application replacement from destroying history. Use documented
-product deletion/disconnect controls and the support guide for intentional
-cleanup; never remove broad Application Support or Keychain locations blindly.
+local erase, identity-reset, and device-disconnect controls only for their
+separate effects. None erases hosted history; private owner erasure is separate.
+Follow the support guide for intentional cleanup and never remove broad
+Application Support or Keychain locations blindly.
 
 ## Updates and help
 

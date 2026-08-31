@@ -8,6 +8,7 @@ import {
   createTelemetryEnvelope,
   validateTelemetryContribution,
 } from "../../web/public/lib.js";
+import { assertRetiredDeletionHealth, createLocalOwnerEraser } from "./local-owner-erasure.mjs";
 
 function optionValue(name, fallback = null) {
   const index = process.argv.indexOf(name);
@@ -75,6 +76,7 @@ if (!contributionPath || !persistTo) {
 const workerDirectory = dirname(dirname(fileURLToPath(import.meta.url)));
 const operator = resolve(workerDirectory, "scripts/collection-control.mjs");
 const sessions = [];
+let ownerEraser;
 let controlState = "unknown";
 
 function operate(action, { confirm = false } = {}) {
@@ -153,6 +155,7 @@ function expect(result, status, label, code = null) {
 
 async function enroll() {
   const session = {
+    participantId: null,
     cookie: null,
     csrfToken: null,
     bootstrapPairing: null,
@@ -177,9 +180,11 @@ async function enroll() {
     throw new Error("Enrollment did not establish a bounded session.");
   }
   session.csrfToken = enrolled.csrfToken;
+  session.participantId = enrolled.participantId;
   session.bootstrapPairing = enrolled.pairing;
   session.created = true;
   sessions.push(session);
+  ownerEraser.trackParticipant(session);
   return session;
 }
 
@@ -233,20 +238,18 @@ async function registerUpload(session, envelope) {
   return registered.uploadAuthorization;
 }
 
-async function deleteParticipant(session) {
-  if (!session.created || session.deleted || !session.cookie) return false;
-  const result = await request("/api/v1/me", {
-    method: "DELETE",
-    session,
-    csrf: true,
-  });
-  if (result.response.status !== 200) return false;
-  session.deleted = true;
-  return true;
+async function eraseParticipant(session, options = { retry: true }) {
+  if (!session.created || session.deleted) return;
+  await ownerEraser.eraseParticipant(session, options);
 }
 
 try {
+  ownerEraser = await createLocalOwnerEraser({
+    origin,
+    ownerAccessFile: optionValue("--owner-access-file"),
+  });
   const initial = expect(await request("/api/health"), 200, "Initial health");
+  assertRetiredDeletionHealth(initial);
   if (initial?.collectionControls?.state !== "operational") {
     throw new Error("The incident drill requires an initially operational backend.");
   }
@@ -289,6 +292,7 @@ try {
     200,
     "Contained health",
   );
+  assertRetiredDeletionHealth(containedHealth);
   if (containedHealth?.collectionControls?.state !== "contained") {
     throw new Error("The running Worker did not observe containment.");
   }
@@ -340,9 +344,8 @@ try {
     200,
     "Contained participant export",
   );
-  if (!await deleteParticipant(rightsParticipant)) {
-    throw new Error("Participant deletion failed during containment.");
-  }
+  await ownerEraser.verifyParticipantRefusal(rightsParticipant);
+  await eraseParticipant(rightsParticipant, { expectedContributions: 0 });
 
   const restored = operate("restore-all", { confirm: true });
   if (restored.state !== "operational"
@@ -387,9 +390,8 @@ try {
       || participantExport.contributions[0]?.records?.length !== expectedRecords) {
     throw new Error("Resumed ingestion did not update the participant export.");
   }
-  if (!await deleteParticipant(resumedParticipant)) {
-    throw new Error("Participant deletion failed after restoration.");
-  }
+  await ownerEraser.verifyParticipantRefusal(resumedParticipant);
+  await eraseParticipant(resumedParticipant, { expectedContributions: 1 });
 
   process.stdout.write(`${JSON.stringify({
     status: "passed",
@@ -400,32 +402,38 @@ try {
     processingBlockedWithoutConsumingAuthority: true,
     publicationBlocked: true,
     exportAvailableDuringContainment: true,
-    deletionAvailableDuringContainment: true,
+    selfServiceDeletionRefusedDuringContainment: true,
+    selfServiceDeletionRefusedAfterRestore: true,
+    participantStateUnchangedAfterRefusal: true,
+    ownerAuthAndCsrfRequired: true,
+    ownerErasureAvailableDuringContainment: true,
     explicitRestoreRequired: true,
     ingestionResumedAfterRestore: true,
     participantExportUpdatedAfterRestore: true,
-    participantsDeleted: sessions.filter((session) => session.deleted).length,
+    participantsErasedByOwner: sessions.filter((session) => session.deleted).length,
   }, null, 2)}\n`);
 } finally {
-  if (controlState !== "operational") {
+  if (controlState !== "unknown" && controlState !== "operational") {
     try {
       operate("restore-all", { confirm: true });
     } catch {
       process.stderr.write(
         "Incident smoke could not restore local collection controls.\n",
       );
+      process.exitCode = 1;
     }
   }
   for (const session of sessions) {
     try {
-      await deleteParticipant(session);
+      await eraseParticipant(session);
     } catch {
       // The fixed cleanup warning below contains no authority or participant ID.
     }
   }
   if (sessions.some((session) => session.created && !session.deleted)) {
     process.stderr.write(
-      "Incident smoke participant cleanup was incomplete; discard the isolated local state.\n",
+      "Incident smoke owner cleanup was incomplete; inspect the isolated local state before reuse.\n",
     );
+    process.exitCode = 1;
   }
 }

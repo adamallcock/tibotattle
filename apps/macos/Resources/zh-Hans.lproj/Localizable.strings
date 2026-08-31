@@ -216,8 +216,8 @@
 "dialog.eraseLocalData" = "抹掉本地数据…";
 "dialog.identityDeviceReset" = "重置身份与设备…";
 "dialog.identityDeviceResetComplete" = "本地身份和设备已重置";
-"dialog.identityDeviceResetCompleteDescription" = "应用状态：除目标本地设备绑定标记和已废弃的身份残留外均予以保留。\n\n钥匙串：%@ 导出身份和已配对设备凭据现已不存在。我们不声称安全擦除。\n\n托管服务：未撤销任何设备，也未删除任何数据。未来贡献前请再次配对此应用；如需删除托管数据，请单独使用托管隐私工作流。";
-"dialog.identityDeviceResetDescription" = "这是一项有针对性的本地安全恢复操作，不是卸载或托管删除。\n\n应用状态：索引、缓存分析、准备的贡献、设置和 Codex 日志均会保留。只会删除本地设备绑定标记以及任何已废弃的文件身份残留。\n\n钥匙串：会删除 %@ 导出身份和已配对设备凭据。不会针对帐户观测或 Claude 会话假名密钥。\n\n托管服务：不会撤销已注册设备，也不会删除任何托管贡献或结果。请单独使用托管隐私工作流。我们不声称安全擦除。";
+"dialog.identityDeviceResetCompleteDescription" = "应用状态：除目标本地设备绑定标记和已废弃的身份残留外均予以保留。\n\n钥匙串：%@ 导出身份和已配对设备凭据现已不存在。我们不声称安全擦除。\n\n托管服务：未撤销任何设备，也未删除任何数据。托管历史记录会保留。未来贡献前请再次配对此应用。有关由服务所有者单独处理的擦除，请参阅项目支持指南。";
+"dialog.identityDeviceResetDescription" = "这是一项有针对性的本地安全恢复操作，不是卸载或托管删除。\n\n应用状态：索引、缓存分析、准备的贡献、设置和 Codex 日志均会保留。只会删除本地设备绑定标记以及任何已废弃的文件身份残留。\n\n钥匙串：会删除 %@ 导出身份和已配对设备凭据。不会针对帐户观测或 Claude 会话假名密钥。\n\n托管服务：不会撤销已注册设备，也不会删除任何托管贡献或结果。托管历史记录会保留。有关由服务所有者单独处理的擦除，请参阅项目支持指南。我们不声称安全擦除。";
 "dialog.localAppData" = "本地应用数据";
 "dialog.localAppDataDescription" = "这个仅所有者可访问的 Application Support 文件夹包含设置、索引、缓存分析、准备的贡献和本地设备绑定状态。它与 Codex 日志、钥匙串和托管数据相互独立。";
 "dialog.manageData" = "管理数据…";

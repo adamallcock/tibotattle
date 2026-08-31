@@ -32,6 +32,7 @@ import { stableJson } from "../../../src/storage.js";
 import {
   validateTelemetryContribution,
 } from "../../web/public/lib.js";
+import { assertRetiredDeletionHealth, createLocalOwnerEraser } from "./local-owner-erasure.mjs";
 
 const {
   inspectContributionSyncQueue,
@@ -188,11 +189,13 @@ if (!contributionFile) {
 }
 const inviteFile = optionValue("--invite-file");
 const session = {
+  participantId: null,
   cookie: null,
   csrfToken: null,
   created: false,
   deleted: false,
 };
+let ownerEraser;
 
 async function request(path, {
   method = "GET",
@@ -232,16 +235,12 @@ function expect(result, status, label) {
   return result.value;
 }
 
-async function deleteParticipant() {
-  if (!session.created || session.deleted || !session.cookie || !session.csrfToken) {
+async function eraseParticipantFixture() {
+  if (!session.created || session.deleted) {
     return;
   }
   try {
-    const deletion = await request("/api/v1/me", {
-      method: "DELETE",
-      csrf: true,
-    });
-    if (deletion.response.ok) session.deleted = true;
+    await ownerEraser.eraseParticipant(session, { retry: true });
   } catch {
     // The final fixed warning is sufficient and contains no authority.
   }
@@ -259,7 +258,12 @@ const stateFile = join(privateDirectory, "device.json");
 const backend = new MemorySecretBackend();
 
 try {
+  ownerEraser = await createLocalOwnerEraser({
+    origin,
+    ownerAccessFile: optionValue("--owner-access-file"),
+  });
   const health = expect(await request("/api/health"), 200, "Health");
+  assertRetiredDeletionHealth(health);
   if (!["local_open", "invite_only"].includes(health?.enrollmentMode)) {
     throw new Error("The backend is not open for this smoke.");
   }
@@ -298,7 +302,9 @@ try {
     throw new Error("Enrollment did not establish a session.");
   }
   session.csrfToken = enrollment.csrfToken;
+  session.participantId = enrollment.participantId;
   session.created = true;
+  ownerEraser.trackParticipant(session);
 
   const pairing = expect(
     await request("/api/v1/me/device-pairings", {
@@ -399,18 +405,8 @@ try {
     confirmDeviceId: paired.deviceId,
     remoteRevocationConfirmed: true,
   });
-  const deletion = expect(
-    await request("/api/v1/me", {
-      method: "DELETE",
-      csrf: true,
-    }),
-    200,
-    "Participant deletion",
-  );
-  if (deletion?.deleted !== true) {
-    throw new Error("Participant deletion did not complete.");
-  }
-  session.deleted = true;
+  await ownerEraser.verifyParticipantRefusal(session);
+  await ownerEraser.eraseParticipant(session, { expectedContributions: 1 });
 
   process.stdout.write(`${JSON.stringify({
     status: "passed",
@@ -423,16 +419,20 @@ try {
     revokedDevicePausedQueue: true,
     retryableJobsPreserved: 1,
     localCredentialRemovedAfterRemoteRevocation: true,
-    participantDeleted: true,
+    selfServiceDeletionRefused: true,
+    participantStateUnchangedAfterRefusal: true,
+    ownerAuthAndCsrfRequired: true,
+    participantErasedByOwner: true,
     printedContentPathsIdentitiesOriginsCredentials: false,
   }, null, 2)}\n`);
 } finally {
-  await deleteParticipant();
+  await eraseParticipantFixture();
   backend.dispose();
   await rm(temporaryRoot, { recursive: true, force: true });
   if (session.created && !session.deleted) {
     process.stderr.write(
       "Queue smoke cleanup was incomplete; inspect the isolated local backend state.\n",
     );
+    process.exitCode = 1;
   }
 }

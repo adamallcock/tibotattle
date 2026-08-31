@@ -9,9 +9,12 @@ last_verified_commit: 52399658
 # Local data, network, and privacy inventory
 
 This is the maintained technical inventory behind TiboTattle's first-run and
-public privacy disclosures. It describes what the shipping app can read, what
-it derives and stores, which operations use the network, and which deletion
-actions are intentionally separate.
+public privacy disclosures. It describes local source reads, derived stores,
+network operations, and intentionally separate removal actions. The baseline
+review commit above predates the
+[2026-08-30 self-service retirement](../decisions/2026-08-30-self-service-deletion-retirement.md)
+documented here. That update is a source contract, not evidence of an installed
+release or hosted deployment.
 
 The central rule is structural: prompts, responses, reasoning, raw commands,
 credentials, private paths/filenames, emails, account names, and other free
@@ -105,12 +108,15 @@ artifacts, and a Durable Object for shared upload admission. Public community
 figures are derived, delayed, rounded/capped, and withheld when privacy or
 quality thresholds are not met.
 
+Stable pseudonyms and identity reattachment permit longitudinal linkage.
+Content-free, pseudonymous contribution is not anonymous data.
+
 ## Network destinations
 
 | Destination | When used | Data sent |
 | --- | --- | --- |
-| `https://tibotattle.com` | Public community reads, hosted identity/session, optional contribution, participant export/delete, app compatibility/preflight. | Route-specific closed requests; contribution requires consent and one-use/device authority. |
-| `https://admin.tibotattle.com` | Owner operations only. | Cloudflare Access assertion and bounded admin reads/actions. The app is not an admin client. |
+| `https://tibotattle.com` | Public community reads, hosted identity/session, optional contribution, participant export, device disconnect, app compatibility/preflight. | Route-specific closed requests; contribution requires consent and one-use/device authority. No self-service hosted deletion. |
+| `https://admin.tibotattle.com` | Owner operations only, including explicitly targeted participant erasure. | Cloudflare Access owner assertion and bounded admin reads/actions with CSRF on mutations. The app is not an admin client. |
 | `https://updates.tibotattle.com/appcast.xml` | Sparkle update checks. | Standard update request metadata; the signed appcast declares the artifact. |
 | Google or Apple identity endpoints | User starts hosted sign-in in the system browser. | Provider-controlled sign-in. The provider callback goes to TiboTattle's Worker, not loopback. |
 | Artifact URL from the verified appcast | User/automatic updater downloads an update. | Standard artifact request; signature, length, and digest/provenance gates remain separate. |
@@ -133,15 +139,38 @@ promise that every data class is deleted on the same schedule:
 | Completed identity-result delivery window | 5 minutes |
 | Sign-in admission rows | 24 hours |
 | Identity re-enrollment cooldown | 30 days |
-| Deletion tombstone | 400 days, to suppress deleted data after restore replay |
+| Deletion tombstone | 400 days in source, to suppress erased participant data after restore replay; not a verified production backup/retention guarantee |
 | Sampled admin diagnostics | 30 days |
-| Contribution quarantine age deletion | Disabled in shipped source; explicit participant/contribution deletion and reconciliation still apply |
+| Contribution quarantine age deletion | Disabled in current source; private owner erasure and orphan reconciliation remain separate operations |
 
 There is no blanket short time-based retention promise for accepted
-contribution/aggregate evidence in current source. Participant actions provide
-export, device revoke/disconnect, and complete
-hosted participant deletion. The deletion ledger persists a tombstone so a
-backup restore cannot silently resurrect deleted participant data.
+contribution/aggregate evidence in current source. Participant capabilities
+retain hosted export and device revoke/disconnect, but neither whole-account
+nor individual-contribution self-service deletion is available. Disconnecting
+does not shorten retention or remove previously accepted data.
+
+Private owner erasure fences uploads, withdraws affected aggregates, records an
+independently verified deletion tombstone and identity cooldown, removes owned
+R2 objects, and completes participant database removal. Immutable aggregate
+revisions may remain withdrawn; replacement publication must exclude the erased
+participant. A tombstone, cooldown, or content-free operational audit is not
+removed merely because the participant's data has been erased. Local history,
+provider-side sign-in records, and provider source files are separate.
+
+The deletion ledger must still suppress erased data after backup restore.
+For tombstoned participants, restore replay claims only active rows or
+interrupted restores with a null deletion fence; it must not take over
+non-null owner/legacy erasures. A busy restore is finished/retried by
+maintenance, not a concurrent owner erasure; final removal must still match
+the restore or owner fence.
+The actual production backup/restore horizon and infrastructure log/object
+policies require independent verification; the constants above do not
+establish them.
+This retirement adds no migration, retention change, or tombstone removal.
+See [production operations](../runbooks/production-operations.md#private-owner-participant-erasure)
+for the protected procedure and [SUPPORT.md](../../SUPPORT.md#hosted-history-and-privacy-requests)
+for the privacy-request intake boundary. Retiring a control is not a conclusion
+about applicable privacy rights or how a particular request should be resolved.
 
 ## Separate deletion actions
 
@@ -149,14 +178,14 @@ backup restore cannot silently resurrect deleted participant data.
 | --- | --- | --- |
 | **Erase local data** | Moves the installed app's Application Support state root to Trash and clears TiboTattle WebKit data. | Provider source files, Keychain capabilities, or hosted data. |
 | **Reset identity and device** | Reviewed TiboTattle Keychain capabilities plus their associated local binding/app state. | General local analysis state unless the reset contract explicitly reports it; hosted contribution records. |
-| **Disconnect this Mac** | Hosted authority for this device plus its local device credential/binding; pauses delivery. | Other devices, hosted participant data, or local analysis. |
-| Delete hosted participant | Hosted participant/account, contribution, session, and device lifecycle with a deletion tombstone. | Local analysis or provider source files. |
+| **Disconnect this Mac** (confirmed) | Hosted authority for this device plus its local device credential/binding; pauses delivery. | Other devices, hosted participant data, or local analysis. |
+| Private owner participant erasure | Hosted participant/account, contribution, session, and device state through the protected pipeline; affected aggregates are withdrawn/rebuilt. | Local analysis, provider source files, retained safeguards/audit, or immutable withdrawn aggregate revisions. |
 | Ordinary app/Homebrew uninstall | Application binaries. | By design, local state and Keychain survive ordinary uninstall. |
 | Homebrew `--zap` | Declared app Application Support/cache/WebKit/preferences. | `~/.codex`, Keychain identities, or previously hosted data. |
 
 Use the app's explicit controls before uninstall when the intent includes
-Keychain or hosted deletion. Do not manually delete the only local index as a
-repair technique; follow
+local cleanup or device disconnect. They cannot perform private owner erasure.
+Do not manually delete the only local index as a repair technique; follow
 [`../runbooks/unified-index-recovery.md`](../runbooks/unified-index-recovery.md).
 
 ## Coverage and uncertainty

@@ -95,6 +95,37 @@ export function backendSmokeSourceArguments(source) {
   throw new TypeError("Backend laboratory contribution source is invalid");
 }
 
+export function assertOwnerErasureLifecycle(storage, r2ObjectCount) {
+  const database = storage.database;
+  const zeroCounts = [
+    "activeParticipants", "deletingParticipants", "acceptedContributions",
+    "canonicalRecords", "contributionOccurrences", "retainedQuarantineReferences",
+    "activeSessions", "activeDevices", "publishedSnapshots",
+  ];
+  const failures = zeroCounts.filter((name) => database[name] !== 0);
+  if (!Number.isSafeInteger(database.withdrawnSnapshots) || database.withdrawnSnapshots < 1) {
+    failures.push("withdrawnSnapshots");
+  }
+  // Erasure withdraws both published and suppressed revisions. Suppression is
+  // proven by the immutable empty payload, not a still-current release_state.
+  if (!Number.isSafeInteger(database.withdrawnSuppressedSnapshots)
+      || database.withdrawnSuppressedSnapshots < 1
+      || database.withdrawnSuppressedSnapshots > database.withdrawnSnapshots) {
+    failures.push("withdrawnSuppressedSnapshots");
+  }
+  // Twenty workload participants plus the separate synthetic owner fixture.
+  if (storage.deletionLedger.tombstones !== 21) failures.push("tombstones");
+  if (r2ObjectCount !== 0) failures.push("r2ObjectCount");
+  if (failures.length > 0) {
+    throw new Error(`The owner-erasure lifecycle left unexpected D1 or R2 state (${failures.join(", ")})`);
+  }
+  return Object.freeze({
+    suppressionEvidence: "immutable_withdrawn_empty_snapshot",
+    suppressedRevisionsWithdrawn: database.withdrawnSuppressedSnapshots,
+    publishedSnapshotsRemaining: database.publishedSnapshots,
+  });
+}
+
 export function localCompanionEnvironment({
   environment = process.env,
   port,
@@ -148,6 +179,7 @@ export function projectLocalBackendLabReceipt({
   if (sourceMode !== "generated_content_free_fixture"
       || typeof locations?.stateDirectory !== "string"
       || typeof locations?.participantAccessFile !== "string"
+      || typeof locations?.ownerAccessFile !== "string"
       || typeof locations?.redeemedInvitationDirectory !== "string"
       || !Number.isSafeInteger(locations?.redeemedInvitationFilesRetained)) {
     throw new TypeError("Backend laboratory receipt projection is invalid");
@@ -161,6 +193,8 @@ export function projectLocalBackendLabReceipt({
     stateDirectory: locations.stateDirectory,
     participantAccessFile: locations.participantAccessFile,
     participantAccessFileContainsSecret: true,
+    ownerAccessFile: locations.ownerAccessFile,
+    ownerAccessFileContainsSecret: true,
     redeemedInvitationDirectory: locations.redeemedInvitationDirectory,
     redeemedInvitationFilesRetained:
       locations.redeemedInvitationFilesRetained,

@@ -1,7 +1,9 @@
 // Shared browser-side localization policy for the loopback dashboard and the
-// public community site. It deliberately has no runtime dependency: both
+// public community site. Its canonical catalog mirror ships locally: both
 // surfaces are shipped as ordinary static ES modules, and a locale choice must
 // work while the local companion is offline.
+
+import { CATALOGS } from "./i18n.generated.js";
 
 export const LOCALIZATION_SCHEMA_VERSION = "tibotattle-localization-v2";
 export const SYSTEM_LANGUAGE_PREFERENCE = "system";
@@ -164,6 +166,9 @@ function interpolate(message, values = {}) {
 // bounded migration bridge for static markup and explicitly registered,
 // product-owned legacy nodes only.
 export const WEB_MESSAGES = Object.freeze({
+  ...Object.fromEntries(Object.keys(CATALOGS[DEFAULT_LOCALE])
+    .filter((key) => key.startsWith("contribution."))
+    .map((key) => [key, SUPPORTED_LOCALES.map((locale) => CATALOGS[locale][key])])),
   "language.label": ["Language", "语言", "Idioma"],
   "language.system": ["System", "跟随系统", "Sistema"],
   "language.english": ["English", "English", "English"],
@@ -885,8 +890,6 @@ export const WEB_MESSAGES = Object.freeze({
   "contribution.identityGenericSession": ["Signed in for hosted contribution", "已登录以进行托管贡献", "Sesión iniciada para contribución alojada"],
   "contribution.signOutStarting": ["Signing out securely…", "正在安全退出登录…", "Cerrando sesión de forma segura…"],
   "contribution.signOutForgetting": ["Forgetting this unfinished sign-in…", "正在忘记这次未完成的登录…", "Olvidando este inicio de sesión incompleto…"],
-  "contribution.signOutCompleted": ["Signed out. Sign in again with Google or Apple when you want to contribute.", "已退出登录。想继续贡献时，请使用 Google 或 Apple 再次登录。", "Sesión cerrada. Inicia sesión de nuevo con Google o Apple cuando quieras contribuir."],
-  "contribution.signOutUnfinished": ["This unfinished sign-in was forgotten. No server session or metadata was created. Sign in again with Google or Apple when you want to contribute.", "这次未完成的登录已被忘记。没有创建服务器会话或元数据。想继续贡献时，请使用 Google 或 Apple 再次登录。", "Este inicio de sesión incompleto se olvidó. No se creó ninguna sesión de servidor ni metadatos. Inicia sesión de nuevo con Google o Apple cuando quieras contribuir."],
   "contribution.signOutFailed": ["The service could not confirm sign-out, so you are still signed in. Nothing was changed; check your connection and try again.", "服务无法确认退出登录，因此你仍处于登录状态。没有任何更改；请检查连接后重试。", "El servicio no pudo confirmar el cierre de sesión, por lo que sigues con la sesión iniciada. No se cambió nada; comprueba tu conexión e inténtalo de nuevo."],
   // Standalone capitalized forms (owner-directed, 2026-08-10): the period is
   // now the whole detail line under Recorded activity — the "event-time API
@@ -1645,9 +1648,6 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Approval covers the kind of data, once — after it, your full history uploads and stays current without per-batch review.": ["核准针对数据类型，只需一次——此后你的完整历史会上传并保持最新，无需逐批审阅。", "La aprobación cubre el tipo de datos, una sola vez; después, tu historial completo se carga y se mantiene al día sin revisión por lotes."],
   "Your full usage history uploads first; new events then upload roughly every 6 hours.": ["首先上传你的完整使用历史；此后新事件大约每 6 小时上传一次。", "Primero se carga tu historial de uso completo; luego los eventos nuevos se cargan aproximadamente cada 6 horas."],
   "Community estimates recompute when your data or corrections to it arrive, including for past months.": ["当你的数据或对它的更正到达时，社区估计会重新计算，包括过去的月份。", "Las estimaciones comunitarias se recalculan cuando llegan tus datos o correcciones, incluso para meses pasados."],
-  // Deletion honesty (2026-08-08): the standing promise sentence left the
-  // card; the working control below replaced it.
-  "Delete my contributions": ["删除我的贡献", "Eliminar mis contribuciones"],
   "The exact kind of data covered": ["涵盖的数据类型明细", "El tipo exacto de datos cubiertos"],
   "Covered: token counts, model identifiers or keyed fingerprints, tier, surface and outcome categories, timestamps, quota percentages, tool-class counts per session, and stable pseudonymous session identifiers.": ["涵盖：令牌数量、模型标识符或密钥指纹、层级、界面与结果类别、时间戳、额度百分比、每个会话的工具类别计数，以及稳定的化名会话标识符。", "Cubierto: recuentos de tokens, identificadores de modelo o huellas con clave, categorías de nivel, superficie y resultado, marcas de tiempo, porcentajes de cuota, recuentos de clases de herramientas por sesión e identificadores de sesión seudónimos estables."],
   "Never covered: prompts, responses, file names, paths, commands, or any account identifier.": ["绝不涵盖：提示词、回复、文件名、路径、命令或任何帐户标识符。", "Nunca cubierto: indicaciones, respuestas, nombres de archivo, rutas, comandos ni ningún identificador de cuenta."],
@@ -1759,8 +1759,6 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Never shared: anything you typed or a model wrote, file names, folders, links, commands, your name, your email, or any account or login details.": ["绝不分享：你输入的或模型生成的任何内容、文件名、文件夹、链接、命令、你的姓名、电子邮件，或任何账户或登录信息。", "Nunca se comparte: nada de lo que escribiste ni de lo que escribió un modelo, nombres de archivos, carpetas, enlaces, comandos, tu nombre, tu correo ni ningún dato de cuenta o inicio de sesión."],
   "Sign in to contribute": ["登录以参与贡献", "Inicia sesión para contribuir"],
   "Contributing uses your Google or Apple sign-in. We keep a scrambled version of it that cannot be turned back into your email or your name. Using TiboTattle on your own needs no account.": ["贡献时会使用你的 Google 或 Apple 登录。我们只保留经过打乱处理的版本，无法还原成你的电子邮件或姓名。单独使用 TiboTattle 不需要账户。", "Contribuir usa tu inicio de sesión de Google o Apple. Guardamos una versión codificada que no se puede convertir de vuelta en tu correo ni en tu nombre. Usar TiboTattle por tu cuenta no necesita ninguna cuenta."],
-  "Signing out ends this app's contribution session.": ["退出登录会结束此应用的贡献会话。", "Cerrar sesión finaliza la sesión de contribución de esta app."],
-  "This app already has a contribution session. Signing out ends it.": ["此应用已有贡献会话。退出登录会结束该会话。", "Esta app ya tiene una sesión de contribución. Cerrar sesión la finaliza."],
   "I want to review a summary and decide whether to send it.": ["我想先查看摘要，再决定是否发送。", "Quiero revisar un resumen y decidir si lo envío."],
   "Connected. Look at the summary below before deciding whether to send it. Nothing will repeat automatically.": ["已连接。请先查看下方的摘要，再决定是否发送。不会自动重复。", "Conectado. Mira el resumen de abajo antes de decidir si lo envías. Nada se repetirá automáticamente."],
   "Sending now. This runs once and then stops.": ["正在发送。此操作只运行一次，然后停止。", "Enviando. Esto se ejecuta una vez y luego se detiene."],

@@ -635,8 +635,8 @@ const DIAGNOSTIC_SURFACES = new Set([
   "hosted_identity",
   "hosted_privacy",
   "local_refresh",
-  // 2026-08-08 (deletion honesty): the dashboard's "Delete my contributions"
-  // action files its failures like every other journey.
+  // Retained for diagnostics from older app versions. The current dashboard
+  // has no self-service hosted deletion action.
   "participant_deletion",
 ]);
 // Identifier-shaped fixed codes only: SCREAMING_SNAKE from the contribution
@@ -1220,7 +1220,7 @@ function participantSessionCookie(value) {
 }
 
 async function boundedParticipantRelayBody(request) {
-  if (["GET", "DELETE"].includes(request.method)) {
+  if (request.method === "GET") {
     const declared = Number(request.headers["content-length"] ?? 0);
     if (Number.isFinite(declared) && declared > 0) {
       throw fixedRelayError("central_participant_request_invalid");
@@ -3215,6 +3215,7 @@ function createPreparedLocalCompanionServer({
   // a foreground or automatic sync cannot begin in the await between the
   // initial idle check and remote revocation.
   let contributionDeviceDisconnectInProgress = false;
+  let contributionReconnectInProgress = 0;
   const disconnectContributionDevice = contributionDeviceDisconnectRunner
     ?? (contributionServiceOrigin === null
       ? null
@@ -3349,7 +3350,9 @@ function createPreparedLocalCompanionServer({
         || typeof incrementalContributionController.stop !== "function"
         || typeof incrementalContributionController.inspect !== "function"
         || typeof incrementalContributionController.approve !== "function"
-        || typeof incrementalContributionController.resume !== "function")) {
+        || typeof incrementalContributionController.resume !== "function"
+        || typeof incrementalContributionController.pauseForDeviceDisconnect
+          !== "function")) {
     throw new TypeError("incrementalContributionController is invalid");
   }
   // Resolved on first use and then held: the provider's legacy leg spawns an
@@ -4174,6 +4177,10 @@ function createPreparedLocalCompanionServer({
           sendError(response, 409, "incremental_sync_not_configured");
           return;
         }
+        if (contributionDeviceDisconnectInProgress) {
+          sendError(response, 409, "sync_in_progress");
+          return;
+        }
         const authorization = consumeReviewedContributionAuthorization(
           reviewToken,
         );
@@ -4182,6 +4189,7 @@ function createPreparedLocalCompanionServer({
           return;
         }
         let approved;
+        contributionReconnectInProgress += 1;
         try {
           // The one-step ceremony records local consent BEFORE the hosted
           // pairing mints this Mac's upload credential, so with no binding on
@@ -4197,6 +4205,8 @@ function createPreparedLocalCompanionServer({
         } catch {
           sendError(response, 500, "incremental_consent_failed");
           return;
+        } finally {
+          contributionReconnectInProgress -= 1;
         }
         if (approved?.consent?.approved !== true
             || approved?.consent?.current !== true
@@ -4252,12 +4262,19 @@ function createPreparedLocalCompanionServer({
           sendError(response, 409, "incremental_sync_not_configured");
           return;
         }
+        if (contributionDeviceDisconnectInProgress) {
+          sendError(response, 409, "sync_in_progress");
+          return;
+        }
         let status;
+        contributionReconnectInProgress += 1;
         try {
           status = await incrementalContribution.resume();
         } catch {
           sendError(response, 500, "sync_control_failed");
           return;
+        } finally {
+          contributionReconnectInProgress -= 1;
         }
         // Same best-effort immediate pass as the approval and re-pair kicks:
         // the scheduled attempt survives if this tick's run fails closed.
@@ -4330,6 +4347,7 @@ function createPreparedLocalCompanionServer({
           sendError(response, 409, "sync_in_progress");
           return;
         }
+        contributionReconnectInProgress += 1;
         try {
           const paired = await pairContributionDevice({ pairingCode });
           const expiresAt = nullableInstant(paired?.expiresAt);
@@ -4406,6 +4424,8 @@ function createPreparedLocalCompanionServer({
             recoveryRequired || migrationRequired ? 409 : 502,
             errorCode,
           );
+        } finally {
+          contributionReconnectInProgress -= 1;
         }
         return;
       }
@@ -4419,47 +4439,70 @@ function createPreparedLocalCompanionServer({
           sendError(response, 409, "contribution_device_disconnect_not_configured");
           return;
         }
-        if (contributionSyncInProgress || contributionDeviceDisconnectInProgress) {
+        if (contributionSyncInProgress || contributionDeviceDisconnectInProgress
+            || contributionReconnectInProgress > 0) {
           sendError(response, 409, "sync_in_progress");
           return;
         }
         contributionDeviceDisconnectInProgress = true;
-        let disconnected;
         try {
-          disconnected = await disconnectContributionDevice();
-        } catch (error) {
-          const cleanupPending = error?.code
-            === "contribution_device_disconnect_cleanup_pending";
-          sendError(
-            response,
-            cleanupPending ? 409 : 502,
-            cleanupPending
-              ? "contribution_device_disconnect_cleanup_pending"
-              : "contribution_device_disconnect_failed",
-          );
-          return;
+          // Persist user intent before revocation or credential cleanup. If
+          // this write fails, the exact credential/binding remain available
+          // for retry; a later remote or cleanup failure keeps delivery paused.
+          if (incrementalContribution !== null) {
+            let paused;
+            try {
+              paused = await incrementalContribution.pauseForDeviceDisconnect();
+            } catch {
+              sendError(response, 500, "contribution_device_disconnect_failed");
+              return;
+            }
+            if (paused?.schemaVersion !== "incremental-contribution-sync-status-v1.0"
+                || paused.settingsAvailable !== true
+                || paused.paused !== true
+                || paused.pausedReason !== "device_disconnected"
+                || paused.nextAttemptAt !== null) {
+              sendError(response, 500, "contribution_device_disconnect_failed");
+              return;
+            }
+          }
+          let disconnected;
+          try {
+            disconnected = await disconnectContributionDevice();
+          } catch (error) {
+            const cleanupPending = error?.code
+              === "contribution_device_disconnect_cleanup_pending";
+            sendError(
+              response,
+              cleanupPending ? 409 : 502,
+              cleanupPending
+                ? "contribution_device_disconnect_cleanup_pending"
+                : "contribution_device_disconnect_failed",
+            );
+            return;
+          }
+          if (disconnected?.status !== "disconnected"
+              || disconnected.deliveryPaused !== true
+              || !["deleted", "already_missing"].includes(
+                disconnected.localCredential,
+              )
+              || disconnected.localBinding !== "removed") {
+            sendError(response, 500, "contribution_device_disconnect_failed");
+            return;
+          }
+          send(response, 200, {
+            schemaVersion: LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION,
+            status: "disconnected",
+            deliveryPaused: true,
+            localCredential: disconnected.localCredential,
+            localBinding: "removed",
+            includesIdentifiers: false,
+            includesCredentials: false,
+            hostedDataDeleted: false,
+          });
         } finally {
           contributionDeviceDisconnectInProgress = false;
         }
-        if (disconnected?.status !== "disconnected"
-            || disconnected.deliveryPaused !== true
-            || !["deleted", "already_missing"].includes(
-              disconnected.localCredential,
-            )
-            || disconnected.localBinding !== "removed") {
-          sendError(response, 500, "contribution_device_disconnect_failed");
-          return;
-        }
-        send(response, 200, {
-          schemaVersion: LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION,
-          status: "disconnected",
-          deliveryPaused: true,
-          localCredential: disconnected.localCredential,
-          localBinding: "removed",
-          includesIdentifiers: false,
-          includesCredentials: false,
-          hostedDataDeleted: false,
-        });
         return;
       }
       if (path === "/api/local/contribution/device-credential-reset") {

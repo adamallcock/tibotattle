@@ -76,7 +76,6 @@ import {
   normalizeLocalOnboarding,
   normalizeDashboardPayload,
   normalizeParticipantCommunityComparison,
-  normalizeParticipantDeletionReceipt,
   normalizeParticipantHistory,
   normalizeParticipantStats,
   normalizeLocalContributionDeviceDisconnect,
@@ -3626,15 +3625,11 @@ test("local contribution preparation exposes only verified bounded results", asy
 
 test("community adapter exposes only the current browser-session routes", async () => {
   const calls = [];
-  const participantId = "participant:00000000-0000-4000-8000-000000000001";
   const client = new CommunityClient({
     getCsrfToken: () => "csrf-confirmation",
     fetchImpl: async (url, options = {}) => {
       calls.push({ url, options });
-      const payload = url === "/api/v1/me" && options.method === "DELETE"
-        ? { deleted: true, participantId, contributionsDeleted: 0 }
-        : { ok: true };
-      return new Response(JSON.stringify(payload), {
+      return new Response(JSON.stringify({ ok: true }), {
         status: 200,
         headers: { "Content-Type": "application/json" }
       });
@@ -3642,28 +3637,27 @@ test("community adapter exposes only the current browser-session routes", async 
   });
   await client.health();
   await client.session();
-  await client.deleteParticipant();
   await client.createDevicePairing();
   await client.logout();
   assert.equal(calls[0].url, "/api/health");
   assert.equal(calls[1].url, "/api/v1/session");
   assert.equal(calls[1].options.credentials, "same-origin");
-  assert.equal(calls[2].url, "/api/v1/me");
-  assert.equal(calls[2].options.method, "DELETE");
+  assert.equal(calls[2].url, "/api/v1/me/device-pairings");
+  assert.equal(calls[2].options.method, "POST");
   assert.equal(calls[2].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
-  assert.equal(calls[3].url, "/api/v1/me/device-pairings");
-  assert.equal(calls[3].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
   // Re-pinned 2026-08-08 (v1.0 wiring): a telemetry participant's pairing now
   // requests the v1.0 incremental consent identifier. The companion's CLAIM
   // of this pairing is what records the server-side consent-once grant that
   // v1.0 chunk uploads are verified against; the v0.1 identifier here left
   // production refusing every upload with 403 TELEMETRY_CONSENT_INVALID.
-  assert.match(calls[3].options.body, /ongoing-privacy-safe-telemetry-v1\.0/);
-  assert.doesNotMatch(calls[3].options.body, /ongoing-privacy-safe-telemetry-v0\.1/);
-  assert.equal(calls[4].url, "/api/v1/logout");
+  assert.match(calls[2].options.body, /ongoing-privacy-safe-telemetry-v1\.0/);
+  assert.doesNotMatch(calls[2].options.body, /ongoing-privacy-safe-telemetry-v0\.1/);
+  assert.equal(calls[3].url, "/api/v1/logout");
+  assert.equal(calls[3].options.headers["X-Usage-Monitor-CSRF"], "csrf-confirmation");
   await client.enroll("um_invite_test");
-  assert.match(calls[5].options.body, /privacy-safe-telemetry-v0\.1/);
-  assert.match(calls[5].options.body, /um_invite_test/);
+  assert.match(calls[4].options.body, /privacy-safe-telemetry-v0\.1/);
+  assert.match(calls[4].options.body, /um_invite_test/);
+  assert.equal(calls.some(({ options }) => options.method === "DELETE"), false);
   for (const retired of [
     "readiness",
     "recover",
@@ -3671,6 +3665,7 @@ test("community adapter exposes only the current browser-session routes", async 
     "contributeSerialized",
     "contribution",
     "deleteContribution",
+    "deleteParticipant",
     "personalStats",
     "participantProfile",
     "communityStats",
@@ -4266,7 +4261,8 @@ test("hosted sign-in step gates contribution and keeps identity copy truthful", 
     /@media \(max-width: 760px\)[\s\S]*?\.topbar \.button\.compact \{ display: none; \}/u,
   );
   assert.match(html, />\s*Sign out\s*</u);
-  assert.match(html, /Signing out ends this app's contribution session/u);
+  assert.match(html, /id="identity-account-detail"[^>]+data-i18n="contribution.signOutDetail"/u);
+  assert.match(html, /Signing out ends this app's hosted session\. It does not stop this Mac's uploads; use Disconnect this Mac for that\./u);
   assert.doesNotMatch(html, /Hosted privacy controls remain available separately/u);
   assert.doesNotMatch(html, /metadata already contributed\s+stays until you delete it/u);
   assert.match(html, /<div class="identity-account" id="identity-account" hidden>/u);
@@ -4485,9 +4481,8 @@ test("retired granular contribution methods are absent from the browser adapter"
   assert.equal(typeof CommunityClient.prototype.deleteContribution, "undefined");
 });
 
-test("deletion receipts fail closed before the UI can claim success", async () => {
+test("historical granular deletion receipts remain parse-only and fail closed", () => {
   const contributionId = "contribution:00000000-0000-4000-8000-000000000001";
-  const participantId = "participant:00000000-0000-4000-8000-000000000001";
 
   assert.deepEqual(
     normalizeContributionDeletionReceipt(
@@ -4495,14 +4490,6 @@ test("deletion receipts fail closed before the UI can claim success", async () =
       contributionId
     ),
     { deleted: true, contributionId }
-  );
-  assert.deepEqual(
-    normalizeParticipantDeletionReceipt({
-      deleted: true,
-      participantId,
-      contributionsDeleted: 2
-    }),
-    { deleted: true, participantId, contributionsDeleted: 2 }
   );
 
   assert.throws(
@@ -4519,50 +4506,7 @@ test("deletion receipts fail closed before the UI can claim success", async () =
     ),
     /invalid contribution deletion receipt/
   );
-  assert.throws(
-    () => normalizeParticipantDeletionReceipt({
-      deleted: true,
-      participantId,
-      contributionsDeleted: -1
-    }),
-    /invalid participant deletion receipt/
-  );
-  assert.throws(
-    () => normalizeParticipantDeletionReceipt({
-      deleted: true,
-      participantId,
-      contributionsDeleted: "1"
-    }),
-    /invalid participant deletion receipt/
-  );
-  assert.throws(
-    () => normalizeParticipantDeletionReceipt(
-      { deleted: true, participantId, contributionsDeleted: 1 },
-      "participant:00000000-0000-4000-8000-000000000002"
-    ),
-    /invalid participant deletion receipt/
-  );
-  assert.throws(
-    () => normalizeParticipantDeletionReceipt({
-      deleted: true,
-      participantId,
-      contributionsDeleted: 1,
-      ignored: true
-    }),
-    /invalid participant deletion receipt/
-  );
-
-  const malformedClient = new CommunityClient({
-    getCsrfToken: () => "csrf-confirmation",
-    fetchImpl: async () => new Response(JSON.stringify({ deleted: true }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
-    })
-  });
-  await assert.rejects(
-    malformedClient.deleteParticipant(),
-    /invalid participant deletion receipt/
-  );
+  assert.equal(typeof CommunityClient.prototype.deleteContribution, "undefined");
 });
 
 test("community snapshots fail closed and never disclose threshold distance", () => {
@@ -6645,7 +6589,7 @@ test("primary contribution journey is one review-and-approve ceremony without ex
   assert.match(html, /Approval is asked once\./u);
 });
 
-test("post-results contribution CTA is explicit while technical and deletion controls stay quiet", async () => {
+test("post-results contribution CTA is explicit and disconnect remains separate", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const communityPosition = html.indexOf('id="community"');
   const footerPosition = html.indexOf("<footer");
@@ -6671,6 +6615,8 @@ test("post-results contribution CTA is explicit while technical and deletion con
   assert.doesNotMatch(html, /id="prepare-contribution"/u);
   assert.doesNotMatch(html, /id="sync-run-once"/u);
   assert.match(html, /id="incremental-consent-approve"/u);
+  assert.match(html, /id="disconnect-device"/u);
+  assert.doesNotMatch(html, /delete-contributions|Delete my contributions/u);
   assert.doesNotMatch(html, /automatic-contribution|contribution-history|backend|browser validation|JSON export|download-participant/iu);
 });
 
@@ -7058,7 +7004,7 @@ test("the approve-once consent surface lights up only with the advertised v1.0 s
   assert.match(html, /Approval is asked once\./u);
   assert.match(
     appSource,
-    /approve\.disabled = busy\s*\n\s*\|\| \(incrementalConsentApproved && !repairNeeded\)\s*\n\s*\|\| \(!incrementalConsentApproved && !reviewVerified\)\s*\n\s*\|\| hostedSignInRequired\(\);/u,
+    /approve\.disabled = busy\s*\n\s*\|\| contributionDisconnectOutcome === "cleanup_pending"\s*\n\s*\|\| \(incrementalConsentApproved && !repairNeeded\)\s*\n\s*\|\| \(!incrementalConsentApproved && !reviewVerified\)\s*\n\s*\|\| hostedSignInRequired\(\);/u,
   );
   assert.match(
     appSource,
@@ -10159,7 +10105,6 @@ async function loadContributionCeremony(harness) {
   const communityClient = new CommunityClient({
     fetchImpl: fakeFetch,
     getCsrfToken: () => harness.session?.csrfToken ?? null,
-    getParticipantId: () => harness.session?.participantId ?? null,
   });
   const localClient = {
     async pairContributionDevice(code) {
@@ -10176,6 +10121,9 @@ async function loadContributionCeremony(harness) {
     "showFailure", "describeFailure", "formatLocal", "t", "node",
     `let incrementalConsentBusy = false;
 let communityConnectBusy = false;
+let contributionDisconnectBusy = false;
+let contributionDisconnectOutcome = harness.disconnectOutcome ?? null;
+let incrementalSyncStatus = harness.syncStatus ?? null;
 let communityDevicePaired = false;
 let communityDevicePairedV1 = false;
 let incrementalRepairAttempted = false;
@@ -10728,6 +10676,34 @@ test("two concurrent ceremony invocations run exactly once", async () => {
   );
   assert.equal(scope.state().communityDevicePairedV1, true);
   assert.equal(scope.state().hostedIdentity, null);
+});
+
+test("a durable disconnect cannot auto-pair but an explicit approval reconnects with the retained session", async () => {
+  const harness = {
+    identity: null,
+    session: {
+      csrfToken: "synthetic-retained-csrf",
+      participantId: "participant:00000000-0000-4000-8000-000000000001",
+      consentVersion: "privacy-safe-telemetry-v0.1",
+    },
+    approved: true,
+    grantRejected: false,
+    syncStatus: { status: "available", paused: true, pausedReason: "device_disconnected" },
+    responses: [{ status: 201, payload: { pairingCode: "synthetic-pairing" } }],
+  };
+  const scope = await loadContributionCeremony(harness);
+  scope.maybeRepairIncrementalAuthorization();
+  scope.resumeContributionCeremonyAfterSignIn();
+  assert.deepEqual(harness.fetchCalls, []);
+  assert.deepEqual(harness.localCalls, []);
+  await scope.approveIncrementalContribution();
+  assert.deepEqual(harness.fetchCalls.map(({ url, csrf }) => [url, csrf]), [
+    ["/api/v1/me/device-pairings", "synthetic-retained-csrf"],
+  ]);
+  assert.deepEqual(harness.localCalls, [{ pairContributionDevice: "synthetic-pairing" }]);
+  assert.equal(scope.state().communityDevicePairedV1, true);
+  assert.equal(scope.state().incrementalConsentApproved, true);
+  assert.deepEqual(harness.sessions, [], "reconnect preserves the participant session");
 });
 
 test("the merged identity status renders the right label and one next action per state", async () => {
@@ -12178,6 +12154,10 @@ async function loadCompanionHealthRecovery(harness) {
       "// The live-progress poll behind the first pass",
       "\nasync function freshReviewTokenForApproval(",
     ),
+    slice(
+      "function contributionDeviceDisconnectPaused() {",
+      "\nfunction contributionDisconnectBlocksRepair() {",
+    ),
   ].join("\n\n");
   // The two surfaces the reader actually sees, taken from the same source
   // rather than restated here: whether the approve ceremony is in the document
@@ -12246,6 +12226,7 @@ let incrementalSyncPollCount = 0;
 let incrementalSyncStatus = null;
 let incrementalConsentApproved = false;
 let incrementalSyncLastOutcomeDetailCode = null;
+let contributionDisconnectOutcome = null;
 function renderLocalOnboarding(value) {
   localOnboarding = value;
   harness.onboardingRenders.push(value?.state ?? null);
@@ -12553,6 +12534,10 @@ async function communityJourneyStageFor(facts) {
   );
   assert.ok(start >= 0 && end > start, "the community journey stage chain is available");
   const chain = appSource.slice(start, end);
+  const disconnectPause = appSource.match(
+    /function contributionDeviceDisconnectPaused\(\) \{[\s\S]*?\n\}/u,
+  )?.[0];
+  assert.ok(disconnectPause);
   const staged = [];
   Function(
     "facts", "stage",
@@ -12565,6 +12550,9 @@ function incrementalUploadAuthorityLost() { return false; }
 function hostedEnrollmentIsPaused() { return false; }
 function hostedSignInRequired() { return facts.signInRequired === true; }
 const incrementalConsentApproved = facts.approved === true;
+const contributionDisconnectOutcome = facts.disconnectOutcome ?? null;
+const incrementalSyncStatus = facts.syncStatus ?? null;
+${disconnectPause}
 ${chain}`,
   )(facts, (name, state, key) => staged.push({ name, state, key }));
   assert.equal(staged.length, 1, "the chain states exactly one community stage");

@@ -9,8 +9,7 @@
  *   GET  /api/v1/session
  *   POST /api/v1/enroll and /api/v1/logout
  *   POST /api/v1/identity/{google,apple}/{start,result}
-*   POST /api/v1/me/device-pairings
- *   DELETE /api/v1/me
+ *   POST /api/v1/me/device-pairings
  *
  * The normalizers below accept complete, partial, stale, and insufficient
  * responses, but never silently turn a failure into real-looking data.
@@ -117,8 +116,6 @@ const PARTICIPANT_COMPARISON_METRIC_UNITS = Object.freeze({
 // browser method calls the retired granular contribution-delete endpoint.
 const CONTRIBUTION_ID_PATTERN =
   /^contribution:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
-const PARTICIPANT_ID_PATTERN =
-  /^participant:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 // The Worker returns one of these in every error body. It identifies a server
 // request, never a participant, so it is safe to show next to the local
 // reference the page mints for the same failure.
@@ -720,22 +717,6 @@ export function normalizeContributionDeletionReceipt(payload, expectedContributi
   return Object.freeze({
     deleted: true,
     contributionId: payload.contributionId
-  });
-}
-
-export function normalizeParticipantDeletionReceipt(payload, expectedParticipantId = null) {
-  if (!hasExactKeys(payload, ["deleted", "participantId", "contributionsDeleted"])
-      || payload.deleted !== true
-      || !PARTICIPANT_ID_PATTERN.test(payload.participantId)
-      || (expectedParticipantId !== null && payload.participantId !== expectedParticipantId)
-      || !Number.isSafeInteger(payload.contributionsDeleted)
-      || payload.contributionsDeleted < 0) {
-    throw new Error("The service returned an invalid participant deletion receipt.");
-  }
-  return Object.freeze({
-    deleted: true,
-    participantId: payload.participantId,
-    contributionsDeleted: payload.contributionsDeleted
   });
 }
 
@@ -1435,7 +1416,11 @@ export function normalizeLocalContributionDeviceDisconnect(payload) {
     localCredential: "unknown",
     localBinding: "unknown",
   };
-  if (payload?.schemaVersion !== LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION
+  if (!hasExactKeys(payload, [
+    "schemaVersion", "status", "deliveryPaused", "localCredential",
+    "localBinding", "hostedDataDeleted", "includesIdentifiers", "includesCredentials",
+  ])
+      || payload?.schemaVersion !== LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION
       || payload?.status !== "disconnected"
       || payload?.deliveryPaused !== true
       || !["deleted", "already_missing"].includes(payload?.localCredential)
@@ -6022,14 +6007,12 @@ export class LocalCompanionClient {
 export class CommunityClient {
   constructor({
     fetchImpl = globalThis.fetch,
-    getCsrfToken = () => null,
-    getParticipantId = () => null
+    getCsrfToken = () => null
   } = {}) {
     // Detached for the same reason as LocalCompanionClient: browser-native
     // fetch throws when invoked with this client as its receiver.
     this.fetchImpl = (...args) => fetchImpl(...args);
     this.getCsrfToken = getCsrfToken;
-    this.getParticipantId = getParticipantId;
   }
 
   sessionOptions(options = {}) {
@@ -6124,15 +6107,6 @@ export class CommunityClient {
 
   async identityAppleResult(state, verifier) {
     return readHostedSignInResult(this.fetchImpl, "apple", state, verifier);
-  }
-
-  async deleteParticipant() {
-    const payload = await fetchJson(
-      this.fetchImpl,
-      `${CENTRAL_ROOT}/me`,
-      this.mutationOptions({ method: "DELETE" })
-    );
-    return normalizeParticipantDeletionReceipt(payload, this.getParticipantId());
   }
 
   createDevicePairing(accountScoped = false) {

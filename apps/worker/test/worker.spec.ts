@@ -37,6 +37,9 @@ import {
   telemetryContributionAdmissionWindow,
 } from "../src/telemetry-repository";
 import { warmAdminMetricsHistoryCache } from "../src/admin-metrics-history";
+import { ownerErase, ownerErasureRequest } from "./helpers/owner-erasure";
+import { beginAdminOperation } from "../src/admin-operations";
+import { finishParticipantDeletion, markParticipantDeleting } from "../src/repository";
 import {
   warmAdminCommunityAllowancePreviewCache,
 } from "../src/admin-community-allowance";
@@ -976,10 +979,10 @@ describe("synthetic usage monitor service", () => {
     });
     expect(cookieUpload.status).toBe(401);
 
-    const uploadReadsPersonal = await api("/api/v1/me", {
+    const uploadReadsPersonal = await api("/api/v1/me/export", {
       headers: { authorization: `Upload ${authorization.uploadAuthorization}` },
     });
-    expect(uploadReadsPersonal.status).toBe(405);
+    expect(uploadReadsPersonal.status).toBe(401);
 
     const wrongScope = await api("/api/v1/contributions", {
       method: "POST",
@@ -1138,10 +1141,9 @@ describe("synthetic usage monitor service", () => {
     ).bind(authorizationId).first<{ state: string }>();
     expect(stillConsuming?.state).toBe("consuming");
 
-    const deletion = await api("/api/v1/me", {
-      method: "DELETE",
-      headers: personalHeaders(participant, { csrf: true }),
-    });
+    const deletion = await ownerErase(
+      testBindings(), participant.participantId,
+    );
     expect(deletion.status).toBe(409);
     await expect(deletion.json()).resolves.toMatchObject({
       error: { code: "UPLOAD_IN_PROGRESS" },
@@ -1233,10 +1235,9 @@ describe("synthetic usage monitor service", () => {
     }>();
     expect(state).toEqual({ state: "revoked", consumed_contribution_id: null });
 
-    const deletion = await api("/api/v1/me", {
-      method: "DELETE",
-      headers: personalHeaders(participant, { csrf: true }),
-    });
+    const deletion = await ownerErase(
+      testBindings(), participant.participantId,
+    );
     expect(deletion.status).toBe(200);
   });
 
@@ -2067,7 +2068,7 @@ describe("synthetic usage monitor service", () => {
         idempotentDeduplication: true,
         communityDaily: true,
         participantExport: true,
-        participantDeletion: true,
+        participantDeletion: false,
         boundedQuarantineRetention: true,
         deletionSafeRestoreReplay: true,
         ongoingDeviceUploadRegistration: true,
@@ -2745,19 +2746,17 @@ describe("synthetic usage monitor service", () => {
         encryptedUpload: false,
         communityDaily: false,
         participantExport: true,
-        participantDeletion: true,
+        participantDeletion: false,
         ongoingDeviceUploadRegistration: false,
       },
     });
 
-    const deleted = await api("/api/v1/me", {
-      method: "DELETE",
-      headers: personalHeaders(participant, { csrf: true }),
-    });
+    const deleted = await ownerErase(
+      testBindings(), participant.participantId,
+    );
     expect(deleted.status).toBe(200);
     await expect(deleted.json()).resolves.toMatchObject({
-      deleted: true,
-      contributionsDeleted: 1,
+      result: { deleted: true, contributionsDeleted: 1 },
     });
     expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
   });
@@ -2808,10 +2807,9 @@ describe("synthetic usage monitor service", () => {
       headers: personalHeaders(participant),
     });
     expect(session.status).toBe(200);
-    const deleted = await api("/api/v1/me", {
-      method: "DELETE",
-      headers: personalHeaders(participant, { csrf: true }),
-    });
+    const deleted = await ownerErase(
+      testBindings(), participant.participantId,
+    );
     expect(deleted.status).toBe(200);
     expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
   });
@@ -2834,6 +2832,8 @@ describe("synthetic usage monitor service", () => {
     });
 
     for (const [path, method] of [
+      ["/api/v1/me", "GET"],
+      ["/api/v1/me", "DELETE"],
       ["/api/v1/recover", "POST"],
       ["/api/v1/me/upload-authorizations", "POST"],
       ["/api/v1/me/contributions/read", "POST"],
@@ -3216,7 +3216,317 @@ describe("synthetic usage monitor service", () => {
     expect(finalCounts).toEqual({ snapshots: 6, rebuilds: 0 });
   });
 
-  it("conditions concurrent deletion loser effects and preserves the winning retry session", async () => {
+  it("refuses the retired whole-account route before any data or storage access", async () => {
+    let storageCalls = 0;
+    const rejectStorage = () => {
+      storageCalls += 1;
+      throw new Error("retired route touched storage");
+    };
+    const runtime = testBindings({
+      USAGE_MONITOR_DB: d1PrepareProxy(testBindings().USAGE_MONITOR_DB, rejectStorage),
+      DELETION_LEDGER: d1PrepareProxy(testBindings().DELETION_LEDGER, rejectStorage),
+      QUARANTINE: new Proxy(testBindings().QUARANTINE, { get: rejectStorage }),
+    });
+    for (const method of ["GET", "DELETE"]) {
+      const response = await api("/api/v1/me", { method }, runtime);
+      expect(response.status).toBe(404);
+      await expect(response.json()).resolves.toMatchObject({ error: { code: "NOT_FOUND" } });
+    }
+    expect(storageCalls).toBe(0);
+  });
+
+  it("keeps an authenticated old client's account, uploads and session unchanged", async () => {
+    const participant = await enrollTelemetry();
+    expect((await uploadEnvelope(participant, await encrypt(telemetryFixture("a"), true))).status).toBe(202);
+    const before = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT * FROM participants WHERE id = ?",
+    ).bind(participant.participantId).first();
+    const objectKeys = (await testBindings().QUARANTINE.list()).objects.map((object) => object.key);
+    const response = await api("/api/v1/me", {
+      method: "DELETE",
+      headers: personalHeaders(participant, { csrf: true }),
+    });
+    expect(response.status).toBe(404);
+    expect(await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT * FROM participants WHERE id = ?",
+    ).bind(participant.participantId).first()).toEqual(before);
+    expect((await testBindings().QUARANTINE.list()).objects.map((object) => object.key)).toEqual(objectKeys);
+    expect((await api("/api/v1/session", { headers: personalHeaders(participant) })).status).toBe(200);
+    expect((await api("/api/v1/me/export", { headers: personalHeaders(participant) })).status).toBe(200);
+    expect(await hasDeletionTombstone(testBindings().DELETION_LEDGER, participant.participantId)).toBe(false);
+  });
+
+  it("requires the pinned owner, private hostname and exact-origin CSRF before erasure", async () => {
+    const participant = await enrollTelemetry();
+    const attempts: Array<{ status: number; code: string; mutate: (fixture: Awaited<ReturnType<typeof ownerErasureRequest>>) => Request }> = [
+      { status: 403, code: "ACCESS_REQUIRED", mutate: ({ request }) => {
+        request.headers.delete("cf-access-jwt-assertion");
+        request.headers.set("cookie", participant.cookie);
+        request.headers.set("x-usage-monitor-csrf", participant.csrfToken);
+        return request;
+      } },
+      { status: 404, code: "NOT_FOUND", mutate: ({ request }) => new Request(
+        "https://example.test/api/v1/admin/action", request,
+      ) },
+      { status: 403, code: "CSRF_INVALID", mutate: ({ request }) => {
+        request.headers.delete("x-usage-monitor-admin");
+        return request;
+      } },
+      { status: 403, code: "CSRF_INVALID", mutate: ({ request }) => {
+        request.headers.set("origin", "https://untrusted.example.test");
+        return request;
+      } },
+      { status: 503, code: "ADMIN_NOT_CONFIGURED", mutate: ({ request, runtimeEnv }) => {
+        Reflect.deleteProperty(runtimeEnv, "ACCESS_ADMIN_EMAIL");
+        return request;
+      } },
+    ];
+    for (const attempt of attempts) {
+      const fixture = await ownerErasureRequest(testBindings(), participant.participantId);
+      const response = await handleRequest(attempt.mutate(fixture), fixture.runtimeEnv);
+      expect(response.status, attempt.code).toBe(attempt.status);
+      await expect(response.json()).resolves.toMatchObject({ error: { code: attempt.code } });
+    }
+    const wrongOwner = await ownerErasureRequest(testBindings(), participant.participantId, {
+      email: "another-person@example.test",
+    });
+    const rejectedOwner = await handleRequest(wrongOwner.request, wrongOwner.runtimeEnv);
+    expect(rejectedOwner.status).toBe(403);
+    await expect(rejectedOwner.json()).resolves.toMatchObject({ error: { code: "ADMIN_REQUIRED" } });
+    expect(await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state FROM participants WHERE id = ?",
+    ).bind(participant.participantId).first()).toEqual({ state: "active" });
+    expect(await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM admin_action_audit",
+    ).first()).toEqual({ total: 0 });
+    expect(await hasDeletionTombstone(testBindings().DELETION_LEDGER, participant.participantId)).toBe(false);
+  });
+
+  it("requires one exact target and explicit confirmation without accepting extra fields", async () => {
+    const participant = await enrollTelemetry();
+    const erasure = { participantId: participant.participantId, confirmation: "erase_hosted_participant" };
+    for (const body of [
+      { action: "run_maintenance", participantErasure: null },
+      { action: "run_maintenance", participantErasure: [] },
+      { action: "run_maintenance", participantErasure: { participantId: participant.participantId } },
+      { action: "run_maintenance", participantErasure: { ...erasure, confirmation: "yes" } },
+      { action: "run_maintenance", participantErasure: { ...erasure, participantId: crypto.randomUUID() } },
+      { action: "run_maintenance", participantErasure: { ...erasure, participantId: "*" } },
+      { action: "run_maintenance", participantErasure: { ...erasure, participantId: [participant.participantId] } },
+      { action: "run_maintenance", participantErasure: { ...erasure, all: true } },
+      { action: "run_maintenance", participantErasure: erasure, force: true },
+    ]) {
+      const fixture = await ownerErasureRequest(testBindings(), participant.participantId);
+      const request = new Request(fixture.request, { body: JSON.stringify(body) });
+      const response = await handleRequest(request, fixture.runtimeEnv);
+      expect(response.status).toBe(400);
+      await expect(response.json()).resolves.toMatchObject({ error: { code: "BODY_INVALID" } });
+    }
+    expect(await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT COUNT(*) AS total FROM admin_action_audit",
+    ).first()).toEqual({ total: 0 });
+    expect((await api("/api/v1/session", { headers: personalHeaders(participant) })).status).toBe(200);
+  });
+
+  it("refuses owner erasure before changing the target if its audit cannot start", async () => {
+    const participant = await enrollTelemetry();
+    const base = testBindings().USAGE_MONITOR_DB;
+    const unavailableAudit = d1PrepareProxy(base, (query) => {
+      if (query.includes("INSERT INTO admin_action_audit")) throw new Error("audit unavailable");
+      return base.prepare(query);
+    });
+    const response = await ownerErase(testBindings({ USAGE_MONITOR_DB: unavailableAudit }), participant.participantId);
+    expect(response.status).toBe(500);
+    expect(await base.prepare("SELECT state FROM participants WHERE id = ?")
+      .bind(participant.participantId).first()).toEqual({ state: "active" });
+    expect(await hasDeletionTombstone(testBindings().DELETION_LEDGER, participant.participantId)).toBe(false);
+  });
+
+  it("requires the production identity secret before claiming owner erasure", async () => {
+    const participant = await enrollTelemetry();
+    const runtime = testBindings();
+    Reflect.set(runtime, "ENVIRONMENT", "production");
+    Reflect.deleteProperty(runtime, "IDENTITY_LINK_SECRET");
+    const response = await ownerErase(runtime, participant.participantId);
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "IDENTITY_CONFIGURATION_INVALID" } });
+    expect(await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT state FROM participants WHERE id = ?",
+    ).bind(participant.participantId).first()).toEqual({ state: "active" });
+    expect(await hasDeletionTombstone(testBindings().DELETION_LEDGER, participant.participantId)).toBe(false);
+  });
+
+  it("resumes a legacy deletion even after its last participant session expires", async () => {
+    const participant = await enrollTelemetry();
+    expect((await uploadEnvelope(participant, await encrypt(telemetryFixture("a"), true))).status).toBe(202);
+    const legacy = await createSessionMaterial(participant.participantId);
+    await sessionInsert(testBindings().USAGE_MONITOR_DB, legacy).run();
+    await markParticipantDeleting(testBindings().USAGE_MONITOR_DB, participant.participantId, legacy.id);
+    await testBindings().USAGE_MONITOR_DB.prepare(
+      "UPDATE web_sessions SET expires_at = ? WHERE participant_id = ?",
+    ).bind(new Date(Date.now() - 1_000).toISOString(), participant.participantId).run();
+    const response = await ownerErase(testBindings(), participant.participantId);
+    expect(response.status).toBe(200);
+    const receipt = await response.json<{ result: { operationId: string } }>();
+    expect(receipt).toMatchObject({ result: { deleted: true, alreadyDeleted: false, contributionsDeleted: 1 } });
+    const audit = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT outcome, details_json FROM admin_action_audit WHERE operation_id = ?",
+    ).bind(receipt.result.operationId).first<{ outcome: string; details_json: string }>();
+    expect(audit?.outcome).toBe("success");
+    expect(JSON.parse(audit!.details_json)).toMatchObject({
+      task: "participant_erasure", participantDigest: expect.stringMatching(/^[0-9a-f]{64}$/u), deleted: true,
+    });
+    expect(audit!.details_json).not.toContain(participant.participantId);
+    expect(audit!.details_json).not.toContain(participant.recoveryCode);
+    expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
+  });
+
+  it("only acknowledges an absent target when an unexpired erasure tombstone exists", async () => {
+    const unknownId = `participant:${crypto.randomUUID()}`;
+    expect((await ownerErase(testBindings(), unknownId)).status).toBe(404);
+    const participant = await enrollTelemetry();
+    expect((await ownerErase(testBindings(), participant.participantId)).status).toBe(200);
+    const retry = await ownerErase(testBindings(), participant.participantId);
+    expect(retry.status).toBe(200);
+    await expect(retry.json()).resolves.toMatchObject({
+      result: { deleted: true, alreadyDeleted: true, contributionsDeleted: null },
+    });
+    await testBindings().DELETION_LEDGER.prepare(
+      "UPDATE deletion_tombstones SET deleted_at = ?, retain_until = ? WHERE participant_digest = ?",
+    ).bind(
+      new Date(Date.now() - 401 * 86_400_000).toISOString(),
+      new Date(Date.now() - 86_400_000).toISOString(),
+      await participantDeletionDigest(participant.participantId),
+    ).run();
+    expect((await ownerErase(testBindings(), participant.participantId)).status).toBe(404);
+  });
+
+  it("waits for a fresh owner attempt lease but recovers an abandoned attempt", async () => {
+    const participant = await enrollTelemetry();
+    const database = testBindings().USAGE_MONITOR_DB;
+    const operationId = await beginAdminOperation(database, "test-owner", "run_maintenance", { task: "participant_erasure" });
+    await markParticipantDeleting(database, participant.participantId, operationId);
+    const busy = await ownerErase(testBindings(), participant.participantId);
+    expect(busy.status).toBe(409);
+    await expect(busy.json()).resolves.toMatchObject({ error: { code: "PARTICIPANT_DELETING" } });
+    expect(await database.prepare("SELECT deletion_session_id FROM participants WHERE id = ?")
+      .bind(participant.participantId).first()).toEqual({ deletion_session_id: operationId });
+    await database.prepare("UPDATE admin_action_audit SET created_at = ? WHERE operation_id = ?")
+      .bind(new Date(Date.now() - 301_000).toISOString(), operationId).run();
+    const retry = await ownerErase(testBindings(), participant.participantId);
+    expect(retry.status).toBe(200);
+    expect(await database.prepare("SELECT id FROM participants WHERE id = ?")
+      .bind(participant.participantId).first()).toBeNull();
+  });
+
+  it("does not let restore maintenance finalize an owner erasure after tombstoning", async () => {
+    const participant = await enrollTelemetry();
+    expect((await uploadEnvelope(participant, await encrypt(telemetryFixture("a"), true))).status).toBe(202);
+    let reachedDelete!: () => void;
+    let releaseDelete!: () => void;
+    const reached = new Promise<void>((resolve) => { reachedDelete = resolve; });
+    const released = new Promise<void>((resolve) => { releaseDelete = resolve; });
+    const baseBucket = testBindings().QUARANTINE;
+    const pausedBucket = new Proxy(baseBucket, {
+      get(target, property) {
+        if (property === "delete") return async (...keys: Parameters<R2Bucket["delete"]>) => {
+          reachedDelete();
+          await released;
+          return target.delete(...keys);
+        };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const ownerRequest = ownerErase(testBindings({ QUARANTINE: pausedBucket }), participant.participantId);
+    await reached;
+    try {
+      const database = testBindings().USAGE_MONITOR_DB;
+      const before = await database.prepare("SELECT state, deletion_session_id FROM participants WHERE id = ?")
+        .bind(participant.participantId).first<{ state: string; deletion_session_id: string }>();
+      expect(before?.state).toBe("deleting");
+      expect(await hasDeletionTombstone(testBindings().DELETION_LEDGER, participant.participantId)).toBe(true);
+      const maintenance = await runBackendLifecycle(database, testBindings().DELETION_LEDGER, baseBucket);
+      expect(maintenance).toMatchObject({ restoredParticipantsSuppressed: 0, restoreReplayComplete: true });
+      expect(await database.prepare("SELECT state, deletion_session_id FROM participants WHERE id = ?")
+        .bind(participant.participantId).first()).toEqual(before);
+      expect((await baseBucket.list()).objects).toHaveLength(1);
+      expect(await database.prepare("SELECT outcome FROM admin_action_audit WHERE operation_id = ?")
+        .bind(before?.deletion_session_id).first()).toEqual({ outcome: "started" });
+    } finally {
+      releaseDelete();
+    }
+    const response = await ownerRequest;
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      result: { deleted: true, alreadyDeleted: false, contributionsDeleted: 1 },
+    });
+    expect((await baseBucket.list()).objects).toHaveLength(0);
+  });
+
+  it("retries interrupted restore cleanup without surrendering its fence to owner erasure", async () => {
+    const participant = await enrollTelemetry();
+    expect((await uploadEnvelope(participant, await encrypt(telemetryFixture("a"), true))).status).toBe(202);
+    await recordDeletionTombstone(testBindings().DELETION_LEDGER, participant.participantId);
+    const bucket = new Proxy(testBindings().QUARANTINE, {
+      get(target, property) {
+        if (property === "delete") return async () => { throw new Error("interrupted restore cleanup"); };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    await expect(runBackendLifecycle(testBindings().USAGE_MONITOR_DB, testBindings().DELETION_LEDGER, bucket))
+      .rejects.toThrow("interrupted restore cleanup");
+    expect(await testBindings().USAGE_MONITOR_DB.prepare("SELECT state, deletion_session_id FROM participants WHERE id = ?")
+      .bind(participant.participantId).first()).toEqual({ state: "deleting", deletion_session_id: null });
+    expect((await ownerErase(testBindings(), participant.participantId)).status).toBe(409);
+    expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(1);
+    const retry = await runBackendLifecycle(testBindings().USAGE_MONITOR_DB, testBindings().DELETION_LEDGER, testBindings().QUARANTINE);
+    expect(retry).toMatchObject({ restoredParticipantsSuppressed: 1, restoreReplayComplete: true });
+    expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
+    expect(await testBindings().USAGE_MONITOR_DB.prepare("SELECT id FROM participants WHERE id = ?")
+      .bind(participant.participantId).first()).toBeNull();
+  });
+
+  it("never lets a fenced-out erasure delete the target's remaining database rows", async () => {
+    const participant = await enrollTelemetry();
+    expect((await uploadEnvelope(participant, await encrypt(telemetryFixture("a"), true))).status).toBe(202);
+    const database = testBindings().USAGE_MONITOR_DB;
+    const oldFence = crypto.randomUUID();
+    const currentFence = crypto.randomUUID();
+    await markParticipantDeleting(database, participant.participantId, oldFence);
+    await database.prepare("UPDATE participants SET deletion_session_id = ? WHERE id = ?")
+      .bind(currentFence, participant.participantId).run();
+    await expect(finishParticipantDeletion(database, participant.participantId, oldFence))
+      .rejects.toMatchObject({ code: "PARTICIPANT_DELETING" });
+    await expect(finishParticipantDeletion(database, participant.participantId, null))
+      .rejects.toMatchObject({ code: "PARTICIPANT_DELETING" });
+    expect(await database.prepare("SELECT COUNT(*) AS total FROM telemetry_contributions WHERE participant_id = ?")
+      .bind(participant.participantId).first()).toEqual({ total: 1 });
+    expect(await database.prepare("SELECT deletion_session_id FROM participants WHERE id = ?")
+      .bind(participant.participantId).first()).toEqual({ deletion_session_id: currentFence });
+    expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(1);
+  });
+
+  it("reports no success when the final audit fails and safely retries the lost receipt", async () => {
+    const participant = await enrollTelemetry();
+    const base = testBindings().USAGE_MONITOR_DB;
+    const failedReceipt = d1PrepareProxy(base, (query) => {
+      if (query.includes("UPDATE admin_action_audit")) throw new Error("audit completion unavailable");
+      return base.prepare(query);
+    });
+    const response = await ownerErase(testBindings({ USAGE_MONITOR_DB: failedReceipt }), participant.participantId);
+    expect(response.status).toBe(500);
+    expect(await base.prepare("SELECT id FROM participants WHERE id = ?")
+      .bind(participant.participantId).first()).toBeNull();
+    const retry = await ownerErase(testBindings(), participant.participantId);
+    expect(retry.status).toBe(200);
+    await expect(retry.json()).resolves.toMatchObject({
+      result: { deleted: true, alreadyDeleted: true, contributionsDeleted: null },
+    });
+  });
+
+  it("fences concurrent owner erasure and resumes without a participant session", async () => {
     const participant = await enrollTelemetry();
     const contribution = await uploadEnvelope(
       participant,
@@ -3251,17 +3561,11 @@ describe("synthetic usage monitor service", () => {
       },
     });
     const responses = await Promise.all([
-      api("/api/v1/me", {
-        method: "DELETE",
-        headers: personalHeaders(participant, { csrf: true }),
-      }, testBindings({ QUARANTINE: flakyBucket })),
-      api("/api/v1/me", {
-        method: "DELETE",
-        headers: personalHeaders(otherParticipant, { csrf: true }),
-      }, testBindings({ QUARANTINE: flakyBucket })),
+      ownerErase(testBindings({ QUARANTINE: flakyBucket }), participant.participantId),
+      ownerErase(testBindings({ QUARANTINE: flakyBucket }), participant.participantId),
     ]);
     expect(responses.filter((response) => response.status === 500)).toHaveLength(1);
-    expect(responses.filter((response) => [401, 409].includes(response.status))).toHaveLength(1);
+    expect(responses.filter((response) => response.status === 409)).toHaveLength(1);
     expect(deleteCalls).toBe(1);
     const withdrawnSnapshot = await testBindings().USAGE_MONITOR_DB.prepare(
       "SELECT release_state FROM community_weekly_snapshots",
@@ -3275,17 +3579,14 @@ describe("synthetic usage monitor service", () => {
       deletion_session_id: string;
     }>();
     expect(state?.state).toBe("deleting");
-    const firstSessionId = participant.cookie.match(/um_session_([^.]+)\./u)?.[1];
-    const winningParticipant = state?.deletion_session_id === firstSessionId
-      ? participant
-      : otherParticipant;
-    const losingParticipant = winningParticipant === participant
-      ? otherParticipant
-      : participant;
-    const otherRejected = await api("/api/v1/session", {
-      headers: personalHeaders(losingParticipant),
-    });
-    expect(otherRejected.status).toBe(401);
+    const winningAudit = await testBindings().USAGE_MONITOR_DB.prepare(
+      "SELECT action, outcome FROM admin_action_audit WHERE operation_id = ?",
+    ).bind(state?.deletion_session_id).first<{ action: string; outcome: string }>();
+    expect(winningAudit).toEqual({ action: "run_maintenance", outcome: "failure" });
+    for (const session of [participant, otherParticipant]) {
+      const rejected = await api("/api/v1/session", { headers: personalHeaders(session) });
+      expect(rejected.status).toBe(401);
+    }
     const uploadRejected = await api("/api/v1/contributions", {
       method: "POST",
       headers: {
@@ -3296,14 +3597,10 @@ describe("synthetic usage monitor service", () => {
     });
     expect(uploadRejected.status).toBe(401);
 
-    const retried = await api("/api/v1/me", {
-      method: "DELETE",
-      headers: personalHeaders(winningParticipant, { csrf: true }),
-    });
+    const retried = await ownerErase(testBindings(), participant.participantId);
     expect(retried.status).toBe(200);
     await expect(retried.json()).resolves.toMatchObject({
-      deleted: true,
-      contributionsDeleted: 1,
+      result: { deleted: true, alreadyDeleted: false, contributionsDeleted: 1 },
     });
     expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
   });
@@ -3312,10 +3609,10 @@ describe("synthetic usage monitor service", () => {
     const participant = await enrollTelemetry();
     const device = await pairDevice(participant);
 
-    const personalRead = await api("/api/v1/me", {
+    const personalRead = await api("/api/v1/me/export", {
       headers: { authorization: `Device ${device.authorization}` },
     });
-    expect(personalRead.status).toBe(405);
+    expect(personalRead.status).toBe(401);
 
     const listed = await api("/api/v1/me/devices", {
       headers: personalHeaders(participant),
@@ -3414,10 +3711,9 @@ describe("synthetic usage monitor service", () => {
     });
     expect(deniedPending.status).toBe(401);
 
-    const deleted = await api("/api/v1/me", {
-      method: "DELETE",
-      headers: personalHeaders(participant, { csrf: true }),
-    });
+    const deleted = await ownerErase(
+      testBindings(), participant.participantId,
+    );
     expect(deleted.status).toBe(200);
     for (const table of [
       "device_pairings",
@@ -3441,13 +3737,12 @@ describe("synthetic usage monitor service", () => {
       expect(response.status).toBe(202);
     }
     expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(2);
-    const deleted = await api("/api/v1/me", {
-      method: "DELETE",
-      headers: personalHeaders(participant, { csrf: true }),
-    });
+    const deleted = await ownerErase(
+      testBindings(), participant.participantId,
+    );
+    expect(deleted.status).toBe(200);
     await expect(deleted.json()).resolves.toMatchObject({
-      deleted: true,
-      contributionsDeleted: 2,
+      result: { deleted: true, contributionsDeleted: 2 },
     });
     expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
     const rows = await testBindings().USAGE_MONITOR_DB.prepare(
@@ -3674,10 +3969,9 @@ describe("synthetic usage monitor service", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    const failed = await api("/api/v1/me", {
-      method: "DELETE",
-      headers: personalHeaders(participant, { csrf: true }),
-    }, testBindings({ DELETION_LEDGER: unavailableLedger }));
+    const failed = await ownerErase(
+      testBindings({ DELETION_LEDGER: unavailableLedger }), participant.participantId,
+    );
     expect(failed.status).toBe(500);
     const primary = await testBindings().USAGE_MONITOR_DB.prepare(
       "SELECT state FROM participants WHERE id = ?",
@@ -3689,10 +3983,9 @@ describe("synthetic usage monitor service", () => {
     ).first<{ total: number }>();
     expect(tombstones?.total).toBe(0);
 
-    const retried = await api("/api/v1/me", {
-      method: "DELETE",
-      headers: personalHeaders(participant, { csrf: true }),
-    });
+    const retried = await ownerErase(
+      testBindings(), participant.participantId,
+    );
     expect(retried.status).toBe(200);
     expect((await testBindings().QUARANTINE.list()).objects).toHaveLength(0);
   });
@@ -4168,10 +4461,7 @@ describe("synthetic usage monitor service", () => {
       expect(first.status).toBe(201);
       const participant = await enrollmentFrom(first);
 
-      const deleted = await api("/api/v1/me", {
-        method: "DELETE",
-        headers: personalHeaders(participant, { csrf: true }),
-      }, env);
+      const deleted = await ownerErase(env, participant.participantId);
       expect(deleted.status).toBe(200);
 
       const cooldown = await env.DELETION_LEDGER.prepare(
@@ -4345,10 +4635,7 @@ describe("synthetic usage monitor service", () => {
       const first = await identityEnroll(linkKey, "google", env);
       expect(first.status).toBe(201);
       const participant = await enrollmentFrom(first);
-      const deleted = await api("/api/v1/me", {
-        method: "DELETE",
-        headers: personalHeaders(participant, { csrf: true }),
-      }, env);
+      const deleted = await ownerErase(env, participant.participantId);
       expect(deleted.status).toBe(200);
       const second = await identityEnroll(linkKey, "google", env);
       expect(second.status).toBe(201);

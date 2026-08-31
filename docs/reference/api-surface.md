@@ -59,7 +59,7 @@ site.
 | `GET` | `/api/v1/admin/overview` | Admin application | Admin | Reads bounded operational, distribution, lifecycle, and sampled error evidence. | Operations |
 | `GET` | `/api/v1/admin/metrics/history` | Admin application | Admin | Reads bounded operational history. | Operations |
 | `GET` | `/api/v1/admin/community/allowance-preview` | Admin application | Admin | Reads unpublished allowance-fit previews; does not publish. | Operations |
-| `POST` | `/api/v1/admin/action` | Admin application | Admin | Revision-checked collection controls, maintenance, rebuild, and distribution actions; auditable D1/R2 effects. | Operations |
+| `POST` | `/api/v1/admin/action` | Owner/admin application | Admin | Collection controls, maintenance, and distribution actions; explicit participant erasure uses the existing maintenance action with auditable D1/R2 effects. | Operations |
 | `POST` | `/api/v1/me/security-reset` | Participant browser | Session | Rotates session/recovery state and invalidates affected credentials. | Participant account |
 | `POST` | `/api/v1/me/device-pairings` | Participant browser | Session | Creates a bounded device-pairing claim in D1. | Device lifecycle |
 | `POST` | `/api/v1/device-pairings/claim` | Native app | Pairing code | Claims the pairing and returns the device credential once. | Device lifecycle |
@@ -74,11 +74,54 @@ site.
 | `POST` | `/api/v1/contributions` | Prepared uploader | Upload | Validates and deduplicates an encrypted contribution, writes D1 state and quarantined R2 object data, and schedules aggregation. | Contribution ingestion |
 | `GET` | `/api/v1/me/export` | Participant browser | Session | Returns a bounded export of the participant's hosted data. | Participant data |
 | `GET` | `/api/v1/community/daily` | Website | Public | Reads a bounded published daily range and omits unavailable allowance evidence. | Community publication |
-| `DELETE` | `/api/v1/me` | Participant browser | Session | Performs the participant deletion lifecycle and tombstone flow. | Participant account |
 
 Production admin API and UI paths are served only on the configured admin host.
 Public-host requests to those paths are deliberately 404. Static site assets
 are not part of the API registry.
+
+### Self-service retirement and private owner erasure
+
+Under the [2026-08-30 source decision](../decisions/2026-08-30-self-service-deletion-retirement.md),
+`DELETE /api/v1/me` is not a registered route: it returns the existing unknown
+API `404 NOT_FOUND` without D1 access or participant mutation.
+`POST /api/v1/me/contributions/delete` remains retired. Health reports
+`participantDeletion: false` and retains `deletionSafeRestoreReplay: true`;
+neither field is deployment or erasure-completion evidence.
+
+Private erasure uses the existing `POST /api/v1/admin/action` and
+`action: "run_maintenance"`, with the closed `participantErasure` object:
+`participantId` is the exact opaque `participant:<UUID>` string, and
+`confirmation` is `"erase_hosted_participant"`. It requires the configured
+admin host, Access-pinned owner identity, exact-origin CSRF, and
+`x-usage-monitor-admin: 1`. Without `participantErasure`, ordinary maintenance
+must not initiate participant erasure. No new route, action enum, or migration
+is introduced.
+
+Success has `schemaVersion: "admin-action-v0.1"`, `action: "run_maintenance"`,
+and `result` containing `task: "participant_erasure"`, `operationId` (UUID),
+`deleted: true`, `alreadyDeleted`, and `contributionsDeleted`:
+
+| Completion evidence | `alreadyDeleted` | `contributionsDeleted` |
+| --- | --- | --- |
+| The operation completed participant erasure | `false` | Number of contributions removed |
+| Participant absent and an unexpired independent tombstone proves prior erasure | `true` | `null` (historical count unknown, not zero) |
+
+Absence without an unexpired tombstone returns `404 NOT_FOUND`, not success.
+An interrupted `deleting` participant with a non-null deletion fence can resume
+through the owner boundary without its former web session. A fresh started
+owner attempt returns `409 PARTICIPANT_DELETING`; wait/recheck rather than
+erase concurrently. Owner takeover is limited to a non-null legacy fence
+without a matching audit, a failed attempt, or a started attempt older than
+five minutes. The new audited operation
+UUID fences final removal against stale attempts. A null `deletion_session_id`
+on a deleting participant belongs to restore replay: owner erasure returns the
+same busy response while maintenance finishes or retries that restore. Cron
+does not resume non-null owner/legacy deletions. Audit action remains
+`run_maintenance`; its details identify `task: "participant_erasure"`, a
+purpose-separated participant digest, and bounded outcome/code/count, never
+raw identifiers. The
+[production owner procedure](../runbooks/production-operations.md#private-owner-participant-erasure)
+defines the exact audit domain and preserved pipeline/restore requirements.
 
 ## Local route inventory
 
@@ -106,7 +149,7 @@ is never an arbitrary local proxy.
 | `GET` | `/api/local/contribution/sync-status` | Dashboard | Loopback read | Reads the legacy prepared-set queue state. | Contribution sync |
 | `POST` | `/api/local/contribution/sync-next` | Dashboard | Loopback mutation | Builds the next bounded local review projection; does not upload. | Contribution sync |
 | `POST` | `/api/local/contribution/device-pair` | Dashboard | Loopback mutation | Claims a hosted pairing and stores the device credential in the platform credential store. | Device lifecycle |
-| `POST` | `/api/local/contribution/device-disconnect` | Dashboard | Loopback mutation | Revokes hosted device authority and removes local binding/credential state. | Device lifecycle |
+| `POST` | `/api/local/contribution/device-disconnect` | Dashboard | Loopback mutation | Persists `device_disconnected` pause intent, revokes hosted device authority, and removes local binding/credential state; preserves history. | Device lifecycle |
 | `POST` | `/api/local/contribution/device-credential-reset` | Dashboard | Loopback mutation | Removes unusable local device credential/binding state; does not delete hosted data. | Device lifecycle |
 | `POST` | `/api/local/contribution/sync-inspect-exact` | Dashboard | Loopback mutation | Verifies the exact next payload and issues a short-lived, single-use local review token. | Contribution sync |
 | `GET` | `/api/local/contribution/incremental-status` | Dashboard | Loopback read | Reads v1 incremental consent/cursor/retry state. | Contribution sync |
@@ -151,7 +194,6 @@ from request data, and keeps provider callbacks off loopback.
 | `POST` | `/api/v1/identity/apple/result` |
 | `GET` | `/api/v1/session` |
 | `POST` | `/api/v1/logout` |
-| `DELETE` | `/api/v1/me` |
 | `POST` | `/api/v1/me/device-pairings` |
 
 ## Native bridge
@@ -198,8 +240,11 @@ and [`../runbooks/unified-index-recovery.md`](../runbooks/unified-index-recovery
 ## Compatibility and retirement
 
 - Compatibility aliases are explicit registry entries, not wildcard routes.
-- A route is retired by removing its callers, migrations/data obligations,
-  registry entry, handler, tests, and documentation together.
+- Retire a route's callers, registry entry, handler, and active promises
+  together; retain negative tests proving refusal without side effects.
+  Migrations, retained-data obligations, erasure/restore safeguards, and
+  historical evidence do not disappear with an HTTP route. Their removal
+  requires a separate reviewed and authorized lifecycle decision.
 - A deprecated route remains documented until the shipping compatibility window
   ends. An obsolete document is deleted once it no longer describes a retained
   contract or supplies enduring audit/recovery evidence.

@@ -89,7 +89,7 @@
             Codex binary's local <code>app-server</code> subprocess. Local
             analysis works offline. Network access is limited to explicit
             capabilities such as signed update checks, hosted sign-in,
-            contribution, deletion, and public aggregate reads; the website
+            contribution, device disconnect, and public aggregate reads; the website
             cannot reach the loopback dashboard.
           </p>
         </article>
@@ -129,11 +129,25 @@
           <p>
             The local display window is not a retention limit: accumulated
             owner-only evidence remains until you run an explicit local erase.
-            Local erase, Keychain identity reset, disconnecting this Mac, and
-            complete hosted participant deletion are separate actions with
-            separate confirmations. Complete hosted deletion removes
-            contributed usage and account records and stops this Mac's upload
-            authority; it does not alter local analysis.
+            Local erase and Keychain identity reset have separate consequences.
+            Disconnect this Mac stops that device's uploads without deleting
+            hosted history or local analysis. Signing out only ends the hosted
+            session; it does not disconnect the upload device.
+          </p>
+          <p>
+            Accepted hosted contributions and aggregates have no blanket short
+            retention limit. Hosted erasure is handled by the service owner,
+            not an in-app deletion control. A deletion record is retained to
+            prevent erased participant data from returning after a backup
+            restore.
+          </p>
+          <p>
+            For privacy, rights, or erasure requests, see
+            <a href="https://github.com/adamallcock/tibotattle/blob/main/SUPPORT.md">project support guidance</a>.
+            A dedicated private privacy-request intake channel is not
+            documented there.
+            Do not post account identifiers, credentials, or private records
+            in public issues.
           </p>
         </article>
         <article class="resource-card" id="uninstall">
@@ -142,9 +156,10 @@
             Ordinary app or Homebrew uninstall preserves local analysis state.
             Homebrew <code>--zap</code> removes the app's Application Support,
             cache, WebKit, and preference state, but not <code>~/.codex</code>,
-            Keychain identities, or data already contributed. Use the app's
-            explicit identity and hosted privacy controls for those separate
-            lifecycles.
+            Keychain identities, or data already contributed. Use the explicit
+            local identity controls for Keychain state, and see the support
+            guidance above for hosted erasure requests. Uninstalling or disconnecting
+            does not erase hosted history.
           </p>
         </article>
         <article class="resource-card wide" id="excluded-content">

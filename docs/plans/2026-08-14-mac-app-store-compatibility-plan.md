@@ -327,6 +327,14 @@ inadequate.
 
 ### Privacy and manifests
 
+Account-flow update, 2026-08-30: the
+[self-service retirement decision](../decisions/2026-08-30-self-service-deletion-retirement.md)
+replaces the source app's hosted-deletion control with confirmed device
+disconnect; hosted erasure is private and owner-operated. That decision does
+not establish Mac App Store eligibility. Recheck the then-current Apple
+account-management requirements against the exact proposed Store build before
+submission; the policy checks below remain open, not satisfied by retirement.
+
 - Inventory every data flow in the native app, Node companion, `keytar`,
   Sparkle-free Store dependency graph, and hosted endpoints.
 - Audit use of Apple's listed required-reason APIs and third-party SDK manifest

@@ -39,11 +39,11 @@ Those remain separate verification gates in the relevant runbooks.
 
 | Surface | Boundary | Implemented surface |
 |---|---|---:|
-| Local companion API | Browser/native shell → loopback Node companion | 24 paths, 27 method/path operations |
+| Local companion API | Browser/native shell → loopback Node companion | 23 paths, 25 method/path operations |
 | Local report pages | Browser → fixed loopback report allowlist | 4 `GET` paths |
 | Central public relay | Loopback companion → configured hosted origin | 1 fixed `GET` path |
-| Participant relay | Loopback companion → configured hosted origin | 9 paths, 9 method/path operations |
-| Hosted Worker API | Internet/native collector → Cloudflare Worker | 31 API paths, 31 method/path operations |
+| Participant relay | Loopback companion → configured hosted origin | 8 paths, 8 method/path operations |
+| Hosted Worker API | Internet/native collector → Cloudflare Worker | 30 API paths, 30 method/path operations |
 | Deliberate negative Worker route | Internet → fixed non-API interception | 1 always-`404` path |
 | Native/browser bridge | WKWebView ↔ macOS shell | 3 message handlers, 4 DOM events, 1 fixed URL scheme |
 | Process protocols | Native shell, companion, analysis owners ↔ child/worker | 8 explicit runtime protocol families |
@@ -94,7 +94,7 @@ flowchart LR
   Local --> |read-only local files| Evidence
   Local <--> |sanitized account protocol| Codex
   Native <--> |four capabilities; get / set / delete| Keychain
-  Local --> |health-only central relay + nine participant relays| Worker
+  Local --> |health-only central relay + 8 participant relays| Worker
   Local --> |device bearer + one-use Upload authority| Worker
   Worker <--> Data
   Worker <--> Objects
@@ -172,7 +172,7 @@ hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
 | `GET` | `/api/local/contribution/sync-status` | Inspect the replay-safe contribution queue and pause state |
 | `POST` | `/api/local/contribution/sync-next` | Inspect the next bounded queued upload candidate; this is intentionally not a `GET` |
 | `POST` | `/api/local/contribution/device-pair` | Claim a one-use hosted pairing code and store the resulting device credential locally |
-| `POST` | `/api/local/contribution/device-disconnect` | Revoke the current hosted device and remove its local authority |
+| `POST` | `/api/local/contribution/device-disconnect` | Persist `device_disconnected` pause intent, revoke the current hosted device, and remove its local authority without deleting history |
 | `POST` | `/api/local/contribution/device-credential-reset` | Remove the local contribution-device credential under the fixed reset contract |
 | `POST` | `/api/local/contribution/sync-inspect-exact` | Inspect exact next-upload bytes and authority without sending |
 | `GET` | `/api/local/contribution/incremental-status` | Inspect incremental v1 eligibility, watermark, and state |
@@ -263,7 +263,6 @@ relayed through loopback.
 | `POST` | `/api/v1/identity/apple/result` | Poll the one-time Apple handoff result |
 | `GET` | `/api/v1/session` | Read the current hosted session projection |
 | `POST` | `/api/v1/logout` | End the hosted browser session |
-| `DELETE` | `/api/v1/me` | Delete hosted participation and its current data |
 | `POST` | `/api/v1/me/device-pairings` | Create a one-use local-device pairing code |
 
 ## 3. Hosted Cloudflare Worker HTTP API
@@ -321,7 +320,7 @@ Authority vocabulary:
 | `GET` | `/api/v1/admin/overview` | Admin | Read owner operations state plus bounded optional distribution integrations |
 | `GET` | `/api/v1/admin/metrics/history` | Admin | Read cached owner metrics history |
 | `GET` | `/api/v1/admin/community/allowance-preview` | Admin | Preview the cached owner-only allowance merge without publishing it |
-| `POST` | `/api/v1/admin/action` | Admin | Run one allowlisted, revision-guarded operations action |
+| `POST` | `/api/v1/admin/action` | Admin | Run an allowlisted operations action; explicit owner participant erasure is a task of `run_maintenance`, not a new action or route |
 | `POST` | `/api/v1/me/security-reset` | Session | Rotate participant recovery and session authority |
 | `POST` | `/api/v1/me/device-pairings` | Session | Mint a one-use pairing code for a local collector |
 | `POST` | `/api/v1/device-pairings/claim` | Pairing code | Bind a locally generated device credential hash to a participant |
@@ -336,16 +335,36 @@ Authority vocabulary:
 | `POST` | `/api/v1/contributions` | Upload | Validate and accept one encrypted contribution under device-minted, body-bound authority |
 | `GET` | `/api/v1/me/export` | Session | Stream the participant's bounded hosted-data export |
 | `GET` | `/api/v1/community/daily` | Public | Read bounded daily community series for `from` and `to` ISO-day bounds |
-| `DELETE` | `/api/v1/me` | Session | Delete hosted participation and data |
 | all | `/.well-known/apple-developer-domain-association.txt` | None | Deliberately intercepted retired path; always `404`, never SPA content |
 
 ### Lifecycle review
 
 The [API lifecycle and redundancy review](../reviews/2026-08-26-api-lifecycle-review.md)
 records the source, caller, tagged-app, and persisted-state evidence behind the
-2026-08-27 retirement. Relay membership is routing permission, not proof of a
-caller. Exact aliases, legacy recovery/upload/statistics/contribution routes,
-and `GET /api/v1/me` are now absent; the v1-aware `DELETE /api/v1/me` remains.
+2026-08-27 retirement as a historical source snapshot. Relay membership is
+routing permission, not proof of a caller. Exact aliases, legacy
+recovery/upload/statistics/contribution routes, and `GET /api/v1/me` are absent.
+The [2026-08-30 decision](../decisions/2026-08-30-self-service-deletion-retirement.md)
+also retires self-service `DELETE /api/v1/me` from the Worker and participant
+relay. It returns `404 NOT_FOUND` without D1 access or participant mutation;
+individual-contribution deletion remains retired. Health reports
+`participantDeletion: false` and `deletionSafeRestoreReplay: true` separately.
+
+Private erasure uses the existing owner/CSRF-protected
+`POST /api/v1/admin/action`, `action: "run_maintenance"`, and explicit
+`participantErasure: { participantId: "participant:<UUID>", confirmation: "erase_hosted_participant" }`.
+Omitting that object means ordinary maintenance only. The `admin-action-v0.1`
+response retains `action: "run_maintenance"` and returns `result` with
+`task: "participant_erasure"`, `operationId` (UUID), `deleted: true`,
+`alreadyDeleted`, and `contributionsDeleted`. A completed erasure returns
+`alreadyDeleted: false` with a numeric count; a retry proven by an unexpired
+independent tombstone returns `alreadyDeleted: true` and
+`contributionsDeleted: null` (unknown, not zero). Missing state alone is never
+completion. See the [API contract](./api-surface.md#self-service-retirement-and-private-owner-erasure)
+and [owner procedure](../runbooks/production-operations.md#private-owner-participant-erasure).
+
+This source-only change introduces no migration, route, action enum, retention
+change, or removal of erasure/restore safeguards; it does not prove deployment.
 Historical D1 migrations and data columns are deliberately retained until the
 owner runs the read-only gates in the
 [hosted API retirement data runbook](../runbooks/2026-08-27-hosted-api-retirement-data-gates.md).

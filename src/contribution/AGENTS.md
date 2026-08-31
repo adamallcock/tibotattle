@@ -28,8 +28,8 @@ first.
 - Bind a review/claim to exact immutable prepared bytes. Later local data creates
   a new prepared set; it must not mutate the reviewed set in place.
 - Keep consent revocation, contribution pause, device disconnection, local
-  identity rotation, hosted deletion, and local evidence deletion separate.
-  Expose the exact effect of each operation.
+  identity rotation, private owner erasure, and local evidence deletion separate.
+  Device disconnection preserves hosted/local history; expose each exact effect.
 - Recurring contribution is foreground/while-open and bounded. Do not introduce a
   daemon, hidden timer, autonomous raw scan, or unreviewed transport path.
 - Fail closed on version mismatch, expired capability, clock ambiguity, unknown

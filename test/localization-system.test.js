@@ -230,9 +230,9 @@ test("shipped static web copy has a complete translated inventory and localizabl
         continue;
       }
       assert.equal(
-        Object.hasOwn(LEGACY_TEXT_CATALOG, text),
+        hasEnglishCatalogValue(text),
         true,
-        `${staticPages[index]} is missing a zh-Hans/es legacy translation for ${JSON.stringify(text)}`,
+        `${staticPages[index]} is missing a complete zh-Hans/es translation for ${JSON.stringify(text)}`,
       );
     }
 

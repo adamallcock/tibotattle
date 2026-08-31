@@ -153,12 +153,20 @@ for the provenance and future-locale policy.
   derived state.
 - Contribution to the optional hosted community-aggregate service is **off by
   default**, requires an explicit review of the exact retained metadata, and is
-  pseudonymous and content-free. Hosted deletion is always available.
+  pseudonymous and content-free. Confirmed **Disconnect this Mac** stops this
+  device's contribution authority while preserving hosted and local history.
+  Self-service hosted deletion is retired in current source; hosted erasure is
+  a separate private owner operation, not an app control.
 - Contributing requires signing in with Google or Apple so that one person
   counts once. The service stores only an irreversible hash of that sign-in,
   never your name or email, and local-only use needs no account at all.
 - Derived artifacts (reports, exports, telemetry) are schema-validated to
   exclude prompts, responses, commands, paths, URLs, and raw identifiers.
+
+The [2026-08-30 deletion-retirement decision](docs/decisions/2026-08-30-self-service-deletion-retirement.md)
+is a source contract, not a deployed-service or installed-release claim. It
+does not change retention or settle privacy-request obligations; see the
+[privacy inventory](docs/reference/local-data-and-privacy.md).
 
 ### Private local report artifacts
 

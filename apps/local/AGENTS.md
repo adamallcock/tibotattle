@@ -48,6 +48,12 @@ compose. Apply the repository root guidance first.
   in URLs, browser storage, or rendered diagnostics.
 - Contribution routes may consume only already prepared, privacy-validated data
   and must preserve review, consent, retry, and deletion guarantees.
+- Do not relay retired participant deletion or private owner-erasure requests.
+  Device disconnect revokes this Mac's authority and preserves hosted/local
+  history; browser sign-out and local identity reset are different operations.
+- Persist disconnect intent as `device_disconnected` before revocation or
+  credential cleanup. Preserve consent and measured progress/history, keep the
+  pause across restart, and require explicit approval or resume to rearm sync.
 
 ## Validation
 
