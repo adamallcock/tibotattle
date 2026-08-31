@@ -36,14 +36,29 @@ a clean-profile smoke all succeed.
    foreground application and installs no `LSUIElement` agent. The compact
    title shows the primary observed quota lane only while the companion reports
    fresh verified evidence; stale, unobserved, starting, and failed states all
-   show a neutral `–`, and an in-progress pass shows `…`. The menu lists every
-   supported observed quota lane. It hides stale percentages and reset times,
-   and shows a reset countdown only for fresh verified evidence. Its disabled
-   rows name the observation and freshness state, so the menu bar never
-   displays a number it cannot justify. The item offers one primary **Open
-   TiboTattle** destination, state-aware **Analyze/Update Local Usage**, and
-   **Quit TiboTattle**; Quit uses the same graceful shutdown as the window's own
-   Quit control.
+   show a neutral `–`. An in-progress pass keeps the fresh current number when
+   one is available and shows `…` only while no current lane can be shown.
+   Left-click opens a
+   transient native popover with fresh-only five-hour and seven-day allowance
+   tracks, the shared weekly pace forecast expressed as under, near, or over
+   sustainable pace with a now-to-reset coverage track, and coverage-aware
+   local-calendar usage bars for 7 or 30 days. The pace reading is shown only
+   after compatible local quota observations bind to the exact current weekly
+   reset; one observation is named as collecting, never promoted to a trend.
+   The bars use
+   observed tokens; dollar figures are explicitly Standard API-price
+   equivalents, not a subscription bill, and disappear when pricing evidence
+   cannot support them. Missing evidence is a named gap, never a zero. The
+   popover forecast is an ephemeral, strict projection from the companion's
+   narrow read-only weekly-pace endpoint. Request-time geometry is recalculated
+   from the retained strict forecast without rerunning accounting; it is never
+   stored, logged, exported, or added to community data. It contains no account
+   identity, plan claim, purchase flow, reset credits, or redemption action.
+   Right-click or Control-click opens the native action menu with **Open
+   TiboTattle**, state-aware **Analyze/Update Local
+   Usage**, Settings, About, update checks when available, and **Quit
+   TiboTattle**. Quit uses the same graceful shutdown as the window's own Quit
+   control.
 5. Choose **Open TiboTattle** and explicitly start local analysis.
 6. If the companion fails or exits, choose **Retry**. The app does not require
    a relaunch for ordinary recovery.

@@ -315,6 +315,85 @@ async function build(root, extra = {}) {
   });
 }
 
+/**
+ * Recreate the shipped v8 on-disk shape from a populated current fixture. It
+ * predates owner binding, physical-source identity, quarantine receipts, and
+ * generation issue counts. Keeping this downgrade here makes the regression
+ * exercise a real populated legacy database without checking in user state or
+ * a platform-specific SQLite binary fixture.
+ */
+async function regressUnifiedIndexToProductionLegacySchema(
+  indexFile,
+  { retainOwner = false, userVersion = 8 } = {},
+) {
+  assert.ok([8, 9].includes(userVersion));
+  const { DatabaseSync } = await import("node:sqlite");
+  const database = new DatabaseSync(indexFile);
+  try {
+    database.exec(`
+      BEGIN IMMEDIATE;
+      DROP TABLE generation_issue_group;
+      DROP TABLE generation_issue;
+      ALTER TABLE index_generation DROP COLUMN skipped_source_count;
+      ALTER TABLE index_generation DROP COLUMN skipped_source_bytes;
+      ALTER TABLE index_generation DROP COLUMN skipped_thread_count;
+      ALTER TABLE source_cursor DROP COLUMN source_dev;
+      ALTER TABLE source_cursor DROP COLUMN source_ino;
+      ALTER TABLE source_cursor DROP COLUMN source_birthtime_ms;
+      ALTER TABLE source_cursor DROP COLUMN source_ctime_ms;
+      ALTER TABLE source_cursor DROP COLUMN source_identity_token;
+      ALTER TABLE source_cursor DROP COLUMN source_state_token;
+      ALTER TABLE source_cursor DROP COLUMN quarantine_code;
+      ${retainOwner ? "" : "ALTER TABLE source_cursor DROP COLUMN owner_local;"}
+
+      ALTER TABLE source_diagnostic RENAME TO source_diagnostic_current;
+      CREATE TABLE source_diagnostic(
+        generation_id INTEGER NOT NULL REFERENCES index_generation ON DELETE CASCADE,
+        source_local BLOB NOT NULL CHECK(length(source_local) = 32),
+        code TEXT NOT NULL CHECK(code IN (
+          'relevantLines', 'malformedLines', 'malformedTimestamps',
+          'partialLines', 'salvagedRecords', 'turnContexts', 'tokenCounts',
+          'forkReplayEventsSkipped', 'unattributedForkReplayEventsSkipped',
+          'cumulativeCounterRegressions', 'tierEvents', 'modelSeededFromLineage',
+          'tierSeededFromLineage', 'modelMissing', 'oversizedLines',
+          'contradictedLeadingSnapshotsSkipped', 'toolRecords', 'toolEvents',
+          'toolRecordsSkipped', 'toolSourceHistoryUnavailable')),
+        count INTEGER NOT NULL CHECK(count >= 0),
+        PRIMARY KEY(generation_id, source_local, code)) STRICT, WITHOUT ROWID;
+      INSERT INTO source_diagnostic(generation_id, source_local, code, count)
+        SELECT generation_id, source_local, code, count
+        FROM source_diagnostic_current
+        WHERE code NOT IN (
+          'malformedAccountingRecords', 'malformedUsageRecords',
+          'malformedRateLimitRecords');
+      DROP TABLE source_diagnostic_current;
+
+      DELETE FROM meta WHERE key IN (
+        'source_identity_version', 'rollout_quarantine_fingerprint');
+      UPDATE parser_version
+      SET parser_version = CASE
+        WHEN parser_version LIKE '%-partial' THEN 'unified-rollout-typed-v8-partial'
+        ELSE 'unified-rollout-typed-v8'
+      END;
+      PRAGMA user_version=${userVersion};
+      COMMIT;
+    `);
+  } finally {
+    database.close();
+  }
+}
+
+async function regressUnifiedIndexToProductionV8Schema(indexFile) {
+  return regressUnifiedIndexToProductionLegacySchema(indexFile);
+}
+
+async function regressUnifiedIndexToProductionV9Schema(indexFile) {
+  return regressUnifiedIndexToProductionLegacySchema(indexFile, {
+    retainOwner: true,
+    userVersion: 9,
+  });
+}
+
 const SECONDARY_INDEX_NAMES = [
   "usage_event_observed",
   "usage_event_session",
@@ -3163,6 +3242,123 @@ test("v7 diagnostic rows survive the closed-vocabulary v11 migration", async () 
   }
 });
 
+test("a populated production v8 index refreshes into authoritative v11 state", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-production-v8.jsonl": [
+      sessionMeta("55555555-5555-4555-8555-555555555555"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  try {
+    const built = await build(root);
+    assert.equal(built.usageEvents, 1);
+    await regressUnifiedIndexToProductionV8Schema(indexFile);
+
+    const { DatabaseSync } = await import("node:sqlite");
+    const legacy = new DatabaseSync(indexFile, { readOnly: true });
+    try {
+      assert.equal(
+        Number(legacy.prepare("PRAGMA user_version").get().user_version),
+        8,
+      );
+      assert.equal(legacy.prepare(
+        "SELECT value FROM meta WHERE key = 'schema_version'",
+      ).get().value, "local-unified-index-v2");
+      assert.equal(legacy.prepare(
+        "SELECT value FROM meta WHERE key = 'source_identity_version'",
+      ).get(), undefined);
+      assert.equal(Number(legacy.prepare(
+        "SELECT COUNT(*) AS count FROM usage_event",
+      ).get().count), 1);
+      const legacyColumns = new Set(legacy.prepare(
+        "PRAGMA table_info(source_cursor)",
+      ).all().map((column) => column.name));
+      for (const column of [
+        "owner_local",
+        "source_dev",
+        "source_identity_token",
+        "quarantine_code",
+      ]) assert.equal(legacyColumns.has(column), false, column);
+      assert.equal(legacy.prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'generation_issue'",
+      ).get(), undefined);
+      assert.equal(legacy.prepare(
+        "SELECT DISTINCT parser_version FROM parser_version",
+      ).get().parser_version, "unified-rollout-typed-v8");
+    } finally {
+      legacy.close();
+    }
+
+    const healed = await ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    assert.equal(healed.rebuilt, true);
+    assert.equal(healed.rebuildReason, "source_identity_changed");
+    assert.equal(healed.totalUsageEvents, 1);
+    assert.equal(healed.generation.status, "complete");
+    assert.equal(healed.generation.usageProvenanceComplete, true);
+    assert.equal(healed.generation.sourceOrderComplete, true);
+    assert.equal(healed.generation.quotaProvenanceComplete, true);
+    assert.equal(healed.generation.toolProvenanceComplete, true);
+
+    const current = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.equal(
+        Number(current.prepare("PRAGMA user_version").get().user_version),
+        11,
+      );
+      assert.equal(current.prepare(
+        "SELECT value FROM meta WHERE key = 'schema_version'",
+      ).get().value, "local-unified-index-v2");
+      assert.equal(current.prepare(
+        "SELECT value FROM meta WHERE key = 'source_identity_version'",
+      ).get().value, "codex-immutable-rollout-v1");
+      const currentColumns = new Set(current.prepare(
+        "PRAGMA table_info(source_cursor)",
+      ).all().map((column) => column.name));
+      for (const column of [
+        "owner_local",
+        "source_dev",
+        "source_identity_token",
+        "quarantine_code",
+      ]) assert.ok(currentColumns.has(column), column);
+      assert.equal(Number(current.prepare(
+        "SELECT COUNT(*) AS count FROM source_cursor WHERE owner_local IS NOT NULL",
+      ).get().count), 1);
+      assert.deepEqual(current.prepare(`
+        SELECT DISTINCT parser_version FROM parser_version
+        ORDER BY parser_version`).all().map((row) => row.parser_version), [
+        LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+      ]);
+    } finally {
+      current.close();
+    }
+
+    const projection = await readLocalUnifiedCompanionProjection({
+      indexFile,
+      nowMs: Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(projection.status, "available");
+    assert.equal(projection.indexStatus, "complete");
+    assert.equal(projection.usageEvents, 1);
+    assert.equal(projection.generation.status, "complete");
+    assert.equal(projection.generation.usageProvenanceComplete, true);
+    assert.equal(projection.generation.sourceOrderComplete, true);
+    assert.equal(projection.generation.quotaProvenanceComplete, true);
+    assert.equal(projection.toolCoverageStatus, "complete");
+    const all = projection.usage.find((period) => period.id === "all");
+    assert.equal(all.events, 1);
+    assert.equal(all.totalTokens, 110);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 test("a v9 multi-root schema migrates to v11 without losing its owner", async () => {
   const { root } = await corpus({
     "rollout-2026-07-25T00-00-00-v9-owner.jsonl": [
@@ -3175,22 +3371,73 @@ test("a v9 multi-root schema migrates to v11 without losing its owner", async ()
   try {
     await build(root);
     const { DatabaseSync } = await import("node:sqlite");
-    const old = new DatabaseSync(indexFile);
-    const ownerBefore = old.prepare(
+    const before = new DatabaseSync(indexFile, { readOnly: true });
+    const ownerBefore = before.prepare(
       "SELECT hex(owner_local) AS owner FROM source_cursor",
     ).get().owner;
-    old.exec(`
-      ALTER TABLE source_cursor DROP COLUMN source_dev;
-      ALTER TABLE source_cursor DROP COLUMN source_ino;
-      ALTER TABLE source_cursor DROP COLUMN source_birthtime_ms;
-      ALTER TABLE source_cursor DROP COLUMN source_ctime_ms;
-      ALTER TABLE source_cursor DROP COLUMN source_identity_token;
-      ALTER TABLE source_cursor DROP COLUMN source_state_token;
-      ALTER TABLE source_cursor DROP COLUMN quarantine_code;
-      DELETE FROM meta WHERE key = 'source_identity_version';
-      PRAGMA user_version=9;
-    `);
-    old.close();
+    const eventsBefore = Number(before.prepare(
+      "SELECT COUNT(*) AS count FROM usage_event",
+    ).get().count);
+    before.close();
+    await regressUnifiedIndexToProductionV9Schema(indexFile);
+
+    const old = new DatabaseSync(indexFile, { readOnly: true });
+    try {
+      assert.equal(Number(old.prepare(
+        "PRAGMA user_version",
+      ).get().user_version), 9);
+      assert.equal(old.prepare(
+        "SELECT value FROM meta WHERE key = 'schema_version'",
+      ).get().value, "local-unified-index-v2");
+      assert.equal(old.prepare(
+        "SELECT value FROM meta WHERE key = 'source_identity_version'",
+      ).get(), undefined);
+      assert.equal(old.prepare(
+        "SELECT DISTINCT parser_version FROM parser_version",
+      ).get().parser_version, "unified-rollout-typed-v8");
+      const legacyCursorColumns = new Set(old.prepare(
+        "PRAGMA table_info(source_cursor)",
+      ).all().map((column) => column.name));
+      assert.equal(legacyCursorColumns.has("owner_local"), true);
+      for (const column of [
+        "source_dev",
+        "source_ino",
+        "source_birthtime_ms",
+        "source_ctime_ms",
+        "source_identity_token",
+        "source_state_token",
+        "quarantine_code",
+      ]) assert.equal(legacyCursorColumns.has(column), false, column);
+      const legacyGenerationColumns = new Set(old.prepare(
+        "PRAGMA table_info(index_generation)",
+      ).all().map((column) => column.name));
+      for (const column of [
+        "skipped_source_count",
+        "skipped_source_bytes",
+        "skipped_thread_count",
+      ]) assert.equal(legacyGenerationColumns.has(column), false, column);
+      for (const table of ["generation_issue", "generation_issue_group"]) {
+        assert.equal(old.prepare(`
+          SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?
+        `).get(table), undefined, table);
+      }
+      const diagnosticSql = old.prepare(`
+        SELECT sql FROM sqlite_master
+        WHERE type = 'table' AND name = 'source_diagnostic'
+      `).get().sql;
+      assert.match(diagnosticSql, /toolSourceHistoryUnavailable/u);
+      assert.doesNotMatch(diagnosticSql, /malformedAccountingRecords/u);
+      assert.doesNotMatch(diagnosticSql, /malformedUsageRecords/u);
+      assert.doesNotMatch(diagnosticSql, /malformedRateLimitRecords/u);
+      assert.equal(old.prepare(
+        "SELECT hex(owner_local) AS owner FROM source_cursor",
+      ).get().owner, ownerBefore);
+      assert.equal(Number(old.prepare(
+        "SELECT COUNT(*) AS count FROM usage_event",
+      ).get().count), eventsBefore);
+    } finally {
+      old.close();
+    }
 
     const migrated = openLocalUnifiedIndex(indexFile, { readOnly: false });
     try {
@@ -3211,12 +3458,31 @@ test("a v9 multi-root schema migrates to v11 without losing its owner", async ()
         "source_state_token",
         "quarantine_code",
       ]) assert.ok(columns.has(column), `missing migrated ${column}`);
+      const generationColumns = new Set(migrated.prepare(
+        "PRAGMA table_info(index_generation)",
+      ).all().map((column) => column.name));
+      for (const column of [
+        "skipped_source_count",
+        "skipped_source_bytes",
+        "skipped_thread_count",
+      ]) assert.ok(generationColumns.has(column), `missing migrated ${column}`);
+      migrated.prepare("SELECT COUNT(*) AS count FROM generation_issue").get();
+      migrated.prepare(
+        "SELECT COUNT(*) AS count FROM generation_issue_group",
+      ).get();
+      const diagnosticSql = migrated.prepare(`
+        SELECT sql FROM sqlite_master
+        WHERE type = 'table' AND name = 'source_diagnostic'
+      `).get().sql;
+      assert.match(diagnosticSql, /malformedAccountingRecords/u);
+      assert.match(diagnosticSql, /malformedUsageRecords/u);
+      assert.match(diagnosticSql, /malformedRateLimitRecords/u);
       assert.equal(migrated.prepare(
         "SELECT hex(owner_local) AS owner FROM source_cursor",
       ).get().owner, ownerBefore);
       assert.equal(Number(migrated.prepare(
         "SELECT COUNT(*) AS count FROM usage_event",
-      ).get().count), 1);
+      ).get().count), eventsBefore);
     } finally {
       migrated.close();
     }
@@ -4333,6 +4599,7 @@ test("a v9 owner gap blocks the v10 identity rebuild and preserves LKG", async (
     const owner = old.prepare(
       "SELECT hex(owner_local) AS owner FROM source_cursor",
     ).get().owner.toLowerCase();
+    old.close();
     const salt = await readFile(secretFile);
     const ownerFor = (id) => sourceOwnerLocal(
       salt,
@@ -4349,18 +4616,7 @@ test("a v9 owner gap blocks the v10 identity rebuild and preserves LKG", async (
       usage(200, 20),
       usage(100, 10),
     )}\n`);
-    old.exec(`
-      ALTER TABLE source_cursor DROP COLUMN source_dev;
-      ALTER TABLE source_cursor DROP COLUMN source_ino;
-      ALTER TABLE source_cursor DROP COLUMN source_birthtime_ms;
-      ALTER TABLE source_cursor DROP COLUMN source_ctime_ms;
-      ALTER TABLE source_cursor DROP COLUMN source_identity_token;
-      ALTER TABLE source_cursor DROP COLUMN source_state_token;
-      ALTER TABLE source_cursor DROP COLUMN quarantine_code;
-      DELETE FROM meta WHERE key = 'source_identity_version';
-      PRAGMA user_version=9;
-    `);
-    old.close();
+    await regressUnifiedIndexToProductionV9Schema(indexFile);
 
     const before = await stat(indexFile);
     await assert.rejects(
@@ -4385,6 +4641,26 @@ test("a v9 owner gap blocks the v10 identity rebuild and preserves LKG", async (
         Number(preserved.prepare("PRAGMA user_version").get().user_version),
         9,
       );
+      assert.equal(preserved.prepare(
+        "SELECT value FROM meta WHERE key = 'schema_version'",
+      ).get().value, "local-unified-index-v2");
+      assert.equal(preserved.prepare(
+        "SELECT DISTINCT parser_version FROM parser_version",
+      ).get().parser_version, "unified-rollout-typed-v8");
+      assert.equal(preserved.prepare(`
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'table' AND name = 'generation_issue'
+      `).get(), undefined);
+      const generationColumns = new Set(preserved.prepare(
+        "PRAGMA table_info(index_generation)",
+      ).all().map((column) => column.name));
+      assert.equal(generationColumns.has("skipped_source_count"), false);
+      const diagnosticSql = preserved.prepare(`
+        SELECT sql FROM sqlite_master
+        WHERE type = 'table' AND name = 'source_diagnostic'
+      `).get().sql;
+      assert.match(diagnosticSql, /toolSourceHistoryUnavailable/u);
+      assert.doesNotMatch(diagnosticSql, /malformedAccountingRecords/u);
       assert.equal(preserved.prepare(
         "SELECT hex(owner_local) AS owner FROM source_cursor",
       ).get().owner.toLowerCase(), owner);

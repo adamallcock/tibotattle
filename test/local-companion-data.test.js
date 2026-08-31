@@ -2228,6 +2228,8 @@ test("a deferred quick reload keeps the projection surfaces it cannot rebuild", 
       datasets: ["startup", "quick"].includes(purpose)
         ? { weekly_values: [] }
         : { weekly_values: [{ sequence: 1 }] },
+      paceForecast: { marker: `${purpose}-forecast` },
+      paceOutlook: { marker: `${purpose}-outlook` },
     },
     quality: {},
     reports: [],
@@ -2239,6 +2241,12 @@ test("a deferred quick reload keeps the projection surfaces it cannot rebuild", 
   await store.reload({ purpose: "full" });
   assert.equal(store.getGradient().datasets.rolling.length, 2);
   assert.equal(store.getWeekly().datasets.weekly_values.length, 1);
+  assert.deepEqual(store.getWeekly().paceForecast, {
+    marker: "full-forecast",
+  });
+  assert.deepEqual(store.getWeeklyPaceOutlook(), {
+    marker: "full-outlook",
+  });
 
   // The quick pass publishes its fresh overview but must not blank the charts.
   await store.reload({ purpose: "quick" });
@@ -2246,6 +2254,12 @@ test("a deferred quick reload keeps the projection surfaces it cannot rebuild", 
   assert.equal(store.getGradient().datasets.rolling.length, 2);
   assert.equal(store.getGradient().datasets.curve.length, 1);
   assert.equal(store.getWeekly().datasets.weekly_values.length, 1);
+  assert.deepEqual(store.getWeekly().paceForecast, {
+    marker: "quick-forecast",
+  });
+  assert.deepEqual(store.getWeeklyPaceOutlook(), {
+    marker: "quick-outlook",
+  });
 
   // A FULL reload is still authoritative in both directions: a genuine
   // transition to empty must land, or this would pin stale figures forever.
@@ -2259,6 +2273,67 @@ test("a deferred quick reload keeps the projection surfaces it cannot rebuild", 
   await emptying.reload({ purpose: "full" });
   assert.equal(emptying.getGradient().datasets.rolling.length, 0);
   assert.equal(emptying.getWeekly().datasets.weekly_values.length, 0);
+});
+
+test("weekly pace reads re-project the strict forecast at request time", async () => {
+  const nowMs = Date.parse("2026-08-03T12:00:00.000Z");
+  const resetsAt = new Date(nowMs + 100 * 60 * 60_000).toISOString();
+  const forecast = {
+    schemaVersion: "local-weekly-pace-forecast-v0.2",
+    status: "will_reach_reset_first",
+    currentUsedPercent: 50,
+    remainingPercent: 50,
+    resetsAt,
+    pace: {
+      method: "median_adjacent_quota_slope",
+      sampleCount: 2,
+      elapsedHours: 2,
+      movementPp: 0.4,
+      activePercentagePointsPerHour: 0.2,
+      overallPercentagePointsPerHour: 0.2,
+    },
+    observationCount: 3,
+    etaAt: null,
+    hoursToExhaustion: null,
+    hoursToReset: 100,
+  };
+  let builds = 0;
+  const store = new LocalCompanionDataStore({
+    builder: async () => {
+      builds += 1;
+      return {
+        schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+        mode: "real_local_evidence",
+        generatedAt: new Date(nowMs).toISOString(),
+        overview: {},
+        gradient: {},
+        weekly: {
+          datasets: {},
+          paceForecast: forecast,
+          paceOutlook: { marker: "must-not-be-served" },
+        },
+        quality: {},
+        reports: [],
+      };
+    },
+  });
+  await store.reload();
+
+  const initial = store.getWeeklyPaceOutlook({ nowMs });
+  const oneHourLater = store.getWeeklyPaceOutlook({
+    nowMs: nowMs + 60 * 60_000,
+  });
+  assert.equal(builds, 1);
+  assert.equal(initial.status, "available");
+  assert.equal(initial.standing, "under");
+  assert.equal(initial.projection.hoursToReset, 100);
+  assert.equal(oneHourLater.projection.hoursToReset, 99);
+  assert.ok(oneHourLater.projection.sparePercent > initial.projection.sparePercent);
+  assert.deepEqual(
+    store.getWeekly({ nowMs: nowMs + 60 * 60_000 }).paceOutlook,
+    oneHourLater,
+  );
+  assert.doesNotMatch(JSON.stringify(oneHourLater), /marker|account|path/iu);
 });
 
 test("the unified index removes the 31-day ceiling and keeps fork replay out of the headline", async () => {
@@ -3027,7 +3102,12 @@ test("a non-authoritative FULL build keeps the evidence it could not rebuild", a
   // only be true once the generation passed the readiness gate and the cache
   // was rebuilt against exactly that generation.
   const period = (events) => ({ id: "7d", label: "Last 7 days", events });
-  const snapshot = ({ matched, empty, sourceMode = "unified" }) => ({
+  const snapshot = ({
+    matched,
+    empty,
+    sourceMode = "unified",
+    paceMarker = matched ? "authoritative" : "not-ready",
+  }) => ({
     schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
     mode: "real_local_evidence",
     generatedAt: "2026-08-21T14:30:00.000Z",
@@ -3038,7 +3118,11 @@ test("a non-authoritative FULL build keeps the evidence it could not rebuild", a
       timeline: { usage: empty ? [] : [{ at: 1 }, { at: 2 }] },
     },
     gradient: { datasets: empty ? { rolling: [] } : { rolling: [{ at: 1 }] } },
-    weekly: { datasets: empty ? { weekly_values: [] } : { weekly_values: [{ sequence: 1 }] } },
+    weekly: {
+      datasets: empty ? { weekly_values: [] } : { weekly_values: [{ sequence: 1 }] },
+      paceForecast: { marker: `${paceMarker}-forecast` },
+      paceOutlook: { marker: `${paceMarker}-outlook` },
+    },
     quality: {},
     reports: [],
   });
@@ -3051,14 +3135,20 @@ test("a non-authoritative FULL build keeps the evidence it could not rebuild", a
 
   // M2/M3: a not-ready full build must not blank a populated dashboard.
   const notReady = storeWith([
-    { matched: true, empty: false },
-    { matched: false, empty: true },
+    { matched: true, empty: false, paceMarker: "old" },
+    { matched: false, empty: true, paceMarker: "fresh" },
   ]);
   await notReady.reload({ purpose: "full" });
   await notReady.reload({ purpose: "full" });
   assert.equal(notReady.getOverview().timeline.usage.length, 2,
     "a not-ready full build must not blank the timeline");
   assert.equal(notReady.getOverview().usage[0].events, 12);
+  assert.deepEqual(notReady.getWeekly().paceForecast, {
+    marker: "fresh-forecast",
+  });
+  assert.deepEqual(notReady.getWeeklyPaceOutlook(), {
+    marker: "fresh-outlook",
+  });
   // The build's own status fields still publish — staleness stays labeled.
   assert.equal(notReady.getOverview().marker, "not-ready");
 

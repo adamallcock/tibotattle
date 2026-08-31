@@ -3406,67 +3406,6 @@ private struct NativeDashboardChromeMetrics {
     }
 }
 
-/// The product's brand palette as native dynamic colors. Values mirror the
-/// web report's tokens (`--paper: #f5f1e8` and `--green: #174f45` in
-/// apps/web/public/styles.css) so the native chrome and the embedded report
-/// read as one surface. The dark appearance keeps the same family: the
-/// accent is lifted for contrast and the paper wash becomes a deep-green
-/// cast rather than a glaring cream sheet.
-private enum NativeBrandPalette {
-    /// Web accent #174f45 in light appearance and Forest Ink #76aa9c in dark.
-    static let accent = NSColor(name: nil) { appearance in
-        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? NSColor(
-                srgbRed: 118 / 255,
-                green: 170 / 255,
-                blue: 156 / 255,
-                alpha: 1
-            )
-            : NSColor(
-                srgbRed: 23 / 255,
-                green: 79 / 255,
-                blue: 69 / 255,
-                alpha: 1
-            )
-    }
-
-    /// Exact web report paper in each appearance. Painting this behind
-    /// WKWebView prevents a mismatched system-grey flash at launch or reload.
-    static let reportPaper = NSColor(name: nil) { appearance in
-        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? NSColor(
-                srgbRed: 20 / 255,
-                green: 26 / 255,
-                blue: 23 / 255,
-                alpha: 1
-            )
-            : NSColor(
-                srgbRed: 245 / 255,
-                green: 241 / 255,
-                blue: 232 / 255,
-                alpha: 1
-            )
-    }
-
-    /// Web background #f5f1e8, washed over the system sidebar material so
-    /// vibrancy still reads through it.
-    static let sidebarWash = NSColor(name: nil) { appearance in
-        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            ? NSColor(
-                srgbRed: 45 / 255,
-                green: 116 / 255,
-                blue: 102 / 255,
-                alpha: 0.22
-            )
-            : NSColor(
-                srgbRed: 245 / 255,
-                green: 241 / 255,
-                blue: 232 / 255,
-                alpha: 0.55
-            )
-    }
-}
-
 /// Lays the brand's paper wash over the system sidebar material. A layer's
 /// background color does not track appearance changes on its own, so the
 /// wash re-resolves its dynamic color in `updateLayer`, which AppKit calls
@@ -9612,21 +9551,731 @@ private enum NativeAnalysisProgressContractSmokeTest {
     }
 }
 
-/// Exercises the real AppKit status item without starting the local companion
-/// or reading any local evidence. This catches the class of regression where a
-/// custom menu view has no measured frame and leaves an apparently empty menu
-/// header in an installed build.
+/// Exercises the real AppKit status item, popover, and native action menu
+/// without starting the local companion or reading any private evidence.
 @MainActor
 private enum MenuBarContractSmokeTest {
+    private static func iso8601(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [
+            .withInternetDateTime,
+            .withFractionalSeconds,
+        ]
+        return formatter.string(from: date)
+    }
+
+    private static func nullableNumber(_ value: Double?) -> Any {
+        if let value { return NSNumber(value: value) }
+        return NSNull()
+    }
+
+    private static func nullableString(_ value: String?) -> Any {
+        if let value { return value }
+        return NSNull()
+    }
+
+    private static func pricingCoverage(
+        fully: Int = 0,
+        partially: Int = 0,
+        unpriced: Int = 0
+    ) -> [String: Any] {
+        [
+            "fullyPricedEvents": fully,
+            "partiallyPricedEvents": partially,
+            "unpricedEvents": unpriced,
+        ]
+    }
+
+    private static func periodRow(_ identifier: String) -> [String: Any] {
+        [
+            "periodId": identifier,
+            "events": 0,
+            "totalTokens": 0,
+            "apiPriceEquivalentUsd": 0,
+            "pricingCoverage": pricingCoverage(),
+        ]
+    }
+
+    private static func quotaWindow(
+        durationMinutes: Int,
+        slot: String,
+        usedPercent: Double,
+        observedAt: Date,
+        resetAt: Date
+    ) -> [String: Any] {
+        [
+            "limitId": "codex",
+            "slot": slot,
+            "usedPercent": usedPercent,
+            "remainingPercent": 100 - usedPercent,
+            "durationMinutes": durationMinutes,
+            "observedAt": iso8601(observedAt),
+            "resetAt": iso8601(resetAt),
+        ]
+    }
+
+    private static func availablePaceOutlook(
+        now: Date,
+        remainingPercent: Double,
+        resetsAt: Date,
+        headlineRate: Double,
+        activeRate: Double? = nil,
+        observationCount: Int = 8,
+        earlyEstimate: Bool = false
+    ) -> [String: Any] {
+        let hoursToReset = resetsAt.timeIntervalSince(now) / 3_600
+        let sustainableRate = remainingPercent / hoursToReset
+        let ratio = headlineRate / sustainableRate
+        let standing = ratio > 1.15 ? "over" : ratio < 0.85 ? "under" : "on"
+        let coveredHours = min(
+            hoursToReset,
+            remainingPercent / headlineRate
+        )
+        let dryHours = max(0, hoursToReset - coveredHours)
+        let sparePercent = max(
+            0,
+            remainingPercent - headlineRate * hoursToReset
+        )
+        let activeHours = activeRate.map { remainingPercent / $0 }
+        let activeFraction = activeHours.flatMap { hours -> Double? in
+            hours < coveredHours * 0.95
+                ? max(0, min(1, hours / hoursToReset))
+                : nil
+        }
+        return [
+            "schemaVersion": "local-weekly-pace-outlook-v0.1",
+            "status": "available",
+            "standing": standing,
+            "critical": standing == "over" && ratio >= 2,
+            "earlyEstimate": earlyEstimate,
+            "remainingPercent": remainingPercent,
+            "resetsAt": iso8601(resetsAt),
+            "observationCount": observationCount,
+            "elapsedHours": 24.0,
+            "rates": [
+                "activePercentagePointsPerHour": nullableNumber(activeRate),
+                "overallPercentagePointsPerHour": headlineRate,
+                "headlinePercentagePointsPerHour": headlineRate,
+                "sustainablePercentagePointsPerHour": sustainableRate,
+                "ratio": ratio,
+            ],
+            "projection": [
+                "hoursToReset": hoursToReset,
+                "coveredHours": coveredHours,
+                "dryHours": dryHours,
+                "sparePercent": sparePercent,
+                "projectedExhaustionAt": nullableString(
+                    standing == "over"
+                        ? iso8601(
+                            now.addingTimeInterval(coveredHours * 3_600)
+                        )
+                        : nil
+                ),
+            ],
+            "track": [
+                "coveredFraction": coveredHours / hoursToReset,
+                "activeExhaustionFraction": nullableNumber(activeFraction),
+            ],
+        ]
+    }
+
+    private static func collectingPaceOutlook(
+        now: Date,
+        remainingPercent: Double,
+        resetsAt: Date
+    ) -> [String: Any] {
+        let hoursToReset = resetsAt.timeIntervalSince(now) / 3_600
+        return [
+            "schemaVersion": "local-weekly-pace-outlook-v0.1",
+            "status": "collecting",
+            "standing": NSNull(),
+            "critical": false,
+            "earlyEstimate": false,
+            "remainingPercent": remainingPercent,
+            "resetsAt": iso8601(resetsAt),
+            "observationCount": 1,
+            "elapsedHours": 0.0,
+            "rates": [
+                "activePercentagePointsPerHour": NSNull(),
+                "overallPercentagePointsPerHour": NSNull(),
+                "headlinePercentagePointsPerHour": NSNull(),
+                "sustainablePercentagePointsPerHour": NSNull(),
+                "ratio": NSNull(),
+            ],
+            "projection": [
+                "hoursToReset": hoursToReset,
+                "coveredHours": NSNull(),
+                "dryHours": NSNull(),
+                "sparePercent": NSNull(),
+                "projectedExhaustionAt": NSNull(),
+            ],
+            "track": [
+                "coveredFraction": NSNull(),
+                "activeExhaustionFraction": NSNull(),
+            ],
+        ]
+    }
+
+    private static func decodePaceOutlook(
+        _ value: [String: Any]
+    ) -> MenuBarWeeklyPaceOutlook? {
+        guard let data = try? JSONSerialization.data(withJSONObject: [
+            "weekly": ["paceOutlook": value],
+        ]) else {
+            return nil
+        }
+        return MenuBarWeeklyPaceOutlookProjection.decode(data)
+    }
+
+    private static func paceOutlookProjectionContract(
+        now: Date,
+        weeklyLane: ObservedQuotaLane
+    ) -> Bool {
+        guard let resetsAt = weeklyLane.resetAt else { return false }
+        let remaining = weeklyLane.remainingPercent
+        let hoursToReset = resetsAt.timeIntervalSince(now) / 3_600
+        let sustainable = remaining / hoursToReset
+        let collecting = decodePaceOutlook(collectingPaceOutlook(
+            now: now,
+            remainingPercent: remaining,
+            resetsAt: resetsAt
+        ))
+        let under = decodePaceOutlook(availablePaceOutlook(
+            now: now,
+            remainingPercent: remaining,
+            resetsAt: resetsAt,
+            headlineRate: sustainable * 0.7
+        ))
+        let on = decodePaceOutlook(availablePaceOutlook(
+            now: now,
+            remainingPercent: remaining,
+            resetsAt: resetsAt,
+            headlineRate: sustainable
+        ))
+        let over = decodePaceOutlook(availablePaceOutlook(
+            now: now,
+            remainingPercent: remaining,
+            resetsAt: resetsAt,
+            headlineRate: sustainable * 1.5,
+            activeRate: sustainable * 2
+        ))
+        let critical = decodePaceOutlook(availablePaceOutlook(
+            now: now,
+            remainingPercent: remaining,
+            resetsAt: resetsAt,
+            headlineRate: sustainable * 2.2
+        ))
+        var malformed = availablePaceOutlook(
+            now: now,
+            remainingPercent: remaining,
+            resetsAt: resetsAt,
+            headlineRate: sustainable
+        )
+        malformed["account"] = "must-never-cross-this-projection"
+        var zeroActive = availablePaceOutlook(
+            now: now,
+            remainingPercent: remaining,
+            resetsAt: resetsAt,
+            headlineRate: sustainable,
+            activeRate: 0
+        )
+        if var rates = zeroActive["rates"] as? [String: Any] {
+            rates["activePercentagePointsPerHour"] = 0.0
+            zeroActive["rates"] = rates
+        }
+        var mismatchedLane = weeklyLane
+        mismatchedLane = ObservedQuotaLane(
+            label: mismatchedLane.label,
+            remainingPercent: mismatchedLane.remainingPercent - 1,
+            durationMinutes: mismatchedLane.durationMinutes,
+            resetAt: mismatchedLane.resetAt,
+            observedAt: mismatchedLane.observedAt,
+            isPrimary: mismatchedLane.isPrimary
+        )
+        return collecting?.status == .collecting
+            && collecting?.elapsedHours == 0
+            && collecting?.isBound(to: weeklyLane, now: now) == true
+            && under?.standing == .under
+            && on?.standing == .on
+            && over?.standing == .over
+            && over?.critical == false
+            && over?.track.activeExhaustionFraction != nil
+            && critical?.standing == .over
+            && critical?.critical == true
+            && critical?.isBound(to: mismatchedLane, now: now) == false
+            && decodePaceOutlook(malformed) == nil
+            && decodePaceOutlook(zeroActive) == nil
+    }
+
+    private static func timelineBucket(
+        startAt: Date,
+        endAt: Date
+    ) -> [String: Any] {
+        [
+            "startAt": iso8601(startAt),
+            "endAt": iso8601(endAt),
+            "usageEvents": 0,
+            "totalTokens": 0,
+            "apiPriceEquivalentUsd": 0,
+            "pricingCoverage": pricingCoverage(),
+        ]
+    }
+
+    private static func overviewFixture(
+        now: Date,
+        calendar: Calendar,
+        quotaWindows: [[String: Any]]? = nil,
+        accountingSource: String = "legacy",
+        generationMatched: Bool = true,
+        timelineUsage: [[String: Any]] = []
+    ) -> [String: Any] {
+        let observedAt = now.addingTimeInterval(-60)
+        let today = calendar.startOfDay(for: now)
+        let coverageStart = calendar.date(
+            byAdding: .day,
+            value: -29,
+            to: today
+        )!
+        var accounting: [String: Any] = [
+            "sourceMode": accountingSource,
+            "periods": [
+                periodRow("24h"),
+                periodRow("7d"),
+                periodRow("30d"),
+            ],
+        ]
+        if accountingSource == "unified" {
+            accounting["generationMatched"] = generationMatched
+        }
+        return [
+            "status": "live",
+            "evidenceStatus": "available",
+            "freshness": [
+                "status": "live",
+                "staleAfterSeconds": 30 * 60,
+                "accountingStatus": "available",
+            ],
+            "quotaWindows": quotaWindows ?? [
+                quotaWindow(
+                    durationMinutes: CodexQuotaWindowDuration.sevenDayMinutes,
+                    slot: "secondary",
+                    usedPercent: 29,
+                    observedAt: observedAt,
+                    resetAt: observedAt.addingTimeInterval(5 * 24 * 60 * 60)
+                ),
+                quotaWindow(
+                    durationMinutes: CodexQuotaWindowDuration.fiveHourMinutes,
+                    slot: "primary",
+                    usedPercent: 37,
+                    observedAt: observedAt,
+                    resetAt: observedAt.addingTimeInterval(2 * 60 * 60)
+                ),
+                quotaWindow(
+                    durationMinutes: 30 * 24 * 60,
+                    slot: "primary",
+                    usedPercent: 12,
+                    observedAt: observedAt,
+                    resetAt: observedAt.addingTimeInterval(10 * 24 * 60 * 60)
+                ),
+                quotaWindow(
+                    durationMinutes: CodexQuotaWindowDuration.fiveHourMinutes,
+                    slot: "secondary",
+                    usedPercent: 38,
+                    observedAt: observedAt.addingTimeInterval(-60),
+                    resetAt: observedAt.addingTimeInterval(90 * 60)
+                ),
+            ],
+            "accounting": accounting,
+            "timeline": [
+                "source": "replay_safe_cache",
+                "bucketMinutes": 15,
+                "coveredAt": [
+                    "startAt": iso8601(coverageStart),
+                    "endAt": iso8601(now),
+                ],
+                "usage": timelineUsage,
+                "history": ["status": "complete"],
+            ],
+        ]
+    }
+
+    private static func decodeOverview(
+        _ root: [String: Any],
+        now: Date,
+        calendar: Calendar
+    ) -> LocalCompanionOverview? {
+        guard let data = try? JSONSerialization.data(withJSONObject: root) else {
+            return nil
+        }
+        return LocalCompanionOverviewProjection.decode(
+            data,
+            now: now,
+            calendar: calendar
+        )
+    }
+
+    private static func semanticProjectionContract() -> Bool {
+        var calendar = Calendar(identifier: .gregorian)
+        guard let timeZone = TimeZone(identifier: "America/Los_Angeles") else {
+            return false
+        }
+        calendar.timeZone = timeZone
+        let parser = ISO8601DateFormatter()
+        guard let now = parser.date(from: "2026-03-10T19:00:00Z"),
+              let overview = decodeOverview(
+                overviewFixture(now: now, calendar: calendar),
+                now: now,
+                calendar: calendar
+              )
+        else {
+            return false
+        }
+        let laneDurations = overview.lanes.map(\.durationMinutes)
+        let currentDay = overview.history.thirtyDayHistory.last
+        let hasSpringForwardDay = overview.history.thirtyDayHistory.contains {
+            abs($0.endAt.timeIntervalSince($0.startAt) - 23 * 60 * 60) < 0.1
+        }
+        guard laneDurations == [
+                CodexQuotaWindowDuration.sevenDayMinutes,
+                CodexQuotaWindowDuration.fiveHourMinutes,
+              ],
+              overview.lanes.count == 2,
+              LocalCompanionOverviewProjection.evidence(
+                for: overview,
+                now: now
+              ) == .live,
+              overview.history.accountingStatus == .current,
+              overview.history.sevenDayHistory.count == 7,
+              overview.history.thirtyDayHistory.count == 30,
+              currentDay?.evidence == .partial,
+              currentDay?.totalTokens == nil,
+              overview.history.thirtyDayHistory.dropLast().allSatisfy({
+                $0.evidence == .available && $0.totalTokens == 0
+              }),
+              hasSpringForwardDay
+        else {
+            return false
+        }
+
+        let observedAt = now.addingTimeInterval(-60)
+        let staleFiveHourObservation = now.addingTimeInterval(-60 * 60)
+        let mixedAgeWindows = [
+            quotaWindow(
+                durationMinutes: CodexQuotaWindowDuration.sevenDayMinutes,
+                slot: "secondary",
+                usedPercent: 29,
+                observedAt: observedAt,
+                resetAt: observedAt.addingTimeInterval(5 * 24 * 60 * 60)
+            ),
+            quotaWindow(
+                durationMinutes: CodexQuotaWindowDuration.fiveHourMinutes,
+                slot: "primary",
+                usedPercent: 37,
+                observedAt: staleFiveHourObservation,
+                resetAt: staleFiveHourObservation.addingTimeInterval(2 * 60 * 60)
+            ),
+        ]
+        guard let mixedAgeOverview = decodeOverview(
+            overviewFixture(
+                now: now,
+                calendar: calendar,
+                quotaWindows: mixedAgeWindows
+            ),
+            now: now,
+            calendar: calendar
+        ) else { return false }
+        var mixedAgeSnapshot = MenuBarStatusSnapshot()
+        mixedAgeSnapshot.phase = .ready
+        mixedAgeSnapshot.evidence = LocalCompanionOverviewProjection.evidence(
+            for: mixedAgeOverview,
+            now: now
+        )
+        mixedAgeSnapshot.lanes = mixedAgeOverview.lanes
+        mixedAgeSnapshot.observedAt = mixedAgeOverview.observedAt
+        mixedAgeSnapshot.staleAfterSeconds = mixedAgeOverview.staleAfterSeconds
+        guard mixedAgeSnapshot.currentLanes(now: now).map(\.durationMinutes) == [
+            CodexQuotaWindowDuration.sevenDayMinutes,
+        ] else { return false }
+
+        // During the historical secondary -> primary slot transition the
+        // companion can briefly expose both representations. The canonical
+        // JS pace forecast chooses primary, so the overview lane must make the
+        // same choice or exact reset/remaining binding would hide the card.
+        let primaryWeeklyReset = now.addingTimeInterval(4 * 24 * 60 * 60)
+        let dualWeeklyWindows = [
+            quotaWindow(
+                durationMinutes: CodexQuotaWindowDuration.sevenDayMinutes,
+                slot: "secondary",
+                usedPercent: 29,
+                observedAt: observedAt.addingTimeInterval(30),
+                resetAt: now.addingTimeInterval(5 * 24 * 60 * 60)
+            ),
+            quotaWindow(
+                durationMinutes: CodexQuotaWindowDuration.sevenDayMinutes,
+                slot: "primary",
+                usedPercent: 31,
+                observedAt: observedAt,
+                resetAt: primaryWeeklyReset
+            ),
+        ]
+        guard let dualWeeklyOverview = decodeOverview(
+            overviewFixture(
+                now: now,
+                calendar: calendar,
+                quotaWindows: dualWeeklyWindows
+            ),
+            now: now,
+            calendar: calendar
+        ),
+        dualWeeklyOverview.lanes.count == 1,
+        let dualWeeklyLane = dualWeeklyOverview.lanes.first,
+        dualWeeklyLane.remainingPercent == 69,
+        dualWeeklyLane.resetAt == primaryWeeklyReset
+        else { return false }
+        var dualWeeklySnapshot = MenuBarStatusSnapshot()
+        dualWeeklySnapshot.phase = .ready
+        dualWeeklySnapshot.evidence = .live
+        dualWeeklySnapshot.lanes = dualWeeklyOverview.lanes
+        dualWeeklySnapshot.staleAfterSeconds = 30 * 60
+        dualWeeklySnapshot.weeklyPaceOutlook = decodePaceOutlook(
+            availablePaceOutlook(
+                now: now,
+                remainingPercent: 69,
+                resetsAt: primaryWeeklyReset,
+                headlineRate: 1
+            )
+        )
+        guard dualWeeklySnapshot.currentWeeklyPaceOutlook(now: now) != nil
+        else { return false }
+
+        var futureWindows = mixedAgeWindows
+        let futureObservedAt = now.addingTimeInterval(60)
+        futureWindows[0] = quotaWindow(
+            durationMinutes: CodexQuotaWindowDuration.sevenDayMinutes,
+            slot: "secondary",
+            usedPercent: 29,
+            observedAt: futureObservedAt,
+            resetAt: futureObservedAt.addingTimeInterval(24 * 60 * 60)
+        )
+        futureWindows[1] = quotaWindow(
+            durationMinutes: CodexQuotaWindowDuration.fiveHourMinutes,
+            slot: "primary",
+            usedPercent: 37,
+            observedAt: futureObservedAt,
+            resetAt: futureObservedAt.addingTimeInterval(2 * 60 * 60)
+        )
+        guard let futureOverview = decodeOverview(
+            overviewFixture(
+                now: now,
+                calendar: calendar,
+                quotaWindows: futureWindows
+            ),
+            now: now,
+            calendar: calendar
+        ),
+        LocalCompanionOverviewProjection.evidence(
+            for: futureOverview,
+            now: now
+        ) != .live else { return false }
+
+        var invalidComplement = mixedAgeWindows[0]
+        invalidComplement["remainingPercent"] = 72
+        guard let complementOverview = decodeOverview(
+            overviewFixture(
+                now: now,
+                calendar: calendar,
+                quotaWindows: [invalidComplement, mixedAgeWindows[1]]
+            ),
+            now: now,
+            calendar: calendar
+        ),
+        complementOverview.lanes.map(\.durationMinutes) == [
+            CodexQuotaWindowDuration.fiveHourMinutes,
+        ] else { return false }
+
+        guard let unmatchedUnified = decodeOverview(
+            overviewFixture(
+                now: now,
+                calendar: calendar,
+                accountingSource: "unified",
+                generationMatched: false
+            ),
+            now: now,
+            calendar: calendar
+        ),
+        unmatchedUnified.history.accountingStatus == .unavailable,
+        unmatchedUnified.history.lastSevenDays == nil else { return false }
+
+        let bucketStart = calendar.startOfDay(for: now)
+        let bucketEnd = bucketStart.addingTimeInterval(15 * 60)
+        let duplicateBucket = timelineBucket(
+            startAt: bucketStart,
+            endAt: bucketEnd
+        )
+        guard let overlappingTimeline = decodeOverview(
+            overviewFixture(
+                now: now,
+                calendar: calendar,
+                timelineUsage: [duplicateBucket, duplicateBucket]
+            ),
+            now: now,
+            calendar: calendar
+        ),
+        overlappingTimeline.history.accountingStatus == .unavailable,
+        overlappingTimeline.history.lastSevenDays == nil else { return false }
+
+        func historyFailsClosed(_ root: [String: Any]) -> Bool {
+            guard let decoded = decodeOverview(
+                root,
+                now: now,
+                calendar: calendar
+            ) else { return false }
+            return decoded.history.accountingStatus == .unavailable
+                && decoded.history.lastSevenDays == nil
+                && decoded.history.lastThirtyDays == nil
+        }
+        var missingPeriodRoot = overviewFixture(now: now, calendar: calendar)
+        guard var missingPeriodAccounting = missingPeriodRoot["accounting"]
+            as? [String: Any]
+        else { return false }
+        missingPeriodAccounting["periods"] = [
+            periodRow("24h"),
+            periodRow("7d"),
+        ]
+        missingPeriodRoot["accounting"] = missingPeriodAccounting
+
+        var invalidCoverageRoot = overviewFixture(now: now, calendar: calendar)
+        guard var invalidCoverageAccounting = invalidCoverageRoot["accounting"]
+            as? [String: Any]
+        else { return false }
+        var invalidCoveragePeriod = periodRow("7d")
+        invalidCoveragePeriod["events"] = 1
+        invalidCoveragePeriod["totalTokens"] = 1_000
+        invalidCoveragePeriod["apiPriceEquivalentUsd"] = 0.01
+        // The coverage sum deliberately disagrees with the one event.
+        invalidCoveragePeriod["pricingCoverage"] = pricingCoverage()
+        invalidCoverageAccounting["periods"] = [
+            periodRow("24h"),
+            invalidCoveragePeriod,
+            periodRow("30d"),
+        ]
+        invalidCoverageRoot["accounting"] = invalidCoverageAccounting
+
+        func timelineRoot(
+            source: String = "replay_safe_cache",
+            bucketMinutes: Int
+        ) -> [String: Any]? {
+            var root = overviewFixture(now: now, calendar: calendar)
+            guard var timeline = root["timeline"] as? [String: Any] else {
+                return nil
+            }
+            timeline["source"] = source
+            timeline["bucketMinutes"] = bucketMinutes
+            root["timeline"] = timeline
+            return root
+        }
+        guard let zeroBucketRoot = timelineRoot(bucketMinutes: 0),
+              let oversizedBucketRoot = timelineRoot(
+                bucketMinutes: 24 * 60 + 1
+              ),
+              let insufficientEvidenceRoot = timelineRoot(
+                source: "insufficient_evidence",
+                bucketMinutes: 15
+              ),
+              historyFailsClosed(missingPeriodRoot),
+              historyFailsClosed(invalidCoverageRoot),
+              historyFailsClosed(zeroBucketRoot),
+              historyFailsClosed(oversizedBucketRoot),
+              historyFailsClosed(insufficientEvidenceRoot)
+        else { return false }
+
+        let weeklyReset = now.addingTimeInterval(5 * 24 * 60 * 60)
+        let fiveHourReset = now.addingTimeInterval(2 * 60 * 60)
+        let boundaryLanes = [
+            ObservedQuotaLane(
+                label: "weekly",
+                remainingPercent: 70,
+                durationMinutes: CodexQuotaWindowDuration.sevenDayMinutes,
+                resetAt: weeklyReset,
+                observedAt: now,
+                isPrimary: true
+            ),
+            ObservedQuotaLane(
+                label: "five-hour",
+                remainingPercent: 70,
+                durationMinutes: CodexQuotaWindowDuration.fiveHourMinutes,
+                resetAt: fiveHourReset,
+                observedAt: now,
+                isPrimary: false
+            ),
+        ]
+        guard let expiringOutlook = decodePaceOutlook(
+            availablePaceOutlook(
+                now: now,
+                remainingPercent: 70,
+                resetsAt: weeklyReset,
+                headlineRate: 70
+            )
+        ),
+        let projectedExhaustion = expiringOutlook.projection
+            .projectedExhaustionAt,
+        let collectingOutlook = decodePaceOutlook(
+            collectingPaceOutlook(
+                now: now,
+                remainingPercent: 70,
+                resetsAt: weeklyReset
+            )
+        )
+        else { return false }
+        return nextEvidencePresentationBoundary(
+            lanes: boundaryLanes,
+            staleAfterSeconds: 10 * 24 * 60 * 60,
+            now: now
+        ) == fiveHourReset
+            && nextEvidencePresentationBoundary(
+                lanes: boundaryLanes,
+                staleAfterSeconds: 10 * 24 * 60 * 60,
+                weeklyPaceOutlook: expiringOutlook,
+                now: now
+            ) == projectedExhaustion
+            && nextEvidencePresentationBoundary(
+                lanes: [boundaryLanes[0]],
+                staleAfterSeconds: 10 * 24 * 60 * 60,
+                weeklyPaceOutlook: collectingOutlook,
+                now: now
+            ) == weeklyReset
+            && menuBarStatusActivationIntent(
+                eventType: .leftMouseUp,
+                modifierFlags: []
+            ) == .popover
+            && menuBarStatusActivationIntent(
+                eventType: .rightMouseUp,
+                modifierFlags: []
+            ) == .actionMenu
+            && menuBarStatusActivationIntent(
+                eventType: .leftMouseUp,
+                modifierFlags: [.control]
+            ) == .actionMenu
+            && menuBarShouldDismissForEscape(
+                keyCode: 53,
+                isMenuTracking: false,
+                isPopoverShown: true
+            )
+    }
+
     static func run() -> Int32 {
         let application = NSApplication.shared
         application.setActivationPolicy(.accessory)
         let durationSeconds = TimeInterval(
             CodexQuotaWindowDuration.sevenDayMinutes * 60
         )
-        let resetAt = Date(timeIntervalSince1970: 1_800_000_000)
-        let observedAt = resetAt.addingTimeInterval(
-            -durationSeconds * 0.76
+        // The compact title intentionally checks freshness against the real
+        // presentation clock. Anchor this compiled smoke to one captured now
+        // instead of a fixed epoch, while retaining the exact 24%-elapsed
+        // weekly position used by the assertions below.
+        let observedAt = Date()
+        let resetAt = observedAt.addingTimeInterval(
+            durationSeconds * 0.76
         )
         let weeklyLane = ObservedQuotaLane(
             label: TiboTattleLocalization.string(.menuBarSevenDayAllowance),
@@ -9636,12 +10285,98 @@ private enum MenuBarContractSmokeTest {
             observedAt: observedAt,
             isPrimary: true
         )
+        let fiveHourLane = ObservedQuotaLane(
+            label: TiboTattleLocalization.string(.menuBarFiveHourAllowance),
+            remainingPercent: 63,
+            durationMinutes: CodexQuotaWindowDuration.fiveHourMinutes,
+            resetAt: observedAt.addingTimeInterval(2 * 60 * 60),
+            observedAt: observedAt,
+            isPrimary: false
+        )
         let weeklyPosition = weeklyWindowPosition(weeklyLane)
         var liveSnapshot = MenuBarStatusSnapshot()
         liveSnapshot.phase = .ready
         liveSnapshot.evidence = .live
-        liveSnapshot.lanes = [weeklyLane]
+        liveSnapshot.lanes = [weeklyLane, fiveHourLane]
         liveSnapshot.observedAt = observedAt
+        liveSnapshot.staleAfterSeconds = 30 * 60
+        liveSnapshot.analysisAvailable = true
+        liveSnapshot.weeklyPaceOutlook = decodePaceOutlook(
+            availablePaceOutlook(
+                now: observedAt,
+                remainingPercent: weeklyLane.remainingPercent,
+                resetsAt: resetAt,
+                headlineRate: 0.9,
+                activeRate: 1.2
+            )
+        )
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let today = calendar.startOfDay(for: observedAt)
+        let historyDays = (0..<30).compactMap { index -> MenuBarHistoryDay? in
+            guard let startAt = calendar.date(
+                byAdding: .day,
+                value: index - 29,
+                to: today
+            ), let endAt = calendar.date(
+                byAdding: .day,
+                value: 1,
+                to: startAt
+            ) else { return nil }
+            let events = Int64(index + 1)
+            return MenuBarHistoryDay(
+                startAt: startAt,
+                endAt: endAt,
+                evidence: index == 29 ? .partial : .available,
+                usageEvents: events,
+                totalTokens: events * 1_000_000,
+                knownAPIPriceEquivalentUSD: Double(events) * 0.25,
+                pricingCoverage: MenuBarPricingCoverage(
+                    fullyPricedEvents: events,
+                    partiallyPricedEvents: 0,
+                    unpricedEvents: 0
+                )
+            )
+        }
+        let sevenDayPeriod = MenuBarRollingPeriod(
+            window: .lastSevenDays,
+            events: 189,
+            totalTokens: 189_000_000,
+            knownAPIPriceEquivalentUSD: 47.25,
+            pricingCoverage: MenuBarPricingCoverage(
+                fullyPricedEvents: 189,
+                partiallyPricedEvents: 0,
+                unpricedEvents: 0
+            )
+        )
+        liveSnapshot.history = MenuBarHistorySnapshot(
+            accountingStatus: .current,
+            last24Hours: MenuBarRollingPeriod(
+                window: .last24Hours,
+                events: 30,
+                totalTokens: 30_000_000,
+                knownAPIPriceEquivalentUSD: 7.50,
+                pricingCoverage: MenuBarPricingCoverage(
+                    fullyPricedEvents: 30,
+                    partiallyPricedEvents: 0,
+                    unpricedEvents: 0
+                )
+            ),
+            lastSevenDays: sevenDayPeriod,
+            lastThirtyDays: MenuBarRollingPeriod(
+                window: .lastThirtyDays,
+                events: 465,
+                totalTokens: 465_000_000,
+                knownAPIPriceEquivalentUSD: 116.25,
+                pricingCoverage: MenuBarPricingCoverage(
+                    fullyPricedEvents: 465,
+                    partiallyPricedEvents: 0,
+                    unpricedEvents: 0
+                )
+            ),
+            sevenDayHistory: Array(historyDays.suffix(7)),
+            thirtyDayHistory: historyDays
+        )
         let liveSummary = liveSnapshot.laneSummary(
             weeklyLane,
             now: observedAt
@@ -9688,6 +10423,67 @@ private enum MenuBarContractSmokeTest {
         )
         let unavailable = controller.nativePresentationContract()
         controller.shutDown()
+        let popup = MenuBarPopoverViewController(
+            productName: BundledProduct.displayName,
+            brandImage: NSApp.applicationIconImage,
+            actions: MenuBarPopoverViewController.Actions(
+                openTiboTattle: {},
+                refresh: {},
+                showMore: { _ in }
+            )
+        )
+        popup.update(snapshot: liveSnapshot, now: observedAt)
+        let sevenDayPopup = popup.nativePresentationContract()
+        popup.selectHistoryRangeForSmokeTest(.thirtyDays)
+        let thirtyDayPopup = popup.nativePresentationContract()
+        func historyWithSevenDayCoverage(
+            _ coverage: MenuBarPricingCoverage,
+            knownCost: Double
+        ) -> MenuBarHistorySnapshot {
+            MenuBarHistorySnapshot(
+                accountingStatus: .current,
+                last24Hours: liveSnapshot.history.last24Hours,
+                lastSevenDays: MenuBarRollingPeriod(
+                    window: .lastSevenDays,
+                    events: coverage.fullyPricedEvents
+                        + coverage.partiallyPricedEvents
+                        + coverage.unpricedEvents,
+                    totalTokens: 12_000_000,
+                    knownAPIPriceEquivalentUSD: knownCost,
+                    pricingCoverage: coverage
+                ),
+                lastThirtyDays: liveSnapshot.history.lastThirtyDays,
+                sevenDayHistory: liveSnapshot.history.sevenDayHistory,
+                thirtyDayHistory: liveSnapshot.history.thirtyDayHistory
+            )
+        }
+        popup.selectHistoryRangeForSmokeTest(.sevenDays)
+        var partialPricingSnapshot = liveSnapshot
+        partialPricingSnapshot.history = historyWithSevenDayCoverage(
+            MenuBarPricingCoverage(
+                fullyPricedEvents: 4,
+                partiallyPricedEvents: 1,
+                unpricedEvents: 1
+            ),
+            knownCost: 2.50
+        )
+        popup.update(snapshot: partialPricingSnapshot, now: observedAt)
+        let partialPricingPopup = popup.nativePresentationContract()
+        var unpricedSnapshot = liveSnapshot
+        unpricedSnapshot.history = historyWithSevenDayCoverage(
+            MenuBarPricingCoverage(
+                fullyPricedEvents: 0,
+                partiallyPricedEvents: 0,
+                unpricedEvents: 6
+            ),
+            knownCost: 0
+        )
+        popup.update(snapshot: unpricedSnapshot, now: observedAt)
+        let unpricedPopup = popup.nativePresentationContract()
+        var noCompanionSnapshot = MenuBarStatusSnapshot()
+        noCompanionSnapshot.phase = .unavailable
+        popup.update(snapshot: noCompanionSnapshot, now: observedAt)
+        let noCompanionPopup = popup.nativePresentationContract()
         guard starting.informationRowsAreNative,
               starting.informationRowsHaveTitles,
               unavailable.informationRowsAreNative,
@@ -9695,7 +10491,11 @@ private enum MenuBarContractSmokeTest {
               starting.analyzeShortcut == "r",
               starting.settingsShortcut == ",",
               starting.quitShortcut == "q",
-              starting.usesNativeStatusItemMenu,
+              !starting.usesNativeStatusItemMenu,
+              starting.statusItemButtonRoutesClicks,
+              starting.popoverIsTransient,
+              starting.popoverContentWidth == 400,
+              !starting.popoverContainsScrollView,
               starting.escapeDismissalMonitorInstalled,
               starting.sameAppClickAwayMonitorInstalled,
               starting.appDeactivationDismissalObserverInstalled,
@@ -9709,7 +10509,34 @@ private enum MenuBarContractSmokeTest {
               staleSnapshot.title == "–",
               unavailableLiveSnapshot.title == "–",
               liveSummary == expectedLiveSummary,
-              staleSummary == expectedStaleSummary
+              staleSummary == expectedStaleSummary,
+              sevenDayPopup.contentWidth == 400,
+              !sevenDayPopup.containsScrollView,
+              sevenDayPopup.visibleAllowanceLaneCount == 2,
+              sevenDayPopup.weeklyPaceVisible,
+              sevenDayPopup.weeklyPaceState == .over,
+              sevenDayPopup.selectedHistoryRange == .sevenDays,
+              sevenDayPopup.dailyBarCount == 7,
+              sevenDayPopup.historyVisible,
+              thirtyDayPopup.selectedHistoryRange == .thirtyDays,
+              thirtyDayPopup.dailyBarCount == 30,
+              thirtyDayPopup.historyVisible,
+              sevenDayPopup.pricingState == .completeEquivalent,
+              sevenDayPopup.historyCoverageState == .mixed,
+              sevenDayPopup.historyCoverageNamed,
+              sevenDayPopup.refreshActionEnabled,
+              partialPricingPopup.pricingState == .knownSubtotal,
+              partialPricingPopup.partialPricingDisclosed,
+              unpricedPopup.pricingState == .unavailable,
+              unpricedPopup.partialPricingDisclosed,
+              !noCompanionPopup.historyVisible,
+              !noCompanionPopup.weeklyPaceVisible,
+              !noCompanionPopup.refreshActionEnabled,
+              paceOutlookProjectionContract(
+                  now: observedAt,
+                  weeklyLane: weeklyLane
+              ),
+              semanticProjectionContract()
         else {
             FileHandle.standardError.write(
                 Data("macOS menu bar contract smoke failed\\n".utf8)
@@ -9718,11 +10545,333 @@ private enum MenuBarContractSmokeTest {
         }
         print(
             "USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT "
-                + "native_rows=true titles=true states=starting,unavailable "
+                + "popover=true width=400 bars=7,30 pace=canonical-outlook "
+                + "native_actions=true states=live,starting,unavailable "
                 + "shortcuts=cmd-r,cmd-comma,cmd-q "
-                + "dismissal=native,escape,same-app,deactivation "
-                + "weekly_position=fresh-only "
-                + "analysis_title=live-fallback"
+                + "routing=left-popover,right-menu,control-menu "
+                + "dismissal=escape,transient,same-app,deactivation "
+                + "weekly_position=factual-menu-only "
+                + "pace_outlook=collecting,under,on,over,critical,fail-closed "
+                + "history=authoritative,coverage-named,fail-closed "
+                + "pricing=complete,partial,unavailable model=dst,overlap,future,per-lane "
+                + "reset_credits=absent analysis_title=live-fallback"
+        )
+        return 0
+    }
+
+    static func render(outputDirectory: String) -> Int32 {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        let output = URL(fileURLWithPath: outputDirectory, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(
+                at: output,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            return 1
+        }
+
+        let observedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let weeklyReset = observedAt.addingTimeInterval(5.25 * 24 * 60 * 60)
+        var snapshot = MenuBarStatusSnapshot()
+        snapshot.phase = .ready
+        snapshot.evidence = .live
+        snapshot.observedAt = observedAt
+        snapshot.staleAfterSeconds = 30 * 60
+        snapshot.analysisAvailable = true
+        snapshot.lanes = [
+            ObservedQuotaLane(
+                label: TiboTattleLocalization.string(.menuBarSevenDayAllowance),
+                remainingPercent: 62,
+                durationMinutes: CodexQuotaWindowDuration.sevenDayMinutes,
+                resetAt: weeklyReset,
+                observedAt: observedAt,
+                isPrimary: true
+            ),
+            ObservedQuotaLane(
+                label: TiboTattleLocalization.string(.menuBarFiveHourAllowance),
+                remainingPercent: 84,
+                durationMinutes: CodexQuotaWindowDuration.fiveHourMinutes,
+                resetAt: observedAt.addingTimeInterval(2.2 * 60 * 60),
+                observedAt: observedAt,
+                isPrimary: false
+            ),
+        ]
+        snapshot.weeklyPaceOutlook = decodePaceOutlook(
+            availablePaceOutlook(
+                now: observedAt,
+                remainingPercent: 62,
+                resetsAt: weeklyReset,
+                headlineRate: 0.82,
+                activeRate: 1.05
+            )
+        )
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let today = calendar.startOfDay(for: observedAt)
+        let days = (0..<30).compactMap { index -> MenuBarHistoryDay? in
+            guard let startAt = calendar.date(
+                byAdding: .day,
+                value: index - 29,
+                to: today
+            ), let endAt = calendar.date(
+                byAdding: .day,
+                value: 1,
+                to: startAt
+            ) else { return nil }
+            let events = Int64([3, 8, 6, 12, 17, 9, 22][index % 7])
+            let tokens = events * Int64(6_500_000 + index * 125_000)
+            return MenuBarHistoryDay(
+                startAt: startAt,
+                endAt: endAt,
+                evidence: index == 29 ? .partial : .available,
+                usageEvents: events,
+                totalTokens: tokens,
+                knownAPIPriceEquivalentUSD: Double(events) * 0.43,
+                pricingCoverage: MenuBarPricingCoverage(
+                    fullyPricedEvents: events,
+                    partiallyPricedEvents: 0,
+                    unpricedEvents: 0
+                )
+            )
+        }
+        func period(
+            _ window: MenuBarRollingPeriod.Window,
+            events: Int64,
+            tokens: Int64,
+            cost: Double
+        ) -> MenuBarRollingPeriod {
+            MenuBarRollingPeriod(
+                window: window,
+                events: events,
+                totalTokens: tokens,
+                knownAPIPriceEquivalentUSD: cost,
+                pricingCoverage: MenuBarPricingCoverage(
+                    fullyPricedEvents: events,
+                    partiallyPricedEvents: 0,
+                    unpricedEvents: 0
+                )
+            )
+        }
+        snapshot.history = MenuBarHistorySnapshot(
+            accountingStatus: .current,
+            last24Hours: period(
+                .last24Hours,
+                events: 22,
+                tokens: 181_000_000,
+                cost: 9.46
+            ),
+            lastSevenDays: period(
+                .lastSevenDays,
+                events: 96,
+                tokens: 748_000_000,
+                cost: 41.28
+            ),
+            lastThirtyDays: period(
+                .lastThirtyDays,
+                events: 388,
+                tokens: 2_870_000_000,
+                cost: 166.84
+            ),
+            sevenDayHistory: Array(days.suffix(7)),
+            thirtyDayHistory: days
+        )
+
+        let originalLanguage = TiboTattleLocalization.languagePreference
+        defer { TiboTattleLocalization.setLanguagePreference(originalLanguage) }
+        let languages: [(TiboTattleLocalization.LanguagePreference, String)] = [
+            (.english, "en"),
+            (.spanish, "es"),
+            (.simplifiedChinese, "zh-Hans"),
+        ]
+        let appearances: [(NSAppearance.Name, String)] = [
+            (.aqua, "light"),
+            (.darkAqua, "dark"),
+        ]
+        do {
+            for (language, languageName) in languages {
+                TiboTattleLocalization.setLanguagePreference(language)
+                let popup = MenuBarPopoverViewController(
+                    productName: BundledProduct.displayName,
+                    brandImage: NSApp.applicationIconImage,
+                    actions: MenuBarPopoverViewController.Actions(
+                        openTiboTattle: {},
+                        refresh: {},
+                        showMore: { _ in }
+                    )
+                )
+                popup.update(snapshot: snapshot, now: observedAt)
+                popup.refreshLocalization()
+                for (appearance, appearanceName) in appearances {
+                    let destination = output.appendingPathComponent(
+                        "menu-bar-popover-\(languageName)-\(appearanceName).png"
+                    )
+                    try popup.renderPNG(to: destination, appearance: appearance)
+                }
+                if language == .english {
+                    popup.selectHistoryRangeForSmokeTest(.thirtyDays)
+                    for (appearance, appearanceName) in appearances {
+                        let destination = output.appendingPathComponent(
+                            "menu-bar-popover-en-30d-\(appearanceName).png"
+                        )
+                        try popup.renderPNG(
+                            to: destination,
+                            appearance: appearance
+                        )
+                    }
+                }
+            }
+
+            let sustainableRate = 62.0 / (
+                weeklyReset.timeIntervalSince(observedAt) / 3_600
+            )
+            let paceStateFixtures: [([String: Any], String)] = [
+                (
+                    collectingPaceOutlook(
+                        now: observedAt,
+                        remainingPercent: 62,
+                        resetsAt: weeklyReset
+                    ),
+                    "collecting"
+                ),
+                (
+                    availablePaceOutlook(
+                        now: observedAt,
+                        remainingPercent: 62,
+                        resetsAt: weeklyReset,
+                        headlineRate: sustainableRate * 0.7
+                    ),
+                    "under"
+                ),
+                (
+                    availablePaceOutlook(
+                        now: observedAt,
+                        remainingPercent: 62,
+                        resetsAt: weeklyReset,
+                        headlineRate: sustainableRate
+                    ),
+                    "on"
+                ),
+                (
+                    availablePaceOutlook(
+                        now: observedAt,
+                        remainingPercent: 62,
+                        resetsAt: weeklyReset,
+                        headlineRate: sustainableRate * 2.2
+                    ),
+                    "critical"
+                ),
+            ]
+            TiboTattleLocalization.setLanguagePreference(.english)
+            for (paceValue, paceName) in paceStateFixtures {
+                guard let paceOutlook = decodePaceOutlook(paceValue) else {
+                    return 1
+                }
+                var paceSnapshot = snapshot
+                paceSnapshot.weeklyPaceOutlook = paceOutlook
+                let popup = MenuBarPopoverViewController(
+                    productName: BundledProduct.displayName,
+                    brandImage: NSApp.applicationIconImage,
+                    actions: MenuBarPopoverViewController.Actions(
+                        openTiboTattle: {},
+                        refresh: {},
+                        showMore: { _ in }
+                    )
+                )
+                popup.update(snapshot: paceSnapshot, now: observedAt)
+                popup.refreshLocalization()
+                try popup.renderPNG(
+                    to: output.appendingPathComponent(
+                        "menu-bar-popover-en-pace-\(paceName)-light.png"
+                    ),
+                    appearance: .aqua
+                )
+            }
+
+            func historyWithPricingCoverage(
+                _ coverage: MenuBarPricingCoverage,
+                knownCost: Double
+            ) -> MenuBarHistorySnapshot {
+                MenuBarHistorySnapshot(
+                    accountingStatus: .current,
+                    last24Hours: snapshot.history.last24Hours,
+                    lastSevenDays: MenuBarRollingPeriod(
+                        window: .lastSevenDays,
+                        events: coverage.fullyPricedEvents
+                            + coverage.partiallyPricedEvents
+                            + coverage.unpricedEvents,
+                        totalTokens: 748_000_000,
+                        knownAPIPriceEquivalentUSD: knownCost,
+                        pricingCoverage: coverage
+                    ),
+                    lastThirtyDays: snapshot.history.lastThirtyDays,
+                    sevenDayHistory: snapshot.history.sevenDayHistory,
+                    thirtyDayHistory: snapshot.history.thirtyDayHistory
+                )
+            }
+            func renderSpanishState(
+                _ stateSnapshot: MenuBarStatusSnapshot,
+                name: String
+            ) throws {
+                TiboTattleLocalization.setLanguagePreference(.spanish)
+                let popup = MenuBarPopoverViewController(
+                    productName: BundledProduct.displayName,
+                    brandImage: NSApp.applicationIconImage,
+                    actions: MenuBarPopoverViewController.Actions(
+                        openTiboTattle: {},
+                        refresh: {},
+                        showMore: { _ in }
+                    )
+                )
+                popup.update(snapshot: stateSnapshot, now: observedAt)
+                popup.refreshLocalization()
+                try popup.renderPNG(
+                    to: output.appendingPathComponent(
+                        "menu-bar-popover-es-\(name)-light.png"
+                    ),
+                    appearance: .aqua
+                )
+            }
+            var partialPricingSnapshot = snapshot
+            partialPricingSnapshot.history = historyWithPricingCoverage(
+                MenuBarPricingCoverage(
+                    fullyPricedEvents: 82,
+                    partiallyPricedEvents: 8,
+                    unpricedEvents: 6
+                ),
+                knownCost: 34.10
+            )
+            try renderSpanishState(
+                partialPricingSnapshot,
+                name: "partial-pricing"
+            )
+            var unpricedSnapshot = snapshot
+            unpricedSnapshot.history = historyWithPricingCoverage(
+                MenuBarPricingCoverage(
+                    fullyPricedEvents: 0,
+                    partiallyPricedEvents: 0,
+                    unpricedEvents: 96
+                ),
+                knownCost: 0
+            )
+            try renderSpanishState(unpricedSnapshot, name: "unpriced")
+            var unavailableSnapshot = MenuBarStatusSnapshot()
+            unavailableSnapshot.phase = .unavailable
+            try renderSpanishState(unavailableSnapshot, name: "unavailable")
+        } catch {
+            FileHandle.standardError.write(
+                Data("macOS menu bar popover render smoke failed\n".utf8)
+            )
+            return 1
+        }
+        print(
+            "USAGE_MONITOR_MACOS_MENU_BAR_POPOVER_RENDER "
+                + "locales=en,es,zh-Hans appearances=light,dark "
+                + "ranges=7d,30d "
+                + "states=live,pace-collecting,pace-under,pace-on,"
+                + "pace-over,pace-critical,partial-pricing,unpriced,unavailable "
+                + "width=400 source=synthetic-content-free"
         )
         return 0
     }
@@ -11181,6 +12330,16 @@ private struct UsageMonitorMain {
         if arguments.contains("--menu-bar-contract-smoke-test") {
             exit(MainActor.assumeIsolated {
                 MenuBarContractSmokeTest.run()
+            })
+        }
+        if let renderIndex = arguments.firstIndex(
+            of: "--menu-bar-popover-render-smoke-test"
+        ) {
+            guard renderIndex + 1 < arguments.count else { exit(2) }
+            exit(MainActor.assumeIsolated {
+                MenuBarContractSmokeTest.render(
+                    outputDirectory: arguments[renderIndex + 1]
+                )
             })
         }
         if arguments.contains("--quota-notification-contract-smoke-test") {

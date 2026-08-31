@@ -79,7 +79,12 @@ function waitForReady(child, output, timeoutMs = 30_000) {
     child.stdout.on("data", inspect);
     child.once("exit", (code, signal) => {
       clearTimeout(timeout);
-      rejectReady(new Error(`portable companion exited before ready (${code ?? signal})`));
+      const details = `${output.stderr}\n${output.stdout}`.trim().slice(-4_000);
+      rejectReady(new Error(
+        `portable companion exited before ready (${code ?? signal})${
+          details.length > 0 ? `\n${details}` : ""
+        }`,
+      ));
     });
     inspect();
   });
@@ -122,7 +127,9 @@ async function runPortableRefresh(origin, timeoutMs = 120_000) {
       Origin: origin,
       "X-Usage-Monitor-Local": "1",
     },
-    body: "{}",
+    // Match the native launch-refresh request byte for byte so this process
+    // regression covers the same authorized mutation contract as the app.
+    body: '{"reason":"user_request"}',
   });
   assert.equal(started.status, 202);
   let payload = await started.json();
@@ -222,7 +229,10 @@ async function pluralFixture() {
       {
         timestamp,
         type: "turn_context",
-        payload: { model: "gpt-5.6-sol" },
+        payload: {
+          model: "gpt-5.6-sol",
+          unindexedPrivateCanary: PRIVATE_CANARY,
+        },
       },
       {
         timestamp,
@@ -244,6 +254,127 @@ async function pluralFixture() {
     );
   }
   return { root, profile, localAppData, stateRoot, codexHomes };
+}
+
+async function downgradeUnifiedIndexToFeatureV9(indexFile) {
+  const { DatabaseSync } = await import("node:sqlite");
+  const database = new DatabaseSync(indexFile);
+  try {
+    const owners = database.prepare(`
+      SELECT hex(owner_local) AS owner FROM source_cursor
+      ORDER BY owner`).all().map((row) => row.owner);
+    const usageEvents = Number(database.prepare(
+      "SELECT COUNT(*) AS count FROM usage_event",
+    ).get().count);
+    assert.equal(owners.length, 2);
+    assert.ok(owners.every((owner) => owner.length === 64));
+    assert.equal(usageEvents, 2);
+
+    database.exec(`
+      BEGIN IMMEDIATE;
+      DROP TABLE generation_issue_group;
+      DROP TABLE generation_issue;
+      ALTER TABLE index_generation DROP COLUMN skipped_source_count;
+      ALTER TABLE index_generation DROP COLUMN skipped_source_bytes;
+      ALTER TABLE index_generation DROP COLUMN skipped_thread_count;
+      ALTER TABLE source_cursor DROP COLUMN source_dev;
+      ALTER TABLE source_cursor DROP COLUMN source_ino;
+      ALTER TABLE source_cursor DROP COLUMN source_birthtime_ms;
+      ALTER TABLE source_cursor DROP COLUMN source_ctime_ms;
+      ALTER TABLE source_cursor DROP COLUMN source_identity_token;
+      ALTER TABLE source_cursor DROP COLUMN source_state_token;
+      ALTER TABLE source_cursor DROP COLUMN quarantine_code;
+
+      ALTER TABLE source_diagnostic RENAME TO source_diagnostic_current;
+      CREATE TABLE source_diagnostic(
+        generation_id INTEGER NOT NULL REFERENCES index_generation ON DELETE CASCADE,
+        source_local BLOB NOT NULL CHECK(length(source_local) = 32),
+        code TEXT NOT NULL CHECK(code IN (
+          'relevantLines', 'malformedLines', 'malformedTimestamps',
+          'partialLines', 'salvagedRecords', 'turnContexts', 'tokenCounts',
+          'forkReplayEventsSkipped', 'unattributedForkReplayEventsSkipped',
+          'cumulativeCounterRegressions', 'tierEvents', 'modelSeededFromLineage',
+          'tierSeededFromLineage', 'modelMissing', 'oversizedLines',
+          'contradictedLeadingSnapshotsSkipped', 'toolRecords', 'toolEvents',
+          'toolRecordsSkipped', 'toolSourceHistoryUnavailable')),
+        count INTEGER NOT NULL CHECK(count >= 0),
+        PRIMARY KEY(generation_id, source_local, code)) STRICT, WITHOUT ROWID;
+      INSERT INTO source_diagnostic(generation_id, source_local, code, count)
+        SELECT generation_id, source_local, code, count
+        FROM source_diagnostic_current
+        WHERE code NOT IN (
+          'malformedAccountingRecords', 'malformedUsageRecords',
+          'malformedRateLimitRecords');
+      DROP TABLE source_diagnostic_current;
+
+      DELETE FROM meta WHERE key IN (
+        'source_identity_version', 'rollout_quarantine_fingerprint');
+      UPDATE parser_version
+      SET parser_version = CASE
+        WHEN parser_version LIKE '%-partial' THEN 'unified-rollout-typed-v8-partial'
+        ELSE 'unified-rollout-typed-v8'
+      END;
+      PRAGMA user_version=9;
+      COMMIT;
+    `);
+
+    assert.equal(
+      Number(database.prepare("PRAGMA user_version").get().user_version),
+      9,
+    );
+    assert.equal(database.prepare(
+      "SELECT value FROM meta WHERE key = 'source_identity_version'",
+    ).get(), undefined);
+    assert.equal(database.prepare(
+      "SELECT value FROM meta WHERE key = 'schema_version'",
+    ).get().value, "local-unified-index-v2");
+    assert.equal(database.prepare(
+      "SELECT DISTINCT parser_version FROM parser_version",
+    ).get().parser_version, "unified-rollout-typed-v8");
+    const columns = new Set(database.prepare(
+      "PRAGMA table_info(source_cursor)",
+    ).all().map((column) => column.name));
+    assert.equal(columns.has("owner_local"), true);
+    for (const column of [
+      "source_dev",
+      "source_ino",
+      "source_birthtime_ms",
+      "source_ctime_ms",
+      "source_identity_token",
+      "source_state_token",
+      "quarantine_code",
+    ]) assert.equal(columns.has(column), false, column);
+    const generationColumns = new Set(database.prepare(
+      "PRAGMA table_info(index_generation)",
+    ).all().map((column) => column.name));
+    for (const column of [
+      "skipped_source_count",
+      "skipped_source_bytes",
+      "skipped_thread_count",
+    ]) assert.equal(generationColumns.has(column), false, column);
+    for (const table of ["generation_issue", "generation_issue_group"]) {
+      assert.equal(database.prepare(`
+        SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?
+      `).get(table), undefined, table);
+    }
+    const diagnosticSql = database.prepare(`
+      SELECT sql FROM sqlite_master
+      WHERE type = 'table' AND name = 'source_diagnostic'
+    `).get().sql;
+    assert.match(diagnosticSql, /toolSourceHistoryUnavailable/u);
+    assert.doesNotMatch(diagnosticSql, /malformedAccountingRecords/u);
+    assert.doesNotMatch(diagnosticSql, /malformedUsageRecords/u);
+    assert.doesNotMatch(diagnosticSql, /malformedRateLimitRecords/u);
+    assert.deepEqual(database.prepare(`
+      SELECT hex(owner_local) AS owner FROM source_cursor
+      ORDER BY owner`).all().map((row) => row.owner), owners);
+    assert.equal(Number(database.prepare(
+      "SELECT COUNT(*) AS count FROM usage_event",
+    ).get().count), usageEvents);
+    return { owners, usageEvents };
+  } finally {
+    database.close();
+  }
 }
 
 test("local companion runs as a private synthetic child process and shuts down", async () => {
@@ -275,6 +406,10 @@ test("local companion runs as a private synthetic child process and shuts down",
     const health = await fetch(`${origin}/api/local/health`).then((response) => response.json());
     const onboarding = await fetch(`${origin}/api/local/onboarding`).then((response) => response.json());
     const overview = await waitForOverview(origin);
+    const paceResponse = await fetch(
+      `${origin}/api/local/weekly-pace-outlook`,
+    );
+    const pace = await paceResponse.json();
     const refresh = await fetch(`${origin}/api/local/refresh`).then((response) => response.json());
     const page = await fetch(`${origin}/`);
     assert.equal(page.status, 200);
@@ -284,8 +419,18 @@ test("local companion runs as a private synthetic child process and shuts down",
     assert.equal(onboarding.status, "ready");
     assert.equal(onboarding.capabilities.customCodexHomeConfigured, true);
     assert.equal(overview.mode, "real_local_evidence");
+    assert.equal(paceResponse.status, 200);
+    assert.deepEqual(Object.keys(pace).sort(), ["schemaVersion", "weekly"]);
+    assert.deepEqual(Object.keys(pace.weekly), ["paceOutlook"]);
+    assert.ok(JSON.stringify(pace).length < 64 * 1_024);
     assert.equal(typeof refresh.refresh?.status, "string");
-    const publicEvidence = JSON.stringify({ health, onboarding, overview, refresh });
+    const publicEvidence = JSON.stringify({
+      health,
+      onboarding,
+      overview,
+      pace,
+      refresh,
+    });
     assert.equal(publicEvidence.includes(PRIVATE_CANARY), false);
     assert.equal(publicEvidence.includes(files.root), false);
   } finally {
@@ -307,6 +452,164 @@ test("local companion runs as a private synthetic child process and shuts down",
       });
     }
     assert.equal(`${output.stdout}\n${output.stderr}`.includes(PRIVATE_CANARY), false);
+    await rm(files.root, { recursive: true, force: true });
+  }
+});
+
+test("portable refresh recovers a populated feature-v9 index after restart", async () => {
+  const files = await pluralFixture();
+  const [primaryCodexHome] = files.codexHomes;
+  const indexFile = join(files.stateRoot, "local-unified-index-v1.sqlite");
+  let active = null;
+  try {
+    active = startPortableCompanion(
+      files,
+      files.codexHomes,
+      primaryCodexHome,
+    );
+    const initialOrigin = await waitForReady(active.child, active.output);
+    const initialRefresh = await runPortableRefresh(initialOrigin);
+    assert.equal(initialRefresh.status, "succeeded");
+    const initialOverview = await waitForOverview(initialOrigin, 120_000);
+    const initialAll = initialOverview.usage.find(({ id }) => id === "all");
+    assert.equal(initialOverview.accounting.sourceMode, "unified");
+    assert.equal(initialOverview.accounting.generationMatched, true);
+    assert.equal(initialAll.events, 2);
+    assert.equal(initialAll.totalTokens, 350);
+    await stopPortableCompanion(active.child);
+    active = null;
+
+    const legacy = await downgradeUnifiedIndexToFeatureV9(indexFile);
+    active = startPortableCompanion(
+      files,
+      files.codexHomes,
+      primaryCodexHome,
+    );
+    const recoveredOrigin = await waitForReady(active.child, active.output);
+
+    // Starting the process is read-only with respect to this migration. The
+    // authorized refresh below owns the staged rebuild and publication.
+    {
+      const { DatabaseSync } = await import("node:sqlite");
+      const beforeRefresh = new DatabaseSync(indexFile, { readOnly: true });
+      try {
+        assert.equal(
+          Number(beforeRefresh.prepare("PRAGMA user_version").get().user_version),
+          9,
+        );
+        assert.equal(Number(beforeRefresh.prepare(
+          "SELECT COUNT(*) AS count FROM usage_event",
+        ).get().count), legacy.usageEvents);
+      } finally {
+        beforeRefresh.close();
+      }
+    }
+
+    const recoveredRefresh = await runPortableRefresh(recoveredOrigin);
+    assert.equal(recoveredRefresh.status, "succeeded");
+    assert.equal(recoveredRefresh.result.unifiedIndex.unchanged, false);
+    assert.equal(
+      recoveredRefresh.result.unifiedIndex.sourcesRescanned,
+      legacy.owners.length,
+    );
+    assert.equal(
+      recoveredRefresh.result.unifiedIndex.insertedUsageEvents,
+      legacy.usageEvents,
+    );
+    assert.equal(
+      recoveredRefresh.result.unifiedIndex.totalUsageEvents,
+      legacy.usageEvents,
+    );
+    assert.equal(
+      recoveredRefresh.result.unifiedIndex.generation.status,
+      "complete",
+    );
+
+    const recoveredOverview = await waitForOverview(recoveredOrigin, 120_000);
+    const recoveredAll = recoveredOverview.usage.find(({ id }) => id === "all");
+    assert.equal(recoveredOverview.accounting.sourceMode, "unified");
+    assert.equal(recoveredOverview.accounting.generationMatched, true);
+    assert.equal(recoveredOverview.accounting.historyCoverage.status, "complete");
+    assert.equal(
+      recoveredOverview.accounting.historyCoverage.sourceMode,
+      "unified",
+    );
+    assert.equal(recoveredAll.events, 2);
+    assert.equal(recoveredAll.totalTokens, 350);
+
+    {
+      const { DatabaseSync } = await import("node:sqlite");
+      const current = new DatabaseSync(indexFile, { readOnly: true });
+      try {
+        assert.equal(
+          Number(current.prepare("PRAGMA user_version").get().user_version),
+          11,
+        );
+        assert.equal(current.prepare(
+          "SELECT value FROM meta WHERE key = 'source_identity_version'",
+        ).get().value, "codex-immutable-rollout-v1");
+        const columns = new Set(current.prepare(
+          "PRAGMA table_info(source_cursor)",
+        ).all().map((column) => column.name));
+        for (const column of [
+          "owner_local",
+          "source_dev",
+          "source_ino",
+          "source_birthtime_ms",
+          "source_ctime_ms",
+          "source_identity_token",
+          "source_state_token",
+          "quarantine_code",
+        ]) assert.ok(columns.has(column), column);
+        const generationColumns = new Set(current.prepare(
+          "PRAGMA table_info(index_generation)",
+        ).all().map((column) => column.name));
+        for (const column of [
+          "skipped_source_count",
+          "skipped_source_bytes",
+          "skipped_thread_count",
+        ]) assert.ok(generationColumns.has(column), column);
+        current.prepare(
+          "SELECT COUNT(*) AS count FROM generation_issue",
+        ).get();
+        current.prepare(
+          "SELECT COUNT(*) AS count FROM generation_issue_group",
+        ).get();
+        const diagnosticSql = current.prepare(`
+          SELECT sql FROM sqlite_master
+          WHERE type = 'table' AND name = 'source_diagnostic'
+        `).get().sql;
+        assert.match(diagnosticSql, /malformedAccountingRecords/u);
+        assert.match(diagnosticSql, /malformedUsageRecords/u);
+        assert.match(diagnosticSql, /malformedRateLimitRecords/u);
+        assert.equal(current.prepare(
+          "SELECT DISTINCT parser_version FROM parser_version",
+        ).get().parser_version, "unified-rollout-typed-v10");
+        assert.deepEqual(current.prepare(`
+          SELECT hex(owner_local) AS owner FROM source_cursor
+          ORDER BY owner`).all().map((row) => row.owner), legacy.owners);
+        assert.equal(Number(current.prepare(
+          "SELECT COUNT(*) AS count FROM usage_event",
+        ).get().count), legacy.usageEvents);
+      } finally {
+        current.close();
+      }
+    }
+
+    const publicEvidence = JSON.stringify({
+      refresh: recoveredRefresh,
+      overview: recoveredOverview,
+    });
+    assert.equal(publicEvidence.includes(PRIVATE_CANARY), false);
+    for (const path of [files.root, files.stateRoot, ...files.codexHomes]) {
+      assert.equal(publicEvidence.includes(path), false);
+    }
+    assert.equal(
+      `${active.output.stdout}\n${active.output.stderr}`.includes(PRIVATE_CANARY),
+      false,
+    );
+  } finally {
+    if (active) await stopPortableCompanion(active.child).catch(() => {});
     await rm(files.root, { recursive: true, force: true });
   }
 });

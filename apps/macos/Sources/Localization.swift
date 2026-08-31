@@ -255,6 +255,71 @@ enum TiboTattleLocalization {
         case menuBarVerifiedAllowanceMany = "menuBar.verifiedAllowanceMany"
         case menuBarVerifiedAllowanceOne = "menuBar.verifiedAllowanceOne"
         case menuBarWaitingToAnalyze = "menuBar.waitingToAnalyze"
+        case menuBarPopupHeaderLive = "menuBarPopup.headerLive"
+        case menuBarPopupHeaderLiveUpdated = "menuBarPopup.headerLiveUpdated"
+        case menuBarPopupHeaderUpdating = "menuBarPopup.headerUpdating"
+        case menuBarPopupRemaining = "menuBarPopup.remaining"
+        case menuBarPopupResets = "menuBarPopup.resets"
+        case menuBarPopupResetUnavailable = "menuBarPopup.resetUnavailable"
+        case menuBarPopupWeeklyPosition = "menuBarPopup.weeklyPosition"
+        case menuBarPopupPositionElapsed = "menuBarPopup.positionElapsed"
+        case menuBarPopupPositionUsed = "menuBarPopup.positionUsed"
+        case menuBarPopupPositionBelow = "menuBarPopup.positionBelow"
+        case menuBarPopupPositionOn = "menuBarPopup.positionOn"
+        case menuBarPopupPositionAbove = "menuBarPopup.positionAbove"
+        case menuBarPopupPositionSummary = "menuBarPopup.positionSummary"
+        case menuBarPopupPositionDisclaimer = "menuBarPopup.positionDisclaimer"
+        case menuBarPopupWeeklyPace = "menuBarPopup.weeklyPace"
+        case menuBarPopupPaceCollecting = "menuBarPopup.paceCollecting"
+        case menuBarPopupPaceUnder = "menuBarPopup.paceUnder"
+        case menuBarPopupPaceOn = "menuBarPopup.paceOn"
+        case menuBarPopupPaceOver = "menuBarPopup.paceOver"
+        case menuBarPopupPaceCritical = "menuBarPopup.paceCritical"
+        case menuBarPopupPaceCollectingDetail = "menuBarPopup.paceCollectingDetail"
+        case menuBarPopupPaceRatioOutcome = "menuBarPopup.paceRatioOutcome"
+        case menuBarPopupPaceDryBeforeReset = "menuBarPopup.paceDryBeforeReset"
+        case menuBarPopupPaceSpareAtReset = "menuBarPopup.paceSpareAtReset"
+        case menuBarPopupPaceReachesReset = "menuBarPopup.paceReachesReset"
+        case menuBarPopupPaceNow = "menuBarPopup.paceNow"
+        case menuBarPopupPaceResetIn = "menuBarPopup.paceResetIn"
+        case menuBarPopupPaceEvidenceOne = "menuBarPopup.paceEvidenceOne"
+        case menuBarPopupPaceEvidenceMany = "menuBarPopup.paceEvidenceMany"
+        case menuBarPopupPaceEarlyEstimate = "menuBarPopup.paceEarlyEstimate"
+        case menuBarPopupPaceActiveMarker = "menuBarPopup.paceActiveMarker"
+        case menuBarPopupLocalUsage = "menuBarPopup.localUsage"
+        case menuBarPopupPeriodLastSevenDays = "menuBarPopup.periodLastSevenDays"
+        case menuBarPopupPeriodLastThirtyDays = "menuBarPopup.periodLastThirtyDays"
+        case menuBarPopupTokenCount = "menuBarPopup.tokenCount"
+        case menuBarPopupUsageChangeOne = "menuBarPopup.usageChangeOne"
+        case menuBarPopupUsageChangesMany = "menuBarPopup.usageChangesMany"
+        case menuBarPopupUsageSummary = "menuBarPopup.usageSummary"
+        case menuBarPopupAPIPriceEquivalent = "menuBarPopup.apiPriceEquivalent"
+        case menuBarPopupAPIPriceEquivalentPartial = "menuBarPopup.apiPriceEquivalentPartial"
+        case menuBarPopupPartialPricing = "menuBarPopup.partialPricing"
+        case menuBarPopupAPIPriceEquivalentUnavailable = "menuBarPopup.apiPriceEquivalentUnavailable"
+        case menuBarPopupAPIPriceEquivalentRecalculating = "menuBarPopup.apiPriceEquivalentRecalculating"
+        case menuBarPopupPartialPricingDetail = "menuBarPopup.partialPricingDetail"
+        case menuBarPopupPartialPricingCaption = "menuBarPopup.partialPricingCaption"
+        case menuBarPopupCoverageMixed = "menuBarPopup.coverageMixed"
+        case menuBarPopupCoverageAccessible = "menuBarPopup.coverageAccessible"
+        case menuBarPopupNotSubscriptionBill = "menuBarPopup.notSubscriptionBill"
+        case menuBarPopupAccountingUnavailableTitle = "menuBarPopup.accountingUnavailableTitle"
+        case menuBarPopupAccountingUnavailableBody = "menuBarPopup.accountingUnavailableBody"
+        case menuBarPopupNoUsageObserved = "menuBarPopup.noUsageObserved"
+        case menuBarPopupStartingTitle = "menuBarPopup.startingTitle"
+        case menuBarPopupStartingBody = "menuBarPopup.startingBody"
+        case menuBarPopupUpdatingTitle = "menuBarPopup.updatingTitle"
+        case menuBarPopupUpdatingBody = "menuBarPopup.updatingBody"
+        case menuBarPopupStaleTitle = "menuBarPopup.staleTitle"
+        case menuBarPopupStaleBody = "menuBarPopup.staleBody"
+        case menuBarPopupErrorTitle = "menuBarPopup.errorTitle"
+        case menuBarPopupErrorBody = "menuBarPopup.errorBody"
+        case menuBarPopupOpenProduct = "menuBarPopup.openProduct"
+        case menuBarPopupRefresh = "menuBarPopup.refresh"
+        case menuBarPopupMore = "menuBarPopup.more"
+        case menuBarPopupAccessibilityOpenProduct = "menuBarPopup.accessibilityOpenProduct"
+        case menuBarPopupAccessibilityRefresh = "menuBarPopup.accessibilityRefresh"
+        case menuBarPopupAccessibilityMore = "menuBarPopup.accessibilityMore"
         case menuQuitProduct = "menu.quitProduct"
         case menuSelectAll = "menu.selectAll"
         case menuSettings = "menu.settings"
@@ -755,6 +820,136 @@ enum TiboTattleLocalization {
                 "1 verified Codex allowance"
             case .menuBarWaitingToAnalyze:
                 "Waiting to Analyze Local Usage"
+            case .menuBarPopupHeaderLive:
+                "Live"
+            case .menuBarPopupHeaderLiveUpdated:
+                "Live · updated %@"
+            case .menuBarPopupHeaderUpdating:
+                "Updating…"
+            case .menuBarPopupRemaining:
+                "%@ remaining"
+            case .menuBarPopupResets:
+                "Resets %@"
+            case .menuBarPopupResetUnavailable:
+                "Reset time unavailable"
+            case .menuBarPopupWeeklyPosition:
+                "Weekly position"
+            case .menuBarPopupPositionElapsed:
+                "Elapsed"
+            case .menuBarPopupPositionUsed:
+                "Used"
+            case .menuBarPopupPositionBelow:
+                "Below even pace"
+            case .menuBarPopupPositionOn:
+                "On even pace"
+            case .menuBarPopupPositionAbove:
+                "Above even pace"
+            case .menuBarPopupPositionSummary:
+                "%@ used · %@ of the window elapsed"
+            case .menuBarPopupPositionDisclaimer:
+                "Compares use with time elapsed · not a forecast"
+            case .menuBarPopupWeeklyPace:
+                "Weekly pace"
+            case .menuBarPopupPaceCollecting:
+                "Collecting pace"
+            case .menuBarPopupPaceUnder:
+                "Under sustainable pace"
+            case .menuBarPopupPaceOn:
+                "Near sustainable pace"
+            case .menuBarPopupPaceOver:
+                "Over sustainable pace"
+            case .menuBarPopupPaceCritical:
+                "Well over sustainable pace"
+            case .menuBarPopupPaceCollectingDetail:
+                "One compatible local observation; a trend needs another."
+            case .menuBarPopupPaceRatioOutcome:
+                "%@× sustainable · %@"
+            case .menuBarPopupPaceDryBeforeReset:
+                "about %@ before reset with none left"
+            case .menuBarPopupPaceSpareAtReset:
+                "about %@ left at reset"
+            case .menuBarPopupPaceReachesReset:
+                "projected to reach reset"
+            case .menuBarPopupPaceNow:
+                "Now"
+            case .menuBarPopupPaceResetIn:
+                "Reset in %@"
+            case .menuBarPopupPaceEvidenceOne:
+                "1 compatible local observation · waiting for another"
+            case .menuBarPopupPaceEvidenceMany:
+                "%@ compatible local observations · estimate can change"
+            case .menuBarPopupPaceEarlyEstimate:
+                "Early estimate · %@"
+            case .menuBarPopupPaceActiveMarker:
+                "%@ · marker shows recent active-use pace"
+            case .menuBarPopupLocalUsage:
+                "Local usage"
+            case .menuBarPopupPeriodLastSevenDays:
+                "Last 7 days"
+            case .menuBarPopupPeriodLastThirtyDays:
+                "Last 30 days"
+            case .menuBarPopupTokenCount:
+                "%@ tokens"
+            case .menuBarPopupUsageChangeOne:
+                "1 local usage change"
+            case .menuBarPopupUsageChangesMany:
+                "%@ local usage changes"
+            case .menuBarPopupUsageSummary:
+                "%@ · %@"
+            case .menuBarPopupAPIPriceEquivalent:
+                "API-price equivalent"
+            case .menuBarPopupAPIPriceEquivalentPartial:
+                "Known API-price equivalent"
+            case .menuBarPopupPartialPricing:
+                "Partial pricing"
+            case .menuBarPopupAPIPriceEquivalentUnavailable:
+                "API-price equivalent is unavailable for this period."
+            case .menuBarPopupAPIPriceEquivalentRecalculating:
+                "Recalculating API-price equivalent…"
+            case .menuBarPopupPartialPricingDetail:
+                "%@ fully priced · %@ partially priced · %@ unpriced"
+            case .menuBarPopupPartialPricingCaption:
+                "Chart heights show known priced portions only."
+            case .menuBarPopupCoverageMixed:
+                "Coverage: %@ complete · %@ partial · %@ unavailable"
+            case .menuBarPopupCoverageAccessible:
+                "%@. %@ complete days, %@ partial days, %@ unavailable days. %@ known tokens."
+            case .menuBarPopupNotSubscriptionBill:
+                "Not a subscription bill"
+            case .menuBarPopupAccountingUnavailableTitle:
+                "Local usage history is not available yet"
+            case .menuBarPopupAccountingUnavailableBody:
+                "Run a local analysis to build 7-day and 30-day API-price-equivalent history from this Mac."
+            case .menuBarPopupNoUsageObserved:
+                "No local usage observed in %@."
+            case .menuBarPopupStartingTitle:
+                "Preparing local usage"
+            case .menuBarPopupStartingBody:
+                "TiboTattle will show values only after a fresh local observation."
+            case .menuBarPopupUpdatingTitle:
+                "Reading current local usage…"
+            case .menuBarPopupUpdatingBody:
+                "TiboTattle will show values only after a fresh local observation."
+            case .menuBarPopupStaleTitle:
+                "Current usage needs an update"
+            case .menuBarPopupStaleBody:
+                "Last observed %@. Allowance values are hidden until a fresh local observation."
+            case .menuBarPopupErrorTitle:
+                "Couldn’t read current usage"
+            case .menuBarPopupErrorBody:
+                "TiboTattle could not reach its local companion. No earlier values are shown as current."
+            case .menuBarPopupOpenProduct:
+                "Open %@"
+            case .menuBarPopupRefresh:
+                "Refresh"
+            case .menuBarPopupMore:
+                "More"
+            case .menuBarPopupAccessibilityOpenProduct:
+                "Open the full %@ window"
+            case .menuBarPopupAccessibilityRefresh:
+                "Refresh local usage"
+            case .menuBarPopupAccessibilityMore:
+                "More %@ actions"
             case .menuQuitProduct:
                 "Quit %@"
             case .menuSelectAll:

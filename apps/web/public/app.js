@@ -7462,10 +7462,25 @@ function formatPaceRatio(ratio) {
  * heading and this track's own label all state the standing in words, so
  * colour is never the only carrier.
  */
-function weeklyPaceTrack(standing, hoursToReset, activePace, remainingPercent) {
+function weeklyPaceTrack(
+  standing,
+  hoursToReset,
+  activePace,
+  remainingPercent,
+  sharedGeometry = null,
+) {
   const hoursLeft = finite(hoursToReset);
   if (!standing || hoursLeft === null || hoursLeft <= 0) return null;
-  const coveredShare = Math.max(0, Math.min(1, standing.coveredHours / hoursLeft));
+  const hasSharedGeometry = sharedGeometry !== null
+    && typeof sharedGeometry === "object"
+    && !Array.isArray(sharedGeometry);
+  const suppliedCoveredShare = hasSharedGeometry
+    ? finite(sharedGeometry.coveredFraction)
+    : null;
+  const coveredShare = hasSharedGeometry
+    ? suppliedCoveredShare
+    : Math.max(0, Math.min(1, standing.coveredHours / hoursLeft));
+  if (coveredShare === null || coveredShare < 0 || coveredShare > 1) return null;
   const track = node("div", "weekly-pace-track");
   const bar = node("div", "weekly-pace-track-bar");
   const covered = node("div", "weekly-pace-track-covered");
@@ -7475,14 +7490,25 @@ function weeklyPaceTrack(standing, hoursToReset, activePace, remainingPercent) {
   // The engine's active-interval pace, drawn only where it would run the
   // allowance out sooner than the headline rate does. It is the edge of the
   // estimate, not the estimate: it answers "and if I do not stop?".
-  const remaining = finite(remainingPercent);
-  const active = finite(activePace);
-  const flatOutHours = active !== null && active > 0 && remaining !== null
+  const suppliedFlatOutShare = hasSharedGeometry
+    ? finite(sharedGeometry.activeExhaustionFraction)
+    : null;
+  const remaining = hasSharedGeometry ? null : finite(remainingPercent);
+  const active = hasSharedGeometry ? null : finite(activePace);
+  const legacyFlatOutHours = active !== null && active > 0 && remaining !== null
     ? remaining / active
     : null;
+  const flatOutShare = hasSharedGeometry
+    ? suppliedFlatOutShare
+    : legacyFlatOutHours !== null
+        && legacyFlatOutHours < standing.coveredHours * .95
+      ? Math.max(0, Math.min(1, legacyFlatOutHours / hoursLeft))
+      : null;
+  const flatOutHours = hasSharedGeometry && flatOutShare !== null
+    ? flatOutShare * hoursLeft
+    : legacyFlatOutHours;
   let flatOutLabel = null;
-  if (flatOutHours !== null && flatOutHours < standing.coveredHours * .95) {
-    const flatOutShare = Math.max(0, Math.min(1, flatOutHours / hoursLeft));
+  if (flatOutShare !== null && flatOutShare >= 0 && flatOutShare <= 1) {
     const mark = node("div", "weekly-pace-track-mark");
     mark.style.insetInlineStart = `${(flatOutShare * 100).toFixed(2)}%`;
     bar.append(mark);
@@ -7523,16 +7549,125 @@ function weeklyPaceTrack(standing, hoursToReset, activePace, remainingPercent) {
   return track;
 }
 
-function renderWeeklyPaceForecast(data) {
-  const card = ensureWeeklyPaceForecastCard();
-  if (!card) return;
-  card.hidden = true;
-  card.className = "weekly-pace-forecast";
-  card.removeAttribute("aria-labelledby");
-  clear(card);
+// New companions publish the complete pace reading. The browser binds this
+// exact DTO after data-client.js has validated its shape and internal
+// consistency; no standing, threshold, exhaustion or track maths is repeated
+// here. `paceForecast` remains alongside it only as evidence metadata and to
+// identify the older engine reset-first state in the DOM.
+function weeklyPaceOutlookPresentation(outlook, forecast, now) {
+  if (!outlook || typeof outlook !== "object" || Array.isArray(outlook)) {
+    return null;
+  }
+  const collectingEvidence = outlook.status === "collecting";
+  const available = outlook.status === "available";
+  if (!collectingEvidence && !available) return null;
 
-  const forecast = data?.weekly?.paceForecast;
-  if (!forecast || typeof forecast !== "object" || Array.isArray(forecast)) return;
+  const resetAt = forecastTimestamp(outlook.resetsAt);
+  const remaining = firstFiniteForecastNumber(outlook.remainingPercent);
+  const hoursToReset = firstFiniteForecastNumber(
+    outlook.projection?.hoursToReset,
+  );
+  const observations = firstFiniteForecastNumber(outlook.observationCount);
+  const paceElapsedHours = firstFiniteForecastNumber(outlook.elapsedHours);
+  if (resetAt === null
+      || resetAt <= now
+      || remaining === null
+      || remaining < 0
+      || remaining > 100
+      || hoursToReset === null
+      || hoursToReset <= 0
+      || observations === null
+      || paceElapsedHours === null) return null;
+
+  const rates = {
+    active: firstFiniteForecastNumber(
+      outlook.rates?.activePercentagePointsPerHour,
+    ),
+    average: firstFiniteForecastNumber(
+      outlook.rates?.overallPercentagePointsPerHour,
+    ),
+    headline: firstFiniteForecastNumber(
+      outlook.rates?.headlinePercentagePointsPerHour,
+    ),
+  };
+  const sourceStatus = String(forecast?.status ?? "").trim().toLowerCase();
+  const reachesResetFirst = sourceStatus === "will_reach_reset_first"
+    || sourceStatus === "reset_before_exhaustion";
+  if (collectingEvidence) {
+    return {
+      resetAt,
+      remaining,
+      rates,
+      headlinePace: rates.headline,
+      hoursToReset,
+      available: false,
+      reachesResetFirst,
+      observations,
+      paceElapsedHours,
+      collectingEvidence: true,
+      earlyEstimate: false,
+      standing: null,
+      paceState: null,
+      projectedEtaAt: null,
+      trackGeometry: null,
+    };
+  }
+
+  const state = outlook.standing;
+  const standing = {
+    state,
+    critical: outlook.critical === true,
+    ratio: firstFiniteForecastNumber(outlook.rates?.ratio),
+    sustainable: firstFiniteForecastNumber(
+      outlook.rates?.sustainablePercentagePointsPerHour,
+    ),
+    coveredHours: firstFiniteForecastNumber(
+      outlook.projection?.coveredHours,
+    ),
+    dryHours: firstFiniteForecastNumber(outlook.projection?.dryHours),
+    sparePercent: firstFiniteForecastNumber(
+      outlook.projection?.sparePercent,
+    ),
+  };
+  const projectedEtaAt = forecastTimestamp(
+    outlook.projection?.projectedExhaustionAt,
+  );
+  if (!Object.hasOwn(PACE_STATE_LABELS, state)
+      || rates.headline === null
+      || standing.ratio === null
+      || standing.sustainable === null
+      || standing.coveredHours === null
+      || standing.dryHours === null
+      || standing.sparePercent === null
+      || (state === "over" ? projectedEtaAt === null : projectedEtaAt !== null)) {
+    return null;
+  }
+  return {
+    resetAt,
+    remaining,
+    rates,
+    headlinePace: rates.headline,
+    hoursToReset,
+    available: true,
+    reachesResetFirst,
+    observations,
+    paceElapsedHours,
+    collectingEvidence: false,
+    earlyEstimate: outlook.earlyEstimate === true,
+    standing,
+    paceState: state,
+    projectedEtaAt,
+    trackGeometry: outlook.track,
+  };
+}
+
+// Compatibility path for a companion that predates paceOutlook. Keep the
+// former browser projection intact so an upgrade never blanks an otherwise
+// valid card. Current companion output always takes the shared DTO path above.
+function legacyWeeklyPaceForecastPresentation(forecast, now) {
+  if (!forecast || typeof forecast !== "object" || Array.isArray(forecast)) {
+    return null;
+  }
   const pace = forecast.pace && typeof forecast.pace === "object"
     ? forecast.pace
     : {};
@@ -7547,8 +7682,7 @@ function renderWeeklyPaceForecast(data) {
     forecast.resetAt,
     forecast.reset_at,
   );
-  const now = Date.now();
-  if (resetAt === null || resetAt <= now) return;
+  if (resetAt === null || resetAt <= now) return null;
 
   let remaining = firstFiniteForecastNumber(
     forecast.remainingPercent,
@@ -7580,7 +7714,9 @@ function renderWeeklyPaceForecast(data) {
     forecast.exhaustionAt,
     forecast.allowanceAt,
   );
-  if (etaAt === null && suppliedHoursToExhaustion !== null && suppliedHoursToExhaustion > 0) {
+  if (etaAt === null
+      && suppliedHoursToExhaustion !== null
+      && suppliedHoursToExhaustion > 0) {
     etaAt = now + suppliedHoursToExhaustion * 3_600_000;
   }
   const available = status === "available"
@@ -7595,31 +7731,22 @@ function renderWeeklyPaceForecast(data) {
     paceIntervals === null ? null : paceIntervals + 1,
   );
   const paceElapsedHours = firstFiniteForecastNumber(pace.elapsedHours);
-  // A single trusted snapshot cannot establish a rate, but it is useful to
-  // say why the forecast is not visible yet. Do not surface an unbounded or
-  // otherwise unusable engine result as a generic empty state.
   const collectingEvidence = status === "insufficient_observations"
     && observations === 1;
   const earlyEstimate = available && (
     (observations !== null && observations <= 2)
     || (paceElapsedHours !== null && paceElapsedHours < 1)
   );
-  // A contradiction between the status and dates is an integration error, not
-  // a reason to show a confident-looking card. Wait for the next refresh.
-  if (available && (etaAt === null || etaAt <= now || etaAt > resetAt)) return;
-  if (!available && !reachesResetFirst && !collectingEvidence) return;
-  if (collectingEvidence && remaining === null) return;
+  if (available && (etaAt === null || etaAt <= now || etaAt > resetAt)) {
+    return null;
+  }
+  if (!available && !reachesResetFirst && !collectingEvidence) return null;
+  if (collectingEvidence && remaining === null) return null;
   if (!collectingEvidence
       && remaining === null
       && headlinePace === null
-      && !reachesResetFirst) return;
+      && !reachesResetFirst) return null;
 
-  // The standing is computed from the headline rate, so the card's colour,
-  // its heading and its arithmetic all come from one number. The engine's own
-  // `available` / `will_reach_reset_first` split still gates whether a card
-  // appears at all, but it no longer decides how the card reads: an engine ETA
-  // built on the active-interval pace is exactly the reading that overstated
-  // the burn.
   const standing = collectingEvidence
     ? null
     : weeklyPaceStanding({
@@ -7632,6 +7759,70 @@ function renderWeeklyPaceForecast(data) {
   const projectedEtaAt = standing !== null && standing.state === "over"
     ? now + standing.coveredHours * 3_600_000
     : null;
+  return {
+    resetAt,
+    remaining,
+    rates,
+    headlinePace,
+    hoursToReset,
+    available,
+    reachesResetFirst,
+    observations,
+    paceElapsedHours,
+    collectingEvidence,
+    earlyEstimate,
+    standing,
+    paceState,
+    projectedEtaAt,
+    trackGeometry: null,
+  };
+}
+
+function weeklyPacePresentation(data, now) {
+  const outlook = data?.weekly?.paceOutlook;
+  // data-client distinguishes an absent legacy field (`undefined`) from a
+  // supplied field that failed its exact decoder (`null`). Only true absence
+  // is allowed onto the compatibility arithmetic path.
+  if (outlook !== undefined) {
+    return weeklyPaceOutlookPresentation(
+      outlook,
+      data?.weekly?.paceForecast,
+      now,
+    );
+  }
+  return legacyWeeklyPaceForecastPresentation(
+    data?.weekly?.paceForecast,
+    now,
+  );
+}
+
+function renderWeeklyPaceForecast(data) {
+  const card = ensureWeeklyPaceForecastCard();
+  if (!card) return;
+  card.hidden = true;
+  card.className = "weekly-pace-forecast";
+  card.removeAttribute("aria-labelledby");
+  clear(card);
+
+  const now = Date.now();
+  const presentation = weeklyPacePresentation(data, now);
+  if (presentation === null) return;
+  const {
+    remaining,
+    rates,
+    headlinePace,
+    hoursToReset,
+    available,
+    reachesResetFirst,
+    observations,
+    paceElapsedHours,
+    collectingEvidence,
+    earlyEstimate,
+    standing,
+    paceState,
+    projectedEtaAt,
+    trackGeometry,
+  } = presentation;
 
   const title = node("h3", "weekly-pace-forecast-title");
   const cardId = "weekly-pace-forecast-title";
@@ -7721,7 +7912,13 @@ function renderWeeklyPaceForecast(data) {
 
   const track = collectingEvidence
     ? null
-    : weeklyPaceTrack(standing, hoursToReset, rates.active, remaining);
+    : weeklyPaceTrack(
+      standing,
+      hoursToReset,
+      rates.active,
+      remaining,
+      trackGeometry,
+    );
 
   // The evidence line names both rates. A reader who wondered why the old
   // card's forecast kept arriving early can see the difference between the
