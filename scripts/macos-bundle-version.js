@@ -14,13 +14,15 @@ export const LEGACY_STABLE_MACOS_BUNDLE_VERSION = "0.1.16";
 export const MACOS_BUNDLE_VERSION_EPOCH = 2_000;
 
 // Signed releases keep the production bundle identifier, so their build
-// numbers must advance from the last shared-identity dogfood build (1022).
+// numbers must advance from the last shared-identity dogfood build (1023).
 // Freeze the owner-reviewed allocations per marketing version and channel;
 // adding a future release is an explicit policy change, never an implicit
 // timestamp or environment-controlled counter.
+// The 0.1.17 RC2 used 1023. Its migration successor uses 1023.1, preserving
+// the already allocated stable 1024 while remaining a strictly newer dogfood.
 export const SIGNED_MACOS_BUNDLE_VERSION_PLAN = Object.freeze({
   "0.1.17": Object.freeze({
-    "internal-dogfood": "1023",
+    "internal-dogfood": "1023.1",
     stable: "1024",
   }),
 });

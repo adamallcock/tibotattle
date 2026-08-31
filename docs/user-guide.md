@@ -94,6 +94,19 @@ Maintainers use the preservation-first
 [unified-index recovery runbook](./runbooks/unified-index-recovery.md). Recovery
 is performed against a copy before replacing durable state.
 
+### Secure upgrade
+
+In builds with the [native migration change](./decisions/2026-08-31-silent-keychain-migration.md),
+TiboTattle first tries to preserve older saved keys silently, up to three times.
+If it cannot finish, **Secure upgrade** appears quietly in **Settings… →
+General**. Choose **Review migration…** when ready. The explanation tells you
+why access is needed before **Approve migration** can open a macOS Keychain
+dialog. Enter a password only in that macOS dialog; TiboTattle does not receive
+it. Cancel leaves migration pending, and approval changes neither key values
+nor contribution consent. Do not reset keys or delete local history to resolve
+this state. The linked decision records qualification; this is not a claim
+that an older installed app already has the new flow.
+
 ## Optional community contribution
 
 Community participation requires sign-in and explicit consent. Before the first

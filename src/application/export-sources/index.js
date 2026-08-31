@@ -315,6 +315,7 @@ export function createLocalExportSourcePipelineContext(proxyDetector, sourcePort
   });
   const sourcePlanBundle = createSourcePlanBundleContext({
     ...runtimeSourcePorts,
+    isProxy,
     claudeStatusExport,
     claudeStatusWorkspace,
     claudeTranscriptExport,

@@ -19,15 +19,26 @@ account observation, Claude-session pseudonym, and contribution device; no
 service/account string crosses the wire. The current packaged-companion graph
 uses the export-identity, account-observation, and contribution-device
 mappings; the Claude callback remains a standalone CLI/local-review
-composition. A legacy `.v1` item is copied to the app-owned `.app.v1` item,
-read back, and only then deleted. A denied prompt returns
-`migration_required` and preserves the legacy item. The packaged runtime will
-not prompt for that capability again in the same app process. Quit and reopen
-TiboTattle before repeating the initiating action; restart is the only retry
-boundary, and reset or deletion is not recovery for this condition. All four
-adapters retain a content-free migration-required diagnostic. The packaged
-runtime excludes `@github/keytar`; standalone CLI/local-review tooling retains
-that compatibility backend.
+composition. When only a legacy `.v1` item exists, a narrow native helper with
+the legacy Node signing identity attempts a silent read up to three times, with
+short backoff. Automatic reads forbid Keychain interaction. The retry budget is
+shared for the app process, including companion restarts. The helper can serve
+only an authenticated native parent over its private descriptor; it accepts no
+service, account, path, or arbitrary credential query.
+
+The native app creates the `.app.v1` item only if absent and verifies an exact
+readback. A conflicting modern item is never overwritten; the legacy item is
+retained as a recovery copy. If silent attempts cannot finish, the broker
+returns `migration_required` and the app quietly offers **Settings… → General →
+Secure upgrade → Review migration…**. Only the explained **Approve migration**
+action can enable a Keychain prompt. Cancel is the default, and a denial leaves
+the key intact and does not schedule another prompt. The menu's **Finish secure
+upgrade…** action opens Settings, not the system prompt. Reset or deletion is
+not migration recovery. All four adapters retain a content-free
+migration-required diagnostic. The packaged runtime excludes `@github/keytar`;
+standalone CLI/local-review tooling retains that compatibility backend. See the
+[migration decision and remaining qualification gates](../../docs/decisions/2026-08-31-silent-keychain-migration.md)
+before treating source tests as signed-upgrade evidence.
 
 ## Consumer lifecycle in the app
 
@@ -400,9 +411,10 @@ a claim that Sparkle has updated the preview client.
 `CFBundleShortVersionString` remains the user-facing package version. The
 Sparkle ordering key, `CFBundleVersion`, is explicitly allocated for signed
 builds that retain the stable bundle identifier. The 0.1.17 internal-dogfood
-build is `1023`; the 0.1.17 stable final is `1024`. These clear the observed
-shared-identity dogfood build `1022`, and stable orders after the tested
-dogfood candidate. A future signed version/channel must add a reviewed
+build is `1023.1`; the 0.1.17 stable final remains `1024`. The migration
+candidate orders strictly after the retained RC2 build `1023` and earlier
+shared-identity dogfood build `1022`, while stable orders after the dogfood
+candidate. A future signed version/channel must add a reviewed
 monotonic allocation before release tooling will run.
 
 Release tooling accepts `USAGE_MONITOR_BUNDLE_VERSION` only when it exactly
@@ -447,6 +459,10 @@ npm run product:macos:release -- \
   --prepare-candidate \
   --previous-stable-manifest "/path/to/previous-stable-release.json"
 ```
+
+`--prepare-candidate` does not stop after compilation: this command continues
+into Developer ID signing and notarization. It is a protected release action,
+not a secret-free build check or dry run.
 
 `--stable-bootstrap` is retained only as the historical first-stable-release
 decision and is not the normal current path. Every later stable release must
@@ -495,7 +511,7 @@ For a later stable release, use `--previous-stable-manifest` in place of
 the release command refuses to guess which continuity policy applies.
 `USAGE_MONITOR_BUNDLE_VERSION` is optional as an operator assertion only; when
 present it must exactly equal the checked-in allocation for the selected
-signed release version and channel (`1023` for 0.1.17 internal dogfood,
+signed release version and channel (`1023.1` for 0.1.17 internal dogfood,
 `1024` for 0.1.17 stable).
 
 `config/deployment-endpoints.js` is the reviewed source for the public origin
@@ -511,14 +527,18 @@ The release command:
    the candidate;
 2. verifies every regular candidate payload file, mode, size, and digest against the
    build inventory, rejects unlisted entries and symbolic links, and
-   normalizes only the three expected Mach-O signature envelopes;
+   normalizes only the reviewed Mach-O signature envelopes for the launcher,
+   embedded Node, migration helper, and Sparkle code;
 3. rebuilds into an isolated directory from the checked-out source and approved
    inputs, requires the fresh source and payload digests to match the reviewed
    candidate, and discards the candidate bytes;
 4. signs Sparkle's Installer XPC, Downloader XPC (preserving its entitlement),
    Autoupdate helper, Updater app, and framework in the upstream-documented
-   inside-out order, followed by embedded Node, the native launcher, and the
-   outer app;
+   inside-out order, followed by embedded Node, the migration helper, the native
+   launcher, and the outer app. The helper must have the exact legacy Node
+   Developer ID designated requirement, the same Team ID, hardened runtime,
+   and no entitlements; the finalizer verifies those requirements against the
+   actual signatures;
 5. applies hardened runtime and a minimal, reviewed Node runtime entitlement
    file;
 6. verifies the complete Developer ID signature;

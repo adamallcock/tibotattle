@@ -1,8 +1,7 @@
 # TiboTattle agent guidance
 
-This is the canonical repository instruction file. It is written for capable,
-long-horizon coding agents: prefer principles, constraints, and verifiable
-outcomes over tutorials or canned examples.
+Canonical guidance for capable, long-horizon agents: prefer principles,
+constraints, and verifiable outcomes over tutorials or canned examples.
 
 ## Use progressive disclosure
 
@@ -11,8 +10,7 @@ outcomes over tutorials or canned examples.
   the client did not load descendant instructions automatically.
 - Read only the references relevant to the task. Do not preload the documentation
   tree, large runbooks, or generated artifacts.
-- For unlisted paths, this root file plus nearby code, manifests, tests, and
-  READMEs are the applicable guidance.
+- For unlisted paths, use this root file plus nearby code, manifests, tests, and READMEs.
 - If instructions conflict, follow the narrower scope and surface the conflict.
 
 | Work | Read next |
@@ -37,9 +35,8 @@ outcomes over tutorials or canned examples.
 | Build, generator, verification, or release tooling | `scripts/AGENTS.md` |
 | Documentation, evidence, plans, or release claims | `docs/AGENTS.md`, then `docs/README.md` |
 
-`CLAUDE.md` imports this file so Claude and AGENTS-aware clients share one
-policy. Keep model- or client-specific guidance out of this file unless it
-changes a repository contract.
+`CLAUDE.md` imports this policy for all agents. Keep client-specific guidance
+out unless it changes a repository contract.
 
 ## Product invariants
 
@@ -48,6 +45,9 @@ and updated authoritative documentation.
 
 - TiboTattle is local-first and privacy-first. Local analysis must work offline,
   and local HTTP services must bind only to loopback.
+- Unexpected Keychain security prompts block release. Routine access must be
+  non-interactive; never weaken protection to suppress prompts. Follow
+  `apps/macos/AGENTS.md` for silent migration, explicit recovery, and proof.
 - Prompts, responses, raw session commands, credentials, private session paths
   and filenames, raw account identifiers, and other session content must not
   enter derived artifacts, fixtures, logs, diagnostics, issues, commits, or

@@ -1,5 +1,7 @@
 import {
   createEmptySupplementalSourcePlan,
+  ExportResourceLimitError,
+  ExportSupplementalSourcePlanError,
   summarizeSupplementalSourcePlan,
   stableJson,
 } from "../../export/index.js";
@@ -16,6 +18,7 @@ const {
   codexCollectorWorkspace,
   codexSourcePlan,
   createHash,
+  isProxy,
   normalizeExportBounds,
   resolvePath,
 } = configuration;
@@ -53,6 +56,13 @@ const BUNDLE_KEYS = Object.freeze([
   "sourcePlanBundleSha256",
 ]);
 const SAFE_CODES = new Set(["configuration", "interval", "hash", "integrity"]);
+const FAILURE_OPERATIONS = new Set(["create", "verify", "summarize"]);
+const FAILURE_SOURCES = new Set([
+  "codex", "collector", "claude_status", "claude_transcript", "workspace_projection", "totals",
+]);
+// Keep diagnostic provenance out of mutable Error properties. A caller cannot
+// forge context by setting error.context, and no raw error/plan is retained.
+const FAILURE_CONTEXTS = new WeakMap();
 
 class ExportSourcePlanBundleError extends Error {
   constructor(code) {
@@ -65,6 +75,72 @@ class ExportSourcePlanBundleError extends Error {
 
 function fail(code) {
   throw new ExportSourcePlanBundleError(code);
+}
+
+const REASON_OWNERS = [
+  [ExportSourcePlanBundleError, "export_source_plan_bundle_"],
+  [ExportResourceLimitError, "export_resource_"],
+  [ExportSupplementalSourcePlanError, "export_supplemental_source_"],
+  [codexSourcePlan.ExportSourcePlanError, "export_source_"],
+  [codexCollectorExport.CodexCollectorExportSourceError, "codex_collector_export_"],
+  [codexCollectorWorkspace.CodexCollectorWorkspaceSourceError, "codex_collector_workspace_source_"],
+  [claudeStatusExport.ClaudeStatusLedgerExportSourceError, "claude_status_ledger_export_"],
+  [claudeStatusWorkspace.ClaudeStatusWorkspaceSourceError, "claude_status_workspace_source_"],
+  [claudeTranscriptExport.ClaudeTranscriptExportSourceError, "claude_transcript_export_"],
+  [claudeTranscriptWorkspace.ClaudeTranscriptWorkspaceSourceError, "claude_transcript_workspace_"],
+];
+
+function safeErrorObject(error) {
+  return error !== null && typeof error === "object" && !isProxy(error);
+}
+
+function hasErrorPrototype(error, prototype) {
+  // Preserve genuine typed errors (including subclasses), without invoking a
+  // foreign Proxy's getPrototypeOf trap or Error property getters.
+  let current = error;
+  for (let depth = 0; depth < 32 && safeErrorObject(current); depth += 1) {
+    current = Object.getPrototypeOf(current);
+    if (current === prototype) return true;
+  }
+  return false;
+}
+
+function failureReason(error) {
+  if (!safeErrorObject(error)) return "unknown";
+  const prototype = Object.getPrototypeOf(error);
+  const descriptor = Object.getOwnPropertyDescriptor(error, "code");
+  if (!descriptor || !Object.hasOwn(descriptor, "value")
+      || typeof descriptor.value !== "string" || descriptor.value.length > 128) return "unknown";
+  for (const [Owner, prefix] of REASON_OWNERS) {
+    if (prototype !== Owner.prototype || !descriptor.value.startsWith(prefix)) continue;
+    try {
+      // The owning constructor is the closed vocabulary authority; neither a
+      // foreign code nor a getter can enlarge the diagnostic vocabulary.
+      const known = new Owner(descriptor.value.slice(prefix.length));
+      return known.code === descriptor.value ? known.code : "unknown";
+    } catch {
+      return "unknown";
+    }
+  }
+  return "unknown";
+}
+
+function rethrowWithContext(error, operation, source, { preserveResourceError = false } = {}) {
+  if (!FAILURE_OPERATIONS.has(operation) || !FAILURE_SOURCES.has(source)) {
+    throw new TypeError("Unknown export source-plan failure context");
+  }
+  const failure = hasErrorPrototype(error, ExportSourcePlanBundleError.prototype)
+    || (preserveResourceError && hasErrorPrototype(error, ExportResourceLimitError.prototype))
+    ? error : new ExportSourcePlanBundleError("integrity");
+  if (!FAILURE_CONTEXTS.has(failure)) {
+    FAILURE_CONTEXTS.set(failure, Object.freeze({ operation, source, reason: failureReason(error) }));
+  }
+  throw failure;
+}
+
+/** Only failures observed at this bundle's real catch boundaries have context. */
+function exportSourcePlanBundleFailureContext(error) {
+  return FAILURE_CONTEXTS.get(error) ?? null;
 }
 
 function exactKeys(value, keys) {
@@ -201,8 +277,7 @@ function summarizeExportSourcePlanBundle(bundle) {
       claude,
     };
   } catch (error) {
-    if (error instanceof ExportSourcePlanBundleError) throw error;
-    fail("integrity");
+    rethrowWithContext(error, "summarize", "totals");
   }
 }
 
@@ -232,6 +307,7 @@ async function createExportSourcePlanBundle({
   const bounds = normalizeExportBounds(startAt, endAt);
   resourceGuard.assertCoveredInterval(bounds.startMs, bounds.endMs);
   const planningGuard = combinedPlanGuard(resourceGuard);
+  let source = "collector";
   try {
     const collector = collectorPath === null ? null : await createCodexCollectorWorkspaceSource({
       collectorPath: resolvePath(collectorPath),
@@ -239,6 +315,7 @@ async function createExportSourcePlanBundle({
       endAt: bounds.endAt,
       resourceGuard: planningGuard,
     });
+    source = "claude_status";
     const claudeStatus = claudeStateDirectory === null ? null : await createClaudeStatusWorkspaceSource({
       stateDirectory: resolvePath(claudeStateDirectory),
       startAt: bounds.startAt,
@@ -246,6 +323,7 @@ async function createExportSourcePlanBundle({
       secret,
       resourceGuard: planningGuard,
     });
+    source = "claude_transcript";
     const claudeTranscript = claudeProjectsDirectory === null ? null
       : await createClaudeTranscriptWorkspaceSource({
         projectsDirectory: resolvePath(claudeProjectsDirectory),
@@ -255,12 +333,14 @@ async function createExportSourcePlanBundle({
         resourceGuard: planningGuard,
       });
     if (claudeTranscript !== null && claudeTranscript.sources.length === 0) fail("configuration");
+    source = "codex";
     const codexPlan = await createCodexExportSourcePlan({
       codexHome,
       startAt: bounds.startAt,
       endAt: bounds.endAt,
       resourceGuard: planningGuard,
     });
+    source = "workspace_projection";
     const bundle = {
       schemaVersion: EXPORT_SOURCE_PLAN_BUNDLE_VERSION,
       startAt: bounds.startAt,
@@ -272,12 +352,12 @@ async function createExportSourcePlanBundle({
       sourcePlanBundleSha256: "0".repeat(64),
     };
     bundle.sourcePlanBundleSha256 = bundleDigest(bundle);
+    source = "totals";
     const totals = planTotals(bundle);
     resourceGuard.observeSourcePlan(totals.sourceFiles, totals.sourceBytes);
     return bundle;
   } catch (error) {
-    if (error instanceof ExportSourcePlanBundleError || error?.name === "ExportResourceLimitError") throw error;
-    fail("integrity");
+    rethrowWithContext(error, "create", source, { preserveResourceError: true });
   }
 }
 
@@ -301,26 +381,32 @@ async function resolveExportSourcePlanBundle(bundle, {
     if (plan !== null) assertPlanInterval(plan, bounds);
   }
   const verificationGuard = combinedPlanGuard(resourceGuard);
+  let source = "codex";
   try {
     await verifyCodexExportSourcePlan(bundle.codexPlan, { resourceGuard: verificationGuard });
     if (bundle.collectorPlan !== null) {
+      source = "collector";
       await verifyCodexCollectorExportSourcePlan(bundle.collectorPlan, { resourceGuard: verificationGuard });
     }
     if (bundle.claudeStatusPlan !== null) {
+      source = "claude_status";
       await verifyClaudeStatusLedgerExportSourcePlan(bundle.claudeStatusPlan, {
         secret,
         resourceGuard: verificationGuard,
       });
     }
     if (bundle.claudeTranscriptPlan !== null) {
-      for (const source of bundle.claudeTranscriptPlan.sources) {
-        await verifyClaudeTranscriptExportSource(bundle.claudeTranscriptPlan, source.sourceKey, {
+      source = "claude_transcript";
+      for (const transcriptSource of bundle.claudeTranscriptPlan.sources) {
+        await verifyClaudeTranscriptExportSource(bundle.claudeTranscriptPlan, transcriptSource.sourceKey, {
           secret,
           resourceGuard: verificationGuard,
         });
       }
     }
+    source = "workspace_projection";
     const workspacePlans = derivedWorkspacePlans(bundle, secret);
+    source = "totals";
     const totals = planTotals(bundle);
     const supplementalSummary = summarizeSupplementalSourcePlan(workspacePlans.supplementalSourcePlan);
     const derivedFiles = bundle.codexPlan.sources.length + supplementalSummary.sourceFiles;
@@ -338,14 +424,14 @@ async function resolveExportSourcePlanBundle(bundle, {
       claudeProjectsDirectory: bundle.claudeTranscriptPlan?.rootDirectory ?? null,
     };
   } catch (error) {
-    if (error instanceof ExportSourcePlanBundleError || error?.name === "ExportResourceLimitError") throw error;
-    fail("integrity");
+    rethrowWithContext(error, "verify", source, { preserveResourceError: true });
   }
 }
 
 return Object.freeze({
   EXPORT_SOURCE_PLAN_BUNDLE_VERSION,
   ExportSourcePlanBundleError,
+  exportSourcePlanBundleFailureContext,
   createExportSourcePlanBundle,
   resolveExportSourcePlanBundle,
   summarizeExportSourcePlanBundle,

@@ -212,3 +212,45 @@ test("agent guidance preserves owner erasure and restore after self-service reti
   assert.match(web, /confirmed \*\*Disconnect this Mac\*\*/u);
   assert.match(docs, /does not retire owner erasure, privacy-request\s+handling, retention disclosures, or deletion-safe restore/u);
 });
+
+test("agent guidance treats unexpected Keychain prompts as a release blocker without weakening security", async () => {
+  const [root, native, scripts, runbook] = await Promise.all([
+    readRepositoryFile("AGENTS.md"),
+    readRepositoryFile("apps/macos/AGENTS.md"),
+    readRepositoryFile("scripts/AGENTS.md"),
+    readRepositoryFile("docs/runbooks/macos-stable-release-runbook.md"),
+  ]);
+
+  assert.match(root, /Unexpected Keychain security prompts block release/u);
+  assert.match(root, /never weaken protection to suppress prompts/u);
+  assert.match(native, /Disable Keychain interaction for startup, refresh, background work/u);
+  assert.match(native, /bounded silent retries/u);
+  assert.match(native, /signing identity and designated\s+requirement/u);
+  assert.match(native, /deliberate approval can enable an OS\s+dialog/u);
+  assert.match(native, /Cancel must be the default/u);
+  assert.match(native, /denial\/cancellation preserve credentials\s+and history/u);
+  assert.match(native, /Never broaden ACLs, entitlements, or access groups/u);
+  assert.match(native, /same-identity upgrades with exact signed artifacts/u);
+  assert.match(native, /prompts block dogfood replacement and public release/u);
+  assert.match(native, /`--prepare-candidate` flag continues into signing and\s+notarization/u);
+  assert.match(scripts, /never automate prompt approval or broaden key access/u);
+  assert.match(runbook, /Signing-key access on the release machine is a separate owner provisioning\s+step/u);
+  assert.doesNotMatch(runbook, /choose \*\*Always Allow\*\*/u);
+});
+
+test("historical Keychain prompt advice points to the prompt-free contract before its original narrative", async () => {
+  const [historical, index] = await Promise.all([
+    readRepositoryFile("docs/design/2026-08-19-first-pairing-keychain-prompt.md"),
+    readRepositoryFile("docs/README.md"),
+  ]);
+  const boundary = historical.split("## Original investigation and implementation record")[0];
+  assert.match(boundary, /^status: superseded$/mu);
+  assert.match(boundary, /0\.1\.13 build 1015/u);
+  assert.match(boundary, /It is not current product or release guidance/u);
+  assert.match(boundary, /Automatic operation must be\s+noninteractive/u);
+  assert.match(boundary, /Cancel as the default/u);
+  assert.match(boundary, /Do not\s+follow the historical Always Allow recommendation, reset credentials/u);
+  assert.match(boundary, /silent-keychain-migration\.md/u);
+  assert.match(boundary, /macos-stable-release-runbook\.md#native-keychain-migration-gate/u);
+  assert.match(index, /\[Silent native Keychain migration\]\(\.\/decisions\/2026-08-31-silent-keychain-migration\.md\)/u);
+});

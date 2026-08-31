@@ -18,6 +18,10 @@ Scope: all files under `scripts/`. Apply the repository root guidance first.
   fsync/atomic rename, journals, and recovery where partial execution matters.
 - Keep output bounded and content-free. Never print secret values, private paths,
   raw session data, identities, signing material, or payload rows.
+- Routine build, test, and dry-run modes must not request Keychain passwords or
+  touch real credentials. Keep signing-key provisioning an explicit owner step;
+  never automate prompt approval or broaden key access to unblock a build.
+  Apply the native prompt-free release gate in `apps/macos/AGENTS.md`.
 
 ## Generators and builds
 

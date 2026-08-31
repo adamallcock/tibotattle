@@ -18,9 +18,15 @@ test("lane manifests include every executable macOS test target", () => {
     "test/i18n-foundation.test.js",
     "test/macos-localization.test.js",
     "test/macos-app-bundle.test.js",
+    "test/macos-keychain-migration-artifact.test.js",
+    "test/macos-keychain-migration-runner.test.js",
+    "test/macos-keychain-migration-ui.test.js",
   ]);
   assert.deepEqual(MACOS_ARTIFACT_TEST_FILES, [
     "test/macos-app-bundle.test.js",
+    "test/macos-keychain-migration-artifact.test.js",
+    "test/macos-keychain-migration-runner.test.js",
+    "test/macos-keychain-migration-ui.test.js",
     "test/macos-updater.test.js",
     "test/macos-updater-release.test.mjs",
   ]);
@@ -129,6 +135,14 @@ test("test-lane selection narrows only paths with complete executable coverage",
     selectTestLanes(["test/macos-app-bundle.test.js"]).lanes,
     ["macos-source", "macos-artifact"],
   );
+  for (const path of [
+    "test/macos-keychain-migration-artifact.test.js",
+    "test/macos-keychain-migration-runner.test.js",
+    "test/macos-keychain-migration-ui.test.js",
+  ]) {
+    assert.deepEqual(selectTestLanes([path]).lanes,
+      ["macos-source", "macos-artifact"], path);
+  }
   assert.deepEqual(
     selectTestLanes(["test/macos-updater.test.js"]).lanes,
     ["macos-artifact"],

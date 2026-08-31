@@ -82,7 +82,7 @@
     "product:macos:preview:validate": "node ./scripts/build-macos-app.js --validate-preview --app \".release-build/macos-preview/current/TiboTattle Preview.app\"",
     "product:macos:publish-update": "node ./scripts/publish-sparkle-update.js",
     "product:macos:release": "node ./scripts/release-macos-app.js --app \".release-build/macos-production/TiboTattle.app\"",
-    "product:macos:test": "npm run product:macos:updater:prepare && USAGE_MONITOR_TEST_LANES=0 USAGE_MONITOR_MACOS_TEST_SCOPE=all node --test --test-concurrency=1 test/macos-app-bundle.test.js test/macos-updater.test.js test/macos-updater-release.test.mjs",
+    "product:macos:test": "npm run product:macos:updater:prepare && USAGE_MONITOR_TEST_LANES=0 USAGE_MONITOR_MACOS_TEST_SCOPE=all node --test --test-concurrency=1 test/macos-app-bundle.test.js test/macos-keychain-migration-artifact.test.js test/macos-keychain-migration-runner.test.js test/macos-keychain-migration-ui.test.js test/macos-updater.test.js test/macos-updater-release.test.mjs",
     "product:macos:updater:prepare": "node ./scripts/prepare-sparkle-framework.js --output \".release-deps/Sparkle.framework\"",
     "product:macos:validate:development": "node ./scripts/validate-macos-install.js --app \".release-build/macos/TiboTattle.app\" --channel stable --development",
     "product:macos:validate:login-item-release": "node ./scripts/validate-macos-login-item-release.js",

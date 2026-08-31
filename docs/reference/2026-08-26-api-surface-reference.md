@@ -213,10 +213,12 @@ into `allowanceImpact` or hide excluded sessions. No priced observations means
 `coveredSubtotal: null`, not a zero-valued placeholder.
 
 When contribution preparation encounters a preserved legacy export identity
-whose one interactive migration read was declined, it returns the fixed
-`identity_migration_required` code. The dashboard directs the user to quit and
-reopen TiboTattle before choosing **Check again**; it does not offer identity
-reset, deletion, or rotation.
+whose bounded silent migration has not completed, it returns the fixed
+`identity_migration_required` code. The dashboard directs the user to native
+**Settings… → General → Secure upgrade → Review migration…**, then **Check
+again**. Only a separate, explained native approval can enable a Keychain
+prompt. The dashboard offers neither approval authority nor identity reset,
+deletion, or rotation as migration recovery.
 
 ### Fixed report pages
 
@@ -555,17 +557,30 @@ never cross the channel:
 | `delete` | `{v: 2, id, op: "delete", capability}` | `{id, ok: true}` |
 
 The broker reads the `.app.v1` generation first. When only the corresponding
-legacy keytar-backed `.v1` item exists, it permits one interactive legacy read
-for that capability per app process, writes and reads back the exact secret in
-the app-owned item, and only then deletes the legacy item. A denied migration
-returns `migration_required` and preserves the legacy item; it never falls back
-to a reset or fresh credential. It also suppresses any further interactive read
-for that capability in the same process. Quit and reopen TiboTattle, then repeat
-the initiating action and allow the fixed migration prompt: app restart is the
-only authorized retry boundary. All four capability adapters preserve a fixed,
-content-free migration-required diagnostic rather than collapsing it to generic
-unavailability. Protocol v1 remains accepted only for the historical
-contribution-device-only client and cannot name a wider capability.
+legacy keytar-backed `.v1` item exists, it attempts a noninteractive read through
+`Contents/Helpers/TiboTattleKeychainMigration`. The helper retains the legacy
+`node` Developer ID identity, has no entitlements, and authenticates its native
+parent's live audit token and signing identity. The parent authenticates the
+spawned helper and pins its code hash. The helper accepts only the four fixed
+capabilities; stable/Preview storage identity comes from the authenticated
+parent, never the request. Its private descriptor frames and lifetime are
+bounded, including when the parent exits during a Keychain call.
+
+Up to three silent attempts use 250 ms and 750 ms backoff after the first
+attempt. The app-process budget survives companion replacement. Each automatic
+read forbids Keychain interaction. Adoption is create-if-absent with exact
+readback, preserves a conflicting modern item, and retains the legacy recovery
+copy. Failure returns `migration_required`; it never invents a fresh identity.
+After exhaustion a quiet native Settings action offers an explanation with
+Cancel as the default. Only deliberate **Approve migration** enables an
+interactive legacy read. Denial preserves the key and stops the approval pass;
+another prompt requires another explicit review. Teardown fences both admission
+and adoption. All four adapters preserve a fixed, content-free migration-required
+diagnostic. No broker operation approves migration or resets its retry budget.
+Protocol v1 remains accepted only for the historical contribution-device-only
+client and cannot name a wider capability. The
+[migration decision](../decisions/2026-08-31-silent-keychain-migration.md)
+records signed qualification and the retained-copy explicit-reset gate.
 
 The broker protocol admits exactly these four capabilities. The packaged
 companion's current runtime graph injects it for export identity, account

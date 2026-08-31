@@ -132,10 +132,19 @@ const SPARKLE_FRAMEWORK_PREFIX =
   "Contents/Frameworks/Sparkle.framework";
 const SIGNED_EXECUTABLE_PATH =
   `Contents/MacOS/${PRODUCT_BRAND.executableName}`;
+export const MACOS_KEYCHAIN_MIGRATION_HELPER = Object.freeze({
+  executable: "Contents/Helpers/TiboTattleKeychainMigration",
+  signingIdentifier: "node",
+});
+export const MACOS_KEYCHAIN_MIGRATION_HELPER_SOURCES = Object.freeze([
+  "apps/macos/Helpers/KeychainMigrationHelper.swift",
+  "apps/macos/Sources/KeychainMigration.swift",
+]);
 const CODE_RESOURCES_PATH = "Contents/_CodeSignature/CodeResources";
 const NORMALIZED_MACH_O_PATHS = new Set([
   SIGNED_EXECUTABLE_PATH,
   "Contents/Resources/runtime/bin/node",
+  MACOS_KEYCHAIN_MIGRATION_HELPER.executable,
   ...SPARKLE_MACH_O_PATHS.map(
     (path) => `${SPARKLE_FRAMEWORK_PREFIX}/${path}`,
   ),
@@ -1056,6 +1065,15 @@ export async function collectMacOSSwiftSources({
         if (SWIFT_EXCLUDED_DIRECTORY_NAMES.has(normalizedName)) {
           continue;
         }
+        if (directory === selectedSourceRoot && entry.name === "Helpers") {
+          // The migration entrypoint has its own @main. Review its exact
+          // closure, but never compile it into the foreground application.
+          await collectMacOSKeychainMigrationHelperSources({
+            repositoryRoot: selectedRepositoryRoot,
+            sourceRoot: selectedSourceRoot,
+          });
+          continue;
+        }
         if (directory === selectedSourceRoot && entry.name !== "Sources") {
           if (
             SWIFT_INTENTIONALLY_EXCLUDED_TOP_LEVEL_DIRECTORY_NAMES
@@ -1113,6 +1131,78 @@ export async function collectMacOSSwiftSources({
         "macOS Swift source",
       ))),
   });
+}
+
+export async function collectMacOSKeychainMigrationHelperSources({
+  repositoryRoot = REPOSITORY_ROOT,
+  sourceRoot = MACOS_SOURCE_ROOT,
+} = {}) {
+  const selectedRepositoryRoot = resolve(repositoryRoot);
+  const selectedSourceRoot = resolve(sourceRoot);
+  const helpersRoot = join(selectedSourceRoot, "Helpers");
+  await assertReviewedDirectory(
+    selectedRepositoryRoot,
+    helpersRoot,
+    "macOS migration helper source root",
+  );
+  const entries = await readdir(helpersRoot, { withFileTypes: true });
+  if (entries.length !== 1
+      || entries[0].name !== "KeychainMigrationHelper.swift"
+      || !entries[0].isFile()
+      || entries[0].isSymbolicLink()) {
+    fail("macOS migration helper must contain only its reviewed entrypoint");
+  }
+  const files = [];
+  for (const relativeFile of MACOS_KEYCHAIN_MIGRATION_HELPER_SOURCES) {
+    const file = join(
+      selectedSourceRoot,
+      ...relativeFile.slice("apps/macos/".length).split("/"),
+    );
+    reviewedRelative(selectedRepositoryRoot, file, "macOS migration helper source");
+    await assertReviewedDirectory(
+      selectedRepositoryRoot,
+      dirname(file),
+      "macOS migration helper source directory",
+    );
+    const metadata = await lstat(file);
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1) {
+      fail("macOS migration helper source must be an unlinked regular file");
+    }
+    if (selectedRepositoryRoot === REPOSITORY_ROOT) {
+      assertAllowedFirstPartyPath(file);
+    }
+    files.push(file);
+  }
+  return Object.freeze({
+    files: Object.freeze(files),
+    relativeFiles: Object.freeze(files.map((file) =>
+      reviewedRelative(selectedRepositoryRoot, file, "macOS migration helper source"))),
+  });
+}
+
+export function assertMacOSKeychainMigrationManifest(manifest) {
+  const helper = manifest?.runtime?.keychainMigrationHelper;
+  const helperSources = manifest?.inputs?.keychainMigrationHelperSources;
+  const appSources = manifest?.inputs?.swiftSources;
+  const files = manifest?.payload?.files;
+  const rows = Array.isArray(files) ? files.filter((entry) =>
+    entry?.path === MACOS_KEYCHAIN_MIGRATION_HELPER.executable) : [];
+  if (stableJson(helper) !== stableJson(MACOS_KEYCHAIN_MIGRATION_HELPER)
+      || stableJson(helperSources) !== stableJson(MACOS_KEYCHAIN_MIGRATION_HELPER_SOURCES)
+      || !Array.isArray(appSources)
+      || !appSources.includes("apps/macos/Sources/KeychainMigration.swift")
+      || appSources.includes("apps/macos/Helpers/KeychainMigrationHelper.swift")
+      || rows.length !== 1
+      || rows[0].normalization !== "mach_o_without_code_signature"
+      || rows[0].mode !== "555"
+      || !Number.isSafeInteger(rows[0].bytes) || rows[0].bytes < 1
+      || typeof rows[0].sha256 !== "string"
+      || !/^[a-f0-9]{64}$/u.test(rows[0].sha256)) {
+    fail(
+      "Application omits or changes the reviewed Keychain migration helper contract",
+      "MACOS_KEYCHAIN_MIGRATION_ARTIFACT_INVALID",
+    );
+  }
 }
 
 const LOCALIZATION_RESOURCE_PATTERN =
@@ -1952,8 +2042,23 @@ function preSignLauncherForInventory(appBundle) {
   ]);
 }
 
-async function compileLauncher(destination, updater, swiftSources, {
+function preSignKeychainMigrationHelperForInventory(appBundle) {
+  run(CODESIGN_PATH, [
+    "--force",
+    "--sign",
+    "-",
+    "--identifier",
+    MACOS_KEYCHAIN_MIGRATION_HELPER.signingIdentifier,
+    "--options",
+    "runtime",
+    "--timestamp=none",
+    join(appBundle, ...MACOS_KEYCHAIN_MIGRATION_HELPER.executable.split("/")),
+  ]);
+}
+
+async function compileNativeExecutable(destination, updater, swiftSources, {
   buildProfile = MACOS_BUILD_PROFILE_RELEASE,
+  migrationHelper = false,
 } = {}) {
   const selectedBuildProfile = normalizeMacOSBuildProfile(buildProfile);
   const sdk = run("/usr/bin/xcrun", [
@@ -1999,27 +2104,35 @@ async function compileLauncher(destination, updater, swiftSources, {
     "-sdk",
     sdk,
     "-module-name",
-    `${PRODUCT_BRAND.executableName}Launcher`,
+    migrationHelper
+      ? "TiboTattleKeychainMigration"
+      : `${PRODUCT_BRAND.executableName}Launcher`,
     "-module-cache-path",
     moduleCache,
-    "-framework",
-    "AppKit",
-    "-framework",
-    "Foundation",
-    // Login-at-login registration uses Apple's macOS 13+ ServiceManagement
-    // API directly.  The framework is provided by the OS and is not bundled.
-    "-framework",
-    "ServiceManagement",
-    // Native, opt-in local alerts use the macOS notification center only.
-    // This is a system framework; it adds no helper, service, or bundled
-    // network-capable dependency.
-    "-framework",
-    "UserNotifications",
-    // The dashboard is hosted in-app. WebKit is a system framework, so this
-    // adds no bundled binary and no new outbound reach: the embedded view is
-    // pinned to the loopback companion origin by its navigation delegate.
-    "-framework",
-    "WebKit",
+    // Darwin exposes audit_token_to_pid/euid declarations, but their
+    // implementations live in libbsm. Both peers authenticate the IPC audit
+    // token, so both the launcher and helper must link this system library.
+    "-lbsm",
+    // The migration helper has no UI, updater, JIT, or separately bundled
+    // runtime. Only the foreground launcher needs the system UI/lifecycle
+    // frameworks. Both use Security through reviewed native APIs.
+    ...(migrationHelper
+      ? ["-framework", "Foundation", "-framework", "Security"]
+      : [
+        "-framework",
+        "AppKit",
+        "-framework",
+        "Foundation",
+        // Login-at-login registration uses the system ServiceManagement API.
+        "-framework",
+        "ServiceManagement",
+        // Native alerts add no separately bundled networking dependency.
+        "-framework",
+        "UserNotifications",
+        // The foreground dashboard remains pinned to the loopback companion.
+        "-framework",
+        "WebKit",
+      ]),
   ];
   if (updater.enabled) {
     arguments_.push(
@@ -2047,7 +2160,7 @@ async function compileLauncher(destination, updater, swiftSources, {
   await utimes(destination, FIXED_EPOCH_SECONDS, FIXED_EPOCH_SECONDS);
   const fileDescription = run("/usr/bin/file", ["-b", destination]);
   if (!fileDescription.includes("Mach-O 64-bit executable arm64")) {
-    fail("Native launcher is not a macOS arm64 executable");
+    fail("Native application code is not a macOS arm64 executable");
   }
 }
 
@@ -2414,6 +2527,7 @@ export async function calculateMacOSSourceInputDigest({
   graph,
   runtimeAssets,
   swiftSources,
+  keychainMigrationHelperSources = null,
   localizationResources = null,
   iconAssets = null,
   updater = null,
@@ -2438,6 +2552,7 @@ export async function calculateMacOSSourceInputDigest({
     CAPTURED_UTF8_SOURCE_HELPER,
     SCRIPT_FILE,
     ...swiftSources.files,
+    ...(keychainMigrationHelperSources?.files ?? []),
     ...localizationFiles,
     ...(iconAssets
       ? [iconAssets.icon.path, iconAssets.provenance.path]
@@ -2798,6 +2913,16 @@ export async function validateMacOSPreviewApp(appPath) {
       "Preview application build manifest has an unexpected identity",
       "MACOS_PREVIEW_METADATA_INVALID",
     );
+  }
+  // A still-signed older Preview may be inspected for replacement, but any
+  // artifact declaring or carrying the new helper must have the complete
+  // current contract. Current builders enforce this unconditionally.
+  if (manifest.runtime?.keychainMigrationHelper !== undefined
+      || manifest.inputs?.keychainMigrationHelperSources !== undefined
+      || (Array.isArray(manifest.payload?.files)
+        && manifest.payload.files.some((entry) =>
+          entry?.path === MACOS_KEYCHAIN_MIGRATION_HELPER.executable))) {
+    assertMacOSKeychainMigrationManifest(manifest);
   }
   const release = manifest.release;
   if (release?.channel !== DISTRIBUTION_CHANNEL_PREVIEW
@@ -3422,21 +3547,25 @@ async function buildApplication(stageApp, centralService, {
 }) {
   const contents = join(stageApp, "Contents");
   const executables = join(contents, "MacOS");
+  const helpers = join(contents, "Helpers");
   const resources = join(contents, "Resources");
   const appRoot = join(resources, "app");
   await mkdir(executables, { recursive: true, mode: 0o755 });
+  await mkdir(helpers, { recursive: true, mode: 0o755 });
   await mkdir(appRoot, { recursive: true, mode: 0o755 });
 
   const [
     graph,
     webModules,
     swiftSources,
+    keychainMigrationHelperSources,
     localizationResources,
     workspaceRuntimePackages,
   ] = await Promise.all([
     collectMacOSRuntimeGraph(),
     collectVerifiedMacOSWebModuleGraph(),
     collectMacOSSwiftSources(),
+    collectMacOSKeychainMigrationHelperSources(),
     collectMacOSLocalizationResources(),
     captureMacOSWorkspaceRuntimePackages(),
   ]);
@@ -3457,11 +3586,17 @@ async function buildApplication(stageApp, centralService, {
     }),
   );
   await writeGeneratedFile(join(contents, "PkgInfo"), "APPL????");
-  await compileLauncher(
+  await compileNativeExecutable(
     join(executables, productBrand.executableName),
     updater,
     swiftSources,
     { buildProfile },
+  );
+  await compileNativeExecutable(
+    join(stageApp, ...MACOS_KEYCHAIN_MIGRATION_HELPER.executable.split("/")),
+    { enabled: false },
+    keychainMigrationHelperSources,
+    { buildProfile, migrationHelper: true },
   );
   await copyPinnedSparkleFramework(contents, updater);
   const node = await copyPinnedNode(resources);
@@ -3485,6 +3620,7 @@ async function buildApplication(stageApp, centralService, {
   // Record a signature-independent digest for the launcher. Pre-signing makes
   // `codesign --remove-signature` canonical both here and after the outer app
   // signature is regenerated for Developer ID distribution.
+  preSignKeychainMigrationHelperForInventory(stageApp);
   if (updater.enabled) {
     signApplicationBundle(stageApp);
   } else {
@@ -3561,6 +3697,7 @@ async function buildApplication(stageApp, centralService, {
         account: productBrand.keychainAccount,
         namespace: productBrand.keychainNamespace,
       },
+      keychainMigrationHelper: MACOS_KEYCHAIN_MIGRATION_HELPER,
       node,
       stateRoot:
         `~/Library/Application Support/${productBrand.stateDirectoryName}`,
@@ -3581,6 +3718,7 @@ async function buildApplication(stageApp, centralService, {
         graph,
         runtimeAssets,
         swiftSources,
+        keychainMigrationHelperSources,
         localizationResources,
         iconAssets,
         updater,
@@ -3588,6 +3726,8 @@ async function buildApplication(stageApp, centralService, {
         workspaceRuntimePackages,
       }),
       firstPartyFiles: graph.relativeFiles,
+      swiftSources: swiftSources.relativeFiles,
+      keychainMigrationHelperSources: keychainMigrationHelperSources.relativeFiles,
       localizationResources: localizationResources.relativeFiles.map((path) =>
         `apps/macos/Resources/${path}`),
       staticAssets: runtimeAssets,
@@ -3598,6 +3738,7 @@ async function buildApplication(stageApp, centralService, {
     dependencies,
     payload: inventory,
   };
+  assertMacOSKeychainMigrationManifest(manifest);
   const serialized = stableJson(manifest);
   // The reviewed central origin is a deliberately configured public value and
   // may legitimately contain the account name of its host (a workers.dev

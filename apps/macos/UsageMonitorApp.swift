@@ -1960,7 +1960,13 @@ private final class CompanionProcess {
     private var keychainBroker: ContributionDeviceKeychainBroker?
     private var stopCompletions: [() -> Void] = []
     private var stopped = false
+    private var terminationInProgress = false
+    private var terminationComplete = false
+    // A caller may detach the companion immediately after requesting stop.
+    // Keep it alive through OS exit and the broker's asynchronous writer barrier.
+    private var stopRetention: CompanionProcess?
     private let nodeRuntimeModeOverride: BundledNodeRuntimeMode?
+    private let onMigrationStatus: (KeychainMigrationStatus) -> Void
     private let onExit: (Bool, Bool) -> Void
     private let onReady: (URL) -> Void
 
@@ -1968,12 +1974,14 @@ private final class CompanionProcess {
         centralService: CentralServiceConfiguration?,
         codexHome: URL,
         nodeRuntimeModeOverride: BundledNodeRuntimeMode? = nil,
+        onMigrationStatus: @escaping (KeychainMigrationStatus) -> Void = { _ in },
         onReady: @escaping (URL) -> Void,
         onExit: @escaping (Bool, Bool) -> Void
     ) {
         self.centralService = centralService
         self.codexHome = codexHome
         self.nodeRuntimeModeOverride = nodeRuntimeModeOverride
+        self.onMigrationStatus = onMigrationStatus
         self.onReady = onReady
         self.onExit = onExit
     }
@@ -1991,7 +1999,44 @@ private final class CompanionProcess {
         return process.processIdentifier
     }
 
-    func launch() throws {
+    /// Only the native confirmation action reaches this seam. There is no
+    /// matching companion message, URL, or web-view operation for approval.
+    func approvePendingMigrations(completion: @escaping (Bool) -> Void) {
+        lock.lock()
+        let broker = keychainBroker
+        let canApprove = !stopped && process?.isRunning == true
+        lock.unlock()
+        guard canApprove, let broker else {
+            DispatchQueue.main.async { completion(false) }
+            return
+        }
+        broker.approvePendingMigrations(completion: completion)
+    }
+
+    func launch(
+        makeBroker: () throws -> ContributionDeviceKeychainBroker = {
+            try ContributionDeviceKeychainBroker(
+                namespace: BundledProduct.keychainNamespace,
+                account: BundledProduct.keychainAccount
+            )
+        }
+    ) throws {
+        // Require the private channel before resource access or child creation.
+        // The factory seam lets the native contract probe reject setup failures
+        // without exhausting descriptors or touching real credentials.
+        let broker: ContributionDeviceKeychainBroker
+        do {
+            broker = try makeBroker()
+        } catch {
+            throw LauncherError.companionLaunch("keychain")
+        }
+        var brokerOwnedByCompanion = false
+        defer {
+            if !brokerOwnedByCompanion { broker.shutdown() }
+        }
+        guard let childEndpoint = broker.childEndpoint else {
+            throw LauncherError.companionLaunch("keychain")
+        }
         let resources = try CompanionResources.bundled()
         let stateRoot = try ownerOnlyStateRoot()
         let homeDirectory = try currentUserHomeDirectory()
@@ -2004,20 +2049,11 @@ private final class CompanionProcess {
             nodeRuntimeModeOverride ?? resources.nodeRuntimeMode
         ).arguments(entrypoint: resources.entrypoint)
         child.currentDirectoryURL = resources.resourceRoot
-        // The companion's standard input is the app's Keychain broker
-        // channel: fresh contribution-device credentials are minted and read
-        // by this signed app, never by the companion's own Keychain access,
-        // which is what raised the first-pairing dialog. The environment
-        // names only the descriptor — the socketpair itself is the
+        // Every native credential operation uses the app's private broker.
+        // The environment names only the descriptor; the socketpair is the
         // authority, so no token or secret crosses argv or the environment.
-        // If the broker cannot be created (descriptor exhaustion), the
-        // companion runs without one and its own explained pairing path
-        // remains the net.
-        let broker = try? ContributionDeviceKeychainBroker(
-            namespace: BundledProduct.keychainNamespace,
-            account: BundledProduct.keychainAccount
-        )
-        child.standardInput = broker?.childEndpoint ?? FileHandle.nullDevice
+        broker.setMigrationStatusObserver(onMigrationStatus)
+        child.standardInput = childEndpoint
         child.standardOutput = standardOutput
         child.standardError = standardError
 
@@ -2036,11 +2072,9 @@ private final class CompanionProcess {
             "USAGE_MONITOR_STATE_ROOT": stateRoot.path,
             "CODEX_HOME": codexHome.path,
         ]
-        if broker?.childEndpoint != nil {
-            environment[
-                ContributionDeviceKeychainBroker.environmentVariable
-            ] = "0"
-        }
+        environment[
+            ContributionDeviceKeychainBroker.environmentVariable
+        ] = "0"
         for name in ["LANG", "LC_ALL", "TMPDIR"] {
             if let value = inherited[name], !value.contains("\0") {
                 environment[name] = value
@@ -2071,26 +2105,31 @@ private final class CompanionProcess {
         }
 
         lock.lock()
+        guard !stopped, process == nil, !terminationInProgress, !terminationComplete else {
+            lock.unlock()
+            throw LauncherError.companionLaunch("stopped")
+        }
         process = child
         keychainBroker = broker
-        stopped = false
+        brokerOwnedByCompanion = true
         pendingOutput = ""
         pendingStandardError = ""
         activeInstanceDetected = false
-        lock.unlock()
         do {
+            // Keep stop from observing an assigned but not-yet-started child.
+            // This is process creation only; no shutdown/Keychain wait is on main.
             try child.run()
-        } catch {
-            lock.lock()
-            process = nil
-            keychainBroker = nil
             lock.unlock()
-            broker?.shutdown()
+        } catch {
+            lock.unlock()
+            standardOutput.fileHandleForReading.readabilityHandler = nil
+            standardError.fileHandleForReading.readabilityHandler = nil
+            didTerminate(success: false, notifyExit: false)
             throw LauncherError.companionLaunch("run")
         }
         // The child holds its dup2'd copy; dropping ours is what turns a
         // companion exit into end-of-file on the broker channel.
-        broker?.closeChildEndpoint()
+        broker.closeChildEndpoint()
     }
 
     private func consumeStandardOutput(_ data: Data) {
@@ -2147,34 +2186,83 @@ private final class CompanionProcess {
         lock.unlock()
     }
 
-    private func didTerminate(success: Bool) {
+    private func didTerminate(success: Bool, notifyExit: Bool = true) {
         lock.lock()
+        guard !terminationInProgress, !terminationComplete else {
+            lock.unlock()
+            return
+        }
+        terminationInProgress = true
         process = nil
         let broker = keychainBroker
         keychainBroker = nil
+        let anotherInstanceIsActive = activeInstanceDetected
+        lock.unlock()
+        let finish = { [self] in
+            finishTermination(
+                success: success,
+                notifyExit: notifyExit,
+                anotherInstanceIsActive: anotherInstanceIsActive
+            )
+        }
+        if let broker {
+            broker.shutdown(completion: finish)
+        } else {
+            finish()
+        }
+    }
+
+    private func finishTermination(
+        success: Bool,
+        notifyExit: Bool,
+        anotherInstanceIsActive: Bool
+    ) {
+        lock.lock()
+        guard terminationInProgress, !terminationComplete else {
+            lock.unlock()
+            return
+        }
+        terminationInProgress = false
+        terminationComplete = true
         let completions = stopCompletions
         stopCompletions.removeAll()
         let wasStopped = stopped
-        let anotherInstanceIsActive = activeInstanceDetected
+        stopRetention = nil
         lock.unlock()
-        broker?.shutdown()
         for completion in completions {
             completion()
         }
-        onExit(success && wasStopped, anotherInstanceIsActive)
+        if notifyExit {
+            onExit(success && wasStopped, anotherInstanceIsActive)
+        }
     }
 
     func stop(completion: @escaping () -> Void) {
         lock.lock()
+        let firstStop = !stopped
         stopped = true
-        guard let child = process, child.isRunning else {
+        if terminationComplete {
             lock.unlock()
             completion()
             return
         }
         stopCompletions.append(completion)
-        child.terminate()
+        stopRetention = self
+        guard !terminationInProgress else {
+            lock.unlock()
+            return
+        }
+        guard let child = process else {
+            lock.unlock()
+            didTerminate(success: true, notifyExit: false)
+            return
+        }
+        let shouldTerminate = firstStop && child.isRunning
         lock.unlock()
+        // A stopped child may still have its Foundation termination handler
+        // pending. That handler and the broker barrier own the completions.
+        guard shouldTerminate else { return }
+        child.terminate()
 
         DispatchQueue.global(qos: .utility).asyncAfter(
             deadline: .now() + 2
@@ -2187,6 +2275,110 @@ private final class CompanionProcess {
                 _ = kill(child.processIdentifier, SIGKILL)
             }
         }
+    }
+
+    /// Deterministic pre-spawn failures through the real launch entrypoint.
+    /// A newly created broker has an endpoint; closing that endpoint models
+    /// the other setup failure without exhausting process-wide descriptors.
+    static func verifyKeychainLaunchContract() -> Bool {
+        enum Failure: CaseIterable { case construction, missingEndpoint }
+        for failure in Failure.allCases {
+            var factoryCalls = 0
+            var healthyEndpointObserved = false
+            var readyCalls = 0
+            var exitCalls = 0
+            let companion = CompanionProcess(
+                centralService: nil,
+                codexHome: URL(fileURLWithPath: "/synthetic-home-not-opened"),
+                onReady: { _ in readyCalls += 1 },
+                onExit: { _, _ in exitCalls += 1 }
+            )
+            do {
+                try companion.launch(makeBroker: {
+                    factoryCalls += 1
+                    if failure == .construction {
+                        throw ContributionDeviceKeychainBrokerUnavailable()
+                    }
+                    let broker = try ContributionDeviceKeychainBroker(
+                        namespace: BundledProduct.keychainNamespace,
+                        account: BundledProduct.keychainAccount
+                    )
+                    healthyEndpointObserved = broker.childEndpoint != nil
+                    broker.closeChildEndpoint()
+                    return broker
+                })
+                return false
+            } catch LauncherError.companionLaunch(let reason) {
+                guard reason == "keychain", factoryCalls == 1,
+                      failure == .construction || healthyEndpointObserved,
+                      companion.process == nil, companion.keychainBroker == nil,
+                      !companion.isRunning, companion.processIdentifier == nil,
+                      readyCalls == 0, exitCalls == 0
+                else { return false }
+            } catch {
+                return false
+            }
+            var stoppedCalls = 0
+            companion.stop { stoppedCalls += 1 }
+            companion.stop { stoppedCalls += 1 }
+            guard stoppedCalls == 2, readyCalls == 0, exitCalls == 0 else { return false }
+        }
+        return true
+    }
+
+    /// Memory-only composition probe: use the actual stop and termination
+    /// methods with an injected broker, never launch a companion or reset helper.
+    static func verifyKeychainShutdownContract() -> Bool {
+        enum Phase: CaseIterable { case alreadyAbsent, handlerPending, brokerDraining }
+        for phase in Phase.allCases {
+            let resultLock = NSLock()
+            var callbackCount = 0
+            var exitCount = 0
+            weak var retainedCompanion: CompanionProcess?
+            let passed = ContributionDeviceKeychainBroker.verifyExternalResetOrder { broker, reset in
+                let companion = CompanionProcess(
+                    centralService: nil,
+                    codexHome: URL(fileURLWithPath: "/synthetic-home-not-opened"),
+                    onReady: { _ in },
+                    onExit: { _, _ in
+                        resultLock.lock(); exitCount += 1; resultLock.unlock()
+                    }
+                )
+                retainedCompanion = companion
+                companion.keychainBroker = broker
+                if phase == .handlerPending {
+                    // A non-running Process models the interval before the
+                    // real Foundation termination handler has been delivered.
+                    companion.process = Process()
+                } else if phase == .brokerDraining {
+                    companion.didTerminate(success: true)
+                }
+                companion.stop {
+                    resultLock.lock(); callbackCount += 1; resultLock.unlock()
+                    reset()
+                }
+                companion.stop {
+                    resultLock.lock(); callbackCount += 1; resultLock.unlock()
+                }
+                if phase == .handlerPending { companion.didTerminate(success: true) }
+                // Drop the caller's reference while the broker is paused.
+                // Pending termination must retain it only through the barrier.
+            }
+            resultLock.lock()
+            let completedOnce = callbackCount == 2
+                && exitCount == (phase == .alreadyAbsent ? 0 : 1)
+            resultLock.unlock()
+            guard passed, completedOnce, retainedCompanion == nil else { return false }
+        }
+        let idle = CompanionProcess(
+            centralService: nil,
+            codexHome: URL(fileURLWithPath: "/synthetic-home-not-opened"),
+            onReady: { _ in }, onExit: { _, _ in }
+        )
+        var completedCount = 0
+        idle.stop { completedCount += 1 }
+        idle.stop { completedCount += 1 }
+        return completedCount == 2
     }
 }
 
@@ -3951,6 +4143,122 @@ private final class NativeSettingsToolbarDelegate: NSObject,
     }
 }
 
+/// Native presentation only: the broker owns the app-process retry budget and
+/// the saved keys. Observing status, opening Settings, and cancelling a review
+/// cannot authorize Keychain interaction or restart the silent retry budget.
+@MainActor
+private final class NativeKeychainMigrationApproval {
+    private(set) var status: KeychainMigrationStatus = .idle
+    private(set) var isReviewing = false
+    private(set) var approvalInFlight = false
+    private(set) var lastApprovalDeferred = false
+    private var reviewGeneration = 0
+    var onPresentationChange: (() -> Void)?
+    private let approve: (@escaping (Bool) -> Void) -> Void
+    private let onMigrationCompleted: () -> Void
+
+    init(
+        approve: @escaping (@escaping (Bool) -> Void) -> Void,
+        onMigrationCompleted: @escaping () -> Void
+    ) {
+        self.approve = approve
+        self.onMigrationCompleted = onMigrationCompleted
+    }
+
+    var showsSettings: Bool {
+        status.pendingCount > 0 || status.isRetrying || status.isApproving
+            || approvalInFlight
+    }
+
+    var showsMenuItem: Bool {
+        status.needsApproval || status.isApproving || approvalInFlight
+    }
+
+    var canReview: Bool {
+        status.needsApproval && !isReviewing && !approvalInFlight
+    }
+
+    var summaryKey: TiboTattleLocalization.Key {
+        if status.isApproving || approvalInFlight {
+            return .settingsKeychainMigrationApproving
+        }
+        if status.isRetrying { return .settingsKeychainMigrationRetrying }
+        if lastApprovalDeferred { return .settingsKeychainMigrationDeferred }
+        return .settingsKeychainMigrationSummary
+    }
+
+    func observe(_ next: KeychainMigrationStatus) {
+        let wasPending = status.pendingCount > 0
+            || status.isRetrying || status.isApproving
+        status = next
+        let completed = wasPending && next.pendingCount == 0
+            && !next.isRetrying && !next.isApproving
+        if completed { lastApprovalDeferred = false }
+        onPresentationChange?()
+        // Initial/current idle observations are not completion receipts and
+        // must never start an extra local refresh.
+        if completed { onMigrationCompleted() }
+    }
+
+    /// The confirmation callback is supplied only by the native review action.
+    /// Its one-shot guard also ignores duplicate sheet completions or a second
+    /// click while either the explanation or system approval is still open.
+    func review(confirm: (@escaping (Bool) -> Void) -> Void) {
+        guard canReview else { return }
+        reviewGeneration += 1
+        let selectedReviewGeneration = reviewGeneration
+        isReviewing = true
+        onPresentationChange?()
+        confirm { [weak self] approved in
+            guard let self, self.isReviewing,
+                  self.reviewGeneration == selectedReviewGeneration
+            else { return }
+            self.isReviewing = false
+            guard approved, self.status.needsApproval,
+                  !self.approvalInFlight
+            else {
+                self.onPresentationChange?()
+                return
+            }
+            self.approvalInFlight = true
+            self.lastApprovalDeferred = false
+            self.onPresentationChange?()
+            self.approve { [weak self] success in
+                guard let self, self.approvalInFlight,
+                      self.reviewGeneration == selectedReviewGeneration
+                else { return }
+                self.approvalInFlight = false
+                self.lastApprovalDeferred = !success
+                self.onPresentationChange?()
+            }
+        }
+    }
+
+    static func makeExplanation() -> NSAlert {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = TiboTattleLocalization.string(
+            .dialogKeychainMigrationTitle
+        )
+        alert.informativeText = TiboTattleLocalization.string(
+            .dialogKeychainMigrationDescription
+        )
+        // Cancel is the safe default. A Return key that merely opened Settings
+        // must not turn into permission for a system password dialog.
+        let cancel = alert.addButton(
+            withTitle: TiboTattleLocalization.string(.commonCancel)
+        )
+        cancel.keyEquivalent = "\r"
+        let approve = alert.addButton(
+            withTitle: TiboTattleLocalization.string(
+                .dialogApproveKeychainMigration
+            )
+        )
+        approve.keyEquivalent = ""
+        return alert
+    }
+}
+
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate,
     NSWindowDelegate, NSToolbarDelegate {
@@ -3960,9 +4268,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private var centralServiceMode: CentralServiceMode?
     private var codexHomeConfiguration: CodexHomeConfiguration?
     private var companion: CompanionProcess?
+    private var retiringCompanions = [ObjectIdentifier: CompanionProcess]()
     private var dashboardURL: URL?
     private var firstRunAcknowledged = false
     private var keychainResetProcess: Process?
+    private var keychainResetGeneration: Int?
     private var launchGeneration = 0
     private var pendingDashboardOpen = false
     private var quitting = false
@@ -3996,6 +4306,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private weak var settingsQuotaNotificationStatusLabel: NSTextField?
     private weak var settingsAppearancePicker: NSPopUpButton?
     private weak var settingsRefreshIntervalPicker: NSPopUpButton?
+    private weak var settingsKeychainMigrationSection: NSView?
+    private weak var settingsKeychainMigrationLabel: NSTextField?
+    private weak var settingsKeychainMigrationButton: NSButton?
+    private weak var keychainMigrationMenuItem: NSMenuItem?
+    private var keychainMigrationRefreshPending = false
+    private lazy var keychainMigrationApproval = NativeKeychainMigrationApproval(
+        approve: { [weak self] completion in
+            guard let self, !self.quitting, let companion = self.companion
+            else {
+                completion(false)
+                return
+            }
+            companion.approvePendingMigrations(completion: completion)
+        },
+        onMigrationCompleted: { [weak self] in
+            self?.refreshAfterKeychainMigration()
+        }
+    )
     private let nativeEvidenceReader = LocalCompanionEvidenceReader()
     private var quotaNotificationCoordinator: QuotaNotificationCoordinator?
     private var nativeDashboardChrome: NativeDashboardChrome?
@@ -4123,6 +4451,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         self.semanticOpenTarget = semanticOpenTarget
         self.loginItemManager = loginItemManager
         super.init()
+        keychainMigrationApproval.onPresentationChange = { [weak self] in
+            self?.updateKeychainMigrationPresentation()
+        }
         updater.onStateChange = { [weak self] in
             self?.updateUpdaterPresentation()
         }
@@ -4294,8 +4625,28 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         return true
     }
 
+    /// Main-thread ownership includes detached generations until their broker
+    /// writer barriers finish. A later destructive reset must await them too.
+    private func retireCompanion(
+        _ previous: CompanionProcess,
+        completion: @escaping () -> Void = {}
+    ) {
+        let identifier = ObjectIdentifier(previous)
+        retiringCompanions[identifier] = previous
+        previous.stop { [weak self, weak previous] in
+            DispatchQueue.main.async {
+                if let self, let previous, self.retiringCompanions[identifier] === previous {
+                    self.retiringCompanions.removeValue(forKey: identifier)
+                }
+                completion()
+            }
+        }
+    }
+
     private func startCompanion() {
         guard !quitting, retryAllowed, firstRunAcknowledged,
+              keychainResetGeneration == nil, keychainResetProcess == nil,
+              companion == nil,
               let codexHomeConfiguration
         else { return }
         startupTimeout?.cancel()
@@ -4322,6 +4673,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         let process = CompanionProcess(
             centralService: centralService,
             codexHome: codexHomeConfiguration.url,
+            onMigrationStatus: { [weak self] status in
+                DispatchQueue.main.async {
+                    guard let self, !self.quitting,
+                          selectedGeneration == self.launchGeneration
+                    else { return }
+                    self.keychainMigrationApproval.observe(status)
+                }
+            },
             onReady: { [weak self] url in
                 DispatchQueue.main.async {
                     self?.companionReady(
@@ -4355,7 +4714,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 }
                 self.launchGeneration += 1
                 self.companion = nil
-                process.stop {}
+                self.retireCompanion(process)
                 self.showFailure(LauncherError.companionTimeout)
             }
             startupTimeout = timeout
@@ -4367,6 +4726,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             )
         } catch {
             companion = nil
+            retireCompanion(process)
             showFailure(error)
         }
     }
@@ -5127,6 +5487,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         else {
             return
         }
+        keychainMigrationRefreshPending = false
         cancelNativeRefreshSchedule()
         cancelNativeIndexingCoveragePoll()
         nativeRefreshInFlight = true
@@ -5335,6 +5696,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         // refresh still leaves the page asserting a freshness this window can
         // no longer vouch for.
         dashboardWebHost?.notifyLocalEvidenceUpdated()
+        if keychainMigrationRefreshPending {
+            refreshAfterKeychainMigration()
+            return
+        }
         scheduleNativeRefresh()
         scheduleNativeIndexingCoveragePoll()
     }
@@ -5503,6 +5868,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         )
         settings.target = self
         appMenu.addItem(settings)
+        let migration = NSMenuItem(
+            title: TiboTattleLocalization.string(.settingsKeychainMigrationMenu),
+            action: #selector(showKeychainMigrationSettings),
+            keyEquivalent: ""
+        )
+        migration.target = self
+        migration.isHidden = !keychainMigrationApproval.showsMenuItem
+        keychainMigrationMenuItem = migration
+        appMenu.addItem(migration)
         appMenu.addItem(.separator())
         let quit = NSMenuItem(
             title: TiboTattleLocalization.format(
@@ -5762,6 +6136,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             return
         }
         dashboardURL = url
+        updateKeychainMigrationPresentation()
         nativeEvidenceState = .unknown
         nativeEvidenceObservedAt = nil
         // A restarted companion invalidates any earlier coverage counts and
@@ -5810,6 +6185,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         startupTimeout?.cancel()
         startupTimeout = nil
         startupAutomaticRefreshPending = false
+        updateKeychainMigrationPresentation()
         if quitting || requested { return }
         dashboardURL = nil
         companion = nil
@@ -5893,18 +6269,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     @objc private func retryCompanion() {
-        guard !quitting, retryAllowed, firstRunAcknowledged else { return }
+        guard !quitting, retryAllowed, firstRunAcknowledged,
+              keychainResetGeneration == nil, keychainResetProcess == nil else { return }
         automaticCompanionRecoveryUsed = false
-        if let previous = companion, previous.isRunning {
+        launchGeneration += 1
+        let retryGeneration = launchGeneration
+        let previous = companion
+        companion = nil
+        if let previous {
             retryButton.isEnabled = false
-            previous.stop { [weak self] in
-                DispatchQueue.main.async {
-                    self?.companion = nil
-                    self?.startCompanion()
-                }
+            retireCompanion(previous) { [weak self] in
+                guard let self, !self.quitting, self.launchGeneration == retryGeneration else { return }
+                self.startCompanion()
             }
         } else {
-            companion = nil
             startCompanion()
         }
     }
@@ -6042,6 +6420,47 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private func updateSettingsCodexHomeSummary() {
         settingsCodexHomeLabel?.stringValue = codexHomeSettingsSummary()
         refitSettingsWindowToContent()
+    }
+
+    private func updateKeychainMigrationPresentation() {
+        let presentation = keychainMigrationApproval
+        settingsKeychainMigrationSection?.isHidden =
+            !presentation.showsSettings
+        settingsKeychainMigrationLabel?.stringValue =
+            TiboTattleLocalization.string(presentation.summaryKey)
+        settingsKeychainMigrationButton?.isEnabled =
+            presentation.canReview && !quitting && companion?.isRunning == true
+        keychainMigrationMenuItem?.isHidden = !presentation.showsMenuItem
+        // A status observation is deliberately non-modal and never opens
+        // Settings. Local quota/accounting presentation keeps its own truth.
+        refitSettingsWindowToContent()
+    }
+
+    private func refreshAfterKeychainMigration() {
+        guard !quitting else { return }
+        keychainMigrationRefreshPending = true
+        guard dashboardURL != nil, !nativeRefreshInFlight else { return }
+        // One repair refresh uses the existing local-only analysis route. It
+        // neither grants contribution consent nor starts a second scan while
+        // the current pass is still running.
+        refreshLocalUsage(automatic: false)
+    }
+
+    @objc private func showKeychainMigrationSettings() {
+        showSettings(selecting: 0)
+    }
+
+    @objc private func reviewKeychainMigration(_ sender: NSButton) {
+        guard sender === settingsKeychainMigrationButton,
+              !quitting, companion?.isRunning == true,
+              let settingsWindow
+        else { return }
+        keychainMigrationApproval.review { complete in
+            let explanation = NativeKeychainMigrationApproval.makeExplanation()
+            explanation.beginSheetModal(for: settingsWindow) { response in
+                complete(response == .alertSecondButtonReturn)
+            }
+        }
     }
 
     private func automaticUpdatesSettingsSummary() -> String {
@@ -6649,6 +7068,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         settingsCheckForUpdatesButton = nil
         settingsAppearancePicker = nil
         settingsRefreshIntervalPicker = nil
+        settingsKeychainMigrationSection = nil
+        settingsKeychainMigrationLabel = nil
+        settingsKeychainMigrationButton = nil
         if shouldRestoreSettings {
             showSettings(selecting: selectedSettingsTab)
         }
@@ -6687,6 +7109,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             updateAppearanceSettingsControl()
             updateRefreshIntervalSettingsControl()
             updateStartAtLoginSettingsControl()
+            updateKeychainMigrationPresentation()
             quotaNotificationCoordinator?.refreshAuthorization()
             updateQuotaNotificationSettingsControls()
             refitSettingsWindowToContent()
@@ -6712,6 +7135,31 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             action: #selector(useDefaultCodexHome)
         )
         let sourceActions = settingsControlRow([chooseSource, useDefaultSource])
+        let migrationStatus = settingsLabel(
+            TiboTattleLocalization.string(keychainMigrationApproval.summaryKey),
+            font: .systemFont(ofSize: 12),
+            color: .secondaryLabelColor
+        )
+        settingsKeychainMigrationLabel = migrationStatus
+        let reviewMigration = NSButton(
+            title: TiboTattleLocalization.string(.settingsKeychainMigrationReview),
+            target: self,
+            action: #selector(reviewKeychainMigration(_:))
+        )
+        reviewMigration.bezelStyle = .rounded
+        reviewMigration.isEnabled = keychainMigrationApproval.canReview
+            && !quitting && companion?.isRunning == true
+        reviewMigration.setAccessibilityLabel(
+            TiboTattleLocalization.string(.settingsKeychainMigrationReview)
+        )
+        settingsKeychainMigrationButton = reviewMigration
+        let migrationSection = settingsGroup(
+            title: TiboTattleLocalization.string(.settingsKeychainMigrationTitle),
+            symbolName: "key",
+            views: [migrationStatus, settingsControlRow([reviewMigration])]
+        )
+        migrationSection.isHidden = !keychainMigrationApproval.showsSettings
+        settingsKeychainMigrationSection = migrationSection
         let appearancePicker = NSPopUpButton(
             frame: .zero,
             pullsDown: false
@@ -7048,6 +7496,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             title: TiboTattleLocalization.string(.settingsGeneral),
             summary: TiboTattleLocalization.string(.settingsGeneralSummary),
             views: [
+                migrationSection,
                 appearanceSection,
                 languageSection,
                 sourceSection,
@@ -7225,6 +7674,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         settingsWindow = newWindow
         settingsTabs = tabs
         settingsToolbarDelegate = toolbarDelegate
+        updateKeychainMigrationPresentation()
         updateQuotaNotificationSettingsControls()
         newWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -7502,13 +7952,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         hideDashboardWebView()
         startupTimeout?.cancel()
         launchGeneration += 1
+        let restartGeneration = launchGeneration
         let previous = companion
         companion = nil
-        if let previous, previous.isRunning {
-            previous.stop { [weak self] in
-                DispatchQueue.main.async {
-                    self?.startCompanion()
-                }
+        if let previous {
+            retireCompanion(previous) { [weak self] in
+                guard let self, !self.quitting, self.launchGeneration == restartGeneration else { return }
+                self.startCompanion()
             }
         } else {
             startCompanion()
@@ -7574,7 +8024,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func performLocalKeychainReset() {
-        guard keychainResetProcess == nil else { return }
+        guard !quitting, keychainResetGeneration == nil, keychainResetProcess == nil else { return }
         lastLifecycleStatus = "Resetting local identity"
         statusLabel.stringValue = TiboTattleLocalization.string(
             .launcherResettingLocalIdentity
@@ -7588,21 +8038,34 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         hideDashboardWebView()
         startupTimeout?.cancel()
         launchGeneration += 1
+        let resetGeneration = launchGeneration
+        // Claim the whole operation, including the asynchronous stop barrier.
+        // A second Reset action must not bypass it after companion is detached.
+        keychainResetGeneration = resetGeneration
         let previous = companion
         companion = nil
+        var pendingCompanions = retiringCompanions
+        if let previous { pendingCompanions[ObjectIdentifier(previous)] = previous }
         let runReset = { [weak self] in
             DispatchQueue.main.async {
-                self?.launchLocalKeychainResetHelper()
+                guard let self, self.keychainResetGeneration == resetGeneration else { return }
+                guard !self.quitting, self.launchGeneration == resetGeneration else {
+                    self.keychainResetGeneration = nil
+                    return
+                }
+                self.launchLocalKeychainResetHelper(generation: resetGeneration)
             }
         }
-        if let previous, previous.isRunning {
-            previous.stop(completion: runReset)
-        } else {
-            runReset()
+        let stopped = DispatchGroup()
+        for previous in pendingCompanions.values {
+            stopped.enter()
+            retireCompanion(previous) { stopped.leave() }
         }
+        stopped.notify(queue: .main, execute: runReset)
     }
 
-    private func launchLocalKeychainResetHelper() {
+    private func launchLocalKeychainResetHelper(generation: Int) {
+        guard keychainResetGeneration == generation, launchGeneration == generation, !quitting else { return }
         do {
             let resources = try CompanionResources.bundled()
             let stateRoot = try ownerOnlyStateRoot()
@@ -7642,11 +8105,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 let errorOutput = standardError.fileHandleForReading
                     .readDataToEndOfFile()
                 DispatchQueue.main.async {
-                    self?.keychainResetProcess = nil
-                    self?.finishLocalKeychainReset(
+                    guard let self, self.keychainResetProcess === terminated else { return }
+                    self.keychainResetProcess = nil
+                    guard self.keychainResetGeneration == generation else { return }
+                    self.keychainResetGeneration = nil
+                    guard !self.quitting, self.launchGeneration == generation else { return }
+                    self.finishLocalKeychainReset(
                         status: terminated.terminationStatus,
                         output: output,
-                        errorOutput: errorOutput
+                        errorOutput: errorOutput,
+                        generation: generation
                     )
                 }
             }
@@ -7654,6 +8122,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             try child.run()
         } catch {
             keychainResetProcess = nil
+            if keychainResetGeneration == generation { keychainResetGeneration = nil }
             showFailure(LauncherError.keychainReset)
         }
     }
@@ -7661,7 +8130,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private func finishLocalKeychainReset(
         status: Int32,
         output: Data,
-        errorOutput: Data
+        errorOutput: Data,
+        generation: Int
     ) {
         let decoded = try? JSONDecoder().decode(
             LocalKeychainResetResult.self,
@@ -7678,6 +8148,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             )
             result.addButton(withTitle: TiboTattleLocalization.string(.dialogDone))
             result.runModal()
+            guard !quitting, launchGeneration == generation else { return }
             retryAllowed = true
             startCompanion()
             return
@@ -7720,9 +8191,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         dashboardWebHost?.stop()
         hideDashboardWebView()
         launchGeneration += 1
+        let eraseGeneration = launchGeneration
         let previous = companion
         companion = nil
         let erase = { [weak self] in
+            guard let self, !self.quitting, self.launchGeneration == eraseGeneration else { return }
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
                     let stateRoot = try ownerOnlyStateRoot()
@@ -7732,7 +8205,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                     )
                     DispatchQueue.main.async {
                         DashboardWebHost.clearPersistentWebsiteData {
-                            guard let self, !self.quitting else { return }
+                            guard !self.quitting, self.launchGeneration == eraseGeneration else { return }
                             do {
                                 self.codexHomeConfiguration =
                                     CodexHomeConfiguration(
@@ -7757,13 +8230,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                     }
                 } catch {
                     DispatchQueue.main.async {
-                        self?.showFailure(LauncherError.dataErase)
+                        guard !self.quitting, self.launchGeneration == eraseGeneration else { return }
+                        self.showFailure(LauncherError.dataErase)
                     }
                 }
             }
         }
-        if let previous, previous.isRunning {
-            previous.stop(completion: erase)
+        if let previous {
+            retireCompanion(previous, completion: erase)
         } else {
             erase()
         }
@@ -8261,6 +8735,7 @@ private enum LifecycleContractSmokeTest {
     }
 
     static func keychainResetContract() -> Int32 {
+        guard CompanionProcess.verifyKeychainShutdownContract() else { return 1 }
         let completePayload = Data(
             """
             {
@@ -8327,7 +8802,8 @@ private enum LifecycleContractSmokeTest {
         print(
             "USAGE_MONITOR_MACOS_KEYCHAIN_RESET_CONTRACT "
                 + "targets=2 app_state=targeted hosted_mutation=false "
-                + "secure_erasure=false confirmations=2"
+                + "secure_erasure=false confirmations=2 writer_barrier=drained "
+                + "callbacks=once reset_resurrection=false keychain_access=0"
         )
         return 0
     }
@@ -8459,6 +8935,135 @@ private enum NativeRefreshSettingsContractSmokeTest {
                 + "picker_action=true picker_persisted=true "
                 + "scheduler=300->900 "
                 + "invalid_ignored=true"
+        )
+        return 0
+    }
+}
+
+/// Exercises the shipped native approval state machine and the real NSAlert
+/// configuration with synthetic completion callbacks. It neither presents a
+/// system permission dialog nor constructs a companion or Keychain broker.
+@MainActor
+private enum NativeKeychainMigrationUIContractSmokeTest {
+    static func run() -> Int32 {
+        _ = NSApplication.shared
+        let explanation = NativeKeychainMigrationApproval.makeExplanation()
+        guard explanation.alertStyle == .informational,
+              explanation.buttons.count == 2,
+              explanation.buttons[0].title ==
+                TiboTattleLocalization.string(.commonCancel),
+              explanation.buttons[0].keyEquivalent == "\r",
+              explanation.buttons[1].title == TiboTattleLocalization.string(
+                .dialogApproveKeychainMigration
+              ),
+              explanation.buttons[1].keyEquivalent.isEmpty,
+              explanation.informativeText == TiboTattleLocalization.string(
+                .dialogKeychainMigrationDescription
+              )
+        else { return 1 }
+
+        var approvalCalls = 0
+        var refreshCalls = 0
+        var confirmationCalls = 0
+        var finishApproval: ((Bool) -> Void)?
+        let state = NativeKeychainMigrationApproval(
+            approve: { completion in
+                approvalCalls += 1
+                finishApproval = completion
+            },
+            onMigrationCompleted: { refreshCalls += 1 }
+        )
+        state.observe(.idle)
+        guard !state.showsSettings, !state.showsMenuItem,
+              !state.canReview, refreshCalls == 0
+        else { return 1 }
+        state.observe(KeychainMigrationStatus(
+            pendingCount: 1, isRetrying: true, isApproving: false
+        ))
+        state.review { complete in
+            confirmationCalls += 1
+            complete(true)
+        }
+        guard state.showsSettings, !state.showsMenuItem,
+              !state.canReview, confirmationCalls == 0, approvalCalls == 0,
+              state.summaryKey == .settingsKeychainMigrationRetrying
+        else { return 1 }
+        state.observe(KeychainMigrationStatus(
+            pendingCount: 1, isRetrying: false, isApproving: false
+        ))
+        guard state.showsMenuItem, state.canReview else { return 1 }
+
+        var cancelledReview: ((Bool) -> Void)?
+        state.review { complete in
+            confirmationCalls += 1
+            cancelledReview = complete
+            complete(false)
+            // A late/duplicate callback may not turn cancellation into approval.
+            complete(true)
+        }
+        guard approvalCalls == 0, refreshCalls == 0,
+              state.canReview, !state.lastApprovalDeferred
+        else { return 1 }
+
+        var staleReviewIgnored = false
+        state.review { complete in
+            cancelledReview?(true)
+            staleReviewIgnored = approvalCalls == 0 && state.isReviewing
+            complete(true)
+        }
+        state.review { complete in
+            confirmationCalls += 1
+            complete(true)
+        }
+        guard approvalCalls == 1, confirmationCalls == 1, staleReviewIgnored,
+              state.approvalInFlight, !state.canReview,
+              state.summaryKey == .settingsKeychainMigrationApproving
+        else { return 1 }
+        finishApproval?(false)
+        finishApproval?(true)
+        guard state.canReview, state.lastApprovalDeferred,
+              state.summaryKey == .settingsKeychainMigrationDeferred,
+              refreshCalls == 0
+        else { return 1 }
+
+        let staleApprovalCompletion = finishApproval
+        state.review { complete in complete(true) }
+        staleApprovalCompletion?(true)
+        guard state.approvalInFlight else { return 1 }
+        state.observe(KeychainMigrationStatus(
+            pendingCount: 1, isRetrying: false, isApproving: true
+        ))
+        state.observe(.idle)
+        finishApproval?(true)
+        state.observe(.idle)
+        guard approvalCalls == 2, refreshCalls == 1,
+              !state.showsSettings, !state.showsMenuItem,
+              !state.canReview, !state.lastApprovalDeferred
+        else { return 1 }
+
+        state.observe(KeychainMigrationStatus(
+            pendingCount: 1, isRetrying: true, isApproving: false
+        ))
+        state.observe(.idle)
+        state.observe(.idle)
+        guard refreshCalls == 2, approvalCalls == 2 else { return 1 }
+
+        var finishReview: ((Bool) -> Void)?
+        state.observe(KeychainMigrationStatus(
+            pendingCount: 1, isRetrying: false, isApproving: false
+        ))
+        state.review { finishReview = $0 }
+        state.observe(.idle)
+        finishReview?(true)
+        guard approvalCalls == 2, refreshCalls == 3,
+              !state.isReviewing, !state.approvalInFlight
+        else { return 1 }
+        print(
+            "USAGE_MONITOR_MACOS_KEYCHAIN_MIGRATION_UI_CONTRACT "
+                + "automatic_prompt=false retrying=quiet "
+                + "cancel=preserved denial=preserved "
+                + "approval=explicit duplicate_ignored=true "
+                + "refresh=transition_only keychain_access=false"
         )
         return 0
     }
@@ -12326,6 +12931,12 @@ private struct UsageMonitorMain {
         }
         BundledProduct.validateRuntimeIdentity()
         if arguments.contains("--keychain-broker-contract-smoke-test") {
+            guard CompanionProcess.verifyKeychainLaunchContract() else { exit(1) }
+            print(
+                "USAGE_MONITOR_MACOS_KEYCHAIN_LAUNCH_CONTRACT "
+                    + "required=true failures=construction,endpoint "
+                    + "child_started=false stop_callbacks=once keychain_access=0"
+            )
             exit(ContributionDeviceKeychainBroker.runContractSmokeTest())
         }
         let semanticOpenTarget = SemanticOpenTarget(
@@ -12407,6 +13018,14 @@ private struct UsageMonitorMain {
         }
         if arguments.contains("--native-refresh-settings-contract-smoke-test") {
             exit(NativeRefreshSettingsContractSmokeTest.run())
+        }
+        if arguments.contains(
+            "--native-keychain-migration-ui-contract-smoke-test"
+        ) {
+            guard BundledProduct.buildChannel == "development" else { exit(2) }
+            exit(MainActor.assumeIsolated {
+                NativeKeychainMigrationUIContractSmokeTest.run()
+            })
         }
         if arguments.contains(
             "--native-appearance-settings-contract-smoke-test"

@@ -21,10 +21,18 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import {
   assertRuntimeIdentity,
+  createRegenerationProgress,
+  reportR7SourcePlanFailureContext,
+  r7SourcePlanFailureMessage,
   recoverFailedGeneration,
   runtimeDetails,
   validateCompleteStaging,
 } from "../scripts/regenerate-r7-release-evidence.js";
+import {
+  createExportSourcePlanBundle,
+  ExportSourcePlanBundleError,
+} from "../src/export-source-plan-bundle.js";
+import { createExportResourceGuard } from "../src/export-resource-policy.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = join(ROOT, "scripts", "regenerate-r7-release-evidence.js");
@@ -99,6 +107,67 @@ function run(arguments_, options = {}) {
     ...options,
   });
 }
+
+test("R7 stderr reports only observed closed source-plan context, never forged error properties", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "usage-monitor-r7-context-test-")));
+  const lines = [];
+  const writeStderr = (line) => lines.push(line);
+  const canary = "PRIVATE_FAILURE_CONTEXT_CANARY";
+  let touched = 0;
+  try {
+    const forged = new ExportSourcePlanBundleError("integrity");
+    for (const key of ["context", "message", "cause", "stack", "code"]) {
+      Object.defineProperty(forged, key, { get() { touched += 1; throw new Error(canary); } });
+    }
+    assert.equal(reportR7SourcePlanFailureContext(forged, { writeStderr }), false);
+    assert.equal(reportR7SourcePlanFailureContext(new Proxy({}, {
+      get() { touched += 1; throw new Error(canary); },
+      getPrototypeOf() { touched += 1; throw new Error(canary); },
+      getOwnPropertyDescriptor() { touched += 1; throw new Error(canary); },
+    }), { writeStderr }), false);
+    assert.deepEqual(lines, []);
+    assert.equal(touched, 0);
+    await assert.rejects(createExportSourcePlanBundle({
+      startAt: "2026-07-24T12:00:00.000Z",
+      endAt: "2026-07-24T13:00:00.000Z",
+      secret: Buffer.alloc(32, 0x6f),
+      resourceGuard: createExportResourceGuard({ scope: "export_set" }),
+      codexHome: root,
+      collectorPath: join(root, canary),
+    }), (error) => {
+      assert.equal(error.code, "export_source_plan_bundle_integrity");
+      assert.equal(error.message, "Local export source-plan bundle failed (integrity)");
+      error.context = { operation: canary, source: root, reason: canary };
+      assert.equal(reportR7SourcePlanFailureContext(error, { writeStderr }), true);
+      Object.defineProperty(error, "message", { get() { touched += 1; throw new Error(canary); } });
+      assert.equal(r7SourcePlanFailureMessage(error), "Local export source-plan bundle failed (integrity)");
+      Object.defineProperty(error, "code", { get() { touched += 1; throw new Error(canary); } });
+      assert.equal(r7SourcePlanFailureMessage(error), "R7 source-plan operation failed");
+      return true;
+    });
+    assert.deepEqual(lines, [
+      "r7-source-plan-failure operation=create source=collector reason=codex_collector_export_source_missing\n",
+    ]);
+    assert.equal(lines.join("").includes(root), false);
+    assert.equal(lines.join("").includes(canary), false);
+    assert.equal(touched, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("R7 freeze progress is fixed, stderr-only, and wired through the existing no-argument hook", async () => {
+  const lines = [];
+  const progress = createRegenerationProgress({ writeStderr: (line) => lines.push(line) });
+  progress.sourcePlanFrozen("PRIVATE_IGNORED_HOOK_ARGUMENT");
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /^r7-progress \d{2}:\d{2}:\d{2} afterSourcePlanFreeze: frozen source plan verified; lifecycle passes starting\n$/u);
+  const source = await readFile(SCRIPT, "utf8");
+  assert.match(source, /afterSourcePlanFreeze: \(\) => progress\.sourcePlanFrozen\(\)/u);
+  assert.match(source, /temporaryRoot: tmpdir\(\),\s+afterSourcePlanFreeze,/u);
+  assert.match(source, /main\(\)\.catch\(\(error\) => \{\s+reportR7SourcePlanFailureContext\(error\);/u);
+  assert.match(source, /const message = r7SourcePlanFailureMessage\(error\)\s+\?\? \(error instanceof Error \? error\.message/u);
+});
 
 function journalOwnerChild({
   destination,

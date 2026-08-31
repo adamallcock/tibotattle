@@ -1218,30 +1218,24 @@
               destination asks again.
             </p>
             <!--
-              The connect step stores the upload credential in the login
-              keychain, and macOS raises its own password dialog for that with
-              zero context (observed live 2026-08-19, first pairing on a fresh
-              Mac). This prepares the reader before the click; the ceremony's
-              pairing step repeats the guidance at the moment it applies.
-
-              Exactly one of these two paragraphs is shown, or neither: a build
-              whose signed app brokers the Keychain raises no dialog at all,
-              and one that is only migrating a legacy credential meets it on
-              its next protected read. renderIncrementalConsent() picks from
-              the companion's reported keychainPrompt surface; the visible
-              default below is the unbrokered case, so a companion that never
-              answers renders exactly today's page.
+              These annotations describe connection storage or an older
+              credential's secure upgrade. Neither authorizes a Keychain
+              dialog. renderIncrementalConsent() retains the companion's
+              keychainPrompt classifier; missing or unknown broker state
+              gets neutral connection information, never prompt preparation.
+              Deliberate migration approval belongs to native Settings only.
             -->
             <p class="annotation" id="incremental-keychain-pairing-note">
               Connecting stores this Mac's upload credential in your login
-              keychain. If macOS asks for permission, choose Always Allow so
-              background uploads keep working.
+              keychain. Local reporting and history are unchanged.
             </p>
             <p class="annotation" id="incremental-keychain-migration-note" hidden>
-              This Mac still has an upload credential from an older build.
-              TiboTattle moves it into app-owned keychain storage the next time
-              it is needed. If macOS asks then, allow TiboTattle to continue;
-              declining leaves the old credential untouched and pauses uploads.
+              This Mac has an upload credential from an older build. TiboTattle
+              first tries to move it to app-owned Keychain storage silently,
+              without changing its value or uploading anything. If Secure
+              upgrade appears in Settings, open Settings… → General and choose
+              Review migration… when you’re ready. The existing credential and
+              local history stay unchanged until migration finishes.
             </p>
             <p class="participant-action-status" id="incremental-consent-status" role="status" hidden></p>
             <!--

@@ -10830,7 +10830,7 @@ async function prepareIncrementalReviewInstance() {
 // on the approve card, so each names the reader's actual next action there.
 const INCREMENTAL_PREPARATION_ERROR_COPY = {
   identity_migration_required:
-    "TiboTattle preserved an older local identity because its move into app-owned keychain storage was not allowed. Quit and reopen TiboTattle, then choose Check again and allow the migration when macOS asks. Do not reset, delete, or rotate the identity. No upload occurred.",
+    "Your existing local identity and history are unchanged. In TiboTattle, open Settings… → General and choose Review migration… under Secure upgrade when you’re ready. No upload occurred. Do not reset, delete, or rotate the identity.",
   identity_unavailable:
     "The local Keychain identity is unavailable. Open Keychain Access, select the login Keychain, unlock it, then choose Check again. Do not reset, delete, rotate, or broaden access to the identity. No upload occurred.",
   coverage_unavailable:
@@ -11677,7 +11677,7 @@ const CONTRIBUTION_DEVICE_CONFLICT_COPY =
 // situation: nothing here is leftover, broken, or in need of clearing. The
 // sentence must say what is true (uploads are paused) and name the one action
 // that changes it (unlock), because the recovery copy above would send the
-// user to a destructive reset for a condition their login password fixes.
+// user to a destructive reset while the intact credential is unavailable.
 const CONTRIBUTION_DEVICE_KEYCHAIN_LOCKED_COPY =
   "Your Mac's login keychain is locked, so TiboTattle cannot reach this Mac's upload credential. Nothing is wrong with the credential and nothing was uploaded — uploads stay paused until you unlock it. Open Keychain Access, unlock the login keychain, then try again. Do not reset or delete the entry.";
 
@@ -11823,13 +11823,13 @@ const LOCAL_COMPANION_ERROR_COPY = {
   contribution_device_recovery_required: CONTRIBUTION_DEVICE_CONFLICT_COPY,
   contribution_device_credential_conflict: CONTRIBUTION_DEVICE_CONFLICT_COPY,
   contribution_device_keychain_access_denied:
-    "macOS did not let TiboTattle read the upload credential it just stored for this Mac — this happens when Deny is chosen in the macOS keychain dialog. Nothing was uploaded. Clear the credential below, choose Review and approve again, and choose Always Allow when macOS asks.",
+    "Uploads are paused because TiboTattle could not access this Mac's upload credential. The existing credential and local history are unchanged. Nothing was uploaded. You can try again later.",
   // Locked is NOT a defect and must never read like one: the credential and
   // its local record are both intact and become readable the moment the
   // keychain is unlocked. Uploads pause; nothing needs clearing or re-pairing.
   contribution_device_keychain_locked: CONTRIBUTION_DEVICE_KEYCHAIN_LOCKED_COPY,
   contribution_device_keychain_migration_required:
-    "TiboTattle left this Mac's older upload credential untouched because its move into app-owned keychain storage was not allowed. Nothing was uploaded. Quit and reopen TiboTattle, then return here and approve again; allow TiboTattle to continue when macOS asks. Do not reset or delete the credential.",
+    "This Mac's existing upload credential and local history are unchanged. In TiboTattle, open Settings… → General and choose Review migration… under Secure upgrade when you’re ready. Nothing was uploaded. Do not reset or delete the credential.",
   unsupported_media_type:
     "The local companion rejected this request format. Nothing was uploaded; reload TiboTattle and try again.",
   request_too_large:
@@ -11953,6 +11953,19 @@ const LOCAL_COMPANION_ERROR_COPY = {
     "The local relay does not forward that participant action. Nothing was uploaded; install the current signed build."
 };
 
+const LOCALIZED_KEYCHAIN_RECOVERY_CODES = new Set([
+  "identity_migration_required",
+  "contribution_device_keychain_migration_required",
+  "contribution_device_keychain_access_denied",
+]);
+
+function localizedKeychainRecoveryExplanation(explanation, code) {
+  return LOCALIZED_KEYCHAIN_RECOVERY_CODES.has(code)
+    && typeof explanation === "string"
+    ? localization.translateText(explanation)
+    : explanation;
+}
+
 /**
  * Turn one failure into honest copy plus a quotable reference.
  *
@@ -12007,10 +12020,17 @@ async function describeFailure({ surface, error, messages = {}, fallback }) {
       `Diagnostic note ${reference} was refused by the local companion.`
     );
   }
-  const explanation = fixedCopy(messages, code)
+  const fixedExplanation = fixedCopy(messages, code)
     ?? fixedCopy(SERVICE_ERROR_COPY, code)
-    ?? fixedCopy(LOCAL_COMPANION_ERROR_COPY, code)
-    ?? fallback;
+    ?? fixedCopy(LOCAL_COMPANION_ERROR_COPY, code);
+  // These fixed Keychain sentences explain a pause or native recovery.
+  // Translate the product-owned sentence before the diagnostic reference is added;
+  // translating the combined text would miss the exact catalog entry. No raw
+  // error, reference, request ID, or unrelated failure passes through here.
+  const explanation = localizedKeychainRecoveryExplanation(
+    fixedExplanation,
+    code,
+  ) ?? fallback;
   const trailer = diagnosticReferenceSentence({
     reference,
     requestId,
@@ -12972,10 +12992,9 @@ function renderIncrementalConsent() {
     || (incrementalConsentApproved && !repairNeeded)
     || (!incrementalConsentApproved && !reviewVerified)
     || hostedSignInRequired();
-  // Keychain guidance is shown only where a dialog can be raised: at the
-  // connect step for an unbrokered companion, at the migrating credential's
-  // next protected read for a brokered one, and nowhere for a fresh brokered
-  // install (S3, red-team review of PR #34).
+  // The retained surface classifier selects neutral connection information or
+  // native migration guidance. It never authorizes an OS dialog; unknown or
+  // missing broker state must not turn into password-prompt preparation.
   const keychainSurface = keychainPromptSurface();
   const pairingNote = $("#incremental-keychain-pairing-note");
   const migrationNote = $("#incremental-keychain-migration-note");
@@ -13127,15 +13146,13 @@ function boundedOutcomeDetailCode(payload) {
 }
 
 /**
- * Where this install can still meet a macOS Keychain dialog, as the companion
- * reports it: "pairing" (the companion mints its own credential, so the
- * connect step can raise one), "migration" (the app brokers the Keychain but
- * a legacy credential still has to migrate on its next protected read),
- * or "none" (brokered with nothing to migrate — no dialog exists).
+ * The companion's retained Keychain information uses "pairing" for
+ * connection information, "migration" for an older credential's secure
+ * upgrade, or "none" when no Keychain annotation applies.
  *
  * "pairing" is the default before the first projection lands and whenever the
- * companion cannot answer, so guidance is only ever withheld on a positive
- * statement that it cannot apply.
+ * companion cannot answer. That default is neutral information, not evidence
+ * that an authorization dialog is expected or permission to trigger one.
  */
 function keychainPromptSurface() {
   const reported = incrementalSyncStatus?.keychainPrompt;
@@ -13602,7 +13619,8 @@ async function approveIncrementalContribution() {
       await renderContributionSessionSignInGate(status, error);
     } else if (contributionConnectStepOf(error) !== null
         || contributionDeviceRecoveryIsRequired(error)
-        || contributionDeviceKeychainIsLocked(error)) {
+        || contributionDeviceKeychainIsLocked(error)
+        || contributionDeviceKeychainAccessIsDenied(error)) {
       await reportContributionConnectFailure(status, error, {
         enrollmentAttemptedWithHostedIdentity,
         enrollmentEstablished,
@@ -13847,8 +13865,18 @@ async function disconnectCommunityDevice() {
 function contributionDeviceRecoveryIsRequired(error) {
   try {
     return error?.code === "contribution_device_recovery_required"
-      || error?.code === "contribution_device_credential_conflict"
-      || error?.code === "contribution_device_keychain_access_denied";
+      || error?.code === "contribution_device_credential_conflict";
+  } catch {
+    return false;
+  }
+}
+
+// Denied access does not establish an unusable credential. Preserve it and
+// keep this pause outside the destructive reset family, including when the
+// error was not tagged with a connection step.
+function contributionDeviceKeychainAccessIsDenied(error) {
+  try {
+    return error?.code === "contribution_device_keychain_access_denied";
   } catch {
     return false;
   }
@@ -14035,7 +14063,7 @@ async function resetContributionDeviceCredential() {
  * Deliberately offers no reset button. The credential is fine; the keychain is
  * locked. The only action that changes anything is unlocking it, so that is
  * the only action named — offering the destructive clear here would cost a
- * needless re-pair for a condition the user's login password fixes. Both
+ * needless re-pair while an intact credential is unavailable. Both
  * sentences take the localized path: a reader in Chinese or Spanish is exactly
  * as likely to meet a locked keychain as anyone else.
  */
@@ -14127,22 +14155,9 @@ const CONTRIBUTION_CONNECT_STEPS = Object.freeze({
   }),
   device_pairing: Object.freeze({
     connects: true,
-    // This step is the one that stores the upload credential in the login
-    // keychain, so the macOS access dialog — a password prompt naming the
-    // bundled helper, node, with zero context of its own — can appear the
-    // moment it runs (observed live 2026-08-19, first pairing on a fresh
-    // Mac). The preparation must already be on screen when that happens:
-    // what asks, why, and that Always Allow is the answer that keeps
-    // background passes running instead of re-prompting every six hours.
-    progress: "Connecting this Mac as an upload-only device… macOS may ask for your login password to protect this Mac's upload credential; the request comes from TiboTattle's bundled helper, which macOS lists as node. Choose Always Allow so background uploads keep working.",
-    // The line above is for installs whose companion still mints the
-    // credential itself. When the signed app brokers the Keychain no dialog
-    // is reachable at this step at all, so naming a process the reader will
-    // never see would be a warning about nothing (S3, red-team review of
-    // PR #34). The remaining case — a legacy item migrating — meets its
-    // dialog on its next protected read, and the approve card's annotation
-    // carries that guidance.
-    brokeredProgress: "Connecting this Mac as an upload-only device…",
+    // Connection progress never prepares or authorizes a Keychain prompt.
+    // Deliberate secure-upgrade approval belongs to native Settings only.
+    progress: "Connecting this Mac as an upload-only device…",
     stopped: "Connecting stopped at step 3 of 3, pairing this Mac as an upload-only device.",
     failure:
       "The pairing was not completed, so this Mac is not connected. Nothing was uploaded; retrying is safe.",
@@ -14163,12 +14178,7 @@ async function contributionConnectStep(stepId, status, run) {
   const step = CONTRIBUTION_CONNECT_STEPS[stepId];
   status.hidden = false;
   status.className = "participant-action-status";
-  // A step keeps its dialog-preparing copy only where a dialog can actually
-  // be raised; "pairing" is the default the companion reports when it cannot
-  // tell, so an unanswering companion behaves exactly as before.
-  setProductText(status, keychainPromptSurface() === "pairing"
-    ? step.progress
-    : step.brokeredProgress ?? step.progress);
+  setProductText(status, step.progress);
   try {
     return await run();
   } catch (error) {
@@ -14203,8 +14213,24 @@ async function reportContributionConnectFailure(status, error, {
   enrollmentAttemptedWithHostedIdentity,
   enrollmentEstablished,
 }) {
-  // Locked is checked first and separately: it is the one member of the 409
-  // family whose cure is not the reset ceremony.
+  // Access denial is a pause, not proof that anything needs clearing. The
+  // existing retry controls remain available; this branch adds no recovery
+  // action and cannot invoke native approval or discard the credential.
+  if (contributionDeviceKeychainAccessIsDenied(error)) {
+    const described = await describeFailure({
+      surface: "contribution_connect",
+      error,
+      fallback: "Uploads are paused. Nothing was uploaded; you can try again later.",
+    });
+    status.hidden = false;
+    status.className = "participant-action-status";
+    // Retire the earlier progress translation so a later language update
+    // cannot resurrect "Connecting…" over the completed pause and reference.
+    setRawText(status, described.text);
+    return;
+  }
+  // A locked Keychain also stays outside the explicit unusable-credential
+  // reset ceremony.
   if (contributionDeviceKeychainIsLocked(error)) {
     await renderContributionDeviceKeychainLocked(status, { error });
     return;

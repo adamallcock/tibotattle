@@ -92,6 +92,7 @@
         "scripts/verify-macos-preview-remote.js",
         "test/browser-module-serving-parity.test.js",
         "test/macos-app-bundle.test.js",
+        "test/macos-keychain-migration-artifact.test.js",
         "test/macos-localization.test.js",
         "test/macos-test-build.test.mjs",
         "test/public-release-site.test.js",
@@ -646,6 +647,7 @@
         "scripts/build-public-release-site.js",
         "scripts/publish-sparkle-update.js",
         "test/macos-app-bundle.test.js",
+        "test/macos-keychain-migration-artifact.test.js",
         "test/public-release-site.test.js",
         "test/publish-sparkle-update.test.js",
         "docs/runbooks/macos-stable-release-runbook.md"
@@ -670,6 +672,7 @@
         "scripts/prepare-sparkle-framework.js",
         "scripts/verify-macos-preview-remote.js",
         "test/macos-app-bundle.test.js",
+        "test/macos-keychain-migration-artifact.test.js",
         "test/macos-updater-release.test.mjs",
         "test/macos-updater.test.js",
         "test/public-release-site.test.js",
