@@ -205,6 +205,17 @@ async function privacyFixture() {
 test("raw Codex scan callbacks and result retain accounting semantics without exposing source content", async () => {
   const fixture = await privacyFixture();
   try {
+    // The fork-parent canary must resolve to a real (content-free) rollout:
+    // an unresolvable inline-fork parent now fails accounting closed by
+    // design, and this test is probing privacy, not orphan-fork semantics.
+    await writeFile(
+      join(fixture.codexHome, "archived_sessions", "rollout-2026-07-30T11-00-00-parent-canary.jsonl"),
+      `${JSON.stringify({
+        timestamp: EVENT_AT,
+        type: "session_meta",
+        payload: { id: RAW_CANARIES.parentId },
+      })}\n`,
+    );
     const usageEvents = [];
     const rateLimitSnapshots = [];
     const toolCalls = [];
