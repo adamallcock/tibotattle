@@ -47,7 +47,9 @@ try {
   );
   console.log(`Update mode: ${result.updateMode}`);
   console.log(`Rollback mode: ${result.rollbackMode}`);
-  console.log("Automatic updater: absent");
+  console.log(
+    `Automatic updater: ${result.automaticUpdaterPresent ? "present" : "absent"}`,
+  );
   console.log("Hosted data mutation: none");
 } catch (error) {
   const code =

@@ -98,7 +98,9 @@ import {
   readMacOSReleaseCredentials,
   readStableReleaseManifest,
   submitToAppleNotary,
+  validateInstalledMacOSApp,
   validateNodeRuntimeEntitlements,
+  validateMacOSSignedReleaseArtifact,
   validateMacOSSignedReplacementArtifacts,
   validateMacOSSignedReplacementPair,
   validateMacOSApplicationsLink,
@@ -5169,6 +5171,139 @@ test("signed updater replacement contract validates upgrade and rollback artifac
       INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION,
       2,
     );
+    // Public release metadata for the one pre-channel-tag dogfood artifact.
+    // Tests never read its real DMG, installed app, or private local state.
+    const historicalDogfoodManifest = {
+      ...previousDogfoodManifest,
+      application: {
+        bundleIdentifier: "com.usagemonitor.local",
+        bundleVersion: "1022",
+        shortVersion: "0.1.16",
+      },
+      artifact: {
+        bytes: 49_341_249,
+        fileName: "TiboTattle-0.1.16-macOS-arm64.dmg",
+        sha256:
+          "2b32964c8b3bc2912620dbbe078aaf4e2fd49f1725a4e94a62dff184cdc9f8c1",
+      },
+      build: {
+        sourceSha256:
+          "ff7f59ec074705f8ecb3d78810177a8e8a4795a1e58c2df24faa9b3e6e26fae7",
+        payloadSha256:
+          "a5740aac152d95b638989462584774c0e3039ecd7db511692bd8fe690d8d37c4",
+      },
+      source: {
+        repository: "https://github.com/adamallcock/tibotattle",
+        commit: "5adaca5fdc8f981c391144e0d29b6f4c764f0f96",
+        tag: "v0.1.16",
+      },
+      updater: {
+        ...previousDogfoodManifest.updater,
+        frameworkSha256:
+          "2a43f8c41a29b195982354d7580036c178ed89e3b3e5dc0d8ab295290d91a0ac",
+        publicEdKeySha256:
+          "77d5717947da768e7e96a1b1e6225d2cae4748a556f109f2a30444a5f41ff3d2",
+        verifyBeforeExtraction: true,
+      },
+    };
+    assert.doesNotThrow(() => validateMacOSSignedReplacementPair({
+      previousManifest: historicalDogfoodManifest,
+      candidateManifest: candidateDogfoodManifest,
+    }));
+    for (const [section, key, value] of [
+      ["application", "bundleIdentifier", "com.example.changed"],
+      ["application", "bundleVersion", "1021"],
+      ["application", "shortVersion", "0.1.15"],
+      ["artifact", "bytes", 49_341_248],
+      ["artifact", "fileName", "repacked.dmg"],
+      ["artifact", "sha256", "0".repeat(64)],
+      ["source", "repository", "https://github.com/example/changed"],
+      ["source", "commit", "a".repeat(40)],
+      ["source", "tag", "tibotattle-internal-dogfood-0.1.16-rc1-source-20260827"],
+      ["build", "sourceSha256", "a".repeat(64)],
+      ["build", "payloadSha256", "b".repeat(64)],
+      ["updater", "appcastURL", "https://updates.example/changed.xml"],
+      ["updater", "publicEdKeySha256", "c".repeat(64)],
+      ["updater", "frameworkSha256", "d".repeat(64)],
+      ["updater", "verifyBeforeExtraction", false],
+      ...Object.keys(assurances).map((key) => ["assurances", key, false]),
+    ]) {
+      const altered = structuredClone(historicalDogfoodManifest);
+      altered[section][key] = value;
+      assert.throws(
+        () => validateMacOSSignedReplacementPair({
+          previousManifest: altered,
+          candidateManifest: candidateDogfoodManifest,
+        }),
+        (error) => typeof error.code === "string"
+          && error.code.startsWith("MACOS_"),
+        `the historical exception must refuse changed ${section}.${key}`,
+      );
+    }
+    assert.throws(
+      () => validateMacOSSignedReplacementPair({
+        previousManifest: historicalDogfoodManifest,
+        candidateManifest: {
+          ...candidateDogfoodManifest,
+          application: {
+            ...candidateDogfoodManifest.application,
+            bundleVersion: "1022",
+          },
+        },
+      }),
+      { code: "MACOS_REPLACEMENT_VERSION_NOT_NEWER" },
+    );
+    assert.throws(
+      () => validateMacOSSignedReplacementPair({
+        previousManifest: {
+          ...previousDogfoodManifest,
+          application: {
+            ...previousDogfoodManifest.application,
+            bundleVersion: "1021",
+          },
+        },
+        candidateManifest: historicalDogfoodManifest,
+      }),
+      { code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" },
+      "the historical dogfood can never be a candidate",
+    );
+    const historicalManifestPath = join(temporaryRoot, "historical.json");
+    const historicalPublicManifestPath = join(temporaryRoot, "historical-public.json");
+    for (const manifest of [
+      historicalDogfoodManifest,
+      {
+        ...historicalDogfoodManifest,
+        channel: createReleaseChannelProvenance(STABLE_RELEASE_CHANNEL, {
+          publicEdKeySha256: historicalDogfoodManifest.updater.publicEdKeySha256,
+        }),
+      },
+    ]) {
+      await writeFile(historicalPublicManifestPath, JSON.stringify(manifest));
+      await assert.rejects(
+        validateMacOSSignedReleaseArtifact({
+          releaseManifestPath: historicalPublicManifestPath,
+          async validateArtifact() {
+            assert.fail("historical compatibility cannot reach public artifact validation");
+          },
+        }),
+        { code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" },
+      );
+    }
+    await writeFile(historicalManifestPath, JSON.stringify(historicalDogfoodManifest));
+    await writeFile(
+      join(temporaryRoot, historicalDogfoodManifest.artifact.fileName),
+      "not-the-historical-dmg",
+    );
+    await assert.rejects(
+      validateMacOSSignedReplacementArtifacts({
+        previousReleaseManifestPath: historicalManifestPath,
+        candidateReleaseManifestPath: candidateManifestPath,
+        async validateArtifact() {
+          assert.fail("the previous DMG bytes must match before native validation");
+        },
+      }),
+      { code: "MACOS_REPLACEMENT_ARTIFACT_INVALID" },
+    );
     assert.doesNotThrow(() => validateMacOSSignedReplacementPair({
       previousManifest: previousDogfoodManifest,
       candidateManifest: candidateDogfoodManifest,
@@ -5519,6 +5654,88 @@ test("signed updater replacement contract validates upgrade and rollback artifac
     );
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("legacy dogfood capability rejects Proxy-forged identities before any artifact access", async () => {
+  const structuralFake = new Proxy({}, {
+    get() {
+      assert.fail("capability authorization must not inspect caller-controlled properties");
+    },
+  });
+  for (const forged of [true, false, {}, Object.freeze({}), structuralFake]) {
+    for (const [name, validate] of [
+      ["candidate inspection", inspectMacOSApp],
+      ["installed validation", validateInstalledMacOSApp],
+      ["DMG validation", validateMacOSDMG],
+    ]) {
+      let symbolReads = 0;
+      let observedSymbol;
+      const baseOptions = {
+        allowLegacyUnsealedSource: false,
+        channel: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+        requireExternalDistribution: true,
+        production: true,
+      };
+      const options = new Proxy(baseOptions, {
+        get(target, key, receiver) {
+          if (typeof key === "symbol") {
+            symbolReads += 1;
+            observedSymbol = key;
+            return forged;
+          }
+          return Reflect.get(target, key, receiver);
+        },
+      });
+      // A null path would fail resolution if authorization reached the FS path.
+      // No fixture, installed application, native tool, or real user state is used.
+      await assert.rejects(
+        validate(null, options),
+        { code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" },
+        `${name} must reject a supplied non-member identity before path resolution`,
+      );
+      assert.equal(symbolReads, 1, "the Proxy exercised the private option read");
+      await assert.rejects(
+        validate(null, { ...baseOptions, [observedSymbol]: forged }),
+        { code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" },
+        `${name} must also reject a forged value replayed with the captured Symbol`,
+      );
+    }
+  }
+});
+
+test("replacement CLI reports the actual automatic-updater result", async () => {
+  const source = await readFile(
+    join(REPOSITORY_ROOT, "scripts", "validate-macos-replacement.js"),
+    "utf8",
+  );
+  const importStatement = /import \{\s*validateMacOSSignedReplacementArtifacts,\s*\} from "\.\/macos-release-core\.js";/u;
+  assert.match(source, importStatement);
+  const executable = source.replace(/^#![^\n]*\n/u, "")
+    .replace(importStatement, "");
+  for (const automaticUpdaterPresent of [true, false]) {
+    const output = [];
+    const processFixture = {
+      argv: ["node", "validator.js", "--previous", "previous.json", "--candidate", "candidate.json"],
+      exitCode: 0,
+    };
+    await runInNewContext(`(async () => { ${executable}\n })()`, {
+      console: {
+        log: (line) => output.push(line),
+        error: (line) => assert.fail(line),
+      },
+      process: processFixture,
+      validateMacOSSignedReplacementArtifacts: async () => ({
+        bundleIdentifier: "com.usagemonitor.local",
+        previousBundleVersion: "1022",
+        candidateBundleVersion: "1023",
+        automaticUpdaterPresent,
+      }),
+    });
+    assert.equal(processFixture.exitCode, 0);
+    assert.ok(output.includes(
+      `Automatic updater: ${automaticUpdaterPresent ? "present" : "absent"}`,
+    ));
   }
 });
 
@@ -5954,6 +6171,75 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
       inspectMacOSApp(app, { requireExternalDistribution: true }),
       { code: "MACOS_RELEASE_SOURCE_INVALID" },
     );
+    await writeBuildManifest({ includeSource: false });
+    for (const attemptedCompatibility of [
+      {},
+      { allowLegacyDogfoodPreviousSource: true },
+      { [Symbol("verified legacy dogfood previous artifact")]: true },
+    ]) {
+      await assert.rejects(
+        inspectMacOSApp(app, {
+          ...attemptedCompatibility,
+          requireExternalDistribution: true,
+        }),
+        { code: "MACOS_RELEASE_SOURCE_INVALID" },
+        "unsealed candidate builds cannot request historical compatibility",
+      );
+    }
+    await writeBuildManifest();
+
+    const plistPath = join(app, "Contents", "Info.plist");
+    const completePlist = JSON.parse(await readFile(plistPath, "utf8"));
+    for (const missing of [
+      ["UsageMonitorKeychainNamespace", "UsageMonitorKeychainAccount"],
+      ["UsageMonitorKeychainNamespace"],
+      ["UsageMonitorKeychainAccount"],
+    ]) {
+      const incomplete = { ...completePlist };
+      for (const key of missing) delete incomplete[key];
+      await writeFile(plistPath, JSON.stringify(incomplete));
+      await writeBuildManifest();
+      await assert.rejects(
+        inspectMacOSApp(app, {
+          requireExternalDistribution: true,
+          allowLegacyDogfoodPreviousSource: true,
+        }),
+        /Application bundle metadata is incomplete/u,
+        "a candidate must not inherit historical missing-Keychain-field compatibility",
+      );
+    }
+    for (const key of ["UsageMonitorKeychainNamespace", "UsageMonitorKeychainAccount"]) {
+      await writeFile(plistPath, JSON.stringify({ ...completePlist, [key]: "different" }));
+      await writeBuildManifest();
+      await assert.rejects(
+        inspectMacOSApp(app, { requireExternalDistribution: true }),
+        /Application bundle metadata is incomplete/u,
+        "a candidate must declare the exact stable Keychain identity",
+      );
+    }
+    await writeFile(plistPath, JSON.stringify(completePlist));
+    const syntheticLegacyPath = "Contents/Resources/app/node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node";
+    const syntheticLegacyBinary = join(app, ...syntheticLegacyPath.split("/"));
+    await mkdir(dirname(syntheticLegacyBinary), { recursive: true });
+    await copyFile(syntheticMachO, syntheticLegacyBinary);
+    await chmod(syntheticLegacyBinary, 0o555);
+    await writeBuildManifest();
+    const legacyNormalizationManifest = JSON.parse(await readFile(buildManifestPath, "utf8"));
+    legacyNormalizationManifest.payload.files.find((entry) =>
+      entry.path === syntheticLegacyPath).normalization = "mach_o_without_code_signature";
+    await writeFile(buildManifestPath, JSON.stringify(legacyNormalizationManifest));
+    await assert.rejects(
+      inspectMacOSApp(app, {
+        requireExternalDistribution: true,
+        allowLegacyDogfoodPreviousSource: true,
+      }),
+      {
+        code: "MACOS_PAYLOAD_INTEGRITY_FAILED",
+        message: "Application build manifest contains an invalid payload entry",
+      },
+      "a candidate cannot request the historical Keytar normalization inventory",
+    );
+    await rm(join(resources, "app"), { recursive: true });
     await writeBuildManifest();
 
     const calls = [];
