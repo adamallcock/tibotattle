@@ -39,6 +39,14 @@ methods, and owner-only derived state. Undisclosed source access, retention of
 prompt/response content, unsafe derived artifacts, unintended network
 transmission, or a bypass of contribution review/consent is in scope.
 
+The interactive local cache-drop tables also resolve explicit display names,
+worker nicknames, and parent links from bounded read-only Codex thread metadata
+and `session_index.jsonl`. This is a separate, same-origin, non-persisted lookup;
+names and raw thread IDs are excluded from accounting caches, reports,
+diagnostics, and contributions. It never uses the prompt-bearing `threads.title`
+as a display-name fallback. A clicked canonical Codex deep link stays a local
+application handoff.
+
 ## Do not include session content in reports
 
 TiboTattle's whole purpose is keeping coding-agent session content private.

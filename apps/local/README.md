@@ -3,7 +3,9 @@
 This loopback-only Node application turns retained privacy-safe monitoring
 artifacts into the functional TiboTattle dashboard. It does not send raw
 Codex logs, accept arbitrary source paths, or expose raw account/session
-pseudonyms to the browser.
+pseudonyms to the browser. A separate, explicitly local-only thread-link
+contract exposes Codex thread IDs and display names for recent cache-drop rows,
+without adding them to accounting snapshots or export DTOs.
 
 A normal refresh processes metadata from the selected Codex `sessions` and
 `archived_sessions` folders. It also reads the selected Codex home's
@@ -13,6 +15,16 @@ settings, and invokes the installed Codex binary's local `app-server` methods
 records are processed locally; prompt and response text is never retained in
 the companion's derived state. See the maintained
 [local data and privacy reference](../../docs/reference/local-data-and-privacy.md).
+
+`GET /api/local/cache-drop-thread-links` independently resolves those recent
+rows against the same published index generation, then reads explicit display
+names from the selected Codex home's `session_index.jsonl` and bounded
+worker/parent metadata from `state_5.sqlite`. It never reads prompt-bearing
+`threads.title` or source transcripts. The endpoint requires the local custom
+header, refuses foreign origins and query strings, returns `no-store`, and
+does not persist its response or modify the source databases. Missing metadata
+does not fail an accounting refresh. See the
+[accepted local-link boundary](../../docs/decisions/2026-08-30-local-cache-drop-thread-links.md).
 
 ## Run
 
