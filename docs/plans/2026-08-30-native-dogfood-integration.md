@@ -30,16 +30,23 @@ must remain untouched by integration.
 | #88 native menu history retained during refresh and popup dismissal | Merged as `41c02dd2`; integrated | Revalidate the signed native artifact, including physical clicks |
 | #87 local cache-drop thread links | Explicitly included; merged as `a864d159` from `ce0aacd6` | Reconcile five-column compact layout, test transient name lookup and native handoff; final integrated R7 remains here |
 | #86 participant self-service deletion retirement | Ready/merged handoff supersedes draft-only exclusion; include `9b121b7d` | Reconcile integrated source and native/consent checks; no hosted deployment or production deletion is authorized here |
-| #75 stacked native popup PR | Native popup already ported into release source | Do not merge excluded Electron ancestry |
+| #75 stacked native popup PR | Merged into the Windows/Electron branch, not main; native functionality already ported by #81 | Verified native parity on `c111fded`; do not merge excluded Electron ancestry |
+| #89 server-computed per-model allowance series | Merged into main as `c111fded` after the first candidate was signed | Include source and rerun the complete Worker gate; hosted activation remains a separate deployment |
+| #90 compact accounting, context-pricing parity and retained R7 evidence | Merged as `d13b19ef` | Preserve completed validation and build the final candidate from the subsequently updated source |
+| #91 purchased-credit research analyzer | Opened after the native freeze; standalone research, not a packaged native dependency | Exclude from this candidate; separate source/privacy review remains necessary |
 | #73, #74, Electron delivery, Linux integration and Claude Code integration | Excluded | No scope expansion without a new decision |
 | Credential-lifetime branch | Unreviewed, uncommitted work remains | Do not silently absorb into this candidate |
 
 Take a fresh PR/main snapshot before freezing. Identify newly included source
 explicitly; do not indefinitely follow unrelated active branches.
 
-The selected source set is now frozen through main's `9b121b7d` (#86), including
-#87 and #88, plus this task's compact-accounting changes. Further unrelated PRs
-are not automatically included in the retained validation run.
+PR #90 closed the initial source freeze through main's `9b121b7d` (#86),
+including #87 and #88 plus this task's compact-accounting changes. The owner's
+subsequent request reopened the freeze to include newly merged #89 at
+`c111fded` and verify #75 parity. The final follow-up also repairs the retained
+replacement validator for the exact already-shipped dogfood artifact; it does
+not change the app's runtime. Further unrelated PRs are not automatically
+included in the retained validation run.
 
 ## Execution and acceptance
 
@@ -150,17 +157,73 @@ remains below the 1,610,612,736-byte ceiling. Record this measurement drift
 without calling it either a proven regression or harmless noise. This is
 internal-dogfood evidence, not stable-release qualification.
 
-Existing Developer ID and notarization configuration authenticated successfully
-without signing or submission. The prior signed 0.1.16 dogfood DMG and receipt
-were located and its checksum matched. A schema-9 preservation copy alone is
-not a working rollback for an old reader that only supports schema 8; do not
-launch that reader against the newer state. Before normal installed launch,
+PR #90 merged as `d13b19ef` with a tree identical to its tested final head.
+The annotated `tibotattle-internal-dogfood-0.1.17-rc1-source-20260831` tag
+identifies that first candidate. Its retained finalizer and independent DMG
+validation both exited zero: Developer ID, hardened runtime, app and DMG
+notarization/stapling, Gatekeeper, and empty-profile checks passed. The artifact
+remains preserved and was not installed. It predates #89 and is not the final
+updated-source candidate.
+
+The subsequent actual replacement check refused the previous 0.1.16 dogfood's
+pre-policy source tag. Its checksum matches the original receipt, and its
+embedded build manifest also predates source seals. The follow-up supports
+only that exact previous artifact through a module-private, expiring capability,
+retaining all native trust and payload checks and leaving candidate/public/signing
+validation strict. Actual artifact validation additionally identified the old
+normalized Keytar binary and two absent Keychain plist identity fields. Both
+compatibility rules are previous-only, with exact historical inventory pins;
+current candidates still require the current inventory and explicit identity.
+The actual 1022-to-1023 replacement gate then passed, including both DMGs and
+their native signature, notarization, Gatekeeper and empty-profile smokes.
+An intervening candidate-mount refusal was resolved by detaching the operator's
+already-mounted test image; no validation rule was relaxed. Neither old receipt
+nor tag was rewritten. Both installed old-app bundles have content- and signature-
+verified private ZIP backups; neither original has been replaced or removed.
+
+On `c111fded`, #89's complete Worker gate exited zero: 429 Worker tests,
+174 script tests, workspace-copy guards, endpoints, generated types,
+TypeScript, and default/staging dry-run bundles passed. Fresh pinned Worker
+dependencies and legitimate no-installer public-site inputs were used. The
+first dependency refresh was sandbox-refused; its authorized unchanged retry
+completed. No Worker deployment or migration occurred. The retained R7
+freshness tests still pass 2/2 because this merge does not change their workload
+closure. Recheck both pinned runtimes after the final repair rather than
+regenerating protected evidence without a source-provenance need.
+
+Read-only #75 parity inspection verified that #81's `91735527` port retained
+the native popup/pace implementation, its native render harness and all three
+locale catalogs. Subsequent #88 changes add refresh retention and dismissal.
+No native implementation port is needed; this is source parity, not the
+remaining physical signed-app interaction check.
+
+The final replacement repair passed all five focused policy/forgery regressions
+and the retained native gate, 67/67 without skips or cancellations. The full
+root repeat reported 3,213 passes, 17 designated skips and one Preview-build
+cancellation, with no failed assertions; it was not a passing root run. The
+macOS power log records a 950-second system sleep during that run. With a
+temporary keep-awake assertion, the unchanged Preview test passed in 136 seconds
+within the retained native gate. No timeout, assertion or test was weakened.
+The final full-suite rerun then exited zero in 441 seconds: 3,214 passes,
+17 designated skips, no failures or cancellations, from 3,231 tests. Both
+pinned-runtime R7 freshness checks passed 2/2 again and all ten receipts remain
+unchanged. The
+private backup, atomic-swap and old-app-retirement guard tests passed 27/27 using
+synthetic directories only; actual installation and retirement have not run.
+Final preflight passed 18/18 and architecture passed with 369 production files,
+1,449 imports and zero approved debt edges. Existing Developer ID availability
+and notarization-profile authentication were checked without changing credentials.
+
+A schema-9 preservation copy alone is not a working rollback for an old reader
+that only supports schema 8; do not launch that reader against the newer state.
+Before normal installed launch,
 check whether existing consent, pairing or a pending sign-in can automatically
 resume contribution. Normal installed launch is held for the owner's direction
 about any automatic pairing or upload; do not alter consent as a workaround.
 Credential-free, empty-profile artifact smokes do not qualify real Keychain or
 normal signed-in operation.
 
-Signing, installation and release publication have not yet been completed for
-this source set. Private state records, comparisons, UI captures and release
-inputs remain local and outside tracked docs.
+Final updated-source tagging, signing, replacement validation, installation
+and physical native checks remain. Public release/updater publication is not
+part of this internal dogfood. Private state records, comparisons, UI captures
+and release inputs remain local and outside tracked docs.
