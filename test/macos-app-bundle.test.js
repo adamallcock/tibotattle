@@ -1564,20 +1564,41 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
     /func applicationWillTerminate[\s\S]*menuBarStatus\?\.shutDown\(\)/u,
   );
   // The shipped app must never become a menu-bar-only surface. Accessory
-  // activation is confined to the non-launching AppKit smoke modes.
+  // activation is confined to isolated AppKit smoke modes, including the
+  // development-only, data-free interaction harness below.
   assert.match(
     source,
     /private enum MenuBarContractSmokeTest \{[\s\S]*?application\.setActivationPolicy\(\.accessory\)/u,
   );
   assert.equal(
     source.match(/setActivationPolicy\(\.accessory\)/gu)?.length,
-    6,
+    8,
     "only isolated AppKit smoke modes may use accessory activation",
   );
   assert.match(
     source,
     /static func render\(outputDirectory: String\) -> Int32 \{[\s\S]*?application\.setActivationPolicy\(\.accessory\)/u,
   );
+  assert.match(
+    source,
+    /static func renderOverview\(inputPath: String, outputDirectory: String\) -> Int32 \{[\s\S]*?application\.setActivationPolicy\(\.accessory\)/u,
+  );
+  const menuBarSmokeSource = source.match(
+    /private enum MenuBarContractSmokeTest \{[\s\S]*?(?=\nprivate enum NativeSettingsLayout)/u,
+  )?.[0] ?? "";
+  const interactionHarness = menuBarSmokeSource.match(
+    /static func runInteractionHarness\(\) -> Int32 \{[\s\S]*?\n    \}/u,
+  )?.[0] ?? "";
+  assert.match(interactionHarness, /application\.setActivationPolicy\(\.accessory\)/u);
+  assert.match(interactionHarness, /MenuBarStatusController\(/u);
+  assert.doesNotMatch(interactionHarness,
+    /CompanionProcess|CompanionResources|\bProcess\(|companionReady\(|startCompanion\(|openDashboard\(/u);
+  const interactionEntry = source.match(
+    /if arguments\.contains\("--menu-bar-interaction-smoke-test"\) \{[\s\S]*?\n        \}/u,
+  )?.[0] ?? "";
+  assert.match(interactionEntry,
+    /guard BundledProduct\.buildChannel == "development"[\s\S]*?else \{\s*exit\(2\)/u);
+  assert.match(interactionEntry, /MenuBarContractSmokeTest\.runInteractionHarness\(\)/u);
   // The sidebar-recovery and interaction-safety smokes build real AppKit or
   // WebKit objects in windows they never bring forward.
   assert.match(
@@ -2830,7 +2851,7 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.match(source, /menu\.popUp\(positioning: nil, at: screenPoint, in: nil\)/u);
   assert.match(source, /func popoverDidClose\(_ notification: Notification\)/u);
   const showActionMenu = source.match(
-    /private func showActionMenu\(from anchor: NSView\)[\s\S]*?(?=\n    func popoverDidClose)/u,
+    /private func showActionMenu\(from anchor: NSView\)[\s\S]*?(?=\n    func popoverDidShow)/u,
   )?.[0] ?? "";
   const popoverDidClose = source.match(
     /func popoverDidClose\(_ notification: Notification\)[\s\S]*?(?=\n    \/\/\/ AppKit normally)/u,
@@ -2888,13 +2909,16 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
     /func shutDown\(\) \{[\s\S]*?stopped = true\s*\n\s*dismissSurfaces\(\)/u,
   );
 
-  // Restart/failure/read errors clear numeric evidence before rendering. A
-  // callback from an older URL or start cannot cross the generation boundary.
+  // Restart/source replacement clears all evidence. Same-source read failures
+  // clear current quota and forecast, but retain explicitly labelled history.
+  // A callback from an older URL/start cannot cross the generation boundary.
   assert.match(source, /private var companionGeneration: UInt64 = 0/u);
-  assert.match(source, /private func invalidateObservedEvidence\(\) \{[\s\S]*?snapshot\.lanes = \[\][\s\S]*?snapshot\.observedAt = nil[\s\S]*?snapshot\.evidence = \.none/u);
+  assert.match(source, /mutating func invalidateObservedEvidence\(keepingHistory: Bool = false\) \{\s*lanes = \[\]\s*observedAt = nil\s*evidence = \.none\s*history = keepingHistory \? history\.retainingLastVerified\(\) : \.unavailable\s*weeklyPaceOutlook = nil\s*staleAfterSeconds = nil/u);
+  assert.match(source, /private func invalidateObservedEvidence\(keepingHistory: Bool = false\) \{[\s\S]*?snapshot\.invalidateObservedEvidence\(keepingHistory: keepingHistory\)/u);
+  assert.match(source, /func companionReady\(dashboardURL: URL\) \{[\s\S]*?invalidateObservedEvidence\(\)/u);
   assert.match(source, /func companionStarting\(\) \{[\s\S]*?invalidateObservedEvidence\(\)/u);
   assert.match(source, /func companionUnavailable\(summary: String\?\) \{[\s\S]*?invalidateObservedEvidence\(\)/u);
-  assert.match(source, /guard let overview else \{[\s\S]*?invalidateObservedEvidence\(\)[\s\S]*?snapshot\.phase = \.unavailable/u);
+  assert.match(source, /guard let overview else \{[\s\S]*?invalidateObservedEvidence\(keepingHistory: true\)[\s\S]*?snapshot\.phase = \.unavailable/u);
   assert.match(source, /self\.companionGeneration == generation/u);
   assert.match(source, /self\.dashboardURL == dashboardURL/u);
 
@@ -3111,15 +3135,18 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   assert.match(popupSource, /menuBarPopupCoverageMixed/u);
   assert.match(popupSource, /menuBarPopupCoverageAccessible/u);
   assert.match(popupSource, /historyCoverageLabel\.isHidden = historyChart\.coverageState == \.complete/u);
+  assert.match(popupSource, /history\.accountingStatus == \.retained[\s\S]*?currentSnapshot\.phase == \.analyzing[\s\S]*?menuBarPopupRetainedHistory/u);
   assert.match(popupSource, /refreshButton\.isEnabled = snapshot\.analysisAvailable/u);
   assert.match(popupSource, /selectHistoryRangeForSmokeTest/u);
   assert.match(popupSource, /renderPNG\(to url: URL, appearance: NSAppearance\.Name\)/u);
+  assert.match(appSource, /of: "--menu-bar-overview-render-smoke-test"[\s\S]*?BundledProduct\.buildChannel == "development"[\s\S]*?MenuBarContractSmokeTest\.renderOverview/u);
 
   // Accounting is independently fail-closed. Calendar-day aggregation uses
   // Calendar arithmetic for DST, preserves gaps, and admits authoritative
   // zeros only inside complete coverage.
   assert.match(modelSource, /freshness\["accountingStatus"\] as\? String == "available"/u);
   assert.match(modelSource, /sourceMode != "unified"[\s\S]*?generationMatched/u);
+  assert.match(modelSource, /projection\["status"\] as\? String == "retained"[\s\S]*?sourceMode == "unified"[\s\S]*?exactBoolean\(accounting\["generationMatched"\]\) == false[\s\S]*?startAt < endAt[\s\S]*?endAt <= retainedAt[\s\S]*?retainedAt <= now/u);
   assert.match(modelSource, /enum Evidence: Equatable \{[\s\S]*?case available[\s\S]*?case partial[\s\S]*?case unavailable/u);
   assert.match(modelSource, /calendar\.date\([\s\S]*?byAdding: \.day/u);
   assert.match(modelSource, /let fullCivilDayCovered/u);
@@ -3219,6 +3246,75 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
   ]) {
     assert.equal(source.includes(forbidden), false, forbidden);
   }
+});
+
+test("menu-bar click-away monitoring is mouse-only, popover-scoped, and preserves status-button routing", async () => {
+  const source = await readFile(MENU_BAR_STATUS_SOURCE, "utf8");
+  const method = (name) => {
+    const body = source.match(new RegExp(
+      `func ${name}\\([^)]*\\)[\\s\\S]*?\\n    \\}`,
+      "u",
+    ))?.[0];
+    assert.ok(body, `${name} must remain an explicit lifecycle boundary`);
+    return body;
+  };
+  const mouseDecision = source.match(
+    /func menuBarShouldDismissForMouse\([\s\S]*?\n\}/u,
+  )?.[0] ?? "";
+  const mouseTargets = source.match(
+    /enum MenuBarMouseTarget[^\n]*\{[\s\S]*?\n\}/u,
+  )?.[0] ?? "";
+  assert.match(mouseTargets, /enum MenuBarMouseTarget: Equatable, CaseIterable \{\s*case popover\s*case statusItem\s*case applicationWindow\s*case outside\s*\}/u);
+  assert.match(mouseDecision, /case \.popover, \.statusItem:\s*return false/u);
+  assert.match(mouseDecision, /case \.applicationWindow:\s*return isMenuTracking \|\| isPopoverShown/u);
+  assert.match(mouseDecision, /case \.outside:\s*return isPopoverShown/u);
+
+  const interactionMonitoring = method("installInteractionMonitoring");
+  const localMouseMonitor = interactionMonitoring.match(
+    /localMouseMonitor = NSEvent\.addLocalMonitorForEvents\([\s\S]*?(?=\n        appDeactivationObserver =)/u,
+  )?.[0] ?? "";
+  assert.match(localMouseMonitor,
+    /matching: \[\.leftMouseDown, \.rightMouseDown, \.otherMouseDown\]/u);
+  assert.match(localMouseMonitor,
+    /guard let self, !self\.stopped,\s*self\.isMenuTracking \|\| self\.popover\.isShown/u);
+  assert.match(localMouseMonitor,
+    /eventWindow === self\.popover\.contentViewController\?\.view\.window \{\s*target = \.popover/u);
+  assert.match(localMouseMonitor,
+    /let button = self\.statusItem\.button,[\s\S]*?eventWindow === button\.window,\s*button\.bounds\.contains\(button\.convert\(event\.locationInWindow, from: nil\)\) \{[\s\S]*?target = \.statusItem/u);
+  assert.match(localMouseMonitor,
+    /NSApp\.windows\.contains\(where: \{ \$0 === eventWindow \}\) \{\s*target = \.applicationWindow\s*\} else \{\s*target = \.outside/u);
+  assert.match(localMouseMonitor,
+    /menuBarShouldDismissForMouse\(\s*target: target,\s*isMenuTracking: self\.isMenuTracking,\s*isPopoverShown: self\.popover\.isShown\s*\) \{\s*self\.dismissSurfaces\(\)\s*\}\s*return event/u);
+  assert.doesNotMatch(localMouseMonitor, /return nil|\.characters|\.keyCode/u);
+  assert.doesNotMatch(interactionMonitoring, /addGlobalMonitorForEvents|startOutsideClickMonitoring/u);
+
+  const outsideMonitoring = method("startOutsideClickMonitoring");
+  assert.equal(source.match(/NSEvent\.addGlobalMonitorForEvents/gu)?.length, 1,
+    "the sole global monitor must stay in the popover-only mouse listener");
+  assert.match(outsideMonitoring,
+    /guard !stopped, popover\.isShown, outsideMouseMonitor == nil else \{ return \}/u);
+  assert.match(outsideMonitoring,
+    /outsideMouseMonitor = NSEvent\.addGlobalMonitorForEvents\(\s*matching: \[\.leftMouseDown, \.rightMouseDown, \.otherMouseDown\]\s*\) \{ \[weak self\] _ in/u);
+  assert.match(outsideMonitoring,
+    /MainActor\.assumeIsolated \{\s*guard let self, !self\.stopped, self\.popover\.isShown else \{ return \}\s*self\.dismissSurfaces\(\)/u);
+  assert.doesNotMatch(outsideMonitoring,
+    /\.keyDown|\.keyUp|\.flagsChanged|\.mouseMoved|\.scrollWheel|\.characters|\.keyCode|\bevent\.|print\(|FileHandle/u);
+  assert.match(method("stopOutsideClickMonitoring"),
+    /if let outsideMouseMonitor \{\s*NSEvent\.removeMonitor\(outsideMouseMonitor\)\s*self\.outsideMouseMonitor = nil/u);
+  assert.match(method("statusItemActivated"),
+    /popover\.show\([\s\S]*?preferredEdge: \.minY\s*\)\s*startOutsideClickMonitoring\(\)/u);
+  assert.match(method("popoverDidShow"), /startOutsideClickMonitoring\(\)/u);
+  assert.match(method("popoverDidClose"),
+    /stopOutsideClickMonitoring\(\)[\s\S]*?guard !stopped/u);
+  assert.match(method("showActionMenu"),
+    /stopOutsideClickMonitoring\(\)[\s\S]*?popover\.performClose\(nil\)/u);
+  assert.match(method("dismissSurfaces"),
+    /stopOutsideClickMonitoring\(\)\s*menu\.cancelTracking\(\)[\s\S]*?popover\.performClose\(nil\)/u);
+  assert.match(method("removeInteractionMonitoring"), /stopOutsideClickMonitoring\(\)/u);
+  assert.match(method("shutDown"),
+    /stopped = true\s*dismissSurfaces\(\)[\s\S]*?removeInteractionMonitoring\(\)/u);
+  assert.match(source, /popoverIsShown: popover\.isShown/u);
+  assert.match(source, /outsideClickAwayMonitorInstalled: outsideMouseMonitor != nil/u);
 });
 
 test("native quota duration and reset scheduling stay bounded and provider-aware", async () => {
@@ -7305,7 +7401,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       menuBarSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT popover=true width=400 bars=7,30 pace=canonical-outlook native_actions=true states=live,starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q routing=left-popover,right-menu,control-menu dismissal=escape,transient,same-app,deactivation weekly_position=factual-menu-only pace_outlook=collecting,under,on,over,critical,fail-closed history=authoritative,coverage-named,fail-closed pricing=complete,partial,unavailable model=dst,overlap,future,per-lane reset_credits=absent analysis_title=live-fallback$/mu,
+      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT popover=true width=400 bars=7,30 pace=canonical-outlook native_actions=true states=live,starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q routing=left-popover,right-menu,control-menu dismissal=escape,transient,same-app,outside,deactivation weekly_position=factual-menu-only pace_outlook=collecting,under,on,over,critical,fail-closed history=authoritative,coverage-named,fail-closed pricing=complete,partial,unavailable model=dst,overlap,future,per-lane reset_credits=absent analysis_title=live-fallback history_retention=refresh,failure,source-reset$/mu,
     );
     const analysisProgressSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),
@@ -7334,10 +7430,13 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       popupRenderSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_MENU_BAR_POPOVER_RENDER locales=en,es,zh-Hans appearances=light,dark ranges=7d,30d states=live,pace-collecting,pace-under,pace-on,pace-over,pace-critical,partial-pricing,unpriced,unavailable width=400 source=synthetic-content-free$/mu,
+      /^USAGE_MONITOR_MACOS_MENU_BAR_POPOVER_RENDER locales=en,es,zh-Hans appearances=light,dark ranges=7d,30d states=live,pace-collecting,pace-under,pace-on,pace-over,pace-critical,partial-pricing,unpriced,unavailable,updating-7d,updating-30d,read-failure-30d width=400 source=synthetic-content-free$/mu,
     );
     const popupRenders = (await readdir(popupRenderDirectory)).sort();
-    assert.equal(popupRenders.length, 15);
+    assert.equal(popupRenders.length, 18);
+    for (const state of ["updating-7d", "updating-30d", "read-failure-30d"]) {
+      assert.equal(popupRenders.includes(`menu-bar-popover-en-${state}-light.png`), true);
+    }
     assert.equal(
       popupRenders.includes("menu-bar-popover-en-30d-light.png"),
       true,
@@ -7381,7 +7480,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       assert.equal(renderBytes.readUInt32BE(16), 800, popupRender);
       const pixelHeight = renderBytes.readUInt32BE(20);
       assert.ok(pixelHeight >= 600, popupRender);
-      if (!popupRender.includes("unavailable")) {
+      if (!popupRender.includes("unavailable") && !popupRender.includes("read-failure")) {
         assert.ok(pixelHeight >= 1_000, popupRender);
       }
       popupRenderDigests.set(

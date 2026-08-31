@@ -66,12 +66,23 @@ that compatibility backend.
    The bars use
    observed tokens; dollar figures are explicitly Standard API-price
    equivalents, not a subscription bill, and disappear when pricing evidence
-   cannot support them. Missing evidence is a named gap, never a zero. The
+   cannot support them. During refresh the last completed usage analysis stays
+   visible with an explicit retained-history label, including both chart ranges
+   and their original coverage. A transient read failure also keeps that
+   labelled history, while current quota and forecast claims are cleared.
+   Companion restart or source replacement clears all previous in-memory
+   evidence; first-run or invalid history is never fabricated. Missing evidence
+   is a named gap, never a zero. The
    popover forecast is an ephemeral, strict projection from the companion's
    narrow read-only weekly-pace endpoint. Request-time geometry is recalculated
    from the retained strict forecast without rerunning accounting; it is never
    stored, logged, exported, or added to community data. It contains no account
    identity, plan claim, purchase flow, reset credits, or redemption action.
+   Clicking outside the popover dismisses it even if another app was already
+   active when it opened. Its outside mouse listener exists only while the
+   popover is open; it does not record event content, monitor global keys, or
+   consume clicks destined for other apps. Popover controls and a second click
+   on its status icon retain their normal control and toggle behavior.
    Right-click or Control-click opens the native action menu with **Open
    TiboTattle**, state-aware **Analyze/Update Local
    Usage**, Settings, About, update checks when available, and **Quit
@@ -570,6 +581,16 @@ backup before launching the previous version unless that exact existing-state
 rollback has been rehearsed.
 
 ## Automated validation
+
+For menu-bar refresh changes, start with `npm run test:macos:source` and
+`npm run test:macos:smoke`. The latter compiles a development-only app and checks
+retained history through both the companion's projection and the native view,
+including both ranges, read failure, and source reset. Its development-only
+`--menu-bar-overview-render-smoke-test <derived-overview.json> <output-directory>`
+mode renders ready, updating, and read-failure states without starting a
+companion or altering installed app state. Automated fixtures must remain
+synthetic; local real-data visual QA is separate from those tests and from an
+installed or signed-artifact gate.
 
 Run the focused suite:
 

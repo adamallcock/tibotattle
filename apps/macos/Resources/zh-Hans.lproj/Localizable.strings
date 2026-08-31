@@ -129,6 +129,7 @@
 "menuBarPopup.notSubscriptionBill" = "并非订阅账单";
 "menuBarPopup.accountingUnavailableTitle" = "本地用量历史尚不可用";
 "menuBarPopup.accountingUnavailableBody" = "运行本地分析，以根据这台 Mac 上的数据生成过去 7 天和 30 天的 API 价格等值历史。";
+"menuBarPopup.retainedHistory" = "正在显示上次完成的分析。";
 "menuBarPopup.noUsageObserved" = "在%@内未观测到本地用量。";
 "menuBarPopup.startingTitle" = "正在准备本地用量";
 "menuBarPopup.startingBody" = "仅在获得新的本地观测后，TiboTattle 才会显示数值。";
