@@ -85,6 +85,9 @@ struct MenuBarHistoryDay: Equatable {
 struct MenuBarHistorySnapshot: Equatable {
     enum AccountingStatus: Equatable {
         case current
+        /// Validated figures from an earlier completed analysis, never a
+        /// current-generation claim. Quota freshness remains independent.
+        case retained
         case unavailable
     }
 
@@ -124,6 +127,20 @@ struct MenuBarHistorySnapshot: Equatable {
             return thirtyDayHistory
         }
     }
+
+    /// Retain only an already validated snapshot after a same-companion read
+    /// failure. This cannot turn a first-run/invalid response into evidence.
+    func retainingLastVerified() -> MenuBarHistorySnapshot {
+        guard accountingStatus != .unavailable else { return self }
+        return MenuBarHistorySnapshot(
+            accountingStatus: .retained,
+            last24Hours: last24Hours,
+            lastSevenDays: lastSevenDays,
+            lastThirtyDays: lastThirtyDays,
+            sevenDayHistory: sevenDayHistory,
+            thirtyDayHistory: thirtyDayHistory
+        )
+    }
 }
 
 /// Pure, fail-closed projection of the accounting and timeline fields already
@@ -136,10 +153,14 @@ enum MenuBarHistoryProjection {
         now: Date,
         calendar: Calendar
     ) -> MenuBarHistorySnapshot {
-        let dayWindows = civilDayWindows(now: now, calendar: calendar)
+        let state = accountingState(root, now: now)
+        // A retained rolling period and its civil-day bars keep the original
+        // analysis date, including across midnight or daylight-saving changes.
+        let snapshotDate = state?.snapshotDate ?? now
+        let dayWindows = civilDayWindows(now: snapshotDate, calendar: calendar)
         let unavailableHistory = unavailableHistories(dayWindows)
 
-        guard accountingIsAuthoritative(root),
+        guard let state,
               let periods = decodePeriods(root)
         else {
             return MenuBarHistorySnapshot(
@@ -154,7 +175,7 @@ enum MenuBarHistoryProjection {
 
         guard let history = decodeHistory(
             root: root,
-            now: now,
+            now: snapshotDate,
             dayWindows: dayWindows
         ) else {
             // Current rolling totals do not make a malformed or unavailable
@@ -171,7 +192,7 @@ enum MenuBarHistoryProjection {
             )
         }
         return MenuBarHistorySnapshot(
-            accountingStatus: .current,
+            accountingStatus: state.status,
             last24Hours: periods[.last24Hours],
             lastSevenDays: periods[.lastSevenDays],
             lastThirtyDays: periods[.lastThirtyDays],
@@ -233,24 +254,49 @@ enum MenuBarHistoryProjection {
 
     private static let maximumJSONSafeInteger = 9_007_199_254_740_991.0
 
-    private static func accountingIsAuthoritative(
-        _ root: [String: Any]
-    ) -> Bool {
-        guard let freshness = root["freshness"] as? [String: Any],
-              freshness["accountingStatus"] as? String == "available",
-              let accounting = root["accounting"] as? [String: Any],
+    private static func accountingState(
+        _ root: [String: Any],
+        now: Date
+    ) -> (status: MenuBarHistorySnapshot.AccountingStatus, snapshotDate: Date)? {
+        guard let accounting = root["accounting"] as? [String: Any],
               let sourceMode = accounting["sourceMode"] as? String,
               ["legacy", "unified"].contains(sourceMode)
         else {
-            return false
+            return nil
         }
 
-        // The data store can retain the previous complete figures while a new
-        // unified generation is being built. Its period rows remain populated,
-        // but `generationMatched` deliberately stays false. That state is not a
-        // current numeric accounting claim for this compact surface.
-        return sourceMode != "unified"
-            || exactBoolean(accounting["generationMatched"]) == true
+        if let value = accounting["projection"] {
+            guard let projection = value as? [String: Any] else { return nil }
+            if projection["status"] as? String == "retained" {
+                // The companion explicitly attests that these are previous
+                // verified figures. A generation mismatch alone is NOT enough:
+                // placeholders or an unlabelled/malformed payload stay hidden.
+                let parser = TimestampParser()
+                guard sourceMode == "unified",
+                      exactBoolean(accounting["generationMatched"]) == false,
+                      exactBoolean(projection["terminal"]) != nil,
+                      let retainedAt = parser.date(projection["retainedAt"]),
+                      let coverage = projection["coveredAt"] as? [String: Any],
+                      let startAt = parser.date(coverage["startAt"]),
+                      let endAt = parser.date(coverage["endAt"]),
+                      startAt < endAt,
+                      endAt <= retainedAt,
+                      retainedAt <= now
+                else { return nil }
+                return (.retained, retainedAt)
+            }
+            guard projection["status"] as? String == "available",
+                  projection["reason"] is NSNull,
+                  exactBoolean(projection["terminal"]) == false
+            else { return nil }
+        }
+
+        guard let freshness = root["freshness"] as? [String: Any],
+              freshness["accountingStatus"] as? String == "available",
+              sourceMode != "unified"
+                || exactBoolean(accounting["generationMatched"]) == true
+        else { return nil }
+        return (.current, now)
     }
 
     private static func decodePeriods(
