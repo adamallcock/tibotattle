@@ -2336,3 +2336,164 @@ test("idle reconciliation does not rewrite the full checkpoint every cycle", asy
     await rm(fixture.root, { recursive: true });
   }
 });
+
+
+test("inline fork replay stays out of the ledger and the baseline rebases across a resume", async () => {
+  const fixture = await collectorFixture([
+    tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),
+  ]);
+  const clock = () => Date.parse("2026-07-23T00:10:00.000Z");
+  const forkFile = join(fixture.sessions, "rollout-2026-07-23T00-05-00-fork.jsonl");
+  const meta = JSON.stringify({
+    timestamp: "2026-07-23T00:05:00.000Z",
+    type: "session_meta",
+    payload: { id: "fork-child", forked_from_id: "vanished-parent" },
+  });
+  const tool = JSON.stringify({
+    timestamp: "2026-07-23T00:05:00.500Z",
+    type: "response_item",
+    payload: { type: "custom_tool_call", name: "replayed-tool", call_id: "replayed-call-1" },
+  });
+  const turn = JSON.stringify({
+    timestamp: "2026-07-23T00:05:02.000Z",
+    type: "turn_context",
+    payload: { model: "gpt-test" },
+  });
+  try {
+    // Run 1 stops mid-replay: the checkpoint must persist the pre-boundary
+    // state so the resume cannot mistake the rest of the replay for spend.
+    await writeFile(forkFile, `${[
+      meta,
+      tokenRecord("2026-07-23T00:05:00.100Z", usage(100), usage(100), 2),
+      tool,
+      tokenRecord("2026-07-23T00:05:01.000Z", usage(300), usage(200), 3),
+    ].join("\n")}\n`);
+    const first = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-20T00:00:00.000Z",
+      clock,
+    });
+    assert.equal(first.status, "complete");
+    const afterFirst = await readLines(fixture.dataFile);
+    assert.equal(
+      afterFirst.filter((row) => row.kind === "codex_rollout_usage_snapshot"
+        && row.components !== null
+        && row.components.input_uncached_tokens > 10).length,
+      0,
+    );
+
+    // The fork's first genuine turn arrives after a restart. Its delta must
+    // be measured from the replayed baseline (400 - 300 = its own 100), not
+    // charged the whole inherited total.
+    await appendFile(forkFile, `${[
+      turn,
+      tokenRecord("2026-07-23T00:05:03.000Z", usage(400), usage(100), 4),
+    ].join("\n")}\n`);
+    const second = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-20T00:00:00.000Z",
+      clock,
+    });
+    assert.equal(second.status, "complete");
+
+    const records = await readLines(fixture.dataFile);
+    const usageRecords = records.filter((row) => row.kind === "codex_rollout_usage_snapshot"
+      && row.components !== null);
+    const forkUsage = usageRecords.filter((row) => row.model === "gpt-test");
+    assert.equal(forkUsage.length, 1);
+    assert.equal(forkUsage[0].components.input_uncached_tokens, 100);
+    assert.equal(
+      records.filter((row) => row.kind === "codex_tool_class_event"
+        && row.toolClass !== undefined
+        && row.observedAt === "2026-07-23T00:05:00.500Z").length,
+      0,
+    );
+
+    const checkpoint = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    assert.equal(checkpoint.diagnostics.forkReplayEventsSkipped, 2);
+    assert.equal(checkpoint.diagnostics.forkReplayToolCallsSkipped, 1);
+    const forkState = Object.values(checkpoint.files)
+      .find((state) => state.isInlineFork === true);
+    assert.ok(forkState);
+    assert.equal(forkState.ownTurnContextSeen, true);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("a truncated fork file re-arms the replay boundary on rescan", async () => {
+  // Regression for the review finding: the truncation reset cleared every
+  // cursor field except ownTurnContextSeen, so a shrink-in-place rescan of a
+  // fork file walked the replayed prefix with both guards disabled and
+  // charged the inherited history as fresh spend.
+  const fixture = await collectorFixture([
+    tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),
+  ]);
+  const clock = () => Date.parse("2026-07-23T00:10:00.000Z");
+  const forkFile = join(fixture.sessions, "rollout-2026-07-23T00-05-00-fork.jsonl");
+  const meta = JSON.stringify({
+    timestamp: "2026-07-23T00:05:00.000Z",
+    type: "session_meta",
+    payload: { id: "fork-child", forked_from_id: "vanished-parent" },
+  });
+  const turn = JSON.stringify({
+    timestamp: "2026-07-23T00:05:02.000Z",
+    type: "turn_context",
+    payload: { model: "gpt-test" },
+  });
+  try {
+    await writeFile(forkFile, `${[
+      meta,
+      tokenRecord("2026-07-23T00:05:00.100Z", usage(100), usage(100), 2),
+      tokenRecord("2026-07-23T00:05:01.000Z", usage(300), usage(200), 3),
+      turn,
+      tokenRecord("2026-07-23T00:05:03.000Z", usage(400), usage(100), 4),
+    ].join("\n")}\n`);
+    const first = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-20T00:00:00.000Z",
+      clock,
+    });
+    assert.equal(first.status, "complete");
+
+    // Shrink in place: same inode, replay-only content shorter than the
+    // consumed cursor. The rescan must re-derive the boundary, not inherit a
+    // stale past-the-boundary flag.
+    await writeFile(forkFile, `${[
+      meta,
+      tokenRecord("2026-07-23T00:05:00.100Z", usage(100), usage(100), 2),
+      tokenRecord("2026-07-23T00:05:01.000Z", usage(300), usage(200), 3),
+    ].join("\n")}\n`);
+    const second = await runCollectorOnce({
+      ...fixture,
+      refreshStale: false,
+      backfill: true,
+      backfillSinceAt: "2026-07-20T00:00:00.000Z",
+      clock,
+    });
+    assert.equal(second.status, "complete");
+
+    const records = await readLines(fixture.dataFile);
+    const forkUsage = records.filter((row) => row.kind === "codex_rollout_usage_snapshot"
+      && row.components !== null
+      && row.components.input_uncached_tokens > 10);
+    assert.equal(forkUsage.length, 1);
+    assert.equal(forkUsage[0].components.input_uncached_tokens, 100);
+
+    const checkpoint = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+    assert.equal(checkpoint.diagnostics.filesTruncated, 1);
+    assert.equal(checkpoint.diagnostics.forkReplayEventsSkipped, 4);
+    const forkState = Object.values(checkpoint.files)
+      .find((state) => state.isInlineFork === true);
+    assert.ok(forkState);
+    assert.equal(forkState.ownTurnContextSeen, false);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});

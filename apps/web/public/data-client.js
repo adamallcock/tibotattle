@@ -25,6 +25,10 @@ export {
 
 const LOCAL_ROOT = "/api/local";
 const CENTRAL_ROOT = "/api/v1";
+// The dashboard has no tool-activity view. Keep this diagnostic in the raw
+// companion payload and retained snapshots, but omit it from display warnings.
+const INTERNAL_TOOL_HISTORY_WARNING =
+  "Usage accounting is complete, but typed tool history is partial. Tool totals are withheld rather than reported as zero.";
 // Provider quota identifiers are protocol values, not display copy. Keep the
 // normal Codex allowance selection bound to the exact technical identifier so
 // a translated UI label (or another product's weekly-looking window) can never
@@ -5443,7 +5447,9 @@ export function normalizeDashboardPayload(payload = {}, fragments = {}) {
       components: pricing?.components ?? selectedUsage?.components
     }),
     coverage: overview?.coverage ?? {},
-    warnings: array(overview?.warnings).map((warning) => text(warning?.message ?? warning, "")).filter(Boolean),
+    warnings: array(overview?.warnings)
+      .map((warning) => text(warning?.message ?? warning, ""))
+      .filter((warning) => warning && warning !== INTERNAL_TOOL_HISTORY_WARNING),
     collector: {
       status: text(overview?.collector?.status, "unavailable"),
       records: count(overview?.collector?.records, 0),

@@ -79,6 +79,7 @@ export function createCodexLogIngestion({
     const diagnostics = {
       filesScanned: rolloutInfos.length,
       lineageParentsMissing: 0,
+      forkRolloutsFailedClosed: 0,
       malformedLines: 0,
       malformedTimestamps: 0,
       malformedAccountingRecords: 0,
@@ -245,7 +246,9 @@ export function createCodexLogIngestion({
           && info.lineage.parentId
         ? snapshotsBySession.get(info.lineage.parentId)
         : null;
-      if (info.lineage.isInlineFork === true && !inheritedSnapshots) {
+      const forkParentUnavailable = info.lineage.isInlineFork === true
+        && !inheritedSnapshots;
+      if (forkParentUnavailable) {
         diagnostics.lineageParentsMissing += 1;
       }
       const rolloutSnapshots = collectOwnSnapshots
@@ -253,6 +256,48 @@ export function createCodexLogIngestion({
         : discardedSnapshots;
       for (const snapshot of historySeed?.snapshots ?? []) {
         rolloutSnapshots.add(snapshot);
+      }
+      if (forkParentUnavailable) {
+        // An inline fork replays its parent's entire history into its own
+        // file, and only the parent's cumulative-snapshot keys can prove
+        // which of this file's records are that replay. Discovery pulls
+        // lineage parents into the batch even when they fall outside the
+        // requested window, so reaching here means the parent rollout is
+        // genuinely unavailable (rotated away, or its group quarantined
+        // without members). The parser's own no-turn-context-yet rule would
+        // still skip the replay shape Codex writes today, but that rule is a
+        // heuristic over the current replay format, and a replay it fails to
+        // recognise is charged as fresh spend at disk speed (measured 92.7x
+        // weekly inflation in a naive count). Accounting fails closed
+        // instead: this rollout contributes no events this scan. Its own
+        // keys are still collected — they include the replayed ancestral
+        // prefix, so a descendant fork scanned in this batch keeps full
+        // replay suppression even though the common ancestor is gone.
+        if (collectOwnSnapshots) {
+          await withRolloutInput(info, async (sourceInput) => {
+            await parser.collectCumulativeSnapshotKeys(
+              sourceInput,
+              rolloutSnapshots,
+              resourceGuard,
+              info.size,
+              signal,
+            );
+          });
+          if (info.lineage.sessionId) {
+            snapshotsBySession.set(info.lineage.sessionId, rolloutSnapshots);
+          }
+        }
+        diagnostics.forkRolloutsFailedClosed += 1;
+        // The skip also withholds this rollout's rate-limit snapshots and
+        // open-task markers. Quota telemetry is redundant across files, but
+        // the experiment harness stops controlled runs on
+        // activeTaskRolloutsAtEnd — so a recently-written orphan fork must
+        // still count as possibly-active, or a preflight would read a busy
+        // machine as idle.
+        if (info.mtimeMs >= activeCutoffMs) {
+          diagnostics.activeTaskRolloutsAtEnd += 1;
+        }
+        continue;
       }
       if (info.lineage.sessionId
           && excludedSessions.has(info.lineage.sessionId)) {

@@ -9148,6 +9148,56 @@ test("a chart says so when its series does not reach back as far as its label", 
 // state wholesale, and its copy and rendering are owned there.
 // ---------------------------------------------------------------------------
 
+test("dashboard warnings omit internal tool history while preserving usage caveats and diagnostics", () => {
+  const toolWarning =
+    "Usage accounting is complete, but typed tool history is partial. Tool totals are withheld rather than reported as zero.";
+  const usageWarning = "Some usage events name an unrecognized model and remain unpriced rather than being assigned a guessed price.";
+  const historyWarning = "The unified local index is unreadable.";
+  const otherToolWarning = "Some tool activity has unpriced usage.";
+  const toolClasses = {
+    status: "unavailable",
+    reason: "typed_tool_history_partial",
+    total: null,
+    counts: Object.fromEntries(
+      ["apply_patch", "local_shell", "other", "subagent", "tool_gateway"]
+        .map((key) => [key, null]),
+    ),
+  };
+  const overview = {
+    warnings: [
+      toolWarning,
+      usageWarning,
+      { message: toolWarning },
+      { message: historyWarning },
+      "",
+      null,
+      {},
+      otherToolWarning,
+    ],
+    activity: { toolEvents: null },
+    pricing: { totalCostUsd: 12.5 },
+    accounting: { toolClasses },
+    timeline: {
+      history: { status: "partial", reason: "typed_tool_history_partial" },
+    },
+  };
+  const original = structuredClone(overview);
+  for (const dashboard of [
+    normalizeDashboardPayload(overview),
+    normalizeDashboardPayload({ overview }),
+    normalizeDashboardPayload({}, { overview }),
+  ]) {
+    assert.deepEqual(dashboard.warnings, [usageWarning, historyWarning, otherToolWarning]);
+    assert.equal(dashboard.pricing.totalCostUsd, 12.5);
+    assert.equal(dashboard.activity.toolEvents, null);
+    assert.deepEqual(dashboard.accounting.toolClasses, toolClasses);
+    assert.equal(dashboard.timeline.history.status, "partial");
+    assert.equal(dashboard.timeline.history.reason, "typed_tool_history_partial");
+  }
+  assert.deepEqual(overview, original, "source diagnostics stay unchanged for retention and inspection");
+  assert.deepEqual(normalizeDashboardPayload({ warnings: [toolWarning] }).warnings, []);
+});
+
 test("self-resolving degraded notes are classed informational and keep the quiet style", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
@@ -9226,8 +9276,6 @@ test("self-resolving degraded notes are classed informational and keep the quiet
     "Recent cost figures come from the live collector projection until the"
       + " replay-safe cache is refreshed. They may double-count usage that"
       + " forked child sessions inherited.",
-    "Usage accounting is complete, but typed tool history is partial. Tool"
-      + " totals are withheld rather than reported as zero.",
     "Indexed-history totals include ${historyCoverage.indexedSourceCount} of"
       + " ${historyCoverage.sourceCount} verified sources."
       + " ${historyCoverage.skippedSourceCount} sources across"

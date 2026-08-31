@@ -2206,7 +2206,7 @@ tbody tr:last-child td { border-bottom: 0; }
   border: 1px solid var(--green);
   border-radius: var(--radius-sm);
   color: var(--ink);
-  background: rgba(255, 254, 249, .98);
+  background: var(--paper);
   box-shadow: 0 18px 42px rgba(31, 45, 39, .2);
   font-size: .68rem;
   line-height: 1.35;
