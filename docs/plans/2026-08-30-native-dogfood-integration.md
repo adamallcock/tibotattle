@@ -27,9 +27,9 @@ must remain untouched by integration.
 | #84 dark cache tooltip | In current main | Include and verify rendered contrast |
 | #85 internal tool-history warning | In current main | Include and verify dashboard state |
 | Compact accounting headings, five-column cache table, quieter partial-coverage copy | Local task changes | Review, test, commit, PR and merge |
-| Native menu history retained during refresh and popup dismissal | Concurrent appbar task | Await owned commit/PR and validation handoff |
+| #88 native menu history retained during refresh and popup dismissal | Merged as `41c02dd2`; integrated | Revalidate the signed native artifact, including physical clicks |
 | #87 local cache-drop thread links | Explicitly included; merged as `a864d159` from `ce0aacd6` | Reconcile five-column compact layout, test transient name lookup and native handoff; final integrated R7 remains here |
-| #86 participant self-service deletion retirement | Explicitly excluded after owner handoff | Draft has remaining root/benchmark gates and separate hosted/privacy decisions; no inclusion absent a later ready handoff |
+| #86 participant self-service deletion retirement | Ready/merged handoff supersedes draft-only exclusion; include `9b121b7d` | Reconcile integrated source and native/consent checks; no hosted deployment or production deletion is authorized here |
 | #75 stacked native popup PR | Native popup already ported into release source | Do not merge excluded Electron ancestry |
 | #73, #74, Electron delivery, Linux integration and Claude Code integration | Excluded | No scope expansion without a new decision |
 | Credential-lifetime branch | Unreviewed, uncommitted work remains | Do not silently absorb into this candidate |
@@ -74,15 +74,21 @@ explicitly; do not indefinitely follow unrelated active branches.
 Fresh main/PR inventory and isolated integration checkout established. Local
 compact-accounting changes were committed as `309eae90` after 27 focused and
 376 full UI tests, documentation checks and preflight passed. PR #87 is merged
-and being combined with that layout; its two protected R7 freshness failures
-belong to this final integrated gate. Its source-only native timeout retry and
-physical click-through limitation remain distinct from release qualification.
+and reconciled with that layout; all 396 combined UI tests passed. PR #88 is
+integrated, and the native source gate passed 54 tests with its three designated
+artifact exclusions. Their protected R7 freshness failures belong to this final
+integrated gate. The source-only native timeout retry and physical click-through
+limitation remain distinct from release qualification. On 2026-08-31 UTC the
+#86 owner supplied the verified merged-source handoff; its earlier draft-only
+exclusion is superseded. Source integration does not retire the live hosted
+endpoint, and the separate owner-access, privacy-intake and retention cutover
+requirements remain in force.
 
 The stable index, matching salt and collector were preserved with verified
 unchanged originals. Copy inspection found physical schema 9, an intact index
 and partial published generation; migration has not run. Existing Developer ID
 and notarization configuration authenticated successfully without signing or
-submission. The appbar owner reports passing compiled smoke and is completing
-the isolated PR handoff. No R7 regeneration, signing, migration, installation or
+submission. The appbar owner supplied passing compiled smoke on the exact
+#87/#88 merge. No R7 regeneration, signing, migration, installation or
 release publication has been completed for this source set. Private state
 records and release inputs remain local and outside tracked docs.

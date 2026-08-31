@@ -36,9 +36,14 @@ remains accountable for release wording, validation, signing, and publication.
 
 **Candidate notes:** [0.1.17](./release-notes/0.1.17.md)
 
-This candidate section combines direct post-v0.1.16 work with merged pull
-requests through [PR #78](https://github.com/adamallcock/tibotattle/pull/78), audited on
-2026-08-27. PRs #73 and #74 are not part of this native macOS candidate. PR #75
+This candidate section combines direct post-v0.1.16 work with reviewed merged
+pull requests, including [PR #80](https://github.com/adamallcock/tibotattle/pull/80),
+[PR #83](https://github.com/adamallcock/tibotattle/pull/83),
+[PR #84](https://github.com/adamallcock/tibotattle/pull/84),
+[PR #85](https://github.com/adamallcock/tibotattle/pull/85),
+[PR #87](https://github.com/adamallcock/tibotattle/pull/87), and
+[PR #88](https://github.com/adamallcock/tibotattle/pull/88).
+PRs #73 and #74 are not part of this native macOS candidate. PR #75
 is not merged wholesale; a native subset of its menu-bar and weekly-pace work
 is ported without its Electron or multi-root changes. Separately, this candidate
 advances the local index to schema 11 only for the measured cleanup-index fix;
@@ -85,6 +90,11 @@ published-release claim.
   allowance lanes, fail-closed 7/30-day usage history, and a weekly pace outlook;
   right-click and Control-click retain the native actions menu (native subset of
   [PR #75](https://github.com/adamallcock/tibotattle/pull/75)).
+- Adds transient local thread-name links to both recent cache-drop tables,
+  including separate parent and worker links when that relationship is recorded.
+  Missing attribution stays unlinked; names and links do not enter persisted
+  accounting, exports, diagnostics, or hosted contribution
+  ([PR #87](https://github.com/adamallcock/tibotattle/pull/87)).
 
 ### Changed
 
@@ -103,6 +113,16 @@ published-release claim.
 - Synchronizes Codex plan and quota contracts, including human-readable plan
   names, the Five-hour allowance label, and distinct observed quota pools
   ([PR #71](https://github.com/adamallcock/tibotattle/pull/71)).
+- Uses event-time Standard API prices and published Priority/Fast price ratios
+  for speed-priced API-equivalent accounting where available. Disclosed pricing
+  assumptions and unknown speed modes remain explicit; this is a comparison
+  measure, not a bill or a claimed subscription quota formula
+  ([PR #80](https://github.com/adamallcock/tibotattle/pull/80)).
+- Compacts accounting presentation with one headline amount, partial-estimate
+  explanations for covered overhead, a shorter Configuration label, and API
+  equivalent table headings whose help retains the Standard-rate basis. The
+  cache-continuity table drops the Estimated lost reuse column without changing
+  the underlying calculation.
 - Completes the API lifecycle cleanup by removing the retired Cloud Run/GCS
   experiment, unused hosted and loopback surfaces, the inactive automatic
   contribution scheduler, and the unfinished Claude quota route while retaining
@@ -112,10 +132,11 @@ published-release claim.
   schema-9 state after a read-only compatibility preflight, then rebuilds a
   schema-11 stage from readable raw history because those formats predate the
   current source-identity contract. A schema-10 index instead receives the
-  additive schema-11 cleanup indexes on a staged copy without rescanning its
-  sources. Neither path replaces the live index until validation succeeds.
-  This build refuses a newer schema before mutation and reports it as
-  unavailable rather than empty.
+  additive schema-11 cleanup indexes on a staged copy. The independent parser
+  v10-to-v11 upgrade still reprocesses readable sources; an unchanged source is
+  reusable only when its parser and source provenance are current. Neither path
+  replaces the live index until validation succeeds. This build refuses a newer
+  schema before mutation and reports it as unavailable rather than empty.
 - Makes the rollback boundary explicit: after migration to schema 10 or 11, do
   not reopen the index with 0.1.16. That shipped binary lacks the typed read-only
   refusal and may touch SQLite journal mode before rejecting the schema.
@@ -147,6 +168,15 @@ published-release claim.
 - Retains valid usage, tool, and quota facts when one provider quota window is
   malformed, while withholding that invalid observation with an explicit
   diagnostic rather than presenting it as zero.
+- Withholds orphaned inline-fork usage when the parent history needed to prove
+  replay suppression is unavailable, including in the legacy collector, instead
+  of charging inherited history as fresh usage
+  ([PR #83](https://github.com/adamallcock/tibotattle/pull/83)).
+- Restores readable dark-mode contrast in cache-reuse tooltips
+  ([PR #84](https://github.com/adamallcock/tibotattle/pull/84)).
+- Removes the internal partial-tool-history warning from the dashboard without
+  changing the underlying coverage state or inventing missing tool totals
+  ([PR #85](https://github.com/adamallcock/tibotattle/pull/85)).
 - Accepts a selected paginated Codex replacement that begins a new segment
   without `history_base`, and clears the replaced lineage snapshot set before
   later forks are evaluated.
@@ -170,6 +200,11 @@ published-release claim.
   ([PR #54](https://github.com/adamallcock/tibotattle/pull/54)).
 - Keeps the latest measured allowance visible in the menu bar during refresh
   ([PR #55](https://github.com/adamallcock/tibotattle/pull/55)).
+- Keeps compatible, previously validated native usage history visible during
+  refresh with retained-data labelling; missing or incompatible evidence remains
+  unavailable rather than being presented as fresh. The native popover also
+  dismisses on an outside click
+  ([PR #88](https://github.com/adamallcock/tibotattle/pull/88)).
 - Disables unused native window tabbing and hardens context-menu behavior
   ([PR #56](https://github.com/adamallcock/tibotattle/pull/56),
   [PR #61](https://github.com/adamallcock/tibotattle/pull/61)).

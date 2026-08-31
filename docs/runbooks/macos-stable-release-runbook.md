@@ -86,11 +86,17 @@ Expect `fail 0`. A green-looking terminal is not a green suite.
 Before signing the 0.1.17 internal-dogfood candidate, rehearse the applicable
 schema-11 transition against a consistent disposable copy of the stable unified
 index and its matching device salt. Schema 8/9 must take the normal staged
-rebuild from readable raw history; schema 10 must take the additive staged
-migration without a source rescan. Keep the installed app stopped while taking
-the copy, leave the live source read-only, and compare SQLite integrity,
-generation metadata, row counts, aggregate token/cost ranges, and source-cursor
-coverage before and after the transition. Follow the canonical
+rebuild from readable raw history. Schema 10 takes the additive physical
+schema-11 migration on a staged copy, but that does not bypass parser
+compatibility: upgrading parser v10 to v11 still reprocesses readable sources
+through normal ingestion. Only an unchanged source whose parser and source
+provenance are already current can be reused without rescanning. Record both
+`PRAGMA user_version` and the published generation's parser provenance; the
+physical version alone cannot establish whether a parser rescan is required.
+Keep the installed app stopped while taking the copy, leave the live source
+read-only, and compare SQLite integrity, generation metadata, row counts,
+aggregate token/cost ranges, and source-cursor coverage before and after the
+transition. Follow the canonical
 [local unified-index recovery runbook](./unified-index-recovery.md)
 for compatibility and preservation rules.
 
@@ -168,7 +174,7 @@ node scripts/release-macos-app.js \
 
 For the 0.1.17 stable release, `CFBundleShortVersionString` remains `0.1.17`
 and the owner-reviewed signed `CFBundleVersion` is exactly `1024`. It follows
-the isolated 0.1.17 dogfood allocation `1023` and the last shared-identity
+the internal-dogfood 0.1.17 allocation `1023` and the last shared-identity
 dogfood build `1022`. The checked-in allocation is authoritative; the
 `USAGE_MONITOR_BUNDLE_VERSION` value above is only an exact assertion and
 cannot select or override a different build. A future stable version must add
