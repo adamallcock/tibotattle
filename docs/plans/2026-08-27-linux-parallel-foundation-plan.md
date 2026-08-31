@@ -3,7 +3,8 @@ title: Linux parallel foundation implementation plan
 date: 2026-08-27
 type: plan
 status: foundation-complete-r7-evidence-blocked
-base_revision: 1a953486da85062861581473eb28114a89771136
+base_revision: 49fc02766c4bb7434b62ccd378d21b2d4ebf5e71
+original_base_revision: 1a953486da85062861581473eb28114a89771136
 owners:
   - desktop
   - platform-security
@@ -17,9 +18,18 @@ owners:
 
 Complete the Linux-owned work that can proceed without activating Linux in the
 production composition root or weakening the macOS/Windows qualification
-sequence. Work occurs on `codex/linux-parallel-foundation-20260827`, branched
-from the selected Electron lineage at
+sequence. The original August 27 work occurred on
+`codex/linux-parallel-foundation-20260827`, based on the local Electron revision
 `1a953486da85062861581473eb28114a89771136`.
+
+For the authorized public integration on August 30, only the Linux changes
+and a focused Electron test synchronization fix were ported to
+`codex/linux-foundation-public-20260830`, based on the already-public Electron
+revision `49fc02766c4bb7434b62ccd378d21b2d4ebf5e71`. The destination is
+`codex/linux-integration`, not `main` or a Windows branch. Ten intervening
+unpublished Electron/macOS commits and their private-history review were
+excluded; the original local branch remains preserved. The August 27 results
+below are historical, not qualification of this reconstructed public branch.
 
 This plan does not authorize a Linux support claim, AppImage publication,
 production selector activation, signing, deployment, version change, or use of
@@ -168,3 +178,18 @@ duplicate `session_meta` record in private local history. No private history or
 evidence contract was mutated to force that gate green. See the
 [verification receipt](../receipts/2026-08-27-linux-parallel-foundation-receipt.md)
 for the complete evidence and remaining production gates.
+
+## Public integration — 2026-08-30
+
+[PR #82](https://github.com/adamallcock/tibotattle/pull/82) targets only
+`codex/linux-integration`. Fresh verification on implementation revision
+`5764d5f555460db2164e9fb9662dd87c6b106268` passed the Linux foundation suite
+(91 passed, one native-only skip), all 300 Electron tests, and the exact-revision
+ARM64 network-disabled source GUI smoke. The full root suite recorded 3,666
+passed, two protected stale-R7-receipt failures, and 68 skips out of 3,736 tests.
+It is not a green repository-wide release gate.
+
+The [public integration receipt](../receipts/2026-08-30-linux-public-integration-receipt.md)
+records the public ancestry boundary, current image identity, fresh results,
+and unchanged production blockers. No private-history recovery or receipt
+regeneration was attempted during this integration.
