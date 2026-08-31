@@ -42,6 +42,9 @@ import {
 import {
   readLocalUnifiedWindowBreakdown,
 } from "../../src/local-unified-window-breakdown.js";
+import {
+  buildLocalCacheDropThreadLinks,
+} from "../../src/local-cache-drop-thread-links.js";
 import { TELEMETRY_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
 import {
   acquireAutomaticContributionRetirementLock,
@@ -734,6 +737,7 @@ const API_ROUTES = new Set([
   "/api/local/identity/hosted-signin-handoff",
   "/api/local/onboarding",
   "/api/local/overview",
+  "/api/local/cache-drop-thread-links",
   "/api/local/gradient",
   "/api/local/weekly",
   "/api/local/weekly-pace-outlook",
@@ -1572,6 +1576,19 @@ function authorizeHostedSignInHandoffRead(request, response) {
   if ((origin !== undefined && !sameOrigin(request))
       || request.headers["x-usage-monitor-local"] !== "1") {
     sendError(response, 403, "hosted_signin_handoff_not_authorized");
+    return false;
+  }
+  return true;
+}
+
+function authorizeCacheDropThreadLinksRead(request, response) {
+  // This optional read includes private local display names. Ordinary browser
+  // same-origin GETs omit Origin; the custom header still requires a CORS
+  // preflight from a foreign page, which the companion never grants.
+  const origin = request.headers.origin;
+  if ((origin !== undefined && !sameOrigin(request))
+      || request.headers["x-usage-monitor-local"] !== "1") {
+    sendError(response, 403, "cache_drop_thread_links_not_authorized");
     return false;
   }
   return true;
@@ -2875,6 +2892,13 @@ function createPreparedLocalCompanionServer({
     fromMs,
     toMs,
   }),
+  // Never enrich the persisted overview or report DTOs with names. This
+  // optional, transient read resolves only rows from the attested snapshot.
+  cacheDropThreadLinksProvider = ({ overview }) => buildLocalCacheDropThreadLinks({
+    indexFile: statePaths.unifiedIndexFile,
+    codexHome,
+    overview,
+  }),
   // This is a programmatic, development-only gate: no environment variable,
   // settings control, route, or UI surface enables Claude usage collection.
   // A caller must explicitly opt into the production-shaped local shadow.
@@ -3024,6 +3048,9 @@ function createPreparedLocalCompanionServer({
   }
   if (typeof onboardingProvider !== "function") {
     throw new TypeError("onboardingProvider must be a function");
+  }
+  if (typeof cacheDropThreadLinksProvider !== "function") {
+    throw new TypeError("cacheDropThreadLinksProvider must be a function");
   }
   if (typeof claudeShadowEnabled !== "boolean"
       || typeof claudeShadowControllerFactory !== "function"
@@ -3980,6 +4007,28 @@ function createPreparedLocalCompanionServer({
           return;
         }
         send(response, 200, dataStore.getOverview());
+        return;
+      }
+      if (path === "/api/local/cache-drop-thread-links") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        if (!authorizeCacheDropThreadLinksRead(request, response)) return;
+        try {
+          send(response, 200, await cacheDropThreadLinksProvider({
+            overview: dataStore.getOverview(),
+          }));
+        } catch {
+          // Missing optional metadata is not a failed accounting refresh.
+          // Never surface filesystem errors, names, or raw thread state.
+          send(response, 200, {
+            schemaVersion: "local-cache-drop-thread-links-v1",
+            status: "unavailable",
+            generation: null,
+            entries: [],
+          });
+        }
         return;
       }
       if (path === "/api/local/gradient") {

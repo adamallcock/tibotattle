@@ -2032,6 +2032,30 @@ tbody tr:last-child td { border-bottom: 0; }
 #cache-switch-details td { padding-inline: var(--space-2); }
 .cache-switch-details th:nth-child(n + 3),
 .cache-switch-details td:nth-child(n + 3) { text-align: end; }
+.cache-drop-thread-cell {
+  min-width: 12rem;
+  max-width: 25rem;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: start;
+}
+.cache-drop-thread-content { min-width: 0; }
+.cache-drop-thread-link {
+  color: var(--green);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: .18em;
+}
+.cache-drop-thread-link:hover { text-decoration-thickness: 2px; }
+.cache-drop-subworker { color: var(--muted); }
+.cache-drop-thread-unavailable {
+  color: var(--muted);
+  cursor: help;
+}
+.cache-drop-thread-unavailable:focus-visible {
+  outline: 3px solid rgba(49, 95, 132, .42);
+  outline-offset: 3px;
+}
 .cache-reuse-outcome {
   margin-top: var(--space-5);
   padding: var(--space-5);
@@ -2274,31 +2298,39 @@ tbody tr:last-child td { border-bottom: 0; }
   .cache-reuse-metrics span { font-size: .62rem; }
   .cache-reuse-metrics small { font-size: .58rem; }
 }
-/* A five-column evidence table is readable on a desktop but not at phone
-   width. Retain its table semantics there, then turn each row into a labelled
+/* The evidence tables are readable on a desktop but not at phone
+   width. Retain their table semantics there, then turn each row into a labelled
    card here instead of leaving an off-screen horizontal scroller. */
 @media (max-width: 640px) {
-  #cache-switch-details .table-wrap {
+  #cache-switch-details .table-wrap,
+  #cache-continuity-details .table-wrap {
     overflow-x: visible;
     border: 0;
     border-radius: 0;
   }
   #cache-switch-details table,
-  #cache-switch-details tbody {
+  #cache-switch-details tbody,
+  #cache-continuity-details table,
+  #cache-continuity-details tbody {
     display: block;
     width: 100%;
   }
-  #cache-switch-details table { min-width: 0; }
-  #cache-switch-details thead { display: none; }
-  #cache-switch-details tbody { display: grid; gap: var(--space-2); }
-  #cache-switch-details tbody tr {
+  #cache-switch-details table,
+  #cache-continuity-details table { min-width: 0; }
+  #cache-switch-details thead,
+  #cache-continuity-details thead { display: none; }
+  #cache-switch-details tbody,
+  #cache-continuity-details tbody { display: grid; gap: var(--space-2); }
+  #cache-switch-details tbody tr,
+  #cache-continuity-details tbody tr {
     display: block;
     padding: var(--space-3);
     border: 1px solid var(--line);
     border-radius: var(--radius-sm);
     background: var(--surface-raised);
   }
-  #cache-switch-details tbody td {
+  #cache-switch-details tbody td,
+  #cache-continuity-details tbody td {
     display: grid;
     grid-template-columns: minmax(0, 42%) minmax(0, 1fr);
     gap: var(--space-2);
@@ -2306,8 +2338,11 @@ tbody tr:last-child td { border-bottom: 0; }
     text-align: end;
     white-space: normal;
   }
-  #cache-switch-details tbody td::before {
+  #cache-switch-details tbody td::before,
+  #cache-continuity-details tbody td::before {
     content: attr(data-label);
+    min-width: 0;
+    overflow-wrap: anywhere;
     color: var(--muted);
     font-size: .62rem;
     font-weight: var(--weight-bold);
@@ -2315,13 +2350,20 @@ tbody tr:last-child td { border-bottom: 0; }
     text-align: start;
     text-transform: uppercase;
   }
-  #cache-switch-details tbody td:last-child { border-bottom: 0; }
-  #cache-switch-details .cache-switch-change { min-width: 0; }
-  #cache-switch-details .empty-cell {
+  #cache-switch-details tbody td:last-child,
+  #cache-continuity-details tbody td:last-child { border-bottom: 0; }
+  #cache-switch-details .cache-switch-change,
+  #cache-continuity-details .cache-switch-change,
+  .cache-drop-thread-cell { min-width: 0; max-width: none; }
+  #cache-switch-details .cache-drop-thread-cell,
+  #cache-continuity-details .cache-drop-thread-cell { text-align: start; }
+  #cache-switch-details .empty-cell,
+  #cache-continuity-details .empty-cell {
     display: block;
     text-align: center;
   }
-  #cache-switch-details .empty-cell::before { content: none; }
+  #cache-switch-details .empty-cell::before,
+  #cache-continuity-details .empty-cell::before { content: none; }
 }
 .accounting-bars { display: grid; gap: 10px; }
 .accounting-dimensions {

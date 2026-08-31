@@ -2255,6 +2255,59 @@ private struct LocalKeychainResetResult: Decodable {
     }
 }
 
+/// A local dashboard click may open one Codex thread, never an arbitrary
+/// custom-scheme operation. No identifier is logged or persisted by the shell.
+private enum CodexThreadOpenTarget {
+    static func accepts(_ url: URL) -> Bool {
+        guard url.absoluteString.range(
+            of: "^codex://threads/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            options: .regularExpression
+        ) != nil,
+              let parts = URLComponents(
+            url: url, resolvingAgainstBaseURL: false
+        ),
+              parts.scheme == "codex",
+              parts.host == "threads",
+              parts.user == nil,
+              parts.password == nil,
+              parts.port == nil,
+              parts.query == nil,
+              parts.fragment == nil,
+              parts.path.hasPrefix("/"),
+              let identifier = UUID(uuidString: String(parts.path.dropFirst()))
+        else {
+            return false
+        }
+        // Also reject encodings, empty ports/query/fragment, extra path
+        // components, and other URL normalizations at the original boundary.
+        return url.absoluteString
+            == "codex://threads/\(identifier.uuidString.lowercased())"
+    }
+
+    static func acceptsNavigation(
+        to url: URL,
+        userActivated: Bool,
+        sourceIsMainFrame: Bool,
+        sourceURL: URL?,
+        sourceOrigin: (scheme: String, host: String, port: Int),
+        companionPort: Int?
+    ) -> Bool {
+        guard accepts(url), userActivated, sourceIsMainFrame,
+              let sourceURL, let companionPort
+        else {
+            return false
+        }
+        return sourceURL.scheme == "http"
+            && sourceURL.host == loopbackHost
+            && sourceURL.port == companionPort
+            && sourceURL.user == nil
+            && sourceURL.password == nil
+            && sourceOrigin.scheme == "http"
+            && sourceOrigin.host == loopbackHost
+            && sourceOrigin.port == companionPort
+    }
+}
+
 /// Removes browser commands that do not belong in TiboTattle's single-page
 /// dashboard while preserving useful page commands such as Reload, Copy, and
 /// Open Link. WKWebView does not expose a public context-menu delegate on
@@ -2300,6 +2353,9 @@ private final class NativeDashboardWebView: WKWebView {
 @MainActor
 private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelegate,
     WKDownloadDelegate, WKScriptMessageHandler {
+    private static let codexThreadLinkWorld = WKContentWorld.world(
+        name: "TiboTattleTrustedThreadLinks"
+    )
     private let onLoaded: () -> Void
     private let onFailure: (LauncherError) -> Void
     private let onDownloadFailure: () -> Void
@@ -2377,6 +2433,11 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         configuration.userContentController.add(
             self,
             name: "tibotattleHostedSignIn"
+        )
+        configuration.userContentController.add(
+            self,
+            contentWorld: Self.codexThreadLinkWorld,
+            name: "tibotattleCodexThreadLink"
         )
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -2497,6 +2558,35 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
                 forMainFrameOnly: true
             )
         )
+        controller.addUserScript(
+            WKUserScript(
+                source: trustedCodexThreadLinkScript(),
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: true,
+                in: codexThreadLinkWorld
+            )
+        )
+    }
+
+    /// A page cannot forge this handler: both the listener and its message
+    /// endpoint live in a non-page content world. Keyboard activation emits a
+    /// trusted click too; script-created clicks never open an external app.
+    private static func trustedCodexThreadLinkScript() -> String {
+        """
+        (function () {
+          document.addEventListener('click', function (event) {
+            if (!event.isTrusted) return;
+            const anchor = event.target instanceof Element
+              ? event.target.closest('a[href]') : null;
+            const href = anchor?.getAttribute('href');
+            if (typeof href !== 'string' ||
+                !/^codex:\\/\\/threads\\/[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(href)) return;
+            event.preventDefault();
+            window.webkit.messageHandlers.tibotattleCodexThreadLink
+              .postMessage({ threadId: href.slice('codex://threads/'.length) });
+          }, true);
+        })();
+        """
     }
 
     /// User scripts are copied into each document when it starts loading.
@@ -2710,6 +2800,28 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         else {
             return
         }
+        if message.name == "tibotattleCodexThreadLink" {
+            let frame = message.frameInfo
+            let origin = frame.securityOrigin
+            guard message.world === Self.codexThreadLinkWorld,
+                  payload.count == 1,
+                  let threadId = payload["threadId"] as? String,
+                  threadId.count == 36,
+                  let url = URL(string: "codex://threads/\(threadId)"),
+                  CodexThreadOpenTarget.acceptsNavigation(
+                    to: url,
+                    userActivated: true,
+                    sourceIsMainFrame: frame.isMainFrame,
+                    sourceURL: frame.request.url,
+                    sourceOrigin: (origin.protocol, origin.host, origin.port),
+                    companionPort: allowedPort
+                  )
+            else {
+                return
+            }
+            openExternally(url)
+            return
+        }
         if message.name == "tibotattleDownloads" {
             // The page asks; the shell acts. The path never crosses the
             // bridge in either direction.
@@ -2749,6 +2861,18 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
             && url.password == nil
     }
 
+    private func openExternalNavigation(
+        _ navigationAction: WKNavigationAction,
+        url: URL
+    ) {
+        if url.scheme?.lowercased() == "codex" {
+            // WKNavigationType.linkActivated does not attest a trusted user
+            // event. Only the isolated click handler may open Codex.
+            return
+        }
+        openExternally(url)
+    }
+
     // MARK: - Navigation policy
 
     func webView(
@@ -2758,6 +2882,12 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     ) {
         guard let url = navigationAction.request.url else {
             decisionHandler(.cancel)
+            return
+        }
+        if url.scheme?.lowercased() == "codex" {
+            // A Codex target never loads or downloads inside WebKit.
+            decisionHandler(.cancel)
+            openExternalNavigation(navigationAction, url: url)
             return
         }
         if navigationAction.shouldPerformDownload {
@@ -2775,7 +2905,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
             return
         }
         decisionHandler(.cancel)
-        openExternally(url)
+        openExternalNavigation(navigationAction, url: url)
     }
 
     func webView(
@@ -2890,10 +3020,10 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
         // A provider may request a new browser window. The app never embeds
-        // remote origins, so hand it straight to the user's default browser
-        // without a second native confirmation dialog.
+        // remote origins. Codex links use the same source-frame and gesture
+        // policy as same-window links; HTTPS/auth behavior remains unchanged.
         if let url = navigationAction.request.url {
-            openExternally(url)
+            openExternalNavigation(navigationAction, url: url)
         }
         return nil
     }
@@ -5545,8 +5675,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     /// A link the embedded dashboard cannot load itself. Only credential-free
-    /// public HTTPS is handed to the user's browser; the app opens nothing
-    /// else, and loads nothing remote itself.
+    /// public HTTPS is handed to the user's browser. User-activated, canonical
+    /// Codex thread links are handed to Codex after the WebHost's origin gate;
+    /// nothing remote loads inside the app.
     private func openExternalDashboardLink(_ url: URL) {
         // The completed hosted-sign-in callback can use only this fixed custom
         // URL to bring the already-running dashboard back to the foreground.
@@ -5556,6 +5687,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             dashboardWebHost?.notifyHostedSignInReturn()
             window?.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        if CodexThreadOpenTarget.accepts(url) {
+            NSWorkspace.shared.open(url)
             return
         }
         guard url.scheme?.lowercased() == "https",
@@ -11290,6 +11425,67 @@ private enum NativeDashboardInteractionSafetySmokeTest {
         "WKMenuItemIdentifierOpenLink"
     )
 
+    private static func codexThreadPolicyIsSafe() -> Bool {
+        let identifier = "11111111-1111-4111-8111-111111111111"
+        let canonical = "codex://threads/\(identifier)"
+        guard let target = URL(string: canonical),
+              CodexThreadOpenTarget.accepts(target)
+        else { return false }
+        let rejected = [
+            "https://threads/\(identifier)",
+            "codex://other/\(identifier)",
+            "codex://threads/not-a-thread",
+            "codex://threads/11111111-1111-0111-8111-111111111111",
+            "codex://threads/11111111-1111-4111-1111-111111111111",
+            "codex://user@threads/\(identifier)",
+            "codex://user:password@threads/\(identifier)",
+            "codex://threads:1234/\(identifier)",
+            "codex://threads:/\(identifier)",
+            canonical + "?next=other", canonical + "?",
+            canonical + "#other", canonical + "#",
+            canonical + "/", canonical + "/other",
+            "codex://threads//\(identifier)",
+            "codex://threads/./\(identifier)",
+            "codex://%74hreads/\(identifier)",
+            "codex://threads/%31" + String(identifier.dropFirst()),
+            "codex://threads\\\(identifier)",
+        ]
+        guard rejected.allSatisfy({ candidate in
+            guard let url = URL(string: candidate) else { return true }
+            return !CodexThreadOpenTarget.accepts(url)
+        }) else { return false }
+
+        func allowed(
+            source: String? = "http://127.0.0.1:41234/#accounting",
+            activated: Bool = true,
+            mainFrame: Bool = true,
+            origin: (String, String, Int) = ("http", "127.0.0.1", 41234),
+            port: Int? = 41234
+        ) -> Bool {
+            CodexThreadOpenTarget.acceptsNavigation(
+                to: target,
+                userActivated: activated,
+                sourceIsMainFrame: mainFrame,
+                sourceURL: source.flatMap { URL(string: $0) },
+                sourceOrigin: origin,
+                companionPort: port
+            )
+        }
+        return allowed()
+            && !allowed(activated: false)
+            && !allowed(mainFrame: false)
+            && !allowed(source: nil)
+            && !allowed(source: "about:blank")
+            && !allowed(source: "blob:http://127.0.0.1:41234/opaque")
+            && !allowed(source: "https://example.invalid/")
+            && !allowed(source: "http://127.0.0.1:41235/")
+            && !allowed(source: "http://user@127.0.0.1:41234/")
+            && !allowed(origin: ("https", "127.0.0.1", 41234))
+            && !allowed(origin: ("http", "example.invalid", 41234))
+            && !allowed(origin: ("http", "127.0.0.1", 41235))
+            && !allowed(port: nil)
+    }
+
     static func run() -> Int32 {
         let application = NSApplication.shared
         application.setActivationPolicy(.accessory)
@@ -11355,6 +11551,7 @@ private enum NativeDashboardInteractionSafetySmokeTest {
             && Set(settingsDelegate.toolbarDefaultItemIdentifiers(
                 settingsToolbar
             )) == expectedSettingsItems
+        let codexThreadLinksSafe = codexThreadPolicyIsSafe()
 
         guard backRemoved,
               forwardRemoved,
@@ -11365,7 +11562,8 @@ private enum NativeDashboardInteractionSafetySmokeTest {
               linkPreviewDisabled,
               toolbarItemsImmovable,
               settingsTabsImmovable,
-              settingsDelegateInstalled
+              settingsDelegateInstalled,
+              codexThreadLinksSafe
         else {
             FileHandle.standardError.write(Data(
                 ("macOS native interaction safety smoke failed "
@@ -11380,7 +11578,8 @@ private enum NativeDashboardInteractionSafetySmokeTest {
                     + "settings_tabs_immovable="
                     + "\(settingsTabsImmovable) "
                     + "settings_delegate="
-                    + "\(settingsDelegateInstalled)\n").utf8
+                    + "\(settingsDelegateInstalled) "
+                    + "codex_thread_links_safe=\(codexThreadLinksSafe)\n").utf8
             ))
             return 1
         }
@@ -11389,7 +11588,8 @@ private enum NativeDashboardInteractionSafetySmokeTest {
                 + "back=false forward=false reload=true "
                 + "download_link=false open_link=true "
                 + "link_preview=false toolbar_immovable=true "
-                + "settings_tabs_immovable=true settings_delegate=true"
+                + "settings_tabs_immovable=true settings_delegate=true "
+                + "codex_thread_links_safe=true"
         )
         return 0
     }

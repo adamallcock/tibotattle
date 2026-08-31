@@ -161,6 +161,7 @@ hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
 | `GET`, `POST` | `/api/local/identity/hosted-signin-handoff` | Read or update the bounded local recovery handle for an in-flight hosted sign-in |
 | `GET` | `/api/local/onboarding` | Local installation and evidence-source readiness |
 | `GET` | `/api/local/overview` | Personal dashboard headline and evidence coverage |
+| `GET` | `/api/local/cache-drop-thread-links` | Optional, generation-bound local thread-name/parent lookup for the two recent cache-drop tables; requires `X-Usage-Monitor-Local: 1` and no foreign Origin |
 | `GET` | `/api/local/gradient` | Quota-versus-cost gradient report data |
 | `GET` | `/api/local/weekly` | Weekly calibration report data |
 | `GET` | `/api/local/weekly-pace-outlook` | Privacy-safe weekly allowance pace projection bound to the current observed window |
@@ -178,6 +179,16 @@ hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
 | `GET` | `/api/local/contribution/incremental-status` | Inspect incremental v1 eligibility, watermark, and state |
 | `POST` | `/api/local/contribution/incremental-approve` | Record explicit approval for the incremental contract |
 | `POST` | `/api/local/contribution/incremental-run` | Run one bounded incremental preparation/delivery cycle |
+
+The thread-link route has a closed `local-cache-drop-thread-links-v1` response:
+`schemaVersion`, `status`, `generation`, and at most 160 `entries`. Each entry
+has a content-free event-pair `key`, `kind` (`switch` or `continuity`), and a
+`thread` with canonical `id`, nullable display `name`/`nickname`, and nullable
+`parent` (`id`, nullable `name`). It only resolves rows from the current
+attested overview; callers cannot supply IDs, source paths, or query parameters.
+Names and raw IDs never enrich the persisted overview, reports, share cards,
+diagnostics, or contributions. Missing or ambiguous metadata is optional
+unavailability, not a refresh failure.
 
 Refresh progress distinguishes source scanning from subsequent calculation.
 Once unified ingestion returns and accounting begins, the count-free receipt
@@ -471,6 +482,13 @@ sign-in. Its scheme, host, empty query, and empty fragment are fixed by
 [`config/product-brand.js`](../../config/product-brand.js); it never transports
 an OAuth code, state, identity, or provider response.
 
+The outbound-only `codex://threads/<UUID>` target opens a user-selected thread
+in Codex. It is not a registered TiboTattle callback. Only a canonical UUID
+without credentials, port, query, fragment, encoding, or extra path is allowed.
+The native-owned isolated-world click bridge requires a trusted DOM click
+(including keyboard activation) in the pinned companion main frame. Generic
+WebKit navigation/new-window requests cannot open Codex programmatically.
+
 ### WKWebView bridge
 
 | Direction | Name | Closed payload / purpose |
@@ -478,6 +496,7 @@ an OAuth code, state, identity, or provider response.
 | Web → native | `tibotattleLocalization` | `{type: "set-language-preference", preference}` with preference restricted to the native locale enum |
 | Web → native | `tibotattleDownloads` | `{type: "reveal-latest-download"}`; the path never crosses the bridge |
 | Web → native | `tibotattleHostedSignIn` | `{inFlight: boolean}` only; carries no provider or identity data |
+| Isolated local click → native | `tibotattleCodexThreadLink` | `{threadId}` only, from the native-owned non-page content world after `event.isTrusted`; canonical UUID and pinned main-frame origin revalidated; never persisted or logged |
 | Native → web | `tibotattle:hosted-sign-in-return` | DOM event telling the live page to collect its opaque result |
 | Native → web | `tibotattle:local-evidence-updated` | DOM event telling the live page that the snapshot changed |
 | Native → web | `tibotattle:locale-override` | `CustomEvent` with one closed language preference |

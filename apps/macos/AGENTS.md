@@ -26,6 +26,8 @@ Apply the repository root guidance first.
 - Native diagnostics and UI state remain content-free. Do not expose paths,
   credentials, raw provider payloads, or session content through Swift errors,
   logs, accessibility labels, clipboard actions, or crash reporting.
+  The approved local cache-drop thread-name UI and Codex UUID handoff are
+  ephemeral navigation only, never native diagnostics or persisted UI state.
 - Read actual macOS service state after login-item, notification, Keychain, or
   permission requests. Do not equate a requested state with an applied state.
 - Unknown, stale, connecting, indexing, cancelled, unavailable, and failed states
