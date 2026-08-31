@@ -1249,8 +1249,8 @@ test("subtotal notes explain the ordering gap, Standard counterfactual and exclu
     const children = [];
     append({ append: (...items) => children.push(...items) }, { status: "available", ...selected });
     const text = children.join("");
-    assert.match(text, /Whole-period total unavailable/u);
-    assert.match(text, /Sessions without exact local event order: 1/u);
+    assert.match(text, /Partial estimate/u);
+    assert.match(text, /excluded sessions with uncertain event order: 1/u);
     assert.match(text, /Covered\/priced subtotal; included drops: \d+\. Not a whole-period total/u);
     assert.match(text, /Standard API equivalent for the same covered\/priced drops: \$/u);
     assert.match(text, /Drops excluded for incomplete prices: 1/u);
@@ -1319,12 +1319,12 @@ test("cache chart readout shows valid bucket subtotals despite a global gap and 
   };
   const good = continuitySubtotalPeriod().byOutcomeBucket.under_one_minute;
   assert.equal(moneyText(good, true), "Standard API equivalent: $0.01");
-  assert.match(moneyText(good, false), /Covered\/priced subtotal at Standard rates: \$0\.01/u);
-  assert.match(moneyText(good, false), /Whole-period total unavailable/u);
+  assert.equal(moneyText(good, false), "Covered subtotal at Standard rates: $0.01 · 1 priced drops.");
+  assert.doesNotMatch(moneyText(good, false), /Whole-period|[Uu]npriced/u);
   const partial = continuitySubtotalPeriod({ ordering: 1, unpriced: 1 })
     .byOutcomeBucket.under_one_minute;
   assert.equal(partial.estimatedPremiumUsd, null);
-  assert.match(moneyText(partial, false), /\$0\.01\. Priced drops: 1; unpriced excluded: 1/u);
+  assert.equal(moneyText(partial, false), "Covered subtotal at Standard rates: $0.01 · 1 priced drops. Excludes 1 unpriced drops.");
   // Exact admitted comparisons in legacy DTO buckets also remain useful;
   // global ordering gaps are never guessed into a particular time bucket.
   assert.match(moneyText({ ...good, coveredSubtotal: null }, false), /subtotal.*\$0\.01/u);
@@ -1401,6 +1401,7 @@ test("cache-impact UI copy has three-locale parity and collapsed evidence tables
       "accounting.cacheImpact.subtotalStandardOnly",
       "accounting.cacheImpact.subtotalUnpriced",
       "accounting.cacheContinuity.outcome.readoutSubtotal",
+      "accounting.cacheContinuity.outcome.readoutSubtotalUnpriced",
     ]) {
       assert.doesNotMatch(translate(key, {
         amount: "$1.23", priced: "2", unpriced: "1",
@@ -1444,7 +1445,7 @@ test("cache-impact UI copy has three-locale parity and collapsed evidence tables
     translate("accounting.cacheSwitch.noteIncompleteOrdering", {
       ordering: "2",
     }, "en"),
-    /exact local event order/u,
+    /excluded sessions with uncertain event order/u,
   );
 
   const [html, styles] = await Promise.all([
@@ -1468,7 +1469,7 @@ test("cache-impact UI copy has three-locale parity and collapsed evidence tables
   );
   assert.equal(
     translate("accounting.cacheSwitch.column.apiEquivalent", {}, "en"),
-    "Standard API equivalent",
+    "API equivalent",
   );
 
   const expectedContinuityLabels = [

@@ -8625,7 +8625,9 @@ function renderCacheReuseReadout(bucket, width, selectedRange,
   setLocalizedText(
     $("#cache-reuse-readout-api"),
     subtotalScope
-      ? "accounting.cacheContinuity.outcome.readoutSubtotal"
+      ? bucket.unpricedDrops > 0
+        ? "accounting.cacheContinuity.outcome.readoutSubtotalUnpriced"
+        : "accounting.cacheContinuity.outcome.readoutSubtotal"
       : "accounting.cacheContinuity.outcome.readoutApi",
     {
       amount: premium === null || premium === undefined
@@ -8863,6 +8865,23 @@ function ensureCacheReuseResizeObserver() {
   cacheReuseResizeObserver.observe(scroll);
 }
 
+function cacheReuseCoverageNote(impact) {
+  if (impact?.status !== "available") return "";
+  const exclusions = [
+    [impact.orderingCoverageGaps, "ordering"],
+    [impact.uncoveredReturns, "boundary"],
+    [impact.unpricedDrops, "pricing"],
+  ].filter(([count]) => count > 0);
+  if (impact.coverageStatus === "complete" && exclusions.length === 0) return "";
+  return [
+    t("accounting.cacheContinuity.outcome.coverage.partial"),
+    ...exclusions.map(([count, kind]) => t(
+      `accounting.cacheContinuity.outcome.coverage.${kind}`,
+      { count: formatCount(count) },
+    )),
+  ].join(" ");
+}
+
 function renderAccountingCacheReuseOutcome(impact) {
   const outcome = $("#cache-reuse-outcome");
   const raster = $("#cache-reuse-raster");
@@ -8870,6 +8889,12 @@ function renderAccountingCacheReuseOutcome(impact) {
   if (!outcome || !raster || !empty) return;
   const buckets = cacheReuseOutcomeBuckets(impact);
   outcome.hidden = buckets === null;
+  const coverage = $("#cache-reuse-coverage");
+  if (coverage) {
+    const note = buckets === null ? "" : cacheReuseCoverageNote(impact);
+    setRawText(coverage, note);
+    coverage.hidden = note === "";
+  }
   if (buckets === null) {
     cacheReuseCurrentImpact = null;
     return;
@@ -8986,7 +9011,7 @@ function renderAccountingCacheContinuityDetails(impact) {
       "empty-cell",
       "accounting.cacheContinuity.detailsEmpty",
     );
-    cell.colSpan = 6;
+    cell.colSpan = 5;
     row.append(cell);
     rows.append(row);
     return;
@@ -9006,7 +9031,6 @@ function renderAccountingCacheContinuityDetails(impact) {
         "numeric-cell",
         `${formatCount(item.previousCacheReadTokens)} → ${formatCount(item.currentCacheReadTokens)}`,
       ),
-      rawNode("td", "numeric-cell", formatCount(item.lostCacheTokens)),
       rawNode(
         "td",
         "model-api-equivalent",
@@ -9579,6 +9603,24 @@ function renderAccountingRebuildDeferral(data, { staleServeShown = false } = {})
   });
 }
 
+function accountingPriceHeadline(accounting) {
+  const weighted = accounting.quotaWeightedApiPriceEquivalentUsd;
+  const explanation = [t("accounting.apiEquivalent.explanation")];
+  if (weighted !== null) {
+    explanation.push(t("accounting.apiEquivalent.standardRateDetail", {
+      amount: formatApiMoney(accounting.apiPriceEquivalentUsd),
+    }));
+  }
+  return [
+    accounting.fastMode.metricShortLabel,
+    explanation.join(" "),
+    weighted === null ? "—" : formatApiMoney(weighted),
+    weighted === null
+      ? t("accounting.apiEquivalent.noWeightedUsage")
+      : accounting.periodLabel,
+  ];
+}
+
 function renderAccounting(data) {
   syncAccountingPeriodControls(data);
   const projection = dashboardAccountingProjection(data);
@@ -9654,7 +9696,6 @@ function renderAccounting(data) {
   // reassurance rather than a number worth a card, and when it is not complete
   // the rows that lack a price are the useful thing to be standing next to.
   const fastMode = accounting.fastMode;
-  const weighted = accounting.quotaWeightedApiPriceEquivalentUsd;
   // Stale substitution serves the version-stable Standard-price scalar and
   // labels itself as previous-version output; quota weighting belongs to the
   // current pipeline and is not reconstructed from an old artifact.
@@ -9682,14 +9723,7 @@ function renderAccounting(data) {
       ],
     ]
     : [
-      [
-        fastMode.metricShortLabel,
-        "A public API-price measuring stick for the usage observed locally. It is not a bill or a subscription limit.",
-        weighted === null ? "—" : formatApiMoney(weighted),
-        weighted === null
-          ? "No increment in this period could be weighted"
-          : `${formatApiMoney(accounting.apiPriceEquivalentUsd)} at Standard rates before Fast weighting`
-      ],
+      accountingPriceHeadline(accounting),
       [
         "Tokens",
         "The tokens attached to those usage changes during the selected time period.",
