@@ -884,6 +884,7 @@ export function createLocalCollectorRefreshRunner({
   stateFile = null,
   accountObservationOperationLockFile = null,
   selectAccountObservationSecret = selectProductionAccountObservationSecret,
+  readAccountAttributionBinding = null,
   runCollector = runCollectorOnce,
   readAccountingCache = readReplaySafeAccountingCache,
   refreshAccounting = null,
@@ -918,6 +919,9 @@ export function createLocalCollectorRefreshRunner({
 } = {}) {
   if (typeof selectAccountObservationSecret !== "function") {
     throw new TypeError("selectAccountObservationSecret must be a function");
+  }
+  if (readAccountAttributionBinding !== null && typeof readAccountAttributionBinding !== "function") {
+    throw new TypeError("readAccountAttributionBinding must be a function or null");
   }
   if (typeof runCollector !== "function") throw new TypeError("runCollector must be a function");
   if (typeof readAccountingCache !== "function") {
@@ -1073,6 +1077,7 @@ export function createLocalCollectorRefreshRunner({
       maximumRecordBatchSize: 500,
       maximumRecentEventKeys: 5_000,
       loadAccountObservationSecret: selection.loadAccountObservationSecret,
+      ...(readAccountAttributionBinding === null ? {} : { readAccountAttributionBinding }),
     };
     // The headline pass uses the collector's ordinary atomic SQLite state
     // transaction with a much smaller read budget. It therefore publishes

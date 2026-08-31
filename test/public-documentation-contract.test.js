@@ -248,7 +248,7 @@ test("component READMEs delegate executable route inventories to the canonical r
   assert.ok(apiRoutesBlock, "local API_ROUTES inventory exists");
   const localRoutes = exactStringLiterals(apiRoutesBlock)
     .filter((value) => value.startsWith("/api/"));
-  assert.equal(localRoutes.length, 24, "review local route-count changes");
+  assert.equal(localRoutes.length, 25, "review local route-count changes");
   for (const route of localRoutes) {
     assert.ok(apiReference.includes(route), `API reference covers local ${route}`);
   }
@@ -256,7 +256,7 @@ test("component READMEs delegate executable route inventories to the canonical r
   const workerRoutesList = [
     ...workerRoutes.matchAll(/pathname:\s*"([^"]+)"/gu),
   ].map(([, route]) => route);
-  assert.equal(workerRoutesList.length, 31, "review Worker route-count changes");
+  assert.equal(workerRoutesList.length, 36, "review Worker route-count changes");
   for (const route of workerRoutesList) {
     assert.ok(apiReference.includes(route), `API reference covers Worker ${route}`);
   }

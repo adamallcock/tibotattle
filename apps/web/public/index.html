@@ -337,6 +337,7 @@
               More observations are required before a useful comparison can be made.
             </p>
             <p class="annotation stale-serve-note" id="comparison-stale-note" hidden></p>
+            <p class="annotation" id="comparison-plan-note" hidden></p>
             <div class="comparison-visual" id="comparison-visual">
               <div class="comparison-row">
                 <span>Observed quota movement</span>
@@ -399,11 +400,16 @@
             <p class="eyebrow">02 · Weekly allowance</p>
             <h2 id="weekly-title">Our best estimate of the seven-day limit</h2>
           </div>
+          <label class="language-picker" id="weekly-plan-control" for="weekly-plan-select" hidden>
+            <span data-i18n="weekly.plan.label">Plan</span>
+            <select id="weekly-plan-select" aria-label="Allowance history plan" data-i18n-aria-label="weekly.plan.aria"></select>
+          </label>
         </div>
+        <p class="annotation" id="weekly-plan-note" hidden></p>
 
         <div class="weekly-hero">
           <div>
-            <span id="weekly-estimate-label" data-i18n="weekly.headline.label">Speed-priced all-data median</span>
+            <span id="weekly-estimate-label">Speed-priced all-data median</span>
             <strong id="weekly-estimate">—</strong>
             <small id="weekly-range">No evidence interval available</small>
           </div>
@@ -1265,6 +1271,26 @@
               </button>
             </div>
             <p class="annotation" id="incremental-sync-retry-note" role="status" hidden></p>
+            <section id="attribution-consent" aria-labelledby="attribution-consent-title" hidden>
+              <h4 id="attribution-consent-title" data-i18n="attributionConsent.title">Separate account and plan evidence</h4>
+              <p class="annotation" id="attribution-consent-description" data-i18n="attributionConsent.description">An optional contribution update can keep observed plans and pseudonymous account tracks separate. It needs a new review and approval.</p>
+              <button class="button button-quiet" id="attribution-review-open" type="button" data-i18n="attributionConsent.review">Review additional fields</button>
+              <div id="attribution-review" hidden>
+                <h4 id="attribution-review-title" tabindex="-1" data-i18n="attributionConsent.reviewTitle">Review account and plan contribution</h4>
+                <p class="annotation" id="attribution-review-destination"></p>
+                <p class="annotation" id="attribution-review-contract"></p>
+                <p class="annotation" id="attribution-review-sample"></p>
+                <dl id="attribution-review-inventory"></dl>
+                <p class="annotation" id="attribution-review-bases"></p>
+                <p class="annotation" data-i18n="attributionConsent.privacy">Account tracks can link eligible activity within this destination and enrollment. No raw account identifiers, prompts, responses or paths are sent. Missing historical identity stays unknown; observed plans are preserved.</p>
+                <label class="annotation"><input id="attribution-consent-confirm" type="checkbox"> <span data-i18n="attributionConsent.confirm">I approve ongoing upload of these fields, including pseudonymous account and plan linkage.</span></label>
+                <div class="contribution-cta-buttons">
+                  <button class="button button-primary" id="attribution-consent-approve" type="button" disabled data-i18n="attributionConsent.approve">Approve account and plan contribution</button>
+                  <button class="button button-quiet" id="attribution-review-cancel" type="button" data-i18n="attributionConsent.cancel">Not now</button>
+                </div>
+              </div>
+              <p class="annotation" id="attribution-consent-status" role="status" hidden></p>
+            </section>
           </section>
           <section class="contribution-device-controls" id="contribution-device-controls" aria-label="Disconnect this Mac" data-i18n-aria-label="contribution.disconnect.action" hidden>
             <p class="annotation" id="disconnect-device-description" data-i18n="contribution.disconnect.description">

@@ -428,6 +428,7 @@ export async function runDisabledStagingDeployment({
         readiness.checks.remoteMigrationInventoryCurrent,
       migrationsCurrent: readiness.checks.migrationsCurrent,
       pilotSchemaCurrent: readiness.checks.pilotSchemaCurrent,
+      attributionSchemaCurrent: readiness.checks.attributionSchemaCurrent,
       primaryReenrollmentSchemaCurrent:
         readiness.checks.primaryReenrollmentSchemaCurrent,
       deletionLedgerSchemaCurrent:

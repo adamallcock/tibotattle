@@ -233,13 +233,13 @@ test("both maintained API references cover every registered HTTP boundary", asyn
   const centralPolicy = centralRoutePolicy(central);
   const participantPolicy = participantRelayPolicy(participant);
 
-  assert.equal(workerPolicy.length, 31, "review Worker route-count changes");
-  assert.equal(localPolicy.length, 24, "review local route-count changes");
+  assert.equal(workerPolicy.length, 36, "review Worker route-count changes");
+  assert.equal(localPolicy.length, 25, "review local route-count changes");
   assert.equal(reportPolicy.length, 4, "review fixed report-count changes");
   assert.equal(centralPolicy.length, 1, "review central relay-count changes");
   assert.equal(
     participantPolicy.length,
-    8,
+    9,
     "review participant relay-count changes",
   );
 

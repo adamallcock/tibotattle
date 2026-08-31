@@ -10,4 +10,5 @@ export {
   CANDIDATES,
   projectBoundedWeeklyCalibrationSummary,
   renderWeeklyCalibrationReport,
+  validWeeklyPlanPopulations,
 } from "./weekly-calibration.js";

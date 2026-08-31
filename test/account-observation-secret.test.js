@@ -69,6 +69,30 @@ test("account observation loader reads or creates only the distinct capability u
   }
 });
 
+test("existing-only account loader never generates or creates an upload identity", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "account-existing-only-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const stored of [null, Buffer.alloc(32, 6)]) {
+    const backend = memoryBackend(stored);
+    const operationLockFile = join(root, "account-operation.lock");
+    const load = createAccountObservationSecretLoader({
+      backend, capability: ACCOUNT_CAPABILITY, operationLockFile, createIfMissing: false,
+      generateSecret: () => { assert.fail("an uploader must not generate an observation root"); },
+    });
+    const result = await load();
+    assert.deepEqual(result, stored);
+    assert.deepEqual(backend.calls, [["read", ACCOUNT_CAPABILITY]]);
+    await assert.rejects(readFile(operationLockFile), { code: "ENOENT" });
+    result?.fill(0);
+  }
+  const selection = selectProductionAccountObservationSecret({
+    platform: "darwin", architecture: "arm64", createIfMissing: false,
+    operationLockFile: join(root, "production-operation.lock"),
+    createKeychainBackend: () => ({ async read() { return null; } }),
+  });
+  assert.equal(await selection.loadAccountObservationSecret(), null);
+});
+
 test("account observation operation lease rejects concurrent creation without persisting a secret", async () => {
   const root = await mkdtemp(join(tmpdir(), "app-usagemonitor-account-concurrent-"));
   const lock = join(root, "state", "account-operation.lock");

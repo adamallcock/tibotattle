@@ -48,6 +48,20 @@ Display windows do not delete older local history. The dashboard may show a
 shorter horizon while the local index retains the evidence needed for replay,
 corrections, and longer-term views.
 
+When local history contains more than one plan, **Allowance** separates the
+plans instead of averaging Plus and Pro reset estimates together. The plan
+selector keeps the headline, history, range, pace and share card on the same
+selected population. The newest observed plan is selected even if it does not
+yet have enough usable evidence; older-plan estimates remain selectable rather
+than being presented as the current plan's allowance.
+
+These historical estimates are conditional on the locally observed plan, not
+proof of which provider account generated every token. Known plan switches and
+ambiguous boundary quantities are excluded narrowly; coherent older history is
+still useful. **Usage and costs** continues to retain all-plan accounting totals.
+Community figures intentionally retain their common Pro-equivalent scale; this
+does not authorize mixing personal Plus and Pro allowance histories.
+
 Switching and cache-drop overheads estimate the API-equivalent premium in
 observed comparisons, not a proven cause or a bill. A labelled covered subtotal
 includes only comparisons with usable ordering and prices. Sessions whose
@@ -99,6 +113,19 @@ is performed against a copy before replacing durable state.
 Community participation requires sign-in and explicit consent. Before the first
 upload, TiboTattle presents the derived, allowlisted contribution. Contributions
 are pseudonymous and omit session content; pseudonymous does not mean anonymous.
+
+A staged successor contribution format can add account/plan attribution only
+after a separate field review and explicit new consent, and only if the hosted
+service enables that format. Existing consent is not upgraded automatically.
+Its pseudonyms can link observations within an enrollment/destination; they
+never include raw provider account identifiers. Interrupted replacement uploads
+remain staged while the previous complete hosted history stays selected.
+Missing identity proof does not erase local usage or imply zero usage.
+
+Re-pairing or renewing this Mac's contribution credential pauses delivery while
+the credential changes. If completion cannot be verified, delivery stays paused
+and the app offers device repair; an ordinary refresh cannot bypass that pause.
+Local usage analysis and previously contributed history remain available.
 
 Signing in, pairing a device, local indexing, successful upload, aggregate
 publication, and device disconnect are separate states. Keep the app’s

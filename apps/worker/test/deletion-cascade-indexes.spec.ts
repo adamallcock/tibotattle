@@ -92,6 +92,25 @@ describe("deletion cascade child indexes (migration 0030)", () => {
     expect(foreignKeyProbes).toBeGreaterThan(10);
   });
 
+  it("uses the three device-leading successor indexes for device foreign-key probes", async () => {
+    const plan = await db().prepare(
+      "EXPLAIN QUERY PLAN DELETE FROM device_credentials WHERE id = ?",
+    ).bind("synthetic-device").all<{ detail: string }>();
+    const details = plan.results.map((row) => row.detail);
+    for (const [table, index] of [
+      ["telemetry_v11_device_consents", "telemetry_v11_consents_device"],
+      ["telemetry_v11_day_manifests", "telemetry_v11_manifests_device"],
+      ["telemetry_v11_chunks", "telemetry_v11_chunks_device"],
+    ]) {
+      const columns = await db().prepare(`PRAGMA index_info('${index}')`)
+        .all<{ name: string }>();
+      expect(columns.results.map((row) => row.name), index).toEqual(["device_id"]);
+      expect(details.filter((detail) => detail.startsWith(`SEARCH ${table} `)))
+        .toEqual([`SEARCH ${table} USING COVERING INDEX ${index} (device_id=?)`]);
+    }
+    expect(details.filter((detail) => /^\s*SCAN\b/u.test(detail))).toEqual([]);
+  });
+
   it("plans the participant and session cascades without scanning a child table", async () => {
     for (const statement of [
       "DELETE FROM participants WHERE id = ?",

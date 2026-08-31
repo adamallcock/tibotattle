@@ -16,7 +16,7 @@ import { validAbortSignal } from "./valid-abort-signal.js";
 // generation whose persisted provenance, quota occurrences, diagnostics, and
 // publication state prove the reader contract.
 export const LOCAL_UNIFIED_ACCOUNTING_SOURCE_VERSION =
-  "local-unified-accounting-source-v2";
+  "local-unified-accounting-source-v3";
 
 const SAFE_TOKEN = /^[A-Za-z0-9._:-]{1,64}$/u;
 const GENERATION_FINGERPRINT = /^generation-v2-[a-f0-9]{64}$/u;
@@ -50,6 +50,8 @@ const GENERATION_STATUSES = new Set([
 ]);
 const CONTEXT_BEHAVIORS = new Set(["source_native", "legacy_zero"]);
 const ADAPTER_ABORT = Symbol("local-unified-accounting-source-abort");
+const ATTRIBUTION_MEMBERSHIP_CACHE_ROWS = 256;
+const MINIMUM_TIMESTAMP_MS = -8_640_000_000_000_000;
 
 function fixedError(code, name = "Error") {
   const error = new Error(code);
@@ -869,6 +871,181 @@ async function revalidatePublishedSnapshot({
   }
 }
 
+function rememberBounded(cache, key, value, limit) {
+  cache.delete(key);
+  cache.set(key, value);
+  if (cache.size > limit) cache.delete(cache.keys().next().value);
+  return value;
+}
+
+/**
+ * Derive historical association metadata from the same pinned SQLite facts as
+ * the caller's usage rows. Nothing is persisted, and no account is inferred.
+ *
+ * read(row) accepts raw usage_event columns source_local, source_offset,
+ * source_ordinal, session_local and observed_at_ms. Callers retain ownership
+ * of the read-only connection and must revalidate its published generation
+ * before publishing their result. Indexed predecessor lookups support repeated
+ * or out-of-order corpus slices without retaining whole sessions.
+ */
+export function createLocalUnifiedUsageAttributionReader({
+  database,
+  generationId,
+} = {}) {
+  if (typeof database?.prepare !== "function"
+      || !Number.isSafeInteger(generationId) || generationId < 1) {
+    throw fixedError("local_unified_index_attribution_options_invalid", "TypeError");
+  }
+  const membership = database.prepare(`
+    SELECT source_ordinal, session_local, scanned_bytes
+    FROM generation_source
+    WHERE generation_id = ? AND source_local = ?
+      AND status IN ('skipped', 'touched', 'resumed', 'rescanned', 'complete')
+      AND diagnostics_complete = 1`);
+  const plans = database.prepare(`
+    SELECT DISTINCT q.plan_type
+    FROM quota_occurrence q
+    JOIN generation_source gs
+      ON gs.generation_id = ? AND gs.source_local = q.source_local
+        AND gs.source_ordinal = q.source_ordinal
+        AND q.source_offset <= gs.scanned_bytes
+        AND gs.status IN ('skipped', 'touched', 'resumed', 'rescanned', 'complete')
+        AND gs.diagnostics_complete = 1
+    WHERE q.source_local = ? AND q.source_offset = ?
+      AND q.source_ordinal = ? AND q.observed_at_ms = ?
+      AND q.provider = 'openai_codex' AND q.admission = 'admitted'
+      AND q.plan_type IS NOT NULL AND q.plan_type <> 'unknown'
+    ORDER BY q.plan_type LIMIT 2`);
+  const sourceBefore = database.prepare(`
+    SELECT p.source_offset, p.observed_at_ms,
+           p.session_local = gs.session_local AS session_matches
+    FROM usage_event p
+    JOIN generation_source gs
+      ON gs.generation_id = ? AND gs.source_local = p.source_local
+        AND gs.source_ordinal = p.source_ordinal
+        AND p.source_offset <= gs.scanned_bytes
+        AND gs.status IN ('skipped', 'touched', 'resumed', 'rescanned', 'complete')
+        AND gs.diagnostics_complete = 1
+    WHERE p.source_local = ? AND p.source_offset IS NOT NULL
+      AND p.source_offset < ?
+    ORDER BY p.source_offset DESC, p.observed_at_ms DESC LIMIT 1`);
+  const sessionBefore = database.prepare(`
+    SELECT p.observed_at_ms
+    FROM usage_event p
+    JOIN generation_source gs
+      ON gs.generation_id = ? AND gs.source_local = p.source_local
+        AND gs.source_ordinal = p.source_ordinal
+        AND p.source_offset <= gs.scanned_bytes
+        AND gs.session_local = p.session_local
+        AND gs.status IN ('skipped', 'touched', 'resumed', 'rescanned', 'complete')
+        AND gs.diagnostics_complete = 1
+    WHERE p.session_local = ? AND p.source_local <> ?
+      AND p.source_offset IS NOT NULL
+      AND p.observed_at_ms >= ? AND p.observed_at_ms < ?
+    ORDER BY p.observed_at_ms DESC LIMIT 1`);
+  const memberships = new Map();
+
+  function projectPredecessor(row, { source = false } = {}) {
+    if (row === undefined) return null;
+    const { observedAtMs } = timestampForMs(row.observed_at_ms);
+    return {
+      observedAtMs,
+      sessionMatches: source && row.session_matches === 1,
+    };
+  }
+
+  return {
+    read(row) {
+      const result = {
+        planAttribution: {
+          basis: "unavailable",
+          planType: null,
+          // Schema 11 does not record a plan variant on quota occurrences.
+          planVariant: null,
+        },
+        usageIntervalStartedAt: null,
+        usageIntervalBasis: "unavailable",
+      };
+      const sourceLocal = safeDigest(row?.source_local ?? null, { nullable: true });
+      const sourceOffset = safeNonNegativeInteger(row?.source_offset ?? null, {
+        nullable: true,
+        nullValue: null,
+      });
+      const sourceOrdinal = safeNonNegativeInteger(row?.source_ordinal ?? null, {
+        nullable: true,
+        nullValue: null,
+      });
+      if (sourceLocal === null || sourceOffset === null || sourceOrdinal === null) {
+        return result;
+      }
+      const { observedAtMs } = timestampForMs(row.observed_at_ms);
+      const sourceKey = sourceLocal.toString("hex");
+      let member = memberships.get(sourceKey);
+      if (member === undefined) {
+        member = membership.get(generationId, sourceLocal) ?? null;
+      }
+      rememberBounded(memberships, sourceKey, member, ATTRIBUTION_MEMBERSHIP_CACHE_ROWS);
+      if (member === null || member.source_ordinal !== sourceOrdinal
+          || !Number.isSafeInteger(member.scanned_bytes) || member.scanned_bytes < 0
+          || sourceOffset > member.scanned_bytes) return result;
+
+      const observedPlans = plans.all(
+        generationId, sourceLocal, sourceOffset, sourceOrdinal, observedAtMs,
+      ).map((value) => safeText(value.plan_type));
+      if (observedPlans.length === 1) {
+        result.planAttribution.basis = "same_record";
+        result.planAttribution.planType = observedPlans[0];
+      } else if (observedPlans.length > 1) {
+        result.planAttribution.basis = "conflicted";
+      }
+
+      // Physical order can positively reveal a reversed clock. Do not hide
+      // that contradiction by picking some earlier wall-clock timestamp.
+      const sourcePrevious = projectPredecessor(sourceBefore.get(
+        generationId, sourceLocal, sourceOffset,
+      ), { source: true });
+      if (sourcePrevious !== null && sourcePrevious.observedAtMs > observedAtMs) {
+        return result;
+      }
+      const sessionLocal = safeDigest(row.session_local ?? null, { nullable: true });
+      const memberSession = safeDigest(member.session_local, { nullable: true });
+      const hasSessionLineage = sessionLocal !== null && memberSession !== null
+        && sessionLocal.equals(memberSession);
+      let previous = null;
+      if (hasSessionLineage) {
+        // Any other-source candidate older than this valid local predecessor
+        // cannot improve the bound. Keeping the lookup inside that interval is
+        // important for a long session held entirely in one source: excluding
+        // that source must not scan its whole history on every usage row.
+        previous = projectPredecessor(sessionBefore.get(
+          generationId,
+          sessionLocal,
+          sourceLocal,
+          sourcePrevious?.sessionMatches === true
+            ? sourcePrevious.observedAtMs : MINIMUM_TIMESTAMP_MS,
+          observedAtMs,
+        ));
+        // Equal-time order is meaningful within this physical source, not
+        // between sources with coincident timestamps/discovery ordinals.
+        if (sourcePrevious?.sessionMatches === true
+            && (previous === null
+              || sourcePrevious.observedAtMs >= previous.observedAtMs)) {
+          previous = sourcePrevious;
+        }
+        if (previous !== null) result.usageIntervalBasis = "previous_session_record";
+      }
+      if (previous === null && sourcePrevious !== null) {
+        previous = sourcePrevious;
+        result.usageIntervalBasis = "previous_source_record";
+      }
+      if (previous !== null) {
+        result.usageIntervalStartedAt = new Date(previous.observedAtMs).toISOString();
+      }
+      return result;
+    },
+  };
+}
+
 function validateRequest({
   startAt,
   endAt,
@@ -987,6 +1164,11 @@ export function createLocalUnifiedAccountingSource({
       const diagnostics = readDiagnostics(database, coverage.generationId);
       const startMs = Date.parse(window.startAt);
       const endMs = Date.parse(window.endAt);
+      const attributionReader = onUsage === undefined ? null
+        : createLocalUnifiedUsageAttributionReader({
+          database,
+          generationId: coverage.generationId,
+        });
       let sequence = 0;
       const usageStatement = database.prepare(`
         SELECT u.event_key,
@@ -1001,6 +1183,7 @@ export function createLocalUnifiedAccountingSource({
                u.source_local,
                u.source_offset,
                u.source_ordinal,
+               u.session_local,
                u.tier_observed_at_ms,
                m.model_id,
                t.billing_surface,
@@ -1050,6 +1233,7 @@ export function createLocalUnifiedAccountingSource({
           ? null
           : timestampForMs(tierObservedAtMs).timestamp;
         const usage = {
+          ...attributionReader?.read(row),
           timestamp,
           timestampMs: observedAtMs,
           model: safeText(row.model_id),

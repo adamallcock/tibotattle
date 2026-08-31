@@ -320,9 +320,12 @@ async function quarantineObjectReferenced(
         OR EXISTS (
           SELECT 1 FROM telemetry_v1_chunks WHERE r2_key = ?
         )
+        OR EXISTS (
+          SELECT 1 FROM telemetry_v11_chunks WHERE r2_key = ?
+        )
       THEN 1 ELSE 0
     END AS referenced`,
-  ).bind(r2Key, r2Key, r2Key).first<{ referenced: number }>();
+  ).bind(r2Key, r2Key, r2Key, r2Key).first<{ referenced: number }>();
   if (row?.referenced !== 0 && row?.referenced !== 1) {
     throw new ApiError(503, "LIFECYCLE_STATE_CONFLICT");
   }
@@ -359,6 +362,9 @@ async function claimOrphanRegistration(
         AND NOT EXISTS (
           SELECT 1 FROM telemetry_v1_chunks WHERE r2_key = ?
         )
+        AND NOT EXISTS (
+          SELECT 1 FROM telemetry_v11_chunks WHERE r2_key = ?
+        )
         AND EXISTS (
           SELECT 1
             FROM quarantine_reconciliation_state
@@ -370,6 +376,7 @@ async function claimOrphanRegistration(
     leaseId,
     row.r2_key,
     row.registered_at,
+    row.r2_key,
     row.r2_key,
     row.r2_key,
     row.r2_key,

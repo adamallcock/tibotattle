@@ -685,6 +685,8 @@ const SECONDARY_INDEX_NAMES = [
   "usage_event_observed",
   "usage_event_session",
   "usage_event_source",
+  "usage_event_source_predecessor",
+  "usage_event_session_predecessor",
   "usage_event_quota_observation",
   "usage_event_boundary_session",
   "usage_event_replay_order",
@@ -956,6 +958,69 @@ test("deferred secondary indexes preserve logical facts and are present before p
     assert.deepEqual(rebuilt.secondaryIndexes, [...SECONDARY_INDEX_NAMES].sort());
     assert.deepEqual(rebuilt.aggregate, online.aggregate);
     assert.deepEqual(rebuilt.logical, online.logical);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("v11 predecessor indexes are additive writable maintenance and read-only opens preserve older v11 files", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-attribution-index.jsonl": [
+      sessionMeta("session-attribution-index"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount(
+        "2026-07-25T00:00:01.000Z",
+        usage(100, 10),
+        usage(100, 10),
+        { usedPercent: 12 },
+      ),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const compatibleIndexNames = [
+    "usage_event_source_predecessor", "usage_event_session_predecessor",
+  ];
+  try {
+    await build(root);
+    const old = openLocalUnifiedIndex(indexFile);
+    const facts = logicalProjection(old);
+    const generation = readUnifiedIndexGenerationDescriptor(old);
+    assert.deepEqual(secondaryIndexNames(old), [...SECONDARY_INDEX_NAMES].sort());
+    assert.equal(Number(old.prepare("PRAGMA user_version").get().user_version), 11);
+    old.exec(`
+      DROP INDEX usage_event_source_predecessor;
+      DROP INDEX usage_event_session_predecessor;
+    `);
+    old.close();
+    const bytesBefore = await readFile(indexFile);
+    const readOnly = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.deepEqual(logicalProjection(readOnly), facts);
+      assert.deepEqual(readUnifiedIndexGenerationDescriptor(readOnly), generation);
+      assert.deepEqual(secondaryIndexNames(readOnly), SECONDARY_INDEX_NAMES
+        .filter((name) => !compatibleIndexNames.includes(name)).sort());
+    } finally {
+      readOnly.close();
+    }
+    assert.deepEqual(await readFile(indexFile), bytesBefore,
+      "a read-only open must not create compatible accelerators in the live file");
+
+    const upgraded = openLocalUnifiedIndex(indexFile);
+    try {
+      assert.deepEqual(secondaryIndexNames(upgraded), [...SECONDARY_INDEX_NAMES].sort());
+      assert.deepEqual(logicalProjection(upgraded), facts);
+      assert.deepEqual(readUnifiedIndexGenerationDescriptor(upgraded), generation);
+      assert.equal(Number(upgraded.prepare("PRAGMA user_version").get().user_version), 11);
+      assert.deepEqual(Object.fromEntries(upgraded.prepare(`
+        SELECT key, value FROM meta WHERE key LIKE 'compatibility_%'
+      `).all().map((row) => [row.key, row.value])), {
+        compatibility_format_user_version: "11",
+        compatibility_minimum_reader_user_version: "11",
+        compatibility_minimum_writer_user_version: "11",
+      });
+    } finally {
+      upgraded.close();
+    }
   } finally {
     await rm(root, { recursive: true });
   }
@@ -4036,6 +4101,8 @@ test("a version-1 index can be opened through the additive v11 schema migration"
         DROP TABLE session_identity;
         DROP TABLE usage_event_boundary;
         DROP INDEX usage_event_replay_order;
+        DROP INDEX usage_event_source_predecessor;
+        DROP INDEX usage_event_session_predecessor;
         UPDATE usage_event SET source_id = NULL, source_offset = NULL;
         ALTER TABLE usage_event DROP COLUMN source_offset;
         ALTER TABLE usage_event DROP COLUMN source_id;

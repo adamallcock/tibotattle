@@ -85,12 +85,163 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     // Added with the per-model allowance fit (2026-08-30): the per-participant
     // composition cache plus the published per-day cohort series.
     "0041_community_model_composition.sql",
+    // Account/plan attribution remains staged: these migrations add input
+    // fencing, explicit consent/floors, and complete-domain activation guards.
+    "0042_analytical_input_fencing.sql",
+    "0043_attribution_transport_staging.sql",
+    "0044_attribution_domain_activation.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",
     "0002_identity_reenrollment_cooldown.sql",
   ]),
 });
+
+// A current migration ledger is necessary, but not proof that its integrity
+// objects still exist. Both local release rehearsal and read-only staging
+// probes use this reviewed inventory; it never authorizes transport cutover.
+export const ATTRIBUTION_SCHEMA_OBJECTS = Object.freeze(Object.entries({
+  table: [
+    "community_analytical_input_versions",
+    "attribution_enrollments",
+    "telemetry_transport_formats",
+    "telemetry_transport_participant_floors",
+    "telemetry_transport_floor_rollbacks",
+    "telemetry_v11_device_consents",
+    "telemetry_v11_day_manifests",
+    "telemetry_v11_chunks",
+    "telemetry_v11_records",
+    "telemetry_v11_domain_predecessors",
+    "telemetry_v11_domains",
+    "telemetry_v11_domain_days",
+    "telemetry_v11_domain_heads",
+  ],
+  index: [
+    "telemetry_v1_records_time_cursor",
+    "telemetry_contributions_successor_compatibility",
+    "telemetry_v11_consents_device",
+    "telemetry_v11_manifests_device_day",
+    "telemetry_v11_manifests_admission",
+    "telemetry_v11_manifests_export",
+    "telemetry_v11_manifests_device",
+    "telemetry_v11_chunks_participant",
+    "telemetry_v11_chunks_device",
+    "telemetry_v11_chunks_retention",
+    "telemetry_v11_records_legacy_counterpart",
+    "telemetry_v11_predecessors_participant",
+    "telemetry_v11_predecessors_device",
+    "telemetry_v11_domains_participant",
+    "telemetry_v11_domains_export_cursor",
+    "telemetry_v11_domains_device",
+    "telemetry_v11_domains_predecessor",
+    "telemetry_v11_domain_days_manifest",
+    "telemetry_v11_records_time_cursor",
+  ],
+  trigger: [
+    "community_analytical_input_participant_created",
+    "community_analytical_input_participant_state",
+    "community_analytical_input_v1_insert",
+    "community_analytical_input_v1_update",
+    "community_analytical_input_v1_delete",
+    "community_analytical_input_legacy_insert",
+    "community_analytical_input_legacy_update",
+    "community_analytical_input_legacy_delete",
+    "community_allowance_input_mutated",
+    "attribution_enrollment_created",
+    "attribution_enrollment_immutable",
+    "telemetry_transport_format_identity_immutable",
+    "telemetry_transport_floor_created",
+    "telemetry_transport_rollback_owner_only",
+    "telemetry_transport_floor_revision",
+    "telemetry_transport_floor_no_implicit_downgrade",
+    "telemetry_transport_floor_successor_history_guard",
+    "telemetry_v11_consent_admission",
+    "telemetry_v11_consent_floor",
+    "telemetry_v11_consent_immutable",
+    "telemetry_transport_legacy_insert",
+    "telemetry_transport_v1_insert",
+    "telemetry_v11_manifest_admission",
+    "telemetry_v11_manifest_immutable",
+    "telemetry_v11_chunk_admission",
+    "telemetry_v11_chunks_enforce_admission",
+    "telemetry_v11_chunks_record_admission",
+    "telemetry_v11_chunk_immutable",
+    "telemetry_v11_record_admission",
+    "telemetry_v11_record_immutable",
+    "telemetry_v11_manifest_ready",
+    "telemetry_v11_domain_immutable",
+    "telemetry_v11_domain_days_immutable",
+    "telemetry_v11_predecessor_immutable",
+    "telemetry_v11_domain_complete_before_insert",
+    "telemetry_v11_domain_day_member",
+    "telemetry_v11_head_insert_guard",
+    "telemetry_v11_head_update_guard",
+    "telemetry_v11_head_insert_publish",
+    "telemetry_v11_head_update_publish",
+    "telemetry_v11_active_domain_delete_guard",
+    "telemetry_v11_active_head_delete_guard",
+    "telemetry_v11_active_day_delete_guard",
+    "telemetry_v11_active_record_delete_guard",
+  ],
+  view: [
+    "telemetry_v11_current_predecessors",
+    "telemetry_v11_activatable_domains",
+    "telemetry_v11_active_records",
+    "telemetry_analytical_records",
+    "telemetry_analytical_chunks",
+  ],
+}).flatMap(([type, names]) => names.map((name) => Object.freeze([type, name]))));
+
+export const ATTRIBUTION_SCHEMA_COLUMNS = Object.freeze(Object.fromEntries(
+  Object.entries({
+    community_analytical_input_versions: ["participant_id", "revision"],
+    community_allowance_publication_state: ["attribution_method_version"],
+    admin_community_allowance_preview_cache: ["attribution_method_version", "source_mutation_epoch"],
+    community_allowance_fit_cache: ["input_fingerprint", "source_method_version"],
+    community_model_composition_cache: ["input_fingerprint", "source_method_version"],
+    community_model_composition_days: ["attribution_method_version", "source_mutation_epoch"],
+    device_credential_rotations: ["recovery_proof_hash"],
+    attribution_enrollments: ["participant_id", "namespace", "created_at"],
+    telemetry_transport_formats: ["schema_version", "format_rank", "lifecycle"],
+    telemetry_transport_participant_floors: ["participant_id", "minimum_rank", "revision", "changed_at"],
+    telemetry_transport_floor_rollbacks: ["operation_id", "participant_id", "participant_digest", "expected_revision", "from_rank", "to_rank", "created_at"],
+    telemetry_v11_device_consents: ["participant_id", "device_id", "telemetry_schema_version", "field_dictionary_version", "privacy_contract_version", "consented_at"],
+    telemetry_v11_day_manifests: ["id", "participant_id", "device_id", "chunk_day", "manifest_digest", "parser_version", "manifest_json", "expected_chunk_count", "state", "created_at", "ready_at"],
+    telemetry_v11_chunks: ["id", "manifest_id", "participant_id", "device_id", "stream", "chunk_day", "chunk_seq", "chunk_id", "chunk_digest", "envelope_digest", "parser_version", "record_count", "r2_key", "device_upload_authorization_id", "quarantine_deleted_at", "created_at"],
+    telemetry_v11_records: ["chunk_id", "manifest_id", "stream", "occurrence_id", "observed_at", "record_json", "legacy_occurrence_id", "legacy_record_json"],
+    telemetry_v11_domain_predecessors: ["token_hash", "participant_id", "device_id", "previous_generation_id", "legacy_fingerprint", "input_revision", "from_day", "through_day", "winners_json", "created_at", "expires_at", "consumed_at"],
+    telemetry_v11_domains: ["id", "participant_id", "device_id", "predecessor_token_hash", "previous_generation_id", "manifest_digest", "legacy_fingerprint", "input_revision", "from_day", "through_day", "days_json", "created_at"],
+    telemetry_v11_domain_days: ["generation_id", "observed_day", "manifest_id"],
+    telemetry_v11_domain_heads: ["participant_id", "generation_id", "revision", "updated_at"],
+  }).map(([table, columns]) => [table, Object.freeze(columns)]),
+));
+
+// One bounded metadata query: no contribution, identity, token or policy-state
+// values leave the database, and no table-per-column remote round trips.
+export const ATTRIBUTION_SCHEMA_PROBE_SQL = `
+WITH required_objects(type, name) AS (VALUES
+  ${ATTRIBUTION_SCHEMA_OBJECTS.map((entry) =>
+    `(${entry.map(sqlStringLiteral).join(", ")})`).join(",\n  ")}
+), required_columns(table_name, column_name) AS (VALUES
+  ${Object.entries(ATTRIBUTION_SCHEMA_COLUMNS).flatMap(([table, columns]) =>
+    columns.map((column) => `(${sqlStringLiteral(table)}, ${sqlStringLiteral(column)})`))
+    .join(",\n  ")}
+)
+SELECT NOT EXISTS (
+  SELECT 1 FROM required_objects expected
+   WHERE NOT EXISTS (SELECT 1 FROM sqlite_master actual
+     WHERE actual.type = expected.type AND actual.name = expected.name)
+) AS attribution_objects,
+NOT EXISTS (
+  SELECT 1 FROM required_columns expected
+   WHERE NOT EXISTS (SELECT 1 FROM pragma_table_info(expected.table_name) actual
+     WHERE actual.name = expected.column_name)
+) AS attribution_columns;
+`;
+
+export function attributionSchemaComplete(row) {
+  return row?.attribution_objects === 1 && row?.attribution_columns === 1;
+}
 export const REQUIRED_RATE_LIMITS = Object.freeze([
   Object.freeze({ name: "ENROLLMENT_RATE_LIMIT", limit: 20 }),
   Object.freeze({ name: "RECOVERY_RATE_LIMIT", limit: 20 }),
@@ -1169,6 +1320,7 @@ export function stagingOperationReceipt(
     "migrationInventoryCurrent",
     "migrationsCurrent",
     "pilotSchemaCurrent",
+    "attributionSchemaCurrent",
     "primaryReenrollmentSchemaCurrent",
     "deletionLedgerSchemaCurrent",
     "identityProtectionSchemaCurrent",
@@ -1219,6 +1371,7 @@ export function probeStagingLive({
     remoteMigrationInventoryCurrent: false,
     migrationsCurrent: false,
     pilotSchemaCurrent: false,
+    attributionSchemaCurrent: false,
     primaryReenrollmentSchemaCurrent: false,
     deletionLedgerSchemaCurrent: false,
     identityProtectionSchemaCurrent: false,
@@ -1433,6 +1586,25 @@ export function probeStagingLive({
         && schemaRow?.lifecycle_status === 1;
       if (!checks.pilotSchemaCurrent) {
         blockers.push("REMOTE_PILOT_SCHEMA_INCOMPLETE");
+      }
+
+      const attributionSchemaProbe = runWrangler(
+        wrangler,
+        workerDirectory,
+        [
+          "d1", "execute", "USAGE_MONITOR_DB",
+          "--remote", "--env", "staging",
+          "--command", ATTRIBUTION_SCHEMA_PROBE_SQL,
+          "--json",
+        ],
+        spawn,
+      );
+      checks.attributionSchemaCurrent = attributionSchemaProbe.ok
+        && attributionSchemaComplete(collectionControlRow(
+          parseJson(attributionSchemaProbe.stdout),
+        ));
+      if (!checks.attributionSchemaCurrent) {
+        blockers.push("REMOTE_ATTRIBUTION_SCHEMA_INCOMPLETE");
       }
 
       const primaryIdentitySchemaProbe = runWrangler(

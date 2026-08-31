@@ -366,3 +366,128 @@ export function parseTelemetryEnvelope(
 export function validateTelemetryEnvelope(
   value: unknown,
 ): true;
+
+export const TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION: "telemetry-contribution-v1.1";
+export const TELEMETRY_V11_ENVELOPE_SCHEMA_VERSION: "telemetry-envelope-v1.1";
+export const TELEMETRY_V11_DAY_MANIFEST_SCHEMA_VERSION: "telemetry-day-manifest-v1.1";
+export const TELEMETRY_V11_FIELD_DICTIONARY_VERSION: "telemetry-v1.1-registry-2026-08-31.1";
+export const TELEMETRY_V11_PRIVACY_CONTRACT_VERSION: "ongoing-privacy-safe-telemetry-v1.1";
+export const TELEMETRY_V11_CONTRACT_STATE: "staged";
+export const MAX_TELEMETRY_V11_CHUNK_RECORDS: 200;
+export const MAX_TELEMETRY_V11_CHUNK_CANONICAL_BYTES: 1250000;
+export const MAX_TELEMETRY_V11_DAY_CHUNKS: 4096;
+export const TELEMETRY_V11_STREAMS: readonly ["quota", "session", "usage"];
+export const TELEMETRY_V11_ACCOUNT_BASES: readonly ["same_source", "provisional_marker", "unavailable"];
+export const TELEMETRY_V11_PLAN_BASES: readonly ["same_source_occurrence", "provisional_marker", "conflicted", "unavailable"];
+export type TelemetryV11Stream = typeof TELEMETRY_V11_STREAMS[number];
+export type TelemetryV11AccountBasis = typeof TELEMETRY_V11_ACCOUNT_BASES[number];
+export type TelemetryV11PlanBasis = typeof TELEMETRY_V11_PLAN_BASES[number];
+export interface TelemetryV11Attribution {
+  accountBasis: TelemetryV11AccountBasis;
+  accountTrackId: string | null;
+  planBasis: TelemetryV11PlanBasis;
+  planType: TelemetryPlanType;
+  planEraId: string | null;
+}
+export interface TelemetryV11Consent {
+  telemetrySchemaVersion: typeof TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION;
+  fieldDictionaryVersion: typeof TELEMETRY_V11_FIELD_DICTIONARY_VERSION;
+  privacyContractVersion: typeof TELEMETRY_V11_PRIVACY_CONTRACT_VERSION;
+}
+export interface TelemetryV11UsageEvent {
+  schemaVersion: "usage-event-v1.1";
+  eventId: string;
+  eventTime: string;
+  sessionUuid: string;
+  provider: string;
+  modelId: string;
+  speedMode: string;
+  apiServiceTier: string;
+  surface: string;
+  billingSurface: string;
+  reasoningEffort: string;
+  agentScope: string;
+  outcome: string;
+  totalInputContextTokens: number | null;
+  components: {
+    inputUncachedTokens: number | null;
+    inputCacheReadTokens: number | null;
+    inputCacheWriteTokens: number | null;
+    outputTextTokens: number | null;
+    outputReasoningTokens: number | null;
+    outputCombinedTokens: number | null;
+  };
+  accountPlanAttribution: TelemetryV11Attribution;
+}
+export interface TelemetryV11QuotaObservation {
+  schemaVersion: "quota-observation-v1.1";
+  observationId: string;
+  observedTime: string;
+  provider: string;
+  planType: TelemetryPlanType;
+  planVariant: string;
+  limitId: string;
+  slot: string;
+  usedPercent: number | null;
+  windowDurationMinutes: number | null;
+  resetsAt: string | null;
+  accountPlanAttribution: TelemetryV11Attribution;
+}
+export interface TelemetryV11SessionDimension {
+  schemaVersion: "session-dimension-v1.1";
+  sessionUuid: string;
+  firstEventTime: string;
+  provider: string;
+  toolClassCounts: Record<string, number>;
+}
+export type TelemetryV11Record = TelemetryV11UsageEvent | TelemetryV11QuotaObservation | TelemetryV11SessionDimension;
+export interface TelemetryV11Chunk {
+  schemaVersion: typeof TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION;
+  manifestDigest: string;
+  chunkId: string;
+  chunkRevision: 1;
+  chunkDigest: string;
+  parserVersion: string;
+  consent: TelemetryV11Consent;
+  records: TelemetryV11Record[];
+}
+export interface TelemetryV11DayManifest {
+  schemaVersion: typeof TELEMETRY_V11_DAY_MANIFEST_SCHEMA_VERSION;
+  day: string;
+  parserVersion: string;
+  consent: TelemetryV11Consent;
+  chunks: {chunkId: string; chunkDigest: string; recordCount: number}[];
+  excluded: Record<TelemetryV11Stream, number>;
+  manifestDigest: string;
+}
+export interface TelemetryV11Envelope {
+  schemaVersion: typeof TELEMETRY_V11_ENVELOPE_SCHEMA_VERSION;
+  synthetic: false;
+  keyId: string;
+  wrappedKey: string;
+  iv: string;
+  ciphertext: string;
+}
+export function telemetryV11RequiredConsent(): Readonly<TelemetryV11Consent>;
+export function isTelemetryV11ConsentCurrent(value: unknown): value is TelemetryV11Consent;
+export function parseTelemetryV11Attribution(value: unknown): TelemetryV11Attribution;
+export function parseTelemetryV11Record(stream: TelemetryV11Stream, value: unknown): TelemetryV11Record;
+export function parseTelemetryV11ChunkId(value: unknown): {stream: TelemetryV11Stream; day: string; seq: number};
+export function parseTelemetryV11Chunk(value: unknown): TelemetryV11Chunk;
+export function parseTelemetryV11DayManifest(value: unknown): TelemetryV11DayManifest;
+export function telemetryV11RecordAnchor(stream: TelemetryV11Stream, record: TelemetryV11Record): {occurrenceId: string; observedAt: string};
+export function canonicalTelemetryV11Json(value: unknown): string;
+export function telemetryV11DayManifestDigestInput(value: TelemetryV11DayManifest): string;
+export function validateTelemetryV11Envelope(value: unknown): TelemetryV11Envelope;
+export const TELEMETRY_V11_DOMAIN_MANIFEST_SCHEMA_VERSION: "telemetry-domain-manifest-v1.1";
+export const MAX_TELEMETRY_V11_DOMAIN_DAYS: 4096;
+export interface TelemetryV11DomainManifest {
+  schemaVersion: typeof TELEMETRY_V11_DOMAIN_MANIFEST_SCHEMA_VERSION;
+  fromDay: string;
+  throughDay: string;
+  predecessor: {token: string; previousGenerationId: string | null; legacyFingerprint: string};
+  days: {day: string; manifestId: string; manifestDigest: string}[];
+  manifestDigest: string;
+}
+export function parseTelemetryV11DomainManifest(value: unknown): TelemetryV11DomainManifest;
+export function telemetryV11DomainManifestDigestInput(value: TelemetryV11DomainManifest): string;

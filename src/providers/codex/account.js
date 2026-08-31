@@ -20,6 +20,7 @@ export {
   findCodexBinary,
   inspectCodexBinary,
   readCodexAccountSnapshot,
+  sanitizeBracketedCodexAccountSnapshotWithSecretLoader,
   sanitizeCodexAccountSnapshot,
   sanitizeCodexAccountSnapshotWithSecretLoader,
   sanitizeRateLimit,

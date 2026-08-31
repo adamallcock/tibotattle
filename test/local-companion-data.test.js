@@ -1564,7 +1564,14 @@ test("the Standard diagnostic fitted mix does not leak into the weighted allowan
       recentMixDays: 14,
     };
     const cache = (await readLocalCollectorAccountingCache({ stateFile })).cache;
-    cache.weeklyCalibration.composition = composition;
+    cache.weeklyCalibration.composition = {
+      ...composition,
+      planType: cache.weeklyCalibration.planType,
+      attributionExcludedBins: 0,
+    };
+    cache.weeklyCalibration.planPopulations.find((population) => (
+      population.planType === cache.weeklyCalibration.selectedPlanType
+    )).composition = cache.weeklyCalibration.composition;
     await writeLocalCollectorAccountingCache({ stateFile, cache });
 
     const snapshot = await buildLocalCompanionSnapshot({
@@ -1598,6 +1605,8 @@ test("an out-of-range fitted-mix share fails closed like any other cache defect"
     });
     const cache = (await readLocalCollectorAccountingCache({ stateFile })).cache;
     cache.weeklyCalibration.composition = {
+      planType: cache.weeklyCalibration.planType,
+      attributionExcludedBins: 0,
       status: "fitted",
       grainHours: 2,
       observationCount: 120,
@@ -1609,6 +1618,9 @@ test("an out-of-range fitted-mix share fails closed like any other cache defect"
       blendedRecentMixUsd: 2_050,
       recentMixDays: 14,
     };
+    cache.weeklyCalibration.planPopulations.find((population) => (
+      population.planType === cache.weeklyCalibration.selectedPlanType
+    )).composition = cache.weeklyCalibration.composition;
     await writeLocalCollectorAccountingCache({ stateFile, cache });
 
     const snapshot = await buildLocalCompanionSnapshot({

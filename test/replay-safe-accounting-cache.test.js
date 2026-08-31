@@ -968,12 +968,12 @@ test("projects replay-safe diagnostics and aggregates costs, dimensions, and 15-
       ),
     cache.timeline[2].apiPriceEquivalentUsd,
   );
-  // Re-pinned (2026-08-08): the input receipt now names its corpus source and
-  // covered span, so full-history unified sourcing is distinguishable from
-  // the windowed fallback.
+  // The v3 receipt retains event-time plan and interval metadata as well as
+  // the corpus source and covered span. Its bounded row estimate includes
+  // those fields for both unified and windowed inputs.
   assert.deepEqual(cache.weeklyCalibrationInput, {
     status: "complete",
-    encoding: "accounting_compact_v2",
+    encoding: "accounting_compact_v3",
     source: "windowed_scan",
     coveredAt: {
       startAt: "2025-07-27T12:00:00.000Z",
@@ -981,7 +981,7 @@ test("projects replay-safe diagnostics and aggregates costs, dimensions, and 15-
     },
     retainedUsageEvents: 4,
     retainedWeeklySnapshots: 0,
-    estimatedRetainedBytes: 1_024,
+    estimatedRetainedBytes: 1_408,
     limits: {
       usageEvents: 750_000,
       weeklySnapshots: 750_000,
@@ -1557,6 +1557,8 @@ test("the streaming composition binning matches the per-event kernel path exactl
   });
   assert.deepEqual(streamed, {
     status: reference.fit.status,
+    planType: "pro",
+    attributionExcludedBins: 0,
     grainHours: 2,
     observationCount: reference.fit.observationCount,
     voidedBinCount: reference.voidedBinCount,
@@ -1762,10 +1764,14 @@ async function writeUnifiedCalibrationFixture(indexFile, {
   boundaries = 10,
 }) {
   const database = openLocalUnifiedIndex(indexFile, { create: true });
+  const sourceLocal = Buffer.alloc(32, 8);
+  const sessionLocal = Buffer.alloc(32, 7);
+  const sourceBytes = resets.length * boundaries * 256;
+  const sourceCount = sourceBytes > 0 ? 1 : 0;
   const generation = beginUnifiedIndexGeneration(database, {
     contractVersion: "unified-calibration-test-v1",
-    discoveredSourceCount: 0,
-    discoveredSourceBytes: 0,
+    discoveredSourceCount: sourceCount,
+    discoveredSourceBytes: sourceBytes,
   });
   const writer = createUnifiedIndexWriter(database, {
     contractVersion: "unified-calibration-test-v1",
@@ -1793,28 +1799,16 @@ async function writeUnifiedCalibrationFixture(indexFile, {
     planType: null,
     scopeLocal: null,
   });
-  const sessionLocal = Buffer.alloc(32, 7);
   let eventNumber = 0;
   for (const [resetIndex, resetStartMs] of resets.entries()) {
     const resetsAtMs = resetStartMs + 7 * 24 * 60 * 60 * 1_000;
     for (let boundary = 0; boundary < boundaries; boundary += 1) {
       const observedMs = resetStartMs + boundary * 60 * 60 * 1_000;
-      if (boundary > 0) {
-        eventNumber += 1;
-        writer.writeUsageEvent({
-          eventKey: Buffer.from(`unified-calibration-event-${eventNumber}`),
-          observedAtMs: observedMs,
-          sessionLocal,
-          accountScopeId,
-          modelId,
-          tierId,
-          surfaceId,
-          reasoningEffort: 8,
-          outcome: 5,
-          tokensInUncached: 1_000_000 + resetIndex * 100_000,
-        });
-      }
-      writer.internQuota({
+      eventNumber += 1;
+      const eventKey = Buffer.alloc(32);
+      eventKey.writeUInt32BE(eventNumber);
+      const sourceOffset = (eventNumber - 1) * 256;
+      const canonicalObservationId = writer.internQuota({
         observedAtMs: observedMs,
         limitId: "codex",
         slot: "secondary",
@@ -1823,17 +1817,91 @@ async function writeUnifiedCalibrationFixture(indexFile, {
         resetsAtMs,
         durationMins: 10_080,
       });
+      // The first boundary is a real quota-only token record. It anchors the
+      // historical interval without becoming a fabricated usage increment.
+      writer.writeUsageEvent({
+        eventKey,
+        generationId: generation.generationId,
+        sourceLocal,
+        sourceOffset,
+        sourceOrdinal: 0,
+        observedAtMs: observedMs,
+        sessionLocal,
+        accountScopeId,
+        modelId,
+        tierId,
+        surfaceId,
+        quotaObservationId: canonicalObservationId,
+        reasoningEffort: 8,
+        outcome: 5,
+        tokensInUncached: boundary > 0 ? 1_000_000 + resetIndex * 100_000 : null,
+      });
+      writer.writeQuotaOccurrence({
+        generationId: generation.generationId,
+        sourceLocal,
+        sourceOffset,
+        sourceOrdinal: 0,
+        surfaceId,
+        canonicalObservationId,
+        observedAtMs: observedMs,
+        provider: "openai_codex",
+        planType: "pro",
+        limitId: "codex",
+        slot: "secondary",
+        slotOrder: 0,
+        usedPercent: boundary,
+        resetsAtMs,
+        durationMins: 10_080,
+        admission: "admitted",
+      });
     }
   }
+  if (sourceCount > 0) {
+    writer.writeSourceCursor({
+      sourceLocal,
+      sourceOrdinal: 0,
+      sessionLocal,
+      scannedBytes: sourceBytes,
+      sizeBytes: sourceBytes,
+      mtimeMs: resets.at(-1),
+      snapshotsPersisted: true,
+      turnContextSeen: false,
+      carryModel: "gpt-5.6-terra",
+      carryEffort: "unknown",
+      carryTierRaw: null,
+      carryTierObservedAtMs: null,
+      carryTotals: null,
+    });
+    writer.writeGenerationSource({
+      generationId: generation.generationId,
+      sourceLocal,
+      sourceOrdinal: 0,
+      sessionLocal,
+      surfaceId,
+      status: "complete",
+      discoveredSizeBytes: sourceBytes,
+      scannedBytes: sourceBytes,
+      mtimeMs: resets.at(-1),
+      diagnosticsComplete: true,
+    });
+    writer.writeSourceDiagnostics(sourceLocal, {}, {
+      generationId: generation.generationId,
+    });
+  }
+  writer.writeMeta("contract_version", "unified-calibration-test-v1");
+  writer.writeMeta("status", "complete");
+  writer.writeMeta("generated_at", new Date(resets.at(-1) ?? 0).toISOString());
+  writer.writeMeta("source_count", sourceCount);
+  writer.writeMeta("source_bytes", sourceBytes);
   writer.finalizeGeneration({
-    status: "partial",
-    blockReason: "calibration_fixture",
-    discoveredSourceCount: 0,
-    discoveredSourceBytes: 0,
-    indexedSourceCount: 0,
-    indexedSourceBytes: 0,
-    discoveryComplete: false,
-    diagnosticsComplete: false,
+    status: "complete",
+    blockReason: null,
+    discoveredSourceCount: sourceCount,
+    discoveredSourceBytes: sourceBytes,
+    indexedSourceCount: sourceCount,
+    indexedSourceBytes: sourceBytes,
+    discoveryComplete: true,
+    diagnosticsComplete: true,
   });
   await writer.close({ integrityCheck: true, fsyncPath: indexFile });
 }
@@ -2795,10 +2863,12 @@ test("replay cache rejects the old prefix-priced version and unreviewed model cr
       components: { input_uncached_tokens: 1_000 },
     })]),
   });
-  assert.equal(cache.schemaVersion, "local-replay-safe-accounting-v0.13");
+  assert.equal(cache.schemaVersion, "local-replay-safe-accounting-v0.14");
   assert.doesNotThrow(() => assertReplaySafeAccountingCache(cache));
   const oldVersion = structuredClone(cache);
   oldVersion.schemaVersion = "local-replay-safe-accounting-v0.12";
+  assert.throws(() => assertReplaySafeAccountingCache(oldVersion));
+  oldVersion.schemaVersion = "local-replay-safe-accounting-v0.13";
   assert.throws(() => assertReplaySafeAccountingCache(oldVersion));
   for (const model of ["gpt-5.6", "gpt-5.5-pro", "gpt-5.5-future"]) {
     const invalidCrossing = structuredClone(cache);

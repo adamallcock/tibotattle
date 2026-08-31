@@ -6217,15 +6217,27 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "src/application/local-contribution-preparation.js",
     "src/application/local-export-set-verification.js",
     "src/application/local-prepared-contribution.js",
+    "src/contribution/telemetry-v11-chunks.js",
+    "src/contribution/telemetry-v11-sync.js",
     "src/export/compression.js",
     "src/export/set-schema.js",
     "src/export/set-verification.js",
     "src/platform/export-set-verification-storage.js",
     "src/platform/owner-only-prepared-contribution-storage.js",
+    "src/platform/telemetry-v11-envelope.js",
+    "src/local-unified-contribution-attribution.js",
     "src/prepared-contribution-compatibility-internal.js",
   ]) {
     assert.equal(graph.relativeFiles.includes(ownedFile), true, ownedFile);
   }
+  for (const relativeFile of [
+    "src/telemetry-v1.1-domain.js",
+    "src/telemetry-v1.1-schemas.js",
+    "src/telemetry-v1.1.js",
+  ]) {
+    assert.equal(MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES.includes(relativeFile), true, relativeFile);
+  }
+  assert.equal(MACOS_QUOTA_ANALYSIS_RUNTIME_FILES.includes("src/plan-attribution.js"), true);
   assert.equal(
     MACOS_RUNTIME_STATIC_ASSETS.includes("apps/macos/reset-local-keychain.js"),
     true,
@@ -7684,9 +7696,9 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       "--input-type=module",
       "--eval",
       [
-        "import { TELEMETRY_SCHEMA_VERSION }",
+        "import { TELEMETRY_SCHEMA_VERSION, TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION }",
         "from '@app-usagemonitor/telemetry-contract';",
-        "process.stdout.write(TELEMETRY_SCHEMA_VERSION);",
+        "process.stdout.write(JSON.stringify([TELEMETRY_SCHEMA_VERSION, TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION]));",
       ].join(" "),
     ], {
       cwd: join(outputA, "Contents", "Resources", "app"),
@@ -7697,10 +7709,25 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
       0,
       telemetryContractProbe.stderr || telemetryContractProbe.stdout,
     );
-    assert.equal(
-      telemetryContractProbe.stdout,
-      "telemetry-contribution-v0.1",
+    assert.deepEqual(
+      JSON.parse(telemetryContractProbe.stdout),
+      ["telemetry-contribution-v0.1", "telemetry-contribution-v1.1"],
     );
+    const planAttributionProbe = spawnSync(node, [
+      "--input-type=module",
+      "--eval",
+      [
+        "import { PLAN_ATTRIBUTION_POLICY, buildPlanAttributionIndex }",
+        "from '@app-usagemonitor/quota-analysis';",
+        "buildPlanAttributionIndex([]);",
+        "process.stdout.write(PLAN_ATTRIBUTION_POLICY.methodVersion);",
+      ].join(" "),
+    ], {
+      cwd: join(outputA, "Contents", "Resources", "app"),
+      encoding: "utf8",
+    });
+    assert.equal(planAttributionProbe.status, 0, planAttributionProbe.stderr || planAttributionProbe.stdout);
+    assert.equal(planAttributionProbe.stdout, "plan-attribution-v1");
     const accountingProbe = spawnSync(node, [
       "--input-type=module",
       "--eval",

@@ -17,6 +17,9 @@ export const PARTICIPANT_RELAY_ROUTE_POLICY = Object.freeze([
   defineParticipantRelayRoute("/api/v1/session", ["GET"]),
   defineParticipantRelayRoute("/api/v1/logout", ["POST"]),
   defineParticipantRelayRoute("/api/v1/me/device-pairings", ["POST"]),
+  // A successor grant is a separate explicit, CSRF-protected hosted-session
+  // action. The device credential must never authorize its own consent.
+  defineParticipantRelayRoute("/api/v1/me/device-telemetry-consents", ["POST"]),
 ]);
 
 const PARTICIPANT_RELAY_ROUTES = new Map();

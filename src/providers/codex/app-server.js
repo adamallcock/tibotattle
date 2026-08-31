@@ -210,6 +210,10 @@ export class CodexAppServerClient extends EventEmitter {
     }
     if (message.method === "account/rateLimits/updated") {
       this.emit("rateLimitsUpdated", message.params ?? null);
+    } else if (message.method === "account/updated" || message.method === "account/login/completed") {
+      // Account-change notifications can contain identity/login material. The
+      // collector only needs an invalidation signal, never that payload.
+      this.emit("accountChanged");
     }
   }
 
@@ -419,6 +423,50 @@ export async function sanitizeCodexAccountSnapshotWithSecretLoader(snapshot, cap
       accountHmacKey: loaded.secret,
       accountCredentialUnavailableReason: loaded.unavailableReason,
     });
+  } finally {
+    loaded.secret?.fill(0);
+  }
+}
+
+/**
+ * A matching account read on each side of an observation is still only
+ * provisional account evidence, not an exact bridge to a rollout occurrence.
+ * Keep the quota/usage evidence when either account read is unavailable or the
+ * reads disagree, but do not attach an account to that evidence.
+ */
+export async function sanitizeBracketedCodexAccountSnapshotWithSecretLoader(snapshot, capturedAt, {
+  loadAccountObservationSecret,
+} = {}) {
+  const loaded = await loadAccountObservationSecretSafely(loadAccountObservationSecret);
+  try {
+    const result = sanitizeCodexAccountSnapshot({
+      account: snapshot.accountAfter,
+      rateLimits: snapshot.rateLimits,
+      accountUsage: snapshot.accountUsage,
+    }, capturedAt, {
+      accountHmacKey: loaded.secret,
+      accountCredentialUnavailableReason: loaded.unavailableReason,
+    });
+    const before = sanitizeAccountScope(deriveOpenAIAccountScope(snapshot.accountBefore, {
+      secret: loaded.secret,
+      planType: normalizeProviderPlanType(snapshot.accountBefore?.account?.planType ?? result.canonical.planType),
+      unavailableSecretReason: loaded.unavailableReason,
+    }));
+    const after = result.accountScope;
+    if (before.status !== "available" || after.status !== "available") {
+      result.accountScope = after.status === "unavailable" ? after : before;
+      return result;
+    }
+    const knownPlans = new Set([
+      before.planType,
+      after.planType,
+      result.canonical.planType,
+      ...Object.values(result.byLimitId).map((limit) => limit.planType),
+    ].filter((plan) => plan !== null && plan !== "unknown"));
+    if (before.scopeId !== after.scopeId || knownPlans.size > 1) {
+      result.accountScope = sanitizeAccountScope(null);
+    }
+    return result;
   } finally {
     loaded.secret?.fill(0);
   }

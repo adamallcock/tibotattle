@@ -125,14 +125,16 @@ function mean(values) {
   return finite.length === 0 ? null : finite.reduce((sum, value) => sum + value, 0) / finite.length;
 }
 
-function partitionKey(row, { includeSlot = true } = {}) {
+function partitionKey(row, { includeSlot = true, includeEra = true } = {}) {
   return [
     row.accountScopeId ?? "unattributed",
     row.provider,
     row.planType,
+    row.planVariant ?? "unknown",
     row.limitId,
     includeSlot ? row.slot : null,
     row.windowDurationMins,
+    includeEra ? row.planEraKey ?? "legacy" : null,
   ].filter((value) => value !== null).join("|");
 }
 
@@ -144,8 +146,13 @@ function logicalResetKey(row) {
   return `${partitionKey(row, { includeSlot: false })}|${row.resetsAt}`;
 }
 
+function resetParentKey(row) {
+  return `${partitionKey(row, { includeSlot: false, includeEra: false })}|${row.resetsAt}`;
+}
+
 function isEligible(row) {
   return row.windowDurationMins === WEEKLY_WINDOW_MINS
+    && row.aggregationEligibility !== "diagnostic_only"
     && row.limitId === "codex"
     && row.nextUsedPercent > row.priorUsedPercent
     && row.marginalUsageEventCount > 0
@@ -976,15 +983,36 @@ function candidateSummary(candidate, resets) {
   };
 }
 
+function capacityDistribution(values) {
+  const finite = values.filter(Number.isFinite);
+  return {
+    count: finite.length,
+    medianApiPriceEquivalentUsd: round(median(finite)),
+    central80ApiPriceEquivalentUsd: {
+      lower: round(quantile(finite, 0.1)),
+      upper: round(quantile(finite, 0.9)),
+    },
+  };
+}
+
 export function analyzeWeeklyCalibration(
   dataset,
-  { priorWindow = 3, forcedCandidateId = null } = {},
+  { priorWindow = 3, forcedCandidateId = null, planType = null } = {},
 ) {
   if (forcedCandidateId !== null
       && !CANDIDATES.some((candidate) => candidate.id === forcedCandidateId)) {
     throw new TypeError("Unknown forced weekly calibration candidate");
   }
-  const grouped = selectResetGroups(dataset.transitions ?? []);
+  const inputTransitions = dataset.transitions ?? [];
+  // Population selection must precede fragment selection and every median or
+  // forecast. A plan with no qualifying fit must not borrow a different plan.
+  const selectedPlanType = planType ?? dataset.attribution?.latestPlanType
+    ?? [...inputTransitions].sort((left, right) => (
+      String(left.eventTime).localeCompare(String(right.eventTime))
+    )).at(-1)?.planType ?? "unknown";
+  const grouped = selectResetGroups(inputTransitions.filter((row) => (
+    (row.planType ?? "unknown") === selectedPlanType
+  )));
   const resetFits = grouped.selected.map((group) => {
     const first = group.first;
     const fits = Object.fromEntries(CANDIDATES.map((candidate) => [candidate.id, fitReset(group.rows, candidate)]));
@@ -993,6 +1021,10 @@ export function analyzeWeeklyCalibration(
       accountScopeId: first.accountScopeId ?? "unattributed",
       provider: first.provider,
       planType: first.planType,
+      planVariant: first.planVariant ?? "unknown",
+      planEraKey: first.planEraKey ?? "legacy",
+      resetParentKey: resetParentKey(first),
+      aggregationEligibility: first.aggregationEligibility ?? "primary_conditional",
       limitId: first.limitId,
       slot: first.slot,
       windowDurationMins: first.windowDurationMins,
@@ -1009,6 +1041,44 @@ export function analyzeWeeklyCalibration(
       lagFits,
     };
   }).filter((reset) => Object.values(reset.fits).some(Boolean));
+
+  // A return to the same plan may create several clean fragments of one reset.
+  // Keep their diagnostics, but each candidate gets at most one primary vote.
+  // Apply its actual fit gates first, then span/points/end/stable-key ordering.
+  const fragmentDiagnostics = [];
+  for (const [field, definitions] of [["fits", CANDIDATES], ["lagFits", LAG_CANDIDATES]]) {
+    for (const candidate of definitions) {
+      const parents = new Map();
+      for (const reset of resetFits) {
+        if (!reset[field][candidate.id]) continue;
+        const values = parents.get(reset.resetParentKey) ?? [];
+        values.push(reset);
+        parents.set(reset.resetParentKey, values);
+      }
+      for (const fragments of parents.values()) {
+        fragments.sort((left, right) => {
+          const a = left[field][candidate.id];
+          const b = right[field][candidate.id];
+          return b.percentSpan - a.percentSpan || b.pointCount - a.pointCount
+            || b.lastObservedAt.localeCompare(a.lastObservedAt)
+            || left.planEraKey.localeCompare(right.planEraKey);
+        });
+        for (const fragment of fragments.slice(1)) {
+          if (field === "fits") fragmentDiagnostics.push({
+            resetParentKey: fragment.resetParentKey,
+            planEraKey: fragment.planEraKey,
+            planType: fragment.planType,
+            candidateId: candidate.id,
+            reason: "another_qualifying_fragment_represents_reset",
+            apiPriceEquivalentUsd: round(fragment[field][candidate.id].fullCapacityUsd),
+            observedSpanPercentagePoints: round(fragment[field][candidate.id].percentSpan),
+            uniqueBoundaries: fragment[field][candidate.id].pointCount,
+          });
+          fragment[field][candidate.id] = null;
+        }
+      }
+    }
+  }
 
   const candidates = CANDIDATES.map((candidate) => candidateSummary(candidate, resetFits));
   const lagCandidates = LAG_CANDIDATES.map((candidate) => candidateSummary(candidate, resetFits.map((reset) => ({
@@ -1131,6 +1201,7 @@ export function analyzeWeeklyCalibration(
   };
   return {
     schemaVersion: SCHEMA_VERSION,
+    selectedPlanType,
     kind: "weekly_quota_cost_calibration",
     materializedAt: dataset.scope?.endAt ?? dataset.materializedAt ?? new Date().toISOString(),
     source: {
@@ -1239,6 +1310,9 @@ export function analyzeWeeklyCalibration(
       accountScopeId: row.accountScopeId,
       provider: row.provider,
       planType: row.planType,
+      planVariant: row.planVariant,
+      planEraKey: row.planEraKey,
+      aggregationEligibility: row.aggregationEligibility,
       limitId: row.limitId,
       slot: row.slot,
       windowDurationMins: row.windowDurationMins,
@@ -1291,8 +1365,19 @@ export function analyzeWeeklyCalibration(
       historicalAccountScopeKnown: rows.every((row) => row.accountScopeId !== "unattributed"),
       sharedSurfaceUsageBounded: false,
       prospectiveCoverage,
+      // Audit the greatest-span selection without giving excluded fragments a
+      // second vote or placing their capacities in the bounded headline DTO.
+      fragmentSelection: CANDIDATES.map((candidate) => ({
+        candidateId: candidate.id,
+        primary: capacityDistribution(resetFits
+          .map((reset) => reset.fits[candidate.id]?.fullCapacityUsd)),
+        diagnosticOnly: capacityDistribution(fragmentDiagnostics
+          .filter((fragment) => fragment.candidateId === candidate.id)
+          .map((fragment) => fragment.apiPriceEquivalentUsd)),
+      })),
     },
     duplicateResetGroupsSuppressed: grouped.suppressed,
+    fragmentDiagnostics,
     interpretation: {
       resultType: "conditional_api_price_equivalent_behavioral_calibration",
       identifiedProviderAllowance: false,
@@ -1308,6 +1393,48 @@ export function analyzeWeeklyCalibration(
 }
 
 export const BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT = 64;
+
+// Shared by the cache and local HTTP projection so an alternate-plan payload
+// cannot evade the checks applied to the selected headline. No identity is
+// inferred by this contract; these are explicitly conditional plan populations.
+export function validWeeklyPlanPopulations(value, validateSummary = () => true) {
+  const token = (candidate) => typeof candidate === "string"
+    && /^[a-z][a-z0-9_-]{0,31}$/u.test(candidate);
+  const metadata = (summary) => summary && token(summary.planType)
+    && summary.planAttribution?.methodVersion === "plan-era-v1"
+    && summary.planAttribution?.status === "historical_plan_conditional"
+    && summary.planAttribution?.accountVerified === false
+    && ["single_plan_conditional", "unavailable"].includes(summary.planAttribution.comparisonEligibility)
+    && Object.keys(summary.planAttribution).sort().join(",")
+      === "accountVerified,comparisonEligibility,methodVersion,status"
+    && (summary.composition === null || summary.composition === undefined
+      || (summary.composition.planType === summary.planType
+        && Number.isSafeInteger(summary.composition.attributionExcludedBins)
+        && summary.composition.attributionExcludedBins >= 0))
+    && Array.isArray(summary.recentResets)
+    && summary.recentResets.length <= BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT
+    && summary.recentResets.every((row) => row?.planType === summary.planType
+      && token(row.planVariant)
+      && typeof row.planEraKey === "string" && row.planEraKey.length > 0 && row.planEraKey.length <= 1_536
+      && !/[\r\n<>]/u.test(row.planEraKey)
+      && ["primary_conditional", "primary_scoped"].includes(row.aggregationEligibility));
+  if (!metadata(value) || !token(value.selectedPlanType)
+      || value.planType !== value.selectedPlanType
+      || !Array.isArray(value.planPopulations) || value.planPopulations.length < 1
+      || value.planPopulations.length > 16) return false;
+  const seen = new Set();
+  for (const population of value.planPopulations) {
+    if (!metadata(population) || seen.has(population.planType)
+        || Object.hasOwn(population, "planPopulations")
+        || Object.hasOwn(population, "selectedPlanType")
+        || !validateSummary(population)) return false;
+    seen.add(population.planType);
+  }
+  const selected = value.planPopulations.find((population) => population.planType === value.selectedPlanType);
+  if (!selected) return false;
+  return ["estimate", "recentResets", "validation", "status", "composition", "generatedAt"]
+    .every((key) => JSON.stringify(value[key]) === JSON.stringify(selected[key]));
+}
 
 function safeSpeedEventCount(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : 0;
@@ -1373,6 +1500,12 @@ function projectComposition(composition) {
     ? Object.fromEntries(vectorEntries)
     : null;
   return {
+    planType: typeof composition.planType === "string"
+        && /^[a-z][a-z0-9_-]{0,31}$/u.test(composition.planType)
+      ? composition.planType : null,
+    attributionExcludedBins: Number.isSafeInteger(composition.attributionExcludedBins)
+        && composition.attributionExcludedBins >= 0
+      ? composition.attributionExcludedBins : 0,
     status: capacityUsdByModel === null && composition.status === "fitted"
       ? "fallback_blended"
       : composition.status,
@@ -1412,12 +1545,50 @@ export function projectBoundedWeeklyCalibrationSummary(dataset, options = {}) {
         && !Array.isArray(dataset.transitions))) {
     throw new TypeError("Weekly calibration dataset is invalid");
   }
+  const planTypes = [...new Set([
+    ...(dataset.attribution?.planTypes ?? []),
+    ...(dataset.transitions ?? []).map((row) => row.planType ?? "unknown"),
+  ].filter((value) => typeof value === "string"
+    && /^[a-z][a-z0-9_-]{0,31}$/u.test(value)))].sort();
+  const selectedPlanType = options.planType ?? dataset.attribution?.latestPlanType
+    ?? [...(dataset.transitions ?? [])].sort((left, right) => (
+      String(left.eventTime).localeCompare(String(right.eventTime))
+    )).at(-1)?.planType ?? "unknown";
+  if (typeof selectedPlanType !== "string"
+      || !/^[a-z][a-z0-9_-]{0,31}$/u.test(selectedPlanType)) {
+    throw new TypeError("Weekly selected plan is invalid");
+  }
+  if (!planTypes.includes(selectedPlanType)) planTypes.push(selectedPlanType);
+  if (planTypes.length > 16) throw new TypeError("Weekly plan population limit exceeded");
+  const populations = planTypes.map((planType) => (
+    projectWeeklyPlanSummary(dataset, {
+      ...options,
+      planType,
+      // An unscoped vector from a mixed corpus is not a selected-plan vector.
+      composition: options.composition?.planType === planType
+        || (planTypes.length === 1 && !options.composition?.planType)
+        ? (options.composition ? { ...options.composition, planType } : null) : null,
+    })
+  ));
+  const selected = populations.find((population) => population.planType === selectedPlanType);
+  return {
+    ...selected,
+    selectedPlanType,
+    planPopulations: populations,
+  };
+}
+
+function projectWeeklyPlanSummary(dataset, options) {
   const { composition = null, ...analysisOptions } = options;
   const report = analyzeWeeklyCalibration(dataset, analysisOptions);
   const value = report.weeklyValueSummary;
   const resets = report.resetValues
     .slice(-BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT)
     .map((row) => ({
+      planType: row.planType,
+      planVariant: row.planVariant,
+      planEraKey: row.planEraKey,
+      aggregationEligibility: row.aggregationEligibility,
       resetIdentity: row.resetIdentity,
       firstObservedAt: row.firstObservedAt,
       lastObservedAt: row.lastObservedAt,
@@ -1446,6 +1617,17 @@ export function projectBoundedWeeklyCalibrationSummary(dataset, options = {}) {
     }));
   return {
     schemaVersion: "weekly-calibration-summary-v0.1",
+    planType: report.selectedPlanType,
+    planAttribution: {
+      methodVersion: "plan-era-v1",
+      status: "historical_plan_conditional",
+      accountVerified: false,
+      comparisonEligibility: dataset.attribution?.singlePlanComparisonEligible === true
+          && report.selectedPlanType !== "unknown"
+          && dataset.attribution?.planTypes?.length === 1
+          && dataset.attribution.planTypes[0] === report.selectedPlanType
+        ? "single_plan_conditional" : "unavailable",
+    },
     status: value === null ? "insufficient_evidence" : "estimated",
     generatedAt: report.materializedAt,
     evidenceBasis:
@@ -1490,7 +1672,8 @@ export function projectBoundedWeeklyCalibrationSummary(dataset, options = {}) {
           ? dataset.summary.deduplicatedRateLimitSnapshots
           : 0,
       weeklyTransitions: (dataset.transitions ?? [])
-        .filter((row) => row.windowDurationMins === WEEKLY_WINDOW_MINS)
+        .filter((row) => row.windowDurationMins === WEEKLY_WINDOW_MINS
+          && (row.planType ?? "unknown") === report.selectedPlanType)
         .length,
       qualifyingResetValues: report.quality.qualifyingResetValues,
     },
@@ -1552,6 +1735,18 @@ export function renderWeeklyCalibrationReport(report) {
     "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ...rows,
     "",
+    ...(report.quality.fragmentSelection ? [
+      "## Plan-fragment selection diagnostics",
+      "",
+      "Each reset has at most one primary vote in the selected plan population. Other qualifying fragments remain diagnostic only. Compare these distributions before rollout to inspect greatest-span selection bias; diagnostic fragments are not independent reset votes.",
+      "",
+      "| Cost candidate | Primary votes | Primary median | Diagnostic fragments | Diagnostic median |",
+      "| --- | ---: | ---: | ---: | ---: |",
+      ...report.quality.fragmentSelection.map((row) => (
+        `| ${row.candidateId} | ${row.primary.count} | ${money(row.primary.medianApiPriceEquivalentUsd)} | ${row.diagnosticOnly.count} | ${money(row.diagnosticOnly.medianApiPriceEquivalentUsd)} |`
+      )),
+      "",
+    ] : []),
     "## Validation",
     "",
     `The model-selection score uses the earlier 70% of each reset to predict the later 30%. The prospective-style check uses only earlier completed resets and scores ${report.prospectiveStyleValidation.scoredResets} later resets, with mean MAE ${report.prospectiveStyleValidation.pooledMeanAbsoluteErrorPp ?? "unavailable"} pp.`,

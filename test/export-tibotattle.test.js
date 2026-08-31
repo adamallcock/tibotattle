@@ -63,6 +63,14 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
       "src/local-analysis-index.js",
       "src/local-archive-accounting-index.js",
       "src/replay-safe-accounting-cache.js",
+      "src/local-unified-contribution-attribution.js",
+      "src/contribution/telemetry-v11-chunks.js",
+      "src/contribution/telemetry-v11-sync.js",
+      "src/platform/telemetry-v11-envelope.js",
+      "packages/quota-analysis/src/plan-attribution.js",
+      "packages/telemetry-contract/src/telemetry-v1.1.js",
+      "packages/telemetry-contract/src/telemetry-v1.1-domain.js",
+      "schemas/telemetry-contribution-v1.1/domain-manifest.schema.json",
     ]) {
       assert.equal(verified.files.includes(path), true, `export must include ${path}`);
     }

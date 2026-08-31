@@ -19,6 +19,8 @@ export {
 export {
   TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
 } from "./contribution/telemetry-v1-chunks.js";
+export { TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
+export { telemetryV11FieldInventory, sanitizeTelemetryAttributionBinding } from "./contribution/index.js";
 
 // Exact composition surface: the scheduling and consent state machine is
 // application-owned; this file

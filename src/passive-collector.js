@@ -6,8 +6,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import {
   CodexAppServerClient,
   CodexAppServerError,
-  deriveOpenAIAccountScopeWithSecretLoader,
-  sanitizeCodexAccountSnapshotWithSecretLoader,
+  sanitizeBracketedCodexAccountSnapshotWithSecretLoader,
   sanitizeRateLimit,
   sanitizeAccountScope,
 } from "./providers/codex/account.js";
@@ -36,12 +35,14 @@ import {
   saveLocalCollectorCheckpoint,
 } from "./local-collector-state.js";
 import { SPARK_QUOTA_LIMIT_IDS } from "./local-companion-usage-model.js";
+import { sanitizeTelemetryAttributionBinding } from "./contribution/index.js";
 
 const CHECKPOINT_SCHEMA_VERSION = "0.3";
 const { readRolloutLineage } = localCodexLogScanner;
 const RECORD_SCHEMA_VERSION = "0.3";
 const MAX_RECENT_EVENT_KEYS = 5_000;
 const MAX_ACCOUNT_SCOPE_MARKER_AGE_MS = 5 * 60_000;
+const ACCOUNT_SCOPE_MARKER_VERSION = "provisional-account-marker-v2";
 const MAX_BUFFERED_ROLLOUT_LINE_BYTES = 16 * 1024 * 1024;
 // Every line the collector can act on is tiny. Measured across the largest
 // rollout files (36,395 relevant lines): the longest `turn_context` was 2 KiB,
@@ -708,26 +709,50 @@ async function lineStartAtOrAfter(path, offset, size, {
   }
 }
 
+function freshAccountMarker(marker, receivedMs) {
+  const markerCapturedMs = Date.parse(marker?.capturedAt);
+  return marker?.version === ACCOUNT_SCOPE_MARKER_VERSION
+    && Number.isFinite(markerCapturedMs)
+    && Number.isFinite(receivedMs)
+    && receivedMs >= markerCapturedMs
+    && receivedMs - markerCapturedMs <= MAX_ACCOUNT_SCOPE_MARKER_AGE_MS;
+}
+
+function provisionalRolloutAccount({ checkpoint, observedMs, receivedAt, windows = [] }) {
+  const marker = checkpoint.accountScopeMarker;
+  const markerCapturedMs = Date.parse(marker?.capturedAt);
+  const receivedMs = Date.parse(receivedAt);
+  let accountScope = sanitizeAccountScope(null);
+  if (!freshAccountMarker(marker, receivedMs)) {
+    // Old collector markers were not bracketed. A clock rollback, expiration,
+    // or pre-v2 marker must not revive that observation as fresh evidence.
+    checkpoint.accountScopeMarker = null;
+  } else if (observedMs >= markerCapturedMs && observedMs <= receivedMs
+      && receivedMs - observedMs <= MAX_ACCOUNT_SCOPE_MARKER_AGE_MS) {
+    accountScope = sanitizeAccountScope(marker.accountScope);
+    const knownPlans = new Set([accountScope.planType, ...windows.map((window) => window.planType)]
+      .filter((plan) => plan !== null && plan !== "unknown"));
+    if (knownPlans.size > 1) {
+      // A different plan on the same admitted event invalidates the global
+      // marker. Do not use it again merely because the next event omits plan.
+      checkpoint.accountScopeMarker = null;
+      accountScope = sanitizeAccountScope(null);
+    }
+  }
+  return {
+    accountScope,
+    accountScopeAttribution: accountScope.status === "available"
+      ? "provisional_fresh_app_server_marker"
+      : "unavailable_no_fresh_contemporaneous_marker",
+  };
+}
+
 function rolloutRecord({ record, state, receivedAt, checkpoint }) {
   const observedMs = Date.parse(record.timestamp);
   if (!Number.isFinite(observedMs)) {
     checkpoint.diagnostics.malformedTimestamps += 1;
     return null;
   }
-  const markerCapturedMs = Date.parse(checkpoint.accountScopeMarker?.capturedAt);
-  const receivedMs = Date.parse(receivedAt);
-  const markerIsFresh = Number.isFinite(markerCapturedMs)
-    && Number.isFinite(receivedMs)
-    && Math.abs(receivedMs - markerCapturedMs) <= MAX_ACCOUNT_SCOPE_MARKER_AGE_MS;
-  const receiptIsFresh = Number.isFinite(receivedMs)
-    && receivedMs - observedMs >= 0
-    && receivedMs - observedMs <= MAX_ACCOUNT_SCOPE_MARKER_AGE_MS;
-  const accountScope = markerIsFresh && receiptIsFresh
-    ? sanitizeAccountScope(checkpoint.accountScopeMarker.accountScope)
-    : sanitizeAccountScope(null);
-  const accountScopeAttribution = accountScope.status === "available"
-    ? "provisional_fresh_app_server_marker"
-    : "unavailable_no_fresh_contemporaneous_marker";
   if (record.type === "turn_context") {
     // Any own turn_context ends an inline fork's replayed prefix: Codex
     // writes the inherited history before the child's first genuine turn.
@@ -753,8 +778,7 @@ function rolloutRecord({ record, state, receivedAt, checkpoint }) {
       source: "rollout_tool_call",
       toolClass: classifyToolCall(record.payload?.name),
       surfaceClassification: state.surfaceClassification,
-      accountScope,
-      accountScopeAttribution,
+      ...provisionalRolloutAccount({ checkpoint, observedMs, receivedAt }),
       controlledState: "unknown",
     };
     safe.eventKey = eventKey({ ...safe, receivedAt: undefined, stalenessMs: undefined });
@@ -801,8 +825,7 @@ function rolloutRecord({ record, state, receivedAt, checkpoint }) {
     components: usage ? canonicalComponents(usage) : null,
     tierSemantics: tierForUsage(state, record.timestamp),
     surfaceClassification: state.surfaceClassification,
-    accountScope,
-    accountScopeAttribution,
+    ...provisionalRolloutAccount({ checkpoint, observedMs, receivedAt, windows }),
     windows,
     controlledState: "unknown",
   };
@@ -1426,17 +1449,41 @@ export function notificationEvidenceFromAppServerRecord(record) {
   };
 }
 
-async function readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObservationSecret) {
-  const rateLimits = await client.readRateLimits();
-  const [account, accountUsage] = await Promise.all([
-    typeof client.readAccount === "function" ? client.readAccount().catch(() => null) : Promise.resolve(null),
+async function readOptionalAccount(client) {
+  try {
+    return typeof client.readAccount === "function" ? await client.readAccount() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function captureAttributionBinding(readBinding) {
+  try { return typeof readBinding === "function" ? sanitizeTelemetryAttributionBinding(await readBinding()) : null; }
+  catch { return null; }
+}
+
+function matchingCapturedBinding(before, after) {
+  return before !== null && after !== null && before.destinationOrigin === after.destinationOrigin
+    && before.enrollmentNamespace === after.enrollmentNamespace ? before : null;
+}
+
+async function readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObservationSecret,
+  readAccountAttributionBinding = null, clock = () => Date.now()) {
+  const bindingBefore = await captureAttributionBinding(readAccountAttributionBinding);
+  const accountBefore = await readOptionalAccount(client);
+  const [rateLimits, accountUsage] = await Promise.all([
+    client.readRateLimits(),
     typeof client.readAccountUsage === "function" ? client.readAccountUsage().catch(() => null) : Promise.resolve(null),
   ]);
-  return sanitizeCodexAccountSnapshotWithSecretLoader(
-    { account, rateLimits, accountUsage },
+  const accountAfter = await readOptionalAccount(client);
+  const payload = await sanitizeBracketedCodexAccountSnapshotWithSecretLoader(
+    { accountBefore, accountAfter, rateLimits, accountUsage },
     capturedAt,
     { loadAccountObservationSecret },
   );
+  const bindingAfter = await captureAttributionBinding(readAccountAttributionBinding);
+  return { ...payload, markerCapturedAt: capturedAt, markerReceivedAt: new Date(clock()).toISOString(),
+    observationBinding: matchingCapturedBinding(bindingBefore, bindingAfter) };
 }
 
 async function appendAppRecord({ payload, source, checkpoint, clock, commitRecord }) {
@@ -1445,6 +1492,35 @@ async function appendAppRecord({ payload, source, checkpoint, clock, commitRecor
   }
   const receivedAt = new Date(clock()).toISOString();
   const record = appServerSnapshotRecord(payload, { source, receivedAt });
+  if (Object.hasOwn(payload ?? {}, "accountScope")) {
+    // Notification processing can establish a new forward-looking marker
+    // without proving which account emitted the earlier notification itself.
+    const markerScope = Object.hasOwn(payload, "markerAccountScope")
+      ? sanitizeAccountScope(payload.markerAccountScope)
+      : record.accountScope;
+    if (markerScope.reason === "credential_locked") {
+      checkpoint.diagnostics.accountCredentialLocked = (checkpoint.diagnostics.accountCredentialLocked ?? 0) + 1;
+    }
+    if (markerScope.reason === "credential_migration_required") {
+      checkpoint.diagnostics.accountCredentialMigrationRequired =
+        (checkpoint.diagnostics.accountCredentialMigrationRequired ?? 0) + 1;
+    }
+    if (markerScope.reason === "credential_unavailable") {
+      checkpoint.diagnostics.accountCredentialUnavailable = (checkpoint.diagnostics.accountCredentialUnavailable ?? 0) + 1;
+    }
+    if (markerScope.status === "available") {
+      checkpoint.accountScopeMarker = {
+        version: ACCOUNT_SCOPE_MARKER_VERSION,
+        capturedAt: payload.markerCapturedAt ?? record.observedAt,
+        receivedAt: payload.markerReceivedAt ?? receivedAt,
+        accountScope: markerScope,
+        source: record.source,
+        observationBinding: sanitizeTelemetryAttributionBinding(payload.observationBinding),
+      };
+    } else {
+      checkpoint.accountScopeMarker = null;
+    }
+  }
   const recentSet = new Set(checkpoint.recentEventKeys);
   if (recentSet.has(record.eventKey)) {
     checkpoint.diagnostics.duplicateEventsSkipped += 1;
@@ -1452,27 +1528,6 @@ async function appendAppRecord({ payload, source, checkpoint, clock, commitRecor
   }
   addRecentKey(checkpoint, record.eventKey, recentSet);
   trimRecentKeys(checkpoint, recentSet, MAX_RECENT_EVENT_KEYS);
-  if (Object.hasOwn(payload ?? {}, "accountScope")) {
-    if (record.accountScope.reason === "credential_locked") {
-      checkpoint.diagnostics.accountCredentialLocked = (checkpoint.diagnostics.accountCredentialLocked ?? 0) + 1;
-    }
-    if (record.accountScope.reason === "credential_migration_required") {
-      checkpoint.diagnostics.accountCredentialMigrationRequired =
-        (checkpoint.diagnostics.accountCredentialMigrationRequired ?? 0) + 1;
-    }
-    if (record.accountScope.reason === "credential_unavailable") {
-      checkpoint.diagnostics.accountCredentialUnavailable = (checkpoint.diagnostics.accountCredentialUnavailable ?? 0) + 1;
-    }
-    if (record.accountScope.status === "available") {
-      checkpoint.accountScopeMarker = {
-        capturedAt: record.observedAt,
-        accountScope: record.accountScope,
-        source: record.source,
-      };
-    } else {
-      checkpoint.accountScopeMarker = null;
-    }
-  }
   checkpoint.lastQuotaObservedAt = record.observedAt;
   checkpoint.diagnostics.appServerRecordsWritten += 1;
   await commitRecord([record]);
@@ -1493,6 +1548,7 @@ function safeErrorCode(error) {
 }
 
 function recordAppServerError(checkpoint, error) {
+  checkpoint.accountScopeMarker = null;
   checkpoint.diagnostics.appServerErrorCounts ??= {};
   const code = safeErrorCode(error);
   checkpoint.diagnostics.appServerErrorCounts[code] = (checkpoint.diagnostics.appServerErrorCounts[code] ?? 0) + 1;
@@ -1527,6 +1583,7 @@ async function rewindCheckpointAfterAppRecordFailure({
   }
   for (const key of Object.keys(checkpoint)) delete checkpoint[key];
   Object.assign(checkpoint, restored ?? structuredClone(pristineCheckpoint));
+  checkpoint.accountScopeMarker = null;
 }
 
 export async function runCollectorOnce({
@@ -1556,6 +1613,7 @@ export async function runCollectorOnce({
   clock = () => Date.now(),
   appServerFactory = () => new CodexAppServerClient(),
   loadAccountObservationSecret = null,
+  readAccountAttributionBinding = null,
   commitState = commitLocalCollectorState,
   saveState = saveLocalCollectorCheckpoint,
 } = {}) {
@@ -1645,6 +1703,8 @@ export async function runCollectorOnce({
             client,
             capturedAt,
             loadAccountObservationSecret,
+            readAccountAttributionBinding,
+            clock,
           );
           if (signal?.aborted) throw new Error("collector_aborted");
           const record = await appendAppRecord({
@@ -1860,7 +1920,8 @@ export async function runCollectorOnce({
         await client.start();
         if (signal?.aborted) throw new Error("collector_aborted");
         const capturedAt = new Date(clock()).toISOString();
-        const payload = await readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObservationSecret);
+        const payload = await readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObservationSecret,
+          readAccountAttributionBinding, clock);
         if (signal?.aborted) throw new Error("collector_aborted");
         const record = await appendAppRecord({
           payload,
@@ -1968,6 +2029,7 @@ export async function runCollectorForeground({
   appServerFactory = () => new CodexAppServerClient(),
   watchRoot = watch,
   loadAccountObservationSecret = null,
+  readAccountAttributionBinding = null,
   ingestUpdates = ingestRolloutUpdates,
   maximumRecordBatchSize = MAX_RECORD_BATCH_SIZE,
   maximumRecentEventKeys = MAX_RECENT_EVENT_KEYS,
@@ -2011,6 +2073,9 @@ export async function runCollectorForeground({
   let maximumPendingRateLimitNotifications = 0;
   let finalized = false;
   let hasDurableCheckpoint = existing !== null;
+  let accountObservationEpoch = 0;
+  let accountInvalidationQueued = false;
+  let accountInvalidationDirty = false;
   const watchers = [];
 
   checkpoint.diagnostics.ingestionErrorCounts ??= {};
@@ -2029,6 +2094,9 @@ export async function runCollectorForeground({
     hasDurableCheckpoint = durable !== null;
     for (const key of Object.keys(checkpoint)) delete checkpoint[key];
     Object.assign(checkpoint, restored);
+    // A failed operation must not revive a marker from before a known account
+    // failure, logout, disconnect, or speculative append.
+    checkpoint.accountScopeMarker = null;
     checkpoint.diagnostics.ingestionErrorCounts ??= {};
     checkpoint.diagnostics.watcherErrorCounts ??= {};
   }
@@ -2107,6 +2175,10 @@ export async function runCollectorForeground({
         await operation();
       } catch (error) {
         recordOperationError(kind, error);
+        if (kind === "rate_limit_notification") {
+          checkpoint.accountScopeMarker = null;
+          await save();
+        }
       }
     };
     operationTail = operationTail.then(run, run);
@@ -2166,22 +2238,42 @@ export async function runCollectorForeground({
     } while (observed !== operationTail);
   }
 
-  async function notificationPayloadFor(connectedClient, canonical) {
+  async function notificationPayloadFor({ connectedClient, canonical, priorAccountScope, arrivalEpoch }) {
     if (!canonical) return canonical;
-    let accountScope;
-    try {
-      const account = typeof connectedClient.readAccount === "function"
-        ? await connectedClient.readAccount()
-        : null;
-      accountScope = await deriveOpenAIAccountScopeWithSecretLoader(account, {
-        loadAccountObservationSecret,
-        planType: account?.account?.planType ?? canonical.planType,
-      });
-    } catch {
-      accountScope = sanitizeAccountScope(null);
-    }
+    const observationEpoch = accountObservationEpoch;
+    const markerCapturedAt = new Date(clock()).toISOString();
+    const bindingBefore = await captureAttributionBinding(readAccountAttributionBinding);
+    const accountBefore = await readOptionalAccount(connectedClient);
+    const accountAfter = await readOptionalAccount(connectedClient);
+    // This brackets processing, not the earlier arrival of the notification.
+    // It may seed only a forward-looking provisional marker, never an exact
+    // account/rollout occurrence bridge.
+    const payload = await sanitizeBracketedCodexAccountSnapshotWithSecretLoader({
+      accountBefore,
+      accountAfter,
+      rateLimits: { rateLimits: canonical },
+      accountUsage: null,
+    }, markerCapturedAt, { loadAccountObservationSecret });
+    const bindingAfter = await captureAttributionBinding(readAccountAttributionBinding);
+    const markerAccountScope = connectedClient === client && observationEpoch === accountObservationEpoch
+      ? payload.accountScope
+      : sanitizeAccountScope(null);
+    const knownPlans = new Set([priorAccountScope.planType, markerAccountScope.planType, canonical.planType]
+      .filter((plan) => plan !== null && plan !== "unknown"));
+    const notificationMatchesMarker = arrivalEpoch === observationEpoch
+      && markerAccountScope.status === "available"
+      && priorAccountScope.status === "available"
+      && priorAccountScope.scopeId === markerAccountScope.scopeId
+      && knownPlans.size <= 1;
+    const accountScope = notificationMatchesMarker || markerAccountScope.status === "unavailable"
+      ? markerAccountScope
+      : sanitizeAccountScope(null);
     return {
       accountScope,
+      markerAccountScope,
+      markerCapturedAt,
+      markerReceivedAt: new Date(clock()).toISOString(),
+      observationBinding: matchingCapturedBinding(bindingBefore, bindingAfter),
       canonical,
       byLimitId: {},
       officialDailyTokens: [],
@@ -2201,7 +2293,7 @@ export async function runCollectorForeground({
           const pending = pendingRateLimitNotification;
           pendingRateLimitNotification = null;
           rateLimitNotificationPayloadsProcessed += 1;
-          const notificationPayload = await notificationPayloadFor(pending.connectedClient, pending.canonical);
+          const notificationPayload = await notificationPayloadFor(pending);
           const record = await appendForegroundAppRecord(notificationPayload, "app_server_notification");
           if (record) notificationRecords += 1;
           if (!record) await save();
@@ -2223,7 +2315,11 @@ export async function runCollectorForeground({
       // same content-free malformed-output failure as the previous path.
     }
     if (pendingRateLimitNotification !== null) rateLimitNotificationPayloadsCoalesced += 1;
-    pendingRateLimitNotification = { connectedClient, canonical };
+    const marker = checkpoint.accountScopeMarker;
+    const priorAccountScope = freshAccountMarker(marker, clock())
+      ? sanitizeAccountScope(marker.accountScope)
+      : sanitizeAccountScope(null);
+    pendingRateLimitNotification = { connectedClient, canonical, priorAccountScope, arrivalEpoch: accountObservationEpoch };
     maximumPendingRateLimitNotifications = Math.max(maximumPendingRateLimitNotifications, 1);
     return scheduleRateLimitNotificationOperation();
   }
@@ -2236,7 +2332,29 @@ export async function runCollectorForeground({
     client.on("rateLimitsUpdated", (payload) => {
       queueRateLimitNotification(connectedClient, payload);
     });
+    const invalidateAccountMarker = () => {
+      if (connectedClient !== client) return;
+      accountObservationEpoch += 1;
+      checkpoint.accountScopeMarker = null;
+      accountInvalidationDirty = true;
+      if (accountInvalidationQueued) return;
+      accountInvalidationQueued = true;
+      enqueueOperation("account_scope_invalidation", async () => {
+        try {
+          while (accountInvalidationDirty) {
+            accountInvalidationDirty = false;
+            checkpoint.accountScopeMarker = null;
+            await save();
+          }
+        } finally {
+          accountInvalidationQueued = false;
+        }
+      });
+    };
+    client.on("accountChanged", invalidateAccountMarker);
     client.on("disconnect", () => {
+      if (connectedClient !== client) return;
+      invalidateAccountMarker();
       client = null;
     });
     try {
@@ -2248,8 +2366,14 @@ export async function runCollectorForeground({
       await drainOperations();
       const lastObservedMs = checkpoint.lastQuotaObservedAt ? Date.parse(checkpoint.lastQuotaObservedAt) : Number.NEGATIVE_INFINITY;
       if (afterReconnect || clock() - lastObservedMs > staleAfterMs) {
+        const observationEpoch = accountObservationEpoch;
         const capturedAt = new Date(clock()).toISOString();
-        const payload = await readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObservationSecret);
+        checkpoint.accountScopeMarker = null;
+        const payload = await readSanitizedAppServerSnapshot(connectedClient, capturedAt, loadAccountObservationSecret,
+          readAccountAttributionBinding, clock);
+        if (client !== connectedClient || observationEpoch !== accountObservationEpoch) {
+          payload.accountScope = sanitizeAccountScope(null);
+        }
         const record = await appendForegroundAppRecord(payload, "app_server_read");
         if (record) notificationRecords += 1;
       }

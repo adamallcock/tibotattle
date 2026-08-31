@@ -1,0 +1,122 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://tibotattle.com/schemas/telemetry-contribution-v1.1/contribution.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "manifestDigest",
+    "chunkId",
+    "chunkRevision",
+    "chunkDigest",
+    "parserVersion",
+    "consent",
+    "records"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "telemetry-contribution-v1.1"
+    },
+    "manifestDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "chunkId": {
+      "type": "string",
+      "pattern": "^(quota|session|usage):\\d{4}-\\d{2}-\\d{2}:(0|[1-9]\\d{0,4})$"
+    },
+    "chunkRevision": {
+      "const": 1
+    },
+    "chunkDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "parserVersion": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,64}$"
+    },
+    "consent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "telemetrySchemaVersion",
+        "fieldDictionaryVersion",
+        "privacyContractVersion"
+      ],
+      "properties": {
+        "telemetrySchemaVersion": {
+          "const": "telemetry-contribution-v1.1"
+        },
+        "fieldDictionaryVersion": {
+          "const": "telemetry-v1.1-registry-2026-08-31.1"
+        },
+        "privacyContractVersion": {
+          "const": "ongoing-privacy-safe-telemetry-v1.1"
+        }
+      }
+    },
+    "records": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 200
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "chunkId": {
+            "pattern": "^usage:"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "records": {
+            "items": {
+              "$ref": "https://tibotattle.com/schemas/telemetry-contribution-v1.1/usage-event.schema.json"
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "chunkId": {
+            "pattern": "^quota:"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "records": {
+            "items": {
+              "$ref": "https://tibotattle.com/schemas/telemetry-contribution-v1.1/quota-observation.schema.json"
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "chunkId": {
+            "pattern": "^session:"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "records": {
+            "items": {
+              "$ref": "https://tibotattle.com/schemas/telemetry-contribution-v1.1/session-dimension.schema.json"
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$comment": "Runtime additionally verifies same UTC day, unique occurrences, exact canonical digest and complete manifest membership."
+}
