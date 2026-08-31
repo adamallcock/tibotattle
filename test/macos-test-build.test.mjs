@@ -179,6 +179,21 @@ test("test compiler profile builds a development-only launcher that runs", {
     });
     assert.equal(smoke.status, 0, smoke.error?.message ?? smoke.stderr);
     assert.match(smoke.stdout, /runtime=development_disabled/u);
+    const dashboardLayoutSmoke = spawnSync(
+      launcher,
+      ["--native-dashboard-layout-smoke-test"],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(
+      dashboardLayoutSmoke.status,
+      0,
+      dashboardLayoutSmoke.error?.message ?? dashboardLayoutSmoke.stderr,
+    );
+    assert.match(
+      dashboardLayoutSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_DASHBOARD_READINESS early=true late=true once=true stale_callbacks=ignored cancelled=true hung_renderer=bounded hard_deadline=120$/mu,
+    );
+    assert.match(dashboardLayoutSmoke.stdout, /USAGE_MONITOR_MACOS_NATIVE_DASHBOARD_LAYOUT/u);
     const progressSmoke = spawnSync(
       launcher,
       ["--native-analysis-progress-contract-smoke-test"],

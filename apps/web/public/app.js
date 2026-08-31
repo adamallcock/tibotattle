@@ -327,6 +327,9 @@ let hostedSignInCancellationInFlight = false;
 let appleSignInUnavailable = false;
 let googleSignInUnavailable = false;
 let localActionBusy = false;
+// Overlapping primary reads share the original busy owner. Publication uses
+// the same load token as quick reloads and cache-drop links below.
+let activeLocalDashboardLoad = null;
 let localRefreshInProgress = false;
 let localRefreshCancelRequested = false;
 // Archive indexing progress is intentionally transient: the durable dashboard
@@ -11151,6 +11154,56 @@ async function copyContributionDiagnostics() {
   }
 }
 
+async function loadLocalDashboardSecondaryState({ isCurrent, primaryAvailable }) {
+  const read = async (request, publish = () => {}) => {
+    const value = await Promise.resolve().then(request).catch(() => null);
+    if (isCurrent()) publish(value);
+    return value;
+  };
+  const health = read(() => localClient.health(), (localHealth) => {
+    // A failed read says nothing about the companion. Never replace a health
+    // answer that landed with one that did not.
+    if (localHealth === null) return;
+    localCompanionHealth = localHealth;
+    renderHostedIdentity();
+    if (!primaryAvailable && dashboard === null) {
+      renderDashboardUnavailableState("dashboard-unavailable");
+    }
+  });
+  const onboarding = read(() => localClient.onboarding(), (value) => {
+    if (value === null) return;
+    renderLocalOnboarding(value);
+    // Bootstrap may have finished before this verdict arrived. Preserve the
+    // browser's existing return-visit cadence; the native shell owns its own.
+    scheduleReturningUserRefresh();
+  });
+  const refresh = read(() => localClient.refreshStatus(), (refreshState) => {
+    if (refreshState === null) return;
+    accountingRebuildDeferral =
+      refreshState?.refresh?.result?.accountingRebuildDeferred ?? null;
+    if (dashboard) renderAccounting(dashboard);
+  });
+  const status = read(
+    () => localClient.contributionSyncStatus(),
+    (value) => renderContributionSyncStatus(primaryAvailable ? value : null),
+  );
+  const preview = read(() => localClient.contributionSyncPreview());
+  const consentAndPreview = (async () => {
+    // These settled answers prevent duplicate recovery reads. Consent must
+    // still precede preview publication: an approved Mac must not re-prepare
+    // a review merely because its usage data was ready first.
+    await Promise.all([health, onboarding]);
+    if (!isCurrent()) return;
+    await loadIncrementalSyncStatus({ isCurrent });
+    if (!isCurrent()) return;
+    scheduleReturningUserRefresh();
+    const value = await preview;
+    if (!isCurrent()) return;
+    renderContributionSyncPreview(primaryAvailable ? value : null);
+  })();
+  await Promise.all([refresh, status, consentAndPreview]);
+}
+
 /** Mark the first real local-dashboard render for the native shell. */
 function markLocalDashboardReady() {
   // The native shell uses this app-owned marker instead of mistaking static
@@ -11161,25 +11214,28 @@ function markLocalDashboardReady() {
 }
 
 async function loadLocalDashboard() {
-  cacheDropThreadLinks.loadToken += 1;
-  const previousBusy = localActionBusy;
+  const loadToken = ++cacheDropThreadLinks.loadToken;
+  const load = {
+    previousBusy: activeLocalDashboardLoad?.pending
+      ? activeLocalDashboardLoad.previousBusy
+      : localActionBusy,
+    pending: true,
+  };
+  activeLocalDashboardLoad = load;
+  const isCurrent = () => cacheDropThreadLinks.loadToken === loadToken;
+  let primaryAvailable = false;
   localActionBusy = true;
   const button = $("#refresh-button");
   button.textContent = "Connecting…";
   updateLocalActionButtons();
   try {
-    const syncState = (async () => {
-      const [preview, status] = await Promise.all([
-        localClient.contributionSyncPreview().catch(() => null),
-        localClient.contributionSyncStatus().catch(() => null)
-      ]);
-      return { preview, status };
-    })();
     const loadDashboardData = async () => {
       try {
         return await localClient.load();
       } catch (firstError) {
+        if (!isCurrent()) throw firstError;
         await new Promise((resolve) => window.setTimeout(resolve, 250));
+        if (!isCurrent()) throw firstError;
         try {
           return await localClient.load();
         } catch {
@@ -11187,60 +11243,34 @@ async function loadLocalDashboard() {
         }
       }
     };
-    const [data, sync, localHealth, onboarding, refreshState] = await Promise.all([
-      loadDashboardData(),
-      syncState,
-      localClient.health().catch(() => null),
-      localClient.onboarding().catch(() => null),
-      localClient.refreshStatus().catch(() => null)
-    ]);
-    // A read that did not land says nothing about the companion, so it may not
-    // replace one that did: the same rule the accounting-rebuild note above
-    // follows. Only the unavailable-state decision below reads THIS load's
-    // answer, because that is the one it is reporting on.
-    if (localHealth !== null) localCompanionHealth = localHealth;
-    if (refreshState !== null) {
-      accountingRebuildDeferral =
-        refreshState?.refresh?.result?.accountingRebuildDeferred ?? null;
-    }
+    const data = await loadDashboardData();
+    if (!isCurrent()) return;
     renderDashboard(data);
-    // Health arrives after the first paint, and the sign-in controls are gated
-    // on a capability it carries. Without this re-render they keep the
-    // disabled state bootstrap gave them when the capability was still unknown.
-    renderHostedIdentity();
-    renderContributionSyncStatus(sync.status);
-    // Before the consent read, because that read now also recovers whichever
-    // companion answers are still unsettled — and an onboarding verdict this
-    // load already holds is not one of them.
-    renderLocalOnboarding(onboarding);
-    // The primary local result is now rendered. Do not keep the native
-    // readiness signal waiting on the secondary contribution-status read;
-    // its consent invariant still completes before the preview renders.
+    // Clear the first-run evidence curtain using the result we actually have,
+    // even while the next optional onboarding verdict is still pending.
+    renderLocalOnboarding(localOnboarding);
     markLocalDashboardReady();
-    // Consent state is read from the companion before the queue renders, so
-    // an already-approved Mac never re-prepares a review instance it no
-    // longer needs.
-    await loadIncrementalSyncStatus();
-    renderContributionSyncPreview(sync.preview);
+    primaryAvailable = true;
   } catch {
-    const [localHealth, onboarding] = await Promise.all([
-      localClient.health().catch(() => null),
-      localClient.onboarding().catch(() => null),
-    ]);
-    if (localHealth !== null) localCompanionHealth = localHealth;
+    if (!isCurrent()) return;
     dashboard = null;
-    renderHostedIdentity();
-    renderContributionSyncStatus(null);
-    renderLocalOnboarding(onboarding);
-    await loadIncrementalSyncStatus();
-    renderContributionSyncPreview(null);
+    renderLocalOnboarding(localOnboarding);
     renderDashboardUnavailableState(
-      localHealth ? "dashboard-unavailable" : "companion-unavailable",
+      localCompanionHealth ? "dashboard-unavailable" : "companion-unavailable",
     );
     markLocalDashboardReady();
   } finally {
-    localActionBusy = previousBusy;
-    updateLocalActionButtons();
+    if (activeLocalDashboardLoad === load) {
+      load.pending = false;
+      localActionBusy = load.previousBusy;
+      updateLocalActionButtons();
+    }
+  }
+  if (isCurrent()) {
+    // Optional reads never own primary readiness or the action's busy state.
+    void loadLocalDashboardSecondaryState({ isCurrent, primaryAvailable }).catch(() => {
+      if (isCurrent()) scheduleIncrementalSyncStatusPoll();
+    });
   }
 }
 
@@ -11268,10 +11298,35 @@ function renderDashboardSkeleton() {
 }
 
 async function loadQuickResultDashboard() {
+  const loadToken = ++cacheDropThreadLinks.loadToken;
+  const isCurrent = () => cacheDropThreadLinks.loadToken === loadToken;
+  try {
+    const data = await localClient.load();
+    if (!isCurrent()) return;
+    renderDashboard(data);
+    renderLocalOnboarding(localOnboarding);
+  } finally {
+    // This generation replaces any pending startup reads too. Keep optional
+    // recovery alive without making native evidence reloads wait for it.
+    if (isCurrent()) {
+      void loadLocalDashboardSecondaryState({
+        isCurrent,
+        primaryAvailable: dashboard !== null && dashboard.mode !== "demo",
+      }).catch(() => {
+        if (isCurrent()) scheduleIncrementalSyncStatusPoll();
+      });
+    }
+  }
+}
+
+function showDemoDashboard() {
   cacheDropThreadLinks.loadToken += 1;
-  const data = await localClient.load();
-  renderDashboard(data);
-  if (localOnboarding) renderLocalOnboarding(localOnboarding);
+  if (activeLocalDashboardLoad?.pending) {
+    localActionBusy = activeLocalDashboardLoad.previousBusy;
+  }
+  activeLocalDashboardLoad = null;
+  renderDashboard(demoDashboard());
+  updateLocalActionButtons();
 }
 
 /**
@@ -13566,7 +13621,7 @@ function scheduleIncrementalSyncStatusPoll({ reset = false } = {}) {
  * landed — a transient loopback failure must not un-advertise a transport the
  * companion confirmed.
  */
-async function recoverLocalCompanionReads() {
+async function recoverLocalCompanionReads({ isCurrent = () => true } = {}) {
   const [localHealth, onboarding] = await Promise.all([
     incrementalSyncCapabilitySettled()
       ? null
@@ -13575,6 +13630,7 @@ async function recoverLocalCompanionReads() {
       ? localClient.onboarding().catch(() => null)
       : null,
   ]);
+  if (!isCurrent()) return;
   let recovered = false;
   if (localHealth !== null) {
     const wasAdvertised = incrementalSyncCapabilityAdvertised();
@@ -13606,8 +13662,14 @@ async function recoverLocalCompanionReads() {
  * consent verdict — so an approved Mac renders as approved after a reload —
  * and the progress facts the status line prints.
  */
-async function loadIncrementalSyncStatus() {
-  await recoverLocalCompanionReads();
+async function loadIncrementalSyncStatus({ isCurrent } = {}) {
+  // Polls and consent actions also cross dashboard loads. A response begun
+  // before a newer primary/quick result or demo selection may not replace it.
+  const loadToken = cacheDropThreadLinks.loadToken;
+  const readIsCurrent = isCurrent
+    ?? (() => cacheDropThreadLinks.loadToken === loadToken);
+  await recoverLocalCompanionReads({ isCurrent: readIsCurrent });
+  if (!readIsCurrent()) return;
   if (!incrementalSyncCapabilityAdvertised()) {
     incrementalSyncStatus = null;
     incrementalConsentApproved = false;
@@ -13632,6 +13694,7 @@ async function loadIncrementalSyncStatus() {
   } catch {
     payload = null;
   }
+  if (!readIsCurrent()) return;
   incrementalSyncStatus = normalizeIncrementalContributionSyncStatus(payload);
   observeContributionDisconnectPause(incrementalSyncStatus);
   incrementalSyncLastOutcomeDetailCode = boundedOutcomeDetailCode(payload);
@@ -14624,7 +14687,7 @@ window.addEventListener("tibotattle:local-evidence-updated", () => {
 // the two-card flow (owner-directed, 2026-08-08): after sign-in, the single
 // Review-and-approve button below is the one contribution action, and its
 // explicit approval is the consent.
-$("#demo-button").addEventListener("click", () => renderDashboard(demoDashboard()));
+$("#demo-button").addEventListener("click", showDemoDashboard);
 // The prepare, lookback, and send controls left with the legacy prepare flow
 // (owner-directed, 2026-08-08). The approve card's only companion control is
 // the error-recovery re-check for its invisible review bootstrap.

@@ -26,6 +26,9 @@ import {
   LOCAL_COMPANION_SCHEMA_VERSION,
 } from "../../src/local-companion-data.js";
 import {
+  readLocalUnifiedCompanionProjection,
+} from "../../src/local-unified-companion-source.js";
+import {
   ingestLocalUnifiedIndexOffMain,
 } from "../../src/local-unified-index-off-main.js";
 import {
@@ -1679,6 +1682,7 @@ test("the port and readiness answer before the first snapshot is built", async (
   const buildStarted = deferred();
   const buildBarrier = deferred();
   const store = fakeStore();
+  let initializationOptions;
   let app;
   try {
     const startedAt = Date.now();
@@ -1689,7 +1693,8 @@ test("the port and readiness answer before the first snapshot is built", async (
       staticRoot: files.staticRoot,
       dataStore: {
         ...store,
-        async initialize() {
+        async initialize(options) {
+          initializationOptions = options;
           buildStarted.resolve();
           await buildBarrier.promise;
         },
@@ -1699,6 +1704,7 @@ test("the port and readiness answer before the first snapshot is built", async (
     });
     const base = `http://127.0.0.1:${app.port}`;
     await buildStarted.promise;
+    assert.deepEqual(initializationOptions, { purpose: "startup" });
 
     // Listening, and honest about what is not ready yet. Before the port moved
     // ahead of the build this request could not even be sent: a real install
@@ -1736,6 +1742,72 @@ test("the port and readiness answer before the first snapshot is built", async (
     );
   } finally {
     buildBarrier.resolve();
+    await app?.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("startup snapshot defers unified history until an explicit full refresh", async () => {
+  const files = await fixture();
+  const projectionModes = [];
+  let fullRefreshRequested = false;
+  let app;
+  try {
+    app = await startLocalCompanionServer({
+      environment: {},
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      homeDirectory: join(files.root, "home"),
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      accountingSourceMode: "unified",
+      codexSpeedBaseline: { readWindows: async () => [] },
+      unifiedProjectionReader: async (options) => {
+        projectionModes.push(options.mode);
+        if (options.mode === "full" && !fullRefreshRequested) {
+          throw new Error("startup_must_not_build_full_projection");
+        }
+        return readLocalUnifiedCompanionProjection(options);
+      },
+      refreshRunner: async () => ({}),
+      port: 0,
+    });
+    await app.snapshotReady;
+    const base = `http://127.0.0.1:${app.port}`;
+    assert.deepEqual(projectionModes, ["deferred"]);
+    const health = await fetch(`${base}/api/local/health`)
+      .then((response) => response.json());
+    assert.deepEqual(health.snapshot, { status: "ready", errorCode: null });
+    const response = await fetch(`${base}/api/local/overview`);
+    assert.equal(response.status, 200);
+    const overview = await response.json();
+    assert.equal(overview.accounting.generationMatched, false);
+    assert.equal(overview.accounting.projection.status, "unavailable");
+    assert.equal(
+      overview.accounting.projection.reason,
+      "local_unified_index_deferred",
+    );
+    assert.deepEqual(overview.timeline.usage, []);
+    assert.equal(overview.timeline.history.status, "loading");
+
+    fullRefreshRequested = true;
+    const started = await fetch(`${base}/api/local/refresh`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1",
+        Origin: base,
+      },
+      body: "{}",
+    });
+    assert.equal(started.status, 202);
+    await waitFor(async () => {
+      const payload = await fetch(`${base}/api/local/refresh`)
+        .then((result) => result.json());
+      return payload.refresh.status === "succeeded";
+    });
+    assert.deepEqual(projectionModes, ["deferred", "full"]);
+  } finally {
     await app?.close();
     await rm(files.root, { recursive: true });
   }
@@ -3867,7 +3939,7 @@ test("a declined legacy Keychain migration is preserved and never routed to rese
     );
     assert.match(
       appSource,
-      /contribution_device_keychain_migration_required:[\s\S]{0,500}Quit and reopen TiboTattle[\s\S]{0,500}Do not reset or delete the credential/u,
+      /contribution_device_keychain_migration_required:[\s\S]{0,500}Settings… → General[\s\S]{0,500}Review migration… under Secure upgrade[\s\S]{0,500}Do not reset or delete the credential/u,
     );
   } finally {
     await app.close();

@@ -1,0 +1,87 @@
+---
+title: Native dogfood startup recovery
+date: 2026-08-31
+type: plan
+status: in-progress
+---
+
+# Boundary
+
+Finish the current native 0.1.17 dogfood before adding account/plan PR #94 to
+an installed candidate. The owner merged #94 into main at `20f449ff` during
+qualification; this corrective candidate remains based on `a3c85036` plus only
+the startup fix. Carry the fix to newer main separately without silently
+changing this artifact's source.
+The signed PR #95 candidate reproduced `UM_MACOS_DASHBOARD_READY_TIMEOUT` on
+normal launch with existing schema-11 history. A replacement companion later
+reported a ready snapshot and returned the overview in 51 ms; the native window
+remained on its timeout screen. Open Dashboard restored real data. The first
+companion exit's cause is not established by these observations.
+
+No index wipe, schema change, credential reset, consent change, hosted deployment,
+or public release is part of this correction.
+
+## Changes
+
+- [x] Select the companion's existing bounded `startup` projection. Preserve
+  attested last-good data and explicit incomplete coverage; the normal refresh
+  supplies eventual full results.
+- [x] Render the primary local result before optional contribution/onboarding
+  requests finish, without breaking consent ordering or async-load fencing.
+- [x] Make native readiness observation document-generation-fenced and bounded.
+  A slow-load threshold must not discard the page or initial-refresh intent;
+  true failure and a hard deadline remain explicit. Late readiness refreshes
+  once and clears the stale timeout diagnostic.
+- [x] Add executable startup/retention, delayed-readiness, cancellation, stale
+  callback and optional-service regressions. Keep every existing safety gate.
+- [x] Validate the combined corrective source and retained R7 freshness. Allocate
+  its monotonic native build and freeze the source separately from newer main.
+- [ ] Sign/notarize, preserve state and the prior app, install and verify real
+  native startup, refresh, restart and prompt-free behavior.
+
+## Acceptance
+
+The corrective RC4 allocation is build `1023.2`, strictly after installed RC3
+`1023.1` and before the reserved stable `1024`. The short version stays `0.1.17`.
+
+The installed native app must show saved local evidence without waiting for full
+history accounting or optional hosted work, retain honest partial labels, recover
+from a delayed ready result without manual reload, and start only one initial
+refresh. Navigation replacement, companion replacement and teardown must fence
+old callbacks. Unexpected Keychain prompts remain a release blocker.
+
+Source tests, isolated smokes, signed artifacts, real-data native interaction and
+public promotion are separate proofs. Fresh R7 receipts retain their actual open
+promotion/resource decisions; they are not a stable-release claim.
+
+## Frozen-source validation
+
+- Full root suite: 3,312 tests, 3,291 passed, zero failures or cancellations,
+  21 existing platform skips; exit 0 in 318.2 seconds.
+- Browser owning gate: 449/449; local companion owning gate: 277/277.
+- Complete retained native gate: 89/89, no failures or skips; exit 0 in
+  237.8 seconds. Documentation preflight: 20/20; release trust: 77/77;
+  architecture: 367 production files, 1,447 imports and zero approved debt.
+- Focused native source/migration tests: 78 passed with the three designated
+  artifact exclusions. The compiled test-profile smoke executes the actual
+  readiness policy (early and late readiness, one-shot completion, cancellation,
+  stale generations and the hard deadline) and passes. It does not establish
+  physical WebKit callback scheduling or installed-artifact behavior.
+- R7 freshness: both retained-receipt checks pass against this source. The
+  correction does not change the R7 workload closure; no protected receipt was
+  regenerated or edited.
+- Rendered browser QA used a read-only loopback proxy serving the frozen web
+  source and the installed companion's real primary read responses. Optional
+  requests were held open, and every mutation was blocked. Overview and Usage
+  and costs rendered; readiness was true with no first-run curtain or visible
+  dialog, and no browser warning/error. A 962 by 541 screenshot was inspected.
+  Aggregate proxy counters confirmed no writes forwarded. The QA tab and proxy
+  were closed afterward; private response bodies were not retained as fixtures.
+- Independent frozen-web review found no concrete blocker in readiness,
+  asynchronous publication fencing or consent ordering. Optional preview
+  discovery retains its existing local queue-bookkeeping semantics; it does
+  not itself upload. A primary read that never settles still reaches the
+  native hard deadline rather than being presented as successful.
+- Exact-source hosted checks, signing, notarization, state-preserving replacement
+  and installed native interaction
+  remain separate pending steps. Browser QA is not native qualification.
