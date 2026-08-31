@@ -9,10 +9,12 @@ status: owner-action-required
 
 ## Purpose
 
-The 2026-08-27 API cleanup removes unreachable hosted HTTP contracts while
-preserving the current identity, device-sync, daily-community, and whole-account
-deletion paths. Historical D1 rows and migration files are deliberately not
-destroyed by the source change.
+The 2026-08-27 API cleanup removed unreachable hosted HTTP contracts while
+preserving identity, device-sync, daily-community, and then-current whole-account
+deletion. The [2026-08-30 decision](../decisions/2026-08-30-self-service-deletion-retirement.md)
+subsequently retires self-service deletion in source and retains private owner
+erasure and deletion-safe restore. Neither retirement destroys historical D1
+rows, migrations, or tombstones, changes retention, or proves deployment.
 
 This runbook is the separate production-data gate for any later physical schema
 cleanup. It is read-only until every invariant below is satisfied. A source
@@ -31,14 +33,24 @@ operations and must have separate receipts.
 - `GET /api/v1/stats/aggregate`
 - `GET /api/v1/community/insights`
 - the session-upload authorization branch of `POST /api/v1/contributions`
+- `DELETE /api/v1/me` (2026-08-30 source retirement; `404 NOT_FOUND` without
+  D1 access or participant mutation)
 
-The following contracts remain live and are not part of this retirement:
+The following source contracts remain supported; verify deployment separately:
 
-- `DELETE /api/v1/me`
+- private owner erasure through explicit `participantErasure` on
+  `POST /api/v1/admin/action` with `action: "run_maintenance"`
 - `POST /api/v1/device/upload-authorizations`
 - device-authorized `POST /api/v1/contributions`
 - `GET /api/v1/community/daily`
 - current identity, session, device-pairing, and device-sync routes
+
+For owner authorization, exact confirmation, audit, retry, and pre-cutover
+active/deleting/tombstone counts, use the existing
+[production operations procedure](./production-operations.md#private-owner-participant-erasure).
+Public deletion-route retirement does not authorize removal of that pipeline
+or its restore ledger. Ordinary maintenance without `participantErasure` must
+not initiate participant erasure.
 
 ## Gate 0: credentials and change boundary
 
@@ -158,13 +170,18 @@ Capture a content-free receipt containing:
 Only after all gates pass should a new forward migration be authored. Never
 rewrite the historical migrations that created the retained rows. Validate the
 new migration against a copy of production-shaped data, deploy it separately,
-and re-run account deletion, device upload, daily community aggregation, and
-admin-readiness checks.
+and re-run private owner erasure, retired public-deletion refusal,
+deletion-safe restore, device upload, daily community aggregation, and
+admin-readiness checks. This is a future schema-cleanup gate, not a migration
+required by self-service deletion retirement.
 
-## Current 2026-08-27 receipt
+## Historical 2026-08-27 receipt
 
 The repository and installed-bundle caller audit completed. A read-only remote
 D1 inspection was attempted, but the local Wrangler session had no production
 API token in the non-interactive environment. No production query or mutation
 ran. Consequently, runtime contracts can retire, while physical D1 schema and
 historical rows remain preserved pending this runbook.
+
+That receipt records only the 2026-08-27 attempt; the 2026-08-30 documentation
+update does not claim a new production inspection or mutation.

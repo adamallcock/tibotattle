@@ -42,6 +42,9 @@ Scope: all files under `apps/web/`. Apply the repository root guidance first.
   them to accounting DTOs, reports, share cards, diagnostics, or contributions.
 - Preserve restrictive network and content-security assumptions. A local preview
   convenience must not weaken the packaged or public surface.
+- Offer confirmed **Disconnect this Mac**, not self-service hosted deletion.
+  State that disconnect preserves hosted and local history; never present
+  sign-out, local erase, or owner-only erasure as equivalent actions.
 - Run the narrow `apps/web/test/*.test.mjs` files while iterating, then
   `npm run product:ui:test`. Add `npm run product:release-site:test` for public
   install/release surface changes and the relevant local or Worker gate for API

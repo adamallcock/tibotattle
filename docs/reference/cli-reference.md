@@ -86,8 +86,10 @@ installed companion; the shipping boundary is recorded in
 | `sync-contributions-resume` | Resume queue delivery. | Updates the explicit queue file; does not itself grant consent. |
 
 Hosted contribution is optional and consent-gated. Inspect the payload before
-first delivery. A device disconnect and hosted-data deletion are separate
-operations; neither should be inferred from a local queue command.
+first delivery. Device disconnect preserves hosted/local history; private owner
+erasure is separate and has no self-service contribution CLI command. Neither
+operation should be inferred from a local queue command. See the
+[owner procedure](../runbooks/production-operations.md#private-owner-participant-erasure).
 
 ## Collector lifecycle
 

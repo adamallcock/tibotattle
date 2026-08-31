@@ -99,17 +99,13 @@ import {
   jsonResponse,
 } from "./errors";
 import {
-  assertDeletionOwner,
   contributionCount,
   contributionForResponse,
   enroll,
   envelopeDigest,
   existingContribution,
-  finishParticipantDeletion,
   insertContribution,
   listContributions,
-  markParticipantDeleting,
-  participantIdentityLinkKeyForDeletion,
   participantIdentityLinkState,
   reattachParticipantByLinkKey,
   revokeSession,
@@ -155,11 +151,9 @@ import {
   purgeExpiredDeletionTombstones,
   purgeExpiredIdentityReenrollmentCooldowns,
   purgeExpiredPrimaryIdentityReenrollmentCooldowns,
-  recordIdentityReenrollmentCooldownFromDigest,
-  recordDeletionTombstone,
-  recordPrimaryIdentityReenrollmentCooldown,
   runBackendLifecycle,
 } from "./retention";
+import { eraseParticipantAsOwner, parseParticipantErasureRequest } from "./participant-erasure";
 import {
   assertSignInStartAdmission,
   assertSignInStartAdmissionConfiguration,
@@ -190,7 +184,6 @@ import {
   telemetryContributionCount,
   telemetryContributionPage,
   telemetryContributionMetadata,
-  telemetryContributionR2KeyPage,
   telemetryEnvelopeDigest,
   telemetryPlaintextDigest,
 } from "./telemetry-repository";
@@ -248,7 +241,6 @@ import {
   telemetryV1ChunkAdmissionError,
   telemetryV1ChunkCount,
   telemetryV1ChunkId,
-  telemetryV1ChunkR2KeyPage,
   telemetryV1DeviceConsentCurrent,
   telemetryV1DeviceForUploadAuthorization,
   telemetryV1SyncManifest,
@@ -2617,123 +2609,6 @@ async function handleExport(request: Request, env: Env): Promise<Response> {
   return new Response(stream, { status: 200, headers });
 }
 
-async function handleDelete(request: Request, env: Env): Promise<Response> {
-  if (request.method !== "DELETE") methodNotAllowed(["DELETE"]);
-  const session = await personalSession(request, env, true, true);
-  assertCsrf(request, session);
-  if (identityRequired(env)) {
-    await assertPinnedIdentityLinkSecretConfiguration(
-      env.USAGE_MONITOR_DB,
-      Reflect.get(env, "IDENTITY_LINK_SECRET"),
-      Reflect.get(env, "IDENTITY_LINK_SECRET_VERSION"),
-    );
-  }
-  if (session.participantState === "active") {
-    await markParticipantDeleting(
-      env.USAGE_MONITOR_DB,
-      session.participantId,
-      session.sessionId,
-    );
-  }
-  await assertDeletionOwner(
-    env.USAGE_MONITOR_DB,
-    session.participantId,
-    session.sessionId,
-  );
-  await recordDeletionTombstone(
-    env.DELETION_LEDGER,
-    session.participantId,
-  );
-  const identityLinkKey = await participantIdentityLinkKeyForDeletion(
-    env.USAGE_MONITOR_DB,
-    session.participantId,
-    session.sessionId,
-  );
-  if (identityLinkKey !== null) {
-    const rawIdentityLinkSecret = Reflect.get(env, "IDENTITY_LINK_SECRET");
-    if (typeof rawIdentityLinkSecret !== "string"
-        || rawIdentityLinkSecret.length < 32) {
-      if (identityRequired(env)) {
-        throw new ApiError(503, "IDENTITY_CONFIGURATION_INVALID");
-      }
-    } else {
-      const cooldownDigest = await identityReenrollmentCooldownDigest(
-        rawIdentityLinkSecret,
-        identityLinkKey,
-      );
-      // Persist the primary marker before dropping the old unique link key.
-      // The external ledger remains the independent restoration safeguard;
-      // this primary marker is what makes fresh INSERT admission atomic.
-      await recordPrimaryIdentityReenrollmentCooldown(
-        env.USAGE_MONITOR_DB,
-        cooldownDigest,
-      );
-      await recordIdentityReenrollmentCooldownFromDigest(
-        env.DELETION_LEDGER,
-        cooldownDigest,
-      );
-    }
-  }
-  const contributions = await listContributions(env.USAGE_MONITOR_DB, session.participantId);
-  if (contributions.length > MAX_SYNTHETIC_CONTRIBUTIONS_PER_PARTICIPANT) {
-    throw new ApiError(500, "INTERNAL_ERROR");
-  }
-  const telemetryTotal = await telemetryContributionCount(
-    env.USAGE_MONITOR_DB,
-    session.participantId,
-  );
-  const telemetryV1Total = await telemetryV1ChunkCount(
-    env.USAGE_MONITOR_DB,
-    session.participantId,
-  );
-  const syntheticR2Keys = contributions.map((row) => row.r2_key);
-  if (syntheticR2Keys.length > 0) {
-    await env.QUARANTINE.delete(syntheticR2Keys);
-  }
-  let cursor: { createdAt: string; contributionId: string } | null = null;
-  do {
-    const page = await telemetryContributionR2KeyPage(
-      env.USAGE_MONITOR_DB,
-      session.participantId,
-      cursor,
-    );
-    if (page.rows.length > 0) {
-      await env.QUARANTINE.delete(page.rows.map((row) => row.r2Key));
-    }
-    cursor = page.nextCursor;
-  } while (cursor);
-  let chunkCursor: { createdAt: string; chunkRowId: string } | null = null;
-  do {
-    const page = await telemetryV1ChunkR2KeyPage(
-      env.USAGE_MONITOR_DB,
-      session.participantId,
-      chunkCursor,
-    );
-    if (page.rows.length > 0) {
-      await env.QUARANTINE.delete(page.rows.map((row) => row.r2Key));
-    }
-    chunkCursor = page.nextCursor;
-  } while (chunkCursor);
-  const currentTelemetryTotal = await telemetryContributionCount(
-    env.USAGE_MONITOR_DB,
-    session.participantId,
-  );
-  const currentTelemetryV1Total = await telemetryV1ChunkCount(
-    env.USAGE_MONITOR_DB,
-    session.participantId,
-  );
-  if (currentTelemetryTotal !== telemetryTotal
-      || currentTelemetryV1Total !== telemetryV1Total) {
-    throw new ApiError(409, "UPLOAD_IN_PROGRESS");
-  }
-  await finishParticipantDeletion(env.USAGE_MONITOR_DB, session.participantId);
-  return jsonResponse({
-    deleted: true,
-    participantId: session.participantId,
-    contributionsDeleted: contributions.length + telemetryTotal
-      + telemetryV1Total,
-  }, 200, { "set-cookie": clearedSessionCookie(), vary: "Cookie" });
-}
 
 const ADMIN_ACTIONS = new Set<AdminAction>([
   "set_collection_controls",
@@ -2895,6 +2770,15 @@ async function handleAdminAction(
     throw new ApiError(400, "BODY_INVALID");
   }
   if (action === "run_maintenance") {
+    if (Object.hasOwn(body.value, "participantErasure")) {
+      const participantId = parseParticipantErasureRequest(body.value);
+      const result = await eraseParticipantAsOwner(env, identityKey, participantId);
+      return jsonResponse(
+        { schemaVersion: "admin-action-v0.1", action, result },
+        200,
+        { "cache-control": "no-store", vary: "Cookie" },
+      );
+    }
     if (Object.keys(body.value).length !== 1) throw new ApiError(400, "BODY_INVALID");
     const operationId = await beginAdminOperation(
       env.USAGE_MONITOR_DB,
@@ -3343,8 +3227,6 @@ async function routeApi(
       return handleExport(request, env);
     case "community_daily":
       return handleCommunityDaily(request, env);
-    case "participant":
-      return handleDelete(request, env);
   }
   return unreachableApiRoute(routeId);
 }
@@ -3511,7 +3393,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           idempotentDeduplication: true,
           communityDaily: collectionControls.publication,
           participantExport: true,
-          participantDeletion: true,
+          participantDeletion: false,
           boundedQuarantineRetention: true,
           deletionSafeRestoreReplay: true,
           ongoingDeviceUploadRegistration:

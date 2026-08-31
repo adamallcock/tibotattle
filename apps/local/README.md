@@ -46,8 +46,8 @@ USAGE_MONITOR_PORT=8791 \
 `USAGE_MONITOR_CENTRAL_ORIGIN` is fixed at startup. It must be either explicit
 development loopback (`http://127.0.0.1:<port>`) or a non-loopback HTTPS
 origin. The credential-free relay permits only `GET /api/health`. The separate
-participant allowlist contains nine current browser operations: enrollment;
-Google and Apple sign-in start/result; session; logout; hosted deletion; and
+participant allowlist contains eight current browser operations: enrollment;
+Google and Apple sign-in start/result; session; logout; and
 device-pairing creation. Collector device sync and upload use their own fixed
 hosted client rather than widening the browser relay. Neither relay can proxy
 an arbitrary host, path, query, content type, cookie, CSRF value,
@@ -57,8 +57,16 @@ The participant relay is intentionally narrow rather than a generic reverse
 proxy. It validates bounded JSON request and response bodies, forwards only the
 fixed TiboTattle session cookie and route-appropriate CSRF value, rejects
 incoming `Authorization`, and rejects unexpected upstream cookies. This lets
-the local dashboard complete its current identity/deletion journey from one
+the local dashboard complete its current identity/pairing journey from one
 origin without exposing raw logs or granting arbitrary network access.
+
+Retired self-service `DELETE /api/v1/me` and private owner erasure are not
+participant-relay permissions. Confirmed **Disconnect this Mac** uses
+`POST /api/local/contribution/device-disconnect` and the collector's fixed
+hosted device client; it does not widen the relay or delete hosted/local
+history. This describes the
+[2026-08-30 source contract](../../docs/decisions/2026-08-30-self-service-deletion-retirement.md),
+not a verified installed release or hosted deployment.
 
 ## Native macOS developer app
 
@@ -292,10 +300,24 @@ accepted queue rows, removes at most sixteen eligible sets per pass, and never
 removes retryable, in-flight, or rejected work.
 
 The ordinary browser journey has no recovery-code, account-reset,
-personal-export, or multi-device-management flow. A quiet
-**Hosted privacy controls** disclosure retains complete hosted deletion.
+personal-export, multi-device-management, or self-service hosted-deletion flow.
+**Disconnect this Mac** asks for confirmation, revokes this device's hosted
+authority, clears its local credential/binding, and pauses delivery. Previously
+hosted history, other devices, and local analysis remain. Browser sign-out is
+not device disconnect; private hosted erasure is an owner operation.
 Native troubleshooting-only local erase and targeted Keychain reset remain
 under **Data & Diagnostics…** and are not contribution steps.
+
+The incremental controller persists `paused: true`,
+`pausedReason: "device_disconnected"`, and `nextAttemptAt: null` before remote
+revocation or local credential cleanup. This is explicit user intent, not the
+transient `device_unavailable` repair state: restarting the app or reaching the
+next scheduled run must not resume delivery. Only explicit approval or resume
+can rearm it. Disconnect cancels scheduled work and aborts in-flight attempts
+without rewriting consent, measured progress, or prior outcomes. If pause
+persistence fails, the operation fails before revocation/cleanup and preserves
+the credential/binding for retry; a later revocation or cleanup failure leaves
+delivery paused.
 
 ## Local API
 
@@ -374,13 +396,23 @@ npm run product:macos:test
 Run the disposable Worker/D1/R2 acceptance laboratory separately with:
 
 ```bash
-# Run once on a clean checkout.
-npm run product:keys:local
-
 npm run product:backend:acceptance
 ```
+
+The lab creates dedicated synthetic owner fixtures and isolated envelope keys,
+and supplies its smoke child with `--owner-access-file` automatically. It does
+not require `.dev.vars` or make ordinary participants admins. Direct smoke/load
+commands have a separate required owner-file preflight; see the
+[local HTTP procedure](../../docs/runbooks/production-operations.md#disposable-local-http-acceptance).
 
 Use `npm run product:backend:lab` instead when you want the verified state and
 portal to remain available for inspection. That command now starts this local
 companion on `http://127.0.0.1:8791/` and the backend Worker on
 `http://127.0.0.1:8792/` together. Open 8791; 8792 is backend-only.
+The companion still defaults to the real Codex home and production credential
+backend: isolated Worker storage does not isolate local sources or Keychain.
+For backend-only inspection use `npm run product:backend:only`. A no-real-account
+browser fixture must separately isolate sources, state, credentials, refresh,
+and outbound requests. The standard lab is invite-only and the browser does
+not collect invitation codes. Use an already established session for inspection
+or a separately configured local-open fixture for fresh browser enrollment.

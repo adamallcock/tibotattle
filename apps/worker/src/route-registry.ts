@@ -216,12 +216,6 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
     methods: ["GET"],
     authority: "public",
   },
-  {
-    pathname: "/api/v1/me",
-    id: "participant",
-    methods: ["DELETE"],
-    authority: "session",
-  },
 ] as const satisfies readonly WorkerRouteDefinition[];
 
 type ExactWorkerRouteDefinition =

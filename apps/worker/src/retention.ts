@@ -427,13 +427,21 @@ async function suppressRestoredParticipant(
   participantId: string,
   rawIdentityLinkSecret?: unknown,
   allowMissingIdentityLinkSecret = false,
-): Promise<void> {
-  await db.prepare(
+): Promise<boolean> {
+  // NULL is the restore-replay fence. Never take over a non-NULL participant
+  // erasure fence: its tombstone is written before cleanup finishes, so a
+  // tombstone alone does not make an in-flight owner erasure a restored row.
+  // Retrying a failed restore (already deleting with NULL) remains supported.
+  const claimed = await db.prepare(
     `UPDATE participants
         SET state = 'deleting',
             deletion_session_id = NULL
-      WHERE id = ? AND state = 'active'`,
-  ).bind(participantId).run();
+      WHERE id = ?
+        AND (state = 'active'
+          OR (state = 'deleting' AND deletion_session_id IS NULL))
+      RETURNING id`,
+  ).bind(participantId).first<{ id: string }>();
+  if (claimed === null) return false;
   const keys = await participantQuarantineKeys(db, participantId);
   if (keys.length > 0) await quarantine.delete(keys);
   // v1.0 chunk journals can far exceed the bounded v0.1 key scan above, so
@@ -472,7 +480,8 @@ async function suppressRestoredParticipant(
       await recordIdentityReenrollmentCooldownFromDigest(ledger, cooldownDigest);
     }
   }
-  await finishParticipantDeletion(db, participantId);
+  await finishParticipantDeletion(db, participantId, null);
+  return true;
 }
 
 export async function replayDeletionTombstones(
@@ -516,7 +525,7 @@ export async function replayDeletionTombstones(
       if (suppressed >= MAX_RESTORE_SUPPRESSIONS_PER_PASS) {
         return { suppressed, complete: false };
       }
-      await suppressRestoredParticipant(
+      const removed = await suppressRestoredParticipant(
         db,
         ledger,
         quarantine,
@@ -524,7 +533,7 @@ export async function replayDeletionTombstones(
         rawIdentityLinkSecret,
         allowMissingIdentityLinkSecret,
       );
-      suppressed += 1;
+      if (removed) suppressed += 1;
     }
     if (page.results.length < SCAN_PAGE_SIZE) {
       return { suppressed, complete: true };

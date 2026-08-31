@@ -19,6 +19,10 @@ export const LOCAL_COMPANION_STATIC_FILES = Object.freeze({
     file: "data-client.js",
     type: "text/javascript; charset=utf-8",
   }),
+  "/i18n.generated.js": Object.freeze({
+    file: "i18n.generated.js",
+    type: "text/javascript; charset=utf-8",
+  }),
   "/install-cta.js": Object.freeze({
     file: "install-cta.js",
     type: "text/javascript; charset=utf-8",

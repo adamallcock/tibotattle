@@ -20,6 +20,13 @@ SELECT
     WHERE release_state = 'suppressed') AS suppressed_snapshots,
   (SELECT COUNT(*) FROM community_weekly_snapshots
     WHERE release_state = 'withdrawn') AS withdrawn_snapshots,
+  (SELECT COUNT(*) FROM community_weekly_snapshots
+    WHERE release_state = 'withdrawn'
+      AND json_extract(payload_json, '$.releaseStatus') = 'suppressed'
+      AND json_extract(payload_json, '$.reason') = 'privacy_release_policy_not_met'
+      AND json_type(payload_json, '$.cells') = 'array'
+      AND json_array_length(payload_json, '$.cells') = 0)
+    AS withdrawn_suppressed_snapshots,
   (SELECT COUNT(*) FROM web_sessions WHERE state = 'active') AS active_sessions,
   (SELECT COUNT(*) FROM device_credentials WHERE state = 'active') AS active_devices;
 `.trim();
@@ -124,6 +131,10 @@ export function inspectLocalBackendState({
       publishedSnapshots: integer(primary.published_snapshots, "published snapshot"),
       suppressedSnapshots: integer(primary.suppressed_snapshots, "suppressed snapshot"),
       withdrawnSnapshots: integer(primary.withdrawn_snapshots, "withdrawn snapshot"),
+      withdrawnSuppressedSnapshots: integer(
+        primary.withdrawn_suppressed_snapshots,
+        "withdrawn empty suppressed snapshot",
+      ),
       activeSessions: integer(primary.active_sessions, "active session"),
       activeDevices: integer(primary.active_devices, "active device"),
     },

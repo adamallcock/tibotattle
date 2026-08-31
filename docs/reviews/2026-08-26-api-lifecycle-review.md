@@ -3,10 +3,21 @@ title: TiboTattle API lifecycle and redundancy review
 date: 2026-08-26
 last_reviewed: 2026-08-27
 type: review
-status: implemented-in-source
+status: historical-source-snapshot
 ---
 
 # TiboTattle API lifecycle and redundancy review
+
+Snapshot note added 2026-08-30: this review preserves the 2026-08-27 source
+outcome and caller/data-retention evidence for the cleanup merged in PR #78.
+Its retained `DELETE /api/v1/me` and nine-operation relay describe that
+checkpoint, not the current contract. The
+[self-service retirement decision](../decisions/2026-08-30-self-service-deletion-retirement.md)
+supersedes that participant-deletion boundary; the
+[maintained API inventory](../reference/api-surface.md) and
+[production operations](../runbooks/production-operations.md#private-owner-participant-erasure)
+now govern private owner erasure. This note does not rewrite the original
+evidence or establish deployment of either source change.
 
 ## Outcome
 

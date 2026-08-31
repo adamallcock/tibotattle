@@ -36,6 +36,18 @@ and command contracts are indexed in [the documentation index](./README.md).
 The source tree at the reviewed commit is ahead of the live Worker reported
 below. Source merge therefore does not prove public deployment.
 
+### Source-only amendment, 2026-08-30
+
+The [approved self-service deletion retirement](./decisions/2026-08-30-self-service-deletion-retirement.md)
+retires `DELETE /api/v1/me` as `404 NOT_FOUND` without D1 access or participant
+mutation. It replaces the app control with confirmed **Disconnect this Mac**,
+preserving hosted/local history, and retains private owner erasure through
+admin maintenance. The source health contract is `participantDeletion: false`
+with `deletionSafeRestoreReplay: true`. No migration or retention change is
+part of that retirement. This amendment does not refresh or supersede the
+2026-08-27 live-service, installed-artifact, release, or updater observations
+below; deployment and release remain separate unproven gates.
+
 ## Public service
 
 At the observation time, `/api/health` returned `status: ok`, open enrollment,

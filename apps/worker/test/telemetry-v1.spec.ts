@@ -6,6 +6,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { canonicalJson } from "../src/canonical-json";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { handleRequest } from "../src/index";
+import { ownerErase } from "./helpers/owner-erasure";
 import {
   rebuildPendingCommunityDailyAggregates,
 } from "../src/community-daily-aggregates";
@@ -1048,17 +1049,10 @@ describe("telemetry-contribution-v1.0 incremental chunks", () => {
     const quarantine = testBindings().QUARANTINE;
     expect(await quarantine.head(chunkRow!.r2_key)).not.toBeNull();
 
-    const deletion = await api("/api/v1/me", {
-      method: "DELETE",
-      headers: {
-        cookie: participant.cookie,
-        "x-usage-monitor-csrf": participant.csrfToken,
-      },
-    });
+    const deletion = await ownerErase(testBindings(), participant.participantId);
     expect(deletion.status).toBe(200);
     await expect(deletion.json()).resolves.toMatchObject({
-      deleted: true,
-      contributionsDeleted: 1,
+      result: { deleted: true, contributionsDeleted: 1 },
     });
 
     expect(await quarantine.head(chunkRow!.r2_key)).toBeNull();

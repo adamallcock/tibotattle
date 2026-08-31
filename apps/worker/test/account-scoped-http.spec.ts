@@ -4,6 +4,7 @@ import type { D1Migration } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { handleRequest } from "../src/index";
+import { ownerErase } from "./helpers/owner-erasure";
 
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
@@ -428,13 +429,7 @@ describe("account-scoped local HTTP ingestion", () => {
     const exportText = await exported.text();
     expect(exportText).toContain(TRACK_A);
 
-    const deleted = await api("/api/v1/me", {
-      method: "DELETE",
-      headers: {
-        cookie: participant.cookie,
-        "x-usage-monitor-csrf": participant.csrfToken,
-      },
-    });
+    const deleted = await ownerErase(bindings(), participant.participantId);
     expect(deleted.status).toBe(200);
     expect(await bindings().QUARANTINE.head(stored!.r2_key)).toBeNull();
     const remaining = await bindings().USAGE_MONITOR_DB.prepare(

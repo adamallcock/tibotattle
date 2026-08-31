@@ -6,6 +6,8 @@ import {
   createTelemetryEnvelope,
   validateTelemetryContribution,
 } from "../../web/public/lib.js";
+import { assertRetiredDeletionHealth, createLocalOwnerEraser } from "./local-owner-erasure.mjs";
+import { assertHttpSmokeCachePolicy } from "./http-smoke-cache-policy.mjs";
 
 function optionValue(name, fallback = null) {
   const index = process.argv.indexOf(name);
@@ -28,7 +30,8 @@ function optionValues(name) {
 
 function boundedOrigin(value) {
   const origin = new URL(value);
-  if (origin.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(origin.hostname)) {
+  if (origin.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(origin.hostname)
+      || origin.username || origin.password) {
     throw new Error("The backend smoke accepts only a loopback HTTP origin.");
   }
   origin.pathname = "/";
@@ -124,6 +127,7 @@ class ParticipantSession {
     this.device = null;
     this.created = false;
     this.deleted = false;
+    this.participantId = null;
   }
 
   applyCookie(setCookie) {
@@ -154,6 +158,7 @@ if (Boolean(contributionPathValue) === generatedFixture) {
 const contributionPath = contributionPathValue ? resolve(contributionPathValue) : null;
 const invitePaths = optionValues("--invite-file").map((value) => resolve(value));
 const sessions = [];
+let ownerEraser;
 let preserveParticipants = false;
 const COMMUNITY_SNAPSHOT_PARTICIPANTS = 20;
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1000;
@@ -202,15 +207,14 @@ async function request(path, {
   } else if (originValue !== null) {
     headers.Origin = originValue;
   }
-  const response = await fetch(new URL(path, origin), {
+  const url = new URL(path, origin);
+  const response = await fetch(url, {
     method,
     headers,
     body,
     redirect: "error",
   });
-  if (response.headers.get("cache-control") !== "no-store") {
-    throw new Error(`The backend returned an unexpected cache policy for ${method} ${path}.`);
-  }
+  assertHttpSmokeCachePolicy(response, { method, pathname: url.pathname });
   if (session) session.applyCookie(response.headers.get("set-cookie"));
   let value = null;
   const text = await response.text();
@@ -413,10 +417,12 @@ async function enrollParticipant(
     throw new Error("Enrollment did not establish the bounded session contract.");
   }
   session.csrfToken = enrollment.csrfToken;
+  session.participantId = enrollment.participantId;
   session.recoveryCode = enrollment.recoveryCode;
   session.bootstrapPairing = enrollment.pairing;
   session.created = true;
   sessions.push(session);
+  ownerEraser.trackParticipant(session);
 
   const probe = expectStatus(
     await request("/api/v1/session", { session }),
@@ -515,21 +521,20 @@ async function upload(session, serializedEnvelope) {
 
 async function cleanupParticipant(session) {
   if (!session.created || session.deleted) return;
-  if (!session.cookie || !session.csrfToken) return;
   try {
-    const deletion = await request("/api/v1/me", {
-      method: "DELETE",
-      session,
-      csrf: true,
-    });
-    if (deletion.response.ok) session.deleted = true;
+    await ownerEraser.eraseParticipant(session, { retry: true });
   } catch {
     // The fixed warning below contains no participant or authority value.
   }
 }
 
 try {
+  ownerEraser = await createLocalOwnerEraser({
+    origin: origin.origin,
+    ownerAccessFile: optionValue("--owner-access-file"),
+  });
   const health = expectStatus(await request("/api/health"), 200, "Health");
+  assertRetiredDeletionHealth(health);
   if (!["local_open", "invite_only"].includes(health?.enrollmentMode)) {
     throw new Error("Enrollment is disabled or the service returned an invalid enrollment mode.");
   }
@@ -821,6 +826,8 @@ try {
     throw new Error("The participant export was incomplete or exposed private authority.");
   }
 
+  for (const session of sessions) await ownerEraser.verifyParticipantRefusal(session);
+
   if (retainInspectionState) {
     await writeParticipantAccessFile(participantAccessFile, primary);
     preserveParticipants = true;
@@ -841,6 +848,9 @@ try {
       canonicalServerRepricing: true,
       communityDailyVerified: true,
       participantExportVerified: true,
+      selfServiceDeletionRefused: true,
+      participantStateUnchangedAfterRefusal: true,
+      ownerAuthAndCsrfRequired: true,
       generatedContentFreeFixture: generatedFixture,
       authorityIsolation: true,
       devicePairingAndUpload: true,
@@ -894,19 +904,11 @@ try {
   );
 
   for (const session of sessions) {
-    const deletion = expectStatus(
-      await request("/api/v1/me", {
-        method: "DELETE",
-        session,
-        csrf: true,
-      }),
-      200,
-      "Participant deletion",
-    );
-    if (deletion.deleted !== true || deletion.contributionsDeleted !== 1) {
-      throw new Error("Participant deletion did not remove the expected contribution.");
-    }
-    session.deleted = true;
+    await ownerEraser.eraseParticipant(session, { expectedContributions: 1 });
+  }
+  const retriedErasure = await ownerEraser.eraseParticipant(primary, { retry: true });
+  if (!retriedErasure.alreadyDeleted || retriedErasure.contributionsDeleted !== null) {
+    throw new Error("Owner erasure retry did not preserve the ledger-proven unknown count.");
   }
 
   process.stdout.write(`${JSON.stringify({
@@ -925,12 +927,17 @@ try {
     serverValidation: true,
     canonicalServerRepricing: true,
     communityDailyVerified: true,
+    participantExportVerified: true,
+    selfServiceDeletionRefused: true,
+    participantStateUnchangedAfterRefusal: true,
+    ownerAuthAndCsrfRequired: true,
+    ownerErasureRetryVerified: true,
     generatedContentFreeFixture: generatedFixture,
     authorityIsolation: true,
     devicePairingAndUpload: true,
     deviceRevocation: true,
     securityResetRevokedUpload: true,
-    participantsDeleted: COMMUNITY_SNAPSHOT_PARTICIPANTS,
+    participantsErasedByOwner: sessions.filter((session) => session.deleted).length,
   }, null, 2)}\n`);
   }
 } finally {
@@ -940,5 +947,6 @@ try {
   if (!preserveParticipants
       && sessions.some((session) => session.created && !session.deleted)) {
     process.stderr.write("Backend smoke cleanup was incomplete; inspect the isolated local D1/R2 state before reuse.\n");
+    process.exitCode = 1;
   }
 }

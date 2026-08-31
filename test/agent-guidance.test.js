@@ -183,3 +183,32 @@ test("agent guidance requires current documentation and removal of obsolete guid
   );
   assert.match(documentationGuidance, /npm run docs:check/u);
 });
+
+test("agent guidance preserves owner erasure and restore after self-service retirement", async () => {
+  const [root, worker, local, web, docs] = await Promise.all([
+    readRepositoryFile("AGENTS.md"),
+    readRepositoryFile("apps/worker/AGENTS.md"),
+    readRepositoryFile("apps/local/AGENTS.md"),
+    readRepositoryFile("apps/web/AGENTS.md"),
+    readRepositoryFile("docs/AGENTS.md"),
+  ]);
+  assert.match(root, /hosted erasure is owner-only/u);
+  for (const marker of [
+    "404 NOT_FOUND",
+    "participantDeletion: false",
+    "deletionSafeRestoreReplay: true",
+    "POST /api/v1/admin/action",
+    "run_maintenance",
+    "participantErasure",
+    "Access-owner and CSRF",
+    "digest-only",
+  ]) {
+    assert.ok(worker.includes(marker), `Worker guidance retains ${marker}`);
+  }
+  assert.match(local, /Do not relay retired participant deletion or private owner-erasure requests/u);
+  assert.match(local, /`device_disconnected` before revocation or\s+credential cleanup/u);
+  assert.match(local, /pause across restart/u);
+  assert.match(worker, /`--owner-access-file` before enrollment or other writes/u);
+  assert.match(web, /confirmed \*\*Disconnect this Mac\*\*/u);
+  assert.match(docs, /does not retire owner erasure, privacy-request\s+handling, retention disclosures, or deletion-safe restore/u);
+});

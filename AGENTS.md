@@ -53,7 +53,7 @@ and updated authoritative documentation.
   enter derived artifacts, fixtures, logs, diagnostics, issues, commits, or
   pull requests.
 - Hosted contribution is optional, off by default, content-free, pseudonymous,
-  consent-gated, reviewable before first upload, and deletable afterward.
+  consent-gated, and reviewable before first upload; hosted erasure is owner-only.
 - Derived data is allowlisted and schema-validated. Unknown upstream fields are
   omitted; unknown, stale, unavailable, or unattributed evidence stays explicit.
   Never convert missing evidence to zero or inferred continuity.

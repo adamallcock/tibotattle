@@ -31,8 +31,18 @@ Two distinct surfaces share this repository:
 - **Hosted contribution service** (`apps/worker`, served at
   [tibotattle.com](https://tibotattle.com)): operated by the maintainer.
   Issues affecting the hosted aggregates, contributor pseudonymity, or the
-  upload/deletion endpoints are in scope. Please do not run disruptive
+  upload, disconnect, private owner-erasure, or deletion-safe restore boundaries
+  are in scope. Please do not run disruptive
   testing (load, enumeration, or exhaustion) against the live service.
+
+Current source retires self-service `DELETE /api/v1/me`: it must return
+`404 NOT_FOUND` without participant mutation. Private participant erasure is
+confined to the existing Access-owner and CSRF-protected admin maintenance
+boundary. Ordinary maintenance must not start erasure without its explicit
+target and confirmation. A bypass of either boundary, raw identifiers in the
+audit, or resurrection after restore is a security issue. This source contract
+does not establish deployment or a new privacy-request reporting channel.
+
 The local refresh reads selected Codex session folders, local Codex
 configuration and lineage state, the installed Codex app-server account/quota
 methods, and owner-only derived state. Undisclosed source access, retention of

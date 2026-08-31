@@ -41,11 +41,12 @@ latest verified external state.
   OAuth handoffs are distinct short-lived capabilities.
 - Account-scoped reads authenticate before revealing whether data exists.
 - Contribution ingestion, device operations, protected session operations, and
-  complete participant deletion remain replay-safe and auditable.
+  private owner participant erasure remain replay-safe and auditable.
 - Public aggregates are delayed, thresholded, rounded, and withheld when
   support, maturity, privacy, or quality evidence is insufficient.
 - Unknown routes and wrong methods fail closed with bounded content-free errors.
-- Admin actions exist only on the reviewed admin host behind Cloudflare Access.
+- Production admin actions exist only on the reviewed admin host behind
+  Cloudflare Access.
 
 The maintained field, storage, retention, and deletion inventory is in the
 [local data and privacy reference](../../docs/reference/local-data-and-privacy.md).
@@ -68,14 +69,27 @@ remote environment or commit `.dev.vars`.
 For the disposable local Worker/D1/R2 laboratory from the repository root:
 
 ```bash
-npm run product:keys:local
 npm run product:backend:acceptance
 ```
+
+The lab automatically provisions separate synthetic owners for its lifecycle
+and retained-state runs, generates isolated envelope keys, and passes the
+appropriate `--owner-access-file` to each smoke child. It does not require the
+workspace `.dev.vars` or promote ordinary participants. Generated-fixture
+receipts identify separate owner and participant access files; both contain
+secrets and must stay owner-only. Direct network harnesses require a supplied
+owner file; offline load profiling does not. Follow the
+[local HTTP procedure](../../docs/runbooks/production-operations.md#disposable-local-http-acceptance)
+for standalone setup, flags, and the development-only authorization boundary.
 
 Use `npm run product:backend:lab` when you intentionally want the verified
 local state and portals to remain open. It starts the loopback companion at
 `http://127.0.0.1:8791` and the backend-only Worker at
-`http://127.0.0.1:8792`. These local results do not prove staging or production.
+`http://127.0.0.1:8792`. Use `npm run product:backend:only` for backend-only
+inspection. The default companion still uses real local sources and production
+credential seams; it is not a no-real-account browser fixture. See the
+[local companion boundary](../local/README.md#test). These local results do not
+prove staging or production.
 
 ## HTTP surface
 
@@ -116,13 +130,30 @@ credential hash while claiming the pairing. Device authority can synchronize,
 renew or disconnect itself, and mint Upload authority; it cannot read session
 controls, export data, manage other devices, or delete hosted participation.
 
-The current public product series is `GET /api/v1/community/daily`. The
-v1-aware `DELETE /api/v1/me` remains the whole-account privacy deletion path;
-`GET /api/v1/me`, legacy personal statistics, weekly aggregate, recovery,
+The current public product series is `GET /api/v1/community/daily`.
+Self-service `DELETE /api/v1/me` is retired: the unknown API response is
+`404 NOT_FOUND`, without D1 access or participant mutation. `GET /api/v1/me`,
+legacy personal statistics, weekly aggregate, recovery,
 session upload authorization, and granular legacy contribution read/delete
 routes have been retired. Hosted export, security reset, and selected-device
 management remain exact Worker session surfaces but are not granted through
 the loopback participant relay.
+
+Confirmed **Disconnect this Mac** uses the existing device-disconnect path;
+it preserves hosted and local history. Private owner erasure instead uses
+`POST /api/v1/admin/action` with `action: "run_maintenance"` and an explicit
+`participantErasure` object containing the exact `participant:<UUID>` target
+and `confirmation: "erase_hosted_participant"`. Cloudflare Access owner-pinning
+and admin CSRF remain required. Omitting that object means ordinary maintenance
+only; there is no new route or action enum. Follow the
+[owner procedure](../../docs/runbooks/production-operations.md#private-owner-participant-erasure)
+for response, audit, retry, and safe-pipeline requirements.
+
+Health advertises `participantDeletion: false` separately from
+`deletionSafeRestoreReplay: true`. Retirement does not change retention,
+migrations, or existing tombstones. This is the
+[2026-08-30 source contract](../../docs/decisions/2026-08-30-self-service-deletion-retirement.md),
+not evidence of deployment or a newly released app.
 
 Contributions are encrypted with a fresh AES-GCM key and the data key is
 wrapped with the published RSA-OAEP-256 key. Only the opaque envelope is held
@@ -174,6 +205,7 @@ target:
 - staging or production deployment;
 - remote D1 migrations or any remote D1 write;
 - R2 object publication, deletion, or reconciliation;
+- private participant erasure through the owner maintenance boundary;
 - OAuth/Access/key/secret changes;
 - enrollment grants, collection controls, or incident containment;
 - live smoke/load tests; and

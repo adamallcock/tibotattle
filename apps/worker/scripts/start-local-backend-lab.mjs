@@ -1,7 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
-  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -16,7 +15,10 @@ import {
   checkLocalWorkspacePackages,
 } from "./check-local-workspace-packages.mjs";
 import { inspectLocalBackendState } from "./inspect-local-backend-state.mjs";
+import { createLocalOwnerFixture } from "./local-owner-fixture.mjs";
+import { assertRetiredDeletionHealth, createLocalOwnerEraser } from "./local-owner-erasure.mjs";
 import {
+  assertOwnerErasureLifecycle,
   backendSmokeSourceArguments,
   localCompanionEnvironment,
   parseLocalBackendLabArguments,
@@ -67,17 +69,6 @@ function createLabDirectory(value) {
   return path;
 }
 
-function assertLocalSecrets() {
-  const path = resolve(workerDirectory, ".dev.vars");
-  const metadata = lstatSync(path);
-  if (!metadata.isFile() || metadata.isSymbolicLink()) {
-    throw new Error("apps/worker/.dev.vars must be a real owner-only file");
-  }
-  if (process.platform !== "win32" && (metadata.mode & 0o077) !== 0) {
-    throw new Error("apps/worker/.dev.vars must be owner-only");
-  }
-}
-
 function run(command, args, label, { capture = false } = {}) {
   const result = spawnSync(command, args, {
     cwd: workerDirectory,
@@ -96,10 +87,16 @@ function run(command, args, label, { capture = false } = {}) {
   return result.stdout ?? "";
 }
 
-function startWorker(port, stateDirectory, { visible = false } = {}) {
+function startWorker(port, stateDirectory, ownerFixture, { visible = false } = {}) {
   const child = spawn(wrangler, [
     "dev",
     "--local",
+    "--env",
+    "",
+    "--config",
+    ownerFixture.configFile,
+    "--env-file",
+    ownerFixture.varsFile,
     "--ip",
     "127.0.0.1",
     "--port",
@@ -156,6 +153,7 @@ async function waitForHealth(origin, child) {
           && body?.checks?.deletionLedger === "ok"
           && body?.checks?.encryptedObjectStore === "reachable"
           && body?.enrollmentMode === "invite_only") {
+        assertRetiredDeletionHealth(body);
         return body;
       }
     } catch {
@@ -281,24 +279,6 @@ function prepareState(stateDirectory, invitationDirectory) {
   return invitationFiles;
 }
 
-function assertDeletedLifecycle(storage, r2ObjectCount) {
-  const database = storage.database;
-  if (database.activeParticipants !== 0
-      || database.deletingParticipants !== 0
-      || database.acceptedContributions !== 0
-      || database.canonicalRecords !== 0
-      || database.contributionOccurrences !== 0
-      || database.retainedQuarantineReferences !== 0
-      || database.activeSessions !== 0
-      || database.activeDevices !== 0
-      || database.suppressedSnapshots < 1
-      || database.withdrawnSnapshots < 1
-      || storage.deletionLedger.tombstones !== 20
-      || r2ObjectCount !== 0) {
-    throw new Error("The destructive lifecycle left unexpected D1 or R2 state");
-  }
-}
-
 async function probePersistedParticipant(origin, participantAccessFile) {
   const access = JSON.parse(readFileSync(participantAccessFile, "utf8"));
   if (access?.origin !== origin
@@ -353,7 +333,6 @@ const lifecycleInvitationDirectory = join(
 );
 const participantAccessFile = join(labDirectory, "participant-access.json");
 const receiptFile = join(labDirectory, "lab-receipt.json");
-assertLocalSecrets();
 mkdirSync(companionStateDirectory, { mode: 0o700 });
 const lifecycleInvitationFiles = prepareState(
   lifecycleStateDirectory,
@@ -362,10 +341,22 @@ const lifecycleInvitationFiles = prepareState(
 const invitationFiles = prepareState(stateDirectory, invitationDirectory);
 
 const origin = `http://127.0.0.1:${port}`;
+const lifecycleOwnerFixture = createLocalOwnerFixture({
+  origin,
+  persistTo: lifecycleStateDirectory,
+  directory: join(labDirectory, "lifecycle-owner-fixture"),
+  workerDirectory,
+});
+const ownerFixture = createLocalOwnerFixture({
+  origin,
+  persistTo: stateDirectory,
+  directory: join(labDirectory, "owner-fixture"),
+  workerDirectory,
+});
 const companionOrigin = options.startCompanion
   ? `http://127.0.0.1:${companionPort}`
   : null;
-let worker = startWorker(port, lifecycleStateDirectory);
+let worker = startWorker(port, lifecycleStateDirectory, lifecycleOwnerFixture);
 let companion = null;
 let stopping = false;
 
@@ -400,24 +391,36 @@ try {
     resolve(workerDirectory, "scripts", "smoke-http-backend.mjs"),
     "--origin",
     origin,
+    "--owner-access-file",
+    lifecycleOwnerFixture.accessFile,
     ...smokeSourceArguments,
     ...lifecycleInvitationFiles.flatMap((path) => ["--invite-file", path]),
-  ], "Destructive lifecycle HTTP acceptance", { capture: true });
+  ], "Owner-erasure lifecycle HTTP acceptance", { capture: true });
   const lifecycleSmoke = JSON.parse(lifecycleSmokeOutput);
+  if (lifecycleSmoke.participantsErasedByOwner !== lifecycleSmoke.participants
+      || lifecycleSmoke.selfServiceDeletionRefused !== true
+      || lifecycleSmoke.participantStateUnchangedAfterRefusal !== true
+      || lifecycleSmoke.ownerAuthAndCsrfRequired !== true) {
+    throw new Error("The owner-erasure HTTP smoke did not prove every acceptance boundary.");
+  }
+  const lifecycleOwner = await createLocalOwnerEraser({ origin, ownerAccessFile: lifecycleOwnerFixture.accessFile });
+  await lifecycleOwner.eraseOwnerFixture();
   const lifecycleR2ObjectCount = await inspectLocalR2ObjectCount(origin);
   await stopWorker(worker);
   const lifecycleStorage = inspectLocalBackendState({
     persistTo: lifecycleStateDirectory,
     workerDirectory,
   });
-  assertDeletedLifecycle(lifecycleStorage, lifecycleR2ObjectCount);
+  const lifecycleSnapshotPrivacy = assertOwnerErasureLifecycle(lifecycleStorage, lifecycleR2ObjectCount);
 
-  worker = startWorker(port, stateDirectory);
+  worker = startWorker(port, stateDirectory, ownerFixture);
   await waitForHealth(origin, worker);
   const smokeOutput = run(node, [
     resolve(workerDirectory, "scripts", "smoke-http-backend.mjs"),
     "--origin",
     origin,
+    "--owner-access-file",
+    ownerFixture.accessFile,
     ...smokeSourceArguments,
     "--retain-inspection-state",
     "--participant-access-file",
@@ -436,7 +439,7 @@ try {
       "The retained R2 object count did not match canonical retention state",
     );
   }
-  worker = startWorker(port, stateDirectory, { visible: !exitAfterReceipt });
+  worker = startWorker(port, stateDirectory, ownerFixture, { visible: !exitAfterReceipt });
   const health = await waitForHealth(origin, worker);
   const restartedR2ObjectCount = await inspectLocalR2ObjectCount(origin);
   if (restartedR2ObjectCount !== r2ObjectCount) {
@@ -456,7 +459,7 @@ try {
   }
   const receipt = projectLocalBackendLabReceipt({
     receipt: {
-      schemaVersion: "local-backend-lab-receipt-v0.3",
+      schemaVersion: "local-backend-lab-receipt-v0.4",
       status: "ready",
       createdAt: new Date().toISOString(),
       origin,
@@ -489,10 +492,17 @@ try {
         deviceRevocation: smoke.deviceRevocation,
         communityDailyVerified: smoke.communityDailyVerified,
         participantExportVerified: smoke.participantExportVerified,
+        selfServiceDeletionRefused: smoke.selfServiceDeletionRefused,
+        participantStateUnchangedAfterRefusal: smoke.participantStateUnchangedAfterRefusal,
+        ownerAuthAndCsrfRequired: smoke.ownerAuthAndCsrfRequired,
       },
-      destructiveLifecycle: {
-        fullParticipantDeletion:
-          lifecycleSmoke.participantsDeleted === lifecycleSmoke.participants,
+      ownerErasureLifecycle: {
+        workloadParticipantsErasedByOwner: lifecycleSmoke.participantsErasedByOwner,
+        fullOwnerErasure:
+          lifecycleSmoke.participantsErasedByOwner === lifecycleSmoke.participants,
+        ownerFixtureErasedSeparately: true,
+        ownerErasureRetryVerified: lifecycleSmoke.ownerErasureRetryVerified,
+        snapshotPrivacy: lifecycleSnapshotPrivacy,
         d1: lifecycleStorage.database,
         deletionLedger: lifecycleStorage.deletionLedger,
         directLocalR2ObjectCount: lifecycleR2ObjectCount,
@@ -512,11 +522,19 @@ try {
         explorerResponseIncludedObjectKeys: false,
       },
       deletionLedger: storage.deletionLedger,
+      localOwnerFixture: {
+        separateFromWorkloadParticipants: true,
+        retainedForLocalOwnerOperations: true,
+        grantsOrdinaryParticipantsAdminAccess: false,
+        envelopeKeysIsolatedFromWorkspace: true,
+      },
       health: {
         database: health.checks.database,
         deletionLedger: health.checks.deletionLedger,
         encryptedQuarantine: health.checks.encryptedObjectStore,
         enrollmentMode: health.enrollmentMode,
+        participantDeletion: health.capabilities.participantDeletion,
+        deletionSafeRestoreReplay: health.capabilities.deletionSafeRestoreReplay,
       },
       acceptance: {
         safeFileAcceptance: true,
@@ -535,8 +553,10 @@ try {
           && restartedR2ObjectCount === r2ObjectCount,
         communityDailyVerified: smoke.communityDailyVerified,
         participantExportVerified: smoke.participantExportVerified,
-        fullParticipantDeletionVerified:
-          lifecycleSmoke.participantsDeleted === lifecycleSmoke.participants,
+        selfServiceDeletionRefusalVerified: lifecycleSmoke.selfServiceDeletionRefused,
+        participantStateUnchangedAfterRefusal: lifecycleSmoke.participantStateUnchangedAfterRefusal,
+        ownerErasureVerified:
+          lifecycleSmoke.participantsErasedByOwner === lifecycleSmoke.participants,
         persistedRestartVerified:
           persistedRestart.participantSessionRestored
           && persistedRestart.participantExportRestored,
@@ -546,6 +566,7 @@ try {
     locations: {
       stateDirectory: labDirectory,
       participantAccessFile,
+      ownerAccessFile: ownerFixture.accessFile,
       redeemedInvitationDirectory: invitationDirectory,
       redeemedInvitationFilesRetained: invitationFiles.length,
     },
@@ -560,7 +581,7 @@ try {
     : {
         ...receipt,
         receiptFile,
-        note: "The session capability is only in the owner-only participant access file.",
+        note: "Participant and dedicated local owner capabilities are in separate owner-only access files. Do not share them.",
   };
   process.stdout.write(`${JSON.stringify(publicOutput, null, 2)}\n`);
   if (exitAfterReceipt) {

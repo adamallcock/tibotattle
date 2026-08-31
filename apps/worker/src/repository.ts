@@ -1039,7 +1039,28 @@ export async function assertDeletionOwner(
 export async function finishParticipantDeletion(
   db: D1Database,
   participantId: string,
+  deletionFence?: string | null,
 ): Promise<void> {
+  if (deletionFence !== undefined) {
+    const results = await db.batch<{ id: string }>([
+      db.prepare(
+        `DELETE FROM contributions WHERE participant_id = ?
+          AND EXISTS (
+            SELECT 1 FROM participants
+             WHERE id = ? AND state = 'deleting' AND deletion_session_id IS ?
+          )`,
+      ).bind(participantId, participantId, deletionFence),
+      db.prepare(
+        "DELETE FROM participants WHERE id = ? AND state = 'deleting' AND deletion_session_id IS ? RETURNING id",
+      ).bind(participantId, deletionFence),
+    ]);
+    // D1's change count includes cascade/trigger effects. RETURNING identifies
+    // the exact fenced parent row, independently of how many children it had.
+    if (results[1]?.results.length !== 1 || results[1]?.results[0]?.id !== participantId) {
+      throw new ApiError(409, "PARTICIPANT_DELETING");
+    }
+    return;
+  }
   await db.batch([
     db.prepare("DELETE FROM contributions WHERE participant_id = ?").bind(participantId),
     db.prepare("DELETE FROM participants WHERE id = ?").bind(participantId),

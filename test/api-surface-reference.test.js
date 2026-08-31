@@ -216,9 +216,10 @@ function reportRoutePolicy(source) {
   );
 }
 
-test("maintained API reference covers every registered HTTP boundary", async () => {
-  const [markdown, worker, local, central, participant, reports] = await Promise.all([
+test("both maintained API references cover every registered HTTP boundary", async () => {
+  const [markdown, detailedMarkdown, worker, local, central, participant, reports] = await Promise.all([
     repositoryFile("docs/reference/api-surface.md"),
+    repositoryFile("docs/reference/2026-08-26-api-surface-reference.md"),
     repositoryFile("apps/worker/src/route-registry.ts"),
     repositoryFile("apps/local/server.js"),
     repositoryFile("src/local-companion-central-proxy.js"),
@@ -232,34 +233,57 @@ test("maintained API reference covers every registered HTTP boundary", async () 
   const centralPolicy = centralRoutePolicy(central);
   const participantPolicy = participantRelayPolicy(participant);
 
-  assert.equal(workerPolicy.length, 32, "review Worker route-count changes");
+  assert.equal(workerPolicy.length, 31, "review Worker route-count changes");
   assert.equal(localPolicy.length, 24, "review local route-count changes");
   assert.equal(reportPolicy.length, 4, "review fixed report-count changes");
   assert.equal(centralPolicy.length, 1, "review central relay-count changes");
   assert.equal(
     participantPolicy.length,
-    9,
+    8,
     "review participant relay-count changes",
   );
 
-  assert.deepEqual(
-    documentedRoutePolicy(markdown, "Hosted Worker route inventory"),
-    workerPolicy,
+  for (const [name, reference] of [
+    ["entrypoint", markdown],
+    ["detailed", detailedMarkdown],
+  ]) {
+    for (const [heading, policy] of [
+      ["Hosted Worker route inventory", workerPolicy],
+      ["Local route inventory", localPolicy],
+      ["Fixed report pages", reportPolicy],
+      ["Public central relay", centralPolicy],
+      ["Participant relay", participantPolicy],
+    ]) {
+      assert.deepEqual(
+        documentedRoutePolicy(reference, heading),
+        policy,
+        `${name}: ${heading}`,
+      );
+    }
+  }
+
+  const ledger = new Map(headingSection(detailedMarkdown, "Surface ledger")
+    .split("\n")
+    .filter((line) => line.startsWith("|"))
+    .map((line) => line.split("|").map((cell) => cell.trim()))
+    .map((cells) => [cells[1], cells[3]]));
+  const operationCount = (policy) => policy.reduce((count, route) =>
+    count + (route.methods === "all" ? 0 : route.methods.length), 0);
+  const workerApiPolicy = workerPolicy.filter((route) => route.path.startsWith("/api/"));
+  assert.equal(
+    ledger.get("Local companion API"),
+    `${localPolicy.length} paths, ${operationCount(localPolicy)} method/path operations`,
   );
-  assert.deepEqual(
-    documentedRoutePolicy(markdown, "Local route inventory"),
-    localPolicy,
+  assert.equal(
+    ledger.get("Participant relay"),
+    `${participantPolicy.length} paths, ${operationCount(participantPolicy)} method/path operations`,
   );
-  assert.deepEqual(
-    documentedRoutePolicy(markdown, "Fixed report pages"),
-    reportPolicy,
+  assert.ok(
+    detailedMarkdown.includes(`health-only central relay + ${participantPolicy.length} participant relays`),
+    "the trust-boundary diagram must match the participant relay inventory",
   );
-  assert.deepEqual(
-    documentedRoutePolicy(markdown, "Public central relay"),
-    centralPolicy,
-  );
-  assert.deepEqual(
-    documentedRoutePolicy(markdown, "Participant relay"),
-    participantPolicy,
+  assert.equal(
+    ledger.get("Hosted Worker API"),
+    `${workerApiPolicy.length} API paths, ${operationCount(workerApiPolicy)} method/path operations`,
   );
 });

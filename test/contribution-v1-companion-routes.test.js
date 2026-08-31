@@ -110,9 +110,11 @@ function fakeStore() {
 function fakeIncrementalController() {
   const calls = {
     start: 0, stop: 0, approve: 0, resume: 0, inspect: 0, runDue: 0,
+    pauseForDeviceDisconnect: 0,
     approveOptions: null,
   };
   let approved = false;
+  let disconnected = false;
   const projection = () => ({
     schemaVersion: "incremental-contribution-sync-status-v1.0",
     contractVersion: "telemetry-contribution-v1.0",
@@ -123,8 +125,8 @@ function fakeIncrementalController() {
       current: approved,
       consentedAt: approved ? "2026-08-03T00:00:00.000Z" : null,
     },
-    paused: false,
-    pausedReason: null,
+    paused: disconnected,
+    pausedReason: disconnected ? "device_disconnected" : null,
     running: false,
     progress: approved
       ? {
@@ -136,7 +138,7 @@ function fakeIncrementalController() {
       }
       : null,
     lastAttemptAt: null,
-    nextAttemptAt: approved ? "2026-08-03T00:00:00.000Z" : null,
+    nextAttemptAt: approved && !disconnected ? "2026-08-03T00:00:00.000Z" : null,
     lastOutcome: approved
       ? {
         at: "2026-08-03T00:00:00.000Z",
@@ -162,10 +164,17 @@ function fakeIncrementalController() {
       calls.approve += 1;
       calls.approveOptions = options ?? null;
       approved = true;
+      disconnected = false;
       return projection();
     },
     async resume() {
       calls.resume += 1;
+      disconnected = false;
+      return projection();
+    },
+    async pauseForDeviceDisconnect() {
+      calls.pauseForDeviceDisconnect += 1;
+      disconnected = true;
       return projection();
     },
     async runDue() {
@@ -1518,6 +1527,9 @@ test("a consent-version change still prepares the fresh review its ceremony need
     },
     async resume() {
       throw new Error("unexpected resume");
+    },
+    async pauseForDeviceDisconnect() {
+      throw new Error("unexpected disconnect");
     },
     async inspect() {
       return {

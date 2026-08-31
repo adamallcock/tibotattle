@@ -998,12 +998,31 @@ h1 {
   background: transparent;
   box-shadow: none;
 }
-/* The deletion control keeps its distance from the primary action: a quiet
-   row under its own rule, never beside Approve. */
-.incremental-delete-row {
+/* Device disconnect is independent of sign-in and the approval surface. */
+.contribution-device-controls {
   margin-top: var(--space-2);
   padding-top: var(--space-3);
   border-top: 1px solid var(--line);
+}
+.contribution-disconnect-dialog {
+  inline-size: min(36rem, calc(100% - var(--space-7)));
+  max-block-size: calc(100% - var(--space-7));
+  margin: auto;
+  padding: var(--pad-card);
+  overflow: auto;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-md);
+  color: var(--text);
+  background: var(--surface-raised);
+}
+.contribution-disconnect-dialog::backdrop {
+  background: rgba(23, 33, 30, .5);
+}
+.contribution-disconnect-dialog h2 { margin-top: 0; }
+.contribution-disconnect-dialog p { line-height: 1.6; }
+#disconnect-device-status:focus {
+  outline: 3px solid rgba(49, 95, 132, .42);
+  outline-offset: 3px;
 }
 .contribution-cta-buttons {
   display: flex;

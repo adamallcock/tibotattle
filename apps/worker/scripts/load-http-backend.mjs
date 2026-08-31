@@ -19,6 +19,11 @@ import {
   mapConcurrent,
   readOwnerOnlyInvitation,
 } from "./load-profile-lib.mjs";
+import {
+  LocalOwnerErasureError,
+  assertRetiredDeletionHealth,
+  createLocalOwnerEraser,
+} from "./local-owner-erasure.mjs";
 
 const FIXED_FATAL_MESSAGE =
   "The backend load runner stopped at a fixed configuration or receipt boundary\n";
@@ -128,6 +133,7 @@ class LoadFailure extends Error {
 }
 
 class Session {
+  participantId = null;
   cookie = null;
   csrfToken = null;
   deviceAuthorization = null;
@@ -149,12 +155,14 @@ class Session {
 }
 
 const sessions = [];
+let ownerEraser;
 const latencies = {
   enrollment: [],
   registration: [],
   upload: [],
   privateResults: [],
-  deletion: [],
+  selfServiceDeletionRefusal: [],
+  ownerErasure: [],
 };
 const failureCounts = new Map();
 const counters = {
@@ -165,11 +173,13 @@ const counters = {
   acceptedRecords: 0,
   deduplicatedRecords: 0,
   participantResults: 0,
-  participantsDeleted: 0,
+  participantDeletionRefusalsVerified: 0,
+  participantsErasedByOwner: 0,
 };
 
 function recordFailure(error) {
-  const code = error instanceof LoadFailure ? error.code : "UNEXPECTED_CLIENT_FAILURE";
+  const code = error instanceof LoadFailure || error instanceof LocalOwnerErasureError
+    ? error.code : "UNEXPECTED_CLIENT_FAILURE";
   failureCounts.set(code, (failureCounts.get(code) ?? 0) + 1);
 }
 
@@ -337,6 +347,10 @@ async function enroll(inviteCode = null) {
     throw new LoadFailure("ENROLLMENT_CONTRACT_INVALID");
   }
   session.csrfToken = result.csrfToken;
+  session.participantId = result.participantId;
+  sessions.push(session);
+  counters.enrollments += 1;
+  ownerEraser.trackParticipant(session);
   const deviceId = randomUUID();
   const rawSecret = randomBytes(32);
   const encodedSecret = rawSecret.toString("base64url");
@@ -358,8 +372,6 @@ async function enroll(inviteCode = null) {
     expectStatus: 201,
   });
   session.deviceAuthorization = `um_device_${deviceId}.${encodedSecret}`;
-  sessions.push(session);
-  counters.enrollments += 1;
   return session;
 }
 
@@ -416,16 +428,10 @@ async function verifyPrivateResults(session, expectedContributions) {
   counters.participantResults += 1;
 }
 
-async function deleteParticipant(session) {
-  if (session.deleted || !session.cookie || !session.csrfToken) return;
-  const result = await timed("deletion", () => request("/api/v1/me", {
-    method: "DELETE",
-    session,
-    csrf: true,
-  }));
-  if (result?.deleted !== true) throw new LoadFailure("DELETION_CONTRACT_INVALID");
-  session.deleted = true;
-  counters.participantsDeleted += 1;
+async function eraseParticipant(session) {
+  if (session.deleted) return;
+  await timed("ownerErasure", () => ownerEraser.eraseParticipant(session, { retry: true }));
+  counters.participantsErasedByOwner += 1;
 }
 
 async function prepareEnvelopes(publicJwk, keyId, maximumAttempts, baseEpoch) {
@@ -456,6 +462,8 @@ async function runParticipant(session, index, envelopes) {
       );
     }
     await verifyPrivateResults(session, attempts);
+    await timed("selfServiceDeletionRefusal", () => ownerEraser.verifyParticipantRefusal(session));
+    counters.participantDeletionRefusalsVerified += 1;
     return true;
   } catch (error) {
     recordFailure(error);
@@ -502,7 +510,7 @@ async function enrollCohort() {
 async function cleanupParticipants() {
   await mapConcurrent(sessions, profile.concurrency, async (session) => {
     try {
-      await deleteParticipant(session);
+      await eraseParticipant(session);
     } catch (error) {
       recordFailure(error);
     }
@@ -512,7 +520,13 @@ async function cleanupParticipants() {
 const startedAt = new Date().toISOString();
 const started = performance.now();
 try {
+  ownerEraser = await createLocalOwnerEraser({
+    origin: origin.origin,
+    ownerAccessFile: optionValue("--owner-access-file"),
+    requestTimeoutMilliseconds: profile.requestTimeoutMilliseconds,
+  });
   const health = await request("/api/health");
+  assertRetiredDeletionHealth(health);
   const expectedEnrollmentMode = invitePaths.length > 0 ? "invite_only" : "local_open";
   if (health?.enrollmentMode !== expectedEnrollmentMode) {
     throw new LoadFailure("ENROLLMENT_MODE_MISMATCH");
@@ -555,15 +569,17 @@ const elapsedMilliseconds = Number((performance.now() - started).toFixed(3));
 const failed = failureCounts.size > 0
   || counters.enrollments !== profile.participants
   || counters.uploads !== profile.bundleAttempts
-  || counters.participantsDeleted !== counters.enrollments;
+  || counters.participantDeletionRefusalsVerified !== counters.enrollments
+  || counters.participantsErasedByOwner !== counters.enrollments;
 const receipt = {
-  schemaVersion: "backend-load-receipt-v0.1",
+  schemaVersion: "backend-load-receipt-v0.2",
   status: failed ? "failed" : "passed",
   startedAt,
   completedAt: new Date().toISOString(),
   originClass: "loopback_http",
   workload: profile,
   counters,
+  erasureAuthority: "dedicated_local_owner_fixture",
   elapsedMilliseconds,
   throughput: {
     bundleAttemptsPerSecond: elapsedMilliseconds > 0

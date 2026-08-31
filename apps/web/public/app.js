@@ -104,8 +104,7 @@ const tPlural = localization.tPlural;
 const localClient = new LocalCompanionClient();
 let communitySession = null;
 const communityClient = new CommunityClient({
-  getCsrfToken: () => communitySession?.csrfToken ?? null,
-  getParticipantId: () => communitySession?.participantId ?? null
+  getCsrfToken: () => communitySession?.csrfToken ?? null
 });
 
 let dashboard = null;
@@ -279,6 +278,13 @@ let incrementalSyncPollTimer = null;
 let incrementalSyncPollCount = 0;
 let localOnboarding = null;
 let communityConnectBusy = false;
+let contributionDisconnectBusy = false;
+let contributionDisconnectChecking = false;
+let contributionDisconnectAbsent = false;
+let contributionDisconnectCheckGeneration = 0;
+// Only a validated receipt confirms completion. Pending cleanup preserves the
+// earlier remote revocation fact even if a later retry cannot reach the Mac.
+let contributionDisconnectOutcome = null;
 // True once this Mac has actually been paired as an upload-only device in
 // this session.
 let communityDevicePaired = false;
@@ -10484,6 +10490,7 @@ function contributionServiceConfigured() {
  * guess here is exactly what produced "connecting fails anyway -> no send".
  */
 function communityUploadAuthorityEvidence() {
+  if (contributionDeviceDisconnectPaused()) return false;
   return communityDevicePaired
     || finite(contributionSyncStatus?.counts?.accepted, 0) > 0
     || Boolean(contributionSyncStatus?.lastAcceptedAt);
@@ -10498,6 +10505,7 @@ function communityUploadAuthorityEvidence() {
 // journey strip. It also gives the silent authorization repair its chance —
 // the repair is guarded to run at most once per page load.
 function renderContributionActionState() {
+  renderContributionDisconnect();
   renderIncrementalConsent();
   renderCommunityJourney();
   maybeRepairIncrementalAuthorization();
@@ -11680,8 +11688,6 @@ const SERVICE_ERROR_COPY = {
     "The contribution service is not accepting new participants right now. Nothing was uploaded, and local reporting is unaffected.",
   CONTRIBUTION_LIMIT_REACHED:
     "This participant has used its community batch allowance for the current window. Nothing was uploaded; the allowance renews on its fixed schedule.",
-  CONTRIBUTION_DELETE_CONFLICT:
-    "A deletion for this contribution is already in progress. Wait for it to finish, then check the history again.",
   PARTICIPANT_DELETING:
     "A deletion is still running for this participant. Wait for it to finish, then try again. Nothing was uploaded.",
   DEVICE_AUTH_INVALID:
@@ -11744,8 +11750,9 @@ const SERVICE_ERROR_COPY = {
     "The contribution service has no usable upload key configured, so it cannot accept encrypted evidence. Nothing was uploaded; try again later.",
   KEY_ID_INVALID:
     "The upload key this build used is not one the contribution service recognizes. Nothing was uploaded; install the current signed build.",
-  LIFECYCLE_BOUNDS_EXCEEDED:
-    "This account already has its maximum of connected Macs, so this Mac was not connected. Sign out a Mac you no longer use from its own TiboTattle, then connect this one again. Nothing was uploaded.",
+  get LIFECYCLE_BOUNDS_EXCEEDED() {
+    return t("contribution.deviceLimit");
+  },
   LIFECYCLE_STATE_CONFLICT:
     "The contribution service is in a different state than this page expected. Nothing was uploaded; reload TiboTattle and try again.",
   TELEMETRY_REQUIRED:
@@ -11861,10 +11868,12 @@ const LOCAL_COMPANION_ERROR_COPY = {
     "TiboTattle refused to disconnect this Mac because the request did not come from the local dashboard. This Mac is unchanged.",
   contribution_device_disconnect_not_configured:
     "This build has no contribution service configured, so there is no device to disconnect. Local reporting is unaffected.",
-  contribution_device_disconnect_failed:
-    "This Mac could not be disconnected. It may still be able to upload; try again, or reopen TiboTattle first.",
-  contribution_device_disconnect_cleanup_pending:
-    "This Mac stopped uploading, but clearing its local credential has not finished. Reopen TiboTattle and check again.",
+  get contribution_device_disconnect_failed() {
+    return t("contribution.disconnect.failed");
+  },
+  get contribution_device_disconnect_cleanup_pending() {
+    return t("contribution.disconnect.cleanupPending");
+  },
   loopback_required:
     "This request has to come from the local dashboard on this Mac. Nothing was changed. Open TiboTattle and try again.",
   host_not_allowed:
@@ -12118,11 +12127,9 @@ function renderHostedIdentity() {
   if (provider !== null) {
     $("#identity-account-mark").setAttribute("href", provider.mark);
   }
-  setProductText(
+  setLocalizedText(
     $("#identity-account-detail"),
-    provider !== null
-      ? "Signing out ends this app's contribution session."
-      : "This app already has a contribution session. Signing out ends it.",
+    "contribution.signOutDetail",
   );
   // One honest, five-state identity status (owner-reported contradictions,
   // 2026-08-08/10). A single flat "Signed in"/"Not signed in" chip could not
@@ -12138,7 +12145,8 @@ function renderHostedIdentity() {
       || pendingHostedSignInResumeInFlight,
     signedIn,
     hasServerSession,
-    repairPending: incrementalConsentApproved && incrementalUploadAuthorityLost(),
+    repairPending: incrementalConsentApproved && incrementalUploadAuthorityLost()
+      && !contributionDisconnectBlocksRepair(),
   });
   setLocalizedText(chip, IDENTITY_STATE_CHIP_KEYS[identityState]);
   chip.className = identityState === "connected"
@@ -12781,6 +12789,10 @@ function renderCommunityJourney() {
       : "journey.community.noHealthAnswer");
   } else if (!contributionServiceConfigured()) {
     stage("community", "waiting", "journey.community.noService");
+  } else if (contributionDeviceDisconnectPaused()) {
+    stage("community", "waiting", contributionDisconnectOutcome === "cleanup_pending"
+      ? "contribution.disconnect.cleanupPending"
+      : "contribution.disconnect.paused");
   } else if (!incrementalSyncCapabilityAdvertised()) {
     // Here the index IS the blocker and the line may say so: the companion
     // answered, reports a contribution service, and derives this flag from
@@ -12910,13 +12922,15 @@ function renderIncrementalConsent() {
   const gate = $("#incremental-consent-gate");
   const chip = $("#incremental-consent-state");
   const reviewVerified = contributionSyncExactReview?.state === "ready";
-  const busy = incrementalConsentBusy || communityConnectBusy;
+  const busy = incrementalConsentBusy || communityConnectBusy
+    || contributionDisconnectBusy || contributionDisconnectDialogOpen();
   // A recorded approval whose upload authority is lost — a claim that
   // carried the v0.1 consent, or a missing device credential — re-opens the
   // same single action (the transparent re-pair). The chip stays "Approved":
   // the user's approval stands; only the transport authorization re-runs.
+  const disconnected = contributionDeviceDisconnectPaused();
   const repairNeeded = incrementalConsentApproved
-    && incrementalUploadAuthorityLost();
+    && (incrementalUploadAuthorityLost() || disconnected);
   setLocalizedText(chip, incrementalConsentApproved
     ? "consent.stateApproved"
     : "consent.stateNotApproved");
@@ -12924,14 +12938,10 @@ function renderIncrementalConsent() {
     ? "evidence-chip"
     : "evidence-chip neutral";
   approve.disabled = busy
+    || contributionDisconnectOutcome === "cleanup_pending"
     || (incrementalConsentApproved && !repairNeeded)
     || (!incrementalConsentApproved && !reviewVerified)
     || hostedSignInRequired();
-  const remove = $("#delete-contributions");
-  if (remove) {
-    remove.hidden = !hasCommunitySession();
-    remove.disabled = busy;
-  }
   // Keychain guidance is shown only where a dialog can be raised: at the
   // connect step for an unbrokered companion, at the migrating credential's
   // next protected read for a brokered one, and nowhere for a fresh brokered
@@ -12965,7 +12975,14 @@ function renderIncrementalConsent() {
       );
     }
   }
-  if (incrementalConsentApproved && !(repairNeeded && hostedSignInRequired())) {
+  if (disconnected) {
+    gate.hidden = false;
+    setLocalizedText(gate, contributionDisconnectOutcome === "cleanup_pending"
+      ? "contribution.disconnect.reviewCleanup"
+      : hostedSignInRequired()
+        ? "contribution.disconnect.signInToReconnect"
+        : "contribution.disconnect.paused");
+  } else if (incrementalConsentApproved && !(repairNeeded && hostedSignInRequired())) {
     forgetLocalizedNode(gate);
     gate.textContent = "";
     gate.hidden = true;
@@ -13004,6 +13021,7 @@ function renderIncrementalSyncStatusLine() {
   const line = $("#incremental-sync-status");
   if (!line) return;
   if (!incrementalSyncCapabilityAdvertised()
+      || contributionDeviceDisconnectPaused()
       || !incrementalConsentApproved
       || incrementalSyncStatus?.status !== "available") {
     forgetLocalizedNode(line);
@@ -13109,13 +13127,15 @@ function renderIncrementalSyncRetry() {
   const visible = incrementalSyncCapabilityAdvertised()
     && incrementalConsentApproved
     && status?.status === "available"
-    && !incrementalGrantRejected();
+    && !incrementalGrantRejected()
+    && !contributionDeviceDisconnectPaused();
   button.hidden = !visible;
   if (!visible) {
     hideIncrementalSyncRetryNote();
     return;
   }
-  button.disabled = status.running === true || incrementalSyncRetryBusy;
+  button.disabled = status.running === true || incrementalSyncRetryBusy
+    || contributionDisconnectBusy || contributionDisconnectDialogOpen();
 }
 
 function hideIncrementalSyncRetryNote() {
@@ -13127,7 +13147,8 @@ function hideIncrementalSyncRetryNote() {
 }
 
 async function runIncrementalSyncNow() {
-  if (incrementalSyncRetryBusy) return;
+  if (incrementalSyncRetryBusy || contributionDisconnectBusy
+      || contributionDisconnectDialogOpen() || contributionDeviceDisconnectPaused()) return;
   incrementalSyncRetryBusy = true;
   hideIncrementalSyncRetryNote();
   renderIncrementalSyncRetry();
@@ -13138,6 +13159,7 @@ async function runIncrementalSyncNow() {
       await localClient.localContributionMutation("incremental-run");
     incrementalSyncStatus =
       normalizeIncrementalContributionSyncStatus(payload);
+    observeContributionDisconnectPause(incrementalSyncStatus);
     incrementalSyncLastOutcomeDetailCode = boundedOutcomeDetailCode(payload);
     if (incrementalSyncStatus?.status === "available") {
       incrementalConsentApproved =
@@ -13305,6 +13327,7 @@ async function loadIncrementalSyncStatus() {
     payload = null;
   }
   incrementalSyncStatus = normalizeIncrementalContributionSyncStatus(payload);
+  observeContributionDisconnectPause(incrementalSyncStatus);
   incrementalSyncLastOutcomeDetailCode = boundedOutcomeDetailCode(payload);
   // Only an available projection may change the consent verdict: a transient
   // read failure normalizes to a fail-closed shape whose false consent must
@@ -13381,6 +13404,8 @@ async function recordFreshLocalContributionApproval(
  */
 async function approveIncrementalContribution() {
   if (incrementalConsentBusy || communityConnectBusy
+      || contributionDisconnectBusy || contributionDisconnectDialogOpen()
+      || contributionDisconnectOutcome === "cleanup_pending"
       || !incrementalSyncCapabilityAdvertised()) {
     return;
   }
@@ -13405,6 +13430,12 @@ async function approveIncrementalContribution() {
     return;
   }
   incrementalConsentBusy = true;
+  if (contributionDeviceDisconnectPaused()) {
+    // This function is reached only by an explicit approval after disconnect;
+    // both silent repair entrypoints refuse the durable disconnect pause.
+    communityDevicePaired = false;
+    communityDevicePairedV1 = false;
+  }
   const reviewGeneration = contributionReviewFence.begin();
   const expectedSummaryIdentity = contributionSyncExactReview?.summaryIdentity
     ?? null;
@@ -13614,6 +13645,7 @@ async function mintDevicePairingWithCookieCommitRetry() {
  * failure or ask again.
  */
 function maybeRepairIncrementalAuthorization() {
+  if (contributionDisconnectBlocksRepair()) return;
   if (incrementalRepairAttempted) return;
   if (incrementalConsentBusy || communityConnectBusy) return;
   if (!incrementalSyncCapabilityAdvertised()) return;
@@ -13633,6 +13665,7 @@ function maybeRepairIncrementalAuthorization() {
  * Review-and-approve action.
  */
 function resumeContributionCeremonyAfterSignIn() {
+  if (contributionDisconnectBlocksRepair()) return;
   if (!incrementalSyncCapabilityAdvertised()) return;
   if (!incrementalConsentApproved || !incrementalUploadAuthorityLost()) return;
   if (incrementalConsentBusy || communityConnectBusy) return;
@@ -13650,50 +13683,135 @@ function resumeContributionCeremonyAfterSignIn() {
   void approveIncrementalContribution();
 }
 
-// Deletion honesty (owner-directed, 2026-08-08): the card no longer states a
-// deletion promise without a control behind it. This is the control — the
-// service's participant deletion (DELETE /api/v1/me), which purges accepted
-// chunks and stored uploads and tombstones the account. It needs the live
-// session, asks for explicit confirmation, and touches nothing local.
-const CONTRIBUTION_DELETION_CONFIRMATION =
-  "Delete everything you contributed?\n\nThe service deletes your contributed usage data and this account's records, and this Mac's upload authority stops working. Local reporting on this Mac is unchanged. This cannot be undone.";
+function contributionDisconnectDialogOpen() {
+  return $("#disconnect-device-dialog")?.open === true;
+}
 
-async function deleteCommunityContributions() {
-  if (incrementalConsentBusy || communityConnectBusy) return;
-  if (!hasCommunitySession()) return;
-  if (!window.confirm(CONTRIBUTION_DELETION_CONFIRMATION)) return;
-  const status = $("#incremental-consent-status");
-  incrementalConsentBusy = true;
+function contributionDeviceDisconnectPaused() {
+  return contributionDisconnectOutcome === "disconnected"
+    || contributionDisconnectOutcome === "cleanup_pending"
+    || contributionDisconnectOutcome === "paused"
+    || (incrementalSyncStatus?.status === "available"
+      && incrementalSyncStatus.paused === true
+      && incrementalSyncStatus.pausedReason === "device_disconnected");
+}
+
+function observeContributionDisconnectPause(status) {
+  if (status?.status !== "available") return;
+  const paused = status.paused === true && status.pausedReason === "device_disconnected";
+  if (paused && [null, "unconfirmed"].includes(contributionDisconnectOutcome)) {
+    contributionDisconnectOutcome = "paused";
+  } else if (!paused && contributionDisconnectOutcome === "paused") {
+    contributionDisconnectOutcome = null;
+  }
+  // A transient unreadable status cannot erase an observed durable pause.
+  // A successful disconnect receipt is stronger and stays until reconnection.
+}
+
+function contributionDisconnectBlocksRepair() {
+  return contributionDisconnectBusy || contributionDisconnectDialogOpen()
+    || contributionDisconnectOutcome !== null || contributionDeviceDisconnectPaused();
+}
+
+function renderContributionDisconnect() {
+  const controls = $("#contribution-device-controls");
+  if (!controls) return;
+  // The device capability, not a browser session or historical upload count,
+  // decides availability. A signed-out Mac can still have a live device.
+  controls.hidden = localCompanionHealth?.capabilities?.contributionDeviceDisconnect !== true;
+  const busy = contributionDisconnectBusy || incrementalConsentBusy
+    || communityConnectBusy || incrementalSyncRetryBusy;
+  $("#disconnect-device").disabled = busy
+    || contributionDisconnectOutcome === "disconnected";
+  $("#disconnect-device-confirm").disabled = controls.hidden || busy
+    || contributionDisconnectChecking || contributionDisconnectAbsent;
+}
+
+async function openContributionDisconnectDialog() {
+  if (localCompanionHealth?.capabilities?.contributionDeviceDisconnect !== true
+      || $("#disconnect-device").disabled || contributionDisconnectDialogOpen()) return;
+  const generation = ++contributionDisconnectCheckGeneration;
+  contributionDisconnectChecking = true;
+  contributionDisconnectAbsent = false;
+  const dialog = $("#disconnect-device-dialog");
+  dialog.showModal();
+  setLocalizedText($("#disconnect-device-check"), "contribution.disconnect.checking");
   renderContributionActionState();
+  $("#disconnect-device-cancel").focus();
+  // Diagnostics may read the Keychain, so this check is user-triggered, never
+  // a new background probe. Unknown is not absence and must allow a retry.
+  const diagnostics = await withContributionReviewDeadline(
+    localClient.contributionDiagnostics(),
+    { timeoutMilliseconds: 10_000 },
+  ).catch(() => null);
+  if (generation !== contributionDisconnectCheckGeneration || !dialog.open) return;
+  contributionDisconnectChecking = false;
+  const observed = diagnostics?.status === "available"
+    && diagnostics.pairing.observed === true;
+  contributionDisconnectAbsent = observed && diagnostics.pairing.paired === false
+    && contributionDisconnectOutcome !== "cleanup_pending";
+  setLocalizedText($("#disconnect-device-check"), contributionDisconnectAbsent
+    ? "contribution.disconnect.absent"
+    : observed && diagnostics.pairing.paired
+      ? "contribution.disconnect.ready"
+      : "contribution.disconnect.unknown");
+  renderContributionDisconnect();
+}
+
+function closeContributionDisconnectDialog() {
+  if (!contributionDisconnectDialogOpen()) return;
+  contributionDisconnectCheckGeneration += 1;
+  contributionDisconnectChecking = false;
+  $("#disconnect-device-dialog").close();
+  renderContributionActionState();
+  $("#disconnect-device").focus();
+}
+
+async function disconnectCommunityDevice() {
+  if (!contributionDisconnectDialogOpen()
+      || $("#disconnect-device-confirm").disabled) return;
+  const previousOutcome = contributionDisconnectOutcome;
+  contributionDisconnectBusy = true;
+  contributionDisconnectOutcome = "unconfirmed";
+  incrementalRepairAttempted = true;
+  contributionDisconnectCheckGeneration += 1;
+  $("#disconnect-device-dialog").close();
+  const status = $("#disconnect-device-status");
   status.hidden = false;
   status.className = "participant-action-status";
-  setProductText(status, "Deleting your contributed data from the service…");
+  setLocalizedText(status, "contribution.disconnect.starting");
+  renderContributionActionState();
+  // The trigger is disabled during the request and after success. Keep focus
+  // on the live result rather than losing it to the document body.
+  status.focus();
   try {
-    await communityClient.deleteParticipant();
-    // The account is tombstoned server-side: the session, the sign-in proof
-    // and this Mac's pairing evidence are all dead with it.
-    hostedIdentity = null;
-    setCommunitySession(null);
+    const result = await localClient.disconnectContributionDevice();
+    if (result?.status !== "disconnected" || result.deliveryPaused !== true) {
+      throw new Error("Device disconnect was not confirmed.");
+    }
+    contributionDisconnectOutcome = "disconnected";
+    communityDevicePaired = false;
     communityDevicePairedV1 = false;
-    status.hidden = false;
-    status.className = "participant-action-status";
-    setProductText(
-      status,
-      "Deleted. The service removed your contributed data and this account's records. Local reporting on this Mac is unchanged.",
-    );
-    renderHostedIdentity();
-    await loadIncrementalSyncStatus().catch(() => {});
+    setLocalizedText(status, "contribution.disconnect.completed");
   } catch (error) {
-    await showFailure(status, {
-      surface: "participant_deletion",
-      error,
-      fallback:
-        "The service did not confirm the deletion, so nothing is assumed deleted. Try again."
-    });
+    const cleanupPending = error?.code === "contribution_device_disconnect_cleanup_pending"
+      || previousOutcome === "cleanup_pending";
+    if (cleanupPending) {
+      contributionDisconnectOutcome = "cleanup_pending";
+      communityDevicePaired = false;
+      communityDevicePairedV1 = false;
+    }
+    status.classList.add("error");
+    setLocalizedText(status, cleanupPending
+      ? "contribution.disconnect.cleanupPending"
+      : "contribution.disconnect.failed");
   } finally {
-    incrementalConsentBusy = false;
+    contributionDisconnectBusy = false;
     renderContributionActionState();
   }
+  // A failed status read cannot overwrite a confirmed disconnect receipt or
+  // restore upload authority. Hosted session and history are never cleared.
+  await loadIncrementalSyncStatus().catch(() => {});
 }
 
 function contributionDeviceRecoveryIsRequired(error) {
@@ -13939,6 +14057,9 @@ async function finishCommunityDevicePairing(pairing, status) {
     throw error;
   }
   communityDevicePaired = true;
+  contributionDisconnectOutcome = null;
+  const disconnectStatus = $("#disconnect-device-status");
+  if (disconnectStatus) disconnectStatus.hidden = true;
   status.textContent =
     `This Mac is connected through ${formatLocal(paired.expiresAt)}. Nothing was uploaded.`;
   return paired;
@@ -14193,8 +14314,22 @@ $("#incremental-consent-approve").addEventListener("click", () => {
 $("#incremental-sync-retry").addEventListener("click", () => {
   void runIncrementalSyncNow();
 });
-$("#delete-contributions").addEventListener("click", () => {
-  void deleteCommunityContributions();
+$("#disconnect-device").addEventListener("click", () => {
+  void openContributionDisconnectDialog();
+});
+$("#disconnect-device-cancel").addEventListener("click", closeContributionDisconnectDialog);
+$("#disconnect-device-dialog").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  closeContributionDisconnectDialog();
+});
+// Some embedded hosts forward Escape keydown without a native dialog cancel.
+$("#disconnect-device-dialog").addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  event.preventDefault();
+  closeContributionDisconnectDialog();
+});
+$("#disconnect-device-confirm").addEventListener("click", () => {
+  void disconnectCommunityDevice();
 });
 $("#range-controls").addEventListener("click", (event) => {
   const button = event.target.closest("[data-days]");

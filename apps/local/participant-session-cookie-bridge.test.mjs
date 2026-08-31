@@ -97,7 +97,6 @@ test("only retained one-use identity-proof routes are exempt from the captured s
   for (const path of [
     "/api/v1/session",
     "/api/v1/logout",
-    "/api/v1/me",
     "/api/v1/me/device-pairings",
   ]) {
     assert.equal(participantRelayPathUsesSessionCookie(path), true, path);
@@ -111,6 +110,12 @@ test("only retained one-use identity-proof routes are exempt from the captured s
     "/api/v1/identity/apple/start",
     "/api/v1/identity/apple/result",
   ]) {
+    assert.equal(participantRelayPathUsesSessionCookie(path), false, path);
+  }
+});
+
+test("retired deletion and private owner routes never take the captured session", () => {
+  for (const path of ["/api/v1/me", "/api/v1/me/", "/api/v1/admin/action"]) {
     assert.equal(participantRelayPathUsesSessionCookie(path), false, path);
   }
 });
