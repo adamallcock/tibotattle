@@ -107,6 +107,23 @@ but it cannot read or migrate stable state. The signed same-identity
 the live stable database into Preview, relabel `PRAGMA user_version`, delete the
 index, or reopen a migrated schema-10 or schema-11 index with shipped 0.1.16.
 
+The replacement validator has one closed previous-only exception for the
+pre-policy internal-dogfood `0.1.16` / build `1022` DMG: SHA-256
+`2b32964c8b3bc2912620dbbe078aaf4e2fd49f1725a4e94a62dff184cdc9f8c1`,
+49,341,249 bytes, source `5adaca5fdc8f981c391144e0d29b6f4c764f0f96`
+at `v0.1.16`. Its receipt predates channel-specific tags and its app lacks an
+embedded source seal. Only the checksum-verified previous side of
+`validate-macos-replacement.js` accepts that identity, its exact build digests,
+and the existing channel, updater-key, and signed-release assurances. Native
+signature, notarization, Gatekeeper, and isolated-smoke checks still run. Matching
+previous-only rules cover its exact normalized Keytar binary and its two absent
+Keychain identity plist fields. The old payload is fully verified, never
+rewritten; current candidates still require the current normalization inventory
+and both explicit Keychain identity fields. No compatibility flag is available
+for a candidate, public installer, or signing path.
+Do not rewrite the old receipt or tag. Preserving this artifact does not prove
+state rollback: a schema-9 backup is already newer than its schema-8 reader.
+
 **The failure class to expect after a batch of merges** is a *pin* that was
 never updated: a reviewed public-API list, a pinned action SHA, a byte-identity
 digest, a root-workspace allowlist, or an exact `deepEqual` on an exported
