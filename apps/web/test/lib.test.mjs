@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { webcrypto } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { createContext, runInContext } from "node:vm";
 import { FAST_MODE_QUOTA_MULTIPLIERS } from "@app-usagemonitor/accounting";
 import {
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
@@ -4139,7 +4140,7 @@ function assignsCompanionHealth(source) {
   for (let match = assignment.exec(source); match !== null; match = assignment.exec(source)) {
     branches.push(source.slice(match.index, match.index + 600));
   }
-  assert.ok(branches.length >= 2, "expected both the loaded and fallback health paths");
+  assert.ok(branches.length >= 2, "expected both the startup and recovery health paths");
   return branches;
 }
 
@@ -5063,7 +5064,7 @@ test("native dashboard readiness follows both first-render outcomes", async () =
   );
 });
 
-test("native dashboard readiness does not wait on secondary contribution status", async () => {
+test("native dashboard readiness does not wait on secondary companion reads", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const loadStart = appSource.indexOf("async function loadLocalDashboard() {");
   const loadEnd = appSource.indexOf(
@@ -5073,29 +5074,492 @@ test("native dashboard readiness does not wait on secondary contribution status"
   assert.ok(loadStart >= 0 && loadEnd > loadStart, "dashboard loader is present");
 
   const loader = appSource.slice(loadStart, loadEnd);
-  const successEnd = loader.indexOf(
-    "\n  } catch {",
-    loader.indexOf("renderContributionSyncPreview(sync.preview);"),
-  );
+  const successEnd = loader.indexOf("\n  } catch {");
   const successPath = loader.slice(0, successEnd);
   const dashboardRender = successPath.indexOf("renderDashboard(data);");
-  const onboardingRender = successPath.indexOf("renderLocalOnboarding(onboarding);");
+  const onboardingRender = successPath.indexOf("renderLocalOnboarding(localOnboarding);");
   const readinessMarker = successPath.indexOf("markLocalDashboardReady();");
-  const secondaryStatus = successPath.indexOf("await loadIncrementalSyncStatus();");
-  const contributionPreview = successPath.indexOf(
-    "renderContributionSyncPreview(sync.preview);",
-  );
+  const secondary = appSource.match(
+    /^async function loadLocalDashboardSecondaryState\([\s\S]*?^\}/mu,
+  )?.[0] ?? "";
+  const secondaryStatus = secondary.indexOf("await loadIncrementalSyncStatus({ isCurrent });");
+  const contributionPreview = secondary.indexOf("renderContributionSyncPreview(");
 
   assert.ok(dashboardRender >= 0, "the primary dashboard render is present");
-  assert.ok(onboardingRender > dashboardRender, "onboarding joins the primary render");
+  assert.ok(onboardingRender > dashboardRender, "cached onboarding unhides the real result");
   assert.ok(
-    readinessMarker > onboardingRender && readinessMarker < secondaryStatus,
-    "the native shell is released after the primary render and before secondary status",
+    readinessMarker > onboardingRender,
+    "the native shell is released after the primary render",
   );
+  assert.doesNotMatch(loader, /localClient\.(health|onboarding|refreshStatus|contributionSyncPreview|contributionSyncStatus)\(/u);
+  assert.doesNotMatch(loader, /await load(?:IncrementalSyncStatus|LocalDashboardSecondaryState)\(/u);
+  assert.ok(loader.indexOf("void loadLocalDashboardSecondaryState(") > loader.indexOf("} finally {"),
+    "the shared secondary path starts after primary busy state is released");
   assert.ok(
-    contributionPreview > secondaryStatus,
+    secondaryStatus >= 0 && contributionPreview > secondaryStatus,
     "the consent status still resolves before the contribution preview",
   );
+});
+
+function dashboardStartupDeferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function dashboardStartupStatus(approved = true) {
+  return {
+    schemaVersion: "local-incremental-contribution-sync-v1.0",
+    status: "available",
+    keychainPrompt: "none",
+    consent: { approved, current: approved },
+    paused: false,
+    running: false,
+    includesContent: false,
+    includesPaths: false,
+    includesIdentifiers: false,
+    includesCredentials: false,
+  };
+}
+
+async function createDashboardStartupHarness({
+  client = {},
+  initialBusy = false,
+  initialHealth = null,
+  initialConsentApproved = false,
+  incrementalStatus = async () => dashboardStartupStatus(),
+} = {}) {
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const state = {
+    events: [], previews: [], primaryReads: 0, statusReads: 0, polls: 0,
+    preparations: 0, reviewUnavailableReports: 0, returnRefreshChecks: 0,
+  };
+  const elements = new Map();
+  const element = (selector) => {
+    if (!elements.has(selector)) elements.set(selector, {
+      disabled: false,
+      hidden: false,
+      textContent: "",
+      setAttribute() {},
+    });
+    return elements.get(selector);
+  };
+  const context = createContext({
+    $: element,
+    window: { setTimeout: (callback) => { queueMicrotask(callback); } },
+    document: { documentElement: { dataset: {} } },
+    cacheDropThreadLinks: { loadToken: 0 },
+    activeLocalDashboardLoad: null,
+    localActionBusy: initialBusy,
+    localCompanionHealth: initialHealth,
+    localOnboarding: null,
+    dashboard: null,
+    accountingRebuildDeferral: { consecutive: 2 },
+    incrementalSyncStatus: null,
+    incrementalConsentApproved: initialConsentApproved,
+    incrementalConsentBusy: false,
+    incrementalSyncLastOutcomeDetailCode: null,
+    incrementalSyncPollCount: 0,
+    INCREMENTAL_SYNC_CONTRACT: "telemetry-contribution-v1.0",
+    contributionSyncBusy: false,
+    contributionSyncPreview: null,
+    contributionSyncExactReview: null,
+    contributionReviewUnavailableKey: null,
+    demoDashboard: () => ({ marker: "demo", mode: "demo" }),
+    localClient: {
+      async load() {
+        state.primaryReads += 1;
+        return client.load ? client.load() : { marker: "primary", mode: "real_local_evidence" };
+      },
+      health: async () => ({ capabilities: {
+        incrementalContributionSync: "telemetry-contribution-v1.0",
+      } }),
+      onboarding: async () => ({ state: "ready" }),
+      refreshStatus: async () => ({ refresh: { result: {} } }),
+      contributionSyncPreview: async () => ({ status: "available", state: "empty", item: null }),
+      contributionSyncStatus: async () => ({ status: "available" }),
+      ...Object.fromEntries(Object.entries(client).filter(([key]) => key !== "load")),
+    },
+    fetch: async () => {
+      state.statusReads += 1;
+      return { ok: true, json: incrementalStatus };
+    },
+    normalizeIncrementalContributionSyncStatus,
+    contributionReviewBootstrapAction,
+    contributionReviewPreparationPermitted,
+    boundedOutcomeDetailCode: () => null,
+    observeContributionDisconnectPause() {},
+    runsInsideNativeDashboard: () => true,
+    setJourneyState(value) { state.journey = value; },
+    scheduleIncrementalSyncStatusPoll() { state.polls += 1; },
+    scheduleReturningUserRefresh() { state.returnRefreshChecks += 1; },
+    maybePrepareIncrementalReviewInstance() { state.preparations += 1; },
+    maybeReportContributionReviewUnavailable() { state.reviewUnavailableReports += 1; },
+    updateLocalActionButtons() {
+      element("#refresh-button").disabled = context.localActionBusy;
+    },
+    renderDashboard(value) {
+      context.dashboard = value;
+      state.events.push(["primary", value.marker]);
+    },
+    renderDashboardUnavailableState(kind) { state.events.push(["unavailable", kind]); },
+    renderHostedIdentity() { state.events.push(["identity"]); },
+    renderAccounting() { state.events.push(["accounting"]); },
+    renderContributionActionState() { state.events.push(["consent", context.incrementalConsentApproved]); },
+    renderContributionSyncStatus(value) { state.events.push(["sync-status", value]); },
+  });
+  for (const name of [
+    "renderLocalOnboarding", "markLocalDashboardReady", "loadLocalDashboard",
+    "loadLocalDashboardSecondaryState", "recoverLocalCompanionReads",
+    "loadIncrementalSyncStatus", "contributionServiceConfigured",
+    "incrementalSyncCapabilityAdvertised", "localCompanionHealthUnknown",
+    "incrementalSyncCapabilitySettled", "localOnboardingUnsettled",
+    "renderContributionSyncPreview", "maybeReviewPreparedSummary",
+    "loadQuickResultDashboard", "showDemoDashboard",
+  ]) {
+    const match = appSource.match(new RegExp(
+      `^(?:async )?function ${name}\\([\\s\\S]*?^\\}`, "mu",
+    ));
+    // The optional helper is absent on the pre-fix loader; execute that loader
+    // too so a regression fails on behavior, not on an extraction convention.
+    if (name === "loadLocalDashboardSecondaryState" && match === null) continue;
+    assert.ok(match, `${name} is executed from production source`);
+    runInContext(match[0], context);
+  }
+  const renderPreview = context.renderContributionSyncPreview;
+  context.renderContributionSyncPreview = (value) => {
+    state.previews.push({ value, approved: context.incrementalConsentApproved });
+    renderPreview(value);
+  };
+  return { context, state, element };
+}
+
+const settleDashboardStartupTasks = () => new Promise(setImmediate);
+
+test("primary startup renders and releases busy state while optional reads remain pending", async (t) => {
+  for (const method of [
+    "health", "onboarding", "refreshStatus", "contributionSyncPreview",
+    "contributionSyncStatus", "incrementalStatus",
+  ]) {
+    await t.test(method, async () => {
+      const pending = dashboardStartupDeferred();
+      const harness = await createDashboardStartupHarness(method === "incrementalStatus"
+        ? { incrementalStatus: () => pending.promise }
+        : { client: { [method]: () => pending.promise } });
+      let completed = false;
+      const loading = harness.context.loadLocalDashboard().then(() => { completed = true; });
+      try {
+        await settleDashboardStartupTasks();
+        assert.equal(harness.context.document.documentElement.dataset.localDashboardReady, "true");
+        assert.equal(harness.context.dashboard.marker, "primary");
+        assert.equal(harness.state.journey, "local-ready",
+          "real evidence must not remain hidden by first-run while onboarding waits");
+        assert.equal(completed, true, "only the primary result owns the dashboard load promise");
+        assert.equal(harness.context.localActionBusy, false);
+        assert.equal(harness.element("#refresh-button").disabled, false);
+      } finally {
+        pending.resolve(null);
+        await loading;
+      }
+    });
+  }
+});
+
+test("primary startup failure renders unavailable without waiting on optional recovery", async () => {
+  const pending = dashboardStartupDeferred();
+  const harness = await createDashboardStartupHarness({ client: {
+    load: async () => { throw new Error("synthetic primary read failure"); },
+    health: () => pending.promise,
+    onboarding: () => pending.promise,
+  } });
+  let completed = false;
+  const loading = harness.context.loadLocalDashboard().then(() => { completed = true; });
+  try {
+    await settleDashboardStartupTasks();
+    assert.equal(harness.state.primaryReads, 2, "the existing single retry is retained");
+    assert.equal(harness.context.dashboard, null);
+    assert.equal(harness.state.events.filter(([kind]) => kind === "primary").length, 0);
+    assert.deepEqual(harness.state.events.filter(([kind]) => kind === "unavailable"), [
+      ["unavailable", "companion-unavailable"],
+    ]);
+    assert.equal(harness.context.document.documentElement.dataset.localDashboardReady, "true");
+    assert.equal(completed, true);
+    assert.equal(harness.context.localActionBusy, false);
+  } finally {
+    pending.resolve(null);
+    await loading;
+  }
+  await settleDashboardStartupTasks();
+  assert.ok(harness.state.polls > 0,
+    "the failed primary path still starts optional companion recovery after readiness");
+});
+
+test("overlapping primary startup loads publish only the newest result and restore the original busy owner", async (t) => {
+  for (const olderSettlesFirst of [true, false]) {
+    await t.test(olderSettlesFirst ? "older settles first" : "newer settles first", async () => {
+      const first = dashboardStartupDeferred();
+      const second = dashboardStartupDeferred();
+      const reads = [first, second];
+      const harness = await createDashboardStartupHarness({
+        client: { load: () => reads.shift().promise },
+      });
+      const older = harness.context.loadLocalDashboard();
+      const newer = harness.context.loadLocalDashboard();
+      if (olderSettlesFirst) {
+        first.resolve({ marker: "old" });
+        await older;
+        assert.equal(harness.context.dashboard, null);
+        assert.equal(harness.context.localActionBusy, true);
+      }
+      second.resolve({ marker: "new" });
+      await newer;
+      assert.equal(harness.context.dashboard.marker, "new");
+      assert.equal(harness.context.localActionBusy, false);
+      if (!olderSettlesFirst) {
+        first.resolve({ marker: "old" });
+        await older;
+      }
+      assert.equal(harness.context.dashboard.marker, "new");
+      assert.equal(harness.context.localActionBusy, false);
+      assert.deepEqual(harness.state.events.filter(([kind]) => kind === "primary"), [["primary", "new"]]);
+    });
+  }
+  const outerOwner = await createDashboardStartupHarness({ initialBusy: true });
+  await outerOwner.context.loadLocalDashboard();
+  assert.equal(outerOwner.context.localActionBusy, true,
+    "a surrounding analysis or setup action retains its own busy state");
+});
+
+test("startup optional failures preserve primary evidence, known health and recorded consent", async () => {
+  const knownHealth = { capabilities: {
+    incrementalContributionSync: "telemetry-contribution-v1.0",
+  } };
+  const fail = async () => { throw new Error("synthetic optional read failure"); };
+  const harness = await createDashboardStartupHarness({
+    client: Object.fromEntries([
+      "health", "onboarding", "refreshStatus", "contributionSyncPreview", "contributionSyncStatus",
+    ].map((method) => [method, fail])),
+    initialHealth: knownHealth,
+    initialConsentApproved: true,
+    incrementalStatus: fail,
+  });
+  await harness.context.loadLocalDashboard();
+  await settleDashboardStartupTasks();
+  assert.equal(harness.context.document.documentElement.dataset.localDashboardReady, "true");
+  assert.equal(harness.context.dashboard.marker, "primary");
+  assert.equal(harness.context.localActionBusy, false);
+  assert.equal(harness.context.localCompanionHealth, knownHealth);
+  assert.equal(harness.context.accountingRebuildDeferral.consecutive, 2);
+  assert.equal(harness.context.incrementalSyncStatus.status, "unavailable");
+  assert.equal(harness.context.incrementalConsentApproved, true);
+  assert.deepEqual(harness.state.previews, [{ value: null, approved: true }]);
+  assert.equal(harness.state.preparations, 0);
+  assert.equal(harness.state.events.filter(([kind]) => kind === "unavailable").length, 0);
+  assert.equal(harness.state.polls, 1);
+});
+
+test("startup preview waits for a validated consent verdict before any automatic preparation", async (t) => {
+  for (const verdict of ["approved", "pre-consent", "unreadable", "invalid"]) {
+    await t.test(verdict, async () => {
+      const pending = dashboardStartupDeferred();
+      const harness = await createDashboardStartupHarness({ incrementalStatus: () => pending.promise });
+      await harness.context.loadLocalDashboard();
+      await settleDashboardStartupTasks();
+      assert.equal(harness.context.document.documentElement.dataset.localDashboardReady, "true");
+      assert.equal(harness.context.localActionBusy, false);
+      assert.equal(harness.state.statusReads, 1);
+      assert.equal(harness.state.previews.length, 0);
+      assert.equal(harness.state.preparations, 0);
+      if (verdict === "unreadable") pending.reject(new Error("synthetic consent failure"));
+      else if (verdict === "invalid") pending.resolve({ status: "available", consent: { approved: false, current: false } });
+      else pending.resolve(dashboardStartupStatus(verdict === "approved"));
+      await settleDashboardStartupTasks();
+      assert.equal(harness.state.previews.length, 1);
+      assert.equal(harness.state.previews[0].approved, verdict === "approved");
+      assert.equal(harness.state.preparations, verdict === "pre-consent" ? 1 : 0,
+        "the production preview/bootstrap pair may prepare only from a validated pre-consent read");
+      assert.equal(harness.context.incrementalSyncStatus.status,
+        ["unreadable", "invalid"].includes(verdict) ? "unavailable" : "available");
+    });
+  }
+});
+
+test("an older primary failure cannot clear a newer result or start an obsolete retry", async () => {
+  const pending = dashboardStartupDeferred();
+  let reads = 0;
+  const harness = await createDashboardStartupHarness({ client: {
+    load: () => ++reads === 1 ? pending.promise : Promise.resolve({ marker: "new" }),
+  } });
+  const older = harness.context.loadLocalDashboard();
+  await harness.context.loadLocalDashboard();
+  pending.reject(new Error("synthetic older primary failure"));
+  await older;
+  await settleDashboardStartupTasks();
+  assert.equal(reads, 2);
+  assert.equal(harness.context.dashboard.marker, "new");
+  assert.equal(harness.context.localActionBusy, false);
+  assert.equal(harness.state.events.filter(([kind]) => kind === "unavailable").length, 0);
+});
+
+test("older startup secondary reads cannot replace a newer load or native quick result", async (t) => {
+  for (const nextLoad of ["loadLocalDashboard", "loadQuickResultDashboard"]) {
+    await t.test(nextLoad, async () => {
+      const newer = {
+        health: { marker: "new", capabilities: { incrementalContributionSync: "telemetry-contribution-v1.0" } },
+        onboarding: { state: "ready", marker: "new" },
+        refreshStatus: { refresh: { result: { accountingRebuildDeferred: { consecutive: 3 } } } },
+        contributionSyncPreview: { status: "available", state: "empty", item: null, marker: "new" },
+        contributionSyncStatus: { status: "available", marker: "new" },
+      };
+      const pending = Object.fromEntries(Object.keys(newer).map((method) => [method, dashboardStartupDeferred()]));
+      const reads = {};
+      let primaryReads = 0;
+      const harness = await createDashboardStartupHarness({ client: {
+        load: async () => ({ marker: ++primaryReads === 1 ? "old" : "new" }),
+        ...Object.fromEntries(Object.entries(newer).map(([method, value]) => [method, () => {
+          reads[method] = (reads[method] ?? 0) + 1;
+          return reads[method] === 1 ? pending[method].promise : Promise.resolve(value);
+        }])),
+      } });
+      await harness.context.loadLocalDashboard();
+      await settleDashboardStartupTasks();
+      await harness.context[nextLoad]();
+      await settleDashboardStartupTasks();
+      assert.equal(harness.state.previews.length, 1);
+      const eventCount = harness.state.events.length;
+      const refreshChecks = harness.state.returnRefreshChecks;
+      pending.health.resolve({ marker: "old", capabilities: {} });
+      pending.onboarding.resolve({ state: "unavailable", marker: "old" });
+      pending.refreshStatus.resolve({ refresh: { result: {} } });
+      pending.contributionSyncStatus.resolve({ status: "unavailable", marker: "old" });
+      pending.contributionSyncPreview.resolve({ status: "unavailable", marker: "old" });
+      await settleDashboardStartupTasks();
+      assert.equal(harness.context.dashboard.marker, "new");
+      assert.equal(harness.context.localCompanionHealth, newer.health);
+      assert.equal(harness.context.localOnboarding, newer.onboarding);
+      assert.equal(harness.context.accountingRebuildDeferral.consecutive, 3);
+      assert.equal(harness.context.incrementalConsentApproved, true);
+      assert.equal(harness.state.previews.length, 1);
+      assert.equal(harness.state.previews[0].value, newer.contributionSyncPreview);
+      assert.equal(harness.state.events.length, eventCount);
+      assert.equal(harness.state.returnRefreshChecks, refreshChecks);
+      assert.equal(harness.context.localActionBusy, false);
+    });
+  }
+});
+
+test("older incremental responses cannot revoke consent established by a newer dashboard load", async (t) => {
+  for (const origin of ["startup", "poll"]) {
+    await t.test(origin, async () => {
+      const pending = dashboardStartupDeferred();
+      let statusReads = 0;
+      const harness = await createDashboardStartupHarness({
+        incrementalStatus: () => ++statusReads === 1 ? pending.promise : Promise.resolve(dashboardStartupStatus()),
+      });
+      const older = origin === "poll"
+        ? harness.context.loadIncrementalSyncStatus()
+        : harness.context.loadLocalDashboard();
+      await settleDashboardStartupTasks();
+      assert.equal(statusReads, 1);
+      await harness.context.loadLocalDashboard();
+      await settleDashboardStartupTasks();
+      assert.equal(harness.context.incrementalConsentApproved, true);
+      assert.equal(harness.state.previews.length, 1);
+      const polls = harness.state.polls;
+      pending.resolve({ ...dashboardStartupStatus(false), keychainPrompt: "migration" });
+      await older;
+      await settleDashboardStartupTasks();
+      assert.equal(harness.context.incrementalConsentApproved, true);
+      assert.equal(harness.context.incrementalSyncStatus.keychainPrompt, "none");
+      assert.equal(harness.state.previews.length, 1);
+      assert.equal(harness.state.preparations, 0);
+      assert.equal(harness.state.polls, polls);
+    });
+  }
+});
+
+test("an older recovery health read cannot replace a newer dashboard health answer", async () => {
+  const pending = dashboardStartupDeferred();
+  const newerHealth = { marker: "new", capabilities: { incrementalContributionSync: "telemetry-contribution-v1.0" } };
+  let healthReads = 0;
+  const harness = await createDashboardStartupHarness({ client: {
+    health: () => {
+      healthReads += 1;
+      if (healthReads === 1) return Promise.resolve(null);
+      if (healthReads === 2) return pending.promise;
+      return Promise.resolve(newerHealth);
+    },
+  } });
+  await harness.context.loadLocalDashboard();
+  await settleDashboardStartupTasks();
+  assert.equal(healthReads, 2, "the first load entered recovery after its health read missed");
+  await harness.context.loadLocalDashboard();
+  await settleDashboardStartupTasks();
+  const eventCount = harness.state.events.length;
+  pending.resolve({ marker: "old", capabilities: {} });
+  await settleDashboardStartupTasks();
+  assert.equal(harness.context.localCompanionHealth, newerHealth);
+  assert.equal(harness.context.incrementalConsentApproved, true);
+  assert.equal(harness.state.statusReads, 1);
+  assert.equal(harness.state.events.length, eventCount);
+});
+
+test("quick reload races and failures preserve the newest real dashboard", async () => {
+  const pending = dashboardStartupDeferred();
+  let primaryReads = 0;
+  const harness = await createDashboardStartupHarness({ client: {
+    load: () => ++primaryReads === 1 ? pending.promise : Promise.resolve({ marker: "new" }),
+  } });
+  const olderQuick = harness.context.loadQuickResultDashboard();
+  await harness.context.loadLocalDashboard();
+  pending.resolve({ marker: "old" });
+  await olderQuick;
+  assert.equal(harness.context.dashboard.marker, "new");
+  harness.context.localClient.load = async () => { throw new Error("synthetic quick failure"); };
+  await assert.rejects(harness.context.loadQuickResultDashboard(), /synthetic quick failure/u);
+  await settleDashboardStartupTasks();
+  assert.equal(harness.context.dashboard.marker, "new");
+  assert.equal(harness.context.localActionBusy, false);
+  assert.equal(harness.state.events.filter(([kind]) => kind === "unavailable").length, 0);
+  assert.equal(harness.context.incrementalConsentApproved, true,
+    "a failed quick read must not strand optional recovery from the earlier generation");
+});
+
+test("explicit demo selection fences pending primary, quick and secondary reads", async (t) => {
+  for (const origin of ["primary", "quick", "secondary"]) {
+    await t.test(origin, async () => {
+      const pending = dashboardStartupDeferred();
+      const harness = await createDashboardStartupHarness({ client: origin === "secondary"
+        ? { health: () => pending.promise }
+        : { load: () => pending.promise } });
+      const loading = origin === "quick"
+        ? harness.context.loadQuickResultDashboard()
+        : harness.context.loadLocalDashboard();
+      await settleDashboardStartupTasks();
+      harness.context.showDemoDashboard();
+      assert.equal(harness.context.dashboard.mode, "demo");
+      assert.equal(harness.context.localActionBusy, false);
+      const eventCount = harness.state.events.length;
+      pending.resolve(origin === "secondary"
+        ? { capabilities: { incrementalContributionSync: "telemetry-contribution-v1.0" } }
+        : { marker: "obsolete" });
+      await loading;
+      await settleDashboardStartupTasks();
+      assert.equal(harness.context.dashboard.mode, "demo");
+      assert.equal(harness.context.localActionBusy, false);
+      assert.equal(harness.state.events.length, eventCount);
+      assert.equal(harness.state.previews.length, 0);
+      assert.equal(harness.context.document.documentElement.dataset.localDashboardReady,
+        origin === "secondary" ? "true" : undefined,
+        "demo selection itself is never mistaken for a real local readiness result");
+    });
+  }
+  const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  assert.match(appSource, /\$\("#demo-button"\)\.addEventListener\("click", showDemoDashboard\);/u);
 });
 
 test("first run is a truthful install and local preflight journey", async () => {
@@ -12490,7 +12954,8 @@ async function loadCompanionHealthRecovery(harness) {
   return Function(
     "harness", "window", "localClient", "renderHostedIdentity", "fetch",
     "normalizeIncrementalContributionSyncStatus", "boundedOutcomeDetailCode",
-    `let localCompanionHealth = harness.health;
+    `const cacheDropThreadLinks = { loadToken: 0 };
+let localCompanionHealth = harness.health;
 let localOnboarding = harness.onboarding;
 let incrementalSyncPollTimer = null;
 let incrementalSyncPollCount = 0;
@@ -12670,10 +13135,19 @@ test("the recovery poll is not gated on the capability it is recovering", async 
   );
   assert.ok(loadLocalDashboard.length > 0, "the dashboard load is available");
   assert.equal(
-    loadLocalDashboard.match(/await loadIncrementalSyncStatus\(\);/gu)?.length,
-    2,
-    "both the loaded and the companion-unavailable paths start the recovery chain",
+    loadLocalDashboard.match(/void loadLocalDashboardSecondaryState\(/gu)?.length,
+    1,
+    "both primary outcomes share one nonblocking secondary recovery path",
   );
+  assert.ok(
+    loadLocalDashboard.indexOf("void loadLocalDashboardSecondaryState(")
+      > loadLocalDashboard.indexOf("} finally {"),
+    "recovery starts after either primary outcome restores busy state",
+  );
+  const secondary = appSource.match(
+    /^async function loadLocalDashboardSecondaryState\([\s\S]*?^\}/mu,
+  )?.[0] ?? "";
+  assert.match(secondary, /await loadIncrementalSyncStatus\(\{ isCurrent \}\);/u);
   // And the gate that returns early must schedule before it does, or the first
   // pass is the last one.
   assert.match(

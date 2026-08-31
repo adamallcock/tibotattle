@@ -34,6 +34,13 @@ USAGE_MONITOR_PORT=8791 node ./apps/local/server.js
 
 Then open `http://127.0.0.1:8791/`.
 
+Startup defers the full-history projection so the first local dashboard does
+not wait for it. A validated last-authoritative snapshot may supply retained
+figures, labelled with their original provenance and the current projection's
+unavailable state. Without a valid saved snapshot, missing history remains
+unavailable. The normal refresh publishes its quick result and then replaces
+the retained or unavailable details with the completed full projection.
+
 To let the personal loopback dashboard read central-service health and use the
 fixed hosted identity/participation relay:
 

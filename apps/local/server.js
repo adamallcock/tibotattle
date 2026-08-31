@@ -3544,11 +3544,10 @@ function createPreparedLocalCompanionServer({
   let automaticContributionRetirement = null;
   let instanceLockPromise = null;
   let snapshotPromise = null;
-  // Building the first snapshot reads the whole retained collector state, which
-  // is seconds of work on a large install. The port is opened before that work
-  // starts, so this is the only record of whether the in-memory snapshot the
-  // read routes project from actually exists yet. It is reported verbatim by
-  // /api/local/health rather than being smoothed into "ready".
+  // The first snapshot defers full-history projection, but even its bounded
+  // local reads can wait on storage. The port opens before that work, so this
+  // records whether the in-memory snapshot the read routes project actually
+  // exists. /api/local/health reports it without smoothing it into "ready".
   let snapshotState = { status: "building", errorCode: null };
   const releaseAutomaticContributionRetirementLock = () => {
     if (automaticContributionRetirementLockRelease !== null) {
@@ -3618,7 +3617,10 @@ function createPreparedLocalCompanionServer({
     if (snapshotPromise === null) {
       snapshotPromise = (async () => {
         try {
-          await dataStore.initialize();
+          // Publish the bounded startup projection first. The store retains
+          // validated prior evidence with its provenance; the normal refresh
+          // supplies the subsequent quick and full projections.
+          await dataStore.initialize({ purpose: "startup" });
           // The v1.0 incremental sync remains the only contribution scheduler.
           // A failure here must never take the local dashboard down.
           try {

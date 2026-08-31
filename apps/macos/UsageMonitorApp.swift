@@ -2535,6 +2535,71 @@ private final class NativeDashboardWebView: WKWebView {
     }
 }
 
+/// One document's bounded readiness observation. The monotonic clock and
+/// generation are supplied by the host, so delayed JavaScript completions can
+/// never ready or fail a replacement document.
+private struct NativeDashboardReadiness {
+    enum Observation: Equatable {
+        case waiting(TimeInterval)
+        case takingLonger
+        case ready
+        case timedOut
+        case ignored
+    }
+
+    static let slowThreshold: TimeInterval = 20
+    static let hardDeadline: TimeInterval = 120
+    private(set) var generation: UInt64 = 0
+    private var beganAt: TimeInterval?
+    private var delayReported = false
+    private var finished = false
+
+    @discardableResult
+    mutating func invalidate() -> UInt64 {
+        generation &+= 1
+        beganAt = nil
+        delayReported = false
+        finished = false
+        return generation
+    }
+
+    mutating func start(generation expected: UInt64, at now: TimeInterval) -> Bool {
+        guard expected == generation, beganAt == nil, now.isFinite else {
+            return false
+        }
+        beganAt = now
+        return true
+    }
+
+    func isObserving(_ expected: UInt64) -> Bool {
+        expected == generation && beganAt != nil && !finished
+    }
+
+    mutating func observe(
+        generation expected: UInt64,
+        at now: TimeInterval,
+        ready: Bool
+    ) -> Observation {
+        guard isObserving(expected), let beganAt, now.isFinite else {
+            return .ignored
+        }
+        let elapsed = max(0, now - beganAt)
+        if elapsed >= Self.hardDeadline {
+            finished = true
+            return .timedOut
+        }
+        if ready {
+            finished = true
+            return .ready
+        }
+        if elapsed >= Self.slowThreshold, !delayReported {
+            delayReported = true
+            return .takingLonger
+        }
+        return .waiting(elapsed < Self.slowThreshold ? 0.25 : 1)
+    }
+}
+
 /// The dashboard is hosted inside the app, so this web view is the product's
 /// primary surface. It is deliberately the narrowest possible browser: it may
 /// load exactly one origin — the loopback companion this launcher started —
@@ -2550,6 +2615,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     )
     private let onLoaded: () -> Void
     private let onFailure: (LauncherError) -> Void
+    private let onReadinessDelay: () -> Void
     private let onDownloadFailure: () -> Void
     private let openExternally: (URL) -> Void
     private let onNavigation: (String) -> Void
@@ -2562,6 +2628,14 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     private var pendingDownloadDestination: URL?
     private var latestCompletedDownload: URL?
     private var viewportPreparationAttempts = 0
+    private var dashboardReadiness = NativeDashboardReadiness()
+    private var dashboardContentPoll: DispatchWorkItem?
+    private var dashboardContentEvaluationInFlight = false
+    private var activeDashboardNavigation: WKNavigation?
+    private let navigationGenerations = NSMapTable<WKNavigation, NSNumber>(
+        keyOptions: .weakMemory,
+        valueOptions: .strongMemory
+    )
     /// False while the view holds no dashboard, so the blank page loaded on
     /// teardown can never be reported as a dashboard that opened.
     private var hasDashboardTarget = false
@@ -2583,10 +2657,12 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         onNavigation: @escaping (String) -> Void,
         onLanguagePreferenceChange: @escaping (
             TiboTattleLocalization.LanguagePreference
-        ) -> Void
+        ) -> Void,
+        onReadinessDelay: @escaping () -> Void = {}
     ) {
         self.onLoaded = onLoaded
         self.onFailure = onFailure
+        self.onReadinessDelay = onReadinessDelay
         self.onDownloadFailure = onDownloadFailure
         self.openExternally = openExternally
         self.onNavigation = onNavigation
@@ -2793,6 +2869,10 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     }
 
     func load(_ url: URL) {
+        let generation = invalidateDashboardContentObservation()
+        activeDashboardNavigation = nil
+        hasDashboardTarget = false
+        pendingDashboardURL = nil
         guard url.scheme?.lowercased() == "http",
               url.host == loopbackHost,
               let port = url.port
@@ -2804,15 +2884,18 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         hasDashboardTarget = true
         pendingDashboardURL = url
         viewportPreparationAttempts = 0
-        loadWhenViewportIsReady()
+        loadWhenViewportIsReady(generation: generation)
     }
 
     /// WKWebView can commit a document before AppKit has given its split pane a
     /// usable size. On a cold launch that produces a loaded, but white,
     /// dashboard until the user manually resizes the window. Defer the first
     /// request for a few main-loop passes until the embedded viewport exists.
-    private func loadWhenViewportIsReady() {
-        guard hasDashboardTarget, let url = pendingDashboardURL else { return }
+    private func loadWhenViewportIsReady(generation: UInt64) {
+        guard hasDashboardTarget,
+              generation == dashboardReadiness.generation,
+              let url = pendingDashboardURL
+        else { return }
         webView.superview?.layoutSubtreeIfNeeded()
         webView.layoutSubtreeIfNeeded()
         let viewport = webView.bounds.integral
@@ -2820,13 +2903,14 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
             guard viewportPreparationAttempts < 20 else {
                 pendingDashboardURL = nil
                 hasDashboardTarget = false
+                invalidateDashboardContentObservation()
                 onFailure(.dashboardViewportUnavailable)
                 return
             }
             viewportPreparationAttempts += 1
             DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
                 [weak self] in
-                self?.loadWhenViewportIsReady()
+                self?.loadWhenViewportIsReady(generation: generation)
             }
             return
         }
@@ -2834,10 +2918,17 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         var request = URLRequest(url: url)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         refreshDocumentStartScripts()
-        webView.load(request)
+        activeDashboardNavigation = webView.load(request)
+        if let navigation = activeDashboardNavigation {
+            navigationGenerations.setObject(
+                NSNumber(value: generation), forKey: navigation
+            )
+        }
     }
 
     func stop() {
+        invalidateDashboardContentObservation()
+        activeDashboardNavigation = nil
         allowedPort = nil
         hasDashboardTarget = false
         // The page this flag described is being discarded, so the flag it set
@@ -3108,24 +3199,42 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         decisionHandler(navigationResponse.canShowMIMEType ? .allow : .download)
     }
 
-    /// How long the document is given to render something before the view is
-    /// declared unavailable, and how often it is asked.
-    ///
-    /// `didFinish` only reports that the *document* finished loading. This
-    /// dashboard then fetches its evidence from the loopback companion and
-    /// renders afterwards, so `#main` is legitimately near-empty at that
-    /// instant. Sampling it once there judged an asynchronous condition at a
-    /// single moment and reported a perfectly working view as broken - which
-    /// is why a right-click Reload failed with
-    /// `UM_MACOS_DASHBOARD_VIEW_UNAVAILABLE` while retrying moments later
-    /// succeeded. The deadline still fails closed: a document that never
-    /// renders is still reported, just not one that is merely slower than a
-    /// single turn of the run loop.
-    private static let dashboardContentDeadline: TimeInterval = 20
-    private static let dashboardContentPollInterval: TimeInterval = 0.25
+    @discardableResult
+    private func invalidateDashboardContentObservation() -> UInt64 {
+        dashboardContentPoll?.cancel()
+        dashboardContentPoll = nil
+        dashboardContentEvaluationInFlight = false
+        return dashboardReadiness.invalidate()
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didStartProvisionalNavigation navigation: WKNavigation!
+    ) {
+        guard hasDashboardTarget, let navigation else { return }
+        if let generation = navigationGenerations.object(forKey: navigation) {
+            guard generation.uint64Value == dashboardReadiness.generation else {
+                return
+            }
+        } else {
+            // WebKit's own Reload does not pass through load(_:). It still
+            // owns a fresh generation and invalidates the prior page's work.
+            let generation = invalidateDashboardContentObservation()
+            navigationGenerations.setObject(
+                NSNumber(value: generation), forKey: navigation
+            )
+        }
+        activeDashboardNavigation = navigation
+    }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        guard hasDashboardTarget else { return }
+        guard hasDashboardTarget, let navigation,
+              navigation === activeDashboardNavigation
+        else { return }
+        let generation = dashboardReadiness.generation
+        guard dashboardReadiness.start(
+            generation: generation, at: ProcessInfo.processInfo.systemUptime
+        ) else { return }
         // A freshly loaded document has no sign-in in flight until it says so,
         // so a stale flag from a prior page never blocks teardown after a
         // reload.
@@ -3140,31 +3249,79 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         )
         awaitDashboardContent(
             in: webView,
-            deadline: Date().addingTimeInterval(Self.dashboardContentDeadline)
+            generation: generation
         )
     }
 
-    private func awaitDashboardContent(in webView: WKWebView, deadline: Date) {
-        guard hasDashboardTarget else { return }
+    /// One bounded heartbeat continues independently of a JavaScript reply.
+    /// A hung renderer therefore cannot evade the hard deadline, and at most
+    /// one evaluation is in flight. The slow threshold keeps the visible page
+    /// and its startup-refresh intent; it is not a terminal failure.
+    private func awaitDashboardContent(in webView: WKWebView, generation: UInt64) {
+        guard hasDashboardTarget, dashboardReadiness.isObserving(generation) else {
+            return
+        }
+        let observation = dashboardReadiness.observe(
+            generation: generation,
+            at: ProcessInfo.processInfo.systemUptime,
+            ready: false
+        )
+        let interval: TimeInterval
+        switch observation {
+        case .waiting(let nextInterval):
+            interval = nextInterval
+        case .takingLonger:
+            onReadinessDelay()
+            interval = 1
+        case .timedOut:
+            finishDashboardContentObservation(ready: false)
+            return
+        case .ready, .ignored:
+            return
+        }
+        let poll = DispatchWorkItem { [weak self, weak webView] in
+            guard let self, let webView,
+                  self.dashboardReadiness.isObserving(generation)
+            else { return }
+            self.dashboardContentPoll = nil
+            self.awaitDashboardContent(in: webView, generation: generation)
+        }
+        dashboardContentPoll = poll
+        DispatchQueue.main.asyncAfter(deadline: .now() + interval, execute: poll)
+        guard !dashboardContentEvaluationInFlight else { return }
+        dashboardContentEvaluationInFlight = true
         webView.evaluateJavaScript(
             "document.documentElement?.dataset.localDashboardReady === 'true';"
         ) { [weak self] value, error in
-            guard let self, self.hasDashboardTarget else { return }
+            guard let self, self.hasDashboardTarget,
+                  self.dashboardReadiness.isObserving(generation)
+            else { return }
+            self.dashboardContentEvaluationInFlight = false
             let localDashboardReady = (value as? NSNumber)?.boolValue ?? false
             if error == nil, localDashboardReady {
-                self.onLoaded()
-                return
+                let outcome = self.dashboardReadiness.observe(
+                    generation: generation,
+                    at: ProcessInfo.processInfo.systemUptime,
+                    ready: true
+                )
+                if outcome == .ready {
+                    self.finishDashboardContentObservation(ready: true)
+                } else if outcome == .timedOut {
+                    self.finishDashboardContentObservation(ready: false)
+                }
             }
-            guard Date() < deadline else {
-                self.hasDashboardTarget = false
-                self.onFailure(.dashboardReadinessTimeout)
-                return
-            }
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + Self.dashboardContentPollInterval
-            ) { [weak self] in
-                self?.awaitDashboardContent(in: webView, deadline: deadline)
-            }
+        }
+    }
+
+    private func finishDashboardContentObservation(ready: Bool) {
+        dashboardContentPoll?.cancel()
+        dashboardContentPoll = nil
+        dashboardContentEvaluationInFlight = false
+        if ready {
+            onLoaded()
+        } else {
+            hasDashboardTarget = false
+            onFailure(.dashboardReadinessTimeout)
         }
     }
 
@@ -3173,7 +3330,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         didFail navigation: WKNavigation!,
         withError error: Error
     ) {
-        reportNavigationFailure(error)
+        reportNavigationFailure(error, navigation: navigation)
     }
 
     func webView(
@@ -3181,24 +3338,29 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         didFailProvisionalNavigation navigation: WKNavigation!,
         withError error: Error
     ) {
-        reportNavigationFailure(error)
+        reportNavigationFailure(error, navigation: navigation)
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         guard hasDashboardTarget else { return }
+        invalidateDashboardContentObservation()
+        activeDashboardNavigation = nil
         hasDashboardTarget = false
         onFailure(.dashboardContentProcessTerminated)
     }
 
-    private func reportNavigationFailure(_ error: Error) {
+    private func reportNavigationFailure(_ error: Error, navigation: WKNavigation?) {
         // A navigation this delegate cancelled on purpose is not a failure.
         let failure = error as NSError
         guard hasDashboardTarget,
+              navigation == nil || navigation === activeDashboardNavigation,
               failure.domain != NSURLErrorDomain
                 || failure.code != NSURLErrorCancelled
         else {
             return
         }
+        invalidateDashboardContentObservation()
+        activeDashboardNavigation = nil
         hasDashboardTarget = false
         onFailure(.dashboardNavigationFailed)
     }
@@ -5380,6 +5542,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 },
                 onLanguagePreferenceChange: { [weak self] preference in
                     self?.changeLanguagePreference(preference)
+                },
+                onReadinessDelay: { [weak self] in
+                    self?.dashboardWebViewTakingLonger()
                 }
             )
             let chrome = installDashboardChrome(webView: created.webView)
@@ -5419,7 +5584,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         host.load(url)
     }
 
+    private func dashboardWebViewTakingLonger() {
+        // The document is still loading honest local evidence. Keep it visible
+        // and keep the one pending startup refresh; no failure/reset is implied.
+        lastLifecycleStatus = "Dashboard loading slowly"
+        updateNativeToolbar(
+            title: TiboTattleLocalization.string(.nativeDashboardStarting),
+            isRefreshing: nativeRefreshInFlight,
+            refreshEnabled: dashboardURL != nil
+        )
+    }
+
     private func dashboardWebViewLoaded() {
+        if lastFailureCode == LauncherError.dashboardReadinessTimeout.failureCode {
+            lastFailureCode = nil
+            lastRecoverySuggestion = nil
+        }
         dashboardWebViewShowing = true
         dashboardContainer.isHidden = false
         statusStack.isHidden = true
@@ -5965,7 +6145,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func dashboardWebViewFailed(_ failure: LauncherError) {
         cancelNativeRefreshSchedule()
-        startupAutomaticRefreshPending = false
+        // A hard readiness deadline stops observation, not the still-unspent
+        // initial refresh. An explicit Open Dashboard can load a new document
+        // and consume it once. Genuine navigation/renderer failures cancel it.
+        if case .dashboardReadinessTimeout = failure {
+            // Preserved until a valid ready result or explicit teardown.
+        } else {
+            startupAutomaticRefreshPending = false
+        }
         nativeEvidenceState = .readFailed
         dashboardWebViewShowing = false
         dashboardContainer.isHidden = true
@@ -12199,7 +12386,67 @@ private enum NativeSettingsLayoutSmokeTest {
 /// loopback server is healthy but WebKit receives no usable display frame.
 @MainActor
 private enum NativeDashboardLayoutSmokeTest {
+    /// Executes the same clock/generation policy used by the real WebKit host.
+    /// No sleeps, page loads, companion, credentials or user data are involved.
+    private static func readinessContract() -> Bool {
+        var state = NativeDashboardReadiness()
+        let initial = state.invalidate()
+        guard state.observe(generation: initial, at: 0, ready: true) == .ignored,
+              state.start(generation: initial, at: 0),
+              !state.start(generation: initial, at: 1),
+              state.observe(generation: initial, at: 0, ready: false) == .waiting(0.25),
+              state.observe(generation: initial, at: 19.9, ready: false) == .waiting(0.25),
+              state.observe(generation: initial, at: 20, ready: false) == .takingLonger,
+              state.observe(generation: initial, at: 21, ready: false) == .waiting(1),
+              state.observe(generation: initial, at: 35, ready: true) == .ready,
+              state.observe(generation: initial, at: 36, ready: true) == .ignored,
+              !state.isObserving(initial)
+        else { return false }
+
+        let replacement = state.invalidate()
+        guard replacement != initial,
+              state.start(generation: replacement, at: 40),
+              // Both a late success and the old deadline are inert.
+              state.observe(generation: initial, at: 45, ready: true) == .ignored,
+              state.observe(generation: initial, at: 125, ready: false) == .ignored,
+              state.observe(generation: replacement, at: 45, ready: false) == .waiting(0.25),
+              state.observe(generation: replacement, at: 60, ready: false) == .takingLonger,
+              // The watchdog still expires if JavaScript never answers.
+              state.observe(generation: replacement, at: 159.9, ready: false) == .waiting(1),
+              state.observe(generation: replacement, at: 160, ready: false) == .timedOut,
+              state.observe(generation: replacement, at: 161, ready: true) == .ignored,
+              !state.isObserving(replacement)
+        else { return false }
+
+        let stopped = state.invalidate()
+        guard state.start(generation: stopped, at: 200) else { return false }
+        let next = state.invalidate()
+        guard state.observe(generation: stopped, at: 201, ready: true) == .ignored,
+              !state.isObserving(next),
+              state.start(generation: next, at: 201),
+              state.observe(generation: next, at: 202, ready: true) == .ready,
+              state.observe(generation: next, at: 203, ready: true) == .ignored
+        else { return false }
+
+        let tooLate = state.invalidate()
+        guard state.start(generation: tooLate, at: 300),
+              state.observe(generation: tooLate, at: 420, ready: true) == .timedOut
+        else { return false }
+        return true
+    }
+
     static func run() -> Int32 {
+        guard readinessContract() else {
+            FileHandle.standardError.write(Data(
+                "macOS dashboard readiness lifecycle smoke failed\n".utf8
+            ))
+            return 1
+        }
+        print(
+            "USAGE_MONITOR_MACOS_DASHBOARD_READINESS "
+                + "early=true late=true once=true stale_callbacks=ignored "
+                + "cancelled=true hung_renderer=bounded hard_deadline=120"
+        )
         let application = NSApplication.shared
         application.setActivationPolicy(.accessory)
         let host = DashboardWebHost(

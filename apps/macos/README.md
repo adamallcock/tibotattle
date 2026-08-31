@@ -42,6 +42,17 @@ before treating source tests as signed-upgrade evidence.
 
 ## Consumer lifecycle in the app
 
+The companion's first snapshot uses its bounded startup projection and retains
+only validated last-good evidence with explicit coverage labels. Full history
+accounting follows through the normal refresh after the first local render;
+optional contribution requests do not define local-dashboard readiness.
+The native host treats 20 seconds as a quiet slow-load threshold, keeps the
+document visible, and continues one generation-fenced readiness observation for
+at most 120 seconds. A stalled JavaScript reply cannot suspend that deadline.
+New navigation or teardown cancels the old observation. A valid late result (or
+an explicit Open Dashboard after the hard deadline) consumes the pending initial
+refresh once and clears the stale readiness-timeout diagnostic.
+
 1. Launch **TiboTattle.app**.
 2. On the first launch, review the one-time **Get Started** disclosure. It
    names every normal local source: selected Codex `sessions` and
@@ -411,10 +422,10 @@ a claim that Sparkle has updated the preview client.
 `CFBundleShortVersionString` remains the user-facing package version. The
 Sparkle ordering key, `CFBundleVersion`, is explicitly allocated for signed
 builds that retain the stable bundle identifier. The 0.1.17 internal-dogfood
-build is `1023.1`; the 0.1.17 stable final remains `1024`. The migration
-candidate orders strictly after the retained RC2 build `1023` and earlier
-shared-identity dogfood build `1022`, while stable orders after the dogfood
-candidate. A future signed version/channel must add a reviewed
+build is `1023.2`; the 0.1.17 stable final remains `1024`. This startup-recovery
+candidate orders strictly after RC3 `1023.1`, retained RC2 `1023`, and earlier
+shared-identity dogfood `1022`, while stable orders after the dogfood candidate.
+A future signed version/channel must add a reviewed
 monotonic allocation before release tooling will run.
 
 Release tooling accepts `USAGE_MONITOR_BUNDLE_VERSION` only when it exactly
@@ -511,7 +522,7 @@ For a later stable release, use `--previous-stable-manifest` in place of
 the release command refuses to guess which continuity policy applies.
 `USAGE_MONITOR_BUNDLE_VERSION` is optional as an operator assertion only; when
 present it must exactly equal the checked-in allocation for the selected
-signed release version and channel (`1023.1` for 0.1.17 internal dogfood,
+signed release version and channel (`1023.2` for 0.1.17 internal dogfood,
 `1024` for 0.1.17 stable).
 
 `config/deployment-endpoints.js` is the reviewed source for the public origin

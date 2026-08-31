@@ -1332,7 +1332,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.doesNotMatch(source, /webView\.autoresizingMask = \[\.width/u);
   assert.match(source, /override func layout\(\) \{[\s\S]*?fitWebViewToBounds\(\)/u);
   assert.match(source, /webView\.frame = frame/u);
-  assert.match(source, /private func loadWhenViewportIsReady\(\)/u);
+  assert.match(source, /private func loadWhenViewportIsReady\(generation: UInt64\)/u);
   assert.match(source, /viewport\.width >= 120, viewport\.height >= 120/u);
   assert.match(source, /nativeDashboardChrome\?\.prepareReportViewport\(\)/u);
   // `didFinish` only means that WebKit has loaded the document shell. The
@@ -1341,7 +1341,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   // sampling a transient DOM node that is legitimately empty during startup.
   assert.match(
     source,
-    /private func awaitDashboardContent\([\s\S]*?webView\.evaluateJavaScript\(\s*"document\.documentElement\?\.dataset\.localDashboardReady === 'true';"\s*\) \{[\s\S]*?guard let self, self\.hasDashboardTarget else \{ return \}[\s\S]*?let localDashboardReady = \(value as\? NSNumber\)\?\.boolValue \?\? false[\s\S]*?if error == nil, localDashboardReady \{[\s\S]*?self\.onLoaded\(\)[\s\S]*?return/u,
+    /private func awaitDashboardContent\([\s\S]*?webView\.evaluateJavaScript\(\s*"document\.documentElement\?\.dataset\.localDashboardReady === 'true';"\s*\) \{[\s\S]*?guard let self, self\.hasDashboardTarget,[\s\S]*?self\.dashboardReadiness\.isObserving\(generation\)[\s\S]*?let localDashboardReady = \(value as\? NSNumber\)\?\.boolValue \?\? false[\s\S]*?if error == nil, localDashboardReady \{[\s\S]*?ready: true[\s\S]*?if outcome == \.ready[\s\S]*?self\.finishDashboardContentObservation\(ready: true\)/u,
   );
   assert.doesNotMatch(source, /document\.querySelector\('#main'\)\?\.innerText/u);
   assert.match(source, /addSplitViewItem\(reportItem\)/u);
@@ -1839,7 +1839,7 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   );
   assert.match(
     source,
-    /func webView\(_ webView: WKWebView, didFinish navigation: WKNavigation!\) \{\s*\n\s*guard hasDashboardTarget else \{ return \}/u,
+    /func webView\(_ webView: WKWebView, didFinish navigation: WKNavigation!\) \{\s*\n\s*guard hasDashboardTarget, let navigation,\s*\n\s*navigation === activeDashboardNavigation\s*\n\s*else \{ return \}/u,
   );
 
   // A failed web view never becomes the only thing on screen: the status
@@ -1889,7 +1889,11 @@ test("the in-app dashboard web view stays pinned to the loopback companion", asy
   );
   assert.match(
     source,
-    /guard Date\(\) < deadline else \{[\s\S]*?self\.onFailure\(\.dashboardReadinessTimeout\)/u,
+    /case \.timedOut:[\s\S]*?finishDashboardContentObservation\(ready: false\)/u,
+  );
+  assert.match(
+    source,
+    /private func finishDashboardContentObservation\(ready: Bool\)[\s\S]*?hasDashboardTarget = false[\s\S]*?onFailure\(\.dashboardReadinessTimeout\)/u,
   );
   assert.match(
     source,
@@ -2021,17 +2025,50 @@ test("native dashboard launch gates its first refresh on the rendered page", asy
     "the launch-only refresh is consumed before collection starts",
   );
 
-  // A page that never marks its result ready, a navigation failure, a
-  // companion exit, or an explicit teardown all discard the pending work.
+  // A deadline stops observation but an explicit Open Dashboard may still
+  // consume the unspent initial refresh. Real failures and teardown discard it.
   assert.match(
     dashboardFailure,
-    /cancelNativeRefreshSchedule\(\)[\s\S]*?startupAutomaticRefreshPending = false/u,
+    /cancelNativeRefreshSchedule\(\)[\s\S]*?if case \.dashboardReadinessTimeout = failure \{[\s\S]*?\} else \{\s*startupAutomaticRefreshPending = false/u,
   );
   assert.match(
     dashboardTeardown,
     /cancelNativeRefreshSchedule\(\)[\s\S]*?startupAutomaticRefreshPending = false/u,
   );
   assert.match(companionExit, /startupAutomaticRefreshPending = false/u);
+  const takingLonger = section(
+    "private func dashboardWebViewTakingLonger()",
+    "private func dashboardWebViewLoaded()",
+  );
+  assert.doesNotMatch(takingLonger, /startupAutomaticRefreshPending = false/u);
+  assert.doesNotMatch(takingLonger, /dashboardContainer\.isHidden = true/u);
+  assert.doesNotMatch(takingLonger, /nativeEvidenceState = \.readFailed/u);
+  assert.match(dashboardLoaded,
+    /lastFailureCode == LauncherError\.dashboardReadinessTimeout\.failureCode[\s\S]*?lastFailureCode = nil[\s\S]*?lastRecoverySuggestion = nil/u);
+});
+
+test("native dashboard readiness fences documents and keeps a bounded renderer watchdog", async () => {
+  const source = await readFile(SWIFT_SOURCE, "utf8");
+  const host = source.slice(source.indexOf("private final class DashboardWebHost:"),
+    source.indexOf("// MARK: - Window, dialog, and file affordances"));
+  assert.match(source, /static let slowThreshold: TimeInterval = 20/u);
+  assert.match(source, /static let hardDeadline: TimeInterval = 120/u);
+  assert.match(host, /func load\(_ url: URL\)[\s\S]*?invalidateDashboardContentObservation\(\)/u);
+  assert.match(host, /func stop\(\)[\s\S]*?invalidateDashboardContentObservation\(\)/u);
+  assert.match(host, /didStartProvisionalNavigation[\s\S]*?generation\.uint64Value == dashboardReadiness\.generation/u);
+  assert.match(host, /didFinish navigation:[\s\S]*?navigation === activeDashboardNavigation/u);
+  assert.match(host, /private func loadWhenViewportIsReady[\s\S]*?generation == dashboardReadiness\.generation/u);
+  const polling = host.slice(host.indexOf("private func awaitDashboardContent("),
+    host.indexOf("private func finishDashboardContentObservation("));
+  const scheduleOffset = polling.indexOf("DispatchQueue.main.asyncAfter");
+  const evaluationOffset = polling.indexOf("webView.evaluateJavaScript");
+  assert.ok(scheduleOffset >= 0, "the independent watchdog schedule exists");
+  assert.ok(evaluationOffset >= 0, "the readiness JavaScript evaluation exists");
+  assert.ok(scheduleOffset < evaluationOffset,
+    "watchdog is scheduled without waiting for a JavaScript completion");
+  assert.match(polling, /guard !dashboardContentEvaluationInFlight else \{ return \}/u);
+  assert.match(polling, /dashboardReadiness\.isObserving\(generation\)/u);
+  assert.match(host, /private func invalidateDashboardContentObservation[\s\S]*?dashboardContentPoll\?\.cancel\(\)[\s\S]*?dashboardReadiness\.invalidate\(\)/u);
 });
 
 test("native app disables AppKit window tabbing before startup", async () => {
@@ -4227,11 +4264,11 @@ test("development and preview builds treat the release-channel policy as optiona
 
 test("macOS release metadata validates versions, production mode, and Keychain references", async () => {
   assert.equal(normalizeMacOSBundleVersion(), DERIVED_MACOS_BUNDLE_VERSION);
-  assert.equal(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION, "1023.1");
+  assert.equal(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION, "1023.2");
   assert.equal(STABLE_SIGNED_BUNDLE_VERSION, "1024");
   assert.equal(
     normalizeMacOSBundleVersion(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
-    "1023.1",
+    "1023.2",
   );
   assert.equal(
     compareMacOSBundleVersions(
@@ -4243,7 +4280,12 @@ test("macOS release metadata validates versions, production mode, and Keychain r
   assert.equal(
     compareMacOSBundleVersions("1023", INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
     -1,
-    "the migration dogfood must be strictly newer than the installed RC2",
+    "the corrective dogfood must be strictly newer than the retained RC2",
+  );
+  assert.equal(
+    compareMacOSBundleVersions("1023.1", INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    -1,
+    "the corrective dogfood must be strictly newer than the installed RC3",
   );
   assert.equal(
     compareMacOSBundleVersions(
@@ -4252,13 +4294,13 @@ test("macOS release metadata validates versions, production mode, and Keychain r
     ) > 0,
     true,
   );
-  for (const unallocated of ["1023", "1023.0", "1023.1.0", "1024", "2000.1.17"]) {
+  for (const unallocated of ["1023", "1023.0", "1023.1", "1023.1.0", "1023.2.0", "1024", "2000.1.17"]) {
     assert.throws(
       () => readMacOSReleaseBuildConfiguration({
         USAGE_MONITOR_BUNDLE_VERSION: unallocated,
       }, INTERNAL_DOGFOOD_RELEASE_CHANNEL),
       { code: "MACOS_BUNDLE_VERSION_MISMATCH" },
-      "operator overrides cannot reuse RC2, alias the allocation, or consume stable/preview builds",
+      "operator overrides cannot reuse RC2/RC3, alias the allocation, or consume stable/preview builds",
     );
   }
   assert.equal(
@@ -8025,6 +8067,10 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.match(
       nativeDashboardLayoutSmoke.stdout,
       /^USAGE_MONITOR_MACOS_NATIVE_DASHBOARD_LAYOUT web_width=[6-9][0-9]{2,} web_height=[6-9][0-9]{2,}$/mu,
+    );
+    assert.match(
+      nativeDashboardLayoutSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_DASHBOARD_READINESS early=true late=true once=true stale_callbacks=ignored cancelled=true hung_renderer=bounded hard_deadline=120$/mu,
     );
     // A sidebar that cannot be reopened is a window with no navigation: the
     // rows live only here, because the web report hides its own sidebar in
