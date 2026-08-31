@@ -124,6 +124,9 @@ published-release claim.
   equivalent table headings whose help retains the Standard-rate basis. The
   cache-continuity table drops the Estimated lost reuse column without changing
   the underlying calculation.
+- Aligns full-history headline and timeline input-context pricing with the
+  accounting cache's existing compatibility rule, fixing differing API
+  equivalents for the same older usage without changing token totals.
 - Replaces self-service hosted-delete controls with confirmed **Disconnect this
   Mac**. Disconnect durably pauses this Mac's contribution delivery without
   deleting hosted history, local analysis, or other devices; signing out is a

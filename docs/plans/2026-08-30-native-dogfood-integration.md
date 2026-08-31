@@ -88,16 +88,48 @@ exclusion is superseded. Source integration does not retire the live hosted
 endpoint, and the separate owner-access, privacy-intake and retention cutover
 requirements remain in force.
 
-After integrating #86, the combined UI gate passed 412/412 and the companion
-gate passed 274/274. The Worker tests passed 422/422, but its dry-run release
-staging refused concurrent uncommitted documentation edits; the complete gate
-must be rerun from the frozen clean tree. No test was disabled or weakened.
+At the initial frozen head `04a88f2c`, the combined UI gate passed 412/412,
+the companion gate 274/274, and the retained native gate 65/65. The complete
+Worker gate passed, including 422 Worker tests, 174 script tests and both
+dry-run bundles, after legitimate no-installer public-site inputs were prepared
+from the clean tree. Earlier dirty-tree and missing-generated-site refusals
+were setup failures, not passing dry runs. No hosted deployment occurred.
 
-The stable index, matching salt and collector were preserved with verified
-unchanged originals. Copy inspection found physical schema 9, an intact index
-and partial published generation; migration has not run. Existing Developer ID
-and notarization configuration authenticated successfully without signing or
-submission. The appbar owner supplied passing compiled smoke on the exact
-#87/#88 merge. No R7 regeneration, signing, migration, installation or
-release publication has been completed for this source set. Private state
-records and release inputs remain local and outside tracked docs.
+The first complete root run reported 3,199 passes, five failures and 21 skips
+from 3,225 tests. Two failures were stale protected R7 receipts. The other three
+were permission-fixture setup failures caused by launching tests under an
+owner-only umask; their unchanged test files passed all 35 tests under the
+normal fixture umask. Preserve owner-only log creation separately from the test
+process umask. A final full root run remains required; no assertion, timeout or
+test was weakened.
+
+Copy-first schema-9 to schema-11 migration and the subsequent accounting
+rebuild completed successfully on `04a88f2c`, with SQLite integrity, generation
+provenance, source-cursor and original-backup checks passing. Fixed-cutoff
+historical usage aggregates and every UTC-day aggregate were identical; the
+collector observation aggregates were unchanged. A third-copy incremental
+replay completed without a cold rebuild or any removed/changed prior usage
+event. Late-discovered source segments explain its additions exactly; this is
+not a claim that the changing live corpus has identical whole-period totals.
+
+The final projection comparison then exposed a genuine context-pricing gap:
+the full-history headline/timeline omitted reported input context and used a
+different missing-context fallback from the replay-safe cache. The narrow
+projection correction now passes 155 focused tests, including same-generation
+full-snapshot/history/timeline parity. It preserves the existing `legacy_zero`
+policy and does not change price cards, cache semantics, ingestion or schema.
+The real-copy projection comparison, R7 and final source/artifact checks must
+bind the corrected source.
+
+Existing Developer ID and notarization configuration authenticated successfully
+without signing or submission. The prior signed 0.1.16 dogfood DMG and receipt
+were located and its checksum matched. A schema-9 preservation copy alone is
+not a working rollback for an old reader that only supports schema 8; do not
+launch that reader against the newer state. Before normal installed launch,
+check whether existing consent, pairing or a pending sign-in can automatically
+resume contribution. Seek explicit direction if that would violate the
+no-pair/no-upload test boundary; do not alter consent as a workaround.
+
+No R7 regeneration, signing, installation or release publication has yet been
+completed for this source set. Private state records, comparisons, UI captures
+and release inputs remain local and outside tracked docs.

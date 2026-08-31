@@ -246,6 +246,7 @@ async function* usageBatches(database) {
            s.agent_scope AS agent_scope,
            s.lineage_disposition AS lineage_disposition,
            a.status AS scope_status,
+           u.total_input_context AS total_input_context,
            u.tokens_in_uncached AS tokens_in_uncached,
            u.tokens_in_cache_read AS tokens_in_cache_read,
            u.tokens_in_cache_write AS tokens_in_cache_write,
@@ -279,6 +280,9 @@ function recordShape(row) {
   return {
     observedAt: new Date(Number(row.observed_at_ms)).toISOString(),
     model: row.model_id,
+    // Match the unified accounting adapter's legacy_zero compatibility:
+    // retain observed context, but never re-infer a NULL from component sums.
+    totalInputContextTokens: row.total_input_context ?? 0,
     components: {
       input_uncached_tokens: tokenCount(row.tokens_in_uncached),
       input_cache_read_tokens: tokenCount(row.tokens_in_cache_read),
