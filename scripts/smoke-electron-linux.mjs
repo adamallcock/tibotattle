@@ -12,6 +12,7 @@
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
 import {
+  chmod,
   mkdir,
   mkdtemp,
   rm,
@@ -23,6 +24,12 @@ import { once } from "node:events";
 import { createServer, isIP } from "node:net";
 import { fileURLToPath } from "node:url";
 
+import {
+  DESKTOP_FIRST_RUN_RECEIPT_FILE_NAME,
+  DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
+  validateDesktopFirstRunReceipt,
+} from "../apps/electron/desktop-first-run.js";
+
 const require = createRequire(import.meta.url);
 const REPOSITORY_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const ELECTRON_MAIN = resolve(REPOSITORY_ROOT, "apps/electron/main.js");
@@ -32,6 +39,8 @@ const MAX_REFRESH_MS = 45_000;
 const MAX_SHUTDOWN_MS = 10_000;
 const MAX_NETWORK_EVIDENCE_URLS = 512;
 const MAX_NETWORK_EVIDENCE_URL_LENGTH = 2_048;
+const MAX_JSON_RESPONSE_BYTES = 1_048_576;
+const MAX_CDP_PAGE_TARGETS = 16;
 const CLI_FAILURE_STATUS = "ELECTRON_LINUX_SMOKE_FAILED";
 const NETWORK_BOUNDARY = "network-none";
 const PLATFORM_ARCHITECTURES = Object.freeze({
@@ -44,8 +53,20 @@ export const ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES = Object.freeze({
   changedReceipt: "ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_RECEIPT_CHANGED",
   failed: "ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_FAILED",
   cancelled: "ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_CANCELLED",
+  degradedInvalid: "ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_DEGRADED_INVALID",
   boundaryInvalid: "ELECTRON_LINUX_SMOKE_REFRESH_BOUNDARY_INVALID",
 });
+export const ELECTRON_LINUX_SMOKE_DEGRADED_FAILURE_CODES = Object.freeze([
+  "codex_rollout_compression_unsupported",
+  "codex_rollout_filename_identity_mismatch",
+  "codex_rollout_generation_ambiguous",
+  "codex_rollout_lineage_invalid",
+  "codex_rollout_content_invalid",
+  "codex_rollout_tail_incomplete",
+]);
+const DEGRADED_FAILURE_CODE_SET = new Set(
+  ELECTRON_LINUX_SMOKE_DEGRADED_FAILURE_CODES,
+);
 
 /**
  * Classify one renderer startup-refresh observation without consulting the
@@ -103,7 +124,49 @@ export function classifyAutomaticStartupRefreshReceipt({
     });
   }
   if (refresh.status === "succeeded") {
-    return Object.freeze({ status: "completed", refreshId: refresh.refreshId });
+    return Object.freeze({
+      status: "completed",
+      refreshId: refresh.refreshId,
+      terminalStatus: "succeeded",
+    });
+  }
+  if (refresh.status === "degraded") {
+    const generation = refresh.result?.unifiedIndex?.generation;
+    const accounting = refresh.result?.accounting;
+    const coherent = refresh.errorCode === "refresh_degraded"
+      && refresh.failedStep === "unified_index"
+      && DEGRADED_FAILURE_CODE_SET.has(refresh.failureCode)
+      && refresh.result?.unifiedIndex?.status === "ingested"
+      && generation?.status === "partial"
+      && generation?.blockReason === "codex_rollout_sources_quarantined"
+      && Number.isSafeInteger(generation.skippedSourceCount)
+      && generation.skippedSourceCount > 0
+      && Number.isSafeInteger(generation.skippedThreadCount)
+      && generation.skippedThreadCount > 0
+      && Number.isSafeInteger(generation.reasonCounts?.[refresh.failureCode])
+      && generation.reasonCounts[refresh.failureCode] > 0
+      && generation.discoveryComplete === true
+      && generation.diagnosticsComplete === true
+      && generation.usageProvenanceComplete === true
+      && generation.sourceOrderComplete === true
+      && generation.quotaProvenanceComplete === true
+      && accounting?.status === "replay_safe"
+      && accounting.sourceMode === "unified"
+      && accounting.coverageStatus === "partial"
+      && accounting.generationMatched === true
+      && accounting.fallbackCount === 0
+      && accounting.diagnosticsAvailable === true;
+    return coherent
+      ? Object.freeze({
+        status: "completed",
+        refreshId: refresh.refreshId,
+        terminalStatus: "degraded",
+        degradedFailureCode: refresh.failureCode,
+      })
+      : Object.freeze({
+        status: "failed",
+        errorCode: ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.degradedInvalid,
+      });
   }
   if (refresh.status === "failed") {
     return Object.freeze({
@@ -150,6 +213,7 @@ export function assertContainerContract({
   platform = process.platform,
   architecture = process.arch,
   imagePlatform = process.env.USAGE_MONITOR_LINUX_IMAGE_PLATFORM,
+  sourceRevision = process.env.TIBOTATTLE_IMAGE_SOURCE_REVISION,
   networkBoundary = process.env.USAGE_MONITOR_LINUX_NETWORK_BOUNDARY,
   networkInterfacesImpl = networkInterfaces,
 } = {}) {
@@ -162,6 +226,10 @@ export function assertContainerContract({
   }
   if (networkBoundary !== NETWORK_BOUNDARY) {
     fail("Linux smoke requires the caller-enforced network-none runtime boundary");
+  }
+  if (typeof sourceRevision !== "string"
+      || !/^[0-9a-f]{40}$/u.test(sourceRevision)) {
+    fail("Linux smoke requires an exact image source revision");
   }
   let interfaces;
   try {
@@ -188,6 +256,7 @@ export function assertContainerContract({
   return Object.freeze({
     imagePlatform,
     architecture,
+    sourceRevision,
     networkBoundary,
     networkBoundaryEvidence: "loopback-only",
   });
@@ -248,7 +317,12 @@ export async function waitFor(predicate, timeoutMs, label) {
   let lastError = null;
   while (Date.now() - started < timeoutMs) {
     try {
-      const value = await predicate();
+      const remaining = Math.max(1, timeoutMs - (Date.now() - started));
+      const value = await withTimeout(
+        Promise.resolve().then(predicate),
+        remaining,
+        label,
+      );
       if (value) return value;
     } catch (error) {
       if (typeof error?.code === "string"
@@ -262,25 +336,85 @@ export async function waitFor(predicate, timeoutMs, label) {
   throw new Error(`${label} timed out${lastError ? ` (${lastError.message})` : ""}`);
 }
 
-async function createSyntheticHome() {
+export async function createSyntheticHome() {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-electron-linux-"));
   const home = join(root, "home");
   const codexHome = join(home, ".codex");
   const claudeHome = join(home, ".claude");
   const stateRoot = join(root, "state");
+  const userData = join(root, "user-data");
+  const settingsRoot = join(userData, "desktop-settings");
   const runtimeDirectory = join(root, "runtime");
-  await mkdir(join(codexHome, "sessions"), { recursive: true, mode: 0o700 });
-  await mkdir(join(codexHome, "archived_sessions"), { recursive: true, mode: 0o700 });
-  await mkdir(claudeHome, { recursive: true, mode: 0o700 });
-  await mkdir(runtimeDirectory, { recursive: true, mode: 0o700 });
-  // The companion only needs a readable synthetic source to render its local
-  // evidence view. Keep the fixture content intentionally non-user-like.
-  await writeFile(
-    join(codexHome, "sessions", "rollout-linux-smoke.jsonl"),
-    `${JSON.stringify({ type: "session_meta", id: "linux-smoke" })}\n`,
-    { mode: 0o600 },
-  );
-  return Object.freeze({ root, home, codexHome, claudeHome, stateRoot, runtimeDirectory });
+  const configHome = join(home, ".config");
+  const cacheHome = join(home, ".cache");
+  const dataHome = join(home, ".local", "share");
+  const sessions = join(codexHome, "sessions");
+  const archivedSessions = join(codexHome, "archived_sessions");
+  const directories = [
+    home,
+    codexHome,
+    sessions,
+    archivedSessions,
+    claudeHome,
+    stateRoot,
+    userData,
+    settingsRoot,
+    runtimeDirectory,
+    configHome,
+    cacheHome,
+    dataHome,
+  ];
+  try {
+    await Promise.all(directories.map((directory) => mkdir(directory, {
+      recursive: true,
+      mode: 0o700,
+    })));
+    await Promise.all(directories.map((directory) => chmod(directory, 0o700)));
+
+    // The companion only needs a readable synthetic source to render its local
+    // evidence view. Keep the fixture content intentionally non-user-like.
+    await writeFile(
+      join(sessions, "rollout-linux-smoke.jsonl"),
+      `${JSON.stringify({ type: "session_meta", id: "linux-smoke" })}\n`,
+      { mode: 0o600 },
+    );
+
+    // Exercise the normal returning-user path through the production POSIX
+    // first-run backend. The fixture is validated before it is serialized and
+    // the backend validates it again at launch; no runtime bypass is installed.
+    const firstRunReceipt = validateDesktopFirstRunReceipt({
+      schemaVersion: DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
+      acknowledged: true,
+    });
+    const firstRunReceiptFile = join(
+      settingsRoot,
+      DESKTOP_FIRST_RUN_RECEIPT_FILE_NAME,
+    );
+    await writeFile(
+      firstRunReceiptFile,
+      `${JSON.stringify(firstRunReceipt)}\n`,
+      { mode: 0o600 },
+    );
+    await chmod(firstRunReceiptFile, 0o600);
+
+    return Object.freeze({
+      root,
+      home,
+      codexHome,
+      claudeHome,
+      stateRoot,
+      userData,
+      settingsRoot,
+      firstRunReceiptFile,
+      runtimeDirectory,
+      configHome,
+      cacheHome,
+      dataHome,
+    });
+  } catch (error) {
+    await rm(root, { recursive: true, force: true }).catch(() => {});
+    throw error;
+  }
 }
 
 function electronBinary() {
@@ -316,18 +450,96 @@ function descendantsOf(parentPid) {
   return result;
 }
 
+function linuxProcessStartTime(pid) {
+  try {
+    const value = String(require("node:fs").readFileSync(
+      `/proc/${pid}/stat`,
+      "utf8",
+    ));
+    const commandEnd = value.lastIndexOf(")");
+    if (commandEnd < 0) fail("Linux process identity was unavailable");
+    // The fields after the command begin at proc(5) field 3; starttime is
+    // field 22 and therefore index 19 in this suffix.
+    const suffix = value.slice(commandEnd + 1).trim().split(/\s+/u);
+    const startTime = suffix[19];
+    if (!/^\d+$/u.test(startTime ?? "")) {
+      fail("Linux process identity was unavailable");
+    }
+    return startTime;
+  } catch (error) {
+    if (error?.code === "ENOENT" || error?.code === "ESRCH") return null;
+    if (String(error?.message ?? "").startsWith("Electron Linux smoke failed:")) {
+      throw error;
+    }
+    fail("Linux process identity was unavailable");
+  }
+}
+
+function captureLinuxProcessIdentity(pid) {
+  const startTime = linuxProcessStartTime(pid);
+  return startTime === null ? null : Object.freeze({ pid, startTime });
+}
+
+function linuxProcessIdentityIsAlive(identity) {
+  const observed = linuxProcessStartTime(identity.pid);
+  return observed !== null && observed === identity.startTime;
+}
+
 async function jsonFetch(url) {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return response.json();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), MAX_OPERATION_MS);
+  timer.unref?.();
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const declaredLength = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_JSON_RESPONSE_BYTES) {
+      throw new Error("JSON response exceeded the smoke boundary");
+    }
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("JSON response body was unavailable");
+    const chunks = [];
+    let totalBytes = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!(value instanceof Uint8Array)) {
+          throw new Error("JSON response body was invalid");
+        }
+        totalBytes += value.byteLength;
+        if (totalBytes > MAX_JSON_RESPONSE_BYTES) {
+          controller.abort();
+          await reader.cancel().catch(() => {});
+          throw new Error("JSON response exceeded the smoke boundary");
+        }
+        chunks.push(Buffer.from(value));
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const text = Buffer.concat(chunks, totalBytes).toString("utf8");
+    return JSON.parse(text);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function connectCdp(target) {
   const socket = new WebSocket(target.webSocketDebuggerUrl);
-  await withTimeout(new Promise((resolveOpen, rejectOpen) => {
-    socket.addEventListener("open", resolveOpen, { once: true });
-    socket.addEventListener("error", () => rejectOpen(new Error("CDP websocket error")), { once: true });
-  }), MAX_OPERATION_MS, "CDP connection");
+  try {
+    await withTimeout(new Promise((resolveOpen, rejectOpen) => {
+      socket.addEventListener("open", resolveOpen, { once: true });
+      socket.addEventListener("error", () => rejectOpen(new Error("CDP websocket error")), { once: true });
+    }), MAX_OPERATION_MS, "CDP connection");
+  } catch (error) {
+    try {
+      socket.close();
+    } catch {
+      // The fixed connection failure remains authoritative.
+    }
+    throw error;
+  }
 
   let nextId = 1;
   const pending = new Map();
@@ -342,7 +554,9 @@ async function connectCdp(target) {
     if (!Number.isInteger(message.id)) {
       const handlers = eventHandlers.get(message.method);
       if (!handlers) return;
-      for (const handler of handlers) handler(message.params ?? {});
+      for (const handler of handlers) {
+        handler(message.params ?? {}, message.sessionId ?? null);
+      }
       return;
     }
     const request = pending.get(message.id);
@@ -352,12 +566,14 @@ async function connectCdp(target) {
     else request.resolve(message.result ?? {});
   };
   socket.addEventListener("message", onMessage);
-  const request = (method, params = {}) => {
+  const request = (method, params = {}, sessionId = null) => {
     const id = nextId++;
     const promise = new Promise((resolveRequest, rejectRequest) => {
       pending.set(id, { resolve: resolveRequest, reject: rejectRequest });
     });
-    socket.send(JSON.stringify({ id, method, params }));
+    socket.send(JSON.stringify(sessionId === null
+      ? { id, method, params }
+      : { id, method, params, sessionId }));
     return withTimeout(promise, MAX_OPERATION_MS, `CDP ${method}`);
   };
   const evaluate = async (expression) => {
@@ -394,6 +610,105 @@ async function connectCdp(target) {
       eventHandlers.clear();
     },
   });
+}
+
+/**
+ * Select only the main dashboard page for this smoke's ephemeral companion.
+ * Electron may expose first-run, recovery, or other page targets through the
+ * same debugging endpoint. Binding both URLs prevents one of those pages (or
+ * a target from another debugger) from satisfying dashboard evidence.
+ */
+export function isLinuxInspectablePageTarget(target, debugPort) {
+  if (target === null
+      || typeof target !== "object"
+      || Array.isArray(target)
+      || target.type !== "page"
+      || typeof target.id !== "string"
+      || target.id.length === 0
+      || typeof target.webSocketDebuggerUrl !== "string"
+      || target.webSocketDebuggerUrl.length === 0
+      || !Number.isInteger(debugPort)
+      || debugPort < 1
+      || debugPort > 65_535) {
+    return false;
+  }
+  let websocket;
+  try {
+    websocket = new URL(target.webSocketDebuggerUrl);
+  } catch {
+    return false;
+  }
+  return websocket.protocol === "ws:"
+    && websocket.hostname === "127.0.0.1"
+    && websocket.port === String(debugPort)
+    && /^\/devtools\/page\//u.test(websocket.pathname)
+    && websocket.search === ""
+    && websocket.hash === ""
+    && websocket.username === ""
+    && websocket.password === "";
+}
+
+export function isLinuxDashboardTarget(target, debugPort) {
+  if (!isLinuxInspectablePageTarget(target, debugPort)
+      || typeof target.url !== "string") {
+    return false;
+  }
+  let dashboard;
+  try {
+    dashboard = new URL(target.url);
+  } catch {
+    return false;
+  }
+  const dashboardPort = Number(dashboard.port);
+  return dashboard.protocol === "http:"
+    && dashboard.hostname === "127.0.0.1"
+    && Number.isInteger(dashboardPort)
+    && dashboardPort >= 1
+    && dashboardPort <= 65_535
+    && dashboard.pathname === "/"
+    && dashboard.search === ""
+    && dashboard.hash === ""
+    && dashboard.username === ""
+    && dashboard.password === "";
+}
+
+export function selectLinuxDashboardTarget(targets, debugPort, targetId = undefined) {
+  if (!Array.isArray(targets)) return undefined;
+  if (targetId !== undefined
+      && (typeof targetId !== "string" || targetId.length === 0)) {
+    return undefined;
+  }
+  return targets.find((target) => (targetId === undefined || target?.id === targetId)
+    && isLinuxDashboardTarget(target, debugPort));
+}
+
+export function reserveLinuxInspectablePageTargets(
+  targets,
+  debugPort,
+  attemptedTargetIds,
+  maximumTargets = MAX_CDP_PAGE_TARGETS,
+) {
+  if (!Array.isArray(targets)
+      || !(attemptedTargetIds instanceof Set)
+      || !Number.isInteger(maximumTargets)
+      || maximumTargets < 1
+      || attemptedTargetIds.size > maximumTargets) {
+    fail("Electron inspectable page target boundary is invalid");
+  }
+  const candidates = new Map();
+  for (const target of targets) {
+    if (!isLinuxInspectablePageTarget(target, debugPort)
+        || attemptedTargetIds.has(target.id)
+        || candidates.has(target.id)) {
+      continue;
+    }
+    candidates.set(target.id, target);
+  }
+  if (attemptedTargetIds.size + candidates.size > maximumTargets) {
+    fail("Electron exposed too many inspectable page targets");
+  }
+  for (const targetId of candidates.keys()) attemptedTargetIds.add(targetId);
+  return [...candidates.values()];
 }
 
 function assertRendererShellSnapshot(snapshot) {
@@ -579,6 +894,8 @@ async function assertAutomaticStartupRefresh({
 }) {
   const refreshUrl = new URL("/api/local/refresh", dashboardUrl);
   let refreshId = null;
+  let terminalStatus = null;
+  let degradedFailureCode = null;
   await waitFor(async () => {
     if (child.exitCode !== null || child.signalCode !== null) {
       fail("Electron exited before automatic startup refresh");
@@ -630,16 +947,45 @@ async function assertAutomaticStartupRefresh({
     });
     if (decision.status === "pending") return false;
     if (decision.status === "failed") failFixed(decision.errorCode);
+    terminalStatus = decision.terminalStatus;
+    degradedFailureCode = decision.degradedFailureCode ?? null;
     return true;
   }, MAX_REFRESH_MS, "automatic startup refresh completion");
   // A completed pass may schedule an intentional bounded reindex continuation.
   // It is a separate operation, not a second startup trigger; stop counting
-  // this document once the startup receipt has reached its terminal success.
+  // this document once the startup receipt has reached its terminal outcome.
   refreshObserver.seal();
-  return refreshId;
+  return Object.freeze({ terminalStatus, degradedFailureCode });
 }
 
-async function runSmoke() {
+export function combineStartupRefreshEvidence(first, second) {
+  const receipts = [first, second];
+  const valid = receipts.every((receipt) => (
+    receipt?.terminalStatus === "succeeded"
+      && receipt.degradedFailureCode === null
+  ) || (
+    receipt?.terminalStatus === "degraded"
+      && DEGRADED_FAILURE_CODE_SET.has(receipt.degradedFailureCode)
+  ));
+  if (!valid) {
+    failFixed(ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.degradedInvalid);
+  }
+  if (receipts.every((receipt) => receipt.terminalStatus === "succeeded")) {
+    return Object.freeze({ terminalStatus: "succeeded", degradedFailureCode: null });
+  }
+  const degraded = receipts.filter((receipt) => receipt?.terminalStatus === "degraded"
+    && DEGRADED_FAILURE_CODE_SET.has(receipt.degradedFailureCode));
+  const codes = new Set(degraded.map((receipt) => receipt.degradedFailureCode));
+  if (codes.size !== 1) {
+    failFixed(ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.degradedInvalid);
+  }
+  return Object.freeze({
+    terminalStatus: "degraded",
+    degradedFailureCode: [...codes][0],
+  });
+}
+
+export async function runSmoke() {
   const containerContract = assertContainerContract();
   const fixture = await createSyntheticHome();
   const port = await freeTcpPort();
@@ -649,9 +995,9 @@ async function runSmoke() {
     LANG: "C.UTF-8",
     HOME: fixture.home,
     TMPDIR: fixture.root,
-    XDG_CONFIG_HOME: join(fixture.home, ".config"),
-    XDG_CACHE_HOME: join(fixture.home, ".cache"),
-    XDG_DATA_HOME: join(fixture.home, ".local", "share"),
+    XDG_CONFIG_HOME: fixture.configHome,
+    XDG_CACHE_HOME: fixture.cacheHome,
+    XDG_DATA_HOME: fixture.dataHome,
     XDG_RUNTIME_DIR: fixture.runtimeDirectory,
     USAGE_MONITOR_RESOURCE_ROOT: REPOSITORY_ROOT,
     USAGE_MONITOR_STATE_ROOT: fixture.stateRoot,
@@ -666,6 +1012,7 @@ async function runSmoke() {
     XAUTHORITY: process.env.XAUTHORITY,
   };
   const child = spawn(binary, [
+    `--user-data-dir=${fixture.userData}`,
     `--remote-debugging-port=${port}`,
     "--remote-debugging-address=127.0.0.1",
     "--disable-gpu",
@@ -679,6 +1026,8 @@ async function runSmoke() {
   let stderrProduced = false;
   child.stdout?.on("data", () => { stdoutProduced = true; });
   child.stderr?.on("data", () => { stderrProduced = true; });
+  const attachedPages = new Map();
+  const attemptedPageTargetIds = new Set();
   let cdp = null;
   let refreshObserver = null;
   let forcedShutdown = false;
@@ -698,35 +1047,69 @@ async function runSmoke() {
       process.stderr.write("Electron Linux endpoint unavailable.\n");
       throw error;
     });
-    const target = await waitFor(async () => {
+    // Poll from the moment the debugging endpoint appears and attach to each
+    // debugger-owned page before deciding what it is. Electron can expose an
+    // auxiliary or recovery page first; only an exact target-id match to the
+    // loopback dashboard below may contribute evidence.
+    const dashboardSelection = await waitFor(async () => {
       const targets = await jsonFetch(`http://127.0.0.1:${port}/json`);
-      return targets.find((entry) => entry.type === "page" && entry.webSocketDebuggerUrl);
+      const inspectablePages = reserveLinuxInspectablePageTargets(
+        targets,
+        port,
+        attemptedPageTargetIds,
+      );
+      await Promise.all(inspectablePages.map(async (target) => {
+        let pageCdp;
+        let pageRefreshObserver;
+        try {
+          pageCdp = await connectCdp(target);
+          pageRefreshObserver = observeLocalRefreshRequests(pageCdp);
+          const observedNetworkUrls = [];
+          let networkEvidenceInvalid = false;
+          const observeNetworkURL = (url) => {
+            if (typeof url !== "string"
+                || url.length === 0
+                || url.length > MAX_NETWORK_EVIDENCE_URL_LENGTH
+                || observedNetworkUrls.length >= MAX_NETWORK_EVIDENCE_URLS) {
+              networkEvidenceInvalid = true;
+              return;
+            }
+            observedNetworkUrls.push(url);
+          };
+          pageCdp.on("Network.requestWillBeSent", ({ request } = {}) => {
+            observeNetworkURL(request?.url);
+          });
+          pageCdp.on("Network.webSocketCreated", ({ url } = {}) => {
+            observeNetworkURL(url);
+          });
+          // The observers exist before either domain is enabled. The selected
+          // page must later contain its own POST; no other page's traffic is
+          // merged into the dashboard receipt.
+          await pageCdp.request("Page.enable");
+          await pageCdp.request("Network.enable");
+          attachedPages.set(target.id, Object.freeze({
+            targetId: target.id,
+            cdp: pageCdp,
+            refreshObserver: pageRefreshObserver,
+            observedNetworkUrls,
+            networkEvidenceInvalid: () => networkEvidenceInvalid,
+          }));
+        } catch {
+          pageRefreshObserver?.dispose?.();
+          pageCdp?.close?.();
+        }
+      }));
+      const target = selectLinuxDashboardTarget(targets, port);
+      if (!target) return null;
+      const page = attachedPages.get(target.id);
+      if (!page) return null;
+      return { target, page };
     }, MAX_STARTUP_MS, "Electron dashboard target");
-    cdp = await connectCdp(target);
-    refreshObserver = observeLocalRefreshRequests(cdp);
-    // Enable both domains immediately after attaching. The renderer's
-    // startup pass is launched by the dashboard bootstrap, so delaying these
-    // domains until after readiness can miss the only POST we are qualifying.
-    const observedNetworkUrls = [];
-    let networkEvidenceInvalid = false;
-    const observeNetworkURL = (url) => {
-      if (typeof url !== "string"
-          || url.length === 0
-          || url.length > MAX_NETWORK_EVIDENCE_URL_LENGTH
-          || observedNetworkUrls.length >= MAX_NETWORK_EVIDENCE_URLS) {
-        networkEvidenceInvalid = true;
-        return;
-      }
-      observedNetworkUrls.push(url);
-    };
-    cdp.on("Network.requestWillBeSent", ({ request } = {}) => {
-      observeNetworkURL(request?.url);
-    });
-    cdp.on("Network.webSocketCreated", ({ url } = {}) => {
-      observeNetworkURL(url);
-    });
-    await cdp.request("Page.enable");
-    await cdp.request("Network.enable");
+    const { target, page: selectedPage } = dashboardSelection;
+    cdp = selectedPage.cdp;
+    refreshObserver = selectedPage.refreshObserver;
+    const observedNetworkUrls = selectedPage.observedNetworkUrls;
+    const selectedDashboardUrl = new URL(target.url);
     selectRequiredRefreshLoader(refreshObserver, await waitFor(
       () => mainFrameLoaderId(cdp),
       MAX_STARTUP_MS,
@@ -750,7 +1133,10 @@ async function runSmoke() {
     );
     selectRequiredRefreshLoader(refreshObserver, await mainFrameLoaderId(cdp));
     const dashboardUrl = new URL(ready.location);
-    if (dashboardUrl.protocol !== "http:" || dashboardUrl.hostname !== "127.0.0.1") {
+    if (dashboardUrl.origin !== selectedDashboardUrl.origin
+        || dashboardUrl.pathname !== "/"
+        || dashboardUrl.search !== ""
+        || dashboardUrl.hash !== "") {
       fail("dashboard did not load from the companion loopback origin");
     }
     if (refreshObserver.selectOrigin(dashboardUrl.origin) !== dashboardUrl.origin) {
@@ -770,14 +1156,19 @@ async function runSmoke() {
       fail("renderer requested a non-loopback resource");
     }
     await assertRendererShell(cdp);
-    await assertAutomaticStartupRefresh({
+    const initialStartupRefresh = await assertAutomaticStartupRefresh({
       child,
       dashboardUrl,
       refreshObserver,
     });
 
     const descendantsAtReady = descendantsOf(child.pid);
-    if (descendantsAtReady.length < 1) fail("Electron had no companion descendant after readiness");
+    const descendantIdentitiesAtReady = descendantsAtReady
+      .map((pid) => captureLinuxProcessIdentity(pid))
+      .filter((identity) => identity !== null);
+    if (descendantIdentitiesAtReady.length < 1) {
+      fail("Electron had no companion descendant after readiness");
+    }
 
     const previousStatus = await jsonFetch(new URL("/api/local/refresh", dashboardUrl));
     const previousRefreshId = typeof previousStatus?.refresh?.refreshId === "string"
@@ -812,13 +1203,17 @@ async function runSmoke() {
     );
     selectRequiredRefreshLoader(refreshObserver, fresh.loaderId);
     await assertRendererShell(cdp);
-    await assertAutomaticStartupRefresh({
+    const reloadStartupRefresh = await assertAutomaticStartupRefresh({
       child,
       dashboardUrl,
       refreshObserver,
       previousRefreshId,
     });
-    if (networkEvidenceInvalid
+    const startupRefresh = combineStartupRefreshEvidence(
+      initialStartupRefresh,
+      reloadStartupRefresh,
+    );
+    if (selectedPage.networkEvidenceInvalid()
         || observedNetworkUrls.some((url) => !isAllowedRendererNetworkURL(url, dashboardUrl.origin))) {
       fail("renderer attempted a non-loopback network request");
     }
@@ -861,7 +1256,17 @@ async function runSmoke() {
       fail("Electron clean-quit control could not be sent");
     }
     await withTimeout(once(child, "exit"), MAX_SHUTDOWN_MS, "Electron clean quit");
-    await waitFor(() => descendantsOf(child.pid).length === 0, MAX_SHUTDOWN_MS, "companion cleanup");
+    // Surviving children are reparented as soon as Electron exits, so walking
+    // the now-dead parent would false-pass. Bind every ready-time descendant
+    // to its Linux /proc start identity and prove those exact processes are
+    // gone even if their PPID changes during shutdown.
+    await waitFor(
+      () => descendantIdentitiesAtReady.every(
+        (identity) => !linuxProcessIdentityIsAlive(identity),
+      ),
+      MAX_SHUTDOWN_MS,
+      "companion cleanup",
+    );
     if (child.signalCode !== null || child.exitCode !== 0) {
       fail(child.signalCode === null
         ? `Electron exited with code ${child.exitCode}`
@@ -879,14 +1284,18 @@ async function runSmoke() {
       networkBoundaryEvidence: containerContract.networkBoundaryEvidence,
       imagePlatform: process.env.USAGE_MONITOR_LINUX_IMAGE_PLATFORM,
       runtimeArchitecture: process.arch,
+      sourceRevision: containerContract.sourceRevision,
       qualification: "development-only",
+      startupRefresh,
     }, null, 2)}\n`);
   } catch (error) {
     forcedShutdown = true;
     throw error;
   } finally {
-    refreshObserver?.dispose?.();
-    cdp?.close();
+    for (const page of attachedPages.values()) {
+      page.refreshObserver?.dispose?.();
+      page.cdp?.close?.();
+    }
     if (child.exitCode === null && child.signalCode === null) {
       child.kill(forcedShutdown ? "SIGKILL" : "SIGTERM");
       await Promise.race([once(child, "exit"), wait(2_000)]);

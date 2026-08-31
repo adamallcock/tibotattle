@@ -307,9 +307,9 @@ test("the checked-in inventory classifies every retained tool entry point and np
   // and Windows/WSL multi-root qualification are all reviewed repository
   // tools. Keep these exact so any future executable or npm alias still
   // requires an ownership decision.
-  assert.equal(result.records, 105);
-  assert.equal(result.candidates.length, 106);
-  assert.equal(result.aliases, 64);
+  assert.equal(result.records, 108);
+  assert.equal(result.candidates.length, 109);
+  assert.equal(result.aliases, 67);
 });
 
 test("the inventory names every static ESM caller of a classified tool", async () => {

@@ -2,7 +2,7 @@
 title: Linux Electron readiness and support plan
 date: 2026-08-21
 type: goal
-status: planned-after-windows
+status: dormant-foundation-implemented
 parent: 2026-08-18-windows-first-electron-delivery-goal.md
 ---
 
@@ -12,11 +12,12 @@ parent: 2026-08-18-windows-first-electron-delivery-goal.md
 
 This is the implementation plan for the Linux stage of the
 [Windows-first Electron delivery goal](./2026-08-18-windows-first-electron-delivery-goal.md).
-It starts only after the shared Electron/core boundary is stable and the
-Windows-first dependency has either passed its native gates or has a named,
-fail-closed external blocker. It does not reorder the Windows work, replace
-the existing native macOS client, or turn the current Linux container smoke
-into a support claim.
+Production integration starts only after the shared Electron/core boundary is
+stable and the Windows-first dependency has either passed its native gates or
+has a named, fail-closed external blocker. Additive Linux-owned foundations may
+be developed in parallel while they remain unreachable from production
+composition. This does not reorder the Windows work, replace the existing
+native macOS client, or turn a Linux container smoke into a support claim.
 
 The first Linux distribution subject is deliberately narrow: native Linux
 x86_64, initially qualified on a declared Ubuntu/Debian matrix, with one
@@ -29,18 +30,28 @@ which selects a native x86_64 AppImage before adding managed channels.
 The plan is development and qualification work only. It authorizes no version
 bump, signing-key use, release upload, package repository publication, service
 deployment, credential migration on a real machine, or change to the native
-macOS launcher/updater. Every test uses a disposable synthetic home, synthetic
-session data, and disposable credentials.
+macOS launcher/updater. Unit tests use synthetic homes, session data, and
+injected credentials. Native credential execution must independently prove the
+reviewed disposable container, tmpfs home/runtime roots, and isolated D-Bus
+session before it can touch the four fixed capability tuples.
 
-## Current status — 2026-08-23
+## Current status — 2026-08-30
 
-The current parity integration remains limited to the existing Linux Electron
-source smoke in the arm64 container/Xvfb environment. The dated 2026-08-21
-container result below is historical development evidence and does not qualify
-Linux x86_64, a native credential store, a desktop-manager tray, autostart, a
-package, installation, upgrade, rollback, uninstall, or an official Linux
-support claim. The Linux L1–L7 gates therefore remain closed pending the native
-x86_64 matrix and its content-free receipts.
+Four dormant foundations now exist: the hardened ARM64 Electron source smoke,
+an exact `linux-x64` Secret Service binding/backend and isolated qualification
+helper, deterministic XDG state/desktop owners, and a manually dispatched
+native AMD64 development workflow. None is wired into production selectors,
+runtime staging, or Electron lifecycle composition. The native AMD64 workflow
+has not run, and no desktop-manager, AppImage, installed lifecycle, upgrade,
+rollback, uninstall, or support evidence exists. Linux L1–L7 acceptance gates
+therefore remain closed. The exact-revision local result and its protected R7
+blocker are recorded in the
+[Linux public integration receipt](../receipts/2026-08-30-linux-public-integration-receipt.md).
+[PR #82](https://github.com/adamallcock/tibotattle/pull/82) ports the Linux work
+onto the already-public Electron base for `codex/linux-integration`, without
+publishing intervening local Electron/macOS work or changing `main` or the
+Windows branches. The August 27 receipt remains a historical record of the
+original local revision.
 
 ## Current state: evidence and non-claims
 
@@ -53,17 +64,16 @@ that any future Linux stage has passed.
 | --- | --- | --- |
 | Electron shell | [`apps/electron/main.js`](../../apps/electron/main.js) composes the companion supervisor, platform gate, and desktop lifecycle. [`apps/electron/preload.cjs`](../../apps/electron/preload.cjs) exposes a frozen allowlisted v1 bridge; it exposes no filesystem or generic/unrestricted IPC bridge. [`apps/electron/loopback-policy.js`](../../apps/electron/loopback-policy.js) confines navigation, requests, webviews, and windows to the exact loopback companion origin. | No Linux support claim, installed-app proof, Linux production credential path, or Linux package has been accepted. |
 | Window, tray, and process lifecycle | [`apps/electron/desktop-lifecycle.js`](../../apps/electron/desktop-lifecycle.js) implements single-instance locking, activation, hide-on-close, tray show/hide/toggle/retry/quit, one automatic companion retry, and serialized shutdown. [`apps/electron/companion-supervisor.js`](../../apps/electron/companion-supervisor.js) allowlists child environment variables, uses an ephemeral companion port, and bounds startup/shutdown. | The current real Linux smoke does not inspect an actual desktop-manager tray or autostart entry. Its tray/window substitute is CDP minimize/restore, and Electron 43 may not expose those CDP methods in the page endpoint. |
-| Linux source GUI smoke | [`containers/electron-linux/Dockerfile`](../../containers/electron-linux/Dockerfile) pins the arm64 Node Bookworm base digest and exact tool versions, installs Electron/Xvfb, and [`scripts/smoke-electron-linux.mjs`](../../scripts/smoke-electron-linux.mjs) launches the real dashboard, checks loopback origin and health, observes HTTP(S)/WebSocket requests across a renderer reload, observes companion descendants, and requests the gated main-process quit. A fresh 2026-08-21 local Colima/Docker arm64 run from this worktree recorded eight descendants at readiness, loopback-only runtime interfaces, renderer reload, and clean quit. | This is a source-checkout Linux arm64 development proof only. Debian APT indexes and exact-version npm/Electron downloads remain mutable online build inputs, so it is not a reproducible production artifact. It does not prove x86_64, a Linux credential store, a desktop-manager tray, autostart, packaging, installation, upgrade, rollback, uninstall, or a release trust root. CDP minimize/restore was unavailable in the fresh run. |
-| Linux paths and state | [`src/platform/participant-identity.js`](../../src/platform/participant-identity.js) derives the POSIX default state root as `$XDG_STATE_HOME/app-usagemonitor` or `~/.local/state/app-usagemonitor`. [`src/platform/local-export-source-ports.js`](../../src/platform/local-export-source-ports.js) already understands Linux/XDG source roots and owner-only POSIX directories. The current smoke supplies disposable `HOME`, `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, XDG directories, and state root. | The full Linux production state composition has not been assembled or adversarially qualified. Every state database, journal, WAL/SHM sidecar, lock, prepared artifact, migration marker, and replacement path needs a Linux-specific positive contract rather than an incidental POSIX branch. |
-| Credentials | `@github/keytar` 7.10.6 contains Linux prebuilds, including the observed installed `linux-x64` candidate digest `e7894a1e1001764de29ff08d3dae418ccbaaf78889c5673d367e05df1682fc7c`. Its upstream Linux implementation uses Secret Service/libsecret. | [`src/platform/export-identity-keychain.js`](../../src/platform/export-identity-keychain.js) is intentionally macOS-only; the current production selectors accept macOS and Windows paths, not Linux. No Linux binding loader, digest policy, D-Bus session/keyring harness, fixed capability map, interprocess mutation lease, or readback receipt exists. The observed digest is a candidate input, not an approved release allowlist. |
+| Linux source GUI smoke | [`containers/electron-linux/Dockerfile`](../../containers/electron-linux/Dockerfile) pins the arm64 Node Bookworm base digest and exact tool versions, installs Electron/Xvfb, and [`scripts/smoke-electron-linux.mjs`](../../scripts/smoke-electron-linux.mjs) launches the real dashboard, checks loopback origin and health, observes HTTP(S)/WebSocket requests across a renderer reload, captures exact descendant process identities, and requests the gated main-process quit. The builder refuses a dirty Git tree, bakes the exact source revision into the image, and the smoke emits that revision. The clean image `sha256:f6b3a32d01f7781214898d3900fa8949ba8692cdf0ae2df7dbdefd15f107ff12` and its network-disabled run are bound to source revision `5764d5f555460db2164e9fb9662dd87c6b106268`; the run recorded nine descendants at readiness, loopback-only runtime interfaces, renderer reload, exact descendant cleanup, and clean quit. | This is a source-checkout Linux arm64 development proof only. Debian APT indexes and exact-version npm/Electron downloads remain mutable online build inputs, so it is not a reproducible production artifact. It does not prove x86_64, a Linux credential store, a desktop-manager tray, autostart, packaging, installation, upgrade, rollback, uninstall, or a release trust root. CDP minimize/restore was unavailable in the exact-revision run. |
+| Linux paths and state | [`src/platform/linux-xdg-paths.js`](../../src/platform/linux-xdg-paths.js) resolves and revalidates owner-only XDG identities. [`src/platform/linux-state-composition.js`](../../src/platform/linux-state-composition.js) inventories the current companion state paths and SQLite sidecars under one dormant state owner. | Production composition is unchanged. Point-of-I/O descriptor ownership, mutation/crash tests, migration, and installed retention evidence remain L2 gates. |
+| Credentials | [`src/platform/linux-secret-service-binding.js`](../../src/platform/linux-secret-service-binding.js) pins `@github/keytar` 7.10.6 `linux-x64` at 109,664 bytes and SHA-256 `e7894a1e1001764de29ff08d3dae418ccbaaf78889c5673d367e05df1682fc7c`. [`src/platform/linux-secret-service.js`](../../src/platform/linux-secret-service.js) owns the four fixed capabilities with readback and content-free errors; [`scripts/qualify-linux-secret-service.mjs`](../../scripts/qualify-linux-secret-service.mjs) requires a reviewed-container marker and separate tmpfs home/runtime roots. [`scripts/run-linux-secret-service-qualification.mjs`](../../scripts/run-linux-secret-service-qualification.mjs) owns the disposable D-Bus/keyring process identities, terminates them, and withholds a receipt unless cleanup is proven. | Production selectors still accept only the existing macOS/Windows owners. The default lease is process-local, crash recovery is incomplete, stock keytar cannot provide locale-independent locked/denied classification, and the native D-Bus/keyring lifecycle has not run on native x86_64. |
 | Packaging | [`apps/electron/electron-builder.config.cjs`](../../apps/electron/electron-builder.config.cjs) has development `darwin` and `win32` directory targets. [`scripts/build-electron-app.mjs`](../../scripts/build-electron-app.mjs) and [`scripts/build-electron-runtime.mjs`](../../scripts/build-electron-runtime.mjs) make the reviewed runtime closure and target-specific native payload explicit. | There is no Linux builder target, Linux icon/desktop metadata, AppImage verifier, x86_64 ELF check, Linux native-binding artifact rule, detached-evidence policy, or installed-app harness. |
-| CI | The repository has [`windows-portability.yml`](../../.github/workflows/windows-portability.yml) and the protected Windows finalizer workflows. The Linux environment is currently restored locally through `pnpm container:electron-linux:build` and `pnpm container:electron-linux:test`. | There is no native Linux x86_64 GUI/package workflow. No Linux result is currently authoritative for support or publication. |
+| CI | [`linux-portability.yml`](../../.github/workflows/linux-portability.yml) is a manual, immutable-action Ubuntu 24.04 development workflow. Its warm row primes and rebuilds from one runner-local Docker cache; its clean row uses `--no-cache`. Both run the native AMD64 image, network-isolated GUI smoke, and supervised disposable Secret Service job. | The workflow source is published in the Linux integration PR but has not been dispatched. It produces source-container evidence only and is not authoritative for AppImage, installed behavior, support, or release publication. |
 | macOS preservation | The native Swift client and its build/release paths remain under [`apps/macos`](../../apps/macos) and are not part of the Electron Linux work. The existing native macOS shell is retained while Electron remains a shared development shell. | A Linux implementation must not modify, replace, or infer readiness from the native macOS login-item, Keychain broker, updater, or release path. |
 
-The current local Docker daemon is not assumed to be running. The documented
-recovery is to start Colima, rebuild the pinned image, and rerun the network-
-isolated container; an existing image or a prior arm64 run is never silently
-treated as x86_64 evidence.
+When the local Docker daemon is stopped, start Colima, rebuild the pinned image,
+and rerun the network-isolated container; an existing image or a prior ARM64
+run is never silently treated as x86_64 evidence.
 
 ## Declared qualification matrix
 
@@ -288,6 +298,11 @@ desktop code and harnesses; primary agent reviews the shared lifecycle diff.
   `~/.config/autostart`), use a reviewed absolute executable and flags, and
   expose enable/disable status without exposing the path or environment in
   diagnostics. Do not install a system-wide unit or privileged helper.
+- Treat the current dormant Node owner as contract/test scaffolding only. Its
+  path-based final `rename` and `unlink` calls cannot condition mutation on the
+  inode that was inspected against a same-UID replacement race. Production
+  activation requires a reviewed native conditional-mutation primitive before
+  claiming atomic or removable autostart behavior.
 - Test autostart disabled, enabled, malformed-entry recovery, executable
   replacement, explicit disable, uninstall cleanup, and relaunch with no
   duplicate companion. Autostart must not run in CI unless the test explicitly
@@ -467,6 +482,11 @@ pnpm container:electron-linux:build
 pnpm container:electron-linux:test
 ```
 
+The image builder requires a clean Git tree and bakes `git rev-parse HEAD` into
+the OCI revision label and smoke environment. Commit the reviewed task branch
+before running these commands; do not relabel a dirty image as exact-revision
+evidence.
+
 The existing package scripts expand to a digest-pinned arm64 base plus
 exact-version/frozen-lock build followed by
 `docker run --rm --init --cap-add=SYS_ADMIN --network none`; no network or
@@ -481,37 +501,31 @@ colima stop
 
 ### Native Linux x86_64: required next environment
 
-The current smoke deliberately verifies that only loopback interfaces exist.
-Running it directly in an ordinary host network namespace therefore fails
-closed even if an environment variable claims otherwise. The repository does
-not expose an amd64 package script yet: Apple-Silicon Colima selected the exact
-amd64 Node image successfully, but QEMU aborted Node/libuv during the frozen
-dependency install. That emulation failure is not a product failure and must
-not be retried into a false x86_64 claim.
+The smoke deliberately verifies that only loopback interfaces exist. Running
+it directly in an ordinary host network namespace therefore fails closed even
+if an environment variable claims otherwise. The repository now exposes
+separate digest-pinned AMD64 build, GUI-smoke, and credential commands plus the
+manual `linux-portability.yml` workflow. That workflow asserts a native
+`x86_64` host and Docker daemon before accepting evidence and labels every
+receipt development-only. It has not run on this branch, so it is executable
+scaffolding rather than native evidence. Apple-Silicon/QEMU results remain
+debugging signals only and cannot satisfy the matrix.
 
-The next x86_64 proof therefore runs on a native Debian/Ubuntu x86_64 runner.
-That stage must add and test explicit amd64 build/run scripts using the exact
-architecture-specific Node image digest and `docker run --network none` (or an
-equally proven isolated network namespace). The smoke independently rejects
-any non-loopback runtime interface. The `libsecret-1-dev`, `gnome-keyring`, and
-`weston` packages are required by the future L1/L3 native qualification
-harness, not by the current arm64 containerized source smoke. Their exact
-package names and versions must be recorded in the matrix receipt rather than
-assumed across distributions.
+### Native Linux: credential foundation and future desktop gates
 
-### Native Linux: future credential and desktop gates
-
-After L1/L3 add the corresponding repository scripts, run them inside fresh
-session roots. The command shape is intentionally explicit about the session
-boundary:
+Build the AMD64 development image, then run the credential helper only through
+the reviewed networkless container command. The helper independently requires
+the baked root-owned marker plus separate tmpfs home/runtime mount identities;
+the environment marker is not isolation authority:
 
 ```bash
-dbus-run-session -- env \
-  HOME="$RUNNER_TEMP/tibotattle-linux-home" \
-  XDG_CONFIG_HOME="$RUNNER_TEMP/tibotattle-linux-config" \
-  XDG_STATE_HOME="$RUNNER_TEMP/tibotattle-linux-state" \
-  XDG_RUNTIME_DIR="$RUNNER_TEMP/tibotattle-linux-runtime" \
-  pnpm test:linux:credentials
+pnpm container:electron-linux:build:amd64
+pnpm container:electron-linux:test:credentials:amd64
+```
+
+The X11/Wayland desktop commands remain future L3 interfaces:
+
+```bash
 
 dbus-run-session -- xvfb-run --auto-servernum \
   --server-args='-screen 0 1280x900x24 -nolisten tcp' \
@@ -524,11 +538,10 @@ WAYLAND_DISPLAY=wayland-tibo \
   pnpm test:linux:desktop -- --protocol=wayland
 ```
 
-The last three commands are required interfaces to add, not claims that the
-scripts already exist. The workflow must own compositor and keyring process
-cleanup and fail if those processes survive. A real Secret Service must be
-created and unlocked inside the disposable D-Bus session; a host keyring must
-never be reused.
+The desktop commands are required interfaces to add, not claims that those
+scripts exist. The workflow must own compositor and keyring process cleanup
+and fail if those processes survive. The native credential command is also
+still unqualified until its warm and clean receipts exist.
 
 ### Future native Linux x86_64 package/lifecycle gate
 
@@ -542,9 +555,10 @@ dbus-run-session -- xvfb-run --auto-servernum \
   pnpm smoke:electron:linux -- --artifact <absolute-unpublished-appimage> --protocol=x11
 ```
 
-The names above are planned command contracts. Until they are implemented and
-their receipts are reviewed, only the existing `container:electron-linux:*`
-and `smoke:electron:linux` commands may be reported as passing evidence.
+The package/lifecycle names above are planned command contracts. Until they are
+implemented and their receipts are reviewed, only an actually executed
+`container:electron-linux:*` source-container command may be reported, with its
+architecture and development-only scope stated explicitly.
 
 ## Ownership and integration boundaries
 
@@ -595,7 +609,8 @@ evidence on the declared matrix:
   separately decided and verified before any publication claim.
 
 Until then, the permitted statement is: “TiboTattle has a network-isolated
-Linux Electron source smoke and a documented Linux implementation plan.” The
-prohibited statements are “TiboTattle supports Linux,” “the arm64 container
-qualifies Linux x86_64,” and “an unsigned or loose AppImage is an official
-Linux release.”
+Linux Electron source smoke plus dormant Linux credential, XDG state/desktop,
+and native-AMD64 CI foundations that are not wired into production.” The
+prohibited statements are “TiboTattle supports Linux,” “the arm64 container or
+an emulated AMD64 run qualifies Linux x86_64,” and “an unsigned or loose
+AppImage is an official Linux release.”
