@@ -56,6 +56,9 @@ promotion/resource decisions; they are not a stable-release claim.
 
 ## Frozen-source validation
 
+These observations apply to corrective source `735a59ce`, based on `a3c85036`,
+not to the later main integration described below.
+
 - Full root suite: 3,312 tests, 3,291 passed, zero failures or cancellations,
   21 existing platform skips; exit 0 in 318.2 seconds.
 - Browser owning gate: 449/449; local companion owning gate: 277/277.
@@ -85,3 +88,22 @@ promotion/resource decisions; they are not a stable-release claim.
 - Exact-source hosted checks, signing, notarization, state-preserving replacement
   and installed native interaction
   remain separate pending steps. Browser QA is not native qualification.
+
+## Source-only main integration
+
+The startup fix was cherry-picked unchanged onto main `20f449ff` as `d0dddc9e`.
+There were no textual conflicts, and the complete PR #94 delta has the same
+stable patch identity before and after integration. This branch includes PR #94;
+the separately frozen RC4 source and its artifact do not.
+
+Integrated source checks passed: browser 473/473, local companion 295/295,
+native source 78 passed with three designated artifact exclusions, architecture,
+and offline Codex, telemetry-schema, browser-mirror and i18n contracts. No full
+root gate or native artifact gate was run for this combined tree.
+
+Both protected R7 freshness checks fail on the current workload digest and file
+count. The integrated workload provenance was recomputed from every main Git
+blob and matches this tree exactly; all ten retained receipts also match main
+byte-for-byte. These failures are inherited from main, not introduced by the
+startup fix. No protected receipt was edited or regenerated. Main-source merge
+remains review-gated, separately from the RC4 signed-artifact qualification.
