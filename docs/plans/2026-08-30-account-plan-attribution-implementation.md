@@ -2,7 +2,7 @@
 title: Account and plan attribution implementation after red-team review
 date: 2026-08-30
 type: plan
-status: implemented-awaiting-release-qualification
+status: implemented-pending-coordinated-merge
 ---
 
 # Account and plan attribution implementation
@@ -18,8 +18,9 @@ not the current implementation baseline. Five unrelated web edits remain
 untouched in the original checkout. Implementation is committed on the isolated
 `codex/account-plan-attribution` branch: `f57dab81` contains the product changes;
 `be8e8f5d` adds the test-only cancellation-observer correction described below.
-The final documentation change records those results without changing product
-code. This branch has not been pushed or integrated with later main changes.
+The implementation-checkpoint documentation records those results without
+changing product code. The subsequent source-PR preparation is recorded below;
+its merge and release qualification are coordinated separately.
 
 This document owns the implementation decisions and progress. It is not a
 deployment, installed-artifact, privacy-erasure, or release receipt. Local tests
@@ -397,3 +398,24 @@ also drove the preserved-history, actual-client and artifact-closure fixes above
   than it can be revalidated within repeated foreground budgets can remain
   pending. It is not truncated or declared uploaded; stable-prefix restart and
   new-day extension have explicit liveness regressions.
+
+### Source-PR preparation: 2026-08-31
+
+The owner subsequently authorized commit, push, PR creation and merge, with a
+separate task coordinating the 0.1.17 dogfood. The isolated attribution branch
+cleanly merged verified `origin/main`
+`3d9055fc8e58c84f8ba71feb5deb58b52c532138` in `67223e2d`, preserving the current
+native replacement validation and its regression tests. No shared checkout,
+installed application, remote service or user database changed.
+
+The dogfood coordinator then explicitly requested that this PR be prepared and
+source-checked but **not merged into main or the next dogfood** until the current
+installed generation is handed off. R7 must not be regenerated in this task.
+The coordinator's separate Keychain-candidate receipts qualify that candidate,
+not this changed attribution workload. This branch's stale R7 failures therefore
+remain explicit; passing the available GitHub PR workflows cannot substitute for
+the full root gate or final frozen-source R7 qualification.
+
+The before/after real-corpus coverage review, native installed-artifact checks,
+and hosted migration/activation boundaries above remain unchanged. Source-PR
+readiness is not permission to upload real data or activate the new transport.
