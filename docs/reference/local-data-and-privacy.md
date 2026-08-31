@@ -126,6 +126,43 @@ quality thresholds are not met.
 Stable pseudonyms and identity reattachment permit longitudinal linkage.
 Content-free, pseudonymous contribution is not anonymous data.
 
+### Account/plan attribution successor (staged)
+
+The source includes a closed v1.1 successor, disabled for new writes by default
+until a separately authorized hosted cutover. Its additional fields are account
+basis, a purpose-separated account pseudonym or null, plan basis/type, and an
+opaque plan-era pseudonym or null. The exact field inventory and derived sample
+must be reviewed; an explicit hosted-session consent grant and local approval
+bind the new schema, field dictionary, privacy contract and destination. Existing
+consent, pairing or an app update alone does not authorize these fields.
+
+The derivation reuses a leased existing account-observation root. It binds to
+the canonical destination and authenticated enrollment namespace, never creates
+a missing root during export, and makes no cross-device identity claim. Missing
+root/history proof leaves attribution unknown without dropping raw local usage.
+Current quota capture is bracketed by compatible account reads; logout, read
+failure and disagreement clear provisional markers. Markers cannot tag history
+before capture and are not upgraded to exact source proof.
+
+Day chunks remain staged until one complete replacement domain passes source,
+occurrence and base-accounting compatibility checks. Old accepted data remains
+stored; a partial replacement cannot become a hybrid primary. Immutable consent
+grants, enrollment bindings, staged chunks and active domains participate in the
+existing owner-erasure/restore boundaries. Device disconnect retains accepted
+history; format rollback changes upload admission only, not the selected data.
+No account/era pseudonyms or finer account cells are added to public aggregates.
+
+An owner-only progress file beside the local index preserves interrupted
+replacement uploads. Its closed, at-most-1-MiB payload contains day/manifest
+digests and control fingerprints, never credentials, root bytes, account
+markers or raw provider identifiers. Loss of this file can require revalidation
+and retry, but it does not erase local evidence or accepted hosted history.
+
+Accepted v0.2 history keeps its existing analytical source. Until a compatible
+replacement adapter exists, this history blocks the stronger-format upgrade
+before consent or admission-floor changes; disjoint dates do not make it safe
+to hide the old source. No local or hosted history is deleted by this refusal.
+
 ## Network destinations
 
 | Destination | When used | Data sent |

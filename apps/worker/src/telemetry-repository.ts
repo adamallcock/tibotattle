@@ -13,6 +13,10 @@ import {
   type ServerPricingResult,
 } from "./server-pricing";
 import { accountScopedQuotaAnalysis } from "./quota-analysis";
+import { accountScopedQuotaAnalysisV1 } from "./quota-analysis-v1";
+import { accountScopedQuotaAnalysisV11 } from "./quota-analysis-v11";
+import { assertV1SourcePinCurrent, loadV1SourcePin, V1_WINNER_FILTER_SQL, type V1SourcePin } from "./telemetry-v1-source-selection";
+import { assertV11SourcePinCurrent, loadV11SourcePin, type V11SourcePin } from "./telemetry-v11-domain";
 import { contributionQuarantineLifecycle } from "./contribution-lifecycle";
 import { parseStoredRecordJson } from "./stored-record";
 import type {
@@ -591,7 +595,7 @@ export async function insertTelemetryContribution(
         dataset_part_index, dataset_part_count, dataset_completeness,
         dataset_range_start, dataset_range_end
       ) VALUES (?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-        ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
     ).bind(
       contributionId,
       participantId,
@@ -627,7 +631,9 @@ export async function insertTelemetryContribution(
     ...recordPairs.flat(),
   ];
   const results = await db.batch(statements);
-  if ((results[0]?.meta.changes ?? 0) < 1) {
+  const inserted = results[0]?.results;
+  if (inserted?.length !== 1 || typeof inserted[0] !== "object" || inserted[0] === null
+      || Reflect.get(inserted[0], "id") !== contributionId) {
     throw new ApiError(409, "PARTICIPANT_DELETING");
   }
   const totalRecords = recordPairs.length;
@@ -1510,7 +1516,95 @@ function insights(totals: CountsRow, fastEvents: number, serverPricedEvents: num
   ];
 }
 
+const INCREMENTAL_COMPONENT_COLUMNS = Object.freeze({
+  inputUncachedTokens: "input_uncached_tokens", inputCacheReadTokens: "input_cache_read_tokens",
+  inputCacheWriteTokens: "input_cache_write_tokens", outputTextTokens: "output_text_tokens",
+  outputReasoningTokens: "output_reasoning_tokens", outputCombinedTokens: "output_combined_tokens",
+});
+
+/** Private totals and fits must describe the same selected analytical source. */
+async function incrementalPersonalStats(
+  db: D1Database, participantId: string, pin: V1SourcePin | V11SourcePin,
+): Promise<object> {
+  const v11 = "source" in pin;
+  const predicate = v11 ? "r.participant_id = ? AND r.generation_id = ?"
+    : "r.participant_id = ? AND " + V1_WINNER_FILTER_SQL;
+  const bindings = v11 ? [participantId, pin.generationId] : [participantId, pin.winnersJson];
+  const components = Object.entries(INCREMENTAL_COMPONENT_COLUMNS);
+  const componentSums = components.map(([name, column]) =>
+    "COALESCE(SUM(CASE WHEN r.stream = 'usage' THEN " + column + " END), 0) AS " + name).join(", ");
+  const componentCounts = components.map(([name, column]) =>
+    "COUNT(CASE WHEN r.stream = 'usage' THEN " + column + " END) AS " + name + "ObservedEvents").join(", ");
+  const from = " FROM telemetry_analytical_records r WHERE " + predicate;
+  const results = await db.batch<Record<string, string | number | null>>([
+    db.prepare("SELECT COUNT(DISTINCT r.chunk_row_id) AS contributions, "
+      + "SUM(r.stream = 'usage') AS usageEvents, SUM(r.stream = 'quota') AS quotaSnapshots, "
+      + "SUM(r.stream = 'session') AS sessionDimensions, "
+      + "SUM(r.stream = 'usage' AND json_extract(r.record_json, '$.speedMode') = 'fast') AS fastEvents, "
+      + componentSums + ", " + componentCounts + from).bind(...bindings),
+    db.prepare("SELECT provider, model_id AS modelId, COUNT(*) AS events, "
+      + componentSums + from + " AND r.stream = 'usage' GROUP BY provider, model_id "
+      + "ORDER BY events DESC, provider, model_id LIMIT 50").bind(...bindings),
+    db.prepare("SELECT observed_day AS day, COUNT(*) AS events, "
+      + "COALESCE(SUM(" + components.map(([, column]) => "COALESCE(" + column + ", 0)").join(" + ") + "), 0) AS tokens"
+      + from + " AND r.stream = 'usage' GROUP BY observed_day ORDER BY observed_day DESC LIMIT 180").bind(...bindings),
+    db.prepare("SELECT record_json" + from
+      + " AND r.stream = 'quota' ORDER BY observed_at DESC, occurrence_id DESC LIMIT 20").bind(...bindings),
+  ]);
+  const row = results[0]?.results[0] ?? {};
+  const count = (name: string) => Number(row[name] ?? 0);
+  const quotaAnalysis = v11
+    ? await accountScopedQuotaAnalysisV11(db, participantId, { sourcePin: pin })
+    : await accountScopedQuotaAnalysisV1(db, participantId, { sourcePin: pin });
+  // Never retry against legacy data if the stronger source changed or became
+  // unavailable. A mixed-source response is worse than a retryable failure.
+  try {
+    if (v11) await assertV11SourcePinCurrent(db, pin);
+    else {
+      await assertV1SourcePinCurrent(db, pin);
+      if (await loadV11SourcePin(db, participantId)) throw new Error("source changed");
+    }
+  } catch { throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE"); }
+  const usageEvents = count("usageEvents");
+  return {
+    schemaVersion: "participant-stats-v0.2", participantId,
+    analyticalSource: {
+      transportSchemaVersion: v11 ? "telemetry-contribution-v1.1" : "telemetry-contribution-v1.0",
+      generationId: v11 ? pin.generationId : null, inputFingerprint: pin.fingerprint,
+      selection: v11 ? "complete_domain" : "single_device_per_day",
+    },
+    totals: {
+      contributions: count("contributions"), usageEvents, quotaSnapshots: count("quotaSnapshots"),
+      activityMarkers: 0, sessionDimensions: count("sessionDimensions"),
+      ...Object.fromEntries(components.map(([name]) => [name, count(name)])),
+      componentCoverage: Object.fromEntries(components.map(([name]) => [name, {
+        observedEvents: count(name + "ObservedEvents"), unavailableEvents: usageEvents - count(name + "ObservedEvents"),
+      }])),
+      toolUnits: null, apiPriceEquivalentUsd: null, serverUnknownBillableUnits: null,
+      fullyPricedEvents: null, partiallyPricedEvents: null, unpricedEvents: null,
+      priceVerification: "not_repriced_in_incremental_stats",
+      fastEvents: count("fastEvents"), fastEventShare: usageEvents > 0 ? count("fastEvents") / usageEvents : null,
+    },
+    byModel: (results[1]?.results ?? []).map((item) => ({ ...item, apiPriceEquivalentUsd: null,
+      priceVerification: "not_repriced_in_incremental_stats" })),
+    daily: [...(results[2]?.results ?? [])].reverse().map((item) => ({ ...item, apiPriceEquivalentUsd: null,
+      priceVerification: "not_repriced_in_incremental_stats" })),
+    latestQuota: (results[3]?.results ?? []).flatMap((item) => {
+      const record = typeof item.record_json === "string" ? parseStoredRecordJson(item.record_json) : null;
+      return record ? [record] : [];
+    }),
+    rollingQuotaMovement: { status: "not_testable", reason: "incremental_rolling_projection_unavailable",
+      interpretation: "conditional_api_price_equivalent_not_provider_allowance" },
+    accountScopedQuotaAnalysis: quotaAnalysis, quotaGradients: [], insights: [],
+    generatedAt: new Date().toISOString(),
+  };
+}
+
 export async function personalStats(db: D1Database, participantId: string): Promise<object> {
+  const attributionPin = await loadV11SourcePin(db, participantId);
+  if (attributionPin) return incrementalPersonalStats(db, participantId, attributionPin);
+  const legacyPin = await loadV1SourcePin(db, { participantId });
+  if (legacyPin.winners.length > 0) return incrementalPersonalStats(db, participantId, legacyPin);
   const [totalRow, breakdown, daily, latestQuota, gradientRows, speedRow, contributionRow] = await Promise.all([
     db.prepare(`${TOTALS_SQL} WHERE participant_id = ?`).bind(participantId).first<CountsRow>(),
     db.prepare(
@@ -1614,6 +1708,10 @@ export async function personalStats(db: D1Database, participantId: string): Prom
     "not_transmitted",
   );
   const quotaAnalysis = await accountScopedQuotaAnalysis(db, participantId);
+  try {
+    await assertV1SourcePinCurrent(db, legacyPin);
+    if (await loadV11SourcePin(db, participantId)) throw new Error("source changed");
+  } catch { throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE"); }
   const classifiedServerEvents = (speedRow?.fullyPriced ?? 0)
     + (speedRow?.partiallyPriced ?? 0)
     + (speedRow?.unpriced ?? 0);

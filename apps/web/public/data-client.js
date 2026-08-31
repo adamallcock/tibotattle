@@ -15,7 +15,13 @@
  * responses, but never silently turn a failure into real-looking data.
  */
 
-import { TELEMETRY_PLAN_TYPES } from "./telemetry-shared.generated.js";
+import {
+  TELEMETRY_PLAN_TYPES,
+  TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
+  TELEMETRY_V11_ACCOUNT_BASES,
+  TELEMETRY_V11_PLAN_BASES,
+  telemetryV11RequiredConsent,
+} from "./telemetry-shared.generated.js";
 
 export {
   COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
@@ -865,6 +871,11 @@ export function normalizeIncrementalContributionSyncStatus(payload) {
   return Object.freeze({
     status: "available",
     keychainPrompt,
+    ...(payload.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+      ? { contractVersion: payload.contractVersion } : {}),
+    ...(payload.attributionUpgrade?.available === true
+      && payload.attributionUpgrade?.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+      ? { attributionUpgradeAvailable: true } : {}),
     consent: Object.freeze({
       approved: payload.consent.approved,
       current: payload.consent.current,
@@ -880,6 +891,52 @@ export function normalizeIncrementalContributionSyncStatus(payload) {
     lastAttemptAt,
     nextAttemptAt,
     lastOutcome
+  });
+}
+
+export function normalizeAttributionContributionReview(payload) {
+  const required = telemetryV11RequiredConsent();
+  const consent = payload?.consent;
+  const inventory = payload?.inventory;
+  const fields = inventory?.fields;
+  let destination;
+  try { destination = new URL(consent?.destinationOrigin); } catch { return null; }
+  const loopback = destination.protocol === "http:"
+    && ["localhost", "127.0.0.1", "[::1]"].includes(destination.hostname);
+  if (payload?.schemaVersion !== "local-incremental-contribution-review-v1.1" || payload.status !== "ready"
+      || payload.includesContent !== false || payload.includesPaths !== false
+      || payload.includesAccountIdentifiers !== false || payload.includesCredentials !== false
+      || !/^[A-Za-z0-9_-]{43}$/u.test(payload.reviewToken ?? "")
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(payload.grantDeviceId ?? "")
+      || (destination.protocol !== "https:" && !loopback) || destination.origin !== consent.destinationOrigin
+      || !consent || Object.keys(consent).length !== 4
+      || Object.entries(required).some(([key, value]) => consent[key] !== value || inventory?.consent?.[key] !== value)
+      || inventory?.schemaVersion !== "telemetry-field-inventory-v1.1"
+      || !/^[0-9a-f]{64}$/u.test(inventory.inventoryDigest ?? "")
+      || !fields || Object.keys(fields).length !== 4
+      || ["usage", "quota", "session", "accountPlanAttribution"].some((stream) =>
+        !Array.isArray(fields[stream]) || fields[stream].length < 1 || fields[stream].length > 40
+        || fields[stream].some((field) => typeof field !== "string" || !/^[A-Za-z][A-Za-z0-9]{0,63}$/u.test(field)))
+      || JSON.stringify(inventory.accountBases) !== JSON.stringify(TELEMETRY_V11_ACCOUNT_BASES)
+      || JSON.stringify(inventory.planBases) !== JSON.stringify(TELEMETRY_V11_PLAN_BASES)
+      || JSON.stringify(inventory.nullableQuotaMeasurements) !== JSON.stringify(["usedPercent", "windowDurationMinutes", "resetsAt"])
+      || !INCREMENTAL_SYNC_DAY_PATTERN.test(payload.sample?.day ?? "")
+      || !/^[0-9a-f]{64}$/u.test(payload.sample?.manifestDigest ?? "")
+      || ["usage", "quota", "session"].some((stream) => count(payload.sample?.recordCounts?.[stream], null) === null)
+      || typeof payload.hostedConsentCurrent !== "boolean") return null;
+  return Object.freeze({
+    reviewToken: payload.reviewToken, grantDeviceId: payload.grantDeviceId,
+    consent: Object.freeze({ ...required, destinationOrigin: destination.origin }),
+    inventory: Object.freeze({ inventoryDigest: inventory.inventoryDigest,
+      fields: Object.freeze(Object.fromEntries(["usage", "quota", "session", "accountPlanAttribution"]
+        .map((stream) => [stream, Object.freeze([...fields[stream]])]))),
+      accountBases: Object.freeze([...inventory.accountBases]), planBases: Object.freeze([...inventory.planBases]),
+      nullableQuotaMeasurements: Object.freeze([...inventory.nullableQuotaMeasurements]),
+    }),
+    sample: Object.freeze({ day: payload.sample.day, manifestDigest: payload.sample.manifestDigest,
+      recordCounts: Object.freeze(Object.fromEntries(["usage", "quota", "session"]
+        .map((stream) => [stream, payload.sample.recordCounts[stream]]))) }),
+    hostedConsentCurrent: payload.hostedConsentCurrent,
   });
 }
 
@@ -5441,30 +5498,65 @@ function normalizeWeeklyPaceForecast(value) {
   };
 }
 
-function normalizeWeekly(payload = {}) {
-  const envelope = payload?.weekly ?? payload;
-  const source = artifactData(envelope);
-  const weeklyValues = array(source.weeklyValues ?? source.weekly_values)
-    .map((row) => ({
-      ...row,
-      priceCardIds: array(row?.priceCardIds ?? row?.price_card_ids)
-        .filter((id) => typeof id === "string" && id.length > 0)
-        .slice(0, 32),
-      priceCardBreakdown: array(row?.priceCardBreakdown ?? row?.price_card_breakdown)
-        .flatMap((item) => {
-          if (typeof item?.priceCardId !== "string"
-              || !/^\d+(?:\.\d+)?$/u.test(item?.costUsd ?? "")
-              || !Number.isSafeInteger(item?.events)
-              || item.events < 0) return [];
-          return [{
-            priceCardId: item.priceCardId,
-            events: item.events,
-            costUsd: item.costUsd,
-          }];
-        })
-        .slice(0, 32),
-    }));
+function normalizeWeeklyPlanAttribution(value) {
+  if (value?.methodVersion !== "plan-era-v1"
+      || value?.status !== "historical_plan_conditional"
+      || value?.accountVerified !== false) return null;
   return {
+    methodVersion: "plan-era-v1",
+    status: "historical_plan_conditional",
+    accountVerified: false,
+    comparisonEligibility: value.comparisonEligibility === "single_plan_conditional"
+      ? "single_plan_conditional" : "unavailable",
+  };
+}
+
+function normalizeWeeklyPopulation(envelope = {}) {
+  const source = artifactData(envelope);
+  const weeklyValueColumns = new Set([
+    "sequence", "first_observed_at", "last_observed_at", "reset_due_at",
+    "resetAt", "slot", "displayed_span_pp", "value_usd", "value",
+    "pairwise_p10_usd", "pairwise_p90_usd", "lower", "upper",
+    "holdout_mae_pp", "known_speed_fraction", "eligible_transitions",
+    "unique_percentage_boundaries",
+  ]);
+  const weeklyValues = array(source.weeklyValues ?? source.weekly_values)
+    .map((row) => {
+      // A local era key can encode account context. It has no presentation
+      // purpose. Carry only the displayed fit columns, never opaque context.
+      const columns = Object.fromEntries(Object.entries(row ?? {})
+        .filter(([key]) => weeklyValueColumns.has(key)));
+      return {
+        ...columns,
+        planType: normalizePlanType(row?.planType ?? row?.plan_type),
+        planVariant: typeof (row?.planVariant ?? row?.plan_variant) === "string"
+            && /^[a-z][a-z0-9_-]{0,31}$/u.test(row.planVariant ?? row.plan_variant)
+          ? row.planVariant ?? row.plan_variant : "unknown",
+        aggregationEligibility: ["primary_conditional", "primary_scoped", "diagnostic_only"]
+          .includes(row?.aggregationEligibility ?? row?.aggregation_eligibility)
+          ? row.aggregationEligibility ?? row.aggregation_eligibility : null,
+        priceCardIds: array(row?.priceCardIds ?? row?.price_card_ids)
+          .filter((id) => typeof id === "string" && id.length > 0)
+          .slice(0, 32),
+        priceCardBreakdown: array(row?.priceCardBreakdown ?? row?.price_card_breakdown)
+          .flatMap((item) => {
+            if (typeof item?.priceCardId !== "string"
+                || !/^\d+(?:\.\d+)?$/u.test(item?.costUsd ?? "")
+                || !Number.isSafeInteger(item?.events)
+                || item.events < 0) return [];
+            return [{
+              priceCardId: item.priceCardId,
+              events: item.events,
+              costUsd: item.costUsd,
+            }];
+          })
+          .slice(0, 32),
+      };
+    });
+  return {
+    status: text(envelope?.status, "unavailable"),
+    planType: normalizePlanType(envelope?.planType),
+    planAttribution: normalizeWeeklyPlanAttribution(envelope?.planAttribution),
     summary: array(source.summary)[0] ?? source.summary ?? {},
     weeklyValues,
     valueSeries: array(source.valueSeries ?? source.value_series),
@@ -5481,6 +5573,87 @@ function normalizeWeekly(payload = {}) {
       label: text(envelope?.accountAttribution?.label, "")
     }
   };
+}
+
+function normalizeWeekly(payload = {}) {
+  const envelope = payload?.weekly ?? payload;
+  const weekly = normalizeWeeklyPopulation(envelope);
+  const planPopulations = [];
+  const candidates = array(envelope?.planPopulations).slice(0, 16);
+  const planCounts = new Map();
+  for (const row of candidates) {
+    planCounts.set(row?.planType, (planCounts.get(row?.planType) ?? 0) + 1);
+  }
+  for (const population of candidates) {
+    const planType = population?.planType;
+    if (!TELEMETRY_PLAN_TYPES.includes(planType) || planCounts.get(planType) !== 1) continue;
+    const normalized = normalizeWeeklyPopulation(population);
+    if (normalized.planAttribution === null) continue;
+    planPopulations.push({
+      ...normalized,
+      // The envelope is the selected population, not a license to relabel a
+      // positively different plan's historical fit.
+      weeklyValues: normalized.weeklyValues.filter((row) => row.planType === planType),
+    });
+  }
+  return {
+    ...weekly,
+    selectedPlanType: normalizePlanType(envelope?.selectedPlanType ?? envelope?.planType),
+    planPopulations,
+  };
+}
+
+const allowancePlanViews = new WeakMap();
+const allowancePlanViewRoots = new WeakMap();
+
+/**
+ * One selected population for every allowance-facing surface. Selection never
+ * changes the all-plan usage ledger or manufactures historical current pace.
+ * The root DTO names the latest observed plan, even when it has no fitted value.
+ */
+export function selectAllowancePlanPopulation(data, requestedPlanType = null) {
+  const root = allowancePlanViewRoots.get(data) ?? data;
+  const weekly = root?.weekly;
+  if (!weekly || weekly.planAttribution?.methodVersion !== "plan-era-v1") return root;
+  const populations = array(weekly.planPopulations);
+  const currentPlanType = normalizePlanType(weekly.selectedPlanType ?? weekly.planType);
+  const selectedPlanType = populations.some((row) => row.planType === requestedPlanType)
+    ? requestedPlanType : currentPlanType;
+  let views = allowancePlanViews.get(root);
+  if (views?.has(selectedPlanType)) return views.get(selectedPlanType);
+  const population = populations.find((row) => row.planType === selectedPlanType)
+    ?? normalizeWeeklyPopulation({ planType: selectedPlanType });
+  const isCurrentPlan = selectedPlanType === currentPlanType;
+  const comparisonAvailable = isCurrentPlan
+    && population.planAttribution?.comparisonEligibility === "single_plan_conditional";
+  const selected = {
+    ...root,
+    weekly: {
+      ...population,
+      selectedPlanType: currentPlanType,
+      planPopulations: populations,
+      stale: weekly.stale,
+      paceForecast: isCurrentPlan ? weekly.paceForecast : null,
+    },
+    quotaWindows: isCurrentPlan
+      ? array(root.quotaWindows).filter((window) => window.planType === selectedPlanType)
+      : [],
+    timeline: {
+      ...root.timeline,
+      allowanceCapacity: comparisonAvailable ? root.timeline?.allowanceCapacity : null,
+    },
+    allowancePlanSelection: {
+      planType: selectedPlanType,
+      currentPlanType,
+      isCurrentPlan,
+      comparisonAvailable,
+    },
+  };
+  views ??= new Map();
+  views.set(selectedPlanType, selected);
+  allowancePlanViews.set(root, views);
+  allowancePlanViewRoots.set(selected, root);
+  return selected;
 }
 
 function normalizeQuality(payload = {}) {
@@ -6079,6 +6252,21 @@ export class LocalCompanionClient {
     });
   }
 
+  async reviewAttributionContribution() {
+    const review = normalizeAttributionContributionReview(
+      await this.localContributionMutation("incremental-review-v11"),
+    );
+    if (review === null) throw new Error("Attribution review is unavailable.");
+    return review;
+  }
+
+  approveAttributionContribution(review) {
+    return this.localContributionMutation("incremental-approve", {
+      reviewToken: review.reviewToken, consent: review.consent,
+      fieldInventoryDigest: review.inventory.inventoryDigest,
+    });
+  }
+
   localContributionMutation(path, body = {}) {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/contribution/${path}`, {
       method: "POST",
@@ -6259,6 +6447,18 @@ export class CommunityClient {
           : "ongoing-privacy-safe-telemetry-v1.0",
         ongoingUpload: true
       })
+    }));
+  }
+
+  grantAttributionContribution(review) {
+    const consent = telemetryV11RequiredConsent();
+    if (!review || Object.entries(consent).some(([key, value]) => review.consent?.[key] !== value)
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(review.grantDeviceId ?? "")) {
+      throw new TypeError("Attribution consent requires a reviewed device target.");
+    }
+    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/device-telemetry-consents`, this.mutationOptions({
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceId: review.grantDeviceId, consent, ongoingUpload: true }),
     }));
   }
 

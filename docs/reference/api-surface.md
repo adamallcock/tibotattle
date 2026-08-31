@@ -68,6 +68,11 @@ site.
 | `POST` | `/api/v1/device/credential/renew` | Native app | Device | Rotates the same device credential without creating a new device slot. | Device lifecycle |
 | `GET` | `/api/v1/device/sync/state` | Native app | Device | Reads the device's v1 incremental cursor/admission state. | Contribution sync |
 | `GET` | `/api/v1/device/sync/manifest` | Native app | Device | Reads a bounded date-range manifest of accepted incremental chunks. | Contribution sync |
+| `GET` | `/api/v1/device/sync-capabilities` | Native app | Device | Reads accepted formats, exact v1.1 grant, write floor/revision and authenticated enrollment/destination binding; never creates consent. | Contribution sync |
+| `POST` | `/api/v1/me/device-telemetry-consents` | Participant browser | Session | Records explicit current v1.1 consent for the selected device and raises the persisted participant write floor. | Contribution consent |
+| `GET`, `POST` | `/api/v1/device/telemetry/v1.1/day-manifests` | Native app | Device | Reads a bounded date-range candidate inventory, or registers/replays one immutable day manifest and reports exact staged chunks; no analytical activation. | Contribution sync |
+| `POST` | `/api/v1/me/telemetry-v11/domain-predecessor` | Native app | Device | Issues a bounded source-pinned bootstrap/successor token, with null predecessor for first cutover. | Contribution sync |
+| `POST` | `/api/v1/me/telemetry-v11/domain-activate` | Native app | Device | Proves complete predecessor coverage and atomically switches the whole analytical domain; incomplete transfers remain staged. | Contribution sync |
 | `GET` | `/api/v1/me/devices` | Participant browser | Session | Lists participant device projections without credentials. | Device lifecycle |
 | `POST` | `/api/v1/me/devices/revoke` | Participant browser | Session | Revokes a selected device. | Device lifecycle |
 | `GET` | `/api/v1/envelope-key` | Native or web client | Public | Returns the public wrapping key; never returns private key material. | Contribution crypto |
@@ -154,6 +159,7 @@ is never an arbitrary local proxy.
 | `POST` | `/api/local/contribution/device-credential-reset` | Dashboard | Loopback mutation | Removes unusable local device credential/binding state; does not delete hosted data. | Device lifecycle |
 | `POST` | `/api/local/contribution/sync-inspect-exact` | Dashboard | Loopback mutation | Verifies the exact next payload and issues a short-lived, single-use local review token. | Contribution sync |
 | `GET` | `/api/local/contribution/incremental-status` | Dashboard | Loopback read | Reads v1 incremental consent/cursor/retry state. | Contribution sync |
+| `POST` | `/api/local/contribution/incremental-review-v11` | Dashboard | Loopback mutation | Capability-gated v1.1 field/sample review with a one-use token bound to the published index, consent triple and destination. Does not upload or grant hosted consent. | Contribution consent |
 | `POST` | `/api/local/contribution/incremental-approve` | Dashboard | Loopback mutation | Records current consent after exact local review and schedules the first due pass. | Contribution sync |
 | `POST` | `/api/local/contribution/incremental-run` | Dashboard | Loopback mutation | Resets bounded retry backoff and asks the consent-gated controller to run now. | Contribution sync |
 
@@ -196,6 +202,7 @@ from request data, and keeps provider callbacks off loopback.
 | `GET` | `/api/v1/session` |
 | `POST` | `/api/v1/logout` |
 | `POST` | `/api/v1/me/device-pairings` |
+| `POST` | `/api/v1/me/device-telemetry-consents` |
 
 ## Native bridge
 

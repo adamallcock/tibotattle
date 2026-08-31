@@ -28,6 +28,14 @@ const COMPOSITION_EXPORTS = Object.freeze([
   "calibrateCompositionCapacities",
   "compositionExpectedPp",
 ]);
+const PLAN_ATTRIBUTION_EXPORTS = Object.freeze([
+  "PLAN_ATTRIBUTION_POLICY",
+  "buildPlanAttributionIndex",
+  "classifyUsageAttribution",
+  "planAttributionContextKey",
+  "planAttributionObservationFromSnapshot",
+  "planEraForInterval",
+]);
 const WINDOW_EXPORTS = Object.freeze([
   "classifyQuotaWindowKind",
   "CODEX_PRIMARY_LIMIT_ID",
@@ -120,6 +128,7 @@ test("quota analysis exposes one exact runtime-neutral package root", async () =
       ...ROLLING_EXPORTS,
       ...PACE_EXPORTS,
       ...COMPOSITION_EXPORTS,
+      ...PLAN_ATTRIBUTION_EXPORTS,
       ...WINDOW_EXPORTS,
     ].sort(),
   );

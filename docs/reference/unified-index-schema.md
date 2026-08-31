@@ -58,6 +58,12 @@ identity semantics differ; schema 10 can take the additive staged migration.
 A newer version is not safe for an older reader. Migrations are transactional
 and forward-only; there is no supported in-place downgrade.
 
+Account/plan attribution does not require a new physical schema or relabeling
+an existing database. Current writable v11 opens also ensure compatible read
+indexes for exact source/offset/time quota lookup and same-session counter
+predecessors. Read-only v11 inspection never adds indexes or mutates the file.
+These indexes change query cost, not retained fact meanings or parser identity.
+
 Parser v11 is independent of the physical v11 index layout. It withholds an
 invalid provider quota window at record level while retaining unrelated valid
 usage, tool, and quota facts from that source. It also treats a selected
@@ -112,6 +118,28 @@ complete/partial status. Sources with ambiguous lineage, malformed accounting,
 unfinished tails, or other closed source-level issues are quarantined rather
 than guessed. A malformed quota observation is omitted with a closed diagnostic
 without discarding other valid facts from that source.
+
+Historical usage plan attribution joins admitted `quota_occurrence` facts on
+source, byte offset, ordinal and observation time inside the published
+`generation_source` membership and scanned-byte boundary. The canonical
+`quota_observation` winner is not account/plan provenance. A copied-forward fact
+may retain an earlier row generation while belonging to the current publication.
+Offsets record the end of a JSONL record, so the final complete record can be
+exactly at `scanned_bytes`. Published source states `complete`, `rescanned`,
+`resumed`, `touched` and `skipped` are eligible only with completed diagnostics;
+unfinished or failed source state is not membership proof.
+
+Plan-era discovery precedes fit/window filtering and includes short-window,
+zero-token, tied and conflicting quota observations. Usage quantity intervals
+start at the previous retained same-session counter, otherwise the previous
+same-source counter; missing or contradictory order remains unresolved. This
+does not retroactively attach today's logged-in account to historical events.
+
+Contribution hydration and full-history calibration refuse an in-progress newer
+generation or a physical fact/count/source-boundary mismatch. The multi-pass
+calibration reader also fences SQLite `data_version` and publication identity
+through completion, including same-count corrections. A refusal preserves the
+previous usable cache and source history; it is not a repair-by-deletion request.
 
 The low-level rebuild primitive creates a separate
 `.building-<pid>-<timestamp>` database, performs integrity checks, fsyncs it,

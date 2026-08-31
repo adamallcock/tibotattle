@@ -751,6 +751,68 @@ test("the default production rebuild is isolated in a child and byte-identical t
   }
 });
 
+test("full-history calibration refuses unpublished replacements without losing the prior cache", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-unpublished-calibration-"));
+  try {
+    const fixture = await writeCompleteGenerationIndex(join(directory, "index.sqlite"), SUBPROCESS_FIXTURE_SHAPE);
+    const stateFile = join(directory, "state.sqlite");
+    const input = {stateFile, sourceMode: "unified", expectedGeneration: fixture.expectedGeneration,
+      unifiedIndexFile: fixture.indexFile, now: () => NOW, rebuildIsolation: "in_process"};
+    await refreshReplaySafeAccountingCache(input);
+    const prior = await readReplaySafeAccountingCache({stateFile});
+    assert.equal(prior.status, "available");
+    const database = openLocalUnifiedIndex(fixture.indexFile);
+    try {
+      beginUnifiedIndexGeneration(database, {contractVersion: "unified-calibration-test-v1", receivedAtMs: NOW});
+      // A staged writer is allowed to replace old offsets. The publication row
+      // itself has not changed, so checking only its fingerprint is insufficient.
+      assert.equal(readUnifiedIndexGenerationDescriptor(database).fingerprint, fixture.expectedGeneration.fingerprint);
+    } finally { database.close(); }
+    await assert.rejects(buildReplaySafeAccountingCache(input), {code: "accounting_unified_generation_mismatch"});
+    const after = await readReplaySafeAccountingCache({stateFile});
+    assert.equal(stableJson(after.cache), stableJson(prior.cache));
+  } finally { await rm(directory, {recursive: true, force: true}); }
+});
+
+test("full-history calibration refuses facts beyond the published source byte boundary", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-unpublished-calibration-offset-"));
+  try {
+    const fixture = await writeCompleteGenerationIndex(join(directory, "index.sqlite"), SUBPROCESS_FIXTURE_SHAPE);
+    const database = openLocalUnifiedIndex(fixture.indexFile);
+    try {
+      database.prepare(`UPDATE usage_event SET source_offset = (
+        SELECT scanned_bytes + 1 FROM generation_source gs WHERE gs.generation_id = ?
+          AND gs.source_local = usage_event.source_local AND gs.source_ordinal = usage_event.source_ordinal)
+        WHERE rowid = (SELECT MAX(rowid) FROM usage_event)`).run(fixture.expectedGeneration.id);
+      assert.equal(readUnifiedIndexGenerationDescriptor(database).fingerprint, fixture.expectedGeneration.fingerprint);
+    } finally { database.close(); }
+    await assert.rejects(buildReplaySafeAccountingCache({sourceMode: "unified",
+      expectedGeneration: fixture.expectedGeneration, unifiedIndexFile: fixture.indexFile, now: () => NOW}),
+    {code: "accounting_unified_generation_mismatch"});
+  } finally { await rm(directory, {recursive: true, force: true}); }
+});
+
+test("full-history calibration includes the final complete line ending at the published byte boundary", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-calibration-final-line-"));
+  try {
+    const fixture = await writeCompleteGenerationIndex(join(directory, "index.sqlite"), SUBPROCESS_FIXTURE_SHAPE);
+    const database = openLocalUnifiedIndex(fixture.indexFile);
+    try {
+      // The extractor records lineEndOffset, not the start of the line. A
+      // final complete record therefore ends exactly at scanned_bytes.
+      database.prepare(`UPDATE usage_event SET source_offset = (
+        SELECT scanned_bytes FROM generation_source gs WHERE gs.generation_id = ?
+          AND gs.source_local = usage_event.source_local AND gs.source_ordinal = usage_event.source_ordinal)
+        WHERE rowid = (SELECT MAX(rowid) FROM usage_event)`).run(fixture.expectedGeneration.id);
+    } finally { database.close(); }
+    const result = await buildReplaySafeAccountingCache({sourceMode: "unified",
+      expectedGeneration: fixture.expectedGeneration, unifiedIndexFile: fixture.indexFile, now: () => NOW});
+    assert.equal(result.weeklyCalibrationInput.source, "unified_index");
+    assert.equal(result.weeklyCalibrationInput.retainedUsageEvents, fixture.usageRows);
+    assert.equal(result.history.status, "available");
+  } finally { await rm(directory, {recursive: true, force: true}); }
+});
+
 test("a dead or lying rebuild child fails closed to the deferral and retains the prior cache", async () => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rebuild-subprocess-crash-"));
   try {

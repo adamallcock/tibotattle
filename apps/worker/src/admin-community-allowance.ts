@@ -1,5 +1,6 @@
 import {
   COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG,
+  COMMUNITY_ATTRIBUTION_METHOD_VERSION,
   COMMUNITY_ALLOWANCE_QUALIFICATION,
   COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS,
   COMMUNITY_ALLOWANCE_SPAN_FLOOR_PP,
@@ -601,6 +602,7 @@ const MODEL_COMPOSITION_DAY_JSON_LIMIT_BYTES = 16 * 1024;
 async function upsertCommunityModelCompositionDay(
   db: D1Database,
   payload: AdminCommunityModelCompositionDay,
+  sourceMutationEpoch: number,
 ): Promise<void> {
   const payloadJson = JSON.stringify(payload);
   if (new TextEncoder().encode(payloadJson).byteLength
@@ -608,12 +610,17 @@ async function upsertCommunityModelCompositionDay(
     return;
   }
   await db.prepare(
-    `INSERT INTO community_model_composition_days (day, payload_json, computed_at)
-     VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    `INSERT INTO community_model_composition_days (
+       day, payload_json, computed_at, attribution_method_version, source_mutation_epoch
+     ) SELECT ?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3, ?4
+       WHERE EXISTS (SELECT 1 FROM community_snapshot_mutation_control
+         WHERE singleton_id = 1 AND mutation_epoch = ?4)
      ON CONFLICT(day) DO UPDATE SET
        payload_json = excluded.payload_json,
-       computed_at = excluded.computed_at`,
-  ).bind(payload.day, payloadJson).run();
+       computed_at = excluded.computed_at,
+       attribution_method_version = excluded.attribution_method_version,
+       source_mutation_epoch = excluded.source_mutation_epoch`,
+  ).bind(payload.day, payloadJson, COMMUNITY_ATTRIBUTION_METHOD_VERSION, sourceMutationEpoch).run();
 }
 
 async function readCommunityModelCompositionDays(
@@ -624,12 +631,14 @@ async function readCommunityModelCompositionDays(
     `SELECT day, payload_json
        FROM community_model_composition_days
       WHERE day <= ?1 AND length(payload_json) <= ?2
+        AND attribution_method_version = ?4
       ORDER BY day DESC
       LIMIT ?3`,
   ).bind(
     latestAllowedDay,
     MODEL_COMPOSITION_DAY_JSON_LIMIT_BYTES,
     ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS,
+    COMMUNITY_ATTRIBUTION_METHOD_VERSION,
   ).all<{ day: string; payload_json: string }>();
   const days: AdminCommunityModelCompositionDay[] = [];
   for (const row of rows.results) {
@@ -763,7 +772,12 @@ export async function buildAdminCommunityAllowancePreviewFromSource(
   db: D1Database,
   nowMs: number = Date.now(),
 ): Promise<AdminCommunityAllowancePreview | null> {
-  const corpus = await readCachedCommunityAllowanceCorpus(db);
+  const sourceEpochRow = await db.prepare(
+    "SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id = 1",
+  ).first<{ mutation_epoch: number }>();
+  const sourceEpoch = sourceEpochRow?.mutation_epoch;
+  if (!Number.isSafeInteger(sourceEpoch) || sourceEpoch! < 0) return null;
+  const corpus = await readCachedCommunityAllowanceCorpus(db, nowMs);
   if (corpus === null) return null;
   // The per-model series is additive evidence: any failure here (missing 0041
   // migration, a refusing analyzer) degrades to whatever day rows already
@@ -776,6 +790,7 @@ export async function buildAdminCommunityAllowancePreviewFromSource(
       await upsertCommunityModelCompositionDay(
         db,
         buildCommunityModelCompositionDay(collection, today),
+        sourceEpoch!,
       );
     }
   } catch {
@@ -786,6 +801,10 @@ export async function buildAdminCommunityAllowancePreviewFromSource(
   } catch {
     modelDays = [];
   }
+  const currentEpoch = await db.prepare(
+    "SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id = 1",
+  ).first<{ mutation_epoch: number }>();
+  if (currentEpoch?.mutation_epoch !== sourceEpoch) return null;
   return buildAdminCommunityAllowancePreview(
     corpus.fits,
     nowMs,
@@ -818,8 +837,9 @@ export async function readCachedAdminCommunityAllowancePreview(
       `SELECT generated_at, payload_json
          FROM admin_community_allowance_preview_cache
         WHERE singleton = 1 AND length(payload_json) <= ?1
+          AND attribution_method_version = ?2
         LIMIT 1`,
-    ).bind(PREVIEW_CACHE_JSON_LIMIT_BYTES)
+    ).bind(PREVIEW_CACHE_JSON_LIMIT_BYTES, COMMUNITY_ATTRIBUTION_METHOD_VERSION)
       .first<{ generated_at: string; payload_json: string }>();
   } catch {
     return previewCacheUnavailable();
@@ -870,8 +890,9 @@ export async function warmAdminCommunityAllowancePreviewCache(
       `SELECT generated_at, payload_json
          FROM admin_community_allowance_preview_cache
         WHERE singleton = 1 AND length(payload_json) <= ?1
+          AND attribution_method_version = ?2
         LIMIT 1`,
-    ).bind(PREVIEW_CACHE_JSON_LIMIT_BYTES)
+    ).bind(PREVIEW_CACHE_JSON_LIMIT_BYTES, COMMUNITY_ATTRIBUTION_METHOD_VERSION)
       .first<{ generated_at: string; payload_json: string }>();
     if (existing !== null
         && typeof existing.generated_at === "string"
@@ -897,6 +918,13 @@ export async function warmAdminCommunityAllowancePreviewCache(
       }
     }
 
+    const epochRow = await db.prepare(
+      "SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id = 1",
+    ).first<{ mutation_epoch: number }>();
+    const sourceEpoch = epochRow?.mutation_epoch;
+    if (!Number.isSafeInteger(sourceEpoch) || sourceEpoch! < 0) {
+      return { code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" };
+    }
     const preview = await buildAdminCommunityAllowancePreviewFromSource(
       db,
       nowEpoch,
@@ -916,12 +944,16 @@ export async function warmAdminCommunityAllowancePreviewCache(
     }
     const write = await db.prepare(
       `INSERT INTO admin_community_allowance_preview_cache (
-         singleton, generated_at, payload_json
-       ) VALUES (1, ?1, ?2)
+         singleton, generated_at, payload_json, attribution_method_version, source_mutation_epoch
+       ) SELECT 1, ?1, ?2, ?3, ?4
+         WHERE EXISTS (SELECT 1 FROM community_snapshot_mutation_control
+           WHERE singleton_id = 1 AND mutation_epoch = ?4)
        ON CONFLICT(singleton) DO UPDATE SET
          generated_at = excluded.generated_at,
-         payload_json = excluded.payload_json`,
-    ).bind(preview.generatedAt, payloadJson).run();
+         payload_json = excluded.payload_json,
+         attribution_method_version = excluded.attribution_method_version,
+         source_mutation_epoch = excluded.source_mutation_epoch`,
+    ).bind(preview.generatedAt, payloadJson, COMMUNITY_ATTRIBUTION_METHOD_VERSION, sourceEpoch).run();
     return write.meta.changes === 1
       ? { code: "ALLOWANCE_PREVIEW_CACHE_REFRESHED" }
       : { code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" };

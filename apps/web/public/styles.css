@@ -323,6 +323,8 @@ body.native-dashboard #setup-card { display: none !important; }
   font-size: .7rem;
   font-weight: var(--weight-semibold);
 }
+#weekly-plan-control { min-width: 0; max-width: 100%; gap: .5rem; }
+#weekly-plan-control select { min-width: 0; max-width: 100%; flex: 0 1 auto; }
 .state-pill, .evidence-chip {
   display: inline-flex;
   align-items: center;
@@ -4778,3 +4780,8 @@ html[data-theme="dark"] .noscript {
     padding: 24px;
   }
 }
+/* The separate successor review must fit native narrow windows and never
+   put a capability or device target into visible markup. */
+#attribution-consent { margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--line); }
+#attribution-review-inventory dd { margin: .25rem 0 1rem; overflow-wrap: anywhere; }
+#attribution-review-contract { overflow-wrap: anywhere; }

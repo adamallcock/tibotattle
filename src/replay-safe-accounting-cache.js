@@ -15,7 +15,10 @@ import {
   createIndexedCodexLogScan,
   defaultLocalAnalysisIndexSecretPath,
 } from "./local-analysis-index.js";
-import { createLocalUnifiedAccountingSource } from "./local-unified-accounting-source.js";
+import {
+  createLocalUnifiedAccountingSource,
+  createLocalUnifiedUsageAttributionReader,
+} from "./local-unified-accounting-source.js";
 import {
   CODEX_TRANSITION_DERIVATION_CEILINGS,
   deriveCodexTransitionSeriesCooperatively,
@@ -49,9 +52,13 @@ import {
   analyzeQuotaPace,
   blendedCompositionCapacityUsd,
   buildCompositionObservations,
+  buildPlanAttributionIndex,
+  classifyUsageAttribution,
   calibrateCompositionCapacities,
   isValidQuotaWindowDuration,
   MODEL_COMPOSITION_POLICY,
+  planAttributionContextKey,
+  planEraForInterval,
   SEVEN_DAY_WINDOW_MINUTES,
 } from "@app-usagemonitor/quota-analysis";
 import { TELEMETRY_PLAN_TYPES } from "@app-usagemonitor/telemetry-contract";
@@ -70,6 +77,7 @@ import { stableJson } from "./storage.js";
 import {
   BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT,
   projectBoundedWeeklyCalibrationSummary,
+  validWeeklyPlanPopulations,
 } from "./reporting/index.js";
 
 // v0.4 added per-model allowance-track and API-price-applicability state, and
@@ -118,8 +126,10 @@ import {
 // v0.13 (2026-08-30): speed crossings use canonical registered models and
 // event-qualified Priority cards. Old prefix-family crossings cannot recover
 // the model/context/epoch eligibility, so they must be rebuilt, not relabeled.
+// v0.14: exact occurrence plans and bounded quantity intervals survive compact
+// replay; plan-era populations replace provider-wide calibration numerators.
 export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
-  "local-replay-safe-accounting-v0.13";
+  "local-replay-safe-accounting-v0.14";
 const { scanCodexLogEvents } = localCodexLogScanner;
 const ALLOWANCE_CAPACITY_SCHEMA_VERSION =
   "codex-primary-allowance-capacity-v0.1";
@@ -484,7 +494,7 @@ export const REPLAY_SAFE_ACCOUNTING_REBUILD_REQUEST_VERSION =
 // phase. The general analysis-index and unified-index worker policies remain
 // unchanged.
 const DEFAULT_ACCOUNTING_INDEX_WORKERS = 4;
-const COMPACT_USAGE_RETAINED_BYTES = 256;
+const COMPACT_USAGE_RETAINED_BYTES = 352;
 const COMPACT_SNAPSHOT_RETAINED_BYTES = 192;
 const DEFAULT_TRANSITION_RESOURCE_LIMITS = Object.freeze({
   usageEvents: CODEX_TRANSITION_DERIVATION_CEILINGS.usageEvents,
@@ -1398,7 +1408,71 @@ function transitionUsageProjection(event, projection) {
       .sort(),
     projection.priced.selectedPriceCardIds,
     projection.priced.priceCardBreakdown ?? [],
+    [
+      event.planAttribution?.basis ?? "unavailable",
+      event.planAttribution?.planType ?? null,
+      event.usageIntervalStartedAt ?? null,
+      event.usageIntervalBasis ?? "unavailable",
+    ],
   ];
+}
+
+// Keep the first and last observation of a chronological same-plan run. Its
+// last old/first new anchors delimit the uncertain switch interval. This is
+// independent of percent, reset and token changes, so quota-only evidence
+// survives the fit-oriented snapshot collapse below.
+function calibrationPlanEvidence({ ordered = false, maximum = 750_000 } = {}) {
+  const rows = [];
+  const runs = new Map();
+  let latestMs = Number.NEGATIVE_INFINITY;
+  let latestPlans = new Set();
+  const planTypes = new Set();
+  return {
+    observe(snapshot) {
+      const window = snapshot?.window;
+      const observedAtMs = Number.isFinite(snapshot?.timestampMs)
+        ? snapshot.timestampMs : Date.parse(snapshot?.timestamp);
+      if (!window || window.provider !== "openai_codex" || window.limitId !== "codex"
+          || !Number.isSafeInteger(observedAtMs)) return;
+      const planType = typeof window.planType === "string" && /^[a-z][a-z0-9_-]{0,31}$/u.test(window.planType)
+        ? window.planType : "unknown";
+      if (planType !== "unknown") {
+        planTypes.add(planType);
+        if (observedAtMs > latestMs) { latestMs = observedAtMs; latestPlans = new Set(); }
+        if (observedAtMs === latestMs) latestPlans.add(planType);
+      }
+      const row = {
+        contextKey: planAttributionContextKey(window.provider, window.limitId),
+        observedAtMs, planType, planVariant: "unknown", accountScopeId: null,
+      };
+      const run = runs.get(row.contextKey);
+      if (ordered && run?.planType === planType && observedAtMs >= run.lastMs) {
+        if (run.lastIndex === run.firstIndex) {
+          run.lastIndex = rows.length;
+          rows.push(row);
+        } else rows[run.lastIndex] = row;
+        run.lastMs = observedAtMs;
+      } else {
+        runs.set(row.contextKey, { planType, firstIndex: rows.length, lastIndex: rows.length, lastMs: observedAtMs });
+        rows.push(row);
+      }
+      if (rows.length > maximum) throw fixedError("accounting_transition_snapshot_limit_exceeded");
+    },
+    finish() {
+      const index = buildPlanAttributionIndex(rows);
+      rows.length = 0;
+      runs.clear();
+      if (index.status !== "ready") throw fixedError("accounting_transition_derivation_limit_exceeded");
+      return {
+        index,
+        summary: {
+          planTypes: [...planTypes].sort(),
+          latestPlanType: latestPlans.size === 1 ? [...latestPlans][0] : "unknown",
+          singlePlanComparisonEligible: planTypes.size === 1 && index.conflicts.length === 0,
+        },
+      };
+    },
+  };
 }
 
 function weeklyRateLimitProjection(snapshot) {
@@ -2482,6 +2556,7 @@ async function deriveBoundedWeeklyCalibrationSeries({
   diagnostics,
   signal,
   resourceCheck,
+  planAttributionIndex,
 }) {
   if ((rawUsageEvents === null) === (usageCorpus === null)) {
     throw new TypeError(
@@ -2507,7 +2582,8 @@ async function deriveBoundedWeeklyCalibrationSeries({
     signal,
     consumeInputs: true,
     includeNormalizedInputs: false,
-    inputEncoding: "accounting_prepriced_compact_v2",
+    inputEncoding: "accounting_prepriced_compact_v3",
+    planAttributionIndex,
     resourceCheck,
   });
 
@@ -2750,6 +2826,8 @@ export async function fitCompositionFromCompactCorpus({
   endMs,
   signal = null,
   checkRuntimeMemory = () => {},
+  planAttributionIndex = null,
+  selectedPlanType = null,
 }) {
   return fitCompositionFromCorpusStream({
     forEachUsageRow: async (consume) => {
@@ -2759,6 +2837,8 @@ export async function fitCompositionFromCompactCorpus({
     endMs,
     signal,
     checkRuntimeMemory,
+    planAttributionIndex,
+    selectedPlanType,
   });
 }
 
@@ -2773,14 +2853,27 @@ async function fitCompositionFromCorpusStream({
   endMs,
   signal = null,
   checkRuntimeMemory = () => {},
+  planAttributionIndex = null,
+  selectedPlanType = null,
 }) {
   const grainMs = MODEL_COMPOSITION_POLICY.grainMs;
+  const contextKey = planAttributionContextKey("openai_codex", "codex");
+  const attributionIndex = planAttributionIndex ?? buildPlanAttributionIndex(
+    weeklyRateLimitSnapshots.filter(Array.isArray)
+      .map((row) => ({ contextKey, observedAtMs: row[1], planType: row[3] })),
+  );
+  const planType = selectedPlanType ?? weeklyRateLimitSnapshots.filter((row) => (
+    Array.isArray(row) && Number.isSafeInteger(row[1])
+  ))
+    .sort((left, right) => left[1] - right[1]).at(-1)?.[3] ?? "unknown";
+  const excludedBins = new Set();
   const recentStartMs = endMs - COMPOSITION_RECENT_MIX_DAYS * 24 * 60 * 60 * 1_000;
   // binStartMs -> Map(model -> summed costUsd), Maps kept in first-encounter
   // order so the kernel accumulates in the same order the per-event path did
   // and the fit stays bit-identical.
   const binCosts = new Map();
   const recentMix = {};
+  const recentCostsByBin = new Map();
   let processed = 0;
   await forEachUsageRow(async (row) => {
     processed += 1;
@@ -2797,10 +2890,21 @@ async function fitCompositionFromCorpusStream({
         || !Number.isFinite(costUsd)
         || costUsd < 0) return;
     const model = row[1];
+    const binStartMs = Math.floor(observedAtMs / grainMs) * grainMs;
+    const intervalStartMs = Date.parse(row[20]?.[2] ?? "");
+    const association = classifyUsageAttribution(attributionIndex, {
+      contextKey, observedAtMs,
+      ...(Number.isSafeInteger(intervalStartMs) ? { intervalStartMs } : {}),
+      observedPlanType: row[20]?.[0] === "same_record" ? row[20][1] : null,
+    }, { planType });
+    if (association.disposition === "incompatible") return;
+    if (row[20]?.[0] === "conflicted" || association.disposition === "unresolved") {
+      excludedBins.add(binStartMs);
+      return;
+    }
     // The kernel's own binning refuses empty model names; the recent mix
     // mirrors the historical per-event behavior and keeps them.
     if (model.length > 0) {
-      const binStartMs = Math.floor(observedAtMs / grainMs) * grainMs;
       let costs = binCosts.get(binStartMs);
       if (costs === undefined) {
         costs = new Map();
@@ -2809,7 +2913,12 @@ async function fitCompositionFromCorpusStream({
       costs.set(model, (costs.get(model) ?? 0) + costUsd);
     }
     if (observedAtMs >= recentStartMs) {
-      recentMix[model] = (recentMix[model] ?? 0) + costUsd;
+      let recentCosts = recentCostsByBin.get(binStartMs);
+      if (recentCosts === undefined) {
+        recentCosts = new Map();
+        recentCostsByBin.set(binStartMs, recentCosts);
+      }
+      recentCosts.set(model, (recentCosts.get(model) ?? 0) + costUsd);
     }
   });
   const quotaRows = [];
@@ -2827,6 +2936,7 @@ async function fitCompositionFromCorpusStream({
     if (!Number.isFinite(observedAtMs)
         || !Number.isFinite(resetsAtSeconds)
         || !Number.isFinite(usedPercent)) continue;
+    if (row[3] !== planType) continue;
     quotaRows.push({
       observedAtMs,
       planType: typeof row[3] === "string" ? row[3] : "unknown",
@@ -2836,14 +2946,27 @@ async function fitCompositionFromCorpusStream({
   }
   // One aggregated row per (bin, model): O(bins x models), not O(events).
   const usageRows = [];
-  for (const [binStartMs, costs] of binCosts) {
-    for (const [model, costUsd] of costs) {
+  for (const binStartMs of new Set([...binCosts.keys(), ...recentCostsByBin.keys()])) {
+    const lookup = planEraForInterval(attributionIndex, {
+      contextKey, observedAtMs: binStartMs + grainMs - 1, intervalStartMs: binStartMs,
+    });
+    if (lookup.status !== "matched" || lookup.era.planType !== planType) excludedBins.add(binStartMs);
+    if (excludedBins.has(binStartMs)) continue;
+    for (const [model, costUsd] of binCosts.get(binStartMs) ?? []) {
       usageRows.push({ observedAtMs: binStartMs, model, costUsd });
+    }
+    // Later conflicting rows can invalidate a whole bin. The recent model mix
+    // must use the same eligible bins as the fit, not an already-added subtotal.
+    for (const [model, costUsd] of recentCostsByBin.get(binStartMs) ?? []) {
+      recentMix[model] = (recentMix[model] ?? 0) + costUsd;
     }
   }
   binCosts.clear();
+  recentCostsByBin.clear();
   const { observations, voidedBinCount, poolCount } =
-    buildCompositionObservations({ usageRows, quotaRows });
+    buildCompositionObservations({ usageRows, quotaRows: quotaRows.filter((row) => (
+      !excludedBins.has(Math.floor(row.observedAtMs / grainMs) * grainMs)
+    )) });
   const fit = calibrateCompositionCapacities(observations);
   const blendedRecentMixUsd = fit.status === "fitted"
     ? blendedCompositionCapacityUsd(recentMix, {
@@ -2852,6 +2975,8 @@ async function fitCompositionFromCorpusStream({
     })
     : null;
   return {
+    planType,
+    attributionExcludedBins: excludedBins.size,
     status: fit.status,
     grainHours: MODEL_COMPOSITION_POLICY.grainMs / 3_600_000,
     observationCount: fit.observationCount,
@@ -2983,6 +3108,7 @@ async function openUnifiedIndexCalibrationCorpus({
   signal,
   checkRuntimeMemory,
   expectedGeneration = null,
+  allowLegacyUnpublished = false,
 }) {
   let metadata;
   try {
@@ -3007,16 +3133,40 @@ async function openUnifiedIndexCalibrationCorpus({
       // A close failure cannot make the read-only handle more open.
     }
   };
+  const descriptor = readUnifiedIndexGenerationDescriptor(database);
+  const generationId = descriptor?.id ?? null;
+  // Publication membership is not a SQLite snapshot. A writer can replace an
+  // earlier offset or append facts while the last published descriptor stays
+  // unchanged. Fence the entire multi-pass read, not just its initial row count.
+  const dataVersion = Number(database.prepare("PRAGMA data_version").get()?.data_version);
   const verifyGeneration = () => {
-    if (expectedGeneration === null || expectedGeneration === undefined) return;
-    const expected = expectedGenerationTokens(expectedGeneration);
-    const observed = publishedUnifiedGenerationTokens(database);
-    if (expected.length === 0
-        || !generationMatchesExpected(expectedGeneration, observed)) {
+    if (!Number.isSafeInteger(dataVersion)
+        || Number(database.prepare("PRAGMA data_version").get()?.data_version) !== dataVersion) {
+      throw fixedError("accounting_unified_generation_mismatch");
+    }
+    if (generationId !== null) {
+      const current = readUnifiedIndexGenerationDescriptor(database);
+      const inProgress = database.prepare(`SELECT 1 FROM index_generation
+        WHERE id > ? AND status = 'in_progress' LIMIT 1`).get(generationId);
+      if (current?.id !== generationId || current?.fingerprint !== descriptor.fingerprint
+          || inProgress !== undefined) {
+        throw fixedError("accounting_unified_generation_mismatch");
+      }
+    }
+    if (expectedGeneration !== null && expectedGeneration !== undefined
+        && (expectedGenerationTokens(expectedGeneration).length === 0
+          || !generationMatchesExpected(expectedGeneration, publishedUnifiedGenerationTokens(database)))) {
       throw fixedError("accounting_unified_generation_mismatch");
     }
   };
   const usageGraceMs = endMs + 5 * 60_000;
+  if (generationId === null && !allowLegacyUnpublished) {
+    dispose();
+    return null;
+  }
+  const attributionReader = generationId === null ? null
+    : createLocalUnifiedUsageAttributionReader({ database, generationId });
+  const planEvidence = calibrationPlanEvidence({ ordered: true, maximum: limits.weeklySnapshots });
   const price = createAccountingPricer();
   // Shared row-count cadence across every read this source performs (the open
   // pass and the later re-read streams continue one counter), matching the
@@ -3057,6 +3207,7 @@ async function openUnifiedIndexCalibrationCorpus({
     if (!Number.isSafeInteger(observedMs)) return null;
     const rawEvent = {
       timestamp: new Date(observedMs).toISOString(),
+      ...(attributionReader?.read(row) ?? {}),
       model: row.model_id,
       // NULL means "the record did not report a total"; it must stay
       // absent so the pricer bands by the summed input components exactly
@@ -3088,6 +3239,10 @@ async function openUnifiedIndexCalibrationCorpus({
   };
   const USAGE_COLUMNS = `
       SELECT u.rowid AS row_id,
+             u.source_local AS source_local,
+             u.source_offset AS source_offset,
+             u.source_ordinal AS source_ordinal,
+             u.session_local AS session_local,
              u.observed_at_ms AS observed_at_ms,
              m.model_id AS model_id,
              t.codex_speed_mode AS codex_speed_mode,
@@ -3104,6 +3259,28 @@ async function openUnifiedIndexCalibrationCorpus({
       JOIN tier_semantics t ON t.id = u.tier_id`;
   try {
     verifyGeneration();
+    if (generationId !== null) {
+      // Count the complete physical fact sets once, before display/fit filters.
+      // Extra unpublished facts cannot be made safe by marking their attribution
+      // unknown: they must not enter the published quantity numerator at all.
+      for (const [table, declaredCount] of [
+        ["usage_event", descriptor.usageEvents],
+        ["quota_occurrence", descriptor.quotaOccurrences],
+      ]) {
+        const counts = database.prepare(`SELECT COUNT(*) AS total,
+          COALESCE(SUM(CASE WHEN gs.source_local IS NULL THEN 1 ELSE 0 END), 0) AS unproven
+          FROM ${table} f LEFT JOIN generation_source gs
+            ON gs.generation_id = ? AND gs.source_local = f.source_local
+            AND gs.source_ordinal = f.source_ordinal
+            AND f.source_offset >= 0 AND f.source_offset <= gs.scanned_bytes
+            AND gs.status IN ('skipped', 'touched', 'resumed', 'rescanned', 'complete')
+            AND gs.diagnostics_complete = 1`).get(generationId);
+        if (Number(counts.total) !== declaredCount || Number(counts.unproven) !== 0) {
+          throw fixedError("accounting_unified_generation_mismatch");
+        }
+      }
+      verifyGeneration();
+    }
     const usageCount = Number(database.prepare(
       "SELECT COUNT(*) AS c FROM usage_event WHERE observed_at_ms <= ?",
     ).get(usageGraceMs)?.c ?? 0);
@@ -3184,16 +3361,30 @@ async function openUnifiedIndexCalibrationCorpus({
     const snapshotLowerMs = retainedStartMs === null
       ? -1
       : firstUsageMs;
-    const snapshotStatement = database.prepare(`
-      SELECT observed_at_ms, slot, plan_type, used_percent, resets_at_ms
-      FROM quota_observation
-      WHERE limit_id = 'codex' AND duration_mins = ?
-        AND used_percent IS NOT NULL AND resets_at_ms IS NOT NULL
-        AND observed_at_ms >= ? AND observed_at_ms <= ?
-      ORDER BY observed_at_ms, id`);
+    const snapshotStatement = generationId === null
+      // Explicit legacy/unpublished fixture/import mode only. Production
+      // schema-11 reads MUST use occurrences; a canonical winner can belong
+      // to a different source/plan at the same time.
+      ? database.prepare(`SELECT observed_at_ms, slot, plan_type, used_percent,
+          resets_at_ms, duration_mins, 'openai_codex' AS provider
+        FROM quota_observation WHERE limit_id = 'codex'
+          AND observed_at_ms >= ? AND observed_at_ms <= ?
+        ORDER BY observed_at_ms, id`)
+      : database.prepare(`SELECT q.observed_at_ms, q.slot, q.plan_type, q.used_percent,
+          q.resets_at_ms, q.duration_mins, q.provider
+        FROM quota_occurrence q
+        JOIN generation_source gs ON gs.generation_id = ?
+          AND gs.source_local = q.source_local AND gs.source_ordinal = q.source_ordinal
+          AND q.source_offset >= 0 AND q.source_offset <= gs.scanned_bytes
+          AND gs.status IN ('skipped', 'touched', 'resumed', 'rescanned', 'complete')
+          AND gs.diagnostics_complete = 1
+        WHERE q.limit_id = 'codex' AND q.admission = 'admitted'
+          AND q.observed_at_ms >= ? AND q.observed_at_ms <= ?
+        ORDER BY q.observed_at_ms, q.id`);
     const weeklyRateLimitSnapshots = [];
     let firstSnapshotMs = null;
     const groupRuns = new Map();
+    let lastObservedPlan = null;
     // Incremental reservation for every snapshot row the collapse decides to
     // retain, mirroring reserveTransitionInput on the windowed path: bytes,
     // snapshot count, and combined count are all checked BEFORE the row is
@@ -3233,11 +3424,8 @@ async function openUnifiedIndexCalibrationCorpus({
         },
       }));
     };
-    for (const row of snapshotStatement.iterate(
-      WEEKLY_WINDOW_MINUTES,
-      snapshotLowerMs,
-      endMs,
-    )) {
+    for (const row of snapshotStatement.iterate(...(generationId === null
+      ? [snapshotLowerMs, endMs] : [generationId, snapshotLowerMs, endMs]))) {
       // Stop reading the stream the moment retention refused a row: every
       // later row would either be refused too or misrepresent a corpus that
       // is already over budget as complete. (Break rather than return: the
@@ -3246,6 +3434,19 @@ async function openUnifiedIndexCalibrationCorpus({
       if (retainedInputBudgetExceeded) break;
       await cadence();
       const observedMs = Number(row.observed_at_ms);
+      planEvidence.observe({
+        timestampMs: observedMs,
+        window: { provider: row.provider, limitId: "codex", planType: row.plan_type },
+      });
+      if (typeof row.plan_type === "string" && row.plan_type !== "unknown") {
+        if (lastObservedPlan !== null && row.plan_type !== lastObservedPlan) {
+          for (const run of groupRuns.values()) if (run.pending) emit(run.pending);
+          groupRuns.clear();
+        }
+        lastObservedPlan = row.plan_type;
+      }
+      if (Number(row.duration_mins) !== WEEKLY_WINDOW_MINUTES || row.resets_at_ms === null
+          || row.used_percent === null) continue;
       const resetsAtSec = Math.floor(Number(row.resets_at_ms) / 1_000);
       const usedPercent = Number(row.used_percent);
       if (!Number.isSafeInteger(observedMs)
@@ -3331,6 +3532,7 @@ async function openUnifiedIndexCalibrationCorpus({
       if (closed) {
         throw fixedError("accounting_calibration_corpus_unavailable");
       }
+      verifyGeneration();
       const endBoundMs = usageMs[high - 1];
       const endBoundRowid = usageRowid[high - 1];
       let cursorMs = usageMs[low];
@@ -3372,6 +3574,7 @@ async function openUnifiedIndexCalibrationCorpus({
       if (served !== high - low) {
         throw fixedError("accounting_unified_generation_changed");
       }
+      verifyGeneration();
     };
     return {
       coveredAt: {
@@ -3380,6 +3583,7 @@ async function openUnifiedIndexCalibrationCorpus({
       },
       retainedUsageEvents,
       weeklyRateLimitSnapshots,
+      planAttribution: planEvidence.finish(),
       usageMs,
       readUsageSlice: async (low, high) => {
         if (!Number.isSafeInteger(low) || !Number.isSafeInteger(high)
@@ -3582,6 +3786,7 @@ export async function buildReplaySafeAccountingCache({
   const weeklyPaceSnapshots = [];
   const rawUsageEvents = [];
   const weeklyRateLimitSnapshots = [];
+  const windowedPlanEvidence = calibrationPlanEvidence({ maximum: limits.weeklySnapshots });
   let retainedSparkUsageEvents = 0;
   let retainedSparkSnapshotInputs = 0;
   const price = createAccountingPricer();
@@ -3676,6 +3881,7 @@ export async function buildReplaySafeAccountingCache({
         if (!Number.isFinite(observedMs)
             || observedMs < startMs
             || observedMs > endMs) return;
+        if (retainWindowedCalibrationInputs) windowedPlanEvidence.observe(snapshot);
         // Rows keep the observed limit id: consumers filter the series with
         // SPARK_QUOTA_LIMIT_IDS.includes(row.limitId), same as the unified
         // and collector paths.
@@ -3807,6 +4013,7 @@ export async function buildReplaySafeAccountingCache({
       declaredSpeedBaselines: baselines,
       signal,
       checkRuntimeMemory,
+      allowLegacyUnpublished: selectedSourceMode === "legacy",
       ...(selectedSourceMode === "unified"
         ? { expectedGeneration: unifiedCoverage?.generation ?? null }
         : {}),
@@ -3838,6 +4045,8 @@ export async function buildReplaySafeAccountingCache({
       : calibrationCorpus.coveredAt.startAt,
     endAt: new Date(endMs).toISOString(),
   };
+  const calibrationAttribution = retainWindowedCalibrationInputs
+    ? windowedPlanEvidence.finish() : calibrationCorpus.planAttribution;
   try {
     // The composition fit reads the same compact corpus the derivation below
     // will consume, so it must run first. It is strictly optional enrichment:
@@ -3855,6 +4064,8 @@ export async function buildReplaySafeAccountingCache({
           endMs,
           signal,
           checkRuntimeMemory,
+          planAttributionIndex: calibrationAttribution.index,
+          selectedPlanType: calibrationAttribution.summary.latestPlanType,
         })
         : await fitCompositionFromCorpusStream({
           forEachUsageRow: calibrationCorpus.forEachRetainedUsage,
@@ -3862,6 +4073,8 @@ export async function buildReplaySafeAccountingCache({
           endMs,
           signal,
           checkRuntimeMemory,
+          planAttributionIndex: calibrationAttribution.index,
+          selectedPlanType: calibrationAttribution.summary.latestPlanType,
         });
     } catch (error) {
       compositionFitFailure = {
@@ -3895,6 +4108,7 @@ export async function buildReplaySafeAccountingCache({
           : {},
         signal,
         resourceCheck: checkRuntimeMemory,
+        planAttributionIndex: calibrationAttribution.index,
       });
     } catch (error) {
       if (error?.name === "AbortError"
@@ -3922,6 +4136,7 @@ export async function buildReplaySafeAccountingCache({
     throw error;
   }
   const weeklyCalibrationDataset = {
+    attribution: calibrationAttribution.summary,
     parserVersion: PARSER_VERSION,
     scope: {
       startAt: calibrationCoveredAt.startAt,
@@ -4018,7 +4233,7 @@ export async function buildReplaySafeAccountingCache({
     allowanceCapacityByScenario,
     weeklyCalibrationInput: {
       status: "complete",
-      encoding: "accounting_compact_v2",
+      encoding: "accounting_compact_v3",
       // Which corpus fed the calibration: the whole unified index when it is
       // present, the scan window only as the fallback. `coveredAt` states the
       // span that corpus actually reaches, so a reader can tell full history
@@ -4553,7 +4768,7 @@ export async function refreshReplaySafeAccountingCache({
 function validWeeklyCalibrationInput(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)
       || value.status !== "complete"
-      || value.encoding !== "accounting_compact_v2"
+      || value.encoding !== "accounting_compact_v3"
       || !["unified_index", "windowed_scan"].includes(value.source)
       || canonicalInstant(value.coveredAt?.startAt) === null
       || canonicalInstant(value.coveredAt?.endAt) === null
@@ -5070,7 +5285,9 @@ function validAllowanceCapacityByScenario(value) {
         || !validAllowanceCalibrationSummary(
           row.calibration,
           forcedCandidateId,
-        )) return false;
+        ) || !validWeeklyPlanPopulations(row.calibration, (population) => (
+          validAllowanceCalibrationSummary(population, forcedCandidateId)
+        ))) return false;
   }
   return true;
 }
@@ -5190,6 +5407,10 @@ function validCache(value) {
       )
       || value.weeklyCalibration?.schemaVersion
         !== "weekly-calibration-summary-v0.1"
+      || !validWeeklyPlanPopulations(value.weeklyCalibration, (population) => (
+        validAllowanceCalibrationSummary(population, population.validation?.selectedCostBasis)
+          && validWeeklyCalibrationComposition(population.composition)
+      ))
       || canonicalInstant(value.weeklyCalibration.generatedAt) === null
       || !["estimated", "insufficient_evidence"].includes(
         value.weeklyCalibration.status,

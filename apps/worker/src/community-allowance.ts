@@ -1,8 +1,9 @@
 import { APP_PRICE_REGISTRY_MANIFEST } from "@app-usagemonitor/accounting";
-import { SEVEN_DAY_WINDOW_MINUTES } from "@app-usagemonitor/quota-analysis";
+import { PLAN_ATTRIBUTION_POLICY, SEVEN_DAY_WINDOW_MINUTES } from "@app-usagemonitor/quota-analysis";
 import { accountScopedQuotaAnalysis } from "./quota-analysis";
 import {
   V1_ANALYSIS_WINDOW_DAYS,
+  V1_PLAN_ATTRIBUTION_ADAPTER_VERSION,
   accountScopedModelCompositionV1,
   accountScopedQuotaAnalysisV1,
 } from "./quota-analysis-v1";
@@ -11,6 +12,18 @@ import type {
   V1ModelCompositionResult,
 } from "./quota-analysis-v1";
 import { SERVER_PRICING_METHOD_VERSION } from "./server-pricing";
+import {
+  V1_SOURCE_SELECTION_METHOD_VERSION,
+  assertV1SourcePinCurrent,
+  loadV1SourcePin,
+} from "./telemetry-v1-source-selection";
+import type { V1SourcePin } from "./telemetry-v1-source-selection";
+import { canonicalJson } from "./canonical-json";
+import { sha256Hex } from "./crypto";
+import { accountScopedModelCompositionV11, accountScopedQuotaAnalysisV11,
+  V11_PLAN_ATTRIBUTION_ADAPTER_VERSION } from "./quota-analysis-v11";
+import { assertV11SourcePinCurrent, loadV11SourcePin, V11_DOMAIN_METHOD_VERSION,
+  type V11SourcePin } from "./telemetry-v11-domain";
 
 /**
  * The community allowance series: for a UTC day, the fitted seven-day Codex
@@ -71,13 +84,81 @@ const NANOUSD_PER_USD = 1_000_000_000;
 // rate via the speed ratio (server pricing v0.3), so fits move to the
 // speed-priced basis; the server pricing method version also joins the cache
 // key so future pricing-semantics changes self-invalidate.
-const FIT_ADAPTER_VERSION = "v1-fit-6";
+const FIT_ADAPTER_VERSION = "v1-fit-7";
+export const COMMUNITY_ATTRIBUTION_METHOD_VERSION =
+  [PLAN_ATTRIBUTION_POLICY.methodVersion, V1_SOURCE_SELECTION_METHOD_VERSION,
+    V1_PLAN_ATTRIBUTION_ADAPTER_VERSION, V11_PLAN_ATTRIBUTION_ADAPTER_VERSION,
+    V11_DOMAIN_METHOD_VERSION].join(":");
 // The tail of every v1 fit-cache key beyond the participant's chunk epoch.
 // One constant serves the writer and both readers so they can never diverge
 // (a 2026-08-30 regression had the corpus reader expecting one fewer segment,
 // which starved the admin allowance preview).
 const V1_FIT_CACHE_KEY_SUFFIX =
-  `${APP_PRICE_REGISTRY_MANIFEST.sha256}:${FIT_ADAPTER_VERSION}:${SERVER_PRICING_METHOD_VERSION}`;
+  `${APP_PRICE_REGISTRY_MANIFEST.sha256}:${FIT_ADAPTER_VERSION}:${SERVER_PRICING_METHOD_VERSION}:${COMMUNITY_ATTRIBUTION_METHOD_VERSION}`;
+
+function analysisFromDay(nowMs: number): string {
+  if (!Number.isFinite(nowMs)) throw new TypeError("analysis time invalid");
+  return new Date(nowMs - V1_ANALYSIS_WINDOW_DAYS * MILLISECONDS_PER_DAY)
+    .toISOString().slice(0, 10);
+}
+
+type LegacySource = "v0.2" | "v1" | "mixed" | "v1.1";
+type CommunitySourcePin = V1SourcePin | V11SourcePin;
+
+function isV11Pin(pin: CommunitySourcePin): pin is V11SourcePin {
+  return "source" in pin && pin.source === "v1.1";
+}
+
+async function assertCommunitySourcePinCurrent(db: D1Database, pin: CommunitySourcePin): Promise<void> {
+  if (isV11Pin(pin)) await assertV11SourcePinCurrent(db, pin);
+  else await assertV1SourcePinCurrent(db, pin);
+}
+
+function sourceCacheKey(pin: CommunitySourcePin, fromDay: string, suffix: string, source: LegacySource = "v1"): string {
+  if (!Number.isSafeInteger(pin.inputRevision) || pin.inputRevision! < 0) {
+    throw new Error("analytical input revision unavailable");
+  }
+  return `${source}:${pin.inputRevision}:${fromDay}:${suffix}`;
+}
+
+async function loadCommunitySourcePin(db: D1Database, participantId: string, fromDay: string, source: LegacySource) {
+  if (source === "v1.1") {
+    const sourcePin = await loadV11SourcePin(db, participantId, {fromDay});
+    if (!sourcePin) throw new Error("activated attribution source unavailable");
+    return {sourcePin, fingerprint: sourcePin.fingerprint};
+  }
+  const sourcePin = await loadV1SourcePin(db, { participantId, fromDay });
+  const legacy = await db.prepare(`SELECT id, plaintext_digest, envelope_digest, dataset_id,
+      range_start, range_end, created_at FROM telemetry_contributions
+    WHERE participant_id = ? AND status = 'accepted'
+      AND transport_schema_version = 'telemetry-contribution-v0.2'
+    ORDER BY id LIMIT 101`).bind(participantId).all<Record<string, unknown>>();
+  if (legacy.results.length > 100) throw new Error("legacy source vector limit exceeded");
+  await assertV1SourcePinCurrent(db, sourcePin);
+  const fingerprint = await sha256Hex(canonicalJson({
+    methodVersion: COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+    v1: sourcePin.fingerprint, legacy: legacy.results,
+  }));
+  return { sourcePin, fingerprint };
+}
+
+function parsedCachedFits(json: string, participantId: string): CommunityAllowanceFit[] | null {
+  let values: unknown;
+  try { values = JSON.parse(json); } catch { return null; }
+  if (!Array.isArray(values) || values.length > 50_000) return null;
+  const fits: CommunityAllowanceFit[] = [];
+  for (const value of values) {
+    if (!value || typeof value !== "object" || Array.isArray(value)
+        || value.participantId !== participantId
+        || typeof value.planType !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/u.test(value.planType)
+        || typeof value.capacityNanousd !== "number" || !Number.isFinite(value.capacityNanousd)
+        || value.capacityNanousd <= 0 || typeof value.lastObservedAt !== "string"
+        || !Number.isFinite(Date.parse(value.lastObservedAt))) return null;
+    fits.push({ participantId, planType: value.planType,
+      capacityNanousd: value.capacityNanousd, lastObservedAt: value.lastObservedAt });
+  }
+  return fits;
+}
 
 export const COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG = Object.freeze([
   Object.freeze({ planType: "pro", label: "Pro 20x", multiplier: 1 }),
@@ -97,12 +178,13 @@ const COMMUNITY_ALLOWANCE_PERSONAL_PLAN_BY_TYPE = new Map<string, {
   plan,
 ]));
 
-// One canonical source-selection CTE feeds both the scheduled collector and
-// the admin cache reader. A participant with both corpora is selected through
-// v0.2 exactly as before; keeping the selection text shared prevents the
-// read-only admin view from silently choosing a different corpus.
+// Enumerate evidence, not a participant-wide preference. Each format is
+// analyzed independently; the reset-domain arbiter below chooses one source
+// for overlapping fits while retaining disjoint history from both.
 const COMMUNITY_ALLOWANCE_PARTICIPANT_SOURCES_CTE = `participant_sources AS (
-  SELECT participant_id, MIN(source) AS source
+  SELECT participant_id,
+         CASE WHEN MAX(source = 'v1.1') = 1 THEN 'v1.1'
+           WHEN COUNT(DISTINCT source) > 1 THEN 'mixed' ELSE MIN(source) END AS source
     FROM (
       SELECT c.participant_id AS participant_id, 'v0.2' AS source
         FROM telemetry_contributions c
@@ -114,6 +196,9 @@ const COMMUNITY_ALLOWANCE_PARTICIPANT_SOURCES_CTE = `participant_sources AS (
         FROM telemetry_v1_chunks c2
         JOIN participants p2 ON p2.id = c2.participant_id AND p2.state = 'active'
        WHERE c2.superseded_at IS NULL
+      UNION ALL
+      SELECT h.participant_id, 'v1.1' AS source FROM telemetry_v11_domain_heads h
+        JOIN participants p3 ON p3.id = h.participant_id AND p3.state = 'active'
     )
    GROUP BY participant_id
 )`;
@@ -160,6 +245,9 @@ interface AnalysisResetFit {
   capacityNanousd?: unknown;
   displayedSpanPp?: unknown;
   lastObservedAt?: unknown;
+  firstObservedAt?: unknown;
+  resetsAt?: unknown;
+  boundaryCount?: unknown;
 }
 
 interface AnalysisCalibrationTrack {
@@ -167,13 +255,72 @@ interface AnalysisCalibrationTrack {
 }
 
 interface AnalysisTrack {
-  continuity?: { planType?: unknown; planVariant?: unknown };
+  continuity?: { planType?: unknown; planVariant?: unknown; accountTrackId?: unknown;
+    provider?: unknown; policyEpoch?: unknown; planEraKey?: unknown };
   calibration?: { tracks?: AnalysisCalibrationTrack[] };
 }
 
 interface AnalysisResult {
   status?: unknown;
   tracks?: AnalysisTrack[];
+}
+
+/** Select only after fit and population gates; never fit a mixed-format numerator. */
+export function selectCommunityAllowanceAnalysisFits(
+  participantId: string,
+  inputs: readonly { source: "v0.2" | "v1" | "v1.1"; analysis: AnalysisResult }[],
+): CommunityAllowanceFit[] {
+  const byParent = new Map<string, {
+    fit: CommunityAllowanceFit; source: "v0.2" | "v1" | "v1.1"; domain: string;
+    span: number; boundaries: number; last: string; era: string;
+  }>();
+  for (const { source, analysis } of inputs) {
+    if (analysis.status !== "ready" || !Array.isArray(analysis.tracks)) continue;
+    for (const track of analysis.tracks) {
+      const continuity = track.continuity;
+      const planType = continuity?.planType;
+      if (typeof planType !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/u.test(planType)) continue;
+      for (const calibration of track.calibration?.tracks ?? []) {
+        for (const reset of calibration.resets ?? []) {
+          if (reset.status !== "conditional_estimate" || reset.limitId !== "codex"
+              || reset.windowDurationMinutes !== SEVEN_DAY_WINDOW_MINUTES
+              || typeof reset.capacityNanousd !== "number" || !Number.isFinite(reset.capacityNanousd)
+              || reset.capacityNanousd <= 0 || typeof reset.displayedSpanPp !== "number"
+              || !Number.isFinite(reset.displayedSpanPp) || reset.displayedSpanPp < COMMUNITY_ALLOWANCE_SPAN_FLOOR_PP
+              || typeof reset.lastObservedAt !== "string" || !Number.isFinite(Date.parse(reset.lastObservedAt))
+              || typeof reset.resetsAt !== "string" || !Number.isFinite(Date.parse(reset.resetsAt))) continue;
+          const domain = JSON.stringify([participantId, continuity?.provider ?? "openai_codex",
+            planType, continuity?.planVariant ?? "unknown", reset.limitId,
+            reset.windowDurationMinutes, reset.resetsAt]);
+          const parent = JSON.stringify([source, domain, continuity?.accountTrackId ?? "unattributed",
+            continuity?.policyEpoch ?? "unknown"]);
+          const candidate = {
+            fit: { participantId, planType, capacityNanousd: reset.capacityNanousd,
+              lastObservedAt: reset.lastObservedAt }, source, domain,
+            span: reset.displayedSpanPp,
+            boundaries: typeof reset.boundaryCount === "number" ? reset.boundaryCount : 0,
+            last: reset.lastObservedAt,
+            era: typeof continuity?.planEraKey === "string" ? continuity.planEraKey : "legacy",
+          };
+          const previous = byParent.get(parent);
+          if (!previous || candidate.span > previous.span
+              || (candidate.span === previous.span && candidate.boundaries > previous.boundaries)
+              || (candidate.span === previous.span && candidate.boundaries === previous.boundaries
+                && (candidate.last > previous.last || (candidate.last === previous.last && candidate.era < previous.era)))) {
+            byParent.set(parent, candidate);
+          }
+        }
+      }
+    }
+  }
+  // Account-linked v0.2 is preferred only for an overlapping qualifying reset
+  // domain. A sparse/non-fitting legacy shard cannot erase disjoint or otherwise
+  // usable v1 history. This is source arbitration, never identity equivalence.
+  const legacyDomains = new Set([...byParent.values()].filter((row) => row.source === "v0.2")
+    .map((row) => row.domain));
+  return [...byParent.values()]
+    .filter((row) => row.source === "v0.2" || !legacyDomains.has(row.domain))
+    .map((row) => row.fit);
 }
 
 // Same linear-interpolation quantile as the shared calibration package uses
@@ -235,12 +382,10 @@ export function summarizeCommunityAllowanceFits(
  * the same shared pricer — producing fits from exactly the same shared
  * calibration package, with ZERO new calibration math (see quota-analysis-v1.ts).
  *
- * A participant with both corpora is analyzed once, via v0.2 (MIN(source)):
- * the v0.2 rows are the richer at-rest evidence, and analyzing both would
- * double-count one account's resets. v1-source participants additionally read
- * through a cheap content-epoch fit cache, since the per-chunk read + reprice +
- * fit is the expensive part of a cron pass and only changes when the chunk
- * journal does.
+ * Formats are fitted independently, then one qualifying source is selected
+ * per overlapping reset domain. This retains disjoint history without joining
+ * a new quota to old unscoped usage or multiplying a reset's vote. The derived
+ * cache is pinned to exact source fingerprints and monotonic input revisions.
  */
 export async function collectCommunityAllowanceFits(
   db: D1Database,
@@ -248,136 +393,78 @@ export async function collectCommunityAllowanceFits(
 ): Promise<CommunityAllowanceFit[]> {
   const participants = await db.prepare(
     `WITH ${COMMUNITY_ALLOWANCE_PARTICIPANT_SOURCES_CTE}
-     SELECT participant_id, source
-       FROM participant_sources
-      ORDER BY participant_id`,
-  ).all<{ participant_id: string; source: "v0.2" | "v1" }>();
+     SELECT participant_id, source FROM participant_sources ORDER BY participant_id`,
+  ).all<{ participant_id: string; source: LegacySource }>();
   const fits: CommunityAllowanceFit[] = [];
+  const fromDay = analysisFromDay(nowMs);
   for (const row of participants.results) {
-    // v1-source fit cache: reuse the last computed fits when the chunk journal
-    // (count, newest created_at, revision sum) plus the pricing registry and
-    // this adapter version are unchanged. A cache hit skips the read + reprice
-    // + fit entirely.
-    let v1CacheKey: string | null = null;
-    if (row.source === "v1") {
-      try {
-        const epoch = await db.prepare(
-          `SELECT COUNT(*) AS n,
-                  COALESCE(MAX(created_at), '') AS newest,
-                  COALESCE(SUM(revision), 0) AS revsum
-             FROM telemetry_v1_chunks
-            WHERE participant_id = ? AND superseded_at IS NULL`,
-        ).bind(row.participant_id).first<{ n: number; newest: string; revsum: number }>();
-        v1CacheKey = `${Number(epoch?.n ?? 0)}:${epoch?.newest ?? ""}:`
-          + `${Number(epoch?.revsum ?? 0)}:${V1_FIT_CACHE_KEY_SUFFIX}`;
-        const cached = await db.prepare(
-          `SELECT fits_json FROM community_allowance_fit_cache
-            WHERE participant_id = ? AND cache_key = ?`,
-        ).bind(row.participant_id, v1CacheKey).first<{ fits_json: string }>();
-        if (cached) {
-          for (const fit of JSON.parse(cached.fits_json) as CommunityAllowanceFit[]) {
-            fits.push(fit);
-          }
-          continue;
-        }
-      } catch {
-        // The fit cache is a pure optimization. If it is unavailable — most
-        // likely migration 0035 has not been applied to this database yet —
-        // degrade to computing the fit fresh this pass rather than aborting the
-        // whole community aggregate. v1CacheKey stays null so the write below is
-        // skipped too, and the next pass retries the cache.
-        v1CacheKey = null;
-      }
-    }
-    const participantFits: CommunityAllowanceFit[] = [];
+    // Source pinning is correctness, not an optional cache optimization.
+    // An unavailable or changing source cannot become a fabricated zero-fit result.
+    const { sourcePin, fingerprint } = await loadCommunitySourcePin(db, row.participant_id, fromDay, row.source);
+    const cacheKey = sourceCacheKey(sourcePin, fromDay, V1_FIT_CACHE_KEY_SUFFIX, row.source);
+    let cachedFits: CommunityAllowanceFit[] | null = null;
     try {
-      const analysis = (row.source === "v1"
-        ? await accountScopedQuotaAnalysisV1(db, row.participant_id, { nowMs })
-        : await accountScopedQuotaAnalysis(db, row.participant_id)) as AnalysisResult;
-      if (analysis.status === "ready" && Array.isArray(analysis.tracks)) {
-        for (const track of analysis.tracks) {
-          // The collector gathers qualifying fits for EVERY plan_type, each
-          // tagged with its plan (the Codex plan IS the plan + multiplier:
-          // pro = 20x, prolite = 5x; the "variant" is not a real distinction —
-          // real v1 uploads carry planVariant "unknown"). The published
-          // allowance band filters to plan_type "pro" in
-          // summarizeCommunityAllowanceDay; the full set also feeds the
-          // per-plan_type capacity monitor. A missing/blank plan_type can seed
-          // no cohort, so it is skipped.
-          const trackPlanType = track.continuity?.planType;
-          if (typeof trackPlanType !== "string" || trackPlanType.length === 0) {
-            continue;
-          }
-          const calibrationTracks = track.calibration?.tracks;
-          if (!Array.isArray(calibrationTracks)) continue;
-          for (const calibrationTrack of calibrationTracks) {
-            if (!Array.isArray(calibrationTrack.resets)) continue;
-            for (const reset of calibrationTrack.resets) {
-              if (reset.status !== "conditional_estimate"
-                  || reset.limitId !== "codex"
-                  || reset.windowDurationMinutes !== SEVEN_DAY_WINDOW_MINUTES
-                  || typeof reset.capacityNanousd !== "number"
-                  || !Number.isFinite(reset.capacityNanousd)
-                  || reset.capacityNanousd <= 0
-                  || typeof reset.displayedSpanPp !== "number"
-                  || !Number.isFinite(reset.displayedSpanPp)
-                  || reset.displayedSpanPp < COMMUNITY_ALLOWANCE_SPAN_FLOOR_PP
-                  || typeof reset.lastObservedAt !== "string"
-                  || !Number.isFinite(Date.parse(reset.lastObservedAt))) {
-                continue;
-              }
-              participantFits.push({
-                participantId: row.participant_id,
-                planType: trackPlanType,
-                capacityNanousd: reset.capacityNanousd,
-                lastObservedAt: reset.lastObservedAt,
-              });
-            }
-          }
-        }
-      }
+      const cached = await db.prepare(
+        `SELECT fits_json FROM community_allowance_fit_cache
+         WHERE participant_id = ? AND cache_key = ?
+           AND input_fingerprint = ? AND source_method_version = ?`,
+      ).bind(row.participant_id, cacheKey, fingerprint, COMMUNITY_ATTRIBUTION_METHOD_VERSION)
+        .first<{ fits_json: string }>();
+      if (cached) cachedFits = parsedCachedFits(cached.fits_json, row.participant_id);
     } catch {
-      // Any residual throw from a single participant's analyzer yields zero
-      // fits for that participant and never aborts the whole collector.
+      // Cache availability does not authorize an unpinned analytical read.
+    }
+    if (cachedFits !== null) {
+      await assertCommunitySourcePinCurrent(db, sourcePin);
+      fits.push(...cachedFits);
       continue;
     }
-    if (row.source === "v1" && v1CacheKey !== null) {
-      try {
-        await db.prepare(
-          `INSERT INTO community_allowance_fit_cache (
-            participant_id, cache_key, fits_json, computed_at
-          ) VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-          ON CONFLICT(participant_id) DO UPDATE SET
-            cache_key = excluded.cache_key,
-            fits_json = excluded.fits_json,
-            computed_at = excluded.computed_at`,
-        ).bind(
-          row.participant_id,
-          v1CacheKey,
-          JSON.stringify(participantFits),
-        ).run();
-      } catch {
-        // Best-effort cache write (see the read note above): a failure just
-        // means the next pass recomputes; the fits already collected stand.
-      }
+    const analyses: { source: "v0.2" | "v1" | "v1.1"; analysis: AnalysisResult }[] = [];
+    if (isV11Pin(sourcePin)) analyses.push({source: "v1.1",
+      analysis: await accountScopedQuotaAnalysisV11(db, row.participant_id, {nowMs, sourcePin}) as AnalysisResult});
+    else if (row.source !== "v0.2") analyses.push({
+      source: "v1",
+      analysis: await accountScopedQuotaAnalysisV1(db, row.participant_id, { nowMs, sourcePin }) as AnalysisResult,
+    });
+    if (row.source === "v0.2" || row.source === "mixed") analyses.push({
+      source: "v0.2",
+      analysis: await accountScopedQuotaAnalysis(db, row.participant_id) as AnalysisResult,
+    });
+    const participantFits = selectCommunityAllowanceAnalysisFits(row.participant_id, analyses);
+    await assertCommunitySourcePinCurrent(db, sourcePin);
+    try {
+      await db.prepare(
+        `INSERT INTO community_allowance_fit_cache (
+           participant_id, cache_key, fits_json, computed_at, input_fingerprint, source_method_version
+         ) SELECT ?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?4, ?5
+           WHERE EXISTS (
+             SELECT 1 FROM community_analytical_input_versions v
+             JOIN participants p ON p.id = v.participant_id AND p.state = 'active'
+             WHERE v.participant_id = ?1 AND v.revision = ?6
+           )
+         ON CONFLICT(participant_id) DO UPDATE SET cache_key = excluded.cache_key,
+           fits_json = excluded.fits_json, computed_at = excluded.computed_at,
+           input_fingerprint = excluded.input_fingerprint, source_method_version = excluded.source_method_version`,
+      ).bind(row.participant_id, cacheKey, JSON.stringify(participantFits), fingerprint,
+        COMMUNITY_ATTRIBUTION_METHOD_VERSION, sourcePin.inputRevision).run();
+    } catch {
+      // Derived cache write is best effort; final publication still has its own epoch fence.
     }
-    for (const fit of participantFits) fits.push(fit);
+    fits.push(...participantFits);
   }
-  // Deterministic order so identical sources canonicalize identically.
-  fits.sort((left, right) => (
-    left.lastObservedAt.localeCompare(right.lastObservedAt)
-    || left.capacityNanousd - right.capacityNanousd
-    || left.participantId.localeCompare(right.participantId)
-  ));
+  fits.sort((left, right) => left.lastObservedAt.localeCompare(right.lastObservedAt)
+    || left.capacityNanousd - right.capacityNanousd || left.participantId.localeCompare(right.participantId));
   return fits;
 }
 
 interface CachedCommunityAllowanceFitRow {
   participant_id: string;
-  source: "v0.2" | "v1";
+  source: LegacySource;
   expected_cache_key: string | null;
   cache_key: string | null;
   fits_json: string | null;
+  input_fingerprint: string | null;
+  source_method_version: string | null;
 }
 
 /**
@@ -394,16 +481,17 @@ export interface CachedCommunityAllowanceCorpus {
  * Read the validated fit-cache corpus for scheduled aggregate construction
  * without invoking either raw-corpus analyzer or issuing a database mutation.
  *
- * The single SELECT verifies each active participant's cheap chunk epoch
- * against the same registry + adapter cache key used by the scheduled
- * collector. Missing/stale v1 rows and v0.2-selected participants fail closed:
- * those sources require analysis and this SELECT-only source cannot substitute
- * raw work. Browser routes must read their own aggregate singleton instead;
+ * The single SELECT verifies each active participant's monotonic input revision
+ * against the same method/pricing/day cache key used by the scheduled collector.
+ * A matching stored exact fingerprint attests the pinned input at that revision.
+ * Missing/stale rows fail closed; this SELECT-only source never substitutes raw
+ * work. Browser routes must read their own aggregate singleton instead;
  * the scheduled aggregate builder remains the sole fit-cache warmer and keeps
  * its existing best-effort INSERT behaviour.
  */
 export async function readCachedCommunityAllowanceCorpus(
   db: D1Database,
+  nowMs: number = Date.now(),
 ): Promise<CachedCommunityAllowanceCorpus | null> {
   let rows: CachedCommunityAllowanceFitRow[];
   try {
@@ -411,22 +499,19 @@ export async function readCachedCommunityAllowanceCorpus(
       `WITH ${COMMUNITY_ALLOWANCE_PARTICIPANT_SOURCES_CTE},
        v1_epochs AS (
          SELECT sources.participant_id,
-                CAST(COUNT(chunks.participant_id) AS TEXT)
-                  || ':' || COALESCE(MAX(chunks.created_at), '')
-                  || ':' || CAST(COALESCE(SUM(chunks.revision), 0) AS TEXT)
-                  || ':' || ? AS expected_cache_key
+                sources.source || ':' || CAST(versions.revision AS TEXT)
+                  || ':' || ?1 || ':' || ?2 AS expected_cache_key
            FROM participant_sources sources
-           LEFT JOIN telemetry_v1_chunks chunks
-             ON chunks.participant_id = sources.participant_id
-            AND chunks.superseded_at IS NULL
-          WHERE sources.source = 'v1'
-          GROUP BY sources.participant_id
+           LEFT JOIN community_analytical_input_versions versions
+             ON versions.participant_id = sources.participant_id
        )
        SELECT sources.participant_id,
               sources.source,
               epochs.expected_cache_key,
               cache.cache_key,
-              cache.fits_json
+              cache.fits_json,
+              cache.input_fingerprint,
+              cache.source_method_version
          FROM participant_sources sources
          LEFT JOIN v1_epochs epochs
            ON epochs.participant_id = sources.participant_id
@@ -434,6 +519,7 @@ export async function readCachedCommunityAllowanceCorpus(
            ON cache.participant_id = sources.participant_id
         ORDER BY sources.participant_id`,
     ).bind(
+      analysisFromDay(nowMs),
       V1_FIT_CACHE_KEY_SUFFIX,
     ).all<CachedCommunityAllowanceFitRow>();
     if (!Array.isArray(result.results)) return null;
@@ -450,44 +536,20 @@ export async function readCachedCommunityAllowanceCorpus(
     if (typeof row.participant_id !== "string"
         || row.participant_id.length === 0
         || participants.has(row.participant_id)
-        || row.source !== "v1"
+        || !["v0.2", "v1", "mixed", "v1.1"].includes(row.source)
         || typeof row.expected_cache_key !== "string"
         || row.expected_cache_key.length === 0
         || row.cache_key !== row.expected_cache_key
+        || typeof row.input_fingerprint !== "string"
+        || !/^[a-f0-9]{64}$/u.test(row.input_fingerprint)
+        || row.source_method_version !== COMMUNITY_ATTRIBUTION_METHOD_VERSION
         || typeof row.fits_json !== "string") {
       return null;
     }
     participants.add(row.participant_id);
-    let cached: unknown;
-    try {
-      cached = JSON.parse(row.fits_json);
-    } catch {
-      return null;
-    }
-    if (!Array.isArray(cached)) return null;
-    for (const candidate of cached) {
-      if (typeof candidate !== "object" || candidate === null
-          || Array.isArray(candidate)) {
-        return null;
-      }
-      const value = candidate as Record<string, unknown>;
-      if (value.participantId !== row.participant_id
-          || typeof value.planType !== "string"
-          || value.planType.length === 0
-          || typeof value.capacityNanousd !== "number"
-          || !Number.isFinite(value.capacityNanousd)
-          || value.capacityNanousd <= 0
-          || typeof value.lastObservedAt !== "string"
-          || !Number.isFinite(Date.parse(value.lastObservedAt))) {
-        return null;
-      }
-      fits.push({
-        participantId: row.participant_id,
-        planType: value.planType,
-        capacityNanousd: value.capacityNanousd,
-        lastObservedAt: value.lastObservedAt,
-      });
-    }
+    const cachedFits = parsedCachedFits(row.fits_json, row.participant_id);
+    if (cachedFits === null) return null;
+    fits.push(...cachedFits);
   }
   fits.sort((left, right) => (
     left.lastObservedAt.localeCompare(right.lastObservedAt)
@@ -507,8 +569,9 @@ export async function readCachedCommunityAllowanceCorpus(
  */
 export async function readCachedCommunityAllowanceFits(
   db: D1Database,
+  nowMs: number = Date.now(),
 ): Promise<CommunityAllowanceFit[] | null> {
-  const corpus = await readCachedCommunityAllowanceCorpus(db);
+  const corpus = await readCachedCommunityAllowanceCorpus(db, nowMs);
   return corpus === null ? null : [...corpus.fits];
 }
 
@@ -618,9 +681,9 @@ export function summarizeCommunityCapacityByPlanType(
 // cached shape carries latestQuotaObservedAt + poisonedBinCount and includes
 // refusals so a refusing participant stops re-running the raw corpus scan
 // every warm pass.
-const COMPOSITION_ADAPTER_VERSION = "v1-composition-2";
+const COMPOSITION_ADAPTER_VERSION = "v1-composition-3";
 const COMPOSITION_CACHE_KEY_SUFFIX =
-  `${APP_PRICE_REGISTRY_MANIFEST.sha256}:${COMPOSITION_ADAPTER_VERSION}:${SERVER_PRICING_METHOD_VERSION}`;
+  `${APP_PRICE_REGISTRY_MANIFEST.sha256}:${COMPOSITION_ADAPTER_VERSION}:${SERVER_PRICING_METHOD_VERSION}:${COMMUNITY_ATTRIBUTION_METHOD_VERSION}`;
 // The composition JSON is a per-model vector plus diagnostics — a few hundred
 // bytes. The storage CHECK allows 32 KiB; enforcing half that here keeps a
 // pathological model census from ever reaching the write.
@@ -672,7 +735,7 @@ export async function collectCommunityModelCompositions(
      SELECT participant_id, source
        FROM participant_sources
       ORDER BY participant_id`,
-  ).all<{ participant_id: string; source: "v0.2" | "v1" }>();
+  ).all<{ participant_id: string; source: LegacySource }>();
   const compositions: CommunityModelComposition[] = [];
   let v1ParticipantCount = 0;
   let unsupportedSourceParticipantCount = 0;
@@ -691,30 +754,44 @@ export async function collectCommunityModelCompositions(
     storeAvailable = false;
   }
   for (const row of participants.results) {
-    if (row.source !== "v1") {
+    const fromDay = analysisFromDay(nowMs);
+    // Composition is one whole-window domain, unlike independent reset fits.
+    // A v0.2 shard outside that domain must not suppress useful v1 composition;
+    // overlapping account-linked rows have no composition adapter and cannot
+    // be silently stitched to the unscoped v1 numerator.
+    const legacyOverlap = row.source === "mixed" ? await db.prepare(`
+      SELECT 1 FROM telemetry_records r
+       JOIN telemetry_contribution_occurrences o
+         ON o.participant_id = r.participant_id AND o.record_kind = r.record_kind
+        AND o.occurrence_id = r.occurrence_id
+       JOIN telemetry_contributions c ON c.id = o.contribution_id
+      WHERE r.participant_id = ? AND r.record_kind = 'quota'
+        AND r.provider = 'openai_codex' AND r.limit_id = 'codex' AND r.observed_at >= ?
+        AND c.status = 'accepted' AND c.transport_schema_version = 'telemetry-contribution-v0.2'
+      LIMIT 1`).bind(row.participant_id, `${fromDay}T00:00:00.000Z`).first() : null;
+    if (row.source === "v0.2" || legacyOverlap !== null) {
       unsupportedSourceParticipantCount += 1;
       continue;
     }
     v1ParticipantCount += 1;
     if (!storeAvailable) continue;
+    const sourcePin: CommunitySourcePin = row.source === "v1.1"
+      ? (await loadV11SourcePin(db, row.participant_id, {fromDay}))!
+      : await loadV1SourcePin(db, { participantId: row.participant_id, fromDay });
+    if (!sourcePin) throw new Error("activated attribution source unavailable");
     let cacheKey: string | null = null;
     try {
-      const epoch = await db.prepare(
-        `SELECT COUNT(*) AS n,
-                COALESCE(MAX(created_at), '') AS newest,
-                COALESCE(SUM(revision), 0) AS revsum
-           FROM telemetry_v1_chunks
-          WHERE participant_id = ? AND superseded_at IS NULL`,
-      ).bind(row.participant_id).first<{ n: number; newest: string; revsum: number }>();
-      cacheKey = `${Number(epoch?.n ?? 0)}:${epoch?.newest ?? ""}:`
-        + `${Number(epoch?.revsum ?? 0)}:${COMPOSITION_CACHE_KEY_SUFFIX}`;
+      cacheKey = sourceCacheKey(sourcePin, fromDay, COMPOSITION_CACHE_KEY_SUFFIX, isV11Pin(sourcePin) ? "v1.1" : "v1");
       const cached = await db.prepare(
         `SELECT composition_json FROM community_model_composition_cache
-          WHERE participant_id = ? AND cache_key = ?`,
-      ).bind(row.participant_id, cacheKey).first<{ composition_json: string }>();
+          WHERE participant_id = ? AND cache_key = ?
+            AND input_fingerprint = ? AND source_method_version = ?`,
+      ).bind(row.participant_id, cacheKey, sourcePin.fingerprint,
+        COMMUNITY_ATTRIBUTION_METHOD_VERSION).first<{ composition_json: string }>();
       if (cached) {
         const parsed: unknown = JSON.parse(cached.composition_json);
         if (validCachedComposition(parsed)) {
+          await assertCommunitySourcePinCurrent(db, sourcePin);
           if (parsed.status === "ready") {
             compositions.push({ participantId: row.participant_id, composition: parsed });
           } else {
@@ -731,11 +808,9 @@ export async function collectCommunityModelCompositions(
     }
     let result: V1ModelCompositionResult;
     try {
-      result = await accountScopedModelCompositionV1(
-        db,
-        row.participant_id,
-        { nowMs },
-      );
+      result = isV11Pin(sourcePin)
+        ? await accountScopedModelCompositionV11(db, row.participant_id, {nowMs, sourcePin})
+        : await accountScopedModelCompositionV1(db, row.participant_id, {nowMs, sourcePin});
     } catch {
       // A single participant's analyzer throw never aborts the collector —
       // and, unlike a refusal, is never cached: a transient D1 error must not
@@ -743,6 +818,7 @@ export async function collectCommunityModelCompositions(
       refusedParticipantCount += 1;
       continue;
     }
+    await assertCommunitySourcePinCurrent(db, sourcePin);
     if (result.status === "ready") {
       compositions.push({ participantId: row.participant_id, composition: result });
     } else {
@@ -755,13 +831,22 @@ export async function collectCommunityModelCompositions(
             <= COMPOSITION_CACHE_JSON_LIMIT_BYTES) {
           await db.prepare(
             `INSERT INTO community_model_composition_cache (
-               participant_id, cache_key, composition_json, computed_at
-             ) VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+               participant_id, cache_key, composition_json, computed_at,
+               input_fingerprint, source_method_version
+             ) SELECT ?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?4, ?5
+               WHERE EXISTS (
+                 SELECT 1 FROM community_analytical_input_versions v
+                 JOIN participants p ON p.id = v.participant_id AND p.state = 'active'
+                 WHERE v.participant_id = ?1 AND v.revision = ?6
+               )
              ON CONFLICT(participant_id) DO UPDATE SET
                cache_key = excluded.cache_key,
                composition_json = excluded.composition_json,
-               computed_at = excluded.computed_at`,
-          ).bind(row.participant_id, cacheKey, compositionJson).run();
+               computed_at = excluded.computed_at,
+               input_fingerprint = excluded.input_fingerprint,
+               source_method_version = excluded.source_method_version`,
+          ).bind(row.participant_id, cacheKey, compositionJson, sourcePin.fingerprint,
+            COMMUNITY_ATTRIBUTION_METHOD_VERSION, sourcePin.inputRevision).run();
         }
       } catch {
         // Best-effort cache write; a failure just means the next pass

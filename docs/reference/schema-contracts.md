@@ -19,6 +19,7 @@ versioning, and retirement rules.
 | --- | --- | --- | --- |
 | Telemetry v0.1 export | `schemas/telemetry-v0.1/*.schema.json` plus `contracts/telemetry-v0.1/field-policy.json` | `generated/telemetry-v0.1-field-dictionary.json` and `generated/telemetry-v0.1-compatibility.json` | `npm run telemetry:check` |
 | Telemetry contribution v0.2 | `packages/telemetry-contract/schemas/v0.2/*.schema.json` and package source | `schemas/telemetry-contribution-v0.2/*.schema.json` byte-canonical mirrors | `npm run telemetry:upload-schemas:check` |
+| Attribution contribution v1.1 (staged) | `packages/telemetry-contract/src/telemetry-v1.1.js`, `telemetry-v1.1-domain.js`, and `telemetry-v1.1-schemas.js` | Eight package JSON Schemas and eight root mirrors in `schemas/telemetry-contribution-v1.1/` | `npm run telemetry:upload-schemas:check`, contract and Worker staging/activation tests |
 | Telemetry browser mirror | Telemetry contract package/source | Browser-consumable generated mirror | `npm run telemetry:browser:check` |
 | Export set v0.1/v0.2 | `schemas/export-set-v0.1/` and `schemas/export-set-v0.2/` | None; controllers/verifiers consume the schemas. | Export schema/controller tests |
 | Export deletion v0.1 | `schemas/export-deletion-v0.1/` | Journal, preflight, commit marker, and receipt are one transaction family. | Export deletion tests |
@@ -37,26 +38,28 @@ own source-derived checks.
 
 ## Root schema inventory
 
-The 27 schemas under `schemas/` are grouped as follows:
+The root schema families are grouped as follows:
 
 | Directory | Files | Meaning |
 | --- | ---: | --- |
 | `telemetry-v0.1/` | 6 | Activity, usage, quota, bundle, compatibility, and privacy receipt for the original reviewed export. |
 | `telemetry-contribution-v0.2/` | 4 | Mirrored activity, usage, quota, and contribution upload schemas. |
+| `telemetry-contribution-v1.1/` | 8 | Generated attribution, usage, quota, session, chunk, envelope, day-manifest and complete-domain-manifest contracts. |
 | `export-deletion-v0.1/` | 4 | Recoverable deletion preflight/journal/commit/receipt. |
 | `export-workspace-discard-v0.1/` | 4 | Recoverable workspace-discard preflight/journal/commit/receipt. |
 | `export-set-v0.1/`, `export-set-v0.2/` | 2 | Versioned export-set manifests. |
 | `product-synthetic-v0.1/` | 2 | Synthetic contribution and encrypted envelope. |
 | Claude, provider accounting, release manifest, R7 release, R7 resource | 5 | One schema per listed family. |
 
-The four package-owned telemetry v0.2 schemas bring the repository total to 31
-schema files. They are canonical package sources, not extra independent
-contracts.
+Package-owned schema copies are not additional independent contracts. v0.2
+package JSON files are canonical; v1.1 JSON files are generated from its package
+schema factory. Telemetry v1.0 remains code-defined and frozen; the v1.1 family
+does not reinterpret existing v1.0 bytes or consent.
 
 ## Canonical versus generated
 
 - Change the canonical package/schema/policy source first.
-- Never hand-edit `generated/` or the root telemetry v0.2 mirrors.
+- Never hand-edit `generated/`, root telemetry mirrors, or generated v1.1 package schemas.
 - Run the named generator, inspect its diff, then run the check mode.
 - A mirror must remain byte-canonical after normalized JSON formatting; do not
   add explanatory fields to only the mirror.
@@ -103,6 +106,32 @@ A version change includes:
 
 Do not weaken a schema or test to accept an already-invalid payload. Fix the
 producer or introduce an explicit reviewed version transition.
+
+### Staged account/plan attribution contract
+
+v1.1 adds a closed `accountPlanAttribution` object with account basis,
+destination/enrollment-scoped account pseudonym (or null), plan basis, plan type
+and opaque plan-era ID (or null). Quota identities represent exact occurrences;
+nullable quota measurements preserve plan-only evidence without inventing a
+reset, percentage or window duration. Conflicting evidence remains explicit.
+
+Code availability is not rollout: migration `0043` initializes v1.1 as `staged`
+and v0.2 as `blocked`. Accepted lifecycle, an explicit current v1.1 consent grant,
+and the participant's persisted minimum write rank gate every upload route.
+Device renewal/re-pair cannot lower that floor. `0044` activates only complete
+comparison domains after proving predecessor coverage. Partial day arrivals do
+not displace old data. See [architecture](./system-architecture.md) and
+[privacy](./local-data-and-privacy.md) for semantics and lifecycle boundaries.
+
+A participant with any accepted v0.2 history is not offered the v1.1 upgrade:
+its effective capability is blocked and a consent grant cannot raise the floor.
+The activation guard independently enforces this, even for disjoint date ranges.
+No v0.2 semantic replacement adapter has been approved; retaining that history
+is required, not permission to delete it to make an upgrade succeed.
+
+The v1.1 wire format does not carry a complete quantity-interval proof. Hosted
+allowance remains explicitly conditional even when a record has an account
+pseudonym. This is not a provider-authoritative account billing contract.
 
 ## Retirement
 

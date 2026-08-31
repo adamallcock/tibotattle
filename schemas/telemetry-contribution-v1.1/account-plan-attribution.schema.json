@@ -1,0 +1,146 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://tibotattle.com/schemas/telemetry-contribution-v1.1/account-plan-attribution.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "accountBasis",
+    "accountTrackId",
+    "planBasis",
+    "planType",
+    "planEraId"
+  ],
+  "properties": {
+    "accountBasis": {
+      "enum": [
+        "same_source",
+        "provisional_marker",
+        "unavailable"
+      ]
+    },
+    "accountTrackId": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "pattern": "^account-track:v2:[0-9a-f]{64}$"
+        }
+      ]
+    },
+    "planBasis": {
+      "enum": [
+        "same_source_occurrence",
+        "provisional_marker",
+        "conflicted",
+        "unavailable"
+      ]
+    },
+    "planType": {
+      "enum": [
+        "free",
+        "go",
+        "plus",
+        "pro",
+        "prolite",
+        "team",
+        "self_serve_business_prolite",
+        "self_serve_business_usage_based",
+        "business",
+        "ent26",
+        "enterprise_cbp_automation",
+        "enterprise_cbp_usage_based",
+        "enterprise",
+        "edu",
+        "edu_plus",
+        "edu_pro",
+        "unknown"
+      ]
+    },
+    "planEraId": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "pattern": "^plan-era:v1:[0-9a-f]{64}$"
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "accountBasis": {
+            "const": "unavailable"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountTrackId": {
+            "type": "null"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "accountTrackId": {
+            "type": "string",
+            "pattern": "^account-track:v2:[0-9a-f]{64}$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planBasis": {
+            "enum": [
+              "unavailable",
+              "conflicted"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "planType": {
+            "const": "unknown"
+          },
+          "planEraId": {
+            "type": "null"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "planType": {
+            "enum": [
+              "free",
+              "go",
+              "plus",
+              "pro",
+              "prolite",
+              "team",
+              "self_serve_business_prolite",
+              "self_serve_business_usage_based",
+              "business",
+              "ent26",
+              "enterprise_cbp_automation",
+              "enterprise_cbp_usage_based",
+              "enterprise",
+              "edu",
+              "edu_plus",
+              "edu_pro"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "$comment": "Independent plan/account proof; provisional is never source-exact. Null era never proves continuity."
+}

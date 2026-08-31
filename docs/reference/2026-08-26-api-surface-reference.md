@@ -39,18 +39,18 @@ Those remain separate verification gates in the relevant runbooks.
 
 | Surface | Boundary | Implemented surface |
 |---|---|---:|
-| Local companion API | Browser/native shell → loopback Node companion | 24 paths, 26 method/path operations |
+| Local companion API | Browser/native shell → loopback Node companion | 25 paths, 27 method/path operations |
 | Local report pages | Browser → fixed loopback report allowlist | 4 `GET` paths |
 | Central public relay | Loopback companion → configured hosted origin | 1 fixed `GET` path |
-| Participant relay | Loopback companion → configured hosted origin | 8 paths, 8 method/path operations |
-| Hosted Worker API | Internet/native collector → Cloudflare Worker | 30 API paths, 30 method/path operations |
+| Participant relay | Loopback companion → configured hosted origin | 9 paths, 9 method/path operations |
+| Hosted Worker API | Internet/native collector → Cloudflare Worker | 35 API paths, 36 method/path operations |
 | Deliberate negative Worker route | Internet → fixed non-API interception | 1 always-`404` path |
 | Native/browser bridge | WKWebView ↔ macOS shell | 4 message handlers, 4 DOM events, 1 fixed URL scheme |
 | Process protocols | Native shell, companion, analysis owners ↔ child/worker | 8 explicit runtime protocol families |
 | Cloudflare service bindings | Worker → platform-managed resources | 3 D1 bindings, 3 production R2 bindings, 1 Durable Object, 8 rate limiters, 1 assets binding, 1 cron schedule |
 | Reviewed code APIs | App/source owners → reusable modules | 5 workspace packages and 24 reviewed source-owner entrypoints |
-| JSON/wire contracts | Collectors, exports, release tooling, hosted intake | 37 JSON contract/schema files plus code-defined telemetry v1 |
-| Storage schema APIs | Hosted and local persistence owners | 43 hosted SQL migrations, 12 local SQLite schema owners, plus object/Keychain contracts |
+| JSON/wire contracts | Collectors, exports, release tooling, hosted intake | Closed versioned families, including generated staged v1.1 and frozen code-defined telemetry v1.0; see schema lifecycle inventory |
+| Storage schema APIs | Hosted and local persistence owners | Ordered hosted SQL migrations, local SQLite schemas, and object/Keychain contracts; attribution adds hosted 0042–0044 without relabeling local schema 11 |
 
 The route counts are checked against the source allowlists by
 [`test/api-surface-reference.test.js`](../../test/api-surface-reference.test.js).
@@ -65,7 +65,7 @@ flowchart LR
     Native[macOS shell<br/>AppKit + WKWebView]
     Web[Dashboard document]
     Local[Loopback companion<br/>127.0.0.1 : ephemeral]
-    Evidence[(Local Codex and Claude evidence)]
+    Evidence[(Local Codex evidence)]
     Codex[Codex app-server<br/>JSONL over stdio]
     Keychain[macOS Keychain<br/>closed capability broker v2]
   end
@@ -94,7 +94,7 @@ flowchart LR
   Local --> |read-only local files| Evidence
   Local <--> |sanitized account protocol| Codex
   Native <--> |four capabilities; get / set / delete| Keychain
-  Local --> |health-only central relay + 8 participant relays| Worker
+  Local --> |health-only central relay + 9 participant relays| Worker
   Local --> |device bearer + one-use Upload authority| Worker
   Worker <--> Data
   Worker <--> Objects
@@ -177,6 +177,7 @@ hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
 | `POST` | `/api/local/contribution/device-credential-reset` | Remove the local contribution-device credential under the fixed reset contract |
 | `POST` | `/api/local/contribution/sync-inspect-exact` | Inspect exact next-upload bytes and authority without sending |
 | `GET` | `/api/local/contribution/incremental-status` | Inspect incremental v1 eligibility, watermark, and state |
+| `POST` | `/api/local/contribution/incremental-review-v11` | Review the capability-gated v1.1 field inventory and derived sample; issue a publication/destination/contract-bound single-use token without uploading |
 | `POST` | `/api/local/contribution/incremental-approve` | Record explicit approval for the incremental contract |
 | `POST` | `/api/local/contribution/incremental-run` | Run one bounded incremental preparation/delivery cycle |
 
@@ -277,6 +278,7 @@ relayed through loopback.
 | `GET` | `/api/v1/session` | Read the current hosted session projection |
 | `POST` | `/api/v1/logout` | End the hosted browser session |
 | `POST` | `/api/v1/me/device-pairings` | Create a one-use local-device pairing code |
+| `POST` | `/api/v1/me/device-telemetry-consents` | Relay explicit v1.1 consent under the hosted personal session and CSRF; never substitute device authority |
 
 ## 3. Hosted Cloudflare Worker HTTP API
 
@@ -342,6 +344,11 @@ Authority vocabulary:
 | `POST` | `/api/v1/device/credential/renew` | Device | Rotate an active device secret in place without consuming a new slot |
 | `GET` | `/api/v1/device/sync/state` | Device | Read the device's accepted-through and synchronization state |
 | `GET` | `/api/v1/device/sync/manifest` | Device | Read the bounded manifest for `fromDay` and `toDay` ISO-day bounds |
+| `GET` | `/api/v1/device/sync-capabilities` | Device | Read accepted formats, consent/floor state and authenticated enrollment/destination binding |
+| `POST` | `/api/v1/me/device-telemetry-consents` | Session | Grant the exact v1.1 contract for a selected device with explicit ongoing-upload approval |
+| `GET`, `POST` | `/api/v1/device/telemetry/v1.1/day-manifests` | Device | Read bounded date-range candidates, or register/resume an immutable staged day manifest and return the exact accepted chunk vector |
+| `POST` | `/api/v1/me/telemetry-v11/domain-predecessor` | Device | Pin the prior analytical domain and legacy source vector for complete replacement |
+| `POST` | `/api/v1/me/telemetry-v11/domain-activate` | Device | Atomically activate a complete proven domain or acknowledge an unchanged vector; never activate a partial day |
 | `GET` | `/api/v1/me/devices` | Session | List the participant's bounded device projections |
 | `POST` | `/api/v1/me/devices/revoke` | Session | Revoke a selected device |
 | `GET` | `/api/v1/envelope-key` | Public | Return the active public wrapping key and key identifier |

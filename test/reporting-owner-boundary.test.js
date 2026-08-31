@@ -40,6 +40,7 @@ const REPORTING_PUBLIC_EXPORTS = Object.freeze([
   "projectBoundedWeeklyCalibrationSummary",
   "renderMonitoringQualityReport",
   "renderWeeklyCalibrationReport",
+  "validWeeklyPlanPopulations",
 ]);
 const REPORTING_CALLERS = Object.freeze([
   "src/cli.js",

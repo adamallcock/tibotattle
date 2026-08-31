@@ -1583,6 +1583,12 @@ test("initialization failure retains the retirement lock until idempotent runtim
     async pauseForDeviceDisconnect() {
       return {};
     },
+    async pauseForDeviceRepair() {
+      return {};
+    },
+    async resumeAfterDeviceRepair() {
+      return {};
+    },
   };
   const baseOptions = {
     resourceRoot: files.resourceRoot,

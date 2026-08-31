@@ -309,7 +309,7 @@ export async function insertTelemetryV1Chunk(
       revision, chunk_digest, envelope_digest, parser_version,
       record_count, accepted_record_count, r2_key,
       device_upload_authorization_id, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
   ).bind(
     insert.chunkRowId,
     insert.participantId,
@@ -343,7 +343,9 @@ export async function insertTelemetryV1Chunk(
   } catch (error) {
     throw mapTelemetryV1BatchError(error);
   }
-  if ((results[chunkStatementIndex]?.meta.changes ?? 0) < 1) {
+  const inserted = results[chunkStatementIndex]?.results;
+  if (inserted?.length !== 1 || typeof inserted[0] !== "object" || inserted[0] === null
+      || Reflect.get(inserted[0], "id") !== insert.chunkRowId) {
     throw new ApiError(409, "PARTICIPANT_DELETING");
   }
   return { acceptedRecords: chunk.records.length };

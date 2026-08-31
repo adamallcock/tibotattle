@@ -52,11 +52,18 @@ import {
 } from "../../src/automatic-contribution-retirement.js";
 import {
   TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
+  TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
   createIncrementalContributionSyncController,
+  incrementalContributionRequiredConsent,
+  telemetryV11FieldInventory,
+  sanitizeTelemetryAttributionBinding,
 } from "../../src/incremental-contribution.js";
 import {
   runIncrementalContributionSyncOnce,
+  readIncrementalContributionV11Capabilities,
+  readIncrementalContributionV11Review,
 } from "../../src/contribution-incremental-sync.js";
+import { readLocalCollectorCheckpoint } from "../../src/local-collector-state.js";
 import {
   HostedSignInHandoffError,
   createHostedSignInHandoffController,
@@ -100,6 +107,7 @@ import {
 import {
   claimContributionDevicePairing,
   disconnectContributionDevice as disconnectContributionDeviceRemotely,
+  renewContributionDeviceCredential,
 } from "../../src/contribution-device-client.js";
 import {
   renewContributionDeviceCredentialIfDue,
@@ -753,6 +761,7 @@ const API_ROUTES = new Set([
   "/api/local/contribution/device-credential-reset",
   "/api/local/contribution/sync-inspect-exact",
   "/api/local/contribution/incremental-status",
+  "/api/local/contribution/incremental-review-v11",
   "/api/local/contribution/incremental-approve",
   "/api/local/contribution/incremental-run",
 ]);
@@ -1837,13 +1846,17 @@ async function authorizeReviewedContributionMutation(
     sendError(response, 400, "invalid_json");
     return null;
   }
-  if (!value || typeof value !== "object" || Array.isArray(value)
-      || Object.keys(value).length !== 1
-      || !REVIEW_TOKEN.test(value.reviewToken ?? "")) {
+  const keys = value && typeof value === "object" && !Array.isArray(value) ? Object.keys(value) : [];
+  const v1 = keys.length === 1 && keys[0] === "reviewToken";
+  const v11 = keys.length === 3 && keys.every((key) => ["reviewToken", "consent", "fieldInventoryDigest"].includes(key))
+    && SHA256.test(value.fieldInventoryDigest ?? "")
+    && value.consent && typeof value.consent === "object" && !Array.isArray(value.consent)
+    && Object.keys(value.consent).length === 4;
+  if ((!v1 && !v11) || !REVIEW_TOKEN.test(value?.reviewToken ?? "")) {
     sendError(response, 400, "invalid_request");
     return null;
   }
-  return value.reviewToken;
+  return value;
 }
 
 async function readFixedFile(root, file, maximumBytes) {
@@ -2229,7 +2242,8 @@ function incrementalSyncStatusProjection(value, {
     status: valid
       ? "available"
       : configured ? "unavailable" : "not_configured",
-    contractVersion: TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
+    contractVersion: valid && value.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+      ? TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION : TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
     keychainPrompt: promptSurface,
     consent: { approved: false, current: false, consentedAt: null },
     paused: false,
@@ -2911,11 +2925,13 @@ function createPreparedLocalCompanionServer({
     projectDirectory: claudeProjectDirectory,
     claudeConfigDirectory,
   }),
+  readAccountAttributionBinding = null,
   refreshRunner = createLocalCollectorRefreshRunner({
     codexHome,
     stateFile: statePaths.collectorStateFile,
     accountObservationOperationLockFile:
       statePaths.accountObservationLockFile,
+    readAccountAttributionBinding: () => readAccountAttributionBinding?.() ?? null,
     selectAccountObservationSecret: (options = {}) =>
       selectProductionAccountObservationSecret({
         ...options,
@@ -3037,11 +3053,31 @@ function createPreparedLocalCompanionServer({
   automaticContributionRetirementLockAcquirer =
     acquireAutomaticContributionRetirementLock,
   incrementalContributionController = null,
+  incrementalContributionRunner = runIncrementalContributionSyncOnce,
+  incrementalAttributionCapabilitiesProvider = null,
+  incrementalAttributionReviewProvider = null,
+  loadExistingAccountObservationSecret = async () => selectProductionAccountObservationSecret({
+    operationLockFile: statePaths.accountObservationLockFile,
+    createKeychainBackend: () => createAppAwareKeychainBackend(environment),
+    createIfMissing: false,
+  }).loadAccountObservationSecret(),
+  readContributionAccountMarkers = async () => {
+    try {
+      const checkpoint = await readLocalCollectorCheckpoint({ stateFile: statePaths.collectorStateFile });
+      return checkpoint?.accountScopeMarker ? [checkpoint.accountScopeMarker] : [];
+    } catch { return []; }
+  },
   onError = () => {},
 } = {}) {
   if (!environment || typeof environment !== "object"
       || Array.isArray(environment)) {
     throw new TypeError("environment must be an object");
+  }
+  if ([incrementalContributionRunner, loadExistingAccountObservationSecret, readContributionAccountMarkers]
+    .some((value) => typeof value !== "function")
+      || [incrementalAttributionCapabilitiesProvider, incrementalAttributionReviewProvider, readAccountAttributionBinding]
+        .some((value) => value !== null && typeof value !== "function")) {
+    throw new TypeError("attribution contribution controls are invalid");
   }
   if (!dataStore || typeof dataStore.initialize !== "function") {
     throw new TypeError("dataStore.initialize must be a function");
@@ -3379,6 +3415,10 @@ function createPreparedLocalCompanionServer({
         || typeof incrementalContributionController.approve !== "function"
         || typeof incrementalContributionController.resume !== "function"
         || typeof incrementalContributionController.pauseForDeviceDisconnect
+          !== "function"
+        || typeof incrementalContributionController.pauseForDeviceRepair
+          !== "function"
+        || typeof incrementalContributionController.resumeAfterDeviceRepair
           !== "function")) {
     throw new TypeError("incrementalContributionController is invalid");
   }
@@ -3413,9 +3453,10 @@ function createPreparedLocalCompanionServer({
       : createIncrementalContributionSyncController({
         settingsFile: statePaths.incrementalContributionSyncSettingsFile,
         destinationOrigin: contributionServiceOrigin,
-        runner: async ({ signal }) => {
+        runner: async ({ signal, consent }) => {
           if (contributionSyncInProgress
-              || contributionDeviceDisconnectInProgress) {
+              || contributionDeviceDisconnectInProgress
+              || contributionReconnectInProgress > 0) {
             const error = new Error("sync_in_progress");
             error.code = "sync_in_progress";
             error.retryable = true;
@@ -3423,31 +3464,64 @@ function createPreparedLocalCompanionServer({
           }
           contributionSyncInProgress = true;
           try {
+            if (await contributionRepairState() !== null) {
+              const error = new Error("device_repair_required");
+              error.code = "device_repair_required";
+              throw error;
+            }
             const backend = await createContributionDeviceBackend();
-            // Silent auto-renewal (sign-in-once durability, part 2). Before the
-            // upload pass, rotate the 30-day credential in place if it is inside
-            // its renewal window, authenticated by the existing credential. This
-            // is strictly best-effort: it never throws into the pass, and a
-            // failure just leaves the still-valid credential for the next try.
+            // Rotation can commit remotely before its local CAS/receipt. A
+            // durable pause precedes the actual renewal, not merely a failed
+            // response, so restart can never retry an uncertain old bearer.
+            let renewal;
+            let renewalHintPersisted = false;
             try {
-              await renewContributionDeviceCredentialIfDue({
+              renewal = await renewContributionDeviceCredentialIfDue({
                 origin: contributionServiceOrigin,
                 renewalStateFile: statePaths.contributionDeviceRenewalStateFile,
                 capabilityOptions: {
                   backend,
                   stateFile: statePaths.contributionDeviceStateFile,
                 },
+                renew: async (options) => {
+                  await pauseContributionDeliveryForRepair();
+                  // Pausing aborts this upload pass, not the independent
+                  // rotation/CAS operation already holding the device guard.
+                  return renewContributionDeviceCredential({ ...options, fetchImpl: centralFetch });
+                },
+                writeState: async (file, value) => {
+                  await writeContributionDeviceRenewalState(file, value);
+                  renewalHintPersisted = true;
+                },
               });
             } catch {
-              // A renewal misconfiguration must never stall delivery; the pass
-              // proceeds on the credential that is still valid.
+              await pauseContributionDeliveryForRepair();
+              renewal = { status: "renewal_failed" };
             }
-            return await runIncrementalContributionSyncOnce({
+            if (renewal?.status === "renewed" || renewal?.status === "renewal_failed") {
+              // Do not repeatedly rotate against an expired hint if its write
+              // failed. The pure renewal owner deliberately tolerates that
+              // failure; this rotation-only scheduling path must not.
+              if (renewal.status === "renewed" && renewalHintPersisted) {
+                await incrementalContribution.resumeAfterDeviceRepair();
+              }
+              // The pause fenced this claim's generation. Success schedules a
+              // fresh pass only after this guard releases; ambiguity remains
+              // durably paused. Neither outcome may send an old-secret upload.
+              return deviceUnavailableIncrementalRunOutcome();
+            }
+            return await incrementalContributionRunner({
               indexFile: statePaths.unifiedIndexFile,
               origin: contributionServiceOrigin,
               backend,
               stateFile: statePaths.contributionDeviceStateFile,
-              signal,
+              signal, consent, fetchImpl: centralFetch,
+              loadExistingAccountObservationSecret,
+              readAccountMarkers: readContributionAccountMarkers,
+              onAttributionBinding: (binding) => {
+                approvedAttributionBinding = sanitizeTelemetryAttributionBinding(binding);
+                approvedAttributionBindingAt = clock();
+              },
             });
           } catch (error) {
             // 2026-08-10 (observed live): a foreground ingest writing the
@@ -3480,6 +3554,99 @@ function createPreparedLocalCompanionServer({
           }
         },
       }));
+  let approvedAttributionBinding = null;
+  let approvedAttributionBindingAt = 0;
+  const pauseContributionDeliveryForRepair = async () => {
+    approvedAttributionBinding = null;
+    attributionSupportCache = null;
+    if (incrementalContribution === null) return;
+    const paused = await incrementalContribution.pauseForDeviceRepair();
+    if (paused?.settingsAvailable !== true || paused.paused !== true
+        || paused.pausedReason !== "device_repair_required" || paused.nextAttemptAt !== null) {
+      throw new Error("device repair pause unavailable");
+    }
+  };
+  const contributionDeviceBusy = () => contributionSyncInProgress
+    || contributionDeviceDisconnectInProgress || contributionReconnectInProgress > 0;
+  const contributionRepairState = async () => {
+    if (incrementalContribution === null) return null;
+    try {
+      const state = await incrementalContribution.inspect();
+      if (state?.settingsAvailable !== true) return "settings_unavailable";
+      return state.pausedReason === "device_repair_required" ? "device_repair_required" : null;
+    } catch { return "settings_unavailable"; }
+  };
+  const contributionControlConflict = async () => {
+    if (contributionDeviceBusy()) return "sync_in_progress";
+    const repair = await contributionRepairState();
+    return contributionDeviceBusy() ? "sync_in_progress" : repair;
+  };
+  const withContributionCredentialRead = async (operation) => {
+    if (contributionDeviceBusy()) return null;
+    // Capability/review GETs lease the same rotating credential as uploads.
+    // Hold the guard before inspecting durable state so pairing cannot enter
+    // in that await or between a credential lease and its network request.
+    contributionSyncInProgress = true;
+    try {
+      if (await contributionRepairState() !== null) return null;
+      return await operation();
+    } finally { contributionSyncInProgress = false; }
+  };
+  if (readAccountAttributionBinding === null) {
+    readAccountAttributionBinding = async () => {
+      if (approvedAttributionBinding === null || clock() - approvedAttributionBindingAt > 5 * 60_000
+          || contributionDeviceDisconnectInProgress || contributionReconnectInProgress > 0) return null;
+      const status = await incrementalContribution?.inspect();
+      return status?.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+        && status?.consent?.approved === true && status?.consent?.current === true
+        && status.settingsAvailable === true && status.pausedReason !== "device_repair_required"
+        ? approvedAttributionBinding : null;
+    };
+  }
+  const readAttributionCapabilities = incrementalAttributionCapabilitiesProvider ?? (async () =>
+    readIncrementalContributionV11Capabilities({ origin: contributionServiceOrigin,
+      backend: await createContributionDeviceBackend(), stateFile: statePaths.contributionDeviceStateFile,
+      fetchImpl: centralFetch, now: clock }));
+  const readAttributionReview = incrementalAttributionReviewProvider ?? (async () =>
+    readIncrementalContributionV11Review({ indexFile: statePaths.unifiedIndexFile,
+      origin: contributionServiceOrigin, backend: await createContributionDeviceBackend(),
+      stateFile: statePaths.contributionDeviceStateFile, fetchImpl: centralFetch, now: clock,
+      readAccountMarkers: readContributionAccountMarkers, loadExistingAccountObservationSecret }));
+  const attributionCapabilities = () => withContributionCredentialRead(readAttributionCapabilities);
+  const attributionReview = () => withContributionCredentialRead(readAttributionReview);
+  let attributionSupportCache = null;
+  let attributionSupportPending = null;
+  const attributionAccepted = (capability) => capability?.destinationOrigin === contributionServiceOrigin
+    && capability?.requiredConsent?.telemetrySchemaVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+    && capability?.formats?.some((format) => format.schemaVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+      && format.lifecycle === "accepted") === true;
+  const attributionReviewReady = (review) => review?.status === "ready" && attributionAccepted(review.capabilities)
+    && sanitizeTelemetryAttributionBinding(review.binding) !== null
+    && review.binding.destinationOrigin === contributionServiceOrigin
+    && review.binding.enrollmentNamespace === review.capabilities.enrollmentNamespace
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(review.grantDeviceId ?? "")
+    && /^generation-v2-[0-9a-f]{64}$/u.test(review.publicationFingerprint ?? "")
+    && SHA256.test(review.sample?.manifestDigest ?? "")
+    && INCREMENTAL_SYNC_DAY.test(review.sample?.day ?? "")
+    && ["usage", "quota", "session"].every((stream) => isNonNegativeInteger(review.sample?.recordCounts?.[stream]))
+    && JSON.stringify(review.inventory) === JSON.stringify(telemetryV11FieldInventory());
+  const attributionUpgradeAvailable = async (status) => {
+    // Do not discover a new upload format before any user-approved sharing,
+    // or let polling repeatedly prompt the credential store/network.
+    if (status?.consent?.approved !== true || contributionDeviceBusy()
+        || status.settingsAvailable !== true || status.pausedReason === "device_repair_required"
+        || !await contributionDeviceBindingPresent()) return false;
+    if (attributionSupportCache !== null && clock() - attributionSupportCache.at < 60_000) {
+      return attributionSupportCache.available;
+    }
+    attributionSupportPending ??= (async () => {
+      let available = false;
+      try { available = attributionAccepted(await attributionCapabilities()); } catch { /* Staged/unavailable stays hidden. */ }
+      attributionSupportCache = { at: clock(), available };
+      return available;
+    })().finally(() => { attributionSupportPending = null; });
+    return attributionSupportPending;
+  };
   const unifiedIndexPresent = async () => {
     try {
       const metadata = await lstat(statePaths.unifiedIndexFile);
@@ -4201,10 +4368,56 @@ function createPreparedLocalCompanionServer({
         } catch {
           status = null;
         }
-        send(response, 200, incrementalSyncStatusProjection(status, {
+        const projected = incrementalSyncStatusProjection(status, {
           configured: true,
           keychainPrompt: keychainPromptSurface(),
-        }));
+        });
+        if (await attributionUpgradeAvailable(status)) {
+          projected.attributionUpgrade = { available: true,
+            contractVersion: TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION };
+        }
+        send(response, 200, projected);
+        return;
+      }
+      if (path === "/api/local/contribution/incremental-review-v11") {
+        if (request.method !== "POST") { sendError(response, 405, "method_not_allowed"); return; }
+        if (!await authorizeLocalMutation(request, response, "exact_review_not_authorized")) return;
+        if (incrementalContribution === null) {
+          sendError(response, 409, "incremental_sync_not_configured"); return;
+        }
+        const conflict = await contributionControlConflict();
+        if (conflict !== null) { sendError(response, 409, conflict); return; }
+        let review;
+        try { review = await attributionReview(); } catch { review = null; }
+        if (!attributionReviewReady(review)) {
+          sendError(response, 409, "attribution_review_unavailable"); return;
+        }
+        const consent = incrementalContributionRequiredConsent({
+          destinationOrigin: contributionServiceOrigin, telemetrySchemaVersion: TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
+        });
+        const reviewToken = randomBytes(32).toString("base64url");
+        const now = clock();
+        purgeReviewedContributionAuthorizations(now);
+        while (reviewedContributionAuthorizations.size >= MAX_ACTIVE_REVIEW_AUTHORIZATIONS) {
+          reviewedContributionAuthorizations.delete(reviewedContributionAuthorizations.keys().next().value);
+        }
+        reviewedContributionAuthorizations.set(reviewToken, {
+          reviewToken, contractVersion: TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION, consent,
+          inventoryDigest: review.inventory.inventoryDigest,
+          publicationFingerprint: review.publicationFingerprint,
+          sampleDigest: review.sample.manifestDigest, sampleDay: review.sample.day,
+          binding: review.binding, grantDeviceId: review.grantDeviceId,
+          expiresAt: now + REVIEW_AUTHORIZATION_LIFETIME_MS,
+        });
+        send(response, 200, {
+          schemaVersion: "local-incremental-contribution-review-v1.1", status: "ready",
+          reviewToken, consent, inventory: review.inventory, sample: review.sample,
+          // A random hosted contribution-device target, not a provider account
+          // identifier or a credential. The session grant needs this target.
+          grantDeviceId: review.grantDeviceId,
+          hostedConsentCurrent: review.capabilities.consentCurrent === true,
+          includesContent: false, includesPaths: false, includesAccountIdentifiers: false, includesCredentials: false,
+        });
         return;
       }
       if (path === "/api/local/contribution/incremental-approve") {
@@ -4216,28 +4429,56 @@ function createPreparedLocalCompanionServer({
         // token proves one verified real instance of the covered data was on
         // screen (the review-bootstrap requirement carried into the
         // approve-once flow); it is single-use, exactly like sync-once.
-        const reviewToken = await authorizeReviewedContributionMutation(
+        const approvalRequest = await authorizeReviewedContributionMutation(
           request,
           response,
           "incremental_consent_not_authorized",
         );
-        if (reviewToken === null) return;
+        if (approvalRequest === null) return;
         if (incrementalContribution === null) {
           sendError(response, 409, "incremental_sync_not_configured");
           return;
         }
-        if (contributionDeviceDisconnectInProgress) {
-          sendError(response, 409, "sync_in_progress");
+        const conflict = await contributionControlConflict();
+        if (conflict !== null) {
+          sendError(response, 409, conflict);
           return;
         }
         const authorization = consumeReviewedContributionAuthorization(
-          reviewToken,
+          approvalRequest.reviewToken,
         );
         if (authorization === null) {
           sendError(response, 409, "review_expired_or_changed");
           return;
         }
+        const v11 = authorization.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION;
+        if (v11 !== Object.hasOwn(approvalRequest, "consent")) {
+          sendError(response, 409, "review_expired_or_changed"); return;
+        }
+        if (v11) {
+          if (approvalRequest.fieldInventoryDigest !== authorization.inventoryDigest
+              || Object.entries(authorization.consent).some(([key, value]) => approvalRequest.consent[key] !== value)) {
+            sendError(response, 409, "review_expired_or_changed"); return;
+          }
+          let current;
+          try { current = await attributionReview(); } catch { current = null; }
+          if (!attributionReviewReady(current)
+              || current.publicationFingerprint !== authorization.publicationFingerprint
+              || current.sample.day !== authorization.sampleDay
+              || current.sample.manifestDigest !== authorization.sampleDigest
+              || current.inventory.inventoryDigest !== authorization.inventoryDigest
+              || current.grantDeviceId !== authorization.grantDeviceId
+              || current.binding.enrollmentNamespace !== authorization.binding.enrollmentNamespace) {
+            sendError(response, 409, "review_expired_or_changed"); return;
+          }
+          // Only the personal hosted session may create this grant. Neither
+          // the local route nor the device uploader can mint it implicitly.
+          if (current.capabilities.consentCurrent !== true) {
+            sendError(response, 409, "hosted_consent_required"); return;
+          }
+        }
         let approved;
+        if (contributionDeviceBusy()) { sendError(response, 409, "sync_in_progress"); return; }
         contributionReconnectInProgress += 1;
         try {
           // The one-step ceremony records local consent BEFORE the hosted
@@ -4250,9 +4491,16 @@ function createPreparedLocalCompanionServer({
           // a Mac that already holds a binding keeps the immediate attempt.
           approved = await incrementalContribution.approve({
             awaitingDevicePairing: !await contributionDeviceBindingPresent(),
+            ...(v11 ? { consent: authorization.consent } : {}),
           });
-        } catch {
-          sendError(response, 500, "incremental_consent_failed");
+          if (v11) {
+            approvedAttributionBinding = authorization.binding;
+            approvedAttributionBindingAt = clock();
+          }
+        } catch (error) {
+          if (error?.code === "incremental_contribution_device_repair_required") {
+            sendError(response, 409, "device_repair_required");
+          } else sendError(response, 500, "incremental_consent_failed");
           return;
         } finally {
           contributionReconnectInProgress -= 1;
@@ -4266,7 +4514,7 @@ function createPreparedLocalCompanionServer({
         send(response, 200, {
           schemaVersion: "local-incremental-contribution-consent-v1.0",
           status: "approved",
-          contractVersion: TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
+          contractVersion: v11 ? TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION : TELEMETRY_V1_CONTRIBUTION_SCHEMA_VERSION,
           consentedAt: nullableInstant(approved.consent.consentedAt),
           includesIdentifiers: false,
           includesCredentials: false,
@@ -4311,16 +4559,19 @@ function createPreparedLocalCompanionServer({
           sendError(response, 409, "incremental_sync_not_configured");
           return;
         }
-        if (contributionDeviceDisconnectInProgress) {
-          sendError(response, 409, "sync_in_progress");
+        const conflict = await contributionControlConflict();
+        if (conflict !== null) {
+          sendError(response, 409, conflict);
           return;
         }
         let status;
         contributionReconnectInProgress += 1;
         try {
           status = await incrementalContribution.resume();
-        } catch {
-          sendError(response, 500, "sync_control_failed");
+        } catch (error) {
+          if (error?.code === "incremental_contribution_device_repair_required") {
+            sendError(response, 409, "device_repair_required");
+          } else sendError(response, 500, "sync_control_failed");
           return;
         } finally {
           contributionReconnectInProgress -= 1;
@@ -4392,12 +4643,20 @@ function createPreparedLocalCompanionServer({
           );
           return;
         }
-        if (contributionDeviceDisconnectInProgress) {
+        if (contributionDeviceBusy()) {
           sendError(response, 409, "sync_in_progress");
           return;
         }
         contributionReconnectInProgress += 1;
+        let pairingSucceeded = false;
+        approvedAttributionBinding = null;
+        attributionSupportCache = null;
         try {
+          // An old bearer must never be reused after an uncertain remote
+          // rotation. Persist intent before the pairing client begins; its
+          // successful return includes both validated receipt and local CAS.
+          try { await pauseContributionDeliveryForRepair(); }
+          catch { sendError(response, 500, "contribution_device_pairing_failed"); return; }
           const paired = await pairContributionDevice({ pairingCode });
           const expiresAt = nullableInstant(paired?.expiresAt);
           if (paired?.status !== "paired"
@@ -4415,23 +4674,8 @@ function createPreparedLocalCompanionServer({
           } catch {
             // deliberately ignored
           }
-          // The v1.0 incremental sync pauses on the same trigger and is
-          // cured by the same pairing, equally best-effort.
-          try {
-            await incrementalContribution?.resume();
-          } catch {
-            // deliberately ignored
-          }
-          // 2026-08-08 (owner-directed): a fresh pairing translates into a
-          // prompt sync attempt too — the re-pair path (a v0.1-consent claim
-          // being replaced by a v1.0 one) must not leave its first pass
-          // waiting on a timer the user cannot see. Same serialization
-          // guarantees as the approval kick above.
-          try {
-            void incrementalContribution?.runDue?.()?.catch?.(() => {});
-          } catch {
-            // deliberately ignored
-          }
+          await incrementalContribution?.resumeAfterDeviceRepair();
+          pairingSucceeded = true;
           send(response, 200, {
             schemaVersion: "local-contribution-device-pairing-v0.1",
             status: "paired",
@@ -4476,6 +4720,11 @@ function createPreparedLocalCompanionServer({
         } finally {
           contributionReconnectInProgress -= 1;
         }
+        // Do not kick while the reconnect guard still excludes upload work.
+        // An ambiguous pairing never reaches this completion-only path.
+        if (pairingSucceeded) {
+          try { void incrementalContribution?.runDue?.()?.catch?.(() => {}); } catch { /* Scheduled attempt survives. */ }
+        }
         return;
       }
       if (path === "/api/local/contribution/device-disconnect") {
@@ -4488,12 +4737,14 @@ function createPreparedLocalCompanionServer({
           sendError(response, 409, "contribution_device_disconnect_not_configured");
           return;
         }
-        if (contributionSyncInProgress || contributionDeviceDisconnectInProgress
-            || contributionReconnectInProgress > 0) {
-          sendError(response, 409, "sync_in_progress");
+        const conflict = await contributionControlConflict();
+        if (conflict !== null) {
+          sendError(response, 409, conflict);
           return;
         }
         contributionDeviceDisconnectInProgress = true;
+        approvedAttributionBinding = null;
+        attributionSupportCache = null;
         try {
           // Persist user intent before revocation or credential cleanup. If
           // this write fails, the exact credential/binding remain available
@@ -4563,16 +4814,20 @@ function createPreparedLocalCompanionServer({
           request,
           response,
         )) return;
-        if (contributionDeviceDisconnectInProgress) {
+        if (contributionDeviceBusy()) {
           sendError(response, 409, "sync_in_progress");
           return;
         }
         let reset;
+        contributionReconnectInProgress += 1;
         try {
+          await pauseContributionDeliveryForRepair();
           reset = await resetContributionDeviceCredential();
         } catch {
           sendError(response, 500, "device_credential_reset_failed");
           return;
+        } finally {
+          contributionReconnectInProgress -= 1;
         }
         if (!["reset", "already_absent"].includes(reset?.status)
             || !["deleted", "already_missing"].includes(reset?.credential)

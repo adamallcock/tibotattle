@@ -312,6 +312,8 @@ function fakeRemote({
           admission_counter: 1,
           quarantine_reconciliation: 1,
           lifecycle_status: 1,
+          attribution_objects: 1,
+          attribution_columns: 1,
           primary_cooldown_table: 1,
           primary_participant_cooldown_digest: 1,
           primary_cooldown_digest: 1,

@@ -17,9 +17,12 @@
  */
 
 import {
+  COMMUNITY_ALLOWANCE_BASIS,
   readCachedCommunityAllowanceCorpus,
   type CommunityAllowanceFit,
 } from "./community-allowance";
+import { isCurrentCommunityAllowancePublication,
+  type CommunityAllowancePublicationStateRow } from "./community-daily-aggregates";
 import { QUARANTINE_RECONCILIATION_GRACE_MILLISECONDS } from "./constants";
 import { ApiError } from "./errors";
 
@@ -1004,19 +1007,23 @@ async function readPublishedBandGauges(
   const gauges: Record<string, number> = {};
   try {
     const published = await db.prepare(
-      `SELECT payload_json FROM community_daily_aggregates
-        WHERE release_state = 'published'
-        ORDER BY day DESC, revision DESC
+      `SELECT a.payload_json, state.publication_state, state.expected_basis,
+          state.attribution_method_version, state.safe_from_day, state.safe_to_day
+        FROM community_daily_aggregates a JOIN community_allowance_publication_state state ON state.singleton=1
+        WHERE a.release_state = 'published' AND a.day BETWEEN state.safe_from_day AND state.safe_to_day
+        ORDER BY a.day DESC, a.revision DESC
         LIMIT 1`,
-    ).first<{ payload_json: string }>();
-    if (published) {
+    ).first<CommunityAllowancePublicationStateRow & { payload_json: string }>();
+    if (published && isCurrentCommunityAllowancePublication(published, nowEpoch)) {
       const payload = JSON.parse(published.payload_json) as {
-        allowance?: { fitCount?: unknown; participantCount?: unknown };
+        allowance?: { basis?: unknown; fitCount?: unknown; participantCount?: unknown };
       };
-      const fitCount = Number(payload.allowance?.fitCount);
-      const participantCount = Number(payload.allowance?.participantCount);
-      if (Number.isFinite(fitCount)) gauges.bandFitCount = fitCount;
-      if (Number.isFinite(participantCount)) {
+      const {fitCount, participantCount, basis} = payload.allowance ?? {};
+      if (basis === COMMUNITY_ALLOWANCE_BASIS && typeof fitCount === "number"
+          && Number.isSafeInteger(fitCount) && fitCount >= 0
+          && typeof participantCount === "number" && Number.isSafeInteger(participantCount)
+          && participantCount >= 0 && participantCount <= fitCount) {
+        gauges.bandFitCount = fitCount;
         gauges.bandParticipantCount = participantCount;
       }
     }
@@ -1024,7 +1031,7 @@ async function readPublishedBandGauges(
     // Absent aggregate tables (fresh environment) leave the gauges out.
   }
   try {
-    const corpus = await readCachedCommunityAllowanceCorpus(db);
+    const corpus = await readCachedCommunityAllowanceCorpus(db, nowEpoch);
     if (corpus !== null) {
       Object.assign(gauges, computeCohortGaugesFromCorpus(corpus.fits, nowEpoch));
     }

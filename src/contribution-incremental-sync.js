@@ -1,4 +1,8 @@
 import { createHash } from "node:crypto";
+import {
+  TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
+  telemetryV11RequiredConsent,
+} from "@app-usagemonitor/telemetry-contract";
 
 import {
   withContributionDeviceSecret,
@@ -14,10 +18,23 @@ import {
   createTelemetryV1Envelope,
 } from "./platform/telemetry-v1-envelope.js";
 import {
+  createOwnerOnlyAutomaticContributionStorageContext,
+  createTelemetryV11Envelope,
+} from "./platform/index.js";
+import {
+  createTelemetryV11Day,
+  readTelemetryV11Capabilities,
+  runTelemetryV11Sync,
+  sanitizeTelemetryAttributionBinding,
+  telemetryV11FieldInventory,
+} from "./contribution/index.js";
+import { createLocalUnifiedTelemetryV11Reader } from "./local-unified-contribution-attribution.js";
+import {
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
   openLocalUnifiedIndex,
   outcomeName,
   reasoningEffortName,
+  readUnifiedIndexGenerationDescriptor,
 } from "./local-unified-index.js";
 
 // The telemetry-contribution-v1.0 sync engine: one bounded pass of the cursor
@@ -67,6 +84,10 @@ const DEVICE_UPLOAD =
   /^um_device_upload_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/u;
 const CHUNK_CONTRIBUTION_ID =
   /^chunk:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const MAX_V11_PROGRESS_BYTES = 1024 * 1024;
+const V11_PROGRESS_KEYS = Object.freeze(["schemaVersion", "contextDigest", "previousGenerationId",
+  "legacyFingerprint", "sourceFingerprint", "validatedDays", "fromDay", "throughDay", "days"]);
 
 const ERROR_CODES = new Set([
   "invalid_configuration",
@@ -343,7 +364,371 @@ function tailPlan(localDays, acknowledgedThroughDay) {
   });
 }
 
-export async function runIncrementalContributionSyncOnce({
+function explicitV11Consent(consent, origin) {
+  const required = telemetryV11RequiredConsent();
+  if (!consent || typeof consent !== "object" || Array.isArray(consent)
+      || Object.keys(consent).length !== 4
+      || consent.destinationOrigin !== origin
+      || Object.entries(required).some(([key, value]) => consent[key] !== value)) {
+    fail("consent_invalid");
+  }
+  return required;
+}
+
+function v11Publication(database) {
+  const descriptor = readUnifiedIndexGenerationDescriptor(database);
+  if (!descriptor || !["complete", "partial"].includes(descriptor.status)
+      || database.prepare("SELECT 1 FROM index_generation WHERE id > ? AND status = 'in_progress' LIMIT 1")
+        .get(descriptor.id)) interrupt("index_unavailable", { retryable: true });
+  return Object.freeze({
+    fingerprint: descriptor.fingerprint,
+    parserVersion: descriptor.parserVersion ?? LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+    dataVersion: database.prepare("PRAGMA data_version").get().data_version,
+    changes: database.prepare("SELECT total_changes() AS count").get().count,
+  });
+}
+
+// This is a private resumability journal, not authority to upload or a record
+// of acknowledged history. The domain runner revalidates its entire context
+// against fresh capabilities/predecessor before using this staged prefix.
+function closedV11Progress(value) {
+  if (value === null) return null;
+  const keys = (record, expected) => record !== null && typeof record === "object" && !Array.isArray(record)
+    && Object.keys(record).sort().join("\0") === [...expected].sort().join("\0");
+  const day = (value) => typeof value === "string" && DAY_PATTERN.test(value)
+    && Number.isFinite(Date.parse(`${value}T00:00:00.000Z`))
+    && new Date(`${value}T00:00:00.000Z`).toISOString().slice(0, 10) === value;
+  if (!keys(value, V11_PROGRESS_KEYS) || value.schemaVersion !== "telemetry-v11-sync-progress-v1"
+      || [value.contextDigest, value.legacyFingerprint, value.sourceFingerprint]
+        .some((value) => typeof value !== "string" || !DIGEST_HEX.test(value))
+      || (value.previousGenerationId !== null && (typeof value.previousGenerationId !== "string" || !UUID_V4.test(value.previousGenerationId)))
+      || !day(value.fromDay) || !day(value.throughDay) || value.fromDay > value.throughDay
+      || !Array.isArray(value.days) || value.days.length > 4096
+      || !Number.isSafeInteger(value.validatedDays) || value.validatedDays < 0
+      || value.validatedDays > value.days.length) interrupt("index_unavailable", { retryable: true });
+  const days = value.days.map((entry, index) => {
+    if (!keys(entry, ["day", "manifestId", "manifestDigest"]) || !day(entry.day)
+        || typeof entry.manifestId !== "string" || !UUID_V4.test(entry.manifestId)
+        || typeof entry.manifestDigest !== "string" || !DIGEST_HEX.test(entry.manifestDigest)
+        || entry.day > value.throughDay
+        || Date.parse(`${entry.day}T00:00:00.000Z`) !== Date.parse(`${value.fromDay}T00:00:00.000Z`) + index * DAY_MILLISECONDS) {
+      interrupt("index_unavailable", { retryable: true });
+    }
+    return { day: entry.day, manifestId: entry.manifestId, manifestDigest: entry.manifestDigest };
+  });
+  return { schemaVersion: value.schemaVersion, contextDigest: value.contextDigest,
+    previousGenerationId: value.previousGenerationId, legacyFingerprint: value.legacyFingerprint,
+    sourceFingerprint: value.sourceFingerprint, validatedDays: value.validatedDays,
+    fromDay: value.fromDay, throughDay: value.throughDay, days };
+}
+
+function localV11ProgressStore({ file, preparation, signal, injected }) {
+  const storage = injected === undefined ? createOwnerOnlyAutomaticContributionStorageContext({
+    createError: () => new PassFailure("index_unavailable", { retryable: true }),
+  }) : null;
+  const guard = () => {
+    if (signal?.aborted) interrupt("interrupted", { retryable: true });
+    preparation.assertCurrent();
+  };
+  return Object.freeze({
+    async read() {
+      guard();
+      let value;
+      if (injected !== undefined) value = await injected.read();
+      else {
+        const text = await storage.readSettingsText({ settingsFile: file, maximumBytes: MAX_V11_PROGRESS_BYTES });
+        try { value = text === null ? null : JSON.parse(text); }
+        catch { interrupt("index_unavailable", { retryable: true }); }
+      }
+      guard();
+      return closedV11Progress(value);
+    },
+    async write(value) {
+      guard();
+      const closed = closedV11Progress(value);
+      const text = JSON.stringify(closed);
+      if (Buffer.byteLength(text) > MAX_V11_PROGRESS_BYTES) interrupt("index_unavailable", { retryable: true });
+      if (injected !== undefined) await injected.write(closed);
+      else await storage.writeSettingsText({ settingsFile: file, text, maximumBytes: MAX_V11_PROGRESS_BYTES });
+      guard();
+    },
+  });
+}
+
+async function createV11Preparation(database, {
+  readAccountMarkers = async () => [],
+  loadExistingAccountObservationSecret = async () => null,
+} = {}) {
+  const accountMarkers = await readAccountMarkers();
+  const publication = v11Publication(database);
+  const reader = createLocalUnifiedTelemetryV11Reader(database, {
+    outcomeName, reasoningEffortName,
+    fallbackParserVersion: LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+    accountMarkers,
+  });
+  // Staged projections also depend on whether captured marker evidence exists.
+  // Losing the last marker must revalidate an earlier marker-bearing prefix,
+  // even though the next pass no longer forces marker/root revalidation. Keep
+  // the actual index publication separate for mutation fencing and review.
+  const sourcePublication = Object.freeze({
+    fingerprint: createHash("sha256").update(JSON.stringify([
+      "telemetry-v11-local-projection-v1", publication.fingerprint, accountMarkers.length > 0,
+    ])).digest("hex"),
+    parserVersion: publication.parserVersion,
+  });
+  let root = null;
+  let rootLoaded = false;
+  let closed = false;
+  const assertCurrent = () => {
+    if (closed) interrupt("index_unavailable", { retryable: true });
+    const current = v11Publication(database);
+    if (current.fingerprint !== publication.fingerprint
+        || current.dataVersion !== publication.dataVersion || current.changes !== publication.changes) {
+      const error = new Error("Local contribution publication changed");
+      error.code = "local_index_changed";
+      throw error;
+    }
+  };
+  const days = reader.days();
+  assertCurrent();
+  return Object.freeze({
+    days: Object.freeze(days), publication, sourcePublication, assertCurrent,
+    // A root becoming readable (or a new captured marker) may alter the
+    // projection without changing indexed facts. Recheck saved day digests
+    // under the current evidence; do not probe an identity just to resume.
+    revalidateProgress: accountMarkers.length > 0,
+    async readDay(day, { binding }) {
+      assertCurrent();
+      const hydrated = reader.readDay(day);
+      // A historical plan does not need an account root. Only an already
+      // captured matching marker can request an existing-only secret lease.
+      // A missing/locked root retains useful history as account-unknown.
+      const hasBoundMarker = ["usage", "quota"].some((stream) => hydrated.recordsByStream[stream].some((record) => {
+        const evidence = hydrated.attributionForRecord(stream, record);
+        const captured = sanitizeTelemetryAttributionBinding(evidence?.observationBinding);
+        return evidence?.accountBasis === "provisional_marker" && captured !== null
+          && captured.destinationOrigin === binding.destinationOrigin && captured.enrollmentNamespace === binding.enrollmentNamespace;
+      }));
+      if (!rootLoaded && hasBoundMarker) {
+        rootLoaded = true;
+        try {
+          const loaded = await loadExistingAccountObservationSecret();
+          if (Buffer.isBuffer(loaded) && loaded.length === 32 && !closed) root = loaded;
+          else if (Buffer.isBuffer(loaded)) loaded.fill(0);
+        } catch { /* Missing account identity is explicit, not an upload failure. */ }
+      }
+      assertCurrent();
+      const result = createTelemetryV11Day({
+        day, ...hydrated, binding, accountObservationSecret: root,
+        parserVersion: publication.parserVersion,
+      });
+      assertCurrent();
+      return result;
+    },
+    close() { closed = true; root?.fill(0); root = null; },
+  });
+}
+
+function v11Failure(error, { daysTotal = 0, networkActivity = false } = {}) {
+  const code = deviceCapabilityFailure(error) ? "device_unavailable"
+    : error?.code === "local_index_changed" ? "local_index_changed"
+      : FAILURE_CODES.has(error?.failureCode) ? error.failureCode : "index_unavailable";
+  return Object.freeze({
+    schemaVersion: RUN_SCHEMA_VERSION, status: "failed", daysTotal, daysSynced: 0,
+    daysPending: daysTotal, chunksUploaded: 0, chunksSkipped: 0, recordsUploaded: 0,
+    acknowledgedThroughDay: null, orphanChunkIds: Object.freeze([]), stagedDays: 0,
+    domainGenerationId: null, networkActivity,
+    failure: Object.freeze({ code,
+      retryable: ["index_unavailable", "local_index_changed", "interrupted"].includes(code)
+        || error?.retryable === true,
+      deviceUnavailable: code === "device_unavailable" || error?.deviceUnavailable === true,
+      retryAfterMilliseconds: error?.retryAfterMilliseconds ?? null }),
+  });
+}
+
+/** The old uploader remains the default. A successor consent is never inferred. */
+export async function runIncrementalContributionSyncOnce(options = {}) {
+  if (options.consent?.telemetrySchemaVersion !== TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION) {
+    return runTelemetryV1SyncOnce(options);
+  }
+  const {
+    indexFile, origin, backend, stateFile, consent, signal, fetchImpl = globalThis.fetch,
+    cryptoImpl = globalThis.crypto, withDeviceSecret = withContributionDeviceSecret,
+    openIndex = openLocalUnifiedIndex, maximumChunks = DEFAULT_MAXIMUM_CHUNKS_PER_PASS,
+    requestTimeoutMilliseconds = DEFAULT_REQUEST_TIMEOUT_MILLISECONDS,
+    maximumDurationMilliseconds = 60_000, now = Date.now,
+    createV11Envelope = createTelemetryV11Envelope,
+    runV11Sync = runTelemetryV11Sync,
+    readAccountMarkers = async () => [], loadExistingAccountObservationSecret = async () => null,
+    onAttributionBinding = null,
+    progressStore = undefined, progressFile = null,
+  } = options;
+  const selectedOrigin = canonicalOrigin(origin);
+  const selectedConsent = explicitV11Consent(consent, selectedOrigin);
+  if (typeof indexFile !== "string" || !indexFile || !backend || typeof backend !== "object"
+      || [fetchImpl, withDeviceSecret, openIndex, now, createV11Envelope, runV11Sync,
+        readAccountMarkers, loadExistingAccountObservationSecret].some((value) => typeof value !== "function")
+      || (onAttributionBinding !== null && typeof onAttributionBinding !== "function")
+      || (progressFile !== null && (typeof progressFile !== "string" || !progressFile))
+      || (progressStore !== undefined && (!progressStore || typeof progressStore.read !== "function"
+        || typeof progressStore.write !== "function"))
+      || !Number.isSafeInteger(maximumChunks) || maximumChunks < 1 || maximumChunks > MAXIMUM_CHUNKS_PER_PASS
+      || !Number.isSafeInteger(requestTimeoutMilliseconds) || requestTimeoutMilliseconds < 1_000
+      || requestTimeoutMilliseconds > MAXIMUM_REQUEST_TIMEOUT_MILLISECONDS
+      || !Number.isSafeInteger(maximumDurationMilliseconds) || maximumDurationMilliseconds < 1
+      || maximumDurationMilliseconds > 300_000
+      || (signal !== undefined && !(signal instanceof AbortSignal))) fail("invalid_configuration");
+  let database = null;
+  let preparation = null;
+  let networkActivity = false;
+  let localIndexChanged = false;
+  const fetch = async (url, request) => {
+    // In addition to each day read, fence the final activation request. A
+    // mutable source replacement must never activate an older/newer mixture.
+    try { preparation?.assertCurrent(); }
+    catch (error) { localIndexChanged = true; throw error; }
+    const response = await fetchImpl(url, request);
+    networkActivity = true;
+    return response;
+  };
+  try {
+    database = openIndex(indexFile, { readOnly: true });
+    preparation = await createV11Preparation(database, { readAccountMarkers, loadExistingAccountObservationSecret });
+    const progress = localV11ProgressStore({ file: progressFile ?? `${indexFile}.telemetry-v11-progress.json`,
+      preparation, signal, injected: progressStore });
+    return await withDeviceSecret({ backend,
+      ...(stateFile === undefined ? {} : { stateFile }), expectedOrigin: selectedOrigin,
+      operation: async (secret, device) => {
+        try {
+          let envelopeKey = null;
+          const result = await runV11Sync({
+            serverBaseUrl: selectedOrigin,
+            deviceAuthorization: `Device um_device_${device.deviceId}.${secret.toString("base64url")}`,
+            consent: selectedConsent, days: preparation.days, fetchImpl: fetch, signal, clock: now,
+            sourcePublication: preparation.sourcePublication,
+            progressStore: progress,
+            revalidateProgress: preparation.revalidateProgress,
+            maxChunks: maximumChunks, maxDurationMs: maximumDurationMilliseconds,
+            requestTimeoutMs: requestTimeoutMilliseconds,
+            readDay: async (day, { binding }) => {
+              onAttributionBinding?.(binding);
+              try { return await preparation.readDay(day, { binding }); }
+              catch (error) { if (error?.code === "local_index_changed") localIndexChanged = true; throw error; }
+            },
+            createEnvelope: async (chunk) => {
+              try { preparation.assertCurrent(); }
+              catch (error) { localIndexChanged = true; throw error; }
+              if (envelopeKey === null) {
+                const requestSignal = signal === undefined ? AbortSignal.timeout(requestTimeoutMilliseconds)
+                  : AbortSignal.any([signal, AbortSignal.timeout(requestTimeoutMilliseconds)]);
+                const response = await fetch(new URL("/api/v1/envelope-key", selectedOrigin), {
+                  credentials: "omit", redirect: "error", signal: requestSignal,
+                  headers: { Accept: "application/json" },
+                });
+                if (!(response instanceof Response) || !response.body) interrupt("response_invalid");
+                const reader = response.body.getReader();
+                const parts = [];
+                let bytes = 0;
+                try {
+                  for (;;) {
+                    const part = await reader.read();
+                    if (part.done) break;
+                    bytes += part.value.byteLength;
+                    if (bytes > MAX_RESPONSE_BYTES) interrupt("response_invalid");
+                    parts.push(part.value);
+                  }
+                } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+                envelopeKey = await readJson(new Response(Buffer.concat(parts), {
+                  status: response.status, headers: response.headers,
+                }));
+                if (envelopeKey?.algorithm !== "RSA-OAEP-256"
+                    || typeof envelopeKey.keyId !== "string" || !envelopeKey.keyId || envelopeKey.keyId.length > 200
+                    || !envelopeKey.publicJwk || typeof envelopeKey.publicJwk !== "object") interrupt("response_invalid");
+              }
+              return createV11Envelope({ chunk, ...envelopeKey, cryptoImpl });
+            },
+          });
+          if (localIndexChanged) return v11Failure({ code: "local_index_changed" }, {
+            daysTotal: result.daysTotal, networkActivity,
+          });
+          return Object.freeze({ ...result, networkActivity: result.networkActivity || networkActivity });
+        } catch (error) {
+          // The device-secret lease intentionally collapses thrown callback
+          // errors. Preserve only the bounded scheduling failure inside it.
+          return v11Failure(error, { daysTotal: preparation.days.length, networkActivity });
+        }
+      },
+    });
+  } catch (error) {
+    return v11Failure(error, { daysTotal: preparation?.days.length ?? 0, networkActivity });
+  } finally { preparation?.close(); database?.close(); }
+}
+
+/** Read-only review material; its account binding stays inside the local service. */
+export async function readIncrementalContributionV11Review({
+  indexFile, origin, backend, stateFile, fetchImpl = globalThis.fetch,
+  withDeviceSecret = withContributionDeviceSecret, openIndex = openLocalUnifiedIndex,
+  readAccountMarkers = async () => [], loadExistingAccountObservationSecret = async () => null,
+  signal, now = Date.now,
+} = {}) {
+  const selectedOrigin = canonicalOrigin(origin);
+  return withDeviceSecret({ backend, ...(stateFile === undefined ? {} : { stateFile }),
+    expectedOrigin: selectedOrigin,
+    operation: async (secret, device) => {
+      let database = null;
+      let preparation = null;
+      try {
+        const capabilities = await readTelemetryV11Capabilities({
+          serverBaseUrl: selectedOrigin,
+          deviceAuthorization: `Device um_device_${device.deviceId}.${secret.toString("base64url")}`,
+          fetchImpl, signal, clock: now,
+        });
+        if (!capabilities.formats.some((format) => format.schemaVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+            && format.lifecycle === "accepted")) return Object.freeze({ status: "unavailable" });
+        database = openIndex(indexFile, { readOnly: true });
+        preparation = await createV11Preparation(database, { readAccountMarkers, loadExistingAccountObservationSecret });
+        const binding = Object.freeze({ destinationOrigin: capabilities.destinationOrigin,
+          enrollmentNamespace: capabilities.enrollmentNamespace });
+        const day = preparation.days.at(-1) ?? null;
+        if (day === null) return Object.freeze({ status: "index_unavailable" });
+        const prepared = await preparation.readDay(day, { binding });
+        const recordCounts = Object.fromEntries(["usage", "quota", "session"].map((stream) => [stream,
+          prepared.chunks.filter((chunk) => chunk.chunkId.startsWith(`${stream}:${day}:`))
+            .reduce((sum, chunk) => sum + chunk.records.length, 0)]));
+        return Object.freeze({ status: "ready", capabilities, binding, grantDeviceId: device.deviceId,
+          inventory: telemetryV11FieldInventory(),
+          publicationFingerprint: preparation.publication.fingerprint,
+          sample: Object.freeze({ day, manifestDigest: prepared.manifest.manifestDigest,
+            recordCounts: Object.freeze(recordCounts) }),
+        });
+      } catch (error) {
+        return Object.freeze({ status: "unavailable", code: v11Failure(error).failure.code });
+      } finally { preparation?.close(); database?.close(); }
+    },
+  });
+}
+
+/** Capability discovery is a GET only; it cannot grant or upgrade consent. */
+export async function readIncrementalContributionV11Capabilities({
+  origin, backend, stateFile, fetchImpl = globalThis.fetch,
+  withDeviceSecret = withContributionDeviceSecret, signal, now = Date.now,
+} = {}) {
+  const selectedOrigin = canonicalOrigin(origin);
+  return withDeviceSecret({ backend, ...(stateFile === undefined ? {} : { stateFile }),
+    expectedOrigin: selectedOrigin,
+    operation: async (secret, device) => {
+      try {
+        return await readTelemetryV11Capabilities({
+          serverBaseUrl: selectedOrigin,
+          deviceAuthorization: `Device um_device_${device.deviceId}.${secret.toString("base64url")}`,
+          fetchImpl, signal, clock: now,
+        });
+      } catch { return null; }
+    },
+  });
+}
+
+async function runTelemetryV1SyncOnce({
   indexFile,
   origin,
   backend,

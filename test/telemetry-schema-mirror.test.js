@@ -5,9 +5,9 @@ import {
   checkTelemetrySchemaMirrors,
 } from "../packages/telemetry-contract/scripts/sync-json-schemas.mjs";
 
-test("legacy telemetry schema mirrors exactly match the package-owned sources", async () => {
+test("legacy and staged successor schema mirrors exactly match the package-owned sources", async () => {
   assert.deepEqual(
     await checkTelemetrySchemaMirrors(),
-    { schemaCount: 4 },
+    { schemaCount: 20 },
   );
 });

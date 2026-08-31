@@ -6,6 +6,7 @@ import { sha256Hex } from "../src/crypto";
 import {
   accountScopedQuotaAnalysis,
 } from "../src/quota-analysis";
+import { selectCommunityAllowanceAnalysisFits } from "../src/community-allowance";
 import { enroll } from "../src/repository";
 import {
   createUploadAuthorizationMaterial,
@@ -146,6 +147,64 @@ function contribution(resetIndex: number): Record<string, unknown> {
   };
 }
 
+// Distinct complete contributions from one account, with three plan eras in
+// the SAME weekly reset. Neither a new dataset nor returning to Pro is a new
+// reset vote. The immutable occurrence IDs remain distinct across eras.
+function planEraContribution(
+  ordinal: number,
+  planType: "pro" | "plus",
+  options: { accountTrackId?: string; startOffsetHours?: number } = {},
+): Record<string, unknown> {
+  const value = contribution(ordinal);
+  const originalStart = Date.parse((value.coveredAt as { startAt: string }).startAt);
+  const start = Date.UTC(2026, 0, 6) + (options.startOffsetHours ?? ordinal * 10) * HOUR_MS;
+  const move = (time: unknown) => new Date(Date.parse(String(time)) - originalStart + start).toISOString();
+  for (const [index, row] of (value.quotaSnapshots as Record<string, unknown>[]).entries()) {
+    row.accountTrackId = options.accountTrackId ?? TRACK;
+    row.observedTime = move(row.observedTime);
+    row.receivedTime = row.observedTime;
+    row.planType = planType;
+    row.planVariant = planType === "pro" ? "pro-20x" : "unknown";
+    row.usedPercent = index * 5;
+    row.resetsAt = "2026-01-08T00:00:00.000Z";
+  }
+  for (const row of value.usageEvents as Record<string, unknown>[]) {
+    row.accountTrackId = options.accountTrackId ?? TRACK;
+    row.eventTime = move(row.eventTime);
+  }
+  value.createdAt = move(value.createdAt);
+  value.coveredAt = {
+    startAt: new Date(start).toISOString(),
+    endAt: new Date(start + 9 * HOUR_MS).toISOString(),
+  };
+  return value;
+}
+
+interface PlanEraAnalysis {
+  status: string;
+  fragmentSelection?: string;
+  tracks: Array<{
+    continuity: { accountTrackId: string; planType: string; planVariant: string; planEraKey: string };
+    evidence: { resets: Array<{ refusalCodes: string[] }> };
+    calibration: { tracks: Array<{ resets: Array<{
+      status: string; capacityNanousd: number | null; priorForecast: unknown;
+      limitId: string; windowDurationMinutes: number; displayedSpanPp: number;
+      firstObservedAt: string; lastObservedAt: string; resetsAt: string;
+      refusalCodes: string[];
+    }> }> };
+    rolling: { status: string };
+    attribution: { status: string; accountScope: string; refusedResets: Array<{ reason: string }> };
+  }>;
+}
+
+function conditionalResets(analysis: PlanEraAnalysis) {
+  return analysis.tracks.flatMap((track) => track.calibration.tracks
+    .flatMap((calibration) => calibration.resets)
+    .filter((reset) => reset.status === "conditional_estimate")
+    .map((reset) => ({ ...reset, planType: track.continuity.planType,
+      accountTrackId: track.continuity.accountTrackId })));
+}
+
 async function insert(
   db: D1Database,
   participant: Awaited<ReturnType<typeof enroll>>,
@@ -189,6 +248,138 @@ describe("disabled v0.2 backend shadow lane", () => {
     await reset();
     const bindings = env as TestBindings;
     await applyD1Migrations(bindings.USAGE_MONITOR_DB, bindings.TEST_MIGRATIONS);
+    // This suite deliberately exercises the dormant adapter. Production's
+    // blocked default and participant downgrade floors stay tested elsewhere.
+    await bindings.USAGE_MONITOR_DB.prepare(
+      "UPDATE telemetry_transport_formats SET lifecycle = 'accepted' WHERE schema_version = 'telemetry-contribution-v0.2'",
+    ).run();
+  });
+
+  it("separates same-account Pro to Plus to Pro eras without changing valid capacities or reset votes", async () => {
+    const db = (env as TestBindings).USAGE_MONITOR_DB;
+    const control = await enroll(db, "privacy-safe-telemetry-v0.2");
+    const mixed = await enroll(db, "privacy-safe-telemetry-v0.2");
+    await insert(db, control, planEraContribution(0, "pro"), 0);
+    const controlAnalysis = await accountScopedQuotaAnalysis(db, control.participantId) as PlanEraAnalysis;
+    const controlFits = conditionalResets(controlAnalysis);
+    expect(controlFits).toHaveLength(1);
+    for (const [index, plan] of (["pro", "plus", "pro"] as const).entries()) {
+      await insert(db, mixed, planEraContribution(index, plan), index);
+    }
+    const analysis = await accountScopedQuotaAnalysis(db, mixed.participantId) as PlanEraAnalysis;
+    const fits = conditionalResets(analysis);
+    expect(analysis.fragmentSelection).toBe("unselected_diagnostics");
+    expect(analysis.tracks).toHaveLength(3);
+    expect(new Set(analysis.tracks.map((track) => track.continuity.planEraKey)).size).toBe(3);
+    expect(fits).toHaveLength(3);
+    expect(fits.map((fit) => fit.capacityNanousd)).toEqual(Array(3).fill(controlFits[0]!.capacityNanousd));
+    expect(analysis.tracks.every((track) => track.attribution.status === "legacy_conditional"
+      && track.attribution.accountScope === "declared")).toBe(true);
+    // A returning plan does not borrow a forecast across the intervening plan.
+    expect(analysis.tracks.every((track) => track.rolling.status === "not_testable")).toBe(true);
+    const selected = selectCommunityAllowanceAnalysisFits(mixed.participantId, [{ source: "v0.2", analysis }]);
+    expect(selected).toHaveLength(2);
+    expect(selected.map((fit) => fit.planType).sort()).toEqual(["plus", "pro"]);
+  });
+
+  it.each(["pro", "plus"] as const)("does not let another account's unpriced %s activity poison account A", async (plan) => {
+    const db = (env as TestBindings).USAGE_MONITOR_DB;
+    const participant = await enroll(db, "privacy-safe-telemetry-v0.2");
+    await insert(db, participant, planEraContribution(0, "pro"), 0);
+    const before = conditionalResets(await accountScopedQuotaAnalysis(db, participant.participantId) as PlanEraAnalysis);
+    expect(before).toHaveLength(1);
+    const otherTrack = `account-track:v1:${"b".repeat(64)}`;
+    const other = planEraContribution(1, plan, { accountTrackId: otherTrack, startOffsetHours: 0 });
+    const unknown = (other.usageEvents as Record<string, unknown>[])[0]!;
+    unknown.modelRecognition = "unrecognized";
+    unknown.modelId = "unknown";
+    unknown.modelFingerprint = opaque("model", 42);
+    (other.accountingDiagnostic as Record<string, unknown>).unknownModelEventCount = 1;
+    await insert(db, participant, other, 1);
+    const analysis = await accountScopedQuotaAnalysis(db, participant.participantId) as PlanEraAnalysis;
+    const fits = conditionalResets(analysis);
+    expect(fits).toHaveLength(1);
+    expect(fits[0]!.accountTrackId).toBe(TRACK);
+    expect(fits[0]!.capacityNanousd).toBe(before[0]!.capacityNanousd);
+    const refused = analysis.tracks.find((track) => track.continuity.accountTrackId === otherTrack)!;
+    expect(refused.evidence.resets
+      .some((reset) => reset.refusalCodes.includes("incomplete_server_pricing"))).toBe(true);
+    expect(refused.calibration.tracks.flatMap((track) => track.resets)
+      .every((reset) => reset.refusalCodes.includes("source_evidence_refused"))).toBe(true);
+  });
+
+  it("does not publish a 20-only fit when 80 percent of overlapping v0.2 usage has no account", async () => {
+    const db = (env as TestBindings).USAGE_MONITOR_DB;
+    const participant = await enroll(db, "privacy-safe-telemetry-v0.2");
+    await insert(db, participant, planEraContribution(0, "pro"), 0);
+    expect(conditionalResets(await accountScopedQuotaAnalysis(db, participant.participantId) as PlanEraAnalysis))
+      .toHaveLength(1);
+    const unknown = planEraContribution(2, "pro", { accountTrackId: "unattributed", startOffsetHours: 0 });
+    unknown.quotaSnapshots = [];
+    for (const event of unknown.usageEvents as Record<string, unknown>[]) {
+      const components = event.components as Record<string, number | null>;
+      for (const [key, value] of Object.entries(components)) if (value !== null) components[key] = value * 4;
+      event.totalInputContextTokens = Number(event.totalInputContextTokens) * 4;
+    }
+    await insert(db, participant, unknown, 2);
+    const analysis = await accountScopedQuotaAnalysis(db, participant.participantId) as PlanEraAnalysis;
+    expect(analysis.status).toBe("ready");
+    expect(conditionalResets(analysis)).toHaveLength(0);
+    expect(analysis.tracks[0]!.attribution.refusedResets).toEqual([
+      expect.objectContaining({ reason: "usage_account_unresolved" }),
+    ]);
+    expect(selectCommunityAllowanceAnalysisFits(participant.participantId, [{ source: "v0.2", analysis }]))
+      .toHaveLength(0);
+    const stored = await db.prepare(`
+      SELECT COUNT(*) AS count, SUM(CASE WHEN account_track_id = 'unattributed' THEN 1 ELSE 0 END) AS unknown
+      FROM telemetry_records WHERE participant_id = ? AND record_kind = 'usage'`)
+      .bind(participant.participantId).first<{ count: number; unknown: number }>();
+    expect(stored).toEqual({ count: 18, unknown: 9 }); // Retained, not dropped or zeroed.
+
+    const later = contribution(1);
+    for (const [index, row] of (later.quotaSnapshots as Record<string, unknown>[]).entries()) row.usedPercent = index * 5;
+    await insert(db, participant, later, 1);
+    const withLater = await accountScopedQuotaAnalysis(db, participant.participantId) as PlanEraAnalysis;
+    expect(conditionalResets(withLater)).toHaveLength(1); // Unknowns outside this reset are not a blanket refusal.
+    expect(conditionalResets(withLater)[0]!.resetsAt).toBe("2026-01-15T00:00:00.000Z");
+  });
+
+  it("does not confuse positively measured zero-cost unattributed usage with missing pricing", async () => {
+    const db = (env as TestBindings).USAGE_MONITOR_DB;
+    const participant = await enroll(db, "privacy-safe-telemetry-v0.2");
+    await insert(db, participant, planEraContribution(0, "pro"), 0);
+    const before = conditionalResets(await accountScopedQuotaAnalysis(db, participant.participantId) as PlanEraAnalysis);
+    const zero = planEraContribution(1, "pro", { accountTrackId: "unattributed", startOffsetHours: 0 });
+    zero.quotaSnapshots = [];
+    for (const event of zero.usageEvents as Record<string, unknown>[]) {
+      const components = event.components as Record<string, number | null>;
+      for (const [key, value] of Object.entries(components)) if (value !== null) components[key] = 0;
+      event.totalInputContextTokens = 0;
+    }
+    await insert(db, participant, zero, 1);
+    const analysis = await accountScopedQuotaAnalysis(db, participant.participantId) as PlanEraAnalysis;
+    expect(conditionalResets(analysis)).toHaveLength(1);
+    expect(conditionalResets(analysis)[0]!.capacityNanousd).toBe(before[0]!.capacityNanousd);
+    expect(analysis.tracks[0]!.attribution.refusedResets).toHaveLength(0);
+  });
+
+  it("uses a tiny foreign-plan five-hour observation before weekly fitability filtering", async () => {
+    const db = (env as TestBindings).USAGE_MONITOR_DB;
+    const participant = await enroll(db, "privacy-safe-telemetry-v0.2");
+    const value = planEraContribution(0, "pro");
+    const quota = value.quotaSnapshots as Record<string, unknown>[];
+    const observedTime = "2026-01-06T04:30:00.000Z";
+    quota.push({ ...quota[0], snapshotId: opaque("snapshot", 800_000),
+      planType: "plus", planVariant: "unknown", observedTime, receivedTime: observedTime,
+      windowDurationMinutes: 300, slot: "primary", usedPercent: 1,
+      resetsAt: "2026-01-06T09:30:00.000Z" });
+    await insert(db, participant, value, 0);
+    const analysis = await accountScopedQuotaAnalysis(db, participant.participantId) as PlanEraAnalysis;
+    expect(analysis.status).toBe("ready");
+    expect(analysis.tracks.filter((track) => track.continuity.planType === "pro")).toHaveLength(2);
+    expect(conditionalResets(analysis)).toHaveLength(0);
+    expect(selectCommunityAllowanceAnalysisFits(participant.participantId,
+      [{ source: "v0.2", analysis }])).toHaveLength(0);
   });
 
   it("persists account-scoped files, reprices on the server, and recomputes private analysis", async () => {

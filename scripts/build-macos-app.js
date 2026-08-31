@@ -322,6 +322,9 @@ export const MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES = Object.freeze([
   "src/primitives.js",
   "src/telemetry-v0.1.js",
   "src/telemetry-v0.2.js",
+  "src/telemetry-v1.1-domain.js",
+  "src/telemetry-v1.1-schemas.js",
+  "src/telemetry-v1.1.js",
   "src/upload.js",
 ]);
 
@@ -349,6 +352,7 @@ export const MACOS_QUOTA_ANALYSIS_RUNTIME_FILES = Object.freeze([
   "index.js",
   "package.json",
   "src/model-composition.js",
+  "src/plan-attribution.js",
   "src/quota-calibration.js",
   "src/quota-pace-forecast.js",
   "src/quota-rolling.js",

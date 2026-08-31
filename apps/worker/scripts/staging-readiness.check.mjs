@@ -5,6 +5,10 @@ import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
 import {
   assessStagingConfiguration,
+  ATTRIBUTION_SCHEMA_COLUMNS,
+  ATTRIBUTION_SCHEMA_OBJECTS,
+  ATTRIBUTION_SCHEMA_PROBE_SQL,
+  attributionSchemaComplete,
   EXPECTED_STAGING_MIGRATIONS,
   GENERATED_WORKER_ASSET_DIRECTORY,
   PRODUCTION_PUBLIC_ASSET_DIRECTORY,
@@ -46,6 +50,11 @@ test("checked-in staging configuration is closed and intentionally unprovisioned
 });
 
 test("migration inventory is exact and rejects missing or unreviewed files", () => {
+  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-3), [
+    "0042_analytical_input_fencing.sql",
+    "0043_attribution_transport_staging.sql",
+    "0044_attribution_domain_activation.sql",
+  ]);
   const inventory = structuredClone(EXPECTED_STAGING_MIGRATIONS);
   assert.deepEqual(validateStagingMigrationInventory(inventory), {
     ok: true,
@@ -75,6 +84,99 @@ test("migration inventory is exact and rejects missing or unreviewed files", () 
     missing.blockers.includes("LOCAL_MIGRATION_INVENTORY_DRIFT"),
     true,
   );
+});
+
+test("attribution metadata probe checks every new guard, view, index and persisted column", () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    const objectNames = () => database.prepare(
+      "SELECT type, name FROM sqlite_master WHERE sql IS NOT NULL",
+    ).all().map(({ type, name }) => `${type}:${name}`);
+    let oldObjects;
+    for (const name of EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB) {
+      if (name.startsWith("0042_")) oldObjects = new Set(objectNames());
+      database.exec(readFileSync(join(workerDirectory, "migrations", name), "utf8"));
+    }
+    assert.deepEqual(objectNames().filter((name) => !oldObjects.has(name)).sort(),
+      ATTRIBUTION_SCHEMA_OBJECTS.map(([type, name]) => `${type}:${name}`).sort());
+    assert.deepEqual({ ...database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get() }, {
+      attribution_objects: 1,
+      attribution_columns: 1,
+    });
+    // A migration label cannot substitute for a lost integrity guard. Every
+    // reviewed non-table object must independently make the probe fail closed.
+    for (const [type, name] of ATTRIBUTION_SCHEMA_OBJECTS) {
+      if (type === "table") continue;
+      database.exec(`SAVEPOINT missing_schema; DROP ${type} ${name};`);
+      const row = database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get();
+      assert.equal(row.attribution_objects, 0, name);
+      assert.equal(attributionSchemaComplete(row), false, name);
+      database.exec("ROLLBACK TO missing_schema; RELEASE missing_schema;");
+    }
+    for (const [table, column] of [
+      ["device_credential_rotations", "recovery_proof_hash"],
+      ["community_allowance_fit_cache", "input_fingerprint"],
+      ["attribution_enrollments", "namespace"],
+      ["telemetry_v11_records", "legacy_record_json"],
+      ["telemetry_v11_domains", "input_revision"],
+    ]) {
+      assert.equal(ATTRIBUTION_SCHEMA_COLUMNS[table].includes(column), true);
+      database.exec(`SAVEPOINT missing_column; ALTER TABLE ${table} RENAME COLUMN ${column} TO omitted_column;`);
+      const row = database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get();
+      assert.equal(row.attribution_columns, 0, `${table}.${column}`);
+      assert.equal(attributionSchemaComplete(row), false);
+      database.exec("ROLLBACK TO missing_column; RELEASE missing_column;");
+    }
+    assert.deepEqual(database.prepare(
+      "SELECT schema_version, lifecycle FROM telemetry_transport_formats ORDER BY format_rank",
+    ).all().map((row) => ({ ...row })), [
+      { schema_version: "telemetry-contribution-v0.1", lifecycle: "accepted" },
+      { schema_version: "telemetry-contribution-v0.2", lifecycle: "blocked" },
+      { schema_version: "telemetry-contribution-v1.0", lifecycle: "accepted" },
+      { schema_version: "telemetry-contribution-v1.1", lifecycle: "staged" },
+    ]);
+    assert.equal(database.prepare("PRAGMA foreign_key_check").all().length, 0);
+    assert.equal(attributionSchemaComplete(undefined), false);
+    assert.equal(attributionSchemaComplete({ attribution_objects: true, attribution_columns: true }), false);
+  } finally {
+    database.close();
+  }
+});
+
+test("current migration labels do not hide missing attribution metadata in staging readiness", () => {
+  const config = provisionedConfig();
+  const result = probeStagingLive({
+    config, wrangler: "/fake/wrangler", workerDirectory,
+    spawn: successSpawn(config, [], { missingAttributionSchema: true }),
+  });
+  assert.equal(result.state, "blocked");
+  assert.equal(result.checks.remoteMigrationInventoryCurrent, true);
+  assert.equal(result.checks.attributionSchemaCurrent, false);
+  assert.equal(result.blockers.includes("REMOTE_ATTRIBUTION_SCHEMA_INCOMPLETE"), true);
+  assert.equal(result.collectionAuthorized, false);
+});
+
+test("staging requires pending attribution migrations before its schema probe", () => {
+  const config = provisionedConfig();
+  const calls = [];
+  const baseSpawn = successSpawn(config, calls);
+  const result = probeStagingLive({
+    config, wrangler: "/fake/wrangler", workerDirectory,
+    spawn: (command, args, options) => {
+      if (args[2] === "USAGE_MONITOR_DB" && args.some((arg) => arg.includes("FROM d1_migrations"))) {
+        calls.push(args);
+        return { status: 0, stdout: JSON.stringify([{ results:
+          EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, -3).map((name) => ({ name })),
+        }]), stderr: "" };
+      }
+      return baseSpawn(command, args, options);
+    },
+  });
+  assert.equal(result.state, "blocked");
+  assert.equal(result.checks.migrationsCurrent, false);
+  assert.equal(result.checks.attributionSchemaCurrent, false);
+  assert.equal(calls.some((args) => args.includes(ATTRIBUTION_SCHEMA_PROBE_SQL)), false);
+  assert.equal(calls.some((args) => args.includes("apply")), false);
 });
 
 test("staging readiness rejects production resources and custom-domain targets", () => {
@@ -204,6 +306,7 @@ test("live readiness proves resources, secrets, migrations, and containment", ()
   assert.equal(result.evidenceType, STAGING_PROOF_TYPES.LIVE_REMOTE);
   assert.equal(result.liveProof, true);
   assert.equal(result.checks.remoteMigrationInventoryCurrent, true);
+  assert.equal(result.checks.attributionSchemaCurrent, true);
   assert.equal(Object.values(result.checks).every(Boolean), true);
   assert.equal(result.checks.primaryReenrollmentSchemaCurrent, true);
   assert.equal(result.checks.deletionLedgerSchemaCurrent, true);
@@ -219,7 +322,8 @@ test("live readiness proves resources, secrets, migrations, and containment", ()
     true,
   );
   assert.deepEqual(result.blockers, []);
-  assert.equal(calls.filter((args) => args[0] === "d1").length, 7);
+  assert.equal(calls.filter((args) => args[0] === "d1").length, 8);
+  assert.equal(calls.filter((args) => args.includes(ATTRIBUTION_SCHEMA_PROBE_SQL)).length, 1);
   assert.equal(calls.some((args) => args.includes("migrations")), false);
   assert.equal(
     calls.filter((args) => args.some((value) =>

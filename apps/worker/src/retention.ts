@@ -2,6 +2,7 @@ import { sha256Hex } from "./crypto";
 import { ApiError } from "./errors";
 import { finishParticipantDeletion } from "./repository";
 import { telemetryV1ChunkR2KeyPage } from "./telemetry-v1-repository";
+import { telemetryV11ChunkR2KeyPage } from "./telemetry-v11-repository";
 import { QUARANTINE_RETENTION_MILLISECONDS } from "./constants";
 
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
@@ -34,7 +35,7 @@ interface ParticipantRow {
 }
 
 interface QuarantineObjectRow {
-  source: "synthetic" | "telemetry" | "telemetry_v1";
+  source: "synthetic" | "telemetry" | "telemetry_v1" | "telemetry_v11";
   id: string;
   r2_key: string;
 }
@@ -46,6 +47,7 @@ const QUARANTINE_SOURCE_TABLES: Record<
   synthetic: "contributions",
   telemetry: "telemetry_contributions",
   telemetry_v1: "telemetry_v1_chunks",
+  telemetry_v11: "telemetry_v11_chunks",
 };
 
 export interface LifecyclePassResult {
@@ -459,6 +461,14 @@ async function suppressRestoredParticipant(
       throw new ApiError(503, "LIFECYCLE_BOUNDS_EXCEEDED");
     }
   } while (chunkCursor);
+  let stagedCursor: { createdAt: string; chunkRowId: string } | null = null;
+  do {
+    const page = await telemetryV11ChunkR2KeyPage(db, participantId, stagedCursor);
+    if (page.rows.length > 0) await quarantine.delete(page.rows.map((row) => row.r2Key));
+    stagedCursor = page.nextCursor;
+    chunkPages += 1;
+    if (chunkPages > MAX_LIFECYCLE_ROWS / 100) throw new ApiError(503, "LIFECYCLE_BOUNDS_EXCEEDED");
+  } while (stagedCursor);
   const participant = await db.prepare(
     `SELECT identity_link_key
        FROM participants
@@ -558,9 +568,13 @@ async function dueQuarantineObjects(
      SELECT 'telemetry_v1' AS source, id, r2_key
        FROM telemetry_v1_chunks
       WHERE quarantine_deleted_at IS NULL AND created_at <= ?
+     UNION ALL
+     SELECT 'telemetry_v11' AS source, id, r2_key
+       FROM telemetry_v11_chunks
+      WHERE quarantine_deleted_at IS NULL AND created_at <= ?
      ORDER BY id
      LIMIT ?`,
-  ).bind(cutoffAt, cutoffAt, cutoffAt, QUARANTINE_DELETE_BATCH_SIZE + 1)
+  ).bind(cutoffAt, cutoffAt, cutoffAt, cutoffAt, QUARANTINE_DELETE_BATCH_SIZE + 1)
     .all<QuarantineObjectRow>();
   return result.results;
 }
@@ -586,11 +600,13 @@ export async function deleteDueQuarantineObjects(
   const deletedAt = new Date().toISOString();
   const updates = batch.map((row) => db.prepare(
     `UPDATE ${QUARANTINE_SOURCE_TABLES[row.source]}
-        SET quarantine_deleted_at = ?
-      WHERE id = ? AND quarantine_deleted_at IS NULL`,
+      SET quarantine_deleted_at = ?
+      WHERE id = ? AND quarantine_deleted_at IS NULL RETURNING id`,
   ).bind(deletedAt, row.id));
   const results = await db.batch(updates);
-  if (results.some((result) => result.meta.changes !== 1)) {
+  if (results.some((result, index) => result.results.length !== 1
+      || typeof result.results[0] !== "object" || result.results[0] === null
+      || Reflect.get(result.results[0], "id") !== batch[index]?.id)) {
     throw new ApiError(503, "LIFECYCLE_STATE_CONFLICT");
   }
   return {

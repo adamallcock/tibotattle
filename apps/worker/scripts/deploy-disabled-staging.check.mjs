@@ -360,6 +360,7 @@ test("deployment runs only after live readiness and verifies contained health", 
   assert.equal(result.receipt.operation, "disabled_staging_deployed");
   assert.equal(result.receipt.activationState, "not_authorized");
   assert.equal(result.receipt.evidence.pilotSchemaCurrent, true);
+  assert.equal(result.receipt.evidence.attributionSchemaCurrent, true);
   assert.equal(result.receipt.evidence.remoteReadOnlyProof, true);
   assert.equal(result.receipt.evidence.migrationInventoryCurrent, true);
   assert.equal(result.receipt.evidence.primaryReenrollmentSchemaCurrent, true);

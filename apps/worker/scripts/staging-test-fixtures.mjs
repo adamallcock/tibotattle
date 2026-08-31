@@ -23,6 +23,7 @@ export function successSpawn(
   calls,
   {
     missingPrimarySchema = false,
+    missingAttributionSchema = false,
     missingDeletionLedgerSchema = false,
     primarySchemaError = false,
     deletionLedgerSchemaError = false,
@@ -110,6 +111,8 @@ export function successSpawn(
             admission_counter: 1,
             quarantine_reconciliation: 1,
             lifecycle_status: 1,
+            attribution_objects: missingAttributionSchema ? 0 : 1,
+            attribution_columns: missingAttributionSchema ? 0 : 1,
             primary_cooldown_table: missingPrimarySchema ? 0 : 1,
             primary_participant_cooldown_digest: missingPrimarySchema ? 0 : 1,
             primary_cooldown_digest: missingPrimarySchema ? 0 : 1,

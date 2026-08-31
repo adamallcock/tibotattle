@@ -15,12 +15,14 @@ import { join } from "node:path";
 import {
   LOCAL_UNIFIED_ACCOUNTING_SOURCE_VERSION,
   createLocalUnifiedAccountingSource,
+  createLocalUnifiedUsageAttributionReader,
 } from "../src/local-unified-accounting-source.js";
 import {
   beginUnifiedIndexGeneration,
   createUnifiedIndexWriter,
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
   openLocalUnifiedIndex,
+  readUnifiedIndexGenerationDescriptor,
 } from "../src/local-unified-index.js";
 
 const START_AT = "2026-08-01T00:00:00.000Z";
@@ -205,6 +207,123 @@ async function createIndex({ status = "complete", empty = false } = {}) {
   return { root, indexFile };
 }
 
+async function createAttributionIndex({
+  sources = [{ id: 1, session: 1 }],
+  records,
+  previous = null,
+  replaceSources = true,
+}) {
+  const root = previous?.root
+    ?? await mkdtemp(join(tmpdir(), "unified-plan-attribution-"));
+  const indexFile = previous?.indexFile ?? join(root, "unified.sqlite");
+  const database = openLocalUnifiedIndex(indexFile, { create: previous === null });
+  const generation = beginUnifiedIndexGeneration(database, {
+    contractVersion: "usage-event-v0.2",
+    receivedAtMs: OBSERVED_MS,
+    discoveredSourceCount: sources.length,
+    discoveredSourceBytes: sources.length * 4096,
+  });
+  const writer = createUnifiedIndexWriter(database, {
+    contractVersion: "usage-event-v0.2",
+    receivedAtMs: OBSERVED_MS,
+    generationId: generation.generationId,
+    parserVersionId: generation.parserVersionId,
+    ingestRunId: generation.ingestRunId,
+  });
+  if (previous !== null && replaceSources) {
+    for (const row of database.prepare(
+      "SELECT source_local, session_local FROM source_cursor",
+    ).all()) writer.deleteSourceFacts(row.source_local, row.session_local);
+  }
+  writer.writeMeta("contract_version", "usage-event-v0.2");
+  writer.writeMeta("status", "complete");
+  writer.writeMeta("generated_at", "2026-08-01T13:00:00.000Z");
+  writer.writeMeta("source_count", sources.length);
+  writer.writeMeta("source_bytes", sources.length * 4096);
+  const accountScopeId = writer.internAccountScope({
+    status: "unavailable", reason: "missing_account", planType: null, scopeLocal: null,
+  });
+  const modelId = writer.internModel("gpt-5.6-sol", "recognized");
+  const tierId = writer.internTier({
+    apiServiceTier: "unknown", billingSurface: "chatgpt_subscription",
+    codexSpeedMode: "standard", tierSource: "unknown", providerTierRaw: null,
+  });
+  const surfaceId = writer.internSurface({
+    agentScope: "root", surface: "cli_exec", threadSource: "user",
+    lineageDisposition: "standalone",
+  });
+  const sourceRows = new Map(sources.map((source, sourceOrdinal) => [source.id, {
+    sourceLocal: Buffer.alloc(32, source.id),
+    sessionLocal: Buffer.alloc(32, source.session),
+    sourceOrdinal,
+  }]));
+  for (const [index, record] of records.entries()) {
+    const source = sourceRows.get(record.source ?? 1);
+    const observedAtMs = OBSERVED_MS + (record.at ?? index * 1_000);
+    const sourceOffset = record.offset ?? index + 1;
+    let quotaObservationId = null;
+    for (const [slotOrder, quota] of (record.quotas ?? []).entries()) {
+      const window = {
+        observedAtMs: OBSERVED_MS + (quota.at ?? record.at ?? index * 1_000),
+        limitId: quota.limitId ?? "codex",
+        slot: quota.slot ?? (slotOrder === 0 ? "primary" : "secondary"),
+        planType: quota.plan ?? null,
+        usedPercent: quota.percent ?? 10,
+        resetsAtMs: RESET_MS,
+        durationMins: quota.duration ?? 10_080,
+      };
+      const canonicalObservationId = writer.internQuota(window);
+      quotaObservationId ??= canonicalObservationId;
+      writer.writeQuotaOccurrence({
+        ...source, sourceOffset, generationId: generation.generationId,
+        surfaceId, canonicalObservationId, ...window, provider: "openai_codex",
+        slotOrder, admission: quota.admission ?? "admitted",
+      });
+    }
+    const eventKey = Buffer.alloc(32);
+    eventKey.writeUInt32BE(index + 1, 28);
+    writer.writeUsageEvent({
+      eventKey, observedAtMs, generationId: generation.generationId,
+      ...source, sourceOffset,
+      sessionLocal: record.session === undefined
+        ? source.sessionLocal : Buffer.alloc(32, record.session),
+      accountScopeId, modelId, tierId, surfaceId, quotaObservationId,
+      reasoningEffort: 4, outcome: 5, tierObservedAtMs: null,
+      tokensInUncached: record.noUsage ? null : record.tokens ?? 1,
+      tokensInCacheRead: record.noUsage ? null : 0,
+      tokensInCacheWrite: record.noUsage ? null : 0,
+      tokensInCacheWrite5m: null, tokensInCacheWrite1h: null,
+      tokensOutText: record.noUsage ? null : 0,
+      tokensOutReasoning: record.noUsage ? null : 0,
+      tokensOutCombined: null, totalInputContext: null, partial: false,
+    });
+  }
+  for (const source of sourceRows.values()) {
+    writer.writeSourceCursor({
+      ...source, scannedBytes: 4096, sizeBytes: 4096, mtimeMs: OBSERVED_MS,
+      snapshotsPersisted: true, turnContextSeen: true, carryModel: "gpt-5.6-sol",
+      carryEffort: "high", carryTierRaw: null, carryTierObservedAtMs: null,
+      carryTotals: null,
+    });
+    writer.writeGenerationSource({
+      ...source, generationId: generation.generationId, surfaceId, status: "complete",
+      discoveredSizeBytes: 4096, scannedBytes: 4096, mtimeMs: OBSERVED_MS,
+      diagnosticsComplete: true,
+    });
+    writer.writeSourceDiagnostics(source.sourceLocal, {}, {
+      generationId: generation.generationId,
+    });
+  }
+  writer.finalizeGeneration({
+    status: "complete", blockReason: null,
+    discoveredSourceCount: sources.length, discoveredSourceBytes: sources.length * 4096,
+    indexedSourceCount: sources.length, indexedSourceBytes: sources.length * 4096,
+    discoveryComplete: true, diagnosticsComplete: true,
+  });
+  await writer.close({ fsyncPath: indexFile });
+  return { root, indexFile, generationId: generation.generationId };
+}
+
 async function scan(indexFile, options = {}) {
   const usage = [];
   const quota = [];
@@ -223,6 +342,312 @@ async function scan(indexFile, options = {}) {
   });
   return { result, usage, quota };
 }
+
+test("exact occurrence plans survive canonical collisions and dual quota windows (L01/L02)", async () => {
+  const fixture = await createAttributionIndex({
+    sources: [{ id: 1, session: 1 }, { id: 2, session: 2 }],
+    records: [
+      { source: 1, at: 0, tokens: 20, quotas: [
+        { plan: "pro", duration: 300 }, { plan: "pro" },
+      ] },
+      { source: 2, at: 0, tokens: 30, quotas: [
+        { plan: "plus", duration: 300, percent: 90 }, { plan: "plus", percent: 90 },
+      ] },
+    ],
+  });
+  try {
+    const database = openLocalUnifiedIndex(fixture.indexFile, { readOnly: true });
+    const before = database.prepare("SELECT * FROM usage_event ORDER BY event_key").all();
+    assert.deepEqual(database.prepare(
+      "SELECT DISTINCT plan_type FROM quota_observation",
+    ).all().map((row) => row.plan_type), ["plus"]);
+    database.close();
+    const { usage, quota } = await scan(fixture.indexFile, {
+      requireComplete: true, verifyPublishedGeneration: true,
+    });
+    assert.equal(usage.length, 2);
+    assert.equal(quota.length, 4);
+    assert.deepEqual(usage.map((row) => row.planAttribution), [
+      { basis: "same_record", planType: "pro", planVariant: null },
+      { basis: "same_record", planType: "plus", planVariant: null },
+    ]);
+    assert.equal(usage.reduce((sum, row) => sum + row.components.input_uncached_tokens, 0), 50);
+    const unchanged = openLocalUnifiedIndex(fixture.indexFile, { readOnly: true });
+    assert.deepEqual(unchanged.prepare(
+      "SELECT * FROM usage_event ORDER BY event_key",
+    ).all(), before);
+    assert.equal(unchanged.prepare("PRAGMA user_version").get().user_version, 11);
+    unchanged.close();
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("admission and exact coordinates control plan association without carry-forward (L04/L05)", async () => {
+  const fixture = await createAttributionIndex({ records: [
+    { quotas: [{ plan: "pro" }, { plan: "pro" }] },
+    { quotas: [{ plan: "plus", admission: "held" }, { plan: "pro" }] },
+    { quotas: [{ plan: "pro" }, { plan: "plus" }] },
+    {},
+    { quotas: [{ plan: null }] },
+    { quotas: [{ plan: "plus", admission: "suppressed" }] },
+    { quotas: [{ plan: "pro", at: 7_000 }] },
+  ] });
+  try {
+    const { usage, quota } = await scan(fixture.indexFile);
+    assert.deepEqual(usage.map((row) => row.planAttribution), [
+      { basis: "same_record", planType: "pro", planVariant: null },
+      { basis: "same_record", planType: "pro", planVariant: null },
+      { basis: "conflicted", planType: null, planVariant: null },
+      ...Array.from({ length: 4 }, () => ({
+        basis: "unavailable", planType: null, planVariant: null,
+      })),
+    ]);
+    assert.equal(usage.length, 7);
+    assert.equal(quota.length, 7);
+    assert.equal(usage.reduce((sum, row) => sum + row.components.input_uncached_tokens, 0), 7);
+    const database = openLocalUnifiedIndex(fixture.indexFile);
+    database.prepare("UPDATE usage_event SET source_offset = NULL WHERE source_offset = 1").run();
+    database.close();
+    const legacy = await scan(fixture.indexFile);
+    assert.equal(legacy.usage.length, 7);
+    assert.deepEqual(legacy.usage[0].planAttribution, {
+      basis: "unavailable", planType: null, planVariant: null,
+    });
+    assert.equal(legacy.usage[0].usageIntervalStartedAt, null);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("quota-only plan changes remain observations and bound the next usage interval (L11/L13)", async () => {
+  const fixture = await createAttributionIndex({ records: [
+    { at: 0, tokens: 20, quotas: [{ plan: "pro" }] },
+    { at: 1_000, noUsage: true, quotas: [{ plan: "plus", percent: 0.1 }] },
+    { at: 2_000, tokens: 30, quotas: [{ plan: "pro" }] },
+  ] });
+  try {
+    const { usage, quota } = await scan(fixture.indexFile, {
+      requireComplete: true, verifyPublishedGeneration: true,
+    });
+    assert.deepEqual(quota.map((row) => row.window.planType), ["pro", "plus", "pro"]);
+    assert.deepEqual(usage.map((row) => row.components.input_uncached_tokens), [20, 30]);
+    assert.deepEqual(usage.map((row) => row.planAttribution.planType), ["pro", "pro"]);
+    assert.equal(usage[0].usageIntervalStartedAt, null);
+    assert.equal(usage[0].usageIntervalBasis, "unavailable");
+    assert.equal(usage[1].usageIntervalStartedAt, new Date(OBSERVED_MS + 1_000).toISOString());
+    assert.equal(usage[1].usageIntervalBasis, "previous_session_record");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("legacy interval bounds use same-session records then source, including outside the requested range (RT08)", async () => {
+  const fixture = await createAttributionIndex({
+    sources: [
+      { id: 1, session: 1 }, { id: 2, session: 1 },
+      { id: 3, session: 3 }, { id: 4, session: 4 },
+    ],
+    records: [
+      { source: 1, at: 0, offset: 10 },
+      { source: 1, at: 2_000, offset: 20 },
+      { source: 3, at: 2_500, offset: 10 },
+      { source: 2, at: 3_000, offset: 10 },
+      { source: 1, at: 4_000, offset: 30 },
+      { source: 4, at: 5_000, offset: 10, session: 9 },
+      { source: 4, at: 6_000, offset: 20, session: 9 },
+    ],
+  });
+  try {
+    const usage = [];
+    await createLocalUnifiedAccountingSource({ indexFile: fixture.indexFile })({
+      startAt: new Date(OBSERVED_MS + 3_000).toISOString(), endAt: END_AT,
+      onUsage: (row) => usage.push(row),
+    });
+    assert.deepEqual(usage.map((row) => row.usageIntervalStartedAt), [
+      new Date(OBSERVED_MS + 2_000).toISOString(),
+      new Date(OBSERVED_MS + 3_000).toISOString(),
+      null,
+      new Date(OBSERVED_MS + 5_000).toISOString(),
+    ]);
+    assert.deepEqual(usage.map((row) => row.usageIntervalBasis), [
+      "previous_session_record", "previous_session_record", "unavailable", "previous_source_record",
+    ]);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("interval bounds do not invent cross-source tie order or follow reversed source clocks (RT08)", async () => {
+  const fixture = await createAttributionIndex({
+    sources: [{ id: 1, session: 1 }, { id: 2, session: 1 }, { id: 3, session: 3 }],
+    records: [
+      { source: 1, at: 0, offset: 10 }, { source: 1, at: 0, offset: 20 },
+      { source: 2, at: 0, offset: 10 },
+      { source: 3, at: 2_000, offset: 10 }, { source: 3, at: 1_000, offset: 20 },
+    ],
+  });
+  try {
+    const { usage } = await scan(fixture.indexFile);
+    assert.deepEqual(usage.map((row) => row.usageIntervalStartedAt), [
+      null, new Date(OBSERVED_MS).toISOString(), null, null, null,
+    ]);
+    assert.deepEqual(usage.map((row) => row.usageIntervalBasis), [
+      "unavailable", "previous_session_record", "unavailable", "unavailable", "unavailable",
+    ]);
+    const database = openLocalUnifiedIndex(fixture.indexFile, { readOnly: true });
+    const reader = createLocalUnifiedUsageAttributionReader({
+      database, generationId: fixture.generationId,
+    });
+    const raw = database.prepare("SELECT * FROM usage_event ORDER BY event_key DESC").all();
+    const first = raw.map((row) => reader.read(row));
+    const second = raw.map((row) => reader.read(row));
+    assert.deepEqual(second, first, "arbitrary/repeated corpus slices have identical metadata");
+    database.close();
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("copy-forward generation membership admits exact occurrences without row-generation equality (L03)", async () => {
+  const records = [{ quotas: [{ plan: "pro" }] }];
+  const first = await createAttributionIndex({ records });
+  try {
+    const next = await createAttributionIndex({
+      records, previous: first, replaceSources: false,
+    });
+    const database = openLocalUnifiedIndex(first.indexFile, { readOnly: true });
+    assert.equal(database.prepare("SELECT generation_id FROM usage_event").get().generation_id, first.generationId);
+    assert.equal(database.prepare("SELECT generation_id FROM quota_occurrence").get().generation_id, next.generationId);
+    database.close();
+    const { usage, result } = await scan(first.indexFile, {
+      requireComplete: true, verifyPublishedGeneration: true,
+    });
+    assert.equal(result.coverage.generationId, next.generationId);
+    assert.deepEqual(usage[0].planAttribution, {
+      basis: "same_record", planType: "pro", planVariant: null,
+    });
+  } finally {
+    await rm(first.root, { recursive: true, force: true });
+  }
+});
+
+test("source replacement derives fresh attribution even when source offset and event key are reused (L16)", async () => {
+  const first = await createAttributionIndex({ records: [
+    { quotas: [{ plan: "pro" }] },
+  ] });
+  try {
+    assert.equal((await scan(first.indexFile)).usage[0].planAttribution.planType, "pro");
+    const next = await createAttributionIndex({ previous: first, records: [
+      { quotas: [{ plan: "plus" }] },
+    ] });
+    const { usage, result } = await scan(first.indexFile, {
+      requireComplete: true, verifyPublishedGeneration: true,
+    });
+    assert.equal(result.coverage.generationId, next.generationId);
+    assert.equal(usage.length, 1);
+    assert.deepEqual(usage[0].planAttribution, {
+      basis: "same_record", planType: "plus", planVariant: null,
+    });
+    assert.equal(usage[0].usageIntervalStartedAt, null);
+  } finally {
+    await rm(first.root, { recursive: true, force: true });
+  }
+});
+
+test("attribution reads remain deterministic across interleaved long sources and arbitrary re-reads", async (t) => {
+  const sourceCount = 32;
+  const recordsPerSource = 2_048;
+  const sources = Array.from({ length: sourceCount }, (_, index) => ({
+    id: index + 1, session: index + 1,
+  }));
+  const records = [];
+  for (let offset = 1; offset <= recordsPerSource; offset += 1) {
+    for (const source of sources) {
+      records.push({
+        source: source.id,
+        offset,
+        at: offset * 1_000 + source.id,
+        quotas: [{ plan: source.id % 2 === 0 ? "pro" : "plus" }],
+      });
+    }
+  }
+  const fixture = await createAttributionIndex({ sources, records });
+  const database = openLocalUnifiedIndex(fixture.indexFile, { readOnly: true });
+  try {
+    database.exec("BEGIN");
+    const before = readUnifiedIndexGenerationDescriptor(database);
+    const inputRows = database.prepare(`
+      SELECT source_local, source_ordinal, source_offset, session_local, observed_at_ms
+      FROM usage_event ORDER BY observed_at_ms, source_ordinal, source_offset
+    `).all();
+    const costs = { predecessorQueries: 0, predecessorRows: 0 };
+    const queryPlans = new Map();
+    const reader = createLocalUnifiedUsageAttributionReader({
+      generationId: fixture.generationId,
+      database: {
+        prepare(sql) {
+          const statement = database.prepare(sql);
+          if (!sql.includes("FROM usage_event p")) return statement;
+          return {
+            get(...parameters) {
+              if (!queryPlans.has(sql)) {
+                queryPlans.set(sql, database.prepare(`EXPLAIN QUERY PLAN ${sql}`)
+                  .all(...parameters).map((row) => row.detail).join("\n"));
+              }
+              costs.predecessorQueries += 1;
+              const row = statement.get(...parameters);
+              costs.predecessorRows += row === undefined ? 0 : 1;
+              return row;
+            },
+            all(...parameters) {
+              costs.predecessorQueries += 1;
+              const rows = statement.all(...parameters);
+              costs.predecessorRows += rows.length;
+              return rows;
+            },
+          };
+        },
+      },
+    });
+    const startedAt = performance.now();
+    let checkedRows = 0;
+    const check = (row) => {
+      checkedRows += 1;
+      const result = reader.read(row);
+      assert.equal(result.planAttribution.basis, "same_record");
+      assert.equal(result.planAttribution.planType, row.source_local[0] % 2 === 0 ? "pro" : "plus");
+      assert.equal(result.usageIntervalStartedAt, row.source_offset === 1
+        ? null : new Date(row.observed_at_ms - 1_000).toISOString());
+    };
+    for (const row of inputRows) check(row);
+    // Go backwards across page boundaries, then revisit the newest source.
+    for (let index = inputRows.length - 1; index >= 0; index -= 137) check(inputRows[index]);
+    check(inputRows.at(-1));
+    t.diagnostic(JSON.stringify({
+      sources: sourceCount,
+      usageRows: inputRows.length,
+      elapsedMs: Number((performance.now() - startedAt).toFixed(1)),
+      ...costs,
+    }));
+    assert.ok(costs.predecessorQueries <= checkedRows * 2,
+      "interleaving cannot trigger prefetch/rescans on bounded-cache eviction");
+    assert.ok(costs.predecessorRows <= checkedRows,
+      "single-source sessions should materialize only their exact source predecessor");
+    assert.equal(queryPlans.size, 2);
+    const plans = [...queryPlans.values()].join("\n");
+    assert.match(plans, /usage_event_source_predecessor/u);
+    assert.match(plans, /usage_event_session_predecessor/u);
+    assert.doesNotMatch(plans, /USE TEMP B-TREE/u,
+      "ordered predecessor seeks must not sort an entire source/session per usage");
+    assert.deepEqual(readUnifiedIndexGenerationDescriptor(database), before);
+    assert.equal(database.prepare("PRAGMA user_version").get().user_version, 11);
+    database.exec("ROLLBACK");
+  } finally {
+    database.close();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
 
 test("the current unified index maps deterministically without mutating SQLite", async () => {
   const { root, indexFile } = await createIndex();

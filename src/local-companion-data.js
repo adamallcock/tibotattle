@@ -71,6 +71,7 @@ import {
 } from "./local-collector-state.js";
 import {
   BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT,
+  validWeeklyPlanPopulations,
 } from "./reporting/index.js";
 import {
   isExactWeeklyPaceForecast,
@@ -585,8 +586,11 @@ function validWeeklyComposition(value) {
   ));
 }
 
-function validLiveWeeklyCalibration(weekly) {
+function validLiveWeeklyCalibration(weekly, { population = false } = {}) {
   if (!weekly || typeof weekly !== "object" || Array.isArray(weekly)
+      || (!population && !validWeeklyPlanPopulations(weekly, (value) => (
+        validLiveWeeklyCalibration(value, { population: true })
+      )))
       || weekly.schemaVersion !== "weekly-calibration-summary-v0.1"
       || !["estimated", "insufficient_evidence"].includes(weekly.status)
       || canonicalWeeklyInstant(weekly.generatedAt) === null
@@ -657,7 +661,7 @@ function validLiveWeeklyCalibration(weekly) {
   );
 }
 
-function projectLiveWeeklyCalibration(cache, cacheReadErrorCode = null) {
+function projectLiveWeeklyCalibration(cache, cacheReadErrorCode = null, { population = false } = {}) {
   const weekly = cache?.weeklyCalibration;
   if (!weekly) {
     return unavailableLiveWeekly(
@@ -670,11 +674,19 @@ function projectLiveWeeklyCalibration(cache, cacheReadErrorCode = null) {
         : "live_cache_missing",
     );
   }
-  if (!validLiveWeeklyCalibration(weekly)) {
+  if (!validLiveWeeklyCalibration(weekly, { population })) {
     return unavailableLiveWeekly("live_cache_invalid");
   }
   const estimate = weekly.estimate;
   return {
+    planType: weekly.planType,
+    selectedPlanType: weekly.selectedPlanType ?? weekly.planType,
+    planAttribution: { ...weekly.planAttribution },
+    ...(!population ? {
+      planPopulations: weekly.planPopulations.map((value) => projectLiveWeeklyCalibration(
+        { weeklyCalibration: value }, null, { population: true },
+      )),
+    } : {}),
     status: weekly.status === "estimated" ? "available" : "insufficient_evidence",
     generatedAt: weekly.generatedAt,
     artifactStatus: weekly.status,
@@ -690,6 +702,7 @@ function projectLiveWeeklyCalibration(cache, cacheReadErrorCode = null) {
     limitations: [...weekly.limitations],
     datasets: {
       summary: [{
+        plan_type: weekly.planType,
         median_weekly_value_usd:
           estimate?.medianApiPriceEquivalentUsd ?? null,
         lower_80_across_resets_usd:
@@ -731,6 +744,9 @@ function projectLiveWeeklyCalibration(cache, cacheReadErrorCode = null) {
           weekly.validation?.forecastErrorP80PercentagePoints ?? null,
       }],
       weekly_values: weekly.recentResets.map((row, index) => ({
+        plan_type: row.planType,
+        plan_variant: row.planVariant,
+        aggregation_eligibility: row.aggregationEligibility,
         sequence: index + 1,
         first_observed_at: row.firstObservedAt,
         last_observed_at: row.lastObservedAt,

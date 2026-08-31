@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://tibotattle.com/schemas/telemetry-contribution-v1.1/envelope.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "synthetic",
+    "keyId",
+    "wrappedKey",
+    "iv",
+    "ciphertext"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "telemetry-envelope-v1.1"
+    },
+    "synthetic": {
+      "const": false
+    },
+    "keyId": {
+      "type": "string",
+      "pattern": "^key:[A-Za-z0-9._-]{1,64}$"
+    },
+    "wrappedKey": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{342}$"
+    },
+    "iv": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{16}$"
+    },
+    "ciphertext": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{16,2000000}$"
+    }
+  }
+}

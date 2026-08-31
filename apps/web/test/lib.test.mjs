@@ -87,6 +87,7 @@ import {
   PARTICIPANT_COMMUNITY_COMPARISON_SCHEMA_VERSION,
   PARTICIPANT_PROFILE_SCHEMA_VERSION,
   PARTICIPANT_STATS_SCHEMA_VERSION,
+  selectAllowancePlanPopulation,
   selectPrimaryCodexQuotaWindow,
   isPrimaryCodexQuotaWindow,
   isPrimaryCodexWeeklyQuotaWindow,
@@ -332,7 +333,7 @@ async function loadLineChartRenderer(documentRef, { translate = null } = {}) {
  * the hero copy can be compared across control positions instead of inferred
  * from the source.
  */
-async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
+async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US", planType = null }) {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const chartStart = appSource.indexOf("const CHART_POINT_STYLE = Object.freeze(");
   const chartEnd = appSource.indexOf("\nfunction firstFiniteForecastNumber", chartStart);
@@ -358,6 +359,9 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
   const money = (value, digits = 0) => value === null || value === undefined
     ? "—"
     : `$${Number(value).toFixed(digits)}`;
+  const { shareCardPlanLabel } = await loadShareCardPlan();
+  let shared = null;
+  let paceData = null;
 
   Function(
     "document", "ResizeObserver", "adaptiveChartTickCount", "finite",
@@ -374,6 +378,8 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
     // the hero harness stubs it like the other side-effect renderers.
     "renderStaleServeNote",
     "activeWeeklyRangeDays", "activeWeeklyMinimumObservedSpanPp",
+    "selectAllowancePlanPopulation", "activeWeeklyPlanType",
+    "renderWeeklyPlanControl", "shareCardPlanLabel",
     `${section}\nreturn renderWeekly;`,
   )(
     { createElementNS: () => new FakeSvgElement("g") },
@@ -402,11 +408,15 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
     () => ({ append() {}, textContent: "" }),
     (value) => new Date(value).toISOString().slice(0, 10),
     (value) => String(value),
-    () => {},
-    () => {},
+    (selectedData) => { paceData = selectedData; },
+    (selectedData, { history }) => { shared = { data: selectedData, history }; },
     () => {},
     rangeDays,
     span,
+    selectAllowancePlanPopulation,
+    planType,
+    () => {},
+    shareCardPlanLabel,
   )(data);
 
   return {
@@ -416,6 +426,8 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US" }) {
     explanation: element("#weekly-explanation").textContent,
     timeZone: element("#weekly-chart-timezone").textContent,
     empty: element("#weekly-empty"),
+    shared,
+    paceData,
   };
 }
 
@@ -5581,6 +5593,62 @@ test("the weekly headline is a stable all-data median and says so on screen", as
   }
 });
 
+test("the rendered allowance headline, history, pace and shared history use one selected plan", async () => {
+  const populations = [["pro", 2_400], ["plus", 85]].map(([planType, value]) => ({
+    planType,
+    status: "available",
+    planAttribution: {
+      methodVersion: "plan-era-v1", status: "historical_plan_conditional",
+      accountVerified: false, comparisonEligibility: "unavailable",
+    },
+    datasets: {
+      summary: [{
+        median_weekly_value_usd: value,
+        lower_80_across_resets_usd: value * .8,
+        upper_80_across_resets_usd: value * 1.2,
+        qualifying_resets: 2,
+      }],
+      weekly_values: [0, 1].map((week) => ({
+        plan_type: planType,
+        aggregation_eligibility: "primary_conditional",
+        value_usd: value,
+        last_observed_at: new Date(Date.UTC(2026, 7, 20 + week * 7)).toISOString(),
+        displayed_span_pp: week ? 80 : 35,
+      })),
+    },
+  }));
+  const data = normalizeDashboardPayload({ weekly: {
+    ...populations[1], selectedPlanType: "plus", planPopulations: populations,
+  } });
+  const plus = await renderWeeklyHero(data, { span: 0, rangeDays: 36_500 });
+  const pro = await renderWeeklyHero(data, { span: 50, rangeDays: 36_500, planType: "pro" });
+  const proInSpanish = await renderWeeklyHero(data, {
+    span: 0, rangeDays: 7, planType: "pro", locale: "es",
+  });
+  assert.match(plus.label, /Plus/u);
+  assert.match(plus.estimate, /\$85/u);
+  assert.match(plus.range, /\$68.*\$102/u);
+  assert.match(pro.label, /Pro \(20×\)/u);
+  assert.match(pro.estimate, /\$2400/u);
+  assert.match(pro.range, /\$1920.*\$2880/u);
+  assert.match(proInSpanish.label, /Pro \(20×\)/u);
+  assert.match(proInSpanish.estimate, /\$2400/u);
+  for (const [view, planType, value, shown] of [
+    [plus, "plus", 85, 2], [pro, "pro", 2_400, 1], [proInSpanish, "pro", 2_400, 2],
+  ]) {
+    assert.equal(view.shared.data.weekly.planType, planType);
+    assert.strictEqual(view.shared.data, view.paceData,
+      "pace and the share card receive the same selected population as the headline");
+    assert.equal(view.shared.history.points.length, shown);
+    assert.ok(view.shared.history.points.every((row) => row.value === value),
+      "the share card gets the exact selected-plan and filtered history, never a pooled graph");
+    assert.strictEqual(view.shared.data.accounting, data.accounting,
+      "plan-specific estimates do not discard the complete activity ledger");
+  }
+  assert.equal(pro.paceData.weekly.paceForecast, null);
+  assert.deepEqual(pro.shared.data.quotaWindows, []);
+});
+
 test("reset boundaries tolerate the provider's timestamp jitter but not a real reset", async () => {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
   const start = appSource.indexOf("const RESET_BOUNDARY_TOLERANCE_MS");
@@ -8483,11 +8551,11 @@ test("the share card wires plan copy through the canvas and transcript", async (
 
   assert.match(
     section,
-    /const planLabel = shareCardPlan\(data\?\.quotaWindows \?\? \[\]\);/u,
+    /const planLabel = data\.allowancePlanSelection\s*\n\s*\? shareCardPlanLabel\(data\?\.weekly\?\.planType\) \|\| t\("weekly\.plan\.unknown"\)\s*\n\s*: shareCardPlan\(data\?\.quotaWindows \?\? \[\]\);/u,
   );
   assert.match(
     section,
-    /plan: planLabel === "" \? "" : t\("share\.plan", \{ plan: planLabel \}\),/u,
+    /plan: planLabel === "" \? "" : t\(\s*\n\s*data\.allowancePlanSelection \? "share\.planAllowance" : "share\.plan",\s*\n\s*\{ plan: planLabel \},\s*\n\s*\),/u,
   );
   assert.match(
     section,
@@ -8518,6 +8586,8 @@ test("the share card wires plan copy through the canvas and transcript", async (
   assert.ok(signature, "the share-card signature is available");
   assert.match(signature, /headlineDate,/u);
   assert.match(signature, /shareCardPlan\(data\?\.quotaWindows \?\? \[\]\),/u);
+  assert.match(signature, /data\.allowancePlanSelection \?\? null,/u);
+  assert.match(section, /caveats\.push\(t\("share\.caveat\.planConditional"\)\);/u);
 });
 
 test("a posted results card can carry only fixed copy and formatted figures", async () => {
@@ -8574,6 +8644,7 @@ test("a posted results card can carry only fixed copy and formatted figures", as
     )].sort(),
     [
       "data.accounting",
+      "data.allowancePlanSelection",
       "data?.accounting?.periods",
       "data?.freshness?.latestObservedAt",
       "data?.mode",
@@ -8586,6 +8657,7 @@ test("a posted results card can carry only fixed copy and formatted figures", as
       "data?.pricing?.totalCostUsd",
       "data?.quotaWindows",
       "data?.schemaVersion",
+      "data?.weekly?.planType",
       "data?.weekly?.summary",
       "data?.weekly?.summary?.median",
       "data?.weekly?.summary?.medianWeeklyValueUsd",
@@ -8671,7 +8743,10 @@ test("a posted results card can carry only fixed copy and formatted figures", as
   assert.doesNotMatch(section, /observed\.find\(/u);
   assert.match(
     section,
-    /const isWeeklyWindow = shareCardWindowKind\(allowanceWindow\) === "seven_day";/u,
+    // A selected plan population is itself an explicit seven-day calibration
+    // contract, even when its historical account has no current quota window.
+    // Legacy payloads still cannot borrow a seven-day fit for another duration.
+    /const isWeeklyWindow = data\.allowancePlanSelection !== undefined\s*\n\s*\|\| shareCardWindowKind\(allowanceWindow\) === "seven_day";/u,
   );
   assert.match(
     section,
@@ -9009,7 +9084,7 @@ test("the posted allowance graph uses the exact history model from the dashboard
     // Re-pinned 2026-08-08 (owner-verified regression): the chart renderer
     // hands its own model in; the card derives one only when rendered
     // standalone, and both reads share the active-filter state.
-    /const isWeeklyWindow = shareCardWindowKind\(allowanceWindow\) === "seven_day";\s*\n\s*const history = isWeeklyWindow\s*\n\s*\? sharedHistory \?\? allowanceHistoryChartModel\(data\)\s*\n\s*: null;\s*\n\s*const trend = isWeeklyWindow \? shareCardTrend\(history\) : null;/u,
+    /const isWeeklyWindow = data\.allowancePlanSelection !== undefined\s*\n\s*\|\| shareCardWindowKind\(allowanceWindow\) === "seven_day";\s*\n\s*const history = isWeeklyWindow\s*\n\s*\? sharedHistory \?\? allowanceHistoryChartModel\(data\)\s*\n\s*: null;\s*\n\s*const trend = isWeeklyWindow \? shareCardTrend\(history\) : null;/u,
   );
   assert.match(
     section,
@@ -9055,6 +9130,7 @@ test("a posted results card always carries a diagnostic-format reference", async
     "shareCardWindowKind(allowanceWindow)",
     "finite(allowanceWindow?.durationMinutes)",
     "finite(allowanceWindow?.remainingPercent)",
+    "data.allowancePlanSelection ?? null",
     "finite(data?.pricing?.quotaWeightedTotalCostUsd)",
     "finite(data?.pricing?.totalCostUsd)",
     "finite(data?.pricing?.coveragePercent)",
@@ -9068,7 +9144,7 @@ test("a posted results card always carries a diagnostic-format reference", async
     // Re-pinned 2026-08-08 (owner-verified regression): the chart renderer
     // hands its own model in; the card derives one only when rendered
     // standalone, and both reads share the active-filter state.
-    /const isWeeklyWindow = shareCardWindowKind\(allowanceWindow\) === "seven_day";\s*\n\s*const history = isWeeklyWindow\s*\n\s*\? sharedHistory \?\? allowanceHistoryChartModel\(data\)\s*\n\s*: null;\s*\n\s*const trend = isWeeklyWindow \? shareCardTrend\(history\) : null;/u,
+    /const isWeeklyWindow = data\.allowancePlanSelection !== undefined\s*\n\s*\|\| shareCardWindowKind\(allowanceWindow\) === "seven_day";\s*\n\s*const history = isWeeklyWindow\s*\n\s*\? sharedHistory \?\? allowanceHistoryChartModel\(data\)\s*\n\s*: null;\s*\n\s*const trend = isWeeklyWindow \? shareCardTrend\(history\) : null;/u,
   );
   assert.match(
     section,
@@ -9181,7 +9257,7 @@ test("a posted results card states a figure in full, dates real evidence, and ma
   // line names its denominator — and the chart takes the reclaimed height.
   assert.match(section, /const trendTop = statTop \+ statHeight \+ 34;/u);
   assert.doesNotMatch(section, /relationshipNote/u);
-  assert.match(section, /label: t\("share\.stat\.recordedActivity"\),/u);
+  assert.match(section, /label: t\(data\.allowancePlanSelection\s*\n\s*\? "share\.stat\.recordedActivityAllPlans" : "share\.stat\.recordedActivity"\),/u);
   assert.match(
     section,
     /label: isWeeklyWindow\s*\n\s*\? t\("share\.stat\.estimatedAllowance"\)\s*\n\s*: t\("share\.stat\.estimatedAllowanceUnavailable"\),/u,
@@ -10267,7 +10343,8 @@ async function loadContributionCeremony(harness) {
   const start = appSource.indexOf("async function approveIncrementalContribution() {");
   const end = appSource.indexOf("async function loadCommunityResults() {");
   assert.ok(start >= 0 && end > start, "the contribution ceremony is available");
-  const section = appSource.slice(start, end);
+  const section = appSource.match(/^function attributionContributionSelected\([\s\S]*?^\}/mu)[0]
+    + "\n" + appSource.slice(start, end);
 
   const elements = new Map();
   const element = (id) => {
@@ -10324,13 +10401,14 @@ async function loadContributionCeremony(harness) {
     "localCompanionHealth", "communityClient", "localClient",
     "loadIncrementalSyncStatus", "scheduleIncrementalSyncStatusPoll",
     "showFailure", "describeFailure", "formatLocal", "t", "node",
-    `let incrementalConsentBusy = false;
+    `const TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION = "telemetry-contribution-v1.1";
+let incrementalConsentBusy = false;
 let communityConnectBusy = false;
 let contributionDisconnectBusy = false;
 let contributionDisconnectOutcome = harness.disconnectOutcome ?? null;
 let incrementalSyncStatus = harness.syncStatus ?? null;
-let communityDevicePaired = false;
-let communityDevicePairedV1 = false;
+let communityDevicePaired = harness.previouslyPaired === true;
+let communityDevicePairedV1 = harness.previouslyPaired === true;
 let incrementalRepairAttempted = false;
 let hostedIdentity = harness.identity;
 let communitySession = harness.session;
@@ -10554,6 +10632,29 @@ test("the post-sign-in resume enrolls with the proof first, then mints and claim
     harness.elements("#incremental-consent-status").localizedKeys
       .includes("consent.authorityRefreshed"),
   );
+});
+
+test("uncertain credential repair requires an explicit fresh pair despite remembered legacy pairing", async () => {
+  const harness = {
+    identity: null,
+    session: { csrfToken: "synthetic-live-csrf", participantId: "synthetic-participant", consentVersion: null },
+    approved: true, grantRejected: false, deviceUnavailable: true, previouslyPaired: true,
+    syncStatus: { status: "available", paused: true, pausedReason: "device_repair_required" },
+    responses: [{ status: 201, payload: { pairingCode: "synthetic-repair-code" } }],
+  };
+  const scope = await loadContributionCeremony(harness);
+  scope.maybeRepairIncrementalAuthorization();
+  scope.resumeContributionCeremonyAfterSignIn();
+  assert.deepEqual(harness.fetchCalls, [], "neither automatic entrypoint retries an uncertain rotation");
+  assert.deepEqual(harness.localCalls, []);
+  await scope.approveIncrementalContribution();
+  assert.deepEqual(harness.fetchCalls.map((call) => [call.url, call.method, call.csrf]), [
+    ["/api/v1/me/device-pairings", "POST", "synthetic-live-csrf"],
+  ]);
+  assert.deepEqual(harness.localCalls, [{ pairContributionDevice: "synthetic-repair-code" }]);
+  assert.equal(scope.state().incrementalConsentApproved, true);
+  assert.equal(scope.state().communityDevicePairedV1, true);
+  assert.equal(scope.state().incrementalRepairAttempted, false);
 });
 
 test("a lost device credential re-opens the ceremony exactly like a rejected grant", async () => {

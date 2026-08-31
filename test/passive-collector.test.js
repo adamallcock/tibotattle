@@ -1513,6 +1513,175 @@ test("a fresh app-server account marker provisionally scopes only new nearby rol
   }
 });
 
+test("prospective marker binding is captured on both sides and never attached from later settings", async () => {
+  const binding = { destinationOrigin: "https://community.example.test", enrollmentNamespace: "synthetic_enrollment_marker" };
+  for (const mode of ["matching", "changed", "unbound", "failed", "extra_field"]) {
+    const fixture = await collectorFixture();
+    let epoch = Date.parse("2026-07-23T00:01:00.000Z");
+    let bindingReads = 0;
+    class BoundClient {
+      async start() {}
+      async readAccount() {
+        epoch += 1_000;
+        return { account: { email: "binding.fixture@example.test", planType: "pro" } };
+      }
+      async readRateLimits() { epoch += 1_000; return appPayload(2); }
+      async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+      close() {}
+    }
+    try {
+      await runCollectorOnce({
+        ...fixture, staleAfterMs: 0, skipRolloutIngestion: true, clock: () => epoch,
+        appServerFactory: () => new BoundClient(), loadAccountObservationSecret: async () => Buffer.alloc(32, 81),
+        readAccountAttributionBinding: async () => {
+          bindingReads += 1;
+          if (mode === "failed" && bindingReads === 2) throw new Error("private-binding-canary");
+          if (mode === "unbound") return null;
+          if (mode === "extra_field") return { ...binding, rawAccount: "private-binding-canary" };
+          return mode === "changed" && bindingReads === 2
+            ? { ...binding, enrollmentNamespace: "synthetic_repaired_enrollment" } : binding;
+        },
+      });
+      assert.equal(bindingReads, 2, mode);
+      const first = JSON.parse(await readFile(fixture.checkpointFile, "utf8")).accountScopeMarker;
+      assert.equal(first.accountScope.status, "available", mode);
+      assert.equal(first.capturedAt, "2026-07-23T00:01:00.000Z", mode);
+      assert.equal(first.receivedAt, "2026-07-23T00:01:03.000Z", mode);
+      assert.deepEqual(first.observationBinding, mode === "matching" ? binding : null, mode);
+      epoch += 10_000;
+      await runCollectorOnce({ ...fixture, refreshStale: false, skipRolloutIngestion: true, clock: () => epoch,
+        readAccountAttributionBinding: async () => assert.fail("later settings must not bind old evidence") });
+      const checkpoint = await readFile(fixture.checkpointFile, "utf8");
+      assert.deepEqual(JSON.parse(checkpoint).accountScopeMarker, first, mode);
+      assert.equal(checkpoint.includes("private-binding-canary"), false, mode);
+      assert.equal(checkpoint.includes("binding.fixture@example.test"), false, mode);
+    } finally {
+      await rm(fixture.root, { recursive: true });
+    }
+  }
+});
+
+async function seedCollectorAccountMarker(fixture) {
+  await runCollectorOnce({
+    ...fixture, refreshStale: false,
+    clock: () => Date.parse("2026-07-23T00:00:00.000Z"),
+  });
+  const calls = [];
+  class MatchingClient {
+    async start() {}
+    async readAccount() {
+      calls.push("account");
+      return { account: { email: "marker.fixture@example.test", planType: "pro" } };
+    }
+    async readRateLimits() { calls.push("quota"); return appPayload(2); }
+    async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+    close() {}
+  }
+  await runCollectorOnce({
+    ...fixture, staleAfterMs: 0, skipRolloutIngestion: true,
+    appServerFactory: () => new MatchingClient(),
+    loadAccountObservationSecret: async () => Buffer.alloc(32, 81),
+    clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+  });
+  assert.deepEqual(calls, ["account", "quota", "account"]);
+  const checkpoint = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+  assert.equal(checkpoint.accountScopeMarker.version, "provisional-account-marker-v2");
+}
+
+test("account markers never apply backward, across a clock rollback, to future events, or after expiration", async () => {
+  const cases = [
+    ["before marker", "2026-07-23T00:00:59.000Z", "2026-07-23T00:01:02.000Z", "unavailable"],
+    ["clock rollback", "2026-07-23T00:00:58.000Z", "2026-07-23T00:00:59.000Z", "unavailable"],
+    ["future event", "2026-07-23T00:01:03.000Z", "2026-07-23T00:01:02.000Z", "unavailable"],
+    ["expired", "2026-07-23T00:06:01.000Z", "2026-07-23T00:06:02.000Z", "unavailable"],
+    ["inclusive freshness boundary", "2026-07-23T00:01:00.000Z", "2026-07-23T00:06:00.000Z", "available"],
+  ];
+  for (const [label, observedAt, receivedAt, expected] of cases) {
+    const fixture = await collectorFixture();
+    try {
+      await seedCollectorAccountMarker(fixture);
+      await appendFile(fixture.rollout, `${tokenRecord(observedAt, usage(10), usage(10), 3)}\n`);
+      await runCollectorOnce({ ...fixture, refreshStale: false, clock: () => Date.parse(receivedAt) });
+      const record = (await readLines(fixture.dataFile)).find((row) => row.kind === "codex_rollout_usage_snapshot");
+      assert.ok(record, `${label}: raw usage must remain available`);
+      assert.equal(record.accountScope.status, expected, label);
+      assert.equal(record.accountScopeAttribution, expected === "available"
+        ? "provisional_fresh_app_server_marker" : "unavailable_no_fresh_contemporaneous_marker", label);
+      assert.equal(record.components.input_uncached_tokens, 10, label);
+    } finally {
+      await rm(fixture.root, { recursive: true });
+    }
+  }
+});
+
+test("a same-record plan conflict clears the marker without dropping usage or rewriting the observed plan", async () => {
+  const fixture = await collectorFixture();
+  try {
+    await seedCollectorAccountMarker(fixture);
+    const differentPlan = JSON.parse(tokenRecord("2026-07-23T00:01:01.000Z", usage(10), usage(10), 3));
+    differentPlan.payload.rate_limits.plan_type = "plus";
+    await appendFile(fixture.rollout, `${JSON.stringify(differentPlan)}\n${tokenRecord("2026-07-23T00:01:02.000Z", usage(20), usage(10), 4)}\n`);
+    await runCollectorOnce({ ...fixture, refreshStale: false, clock: () => Date.parse("2026-07-23T00:01:03.000Z") });
+    const records = (await readLines(fixture.dataFile)).filter((row) => row.kind === "codex_rollout_usage_snapshot");
+    assert.equal(records.length, 2);
+    assert.deepEqual(records.map((row) => row.accountScope.status), ["unavailable", "unavailable"]);
+    assert.deepEqual(records.map((row) => row.windows[0].planType), ["plus", "pro"]);
+    assert.deepEqual(records.map((row) => row.components.input_uncached_tokens), [10, 10]);
+    assert.equal(JSON.parse(await readFile(fixture.checkpointFile, "utf8")).accountScopeMarker, null);
+  } finally {
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("logout, failed account/quota reads and account/plan races durably invalidate an earlier marker", async () => {
+  for (const failure of ["logout", "account_read", "account_switch", "account_plan", "quota_plan", "quota_read", "start", "commit"]) {
+    const fixture = await collectorFixture();
+    let reads = 0;
+    class InvalidatingClient {
+      async start() { if (failure === "start") throw new CodexAppServerError("authentication_failure", "Synthetic failure"); }
+      async readAccount() {
+        reads += 1;
+        if (failure === "logout" && reads === 2) return null;
+        if (failure === "account_read" && reads === 2) throw new Error("DO-NOT-LEAK-account-failure");
+        return { account: {
+          email: failure === "account_switch" && reads === 2 ? "switched.fixture@example.test" : "marker.fixture@example.test",
+          planType: failure === "account_plan" && reads === 2 ? "plus" : "pro",
+        } };
+      }
+      async readRateLimits() {
+        if (failure === "quota_read") throw new CodexAppServerError("authentication_failure", "Synthetic failure");
+        const payload = appPayload(3);
+        if (failure === "quota_plan") payload.rateLimits.planType = "plus";
+        return payload;
+      }
+      async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+      close() {}
+    }
+    try {
+      await seedCollectorAccountMarker(fixture);
+      await runCollectorOnce({
+        ...fixture, staleAfterMs: 0, skipRolloutIngestion: true,
+        appServerFactory: () => new InvalidatingClient(),
+        loadAccountObservationSecret: async () => Buffer.alloc(32, 81),
+        clock: () => Date.parse("2026-07-23T00:01:01.000Z"),
+        ...(failure === "commit" ? { commitState: async () => { throw new Error("Synthetic commit failure"); } } : {}),
+      });
+      assert.equal(JSON.parse(await readFile(fixture.checkpointFile, "utf8")).accountScopeMarker, null, failure);
+      await appendFile(fixture.rollout, `${tokenRecord("2026-07-23T00:01:02.000Z", usage(10), usage(10), 4)}\n`);
+      await runCollectorOnce({ ...fixture, refreshStale: false, clock: () => Date.parse("2026-07-23T00:01:03.000Z") });
+      const records = await readLines(fixture.dataFile);
+      const usageRecord = records.find((row) => row.kind === "codex_rollout_usage_snapshot");
+      assert.equal(usageRecord.accountScope.status, "unavailable", failure);
+      assert.equal(usageRecord.components.input_uncached_tokens, 10, failure);
+      assert.ok(records.some((row) => row.source === "app_server_read" && row.windows[0].usedPercent === 2), failure);
+      assert.equal(JSON.stringify(records).includes("fixture@example.test"), false, failure);
+      assert.equal(JSON.stringify(records).includes("DO-NOT-LEAK"), false, failure);
+    } finally {
+      await rm(fixture.root, { recursive: true });
+    }
+  }
+});
+
 test("a refresh whose snapshot carries Spark windows still exposes notification evidence", async () => {
   const fixture = await collectorFixture();
   const accountSecret = Buffer.alloc(32, 82);
@@ -2011,8 +2180,8 @@ test("foreground re-reads account scope before attributing a rate-limit notifica
     async readAccount() {
       accountReads += 1;
       const account = { account: { email: currentEmail, planType: "pro" } };
-      if (accountReads === 1) markInitialAccountRead();
-      if (accountReads === 2) markNotificationAccountRead();
+      if (accountReads === 2) markInitialAccountRead();
+      if (accountReads === 4) markNotificationAccountRead();
       return account;
     }
     async readAccountUsage() { return { dailyUsageBuckets: [] }; }
@@ -2076,6 +2245,121 @@ test("foreground re-reads account scope before attributing a rate-limit notifica
   }
 });
 
+test("a duplicate unavailable notification still clears a newer account marker", async () => {
+  const fixture = await collectorFixture();
+  const controller = new AbortController();
+  let loggedIn = true;
+  let activeClient;
+  let foreground;
+  let nowMs = Date.parse("2026-07-23T00:01:00.000Z");
+  const hardStop = setTimeout(() => controller.abort(), 10_000);
+  class AccountClient extends EventEmitter {
+    async start() {}
+    async readRateLimits() { return appPayload(2); }
+    async readAccount() { return loggedIn ? { account: { email: "duplicate.fixture@example.test", planType: "pro" } } : null; }
+    async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+    close() {}
+  }
+  async function until(predicate, label) {
+    for (let attempt = 0; attempt < 500; attempt += 1) {
+      if (await predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.fail(label);
+  }
+  try {
+    foreground = runCollectorForeground({
+      ...fixture, signal: controller.signal, staleAfterMs: 0, reconciliationMs: 20,
+      appServerFactory: () => { activeClient = new AccountClient(); return activeClient; },
+      loadAccountObservationSecret: async () => Buffer.alloc(32, 87), clock: () => nowMs,
+    });
+    await until(async () => (await readLines(fixture.dataFile)).some((row) => row.source === "app_server_read"), "initial quota record");
+    loggedIn = false;
+    nowMs += 1_000;
+    activeClient.emit("rateLimitsUpdated", appPayload(3));
+    await until(async () => (await readLines(fixture.dataFile)).some((row) => row.source === "app_server_notification" && row.windows[0].usedPercent === 3), "first unavailable notification");
+    loggedIn = true;
+    nowMs += 1_000;
+    activeClient.emit("rateLimitsUpdated", appPayload(4));
+    await until(async () => (await readLines(fixture.dataFile)).some((row) => row.source === "app_server_notification" && row.windows[0].usedPercent === 4), "new matching account marker");
+    assert.equal(JSON.parse(await readFile(fixture.checkpointFile, "utf8")).accountScopeMarker.accountScope.status, "available");
+    loggedIn = false;
+    nowMs += 1_000;
+    activeClient.emit("rateLimitsUpdated", appPayload(3));
+    await until(async () => {
+      const checkpoint = JSON.parse(await readFile(fixture.checkpointFile, "utf8"));
+      return checkpoint.accountScopeMarker === null && checkpoint.diagnostics.duplicateEventsSkipped > 0;
+    }, "duplicate notification must durably invalidate the marker");
+    nowMs += 1_000;
+    await appendFile(fixture.rollout, `${tokenRecord(new Date(nowMs).toISOString(), usage(10), usage(10), 3)}\n`);
+    await until(async () => (await readLines(fixture.dataFile)).some((row) => row.kind === "codex_rollout_usage_snapshot"), "post-logout usage");
+    controller.abort();
+    await foreground;
+    const records = await readLines(fixture.dataFile);
+    assert.equal(records.filter((row) => row.source === "app_server_notification").length, 2);
+    const usageRecord = records.find((row) => row.kind === "codex_rollout_usage_snapshot");
+    assert.equal(usageRecord.accountScope.status, "unavailable");
+    assert.equal(usageRecord.components.input_uncached_tokens, 10);
+  } finally {
+    clearTimeout(hardStop);
+    controller.abort();
+    await foreground?.catch(() => {});
+    await rm(fixture.root, { recursive: true });
+  }
+});
+
+test("foreground account-change and disconnect signals invalidate the marker before queued usage", async () => {
+  for (const signalName of ["accountChanged", "disconnect"]) {
+    const fixture = await collectorFixture();
+    const controller = new AbortController();
+    let activeClient;
+    let foreground;
+    let nowMs = Date.parse("2026-07-23T00:01:00.000Z");
+    const hardStop = setTimeout(() => controller.abort(), 10_000);
+    class InvalidationClient extends EventEmitter {
+      async start() {}
+      async readRateLimits() { return appPayload(2); }
+      async readAccount() { return { account: { email: "invalidation.fixture@example.test", planType: "pro" } }; }
+      async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+      close() {}
+    }
+    try {
+      foreground = runCollectorForeground({
+        ...fixture, signal: controller.signal, staleAfterMs: 0, reconciliationMs: 20,
+        appServerFactory: () => { activeClient = new InvalidationClient(); return activeClient; },
+        loadAccountObservationSecret: async () => Buffer.alloc(32, 88), clock: () => nowMs,
+      });
+      for (let attempt = 0; attempt < 500; attempt += 1) {
+        if ((await readLines(fixture.dataFile)).some((row) => row.source === "app_server_read")) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      nowMs = Date.parse("2026-07-23T00:01:03.000Z");
+      for (let index = 0; index < (signalName === "accountChanged" ? 100 : 1); index += 1) {
+        activeClient.emit(signalName);
+      }
+      await appendFile(fixture.rollout, `${tokenRecord("2026-07-23T00:01:02.000Z", usage(10), usage(10), 3)}\n`);
+      for (let attempt = 0; attempt < 500; attempt += 1) {
+        if ((await readLines(fixture.dataFile)).some((row) => row.kind === "codex_rollout_usage_snapshot")) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      controller.abort();
+      const result = await foreground;
+      if (signalName === "accountChanged") {
+        assert.ok(result.resourceActivity.checkpointWrites < 10, "an account-change burst must coalesce its durable invalidation");
+      }
+      const record = (await readLines(fixture.dataFile)).find((row) => row.kind === "codex_rollout_usage_snapshot");
+      assert.ok(record, signalName);
+      assert.equal(record.accountScope.status, "unavailable", signalName);
+      assert.equal(record.components.input_uncached_tokens, 10, signalName);
+    } finally {
+      clearTimeout(hardStop);
+      controller.abort();
+      await foreground?.catch(() => {});
+      await rm(fixture.root, { recursive: true });
+    }
+  }
+});
+
 test("foreground coalesces a notification burst to one pending payload and re-reads the switched account", async () => {
   const fixture = await collectorFixture();
   const controller = new AbortController();
@@ -2097,7 +2381,7 @@ test("foreground coalesces a notification burst to one pending payload and re-re
     async readAccount() {
       accountReads += 1;
       const observedEmail = currentEmail;
-      if (accountReads === 2) {
+      if (accountReads === 3) {
         markFirstNotificationReadStarted();
         await firstNotificationReadReleased;
       }
@@ -2158,6 +2442,8 @@ test("foreground coalesces a notification burst to one pending payload and re-re
     const records = await readLines(fixture.dataFile);
     const notifications = records.filter((record) => record.source === "app_server_notification");
     assert.deepEqual(notifications.map((record) => record.windows[0].usedPercent), [3, 100]);
+    assert.equal(notifications[0].accountScope.status, "unavailable", "a switch during the read bracket cannot be attributed");
+    assert.equal(notifications[1].accountScope.status, "unavailable", "a later account read cannot label a notification queued under another account marker");
     const rollout = records.find((record) => record.kind === "codex_rollout_usage_snapshot");
     const expected = deriveOpenAIAccountScope({ account: { email: currentEmail } }, { secret, planType: "pro" });
     assert.equal(rollout.accountScope.scopeId, expected.scopeId);

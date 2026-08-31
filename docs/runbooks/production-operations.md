@@ -22,7 +22,7 @@ the [macOS stable release runbook](./macos-stable-release-runbook.md).
 |---|---|
 | Public and `www` hosts | One production Worker and manifest-verified static release-site assets |
 | Admin host | Same Worker, but admin routes exist only on `admin.tibotattle.com`, behind Cloudflare Access and a Worker-side owner check |
-| Primary durable state | `USAGE_MONITOR_DB` D1 binding; checked-in migrations through `0041_community_model_composition.sql` in this snapshot |
+| Primary durable state | `USAGE_MONITOR_DB` D1 binding; checked-in migrations through `0044_attribution_domain_activation.sql`; this is a source inventory, not proof of remote application |
 | Deletion ledger | Separate `DELETION_LEDGER` D1 binding and migration ledger |
 | Encrypted/quarantined objects | Production `QUARANTINE` R2 binding with explicit deletion/reconciliation and deletion-safe restore rules; automatic age-based deletion is disabled in this source snapshot |
 | Upload admission | `UPLOAD_INGRESS_BUDGET` Durable Object plus explicit rate-limit bindings |
@@ -154,6 +154,59 @@ The underlying policy and failure modes are retained in
 [the production migration gate](../governance/2026-08-07-production-deploy-migration-gate.md).
 
 ## Owner deployment
+
+### Attribution successor cutover and rollback
+
+The account/plan changes separate analytical correction from new consented
+transport. `0042` fences legacy analytical inputs/caches and publication;
+`0043` adds explicit consent, enrollment namespaces, admission floors and
+immutable staged day transport; `0044` adds complete-domain activation. Local
+schema 11 is not renamed, downgraded or wiped. Applying migrations or enabling
+the staged v1.1 format remains a separately authorized production operation.
+
+The release rehearsal and staging readiness probe check both the exact migration
+inventory and the attribution tables, columns, indexes, integrity triggers and
+source-selection views. A complete ledger with missing schema guards fails the
+readiness check. These schema-only probes do not transmit contribution content
+and do not authorize migration application or format activation.
+
+Before cutover, run the synthetic transport, domain, re-pair, erasure, source-pin
+and public publication tests. Verify the actual pending migration set, owner
+rollback authority, backup/deletion-ledger posture and consent UI. Code or a
+successful development upload does not prove any existing person has consented.
+New consent requires the exact schema/dictionary/privacy triple, explicit
+ongoing-upload intent and hosted personal-session CSRF. Capability reads and
+device credentials cannot grant it. Existing v1 uploads remain valid until
+that participant explicitly raises its minimum write rank.
+
+Check for accepted v0.2 history before offering an upgrade. Such participants
+have an effectively blocked v1.1 capability; both consent and activation refuse
+the transition, including disjoint-day candidates. This prevents loss of an
+otherwise valid legacy fit. Do not delete old contributions or bypass the floor
+guard to force cutover; a reviewed semantic replacement adapter is required.
+
+Activation requires a contiguous full-domain manifest, a current predecessor
+token/fingerprint, ready chunks and exact semantic predecessor coverage. Its
+limit is 4,096 days and 30,000 chunks; over-limit or unproven replacement stays
+staged without discarding history. An unchanged vector acknowledges the actual
+active generation without republishing; a source correction forces revalidation.
+Read back the selected generation and public readiness independently. Never
+infer complete cutover from successful chunk delivery alone.
+
+For an explicitly authorized write-floor rollback, use the existing
+`POST /api/v1/admin/action` with `action: "run_maintenance"` and one closed
+`transportRollback` object containing `participantId`, `expectedRevision`,
+`fromRank`, `toRank` and
+`confirmation: "lower_transport_admission_preserving_analytical_source"`.
+The exact target and current revision must be inspected first. The Access owner
+and admin CSRF gates still apply. The result reports the new write floor,
+policy revision and `activeAnalyticalSourcePreserved: true`; the audit stores
+a purpose-separated participant digest, not the raw target. A stale revision
+is a conflict, never permission to retry with an invented one. Lowering a floor
+does not unpin the active analytical history, delete consent, reactivate erased
+data or authorize a different cross-format join.
+
+### Guarded deployment wrapper
 
 Only after explicit authorization and green preflight, use the wrapper from
 `apps/worker`:

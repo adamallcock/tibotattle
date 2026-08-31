@@ -11,6 +11,7 @@ import {
   demoDashboard,
   isValidQuotaWindowDuration,
   normalizeIncrementalContributionSyncStatus,
+  selectAllowancePlanPopulation,
   selectPrimaryCodexQuotaWindow
 } from "./data-client.js";
 import {
@@ -48,6 +49,7 @@ import {
 import {
   TELEMETRY_PLAN_DISPLAY_NAMES,
   TELEMETRY_PLAN_TYPES,
+  TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
 } from "./telemetry-shared.generated.js";
 import {
   compact,
@@ -136,6 +138,9 @@ let activeAccountingPeriod = "7d";
 // visible reason, which is the inconsistency this settles.
 let activeWeeklyRangeDays = 30;
 let activeWeeklyMinimumObservedSpanPp = 50;
+// Null follows the latest observed plan, including an insufficient one. An
+// explicit choice stays in memory across refreshes, ranges and locale changes.
+let activeWeeklyPlanType = null;
 let timelineViewport = null;
 let usageTimelineViewport = null;
 let timelinePointerStart = null;
@@ -231,6 +236,9 @@ let contributionSyncAutoReviewedKey = null;
 let incrementalConsentApproved = false;
 let incrementalConsentBusy = false;
 let incrementalSyncStatus = null;
+let attributionContributionReview = null;
+let attributionContributionBusy = false;
+let attributionContributionNotice = null;
 // The optional lastOutcome.detail.code the 0.1.2 companion records beside the
 // bare outcome code, so "Last error: device credential unavailable" can be
 // stated instead of an anonymous "run_failed". The bounded normalizer keeps
@@ -1687,6 +1695,14 @@ function matchedRollingPairs(data) {
 }
 
 function renderComparison(data) {
+  data = selectAllowancePlanPopulation(data, activeWeeklyPlanType);
+  const planNote = $("#comparison-plan-note");
+  if (planNote) {
+    planNote.hidden = data.allowancePlanSelection?.comparisonAvailable !== true;
+    if (!planNote.hidden) setLocalizedText(planNote,
+      "weekly.plan.comparisonConditional",
+      { plan: shareCardPlanLabel(data.weekly.planType) || t("weekly.plan.unknown") });
+  }
   // The observed-versus-calculated comparison depends on the calibration
   // capacity; when that capacity is served from the previous version's cache
   // during a recalculation, the comparison says so, quietly.
@@ -1698,7 +1714,7 @@ function renderComparison(data) {
   const pair = matchedPairs.at(-1) ?? null;
   const summary = data.gradient.summary ?? {};
   const weeklySummary = data.weekly.summary ?? {};
-  const legacyDemo = data.mode === "demo";
+  const legacyDemo = data.mode === "demo" && !data.allowancePlanSelection;
   const mae = matchedPairs.length > 0
     ? matchedPairs.reduce(
       (sum, row) => sum + Math.abs(row.observed - row.expected),
@@ -1760,11 +1776,20 @@ function renderComparison(data) {
     modelCostShares,
   });
   if (!pair || pair.observed === null || pair.expected === null) {
+    // A new population must not retain the previous plan's visible bars.
+    for (const row of $("#comparison-visual").querySelectorAll(".comparison-row")) {
+      row.querySelector("i").style.width = "0%";
+      row.querySelector("strong").textContent = "—";
+    }
     setProductText(chip, "Insufficient");
-    setProductText(
-      $("#comparison-result"),
-      "There is not yet a matched quota-and-cost window to compare.",
-    );
+    if (data.allowancePlanSelection?.comparisonAvailable === false) {
+      setLocalizedText($("#comparison-result"), "weekly.plan.comparisonPending");
+    } else {
+      setProductText(
+        $("#comparison-result"),
+        "There is not yet a matched quota-and-cost window to compare.",
+      );
+    }
     return;
   }
   const max = Math.max(Math.abs(pair.observed), Math.abs(pair.expected), 1);
@@ -2302,12 +2327,15 @@ function buildShareCard(data, {
   const summary = data?.weekly?.summary ?? {};
 
   const allowanceWindow = shareCardWindow(data?.quotaWindows ?? []);
-  const isWeeklyWindow = shareCardWindowKind(allowanceWindow) === "seven_day";
+  const isWeeklyWindow = data.allowancePlanSelection !== undefined
+    || shareCardWindowKind(allowanceWindow) === "seven_day";
   const remaining = finite(allowanceWindow?.remainingPercent);
   const windowLabel = shareCardWindowLabel(allowanceWindow);
   // The reader's most-recent plan, read from the same bounded plan_type enum
   // the quota cards use. "" leaves the header chip off entirely.
-  const planLabel = shareCardPlan(data?.quotaWindows ?? []);
+  const planLabel = data.allowancePlanSelection
+    ? shareCardPlanLabel(data?.weekly?.planType) || t("weekly.plan.unknown")
+    : shareCardPlan(data?.quotaWindows ?? []);
 
   const weighted = !accountingEvidenceAvailable
     ? null
@@ -2372,7 +2400,8 @@ function buildShareCard(data, {
       // allowance. The label must make the different denominator clear on the
       // image itself: an activity total can legitimately exceed one estimated
       // allowance without being a billing error or an allowance overrun.
-      label: t("share.stat.recordedActivity"),
+      label: t(data.allowancePlanSelection
+        ? "share.stat.recordedActivityAllPlans" : "share.stat.recordedActivity"),
       value: spend === null ? t("share.value.notAvailable") : formatMoney(spend, 0),
       // The "event-time API equivalent" caption is gone (owner-directed,
       // 2026-08-10): the detail line states the selected range and nothing
@@ -2401,6 +2430,9 @@ function buildShareCard(data, {
   const caveats = [];
   if (isDemo) {
     caveats.push(t("share.caveat.demo"));
+  }
+  if (data.allowancePlanSelection) {
+    caveats.push(t("share.caveat.planConditional"));
   }
   if (spend !== null && excluded > 0) {
     caveats.push(t("share.caveat.unweighted", {
@@ -2447,7 +2479,10 @@ function buildShareCard(data, {
     // The Codex plan name is presented as-is; only the surrounding word is
     // localized (share.plan). "" when no window named a plan, so a card that
     // cannot name a plan carries no chip and no empty wrapper.
-    plan: planLabel === "" ? "" : t("share.plan", { plan: planLabel }),
+    plan: planLabel === "" ? "" : t(
+      data.allowancePlanSelection ? "share.planAllowance" : "share.plan",
+      { plan: planLabel },
+    ),
     stats: Object.freeze(stats.map((stat) => Object.freeze({ ...stat }))),
     // Reset-fit history is an explicitly seven-day model. It is never drawn
     // behind a five-hour or provider-reported generic allowance window.
@@ -3192,7 +3227,8 @@ function shareCardActivitySelection(data, rangeDays) {
 function renderShareCard(data, { history: sharedHistory = null } = {}) {
   const canvas = $("#share-card-canvas");
   const allowanceWindow = shareCardWindow(data?.quotaWindows ?? []);
-  const isWeeklyWindow = shareCardWindowKind(allowanceWindow) === "seven_day";
+  const isWeeklyWindow = data.allowancePlanSelection !== undefined
+    || shareCardWindowKind(allowanceWindow) === "seven_day";
   const history = isWeeklyWindow
     ? sharedHistory ?? allowanceHistoryChartModel(data)
     : null;
@@ -3208,6 +3244,7 @@ function renderShareCard(data, { history: sharedHistory = null } = {}) {
     finite(allowanceWindow?.durationMinutes),
     finite(allowanceWindow?.remainingPercent),
     shareCardPlan(data?.quotaWindows ?? []),
+    data.allowancePlanSelection ?? null,
     finite(data?.pricing?.quotaWeightedTotalCostUsd),
     finite(data?.pricing?.totalCostUsd),
     finite(data?.pricing?.coveragePercent),
@@ -3239,6 +3276,10 @@ function renderShareCard(data, { history: sharedHistory = null } = {}) {
   // The header's reference chip is gone (owner-directed, 2026-08-08): the
   // reference still exists — the saved file name carries it — but the panel
   // header no longer prints a code the reader cannot act on.
+  // This generated transcript replaces the initial placeholder. The static
+  // localizer must not overwrite the selected-plan figures after a language
+  // change; renderWeekly rebuilds the transcript in the new language.
+  canvas.removeAttribute("data-i18n-aria-label");
   canvas.setAttribute("aria-label", shareCardText(shareCard));
   if (!drawShareCard(canvas, shareCard)) {
     shareCard = null;
@@ -4632,6 +4673,7 @@ function selectedTimelinePoints(data) {
 }
 
 function renderTimeline(data) {
+  data = selectAllowancePlanPopulation(data, activeWeeklyPlanType);
   const {
     points,
     baselinePoints,
@@ -4679,6 +4721,8 @@ function renderTimeline(data) {
         : tPlural("dashboard.timeline.series", 0, { window: windowLabel });
     empty.querySelector("p").textContent = unavailable
       ? t(projectionUnavailableCopyKey(data))
+      : data.allowancePlanSelection?.comparisonAvailable === false
+        ? t("weekly.plan.comparisonPending")
       : visiblePoints.length
         ? t("dashboard.timeline.noBracket", { window: windowLabel })
         : t("dashboard.timeline.missingData");
@@ -7373,7 +7417,44 @@ function renderWeeklyPaceForecast(data) {
   card.hidden = false;
 }
 
+function renderWeeklyPlanControl(data) {
+  const control = $("#weekly-plan-control");
+  const select = $("#weekly-plan-select");
+  const note = $("#weekly-plan-note");
+  if (!control || !select || !note) return;
+  const selection = data.allowancePlanSelection;
+  control.hidden = !selection;
+  note.hidden = !selection;
+  if (!selection) return;
+  const populations = data.weekly.planPopulations ?? [];
+  const signature = JSON.stringify([
+    populations.map((row) => row.planType),
+    selection.currentPlanType,
+    localization.locale(),
+  ]);
+  if (select.dataset.populationSignature !== signature) {
+    select.replaceChildren(...populations.map((row) => {
+      const option = node("option");
+      option.value = row.planType;
+      option.textContent = t(row.planType === selection.currentPlanType
+        ? "weekly.plan.latestOption" : "weekly.plan.historyOption", {
+        plan: shareCardPlanLabel(row.planType) || t("weekly.plan.unknown"),
+      });
+      return option;
+    }));
+    select.dataset.populationSignature = signature;
+  }
+  select.value = selection.planType;
+  select.disabled = populations.length < 2;
+  setLocalizedText(note, selection.isCurrentPlan
+    ? "weekly.plan.conditional" : "weekly.plan.historicalConditional", {
+    plan: shareCardPlanLabel(selection.planType) || t("weekly.plan.unknown"),
+  });
+}
+
 function renderWeekly(data) {
+  data = selectAllowancePlanPopulation(data, activeWeeklyPlanType);
+  renderWeeklyPlanControl(data);
   renderWeeklyPaceForecast(data);
   // A weekly estimate carried over from the previous app version while the
   // recalculation runs announces itself here, quietly.
@@ -7398,13 +7479,17 @@ function renderWeekly(data) {
   // underneath reports how much of that population the chart is drawing. The
   // headline is deliberately not made to follow the filter — a figure people
   // quote should not move when they adjust a chart control.
-  setLocalizedText($("#weekly-estimate-label"), "weekly.headline.label");
+  const planLabel = shareCardPlanLabel(data.weekly.planType) || t("weekly.plan.unknown");
+  setLocalizedText($("#weekly-estimate-label"), data.allowancePlanSelection
+    ? "weekly.headline.planLabel" : "weekly.headline.label", { plan: planLabel });
   $("#weekly-estimate").textContent = estimate === null
     ? t("weekly.headline.insufficient")
     : t("weekly.headline.value", { amount: formatMoney(estimate) });
   $("#weekly-range").textContent = lower === null || upper === null
     ? t("weekly.headline.rangeUnavailable")
-    : t("weekly.headline.range", {
+    : t(data.allowancePlanSelection
+      ? "weekly.headline.planRange" : "weekly.headline.range", {
+      plan: planLabel,
       lower: formatMoney(lower),
       upper: formatMoney(upper),
     });
@@ -12855,6 +12940,8 @@ function renderCommunityJourney() {
     } else {
       stage("community", "waiting", "journey.community.waitingIndex");
     }
+  } else if (incrementalConsentApproved && incrementalSyncStatus?.pausedReason === "device_repair_required") {
+    stage("community", "action", "consent.repairConnection");
   } else if (incrementalConsentApproved && incrementalUploadAuthorityLost()) {
     // The transparent re-pair is pending, so this stage must not claim
     // "done · syncing" while the approve card is asking for a sign-in
@@ -12883,6 +12970,164 @@ function renderCommunityJourney() {
 // that transport exists the surface stays out of the document entirely, so
 // the page never claims an automatic upload that cannot happen.
 const INCREMENTAL_SYNC_CONTRACT = "telemetry-contribution-v1.0";
+
+function attributionContributionSelected() {
+  return incrementalSyncStatus?.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION;
+}
+
+function renderAttributionContribution() {
+  const surface = $("#attribution-consent");
+  if (!surface) return;
+  const selected = attributionContributionSelected();
+  const approved = selected && incrementalSyncStatus?.consent?.approved === true
+    && incrementalSyncStatus.consent.current === true;
+  surface.hidden = !selected && incrementalSyncStatus?.attributionUpgradeAvailable !== true;
+  if (surface.hidden) return;
+  const busy = attributionContributionBusy || incrementalConsentBusy || communityConnectBusy
+    || contributionDisconnectBusy || contributionDisconnectDialogOpen();
+  const repair = incrementalUploadAuthorityLost() || contributionDeviceDisconnectPaused();
+  const repairRequired = approved && incrementalSyncStatus?.pausedReason === "device_repair_required";
+  const button = $("#attribution-review-open");
+  button.hidden = approved && !repair;
+  button.disabled = busy || contributionDisconnectOutcome === "cleanup_pending";
+  setLocalizedText(button, repairRequired ? "consent.repairConnection" : "attributionConsent.review");
+  setLocalizedText($("#attribution-consent-description"), repairRequired
+    ? "consent.repairRequired" : approved ? "attributionConsent.approved" : "attributionConsent.description");
+  const review = attributionContributionReview;
+  const details = $("#attribution-review");
+  details.hidden = review === null;
+  if (review !== null) {
+    setLocalizedText($("#attribution-review-destination"), "attributionConsent.destination", {
+      destination: review.consent.destinationOrigin,
+    });
+    setRawText($("#attribution-review-contract"), [review.consent.telemetrySchemaVersion,
+      review.consent.fieldDictionaryVersion, review.consent.privacyContractVersion].join(" · "));
+    setLocalizedText($("#attribution-review-sample"), "attributionConsent.sample", {
+      day: review.sample.day, usage: formatNumber(review.sample.recordCounts.usage),
+      quota: formatNumber(review.sample.recordCounts.quota), sessions: formatNumber(review.sample.recordCounts.session),
+    });
+    const inventory = $("#attribution-review-inventory");
+    inventory.replaceChildren();
+    for (const [stream, fields] of Object.entries(review.inventory.fields)) {
+      const row = document.createElement("div");
+      const label = document.createElement("dt");
+      label.textContent = t(`attributionConsent.fields.${stream}`);
+      const values = document.createElement("dd");
+      values.textContent = fields.join(", ");
+      row.append(label, values);
+      inventory.append(row);
+    }
+    setLocalizedText($("#attribution-review-bases"), "attributionConsent.bases", {
+      accounts: review.inventory.accountBases.join(", "), plans: review.inventory.planBases.join(", "),
+      nullable: review.inventory.nullableQuotaMeasurements.join(", "),
+    });
+  }
+  $("#attribution-consent-confirm").disabled = busy;
+  $("#attribution-consent-approve").disabled = busy || review === null
+    || !$("#attribution-consent-confirm").checked || hostedSignInRequired();
+  $("#attribution-review-cancel").disabled = busy;
+  const note = $("#attribution-consent-status");
+  const key = attributionContributionNotice ?? (review && hostedSignInRequired() ? "consent.signInFirst" : null);
+  note.hidden = key === null;
+  if (key !== null) setLocalizedText(note, key);
+}
+
+async function ensureAttributionHostedSession() {
+  if (hostedIdentity !== null) {
+    const enrollment = await communityClient.enroll(null, "telemetry-contribution-v0.1", {
+      deviceBootstrap: false, identity: hostedIdentity,
+    });
+    if (enrollment?.schemaVersion !== "participant-bootstrap-v0.1" || typeof enrollment.csrfToken !== "string") {
+      throw new Error("Hosted session is unavailable.");
+    }
+    setCommunitySession({ csrfToken: enrollment.csrfToken, participantId: enrollment.participantId ?? null,
+      consentVersion: "privacy-safe-telemetry-v0.1" });
+    await clearPendingHostedSignIn().catch(() => {});
+    hostedIdentity = null;
+    communitySessionMintedAt = Date.now();
+  }
+  if (!hasCommunitySession()) throw new Error("Hosted sign-in is required.");
+}
+
+async function openAttributionContributionReview() {
+  if (attributionContributionBusy || incrementalConsentBusy || communityConnectBusy
+      || contributionDisconnectBusy || contributionDisconnectDialogOpen()) return;
+  if (!attributionContributionSelected() && incrementalSyncStatus?.attributionUpgradeAvailable !== true) return;
+  const repairNeeded = ["device_unavailable", "device_repair_required"].includes(incrementalSyncStatus?.pausedReason)
+    || contributionDeviceDisconnectPaused();
+  if (!attributionContributionSelected() && repairNeeded) {
+    // The existing-format repair may resume an upload immediately. Keep it
+    // separate from new-format review instead of racing that credential use.
+    attributionContributionNotice = "attributionConsent.repairBeforeReview";
+    renderAttributionContribution();
+    return;
+  }
+  const repairing = attributionContributionSelected() && repairNeeded;
+  const alreadyApproved = attributionContributionSelected() && incrementalSyncStatus?.consent?.approved === true
+    && incrementalSyncStatus.consent.current === true;
+  attributionContributionBusy = true;
+  attributionContributionReview = null;
+  attributionContributionNotice = repairing ? "consent.syncRefreshingAuthority" : "attributionConsent.reviewing";
+  $("#attribution-consent-confirm").checked = false;
+  renderAttributionContribution();
+  try {
+    if (repairing) {
+      // Clear the repair pause first. Only current exact successor consent
+      // can resume an upload; stale consent still needs the fresh review.
+      await ensureAttributionHostedSession();
+      const pairing = await mintDevicePairingWithCookieCommitRetry();
+      await localClient.pairContributionDevice(pairing.pairingCode);
+      contributionDisconnectOutcome = null;
+      if (alreadyApproved) {
+        await loadIncrementalSyncStatus().catch(() => {});
+        scheduleIncrementalSyncStatusPoll({ reset: true });
+        attributionContributionNotice = "consent.authorityRefreshed";
+        return;
+      }
+    }
+    attributionContributionReview = await localClient.reviewAttributionContribution();
+    attributionContributionNotice = null;
+    $("#attribution-review").hidden = false;
+    $("#attribution-review-title").focus();
+  } catch {
+    attributionContributionNotice = repairing ? "consent.repairIncomplete" : "attributionConsent.reviewUnavailable";
+  } finally {
+    attributionContributionBusy = false;
+    renderAttributionContribution();
+  }
+}
+
+async function approveAttributionContribution() {
+  const review = attributionContributionReview;
+  if (review === null || attributionContributionBusy || incrementalConsentBusy || communityConnectBusy
+      || contributionDisconnectBusy || contributionDisconnectDialogOpen()
+      || !$("#attribution-consent-confirm").checked || hostedSignInRequired()) return;
+  attributionContributionBusy = true;
+  attributionContributionNotice = "attributionConsent.approving";
+  renderAttributionContribution();
+  try {
+    await ensureAttributionHostedSession();
+    // Distinct authority: this call carries the hosted session + CSRF, never
+    // the upload device credential. The local approval verifies the grant.
+    await communityClient.grantAttributionContribution(review);
+    const result = await localClient.approveAttributionContribution(review);
+    if (result?.status !== "approved" || result.contractVersion !== TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION) {
+      throw new Error("Attribution approval did not finish.");
+    }
+    attributionContributionReview = null;
+    attributionContributionNotice = "attributionConsent.approved";
+    await loadIncrementalSyncStatus();
+    scheduleIncrementalSyncStatusPoll({ reset: true });
+  } catch {
+    // A grant may have landed while local approval lost its response. Never
+    // claim no hosted change, auto-approve, or fall back to the older format.
+    attributionContributionReview = null;
+    attributionContributionNotice = "attributionConsent.approvalIncomplete";
+  } finally {
+    attributionContributionBusy = false;
+    renderContributionActionState();
+  }
+}
 
 function incrementalSyncCapabilityAdvertised() {
   return localCompanionHealth?.capabilities?.incrementalContributionSync
@@ -12939,18 +13184,19 @@ function incrementalGrantRejected() {
 
 /**
  * Whether this Mac's upload authority is lost and only the connect ceremony
- * can restore it. Two paused reasons qualify: consent_rejected (the service
+ * can restore it. Paused reasons include consent_rejected (the service
  * refused the grant) and device_unavailable (no readable device credential —
  * after a credential reset or a broken Keychain binding). Gating repair on
  * consent_rejected alone was a designed-in deadlock: with no credential,
  * every pass dies at device_unavailable before any upload can be refused,
  * so the only state that re-opened the ceremony was unreachable from the
- * state that needed it.
+ * state that needed it. An uncertain credential rotation is separately
+ * device_repair_required: only an explicit repair may resume that pause.
  */
 function incrementalUploadAuthorityLost() {
   return incrementalGrantRejected()
     || (incrementalSyncStatus?.status === "available"
-      && incrementalSyncStatus.pausedReason === "device_unavailable");
+      && ["device_unavailable", "device_repair_required"].includes(incrementalSyncStatus.pausedReason));
 }
 
 /**
@@ -12973,7 +13219,7 @@ function renderIncrementalConsent() {
   const chip = $("#incremental-consent-state");
   const reviewVerified = contributionSyncExactReview?.state === "ready";
   const busy = incrementalConsentBusy || communityConnectBusy
-    || contributionDisconnectBusy || contributionDisconnectDialogOpen();
+    || contributionDisconnectBusy || contributionDisconnectDialogOpen() || attributionContributionBusy;
   // A recorded approval whose upload authority is lost — a claim that
   // carried the v0.1 consent, or a missing device credential — re-opens the
   // same single action (the transparent re-pair). The chip stays "Approved":
@@ -12981,6 +13227,8 @@ function renderIncrementalConsent() {
   const disconnected = contributionDeviceDisconnectPaused();
   const repairNeeded = incrementalConsentApproved
     && (incrementalUploadAuthorityLost() || disconnected);
+  const repairRequired = incrementalSyncStatus?.pausedReason === "device_repair_required";
+  setLocalizedText(approve, repairRequired ? "consent.repairConnection" : "consent.reviewAndApprove");
   setLocalizedText(chip, incrementalConsentApproved
     ? "consent.stateApproved"
     : "consent.stateNotApproved");
@@ -13031,6 +13279,9 @@ function renderIncrementalConsent() {
       : hostedSignInRequired()
         ? "contribution.disconnect.signInToReconnect"
         : "contribution.disconnect.paused");
+  } else if (repairRequired && hostedSignInRequired()) {
+    gate.hidden = false;
+    setLocalizedText(gate, "consent.signInFirst");
   } else if (incrementalConsentApproved && !(repairNeeded && hostedSignInRequired())) {
     forgetLocalizedNode(gate);
     gate.textContent = "";
@@ -13053,6 +13304,7 @@ function renderIncrementalConsent() {
   }
   renderIncrementalSyncStatusLine();
   renderIncrementalSyncRetry();
+  renderAttributionContribution();
 }
 
 /**
@@ -13076,6 +13328,11 @@ function renderIncrementalSyncStatusLine() {
     forgetLocalizedNode(line);
     line.textContent = "";
     line.hidden = true;
+    return;
+  }
+  if (incrementalSyncStatus.pausedReason === "device_repair_required") {
+    setLocalizedText(line, "consent.repairRequired");
+    line.hidden = false;
     return;
   }
   // The transparent re-pair state renders as the routine it is — an
@@ -13175,6 +13432,7 @@ function renderIncrementalSyncRetry() {
     && incrementalConsentApproved
     && status?.status === "available"
     && !incrementalGrantRejected()
+    && status.pausedReason !== "device_repair_required"
     && !contributionDeviceDisconnectPaused();
   button.hidden = !visible;
   if (!visible) {
@@ -13195,7 +13453,8 @@ function hideIncrementalSyncRetryNote() {
 
 async function runIncrementalSyncNow() {
   if (incrementalSyncRetryBusy || contributionDisconnectBusy
-      || contributionDisconnectDialogOpen() || contributionDeviceDisconnectPaused()) return;
+      || contributionDisconnectDialogOpen() || contributionDeviceDisconnectPaused()
+      || incrementalSyncStatus?.pausedReason === "device_repair_required") return;
   incrementalSyncRetryBusy = true;
   hideIncrementalSyncRetryNote();
   renderIncrementalSyncRetry();
@@ -13450,6 +13709,10 @@ async function recordFreshLocalContributionApproval(
  * failure, because nothing the user did failed.
  */
 async function approveIncrementalContribution() {
+  if (attributionContributionSelected()) {
+    await openAttributionContributionReview();
+    return;
+  }
   if (incrementalConsentBusy || communityConnectBusy
       || contributionDisconnectBusy || contributionDisconnectDialogOpen()
       || contributionDisconnectOutcome === "cleanup_pending"
@@ -13477,9 +13740,9 @@ async function approveIncrementalContribution() {
     return;
   }
   incrementalConsentBusy = true;
-  if (contributionDeviceDisconnectPaused()) {
-    // This function is reached only by an explicit approval after disconnect;
-    // both silent repair entrypoints refuse the durable disconnect pause.
+  if (contributionDeviceDisconnectPaused() || incrementalSyncStatus?.pausedReason === "device_repair_required") {
+    // Explicit reconnect must replace any remembered pairing. Silent repair
+    // entrypoints refuse both disconnect and uncertain-rotation pauses.
     communityDevicePaired = false;
     communityDevicePairedV1 = false;
   }
@@ -13693,6 +13956,8 @@ async function mintDevicePairingWithCookieCommitRetry() {
  * failure or ask again.
  */
 function maybeRepairIncrementalAuthorization() {
+  if (attributionContributionSelected()) return;
+  if (incrementalSyncStatus?.pausedReason === "device_repair_required") return;
   if (contributionDisconnectBlocksRepair()) return;
   if (incrementalRepairAttempted) return;
   if (incrementalConsentBusy || communityConnectBusy) return;
@@ -13713,6 +13978,11 @@ function maybeRepairIncrementalAuthorization() {
  * Review-and-approve action.
  */
 function resumeContributionCeremonyAfterSignIn() {
+  if (attributionContributionSelected()) {
+    renderAttributionContribution();
+    return;
+  }
+  if (incrementalSyncStatus?.pausedReason === "device_repair_required") return;
   if (contributionDisconnectBlocksRepair()) return;
   if (!incrementalSyncCapabilityAdvertised()) return;
   if (!incrementalConsentApproved || !incrementalUploadAuthorityLost()) return;
@@ -14367,6 +14637,17 @@ $("#incremental-copy-diagnostics").addEventListener("click", () => {
 $("#incremental-consent-approve").addEventListener("click", () => {
   void approveIncrementalContribution();
 });
+$("#attribution-review-open")?.addEventListener("click", () => { void openAttributionContributionReview(); });
+$("#attribution-consent-confirm")?.addEventListener("change", renderAttributionContribution);
+$("#attribution-consent-approve")?.addEventListener("click", () => { void approveAttributionContribution(); });
+$("#attribution-review-cancel")?.addEventListener("click", () => {
+  if (attributionContributionBusy) return;
+  attributionContributionReview = null;
+  attributionContributionNotice = null;
+  $("#attribution-consent-confirm").checked = false;
+  renderAttributionContribution();
+  $("#attribution-review-open").focus();
+});
 $("#incremental-sync-retry").addEventListener("click", () => {
   void runIncrementalSyncNow();
 });
@@ -14606,6 +14887,16 @@ $("#weekly-range-controls").addEventListener("click", (event) => {
   // renderWeekly itself re-renders the share card from the same model
   // (owner-verified regression, 2026-08-08), so a control cannot redraw the
   // chart while leaving the card on the previous filters.
+  renderWeekly(dashboard);
+});
+$("#weekly-plan-select")?.addEventListener("change", (event) => {
+  if (!dashboard || !dashboard.weekly.planPopulations.some(
+    (population) => population.planType === event.target.value,
+  )) return;
+  activeWeeklyPlanType = event.target.value;
+  timelineSeriesMemo = null;
+  renderComparison(dashboard);
+  renderTimeline(dashboard);
   renderWeekly(dashboard);
 });
 $("#weekly-span-control").addEventListener("input", (event) => {

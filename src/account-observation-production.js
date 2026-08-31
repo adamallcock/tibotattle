@@ -24,10 +24,12 @@ export function selectProductionAccountObservationSecret({
   operationLockFile = defaultAccountObservationOperationLockFile(),
   createKeychainBackend = createExportIdentityKeychainBackend,
   keychainCapability = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation,
+  createIfMissing = true,
   developmentSecret = null,
   windowsReadiness = null,
   createWindowsBackend = null,
 } = {}) {
+  if (typeof createIfMissing !== "boolean") fail("ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_INVALID");
   if (developmentSecret !== null) {
     return Object.freeze({
       mode: "injected_development_secret",
@@ -57,6 +59,7 @@ export function selectProductionAccountObservationSecret({
           backend,
           capability: keychainCapability,
           operationLockFile,
+          createIfMissing,
         }),
       });
     } catch {
@@ -82,6 +85,7 @@ export function selectProductionAccountObservationSecret({
       backend,
       capability: keychainCapability,
       operationLockFile,
+      createIfMissing,
     }),
   });
 }

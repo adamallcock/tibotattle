@@ -2859,12 +2859,16 @@ test("a bounded continuation keeps the early headline and skips deep accounting"
   let rebuilds = 0;
   const progress = [];
   const collectorOptions = [];
+  const readAccountAttributionBinding = async () => ({
+    destinationOrigin: "https://telemetry.example", enrollmentNamespace: "synthetic_enrollment_0001",
+  });
   const earlyPausedIndex = {
     ...PAUSED_INDEX,
     filesProcessed: 1,
     recordsWritten: 2,
   };
   const runner = createLocalCollectorRefreshRunner({
+    readAccountAttributionBinding,
     selectAccountObservationSecret: () => ({
       loadAccountObservationSecret: null,
     }),
@@ -2915,6 +2919,8 @@ test("a bounded continuation keeps the early headline and skips deep accounting"
   assert.equal(cacheReads, 0);
   assert.equal(rebuilds, 0);
   assert.equal(collectorOptions.length, 2);
+  assert.equal(collectorOptions[0].readAccountAttributionBinding, readAccountAttributionBinding);
+  assert.equal(collectorOptions[1].readAccountAttributionBinding, readAccountAttributionBinding);
   assert.equal(
     collectorOptions[0].maximumRecentRunBytes,
     128 * 1024 * 1024,

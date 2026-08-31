@@ -1,0 +1,452 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://tibotattle.com/schemas/telemetry-contribution-v1.1/quota-observation.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "observationId",
+    "observedTime",
+    "provider",
+    "planType",
+    "planVariant",
+    "limitId",
+    "slot",
+    "usedPercent",
+    "windowDurationMinutes",
+    "resetsAt",
+    "accountPlanAttribution"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "quota-observation-v1.1"
+    },
+    "observationId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{8,128}$"
+    },
+    "observedTime": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+    },
+    "provider": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,64}$"
+    },
+    "planType": {
+      "enum": [
+        "free",
+        "go",
+        "plus",
+        "pro",
+        "prolite",
+        "team",
+        "self_serve_business_prolite",
+        "self_serve_business_usage_based",
+        "business",
+        "ent26",
+        "enterprise_cbp_automation",
+        "enterprise_cbp_usage_based",
+        "enterprise",
+        "edu",
+        "edu_plus",
+        "edu_pro",
+        "unknown"
+      ]
+    },
+    "planVariant": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,64}$"
+    },
+    "limitId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,64}$"
+    },
+    "slot": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,64}$"
+    },
+    "usedPercent": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        }
+      ]
+    },
+    "windowDurationMinutes": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 527040
+        }
+      ]
+    },
+    "resetsAt": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$"
+        }
+      ]
+    },
+    "accountPlanAttribution": {
+      "$ref": "https://tibotattle.com/schemas/telemetry-contribution-v1.1/account-plan-attribution.schema.json"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "free"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "properties": {
+              "planType": {
+                "const": "free"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "go"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "properties": {
+              "planType": {
+                "const": "go"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "plus"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "properties": {
+              "planType": {
+                "const": "plus"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "pro"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "properties": {
+              "planType": {
+                "const": "pro"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "prolite"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "properties": {
+              "planType": {
+                "const": "prolite"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "team"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "properties": {
+              "planType": {
+                "const": "team"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "self_serve_business_prolite"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "properties": {
+              "planType": {
+                "const": "self_serve_business_prolite"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "self_serve_business_usage_based"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "properties": {
+              "planType": {
+                "const": "self_serve_business_usage_based"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "business"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "properties": {
+              "planType": {
+                "const": "business"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "ent26"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "properties": {
+              "planType": {
+                "const": "ent26"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "enterprise_cbp_automation"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "properties": {
+              "planType": {
+                "const": "enterprise_cbp_automation"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "enterprise_cbp_usage_based"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "properties": {
+              "planType": {
+                "const": "enterprise_cbp_usage_based"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "enterprise"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "properties": {
+              "planType": {
+                "const": "enterprise"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "edu"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "properties": {
+              "planType": {
+                "const": "edu"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "edu_plus"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "properties": {
+              "planType": {
+                "const": "edu_plus"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "edu_pro"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "properties": {
+              "planType": {
+                "const": "edu_pro"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "planType": {
+            "const": "unknown"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "accountPlanAttribution": {
+            "properties": {
+              "planType": {
+                "const": "unknown"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

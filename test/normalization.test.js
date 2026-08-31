@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   codexAppServerChildEnv,
+  sanitizeBracketedCodexAccountSnapshotWithSecretLoader,
   sanitizeCodexAccountSnapshot,
   sanitizeCodexAccountSnapshotWithSecretLoader,
 } from "../src/providers/codex/account.js";
@@ -134,6 +135,80 @@ test("locked, denied, and malformed credential loads remain safely unattributed"
     });
     assert.equal(JSON.stringify(result).includes("DO-NOT-LEAK"), false);
   }
+});
+
+test("bracketed account sanitation uses one disposable root lease and preserves only matching account/plan evidence", async () => {
+  const account = { account: { email: "bracket.fixture@example.test", planType: "pro" } };
+  const snapshot = {
+    accountBefore: account,
+    accountAfter: { account: { email: "BRACKET.FIXTURE@example.test", planType: "pro" } },
+    rateLimits: { rateLimits: {
+      limitId: "codex", planType: "pro",
+      primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 123 },
+    } },
+    accountUsage: { dailyUsageBuckets: [{ startDate: "2026-07-23", tokens: 10 }] },
+  };
+  const disposable = Buffer.alloc(32, 77);
+  let loads = 0;
+  const result = await sanitizeBracketedCodexAccountSnapshotWithSecretLoader(snapshot, "2026-07-23T00:00:00.000Z", {
+    loadAccountObservationSecret: async () => { loads += 1; return disposable; },
+  });
+  assert.equal(loads, 1);
+  assert.deepEqual(disposable, Buffer.alloc(32));
+  assert.equal(result.accountScope.status, "available");
+  assert.equal(result.accountScope.planType, "pro");
+  assert.equal(result.canonical.primary.usedPercent, 25);
+  assert.deepEqual(result.officialDailyTokens, [{ date: "2026-07-23", tokens: 10 }]);
+  assert.equal(JSON.stringify(result).includes("fixture@example.test"), false);
+
+  const conflicts = [
+    { accountBefore: null },
+    { accountAfter: null },
+    { accountAfter: { account: { email: "different.fixture@example.test", planType: "pro" } } },
+    { accountBefore: { account: { email: "bracket.fixture@example.test", planType: "plus" } } },
+    { accountAfter: { account: { email: "bracket.fixture@example.test", planType: "plus" } } },
+    { rateLimits: { rateLimits: { ...snapshot.rateLimits.rateLimits, planType: "plus" } } },
+    { rateLimits: {
+      ...snapshot.rateLimits,
+      rateLimitsByLimitId: { codex_bengalfox: { ...snapshot.rateLimits.rateLimits, limitId: "codex_bengalfox", planType: "plus" } },
+    } },
+  ];
+  for (const conflict of conflicts) {
+    const result = await sanitizeBracketedCodexAccountSnapshotWithSecretLoader({ ...snapshot, ...conflict }, "2026-07-23T00:00:00.000Z", {
+      loadAccountObservationSecret: async () => Buffer.alloc(32, 77),
+    });
+    assert.equal(result.accountScope.status, "unavailable");
+    assert.equal(result.accountScope.scopeId, null);
+    assert.equal(result.canonical.primary.usedPercent, 25, "account uncertainty must not discard the quota evidence");
+    assert.deepEqual(result.officialDailyTokens, [{ date: "2026-07-23", tokens: 10 }]);
+    assert.equal(JSON.stringify(result).includes("fixture@example.test"), false);
+  }
+});
+
+test("bracketed account sanitation preserves credential recovery status and zeroes the lease on malformed quota input", async () => {
+  const account = { account: { email: "safe.fixture@example.test", planType: "pro" } };
+  const snapshot = {
+    accountBefore: account, accountAfter: account,
+    rateLimits: { rateLimits: { limitId: "codex", planType: "pro", primary: { usedPercent: 3, windowDurationMins: 300 } } },
+    accountUsage: null,
+  };
+  for (const [code, reason] of [
+    ["account_observation_credential_locked", "credential_locked"],
+    ["account_observation_credential_migration_required", "credential_migration_required"],
+    ["account_observation_credential_unavailable", "credential_unavailable"],
+  ]) {
+    const result = await sanitizeBracketedCodexAccountSnapshotWithSecretLoader(snapshot, "2026-07-23T00:00:00.000Z", {
+      loadAccountObservationSecret: async () => { const error = new Error("DO-NOT-LEAK"); error.code = code; throw error; },
+    });
+    assert.equal(result.accountScope.status, "unavailable");
+    assert.equal(result.accountScope.reason, reason);
+    assert.equal(JSON.stringify(result).includes("DO-NOT-LEAK"), false);
+  }
+  const disposable = Buffer.alloc(32, 79);
+  await assert.rejects(() => sanitizeBracketedCodexAccountSnapshotWithSecretLoader({ ...snapshot, rateLimits: {} }, "2026-07-23T00:00:00.000Z", {
+    loadAccountObservationSecret: async () => disposable,
+  }), /canonical rate-limit snapshot/u);
+  assert.deepEqual(disposable, Buffer.alloc(32));
 });
 
 test("ccusage summary keeps token categories disjoint", () => {

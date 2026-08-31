@@ -189,6 +189,92 @@ function resetTransitions({
   });
 }
 
+test("mixed-plan summaries retain legacy evidence without pooling plan medians", () => {
+  const reset = Math.floor(Date.parse("2026-08-20T00:00:00.000Z") / 1_000);
+  const pro = resetTransitions({ reset, capacityUsd: 1_600, accountScopeId: "unattributed" });
+  const plus = resetTransitions({ reset: reset + 604_800, capacityUsd: 80, accountScopeId: "unattributed" })
+    .map((row) => ({ ...row, planType: "plus", planVariant: "unknown" }));
+  const result = projectBoundedWeeklyCalibrationSummary(dataset([...pro, ...plus]));
+  assert.equal(result.selectedPlanType, "plus");
+  assert.equal(result.estimate.medianApiPriceEquivalentUsd, 80);
+  assert.deepEqual(result.planPopulations.map((row) => [
+    row.planType, row.estimate.medianApiPriceEquivalentUsd,
+  ]), [["plus", 80], ["pro", 1_600]]);
+  assert.ok(result.recentResets.every((row) => row.planType === "plus"));
+  assert.equal(result.planAttribution.accountVerified, false);
+  const selectedPro = projectBoundedWeeklyCalibrationSummary(dataset([...pro, ...plus]), { planType: "pro" });
+  assert.equal(selectedPro.estimate.medianApiPriceEquivalentUsd, 1_600);
+});
+
+test("a newly observed plan without a fit never borrows an older plan's headline", () => {
+  const reset = Math.floor(Date.parse("2026-08-20T00:00:00.000Z") / 1_000);
+  const input = dataset(resetTransitions({ reset }));
+  input.attribution = { latestPlanType: "plus", planTypes: ["pro", "plus"] };
+  const result = projectBoundedWeeklyCalibrationSummary(input);
+  assert.equal(result.selectedPlanType, "plus");
+  assert.equal(result.estimate, null);
+  assert.equal(result.status, "insufficient_evidence");
+  assert.equal(result.planPopulations.find((row) => row.planType === "pro").estimate.medianApiPriceEquivalentUsd, 600);
+});
+
+test("returning plan-era fragments cannot multiply one reset's primary votes", () => {
+  const reset = Math.floor(Date.parse("2026-08-20T00:00:00.000Z") / 1_000);
+  const first = resetTransitions({ reset, capacityUsd: 800 }).slice(0, 12)
+    .map((row) => ({ ...row, planEraKey: "pro:first", aggregationEligibility: "primary_conditional" }));
+  const returned = resetTransitions({ reset, capacityUsd: 600 }).map((row) => ({
+    ...row, planEraKey: "pro:return", aggregationEligibility: "primary_conditional",
+    eventTime: new Date(Date.parse(row.eventTime) + 3_600_000).toISOString(),
+    lastPriorObservedAt: new Date(Date.parse(row.lastPriorObservedAt) + 3_600_000).toISOString(),
+    firstNextObservedAt: new Date(Date.parse(row.firstNextObservedAt) + 3_600_000).toISOString(),
+  }));
+  const report = analyzeWeeklyCalibration(dataset([...first, ...returned]));
+  assert.equal(report.weeklyValueSummary.resetCount, 1);
+  assert.equal(report.weeklyValueSummary.medianApiPriceEquivalentUsd, 600);
+  assert.equal(report.resetValues[0].planEraKey, "pro:return");
+  const excluded = report.fragmentDiagnostics.find((row) => (
+    row.planEraKey === "pro:first" && row.candidateId === "standard_api"
+  ));
+  assert.equal(excluded.reason, "another_qualifying_fragment_represents_reset");
+  assert.equal(excluded.apiPriceEquivalentUsd, 800);
+  assert.ok(excluded.observedSpanPercentagePoints > 0);
+  assert.ok(excluded.uniqueBoundaries > 0);
+  const selection = report.quality.fragmentSelection.find((row) => row.candidateId === "standard_api");
+  assert.deepEqual(selection.primary, {
+    count: 1, medianApiPriceEquivalentUsd: 600,
+    central80ApiPriceEquivalentUsd: { lower: 600, upper: 600 },
+  });
+  assert.deepEqual(selection.diagnosticOnly, {
+    count: 1, medianApiPriceEquivalentUsd: 800,
+    central80ApiPriceEquivalentUsd: { lower: 800, upper: 800 },
+  });
+  assert.match(renderWeeklyCalibrationReport(report),
+    /\| standard_api \| 1 \| \$600\.00 \| 1 \| \$800\.00 \|/);
+  // Diagnostics cannot become a second vote or enter the bounded headline DTO.
+  const summary = projectBoundedWeeklyCalibrationSummary(dataset([...first, ...returned]));
+  assert.equal(summary.estimate.qualifyingResets, 1);
+  assert.equal(summary.estimate.medianApiPriceEquivalentUsd, 600);
+  assert.equal(Object.hasOwn(summary, "fragmentDiagnostics"), false);
+});
+
+test("fragment selection reports absent diagnostics as unavailable rather than zero capacity", () => {
+  const reset = Math.floor(Date.parse("2026-08-20T00:00:00.000Z") / 1_000);
+  const report = analyzeWeeklyCalibration(dataset(resetTransitions({ reset })));
+  const selection = report.quality.fragmentSelection.find((row) => row.candidateId === "standard_api");
+  assert.deepEqual(selection.diagnosticOnly, {
+    count: 0, medianApiPriceEquivalentUsd: null,
+    central80ApiPriceEquivalentUsd: { lower: null, upper: null },
+  });
+});
+
+test("mixed unscoped composition never escapes as a selected-plan vector", () => {
+  const input = { transitions: [], attribution: { latestPlanType: "pro", planTypes: ["plus", "pro"] } };
+  const result = projectBoundedWeeklyCalibrationSummary(input, {
+    composition: { status: "fitted", capacityUsdByModel: { "gpt-5": 200 }, observationCount: 100 },
+  });
+  assert.equal(result.composition, null);
+  assert.ok(result.planPopulations.every((population) => population.composition === null));
+});
+
 test("weekly reset provenance preserves mixed historical card windows", () => {
   const reset = Math.floor(Date.parse("2026-08-03T00:00:00.000Z") / 1_000);
   const preChangeId = "openai:gpt-5.6-terra:standard:short-through-2026-07-29:official-observed-2026-08-30";

@@ -612,6 +612,12 @@ const SECONDARY_INDEX_SCHEMA = `
     ON usage_event(session_local);
   CREATE INDEX IF NOT EXISTS usage_event_source
     ON usage_event(source_local);
+  CREATE INDEX IF NOT EXISTS usage_event_source_predecessor
+    ON usage_event(source_local, source_offset, observed_at_ms,
+                   source_ordinal, session_local);
+  CREATE INDEX IF NOT EXISTS usage_event_session_predecessor
+    ON usage_event(session_local, observed_at_ms, source_local,
+                   source_ordinal);
   CREATE INDEX IF NOT EXISTS usage_event_quota_observation
     ON usage_event(quota_observation_id);
   CREATE INDEX IF NOT EXISTS usage_event_boundary_session
@@ -634,6 +640,8 @@ const SECONDARY_INDEX_NAMES = Object.freeze([
   "usage_event_observed",
   "usage_event_session",
   "usage_event_source",
+  "usage_event_source_predecessor",
+  "usage_event_session_predecessor",
   "usage_event_quota_observation",
   "usage_event_boundary_session",
   "usage_event_replay_order",
@@ -641,6 +649,13 @@ const SECONDARY_INDEX_NAMES = Object.freeze([
   "quota_occurrence_replay_order",
   "tool_class_fact_generation",
   "tool_class_fact_source",
+]);
+// These accelerators add no fields or admission semantics. Existing v11 files
+// remain readable without them; writable initialization and staged publication
+// add them transactionally without changing the format/minimum reader version.
+const COMPATIBLE_READER_INDEX_NAMES = new Set([
+  "usage_event_source_predecessor",
+  "usage_event_session_predecessor",
 ]);
 
 function fixedError(code) {
@@ -1040,13 +1055,16 @@ function schemaSql({ deferSecondaryIndexes = false } = {}) {
     : `${SCHEMA}\n${SECONDARY_INDEX_SCHEMA}`;
 }
 
-function assertSecondaryIndexes(database) {
-  const placeholders = SECONDARY_INDEX_NAMES.map(() => "?").join(", ");
+function assertSecondaryIndexes(database, { allowMissingCompatible = false } = {}) {
+  const requiredNames = allowMissingCompatible
+    ? SECONDARY_INDEX_NAMES.filter((name) => !COMPATIBLE_READER_INDEX_NAMES.has(name))
+    : SECONDARY_INDEX_NAMES;
+  const placeholders = requiredNames.map(() => "?").join(", ");
   const present = new Set(database.prepare(
     `SELECT name FROM sqlite_master
      WHERE type = 'index' AND name IN (${placeholders})`,
-  ).all(...SECONDARY_INDEX_NAMES).map((row) => row.name));
-  const missing = SECONDARY_INDEX_NAMES.filter((name) => !present.has(name));
+  ).all(...requiredNames).map((row) => row.name));
+  const missing = requiredNames.filter((name) => !present.has(name));
   if (missing.length > 0) {
     throw fixedError("local_unified_index_secondary_indexes_missing");
   }
@@ -1401,7 +1419,9 @@ function validateDatabase(database, {
       || (current && !compatibilityCurrent)) {
     throw fixedError("local_unified_index_schema_invalid");
   }
-  if (current && !deferSecondaryIndexes) assertSecondaryIndexes(database);
+  if (current && !deferSecondaryIndexes) {
+    assertSecondaryIndexes(database, { allowMissingCompatible: readOnly });
+  }
   return {
     ...compatibility,
     schemaVersion: schema?.value ?? null,

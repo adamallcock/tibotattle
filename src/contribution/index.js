@@ -1,8 +1,13 @@
 export {
   TELEMETRY_ACCOUNT_TRACK_VERSION,
+  TELEMETRY_ACCOUNT_TRACK_V2_VERSION,
   UNATTRIBUTED_ACCOUNT_TRACK_ID,
   deriveTelemetryAccountTrackId,
+  deriveTelemetryAccountTrackIdV2,
+  deriveTelemetryPlanEraIdV1,
+  sanitizeTelemetryAttributionBinding,
   isTelemetryAccountTrackId,
+  isTelemetryAccountTrackIdV2,
 } from "./account-track.js";
 export {
   MAX_PREPARED_CONTRIBUTION_BATCHES,
@@ -33,3 +38,13 @@ export {
   validateTelemetryContributionDatasetV02,
   validateTelemetryContributionV02,
 } from "./telemetry-v02-projection.js";
+export {
+  createTelemetryV11Day,
+  deriveTelemetryV11Attribution,
+  deriveTelemetryV11QuotaOccurrenceId,
+  telemetryV11FieldInventory,
+} from "./telemetry-v11-chunks.js";
+export {
+  readTelemetryV11Capabilities,
+  runTelemetryV11Sync,
+} from "./telemetry-v11-sync.js";

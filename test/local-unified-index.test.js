@@ -374,7 +374,11 @@ async function abortWhenStageGenerationFinalizes(
   while (Date.now() < deadline) {
     let database = null;
     try {
-      database = openLocalUnifiedIndex(stageFile, { readOnly: true });
+      // This is a test-only observer of an already-known synthetic stage, not
+      // a production index reader. Never wait synchronously for its exclusive
+      // writer: that writer needs this event loop to finish and close. A busy
+      // stage is retried after yielding, within the same bounded deadline.
+      database = new DatabaseSync(stageFile, { readOnly: true, timeout: 0 });
       const status = database.prepare(`
         SELECT status FROM index_generation
         ORDER BY id DESC LIMIT 1`).get()?.status ?? null;
@@ -685,6 +689,8 @@ const SECONDARY_INDEX_NAMES = [
   "usage_event_observed",
   "usage_event_session",
   "usage_event_source",
+  "usage_event_source_predecessor",
+  "usage_event_session_predecessor",
   "usage_event_quota_observation",
   "usage_event_boundary_session",
   "usage_event_replay_order",
@@ -956,6 +962,69 @@ test("deferred secondary indexes preserve logical facts and are present before p
     assert.deepEqual(rebuilt.secondaryIndexes, [...SECONDARY_INDEX_NAMES].sort());
     assert.deepEqual(rebuilt.aggregate, online.aggregate);
     assert.deepEqual(rebuilt.logical, online.logical);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("v11 predecessor indexes are additive writable maintenance and read-only opens preserve older v11 files", async () => {
+  const { root } = await corpus({
+    "rollout-2026-07-25T00-00-00-attribution-index.jsonl": [
+      sessionMeta("session-attribution-index"),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol"),
+      tokenCount(
+        "2026-07-25T00:00:01.000Z",
+        usage(100, 10),
+        usage(100, 10),
+        { usedPercent: 12 },
+      ),
+    ],
+  });
+  const indexFile = join(root, "index.sqlite");
+  const compatibleIndexNames = [
+    "usage_event_source_predecessor", "usage_event_session_predecessor",
+  ];
+  try {
+    await build(root);
+    const old = openLocalUnifiedIndex(indexFile);
+    const facts = logicalProjection(old);
+    const generation = readUnifiedIndexGenerationDescriptor(old);
+    assert.deepEqual(secondaryIndexNames(old), [...SECONDARY_INDEX_NAMES].sort());
+    assert.equal(Number(old.prepare("PRAGMA user_version").get().user_version), 11);
+    old.exec(`
+      DROP INDEX usage_event_source_predecessor;
+      DROP INDEX usage_event_session_predecessor;
+    `);
+    old.close();
+    const bytesBefore = await readFile(indexFile);
+    const readOnly = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    try {
+      assert.deepEqual(logicalProjection(readOnly), facts);
+      assert.deepEqual(readUnifiedIndexGenerationDescriptor(readOnly), generation);
+      assert.deepEqual(secondaryIndexNames(readOnly), SECONDARY_INDEX_NAMES
+        .filter((name) => !compatibleIndexNames.includes(name)).sort());
+    } finally {
+      readOnly.close();
+    }
+    assert.deepEqual(await readFile(indexFile), bytesBefore,
+      "a read-only open must not create compatible accelerators in the live file");
+
+    const upgraded = openLocalUnifiedIndex(indexFile);
+    try {
+      assert.deepEqual(secondaryIndexNames(upgraded), [...SECONDARY_INDEX_NAMES].sort());
+      assert.deepEqual(logicalProjection(upgraded), facts);
+      assert.deepEqual(readUnifiedIndexGenerationDescriptor(upgraded), generation);
+      assert.equal(Number(upgraded.prepare("PRAGMA user_version").get().user_version), 11);
+      assert.deepEqual(Object.fromEntries(upgraded.prepare(`
+        SELECT key, value FROM meta WHERE key LIKE 'compatibility_%'
+      `).all().map((row) => [row.key, row.value])), {
+        compatibility_format_user_version: "11",
+        compatibility_minimum_reader_user_version: "11",
+        compatibility_minimum_writer_user_version: "11",
+      });
+    } finally {
+      upgraded.close();
+    }
   } finally {
     await rm(root, { recursive: true });
   }
@@ -3819,6 +3888,45 @@ test("a recovery lock acquired during target validation blocks staged publicatio
   }
 });
 
+test("the finalized-stage observer yields to an exclusive writer on the same event loop", async () => {
+  const { root } = await corpus({});
+  const indexFile = join(root, "index.sqlite");
+  const stageFile = join(root, "finalized-stage.sqlite");
+  let writer = null;
+  let released = null;
+  try {
+    await build(root);
+    await copyFile(indexFile, stageFile);
+    writer = new DatabaseSync(stageFile);
+    writer.exec("BEGIN EXCLUSIVE");
+    released = new Promise((resolve, reject) => {
+      setImmediate(() => {
+        try {
+          writer.exec("COMMIT");
+          writer.close();
+          writer = null;
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    const controller = new AbortController();
+    // The observer's existing two-second deadline must include contention.
+    // A synchronous five-second busy wait prevents the queued COMMIT above
+    // from running, so the old probe fails this deterministically.
+    const status = await abortWhenStageGenerationFinalizes(stageFile, controller);
+    await released;
+    assert.equal(status, "complete");
+    assert.equal(controller.signal.aborted, true);
+    assert.equal(writer, null);
+  } finally {
+    await released?.catch(() => {});
+    if (writer?.isOpen) writer.close();
+    await rm(root, { recursive: true });
+  }
+});
+
 test("an abort during incremental close cannot publish its finalized stage", async () => {
   const { root, sessions } = await corpus({
     "rollout-2026-07-25T00-00-00-late-incremental-abort.jsonl": [
@@ -4036,6 +4144,8 @@ test("a version-1 index can be opened through the additive v11 schema migration"
         DROP TABLE session_identity;
         DROP TABLE usage_event_boundary;
         DROP INDEX usage_event_replay_order;
+        DROP INDEX usage_event_source_predecessor;
+        DROP INDEX usage_event_session_predecessor;
         UPDATE usage_event SET source_id = NULL, source_offset = NULL;
         ALTER TABLE usage_event DROP COLUMN source_offset;
         ALTER TABLE usage_event DROP COLUMN source_id;
