@@ -374,7 +374,11 @@ async function abortWhenStageGenerationFinalizes(
   while (Date.now() < deadline) {
     let database = null;
     try {
-      database = openLocalUnifiedIndex(stageFile, { readOnly: true });
+      // This is a test-only observer of an already-known synthetic stage, not
+      // a production index reader. Never wait synchronously for its exclusive
+      // writer: that writer needs this event loop to finish and close. A busy
+      // stage is retried after yielding, within the same bounded deadline.
+      database = new DatabaseSync(stageFile, { readOnly: true, timeout: 0 });
       const status = database.prepare(`
         SELECT status FROM index_generation
         ORDER BY id DESC LIMIT 1`).get()?.status ?? null;
@@ -3880,6 +3884,45 @@ test("a recovery lock acquired during target validation blocks staged publicatio
     assert.deepEqual(await readFile(indexFile), publishedBefore);
     assert.deepEqual(await readFile(stageFile), publishedBefore);
   } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("the finalized-stage observer yields to an exclusive writer on the same event loop", async () => {
+  const { root } = await corpus({});
+  const indexFile = join(root, "index.sqlite");
+  const stageFile = join(root, "finalized-stage.sqlite");
+  let writer = null;
+  let released = null;
+  try {
+    await build(root);
+    await copyFile(indexFile, stageFile);
+    writer = new DatabaseSync(stageFile);
+    writer.exec("BEGIN EXCLUSIVE");
+    released = new Promise((resolve, reject) => {
+      setImmediate(() => {
+        try {
+          writer.exec("COMMIT");
+          writer.close();
+          writer = null;
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    const controller = new AbortController();
+    // The observer's existing two-second deadline must include contention.
+    // A synchronous five-second busy wait prevents the queued COMMIT above
+    // from running, so the old probe fails this deterministically.
+    const status = await abortWhenStageGenerationFinalizes(stageFile, controller);
+    await released;
+    assert.equal(status, "complete");
+    assert.equal(controller.signal.aborted, true);
+    assert.equal(writer, null);
+  } finally {
+    await released?.catch(() => {});
+    if (writer?.isOpen) writer.close();
     await rm(root, { recursive: true });
   }
 });
