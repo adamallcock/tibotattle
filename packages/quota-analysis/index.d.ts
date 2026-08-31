@@ -388,3 +388,106 @@ export function analyzeQuotaPace(input: {
   currentSnapshot: QuotaPaceSnapshotInput;
   observations: readonly QuotaPaceSnapshotInput[];
 }): QuotaPaceForecast;
+
+// ---------------------------------------------------------------------------
+// Model-composition kernel (src/model-composition.js)
+// ---------------------------------------------------------------------------
+
+export interface CompositionUsageRow {
+  /** Epoch milliseconds of the priced usage (any grain; only bin sums matter). */
+  observedAtMs: number;
+  model: string;
+  costUsd: number;
+}
+
+export interface CompositionQuotaRow {
+  /** Epoch milliseconds of the weekly-window reading. */
+  observedAtMs: number;
+  planType: string;
+  /** Epoch milliseconds of the pool's printed expiry. */
+  resetsAtMs: number;
+  /** Displayed 0-100 gauge value. */
+  usedPercent: number;
+}
+
+export interface CompositionObservation {
+  binStartMs: number;
+  poolKey: string;
+  segmentIndex: number;
+  ppDelta: number;
+  costByModel: Readonly<Record<string, number>>;
+}
+
+export interface CompositionObservationCorpus {
+  observations: CompositionObservation[];
+  voidedBinCount: number;
+  poolCount: number;
+}
+
+export interface CompositionIdentification {
+  adjustedR2: number | null;
+  singleConstantAdjustedR2: number | null;
+  splitHalfIdentified: boolean;
+  splitHalfMaxCapacityDriftFraction: number | null;
+}
+
+export type CompositionFitStatus =
+  | "fitted"
+  | "fallback_blended"
+  | "insufficient_observations";
+
+export interface CompositionFit {
+  status: CompositionFitStatus;
+  observationCount: number;
+  totalCostUsd: number | null;
+  modelCostShares: Readonly<Record<string, number>>;
+  /** Null unless status is "fitted". */
+  capacityUsdByModel: Readonly<Record<string, number>> | null;
+  singleConstantUsd: number | null;
+  r2: number | null;
+  singleConstantR2: number | null;
+  solverConverged: boolean | null;
+  identification: CompositionIdentification | null;
+}
+
+export const MODEL_COMPOSITION_POLICY: Readonly<{
+  grainMs: number;
+  poolToleranceMs: number;
+  resetDropPp: number;
+  maxCrossingElapsedMs: number;
+  minimumModelCostShare: number;
+  minimumObservations: number;
+  otherModelKey: string;
+  maxSplitHalfCapacityDriftFraction: number;
+}>;
+
+export function buildCompositionObservations(
+  input?: {
+    usageRows?: readonly CompositionUsageRow[];
+    quotaRows?: readonly CompositionQuotaRow[];
+  },
+  policy?: {
+    grainMs?: number;
+    poolToleranceMs?: number;
+    resetDropPp?: number;
+    maxCrossingElapsedMs?: number;
+  },
+): CompositionObservationCorpus;
+
+export function calibrateCompositionCapacities(
+  observations: readonly CompositionObservation[],
+  policy?: {
+    minimumModelCostShare?: number;
+    minimumObservations?: number;
+    otherModelKey?: string;
+    maxSplitHalfCapacityDriftFraction?: number;
+  },
+): CompositionFit;
+
+export function blendedCompositionCapacityUsd(
+  costByModel: Readonly<Record<string, number>>,
+  options: {
+    capacityUsdByModel: Readonly<Record<string, number>> | null;
+    fallbackCapacityUsd: number | null;
+  },
+): number | null;

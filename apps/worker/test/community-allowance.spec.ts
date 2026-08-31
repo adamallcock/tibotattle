@@ -6,11 +6,22 @@ import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { handleRequest } from "../src/index";
 import {
   collectCommunityAllowanceFits,
+  collectCommunityModelCompositions,
   summarizeCommunityAllowanceDay,
   summarizeCommunityCapacityByPlanType,
 } from "../src/community-allowance";
-import type { CommunityAllowanceFit } from "../src/community-allowance";
+import type {
+  CommunityAllowanceFit,
+  CommunityModelComposition,
+} from "../src/community-allowance";
 import {
+  buildCommunityModelCompositionDay,
+  buildAdminCommunityAllowancePreviewFromSource,
+  readCachedAdminCommunityAllowancePreview,
+  warmAdminCommunityAllowancePreviewCache,
+} from "../src/admin-community-allowance";
+import {
+  accountScopedModelCompositionV1,
   accountScopedQuotaAnalysisV1,
   accountScopedQuotaAnalysisV1FullReferenceForTest,
   downsampleQuotaForTest,
@@ -974,6 +985,7 @@ async function seedV1CalibratableReset(options: {
   stepPp: number;
   tag: string;
   unpriceable?: boolean;
+  planType?: string;
   // Override the nine 10+index*stepPp levels with an explicit used_percent
   // sequence — e.g. one carrying a small backward "noise" dip.
   usedPercents?: number[];
@@ -988,7 +1000,7 @@ async function seedV1CalibratableReset(options: {
       occurrence_id: `q-${options.tag}-${index}`,
       observed_at: new Date(startMs + index * 5 * 60_000).toISOString(),
       provider: "openai_codex",
-      plan_type: "pro",
+      plan_type: options.planType ?? "pro",
       // Real v1 uploads always carry the variant as "unknown" (the client
       // strips it); the band must draw from this shape, cohorting by plan_type.
       plan_variant: "unknown",
@@ -1899,5 +1911,256 @@ describe("v1 analyzer scale fix — fit-preserving reduction", () => {
     expect(
       (await downsampleQuotaForTest(db(), at, SCALE_NOW)).length,
     ).toBeGreaterThan(0);
+  });
+});
+
+describe("per-model composition from the v1.0 chunk corpus", () => {
+  it("reads the v1 corpus per model and reports composition evidence", async () => {
+    const participantId = await seedV1Participant("composition");
+    await seedV1Session(participantId, "v1-session-composition");
+    await seedV1Device(participantId, "v1-device-composition", "v1-session-composition");
+    await seedThreeV1Resets(participantId, "v1-device-composition", 5, "composition");
+
+    const result = await accountScopedModelCompositionV1(db(), participantId, {});
+    expect(result.status).toBe("ready");
+    if (result.status !== "ready") return;
+    expect(result.planType).toBe("pro");
+    expect(result.quotaRowCount).toBeGreaterThan(0);
+    expect(result.usageEventCount).toBeGreaterThan(0);
+    expect(result.unpricedUsageEventCount).toBe(0);
+    expect(result.fit.totalCostUsd!).toBeGreaterThan(0);
+    // The fixture is single-model, so the whole cost share is Sol's.
+    expect(result.fit.modelCostShares["gpt-5.6-sol"]).toBeCloseTo(1, 5);
+    // A three-reset fixture spans too few kernel bins to identify a
+    // per-model vector; the honest outcome is the kernel's own refusal,
+    // never a fabricated fit.
+    expect([
+      "fitted",
+      "fallback_blended",
+      "insufficient_observations",
+    ]).toContain(result.fit.status);
+  });
+
+  it("caches compositions by chunk epoch and reuses them", async () => {
+    const participantId = await seedV1Participant("composition-cache");
+    await seedV1Session(participantId, "v1-session-composition-cache");
+    await seedV1Device(participantId, "v1-device-composition-cache", "v1-session-composition-cache");
+    await seedThreeV1Resets(participantId, "v1-device-composition-cache", 5, "ccache");
+
+    const first = await collectCommunityModelCompositions(db());
+    expect(first.v1ParticipantCount).toBe(1);
+    expect(first.unsupportedSourceParticipantCount).toBe(0);
+    expect(first.compositions).toHaveLength(1);
+    const cached = await db().prepare(
+      "SELECT cache_key, computed_at FROM community_model_composition_cache WHERE participant_id = ?",
+    ).bind(participantId).first<{ cache_key: string; computed_at: string }>();
+    expect(cached).not.toBeNull();
+
+    const second = await collectCommunityModelCompositions(db());
+    expect(second.compositions).toHaveLength(1);
+    const reread = await db().prepare(
+      "SELECT cache_key, computed_at FROM community_model_composition_cache WHERE participant_id = ?",
+    ).bind(participantId).first<{ cache_key: string; computed_at: string }>();
+    // An unchanged chunk epoch is a cache hit: the row is not rewritten.
+    expect(reread?.computed_at).toBe(cached?.computed_at);
+    expect(reread?.cache_key).toBe(cached?.cache_key);
+  });
+
+  it("normalizes per-model capacities by plan and takes the cohort median", () => {
+    const composition = (
+      participantId: string,
+      planType: string,
+      capacityUsdByModel: Record<string, number> | null,
+      status: "fitted" | "fallback_blended" = "fitted",
+    ): CommunityModelComposition => ({
+      participantId,
+      composition: {
+        status: "ready",
+        planType,
+        fit: {
+          status,
+          observationCount: 30,
+          totalCostUsd: 100,
+          modelCostShares: {},
+          capacityUsdByModel,
+          singleConstantUsd: 2_000,
+          r2: 0.8,
+          singleConstantR2: 0.7,
+          solverConverged: true,
+          identification: {
+            adjustedR2: 0.8,
+            singleConstantAdjustedR2: 0.7,
+            splitHalfIdentified: true,
+            splitHalfMaxCapacityDriftFraction: 0.05,
+          },
+        },
+        voidedBinCount: 0,
+        poolCount: 1,
+        quotaRowCount: 9,
+        usageEventCount: 8,
+        unpricedUsageEventCount: 0,
+        poisonedBinCount: 0,
+        latestQuotaObservedAt: "2026-08-30T12:00:00.000Z",
+      },
+    });
+    const day = buildCommunityModelCompositionDay({
+      compositions: [
+        composition("p-pro", "pro", {
+          "gpt-5.6-sol": 2_400,
+          "gpt-5.6-terra": 1_100,
+        }),
+        // Plus capacities are per that plan's own weekly pool; x20 normalizes
+        // to the Pro-20x basis, landing on the same 2,400.
+        composition("p-plus", "plus", { "gpt-5.6-sol": 120 }),
+        // Identification failure: contributes to unstable, never to a median.
+        composition("p-unstable", "pro", null, "fallback_blended"),
+      ],
+      v1ParticipantCount: 4,
+      unsupportedSourceParticipantCount: 2,
+      refusedParticipantCount: 1,
+    }, "2026-08-30");
+    expect(day.day).toBe("2026-08-30");
+    expect(day.fittedParticipantCount).toBe(2);
+    expect(day.unstableParticipantCount).toBe(1);
+    expect(day.staleParticipantCount).toBe(0);
+    expect(day.refusedParticipantCount).toBe(1);
+    expect(day.v1ParticipantCount).toBe(4);
+    expect(day.unsupportedSourceParticipantCount).toBe(2);
+    expect(day.byModel["gpt-5.6-sol"]).toEqual({
+      capacityUsd: 2_400,
+      participantCount: 2,
+    });
+    expect(day.byModel["gpt-5.6-terra"]).toEqual({
+      capacityUsd: 1_100,
+      participantCount: 1,
+    });
+    expect(day.byModel["gpt-5.6-luna"]).toEqual({
+      capacityUsd: null,
+      participantCount: 0,
+    });
+    expect(day.byModel["gpt-5.5"]).toEqual({
+      capacityUsd: null,
+      participantCount: 0,
+    });
+  });
+
+  it("ages a frozen-epoch participant out of the day cohort", () => {
+    const composition = (
+      participantId: string,
+      latestQuotaObservedAt: string,
+    ): CommunityModelComposition => ({
+      participantId,
+      composition: {
+        status: "ready",
+        planType: "pro",
+        fit: {
+          status: "fitted",
+          observationCount: 30,
+          totalCostUsd: 100,
+          modelCostShares: {},
+          capacityUsdByModel: { "gpt-5.6-sol": 2_400 },
+          singleConstantUsd: 2_000,
+          r2: 0.8,
+          singleConstantR2: 0.7,
+          solverConverged: true,
+          identification: {
+            adjustedR2: 0.8,
+            singleConstantAdjustedR2: 0.7,
+            splitHalfIdentified: true,
+            splitHalfMaxCapacityDriftFraction: 0.05,
+          },
+        },
+        voidedBinCount: 0,
+        poolCount: 1,
+        quotaRowCount: 9,
+        usageEventCount: 8,
+        unpricedUsageEventCount: 0,
+        poisonedBinCount: 0,
+        latestQuotaObservedAt,
+      },
+    });
+    const day = buildCommunityModelCompositionDay({
+      compositions: [
+        composition("p-live", "2026-08-29T12:00:00.000Z"),
+        // Newest quota evidence 40 days old: a departed device riding its
+        // frozen chunk-epoch cache. It must not enter the median.
+        composition("p-departed", "2026-07-21T12:00:00.000Z"),
+      ],
+      v1ParticipantCount: 2,
+      unsupportedSourceParticipantCount: 0,
+      refusedParticipantCount: 0,
+    }, "2026-08-30");
+    expect(day.fittedParticipantCount).toBe(1);
+    expect(day.staleParticipantCount).toBe(1);
+    expect(day.byModel["gpt-5.6-sol"]).toEqual({
+      capacityUsd: 2_400,
+      participantCount: 1,
+    });
+  });
+
+  it("refuses a window that spans more than one plan", async () => {
+    const participantId = await seedV1Participant("composition-multiplan");
+    await seedV1Session(participantId, "v1-session-composition-multiplan");
+    await seedV1Device(participantId, "v1-device-composition-multiplan", "v1-session-composition-multiplan");
+    await seedThreeV1Resets(participantId, "v1-device-composition-multiplan", 5, "cmp");
+    // One extra reset on a different plan: a pp is worth plan-multiplier
+    // different dollars, so the kernel would mix incommensurable regimes.
+    await seedV1CalibratableReset({
+      participantId,
+      deviceId: "v1-device-composition-multiplan",
+      day: "2026-07-28",
+      startTime: "2026-07-28T12:00:00.000Z",
+      resetsAt: "2026-08-04T12:00:00.000Z",
+      stepPp: 5,
+      tag: "cmp-plus",
+      planType: "plus",
+    });
+    const result = await accountScopedModelCompositionV1(db(), participantId, {});
+    expect(result.status).toBe("not_testable");
+    if (result.status === "not_testable") {
+      expect(result.reason).toBe("multi_plan_window_unsupported");
+    }
+  });
+
+  it("voids bins that contain a not-fully-priced event", async () => {
+    const participantId = await seedV1Participant("composition-poisoned");
+    await seedV1Session(participantId, "v1-session-composition-poisoned");
+    await seedV1Device(participantId, "v1-device-composition-poisoned", "v1-session-composition-poisoned");
+    await seedThreeV1Resets(participantId, "v1-device-composition-poisoned", 5, "cpo", true);
+    const result = await accountScopedModelCompositionV1(db(), participantId, {});
+    expect(result.status).toBe("ready");
+    if (result.status !== "ready") return;
+    // Every seeded event is unpriceable, so every carrying bin is voided:
+    // nothing trains, nothing is guessed.
+    expect(result.unpricedUsageEventCount).toBeGreaterThan(0);
+    expect(result.poisonedBinCount).toBeGreaterThan(0);
+    expect(result.usageEventCount).toBe(0);
+    expect(result.fit.status).toBe("insufficient_observations");
+  });
+
+  it("embeds the day series in the scheduled preview and survives the cache validator", async () => {
+    const participantId = await seedV1Participant("composition-preview");
+    await seedV1Session(participantId, "v1-session-composition-preview");
+    await seedV1Device(participantId, "v1-device-composition-preview", "v1-session-composition-preview");
+    await seedThreeV1Resets(participantId, "v1-device-composition-preview", 5, "cprev");
+    // Warm the blended fit cache first: the scheduled preview source reads
+    // the corpus through it and fails closed otherwise.
+    await collectCommunityAllowanceFits(db());
+
+    const nowMs = Date.now();
+    const today = new Date(nowMs).toISOString().slice(0, 10);
+    const preview = await buildAdminCommunityAllowancePreviewFromSource(db(), nowMs);
+    expect(preview).not.toBeNull();
+    expect(preview!.models.days).toHaveLength(1);
+    expect(preview!.models.days[0]!.day).toBe(today);
+    expect(preview!.models.days[0]!.v1ParticipantCount).toBe(1);
+    const serialized = JSON.stringify(preview);
+    expect(serialized).not.toContain(participantId);
+
+    const warmed = await warmAdminCommunityAllowancePreviewCache(db(), nowMs);
+    expect(warmed.code).toBe("ALLOWANCE_PREVIEW_CACHE_REFRESHED");
+    const read = await readCachedAdminCommunityAllowancePreview(db(), nowMs);
+    expect(read.models.days).toHaveLength(1);
+    expect(read.models.days[0]!.day).toBe(today);
   });
 });

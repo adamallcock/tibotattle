@@ -2190,6 +2190,12 @@ function scheduleRefresh({ retry = false } = {}) {
 const ADMIN_ALLOWANCE_DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
 const ADMIN_ALLOWANCE_CHART_WIDTH = 960;
 const ADMIN_ALLOWANCE_CHART_HEIGHT = 300;
+const ADMIN_ALLOWANCE_MODEL_STYLES = Object.freeze({
+  "gpt-5.6-sol": Object.freeze({ className: "model-sol" }),
+  "gpt-5.6-terra": Object.freeze({ className: "model-terra" }),
+  "gpt-5.6-luna": Object.freeze({ className: "model-luna" }),
+  "gpt-5.5": Object.freeze({ className: "model-gpt55" }),
+});
 const ADMIN_ALLOWANCE_PLAN_STYLES = Object.freeze({
   pro: Object.freeze({ label: "Pro 20x", className: "pro" }),
   prolite: Object.freeze({ label: "Pro 5x → 20x", className: "prolite" }),
@@ -2241,7 +2247,7 @@ export function adminAllowanceChartModel(preview, {
   height = ADMIN_ALLOWANCE_CHART_HEIGHT,
 } = {}) {
   if (!preview || !Array.isArray(preview.days) || preview.days.length === 0
-      || (mode !== "combined" && mode !== "plans")) {
+      || (mode !== "combined" && mode !== "plans" && mode !== "models")) {
     return null;
   }
   const anchor = preview.days.at(-1).day;
@@ -2257,19 +2263,47 @@ export function adminAllowanceChartModel(preview, {
     key: plan.planType,
     ...ADMIN_ALLOWANCE_PLAN_STYLES[plan.planType],
   }));
+  const modelDayByDay = new Map(
+    (preview.models?.days ?? []).map((day) => [day.day, day]),
+  );
+  const modelSeries = (preview.models?.modelConfig ?? []).map((model) => ({
+    key: model.modelId,
+    label: model.label,
+    className: ADMIN_ALLOWANCE_MODEL_STYLES[model.modelId]?.className
+      ?? "model-other",
+  }));
   const activePlanFilter = mode === "plans"
     && planSeries.some((plan) => plan.key === planFilter)
     ? planFilter
     : null;
   const legendSeries = mode === "combined"
     ? [{ key: "combined", label: "Combined", className: "combined" }]
-    : planSeries;
-  const series = activePlanFilter === null
+    : mode === "models"
+      ? modelSeries
+      : planSeries;
+  const series = mode !== "plans" || activePlanFilter === null
     ? legendSeries
     : planSeries.filter((plan) => plan.key === activePlanFilter);
-  const summaryFor = (day, key) => (
-    key === "combined" ? day.combined : day.byPlanType[key]
-  );
+  const summaryFor = (day, key) => {
+    if (mode === "models") {
+      const modelDay = modelDayByDay.get(day.day);
+      const summary = modelDay?.byModel?.[key];
+      if (!summary || summary.capacityUsd === null) return null;
+      // Adapted to the plan-summary shape the point builder reads. The
+      // composition basis has no q10-q90 band; the dot radius scales on the
+      // day's identification-passing participant count.
+      return {
+        centralUsd: summary.capacityUsd,
+        // Both counts are this model's own supporting accounts, so the dot
+        // radius and its label describe the series they sit on, not the
+        // day-global cohort.
+        fitCount: summary.participantCount,
+        participantCount: summary.participantCount,
+        band80Usd: null,
+      };
+    }
+    return key === "combined" ? day.combined : day.byPlanType[key];
+  };
   let visibleValueCount = 0;
   const valueCandidates = [];
   for (const day of days) {
@@ -2298,6 +2332,18 @@ export function adminAllowanceChartModel(preview, {
           summary.band80Usd.lowerUsd,
           summary.band80Usd.upperUsd,
         );
+      }
+    }
+    // Per-model capacities join the shared axis pool for the same reason the
+    // plan values always do: the y-scale must not move when the operator
+    // switches views.
+    const modelDay = modelDayByDay.get(day.day);
+    if (modelDay) {
+      for (const definition of modelSeries) {
+        const capacity = modelDay.byModel?.[definition.key]?.capacityUsd;
+        if (capacity !== null && capacity !== undefined) {
+          valueCandidates.push(capacity);
+        }
       }
     }
   }
@@ -2495,9 +2541,11 @@ function appendAdminAllowanceChart(container, preview) {
     role: "img",
     "aria-label": state.allowanceMode === "combined"
       ? "Combined Pro 20x-equivalent community allowance by day"
-      : model.activePlanFilter === null
-        ? "Pro 20x-equivalent community allowance by plan and day"
-        : `${model.series[0].label} Pro 20x-equivalent community allowance by day`,
+      : state.allowanceMode === "models"
+        ? "Pro 20x-equivalent per-model allowance by day"
+        : model.activePlanFilter === null
+          ? "Pro 20x-equivalent community allowance by plan and day"
+          : `${model.series[0].label} Pro 20x-equivalent community allowance by day`,
   });
   for (const tick of model.dollarTicks) {
     svg.append(adminAllowanceSvg("line", "chart-grid", {
@@ -2695,6 +2743,55 @@ function renderAdminAllowanceControls() {
   }
 }
 
+function appendModelAllowanceSummaries(container, preview) {
+  const models = preview.models;
+  const latest = models.days.at(-1) ?? null;
+  if (latest === null) {
+    const empty = document.createElement("p");
+    empty.className = "admin-allowance-empty";
+    empty.textContent = "No identification-passing per-model fits recorded"
+      + " yet. The series accrues from the first day the composition kernel"
+      + " accepts a fit.";
+    container.append(empty);
+    return;
+  }
+  const grid = document.createElement("div");
+  grid.className = "admin-allowance-plans";
+  for (const model of models.modelConfig) {
+    const summary = latest.byModel[model.modelId];
+    const tile = document.createElement("div");
+    tile.className = "admin-allowance-plan-summary";
+    const label = document.createElement("p");
+    label.className = "admin-allowance-plan-label";
+    label.textContent = model.label;
+    const value = document.createElement("p");
+    value.className = "admin-allowance-value";
+    value.textContent = summary.capacityUsd === null
+      ? "—"
+      : allowanceUsd(summary.capacityUsd);
+    const unit = document.createElement("p");
+    unit.className = "admin-allowance-unit";
+    unit.textContent = "per 100pp weekly, Pro 20x equivalent";
+    const meta = document.createElement("p");
+    meta.className = "admin-allowance-meta";
+    meta.textContent = summary.capacityUsd === null
+      ? "No identification-passing fit carries this model"
+      : `${allowanceCountLabel(summary.participantCount, "account")}`
+        + ` · ${latest.day}`;
+    tile.append(label, value, unit, meta);
+    grid.append(tile);
+  }
+  container.append(grid);
+  const note = document.createElement("p");
+  note.className = "admin-allowance-meta admin-allowance-models-note";
+  note.textContent = "Per-model capacities come from the shared NNLS"
+    + " composition kernel and display only when its identification gate"
+    + " (split-half stability, adjusted-R2 improvement) passes"
+    + ` — ${latest.fittedParticipantCount} of ${latest.v1ParticipantCount}`
+    + " contributing accounts pass today.";
+  container.append(note);
+}
+
 function renderAdminCommunityAllowance(preview) {
   if (!isAdminPage) return;
   const container = $("#admin-community-allowance-result");
@@ -2718,6 +2815,8 @@ function renderAdminCommunityAllowance(preview) {
   }
   if (state.allowanceMode === "combined") {
     appendCombinedAllowanceSummary(container, preview);
+  } else if (state.allowanceMode === "models") {
+    appendModelAllowanceSummaries(container, preview);
   } else {
     appendPlanAllowanceSummaries(container, preview);
   }

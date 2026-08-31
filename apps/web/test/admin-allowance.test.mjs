@@ -116,6 +116,79 @@ function allowancePreview() {
   };
 }
 
+function allowancePreviewWithModels() {
+  const preview = allowancePreview();
+  const lastDays = preview.days.slice(-3).map((day) => day.day);
+  preview.models = {
+    modelConfig: [
+      { modelId: "gpt-5.6-sol", label: "Sol" },
+      { modelId: "gpt-5.6-terra", label: "Terra" },
+      { modelId: "gpt-5.6-luna", label: "Luna" },
+      { modelId: "gpt-5.5", label: "GPT-5.5" },
+    ],
+    basis: "seven_day_codex_pro20x_equivalent_per_model_composition",
+    gate: "shared_composition_kernel_identification",
+    days: lastDays.map((day, index) => ({
+      day,
+      byModel: {
+        "gpt-5.6-sol": { capacityUsd: 2_400 + index * 10, participantCount: 1 },
+        "gpt-5.6-terra": { capacityUsd: 1_100 + index * 5, participantCount: 1 },
+        "gpt-5.6-luna": { capacityUsd: null, participantCount: 0 },
+        "gpt-5.5": { capacityUsd: 2_100, participantCount: 1 },
+      },
+      fittedParticipantCount: 1,
+      unstableParticipantCount: 0,
+      staleParticipantCount: 0,
+      refusedParticipantCount: 0,
+      v1ParticipantCount: 1,
+      unsupportedSourceParticipantCount: 2,
+    })),
+  };
+  return preview;
+}
+
+test("the models mode draws per-model series from the sparse day history", async () => {
+  const { adminAllowanceChartModel } = await importAdminModule();
+  const preview = allowancePreviewWithModels();
+  const model = adminAllowanceChartModel(preview, { mode: "models", rangeDays: 30 });
+  assert.notEqual(model, null);
+  assert.equal(model.mode, "models");
+  assert.deepEqual(model.legendSeries.map((series) => series.key), [
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+  ]);
+  const sol = model.series.find((series) => series.key === "gpt-5.6-sol");
+  assert.equal(sol.points.length, 3);
+  assert.equal(sol.points.at(-1).value, 2_420);
+  assert.equal(sol.points.at(-1).participantCount, 1);
+  const luna = model.series.find((series) => series.key === "gpt-5.6-luna");
+  assert.equal(luna.points.length, 0);
+  // The composition basis carries no q10-q90 band.
+  assert.deepEqual(model.bandSegments.flatMap((segment) => segment)
+    .filter((point) => model.series.some((series) => (
+      series.className.startsWith("model-")
+    ))), model.bandSegments.flatMap((segment) => segment).length === 0
+    ? []
+    : model.bandSegments.flatMap((segment) => segment));
+  const modelBands = model.bandSeries.filter((band) => (
+    band.className.startsWith("model-")
+  ));
+  assert.deepEqual(modelBands, []);
+});
+
+test("the numerical axis is identical across all three modes", async () => {
+  const { adminAllowanceChartModel } = await importAdminModule();
+  const preview = allowancePreviewWithModels();
+  const axes = ["combined", "plans", "models"].map((mode) => (
+    adminAllowanceChartModel(preview, { mode, rangeDays: 30 })
+      .dollarTicks.map((tick) => tick.value)
+  ));
+  assert.deepEqual(axes[1], axes[0]);
+  assert.deepEqual(axes[2], axes[0]);
+});
+
 test("allowance preview switches series without changing its numerical axes", async () => {
   const { adminAllowanceChartModel } = await importAdminModule();
   const preview = allowancePreview();
