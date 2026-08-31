@@ -2,7 +2,7 @@
 title: Account and plan attribution implementation after red-team review
 date: 2026-08-30
 type: plan
-status: implementation-in-progress
+status: implemented-awaiting-release-qualification
 ---
 
 # Account and plan attribution implementation
@@ -15,7 +15,11 @@ is the verified `origin/main` revision at investigation time,
 `c111fded0da1fd58d90b1f87be5d57afeebf133b`.
 The earlier plan investigated `b7112217`; its source inventory is historical,
 not the current implementation baseline. Five unrelated web edits remain
-untouched in the original checkout. Work proceeds in an isolated task branch.
+untouched in the original checkout. Implementation is committed on the isolated
+`codex/account-plan-attribution` branch: `f57dab81` contains the product changes;
+`be8e8f5d` adds the test-only cancellation-observer correction described below.
+The final documentation change records those results without changing product
+code. This branch has not been pushed or integrated with later main changes.
 
 This document owns the implementation decisions and progress. It is not a
 deployment, installed-artifact, privacy-erasure, or release receipt. Local tests
@@ -163,10 +167,11 @@ resolve their implementation ambiguities.
   server capability/reconsent/floor; complete candidate activation/bootstrap;
   credential renewal/re-pair reconciliation; owner erasure and audited rollback.
   Implement and rehearse locally; do not enable or deploy without authorization.
-- [ ] **P6 — Integration and evidence.** Public-path regression matrix, privacy,
+- [x] **P6 — Local integration and evidence.** Public-path regression matrix, privacy,
   boundedness/query costs, same-baseline preservation comparison, owning suites,
-  architecture/docs gates, rendered browser/native checks and isolated bundle build.
-  Record unavailable environment/protected gates honestly.
+  architecture/docs gates, rendered browser checks and isolated native test bundles.
+  The separate empirical, protected-R7 and installed-release gates below remain
+  open; executing the local gates is not a release-readiness claim.
 
 ### Mandatory numerical and preservation cases
 
@@ -287,27 +292,84 @@ an empirical claim about every real account or the largest retained corpus.
 
 ### Verification checkpoint: 2026-08-31
 
-The first complete broad run after implementation used Node 26.2.0 on native
-macOS arm64. `pnpm test` ran 3,369 tests: 3,350 passed, 17 native-Windows tests
-were skipped on macOS, and two retained-R7-receipt tests failed because the
-workload-code digest and file count changed. The R7 freshness assertions and
-generated receipts remain untouched; the source inventory assertion includes
-the new contract modules and schemas. This is not a green release gate.
+Validation used Node 26.2.0 on native macOS arm64. The final complete root run
+was against `be8e8f5d`; the local/browser/Worker owning runs used the same product
+bytes at `f57dab81`. The intervening commit changes one test file only.
 
-Additional executed owning gates at this checkpoint:
+| Gate | Observed result and boundary |
+| --- | --- |
+| `pnpm test` | 3,382 tests: **3,363 passed, 2 failed, 17 skipped**; exit 1; 462.5 seconds. Both failures are the retained R7 provenance receipts. All skips are native-Windows qualification on macOS. |
+| `pnpm run product:local:test` | 294/294 passed; exit 0. Includes the final pairing, renewal, restart and stale-consent HTTP paths. |
+| `pnpm run product:ui:test` | 438/438 passed; exit 0, on the frozen final product bytes. |
+| Worker `npm run check` | Exit 0: 524/524 functional tests, 179/179 operational-script tests and 27/27 workspace-package checks, plus types, endpoint checks, local migrations and dry packaging/configuration. |
+| Worker `deploy:dry`, `staging:check`, `production:deploy:dry` | Each exited 0 after canonical public-asset generation. These are non-deploying checks. Staging explicitly remains `safe_unprovisioned`, `liveProof: false`, `collectionAuthorized: false`. |
+| Native owning checkpoint | `pnpm run product:macos:test`: 65/65 passed. The final broad run also passed the native bundle, packaged-module, watchdog and isolated-Preview tests; no system installation. |
+| Final index-observer follow-up | Entire index file 104/104; 20 repeated pairs 40/40; the final broad run also passed both observer/cancellation regressions. |
+| Shared reporting preservation | Weekly reporting, pinned-baseline attribution and reporting-boundary group: 32/32 passed. |
+| Architecture and mirrors | 380 production files, 1,534 imports, zero approved debt edges; browser mirror and all 20 upload-schema mirrors current. |
+| Documentation/preflight | 18/18 governance tests; maintained documentation and source/configuration links valid; whitespace checks passed. |
 
-- `pnpm run product:local:test`: 281/281 passed.
-- `pnpm run product:macos:test`: 65/65 passed, including built-bundle module
-  imports, watchdog and isolated Preview checks; no system installation.
-- Worker `npm run scripts:check`: 27/27 package guards and 179/179 operational
-  checks, including a disposable local Wrangler migration rehearsal. All 524
-  Worker functional tests also pass. Its subsequent packaging step correctly
-  refuses the still-uncommitted worktree; clean-tree packaging remains pending.
-- Weekly reporting, pinned-baseline attribution and reporting-boundary tests:
-  32/32 passed after retaining the diagnostic-fragment measurements.
+The R7 freshness assertions and generated receipts remain untouched; only the
+source-inventory assertion adds the new contract modules and schemas. The two
+failures identify `workloadCodeSha256` and `workloadCodeFileCount` as stale. They
+are not waived, and this is **not a green root/release gate**.
 
-The recovery-coordination fix and final owning-suite reruns remain in progress;
-these checkpoint counts do not claim to cover later edits.
+#### Cancellation-test correction, not a production locking change
+
+The first broad run on `f57dab81` exposed an additional intermittent test failure.
+Its synthetic stage observer opened the production reader with a five-second
+SQLite busy wait while the exclusive writer needed that same event loop to
+finish. This blocked the observer's existing two-second deadline. The unchanged
+test reproduced after 12 successful repeats; a deterministic contention fixture
+reproduced the old failure in 5.44 seconds.
+
+`be8e8f5d` makes only that synthetic observer's read nonblocking and retries after
+yielding. Production locks, production busy timeout, the two-second deadline,
+abort timing, generation assertions, byte-identical live-database preservation
+and stage cleanup remain unchanged. The new regression and the original abort
+case both passed inside the final broad run, not just in isolation.
+
+#### Dry public-asset provenance
+
+The isolated checkout initially lacked its generated public release manifest.
+The canonical `product:release-site` builder produced a manifest-verified,
+21-file closure; clean-tree staging checked its source provenance against the
+actual checked-out commit. All installer arguments were deliberately omitted:
+`installer: null` is not an installer/signing/release receipt.
+
+This local dry build reused the credential-free public
+[social-preview PNG](https://tibotattle.com/social-preview.png), verified as
+1200 by 630 pixels, 375,392 bytes, SHA-256
+`4618571ce400c435aa3ab3b53d85e966848276f29e4585df4868c619ce106074`.
+It does not qualify regenerated social artwork. The social-preview generator's
+ordinary Chrome-profile launch was not used under the no-real-credentials test
+boundary. No hosted assets or Workers were published, no remote schema was
+applied, and no installed app was changed.
+
+#### Rendered browser verification
+
+The Browser-guided checks served the committed dashboard modules with explicitly
+labeled synthetic API fixtures on loopback, not real-account data. The final
+plan-selector checks used `http://127.0.0.1:8934/` and its `scenario=empty` and
+`scenario=single` fixtures. Desktop was 962 by 541 CSS pixels; the narrow Spanish
+check measured 391 by 846 CSS pixels after the browser's viewport/zoom mapping.
+
+| Browser check | Observed evidence |
+| --- | --- |
+| Page identity / nonblank / overlays | Correct synthetic-QA title and loopback URL, meaningful dashboard DOM, no framework error overlay. |
+| Console health | No warnings or errors in the checked flows. |
+| Plan switching | Plus shows $85 and its own history; selecting Pro shows $2,400 and its own history/range. Historical Pro does not borrow the current Plus pace. |
+| Sparse current plan | Empty Plus shows insufficient evidence, not Pro's estimate or zero. Pro history remains selectable. |
+| Single-plan behavior | One selected Pro choice, disabled rather than offering a nonexistent second plan; the existing estimate remains visible. |
+| Narrow layout / localization | New plan controls and attribution copy render in Spanish with no horizontal document overflow. Existing untranslated demo/forecast copy is not newly qualified. |
+| Screenshot evidence | Viewport captures retain the selected Plus, selected Pro and narrow insufficient-Plus states. The Pro share card was also visually checked; no save/copy/upload action was needed. |
+| Explicit repair | A separate final synthetic component check in English and Spanish verified Repair connection to validated pairing to success, without redundant review/grant/approval. Real HTTP tests separately cover stale-consent repair through a fresh grant. |
+
+Temporary tabs and loopback servers were closed and the viewport override reset.
+These checks do not qualify installed-native rendering, real provider-account
+switching or an actual hosted contribution. The independent code-quality review
+closed every concrete recovery finding it raised; the plan-completeness pass
+also drove the preserved-history, actual-client and artifact-closure fixes above.
 
 ### Separate rollout and empirical gates
 
