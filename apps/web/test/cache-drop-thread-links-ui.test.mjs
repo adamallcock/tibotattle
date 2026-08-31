@@ -263,7 +263,7 @@ test("both drop tables replace local time with localized thread names and preser
   for (const kind of ["switch", "continuity"]) {
     const details = html.match(new RegExp(`<details[^>]+id="cache-${kind}-details"[\\s\\S]*?<\\/details>`, "u"))?.[0];
     assert.ok(details);
-    assert.equal((details.match(/<th\b/gu) ?? []).length, kind === "switch" ? 5 : 6);
+    assert.equal((details.match(/<th\b/gu) ?? []).length, 5);
     assert.match(details, /data-i18n="accounting\.cacheDropThread\.column">Thread name<\/th>/u);
     assert.doesNotMatch(details, /column\.localTime|>Local time<\/th>/u);
     assert.ok(source.includes(`cacheDropThreadCell("${kind}", item)`));
@@ -279,7 +279,7 @@ test("both drop tables replace local time with localized thread names and preser
   }
 });
 
-test("continuity rows preserve six translated columns, lost tokens and the empty-state span", () => {
+test("compact continuity rows preserve five translated columns, thread navigation and the empty-state span", () => {
   const start = source.indexOf("function renderAccountingCacheContinuityDetails(");
   const end = source.indexOf("\nfunction sideChatConfigurationDescription(", start);
   assert.ok(start >= 0 && end > start);
@@ -316,24 +316,23 @@ test("continuity rows preserve six translated columns, lost tokens and the empty
     );
     render({ status: "available", recent: [{ ...row("continuity"), estimatedPremiumUsd: 0.3 }] });
     assert.equal(rows.children.length, 1);
-    assert.equal(rows.children[0].children.length, 6);
+    assert.equal(rows.children[0].children.length, 5);
     assert.deepEqual(rows.children[0].children.map((cell) => cell.getAttribute("data-label")), [
       "accounting.cacheDropThread.column",
       "accounting.cacheContinuity.column.gap",
       "accounting.cacheContinuity.column.configuration",
       "accounting.cacheContinuity.column.cacheRead",
-      "accounting.cacheContinuity.column.lostTokens",
       "accounting.cacheContinuity.column.apiEquivalent",
     ].map(message));
     assert.deepEqual(rows.children[0].children.map((cell) => cell.textContent), [
       message("accounting.cacheDropThread.unavailable"), "60 seconds", "GPT-5.6 Sol · High",
-      "120000 → 20000", "100000", "$0.30",
+      "120000 → 20000", "$0.30",
     ]);
     assert.equal(harness.state.cells.continuity.length, 1);
     render({ status: "available", recent: [] });
     assert.equal(rows.children.length, 1);
     assert.equal(rows.children[0].children.length, 1);
-    assert.equal(rows.children[0].children[0].colSpan, 6);
+    assert.equal(rows.children[0].children[0].colSpan, 5);
     assert.equal(rows.children[0].children[0].textContent, message("accounting.cacheContinuity.detailsEmpty"));
     assert.equal(harness.state.cells.continuity.length, 0);
   }

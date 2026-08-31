@@ -22,6 +22,7 @@ import {
   isInformationalTerminalHistoryGap,
 } from "../src/local-companion-data.js";
 import {
+  createAccountingPricer,
   refreshReplaySafeAccountingCache,
 } from "../src/replay-safe-accounting-cache.js";
 import {
@@ -39,6 +40,7 @@ import {
 import {
   readLocalUnifiedCompanionProjection,
 } from "../src/local-unified-companion-source.js";
+import { usageProjection } from "../src/local-companion-usage-model.js";
 
 const ARTIFACT_FILES = {
   gradient: "2026-07-24-simple-quota-gradient-artifact.json",
@@ -132,6 +134,37 @@ function rolloutToken(timestamp, total, last, usedPercent) {
     },
   });
 }
+
+test("usage projection preserves explicit context and absent-field pricing at 272k", () => {
+  const pricer = createAccountingPricer();
+  const cases = [
+    { input: 272_000, context: {}, cost: "2.7209" },
+    { input: 271_999, context: {}, cost: "1.360595" },
+    { input: 272_000, context: { totalInputContextTokens: 0 }, cost: "1.3606" },
+    { input: 272_000, context: { totalInputContextTokens: 271_999 }, cost: "1.3606" },
+    { input: 271_999, context: { totalInputContextTokens: 272_000 }, cost: "2.72089" },
+    ...[undefined, null, -1, 1.5, "0", Number.NaN, Number.POSITIVE_INFINITY]
+      .map((value) => ({
+        input: 272_000,
+        context: { totalInputContextTokens: value },
+        cost: "2.7209",
+      })),
+  ];
+  for (const { input, context, cost } of cases) {
+    const record = {
+      observedAt: "2026-07-25T12:00:00.000Z",
+      model: "gpt-5.6-sol",
+      components: { input_uncached_tokens: input, output_text_tokens: 20 },
+      ...context,
+    };
+    for (const price of [null, pricer]) {
+      const projection = usageProjection(record, "unknown", price);
+      assert.equal(projection.totalTokens, input + 20);
+      assert.equal(projection.apiPriceEquivalentUsdExact, cost);
+      assert.equal(projection.pricingCoverageStatus, "fully_priced");
+    }
+  }
+});
 
 test("local companion builds a closed real-data projection without identifiers or paths", async () => {
   const root = await fixtureRoot();
@@ -2240,6 +2273,136 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
     assert.equal(
       tampered.errorCode,
       "local_unified_index_tool_attestation_mismatch",
+    );
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("full unified snapshot prices stored context like the same-generation replay cache", async () => {
+  const root = await fixtureRoot();
+  const nowMs = Date.parse("2026-08-30T00:00:00.000Z");
+  const cases = [
+    { at: "2026-07-01T12:00:00.000Z", input: 272_000, context: null, cost: 1.3606 },
+    { at: "2026-07-02T12:00:00.000Z", input: 300_000, context: null, cost: 1.5006 },
+    { at: "2026-08-29T11:00:00.000Z", input: 271_999, context: null, cost: 1.088396 },
+    { at: "2026-08-29T12:00:00.000Z", input: 272_000, context: 271_999, cost: 1.0884 },
+    { at: "2026-08-29T13:00:00.000Z", input: 271_999, context: 272_000, cost: 2.176592 },
+  ];
+  try {
+    const stateDirectory = join(root, ".usage-monitor");
+    const indexFile = join(stateDirectory, "local-unified-index-v1.sqlite");
+    const stateFile = join(stateDirectory, "local-collector-state-v1.sqlite");
+    const sessions = join(root, "sessions");
+    await mkdir(sessions);
+    let totalInput = 0;
+    let totalOutput = 0;
+    await writeFile(join(sessions, "rollout-2026-07-01T12-00-00-context.jsonl"), `${[
+      JSON.stringify({
+        timestamp: cases[0].at,
+        type: "session_meta",
+        payload: { id: "synthetic-context-session", thread_source: "user" },
+      }),
+      JSON.stringify({
+        timestamp: cases[0].at,
+        type: "turn_context",
+        payload: { model: "gpt-5.6-sol", effort: "high" },
+      }),
+      ...cases.map(({ at, input }) => {
+        totalInput += input;
+        totalOutput += 20;
+        return rolloutToken(
+          at,
+          rolloutUsage(totalInput, totalOutput),
+          rolloutUsage(input, 20),
+          10,
+        );
+      }),
+    ].join("\n")}\n`);
+    const { rebuildLocalUnifiedIndex } = await import("../src/local-unified-index-build.js");
+    const built = await rebuildLocalUnifiedIndex({
+      codexHome: root,
+      indexFile,
+      secretFile: join(stateDirectory, "local-unified-index-device-salt-v1"),
+      contractVersion: "companion-context-test-v1",
+    });
+    assert.equal(built.usageEvents, cases.length);
+    const database = openLocalUnifiedIndex(indexFile, { readOnly: false });
+    try {
+      // The current Codex parser reports no context. Seed the two observed
+      // contexts only in this synthetic index to exercise the typed read
+      // contract; the legacy NULL rows must remain NULL on disk.
+      for (const { at, context } of cases.filter((row) => row.context !== null)) {
+        database.prepare(`
+          UPDATE usage_event SET total_input_context = ? WHERE observed_at_ms = ?
+        `).run(context, Date.parse(at));
+      }
+      assert.deepEqual(
+        database.prepare(`
+          SELECT total_input_context AS context FROM usage_event ORDER BY observed_at_ms
+        `).all().map((row) => row.context),
+        cases.map((row) => row.context),
+      );
+    } finally {
+      database.close();
+    }
+    const cache = await refreshReplaySafeAccountingCache({
+      stateFile,
+      sourceMode: "unified",
+      unifiedIndexFile: indexFile,
+      expectedGeneration: built.generation,
+      contextBehavior: "legacy_zero",
+      codexHome: root,
+      now: () => nowMs,
+    });
+    const snapshot = await buildLocalCompanionSnapshot({
+      root,
+      accountingSourceMode: "unified",
+      unifiedIndexFile: indexFile,
+      allowDevelopmentArtifactFallback: false,
+      now: () => nowMs,
+    });
+    const { accounting, timeline, usage } = snapshot.overview;
+    assert.equal(accounting.accountingCacheStatus, "available");
+    assert.equal(accounting.generationMatched, true);
+    assert.equal(accounting.generationFingerprint, built.generation.fingerprint);
+    assert.equal(accounting.compatibilityBehavior, "legacy_zero");
+    assert.equal(timeline.source, "unified_local_index");
+    assert.equal(timeline.history.status, "complete");
+    const all = usage.find((period) => period.id === "all");
+    const history = accounting.periods.find((period) => period.periodId === "history");
+    assert.equal(all.events, cases.length);
+    assert.equal(all.totalTokens, 1_388_098);
+    assert.equal(all.apiPriceEquivalentUsd, 7.214588);
+    for (const field of [
+      "events", "totalTokens", "apiPriceEquivalentUsd", "priceCardIds", "priceCardBreakdown",
+    ]) {
+      assert.deepEqual(all[field], cache.history.period[field], field);
+      assert.deepEqual(all[field], history[field], field);
+    }
+    assert.deepEqual(all.componentCosts, cache.history.period.componentCosts);
+    for (const id of ["24h", "7d", "30d"]) {
+      const displayed = usage.find((period) => period.id === id);
+      const cached = cache.periods.find((period) => period.id === id);
+      assert.equal(displayed.events, 3);
+      assert.equal(displayed.apiPriceEquivalentUsd, cached.apiPriceEquivalentUsd);
+      assert.equal(displayed.totalTokens, cached.totalTokens);
+    }
+    const timelineTotals = (rows) => rows.map((row) => ({
+      startAt: row.startAt,
+      usageEvents: row.usageEvents,
+      totalTokens: row.totalTokens,
+      apiPriceEquivalentUsd: row.apiPriceEquivalentUsd,
+    }));
+    assert.deepEqual(timelineTotals(timeline.usage), cases.map(({ at, input, cost }) => ({
+      startAt: at,
+      usageEvents: 1,
+      totalTokens: input + 20,
+      apiPriceEquivalentUsd: cost,
+    })));
+    assert.deepEqual(
+      timelineTotals(timeline.usage.filter((row) => row.startAt >= cache.coveredAt.startAt)),
+      timelineTotals(cache.timeline),
     );
   } finally {
     await rm(root, { recursive: true });

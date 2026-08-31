@@ -798,7 +798,7 @@
                     <th>Usage changes</th>
                     <th>Tokens</th>
                     <th class="model-share-head" data-i18n="accounting.model.shareHeading">Share</th>
-                    <th>Standard API equivalent</th>
+                    <th data-i18n-title="accounting.apiEquivalent.standardRateBasis" title="Calculated at Standard API rates.">API equivalent</th>
                     <th class="model-share-head" data-i18n="accounting.model.shareHeading">Share</th>
                   </tr>
                 </thead>
@@ -849,14 +849,14 @@
           </p>
           <div class="table-wrap">
             <table>
-              <caption class="sr-only" data-i18n="accounting.cacheSwitch.tableCaption">Recent possible switch-overhead evidence</caption>
+              <caption class="sr-only" data-i18n="accounting.cacheSwitch.tableCaption">Recent covered switch-overhead comparisons at Standard API rates; not a period total</caption>
               <thead>
                 <tr>
                   <th data-i18n="accounting.cacheDropThread.column">Thread name</th>
                   <th data-i18n="accounting.cacheSwitch.column.change">Configuration change</th>
                   <th data-i18n="accounting.cacheSwitch.column.cacheRead">Cache read</th>
                   <th data-i18n="accounting.cacheSwitch.column.lostTokens">Est. lost reuse</th>
-                  <th data-i18n="accounting.cacheSwitch.column.apiEquivalent">API equivalent</th>
+                  <th data-i18n="accounting.cacheSwitch.column.apiEquivalent" data-i18n-title="accounting.apiEquivalent.standardRateBasis" title="Calculated at Standard API rates.">API equivalent</th>
                 </tr>
               </thead>
               <tbody id="cache-switch-rows"></tbody>
@@ -899,6 +899,7 @@
             </div>
           </div>
           <p class="cache-reuse-empty" id="cache-reuse-empty" data-i18n="accounting.cacheContinuity.outcome.noData" hidden>No eligible follow-up turns were found in this period.</p>
+          <p class="annotation" id="cache-reuse-coverage" hidden></p>
           <div class="cache-reuse-raster" id="cache-reuse-raster">
             <div class="cache-reuse-raster-scroll" id="cache-reuse-raster-scroll">
               <div class="cache-reuse-raster-stage" id="cache-reuse-raster-stage">
@@ -921,15 +922,14 @@
           <summary data-i18n="accounting.cacheContinuity.detailsSummary">See recent large cache drops</summary>
           <div class="table-wrap">
             <table class="cache-continuity-recent-table">
-              <caption class="sr-only" data-i18n="accounting.cacheContinuity.tableCaption">Recent possible cache-continuity overhead evidence</caption>
+              <caption class="sr-only" data-i18n="accounting.cacheContinuity.tableCaption">Recent covered cache-continuity comparisons at Standard API rates; not a period total</caption>
               <thead>
                 <tr>
                   <th data-i18n="accounting.cacheDropThread.column">Thread name</th>
                   <th data-i18n="accounting.cacheContinuity.column.gap">Time between turns</th>
-                  <th data-i18n="accounting.cacheContinuity.column.configuration">Unchanged configuration</th>
+                  <th data-i18n="accounting.cacheContinuity.column.configuration">Configuration</th>
                   <th data-i18n="accounting.cacheContinuity.column.cacheRead">Cache read</th>
-                  <th data-i18n="accounting.cacheContinuity.column.lostTokens">Estimated lost reuse</th>
-                  <th data-i18n="accounting.cacheContinuity.column.apiEquivalent">Standard API equivalent</th>
+                  <th data-i18n="accounting.cacheContinuity.column.apiEquivalent" data-i18n-title="accounting.apiEquivalent.standardRateBasis" title="Calculated at Standard API rates.">API equivalent</th>
                 </tr>
               </thead>
               <tbody id="cache-continuity-rows"></tbody>

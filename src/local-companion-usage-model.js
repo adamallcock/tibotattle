@@ -244,6 +244,11 @@ export function usageProjection(record, declaredSpeed = "unknown", pricer = null
       : components.output_text_tokens + components.output_reasoning_tokens);
   if (totalTokens === 0) return null;
   const model = safeModel(record.model);
+  const pricingEvent = { timestamp: record.observedAt, model };
+  if (Number.isSafeInteger(record.totalInputContextTokens)
+      && record.totalInputContextTokens >= 0) {
+    pricingEvent.totalInputContextTokens = record.totalInputContextTokens;
+  }
   let priced;
   try {
     // A caller iterating a large store passes a memoized pricer (the same one
@@ -251,10 +256,9 @@ export function usageProjection(record, declaredSpeed = "unknown", pricer = null
     // whenever its per-(model, band, date) plan cannot be proven exact, so
     // the figures are identical either way — only the wall time differs.
     priced = pricer !== null
-      ? pricer({ timestamp: record.observedAt, model }, components)
+      ? pricer(pricingEvent, components)
       : priceCodexUsageEvent({
-        timestamp: record.observedAt,
-        model,
+        ...pricingEvent,
         components,
       }, {
         // Subscription speed and the API billing tier are separate concepts.
