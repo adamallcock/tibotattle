@@ -2890,6 +2890,39 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
     /func menuBarStatusActivationIntent\([\s\S]*?eventType == \.rightMouseUp[\s\S]*?modifierFlags\.contains\(\.control\)/u,
   );
   assert.match(source, /popover\.show\([\s\S]*?preferredEdge: \.minY/u);
+  assert.match(
+    source,
+    /popoverController\.prepareForPresentation\(from: sender\)\s*\n\s*popoverController\.update\(snapshot: snapshot\)\s*\n\s*popover\.show/u,
+  );
+  assert.match(popupSource, /private let scrollView = NSScrollView\(\)/u);
+  assert.match(popupSource, /scrollView\.hasVerticalScroller = true/u);
+  assert.match(popupSource, /scrollView\.hasHorizontalScroller = false/u);
+  assert.match(popupSource, /scrollView\.horizontalScrollElasticity = \.none/u);
+  assert.match(
+    popupSource,
+    /func menuBarPopoverMaximumViewportHeight\([\s\S]*?anchorMinY[\s\S]*?- visibleFrame\.minY[\s\S]*?- MenuBarPopoverMetrics\.popoverVerticalClearance[\s\S]*?return min\(screenMaximum, max\(1, anchorMaximum\)\)/u,
+  );
+  assert.equal(
+    popupSource.match(/menuBarPopoverMaximumViewportHeight\(/gu)?.length,
+    3,
+    "one cap helper definition must serve production and the compiled smoke seam",
+  );
+  assert.match(
+    popupSource,
+    /let previousVerticalOffset = scrollView\.contentView\.bounds\.minY[\s\S]*?setVerticalScrollOffset\(previousVerticalOffset\)/u,
+  );
+  assert.match(
+    popupSource,
+    /func prepareForPresentation\(from anchor: NSView\)[\s\S]*?updatePreferredContentSize\(\)\s*\n\s*scrollToTop\(\)/u,
+  );
+  assert.match(
+    popupSource,
+    /func isFullyVisibleInViewport\(_ candidate: NSView\)[\s\S]*?scrollView\.contentView\.convert\([\s\S]*?visibleBounds\.contains\(frameInClipView\)/u,
+  );
+  assert.match(
+    popupSource,
+    /func scrollToBottomForSmokeTest\(\)[\s\S]*?setVerticalScrollOffset\(maximumVerticalScrollOffset\(\)\)/u,
+  );
   assert.match(source, /menu\.popUp\(positioning: nil, at: screenPoint, in: nil\)/u);
   assert.match(source, /func popoverDidClose\(_ notification: Notification\)/u);
   const showActionMenu = source.match(
@@ -3135,11 +3168,13 @@ test("menu-bar status item degrades honestly and never invents allowance evidenc
     /weeklyPaceOutlook: snapshot\.weeklyPaceOutlook,/u,
   );
 
-  // The rich popup is a real AppKit surface with fixed width, no scroll view,
-  // two native history ranges, and the companion-projected weekly pace states.
+  // The rich popup is a real AppKit surface with fixed width, vertical-only
+  // overflow, two native history ranges, and companion-projected pace states.
   assert.match(popupSource, /final class MenuBarPopoverViewController: NSViewController/u);
   assert.match(popupSource, /static let width: CGFloat = 400/u);
-  assert.doesNotMatch(popupSource, /NSScrollView\s*\(/u);
+  assert.match(popupSource, /private let scrollView = NSScrollView\(\)/u);
+  assert.match(popupSource, /scrollView\.hasVerticalScroller = true/u);
+  assert.match(popupSource, /scrollView\.hasHorizontalScroller = false/u);
   assert.match(popupSource, /let rangeControl = NSSegmentedControl\(\)/u);
   assert.match(modelSource, /case sevenDays = "7d"/u);
   assert.match(modelSource, /case thirtyDays = "30d"/u);
@@ -4264,11 +4299,11 @@ test("development and preview builds treat the release-channel policy as optiona
 
 test("macOS release metadata validates versions, production mode, and Keychain references", async () => {
   assert.equal(normalizeMacOSBundleVersion(), DERIVED_MACOS_BUNDLE_VERSION);
-  assert.equal(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION, "1023.2");
+  assert.equal(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION, "1023.3");
   assert.equal(STABLE_SIGNED_BUNDLE_VERSION, "1024");
   assert.equal(
     normalizeMacOSBundleVersion(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
-    "1023.2",
+    "1023.3",
   );
   assert.equal(
     compareMacOSBundleVersions(
@@ -4288,19 +4323,24 @@ test("macOS release metadata validates versions, production mode, and Keychain r
     "the corrective dogfood must be strictly newer than the installed RC3",
   );
   assert.equal(
+    compareMacOSBundleVersions("1023.2", INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    -1,
+    "the final integrated dogfood must be strictly newer than startup-recovery RC4",
+  );
+  assert.equal(
     compareMacOSBundleVersions(
       STABLE_SIGNED_BUNDLE_VERSION,
       INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION,
     ) > 0,
     true,
   );
-  for (const unallocated of ["1023", "1023.0", "1023.1", "1023.1.0", "1023.2.0", "1024", "2000.1.17"]) {
+  for (const unallocated of ["1023", "1023.0", "1023.1", "1023.1.0", "1023.2", "1023.2.0", "1023.3.0", "1024", "2000.1.17"]) {
     assert.throws(
       () => readMacOSReleaseBuildConfiguration({
         USAGE_MONITOR_BUNDLE_VERSION: unallocated,
       }, INTERNAL_DOGFOOD_RELEASE_CHANNEL),
       { code: "MACOS_BUNDLE_VERSION_MISMATCH" },
-      "operator overrides cannot reuse RC2/RC3, alias the allocation, or consume stable/preview builds",
+      "operator overrides cannot reuse an earlier RC, alias the allocation, or consume stable/preview builds",
     );
   }
   assert.equal(
@@ -7883,7 +7923,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       menuBarSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT popover=true width=400 bars=7,30 pace=canonical-outlook native_actions=true states=live,starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q routing=left-popover,right-menu,control-menu dismissal=escape,transient,same-app,outside,deactivation weekly_position=factual-menu-only pace_outlook=collecting,under,on,over,critical,fail-closed history=authoritative,coverage-named,fail-closed pricing=complete,partial,unavailable model=dst,overlap,future,per-lane reset_credits=absent analysis_title=live-fallback history_retention=refresh,failure,source-reset$/mu,
+      /^USAGE_MONITOR_MACOS_MENU_BAR_CONTRACT popover=true width=400 bars=7,30 pace=canonical-outlook native_actions=true states=live,starting,unavailable shortcuts=cmd-r,cmd-comma,cmd-q routing=left-popover,right-menu,control-menu dismissal=escape,transient,same-app,outside,deactivation weekly_position=factual-menu-only pace_outlook=collecting,under,on,over,critical,fail-closed history=authoritative,coverage-named,fail-closed pricing=complete,partial,unavailable model=dst,overlap,future,per-lane reset_credits=absent analysis_title=live-fallback history_retention=refresh,failure,source-reset overflow=screen-capped,vertical-only,top-reset,poll-preserved$/mu,
     );
     const analysisProgressSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),

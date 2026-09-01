@@ -42,8 +42,14 @@ pull requests, including [PR #80](https://github.com/adamallcock/tibotattle/pull
 [PR #84](https://github.com/adamallcock/tibotattle/pull/84),
 [PR #85](https://github.com/adamallcock/tibotattle/pull/85),
 [PR #86](https://github.com/adamallcock/tibotattle/pull/86),
-[PR #87](https://github.com/adamallcock/tibotattle/pull/87), and
-[PR #88](https://github.com/adamallcock/tibotattle/pull/88).
+[PR #87](https://github.com/adamallcock/tibotattle/pull/87),
+[PR #88](https://github.com/adamallcock/tibotattle/pull/88),
+[PR #89](https://github.com/adamallcock/tibotattle/pull/89),
+[PR #90](https://github.com/adamallcock/tibotattle/pull/90),
+[PR #92](https://github.com/adamallcock/tibotattle/pull/92),
+[PR #94](https://github.com/adamallcock/tibotattle/pull/94),
+[PR #95](https://github.com/adamallcock/tibotattle/pull/95), and
+[PR #96](https://github.com/adamallcock/tibotattle/pull/96).
 PRs #73 and #74 are not part of this native macOS candidate. PR #75
 is not merged wholesale; a native subset of its menu-bar and weekly-pace work
 is ported without its Electron or multi-root changes. Separately, this candidate
@@ -89,13 +95,21 @@ published-release claim.
   planning and status prose from the active tree.
 - Adds a native left-click menu-bar popover with current Five-hour and seven-day
   allowance lanes, fail-closed 7/30-day usage history, and a weekly pace outlook;
-  right-click and Control-click retain the native actions menu (native subset of
+  right-click and Control-click retain the native actions menu. The complete
+  instrument now remains reachable through vertical scrolling when two quota
+  lanes exceed the height available below the status item (native subset of
   [PR #75](https://github.com/adamallcock/tibotattle/pull/75)).
 - Adds transient local thread-name links to both recent cache-drop tables,
   including separate parent and worker links when that relationship is recorded.
   Missing attribution stays unlinked; names and links do not enter persisted
   accounting, exports, diagnostics, or hosted contribution
   ([PR #87](https://github.com/adamallcock/tibotattle/pull/87)).
+- Adds an admin-only **By model** allowance view for Sol, Terra, Luna, and
+  GPT-5.5, using the existing Pro-20x normalization and refusing the model band
+  when identification or percentile evidence is incomplete. This source needs
+  Worker migration 0041, deployment, warming, and real cohort data before the
+  hosted view is operational; installing the desktop app does not activate it
+  ([PR #89](https://github.com/adamallcock/tibotattle/pull/89)).
 
 ### Changed
 
@@ -127,6 +141,17 @@ published-release claim.
 - Aligns full-history headline and timeline input-context pricing with the
   accounting cache's existing compatibility rule, fixing differing API
   equivalents for the same older usage without changing token totals.
+- Keeps current-plan and historical-plan local estimates, history, comparison
+  ranges, forecasts, and share cards on the same selected plan-era population.
+  Missing or conflicting account/plan evidence remains unavailable instead of
+  borrowing another era or claiming account-exact, cross-device, or
+  provider-authoritative billing attribution
+  ([PR #94](https://github.com/adamallcock/tibotattle/pull/94)).
+- Adds the closed telemetry v1.1 account/plan transport and lifecycle as staged
+  source only. Worker migrations 0042-0044, hosted activation, and a new explicit
+  consent are separate gates; a desktop install does not deploy the protocol or
+  alter an existing contribution consent
+  ([PR #94](https://github.com/adamallcock/tibotattle/pull/94)).
 - Replaces self-service hosted-delete controls with confirmed **Disconnect this
   Mac**. Disconnect durably pauses this Mac's contribution delivery without
   deleting hosted history, local analysis, or other devices; signing out is a
@@ -204,6 +229,15 @@ published-release claim.
 - Replaces the unconditional “Headline ready” refresh claim with neutral local
   summary/progress copy, and keeps native and browser polling attached through
   the bounded fresh-index build window.
+- Retries compatible legacy Keychain reads non-interactively up to three times
+  and reserves the explained approval fallback for an explicit Settings action.
+  Automatic launch, refresh, contribution, and migration paths remain
+  prompt-free; an unexpected security prompt blocks release qualification
+  ([PR #95](https://github.com/adamallcock/tibotattle/pull/95)).
+- Recovers the native dashboard when readiness arrives after the initial wait:
+  startup uses the bounded primary projection, fences stale generations, keeps
+  the slow-load page alive, and replaces a prior timeout after the late primary
+  render succeeds ([PR #96](https://github.com/adamallcock/tibotattle/pull/96)).
 - Keeps cancellation and timeout terminal handling from starting another full
   data-store reload, preserves the last published generation, and reclaims only
   old, exactly identified abandoned staging files on a later safe retry.
@@ -247,9 +281,11 @@ published-release claim.
 - Gives Preview its own app, bundle, semantic-open, local-state, Keychain,
   preferences, and Sparkle-feed identities, preventing preview installation or
   updates from replacing stable state.
-- Allocates build 1023 to the 0.1.17 internal-dogfood candidate and build 1024
-  to stable, and requires a clean checkout with exactly one matching annotated
-  channel tag at `HEAD` before signed release tooling can proceed.
+- Records builds 1023, 1023.1, and 1023.2 as earlier 0.1.17 internal dogfoods,
+  allocates build 1023.3 to the integrated RC5 candidate, and retains build 1024
+  for stable. Signed tooling requires a clean checkout with exactly one matching
+  annotated channel tag at `HEAD` before it can proceed. RC4 at build 1023.2 is
+  installed evidence for its frozen source, not proof that RC5 or stable exists.
 - Establishes scoped, machine-checked repository guidance for coding agents and
   the root layout they may extend
   ([PR #77](https://github.com/adamallcock/tibotattle/pull/77)).

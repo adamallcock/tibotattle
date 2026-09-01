@@ -2,7 +2,7 @@
 title: Account and plan attribution implementation after red-team review
 date: 2026-08-30
 type: plan
-status: implemented-pending-coordinated-merge
+status: implemented-merged-pending-qualification
 ---
 
 # Account and plan attribution implementation
@@ -19,8 +19,10 @@ untouched in the original checkout. Implementation is committed on the isolated
 `codex/account-plan-attribution` branch: `f57dab81` contains the product changes;
 `be8e8f5d` adds the test-only cancellation-observer correction described below.
 The implementation-checkpoint documentation records those results without
-changing product code. The subsequent source-PR preparation is recorded below;
-its merge and release qualification are coordinated separately.
+changing product code. PR #94 later merged into `main` as
+`20f449ff5c222989029fe343f219f02b497ae1d4`; source merge does not close the
+empirical, protected-R7, installed-artifact, migration, consent, deployment, or
+release gates recorded below.
 
 This document owns the implementation decisions and progress. It is not a
 deployment, installed-artifact, privacy-erasure, or release receipt. Local tests
@@ -383,16 +385,20 @@ also drove the preserved-history, actual-client and artifact-closure fixes above
   selected-versus-diagnostic distribution and resource review remains required
   before hosted methodology activation or dogfood sign-off. No acceptable-loss
   percentage is invented to bypass it.
-- **R7:** retained receipts need the protected, environment-specific regeneration
-  workflow after source freeze. Stale receipts are not waived or hand-edited.
+- **R7:** the current RC5 R7 workload-source closure completed the protected
+  dual-runtime regeneration after its source freeze. All ten receipts validate
+  against 359 files / workload SHA-256
+  `4c3058b3453bda2696e946952d18e81310f26eb0187074d410c730e44162f1d6`;
+  the reconstructed decision remains `release_open` and is not promoted by hand.
+  Native UI and allocation files are outside that closure and use separate gates.
 - **Hosted cutover:** 0042–0044 are source migrations, not remote receipts.
   Stronger-format writes remain staged and require explicit new consent; existing
   v0.2 history is deliberately preserved behind an upgrade refusal until a
   compatible replacement adapter is reviewed.
-- **Delivery:** source validation and local ad-hoc test bundles do not establish
-  CI, merge, deployment, a signed/notarized release, updater availability, or an
-  installed and manually verified dogfood. None of those protected outcomes has
-  been performed as part of this implementation.
+- **Delivery:** source validation, passing PR workflows, and the later PR #94
+  merge do not establish deployment, a signed/notarized integrated release,
+  updater availability, or an installed and manually verified integrated
+  dogfood. Those protected outcomes remain separate from this implementation.
 - **Large/continuously changing histories:** the immutable domain limits are
   4,096 days, 30,000 chunks and 6,000,000 records. A prefix that changes faster
   than it can be revalidated within repeated foreground budgets can remain
@@ -419,3 +425,42 @@ the full root gate or final frozen-source R7 qualification.
 The before/after real-corpus coverage review, native installed-artifact checks,
 and hosted migration/activation boundaries above remain unchanged. Source-PR
 readiness is not permission to upload real data or activate the new transport.
+
+### Merge receipt and current boundary: 2026-08-31
+
+After the held installed-generation handoff, PR #94 merged into `main` as
+`20f449ff5c222989029fe343f219f02b497ae1d4`. The current release-preparation
+base `3b0f2d23775c0ca1f092fe3eb48f0c3166c8461a` includes that merge together
+with the prompt-free Keychain and startup-recovery follow-ups. The earlier hold
+and validation record above remain historical evidence for the reviewed PR
+head; they are no longer a statement that PR #94 is unmerged.
+
+The current RC5 R7 workload-source closure subsequently regenerated all ten
+protected receipts on 2026-08-31. Its closure is 359 files with workload
+SHA-256 `4c3058b3453bda2696e946952d18e81310f26eb0187074d410c730e44162f1d6`;
+the retained receipt test passes, and the reconstructed decision remains
+honestly `release_open` rather than release-ready. Native UI/allocation changes
+are outside this closure and retain separate source, smoke, and artifact gates.
+The fixed real-corpus
+before/after coverage, selected-versus-diagnostic distribution, and resource
+review remain open before PR #94 methodology sign-off or hosted activation.
+Current APIs cannot emit a complete named fit-rejection reconciliation, so no
+green empirical receipt or same-login workspace-identity proof is claimed.
+
+An owner-only diagnostic attempt on 2026-08-31 pinned the PR first parent
+`a3c850360bc83c0e27bef2171aeb4a302b72f472`, merge result
+`20f449ff5c222989029fe343f219f02b497ae1d4`, and fixed window
+`2025-08-31T00:00:00.000Z` through `2026-08-31T00:00:00.000Z`. It failed closed
+before comparison when the strict baseline scan reported
+`codex_rollout_content_invalid`. The supported resource benchmark separately
+stopped at `benchmark_cold_rebuild_incomplete` on both revisions. No aggregate
+comparison receipt was produced, no invalid source was silently excluded, and
+the empirical gate remains open.
+
+The live Worker observed read-only on 2026-08-31 reported deployment source
+`304f3d736b6f9451d32a616bf3046ea628e828a3`, which predates PR #94's
+device-continuity protocol. Migrations 0042-0044, telemetry v1.1 activation, and
+new consent remain undeployed and separately authorized. The signed, notarized,
+installed RC4 at source `735a59ce2ec01df0e381fb1aa878c5c7a39edcd8`, build
+`1023.2`, also predates PR #94. It cannot qualify this integrated source or the
+planned RC5 build `1023.3`.

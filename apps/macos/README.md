@@ -422,9 +422,10 @@ a claim that Sparkle has updated the preview client.
 `CFBundleShortVersionString` remains the user-facing package version. The
 Sparkle ordering key, `CFBundleVersion`, is explicitly allocated for signed
 builds that retain the stable bundle identifier. The 0.1.17 internal-dogfood
-build is `1023.2`; the 0.1.17 stable final remains `1024`. This startup-recovery
-candidate orders strictly after RC3 `1023.1`, retained RC2 `1023`, and earlier
-shared-identity dogfood `1022`, while stable orders after the dogfood candidate.
+build is `1023.3`; the 0.1.17 stable final remains `1024`. This final integrated
+candidate orders strictly after startup-recovery RC4 `1023.2`, migration RC3
+`1023.1`, retained RC2 `1023`, and earlier shared-identity dogfood `1022`, while
+stable orders after the dogfood candidate.
 A future signed version/channel must add a reviewed
 monotonic allocation before release tooling will run.
 
@@ -522,7 +523,7 @@ For a later stable release, use `--previous-stable-manifest` in place of
 the release command refuses to guess which continuity policy applies.
 `USAGE_MONITOR_BUNDLE_VERSION` is optional as an operator assertion only; when
 present it must exactly equal the checked-in allocation for the selected
-signed release version and channel (`1023.2` for 0.1.17 internal dogfood,
+signed release version and channel (`1023.3` for 0.1.17 internal dogfood,
 `1024` for 0.1.17 stable).
 
 `config/deployment-endpoints.js` is the reviewed source for the public origin

@@ -77,12 +77,16 @@ async function upload(fixture: Awaited<ReturnType<typeof createV11DeviceFixture>
   return api("/api/v1/contributions", { method: "POST", headers: {
     authorization: `Upload ${authorization.uploadAuthorization}`, "content-type": "application/json" }, body: raw });
 }
-function runnerOptions(fixture: Awaited<ReturnType<typeof createV11DeviceFixture>>, count = 1) {
+function runnerOptions(
+  fixture: Awaited<ReturnType<typeof createV11DeviceFixture>>,
+  count = 1,
+  syncDay = day,
+) {
   return {
     serverBaseUrl: "https://example.test", deviceAuthorization: fixture.authorization,
-    consent: telemetryV11RequiredConsent(), days: [day],
-    readDay: async (selectedDay: string) => makeV11Day(selectedDay, { usage: selectedDay === day
-      ? Array.from({ length: count }, (_, index) => v11UsageRecord(day, "a", { eventId: "event:v2:" + index.toString(16).padStart(64, "0") }))
+    consent: telemetryV11RequiredConsent(), days: [syncDay],
+    readDay: async (selectedDay: string) => makeV11Day(selectedDay, { usage: selectedDay === syncDay
+      ? Array.from({ length: count }, (_, index) => v11UsageRecord(syncDay, "a", { eventId: "event:v2:" + index.toString(16).padStart(64, "0") }))
       : [] }),
     createEnvelope: encrypted,
     fetchImpl: async (url: URL, options: RequestInit) => {
@@ -230,7 +234,8 @@ describe("staged attribution transport and enrollment floor", () => {
 
   it("the real HTTP runner resumes a bounded partial day and activates only its complete comparison domain", async () => {
     const fixture = await createV11DeviceFixture(db(), { grant: true });
-    const options = runnerOptions(fixture, 201);
+    const syncDay = new Date(fixture.nowEpoch).toISOString().slice(0, 10);
+    const options = runnerOptions(fixture, 201, syncDay);
     const partial = await runTelemetryV11Sync({ ...options, maxChunks: 1 });
     expect(partial.failure).toBeNull();
     expect(partial).toMatchObject({ status: "partial", chunksUploaded: 1, daysSynced: 0, acknowledgedThroughDay: null });
