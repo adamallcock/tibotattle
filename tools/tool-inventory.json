@@ -5,6 +5,21 @@
   "records": [
     {
       "classification": "reusable_benchmark",
+      "owner": "quota_research",
+      "canonicalPath": "scripts/analyze-credit-drawdown.js",
+      "stableAlias": null,
+      "stableAliasReason": "Research instrument for re-verifying purchased-credit pricing after provider rate changes; exercised by focused tests and not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/analyze-credit-drawdown.test.js"
+      ],
+      "decision": "retain_as_reusable_pricing_research_instrument",
+      "provenance": null,
+      "provenanceReason": "Findings were folded into the maintained quota-analysis calibration; the focused test retains the episode, settlement, and redaction contract without a narrative artifact.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "reusable_benchmark",
       "owner": "local_analysis",
       "canonicalPath": "scripts/benchmark-local-analysis-pipeline.mjs",
       "stableAlias": null,

@@ -303,14 +303,15 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  // 85 records / 87 executable paths: release-documentation, Codex contract,
-  // documentation governance, repository-layout, macOS bundle-version, and
-  // local index-recovery gates are reviewed repository operations invoked by
-  // CI, release runbooks, or supported internal product tooling.
+  // 86 records / 88 executable paths: release-documentation, Codex contract,
+  // documentation governance, repository-layout, macOS bundle-version, local
+  // index-recovery gates, and the credit-drawdown pricing research instrument
+  // are reviewed repository operations invoked by CI, release runbooks,
+  // supported internal product tooling, or focused research tests.
   // Keep these exact so any future executable still requires an ownership
   // decision.
-  assert.equal(result.records, 85);
-  assert.equal(result.candidates.length, 87);
+  assert.equal(result.records, 86);
+  assert.equal(result.candidates.length, 88);
   assert.ok(result.aliases >= 25);
 });
 
