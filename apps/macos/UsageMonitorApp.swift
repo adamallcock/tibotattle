@@ -11043,6 +11043,41 @@ private enum MenuBarContractSmokeTest {
         )
         popup.update(snapshot: liveSnapshot, now: observedAt)
         let sevenDayPopup = popup.nativePresentationContract()
+        let overflowPopup = MenuBarPopoverViewController(
+            productName: BundledProduct.displayName,
+            brandImage: NSApp.applicationIconImage,
+            actions: MenuBarPopoverViewController.Actions(
+                openTiboTattle: {},
+                refresh: {},
+                showMore: { _ in }
+            )
+        )
+        var oneLaneSnapshot = liveSnapshot
+        oneLaneSnapshot.lanes = [weeklyLane]
+        let syntheticVisibleFrame = NSRect(
+            x: 0,
+            y: 40,
+            width: 1_440,
+            height: 800
+        )
+        let syntheticAnchorMinY: CGFloat = 428
+        overflowPopup.update(snapshot: oneLaneSnapshot, now: observedAt)
+        let oneLaneViewportCap = overflowPopup.prepareForPresentationForSmokeTest(
+            anchorMinY: syntheticAnchorMinY,
+            visibleFrame: syntheticVisibleFrame
+        )
+        let oneLaneOverflowAtTop = overflowPopup.nativePresentationContract()
+        overflowPopup.scrollToVerticalOffsetForSmokeTest(72)
+        let oneLaneOverflowScrolled = overflowPopup.nativePresentationContract()
+        overflowPopup.update(snapshot: liveSnapshot, now: observedAt)
+        let twoLaneOverflowPreserved = overflowPopup.nativePresentationContract()
+        overflowPopup.scrollToBottomForSmokeTest()
+        let twoLaneOverflowAtBottom = overflowPopup.nativePresentationContract()
+        let twoLaneViewportCap = overflowPopup.prepareForPresentationForSmokeTest(
+            anchorMinY: syntheticAnchorMinY,
+            visibleFrame: syntheticVisibleFrame
+        )
+        let twoLaneOverflowAtTop = overflowPopup.nativePresentationContract()
         popup.selectHistoryRangeForSmokeTest(.thirtyDays)
         let thirtyDayPopup = popup.nativePresentationContract()
         popup.update(snapshot: analyzingLiveSnapshot, now: observedAt)
@@ -11114,6 +11149,72 @@ private enum MenuBarContractSmokeTest {
         noCompanionSnapshot.phase = .unavailable
         popup.update(snapshot: noCompanionSnapshot, now: observedAt)
         let noCompanionPopup = popup.nativePresentationContract()
+        let overflowGeometryChecks: [(String, Bool)] = [
+            ("natural-two-lane-fits-without-cap", !sevenDayPopup.verticalScrollingRequired),
+            ("natural-two-lane-starts-at-top", sevenDayPopup.contentStartsAtTop),
+            ("one-lane-count", oneLaneOverflowAtTop.visibleAllowanceLaneCount == 1),
+            ("one-lane-overflows", oneLaneOverflowAtTop.verticalScrollingRequired),
+            ("one-lane-vertical-only", !oneLaneOverflowAtTop.horizontalScrollingEnabled),
+            ("one-lane-starts-at-top", oneLaneOverflowAtTop.contentStartsAtTop),
+            ("one-lane-header-visible", oneLaneOverflowAtTop.headerVisible),
+            ("synthetic-cap-exact", oneLaneViewportCap == 360),
+            (
+                "forced-viewport-height",
+                oneLaneOverflowAtTop.viewportHeight == oneLaneViewportCap
+            ),
+            (
+                "one-lane-document-exceeds-viewport",
+                oneLaneOverflowAtTop.documentHeight > oneLaneOverflowAtTop.viewportHeight
+            ),
+            ("smoke-scroll-moves", !oneLaneOverflowScrolled.contentStartsAtTop),
+            ("smoke-scroll-positive", oneLaneOverflowScrolled.verticalScrollOffset > 0),
+            ("two-lane-count", twoLaneOverflowPreserved.visibleAllowanceLaneCount == 2),
+            ("two-lane-overflows", twoLaneOverflowPreserved.verticalScrollingRequired),
+            ("two-lane-vertical-only", !twoLaneOverflowPreserved.horizontalScrollingEnabled),
+            (
+                "poll-preserves-scroll",
+                abs(
+                    twoLaneOverflowPreserved.verticalScrollOffset
+                        - oneLaneOverflowScrolled.verticalScrollOffset
+                ) <= 0.5
+            ),
+            (
+                "two-lanes-grow-document",
+                twoLaneOverflowPreserved.documentHeight
+                    > oneLaneOverflowAtTop.documentHeight
+            ),
+            (
+                "bottom-offset-reached",
+                abs(
+                    twoLaneOverflowAtBottom.verticalScrollOffset
+                        - twoLaneOverflowAtBottom.maximumVerticalScrollOffset
+                ) <= 0.5
+            ),
+            ("bottom-offset-positive", twoLaneOverflowAtBottom.maximumVerticalScrollOffset > 0),
+            ("bottom-footer-actions-visible", twoLaneOverflowAtBottom.footerActionsVisible),
+            ("bottom-header-hidden", !twoLaneOverflowAtBottom.headerVisible),
+            ("reopen-synthetic-cap-exact", twoLaneViewportCap == 360),
+            ("reopen-two-lane-count", twoLaneOverflowAtTop.visibleAllowanceLaneCount == 2),
+            ("reopen-two-lane-overflows", twoLaneOverflowAtTop.verticalScrollingRequired),
+            ("reopen-two-lane-vertical-only", !twoLaneOverflowAtTop.horizontalScrollingEnabled),
+            ("reopen-starts-at-top", twoLaneOverflowAtTop.contentStartsAtTop),
+            ("reopen-zero-offset", twoLaneOverflowAtTop.verticalScrollOffset == 0),
+            ("reopen-header-visible", twoLaneOverflowAtTop.headerVisible),
+            ("reopen-footer-actions-below-fold", !twoLaneOverflowAtTop.footerActionsVisible),
+        ]
+        if let failed = overflowGeometryChecks.first(where: { !$0.1 }) {
+            FileHandle.standardError.write(Data(
+                ("macOS menu bar overflow smoke failed: \(failed.0) "
+                    + "one_document=\(oneLaneOverflowAtTop.documentHeight) "
+                    + "two_document=\(twoLaneOverflowAtTop.documentHeight) "
+                    + "viewport=\(twoLaneOverflowAtTop.viewportHeight) "
+                    + "one_offset=\(oneLaneOverflowScrolled.verticalScrollOffset) "
+                    + "two_offset=\(twoLaneOverflowPreserved.verticalScrollOffset) "
+                    + "bottom_offset=\(twoLaneOverflowAtBottom.verticalScrollOffset) "
+                    + "maximum_offset=\(twoLaneOverflowAtBottom.maximumVerticalScrollOffset)\n").utf8
+            ))
+            return 1
+        }
         guard starting.informationRowsAreNative,
               starting.informationRowsHaveTitles,
               unavailable.informationRowsAreNative,
@@ -11125,7 +11226,7 @@ private enum MenuBarContractSmokeTest {
               starting.statusItemButtonRoutesClicks,
               starting.popoverIsTransient,
               starting.popoverContentWidth == 400,
-              !starting.popoverContainsScrollView,
+              starting.popoverContainsScrollView,
               starting.escapeDismissalMonitorInstalled,
               starting.sameAppClickAwayMonitorInstalled,
               starting.appDeactivationDismissalObserverInstalled,
@@ -11141,7 +11242,8 @@ private enum MenuBarContractSmokeTest {
               liveSummary == expectedLiveSummary,
               staleSummary == expectedStaleSummary,
               sevenDayPopup.contentWidth == 400,
-              !sevenDayPopup.containsScrollView,
+              sevenDayPopup.containsScrollView,
+              !sevenDayPopup.horizontalScrollingEnabled,
               sevenDayPopup.visibleAllowanceLaneCount == 2,
               sevenDayPopup.weeklyPaceVisible,
               sevenDayPopup.weeklyPaceState == .over,
@@ -11218,6 +11320,7 @@ private enum MenuBarContractSmokeTest {
                 + "pricing=complete,partial,unavailable model=dst,overlap,future,per-lane "
                 + "reset_credits=absent analysis_title=live-fallback "
                 + "history_retention=refresh,failure,source-reset"
+                + " overflow=screen-capped,vertical-only,top-reset,poll-preserved"
         )
         return 0
     }

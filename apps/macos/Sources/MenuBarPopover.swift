@@ -7,7 +7,16 @@ import Foundation
 struct MenuBarPopoverPresentationContract: Equatable {
     let contentWidth: CGFloat
     let contentHeight: CGFloat
+    let documentHeight: CGFloat
+    let viewportHeight: CGFloat
     let containsScrollView: Bool
+    let verticalScrollingRequired: Bool
+    let horizontalScrollingEnabled: Bool
+    let contentStartsAtTop: Bool
+    let verticalScrollOffset: CGFloat
+    let maximumVerticalScrollOffset: CGFloat
+    let headerVisible: Bool
+    let footerActionsVisible: Bool
     let visibleAllowanceLaneCount: Int
     let weeklyPaceVisible: Bool
     let weeklyPaceState: MenuBarPopoverPaceState?
@@ -39,9 +48,42 @@ private enum MenuBarPopoverMetrics {
     static let width: CGFloat = 400
     static let horizontalInset: CGFloat = 18
     static let verticalInset: CGFloat = 16
+    /// Room for the NSPopover arrow, window chrome and lower screen edge.
+    static let popoverVerticalClearance: CGFloat = 28
     static let sectionSpacing: CGFloat = 13
     static let separatorSpacing: CGFloat = 12
     static let chartHeight: CGFloat = 104
+}
+
+/// One deterministic cap for production status-item geometry and compiled
+/// synthetic geometry. `visibleFrame` excludes the Dock/menu bar; the anchor
+/// further limits the space actually available below the clicked status item.
+func menuBarPopoverMaximumViewportHeight(
+    anchorMinY: CGFloat?,
+    visibleFrame: NSRect
+) -> CGFloat {
+    let screenMaximum = max(
+        1,
+        floor(
+            visibleFrame.height
+                - MenuBarPopoverMetrics.popoverVerticalClearance
+        )
+    )
+    guard let anchorMinY, anchorMinY.isFinite else { return screenMaximum }
+    let anchorMaximum = floor(
+        anchorMinY
+            - visibleFrame.minY
+            - MenuBarPopoverMetrics.popoverVerticalClearance
+    )
+    return min(screenMaximum, max(1, anchorMaximum))
+}
+
+/// AppKit's default document coordinates start at the lower edge. A flipped
+/// document gives this top-to-bottom instrument an unambiguous zero offset,
+/// so every explicit opening can reveal the header while background updates
+/// preserve the user's current vertical position.
+private final class MenuBarPopoverDocumentView: NSView {
+    override var isFlipped: Bool { true }
 }
 
 private enum MenuBarPopoverHistoryState {
@@ -715,6 +757,10 @@ final class MenuBarPopoverViewController: NSViewController {
     private let disclaimerLabel = NSTextField(wrappingLabelWithString: "")
     private let openButton = NSButton()
     private let refreshButton = NSButton()
+    private let scrollView = NSScrollView()
+    private let contentDocumentView = MenuBarPopoverDocumentView()
+    private let contentStack = NSStackView()
+    private var headerView: NSView?
 
     private var currentSnapshot = MenuBarStatusSnapshot()
     private var currentNow = Date()
@@ -723,6 +769,9 @@ final class MenuBarPopoverViewController: NSViewController {
     private var historyState: MenuBarPopoverHistoryState = .unavailable
     private var partialPricingDisclosed = false
     private var pricingState: MenuBarPopoverPricingState = .unavailable
+    private var documentHeightConstraint: NSLayoutConstraint?
+    private var naturalContentHeight: CGFloat = 1
+    private var maximumViewportHeight: CGFloat?
     private var didLoadInterface = false
 
     init(productName: String, brandImage: NSImage?, actions: Actions) {
@@ -749,28 +798,60 @@ final class MenuBarPopoverViewController: NSViewController {
 
         configureTypography()
 
-        let content = NSStackView()
-        content.translatesAutoresizingMaskIntoConstraints = false
-        content.orientation = .vertical
-        content.alignment = .leading
-        content.spacing = MenuBarPopoverMetrics.sectionSpacing
-        root.addSubview(content)
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+        scrollView.horizontalScrollElasticity = .none
+        scrollView.verticalScrollElasticity = .automatic
+        scrollView.scrollerStyle = .overlay
+        root.addSubview(scrollView)
+
+        contentDocumentView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.documentView = contentDocumentView
+
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        contentStack.orientation = .vertical
+        contentStack.alignment = .leading
+        contentStack.spacing = MenuBarPopoverMetrics.sectionSpacing
+        contentDocumentView.addSubview(contentStack)
+        let documentHeightConstraint = contentDocumentView.heightAnchor.constraint(
+            equalToConstant: 1
+        )
+        self.documentHeightConstraint = documentHeightConstraint
         NSLayoutConstraint.activate([
-            content.leadingAnchor.constraint(
-                equalTo: root.leadingAnchor,
+            scrollView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: root.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            contentDocumentView.leadingAnchor.constraint(
+                equalTo: scrollView.contentView.leadingAnchor
+            ),
+            contentDocumentView.topAnchor.constraint(
+                equalTo: scrollView.contentView.topAnchor
+            ),
+            contentDocumentView.widthAnchor.constraint(
+                equalTo: scrollView.contentView.widthAnchor
+            ),
+            documentHeightConstraint,
+            contentStack.leadingAnchor.constraint(
+                equalTo: contentDocumentView.leadingAnchor,
                 constant: MenuBarPopoverMetrics.horizontalInset
             ),
-            content.trailingAnchor.constraint(
-                equalTo: root.trailingAnchor,
+            contentStack.trailingAnchor.constraint(
+                equalTo: contentDocumentView.trailingAnchor,
                 constant: -MenuBarPopoverMetrics.horizontalInset
             ),
-            content.topAnchor.constraint(
-                equalTo: root.topAnchor,
+            contentStack.topAnchor.constraint(
+                equalTo: contentDocumentView.topAnchor,
                 constant: MenuBarPopoverMetrics.verticalInset
             ),
         ])
 
         let header = makeHeader()
+        headerView = header
         let allowanceSection = makeAllowanceSection()
         let historySection = makeHistorySection()
         let footer = makeFooter()
@@ -786,11 +867,11 @@ final class MenuBarPopoverViewController: NSViewController {
             MenuBarPopoverSeparator(),
             footer,
         ] {
-            content.addArrangedSubview(arranged)
-            arranged.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+            contentStack.addArrangedSubview(arranged)
+            arranged.widthAnchor.constraint(equalTo: contentStack.widthAnchor).isActive = true
         }
 
-        content.setCustomSpacing(
+        contentStack.setCustomSpacing(
             MenuBarPopoverMetrics.separatorSpacing,
             after: header
         )
@@ -858,10 +939,25 @@ final class MenuBarPopoverViewController: NSViewController {
     func nativePresentationContract() -> MenuBarPopoverPresentationContract {
         loadViewIfNeeded()
         view.layoutSubtreeIfNeeded()
+        let viewportHeight = scrollView.contentView.bounds.height
+        let documentHeight = contentDocumentView.bounds.height
+        let verticalOffset = scrollView.contentView.bounds.minY
+        let maximumVerticalOffset = maximumVerticalScrollOffset()
         return MenuBarPopoverPresentationContract(
             contentWidth: view.bounds.width,
             contentHeight: view.bounds.height,
+            documentHeight: documentHeight,
+            viewportHeight: viewportHeight,
             containsScrollView: containsScrollView(view),
+            verticalScrollingRequired: documentHeight > viewportHeight + 0.5,
+            horizontalScrollingEnabled: scrollView.hasHorizontalScroller
+                || scrollView.horizontalScrollElasticity != .none,
+            contentStartsAtTop: abs(verticalOffset) <= 0.5,
+            verticalScrollOffset: verticalOffset,
+            maximumVerticalScrollOffset: maximumVerticalOffset,
+            headerVisible: headerView.map(isFullyVisibleInViewport) ?? false,
+            footerActionsVisible: isFullyVisibleInViewport(openButton)
+                && isFullyVisibleInViewport(refreshButton),
             visibleAllowanceLaneCount: visibleAllowanceLaneCount,
             weeklyPaceVisible: !weeklySection.isHidden,
             weeklyPaceState: weeklySection.isHidden
@@ -879,6 +975,58 @@ final class MenuBarPopoverViewController: NSViewController {
             openActionEnabled: openButton.isEnabled,
             refreshActionEnabled: refreshButton.isEnabled
         )
+    }
+
+    /// Apply the height that can actually fit below the status item. The
+    /// anchor's screen coordinates matter on mixed-size multi-display setups;
+    /// `visibleFrame` also respects the Dock and menu-bar reservations.
+    /// Explicit opening resets to the top, while ordinary `update` calls keep
+    /// the current scroll offset.
+    func prepareForPresentation(from anchor: NSView) {
+        loadViewIfNeeded()
+        let screen = anchor.window?.screen ?? NSScreen.main ?? NSScreen.screens.first
+        maximumViewportHeight = screen.map { screen in
+            let anchorMinY = anchor.window.map { window in
+                let anchorInWindow = anchor.convert(anchor.bounds, to: nil)
+                return window.convertToScreen(anchorInWindow).minY
+            }
+            return menuBarPopoverMaximumViewportHeight(
+                anchorMinY: anchorMinY,
+                visibleFrame: screen.visibleFrame
+            )
+        }
+        updatePreferredContentSize()
+        scrollToTop()
+    }
+
+    /// Deterministic packaged-smoke seam through the exact production cap.
+    @discardableResult
+    func prepareForPresentationForSmokeTest(
+        anchorMinY: CGFloat,
+        visibleFrame: NSRect
+    ) -> CGFloat {
+        loadViewIfNeeded()
+        let cap = menuBarPopoverMaximumViewportHeight(
+            anchorMinY: anchorMinY,
+            visibleFrame: visibleFrame
+        )
+        maximumViewportHeight = cap
+        updatePreferredContentSize()
+        scrollToTop()
+        return cap
+    }
+
+    /// Deterministic packaged-smoke seam that proves polling updates retain a
+    /// user's established scroll position.
+    func scrollToVerticalOffsetForSmokeTest(_ offset: CGFloat) {
+        loadViewIfNeeded()
+        setVerticalScrollOffset(offset)
+    }
+
+    /// Deterministic packaged-smoke seam for the actual bottom scroll extent.
+    func scrollToBottomForSmokeTest() {
+        loadViewIfNeeded()
+        setVerticalScrollOffset(maximumVerticalScrollOffset())
     }
 
     /// Deterministic packaged-smoke seam. The production segmented control and
@@ -1380,19 +1528,64 @@ final class MenuBarPopoverViewController: NSViewController {
     }
 
     private func updatePreferredContentSize() {
-        guard didLoadInterface, let content = view.subviews.first else { return }
+        guard didLoadInterface, let documentHeightConstraint else { return }
+        let previousVerticalOffset = scrollView.contentView.bounds.minY
         view.frame.size.width = MenuBarPopoverMetrics.width
         view.layoutSubtreeIfNeeded()
-        let fittingHeight = ceil(
-            content.fittingSize.height + MenuBarPopoverMetrics.verticalInset * 2
+        naturalContentHeight = max(
+            1,
+            ceil(
+                contentStack.fittingSize.height
+                    + MenuBarPopoverMetrics.verticalInset * 2
+            )
+        )
+        let viewportHeight = min(
+            naturalContentHeight,
+            maximumViewportHeight ?? naturalContentHeight
+        )
+        documentHeightConstraint.constant = max(
+            naturalContentHeight,
+            viewportHeight
         )
         let size = NSSize(
             width: MenuBarPopoverMetrics.width,
-            height: max(1, fittingHeight)
+            height: max(1, viewportHeight)
         )
         view.frame.size = size
         preferredContentSize = size
         view.layoutSubtreeIfNeeded()
+        setVerticalScrollOffset(previousVerticalOffset)
+    }
+
+    private func scrollToTop() {
+        setVerticalScrollOffset(0)
+    }
+
+    private func maximumVerticalScrollOffset() -> CGFloat {
+        max(
+            0,
+            contentDocumentView.bounds.height
+                - scrollView.contentView.bounds.height
+        )
+    }
+
+    private func isFullyVisibleInViewport(_ candidate: NSView) -> Bool {
+        let frameInClipView = scrollView.contentView.convert(
+            candidate.bounds,
+            from: candidate
+        )
+        let visibleBounds = scrollView.contentView.bounds.insetBy(dx: -0.5, dy: -0.5)
+        return !candidate.isHidden
+            && !frameInClipView.isEmpty
+            && visibleBounds.contains(frameInClipView)
+    }
+
+    private func setVerticalScrollOffset(_ requestedOffset: CGFloat) {
+        view.layoutSubtreeIfNeeded()
+        let maximumOffset = maximumVerticalScrollOffset()
+        let offset = min(max(0, requestedOffset), maximumOffset)
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: offset))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
     private func renderableLanes(

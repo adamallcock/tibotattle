@@ -1693,6 +1693,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
         }
         menu.cancelTracking()
         isMenuTracking = false
+        popoverController.prepareForPresentation(from: sender)
         popoverController.update(snapshot: snapshot)
         popover.show(
             relativeTo: sender.bounds,

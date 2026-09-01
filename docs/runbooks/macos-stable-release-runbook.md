@@ -241,8 +241,9 @@ node scripts/release-macos-app.js \
 
 For the 0.1.17 stable release, `CFBundleShortVersionString` remains `0.1.17`
 and the owner-reviewed signed `CFBundleVersion` is exactly `1024`. It follows
-the internal-dogfood 0.1.17 startup-recovery allocation `1023.2`, migration RC3
-`1023.1`, retained RC2 `1023`, and earlier shared-identity dogfood `1022`. The
+the final integrated internal-dogfood 0.1.17 allocation `1023.3`,
+startup-recovery RC4 `1023.2`, migration RC3 `1023.1`, retained RC2 `1023`,
+and earlier shared-identity dogfood `1022`. The
 checked-in allocation is authoritative; the
 `USAGE_MONITOR_BUNDLE_VERSION` value above is only an exact assertion and
 cannot select or override a different build. A future stable version must add

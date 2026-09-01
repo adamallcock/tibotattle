@@ -277,3 +277,18 @@ authorized old-to-new installation check and complete native visual/interaction
 QA. No real TiboTattle Keychain item, installed app, application history, consent,
 or hosted deployment has been changed by these implementation and synthetic
 qualification steps. No release is established by this decision.
+
+## Later dogfood amendment: 2026-08-31
+
+The `1023.1` sentence above records the allocation at that checkpoint. PR #95
+subsequently merged as `a3c850360bc83c0e27bef2171aeb4a302b72f472`, and the
+startup-recovery RC4 used build `1023.2`. RC4 source
+`735a59ce2ec01df0e381fb1aa878c5c7a39edcd8` was signed, notarized, and installed;
+that artifact excludes later PR #94 and does not qualify current main or stable.
+
+The next integrated dogfood allocation is RC5 build `1023.3`, strictly after
+RC4 and before reserved stable build `1024`. It has not yet been built or
+qualified. The prompt-avoidance contract is unchanged: automatic Keychain reads
+remain bounded to three non-interactive attempts, and only the explained,
+deliberate Settings recovery action may request approval. An unexpected prompt
+in an automatic flow remains release-blocking.

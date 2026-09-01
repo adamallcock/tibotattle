@@ -138,6 +138,15 @@ dogfood build `1022`; the stable final also orders after the dogfood candidate.
 Release tooling refuses a signed version/channel without an owner-reviewed
 allocation, and an environment value can only assert the exact allocation.
 
+#### Allocation amendment, 2026-08-31
+
+The `1023` paragraph above records the first 0.1.17 dogfood allocation. RC2 used
+build `1023`, RC3 used `1023.1`, and the signed, notarized, installed
+startup-recovery RC4 used `1023.2`. The integrated RC5 allocation is now
+`1023.3`; stable remains reserved at `1024`. Each increment retains the same
+production bundle identity and therefore must be monotonic. RC4 evidence applies
+only to its frozen source and is not inherited by RC5 or stable.
+
 The separately identified Preview app uses the deterministic migration epoch
 `(2000 + major).minor.patch`, so preview package `0.1.17` maps to
 `2000.1.17`. That keeps local preview builds deterministic and valid within

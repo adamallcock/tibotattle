@@ -2,16 +2,17 @@
 title: Native dogfood startup recovery
 date: 2026-08-31
 type: plan
-status: in-progress
+status: implemented-pending-integrated-candidate
 ---
 
 # Boundary
 
-Finish the current native 0.1.17 dogfood before adding account/plan PR #94 to
-an installed candidate. The owner merged #94 into main at `20f449ff` during
-qualification; this corrective candidate remains based on `a3c85036` plus only
-the startup fix. Carry the fix to newer main separately without silently
-changing this artifact's source.
+The corrective RC4 was intentionally frozen before account/plan PR #94. The
+owner later merged #94 into main at `20f449ff`, and PR #96 carried the startup
+fix to newer main as merge `3b0f2d23`. Preserve the artifact boundary: installed
+RC4 source `735a59ce` is based on `a3c85036` plus only the startup fix; it does
+not contain or qualify PR #94. The integrated current-main candidate is a new
+RC5, not a relabel of RC4.
 The signed PR #95 candidate reproduced `UM_MACOS_DASHBOARD_READY_TIMEOUT` on
 normal launch with existing schema-11 history. A replacement companion later
 reported a ready snapshot and returned the overview in 51 ms; the native window
@@ -36,8 +37,11 @@ or public release is part of this correction.
   callback and optional-service regressions. Keep every existing safety gate.
 - [x] Validate the combined corrective source and retained R7 freshness. Allocate
   its monotonic native build and freeze the source separately from newer main.
-- [ ] Sign/notarize, preserve state and the prior app, install and verify real
-  native startup, refresh, restart and prompt-free behavior.
+- [x] Sign, notarize, preserve state and the prior app, and install frozen RC4
+  build `1023.2`. This qualifies only source `735a59ce`.
+- [ ] Re-run exact-source artifact gates and verify native startup, refresh,
+  restart, pairing repair, and prompt-free behavior on integrated RC5 build
+  `1023.3`.
 
 ## Acceptance
 
@@ -85,9 +89,10 @@ not to the later main integration described below.
   discovery retains its existing local queue-bookkeeping semantics; it does
   not itself upload. A primary read that never settles still reaches the
   native hard deadline rather than being presented as successful.
-- Exact-source hosted checks, signing, notarization, state-preserving replacement
-  and installed native interaction
-  remain separate pending steps. Browser QA is not native qualification.
+- RC4 signing, notarization, state-preserving replacement, and installation were
+  completed later for this exact frozen source. That evidence is not inherited
+  by the integrated PR #94 tree or stable release. Browser QA remains distinct
+  from physical native qualification.
 
 ## Source-only main integration
 
@@ -105,5 +110,25 @@ Both protected R7 freshness checks fail on the current workload digest and file
 count. The integrated workload provenance was recomputed from every main Git
 blob and matches this tree exactly; all ten retained receipts also match main
 byte-for-byte. These failures are inherited from main, not introduced by the
-startup fix. No protected receipt was edited or regenerated. Main-source merge
-remains review-gated, separately from the RC4 signed-artifact qualification.
+startup fix. No protected receipt was edited or regenerated. At the time of
+this checkpoint, main-source merge remained review-gated, separately from the
+RC4 signed-artifact qualification.
+
+## Merge and integrated-candidate amendment
+
+PR #96 subsequently merged the source-only startup correction into `main` as
+`3b0f2d23775c0ca1f092fe3eb48f0c3166c8461a`. That release-preparation base
+includes PR #94 and PR #95. The earlier stale-R7 statement remains the accurate
+checkpoint for that pre-merge review. The current RC5 R7 workload-source closure
+subsequently regenerated and validated all ten protected receipts on 2026-08-31
+against 359 files / workload SHA-256
+`4c3058b3453bda2696e946952d18e81310f26eb0187074d410c730e44162f1d6`.
+The reconstructed decision remains `release_open`; this is current evidence,
+not a claim that R7's standing promotion ceilings or PR #94's empirical gate are
+closed. The native startup and RC5 allocation files are outside that workload
+closure and remain subject to their separate native and artifact gates.
+
+Installed RC4 source `735a59ce2ec01df0e381fb1aa878c5c7a39edcd8`, build
+`1023.2`, is signed and notarized but excludes PR #94. The next integrated
+dogfood therefore uses monotonic RC5 build `1023.3`; it has not yet been built,
+signed, notarized, or installed. Stable build `1024` remains separately reserved.
