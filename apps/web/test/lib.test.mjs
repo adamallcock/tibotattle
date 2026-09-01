@@ -1054,7 +1054,7 @@ test("refresh polling budget gives each accepted continuation a fresh window", (
 
 test("default local analysis permits only two bounded continuations", () => {
   const budget = createRefreshPollingBudget();
-  assert.equal(LOCAL_REFRESH_POLLING_WINDOW_MS, 121 * 60 * 1_000);
+  assert.equal(LOCAL_REFRESH_POLLING_WINDOW_MS, 241 * 60 * 1_000);
   assert.equal(budget.canContinue(), true);
   assert.equal(budget.noteContinuation(), true);
   assert.equal(budget.noteContinuation(), true);

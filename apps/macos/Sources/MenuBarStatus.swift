@@ -289,7 +289,7 @@ enum LocalAnalysisTerminalOutcome: String, Equatable {
     /// `nil` preserves the current policy before any pass has completed.
     /// Only a clean success re-enables automatic stale-evidence refresh. A
     /// degraded, cancelled, or failed cold build must wait for an explicit
-    /// retry instead of restarting for up to two hours on every idle poll.
+    /// retry instead of restarting for up to four hours on every idle poll.
     var automaticRefreshSuppressed: Bool? {
         switch self {
         case .idle:

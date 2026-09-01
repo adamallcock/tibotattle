@@ -147,6 +147,15 @@ startup-recovery RC4 used `1023.2`. The integrated RC5 allocation is now
 production bundle identity and therefore must be monotonic. RC4 evidence applies
 only to its frozen source and is not inherited by RC5 or stable.
 
+#### Allocation amendment, 2026-08-31 (RC6)
+
+RC5 build `1023.3` was subsequently signed, notarized, installed, and then
+failed its real full-accounting refresh gate because the ordinary five-minute
+deadline terminated a healthy v0.14 cache rebuild. The corrected RC6 dogfood is
+allocated `1023.4`, strictly after installed RC5 and before reserved stable
+`1024`. RC5 artifact evidence remains evidence for RC5 only; it cannot qualify
+RC6 or stable.
+
 The separately identified Preview app uses the deterministic migration epoch
 `(2000 + major).minor.patch`, so preview package `0.1.17` maps to
 `2000.1.17`. That keeps local preview builds deterministic and valid within

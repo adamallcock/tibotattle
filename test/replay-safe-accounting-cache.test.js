@@ -2959,6 +2959,45 @@ test("refresh forwards AbortSignal and never writes an aborted projection", asyn
   assert.equal(await readTestCache(cacheFile), null);
 });
 
+test("an abort during cache-store preparation preserves the retained cache", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-publish-abort-"));
+  const cacheFile = join(directory, "accounting.json");
+  await refreshReplaySafeAccountingCache({
+    cacheFile,
+    now: () => NOW,
+    scan: scanner([
+      usageEvent({
+        timestamp: "2026-07-27T11:55:00.000Z",
+        components: { input_uncached_tokens: 1_000_000 },
+      }),
+    ]),
+  });
+  const before = await readTestCache(cacheFile);
+  const controller = new AbortController();
+
+  // The async writer has entered ensureDatabase before returning this promise.
+  // Abort immediately while that preparation is awaiting filesystem work; the
+  // post-preparation check must stop the synchronous replacement transaction.
+  const publication = writeLocalCollectorAccountingCache({
+    stateFile: cacheFile,
+    cache: {
+      ...before,
+      generatedAt: new Date(NOW + 1_000).toISOString(),
+    },
+    signal: controller.signal,
+  });
+  controller.abort();
+
+  await assert.rejects(
+    publication,
+    (error) => (
+      error?.name === "AbortError"
+      && error?.code === "accounting_refresh_aborted"
+    ),
+  );
+  assert.deepEqual(await readTestCache(cacheFile), before);
+});
+
 test("compact transition input ceilings fail closed without truncating or replacing the last good cache", async () => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-bounds-"));
   const cacheFile = join(directory, "accounting.json");

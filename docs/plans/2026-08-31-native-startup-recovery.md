@@ -132,3 +132,8 @@ Installed RC4 source `735a59ce2ec01df0e381fb1aa878c5c7a39edcd8`, build
 `1023.2`, is signed and notarized but excludes PR #94. The next integrated
 dogfood therefore uses monotonic RC5 build `1023.3`; it has not yet been built,
 signed, notarized, or installed. Stable build `1024` remains separately reserved.
+
+RC5 was subsequently built, signed, notarized and installed, then failed its
+separate real full-accounting refresh gate at the ordinary five-minute timeout.
+The corrective RC6 allocation is `1023.4`; none of RC5's artifact or startup
+evidence qualifies that later source.

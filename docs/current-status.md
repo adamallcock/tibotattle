@@ -113,21 +113,26 @@ The complete qualification matrix and rules for changing these claims are in
 
 - The checked-out source contains unreleased changes after `v0.1.16`; the
   [changelog](../CHANGELOG.md) records them without claiming they shipped.
-- The installed RC4 proves only frozen source `735a59ce`, build `1023.2`. It
-  excludes PR #94. The integrated RC5 allocation is `1023.3`, but no signed,
-  notarized, or installed RC5 artifact is established by this snapshot.
-- The current RC5 R7 workload-source closure has fresh protected dual-runtime
+- Integrated RC5 source `ff506dc3`, build `1023.3`, was signed, notarized and
+  installed on 2026-08-31. Its state-preserving replacement and first launch
+  passed, but its real full-accounting refresh did not: a healthy v0.14 rebuild
+  was terminated by the ordinary five-minute deadline. RC5 is therefore not
+  the dogfood handoff. Corrective RC6 is allocated monotonic build `1023.4` and
+  still needs frozen-source, R7, signed-artifact, replacement and physical
+  refresh evidence.
+- The RC5 R7 workload-source closure has protected dual-runtime
   receipts for 359 files / workload SHA-256
   `4c3058b3453bda2696e946952d18e81310f26eb0187074d410c730e44162f1d6`.
-  Both decisions remain honestly `release_open`; a later workload change would
-  make these receipts historical again. Native UI and build-allocation files are
-  outside that R7 closure and require their separate macOS source, smoke,
+  Both decisions remain honestly `release_open`. RC6 changes workload-owned
+  refresh/accounting source, so those receipts are now historical for RC5 and
+  must be regenerated after the corrective source is frozen. Native UI and
+  build-allocation files remain subject to their separate macOS source, smoke,
   signed-artifact, and installed-artifact gates.
 - The public service and release feed are remote state. Their health and
   availability can change after this snapshot.
 - Public health is not proof that every admin, identity, contribution, deletion,
   or updater path works end to end.
-- Before RC5 dogfood sign-off or 0.1.17 stable qualification, PR #94 still needs
+- Before RC6 dogfood sign-off or 0.1.17 stable qualification, PR #94 still needs
   the fixed real-corpus before/after coverage, diagnostic-distribution, and
   resource review. Current APIs cannot emit the complete named fit-rejection
   reconciliation, so that gate remains open rather than inferred green. The
@@ -139,7 +144,7 @@ The complete qualification matrix and rules for changing these claims are in
   the strict pre-PR scan reported `codex_rollout_content_invalid`. The supported
   resource benchmark independently stopped at `benchmark_cold_rebuild_incomplete`
   on both exact PR #94 revisions. No empirical comparison receipt was produced,
-  no source was excluded, and this remains an open RC5/stable gate.
+  no source was excluded, and this remains an open RC6/stable gate.
 
 ## How to refresh this page
 

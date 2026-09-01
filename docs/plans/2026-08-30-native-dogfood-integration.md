@@ -243,7 +243,11 @@ and physical native checks remain. Public release/updater publication is not
 part of this internal dogfood. Private state records, comparisons, UI captures
 and release inputs remain local and outside tracked docs.
 
-## RC4 handoff and integrated RC5 boundary
+## RC4 handoff and integrated RC5 boundary (pre-RC5 snapshot)
+
+This section records the gate state before RC5 was frozen and built. The later
+RC5 installed-refresh finding and RC6 amendment below supersede its present-tense
+candidate status; the open PR #94 empirical boundary remains unchanged.
 
 Frozen RC4 source `735a59ce2ec01df0e381fb1aa878c5c7a39edcd8`, build
 `1023.2`, was subsequently signed, notarized, and installed. That artifact is
@@ -278,3 +282,34 @@ The current source repair requires both the newer desktop path and compatible
 hosted Worker behavior. Worker migrations/deployment, telemetry v1.1 activation,
 and new consent are protected operations outside this internal artifact build;
 desktop installation alone cannot establish end-to-end pairing repair.
+
+## RC5 installed-refresh finding and RC6 correction
+
+RC5 source `ff506dc3`, tagged for internal dogfood and allocated build `1023.3`,
+subsequently passed source, protected R7, Developer ID, notarization, stapling,
+Gatekeeper, state-preserving replacement and first-launch checks. The exact
+installed artifact then failed the required real refresh check. Its current
+schema-11 index was reusable, but the v0.14 accounting semantics required a
+full cache rebuild. That rebuild remained active below the fixed memory ceiling
+until the ordinary five-minute controller deadline aborted it; the previous
+cache remained intact and no partial result was published. Repeating RC5 would
+restart the same uncheckpointed work and is not an acceptable handoff.
+
+Corrective RC6 uses monotonic build `1023.4`. The runner now emits its fixed,
+count-free accounting marker only after the authoritative cache reuse check has
+failed and immediately before a real full rebuild. The controller accepts that
+exact marker once and extends the run to the existing four-hour total cold-work
+ceiling. Cache hits, malformed progress and repeated markers retain the normal
+five-minute deadline. Browser and native polling remain attached through the
+server ceiling plus one minute, and cancellation is rechecked immediately before
+atomic cache publication. Existing resource, generation, size, privacy and
+killable-child guards are unchanged.
+
+RC6 must rerun the exact source gates and protected R7 after source freeze, then
+repeat signing, notarization, replacement validation, state-preserving install
+and physical checks. The real full-accounting refresh must reach terminal
+success and publish current generation-matched v0.14 figures; the two-limit
+popover must also pass its installed interaction check. PR #94's purpose-built
+fixed-corpus comparator remains an open internal-dogfood/stable gate, and no
+hosted Worker deployment, migration, stable tag, appcast or public artifact is
+authorized by this correction.

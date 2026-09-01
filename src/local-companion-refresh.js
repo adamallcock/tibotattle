@@ -1,6 +1,7 @@
 import { randomInt, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import {
   isValidQuotaWindowDuration,
 } from "@app-usagemonitor/quota-analysis";
@@ -1207,16 +1208,6 @@ export function createLocalCollectorRefreshRunner({
     if (refreshAccounting !== null
         && accountingMayRun
         && unifiedAccountingReady) {
-      if (accountingSourceMode === "unified" && signal?.aborted !== true) {
-        // Cursor reuse means the last scan count can be only a handful of
-        // changed files. It is no longer progress once ingestion has returned.
-        // Keep this count-free stage through accounting and the controller's
-        // full snapshot reload; neither boundary is a completion claim.
-        await onProgress?.({
-          kind: ACCOUNTING_PROGRESS_KIND,
-          status: "calculating",
-        });
-      }
       // A provider quota observation does not alter replay-safe token
       // accounting. Reuse a current cache when no rollout usage record was
       // added, while the collector state continues to supply the fresh quota
@@ -1268,6 +1259,19 @@ export function createLocalCollectorRefreshRunner({
         }
       }
       if (accounting === null && !withinRebuildBackoff) {
+        if (accountingSourceMode === "unified" && signal?.aborted !== true) {
+          // This exact count-free marker is emitted only after the current
+          // cache has failed the authoritative reuse check and immediately
+          // before a full replay-safe rebuild. The controller can therefore
+          // grant the bounded cold-work deadline without guessing from stale
+          // presentation state or extending an ordinary cache-hit refresh.
+          // Keep it through the controller's full snapshot reload; neither
+          // boundary is itself a completion claim.
+          await onProgress?.({
+            kind: ACCOUNTING_PROGRESS_KIND,
+            status: "calculating",
+          });
+        }
         let rebuilt = null;
         try {
           rebuilt = await refreshAccounting({
@@ -1712,10 +1716,17 @@ export const LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS =
   4 * 60 * 60_000;
 export const LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS =
   LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS;
+export const LOCAL_COMPANION_REFRESH_CANCEL_SETTLEMENT_MS = 30_000;
+const LOCAL_COMPANION_REFRESH_CANCEL_SETTLEMENT_MAX_MS = 60_000;
+const CANCEL_SETTLEMENT_EXPIRED = Symbol("cancel_settlement_expired");
 
 export class LocalCompanionRefreshController {
+  #accountingTimeoutMs;
   #abortController = null;
+  #beginCancellationSettlement = null;
+  #cancelSettlementMs;
   #cancelRequested = false;
+  #clearTimeoutImpl;
   #clock;
   #createRefreshId;
   #dataStore;
@@ -1725,16 +1736,23 @@ export class LocalCompanionRefreshController {
   #onDegradedOutcome;
   #onTerminalFailure;
   #runner;
+  #setTimeoutImpl;
   #state;
   #timeoutMs;
   #timeoutMsForRun;
+  #monotonicClock;
 
   constructor({
     runner,
     dataStore,
     timeoutMs = 5 * 60_000,
     timeoutMsForRun = null,
+    accountingTimeoutMs = LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS,
+    cancelSettlementMs = LOCAL_COMPANION_REFRESH_CANCEL_SETTLEMENT_MS,
     clock = () => Date.now(),
+    monotonicClock = () => performance.now(),
+    setTimeoutImpl = setTimeout,
+    clearTimeoutImpl = clearTimeout,
     createRefreshId = randomUUID,
     // Observer for terminal refresh failures. Receives only the bounded
     // identity the failed state itself carries — errorCode, and failedStep /
@@ -1761,6 +1779,30 @@ export class LocalCompanionRefreshController {
     if (timeoutMsForRun !== null && typeof timeoutMsForRun !== "function") {
       throw new TypeError("timeoutMsForRun must be a function or null");
     }
+    if (!Number.isSafeInteger(accountingTimeoutMs)
+        || accountingTimeoutMs < 1_000
+        || accountingTimeoutMs > LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS) {
+      throw new TypeError(
+        "accountingTimeoutMs must be between 1,000 and 14,400,000",
+      );
+    }
+    if (!Number.isSafeInteger(cancelSettlementMs)
+        || cancelSettlementMs < 1_000
+        || cancelSettlementMs
+          > LOCAL_COMPANION_REFRESH_CANCEL_SETTLEMENT_MAX_MS) {
+      throw new TypeError(
+        "cancelSettlementMs must be between 1,000 and 60,000",
+      );
+    }
+    if (typeof monotonicClock !== "function") {
+      throw new TypeError("monotonicClock must be a function");
+    }
+    if (typeof setTimeoutImpl !== "function"
+        || typeof clearTimeoutImpl !== "function") {
+      throw new TypeError(
+        "setTimeoutImpl and clearTimeoutImpl must be functions",
+      );
+    }
     if (typeof createRefreshId !== "function") {
       throw new TypeError("createRefreshId must be a function");
     }
@@ -1774,7 +1816,12 @@ export class LocalCompanionRefreshController {
     this.#dataStore = dataStore;
     this.#timeoutMs = timeoutMs;
     this.#timeoutMsForRun = timeoutMsForRun;
+    this.#accountingTimeoutMs = accountingTimeoutMs;
+    this.#cancelSettlementMs = cancelSettlementMs;
     this.#clock = clock;
+    this.#monotonicClock = monotonicClock;
+    this.#setTimeoutImpl = setTimeoutImpl;
+    this.#clearTimeoutImpl = clearTimeoutImpl;
     this.#createRefreshId = createRefreshId;
     this.#onTerminalFailure = onTerminalFailure;
     this.#onDegradedOutcome = onDegradedOutcome;
@@ -1808,6 +1855,11 @@ export class LocalCompanionRefreshController {
       ...this.#state,
       status: "cancelling",
     };
+    // An explicit cancel supersedes the ordinary or extended work deadline.
+    // Bound settlement independently so an injected or defective runner that
+    // ignores AbortSignal cannot hold the foreground refresh lock for the
+    // remainder of a four-hour cold-accounting allowance.
+    this.#beginCancellationSettlement?.();
     this.#abortController.abort();
     return true;
   }
@@ -1886,16 +1938,75 @@ export class LocalCompanionRefreshController {
     };
     let timedOut = false;
     let timeout;
+    let cancellationSettlementTimeout;
+    let accountingDeadlineApplied = false;
+    const timeoutStartedAt = this.#monotonicClock();
     const controller = new AbortController();
     this.#abortController = controller;
-    const work = Promise.resolve()
+    const expire = () => {
+      if (this.#state.refreshId !== refreshId
+          || this.#cancelRequested
+          || !["running", "cancelling"].includes(this.#state.status)) return;
+      timedOut = true;
+      controller.abort();
+      this.#state = {
+        status: "failed",
+        refreshId: this.#state.refreshId,
+        startedAt: this.#state.startedAt,
+        finishedAt: new Date(this.#clock()).toISOString(),
+        result: null,
+        progress: terminalRefreshProgress(this.#state.progress),
+        quickResultAt: this.#state.quickResultAt,
+        errorCode: "refresh_timed_out",
+      };
+      // The timeout IS the terminal failure the user sees, and a hung runner
+      // may never settle — file the trail entry now, not at settlement.
+      this.#notifyTerminalFailure();
+    };
+    const armTimeoutFromStart = (budgetMs) => {
+      this.#clearTimeoutImpl(timeout);
+      const elapsedMs = Math.max(
+        0,
+        this.#monotonicClock() - timeoutStartedAt,
+      );
+      const remainingMs = Math.max(1, Math.ceil(budgetMs - elapsedMs));
+      timeout = this.#setTimeoutImpl(expire, remainingMs);
+      timeout.unref?.();
+    };
+    let resolveCancellationSettlement;
+    const cancellationSettlement = new Promise((resolve) => {
+      resolveCancellationSettlement = resolve;
+    });
+    this.#beginCancellationSettlement = () => {
+      this.#clearTimeoutImpl(timeout);
+      if (cancellationSettlementTimeout !== undefined) return;
+      cancellationSettlementTimeout = this.#setTimeoutImpl(
+        () => resolveCancellationSettlement(CANCEL_SETTLEMENT_EXPIRED),
+        this.#cancelSettlementMs,
+      );
+      cancellationSettlementTimeout.unref?.();
+    };
+    const runnerWork = Promise.resolve()
       .then(() => this.#runner({
         signal: controller.signal,
         onProgress: async (progress) => {
-          if (timedOut
+          if (this.#state.refreshId !== refreshId
+              || timedOut
               || !["running", "cancelling"].includes(this.#state.status)) return;
           const projected = publicRefreshProgress(progress);
           if (projected === null) return;
+          if (!accountingDeadlineApplied
+              && !this.#cancelRequested
+              && this.#state.status === "running"
+              && projected.kind === ACCOUNTING_PROGRESS_KIND
+              && this.#accountingTimeoutMs > selectedTimeoutMs) {
+            // The runner emits this exact marker only for an actual full
+            // replay-safe rebuild. Extend once to the same four-hour total
+            // bound used by a fresh index; repeated or malformed progress
+            // cannot keep a run alive indefinitely.
+            accountingDeadlineApplied = true;
+            armTimeoutFromStart(this.#accountingTimeoutMs);
+          }
           let quickResultAt = this.#state.quickResultAt;
           if (projected.kind !== ARCHIVE_INDEX_PROGRESS_KIND
               && projected.phase === "quick_result"
@@ -1918,19 +2029,26 @@ export class LocalCompanionRefreshController {
             quickResultAt,
           };
         },
-      }))
+      }));
+    const work = Promise.race([runnerWork, cancellationSettlement])
       .then(async (result) => {
         if (this.#cancelRequested) {
           // The data store already owns the last verified snapshot. A cancel
-          // must become terminal as soon as worker shutdown is confirmed,
-          // rather than entering another potentially expensive projection.
+          // becomes terminal as soon as worker shutdown is confirmed. If a
+          // defective runner ignores abort, the short settlement watchdog
+          // instead detaches it from the foreground generation; the runner's
+          // AbortSignal still fences durable accounting publication.
           this.#state = {
             status: "cancelled",
             refreshId: this.#state.refreshId,
             startedAt: this.#state.startedAt,
             finishedAt: new Date(this.#clock()).toISOString(),
-            result: publicRefreshResult(result, this.#clock()),
-            progress: publicIndexingResult(result?.indexing)
+            result: result === CANCEL_SETTLEMENT_EXPIRED
+              ? null
+              : publicRefreshResult(result, this.#clock()),
+            progress: result === CANCEL_SETTLEMENT_EXPIRED
+              ? terminalRefreshProgress(this.#state.progress)
+              : publicIndexingResult(result?.indexing)
               ?? terminalRefreshProgress(this.#state.progress),
             quickResultAt: this.#state.quickResultAt,
             errorCode: "refresh_cancelled",
@@ -2036,29 +2154,14 @@ export class LocalCompanionRefreshController {
         this.#notifyTerminalFailure();
       })
       .finally(() => {
-        clearTimeout(timeout);
+        this.#clearTimeoutImpl(timeout);
+        this.#clearTimeoutImpl(cancellationSettlementTimeout);
         this.#abortController = null;
+        this.#beginCancellationSettlement = null;
         this.#cancelRequested = false;
         this.#inFlight = null;
       });
-    timeout = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-      this.#state = {
-        status: "failed",
-        refreshId: this.#state.refreshId,
-        startedAt: this.#state.startedAt,
-        finishedAt: new Date(this.#clock()).toISOString(),
-        result: null,
-        progress: terminalRefreshProgress(this.#state.progress),
-        quickResultAt: this.#state.quickResultAt,
-        errorCode: "refresh_timed_out",
-      };
-      // The timeout IS the terminal failure the user sees, and a hung runner
-      // may never settle — file the trail entry now, not at settlement.
-      this.#notifyTerminalFailure();
-    }, selectedTimeoutMs);
-    timeout.unref?.();
+    armTimeoutFromStart(selectedTimeoutMs);
     this.#inFlight = work;
     return true;
   }

@@ -4761,7 +4761,16 @@ export async function refreshReplaySafeAccountingCache({
   if (Buffer.byteLength(stableJson(cache)) > MAX_CACHE_BYTES) {
     throw fixedError("cache_invalid_size");
   }
-  await writeLocalCollectorAccountingCache({ stateFile: selectedStateFile, cache });
+  // A timeout/cancel can arrive after the isolated child has returned a valid
+  // artifact but before its atomic publication. Recheck at the final durable
+  // boundary so a run already reported as stopped cannot replace the retained
+  // cache behind that terminal state.
+  throwIfAborted(options.signal ?? null);
+  await writeLocalCollectorAccountingCache({
+    stateFile: selectedStateFile,
+    cache,
+    signal: options.signal ?? null,
+  });
   return cache;
 }
 
