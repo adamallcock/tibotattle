@@ -422,12 +422,22 @@ a claim that Sparkle has updated the preview client.
 `CFBundleShortVersionString` remains the user-facing package version. The
 Sparkle ordering key, `CFBundleVersion`, is explicitly allocated for signed
 builds that retain the stable bundle identifier. The 0.1.17 internal-dogfood
-RC6 build is `1023.4`; the 0.1.17 stable final remains `1024`. This corrected
-candidate orders strictly after installed RC5 `1023.3`, startup-recovery RC4
-`1023.2`, migration RC3 `1023.1`, retained RC2 `1023`, and earlier
-shared-identity dogfood `1022`, while stable orders after the dogfood candidate.
+RC7 build is `1023.5`; the 0.1.17 stable final remains `1024`. This corrected
+candidate orders strictly after installed RC6 `1023.4`, integrated RC5
+`1023.3`, startup-recovery RC4 `1023.2`, migration RC3 `1023.1`, retained RC2
+`1023`, and earlier shared-identity dogfood `1022`, while stable orders after
+the dogfood candidate.
 A future signed version/channel must add a reviewed
 monotonic allocation before release tooling will run.
+
+Installed RC6 proved that the cold-accounting lifetime can safely exceed the
+ordinary five-minute refresh deadline. Its real refresh then exposed the
+inherited `recent_7d_indexing` legacy checkpoint suppressing otherwise-
+authoritative unified accounting. RC7 removes only that retired collector gate;
+`unifiedGenerationAuthoritative` and every generation, completeness, resource,
+and publication guard remain fail-closed. The allocation is not artifact or
+installed-app evidence: exact-source gates, protected R7, signing, notarization,
+state-preserving replacement, and physical verification must be repeated.
 
 Release tooling accepts `USAGE_MONITOR_BUNDLE_VERSION` only when it exactly
 matches the checked-in channel allocation, and the signed stable path still
@@ -523,7 +533,7 @@ For a later stable release, use `--previous-stable-manifest` in place of
 the release command refuses to guess which continuity policy applies.
 `USAGE_MONITOR_BUNDLE_VERSION` is optional as an operator assertion only; when
 present it must exactly equal the checked-in allocation for the selected
-signed release version and channel (`1023.4` for 0.1.17 internal dogfood,
+signed release version and channel (`1023.5` for 0.1.17 internal dogfood,
 `1024` for 0.1.17 stable).
 
 `config/deployment-endpoints.js` is the reviewed source for the public origin

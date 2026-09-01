@@ -670,7 +670,7 @@ test("unified accounting mode never advances the legacy archive and passes expli
   assert.equal(result.accounting.sourceMode, "unified");
 });
 
-test("tool-only partial coverage does not block complete usage accounting", async () => {
+test("tool-only partial coverage and an inherited legacy indexing status do not block unified accounting", async () => {
   let accountingCalls = 0;
   const generation = {
     id: 8,
@@ -694,7 +694,15 @@ test("tool-only partial coverage does not block complete usage accounting", asyn
       rolloutRecordsWritten: 1,
       filesDiscovered: 1,
       refresh: { attempted: false, recordWritten: false, errorCode: null },
-      indexing: COMPLETE_INDEX,
+      indexing: {
+        ...COMPLETE_INDEX,
+        status: "recent_7d_indexing",
+        phase: "rollout_index",
+        coveredAt: {
+          ...COMPLETE_INDEX.coveredAt,
+          endAt: null,
+        },
+      },
     }),
     refreshUnifiedIndex: async () => ({ status: "ingested", generation }),
     refreshAccounting: async (options) => {
@@ -717,6 +725,7 @@ test("tool-only partial coverage does not block complete usage accounting", asyn
   assert.equal(accountingCalls, 1);
   assert.equal(result.accounting.sourceMode, "unified");
   assert.equal(result.accounting.refreshStatus, "rebuilt");
+  assert.equal(result.indexing.status, "recent_7d_indexing");
   assert.equal(result.unifiedIndex.generation.toolProvenanceComplete, false);
 });
 

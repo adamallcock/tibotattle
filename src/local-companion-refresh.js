@@ -1133,20 +1133,15 @@ export function createLocalCollectorRefreshRunner({
     }
     const completedIndex = publicIndexingResult(result?.indexing);
     await publishHeadline(completedIndex);
+    // Unified accounting reads the independently published unified index.
+    // The quota-only collector deliberately preserves its inherited legacy
+    // indexing descriptor, which may still say `recent_7d_indexing`; that
+    // retired checkpoint must not suppress an authoritative unified rebuild.
+    // `unifiedGenerationAuthoritative` remains the fail-closed source gate.
     const accountingMayRun = accountingSourceMode === "unified"
-      ? completedIndex === null
-        || [
-          "recent_7d_complete",
-          "recent_7d_partial",
-          "prospective_only",
-          // Unified accounting reads the published index, not the bounded
-          // collector ledger, so a collector-only pause must not suppress a
-          // complete-generation accounting pass.
-          "bounded_pause",
-        ].includes(completedIndex.status)
-      : completedIndex === null
-        || ["recent_7d_complete", "recent_7d_partial", "prospective_only"]
-          .includes(completedIndex.status);
+      || completedIndex === null
+      || ["recent_7d_complete", "recent_7d_partial", "prospective_only"]
+        .includes(completedIndex.status);
     let unifiedIndex = null;
     refreshStep = "unified_index";
     if (accountingSourceMode === "unified"
