@@ -170,6 +170,23 @@ internal-dogfood allocation is `1023.5`, strictly after installed RC6 and before
 reserved stable `1024`. RC6 artifact evidence remains evidence for RC6 only;
 RC7 requires fresh exact-source, R7, artifact, replacement, and installed checks.
 
+#### Allocation amendment, 2026-09-01 (RC8)
+
+RC7 source merge `87e07be350582713d815a21b4db470ed84aae037`, build
+`1023.5`, subsequently passed protected R7, the full source gate, Developer ID
+signing, notarization, stapling, and state-preserving installation. Its first
+installed refresh ingested unified-index generation 44, then the strict v0.14
+cache validator rejected inconsistent fit metadata. An early diagnostic-only
+transition was excluded from the fit, but its eligibility was still projected
+onto a reset fitted from later eligible transitions. RC8 preserves that strict
+validator and projects reset fit metadata from the first eligible row. Its
+monotonic internal-dogfood allocation is
+`1023.6`, strictly after installed RC7 and before reserved stable `1024`.
+RC7's artifact and R7 evidence remain evidence for RC7 only; RC8 requires a
+fresh exact-source freeze, protected R7, artifact, replacement, installed
+refresh, and physical native verification. Allocation does not claim those
+gates have passed.
+
 The separately identified Preview app uses the deterministic migration epoch
 `(2000 + major).minor.patch`, so preview package `0.1.17` maps to
 `2000.1.17`. That keeps local preview builds deterministic and valid within

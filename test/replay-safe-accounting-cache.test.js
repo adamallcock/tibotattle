@@ -1342,6 +1342,95 @@ test("the same lineage-aware scan produces a bounded weekly calibration summary"
   assert.equal(cache.weeklyCalibration.composition.capacityUsdByModel, null);
 });
 
+test("refresh publishes a fitted reset after an earlier diagnostic-only transition", async (t) => {
+  const directory = await mkdtemp(join(
+    tmpdir(),
+    "usage-monitor-diagnostic-first-calibration-",
+  ));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const stateFile = join(directory, "local-collector-state-v1.sqlite");
+  const startMs = Date.parse("2026-08-01T00:00:00.000Z");
+  const stamp = (seconds) => new Date(startMs + seconds * 1_000).toISOString();
+  const resetsAt = Math.floor(
+    (startMs + 7 * 24 * 60 * 60 * 1_000) / 1_000,
+  );
+  const snapshots = [
+    weeklySnapshot({
+      timestamp: stamp(0),
+      usedPercent: 0,
+      planType: "pro",
+      resetsAt,
+    }),
+    weeklySnapshot({
+      timestamp: stamp(10),
+      usedPercent: 1,
+      planType: "pro",
+      resetsAt,
+    }),
+    ...Array.from({ length: 9 }, (_, boundary) => weeklySnapshot({
+      timestamp: stamp(20 + boundary * 10),
+      usedPercent: boundary,
+      planType: "plus",
+      resetsAt,
+    })),
+  ];
+  const events = Array.from({ length: 8 }, (_, index) => ({
+    ...usageEvent({
+      timestamp: stamp(25 + index * 10),
+      components: {
+        input_uncached_tokens: index === 0 ? 100_000_000 : 1_000_000,
+      },
+    }),
+    planAttribution: {
+      basis: "same_record",
+      planType: "plus",
+      planVariant: null,
+    },
+    // The first Plus quantity interval begins during the preceding Pro era,
+    // so the real transition miner makes only that row diagnostic. Every
+    // later interval starts inside the Plus era and remains fit-eligible.
+    usageIntervalStartedAt: stamp(index === 0 ? 9 : 21 + index * 10),
+    usageIntervalBasis: "previous_session_record",
+  }));
+
+  const written = await refreshReplaySafeAccountingCache({
+    cacheFile: stateFile,
+    now: () => startMs + 12 * 60 * 60 * 1_000,
+    windowDays: 365,
+    scan: async ({ onUsage, onRateLimitSnapshot }) => {
+      for (const event of events) onUsage(event);
+      for (const snapshot of snapshots) onRateLimitSnapshot(snapshot);
+      return { diagnostics: {} };
+    },
+  });
+
+  assert.doesNotThrow(() => assertReplaySafeAccountingCache(written));
+  const read = await readReplaySafeAccountingCache({
+    cacheFile: stateFile,
+    now: () => startMs + 12 * 60 * 60 * 1_000,
+  });
+  assert.equal(read.status, "available");
+  assert.equal(read.errorCode, null);
+  assert.deepEqual(read.cache, written);
+
+  const projections = [
+    written.weeklyCalibration,
+    ...Object.values(written.allowanceCapacityByScenario.scenarios)
+      .map((scenario) => scenario.calibration),
+  ];
+  for (const projection of projections) {
+    assert.equal(projection.selectedPlanType, "plus");
+    assert.equal(projection.status, "estimated");
+    assert.equal(projection.estimate.qualifyingResets, 1);
+    assert.equal(projection.recentResets.length, 1);
+    assert.equal(projection.recentResets[0].eligibleTransitions, 7);
+    assert.equal(
+      projection.recentResets[0].aggregationEligibility,
+      "primary_conditional",
+    );
+  }
+});
+
 test("a mix-varied corpus yields a fitted per-model composition that survives the cache round trip", async () => {
   const directory = await mkdtemp(join(tmpdir(), "composition-cache-"));
   const stateFile = join(directory, "collector-state-v1.sqlite");

@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-01
 type: status
 status: current
-source_commit: 64fc79e44f671336e8060416932538ff360ac4ca
+source_commit: 87e07be350582713d815a21b4db470ed84aae037
 observation_date: 2026-09-01
 ---
 
@@ -18,8 +18,8 @@ using this page for a later release or operational decision.
 
 | Boundary | Verified state |
 |---|---|
-| Documentation/source review | RC7 preparation source `64fc79e44f671336e8060416932538ff360ac4ca`, reviewed 2026-09-01; final source freeze is pending |
-| Installed internal dogfood | Signed and notarized RC6 source `e59115d41958f6b23496a65c9732a6a9944fdde0`, build `1023.4`, installed 2026-08-31; the timeout correction passed but the advanced-accounting handoff did not |
+| Documentation/source review | RC7 source merge `87e07be350582713d815a21b4db470ed84aae037`, reviewed 2026-09-01; RC8 corrective source is not yet frozen |
+| Installed internal dogfood | Signed, notarized, and stapled RC7 source `87e07be350582713d815a21b4db470ed84aae037`, build `1023.5`, installed 2026-09-01; generation 44 ingestion passed but the strict v0.14 cache validator withheld advanced accounting |
 | Public service | Read-only `GET https://tibotattle.com/api/health`, HTTP 200, deployment source `304f3d736b6f9451d32a616bf3046ea628e828a3`, observed 2026-08-31 |
 | Public updater | Read-only `GET https://updates.tibotattle.com/appcast.xml`, observed 2026-08-27 |
 | Published release | GitHub release API for `adamallcock/tibotattle`, observed 2026-08-27 |
@@ -126,21 +126,29 @@ The complete qualification matrix and rules for changing these claims are in
   installed result then exposed an inherited `recent_7d_indexing` legacy
   checkpoint suppressing otherwise-authoritative unified accounting. RC6 is
   therefore not the final dogfood handoff.
-- RC7 source preparation removes only that retired collector checkpoint. It
-  continues to require `unifiedGenerationAuthoritative` before accounting can
-  publish and does not relax source completeness, generation matching, resource
-  ceilings, or atomic publication. RC7 is allocated monotonic build `1023.5`,
-  strictly after installed RC6 and before reserved stable build `1024`. Fresh
-  exact-source gates, R7, signed-artifact, replacement, and physical installed
-  refresh evidence remain required.
-- The RC6 R7 workload-source closure has protected dual-runtime receipts for
+- RC7 source merge `87e07be350582713d815a21b4db470ed84aae037`, build
+  `1023.5`, removed only that retired collector checkpoint and subsequently
+  passed protected R7, the full source gate, Developer ID signing, notarization,
+  stapling, Gatekeeper, state-preserving replacement, and installation. Its
+  first installed refresh ingested unified-index generation 44, then correctly
+  withheld advanced accounting when the strict v0.14 cache validator found
+  inconsistent fit metadata. The fit correctly excluded an early
+  diagnostic-only transition, but the projection copied that rejected row's
+  eligibility onto the reset fitted from later eligible transitions.
+- RC8 retains the strict validator and projects reset fit metadata from the
+  first eligible row. It is allocated monotonic build `1023.6`, strictly after
+  installed RC7 and before reserved stable build `1024`. This source change
+  invalidates RC7's workload receipts, so RC8 still requires a fresh exact-source
+  freeze, protected R7, full source gate, signed/notarized/stapled artifact,
+  state-preserving replacement, installed refresh, and physical native checks.
+  This allocation and source diagnosis are not evidence that RC8 was built or
+  passed.
+- The RC7 R7 workload-source closure has protected dual-runtime receipts for
   359 files / workload SHA-256
-  `fcb55e0cb729b56249e2c6f4d8fa4a08bc4b4c8fe99a506ce10cfe1068ed48d5`.
-  Both decisions remain honestly `release_open`. RC7 changes workload-owned
-  refresh/accounting source, so those receipts are historical for RC6 and must
-  be regenerated after the corrective source is frozen. Native UI and
-  build-allocation files remain subject to their separate macOS source, smoke,
-  signed-artifact, and installed-artifact gates.
+  `ea504fde37402622239d5405aa74c264b98a111c8da5b4031a0977fa5bd80741`.
+  Both decisions remain honestly `release_open`. Native UI and build-allocation
+  files remain subject to their separate macOS source, smoke, signed-artifact,
+  and installed-artifact gates.
 - The public service and release feed are remote state. Their health and
   availability can change after this snapshot.
 - Public health is not proof that every admin, identity, contribution, deletion,
@@ -150,7 +158,7 @@ The complete qualification matrix and rules for changing these claims are in
   complete named fit-rejection reconciliation, so R7 cannot be used as a
   substitute. An explicitly open-gate internal dogfood may proceed for testing,
   but this blocks stable and public 0.1.17 qualification until it is closed or
-  deliberately resolved. The exact RC7 native artifact must separately pass
+  deliberately resolved. The exact RC8 native artifact must separately pass
   signing, notarization, state-preserving installation, updater, and physical
   native checks. Pairing continuity needs compatible hosted Worker migrations
   and deployment before the repaired desktop flow can be validated end to end.

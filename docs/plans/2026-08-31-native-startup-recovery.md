@@ -46,9 +46,14 @@ or public release is part of this correction.
   refresh gates on RC6 build `1023.4`. The lifetime correction passed; the
   installed run exposed the separate legacy accounting checkpoint recorded
   below.
+- [x] Repeat the exact-source, R7, signed-artifact, replacement, native startup,
+  prompt-free, and existing local binding/diagnostic checks on RC7 build
+  `1023.5`. End-to-end pairing repair remains unqualified until a compatible
+  hosted Worker is deployed. Its installed refresh ingested generation 44 but
+  exposed the separate fit-metadata defect below.
 - [ ] Repeat the exact-source, R7, signed-artifact, replacement, native startup,
-  refresh, pairing-repair, prompt-free, and accounting checks on RC7 build
-  `1023.5`.
+  refresh, pairing-repair, prompt-free, and accounting checks on RC8 build
+  `1023.6`.
 
 ## Acceptance
 
@@ -164,3 +169,20 @@ replacement, and installed native verification. PR #94's fixed-real-corpus
 comparator remains **OPEN / NOT RUN**: an explicitly open-gate internal dogfood
 may be tested, but stable and public qualification remain blocked until that
 gate is closed or deliberately resolved.
+
+## RC7 installed follow-up and RC8 boundary
+
+RC7 source merge `87e07be350582713d815a21b4db470ed84aae037`, build
+`1023.5`, passed protected R7, the full source gate, signing, notarization,
+stapling, and state-preserving installation. Startup recovery remained healthy.
+The first installed refresh ingested generation 44, then the strict v0.14 cache
+validator rejected inconsistent fit metadata. The fit correctly excluded an
+early diagnostic-only transition, but the projection copied that rejected row's
+eligibility onto the reset fitted from later eligible rows.
+
+RC8 keeps the strict validator and starts reset fit-metadata projection at the
+first eligible row. Build `1023.6` is allocated strictly after RC7 and before
+stable `1024`, but it has not yet passed exact-source R7, artifact, replacement,
+installed-refresh, or physical-native gates. PR #94's formal comparator remains
+**OPEN / NOT RUN** and blocks stable/public qualification; explicitly open-gate
+internal dogfood testing may continue.
