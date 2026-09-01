@@ -4299,11 +4299,11 @@ test("development and preview builds treat the release-channel policy as optiona
 
 test("macOS release metadata validates versions, production mode, and Keychain references", async () => {
   assert.equal(normalizeMacOSBundleVersion(), DERIVED_MACOS_BUNDLE_VERSION);
-  assert.equal(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION, "1023.5");
+  assert.equal(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION, "1023.6");
   assert.equal(STABLE_SIGNED_BUNDLE_VERSION, "1024");
   assert.equal(
     normalizeMacOSBundleVersion(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
-    "1023.5",
+    "1023.6",
   );
   assert.equal(
     compareMacOSBundleVersions(
@@ -4338,13 +4338,18 @@ test("macOS release metadata validates versions, production mode, and Keychain r
     "the retired-checkpoint correction must be strictly newer than installed RC6",
   );
   assert.equal(
+    compareMacOSBundleVersions("1023.5", INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    -1,
+    "the fitted-transition correction must be strictly newer than installed RC7",
+  );
+  assert.equal(
     compareMacOSBundleVersions(
       STABLE_SIGNED_BUNDLE_VERSION,
       INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION,
     ) > 0,
     true,
   );
-  for (const unallocated of ["1023", "1023.0", "1023.1", "1023.1.0", "1023.2", "1023.2.0", "1023.3", "1023.3.0", "1023.4", "1023.4.0", "1023.5.0", "1024", "2000.1.17"]) {
+  for (const unallocated of ["1023", "1023.0", "1023.1", "1023.1.0", "1023.2", "1023.2.0", "1023.3", "1023.3.0", "1023.4", "1023.4.0", "1023.5", "1023.5.0", "1023.6.0", "1024", "2000.1.17"]) {
     assert.throws(
       () => readMacOSReleaseBuildConfiguration({
         USAGE_MONITOR_BUNDLE_VERSION: unallocated,

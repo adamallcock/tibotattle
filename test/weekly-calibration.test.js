@@ -6,6 +6,7 @@ import {
   BOUNDED_WEEKLY_CALIBRATION_RESET_LIMIT,
   projectBoundedWeeklyCalibrationSummary,
   renderWeeklyCalibrationReport,
+  validWeeklyPlanPopulations,
 } from "../src/reporting/index.js";
 import { verifyWeeklyCalibration } from "../src/verify-weekly-calibration.js";
 
@@ -204,6 +205,53 @@ test("mixed-plan summaries retain legacy evidence without pooling plan medians",
   assert.equal(result.planAttribution.accountVerified, false);
   const selectedPro = projectBoundedWeeklyCalibrationSummary(dataset([...pro, ...plus]), { planType: "pro" });
   assert.equal(selectedPro.estimate.medianApiPriceEquivalentUsd, 1_600);
+});
+
+test("bounded summaries describe a fit from its first eligible transition", () => {
+  const reset = Math.floor(Date.parse("2026-08-20T00:00:00.000Z") / 1_000);
+  const diagnosticJumpUsd = 5_994;
+  const transitions = resetTransitions({ reset }).slice(0, 8).map((row, index) => ({
+    ...row,
+    // The rejected first interval contains a large attribution-uncertain
+    // cost jump. Later admitted intervals continue from that ledger value at
+    // the ordinary $600/100pp slope. If the first row ever leaks into the
+    // fit, its outlying boundary makes the counterfactual projection fail
+    // instead of coincidentally retaining the expected headline.
+    lastPriorCumulativeApiPricedUsd:
+      row.lastPriorCumulativeApiPricedUsd + (index === 0 ? 0 : diagnosticJumpUsd),
+    firstNextCumulativeApiPricedUsd:
+      row.firstNextCumulativeApiPricedUsd + diagnosticJumpUsd,
+    lastPriorCumulativeQuotaWeightedLowerUsd:
+      row.lastPriorCumulativeQuotaWeightedLowerUsd + (index === 0 ? 0 : diagnosticJumpUsd),
+    firstNextCumulativeQuotaWeightedLowerUsd:
+      row.firstNextCumulativeQuotaWeightedLowerUsd + diagnosticJumpUsd,
+    lastPriorCumulativeQuotaWeightedUpperUsd:
+      row.lastPriorCumulativeQuotaWeightedUpperUsd + (index === 0 ? 0 : diagnosticJumpUsd),
+    firstNextCumulativeQuotaWeightedUpperUsd:
+      row.firstNextCumulativeQuotaWeightedUpperUsd + diagnosticJumpUsd,
+    aggregationEligibility: index === 0
+      ? "diagnostic_only"
+      : "primary_conditional",
+  }));
+
+  const summary = projectBoundedWeeklyCalibrationSummary(dataset(transitions));
+
+  assert.equal(summary.status, "estimated");
+  assert.equal(summary.estimate.medianApiPriceEquivalentUsd, 600);
+  assert.equal(summary.recentResets[0].eligibleTransitions, 7);
+  assert.equal(
+    summary.recentResets[0].aggregationEligibility,
+    "primary_conditional",
+  );
+  assert.equal(validWeeklyPlanPopulations(summary), true);
+
+  const accidentallyAdmitted = projectBoundedWeeklyCalibrationSummary(dataset(
+    transitions.map((row, index) => index === 0
+      ? { ...row, aggregationEligibility: "primary_conditional" }
+      : row),
+  ));
+  assert.equal(accidentallyAdmitted.status, "insufficient_evidence");
+  assert.equal(accidentallyAdmitted.estimate, null);
 });
 
 test("a newly observed plan without a fit never borrows an older plan's headline", () => {

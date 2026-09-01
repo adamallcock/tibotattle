@@ -281,9 +281,9 @@ published-release claim.
 - Gives Preview its own app, bundle, semantic-open, local-state, Keychain,
   preferences, and Sparkle-feed identities, preventing preview installation or
   updates from replacing stable state.
-- Records builds 1023, 1023.1, 1023.2, 1023.3, and 1023.4 as earlier 0.1.17
-  internal dogfoods, allocates build 1023.5 to RC7, and retains build 1024 for
-  stable.
+- Records builds 1023, 1023.1, 1023.2, 1023.3, 1023.4, and 1023.5 as earlier
+  0.1.17 internal dogfoods, allocates build 1023.6 to RC8, and retains build
+  1024 for stable.
   Signed tooling requires a clean checkout with exactly one matching annotated
   channel tag at `HEAD` before it can proceed. RC5 build 1023.3 is signed,
   notarized, and installed evidence for its frozen source, but physical testing
@@ -292,9 +292,14 @@ published-release claim.
   timeout correction in a signed, notarized, installed refresh, but exposed an
   inherited `recent_7d_indexing` legacy checkpoint suppressing otherwise-
   authoritative unified accounting. RC7 removes only that retired collector
-  gate, retains the fail-closed unified-generation authority check, and still
-  requires fresh exact-source gates, protected R7 regeneration, signing,
-  installation, and physical verification.
+  gate and subsequently passed its protected R7, full source gate, Developer ID
+  signing, notarization, stapling, and state-preserving installation gates. Its
+  first installed refresh ingested unified-index generation 44, but the strict
+  v0.14 cache validator rejected accounting because the projection copied an
+  excluded diagnostic-only row's eligibility onto a reset fitted from later
+  eligible transitions. RC8 retains that strict validator, projects fit
+  metadata from the first eligible row, and requires fresh exact-source R7,
+  artifact, install, and physical verification before it can replace RC7.
 - Establishes scoped, machine-checked repository guidance for coding agents and
   the root layout they may extend
   ([PR #77](https://github.com/adamallcock/tibotattle/pull/77)).

@@ -311,3 +311,13 @@ correction must ship as a newly signed candidate rather than relabel RC6. RC7 is
 allocated monotonic build `1023.5`; the Keychain contract is unchanged, and an
 unexpected prompt remains release-blocking during its fresh installed-artifact
 qualification.
+
+### RC8 allocation follow-up
+
+RC7 source merge `87e07be350582713d815a21b4db470ed84aae037`, build
+`1023.5`, subsequently passed signing, notarization, stapling, installation,
+launch, and automatic prompt-free checks. Its installed refresh exposed a
+separate accounting fit-metadata defect, so that source cannot be relabelled.
+RC8 is allocated monotonic build `1023.6`; the Keychain contract is unchanged,
+and an unexpected automatic prompt remains release-blocking during fresh RC8
+artifact and installed qualification. No RC8 artifact result is claimed here.

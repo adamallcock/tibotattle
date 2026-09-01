@@ -13,8 +13,8 @@ Electron release, or new signed-Preview workflow. Source integration, tests,
 state migration, signing, installation, and native verification are separate
 gates; none is complete merely because an earlier gate passed.
 
-The current candidate state is the RC7 amendment at the end of this plan.
-Earlier RC4, RC5, and RC6 sections preserve their checkpoint evidence and are
+The current candidate state is the RC8 amendment at the end of this plan.
+Earlier RC4, RC5, RC6, and RC7 sections preserve their checkpoint evidence and are
 not current build allocations.
 
 The installed RC4 source is `735a59ce`, build `1023.2`. Its prompt-free Keychain
@@ -84,8 +84,8 @@ automatically included in the retained validation run.
    `tibotattle-internal-dogfood-0.1.17-rcN-source-YYYYMMDD` tag. Use the reviewed
    channel allocation from `scripts/macos-bundle-version.js`, clean source and
    retained release finalizer. Earlier candidates used `1023`, `1023.1`,
-   `1023.2`, `1023.3`, and `1023.4`; corrective RC7 uses `1023.5`. Stable
-   remains `1024`.
+   `1023.2`, `1023.3`, `1023.4`, and `1023.5`; corrective RC8 uses `1023.6`.
+   Stable remains `1024`.
    Signing and notarization are authorized; public updater/release publication
    and hosted deployment are not part of this task.
 6. Install only the verified signed artifact with a recoverable prior-app and
@@ -344,3 +344,26 @@ used only as an explicitly open-gate internal dogfood; stable and public
 qualification remain blocked until that comparator is closed or deliberately
 resolved. No hosted Worker deployment, migration, stable tag, appcast, or
 public artifact is authorized by this correction.
+
+## RC7 installed result and RC8 correction
+
+RC7 source merge `87e07be350582713d815a21b4db470ed84aae037`, build
+`1023.5`, completed protected R7, the full source gate, Developer ID signing,
+notarization, stapling, and state-preserving installation. Its first installed
+refresh ingested unified-index generation 44, then withheld advanced accounting
+because the strict v0.14 cache validator rejected inconsistent fit metadata. The
+fit correctly excluded an early diagnostic-only transition, but the projection
+copied that rejected row's eligibility onto the reset fitted from later eligible
+transitions.
+
+RC8 preserves the strict validator and projects reset fit metadata from the
+first eligible row. Its monotonic build is `1023.6`, strictly after installed
+RC7 and before stable `1024`. RC7's R7 and artifact evidence cannot qualify this
+source change: RC8 still needs fresh exact-source R7, full source, artifact,
+replacement, installed-refresh, and physical native checks. This amendment does
+not claim any RC8 gate has passed.
+
+PR #94's formal fixed-real-corpus comparator remains **OPEN / NOT RUN** and
+blocks stable or public qualification. Internal RC8 dogfood testing may proceed
+only with that gate explicitly open. No hosted Worker deployment, migration,
+stable tag, appcast, or public artifact is authorized here.
