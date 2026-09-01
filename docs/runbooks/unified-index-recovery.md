@@ -89,6 +89,14 @@ four-hour cold-refresh deadline; ordinary current-parser refreshes keep five
 minutes. Missing, unknown, or inconsistent provenance must not be relabelled to
 obtain that budget.
 
+A current-parser index can also require a full accounting rebuild after the
+current cache fails its authoritative schema, generation, context, or reuse
+check. The runner emits the fixed accounting-work marker only immediately before
+that rebuild; the controller then applies the same four-hour total deadline.
+Do not infer this state from displayed retained figures, edit cache metadata, or
+retry a five-minute failure in a loop: accounting has no durable mid-build
+checkpoint, so an interrupted rebuild restarts from its retained source state.
+
 Index publication and accounting completion are separate stages. If a refresh
 times out after publishing, inspect its published generation and accounting
 receipt separately: valid indexed tokens do not establish that the new

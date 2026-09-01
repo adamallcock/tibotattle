@@ -17,6 +17,7 @@ import {
   unlinkDurably,
 } from "./storage.js";
 import { readBoundedUtf8LineEntries } from "./platform/index.js";
+import { validAbortSignal } from "./valid-abort-signal.js";
 
 // This database is deliberately the one durable owner-controlled store for
 // local collector facts, cursors, quota observations and derived accounting.
@@ -59,6 +60,13 @@ function fixedError(code) {
   const error = new Error(code);
   error.code = code;
   return error;
+}
+
+function throwIfAccountingCachePublicationAborted(signal) {
+  if (!signal?.aborted) return;
+  const error = fixedError("accounting_refresh_aborted");
+  error.name = "AbortError";
+  throw error;
 }
 
 function ownerOnlyRegularFile(metadata) {
@@ -1366,14 +1374,28 @@ export async function saveLocalCollectorCheckpoint({
 export async function writeLocalCollectorAccountingCache({
   stateFile = defaultLocalCollectorStatePath(),
   cache,
+  signal = null,
 } = {}) {
-  if (!cache || typeof cache !== "object" || Array.isArray(cache)) {
+  if (!cache
+      || typeof cache !== "object"
+      || Array.isArray(cache)
+      || !validAbortSignal(signal)) {
     throw new TypeError("Local collector accounting cache is invalid");
   }
+  throwIfAccountingCachePublicationAborted(signal);
   await ensureDatabase(stateFile);
+  // Database preparation crosses asynchronous filesystem boundaries. A
+  // refresh can be cancelled while those owner-only durability checks are in
+  // flight, so preparation must not imply permission to replace the retained
+  // accounting row.
+  throwIfAccountingCachePublicationAborted(signal);
   let database;
   try {
     database = openDatabase(stateFile, { readOnly: false });
+    // From this check through COMMIT the operation is deliberately
+    // synchronous, so no later abort event can interleave with the atomic row
+    // replacement. Keep the check adjacent to that boundary.
+    throwIfAccountingCachePublicationAborted(signal);
     transaction(database, () => {
       writeMeta(database, "accounting_cache", cache);
     });

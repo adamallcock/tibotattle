@@ -14,6 +14,7 @@ import {
   createLocalCollectorRefreshRunner,
   createTerminalRefreshFailureRecorder,
   LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS,
+  LOCAL_COMPANION_REFRESH_CANCEL_SETTLEMENT_MS,
   LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS,
   LocalCompanionRefreshController,
 } from "../src/local-companion-refresh.js";
@@ -70,6 +71,53 @@ const PAUSED_INDEX = Object.freeze({
   },
 });
 
+function createManualTimerScheduler() {
+  let nowMs = 0;
+  let nextId = 1;
+  const scheduled = new Map();
+  return {
+    now: () => nowMs,
+    setTimeout(callback, delayMs) {
+      const handle = {
+        id: nextId,
+        unref() {},
+      };
+      nextId += 1;
+      scheduled.set(handle, {
+        callback,
+        dueAt: nowMs + delayMs,
+        id: handle.id,
+      });
+      return handle;
+    },
+    clearTimeout(handle) {
+      scheduled.delete(handle);
+    },
+    advanceBy(elapsedMs) {
+      const target = nowMs + elapsedMs;
+      while (true) {
+        const ready = [...scheduled.entries()]
+          .filter(([, value]) => value.dueAt <= target)
+          .sort((left, right) => (
+            left[1].dueAt - right[1].dueAt || left[1].id - right[1].id
+          ))[0];
+        if (ready === undefined) break;
+        const [handle, value] = ready;
+        scheduled.delete(handle);
+        nowMs = value.dueAt;
+        value.callback();
+      }
+      nowMs = target;
+    },
+  };
+}
+
+async function flushControllerSettlement(controller) {
+  for (let attempt = 0; attempt < 100 && controller.isRunning(); attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
 test("refresh controller admits the bounded fresh-index ceiling", () => {
   const dependencies = {
     runner: async () => ({}),
@@ -83,9 +131,11 @@ test("refresh controller admits the bounded fresh-index ceiling", () => {
     LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS,
     14_400_000,
   );
+  assert.equal(LOCAL_COMPANION_REFRESH_CANCEL_SETTLEMENT_MS, 30_000);
   assert.doesNotThrow(() => new LocalCompanionRefreshController({
     ...dependencies,
     timeoutMs: LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS,
+    accountingTimeoutMs: LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS,
   }));
   assert.throws(
     () => new LocalCompanionRefreshController({
@@ -94,6 +144,24 @@ test("refresh controller admits the bounded fresh-index ceiling", () => {
     }),
     /14,400,000/u,
   );
+  for (const accountingTimeoutMs of [999, 14_400_001]) {
+    assert.throws(
+      () => new LocalCompanionRefreshController({
+        ...dependencies,
+        accountingTimeoutMs,
+      }),
+      /accountingTimeoutMs.*14,400,000/u,
+    );
+  }
+  for (const cancelSettlementMs of [999, 60_001]) {
+    assert.throws(
+      () => new LocalCompanionRefreshController({
+        ...dependencies,
+        cancelSettlementMs,
+      }),
+      /cancelSettlementMs.*60,000/u,
+    );
+  }
   const dynamicallyInvalid = new LocalCompanionRefreshController({
     ...dependencies,
     timeoutMsForRun: () => LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS + 1,
@@ -834,6 +902,165 @@ test("unified authority keeps quota-only collection prospective and softens a co
   assert.equal(result.indexing.status, "bounded_pause");
   assert.equal(result.accounting.sourceMode, "unified");
   assert.equal(result.accounting.refreshStatus, "rebuilt");
+});
+
+test("a reusable unified accounting cache does not announce a cold rebuild", async () => {
+  const progress = [];
+  let rebuilds = 0;
+  const expectedGeneration = {
+    id: 14,
+    fingerprint: "r".repeat(64),
+    status: "complete",
+    discoveryComplete: true,
+    diagnosticsComplete: true,
+    usageProvenanceComplete: true,
+    sourceOrderComplete: true,
+    quotaProvenanceComplete: true,
+    toolProvenanceComplete: true,
+  };
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    unifiedIndexFile: "/private/local-unified-index-v1.sqlite",
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 0,
+      filesDiscovered: 1,
+      refresh: { attempted: false, recordWritten: false, errorCode: null },
+      indexing: COMPLETE_INDEX,
+    }),
+    refreshUnifiedIndex: async () => ({
+      status: "ingested",
+      generation: expectedGeneration,
+    }),
+    readAccountingCache: async (options) => {
+      assert.equal(options.expectedGeneration.id, expectedGeneration.id);
+      assert.equal(
+        options.expectedGeneration.fingerprint,
+        expectedGeneration.fingerprint,
+      );
+      return {
+        status: "available",
+        errorCode: null,
+        cache: {
+          ...REUSABLE_ACCOUNTING_CACHE,
+          sourceDescriptor: {
+            mode: "unified",
+            fallbackCount: 0,
+          },
+        },
+      };
+    },
+    refreshAccounting: async () => {
+      rebuilds += 1;
+      throw new Error("a reusable cache must not rebuild");
+    },
+  });
+
+  const result = await runner({ onProgress: (value) => progress.push(value) });
+
+  assert.equal(rebuilds, 0);
+  assert.equal(result.accounting.refreshStatus, "reused");
+  assert.equal(progress.some((value) => value?.kind === "accounting"), false);
+});
+
+test("a semantics-outdated unified cache announces one rebuild and receives the cold-work bound", async (t) => {
+  const timers = createManualTimerScheduler();
+  const rebuildEntered = Promise.withResolvers();
+  const rebuildSettled = Promise.withResolvers();
+  const events = [];
+  let rebuilds = 0;
+  let rebuildSignal;
+  t.after(() => rebuildSettled.resolve({}));
+  const generation = {
+    id: 15,
+    fingerprint: "s".repeat(64),
+    status: "complete",
+    discoveryComplete: true,
+    diagnosticsComplete: true,
+    usageProvenanceComplete: true,
+    sourceOrderComplete: true,
+    quotaProvenanceComplete: true,
+    toolProvenanceComplete: true,
+  };
+  const collectorRunner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    unifiedIndexFile: "/private/local-unified-index-v1.sqlite",
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 0,
+      filesDiscovered: 1,
+      refresh: { attempted: false, recordWritten: false, errorCode: null },
+      indexing: COMPLETE_INDEX,
+    }),
+    refreshUnifiedIndex: async () => ({
+      status: "ingested",
+      generation,
+    }),
+    readAccountingCache: async (options) => {
+      assert.equal(options.sourceMode, "unified");
+      assert.equal(options.expectedGeneration.id, generation.id);
+      events.push("cache_accounting_semantics_outdated");
+      return {
+        status: "unavailable",
+        errorCode: "cache_accounting_semantics_outdated",
+        cache: null,
+      };
+    },
+    refreshAccounting: async ({ expectedGeneration, signal }) => {
+      rebuilds += 1;
+      rebuildSignal = signal;
+      assert.equal(expectedGeneration.id, generation.id);
+      events.push("rebuild");
+      rebuildEntered.resolve();
+      return rebuildSettled.promise;
+    },
+  });
+  const runner = ({ onProgress, ...options }) => collectorRunner({
+    ...options,
+    onProgress: async (progress) => {
+      if (progress?.kind === "accounting") events.push("accounting_marker");
+      await onProgress(progress);
+    },
+  });
+  const controller = new LocalCompanionRefreshController({
+    runner,
+    dataStore: { async reload() {} },
+    timeoutMs: 1_000,
+    accountingTimeoutMs: 4_000,
+    monotonicClock: timers.now,
+    setTimeoutImpl: timers.setTimeout,
+    clearTimeoutImpl: timers.clearTimeout,
+  });
+
+  assert.equal(controller.start(), true);
+  await rebuildEntered.promise;
+  assert.deepEqual(events, [
+    "cache_accounting_semantics_outdated",
+    "accounting_marker",
+    "rebuild",
+  ]);
+  assert.equal(rebuilds, 1);
+  assert.deepEqual(controller.getStatus().progress, {
+    kind: "accounting",
+    status: "calculating",
+  });
+
+  timers.advanceBy(3_999);
+  assert.equal(controller.getStatus().status, "running");
+  assert.equal(rebuildSignal.aborted, false);
+  timers.advanceBy(1);
+  assert.equal(controller.getStatus().status, "failed");
+  assert.equal(controller.getStatus().errorCode, "refresh_timed_out");
+  assert.equal(rebuildSignal.aborted, true);
+
+  rebuildSettled.resolve({});
+  await flushControllerSettlement(controller);
+  assert.equal(rebuilds, 1);
+  assert.equal(controller.getStatus().status, "failed");
 });
 
 test("a fresh unified machine completes its first refresh when the app-server read fails", async () => {
@@ -2543,6 +2770,175 @@ test("accounting progress accepts only its exact count-free work marker", async 
   assert.deepEqual(reloadPurposes, ["full"]);
 });
 
+test("an exact accounting rebuild marker extends the ordinary deadline once to the cold-work bound", async (t) => {
+  const timers = createManualTimerScheduler();
+  const entered = Promise.withResolvers();
+  const settled = Promise.withResolvers();
+  let publish;
+  let signal;
+  t.after(() => settled.resolve({}));
+  const controller = new LocalCompanionRefreshController({
+    runner: async ({ signal: activeSignal, onProgress }) => {
+      signal = activeSignal;
+      publish = onProgress;
+      entered.resolve();
+      return settled.promise;
+    },
+    dataStore: { async reload() {} },
+    timeoutMs: 1_000,
+    accountingTimeoutMs: 1_500,
+    monotonicClock: timers.now,
+    setTimeoutImpl: timers.setTimeout,
+    clearTimeoutImpl: timers.clearTimeout,
+  });
+
+  assert.equal(controller.start(), true);
+  await entered.promise;
+  // The first marker arrives close to the ordinary deadline. It grants a
+  // 1,500 ms total-from-start bound, not another 1,500 ms from this point.
+  timers.advanceBy(900);
+  await publish({ kind: "accounting", status: "calculating" });
+  timers.advanceBy(300);
+  // Repeated and future-shaped markers cannot move the total deadline again.
+  await publish({ kind: "accounting", status: "calculating" });
+  await publish({
+    kind: "accounting",
+    status: "calculating",
+    privateUnreviewedField: true,
+  });
+  timers.advanceBy(299);
+  assert.equal(controller.getStatus().status, "running");
+  assert.equal(signal.aborted, false);
+
+  timers.advanceBy(1);
+  assert.equal(controller.getStatus().status, "failed");
+  assert.equal(controller.getStatus().errorCode, "refresh_timed_out");
+  assert.equal(signal.aborted, true);
+  settled.resolve({});
+  await flushControllerSettlement(controller);
+  assert.equal(controller.getStatus().status, "failed");
+});
+
+test("a late accounting marker cannot extend work after cancellation", async (t) => {
+  const timers = createManualTimerScheduler();
+  const entered = Promise.withResolvers();
+  const settled = Promise.withResolvers();
+  let publish;
+  let signal;
+  t.after(() => settled.resolve({}));
+  const controller = new LocalCompanionRefreshController({
+    runner: async ({ signal: activeSignal, onProgress }) => {
+      signal = activeSignal;
+      publish = onProgress;
+      entered.resolve();
+      return settled.promise;
+    },
+    dataStore: { async reload() {} },
+    timeoutMs: 1_000,
+    accountingTimeoutMs: 1_500,
+    cancelSettlementMs: 1_000,
+    monotonicClock: timers.now,
+    setTimeoutImpl: timers.setTimeout,
+    clearTimeoutImpl: timers.clearTimeout,
+  });
+
+  assert.equal(controller.start(), true);
+  await entered.promise;
+  assert.equal(controller.cancel(), true);
+  assert.equal(signal.aborted, true);
+  await publish({ kind: "accounting", status: "calculating" });
+  timers.advanceBy(999);
+  assert.equal(controller.getStatus().status, "cancelling");
+  assert.equal(controller.isRunning(), true);
+
+  timers.advanceBy(1);
+  await flushControllerSettlement(controller);
+  assert.equal(controller.getStatus().status, "cancelled");
+  assert.equal(controller.getStatus().errorCode, "refresh_cancelled");
+  assert.equal(controller.isRunning(), false);
+
+  settled.resolve({});
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(controller.getStatus().status, "cancelled");
+});
+
+test("the cancellation watchdog releases an abort-ignoring accounting run without clobbering its successor", async (t) => {
+  const timers = createManualTimerScheduler();
+  const firstEntered = Promise.withResolvers();
+  const firstSettled = Promise.withResolvers();
+  const secondEntered = Promise.withResolvers();
+  const secondSettled = Promise.withResolvers();
+  let firstPublish;
+  let firstSignal;
+  let runs = 0;
+  let reloads = 0;
+  t.after(() => {
+    firstSettled.resolve({});
+    secondSettled.resolve({});
+  });
+  const controller = new LocalCompanionRefreshController({
+    runner: async ({ signal, onProgress }) => {
+      runs += 1;
+      if (runs === 1) {
+        firstSignal = signal;
+        firstPublish = onProgress;
+        await onProgress({ kind: "accounting", status: "calculating" });
+        firstEntered.resolve();
+        // Deliberately ignore AbortSignal: the controller must bound how long
+        // this defective runner owns the foreground slot.
+        return firstSettled.promise;
+      }
+      secondEntered.resolve();
+      return secondSettled.promise;
+    },
+    dataStore: { async reload() { reloads += 1; } },
+    timeoutMs: 1_000,
+    accountingTimeoutMs: 4_000,
+    cancelSettlementMs: 1_000,
+    monotonicClock: timers.now,
+    setTimeoutImpl: timers.setTimeout,
+    clearTimeoutImpl: timers.clearTimeout,
+  });
+
+  assert.equal(controller.start(), true);
+  await firstEntered.promise;
+  assert.equal(controller.cancel(), true);
+  assert.equal(firstSignal.aborted, true);
+  timers.advanceBy(999);
+  assert.equal(controller.isRunning(), true);
+  assert.equal(controller.getStatus().status, "cancelling");
+
+  timers.advanceBy(1);
+  await flushControllerSettlement(controller);
+  assert.equal(controller.isRunning(), false);
+  assert.equal(controller.getStatus().status, "cancelled");
+  assert.equal(controller.getStatus().result, null);
+  assert.equal(reloads, 0);
+
+  assert.equal(controller.start(), true);
+  await secondEntered.promise;
+  const successorId = controller.getStatus().refreshId;
+  assert.equal(controller.getStatus().status, "running");
+
+  // A late progress callback and settlement from the detached first runner
+  // belong to its old refresh generation. Neither may mutate or release the
+  // successor's state or in-flight ownership.
+  await firstPublish({ kind: "accounting", status: "calculating" });
+  firstSettled.resolve({ indexing: COMPLETE_INDEX });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(controller.isRunning(), true);
+  assert.equal(controller.getStatus().refreshId, successorId);
+  assert.equal(controller.getStatus().status, "running");
+  assert.equal(controller.getStatus().progress, null);
+  assert.equal(reloads, 0);
+
+  secondSettled.resolve({ indexing: COMPLETE_INDEX });
+  await flushControllerSettlement(controller);
+  assert.equal(controller.getStatus().refreshId, successorId);
+  assert.equal(controller.getStatus().status, "succeeded");
+  assert.equal(reloads, 1);
+});
+
 test("accounting work markers never survive failure, cancellation, or timeout as running work", async (t) => {
   for (const outcome of ["failure", "cancel", "timeout"]) {
     await t.test(outcome, async (t) => {
@@ -2560,6 +2956,9 @@ test("accounting work markers never survive failure, cancellation, or timeout as
         },
         dataStore: { async reload({ purpose }) { reloadPurposes.push(purpose); } },
         timeoutMs: 1_000,
+        // This test owns terminal-state cleanup, not deadline extension; keep
+        // its accounting bound equal to its deliberately tiny base timeout.
+        accountingTimeoutMs: 1_000,
       });
       assert.equal(controller.start(), true);
       await entered.promise;

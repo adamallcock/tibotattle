@@ -152,11 +152,18 @@ seven-day index and deeper replay-safe accounting complete. The refresh status
 exposes `quickResultAt` and the `quick_result` phase. Internal
 `bounded_pause` results continue automatically under the same user action, with
 a fixed ceiling of exactly two automatic continuations after the initial pass.
-Each accepted pass receives a six-minute browser polling window around the
-server's five-minute pass ceiling, so one click has a finite roughly 18-minute
-UI budget. If more work remains, the dashboard says **Deep analysis paused
-after two bounded continuations**, retains the headline and verified state, and
-offers an explicit later resume; it is not presented as a crash.
+Ordinary cache-hit work retains the server's five-minute pass ceiling. A fresh
+index, or the exact point at which the companion has authoritatively selected a
+full accounting-cache rebuild, can instead use a four-hour total cold-work
+ceiling measured from that refresh's start. Each accepted pass receives a
+241-minute browser polling window so progress and **Cancel** remain attached to
+either server bound; the browser window does not extend the companion deadline.
+The fixed maximum remains two automatic continuations after the initial pass,
+so the absolute UI attachment bound is three 241-minute windows even though
+ordinary passes normally settle within five minutes. If more work remains, the
+dashboard says **Deep analysis paused after two bounded continuations**, retains
+the headline and verified state, and offers an explicit later resume; it is not
+presented as a crash.
 
 A user can cancel through the same-origin loopback API at any time. Cancellation
 preserves the last verified dashboard, safe quick result, and durable

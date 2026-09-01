@@ -81,6 +81,14 @@ for rotated sources do not keep extending ordinary refreshes. This metadata-only
 decision does not replace the worker's full compatibility, integrity, or
 publication checks.
 
+Index and accounting validity are separate. After indexing, the authoritative
+accounting cache reader may determine that no current generation-bound cache is
+reusable (for example after a reviewed accounting-semantics version change).
+Only when the runner actually enters that full rebuild does its exact,
+count-free accounting marker extend the same run to the four-hour total bound.
+A cache hit, malformed progress, or repeated marker cannot extend the ordinary
+deadline or re-arm it indefinitely.
+
 ## Current table groups
 
 | Group | Tables | Purpose |

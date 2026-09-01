@@ -281,11 +281,14 @@ published-release claim.
 - Gives Preview its own app, bundle, semantic-open, local-state, Keychain,
   preferences, and Sparkle-feed identities, preventing preview installation or
   updates from replacing stable state.
-- Records builds 1023, 1023.1, and 1023.2 as earlier 0.1.17 internal dogfoods,
-  allocates build 1023.3 to the integrated RC5 candidate, and retains build 1024
-  for stable. Signed tooling requires a clean checkout with exactly one matching
-  annotated channel tag at `HEAD` before it can proceed. RC4 at build 1023.2 is
-  installed evidence for its frozen source, not proof that RC5 or stable exists.
+- Records builds 1023, 1023.1, 1023.2, and 1023.3 as earlier 0.1.17 internal
+  dogfoods, allocates build 1023.4 to RC6, and retains build 1024 for stable.
+  Signed tooling requires a clean checkout with exactly one matching annotated
+  channel tag at `HEAD` before it can proceed. RC5 build 1023.3 is signed,
+  notarized, and installed evidence for its frozen source, but physical testing
+  found that its ordinary five-minute refresh deadline stopped a legitimate
+  full accounting-cache rebuild. RC6 still requires exact-source gates,
+  protected R7 regeneration, signing, installation, and physical verification.
 - Establishes scoped, machine-checked repository guidance for coding agents and
   the root layout they may extend
   ([PR #77](https://github.com/adamallcock/tibotattle/pull/77)).

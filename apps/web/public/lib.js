@@ -311,11 +311,12 @@ export function contributionBatchAdmission({
   });
 }
 
-// A fresh native index has a two-hour server-side cold-build bound. Keep the
-// browser attached for that bound plus one minute so progress and Cancel stay
-// usable; this does not extend the companion's own deadline, and ordinary
-// existing-index refreshes still settle at their five-minute server bound.
-export const LOCAL_REFRESH_POLLING_WINDOW_MS = 121 * 60 * 1_000;
+// A fresh index or an authoritatively selected full accounting rebuild has a
+// four-hour server-side cold-work bound. Keep the browser attached for that
+// bound plus one minute so progress and Cancel stay usable; this does not
+// extend the companion's own deadline, and ordinary cache-hit refreshes still
+// settle at their five-minute server bound.
+export const LOCAL_REFRESH_POLLING_WINDOW_MS = 241 * 60 * 1_000;
 
 export function createRefreshPollingBudget({
   now = () => Date.now(),

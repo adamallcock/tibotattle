@@ -292,3 +292,11 @@ qualified. The prompt-avoidance contract is unchanged: automatic Keychain reads
 remain bounded to three non-interactive attempts, and only the explained,
 deliberate Settings recovery action may request approval. An unexpected prompt
 in an automatic flow remains release-blocking.
+
+### RC6 allocation follow-up
+
+RC5 build `1023.3` was later signed, notarized and installed without an observed
+automatic Keychain prompt, but failed the separate real accounting-refresh
+gate. Corrective RC6 is build `1023.4`; the prompt-avoidance contract and its
+release-blocking treatment are unchanged and must be reverified on that exact
+installed artifact.
