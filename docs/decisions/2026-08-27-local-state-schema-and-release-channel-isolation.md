@@ -156,6 +156,20 @@ allocated `1023.4`, strictly after installed RC5 and before reserved stable
 `1024`. RC5 artifact evidence remains evidence for RC5 only; it cannot qualify
 RC6 or stable.
 
+#### Allocation amendment, 2026-09-01 (RC7)
+
+RC6 build `1023.4` was subsequently signed, notarized, installed, and refreshed
+against preserved schema-11 state. Its real accounting rebuild ran past five
+minutes and reached terminal refresh success, proving the RC5 deadline defect
+was corrected. The installed result then exposed an inherited
+`recent_7d_indexing` legacy checkpoint suppressing otherwise-authoritative
+unified accounting. RC7 removes only that retired collector checkpoint while
+retaining the fail-closed `unifiedGenerationAuthoritative` predicate and all
+generation, completeness, resource, and atomic-publication guards. Its monotonic
+internal-dogfood allocation is `1023.5`, strictly after installed RC6 and before
+reserved stable `1024`. RC6 artifact evidence remains evidence for RC6 only;
+RC7 requires fresh exact-source, R7, artifact, replacement, and installed checks.
+
 The separately identified Preview app uses the deterministic migration epoch
 `(2000 + major).minor.patch`, so preview package `0.1.17` maps to
 `2000.1.17`. That keeps local preview builds deterministic and valid within

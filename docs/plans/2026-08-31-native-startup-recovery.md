@@ -39,9 +39,16 @@ or public release is part of this correction.
   its monotonic native build and freeze the source separately from newer main.
 - [x] Sign, notarize, preserve state and the prior app, and install frozen RC4
   build `1023.2`. This qualifies only source `735a59ce`.
-- [ ] Re-run exact-source artifact gates and verify native startup, refresh,
-  restart, pairing repair, and prompt-free behavior on integrated RC5 build
-  `1023.3`.
+- [x] Re-run exact-source artifact gates and verify native startup, refresh,
+  restart, and prompt-free behavior on integrated RC5 build `1023.3`. Its real
+  refresh failed at five minutes, leading to RC6.
+- [x] Repeat the source, R7, signed-artifact, replacement, startup, and real
+  refresh gates on RC6 build `1023.4`. The lifetime correction passed; the
+  installed run exposed the separate legacy accounting checkpoint recorded
+  below.
+- [ ] Repeat the exact-source, R7, signed-artifact, replacement, native startup,
+  refresh, pairing-repair, prompt-free, and accounting checks on RC7 build
+  `1023.5`.
 
 ## Acceptance
 
@@ -129,11 +136,31 @@ closed. The native startup and RC5 allocation files are outside that workload
 closure and remain subject to their separate native and artifact gates.
 
 Installed RC4 source `735a59ce2ec01df0e381fb1aa878c5c7a39edcd8`, build
-`1023.2`, is signed and notarized but excludes PR #94. The next integrated
-dogfood therefore uses monotonic RC5 build `1023.3`; it has not yet been built,
-signed, notarized, or installed. Stable build `1024` remains separately reserved.
+`1023.2`, is signed and notarized but excludes PR #94. At that checkpoint, the
+next integrated dogfood used monotonic RC5 build `1023.3`; it had not yet been
+built, signed, notarized, or installed. Stable build `1024` remained separately
+reserved.
 
 RC5 was subsequently built, signed, notarized and installed, then failed its
 separate real full-accounting refresh gate at the ordinary five-minute timeout.
 The corrective RC6 allocation is `1023.4`; none of RC5's artifact or startup
 evidence qualifies that later source.
+
+## RC6 installed follow-up and RC7 boundary
+
+RC6 source `e59115d41958f6b23496a65c9732a6a9944fdde0`, build `1023.4`,
+was subsequently signed, notarized, installed, and launched against preserved
+schema-11 state without an observed automatic Keychain prompt. Its real refresh
+ran beyond five minutes and reached terminal success, so the RC5 lifetime defect
+is corrected. Native startup recovery also remained successful on that artifact.
+
+The same installed run exposed a separate inherited `recent_7d_indexing` legacy
+checkpoint suppressing otherwise-authoritative unified accounting. RC7 removes
+only that retired collector gate and retains the fail-closed
+`unifiedGenerationAuthoritative` decision. RC7 is allocated build `1023.5`,
+strictly after installed RC6 and before stable `1024`; it still requires fresh
+exact-source gates, protected R7, signing, notarization, state-preserving
+replacement, and installed native verification. PR #94's fixed-real-corpus
+comparator remains **OPEN / NOT RUN**: an explicitly open-gate internal dogfood
+may be tested, but stable and public qualification remain blocked until that
+gate is closed or deliberately resolved.

@@ -13,6 +13,10 @@ Electron release, or new signed-Preview workflow. Source integration, tests,
 state migration, signing, installation, and native verification are separate
 gates; none is complete merely because an earlier gate passed.
 
+The current candidate state is the RC7 amendment at the end of this plan.
+Earlier RC4, RC5, and RC6 sections preserve their checkpoint evidence and are
+not current build allocations.
+
 The installed RC4 source is `735a59ce`, build `1023.2`. Its prompt-free Keychain
 foundation, approved recovery boundary, and qualification are recorded in the
 [silent-migration decision](../decisions/2026-08-31-silent-keychain-migration.md).
@@ -79,8 +83,9 @@ automatically included in the retained validation run.
 5. Commit and merge the reviewed result, then create one exact annotated
    `tibotattle-internal-dogfood-0.1.17-rcN-source-YYYYMMDD` tag. Use the reviewed
    channel allocation from `scripts/macos-bundle-version.js`, clean source and
-   retained release finalizer. Earlier candidates used `1023`, `1023.1`, and
-   `1023.2`; the integrated RC5 uses `1023.3`. Stable remains `1024`.
+   retained release finalizer. Earlier candidates used `1023`, `1023.1`,
+   `1023.2`, `1023.3`, and `1023.4`; corrective RC7 uses `1023.5`. Stable
+   remains `1024`.
    Signing and notarization are authorized; public updater/release publication
    and hosted deployment are not part of this task.
 6. Install only the verified signed artifact with a recoverable prior-app and
@@ -283,7 +288,7 @@ hosted Worker behavior. Worker migrations/deployment, telemetry v1.1 activation,
 and new consent are protected operations outside this internal artifact build;
 desktop installation alone cannot establish end-to-end pairing repair.
 
-## RC5 installed-refresh finding and RC6 correction
+## RC5 installed-refresh finding and RC6 correction (historical checkpoint)
 
 RC5 source `ff506dc3`, tagged for internal dogfood and allocated build `1023.3`,
 subsequently passed source, protected R7, Developer ID, notarization, stapling,
@@ -305,11 +310,37 @@ server ceiling plus one minute, and cancellation is rechecked immediately before
 atomic cache publication. Existing resource, generation, size, privacy and
 killable-child guards are unchanged.
 
-RC6 must rerun the exact source gates and protected R7 after source freeze, then
-repeat signing, notarization, replacement validation, state-preserving install
-and physical checks. The real full-accounting refresh must reach terminal
-success and publish current generation-matched v0.14 figures; the two-limit
-popover must also pass its installed interaction check. PR #94's purpose-built
-fixed-corpus comparator remains an open internal-dogfood/stable gate, and no
-hosted Worker deployment, migration, stable tag, appcast or public artifact is
-authorized by this correction.
+At this checkpoint, RC6 still had to rerun the exact source gates and protected
+R7 after source freeze, then repeat signing, notarization, replacement
+validation, state-preserving install, and physical checks. The real full-
+accounting refresh had to reach terminal success and publish current generation-
+matched v0.14 figures; the two-limit popover also remained an installed
+interaction check. The later section records the RC6 result and superseding RC7
+allocation. No hosted Worker deployment, migration, stable tag, appcast, or
+public artifact was authorized by this correction.
+
+## RC6 installed result and RC7 correction
+
+RC6 source `e59115d41958f6b23496a65c9732a6a9944fdde0`, build `1023.4`,
+subsequently completed its exact source gates, protected R7, Developer ID
+signing, notarization, stapling, Gatekeeper, state-preserving replacement, and
+installed launch without an observed Keychain prompt. Its real refresh ran
+past five minutes and reached terminal success, proving the RC5 lifetime fix.
+The result nevertheless did not publish current advanced accounting because an
+inherited `recent_7d_indexing` legacy checkpoint suppressed otherwise-
+authoritative unified accounting.
+
+RC7 removes only that retired collector checkpoint. It continues to require
+`unifiedGenerationAuthoritative`, matching generations, complete accounting
+provenance, resource ceilings, cancellation fencing, and atomic publication.
+Its monotonic build is `1023.5`, strictly after installed RC6 and before stable
+`1024`. The source change invalidates RC6's workload receipts for RC7, so fresh
+exact-source gates and protected R7 must precede a new tag, signed/notarized
+artifact, state-preserving replacement, and installed refresh and two-limit
+popover checks.
+
+PR #94's fixed-real-corpus comparator remains **OPEN / NOT RUN**. RC7 may be
+used only as an explicitly open-gate internal dogfood; stable and public
+qualification remain blocked until that comparator is closed or deliberately
+resolved. No hosted Worker deployment, migration, stable tag, appcast, or
+public artifact is authorized by this correction.

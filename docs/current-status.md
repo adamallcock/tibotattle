@@ -1,10 +1,10 @@
 ---
 title: Current product and release status
-date: 2026-08-31
+date: 2026-09-01
 type: status
 status: current
-source_commit: 3b0f2d23775c0ca1f092fe3eb48f0c3166c8461a
-observation_date: 2026-08-31
+source_commit: 64fc79e44f671336e8060416932538ff360ac4ca
+observation_date: 2026-09-01
 ---
 
 # Current product and release status
@@ -18,8 +18,8 @@ using this page for a later release or operational decision.
 
 | Boundary | Verified state |
 |---|---|
-| Documentation/source review | Release-preparation base `origin/main` commit `3b0f2d23775c0ca1f092fe3eb48f0c3166c8461a`, reviewed 2026-08-31; final source freeze is pending |
-| Installed internal dogfood | Signed and notarized RC4 source `735a59ce2ec01df0e381fb1aa878c5c7a39edcd8`, build `1023.2`, installed 2026-08-31; excludes PR #94 and is not current main or stable |
+| Documentation/source review | RC7 preparation source `64fc79e44f671336e8060416932538ff360ac4ca`, reviewed 2026-09-01; final source freeze is pending |
+| Installed internal dogfood | Signed and notarized RC6 source `e59115d41958f6b23496a65c9732a6a9944fdde0`, build `1023.4`, installed 2026-08-31; the timeout correction passed but the advanced-accounting handoff did not |
 | Public service | Read-only `GET https://tibotattle.com/api/health`, HTTP 200, deployment source `304f3d736b6f9451d32a616bf3046ea628e828a3`, observed 2026-08-31 |
 | Public updater | Read-only `GET https://updates.tibotattle.com/appcast.xml`, observed 2026-08-27 |
 | Published release | GitHub release API for `adamallcock/tibotattle`, observed 2026-08-27 |
@@ -116,35 +116,50 @@ The complete qualification matrix and rules for changing these claims are in
 - Integrated RC5 source `ff506dc3`, build `1023.3`, was signed, notarized and
   installed on 2026-08-31. Its state-preserving replacement and first launch
   passed, but its real full-accounting refresh did not: a healthy v0.14 rebuild
-  was terminated by the ordinary five-minute deadline. RC5 is therefore not
-  the dogfood handoff. Corrective RC6 is allocated monotonic build `1023.4` and
-  still needs frozen-source, R7, signed-artifact, replacement and physical
-  refresh evidence.
-- The RC5 R7 workload-source closure has protected dual-runtime
-  receipts for 359 files / workload SHA-256
-  `4c3058b3453bda2696e946952d18e81310f26eb0187074d410c730e44162f1d6`.
-  Both decisions remain honestly `release_open`. RC6 changes workload-owned
-  refresh/accounting source, so those receipts are now historical for RC5 and
-  must be regenerated after the corrective source is frozen. Native UI and
+  was terminated by the ordinary five-minute deadline. That evidence remains
+  specific to RC5.
+- RC6 source `e59115d41958f6b23496a65c9732a6a9944fdde0`, build `1023.4`,
+  subsequently passed its source gates, protected R7, Developer ID signing,
+  notarization, stapling, Gatekeeper, state-preserving replacement, and installed
+  launch without an observed Keychain prompt. Its real refresh ran past five
+  minutes and reached terminal success, proving the deadline correction. The
+  installed result then exposed an inherited `recent_7d_indexing` legacy
+  checkpoint suppressing otherwise-authoritative unified accounting. RC6 is
+  therefore not the final dogfood handoff.
+- RC7 source preparation removes only that retired collector checkpoint. It
+  continues to require `unifiedGenerationAuthoritative` before accounting can
+  publish and does not relax source completeness, generation matching, resource
+  ceilings, or atomic publication. RC7 is allocated monotonic build `1023.5`,
+  strictly after installed RC6 and before reserved stable build `1024`. Fresh
+  exact-source gates, R7, signed-artifact, replacement, and physical installed
+  refresh evidence remain required.
+- The RC6 R7 workload-source closure has protected dual-runtime receipts for
+  359 files / workload SHA-256
+  `fcb55e0cb729b56249e2c6f4d8fa4a08bc4b4c8fe99a506ce10cfe1068ed48d5`.
+  Both decisions remain honestly `release_open`. RC7 changes workload-owned
+  refresh/accounting source, so those receipts are historical for RC6 and must
+  be regenerated after the corrective source is frozen. Native UI and
   build-allocation files remain subject to their separate macOS source, smoke,
   signed-artifact, and installed-artifact gates.
 - The public service and release feed are remote state. Their health and
   availability can change after this snapshot.
 - Public health is not proof that every admin, identity, contribution, deletion,
   or updater path works end to end.
-- Before RC6 dogfood sign-off or 0.1.17 stable qualification, PR #94 still needs
-  the fixed real-corpus before/after coverage, diagnostic-distribution, and
-  resource review. Current APIs cannot emit the complete named fit-rejection
-  reconciliation, so that gate remains open rather than inferred green. The
-  exact integrated native artifact must also pass signing, notarization,
-  state-preserving installation, updater, and physical native checks. Pairing
-  continuity needs compatible hosted Worker migrations/deployment before the
-  repaired desktop flow can be validated end to end.
+- PR #94's fixed-real-corpus before/after coverage, diagnostic-distribution, and
+  resource comparator remains **OPEN / NOT RUN**. Current APIs cannot emit the
+  complete named fit-rejection reconciliation, so R7 cannot be used as a
+  substitute. An explicitly open-gate internal dogfood may proceed for testing,
+  but this blocks stable and public 0.1.17 qualification until it is closed or
+  deliberately resolved. The exact RC7 native artifact must separately pass
+  signing, notarization, state-preserving installation, updater, and physical
+  native checks. Pairing continuity needs compatible hosted Worker migrations
+  and deployment before the repaired desktop flow can be validated end to end.
 - An owner-only fixed-window attempt on 2026-08-31 failed closed before comparison:
   the strict pre-PR scan reported `codex_rollout_content_invalid`. The supported
   resource benchmark independently stopped at `benchmark_cold_rebuild_incomplete`
   on both exact PR #94 revisions. No empirical comparison receipt was produced,
-  no source was excluded, and this remains an open RC6/stable gate.
+  no source was excluded, and this does not constitute a run of the formal
+  comparator. Its **OPEN / NOT RUN** state remains a stable/public gate.
 
 ## How to refresh this page
 
