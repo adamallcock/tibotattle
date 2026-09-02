@@ -269,6 +269,7 @@ published-release claim.
 
 ### Release tooling
 
+- Updates the root schema-validation dependency `fast-uri` to patched 3.1.6.
 - Verifies that the rendered social preview is the exact asset selected for the
   release ([PR #52](https://github.com/adamallcock/tibotattle/pull/52)).
 - Adds checked-in, provenance-linked release notes and changelog validation

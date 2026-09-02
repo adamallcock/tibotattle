@@ -418,3 +418,14 @@ defines measured optimization work without changing accounting semantics.
 PR #94's formal fixed-real-corpus comparator remains **OPEN / NOT RUN**. This
 continues to be an explicitly open-gate internal dogfood, not stable/public
 qualification or hosted pairing/deployment proof.
+
+The first RC9 source commit was `cd428e55` (draft PR #102). Its hosted security
+scan identified four published high-severity `fast-uri` advisories in the
+unchanged root lockfile. The compatible patched release is
+[`fast-uri` 3.1.6](https://github.com/fastify/fast-uri/security/advisories/GHSA-5jgf-p345-68v8).
+The early R7 attempt was deliberately stopped during its second synthetic
+profile, before any real-history phase. Automatic recovery completed; all ten
+retained receipts were independently verified unchanged and the supported
+recovery command reported no interrupted generation. Updating the one
+transitive dependency requires a new source freeze and a complete fresh R7 run;
+the canceled attempt is not release evidence.
