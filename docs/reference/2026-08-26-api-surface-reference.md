@@ -39,7 +39,7 @@ Those remain separate verification gates in the relevant runbooks.
 
 | Surface | Boundary | Implemented surface |
 |---|---|---:|
-| Local companion API | Browser/native shell → loopback Node companion | 25 paths, 27 method/path operations |
+| Local companion API | Browser/native shell → loopback Node companion | 26 paths, 28 method/path operations |
 | Local report pages | Browser → fixed loopback report allowlist | 4 `GET` paths |
 | Central public relay | Loopback companion → configured hosted origin | 1 fixed `GET` path |
 | Participant relay | Loopback companion → configured hosted origin | 9 paths, 9 method/path operations |
@@ -167,7 +167,8 @@ hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
 | `GET` | `/api/local/weekly-pace-outlook` | Privacy-safe weekly allowance pace projection bound to the current observed window |
 | `GET` | `/api/local/quality` | Monitoring-quality report data |
 | `GET` | `/api/local/timeline/window-breakdown` | Bounded indexed timeline breakdown for `from` and `to` epoch-millisecond bounds |
-| `GET`, `POST` | `/api/local/refresh` | Inspect refresh state or start one bounded local refresh |
+| `GET`, `POST` | `/api/local/refresh` | Inspect refresh state or explicitly start one bounded retained-history and detailed-accounting refresh |
+| `POST` | `/api/local/refresh/quick` | Refresh current quota/headline evidence without advancing retained history or rebuilding detailed accounting |
 | `POST` | `/api/local/refresh/cancel` | Cooperatively cancel the active refresh |
 | `POST` | `/api/local/contribution/prepare` | Build and validate a reviewed local contribution set |
 | `GET` | `/api/local/contribution/sync-status` | Inspect the replay-safe contribution queue and pause state |

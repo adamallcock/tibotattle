@@ -41,6 +41,11 @@ import {
   readLocalUnifiedCompanionProjection,
 } from "../src/local-unified-companion-source.js";
 import { usageProjection } from "../src/local-companion-usage-model.js";
+import {
+  isAuthoritativeDashboardSnapshot,
+  readAuthoritativeDashboardSnapshot,
+  writeAuthoritativeDashboardSnapshot,
+} from "../src/local-authoritative-dashboard-snapshot.js";
 
 const ARTIFACT_FILES = {
   gradient: "2026-07-24-simple-quota-gradient-artifact.json",
@@ -2381,6 +2386,17 @@ test("full unified snapshot prices stored context like the same-generation repla
     assert.equal(accounting.compatibilityBehavior, "legacy_zero");
     assert.equal(timeline.source, "unified_local_index");
     assert.equal(timeline.history.status, "complete");
+    // Exercise the production builder, not a hand-shaped fixture: requiring
+    // a retired top-level report field previously rejected every real save.
+    assert.equal(isAuthoritativeDashboardSnapshot(snapshot), true);
+    const snapshotFile = join(stateDirectory, "private", "last-authoritative-dashboard.json");
+    assert.equal(await writeAuthoritativeDashboardSnapshot({
+      snapshotFile, snapshot, now: () => nowMs,
+    }), true);
+    const restored = await readAuthoritativeDashboardSnapshot({ snapshotFile });
+    assert.notEqual(restored, null);
+    assert.deepEqual(restored.snapshot, JSON.parse(JSON.stringify(snapshot)),
+      "the production JSON projection survives durable persistence exactly");
     const all = usage.find((period) => period.id === "all");
     const history = accounting.periods.find((period) => period.periodId === "history");
     assert.equal(all.events, cases.length);

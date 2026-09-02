@@ -193,6 +193,172 @@ test("refresh controller resolves a fresh-state timeout for each run", async () 
   assert.equal(selections, 2);
 });
 
+test("quick refresh publishes quota/headline data without deep index, accounting, or archive work", async () => {
+  const calls = {
+    unified: 0,
+    accounting: 0,
+    archive: 0,
+  };
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async () => ({
+      rolloutRecordsWritten: 0,
+      filesDiscovered: 4,
+      refresh: {
+        attempted: true,
+        recordWritten: true,
+        errorCode: null,
+      },
+      indexing: COMPLETE_INDEX,
+    }),
+    refreshUnifiedIndex: async () => {
+      calls.unified += 1;
+      throw new Error("quick refresh must not advance the unified index");
+    },
+    refreshAccounting: async () => {
+      calls.accounting += 1;
+      throw new Error("quick refresh must not rebuild accounting");
+    },
+    refreshArchiveIndex: async () => {
+      calls.archive += 1;
+      throw new Error("quick refresh must not scan the archive");
+    },
+  });
+
+  const result = await runner({ mode: "quick" });
+  assert.deepEqual(calls, { unified: 0, accounting: 0, archive: 0 });
+  assert.equal(result.filesDiscovered, 4);
+  assert.equal(result.quotaRefresh.recordWritten, true);
+  assert.equal(Object.hasOwn(result, "unifiedIndex"), false);
+  assert.equal(Object.hasOwn(result, "accounting"), false);
+  assert.equal(Object.hasOwn(result, "archiveIndex"), false);
+  await assert.rejects(
+    runner({ mode: "automatic" }),
+    /mode must be quick or detailed/u,
+  );
+});
+
+test("quick legacy refresh skips rollout backfill and a bounded collector continuation", async () => {
+  const collectorCalls = [];
+  const deepCalls = { unified: 0, accounting: 0, archive: 0 };
+  const runner = createLocalCollectorRefreshRunner({
+    accountingSourceMode: "legacy",
+    selectAccountObservationSecret: () => ({
+      loadAccountObservationSecret: null,
+    }),
+    runCollector: async (options) => {
+      collectorCalls.push(options);
+      return {
+        rolloutRecordsWritten: 0,
+        filesDiscovered: 9,
+        refresh: { attempted: true, recordWritten: true, errorCode: null },
+        // An inherited checkpoint must not turn a quick quota observation
+        // into the detailed legacy runner's normal second pass.
+        indexing: PAUSED_INDEX,
+      };
+    },
+    refreshUnifiedIndex: async () => { deepCalls.unified += 1; },
+    refreshAccounting: async () => { deepCalls.accounting += 1; },
+    refreshArchiveIndex: async () => { deepCalls.archive += 1; },
+  });
+
+  const result = await runner({ mode: "quick" });
+  assert.equal(collectorCalls.length, 1);
+  assert.equal(collectorCalls[0].backfill, false);
+  assert.equal(Object.hasOwn(collectorCalls[0], "backfillSinceAt"), false);
+  assert.equal(collectorCalls[0].skipRolloutIngestion, true);
+  assert.equal(collectorCalls[0].refreshStale, true);
+  assert.equal(collectorCalls[0].staleAfterMs, 0);
+  assert.deepEqual(deepCalls, { unified: 0, accounting: 0, archive: 0 });
+  assert.equal(result.quotaRefresh.recordWritten, true);
+  assert.deepEqual(result.indexing, PAUSED_INDEX);
+  assert.equal(Object.hasOwn(result, "unifiedIndex"), false);
+  assert.equal(Object.hasOwn(result, "accounting"), false);
+  assert.equal(Object.hasOwn(result, "archiveIndex"), false);
+});
+
+test("refresh controller forwards mode and reloads quick and detailed results distinctly", async () => {
+  const modes = [];
+  const reloads = [];
+  const controller = new LocalCompanionRefreshController({
+    runner: async ({ mode }) => {
+      modes.push(mode);
+      return {
+        rolloutRecordsWritten: 0,
+        filesDiscovered: 0,
+        quotaRefresh: {
+          attempted: true,
+          recordWritten: false,
+          errorCode: null,
+        },
+      };
+    },
+    dataStore: {
+      async reload(options) {
+        reloads.push(options);
+      },
+    },
+  });
+
+  assert.equal(controller.start({ mode: "quick" }), true);
+  while (controller.isRunning()) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(controller.start(), true);
+  while (controller.isRunning()) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.deepEqual(modes, ["quick", "detailed"]);
+  assert.equal(reloads[0].purpose, "quick");
+  assert.equal(Object.hasOwn(reloads[0], "unifiedProjectionReuse"), false);
+  assert.equal(reloads[1].purpose, "full");
+  assert.equal(Object.hasOwn(reloads[1], "unifiedProjectionReuse"), true);
+  assert.throws(
+    () => controller.start({ mode: "automatic" }),
+    /mode must be quick or detailed/u,
+  );
+});
+
+test("refresh mode and actual start time survive joins and terminal outcomes", async () => {
+  for (const mode of ["quick", "detailed"]) {
+    for (const outcome of ["succeeded", "failed", "cancelled"]) {
+      const pending = Promise.withResolvers();
+      const startedAt = Date.parse("2026-09-01T12:00:00.000Z");
+      let now = startedAt;
+      const controller = new LocalCompanionRefreshController({
+        clock: () => now,
+        runner: () => pending.promise,
+        dataStore: { async reload() {} },
+      });
+      assert.equal(controller.getStatus().mode, null);
+      assert.equal(controller.getStatus().startedAt, null);
+      assert.equal(controller.start({ mode }), true);
+      const running = controller.getStatus();
+      assert.equal(running.mode, mode);
+      assert.equal(running.startedAt, new Date(startedAt).toISOString());
+      now += 15_000;
+      assert.equal(controller.start({
+        mode: mode === "quick" ? "detailed" : "quick",
+      }), false);
+      assert.deepEqual(controller.getStatus(), running,
+        "a 409 join keeps the running operation's mode and start receipt");
+      if (outcome === "cancelled") controller.cancel();
+      if (outcome === "failed") pending.reject(new Error("synthetic failure"));
+      else pending.resolve({});
+      await flushControllerSettlement(controller);
+      const terminal = controller.getStatus();
+      assert.equal(terminal.status, outcome);
+      assert.equal(terminal.mode, mode);
+      assert.equal(terminal.startedAt, running.startedAt);
+      assert.equal(terminal.refreshId, running.refreshId);
+      assert.equal(terminal.finishedAt, new Date(now).toISOString());
+    }
+  }
+});
+
 const REUSABLE_ACCOUNTING_CACHE = Object.freeze({
   schemaVersion: REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
   generatedAt: "2026-07-23T10:00:00.000Z",

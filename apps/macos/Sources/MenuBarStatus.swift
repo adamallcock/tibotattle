@@ -305,17 +305,53 @@ enum LocalAnalysisTerminalOutcome: String, Equatable {
 enum LocalAnalysisActivity: Equatable {
     case idle(
         refreshID: String?,
-        outcome: LocalAnalysisTerminalOutcome
+        outcome: LocalAnalysisTerminalOutcome,
+        attempt: LocalAnalysisAttempt? = nil
     )
-    case running(refreshID: String?, progress: LocalAnalysisProgress?)
+    case running(
+        refreshID: String?,
+        progress: LocalAnalysisProgress?,
+        attempt: LocalAnalysisAttempt? = nil
+    )
+
+    var attempt: LocalAnalysisAttempt? {
+        switch self {
+        case let .idle(_, _, attempt), let .running(_, _, attempt):
+            attempt
+        }
+    }
 }
 
 /// Result of asking the companion to start the existing refresh pass.
 enum LocalAnalysisStart: Equatable {
-    case started(refreshID: String?)
-    case alreadyRunning(refreshID: String?)
+    case started(refreshID: String?, attempt: LocalAnalysisAttempt? = nil)
+    case alreadyRunning(refreshID: String?, attempt: LocalAnalysisAttempt? = nil)
     case rejected(String)
     case unreachable
+}
+
+/// Bounded controller evidence, not a client request timestamp. Missing or
+/// future-schema receipts never guess a mode or consume a cadence allowance.
+struct LocalAnalysisAttempt: Equatable {
+    let mode: LocalAnalysisMode
+    let startedAt: Date
+}
+
+/// Selects one of the companion's two explicit refresh contracts. Quick
+/// refreshes collect current quota/headline evidence only; detailed refreshes
+/// additionally advance retained history and replay-safe accounting.
+enum LocalAnalysisMode: String, Equatable {
+    case quick
+    case detailed
+
+    var routePath: String {
+        switch self {
+        case .quick:
+            "/api/local/refresh/quick"
+        case .detailed:
+            "/api/local/refresh"
+        }
+    }
 }
 
 /// The status item keeps the product's bird mark at a glance, while the small
@@ -1048,7 +1084,10 @@ final class LocalCompanionEvidenceReader {
             data, response, _ in
             let activity = Self.acceptedPayload(data, response)
                 .flatMap { Self.decodeActivity($0) }
-            DispatchQueue.main.async { completion(activity) }
+            DispatchQueue.main.async {
+                NativeDetailedRefreshCadence.observe(activity?.attempt)
+                completion(activity)
+            }
         }
         task.resume()
     }
@@ -1075,14 +1114,14 @@ final class LocalCompanionEvidenceReader {
         task.resume()
     }
 
-    /// Starts the companion's own refresh pass: the exact route the dashboard
-    /// button uses, with the same same-origin proof and the same fixed
-    /// `user_request` body the companion accepts.
+    /// Starts the selected companion refresh pass with the same same-origin
+    /// proof and fixed `user_request` body used by first-party refresh UI.
     func startAnalysis(
         base: URL,
+        mode: LocalAnalysisMode,
         completion: @escaping (LocalAnalysisStart) -> Void
     ) {
-        guard let url = loopbackEndpoint(base, path: "/api/local/refresh"),
+        guard let url = loopbackEndpoint(base, path: mode.routePath),
               let origin = loopbackOrigin(base)
         else {
             completion(.unreachable)
@@ -1095,12 +1134,13 @@ final class LocalCompanionEvidenceReader {
         let task = session.dataTask(with: mutation) { data, response, _ in
             let status = (response as? HTTPURLResponse)?.statusCode
             let refreshID = data.flatMap(Self.decodeRefreshID)
+            let attempt = data.flatMap(Self.decodeAttempt)
             let result: LocalAnalysisStart
             switch status {
             case 202:
-                result = .started(refreshID: refreshID)
+                result = .started(refreshID: refreshID, attempt: attempt)
             case 409:
-                result = .alreadyRunning(refreshID: refreshID)
+                result = .alreadyRunning(refreshID: refreshID, attempt: attempt)
             case .some(let code):
                 let payload = data.flatMap {
                     try? JSONSerialization.jsonObject(with: $0)
@@ -1114,7 +1154,12 @@ final class LocalCompanionEvidenceReader {
             case .none:
                 result = .unreachable
             }
-            DispatchQueue.main.async { completion(result) }
+            DispatchQueue.main.async {
+                if status == 202 || status == 409 {
+                    NativeDetailedRefreshCadence.observe(attempt)
+                }
+                completion(result)
+            }
         }
         task.resume()
     }
@@ -1180,14 +1225,46 @@ final class LocalCompanionEvidenceReader {
         if ["running", "cancelling"].contains(status) {
             return .running(
                 refreshID: refreshID,
-                progress: decodeProgress(refresh["progress"])
+                progress: decodeProgress(refresh["progress"]),
+                attempt: decodeAttempt(refresh)
             )
         }
         guard let outcome = LocalAnalysisTerminalOutcome(rawValue: status)
         else {
             return nil
         }
-        return .idle(refreshID: refreshID, outcome: outcome)
+        return .idle(
+            refreshID: refreshID,
+            outcome: outcome,
+            attempt: decodeAttempt(refresh)
+        )
+    }
+
+    private static func decodeAttempt(_ data: Data) -> LocalAnalysisAttempt? {
+        guard let root = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+              let refresh = root["refresh"] as? [String: Any]
+        else { return nil }
+        return decodeAttempt(refresh)
+    }
+
+    private static func decodeAttempt(
+        _ refresh: [String: Any]
+    ) -> LocalAnalysisAttempt? {
+        guard decodeRefreshID(refresh) != nil,
+              let rawMode = refresh["mode"] as? String,
+              let mode = LocalAnalysisMode(rawValue: rawMode),
+              let rawStartedAt = refresh["startedAt"] as? String,
+              rawStartedAt.utf8.count == 24
+        else { return nil }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        guard let startedAt = formatter.date(from: rawStartedAt),
+              startedAt.timeIntervalSince1970.isFinite,
+              startedAt.timeIntervalSince1970 >= 0,
+              formatter.string(from: startedAt) == rawStartedAt
+        else { return nil }
+        return LocalAnalysisAttempt(mode: mode, startedAt: startedAt)
     }
 
     private static func decodeProgress(_ value: Any?) -> LocalAnalysisProgress? {
@@ -1923,14 +2000,14 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
         // state is confirmed by the response and the poll that follows.
         snapshot.phase = .analyzing
         render()
-        reader.startAnalysis(base: dashboardURL) { [weak self] result in
+        reader.startAnalysis(base: dashboardURL, mode: .quick) { [weak self] result in
             guard let self,
                   !self.stopped,
                   self.companionGeneration == generation,
                   self.dashboardURL == dashboardURL
             else { return }
             switch result {
-            case let .started(refreshID), let .alreadyRunning(refreshID):
+            case let .started(refreshID, _), let .alreadyRunning(refreshID, _):
                 self.snapshot.phase = .analyzing
                 self.notificationEvaluationAwaitingRefresh = true
                 self.notificationEvaluationRefreshID = refreshID
@@ -1994,7 +2071,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
             switch activity {
             case .running:
                 self.snapshot.phase = .analyzing
-            case let .idle(refreshID, outcome):
+            case let .idle(refreshID, outcome, _):
                 if self.overviewResponseHealthy {
                     self.snapshot.phase = .ready
                 }
@@ -2554,7 +2631,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
         let generation = companionGeneration
         snapshot.phase = .analyzing
         render()
-        reader.startAnalysis(base: dashboardURL) { [weak self] result in
+        reader.startAnalysis(base: dashboardURL, mode: .quick) { [weak self] result in
             guard let self,
                   !self.stopped,
                   self.companionGeneration == generation,
@@ -2562,7 +2639,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
             else { return }
             self.automaticRefreshInFlight = false
             switch result {
-            case let .started(refreshID), let .alreadyRunning(refreshID):
+            case let .started(refreshID, _), let .alreadyRunning(refreshID, _):
                 self.automaticRefreshInFlight = true
                 self.snapshot.phase = .analyzing
                 self.notificationEvaluationAwaitingRefresh = true

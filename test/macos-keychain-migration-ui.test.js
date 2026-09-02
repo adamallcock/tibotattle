@@ -129,17 +129,23 @@ test("migration completion queues one existing local refresh without granting co
   assert.match(refresh, /guard !quitting else \{ return \}/u);
   assert.match(refresh, /keychainMigrationRefreshPending = true/u);
   assert.match(refresh, /guard dashboardURL != nil, !nativeRefreshInFlight else \{ return \}/u);
-  assert.match(refresh, /refreshLocalUsage\(automatic: false\)/u);
+  assert.match(
+    refresh,
+    /refreshLocalUsage\(automatic: false, mode: \.detailed\)/u,
+  );
   assert.doesNotMatch(
     refresh,
     /approvePendingMigrations\(|grant\w*Consent\(|\.consent\(|\.pair\(|\.upload\(/u,
   );
   const start = section(
-    "private func refreshLocalUsage(automatic: Bool)",
+    "private func refreshLocalUsage(",
     "private func pollNativeRefresh(",
   );
   assert.match(start, /keychainMigrationRefreshPending = false/u);
-  assert.match(start, /nativeEvidenceReader\.startAnalysis\(base: dashboardURL\)/u);
+  assert.match(
+    start,
+    /nativeEvidenceReader\.startAnalysis\([\s\S]*?base: dashboardURL,[\s\S]*?mode: mode/u,
+  );
   const finish = section(
     "private func finishNativeRefresh(title:",
     "private func readNativeToolbarStatusFacts(",

@@ -7,8 +7,8 @@ pseudonyms to the browser. A separate, explicitly local-only thread-link
 contract exposes Codex thread IDs and display names for recent cache-drop rows,
 without adding them to accounting snapshots or export DTOs.
 
-A normal refresh processes metadata from the selected Codex `sessions` and
-`archived_sessions` folders. It also reads the selected Codex home's
+A detailed-accounting refresh processes metadata from the selected Codex
+`sessions` and `archived_sessions` folders. It also reads the selected Codex home's
 `state_5.sqlite` for rollout lineage and `config.toml` for service-tier
 settings, and invokes the installed Codex binary's local `app-server` methods
 `account/read`, `account/rateLimits/read`, and `account/usage/read`. Source
@@ -38,8 +38,10 @@ Startup defers the full-history projection so the first local dashboard does
 not wait for it. A validated last-authoritative snapshot may supply retained
 figures, labelled with their original provenance and the current projection's
 unavailable state. Without a valid saved snapshot, missing history remains
-unavailable. The normal refresh publishes its quick result and then replaces
-the retained or unavailable details with the completed full projection.
+unavailable. Ordinary Refresh publishes current quota/headline evidence and
+does not advance retained history. The explicit detailed recalculation replaces
+retained or unavailable details only after its generation-bound full projection
+completes.
 
 To let the personal loopback dashboard read central-service health and use the
 fixed hosted identity/participation relay:
@@ -137,18 +139,20 @@ On first use:
 1. open the dashboard from the native window;
 2. review whether local Codex metadata and writable installed state are
    available;
-3. let the native launcher start one bounded, cancellable refresh after the
-   dashboard's first paint, or choose **Analyze local usage** in a standalone
-   browser development session;
-4. keep reading as TiboTattle automatically continues bounded slices under
-   that original action, or choose **Cancel** and resume later; and
+3. let the native launcher perform one quick quota/headline refresh after the
+   dashboard's first paint, or choose **Refresh** in a standalone browser
+   development session;
+4. when explicitly recalculating detailed accounting, keep reading as
+   TiboTattle continues bounded slices under that original action, or choose
+   **Cancel** and resume later; and
 5. review the privacy-safe local results; then
 6. optionally choose **Contribute and keep it current**, review the exact first
    prepared contribution, and send it explicitly.
 
-Every slice is deliberately bounded. A separate 128 MiB checkpointed headline
-pass publishes current quota and recent content-free usage before the full
-seven-day index and deeper replay-safe accounting complete. The refresh status
+Every detailed-analysis slice is deliberately bounded. A separate 128 MiB
+checkpointed headline pass publishes current quota and recent content-free
+usage before the full seven-day index and deeper replay-safe accounting
+complete. The refresh status
 exposes `quickResultAt` and the `quick_result` phase. Internal
 `bounded_pause` results continue automatically under the same user action, with
 a fixed ceiling of exactly two automatic continuations after the initial pass.
@@ -178,9 +182,25 @@ that live cache and labels older observations as account-unattributed and
 potentially spanning multiple accounts. It does not read the replay-heavy
 collector record store as a substitute or perform a second raw-log pass.
 
-A quota-only refresh now reuses a current accounting cache while preserving
-the newly observed quota card. If any genuinely new rollout usage was written,
-the companion still rebuilds through one bounded 31-day replay-safe scan.
+An ordinary quick refresh preserves the last authoritative accounting
+projection while publishing the newly observed quota card; it never advances
+the unified index or starts a replay-safe rebuild. An explicit detailed refresh
+advances the index and rebuilds from the retained authoritative corpus when the
+generation is not already cached. A display range is not a history-retention
+limit; the explicit legacy rollback scan has a configured window of at least
+365 days.
+
+Refresh status carries the attempt's `mode` (`quick` or `detailed`) and actual
+`startedAt`, including joined and terminal attempts. Native automatic cadence
+observes that receipt, including browser-started work. A confirmed join of a
+quick attempt does not consume the hourly detailed allowance.
+
+Selected-plan Trends receives a separate compact, generation/basis/cohort-bound
+usage and quota lane. Explicit comparable intervals prevent rolling windows or
+cumulative drift from bridging a plan transition or ambiguous usage. Quota is
+selected before generic cross-plan collapse. The optional lane has 100,000-row
+and 4 MiB resource ceilings, not a short history window: a limit refuses that
+comparison rather than truncating history or invalidating all-plan accounting.
 The existing export resource guard is applied to source files and bytes,
 directory entries, elapsed time, line size, and RSS, including a 1.5 GiB
 accounting RSS ceiling. A violation becomes fixed

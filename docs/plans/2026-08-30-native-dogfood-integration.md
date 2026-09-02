@@ -13,11 +13,11 @@ Electron release, or new signed-Preview workflow. Source integration, tests,
 state migration, signing, installation, and native verification are separate
 gates; none is complete merely because an earlier gate passed.
 
-The current candidate state is the RC8 amendment at the end of this plan.
-Earlier RC4, RC5, RC6, and RC7 sections preserve their checkpoint evidence and are
+The current candidate state is the RC9 amendment at the end of this plan.
+Earlier RC4, RC5, RC6, RC7, and RC8 sections preserve their checkpoint evidence and are
 not current build allocations.
 
-The installed RC4 source is `735a59ce`, build `1023.2`. Its prompt-free Keychain
+At the RC4 checkpoint, the installed source was `735a59ce`, build `1023.2`. Its prompt-free Keychain
 foundation, approved recovery boundary, and qualification are recorded in the
 [silent-migration decision](../decisions/2026-08-31-silent-keychain-migration.md).
 RC4 is signed, notarized, and installed, but it was intentionally frozen before
@@ -84,7 +84,8 @@ automatically included in the retained validation run.
    `tibotattle-internal-dogfood-0.1.17-rcN-source-YYYYMMDD` tag. Use the reviewed
    channel allocation from `scripts/macos-bundle-version.js`, clean source and
    retained release finalizer. Earlier candidates used `1023`, `1023.1`,
-   `1023.2`, `1023.3`, `1023.4`, and `1023.5`; corrective RC8 uses `1023.6`.
+   `1023.2`, `1023.3`, `1023.4`, `1023.5`, and RC8 `1023.6`; corrective RC9
+   uses `1023.7`.
    Stable remains `1024`.
    Signing and notarization are authorized; public updater/release publication
    and hosted deployment are not part of this task.
@@ -367,3 +368,53 @@ PR #94's formal fixed-real-corpus comparator remains **OPEN / NOT RUN** and
 blocks stable or public qualification. Internal RC8 dogfood testing may proceed
 only with that gate explicitly open. No hosted Worker deployment, migration,
 stable tag, appcast, or public artifact is authorized here.
+
+## RC9 refresh and mixed-plan correction — 2026-09-02
+
+The corrective source is based on main `35802d21ede67d362533f4e2be6b38041ece1cda`
+(PR #101). The installed app's plist was observed as version `0.1.17`, build
+`1023.6` on 2026-09-02; that metadata observation does not independently requalify
+RC8's signing or runtime. RC9 is allocated `1023.7`, before reserved stable
+`1024`, and has not yet been built or installed.
+
+The owner-approved refresh policy is now represented in source: startup,
+ordinary Refresh, and Cmd-R perform quick quota/headline work. Detailed history
+and accounting have a separate explicit action. Automatic checks may attempt
+deep work at most once per hour while no refresh is in flight; failure,
+cancellation, and interruption consume that attempt. This is app-work
+coordination, not keyboard or mouse activity monitoring. A confirmed conflict
+with another quick request can undo only its own reservation. Observed deep
+requests from another surface retain their true start time. Terminal status and
+late callbacks cannot leave a finished request indefinitely calculating.
+
+The mixed-plan correction adds one compact, closed, generation-bound
+selected-plan timeline to the existing all-plan ledger. Plan, basis, reset
+cohort, generation and fingerprint must agree. Ambiguous attribution intervals
+remain gaps; the chart cannot bridge another plan or invent a quota movement.
+Reported and declared speed retain their evidence; unresolved speed uses the
+existing explicit Standard/Fast scenarios. Resource refusal affects only this
+optional comparison lane, without truncating retained history. Compact tuples
+remain compact through authoritative snapshot persistence and HTTP, and expand
+only at the browser boundary. The production snapshot validator also now agrees
+with the actual builder's top-level contract.
+
+Focused native/controller review and the unified index → saved cache → companion
+→ selected-plan browser integration pass. The first diagnostic broad run found
+a stale-serve regression, two missing Worker test dependencies, and the two
+stale R7 provenance checks. The regression is now corrected: valid historical
+scalar estimates remain explicitly stale and unscoped, while contradictory
+scope is refused and current comparison still requires full attribution. Both
+missing test dependencies are installed. Final focused accounting checks pass
+122/122, browser owning checks pass 481/481, preflight passes 20/20, and
+architecture reports no boundary debt. Native/controller, mixed-plan compact
+projection, and stale-serve reviews have no outstanding high-severity findings.
+The earlier broad run remains non-green; it is not a passing release gate.
+Freeze corrected source before protected R7, final broad
+validation, signing, notarization, state-preserving replacement, and physical
+native/Trends verification. The separate
+[performance handoff](./2026-09-01-detailed-accounting-refresh-performance.md)
+defines measured optimization work without changing accounting semantics.
+
+PR #94's formal fixed-real-corpus comparator remains **OPEN / NOT RUN**. This
+continues to be an explicitly open-gate internal dogfood, not stable/public
+qualification or hosted pairing/deployment proof.

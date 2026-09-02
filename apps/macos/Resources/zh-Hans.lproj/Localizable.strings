@@ -29,7 +29,8 @@
 "nativeDashboard.progressQuotaRefresh" = "正在刷新额度…";
 "nativeDashboard.progressSaving" = "正在保存分析进度…";
 "nativeDashboard.refreshUsage" = "刷新";
-"nativeDashboard.refreshUsageTooltip" = "从所选 Codex 会话文件夹，以及本地 Codex 帐户、额度、配置和运行谱系来源中更新。所有处理都留在这台 Mac 上。";
+"nativeDashboard.refreshUsageTooltip" = "从本地来源刷新当前额度和摘要。详细核算会单独更新，所有处理都留在这台 Mac 上。";
+"nativeDashboard.recalculateDetailedAccounting" = "重新计算详细核算…";
 "nativeDashboard.share" = "分享";
 "nativeDashboard.showSidebar" = "显示边栏";
 "nativeDashboard.shareTooltip" = "打开本地分享卡片。";
@@ -369,7 +370,7 @@
 "settings.startAtLoginUnregistrationNotConfirmedMessage" = "macOS 未确认 TiboTattle 已从登录项中移除。在依赖它之前，请检查“系统设置”→“登录项”。";
 "settings.startAtLoginUnregistrationNotConfirmedTitle" = "未确认移除登录时启动";
 "settings.refreshInterval" = "刷新间隔";
-"settings.refreshIntervalDetail" = "保存在这台 Mac 上，仅在 TiboTattle 打开时使用。";
+"settings.refreshIntervalDetail" = "TiboTattle 打开时刷新当前额度。详细核算最多每小时重新计算一次，也可从“显示”菜单手动运行。";
 "settings.refreshIntervalOneMinute" = "每分钟";
 "settings.refreshIntervalFiveMinutes" = "每 5 分钟";
 "settings.refreshIntervalFifteenMinutes" = "每 15 分钟";

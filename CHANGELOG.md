@@ -282,8 +282,8 @@ published-release claim.
   preferences, and Sparkle-feed identities, preventing preview installation or
   updates from replacing stable state.
 - Records builds 1023, 1023.1, 1023.2, 1023.3, 1023.4, and 1023.5 as earlier
-  0.1.17 internal dogfoods, allocates build 1023.6 to RC8, and retains build
-  1024 for stable.
+  0.1.17 internal dogfoods, records RC8 as build 1023.6, allocates build 1023.7
+  to corrective RC9, and retains build 1024 for stable.
   Signed tooling requires a clean checkout with exactly one matching annotated
   channel tag at `HEAD` before it can proceed. RC5 build 1023.3 is signed,
   notarized, and installed evidence for its frozen source, but physical testing
@@ -297,9 +297,12 @@ published-release claim.
   first installed refresh ingested unified-index generation 44, but the strict
   v0.14 cache validator rejected accounting because the projection copied an
   excluded diagnostic-only row's eligibility onto a reset fitted from later
-  eligible transitions. RC8 retains that strict validator, projects fit
-  metadata from the first eligible row, and requires fresh exact-source R7,
-  artifact, install, and physical verification before it can replace RC7.
+  eligible transitions. RC8 retains that strict validator and projects fit
+  metadata from the first eligible row. RC9 separates quick refresh from
+  detailed accounting, bounds automatic deep attempts to once per hour, restores
+  authoritative snapshot persistence, and supplies a scope-bound selected-plan
+  Trends lane. RC9 still requires fresh exact-source R7, artifact, install, and
+  physical verification; earlier candidates do not qualify these corrections.
 - Establishes scoped, machine-checked repository guidance for coding agents and
   the root layout they may extend
   ([PR #77](https://github.com/adamallcock/tibotattle/pull/77)).

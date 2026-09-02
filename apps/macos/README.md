@@ -43,8 +43,9 @@ before treating source tests as signed-upgrade evidence.
 ## Consumer lifecycle in the app
 
 The companion's first snapshot uses its bounded startup projection and retains
-only validated last-good evidence with explicit coverage labels. Full history
-accounting follows through the normal refresh after the first local render;
+only validated last-good evidence with explicit coverage labels. The initial
+refresh updates current quota/headline evidence only. Detailed accounting runs
+through the explicit recalculation action or the bounded hourly attempt;
 optional contribution requests do not define local-dashboard readiness.
 The native host treats 20 seconds as a quiet slow-load threshold, keeps the
 document visible, and continues one generation-fenced readiness observation for
@@ -67,7 +68,7 @@ refresh once and clears the stale readiness-timeout diagnostic.
    Login Item. The acknowledgement is an owner-only local receipt; moving
    local app data to Trash makes the disclosure appear again.
 3. The native window starts one private loopback companion on an ephemeral
-   port and performs its existing bounded local refresh while the normal app
+   port and performs a quick quota/headline refresh while the normal app
    remains open. The Login Item adds no separate scanner; raw logs and prompts
    are never uploaded by the launch itself, and optional contribution keeps its
    separate review and consent controls.
@@ -206,8 +207,15 @@ no names or identifiers are logged or persisted by this handoff. Native
 context-menu **Open Link** does not perform this Codex handoff; use the link
 itself. Existing HTTPS and hosted sign-in-return behavior are unchanged.
 
-The toolbar has no independent data authority. **Refresh usage** reuses the
-already-running loopback Node companion and its existing local refresh route.
+The toolbar has no independent data authority. **Refresh usage** and Cmd-R use
+the already-running loopback companion's quick route, without index ingestion
+or detailed accounting. **View → Recalculate Detailed Accounting…** explicitly
+advances history and rebuilds accounting. The foreground interval may make at
+most one automatic detailed attempt per hour while no refresh is in flight;
+startup and intervening checks stay quick. Failed, cancelled, and interrupted
+detailed attempts count toward the hourly budget. A companion terminal receipt
+clears the native busy state before optional presentation reads; activation and
+wake reconcile that state without launching a second refresh.
 There is still one companion child while the app is open; the in-app refresh
 timer is only foreground scheduling, not a daemon, login item, LaunchAgent, or
 background URL session. The separate Keychain-reset helper remains available
@@ -422,8 +430,8 @@ a claim that Sparkle has updated the preview client.
 `CFBundleShortVersionString` remains the user-facing package version. The
 Sparkle ordering key, `CFBundleVersion`, is explicitly allocated for signed
 builds that retain the stable bundle identifier. The 0.1.17 internal-dogfood
-RC8 build is `1023.6`; the 0.1.17 stable final remains `1024`. This corrected
-candidate orders strictly after installed RC7 `1023.5`, RC6 `1023.4`,
+RC9 build allocation is `1023.7`; the 0.1.17 stable final remains `1024`. This
+candidate orders strictly after RC8 `1023.6`, installed RC7 `1023.5`, RC6 `1023.4`,
 integrated RC5 `1023.3`, startup-recovery RC4 `1023.2`, migration RC3
 `1023.1`, retained RC2 `1023`, and earlier shared-identity dogfood `1022`,
 while stable orders after the dogfood candidate.
@@ -439,11 +447,19 @@ and state-preserving installation. Its first installed refresh ingested
 generation 44, then the strict v0.14 cache validator rejected inconsistent fit
 metadata. The fit correctly excluded an early diagnostic-only transition, but
 the projection copied that rejected row's eligibility onto the reset fitted from
-later eligible transitions. RC8 retains the strict validator and projects fit
-metadata from the first eligible row. Its allocation is not
-artifact or installed-app evidence: exact-source gates, protected R7, signing,
-notarization, state-preserving replacement, and physical verification must be
-repeated.
+later eligible transitions. RC8 source retains the strict validator and projects
+fit metadata from the first eligible row.
+
+RC9 source is under validation on base `35802d21ede67d362533f4e2be6b38041ece1cda`.
+It separates quick quota/headline refresh from explicit detailed recalculation,
+bounds automatic detailed attempts to at most hourly, reconciles native refresh
+completion from the controller, and restores selected-plan Trends with matching
+plan-scoped usage plus retained authoritative snapshots across relaunch. The
+allocation is not artifact or installed-app evidence: exact-source gates,
+protected R7, signing, notarization, state-preserving replacement, installed
+refresh, and physical verification remain required. PR #94's real-corpus
+comparator remains **OPEN / NOT RUN**; compatible hosted migrations/deployment
+and end-to-end device pairing remain a separate open gate.
 
 Release tooling accepts `USAGE_MONITOR_BUNDLE_VERSION` only when it exactly
 matches the checked-in channel allocation, and the signed stable path still
@@ -539,7 +555,7 @@ For a later stable release, use `--previous-stable-manifest` in place of
 the release command refuses to guess which continuity policy applies.
 `USAGE_MONITOR_BUNDLE_VERSION` is optional as an operator assertion only; when
 present it must exactly equal the checked-in allocation for the selected
-signed release version and channel (`1023.6` for 0.1.17 internal dogfood,
+signed release version and channel (`1023.7` for 0.1.17 internal dogfood,
 `1024` for 0.1.17 stable).
 
 `config/deployment-endpoints.js` is the reviewed source for the public origin

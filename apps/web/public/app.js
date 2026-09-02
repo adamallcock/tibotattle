@@ -554,6 +554,13 @@ function updateLocalActionButtons() {
     button.disabled = localActionBusy || !allowed;
     if (!localActionBusy) button.textContent = label;
   }
+  const detailed = $("#recalculate-detailed-accounting");
+  if (detailed) {
+    detailed.disabled = localActionBusy || !allowed;
+    if (!localActionBusy) {
+      setLocalizedText(detailed, "refresh.recalculateDetailed");
+    }
+  }
   const setupCheck = $("#setup-check-again");
   if (setupCheck) setupCheck.disabled = localActionBusy;
   const companionCheck = $("#companion-check");
@@ -1684,7 +1691,7 @@ function humanize(value) {
 }
 
 function matchedRollingPairs(data) {
-  if (data.timeline?.usage?.length) {
+  if (allowanceTimelineUsage(data).length) {
     return liveTimelinePoints(data, {
       windowHours: CALIBRATION_WINDOW_HOURS,
       rangeDays: activeUsageRangeDays,
@@ -1695,6 +1702,12 @@ function matchedRollingPairs(data) {
   // diagnostics, but cannot supply an allowance comparison without the
   // bucket-level speed evidence needed to match the numerator and capacity.
   return [];
+}
+
+function allowanceTimelineUsage(data) {
+  return data.allowancePlanSelection
+    ? data.timeline?.selectedPlanUsage ?? []
+    : data.timeline?.usage ?? [];
 }
 
 function renderComparison(data) {
@@ -3429,7 +3442,7 @@ function groupRolling(rows, hours) {
 }
 
 function latestTimelineObservationMs(data) {
-  const latest = data.timeline.usage.at(-1)?.endAt
+  const latest = allowanceTimelineUsage(data).at(-1)?.endAt
     ?? mainWeeklyQuotaTrack(data.timeline.quota).at(-1)?.observedAt
     ?? data.freshness.latestObservedAt;
   const latestMs = Date.parse(latest);
@@ -3838,12 +3851,28 @@ function timelineAllowanceWeightedCost(row, capacitySelection) {
     : null;
 }
 
+function timelineComparisonInterval(data, startMs, endMs) {
+  // Legacy DTOs have no plan-selection contract. A selected-plan view must
+  // positively cover the entire span; absence is not evidence of continuity.
+  if (!data.allowancePlanSelection) return null;
+  const intervals = data.timeline.comparisonIntervals ?? [];
+  let low = 0;
+  let high = intervals.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (intervals[middle][0] <= startMs) low = middle + 1;
+    else high = middle;
+  }
+  const interval = intervals[low - 1];
+  return interval && endMs <= interval[1] ? interval : false;
+}
+
 function liveTimelinePoints(
   data,
   {
     windowHours = CALIBRATION_WINDOW_HOURS,
     rangeDays = activeCalibrationRangeDays,
-    usage = data.timeline.usage,
+    usage = allowanceTimelineUsage(data),
   } = {},
 ) {
   const capacitySelection = timelineCalibrationCapacity(data);
@@ -3890,10 +3919,17 @@ function liveTimelinePoints(
   let driftCostUsd = 0;
   let comparisonSegment = 0;
   let previousComparable = false;
+  let previousPlanInterval = null;
   for (let index = 0; index < usage.length; index += 1) {
     const current = usage[index];
     const endMs = Date.parse(current.endAt);
     const currentWeightedCost = weightedCosts[index];
+    const planInterval = timelineComparisonInterval(data, Date.parse(current.startAt), endMs);
+    if (planInterval === false || planInterval !== previousPlanInterval) {
+      driftAnchor = null;
+      driftCostUsd = 0;
+    }
+    previousPlanInterval = planInterval;
     if (currentWeightedCost === null) rollingWeightingGaps += 1;
     else rollingCost += currentWeightedCost;
     rollingEvents += current.usageEvents;
@@ -3951,7 +3987,11 @@ function liveTimelinePoints(
     }
     const before = startMatch?.row ?? null;
     const after = afterMatch?.row ?? null;
+    const planComparable = timelineComparisonInterval(data,
+      Math.min(spanStartMs, startMatch?.timestampMs ?? spanStartMs),
+      Math.max(spanEndMs, afterMatch?.timestampMs ?? spanEndMs)) !== false;
     const bracketed = before && after
+      && planComparable
       && spanStartMs - startMatch.timestampMs <= maximumBracketGapMs
       && endMs - afterMatch.timestampMs <= maximumBracketGapMs;
     const sameReset = Boolean(bracketed)
@@ -4009,6 +4049,7 @@ function liveTimelinePoints(
       windowEvents = Math.max(0, eventsPrefix[top] - eventsPrefix[lower]);
     }
     const expected = !poolSaturated
+        && planComparable
         && capacity !== null && capacity > 0
         && windowWeightingGaps === 0
       ? windowCostUsd / capacity * 100
@@ -4022,9 +4063,10 @@ function liveTimelinePoints(
       apiCostUsd: windowWeightingGaps === 0 ? windowCostUsd : 0,
       poolSaturated,
     });
-    const evidence = windowWeightingGaps === 0
-      ? classifiedEvidence
-      : { status: "quota_weighting_unavailable", residual: null };
+    const evidence = !planComparable
+      ? { status: "reset_or_track_change", residual: null }
+      : windowWeightingGaps === 0 ? classifiedEvidence
+        : { status: "quota_weighting_unavailable", residual: null };
     let cumulativeResidual = null;
     // A re-anchor marks the first drift observation of a new reset or track:
     // the deviation-period detector splits its runs here, so a sustained drift
@@ -4034,6 +4076,8 @@ function liveTimelinePoints(
     if (capacity !== null && capacity > 0
         && currentWeightedCost !== null
         && after !== null
+        && timelineComparisonInterval(data,
+          Math.min(Date.parse(current.startAt), afterMatch.timestampMs), endMs) !== false
         && Number.isFinite(finite(after.usedPercent))
         && endMs - afterMatch.timestampMs <= maximumBracketGapMs) {
       // A used_percent DECREASE beyond display jitter inside one boundary is
@@ -4116,8 +4160,8 @@ function liveTimelinePoints(
       // Kept under the legacy internal key for downstream chart diagnostics,
       // but this is now the selected speed-priced amount, never Standard
       // dollars paired with a Fast-adjusted capacity.
-      apiCostUsd: windowWeightingGaps === 0 ? windowCostUsd : null,
-      allowanceWeightedUsd: windowWeightingGaps === 0
+      apiCostUsd: planComparable && windowWeightingGaps === 0 ? windowCostUsd : null,
+      allowanceWeightedUsd: planComparable && windowWeightingGaps === 0
         ? windowCostUsd
         : null,
       allowanceBasisId: capacitySelection?.basisId ?? null,
@@ -4138,7 +4182,7 @@ function groupedUsageTimeline(data) {
   const hourMs = 60 * 60 * 1_000;
   const cutoff = timelineCutoffMs(data, activeUsageRangeDays);
   const groups = new Map();
-  for (const row of data.timeline.usage) {
+  for (const row of allowanceTimelineUsage(data)) {
     const timestamp = Date.parse(row.startAt);
     if (!Number.isFinite(timestamp) || timestamp < cutoff) continue;
     let key;
@@ -4593,13 +4637,18 @@ function selectedTimelinePoints(data) {
       && timelineSeriesMemo.rangeDays === activeCalibrationRangeDays) {
     return timelineSeriesMemo.selection;
   }
-  const sideChatAdjusted = data.accounting?.sideChatEstimates?.status
+  const scopedUsage = allowanceTimelineUsage(data);
+  // Side-chat estimates predate plan-era attribution. They remain visible in
+  // all-plan accounting, but cannot enter a current-plan numerator until they
+  // carry the same plan/generation scope as the exact usage timeline.
+  const sideChatAdjusted = !data.allowancePlanSelection
+    && data.accounting?.sideChatEstimates?.status
       === "available"
     && data.accounting.sideChatEstimates.methodology
       ?.includedInCalibrationTimeline === true
     && Array.isArray(data.timeline.calibrationUsage)
     && data.timeline.calibrationUsage.length > 0;
-  const exactByBucket = new Map(data.timeline.usage.map((row) => [
+  const exactByBucket = new Map(scopedUsage.map((row) => [
     `${row.startAt}|${row.endAt}`,
     row,
   ]));
@@ -4655,7 +4704,7 @@ function selectedTimelinePoints(data) {
   const livePoints = liveTimelinePoints(data, {
     usage: sideChatAdjusted
       ? data.timeline.calibrationUsage
-      : data.timeline.usage,
+      : scopedUsage,
   });
   // Retained gradient artifacts carry only Standard-rate rolling cost. They
   // can remain historical evidence elsewhere, but may never replace the
@@ -4817,6 +4866,11 @@ function renderTimelineConfidence(
   if (accountingIsUnavailable(data)) {
     element.classList.add("low");
     setLocalizedText(element, projectionUnavailableCopyKey(data));
+    return;
+  }
+  if (data.allowancePlanSelection?.comparisonAvailable === false) {
+    element.classList.add("low");
+    setLocalizedText(element, "weekly.plan.comparisonPending");
     return;
   }
   const activePoints = visiblePoints.filter((point) => point.status !== "inactive");
@@ -11357,7 +11411,7 @@ function historyProgressReceipt() {
 }
 
 /**
- * After a successful refresh that left the history index incomplete, run the
+ * After an explicit detailed refresh that left the history index incomplete, run the
  * next pass promptly instead of waiting for the sparse auto-cadence, bounded
  * by REINDEX_AUTO_CONTINUE_LIMIT. Stops the moment coverage completes, the
  * user interacts, or the bound is reached (the ordinary cadence then carries
@@ -11384,11 +11438,11 @@ function scheduleReindexAutoContinuation() {
       return;
     }
     reindexAutoContinuations += 1;
-    void requestRefresh({ autoContinue: true });
+    void requestRefresh({ autoContinue: true, detailed: true });
   }, REINDEX_AUTO_CONTINUE_DELAY_MS);
 }
 
-async function requestRefresh({ autoContinue = false } = {}) {
+async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
   if (localActionBusy) return;
   // Fence continuation against the exact coverage visible before this pass.
   // If the terminal reload presents the same generation/count/byte receipt,
@@ -11409,7 +11463,9 @@ async function requestRefresh({ autoContinue = false } = {}) {
     updateLocalActionButtons();
     return;
   }
-  const button = $("#refresh-button");
+  const button = detailed
+    ? $("#recalculate-detailed-accounting")
+    : $("#refresh-button");
   let refreshAccepted = false;
   let cancelled = false;
   let quickResultLoaded = false;
@@ -11418,11 +11474,15 @@ async function requestRefresh({ autoContinue = false } = {}) {
   localRefreshInProgress = true;
   localRefreshCancelRequested = false;
   archiveHistoryScanActive = false;
-  button.textContent = "Starting local analysis…";
+  button.textContent = detailed
+    ? "Starting detailed accounting…"
+    : "Starting local analysis…";
   updateLocalActionButtons();
   setGlobalState("updating");
   try {
-    await localClient.refresh();
+    await (detailed
+      ? localClient.recalculateDetailedAccounting()
+      : localClient.refresh());
     refreshAccepted = true;
     let activePassStartedMs = Date.now();
     const pollingBudget = createRefreshPollingBudget();
@@ -11519,7 +11579,9 @@ async function requestRefresh({ autoContinue = false } = {}) {
           throw new Error("The bounded continuation limit was reached.");
         }
         try {
-          await localClient.refresh();
+          await (detailed
+            ? localClient.recalculateDetailedAccounting()
+            : localClient.refresh());
           pollingBudget.noteContinuation();
           activePassStartedMs = Date.now();
           timeoutSettlementNoted = false;
@@ -11620,7 +11682,7 @@ async function requestRefresh({ autoContinue = false } = {}) {
     archiveHistoryScanActive = false;
     button.textContent = "Loading updated evidence…";
     await loadLocalDashboard();
-    scheduleReindexAutoContinuation();
+    if (detailed) scheduleReindexAutoContinuation();
   } catch (error) {
     if (dashboard) {
       setGlobalState(dashboard.state, {
@@ -14649,6 +14711,9 @@ async function restoreCommunitySession() {
 
 $("#refresh-button").addEventListener("click", requestRefresh);
 $("#setup-refresh").addEventListener("click", requestRefresh);
+$("#recalculate-detailed-accounting").addEventListener("click", () => {
+  void requestRefresh({ detailed: true });
+});
 $("#cancel-refresh").addEventListener("click", cancelLocalAnalysis);
 $("#open-installed-app").addEventListener("click", openInstalledApp);
 $("#connection-check").addEventListener("click", checkLocalSetup);

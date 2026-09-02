@@ -128,11 +128,18 @@ import {
 // the model/context/epoch eligibility, so they must be rebuilt, not relabeled.
 // v0.14: exact occurrence plans and bounded quantity intervals survive compact
 // replay; plan-era populations replace provider-wide calibration numerators.
+// v0.15: the selected plan gets its own generation-bound, plan-era-attributed
+// usage timeline. The ordinary timeline remains the conserved all-plan ledger;
+// allowance-facing Trends may use the scoped timeline only when its plan,
+// generation, basis and fitted-reset cohort match the selected capacity.
 export const REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION =
-  "local-replay-safe-accounting-v0.14";
+  "local-replay-safe-accounting-v0.15";
 const { scanCodexLogEvents } = localCodexLogScanner;
 const ALLOWANCE_CAPACITY_SCHEMA_VERSION =
   "codex-primary-allowance-capacity-v0.1";
+const PLAN_SCOPED_TIMELINE_SCHEMA_VERSION =
+  "local-plan-scoped-accounting-timeline-v1";
+const PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION = "plan-era-v1";
 const ALLOWANCE_SCENARIO_CANDIDATES = Object.freeze({
   unresolved_as_standard: "speed_lower",
   unresolved_as_fast: "speed_upper",
@@ -183,6 +190,11 @@ const MINIMUM_WINDOW_DAYS = 365;
 const MAXIMUM_WINDOW_DAYS = 3_653;
 const DEFAULT_WINDOW_DAYS = MINIMUM_WINDOW_DAYS;
 const TIMELINE_BUCKET_MS = 15 * 60 * 1_000;
+// Resource ceilings, not retention windows: refuse this optional comparison
+// lane as a whole rather than truncating history or failing ordinary accounting.
+const MAX_PLAN_TIMELINE_ROWS = 100_000;
+const MAX_PLAN_TIMELINE_BYTES = 4 * 1024 * 1024;
+const PLAN_TIMELINE_ENCODING = "plan_bucket_v1";
 const MAX_QUOTA_TIMELINE_ROWS = 10_000;
 const WEEKLY_WINDOW_MINUTES = SEVEN_DAY_WINDOW_MINUTES;
 const SPARK_MODEL = OPENAI_CODEX_SPARK_MODEL_ID;
@@ -2454,6 +2466,284 @@ function finalizeTimeline(buckets) {
     }));
 }
 
+function compactPlanScopedTimelineEvent(row, declaredSpeedBaselines) {
+  if (!Array.isArray(row) || row.length !== 21
+      || !Array.isArray(row[20]) || row[20].length !== 4) return null;
+  const timestamp = canonicalInstant(row[0]);
+  const components = Object.fromEntries(COMPONENT_KEYS.map((key, index) => [
+    key,
+    Number.isSafeInteger(row[index + 3]) && row[index + 3] >= 0
+      ? row[index + 3] : null,
+  ]));
+  const standardUsd = Number(row[10]);
+  const standardScenarioUsd = Number(row[14]);
+  const fastScenarioUsd = Number(row[15]);
+  if (timestamp === null || Object.values(components).includes(null)
+      || !Number.isFinite(standardUsd) || standardUsd < 0
+      || !Number.isFinite(standardScenarioUsd) || standardScenarioUsd < 0
+      || !Number.isFinite(fastScenarioUsd) || fastScenarioUsd < 0
+      || !["fully_priced", "partially_priced", "unpriced"].includes(row[12])) {
+    return null;
+  }
+  const speed = ["standard", "fast"].includes(row[9]) ? row[9] : "unknown";
+  // Re-run the same timestamped declaration lookup used when the compact row
+  // was constructed. Dollar equality is not provenance: it can also arise for
+  // a zero-cost event (or a future 1x rate), so inferring a declaration from
+  // equal scenario totals would silently relabel unknown evidence.
+  const declarationResolved = speed === "unknown"
+    && ["standard", "fast"].includes(
+      declaredSpeedModeAt(declaredSpeedBaselines, Date.parse(timestamp)),
+    );
+  return {
+    timestamp,
+    components,
+    totalTokens: tokenTotal(components),
+    standardUsd,
+    standardScenarioUsd,
+    fastScenarioUsd,
+    pricingCoverageStatus: row[12],
+    observedSpeed: speed !== "unknown",
+    declarationResolved,
+  };
+}
+
+function addCompactPlanScopedTimelineEvent(buckets, event) {
+  const observedMs = Date.parse(event.timestamp);
+  const startMs = Math.floor(observedMs / TIMELINE_BUCKET_MS)
+    * TIMELINE_BUCKET_MS;
+  const bucket = buckets.get(startMs) ?? {
+    ...newTimelineBucket(startMs),
+    scenarioWeighting: {
+      unresolved_as_standard: 0,
+      unresolved_as_fast: 0,
+    },
+    weightingCoverage: {
+      observedEvents: 0,
+      declaredFromConfigEvents: 0,
+      assumedEvents: 0,
+    },
+  };
+  bucket.usageEvents += 1;
+  bucket.totalTokens += event.totalTokens;
+  bucket.apiPriceEquivalentUsd += event.standardUsd;
+  bucket.scenarioWeighting.unresolved_as_standard +=
+    event.standardScenarioUsd;
+  bucket.scenarioWeighting.unresolved_as_fast += event.fastScenarioUsd;
+  addComponents(bucket.components, event.components);
+  bucket.pricingCoverage[
+    event.pricingCoverageStatus === "fully_priced"
+      ? "fullyPricedEvents"
+      : event.pricingCoverageStatus === "partially_priced"
+        ? "partiallyPricedEvents"
+        : "unpricedEvents"
+  ] += 1;
+  if (event.observedSpeed) bucket.weightingCoverage.observedEvents += 1;
+  else if (event.declarationResolved) {
+    bucket.weightingCoverage.declaredFromConfigEvents += 1;
+  } else {
+    bucket.weightingCoverage.assumedEvents += 1;
+  }
+  buckets.set(startMs, bucket);
+  return startMs;
+}
+
+function finalizePlanScopedTimelineDraft({
+  buckets,
+  invalidBuckets,
+  attributionIndex,
+  contextKey,
+  planType,
+  diagnostics,
+  endMs,
+  resourceLimited,
+  quota,
+}) {
+  let invalidatedCandidateEvents = 0;
+  let invalidatedBuckets = 0;
+  const rows = [];
+  for (const bucket of [...buckets.values()].sort((left, right) => (
+    left.startMs - right.startMs
+  ))) {
+    const lookup = planEraForInterval(attributionIndex, {
+      contextKey,
+      intervalStartMs: bucket.startMs,
+      observedAtMs: bucket.startMs + TIMELINE_BUCKET_MS - 1,
+    });
+    if (invalidBuckets.has(bucket.startMs)
+        || lookup.status !== "matched"
+        || lookup.era.planType !== planType) {
+      invalidatedBuckets += 1;
+      invalidatedCandidateEvents += bucket.usageEvents;
+      invalidBuckets.add(bucket.startMs);
+      continue;
+    }
+    rows.push({
+      startAt: new Date(bucket.startMs).toISOString(),
+      endAt: new Date(bucket.startMs + TIMELINE_BUCKET_MS).toISOString(),
+      usageEvents: bucket.usageEvents,
+      totalTokens: bucket.totalTokens,
+      apiPriceEquivalentUsd: roundedMoney(bucket.apiPriceEquivalentUsd),
+      scenarioWeighting: Object.fromEntries(
+        Object.entries(bucket.scenarioWeighting).map(([scenario, value]) => [
+          scenario,
+          roundedMoney(value),
+        ]),
+      ),
+      weightingCoverage: { ...bucket.weightingCoverage },
+      components: bucket.components,
+      pricingCoverage: bucket.pricingCoverage,
+    });
+  }
+  // Publish explicit comparable intervals, including quiet buckets, so a
+  // consumer cannot bridge an omitted ambiguous bucket or another plan era.
+  // Bounds come from the same attribution index, not the fit's training resets.
+  const comparisonIntervals = [];
+  const currentStart = Math.floor(endMs / TIMELINE_BUCKET_MS) * TIMELINE_BUCKET_MS;
+  const firstStart = Math.min(rows.length ? Date.parse(rows[0].startAt) : currentStart,
+    quota.length ? Math.floor(quota[0][0] / TIMELINE_BUCKET_MS) * TIMELINE_BUCKET_MS : currentStart);
+  const lastEnd = (Math.floor(endMs / TIMELINE_BUCKET_MS) + 1) * TIMELINE_BUCKET_MS;
+  const invalid = [...invalidBuckets].sort((a, b) => a - b);
+  let invalidAt = 0;
+  for (const era of attributionIndex?.eras ?? []) {
+    if (era.contextKey !== contextKey || era.accountScopeId !== null
+        || era.planType !== planType) continue;
+    let start = Math.max(firstStart, era.lowerBoundMs === null ? firstStart
+      : Math.ceil(era.lowerBoundMs / TIMELINE_BUCKET_MS) * TIMELINE_BUCKET_MS);
+    const end = Math.min(lastEnd, era.upperBoundMs === null ? lastEnd
+      : Math.floor((era.upperBoundMs + 1) / TIMELINE_BUCKET_MS) * TIMELINE_BUCKET_MS);
+    while (invalidAt < invalid.length && invalid[invalidAt] < start) invalidAt += 1;
+    while (invalidAt < invalid.length && invalid[invalidAt] < end) {
+      const gapStart = invalid[invalidAt++];
+      if (gapStart > start) comparisonIntervals.push([start, gapStart]);
+      start = gapStart + TIMELINE_BUCKET_MS;
+    }
+    if (start < end) comparisonIntervals.push([start, end]);
+  }
+  const comparableQuota = [];
+  let quotaIntervalAt = 0;
+  for (const row of quota) {
+    while (quotaIntervalAt < comparisonIntervals.length
+        && comparisonIntervals[quotaIntervalAt][1] <= row[0]) quotaIntervalAt += 1;
+    const interval = comparisonIntervals[quotaIntervalAt];
+    if (interval && row[0] >= interval[0] && row[0] < interval[1]) comparableQuota.push(row);
+  }
+  return {
+    planType,
+    rows,
+    comparisonIntervals,
+    resourceLimited,
+    attributionReady: attributionIndex?.status === "ready",
+    quota: comparableQuota,
+    diagnostics: {
+      ...diagnostics,
+      admittedEvents: rows.reduce((sum, row) => sum + row.usageEvents, 0),
+      invalidatedBuckets,
+      invalidatedCandidateEvents,
+    },
+  };
+}
+
+// Closed compact form avoids duplicating full object keys for every historical
+// bucket. Keep the event-summed token total: combined-output and split-output
+// events can coexist in one bucket. Only coverage complements are derived.
+function encodePlanScopedTimelineRow(row) {
+  return [Date.parse(row.startAt), row.usageEvents,
+    ...COMPONENT_KEYS.map((key) => row.components[key]),
+    row.apiPriceEquivalentUsd,
+    row.scenarioWeighting.unresolved_as_standard,
+    row.scenarioWeighting.unresolved_as_fast,
+    row.weightingCoverage.observedEvents,
+    row.weightingCoverage.declaredFromConfigEvents,
+    row.pricingCoverage.fullyPricedEvents,
+    row.pricingCoverage.partiallyPricedEvents, row.totalTokens];
+}
+
+export function decodePlanScopedTimelineRow(row) {
+  if (!Array.isArray(row) || row.length !== 16
+      || row.some((value) => typeof value !== "number" || !Number.isFinite(value))
+      || !Number.isSafeInteger(row[0]) || row[0] % TIMELINE_BUCKET_MS !== 0
+      || !Number.isFinite(new Date(row[0] + TIMELINE_BUCKET_MS).getTime())
+      || row.slice(1).some((value) => value < 0)
+      || [1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 14, 15].some((i) => !Number.isSafeInteger(row[i]))
+      || row[1] < 1 || row[11] + row[12] > row[1]
+      || row[13] + row[14] > row[1]) return null;
+  const components = Object.fromEntries(COMPONENT_KEYS.map((key, i) => [key, row[i + 2]]));
+  return {
+    startAt: new Date(row[0]).toISOString(),
+    endAt: new Date(row[0] + TIMELINE_BUCKET_MS).toISOString(),
+    usageEvents: row[1], totalTokens: row[15], components,
+    apiPriceEquivalentUsd: row[8],
+    scenarioWeighting: { unresolved_as_standard: row[9], unresolved_as_fast: row[10] },
+    weightingCoverage: { observedEvents: row[11], declaredFromConfigEvents: row[12],
+      assumedEvents: row[1] - row[11] - row[12] },
+    pricingCoverage: { fullyPricedEvents: row[13], partiallyPricedEvents: row[14],
+      unpricedEvents: row[1] - row[13] - row[14] },
+  };
+}
+
+function unavailablePlanTimeline(reason) {
+  return {
+    schemaVersion: PLAN_SCOPED_TIMELINE_SCHEMA_VERSION,
+    encoding: PLAN_TIMELINE_ENCODING,
+    status: "unavailable", reason, planScope: null, usage: [], quota: [], comparisonIntervals: [],
+    diagnostics: { consideredEvents: 0, admittedEvents: 0, incompatibleEvents: 0,
+      unresolvedEvents: 0, conflictedEvents: 0, malformedEvents: 0,
+      invalidatedBuckets: 0, invalidatedCandidateEvents: 0 },
+  };
+}
+
+function calibrationCohortId(calibration) {
+  if (calibration?.status !== "estimated"
+      || !Array.isArray(calibration.recentResets)
+      || calibration.recentResets.length === 0) return null;
+  const cohort = calibration.recentResets.map((row) => row?.resetIdentity);
+  if (cohort.some((value) => canonicalInstant(value) === null)) return null;
+  return createHash("sha256").update(JSON.stringify(cohort)).digest("hex");
+}
+
+function planScopedTimelineReceipt({
+  draft,
+  sourceMode,
+  generation,
+  generationFingerprint,
+  capacityPlanScope,
+}) {
+  const unavailable = unavailablePlanTimeline;
+  if (sourceMode !== "unified"
+      || generation === null || generation === undefined
+      || generationFingerprint === null
+      || generationFingerprint === undefined) {
+    return unavailable("plan_scoped_generation_unavailable");
+  }
+  if (!draft || draft.attributionReady !== true || draft.planType === "unknown"
+      || draft.diagnostics?.malformedEvents !== 0
+      || capacityPlanScope?.planType !== draft.planType
+      || capacityPlanScope?.methodVersion
+        !== PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION) {
+    return unavailable("plan_scoped_attribution_unavailable");
+  }
+  if (draft.resourceLimited || draft.rows.length > MAX_PLAN_TIMELINE_ROWS
+      || draft.comparisonIntervals.length > MAX_PLAN_TIMELINE_ROWS
+      || draft.quota.length > MAX_PLAN_TIMELINE_ROWS) return unavailable("plan_scoped_resource_limit");
+  const receipt = {
+    schemaVersion: PLAN_SCOPED_TIMELINE_SCHEMA_VERSION,
+    encoding: PLAN_TIMELINE_ENCODING,
+    status: "available",
+    reason: null,
+    planScope: {
+      ...capacityPlanScope,
+      sourceGeneration: generation,
+      sourceGenerationFingerprint: generationFingerprint,
+    },
+    usage: draft.rows.map(encodePlanScopedTimelineRow),
+    comparisonIntervals: draft.comparisonIntervals,
+    quota: draft.quota,
+    diagnostics: draft.diagnostics,
+  };
+  return Buffer.byteLength(stableJson(receipt)) <= MAX_PLAN_TIMELINE_BYTES
+    ? receipt : unavailable("plan_scoped_resource_limit");
+}
+
 function publicDiagnostics(value) {
   return {
     filesScanned: Number.isSafeInteger(value?.filesScanned)
@@ -2828,6 +3118,7 @@ export async function fitCompositionFromCompactCorpus({
   checkRuntimeMemory = () => {},
   planAttributionIndex = null,
   selectedPlanType = null,
+  declaredSpeedBaselines = [],
 }) {
   return fitCompositionFromCorpusStream({
     forEachUsageRow: async (consume) => {
@@ -2839,6 +3130,7 @@ export async function fitCompositionFromCompactCorpus({
     checkRuntimeMemory,
     planAttributionIndex,
     selectedPlanType,
+    declaredSpeedBaselines,
   });
 }
 
@@ -2855,6 +3147,7 @@ async function fitCompositionFromCorpusStream({
   checkRuntimeMemory = () => {},
   planAttributionIndex = null,
   selectedPlanType = null,
+  declaredSpeedBaselines = [],
 }) {
   const grainMs = MODEL_COMPOSITION_POLICY.grainMs;
   const contextKey = planAttributionContextKey("openai_codex", "codex");
@@ -2867,6 +3160,23 @@ async function fitCompositionFromCorpusStream({
   ))
     .sort((left, right) => left[1] - right[1]).at(-1)?.[3] ?? "unknown";
   const excludedBins = new Set();
+  const planScopedBuckets = new Map();
+  const invalidPlanScopedBuckets = new Set();
+  let planTimelineResourceLimited = false;
+  const checkPlanTimelineSize = () => {
+    if (planScopedBuckets.size + invalidPlanScopedBuckets.size > MAX_PLAN_TIMELINE_ROWS) {
+      planTimelineResourceLimited = true;
+      planScopedBuckets.clear();
+      invalidPlanScopedBuckets.clear();
+    }
+  };
+  const planScopedDiagnostics = {
+    consideredEvents: 0,
+    incompatibleEvents: 0,
+    unresolvedEvents: 0,
+    conflictedEvents: 0,
+    malformedEvents: 0,
+  };
   const recentStartMs = endMs - COMPOSITION_RECENT_MIX_DAYS * 24 * 60 * 60 * 1_000;
   // binStartMs -> Map(model -> summed costUsd), Maps kept in first-encounter
   // order so the kernel accumulates in the same order the per-event path did
@@ -2897,11 +3207,41 @@ async function fitCompositionFromCorpusStream({
       ...(Number.isSafeInteger(intervalStartMs) ? { intervalStartMs } : {}),
       observedPlanType: row[20]?.[0] === "same_record" ? row[20][1] : null,
     }, { planType });
-    if (association.disposition === "incompatible") return;
-    if (row[20]?.[0] === "conflicted" || association.disposition === "unresolved") {
-      excludedBins.add(binStartMs);
+    const planTimelineEvent = compactPlanScopedTimelineEvent(
+      row,
+      declaredSpeedBaselines,
+    );
+    if (planTimelineEvent === null) {
+      planScopedDiagnostics.malformedEvents += 1;
+    } else {
+      planScopedDiagnostics.consideredEvents += 1;
+    }
+    if (association.disposition === "incompatible") {
+      if (planTimelineEvent !== null) {
+        planScopedDiagnostics.incompatibleEvents += 1;
+      }
       return;
     }
+    if (row[20]?.[0] === "conflicted"
+        || association.disposition === "unresolved") {
+      excludedBins.add(binStartMs);
+      if (planTimelineEvent !== null) {
+        if (!planTimelineResourceLimited) invalidPlanScopedBuckets.add(
+          Math.floor(observedAtMs / TIMELINE_BUCKET_MS) * TIMELINE_BUCKET_MS,
+        );
+        checkPlanTimelineSize();
+        if (row[20]?.[0] === "conflicted") {
+          planScopedDiagnostics.conflictedEvents += 1;
+        } else {
+          planScopedDiagnostics.unresolvedEvents += 1;
+        }
+      }
+      return;
+    }
+    if (planTimelineEvent !== null && !planTimelineResourceLimited) {
+      addCompactPlanScopedTimelineEvent(planScopedBuckets, planTimelineEvent);
+    }
+    checkPlanTimelineSize();
     // The kernel's own binning refuses empty model names; the recent mix
     // mirrors the historical per-event behavior and keeps them.
     if (model.length > 0) {
@@ -2922,6 +3262,9 @@ async function fitCompositionFromCorpusStream({
     }
   });
   const quotaRows = [];
+  // Use admitted plan-preserving snapshots, not the generic timeline whose
+  // same-instant collapse may already have chosen a different plan's row.
+  const scopedQuota = new Map();
   for (const row of weeklyRateLimitSnapshots) {
     processed += 1;
     if (processed % ACCOUNTING_RSS_CHECK_INTERVAL === 0) {
@@ -2937,6 +3280,25 @@ async function fitCompositionFromCorpusStream({
         || !Number.isFinite(resetsAtSeconds)
         || !Number.isFinite(usedPercent)) continue;
     if (row[3] !== planType) continue;
+    if (!planTimelineResourceLimited && row[2] === "openai_codex"
+        && row[4] === "codex" && row[6] === WEEKLY_WINDOW_MINUTES
+        && usedPercent >= 0 && usedPercent <= 100) {
+      const match = planEraForInterval(attributionIndex, { contextKey, observedAtMs });
+      if (match.status === "matched" && match.era.planType === planType) {
+        const prior = scopedQuota.get(observedAtMs);
+        if (prior === null) {
+          // Once contradictory, later repeated rows cannot restore a winner.
+        } else if (prior && (prior[1] !== resetsAtSeconds || prior[2] !== usedPercent)) {
+          scopedQuota.set(observedAtMs, null);
+          invalidPlanScopedBuckets.add(Math.floor(observedAtMs / TIMELINE_BUCKET_MS) * TIMELINE_BUCKET_MS);
+          checkPlanTimelineSize();
+        } else scopedQuota.set(observedAtMs, [observedAtMs, resetsAtSeconds, usedPercent]);
+        if (scopedQuota.size > MAX_PLAN_TIMELINE_ROWS || planTimelineResourceLimited) {
+          planTimelineResourceLimited = true;
+          scopedQuota.clear();
+        }
+      }
+    }
     quotaRows.push({
       observedAtMs,
       planType: typeof row[3] === "string" ? row[3] : "unknown",
@@ -2974,6 +3336,17 @@ async function fitCompositionFromCorpusStream({
       fallbackCapacityUsd: fit.singleConstantUsd,
     })
     : null;
+  const planScopedTimeline = finalizePlanScopedTimelineDraft({
+    buckets: planScopedBuckets,
+    invalidBuckets: invalidPlanScopedBuckets,
+    attributionIndex,
+    contextKey,
+    planType,
+    diagnostics: planScopedDiagnostics,
+    endMs,
+    resourceLimited: planTimelineResourceLimited,
+    quota: [...scopedQuota.values()].filter((row) => row !== null).sort((a, b) => a[0] - b[0]),
+  });
   return {
     planType,
     attributionExcludedBins: excludedBins.size,
@@ -2997,6 +3370,7 @@ async function fitCompositionFromCorpusStream({
       ? Number(blendedRecentMixUsd.toFixed(2))
       : null,
     recentMixDays: COMPOSITION_RECENT_MIX_DAYS,
+    planScopedTimeline,
   };
 }
 
@@ -4027,6 +4401,7 @@ export async function buildReplaySafeAccountingCache({
     }
   }
   let composition = null;
+  let planScopedTimelineDraft = null;
   let compositionFitFailure = null;
   let transitionSeries;
   const retainedUsageEvents = retainWindowedCalibrationInputs
@@ -4057,7 +4432,7 @@ export async function buildReplaySafeAccountingCache({
     // dies here re-runs the same doomed pass on every scheduler tick while the
     // on-disk cache stays a rejected older artifact.
     try {
-      composition = retainWindowedCalibrationInputs
+      const compositionResult = retainWindowedCalibrationInputs
         ? await fitCompositionFromCompactCorpus({
           rawUsageEvents,
           weeklyRateLimitSnapshots,
@@ -4066,6 +4441,7 @@ export async function buildReplaySafeAccountingCache({
           checkRuntimeMemory,
           planAttributionIndex: calibrationAttribution.index,
           selectedPlanType: calibrationAttribution.summary.latestPlanType,
+          declaredSpeedBaselines: baselines,
         })
         : await fitCompositionFromCorpusStream({
           forEachUsageRow: calibrationCorpus.forEachRetainedUsage,
@@ -4075,7 +4451,10 @@ export async function buildReplaySafeAccountingCache({
           checkRuntimeMemory,
           planAttributionIndex: calibrationAttribution.index,
           selectedPlanType: calibrationAttribution.summary.latestPlanType,
+          declaredSpeedBaselines: baselines,
         });
+      ({ planScopedTimeline: planScopedTimelineDraft, ...composition } =
+        compositionResult);
     } catch (error) {
       compositionFitFailure = {
         status: "fit_failed",
@@ -4184,15 +4563,32 @@ export async function buildReplaySafeAccountingCache({
       ),
     }]),
   );
+  const selectedAllowanceCalibration = allowanceScenarios
+    .unresolved_as_standard.calibration;
+  const capacityPlanScope = {
+    methodVersion: PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION,
+    planType: selectedAllowanceCalibration.selectedPlanType,
+    basisFamilyId:
+      allowanceScenarios.unresolved_as_standard.basis.basisFamilyId,
+    cohortId: calibrationCohortId(selectedAllowanceCalibration),
+  };
   const allowanceCapacityByScenario = {
     schemaVersion: ALLOWANCE_CAPACITY_SCHEMA_VERSION,
     basisFamilyId:
       allowanceScenarios.unresolved_as_standard.basis.basisFamilyId,
+    planScope: capacityPlanScope,
     scenarios: allowanceScenarios,
   };
+  const planScopedTimeline = planScopedTimelineReceipt({
+    draft: planScopedTimelineDraft,
+    sourceMode: selectedSourceMode,
+    generation: unifiedCoverage?.generation ?? null,
+    generationFingerprint: unifiedCoverage?.generationFingerprint ?? null,
+    capacityPlanScope,
+  });
   const paceForecast = projectWeeklyPaceForecast(weeklyPaceSnapshots, endMs);
   throwIfAborted(signal);
-  return {
+  const cache = {
     schemaVersion: REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION,
     generatedAt: new Date(endMs).toISOString(),
     coveredAt: {
@@ -4219,6 +4615,7 @@ export async function buildReplaySafeAccountingCache({
     history,
     periods: [...periods.values()].map(finalizePeriod),
     timeline: finalizeTimeline(timeline),
+    planScopedTimeline,
     sparkUsageTimeline: finalizeTimeline(sparkTimeline),
     quotaTimeline: finalizeWeeklyQuotaTimeline(
       weeklyQuotaTimelineBuckets,
@@ -4249,6 +4646,11 @@ export async function buildReplaySafeAccountingCache({
     },
     diagnostics: publicDiagnostics(scanned?.diagnostics),
   };
+  if (cache.planScopedTimeline.status === "available"
+      && Buffer.byteLength(stableJson(cache)) > MAX_CACHE_BYTES) {
+    cache.planScopedTimeline = unavailablePlanTimeline("plan_scoped_resource_limit");
+  }
+  return cache;
 }
 
 // Everything the child may not say: an envelope whose error code fails the
@@ -5277,6 +5679,14 @@ function validAllowanceCalibrationSummary(value, forcedCandidateId) {
 function validAllowanceCapacityByScenario(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)
       || value.schemaVersion !== ALLOWANCE_CAPACITY_SCHEMA_VERSION
+      || value.planScope?.methodVersion
+        !== PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION
+      || typeof value.planScope?.planType !== "string"
+      || !/^[a-z][a-z0-9_-]{0,31}$/u.test(value.planScope.planType)
+      || value.planScope.basisFamilyId !== value.basisFamilyId
+      || !(value.planScope.cohortId === null
+        || (typeof value.planScope.cohortId === "string"
+          && /^[a-f0-9]{64}$/u.test(value.planScope.cohortId)))
       || !value.scenarios || typeof value.scenarios !== "object"
       || Array.isArray(value.scenarios)
       || Object.keys(value.scenarios).sort().join(",")
@@ -5291,6 +5701,7 @@ function validAllowanceCapacityByScenario(value) {
     if (!row || typeof row !== "object" || Array.isArray(row)
         || stableJson(row.basis) !== stableJson(expectedBasis)
         || value.basisFamilyId !== expectedBasis.basisFamilyId
+        || row.calibration?.selectedPlanType !== value.planScope.planType
         || !validAllowanceCalibrationSummary(
           row.calibration,
           forcedCandidateId,
@@ -5298,7 +5709,124 @@ function validAllowanceCapacityByScenario(value) {
           validAllowanceCalibrationSummary(population, forcedCandidateId)
         ))) return false;
   }
-  return true;
+  const selectedCalibration = value.scenarios.unresolved_as_standard.calibration;
+  return value.planScope.cohortId === calibrationCohortId(selectedCalibration);
+}
+
+function validPlanScopedTimeline(value, sourceDescriptor, capacity) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.schemaVersion !== PLAN_SCOPED_TIMELINE_SCHEMA_VERSION
+      || value.encoding !== PLAN_TIMELINE_ENCODING
+      || !["available", "unavailable"].includes(value.status)
+      || !Array.isArray(value.usage)
+      || value.usage.length > MAX_PLAN_TIMELINE_ROWS
+      || !Array.isArray(value.comparisonIntervals)
+      || value.comparisonIntervals.length > MAX_PLAN_TIMELINE_ROWS
+      || !Array.isArray(value.quota) || value.quota.length > MAX_PLAN_TIMELINE_ROWS
+      || !value.diagnostics || typeof value.diagnostics !== "object"
+      || Array.isArray(value.diagnostics)) return false;
+  const diagnosticKeys = [
+    "consideredEvents",
+    "admittedEvents",
+    "incompatibleEvents",
+    "unresolvedEvents",
+    "conflictedEvents",
+    "malformedEvents",
+    "invalidatedBuckets",
+    "invalidatedCandidateEvents",
+  ];
+  if (!diagnosticKeys.every((key) => (
+    Number.isSafeInteger(value.diagnostics[key])
+      && value.diagnostics[key] >= 0
+  ))) return false;
+  if (value.status === "unavailable") {
+    return value.planScope === null && value.usage.length === 0
+      && value.comparisonIntervals.length === 0 && value.quota.length === 0
+      && [
+        "plan_scoped_generation_unavailable",
+        "plan_scoped_attribution_unavailable",
+        "plan_scoped_resource_limit",
+      ].includes(value.reason);
+  }
+  const scope = value.planScope;
+  if (value.reason !== null || !scope || typeof scope !== "object"
+      || Array.isArray(scope)
+      || scope.methodVersion !== PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION
+      || typeof scope.planType !== "string"
+      || !/^[a-z][a-z0-9_-]{0,31}$/u.test(scope.planType)
+      || scope.basisFamilyId !== capacity?.basisFamilyId
+      || scope.planType !== capacity?.planScope?.planType
+      || scope.cohortId !== capacity?.planScope?.cohortId
+      || scope.sourceGeneration !== sourceDescriptor?.generation
+      || scope.sourceGenerationFingerprint
+        !== sourceDescriptor?.generationFingerprint) return false;
+  let admittedEvents = 0;
+  let priorEndMs = Number.NEGATIVE_INFINITY;
+  for (const interval of value.comparisonIntervals) {
+    if (!Array.isArray(interval) || interval.length !== 2
+        || !interval.every((ms) => Number.isSafeInteger(ms)
+          && ms % TIMELINE_BUCKET_MS === 0 && Number.isFinite(new Date(ms).getTime()))
+        || interval[0] < priorEndMs || interval[1] <= interval[0]) return false;
+    priorEndMs = interval[1];
+  }
+  priorEndMs = Number.NEGATIVE_INFINITY;
+  let quotaIntervalAt = 0;
+  for (const row of value.quota) {
+    if (!Array.isArray(row) || row.length !== 3
+        || !row.every((n) => typeof n === "number" && Number.isFinite(n))
+        || !Number.isSafeInteger(row[0]) || row[0] <= priorEndMs
+        || !Number.isFinite(new Date(row[0]).getTime())
+        || !Number.isFinite(new Date(row[1] * 1000).getTime())
+        || row[2] < 0 || row[2] > 100) return false;
+    while (quotaIntervalAt < value.comparisonIntervals.length
+        && value.comparisonIntervals[quotaIntervalAt][1] <= row[0]) quotaIntervalAt += 1;
+    const interval = value.comparisonIntervals[quotaIntervalAt];
+    if (!interval || row[0] < interval[0] || row[0] >= interval[1]) return false;
+    priorEndMs = row[0];
+  }
+  priorEndMs = Number.NEGATIVE_INFINITY;
+  let intervalAt = 0;
+  for (const compact of value.usage) {
+    const row = decodePlanScopedTimelineRow(compact);
+    if (row === null) return false;
+    const startMs = Date.parse(row?.startAt ?? "");
+    const endMs = Date.parse(row?.endAt ?? "");
+    while (intervalAt < value.comparisonIntervals.length
+        && value.comparisonIntervals[intervalAt][1] <= startMs) intervalAt += 1;
+    const interval = value.comparisonIntervals[intervalAt];
+    if (!interval || interval[0] > startMs || interval[1] < endMs) return false;
+    const scenarios = row?.scenarioWeighting;
+    const coverage = row?.weightingCoverage;
+    const pricing = row?.pricingCoverage;
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs)
+        || endMs - startMs !== TIMELINE_BUCKET_MS
+        || startMs < priorEndMs
+        || !Number.isSafeInteger(row.usageEvents) || row.usageEvents < 1
+        || !Number.isSafeInteger(row.totalTokens) || row.totalTokens < 0
+        || !Number.isFinite(row.apiPriceEquivalentUsd)
+        || row.apiPriceEquivalentUsd < 0
+        || !scenarios || typeof scenarios !== "object"
+        || Array.isArray(scenarios)
+        || Object.keys(scenarios).sort().join(",")
+          !== Object.keys(ALLOWANCE_SCENARIO_CANDIDATES).sort().join(",")
+        || !Object.values(scenarios).every((amount) => (
+          Number.isFinite(amount) && amount >= 0
+        ))
+        || !coverage || !["observedEvents", "declaredFromConfigEvents", "assumedEvents"]
+          .every((key) => Number.isSafeInteger(coverage[key]) && coverage[key] >= 0)
+        || coverage.observedEvents + coverage.declaredFromConfigEvents
+          + coverage.assumedEvents !== row.usageEvents
+        || !pricing || !["fullyPricedEvents", "partiallyPricedEvents", "unpricedEvents"]
+          .every((key) => Number.isSafeInteger(pricing[key]) && pricing[key] >= 0)
+        || pricing.fullyPricedEvents + pricing.partiallyPricedEvents
+          + pricing.unpricedEvents !== row.usageEvents
+        || !row.components || COMPONENT_KEYS.some((key) => (
+          !Number.isSafeInteger(row.components[key]) || row.components[key] < 0
+        ))) return false;
+    priorEndMs = endMs;
+    admittedEvents += row.usageEvents;
+  }
+  return admittedEvents === value.diagnostics.admittedEvents;
 }
 
 const COMPOSITION_CACHE_STATUSES = new Set([
@@ -5412,6 +5940,11 @@ function validCache(value) {
       || (value.weekly !== undefined && !validWeeklyPaceContainer(value.weekly))
       || !validWeeklyCalibrationInput(value.weeklyCalibrationInput)
       || !validAllowanceCapacityByScenario(
+        value.allowanceCapacityByScenario,
+      )
+      || !validPlanScopedTimeline(
+        value.planScopedTimeline,
+        value.sourceDescriptor,
         value.allowanceCapacityByScenario,
       )
       || value.weeklyCalibration?.schemaVersion

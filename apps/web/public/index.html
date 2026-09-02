@@ -738,11 +738,16 @@
             <p class="eyebrow">04 · Cost accounting</p>
             <h2 id="accounting-title">How the estimate was calculated</h2>
           </div>
-          <div class="segmented-control" id="accounting-period-controls" aria-label="Accounting period" data-i18n-aria-label="aria.accountingPeriod">
-            <button type="button" data-period="24h">24h</button>
-            <button type="button" data-period="7d" class="active" aria-pressed="true">7d</button>
-            <button type="button" data-period="30d">30d</button>
-            <button type="button" data-period="history" hidden>Indexed history</button>
+          <div class="chart-control-stack">
+            <div class="segmented-control" id="accounting-period-controls" aria-label="Accounting period" data-i18n-aria-label="aria.accountingPeriod">
+              <button type="button" data-period="24h">24h</button>
+              <button type="button" data-period="7d" class="active" aria-pressed="true">7d</button>
+              <button type="button" data-period="30d">30d</button>
+              <button type="button" data-period="history" hidden>Indexed history</button>
+            </div>
+            <button class="button button-secondary compact" id="recalculate-detailed-accounting" type="button" data-i18n="refresh.recalculateDetailed" disabled>
+              Recalculate detailed accounting…
+            </button>
           </div>
         </div>
         <div class="notice notice-info accounting-disclosure">

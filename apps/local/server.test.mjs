@@ -2260,6 +2260,67 @@ test("server rejects forged hosts and requires same-origin refresh authorization
   }
 });
 
+test("loopback quick refresh is separately authorized and selects the quick controller mode", async () => {
+  const files = await fixture();
+  const store = fakeStore();
+  const modes = [];
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: store,
+    refreshRunner: async ({ mode }) => {
+      modes.push(mode);
+      return {
+        rolloutRecordsWritten: 0,
+        filesDiscovered: 0,
+        quotaRefresh: {
+          attempted: true,
+          recordWritten: false,
+          errorCode: null,
+        },
+      };
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const unauthorized = await fetch(`${base}/api/local/refresh/quick`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(unauthorized.status, 403);
+
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const started = await fetch(`${base}/api/local/refresh/quick`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ reason: "user_request" }),
+    });
+    assert.equal(started.status, 202);
+    await waitFor(async () => {
+      const status = await fetch(`${base}/api/local/refresh`)
+        .then((response) => response.json());
+      return status.refresh.status === "succeeded";
+    });
+    assert.deepEqual(modes, ["quick"]);
+    assert.equal(store.reloads, 1);
+    assert.equal(
+      (await fetch(`${base}/api/local/refresh/quick`)).status,
+      405,
+    );
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
 test("loopback refresh publishes a rollout quarantine as degraded verified coverage", async () => {
   const files = await fixture();
   const generation = {

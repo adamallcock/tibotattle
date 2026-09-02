@@ -55,6 +55,7 @@ import {
 } from "./local-unified-companion-source.js";
 import {
   createAccountingPricer,
+  decodePlanScopedTimelineRow,
   readReplaySafeAccountingCache,
 } from "./replay-safe-accounting-cache.js";
 import {
@@ -115,6 +116,9 @@ const ALLOWANCE_SCENARIOS = Object.freeze([
 ]);
 const TIMELINE_ALLOWANCE_WEIGHTING_SCHEMA_VERSION =
   "quota-weighted-timeline-v0.1";
+const PLAN_SCOPED_TIMELINE_SCHEMA_VERSION =
+  "local-plan-scoped-accounting-timeline-v1";
+const PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION = "plan-era-v1";
 const TIMELINE_WEIGHTING_STATUS_CODE = Object.freeze({
   complete: 0,
   partial: 1,
@@ -831,6 +835,7 @@ function projectAllowanceCapacityScenario(container, scenario) {
   const cohort = calibration.recentResets.map((row) => row.resetIdentity);
   return {
     basisId: source.basis.basisId,
+    planType: calibration.selectedPlanType,
     medianCapacityUsd: estimate.medianApiPriceEquivalentUsd,
     plausibleRangeUsd: { ...estimate.plausibleRangeUsd },
     qualifyingResets: estimate.qualifyingResets,
@@ -864,7 +869,7 @@ function comparableAllowanceCapacityCohort(left, right) {
     ));
 }
 
-function projectAllowanceCapacity(container) {
+function projectAllowanceCapacity(container, sourceDescriptor = null, { staleCompatibility = false } = {}) {
   const standardBasis = codexPrimaryAllowanceBasis(
     "unresolved_as_standard",
   );
@@ -877,6 +882,7 @@ function projectAllowanceCapacity(container) {
     basisFamilyId: standardBasis.basisFamilyId,
     selectedScenario: null,
     scenarios,
+    planScope: null,
     accountAttribution: {
       status: "historical_unattributed",
       maySpanMultipleAccounts: true,
@@ -887,6 +893,15 @@ function projectAllowanceCapacity(container) {
       || container.basisFamilyId !== standardBasis.basisFamilyId) {
     return unavailable("allowance_capacity_cache_unavailable");
   }
+  // Prior versions may have an unscoped scalar fit. Only the provenance-labeled
+  // stale channel may retain it; it must never become a current comparison lane.
+  const hasScope = container.planScope !== null && container.planScope !== undefined;
+  if ((!staleCompatibility || hasScope)
+      && (container.planScope?.methodVersion !== "plan-era-v1"
+      || typeof container.planScope?.planType !== "string"
+      || container.planScope.basisFamilyId !== standardBasis.basisFamilyId)) {
+    return unavailable("allowance_capacity_cache_unavailable");
+  }
   const internal = Object.fromEntries(ALLOWANCE_SCENARIOS.map((scenario) => [
     scenario,
     projectAllowanceCapacityScenario(container, scenario),
@@ -894,12 +909,22 @@ function projectAllowanceCapacity(container) {
   const scenarios = Object.fromEntries(ALLOWANCE_SCENARIOS.map((scenario) => {
     const row = internal[scenario];
     if (row === null) return [scenario, null];
-    const { cohort: _cohort, ...projected } = row;
+    const { cohort: _cohort, planType: _planType, ...projected } = row;
     return [scenario, projected];
   }));
   const selectedScenario = DEFAULT_UNRESOLVED_SPEED_SCENARIO;
   if (internal[selectedScenario] === null) {
     return unavailable("selected_allowance_capacity_unavailable", scenarios);
+  }
+  const selected = internal[selectedScenario];
+  if ((hasScope && (container.planScope.planType !== selected.planType
+      || container.planScope.cohortId !== selected.cohortId))
+      || (!staleCompatibility && (sourceDescriptor?.mode !== "unified"
+      || sourceDescriptor.generation === null
+      || sourceDescriptor.generation === undefined
+      || sourceDescriptor.generationFingerprint === null
+      || sourceDescriptor.generationFingerprint === undefined))) {
+    return unavailable("selected_allowance_capacity_scope_mismatch", scenarios);
   }
   return {
     status: "available",
@@ -907,6 +932,14 @@ function projectAllowanceCapacity(container) {
     basisFamilyId: standardBasis.basisFamilyId,
     selectedScenario,
     scenarios,
+    planScope: staleCompatibility ? null : {
+      methodVersion: container.planScope.methodVersion,
+      planType: container.planScope.planType,
+      basisFamilyId: container.planScope.basisFamilyId,
+      cohortId: container.planScope.cohortId,
+      sourceGeneration: sourceDescriptor.generation,
+      sourceGenerationFingerprint: sourceDescriptor.generationFingerprint,
+    },
     accountAttribution: {
       status: "historical_unattributed",
       maySpanMultipleAccounts: true,
@@ -2226,6 +2259,63 @@ function quotaWeightedUsageTimeline(rows, { inference }) {
   });
 }
 
+function projectPlanScopedUsageTimeline(cache, allowanceCapacity) {
+  const source = cache?.planScopedTimeline;
+  const sourceDescriptor = cache?.sourceDescriptor;
+  const scope = source?.planScope;
+  const expectedScope = allowanceCapacity?.planScope;
+  const unavailable = (reason) => ({
+    schemaVersion: PLAN_SCOPED_TIMELINE_SCHEMA_VERSION,
+    status: "unavailable",
+    reason,
+    planScope: null,
+    usage: [],
+    quota: [],
+    comparisonIntervals: [],
+  });
+  if (source?.schemaVersion !== PLAN_SCOPED_TIMELINE_SCHEMA_VERSION
+      || source?.status !== "available"
+      || source.reason !== null
+      || source.encoding !== "plan_bucket_v1"
+      || !Array.isArray(source.usage)
+      || !Array.isArray(source.quota) || !Array.isArray(source.comparisonIntervals)
+      || sourceDescriptor?.mode !== "unified"
+      || allowanceCapacity?.status !== "available"
+      || scope?.methodVersion !== PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION
+      || scope.planType !== expectedScope?.planType
+      || scope.basisFamilyId !== expectedScope?.basisFamilyId
+      || scope.cohortId !== expectedScope?.cohortId
+      || scope.sourceGeneration !== expectedScope?.sourceGeneration
+      || scope.sourceGenerationFingerprint
+        !== expectedScope?.sourceGenerationFingerprint
+      || scope.sourceGeneration !== sourceDescriptor.generation
+      || scope.sourceGenerationFingerprint
+        !== sourceDescriptor.generationFingerprint) {
+    return unavailable("plan_scoped_timeline_unavailable");
+  }
+  const usage = [];
+  for (const compact of source.usage) {
+    const row = decodePlanScopedTimelineRow(compact);
+    if (row === null) {
+      return unavailable("plan_scoped_timeline_invalid");
+    }
+    // Keep the bounded compact form through HTTP and snapshot persistence.
+    // Expanding here can turn a 4 MiB lane into >16 MiB of repeated keys,
+    // preventing the entire otherwise-valid dashboard from being retained.
+    usage.push([...compact]);
+  }
+  return {
+    schemaVersion: PLAN_SCOPED_TIMELINE_SCHEMA_VERSION,
+    status: "available",
+    reason: null,
+    encoding: "plan_bucket_v1",
+    planScope: { ...scope },
+    usage,
+    comparisonIntervals: source.comparisonIntervals.map(([startMs, endMs]) => [startMs, endMs]),
+    quota: source.quota.map((row) => [...row]),
+  };
+}
+
 function timelineAllowanceWeightingEncoding() {
   return {
     schemaVersion: TIMELINE_ALLOWANCE_WEIGHTING_SCHEMA_VERSION,
@@ -2696,10 +2786,11 @@ export async function buildLocalCompanionSnapshot({
   );
   let allowanceCapacity = projectAllowanceCapacity(
     replaySafeCache?.allowanceCapacityByScenario,
+    replaySafeCache?.sourceDescriptor,
   );
   if (staleProvenance !== null) {
-    // The stale artifact rides the SAME validating projections as a current
-    // cache: a block whose shape the current validators refuse projects
+    // The stale artifact retains the same scalar/calibration validation as a
+    // current cache: a block whose shape those validators refuse projects
     // "unavailable" and stays withheld exactly as today, so only structurally
     // sound figures are ever stale-served. (The common updater step keeps the
     // calibration/allowance shapes intact — the version bump names a change
@@ -2713,6 +2804,8 @@ export async function buildLocalCompanionSnapshot({
     }
     const staleCapacity = projectAllowanceCapacity(
       staleReplaySafe.cache?.allowanceCapacityByScenario,
+      staleReplaySafe.cache?.sourceDescriptor,
+      { staleCompatibility: true },
     );
     if (staleCapacity.status !== "unavailable") {
       allowanceCapacity = { ...staleCapacity, stale: staleProvenance };
@@ -2917,6 +3010,10 @@ export async function buildLocalCompanionSnapshot({
   const calibrationUsageTimeline = quotaWeightedUsageTimeline(
     calibrationUsageTimelineWithSpeed,
     fastModeContext,
+  );
+  const planScopedTimeline = projectPlanScopedUsageTimeline(
+    replaySafeCache,
+    allowanceCapacity,
   );
   const timelineCoveredAt = unifiedAccountingWithheld
     ? { startAt: null, endAt: null }
@@ -3222,6 +3319,7 @@ export async function buildLocalCompanionSnapshot({
           ? { calibrationUsage: calibrationUsageTimeline }
           : {}),
         allowanceCapacity,
+        planScoped: planScopedTimeline,
         quota: quotaTimeline,
         sparkUsage: sparkUsageTimeline,
         sparkQuota: sparkQuotaTimeline,

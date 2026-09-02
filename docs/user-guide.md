@@ -80,15 +80,32 @@ diagnostics, or community contributions.
 
 ## Refresh, progress, and recovery
 
-Use Refresh to request a new local analysis pass. The app keeps verified prior
-figures visible while newer data is being reconciled where the evidence permits.
-Do not repeatedly relaunch during first-run indexing; that can make progress
-appear to restart even when source data is intact.
+Use **Refresh** to update current quota and headline evidence. That ordinary
+action is intentionally light: it does not scan retained history or rebuild
+detailed accounting. The app keeps verified prior detailed figures visible,
+with their current freshness state, where the evidence permits.
 
-After source scanning, **Calculating accounting…** means the app is calculating
-and preparing the updated dashboard. It replaces the file counter: a small
-number of changed files does not mean all the unchanged files are being read
-again. Only the terminal refresh status establishes completion.
+Choose **Recalculate detailed accounting…** when you explicitly want to advance
+retained history and rebuild the generation-bound Usage-and-costs and Trends
+evidence. While the app remains open it may make one automatic detailed attempt
+after an hour; startup and the intervening automatic checks stay light. Failed,
+cancelled, and interrupted detailed attempts count toward that hour so they do
+not become a retry loop.
+
+Trends compares the selected plan's compatible usage and quota history. Earlier
+history on another plan does not disable a usable current-plan fit, and it is
+not borrowed into that fit. Ambiguous intervals and plan transitions remain
+gaps. Unresolved speed uses the labelled Standard scenario, without pretending
+that Standard speed was observed.
+
+Do not repeatedly relaunch during a detailed pass; that can make progress appear
+to restart even when source data is intact.
+
+During an explicit or hourly detailed pass, **Calculating accounting…** means
+the app is calculating and preparing the updated dashboard. It replaces the
+file counter: a small number of changed files does not mean all the unchanged
+files are being read again. Only the terminal refresh status establishes
+completion.
 
 If the dashboard stays blank or reports a schema/index error:
 

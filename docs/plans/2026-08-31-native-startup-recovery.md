@@ -52,8 +52,9 @@ or public release is part of this correction.
   hosted Worker is deployed. Its installed refresh ingested generation 44 but
   exposed the separate fit-metadata defect below.
 - [ ] Repeat the exact-source, R7, signed-artifact, replacement, native startup,
-  refresh, pairing-repair, prompt-free, and accounting checks on RC8 build
-  `1023.6`.
+  refresh, prompt-free, and accounting checks on corrective RC9 build `1023.7`.
+  Installed metadata now identifies RC8 `1023.6`; its evidence cannot qualify
+  RC9. End-to-end pairing repair still requires the separately deployed Worker.
 
 ## Acceptance
 
@@ -186,3 +187,14 @@ stable `1024`, but it has not yet passed exact-source R7, artifact, replacement,
 installed-refresh, or physical-native gates. PR #94's formal comparator remains
 **OPEN / NOT RUN** and blocks stable/public qualification; explicitly open-gate
 internal dogfood testing may continue.
+
+## RC9 current follow-up — 2026-09-02
+
+The current corrective source is based on main `35802d21`, after RC8/PR #101.
+RC8 metadata (`0.1.17`, build `1023.6`) was observed in the installed app on
+2026-09-02; this is not a fresh signature or runtime qualification. RC9 `1023.7`
+separates startup/manual quick refresh from explicit or hourly detailed work,
+fences stale native status callbacks, restores authoritative snapshot persistence,
+and supplies a scope-bound mixed-plan Trends projection. It remains under source
+validation. The current execution and open release boundaries are in the
+[RC9 integration amendment](./2026-08-30-native-dogfood-integration.md#rc9-refresh-and-mixed-plan-correction--2026-09-02).

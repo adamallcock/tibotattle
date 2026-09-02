@@ -1349,7 +1349,18 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.doesNotMatch(source, /split\.addArrangedSubview\(webView\)/u);
   assert.match(source, /newWindow\.toolbar = makeDashboardToolbar\(\)/u);
   assert.match(source, /newWindow\.toolbarStyle = \.unified/u);
-  assert.match(source, /refreshLocalUsage\(automatic: true\)/u);
+  assert.match(
+    source,
+    /refreshLocalUsage\(automatic: true, mode: \.quick\)/u,
+  );
+  assert.match(
+    source,
+    /NativeDetailedRefreshCadence[\s\S]*?minimumInterval: TimeInterval = 60 \* 60[\s\S]*?defaults\.set\(nowInterval, forKey: defaultsKey\)[\s\S]*?return \.quick[\s\S]*?return \.detailed/u,
+  );
+  assert.match(source, /let detailedReservation = mode == \.detailed[\s\S]*?NativeDetailedRefreshCadence\.recordDetailedAttempt\(\)[\s\S]*?nativeEvidenceReader\.startAnalysis/u);
+  assert.match(source, /case let \.alreadyRunning\(_, attempt\)[\s\S]*?restoreAfterQuickJoin\(\s*detailedReservation,\s*attempt: attempt/u);
+  assert.match(source, /restoreAfterQuickJoin[\s\S]*?attempt\?\.mode == \.quick[\s\S]*?reservation\.stampedAt[\s\S]*?reservation\.token/u);
+  assert.match(source, /!cadenceStatusChecked[\s\S]*?nativeEvidenceReader\.readAnalysisActivity[\s\S]*?allowAutomaticDetailed: controllerIdle/u);
   assert.match(source, /static let defaultsKey = "tibotattle\.refresh-interval\.v1"/u);
   assert.match(source, /static let allowedSeconds = \[60, 5 \* 60, 15 \* 60, 30 \* 60\]/u);
   assert.match(source, /static func seconds\(in defaults: UserDefaults\) -> Int/u);
@@ -2008,7 +2019,7 @@ test("native dashboard launch gates its first refresh on the rendered page", asy
   );
   assert.doesNotMatch(
     companionReady,
-    /refreshLocalUsage\(automatic: true\)/u,
+    /refreshLocalUsage\(automatic: true, mode: \.quick\)/u,
   );
 
   // The page-host callback is the only consumer of that pending flag: clear
@@ -2016,11 +2027,13 @@ test("native dashboard launch gates its first refresh on the rendered page", asy
   // second startup pass.
   assert.match(
     dashboardLoaded,
-    /if startupAutomaticRefreshPending \{\s*\n\s*startupAutomaticRefreshPending = false\s*\n\s*refreshLocalUsage\(automatic: true\)/u,
+    /if startupAutomaticRefreshPending \{\s*\n\s*startupAutomaticRefreshPending = false\s*\n\s*refreshLocalUsage\(automatic: true, mode: \.quick\)/u,
   );
   assert.equal(
     dashboardLoaded.indexOf("startupAutomaticRefreshPending = false")
-      < dashboardLoaded.indexOf("refreshLocalUsage(automatic: true)"),
+      < dashboardLoaded.indexOf(
+        "refreshLocalUsage(automatic: true, mode: .quick)",
+      ),
     true,
     "the launch-only refresh is consumed before collection starts",
   );
@@ -2126,6 +2139,14 @@ test("native refresh progress stays fixed-vocabulary and count-bounded", async (
   );
   assert.match(
     menuBarStatusSource,
+    /enum LocalAnalysisMode:[\s\S]*?case quick[\s\S]*?case detailed[\s\S]*?case \.quick:[\s\S]*?"\/api\/local\/refresh\/quick"[\s\S]*?case \.detailed:[\s\S]*?"\/api\/local\/refresh"/u,
+  );
+  assert.match(
+    menuBarStatusSource,
+    /func startAnalysis\([\s\S]*?mode: LocalAnalysisMode[\s\S]*?path: mode\.routePath/u,
+  );
+  assert.match(
+    menuBarStatusSource,
     /automaticRefreshInFlight = false[\s\S]*?outcome\.automaticRefreshSuppressed[\s\S]*?automaticRefreshSuppressed = suppressed/u,
   );
   assert.match(
@@ -2161,7 +2182,7 @@ test("native refresh progress stays fixed-vocabulary and count-bounded", async (
   assert.doesNotMatch(activityDecoder, /progress\["message"\]/u);
   assert.match(
     refreshPoll,
-    /case let \.running\(_, progress\):[\s\S]*?progress\?\.nativeToolbarTitle\(\s*hasUsableHeadlineEvidence: false\s*\)[\s\S]*?pollNativeRefresh/u,
+    /case let \.running\(refreshID, progress, _\):[\s\S]*?progress\?\.nativeToolbarTitle\(\s*hasUsableHeadlineEvidence: false\s*\)[\s\S]*?pollNativeRefresh/u,
   );
   assert.match(
     source,
@@ -2186,6 +2207,31 @@ test("native refresh progress stays fixed-vocabulary and count-bounded", async (
   assert.match(
     refreshPoll,
     /case \.none:[\s\S]*?nativeEvidenceState = \.readFailed[\s\S]*?isRefreshing: true,[\s\S]*?refreshEnabled: false[\s\S]*?remainingAttempts: max\(0, remainingAttempts - 1\)[\s\S]*?return/u,
+  );
+  assert.match(
+    source,
+    /nativeRefreshStartWatchdogMilliseconds = 12_000[\s\S]*?let startWatchdog = DispatchWorkItem[\s\S]*?nativeRefreshSequence == refreshSequence[\s\S]*?pollNativeRefresh\(/u,
+  );
+  assert.match(
+    refreshPoll,
+    /nativeRefreshReadWatchdogMilliseconds[\s\S]*?nativeRefreshReadEpoch == readEpoch[\s\S]*?pollNativeRefresh\(/u,
+  );
+  assert.match(
+    source,
+    /private func handleNativeRefreshTerminal\([\s\S]*?settleNativeRefresh\([\s\S]*?nativeEvidenceReader\.readOverview/u,
+  );
+  assert.match(source, /nativeRefreshStartFence\.begin\(\)[\s\S]*?nativeEvidenceReader\.startAnalysis[\s\S]*?nativeRefreshStartFence\.resolve\(\)/u);
+  assert.match(refreshPoll, /let startObservation = self\.nativeRefreshStartFence\.observation\(\)[\s\S]*?readAnalysisActivity[\s\S]*?case let \.idle[\s\S]*?allowsTerminal\(\s*startObservation\s*\)/u);
+  assert.match(menuBarStatusSource, /readAnalysisActivity[\s\S]*?NativeDetailedRefreshCadence\.observe\(activity\?\.attempt\)/u);
+  assert.match(menuBarStatusSource, /LocalAnalysisMode\(rawValue: rawMode\)[\s\S]*?rawStartedAt\.utf8\.count == 24[\s\S]*?formatter\.string\(from: startedAt\) == rawStartedAt/u);
+  assert.match(
+    source,
+    /func applicationDidBecomeActive[\s\S]*?reconcileNativeRefreshStatus\(\)/u,
+  );
+  assert.match(source, /NSWorkspace\.didWakeNotification[\s\S]*?reconcileNativeRefreshStatus\(\)/u);
+  assert.match(
+    source,
+    /private func reconcileNativeRefreshStatus\([\s\S]*?case let \.running\(refreshID, progress, _\):[\s\S]*?nativeRefreshInFlight = true[\s\S]*?case let \.idle\(refreshID, _, _\):[\s\S]*?handleNativeRefreshTerminal[\s\S]*?case \.none:\s*\n\s*return/u,
   );
   assert.doesNotMatch(source, /remainingAttempts: 120/u);
   assert.match(source, /--native-analysis-progress-contract-smoke-test/u);
@@ -2278,7 +2324,18 @@ test("unified toolbar preserves the rich loopback report and single authority", 
   assert.match(source, /let item = NSTabViewItem\(identifier: identifier\)/u);
   assert.match(source, /toolbar\.delegate = toolbarDelegate/u);
   assert.match(source, /settingsToolbarDelegate = toolbarDelegate/u);
-  assert.match(toolbar, /@objc private func refreshDashboardFromToolbar\(\) \{[\s\S]*?refreshLocalUsage\(automatic: false\)/u);
+  assert.match(
+    toolbar,
+    /@objc private func refreshDashboardFromToolbar\(\) \{[\s\S]*?refreshLocalUsage\(automatic: false, mode: \.quick\)/u,
+  );
+  assert.match(
+    toolbar,
+    /@objc private func recalculateDetailedAccounting\(\) \{[\s\S]*?refreshLocalUsage\(automatic: false, mode: \.detailed\)/u,
+  );
+  assert.match(
+    source,
+    /let recalculateDetailedAccounting = NSMenuItem\([\s\S]*?nativeDashboardRecalculateDetailedAccounting[\s\S]*?#selector\(recalculateDetailedAccounting\)/u,
+  );
   assert.match(
     toolbar,
     /@objc private func showShareCardFromToolbar\(\) \{[\s\S]*?document\.getElementById\('share-panel'\)\?\.scrollIntoView/u,
@@ -2482,7 +2539,7 @@ test("toolbar pill narrates index progress, terminal gaps, and refresh failure w
   // A refresh terminal re-reads both facts before the pill claims a state.
   assert.match(
     source,
-    /readNativeToolbarStatusFacts\(base: base\) \{ \[weak self\] in\s*\n\s*self\?\.finishNativeRefresh\(/u,
+    /handleNativeRefreshTerminal\([\s\S]*?settleNativeRefresh\([\s\S]*?readNativeToolbarStatusFacts\(base: base\) \{ \[weak self\] in[\s\S]*?updateNativeToolbar\(/u,
   );
   // While coverage is incomplete the idle pill re-reads it on a bounded
   // 30-second foreground cadence; a refresh start, coverage completion,
@@ -4299,11 +4356,11 @@ test("development and preview builds treat the release-channel policy as optiona
 
 test("macOS release metadata validates versions, production mode, and Keychain references", async () => {
   assert.equal(normalizeMacOSBundleVersion(), DERIVED_MACOS_BUNDLE_VERSION);
-  assert.equal(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION, "1023.6");
+  assert.equal(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION, "1023.7");
   assert.equal(STABLE_SIGNED_BUNDLE_VERSION, "1024");
   assert.equal(
     normalizeMacOSBundleVersion(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
-    "1023.6",
+    "1023.7",
   );
   assert.equal(
     compareMacOSBundleVersions(
@@ -4343,13 +4400,18 @@ test("macOS release metadata validates versions, production mode, and Keychain r
     "the fitted-transition correction must be strictly newer than installed RC7",
   );
   assert.equal(
+    compareMacOSBundleVersions("1023.6", INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
+    -1,
+    "the refresh-policy RC9 allocation must be strictly newer than RC8",
+  );
+  assert.equal(
     compareMacOSBundleVersions(
       STABLE_SIGNED_BUNDLE_VERSION,
       INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION,
     ) > 0,
     true,
   );
-  for (const unallocated of ["1023", "1023.0", "1023.1", "1023.1.0", "1023.2", "1023.2.0", "1023.3", "1023.3.0", "1023.4", "1023.4.0", "1023.5", "1023.5.0", "1023.6.0", "1024", "2000.1.17"]) {
+  for (const unallocated of ["1023", "1023.0", "1023.1", "1023.1.0", "1023.2", "1023.2.0", "1023.3", "1023.3.0", "1023.4", "1023.4.0", "1023.5", "1023.5.0", "1023.6", "1023.6.0", "1023.7.0", "1024", "2000.1.17"]) {
     assert.throws(
       () => readMacOSReleaseBuildConfiguration({
         USAGE_MONITOR_BUNDLE_VERSION: unallocated,
@@ -7952,7 +8014,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       analysisProgressSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_ANALYSIS_PROGRESS_CONTRACT phases=allowlisted archive=scanning unified=scanning accounting=calculating counts=bounded quick_result=evidence-gated contradictory=generic unknown=generic free_text=ignored idle=unchanged terminal=automatic-backoff percent=false eta=false$/mu,
+      /^USAGE_MONITOR_MACOS_ANALYSIS_PROGRESS_CONTRACT phases=allowlisted archive=scanning unified=scanning accounting=calculating counts=bounded quick_result=evidence-gated contradictory=generic unknown=generic free_text=ignored idle=unchanged terminal=automatic-backoff attempt=mode-and-actual-start percent=false eta=false$/mu,
     );
     const popupRenderDirectory = join(temporaryRoot, "menu-bar-popover-render");
     const popupRenderSmoke = spawnSync(
@@ -8086,7 +8148,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     );
     assert.match(
       refreshSettingsSmoke.stdout,
-      /^USAGE_MONITOR_MACOS_REFRESH_SETTINGS_CONTRACT default=300 persisted=900 reloaded=900 picker_action=true picker_persisted=true scheduler=300->900 invalid_ignored=true$/mu,
+      /^USAGE_MONITOR_MACOS_REFRESH_SETTINGS_CONTRACT default=300 persisted=900 reloaded=900 picker_action=true picker_persisted=true scheduler=300->900 detailed_attempt_cadence=3600 startup=quick quick_join=restored newer_attempt=preserved external_attempt=actual-start stale_idle=ignored invalid_ignored=true$/mu,
     );
     const appearanceSettingsSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),

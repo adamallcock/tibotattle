@@ -321,6 +321,7 @@ export const WEB_MESSAGES = Object.freeze({
     "已验证的概要证据仍然可用，但统一历史步骤以固定的降级状态结束（{code}）。自动重试已停止；仍可明确重试。",
     "La evidencia resumida verificada sigue disponible, pero el paso de historial unificado terminó en un estado degradado fijo ({code}). Los reintentos automáticos se han detenido; aún puedes reintentar expresamente.",
   ],
+  "refresh.recalculateDetailed": ["Recalculate detailed accounting…", "重新计算详细账目…", "Recalcular contabilidad detallada…"],
   // Why the replay-safe accounting artifacts are missing when the rebuild has
   // deferred repeatedly: the rebuild misses its memory ceiling, softly, and
   // retries — this names the cause and the streak instead of showing bare
@@ -1725,6 +1726,7 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Skip to monitoring dashboard": ["跳到监测仪表板", "Ir al panel de seguimiento"],
   "Connecting": ["正在连接", "Conectando"],
   "Analyze local usage": ["分析本地使用情况", "Analizar el uso local"],
+  "Recalculate detailed accounting…": ["重新计算详细账目…", "Recalcular contabilidad detallada…"],
   "Overview": ["概览", "Resumen"],
   "Allowance": ["额度", "Límite"],
   "Trends": ["趋势", "Tendencias"],

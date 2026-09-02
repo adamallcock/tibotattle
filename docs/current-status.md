@@ -1,10 +1,10 @@
 ---
 title: Current product and release status
-date: 2026-09-01
+date: 2026-09-02
 type: status
 status: current
-source_commit: 87e07be350582713d815a21b4db470ed84aae037
-observation_date: 2026-09-01
+source_commit: 35802d21ede67d362533f4e2be6b38041ece1cda
+observation_date: 2026-09-02
 ---
 
 # Current product and release status
@@ -18,8 +18,8 @@ using this page for a later release or operational decision.
 
 | Boundary | Verified state |
 |---|---|
-| Documentation/source review | RC7 source merge `87e07be350582713d815a21b4db470ed84aae037`, reviewed 2026-09-01; RC8 corrective source is not yet frozen |
-| Installed internal dogfood | Signed, notarized, and stapled RC7 source `87e07be350582713d815a21b4db470ed84aae037`, build `1023.5`, installed 2026-09-01; generation 44 ingestion passed but the strict v0.14 cache validator withheld advanced accounting |
+| Documentation/source review | Base `35802d21ede67d362533f4e2be6b38041ece1cda`, reviewed 2026-09-02; local RC9 corrections and build `1023.7` allocation are under validation, not frozen or artifact-qualified |
+| Installed internal dogfood | App metadata observed 2026-09-02: version `0.1.17`, RC8 build `1023.6`. This read-only plist observation does not requalify its signature, source, or runtime. RC9 has not replaced it |
 | Public service | Read-only `GET https://tibotattle.com/api/health`, HTTP 200, deployment source `304f3d736b6f9451d32a616bf3046ea628e828a3`, observed 2026-08-31 |
 | Public updater | Read-only `GET https://updates.tibotattle.com/appcast.xml`, observed 2026-08-27 |
 | Published release | GitHub release API for `adamallcock/tibotattle`, observed 2026-08-27 |
@@ -135,14 +135,23 @@ The complete qualification matrix and rules for changing these claims are in
   inconsistent fit metadata. The fit correctly excluded an early
   diagnostic-only transition, but the projection copied that rejected row's
   eligibility onto the reset fitted from later eligible transitions.
-- RC8 retains the strict validator and projects reset fit metadata from the
-  first eligible row. It is allocated monotonic build `1023.6`, strictly after
-  installed RC7 and before reserved stable build `1024`. This source change
-  invalidates RC7's workload receipts, so RC8 still requires a fresh exact-source
-  freeze, protected R7, full source gate, signed/notarized/stapled artifact,
-  state-preserving replacement, installed refresh, and physical native checks.
-  This allocation and source diagnosis are not evidence that RC8 was built or
-  passed.
+- RC8 source retains the strict validator and projects reset fit metadata from
+  the first eligible row. Its prior allocation was `1023.6`; the reviewed source
+  base for this update is `35802d21ede67d362533f4e2be6b38041ece1cda`.
+- RC9 reserves monotonic build `1023.7`, strictly after RC8 and before stable
+  `1024`. Its source is under validation: ordinary refresh and startup collect
+  quick quota/headline evidence; explicit detailed recalculation remains
+  separate; automatic detailed attempts are at most hourly and count failed or
+  interrupted requests. Native polling uses controller mode/start receipts and
+  terminal-state fencing, so browser-started work shares the cadence and stale
+  pre-start replies cannot settle a new request. Trends pairs the selected
+  plan's fit with its source-bound usage, preserves established speed evidence
+  with the reviewed Standard fallback, and keeps all-plan accounting separate.
+  Authoritative dashboard snapshots use the current production shape so they
+  can be retained across relaunch. These are source changes, not evidence of a
+  built, installed, or passing RC9. Fresh exact-source R7, the complete source
+  gate, signed/notarized/stapled artifact, state-preserving replacement,
+  installed refresh, and physical native checks remain required.
 - The RC7 R7 workload-source closure has protected dual-runtime receipts for
   359 files / workload SHA-256
   `ea504fde37402622239d5405aa74c264b98a111c8da5b4031a0977fa5bd80741`.
@@ -158,7 +167,7 @@ The complete qualification matrix and rules for changing these claims are in
   complete named fit-rejection reconciliation, so R7 cannot be used as a
   substitute. An explicitly open-gate internal dogfood may proceed for testing,
   but this blocks stable and public 0.1.17 qualification until it is closed or
-  deliberately resolved. The exact RC8 native artifact must separately pass
+  deliberately resolved. The exact RC9 native artifact must separately pass
   signing, notarization, state-preserving installation, updater, and physical
   native checks. Pairing continuity needs compatible hosted Worker migrations
   and deployment before the repaired desktop flow can be validated end to end.
