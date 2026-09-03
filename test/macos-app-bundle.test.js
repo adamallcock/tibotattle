@@ -5287,10 +5287,11 @@ test("signed updater replacement contract validates upgrade and rollback artifac
         previousBundleVersion: "0.1.16",
       },
     );
-    assert.doesNotThrow(() => validateMacOSSignedReplacementPair({
+    assert.throws(() => validateMacOSSignedReplacementPair({
       previousManifest: legacyStableManifest,
       candidateManifest: epochCandidateManifest,
-    }));
+    }), { code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" },
+    "a legacy version alone remains a continuity input, not exact previous-artifact proof");
     for (const rejectedLegacySource of ["0.1.17", "0.2.0"]) {
       const rejectedManifest = {
         ...legacyStableManifest,
@@ -5666,31 +5667,15 @@ test("signed updater replacement contract validates upgrade and rollback artifac
       JSON.stringify(epochCandidateManifest),
     );
     const legacyValidatedArtifacts = [];
-    await validateMacOSSignedReplacementArtifacts({
+    await assert.rejects(validateMacOSSignedReplacementArtifacts({
       previousReleaseManifestPath: previousManifestPath,
       candidateReleaseManifestPath: candidateManifestPath,
       async validateArtifact(path, options) {
         legacyValidatedArtifacts.push([path, options]);
       },
-    });
-    assert.deepEqual(legacyValidatedArtifacts, [
-      [
-        join(temporaryRoot, legacyStableManifest.artifact.fileName),
-        {
-          allowLegacyUnsealedSource: true,
-          channel: STABLE_RELEASE_CHANNEL,
-          production: true,
-        },
-      ],
-      [
-        join(temporaryRoot, epochCandidateManifest.artifact.fileName),
-        {
-          allowLegacyUnsealedSource: false,
-          channel: STABLE_RELEASE_CHANNEL,
-          production: true,
-        },
-      ],
-    ]);
+    }), { code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" });
+    assert.deepEqual(legacyValidatedArtifacts, [],
+      "unbound legacy artifacts cannot reach native validation or obtain compatibility");
     await writeFile(
       previousManifestPath,
       JSON.stringify(previousManifest),
@@ -5942,14 +5927,14 @@ test("legacy dogfood capability rejects Proxy-forged identities before any artif
         { code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" },
         `${name} must reject a supplied non-member identity before path resolution`,
       );
-      assert.equal(symbolReads, 2, "both private compatibility reads were exercised");
-      assert.equal(new Set(observedSymbols).size, 2);
+      assert.equal(symbolReads, 3, "all private compatibility reads were exercised");
+      assert.equal(new Set(observedSymbols).size, 3);
       for (const [index, observedSymbol] of observedSymbols.entries()) {
         await assert.rejects(
           validate(null, { ...baseOptions, [observedSymbol]: forged }),
-          { code: index === 0 ? "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID"
-            : "MACOS_KEYCHAIN_MIGRATION_COMPATIBILITY_INVALID" },
-          `${name} must reject a forged value replayed with either captured Symbol`,
+          { code: index === 1 ? "MACOS_KEYCHAIN_MIGRATION_COMPATIBILITY_INVALID"
+            : "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" },
+          `${name} must reject a forged value replayed with each captured Symbol`,
         );
       }
     }

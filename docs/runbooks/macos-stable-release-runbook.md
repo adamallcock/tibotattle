@@ -107,7 +107,21 @@ but it cannot read or migrate stable state. The signed same-identity
 the live stable database into Preview, relabel `PRAGMA user_version`, delete the
 index, or reopen a migrated schema-10 or schema-11 index with shipped 0.1.16.
 
-The replacement validator has one closed previous-only exception for the
+The replacement validator has a closed previous-only exception for published
+stable `0.1.16` / bundle version `0.1.16`: SHA-256
+`5e3e60402ffa3c61d8279f5f759548a8b48084f1ae567eeb1b30156c7f30a9fe`,
+49,341,389 bytes, source `4f30508eff55c122e73025ad06d73b33cadbc508`
+at `v0.1.16`. Its exact receipt, source/payload digests, updater key/framework,
+and normalized Keytar tuple are pinned. Only the checksum-verified previous
+artifact receives short-lived compatibility for the absent source seal,
+migration helper, and both Keychain identity plist fields. A version match or
+public boolean cannot authorize it. The capability expires before candidate
+validation, including when previous validation fails. Native signature,
+notarization, Gatekeeper, and isolated-smoke checks remain required; the old
+manifest and artifact are never rewritten. This is replacement-artifact proof,
+not existing-state rollback or prompt-free installed-upgrade proof.
+
+A separate closed previous-only exception covers the
 pre-policy internal-dogfood `0.1.16` / build `1022` DMG: SHA-256
 `2b32964c8b3bc2912620dbbe078aaf4e2fd49f1725a4e94a62dff184cdc9f8c1`,
 49,341,249 bytes, source `5adaca5fdc8f981c391144e0d29b6f4c764f0f96`
@@ -165,7 +179,7 @@ implementation and synthetic reset evidence are recorded in the
 and do not authorize resetting real credentials during qualification. An
 unsigned smoke or a blocked signed probe is not signed-upgrade evidence.
 
-A second closed previous-only exception accepts the retained 0.1.17 / build
+Another closed previous-only exception accepts the retained 0.1.17 / build
 1023 RC2 DMG, SHA-256
 `125a15da9b0e260ec3797527d6b98e15aa1172e8b6fc8e7942d2a799cc2b29b0`,
 49,574,961 bytes, source `3d9055fc8e58c84f8ba71feb5deb58b52c532138`.

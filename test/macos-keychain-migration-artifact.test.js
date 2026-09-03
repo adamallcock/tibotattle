@@ -10,6 +10,7 @@ import {
   createReleaseChannelProvenance,
   getReleaseChannel,
   INTERNAL_DOGFOOD_RELEASE_CHANNEL,
+  STABLE_RELEASE_CHANNEL,
 } from "../config/release-channels.js";
 import {
   MACOS_KEYCHAIN_MIGRATION_HELPER,
@@ -22,7 +23,10 @@ import {
 import {
   createMacOSSignedReplacementContract,
   inspectMacOSApp,
+  validateInstalledMacOSApp,
+  validateMacOSDMG,
   validateMacOSKeychainMigrationSignatureDescriptions,
+  validateMacOSSignedReleaseArtifact,
   validateMacOSSignedReplacementPair,
   verifyMacOSKeychainMigrationSignatures,
 } from "../scripts/macos-release-core.js";
@@ -361,6 +365,352 @@ test("callers cannot forge the previous-only helper compatibility capability", a
   await assert.rejects(inspectMacOSApp("/synthetic/TiboTattle.app", forged), {
     code: "MACOS_KEYCHAIN_MIGRATION_COMPATIBILITY_INVALID",
   });
+});
+
+function legacyStablePreviousManifest() {
+  // Public historical release metadata only; never read the real DMG or user state.
+  const previous = preMigrationPreviousManifest();
+  previous.application.bundleVersion = "0.1.16";
+  previous.application.shortVersion = "0.1.16";
+  previous.artifact = {
+    bytes: 49_341_389,
+    fileName: "TiboTattle-0.1.16-macOS-arm64.dmg",
+    sha256: "5e3e60402ffa3c61d8279f5f759548a8b48084f1ae567eeb1b30156c7f30a9fe",
+  };
+  previous.build = {
+    sourceSha256: "95de0721e5a29ab0988535a55935e516012e9230185bab79d1504b24fc59513a",
+    payloadSha256: "23f41a17bc6f4fede452e53f61972999b7ea144e732cd59807d77aca2ada20e5",
+  };
+  previous.source.commit = "4f30508eff55c122e73025ad06d73b33cadbc508";
+  previous.source.tag = "v0.1.16";
+  previous.updater.publicEdKeySha256 =
+    "ae8a8e00311a4cfc1e7e7f2eedcf7fa53d6bc197997c912a0b8f908e54a28fbf";
+  previous.channel = createReleaseChannelProvenance(STABLE_RELEASE_CHANNEL, {
+    publicEdKeySha256: previous.updater.publicEdKeySha256,
+  });
+  previous.updater.appcastURL = previous.channel.sparkle.appcastURL;
+  return previous;
+}
+
+function stableReplacementCandidate() {
+  const candidate = legacyStablePreviousManifest();
+  candidate.application.bundleVersion = "1024";
+  candidate.application.shortVersion = "0.1.17";
+  candidate.artifact = { bytes: 128, fileName: "candidate.dmg", sha256: "c".repeat(64) };
+  candidate.source.commit = "d".repeat(40);
+  candidate.source.tag = "v0.1.17";
+  return candidate;
+}
+
+test("historical stable compatibility pins every previous receipt field and rejects candidate use", async () => {
+  const previous = legacyStablePreviousManifest();
+  const candidate = stableReplacementCandidate();
+  assert.equal(validateMacOSSignedReplacementPair({
+    previousManifest: previous, candidateManifest: candidate,
+  }).previousBundleVersion, "0.1.16");
+  for (const [section, key, value] of [
+    ["application", "bundleIdentifier", "com.example.other"],
+    ["application", "bundleVersion", "1022"],
+    ["application", "shortVersion", "0.1.15"],
+    ["artifact", "bytes", previous.artifact.bytes - 1],
+    ["artifact", "sha256", "e".repeat(64)],
+    ["artifact", "fileName", "repacked.dmg"],
+    ["source", "commit", "f".repeat(40)],
+    ["source", "repository", "https://github.com/example/other"],
+    ["source", "tag", "v0.1.15"],
+    ["build", "sourceSha256", "a".repeat(64)],
+    ["build", "payloadSha256", "b".repeat(64)],
+    ["updater", "frameworkSha256", "c".repeat(64)],
+    ["updater", "publicEdKeySha256", "d".repeat(64)],
+    ["updater", "appcastURL", "https://updates.example/other.xml"],
+    ["updater", "verifyBeforeExtraction", false],
+    ...Object.keys(previous.assurances).map((key) => ["assurances", key, false]),
+  ]) {
+    const changed = structuredClone(previous);
+    changed[section][key] = value;
+    assert.throws(() => validateMacOSSignedReplacementPair({
+      previousManifest: changed, candidateManifest: candidate,
+    }), (error) => error.code?.startsWith("MACOS_"), `${section}.${key}`);
+  }
+  for (const key of ["source", "build"]) {
+    const changed = structuredClone(previous);
+    delete changed[key];
+    assert.throws(() => validateMacOSSignedReplacementPair({
+      previousManifest: changed, candidateManifest: candidate,
+    }), { code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" });
+  }
+  assert.throws(() => validateMacOSSignedReplacementPair({
+    previousManifest: candidate, candidateManifest: previous,
+  }), { code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" });
+  const root = await mkdtemp(join(await realpath(tmpdir()), "tibotattle-stable-previous-"));
+  try {
+    const path = join(root, "historical.json");
+    await writeFile(path, JSON.stringify(previous));
+    await assert.rejects(validateMacOSSignedReleaseArtifact({
+      releaseManifestPath: path,
+      validateArtifact() { assert.fail("historical stable must never reach the public installer"); },
+    }), { code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the public legacy boolean and forged stable capability cannot bypass artifact authorization", async () => {
+  for (const [validate, code] of [
+    [inspectMacOSApp, "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID"],
+    [validateInstalledMacOSApp, "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID"],
+    [validateMacOSDMG, "MACOS_DMG_DISTRIBUTION_INVALID"],
+  ]) {
+    await assert.rejects(validate(null, {
+      allowLegacyUnsealedSource: true, channel: STABLE_RELEASE_CHANNEL,
+      requireExternalDistribution: true, production: true,
+    }), { code }, "a bare boolean must fail before path resolution");
+    const options = new Proxy({}, {
+      get(target, key) {
+        if (typeof key === "symbol"
+            && key.description === "verified legacy stable previous artifact") return {};
+        return target[key];
+      },
+    });
+    await assert.rejects(validate(null, options), {
+      code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
+    });
+  }
+});
+
+function releaseSourceSection(source, startMarker, endMarker) {
+  const start = source.indexOf(startMarker);
+  const end = source.indexOf(endMarker, start);
+  assert.equal(start >= 0 && end > start, true, startMarker);
+  return source.slice(start, end).replace(/^export /u, "");
+}
+
+test("historical receipt artifact reading rejects changed DMG bytes and size before granting authority", async () => {
+  const source = await readFile(join(REPOSITORY_ROOT, "scripts/macos-release-core.js"), "utf8");
+  const readerSource = releaseSourceSection(source,
+    "async function readReplacementReleaseArtifact(", "\n/**\n * Validate one exact public release artifact");
+  const previous = legacyStablePreviousManifest();
+  for (const [size, digest, accepted] of [
+    [previous.artifact.bytes, previous.artifact.sha256, true],
+    [previous.artifact.bytes - 1, previous.artifact.sha256, false],
+    [previous.artifact.bytes, "0".repeat(64), false],
+  ]) {
+    const readArtifact = runInNewContext(`(${readerSource})`, {
+      resolve, dirname, join,
+      regularPath: async () => ({ size }),
+      readFile: async () => JSON.stringify(previous),
+      sha256File: async () => digest,
+      validateSignedReleaseManifest(manifest) {
+        validateMacOSSignedReplacementPair({
+          previousManifest: manifest, candidateManifest: stableReplacementCandidate(),
+        });
+      },
+      fail(message, code) { throw Object.assign(new Error(message), { code }); },
+    });
+    const reading = readArtifact("/synthetic/previous.json", "Previous release");
+    if (accepted) assert.equal((await reading).manifest.artifact.sha256, previous.artifact.sha256);
+    else await assert.rejects(reading, { code: "MACOS_REPLACEMENT_ARTIFACT_INVALID" });
+  }
+});
+
+test("historical stable DMG validation rechecks exact bytes before native trust commands", async () => {
+  const source = await readFile(join(REPOSITORY_ROOT, "scripts/macos-release-core.js"), "utf8");
+  const dmgSource = releaseSourceSection(source,
+    "export async function validateMacOSDMG(", "\nasync function writeAtomic(");
+  const pin = releaseSourceSection(source,
+    "const LEGACY_STABLE_PREVIOUS_RELEASE =", "// This immutable rc2");
+  const capabilityValidator = releaseSourceSection(source,
+    "function validateLegacyStablePreviousCapability(", "\nfunction resolveOperationalReleaseChannel(");
+  const previous = legacyStablePreviousManifest();
+  const nativeBoundary = new Error("synthetic native trust boundary");
+  for (const [size, digest, channel, accepted] of [
+    [previous.artifact.bytes, previous.artifact.sha256, STABLE_RELEASE_CHANNEL, true],
+    [previous.artifact.bytes - 1, previous.artifact.sha256, STABLE_RELEASE_CHANNEL, false],
+    [previous.artifact.bytes, "0".repeat(64), STABLE_RELEASE_CHANNEL, false],
+    [previous.artifact.bytes, previous.artifact.sha256, INTERNAL_DOGFOOD_RELEASE_CHANNEL, false],
+  ]) {
+    const harness = runInNewContext(`${pin}\n${capabilityValidator}\n${dmgSource}\n`
+      + "const token = Object.freeze({}); VERIFIED_LEGACY_STABLE_CAPABILITIES.add(token);"
+      + "({ validateMacOSDMG, options: { [VERIFIED_LEGACY_STABLE_PREVIOUS_ARTIFACT]: token } })", {
+      resolve, PRODUCT_BRAND, STABLE_RELEASE_CHANNEL,
+      VERIFIED_LEGACY_DOGFOOD_PREVIOUS_ARTIFACT: Symbol("synthetic dogfood"),
+      VERIFIED_PRE_MIGRATION_PREVIOUS_ARTIFACT: Symbol("synthetic pre-migration"),
+      validateLegacyDogfoodPreviousCapability: () => false,
+      validatePreMigrationPreviousCapability: () => false,
+      DMG_DISTRIBUTIONS: { release: "release", preview: "preview", development: "development" },
+      regularPath: async () => ({ size }),
+      sha256File: async () => digest,
+      runMacOSReleaseCommand() { throw nativeBoundary; },
+      fail(message, code) { throw Object.assign(new Error(message), { code }); },
+    });
+    const validation = harness.validateMacOSDMG("/synthetic/previous.dmg", {
+      ...harness.options, channel, production: true,
+    });
+    await assert.rejects(validation, accepted ? (error) => error === nativeBoundary : {
+      code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
+    });
+  }
+});
+
+test("stable previous capabilities expire on success and failure before candidate validation", async () => {
+  const source = await readFile(join(REPOSITORY_ROOT, "scripts/macos-release-core.js"), "utf8");
+  const orchestration = releaseSourceSection(source,
+    "export async function validateMacOSSignedReplacementArtifacts(", "\nfunction releaseEnvironment(");
+  const pin = releaseSourceSection(source,
+    "const LEGACY_STABLE_PREVIOUS_RELEASE =", "// This immutable rc2");
+  const capabilityValidator = releaseSourceSection(source,
+    "function validateLegacyStablePreviousCapability(", "\nfunction resolveOperationalReleaseChannel(");
+  const isExact = releaseSourceSection(source,
+    "function isExactLegacyStablePreviousRelease(", "\nfunction isExactPreMigrationDogfoodPreviousRelease(");
+  const previous = { artifact: "/synthetic/previous.dmg", manifest: legacyStablePreviousManifest() };
+  const candidate = { artifact: "/synthetic/candidate.dmg", manifest: stableReplacementCandidate() };
+  for (const rejectPrevious of [false, true]) {
+    const harness = runInNewContext(`${pin}\n${capabilityValidator}\n${isExact}\n${orchestration}\n`
+      + "({ validateMacOSSignedReplacementArtifacts, validateLegacyStablePreviousCapability })", {
+      STABLE_RELEASE_CHANNEL,
+      BUNDLE_IDENTIFIER: PRODUCT_BRAND.bundleIdentifier,
+      PUBLIC_RELEASE_SOURCE_REPOSITORY: previous.manifest.source.repository,
+      isExactLegacyDogfoodPreviousRelease: () => false,
+      isExactPreMigrationDogfoodPreviousRelease: () => false,
+      validateMacOSSignedReplacementPair,
+      readReplacementReleaseArtifact: async (path) => path === "previous" ? previous : candidate,
+      fail(message, code) { throw Object.assign(new Error(message), { code }); },
+    });
+    let captured = null;
+    const calls = [];
+    const validation = harness.validateMacOSSignedReplacementArtifacts({
+      previousReleaseManifestPath: "previous", candidateReleaseManifestPath: "candidate",
+      async validateArtifact(path, options) {
+        calls.push(path);
+        if (path === previous.artifact) {
+          const keys = Object.getOwnPropertySymbols(options);
+          assert.equal(keys.length, 1);
+          captured = options[keys[0]];
+          assert.equal(harness.validateLegacyStablePreviousCapability(captured), true);
+          assert.equal(options.allowLegacyUnsealedSource, true);
+          if (rejectPrevious) throw new Error("synthetic native rejection");
+        } else {
+          assert.equal(Object.getOwnPropertySymbols(options).length, 0);
+          assert.equal(options.allowLegacyUnsealedSource, false);
+          assert.throws(() => harness.validateLegacyStablePreviousCapability(captured), {
+            code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
+          });
+        }
+      },
+    });
+    if (rejectPrevious) await assert.rejects(validation, /synthetic native rejection/u);
+    else await validation;
+    assert.deepEqual(calls, rejectPrevious ? [previous.artifact] : [previous.artifact, candidate.artifact]);
+    assert.throws(() => harness.validateLegacyStablePreviousCapability(captured), {
+      code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
+    });
+  }
+});
+
+test("historical stable inspection binds the app build digests before accepting legacy payload shape", async () => {
+  const source = await readFile(join(REPOSITORY_ROOT, "scripts/macos-release-core.js"), "utf8");
+  const inspectorSource = releaseSourceSection(source,
+    "export async function inspectMacOSApp(", "\nexport function readMacOSReleaseCredentials(");
+  const pin = releaseSourceSection(source,
+    "const LEGACY_STABLE_PREVIOUS_RELEASE =", "// This immutable rc2");
+  const capabilityValidator = releaseSourceSection(source,
+    "function validateLegacyStablePreviousCapability(", "\nfunction resolveOperationalReleaseChannel(");
+  const previous = legacyStablePreviousManifest();
+  const manifest = {
+    schemaVersion: "usage-monitor-macos-app-build-v0.1",
+    application: previous.application,
+    inputs: { sourceSha256: previous.build.sourceSha256 },
+    payload: { payloadSha256: previous.build.payloadSha256 },
+    release: { updater: previous.updater },
+  };
+  const payloadBoundary = new Error("synthetic payload verification boundary");
+  for (const mutation of [
+    null,
+    (value) => { value.inputs.sourceSha256 = "a".repeat(64); },
+    (value) => { value.payload.payloadSha256 = "b".repeat(64); },
+    (value) => { value.application.bundleVersion = "1024"; },
+    (value) => { value.application.shortVersion = "0.1.17"; },
+    (value) => { value.release.source = { commit: previous.source.commit, tag: previous.source.tag }; },
+    (value) => { value.release.updater.publicEdKeySha256 = "c".repeat(64); },
+    (value) => { value.release.updater.frameworkSha256 = "d".repeat(64); },
+  ]) {
+    const changed = structuredClone(manifest);
+    if (mutation) mutation(changed);
+    const harness = runInNewContext(`${pin}\n${capabilityValidator}\n${inspectorSource}\n`
+      + "const token = Object.freeze({}); VERIFIED_LEGACY_STABLE_CAPABILITIES.add(token);"
+      + "({ inspectMacOSApp, options: { [VERIFIED_LEGACY_STABLE_PREVIOUS_ARTIFACT]: token } })", {
+      resolve, join, basename: (path) => path.split("/").at(-1),
+      STABLE_RELEASE_CHANNEL,
+      APP_NAME: PRODUCT_BRAND.bundleName,
+      BUNDLE_IDENTIFIER: PRODUCT_BRAND.bundleIdentifier,
+      BUILD_MANIFEST_PATH: "Contents/Resources/build-manifest.json",
+      BUILD_MANIFEST_SCHEMA: "usage-monitor-macos-app-build-v0.1",
+      VERIFIED_LEGACY_DOGFOOD_PREVIOUS_ARTIFACT: Symbol("synthetic dogfood"),
+      VERIFIED_PRE_MIGRATION_PREVIOUS_ARTIFACT: Symbol("synthetic pre-migration"),
+      validateLegacyDogfoodPreviousCapability: () => false,
+      validatePreMigrationPreviousCapability: () => false,
+      regularPath: async () => {},
+      readFile: async () => JSON.stringify(changed),
+      verifyMacOSBuildPayload() { throw payloadBoundary; },
+      fail(message, code) { throw Object.assign(new Error(message), { code }); },
+    });
+    await assert.rejects(harness.inspectMacOSApp("/synthetic/TiboTattle.app", {
+      ...harness.options, requireExternalDistribution: true,
+    }), mutation === null ? (error) => error === payloadBoundary : {
+      code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
+    });
+  }
+});
+
+test("stable previous payload compatibility accepts only the exact normalized Keytar tuple", async () => {
+  const source = await readFile(join(REPOSITORY_ROOT, "scripts/macos-release-core.js"), "utf8");
+  const payloadSource = releaseSourceSection(source,
+    "async function verifyMacOSBuildPayload(", "\nfunction parsePlist(");
+  const pinSource = releaseSourceSection(source,
+    "const LEGACY_STABLE_PREVIOUS_RELEASE =", "// This immutable rc2");
+  const nativeInventoryReached = new Error("synthetic native inventory boundary");
+  const token = Object.freeze({});
+  const harness = runInNewContext(`${pinSource}\n${payloadSource}\n`
+    + "({ verifyMacOSBuildPayload, keytar: LEGACY_STABLE_PREVIOUS_RELEASE.keytar })", {
+    validateLegacyDogfoodPreviousCapability: () => false,
+    validatePreMigrationPreviousCapability: () => false,
+    validateLegacyStablePreviousCapability: (value) => value === token,
+    assertMacOSKeychainMigrationManifest,
+    MACOS_KEYCHAIN_MIGRATION_HELPER,
+    BASE_NORMALIZED_MACH_O_PATHS: [MACOS_KEYCHAIN_MIGRATION_HELPER.executable],
+    NORMALIZED_MACH_O_PATHS: new Set([MACOS_KEYCHAIN_MIGRATION_HELPER.executable]),
+    BUILD_MANIFEST_PATH: "Contents/Resources/build-manifest.json",
+    CODE_RESOURCES_PATH: "Contents/_CodeSignature/CodeResources",
+    validateManifestPayloadPath() {},
+    walkMacOSPayload() { throw nativeInventoryReached; },
+    fail(message, code) { throw Object.assign(new Error(message), { code }); },
+  });
+  const manifest = {
+    payload: {
+      files: [{ ...harness.keytar, normalization: "mach_o_without_code_signature" }],
+      links: [], totalBytes: harness.keytar.bytes, payloadSha256: "a".repeat(64),
+    },
+  };
+  await assert.rejects(harness.verifyMacOSBuildPayload("/synthetic", manifest, null, null, token),
+    (error) => error === nativeInventoryReached,
+    "exact historical inventory must continue to unchanged filesystem/byte verification");
+  for (const [key, value] of [
+    ["bytes", harness.keytar.bytes - 1], ["mode", "755"], ["sha256", "b".repeat(64)],
+    ["normalization", "raw"], ["path", "Contents/Resources/other.node"],
+  ]) {
+    const changed = structuredClone(manifest);
+    changed.payload.files[0][key] = value;
+    await assert.rejects(harness.verifyMacOSBuildPayload("/synthetic", changed, null, null, token), {
+      code: "MACOS_PAYLOAD_INTEGRITY_FAILED",
+    }, key);
+  }
+  const missing = structuredClone(manifest);
+  missing.payload.files = [];
+  await assert.rejects(harness.verifyMacOSBuildPayload("/synthetic", missing, null, null, token), {
+    code: "MACOS_PAYLOAD_INTEGRITY_FAILED",
+  });
+  await assert.rejects(harness.verifyMacOSBuildPayload("/synthetic", manifest), ARTIFACT_ERROR,
+    "without historical authority the current migration helper remains mandatory");
 });
 
 test("native helper compilation and inside-out signing exclude keytar and Node runtime exceptions", async () => {
