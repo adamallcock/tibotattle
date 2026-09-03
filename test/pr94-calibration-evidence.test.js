@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
+import * as quota from "../packages/quota-analysis/index.js";
+import * as miner from "../src/codex-transition-miner.js";
+import { buildPr94QuotaGroups, derivePr94BatchedTransitions } from "../scripts/lib/pr94-analysis-worker.mjs";
 import {
   buildPr94CalibrationEvidence, comparePr94CalibrationEvidence,
   iteratePr94CalibrationPrivateFrames, importPr94CalibrationEvidence,
@@ -200,6 +203,54 @@ test("PR94 zero-transition parents require demonstrated reasons; ambiguous disap
   assert.equal(unexplained.status, "fail");
   assert.equal(unexplained.counts.unexplainedParents, 1);
   assert.equal(comparePr94CalibrationEvidence(unexplained, unexplained).status, "fail");
+});
+
+test("PR94 original miner proves no within-era percentage change across a Pro Plus Pro switch", async (t) => {
+  const start = Date.parse("2026-08-25T00:00:00.000Z");
+  const snapshot = (hour, percent, planType = "pro", duration = 10_080) => ({
+    timestamp: new Date(start + hour * 3_600_000).toISOString(), timestampMs: start + hour * 3_600_000,
+    window: { provider: "openai_codex", planType, limitId: "codex", slot: "primary",
+      windowDurationMins: duration, resetsAt: RESET, usedPercent: percent },
+  });
+  const snapshots = [snapshot(0, 0), snapshot(1, 0), snapshot(2, 0, "plus", 300), snapshot(3, 1), snapshot(4, 1)];
+  const grouped = buildPr94QuotaGroups(snapshots, { quota, revisionKind: "final" });
+  const unsupported = evidence([], { rawParents: grouped.rawParents });
+  t.after(() => disposePr94CalibrationEvidencePrivate(unsupported));
+  assert.equal(unsupported.status, "fail");
+  assert.equal(candidate(unsupported).outcomes.unexplained_no_transition, 1);
+  const derived = await derivePr94BatchedTransitions({ modules: { miner }, usage: [], grouped,
+    startAt: SCOPE.startAt, endAt: SCOPE.endAt });
+  assert.deepEqual(derived.transitions, []);
+  assert.deepEqual(grouped.rawParents[0].derivationEvidence, {
+    groupCount: 2, snapshotCount: 4, transitionCount: 0, zeroTransitionGroupCount: 2,
+  });
+  const explained = evidence(derived.transitions, { rawParents: grouped.rawParents });
+  t.after(() => disposePr94CalibrationEvidencePrivate(explained));
+  assert.equal(explained.status, "pass");
+  assert.equal(explained.counts.unexplainedParents, 0);
+  assert.ok(explained.candidates.every((item) => item.outcomes.no_within_era_percent_change === 1));
+  const compared = comparePr94CalibrationEvidence(explained, explained);
+  assert.ok(compared.primaryOutcomeMatrix.every((cell) => cell.afterOutcomes[0].outcome === "no_within_era_percent_change"));
+  assert.doesNotMatch(JSON.stringify(explained), /eraKey|2026-|resetsAt|derivationEvidence/);
+});
+
+test("PR94 refuses unsupported, inconsistent or positive derivation summaries for an empty parent", () => {
+  const raw = rawParent(rows()[0]);
+  const valid = { groupCount: 2, snapshotCount: 13, transitionCount: 0, zeroTransitionGroupCount: 2 };
+  const mutations = [
+    { ...valid, extra: 1 }, { ...valid, snapshotCount: 12 }, { ...valid, groupCount: 14 },
+    { ...valid, groupCount: 0 }, { ...valid, zeroTransitionGroupCount: 1 },
+    { ...valid, transitionCount: 1, zeroTransitionGroupCount: 1 },
+    { ...valid, transitionCount: Number.MAX_SAFE_INTEGER },
+  ];
+  for (const derivationEvidence of mutations) {
+    assert.throws(() => evidence([], { rawParents: [{ ...raw, derivationEvidence }] }),
+      isCode("pr94_calibration_snapshot_partition_invalid"));
+  }
+  const single = evidence([], { rawParents: [{ ...raw, derivationEvidence: { ...valid, groupCount: 1, zeroTransitionGroupCount: 1 } }] });
+  assert.equal(single.status, "fail");
+  assert.equal(candidate(single).outcomes.unexplained_no_transition, 1);
+  disposePr94CalibrationEvidencePrivate(single);
 });
 
 test("PR94 rejects incompatible raw snapshot partitions and unknown transition parents", () => {

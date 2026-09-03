@@ -22,7 +22,7 @@ const OUTCOMES = Object.freeze([
   "aggregation_diagnostic_only", "insufficient_unique_boundaries", "insufficient_percent_span",
   "training_capacity_unavailable", "insufficient_training_pairs", "full_capacity_unavailable",
   "relative_width_unavailable", "relative_width_exceeded", "insufficient_snapshots",
-  "no_percent_change", "all_snapshot_attribution_withheld", "unexplained_no_transition",
+  "no_percent_change", "no_within_era_percent_change", "all_snapshot_attribution_withheld", "unexplained_no_transition",
 ]);
 const ROW_REASONS = Object.freeze([
   "eligible", "aggregation_diagnostic_only", "non_increasing_percent", "no_usage",
@@ -215,15 +215,31 @@ function noTransitionReason(raw) {
       || matched + conflicted + unavailable !== total) {
     fail("pr94_calibration_snapshot_partition_invalid");
   }
-  if (matched === 0 && total > 0) return "all_snapshot_attribution_withheld";
   const matchedUnique = raw.matchedUniqueSnapshotCount ?? (matched === total ? unique : null);
   const matchedDistinct = raw.matchedDistinctPercentCount ?? (matched === total ? distinct : null);
   if (matchedUnique !== null && (count(matchedUnique) > matched
       || (matchedDistinct !== null && count(matchedDistinct) > matchedUnique))) {
     fail("pr94_calibration_snapshot_partition_invalid");
   }
+  const derived = raw.derivationEvidence;
+  if (derived !== undefined) {
+    const keys = ["groupCount", "snapshotCount", "transitionCount", "zeroTransitionGroupCount"];
+    if (!equal(recordKeys(derived).sort(), [...keys].sort())) fail("pr94_calibration_snapshot_partition_invalid");
+    for (const key of keys) if (count(derived[key]) > 1_000_000) fail("pr94_calibration_snapshot_partition_invalid");
+    if (matchedUnique === null || derived.snapshotCount !== matchedUnique
+        || derived.groupCount > derived.snapshotCount
+        || (derived.groupCount === 0) !== (derived.snapshotCount === 0)
+        || derived.transitionCount > derived.snapshotCount - derived.groupCount
+        || derived.zeroTransitionGroupCount > derived.groupCount
+        || (derived.transitionCount === 0) !== (derived.zeroTransitionGroupCount === derived.groupCount)) {
+      fail("pr94_calibration_snapshot_partition_invalid");
+    }
+  }
+  if (matched === 0 && total > 0) return "all_snapshot_attribution_withheld";
   if (matchedUnique !== null && matchedUnique < 2) return "insufficient_snapshots";
   if (matchedDistinct !== null && matchedDistinct < 2) return "no_percent_change";
+  if (derived && derived.groupCount > 1 && derived.transitionCount === 0
+      && matchedDistinct !== null && matchedDistinct >= 2) return "no_within_era_percent_change";
   return "unexplained_no_transition";
 }
 
@@ -263,7 +279,7 @@ export function buildPr94CalibrationEvidence(options) {
     const id = parentKey(raw, hmacKey);
     if (parents.has(id)) fail("pr94_calibration_duplicate_parent");
     const reason = noTransitionReason(raw); // Validate every raw partition, not only empty parents.
-    parents.set(id, { raw, reason, frames: candidates.map((candidate) => ({
+    parents.set(id, { raw, reason, transitionRows: 0, frames: candidates.map((candidate) => ({
       kind: "parent", parentKey: id, candidateId: candidate.id, planType: plan(raw.planType),
       accountKnown: accountKnown(raw.accountScopeId),
       snapshotCount: raw.snapshotCount, fragments: [], noTransitionReason: null,
@@ -273,12 +289,20 @@ export function buildPr94CalibrationEvidence(options) {
   const groupedRows = new Map();
   const rowReasons = emptyCounts(ROW_REASONS);
   for (const row of weekly) {
-    if (!parents.has(parentKey(row, hmacKey))) fail("pr94_calibration_transition_parent_missing");
+    const parent = parents.get(parentKey(row, hmacKey));
+    if (!parent) fail("pr94_calibration_transition_parent_missing");
+    parent.transitionRows += 1;
     const group = groupKey(row, internals);
     const rows = groupedRows.get(group) ?? [];
     rows.push(row);
     groupedRows.set(group, rows);
     rowReasons[eligibleReason(row, internals)] += 1;
+  }
+  for (const parent of parents.values()) {
+    if (parent.raw.derivationEvidence !== undefined
+        && parent.raw.derivationEvidence.transitionCount !== parent.transitionRows) {
+      fail("pr94_calibration_snapshot_partition_invalid");
+    }
   }
   if (groupedRows.size > LIMITS.fragments) fail("pr94_calibration_fragment_limit");
   const actualPlans = [...new Set(rawParents.map((row) => row.planType ?? "unknown"))].sort();

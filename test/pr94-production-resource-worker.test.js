@@ -5,19 +5,27 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY } from "../src/replay-safe-accounting-cache.js";
+import * as readerModule from "../src/local-unified-accounting-source.js";
+import { openLocalUnifiedIndex } from "../src/local-unified-index.js";
 import {
   PR94_PRODUCTION_ERROR_CODES,
   buildPr94ProductionResourceRequest,
+  collectPr94AttributionQueryPlans,
   projectPr94ProductionCache,
   runPr94ProductionResourceWorker,
+  validatePr94AttributionQueryPlans,
   validatePr94ProductionResourceEvidence,
 } from "../scripts/lib/pr94-production-resource-worker.mjs";
 
 // All orchestration adapters below are synthetic. No revision child, real
-// database, corpus, native app, credentials or external process is executed.
+// private database, corpus, native app, credentials or external process is used.
+// The query-plan integration test creates its own empty synthetic SQLite index.
 const START = "2025-08-01T00:00:00.000Z";
 const END = "2026-08-01T00:00:00.000Z";
 const REVISION = "a".repeat(40);
+const BEFORE_REVISION = "a3c850360bc83c0e27bef2171aeb4a302b72f472";
+const AFTER_REVISION = "20f449ff5c222989029fe343f219f02b497ae1d4";
+const QUERY_ROLES = ["membership", "same_record_plans", "source_predecessor", "session_predecessor"];
 const SHA = "b".repeat(64);
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const clone = (value) => structuredClone(value);
@@ -28,7 +36,14 @@ const GENERATION = Object.freeze({ id: 44, fingerprint: `generation-v2-${SHA}`, 
   diagnosticsComplete: true, usageProvenanceComplete: true, sourceOrderComplete: true, quotaProvenanceComplete: true,
   indexedSourceCount: 3, indexedSourceBytes: 1000, skippedSourceCount: 0, skippedSourceBytes: 0,
   skippedThreadCount: 0, usageEvents: 2, quotaOccurrences: 1, toolFacts: 0 });
-const METADATA = Object.freeze({ policy: POLICY, generation: GENERATION, requestVersion: "replay-safe-accounting-rebuild-request-v1" });
+function queryPlans(revision = REVISION) {
+  return { schema: "pr94-attribution-query-plans-v1", scope: "attribution_point_queries_explain_only", binding: "synthetic",
+    status: revision === BEFORE_REVISION ? "feature_absent" : "observed",
+    statements: revision === BEFORE_REVISION ? null : Object.fromEntries(QUERY_ROLES.map((role) => [role,
+      { steps: 1, search: 1, scan: 0, tempSort: 0, other: 0 }])) };
+}
+const METADATA = Object.freeze({ policy: POLICY, generation: GENERATION,
+  requestVersion: "replay-safe-accounting-rebuild-request-v1", queryPlans: queryPlans() });
 const SOURCE = Object.freeze({ revision: REVISION,
   dependencies: { sourceSha256: SHA, runtimeSha256: SHA, lockSha256: SHA, identitySha256: SHA } });
 const CONTEXT = Object.freeze({ startAt: START, endAt: END, generationId: 44, generationFingerprint: GENERATION.fingerprint });
@@ -48,7 +63,7 @@ function cache(encoding = "accounting_compact_v3") {
     extraDiagnostic: "SYNTHETIC_PRIVATE" };
 }
 
-async function fixture(action, { encoding = "accounting_compact_v3" } = {}) {
+async function fixture(action, { encoding = "accounting_compact_v3", revision = REVISION } = {}) {
   const directory = await realpath(await mkdtemp(join(tmpdir(), "pr94-production-resource-test-")));
   try {
     const inputDirectory = join(directory, "input");
@@ -56,17 +71,17 @@ async function fixture(action, { encoding = "accounting_compact_v3" } = {}) {
     const indexFile = join(inputDirectory, "synthetic.sqlite");
     const input = "synthetic offline index bytes, not SQLite";
     await writeFile(indexFile, input, { mode: 0o400 });
-    const options = { privateOperationApproved: true, root: join(directory, "synthetic-source"), expectedRevision: REVISION,
+    const options = { privateOperationApproved: true, root: join(directory, "synthetic-source"), expectedRevision: revision,
       indexFile, expectedIndex: { sha256: hash(input), bytes: Buffer.byteLength(input), generationId: 44 },
       outputDirectory: join(directory, "output"), startAt: START, endAt: END, timeoutSeconds: 30 };
     const calls = []; const probes = []; const identities = [];
     const artifact = JSON.stringify(cache(encoding));
     const adapters = {
       runtime: RUNTIME,
-      inspectSource: async (root) => { identities.push(root); return clone(SOURCE); },
+      inspectSource: async (root) => { identities.push(root); return { ...clone(SOURCE), revision }; },
       probe: async (request) => {
         probes.push(request);
-        return request.stage === "metadata" ? clone(METADATA)
+        return request.stage === "metadata" ? { ...clone(METADATA), queryPlans: queryPlans(revision) }
           : projectPr94ProductionCache(JSON.parse(await readFile(request.path, "utf8")), request.context);
       },
       command: async (command, args, configuration) => {
@@ -151,6 +166,9 @@ test("orchestration times only two unmodified production child processes, with e
     assert.equal(receipt.exactRepeatOutput, true);
     assert.equal(calls.length, 2);
     assert.equal(probes.length, 4);
+    assert.deepEqual(probes.filter(({ stage }) => stage === "metadata").map(({ context }) => context),
+      [{ revision: REVISION, observedAtMs: Date.parse(END) }, { revision: REVISION, observedAtMs: Date.parse(END) }]);
+    assert.deepEqual(receipt.queryPlans, queryPlans());
     assert.equal(identities.length, 2);
     const requests = [];
     for (const { command, args, configuration } of calls) {
@@ -181,7 +199,8 @@ test("baseline compact-v2 child artifacts remain valid in their own lane", async
     const receipt = await runPr94ProductionResourceWorker(options, adapters);
     assert.equal(receipt.runs[0].cache.schemaVersion, "local-replay-safe-accounting-v0.13");
     assert.equal(receipt.runs[0].cache.weeklyInput.encoding, "accounting_compact_v2");
-  }, { encoding: "accounting_compact_v2" });
+    assert.deepEqual(receipt.queryPlans, queryPlans(BEFORE_REVISION));
+  }, { encoding: "accounting_compact_v2", revision: BEFORE_REVISION });
 });
 
 test("approval, pinned revision, runtime and expected copied-index identity fail before child execution", async () => {
@@ -331,6 +350,169 @@ test("closed resource receipt rejects unknown keys, fabricated scope, unsafe val
       (value) => { value.indexUnchanged = false; },
       (value) => { value.notMeasured = []; },
       (value) => { value.generation.toolProvenanceComplete = "true"; },
+      (value) => { delete value.queryPlans; },
+      (value) => { value.queryPlans = queryPlans(BEFORE_REVISION); },
+      (value) => { value.queryPlans.statements.membership.sql = "SYNTHETIC_PRIVATE"; },
     ]) { const changed = clone(good); mutate(changed); assert.throws(() => validatePr94ProductionResourceEvidence(changed)); }
+  });
+});
+
+function explainFixture(details = ["SEARCH synthetic USING INDEX synthetic (key=?)"]) {
+  const calls = [];
+  return {
+    calls,
+    options: { readerModule, generationId: 44, observedAtMs: Date.parse(END), revision: REVISION,
+      database: { prepare(sql) {
+        assert.match(sql, /^EXPLAIN QUERY PLAN\s+SELECT\b/u, "no data SELECT is executed");
+        return { *iterate(...parameters) {
+          calls.push({ sql, parameters });
+          for (const [index, detail] of details.entries()) yield { id: index + 1, parent: 0, notused: 0, detail };
+        } };
+      } },
+    },
+  };
+}
+
+test("EXPLAIN adapter drives exactly four original public-reader queries using synthetic bindings", () => {
+  const fixture = explainFixture(["SEARCH SYNTHETIC_PRIVATE_SEARCH", "SCAN SYNTHETIC_PRIVATE_SCAN",
+    "USE TEMP B-TREE FOR ORDER BY SYNTHETIC_PRIVATE_SORT", "SYNTHETIC_PRIVATE_FUTURE_OPERATION"]);
+  const evidence = collectPr94AttributionQueryPlans(fixture.options);
+  assert.equal(validatePr94AttributionQueryPlans(evidence, REVISION), evidence);
+  assert.equal(fixture.calls.length, 4);
+  assert.deepEqual(fixture.calls.map(({ parameters }) => parameters.length), [2, 5, 3, 5]);
+  assert.deepEqual(Object.keys(evidence.statements), QUERY_ROLES);
+  for (const counts of Object.values(evidence.statements)) {
+    assert.deepEqual(counts, { steps: 4, search: 1, scan: 1, tempSort: 1, other: 1 });
+  }
+  assert.ok(fixture.calls.every(({ parameters }) => parameters[0] === 44));
+  assert.equal(fixture.calls[1].parameters.at(-1), Date.parse(END));
+  assert.equal(fixture.calls[3].parameters.at(-1), Date.parse(END));
+  const serialized = JSON.stringify(evidence);
+  for (const excluded of ["SYNTHETIC_PRIVATE", "SELECT", "EXPLAIN", "source_local", "source_ordinal",
+    "source_offset", "session_local", "parameters", "detail", "index", String(Date.parse(END))]) {
+    assert.ok(!serialized.includes(excluded));
+  }
+});
+
+test("actual SQLite plans compile from the unchanged reader against an immutable synthetic schema-11 index", async () => {
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "pr94-explain-only-test-")));
+  const indexFile = join(directory, "synthetic.sqlite");
+  let database;
+  try {
+    openLocalUnifiedIndex(indexFile, { create: true }).close();
+    await chmod(indexFile, 0o400);
+    const before = await readFile(indexFile);
+    database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+    let explained = 0;
+    const evidence = collectPr94AttributionQueryPlans({ readerModule, generationId: 44,
+      observedAtMs: Date.parse(END), revision: REVISION, database: { prepare(sql) {
+        assert.match(sql, /^EXPLAIN QUERY PLAN\s+SELECT\b/u);
+        explained += 1;
+        return database.prepare(sql);
+      } } });
+    assert.equal(explained, 4);
+    assert.equal(evidence.status, "observed");
+    assert.deepEqual(Object.keys(evidence.statements), QUERY_ROLES);
+    assert.ok(Object.values(evidence.statements).every((counts) => counts.steps > 0));
+    database.close(); database = null;
+    assert.deepEqual(await readFile(indexFile), before);
+  } finally {
+    database?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("feature absence is null evidence only at the exact first parent, never after/final zero counters", () => {
+  const fixture = explainFixture();
+  const evidence = collectPr94AttributionQueryPlans({ ...fixture.options, revision: BEFORE_REVISION, readerModule: {} });
+  assert.deepEqual(evidence, queryPlans(BEFORE_REVISION));
+  assert.equal(fixture.calls.length, 0);
+  assert.equal(validatePr94AttributionQueryPlans(evidence, BEFORE_REVISION), evidence);
+  for (const revision of [AFTER_REVISION, REVISION]) {
+    assert.throws(() => collectPr94AttributionQueryPlans({ ...fixture.options, revision, readerModule: {} }),
+      { code: "pr94_production_query_plan_invalid" });
+    assert.throws(() => validatePr94AttributionQueryPlans(evidence, revision));
+  }
+  assert.throws(() => collectPr94AttributionQueryPlans({ ...fixture.options, revision: BEFORE_REVISION }),
+    { code: "pr94_production_query_plan_invalid" });
+  assert.throws(() => validatePr94AttributionQueryPlans(queryPlans(), BEFORE_REVISION));
+});
+
+test("query-plan shape drift, data-query attempts and private SQLite exceptions refuse with a fixed code", () => {
+  for (const mutate of [
+    (options) => { options.revision = "unknown"; },
+    (options) => { options.generationId = 0; },
+    (options) => { options.observedAtMs = NaN; },
+    (options) => { options.database.prepare = () => { throw new Error("SYNTHETIC_PRIVATE_SQL_OR_PATH"); }; },
+    (options) => { options.database.prepare = () => ({ *iterate() { yield { detail: "SEARCH private" }; } }); },
+    (options) => { options.database.prepare = () => ({ *iterate() {} }); },
+    (options) => { options.readerModule = { createLocalUnifiedUsageAttributionReader({ database }) {
+      database.prepare("DELETE FROM synthetic");
+    } }; },
+    (options) => { options.readerModule = { createLocalUnifiedUsageAttributionReader({ database }) {
+      for (let index = 0; index < 5; index += 1) database.prepare("SELECT 1");
+    } }; },
+    (options) => { options.readerModule = { createLocalUnifiedUsageAttributionReader({ database }) {
+      const statement = database.prepare("SELECT 1");
+      return { read() { statement.all(44, Buffer.alloc(32)); } };
+    } }; },
+    (options) => { options.readerModule = { createLocalUnifiedUsageAttributionReader({ database }) {
+      const statement = database.prepare("SELECT 1");
+      return { read() { statement.get(44); } };
+    } }; },
+    (options) => { options.readerModule = { createLocalUnifiedUsageAttributionReader() { return { read() {} }; } }; },
+    (options) => { options.readerModule = { createLocalUnifiedUsageAttributionReader(args) {
+      const original = readerModule.createLocalUnifiedUsageAttributionReader(args);
+      return { read(row) { original.read(row); original.read(row); } };
+    } }; },
+  ]) {
+    const fixture = explainFixture(); mutate(fixture.options);
+    assert.throws(() => collectPr94AttributionQueryPlans(fixture.options),
+      { code: "pr94_production_query_plan_invalid", message: "pr94_production_query_plan_invalid" });
+  }
+});
+
+test("query-plan validator rejects unknown keys, unsafe counts, missing statements and false absence", () => {
+  for (const mutate of [
+    (value) => { value.raw = "SYNTHETIC_PRIVATE"; },
+    (value) => { value.scope = "all_accounting_queries"; },
+    (value) => { value.binding = "real_rows"; },
+    (value) => { value.status = "feature_absent"; },
+    (value) => { value.statements = null; },
+    (value) => { delete value.statements.source_predecessor; },
+    (value) => { value.statements.full_scan = clone(value.statements.membership); },
+    (value) => { value.statements.membership.detail = "SYNTHETIC_PRIVATE"; },
+    (value) => { value.statements.membership.steps = 0; },
+    (value) => { value.statements.membership.scan = NaN; },
+    (value) => { value.statements.membership.scan = Infinity; },
+    (value) => { value.statements.membership.scan = -0; },
+    (value) => { value.statements.membership.scan = Number.MAX_SAFE_INTEGER + 1; },
+    (value) => { value.statements.membership.steps = 2; },
+    (value) => { Object.defineProperty(value.statements.membership, "search", { enumerable: true,
+      get() { assert.fail("getter invoked"); } }); },
+  ]) {
+    const value = queryPlans(); mutate(value);
+    assert.throws(() => validatePr94AttributionQueryPlans(value, REVISION));
+  }
+});
+
+test("query plans are required before timed work and must match the untimed post-run observation", async () => {
+  for (const phase of ["initial", "final"]) await fixture(async ({ options, adapters, calls }) => {
+    const original = adapters.probe; let metadataCalls = 0;
+    adapters.probe = async (request) => {
+      const value = await original(request);
+      if (request.stage === "metadata") {
+        metadataCalls += 1;
+        if (phase === "initial") delete value.queryPlans;
+        else if (metadataCalls === 2) {
+          value.queryPlans.statements.membership.search = 0;
+          value.queryPlans.statements.membership.scan = 1;
+        }
+      }
+      return value;
+    };
+    await assert.rejects(runPr94ProductionResourceWorker(options, adapters),
+      { code: phase === "initial" ? "pr94_production_invalid" : "pr94_production_query_plan_changed" });
+    assert.equal(calls.length, phase === "initial" ? 0 : 2);
   });
 });

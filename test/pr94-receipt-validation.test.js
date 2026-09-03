@@ -9,6 +9,8 @@ const HASH = (character) => character.repeat(64);
 const REVISION = (character) => character.repeat(40);
 const INSTANT_START = "2025-09-01T00:00:00.000Z";
 const INSTANT_END = "2026-09-01T00:00:00.000Z";
+const BEFORE_REVISION = "a3c850360bc83c0e27bef2171aeb4a302b72f472";
+const AFTER_REVISION = "20f449ff5c222989029fe343f219f02b497ae1d4";
 const clone = (value) => structuredClone(value);
 
 function emptyLedger() {
@@ -21,6 +23,7 @@ const OUTCOMES = [
   "aggregation_diagnostic_only", "insufficient_unique_boundaries", "insufficient_percent_span",
   "training_capacity_unavailable", "insufficient_training_pairs", "full_capacity_unavailable",
   "relative_width_unavailable", "relative_width_exceeded", "insufficient_snapshots", "no_percent_change",
+  "no_within_era_percent_change",
   "all_snapshot_attribution_withheld", "unexplained_no_transition",
 ];
 const CANDIDATES = ["standard_api", "speed_lower", "speed_midpoint", "speed_upper"];
@@ -77,6 +80,16 @@ function populatedCalibration(revisionKind, options = {}) {
     hmacKey: CALIBRATION_HMAC_KEY, scope: CALIBRATION_SCOPE, selectedPlanType: options.planType ?? "pro" });
 }
 
+function noWithinEraCalibration(revisionKind) {
+  const first = calibrationRows()[0];
+  return buildPr94CalibrationEvidence({ internals: calibrationOriginal,
+    analyzeWeeklyCalibration: calibrationOriginal.analyzeWeeklyCalibration,
+    candidates: calibrationOriginal.CANDIDATES, transitions: [], rawParents: [{ ...calibrationRawParent(first),
+      matchedDistinctPercentCount: 2,
+      derivationEvidence: { groupCount: 2, snapshotCount: 13, transitionCount: 0, zeroTransitionGroupCount: 2 } }],
+    revisionKind, hmacKey: CALIBRATION_HMAC_KEY, scope: CALIBRATION_SCOPE, selectedPlanType: "pro" });
+}
+
 function distribution() { return { count: 0, median: null, central80: { lower: null, upper: null } }; }
 function calibrationCandidate(candidateId, parentCandidates = 0) {
   return { candidateId, parentCandidates,
@@ -122,6 +135,16 @@ function source(revisionCharacter) {
   return { revision: revisionValue, dependencies: { sourceSha256: HASH("f"), runtimeSha256: HASH("0"),
     lockSha256: HASH("1"), identitySha256: HASH("2") } };
 }
+function queryPlans(revision) {
+  if (revision === BEFORE_REVISION) {
+    return { schema: "pr94-attribution-query-plans-v1", scope: "attribution_point_queries_explain_only",
+      binding: "synthetic", status: "feature_absent", statements: null };
+  }
+  const statements = Object.fromEntries(["membership", "same_record_plans", "source_predecessor", "session_predecessor"]
+    .map((role) => [role, { steps: 1, search: 1, scan: 0, tempSort: 0, other: 0 }]));
+  return { schema: "pr94-attribution-query-plans-v1", scope: "attribution_point_queries_explain_only",
+    binding: "synthetic", status: "observed", statements };
+}
 function resource(side, receipt, evidence) {
   const generationEvidence = evidence[side].generation;
   return { schema: "pr94-production-resource-v1", scope: "isolated_child_repeatability", revision: receipt.sources[side].revision,
@@ -142,6 +165,7 @@ function resource(side, receipt, evidence) {
           retainedUsageEvents: 0, retainedWeeklySnapshots: 0, estimatedRetainedBytes: 0,
           limits: { usageEvents: 1, weeklySnapshots: 1, combinedInputs: 1, retainedBytes: 1 } },
         rows: { periods: 0, timeline: 0, sparkUsageTimeline: 0, quotaTimeline: 0, sparkQuotaTimeline: 0 } } })),
+    queryPlans: queryPlans(receipt.sources[side].revision),
     exactRepeatOutput: true, indexUnchanged: true, sourceUnchanged: true, dependenciesUnchanged: true,
     notMeasured: ["app_no_change_cache_hit", "app_relaunch", "end_to_end_refresh", "cancellation", "evidence_observer_overhead"] };
 }
@@ -149,7 +173,7 @@ function receipt() {
   const evidence = { before: analysis("before"), after: analysis("after"), final: analysis("final") };
   const value = { schema: "pr94-admitted-index-comparison-v1", status: "passed",
     scope: "fixed_admitted_index_analysis_not_raw_ingestion_or_hosted_activation",
-    sources: { before: source("a3c850360bc83c0e27bef2171aeb4a302b72f472"), after: source("20f449ff5c222989029fe343f219f02b497ae1d4"), final: source("c") }, index: { sha256: HASH("6"), bytes: 1 },
+    sources: { before: source(BEFORE_REVISION), after: source(AFTER_REVISION), final: source("c") }, index: { sha256: HASH("6"), bytes: 1 },
     window: { startAt: INSTANT_START, endAt: INSTANT_END },
     comparison: { attributionLedger: ledgerComparison(), finalLedger: ledgerComparison(),
       attributionCalibration: calibrationComparison(), finalCalibration: calibrationComparison(), readerEvidenceUnchanged: true },
@@ -217,6 +241,32 @@ test("comparison validator accepts actual populated calibration v2 matrices in c
   assert.throws(() => validatePr94ComparisonReceipt(reversed), { code: "pr94_receipt_comparison_invalid" });
 });
 
+test("receipt validator accepts the original miner's within-era no-change outcome", () => {
+  const beforeCalibration = noWithinEraCalibration("before");
+  const afterCalibration = noWithinEraCalibration("after");
+  const finalCalibration = noWithinEraCalibration("final");
+  for (const value of [beforeCalibration, afterCalibration, finalCalibration]) {
+    assert.equal(value.candidates[0].outcomes.no_within_era_percent_change, 1);
+  }
+  const result = receipt();
+  result.evidence.before.calibration = beforeCalibration;
+  result.evidence.after.calibration = afterCalibration;
+  result.evidence.final.calibration = finalCalibration;
+  result.comparison.attributionCalibration = comparePr94CalibrationEvidence(beforeCalibration, afterCalibration);
+  result.comparison.finalCalibration = comparePr94CalibrationEvidence(afterCalibration, finalCalibration);
+  assert.equal(validatePr94ComparisonReceipt(result), result);
+  assert.ok(result.comparison.attributionCalibration.primaryOutcomeMatrix.every((cell) =>
+    cell.afterOutcomes.length === 1
+      && cell.afterOutcomes[0].outcome === "no_within_era_percent_change"));
+
+  const unknownOutcome = clone(result);
+  unknownOutcome.evidence.after.calibration.candidates[0].outcomes.no_within_era_percent_change_extra = 1;
+  assert.throws(() => validatePr94ComparisonReceipt(unknownOutcome), { code: "pr94_receipt_comparison_invalid" });
+  const misplacedOutcome = clone(result);
+  misplacedOutcome.evidence.after.calibration.rowReasons.no_within_era_percent_change = 1;
+  assert.throws(() => validatePr94ComparisonReceipt(misplacedOutcome), { code: "pr94_receipt_comparison_invalid" });
+});
+
 test("analysis validator is closed and rejects raw/private channels, hashes, counts and timings", () => {
   for (const mutate of [
     (value) => { value.privatePath = "/private/synthetic"; },
@@ -254,6 +304,13 @@ test("analysis validator delegates closed ledger and calibration aggregate valid
 test("comparison validator binds evidence revisions, unchanged reader evidence and production resources", () => {
   const good = receipt();
   assert.equal(validatePr94ComparisonReceipt(good), good);
+  assert.equal(good.productionResources.before.queryPlans.status, "feature_absent");
+  assert.equal(good.productionResources.before.queryPlans.statements, null);
+  for (const side of ["after", "final"]) {
+    assert.equal(good.productionResources[side].queryPlans.status, "observed");
+    assert.deepEqual(Object.keys(good.productionResources[side].queryPlans.statements), [
+      "membership", "same_record_plans", "source_predecessor", "session_predecessor"]);
+  }
   for (const mutate of [
     (value) => { value.harness = { revision: REVISION("d") }; },
     (value) => { value.sources.before.revision = "short"; },
@@ -267,6 +324,13 @@ test("comparison validator binds evidence revisions, unchanged reader evidence a
     (value) => { value.sources.final.dependencies.runtimeSha256 = HASH("3"); },
     (value) => { value.evidence.final.populationEvidence.unknownAccountOnlyWithheldEvents = 1; },
     (value) => { value.productionResources.final.runs[0].metrics.peakRssBytes = 6_442_450_945; },
+    (value) => { value.productionResources.before.queryPlans.status = "observed";
+      value.productionResources.before.queryPlans.statements = queryPlans(AFTER_REVISION).statements; },
+    (value) => { value.productionResources.after.queryPlans.status = "feature_absent";
+      value.productionResources.after.queryPlans.statements = null; },
+    (value) => { value.productionResources.after.queryPlans.statements.membership.steps = 2; },
+    (value) => { value.productionResources.after.queryPlans.statements.membership.rawSql = "SELECT synthetic"; },
+    (value) => { value.productionResources.final.queryPlans.statements.session_predecessor.search = -1; },
     (value) => { value.measurements.before.wallMs = -1; },
   ]) {
     const value = clone(good); mutate(value);

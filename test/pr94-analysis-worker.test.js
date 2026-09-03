@@ -109,8 +109,40 @@ test("PR94 raw occurrence counts survive slim projection and deduplicate only fo
   assert.equal(grouped.rawParents[0].snapshotCount, 14);
   assert.equal(grouped.rawParents[0].uniqueSnapshotCount, 13);
   const batched = await derivePr94BatchedTransitions({ modules: { miner }, usage: fixture.usage, grouped, startAt: START, endAt: END });
+  assert.equal(grouped.rawParents[0].derivationEvidence.snapshotCount, 13);
   assert.deepEqual(batched.transitions, (await oracle(fixture)).transitions);
   assert.equal(batched.deduplicatedSnapshotCount, 39);
+});
+
+test("PR94 original derivation summaries are bound to exact parents, groups and emitted counts", async () => {
+  const mutations = [
+    (result) => { delete result.groupSummaries; },
+    (result) => { result.windowGroupCount += 1; },
+    (result) => { result.groupSummaries[0].provider = "different-provider"; },
+    (result) => { result.groupSummaries[0].planType = "plus"; },
+    (result) => { result.groupSummaries[0].limitId = "spark"; },
+    (result) => { result.groupSummaries[0].accountScopeId = "synthetic-different-account"; },
+    (result) => { result.groupSummaries[0].resetsAt += 1; },
+    (result) => { result.groupSummaries[0].windowDurationMins = 300; },
+    (result) => { result.groupSummaries[0].snapshotCount += 1; },
+    (result) => { result.deduplicatedSnapshotCount -= 1; },
+    (result) => { result.groupSummaries[0].transitionCount -= 1; result.groupSummaries[0].monotonicTransitionCount -= 1; },
+    (result) => { result.groupSummaries[0].monotonicTransitionCount = -1; },
+    (result) => { result.groupSummaries[0].planEraKey = "unrelated-era"; },
+    (result) => { result.groupSummaries.push({ ...result.groupSummaries[0] }); result.windowGroupCount += 1; },
+    (result) => { result.transitions.pop(); },
+  ];
+  for (const mutate of mutations) {
+    const fixture = completeFixture();
+    const grouped = buildPr94QuotaGroups(fixture.snapshots, { quota, revisionKind: "final" });
+    const changedMiner = { async deriveCodexTransitionSeriesCooperatively(options) {
+      const result = await miner.deriveCodexTransitionSeriesCooperatively(options);
+      mutate(result);
+      return result;
+    } };
+    await assert.rejects(derivePr94BatchedTransitions({ modules: { miner: changedMiner }, usage: fixture.usage,
+      grouped, startAt: START, endAt: END }), { code: "pr94_derivation_invalid" });
+  }
 });
 
 test("PR94 equal-time contradictory plan evidence cannot choose a population by insertion order", () => {

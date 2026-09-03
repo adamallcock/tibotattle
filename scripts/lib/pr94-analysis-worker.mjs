@@ -144,12 +144,55 @@ function bound(values, target, inclusive) {
   return low;
 }
 
+// These are the original miner's groups, not a second implementation of its
+// era or transition policy. Bind every summary to its input parent and emitted
+// rows before retaining only bounded, content-free counts for reconciliation.
+function originalDerivationEvidence(result, identity, attributed) {
+  if (!Array.isArray(result.groupSummaries) || result.groupSummaries.length > MAX_QUOTA
+      || result.windowGroupCount !== result.groupSummaries.length) fail("pr94_derivation_invalid");
+  const expectedParent = parentKey(identity);
+  const rowCounts = new Map();
+  for (const row of result.transitions) {
+    if (parentKey(row) !== expectedParent) fail("pr94_derivation_invalid");
+    const era = attributed ? row.planEraKey : "legacy";
+    if (typeof era !== "string" || era.length === 0 || era.length > 4096) fail("pr94_derivation_invalid");
+    rowCounts.set(era, (rowCounts.get(era) ?? 0) + 1);
+  }
+  const seen = new Set();
+  const evidence = { groupCount: result.groupSummaries.length, snapshotCount: 0,
+    transitionCount: 0, zeroTransitionGroupCount: 0 };
+  for (const summary of result.groupSummaries) {
+    if (!summary || parentKey(summary) !== expectedParent
+        || !["primary", "secondary"].includes(summary.slot)
+        || !integer(summary.snapshotCount) || summary.snapshotCount < 1 || summary.snapshotCount > MAX_QUOTA
+        || !integer(summary.transitionCount) || summary.transitionCount >= summary.snapshotCount
+        || !integer(summary.monotonicTransitionCount) || !integer(summary.regressionTransitionCount)
+        || summary.monotonicTransitionCount + summary.regressionTransitionCount !== summary.transitionCount) {
+      fail("pr94_derivation_invalid");
+    }
+    const era = attributed ? summary.planEraKey : "legacy";
+    if (typeof era !== "string" || era.length === 0 || era.length > 4096 || seen.has(era)
+        || (rowCounts.get(era) ?? 0) !== summary.transitionCount) fail("pr94_derivation_invalid");
+    seen.add(era);
+    rowCounts.delete(era);
+    evidence.snapshotCount += summary.snapshotCount;
+    evidence.transitionCount += summary.transitionCount;
+    evidence.zeroTransitionGroupCount += Number(summary.transitionCount === 0);
+    if (evidence.snapshotCount > MAX_QUOTA || evidence.transitionCount > MAX_TRANSITIONS) fail("pr94_derivation_invalid");
+  }
+  if (rowCounts.size !== 0 || evidence.snapshotCount !== result.deduplicatedSnapshotCount
+      || evidence.transitionCount !== result.transitions.length) fail("pr94_derivation_invalid");
+  return Object.freeze(evidence);
+}
+
 export async function derivePr94BatchedTransitions({ modules, usage, grouped, startAt, endAt,
   resourceCheck = checkResource }) {
   const transitions = [];
   let deduplicatedSnapshotCount = 0;
   let maximumUsageSlice = 0;
   let maximumQuotaSlice = 0;
+  const rawParents = new Map(grouped.rawParents.map((parent) => [parentKey(parent), parent]));
+  if (rawParents.size !== grouped.rawParents.length || rawParents.size !== grouped.groups.length) fail("pr94_derivation_invalid");
   for (const group of grouped.groups) {
     resourceCheck();
     const windowStart = (group.identity.resetsAt - WEEKLY * 60) * 1000;
@@ -165,13 +208,20 @@ export async function derivePr94BatchedTransitions({ modules, usage, grouped, st
       includeNormalizedInputs: false, consumeInputs: true,
       resourceCheck, ...(grouped.attribution ? { planAttributionIndex: grouped.attribution } : {}),
     });
-    if (!integer(result.deduplicatedSnapshotCount) || !Array.isArray(result.transitions)) {
+    if (!integer(result.deduplicatedSnapshotCount) || result.deduplicatedSnapshotCount > group.snapshots.length
+        || !Array.isArray(result.transitions) || result.transitions.length > MAX_TRANSITIONS) {
       fail("pr94_derivation_invalid");
     }
+    const parent = rawParents.get(parentKey(group.identity));
+    const derivationEvidence = originalDerivationEvidence(result, group.identity, grouped.attribution !== null);
+    if (!parent || derivationEvidence.snapshotCount !== parent.matchedUniqueSnapshotCount) fail("pr94_derivation_invalid");
+    parent.derivationEvidence = derivationEvidence;
+    rawParents.delete(parentKey(group.identity));
     deduplicatedSnapshotCount += result.deduplicatedSnapshotCount;
     if (transitions.length + result.transitions.length > MAX_TRANSITIONS) fail("pr94_resource_limit");
     for (const row of result.transitions) transitions.push(row);
   }
+  if (rawParents.size !== 0) fail("pr94_derivation_invalid");
   transitions.sort((a, b) => a.eventTime.localeCompare(b.eventTime)
     || a.resetIdentity.localeCompare(b.resetIdentity)
     || a.windowDurationMins - b.windowDurationMins || a.slot.localeCompare(b.slot));

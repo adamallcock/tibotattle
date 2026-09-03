@@ -44,7 +44,7 @@ const OUTCOMES = Object.freeze([
   "aggregation_diagnostic_only", "insufficient_unique_boundaries", "insufficient_percent_span",
   "training_capacity_unavailable", "insufficient_training_pairs", "full_capacity_unavailable",
   "relative_width_unavailable", "relative_width_exceeded", "insufficient_snapshots",
-  "no_percent_change", "all_snapshot_attribution_withheld", "unexplained_no_transition",
+  "no_percent_change", "no_within_era_percent_change", "all_snapshot_attribution_withheld", "unexplained_no_transition",
 ]);
 const ROW_REASONS = Object.freeze([
   "eligible", "aggregation_diagnostic_only", "non_increasing_percent", "no_usage",

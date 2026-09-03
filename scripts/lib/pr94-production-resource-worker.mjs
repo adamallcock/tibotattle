@@ -28,6 +28,12 @@ const POLICY_KEYS = ["maximumRssBytes", "rssDeltaBudgetBytes", "rebuildChildOldS
 const INPUT_LIMITS = ["usageEvents", "weeklySnapshots", "combinedInputs", "retainedBytes"];
 const CACHE_ARRAYS = ["periods", "timeline", "sparkUsageTimeline", "quotaTimeline", "sparkQuotaTimeline"];
 const RUN_KINDS = ["primary", "fresh_process_repeat"];
+const BEFORE_REVISION = "a3c850360bc83c0e27bef2171aeb4a302b72f472";
+const QUERY_PLAN_SCHEMA = "pr94-attribution-query-plans-v1";
+const QUERY_ROLES = ["membership", "same_record_plans", "source_predecessor", "session_predecessor"];
+const QUERY_METHODS = ["get", "all", "get", "get"];
+const QUERY_ARITIES = [2, 5, 3, 5];
+const QUERY_COUNTS = ["steps", "search", "scan", "tempSort", "other"];
 const MODULE_FILE = fileURLToPath(import.meta.url);
 const SAFE_FAILURES = new Set([
   "invalid", "approval_required", "runtime_invalid", "window_invalid", "policy_invalid", "path_invalid",
@@ -36,6 +42,7 @@ const SAFE_FAILURES = new Set([
   "command_failed", "command_timeout", "command_output_limit", "command_aborted", "command_termination_unconfirmed",
   "metrics_invalid", "envelope_invalid", "child_refused", "artifact_invalid", "artifact_mismatch", "index_invalid",
   "resource_limit_exceeded", "dependency_invalid", "dependency_changed", "dependency_limit_exceeded", "refused",
+  "query_plan_invalid", "query_plan_changed",
 ]);
 export const PR94_PRODUCTION_ERROR_CODES = Object.freeze([...SAFE_FAILURES].map((code) => `pr94_production_${code}`));
 
@@ -68,6 +75,88 @@ function sameFile(left, right) {
     .every((key) => left[key] === right[key]);
 }
 function same(left, right) { return JSON.stringify(left) === JSON.stringify(right); }
+
+export function validatePr94AttributionQueryPlans(value, revision) {
+  exact(value, ["schema", "scope", "binding", "status", "statements"]);
+  if (typeof revision !== "string" || !REVISION.test(revision)
+      || value.schema !== QUERY_PLAN_SCHEMA || value.scope !== "attribution_point_queries_explain_only"
+      || value.binding !== "synthetic") fail("query_plan_invalid");
+  if (revision === BEFORE_REVISION) {
+    if (value.status !== "feature_absent" || value.statements !== null) fail("query_plan_invalid");
+    return value;
+  }
+  if (value.status !== "observed") fail("query_plan_invalid");
+  exact(value.statements, QUERY_ROLES);
+  for (const role of QUERY_ROLES) {
+    const counts = exact(value.statements[role], QUERY_COUNTS);
+    QUERY_COUNTS.forEach((key) => integer(counts[key]));
+    if (counts.steps < 1 || integer(counts.search + counts.scan + counts.tempSort + counts.other) !== counts.steps) {
+      fail("query_plan_invalid");
+    }
+  }
+  return value;
+}
+
+// Compile the selected reader's original four point-query statements against
+// the real read-only schema, using only synthetic bind values. The adapter
+// NEVER steps a data SELECT. Its synthetic membership drives the public
+// reader's branches, not a claim that an index row exists. Statement order,
+// method and arity are a closed contract of the reviewed after/final readers.
+// This excludes full scans, optional precomputation and query execution cost.
+export function collectPr94AttributionQueryPlans({ readerModule, database, generationId, observedAtMs, revision }) {
+  try {
+    if (typeof revision !== "string" || !REVISION.test(revision)
+        || typeof database?.prepare !== "function") fail("query_plan_invalid");
+    integer(generationId, 1);
+    integer(observedAtMs, -8_640_000_000_000_000, 8_640_000_000_000_000);
+    const createReader = readerModule?.createLocalUnifiedUsageAttributionReader;
+    const evidence = { schema: QUERY_PLAN_SCHEMA, scope: "attribution_point_queries_explain_only",
+      binding: "synthetic", status: "feature_absent", statements: null };
+    if (revision === BEFORE_REVISION) {
+      if (createReader !== undefined) fail("query_plan_invalid");
+      return validatePr94AttributionQueryPlans(evidence, revision);
+    }
+    if (typeof createReader !== "function") fail("query_plan_invalid");
+    const source = Buffer.alloc(32, 17); const session = Buffer.alloc(32, 29);
+    const prepared = []; const statements = {};
+    const explainOnly = {
+      prepare(sql) {
+        const index = prepared.length;
+        if (index >= QUERY_ROLES.length || typeof sql !== "string" || !/^\s*SELECT\b/u.test(sql)) fail("query_plan_invalid");
+        const state = { used: false }; prepared.push(state);
+        function explain(method, parameters) {
+          if (state.used || method !== QUERY_METHODS[index] || parameters.length !== QUERY_ARITIES[index]) fail("query_plan_invalid");
+          state.used = true;
+          const counts = { steps: 0, search: 0, scan: 0, tempSort: 0, other: 0 };
+          // Iteration bounds retained memory independently of plan length;
+          // the surrounding untimed probe keeps its existing 30-second bound.
+          for (const row of database.prepare(`EXPLAIN QUERY PLAN ${sql}`).iterate(...parameters)) {
+            exact(row, ["id", "parent", "notused", "detail"]);
+            integer(row.id); integer(row.parent); integer(row.notused);
+            if (typeof row.detail !== "string" || row.detail.length === 0) fail("query_plan_invalid");
+            const kind = /^SEARCH\b/u.test(row.detail) ? "search"
+              : /^SCAN\b/u.test(row.detail) ? "scan"
+                : /^USE TEMP B-TREE\b/u.test(row.detail) ? "tempSort" : "other";
+            counts.steps = integer(counts.steps + 1);
+            counts[kind] = integer(counts[kind] + 1);
+          }
+          statements[QUERY_ROLES[index]] = counts;
+          if (index === 0) return { source_ordinal: 0, session_local: session, scanned_bytes: 1 };
+          return index === 1 ? [] : undefined;
+        }
+        return { get: (...parameters) => explain("get", parameters), all: (...parameters) => explain("all", parameters) };
+      },
+    };
+    const reader = createReader({ database: explainOnly, generationId });
+    reader.read({ source_local: source, source_ordinal: 0, source_offset: 1,
+      session_local: session, observed_at_ms: observedAtMs });
+    if (prepared.length !== QUERY_ROLES.length || prepared.some((state) => !state.used)) fail("query_plan_invalid");
+    return validatePr94AttributionQueryPlans({ ...evidence, status: "observed", statements }, revision);
+  } catch {
+    // SQLite errors can contain SQL, schema names or private bindings.
+    fail("query_plan_invalid");
+  }
+}
 
 function windowFor(startAt, endAt) {
   instant(startAt); instant(endAt);
@@ -183,15 +272,23 @@ function validateSource(value, expectedRevision) {
 async function probeRevision({ root, stage, path, context, command, environment, signal, cwd }) {
   const cacheUrl = JSON.stringify(pathToFileURL(join(root, "src/replay-safe-accounting-cache.js")).href);
   const indexUrl = JSON.stringify(pathToFileURL(join(root, "src/local-unified-index.js")).href);
+  const readerUrl = JSON.stringify(pathToFileURL(join(root, "src/local-unified-accounting-source.js")).href);
   const projectionUrl = JSON.stringify(pathToFileURL(MODULE_FILE).href);
   const program = `import { readFile } from 'node:fs/promises';
 import { REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY as policy, REPLAY_SAFE_ACCOUNTING_REBUILD_REQUEST_VERSION as requestVersion, assertReplaySafeAccountingCache } from ${cacheUrl};
 import { openLocalUnifiedIndex, readUnifiedIndexGenerationDescriptor } from ${indexUrl};
-import { projectPr94ProductionCache } from ${projectionUrl};
+import * as readerModule from ${readerUrl};
+import { projectPr94ProductionCache, collectPr94AttributionQueryPlans } from ${projectionUrl};
 try {
  if (process.argv[1] === 'metadata') {
   const db = openLocalUnifiedIndex(process.argv[2], { readOnly: true });
-  try { process.stdout.write(JSON.stringify({ policy, requestVersion, generation: readUnifiedIndexGenerationDescriptor(db) })); } finally { db.close(); }
+  try {
+   const generation = readUnifiedIndexGenerationDescriptor(db);
+   const context = JSON.parse(process.argv[3]);
+   const queryPlans = collectPr94AttributionQueryPlans({ readerModule, database: db, generationId: generation.id,
+    observedAtMs: context.observedAtMs, revision: context.revision });
+   process.stdout.write(JSON.stringify({ policy, requestVersion, generation, queryPlans }));
+  } finally { db.close(); }
  } else {
   const cache = JSON.parse(await readFile(process.argv[2], 'utf8'));
   assertReplaySafeAccountingCache(cache);
@@ -211,7 +308,7 @@ try {
 
 export function validatePr94ProductionResourceEvidence(value) {
   exact(value, ["schema", "scope", "revision", "dependencies", "clock", "index", "generation", "policy",
-    "limits", "runs", "exactRepeatOutput", "indexUnchanged", "sourceUnchanged", "dependenciesUnchanged", "notMeasured"]);
+    "limits", "runs", "queryPlans", "exactRepeatOutput", "indexUnchanged", "sourceUnchanged", "dependenciesUnchanged", "notMeasured"]);
   if (value.schema !== SCHEMA || value.scope !== "isolated_child_repeatability" || !REVISION.test(value.revision)) fail();
   validateSource({ revision: value.revision, dependencies: value.dependencies }, value.revision);
   exact(value.clock, ["startAt", "endAt", "nowMs", "windowDays"]);
@@ -221,6 +318,7 @@ export function validatePr94ProductionResourceEvidence(value) {
   integer(value.generation.id, 1); integer(value.generation.usageEvents); integer(value.generation.quotaOccurrences);
   if (!["complete", "partial"].includes(value.generation.publicationStatus) || typeof value.generation.toolProvenanceComplete !== "boolean") fail();
   validatePolicy(value.policy);
+  validatePr94AttributionQueryPlans(value.queryPlans, value.revision);
   exact(value.limits, ["envelopeBytes", "transportBytes", "durableCacheBytes"]);
   if (!same(value.limits, { envelopeBytes: 64 * 1024, transportBytes: TRANSPORT_BYTES, durableCacheBytes: CACHE_BYTES })) fail();
   if (!Array.isArray(value.runs) || value.runs.length !== 2) fail();
@@ -273,9 +371,11 @@ async function runWorker(options, {
   await mkdir(temporary, { mode: 0o700 });
   const environment = { TMPDIR: temporary, LC_ALL: "C" };
   const probeOptions = { root: options.root, command, environment, signal, cwd: options.outputDirectory };
-  const initial = await probe({ ...probeOptions, stage: "metadata", path: options.indexFile });
-  exact(initial, ["policy", "requestVersion", "generation"]);
+  const metadataContext = { revision: options.expectedRevision, observedAtMs: clock.nowMs };
+  const initial = await probe({ ...probeOptions, stage: "metadata", path: options.indexFile, context: metadataContext });
+  exact(initial, ["policy", "requestVersion", "generation", "queryPlans"]);
   validatePolicy(initial.policy);
+  validatePr94AttributionQueryPlans(initial.queryPlans, options.expectedRevision);
   const generation = projectDetailedAccountingBenchmarkGeneration(initial.generation);
   if (generation.id !== options.expectedIndex.generationId) fail("generation_mismatch");
   const request = buildPr94ProductionResourceRequest({ ...clock, indexFile: options.indexFile, codexHome, ...initial });
@@ -308,7 +408,11 @@ async function runWorker(options, {
   if (!sameFile(indexStat, await inspectDetailedAccountingBenchmarkIndex(options.indexFile))
       || await digestDetailedAccountingBenchmarkFile(options.indexFile, indexStat, { signal }) !== indexSha256) fail("index_changed");
   if (!same(beforeSource, validateSource(await inspectSource(options.root, { signal, command }), options.expectedRevision))) fail("source_changed");
-  if (!same(initial, await probe({ ...probeOptions, stage: "metadata", path: options.indexFile }))) fail("generation_changed");
+  const finalMetadata = await probe({ ...probeOptions, stage: "metadata", path: options.indexFile, context: metadataContext });
+  exact(finalMetadata, ["policy", "requestVersion", "generation", "queryPlans"]);
+  validatePr94AttributionQueryPlans(finalMetadata.queryPlans, options.expectedRevision);
+  if (!same(initial.queryPlans, finalMetadata.queryPlans)) fail("query_plan_changed");
+  if (!same(initial, finalMetadata)) fail("generation_changed");
   const finalOutputStat = await privateDirectory(options.outputDirectory);
   if (outputStat.dev !== finalOutputStat.dev || outputStat.ino !== finalOutputStat.ino) fail("path_invalid");
   cancelled(signal);
@@ -317,7 +421,7 @@ async function runWorker(options, {
     index: { sha256: indexSha256, bytes: indexStat.size },
     generation: { id: generation.id, publicationStatus: generation.publicationStatus,
       toolProvenanceComplete: generation.toolProvenanceComplete, usageEvents: generation.usageEvents,
-      quotaOccurrences: generation.quotaOccurrences }, policy: initial.policy,
+      quotaOccurrences: generation.quotaOccurrences }, policy: initial.policy, queryPlans: initial.queryPlans,
     limits: { envelopeBytes: 64 * 1024, transportBytes: TRANSPORT_BYTES, durableCacheBytes: CACHE_BYTES }, runs,
     exactRepeatOutput: true, indexUnchanged: true, sourceUnchanged: true, dependenciesUnchanged: true,
     notMeasured: ["app_no_change_cache_hit", "app_relaunch", "end_to_end_refresh", "cancellation", "evidence_observer_overhead"] });
