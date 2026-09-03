@@ -210,7 +210,9 @@ only for an artifact claiming the attested v1 profile/path; a
 native/checksum-only artifact records explicit `null` evidence instead and may
 skip those attestation steps.
 
-1. Start from a clean checkout at the exact protected annotated version tag.
+1. Finalize the reviewed release notes and dated changelog before freezing the
+   source, then start from a clean checkout at the exact protected annotated
+   version tag. The macOS runbook explains the pre-tag documentation/CI order.
 2. Build on the native controlled runner with the committed lockfile.
 3. Run native tests and clean install/upgrade/uninstall checks.
 4. Complete all byte-changing operations: package, sign nested binaries,
@@ -226,10 +228,10 @@ skip those attestation steps.
    and `sbom.attestation` bundle outputs beside the final subject.
 9. Generate and validate release-manifest.json and SHA256SUMS with
    scripts/generate-release-evidence.js.
-10. Finalize the release notes and changelog: add release, annotated-tag, and
-    exact comparison provenance; include only verified public credits and mark
-    related open issues as open. Then create a draft GitHub release and upload
-    only reviewed public assets.
+10. Verify the already-frozen release notes and changelog contain release,
+    annotated-tag, and exact comparison provenance, verified public credits,
+    and explicit open-issue boundaries. Do not edit the tagged build source
+    here. Create a draft GitHub release and upload only reviewed public assets.
 11. Copy every draft asset from the reviewed staging area into a fresh
     verification directory. Validate the manifest and SHA256SUMS and source
     identity there. For the attested v1 profile/path, also verify both
@@ -247,7 +249,10 @@ or evidence need to change.
 ## 5. Draft and immutable release publication
 
 The public asset set for a direct subject always includes the final platform
-artifact, `release-manifest.json`, `SHA256SUMS`, and `verify-release.md`. Include
+artifact, `release-manifest.json`, `SHA256SUMS`, and `verify-release.md`. When
+`updater.enabled` is true, also include its exact metadata file; macOS Sparkle
+uses `appcast.xml`. Its checksum entry must have a corresponding uploaded asset.
+Include
 the following only when the artifact's manifest fields are non-null:
 
 - the SPDX JSON SBOM when `artifact.sbom` is non-null;
@@ -301,6 +306,8 @@ gh release create "$TAG" --repo "$REPO" --verify-tag --draft \
 gh release upload "$TAG" --repo "$REPO" \
   "$ARTIFACT" \
   "$RELEASE_MANIFEST" "$SHA256SUMS" "$VERIFY_GUIDE"
+# For a macOS direct subject with Sparkle enabled, also upload the exact feed:
+gh release upload "$TAG" --repo "$REPO" "<staging-directory>/appcast.xml"
 ~~~
 
 For the attested v1 profile/path, produce and verify the final SPDX file and
@@ -318,6 +325,8 @@ SBOM_BUNDLE="$EVIDENCE_DIRECTORY/$ARTIFACT_NAME.sbom.bundle.json"
 gh release upload "$TAG" --repo "$REPO" \
   "$ARTIFACT" "$SPDX" "$PROVENANCE_BUNDLE" "$SBOM_BUNDLE" \
   "$RELEASE_MANIFEST" "$SHA256SUMS" "$VERIFY_GUIDE"
+# For a macOS direct subject with Sparkle enabled, also upload the exact feed:
+gh release upload "$TAG" --repo "$REPO" "<staging-directory>/appcast.xml"
 ~~~
 
 Before publication, validate the exact draft staging directory locally. This

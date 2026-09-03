@@ -303,16 +303,40 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  // 86 records / 88 executable paths: release-documentation, Codex contract,
+  // 94 records / 96 executable paths: release-documentation, Codex contract,
   // documentation governance, repository-layout, macOS bundle-version, and
   // local index-recovery gates are reviewed repository operations invoked by
   // CI, release runbooks, or supported internal product tooling.
   // Keep these exact so any future executable still requires an ownership
   // decision.
-  // Includes the reviewed, protected exact-output accounting child benchmark.
-  assert.equal(result.records, 86);
-  assert.equal(result.candidates.length, 88);
+  // Includes the reviewed exact-output accounting child benchmark and eight
+  // protected PR94 qualification entrypoints/helpers; neither is a product API.
+  assert.equal(result.records, 94);
+  assert.equal(result.candidates.length, 96);
   assert.ok(result.aliases >= 25);
+});
+
+test("the eight PR94 qualifier paths retain explicit ownership without product command aliases", async () => {
+  const inventory = JSON.parse(await readFile(join(REPOSITORY_ROOT, "tools/tool-inventory.json"), "utf8"));
+  const records = inventory.records.filter(({ canonicalPath }) => canonicalPath.includes("pr94"));
+  assert.deepEqual(records.map(({ canonicalPath }) => canonicalPath).sort(), [
+    "scripts/lib/pr94-analysis-worker.mjs",
+    "scripts/lib/pr94-calibration-evidence.mjs",
+    "scripts/lib/pr94-ledger-evidence.mjs",
+    "scripts/lib/pr94-population-evidence.mjs",
+    "scripts/lib/pr94-production-resource-worker.mjs",
+    "scripts/lib/pr94-receipt-validation.mjs",
+    "scripts/lib/pr94-revision-loader.mjs",
+    "scripts/qualify-pr94-attribution.mjs",
+  ]);
+  for (const record of records) {
+    assert.equal(record.classification, "reusable_benchmark");
+    assert.equal(record.owner, "local_analysis");
+    assert.equal(record.stableAlias, null);
+    assert.deepEqual(record.additionalAliases, []);
+    assert.equal(record.provenance, "docs/plans/2026-09-03-public-0.1.17-release.md");
+    assert.ok(record.callers.some((path) => path.startsWith("test/pr94-")));
+  }
 });
 
 test("the inventory names every static ESM caller of a classified tool", async () => {
