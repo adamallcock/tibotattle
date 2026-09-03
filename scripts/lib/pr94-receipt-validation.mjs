@@ -398,7 +398,6 @@ function validateSources(value) {
   if (value.before.revision !== PR94_COMPARISON_REVISIONS.before
       || value.after.revision !== PR94_COMPARISON_REVISIONS.after) reject();
   if (value.before.dependencies.runtimeSha256 !== value.after.dependencies.runtimeSha256
-      || value.before.dependencies.runtimeSha256 !== value.final.dependencies.runtimeSha256
       || value.before.dependencies.lockSha256 !== value.after.dependencies.lockSha256) reject();
   // Only before/after isolate PR94. The separately identified final lane also
   // includes subsequent reviewed dependency updates; bind those to its own

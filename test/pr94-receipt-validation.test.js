@@ -321,7 +321,9 @@ test("comparison validator binds evidence revisions, unchanged reader evidence a
       value.comparison.attributionLedger.rows.usage.after = 1;
       value.comparison.attributionLedger.rows.usage.unchanged = 1; },
     (value) => { value.evidence.after.generation.usageEvents = 1; },
-    (value) => { value.sources.final.dependencies.runtimeSha256 = HASH("3"); },
+    (value) => { value.sources.final.dependencies = {
+      ...value.sources.final.dependencies, runtimeSha256: HASH("3"),
+    }; },
     (value) => { value.evidence.final.populationEvidence.unknownAccountOnlyWithheldEvents = 1; },
     (value) => { value.productionResources.final.runs[0].metrics.peakRssBytes = 6_442_450_945; },
     (value) => { value.productionResources.before.queryPlans.status = "observed";
@@ -341,11 +343,12 @@ test("comparison validator binds evidence revisions, unchanged reader evidence a
 test("only the PR94 isolation pair requires identical locks; final dependencies remain independently bound", () => {
   const value = receipt();
   value.sources.final.dependencies.lockSha256 = HASH("7");
+  value.sources.final.dependencies.runtimeSha256 = HASH("8");
   // The fixture intentionally shares the source/probe dependency object.
   assert.equal(validatePr94ComparisonReceipt(value), value);
   const drift = clone(value);
   drift.productionResources.final.dependencies = {
-    ...drift.productionResources.final.dependencies, lockSha256: HASH("8"),
+    ...drift.productionResources.final.dependencies, runtimeSha256: HASH("9"),
   };
   assert.throws(() => validatePr94ComparisonReceipt(drift), { code: "pr94_receipt_comparison_invalid" });
   const mixedPair = clone(value);
