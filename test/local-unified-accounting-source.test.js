@@ -15,7 +15,9 @@ import { join } from "node:path";
 import {
   LOCAL_UNIFIED_ACCOUNTING_SOURCE_VERSION,
   createLocalUnifiedAccountingSource,
+  canonicalInstant,
   createLocalUnifiedUsageAttributionReader,
+  precomputeLocalUnifiedUsageAttribution,
 } from "../src/local-unified-accounting-source.js";
 import {
   beginUnifiedIndexGeneration,
@@ -649,6 +651,275 @@ test("attribution reads remain deterministic across interleaved long sources and
   }
 });
 
+test("canonicalInstant's shape fast path agrees with the Date round trip on every input class", () => {
+  const roundTrip = (value) => {
+    if (typeof value !== "string") return null;
+    const timestamp = Date.parse(value);
+    return Number.isFinite(timestamp)
+        && new Date(timestamp).toISOString() === value
+      ? value
+      : null;
+  };
+  const pad = (number, width) => String(number).padStart(width, "0");
+  const inputs = [];
+  // The whole calendar field grid, including every out-of-range neighbour.
+  for (const year of [0, 1, 4, 100, 400, 1900, 1970, 2000, 2024, 2026, 2100, 9999]) {
+    for (let month = 0; month <= 13; month += 1) {
+      for (let day = 0; day <= 32; day += 1) {
+        inputs.push(`${pad(year, 4)}-${pad(month, 2)}-${pad(day, 2)}T12:34:56.789Z`);
+      }
+    }
+  }
+  for (const [hour, minute, second] of [
+    [0, 0, 0], [23, 59, 59], [24, 0, 0], [23, 60, 0], [23, 59, 60],
+    [25, 0, 0], [99, 99, 99], [12, 0, 60], [0, 60, 0],
+  ]) {
+    inputs.push(`2026-06-15T${pad(hour, 2)}:${pad(minute, 2)}:${pad(second, 2)}.000Z`);
+  }
+  inputs.push(
+    "2026-06-15T12:00:00Z", "2026-06-15T12:00:00.00Z", "2026-06-15T12:00:00.0000Z",
+    "2026-06-15 12:00:00.000Z", "2026-06-15T12:00:00.000+00:00", "2026-06-15T12:00:00.000z",
+    "+002026-06-15T12:00:00.000Z", "+010000-01-01T00:00:00.000Z", "-000001-01-01T00:00:00.000Z",
+    "-000000-01-01T00:00:00.000Z", "275760-09-13T00:00:00.000Z", "+275760-09-13T00:00:00.000Z",
+    "+275760-09-13T00:00:00.001Z", "-271821-04-20T00:00:00.000Z", "-271821-04-19T23:59:59.999Z",
+    "２０２６-06-15T12:00:00.000Z", "2026-06-15T12:00:00.000Z\n", " 2026-06-15T12:00:00.000Z",
+    "", "Z", null, undefined, 5, {}, [], true,
+  );
+  // Random instants across the whole Date range (4-digit and expanded years)
+  // plus single-character corruptions of canonical strings.
+  let seed = 0x2545f491;
+  const next = () => {
+    seed = (Math.imul(seed, 1_664_525) + 1_013_904_223) >>> 0;
+    return seed;
+  };
+  const randomMs = () => Math.floor((next() / 2 ** 32) * 2 * 8.64e15) - 8.64e15;
+  for (let index = 0; index < 20_000; index += 1) {
+    inputs.push(new Date(randomMs()).toISOString());
+  }
+  for (let index = 0; index < 5_000; index += 1) {
+    const canonical = new Date(Math.floor((next() / 2 ** 32) * 8.64e15) - 4.32e15).toISOString();
+    const position = next() % canonical.length;
+    const replacement = String.fromCharCode(48 + (next() % 10));
+    inputs.push(`${canonical.slice(0, position)}${replacement}${canonical.slice(position + 1)}`);
+  }
+  let checked = 0;
+  for (const input of inputs) {
+    assert.equal(canonicalInstant(input), roundTrip(input), JSON.stringify(input));
+    checked += 1;
+  }
+  assert.ok(checked > 30_000);
+});
+
+test("the one-pass attribution precomputation reproduces every point-query read exactly", async (t) => {
+  // Scenarios that exercise each branch of the reader: same-record and
+  // conflicting plans, unknown plans, a session spanning two sources with
+  // interleaved and tied timestamps, a reversed source clock, offsets past a
+  // member's scanned bytes, a source dropped from the generation, and gaps
+  // in the offset sequence.
+  const scenarios = [
+    {
+      name: "two sources sharing a session with ties and reversed clocks",
+      sources: [{ id: 1, session: 9 }, { id: 2, session: 9 }, { id: 3, session: 3 }],
+      records: [
+        { source: 1, offset: 1, at: 0, quotas: [{ plan: "pro" }] },
+        { source: 2, offset: 1, at: 500, quotas: [{ plan: "pro" }] },
+        { source: 1, offset: 2, at: 1_000, quotas: [{ plan: "pro" }] },
+        { source: 2, offset: 2, at: 1_000, quotas: [{ plan: "plus" }] },
+        { source: 1, offset: 3, at: 900 },
+        { source: 2, offset: 3, at: 1_500, quotas: [{ plan: "pro" }, { plan: "plus" }] },
+        { source: 3, offset: 1, at: 2_000, quotas: [{ plan: "pro" }] },
+        { source: 3, offset: 2, at: 2_000, quotas: [{ plan: "unknown" }] },
+        { source: 3, offset: 4, at: 1_900 },
+        { source: 1, offset: 4, at: 3_000, quotas: [{ plan: "pro", admission: "held" }] },
+        { source: 2, offset: 4, at: 3_000, noUsage: true },
+        { source: 2, offset: 5, at: 3_100 },
+        // Records whose session is not the source's own session: no session
+        // lineage, so only the source predecessor can bound the interval.
+        { source: 1, offset: 5, at: 4_000, session: 5, quotas: [{ plan: "pro" }] },
+        { source: 1, offset: 6, at: 4_100, session: 5 },
+        { source: 1, offset: 7, at: 4_050, session: 5 },
+      ],
+    },
+    {
+      name: "membership boundaries",
+      sources: [{ id: 1, session: 1 }, { id: 2, session: 2 }],
+      records: Array.from({ length: 40 }, (_, index) => ({
+        source: (index % 2) + 1,
+        offset: 100 + index * 100,
+        at: index * 1_000,
+        quotas: index % 5 === 0 ? [] : [{ plan: index % 3 === 0 ? "plus" : "pro" }],
+      })),
+      mutate(database, generationId) {
+        // Source 2 is only partially scanned in this generation, so offsets
+        // past the boundary are unattributable and cannot be predecessors.
+        database.prepare(`
+          UPDATE generation_source SET scanned_bytes = 2_500
+          WHERE generation_id = ? AND source_local = ?`).run(generationId, Buffer.alloc(32, 2));
+      },
+    },
+    {
+      name: "a source dropped from the generation",
+      sources: [{ id: 1, session: 1 }, { id: 2, session: 1 }],
+      records: Array.from({ length: 12 }, (_, index) => ({
+        source: (index % 2) + 1,
+        offset: index + 1,
+        at: index * 700,
+        quotas: [{ plan: "pro" }],
+      })),
+      mutate(database, generationId) {
+        database.prepare(`
+          UPDATE generation_source SET status = 'failed'
+          WHERE generation_id = ? AND source_local = ?`).run(generationId, Buffer.alloc(32, 2));
+      },
+    },
+  ];
+  for (const scenario of scenarios) {
+    const fixture = await createAttributionIndex({
+      sources: scenario.sources,
+      records: scenario.records,
+    });
+    const database = openLocalUnifiedIndex(fixture.indexFile);
+    try {
+      scenario.mutate?.(database, fixture.generationId);
+      const rows = database.prepare(`
+        SELECT rowid AS row_id, source_local, source_offset, source_ordinal,
+               session_local, observed_at_ms
+        FROM usage_event ORDER BY observed_at_ms, source_ordinal, source_offset`).all();
+      const live = createLocalUnifiedUsageAttributionReader({
+        database, generationId: fixture.generationId,
+      });
+      const precomputed = precomputeLocalUnifiedUsageAttribution({
+        database, generationId: fixture.generationId,
+      });
+      const batch = createLocalUnifiedUsageAttributionReader({
+        database, generationId: fixture.generationId, precomputed,
+      });
+      const bases = new Set();
+      for (const row of rows) {
+        assert.equal(precomputed.has(row.row_id), true, scenario.name);
+        const expected = live.read(row);
+        assert.deepEqual(batch.read(row), expected, `${scenario.name}: rowid ${row.row_id}`);
+        bases.add(`${expected.planAttribution.basis}/${expected.usageIntervalBasis}`);
+      }
+      // A rowid the pass never saw is served by the point queries, unchanged.
+      assert.deepEqual(
+        batch.read({ ...rows[0], row_id: rows.at(-1).row_id + 1_000 }),
+        live.read(rows[0]),
+      );
+      t.diagnostic(`${scenario.name}: ${rows.length} rows, outcomes ${[...bases].sort().join(" ")}`);
+      assert.ok(rows.length >= 12, scenario.name);
+    } finally {
+      database.close();
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("an indexed-history consumer receives the covered range in the same read, proven per window", async () => {
+  const fixture = await createAttributionIndex({
+    sources: [{ id: 1, session: 1 }],
+    records: Array.from({ length: 12 }, (_, index) => ({
+      offset: index + 1,
+      at: index * 1_000,
+      tokens: index === 5 ? 0 : 1,
+      quotas: [{ plan: "pro" }],
+    })),
+  });
+  try {
+    const source = createLocalUnifiedAccountingSource({
+      indexFile: fixture.indexFile,
+      requireComplete: true,
+    });
+    const windowStartMs = OBSERVED_MS + 7_000;
+    const request = () => {
+      const windowed = [];
+      const history = [];
+      const quota = [];
+      return {
+        windowed,
+        history,
+        quota,
+        options: {
+          startAt: new Date(windowStartMs).toISOString(),
+          endAt: END_AT,
+          onUsage: (row) => windowed.push(row),
+          onRateLimitSnapshot: (row) => quota.push(row),
+          indexedHistory: { onUsage: (row) => history.push(row) },
+        },
+      };
+    };
+    const fused = request();
+    const result = await source(fused.options);
+    assert.equal(result.indexedHistory.status, "available");
+    assert.equal(result.indexedHistory.errorCode, null);
+    assert.equal(result.indexedHistory.coverage.generationId, result.coverage.generationId);
+    assert.deepEqual(result.indexedHistory.coverage.coveredAt, result.coverage.coveredAt);
+    assert.deepEqual(result.indexedHistory.capabilities, result.capabilities);
+    // The window saw only its own rows; history saw every usage row of the
+    // covered range (the zero-token record is not a usage row for either).
+    assert.deepEqual(fused.windowed.map((row) => row.sourceOffset), [8, 9, 10, 11, 12]);
+    assert.deepEqual(fused.history.map((row) => row.sourceOffset), [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]);
+    // Quota rows are delivered for the window only.
+    assert.deepEqual(fused.quota.map((row) => row.sourceOffset), [8, 9, 10, 11, 12]);
+    // A row inside both windows is one object, delivered to both consumers
+    // with the windowed consumer's attribution; history-only rows carry none.
+    assert.equal(fused.history[6], fused.windowed[0]);
+    assert.ok(Object.hasOwn(fused.windowed[0], "planAttribution"));
+    assert.equal(Object.hasOwn(fused.history[0], "planAttribution"), false);
+    assert.equal(fused.history[0].model, "gpt-5.6-sol");
+    // Sequence numbers are unique across everything delivered.
+    const sequences = [...fused.windowed, ...fused.history, ...fused.quota].map((row) => row.sequence);
+    assert.equal(new Set(sequences).size, 5 + 6 + 5);
+
+    // The same rows, read separately, are byte-for-byte what the fused read
+    // delivered (attribution keys aside, which history never receives).
+    const separate = [];
+    const separateResult = await source({
+      startAt: result.coverage.coveredAt.startAt,
+      endAt: result.coverage.coveredAt.endAt,
+      usageAttribution: "none",
+      onUsage: (row) => separate.push(row),
+    });
+    const strip = ({ sequence, planAttribution, usageIntervalStartedAt, usageIntervalBasis, ...rest }) => rest;
+    assert.deepEqual(fused.history.map(strip), separate.map(strip));
+    assert.deepEqual(separateResult.coverage, result.indexedHistory.coverage);
+
+    // A covered-range proof failure leaves the window's read intact and is
+    // reported with the code a separate read of that range throws.
+    const database = openLocalUnifiedIndex(fixture.indexFile);
+    database.prepare(`
+      UPDATE usage_event SET source_offset = NULL
+      WHERE observed_at_ms = ?`).run(OBSERVED_MS + 1_000);
+    database.close();
+    const degraded = request();
+    const degradedResult = await source(degraded.options);
+    assert.equal(degradedResult.coverage.status, "complete");
+    assert.deepEqual(degraded.windowed.map((row) => row.sourceOffset), [8, 9, 10, 11, 12]);
+    assert.deepEqual(degraded.history, []);
+    assert.equal(degradedResult.indexedHistory.status, "unavailable");
+    assert.equal(
+      degradedResult.indexedHistory.errorCode,
+      "local_unified_index_accounting_coverage_incomplete",
+    );
+    await assert.rejects(
+      source({
+        startAt: result.coverage.coveredAt.startAt,
+        endAt: result.coverage.coveredAt.endAt,
+        onUsage: () => {},
+      }),
+      (error) => error.code === "local_unified_index_accounting_coverage_incomplete",
+    );
+    for (const indexedHistory of [null, "history", [], {}, { onUsage: 1 }]) {
+      await assert.rejects(
+        source({ startAt: START_AT, endAt: END_AT, indexedHistory }),
+        (error) => error.code === "local_unified_index_read_request_invalid",
+      );
+    }
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("the current unified index maps deterministically without mutating SQLite", async () => {
   const { root, indexFile } = await createIndex();
   try {
@@ -964,6 +1235,96 @@ test("callback errors stay fixed and content-free, and sequence counts callbacks
     assert.equal(quota[0].sequence, 0);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("usage attribution is derived only for consumers that declare they read it", async () => {
+  const { root, indexFile } = await createIndex();
+  try {
+    const source = createLocalUnifiedAccountingSource({ indexFile });
+    const collect = async (request) => {
+      const usage = [];
+      await source({
+        startAt: START_AT,
+        endAt: END_AT,
+        onUsage: (row) => usage.push(row),
+        ...request,
+      });
+      return usage;
+    };
+    const attributionKeys = [
+      "planAttribution",
+      "usageIntervalStartedAt",
+      "usageIntervalBasis",
+    ];
+    for (const request of [{}, { usageAttribution: "required" }]) {
+      const usage = await collect(request);
+      assert.equal(usage.length, 2);
+      for (const row of usage) {
+        for (const key of attributionKeys) assert.ok(Object.hasOwn(row, key), key);
+      }
+    }
+    const aggregate = await collect({ usageAttribution: "none" });
+    assert.equal(aggregate.length, 2);
+    for (const row of aggregate) {
+      for (const key of attributionKeys) {
+        assert.equal(Object.hasOwn(row, key), false, key);
+      }
+      // Everything an aggregate consumer reads is still there, unchanged.
+      assert.equal(row.model, "gpt-5.6-sol");
+      assert.equal(typeof row.timestamp, "string");
+      assert.equal(row.sourceOrdinal, 0);
+    }
+    assert.deepEqual(
+      aggregate.map((row) => row.components.input_uncached_tokens),
+      [10, 20],
+    );
+    for (const usageAttribution of ["all", "", null, 1, true]) {
+      await assert.rejects(
+        source({ startAt: START_AT, endAt: END_AT, usageAttribution }),
+        (error) => error.code === "local_unified_index_read_request_invalid",
+        String(usageAttribution),
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an abort signalled from a macrotask stops the read within one yield cadence", async () => {
+  const rowCount = 6_000;
+  const fixture = await createAttributionIndex({
+    records: Array.from({ length: rowCount }, (_, index) => ({
+      at: index * 1_000,
+      tokens: 1,
+    })),
+  });
+  try {
+    const controller = new AbortController();
+    let delivered = 0;
+    await assert.rejects(
+      createLocalUnifiedAccountingSource({ indexFile: fixture.indexFile })({
+        startAt: START_AT,
+        endAt: new Date(OBSERVED_MS + rowCount * 1_000).toISOString(),
+        signal: controller.signal,
+        usageAttribution: "none",
+        onUsage: () => {
+          delivered += 1;
+          // Arm the abort from the event loop's check phase, exactly the way
+          // a signal handler or the parent's watchdog would reach the loop.
+          if (delivered === 1) setImmediate(() => controller.abort());
+        },
+      }),
+      (error) => error.name === "AbortError"
+        && error.code === "local_unified_index_read_aborted",
+    );
+    // Synchronous consumers are delivered without a promise per row, so the
+    // only place a macrotask can run is the loop's periodic cooperative
+    // yield. The abort must land there, not after the whole stream.
+    assert.ok(delivered >= 2, `expected delivery to begin, saw ${delivered}`);
+    assert.ok(delivered <= 2_049, `abort waited for ${delivered} rows`);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
   }
 });
 

@@ -9,11 +9,13 @@ import {
   assertReplaySafeAccountingCache,
   buildReplaySafeAccountingCache,
   buildReplaySafeAccountingPeriod,
+  createAccountingPricer,
   decodePlanScopedTimelineRow,
   fitCompositionFromCompactCorpus,
   readReplaySafeAccountingCache as readReplaySafeAccountingCacheImpl,
   refreshReplaySafeAccountingCache as refreshReplaySafeAccountingCacheImpl,
 } from "../src/replay-safe-accounting-cache.js";
+import { addUsdStrings } from "@app-usagemonitor/accounting";
 import {
   readLocalCollectorAccountingCache,
   writeLocalCollectorAccountingCache,
@@ -2218,6 +2220,171 @@ test("the unified index supplies the full-history calibration corpus with no sca
   // calibration corpus escapes it.
   assert.equal(cache.coveredAt.endAt, "2026-08-20T12:00:00.000Z");
   assert.equal(cache.schemaVersion, REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION);
+});
+
+test("the exact-ledger fast lane reproduces the decimal-string fold to the digit", async () => {
+  // Deterministic pseudo-random quantities: a fixed LCG, no wall clock.
+  let seed = 0x9e3779b9;
+  const next = (bound) => {
+    seed = (Math.imul(seed, 1_664_525) + 1_013_904_223) >>> 0;
+    return seed % bound;
+  };
+  const pricer = createAccountingPricer();
+  const oracle = createAccountingPricer();
+  const dayMs = 24 * 60 * 60 * 1_000;
+  const events = [];
+  for (let index = 0; index < 4_000; index += 1) {
+    const combinedOnly = next(7) === 0;
+    const unknownModel = next(29) === 0;
+    const timestamp = new Date(NOW - next(400) * dayMs - next(dayMs)).toISOString();
+    events.push({
+      timestamp,
+      model: unknownModel ? "gpt-unknown-model" : "gpt-5.6-sol",
+      // Long-context bands price differently; cover both sides of 272k.
+      totalInputContextTokens: next(3) === 0 ? 272_000 + next(50_000) : next(200_000),
+      components: {
+        input_uncached_tokens: next(300_000),
+        input_cache_read_tokens: next(300_000),
+        input_cache_write_tokens: next(50_000),
+        output_text_tokens: combinedOnly ? 0 : next(40_000),
+        output_reasoning_tokens: combinedOnly ? 0 : next(40_000),
+        output_combined_tokens: combinedOnly ? 1 + next(40_000) : 0,
+      },
+      tierSemantics: {
+        billingSurface: "chatgpt_subscription",
+        codexSpeedMode: "standard",
+        apiServiceTier: "unknown",
+        tierSource: "unknown",
+      },
+      surfaceClassification: {
+        surface: "cli_exec",
+        threadSource: "user",
+        agentScope: "root",
+        lineageDisposition: "standalone",
+      },
+    });
+  }
+  // Per-event card breakdown: exact sum of the event's component costs.
+  let checkedCards = 0;
+  for (const event of events) {
+    const priced = pricer(event, event.components);
+    const perCard = new Map();
+    for (const row of priced.components) {
+      if (row.pricingStatus !== "priced") continue;
+      perCard.set(row.priceCardId, addUsdStrings(perCard.get(row.priceCardId) ?? "0", row.costUsd));
+    }
+    for (const item of priced.priceCardBreakdown) {
+      assert.equal(item.costUsd, perCard.get(item.priceCardId), item.priceCardId);
+      checkedCards += 1;
+    }
+    assert.equal(priced.totalUsd, addUsdStrings(...priced.components
+      .filter((row) => row.pricingStatus === "priced").map((row) => row.costUsd)));
+    // The fast plan's closed shape is unchanged (the full pricer's richer
+    // shape is untouched by this lane and merely passes through it).
+    for (const key of [
+      "components", "coverageStatus", "priceCardBreakdown", "selectedPriceCardIds",
+      "totalUsd", "warnings",
+    ]) assert.ok(Object.hasOwn(priced, key), key);
+    assert.deepEqual(Object.getOwnPropertySymbols(priced).filter((symbol) => (
+      Object.getOwnPropertyDescriptor(priced, symbol).enumerable
+    )), []);
+  }
+  assert.ok(checkedCards > 1_000);
+
+  // Period totals: the retained exact string equals the per-event fold of
+  // the same priced totals, across fast-lane (split output), string-lane
+  // (combined-only output, unknown model) and long-context events alike.
+  const period = await buildReplaySafeAccountingPeriod({
+    id: "history",
+    startAt: new Date(NOW - 401 * dayMs).toISOString(),
+    endAt: new Date(NOW).toISOString(),
+    maximumRssBytes: 64 * 1024 * 1024 * 1024,
+    scan: async ({ onUsage }) => {
+      for (const event of events) onUsage(event);
+    },
+  });
+  let expectedExact = "0";
+  const expectedCards = new Map();
+  for (const event of events) {
+    const components = { ...event.components };
+    const separated = components.output_text_tokens + components.output_reasoning_tokens;
+    if (components.output_combined_tokens > 0 && separated > 0) components.output_combined_tokens = 0;
+    const pricingComponents = components.output_combined_tokens > 0
+      ? { ...components, output_text_tokens: components.output_combined_tokens, output_combined_tokens: 0 }
+      : components;
+    const priced = oracle({ ...event, model: event.model }, pricingComponents);
+    expectedExact = addUsdStrings(expectedExact, priced.totalUsd);
+    for (const item of priced.priceCardBreakdown) {
+      expectedCards.set(item.priceCardId, addUsdStrings(expectedCards.get(item.priceCardId) ?? "0", item.costUsd));
+    }
+  }
+  assert.equal(period.period.events, events.length);
+  assert.equal(period.period.apiPriceEquivalentUsdExact, expectedExact);
+  assert.notEqual(expectedExact, "0");
+  assert.deepEqual(
+    Object.fromEntries(period.period.priceCardBreakdown.map((row) => [row.priceCardId, row.costUsd])),
+    Object.fromEntries(expectedCards),
+  );
+  // The settled rows carry nothing but their closed shape.
+  for (const row of period.period.priceCardBreakdown) {
+    assert.deepEqual(Object.keys(row).sort(), ["costUsd", "events", "priceCardId"]);
+    assert.equal(JSON.stringify(row), JSON.stringify({ priceCardId: row.priceCardId, events: row.events, costUsd: row.costUsd }));
+  }
+  assert.equal(Object.getOwnPropertySymbols(period.period).length, 0);
+});
+
+test("aggregate scans declare no attribution and only the windowed fallback corpus requires it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-attribution-declaration-"));
+  const indexFile = join(directory, "local-unified-index-v1.sqlite");
+  await writeUnifiedCalibrationFixture(indexFile, {
+    resets: [
+      Date.parse("2025-05-01T00:00:00.000Z"),
+      Date.parse("2025-05-08T00:00:00.000Z"),
+      Date.parse("2025-05-15T00:00:00.000Z"),
+    ],
+  });
+  const recording = (scan, modes) => async (options) => {
+    modes.push(options.usageAttribution ?? "(undeclared)");
+    return scan(options);
+  };
+  try {
+    // The unified corpus supplies calibration: the windowed pass is a pure
+    // aggregate consumer and must not ask for per-row attribution.
+    const withCorpus = [];
+    await buildReplaySafeAccountingCache({
+      now: () => Date.parse("2026-08-20T12:00:00.000Z"),
+      unifiedIndexFile: indexFile,
+      scan: recording(scanner([]), withCorpus),
+    });
+    assert.deepEqual(withCorpus, ["none"]);
+
+    // No usable unified corpus: the windowed pass retains the compact
+    // calibration rows itself and therefore needs attribution on every row.
+    const fallback = [];
+    await buildReplaySafeAccountingCache({
+      now: () => Date.parse("2026-08-20T12:00:00.000Z"),
+      scan: recording(scanner([]), fallback),
+    });
+    assert.deepEqual(fallback, ["required"]);
+
+    // Unified authority without a calibration corpus: the windowed pass still
+    // requires attribution, the full-history period total never does.
+    const unified = [];
+    await buildReplaySafeAccountingCache({
+      sourceMode: "unified",
+      expectedGeneration: "generation-test-1",
+      scan: recording(completeUnifiedScanner([
+        usageEvent({
+          timestamp: "2026-07-27T11:00:00.000Z",
+          components: { input_uncached_tokens: 1_000 },
+        }),
+      ]), unified),
+      now: () => NOW,
+    });
+    assert.deepEqual(unified, ["required", "none"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("declared speed baselines resolve unified calibration events before scenario fitting", async () => {
