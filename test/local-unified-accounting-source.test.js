@@ -15,6 +15,7 @@ import { join } from "node:path";
 import {
   LOCAL_UNIFIED_ACCOUNTING_SOURCE_VERSION,
   createLocalUnifiedAccountingSource,
+  canonicalInstant,
   createLocalUnifiedUsageAttributionReader,
   precomputeLocalUnifiedUsageAttribution,
 } from "../src/local-unified-accounting-source.js";
@@ -648,6 +649,65 @@ test("attribution reads remain deterministic across interleaved long sources and
     database.close();
     await rm(fixture.root, { recursive: true, force: true });
   }
+});
+
+test("canonicalInstant's shape fast path agrees with the Date round trip on every input class", () => {
+  const roundTrip = (value) => {
+    if (typeof value !== "string") return null;
+    const timestamp = Date.parse(value);
+    return Number.isFinite(timestamp)
+        && new Date(timestamp).toISOString() === value
+      ? value
+      : null;
+  };
+  const pad = (number, width) => String(number).padStart(width, "0");
+  const inputs = [];
+  // The whole calendar field grid, including every out-of-range neighbour.
+  for (const year of [0, 1, 4, 100, 400, 1900, 1970, 2000, 2024, 2026, 2100, 9999]) {
+    for (let month = 0; month <= 13; month += 1) {
+      for (let day = 0; day <= 32; day += 1) {
+        inputs.push(`${pad(year, 4)}-${pad(month, 2)}-${pad(day, 2)}T12:34:56.789Z`);
+      }
+    }
+  }
+  for (const [hour, minute, second] of [
+    [0, 0, 0], [23, 59, 59], [24, 0, 0], [23, 60, 0], [23, 59, 60],
+    [25, 0, 0], [99, 99, 99], [12, 0, 60], [0, 60, 0],
+  ]) {
+    inputs.push(`2026-06-15T${pad(hour, 2)}:${pad(minute, 2)}:${pad(second, 2)}.000Z`);
+  }
+  inputs.push(
+    "2026-06-15T12:00:00Z", "2026-06-15T12:00:00.00Z", "2026-06-15T12:00:00.0000Z",
+    "2026-06-15 12:00:00.000Z", "2026-06-15T12:00:00.000+00:00", "2026-06-15T12:00:00.000z",
+    "+002026-06-15T12:00:00.000Z", "+010000-01-01T00:00:00.000Z", "-000001-01-01T00:00:00.000Z",
+    "-000000-01-01T00:00:00.000Z", "275760-09-13T00:00:00.000Z", "+275760-09-13T00:00:00.000Z",
+    "+275760-09-13T00:00:00.001Z", "-271821-04-20T00:00:00.000Z", "-271821-04-19T23:59:59.999Z",
+    "２０２６-06-15T12:00:00.000Z", "2026-06-15T12:00:00.000Z\n", " 2026-06-15T12:00:00.000Z",
+    "", "Z", null, undefined, 5, {}, [], true,
+  );
+  // Random instants across the whole Date range (4-digit and expanded years)
+  // plus single-character corruptions of canonical strings.
+  let seed = 0x2545f491;
+  const next = () => {
+    seed = (Math.imul(seed, 1_664_525) + 1_013_904_223) >>> 0;
+    return seed;
+  };
+  const randomMs = () => Math.floor((next() / 2 ** 32) * 2 * 8.64e15) - 8.64e15;
+  for (let index = 0; index < 20_000; index += 1) {
+    inputs.push(new Date(randomMs()).toISOString());
+  }
+  for (let index = 0; index < 5_000; index += 1) {
+    const canonical = new Date(Math.floor((next() / 2 ** 32) * 8.64e15) - 4.32e15).toISOString();
+    const position = next() % canonical.length;
+    const replacement = String.fromCharCode(48 + (next() % 10));
+    inputs.push(`${canonical.slice(0, position)}${replacement}${canonical.slice(position + 1)}`);
+  }
+  let checked = 0;
+  for (const input of inputs) {
+    assert.equal(canonicalInstant(input), roundTrip(input), JSON.stringify(input));
+    checked += 1;
+  }
+  assert.ok(checked > 30_000);
 });
 
 test("the one-pass attribution precomputation reproduces every point-query read exactly", async (t) => {

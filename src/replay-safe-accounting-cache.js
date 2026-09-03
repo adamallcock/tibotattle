@@ -16,6 +16,7 @@ import {
   defaultLocalAnalysisIndexSecretPath,
 } from "./local-analysis-index.js";
 import {
+  canonicalInstant,
   createLocalUnifiedAccountingSource,
   createLocalUnifiedUsageAttributionReader,
   precomputeLocalUnifiedUsageAttribution,
@@ -1027,14 +1028,6 @@ function transitionResourceLimits(value) {
     }
     return [key, selected];
   }));
-}
-
-function canonicalInstant(value) {
-  if (typeof value !== "string") return null;
-  const timestamp = Date.parse(value);
-  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value
-    ? value
-    : null;
 }
 
 function emptyComponents() {

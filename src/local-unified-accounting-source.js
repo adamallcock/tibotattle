@@ -60,8 +60,38 @@ function fixedError(code, name = "Error") {
   return error;
 }
 
-function canonicalInstant(value) {
+// The exact shape Date#toISOString produces for years 0000 through 9999. A
+// string of this shape whose fields are in range is the unique canonical
+// representation of its instant, so parsing it and formatting the result
+// would hand back the same string; that is what the round trip below checks,
+// and the shape test answers it without constructing a Date. Every other
+// input — expanded ±YYYYYY years, offsets, missing millis, garbage — still
+// takes the round trip and is judged by it. The two paths agree on every
+// input (see the reader's test suite, which drives both over the whole
+// field grid, the Date range edges and randomized corruptions).
+const CANONICAL_INSTANT_SHAPE =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.\d{3}Z$/u;
+const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+function daysInMonth(year, month) {
+  if (month !== 2) return DAYS_IN_MONTH[month - 1];
+  return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0 ? 29 : 28;
+}
+
+export function canonicalInstant(value) {
   if (typeof value !== "string") return null;
+  const shape = CANONICAL_INSTANT_SHAPE.exec(value);
+  if (shape !== null) {
+    const month = Number(shape[2]);
+    const day = Number(shape[3]);
+    return month >= 1 && month <= 12
+      && day >= 1 && day <= daysInMonth(Number(shape[1]), month)
+      && Number(shape[4]) <= 23
+      && Number(shape[5]) <= 59
+      && Number(shape[6]) <= 59
+      ? value
+      : null;
+  }
   const timestamp = Date.parse(value);
   return Number.isFinite(timestamp)
       && new Date(timestamp).toISOString() === value
