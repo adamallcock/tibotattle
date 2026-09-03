@@ -429,3 +429,39 @@ retained receipts were independently verified unchanged and the supported
 recovery command reported no interrupted generation. Updating the one
 transitive dependency requires a new source freeze and a complete fresh R7 run;
 the canceled attempt is not release evidence.
+
+The restarted full R7 run on `bf574722` completed all six synthetic/runtime
+profiles, then failed during real-history `export_set_verify` with
+`hardlink_zero_rejected` on 2026-09-03 UTC. This means the filesystem sampler
+observed an owned regular file with zero links and an immediate second pathname
+lookup succeeded. Its fixed diagnostic does not distinguish a persistent
+zero-link inode from a newly created replacement. Temporary SQLite journal
+churn is a hypothesis, not an established cause. Verification success is not
+proven. Automatic recovery completed, the ten retained receipts remain
+unchanged, and the unchanged sampler tests pass 17/17. The incomplete run is
+not release evidence; PR #102 and the new artifact remain held while the
+filesystem case is investigated using synthetic data only.
+
+A bounded synthetic macOS/Node 26.2.0 experiment subsequently reproduced this
+failure class without injected filesystem observations: 20,000 SQLite
+DELETE/FULL transactions completed normally; 43 zero-link journal observations
+split into 22 confirmed disappearances and 21 distinct owned, one-link regular
+replacements. The unchanged sampler rejected all 21 replacements. Continuous
+sampling and one-record transactions amplified the race; these are diagnostic
+results, not release performance evidence or proof of the specific failed
+real-history pathname. The sampler correction requires one verified replacement
+in an unchanged parent/root, counts both observed sizes conservatively, and
+retains refusal of unsafe or ambiguous states. Its new source must pass focused
+tests and review before another complete R7 generation; no old partial profile
+may be reused.
+
+Sampler v0.2 validation passes 64/64 focused tests, including one-reread,
+unsafe-replacement, parent/root identity, integer-overflow, and redaction cases;
+39/39 schema/recovery tests; and 8/8 synthetic lifecycle/materialized-boundary
+tests. Recovery tests require process-observation permission: three sandboxed
+liveness checks failed and all passed unchanged with that permission. Preflight
+passes 20/20 and architecture has no boundary debt. A fresh bounded SQLite
+experiment completed all 20,000 transactions, observed 21 valid replacements
+plus 74 disappearances, and recorded no sampler failures. Different timing and
+sampling counts are not a performance comparison. Review found no outstanding
+correctness issue; the complete source gate and protected R7 remain pending.

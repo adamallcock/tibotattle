@@ -15,6 +15,12 @@ history, or released. It must be rebound to the exact merged source revision
 that follows the 0.1.17 refresh-policy and mixed-plan correctness fixes before
 implementation begins.
 
+PR #94's formal account/plan-attribution empirical gate remains **OPEN / NOT
+RUN** unless its separately reviewed cross-revision comparator and sanitizer
+produce the required attribution and eligibility reconciliation. This plan's
+profiling receipts, synthetic comparisons, R7 results, and native/dogfood QA do
+not close that gate or authorize hosted methodology activation.
+
 Draft source boundary: branch `codex/refresh-accounting-progress-rc9`, based on
 `35802d21ede67d362533f4e2be6b38041ece1cda` (PR #101). This is not the final
 optimization baseline: the refresh, snapshot, and plan-scope corrections are

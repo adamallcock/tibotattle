@@ -6,7 +6,7 @@ import {
   readBoundedDirectoryEntries,
 } from "./export-resource-policy.js";
 
-export const R7_FILESYSTEM_HIGH_WATER_VERSION = "g1-r7-filesystem-high-water-v0.1";
+export const R7_FILESYSTEM_HIGH_WATER_VERSION = "g1-r7-filesystem-high-water-v0.2";
 export const R7_FILESYSTEM_SAMPLE_INTERVAL_MS = 100;
 
 export const R7_FILESYSTEM_HIGH_WATER_OUTCOMES = Object.freeze([
@@ -57,6 +57,22 @@ function safeIdentity(stat) {
 
 function sameIdentity(stat, identity) {
   return safeIdentity(stat) && stat.dev === identity.dev && stat.ino === identity.ino;
+}
+
+function safeRegularIdentity(stat) {
+  return stat?.isFile?.() === true
+    && stat.isSymbolicLink() === false
+    && Number.isSafeInteger(stat.dev) && stat.dev >= 0
+    && Number.isSafeInteger(stat.ino) && stat.ino >= 0;
+}
+
+function countRegularFile(totals, stat) {
+  if (!Number.isSafeInteger(stat.size) || stat.size < 0
+      || totals.bytes > Number.MAX_SAFE_INTEGER - stat.size) {
+    fail("sampling_failed");
+  }
+  totals.bytes += stat.size;
+  totals.fileCount += 1;
 }
 
 function normalizeMaximumEntries(value) {
@@ -286,7 +302,13 @@ export async function measureR7FilesystemRoot(binding, {
       }
       if (names.length > remaining) fail("directory_limit_exceeded");
       for (const name of names) {
-        await rootStillBound(state, deps);
+        if (!await assertDirectoryIdentity(
+          directory.path,
+          directory.identity,
+          state,
+          deps,
+          { allowMissing: directory.path !== state.canonical },
+        )) break;
         const path = join(directory.path, name);
         let stat;
         try {
@@ -313,18 +335,20 @@ export async function measureR7FilesystemRoot(binding, {
           continue;
         }
         if (!stat.isFile()) fail("unsupported_entry_rejected");
+        let replacement = null;
         if (stat.nlink !== 1) {
           const owned = typeof process.getuid !== "function" || stat.uid === process.getuid();
           let confirmedTerminalUnlink = false;
           if (!allowTransientOwnedHardlinks) fail("hardlink_rejected");
           if (!owned) fail("hardlink_unowned_rejected");
           if (stat.nlink === 0) {
-            // A path-based lstat can race the final unlink of an owned export
-            // transaction inode and return its terminal zero-link state. Treat
-            // only a subsequent ENOENT as ordinary disappearance. A path that
-            // still resolves (including a replacement) remains fail-closed.
+            if (!safeRegularIdentity(stat)) fail("hardlink_zero_rejected");
+            // SQLite DELETE-mode journals can be unlinked and recreated between
+            // path lookups. Recheck once: disappearance or a distinct, owned,
+            // singly-linked regular inode in the still-bound parent is safe to
+            // measure. Persistent zero links and ambiguous replacements fail.
             try {
-              await deps.lstatPath(path);
+              replacement = await deps.lstatPath(path);
             } catch (error) {
               if (error?.code === "ENOENT") {
                 await rootStillBound(state, deps);
@@ -333,16 +357,32 @@ export async function measureR7FilesystemRoot(binding, {
                 fail("sampling_failed");
               }
             }
+            // A confirmed disappearance retains removable-parent tolerance;
+            // every resolving replacement requires the exact parent to remain.
+            await assertDirectoryIdentity(
+              directory.path,
+              directory.identity,
+              state,
+              deps,
+              { allowMissing: confirmedTerminalUnlink && directory.path !== state.canonical },
+            );
+            if (replacement !== null) {
+              if (!safeRegularIdentity(replacement)
+                  || replacement.dev !== stat.dev || replacement.ino === stat.ino
+                  || replacement.uid !== stat.uid || replacement.nlink !== 1) {
+                fail("hardlink_zero_rejected");
+              }
+              confirmedTerminalUnlink = true;
+            }
             if (!confirmedTerminalUnlink) fail("hardlink_zero_rejected");
           }
           if (stat.nlink !== 2 && !confirmedTerminalUnlink) fail("hardlink_many_rejected");
         }
-        if (!Number.isSafeInteger(stat.size) || stat.size < 0
-            || totals.bytes > Number.MAX_SAFE_INTEGER - stat.size) {
-          fail("sampling_failed");
-        }
-        totals.bytes += stat.size;
-        totals.fileCount += 1;
+        countRegularFile(totals, stat);
+        // Keep both observed inode sizes: this is a conservative mutable-tree
+        // high-water sample, not a claim that they coexisted at one instant.
+        // entryCount counts enumerated paths; fileCount counts observed inodes.
+        if (replacement !== null) countRegularFile(totals, replacement);
       }
       await assertDirectoryIdentity(
         directory.path,
