@@ -1,18 +1,24 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, link, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { EventEmitter } from "node:events";
+import { chmod, link, mkdir, mkdtemp, open, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
   detailedAccountingBenchmarkFailure,
+  digestDetailedAccountingBenchmarkFile,
   inspectDetailedAccountingBenchmarkIndex,
   parseDetailedAccountingBenchmarkArguments,
   parseMacOsTimeMetrics,
   parseSuccessfulAccountingEnvelope,
   projectDetailedAccountingBenchmarkGeneration,
+  publishDetailedAccountingBenchmarkReceipt,
   runBoundedBenchmarkCommand,
   runDetailedAccountingBenchmark,
+  snapshotDetailedAccountingDependencies,
+  validateDetailedAccountingDependencyPair,
   validateDetailedAccountingBenchmarkReceipt,
   verifyAccountingBenchmarkArtifact,
 } from "../scripts/benchmark-detailed-accounting.mjs";
@@ -135,7 +141,7 @@ test("bounded command enforces both stdout and stderr limits and redacts failure
   await assert.rejects(runBoundedBenchmarkCommand(process.execPath, ["--eval",
     "process.stderr.write('private-secret'); process.exit(42);"], { timeoutMs: 5000 }), codeIs("command_failed"));
   assert.deepEqual(detailedAccountingBenchmarkFailure(new Error("private-secret")), {
-    schema: "detailed-accounting-child-benchmark-v1", status: "failed", code: "command_failed",
+    schema: "detailed-accounting-child-benchmark-v2", status: "failed", code: "command_failed",
   });
 });
 
@@ -148,12 +154,176 @@ test("bounded command times out an uncooperative child and honors cancellation",
   await assert.rejects(runBoundedBenchmarkCommand(process.execPath, [], { signal: controller.signal }), codeIs("command_aborted"));
 });
 
+test("hash cancellation stops on the first observed chunk rather than finishing the file", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "accounting-benchmark-hash-abort-test-"));
+  try {
+    const file = join(directory, "synthetic-bytes");
+    await writeFile(file, Buffer.alloc(256 * 1024, 7), { mode: 0o600 });
+    const controller = new AbortController();
+    let chunks = 0;
+    await assert.rejects(digestDetailedAccountingBenchmarkFile(file, null, {
+      signal: controller.signal,
+      onChunk: () => { chunks += 1; controller.abort(); },
+    }), codeIs("command_aborted"));
+    assert.equal(chunks, 1);
+    assert.equal(await digestDetailedAccountingBenchmarkFile(file), hash(Buffer.alloc(256 * 1024, 7)));
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("cancellation of a live command terminates the child before the test ends", async () => {
+  const controller = new AbortController();
+  let closed;
+  let closeObserved = false;
+  await assert.rejects(runBoundedBenchmarkCommand(process.execPath, ["--eval",
+    "process.on('SIGTERM', () => {}); process.stdout.write('ready'); setInterval(() => {}, 1000);"], {
+    signal: controller.signal, timeoutMs: 5000, killGraceMs: 20,
+    spawnCommand: (...args) => {
+      const child = spawn(...args);
+      closed = new Promise((resolveClosed) => child.once("close", (code, signal) => {
+        closeObserved = true;
+        resolveClosed({ code, signal });
+      }));
+      child.stdout.once("data", () => controller.abort());
+      return child;
+    },
+  }), (error) => {
+    assert.equal(closeObserved, true, "command must not settle before its direct child's close event");
+    return codeIs("command_aborted")(error);
+  });
+  assert.deepEqual(await closed, { code: null, signal: "SIGKILL" });
+});
+
+test("a missing close after escalation is reported as unconfirmed termination, not successful cancellation", async () => {
+  const child = new EventEmitter();
+  child.stdin = { on() {}, destroy() {} };
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = () => false;
+  await assert.rejects(runBoundedBenchmarkCommand("synthetic-never-spawned", [], {
+    spawnCommand: () => child, timeoutMs: 1, killGraceMs: 1,
+  }), codeIs("command_termination_unconfirmed"));
+  assert.equal(detailedAccountingBenchmarkFailure({ code: "command_termination_unconfirmed" }).code,
+    "command_termination_unconfirmed");
+});
+
+test("late cancellation cannot publish a success receipt or overwrite an existing receipt", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "accounting-benchmark-publish-abort-test-"));
+  try {
+    const controller = new AbortController();
+    await assert.rejects(publishDetailedAccountingBenchmarkReceipt(directory, syntheticReceipt(), {
+      signal: controller.signal, beforePublish: () => controller.abort(),
+    }), codeIs("command_aborted"));
+    await assert.rejects(readFile(join(directory, "receipt.json")), (error) => error.code === "ENOENT");
+    const duringWrite = new AbortController();
+    await assert.rejects(publishDetailedAccountingBenchmarkReceipt(directory, syntheticReceipt(), {
+      signal: duringWrite.signal, afterWrite: () => duringWrite.abort(),
+    }), codeIs("command_aborted"));
+    await assert.rejects(readFile(join(directory, "receipt.json")), (error) => error.code === "ENOENT");
+    await publishDetailedAccountingBenchmarkReceipt(directory, syntheticReceipt());
+    const original = await readFile(join(directory, "receipt.json"));
+    await assert.rejects(publishDetailedAccountingBenchmarkReceipt(directory, syntheticReceipt()),
+      (error) => error.code === "EEXIST");
+    assert.deepEqual(await readFile(join(directory, "receipt.json")), original);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+async function syntheticDependencyRevision(directory, side) {
+  const root = join(directory, side);
+  const runtime = join(root, "node_modules/.pnpm/synthetic-runtime@1.0.0/node_modules/synthetic-runtime");
+  const git = (args) => runBoundedBenchmarkCommand("/usr/bin/git", ["-C", root, ...args], {
+    env: { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },
+  });
+  for (const child of ["src", "packages/accounting", "node_modules/@app-usagemonitor",
+    "node_modules/.pnpm/synthetic-runtime@1.0.0/node_modules/synthetic-runtime"]) {
+    await mkdir(join(root, child), { recursive: true, mode: 0o700 });
+  }
+  await writeFile(join(root, ".gitignore"), "node_modules/\n", { mode: 0o600 });
+  await writeFile(join(root, "package.json"), JSON.stringify({ name: "synthetic-benchmark", type: "module",
+    dependencies: { "@app-usagemonitor/accounting": "workspace:*", "synthetic-runtime": "1.0.0" } }), { mode: 0o600 });
+  await writeFile(join(root, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\npackages:\n  synthetic-runtime@1.0.0:\n    resolution: {}\nsnapshots:\n  synthetic-runtime@1.0.0: {}\n", { mode: 0o600 });
+  await writeFile(join(root, "src/replay-safe-accounting-rebuild-child.js"),
+    "import '@app-usagemonitor/accounting'; import 'synthetic-runtime'; throw new Error('must not execute product modules');\n", { mode: 0o600 });
+  await writeFile(join(root, "packages/accounting/package.json"), JSON.stringify({ name: "@app-usagemonitor/accounting",
+    version: "1.0.0", type: "module", exports: { ".": { import: "./index.js", default: "./index.js" } } }), { mode: 0o600 });
+  await writeFile(join(root, "packages/accounting/index.js"),
+    "export const synthetic = true; throw new Error('must not execute workspace modules');\n", { mode: 0o600 });
+  await symlink("../../packages/accounting", join(root, "node_modules/@app-usagemonitor/accounting"));
+  await symlink(".pnpm/synthetic-runtime@1.0.0/node_modules/synthetic-runtime", join(root, "node_modules/synthetic-runtime"));
+  await writeFile(join(runtime, "package.json"), JSON.stringify({ name: "synthetic-runtime", version: "1.0.0",
+    type: "module", exports: { import: "./index.js", require: "./require.cjs" } }), { mode: 0o600 });
+  await writeFile(join(runtime, "index.js"), "throw new Error('must not execute installed modules');\n", { mode: 0o600 });
+  await writeFile(join(runtime, "require.cjs"), "throw new Error('must not execute CJS modules');\n", { mode: 0o600 });
+  await git(["init", "--quiet"]);
+  await git(["add", "."]);
+  await git(["-c", "user.name=Synthetic Test", "-c", "user.email=synthetic@example.invalid",
+    "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "synthetic dependency fixture"]);
+  return { root, runtime, git };
+}
+
+test("dependency snapshots bind own tracked workspace bytes and resolved pnpm package sources without executing them", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "accounting-benchmark-dependency-test-"));
+  try {
+    const baseline = await syntheticDependencyRevision(directory, "baseline");
+    const candidate = await syntheticDependencyRevision(directory, "candidate");
+    const before = { baseline: await snapshotDetailedAccountingDependencies(baseline.root),
+      candidate: await snapshotDetailedAccountingDependencies(candidate.root) };
+    assert.equal(before.baseline.sourceSha256, before.candidate.sourceSha256);
+    assert.equal(before.baseline.runtimeSha256, before.candidate.runtimeSha256);
+    assert.match(validateDetailedAccountingDependencyPair(before), /^[a-f0-9]{64}$/u);
+    assert.deepEqual(await snapshotDetailedAccountingDependencies(candidate.root), before.candidate);
+    assert.doesNotMatch(JSON.stringify(before), /\/tmp|private|node_modules|accounting|synthetic|\.js/u);
+    const entry = join(candidate.runtime, "index.js");
+    const original = await readFile(entry);
+    await writeFile(entry, "throw new Error('different installed bytes');\n");
+    const changed = { ...before, candidate: await snapshotDetailedAccountingDependencies(candidate.root) };
+    assert.throws(() => validateDetailedAccountingDependencyPair(changed), codeIs("dependency_mismatch"));
+    await writeFile(entry, original);
+    await utimes(entry, new Date(0), new Date(0));
+    const restored = { ...before, candidate: await snapshotDetailedAccountingDependencies(candidate.root) };
+    assert.equal(restored.candidate.runtimeSha256, before.candidate.runtimeSha256);
+    assert.throws(() => validateDetailedAccountingDependencyPair(restored, before), codeIs("dependency_changed"));
+    const manifestFile = join(candidate.runtime, "package.json");
+    const manifest = JSON.parse(await readFile(manifestFile, "utf8"));
+    await writeFile(manifestFile, JSON.stringify({ ...manifest, version: "2.0.0" }));
+    await assert.rejects(snapshotDetailedAccountingDependencies(candidate.root), codeIs("dependency_invalid"));
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("dependency inspection rejects cross-root workspace links, hidden tracked edits, surprising package links and bounds", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "accounting-benchmark-dependency-refusal-test-"));
+  try {
+    const baseline = await syntheticDependencyRevision(directory, "baseline");
+    const candidate = await syntheticDependencyRevision(directory, "candidate");
+    const workspaceLink = join(candidate.root, "node_modules/@app-usagemonitor/accounting");
+    await rm(workspaceLink);
+    await symlink(join(baseline.root, "packages/accounting"), workspaceLink);
+    await assert.rejects(snapshotDetailedAccountingDependencies(candidate.root), codeIs("dependency_invalid"));
+    await rm(workspaceLink);
+    await symlink("../../packages/accounting", workspaceLink);
+    const alias = join(candidate.runtime, "alias.js");
+    await symlink("index.js", alias);
+    await assert.rejects(snapshotDetailedAccountingDependencies(candidate.root), codeIs("dependency_invalid"));
+    await rm(alias);
+    for (const limits of [{ maximumFiles: 1 }, { maximumEntries: 1 }, { maximumBytes: 1 }, { maximumFileBytes: 1 }]) {
+      await assert.rejects(snapshotDetailedAccountingDependencies(candidate.root, { limits }), codeIs("dependency_limit_exceeded"));
+    }
+    await assert.rejects(snapshotDetailedAccountingDependencies(candidate.root, { limits: { maximumFiles: 1025 } }), codeIs("dependency_invalid"));
+    await candidate.git(["update-index", "--assume-unchanged", "packages/accounting/index.js"]);
+    await writeFile(join(candidate.root, "packages/accounting/index.js"), "export const changed = true;\n");
+    assert.equal((await candidate.git(["status", "--porcelain=v1"])).stdout, "");
+    await assert.rejects(snapshotDetailedAccountingDependencies(candidate.root), codeIs("dependency_invalid"));
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(snapshotDetailedAccountingDependencies(candidate.root, { signal: controller.signal }), codeIs("command_aborted"));
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
 function syntheticReceipt() {
   const numericGeneration = Object.fromEntries(["id", "indexedSourceCount", "indexedSourceBytes",
     "skippedSourceCount", "skippedSourceBytes", "skippedThreadCount", "usageEvents", "quotaOccurrences", "toolFacts"]
     .map((key) => [key, key === "id" ? 1 : 0]));
   return {
-    schema: "detailed-accounting-child-benchmark-v1", scope: "isolated_accounting_child_only",
+    schema: "detailed-accounting-child-benchmark-v2", scope: "isolated_accounting_child_only",
     runtime: { version: "v26.2.0", platform: "darwin", arch: "arm64", sha256: "a".repeat(64) },
     baselineRevision: "b".repeat(40), candidateRevision: "c".repeat(40),
     index: { sha256: "d".repeat(64), bytes: 4096 }, generation: { ...numericGeneration, fingerprintSha256: "e".repeat(64),
@@ -164,6 +334,7 @@ function syntheticReceipt() {
     runs: [0, 1].flatMap((run) => ["baseline", "candidate"].map((side) => ({ side, run, warmup: run === 0,
       wallMs: 20, userCpuMs: 10, systemCpuMs: 5, peakRssBytes: 512 }))),
     exactOutputMatch: true, indexUnchanged: true, sourceUnchanged: true,
+    dependenciesSha256: "f".repeat(64),
   };
 }
 
@@ -182,6 +353,8 @@ test("receipt schema is closed recursively, complete by revision/run, and conten
     (value) => { value.runs[1] = value.runs[0]; },
     (value) => { value.indexUnchanged = false; },
     (value) => { value.exactOutputMatch = false; },
+    (value) => { value.dependenciesSha256 = "private-path"; },
+    (value) => { value.schema = "detailed-accounting-child-benchmark-v1"; delete value.dependenciesSha256; },
   ]) {
     const changed = structuredClone(receipt);
     mutate(changed);
@@ -218,7 +391,13 @@ test("synthetic substitute revisions exercise the complete private runner withou
     for (const side of ["baseline", "candidate"]) {
       const root = join(directory, side);
       await mkdir(join(root, "src"), { recursive: true, mode: 0o700 });
-      await writeFile(join(root, "package.json"), '{"type":"module"}', { mode: 0o600 });
+      await mkdir(join(root, "node_modules/synthetic-runtime"), { recursive: true, mode: 0o700 });
+      await writeFile(join(root, ".gitignore"), "node_modules/\n", { mode: 0o600 });
+      await writeFile(join(root, "package.json"), '{"type":"module","dependencies":{"synthetic-runtime":"1.0.0"}}', { mode: 0o600 });
+      await writeFile(join(root, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\npackages:\n  synthetic-runtime@1.0.0:\n    resolution: {}\n", { mode: 0o600 });
+      await writeFile(join(root, "node_modules/synthetic-runtime/package.json"),
+        '{"name":"synthetic-runtime","version":"1.0.0","type":"module","exports":"./index.js"}', { mode: 0o600 });
+      await writeFile(join(root, "node_modules/synthetic-runtime/index.js"), "export const synthetic = true;\n", { mode: 0o600 });
       await writeFile(join(root, "src/local-unified-index.js"),
         `export const openLocalUnifiedIndex = () => ({ close() {} }); export const readUnifiedIndexGenerationDescriptor = () => (${JSON.stringify(generation)});`, { mode: 0o600 });
       await writeFile(join(root, "src/replay-safe-accounting-cache.js"),
@@ -226,7 +405,7 @@ test("synthetic substitute revisions exercise the complete private runner withou
         + "export const REPLAY_SAFE_ACCOUNTING_REBUILD_REQUEST_VERSION = 'replay-safe-accounting-rebuild-request-v1';\n"
         + "export function assertReplaySafeAccountingCache(value) { if(value.synthetic !== true) throw new Error('invalid'); return value; }", { mode: 0o600 });
       await writeFile(join(root, "src/replay-safe-accounting-rebuild-child.js"),
-        "import { readFile, writeFile } from 'node:fs/promises'; import { createHash } from 'node:crypto';\n"
+        "import { readFile, writeFile } from 'node:fs/promises'; import { createHash } from 'node:crypto'; import 'synthetic-runtime';\n"
         + "process.stdin.resume(); process.stdin.on('end', () => process.exit(9));\n"
         + "const request = JSON.parse(await readFile(process.argv[2], 'utf8')); const payload = JSON.stringify({ synthetic: true, nowMs: request.nowMs });\n"
         + "await writeFile(process.argv[3], payload, { mode: 0o600, flag: 'wx' });\n"
@@ -250,6 +429,7 @@ test("synthetic substitute revisions exercise the complete private runner withou
     assert.equal(receipt.exactOutputMatch, true);
     assert.equal(receipt.indexUnchanged, true);
     assert.equal(receipt.sourceUnchanged, true);
+    assert.match(receipt.dependenciesSha256, /^[a-f0-9]{64}$/u);
     assert.equal(receipt.generation.publicationStatus, "partial");
     assert.deepEqual(receipt.runs.map(({ side, run }) => [side, run]), [
       ["baseline", 0], ["candidate", 0], ["candidate", 1], ["baseline", 1],
@@ -257,6 +437,22 @@ test("synthetic substitute revisions exercise the complete private runner withou
     assert.doesNotMatch(JSON.stringify(receipt), /synthetic-only|private|input\.sqlite|\/tmp|account_id/iu);
     await assert.rejects(runDetailedAccountingBenchmark(options), (error) => error.code === "EEXIST");
     const candidateRoot = join(directory, "candidate");
+    const lateAbortDirectory = join(directory, "late-abort-output");
+    const controller = new AbortController();
+    await assert.rejects(runDetailedAccountingBenchmark({ ...options, outputDirectory: lateAbortDirectory }, {
+      signal: controller.signal, beforeReceiptPublication: () => controller.abort(),
+    }), codeIs("command_aborted"));
+    await assert.rejects(readFile(join(lateAbortDirectory, "receipt.json")), (error) => error.code === "ENOENT");
+    const mutatedDirectory = join(directory, "changed-dependency-output");
+    const runtimeFile = join(candidateRoot, "node_modules/synthetic-runtime/index.js");
+    const originalRuntime = await readFile(runtimeFile);
+    await assert.rejects(runDetailedAccountingBenchmark({ ...options, outputDirectory: mutatedDirectory }, {
+      afterAccountingRun: async ({ side, run }) => {
+        if (side === "baseline" && run === 0) await writeFile(runtimeFile, "export const synthetic = false;\n");
+      },
+    }), codeIs("dependency_mismatch"));
+    await assert.rejects(readFile(join(mutatedDirectory, "receipt.json")), (error) => error.code === "ENOENT");
+    await writeFile(runtimeFile, originalRuntime);
     const commitCandidate = async () => {
       const git = (args) => runBoundedBenchmarkCommand("/usr/bin/git", ["-C", candidateRoot, ...args], {
         env: { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" },

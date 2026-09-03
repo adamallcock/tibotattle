@@ -557,6 +557,18 @@ those tooling safeguards before final release validation; the measured product
 code remains unchanged by that repair. This does not close PR #94's distinct
 empirical gate or establish end-to-end installed refresh time.
 
+The benchmark-tool follow-up now propagates cancellation through hashing,
+source checks and receipt publication, confirms direct-child closure after
+forced termination, and binds bounded dependency snapshots before and after a
+comparison. Its closed v2 receipt adds only an aggregate dependency digest;
+the completed v1 measurement is not relabeled. The final focused suite passed
+18/18, preflight 20/20, and architecture with zero debt; independent review
+found no remaining concrete issue. No product/workload source changed in this
+tooling repair. The retained macOS owning gate passed 90/90 with no skips or
+cancellations on Node 26.2.0/macOS arm64, including all compiled artifact
+blocks. Signing, installed verification and the final broad source gate remain
+separate.
+
 The latest owner authorization covers local candidate preparation, signing,
 notarization and dogfood testing, not publication. Stable release approval,
 remote version-tag publication, GitHub release, Sparkle feed, Homebrew/website,

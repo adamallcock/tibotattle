@@ -102,6 +102,12 @@ safeguards are being corrected separately without changing the measured product
 code; a later harness revision must not silently relabel this v1 measurement.
 An earlier interrupted comparison was excluded entirely from these results.
 
+Subsequent tooling follow-up on 2026-09-03: the v2 harness adds bounded
+before/after dependency snapshots and cancellation-safe hashing/publication,
+including confirmed direct-child closure after forced termination. Its focused
+synthetic tests passed 18/18 and independent review found no remaining concrete
+issue. This does not retroactively turn this completed v1 run into v2 evidence.
+
 ## Remaining gates
 
 Complete optimized-source R7, final root/native/Worker checks, signed artifacts,
