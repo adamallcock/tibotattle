@@ -34,10 +34,24 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-**Candidate notes:** [0.1.17](./release-notes/0.1.17.md)
+Future changes will be recorded here.
 
-This candidate section combines direct post-v0.1.16 work with reviewed merged
-pull requests, including [PR #80](https://github.com/adamallcock/tibotattle/pull/80),
+## [0.1.17](./release-notes/0.1.17.md) - 2026-09-03
+
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.17) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.17) ·
+[changes since v0.1.16](https://github.com/adamallcock/tibotattle/compare/v0.1.16...v0.1.17) ·
+[accepted runtime basis](https://github.com/adamallcock/tibotattle/commit/394c8a03a986e0daadbe662679fd002202682e44)
+
+Stable product build `1024` uses accepted runtime basis
+`394c8a03a986e0daadbe662679fd002202682e44`; internal RC9 `1023.7` was the
+preceding dogfood allocation. PR #94 outcome is `passed_with_historical_artifact_refusal`; see the
+[qualification receipt](./docs/receipts/2026-09-03-pr94-account-plan-attribution-qualification.md).
+The manual clean-profile and physical Login Item matrix remains deferred; see
+the [native release plan](./docs/plans/2026-09-03-public-0.1.17-release.md).
+Hosted migrations and device pairing are not activated by the desktop release.
+
+This entry combines direct post-v0.1.16 work with reviewed merges in [PR #80](https://github.com/adamallcock/tibotattle/pull/80),
 [PR #83](https://github.com/adamallcock/tibotattle/pull/83),
 [PR #84](https://github.com/adamallcock/tibotattle/pull/84),
 [PR #85](https://github.com/adamallcock/tibotattle/pull/85),
@@ -50,19 +64,14 @@ pull requests, including [PR #80](https://github.com/adamallcock/tibotattle/pull
 [PR #94](https://github.com/adamallcock/tibotattle/pull/94),
 [PR #95](https://github.com/adamallcock/tibotattle/pull/95), and
 [PR #96](https://github.com/adamallcock/tibotattle/pull/96).
-PRs #73 and #74 are not part of this native macOS candidate. PR #75
-is not merged wholesale; a native subset of its menu-bar and weekly-pace work
-is ported without its Electron or multi-root changes. Separately, this candidate
-advances the local index to schema 11 only for the measured cleanup-index fix;
-it does not import PR #75's broader schema work. The candidate does not include
-the Electron application or unfinished Claude Code usage-monitoring integration
-work. Claude-related carryover is limited to dormant local/export compatibility
-scaffolding already on `main` and removal of the inactive quota route; 0.1.17
-does not collect, display, or claim Claude Code usage. The
-[merged-main comparison](https://github.com/adamallcock/tibotattle/compare/v0.1.16...main)
-is the public branch-history view; PR links identify reviewed merges, while
-unlinked items are direct commits. Nothing in this section is a
-published-release claim.
+PRs #73 and #74 are not part of this native macOS release. PR #75 is not
+merged wholesale; a native subset of its menu-bar and weekly-pace work is
+ported without its Electron or multi-root changes. The release does not
+include the Electron application or unfinished Claude Code usage-monitoring
+integration; 0.1.17 does not collect, display, or claim Claude Code usage.
+The [merged-main comparison](https://github.com/adamallcock/tibotattle/compare/v0.1.16...main)
+provides public branch-history context; PR links identify reviewed merges, while
+unlinked items are direct commits.
 
 ### Added
 
@@ -282,29 +291,14 @@ published-release claim.
 - Gives Preview its own app, bundle, semantic-open, local-state, Keychain,
   preferences, and Sparkle-feed identities, preventing preview installation or
   updates from replacing stable state.
-- Records builds 1023, 1023.1, 1023.2, 1023.3, 1023.4, and 1023.5 as earlier
-  0.1.17 internal dogfoods, records RC8 as build 1023.6, allocates build 1023.7
-  to corrective RC9, and retains build 1024 for stable.
-  Signed tooling requires a clean checkout with exactly one matching annotated
-  channel tag at `HEAD` before it can proceed. RC5 build 1023.3 is signed,
-  notarized, and installed evidence for its frozen source, but physical testing
-  found that its ordinary five-minute refresh deadline stopped a legitimate
-  full accounting-cache rebuild. RC6 build 1023.4 subsequently proved that
-  timeout correction in a signed, notarized, installed refresh, but exposed an
-  inherited `recent_7d_indexing` legacy checkpoint suppressing otherwise-
-  authoritative unified accounting. RC7 removes only that retired collector
-  gate and subsequently passed its protected R7, full source gate, Developer ID
-  signing, notarization, stapling, and state-preserving installation gates. Its
-  first installed refresh ingested unified-index generation 44, but the strict
-  v0.14 cache validator rejected accounting because the projection copied an
-  excluded diagnostic-only row's eligibility onto a reset fitted from later
-  eligible transitions. RC8 retains that strict validator and projects fit
-  metadata from the first eligible row. RC9 combines manual quota and detailed
-  accounting refresh in one action, keeps automatic quota checks light, bounds
-  automatic deep attempts to once per hour, restores
-  authoritative snapshot persistence, and supplies a scope-bound selected-plan
-  Trends lane. RC9 still requires fresh exact-source R7, artifact, install, and
-  physical verification; earlier candidates do not qualify these corrections.
+- Records the stable build-1024 release allocation and accepted runtime basis
+  `394c8a03a986e0daadbe662679fd002202682e44`; internal RC9 build `1023.7` was
+  the preceding dogfood allocation. Signed tooling requires a clean checkout
+  with exactly one matching annotated channel tag at `HEAD` before it can
+  proceed. The release retains the fail-closed source, generation, resource,
+  validation, atomic-publication, selected-plan Trends, and snapshot safeguards.
+  PR #94 outcome is `passed_with_historical_artifact_refusal` in the [qualification
+  receipt](./docs/receipts/2026-09-03-pr94-account-plan-attribution-qualification.md).
 - Establishes scoped, machine-checked repository guidance for coding agents and
   the root layout they may extend
   ([PR #77](https://github.com/adamallcock/tibotattle/pull/77)).

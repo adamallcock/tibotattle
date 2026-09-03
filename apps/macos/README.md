@@ -453,38 +453,21 @@ a claim that Sparkle has updated the preview client.
 
 `CFBundleShortVersionString` remains the user-facing package version. The
 Sparkle ordering key, `CFBundleVersion`, is explicitly allocated for signed
-builds that retain the stable bundle identifier. The 0.1.17 internal-dogfood
-RC9 build allocation is `1023.7`; the 0.1.17 stable final remains `1024`. This
-candidate orders strictly after RC8 `1023.6`, installed RC7 `1023.5`, RC6 `1023.4`,
-integrated RC5 `1023.3`, startup-recovery RC4 `1023.2`, migration RC3
-`1023.1`, retained RC2 `1023`, and earlier shared-identity dogfood `1022`,
-while stable orders after the dogfood candidate.
-A future signed version/channel must add a reviewed
-monotonic allocation before release tooling will run.
+builds that retain the stable bundle identifier. The 0.1.17 stable allocation
+uses build `1024` and accepted runtime basis
+`394c8a03a986e0daadbe662679fd002202682e44`; internal RC9 build `1023.7` was the
+preceding dogfood allocation. The exact source provenance is the annotated
+[`v0.1.17` tag](https://github.com/adamallcock/tibotattle/tree/v0.1.17). A future
+signed version/channel must add a reviewed monotonic allocation before release
+tooling will run.
 
-Installed RC6 proved that the cold-accounting lifetime can safely exceed the
-ordinary five-minute refresh deadline. Its real refresh then exposed the
-inherited `recent_7d_indexing` legacy checkpoint suppressing otherwise-
-authoritative unified accounting. RC7 removed only that retired collector gate
-and passed protected R7, the full source gate, signing, notarization, stapling,
-and state-preserving installation. Its first installed refresh ingested
-generation 44, then the strict v0.14 cache validator rejected inconsistent fit
-metadata. The fit correctly excluded an early diagnostic-only transition, but
-the projection copied that rejected row's eligibility onto the reset fitted from
-later eligible transitions. RC8 source retains the strict validator and projects
-fit metadata from the first eligible row.
-
-RC9 source is under validation on base `35802d21ede67d362533f4e2be6b38041ece1cda`.
-It keeps startup and frequent automatic quota checks quick, makes the single
-manual Refresh action update detailed accounting too, bounds automatic detailed
-attempts to at most hourly, reconciles native refresh
-completion from the controller, and restores selected-plan Trends with matching
-plan-scoped usage plus retained authoritative snapshots across relaunch. The
-allocation is not artifact or installed-app evidence: exact-source gates,
-protected R7, signing, notarization, state-preserving replacement, installed
-refresh, and physical verification remain required. PR #94's real-corpus
-comparator remains **OPEN / NOT RUN**; compatible hosted migrations/deployment
-and end-to-end device pairing remain a separate open gate.
+Earlier RCs are historical qualification evidence only. The build-1024
+release retains the fail-closed source, generation, resource, validation,
+atomic-publication, selected-plan Trends, and snapshot safeguards. PR #94
+outcome is `passed_with_historical_artifact_refusal` in the
+[qualification receipt](../../docs/receipts/2026-09-03-pr94-account-plan-attribution-qualification.md).
+Hosted migrations and end-to-end device pairing are not activated by the
+desktop release.
 
 Release tooling accepts `USAGE_MONITOR_BUNDLE_VERSION` only when it exactly
 matches the checked-in channel allocation, and the signed stable path still
@@ -550,6 +533,13 @@ accepts only `vX.Y.Z` matching the short version. Internal dogfood accepts only
 `tibotattle-internal-dogfood-X.Y.Z-rcN-source-YYYYMMDD`, with a positive
 non-zero-padded `N` and a real calendar date. Lightweight tags, aliases, wrong
 versions, and multiple matching channel tags at HEAD fail closed.
+
+External-release bundles set only the outer `.app` Finder creation and
+modification dates from the sealed source commit's Git committer timestamp.
+Payload files retain the fixed epoch used for reproducible inventories, and the
+DMG packager reapplies the same source-bound dates after staging. This
+filesystem metadata is outside the signed and inventoried payload; no build-host
+wall clock is used for it.
 
 ## Developer ID and notarization
 
@@ -697,6 +687,14 @@ The automated validator proves the bundle and Gatekeeper contract on the build
 Mac with an empty temporary home. It also runs the packaged Login Item contract
 smoke against an injected fake manager; that check makes zero real
 ServiceManagement calls. It is not a substitute for a truly clean machine.
+The manual clean-profile and physical Login Item matrix remains deferred; see
+the [native release plan](../../docs/plans/2026-09-03-public-0.1.17-release.md).
+
+For Finder metadata, inspect the app directly on the final frozen DMG, read-only,
+after stapling. Derive the expected timestamp from the sealed source commit in
+`build-manifest.json`, then compare the outer bundle's creation and modification
+dates with that source-derived value. The isolated `ditto` copy used for
+clean-profile smoke is not evidence of mounted-volume Finder metadata.
 
 Before sending the DMG to any external user, perform a human clean-Mac or
 disposable-VM rehearsal:

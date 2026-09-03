@@ -1,10 +1,10 @@
 ---
 title: Current product and release status
-date: 2026-09-02
+date: 2026-09-03
 type: status
 status: current
-source_commit: 35802d21ede67d362533f4e2be6b38041ece1cda
-observation_date: 2026-09-02
+source_commit: 9494c0776892127284fca744a304cc3c0c58bdf3
+observation_date: 2026-09-03
 ---
 
 # Current product and release status
@@ -18,11 +18,11 @@ using this page for a later release or operational decision.
 
 | Boundary | Verified state |
 |---|---|
-| Documentation/source review | Base `35802d21ede67d362533f4e2be6b38041ece1cda`, reviewed 2026-09-02; local RC9 corrections and build `1023.7` allocation are under validation, not frozen or artifact-qualified |
-| Installed internal dogfood | App metadata observed 2026-09-02: version `0.1.17`, RC8 build `1023.6`. This read-only plist observation does not requalify its signature, source, or runtime. RC9 has not replaced it |
+| Documentation/source review | Release-preparation source `9494c0776892127284fca744a304cc3c0c58bdf3`, reviewed 2026-09-03; product runtime is unchanged from PR #102 merge `394c8a03a986e0daadbe662679fd002202682e44` |
+| Installed internal dogfood | Version `0.1.17`, RC9 build `1023.7`, source `394c8a03`; owner accepted the inspected apps on 2026-09-03. Plist version/build/minimum-OS were independently rechecked; this does not qualify every historical credential or clean-profile case |
 | Public service | Read-only `GET https://tibotattle.com/api/health`, HTTP 200, deployment source `304f3d736b6f9451d32a616bf3046ea628e828a3`, observed 2026-08-31 |
-| Public updater | Read-only `GET https://updates.tibotattle.com/appcast.xml`, observed 2026-08-27 |
-| Published release | GitHub release API for `adamallcock/tibotattle`, observed 2026-08-27 |
+| Public updater | Stable `0.1.16`; read-only feed check recorded 2026-09-03 in the release plan |
+| Published release | Immutable GitHub `v0.1.16`, exact five-asset set rechecked 2026-09-03; `v0.1.17` is not yet published at this snapshot |
 
 This is a snapshot, not an automatic monitor. A newer commit, deployment, feed,
 or release makes the corresponding row stale without changing the other rows.
@@ -109,74 +109,45 @@ point-in-time evidence only.
 The complete qualification matrix and rules for changing these claims are in
 [platform-support.md](./reference/platform-support.md).
 
-## Known boundaries
+## Release qualification and known boundaries
 
-- The checked-out source contains unreleased changes after `v0.1.16`; the
-  [changelog](../CHANGELOG.md) records them without claiming they shipped.
-- Integrated RC5 source `ff506dc3`, build `1023.3`, was signed, notarized and
-  installed on 2026-08-31. Its state-preserving replacement and first launch
-  passed, but its real full-accounting refresh did not: a healthy v0.14 rebuild
-  was terminated by the ordinary five-minute deadline. That evidence remains
-  specific to RC5.
-- RC6 source `e59115d41958f6b23496a65c9732a6a9944fdde0`, build `1023.4`,
-  subsequently passed its source gates, protected R7, Developer ID signing,
-  notarization, stapling, Gatekeeper, state-preserving replacement, and installed
-  launch without an observed Keychain prompt. Its real refresh ran past five
-  minutes and reached terminal success, proving the deadline correction. The
-  installed result then exposed an inherited `recent_7d_indexing` legacy
-  checkpoint suppressing otherwise-authoritative unified accounting. RC6 is
-  therefore not the final dogfood handoff.
-- RC7 source merge `87e07be350582713d815a21b4db470ed84aae037`, build
-  `1023.5`, removed only that retired collector checkpoint and subsequently
-  passed protected R7, the full source gate, Developer ID signing, notarization,
-  stapling, Gatekeeper, state-preserving replacement, and installation. Its
-  first installed refresh ingested unified-index generation 44, then correctly
-  withheld advanced accounting when the strict v0.14 cache validator found
-  inconsistent fit metadata. The fit correctly excluded an early
-  diagnostic-only transition, but the projection copied that rejected row's
-  eligibility onto the reset fitted from later eligible transitions.
-- RC8 source retains the strict validator and projects reset fit metadata from
-  the first eligible row. Its prior allocation was `1023.6`; the reviewed source
-  base for this update is `35802d21ede67d362533f4e2be6b38041ece1cda`.
-- RC9 reserves monotonic build `1023.7`, strictly after RC8 and before stable
-  `1024`. Its source is under validation: a single manual Refresh updates quota
-  and detailed accounting, while startup and frequent automatic checks collect
-  quick quota/headline evidence; automatic detailed attempts are at most hourly and count failed or
-  interrupted requests. Native polling uses controller mode/start receipts and
-  terminal-state fencing, so browser-started work shares the cadence and stale
-  pre-start replies cannot settle a new request. Trends pairs the selected
-  plan's fit with its source-bound usage, preserves established speed evidence
-  with the reviewed Standard fallback, and keeps all-plan accounting separate.
-  Authoritative dashboard snapshots use the current production shape so they
-  can be retained across relaunch. These are source changes, not evidence of a
-  built, installed, or passing RC9. Fresh exact-source R7, the complete source
-  gate, signed/notarized/stapled artifact, state-preserving replacement,
-  installed refresh, and physical native checks remain required.
-- The RC7 R7 workload-source closure has protected dual-runtime receipts for
-  359 files / workload SHA-256
-  `ea504fde37402622239d5405aa74c264b98a111c8da5b4031a0977fa5bd80741`.
-  Both decisions remain honestly `release_open`. Native UI and build-allocation
-  files remain subject to their separate macOS source, smoke, signed-artifact,
-  and installed-artifact gates.
-- The public service and release feed are remote state. Their health and
-  availability can change after this snapshot.
-- Public health is not proof that every admin, identity, contribution, deletion,
-  or updater path works end to end.
-- PR #94's fixed-real-corpus before/after coverage, diagnostic-distribution, and
-  resource comparator remains **OPEN / NOT RUN**. Current APIs cannot emit the
-  complete named fit-rejection reconciliation, so R7 cannot be used as a
-  substitute. An explicitly open-gate internal dogfood may proceed for testing,
-  but this blocks stable and public 0.1.17 qualification until it is closed or
-  deliberately resolved. The exact RC9 native artifact must separately pass
-  signing, notarization, state-preserving installation, updater, and physical
-  native checks. Pairing continuity needs compatible hosted Worker migrations
-  and deployment before the repaired desktop flow can be validated end to end.
-- An owner-only fixed-window attempt on 2026-08-31 failed closed before comparison:
-  the strict pre-PR scan reported `codex_rollout_content_invalid`. The supported
-  resource benchmark independently stopped at `benchmark_cold_rebuild_incomplete`
-  on both exact PR #94 revisions. No empirical comparison receipt was produced,
-  no source was excluded, and this does not constitute a run of the formal
-  comparator. Its **OPEN / NOT RUN** state remains a stable/public gate.
+- The [public-release plan](./plans/2026-09-03-public-0.1.17-release.md)
+  tracks final build `1024`, exact signed-artifact and prior-stable replacement
+  checks, immutable GitHub publication, Sparkle, and Homebrew independently.
+  Source preparation and a dated changelog are not publication evidence.
+- The accepted RC9 runtime has one manual Refresh for quota and detailed
+  accounting, quick startup/automatic checks, at-most-hourly automatic detailed
+  attempts, selected-plan Trends, retained authoritative snapshots, and the
+  measured accounting optimization. The
+  [performance receipt](./receipts/2026-09-03-optimized-rc9-accounting-comparison.md)
+  measures the accounting child, not end-to-end refresh latency.
+- PR #94's local qualification passed with the historical artifact refusal
+  explicitly recorded; the final candidate passes its strict cache validator. The
+  [local qualification receipt](./receipts/2026-09-03-pr94-account-plan-attribution-qualification.md)
+  binds the exact before, after, and final revisions to one immutable admitted
+  index. Its scope is accounting, attribution, calibration, and isolated-child
+  resources; it does not prove raw ingestion, account-exact identity, hosted
+  activation, or installed native lifecycle behavior.
+- The earlier 2026-08-31 raw-source attempt failed closed at
+  `codex_rollout_content_invalid` / `benchmark_cold_rebuild_incomplete` and
+  produced no comparison receipt. Later admitted-index qualification does not
+  relabel that attempt as passed or establish repair of its raw sources.
+- Retained dual-runtime R7 receipts bind workload SHA-256
+  `371af38d9066d4fd2d605efee1bc83a8618f20bb72403e4c9f80410d81b18299`.
+  Their decisions remain `release_open`, not a claim that every native or
+  publication gate passed. Release-tooling changes do not require regeneration
+  when the protected workload and freshness checks remain unchanged.
+- Following the owner's 2026-09-03 confidence-based release direction, the full
+  clean-profile/physical Login Item matrix is deferred for 0.1.17, not passed.
+  The release still stops for data loss, invalid signatures or updater bytes,
+  and unexpected Keychain prompts. Isolated-profile and fake-manager smokes
+  do not establish the deferred manual evidence.
+- Hosted migrations/deployment, plan-transport consent activation, and repaired
+  device pairing remain separate. Website validator backport/deployment is
+  separately held; publishing the desktop must not deploy current-main Worker
+  code or mutate hosted data.
+- Remote health and availability can change after this snapshot. Public health
+  is not proof of every admin, identity, contribution, deletion, or updater path.
 
 ## How to refresh this page
 

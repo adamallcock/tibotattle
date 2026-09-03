@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
+import { writeFileSync } from "node:fs";
 import {
   access,
   appendFile,
@@ -77,8 +78,10 @@ import {
   parseMacOSBuildArguments,
   pinnedPackage,
   pinnedPackageTreeDigest,
+  readMacOSReleaseSourceTimestamp,
   stageMacOSWebModules,
   stageMacOSWorkspaceRuntimePackages,
+  setMacOSBundleFinderMetadata,
   installMacOSExternalBuildOutput,
   validateMacOSPreviewApp,
   validateMacOSNodeRuntimeInput,
@@ -341,6 +344,172 @@ test("reviewed product brand owns the native bundle and semantic-open identity",
     "keychainAccount",
   ]) {
     assert.notEqual(PREVIEW_PRODUCT_BRAND[key], PRODUCT_BRAND[key], key);
+  }
+});
+
+test("external release Finder metadata is bound to the source revision", () => {
+  const commit = execFileSync(
+    "/usr/bin/git",
+    ["-C", REPOSITORY_ROOT, "rev-parse", "HEAD"],
+    { encoding: "utf8" },
+  ).trim();
+  const expectedTimestamp = Number(execFileSync(
+    "/usr/bin/git",
+    ["-C", REPOSITORY_ROOT, "show", "-s", "--format=%ct", commit],
+    { encoding: "utf8" },
+  ).trim());
+  const timestamp = readMacOSReleaseSourceTimestamp({ commit });
+  assert.equal(timestamp, expectedTimestamp);
+  assert.notEqual(timestamp, 946_684_800);
+
+  const calls = [];
+  assert.deepEqual(
+    setMacOSBundleFinderMetadata("/private/tmp/TiboTattle.app", {
+      birthTimeSeconds: timestamp,
+      commandRunner: (...arguments_) => calls.push(arguments_),
+    }),
+    {
+      birthTimeSeconds: timestamp,
+      modificationTimeSeconds: timestamp,
+    },
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], "/usr/bin/SetFile");
+  assert.deepEqual(calls[0][1].slice(0, 1), ["-d"]);
+  assert.equal(calls[0][1][2], "-m");
+  assert.equal(calls[0][1][1], calls[0][1][3]);
+  const expectedDate = new Date(timestamp * 1_000);
+  const pad = (value) => String(value).padStart(2, "0");
+  assert.equal(
+    calls[0][1][1],
+    `${pad(expectedDate.getUTCMonth() + 1)}/${pad(expectedDate.getUTCDate())}/${expectedDate.getUTCFullYear()} `
+      + `${pad(expectedDate.getUTCHours())}:${pad(expectedDate.getUTCMinutes())}:${pad(expectedDate.getUTCSeconds())}`,
+  );
+  assert.equal(calls[0][1][4], "/private/tmp/TiboTattle.app");
+  assert.deepEqual(calls[0][2], {
+    env: {
+      PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+      TZ: "UTC",
+    },
+  });
+});
+
+test("SetFile normalizes bundle birth and modification dates", {
+  skip: process.platform === "darwin"
+    ? false
+    : "requires macOS SetFile",
+}, async () => {
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-finder-metadata-"),
+  );
+  const app = join(temporaryRoot, "TiboTattle.app");
+  const timestamp = 1_700_000_000;
+  try {
+    await mkdir(app, { recursive: true });
+    setMacOSBundleFinderMetadata(app, {
+      birthTimeSeconds: timestamp,
+    });
+    const metadata = await lstat(app);
+    assert.equal(Math.trunc(metadata.birthtimeMs / 1_000), timestamp);
+    assert.equal(Math.trunc(metadata.mtimeMs / 1_000), timestamp);
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("release DMG packaging resolves source-bound Finder metadata before hdiutil", {
+  skip: process.platform === "darwin"
+    ? false
+    : "requires macOS release tooling",
+}, async () => {
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-release-finder-metadata-"),
+  );
+  const sourceApp = join(temporaryRoot, "input", "TiboTattle.app");
+  const output = join(temporaryRoot, "output", "TiboTattle-release.dmg");
+  const failedOutput = join(
+    temporaryRoot,
+    "failed-output",
+    "TiboTattle-release.dmg",
+  );
+  const commit = execFileSync(
+    "/usr/bin/git",
+    ["-C", REPOSITORY_ROOT, "rev-parse", "HEAD"],
+    { encoding: "utf8" },
+  ).trim();
+  const expectedTimestamp = readMacOSReleaseSourceTimestamp({ commit });
+  const events = [];
+  const inspectInput = async (appPath, distribution, channel) => {
+    assert.equal(appPath, sourceApp);
+    assert.equal(distribution, "release");
+    assert.equal(channel, STABLE_RELEASE_CHANNEL);
+    return Object.freeze({
+      appPath,
+      shortVersion: RELEASE_VERSION,
+      source: Object.freeze({ commit }),
+    });
+  };
+  const commandRunner = (command, arguments_) => {
+    events.push([command, arguments_[0]]);
+    if (command === "/usr/bin/ditto") {
+      const copied = spawnSync(command, arguments_, {
+        encoding: "utf8",
+      });
+      assert.equal(copied.status, 0, copied.stderr || copied.stdout);
+    } else if (command === "/usr/bin/hdiutil"
+        && arguments_[0] === "create") {
+      writeFileSync(arguments_.at(-1), "synthetic-dmg");
+    }
+    return { stderr: "", stdout: "" };
+  };
+  const finderMetadataSetter = (path, metadata) => {
+    events.push(["/usr/bin/SetFile", path]);
+    setMacOSBundleFinderMetadata(path, metadata);
+  };
+  try {
+    await mkdir(join(sourceApp, "Contents"), { recursive: true });
+    await writeFile(join(sourceApp, "Contents", "marker.txt"), "synthetic");
+    const packaged = await packageMacOSDMG({
+      appPath: sourceApp,
+      output,
+      distribution: "release",
+      channel: STABLE_RELEASE_CHANNEL,
+    }, {
+      commandRunner,
+      finderMetadataSetter,
+      inspectInput,
+    });
+    assert.equal(packaged.output, output);
+    assert.equal(packaged.distribution, "release");
+    assert.equal(packaged.bytes, Buffer.byteLength("synthetic-dmg"));
+    assert.equal(
+      events.findIndex(([command]) => command === "/usr/bin/SetFile")
+        < events.findIndex(([command, action]) =>
+          command === "/usr/bin/hdiutil" && action === "create"),
+      true,
+    );
+    assert.equal(await stat(output).then((metadata) => metadata.isFile()), true);
+
+    await mkdir(dirname(failedOutput), { recursive: true });
+    await assert.rejects(
+      packageMacOSDMG({
+        appPath: sourceApp,
+        output: failedOutput,
+        distribution: "release",
+        channel: STABLE_RELEASE_CHANNEL,
+      }, {
+        commandRunner,
+        finderMetadataSetter() {
+          throw new Error("synthetic SetFile failure");
+        },
+        inspectInput,
+      }),
+      /synthetic SetFile failure/u,
+    );
+    await assert.rejects(lstat(failedOutput), { code: "ENOENT" });
+    assert.equal(expectedTimestamp, readMacOSReleaseSourceTimestamp({ commit }));
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
   }
 });
 
@@ -4146,6 +4315,57 @@ test("external app output is fresh-only and rejects a TOCTOU target", async () =
   }
 });
 
+test("external Finder metadata failure happens before output claim", {
+  skip: process.platform === "darwin"
+    ? false
+    : "requires macOS SetFile",
+}, async () => {
+  const temporaryRoot = await mkdtemp(
+    join(await realpath(tmpdir()), "usage-monitor-external-finder-output-"),
+  );
+  const stagedApp = join(temporaryRoot, "staged", "TiboTattle.app");
+  const output = join(temporaryRoot, "output", "TiboTattle.app");
+  const missingStagedApp = join(
+    temporaryRoot,
+    "missing",
+    "TiboTattle.app",
+  );
+  const failedOutput = join(
+    temporaryRoot,
+    "failed-output",
+    "TiboTattle.app",
+  );
+  const finderMetadata = { birthTimeSeconds: 1_700_000_000 };
+  try {
+    await mkdir(join(stagedApp, "Contents"), { recursive: true });
+    await writeFile(join(stagedApp, "Contents", "marker.txt"), "staged");
+    await mkdir(dirname(output), { recursive: true });
+    await installMacOSExternalBuildOutput(stagedApp, output, {
+      finderMetadata,
+    });
+    const outputMetadata = await lstat(output);
+    assert.equal(
+      Math.trunc(outputMetadata.birthtimeMs / 1_000),
+      finderMetadata.birthTimeSeconds,
+    );
+    assert.equal(
+      Math.trunc(outputMetadata.mtimeMs / 1_000),
+      finderMetadata.birthTimeSeconds,
+    );
+
+    await mkdir(dirname(failedOutput), { recursive: true });
+    await assert.rejects(
+      installMacOSExternalBuildOutput(missingStagedApp, failedOutput, {
+        finderMetadata,
+      }),
+      /SetFile|No such file/u,
+    );
+    await assert.rejects(lstat(failedOutput), { code: "ENOENT" });
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
 test("release authorization is programmatic and does not apply to development or preview", async () => {
   const source = await readFile(RELEASE_CORE, "utf8");
   assert.match(
@@ -5290,10 +5510,11 @@ test("signed updater replacement contract validates upgrade and rollback artifac
         previousBundleVersion: "0.1.16",
       },
     );
-    assert.doesNotThrow(() => validateMacOSSignedReplacementPair({
+    assert.throws(() => validateMacOSSignedReplacementPair({
       previousManifest: legacyStableManifest,
       candidateManifest: epochCandidateManifest,
-    }));
+    }), { code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" },
+    "a legacy version alone remains a continuity input, not exact previous-artifact proof");
     for (const rejectedLegacySource of ["0.1.17", "0.2.0"]) {
       const rejectedManifest = {
         ...legacyStableManifest,
@@ -5669,31 +5890,15 @@ test("signed updater replacement contract validates upgrade and rollback artifac
       JSON.stringify(epochCandidateManifest),
     );
     const legacyValidatedArtifacts = [];
-    await validateMacOSSignedReplacementArtifacts({
+    await assert.rejects(validateMacOSSignedReplacementArtifacts({
       previousReleaseManifestPath: previousManifestPath,
       candidateReleaseManifestPath: candidateManifestPath,
       async validateArtifact(path, options) {
         legacyValidatedArtifacts.push([path, options]);
       },
-    });
-    assert.deepEqual(legacyValidatedArtifacts, [
-      [
-        join(temporaryRoot, legacyStableManifest.artifact.fileName),
-        {
-          allowLegacyUnsealedSource: true,
-          channel: STABLE_RELEASE_CHANNEL,
-          production: true,
-        },
-      ],
-      [
-        join(temporaryRoot, epochCandidateManifest.artifact.fileName),
-        {
-          allowLegacyUnsealedSource: false,
-          channel: STABLE_RELEASE_CHANNEL,
-          production: true,
-        },
-      ],
-    ]);
+    }), { code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" });
+    assert.deepEqual(legacyValidatedArtifacts, [],
+      "unbound legacy artifacts cannot reach native validation or obtain compatibility");
     await writeFile(
       previousManifestPath,
       JSON.stringify(previousManifest),
@@ -5945,14 +6150,14 @@ test("legacy dogfood capability rejects Proxy-forged identities before any artif
         { code: "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" },
         `${name} must reject a supplied non-member identity before path resolution`,
       );
-      assert.equal(symbolReads, 2, "both private compatibility reads were exercised");
-      assert.equal(new Set(observedSymbols).size, 2);
+      assert.equal(symbolReads, 3, "all private compatibility reads were exercised");
+      assert.equal(new Set(observedSymbols).size, 3);
       for (const [index, observedSymbol] of observedSymbols.entries()) {
         await assert.rejects(
           validate(null, { ...baseOptions, [observedSymbol]: forged }),
-          { code: index === 0 ? "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID"
-            : "MACOS_KEYCHAIN_MIGRATION_COMPATIBILITY_INVALID" },
-          `${name} must reject a forged value replayed with either captured Symbol`,
+          { code: index === 1 ? "MACOS_KEYCHAIN_MIGRATION_COMPATIBILITY_INVALID"
+            : "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID" },
+          `${name} must reject a forged value replayed with each captured Symbol`,
         );
       }
     }
