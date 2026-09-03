@@ -499,6 +499,7 @@ async function writeCompleteGenerationIndex(indexFile, {
   resetStarts,
   boundariesPerReset,
   usagePerBoundary,
+  scannedBytes = 4_096,
 }) {
   const receivedAtMs = resetStarts[0];
   const database = openLocalUnifiedIndex(indexFile, { create: true });
@@ -506,7 +507,7 @@ async function writeCompleteGenerationIndex(indexFile, {
     contractVersion: "usage-event-v0.2",
     receivedAtMs,
     discoveredSourceCount: 1,
-    discoveredSourceBytes: 4_096,
+    discoveredSourceBytes: scannedBytes,
   });
   const writer = createUnifiedIndexWriter(database, {
     contractVersion: "usage-event-v0.2",
@@ -519,7 +520,7 @@ async function writeCompleteGenerationIndex(indexFile, {
   writer.writeMeta("status", "complete");
   writer.writeMeta("generated_at", new Date(receivedAtMs).toISOString());
   writer.writeMeta("source_count", 1);
-  writer.writeMeta("source_bytes", 4_096);
+  writer.writeMeta("source_bytes", scannedBytes);
   const sourceLocal = Buffer.alloc(32, 4);
   const sessionLocal = Buffer.alloc(32, 7);
   const accountScopeId = writer.internAccountScope({
@@ -632,8 +633,8 @@ async function writeCompleteGenerationIndex(indexFile, {
     sourceLocal,
     sourceOrdinal: 0,
     sessionLocal,
-    scannedBytes: 4_096,
-    sizeBytes: 4_096,
+    scannedBytes: scannedBytes,
+    sizeBytes: scannedBytes,
     mtimeMs: receivedAtMs,
     snapshotsPersisted: true,
     turnContextSeen: true,
@@ -650,8 +651,8 @@ async function writeCompleteGenerationIndex(indexFile, {
     sessionLocal,
     surfaceId,
     status: "complete",
-    discoveredSizeBytes: 4_096,
-    scannedBytes: 4_096,
+    discoveredSizeBytes: scannedBytes,
+    scannedBytes: scannedBytes,
     mtimeMs: receivedAtMs,
     diagnosticsComplete: true,
   });
@@ -662,9 +663,9 @@ async function writeCompleteGenerationIndex(indexFile, {
     status: "complete",
     blockReason: null,
     discoveredSourceCount: 1,
-    discoveredSourceBytes: 4_096,
+    discoveredSourceBytes: scannedBytes,
     indexedSourceCount: 1,
-    indexedSourceBytes: 4_096,
+    indexedSourceBytes: scannedBytes,
     discoveryComplete: true,
     diagnosticsComplete: true,
   });
@@ -746,6 +747,68 @@ test("the default production rebuild is isolated in a child and byte-identical t
     const written = await readReplaySafeAccountingCache({ stateFile });
     assert.equal(written.status, "available");
     assert.deepEqual(written.cache, viaSubprocess);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("each retained corpus row's attribution is derived once across the fit and the batched derivation", { timeout: 120_000 }, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-attribution-memo-"));
+  try {
+    // 54k usage rows: past the 50k single-derivation usage budget, so the
+    // derivation runs several on-demand slices AFTER the composition fit has
+    // already streamed every row once. Every slice used to re-derive plan
+    // attribution row by row through the indexed point queries.
+    const fixture = await writeCompleteGenerationIndex(
+      join(directory, "local-unified-index-v1.sqlite"),
+      {
+        resetStarts: Array.from(
+          { length: 3 },
+          (_, week) => Date.parse("2026-05-07T00:00:00.000Z") + week * WEEK_MS,
+        ),
+        boundariesPerReset: 100,
+        usagePerBoundary: 180,
+        scannedBytes: 1 << 20,
+      },
+    );
+    assert.equal(fixture.usageRows, 54_000);
+    let metrics = null;
+    const cache = await buildReplaySafeAccountingCache({
+      sourceMode: "unified",
+      expectedGeneration: fixture.expectedGeneration,
+      unifiedIndexFile: fixture.indexFile,
+      now: () => NOW,
+      declaredSpeedBaselines: DECLARED_SPEED_BASELINES,
+      onCalibrationCorpusMetrics: (value) => { metrics = value; },
+    });
+    assert.equal(cache.weeklyCalibrationInput.source, "unified_index");
+    assert.equal(cache.weeklyCalibrationInput.retainedUsageEvents, fixture.usageRows);
+    assert.equal(cache.weeklyCalibration.status, "estimated");
+    t.diagnostic(JSON.stringify(metrics));
+    assert.equal(metrics.retainedUsageEvents, fixture.usageRows);
+    assert.equal(metrics.weeklySnapshots, 3 * 100);
+    // The fit projects the whole corpus once; the batched derivation then
+    // re-projects every row inside its reset windows (rows past the last
+    // observation are outside every slice), so the corpus is projected well
+    // over once...
+    assert.ok(
+      metrics.projectedRows > 1.9 * metrics.retainedUsageEvents,
+      `expected the derivation to re-project the corpus, saw ${metrics.projectedRows}`,
+    );
+    // ...while attribution is read exactly once per retained row.
+    assert.equal(metrics.attributionReads, metrics.retainedUsageEvents);
+    // A caller that carries the in-process seam cannot be isolated in a child.
+    await assert.rejects(
+      refreshReplaySafeAccountingCache({
+        stateFile: join(directory, "local-collector-state-v1.sqlite"),
+        sourceMode: "unified",
+        expectedGeneration: fixture.expectedGeneration,
+        unifiedIndexFile: fixture.indexFile,
+        rebuildIsolation: "subprocess",
+        onCalibrationCorpusMetrics: () => {},
+      }),
+      /cannot carry injected scan, rss or metrics seams/u,
+    );
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -971,7 +1034,7 @@ test("isolation options validate closed", async () => {
         rebuildIsolation: "subprocess",
         scan: async () => ({ diagnostics: {} }),
       }),
-      /rebuildIsolation subprocess cannot carry injected scan or rss seams/u,
+      /rebuildIsolation subprocess cannot carry injected scan, rss or metrics seams/u,
     );
     await assert.rejects(
       refreshReplaySafeAccountingCache({

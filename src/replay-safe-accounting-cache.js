@@ -3250,6 +3250,79 @@ async function openUnifiedIndexCalibrationCorpus({
   }
   const attributionReader = generationId === null ? null
     : createLocalUnifiedUsageAttributionReader({ database, generationId });
+  // Attribution memo, keyed by retained position. A row's attribution is a
+  // pure function of the immutable generation this handle is fenced to, and
+  // the derivation re-reads every retained row at least once after the fit
+  // has already projected it; each of those re-reads paid the reader's
+  // membership lookup plus up to three point queries again. Remember the
+  // result on first projection in thin typed columns (~14 bytes per retained
+  // row, allocated once the retained count is known) and replay it on every
+  // later projection of the same position. Only the reader's closed
+  // vocabulary is memoized; anything else is re-derived each time.
+  const ATTRIBUTION_BASES = ["unavailable", "same_record", "conflicted"];
+  const INTERVAL_BASES = [
+    "unavailable",
+    "previous_session_record",
+    "previous_source_record",
+  ];
+  let memoBasis = null;
+  let memoPlan = null;
+  let memoIntervalMs = null;
+  let memoIntervalBasis = null;
+  const memoPlanTable = [];
+  const memoPlanIndex = new Map();
+  let attributionReads = 0;
+  let projectedRows = 0;
+  const attributionAt = (row, position) => {
+    if (attributionReader === null) return {};
+    if (memoBasis !== null && position !== undefined
+        && memoBasis[position] !== 0) {
+      const planIndex = memoPlan[position];
+      const intervalMs = memoIntervalMs[position];
+      return {
+        planAttribution: {
+          basis: ATTRIBUTION_BASES[memoBasis[position] - 1],
+          planType: planIndex < 0 ? null : memoPlanTable[planIndex],
+          planVariant: null,
+        },
+        usageIntervalStartedAt: Number.isNaN(intervalMs)
+          ? null
+          : new Date(intervalMs).toISOString(),
+        usageIntervalBasis: INTERVAL_BASES[memoIntervalBasis[position]],
+      };
+    }
+    attributionReads += 1;
+    const result = attributionReader.read(row);
+    if (memoBasis === null || position === undefined) return result;
+    const basisIndex = ATTRIBUTION_BASES.indexOf(result.planAttribution?.basis);
+    const intervalBasisIndex = INTERVAL_BASES.indexOf(result.usageIntervalBasis);
+    const planType = result.planAttribution?.planType ?? null;
+    const intervalMs = result.usageIntervalStartedAt === null
+      ? Number.NaN
+      : Date.parse(result.usageIntervalStartedAt);
+    if (basisIndex === -1 || intervalBasisIndex === -1
+        || result.planAttribution?.planVariant !== null
+        || (planType !== null && typeof planType !== "string")
+        || (result.usageIntervalStartedAt !== null
+          && (!Number.isSafeInteger(intervalMs)
+            || new Date(intervalMs).toISOString()
+              !== result.usageIntervalStartedAt))) {
+      return result;
+    }
+    let planIndex = -1;
+    if (planType !== null) {
+      planIndex = memoPlanIndex.get(planType) ?? -1;
+      if (planIndex === -1) {
+        planIndex = memoPlanTable.push(planType) - 1;
+        memoPlanIndex.set(planType, planIndex);
+      }
+    }
+    memoBasis[position] = basisIndex + 1;
+    memoPlan[position] = planIndex;
+    memoIntervalMs[position] = intervalMs;
+    memoIntervalBasis[position] = intervalBasisIndex;
+    return result;
+  };
   const planEvidence = calibrationPlanEvidence({ ordered: true, maximum: limits.weeklySnapshots });
   const price = createAccountingPricer();
   // Shared row-count cadence across every read this source performs (the open
@@ -3286,12 +3359,18 @@ async function openUnifiedIndexCalibrationCorpus({
   };
   // The priced compact projection, identical to the windowed scan's retention
   // shape. Returns null for exactly the rows retainedByLightFilter refuses.
-  const projectUsageRow = (row) => {
+  const projectUsageRow = (row, position) => {
     const observedMs = Number(row.observed_at_ms);
     if (!Number.isSafeInteger(observedMs)) return null;
+    // Refuse the rows the discovery pass refused (zero-token, Spark) BEFORE
+    // deriving attribution: the memo is keyed by retained position, and a
+    // refused row would otherwise be derived and remembered under the
+    // position of the retained row that follows it.
+    if (!retainedByLightFilter(row)) return null;
+    projectedRows += 1;
     const rawEvent = {
       timestamp: new Date(observedMs).toISOString(),
-      ...(attributionReader?.read(row) ?? {}),
+      ...attributionAt(row, position),
       model: row.model_id,
       // NULL means "the record did not report a total"; it must stay
       // absent so the pricer bands by the summed input components exactly
@@ -3450,6 +3529,14 @@ async function openUnifiedIndexCalibrationCorpus({
     stampedRowid.length = 0;
     const retainedUsageEvents = usageMs.length;
     const firstUsageMs = usageMs[0];
+    if (attributionReader !== null) {
+      memoBasis = new Uint8Array(retainedUsageEvents);
+      memoPlan = new Int32Array(retainedUsageEvents);
+      memoIntervalMs = new Float64Array(retainedUsageEvents);
+      memoIntervalBasis = new Uint8Array(retainedUsageEvents);
+      throwIfAborted(signal);
+      checkRuntimeMemory();
+    }
 
     const snapshotLowerMs = retainedStartMs === null
       ? -1
@@ -3643,7 +3730,11 @@ async function openUnifiedIndexCalibrationCorpus({
           if (batch.length === 0) break;
           for (const row of batch) {
             await cadence();
-            const projected = projectUsageRow(row);
+            // `low + served` is this row's retained position: the stream
+            // yields exactly the retained rows between its bounds in retained
+            // order, and projectUsageRow returns null for precisely the rows
+            // the discovery pass refused (verified by the count below).
+            const projected = projectUsageRow(row, low + served);
             if (projected === null) continue;
             served += 1;
             await consume(projected);
@@ -3678,6 +3769,16 @@ async function openUnifiedIndexCalibrationCorpus({
       weeklyRateLimitSnapshots,
       planAttribution: planEvidence.finish(),
       usageMs,
+      // Content-free work counters for structural regression tests: how many
+      // rows the re-read streams projected and how many attribution reads
+      // the memo let through. Counts only, never rows. (The snapshot count is
+      // captured now because the derivation consumes that array in place.)
+      metrics: ((retainedWeeklySnapshots) => () => ({
+        retainedUsageEvents,
+        weeklySnapshots: retainedWeeklySnapshots,
+        projectedRows,
+        attributionReads,
+      }))(weeklyRateLimitSnapshots.length),
       readUsageSlice: async (low, high) => {
         if (!Number.isSafeInteger(low) || !Number.isSafeInteger(high)
             || low < 0 || high > retainedUsageEvents || low >= high) {
@@ -3744,9 +3845,18 @@ export async function buildReplaySafeAccountingCache({
   transitionResourceLimits: requestedTransitionResourceLimits = null,
   rss = () => process.memoryUsage().rss,
   maximumRssBytes = MAX_ACCOUNTING_RSS_BYTES,
+  // In-process characterization seam: receives the unified calibration
+  // corpus's content-free work counters (row and attribution-read counts)
+  // once the corpus has been fully consumed. Functions cannot cross the
+  // rebuild child's boundary, so a caller that sets this stays in process.
+  onCalibrationCorpusMetrics = null,
 } = {}) {
   if (scan === null && (sourceMode === null || sourceMode === undefined)) {
     throw fixedError("accounting_source_required");
+  }
+  if (onCalibrationCorpusMetrics !== null
+      && typeof onCalibrationCorpusMetrics !== "function") {
+    throw new TypeError("onCalibrationCorpusMetrics must be a function or null");
   }
   const selectedSourceMode = normalizeAccountingSourceMode(sourceMode);
   const selectedContextBehavior = normalizeContextBehavior(contextBehavior);
@@ -4228,7 +4338,13 @@ export async function buildReplaySafeAccountingCache({
     // slices were read off is still the generation the build is bound to, and
     // release the read handle. The one-shot reader ran the same checks at its
     // end; streaming widens the window they cover, not their meaning.
-    if (calibrationCorpus !== null) await calibrationCorpus.finish();
+    if (calibrationCorpus !== null) {
+      const corpusMetrics = calibrationCorpus.metrics();
+      await calibrationCorpus.finish();
+      if (onCalibrationCorpusMetrics !== null) {
+        onCalibrationCorpusMetrics(corpusMetrics);
+      }
+    }
   } catch (error) {
     calibrationCorpus?.dispose();
     throw error;
@@ -4692,10 +4808,12 @@ export async function refreshReplaySafeAccountingCache({
   // "auto". Everything a production call carries is serializable, so the
   // production paths (unified reader, legacy indexed scan) are reconstructed
   // inside the child by value.
-  const subprocessEligible = scan === null && !Object.hasOwn(options, "rss");
+  const subprocessEligible = scan === null
+    && !Object.hasOwn(options, "rss")
+    && !Object.hasOwn(options, "onCalibrationCorpusMetrics");
   if (selectedRebuildIsolation === "subprocess" && !subprocessEligible) {
     throw new TypeError(
-      "rebuildIsolation subprocess cannot carry injected scan or rss seams",
+      "rebuildIsolation subprocess cannot carry injected scan, rss or metrics seams",
     );
   }
   const rebuildInSubprocess = selectedRebuildIsolation === "subprocess"
