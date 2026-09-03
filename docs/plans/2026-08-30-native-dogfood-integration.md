@@ -504,7 +504,7 @@ Acceptance and execution sequence:
   retained-cache and failure behavior with deterministic tests.
 - [x] Route only explicit manual controls to detailed refresh, remove the
   duplicate action, and preserve automatic cadence and controller fences.
-- [ ] Run focused ownership gates and independent review, then compare baseline
+- [x] Run focused ownership gates and independent review, then compare baseline
   RC9 and optimized RC9 on one immutable private index with a pinned clock.
   Keep exact output equality, raw wall/CPU/peak-RSS and lifecycle results
   content-free; never infer end-to-end timing from separate phase sums.
@@ -544,6 +544,18 @@ durable publication, zero deferral callbacks and exact complete-cache parity
 when only the point reader fits. The accounting owning suites then passed
 135/135 with no skips or failures. Restart the controlled comparison on the
 corrected clean source.
+
+The corrected comparison completed successfully on baseline `a89eaa8b` and
+candidate `b06b5968`. One warm-up plus three measured runs per revision produced
+eight identical 15,511,261-byte cache artifacts. Median child wall time fell
+from 321.86 to 39.25 seconds (8.2 times faster); median peak RSS rose about
+5.3%, with every run below the unchanged 6 GiB ceiling. The
+[exact comparison receipt](../receipts/2026-09-03-optimized-rc9-accounting-comparison.md)
+records raw CPU/RSS measurements, immutable input, supplementary dependency
+verification, and the v1 harness's cancellation/provenance limitations. Correct
+those tooling safeguards before final release validation; the measured product
+code remains unchanged by that repair. This does not close PR #94's distinct
+empirical gate or establish end-to-end installed refresh time.
 
 The latest owner authorization covers local candidate preparation, signing,
 notarization and dogfood testing, not publication. Stable release approval,
