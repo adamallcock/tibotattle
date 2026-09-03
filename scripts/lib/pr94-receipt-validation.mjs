@@ -397,10 +397,12 @@ function validateSources(value) {
   for (const side of ["before", "after", "final"]) validateSource(value[side]);
   if (value.before.revision !== PR94_COMPARISON_REVISIONS.before
       || value.after.revision !== PR94_COMPARISON_REVISIONS.after) reject();
-  for (const key of ["runtimeSha256", "lockSha256"]) {
-    if (value.before.dependencies[key] !== value.after.dependencies[key]
-        || value.before.dependencies[key] !== value.final.dependencies[key]) reject();
-  }
+  if (value.before.dependencies.runtimeSha256 !== value.after.dependencies.runtimeSha256
+      || value.before.dependencies.runtimeSha256 !== value.final.dependencies.runtimeSha256
+      || value.before.dependencies.lockSha256 !== value.after.dependencies.lockSha256) reject();
+  // Only before/after isolate PR94. The separately identified final lane also
+  // includes subsequent reviewed dependency updates; bind those to its own
+  // production probes instead of pretending it is the historical PR94 tree.
   return value;
 }
 

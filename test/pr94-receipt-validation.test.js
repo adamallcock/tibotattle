@@ -274,6 +274,22 @@ test("comparison validator binds evidence revisions, unchanged reader evidence a
   }
 });
 
+test("only the PR94 isolation pair requires identical locks; final dependencies remain independently bound", () => {
+  const value = receipt();
+  value.sources.final.dependencies.lockSha256 = HASH("7");
+  // The fixture intentionally shares the source/probe dependency object.
+  assert.equal(validatePr94ComparisonReceipt(value), value);
+  const drift = clone(value);
+  drift.productionResources.final.dependencies = {
+    ...drift.productionResources.final.dependencies, lockSha256: HASH("8"),
+  };
+  assert.throws(() => validatePr94ComparisonReceipt(drift), { code: "pr94_receipt_comparison_invalid" });
+  const mixedPair = clone(value);
+  mixedPair.sources.after.dependencies.lockSha256 = HASH("7");
+  mixedPair.productionResources.after.dependencies.lockSha256 = HASH("7");
+  assert.throws(() => validatePr94ComparisonReceipt(mixedPair), { code: "pr94_receipt_comparison_invalid" });
+});
+
 test("closed validators reject accessor, symbol, prototype and raw content channels", () => {
   const value = analysis("before");
   Object.defineProperty(value, "private", { enumerable: true, get() { throw new Error("synthetic"); } });
