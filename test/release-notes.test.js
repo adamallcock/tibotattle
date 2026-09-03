@@ -134,6 +134,26 @@ async function populateLegacyTagFixture(rootDirectory) {
   ]);
 }
 
+function assertReleaseLifecycleInventory(result, packageVersionIsTagged) {
+  assert.equal(
+    result.stableTagVersions.includes(result.packageVersion),
+    packageVersionIsTagged,
+  );
+  assert.equal(
+    result.changelogVersions.includes(result.packageVersion),
+    packageVersionIsTagged,
+  );
+  assert.equal(
+    result.noteVersions.length,
+    result.changelogVersions.length + (packageVersionIsTagged ? 0 : 1),
+  );
+
+  const expectedVersions = new Set(result.stableTagVersions);
+  assert.deepEqual(new Set(result.changelogVersions), expectedVersions);
+  expectedVersions.add(result.packageVersion);
+  assert.deepEqual(new Set(result.noteVersions), expectedVersions);
+}
+
 test("the current repository covers every stable tag and package version", async () => {
   const result = await checkReleaseNotes({ rootDirectory: REPOSITORY_ROOT });
   assert.equal(result.ok, true, formatReleaseNotesReport(result));
@@ -154,9 +174,10 @@ test("the current repository covers every stable tag and package version", async
     true,
   );
   assert.equal(result.noteVersions.length >= 17, true);
-  assert.equal(result.noteVersions.length, result.changelogVersions.length + 1);
-  assert.equal(result.noteVersions.includes(result.packageVersion), true);
-  assert.equal(result.changelogVersions.includes(result.packageVersion), false);
+  assertReleaseLifecycleInventory(
+    result,
+    result.stableTagVersions.includes(result.packageVersion),
+  );
 });
 
 test("only the exact protected v0.1.10 anomaly is pinned", () => {
@@ -291,7 +312,44 @@ test("release preparation covers the package version before its tag exists", asy
     assert.equal(result.ok, true, formatReleaseNotesReport(result));
     assert.deepEqual(result.stableTagVersions, ["1.1.0"]);
     assert.deepEqual(result.changelogVersions, ["1.1.0"]);
-    assert.equal(result.noteVersions.includes("1.2.0"), true);
+    assertReleaseLifecycleInventory(result, false);
+  });
+});
+
+test("release preparation covers the package version after its tag exists", async () => {
+  await withReleaseFixture(async (rootDirectory) => {
+    await populateCompleteFixture(rootDirectory);
+    const changelogPath = join(rootDirectory, "CHANGELOG.md");
+    const changelog = await readFile(changelogPath, "utf8");
+    await writeFile(
+      changelogPath,
+      changelog.replace(
+        [
+          "## [Unreleased]",
+          "",
+          "**Candidate notes:** [1.2.0](./release-notes/1.2.0.md)",
+          "",
+          "- Candidate work remains unreleased.",
+        ].join("\n"),
+        [
+          "## [Unreleased]",
+          "",
+          "## [1.2.0](./release-notes/1.2.0.md) - 2026-08-23",
+          "",
+          ...provenanceLines("1.2.0", "1.1.0"),
+          "- Finalized release.",
+        ].join("\n"),
+      ),
+      "utf8",
+    );
+    const result = await checkReleaseNotes({
+      rootDirectory,
+      tagVersions: ["v1.1.0", "v1.2.0"],
+    });
+    assert.equal(result.ok, true, formatReleaseNotesReport(result));
+    assert.deepEqual(result.stableTagVersions, ["1.1.0", "1.2.0"]);
+    assert.deepEqual(result.changelogVersions, ["1.2.0", "1.1.0"]);
+    assertReleaseLifecycleInventory(result, true);
   });
 });
 
