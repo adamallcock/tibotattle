@@ -121,6 +121,12 @@ const DISTRIBUTION_CHANNEL_PRODUCTION = "production";
 const MACOS_BUILD_PROFILE_RELEASE = "release";
 const MACOS_BUILD_PROFILE_TEST = "test";
 const FIXED_EPOCH_SECONDS = 946_684_800;
+const GIT_PATH = "/usr/bin/git";
+const SET_FILE_PATH = "/usr/bin/SetFile";
+const MACOS_TOOL_ENV = Object.freeze({
+  PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+  TZ: "UTC",
+});
 const MAXIMUM_BUNDLE_BYTES = 512 * 1024 * 1024;
 const MANIFEST_SCHEMA = "usage-monitor-macos-app-build-v0.1";
 const CODESIGN_PATH = "/usr/bin/codesign";
@@ -1968,6 +1974,93 @@ function run(command, args, options = {}) {
   return result.stdout.trim();
 }
 
+function macOSFinderDate(timestampSeconds, label) {
+  if (!Number.isSafeInteger(timestampSeconds) || timestampSeconds < 0) {
+    fail(`${label} must be a non-negative integer timestamp`);
+  }
+  const date = new Date(timestampSeconds * 1_000);
+  if (!Number.isFinite(date.getTime())
+      || date.getUTCFullYear() < 1904
+      || date.getUTCFullYear() > 9999) {
+    fail(`${label} is outside the supported macOS file-date range`);
+  }
+  const pad = (value) => String(value).padStart(2, "0");
+  return [
+    `${pad(date.getUTCMonth() + 1)}/${pad(date.getUTCDate())}/${date.getUTCFullYear()}`,
+    `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`,
+  ].join(" ");
+}
+
+/**
+ * Read the source commit's timestamp for external builds. The commit is
+ * already authenticated by the release-core preflight; reading it here keeps
+ * Finder metadata tied to that same immutable source revision without adding
+ * a wall-clock input or changing the public build manifest.
+ */
+export function readMacOSReleaseSourceTimestamp(source) {
+  if (!source || typeof source !== "object"
+      || typeof source.commit !== "string"
+      || !/^[0-9a-f]{40,64}$/u.test(source.commit)) {
+    fail(
+      "Release source commit is required for Finder metadata",
+      "MACOS_RELEASE_SOURCE_INVALID",
+    );
+  }
+  const output = run(GIT_PATH, [
+    "-C",
+    REPOSITORY_ROOT,
+    "show",
+    "-s",
+    "--format=%ct",
+    `${source.commit}^{commit}`,
+  ], { env: MACOS_TOOL_ENV });
+  if (!/^\d+$/u.test(output)) {
+    fail(
+      "Release source commit timestamp is invalid",
+      "MACOS_RELEASE_SOURCE_TIMESTAMP_INVALID",
+    );
+  }
+  const timestampSeconds = Number(output);
+  if (!Number.isSafeInteger(timestampSeconds) || timestampSeconds < 0) {
+    fail(
+      "Release source commit timestamp is outside the supported range",
+      "MACOS_RELEASE_SOURCE_TIMESTAMP_INVALID",
+    );
+  }
+  return timestampSeconds;
+}
+
+/**
+ * Set only the outer bundle directory's Finder birth/modify dates. Payload
+ * files retain the fixed normalization above; this filesystem metadata is not
+ * part of the signed or inventoried payload bytes.
+ */
+export function setMacOSBundleFinderMetadata(path, {
+  birthTimeSeconds,
+  modificationTimeSeconds = birthTimeSeconds,
+  commandRunner = run,
+} = {}) {
+  if (typeof path !== "string" || path.length === 0 || path.includes("\0")) {
+    fail("macOS bundle path is invalid for Finder metadata");
+  }
+  const birthDate = macOSFinderDate(birthTimeSeconds, "Finder birth time");
+  const modificationDate = macOSFinderDate(
+    modificationTimeSeconds,
+    "Finder modification time",
+  );
+  commandRunner(SET_FILE_PATH, [
+    "-d",
+    birthDate,
+    "-m",
+    modificationDate,
+    path,
+  ], { env: MACOS_TOOL_ENV });
+  return Object.freeze({
+    birthTimeSeconds,
+    modificationTimeSeconds,
+  });
+}
+
 function assertBuildPlatform() {
   if (process.platform !== "darwin"
       || process.arch !== PINNED_NODE_ARCHITECTURE) {
@@ -3269,7 +3362,15 @@ export async function assertMacOSExternalBuildOutputIsFresh(output) {
   );
 }
 
-export async function installMacOSExternalBuildOutput(stagedApp, output) {
+export async function installMacOSExternalBuildOutput(stagedApp, output, {
+  finderMetadata = null,
+} = {}) {
+  // Validate and apply Finder metadata while the bundle is still isolated.
+  // If SetFile is unavailable or rejects the staged bundle, no final output
+  // path has been claimed yet.
+  if (finderMetadata !== null) {
+    setMacOSBundleFinderMetadata(stagedApp, finderMetadata);
+  }
   try {
     // Claim the final bundle path without replacement. If an output appears
     // after the pre-build check, mkdir fails and the existing target remains.
@@ -3283,8 +3384,34 @@ export async function installMacOSExternalBuildOutput(stagedApp, output) {
     }
     throw error;
   }
-  for (const entry of await readdir(stagedApp)) {
-    await rename(join(stagedApp, entry), join(output, entry));
+  try {
+    // mkdir above claims the path; set its root metadata before moving any
+    // payload entries so a metadata failure cannot expose a final bundle.
+    if (finderMetadata !== null) {
+      setMacOSBundleFinderMetadata(output, finderMetadata);
+    }
+    for (const entry of await readdir(stagedApp)) {
+      await rename(join(stagedApp, entry), join(output, entry));
+    }
+    if (finderMetadata !== null) {
+      // Moving entries updates the claimed directory's mtime. Restore only
+      // that root field after the move; the source-bound SetFile preflight
+      // above already established the Finder birth date before installation.
+      const modificationTimeSeconds = finderMetadata.modificationTimeSeconds
+        ?? finderMetadata.birthTimeSeconds;
+      await utimes(
+        output,
+        modificationTimeSeconds,
+        modificationTimeSeconds,
+      );
+    }
+  } catch (error) {
+    try {
+      await rm(output, { recursive: true, force: false });
+    } catch (cleanupError) {
+      error.message = `${error.message}; failed to remove incomplete external output: ${cleanupError.message}`;
+    }
+    throw error;
   }
 }
 
@@ -3936,6 +4063,9 @@ export async function buildMacOSApp({
     })
     : resolve(output);
   assertBuildPlatform();
+  const releaseFinderTimestamp = externalDistribution
+    ? readMacOSReleaseSourceTimestamp(sealedReleaseSource)
+    : null;
   const iconAssets = await loadIconAssets({
     required: distribution.externalDistribution || distribution.previewDistribution,
   });
@@ -3966,7 +4096,11 @@ export async function buildMacOSApp({
     });
     signApplicationBundle(stagedApp);
     if (externalDistribution) {
-      await installMacOSExternalBuildOutput(stagedApp, selectedOutput);
+      await installMacOSExternalBuildOutput(stagedApp, selectedOutput, {
+        finderMetadata: {
+          birthTimeSeconds: releaseFinderTimestamp,
+        },
+      });
     } else {
       let legacyPreviewArchive = null;
       if (await verifyExistingBuildTarget(selectedOutput, productBrand)) {

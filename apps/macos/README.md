@@ -528,6 +528,13 @@ accepts only `vX.Y.Z` matching the short version. Internal dogfood accepts only
 non-zero-padded `N` and a real calendar date. Lightweight tags, aliases, wrong
 versions, and multiple matching channel tags at HEAD fail closed.
 
+External-release bundles set only the outer `.app` Finder creation and
+modification dates from the sealed source commit's Git committer timestamp.
+Payload files retain the fixed epoch used for reproducible inventories, and the
+DMG packager reapplies the same source-bound dates after staging. This
+filesystem metadata is outside the signed and inventoried payload; no build-host
+wall clock is used for it.
+
 ## Developer ID and notarization
 
 The release operator must first make a `Developer ID Application` identity

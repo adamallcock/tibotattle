@@ -56,6 +56,8 @@ import {
   assertMacOSKeychainMigrationManifest,
   buildMacOSAppForRelease,
   buildMacOSReleaseCandidate,
+  readMacOSReleaseSourceTimestamp,
+  setMacOSBundleFinderMetadata,
   validateMacOSPreviewApp,
 } from "./build-macos-app.js";
 import {
@@ -2692,14 +2694,21 @@ export async function packageMacOSDMG({
   replace = false,
   distribution,
   channel = STABLE_RELEASE_CHANNEL,
-}) {
+}, {
+  inspectInput = inspectMacOSDMGInput,
+  commandRunner = runMacOSReleaseCommand,
+  finderMetadataSetter = setMacOSBundleFinderMetadata,
+} = {}) {
   if (!Object.values(DMG_DISTRIBUTIONS).includes(distribution)) {
     fail(
       "DMG packaging requires an explicit development, preview, or release distribution",
       "MACOS_DMG_DISTRIBUTION_REQUIRED",
     );
   }
-  const inspected = await inspectMacOSDMGInput(appPath, distribution, channel);
+  const inspected = await inspectInput(appPath, distribution, channel);
+  const releaseFinderTimestamp = distribution === DMG_DISTRIBUTIONS.release
+    ? readMacOSReleaseSourceTimestamp(inspected.source)
+    : null;
   const selectedOutput = resolve(output);
   if (basename(selectedOutput).startsWith(".")
       || !selectedOutput.endsWith(".dmg")) {
@@ -2735,7 +2744,7 @@ export async function packageMacOSDMG({
   );
   try {
     await mkdir(staging, { recursive: true, mode: 0o755 });
-    runMacOSReleaseCommand("/usr/bin/ditto", [
+    commandRunner("/usr/bin/ditto", [
       "--noqtn",
       inspected.appPath,
       stagedApp,
@@ -2756,8 +2765,17 @@ export async function packageMacOSDMG({
         await utimes(current, FIXED_EPOCH_SECONDS, FIXED_EPOCH_SECONDS);
       }
     }
+    if (releaseFinderTimestamp !== null) {
+      // The payload tree remains normalized to the fixed epoch. Restore the
+      // source-bound outer bundle dates so Finder does not expose that
+      // reproducibility sentinel as a release date.
+      finderMetadataSetter(stagedApp, {
+        birthTimeSeconds: releaseFinderTimestamp,
+        modificationTimeSeconds: releaseFinderTimestamp,
+      });
+    }
     await symlink("/Applications", join(staging, "Applications"));
-    runMacOSReleaseCommand("/usr/bin/hdiutil", [
+    commandRunner("/usr/bin/hdiutil", [
       "create",
       "-ov",
       "-srcfolder",
@@ -2778,7 +2796,7 @@ export async function packageMacOSDMG({
       failureMessage: "DMG creation failed",
       timeout: 300_000,
     });
-    runMacOSReleaseCommand("/usr/bin/hdiutil", [
+    commandRunner("/usr/bin/hdiutil", [
       "verify",
       temporaryDMG,
     ], {
