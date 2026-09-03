@@ -3709,6 +3709,62 @@ test("a caller that names its own ceiling keeps it, which is how the rebuild sub
   assert.equal(samples.length, 2);
 });
 
+test("fused history keeps hard archive RSS failures at every boundary and retains the last good cache", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-fused-archive-guard-"));
+  const cacheFile = join(directory, "collector.sqlite");
+  try {
+    await refreshReplaySafeAccountingCache({
+      cacheFile, now: () => NOW,
+      scan: scanner([usageEvent({
+        timestamp: "2026-07-27T11:55:00.000Z", components: { input_uncached_tokens: 1_000_000 },
+      })]),
+    });
+    const before = await readTestCache(cacheFile);
+    const oldTimestamp = new Date(NOW - 366 * 24 * 60 * 60_000).toISOString();
+    const oldEvent = () => usageEvent({ timestamp: oldTimestamp, components: { input_uncached_tokens: 1 } });
+    for (const boundary of ["start", "cadence", "finish"]) {
+      for (const failure of ["overflow", "invalid"]) await t.test(`${boundary}: ${failure}`, async () => {
+        let currentRss = 0;
+        let delivered = 0;
+        let scans = 0;
+        const badRss = failure === "overflow" ? 1025 : Number.NaN;
+        const scan = async (options) => {
+          scans += 1;
+          assert.equal(typeof options.indexedHistory?.onUsage, "function");
+          const result = await completeUnifiedScanner([], { startAt: oldTimestamp })(options);
+          if (boundary === "start") currentRss = badRss;
+          for (let index = 0; index < (boundary === "cadence" ? 2048 : 1); index += 1) {
+            if (boundary === "cadence" && index === 2047) currentRss = badRss;
+            delivered += 1;
+            options.indexedHistory.onUsage(oldEvent());
+          }
+          if (boundary === "finish") currentRss = badRss;
+          return {
+            ...result,
+            indexedHistory: {
+              status: "available", errorCode: null,
+              coverage: result.coverage, capabilities: result.capabilities,
+              diagnosticsAvailable: result.diagnosticsAvailable,
+            },
+          };
+        };
+        await assert.rejects(refreshReplaySafeAccountingCache({
+          cacheFile, sourceMode: "unified", expectedGeneration: "generation-test-1",
+          unifiedIndexFile: join(directory, "absent-unified.sqlite"),
+          now: () => NOW, scan, rss: () => currentRss, maximumRssBytes: 1024,
+        }), (error) => error.code === (failure === "overflow"
+          ? "accounting_archive_rss_limit_exceeded" : "accounting_archive_rss_measurement_invalid"));
+        assert.equal(scans, 1, "the failure occurred in the fused read, not a separate history scan");
+        assert.equal(delivered, boundary === "cadence" ? 2048 : 1);
+        assert.deepEqual(await readTestCache(cacheFile), before);
+        assert.equal((await stat(cacheFile)).mode & 0o777, 0o600);
+      });
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("an RSS ceiling miss during accounting is a soft target: the prior cache is retained and served", async () => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rss-bound-"));
   const cacheFile = join(directory, "accounting.json");

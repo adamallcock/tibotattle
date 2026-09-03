@@ -859,6 +859,9 @@ test("each retained corpus row's attribution is derived once across the fit and 
     );
     // ...while attribution is read exactly once per retained row.
     assert.equal(metrics.attributionReads, metrics.retainedUsageEvents);
+    assert.equal(metrics.attributionPrecomputeUsed, true);
+    assert.equal(metrics.attributionPrecomputeRows, fixture.usageRows);
+    assert.ok(metrics.attributionPrecomputeBytes >= fixture.usageRows * 32);
     // A caller that carries the in-process seam cannot be isolated in a child.
     await assert.rejects(
       refreshReplaySafeAccountingCache({
@@ -871,6 +874,50 @@ test("each retained corpus row's attribution is derived once across the fit and 
       }),
       /cannot carry injected scan, rss or metrics seams/u,
     );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("an oversized optional precompute falls back without changing retained calibration or the ledger", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-precompute-fallback-"));
+  try {
+    const fixture = await writeCompleteGenerationIndex(join(directory, "index.sqlite"), {
+      resetStarts: Array.from({ length: 3 }, (_, week) => Date.parse("2026-05-07T00:00:00.000Z") + week * WEEK_MS),
+      boundariesPerReset: 100, usagePerBoundary: 8, scannedBytes: 1 << 20,
+    });
+    const metrics = [];
+    const results = [];
+    for (const retainedBytes of [64 * 1024, 128 * 1024]) {
+      results.push(await buildReplaySafeAccountingCache({
+        sourceMode: "unified", expectedGeneration: fixture.expectedGeneration,
+        unifiedIndexFile: fixture.indexFile, now: () => NOW,
+        declaredSpeedBaselines: DECLARED_SPEED_BASELINES,
+        transitionResourceLimits: { usageEvents: 100, retainedBytes },
+        onCalibrationCorpusMetrics: (value) => { metrics.push(value); },
+      }));
+    }
+    assert.equal(metrics.length, 2);
+    assert.equal(metrics[0].attributionPrecomputeUsed, false);
+    assert.equal(metrics[0].attributionPrecomputeRows, 0);
+    assert.equal(metrics[0].attributionPrecomputeBytes, 0);
+    assert.equal(metrics[1].attributionPrecomputeUsed, true);
+    assert.equal(metrics[1].attributionPrecomputeRows, fixture.usageRows);
+    for (const value of metrics) assert.equal(value.retainedUsageEvents, 100);
+    const [fallback, optimized] = results;
+    assert.equal(fallback.weeklyCalibrationInput.limits.retainedBytes, 64 * 1024);
+    assert.equal(optimized.weeklyCalibrationInput.limits.retainedBytes, 128 * 1024);
+    // The named policy value is intentionally different; every derived field
+    // (including exact decimals, attribution, plan lanes and diagnostics) is not.
+    const comparable = (cache) => ({
+      ...cache,
+      weeklyCalibrationInput: {
+        ...cache.weeklyCalibrationInput,
+        limits: { ...cache.weeklyCalibrationInput.limits, retainedBytes: null },
+      },
+    });
+    assert.equal(stableJson(comparable(fallback)), stableJson(comparable(optimized)));
+    assert.equal(fallback.history.period.events, fixture.usageRows);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

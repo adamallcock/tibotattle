@@ -788,8 +788,9 @@ test("the one-pass attribution precomputation reproduces every point-query read 
       const live = createLocalUnifiedUsageAttributionReader({
         database, generationId: fixture.generationId,
       });
-      const precomputed = precomputeLocalUnifiedUsageAttribution({
+      const precomputed = await precomputeLocalUnifiedUsageAttribution({
         database, generationId: fixture.generationId,
+        maximumRetainedBytes: 1024 * 1024,
       });
       const batch = createLocalUnifiedUsageAttributionReader({
         database, generationId: fixture.generationId, precomputed,
@@ -812,6 +813,136 @@ test("the one-pass attribution precomputation reproduces every point-query read 
       database.close();
       await rm(fixture.root, { recursive: true, force: true });
     }
+  }
+});
+
+test("attribution precomputation sizes live rows, not sparse rescan rowids, and falls back exactly", async () => {
+  let fixture = await createAttributionIndex({ records: Array.from({ length: 12 }, (_, index) => ({
+    quotas: [{ plan: index % 2 === 0 ? "pro" : "plus" }],
+  })) });
+  try {
+    for (let rescan = 0; rescan < 2; rescan += 1) {
+      if (rescan > 0) fixture = await createAttributionIndex({
+        previous: fixture,
+        records: Array.from({ length: 12 }, () => ({ quotas: [{ plan: "plus" }] })),
+      });
+      const database = openLocalUnifiedIndex(fixture.indexFile);
+      try {
+        // Persisted IDs can grow independently of the live row count after
+        // deletion/reinsertion. These IDs would require terabyte arrays if
+        // MAX(rowid) were still used as the allocation length.
+        database.prepare("UPDATE usage_event SET rowid = rowid + ?").run(2 ** 40 + rescan * 10_000);
+        const rows = database.prepare("SELECT rowid AS row_id, * FROM usage_event ORDER BY rowid").all();
+        const reference = createLocalUnifiedUsageAttributionReader({ database, generationId: fixture.generationId });
+        const expected = rows.map((row) => reference.read(row));
+        const allocationReservations = [];
+        const precomputed = await precomputeLocalUnifiedUsageAttribution({
+          database, generationId: fixture.generationId, maximumRetainedBytes: 4096,
+          checkRuntimeMemory: (bytes) => { if (bytes > 0) allocationReservations.push(bytes); },
+        });
+        assert.equal(precomputed.retainedRows, 12);
+        assert.ok(precomputed.retainedBytes <= 4096);
+        assert.equal(allocationReservations[0], 12 * 32);
+        const optimized = createLocalUnifiedUsageAttributionReader({ database, generationId: fixture.generationId, precomputed });
+        assert.deepEqual(rows.map((row) => optimized.read(row)), expected);
+        if (rescan > 0) assert.ok(expected.every((row) => row.planAttribution.planType === "plus"));
+        for (const absent of [0, 2 ** 40, rows.at(-1).row_id + 1, Number.MAX_SAFE_INTEGER]) {
+          assert.equal(precomputed.has(absent), false);
+        }
+        // Too little space for the typed columns, or for their plan dictionary,
+        // simply declines the optimization; the old reader stays authoritative.
+        for (const maximumRetainedBytes of [12 * 32 - 1, 12 * 32]) {
+          const declined = await precomputeLocalUnifiedUsageAttribution({
+            database, generationId: fixture.generationId, maximumRetainedBytes,
+          });
+          assert.equal(declined, null);
+          const fallback = createLocalUnifiedUsageAttributionReader({ database, generationId: fixture.generationId, precomputed: declined });
+          assert.deepEqual(rows.map((row) => fallback.read(row)), expected);
+        }
+      } finally {
+        database.close();
+      }
+    }
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("precompute checks allocation headroom before allocating and yields in every whole-table walk", async (t) => {
+  const rowCount = 6000;
+  const fixture = await createAttributionIndex({
+    sources: [{ id: 1, session: 1 }, { id: 2, session: 1 }],
+    records: Array.from({ length: rowCount }, (_, index) => ({
+      source: index % 2 + 1, offset: Math.floor(index / 2) + 1,
+    })),
+  });
+  const database = openLocalUnifiedIndex(fixture.indexFile, { readOnly: true });
+  const observe = (onRow) => {
+    let rowidPass = 0;
+    return {
+      prepare(sql) {
+        const statement = database.prepare(sql);
+        return {
+          get: (...args) => statement.get(...args),
+          *iterate(...args) {
+            const phase = sql.includes("ORDER BY rowid")
+              ? (++rowidPass === 1 ? "count" : "rowids")
+              : sql.includes("ORDER BY session_local") ? "sessions" : "predecessors";
+            let rows = 0;
+            for (const row of statement.iterate(...args)) {
+              onRow(phase, ++rows);
+              yield row;
+            }
+          },
+        };
+      },
+    };
+  };
+  try {
+    let rowsRead = 0;
+    let reservedBytes = 0;
+    const allocationError = Object.assign(new Error("accounting_transition_memory_budget_exceeded"), {
+      code: "accounting_transition_memory_budget_exceeded",
+    });
+    await assert.rejects(precomputeLocalUnifiedUsageAttribution({
+      database: observe(() => { rowsRead += 1; }), generationId: fixture.generationId,
+      maximumRetainedBytes: 1024 * 1024,
+      checkRuntimeMemory: (additionalBytes) => {
+        if (additionalBytes > 0) { reservedBytes = additionalBytes; throw allocationError; }
+      },
+    }), (error) => error === allocationError);
+    assert.equal(reservedBytes, rowCount * 32);
+    assert.equal(rowsRead, rowCount, "only the non-allocating count walk may precede reservation");
+
+    for (const target of ["count", "rowids", "predecessors", "sessions"]) {
+      for (const stop of ["abort", "rss"]) await t.test(`${target}: ${stop}`, async () => {
+        const controller = new AbortController();
+        let reached = 0;
+        let active = null;
+        const guardedDatabase = observe((phase, rows) => {
+          active = phase;
+          if (phase !== target) return;
+          reached = rows;
+          if (rows === 10 && stop === "abort") setImmediate(() => controller.abort());
+        });
+        const rssError = Object.assign(new Error("accounting_transition_rss_limit_exceeded"), {
+          code: "accounting_transition_rss_limit_exceeded",
+        });
+        await assert.rejects(precomputeLocalUnifiedUsageAttribution({
+          database: guardedDatabase, generationId: fixture.generationId,
+          maximumRetainedBytes: 1024 * 1024, signal: controller.signal,
+          checkRuntimeMemory: () => {
+            if (stop === "rss" && active === target && reached >= 10) throw rssError;
+          },
+        }), (error) => stop === "rss" ? error === rssError
+          : error.name === "AbortError" && error.code === "local_unified_index_read_aborted");
+        assert.ok(reached >= 10 && reached <= 2058, `${target} read ${reached} rows before stopping`);
+        assert.ok(reached < rowCount);
+      });
+    }
+  } finally {
+    database.close();
+    await rm(fixture.root, { recursive: true, force: true });
   }
 });
 

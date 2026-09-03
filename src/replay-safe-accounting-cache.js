@@ -3626,6 +3626,7 @@ async function openUnifiedIndexCalibrationCorpus({
   // fact sets are proven: the reader is handed a one-pass precomputation of
   // its per-row lookups so the projection streams issue no point queries.
   let attributionReader = null;
+  let attributionPrecompute = null;
   // Attribution memo, keyed by retained position. A row's attribution is a
   // pure function of the immutable generation this handle is fenced to, and
   // the derivation re-reads every retained row at least once after the fit
@@ -3820,16 +3821,21 @@ async function openUnifiedIndexCalibrationCorpus({
       }
       verifyGeneration();
       // One ordered pass replaces the reader's per-row point queries for the
-      // whole generation (~14 bytes per usage row of typed columns, metered
-      // by the same RSS guard as the rest of the open pass). The reader's
-      // decision logic is unchanged; it only consults these results.
+      // whole generation with dense live-row columns, preflighted against
+      // the existing retained-byte budget and runtime headroom. Every walk
+      // yields/checks cancellation and RSS; an oversized optimization falls
+      // back to the authoritative point queries without excluding history.
+      attributionPrecompute = await precomputeLocalUnifiedUsageAttribution({
+        database,
+        generationId,
+        maximumRetainedBytes: limits.retainedBytes,
+        signal,
+        checkRuntimeMemory,
+      });
       attributionReader = createLocalUnifiedUsageAttributionReader({
         database,
         generationId,
-        precomputed: precomputeLocalUnifiedUsageAttribution({
-          database,
-          generationId,
-        }),
+        precomputed: attributionPrecompute,
       });
       throwIfAborted(signal);
       checkRuntimeMemory();
@@ -3921,6 +3927,7 @@ async function openUnifiedIndexCalibrationCorpus({
     const retainedUsageEvents = usageMs.length;
     const firstUsageMs = usageMs[0];
     if (attributionReader !== null) {
+      checkRuntimeMemory(retainedUsageEvents * 14);
       memoBasis = new Uint8Array(retainedUsageEvents);
       memoPlan = new Int32Array(retainedUsageEvents);
       memoIntervalMs = new Float64Array(retainedUsageEvents);
@@ -4169,6 +4176,9 @@ async function openUnifiedIndexCalibrationCorpus({
         weeklySnapshots: retainedWeeklySnapshots,
         projectedRows,
         attributionReads,
+        attributionPrecomputeUsed: attributionPrecompute !== null,
+        attributionPrecomputeRows: attributionPrecompute?.retainedRows ?? 0,
+        attributionPrecomputeBytes: attributionPrecompute?.retainedBytes ?? 0,
       }))(weeklyRateLimitSnapshots.length),
       readUsageSlice: async (low, high) => {
         if (!Number.isSafeInteger(low) || !Number.isSafeInteger(high)
@@ -4203,9 +4213,10 @@ async function openUnifiedIndexCalibrationCorpus({
     };
   } catch (error) {
     dispose();
-    if (error?.name === "AbortError"
-        || (typeof error?.code === "string"
-          && error.code.startsWith("accounting_"))) {
+    if (error?.name === "AbortError") {
+      throw fixedError("accounting_refresh_aborted", "AbortError");
+    }
+    if (typeof error?.code === "string" && error.code.startsWith("accounting_")) {
       throw error;
     }
     return null;
@@ -4303,7 +4314,7 @@ export async function buildReplaySafeAccountingCache({
     maximumRssBytes,
     baselineRss + ACCOUNTING_RSS_DELTA_BUDGET_BYTES,
   );
-  const checkRuntimeMemory = () => {
+  const checkRuntimeMemory = (additionalBytes = 0) => {
     const currentRss = rss();
     if (!Number.isSafeInteger(currentRss) || currentRss < 0) {
       throw fixedError("accounting_transition_rss_measurement_invalid");
@@ -4317,6 +4328,11 @@ export async function buildReplaySafeAccountingCache({
           ceilingRssBytes: effectiveMaximumRssBytes,
         },
       );
+    }
+    // Allocation reservations are not measured RSS: fail before allocation
+    // using the retained-memory budget code, never fabricate an RSS sample.
+    if (additionalBytes > effectiveMaximumRssBytes - currentRss) {
+      throw fixedError("accounting_transition_memory_budget_exceeded");
     }
   };
   checkRuntimeMemory();
@@ -4429,13 +4445,27 @@ export async function buildReplaySafeAccountingCache({
   // has projected them, so the projection is shared); a scanner that does
   // not report `indexedHistory` falls back to the separate full-history read
   // below. The accumulation mirrors buildReplaySafeAccountingPeriod exactly,
-  // metered by this build's own RSS guard.
+  // metered at the same ceiling with the archive's HARD failure policy.
   const historyPeriod = selectedSourceMode === "unified"
     ? newPeriod("history", "Indexed history")
     : null;
   let historyAcceptedEvents = 0;
+  let historyStarted = false;
+  const checkHistoryRuntimeMemory = () => {
+    const currentRss = rss();
+    if (!Number.isSafeInteger(currentRss) || currentRss < 0) {
+      throw fixedError("accounting_archive_rss_measurement_invalid");
+    }
+    if (currentRss > effectiveMaximumRssBytes) {
+      throw fixedError("accounting_archive_rss_limit_exceeded");
+    }
+  };
   const historyOnUsage = (rawEvent) => {
     throwIfAborted(signal);
+    if (!historyStarted) {
+      checkHistoryRuntimeMemory();
+      historyStarted = true;
+    }
     const observedAt = canonicalInstant(rawEvent?.timestamp);
     if (observedAt === null) return;
     let event = rawEvent[PROJECTED_EVENT];
@@ -4450,7 +4480,7 @@ export async function buildReplaySafeAccountingCache({
     addEvent(historyPeriod, event);
     historyAcceptedEvents += 1;
     if (historyAcceptedEvents % ACCOUNTING_RSS_CHECK_INTERVAL === 0) {
-      checkRuntimeMemory();
+      checkHistoryRuntimeMemory();
     }
   };
   let scanned;
@@ -4576,6 +4606,9 @@ export async function buildReplaySafeAccountingCache({
     throw error;
   }
   throwIfAborted(signal);
+  // Do not let the subsequent windowed/transition check convert an archive
+  // end-of-pass overflow into a soft, indefinitely deferred accounting miss.
+  if (scanned?.indexedHistory?.status === "available") checkHistoryRuntimeMemory();
   checkRuntimeMemory();
   let history = historyUnavailable(
     selectedSourceMode === "unified"

@@ -962,14 +962,17 @@ function rememberBounded(cache, key, value, limit) {
  * or out-of-order corpus slices without retaining whole sessions.
  */
 /**
- * One ordered pass over a published generation that pre-derives the two
+ * Bounded index walks over a published generation pre-derive the two
  * expensive per-row lookups the attribution reader performs — the same-record
  * quota plans and the same-source predecessor — for every usage row, keyed
- * by rowid, plus the set of sessions whose rows span more than one source
+ * by a dense sorted live-rowid index, plus per-row multi-source session flags
  * (the only sessions for which the cross-source session predecessor query can
  * return anything). The reader's decision logic is untouched: given this
  * structure it consults these results instead of issuing point queries, and
- * falls back to the queries for any rowid the pass did not see.
+ * falls back to the queries for any rowid the pass did not see. An allocation
+ * that exceeds the caller's retained-byte budget declines the optimization
+ * altogether. RSS and cancellation checks run before allocation, between
+ * stages and at a bounded cooperative cadence during every whole-table walk.
  *
  * Why it is exact:
  * - the pass walks usage_event in (source_local, source_offset,
@@ -984,67 +987,117 @@ function rememberBounded(cache, key, value, limit) {
  *   filters, and are reduced with the same DISTINCT / ORDER BY / LIMIT 2 rule;
  * - a session confined to one source has no row from another source, so the
  *   session-predecessor query is provably empty for it.
- * Everything retained is content-free: offsets, ordinals, timestamps, plan
- * labels and salted digests, the same columns the point queries read.
+ * Everything retained is content-free: numeric row identities, timestamps,
+ * plan labels and flags. Salted digests are compared only while streaming;
+ * no whole-generation membership or session-identity map remains resident.
  */
-export function precomputeLocalUnifiedUsageAttribution({
+export async function precomputeLocalUnifiedUsageAttribution({
   database,
   generationId,
+  maximumRetainedBytes,
+  signal = null,
+  checkRuntimeMemory = () => {},
 } = {}) {
   if (typeof database?.prepare !== "function"
-      || !Number.isSafeInteger(generationId) || generationId < 1) {
+      || !Number.isSafeInteger(generationId) || generationId < 1
+      || !Number.isSafeInteger(maximumRetainedBytes) || maximumRetainedBytes < 1
+      || !validAbortSignal(signal) || typeof checkRuntimeMemory !== "function") {
     throw fixedError("local_unified_index_attribution_options_invalid", "TypeError");
   }
-  const maxRowId = Number(database.prepare(
-    "SELECT COALESCE(MAX(rowid), 0) AS max_row_id FROM usage_event",
-  ).get()?.max_row_id);
-  if (!Number.isSafeInteger(maxRowId) || maxRowId < 0) {
-    throw fixedError("local_unified_index_row_invalid");
+  const checkpoint = (additionalBytes = 0) => {
+    throwIfAborted(signal);
+    checkRuntimeMemory(additionalBytes);
+  };
+  const yieldCheckpoint = async () => {
+    checkpoint();
+    await new Promise((resolve) => setImmediate(resolve));
+    checkpoint();
+  };
+  let processed = 0;
+  checkpoint();
+  // Rowids are durable SQLite identities, not dense array offsets: a rescan
+  // can leave a handful of live rows at arbitrarily high IDs. Count live rows
+  // with a cooperative primary-key walk before allocating. If the optional
+  // optimization cannot fit, retain the authoritative point-query reader;
+  // a large archive must not become a new calibration exclusion.
+  const rowIdsStatement = database.prepare("SELECT rowid AS row_id FROM usage_event ORDER BY rowid");
+  const bytesPerRow = 32; // all typed columns below, including session scratch
+  const maximumRows = Math.min(Math.floor(maximumRetainedBytes / bytesPerRow), 0xffff_ffff);
+  let size = 0;
+  for (const row of rowIdsStatement.iterate()) {
+    if (!Number.isSafeInteger(Number(row.row_id)) || Number(row.row_id) < 0) {
+      throw fixedError("local_unified_index_row_invalid");
+    }
+    size += 1;
+    if (size > maximumRows) return null;
+    if (++processed % CALLBACK_YIELD_ROWS === 0) await yieldCheckpoint();
   }
-  const size = maxRowId + 1;
+  let retainedBytes = size * bytesPerRow;
+  checkpoint(retainedBytes); // reserve headroom BEFORE allocating any columns
+  const rowIds = new Float64Array(size);
   const seen = new Uint8Array(size);
-  const predecessorMs = new Float64Array(size).fill(Number.NaN);
-  const predecessorSessionMatches = new Uint8Array(size);
+  const predecessorMs = new Float64Array(size);
+  const predecessorFlags = new Uint8Array(size); // 0 absent; 1 source; 2 session
   const planCount = new Uint8Array(size);
-  const planFirst = new Int32Array(size).fill(-1);
-  const planSecond = new Int32Array(size).fill(-1);
+  const planFirst = new Int32Array(size);
+  const planSecond = new Int32Array(size);
+  const otherSource = new Uint8Array(size);
+  const sessionPositions = new Uint32Array(size);
+  checkpoint();
+  let position = 0;
+  for (const row of rowIdsStatement.iterate()) {
+    const rowId = Number(row.row_id);
+    if (!Number.isSafeInteger(rowId) || rowId < 0 || position >= size
+        || (position > 0 && rowId <= rowIds[position - 1])) {
+      throw fixedError("local_unified_index_row_invalid");
+    }
+    rowIds[position++] = rowId;
+    if (++processed % CALLBACK_YIELD_ROWS === 0) await yieldCheckpoint();
+  }
+  if (position !== size) throw fixedError("local_unified_index_row_invalid");
+  const positionFor = (rowId) => {
+    if (!Number.isSafeInteger(rowId) || rowId < 0) return -1;
+    let low = 0;
+    let high = size - 1;
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      if (rowIds[middle] === rowId) return middle;
+      if (rowIds[middle] < rowId) low = middle + 1;
+      else high = middle - 1;
+    }
+    return -1;
+  };
   const planTable = [];
   const planIndexByLabel = new Map();
+  let planBudgetExceeded = false;
   const internPlan = (label) => {
     let index = planIndexByLabel.get(label);
     if (index === undefined) {
+      // Bound the only retained string dictionary too. Invalid upstream labels
+      // are left to the unchanged reader's validation, not newly rejected for
+      // unrelated rows encountered by this optional whole-table pass.
+      const bytes = 256 + label.length * 2;
+      if (!SAFE_TOKEN.test(label) || retainedBytes + bytes > maximumRetainedBytes) {
+        planBudgetExceeded = true;
+        return 0;
+      }
+      checkpoint(bytes);
+      retainedBytes += bytes;
       index = planTable.push(label) - 1;
       planIndexByLabel.set(label, index);
     }
     return index;
   };
-  const members = new Map();
-  for (const row of database.prepare(`
-    SELECT source_local, source_ordinal, session_local, scanned_bytes
+  const membership = database.prepare(`
+    SELECT source_ordinal, session_local, scanned_bytes
     FROM generation_source
-    WHERE generation_id = ?
+    WHERE generation_id = ? AND source_local = ?
       AND status IN ('skipped', 'touched', 'resumed', 'rescanned', 'complete')
-      AND diagnostics_complete = 1`).iterate(generationId)) {
-    members.set(Buffer.from(row.source_local).toString("hex"), {
-      sourceOrdinal: Number(row.source_ordinal),
-      sessionLocal: row.session_local === null
-        ? null
-        : Buffer.from(row.session_local),
-      scannedBytes: Number(row.scanned_bytes),
-    });
-  }
-  const multiSourceSessions = new Set();
-  for (const row of database.prepare(`
-    SELECT session_local FROM usage_event
-    GROUP BY session_local HAVING COUNT(DISTINCT source_local) > 1`).iterate()) {
-    if (row.session_local !== null) {
-      multiSourceSessions.add(Buffer.from(row.session_local).toString("hex"));
-    }
-  }
+      AND diagnostics_complete = 1`);
   const stream = database.prepare(`
     SELECT u.rowid AS row_id, u.source_local, u.source_offset,
            u.source_ordinal, u.session_local, u.observed_at_ms, q.plan_type
-    FROM usage_event u
+    FROM usage_event u INDEXED BY usage_event_source_predecessor
     LEFT JOIN quota_occurrence q
       ON q.source_local = u.source_local AND q.source_offset = u.source_offset
         AND q.source_ordinal = u.source_ordinal
@@ -1058,33 +1111,40 @@ export function precomputeLocalUnifiedUsageAttribution({
   let previousGroupLast = null;
   let currentGroupLast = null;
   let lastRowId = -1;
-  const rowPlans = new Set();
-  const settlePlans = (rowId) => {
-    if (rowPlans.size === 0) return;
+  let lastPosition = -1;
+  let firstPlan = null;
+  let secondPlan = null;
+  const settlePlans = () => {
+    if (firstPlan === null) return;
     // The reader keeps the two smallest distinct labels (ORDER BY ... LIMIT 2,
     // SQLite's BINARY collation = UTF-8 byte order) and treats a second one
     // as a conflict; both survive so the reader validates exactly what the
     // query would have handed it.
-    const ordered = [...rowPlans].sort(utf8ByteCompare).slice(0, 2);
-    planCount[rowId] = ordered.length;
-    planFirst[rowId] = internPlan(ordered[0]);
-    if (ordered.length > 1) planSecond[rowId] = internPlan(ordered[1]);
-    rowPlans.clear();
+    planCount[lastPosition] = secondPlan === null ? 1 : 2;
+    planFirst[lastPosition] = internPlan(firstPlan);
+    if (secondPlan !== null) planSecond[lastPosition] = internPlan(secondPlan);
+    firstPlan = null;
+    secondPlan = null;
   };
   for (const row of stream.iterate()) {
     const rowId = Number(row.row_id);
-    if (!Number.isSafeInteger(rowId) || rowId < 0 || rowId > maxRowId) {
-      throw fixedError("local_unified_index_row_invalid");
-    }
     if (rowId !== lastRowId) {
-      if (lastRowId !== -1) settlePlans(lastRowId);
+      if (lastRowId !== -1) settlePlans();
+      if (planBudgetExceeded) return null;
       lastRowId = rowId;
+      lastPosition = positionFor(rowId);
+      if (lastPosition === -1) throw fixedError("local_unified_index_row_invalid");
       const sourceHex = row.source_local === null
         ? null
         : Buffer.from(row.source_local).toString("hex");
       if (sourceHex !== currentSourceHex) {
         currentSourceHex = sourceHex;
-        member = sourceHex === null ? null : members.get(sourceHex) ?? null;
+        const found = sourceHex === null ? null : membership.get(generationId, row.source_local);
+        member = found == null ? null : {
+          sourceOrdinal: Number(found.source_ordinal),
+          scannedBytes: Number(found.scanned_bytes),
+          sessionLocal: found.session_local === null ? null : Buffer.from(found.session_local),
+        };
         groupOffset = null;
         previousGroupLast = null;
         currentGroupLast = null;
@@ -1095,10 +1155,10 @@ export function precomputeLocalUnifiedUsageAttribution({
         currentGroupLast = null;
         groupOffset = offset;
       }
-      seen[rowId] = 1;
+      seen[lastPosition] = 1;
       if (previousGroupLast !== null) {
-        predecessorMs[rowId] = previousGroupLast.observedAtMs;
-        predecessorSessionMatches[rowId] = previousGroupLast.sessionMatches ? 1 : 0;
+        predecessorMs[lastPosition] = previousGroupLast.observedAtMs;
+        predecessorFlags[lastPosition] = previousGroupLast.sessionMatches ? 2 : 1;
       }
       if (member !== null && offset !== null
           && Number(row.source_ordinal) === member.sourceOrdinal
@@ -1111,27 +1171,80 @@ export function precomputeLocalUnifiedUsageAttribution({
         };
       }
     }
-    if (typeof row.plan_type === "string") rowPlans.add(row.plan_type);
+    if (typeof row.plan_type === "string" && row.plan_type !== firstPlan) {
+      if (firstPlan === null || utf8ByteCompare(row.plan_type, firstPlan) < 0) {
+        secondPlan = firstPlan;
+        firstPlan = row.plan_type;
+      } else if (secondPlan === null || utf8ByteCompare(row.plan_type, secondPlan) < 0) {
+        secondPlan = row.plan_type;
+      }
+    }
+    if (++processed % CALLBACK_YIELD_ROWS === 0) await yieldCheckpoint();
   }
-  if (lastRowId !== -1) settlePlans(lastRowId);
+  if (lastRowId !== -1) settlePlans();
+  if (planBudgetExceeded) return null;
+  checkpoint();
+  // Walk the existing session index rather than GROUP BY/COUNT(DISTINCT),
+  // which can finish an entire large group before yielding its first row.
+  // Typed pending positions and per-row flags bound even one huge session;
+  // no whole-history Set/Map of salted identities is retained.
+  let sessionHex = null;
+  let sessionSourceHex = null;
+  let sessionHasOtherSource = false;
+  let sessionCount = 0;
+  const settleSession = async () => {
+    if (sessionHasOtherSource) {
+      for (let index = 0; index < sessionCount; index += 1) {
+        otherSource[sessionPositions[index]] = 1;
+        if (++processed % CALLBACK_YIELD_ROWS === 0) await yieldCheckpoint();
+      }
+    }
+    sessionCount = 0;
+    sessionHasOtherSource = false;
+    sessionSourceHex = null;
+  };
+  for (const row of database.prepare(`
+    SELECT rowid AS row_id, session_local, source_local FROM usage_event
+    INDEXED BY usage_event_session_predecessor ORDER BY session_local`).iterate()) {
+    const nextSessionHex = row.session_local === null ? null : Buffer.from(row.session_local).toString("hex");
+    if (nextSessionHex !== sessionHex) {
+      await settleSession();
+      sessionHex = nextSessionHex;
+    }
+    if (nextSessionHex !== null) {
+      const rowPosition = positionFor(Number(row.row_id));
+      if (rowPosition === -1 || sessionCount >= size) throw fixedError("local_unified_index_row_invalid");
+      sessionPositions[sessionCount++] = rowPosition;
+      // COUNT(DISTINCT source_local) ignores SQL NULL, as this walk does.
+      if (row.source_local !== null) {
+        const sourceHex = Buffer.from(row.source_local).toString("hex");
+        if (sessionSourceHex === null) sessionSourceHex = sourceHex;
+        else if (sourceHex !== sessionSourceHex) sessionHasOtherSource = true;
+      }
+    }
+    if (++processed % CALLBACK_YIELD_ROWS === 0) await yieldCheckpoint();
+  }
+  await settleSession();
+  checkpoint();
   return {
-    has: (rowId) => Number.isSafeInteger(rowId) && rowId >= 0
-      && rowId <= maxRowId && seen[rowId] === 1,
+    retainedRows: size,
+    retainedBytes,
+    has: (rowId) => seen[positionFor(rowId)] === 1,
     plansFor: (rowId) => {
-      const count = planCount[rowId];
+      const index = positionFor(rowId);
+      const count = planCount[index] ?? 0;
       if (count === 0) return [];
-      if (count === 1) return [planTable[planFirst[rowId]]];
-      return [planTable[planFirst[rowId]], planTable[planSecond[rowId]]];
+      if (count === 1) return [planTable[planFirst[index]]];
+      return [planTable[planFirst[index]], planTable[planSecond[index]]];
     },
-    predecessorFor: (rowId) => (
-      Number.isNaN(predecessorMs[rowId])
-        ? undefined
-        : {
-          observed_at_ms: predecessorMs[rowId],
-          session_matches: predecessorSessionMatches[rowId],
-        }
-    ),
-    multiSourceSessions,
+    predecessorFor: (rowId) => {
+      const index = positionFor(rowId);
+      return predecessorFlags[index] > 0 ? {
+        observed_at_ms: predecessorMs[index],
+        session_matches: predecessorFlags[index] === 2 ? 1 : 0,
+      } : undefined;
+    },
+    hasOtherSource: (rowId) => otherSource[positionFor(rowId)] === 1,
   };
 }
 
@@ -1150,7 +1263,7 @@ export function createLocalUnifiedUsageAttributionReader({
         && (typeof precomputed?.has !== "function"
           || typeof precomputed.plansFor !== "function"
           || typeof precomputed.predecessorFor !== "function"
-          || !(precomputed.multiSourceSessions instanceof Set)))) {
+          || typeof precomputed.hasOtherSource !== "function"))) {
     throw fixedError("local_unified_index_attribution_options_invalid", "TypeError");
   }
   const membership = database.prepare(`
@@ -1283,7 +1396,7 @@ export function createLocalUnifiedUsageAttributionReader({
         // so the query below is provably empty for it; only sessions the
         // precomputation saw spanning several sources still pay for it.
         previous = projectPredecessor(usePrecomputed
-            && !precomputed.multiSourceSessions.has(sessionLocal.toString("hex"))
+            && !precomputed.hasOtherSource(rowId)
           ? undefined
           : sessionBefore.get(
             generationId,
