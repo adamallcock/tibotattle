@@ -11,6 +11,9 @@
       "stableAliasReason": "Protected private-index child comparison requires explicit approval and is not a supported product command.",
       "additionalAliases": [],
       "callers": [
+        "scripts/lib/pr94-analysis-worker.mjs",
+        "scripts/lib/pr94-production-resource-worker.mjs",
+        "scripts/qualify-pr94-attribution.mjs",
         "test/detailed-accounting-benchmark.test.js"
       ],
       "decision": "retain_as_optimization_qualification_gate",
@@ -609,6 +612,130 @@
       "legacyPaths": []
     },
     {
+      "classification": "reusable_benchmark",
+      "owner": "local_analysis",
+      "canonicalPath": "scripts/lib/pr94-analysis-worker.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Private per-revision analysis is an isolated qualification worker, not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/qualify-pr94-attribution.mjs",
+        "test/pr94-analysis-worker.test.js"
+      ],
+      "decision": "retain_as_attribution_qualification_support",
+      "provenance": "docs/plans/2026-09-03-public-0.1.17-release.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "reusable_benchmark",
+      "owner": "local_analysis",
+      "canonicalPath": "scripts/lib/pr94-calibration-evidence.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Closed calibration evidence and private comparison support are imported by the protected qualifier, not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/lib/pr94-analysis-worker.mjs",
+        "scripts/qualify-pr94-attribution.mjs",
+        "test/pr94-analysis-worker.test.js",
+        "test/pr94-calibration-evidence.test.js",
+        "test/pr94-receipt-validation.test.js"
+      ],
+      "decision": "retain_as_attribution_qualification_support",
+      "provenance": "docs/plans/2026-09-03-public-0.1.17-release.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "reusable_benchmark",
+      "owner": "local_analysis",
+      "canonicalPath": "scripts/lib/pr94-ledger-evidence.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Exact ledger conservation and sealed private row comparison are imported qualification support, not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/lib/pr94-analysis-worker.mjs",
+        "scripts/lib/pr94-population-evidence.mjs",
+        "scripts/lib/pr94-receipt-validation.mjs",
+        "scripts/qualify-pr94-attribution.mjs",
+        "test/pr94-analysis-worker.test.js",
+        "test/pr94-ledger-evidence.test.js",
+        "test/pr94-population-evidence.test.js",
+        "test/pr94-receipt-validation.test.js"
+      ],
+      "decision": "retain_as_attribution_qualification_support",
+      "provenance": "docs/plans/2026-09-03-public-0.1.17-release.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "reusable_benchmark",
+      "owner": "local_analysis",
+      "canonicalPath": "scripts/lib/pr94-population-evidence.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Disjoint plan-population conservation is imported qualification support, not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/lib/pr94-analysis-worker.mjs",
+        "scripts/lib/pr94-receipt-validation.mjs",
+        "test/pr94-population-evidence.test.js"
+      ],
+      "decision": "retain_as_attribution_qualification_support",
+      "provenance": "docs/plans/2026-09-03-public-0.1.17-release.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "reusable_benchmark",
+      "owner": "local_analysis",
+      "canonicalPath": "scripts/lib/pr94-production-resource-worker.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Protected private-index production-child repeatability requires explicit approval and is not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/lib/pr94-receipt-validation.mjs",
+        "scripts/qualify-pr94-attribution.mjs",
+        "test/pr94-production-resource-worker.test.js"
+      ],
+      "decision": "retain_as_attribution_qualification_support",
+      "provenance": "docs/plans/2026-09-03-public-0.1.17-release.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "reusable_benchmark",
+      "owner": "local_analysis",
+      "canonicalPath": "scripts/lib/pr94-receipt-validation.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Closed aggregate and cross-lane receipt validation is imported qualification support, not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/qualify-pr94-attribution.mjs",
+        "test/pr94-analysis-worker.test.js",
+        "test/pr94-receipt-validation.test.js"
+      ],
+      "decision": "retain_as_attribution_qualification_support",
+      "provenance": "docs/plans/2026-09-03-public-0.1.17-release.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "reusable_benchmark",
+      "owner": "local_analysis",
+      "canonicalPath": "scripts/lib/pr94-revision-loader.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Pinned revision loading and export-only instrumentation are internal qualification support, not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/lib/pr94-analysis-worker.mjs",
+        "test/pr94-revision-loader.test.js"
+      ],
+      "decision": "retain_as_attribution_qualification_support",
+      "provenance": "docs/plans/2026-09-03-public-0.1.17-release.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
       "classification": "build_release_operation",
       "owner": "local_review_release",
       "canonicalPath": "scripts/local-review-network-audit-preload.cjs",
@@ -797,6 +924,22 @@
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": "docs/runbooks/macos-stable-release-runbook.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "reusable_benchmark",
+      "owner": "local_analysis",
+      "canonicalPath": "scripts/qualify-pr94-attribution.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Protected private-index before/after/final comparison requires explicit approval and is not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "docs/plans/2026-09-03-public-0.1.17-release.md",
+        "test/pr94-qualification-runner.test.js"
+      ],
+      "decision": "retain_as_attribution_qualification_gate",
+      "provenance": "docs/plans/2026-09-03-public-0.1.17-release.md",
       "provenanceReason": null,
       "legacyPaths": []
     },
