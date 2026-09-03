@@ -18,6 +18,7 @@ import {
 import {
   createLocalUnifiedAccountingSource,
   createLocalUnifiedUsageAttributionReader,
+  precomputeLocalUnifiedUsageAttribution,
 } from "./local-unified-accounting-source.js";
 import {
   CODEX_TRANSITION_DERIVATION_CEILINGS,
@@ -3248,8 +3249,10 @@ async function openUnifiedIndexCalibrationCorpus({
     dispose();
     return null;
   }
-  const attributionReader = generationId === null ? null
-    : createLocalUnifiedUsageAttributionReader({ database, generationId });
+  // Bound inside the fenced open pass below, once the generation's complete
+  // fact sets are proven: the reader is handed a one-pass precomputation of
+  // its per-row lookups so the projection streams issue no point queries.
+  let attributionReader = null;
   // Attribution memo, keyed by retained position. A row's attribution is a
   // pure function of the immutable generation this handle is fenced to, and
   // the derivation re-reads every retained row at least once after the fit
@@ -3442,6 +3445,21 @@ async function openUnifiedIndexCalibrationCorpus({
           throw fixedError("accounting_unified_generation_mismatch");
         }
       }
+      verifyGeneration();
+      // One ordered pass replaces the reader's per-row point queries for the
+      // whole generation (~14 bytes per usage row of typed columns, metered
+      // by the same RSS guard as the rest of the open pass). The reader's
+      // decision logic is unchanged; it only consults these results.
+      attributionReader = createLocalUnifiedUsageAttributionReader({
+        database,
+        generationId,
+        precomputed: precomputeLocalUnifiedUsageAttribution({
+          database,
+          generationId,
+        }),
+      });
+      throwIfAborted(signal);
+      checkRuntimeMemory();
       verifyGeneration();
     }
     const usageCount = Number(database.prepare(

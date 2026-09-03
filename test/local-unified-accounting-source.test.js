@@ -16,6 +16,7 @@ import {
   LOCAL_UNIFIED_ACCOUNTING_SOURCE_VERSION,
   createLocalUnifiedAccountingSource,
   createLocalUnifiedUsageAttributionReader,
+  precomputeLocalUnifiedUsageAttribution,
 } from "../src/local-unified-accounting-source.js";
 import {
   beginUnifiedIndexGeneration,
@@ -646,6 +647,111 @@ test("attribution reads remain deterministic across interleaved long sources and
   } finally {
     database.close();
     await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("the one-pass attribution precomputation reproduces every point-query read exactly", async (t) => {
+  // Scenarios that exercise each branch of the reader: same-record and
+  // conflicting plans, unknown plans, a session spanning two sources with
+  // interleaved and tied timestamps, a reversed source clock, offsets past a
+  // member's scanned bytes, a source dropped from the generation, and gaps
+  // in the offset sequence.
+  const scenarios = [
+    {
+      name: "two sources sharing a session with ties and reversed clocks",
+      sources: [{ id: 1, session: 9 }, { id: 2, session: 9 }, { id: 3, session: 3 }],
+      records: [
+        { source: 1, offset: 1, at: 0, quotas: [{ plan: "pro" }] },
+        { source: 2, offset: 1, at: 500, quotas: [{ plan: "pro" }] },
+        { source: 1, offset: 2, at: 1_000, quotas: [{ plan: "pro" }] },
+        { source: 2, offset: 2, at: 1_000, quotas: [{ plan: "plus" }] },
+        { source: 1, offset: 3, at: 900 },
+        { source: 2, offset: 3, at: 1_500, quotas: [{ plan: "pro" }, { plan: "plus" }] },
+        { source: 3, offset: 1, at: 2_000, quotas: [{ plan: "pro" }] },
+        { source: 3, offset: 2, at: 2_000, quotas: [{ plan: "unknown" }] },
+        { source: 3, offset: 4, at: 1_900 },
+        { source: 1, offset: 4, at: 3_000, quotas: [{ plan: "pro", admission: "held" }] },
+        { source: 2, offset: 4, at: 3_000, noUsage: true },
+        { source: 2, offset: 5, at: 3_100 },
+        // Records whose session is not the source's own session: no session
+        // lineage, so only the source predecessor can bound the interval.
+        { source: 1, offset: 5, at: 4_000, session: 5, quotas: [{ plan: "pro" }] },
+        { source: 1, offset: 6, at: 4_100, session: 5 },
+        { source: 1, offset: 7, at: 4_050, session: 5 },
+      ],
+    },
+    {
+      name: "membership boundaries",
+      sources: [{ id: 1, session: 1 }, { id: 2, session: 2 }],
+      records: Array.from({ length: 40 }, (_, index) => ({
+        source: (index % 2) + 1,
+        offset: 100 + index * 100,
+        at: index * 1_000,
+        quotas: index % 5 === 0 ? [] : [{ plan: index % 3 === 0 ? "plus" : "pro" }],
+      })),
+      mutate(database, generationId) {
+        // Source 2 is only partially scanned in this generation, so offsets
+        // past the boundary are unattributable and cannot be predecessors.
+        database.prepare(`
+          UPDATE generation_source SET scanned_bytes = 2_500
+          WHERE generation_id = ? AND source_local = ?`).run(generationId, Buffer.alloc(32, 2));
+      },
+    },
+    {
+      name: "a source dropped from the generation",
+      sources: [{ id: 1, session: 1 }, { id: 2, session: 1 }],
+      records: Array.from({ length: 12 }, (_, index) => ({
+        source: (index % 2) + 1,
+        offset: index + 1,
+        at: index * 700,
+        quotas: [{ plan: "pro" }],
+      })),
+      mutate(database, generationId) {
+        database.prepare(`
+          UPDATE generation_source SET status = 'failed'
+          WHERE generation_id = ? AND source_local = ?`).run(generationId, Buffer.alloc(32, 2));
+      },
+    },
+  ];
+  for (const scenario of scenarios) {
+    const fixture = await createAttributionIndex({
+      sources: scenario.sources,
+      records: scenario.records,
+    });
+    const database = openLocalUnifiedIndex(fixture.indexFile);
+    try {
+      scenario.mutate?.(database, fixture.generationId);
+      const rows = database.prepare(`
+        SELECT rowid AS row_id, source_local, source_offset, source_ordinal,
+               session_local, observed_at_ms
+        FROM usage_event ORDER BY observed_at_ms, source_ordinal, source_offset`).all();
+      const live = createLocalUnifiedUsageAttributionReader({
+        database, generationId: fixture.generationId,
+      });
+      const precomputed = precomputeLocalUnifiedUsageAttribution({
+        database, generationId: fixture.generationId,
+      });
+      const batch = createLocalUnifiedUsageAttributionReader({
+        database, generationId: fixture.generationId, precomputed,
+      });
+      const bases = new Set();
+      for (const row of rows) {
+        assert.equal(precomputed.has(row.row_id), true, scenario.name);
+        const expected = live.read(row);
+        assert.deepEqual(batch.read(row), expected, `${scenario.name}: rowid ${row.row_id}`);
+        bases.add(`${expected.planAttribution.basis}/${expected.usageIntervalBasis}`);
+      }
+      // A rowid the pass never saw is served by the point queries, unchanged.
+      assert.deepEqual(
+        batch.read({ ...rows[0], row_id: rows.at(-1).row_id + 1_000 }),
+        live.read(rows[0]),
+      );
+      t.diagnostic(`${scenario.name}: ${rows.length} rows, outcomes ${[...bases].sort().join(" ")}`);
+      assert.ok(rows.length >= 12, scenario.name);
+    } finally {
+      database.close();
+      await rm(fixture.root, { recursive: true, force: true });
+    }
   }
 });
 

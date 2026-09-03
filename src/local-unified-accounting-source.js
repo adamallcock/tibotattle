@@ -909,12 +909,196 @@ function rememberBounded(cache, key, value, limit) {
  * before publishing their result. Indexed predecessor lookups support repeated
  * or out-of-order corpus slices without retaining whole sessions.
  */
-export function createLocalUnifiedUsageAttributionReader({
+/**
+ * One ordered pass over a published generation that pre-derives the two
+ * expensive per-row lookups the attribution reader performs — the same-record
+ * quota plans and the same-source predecessor — for every usage row, keyed
+ * by rowid, plus the set of sessions whose rows span more than one source
+ * (the only sessions for which the cross-source session predecessor query can
+ * return anything). The reader's decision logic is untouched: given this
+ * structure it consults these results instead of issuing point queries, and
+ * falls back to the queries for any rowid the pass did not see.
+ *
+ * Why it is exact:
+ * - the pass walks usage_event in (source_local, source_offset,
+ *   observed_at_ms) order — the covering predecessor index's own order, with
+ *   (source_ordinal, session_local, rowid) as the implicit tail — so a row's
+ *   same-source predecessor is the last eligible row of the previous offset
+ *   group, exactly the row the reader's `ORDER BY source_offset DESC,
+ *   observed_at_ms DESC LIMIT 1` reverse index walk returns, under the same
+ *   eligibility (generation membership, matching ordinal, offset within the
+ *   member's scanned bytes, non-null offset);
+ * - same-record plans arrive joined on the reader's own four-column key and
+ *   filters, and are reduced with the same DISTINCT / ORDER BY / LIMIT 2 rule;
+ * - a session confined to one source has no row from another source, so the
+ *   session-predecessor query is provably empty for it.
+ * Everything retained is content-free: offsets, ordinals, timestamps, plan
+ * labels and salted digests, the same columns the point queries read.
+ */
+export function precomputeLocalUnifiedUsageAttribution({
   database,
   generationId,
 } = {}) {
   if (typeof database?.prepare !== "function"
       || !Number.isSafeInteger(generationId) || generationId < 1) {
+    throw fixedError("local_unified_index_attribution_options_invalid", "TypeError");
+  }
+  const maxRowId = Number(database.prepare(
+    "SELECT COALESCE(MAX(rowid), 0) AS max_row_id FROM usage_event",
+  ).get()?.max_row_id);
+  if (!Number.isSafeInteger(maxRowId) || maxRowId < 0) {
+    throw fixedError("local_unified_index_row_invalid");
+  }
+  const size = maxRowId + 1;
+  const seen = new Uint8Array(size);
+  const predecessorMs = new Float64Array(size).fill(Number.NaN);
+  const predecessorSessionMatches = new Uint8Array(size);
+  const planCount = new Uint8Array(size);
+  const planFirst = new Int32Array(size).fill(-1);
+  const planSecond = new Int32Array(size).fill(-1);
+  const planTable = [];
+  const planIndexByLabel = new Map();
+  const internPlan = (label) => {
+    let index = planIndexByLabel.get(label);
+    if (index === undefined) {
+      index = planTable.push(label) - 1;
+      planIndexByLabel.set(label, index);
+    }
+    return index;
+  };
+  const members = new Map();
+  for (const row of database.prepare(`
+    SELECT source_local, source_ordinal, session_local, scanned_bytes
+    FROM generation_source
+    WHERE generation_id = ?
+      AND status IN ('skipped', 'touched', 'resumed', 'rescanned', 'complete')
+      AND diagnostics_complete = 1`).iterate(generationId)) {
+    members.set(Buffer.from(row.source_local).toString("hex"), {
+      sourceOrdinal: Number(row.source_ordinal),
+      sessionLocal: row.session_local === null
+        ? null
+        : Buffer.from(row.session_local),
+      scannedBytes: Number(row.scanned_bytes),
+    });
+  }
+  const multiSourceSessions = new Set();
+  for (const row of database.prepare(`
+    SELECT session_local FROM usage_event
+    GROUP BY session_local HAVING COUNT(DISTINCT source_local) > 1`).iterate()) {
+    if (row.session_local !== null) {
+      multiSourceSessions.add(Buffer.from(row.session_local).toString("hex"));
+    }
+  }
+  const stream = database.prepare(`
+    SELECT u.rowid AS row_id, u.source_local, u.source_offset,
+           u.source_ordinal, u.session_local, u.observed_at_ms, q.plan_type
+    FROM usage_event u
+    LEFT JOIN quota_occurrence q
+      ON q.source_local = u.source_local AND q.source_offset = u.source_offset
+        AND q.source_ordinal = u.source_ordinal
+        AND q.observed_at_ms = u.observed_at_ms
+        AND q.provider = 'openai_codex' AND q.admission = 'admitted'
+        AND q.plan_type IS NOT NULL AND q.plan_type <> 'unknown'
+    ORDER BY u.source_local, u.source_offset, u.observed_at_ms`);
+  let currentSourceHex = null;
+  let member = null;
+  let groupOffset = null;
+  let previousGroupLast = null;
+  let currentGroupLast = null;
+  let lastRowId = -1;
+  const rowPlans = new Set();
+  const settlePlans = (rowId) => {
+    if (rowPlans.size === 0) return;
+    // The reader keeps the two smallest distinct labels (ORDER BY ... LIMIT 2,
+    // SQLite's BINARY collation = UTF-8 byte order) and treats a second one
+    // as a conflict; both survive so the reader validates exactly what the
+    // query would have handed it.
+    const ordered = [...rowPlans].sort(utf8ByteCompare).slice(0, 2);
+    planCount[rowId] = ordered.length;
+    planFirst[rowId] = internPlan(ordered[0]);
+    if (ordered.length > 1) planSecond[rowId] = internPlan(ordered[1]);
+    rowPlans.clear();
+  };
+  for (const row of stream.iterate()) {
+    const rowId = Number(row.row_id);
+    if (!Number.isSafeInteger(rowId) || rowId < 0 || rowId > maxRowId) {
+      throw fixedError("local_unified_index_row_invalid");
+    }
+    if (rowId !== lastRowId) {
+      if (lastRowId !== -1) settlePlans(lastRowId);
+      lastRowId = rowId;
+      const sourceHex = row.source_local === null
+        ? null
+        : Buffer.from(row.source_local).toString("hex");
+      if (sourceHex !== currentSourceHex) {
+        currentSourceHex = sourceHex;
+        member = sourceHex === null ? null : members.get(sourceHex) ?? null;
+        groupOffset = null;
+        previousGroupLast = null;
+        currentGroupLast = null;
+      }
+      const offset = row.source_offset === null ? null : Number(row.source_offset);
+      if (offset !== groupOffset) {
+        if (currentGroupLast !== null) previousGroupLast = currentGroupLast;
+        currentGroupLast = null;
+        groupOffset = offset;
+      }
+      seen[rowId] = 1;
+      if (previousGroupLast !== null) {
+        predecessorMs[rowId] = previousGroupLast.observedAtMs;
+        predecessorSessionMatches[rowId] = previousGroupLast.sessionMatches ? 1 : 0;
+      }
+      if (member !== null && offset !== null
+          && Number(row.source_ordinal) === member.sourceOrdinal
+          && offset <= member.scannedBytes) {
+        currentGroupLast = {
+          observedAtMs: row.observed_at_ms,
+          sessionMatches: member.sessionLocal !== null
+            && row.session_local !== null
+            && member.sessionLocal.equals(row.session_local),
+        };
+      }
+    }
+    if (typeof row.plan_type === "string") rowPlans.add(row.plan_type);
+  }
+  if (lastRowId !== -1) settlePlans(lastRowId);
+  return {
+    has: (rowId) => Number.isSafeInteger(rowId) && rowId >= 0
+      && rowId <= maxRowId && seen[rowId] === 1,
+    plansFor: (rowId) => {
+      const count = planCount[rowId];
+      if (count === 0) return [];
+      if (count === 1) return [planTable[planFirst[rowId]]];
+      return [planTable[planFirst[rowId]], planTable[planSecond[rowId]]];
+    },
+    predecessorFor: (rowId) => (
+      Number.isNaN(predecessorMs[rowId])
+        ? undefined
+        : {
+          observed_at_ms: predecessorMs[rowId],
+          session_matches: predecessorSessionMatches[rowId],
+        }
+    ),
+    multiSourceSessions,
+  };
+}
+
+function utf8ByteCompare(left, right) {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
+export function createLocalUnifiedUsageAttributionReader({
+  database,
+  generationId,
+  precomputed = null,
+} = {}) {
+  if (typeof database?.prepare !== "function"
+      || !Number.isSafeInteger(generationId) || generationId < 1
+      || (precomputed !== null
+        && (typeof precomputed?.has !== "function"
+          || typeof precomputed.plansFor !== "function"
+          || typeof precomputed.predecessorFor !== "function"
+          || !(precomputed.multiSourceSessions instanceof Set)))) {
     throw fixedError("local_unified_index_attribution_options_invalid", "TypeError");
   }
   const membership = database.prepare(`
@@ -1010,9 +1194,14 @@ export function createLocalUnifiedUsageAttributionReader({
           || !Number.isSafeInteger(member.scanned_bytes) || member.scanned_bytes < 0
           || sourceOffset > member.scanned_bytes) return result;
 
-      const observedPlans = plans.all(
-        generationId, sourceLocal, sourceOffset, sourceOrdinal, observedAtMs,
-      ).map((value) => safeText(value.plan_type));
+      const rowId = precomputed === null ? null : Number(row.row_id);
+      const usePrecomputed = rowId !== null && precomputed.has(rowId);
+      const observedPlans = (usePrecomputed
+        ? precomputed.plansFor(rowId)
+        : plans.all(
+          generationId, sourceLocal, sourceOffset, sourceOrdinal, observedAtMs,
+        ).map((value) => value.plan_type)
+      ).map((value) => safeText(value));
       if (observedPlans.length === 1) {
         result.planAttribution.basis = "same_record";
         result.planAttribution.planType = observedPlans[0];
@@ -1022,9 +1211,9 @@ export function createLocalUnifiedUsageAttributionReader({
 
       // Physical order can positively reveal a reversed clock. Do not hide
       // that contradiction by picking some earlier wall-clock timestamp.
-      const sourcePrevious = projectPredecessor(sourceBefore.get(
-        generationId, sourceLocal, sourceOffset,
-      ), { source: true });
+      const sourcePrevious = projectPredecessor(usePrecomputed
+        ? precomputed.predecessorFor(rowId)
+        : sourceBefore.get(generationId, sourceLocal, sourceOffset), { source: true });
       if (sourcePrevious !== null && sourcePrevious.observedAtMs > observedAtMs) {
         return result;
       }
@@ -1038,14 +1227,20 @@ export function createLocalUnifiedUsageAttributionReader({
         // cannot improve the bound. Keeping the lookup inside that interval is
         // important for a long session held entirely in one source: excluding
         // that source must not scan its whole history on every usage row.
-        previous = projectPredecessor(sessionBefore.get(
-          generationId,
-          sessionLocal,
-          sourceLocal,
-          sourcePrevious?.sessionMatches === true
-            ? sourcePrevious.observedAtMs : MINIMUM_TIMESTAMP_MS,
-          observedAtMs,
-        ));
+        // A session confined to a single source has no other-source record,
+        // so the query below is provably empty for it; only sessions the
+        // precomputation saw spanning several sources still pay for it.
+        previous = projectPredecessor(usePrecomputed
+            && !precomputed.multiSourceSessions.has(sessionLocal.toString("hex"))
+          ? undefined
+          : sessionBefore.get(
+            generationId,
+            sessionLocal,
+            sourceLocal,
+            sourcePrevious?.sessionMatches === true
+              ? sourcePrevious.observedAtMs : MINIMUM_TIMESTAMP_MS,
+            observedAtMs,
+          ));
         // Equal-time order is meaningful within this physical source, not
         // between sources with coincident timestamps/discovery ordinals.
         if (sourcePrevious?.sessionMatches === true
