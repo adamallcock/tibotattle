@@ -1129,6 +1129,55 @@ function scaledUsdString(value) {
   return `${whole}.${fraction}`.replace(/\.?0+$/u, "");
 }
 
+// Exact-ledger fast lane. The decimal-string ledger (`addUsdStrings`) is the
+// contract: every retained exact total is the canonical decimal string of an
+// exact sum. Folding it one event at a time re-parses the growing total and
+// re-formats the sum on every add, and at ~1.2 us a call it was ~5% of a
+// large rebuild. Fast-path prices are integer nano-dollars, so an event's
+// contribution can be accumulated as a BigInt and folded into the string
+// ledger only when a non-integer addend arrives or the period is finalized.
+// The exact sum is the same either way; the canonical string of that sum is
+// therefore identical to the per-event fold, and the string field stays the
+// value of record. The pending BigInt lives on a non-enumerable symbol so it
+// never reaches a spread, JSON, or the closed cache schema.
+const EXACT_SCALED = Symbol("exactUsdScaledPending");
+const SCALED_TOTAL = Symbol("pricedUsdScaledTotals");
+
+function bigIntNanoUsdString(value) {
+  const whole = value / 1_000_000_000n;
+  const fraction = String(value % 1_000_000_000n).padStart(9, "0");
+  return `${whole}.${fraction}`;
+}
+
+function addExactUsd(target, key, addendString, addendScaled) {
+  if (addendScaled !== null) {
+    const pending = target[EXACT_SCALED];
+    const next = (pending === undefined ? 0n : pending) + BigInt(addendScaled);
+    if (pending === undefined) {
+      Object.defineProperty(target, EXACT_SCALED, {
+        value: next,
+        writable: true,
+        enumerable: false,
+        configurable: true,
+      });
+    } else {
+      target[EXACT_SCALED] = next;
+    }
+    return;
+  }
+  flushExactUsd(target, key);
+  target[key] = addUsdStrings(target[key], addendString);
+}
+
+function flushExactUsd(target, key) {
+  const pending = target[EXACT_SCALED];
+  if (pending === undefined) return;
+  if (pending > 0n) {
+    target[key] = addUsdStrings(target[key], bigIntNanoUsdString(pending));
+  }
+  target[EXACT_SCALED] = 0n;
+}
+
 // Exported for the unified-index companion read: one memoized unit-price plan
 // per (model, context band, effective date), integer-scaled per event, falling
 // back to the full pricer whenever a plan cannot be proven exact. This is the
@@ -1211,6 +1260,7 @@ export function createAccountingPricer() {
     }
     const pricedComponents = [];
     const priceCardBreakdown = new Map();
+    const cardScaled = new Map();
     let totalUsdScaled = 0;
     for (const name of COMPONENT_KEYS) {
       const quantity = components[name] ?? 0;
@@ -1252,16 +1302,26 @@ export function createAccountingPricer() {
         costUsd: scaledUsdString(costUsdScaled),
         priceCardId: template.priceCardId,
       });
-      const card = priceCardBreakdown.get(template.priceCardId) ?? {
-        priceCardId: template.priceCardId,
-        events: 0,
-        costUsd: "0",
-      };
-      card.events = 1;
-      card.costUsd = addUsdStrings(card.costUsd, scaledUsdString(costUsdScaled));
-      priceCardBreakdown.set(template.priceCardId, card);
+      // Per-card cost is the exact sum of this event's integer-scaled
+      // component costs; format it once instead of folding decimal strings.
+      // (totalUsdScaled is proven safe above, and each card's sum is a part
+      // of it.)
+      cardScaled.set(
+        template.priceCardId,
+        (cardScaled.get(template.priceCardId) ?? 0) + costUsdScaled,
+      );
+      if (!priceCardBreakdown.has(template.priceCardId)) {
+        priceCardBreakdown.set(template.priceCardId, {
+          priceCardId: template.priceCardId,
+          events: 1,
+          costUsd: "0",
+        });
+      }
     }
-    return {
+    for (const [priceCardId, scaled] of cardScaled) {
+      priceCardBreakdown.get(priceCardId).costUsd = scaledUsdString(scaled);
+    }
+    const priced = {
       totalUsd: scaledUsdString(totalUsdScaled),
       coverageStatus: "fully_priced",
       components: pricedComponents,
@@ -1271,6 +1331,13 @@ export function createAccountingPricer() {
       ),
       warnings: plan.warnings,
     };
+    // Integer-scaled totals for the exact-ledger fast lane (see addExactUsd).
+    // Non-enumerable: the priced shape callers see and serialize is unchanged.
+    Object.defineProperty(priced, SCALED_TOTAL, {
+      value: { totalUsd: totalUsdScaled, byCard: cardScaled },
+      enumerable: false,
+    });
+    return priced;
   };
 }
 
@@ -2119,9 +2186,12 @@ function addEvent(period, event) {
   period.events += 1;
   period.totalTokens += event.totalTokens;
   period.apiPriceEquivalentUsd += event.apiPriceEquivalentUsd;
-  period.apiPriceEquivalentUsdExact = addUsdStrings(
-    period.apiPriceEquivalentUsdExact,
+  const scaledTotals = event.priced?.[SCALED_TOTAL] ?? null;
+  addExactUsd(
+    period,
+    "apiPriceEquivalentUsdExact",
     event.priced?.totalUsd ?? "0",
+    scaledTotals === null ? null : scaledTotals.totalUsd,
   );
   addComponents(period.components, event.components);
   addComponentCosts(period.componentCosts, event.components, event.priced);
@@ -2135,7 +2205,13 @@ function addEvent(period, event) {
       costUsd: "0",
     };
     row.events += item.events ?? 0;
-    row.costUsd = addUsdStrings(row.costUsd, item.costUsd ?? "0");
+    const cardScaled = scaledTotals?.byCard.get(item.priceCardId);
+    addExactUsd(
+      row,
+      "costUsd",
+      item.costUsd ?? "0",
+      Number.isSafeInteger(cardScaled) ? cardScaled : null,
+    );
     period.priceCardBreakdown[item.priceCardId] = row;
   }
   const model = period.byModel[event.model] ??= {
@@ -2245,6 +2321,11 @@ function combinedModelUsage(finalized) {
 function finalizePeriod(period) {
   const priced = period.pricingCoverage.fullyPricedEvents
     + period.pricingCoverage.partiallyPricedEvents;
+  // Settle the exact-ledger fast lane before anything reads the strings.
+  flushExactUsd(period, "apiPriceEquivalentUsdExact");
+  for (const row of Object.values(period.priceCardBreakdown)) {
+    flushExactUsd(row, "costUsd");
+  }
   const finalized = {
     ...period,
     apiPriceEquivalentUsd: roundedExactMoney(
