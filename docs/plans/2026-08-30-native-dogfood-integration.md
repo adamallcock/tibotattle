@@ -523,7 +523,15 @@ not yet real-corpus, compiled-native or installed-artifact proof. The new
 private benchmark runner passed 12/12 synthetic safety and orchestration tests
 under the required local process permissions. Its first restricted-sandbox
 attempt could not read the operating-system timing counters; no test was
-weakened. The combined full-root run is still in progress.
+weakened. The first combined full-root run completed 3,585 tests: 3,562 passed,
+six failed and 17 platform skips, exit 1, in 448.3 seconds. Three permission
+fixtures were accidentally created under the coordinator's restrictive `077`
+mask instead of their expected normal `022` mask; all pass unchanged under
+`022`. One exact tool-inventory count needed to include the new reviewed
+benchmark (86 records / 88 executable paths); its ownership check stays exact.
+The remaining two failures are the expected stale R7 source fingerprints.
+The five-file focused recheck passed 52/52, without skips or weakened tests.
+The full-root command is not green; rerun it after final-source R7.
 
 The latest owner authorization covers local candidate preparation, signing,
 notarization and dogfood testing, not publication. Stable release approval,
