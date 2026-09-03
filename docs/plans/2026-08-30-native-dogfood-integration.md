@@ -477,3 +477,58 @@ archive after SHA-512 verification against the lockfile. A cheap source test
 now checks AJV's resolved fast-uri through the actual native pin before expensive
 builds. Native artifact and full-source validation must be repeated; no pin or
 test has been weakened.
+
+## Optimized RC9 integration — 2026-09-03
+
+The owner approved integrating the seven accounting optimizations recorded at
+`bc1b8325`, fixing their resource-guard issues, and using one visible manual
+Refresh action for quota and detailed accounting. Startup and frequent automatic
+quota checks remain quick; automatic detailed attempts remain at most hourly.
+Original RC9 and performance branches are preserved. Integration merge
+`6d58fa7f` combines them without reverting the mixed-plan, snapshot, or native
+state corrections. No unrelated local-main changes are included implicitly.
+
+Pre-optimization source `d362e168` completed the full protected R7 run with ten
+validated receipts on 2026-09-03 UTC, in about 37 minutes; both retained-receipt
+checks pass. Those receipts were committed separately at `a89eaa8b` as baseline
+evidence. They do not qualify the optimized source. Both retained release
+decisions remain `release_open`; regeneration does not close the separate
+PR #94 empirical comparator.
+
+Acceptance and execution sequence:
+
+- [x] Preserve both original commit histories and integrate the approved scope.
+- [x] Bound attribution precomputation by live rows, preflight allocations, and
+  check cancellation/RSS throughout; preserve exact point-reader fallback.
+- [x] Preserve hard archive-overflow semantics in fused history and prove
+  retained-cache and failure behavior with deterministic tests.
+- [x] Route only explicit manual controls to detailed refresh, remove the
+  duplicate action, and preserve automatic cadence and controller fences.
+- [ ] Run focused ownership gates and independent review, then compare baseline
+  RC9 and optimized RC9 on one immutable private index with a pinned clock.
+  Keep exact output equality, raw wall/CPU/peak-RSS and lifecycle results
+  content-free; never infer end-to-end timing from separate phase sums.
+- [ ] Freeze the corrected combined source; run complete protected R7 and the
+  full source/native/Worker gates without weakening checks.
+- [ ] Prepare signed/notarized dogfood `1023.7` and stable-channel `1024`
+  artifacts for owner inspection; preserve previous DMGs and local state.
+- [ ] Validate state-preserving replacement and installed native behavior.
+
+Resource fixes are committed at `acb485ed`; their owning suites passed
+134/134 with no skips or failures. The manual-control change is committed at
+`7e5efe1e`; the full browser suite passed 488/488 and native source checks
+passed 79 tests with three designated artifact exclusions. Independent
+source review found no remaining resource or refresh-policy defects; this is
+not yet real-corpus, compiled-native or installed-artifact proof. The new
+private benchmark runner passed 12/12 synthetic safety and orchestration tests
+under the required local process permissions. Its first restricted-sandbox
+attempt could not read the operating-system timing counters; no test was
+weakened. The combined full-root run is still in progress.
+
+The latest owner authorization covers local candidate preparation, signing,
+notarization and dogfood testing, not publication. Stable release approval,
+remote version-tag publication, GitHub release, Sparkle feed, Homebrew/website,
+hosted deployment/migrations and contribution uploads remain withheld. A local
+stable-channel build is only an inspection candidate, not a claim that the open
+PR #94 comparator or hosted pairing gates have passed. Unexpected Keychain
+prompts remain a stop condition; never automate approval or change access rules.

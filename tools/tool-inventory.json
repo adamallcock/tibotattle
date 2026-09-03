@@ -6,6 +6,21 @@
     {
       "classification": "reusable_benchmark",
       "owner": "local_analysis",
+      "canonicalPath": "scripts/benchmark-detailed-accounting.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Protected private-index child comparison requires explicit approval and is not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/detailed-accounting-benchmark.test.js"
+      ],
+      "decision": "retain_as_optimization_qualification_gate",
+      "provenance": "docs/plans/2026-09-01-detailed-accounting-refresh-performance.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "reusable_benchmark",
+      "owner": "local_analysis",
       "canonicalPath": "scripts/benchmark-local-analysis-pipeline.mjs",
       "stableAlias": null,
       "stableAliasReason": "Research benchmark is exercised by focused tests and is not a supported product command.",

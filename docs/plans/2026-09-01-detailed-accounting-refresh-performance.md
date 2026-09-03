@@ -2,18 +2,20 @@
 title: Detailed accounting refresh performance handoff
 date: 2026-09-01
 type: plan
-status: proposed
+status: in-progress
 ---
 
 # Detailed accounting refresh performance handoff
 
 ## Status and claim boundary
 
-This is a source-level handoff for a follow-up performance task. It does not
-claim that the detailed-accounting path has been optimized, qualified on real
-history, or released. It must be rebound to the exact merged source revision
-that follows the 0.1.17 refresh-policy and mixed-plan correctness fixes before
-implementation begins.
+This is the source-level performance and integration plan. The original
+optimization receipt at `bc1b8325` reports successful child-rebuild measurements
+on the pre-RC9 baseline; it does not qualify the integrated source or a release.
+The owner subsequently approved integrating those changes with RC9, repairing
+resource-guard regressions, and simplifying the manual refresh controls.
+The current execution record is the
+[optimized RC9 integration amendment](./2026-08-30-native-dogfood-integration.md#optimized-rc9-integration--2026-09-03).
 
 PR #94's formal account/plan-attribution empirical gate remains **OPEN / NOT
 RUN** unless its separately reviewed cross-revision comparator and sanitizer
@@ -21,10 +23,23 @@ produce the required attribution and eligibility reconciliation. This plan's
 profiling receipts, synthetic comparisons, R7 results, and native/dogfood QA do
 not close that gate or authorize hosted methodology activation.
 
-Draft source boundary: branch `codex/refresh-accounting-progress-rc9`, based on
-`35802d21ede67d362533f4e2be6b38041ece1cda` (PR #101). This is not the final
-optimization baseline: the refresh, snapshot, and plan-scope corrections are
-still under integration review. Wait for the coordinator's exact merged SHA.
+The comparison baseline is RC9 `d362e16808ceb0989b398e0d531386d78760cb1b`
+(or its receipt-only descendant `a89eaa8b`). It includes the refresh, snapshot,
+and mixed-plan corrections missing from the original performance receipt.
+The candidate belongs to `codex/release-0.1.17-optimized`; record its exact
+clean revision in the new comparison receipt before qualifying it.
+
+The protected [`benchmark-detailed-accounting.mjs`](../../scripts/benchmark-detailed-accounting.mjs)
+runner compares the unmodified production accounting child from two clean
+revisions against one immutable owner-only index copy and a pinned clock.
+It requires `--allow-private-index-benchmark`, explicit baseline/candidate
+roots, index, fresh output directory, ISO clock and window days. One warmup
+and three measured runs per revision are the default; the closed aggregate
+receipt records exact output equality, wall/user/system time, true peak RSS,
+source/runtime identities and unchanged input. Run sequentially on a quiescent
+machine, never concurrently with R7. Private requests and cache artifacts stay
+owner-only. This child-only comparison does not measure ingestion, parent-side
+publication or no-change refreshes, and does not close PR #94's formal gate.
 
 The reference dogfood observation was content-free and owner-local: a changed
 generation took approximately 7 minutes 13 seconds to complete detailed
@@ -38,8 +53,8 @@ Mac and one corpus; they are a baseline for profiling, not a support promise.
 Make an explicit detailed-accounting refresh fast, bounded, cancellable, and
 visibly progressive enough that users do not experience a long opaque
 "Calculating accounting" state. Optimize the changed-generation path first,
-because the light refresh path is deliberately separate and must never launch
-detailed accounting.
+because frequent automatic quota checks remain deliberately light. The single
+manual Refresh action now requests quota and detailed accounting together.
 
 The work is successful only if it preserves every accounting, attribution,
 privacy, and generation-binding invariant. A faster plausible result is a
@@ -48,18 +63,18 @@ evidence with zero, reuses stale work as current, or can publish after cancel.
 
 ## Product contract to preserve
 
-The refresh-policy change preceding this task establishes three distinct user
-intents:
+The owner-approved simplification supersedes the earlier separate manual
+quick/deep controls:
 
-- ordinary Refresh is light and updates quota/headline evidence without
-  rebuilding detailed accounting;
-- automatic refreshes are light except for a bounded, at-most-hourly detailed
-  attempt after the app is otherwise idle;
-- `Recalculate detailed accounting…` is an explicit deep operation.
+- one manual Refresh action updates quota, history and detailed accounting,
+  reusing a valid generation-bound cache;
+- startup and frequent automatic quota checks stay light;
+- automatic detailed attempts remain bounded to at most hourly while no refresh
+  is in flight, counting failed, cancelled and interrupted attempts.
 
-Performance work must not collapse those operations back into a single route or
-make an ordinary refresh pay for speculative detailed work. It may make the
-explicit deep operation dramatically cheaper.
+The quick and detailed backend operations stay independently observable and
+share one controller. Keep concurrency, cancellation, generation fencing,
+last-good data and progress; do not wholesale revert the RC9 correctness commit.
 
 The mixed-plan correction preceding this task also requires a selected-plan
 timeline. A current Pro, Plus, or ProLite fit may use only compatible evidence
@@ -363,7 +378,7 @@ showing accounting after the companion has returned a terminal receipt.
 Use these as an initial product target, then report raw values and deltas so the
 owner can adjust them from evidence:
 
-- ordinary light refresh: no detailed-accounting child and no unified-index
+- automatic light refresh: no detailed-accounting child and no unified-index
   scan;
 - unchanged explicit detailed refresh: p95 at or below 15 seconds;
 - one-small-append detailed refresh: p50 at or below 60 seconds and p95 at or
