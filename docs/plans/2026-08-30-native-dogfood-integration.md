@@ -465,3 +465,15 @@ experiment completed all 20,000 transactions, observed 21 valid replacements
 plus 74 disappearances, and recorded no sampler failures. Different timing and
 sampling counts are not a performance comparison. Review found no outstanding
 correctness issue; the complete source gate and protected R7 remain pending.
+
+The exact `6728986e` pre-R7 root run completed 3,538 tests: 3,516 passed,
+five failed, and 17 platform skips. Three native artifact blocks all stopped
+with `Pinned package mismatch for fast-uri`: the earlier lockfile security
+update had not updated the native builder's independent version/tree pins.
+The remaining two failures were stale R7 receipts. This is an integration
+defect, not a flaky timeout. The native pin and expected artifact inventory now
+use 3.1.6; the installed package tree was independently matched to the official
+archive after SHA-512 verification against the lockfile. A cheap source test
+now checks AJV's resolved fast-uri through the actual native pin before expensive
+builds. Native artifact and full-source validation must be repeated; no pin or
+test has been weakened.

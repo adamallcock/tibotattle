@@ -280,7 +280,7 @@ const PINNED_PACKAGES = Object.freeze({
   "@app-usagemonitor/telemetry-contract": RELEASE_VERSION,
   ajv: "8.20.0",
   "fast-deep-equal": "3.1.3",
-  "fast-uri": "3.1.5",
+  "fast-uri": "3.1.6",
   "json-schema-traverse": "1.0.0",
   "require-from-string": "2.0.2",
   runcost: "0.2.1",
@@ -298,7 +298,9 @@ const PINNED_PACKAGE_TREE_DIGESTS = Object.freeze({
   ajv: "7fecaf9a9ff3f41dabc7f7d762c7fecb8384c38a3c0dd4e6da0f3b3ef04569ca",
   "fast-deep-equal":
     "6c98665ed0585630ce02fbf064e6ed854f8e6546cb1e534158dbfbc18e05aa85",
-  "fast-uri": "45d5024ff5b5207801db39d27aa6aa9fc6ca54b042d25cdf23dfbf9e526705eb",
+  // Security patch: the installed tree matches the official 3.1.6 archive
+  // whose SHA-512 integrity is pinned in pnpm-lock.yaml.
+  "fast-uri": "d267bdc69f6805e4b6dcab9d48d543c490ee3022adb3f7e1ba02f542f70e25c8",
   "json-schema-traverse":
     "71ac31baf5e8476eb746605c96d1961a1e7474d4491828506602cbf17b5c5af6",
   "require-from-string":

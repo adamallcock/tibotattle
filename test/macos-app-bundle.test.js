@@ -7693,7 +7693,7 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
         },
         { name: "ajv", version: "8.20.0" },
         { name: "fast-deep-equal", version: "3.1.3" },
-        { name: "fast-uri", version: "3.1.5" },
+        { name: "fast-uri", version: "3.1.6" },
         { name: "json-schema-traverse", version: "1.0.0" },
         { name: "require-from-string", version: "2.0.2" },
         { name: "runcost", version: "0.2.1" },
@@ -9747,6 +9747,15 @@ test("build script itself does not admit private output trees", async () => {
 // bytes into the signed app. It now also verifies a reviewed deterministic
 // file-tree digest of the installed package, rejecting tampered bytes before
 // any copy or signing.
+test("the macOS fast-uri security pin matches the actual AJV runtime dependency", async () => {
+  const rootRequire = createRequire(join(REPOSITORY_ROOT, "package.json"));
+  const ajvRequire = createRequire(rootRequire.resolve("ajv/package.json"));
+  const packagePath = ajvRequire.resolve("fast-uri/package.json");
+  const accepted = await pinnedPackage("fast-uri", packagePath);
+  assert.equal(accepted.version, "3.1.6");
+  assert.equal(accepted.treeDigest, await pinnedPackageTreeDigest(dirname(packagePath)));
+});
+
 test("pinnedPackage authenticates external packages by reviewed file-tree digest, not just name and version", async (t) => {
   const rootRequire = createRequire(join(REPOSITORY_ROOT, "package.json"));
 
