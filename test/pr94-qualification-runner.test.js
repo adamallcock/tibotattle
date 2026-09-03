@@ -41,6 +41,19 @@ test("PR94 programmatic entry refuses before source or private data access witho
   await assert.rejects(runPr94Qualification({}), code("pr94_approval_required"));
 });
 
+test("runner validates the shared semantic projection before production resource probes", async () => {
+  const source = await readFile(new URL("../scripts/qualify-pr94-attribution.mjs", import.meta.url), "utf8");
+  const comparison = source.indexOf("const comparison = {");
+  const validation = source.indexOf("validatePr94ComparisonEvidence({ comparison, evidence: publicEvidence });");
+  const disposal = source.indexOf("for (const value of Object.values(evidence)) {", comparison);
+  const production = source.indexOf("const productionResources = {};");
+  const finalValidation = source.indexOf("validatePr94ComparisonReceipt(receipt);");
+  assert.ok(comparison > 0 && validation > comparison);
+  assert.ok(disposal > validation && production > disposal);
+  assert.ok(finalValidation > production);
+  assert.match(source.slice(production, finalValidation), /evidence: publicEvidence,/u);
+});
+
 test("analysis envelopes propagate only closed fixed diagnostic codes", () => {
   const success = { status: "ok", resultBytes: 256, resultSha256: "a".repeat(64) };
   assert.deepEqual(parsePr94AnalysisEnvelope(JSON.stringify(success)), success);

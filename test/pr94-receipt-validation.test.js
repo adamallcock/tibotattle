@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 import { createPr94LedgerEvidence } from "../scripts/lib/pr94-ledger-evidence.mjs";
 import { buildPr94CalibrationEvidence, comparePr94CalibrationEvidence } from "../scripts/lib/pr94-calibration-evidence.mjs";
-import { validatePr94AnalysisResult, validatePr94ComparisonReceipt } from "../scripts/lib/pr94-receipt-validation.mjs";
+import { validatePr94AnalysisResult, validatePr94ComparisonEvidence, validatePr94ComparisonReceipt } from "../scripts/lib/pr94-receipt-validation.mjs";
 
 const HASH = (character) => character.repeat(64);
 const REVISION = (character) => character.repeat(40);
@@ -43,13 +43,14 @@ const CALIBRATION_HMAC_KEY = new Uint8Array(32).fill(13);
 const CALIBRATION_RESET = Date.parse("2026-08-31T00:00:00.000Z") / 1_000;
 const CALIBRATION_SCOPE = { startAt: "2026-08-01T00:00:00.000Z", endAt: "2026-09-01T00:00:00.000Z" };
 
-function calibrationRows({ planType = "pro", count = 12, offset = 0, costStep = 10 } = {}) {
+function calibrationRows({ planType = "pro", count = 12, offset = 0, costStep = 10,
+  reset = CALIBRATION_RESET, era = "era-one", eligibility = "primary_conditional" } = {}) {
   return Array.from({ length: count }, (_, index) => {
     const time = Date.parse("2026-08-25T00:00:00.000Z") + (index + offset) * 3_600_000;
     return {
-      accountScopeId: "unattributed", provider: "openai_codex", planType, planVariant: "unknown", planEraKey: "era-one",
-      aggregationEligibility: "primary_conditional", limitId: "codex", slot: "primary", windowDurationMins: 10_080,
-      resetsAt: CALIBRATION_RESET, eventTime: new Date(time + 3_600_000).toISOString(),
+      accountScopeId: "unattributed", provider: "openai_codex", planType, planVariant: "unknown", planEraKey: era,
+      aggregationEligibility: eligibility, limitId: "codex", slot: "primary", windowDurationMins: 10_080,
+      resetsAt: reset, eventTime: new Date(time + 3_600_000).toISOString(),
       lastPriorObservedAt: new Date(time).toISOString(), firstNextObservedAt: new Date(time + 3_600_000).toISOString(),
       priorUsedPercent: index, nextUsedPercent: index + 1,
       lastPriorCumulativeApiPricedUsd: index * costStep, firstNextCumulativeApiPricedUsd: (index + 1) * costStep,
@@ -72,12 +73,22 @@ function calibrationRawParent(first) {
 }
 
 function populatedCalibration(revisionKind, options = {}) {
-  const transitions = calibrationRows(options);
+  const parents = Array.from({ length: options.parentCount ?? 1 }, (_, index) => {
+    const parentOptions = { ...options, reset: CALIBRATION_RESET - index * 604_800,
+      offset: (options.offset ?? 0) - index * 168 };
+    return [
+      ...calibrationRows(parentOptions),
+      ...(options.withDiagnostic ? calibrationRows({ ...parentOptions, era: "era-two", count: 9,
+        offset: parentOptions.offset + 20 }) : []),
+    ];
+  });
+  const transitions = parents.flat();
   return buildPr94CalibrationEvidence({ internals: calibrationOriginal,
     analyzeWeeklyCalibration: calibrationOriginal.analyzeWeeklyCalibration,
     candidates: calibrationOriginal.CANDIDATES, transitions,
-    rawParents: [calibrationRawParent(transitions[0])], revisionKind,
-    hmacKey: CALIBRATION_HMAC_KEY, scope: CALIBRATION_SCOPE, selectedPlanType: options.planType ?? "pro" });
+    rawParents: parents.map((rows) => calibrationRawParent(rows[0])), revisionKind,
+    hmacKey: CALIBRATION_HMAC_KEY, scope: CALIBRATION_SCOPE,
+    selectedPlanType: Object.hasOwn(options, "selectedPlanType") ? options.selectedPlanType : options.planType ?? "pro" });
 }
 
 function noWithinEraCalibration(revisionKind) {
@@ -182,6 +193,17 @@ function receipt() {
   for (const side of ["before", "after", "final"]) value.productionResources[side] = resource(side, value, evidence);
   return value;
 }
+function populatedReceipt(options = {}, afterOptions = options) {
+  const result = receipt();
+  result.evidence.before.calibration = populatedCalibration("before", options);
+  result.evidence.after.calibration = populatedCalibration("after", afterOptions);
+  result.evidence.final.calibration = populatedCalibration("final", afterOptions);
+  result.comparison.attributionCalibration = comparePr94CalibrationEvidence(
+    result.evidence.before.calibration, result.evidence.after.calibration);
+  result.comparison.finalCalibration = comparePr94CalibrationEvidence(
+    result.evidence.after.calibration, result.evidence.final.calibration);
+  return result;
+}
 function ledgerComparison() {
   const row = { before: 0, after: 0, unchanged: 0, changed: 0, missing: 0, added: 0 };
   return { schemaVersion: "pr94-ledger-comparison-v1", status: "equal", aggregateEqual: true,
@@ -198,6 +220,16 @@ function calibrationComparison() {
 }
 function rejects(value, expectedCode = "pr94_receipt_analysis_invalid") {
   assert.throws(() => validatePr94AnalysisResult(value), { code: expectedCode });
+}
+function acceptsComparison(value) {
+  const pair = { comparison: value.comparison, evidence: value.evidence };
+  assert.equal(validatePr94ComparisonEvidence(pair), pair);
+  assert.equal(validatePr94ComparisonReceipt(value), value);
+}
+function rejectsComparison(value) {
+  const pair = { comparison: value.comparison, evidence: value.evidence };
+  assert.throws(() => validatePr94ComparisonEvidence(pair), { code: "pr94_receipt_comparison_invalid" });
+  assert.throws(() => validatePr94ComparisonReceipt(value), { code: "pr94_receipt_comparison_invalid" });
 }
 
 test("PR94 receipt validators accept content-free synthetic analysis and comparison projections", () => {
@@ -239,6 +271,139 @@ test("comparison validator accepts actual populated calibration v2 matrices in c
   const reversed = clone(result);
   reversed.comparison.attributionCalibration.primaryOutcomeMatrix.reverse();
   assert.throws(() => validatePr94ComparisonReceipt(reversed), { code: "pr94_receipt_comparison_invalid" });
+});
+
+for (const [selectedPlanType, primaryOutcome] of [
+  ["pro", "selected_plan_primary"], ["plus", "alternate_plan_primary"], [null, "unselected_plan_primary"],
+]) {
+  test(`comparison validator reconciles merged producer cells for ${primaryOutcome}`, () => {
+    const result = populatedReceipt({ parentCount: 3, selectedPlanType });
+    for (const comparison of [result.comparison.attributionCalibration, result.comparison.finalCalibration]) {
+      assert.equal(comparison.status, "pass");
+      assert.equal(comparison.reconciledParentCandidates, 12);
+      assert.equal(comparison.retainedPrimaryFits, 12);
+      assert.equal(comparison.primaryOutcomeMatrix.length, 4);
+      for (const cell of comparison.primaryOutcomeMatrix) {
+        assert.equal(cell.parentCandidates, 3);
+        assert.equal(cell.afterPrimaryFits, 3);
+        assert.deepEqual(cell.afterOutcomes, [{ outcome: primaryOutcome, count: 1 }]);
+      }
+    }
+    acceptsComparison(result);
+    for (const side of ["attributionCalibration", "finalCalibration"]) {
+      for (const mutate of [
+        (cell) => { cell.afterOutcomes[0].count = 2; },
+        (cell) => { cell.afterOutcomes[0].count = 3; },
+        (cell) => { cell.parentCandidates = 2; },
+        (cell) => { cell.afterOutcomes = [{ outcome: "aggregation_diagnostic_only", count: 3 }]; },
+      ]) {
+        const changed = clone(result);
+        mutate(changed.comparison[side].primaryOutcomeMatrix[0]);
+        rejectsComparison(changed);
+      }
+    }
+  });
+}
+
+test("merged primary cells count only primary outcomes, not losing diagnostic fragments", () => {
+  const result = populatedReceipt({ parentCount: 3, withDiagnostic: true });
+  for (const comparison of [result.comparison.attributionCalibration, result.comparison.finalCalibration]) {
+    assert.equal(comparison.primaryOutcomeMatrix.length, 4);
+    for (const cell of comparison.primaryOutcomeMatrix) {
+      assert.equal(cell.parentCandidates, 3);
+      assert.equal(cell.afterPrimaryFits, 3);
+      assert.deepEqual(cell.afterOutcomes, [
+        { outcome: "losing_qualifying_fragment", count: 1 }, { outcome: "selected_plan_primary", count: 1 },
+      ]);
+    }
+  }
+  acceptsComparison(result);
+  for (const side of ["attributionCalibration", "finalCalibration"]) {
+    const diagnosticsAsPrimary = clone(result);
+    diagnosticsAsPrimary.comparison[side].primaryOutcomeMatrix[0].afterOutcomes = [
+      { outcome: "losing_qualifying_fragment", count: 3 },
+    ];
+    rejectsComparison(diagnosticsAsPrimary);
+    const multiplied = clone(result);
+    multiplied.comparison[side].primaryOutcomeMatrix[0].afterOutcomes[1].count = 2;
+    rejectsComparison(multiplied);
+  }
+});
+
+test("merged no-primary cells retain diagnostic outcomes without inventing primary fits", () => {
+  const result = populatedReceipt({ parentCount: 3, eligibility: "diagnostic_only" });
+  for (const comparison of [result.comparison.attributionCalibration, result.comparison.finalCalibration]) {
+    assert.equal(comparison.primaryOutcomeMatrix.length, 4);
+    for (const cell of comparison.primaryOutcomeMatrix) {
+      assert.equal(cell.transition, "no_primary");
+      assert.equal(cell.parentCandidates, 3);
+      assert.equal(cell.afterPrimaryFits, 0);
+      assert.deepEqual(cell.afterOutcomes, [{ outcome: "aggregation_diagnostic_only", count: 1 }]);
+    }
+  }
+  acceptsComparison(result);
+  for (const side of ["attributionCalibration", "finalCalibration"]) {
+    const invented = clone(result);
+    invented.comparison[side].primaryOutcomeMatrix[0].afterOutcomes = [{ outcome: "selected_plan_primary", count: 1 }];
+    rejectsComparison(invented);
+  }
+});
+
+test("merged missing-parent cells remain a failed comparison even when no primaries were lost", () => {
+  const result = populatedReceipt({ parentCount: 3, eligibility: "diagnostic_only" },
+    { parentCount: 1, eligibility: "diagnostic_only" });
+  const comparison = result.comparison.attributionCalibration;
+  assert.equal(comparison.status, "fail");
+  assert.equal(comparison.missingParentCandidates, 8);
+  assert.equal(comparison.lostPrimaryFits, 0);
+  const missing = comparison.primaryOutcomeMatrix.filter((cell) => cell.transition === "missing_parent");
+  assert.equal(missing.length, 4);
+  for (const cell of missing) {
+    assert.equal(cell.parentCandidates, 2);
+    assert.equal(cell.afterPrimaryFits, 0);
+    assert.deepEqual(cell.afterOutcomes, [{ outcome: "missing_parent", count: 1 }]);
+  }
+  rejectsComparison(result);
+  const falsePass = clone(result);
+  falsePass.comparison.attributionCalibration.status = "pass";
+  rejectsComparison(falsePass);
+});
+
+test("early semantic validation accepts exactly the comparison/evidence pair and shares receipt refusals", () => {
+  const result = populatedReceipt({ parentCount: 2 });
+  acceptsComparison(result);
+  for (const mutate of [
+    (value) => { value.comparison.readerEvidenceUnchanged = false; },
+    (value) => { value.comparison.finalLedger.rows.usage.before = 1; },
+    (value) => { value.comparison.attributionCalibration.retainedPrimaryFits += 1; },
+    (value) => { value.evidence.after.revisionKind = "before"; },
+    (value) => { value.evidence.final.coverage.accountingStatus = "partial"; },
+    (value) => { value.evidence.after.calibration.status = "fail"; },
+  ]) {
+    const changed = clone(result); mutate(changed); rejectsComparison(changed);
+  }
+  const pair = { comparison: result.comparison, evidence: result.evidence };
+  for (const invalid of [
+    { comparison: pair.comparison }, { evidence: pair.evidence }, { ...pair, sources: result.sources },
+    { ...pair, productionResources: result.productionResources }, { ...pair, extra: "synthetic" },
+    Object.assign(Object.create({ extra: "synthetic" }), pair), { ...pair, [Symbol("extra")]: "synthetic" },
+    null, [],
+  ]) {
+    assert.throws(() => validatePr94ComparisonEvidence(invalid), { code: "pr94_receipt_comparison_invalid" });
+  }
+  let accessCount = 0;
+  const accessor = { comparison: pair.comparison };
+  Object.defineProperty(accessor, "evidence", { enumerable: true, get() { accessCount += 1; return pair.evidence; } });
+  assert.throws(() => validatePr94ComparisonEvidence(accessor), { code: "pr94_receipt_comparison_invalid" });
+  assert.equal(accessCount, 0);
+
+  // This early gate is semantic only. Final validation still requires the
+  // independently bound source, window, measurement, and production evidence.
+  const invalidResources = clone(result);
+  invalidResources.productionResources.final.runs[0].artifact.sha256 = HASH("7");
+  const semanticPair = { comparison: invalidResources.comparison, evidence: invalidResources.evidence };
+  assert.equal(validatePr94ComparisonEvidence(semanticPair), semanticPair);
+  assert.throws(() => validatePr94ComparisonReceipt(invalidResources), { code: "pr94_receipt_comparison_invalid" });
 });
 
 test("receipt validator accepts the original miner's within-era no-change outcome", () => {

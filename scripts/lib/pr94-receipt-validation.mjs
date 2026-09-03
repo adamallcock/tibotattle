@@ -34,6 +34,9 @@ const CANDIDATES = Object.freeze([
 const PRIMARY_TRANSITIONS = Object.freeze([
   "retained_primary", "lost_primary", "new_primary", "no_primary", "missing_parent",
 ]);
+const PRIMARY_OUTCOMES = Object.freeze([
+  "selected_plan_primary", "alternate_plan_primary", "unselected_plan_primary",
+]);
 const PLANS = new Set([
   "free", "plus", "pro", "pro_lite", "team", "business", "enterprise", "edu", "unknown", "other",
 ]);
@@ -490,7 +493,7 @@ function validateCalibrationComparison(value, before = null, after = null) {
         || cell.retainedPrimaryFits + cell.newPrimaryFits !== cell.afterPrimaryFits
         || cell.changedInputPrimaryLosses > cell.lostPrimaryFits) reject();
     list(cell.afterOutcomes, OUTCOMES.length + 1);
-    let outcomeTotal = 0;
+    let primaryOutcomesPerParent = 0;
     let previousOutcome = null;
     for (const outcome of cell.afterOutcomes) {
       exact(outcome, ["outcome", "count"]);
@@ -498,7 +501,7 @@ function validateCalibrationComparison(value, before = null, after = null) {
       integer(outcome.count, 1, MAX_CALIBRATION_ITEMS);
       if (previousOutcome !== null && outcome.outcome <= previousOutcome) reject();
       previousOutcome = outcome.outcome;
-      outcomeTotal += outcome.count;
+      if (PRIMARY_OUTCOMES.includes(outcome.outcome)) primaryOutcomesPerParent += outcome.count;
     }
     if (cell.afterOutcomes.length === 0
         || (cell.transition === "missing_parent"
@@ -510,7 +513,10 @@ function validateCalibrationComparison(value, before = null, after = null) {
     if (cell.transition === "new_primary" && (cell.baselinePrimaryFits !== 0 || cell.afterPrimaryFits === 0)) reject();
     if (cell.transition === "no_primary" && (cell.baselinePrimaryFits !== 0 || cell.afterPrimaryFits !== 0)) reject();
     if (cell.transition === "missing_parent" && cell.afterPrimaryFits !== 0) reject();
-    if (cell.transition !== "missing_parent" && outcomeTotal < cell.afterPrimaryFits) reject();
+    // The cell key contains a shared per-parent outcome shape, while fit
+    // counts are summed over every parent represented by the cell. Diagnostic
+    // and rejection outcomes must never justify a primary fit.
+    if (cell.afterPrimaryFits !== cell.parentCandidates * primaryOutcomesPerParent) reject();
     const key = JSON.stringify([cell.candidateId, cell.planType, cell.accountKnown, cell.transition, cell.afterOutcomes]);
     if (seen.has(key) || (previousKey !== null && key <= previousKey)) reject();
     seen.add(key); previousKey = key;
@@ -603,6 +609,19 @@ function validateEvidence(value) {
   return value;
 }
 
+function validateComparisonEvidenceLocal(value) {
+  exact(value, ["comparison", "evidence"]);
+  validateEvidence(value.evidence);
+  validateComparison(value.comparison, value.evidence);
+  return value;
+}
+
+/** Validate the semantic pair before running the separate production probes. */
+export function validatePr94ComparisonEvidence(value) {
+  try { return validateComparisonEvidenceLocal(value); }
+  catch { throw publicError("comparison"); }
+}
+
 function validateProductionResources(value, receipt, evidence) {
   exact(value, ["before", "after", "final"]);
   for (const side of ["before", "after", "final"]) {
@@ -640,8 +659,7 @@ function validateReceiptLocal(value) {
   validateIndex(value.index);
   validateWindow(value.window);
   validateMeasurements(value.measurements);
-  validateEvidence(value.evidence);
-  validateComparison(value.comparison, value.evidence);
+  validateComparisonEvidenceLocal({ comparison: value.comparison, evidence: value.evidence });
   validateProductionResources(value.productionResources, value, value.evidence);
   return value;
 }

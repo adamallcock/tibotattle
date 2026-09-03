@@ -18,7 +18,9 @@ import {
   disposePr94CalibrationEvidencePrivate,
 } from "./lib/pr94-calibration-evidence.mjs";
 import { runPr94ProductionResourceWorker, PR94_PRODUCTION_ERROR_CODES } from "./lib/pr94-production-resource-worker.mjs";
-import { validatePr94AnalysisResult, validatePr94ComparisonReceipt } from "./lib/pr94-receipt-validation.mjs";
+import {
+  validatePr94AnalysisResult, validatePr94ComparisonEvidence, validatePr94ComparisonReceipt,
+} from "./lib/pr94-receipt-validation.mjs";
 import { PR94_ANALYSIS_ERROR_CODES } from "./lib/pr94-analysis-worker.mjs";
 
 export const PR94_COMPARISON_REVISIONS = Object.freeze({
@@ -275,6 +277,10 @@ export async function runPr94Qualification(options, { signal = null } = {}) {
         || Object.values(evidence).some((value) => value.analysis.populationEvidence.unknownAccountOnlyWithheldEvents !== 0)) {
       fail("pr94_comparison_not_passed");
     }
+    const publicEvidence = Object.fromEntries(Object.entries(evidence).map(([side, value]) => [side, value.analysis]));
+    // Validate the exact semantic projection before starting the six expensive
+    // production probes. Final receipt validation checks this same object again.
+    validatePr94ComparisonEvidence({ comparison, evidence: publicEvidence });
     for (const value of Object.values(evidence)) {
       disposePr94LedgerEvidencePrivate(value.ledger);
       if (value.calibration !== null) disposePr94CalibrationEvidencePrivate(value.calibration);
@@ -310,7 +316,7 @@ export async function runPr94Qualification(options, { signal = null } = {}) {
       sources, index: { sha256: indexSha256, bytes: indexStat.size },
       window: { startAt: options.startAt, endAt: options.endAt }, comparison,
       measurements, productionResources,
-      evidence: Object.fromEntries(Object.entries(evidence).map(([side, value]) => [side, value.analysis])),
+      evidence: publicEvidence,
     };
     validatePr94ComparisonReceipt(receipt);
     await publishPr94Receipt(options.outputDirectory, receipt, { signal });
