@@ -752,6 +752,7 @@ const API_ROUTES = new Set([
   "/api/local/quality",
   "/api/local/timeline/window-breakdown",
   "/api/local/refresh",
+  "/api/local/refresh/quick",
   "/api/local/refresh/cancel",
   "/api/local/contribution/prepare",
   "/api/local/contribution/sync-status",
@@ -4916,11 +4917,35 @@ function createPreparedLocalCompanionServer({
           response,
           "refresh_not_authorized",
         )) return;
-        if (!refresh.start()) {
+        if (!refresh.start({ mode: "detailed" })) {
           // Keep the terminal receipt's opaque run identifier available to a
           // first-party native caller that joined an already-running explicit
           // refresh. It contains no account or evidence data and lets the
           // caller reject a later, unrelated terminal receipt.
+          send(response, 409, {
+            schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+            error: { code: "refresh_in_progress" },
+            refresh: refresh.getStatus(),
+          });
+          return;
+        }
+        send(response, 202, {
+          schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+          refresh: refresh.getStatus(),
+        });
+        return;
+      }
+      if (path === "/api/local/refresh/quick") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        if (!await authorizeLocalMutation(
+          request,
+          response,
+          "refresh_not_authorized",
+        )) return;
+        if (!refresh.start({ mode: "quick" })) {
           send(response, 409, {
             schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
             error: { code: "refresh_in_progress" },

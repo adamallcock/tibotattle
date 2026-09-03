@@ -112,7 +112,7 @@
 "settings.startAtLoginUnregistrationNotConfirmedMessage" = "macOS did not confirm that TiboTattle was removed from Login Items. Review System Settings → Login Items before relying on it.";
 "settings.startAtLoginUnregistrationNotConfirmedTitle" = "Removal from login was not confirmed";
 "settings.refreshInterval" = "Refresh interval";
-"settings.refreshIntervalDetail" = "Saved on this Mac and used while TiboTattle is open.";
+"settings.refreshIntervalDetail" = "Checks current allowance while TiboTattle is open. Detailed accounting updates automatically at most hourly; choose Refresh to update everything now.";
 "settings.refreshIntervalOneMinute" = "Every minute";
 "settings.refreshIntervalFiveMinutes" = "Every 5 minutes";
 "settings.refreshIntervalFifteenMinutes" = "Every 15 minutes";
@@ -148,7 +148,7 @@
 "nativeDashboard.progressQuotaRefresh" = "Refreshing allowance…";
 "nativeDashboard.progressSaving" = "Saving analysis progress…";
 "nativeDashboard.refreshUsage" = "Refresh";
-"nativeDashboard.refreshUsageTooltip" = "Update from selected Codex session folders and local Codex account, quota, configuration, and rollout-lineage sources. Processing stays on this Mac.";
+"nativeDashboard.refreshUsageTooltip" = "Refresh the current allowance, local history, and detailed accounting. Reuses valid cached results; all processing stays on this Mac.";
 "nativeDashboard.share" = "Share";
 "nativeDashboard.showSidebar" = "Show Sidebar";
 "nativeDashboard.shareTooltip" = "Open the local share card.";

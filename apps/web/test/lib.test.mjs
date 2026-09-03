@@ -2767,11 +2767,15 @@ test("local refresh uses the closed same-origin contract and exposes polling", a
     }
   });
   await client.refresh();
+  await client.recalculateDetailedAccounting();
   await client.refreshStatus();
-  assert.equal(calls[0].url, "/api/local/refresh");
+  assert.equal(calls[0].url, "/api/local/refresh/quick");
   assert.equal(calls[0].options.body, "{}");
   assert.equal(calls[0].options.headers["X-Usage-Monitor-Local"], "1");
-  assert.equal(calls[1].options.method, undefined);
+  assert.equal(calls[1].url, "/api/local/refresh");
+  assert.equal(calls[1].options.method, "POST");
+  assert.equal(calls[2].url, "/api/local/refresh");
+  assert.equal(calls[2].options.method, undefined);
 });
 
 test("local health exposes the content-free preparation mode", async () => {
@@ -10248,6 +10252,9 @@ const testAllowanceCapacity = (medianCapacityUsd = 1_000) => ({
 
 async function loadLiveTimelinePoints() {
   const appSource = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  const usageStart = appSource.indexOf("function allowanceTimelineUsage(data) {");
+  const usageEnd = appSource.indexOf("\nfunction renderComparison(", usageStart);
+  assert.ok(usageStart >= 0 && usageEnd > usageStart, "allowanceTimelineUsage is available");
   const start = appSource.indexOf("function mainWeeklyQuotaTrack(rows) {");
   const end = appSource.indexOf("\nfunction groupedUsageTimeline(");
   assert.ok(start >= 0 && end > start, "liveTimelinePoints is available");
@@ -10260,7 +10267,7 @@ async function loadLiveTimelinePoints() {
     "isPrimaryCodexWeeklyQuotaWindow",
     "CALIBRATION_WINDOW_HOURS",
     "activeCalibrationRangeDays",
-    `${section}\nreturn liveTimelinePoints;`,
+    `${appSource.slice(usageStart, usageEnd)}\n${section}\nreturn liveTimelinePoints;`,
   )(
     finite,
     () => Number.NEGATIVE_INFINITY,
@@ -10295,6 +10302,33 @@ async function loadLiveTimelinePoints() {
     }, options);
   };
 }
+
+test("selected-plan rolling windows and cumulative drift cannot bridge an omitted era or ambiguous bucket", async () => {
+  const liveTimelinePoints = await loadLiveTimelinePoints();
+  const base = Date.parse("2026-08-05T00:00:00Z");
+  const hour = (i) => new Date(base + i * 3_600_000).toISOString();
+  const usage = [0, 1, 3, 4, 5].map((i) => ({ startAt: hour(i), endAt: hour(i + 1),
+    usageEvents: 1, apiPriceEquivalentUsd: 10, allowanceWeighting: testAllowanceWeighting(10) }));
+  const points = liveTimelinePoints({
+    allowancePlanSelection: { comparisonAvailable: true },
+    timeline: { usage, selectedPlanUsage: usage,
+      comparisonIntervals: [[base, base + 2 * 3_600_000], [base + 3 * 3_600_000, base + 6 * 3_600_000]],
+      quota: [0, 1, 2, 3, 4, 5, 6].map((i) => ({ observedAt: hour(i),
+        usedPercent: i * 2, remainingPercent: 100 - i * 2, limitId: "codex",
+        durationMinutes: 10_080, resetAt: "2026-08-12T00:00:00Z" })) },
+  }, { windowHours: 3 });
+  const crossing = points.find((p) => p.timestamp === hour(4));
+  assert.equal(crossing.expected, null);
+  assert.equal(crossing.observed, null);
+  assert.equal(crossing.residual, null);
+  assert.equal(crossing.status, "reset_or_track_change");
+  assert.equal(crossing.driftReanchor, true);
+  assert.equal(crossing.cumulativeResidual, 0);
+  const recovered = points.find((p) => p.timestamp === hour(6));
+  assert.equal(recovered.expected, 3);
+  assert.equal(recovered.observed, 6);
+  assert.equal(recovered.residual, 3);
+});
 
 test("cumulative drift sums non-overlapping buckets and re-anchors at each reset boundary", async () => {
   const liveTimelinePoints = await loadLiveTimelinePoints();

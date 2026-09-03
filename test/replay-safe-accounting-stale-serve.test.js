@@ -13,6 +13,7 @@ import {
   writeLocalCollectorAccountingCache,
 } from "../src/local-collector-state.js";
 import { buildLocalCompanionSnapshot } from "../src/local-companion-data.js";
+import { normalizeDashboardPayload, selectAllowancePlanPopulation } from "../apps/web/public/data-client.js";
 
 // Serve-stale-labeled (2026-08-19). A cache whose semantic identity mismatches
 // the current code — the exact state every updater enters, because a schema
@@ -223,13 +224,45 @@ test("the snapshot serves stale-labeled cost, allowance, and capacity projection
     // from the stale calibration with the same provenance.
     const capacity = snapshot.overview.timeline.allowanceCapacity;
     assert.equal(capacity.status, "available");
+    assert.equal(capacity.planScope, null, "a stale scalar cannot claim a current plan/generation scope");
     assert.equal(capacity.stale.stale, true);
     assert.equal(capacity.stale.schemaVersion, OUTDATED_SCHEMA_VERSION);
     assert.ok(
       capacity.scenarios.unresolved_as_standard.medianCapacityUsd > 0,
     );
+    const dashboard = normalizeDashboardPayload({
+      ...snapshot.overview, weekly: snapshot.weekly,
+    });
+    assert.equal(dashboard.timeline.allowanceCapacity.status, "available");
+    assert.equal(dashboard.timeline.allowanceCapacity.stale.stale, true);
+    assert.equal(dashboard.timeline.allowanceCapacity.planScope, null);
+    assert.equal(selectAllowancePlanPopulation(dashboard).allowancePlanSelection.comparisonAvailable, false,
+      "a legacy stale scalar must not supply a current selected-plan comparison");
     // The alert-styled withheld banner is replaced by the quiet label.
     assert.ok(!snapshot.overview.warnings.includes(WITHHELD_SENTENCE));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stale capacity accepts absent legacy scope but rejects contradictory supplied scope", async () => {
+  const root = await fixtureRoot();
+  const stateFile = join(root, ".usage-monitor", "local-collector-state-v1.sqlite");
+  try {
+    const outdated = await writeOutdatedPriorCache(stateFile);
+    const unscoped = structuredClone(outdated);
+    delete unscoped.allowanceCapacityByScenario.planScope;
+    await writeLocalCollectorAccountingCache({ stateFile, cache: unscoped });
+    const legacy = await buildLocalCompanionSnapshot(snapshotOptions(root, stateFile));
+    assert.equal(legacy.overview.timeline.allowanceCapacity.status, "available");
+    assert.equal(legacy.overview.timeline.allowanceCapacity.planScope, null);
+    assert.equal(legacy.overview.timeline.allowanceCapacity.stale.stale, true);
+    const conflicting = structuredClone(outdated);
+    conflicting.allowanceCapacityByScenario.planScope.cohortId = "f".repeat(64);
+    await writeLocalCollectorAccountingCache({ stateFile, cache: conflicting });
+    const refused = await buildLocalCompanionSnapshot(snapshotOptions(root, stateFile));
+    assert.equal(refused.overview.timeline.allowanceCapacity.status, "unavailable");
+    assert.equal(refused.overview.timeline.allowanceCapacity.planScope, null);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

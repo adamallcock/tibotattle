@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { link, mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, open, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -38,6 +38,83 @@ function manualScheduler() {
 async function flushSampling() {
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
+}
+
+function statWithOverrides(stat, overrides) {
+  return new Proxy(stat, {
+    get(target, property) {
+      if (Object.hasOwn(overrides, property)) return overrides[property];
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+async function zeroLinkReplacementFixture(t, {
+  nested = false,
+  oldBytes = 3,
+  replacementBytes = 5,
+  oldOverrides = {},
+  secondOverrides = {},
+  secondError = null,
+  afterSecondRead = null,
+} = {}) {
+  const created = await fixture(t);
+  const parent = await realpath(created.parent);
+  const root = await realpath(created.root);
+  const directory = nested ? join(root, "mutable-directory") : root;
+  if (nested) await mkdir(directory, { mode: 0o700 });
+  const target = join(directory, "z-PRIVATE_ZERO_LINK_RECORD");
+  const replacement = join(parent, "replacement-record");
+  await writeFile(target, Buffer.alloc(oldBytes), { mode: 0o600 });
+  await writeFile(replacement, Buffer.alloc(replacementBytes), { mode: 0o600 });
+  // Both inodes coexist, and the old descriptor remains open through the test.
+  // The positive replacement must not depend on allocator reuse or timing.
+  const oldHandle = await open(target, "r");
+  t.after(() => oldHandle.close());
+  const oldStat = await oldHandle.stat();
+  const replacementStat = await lstat(replacement);
+  assert.notEqual(oldStat.ino, replacementStat.ino);
+  assert.equal(oldStat.dev, replacementStat.dev);
+  assert.equal(oldStat.uid, replacementStat.uid);
+  const binding = await createR7FilesystemRootBinding(root);
+  let targetReads = 0;
+  const value = {
+    parent, root, directory, target, oldStat, replacementStat, binding,
+    get targetReads() { return targetReads; },
+    dependencies: {
+      async lstatPath(path) {
+        if (path !== target) return lstat(path);
+        targetReads += 1;
+        const stat = await lstat(path);
+        if (targetReads === 1) {
+          await rename(replacement, target);
+          return statWithOverrides(stat, { nlink: 0, ...oldOverrides });
+        }
+        if (targetReads === 2) {
+          if (secondError !== null) throw secondError;
+          await afterSecondRead?.(value);
+          const selected = typeof secondOverrides === "function"
+            ? secondOverrides(value) : secondOverrides;
+          return statWithOverrides(stat, selected);
+        }
+        // A third read would be valid. Rejection tests assert that the sampler
+        // never retries an invalid second observation until it becomes safe.
+        return stat;
+      },
+    },
+  };
+  return value;
+}
+
+function assertRedactedFilesystemFailure(error, code, sample) {
+  assert.ok(error instanceof R7FilesystemHighWaterError);
+  assert.equal(error.code, code);
+  for (const canary of [sample.parent, sample.root, sample.target, "PRIVATE_ZERO_LINK_RECORD"]) {
+    assert.equal(error.message.includes(canary), false);
+    assert.equal(JSON.stringify(error).includes(canary), false);
+  }
+  return true;
 }
 
 test("sampler returns explicit aggregate-only before, high-water, and after measurements", async (t) => {
@@ -335,6 +412,212 @@ test("a confirmed terminal-unlink inode remains conservatively counted", async (
     },
   });
   assert.deepEqual(value, { bytes: 1, entryCount: 1, fileCount: 1, directoryCount: 0 });
+});
+
+test("a distinct owned singly-linked replacement conservatively counts both observed inodes", async (t) => {
+  const sample = await zeroLinkReplacementFixture(t);
+  const value = await measureR7FilesystemRoot(sample.binding, {
+    allowTransientOwnedHardlinks: true,
+  }, sample.dependencies);
+  assert.deepEqual(value, { bytes: 8, entryCount: 1, fileCount: 2, directoryCount: 0 });
+  assert.equal(sample.targetReads, 2);
+  assert.equal(JSON.stringify(value).includes(sample.root), false);
+  assert.equal(JSON.stringify(value).includes("PRIVATE_ZERO_LINK_RECORD"), false);
+});
+
+test("zero-byte old and replacement files remain two observations of one path", async (t) => {
+  const sample = await zeroLinkReplacementFixture(t, { oldBytes: 0, replacementBytes: 0 });
+  assert.deepEqual(await measureR7FilesystemRoot(sample.binding, {
+    allowTransientOwnedHardlinks: true,
+  }, sample.dependencies), { bytes: 0, entryCount: 1, fileCount: 2, directoryCount: 0 });
+  assert.equal(sample.targetReads, 2);
+});
+
+test("terminal-zero replacement handling remains disabled by default and when explicitly false", async (t) => {
+  for (const [name, options] of [
+    ["default", {}],
+    ["explicit false", { allowTransientOwnedHardlinks: false }],
+  ]) {
+    await t.test(name, async (t) => {
+      const sample = await zeroLinkReplacementFixture(t);
+      await assert.rejects(
+        measureR7FilesystemRoot(sample.binding, options, sample.dependencies),
+        (error) => assertRedactedFilesystemFailure(error, "r7_filesystem_hardlink_rejected", sample),
+      );
+      assert.equal(sample.targetReads, 1, "strict mode must not start the replacement recheck");
+    });
+  }
+});
+
+test("an invalid second observation fails closed without retrying a valid third observation", async (t) => {
+  const cases = [
+    ["persistent zero links", { nlink: 0 }],
+    ["same inode", (sample) => ({ ino: sample.oldStat.ino })],
+    ["replacement has two links", { nlink: 2 }],
+    ["replacement has three links", { nlink: 3 }],
+    ["replacement is a symlink", { isSymbolicLink: () => true }],
+    ["replacement is a directory", { isFile: () => false, isDirectory: () => true }],
+    ["replacement is another non-regular type", { isFile: () => false }],
+    ["replacement changes owner", (sample) => ({ uid: sample.oldStat.uid + 1 })],
+    ["replacement changes device", (sample) => ({ dev: sample.oldStat.dev + 1 })],
+    ["replacement has negative device", { dev: -1 }],
+    ["replacement has fractional device", { dev: 0.5 }],
+    ["replacement has negative inode", { ino: -1 }],
+    ["replacement has fractional inode", { ino: 0.5 }],
+    ["replacement has non-finite inode", { ino: Number.NaN }],
+    ["replacement has unsafe inode", { ino: Number.MAX_SAFE_INTEGER + 1 }],
+  ];
+  for (const [name, secondOverrides] of cases) {
+    await t.test(name, async (t) => {
+      const sample = await zeroLinkReplacementFixture(t, { secondOverrides });
+      await assert.rejects(
+        measureR7FilesystemRoot(sample.binding, { allowTransientOwnedHardlinks: true }, sample.dependencies),
+        (error) => assertRedactedFilesystemFailure(error, "r7_filesystem_hardlink_zero_rejected", sample),
+      );
+      assert.equal(sample.targetReads, 2, "only the initial stat and one recheck are permitted");
+    });
+  }
+});
+
+test("a zero-link first observation needs a safe regular-file identity before rechecking", async (t) => {
+  for (const [name, oldOverrides] of [
+    ["negative device", { dev: -1 }],
+    ["fractional device", { dev: 0.5 }],
+    ["negative inode", { ino: -1 }],
+    ["non-finite inode", { ino: Number.NaN }],
+    ["unsafe inode", { ino: Number.MAX_SAFE_INTEGER + 1 }],
+  ]) {
+    await t.test(name, async (t) => {
+      const sample = await zeroLinkReplacementFixture(t, { oldOverrides });
+      await assert.rejects(
+        measureR7FilesystemRoot(sample.binding, { allowTransientOwnedHardlinks: true }, sample.dependencies),
+        (error) => assertRedactedFilesystemFailure(error, "r7_filesystem_hardlink_zero_rejected", sample),
+      );
+      assert.equal(sample.targetReads, 1);
+    });
+  }
+});
+
+test("both observed file sizes and their accumulated total stay safe integers", async (t) => {
+  for (const [label, size] of [
+    ["negative", -1], ["fractional", 0.5], ["NaN", Number.NaN],
+    ["infinite", Number.POSITIVE_INFINITY], ["unsafe", Number.MAX_SAFE_INTEGER + 1],
+  ]) {
+    for (const side of ["old", "replacement"]) {
+      await t.test(`${side} ${label} size`, async (t) => {
+        const sample = await zeroLinkReplacementFixture(t, side === "old"
+          ? { oldOverrides: { size } } : { secondOverrides: { size } });
+        await assert.rejects(
+          measureR7FilesystemRoot(sample.binding, { allowTransientOwnedHardlinks: true }, sample.dependencies),
+          (error) => assertRedactedFilesystemFailure(error, "r7_filesystem_sampling_failed", sample),
+        );
+        assert.equal(sample.targetReads, 2);
+      });
+    }
+  }
+  await t.test("old plus replacement overflows", async (t) => {
+    const sample = await zeroLinkReplacementFixture(t, {
+      oldOverrides: { size: Number.MAX_SAFE_INTEGER }, secondOverrides: { size: 1 },
+    });
+    await assert.rejects(
+      measureR7FilesystemRoot(sample.binding, { allowTransientOwnedHardlinks: true }, sample.dependencies),
+      (error) => assertRedactedFilesystemFailure(error, "r7_filesystem_sampling_failed", sample),
+    );
+    assert.equal(sample.targetReads, 2);
+  });
+  await t.test("prior files plus old and replacement overflow", async (t) => {
+    const sample = await zeroLinkReplacementFixture(t);
+    const prefix = join(sample.root, "a-prior-file");
+    await writeFile(prefix, "x");
+    await assert.rejects(
+      measureR7FilesystemRoot(sample.binding, { allowTransientOwnedHardlinks: true }, {
+        ...sample.dependencies,
+        async lstatPath(path) {
+          const stat = await sample.dependencies.lstatPath(path);
+          return path === prefix ? statWithOverrides(stat, { size: Number.MAX_SAFE_INTEGER - 3 }) : stat;
+        },
+      }),
+      (error) => assertRedactedFilesystemFailure(error, "r7_filesystem_sampling_failed", sample),
+    );
+    assert.equal(sample.targetReads, 2);
+  });
+});
+
+test("a non-ENOENT recheck failure stays redacted and is never retried", async (t) => {
+  const sample = await zeroLinkReplacementFixture(t, {
+    secondError: Object.assign(new Error("PRIVATE_ZERO_LINK_RECORD_READ_FAILURE"), { code: "EACCES" }),
+  });
+  await assert.rejects(
+    measureR7FilesystemRoot(sample.binding, { allowTransientOwnedHardlinks: true }, sample.dependencies),
+    (error) => assertRedactedFilesystemFailure(error, "r7_filesystem_sampling_failed", sample),
+  );
+  assert.equal(sample.targetReads, 2);
+});
+
+test("successful replacement stats cannot hide replacement of their containing directory or root", async (t) => {
+  for (const [name, nested, code, removeParent] of [
+    ["containing directory replaced", true, "r7_filesystem_sampling_failed", false],
+    ["containing directory removed", true, "r7_filesystem_sampling_failed", true],
+    ["bound root replaced", false, "r7_filesystem_root_replaced", false],
+  ]) {
+    await t.test(name, async (t) => {
+      const sample = await zeroLinkReplacementFixture(t, {
+        nested,
+        async afterSecondRead(current) {
+          if (removeParent) {
+            await rm(current.directory, { recursive: true });
+            return;
+          }
+          await rename(current.directory, join(current.parent, "retired-directory"));
+          await mkdir(current.directory, { mode: 0o700 });
+          await writeFile(current.target, "new directory file", { mode: 0o600 });
+        },
+      });
+      await assert.rejects(
+        measureR7FilesystemRoot(sample.binding, { allowTransientOwnedHardlinks: true }, sample.dependencies),
+        (error) => assertRedactedFilesystemFailure(error, code, sample),
+      );
+      assert.equal(sample.targetReads, 2);
+    });
+  }
+});
+
+test("confirmed terminal disappearance still permits removal of its containing directory", async (t) => {
+  const sample = await zeroLinkReplacementFixture(t, {
+    nested: true,
+    async afterSecondRead(current) {
+      await rm(current.directory, { recursive: true });
+      throw Object.assign(new Error("PRIVATE_ZERO_LINK_RECORD_GONE"), { code: "ENOENT" });
+    },
+  });
+  assert.deepEqual(await measureR7FilesystemRoot(sample.binding, {
+    allowTransientOwnedHardlinks: true,
+  }, sample.dependencies), { bytes: 3, entryCount: 2, fileCount: 1, directoryCount: 1 });
+  assert.equal(sample.targetReads, 2);
+});
+
+test("the containing directory is rebound after enumeration before any child stat", async (t) => {
+  const sample = await zeroLinkReplacementFixture(t, { nested: true });
+  const { readBoundedDirectoryEntries } = await import("../src/export-resource-policy.js");
+  let replaced = false;
+  await assert.rejects(
+    measureR7FilesystemRoot(sample.binding, { allowTransientOwnedHardlinks: true }, {
+      ...sample.dependencies,
+      async readDirectoryEntries(path, options) {
+        const names = await readBoundedDirectoryEntries(path, options);
+        if (path === sample.directory && !replaced) {
+          replaced = true;
+          await rename(path, join(sample.parent, "retired-parent-before-stat"));
+          await mkdir(path, { mode: 0o700 });
+          await writeFile(sample.target, "substituted", { mode: 0o600 });
+        }
+        return names;
+      },
+    }),
+    (error) => assertRedactedFilesystemFailure(error, "r7_filesystem_sampling_failed", sample),
+  );
+  assert.equal(replaced, true);
+  assert.equal(sample.targetReads, 0, "a replaced parent must fail before resolving its child");
 });
 
 test("tree measurement rejects unsupported filesystem entry types", async (t) => {

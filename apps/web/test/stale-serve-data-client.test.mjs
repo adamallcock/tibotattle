@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { normalizeDashboardPayload } from "../public/data-client.js";
+import {
+  normalizeDashboardPayload,
+  selectAllowancePlanPopulation,
+} from "../public/data-client.js";
 import { SUPPORTED_LOCALES, translate } from "../public/localization.js";
 
 // Serve-stale-labeled (2026-08-19): projections computed by the previous app
@@ -138,6 +141,7 @@ test("the trends capacity keeps its staleness provenance through normalization",
   const capacity = normalized.timeline.allowanceCapacity;
   assert.equal(capacity.status, "available");
   assert.deepEqual(capacity.stale, STALE_PROVENANCE);
+  assert.equal(capacity.planScope, null);
   assert.equal(
     capacity.scenarios.unresolved_as_standard.medianCapacityUsd,
     100,
@@ -148,6 +152,18 @@ test("the trends capacity keeps its staleness provenance through normalization",
     timeline: { allowanceCapacity: staleCapacity(null) },
   });
   assert.equal(unmarked.timeline.allowanceCapacity.stale, null);
+  assert.equal(unmarked.timeline.allowanceCapacity.status, "unavailable",
+    "unscoped capacity cannot be published as current");
+  normalized.weekly = {
+    planType: "pro",
+    selectedPlanType: "pro",
+    planAttribution: { methodVersion: "plan-era-v1" },
+    planPopulations: [{ planType: "pro", status: "available" }],
+  };
+  const selected = selectAllowancePlanPopulation(normalized);
+  assert.equal(selected.allowancePlanSelection.comparisonAvailable, false);
+  assert.equal(selected.timeline.allowanceCapacity, null,
+    "retained legacy capacity cannot stand in for a scoped Trends fit");
 });
 
 test("the weekly allowance keeps its staleness provenance through normalization", () => {

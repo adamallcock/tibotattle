@@ -21,11 +21,12 @@ export const MACOS_BUNDLE_VERSION_EPOCH = 2_000;
 // The 0.1.17 RC2 used 1023, RC3 used 1023.1, installed startup-recovery RC4
 // used 1023.2, installed integrated RC5 used 1023.3, and installed accounting-
 // deadline RC6 used 1023.4, and the retired-checkpoint RC7 used 1023.5. The
-// fitted-transition correction uses monotonic RC8 build 1023.6, preserving the
-// allocated stable 1024 and upgrade ordering.
+// fitted-transition correction used RC8 allocation 1023.6. RC9 reserves 1023.7
+// for refresh-policy, selected-plan Trends, and last-good snapshot corrections,
+// preserving allocated stable 1024. Allocation is not built/installed evidence.
 export const SIGNED_MACOS_BUNDLE_VERSION_PLAN = Object.freeze({
   "0.1.17": Object.freeze({
-    "internal-dogfood": "1023.6",
+    "internal-dogfood": "1023.7",
     stable: "1024",
   }),
 });

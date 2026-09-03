@@ -13,11 +13,11 @@ Electron release, or new signed-Preview workflow. Source integration, tests,
 state migration, signing, installation, and native verification are separate
 gates; none is complete merely because an earlier gate passed.
 
-The current candidate state is the RC8 amendment at the end of this plan.
-Earlier RC4, RC5, RC6, and RC7 sections preserve their checkpoint evidence and are
+The current candidate state is the RC9 amendment at the end of this plan.
+Earlier RC4, RC5, RC6, RC7, and RC8 sections preserve their checkpoint evidence and are
 not current build allocations.
 
-The installed RC4 source is `735a59ce`, build `1023.2`. Its prompt-free Keychain
+At the RC4 checkpoint, the installed source was `735a59ce`, build `1023.2`. Its prompt-free Keychain
 foundation, approved recovery boundary, and qualification are recorded in the
 [silent-migration decision](../decisions/2026-08-31-silent-keychain-migration.md).
 RC4 is signed, notarized, and installed, but it was intentionally frozen before
@@ -84,7 +84,8 @@ automatically included in the retained validation run.
    `tibotattle-internal-dogfood-0.1.17-rcN-source-YYYYMMDD` tag. Use the reviewed
    channel allocation from `scripts/macos-bundle-version.js`, clean source and
    retained release finalizer. Earlier candidates used `1023`, `1023.1`,
-   `1023.2`, `1023.3`, `1023.4`, and `1023.5`; corrective RC8 uses `1023.6`.
+   `1023.2`, `1023.3`, `1023.4`, `1023.5`, and RC8 `1023.6`; corrective RC9
+   uses `1023.7`.
    Stable remains `1024`.
    Signing and notarization are authorized; public updater/release publication
    and hosted deployment are not part of this task.
@@ -367,3 +368,252 @@ PR #94's formal fixed-real-corpus comparator remains **OPEN / NOT RUN** and
 blocks stable or public qualification. Internal RC8 dogfood testing may proceed
 only with that gate explicitly open. No hosted Worker deployment, migration,
 stable tag, appcast, or public artifact is authorized here.
+
+## RC9 refresh and mixed-plan correction — 2026-09-02
+
+The corrective source is based on main `35802d21ede67d362533f4e2be6b38041ece1cda`
+(PR #101). The installed app's plist was observed as version `0.1.17`, build
+`1023.6` on 2026-09-02; that metadata observation does not independently requalify
+RC8's signing or runtime. RC9 is allocated `1023.7`, before reserved stable
+`1024`, and has not yet been built or installed.
+
+The owner-approved refresh policy is now represented in source: startup,
+ordinary Refresh, and Cmd-R perform quick quota/headline work. Detailed history
+and accounting have a separate explicit action. Automatic checks may attempt
+deep work at most once per hour while no refresh is in flight; failure,
+cancellation, and interruption consume that attempt. This is app-work
+coordination, not keyboard or mouse activity monitoring. A confirmed conflict
+with another quick request can undo only its own reservation. Observed deep
+requests from another surface retain their true start time. Terminal status and
+late callbacks cannot leave a finished request indefinitely calculating.
+
+The mixed-plan correction adds one compact, closed, generation-bound
+selected-plan timeline to the existing all-plan ledger. Plan, basis, reset
+cohort, generation and fingerprint must agree. Ambiguous attribution intervals
+remain gaps; the chart cannot bridge another plan or invent a quota movement.
+Reported and declared speed retain their evidence; unresolved speed uses the
+existing explicit Standard/Fast scenarios. Resource refusal affects only this
+optional comparison lane, without truncating retained history. Compact tuples
+remain compact through authoritative snapshot persistence and HTTP, and expand
+only at the browser boundary. The production snapshot validator also now agrees
+with the actual builder's top-level contract.
+
+Focused native/controller review and the unified index → saved cache → companion
+→ selected-plan browser integration pass. The first diagnostic broad run found
+a stale-serve regression, two missing Worker test dependencies, and the two
+stale R7 provenance checks. The regression is now corrected: valid historical
+scalar estimates remain explicitly stale and unscoped, while contradictory
+scope is refused and current comparison still requires full attribution. Both
+missing test dependencies are installed. Final focused accounting checks pass
+122/122, browser owning checks pass 481/481, preflight passes 20/20, and
+architecture reports no boundary debt. Native/controller, mixed-plan compact
+projection, and stale-serve reviews have no outstanding high-severity findings.
+The earlier broad run remains non-green; it is not a passing release gate.
+Freeze corrected source before protected R7, final broad
+validation, signing, notarization, state-preserving replacement, and physical
+native/Trends verification. The separate
+[performance handoff](./2026-09-01-detailed-accounting-refresh-performance.md)
+defines measured optimization work without changing accounting semantics.
+
+PR #94's formal fixed-real-corpus comparator remains **OPEN / NOT RUN**. This
+continues to be an explicitly open-gate internal dogfood, not stable/public
+qualification or hosted pairing/deployment proof.
+
+The first RC9 source commit was `cd428e55` (draft PR #102). Its hosted security
+scan identified four published high-severity `fast-uri` advisories in the
+unchanged root lockfile. The compatible patched release is
+[`fast-uri` 3.1.6](https://github.com/fastify/fast-uri/security/advisories/GHSA-5jgf-p345-68v8).
+The early R7 attempt was deliberately stopped during its second synthetic
+profile, before any real-history phase. Automatic recovery completed; all ten
+retained receipts were independently verified unchanged and the supported
+recovery command reported no interrupted generation. Updating the one
+transitive dependency requires a new source freeze and a complete fresh R7 run;
+the canceled attempt is not release evidence.
+
+The restarted full R7 run on `bf574722` completed all six synthetic/runtime
+profiles, then failed during real-history `export_set_verify` with
+`hardlink_zero_rejected` on 2026-09-03 UTC. This means the filesystem sampler
+observed an owned regular file with zero links and an immediate second pathname
+lookup succeeded. Its fixed diagnostic does not distinguish a persistent
+zero-link inode from a newly created replacement. Temporary SQLite journal
+churn is a hypothesis, not an established cause. Verification success is not
+proven. Automatic recovery completed, the ten retained receipts remain
+unchanged, and the unchanged sampler tests pass 17/17. The incomplete run is
+not release evidence; PR #102 and the new artifact remain held while the
+filesystem case is investigated using synthetic data only.
+
+A bounded synthetic macOS/Node 26.2.0 experiment subsequently reproduced this
+failure class without injected filesystem observations: 20,000 SQLite
+DELETE/FULL transactions completed normally; 43 zero-link journal observations
+split into 22 confirmed disappearances and 21 distinct owned, one-link regular
+replacements. The unchanged sampler rejected all 21 replacements. Continuous
+sampling and one-record transactions amplified the race; these are diagnostic
+results, not release performance evidence or proof of the specific failed
+real-history pathname. The sampler correction requires one verified replacement
+in an unchanged parent/root, counts both observed sizes conservatively, and
+retains refusal of unsafe or ambiguous states. Its new source must pass focused
+tests and review before another complete R7 generation; no old partial profile
+may be reused.
+
+Sampler v0.2 validation passes 64/64 focused tests, including one-reread,
+unsafe-replacement, parent/root identity, integer-overflow, and redaction cases;
+39/39 schema/recovery tests; and 8/8 synthetic lifecycle/materialized-boundary
+tests. Recovery tests require process-observation permission: three sandboxed
+liveness checks failed and all passed unchanged with that permission. Preflight
+passes 20/20 and architecture has no boundary debt. A fresh bounded SQLite
+experiment completed all 20,000 transactions, observed 21 valid replacements
+plus 74 disappearances, and recorded no sampler failures. Different timing and
+sampling counts are not a performance comparison. Review found no outstanding
+correctness issue; the complete source gate and protected R7 remain pending.
+
+The exact `6728986e` pre-R7 root run completed 3,538 tests: 3,516 passed,
+five failed, and 17 platform skips. Three native artifact blocks all stopped
+with `Pinned package mismatch for fast-uri`: the earlier lockfile security
+update had not updated the native builder's independent version/tree pins.
+The remaining two failures were stale R7 receipts. This is an integration
+defect, not a flaky timeout. The native pin and expected artifact inventory now
+use 3.1.6; the installed package tree was independently matched to the official
+archive after SHA-512 verification against the lockfile. A cheap source test
+now checks AJV's resolved fast-uri through the actual native pin before expensive
+builds. Native artifact and full-source validation must be repeated; no pin or
+test has been weakened.
+
+## Optimized RC9 integration — 2026-09-03
+
+The owner approved integrating the seven accounting optimizations recorded at
+`bc1b8325`, fixing their resource-guard issues, and using one visible manual
+Refresh action for quota and detailed accounting. Startup and frequent automatic
+quota checks remain quick; automatic detailed attempts remain at most hourly.
+Original RC9 and performance branches are preserved. Integration merge
+`6d58fa7f` combines them without reverting the mixed-plan, snapshot, or native
+state corrections. No unrelated local-main changes are included implicitly.
+
+Pre-optimization source `d362e168` completed the full protected R7 run with ten
+validated receipts on 2026-09-03 UTC, in about 37 minutes; both retained-receipt
+checks pass. Those receipts were committed separately at `a89eaa8b` as baseline
+evidence. They do not qualify the optimized source. Both retained release
+decisions remain `release_open`; regeneration does not close the separate
+PR #94 empirical comparator.
+
+Acceptance and execution sequence:
+
+- [x] Preserve both original commit histories and integrate the approved scope.
+- [x] Bound attribution precomputation by live rows, preflight allocations, and
+  check cancellation/RSS throughout; preserve exact point-reader fallback.
+- [x] Preserve hard archive-overflow semantics in fused history and prove
+  retained-cache and failure behavior with deterministic tests.
+- [x] Route only explicit manual controls to detailed refresh, remove the
+  duplicate action, and preserve automatic cadence and controller fences.
+- [x] Run focused ownership gates and independent review, then compare baseline
+  RC9 and optimized RC9 on one immutable private index with a pinned clock.
+  Keep exact output equality, raw wall/CPU/peak-RSS and lifecycle results
+  content-free; never infer end-to-end timing from separate phase sums.
+- [x] Freeze the corrected combined source; run complete protected R7 and the
+  full source/native/Worker gates without weakening checks.
+- [ ] Prepare signed/notarized dogfood `1023.7` and stable-channel `1024`
+  artifacts for owner inspection; preserve previous DMGs and local state.
+- [ ] Validate state-preserving replacement and installed native behavior.
+
+Resource fixes are committed at `acb485ed`; their owning suites passed
+134/134 with no skips or failures. The manual-control change is committed at
+`7e5efe1e`; the full browser suite passed 488/488 and native source checks
+passed 79 tests with three designated artifact exclusions. Independent
+source review found no remaining resource or refresh-policy defects; this is
+not yet real-corpus, compiled-native or installed-artifact proof. The new
+private benchmark runner passed 12/12 synthetic safety and orchestration tests
+under the required local process permissions. Its first restricted-sandbox
+attempt could not read the operating-system timing counters; no test was
+weakened. The first combined full-root run completed 3,585 tests: 3,562 passed,
+six failed and 17 platform skips, exit 1, in 448.3 seconds. Three permission
+fixtures were accidentally created under the coordinator's restrictive `077`
+mask instead of their expected normal `022` mask; all pass unchanged under
+`022`. One exact tool-inventory count needed to include the new reviewed
+benchmark (86 records / 88 executable paths); its ownership check stays exact.
+The remaining two failures are the expected stale R7 source fingerprints.
+The five-file focused recheck passed 52/52, without skips or weakened tests.
+The full-root command is not green; rerun it after final-source R7.
+
+A follow-up low-memory review found that a planned allocation exceeding RSS
+headroom escaped the optional precompute into whole-refresh deferral. The first
+private comparison was canceled through its supported signal handler (exit 1,
+`command_aborted`); its partial outputs are not qualification evidence.
+The fix catches only the optional reservation code at the caller and falls back
+to point queries. Actual RSS overflow, invalid measurements, cancellation and
+generation failures still propagate. A new integration regression proves valid
+durable publication, zero deferral callbacks and exact complete-cache parity
+when only the point reader fits. The accounting owning suites then passed
+135/135 with no skips or failures. Restart the controlled comparison on the
+corrected clean source.
+
+The corrected comparison completed successfully on baseline `a89eaa8b` and
+candidate `b06b5968`. One warm-up plus three measured runs per revision produced
+eight identical 15,511,261-byte cache artifacts. Median child wall time fell
+from 321.86 to 39.25 seconds (8.2 times faster); median peak RSS rose about
+5.3%, with every run below the unchanged 6 GiB ceiling. The
+[exact comparison receipt](../receipts/2026-09-03-optimized-rc9-accounting-comparison.md)
+records raw CPU/RSS measurements, immutable input, supplementary dependency
+verification, and the v1 harness's cancellation/provenance limitations. Correct
+those tooling safeguards before final release validation; the measured product
+code remains unchanged by that repair. This does not close PR #94's distinct
+empirical gate or establish end-to-end installed refresh time.
+
+The benchmark-tool follow-up now propagates cancellation through hashing,
+source checks and receipt publication, confirms direct-child closure after
+forced termination, and binds bounded dependency snapshots before and after a
+comparison. Its closed v2 receipt adds only an aggregate dependency digest;
+the completed v1 measurement is not relabeled. The final focused suite passed
+18/18, preflight 20/20, and architecture with zero debt; independent review
+found no remaining concrete issue. No product/workload source changed in this
+tooling repair. The retained macOS owning gate passed 90/90 with no skips or
+cancellations on Node 26.2.0/macOS arm64, including all compiled artifact
+blocks. Signing, installed verification and the final broad source gate remain
+separate.
+
+The latest owner authorization covers local candidate preparation, signing,
+notarization and dogfood testing, not publication. Stable release approval,
+remote version-tag publication, GitHub release, Sparkle feed, Homebrew/website,
+hosted deployment/migrations and contribution uploads remain withheld. A local
+stable-channel build is only an inspection candidate, not a claim that the open
+PR #94 comparator or hosted pairing gates have passed. Unexpected Keychain
+prompts remain a stop condition; never automate approval or change access rules.
+
+The complete optimized R7 generation on `f67908fe` exited zero on
+2026-09-03 UTC after 36.2 minutes, replacing exactly ten validated receipts.
+The separate retained-receipt tests passed 2/2. Independent diff review found
+unchanged outcomes and failure classifications, no new hard resource failure,
+and matching execution-input hashes in both decision receipts. Both decisions
+remain `release_open`, with all 19 ceiling decisions unresolved. Two external
+RSS sampling failures remain explicit in Node 24 synthetic profiles; the
+real-history profiles have none. Maximum real-history RSS changed from
+1,060.22 to 1,232.92 MiB on Node 24 and from 1,158.88 to 1,132.97 MiB on
+Node 26, below the unchanged 1,536 MiB ceiling. Selected file and record
+counts are unchanged, but source bytes grew between runs; these deltas are not
+a fixed-input causal performance comparison.
+
+The complete Worker gate passed on `f67908fe`: 524 Worker tests, 179 operation
+tests, package guards, generated types, TypeScript, endpoint checks, and both
+default/staging dry-run bundles. No hosted write occurred. The post-R7 full
+root run completed 3,592 tests with 3,574 passes, one failure, 17 platform
+skips and no cancellations (exit 1, 459.9 seconds). Its sole failure correctly
+identified the benchmark's missing caller declaration for the shared ESM parser
+in the tool inventory. The declaration is now repaired without changing the
+parser, product code, test assertion, or protected workload. This required a
+full rerun; that failed command is not described as green.
+
+After the declaration repair, the full-root rerun exited zero: 3,592 tests,
+3,575 passed, 17 designated Windows skips, no failures or cancellations,
+458.6 seconds. The focused inventory/R7 checks passed 7/7; preflight passed
+20/20; architecture passed with 382 files, 1,538 imports and zero debt. The
+installed Codex contract and release-documentation checks passed. No assertion,
+timeout, exclusion or resource ceiling was weakened. The inventory repair and
+updated prose do not change the protected workload; its freshly regenerated
+receipts remain current. Signed artifacts and real-profile physical checks are
+still separate from these completed source gates.
+
+Normal live launch can resume previously consented contribution uploads.
+Automated native artifact checks must use the supported isolated profile when
+real delivery is outside the authorized QA scope. Preserve live consent and
+all local evidence unchanged, and leave the installed dogfood closed for owner
+inspection.
+Do not change consent, disconnect the device, or broaden network authority to
+make automated QA easier.

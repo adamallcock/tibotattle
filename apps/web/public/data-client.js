@@ -3,7 +3,8 @@
  *
  * Local companion contract:
  *   GET  /api/local/{onboarding,overview,gradient,weekly,quality}
- *   POST /api/local/refresh
+ *   POST /api/local/refresh/quick (automatic/lightweight observation refresh)
+ *   POST /api/local/refresh       (explicit detailed-accounting rebuild)
  *
  * Hosted browser-session contract:
  *   GET  /api/v1/session
@@ -3341,6 +3342,9 @@ const ALLOWANCE_BASIS_FAMILY_ID =
   "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario";
 const TIMELINE_ALLOWANCE_WEIGHTING_SCHEMA_VERSION =
   "quota-weighted-timeline-v0.1";
+const PLAN_SCOPED_TIMELINE_SCHEMA_VERSION =
+  "local-plan-scoped-accounting-timeline-v1";
+const PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION = "plan-era-v1";
 const TIMELINE_WEIGHTING_STATUS_BY_CODE = Object.freeze([
   "complete",
   "partial",
@@ -3654,10 +3658,10 @@ function normalizeAccountingDimension(value, allowedKeys) {
   }));
 }
 
-function normalizeLocalUsageTimeline(value, weightingEncoding = undefined) {
+function normalizeLocalUsageTimeline(value, weightingEncoding = undefined, maximumRows = 3_000) {
   if (weightingEncoding === null) return [];
   const rows = [];
-  for (const row of array(value).slice(-3_000)) {
+  for (const row of array(value).slice(-maximumRows)) {
     const startAt = text(row?.startAt, "");
     const endAt = text(row?.endAt, "");
     const startMs = Date.parse(startAt);
@@ -3716,11 +3720,58 @@ function unavailableAllowanceCapacity(reason = "allowance_capacity_unavailable")
       unresolved_as_standard: null,
       unresolved_as_fast: null
     },
+    planScope: null,
+    stale: null,
     accountAttribution: {
       status: "historical_unattributed",
       maySpanMultipleAccounts: true
     }
   };
+}
+
+function normalizePlanScope(value) {
+  const planType = normalizePlanType(value?.planType);
+  const cohortId = typeof value?.cohortId === "string"
+      && /^[0-9a-f]{64}$/u.test(value.cohortId)
+    ? value.cohortId
+    : null;
+  const rawGeneration = value?.sourceGeneration;
+  const sourceGeneration = Number.isSafeInteger(rawGeneration)
+      && rawGeneration >= 0
+    ? String(rawGeneration)
+    : typeof rawGeneration === "string"
+        && /^[A-Za-z0-9._:-]{1,256}$/u.test(rawGeneration)
+      ? rawGeneration
+      : "";
+  const sourceGenerationFingerprint = text(
+    value?.sourceGenerationFingerprint,
+    ""
+  );
+  if (value?.methodVersion !== PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION
+      || planType === "unknown"
+      || value?.basisFamilyId !== ALLOWANCE_BASIS_FAMILY_ID
+      || cohortId === null
+      || sourceGeneration === ""
+      || sourceGenerationFingerprint === "") return null;
+  return {
+    methodVersion: PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION,
+    planType,
+    basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
+    cohortId,
+    sourceGeneration,
+    sourceGenerationFingerprint
+  };
+}
+
+function matchingPlanScope(left, right) {
+  return left !== null && right !== null
+    && left.methodVersion === right.methodVersion
+    && left.planType === right.planType
+    && left.basisFamilyId === right.basisFamilyId
+    && left.cohortId === right.cohortId
+    && left.sourceGeneration === right.sourceGeneration
+    && left.sourceGenerationFingerprint
+      === right.sourceGenerationFingerprint;
 }
 
 function normalizeAllowanceCapacityScenario(value, scenario) {
@@ -3930,11 +3981,18 @@ function normalizeAllowanceCapacity(value) {
   const selectedScenario = ALLOWANCE_SCENARIOS.includes(value.selectedScenario)
     ? value.selectedScenario
     : null;
+  const planScope = normalizePlanScope(value.planScope);
+  const stale = normalizeStaleProvenance(value.stale);
+  // Prior cache formats predate plan-scoped timelines. Retain their explicitly
+  // stale scalar for historical display, never as a current plan numerator.
+  const legacyStale = value.planScope == null && stale !== null;
   if (value.status === "available") {
-    if (selectedScenario === null || scenarios[selectedScenario] === null) {
+    if (selectedScenario === null || scenarios[selectedScenario] === null
+        || (!legacyStale && (planScope === null
+          || planScope.cohortId !== scenarios[selectedScenario].cohortId))) {
       return unavailableAllowanceCapacity("allowance_capacity_invalid");
     }
-  } else if (selectedScenario !== null) {
+  } else if (selectedScenario !== null || planScope !== null) {
     return unavailableAllowanceCapacity("allowance_capacity_invalid");
   }
   if (value.status === "range"
@@ -3953,11 +4011,134 @@ function normalizeAllowanceCapacity(value) {
     basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
     selectedScenario,
     scenarios,
-    stale: normalizeStaleProvenance(value.stale),
+    planScope,
+    stale,
     accountAttribution: {
       status: "historical_unattributed",
       maySpanMultipleAccounts: true
     }
+  };
+}
+
+function unavailablePlanScopedTimeline(reason = "plan_scoped_timeline_unavailable") {
+  return {
+    schemaVersion: PLAN_SCOPED_TIMELINE_SCHEMA_VERSION,
+    status: "unavailable",
+    reason,
+    planScope: null,
+    usage: [],
+    quota: [],
+    comparisonIntervals: []
+  };
+}
+
+function normalizePlanScopedTimeline(value, weightingEncoding, capacity) {
+  if (value?.schemaVersion !== PLAN_SCOPED_TIMELINE_SCHEMA_VERSION
+      || value?.status !== "available" || value.reason !== null
+      || value.encoding !== "plan_bucket_v1") {
+    return unavailablePlanScopedTimeline();
+  }
+  const planScope = normalizePlanScope(value.planScope);
+  const capacityScope = capacity?.status === "available"
+    ? capacity.planScope : null;
+  if (planScope === null || capacityScope === null
+      || !matchingPlanScope(planScope, capacityScope)) {
+    return unavailablePlanScopedTimeline("plan_scoped_timeline_scope_mismatch");
+  }
+  if (!Array.isArray(value.usage) || value.usage.length > 100_000
+      || !Array.isArray(value.quota) || value.quota.length > 100_000
+      || !Array.isArray(value.comparisonIntervals) || value.comparisonIntervals.length > 100_000) {
+    return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+  }
+  const comparisonIntervals = [];
+  let priorEnd = -Infinity;
+  for (const interval of value.comparisonIntervals) {
+    if (!Array.isArray(interval) || interval.length !== 2
+        || !interval.every((ms) => Number.isSafeInteger(ms)
+          && ms % 900_000 === 0 && Number.isFinite(new Date(ms).getTime()))
+        || interval[0] < priorEnd || interval[1] <= interval[0]) {
+      return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+    }
+    comparisonIntervals.push([...interval]);
+    priorEnd = interval[1];
+  }
+  const decodedUsage = value.usage.map(decodePlanTimelineUsage);
+  if (decodedUsage.includes(null)) return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+  const usage = normalizeLocalUsageTimeline(decodedUsage, weightingEncoding, 100_000);
+  const decodedQuota = [];
+  for (const row of value.quota) {
+    if (!Array.isArray(row) || row.length !== 3
+        || !row.every((n) => typeof n === "number" && Number.isFinite(n))
+        || !Number.isSafeInteger(row[0]) || !Number.isFinite(new Date(row[0]).getTime())
+        || !Number.isFinite(new Date(row[1] * 1000).getTime())
+        || row[2] < 0 || row[2] > 100) return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+    decodedQuota.push({ observedAt: new Date(row[0]).toISOString(), resetAt: new Date(row[1] * 1000).toISOString(),
+      usedPercent: row[2], remainingPercent: 100 - row[2], limitId: "codex", durationMinutes: 10_080,
+      slot: "unknown", planType: planScope.planType, accountAttribution: "unattributed" });
+  }
+  const quota = normalizeLocalQuotaTimeline(decodedQuota, 100_000);
+  if (usage.length !== value.usage.length || quota.length !== value.quota.length
+      || quota.some((row) => row.planType !== planScope.planType)) {
+    return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+  }
+  let intervalAt = 0;
+  priorEnd = -Infinity;
+  for (const row of usage) {
+    const start = Date.parse(row.startAt);
+    const end = Date.parse(row.endAt);
+    while (intervalAt < comparisonIntervals.length
+        && comparisonIntervals[intervalAt][1] <= start) intervalAt += 1;
+    const interval = comparisonIntervals[intervalAt];
+    if (start < priorEnd || !interval || start < interval[0] || end > interval[1]) {
+      return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+    }
+    priorEnd = end;
+  }
+  intervalAt = 0;
+  priorEnd = -Infinity;
+  for (const row of quota) {
+    const at = Date.parse(row.observedAt);
+    while (intervalAt < comparisonIntervals.length
+        && comparisonIntervals[intervalAt][1] <= at) intervalAt += 1;
+    const interval = comparisonIntervals[intervalAt];
+    if (at <= priorEnd || !interval || at < interval[0] || at >= interval[1]) {
+      return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+    }
+    priorEnd = at;
+  }
+  return {
+    schemaVersion: PLAN_SCOPED_TIMELINE_SCHEMA_VERSION,
+    status: "available",
+    reason: null,
+    planScope,
+    usage,
+    quota,
+    comparisonIntervals
+  };
+}
+
+function decodePlanTimelineUsage(row) {
+  if (!Array.isArray(row) || row.length !== 16
+      || row.some((n) => typeof n !== "number" || !Number.isFinite(n))
+      || !Number.isSafeInteger(row[0]) || row[0] % 900_000 !== 0
+      || !Number.isFinite(new Date(row[0] + 900_000).getTime())
+      || row.slice(1).some((n) => n < 0)
+      || [1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 14, 15].some((i) => !Number.isSafeInteger(row[i]))
+      || row[1] < 1 || row[11] + row[12] > row[1] || row[13] + row[14] > row[1]) return null;
+  const priced = row[13] + row[14] === row[1];
+  return {
+    startAt: new Date(row[0]).toISOString(), endAt: new Date(row[0] + 900_000).toISOString(),
+    usageEvents: row[1], totalTokens: row[15], apiPriceEquivalentUsd: row[8],
+    components: Object.fromEntries(LOCAL_COMPONENT_KEYS.map((key, i) => [key, row[i + 2]])),
+    pricingCoverage: { fullyPricedEvents: row[13], partiallyPricedEvents: row[14],
+      unpricedEvents: row[1] - row[13] - row[14] },
+    // Existing weighting encoding: complete=0, unknown=2; unpriced events
+    // withhold the whole bucket, while unresolved speed remains a scenario.
+    allowanceWeighting: [row[9], row[10]].flatMap((usd) => [
+      priced ? 0 : 2, priced ? usd : null, priced ? usd : 0,
+      priced ? row[11] : 0, priced ? row[12] : 0,
+      priced ? row[1] - row[11] - row[12] : 0, 0, priced ? 0 : row[1],
+    ]),
   };
 }
 
@@ -3976,7 +4157,30 @@ function normalizeLocalTimeline(value = {}) {
     value.calibrationUsage,
     weightingEncoding
   );
-  const quota = array(value.quota).slice(-10_000).flatMap((row) => {
+  const allowanceCapacity = normalizeAllowanceCapacity(value.allowanceCapacity);
+  const planScoped = normalizePlanScopedTimeline(
+    value.planScoped,
+    weightingEncoding,
+    allowanceCapacity
+  );
+  const quota = normalizeLocalQuotaTimeline(value.quota);
+  return {
+    bucketMinutes: count(value.bucketMinutes, 15),
+    coveredAt: {
+      startAt: text(value?.coveredAt?.startAt, ""),
+      endAt: text(value?.coveredAt?.endAt, "")
+    },
+    usage,
+    calibrationUsage,
+    allowanceCapacity,
+    planScoped,
+    quota,
+    history: normalizeTimelineHistory(value.history)
+  };
+}
+
+function normalizeLocalQuotaTimeline(value, maximumRows = 10_000) {
+  return array(value).slice(-maximumRows).flatMap((row) => {
     const observedAt = text(row?.observedAt, "");
     const usedPercent = finite(row?.usedPercent, null);
     const remainingPercent = finite(row?.remainingPercent, null);
@@ -4005,18 +4209,6 @@ function normalizeLocalTimeline(value = {}) {
         : "unattributed"
     }];
   });
-  return {
-    bucketMinutes: count(value.bucketMinutes, 15),
-    coveredAt: {
-      startAt: text(value?.coveredAt?.startAt, ""),
-      endAt: text(value?.coveredAt?.endAt, "")
-    },
-    usage,
-    calibrationUsage,
-    allowanceCapacity: normalizeAllowanceCapacity(value.allowanceCapacity),
-    quota,
-    history: normalizeTimelineHistory(value.history)
-  };
 }
 
 /**
@@ -5624,8 +5816,24 @@ export function selectAllowancePlanPopulation(data, requestedPlanType = null) {
   const population = populations.find((row) => row.planType === selectedPlanType)
     ?? normalizeWeeklyPopulation({ planType: selectedPlanType });
   const isCurrentPlan = selectedPlanType === currentPlanType;
+  const allowanceCapacity = root.timeline?.allowanceCapacity ?? null;
+  const planScoped = root.timeline?.planScoped ?? null;
+  // The old gate asked whether the whole retained history contained one plan.
+  // That made a perfectly coherent current-plan fit unusable as soon as an
+  // earlier plan existed, then paired the selected capacity with all-plan
+  // usage anyway. The new gate is stricter where it matters: the scoped usage
+  // and fitted capacity must name the same current plan, method, basis, reset
+  // cohort and unified-index generation. Historical selections remain
+  // unavailable because no historical scoped numerator is published.
   const comparisonAvailable = isCurrentPlan
-    && population.planAttribution?.comparisonEligibility === "single_plan_conditional";
+    && population.status === "available"
+    && allowanceCapacity?.status === "available"
+    && planScoped?.status === "available"
+    && planScoped.planScope?.planType === selectedPlanType
+    && matchingPlanScope(
+      planScoped.planScope,
+      allowanceCapacity.planScope
+    );
   const selected = {
     ...root,
     weekly: {
@@ -5640,7 +5848,16 @@ export function selectAllowancePlanPopulation(data, requestedPlanType = null) {
       : [],
     timeline: {
       ...root.timeline,
-      allowanceCapacity: comparisonAvailable ? root.timeline?.allowanceCapacity : null,
+      // Keep `usage` and `calibrationUsage` as the conserved all-plan ledger.
+      // Trends consumes this explicit selected-plan lane; Usage & costs and
+      // every all-plan total continue to read the established fields.
+      selectedPlanUsage: comparisonAvailable ? planScoped.usage : [],
+      selectedPlanCalibrationUsage: comparisonAvailable ? planScoped.usage : [],
+      // The scoped quota lane was built before the generic cross-plan collapse.
+      // Keep the original root DTO untouched for all-plan consumers.
+      quota: comparisonAvailable ? planScoped.quota : [],
+      comparisonIntervals: comparisonAvailable ? planScoped.comparisonIntervals : [],
+      allowanceCapacity: comparisonAvailable ? allowanceCapacity : null,
     },
     allowancePlanSelection: {
       planType: selectedPlanType,
@@ -5951,6 +6168,17 @@ export class LocalCompanionClient {
   }
 
   async refresh() {
+    return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh/quick`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1"
+      },
+      body: JSON.stringify({})
+    });
+  }
+
+  async recalculateDetailedAccounting() {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh`, {
       method: "POST",
       headers: {

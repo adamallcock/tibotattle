@@ -9,10 +9,13 @@ import {
   assertReplaySafeAccountingCache,
   buildReplaySafeAccountingCache,
   buildReplaySafeAccountingPeriod,
+  createAccountingPricer,
+  decodePlanScopedTimelineRow,
   fitCompositionFromCompactCorpus,
   readReplaySafeAccountingCache as readReplaySafeAccountingCacheImpl,
   refreshReplaySafeAccountingCache as refreshReplaySafeAccountingCacheImpl,
 } from "../src/replay-safe-accounting-cache.js";
+import { addUsdStrings } from "@app-usagemonitor/accounting";
 import {
   readLocalCollectorAccountingCache,
   writeLocalCollectorAccountingCache,
@@ -1517,6 +1520,133 @@ function compactSnapshotRow(
   return row;
 }
 
+test("plan-scoped speed provenance comes from declarations, never dollar equality", async () => {
+  const timestampMs = Date.parse("2026-08-10T00:05:00.000Z");
+  const row = new Array(21).fill(null);
+  row[0] = new Date(timestampMs).toISOString();
+  row[1] = "gpt-5.6-sol";
+  for (let index = 3; index <= 8; index += 1) row[index] = 0;
+  row[3] = 1;
+  row[9] = "unknown";
+  row[10] = 0;
+  row[12] = "fully_priced";
+  row[14] = 0;
+  row[15] = 0;
+  row[16] = [];
+  row[17] = [];
+  row[18] = [];
+  row[19] = [];
+  row[20] = ["same_record", "pro", row[0], "previous_session_record"];
+  const snapshots = [compactSnapshotRow(
+    timestampMs,
+    1,
+    Math.floor((timestampMs + 7 * 24 * 60 * 60 * 1_000) / 1_000),
+  )];
+  const declared = await fitCompositionFromCompactCorpus({
+    rawUsageEvents: [row],
+    weeklyRateLimitSnapshots: snapshots,
+    endMs: timestampMs + 60_000,
+    declaredSpeedBaselines: [{
+      firstSeenAt: "2026-08-09T00:00:00.000Z",
+      lastSeenAt: "2026-08-11T00:00:00.000Z",
+      mode: "standard",
+    }],
+  });
+  assert.equal(
+    declared.planScopedTimeline.rows[0].weightingCoverage
+      .declaredFromConfigEvents,
+    1,
+    "a zero-dollar event is declared only because the timestamped declaration exists",
+  );
+  assert.equal(
+    declared.planScopedTimeline.rows[0].weightingCoverage.assumedEvents,
+    0,
+  );
+  const unknown = await fitCompositionFromCompactCorpus({
+    rawUsageEvents: [row],
+    weeklyRateLimitSnapshots: snapshots,
+    endMs: timestampMs + 60_000,
+  });
+  assert.equal(
+    unknown.planScopedTimeline.rows[0].weightingCoverage
+      .declaredFromConfigEvents,
+    0,
+  );
+  assert.equal(
+    unknown.planScopedTimeline.rows[0].weightingCoverage.assumedEvents,
+    1,
+    "equal scenario dollars without explicit provenance remain assumed",
+  );
+});
+
+test("compact plan buckets preserve event-summed tokens and reject malformed evidence", () => {
+  const compact = [Date.parse("2026-08-10T00:00:00Z"), 2, 1, 2, 3, 4, 5, 6,
+    .5, 1, 2, 1, 0, 1, 1, 21];
+  const decoded = decodePlanScopedTimelineRow(compact);
+  assert.equal(decoded.totalTokens, 21, "combined and split output totals cannot overwrite one another");
+  assert.equal(decoded.usageEvents, 2);
+  assert.deepEqual(decoded.weightingCoverage, { observedEvents: 1, declaredFromConfigEvents: 0, assumedEvents: 1 });
+  assert.deepEqual(decoded.pricingCoverage, { fullyPricedEvents: 1, partiallyPricedEvents: 1, unpricedEvents: 0 });
+  for (const invalid of [compact.slice(0, -1), [...compact, "private"],
+    compact.map((v, i) => i === 11 ? 3 : v), compact.map((v, i) => i === 8 ? "0.5" : v),
+    compact.map((v, i) => i === 0 ? v + 1 : v)]) {
+    assert.equal(decodePlanScopedTimelineRow(invalid), null);
+  }
+});
+
+test("plan-scoped intervals retain separated same-plan eras and fence ambiguous buckets", async () => {
+  const base = Date.parse("2026-08-10T00:00:00Z");
+  const at = (minutes) => base + minutes * 60_000;
+  const usage = (minutes, planType, conflicted = false) => {
+    const row = new Array(21).fill(null);
+    row[0] = new Date(at(minutes)).toISOString(); row[1] = "gpt-5.6-sol";
+    for (let i = 3; i <= 8; i += 1) row[i] = 0;
+    row[3] = 10; row[9] = "unknown"; row[10] = 1; row[12] = "fully_priced";
+    row[14] = 1; row[15] = 2;
+    row[20] = [conflicted ? "conflicted" : "same_record", planType, row[0], "previous_session_record"];
+    return row;
+  };
+  const snapshots = [[0, "pro"], [30, "pro"], [45, "plus"], [60, "plus"], [75, "pro"], [120, "pro"]]
+    .map(([minutes, plan]) => {
+      const row = compactSnapshotRow(at(minutes), minutes / 2, Math.floor(at(10_080) / 1000), plan);
+      row[2] = "openai_codex"; row[4] = "codex"; row[6] = 10_080;
+      return row;
+    });
+  const result = await fitCompositionFromCompactCorpus({
+    rawUsageEvents: [usage(5, "pro"), usage(20, "pro"), usage(50, "plus"),
+      usage(80, "pro"), usage(95, "pro", true), usage(110, "pro")],
+    weeklyRateLimitSnapshots: snapshots, endMs: at(120), selectedPlanType: "pro",
+  });
+  assert.deepEqual(result.planScopedTimeline.comparisonIntervals,
+    [[at(0), at(30)], [at(75), at(90)], [at(105), at(135)]]);
+  assert.deepEqual(result.planScopedTimeline.rows.map((row) => row.startAt),
+    [0, 15, 75, 105].map((m) => new Date(at(m)).toISOString()));
+  assert.deepEqual(result.planScopedTimeline.quota.map((row) => row[0]), [0, 75, 120].map(at));
+  assert.equal(result.planScopedTimeline.diagnostics.conflictedEvents, 1);
+  const contradictory = await fitCompositionFromCompactCorpus({
+    rawUsageEvents: [usage(5, "pro"), usage(20, "pro")],
+    weeklyRateLimitSnapshots: [snapshots[0]],
+    endMs: at(30), selectedPlanType: "pro",
+    planAttributionIndex: { status: "limit_exceeded", eras: [], contexts: new Map() },
+  });
+  assert.equal(contradictory.planScopedTimeline.attributionReady, false);
+  assert.deepEqual(contradictory.planScopedTimeline.rows, []);
+  const quota = (minutes, used) => {
+    const row = [...snapshots[0]];
+    row[0] = new Date(at(minutes)).toISOString(); row[1] = at(minutes); row[8] = used;
+    return row;
+  };
+  const conflictAtBoundary = await fitCompositionFromCompactCorpus({
+    rawUsageEvents: [usage(5, "pro"), usage(20, "pro"), usage(35, "pro")],
+    weeklyRateLimitSnapshots: [quota(0, 0), quota(15, 1), quota(15, 2), quota(15, 1), quota(60, 4)],
+    endMs: at(60), selectedPlanType: "pro",
+  });
+  assert.deepEqual(conflictAtBoundary.planScopedTimeline.comparisonIntervals,
+    [[at(0), at(15)], [at(30), at(75)]]);
+  assert.deepEqual(conflictAtBoundary.planScopedTimeline.quota.map((row) => row[0]), [at(0), at(60)],
+    "a repeated first value cannot restore a contradictory boundary anchor");
+});
+
 // The pre-streaming per-event reference: materialize {observedAtMs, model,
 // costUsd} objects for the whole corpus and hand them to the kernel — the
 // exact code the streaming pass replaced. The fit must stay bit-identical to
@@ -1644,7 +1774,8 @@ test("the streaming composition binning matches the per-event kernel path exactl
     weeklyRateLimitSnapshots,
     endMs,
   });
-  assert.deepEqual(streamed, {
+  const { planScopedTimeline, ...streamedComposition } = streamed;
+  assert.deepEqual(streamedComposition, {
     status: reference.fit.status,
     planType: "pro",
     attributionExcludedBins: 0,
@@ -1661,6 +1792,16 @@ test("the streaming composition binning matches the per-event kernel path exactl
     blendedRecentMixUsd: Number(reference.blendedRecentMixUsd.toFixed(2)),
     recentMixDays: 14,
   });
+  assert.equal(planScopedTimeline.planType, "pro");
+  assert.deepEqual(planScopedTimeline.rows, []);
+  assert.equal(
+    planScopedTimeline.diagnostics.malformedEvents,
+    rawUsageEvents.filter((row) => Array.isArray(row)
+      && Number.isFinite(Date.parse(row[0]))
+      && Number.isFinite(Number(row[10]))
+      && Number(row[10]) >= 0).length,
+    "the legacy compact fixture deliberately lacks the v0.15 attribution tuple",
+  );
 
   // The grains themselves are identical, not merely the fit summary:
   // aggregating per (grain bin, model) in encounter order and re-running the
@@ -1999,6 +2140,47 @@ async function writeUnifiedCalibrationFixture(indexFile, {
 // the calibration corpus spans all N months. The fixture resets sit MORE than
 // a year before "now" — outside every representable scan window — and the
 // scan itself returns nothing, so an estimate can only come from the index.
+test("a fitted unified plan timeline survives cache validation and the production dashboard projection", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-plan-timeline-roundtrip-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const indexFile = join(directory, "local-unified-index-v1.sqlite");
+  const stateFile = join(directory, "local-collector-state-v1.sqlite");
+  await writeUnifiedCalibrationFixture(indexFile, {
+    resets: [1, 8, 15].map((day) => Date.UTC(2026, 7, day)), boundaries: 10,
+  });
+  const now = () => Date.parse("2026-08-30T12:00:00Z");
+  const cache = await refreshReplaySafeAccountingCacheImpl({
+    sourceMode: "unified", unifiedIndexFile: indexFile, expectedGeneration: 1,
+    stateFile, now,
+  });
+  assert.equal(cache.planScopedTimeline.status, "available");
+  assert.equal(cache.planScopedTimeline.encoding, "plan_bucket_v1");
+  assert.equal(cache.planScopedTimeline.usage.length, 27);
+  assert.ok(cache.planScopedTimeline.quota.length > 0);
+  assert.doesNotThrow(() => assertReplaySafeAccountingCache(cache));
+  const read = await readReplaySafeAccountingCacheImpl({ stateFile, sourceMode: "unified", expectedGeneration: 1, now });
+  assert.equal(read.status, "available");
+  assert.deepEqual(read.cache.planScopedTimeline, cache.planScopedTimeline);
+  const { buildLocalCompanionSnapshot } = await import("../src/local-companion-data.js");
+  const snapshot = await buildLocalCompanionSnapshot({ root: directory, collectorStateFile: stateFile,
+    unifiedIndexFile: indexFile, accountingSourceMode: "unified", allowDevelopmentArtifactFallback: false, now });
+  const scoped = snapshot.overview.timeline.planScoped;
+  assert.equal(scoped.status, "available");
+  assert.equal(scoped.usage.length, 27);
+  assert.equal(scoped.usage.reduce((sum, row) => sum + decodePlanScopedTimelineRow(row).totalTokens, 0),
+    cache.planScopedTimeline.usage.reduce((sum, row) => sum + decodePlanScopedTimelineRow(row).totalTokens, 0));
+  assert.equal(scoped.encoding, "plan_bucket_v1");
+  assert.deepEqual(scoped.usage, cache.planScopedTimeline.usage,
+    "HTTP and retained snapshots do not expand compact history into repeated object keys");
+  assert.deepEqual(scoped.quota, cache.planScopedTimeline.quota);
+  const { normalizeDashboardPayload, selectAllowancePlanPopulation } = await import("../apps/web/public/data-client.js");
+  const selected = selectAllowancePlanPopulation(normalizeDashboardPayload(snapshot));
+  assert.equal(selected.allowancePlanSelection.comparisonAvailable, true);
+  assert.equal(selected.timeline.selectedPlanUsage.length, 27);
+  assert.equal(selected.timeline.quota.length, scoped.quota.length);
+  assert.ok(selected.timeline.quota.every((row) => row.planType === "pro"));
+});
+
 test("the unified index supplies the full-history calibration corpus with no scan window", async () => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-unified-calibration-"));
   const indexFile = join(directory, "local-unified-index-v1.sqlite");
@@ -2038,6 +2220,171 @@ test("the unified index supplies the full-history calibration corpus with no sca
   // calibration corpus escapes it.
   assert.equal(cache.coveredAt.endAt, "2026-08-20T12:00:00.000Z");
   assert.equal(cache.schemaVersion, REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION);
+});
+
+test("the exact-ledger fast lane reproduces the decimal-string fold to the digit", async () => {
+  // Deterministic pseudo-random quantities: a fixed LCG, no wall clock.
+  let seed = 0x9e3779b9;
+  const next = (bound) => {
+    seed = (Math.imul(seed, 1_664_525) + 1_013_904_223) >>> 0;
+    return seed % bound;
+  };
+  const pricer = createAccountingPricer();
+  const oracle = createAccountingPricer();
+  const dayMs = 24 * 60 * 60 * 1_000;
+  const events = [];
+  for (let index = 0; index < 4_000; index += 1) {
+    const combinedOnly = next(7) === 0;
+    const unknownModel = next(29) === 0;
+    const timestamp = new Date(NOW - next(400) * dayMs - next(dayMs)).toISOString();
+    events.push({
+      timestamp,
+      model: unknownModel ? "gpt-unknown-model" : "gpt-5.6-sol",
+      // Long-context bands price differently; cover both sides of 272k.
+      totalInputContextTokens: next(3) === 0 ? 272_000 + next(50_000) : next(200_000),
+      components: {
+        input_uncached_tokens: next(300_000),
+        input_cache_read_tokens: next(300_000),
+        input_cache_write_tokens: next(50_000),
+        output_text_tokens: combinedOnly ? 0 : next(40_000),
+        output_reasoning_tokens: combinedOnly ? 0 : next(40_000),
+        output_combined_tokens: combinedOnly ? 1 + next(40_000) : 0,
+      },
+      tierSemantics: {
+        billingSurface: "chatgpt_subscription",
+        codexSpeedMode: "standard",
+        apiServiceTier: "unknown",
+        tierSource: "unknown",
+      },
+      surfaceClassification: {
+        surface: "cli_exec",
+        threadSource: "user",
+        agentScope: "root",
+        lineageDisposition: "standalone",
+      },
+    });
+  }
+  // Per-event card breakdown: exact sum of the event's component costs.
+  let checkedCards = 0;
+  for (const event of events) {
+    const priced = pricer(event, event.components);
+    const perCard = new Map();
+    for (const row of priced.components) {
+      if (row.pricingStatus !== "priced") continue;
+      perCard.set(row.priceCardId, addUsdStrings(perCard.get(row.priceCardId) ?? "0", row.costUsd));
+    }
+    for (const item of priced.priceCardBreakdown) {
+      assert.equal(item.costUsd, perCard.get(item.priceCardId), item.priceCardId);
+      checkedCards += 1;
+    }
+    assert.equal(priced.totalUsd, addUsdStrings(...priced.components
+      .filter((row) => row.pricingStatus === "priced").map((row) => row.costUsd)));
+    // The fast plan's closed shape is unchanged (the full pricer's richer
+    // shape is untouched by this lane and merely passes through it).
+    for (const key of [
+      "components", "coverageStatus", "priceCardBreakdown", "selectedPriceCardIds",
+      "totalUsd", "warnings",
+    ]) assert.ok(Object.hasOwn(priced, key), key);
+    assert.deepEqual(Object.getOwnPropertySymbols(priced).filter((symbol) => (
+      Object.getOwnPropertyDescriptor(priced, symbol).enumerable
+    )), []);
+  }
+  assert.ok(checkedCards > 1_000);
+
+  // Period totals: the retained exact string equals the per-event fold of
+  // the same priced totals, across fast-lane (split output), string-lane
+  // (combined-only output, unknown model) and long-context events alike.
+  const period = await buildReplaySafeAccountingPeriod({
+    id: "history",
+    startAt: new Date(NOW - 401 * dayMs).toISOString(),
+    endAt: new Date(NOW).toISOString(),
+    maximumRssBytes: 64 * 1024 * 1024 * 1024,
+    scan: async ({ onUsage }) => {
+      for (const event of events) onUsage(event);
+    },
+  });
+  let expectedExact = "0";
+  const expectedCards = new Map();
+  for (const event of events) {
+    const components = { ...event.components };
+    const separated = components.output_text_tokens + components.output_reasoning_tokens;
+    if (components.output_combined_tokens > 0 && separated > 0) components.output_combined_tokens = 0;
+    const pricingComponents = components.output_combined_tokens > 0
+      ? { ...components, output_text_tokens: components.output_combined_tokens, output_combined_tokens: 0 }
+      : components;
+    const priced = oracle({ ...event, model: event.model }, pricingComponents);
+    expectedExact = addUsdStrings(expectedExact, priced.totalUsd);
+    for (const item of priced.priceCardBreakdown) {
+      expectedCards.set(item.priceCardId, addUsdStrings(expectedCards.get(item.priceCardId) ?? "0", item.costUsd));
+    }
+  }
+  assert.equal(period.period.events, events.length);
+  assert.equal(period.period.apiPriceEquivalentUsdExact, expectedExact);
+  assert.notEqual(expectedExact, "0");
+  assert.deepEqual(
+    Object.fromEntries(period.period.priceCardBreakdown.map((row) => [row.priceCardId, row.costUsd])),
+    Object.fromEntries(expectedCards),
+  );
+  // The settled rows carry nothing but their closed shape.
+  for (const row of period.period.priceCardBreakdown) {
+    assert.deepEqual(Object.keys(row).sort(), ["costUsd", "events", "priceCardId"]);
+    assert.equal(JSON.stringify(row), JSON.stringify({ priceCardId: row.priceCardId, events: row.events, costUsd: row.costUsd }));
+  }
+  assert.equal(Object.getOwnPropertySymbols(period.period).length, 0);
+});
+
+test("aggregate scans declare no attribution and only the windowed fallback corpus requires it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-attribution-declaration-"));
+  const indexFile = join(directory, "local-unified-index-v1.sqlite");
+  await writeUnifiedCalibrationFixture(indexFile, {
+    resets: [
+      Date.parse("2025-05-01T00:00:00.000Z"),
+      Date.parse("2025-05-08T00:00:00.000Z"),
+      Date.parse("2025-05-15T00:00:00.000Z"),
+    ],
+  });
+  const recording = (scan, modes) => async (options) => {
+    modes.push(options.usageAttribution ?? "(undeclared)");
+    return scan(options);
+  };
+  try {
+    // The unified corpus supplies calibration: the windowed pass is a pure
+    // aggregate consumer and must not ask for per-row attribution.
+    const withCorpus = [];
+    await buildReplaySafeAccountingCache({
+      now: () => Date.parse("2026-08-20T12:00:00.000Z"),
+      unifiedIndexFile: indexFile,
+      scan: recording(scanner([]), withCorpus),
+    });
+    assert.deepEqual(withCorpus, ["none"]);
+
+    // No usable unified corpus: the windowed pass retains the compact
+    // calibration rows itself and therefore needs attribution on every row.
+    const fallback = [];
+    await buildReplaySafeAccountingCache({
+      now: () => Date.parse("2026-08-20T12:00:00.000Z"),
+      scan: recording(scanner([]), fallback),
+    });
+    assert.deepEqual(fallback, ["required"]);
+
+    // Unified authority without a calibration corpus: the windowed pass still
+    // requires attribution, the full-history period total never does.
+    const unified = [];
+    await buildReplaySafeAccountingCache({
+      sourceMode: "unified",
+      expectedGeneration: "generation-test-1",
+      scan: recording(completeUnifiedScanner([
+        usageEvent({
+          timestamp: "2026-07-27T11:00:00.000Z",
+          components: { input_uncached_tokens: 1_000 },
+        }),
+      ]), unified),
+      now: () => NOW,
+    });
+    assert.deepEqual(unified, ["required", "none"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("declared speed baselines resolve unified calibration events before scenario fitting", async () => {
@@ -2952,7 +3299,7 @@ test("replay cache rejects the old prefix-priced version and unreviewed model cr
       components: { input_uncached_tokens: 1_000 },
     })]),
   });
-  assert.equal(cache.schemaVersion, "local-replay-safe-accounting-v0.14");
+  assert.equal(cache.schemaVersion, "local-replay-safe-accounting-v0.15");
   assert.doesNotThrow(() => assertReplaySafeAccountingCache(cache));
   const oldVersion = structuredClone(cache);
   oldVersion.schemaVersion = "local-replay-safe-accounting-v0.12";
@@ -3360,6 +3707,62 @@ test("a caller that names its own ceiling keeps it, which is how the rebuild sub
   // Two readings: the pre-flight check and the post-scan check. A third would
   // mean the named path had started deriving a baseline it was told not to.
   assert.equal(samples.length, 2);
+});
+
+test("fused history keeps hard archive RSS failures at every boundary and retains the last good cache", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-fused-archive-guard-"));
+  const cacheFile = join(directory, "collector.sqlite");
+  try {
+    await refreshReplaySafeAccountingCache({
+      cacheFile, now: () => NOW,
+      scan: scanner([usageEvent({
+        timestamp: "2026-07-27T11:55:00.000Z", components: { input_uncached_tokens: 1_000_000 },
+      })]),
+    });
+    const before = await readTestCache(cacheFile);
+    const oldTimestamp = new Date(NOW - 366 * 24 * 60 * 60_000).toISOString();
+    const oldEvent = () => usageEvent({ timestamp: oldTimestamp, components: { input_uncached_tokens: 1 } });
+    for (const boundary of ["start", "cadence", "finish"]) {
+      for (const failure of ["overflow", "invalid"]) await t.test(`${boundary}: ${failure}`, async () => {
+        let currentRss = 0;
+        let delivered = 0;
+        let scans = 0;
+        const badRss = failure === "overflow" ? 1025 : Number.NaN;
+        const scan = async (options) => {
+          scans += 1;
+          assert.equal(typeof options.indexedHistory?.onUsage, "function");
+          const result = await completeUnifiedScanner([], { startAt: oldTimestamp })(options);
+          if (boundary === "start") currentRss = badRss;
+          for (let index = 0; index < (boundary === "cadence" ? 2048 : 1); index += 1) {
+            if (boundary === "cadence" && index === 2047) currentRss = badRss;
+            delivered += 1;
+            options.indexedHistory.onUsage(oldEvent());
+          }
+          if (boundary === "finish") currentRss = badRss;
+          return {
+            ...result,
+            indexedHistory: {
+              status: "available", errorCode: null,
+              coverage: result.coverage, capabilities: result.capabilities,
+              diagnosticsAvailable: result.diagnosticsAvailable,
+            },
+          };
+        };
+        await assert.rejects(refreshReplaySafeAccountingCache({
+          cacheFile, sourceMode: "unified", expectedGeneration: "generation-test-1",
+          unifiedIndexFile: join(directory, "absent-unified.sqlite"),
+          now: () => NOW, scan, rss: () => currentRss, maximumRssBytes: 1024,
+        }), (error) => error.code === (failure === "overflow"
+          ? "accounting_archive_rss_limit_exceeded" : "accounting_archive_rss_measurement_invalid"));
+        assert.equal(scans, 1, "the failure occurred in the fused read, not a separate history scan");
+        assert.equal(delivered, boundary === "cadence" ? 2048 : 1);
+        assert.deepEqual(await readTestCache(cacheFile), before);
+        assert.equal((await stat(cacheFile)).mode & 0o777, 0o600);
+      });
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("an RSS ceiling miss during accounting is a soft target: the prior cache is retained and served", async () => {

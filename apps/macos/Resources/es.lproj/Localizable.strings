@@ -29,7 +29,7 @@
 "nativeDashboard.progressQuotaRefresh" = "Actualizando el límite…";
 "nativeDashboard.progressSaving" = "Guardando el progreso del análisis…";
 "nativeDashboard.refreshUsage" = "Actualizar";
-"nativeDashboard.refreshUsageTooltip" = "Actualiza desde las carpetas de sesiones de Codex seleccionadas y las fuentes locales de cuenta, límite, configuración y linaje de ejecuciones de Codex. El procesamiento permanece en este Mac.";
+"nativeDashboard.refreshUsageTooltip" = "Actualiza el límite actual, el historial local y la contabilidad detallada. Reutiliza los resultados en caché válidos; todo el procesamiento permanece en este Mac.";
 "nativeDashboard.share" = "Compartir";
 "nativeDashboard.showSidebar" = "Mostrar barra lateral";
 "nativeDashboard.shareTooltip" = "Abrir la tarjeta local para compartir.";
@@ -369,7 +369,7 @@
 "settings.startAtLoginUnregistrationNotConfirmedMessage" = "macOS no confirmó que TiboTattle se eliminó de los elementos de inicio de sesión. Revisa Configuración del Sistema → Elementos de inicio de sesión antes de confiar en ello.";
 "settings.startAtLoginUnregistrationNotConfirmedTitle" = "No se confirmó la eliminación del inicio al iniciar sesión";
 "settings.refreshInterval" = "Intervalo de actualización";
-"settings.refreshIntervalDetail" = "Se guarda en este Mac y se usa mientras TiboTattle está abierto.";
+"settings.refreshIntervalDetail" = "Comprueba el límite actual mientras TiboTattle está abierto. La contabilidad detallada se actualiza automáticamente como máximo una vez por hora; elige Actualizar para actualizarlo todo ahora.";
 "settings.refreshIntervalOneMinute" = "Cada minuto";
 "settings.refreshIntervalFiveMinutes" = "Cada 5 minutos";
 "settings.refreshIntervalFifteenMinutes" = "Cada 15 minutos";

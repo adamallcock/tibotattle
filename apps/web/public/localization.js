@@ -321,6 +321,12 @@ export const WEB_MESSAGES = Object.freeze({
     "已验证的概要证据仍然可用，但统一历史步骤以固定的降级状态结束（{code}）。自动重试已停止；仍可明确重试。",
     "La evidencia resumida verificada sigue disponible, pero el paso de historial unificado terminó en un estado degradado fijo ({code}). Los reintentos automáticos se han detenido; aún puedes reintentar expresamente.",
   ],
+  "refresh.alreadyRunningTitle": ["An update is already running", "更新正在进行中", "Ya hay una actualización en curso"],
+  "refresh.alreadyRunningCopy": [
+    "This request did not start another update. Your current results remain available; when the current update finishes, choose Refresh again if detailed accounting still needs updating.",
+    "此请求没有启动另一次更新。当前结果仍然可用；当前更新完成后，如果详细核算仍需更新，请再次选择“刷新”。",
+    "Esta solicitud no inició otra actualización. Tus resultados actuales siguen disponibles; cuando termine la actualización en curso, elige Actualizar de nuevo si la contabilidad detallada aún necesita actualizarse.",
+  ],
   // Why the replay-safe accounting artifacts are missing when the rebuild has
   // deferred repeatedly: the rebuild misses its memory ceiling, softly, and
   // retries — this names the cause and the streak instead of showing bare

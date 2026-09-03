@@ -60,8 +60,38 @@ function fixedError(code, name = "Error") {
   return error;
 }
 
-function canonicalInstant(value) {
+// The exact shape Date#toISOString produces for years 0000 through 9999. A
+// string of this shape whose fields are in range is the unique canonical
+// representation of its instant, so parsing it and formatting the result
+// would hand back the same string; that is what the round trip below checks,
+// and the shape test answers it without constructing a Date. Every other
+// input — expanded ±YYYYYY years, offsets, missing millis, garbage — still
+// takes the round trip and is judged by it. The two paths agree on every
+// input (see the reader's test suite, which drives both over the whole
+// field grid, the Date range edges and randomized corruptions).
+const CANONICAL_INSTANT_SHAPE =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.\d{3}Z$/u;
+const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+function daysInMonth(year, month) {
+  if (month !== 2) return DAYS_IN_MONTH[month - 1];
+  return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0 ? 29 : 28;
+}
+
+export function canonicalInstant(value) {
   if (typeof value !== "string") return null;
+  const shape = CANONICAL_INSTANT_SHAPE.exec(value);
+  if (shape !== null) {
+    const month = Number(shape[2]);
+    const day = Number(shape[3]);
+    return month >= 1 && month <= 12
+      && day >= 1 && day <= daysInMonth(Number(shape[1]), month)
+      && Number(shape[4]) <= 23
+      && Number(shape[5]) <= 59
+      && Number(shape[6]) <= 59
+      ? value
+      : null;
+  }
   const timestamp = Date.parse(value);
   return Number.isFinite(timestamp)
       && new Date(timestamp).toISOString() === value
@@ -711,18 +741,27 @@ function validateUsageJoins(
   const usageCount = Number(database.prepare(`
     SELECT COUNT(*) AS count FROM usage_event u${where}
   `).get(...parameters)?.count ?? 0);
-  const joinedEvents = Number(database.prepare(`
+  // Every dimension id is an INTEGER PRIMARY KEY, so an inner join over the
+  // four dimensions matches each usage row at most once and the joined count
+  // equals the usage count exactly when no row references a missing
+  // dimension. Ask that question directly: the planner turns the four-way
+  // join into a scan of the smallest dimension times the whole usage range
+  // (~4.5 s per call on a 727k-row index), while four correlated primary-key
+  // probes finish the same proof in ~0.3 s. The pass/fail result is identical.
+  const orphanedEvents = Number(database.prepare(`
     SELECT COUNT(*) AS count
     FROM usage_event u
-    JOIN model m ON m.id = u.model_id
-    JOIN tier_semantics t ON t.id = u.tier_id
-    JOIN surface_class s ON s.id = u.surface_id
-    JOIN account_scope a ON a.id = u.account_scope_id
-    ${where}
+    ${verifyPublishedGeneration ? "WHERE" : `${where}
+      AND`} (
+      NOT EXISTS (SELECT 1 FROM model m WHERE m.id = u.model_id)
+      OR NOT EXISTS (SELECT 1 FROM tier_semantics t WHERE t.id = u.tier_id)
+      OR NOT EXISTS (SELECT 1 FROM surface_class s WHERE s.id = u.surface_id)
+      OR NOT EXISTS (
+        SELECT 1 FROM account_scope a WHERE a.id = u.account_scope_id))
   `).get(...parameters)?.count ?? 0);
   if (!Number.isSafeInteger(usageCount)
-      || !Number.isSafeInteger(joinedEvents)
-      || joinedEvents !== usageCount) {
+      || !Number.isSafeInteger(orphanedEvents)
+      || orphanedEvents !== 0) {
     throw fixedError("local_unified_index_row_invalid");
   }
 }
@@ -780,27 +819,39 @@ function hasUsage(components) {
   return Object.values(components).some((value) => value > 0);
 }
 
-async function invoke(callback, value, signal) {
-  if (callback === undefined) return;
-  try {
-    const result = callback(value);
-    if (result && typeof result.then === "function") await result;
-  } catch (error) {
-    if (error?.name === "AbortError"
-        || error?.code === "ABORT_ERR"
-        || signal?.aborted) {
-      const aborted = fixedError(
-        "local_unified_index_read_aborted",
-        "AbortError",
-      );
-      aborted[ADAPTER_ABORT] = true;
-      throw aborted;
-    }
-    if (CALLBACK_RESOURCE_CODES.has(error?.code)) {
-      throw fixedError(error.code);
-    }
-    throw fixedError("local_unified_index_callback_failed");
+function mapCallbackError(error, signal) {
+  if (error?.name === "AbortError"
+      || error?.code === "ABORT_ERR"
+      || signal?.aborted) {
+    const aborted = fixedError(
+      "local_unified_index_read_aborted",
+      "AbortError",
+    );
+    aborted[ADAPTER_ABORT] = true;
+    return aborted;
   }
+  if (CALLBACK_RESOURCE_CODES.has(error?.code)) {
+    return fixedError(error.code);
+  }
+  return fixedError("local_unified_index_callback_failed");
+}
+
+// Deliver one row. A synchronous consumer costs no promise at all; only a
+// consumer that returns a thenable is awaited. Either way a throw or a
+// rejection maps to the same fixed, content-free codes.
+function invoke(callback, value, signal) {
+  let result;
+  try {
+    result = callback(value);
+  } catch (error) {
+    throw mapCallbackError(error, signal);
+  }
+  if (result && typeof result.then === "function") {
+    return result.then(undefined, (error) => {
+      throw mapCallbackError(error, signal);
+    });
+  }
+  return undefined;
 }
 
 function readDiagnostics(database, generationId) {
@@ -871,6 +922,28 @@ async function revalidatePublishedSnapshot({
   }
 }
 
+function capabilitiesFor(coverage) {
+  return {
+    readsRawSources: false,
+    deterministicCanonicalOrder: coverage.generationProof,
+    sourceOrderingProvenance: coverage.provenanceComplete,
+    sourceOffsetProvenance: coverage.provenanceComplete,
+    sourceScopedQuotaOccurrences: coverage.quotaOccurrencesComplete,
+    durableDiagnostics: coverage.diagnosticsComplete,
+    crashSafeGenerationPublication: coverage.generationProof,
+  };
+}
+
+function unavailableHistoryRead(errorCode) {
+  return {
+    status: "unavailable",
+    errorCode,
+    coverage: null,
+    capabilities: null,
+    diagnosticsAvailable: null,
+  };
+}
+
 function rememberBounded(cache, key, value, limit) {
   cache.delete(key);
   cache.set(key, value);
@@ -888,12 +961,309 @@ function rememberBounded(cache, key, value, limit) {
  * before publishing their result. Indexed predecessor lookups support repeated
  * or out-of-order corpus slices without retaining whole sessions.
  */
+/**
+ * Bounded index walks over a published generation pre-derive the two
+ * expensive per-row lookups the attribution reader performs — the same-record
+ * quota plans and the same-source predecessor — for every usage row, keyed
+ * by a dense sorted live-rowid index, plus per-row multi-source session flags
+ * (the only sessions for which the cross-source session predecessor query can
+ * return anything). The reader's decision logic is untouched: given this
+ * structure it consults these results instead of issuing point queries, and
+ * falls back to the queries for any rowid the pass did not see. An allocation
+ * that exceeds the caller's retained-byte budget declines the optimization
+ * altogether. RSS and cancellation checks run before allocation, between
+ * stages and at a bounded cooperative cadence during every whole-table walk.
+ *
+ * Why it is exact:
+ * - the pass walks usage_event in (source_local, source_offset,
+ *   observed_at_ms) order — the covering predecessor index's own order, with
+ *   (source_ordinal, session_local, rowid) as the implicit tail — so a row's
+ *   same-source predecessor is the last eligible row of the previous offset
+ *   group, exactly the row the reader's `ORDER BY source_offset DESC,
+ *   observed_at_ms DESC LIMIT 1` reverse index walk returns, under the same
+ *   eligibility (generation membership, matching ordinal, offset within the
+ *   member's scanned bytes, non-null offset);
+ * - same-record plans arrive joined on the reader's own four-column key and
+ *   filters, and are reduced with the same DISTINCT / ORDER BY / LIMIT 2 rule;
+ * - a session confined to one source has no row from another source, so the
+ *   session-predecessor query is provably empty for it.
+ * Everything retained is content-free: numeric row identities, timestamps,
+ * plan labels and flags. Salted digests are compared only while streaming;
+ * no whole-generation membership or session-identity map remains resident.
+ */
+export async function precomputeLocalUnifiedUsageAttribution({
+  database,
+  generationId,
+  maximumRetainedBytes,
+  signal = null,
+  checkRuntimeMemory = () => {},
+} = {}) {
+  if (typeof database?.prepare !== "function"
+      || !Number.isSafeInteger(generationId) || generationId < 1
+      || !Number.isSafeInteger(maximumRetainedBytes) || maximumRetainedBytes < 1
+      || !validAbortSignal(signal) || typeof checkRuntimeMemory !== "function") {
+    throw fixedError("local_unified_index_attribution_options_invalid", "TypeError");
+  }
+  const checkpoint = (additionalBytes = 0) => {
+    throwIfAborted(signal);
+    checkRuntimeMemory(additionalBytes);
+  };
+  const yieldCheckpoint = async () => {
+    checkpoint();
+    await new Promise((resolve) => setImmediate(resolve));
+    checkpoint();
+  };
+  let processed = 0;
+  checkpoint();
+  // Rowids are durable SQLite identities, not dense array offsets: a rescan
+  // can leave a handful of live rows at arbitrarily high IDs. Count live rows
+  // with a cooperative primary-key walk before allocating. If the optional
+  // optimization cannot fit, retain the authoritative point-query reader;
+  // a large archive must not become a new calibration exclusion.
+  const rowIdsStatement = database.prepare("SELECT rowid AS row_id FROM usage_event ORDER BY rowid");
+  const bytesPerRow = 32; // all typed columns below, including session scratch
+  const maximumRows = Math.min(Math.floor(maximumRetainedBytes / bytesPerRow), 0xffff_ffff);
+  let size = 0;
+  for (const row of rowIdsStatement.iterate()) {
+    if (!Number.isSafeInteger(Number(row.row_id)) || Number(row.row_id) < 0) {
+      throw fixedError("local_unified_index_row_invalid");
+    }
+    size += 1;
+    if (size > maximumRows) return null;
+    if (++processed % CALLBACK_YIELD_ROWS === 0) await yieldCheckpoint();
+  }
+  let retainedBytes = size * bytesPerRow;
+  checkpoint(retainedBytes); // reserve headroom BEFORE allocating any columns
+  const rowIds = new Float64Array(size);
+  const seen = new Uint8Array(size);
+  const predecessorMs = new Float64Array(size);
+  const predecessorFlags = new Uint8Array(size); // 0 absent; 1 source; 2 session
+  const planCount = new Uint8Array(size);
+  const planFirst = new Int32Array(size);
+  const planSecond = new Int32Array(size);
+  const otherSource = new Uint8Array(size);
+  const sessionPositions = new Uint32Array(size);
+  checkpoint();
+  let position = 0;
+  for (const row of rowIdsStatement.iterate()) {
+    const rowId = Number(row.row_id);
+    if (!Number.isSafeInteger(rowId) || rowId < 0 || position >= size
+        || (position > 0 && rowId <= rowIds[position - 1])) {
+      throw fixedError("local_unified_index_row_invalid");
+    }
+    rowIds[position++] = rowId;
+    if (++processed % CALLBACK_YIELD_ROWS === 0) await yieldCheckpoint();
+  }
+  if (position !== size) throw fixedError("local_unified_index_row_invalid");
+  const positionFor = (rowId) => {
+    if (!Number.isSafeInteger(rowId) || rowId < 0) return -1;
+    let low = 0;
+    let high = size - 1;
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      if (rowIds[middle] === rowId) return middle;
+      if (rowIds[middle] < rowId) low = middle + 1;
+      else high = middle - 1;
+    }
+    return -1;
+  };
+  const planTable = [];
+  const planIndexByLabel = new Map();
+  let planBudgetExceeded = false;
+  const internPlan = (label) => {
+    let index = planIndexByLabel.get(label);
+    if (index === undefined) {
+      // Bound the only retained string dictionary too. Invalid upstream labels
+      // are left to the unchanged reader's validation, not newly rejected for
+      // unrelated rows encountered by this optional whole-table pass.
+      const bytes = 256 + label.length * 2;
+      if (!SAFE_TOKEN.test(label) || retainedBytes + bytes > maximumRetainedBytes) {
+        planBudgetExceeded = true;
+        return 0;
+      }
+      checkpoint(bytes);
+      retainedBytes += bytes;
+      index = planTable.push(label) - 1;
+      planIndexByLabel.set(label, index);
+    }
+    return index;
+  };
+  const membership = database.prepare(`
+    SELECT source_ordinal, session_local, scanned_bytes
+    FROM generation_source
+    WHERE generation_id = ? AND source_local = ?
+      AND status IN ('skipped', 'touched', 'resumed', 'rescanned', 'complete')
+      AND diagnostics_complete = 1`);
+  const stream = database.prepare(`
+    SELECT u.rowid AS row_id, u.source_local, u.source_offset,
+           u.source_ordinal, u.session_local, u.observed_at_ms, q.plan_type
+    FROM usage_event u INDEXED BY usage_event_source_predecessor
+    LEFT JOIN quota_occurrence q
+      ON q.source_local = u.source_local AND q.source_offset = u.source_offset
+        AND q.source_ordinal = u.source_ordinal
+        AND q.observed_at_ms = u.observed_at_ms
+        AND q.provider = 'openai_codex' AND q.admission = 'admitted'
+        AND q.plan_type IS NOT NULL AND q.plan_type <> 'unknown'
+    ORDER BY u.source_local, u.source_offset, u.observed_at_ms`);
+  let currentSourceHex = null;
+  let member = null;
+  let groupOffset = null;
+  let previousGroupLast = null;
+  let currentGroupLast = null;
+  let lastRowId = -1;
+  let lastPosition = -1;
+  let firstPlan = null;
+  let secondPlan = null;
+  const settlePlans = () => {
+    if (firstPlan === null) return;
+    // The reader keeps the two smallest distinct labels (ORDER BY ... LIMIT 2,
+    // SQLite's BINARY collation = UTF-8 byte order) and treats a second one
+    // as a conflict; both survive so the reader validates exactly what the
+    // query would have handed it.
+    planCount[lastPosition] = secondPlan === null ? 1 : 2;
+    planFirst[lastPosition] = internPlan(firstPlan);
+    if (secondPlan !== null) planSecond[lastPosition] = internPlan(secondPlan);
+    firstPlan = null;
+    secondPlan = null;
+  };
+  for (const row of stream.iterate()) {
+    const rowId = Number(row.row_id);
+    if (rowId !== lastRowId) {
+      if (lastRowId !== -1) settlePlans();
+      if (planBudgetExceeded) return null;
+      lastRowId = rowId;
+      lastPosition = positionFor(rowId);
+      if (lastPosition === -1) throw fixedError("local_unified_index_row_invalid");
+      const sourceHex = row.source_local === null
+        ? null
+        : Buffer.from(row.source_local).toString("hex");
+      if (sourceHex !== currentSourceHex) {
+        currentSourceHex = sourceHex;
+        const found = sourceHex === null ? null : membership.get(generationId, row.source_local);
+        member = found == null ? null : {
+          sourceOrdinal: Number(found.source_ordinal),
+          scannedBytes: Number(found.scanned_bytes),
+          sessionLocal: found.session_local === null ? null : Buffer.from(found.session_local),
+        };
+        groupOffset = null;
+        previousGroupLast = null;
+        currentGroupLast = null;
+      }
+      const offset = row.source_offset === null ? null : Number(row.source_offset);
+      if (offset !== groupOffset) {
+        if (currentGroupLast !== null) previousGroupLast = currentGroupLast;
+        currentGroupLast = null;
+        groupOffset = offset;
+      }
+      seen[lastPosition] = 1;
+      if (previousGroupLast !== null) {
+        predecessorMs[lastPosition] = previousGroupLast.observedAtMs;
+        predecessorFlags[lastPosition] = previousGroupLast.sessionMatches ? 2 : 1;
+      }
+      if (member !== null && offset !== null
+          && Number(row.source_ordinal) === member.sourceOrdinal
+          && offset <= member.scannedBytes) {
+        currentGroupLast = {
+          observedAtMs: row.observed_at_ms,
+          sessionMatches: member.sessionLocal !== null
+            && row.session_local !== null
+            && member.sessionLocal.equals(row.session_local),
+        };
+      }
+    }
+    if (typeof row.plan_type === "string" && row.plan_type !== firstPlan) {
+      if (firstPlan === null || utf8ByteCompare(row.plan_type, firstPlan) < 0) {
+        secondPlan = firstPlan;
+        firstPlan = row.plan_type;
+      } else if (secondPlan === null || utf8ByteCompare(row.plan_type, secondPlan) < 0) {
+        secondPlan = row.plan_type;
+      }
+    }
+    if (++processed % CALLBACK_YIELD_ROWS === 0) await yieldCheckpoint();
+  }
+  if (lastRowId !== -1) settlePlans();
+  if (planBudgetExceeded) return null;
+  checkpoint();
+  // Walk the existing session index rather than GROUP BY/COUNT(DISTINCT),
+  // which can finish an entire large group before yielding its first row.
+  // Typed pending positions and per-row flags bound even one huge session;
+  // no whole-history Set/Map of salted identities is retained.
+  let sessionHex = null;
+  let sessionSourceHex = null;
+  let sessionHasOtherSource = false;
+  let sessionCount = 0;
+  const settleSession = async () => {
+    if (sessionHasOtherSource) {
+      for (let index = 0; index < sessionCount; index += 1) {
+        otherSource[sessionPositions[index]] = 1;
+        if (++processed % CALLBACK_YIELD_ROWS === 0) await yieldCheckpoint();
+      }
+    }
+    sessionCount = 0;
+    sessionHasOtherSource = false;
+    sessionSourceHex = null;
+  };
+  for (const row of database.prepare(`
+    SELECT rowid AS row_id, session_local, source_local FROM usage_event
+    INDEXED BY usage_event_session_predecessor ORDER BY session_local`).iterate()) {
+    const nextSessionHex = row.session_local === null ? null : Buffer.from(row.session_local).toString("hex");
+    if (nextSessionHex !== sessionHex) {
+      await settleSession();
+      sessionHex = nextSessionHex;
+    }
+    if (nextSessionHex !== null) {
+      const rowPosition = positionFor(Number(row.row_id));
+      if (rowPosition === -1 || sessionCount >= size) throw fixedError("local_unified_index_row_invalid");
+      sessionPositions[sessionCount++] = rowPosition;
+      // COUNT(DISTINCT source_local) ignores SQL NULL, as this walk does.
+      if (row.source_local !== null) {
+        const sourceHex = Buffer.from(row.source_local).toString("hex");
+        if (sessionSourceHex === null) sessionSourceHex = sourceHex;
+        else if (sourceHex !== sessionSourceHex) sessionHasOtherSource = true;
+      }
+    }
+    if (++processed % CALLBACK_YIELD_ROWS === 0) await yieldCheckpoint();
+  }
+  await settleSession();
+  checkpoint();
+  return {
+    retainedRows: size,
+    retainedBytes,
+    has: (rowId) => seen[positionFor(rowId)] === 1,
+    plansFor: (rowId) => {
+      const index = positionFor(rowId);
+      const count = planCount[index] ?? 0;
+      if (count === 0) return [];
+      if (count === 1) return [planTable[planFirst[index]]];
+      return [planTable[planFirst[index]], planTable[planSecond[index]]];
+    },
+    predecessorFor: (rowId) => {
+      const index = positionFor(rowId);
+      return predecessorFlags[index] > 0 ? {
+        observed_at_ms: predecessorMs[index],
+        session_matches: predecessorFlags[index] === 2 ? 1 : 0,
+      } : undefined;
+    },
+    hasOtherSource: (rowId) => otherSource[positionFor(rowId)] === 1,
+  };
+}
+
+function utf8ByteCompare(left, right) {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
 export function createLocalUnifiedUsageAttributionReader({
   database,
   generationId,
+  precomputed = null,
 } = {}) {
   if (typeof database?.prepare !== "function"
-      || !Number.isSafeInteger(generationId) || generationId < 1) {
+      || !Number.isSafeInteger(generationId) || generationId < 1
+      || (precomputed !== null
+        && (typeof precomputed?.has !== "function"
+          || typeof precomputed.plansFor !== "function"
+          || typeof precomputed.predecessorFor !== "function"
+          || typeof precomputed.hasOtherSource !== "function"))) {
     throw fixedError("local_unified_index_attribution_options_invalid", "TypeError");
   }
   const membership = database.prepare(`
@@ -989,9 +1359,14 @@ export function createLocalUnifiedUsageAttributionReader({
           || !Number.isSafeInteger(member.scanned_bytes) || member.scanned_bytes < 0
           || sourceOffset > member.scanned_bytes) return result;
 
-      const observedPlans = plans.all(
-        generationId, sourceLocal, sourceOffset, sourceOrdinal, observedAtMs,
-      ).map((value) => safeText(value.plan_type));
+      const rowId = precomputed === null ? null : Number(row.row_id);
+      const usePrecomputed = rowId !== null && precomputed.has(rowId);
+      const observedPlans = (usePrecomputed
+        ? precomputed.plansFor(rowId)
+        : plans.all(
+          generationId, sourceLocal, sourceOffset, sourceOrdinal, observedAtMs,
+        ).map((value) => value.plan_type)
+      ).map((value) => safeText(value));
       if (observedPlans.length === 1) {
         result.planAttribution.basis = "same_record";
         result.planAttribution.planType = observedPlans[0];
@@ -1001,9 +1376,9 @@ export function createLocalUnifiedUsageAttributionReader({
 
       // Physical order can positively reveal a reversed clock. Do not hide
       // that contradiction by picking some earlier wall-clock timestamp.
-      const sourcePrevious = projectPredecessor(sourceBefore.get(
-        generationId, sourceLocal, sourceOffset,
-      ), { source: true });
+      const sourcePrevious = projectPredecessor(usePrecomputed
+        ? precomputed.predecessorFor(rowId)
+        : sourceBefore.get(generationId, sourceLocal, sourceOffset), { source: true });
       if (sourcePrevious !== null && sourcePrevious.observedAtMs > observedAtMs) {
         return result;
       }
@@ -1017,14 +1392,20 @@ export function createLocalUnifiedUsageAttributionReader({
         // cannot improve the bound. Keeping the lookup inside that interval is
         // important for a long session held entirely in one source: excluding
         // that source must not scan its whole history on every usage row.
-        previous = projectPredecessor(sessionBefore.get(
-          generationId,
-          sessionLocal,
-          sourceLocal,
-          sourcePrevious?.sessionMatches === true
-            ? sourcePrevious.observedAtMs : MINIMUM_TIMESTAMP_MS,
-          observedAtMs,
-        ));
+        // A session confined to a single source has no other-source record,
+        // so the query below is provably empty for it; only sessions the
+        // precomputation saw spanning several sources still pay for it.
+        previous = projectPredecessor(usePrecomputed
+            && !precomputed.hasOtherSource(rowId)
+          ? undefined
+          : sessionBefore.get(
+            generationId,
+            sessionLocal,
+            sourceLocal,
+            sourcePrevious?.sessionMatches === true
+              ? sourcePrevious.observedAtMs : MINIMUM_TIMESTAMP_MS,
+            observedAtMs,
+          ));
         // Equal-time order is meaningful within this physical source, not
         // between sources with coincident timestamps/discovery ordinals.
         if (sourcePrevious?.sessionMatches === true
@@ -1046,12 +1427,28 @@ export function createLocalUnifiedUsageAttributionReader({
   };
 }
 
+// What a usage consumer declares about the per-row attribution it will read.
+// "required" (the default, and the historical behavior) enriches every usage
+// row with plan attribution and usage-interval metadata, which costs a
+// membership lookup plus up to three indexed point queries per row. "none" is
+// for aggregate consumers that never read those fields — the rows carry no
+// attribution keys at all, so an accidental reader fails loudly rather than
+// reading a silently absent value.
+const USAGE_ATTRIBUTION_MODES = new Set(["required", "none"]);
+// Rows delivered between event-loop yields. Consumers run synchronously, so
+// a yield every so often is what lets an abort signalled from a macrotask
+// (SIGTERM, a timer, the parent's watchdog) actually reach the loop's abort
+// check instead of waiting for the whole stream.
+const CALLBACK_YIELD_ROWS = 2_048;
+
 function validateRequest({
   startAt,
   endAt,
   signal,
   onUsage,
   onRateLimitSnapshot,
+  usageAttribution,
+  indexedHistory,
 }) {
   const start = canonicalInstant(startAt);
   const end = canonicalInstant(endAt);
@@ -1059,10 +1456,25 @@ function validateRequest({
       || !validAbortSignal(signal)
       || (onUsage !== undefined && typeof onUsage !== "function")
       || (onRateLimitSnapshot !== undefined
-        && typeof onRateLimitSnapshot !== "function")) {
+        && typeof onRateLimitSnapshot !== "function")
+      || (usageAttribution !== undefined
+        && !USAGE_ATTRIBUTION_MODES.has(usageAttribution))
+      || (indexedHistory !== undefined
+        && (indexedHistory === null
+          || typeof indexedHistory !== "object"
+          || Array.isArray(indexedHistory)
+          || typeof indexedHistory.onUsage !== "function"))) {
     throw fixedError("local_unified_index_read_request_invalid", "TypeError");
   }
-  return { startAt: start, endAt: end };
+  return {
+    startAt: start,
+    endAt: end,
+    usageAttribution: usageAttribution ?? "required",
+  };
+}
+
+function cooperativeYield() {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 /**
@@ -1092,6 +1504,16 @@ export function createLocalUnifiedAccountingSource({
     signal = null,
     onUsage,
     onRateLimitSnapshot,
+    usageAttribution,
+    // Optional second consumer: `{ onUsage }` receives every usage row of the
+    // published generation's whole covered range (never quota rows, never
+    // attribution) in the SAME physical pass as the requested window. The
+    // covered range is proven with exactly the checks a separate read of it
+    // would run; if that proof fails with a reader code the result reports
+    // `indexedHistory.status: "unavailable"` with the code, the pass shrinks
+    // back to the requested window, and the requested window's own read is
+    // unaffected — the two outcomes are independent, as two reads would be.
+    indexedHistory,
   } = {}) {
     const window = validateRequest({
       startAt,
@@ -1099,6 +1521,8 @@ export function createLocalUnifiedAccountingSource({
       signal,
       onUsage,
       onRateLimitSnapshot,
+      usageAttribution,
+      indexedHistory,
     });
     throwIfAborted(signal);
     let metadata;
@@ -1127,49 +1551,122 @@ export function createLocalUnifiedAccountingSource({
         throw fixedError("local_unified_index_file_changed");
       }
       const meta = readMeta(database);
-      const coverage = readCurrentGeneration(database, meta, window, {
-        verifyPublishedGeneration: verifyGeneration,
-      });
-      if (expected !== null
-          && ((expected.id !== null && expected.id !== coverage.generationId)
-            || (expected.fingerprint !== null
-              && expected.fingerprint !== coverage.generationFingerprint))) {
-        throw fixedError("local_unified_index_generation_mismatch");
-      }
-      const contractVersion = requiredMetaText(meta, "contract_version");
-      if (!SAFE_TOKEN.test(contractVersion)) {
-        throw fixedError("local_unified_index_meta_invalid");
-      }
-      validateUsageJoins(database, {
-        ...window,
-        verifyPublishedGeneration: verifyGeneration,
-      });
-      const compatibility = parserCompatibility(
-        database,
-        contractVersion,
-        coverage.generationId,
-      );
-      if (compatibility.status !== "compatible"
-          && coverage.status === "complete") {
-        coverage.status = "partial";
-        coverage.generationProof = false;
-        coverage.blockReason = "mixed_parser_versions";
-      }
-      const attestedGap = coverage.status === "partial"
-        && coverage.blockReason === "codex_rollout_sources_quarantined"
-        && coverage.generationProof === true;
-      if (requireComplete && coverage.status !== "complete" && !attestedGap) {
-        throw fixedError("local_unified_index_accounting_coverage_incomplete");
-      }
-      const diagnostics = readDiagnostics(database, coverage.generationId);
+      // The proof one requested window needs, in the order the reader has
+      // always run it. The covered-range consumer below runs the identical
+      // sequence for its own window, so a fused read proves each window
+      // exactly as a separate read of that window would.
+      const validateWindow = ({ startAt: requestedStartAt, endAt: requestedEndAt }) => {
+        const requested = { startAt: requestedStartAt, endAt: requestedEndAt };
+        const proven = readCurrentGeneration(database, meta, requested, {
+          verifyPublishedGeneration: verifyGeneration,
+        });
+        if (expected !== null
+            && ((expected.id !== null && expected.id !== proven.generationId)
+              || (expected.fingerprint !== null
+                && expected.fingerprint !== proven.generationFingerprint))) {
+          throw fixedError("local_unified_index_generation_mismatch");
+        }
+        const provenContractVersion = requiredMetaText(meta, "contract_version");
+        if (!SAFE_TOKEN.test(provenContractVersion)) {
+          throw fixedError("local_unified_index_meta_invalid");
+        }
+        validateUsageJoins(database, {
+          startAt: requested.startAt,
+          endAt: requested.endAt,
+          verifyPublishedGeneration: verifyGeneration,
+        });
+        const provenCompatibility = parserCompatibility(
+          database,
+          provenContractVersion,
+          proven.generationId,
+        );
+        if (provenCompatibility.status !== "compatible"
+            && proven.status === "complete") {
+          proven.status = "partial";
+          proven.generationProof = false;
+          proven.blockReason = "mixed_parser_versions";
+        }
+        const attestedGap = proven.status === "partial"
+          && proven.blockReason === "codex_rollout_sources_quarantined"
+          && proven.generationProof === true;
+        if (requireComplete && proven.status !== "complete" && !attestedGap) {
+          throw fixedError("local_unified_index_accounting_coverage_incomplete");
+        }
+        return {
+          coverage: proven,
+          contractVersion: provenContractVersion,
+          compatibility: provenCompatibility,
+          diagnostics: readDiagnostics(database, proven.generationId),
+        };
+      };
+      const { coverage, contractVersion, compatibility, diagnostics } =
+        validateWindow(window);
       const startMs = Date.parse(window.startAt);
       const endMs = Date.parse(window.endAt);
-      const attributionReader = onUsage === undefined ? null
+      let historyRead = null;
+      let historyRange = null;
+      if (indexedHistory !== undefined) {
+        const coveredAt = coverage.coveredAt;
+        if (coveredAt === null) {
+          historyRead = unavailableHistoryRead(
+            "local_unified_index_coverage_unavailable",
+          );
+        } else {
+          try {
+            const proven = validateWindow({
+              startAt: coveredAt.startAt,
+              endAt: coveredAt.endAt,
+            });
+            historyRange = {
+              startMs: Date.parse(coveredAt.startAt),
+              endMs: Date.parse(coveredAt.endAt),
+            };
+            historyRead = {
+              status: "available",
+              errorCode: null,
+              coverage: proven.coverage,
+              capabilities: capabilitiesFor(proven.coverage),
+              diagnosticsAvailable: proven.coverage.diagnosticsComplete,
+            };
+          } catch (error) {
+            if (typeof error?.code !== "string"
+                || !error.code.startsWith("local_unified_index_")) {
+              throw error;
+            }
+            historyRead = unavailableHistoryRead(error.code);
+          }
+        }
+      }
+      // One physical pass over the union of the proven windows; each row is
+      // delivered only to the consumers whose window contains it, exactly as
+      // separate bounded reads would have delivered it.
+      const scanStartMs = historyRange === null
+        ? startMs
+        : Math.min(startMs, historyRange.startMs);
+      const scanEndMs = historyRange === null
+        ? endMs
+        : Math.max(endMs, historyRange.endMs);
+      // Attribution is derived only for a consumer that declared it will read
+      // it. The aggregate consumers (period totals, timelines) never do, and
+      // on a large index the per-row lookups were two thirds of a rebuild.
+      const attributionReader = onUsage === undefined
+          || window.usageAttribution !== "required"
+        ? null
         : createLocalUnifiedUsageAttributionReader({
           database,
           generationId: coverage.generationId,
         });
       let sequence = 0;
+      let deliveredSinceYield = 0;
+      const deliver = async (callback, value) => {
+        const pending = invoke(callback, value, signal);
+        if (pending !== undefined) await pending;
+        deliveredSinceYield += 1;
+        if (deliveredSinceYield === CALLBACK_YIELD_ROWS) {
+          deliveredSinceYield = 0;
+          await cooperativeYield();
+        }
+      };
       const usageStatement = database.prepare(`
         SELECT u.event_key,
                u.observed_at_ms,
@@ -1206,10 +1703,14 @@ export function createLocalUnifiedAccountingSource({
                  COALESCE(u.source_offset, 9223372036854775807),
                  u.event_key
       `);
-      for (const row of usageStatement.iterate(startMs, endMs)) {
+      for (const row of usageStatement.iterate(scanStartMs, scanEndMs)) {
         throwIfAborted(signal);
         validateEventKey(row.event_key);
         const { observedAtMs, timestamp } = timestampForMs(row.observed_at_ms);
+        const inWindow = observedAtMs >= startMs && observedAtMs <= endMs;
+        const inHistory = historyRange !== null
+          && observedAtMs >= historyRange.startMs
+          && observedAtMs <= historyRange.endMs;
         const components = usageComponents(row);
         if (!hasUsage(components)) continue;
         const totalInputContextTokens = safeNonNegativeInteger(
@@ -1233,7 +1734,7 @@ export function createLocalUnifiedAccountingSource({
           ? null
           : timestampForMs(tierObservedAtMs).timestamp;
         const usage = {
-          ...attributionReader?.read(row),
+          ...(inWindow ? attributionReader?.read(row) : undefined),
           timestamp,
           timestampMs: observedAtMs,
           model: safeText(row.model_id),
@@ -1265,9 +1766,13 @@ export function createLocalUnifiedAccountingSource({
           usage.sourceRolloutOrdinal = sourceOrdinal;
           usage.sourceOrdinal = sourceOrdinal;
         }
-        if (onUsage !== undefined) {
+        if (inWindow && onUsage !== undefined) {
           usage.sequence = sequence++;
-          await invoke(onUsage, usage, signal);
+          await deliver(onUsage, usage);
+        }
+        if (inHistory) {
+          if (usage.sequence === undefined) usage.sequence = sequence++;
+          await deliver(indexedHistory.onUsage, usage);
         }
       }
 
@@ -1289,7 +1794,10 @@ export function createLocalUnifiedAccountingSource({
                  q.slot_order,
                  q.id
       `);
-      for (const row of quotaStatement.iterate(startMs, endMs)) {
+      // Quota rows across the whole scanned range are validated (a separate
+      // read of the covered range validated them too); only the requested
+      // window's rows are delivered, since the history consumer takes none.
+      for (const row of quotaStatement.iterate(scanStartMs, scanEndMs)) {
         throwIfAborted(signal);
         const { observedAtMs, timestamp } = timestampForMs(row.observed_at_ms);
         const durationMins = safeNonNegativeInteger(row.duration_mins);
@@ -1343,9 +1851,10 @@ export function createLocalUnifiedAccountingSource({
           sourceOffset,
           slotOrder,
         };
-        if (onRateLimitSnapshot !== undefined) {
+        if (onRateLimitSnapshot !== undefined
+            && observedAtMs >= startMs && observedAtMs <= endMs) {
           quota.sequence = sequence++;
-          await invoke(onRateLimitSnapshot, quota, signal);
+          await deliver(onRateLimitSnapshot, quota);
         }
       }
       throwIfAborted(signal);
@@ -1357,16 +1866,22 @@ export function createLocalUnifiedAccountingSource({
         requestedWindow: window,
         verifyPublishedGeneration: verifyGeneration,
       });
-      const capabilities = {
-        readsRawSources: false,
-        deterministicCanonicalOrder: coverage.generationProof,
-        sourceOrderingProvenance: coverage.provenanceComplete,
-        sourceOffsetProvenance: coverage.provenanceComplete,
-        sourceScopedQuotaOccurrences: coverage.quotaOccurrencesComplete,
-        durableDiagnostics: coverage.diagnosticsComplete,
-        crashSafeGenerationPublication: coverage.generationProof,
-      };
+      if (historyRange !== null) {
+        await revalidatePublishedSnapshot({
+          indexFile,
+          metadata,
+          database,
+          coverage: historyRead.coverage,
+          requestedWindow: {
+            startAt: coverage.coveredAt.startAt,
+            endAt: coverage.coveredAt.endAt,
+          },
+          verifyPublishedGeneration: verifyGeneration,
+        });
+      }
+      const capabilities = capabilitiesFor(coverage);
       return {
+        ...(historyRead === null ? {} : { indexedHistory: historyRead }),
         readerVersion: LOCAL_UNIFIED_ACCOUNTING_SOURCE_VERSION,
         schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
         parserVersion: compatibility.parserVersions.length === 1

@@ -241,7 +241,8 @@ node scripts/release-macos-app.js \
 
 For the 0.1.17 stable release, `CFBundleShortVersionString` remains `0.1.17`
 and the owner-reviewed signed `CFBundleVersion` is exactly `1024`. It follows
-the fit-metadata RC8 internal-dogfood allocation `1023.6`, retired-checkpoint
+the refresh-policy RC9 internal-dogfood allocation `1023.7`, fit-metadata RC8
+allocation `1023.6`, retired-checkpoint
 RC7 `1023.5`, accounting-deadline RC6 `1023.4`, integrated RC5 `1023.3`,
 startup-recovery RC4 `1023.2`, migration RC3 `1023.1`, retained RC2 `1023`,
 and earlier shared-identity dogfood `1022`. The
@@ -256,13 +257,20 @@ Sparkle ordering.
 RC7 source merge `87e07be350582713d815a21b4db470ed84aae037` passed its
 protected R7, full source, signing, notarization, stapling, and installation
 gates. Its first installed refresh ingested generation 44 but the strict v0.14
-cache validator rejected inconsistent fit metadata. RC8 retains that validator
-and projects fit metadata from the first eligible row. Before any RC8 candidate
-is treated as installed dogfood evidence, repeat exact-source R7, full source,
-artifact, state-preserving install, installed refresh, and physical native
-checks. The formal PR #94 real-corpus comparator remains **OPEN / NOT RUN** and
-blocks stable or public qualification; an explicitly open-gate internal
-dogfood does not close it.
+cache validator rejected inconsistent fit metadata. RC8 source retains that
+validator and projects fit metadata from the first eligible row. RC9 source is
+under validation on base `35802d21ede67d362533f4e2be6b38041ece1cda`: one manual
+Refresh for quota and accounting, quick startup/automatic checks,
+at-most-hourly automatic detailed attempts,
+native terminal-state reconciliation, selected-plan Trends, and last-good
+snapshot persistence. Its `1023.7` allocation does not establish a built or
+installed artifact. Before RC9 is treated as installed dogfood evidence, repeat
+exact-source R7, full source, artifact, state-preserving install, installed
+refresh, and physical native checks. The formal PR #94 real-corpus comparator
+remains **OPEN / NOT RUN** and blocks stable or public qualification; an
+explicitly open-gate internal dogfood does not close it. Compatible hosted
+Worker migrations/deployment and end-to-end device pairing also remain open,
+separate gates; a desktop installation cannot qualify them.
 
 Signing-key access on the release machine is a separate owner provisioning
 step, not an end-user permission requirement. If signing requests approval,

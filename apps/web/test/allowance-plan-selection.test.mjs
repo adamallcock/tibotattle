@@ -7,6 +7,86 @@ import {
 } from "../public/data-client.js";
 import { SUPPORTED_LOCALES, translate } from "../public/localization.js";
 
+const BASIS_FAMILY =
+  "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario";
+const COHORT_ID = "a".repeat(64);
+
+function planScope(planType) {
+  return {
+    methodVersion: "plan-era-v1",
+    planType,
+    basisFamilyId: BASIS_FAMILY,
+    cohortId: COHORT_ID,
+    sourceGeneration: 17,
+    sourceGenerationFingerprint: "generation-fingerprint-17",
+  };
+}
+
+function capacityScenario(scenario) {
+  return {
+    basisId: `${BASIS_FAMILY}:${scenario}`,
+    medianCapacityUsd: 2_400,
+    plausibleRangeUsd: { lower: 2_000, upper: 2_800 },
+    qualifyingResets: 3,
+    cohortId: COHORT_ID,
+    validation: {
+      sameResetHoldoutMeanAbsoluteErrorPercentagePoints: 1,
+      priorResetMeanAbsoluteErrorPercentagePoints: 2,
+      priorResetAbsoluteBiasPercentagePoints: 0,
+      forecastErrorP80PercentagePoints: 3,
+      scoredPriorResets: 2,
+      scoredPriorPoints: 8,
+    },
+  };
+}
+
+function allowanceCapacity(planType) {
+  return {
+    status: "available",
+    reason: null,
+    basisFamilyId: BASIS_FAMILY,
+    selectedScenario: "unresolved_as_standard",
+    scenarios: {
+      unresolved_as_standard: capacityScenario("unresolved_as_standard"),
+      unresolved_as_fast: capacityScenario("unresolved_as_fast"),
+    },
+    planScope: planScope(planType),
+    accountAttribution: {
+      status: "historical_unattributed",
+      maySpanMultipleAccounts: true,
+    },
+  };
+}
+
+function usageRow({ events = 1, standardUsd = 4, fastUsd = 8 } = {}) {
+  return {
+    startAt: "2026-08-30T11:45:00.000Z",
+    endAt: "2026-08-30T12:00:00.000Z",
+    usageEvents: events,
+    totalTokens: 1_000,
+    apiPriceEquivalentUsd: standardUsd,
+    components: { input_uncached_tokens: 1_000 },
+    pricingCoverage: {
+      fullyPricedEvents: events,
+      partiallyPricedEvents: 0,
+      unpricedEvents: 0,
+    },
+    allowanceWeighting: [
+      0, standardUsd, standardUsd, 0, 0, events, 0, 0,
+      0, fastUsd, fastUsd, 0, 0, events, 0, 0,
+    ],
+  };
+}
+
+function compactPlanRow(row) {
+  return [Date.parse(row.startAt), row.usageEvents,
+    ...["input_uncached_tokens", "input_cache_read_tokens", "input_cache_write_tokens",
+      "output_text_tokens", "output_reasoning_tokens", "output_combined_tokens"].map((key) => row.components[key] ?? 0),
+    row.apiPriceEquivalentUsd, row.allowanceWeighting[1], row.allowanceWeighting[9],
+    row.allowanceWeighting[3], row.allowanceWeighting[4], row.pricingCoverage.fullyPricedEvents,
+    row.pricingCoverage.partiallyPricedEvents, row.totalTokens];
+}
+
 function population(planType, value, comparisonEligibility = "unavailable") {
   return {
     planType,
@@ -39,7 +119,9 @@ function population(planType, value, comparisonEligibility = "unavailable") {
   };
 }
 
-function dashboard({ current = "plus", plus = null, comparison = "unavailable" } = {}) {
+function dashboard({ current = "plus", plus = null, comparison = "unavailable",
+  scopedRows = [usageRow()], scopedIntervals = [[Date.parse("2026-01-01T00:00:00Z"), Date.parse("2026-09-01T00:00:00Z")]],
+} = {}) {
   const populations = [population("pro", 2_400, comparison), population("plus", plus, comparison)];
   const selected = populations.find((row) => row.planType === current);
   const data = normalizeDashboardPayload({
@@ -72,10 +154,29 @@ function dashboard({ current = "plus", plus = null, comparison = "unavailable" }
       observedAt: "2026-08-30T12:00:00.000Z",
       usedPercent: 30, remainingPercent: 70,
     })),
+    timeline: {
+      allowanceWeightingEncoding: {
+        schemaVersion: "quota-weighted-timeline-v0.1",
+        basisFamilyId: BASIS_FAMILY,
+        scenarioOrder: ["unresolved_as_standard", "unresolved_as_fast"],
+        selectedScenario: "unresolved_as_standard",
+      },
+      usage: [usageRow({ events: 2, standardUsd: 10, fastUsd: 20 })],
+      calibrationUsage: [],
+      allowanceCapacity: allowanceCapacity(current),
+      planScoped: {
+        schemaVersion: "local-plan-scoped-accounting-timeline-v1",
+        encoding: "plan_bucket_v1",
+        status: "available",
+        reason: null,
+        planScope: planScope(current),
+        usage: scopedRows.map(compactPlanRow),
+        comparisonIntervals: scopedIntervals,
+        quota: [[Date.parse("2026-08-30T11:45:00.000Z"), Date.parse("2026-09-01T00:00:00.000Z") / 1000, 30]],
+      },
+      quota: [],
+    },
   });
-  // The selector treats the already-normalized comparison as an opaque
-  // contract. Detailed capacity/ledger validation has its own boundary tests.
-  data.timeline.allowanceCapacity = { status: "available", medianCapacityUsd: 2_400 };
   return data;
 }
 
@@ -93,6 +194,79 @@ test("latest-plan selection remains insufficient instead of borrowing the old pl
   assert.strictEqual(selected.weekly.paceForecast, data.weekly.paceForecast);
   assert.deepEqual(selected.quotaWindows.map((row) => row.planType), ["plus"]);
   assert.equal(selected.timeline.allowanceCapacity, null);
+  assert.deepEqual(selected.timeline.selectedPlanUsage, []);
+  assert.equal(selected.timeline.usage[0].usageEvents, 2,
+    "the all-plan ledger remains conserved while the sparse current plan is unavailable");
+});
+
+test("selected quota is independent of generic cross-plan collapse and all-plan data stays intact", () => {
+  const data = dashboard({ current: "pro", plus: 85 });
+  data.timeline.quota = [{ ...data.timeline.planScoped.quota[0], planType: "plus", usedPercent: 90 }];
+  const selected = selectAllowancePlanPopulation(data);
+  assert.deepEqual(selected.timeline.quota.map((row) => [row.planType, row.usedPercent]), [["pro", 30]]);
+  assert.deepEqual(data.timeline.quota.map((row) => [row.planType, row.usedPercent]), [["plus", 90]]);
+});
+
+test("valid scoped history beyond 3000 buckets is retained, not rejected or truncated", () => {
+  const start = Date.parse("2026-07-01T00:00:00Z");
+  const rows = Array.from({ length: 4_000 }, (_, i) => ({ ...usageRow(),
+    startAt: new Date(start + i * 900_000).toISOString(),
+    endAt: new Date(start + (i + 1) * 900_000).toISOString() }));
+  const data = dashboard({ current: "pro", plus: 85, scopedRows: rows });
+  const selected = selectAllowancePlanPopulation(data);
+  assert.equal(selected.allowancePlanSelection.comparisonAvailable, true);
+  assert.equal(selected.timeline.selectedPlanUsage.length, 4_000);
+  assert.equal(selected.timeline.selectedPlanUsage[0].startAt, rows[0].startAt);
+  assert.equal(selected.timeline.selectedPlanUsage.at(-1).endAt, rows.at(-1).endAt);
+});
+
+test("a scoped bucket crossing an attribution gap fails closed", () => {
+  const start = Date.parse(usageRow().startAt);
+  const data = dashboard({ current: "pro", plus: 85, scopedIntervals: [[start - 900_000, start]] });
+  assert.equal(data.timeline.planScoped.status, "unavailable");
+  assert.equal(selectAllowancePlanPopulation(data).allowancePlanSelection.comparisonAvailable, false);
+  assert.equal(data.timeline.usage[0].usageEvents, 2);
+});
+
+test("compact plan rows preserve partial pricing, unknown coverage, and event-summed tokens", () => {
+  for (const [fullyPricedEvents, partiallyPricedEvents, unpricedEvents] of [[4, 0, 0], [1, 3, 0], [1, 1, 2]]) {
+    const row = usageRow({ events: 4 });
+    row.components = { input_uncached_tokens: 10, output_text_tokens: 2,
+      output_reasoning_tokens: 3, output_combined_tokens: 7 };
+    row.totalTokens = 22;
+    row.allowanceWeighting[3] = 1;
+    row.allowanceWeighting[4] = 1;
+    row.pricingCoverage = { fullyPricedEvents, partiallyPricedEvents, unpricedEvents };
+    const data = dashboard({ current: "pro", scopedRows: [row] });
+    assert.equal(data.timeline.planScoped.status, "available");
+    const decoded = data.timeline.planScoped.usage[0];
+    assert.equal(decoded.totalTokens, 22);
+    assert.deepEqual(decoded.pricingCoverage, row.pricingCoverage);
+    assert.equal(decoded.components.output_combined_tokens, 7);
+    const standard = decoded.allowanceWeighting.scenarios.unresolved_as_standard;
+    assert.equal(standard.quotaWeightedUsd, unpricedEvents ? null : 4);
+    assert.deepEqual(standard.coverage, { totalEvents: 4, observedEvents: unpricedEvents ? 0 : 1,
+      declaredFromConfigEvents: unpricedEvents ? 0 : 1, assumedEvents: unpricedEvents ? 0 : 2,
+      inferredEvents: 0, unknownEvents: unpricedEvents ? 4 : 0,
+      observedSharePercent: unpricedEvents ? 0 : 25, unknownSharePercent: unpricedEvents ? 100 : 0 });
+    assert.equal(decoded.allowanceWeighting.status, unpricedEvents ? "unavailable" : "complete");
+  }
+});
+
+test("malformed compact counts and pricing quarantine the optional lane without losing the ledger", () => {
+  for (const mutate of [
+    (row) => { row.usageEvents = 1.5; },
+    (row) => { row.apiPriceEquivalentUsd = "4"; },
+    (row) => { row.allowanceWeighting[3] = 2; },
+    (row) => { row.pricingCoverage.partiallyPricedEvents = 1; },
+    (row) => { row.totalTokens = -1; },
+  ]) {
+    const row = usageRow();
+    mutate(row);
+    const data = dashboard({ current: "pro", scopedRows: [row] });
+    assert.equal(data.timeline.planScoped.status, "unavailable");
+    assert.equal(data.timeline.usage[0].usageEvents, 2);
+  }
 });
 
 test("historical-plan selection changes the fitted population but never current pace or the all-plan ledger", () => {
@@ -107,6 +281,7 @@ test("historical-plan selection changes the fitted population but never current 
   assert.strictEqual(pro.accounting, data.accounting);
   assert.strictEqual(pro.pricing, data.pricing);
   assert.strictEqual(pro.timeline.usage, data.timeline.usage);
+  assert.deepEqual(pro.timeline.selectedPlanUsage, []);
   assert.deepEqual(data, before, "selection cannot mutate or discard retained evidence");
   const plus = selectAllowancePlanPopulation(pro, "plus");
   assert.equal(plus.weekly.summary.median_weekly_value_usd, 85);
@@ -115,18 +290,39 @@ test("historical-plan selection changes the fitted population but never current 
     "stable selected views preserve the chart's identity-based memoization");
 });
 
-test("only explicit current single-plan coverage preserves the comparison", () => {
+test("only an exact current-plan generation/cohort match preserves the comparison", () => {
   const covered = dashboard({ current: "pro", plus: 85, comparison: "single_plan_conditional" });
   const selected = selectAllowancePlanPopulation(covered);
   assert.equal(selected.allowancePlanSelection.comparisonAvailable, true);
   assert.strictEqual(selected.timeline.allowanceCapacity, covered.timeline.allowanceCapacity);
+  assert.equal(selected.timeline.selectedPlanUsage[0].usageEvents, 1);
+  assert.equal(selected.timeline.usage[0].usageEvents, 2,
+    "selecting Trends cannot rewrite the all-plan accounting timeline");
   const historical = selectAllowancePlanPopulation(covered, "plus");
   assert.equal(historical.allowancePlanSelection.comparisonAvailable, false);
   assert.equal(historical.timeline.allowanceCapacity, null);
   assert.equal(historical.weekly.paceForecast, null);
   const mixed = selectAllowancePlanPopulation(dashboard({ current: "pro", plus: 85 }));
-  assert.equal(mixed.allowancePlanSelection.comparisonAvailable, false);
-  assert.equal(mixed.timeline.allowanceCapacity, null);
+  assert.equal(mixed.allowancePlanSelection.comparisonAvailable, true,
+    "an older alternate plan does not invalidate an independently scoped current-plan numerator");
+  assert.equal(mixed.timeline.allowanceCapacity.status, "available");
+});
+
+test("basis, plan, cohort, or generation mismatches fail closed", () => {
+  for (const mutate of [
+    (scope) => { scope.planType = "plus"; },
+    (scope) => { scope.basisFamilyId = "wrong-basis"; },
+    (scope) => { scope.cohortId = "b".repeat(64); },
+    (scope) => { scope.sourceGeneration = "generation-18"; },
+    (scope) => { scope.sourceGenerationFingerprint = "other-fingerprint"; },
+  ]) {
+    const data = dashboard({ current: "pro", plus: 85 });
+    mutate(data.timeline.planScoped.planScope);
+    const selected = selectAllowancePlanPopulation(data);
+    assert.equal(selected.allowancePlanSelection.comparisonAvailable, false);
+    assert.deepEqual(selected.timeline.selectedPlanUsage, []);
+    assert.equal(selected.timeline.usage[0].usageEvents, 2);
+  }
 });
 
 test("unsupported selections cannot create a pooled plan and legacy payloads are unchanged", () => {
@@ -193,4 +389,19 @@ test("dynamic plan labels and share transcripts cannot be replaced by static loc
     "a localized redraw keeps the selected-plan transcript, never the initial empty-card placeholder");
   assert.match(source, /const legacyDemo = data\.mode === "demo" && !data\.allowancePlanSelection;/u,
     "even a labelled fixture cannot borrow a global legacy rate for an insufficient selected plan");
+});
+
+test("manual refresh includes detailed accounting while automatic refresh stays quick", async () => {
+  const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
+  const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
+  assert.doesNotMatch(html, /id="recalculate-detailed-accounting"/u,
+    "the accounting page does not offer a duplicate manual refresh action");
+  assert.match(source, /localClient\.recalculateDetailedAccounting\(\)/u);
+  assert.match(source, /async function requestRefresh\(\{ autoContinue = false, detailed = false \} = \{\}\)/u,
+    "the shared default stays quick for startup and automatic callers");
+  assert.match(source, /requestRefresh\(\{ detailed: true \}\)/u);
+  assert.match(source, /if \(detailed\) scheduleReindexAutoContinuation\(\);/u,
+    "ordinary quick refresh cannot schedule a history continuation");
+  assert.match(source, /requestRefresh\(\{ autoContinue: true, detailed: true \}\)/u,
+    "bounded continuation preserves the original explicit detailed operation");
 });

@@ -706,7 +706,7 @@ enum TiboTattleLocalization {
             case .nativeDashboardRefreshUsage:
                 "Refresh"
             case .nativeDashboardRefreshUsageTooltip:
-                "Update from selected Codex session folders and local Codex account, quota, configuration, and rollout-lineage sources. Processing stays on this Mac."
+                "Refresh the current allowance, local history, and detailed accounting. Reuses valid cached results; all processing stays on this Mac."
             case .nativeDashboardShare:
                 "Share"
             case .nativeDashboardShareTooltip:
@@ -1144,7 +1144,7 @@ enum TiboTattleLocalization {
             case .settingsRefreshInterval:
                 "Refresh interval"
             case .settingsRefreshIntervalDetail:
-                "Saved on this Mac and used while TiboTattle is open."
+                "Checks current allowance while TiboTattle is open. Detailed accounting updates automatically at most hourly; choose Refresh to update everything now."
             case .settingsRefreshIntervalOneMinute:
                 "Every minute"
             case .settingsRefreshIntervalFiveMinutes:

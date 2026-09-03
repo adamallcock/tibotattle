@@ -686,6 +686,148 @@ private struct NativeForegroundRefreshSchedule: Equatable {
     }
 }
 
+/// Detailed accounting is deliberately attempt-based and rate-limited across
+/// launches. Recording before a request starts prevents a failed, cancelled,
+/// or interrupted pass from becoming a tight automatic retry loop. A missing
+/// or malformed value is seeded with `now`, making the first launch pass quick.
+enum NativeDetailedRefreshCadence {
+    static let defaultsKey = "tibotattle.detailed-refresh-last-attempt.v1"
+    static let reservationKey = "tibotattle.detailed-refresh-reservation.v1"
+    static let minimumInterval: TimeInterval = 60 * 60
+
+    struct Reservation {
+        let stampedAt: Double
+        let token: String
+        let previousAttempt: Double?
+        let previousToken: String?
+    }
+
+    static func automaticMode(
+        now: Date = Date(),
+        defaults: UserDefaults = .standard
+    ) -> LocalAnalysisMode {
+        let nowInterval = now.timeIntervalSince1970
+        guard nowInterval.isFinite, nowInterval >= 0 else { return .quick }
+        guard let stored = defaults.object(forKey: defaultsKey) as? NSNumber,
+              stored.doubleValue.isFinite,
+              stored.doubleValue >= 0,
+              stored.doubleValue <= nowInterval
+        else {
+            defaults.set(nowInterval, forKey: defaultsKey)
+            return .quick
+        }
+        guard nowInterval - stored.doubleValue >= minimumInterval else {
+            return .quick
+        }
+        return .detailed
+    }
+
+    static func seedIfMissing(
+        now: Date = Date(),
+        defaults: UserDefaults = .standard
+    ) {
+        guard defaults.object(forKey: defaultsKey) == nil else { return }
+        recordDetailedAttempt(now: now, defaults: defaults)
+    }
+
+    @discardableResult
+    static func recordDetailedAttempt(
+        now: Date = Date(),
+        defaults: UserDefaults = .standard
+    ) -> Reservation? {
+        let value = now.timeIntervalSince1970
+        guard value.isFinite, value >= 0 else { return nil }
+        let reservation = Reservation(
+            stampedAt: value,
+            token: UUID().uuidString,
+            previousAttempt: (defaults.object(forKey: defaultsKey) as? NSNumber)
+                .map(\.doubleValue),
+            previousToken: defaults.string(forKey: reservationKey)
+        )
+        defaults.set(value, forKey: defaultsKey)
+        defaults.set(reservation.token, forKey: reservationKey)
+        return reservation
+    }
+
+    /// Only a confirmed conflict with a quick run proves that this detailed
+    /// request did no work. Unknown/rejected/interrupted responses retain the
+    /// optimistic stamp. Compare the token as well as time so a later attempt
+    /// at the same timestamp cannot be rolled back by an old callback.
+    static func restoreAfterQuickJoin(
+        _ reservation: Reservation?,
+        attempt: LocalAnalysisAttempt?,
+        defaults: UserDefaults = .standard
+    ) {
+        guard attempt?.mode == .quick, let reservation,
+              defaults.double(forKey: defaultsKey) == reservation.stampedAt,
+              defaults.string(forKey: reservationKey) == reservation.token
+        else { return }
+        if let previous = reservation.previousAttempt {
+            defaults.set(previous, forKey: defaultsKey)
+        } else {
+            defaults.removeObject(forKey: defaultsKey)
+        }
+        if let previousToken = reservation.previousToken {
+            defaults.set(previousToken, forKey: reservationKey)
+        } else {
+            defaults.removeObject(forKey: reservationKey)
+        }
+    }
+
+    /// Every native reader observes the same controller receipt, including
+    /// browser-started runs and terminal failures. Record its actual start
+    /// once, never `now` on every poll and never move a newer attempt backward.
+    static func observe(
+        _ attempt: LocalAnalysisAttempt?,
+        now: Date = Date(),
+        defaults: UserDefaults = .standard
+    ) {
+        guard let attempt, attempt.mode == .detailed else { return }
+        let started = attempt.startedAt.timeIntervalSince1970
+        let current = now.timeIntervalSince1970
+        guard started.isFinite, started >= 0,
+              current.isFinite, started <= current
+        else { return }
+        if let stored = defaults.object(forKey: defaultsKey) as? NSNumber,
+           stored.doubleValue.isFinite, stored.doubleValue >= started {
+            return
+        }
+        recordDetailedAttempt(now: attempt.startedAt, defaults: defaults)
+    }
+}
+
+/// A GET issued before a POST reply may still describe the previous idle
+/// controller. Its terminal result cannot settle the new request, even if
+/// that GET callback arrives after the POST's 202 callback.
+private struct NativeRefreshStartFence {
+    struct Observation {
+        let generation: UInt64
+        let startResolved: Bool
+    }
+
+    private var generation: UInt64 = 0
+    private var awaitingResponse = false
+
+    mutating func begin() {
+        generation &+= 1
+        awaitingResponse = true
+    }
+
+    mutating func resolve() {
+        generation &+= 1
+        awaitingResponse = false
+    }
+
+    func observation() -> Observation {
+        Observation(generation: generation, startResolved: !awaitingResponse)
+    }
+
+    func allowsTerminal(_ observation: Observation) -> Bool {
+        !awaitingResponse && observation.startResolved
+            && observation.generation == generation
+    }
+}
+
 private enum NativeForegroundRefreshScheduler {
     /// This scheduler is deliberately an in-process main-queue work item. It
     /// is cancelled when the app quits or when a refresh starts, and it never
@@ -4497,9 +4639,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private weak var nativeShareToolbarItem: NSToolbarItem?
     private weak var nativeSettingsToolbarItem: NSToolbarItem?
     private var nativeRefreshPoll: DispatchWorkItem?
+    private var nativeRefreshStartWatchdog: DispatchWorkItem?
+    private var nativeRefreshReadWatchdog: DispatchWorkItem?
     private var nativeRefreshSchedule: DispatchWorkItem?
     private var nativeRefreshInFlight = false
+    private var nativeRefreshStartFence = NativeRefreshStartFence()
     private var nativeRefreshProgress: LocalAnalysisProgress?
+    private var nativeRefreshSequence: UInt64 = 0
+    private var nativeRefreshReadEpoch: UInt64 = 0
+    private var workspaceWakeObserver: NSObjectProtocol?
     /// One launch-only refresh waits until the page has rendered its first
     /// local result. This prevents the heavy collector from winning the
     /// loopback race against the dashboard's own initial reads.
@@ -4515,6 +4663,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     /// Opaque companion token for the particular refresh this surface started
     /// or joined. It is never persisted or exposed in UI/notification text.
     private var nativeRefreshID: String?
+    /// Notification evaluation belongs only to a refresh this native surface
+    /// explicitly started or joined. Reconciliation may adopt an external run
+    /// for UI liveness without claiming notification ownership.
+    private var nativeRefreshNotificationID: String?
     // A fresh unified index or an authoritatively selected full accounting
     // rebuild receives the companion's bounded four-hour cold-work window.
     // Keep native progress attached through that same window plus one minute
@@ -4522,6 +4674,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     // the former 120 polls stopped after about 90 seconds and could label a
     // still-running first build as finished.
     private static let nativeRefreshPollIntervalMilliseconds = 750
+    private static let nativeRefreshStartWatchdogMilliseconds = 12_000
+    private static let nativeRefreshReadWatchdogMilliseconds = 12_000
     /// Once the companion's own maximum work window has elapsed, stay
     /// attached until its terminal receipt without keeping the ordinary
     /// sub-second progress cadence alive indefinitely.
@@ -4624,6 +4778,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = umask(0o077)
+        workspaceWakeObserver = NSWorkspace.shared.notificationCenter
+            .addObserver(
+                forName: NSWorkspace.didWakeNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.reconcileNativeRefreshStatus()
+            }
         applyAppearancePreference(notifyDashboard: false)
         installApplicationMenu()
         createWindow()
@@ -4695,6 +4857,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         // already updates native dynamic colors; this keeps the live report's
         // explicit document theme synchronized when the window returns.
         synchronizeResolvedAppearance()
+        reconcileNativeRefreshStatus()
     }
 
     private func showFirstRunDisclosure() -> Bool {
@@ -5421,7 +5584,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     @objc private func refreshDashboardFromToolbar() {
         // This reuses the existing foreground-only Node companion path. The
         // toolbar never starts a helper, daemon, or separate background task.
-        refreshLocalUsage(automatic: false)
+        refreshLocalUsage(automatic: false, mode: .detailed)
     }
 
     @objc private func showShareCardFromToolbar() {
@@ -5625,7 +5788,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         }
         if startupAutomaticRefreshPending {
             startupAutomaticRefreshPending = false
-            refreshLocalUsage(automatic: true)
+            refreshLocalUsage(automatic: true, mode: .quick)
         }
     }
 
@@ -5656,10 +5819,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     /// Updates are automatic only while the ordinary app is open. A login
     /// item (if enabled) launches that same foreground app; it never starts a
-    /// separate worker, daemon, or background URL session. The same bounded
-    /// loopback refresh route remains the only reader, so a manual click and
-    /// the foreground cadence cannot start two scans at once.
-    private func refreshLocalUsage(automatic: Bool) {
+    /// separate worker, daemon, or background URL session. Both explicit
+    /// loopback refresh modes share one companion controller, so a manual
+    /// click and the foreground cadence cannot start two scans at once.
+    private func refreshLocalUsage(
+        automatic: Bool,
+        mode requestedMode: LocalAnalysisMode,
+        allowAutomaticDetailed: Bool = false,
+        cadenceStatusChecked: Bool = false
+    ) {
         guard !quitting,
               !nativeRefreshInFlight,
               !(automatic
@@ -5668,10 +5836,67 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         else {
             return
         }
+        if automatic, allowAutomaticDetailed, !cadenceStatusChecked {
+            // A browser-started detailed run can finish between native polls.
+            // Reconcile its actual-start receipt before spending the hourly
+            // allowance; unavailable or running state permits only a quick
+            // request (which may join the one controller-owned active run).
+            let observedSequence = nativeRefreshSequence
+            var resolved = false
+            let fallback = DispatchWorkItem { [weak self] in
+                guard let self, !resolved, !self.quitting,
+                      !self.nativeRefreshInFlight,
+                      self.nativeRefreshSequence == observedSequence
+                else { return }
+                resolved = true
+                self.refreshLocalUsage(automatic: true, mode: .quick)
+            }
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + .milliseconds(
+                    Self.nativeRefreshStartWatchdogMilliseconds
+                ),
+                execute: fallback
+            )
+            nativeEvidenceReader.readAnalysisActivity(base: dashboardURL) {
+                [weak self] activity in
+                guard let self, !resolved, !self.quitting,
+                      !self.nativeRefreshInFlight,
+                      self.nativeRefreshSequence == observedSequence
+                else { return }
+                resolved = true
+                fallback.cancel()
+                let controllerIdle: Bool
+                if case .idle = activity { controllerIdle = true }
+                else { controllerIdle = false }
+                self.refreshLocalUsage(
+                    automatic: true,
+                    mode: .quick,
+                    allowAutomaticDetailed: controllerIdle,
+                    cadenceStatusChecked: true
+                )
+            }
+            return
+        }
+        let mode: LocalAnalysisMode
+        if automatic, allowAutomaticDetailed {
+            mode = NativeDetailedRefreshCadence.automaticMode()
+        } else {
+            if automatic {
+                NativeDetailedRefreshCadence.seedIfMissing()
+            }
+            mode = requestedMode
+        }
+        let detailedReservation = mode == .detailed
+            ? NativeDetailedRefreshCadence.recordDetailedAttempt()
+            : nil
         keychainMigrationRefreshPending = false
         cancelNativeRefreshSchedule()
         cancelNativeIndexingCoveragePoll()
         nativeRefreshInFlight = true
+        nativeRefreshStartFence.begin()
+        nativeRefreshSequence &+= 1
+        let refreshSequence = nativeRefreshSequence
+        nativeRefreshNotificationID = nil
         nativeRefreshProgress = nil
         updateNativeToolbar(
             title: automatic
@@ -5680,14 +5905,48 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             isRefreshing: true,
             refreshEnabled: false
         )
-        nativeEvidenceReader.startAnalysis(base: dashboardURL) { [weak self] result in
-            guard let self, !self.quitting else { return }
+        let startWatchdog = DispatchWorkItem { [weak self] in
+            guard let self, !self.quitting, self.nativeRefreshInFlight,
+                  self.nativeRefreshSequence == refreshSequence
+            else { return }
+            self.nativeRefreshNotificationID = nil
+            self.pollNativeRefresh(
+                base: dashboardURL,
+                remainingAttempts: Self.nativeRefreshMaximumPollAttempts,
+                sequence: refreshSequence
+            )
+        }
+        nativeRefreshStartWatchdog = startWatchdog
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(
+                Self.nativeRefreshStartWatchdogMilliseconds
+            ),
+            execute: startWatchdog
+        )
+        nativeEvidenceReader.startAnalysis(
+            base: dashboardURL,
+            mode: mode
+        ) { [weak self] result in
+            guard let self, !self.quitting,
+                  self.nativeRefreshSequence == refreshSequence
+            else { return }
+            self.nativeRefreshStartWatchdog?.cancel()
+            self.nativeRefreshStartWatchdog = nil
+            self.nativeRefreshStartFence.resolve()
+            if case let .alreadyRunning(_, attempt) = result {
+                NativeDetailedRefreshCadence.restoreAfterQuickJoin(
+                    detailedReservation,
+                    attempt: attempt
+                )
+            }
             switch result {
-            case let .started(refreshID), let .alreadyRunning(refreshID):
+            case let .started(refreshID, _), let .alreadyRunning(refreshID, _):
                 self.nativeRefreshID = refreshID
+                self.nativeRefreshNotificationID = refreshID
                 self.pollNativeRefresh(
                     base: dashboardURL,
-                    remainingAttempts: Self.nativeRefreshMaximumPollAttempts
+                    remainingAttempts: Self.nativeRefreshMaximumPollAttempts,
+                    sequence: refreshSequence
                 )
             case .rejected:
                 self.nativeEvidenceState = .readFailed
@@ -5718,23 +5977,59 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         }
     }
 
-    private func pollNativeRefresh(base: URL, remainingAttempts: Int) {
+    private func pollNativeRefresh(
+        base: URL,
+        remainingAttempts: Int,
+        sequence: UInt64
+    ) {
         cancelNativeRefreshPoll()
         let pollIntervalMilliseconds = remainingAttempts > 0
             ? Self.nativeRefreshPollIntervalMilliseconds
             : Self.nativeRefreshSettlementPollIntervalMilliseconds
         let work = DispatchWorkItem { [weak self] in
-            guard let self, !self.quitting, self.nativeRefreshInFlight else {
+            guard let self, !self.quitting, self.nativeRefreshInFlight,
+                  self.nativeRefreshSequence == sequence
+            else {
                 return
             }
+            self.nativeRefreshReadEpoch &+= 1
+            let readEpoch = self.nativeRefreshReadEpoch
+            let startObservation = self.nativeRefreshStartFence.observation()
+            let watchdog = DispatchWorkItem { [weak self] in
+                guard let self, !self.quitting, self.nativeRefreshInFlight,
+                      self.nativeRefreshSequence == sequence,
+                      self.nativeRefreshReadEpoch == readEpoch
+                else { return }
+                self.pollNativeRefresh(
+                    base: base,
+                    remainingAttempts: max(0, remainingAttempts - 1),
+                    sequence: sequence
+                )
+            }
+            self.nativeRefreshReadWatchdog = watchdog
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + .milliseconds(
+                    Self.nativeRefreshReadWatchdogMilliseconds
+                ),
+                execute: watchdog
+            )
             self.nativeEvidenceReader.readAnalysisActivity(base: base) { [weak self] activity in
-                guard let self, !self.quitting, self.nativeRefreshInFlight else {
+                guard let self, !self.quitting, self.nativeRefreshInFlight,
+                      self.nativeRefreshSequence == sequence,
+                      self.nativeRefreshReadEpoch == readEpoch
+                else {
                     return
                 }
-                let terminalRefreshID: String?
+                self.nativeRefreshReadWatchdog?.cancel()
+                self.nativeRefreshReadWatchdog = nil
                 switch activity {
-                case let .running(_, progress):
-                    terminalRefreshID = nil
+                case let .running(refreshID, progress, _):
+                    if let refreshID {
+                        if self.nativeRefreshNotificationID != refreshID {
+                            self.nativeRefreshNotificationID = nil
+                        }
+                        self.nativeRefreshID = refreshID
+                    }
                     self.nativeRefreshProgress = progress
                     self.updateNativeToolbar(
                         // The refresh receipt has not supplied a matched
@@ -5767,17 +6062,35 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                         )
                         self.pollNativeRefresh(
                             base: base,
-                            remainingAttempts: 0
+                            remainingAttempts: 0,
+                            sequence: sequence
                         )
                         return
                     }
                     self.pollNativeRefresh(
                         base: base,
-                        remainingAttempts: remainingAttempts - 1
+                        remainingAttempts: remainingAttempts - 1,
+                        sequence: sequence
                     )
                     return
-                case let .idle(refreshID, _):
-                    terminalRefreshID = refreshID
+                case let .idle(refreshID, _, _):
+                    guard self.nativeRefreshStartFence.allowsTerminal(
+                        startObservation
+                    ) else {
+                        self.pollNativeRefresh(
+                            base: base,
+                            remainingAttempts: max(0, remainingAttempts - 1),
+                            sequence: sequence
+                        )
+                        return
+                    }
+                    self.handleNativeRefreshTerminal(
+                        base: base,
+                        terminalRefreshID: refreshID,
+                        sequence: sequence,
+                        startObservation: startObservation
+                    )
+                    return
                 case .none:
                     // A failed or future-schema activity read is not evidence
                     // that the accepted refresh stopped. Keep the control
@@ -5793,62 +6106,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                     )
                     self.pollNativeRefresh(
                         base: base,
-                        remainingAttempts: max(0, remainingAttempts - 1)
+                        remainingAttempts: max(0, remainingAttempts - 1),
+                        sequence: sequence
                     )
                     return
-                }
-                self.nativeEvidenceReader.readOverview(base: base) { [weak self] overview in
-                    guard let self, !self.quitting else { return }
-                    if let overview {
-                        self.nativeEvidenceObservedAt = overview.observedAt
-                        switch LocalCompanionOverviewProjection.evidence(
-                            for: overview
-                        ) {
-                        case .live:
-                            self.nativeEvidenceState = .live
-                        case .stale:
-                            self.nativeEvidenceState = .stale
-                        case .none:
-                            self.nativeEvidenceState = .unknown
-                        }
-                    } else {
-                        // Keep any last observed timestamp for honest age
-                        // context, but distinguish a transient read failure
-                        // from a dead companion process.
-                        self.nativeEvidenceState = .readFailed
-                    }
-                    let title: String
-                    if let overview,
-                       LocalCompanionOverviewProjection.evidence(
-                        for: overview
-                       ) == .live {
-                        title = TiboTattleLocalization.string(.launcherUpToDate)
-                    } else if overview?.lanes.isEmpty == false {
-                        title = TiboTattleLocalization.string(
-                            .launcherNeedsAttention
-                        )
-                    } else {
-                        title = TiboTattleLocalization.string(
-                            .launcherNoAllowanceObserved
-                        )
-                    }
-                    let expectedRefreshID = terminalRefreshID == self.nativeRefreshID
-                        ? self.nativeRefreshID
-                        : nil
-                    self.evaluateQuotaNotificationsAfterRefresh(
-                        base: base,
-                        expectedRefreshID: expectedRefreshID
-                    )
-                    // The pill's terminal state is decided only after the
-                    // companion's own coverage counts and refresh receipt
-                    // have been re-read; a failed pass or a still-building
-                    // index then takes the title over the evidence prose.
-                    self.readNativeToolbarStatusFacts(base: base) { [weak self] in
-                        self?.finishNativeRefresh(
-                            title: title,
-                            refreshEnabled: true
-                        )
-                    }
                 }
             }
         }
@@ -5861,10 +6122,142 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         )
     }
 
+    /// The companion's terminal receipt is authoritative for whether work is
+    /// still running. Clear the busy latch before any optional overview or
+    /// coverage read: those reads may fail or lose a callback, but cannot turn
+    /// an already-terminal refresh back into an endless spinner.
+    private func handleNativeRefreshTerminal(
+        base: URL,
+        terminalRefreshID: String?,
+        sequence: UInt64,
+        startObservation: NativeRefreshStartFence.Observation
+    ) {
+        guard nativeRefreshInFlight, nativeRefreshSequence == sequence,
+              nativeRefreshStartFence.allowsTerminal(startObservation)
+        else {
+            return
+        }
+        let expectedRefreshID = terminalRefreshID == nativeRefreshNotificationID
+            ? nativeRefreshNotificationID
+            : nil
+        settleNativeRefresh(
+            title: TiboTattleLocalization.string(.nativeDashboardStatus),
+            refreshEnabled: true
+        )
+        let presentationSequence = nativeRefreshSequence
+        evaluateQuotaNotificationsAfterRefresh(
+            base: base,
+            expectedRefreshID: expectedRefreshID
+        )
+        nativeEvidenceReader.readOverview(base: base) { [weak self] overview in
+            guard let self, !self.quitting,
+                  !self.nativeRefreshInFlight,
+                  self.nativeRefreshSequence == presentationSequence
+            else { return }
+            if let overview {
+                self.nativeEvidenceObservedAt = overview.observedAt
+                switch LocalCompanionOverviewProjection.evidence(for: overview) {
+                case .live:
+                    self.nativeEvidenceState = .live
+                case .stale:
+                    self.nativeEvidenceState = .stale
+                case .none:
+                    self.nativeEvidenceState = .unknown
+                }
+            } else {
+                self.nativeEvidenceState = .readFailed
+            }
+            let title: String
+            if let overview,
+               LocalCompanionOverviewProjection.evidence(for: overview) == .live {
+                title = TiboTattleLocalization.string(.launcherUpToDate)
+            } else if overview?.lanes.isEmpty == false {
+                title = TiboTattleLocalization.string(.launcherNeedsAttention)
+            } else {
+                title = TiboTattleLocalization.string(
+                    .launcherNoAllowanceObserved
+                )
+            }
+            self.readNativeToolbarStatusFacts(base: base) { [weak self] in
+                guard let self, !self.quitting,
+                      !self.nativeRefreshInFlight,
+                      self.nativeRefreshSequence == presentationSequence
+                else { return }
+                self.updateNativeToolbar(
+                    title: title,
+                    isRefreshing: false,
+                    refreshEnabled: true
+                )
+            }
+        }
+    }
+
+    /// Re-adopt a companion run after activation or wake, and clear only from
+    /// an explicit terminal receipt. An unreadable or future-schema response
+    /// is deliberately a no-op because it is not evidence that work stopped.
+    private func reconcileNativeRefreshStatus() {
+        guard !quitting, let base = dashboardURL else { return }
+        let observedSequence = nativeRefreshSequence
+        let startObservation = nativeRefreshStartFence.observation()
+        nativeEvidenceReader.readAnalysisActivity(base: base) { [weak self] activity in
+            guard let self, !self.quitting,
+                  self.nativeRefreshSequence == observedSequence
+            else { return }
+            switch activity {
+            case let .running(refreshID, progress, _):
+                if !self.nativeRefreshInFlight {
+                    self.cancelNativeRefreshSchedule()
+                    self.cancelNativeIndexingCoveragePoll()
+                    self.nativeRefreshInFlight = true
+                    self.nativeRefreshSequence &+= 1
+                    self.nativeRefreshNotificationID = nil
+                }
+                let sequence = self.nativeRefreshSequence
+                if let refreshID {
+                    if self.nativeRefreshNotificationID != refreshID {
+                        self.nativeRefreshNotificationID = nil
+                    }
+                    self.nativeRefreshID = refreshID
+                }
+                self.nativeRefreshProgress = progress
+                self.updateNativeToolbar(
+                    title: progress?.nativeToolbarTitle()
+                        ?? TiboTattleLocalization.string(
+                            .nativeDashboardUpdating
+                        ),
+                    isRefreshing: true,
+                    refreshEnabled: false
+                )
+                self.pollNativeRefresh(
+                    base: base,
+                    remainingAttempts: Self.nativeRefreshMaximumPollAttempts,
+                    sequence: sequence
+                )
+            case let .idle(refreshID, _, _):
+                guard self.nativeRefreshInFlight else { return }
+                self.handleNativeRefreshTerminal(
+                    base: base,
+                    terminalRefreshID: refreshID,
+                    sequence: observedSequence,
+                    startObservation: startObservation
+                )
+            case .none:
+                return
+            }
+        }
+    }
+
     private func finishNativeRefresh(title: String, refreshEnabled: Bool) {
+        settleNativeRefresh(title: title, refreshEnabled: refreshEnabled)
+    }
+
+    private func settleNativeRefresh(title: String, refreshEnabled: Bool) {
+        nativeRefreshSequence &+= 1
         nativeRefreshInFlight = false
+        nativeRefreshStartFence.resolve()
         nativeRefreshProgress = nil
         nativeRefreshID = nil
+        nativeRefreshNotificationID = nil
         cancelNativeRefreshPoll()
         updateNativeToolbar(
             title: title,
@@ -5946,8 +6339,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func cancelNativeRefreshPoll() {
+        nativeRefreshStartWatchdog?.cancel()
+        nativeRefreshStartWatchdog = nil
         nativeRefreshPoll?.cancel()
         nativeRefreshPoll = nil
+        nativeRefreshReadWatchdog?.cancel()
+        nativeRefreshReadWatchdog = nil
+        nativeRefreshReadEpoch &+= 1
     }
 
     /// The foreground app keeps its own local evidence current while a
@@ -5963,7 +6361,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             return
         }
         let work = NativeForegroundRefreshScheduler.schedule { [weak self] in
-            self?.refreshLocalUsage(automatic: true)
+            self?.refreshLocalUsage(
+                automatic: true,
+                mode: .quick,
+                allowAutomaticDetailed: true
+            )
         }
         nativeRefreshSchedule = work
     }
@@ -6226,6 +6628,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         nativeHistoryIndexingCoverage = nil
         nativeRefreshFailure = nil
         nativeRefreshInFlight = false
+        nativeRefreshStartFence.resolve()
         nativeRefreshProgress = nil
         nativeRefreshID = nil
         dashboardWebHost?.stop()
@@ -6631,7 +7034,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         // One repair refresh uses the existing local-only analysis route. It
         // neither grants contribution consent nor starts a second scan while
         // the current pass is still running.
-        refreshLocalUsage(automatic: false)
+        refreshLocalUsage(automatic: false, mode: .detailed)
     }
 
     @objc private func showKeychainMigrationSettings() {
@@ -8523,6 +8926,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     func applicationWillTerminate(_ notification: Notification) {
         startupTimeout?.cancel()
+        if let workspaceWakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(
+                workspaceWakeObserver
+            )
+            self.workspaceWakeObserver = nil
+        }
         cancelNativeRefreshPoll()
         cancelNativeRefreshSchedule()
         cancelNativeIndexingCoveragePoll()
@@ -9117,11 +9526,110 @@ private enum NativeRefreshSettingsContractSmokeTest {
         else {
             return 1
         }
+        let cadenceStart = Date(timeIntervalSince1970: 10_000)
+        guard NativeDetailedRefreshCadence.automaticMode(
+            now: cadenceStart,
+            defaults: reloaded
+        ) == .quick,
+              reloaded.double(
+                forKey: NativeDetailedRefreshCadence.defaultsKey
+              ) == cadenceStart.timeIntervalSince1970,
+              NativeDetailedRefreshCadence.automaticMode(
+                now: cadenceStart.addingTimeInterval(3_599),
+                defaults: reloaded
+              ) == .quick,
+              NativeDetailedRefreshCadence.automaticMode(
+                now: cadenceStart.addingTimeInterval(3_600),
+                defaults: reloaded
+              ) == .detailed,
+              reloaded.double(
+                forKey: NativeDetailedRefreshCadence.defaultsKey
+              ) == cadenceStart.timeIntervalSince1970
+        else {
+            return 1
+        }
+        let attemptedAt = cadenceStart.addingTimeInterval(3_600)
+        let reservation = NativeDetailedRefreshCadence.recordDetailedAttempt(
+            now: attemptedAt, defaults: reloaded
+        )
+        NativeDetailedRefreshCadence.restoreAfterQuickJoin(
+            reservation, attempt: nil, defaults: reloaded
+        )
+        guard NativeDetailedRefreshCadence.automaticMode(
+            now: attemptedAt.addingTimeInterval(1), defaults: reloaded
+        ) == .quick else { return 1 }
+        let quickJoin = LocalAnalysisAttempt(mode: .quick, startedAt: attemptedAt)
+        NativeDetailedRefreshCadence.restoreAfterQuickJoin(
+            reservation, attempt: quickJoin, defaults: reloaded
+        )
+        guard reloaded.double(forKey: NativeDetailedRefreshCadence.defaultsKey)
+                == cadenceStart.timeIntervalSince1970,
+              NativeDetailedRefreshCadence.automaticMode(
+                now: attemptedAt, defaults: reloaded
+              ) == .detailed
+        else { return 1 }
+        let earlier = NativeDetailedRefreshCadence.recordDetailedAttempt(
+            now: attemptedAt, defaults: reloaded
+        )
+        let later = NativeDetailedRefreshCadence.recordDetailedAttempt(
+            now: attemptedAt, defaults: reloaded
+        )
+        NativeDetailedRefreshCadence.restoreAfterQuickJoin(
+            earlier, attempt: quickJoin, defaults: reloaded
+        )
+        guard reloaded.string(forKey: NativeDetailedRefreshCadence.reservationKey)
+                == later?.token,
+              reloaded.double(forKey: NativeDetailedRefreshCadence.defaultsKey)
+                == attemptedAt.timeIntervalSince1970
+        else { return 1 }
+        NativeDetailedRefreshCadence.seedIfMissing(
+            now: cadenceStart.addingTimeInterval(9_000),
+            defaults: reloaded
+        )
+        guard reloaded.double(
+            forKey: NativeDetailedRefreshCadence.defaultsKey
+        ) == cadenceStart.addingTimeInterval(3_600).timeIntervalSince1970
+        else {
+            return 1
+        }
+        let externalStart = cadenceStart.addingTimeInterval(10_000)
+        let external = LocalAnalysisAttempt(mode: .detailed, startedAt: externalStart)
+        NativeDetailedRefreshCadence.observe(
+            external, now: externalStart.addingTimeInterval(5), defaults: reloaded
+        )
+        NativeDetailedRefreshCadence.observe(
+            external, now: externalStart.addingTimeInterval(3_599), defaults: reloaded
+        )
+        guard reloaded.double(forKey: NativeDetailedRefreshCadence.defaultsKey)
+                == externalStart.timeIntervalSince1970,
+              NativeDetailedRefreshCadence.automaticMode(
+                now: externalStart.addingTimeInterval(3_599), defaults: reloaded
+              ) == .quick,
+              NativeDetailedRefreshCadence.automaticMode(
+                now: externalStart.addingTimeInterval(3_600), defaults: reloaded
+              ) == .detailed
+        else { return 1 }
+        var startFence = NativeRefreshStartFence()
+        startFence.begin()
+        let oldIdleRead = startFence.observation()
+        guard !startFence.allowsTerminal(oldIdleRead) else { return 1 }
+        // The delayed POST now returns 202/running. The earlier idle GET is
+        // still stale even if its callback arrives after this resolution.
+        startFence.resolve()
+        guard !startFence.allowsTerminal(oldIdleRead),
+              startFence.allowsTerminal(startFence.observation())
+        else { return 1 }
+        let previousRunRead = startFence.observation()
+        startFence.begin()
+        guard !startFence.allowsTerminal(previousRunRead) else { return 1 }
         print(
             "USAGE_MONITOR_MACOS_REFRESH_SETTINGS_CONTRACT "
                 + "default=300 persisted=900 reloaded=900 "
                 + "picker_action=true picker_persisted=true "
                 + "scheduler=300->900 "
+                + "detailed_attempt_cadence=3600 startup=quick "
+                + "quick_join=restored newer_attempt=preserved "
+                + "external_attempt=actual-start stale_idle=ignored "
                 + "invalid_ignored=true"
         )
         return 0
@@ -9613,7 +10121,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             ("prospective", .prospective),
         ]
         for (rawPhase, expectedPhase) in phases {
-            guard case let .running(decodedRefreshID, progress) = decode(
+            guard case let .running(decodedRefreshID, progress, _) = decode(
                 progress: ["phase": rawPhase]
             ),
                 decodedRefreshID == refreshID,
@@ -9624,7 +10132,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             }
         }
 
-        guard case let .running(_, quickProgress) = decode(
+        guard case let .running(_, quickProgress, _) = decode(
             progress: ["phase": "quick_result"]
         ),
               quickProgress?.nativeToolbarTitle(
@@ -9652,7 +10160,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             TiboTattleLocalization.integerString(42),
             TiboTattleLocalization.integerString(180)
         )
-        guard case let .running(_, countedProgress) = counted,
+        guard case let .running(_, countedProgress, _) = counted,
               countedProgress == LocalAnalysisProgress(
                 phase: .rolloutIndex,
                 filesSelected: 180,
@@ -9672,7 +10180,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             "filesProcessed": 42,
             "recordsWritten": 9_000,
         ])
-        guard case let .running(_, unifiedProgress) = unified,
+        guard case let .running(_, unifiedProgress, _) = unified,
               unifiedProgress == LocalAnalysisProgress(
                 phase: .rolloutIndex,
                 filesSelected: 180,
@@ -9687,7 +10195,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             "kind": "accounting",
             "status": "calculating",
         ]
-        guard case let .running(_, accountingProgress) = decode(
+        guard case let .running(_, accountingProgress, _) = decode(
             progress: accountingMarker
         ),
               accountingProgress == LocalAnalysisProgress(
@@ -9714,7 +10222,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             ["phase": "accounting"],
         ]
         for invalid in invalidAccounting {
-            guard case let .running(_, progress) = decode(progress: invalid),
+            guard case let .running(_, progress, _) = decode(progress: invalid),
                   progress == nil
             else {
                 return failure("accounting exact-key boundary")
@@ -9738,7 +10246,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             "filesProcessed": 0,
             "recordsWritten": 0,
         ])
-        guard case let .running(_, unifiedZeroProgress) = unifiedZero,
+        guard case let .running(_, unifiedZeroProgress, _) = unifiedZero,
               unifiedZeroProgress?.nativeToolbarTitle()
                 == TiboTattleLocalization.string(
                     .nativeDashboardProgressAnalyzing
@@ -9766,9 +10274,9 @@ private enum NativeAnalysisProgressContractSmokeTest {
             "recordsWritten": 9_000,
             "path": "/Users/private/repository",
         ])
-        guard case let .running(_, invalidUnifiedProgress) = invalidUnified,
+        guard case let .running(_, invalidUnifiedProgress, _) = invalidUnified,
               invalidUnifiedProgress == nil,
-              case let .running(_, forgedUnifiedProgress) = forgedUnified,
+              case let .running(_, forgedUnifiedProgress, _) = forgedUnified,
               forgedUnifiedProgress == nil
         else {
             return failure("unified index closed contract")
@@ -9779,7 +10287,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             "filesSelected": 1_000_000_001,
             "filesProcessed": -1,
         ])
-        guard case let .running(_, unsafeProgress) = unsafe,
+        guard case let .running(_, unsafeProgress, _) = unsafe,
               unsafeProgress?.filesSelected == nil,
               unsafeProgress?.filesProcessed == nil
         else {
@@ -9791,7 +10299,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             "filesSelected": true,
             "filesProcessed": 4.5,
         ])
-        guard case let .running(_, malformedProgress) = malformed,
+        guard case let .running(_, malformedProgress, _) = malformed,
               malformedProgress?.filesSelected == nil,
               malformedProgress?.filesProcessed == nil
         else {
@@ -9803,7 +10311,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             "filesSelected": 2,
             "filesProcessed": 3,
         ])
-        guard case let .running(_, contradictoryProgress) = contradictory,
+        guard case let .running(_, contradictoryProgress, _) = contradictory,
               contradictoryProgress?.nativeToolbarTitle()
                 == TiboTattleLocalization.string(
                     .nativeDashboardProgressAnalyzing
@@ -9816,7 +10324,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             "kind": "archive_index",
             "status": "scanning",
         ])
-        guard case let .running(_, archiveProgress) = archive,
+        guard case let .running(_, archiveProgress, _) = archive,
               archiveProgress?.phase == .archiveIndex
         else {
             return failure("archive phase")
@@ -9826,7 +10334,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             "phase": "server_supplied_unreviewed_phase",
             "message": "server supplied prose",
         ])
-        guard case let .running(_, unknownProgress) = unknown,
+        guard case let .running(_, unknownProgress, _) = unknown,
               unknownProgress == nil
         else {
             return failure("unknown phase")
@@ -9854,6 +10362,43 @@ private enum NativeAnalysisProgressContractSmokeTest {
             return failure("idle contract")
         }
 
+        let startedAt = "2026-09-01T12:00:00.000Z"
+        let receiptDate = Date(timeIntervalSince1970: 1_788_264_000)
+        for mode in ["quick", "detailed"] {
+            for status in ["running", "succeeded", "failed", "cancelled"] {
+                let payload: [String: Any] = ["refresh": [
+                    "status": status,
+                    "refreshId": refreshID,
+                    "mode": mode,
+                    "startedAt": startedAt,
+                ]]
+                guard let data = try? JSONSerialization.data(withJSONObject: payload),
+                      let activity = LocalCompanionEvidenceReader.decodeActivity(data),
+                      activity.attempt == LocalAnalysisAttempt(
+                        mode: LocalAnalysisMode(rawValue: mode)!,
+                        startedAt: receiptDate
+                      )
+                else { return failure("mode/start receipt") }
+            }
+        }
+        let invalidReceipts: [[String: Any]] = [
+            ["mode": "automatic", "startedAt": startedAt],
+            ["mode": true, "startedAt": startedAt],
+            ["mode": "detailed", "startedAt": "2026-09-01T12:00:00Z"],
+            ["mode": "detailed", "startedAt": "not a timestamp"],
+            ["mode": "detailed", "startedAt": 1_788_264_000],
+            ["mode": "detailed"],
+            ["startedAt": startedAt],
+        ]
+        for invalid in invalidReceipts {
+            var refresh: [String: Any] = ["status": "running", "refreshId": refreshID]
+            refresh.merge(invalid) { _, replacement in replacement }
+            guard let data = try? JSONSerialization.data(withJSONObject: ["refresh": refresh]),
+                  let activity = LocalCompanionEvidenceReader.decodeActivity(data),
+                  activity.attempt == nil
+            else { return failure("invalid mode/start receipt") }
+        }
+
         print(
             "USAGE_MONITOR_MACOS_ANALYSIS_PROGRESS_CONTRACT "
                 + "phases=allowlisted archive=scanning unified=scanning "
@@ -9861,6 +10406,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
                 + "counts=bounded quick_result=evidence-gated "
                 + "contradictory=generic unknown=generic free_text=ignored "
                 + "idle=unchanged terminal=automatic-backoff "
+                + "attempt=mode-and-actual-start "
                 + "percent=false eta=false"
         )
         return 0

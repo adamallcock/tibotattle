@@ -29,6 +29,9 @@ const MAXIMUM_TEMP_DIRECTORY_ENTRIES_INSPECTED = 64;
 const MAXIMUM_STALE_TEMPS_REMOVED_PER_WRITE = 2;
 
 const COMPANION_SCHEMA_VERSION = "local-companion-v0.1";
+// Keep this closed list aligned with buildLocalCompanionSnapshot's public
+// top-level projection. HTML reports are served by dedicated loopback routes;
+// they are not part of the retained dashboard snapshot.
 const EXPECTED_SNAPSHOT_KEYS = Object.freeze([
   "schemaVersion",
   "mode",
@@ -37,7 +40,6 @@ const EXPECTED_SNAPSHOT_KEYS = Object.freeze([
   "gradient",
   "weekly",
   "quality",
-  "reports",
 ]);
 const TYPED_TOOL_HISTORY_WARNING =
   "Usage accounting is complete, but typed tool history is partial. Tool totals are withheld rather than reported as zero.";
