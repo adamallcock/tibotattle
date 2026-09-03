@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-03
 type: status
 status: current
-source_commit: 8c8a149fa0c7f1597108892f9ad4baf1571abfad
+source_commit: a53319e506ca49fa9b65de99f51ba3e6c03f1272
 observation_date: 2026-09-03
 ---
 
@@ -18,7 +18,7 @@ using this page for a later release or operational decision.
 
 | Boundary | Verified state |
 |---|---|
-| Documentation/source review | Intel working candidate `0.1.18` on merge base `8c8a149f`, including published 0.1.17 source; no 0.1.18 tag or release created |
+| Documentation/source review | Intel implementation candidate `0.1.18`, local commit `a53319e506ca49fa9b65de99f51ba3e6c03f1272`, includes published 0.1.17 source; no 0.1.18 tag or release created |
 | Installed internal dogfood | Version `0.1.17`, RC9 build `1023.7`, source `394c8a03`; owner accepted the inspected apps on 2026-09-03. Plist version/build/minimum-OS were independently rechecked; this does not qualify every historical credential or clean-profile case |
 | Public service | Read-only `GET https://tibotattle.com/api/health`, HTTP 200, deployment source `304f3d736b6f9451d32a616bf3046ea628e828a3`, observed 2026-08-31 |
 | Public updater | Stable `0.1.16`; read-only feed check recorded 2026-09-03 in the release plan |
@@ -115,6 +115,14 @@ The complete qualification matrix and rules for changing these claims are in
 [platform-support.md](./reference/platform-support.md).
 
 ## Release qualification and known boundaries
+
+- The [Intel implementation plan](./plans/2026-09-03-macos-intel-release.md)
+  records separate thin builds, architecture-specific update/publication
+  contracts and manifest-driven website availability. Native/Rosetta and Worker
+  checks pass; the final root run has 3,736 passes and two stale R7 receipt
+  failures following the 0.1.18 version bump. Physical Intel, private-history R7
+  regeneration, signing/notarization and installed update qualification remain
+  separate gates. No Intel release, feed or website was published.
 
 - The [public-release plan](./plans/2026-09-03-public-0.1.17-release.md)
   tracks final build `1024`, exact signed-artifact and prior-stable replacement

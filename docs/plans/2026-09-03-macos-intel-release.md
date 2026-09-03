@@ -54,8 +54,11 @@ Do not reuse the ARM 0.1.17 artifact as Intel recovery/update history.
   DMGs with the same version/tag/commit. Website Intel download, version, minimum
   macOS and checksum appear only for validated Intel evidence. Intel Homebrew
   remains unadvertised until the separate tap supports it.
-- [ ] Source tests, Worker checks, retained native artifact gates, actual Intel
-  development build/DMG and isolated synthetic Rosetta smoke pass on this source.
+- [x] Native artifact gates, actual Intel development build/DMG, isolated
+  synthetic Rosetta smoke and full Worker checks pass; full-root results and
+  the separate R7 freshness failure are recorded below.
+- [ ] Regenerate retained R7 receipts through the protected real-history workflow
+  before claiming a completely green root suite or fresh release evidence.
 - [x] Browser checks cover available and unavailable Intel states, ARM regression,
   keyboard selection and mobile layout, distinguishing synthetic UI fixtures
   from published evidence.
@@ -128,24 +131,49 @@ servers were stopped after inspection.
 
 Updater tests cover first Intel bootstrap while an ARM feed already exists,
 unchanged ARM bytes, signature/CAS/nonce checks, wrong-architecture history,
-wrong namespaces and mismatched signed version/filename. Worker checks pass
-through type, script and runtime tests; final clean-tree asset staging/dry
-bundling is tracked separately from deployment.
+wrong namespaces and mismatched signed version/filename. The complete Worker check passed, including 529 runtime tests, type/script
+checks, production asset staging and both dry bundles. It used validated,
+publicly released ARM 0.1.17 bytes and the real published social image; generated
+Intel metadata remains null. Nothing was deployed.
 
 The initial full root run found three stale native test expectations for the
 extracted feed policy/new validation fields and a missing tool-inventory caller
-entry. Those were corrected without weakening runtime assertions. A fresh full
-run is pending at this checkpoint. The two R7 freshness failures remain:
+entry. Those were corrected without weakening runtime assertions. The final
+full root run on the implementation committed as `a53319e5` completed with
+**3,736 passed, 2 failed and 17 existing conditional skips** (3,755 total).
+Both remaining failures are the R7 freshness/decision checks:
 0.1.18 changes six version/compatibility files in the hashed R7 workload closure.
 All retained R7 receipts are consequently stale. They were not rewritten,
 skipped or relabelled. The [R7 runbook](../runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md)
 requires separately authorized local regeneration because the real-history
 profile reads the owner's private Codex corpus.
 
+## Final local Intel artifacts
+
+These are ad-hoc local outputs, not Developer ID/notarized installers. All eight
+Preview binaries and all three Development binaries were independently checked
+with `lipo` and contain exactly `x86_64`. The final Preview DMG was mounted and
+validated without installing it. Its size is **52,054,408 bytes** and SHA-256 is
+`9ed1fb80a150137441da87d94c2b54056bae52c63ce2d494d74bc319da59a3ec`.
+
+The final Development build passed normal and JIT-less loopback lifecycle
+smokes in fresh synthetic homes. Both profiles passed compiled architecture
+routing, updater, fake Login Item and in-memory Keychain broker contracts.
+Migration UI smoke passed in Development and was correctly refused in Preview.
+An additional 31 credential, accounting and telemetry tests passed using the
+pinned Intel Node binary under Rosetta. This does not qualify physical Intel
+provider discovery, user state, Keychain prompts or installed update behavior.
+
+Local evidence is retained under `.release-build/intel-complete/`; root and
+Worker logs are `.release-build/intel-full-root-final.log` and
+`.release-build/intel-worker-complete-check.log`. Browser captures are
+`.release-build/intel-website-*.png`. These ignored local outputs are not public
+release evidence and must not be uploaded as a substitute for qualification.
+
 ## Gates before an Intel release
 
-1. Complete local regression and clean-tree Worker dry-build evidence, including
-   protected R7 receipt regeneration before relying on those release receipts.
+1. Regenerate the protected R7 receipts and rerun their freshness tests before
+   claiming a completely green root suite or relying on those release receipts.
 2. Finalize a common clean annotated 0.1.18 source tag only after review. Keep
    dogfood/stable build allocation and source identity identical across the two
    architectures. Do not change the immutable 0.1.17 release or tag.
