@@ -1143,6 +1143,12 @@ function scaledUsdString(value) {
 // never reaches a spread, JSON, or the closed cache schema.
 const EXACT_SCALED = Symbol("exactUsdScaledPending");
 const SCALED_TOTAL = Symbol("pricedUsdScaledTotals");
+// A fused unified read delivers one raw usage row to both the windowed and
+// the full-history consumer. The projection is a pure function of the row
+// and the (memoized, instance-independent) pricer, so the first consumer
+// leaves it on the row under this non-enumerable symbol and the second reuses
+// it rather than pricing the row again.
+const PROJECTED_EVENT = Symbol("projectedUsageEvent");
 
 function bigIntNanoUsdString(value) {
   const whole = value / 1_000_000_000n;
@@ -4049,6 +4055,37 @@ export async function buildReplaySafeAccountingCache({
       checkRuntimeMemory();
     }
   };
+  // Unified authority: the full-history period total is folded in the SAME
+  // physical read as the windowed scan. A unified reader that supports the
+  // fused read delivers every usage row of the generation's covered range to
+  // this consumer (rows inside the window arrive after the windowed consumer
+  // has projected them, so the projection is shared); a scanner that does
+  // not report `indexedHistory` falls back to the separate full-history read
+  // below. The accumulation mirrors buildReplaySafeAccountingPeriod exactly,
+  // metered by this build's own RSS guard.
+  const historyPeriod = selectedSourceMode === "unified"
+    ? newPeriod("history", "Indexed history")
+    : null;
+  let historyAcceptedEvents = 0;
+  const historyOnUsage = (rawEvent) => {
+    throwIfAborted(signal);
+    const observedAt = canonicalInstant(rawEvent?.timestamp);
+    if (observedAt === null) return;
+    let event = rawEvent[PROJECTED_EVENT];
+    if (event === undefined) {
+      event = eventProjection(rawEvent, price);
+      if (event === null) return;
+      const observedMs = Date.parse(observedAt);
+      event.declaredSpeed = event.speed === "unknown"
+        ? declaredSpeedModeAt(baselines, observedMs) ?? "unknown"
+        : "unknown";
+    }
+    addEvent(historyPeriod, event);
+    historyAcceptedEvents += 1;
+    if (historyAcceptedEvents % ACCOUNTING_RSS_CHECK_INTERVAL === 0) {
+      checkRuntimeMemory();
+    }
+  };
   let scanned;
   let unifiedCoverage = null;
   try {
@@ -4063,6 +4100,9 @@ export async function buildReplaySafeAccountingCache({
       // corpus supplies calibration, the streaming corpus derives attribution
       // itself and this pass is a pure aggregate consumer.
       usageAttribution: retainWindowedCalibrationInputs ? "required" : "none",
+      ...(historyPeriod === null
+        ? {}
+        : { indexedHistory: { onUsage: historyOnUsage } }),
       onUsage: (rawEvent) => {
         throwIfAborted(signal);
         const observedAt = canonicalInstant(rawEvent?.timestamp);
@@ -4076,6 +4116,13 @@ export async function buildReplaySafeAccountingCache({
         event.declaredSpeed = event.speed === "unknown"
           ? declaredSpeedModeAt(baselines, observedMs) ?? "unknown"
           : "unknown";
+        if (Object.isExtensible(rawEvent)) {
+          Object.defineProperty(rawEvent, PROJECTED_EVENT, {
+            value: event,
+            enumerable: false,
+            configurable: true,
+          });
+        }
         if (retainWindowedCalibrationInputs) {
           reserveTransitionInput("usage");
         } else {
@@ -4172,23 +4219,55 @@ export async function buildReplaySafeAccountingCache({
     unifiedCoverage?.generationFingerprint ?? null,
   );
   if (selectedSourceMode === "unified" && unifiedCoverage !== null) {
+    const fusedHistory = scanned?.indexedHistory;
     let historyScanned = null;
     const historyScan = async (scanOptions) => {
       historyScanned = await effectiveScan(scanOptions);
       return historyScanned;
     };
     try {
-      const historyValue = await buildReplaySafeAccountingPeriod({
-        id: "history",
-        label: "Indexed history",
-        startAt: unifiedCoverage.coveredAt.startAt,
-        endAt: unifiedCoverage.coveredAt.endAt,
-        scan: historyScan,
-        signal,
-        declaredSpeedBaselines: baselines,
-        rss,
-        maximumRssBytes: effectiveMaximumRssBytes,
-      });
+      let historyValue;
+      if (fusedHistory !== undefined) {
+        // The reader proved the covered range in the fused read; an
+        // unavailable outcome carries the same reader code a separate read
+        // of that range would have thrown, and takes the same path below.
+        if (fusedHistory?.status !== "available") {
+          throw fixedError(
+            typeof fusedHistory?.errorCode === "string"
+              ? fusedHistory.errorCode
+              : "local_unified_index_read_failed",
+          );
+        }
+        historyScanned = {
+          ...scanned,
+          coverage: fusedHistory.coverage,
+          capabilities: fusedHistory.capabilities,
+          diagnosticsAvailable: fusedHistory.diagnosticsAvailable,
+        };
+        historyValue = {
+          generatedAt: unifiedCoverage.coveredAt.endAt,
+          coveredAt: {
+            startAt: unifiedCoverage.coveredAt.startAt,
+            endAt: unifiedCoverage.coveredAt.endAt,
+          },
+          priceEpochBasis: HISTORICAL_PRICE_EPOCH_BASIS,
+          priceRegistryVersion: APP_PRICE_REGISTRY_MANIFEST.version,
+          priceRegistryObservedAt: APP_PRICE_REGISTRY_MANIFEST.observedAt,
+          period: finalizePeriod(historyPeriod),
+        };
+      } else {
+        historyValue = await buildReplaySafeAccountingPeriod({
+          id: "history",
+          label: "Indexed history",
+          startAt: unifiedCoverage.coveredAt.startAt,
+          endAt: unifiedCoverage.coveredAt.endAt,
+          scan: historyScan,
+          signal,
+          declaredSpeedBaselines: baselines,
+          rss,
+          maximumRssBytes: effectiveMaximumRssBytes,
+        });
+      }
       const historyCoverage = normalizeUnifiedCoverage(
         historyScanned,
         expectedGeneration,

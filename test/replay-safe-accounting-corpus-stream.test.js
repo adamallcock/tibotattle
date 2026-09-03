@@ -18,6 +18,9 @@ import {
   readUnifiedIndexGenerationDescriptor,
 } from "../src/local-unified-index.js";
 import { stableJson } from "../src/storage.js";
+import {
+  createLocalUnifiedAccountingSource,
+} from "../src/local-unified-accounting-source.js";
 
 // The streaming calibration corpus (2026-08-19). The pre-streaming reader
 // materialized every priced compact usage row before the fit and the
@@ -747,6 +750,65 @@ test("the default production rebuild is isolated in a child and byte-identical t
     const written = await readReplaySafeAccountingCache({ stateFile });
     assert.equal(written.status, "available");
     assert.deepEqual(written.cache, viaSubprocess);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("the fused single-read build is byte-identical to the separate full-history read", { timeout: 120_000 }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-fused-history-"));
+  try {
+    // Two reset windows more than a year before NOW and two inside the
+    // 365-day scan window: the covered range extends past the window on the
+    // old side, so the history period holds rows the windowed pass never sees.
+    const fixture = await writeCompleteGenerationIndex(
+      join(directory, "local-unified-index-v1.sqlite"),
+      {
+        resetStarts: [
+          Date.parse("2025-05-07T00:00:00.000Z"),
+          Date.parse("2025-05-14T00:00:00.000Z"),
+          Date.parse("2026-06-04T00:00:00.000Z"),
+          Date.parse("2026-06-11T00:00:00.000Z"),
+        ],
+        boundariesPerReset: 60,
+        usagePerBoundary: 8,
+      },
+    );
+    const options = {
+      sourceMode: "unified",
+      expectedGeneration: fixture.expectedGeneration,
+      unifiedIndexFile: fixture.indexFile,
+      contextBehavior: "legacy_zero",
+      now: () => NOW,
+      declaredSpeedBaselines: DECLARED_SPEED_BASELINES,
+    };
+    const fused = await buildReplaySafeAccountingCache(options);
+    // The same reader, refusing the fused consumer: the build must fall back
+    // to its separate full-history read and produce the identical artifact.
+    const reader = createLocalUnifiedAccountingSource({
+      indexFile: fixture.indexFile,
+      requireComplete: true,
+      expectedGeneration: fixture.expectedGeneration,
+      contextBehavior: "legacy_zero",
+    });
+    let reads = 0;
+    const separate = await buildReplaySafeAccountingCache({
+      ...options,
+      scan: (scanOptions) => {
+        reads += 1;
+        return reader({ ...scanOptions, indexedHistory: undefined });
+      },
+    });
+    assert.equal(reads, 2);
+    assert.equal(stableJson(fused), stableJson(separate));
+    assert.equal(fused.history.status, "available");
+    assert.equal(fused.history.period.events, fixture.usageRows);
+    const windowed = fused.periods.find((period) => period.id === "all");
+    assert.ok(
+      fused.history.period.events > windowed.events,
+      "history must include the rows older than the scan window",
+    );
+    assert.ok(windowed.events > 0);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

@@ -755,6 +755,111 @@ test("the one-pass attribution precomputation reproduces every point-query read 
   }
 });
 
+test("an indexed-history consumer receives the covered range in the same read, proven per window", async () => {
+  const fixture = await createAttributionIndex({
+    sources: [{ id: 1, session: 1 }],
+    records: Array.from({ length: 12 }, (_, index) => ({
+      offset: index + 1,
+      at: index * 1_000,
+      tokens: index === 5 ? 0 : 1,
+      quotas: [{ plan: "pro" }],
+    })),
+  });
+  try {
+    const source = createLocalUnifiedAccountingSource({
+      indexFile: fixture.indexFile,
+      requireComplete: true,
+    });
+    const windowStartMs = OBSERVED_MS + 7_000;
+    const request = () => {
+      const windowed = [];
+      const history = [];
+      const quota = [];
+      return {
+        windowed,
+        history,
+        quota,
+        options: {
+          startAt: new Date(windowStartMs).toISOString(),
+          endAt: END_AT,
+          onUsage: (row) => windowed.push(row),
+          onRateLimitSnapshot: (row) => quota.push(row),
+          indexedHistory: { onUsage: (row) => history.push(row) },
+        },
+      };
+    };
+    const fused = request();
+    const result = await source(fused.options);
+    assert.equal(result.indexedHistory.status, "available");
+    assert.equal(result.indexedHistory.errorCode, null);
+    assert.equal(result.indexedHistory.coverage.generationId, result.coverage.generationId);
+    assert.deepEqual(result.indexedHistory.coverage.coveredAt, result.coverage.coveredAt);
+    assert.deepEqual(result.indexedHistory.capabilities, result.capabilities);
+    // The window saw only its own rows; history saw every usage row of the
+    // covered range (the zero-token record is not a usage row for either).
+    assert.deepEqual(fused.windowed.map((row) => row.sourceOffset), [8, 9, 10, 11, 12]);
+    assert.deepEqual(fused.history.map((row) => row.sourceOffset), [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]);
+    // Quota rows are delivered for the window only.
+    assert.deepEqual(fused.quota.map((row) => row.sourceOffset), [8, 9, 10, 11, 12]);
+    // A row inside both windows is one object, delivered to both consumers
+    // with the windowed consumer's attribution; history-only rows carry none.
+    assert.equal(fused.history[6], fused.windowed[0]);
+    assert.ok(Object.hasOwn(fused.windowed[0], "planAttribution"));
+    assert.equal(Object.hasOwn(fused.history[0], "planAttribution"), false);
+    assert.equal(fused.history[0].model, "gpt-5.6-sol");
+    // Sequence numbers are unique across everything delivered.
+    const sequences = [...fused.windowed, ...fused.history, ...fused.quota].map((row) => row.sequence);
+    assert.equal(new Set(sequences).size, 5 + 6 + 5);
+
+    // The same rows, read separately, are byte-for-byte what the fused read
+    // delivered (attribution keys aside, which history never receives).
+    const separate = [];
+    const separateResult = await source({
+      startAt: result.coverage.coveredAt.startAt,
+      endAt: result.coverage.coveredAt.endAt,
+      usageAttribution: "none",
+      onUsage: (row) => separate.push(row),
+    });
+    const strip = ({ sequence, planAttribution, usageIntervalStartedAt, usageIntervalBasis, ...rest }) => rest;
+    assert.deepEqual(fused.history.map(strip), separate.map(strip));
+    assert.deepEqual(separateResult.coverage, result.indexedHistory.coverage);
+
+    // A covered-range proof failure leaves the window's read intact and is
+    // reported with the code a separate read of that range throws.
+    const database = openLocalUnifiedIndex(fixture.indexFile);
+    database.prepare(`
+      UPDATE usage_event SET source_offset = NULL
+      WHERE observed_at_ms = ?`).run(OBSERVED_MS + 1_000);
+    database.close();
+    const degraded = request();
+    const degradedResult = await source(degraded.options);
+    assert.equal(degradedResult.coverage.status, "complete");
+    assert.deepEqual(degraded.windowed.map((row) => row.sourceOffset), [8, 9, 10, 11, 12]);
+    assert.deepEqual(degraded.history, []);
+    assert.equal(degradedResult.indexedHistory.status, "unavailable");
+    assert.equal(
+      degradedResult.indexedHistory.errorCode,
+      "local_unified_index_accounting_coverage_incomplete",
+    );
+    await assert.rejects(
+      source({
+        startAt: result.coverage.coveredAt.startAt,
+        endAt: result.coverage.coveredAt.endAt,
+        onUsage: () => {},
+      }),
+      (error) => error.code === "local_unified_index_accounting_coverage_incomplete",
+    );
+    for (const indexedHistory of [null, "history", [], {}, { onUsage: 1 }]) {
+      await assert.rejects(
+        source({ startAt: START_AT, endAt: END_AT, indexedHistory }),
+        (error) => error.code === "local_unified_index_read_request_invalid",
+      );
+    }
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("the current unified index maps deterministically without mutating SQLite", async () => {
   const { root, indexFile } = await createIndex();
   try {

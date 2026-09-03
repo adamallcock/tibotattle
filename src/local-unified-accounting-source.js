@@ -892,6 +892,28 @@ async function revalidatePublishedSnapshot({
   }
 }
 
+function capabilitiesFor(coverage) {
+  return {
+    readsRawSources: false,
+    deterministicCanonicalOrder: coverage.generationProof,
+    sourceOrderingProvenance: coverage.provenanceComplete,
+    sourceOffsetProvenance: coverage.provenanceComplete,
+    sourceScopedQuotaOccurrences: coverage.quotaOccurrencesComplete,
+    durableDiagnostics: coverage.diagnosticsComplete,
+    crashSafeGenerationPublication: coverage.generationProof,
+  };
+}
+
+function unavailableHistoryRead(errorCode) {
+  return {
+    status: "unavailable",
+    errorCode,
+    coverage: null,
+    capabilities: null,
+    diagnosticsAvailable: null,
+  };
+}
+
 function rememberBounded(cache, key, value, limit) {
   cache.delete(key);
   cache.set(key, value);
@@ -1283,6 +1305,7 @@ function validateRequest({
   onUsage,
   onRateLimitSnapshot,
   usageAttribution,
+  indexedHistory,
 }) {
   const start = canonicalInstant(startAt);
   const end = canonicalInstant(endAt);
@@ -1292,7 +1315,12 @@ function validateRequest({
       || (onRateLimitSnapshot !== undefined
         && typeof onRateLimitSnapshot !== "function")
       || (usageAttribution !== undefined
-        && !USAGE_ATTRIBUTION_MODES.has(usageAttribution))) {
+        && !USAGE_ATTRIBUTION_MODES.has(usageAttribution))
+      || (indexedHistory !== undefined
+        && (indexedHistory === null
+          || typeof indexedHistory !== "object"
+          || Array.isArray(indexedHistory)
+          || typeof indexedHistory.onUsage !== "function"))) {
     throw fixedError("local_unified_index_read_request_invalid", "TypeError");
   }
   return {
@@ -1334,6 +1362,15 @@ export function createLocalUnifiedAccountingSource({
     onUsage,
     onRateLimitSnapshot,
     usageAttribution,
+    // Optional second consumer: `{ onUsage }` receives every usage row of the
+    // published generation's whole covered range (never quota rows, never
+    // attribution) in the SAME physical pass as the requested window. The
+    // covered range is proven with exactly the checks a separate read of it
+    // would run; if that proof fails with a reader code the result reports
+    // `indexedHistory.status: "unavailable"` with the code, the pass shrinks
+    // back to the requested window, and the requested window's own read is
+    // unaffected — the two outcomes are independent, as two reads would be.
+    indexedHistory,
   } = {}) {
     const window = validateRequest({
       startAt,
@@ -1342,6 +1379,7 @@ export function createLocalUnifiedAccountingSource({
       onUsage,
       onRateLimitSnapshot,
       usageAttribution,
+      indexedHistory,
     });
     throwIfAborted(signal);
     let metadata;
@@ -1370,43 +1408,101 @@ export function createLocalUnifiedAccountingSource({
         throw fixedError("local_unified_index_file_changed");
       }
       const meta = readMeta(database);
-      const coverage = readCurrentGeneration(database, meta, window, {
-        verifyPublishedGeneration: verifyGeneration,
-      });
-      if (expected !== null
-          && ((expected.id !== null && expected.id !== coverage.generationId)
-            || (expected.fingerprint !== null
-              && expected.fingerprint !== coverage.generationFingerprint))) {
-        throw fixedError("local_unified_index_generation_mismatch");
-      }
-      const contractVersion = requiredMetaText(meta, "contract_version");
-      if (!SAFE_TOKEN.test(contractVersion)) {
-        throw fixedError("local_unified_index_meta_invalid");
-      }
-      validateUsageJoins(database, {
-        ...window,
-        verifyPublishedGeneration: verifyGeneration,
-      });
-      const compatibility = parserCompatibility(
-        database,
-        contractVersion,
-        coverage.generationId,
-      );
-      if (compatibility.status !== "compatible"
-          && coverage.status === "complete") {
-        coverage.status = "partial";
-        coverage.generationProof = false;
-        coverage.blockReason = "mixed_parser_versions";
-      }
-      const attestedGap = coverage.status === "partial"
-        && coverage.blockReason === "codex_rollout_sources_quarantined"
-        && coverage.generationProof === true;
-      if (requireComplete && coverage.status !== "complete" && !attestedGap) {
-        throw fixedError("local_unified_index_accounting_coverage_incomplete");
-      }
-      const diagnostics = readDiagnostics(database, coverage.generationId);
+      // The proof one requested window needs, in the order the reader has
+      // always run it. The covered-range consumer below runs the identical
+      // sequence for its own window, so a fused read proves each window
+      // exactly as a separate read of that window would.
+      const validateWindow = ({ startAt: requestedStartAt, endAt: requestedEndAt }) => {
+        const requested = { startAt: requestedStartAt, endAt: requestedEndAt };
+        const proven = readCurrentGeneration(database, meta, requested, {
+          verifyPublishedGeneration: verifyGeneration,
+        });
+        if (expected !== null
+            && ((expected.id !== null && expected.id !== proven.generationId)
+              || (expected.fingerprint !== null
+                && expected.fingerprint !== proven.generationFingerprint))) {
+          throw fixedError("local_unified_index_generation_mismatch");
+        }
+        const provenContractVersion = requiredMetaText(meta, "contract_version");
+        if (!SAFE_TOKEN.test(provenContractVersion)) {
+          throw fixedError("local_unified_index_meta_invalid");
+        }
+        validateUsageJoins(database, {
+          startAt: requested.startAt,
+          endAt: requested.endAt,
+          verifyPublishedGeneration: verifyGeneration,
+        });
+        const provenCompatibility = parserCompatibility(
+          database,
+          provenContractVersion,
+          proven.generationId,
+        );
+        if (provenCompatibility.status !== "compatible"
+            && proven.status === "complete") {
+          proven.status = "partial";
+          proven.generationProof = false;
+          proven.blockReason = "mixed_parser_versions";
+        }
+        const attestedGap = proven.status === "partial"
+          && proven.blockReason === "codex_rollout_sources_quarantined"
+          && proven.generationProof === true;
+        if (requireComplete && proven.status !== "complete" && !attestedGap) {
+          throw fixedError("local_unified_index_accounting_coverage_incomplete");
+        }
+        return {
+          coverage: proven,
+          contractVersion: provenContractVersion,
+          compatibility: provenCompatibility,
+          diagnostics: readDiagnostics(database, proven.generationId),
+        };
+      };
+      const { coverage, contractVersion, compatibility, diagnostics } =
+        validateWindow(window);
       const startMs = Date.parse(window.startAt);
       const endMs = Date.parse(window.endAt);
+      let historyRead = null;
+      let historyRange = null;
+      if (indexedHistory !== undefined) {
+        const coveredAt = coverage.coveredAt;
+        if (coveredAt === null) {
+          historyRead = unavailableHistoryRead(
+            "local_unified_index_coverage_unavailable",
+          );
+        } else {
+          try {
+            const proven = validateWindow({
+              startAt: coveredAt.startAt,
+              endAt: coveredAt.endAt,
+            });
+            historyRange = {
+              startMs: Date.parse(coveredAt.startAt),
+              endMs: Date.parse(coveredAt.endAt),
+            };
+            historyRead = {
+              status: "available",
+              errorCode: null,
+              coverage: proven.coverage,
+              capabilities: capabilitiesFor(proven.coverage),
+              diagnosticsAvailable: proven.coverage.diagnosticsComplete,
+            };
+          } catch (error) {
+            if (typeof error?.code !== "string"
+                || !error.code.startsWith("local_unified_index_")) {
+              throw error;
+            }
+            historyRead = unavailableHistoryRead(error.code);
+          }
+        }
+      }
+      // One physical pass over the union of the proven windows; each row is
+      // delivered only to the consumers whose window contains it, exactly as
+      // separate bounded reads would have delivered it.
+      const scanStartMs = historyRange === null
+        ? startMs
+        : Math.min(startMs, historyRange.startMs);
+      const scanEndMs = historyRange === null
+        ? endMs
+        : Math.max(endMs, historyRange.endMs);
       // Attribution is derived only for a consumer that declared it will read
       // it. The aggregate consumers (period totals, timelines) never do, and
       // on a large index the per-row lookups were two thirds of a rebuild.
@@ -1464,10 +1560,14 @@ export function createLocalUnifiedAccountingSource({
                  COALESCE(u.source_offset, 9223372036854775807),
                  u.event_key
       `);
-      for (const row of usageStatement.iterate(startMs, endMs)) {
+      for (const row of usageStatement.iterate(scanStartMs, scanEndMs)) {
         throwIfAborted(signal);
         validateEventKey(row.event_key);
         const { observedAtMs, timestamp } = timestampForMs(row.observed_at_ms);
+        const inWindow = observedAtMs >= startMs && observedAtMs <= endMs;
+        const inHistory = historyRange !== null
+          && observedAtMs >= historyRange.startMs
+          && observedAtMs <= historyRange.endMs;
         const components = usageComponents(row);
         if (!hasUsage(components)) continue;
         const totalInputContextTokens = safeNonNegativeInteger(
@@ -1491,7 +1591,7 @@ export function createLocalUnifiedAccountingSource({
           ? null
           : timestampForMs(tierObservedAtMs).timestamp;
         const usage = {
-          ...attributionReader?.read(row),
+          ...(inWindow ? attributionReader?.read(row) : undefined),
           timestamp,
           timestampMs: observedAtMs,
           model: safeText(row.model_id),
@@ -1523,9 +1623,13 @@ export function createLocalUnifiedAccountingSource({
           usage.sourceRolloutOrdinal = sourceOrdinal;
           usage.sourceOrdinal = sourceOrdinal;
         }
-        if (onUsage !== undefined) {
+        if (inWindow && onUsage !== undefined) {
           usage.sequence = sequence++;
           await deliver(onUsage, usage);
+        }
+        if (inHistory) {
+          if (usage.sequence === undefined) usage.sequence = sequence++;
+          await deliver(indexedHistory.onUsage, usage);
         }
       }
 
@@ -1547,7 +1651,10 @@ export function createLocalUnifiedAccountingSource({
                  q.slot_order,
                  q.id
       `);
-      for (const row of quotaStatement.iterate(startMs, endMs)) {
+      // Quota rows across the whole scanned range are validated (a separate
+      // read of the covered range validated them too); only the requested
+      // window's rows are delivered, since the history consumer takes none.
+      for (const row of quotaStatement.iterate(scanStartMs, scanEndMs)) {
         throwIfAborted(signal);
         const { observedAtMs, timestamp } = timestampForMs(row.observed_at_ms);
         const durationMins = safeNonNegativeInteger(row.duration_mins);
@@ -1601,7 +1708,8 @@ export function createLocalUnifiedAccountingSource({
           sourceOffset,
           slotOrder,
         };
-        if (onRateLimitSnapshot !== undefined) {
+        if (onRateLimitSnapshot !== undefined
+            && observedAtMs >= startMs && observedAtMs <= endMs) {
           quota.sequence = sequence++;
           await deliver(onRateLimitSnapshot, quota);
         }
@@ -1615,16 +1723,22 @@ export function createLocalUnifiedAccountingSource({
         requestedWindow: window,
         verifyPublishedGeneration: verifyGeneration,
       });
-      const capabilities = {
-        readsRawSources: false,
-        deterministicCanonicalOrder: coverage.generationProof,
-        sourceOrderingProvenance: coverage.provenanceComplete,
-        sourceOffsetProvenance: coverage.provenanceComplete,
-        sourceScopedQuotaOccurrences: coverage.quotaOccurrencesComplete,
-        durableDiagnostics: coverage.diagnosticsComplete,
-        crashSafeGenerationPublication: coverage.generationProof,
-      };
+      if (historyRange !== null) {
+        await revalidatePublishedSnapshot({
+          indexFile,
+          metadata,
+          database,
+          coverage: historyRead.coverage,
+          requestedWindow: {
+            startAt: coverage.coveredAt.startAt,
+            endAt: coverage.coveredAt.endAt,
+          },
+          verifyPublishedGeneration: verifyGeneration,
+        });
+      }
+      const capabilities = capabilitiesFor(coverage);
       return {
+        ...(historyRead === null ? {} : { indexedHistory: historyRead }),
         readerVersion: LOCAL_UNIFIED_ACCOUNTING_SOURCE_VERSION,
         schemaVersion: LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
         parserVersion: compatibility.parserVersions.length === 1
