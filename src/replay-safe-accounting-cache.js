@@ -3302,8 +3302,17 @@ async function openUnifiedIndexCalibrationCorpus({
       }
     }
 
+    // The unary `+` on observed_at_ms is a deliberate planner hint, not
+    // arithmetic: it stops SQLite from choosing the observed_at_ms index for
+    // the (usually unbounded) time range and then sorting the ENTIRE range in
+    // a temp b-tree to serve each 20k-row keyset page. Measured on a 727k-row
+    // index that plan cost ~2 s per page (~37 pages); the rowid primary-key
+    // walk this forces satisfies ORDER BY u.rowid directly and serves a page
+    // in single-digit milliseconds. The predicate, the row set and the row
+    // order are identical either way (SQLite evaluates the same comparison,
+    // it just cannot use the index for it).
     const usageStatement = database.prepare(`${USAGE_COLUMNS}
-      WHERE u.rowid > ? AND u.observed_at_ms >= ? AND u.observed_at_ms <= ?
+      WHERE u.rowid > ? AND +u.observed_at_ms >= ? AND +u.observed_at_ms <= ?
       ORDER BY u.rowid
       LIMIT ${UNIFIED_CALIBRATION_READ_BATCH_ROWS}`);
     // Discovery pass: thin (observedMs, rowid) stamps for the rows the corpus

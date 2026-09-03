@@ -711,18 +711,27 @@ function validateUsageJoins(
   const usageCount = Number(database.prepare(`
     SELECT COUNT(*) AS count FROM usage_event u${where}
   `).get(...parameters)?.count ?? 0);
-  const joinedEvents = Number(database.prepare(`
+  // Every dimension id is an INTEGER PRIMARY KEY, so an inner join over the
+  // four dimensions matches each usage row at most once and the joined count
+  // equals the usage count exactly when no row references a missing
+  // dimension. Ask that question directly: the planner turns the four-way
+  // join into a scan of the smallest dimension times the whole usage range
+  // (~4.5 s per call on a 727k-row index), while four correlated primary-key
+  // probes finish the same proof in ~0.3 s. The pass/fail result is identical.
+  const orphanedEvents = Number(database.prepare(`
     SELECT COUNT(*) AS count
     FROM usage_event u
-    JOIN model m ON m.id = u.model_id
-    JOIN tier_semantics t ON t.id = u.tier_id
-    JOIN surface_class s ON s.id = u.surface_id
-    JOIN account_scope a ON a.id = u.account_scope_id
-    ${where}
+    ${verifyPublishedGeneration ? "WHERE" : `${where}
+      AND`} (
+      NOT EXISTS (SELECT 1 FROM model m WHERE m.id = u.model_id)
+      OR NOT EXISTS (SELECT 1 FROM tier_semantics t WHERE t.id = u.tier_id)
+      OR NOT EXISTS (SELECT 1 FROM surface_class s WHERE s.id = u.surface_id)
+      OR NOT EXISTS (
+        SELECT 1 FROM account_scope a WHERE a.id = u.account_scope_id))
   `).get(...parameters)?.count ?? 0);
   if (!Number.isSafeInteger(usageCount)
-      || !Number.isSafeInteger(joinedEvents)
-      || joinedEvents !== usageCount) {
+      || !Number.isSafeInteger(orphanedEvents)
+      || orphanedEvents !== 0) {
     throw fixedError("local_unified_index_row_invalid");
   }
 }
