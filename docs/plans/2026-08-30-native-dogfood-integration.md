@@ -533,6 +533,18 @@ The remaining two failures are the expected stale R7 source fingerprints.
 The five-file focused recheck passed 52/52, without skips or weakened tests.
 The full-root command is not green; rerun it after final-source R7.
 
+A follow-up low-memory review found that a planned allocation exceeding RSS
+headroom escaped the optional precompute into whole-refresh deferral. The first
+private comparison was canceled through its supported signal handler (exit 1,
+`command_aborted`); its partial outputs are not qualification evidence.
+The fix catches only the optional reservation code at the caller and falls back
+to point queries. Actual RSS overflow, invalid measurements, cancellation and
+generation failures still propagate. A new integration regression proves valid
+durable publication, zero deferral callbacks and exact complete-cache parity
+when only the point reader fits. The accounting owning suites then passed
+135/135 with no skips or failures. Restart the controlled comparison on the
+corrected clean source.
+
 The latest owner authorization covers local candidate preparation, signing,
 notarization and dogfood testing, not publication. Stable release approval,
 remote version-tag publication, GitHub release, Sparkle feed, Homebrew/website,

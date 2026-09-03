@@ -3825,13 +3825,23 @@ async function openUnifiedIndexCalibrationCorpus({
       // the existing retained-byte budget and runtime headroom. Every walk
       // yields/checks cancellation and RSS; an oversized optimization falls
       // back to the authoritative point queries without excluding history.
-      attributionPrecompute = await precomputeLocalUnifiedUsageAttribution({
-        database,
-        generationId,
-        maximumRetainedBytes: limits.retainedBytes,
-        signal,
-        checkRuntimeMemory,
-      });
+      try {
+        attributionPrecompute = await precomputeLocalUnifiedUsageAttribution({
+          database,
+          generationId,
+          maximumRetainedBytes: limits.retainedBytes,
+          signal,
+          checkRuntimeMemory,
+        });
+      } catch (error) {
+        // A reservation for OPTIONAL arrays/dictionary is not required by
+        // the point-query reader. Decline only that planned allocation;
+        // actual RSS failures, invalid samples, cancellation and provenance
+        // failures still propagate through the normal build policy.
+        if (error?.code !== "accounting_transition_memory_budget_exceeded"
+            || error?.name === "AbortError") throw error;
+        attributionPrecompute = null;
+      }
       attributionReader = createLocalUnifiedUsageAttributionReader({
         database,
         generationId,

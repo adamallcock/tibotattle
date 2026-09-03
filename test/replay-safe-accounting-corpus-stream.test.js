@@ -923,6 +923,54 @@ test("an oversized optional precompute falls back without changing retained cali
   }
 });
 
+test("insufficient RSS headroom for optional precompute completes through the point reader without deferring", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-precompute-headroom-"));
+  try {
+    const fixture = await writeCompleteGenerationIndex(join(directory, "index.sqlite"), {
+      resetStarts: Array.from({ length: 3 }, (_, week) => Date.parse("2026-05-07T00:00:00.000Z") + week * WEEK_MS),
+      boundariesPerReset: 100, usagePerBoundary: 8, scannedBytes: 1 << 20,
+    });
+    const baselineRss = 1024 * 1024;
+    const availableHeadroom = 2048;
+    assert.ok(availableHeadroom < fixture.usageRows * 32, "the optional live-row columns cannot fit");
+    assert.ok(availableHeadroom > 100 * 14, "the required retained-position memo still fits");
+    const metrics = [];
+    const deferrals = [];
+    const caches = [];
+    for (const headroom of [availableHeadroom, 4 * 1024 * 1024]) {
+      const stateFile = join(directory, `state-${headroom}.sqlite`);
+      const cache = await refreshReplaySafeAccountingCache({
+        stateFile, sourceMode: "unified", expectedGeneration: fixture.expectedGeneration,
+        unifiedIndexFile: fixture.indexFile, now: () => NOW,
+        declaredSpeedBaselines: DECLARED_SPEED_BASELINES,
+        transitionResourceLimits: { usageEvents: 100 },
+        rebuildIsolation: "in_process",
+        rss: () => baselineRss, maximumRssBytes: baselineRss + headroom,
+        onCalibrationCorpusMetrics: (value) => { metrics.push(value); },
+        onAccountingRebuildDeferred: (value) => { deferrals.push(value); },
+      });
+      assert.equal(cache.schemaVersion, REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION);
+      assert.equal(cache.history.status, "available");
+      assert.equal(cache.history.period.events, fixture.usageRows);
+      const saved = await readReplaySafeAccountingCache({ stateFile });
+      assert.equal(saved.status, "available", "the completed refresh published a valid durable cache");
+      assert.equal(stableJson(saved.cache), stableJson(cache));
+      caches.push(cache);
+    }
+    assert.deepEqual(deferrals, []);
+    assert.equal(metrics.length, 2);
+    assert.equal(metrics[0].attributionPrecomputeUsed, false);
+    assert.equal(metrics[0].attributionPrecomputeRows, 0);
+    assert.equal(metrics[0].attributionPrecomputeBytes, 0);
+    assert.equal(metrics[1].attributionPrecomputeUsed, true);
+    assert.equal(metrics[1].attributionPrecomputeRows, fixture.usageRows);
+    for (const value of metrics) assert.equal(value.retainedUsageEvents, 100);
+    assert.equal(stableJson(caches[0]), stableJson(caches[1]));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("full-history calibration refuses unpublished replacements without losing the prior cache", async () => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-unpublished-calibration-"));
   try {
