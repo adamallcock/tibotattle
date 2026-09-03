@@ -1,12 +1,12 @@
 import { PR94_LEDGER_COMPONENTS, validatePr94LedgerEvidenceAggregate } from "./pr94-ledger-evidence.mjs";
-import { validatePr94ProductionResourceEvidence } from "./pr94-production-resource-worker.mjs";
+import { validatePr94ProductionResourceEvidence, validatePr94ProductionResourceOutcome } from "./pr94-production-resource-worker.mjs";
 import { validatePr94PopulationEvidence } from "./pr94-population-evidence.mjs";
 
 // This module validates only the content-free public projections. Private
 // frame files remain the authority for row-level comparison and are never
 // accepted by these functions.
 const ANALYSIS_SCHEMA = "pr94-analysis-worker-v1";
-const RECEIPT_SCHEMA = "pr94-admitted-index-comparison-v1";
+const RECEIPT_SCHEMA = "pr94-admitted-index-comparison-v2";
 const CALIBRATION_SCHEMA = "pr94-calibration-evidence-v2";
 const CALIBRATION_COMPARISON_SCHEMA = "pr94-calibration-comparison-v2";
 const LEDGER_COMPARISON_SCHEMA = "pr94-ledger-comparison-v1";
@@ -608,7 +608,12 @@ function validateProductionResources(value, receipt, evidence) {
   exact(value, ["before", "after", "final"]);
   for (const side of ["before", "after", "final"]) {
     const resource = value[side];
-    try { validatePr94ProductionResourceEvidence(resource); } catch { reject(); }
+    try {
+      // Only the original merge may record its known unshippable artifact.
+      // Baseline and final candidate still require the strict success shape.
+      if (side === "after") validatePr94ProductionResourceOutcome(resource);
+      else validatePr94ProductionResourceEvidence(resource);
+    } catch { reject(); }
     if (resource.revision !== receipt.sources[side].revision
         || !same(resource.dependencies, receipt.sources[side].dependencies)
         || !same(resource.index, receipt.index)
@@ -621,12 +626,16 @@ function validateProductionResources(value, receipt, evidence) {
         || resource.generation.usageEvents !== generation.usageEvents
         || resource.generation.quotaOccurrences !== generation.quotaOccurrences) reject();
   }
+  const historicalRefusal = value.after.status === "historical_artifact_refused";
+  if (receipt.status !== (historicalRefusal
+    ? "passed_with_historical_artifact_refusal" : "passed")) reject();
   return value;
 }
 
 function validateReceiptLocal(value) {
   exact(value, RECEIPT_KEYS);
-  if (value.schema !== RECEIPT_SCHEMA || value.status !== "passed"
+  if (value.schema !== RECEIPT_SCHEMA
+      || !["passed", "passed_with_historical_artifact_refusal"].includes(value.status)
       || value.scope !== "fixed_admitted_index_analysis_not_raw_ingestion_or_hosted_activation") reject();
   validateSources(value.sources);
   validateIndex(value.index);

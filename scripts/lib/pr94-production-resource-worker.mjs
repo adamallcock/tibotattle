@@ -16,7 +16,7 @@ import {
 // ingestion, installed-app work, cache publication or application refresh runs
 // in the timed process. Repeated fresh processes prove child repeatability, not
 // an app-level no-change cache hit, relaunch, refresh or cancellation outcome.
-const SCHEMA = "pr94-production-resource-v1";
+const SCHEMA = "pr94-production-resource-v2";
 const DAY_MS = 86_400_000;
 const HASH = /^[a-f0-9]{64}$/u;
 const REVISION = /^[a-f0-9]{40}$/u;
@@ -29,6 +29,7 @@ const INPUT_LIMITS = ["usageEvents", "weeklySnapshots", "combinedInputs", "retai
 const CACHE_ARRAYS = ["periods", "timeline", "sparkUsageTimeline", "quotaTimeline", "sparkQuotaTimeline"];
 const RUN_KINDS = ["primary", "fresh_process_repeat"];
 const BEFORE_REVISION = "a3c850360bc83c0e27bef2171aeb4a302b72f472";
+const AFTER_REVISION = "20f449ff5c222989029fe343f219f02b497ae1d4";
 const QUERY_PLAN_SCHEMA = "pr94-attribution-query-plans-v1";
 const QUERY_ROLES = ["membership", "same_record_plans", "source_predecessor", "session_predecessor"];
 const QUERY_METHODS = ["get", "all", "get", "get"];
@@ -200,14 +201,20 @@ function validateProjection(value) {
   return value;
 }
 
-/** Call only after the selected revision's assertReplaySafeAccountingCache. */
-export function projectPr94ProductionCache(cache, { startAt, endAt, generationId, generationFingerprint }) {
+/** Bind even a refused historical artifact without treating it as valid. */
+export function assertPr94ProductionCacheContext(cache, { startAt, endAt, generationId, generationFingerprint }) {
   windowFor(startAt, endAt);
   integer(generationId, 1);
   if (!/^generation-v2-[a-f0-9]{64}$/u.test(generationFingerprint)) fail();
   if (cache?.generatedAt !== endAt || cache?.coveredAt?.startAt !== startAt || cache.coveredAt.endAt !== endAt
       || cache?.sourceDescriptor?.generation !== String(generationId)
       || cache.sourceDescriptor.generationFingerprint !== generationFingerprint) fail("cache_context_mismatch");
+}
+
+/** Call only after the selected revision's assertReplaySafeAccountingCache. */
+export function projectPr94ProductionCache(cache, context) {
+  assertPr94ProductionCacheContext(cache, context);
+  const { endAt } = context;
   const input = cache.weeklyCalibrationInput;
   if (!input || !input.coveredAt) fail();
   instant(input.coveredAt.startAt); instant(input.coveredAt.endAt);
@@ -278,7 +285,7 @@ async function probeRevision({ root, stage, path, context, command, environment,
 import { REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY as policy, REPLAY_SAFE_ACCOUNTING_REBUILD_REQUEST_VERSION as requestVersion, assertReplaySafeAccountingCache } from ${cacheUrl};
 import { openLocalUnifiedIndex, readUnifiedIndexGenerationDescriptor } from ${indexUrl};
 import * as readerModule from ${readerUrl};
-import { projectPr94ProductionCache, collectPr94AttributionQueryPlans } from ${projectionUrl};
+import { assertPr94ProductionCacheContext, projectPr94ProductionCache, collectPr94AttributionQueryPlans } from ${projectionUrl};
 try {
  if (process.argv[1] === 'metadata') {
   const db = openLocalUnifiedIndex(process.argv[2], { readOnly: true });
@@ -291,8 +298,17 @@ try {
   } finally { db.close(); }
  } else {
   const cache = JSON.parse(await readFile(process.argv[2], 'utf8'));
-  assertReplaySafeAccountingCache(cache);
-  process.stdout.write(JSON.stringify(projectPr94ProductionCache(cache, JSON.parse(process.argv[3]))));
+  const context = JSON.parse(process.argv[3]);
+  assertPr94ProductionCacheContext(cache, context);
+  let assertionRefused = false;
+  try {
+   assertReplaySafeAccountingCache(cache);
+  } catch (error) {
+   if (context?.revision !== '${AFTER_REVISION}' || error?.code !== 'cache_invalid') throw error;
+   assertionRefused = true;
+  }
+  if (assertionRefused) process.stdout.write(JSON.stringify({ status: 'refused', code: 'cache_invalid' }));
+  else process.stdout.write(JSON.stringify(projectPr94ProductionCache(cache, context)));
  }
 } catch { process.exitCode = 1; }`;
   let output;
@@ -340,6 +356,63 @@ export function validatePr94ProductionResourceEvidence(value) {
   return value;
 }
 
+function validateHistoricalCacheAssertion(value) {
+  exact(value, ["status", "code"]);
+  if (value.status !== "refused" || value.code !== "cache_invalid") fail();
+  return value;
+}
+
+function historicalCacheAssertion(value) {
+  try { return validateHistoricalCacheAssertion(value); }
+  catch { return null; }
+}
+
+function validateHistoricalArtifactRefusal(value) {
+  exact(value, ["schema", "scope", "status", "revision", "dependencies", "clock", "index", "generation", "policy",
+    "limits", "runs", "queryPlans", "exactRepeatOutput", "indexUnchanged", "sourceUnchanged", "dependenciesUnchanged", "notMeasured"]);
+  if (value.schema !== SCHEMA || value.scope !== "isolated_child_repeatability"
+      || value.status !== "historical_artifact_refused" || value.revision !== AFTER_REVISION) fail();
+  validateSource({ revision: value.revision, dependencies: value.dependencies }, AFTER_REVISION);
+  exact(value.clock, ["startAt", "endAt", "nowMs", "windowDays"]);
+  if (!same(value.clock, windowFor(value.clock.startAt, value.clock.endAt))) fail();
+  exact(value.index, ["sha256", "bytes"]); digest(value.index.sha256); integer(value.index.bytes, 1);
+  exact(value.generation, ["id", "publicationStatus", "toolProvenanceComplete", "usageEvents", "quotaOccurrences"]);
+  integer(value.generation.id, 1); integer(value.generation.usageEvents); integer(value.generation.quotaOccurrences);
+  if (!["complete", "partial"].includes(value.generation.publicationStatus)
+      || typeof value.generation.toolProvenanceComplete !== "boolean") fail();
+  validatePolicy(value.policy);
+  validatePr94AttributionQueryPlans(value.queryPlans, AFTER_REVISION);
+  exact(value.limits, ["envelopeBytes", "transportBytes", "durableCacheBytes"]);
+  if (!same(value.limits, { envelopeBytes: 64 * 1024, transportBytes: TRANSPORT_BYTES, durableCacheBytes: CACHE_BYTES })) fail();
+  if (!Array.isArray(value.runs) || value.runs.length !== 2) fail();
+  value.runs.forEach((run, index) => {
+    exact(run, ["kind", "metrics", "envelope", "artifact", "cacheAssertion"]);
+    if (run.kind !== RUN_KINDS[index]) fail();
+    exact(run.metrics, ["wallMs", "userCpuMs", "systemCpuMs", "peakRssBytes"]);
+    Object.values(run.metrics).forEach((measurement) => integer(measurement));
+    integer(run.metrics.peakRssBytes, 1, value.policy.maximumRssBytes);
+    const envelope = parseSuccessfulAccountingEnvelope(JSON.stringify(run.envelope));
+    exact(run.artifact, ["sha256", "bytes"]); digest(run.artifact.sha256); integer(run.artifact.bytes, 2, CACHE_BYTES);
+    if (envelope.resultBytes !== run.artifact.bytes || envelope.resultSha256 !== run.artifact.sha256) fail();
+    validateHistoricalCacheAssertion(run.cacheAssertion);
+  });
+  if (!same(value.runs[0].envelope, value.runs[1].envelope)
+      || !same(value.runs[0].artifact, value.runs[1].artifact)
+      || !same(value.runs[0].cacheAssertion, value.runs[1].cacheAssertion)
+      || value.exactRepeatOutput !== true || value.indexUnchanged !== true || value.sourceUnchanged !== true
+      || value.dependenciesUnchanged !== true
+      || !same(value.notMeasured, ["app_no_change_cache_hit", "app_relaunch", "end_to_end_refresh", "cancellation", "evidence_observer_overhead"])) fail();
+  return value;
+}
+
+/** Strict production evidence, or the one pinned historical refusal outcome. */
+export function validatePr94ProductionResourceOutcome(value) {
+  const status = value && typeof value === "object"
+    ? Object.getOwnPropertyDescriptor(value, "status") : null;
+  if (status && Object.hasOwn(status, "value")) return validateHistoricalArtifactRefusal(value);
+  return validatePr94ProductionResourceEvidence(value);
+}
+
 async function runWorker(options, {
   signal = null, command = runBoundedBenchmarkCommand, inspectSource = sourceIdentity,
   probe = probeRevision, runtime = { version: process.version, platform: process.platform, arch: process.arch },
@@ -380,7 +453,7 @@ async function runWorker(options, {
   if (generation.id !== options.expectedIndex.generationId) fail("generation_mismatch");
   const request = buildPr94ProductionResourceRequest({ ...clock, indexFile: options.indexFile, codexHome, ...initial });
   const context = { startAt: clock.startAt, endAt: clock.endAt, generationId: generation.id,
-    generationFingerprint: initial.generation.fingerprint };
+    generationFingerprint: initial.generation.fingerprint, revision: options.expectedRevision };
   const runs = [];
   for (const kind of RUN_KINDS) {
     cancelled(signal);
@@ -398,11 +471,19 @@ async function runWorker(options, {
     const metrics = parseMacOsTimeMetrics(output.stderr);
     if (metrics.peakRssBytes > initial.policy.maximumRssBytes) fail("resource_limit_exceeded");
     const artifact = await verifyAccountingBenchmarkArtifact(resultFile, envelope, { signal });
-    const cache = validateProjection(await probe({ ...probeOptions, stage: "artifact", path: resultFile, context }));
+    const probed = await probe({ ...probeOptions, stage: "artifact", path: resultFile, context });
+    const cacheAssertion = historicalCacheAssertion(probed);
+    const cache = cacheAssertion === null ? validateProjection(probed) : null;
+    if (cacheAssertion !== null && options.expectedRevision !== AFTER_REVISION) fail("artifact_invalid");
     // Bind the exact file validated by the selected revision's public facade.
     if (!same(artifact, await verifyAccountingBenchmarkArtifact(resultFile, envelope, { signal }))) fail("artifact_changed");
-    if (runs.length && (!same(runs[0].artifact, artifact) || !same(runs[0].cache, cache))) fail("repeat_mismatch");
-    runs.push({ kind, metrics, envelope, artifact, cache });
+    const priorCache = runs.length && Object.hasOwn(runs[0], "cache") ? runs[0].cache : null;
+    const priorAssertion = runs.length && Object.hasOwn(runs[0], "cacheAssertion") ? runs[0].cacheAssertion : null;
+    if (runs.length && (!same(runs[0].envelope, envelope) || !same(runs[0].artifact, artifact)
+        || !same(priorCache, cache) || !same(priorAssertion, cacheAssertion))) fail("repeat_mismatch");
+    runs.push(cacheAssertion === null
+      ? { kind, metrics, envelope, artifact, cache }
+      : { kind, metrics, envelope, artifact, cacheAssertion });
   }
   cancelled(signal);
   if (!sameFile(indexStat, await inspectDetailedAccountingBenchmarkIndex(options.indexFile))
@@ -416,7 +497,7 @@ async function runWorker(options, {
   const finalOutputStat = await privateDirectory(options.outputDirectory);
   if (outputStat.dev !== finalOutputStat.dev || outputStat.ino !== finalOutputStat.ino) fail("path_invalid");
   cancelled(signal);
-  return validatePr94ProductionResourceEvidence({ schema: SCHEMA, scope: "isolated_child_repeatability",
+  const shared = { schema: SCHEMA, scope: "isolated_child_repeatability",
     revision: beforeSource.revision, dependencies: beforeSource.dependencies, clock,
     index: { sha256: indexSha256, bytes: indexStat.size },
     generation: { id: generation.id, publicationStatus: generation.publicationStatus,
@@ -424,7 +505,12 @@ async function runWorker(options, {
       quotaOccurrences: generation.quotaOccurrences }, policy: initial.policy, queryPlans: initial.queryPlans,
     limits: { envelopeBytes: 64 * 1024, transportBytes: TRANSPORT_BYTES, durableCacheBytes: CACHE_BYTES }, runs,
     exactRepeatOutput: true, indexUnchanged: true, sourceUnchanged: true, dependenciesUnchanged: true,
-    notMeasured: ["app_no_change_cache_hit", "app_relaunch", "end_to_end_refresh", "cancellation", "evidence_observer_overhead"] });
+    notMeasured: ["app_no_change_cache_hit", "app_relaunch", "end_to_end_refresh", "cancellation", "evidence_observer_overhead"] };
+  if (runs.every((run) => Object.hasOwn(run, "cacheAssertion"))) {
+    if (options.expectedRevision !== AFTER_REVISION) fail("artifact_invalid");
+    return validatePr94ProductionResourceOutcome({ ...shared, status: "historical_artifact_refused" });
+  }
+  return validatePr94ProductionResourceOutcome(shared);
 }
 
 /** Characterization adapters are function-only seams, never CLI input. */

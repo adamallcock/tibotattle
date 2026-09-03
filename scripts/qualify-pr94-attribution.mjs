@@ -303,7 +303,9 @@ export async function runPr94Qualification(options, { signal = null } = {}) {
     }
     cancelled(signal);
     const receipt = {
-      schema: "pr94-admitted-index-comparison-v1", status: "passed",
+      schema: "pr94-admitted-index-comparison-v2",
+      status: productionResources.after.status === "historical_artifact_refused"
+        ? "passed_with_historical_artifact_refusal" : "passed",
       scope: "fixed_admitted_index_analysis_not_raw_ingestion_or_hosted_activation",
       sources, index: { sha256: indexSha256, bytes: indexStat.size },
       window: { startAt: options.startAt, endAt: options.endAt }, comparison,

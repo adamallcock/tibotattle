@@ -147,7 +147,7 @@ function queryPlans(revision) {
 }
 function resource(side, receipt, evidence) {
   const generationEvidence = evidence[side].generation;
-  return { schema: "pr94-production-resource-v1", scope: "isolated_child_repeatability", revision: receipt.sources[side].revision,
+  return { schema: "pr94-production-resource-v2", scope: "isolated_child_repeatability", revision: receipt.sources[side].revision,
     dependencies: receipt.sources[side].dependencies,
     clock: { startAt: INSTANT_START, endAt: INSTANT_END, nowMs: Date.parse(INSTANT_END), windowDays: 365 },
     index: receipt.index, generation: { id: generationEvidence.id, publicationStatus: generationEvidence.publicationStatus,
@@ -171,7 +171,7 @@ function resource(side, receipt, evidence) {
 }
 function receipt() {
   const evidence = { before: analysis("before"), after: analysis("after"), final: analysis("final") };
-  const value = { schema: "pr94-admitted-index-comparison-v1", status: "passed",
+  const value = { schema: "pr94-admitted-index-comparison-v2", status: "passed",
     scope: "fixed_admitted_index_analysis_not_raw_ingestion_or_hosted_activation",
     sources: { before: source(BEFORE_REVISION), after: source(AFTER_REVISION), final: source("c") }, index: { sha256: HASH("6"), bytes: 1 },
     window: { startAt: INSTANT_START, endAt: INSTANT_END },
@@ -352,6 +352,40 @@ test("only the PR94 isolation pair requires identical locks; final dependencies 
   mixedPair.sources.after.dependencies.lockSha256 = HASH("7");
   mixedPair.productionResources.after.dependencies.lockSha256 = HASH("7");
   assert.throws(() => validatePr94ComparisonReceipt(mixedPair), { code: "pr94_receipt_comparison_invalid" });
+});
+
+test("historical artifact refusal requires an explicit v2 result and never substitutes for final validation", () => {
+  const value = receipt();
+  value.status = "passed_with_historical_artifact_refusal";
+  const historical = value.productionResources.after;
+  historical.status = "historical_artifact_refused";
+  historical.runs = historical.runs.map(({ cache, ...run }) => ({
+    ...run, cacheAssertion: { status: "refused", code: "cache_invalid" },
+  }));
+  assert.equal(validatePr94ComparisonReceipt(value), value);
+
+  for (const mutate of [
+    (changed) => { changed.status = "passed"; },
+    (changed) => { changed.schema = "pr94-admitted-index-comparison-v1"; },
+    (changed) => { changed.productionResources.after.schema = "pr94-production-resource-v1"; },
+    (changed) => { changed.productionResources.after.runs[1].cacheAssertion.code = "other_failure"; },
+    (changed) => { changed.productionResources.after.runs[1].artifact.sha256 = HASH("7"); },
+    (changed) => { changed.productionResources.after.index = { ...changed.productionResources.after.index, sha256: HASH("7") }; },
+    (changed) => { changed.productionResources.after.dependencies = {
+      ...changed.productionResources.after.dependencies, identitySha256: HASH("7"),
+    }; },
+    (changed) => { changed.productionResources.final = clone(changed.productionResources.after); },
+    (changed) => { changed.productionResources.before = clone(changed.productionResources.after); },
+    (changed) => { changed.comparison.attributionLedger.status = "different"; },
+    (changed) => { changed.comparison.attributionCalibration.status = "fail"; },
+    (changed) => { changed.productionResources.final.runs[0].cache.source.accountingCoverage = "partial"; },
+  ]) {
+    const changed = clone(value); mutate(changed);
+    assert.throws(() => validatePr94ComparisonReceipt(changed), { code: "pr94_receipt_comparison_invalid" });
+  }
+  const falseRefusal = receipt();
+  falseRefusal.status = "passed_with_historical_artifact_refusal";
+  assert.throws(() => validatePr94ComparisonReceipt(falseRefusal), { code: "pr94_receipt_comparison_invalid" });
 });
 
 test("closed validators reject accessor, symbol, prototype and raw content channels", () => {

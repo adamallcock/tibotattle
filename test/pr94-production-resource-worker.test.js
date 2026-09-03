@@ -8,6 +8,7 @@ import { REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY } from "../src/replay-safe-account
 import * as readerModule from "../src/local-unified-accounting-source.js";
 import { openLocalUnifiedIndex } from "../src/local-unified-index.js";
 import {
+  assertPr94ProductionCacheContext,
   PR94_PRODUCTION_ERROR_CODES,
   buildPr94ProductionResourceRequest,
   collectPr94AttributionQueryPlans,
@@ -15,6 +16,7 @@ import {
   runPr94ProductionResourceWorker,
   validatePr94AttributionQueryPlans,
   validatePr94ProductionResourceEvidence,
+  validatePr94ProductionResourceOutcome,
 } from "../scripts/lib/pr94-production-resource-worker.mjs";
 
 // All orchestration adapters below are synthetic. No revision child, real
@@ -158,10 +160,31 @@ test("projection rejects wrong clock/generation/source and out-of-budget input c
   ]) { const value = cache(); mutate(value); assert.throws(() => projectPr94ProductionCache(value, CONTEXT)); }
 });
 
+test("historical refusal context guard binds clock and generation without projecting an invalid cache", () => {
+  const full = cache();
+  const invalid = { generatedAt: full.generatedAt, coveredAt: full.coveredAt,
+    sourceDescriptor: full.sourceDescriptor };
+  assert.equal(assertPr94ProductionCacheContext(invalid, CONTEXT), undefined);
+  assert.throws(() => projectPr94ProductionCache(invalid, CONTEXT));
+  for (const mutate of [
+    (value) => { value.generatedAt = START; },
+    (value) => { value.coveredAt.startAt = END; },
+    (value) => { value.coveredAt.endAt = START; },
+    (value) => { value.sourceDescriptor.generation = "45"; },
+    (value) => { value.sourceDescriptor.generationFingerprint = `generation-v2-${"c".repeat(64)}`; },
+    (value) => { delete value.sourceDescriptor; },
+  ]) {
+    const value = clone(invalid); mutate(value);
+    assert.throws(() => assertPr94ProductionCacheContext(value, CONTEXT),
+      { code: "pr94_production_cache_context_mismatch" });
+  }
+});
+
 test("orchestration times only two unmodified production child processes, with exact identical requests", async () => {
   await fixture(async ({ options, adapters, calls, probes, identities, directory }) => {
     const receipt = await runPr94ProductionResourceWorker(options, adapters);
     assert.equal(validatePr94ProductionResourceEvidence(receipt), receipt);
+    assert.equal(receipt.schema, "pr94-production-resource-v2");
     assert.equal(receipt.scope, "isolated_child_repeatability");
     assert.equal(receipt.exactRepeatOutput, true);
     assert.equal(calls.length, 2);
@@ -201,6 +224,88 @@ test("baseline compact-v2 child artifacts remain valid in their own lane", async
     assert.equal(receipt.runs[0].cache.weeklyInput.encoding, "accounting_compact_v2");
     assert.deepEqual(receipt.queryPlans, queryPlans(BEFORE_REVISION));
   }, { encoding: "accounting_compact_v2", revision: BEFORE_REVISION });
+});
+
+test("exact historical after may report two deterministic strict cache-invalid assertions without a projection", async () => {
+  await fixture(async ({ options, adapters, calls, probes, artifact }) => {
+    const original = adapters.probe;
+    adapters.probe = async (request) => request.stage === "artifact"
+      ? (probes.push(request), { status: "refused", code: "cache_invalid" })
+      : original(request);
+    const receipt = await runPr94ProductionResourceWorker(options, adapters);
+    assert.equal(validatePr94ProductionResourceOutcome(receipt), receipt);
+    assert.throws(() => validatePr94ProductionResourceEvidence(receipt));
+    assert.equal(receipt.status, "historical_artifact_refused");
+    assert.equal(receipt.schema, "pr94-production-resource-v2");
+    assert.equal(receipt.revision, AFTER_REVISION);
+    assert.equal(calls.length, 2);
+    assert.equal(probes.filter(({ stage }) => stage === "artifact").length, 2);
+    assert.deepEqual(probes.filter(({ stage }) => stage === "artifact").map(({ context }) => context.revision),
+      [AFTER_REVISION, AFTER_REVISION]);
+    assert.deepEqual(receipt.runs.map((run) => run.cacheAssertion), [
+      { status: "refused", code: "cache_invalid" },
+      { status: "refused", code: "cache_invalid" },
+    ]);
+    assert.ok(receipt.runs.every((run) => !Object.hasOwn(run, "cache")));
+    assert.deepEqual(receipt.runs[0].artifact, receipt.runs[1].artifact);
+    assert.deepEqual(receipt.runs[0].envelope, receipt.runs[1].envelope);
+    assert.equal(receipt.runs[0].artifact.sha256, hash(artifact));
+    for (const mutate of [
+      (value) => { value.status = "passed"; },
+      (value) => { value.revision = REVISION; },
+      (value) => { value.runs[0].cacheAssertion.code = "other"; },
+      (value) => { value.runs[0].cache = { projected: true }; },
+      (value) => { value.runs[1].envelope.resultSha256 = SHA; },
+      (value) => { value.raw = "SYNTHETIC_PRIVATE"; },
+    ]) {
+      const changed = clone(receipt); mutate(changed);
+      assert.throws(() => validatePr94ProductionResourceOutcome(changed));
+    }
+  }, { revision: AFTER_REVISION });
+});
+
+test("historical refusal is rejected for other revisions, other codes, mixed runs and nondeterministic artifacts", async () => {
+  for (const scenario of ["before_revision", "other_revision", "wrong_code", "mixed", "changed_artifact"]) {
+    await fixture(async ({ options, adapters, calls }) => {
+      const originalProbe = adapters.probe;
+      let artifactProbes = 0;
+      adapters.probe = async (request) => {
+        if (request.stage !== "artifact") return originalProbe(request);
+        artifactProbes += 1;
+        if (scenario === "wrong_code") return { status: "refused", code: "accounting_cache_invalid" };
+        if (scenario === "mixed" && artifactProbes === 2) return originalProbe(request);
+        return { status: "refused", code: "cache_invalid" };
+      };
+      if (scenario === "changed_artifact") {
+        const originalCommand = adapters.command;
+        adapters.command = async (...args) => {
+          const output = await originalCommand(...args);
+          if (calls.length === 2) {
+            const changed = `${await readFile(args[1].at(-1), "utf8")} `;
+            await writeFile(args[1].at(-1), changed, { mode: 0o600 });
+            output.stdout = JSON.stringify({ status: "ok", resultBytes: Buffer.byteLength(changed), resultSha256: hash(changed) });
+          }
+          return output;
+        };
+      }
+      await assert.rejects(runPr94ProductionResourceWorker(options, adapters));
+      assert.equal(calls.length, ["before_revision", "other_revision", "wrong_code"].includes(scenario) ? 1 : 2);
+    }, { revision: scenario === "before_revision" ? BEFORE_REVISION
+      : scenario === "other_revision" ? REVISION : AFTER_REVISION });
+  }
+});
+
+test("ordinary strict evidence remains valid for before, after and final revisions", async () => {
+  for (const revision of [BEFORE_REVISION, AFTER_REVISION, REVISION]) {
+    await fixture(async ({ options, adapters }) => {
+      const receipt = await runPr94ProductionResourceWorker(options, adapters);
+      assert.equal(Object.hasOwn(receipt, "status"), false);
+      assert.equal(validatePr94ProductionResourceEvidence(receipt), receipt);
+      assert.equal(validatePr94ProductionResourceOutcome(receipt), receipt);
+      assert.ok(receipt.runs.every((run) => Object.hasOwn(run, "cache")
+        && !Object.hasOwn(run, "cacheAssertion")));
+    }, { revision });
+  }
 });
 
 test("approval, pinned revision, runtime and expected copied-index identity fail before child execution", async () => {
