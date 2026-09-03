@@ -259,8 +259,9 @@ protected R7, full source, signing, notarization, stapling, and installation
 gates. Its first installed refresh ingested generation 44 but the strict v0.14
 cache validator rejected inconsistent fit metadata. RC8 source retains that
 validator and projects fit metadata from the first eligible row. RC9 source is
-under validation on base `35802d21ede67d362533f4e2be6b38041ece1cda`: quick and
-detailed refresh separation, at-most-hourly automatic detailed attempts,
+under validation on base `35802d21ede67d362533f4e2be6b38041ece1cda`: one manual
+Refresh for quota and accounting, quick startup/automatic checks,
+at-most-hourly automatic detailed attempts,
 native terminal-state reconciliation, selected-plan Trends, and last-good
 snapshot persistence. Its `1023.7` allocation does not establish a built or
 installed artifact. Before RC9 is treated as installed dogfood evidence, repeat

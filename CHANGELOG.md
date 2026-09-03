@@ -299,8 +299,9 @@ published-release claim.
   v0.14 cache validator rejected accounting because the projection copied an
   excluded diagnostic-only row's eligibility onto a reset fitted from later
   eligible transitions. RC8 retains that strict validator and projects fit
-  metadata from the first eligible row. RC9 separates quick refresh from
-  detailed accounting, bounds automatic deep attempts to once per hour, restores
+  metadata from the first eligible row. RC9 combines manual quota and detailed
+  accounting refresh in one action, keeps automatic quota checks light, bounds
+  automatic deep attempts to once per hour, restores
   authoritative snapshot persistence, and supplies a scope-bound selected-plan
   Trends lane. RC9 still requires fresh exact-source R7, artifact, install, and
   physical verification; earlier candidates do not qualify these corrections.

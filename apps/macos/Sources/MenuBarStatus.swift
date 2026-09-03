@@ -2000,7 +2000,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
         // state is confirmed by the response and the poll that follows.
         snapshot.phase = .analyzing
         render()
-        reader.startAnalysis(base: dashboardURL, mode: .quick) { [weak self] result in
+        reader.startAnalysis(base: dashboardURL, mode: .detailed) { [weak self] result in
             guard let self,
                   !self.stopped,
                   self.companionGeneration == generation,

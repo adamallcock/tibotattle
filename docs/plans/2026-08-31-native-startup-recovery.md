@@ -193,7 +193,8 @@ internal dogfood testing may continue.
 The current corrective source is based on main `35802d21`, after RC8/PR #101.
 RC8 metadata (`0.1.17`, build `1023.6`) was observed in the installed app on
 2026-09-02; this is not a fresh signature or runtime qualification. RC9 `1023.7`
-separates startup/manual quick refresh from explicit or hourly detailed work,
+keeps startup/automatic quota refresh quick and uses one manual Refresh for
+detailed work, with at-most-hourly automatic detailed attempts,
 fences stale native status callbacks, restores authoritative snapshot persistence,
 and supplies a scope-bound mixed-plan Trends projection. It remains under source
 validation. The current execution and open release boundaries are in the

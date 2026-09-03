@@ -80,17 +80,20 @@ diagnostics, or community contributions.
 
 ## Refresh, progress, and recovery
 
-Use **Refresh** to update current quota and headline evidence. That ordinary
-action is intentionally light: it does not scan retained history or rebuild
-detailed accounting. The app keeps verified prior detailed figures visible,
-with their current freshness state, where the evidence permits.
+Use **Refresh** (or Cmd-R in the native app) to update quota, retained history,
+and detailed Usage-and-costs and Trends evidence together. A valid
+generation-bound accounting cache is reused; a changed generation is
+recalculated. There is no separate detailed-accounting button. The app keeps
+verified prior figures visible, with their current freshness state, while work
+is in progress. If another refresh is already running, the shared controller
+keeps that single operation authoritative. Native controls follow its progress;
+the browser shows an informational notice without starting a second operation.
 
-Choose **Recalculate detailed accounting…** when you explicitly want to advance
-retained history and rebuild the generation-bound Usage-and-costs and Trends
-evidence. While the app remains open it may make one automatic detailed attempt
-after an hour; startup and the intervening automatic checks stay light. Failed,
+Startup and frequent automatic quota checks stay light. While the app remains
+open it may make one automatic detailed attempt after an hour. Failed,
 cancelled, and interrupted detailed attempts count toward that hour so they do
-not become a retry loop.
+not become a retry loop. After an already-running quick quota check finishes,
+you can choose Refresh again to request detailed work.
 
 Trends compares the selected plan's compatible usage and quota history. Earlier
 history on another plan does not disable a usable current-plan fit, and it is

@@ -144,9 +144,10 @@ for the provenance and future-locale policy.
 - The dashboard binds to loopback only. The packaged app's network behavior is
   audited at build time (zero JavaScript and zero native network attempts in
   offline mode).
-- An ordinary Refresh updates current quota/headline evidence without scanning
-  retained history or rebuilding detailed accounting. The explicit detailed
-  recalculation reads more than the selected session folders. It processes
+- Manual Refresh updates quota and detailed accounting together, reusing a
+  valid generation-bound cache. Startup and frequent automatic quota checks
+  stay lightweight; automatic detailed attempts are limited to once per hour.
+  Detailed refresh reads more than the selected session folders. It processes
   metadata from the selected Codex `sessions` and `archived_sessions` folders;
   reads `state_5.sqlite` for rollout lineage and `config.toml` for service-tier
   settings; invokes the installed Codex binary's local `app-server` methods

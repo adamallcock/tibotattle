@@ -2158,6 +2158,16 @@ test("native refresh progress stays fixed-vocabulary and count-bounded", async (
   )?.[0] ?? "";
   assert.ok(manualRefresh, "manual menu-bar refresh action is present");
   assert.doesNotMatch(manualRefresh, /automaticRefreshSuppressed/u);
+  assert.match(manualRefresh, /reader\.startAnalysis\(base: dashboardURL, mode: \.detailed\)/u,
+    "manual menu and popover refresh use the existing full accounting route");
+  assert.match(manualRefresh, /case let \.started\(refreshID, _\), let \.alreadyRunning\(refreshID, _\):/u,
+    "a controller conflict joins the existing update without starting another build");
+  const automaticRefresh = menuBarStatusSource.slice(
+    menuBarStatusSource.indexOf("private func refreshStaleEvidenceIfNeeded()"),
+  );
+  assert.match(automaticRefresh, /reader\.startAnalysis\(base: dashboardURL, mode: \.quick\)/u,
+    "automatic stale-quota polling remains lightweight");
+  assert.doesNotMatch(automaticRefresh, /mode: \.detailed/u);
   assert.match(activityDecoder, /doubleValue\.rounded\(\.towardZero\)/u);
   assert.match(activityDecoder, /progress\["phase"\]/u);
   assert.match(activityDecoder, /progress\["kind"\][\s\S]*?"archive_index"/u);
@@ -2326,15 +2336,17 @@ test("unified toolbar preserves the rich loopback report and single authority", 
   assert.match(source, /settingsToolbarDelegate = toolbarDelegate/u);
   assert.match(
     toolbar,
-    /@objc private func refreshDashboardFromToolbar\(\) \{[\s\S]*?refreshLocalUsage\(automatic: false, mode: \.quick\)/u,
+    /@objc private func refreshDashboardFromToolbar\(\) \{[\s\S]*?refreshLocalUsage\(automatic: false, mode: \.detailed\)/u,
   );
-  assert.match(
-    toolbar,
-    /@objc private func recalculateDetailedAccounting\(\) \{[\s\S]*?refreshLocalUsage\(automatic: false, mode: \.detailed\)/u,
+  assert.doesNotMatch(
+    source,
+    /recalculateDetailedAccounting|nativeDashboardRecalculateDetailedAccounting/u,
+    "one manual Refresh action replaces the duplicate detailed-accounting menu action",
   );
   assert.match(
     source,
-    /let recalculateDetailedAccounting = NSMenuItem\([\s\S]*?nativeDashboardRecalculateDetailedAccounting[\s\S]*?#selector\(recalculateDetailedAccounting\)/u,
+    /let refresh = NSMenuItem\([\s\S]*?nativeDashboardRefreshUsage[\s\S]*?#selector\(refreshDashboardFromToolbar\),\s*keyEquivalent: "r"/u,
+    "Command-R uses the same manual full refresh as the toolbar",
   );
   assert.match(
     toolbar,

@@ -5584,10 +5584,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     @objc private func refreshDashboardFromToolbar() {
         // This reuses the existing foreground-only Node companion path. The
         // toolbar never starts a helper, daemon, or separate background task.
-        refreshLocalUsage(automatic: false, mode: .quick)
-    }
-
-    @objc private func recalculateDetailedAccounting() {
         refreshLocalUsage(automatic: false, mode: .detailed)
     }
 
@@ -6512,15 +6508,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         )
         refresh.target = self
         viewMenu.addItem(refresh)
-        let recalculateDetailedAccounting = NSMenuItem(
-            title: TiboTattleLocalization.string(
-                .nativeDashboardRecalculateDetailedAccounting
-            ),
-            action: #selector(recalculateDetailedAccounting),
-            keyEquivalent: ""
-        )
-        recalculateDetailedAccounting.target = self
-        viewMenu.addItem(recalculateDetailedAccounting)
         // The standard macOS sidebar command, on the standard key equivalent.
         // A collapsed sidebar has no divider left to drag, so this and the
         // toolbar item are the two ways back; the title is rewritten to

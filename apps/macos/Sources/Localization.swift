@@ -202,7 +202,6 @@ enum TiboTattleLocalization {
         case nativeDashboardProgressSaving = "nativeDashboard.progressSaving"
         case nativeDashboardRefreshUsage = "nativeDashboard.refreshUsage"
         case nativeDashboardRefreshUsageTooltip = "nativeDashboard.refreshUsageTooltip"
-        case nativeDashboardRecalculateDetailedAccounting = "nativeDashboard.recalculateDetailedAccounting"
         case nativeDashboardShare = "nativeDashboard.share"
         case nativeDashboardShareTooltip = "nativeDashboard.shareTooltip"
         case nativeDashboardStarting = "nativeDashboard.starting"
@@ -707,9 +706,7 @@ enum TiboTattleLocalization {
             case .nativeDashboardRefreshUsage:
                 "Refresh"
             case .nativeDashboardRefreshUsageTooltip:
-                "Refresh the current allowance and headline from local sources. Detailed accounting updates separately and stays on this Mac."
-            case .nativeDashboardRecalculateDetailedAccounting:
-                "Recalculate Detailed Accounting…"
+                "Refresh the current allowance, local history, and detailed accounting. Reuses valid cached results; all processing stays on this Mac."
             case .nativeDashboardShare:
                 "Share"
             case .nativeDashboardShareTooltip:
@@ -1147,7 +1144,7 @@ enum TiboTattleLocalization {
             case .settingsRefreshInterval:
                 "Refresh interval"
             case .settingsRefreshIntervalDetail:
-                "Checks current allowance while TiboTattle is open. Detailed accounting recalculates at most hourly, or when you choose it from View."
+                "Checks current allowance while TiboTattle is open. Detailed accounting updates automatically at most hourly; choose Refresh to update everything now."
             case .settingsRefreshIntervalOneMinute:
                 "Every minute"
             case .settingsRefreshIntervalFiveMinutes:

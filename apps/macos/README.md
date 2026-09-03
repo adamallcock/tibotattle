@@ -44,8 +44,9 @@ before treating source tests as signed-upgrade evidence.
 
 The companion's first snapshot uses its bounded startup projection and retains
 only validated last-good evidence with explicit coverage labels. The initial
-refresh updates current quota/headline evidence only. Detailed accounting runs
-through the explicit recalculation action or the bounded hourly attempt;
+automatic refresh updates current quota/headline evidence only. Manual
+**Refresh** updates quota and detailed accounting together; detailed accounting
+also runs through the bounded hourly attempt;
 optional contribution requests do not define local-dashboard readiness.
 The native host treats 20 seconds as a quiet slow-load threshold, keeps the
 document visible, and continues one generation-fenced readiness observation for
@@ -207,10 +208,10 @@ no names or identifiers are logged or persisted by this handoff. Native
 context-menu **Open Link** does not perform this Codex handoff; use the link
 itself. Existing HTTPS and hosted sign-in-return behavior are unchanged.
 
-The toolbar has no independent data authority. **Refresh usage** and Cmd-R use
-the already-running loopback companion's quick route, without index ingestion
-or detailed accounting. **View → Recalculate Detailed Accounting…** explicitly
-advances history and rebuilds accounting. The foreground interval may make at
+The toolbar has no independent data authority. **Refresh usage**, Cmd-R, and
+menu-bar/popover Refresh use the already-running loopback companion's detailed
+route: quota and retained history advance together, and valid cached accounting
+is reused. There is no separate detailed-accounting action. The foreground interval may make at
 most one automatic detailed attempt per hour while no refresh is in flight;
 startup and intervening checks stay quick. Failed, cancelled, and interrupted
 detailed attempts count toward the hourly budget. A companion terminal receipt
@@ -451,8 +452,9 @@ later eligible transitions. RC8 source retains the strict validator and projects
 fit metadata from the first eligible row.
 
 RC9 source is under validation on base `35802d21ede67d362533f4e2be6b38041ece1cda`.
-It separates quick quota/headline refresh from explicit detailed recalculation,
-bounds automatic detailed attempts to at most hourly, reconciles native refresh
+It keeps startup and frequent automatic quota checks quick, makes the single
+manual Refresh action update detailed accounting too, bounds automatic detailed
+attempts to at most hourly, reconciles native refresh
 completion from the controller, and restores selected-plan Trends with matching
 plan-scoped usage plus retained authoritative snapshots across relaunch. The
 allocation is not artifact or installed-app evidence: exact-source gates,

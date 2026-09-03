@@ -3,7 +3,7 @@
  *
  * Local companion contract:
  *   GET  /api/local/{onboarding,overview,gradient,weekly,quality}
- *   POST /api/local/refresh/quick (ordinary observation refresh)
+ *   POST /api/local/refresh/quick (automatic/lightweight observation refresh)
  *   POST /api/local/refresh       (explicit detailed-accounting rebuild)
  *
  * Hosted browser-session contract:

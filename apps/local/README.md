@@ -38,10 +38,10 @@ Startup defers the full-history projection so the first local dashboard does
 not wait for it. A validated last-authoritative snapshot may supply retained
 figures, labelled with their original provenance and the current projection's
 unavailable state. Without a valid saved snapshot, missing history remains
-unavailable. Ordinary Refresh publishes current quota/headline evidence and
-does not advance retained history. The explicit detailed recalculation replaces
-retained or unavailable details only after its generation-bound full projection
-completes.
+unavailable. Automatic lightweight refresh publishes current quota/headline
+evidence without advancing retained history. Manual **Refresh** updates quota
+and detailed accounting together, replacing retained or unavailable details
+only after its generation-bound full projection completes.
 
 To let the personal loopback dashboard read central-service health and use the
 fixed hosted identity/participation relay:
@@ -142,7 +142,7 @@ On first use:
 3. let the native launcher perform one quick quota/headline refresh after the
    dashboard's first paint, or choose **Refresh** in a standalone browser
    development session;
-4. when explicitly recalculating detailed accounting, keep reading as
+4. during manual **Refresh**, keep reading as
    TiboTattle continues bounded slices under that original action, or choose
    **Cancel** and resume later; and
 5. review the privacy-safe local results; then
@@ -182,9 +182,9 @@ that live cache and labels older observations as account-unattributed and
 potentially spanning multiple accounts. It does not read the replay-heavy
 collector record store as a substitute or perform a second raw-log pass.
 
-An ordinary quick refresh preserves the last authoritative accounting
+An automatic quick refresh preserves the last authoritative accounting
 projection while publishing the newly observed quota card; it never advances
-the unified index or starts a replay-safe rebuild. An explicit detailed refresh
+the unified index or starts a replay-safe rebuild. The single manual Refresh action
 advances the index and rebuilds from the retained authoritative corpus when the
 generation is not already cached. A display range is not a history-retention
 limit; the explicit legacy rollback scan has a configured window of at least

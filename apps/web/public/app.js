@@ -554,13 +554,6 @@ function updateLocalActionButtons() {
     button.disabled = localActionBusy || !allowed;
     if (!localActionBusy) button.textContent = label;
   }
-  const detailed = $("#recalculate-detailed-accounting");
-  if (detailed) {
-    detailed.disabled = localActionBusy || !allowed;
-    if (!localActionBusy) {
-      setLocalizedText(detailed, "refresh.recalculateDetailed");
-    }
-  }
   const setupCheck = $("#setup-check-again");
   if (setupCheck) setupCheck.disabled = localActionBusy;
   const companionCheck = $("#companion-check");
@@ -11463,9 +11456,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
     updateLocalActionButtons();
     return;
   }
-  const button = detailed
-    ? $("#recalculate-detailed-accounting")
-    : $("#refresh-button");
+  const button = $("#refresh-button");
   let refreshAccepted = false;
   let cancelled = false;
   let quickResultLoaded = false;
@@ -11688,6 +11679,17 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       setGlobalState(dashboard.state, {
         companionReachable: dashboard.mode !== "demo",
       });
+    }
+    if (!refreshAccepted && error?.status === 409) {
+      // Another surface owns the shared controller. In particular, a quick
+      // run is not proof that this request's detailed work was accepted. Do
+      // not enqueue an escalation or turn a safe conflict into a failure.
+      showConnectionNotice({
+        title: t("refresh.alreadyRunningTitle"),
+        copy: t("refresh.alreadyRunningCopy"),
+        kind: "info",
+      });
+      return;
     }
     // This was a bare `catch {}`: it printed one of three sentences for every
     // possible cause and discarded the only evidence of which one occurred.
@@ -14709,9 +14711,10 @@ async function restoreCommunitySession() {
   }
 }
 
-$("#refresh-button").addEventListener("click", requestRefresh);
-$("#setup-refresh").addEventListener("click", requestRefresh);
-$("#recalculate-detailed-accounting").addEventListener("click", () => {
+$("#refresh-button").addEventListener("click", () => {
+  void requestRefresh({ detailed: true });
+});
+$("#setup-refresh").addEventListener("click", () => {
   void requestRefresh({ detailed: true });
 });
 $("#cancel-refresh").addEventListener("click", cancelLocalAnalysis);

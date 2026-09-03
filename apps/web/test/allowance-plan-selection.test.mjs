@@ -391,11 +391,14 @@ test("dynamic plan labels and share transcripts cannot be replaced by static loc
     "even a labelled fixture cannot borrow a global legacy rate for an insufficient selected plan");
 });
 
-test("ordinary refresh stays quick and detailed accounting requires its explicit action", async () => {
+test("manual refresh includes detailed accounting while automatic refresh stays quick", async () => {
   const html = await readFile(new URL("../public/index.html", import.meta.url), "utf8");
   const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
-  assert.match(html, /id="recalculate-detailed-accounting"/u);
+  assert.doesNotMatch(html, /id="recalculate-detailed-accounting"/u,
+    "the accounting page does not offer a duplicate manual refresh action");
   assert.match(source, /localClient\.recalculateDetailedAccounting\(\)/u);
+  assert.match(source, /async function requestRefresh\(\{ autoContinue = false, detailed = false \} = \{\}\)/u,
+    "the shared default stays quick for startup and automatic callers");
   assert.match(source, /requestRefresh\(\{ detailed: true \}\)/u);
   assert.match(source, /if \(detailed\) scheduleReindexAutoContinuation\(\);/u,
     "ordinary quick refresh cannot schedule a history continuation");

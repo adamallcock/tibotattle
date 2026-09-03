@@ -139,9 +139,9 @@ The complete qualification matrix and rules for changing these claims are in
   the first eligible row. Its prior allocation was `1023.6`; the reviewed source
   base for this update is `35802d21ede67d362533f4e2be6b38041ece1cda`.
 - RC9 reserves monotonic build `1023.7`, strictly after RC8 and before stable
-  `1024`. Its source is under validation: ordinary refresh and startup collect
-  quick quota/headline evidence; explicit detailed recalculation remains
-  separate; automatic detailed attempts are at most hourly and count failed or
+  `1024`. Its source is under validation: a single manual Refresh updates quota
+  and detailed accounting, while startup and frequent automatic checks collect
+  quick quota/headline evidence; automatic detailed attempts are at most hourly and count failed or
   interrupted requests. Native polling uses controller mode/start receipts and
   terminal-state fencing, so browser-started work shares the cadence and stale
   pre-start replies cannot settle a new request. Trends pairs the selected
