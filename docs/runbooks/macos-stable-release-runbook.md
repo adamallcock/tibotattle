@@ -51,7 +51,11 @@ A version bump is **not** just package.json. Bump or regenerate all of:
    boundaries explicitly, and move shipped items out of `Unreleased`. Do not
    reconstruct claims or attribution that were not validated.
 
-Run the release preflight before tagging:
+Run candidate preflight while untagged work remains under `Unreleased`. The
+documentation checker requires a stable tag for a dated release entry: finalize
+and commit the release text, create the local annotated tag as described in
+section 1, then run the final preflight below before pushing that tag. Do not
+weaken the checker or edit tracked release text after freezing the tag.
 
 ~~~bash
 node scripts/check-release-notes.mjs
@@ -203,7 +207,9 @@ the new constant.
 
 The macOS finalizer requires an empty tree (including untracked files) and an
 exact annotated tag. The tag must identify the reviewed release commit and be
-protected by the repository's version-tag rules.
+protected by the repository's version-tag rules. It may identify the frozen,
+reviewed PR head; it need not identify the later main merge commit. Build only
+with HEAD at that exact tagged commit.
 
 The sole historical exception is the pre-policy `v0.1.10` published ref. It is
 a protected lightweight tag at
@@ -215,10 +221,35 @@ lightweight tag: every new stable tag must remain annotated and protected.
 
 ~~~bash
 git status --porcelain=v1 --untracked-files=all   # must print nothing
-git describe --exact-match --tags HEAD             # must print vX.Y.Z
-git tag -a vX.Y.Z <reviewed-commit> -m "TiboTattle X.Y.Z ..."
-git push origin vX.Y.Z
+git tag -a vX.Y.Z HEAD -m "TiboTattle X.Y.Z ..."  # final reviewed commit
+git describe --exact-match --tags HEAD           # must print vX.Y.Z
 ~~~
+
+For a tagged PR head, complete local checks and final-artifact validation from
+that frozen checkout before atomically pushing its branch and tag. Set
+`RELEASE_BRANCH` to the actual reviewed branch; do not push directly to main:
+
+~~~bash
+git push --atomic origin "refs/heads/$RELEASE_BRANCH" "refs/tags/vX.Y.Z"
+~~~
+
+Require passing CI for the frozen PR head after the remote tag is available.
+The release-trust PR job uses the PR merge checkout and fetches full history;
+the tag need not point at that synthetic merge. Merge normally, without squash
+or rebase, preserving the tagged head as an ancestor and an identical tree.
+Resolve `MERGE_COMMIT` to the actual resulting merge commit and verify:
+
+~~~bash
+git merge-base --is-ancestor "vX.Y.Z^{}" "$MERGE_COMMIT"
+git diff --exit-code "vX.Y.Z^{tree}" "$MERGE_COMMIT^{tree}"
+~~~
+
+Only then proceed to public release publication. Keep artifact provenance at
+the tagged PR-head commit, not the later merge commit. Do not rewrite tags or
+shared history; if CI or merge changes require different source bytes, stop and
+resolve the release identity before continuing. Final notes and changelog must
+already be committed before the local tag; later publication steps verify and
+upload that frozen text rather than changing it.
 
 Do not sign from a branch that is ahead of or different from the tag. The
 source identity later recorded in the release evidence descriptor must be the
@@ -268,23 +299,27 @@ The separate `TiboTattle Preview.app` identity may use the deterministic
 preview epoch (`2000.1.17` for 0.1.17); it does not participate in stable
 Sparkle ordering.
 
-RC7 source merge `87e07be350582713d815a21b4db470ed84aae037` passed its
-protected R7, full source, signing, notarization, stapling, and installation
-gates. Its first installed refresh ingested generation 44 but the strict v0.14
-cache validator rejected inconsistent fit metadata. RC8 source retains that
-validator and projects fit metadata from the first eligible row. RC9 source is
-under validation on base `35802d21ede67d362533f4e2be6b38041ece1cda`: one manual
-Refresh for quota and accounting, quick startup/automatic checks,
-at-most-hourly automatic detailed attempts,
-native terminal-state reconciliation, selected-plan Trends, and last-good
-snapshot persistence. Its `1023.7` allocation does not establish a built or
-installed artifact. Before RC9 is treated as installed dogfood evidence, repeat
-exact-source R7, full source, artifact, state-preserving install, installed
-refresh, and physical native checks. The formal PR #94 real-corpus comparator
-remains **OPEN / NOT RUN** and blocks stable or public qualification; an
-explicitly open-gate internal dogfood does not close it. Compatible hosted
-Worker migrations/deployment and end-to-end device pairing also remain open,
-separate gates; a desktop installation cannot qualify them.
+The owner accepted the runtime from source
+`394c8a03a986e0daadbe662679fd002202682e44` in dogfood `1023.7` and inspected
+stable build `1024`. That acceptance is the retained runtime basis, not proof
+of newly finalized bytes. The final `0.1.17`/`1024` artifact must bind the
+reviewed release tag and pass fresh signed-artifact and exact previous-stable
+replacement validation. Formal PR #94 local qualification completed with
+`passed_with_historical_artifact_refusal`; the final candidate passes its strict
+cache validator. The
+[qualification receipt](../receipts/2026-09-03-pr94-account-plan-attribution-qualification.md)
+records exact data conservation, coverage review, and resource measurements.
+Failed or partial earlier comparison runs remain historical failures, not
+qualification evidence.
+
+For 0.1.17 only, the full clean-profile/physical Login Item matrix is explicitly
+deferred, not passed, under the
+[owner's release-specific decision](../plans/2026-09-03-public-0.1.17-release.md).
+Automated isolated-profile and fake-manager checks do not establish those
+manual results. Data conservation, signatures, updater integrity, and the
+unexpected-Keychain-prompt stop condition remain unchanged. Hosted migrations,
+protocol activation, live contribution tests, and website publication remain
+separate; this release decision does not authorize them.
 
 Signing-key access on the release machine is a separate owner provisioning
 step, not an end-user permission requirement. If signing requests approval,
@@ -299,12 +334,34 @@ the final arm64 DMG at:
 .release-build/macos-release/TiboTattle-X.Y.Z-macOS-arm64.dmg
 ~~~
 
-Read the minimum OS out of the bundle now, and use only this value afterwards:
+Read the minimum OS and Finder dates from the app inside the final DMG, not
+the retained review candidate (the finalizer signs a separate staged app).
+After final validation, mount the DMG read-only without launching the app.
+Compare the outer `.app` directory's birth time and modification time against
+the committer timestamp of its sealed source commit:
 
 ~~~bash
-/usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" \
-  .release-build/macos-production/TiboTattle.app/Contents/Info.plist
+(
+  set -e
+  FINDER_DMG="$PWD/.release-build/macos-release/TiboTattle-X.Y.Z-macOS-arm64.dmg"
+  FINDER_MOUNT="$(mktemp -d /private/tmp/tibotattle-final-finder.XXXXXX)"
+  /usr/bin/hdiutil attach -readonly -nobrowse -mountpoint "$FINDER_MOUNT" "$FINDER_DMG"
+  trap '/usr/bin/hdiutil detach "$FINDER_MOUNT"' EXIT
+  FINDER_APP="$FINDER_MOUNT/TiboTattle.app"
+  FINDER_COMMIT="$(/usr/bin/plutil -extract release.source.commit raw -o - \
+    "$FINDER_APP/Contents/Resources/build-manifest.json")"
+  FINDER_EPOCH="$(git show -s --format=%ct "$FINDER_COMMIT^{commit}")"
+  test "$(/usr/bin/stat -f %B "$FINDER_APP")" = "$FINDER_EPOCH"
+  test "$(/usr/bin/stat -f %m "$FINDER_APP")" = "$FINDER_EPOCH"
+  /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" \
+    "$FINDER_APP/Contents/Info.plist"
+)
 ~~~
+
+Both timestamp comparisons must pass. This checks only the outer bundle's
+Finder metadata; internal payload timestamps remain normalized. Never repair
+dates inside a mounted or signed artifact. Use the printed minimum OS value
+afterwards.
 
 It is typed by hand in two places later — the "Requires macOS N or later" line
 in `release-notes/X.Y.Z.md`, and `--minimum-macos` in the release-site command
@@ -342,13 +399,14 @@ npm run product:macos:appcast -- \
   --channel stable \
   --app ".release-build/macos-production/TiboTattle.app" \
   --dmg ".release-build/macos-release/TiboTattle-X.Y.Z-macOS-arm64.dmg" \
-  --bundle-version "X.Y.Z" \
+  --bundle-version "1024" \
   --sparkle-public-ed-key "jhgPwmvWLMr7TGURJUoi6sXias7YP1F+hejZawKVTGw="
 ~~~
 
 This uses the pinned generate_appcast and embeds the feed signature required by
 the installed client's SURequireSignedFeed=true. A hand-built minimal appcast
-is not a valid updater subject.
+is not a valid updater subject. `1024` is the reviewed 0.1.17 bundle build, not
+the marketing version; future releases must use their reviewed allocation.
 
 Do **not** run the publishing command yet. The appcast is carried as updater
 metadata in the release evidence descriptor and is published only after the
@@ -544,12 +602,14 @@ gh release create "$TAG" --repo "$REPO" --verify-tag --draft \
   --title "TiboTattle X.Y.Z" --notes-file "$NOTES_FILE"
 # Use this baseline upload for a native/checksum-only manifest (null evidence):
 gh release upload "$TAG" --repo "$REPO" \
-  "$DMG" "$RELEASE_MANIFEST" "$SHA256SUMS" "$VERIFY_GUIDE"
+  "$DMG" "$RELEASE_MANIFEST" "$SHA256SUMS" "$VERIFY_GUIDE" \
+  "$RELEASE_DIR/appcast.xml"
 
 # For the attested v1 profile/path, use this command instead:
 gh release upload "$TAG" --repo "$REPO" \
   "$DMG" "$SPDX" "$PROVENANCE" "$SBOM_ATTESTATION" \
-  "$RELEASE_MANIFEST" "$SHA256SUMS" "$VERIFY_GUIDE"
+  "$RELEASE_MANIFEST" "$SHA256SUMS" "$VERIFY_GUIDE" \
+  "$RELEASE_DIR/appcast.xml"
 ~~~
 
 Download every asset into a fresh directory. During the draft phase, verify the
@@ -647,6 +707,7 @@ gh release verify-asset "$TAG" "$PUBLISHED_VERIFY_DIR/$ARTIFACT_NAME" --repo "$R
 gh release verify-asset "$TAG" "$PUBLISHED_VERIFY_DIR/release-manifest.json" --repo "$REPO"
 gh release verify-asset "$TAG" "$PUBLISHED_VERIFY_DIR/SHA256SUMS" --repo "$REPO"
 gh release verify-asset "$TAG" "$PUBLISHED_VERIFY_DIR/verify-release.md" --repo "$REPO"
+gh release verify-asset "$TAG" "$PUBLISHED_VERIFY_DIR/appcast.xml" --repo "$REPO"
 ~~~
 
 For an attested v1 profile/path, also verify each published evidence asset:
@@ -705,11 +766,23 @@ Verify content by **downloading the bytes and hashing them**, not by reading a
 field that says what you expect:
 
 ~~~bash
-curl -s -o /tmp/live.dmg "https://updates.tibotattle.com/releases/X.Y.Z/$SHA/TiboTattle-X.Y.Z-macOS-arm64.dmg"
-shasum -a 256 /tmp/live.dmg     # must equal $SHA
-gh release download "$TAG" --repo "$REPO" --dir /tmp/gh --pattern '*.dmg' --clobber
-shasum -a 256 /tmp/gh/*.dmg     # must equal $SHA
+(
+  set -e -o pipefail
+  LIVE_VERIFY_DIR="$(mktemp -d /private/tmp/tibotattle-live-update.XXXXXX)"
+  SPARKLE_DOWNLOAD_URL="$(/usr/bin/xmllint --xpath \
+    'string(/rss/channel/item/enclosure/@url)' "$RELEASE_DIR/appcast.xml")"
+  test -n "$SPARKLE_DOWNLOAD_URL"
+  curl --fail --show-error --location \
+    --output "$LIVE_VERIFY_DIR/$ARTIFACT_NAME" "$SPARKLE_DOWNLOAD_URL"
+  LIVE_SHA="$(shasum -a 256 "$LIVE_VERIFY_DIR/$ARTIFACT_NAME" | awk '{print $1}')"
+  EXPECTED_SHA="$(shasum -a 256 "$DMG" | awk '{print $1}')"
+  test "$LIVE_SHA" = "$EXPECTED_SHA"
+)
 ~~~
+
+Use the actual generated enclosure URL: its content-addressed namespace is the
+bundle build (`releases/1024/...` for 0.1.17), not the marketing version. The
+fresh GitHub-download validation in section 6 separately verifies those bytes.
 
 **A 200 from a hash-named R2 URL is evidence of publication, not of content.**
 The digest in that key is a naming convention; R2 serves whatever bytes live at
