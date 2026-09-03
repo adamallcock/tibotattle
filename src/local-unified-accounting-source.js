@@ -789,27 +789,39 @@ function hasUsage(components) {
   return Object.values(components).some((value) => value > 0);
 }
 
-async function invoke(callback, value, signal) {
-  if (callback === undefined) return;
-  try {
-    const result = callback(value);
-    if (result && typeof result.then === "function") await result;
-  } catch (error) {
-    if (error?.name === "AbortError"
-        || error?.code === "ABORT_ERR"
-        || signal?.aborted) {
-      const aborted = fixedError(
-        "local_unified_index_read_aborted",
-        "AbortError",
-      );
-      aborted[ADAPTER_ABORT] = true;
-      throw aborted;
-    }
-    if (CALLBACK_RESOURCE_CODES.has(error?.code)) {
-      throw fixedError(error.code);
-    }
-    throw fixedError("local_unified_index_callback_failed");
+function mapCallbackError(error, signal) {
+  if (error?.name === "AbortError"
+      || error?.code === "ABORT_ERR"
+      || signal?.aborted) {
+    const aborted = fixedError(
+      "local_unified_index_read_aborted",
+      "AbortError",
+    );
+    aborted[ADAPTER_ABORT] = true;
+    return aborted;
   }
+  if (CALLBACK_RESOURCE_CODES.has(error?.code)) {
+    return fixedError(error.code);
+  }
+  return fixedError("local_unified_index_callback_failed");
+}
+
+// Deliver one row. A synchronous consumer costs no promise at all; only a
+// consumer that returns a thenable is awaited. Either way a throw or a
+// rejection maps to the same fixed, content-free codes.
+function invoke(callback, value, signal) {
+  let result;
+  try {
+    result = callback(value);
+  } catch (error) {
+    throw mapCallbackError(error, signal);
+  }
+  if (result && typeof result.then === "function") {
+    return result.then(undefined, (error) => {
+      throw mapCallbackError(error, signal);
+    });
+  }
+  return undefined;
 }
 
 function readDiagnostics(database, generationId) {
@@ -1055,12 +1067,27 @@ export function createLocalUnifiedUsageAttributionReader({
   };
 }
 
+// What a usage consumer declares about the per-row attribution it will read.
+// "required" (the default, and the historical behavior) enriches every usage
+// row with plan attribution and usage-interval metadata, which costs a
+// membership lookup plus up to three indexed point queries per row. "none" is
+// for aggregate consumers that never read those fields — the rows carry no
+// attribution keys at all, so an accidental reader fails loudly rather than
+// reading a silently absent value.
+const USAGE_ATTRIBUTION_MODES = new Set(["required", "none"]);
+// Rows delivered between event-loop yields. Consumers run synchronously, so
+// a yield every so often is what lets an abort signalled from a macrotask
+// (SIGTERM, a timer, the parent's watchdog) actually reach the loop's abort
+// check instead of waiting for the whole stream.
+const CALLBACK_YIELD_ROWS = 2_048;
+
 function validateRequest({
   startAt,
   endAt,
   signal,
   onUsage,
   onRateLimitSnapshot,
+  usageAttribution,
 }) {
   const start = canonicalInstant(startAt);
   const end = canonicalInstant(endAt);
@@ -1068,10 +1095,20 @@ function validateRequest({
       || !validAbortSignal(signal)
       || (onUsage !== undefined && typeof onUsage !== "function")
       || (onRateLimitSnapshot !== undefined
-        && typeof onRateLimitSnapshot !== "function")) {
+        && typeof onRateLimitSnapshot !== "function")
+      || (usageAttribution !== undefined
+        && !USAGE_ATTRIBUTION_MODES.has(usageAttribution))) {
     throw fixedError("local_unified_index_read_request_invalid", "TypeError");
   }
-  return { startAt: start, endAt: end };
+  return {
+    startAt: start,
+    endAt: end,
+    usageAttribution: usageAttribution ?? "required",
+  };
+}
+
+function cooperativeYield() {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 /**
@@ -1101,6 +1138,7 @@ export function createLocalUnifiedAccountingSource({
     signal = null,
     onUsage,
     onRateLimitSnapshot,
+    usageAttribution,
   } = {}) {
     const window = validateRequest({
       startAt,
@@ -1108,6 +1146,7 @@ export function createLocalUnifiedAccountingSource({
       signal,
       onUsage,
       onRateLimitSnapshot,
+      usageAttribution,
     });
     throwIfAborted(signal);
     let metadata;
@@ -1173,12 +1212,27 @@ export function createLocalUnifiedAccountingSource({
       const diagnostics = readDiagnostics(database, coverage.generationId);
       const startMs = Date.parse(window.startAt);
       const endMs = Date.parse(window.endAt);
-      const attributionReader = onUsage === undefined ? null
+      // Attribution is derived only for a consumer that declared it will read
+      // it. The aggregate consumers (period totals, timelines) never do, and
+      // on a large index the per-row lookups were two thirds of a rebuild.
+      const attributionReader = onUsage === undefined
+          || window.usageAttribution !== "required"
+        ? null
         : createLocalUnifiedUsageAttributionReader({
           database,
           generationId: coverage.generationId,
         });
       let sequence = 0;
+      let deliveredSinceYield = 0;
+      const deliver = async (callback, value) => {
+        const pending = invoke(callback, value, signal);
+        if (pending !== undefined) await pending;
+        deliveredSinceYield += 1;
+        if (deliveredSinceYield === CALLBACK_YIELD_ROWS) {
+          deliveredSinceYield = 0;
+          await cooperativeYield();
+        }
+      };
       const usageStatement = database.prepare(`
         SELECT u.event_key,
                u.observed_at_ms,
@@ -1276,7 +1330,7 @@ export function createLocalUnifiedAccountingSource({
         }
         if (onUsage !== undefined) {
           usage.sequence = sequence++;
-          await invoke(onUsage, usage, signal);
+          await deliver(onUsage, usage);
         }
       }
 
@@ -1354,7 +1408,7 @@ export function createLocalUnifiedAccountingSource({
         };
         if (onRateLimitSnapshot !== undefined) {
           quota.sequence = sequence++;
-          await invoke(onRateLimitSnapshot, quota, signal);
+          await deliver(onRateLimitSnapshot, quota);
         }
       }
       throwIfAborted(signal);

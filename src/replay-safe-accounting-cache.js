@@ -2364,6 +2364,9 @@ export async function buildReplaySafeAccountingPeriod({
     startAt: canonicalStart,
     endAt: canonicalEnd,
     signal,
+    // A period total never reads plan attribution or usage intervals; declare
+    // that so a unified reader can skip deriving them for every row.
+    usageAttribution: "none",
     onUsage: (rawEvent) => {
       throwIfAborted(signal);
       const observedAt = canonicalInstant(rawEvent?.timestamp);
@@ -3846,6 +3849,11 @@ export async function buildReplaySafeAccountingCache({
       codexHome,
       resourceGuard: scanResourceGuard,
       signal,
+      // Per-row plan attribution is consumed only by the compact calibration
+      // rows this pass retains on the windowed-fallback path. When the unified
+      // corpus supplies calibration, the streaming corpus derives attribution
+      // itself and this pass is a pure aggregate consumer.
+      usageAttribution: retainWindowedCalibrationInputs ? "required" : "none",
       onUsage: (rawEvent) => {
         throwIfAborted(signal);
         const observedAt = canonicalInstant(rawEvent?.timestamp);

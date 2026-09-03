@@ -967,6 +967,96 @@ test("callback errors stay fixed and content-free, and sequence counts callbacks
   }
 });
 
+test("usage attribution is derived only for consumers that declare they read it", async () => {
+  const { root, indexFile } = await createIndex();
+  try {
+    const source = createLocalUnifiedAccountingSource({ indexFile });
+    const collect = async (request) => {
+      const usage = [];
+      await source({
+        startAt: START_AT,
+        endAt: END_AT,
+        onUsage: (row) => usage.push(row),
+        ...request,
+      });
+      return usage;
+    };
+    const attributionKeys = [
+      "planAttribution",
+      "usageIntervalStartedAt",
+      "usageIntervalBasis",
+    ];
+    for (const request of [{}, { usageAttribution: "required" }]) {
+      const usage = await collect(request);
+      assert.equal(usage.length, 2);
+      for (const row of usage) {
+        for (const key of attributionKeys) assert.ok(Object.hasOwn(row, key), key);
+      }
+    }
+    const aggregate = await collect({ usageAttribution: "none" });
+    assert.equal(aggregate.length, 2);
+    for (const row of aggregate) {
+      for (const key of attributionKeys) {
+        assert.equal(Object.hasOwn(row, key), false, key);
+      }
+      // Everything an aggregate consumer reads is still there, unchanged.
+      assert.equal(row.model, "gpt-5.6-sol");
+      assert.equal(typeof row.timestamp, "string");
+      assert.equal(row.sourceOrdinal, 0);
+    }
+    assert.deepEqual(
+      aggregate.map((row) => row.components.input_uncached_tokens),
+      [10, 20],
+    );
+    for (const usageAttribution of ["all", "", null, 1, true]) {
+      await assert.rejects(
+        source({ startAt: START_AT, endAt: END_AT, usageAttribution }),
+        (error) => error.code === "local_unified_index_read_request_invalid",
+        String(usageAttribution),
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an abort signalled from a macrotask stops the read within one yield cadence", async () => {
+  const rowCount = 6_000;
+  const fixture = await createAttributionIndex({
+    records: Array.from({ length: rowCount }, (_, index) => ({
+      at: index * 1_000,
+      tokens: 1,
+    })),
+  });
+  try {
+    const controller = new AbortController();
+    let delivered = 0;
+    await assert.rejects(
+      createLocalUnifiedAccountingSource({ indexFile: fixture.indexFile })({
+        startAt: START_AT,
+        endAt: new Date(OBSERVED_MS + rowCount * 1_000).toISOString(),
+        signal: controller.signal,
+        usageAttribution: "none",
+        onUsage: () => {
+          delivered += 1;
+          // Arm the abort from the event loop's check phase, exactly the way
+          // a signal handler or the parent's watchdog would reach the loop.
+          if (delivered === 1) setImmediate(() => controller.abort());
+        },
+      }),
+      (error) => error.name === "AbortError"
+        && error.code === "local_unified_index_read_aborted",
+    );
+    // Synchronous consumers are delivered without a promise per row, so the
+    // only place a macrotask can run is the loop's periodic cooperative
+    // yield. The abort must land there, not after the whole stream.
+    assert.ok(delivered >= 2, `expected delivery to begin, saw ${delivered}`);
+    assert.ok(delivered <= 2_049, `abort waited for ${delivered} rows`);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("orphaned dimensions and null quota percentages fail closed", async () => {
   const orphan = await createIndex();
   try {

@@ -2040,6 +2040,60 @@ test("the unified index supplies the full-history calibration corpus with no sca
   assert.equal(cache.schemaVersion, REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION);
 });
 
+test("aggregate scans declare no attribution and only the windowed fallback corpus requires it", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-attribution-declaration-"));
+  const indexFile = join(directory, "local-unified-index-v1.sqlite");
+  await writeUnifiedCalibrationFixture(indexFile, {
+    resets: [
+      Date.parse("2025-05-01T00:00:00.000Z"),
+      Date.parse("2025-05-08T00:00:00.000Z"),
+      Date.parse("2025-05-15T00:00:00.000Z"),
+    ],
+  });
+  const recording = (scan, modes) => async (options) => {
+    modes.push(options.usageAttribution ?? "(undeclared)");
+    return scan(options);
+  };
+  try {
+    // The unified corpus supplies calibration: the windowed pass is a pure
+    // aggregate consumer and must not ask for per-row attribution.
+    const withCorpus = [];
+    await buildReplaySafeAccountingCache({
+      now: () => Date.parse("2026-08-20T12:00:00.000Z"),
+      unifiedIndexFile: indexFile,
+      scan: recording(scanner([]), withCorpus),
+    });
+    assert.deepEqual(withCorpus, ["none"]);
+
+    // No usable unified corpus: the windowed pass retains the compact
+    // calibration rows itself and therefore needs attribution on every row.
+    const fallback = [];
+    await buildReplaySafeAccountingCache({
+      now: () => Date.parse("2026-08-20T12:00:00.000Z"),
+      scan: recording(scanner([]), fallback),
+    });
+    assert.deepEqual(fallback, ["required"]);
+
+    // Unified authority without a calibration corpus: the windowed pass still
+    // requires attribution, the full-history period total never does.
+    const unified = [];
+    await buildReplaySafeAccountingCache({
+      sourceMode: "unified",
+      expectedGeneration: "generation-test-1",
+      scan: recording(completeUnifiedScanner([
+        usageEvent({
+          timestamp: "2026-07-27T11:00:00.000Z",
+          components: { input_uncached_tokens: 1_000 },
+        }),
+      ]), unified),
+      now: () => NOW,
+    });
+    assert.deepEqual(unified, ["required", "none"]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("declared speed baselines resolve unified calibration events before scenario fitting", async () => {
   const directory = await mkdtemp(join(
     tmpdir(),
