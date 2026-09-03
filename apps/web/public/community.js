@@ -31,7 +31,12 @@ setFormattingLocale(localization.formatLocale());
 setMessageLocale(localization.locale());
 export const HOMEBREW_INSTALL_COMMAND =
   "brew install --cask adamallcock/tap/tibotattle";
-export const PUBLIC_PLATFORMS = Object.freeze(["macos", "windows", "linux"]);
+export const PUBLIC_PLATFORMS = Object.freeze([
+  "macos",
+  "macos-intel",
+  "windows",
+  "linux",
+]);
 const PUBLIC_PLATFORM_STORAGE_KEY = "tibotattle.download-platform.v1";
 // Resolve generated copy from the document language at render time. The
 // browser localizer updates that attribute before emitting its locale-change
@@ -70,6 +75,8 @@ function normalizePublicPlatform(candidate) {
  * Coarse browser-reported platform detection is used only to choose the first
  * visible tab. It never redirects, hides alternatives, starts a download, or
  * claims that the app is installed. Unknown and mobile platforms return null.
+ * MacIntel and Intel Mac OS X tokens also occur on Apple Silicon browsers, so
+ * Intel selection requires an explicit tab, URL, or saved choice.
  */
 export function detectPublicPlatform({
   userAgentDataPlatform = "",

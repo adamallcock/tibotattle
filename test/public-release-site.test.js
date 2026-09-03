@@ -458,26 +458,28 @@ function assertPublicEntryClaimBoundary(html, label = "public entry") {
 
 function assertPublishedPlatformSelectorContract(html) {
   const panelStarts = Object.fromEntries(
-    ["macos", "windows", "linux"].map((platform) => {
+    ["macos", "macos-intel", "windows", "linux"].map((platform) => {
       const marker = `id="platform-panel-${platform}"`;
       const index = html.indexOf(marker);
       assert.notEqual(index, -1, `published index includes the ${platform} panel`);
       return [platform, index];
     }),
   );
-  assert.ok(panelStarts.macos < panelStarts.windows, "macOS panel precedes Windows");
+  assert.ok(panelStarts.macos < panelStarts["macos-intel"], "Apple silicon panel precedes Intel");
+  assert.ok(panelStarts["macos-intel"] < panelStarts.windows, "macOS Intel panel precedes Windows");
   assert.ok(panelStarts.windows < panelStarts.linux, "Windows panel precedes Linux");
   const panelsEnd = html.indexOf('<a class="community-inline"', panelStarts.linux);
   assert.notEqual(panelsEnd, -1, "platform panels end before the community link");
 
   const panels = {
-    macos: html.slice(panelStarts.macos, panelStarts.windows),
+    macos: html.slice(panelStarts.macos, panelStarts["macos-intel"]),
+    "macos-intel": html.slice(panelStarts["macos-intel"], panelStarts.windows),
     windows: html.slice(panelStarts.windows, panelStarts.linux),
     linux: html.slice(panelStarts.linux, panelsEnd),
   };
 
   assert.match(html, /id="platform-selector"[^>]*role="tablist"/u);
-  for (const platform of ["macos", "windows", "linux"]) {
+  for (const platform of ["macos", "macos-intel", "windows", "linux"]) {
     assert.match(
       html,
       new RegExp(
@@ -516,9 +518,12 @@ function assertPublishedPlatformSelectorContract(html) {
   assert.match(panels.macos, /brew install --cask adamallcock\/tap\/tibotattle/u);
   assert.match(panels.macos, /Developer ID signed and Apple notarized\./u);
 
-  for (const [platform, issue] of [["windows", 3], ["linux", 4]]) {
+  for (const [platform, displayName, issue] of [
+    ["macos-intel", "macOS Intel", 93],
+    ["windows", "Windows", 3],
+    ["linux", "Linux", 4],
+  ]) {
     const panel = panels[platform];
-    const displayName = platform === "windows" ? "Windows" : "Linux";
     assert.match(panel, /Not yet available/u);
     assert.match(
       panel,
@@ -544,6 +549,7 @@ function assertPublishedPlatformSelectorContract(html) {
       `${displayName} exposes only its roadmap issue link`,
     );
     assert.doesNotMatch(panel, /<button\b/iu);
+    assert.doesNotMatch(panel, /Download for|brew install|SHA-256|Developer ID|notarized|\.dmg\b/iu);
     assert.doesNotMatch(
       panel,
       /\b(?:winget|choco(?:latey)?|scoop|powershell|appimage|flatpak|snap|apt(?:-get)?|dnf|yum|pacman)\b|\.(?:exe|msi|msix|deb|rpm)\b/iu,

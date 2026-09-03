@@ -3,6 +3,7 @@ import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import {
+  access,
   appendFile,
   chmod,
   copyFile,
@@ -70,6 +71,7 @@ import {
   assertMacOSWorkspaceRuntimePackageInventory,
   assertMacOSExternalBuildOutputIsFresh,
   normalizeMacOSBundleVersion,
+  normalizeMacOSBuildArchitecture,
   normalizeMacOSBuildProfile,
   normalizeMacOSCentralOrigin,
   parseMacOSBuildArguments,
@@ -79,6 +81,7 @@ import {
   stageMacOSWorkspaceRuntimePackages,
   installMacOSExternalBuildOutput,
   validateMacOSPreviewApp,
+  validateMacOSNodeRuntimeInput,
   validateMacOSPreviewOutputPath,
   validateMacOSDistributionConfiguration,
 } from "../scripts/build-macos-app.js";
@@ -9809,4 +9812,110 @@ test("pinnedPackage authenticates external packages by reviewed file-tree digest
   await writeFile(join(tamperedRoot, "index.js"), "module.exports = 1;\n");
   const after = await pinnedPackageTreeDigest(tamperedRoot);
   assert.notEqual(before, after);
+});
+
+const output = ".release-build/intel-test/TiboTattle.app";
+const nodeRuntime = ".release-build/verified-intel/bin/node";
+
+test("macOS architecture selection is explicit and leaves ARM defaults intact", () => {
+  const defaults = parseMacOSBuildArguments(["--output", output], {});
+  assert.equal(defaults.architecture, "arm64");
+  assert.equal(defaults.nodeRuntime, null);
+  assert.equal(defaults.buildProfile, "release");
+  const intel = parseMacOSBuildArguments([
+    "--output", output, "--test-build", "--architecture", "x64",
+    "--node-runtime", nodeRuntime,
+  ], {});
+  assert.equal(intel.architecture, "x64");
+  assert.equal(intel.nodeRuntime, resolve(nodeRuntime));
+  assert.equal(intel.buildProfile, "test");
+  assert.equal(intel.sparkleFramework, null);
+  assert.equal(intel.externalDistribution, false);
+  assert.equal(intel.previewDistribution, false);
+  for (const architecture of ["x86_64", "universal", "ia32", "", null]) {
+    assert.throws(() => normalizeMacOSBuildArchitecture(architecture), {
+      code: "MACOS_BUILD_ARCHITECTURE_INVALID",
+    });
+  }
+  assert.throws(() => parseMacOSBuildArguments([
+    "--output", output, "--architecture", "x64",
+  ], {}), { code: "MACOS_INTEL_NODE_RUNTIME_REQUIRED" });
+  assert.throws(() => parseMacOSBuildArguments([
+    "--output", output, "--node-runtime", nodeRuntime,
+  ], {}), { code: "MACOS_NODE_RUNTIME_OVERRIDE_FORBIDDEN" });
+  for (const arguments_ of [
+    ["--architecture", "arm64", "--architecture", "x64"],
+    ["--architecture"],
+    ["--architecture", "x64", "--node-runtime"],
+    ["--architecture", "x64", "--node-runtime", "--test-build"],
+    ["--architecture", "x64", "--node-runtime", nodeRuntime, "--node-runtime", nodeRuntime],
+  ]) {
+    assert.throws(() => parseMacOSBuildArguments(["--output", output, ...arguments_], {}));
+  }
+  assert.throws(() => parseMacOSBuildArguments([
+    "--validate-preview", "--app", output, "--architecture", "arm64",
+  ], {}), { code: "MACOS_PREVIEW_VALIDATION_ARGUMENTS_INVALID" });
+});
+
+test("Intel cannot enter Preview or external release through any builder entrypoint", async () => {
+  for (const flag of ["--preview-distribution", "--external-distribution"]) {
+    assert.throws(() => parseMacOSBuildArguments([
+      flag, "--architecture", "x64", "--node-runtime", nodeRuntime,
+    ], {}), { code: "MACOS_INTEL_DISTRIBUTION_UNQUALIFIED" });
+  }
+  for (const configuration of [
+    { previewDistribution: true },
+    { externalDistribution: true },
+  ]) {
+    await assert.rejects(buildMacOSApp({
+      output, architecture: "x64", nodeRuntime, ...configuration,
+    }), { code: "MACOS_INTEL_DISTRIBUTION_UNQUALIFIED" });
+  }
+  for (const builder of [buildMacOSReleaseCandidate, buildMacOSAppForRelease]) {
+    await assert.rejects(builder({
+      output, candidateAppPath: output, architecture: "x64", nodeRuntime,
+      externalDistribution: true,
+      environment: new Proxy({}, {
+        get() { throw new Error("Credential environment must not be read"); },
+      }),
+    }), { code: "MACOS_INTEL_DISTRIBUTION_UNQUALIFIED" });
+  }
+});
+
+test("Intel runtime verification rejects wrong bytes without executing them or creating build output", async () => {
+  const scratch = await mkdtemp(join(await realpath(tmpdir()), "macos-intel-runtime-"));
+  try {
+    const bin = join(scratch, "bin");
+    await mkdir(bin);
+    const executable = join(bin, "node");
+    const marker = join(scratch, "executed");
+    await writeFile(executable, `#!/bin/sh\ntouch '${marker}'\n`);
+    await chmod(executable, 0o755);
+    await writeFile(join(scratch, "LICENSE"), "Synthetic runtime license\n");
+    await assert.rejects(validateMacOSNodeRuntimeInput({
+      architecture: "x64", nodeRuntime: executable,
+    }), { code: "MACOS_NODE_RUNTIME_DIGEST_MISMATCH" });
+    await assert.rejects(access(marker), { code: "ENOENT" });
+    const linked = join(bin, "linked-node");
+    await symlink(executable, linked);
+    await assert.rejects(validateMacOSNodeRuntimeInput({
+      architecture: "x64", nodeRuntime: linked,
+    }), { code: "MACOS_NODE_RUNTIME_INPUT_INVALID" });
+    const missingPath = join(scratch, "private-runtime-path");
+    await assert.rejects(validateMacOSNodeRuntimeInput({
+      architecture: "x64", nodeRuntime: missingPath,
+    }), (error) => error.code === "MACOS_NODE_RUNTIME_INPUT_INVALID"
+      && !error.message.includes(scratch));
+    if (process.platform === "darwin" && process.arch === "arm64"
+        && process.version === "v26.2.0") {
+      const candidate = join(scratch, "uncreated", "TiboTattle.app");
+      await assert.rejects(buildMacOSApp({
+        output: candidate, architecture: "x64", nodeRuntime: executable,
+        buildProfile: "test",
+      }), { code: "MACOS_NODE_RUNTIME_DIGEST_MISMATCH" });
+      await assert.rejects(access(join(scratch, "uncreated")), { code: "ENOENT" });
+    }
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
 });

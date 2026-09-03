@@ -368,7 +368,7 @@ test("native helper compilation and inside-out signing exclude keytar and Node r
     readFile(join(REPOSITORY_ROOT, "scripts/build-macos-app.js"), "utf8"),
     readFile(join(REPOSITORY_ROOT, "scripts/macos-release-core.js"), "utf8"),
   ]);
-  assert.match(builder, /keychainMigrationHelperSources,\s*\{ buildProfile, migrationHelper: true \}/u);
+  assert.match(builder, /keychainMigrationHelperSources,\s*\{ architecture, buildProfile, migrationHelper: true \}/u);
   assert.match(builder, /\? \["-framework", "Foundation", "-framework", "Security"\]/u);
   const nodeSign = release.indexOf("sign(NODE_EXECUTABLE, { entitlements: NODE_ENTITLEMENTS })");
   const helperSign = release.indexOf("sign(MACOS_KEYCHAIN_MIGRATION_HELPER.executable, {");
@@ -387,48 +387,56 @@ test("both actual native compile invocations link audit-token symbols through li
   const end = builder.indexOf("\nasync function copyPinnedSparkleFramework", start);
   assert.equal(start >= 0 && end > start, true);
   const compileSource = builder.slice(start, end);
+  const architectureStart = builder.indexOf("function machOArchitecture(");
+  const architectureEnd = builder.indexOf("\n}\n", architectureStart) + 2;
+  assert.equal(architectureStart >= 0 && architectureEnd > architectureStart, true);
+  const architectureSource = builder.slice(architectureStart, architectureEnd);
   for (const buildProfile of ["release", "test"]) {
     for (const migrationHelper of [false, true]) {
-      const calls = [];
-      const compile = runInNewContext(`(${compileSource})`, {
-        MACOS_BUILD_PROFILE_RELEASE: "release",
-        MACOS_BUILD_PROFILE_TEST: "test",
-        MINIMUM_MACOS_VERSION: "14.0",
-        FIXED_EPOCH_SECONDS: 946_684_800,
-        PRODUCT_BRAND,
-        normalizeMacOSBuildProfile: (value) => value,
-        dirname,
-        join,
-        mkdtemp: async () => "/synthetic/compiler-scratch",
-        prepareTestCompilerModuleCache: async () => "/synthetic/module-cache",
-        chmod: async () => {},
-        utimes: async () => {},
-        rm: async () => {},
-        fail: (message) => { throw new Error(message); },
-        run(command, arguments_) {
-          calls.push({ command, arguments_: Array.from(arguments_) });
-          if (command === "/usr/bin/file") return "Mach-O 64-bit executable arm64";
-          if (arguments_.includes("--show-sdk-path")) return "/synthetic/macos-sdk";
-          if (arguments_.includes("--version")) return "synthetic Swift toolchain";
-          return "";
-        },
-      });
-      const destination = migrationHelper
-        ? "/synthetic/TiboTattleKeychainMigration" : "/synthetic/TiboTattle";
-      await compile(destination, { enabled: false }, {
-        files: migrationHelper ? [ENTRYPOINT_SOURCE, SHARED_SOURCE] : [SHARED_SOURCE],
-      }, { buildProfile, migrationHelper });
-      const compileCalls = calls.filter(({ command, arguments_ }) =>
-        command === "/usr/bin/xcrun" && arguments_.includes("swiftc")
-        && !arguments_.includes("--version"));
-      assert.equal(compileCalls.length, 1);
-      const arguments_ = compileCalls[0].arguments_;
-      assert.equal(arguments_.filter((value) => value === "-lbsm").length, 1);
-      assert.equal(arguments_.includes("WebKit"), !migrationHelper);
-      assert.equal(arguments_.includes("Security"), migrationHelper);
-      assert.equal(arguments_[arguments_.indexOf("-o") + 1], destination);
-      assert.equal(arguments_.includes(ENTRYPOINT_SOURCE), migrationHelper);
-      assert.equal(calls.some(({ command }) => command.includes("codesign")), false);
+      for (const [architecture, nativeArchitecture] of [["arm64", "arm64"], ["x64", "x86_64"]]) {
+        const calls = [];
+        const compile = runInNewContext(`${architectureSource}; (${compileSource})`, {
+          PINNED_NODE_ARCHITECTURE: "arm64",
+          MACOS_BUILD_PROFILE_RELEASE: "release",
+          MACOS_BUILD_PROFILE_TEST: "test",
+          MINIMUM_MACOS_VERSION: "14.0",
+          FIXED_EPOCH_SECONDS: 946_684_800,
+          PRODUCT_BRAND,
+          normalizeMacOSBuildProfile: (value) => value,
+          dirname,
+          join,
+          mkdtemp: async () => "/synthetic/compiler-scratch",
+          prepareTestCompilerModuleCache: async () => "/synthetic/module-cache",
+          chmod: async () => {},
+          utimes: async () => {},
+          rm: async () => {},
+          fail: (message) => { throw new Error(message); },
+          run(command, arguments_) {
+            calls.push({ command, arguments_: Array.from(arguments_) });
+            if (command === "/usr/bin/file") return `Mach-O 64-bit executable ${nativeArchitecture}`;
+            if (arguments_.includes("--show-sdk-path")) return "/synthetic/macos-sdk";
+            if (arguments_.includes("--version")) return "synthetic Swift toolchain";
+            return "";
+          },
+        });
+        const destination = migrationHelper
+          ? "/synthetic/TiboTattleKeychainMigration" : "/synthetic/TiboTattle";
+        await compile(destination, { enabled: false }, {
+          files: migrationHelper ? [ENTRYPOINT_SOURCE, SHARED_SOURCE] : [SHARED_SOURCE],
+        }, { architecture, buildProfile, migrationHelper });
+        const compileCalls = calls.filter(({ command, arguments_ }) =>
+          command === "/usr/bin/xcrun" && arguments_.includes("swiftc")
+          && !arguments_.includes("--version"));
+        assert.equal(compileCalls.length, 1);
+        const arguments_ = compileCalls[0].arguments_;
+        assert.equal(arguments_[arguments_.indexOf("-target") + 1], `${nativeArchitecture}-apple-macos14.0`);
+        assert.equal(arguments_.filter((value) => value === "-lbsm").length, 1);
+        assert.equal(arguments_.includes("WebKit"), !migrationHelper);
+        assert.equal(arguments_.includes("Security"), migrationHelper);
+        assert.equal(arguments_[arguments_.indexOf("-o") + 1], destination);
+        assert.equal(arguments_.includes(ENTRYPOINT_SOURCE), migrationHelper);
+        assert.equal(calls.some(({ command }) => command.includes("codesign")), false);
+      }
     }
   }
 });

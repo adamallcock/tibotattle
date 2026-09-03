@@ -255,13 +255,36 @@ The ordinary uninstall journey is simply: quit TiboTattle and move
 
 ## Developer build
 
-The current bundle is pinned to Node 26.2.0 and Apple silicon:
+The builder requires Node 26.2.0 on Apple silicon. Its default target remains
+Apple silicon:
 
 ```bash
 npm run product:macos:build
 npm run product:macos:validate:development
 open ".release-build/macos/TiboTattle.app"
 ```
+
+An experimental Intel development/test target is available on the same builder:
+
+```bash
+node scripts/build-macos-app.js --architecture x64 \
+  --node-runtime "<verified-node-v26.2.0-darwin-x64>/bin/node" \
+  --test-build --output ".release-build/macos-intel-test/TiboTattle.app"
+```
+
+Use the official Node 26.2.0 Darwin x64 distribution, including its adjacent
+`LICENSE`. The builder checks the pinned executable and license hashes before
+executing the staged runtime. It compiles the launcher and native Keychain
+migration helper for `x86_64`, but retains the development channel, ad-hoc
+signing and disabled updater. Intel Preview and external-distribution requests
+are refused. Do not install this shared-identity development app over a stable
+app or run it against stable user state as a qualification shortcut.
+
+This target does not extend the public support claim, qualify real Intel
+hardware, or enable Intel DMG packaging, release verification or updates. See
+the [Intel release plan](../../docs/plans/2026-09-03-macos-intel-release.md) for
+the remaining gates. The commands below remain the Apple Silicon development
+packaging path.
 
 Create a deterministic-layout developer DMG:
 

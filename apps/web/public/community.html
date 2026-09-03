@@ -139,7 +139,19 @@
                 data-platform="macos"
                 tabindex="0"
               >
-                <span data-i18n="installer.platform.macos">macOS</span>
+                <span data-i18n="installer.platform.macos">macOS Apple silicon</span>
+              </button>
+              <button
+                class="platform-tab"
+                id="platform-tab-macos-intel"
+                type="button"
+                role="tab"
+                aria-selected="false"
+                aria-controls="platform-panel-macos-intel"
+                data-platform="macos-intel"
+                tabindex="-1"
+              >
+                <span data-i18n="installer.platform.macosIntel">macOS Intel</span>
               </button>
               <button
                 class="platform-tab"
@@ -270,6 +282,21 @@
                 <strong data-i18n="installer.assurance.message">Developer ID signed and Apple notarized.</strong>
                 <a href="./docs.html#download-security" data-i18n="installer.assurance.details">Security and verification</a>
               </p>
+            </section>
+
+            <section
+              class="platform-panel platform-unavailable-panel"
+              id="platform-panel-macos-intel"
+              role="tabpanel"
+              aria-labelledby="platform-tab-macos-intel"
+              data-platform-panel="macos-intel"
+              tabindex="0"
+              hidden
+            >
+              <p class="platform-availability" data-i18n="installer.availability.notYetAvailable">Not yet available</p>
+              <h2 data-i18n="installer.macosIntel.unavailableTitle">TiboTattle for macOS Intel is not available yet.</h2>
+              <p data-i18n="installer.macosIntel.unavailableCopy">Follow the macOS Intel support work for progress. A download will appear only after the macOS Intel release passes its platform and release checks.</p>
+              <a href="https://github.com/adamallcock/tibotattle/issues/93" data-i18n="installer.macosIntel.trackSupport">Track macOS Intel support</a>
             </section>
 
             <section

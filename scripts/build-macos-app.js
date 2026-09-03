@@ -93,6 +93,14 @@ const WEB_MODULE_ROOT = join(
 );
 const PINNED_NODE_VERSION = "v26.2.0";
 const PINNED_NODE_ARCHITECTURE = "arm64";
+// Intel is a development target only. These file digests are from the official
+// node-v26.2.0-darwin-x64.tar.xz archive, SHA-256
+// 50e3fb7cda816f0ab8929551516530669d1c0449a3f6a8a044be82a57cc642a4.
+// Verify the archive before extracting it; never execute an unverified input.
+const PINNED_INTEL_NODE_SHA256 =
+  "51ef33e35c9cd96192baba41dfb592a9568380a5b2190d64e63332c4bd807e0f";
+const PINNED_INTEL_NODE_LICENSE_SHA256 =
+  "148eacf7863ef4329224a29398623077200a27194aa075569faf4a0a85566ca5";
 const MINIMUM_MACOS_VERSION = "14.0";
 const PACKAGE_NAME = "app-usagemonitor";
 const SHORT_VERSION = RELEASE_VERSION;
@@ -1980,6 +1988,103 @@ function assertBuildPlatform() {
   }
 }
 
+export function normalizeMacOSBuildArchitecture(value = PINNED_NODE_ARCHITECTURE) {
+  if (value === "arm64" || value === "x64") return value;
+  fail(
+    "macOS target architecture must be arm64 or x64",
+    "MACOS_BUILD_ARCHITECTURE_INVALID",
+  );
+}
+
+function assertMacOSBuildArchitectureConfiguration({
+  architecture = PINNED_NODE_ARCHITECTURE,
+  nodeRuntime = null,
+  externalDistribution = false,
+  previewDistribution = false,
+} = {}) {
+  const selected = normalizeMacOSBuildArchitecture(architecture);
+  if (selected === "x64" && (externalDistribution || previewDistribution)) {
+    fail(
+      "Intel bundles are development-only until the signed release and updater gates are qualified",
+      "MACOS_INTEL_DISTRIBUTION_UNQUALIFIED",
+    );
+  }
+  if (selected === "arm64" && nodeRuntime !== null) {
+    fail(
+      "Apple Silicon builds must use the pinned builder's Node runtime",
+      "MACOS_NODE_RUNTIME_OVERRIDE_FORBIDDEN",
+    );
+  }
+  if (selected === "x64" && (typeof nodeRuntime !== "string"
+      || nodeRuntime.length === 0 || nodeRuntime.includes("\0"))) {
+    fail(
+      "Intel development builds require --node-runtime with the pinned official Intel Node executable",
+      "MACOS_INTEL_NODE_RUNTIME_REQUIRED",
+    );
+  }
+  return selected;
+}
+
+function machOArchitecture(architecture) {
+  return architecture === "x64" ? "x86_64" : "arm64";
+}
+
+// Inspect input bytes without executing them. The copied runtime is checked
+// again before a bounded version/architecture probe in the private build tree.
+export async function validateMacOSNodeRuntimeInput({
+  architecture = PINNED_NODE_ARCHITECTURE,
+  nodeRuntime = null,
+} = {}) {
+  const selected = assertMacOSBuildArchitectureConfiguration({
+    architecture,
+    nodeRuntime,
+  });
+  let executable;
+  let license;
+  let executableSha256;
+  let licenseSha256;
+  try {
+    const requested = resolve(nodeRuntime ?? process.execPath);
+    executable = await realpath(requested);
+    license = resolve(dirname(executable), "..", "LICENSE");
+    for (const [path, maximumBytes] of [
+      [executable, MAXIMUM_BUNDLE_BYTES], [license, 1024 * 1024],
+    ]) {
+      const metadata = await lstat(path);
+      if (!metadata.isFile() || metadata.isSymbolicLink()
+          || metadata.nlink !== 1 || metadata.size > maximumBytes) {
+        throw new Error("not a regular unlinked input");
+      }
+    }
+    if (selected === "x64" && executable !== requested) {
+      throw new Error("Intel runtime must not traverse a symbolic link");
+    }
+    [executableSha256, licenseSha256] = await Promise.all([
+      sha256File(executable),
+      sha256File(license),
+    ]);
+  } catch {
+    fail(
+      "Selected Node runtime and license must be readable regular files",
+      "MACOS_NODE_RUNTIME_INPUT_INVALID",
+    );
+  }
+  if (selected === "x64" && (executableSha256 !== PINNED_INTEL_NODE_SHA256
+      || licenseSha256 !== PINNED_INTEL_NODE_LICENSE_SHA256)) {
+    fail(
+      "Intel Node runtime or license does not match the pinned official Node 26.2.0 bytes",
+      "MACOS_NODE_RUNTIME_DIGEST_MISMATCH",
+    );
+  }
+  return Object.freeze({
+    architecture: selected,
+    executable,
+    executableSha256,
+    license,
+    licenseSha256,
+  });
+}
+
 export function normalizeMacOSBuildProfile(value = MACOS_BUILD_PROFILE_RELEASE) {
   if (value === MACOS_BUILD_PROFILE_RELEASE
       || value === MACOS_BUILD_PROFILE_TEST) {
@@ -1991,11 +2096,12 @@ export function normalizeMacOSBuildProfile(value = MACOS_BUILD_PROFILE_RELEASE) 
   );
 }
 
-function testCompilerModuleCachePath(sdk, toolchainVersion) {
+function testCompilerModuleCachePath(sdk, toolchainVersion, architecture) {
   const cacheKey = createHash("sha256")
     .update([
       process.version,
       process.arch,
+      architecture,
       sdk,
       toolchainVersion,
       MINIMUM_MACOS_VERSION,
@@ -2010,8 +2116,8 @@ function testCompilerModuleCachePath(sdk, toolchainVersion) {
   );
 }
 
-async function prepareTestCompilerModuleCache(sdk, toolchainVersion) {
-  const moduleCache = testCompilerModuleCachePath(sdk, toolchainVersion);
+async function prepareTestCompilerModuleCache(sdk, toolchainVersion, architecture) {
+  const moduleCache = testCompilerModuleCachePath(sdk, toolchainVersion, architecture);
   await mkdir(moduleCache, { recursive: true, mode: 0o700 });
   const metadata = await lstat(moduleCache);
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
@@ -2063,6 +2169,7 @@ function preSignKeychainMigrationHelperForInventory(appBundle) {
 }
 
 async function compileNativeExecutable(destination, updater, swiftSources, {
+  architecture = PINNED_NODE_ARCHITECTURE,
   buildProfile = MACOS_BUILD_PROFILE_RELEASE,
   migrationHelper = false,
 } = {}) {
@@ -2084,6 +2191,7 @@ async function compileNativeExecutable(destination, updater, swiftSources, {
       run("/usr/bin/xcrun", ["--sdk", "macosx", "swiftc", "--version"], {
         env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
       }),
+      architecture,
     )
     : compilerScratch;
   const compileEnvironment = {
@@ -2106,7 +2214,7 @@ async function compileNativeExecutable(destination, updater, swiftSources, {
       ? ["-Onone"]
       : ["-O", "-whole-module-optimization"]),
     "-target",
-    `arm64-apple-macos${MINIMUM_MACOS_VERSION}`,
+    `${machOArchitecture(architecture)}-apple-macos${MINIMUM_MACOS_VERSION}`,
     "-sdk",
     sdk,
     "-module-name",
@@ -2165,12 +2273,12 @@ async function compileNativeExecutable(destination, updater, swiftSources, {
   await chmod(destination, 0o555);
   await utimes(destination, FIXED_EPOCH_SECONDS, FIXED_EPOCH_SECONDS);
   const fileDescription = run("/usr/bin/file", ["-b", destination]);
-  if (!fileDescription.includes("Mach-O 64-bit executable arm64")) {
-    fail("Native application code is not a macOS arm64 executable");
+  if (!fileDescription.includes(`Mach-O 64-bit executable ${machOArchitecture(architecture)}`)) {
+    fail("Native application code does not match the selected macOS architecture");
   }
 }
 
-async function copyPinnedSparkleFramework(contents, updater) {
+async function copyPinnedSparkleFramework(contents, updater, architecture) {
   if (!updater.enabled) return null;
   const destination = join(contents, "Frameworks", "Sparkle.framework");
   for (const entry of updater.framework.entries) {
@@ -2188,11 +2296,11 @@ async function copyPinnedSparkleFramework(contents, updater) {
   }
   for (const relativePath of SPARKLE_MACH_O_PATHS) {
     const executable = join(destination, ...relativePath.split("/"));
-    const replacement = `${executable}.arm64`;
+    const replacement = `${executable}.${machOArchitecture(architecture)}`;
     run("/usr/bin/lipo", [
       executable,
       "-thin",
-      PINNED_NODE_ARCHITECTURE,
+      machOArchitecture(architecture),
       "-output",
       replacement,
     ], {
@@ -2207,26 +2315,41 @@ async function copyPinnedSparkleFramework(contents, updater) {
   return destination;
 }
 
-async function copyPinnedNode(resourcesRoot) {
-  const selectedNode = await realpath(process.execPath);
-  const nodeVersion = run(selectedNode, ["--version"], {
-    env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
-  });
-  if (nodeVersion !== PINNED_NODE_VERSION) {
-    fail("The selected Node executable does not match the pinned version");
-  }
+async function copyPinnedNode(resourcesRoot, runtimeInput) {
   const destination = join(resourcesRoot, "runtime", "bin", "node");
-  await copyRegularFile(selectedNode, destination, 0o555);
-  const nodeLicense = resolve(dirname(selectedNode), "..", "LICENSE");
+  const licenseDestination = join(resourcesRoot, "licenses", "node-26.2.0.txt");
+  await copyRegularFile(runtimeInput.executable, destination, 0o555);
   await copyRegularFile(
-    nodeLicense,
-    join(resourcesRoot, "licenses", "node-26.2.0.txt"),
+    runtimeInput.license,
+    licenseDestination,
     0o444,
   );
+  const [runtimeSha256, licenseSha256] = await Promise.all([
+    sha256File(destination),
+    sha256File(licenseDestination),
+  ]);
+  if (runtimeSha256 !== runtimeInput.executableSha256
+      || licenseSha256 !== runtimeInput.licenseSha256) {
+    fail("Selected Node input changed during staging", "MACOS_NODE_RUNTIME_INPUT_CHANGED");
+  }
+  const runtimeIdentity = run(destination, [
+    "-p", "JSON.stringify([process.version, process.platform, process.arch])",
+  ], {
+    cwd: resourcesRoot,
+    env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+  });
+  if (runtimeIdentity !== JSON.stringify([
+    PINNED_NODE_VERSION, "darwin", runtimeInput.architecture,
+  ])) {
+    fail(
+      "The selected Node executable does not match the pinned version and target architecture",
+      "MACOS_NODE_RUNTIME_IDENTITY_MISMATCH",
+    );
+  }
   return Object.freeze({
-    architecture: PINNED_NODE_ARCHITECTURE,
+    architecture: runtimeInput.architecture,
     executable: "Contents/Resources/runtime/bin/node",
-    sha256: await sha256File(destination),
+    sha256: runtimeSha256,
     version: PINNED_NODE_VERSION.slice(1),
   });
 }
@@ -3350,6 +3473,9 @@ async function prepareOutput(output, {
 
 export function parseMacOSBuildArguments(argv, environment = process.env) {
   let output = null;
+  let architecture = PINNED_NODE_ARCHITECTURE;
+  let architectureSeen = false;
+  let nodeRuntime = null;
   let centralOrigin = null;
   let centralOriginSeen = false;
   let allowLoopbackCentralOrigin = false;
@@ -3373,6 +3499,22 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
         fail("--output must be provided exactly once with a value");
       }
       output = resolve(argv[++index] ?? "");
+    } else if (argument === "--architecture") {
+      if (architectureSeen || index + 1 >= argv.length) {
+        fail("--architecture must be provided at most once with a value");
+      }
+      architectureSeen = true;
+      architecture = normalizeMacOSBuildArchitecture(argv[++index]);
+    } else if (argument === "--node-runtime") {
+      if (nodeRuntime !== null || index + 1 >= argv.length) {
+        fail("--node-runtime must be provided at most once with a value");
+      }
+      nodeRuntime = argv[++index];
+      if (nodeRuntime.length === 0 || nodeRuntime.startsWith("--")
+          || nodeRuntime.includes("\0")) {
+        fail("--node-runtime requires a file path", "MACOS_NODE_RUNTIME_INPUT_INVALID");
+      }
+      nodeRuntime = resolve(nodeRuntime);
     } else if (argument === "--central-origin") {
       if (centralOriginSeen || index + 1 >= argv.length) {
         fail("--central-origin must be provided at most once with a value");
@@ -3448,6 +3590,8 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
   if (validatePreview) {
     if (appPath === null
         || output !== null
+        || architectureSeen
+        || nodeRuntime !== null
         || centralOriginSeen
         || allowLoopbackCentralOrigin
         || externalDistribution
@@ -3466,6 +3610,9 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
     }
     return { appPath, validatePreview };
   }
+  assertMacOSBuildArchitectureConfiguration({
+    architecture, nodeRuntime, externalDistribution, previewDistribution,
+  });
   if (appPath !== null) {
     fail("--app is only valid with --validate-preview");
   }
@@ -3524,6 +3671,8 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
   if (!output) fail("--output is required");
   return {
     output,
+    architecture,
+    nodeRuntime,
     centralOrigin,
     allowLoopbackCentralOrigin,
     externalDistribution,
@@ -3541,6 +3690,8 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
 }
 
 async function buildApplication(stageApp, centralService, {
+  architecture,
+  runtimeInput,
   bundleVersion,
   buildProfile,
   distribution,
@@ -3596,16 +3747,16 @@ async function buildApplication(stageApp, centralService, {
     join(executables, productBrand.executableName),
     updater,
     swiftSources,
-    { buildProfile },
+    { architecture, buildProfile },
   );
   await compileNativeExecutable(
     join(stageApp, ...MACOS_KEYCHAIN_MIGRATION_HELPER.executable.split("/")),
     { enabled: false },
     keychainMigrationHelperSources,
-    { buildProfile, migrationHelper: true },
+    { architecture, buildProfile, migrationHelper: true },
   );
-  await copyPinnedSparkleFramework(contents, updater);
-  const node = await copyPinnedNode(resources);
+  await copyPinnedSparkleFramework(contents, updater, architecture);
+  const node = await copyPinnedNode(resources, runtimeInput);
   await stageMacOSLocalizationResources(contents, appRoot, localizationResources);
   await copyFirstPartyRuntime(appRoot, graph, runtimeAssets, webModules);
   const dependencies = await copyRuntimeDependencies(
@@ -3801,6 +3952,8 @@ async function assertCurrentExportCompatibilityManifest() {
 
 export async function buildMacOSApp({
   output,
+  architecture = PINNED_NODE_ARCHITECTURE,
+  nodeRuntime = null,
   centralOrigin = null,
   allowLoopbackCentralOrigin = false,
   externalDistribution = false,
@@ -3816,6 +3969,9 @@ export async function buildMacOSApp({
   releaseSource = null,
   releaseAuthorization = null,
 }) {
+  const selectedArchitecture = assertMacOSBuildArchitectureConfiguration({
+    architecture, nodeRuntime, externalDistribution, previewDistribution,
+  });
   const selectedBuildProfile = normalizeMacOSBuildProfile(buildProfile);
   await assertCurrentExportCompatibilityManifest();
   if (externalDistribution && previewDistribution) {
@@ -3936,6 +4092,10 @@ export async function buildMacOSApp({
     })
     : resolve(output);
   assertBuildPlatform();
+  const runtimeInput = await validateMacOSNodeRuntimeInput({
+    architecture: selectedArchitecture,
+    nodeRuntime,
+  });
   const iconAssets = await loadIconAssets({
     required: distribution.externalDistribution || distribution.previewDistribution,
   });
@@ -3953,6 +4113,8 @@ export async function buildMacOSApp({
   const stagedApp = join(temporaryRoot, productBrand.bundleName);
   try {
     const manifest = await buildApplication(stagedApp, centralService, {
+      architecture: selectedArchitecture,
+      runtimeInput,
       bundleVersion: selectedBundleVersion,
       buildProfile: selectedBuildProfile,
       distribution,
@@ -4020,6 +4182,7 @@ export async function buildMacOSApp({
         manifest.release.externalDistributionRequested,
       updaterEnabled: manifest.release.updater.enabled,
       buildProfile: selectedBuildProfile,
+      architecture: manifest.runtime.node.architecture,
     });
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
@@ -4033,6 +4196,8 @@ export async function buildMacOSApp({
  * caller having already performed the checks.
  */
 async function readMacOSReleaseBuildPreflight({
+  architecture = PINNED_NODE_ARCHITECTURE,
+  nodeRuntime = null,
   environment = process.env,
   previousStableManifestPath = null,
   stableBootstrap = false,
@@ -4043,6 +4208,10 @@ async function readMacOSReleaseBuildPreflight({
   sparkleAppcastURL,
   sparklePublicEdKey,
 }) {
+  // Refuse Intel before source, credential, signing, or updater preflights.
+  assertMacOSBuildArchitectureConfiguration({
+    architecture, nodeRuntime, externalDistribution: true,
+  });
   const releaseCore = await import("./macos-release-core.js");
   const buildConfiguration = releaseCore.readMacOSReleaseBuildConfiguration(
     environment,
@@ -4158,6 +4327,8 @@ async function main(argv) {
   const {
     appPath,
     output,
+    architecture,
+    nodeRuntime,
     centralOrigin,
     allowLoopbackCentralOrigin,
     externalDistribution,
@@ -4182,6 +4353,8 @@ async function main(argv) {
   }
   const result = await buildMacOSApp({
     output,
+    architecture,
+    nodeRuntime,
     centralOrigin,
     allowLoopbackCentralOrigin,
     externalDistribution,
@@ -4201,6 +4374,7 @@ async function main(argv) {
   console.log(`Source SHA-256: ${result.sourceSha256}`);
   console.log(`Payload bytes: ${result.totalBytes}`);
   console.log(`Compiler profile: ${result.buildProfile}`);
+  console.log(`Target architecture: ${result.architecture}`);
   console.log(`Channel: ${result.channel}`);
   console.log(`Central service: ${result.centralServiceMode}`);
   console.log(

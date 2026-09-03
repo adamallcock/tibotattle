@@ -10,13 +10,14 @@ status: maintained
 This is the authority for public operating-system support claims. It defines
 what must be proven before a platform moves from source work to supported use.
 The current result is intentionally narrow: macOS 14+ on Apple silicon is
-supported; Windows and Linux are not.
+supported; Intel macOS, Windows and Linux are not.
 
 ## Status matrix
 
 | Platform | Source and contract | Native/physical qualification | Install, trust, update, release | Public status |
 |---|---|---|---|---|
 | macOS 14+ arm64 | Implemented | Native macOS product and retained qualification paths | Developer ID, notarization, Sparkle, stable DMG, and public `v0.1.16` release paths exist | **Supported** |
+| macOS 14+ x86_64 | Experimental development/test builder and native broker selection | Cross-compilation and synthetic Rosetta probes; no physical Intel qualification | Development app only; no qualified Intel installer, signing/notarization receipt, or update feed | **Unsupported** |
 | Windows x64 | Portable core and fail-closed native filesystem/credential adapter exist | Partial qualification evidence; not a standing release gate | No supported signed installer, clean install/upgrade/uninstall receipt, updater, or stable artifact | **Unsupported** |
 | Linux x86_64 | Portable/core and container checks may run | Contract or container results are not physical desktop qualification | No supported signed package/repository, clean install/uninstall receipt, updater boundary, or stable artifact | **Unsupported** |
 
@@ -56,6 +57,11 @@ or browser-rendered dashboard does not extend the support claim.
 
 Intel macOS is not claimed. Adding it requires a separately identified final
 artifact and the full ladder above; Rosetta behavior alone is not qualification.
+The builder has an experimental, updater-disabled Intel development/test target
+on the pinned Apple Silicon host. The website exposes a separate macOS Intel
+tab with an unavailable state; neither is a supported download. See the
+[native developer build](../../apps/macos/README.md#developer-build) and
+[Intel release plan](../plans/2026-09-03-macos-intel-release.md).
 
 ## Windows
 

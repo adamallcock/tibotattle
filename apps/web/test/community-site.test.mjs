@@ -151,7 +151,7 @@ class FakePlatformNode {
 }
 
 function fakePlatformSelectorDocument({ missingPanel = null } = {}) {
-  const platforms = ["macos", "windows", "linux"];
+  const platforms = ["macos", "macos-intel", "windows", "linux"];
   const tabs = new Map(platforms.map((platform) => [
     platform,
     new FakePlatformNode({ dataset: { platform } }),
@@ -207,7 +207,7 @@ function assertPlatformSelection(fixture, selectedPlatform) {
     selectedPlatform,
   );
   assert.equal(fixture.selector.hidden, false);
-  for (const platform of ["macos", "windows", "linux"]) {
+  for (const platform of ["macos", "macos-intel", "windows", "linux"]) {
     assert.equal(
       fixture.tabs.get(platform).attributes.get("aria-selected"),
       String(platform === selectedPlatform),
@@ -391,7 +391,7 @@ test("the public site presents only the install call to action and the community
   assert.match(tablist, /\brole="tablist"/u);
   assert.match(tablist, /\baria-label="Choose your platform"/u);
   assert.match(tablist, /\bhidden(?:\s|>)/u);
-  for (const platform of ["macos", "windows", "linux"]) {
+  for (const platform of ["macos", "macos-intel", "windows", "linux"]) {
     const tab = openingTagForId(html, `platform-tab-${platform}`);
     assert.match(tab, /\brole="tab"/u);
     assert.match(tab, new RegExp(`\\baria-controls="platform-panel-${platform}"`, "u"));
@@ -478,7 +478,8 @@ test("the first visit leads with the product, platform choice, and daily communi
   assert.match(html, /id="header-download-label"[^>]*>\s*Get the app\s*<\/span>/u);
   assert.doesNotMatch(html, /Get the Mac app/u);
   for (const [platform, label] of [
-    ["macos", "macOS"],
+    ["macos", "macOS Apple silicon"],
+    ["macos-intel", "macOS Intel"],
     ["windows", "Windows"],
     ["linux", "Linux"],
   ]) {
@@ -561,16 +562,19 @@ test("the first visit leads with the product, platform choice, and daily communi
 test("platform tabs keep the live macOS release separate from honest unavailable panels", async () => {
   const html = await readFile(SITE_HTML, "utf8");
   const macosStart = html.indexOf('id="platform-panel-macos"');
+  const intelStart = html.indexOf('id="platform-panel-macos-intel"');
   const windowsStart = html.indexOf('id="platform-panel-windows"');
   const linuxStart = html.indexOf('id="platform-panel-linux"');
   const panelsEnd = html.indexOf('class="community-inline"', linuxStart);
 
   assert.ok(macosStart >= 0, "macOS panel exists");
-  assert.ok(windowsStart > macosStart, "Windows panel follows macOS");
+  assert.ok(intelStart > macosStart, "Intel panel follows Apple silicon");
+  assert.ok(windowsStart > intelStart, "Windows panel follows macOS Intel");
   assert.ok(linuxStart > windowsStart, "Linux panel follows Windows");
   assert.ok(panelsEnd > linuxStart, "platform panels end before community activity");
 
-  const macosPanel = html.slice(macosStart, windowsStart);
+  const macosPanel = html.slice(macosStart, intelStart);
+  const intelPanel = html.slice(intelStart, windowsStart);
   const windowsPanel = html.slice(windowsStart, linuxStart);
   const linuxPanel = html.slice(linuxStart, panelsEnd);
 
@@ -580,6 +584,7 @@ test("platform tabs keep the live macOS release separate from honest unavailable
   assert.match(macosPanel, /Developer ID signed and Apple notarized\./u);
 
   for (const [platform, panel] of [
+    ["macOS Intel", intelPanel],
     ["Windows", windowsPanel],
     ["Linux", linuxPanel],
   ]) {
@@ -587,16 +592,18 @@ test("platform tabs keep the live macOS release separate from honest unavailable
     assert.match(panel, /Not yet available/u);
     assert.doesNotMatch(panel, /id="installer-|id="homebrew-|brew install/iu);
     assert.doesNotMatch(panel, /Download for|\.dmg\b|\.exe\b|\.msi\b|AppImage/iu);
+    assert.doesNotMatch(panel, /SHA-256|Developer ID|notarized|Version 0\./iu);
     assert.doesNotMatch(panel, /<a\b[^>]*class="[^"]*\bbutton\b/iu);
     assert.doesNotMatch(panel, /<button\b[^>]*disabled/iu);
   }
+  assert.match(intelPanel, /tibotattle\/issues\/93/u);
   assert.match(windowsPanel, /tibotattle\/issues\/3/u);
   assert.match(linuxPanel, /tibotattle\/issues\/4/u);
 
   const macosTab = openingTagForId(html, "platform-tab-macos");
   assert.match(macosTab, /\baria-selected="true"/u);
   assert.match(macosTab, /\btabindex="0"/u);
-  for (const platform of ["windows", "linux"]) {
+  for (const platform of ["macos-intel", "windows", "linux"]) {
     const tab = openingTagForId(html, `platform-tab-${platform}`);
     assert.match(tab, /\baria-selected="false"/u);
     assert.match(tab, /\btabindex="-1"/u);
@@ -615,6 +622,14 @@ test("platform detection is conservative and explicit choices take precedence", 
   assert.equal(
     detectPublicPlatform({ userAgentDataPlatform: "macOS", userAgent: "" }),
     "macos",
+  );
+  assert.equal(
+    detectPublicPlatform({
+      userAgentDataPlatform: "MacIntel",
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    }),
+    "macos",
+    "Intel browser tokens also occur on Apple silicon and cannot identify the chip",
   );
   assert.equal(
     detectPublicPlatform({ userAgentDataPlatform: "Linux", userAgent: "" }),
@@ -671,6 +686,14 @@ test("platform detection is conservative and explicit choices take precedence", 
     "a ChromeOS Linux token must not select a Linux desktop build",
   );
 
+  assert.equal(
+    resolveInitialPublicPlatform({
+      urlPlatform: "macos-intel",
+      savedPlatform: "windows",
+      detectedPlatform: "macos",
+    }),
+    "macos-intel",
+  );
   assert.equal(
     resolveInitialPublicPlatform({
       urlPlatform: "linux",
@@ -750,13 +773,47 @@ test("the platform selector applies URL state and persists only user interaction
 
   press("windows", "ArrowRight", "linux");
   press("linux", "ArrowRight", "macos");
+  press("macos", "ArrowRight", "macos-intel");
+  press("macos-intel", "ArrowRight", "windows");
+  press("windows", "ArrowLeft", "macos-intel");
+  press("macos-intel", "ArrowLeft", "macos");
   press("macos", "ArrowLeft", "linux");
   press("linux", "Home", "macos");
   press("macos", "End", "linux");
   assert.deepEqual(
     storage.writes.map(([, value]) => value),
-    ["windows", "linux", "macos", "linux", "macos", "linux"],
+    ["windows", "linux", "macos", "macos-intel", "windows", "macos-intel", "macos", "linux", "macos", "linux"],
   );
+});
+
+test("explicit Intel selection hides the ARM panel and survives the next visit", () => {
+  const storage = recordingStorage();
+  const fixture = fakePlatformSelectorDocument();
+  wirePublicPlatformSelector(fixture.documentRef, {
+    navigatorRef: { userAgentData: { platform: "macOS" } },
+    locationRef: { search: "" },
+    storage,
+  });
+  fixture.selector.dispatch("click", { target: fixture.tabs.get("macos-intel") });
+  assertPlatformSelection(fixture, "macos-intel");
+  assert.equal(fixture.panels.get("macos").hidden, true);
+
+  const nextVisit = fakePlatformSelectorDocument();
+  assert.equal(wirePublicPlatformSelector(nextVisit.documentRef, {
+    navigatorRef: { userAgentData: { platform: "macOS" } },
+    locationRef: { search: "" },
+    storage,
+  }), "macos-intel");
+  assertPlatformSelection(nextVisit, "macos-intel");
+  assert.equal(storage.writes.length, 1, "only the deliberate selection is persisted");
+
+  const linkedVisit = fakePlatformSelectorDocument();
+  assert.equal(wirePublicPlatformSelector(linkedVisit.documentRef, {
+    navigatorRef: { userAgentData: { platform: "Windows" } },
+    locationRef: { search: "?platform=macos-intel" },
+    storage: recordingStorage({ "tibotattle.download-platform.v1": "windows" }),
+  }), "macos-intel");
+  assertPlatformSelection(linkedVisit, "macos-intel");
 });
 
 test("platform inference reveals the selector without writing session state", () => {
@@ -950,14 +1007,14 @@ test("the Homebrew command stays bounded and readable at narrow widths", async (
   );
 });
 
-test("the platform selector stays a quiet compact line above the active download", async () => {
+test("the platform selector stays compact and wraps full architecture labels at narrow widths", async () => {
   const styles = await readFile(new URL("../public/styles.css", import.meta.url), "utf8");
   const selectorRule = styles.match(/\.community-site \.platform-selector \{([^}]*)\}/u)?.[1] ?? "";
   const tabRule = styles.match(/\.community-site \.platform-tab \{([^}]*)\}/u)?.[1] ?? "";
   const selectedRule = styles.match(/\.community-site \.platform-tab\[aria-selected="true"\] \{([^}]*)\}/u)?.[1] ?? "";
 
   assert.match(selectorRule, /display: inline-flex;/u);
-  assert.match(selectorRule, /flex-wrap: nowrap;/u);
+  assert.match(selectorRule, /flex-wrap: wrap;/u);
   assert.match(selectorRule, /width: auto;/u);
   assert.match(selectorRule, /border: 0;/u);
   assert.match(selectorRule, /background: transparent;/u);
