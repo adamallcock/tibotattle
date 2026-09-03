@@ -8,6 +8,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   readlink,
   readdir,
@@ -93,7 +94,7 @@ const WEB_MODULE_ROOT = join(
 );
 const PINNED_NODE_VERSION = "v26.2.0";
 const PINNED_NODE_ARCHITECTURE = "arm64";
-// Intel is a development target only. These file digests are from the official
+// These Intel file digests are from the official
 // node-v26.2.0-darwin-x64.tar.xz archive, SHA-256
 // 50e3fb7cda816f0ab8929551516530669d1c0449a3f6a8a044be82a57cc642a4.
 // Verify the archive before extracting it; never execute an unverified input.
@@ -239,7 +240,9 @@ const MACOS_PREVIEW_APPCAST_PATH = "/preview/appcast.xml";
 export const MACOS_PREVIEW_DISTRIBUTION_CHANNEL =
   DISTRIBUTION_CHANNEL_PREVIEW;
 
-function assertMacOSPreviewAppcastBoundary(value) {
+function assertMacOSPreviewAppcastBoundary(value, architecture = "arm64") {
+  const expectedPath = architecture === "x64"
+    ? "/preview/intel/appcast.xml" : MACOS_PREVIEW_APPCAST_PATH;
   let selected;
   try {
     selected = new URL(value);
@@ -249,7 +252,7 @@ function assertMacOSPreviewAppcastBoundary(value) {
       "MACOS_PREVIEW_FEED_PATH_INVALID",
     );
   }
-  if (selected.pathname !== MACOS_PREVIEW_APPCAST_PATH) {
+  if (selected.pathname !== expectedPath) {
     fail(
       "Preview distribution requires the reviewed /preview/appcast.xml path",
       "MACOS_PREVIEW_FEED_PATH_INVALID",
@@ -551,14 +554,14 @@ export function normalizeMacOSCentralOrigin(
   fail("Central origin must be an HTTPS DNS origin and non-loopback");
 }
 
-function resolveOperationalReleaseChannel(channel = STABLE_RELEASE_CHANNEL) {
+function resolveOperationalReleaseChannel(channel = STABLE_RELEASE_CHANNEL, architecture = "arm64") {
   if (typeof channel !== "string") {
     fail(
       "External distribution must select a named release channel",
       "MACOS_RELEASE_CHANNEL_NAME_REQUIRED",
     );
   }
-  return resolveReleaseChannel(channel);
+  return resolveReleaseChannel(channel, { architecture });
 }
 
 function normalizeMacOSReleaseChannelOrigin(channel) {
@@ -2096,12 +2099,6 @@ function assertMacOSBuildArchitectureConfiguration({
   previewDistribution = false,
 } = {}) {
   const selected = normalizeMacOSBuildArchitecture(architecture);
-  if (selected === "x64" && (externalDistribution || previewDistribution)) {
-    fail(
-      "Intel bundles are development-only until the signed release and updater gates are qualified",
-      "MACOS_INTEL_DISTRIBUTION_UNQUALIFIED",
-    );
-  }
   if (selected === "arm64" && nodeRuntime !== null) {
     fail(
       "Apple Silicon builds must use the pinned builder's Node runtime",
@@ -2111,7 +2108,7 @@ function assertMacOSBuildArchitectureConfiguration({
   if (selected === "x64" && (typeof nodeRuntime !== "string"
       || nodeRuntime.length === 0 || nodeRuntime.includes("\0"))) {
     fail(
-      "Intel development builds require --node-runtime with the pinned official Intel Node executable",
+      "Intel builds require --node-runtime with the pinned official Intel Node executable",
       "MACOS_INTEL_NODE_RUNTIME_REQUIRED",
     );
   }
@@ -2120,6 +2117,52 @@ function assertMacOSBuildArchitectureConfiguration({
 
 function machOArchitecture(architecture) {
   return architecture === "x64" ? "x86_64" : "arm64";
+}
+
+export function assertMacOSMachOArchitecture(bytes, architecture) {
+  const selected = normalizeMacOSBuildArchitecture(architecture);
+  const cpuType = selected === "x64" ? 0x01000007 : 0x0100000c;
+  if (!Buffer.isBuffer(bytes) || bytes.length < 32
+      || bytes.readUInt32LE(0) !== 0xfeedfacf
+      || bytes.readUInt32LE(4) !== cpuType) {
+    fail(
+      "Bundle executable is not a thin Mach-O for the selected architecture",
+      "MACOS_BUNDLE_ARCHITECTURE_MISMATCH",
+    );
+  }
+}
+
+export async function assertMacOSBundleArchitecture(appPath, {
+  architecture = "arm64", updaterEnabled = false, helperRequired = true,
+} = {}) {
+  normalizeMacOSBuildArchitecture(architecture);
+  const files = [
+    SIGNED_EXECUTABLE_PATH,
+    "Contents/Resources/runtime/bin/node",
+    ...(helperRequired ? [MACOS_KEYCHAIN_MIGRATION_HELPER.executable] : []),
+    ...(updaterEnabled ? SPARKLE_MACH_O_PATHS.map((path) =>
+      `${SPARKLE_FRAMEWORK_PREFIX}/${path}`) : []),
+  ];
+  for (const path of files) {
+    const file = await open(join(appPath, ...path.split("/")),
+      fileSystemConstants.O_RDONLY | fileSystemConstants.O_NOFOLLOW);
+    try {
+      if (!(await file.stat()).isFile()) {
+        fail("Bundle executable must be a regular file", "MACOS_BUNDLE_ARCHITECTURE_MISMATCH");
+      }
+      const header = Buffer.alloc(32);
+      const { bytesRead } = await file.read(header, 0, 32, 0);
+      assertMacOSMachOArchitecture(header.subarray(0, bytesRead), architecture);
+    } finally {
+      await file.close();
+    }
+  }
+}
+
+function previewStagingRootForArchitecture(architecture) {
+  return architecture === "x64"
+    ? join(REPOSITORY_ROOT, ".release-build", "macos-preview", "intel", "current")
+    : DEFAULT_PREVIEW_STAGING_ROOT;
 }
 
 // Inspect input bytes without executing them. The copied runtime is checked
@@ -3082,7 +3125,8 @@ function readMacOSInfoPlist(path) {
  * The validator intentionally accepts only the preview marker and never
  * writes an application or attempts an install into /Applications.
  */
-export async function validateMacOSPreviewApp(appPath) {
+export async function validateMacOSPreviewApp(appPath, { architecture = "arm64" } = {}) {
+  normalizeMacOSBuildArchitecture(architecture);
   if (typeof appPath !== "string"
       || appPath.length === 0
       || appPath.includes("\0")) {
@@ -3147,6 +3191,9 @@ export async function validateMacOSPreviewApp(appPath) {
     assertMacOSKeychainMigrationManifest(manifest);
   }
   const release = manifest.release;
+  if (manifest.runtime?.node?.architecture !== architecture) {
+    fail("Preview runtime architecture does not match the selected target", "MACOS_BUNDLE_ARCHITECTURE_MISMATCH");
+  }
   if (release?.channel !== DISTRIBUTION_CHANNEL_PREVIEW
       || release.channelName !== DISTRIBUTION_CHANNEL_PREVIEW
       || release.appOpenScheme !== PREVIEW_PRODUCT_BRAND.appOpenScheme
@@ -3216,6 +3263,7 @@ export async function validateMacOSPreviewApp(appPath) {
     );
   }
   const updaterMetadata = normalizeMacOSUpdaterMetadata({
+    architecture,
     appcastURL: plist.SUFeedURL,
     publicEdKey: plist.SUPublicEDKey,
   });
@@ -3225,7 +3273,11 @@ export async function validateMacOSPreviewApp(appPath) {
       "MACOS_PREVIEW_STABLE_FEED_FORBIDDEN",
     );
   }
-  assertMacOSPreviewAppcastBoundary(updaterMetadata.appcastURL);
+  assertMacOSPreviewAppcastBoundary(updaterMetadata.appcastURL, architecture);
+  await assertMacOSBundleArchitecture(selected, {
+    architecture, updaterEnabled: true,
+    helperRequired: manifest.runtime?.keychainMigrationHelper !== undefined,
+  });
   const frameworkPath = join(
     selected,
     ...SPARKLE_FRAMEWORK_PREFIX.split("/"),
@@ -3330,8 +3382,14 @@ export async function validateMacOSPreviewApp(appPath) {
     );
   }
   run(CODESIGN_PATH, ["--verify", "--deep", "--strict", selected]);
+  if (plist.LSMinimumSystemVersion !== "14.0"
+      || manifest.application.minimumMacOSVersion !== plist.LSMinimumSystemVersion) {
+    fail("Preview minimum macOS version does not match its platform contract", "MACOS_MINIMUM_OS_MISMATCH");
+  }
   return Object.freeze({
     appPath: selected,
+    architecture,
+    minimumMacos: plist.LSMinimumSystemVersion,
     bundleIdentifier: plist.CFBundleIdentifier,
     bundleVersion: plist.CFBundleVersion,
     channel: DISTRIBUTION_CHANNEL_PREVIEW,
@@ -3717,7 +3775,6 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
   if (validatePreview) {
     if (appPath === null
         || output !== null
-        || architectureSeen
         || nodeRuntime !== null
         || centralOriginSeen
         || allowLoopbackCentralOrigin
@@ -3735,7 +3792,7 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
         "MACOS_PREVIEW_VALIDATION_ARGUMENTS_INVALID",
       );
     }
-    return { appPath, validatePreview };
+    return { appPath, validatePreview, ...(architectureSeen ? { architecture } : {}) };
   }
   assertMacOSBuildArchitectureConfiguration({
     architecture, nodeRuntime, externalDistribution, previewDistribution,
@@ -3759,7 +3816,7 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
     );
   }
   if (externalDistribution) {
-    resolveOperationalReleaseChannel(releaseChannel);
+    resolveOperationalReleaseChannel(releaseChannel, architecture);
     fail(
       "External distribution is only available through the validated release-macos-app programmatic path",
       "MACOS_EXTERNAL_BUILD_RELEASE_CORE_REQUIRED",
@@ -3773,7 +3830,7 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
         "MACOS_PREVIEW_OUTPUT_FORBIDDEN",
       );
     }
-    output = DEFAULT_PREVIEW_OUTPUT;
+    output = join(previewStagingRootForArchitecture(architecture), PREVIEW_PRODUCT_BRAND.bundleName);
     centralOrigin = centralOrigin
       ?? environment.USAGE_MONITOR_PREVIEW_CENTRAL_ORIGIN
       ?? MACOS_PREVIEW_PUBLIC_CONFIGURATION.centralOrigin;
@@ -3783,7 +3840,9 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
       ?? resolve(environmentFramework ?? DEFAULT_PREVIEW_FRAMEWORK);
     sparkleAppcastURL = sparkleAppcastURL
       ?? environment.USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL
-      ?? MACOS_PREVIEW_PUBLIC_CONFIGURATION.sparkleAppcastURL;
+      ?? (architecture === "x64"
+        ? new URL("/preview/intel/appcast.xml", MACOS_PREVIEW_PUBLIC_CONFIGURATION.sparkleAppcastURL).href
+        : MACOS_PREVIEW_PUBLIC_CONFIGURATION.sparkleAppcastURL);
     sparklePublicEdKey = sparklePublicEdKey
       ?? environment.USAGE_MONITOR_PREVIEW_SPARKLE_PUBLIC_ED_KEY
       ?? MACOS_PREVIEW_PUBLIC_CONFIGURATION.sparklePublicEdKey;
@@ -3793,7 +3852,7 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
         "MACOS_PREVIEW_STABLE_FEED_FORBIDDEN",
       );
     }
-    assertMacOSPreviewAppcastBoundary(sparkleAppcastURL);
+    assertMacOSPreviewAppcastBoundary(sparkleAppcastURL, architecture);
   }
   if (!output) fail("--output is required");
   return {
@@ -3884,6 +3943,7 @@ async function buildApplication(stageApp, centralService, {
   );
   await copyPinnedSparkleFramework(contents, updater, architecture);
   const node = await copyPinnedNode(resources, runtimeInput);
+  await assertMacOSBundleArchitecture(stageApp, { architecture, updaterEnabled: updater.enabled });
   await stageMacOSLocalizationResources(contents, appRoot, localizationResources);
   await copyFirstPartyRuntime(appRoot, graph, runtimeAssets, webModules);
   const dependencies = await copyRuntimeDependencies(
@@ -4087,7 +4147,7 @@ export async function buildMacOSApp({
   previewDistribution = false,
   releaseChannel = STABLE_RELEASE_CHANNEL,
   replacePreviewOutput = false,
-  previewStagingRoot = DEFAULT_PREVIEW_STAGING_ROOT,
+  previewStagingRoot = null,
   bundleVersion = BUNDLE_VERSION,
   buildProfile = MACOS_BUILD_PROFILE_RELEASE,
   sparkleFramework = null,
@@ -4099,6 +4159,7 @@ export async function buildMacOSApp({
   const selectedArchitecture = assertMacOSBuildArchitectureConfiguration({
     architecture, nodeRuntime, externalDistribution, previewDistribution,
   });
+  previewStagingRoot ??= previewStagingRootForArchitecture(selectedArchitecture);
   const selectedBuildProfile = normalizeMacOSBuildProfile(buildProfile);
   await assertCurrentExportCompatibilityManifest();
   if (externalDistribution && previewDistribution) {
@@ -4116,7 +4177,7 @@ export async function buildMacOSApp({
     );
   }
   const selectedReleaseChannel = externalDistribution
-    ? resolveOperationalReleaseChannel(releaseChannel)
+    ? resolveOperationalReleaseChannel(releaseChannel, selectedArchitecture)
     : null;
   if (externalDistribution
       && releaseAuthorization !== MACOS_RELEASE_BUILD_AUTHORIZATION) {
@@ -4183,9 +4244,10 @@ export async function buildMacOSApp({
     );
   }
   if (distribution.previewDistribution) {
-    assertMacOSPreviewAppcastBoundary(sparkleAppcastURL);
+    assertMacOSPreviewAppcastBoundary(sparkleAppcastURL, selectedArchitecture);
   }
   const updater = await normalizeMacOSUpdaterConfiguration({
+    architecture: selectedArchitecture,
     appcastURL: selectedReleaseChannel?.sparkle.appcastURL
       ?? sparkleAppcastURL,
     externalDistribution: distribution.externalDistribution,
@@ -4201,7 +4263,7 @@ export async function buildMacOSApp({
     );
   }
   if (distribution.previewDistribution) {
-    assertMacOSPreviewAppcastBoundary(updater.appcastURL);
+    assertMacOSPreviewAppcastBoundary(updater.appcastURL, selectedArchitecture);
   }
   const selectedPublicEdKeySha256 =
     selectedReleaseChannel?.sparkle.publicEdKeySha256 ?? null;
@@ -4274,7 +4336,7 @@ export async function buildMacOSApp({
             );
           }
           try {
-            await validateMacOSPreviewApp(selectedOutput);
+            await validateMacOSPreviewApp(selectedOutput, { architecture: selectedArchitecture });
           } catch (error) {
             const legacyManifest = await readReplaceableLegacyPreviewManifest(
               selectedOutput,
@@ -4342,7 +4404,7 @@ async function readMacOSReleaseBuildPreflight({
   sparkleAppcastURL,
   sparklePublicEdKey,
 }) {
-  // Refuse Intel before source, credential, signing, or updater preflights.
+  // Validate explicit target/runtime selection before release preflights.
   assertMacOSBuildArchitectureConfiguration({
     architecture, nodeRuntime, externalDistribution: true,
   });
@@ -4350,8 +4412,10 @@ async function readMacOSReleaseBuildPreflight({
   const buildConfiguration = releaseCore.readMacOSReleaseBuildConfiguration(
     environment,
     releaseChannel,
+    { architecture },
   );
   const updater = await normalizeMacOSUpdaterConfiguration({
+    architecture,
     appcastURL: buildConfiguration.sparkleAppcastURL,
     externalDistribution: true,
     frameworkPath: buildConfiguration.sparkleFramework,
@@ -4361,6 +4425,7 @@ async function readMacOSReleaseBuildPreflight({
     ? null
     : await releaseCore.readStableReleaseManifest(previousStableManifestPath);
   releaseCore.assertStableSparkleKeyContinuity({
+    architecture,
     candidateBundleVersion: buildConfiguration.bundleVersion,
     candidatePublicEdKeySha256: sha256(
       Buffer.from(updater.publicEdKey, "base64"),
@@ -4409,6 +4474,7 @@ async function assertMacOSReleaseBuildPreflight(options) {
     candidateAppPath,
     {
       channel: releaseChannel,
+      architecture: options.architecture ?? "arm64",
       requireExternalDistribution: true,
     },
   );
@@ -4477,7 +4543,7 @@ async function main(argv) {
     validatePreview,
   } = parseMacOSBuildArguments(argv);
   if (validatePreview) {
-    const result = await validateMacOSPreviewApp(appPath);
+    const result = await validateMacOSPreviewApp(appPath, { architecture });
     console.log("Preview validation: passed");
     console.log(`Bundle: ${result.bundleIdentifier}`);
     console.log(`Bundle version: ${result.bundleVersion}`);

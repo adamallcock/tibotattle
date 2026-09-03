@@ -16,8 +16,8 @@ supported; Intel macOS, Windows and Linux are not.
 
 | Platform | Source and contract | Native/physical qualification | Install, trust, update, release | Public status |
 |---|---|---|---|---|
-| macOS 14+ arm64 | Implemented | Native macOS product and retained qualification paths | Developer ID, notarization, Sparkle, stable DMG, and public `v0.1.16` release paths exist | **Supported** |
-| macOS 14+ x86_64 | Experimental development/test builder and native broker selection | Cross-compilation and synthetic Rosetta probes; no physical Intel qualification | Development app only; no qualified Intel installer, signing/notarization receipt, or update feed | **Unsupported** |
+| macOS 14+ arm64 | Implemented | Native macOS product and retained qualification paths | Developer ID, notarization, Sparkle, stable DMG, and public `v0.1.17` release paths exist | **Supported** |
+| macOS 14+ x86_64 | Explicit thin Intel build, native broker, packaging and isolated updater contracts | Cross-compilation and synthetic Rosetta probes; no physical Intel qualification | Release tooling implemented; no qualified signed Intel installer or published feed | **Unsupported** |
 | Windows x64 | Portable core and fail-closed native filesystem/credential adapter exist | Partial qualification evidence; not a standing release gate | No supported signed installer, clean install/upgrade/uninstall receipt, updater, or stable artifact | **Unsupported** |
 | Linux x86_64 | Portable/core and container checks may run | Contract or container results are not physical desktop qualification | No supported signed package/repository, clean install/uninstall receipt, updater boundary, or stable artifact | **Unsupported** |
 
@@ -57,9 +57,11 @@ or browser-rendered dashboard does not extend the support claim.
 
 Intel macOS is not claimed. Adding it requires a separately identified final
 artifact and the full ladder above; Rosetta behavior alone is not qualification.
-The builder has an experimental, updater-disabled Intel development/test target
-on the pinned Apple Silicon host. The website exposes a separate macOS Intel
-tab with an unavailable state; neither is a supported download. See the
+The pinned Apple silicon builder accepts an explicit Intel runtime and target.
+Packaging and update contracts identify Intel independently; every artifact must
+pass its own native trust and update gates. The website has a separate macOS
+Intel tab that remains unavailable unless validated Intel release evidence is
+supplied. Source implementation does not establish a supported download. See the
 [native developer build](../../apps/macos/README.md#developer-build) and
 [Intel release plan](../plans/2026-09-03-macos-intel-release.md).
 

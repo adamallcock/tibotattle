@@ -70,6 +70,8 @@ export const DEPLOYMENT_ENDPOINTS = Object.freeze({
   sparkle: Object.freeze({
     appcastURL: new URL("/appcast.xml", sparkleUpdateOriginURL).href,
     origin: sparkleUpdateOriginURL.origin,
+    intelAppcastURL: new URL("/intel/appcast.xml", sparkleUpdateOriginURL).href,
+    intelPreviewAppcastURL: new URL("/preview/intel/appcast.xml", sparkleUpdateOriginURL).href,
     // Preview is a separately identified client and must never consume the
     // stable appcast. Keeping the dedicated path in the reviewed endpoint
     // manifest prevents the native build and deployment checks from drifting.
@@ -120,6 +122,14 @@ export function assertDeploymentEndpoints(
     throw new TypeError(
       "Sparkle preview appcast URL must be derived from its origin",
     );
+  }
+  for (const [field, path] of [
+    ["intelAppcastURL", "/intel/appcast.xml"],
+    ["intelPreviewAppcastURL", "/preview/intel/appcast.xml"],
+  ]) {
+    if (endpoints.sparkle?.[field] !== new URL(path, reviewedSparkleOrigin).href) {
+      throw new TypeError("Sparkle Intel appcast URL must match its reviewed path");
+    }
   }
   if (typeof endpoints.sparkle?.r2Bucket !== "string"
       || !/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/u.test(

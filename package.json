@@ -1,6 +1,6 @@
 {
   "name": "app-usagemonitor",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "private": true,
   "type": "module",
   "description": "Local-first coding-agent usage analysis with optional privacy-safe community aggregates.",

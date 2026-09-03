@@ -57,6 +57,8 @@ import {
   MACOS_QUOTA_ANALYSIS_RUNTIME_FILES,
   MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES,
   MACOS_WEB_MODULE_ENTRYPOINTS,
+  assertMacOSBundleArchitecture,
+  assertMacOSMachOArchitecture,
   buildMacOSApp,
   buildMacOSAppForRelease,
   buildMacOSReleaseCandidate,
@@ -98,6 +100,7 @@ import {
   developerIDSignMacOSApp,
   developerIDSignMacOSDMG,
   inspectMacOSApp,
+  macOSReleaseManifestArchitecture,
   isMacOSReleaseSourceTagForChannel,
   packageMacOSDMG,
   prepareMacOSReleaseCandidate,
@@ -558,7 +561,7 @@ test("native launch binds each bundle ID to one reviewed runtime identity", asyn
   );
   assert.match(
     source,
-    /"com\.usagemonitor\.local\.preview",\s*"preview_distribution",\s*"preview_distribution",\s*true[\s\S]*requiredAppcastPath: "\/preview\/appcast\.xml"[\s\S]*automaticUpdates: false/u,
+    /"com\.usagemonitor\.local\.preview",\s*"preview_distribution",\s*"preview_distribution",\s*true[\s\S]*requiredAppcastPath: MacOSUpdaterFeedPolicy\.previewPath[\s\S]*automaticUpdates: false/u,
   );
   assert.equal(
     source.includes(DEPLOYMENT_ENDPOINTS.sparkle.appcastURL),
@@ -579,8 +582,9 @@ test("native launch binds each bundle ID to one reviewed runtime identity", asyn
   );
   assert.match(
     source,
-    /components\.percentEncodedPath == requiredAppcastPath[\s\S]*expectedAppcastURL == nil \|\| appcast == expectedAppcastURL/u,
+    /components\.percentEncodedPath == requiredPath[\s\S]*expectedURL == nil \|\| appcast == expectedURL/u,
   );
+  assert.match(source, /MacOSUpdaterFeedPolicy\.accepts\(\s*appcast,[\s\S]*expectedURL: expectedAppcastURL,[\s\S]*requiredPath: requiredAppcastPath\s*\)/u);
   assert.match(
     source,
     /publicKeyBytes\.count == 32[\s\S]*publicKeyBytes\.base64EncodedString\(\) == publicKey/u,
@@ -4441,6 +4445,7 @@ test("generic DMG packaging requires an explicit visible non-release mode", () =
     ]),
     {
       appPath: resolve(".release-build/macos/TiboTattle.app"),
+      architecture: "arm64",
       output: resolve(
         `.release-build/macos/TiboTattle-${RELEASE_VERSION}`
           + "-macOS-arm64-development.dmg",
@@ -4591,11 +4596,13 @@ test("development and preview builds treat the release-channel policy as optiona
 
 test("macOS release metadata validates versions, production mode, and Keychain references", async () => {
   assert.equal(normalizeMacOSBundleVersion(), DERIVED_MACOS_BUNDLE_VERSION);
-  assert.equal(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION, "1023.7");
-  assert.equal(STABLE_SIGNED_BUNDLE_VERSION, "1024");
+  assert.equal(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION, "1025");
+  assert.equal(STABLE_SIGNED_BUNDLE_VERSION, "1026");
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.17", INTERNAL_DOGFOOD_RELEASE_CHANNEL), "1023.7");
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.17", STABLE_RELEASE_CHANNEL), "1024");
   assert.equal(
     normalizeMacOSBundleVersion(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
-    "1023.7",
+    "1025",
   );
   assert.equal(
     compareMacOSBundleVersions(
@@ -4656,7 +4663,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
     );
   }
   assert.equal(
-    resolveSignedMacOSBundleVersion("0.1.18", STABLE_RELEASE_CHANNEL),
+    resolveSignedMacOSBundleVersion("0.1.19", STABLE_RELEASE_CHANNEL),
     null,
     "a future signed version requires an explicit owner-reviewed allocation",
   );
@@ -5388,7 +5395,7 @@ test("signed updater replacement contract validates upgrade and rollback artifac
     },
     assurances: { ...assurances },
     updater: {
-      appcastURL: "https://usage.example/appcast.xml",
+      appcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
       automaticChecks: true,
       automaticUpdateOptInAvailable: true,
       automaticUpdatesEnabledByDefault: true,
@@ -5413,6 +5420,46 @@ test("signed updater replacement contract validates upgrade and rollback artifac
     "UsageMonitor-candidate.dmg",
     candidateBytes,
   );
+  const intelManifest = (manifest) => {
+    const result = structuredClone(manifest);
+    result.application.architecture = "x64";
+    result.artifact.fileName = `TiboTattle-${RELEASE_VERSION}-macOS-x64.dmg`;
+    result.channel = createReleaseChannelProvenance(STABLE_RELEASE_CHANNEL, {
+      architecture: "x64", publicEdKeySha256: sparklePublicKeySha256,
+    });
+    result.updater.appcastURL = getReleaseChannel(STABLE_RELEASE_CHANNEL, { architecture: "x64" }).sparkle.appcastURL;
+    return result;
+  };
+  const intelPrevious = intelManifest(previousManifest);
+  const intelCandidate = intelManifest(candidateManifest);
+  assert.equal(macOSReleaseManifestArchitecture(previousManifest), "arm64");
+  assert.equal(macOSReleaseManifestArchitecture(intelCandidate), "x64");
+  assert.equal(validateMacOSSignedReplacementPair({
+    previousManifest: intelPrevious, candidateManifest: intelCandidate,
+  }).previousBundleVersion, "10");
+  assert.throws(() => validateMacOSSignedReplacementPair({
+    previousManifest, candidateManifest: intelCandidate,
+  }), { code: "MACOS_RELEASE_ARCHITECTURE_MISMATCH" });
+  assert.throws(() => assertStableSparkleKeyContinuity({
+    architecture: "x64", channel: STABLE_RELEASE_CHANNEL,
+    candidateBundleVersion: "11", candidatePublicEdKeySha256: sparklePublicKeySha256,
+    previousManifest,
+  }), { code: "MACOS_RELEASE_ARCHITECTURE_MISMATCH" });
+  assert.equal(assertStableSparkleKeyContinuity({
+    architecture: "x64", channel: STABLE_RELEASE_CHANNEL,
+    candidateBundleVersion: "11", candidatePublicEdKeySha256: sparklePublicKeySha256,
+    previousManifest: intelPrevious,
+  }).mode, "previous_manifest");
+  assert.equal(assertStableSparkleKeyContinuity({
+    architecture: "x64", channel: STABLE_RELEASE_CHANNEL,
+    candidateBundleVersion: "11", candidatePublicEdKeySha256: sparklePublicKeySha256,
+    stableBootstrap: true,
+  }).mode, "bootstrap");
+  const mislabeledIntel = structuredClone(intelCandidate);
+  mislabeledIntel.artifact.fileName = `TiboTattle-${RELEASE_VERSION}-macOS-arm64.dmg`;
+  assert.throws(() => macOSReleaseManifestArchitecture(mislabeledIntel), {
+    code: "MACOS_RELEASE_ARCHITECTURE_MISMATCH",
+  });
   const legacyStableManifest = {
     ...previousManifest,
     application: {
@@ -5748,6 +5795,10 @@ test("signed updater replacement contract validates upgrade and rollback artifac
         channel: createReleaseChannelProvenance(STABLE_RELEASE_CHANNEL, {
           publicEdKeySha256: historicalDogfoodManifest.updater.publicEdKeySha256,
         }),
+        updater: {
+          ...historicalDogfoodManifest.updater,
+          appcastURL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
+        },
       },
     ]) {
       await writeFile(historicalPublicManifestPath, JSON.stringify(manifest));
@@ -5868,6 +5919,7 @@ test("signed updater replacement contract validates upgrade and rollback artifac
         join(temporaryRoot, previousManifest.artifact.fileName),
         {
           allowLegacyUnsealedSource: false,
+          architecture: "arm64",
           channel: STABLE_RELEASE_CHANNEL,
           production: true,
         },
@@ -5876,6 +5928,7 @@ test("signed updater replacement contract validates upgrade and rollback artifac
         join(temporaryRoot, candidateManifest.artifact.fileName),
         {
           allowLegacyUnsealedSource: false,
+          architecture: "arm64",
           channel: STABLE_RELEASE_CHANNEL,
           production: true,
         },
@@ -6522,6 +6575,7 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
         CFBundleIdentifier: "com.usagemonitor.local",
         CFBundleName: PRODUCT_BRAND.displayName,
         CFBundleShortVersionString: "0.0.1",
+        LSMinimumSystemVersion: "14.0",
         CFBundleVersion: "1",
         CFBundleIconFile: "AppIcon",
         CFBundleURLTypes: [{
@@ -6561,8 +6615,12 @@ test("Developer ID and notary hooks are inside-out, hardened, and credential-min
         schemaVersion: "usage-monitor-macos-app-build-v0.1",
         application: {
           bundleIdentifier: "com.usagemonitor.local",
+          minimumMacOSVersion: "14.0",
         },
-        runtime: { keychainMigrationHelper: { ...MACOS_KEYCHAIN_MIGRATION_HELPER } },
+        runtime: {
+          node: { architecture: "arm64" },
+          keychainMigrationHelper: { ...MACOS_KEYCHAIN_MIGRATION_HELPER },
+        },
         inputs: {
           swiftSources: ["apps/macos/Sources/KeychainMigration.swift", "apps/macos/UsageMonitorApp.swift"],
           keychainMigrationHelperSources: [...MACOS_KEYCHAIN_MIGRATION_HELPER_SOURCES],
@@ -9145,6 +9203,8 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.deepEqual(
       await validateMacOSDMG(dmg, { production: false }),
       {
+        architecture: "arm64",
+        minimumMacos: "14.0",
         bundleIdentifier: "com.usagemonitor.local",
         production: false,
         shortVersion: RELEASE_VERSION,
@@ -9312,6 +9372,8 @@ macOSArtifactTest("preview distribution builds use an isolated identity and reje
     assert.equal(manifest.release.requiresDeveloperIDAndNotarization, false);
     assert.deepEqual(await validateMacOSPreviewApp(output), {
       appPath: resolve(output),
+      architecture: "arm64",
+      minimumMacos: "14.0",
       bundleIdentifier: PREVIEW_PRODUCT_BRAND.bundleIdentifier,
       bundleVersion: "42",
       channel: MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
@@ -9341,6 +9403,8 @@ macOSArtifactTest("preview distribution builds use an isolated identity and reje
       }),
       {
         bundleIdentifier: PREVIEW_PRODUCT_BRAND.bundleIdentifier,
+        architecture: "arm64",
+        minimumMacos: "14.0",
         production: false,
         shortVersion: RELEASE_VERSION,
       },
@@ -9615,6 +9679,8 @@ macOSArtifactTest("preview distribution builds use an isolated identity and reje
     ], { stdio: "ignore" });
     assert.deepEqual(await validateMacOSPreviewApp(output), {
       appPath: resolve(output),
+      architecture: "arm64",
+      minimumMacos: "14.0",
       bundleIdentifier: PREVIEW_PRODUCT_BRAND.bundleIdentifier,
       bundleVersion: "42",
       channel: MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
@@ -9729,6 +9795,8 @@ macOSArtifactTest("preview distribution builds use an isolated identity and reje
     });
     assert.deepEqual(await validateMacOSPreviewApp(output), {
       appPath: resolve(output),
+      architecture: "arm64",
+      minimumMacos: "14.0",
       bundleIdentifier: PREVIEW_PRODUCT_BRAND.bundleIdentifier,
       bundleVersion: "42",
       channel: MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
@@ -10022,6 +10090,58 @@ test("pinnedPackage authenticates external packages by reviewed file-tree digest
 const output = ".release-build/intel-test/TiboTattle.app";
 const nodeRuntime = ".release-build/verified-intel/bin/node";
 
+test("bundle architecture verification covers launcher, Node, helper and every Sparkle executable", async () => {
+  const header = (architecture) => {
+    const bytes = Buffer.alloc(32);
+    bytes.writeUInt32LE(0xfeedfacf, 0);
+    bytes.writeUInt32LE(architecture === "x64" ? 0x01000007 : 0x0100000c, 4);
+    return bytes;
+  };
+  for (const architecture of ["arm64", "x64"]) {
+    assertMacOSMachOArchitecture(header(architecture), architecture);
+    assert.throws(() => assertMacOSMachOArchitecture(header(architecture === "x64" ? "arm64" : "x64"), architecture), {
+      code: "MACOS_BUNDLE_ARCHITECTURE_MISMATCH",
+    });
+    assert.throws(() => assertMacOSMachOArchitecture(Buffer.alloc(32), architecture), {
+      code: "MACOS_BUNDLE_ARCHITECTURE_MISMATCH",
+    });
+  }
+  const scratch = await mkdtemp(join(await realpath(tmpdir()), "macos-architecture-fixture-"));
+  try {
+    const paths = [
+      "Contents/MacOS/TiboTattle", "Contents/Resources/runtime/bin/node",
+      MACOS_KEYCHAIN_MIGRATION_HELPER.executable,
+      ...SPARKLE_MACH_O_PATHS.map((path) => `Contents/Frameworks/Sparkle.framework/${path}`),
+    ];
+    for (const path of paths) {
+      await mkdir(dirname(join(scratch, path)), { recursive: true });
+      await writeFile(join(scratch, path), header("x64"));
+    }
+    await assertMacOSBundleArchitecture(scratch, { architecture: "x64", updaterEnabled: true });
+    for (const path of paths) {
+      await writeFile(join(scratch, path), header("arm64"));
+      await assert.rejects(assertMacOSBundleArchitecture(scratch, {
+        architecture: "x64", updaterEnabled: true,
+      }), { code: "MACOS_BUNDLE_ARCHITECTURE_MISMATCH" });
+      await writeFile(join(scratch, path), header("x64"));
+    }
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test("Intel signed build configuration selects only its architecture's reviewed feed", () => {
+  const environment = {
+    USAGE_MONITOR_SPARKLE_FRAMEWORK: ".release-deps/Sparkle.framework",
+    USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY: Buffer.alloc(32, 1).toString("base64"),
+  };
+  const configuration = readMacOSReleaseBuildConfiguration(environment, STABLE_RELEASE_CHANNEL, { architecture: "x64" });
+  assert.equal(new URL(configuration.sparkleAppcastURL).pathname, "/intel/appcast.xml");
+  assert.throws(() => readMacOSReleaseBuildConfiguration({
+    ...environment, USAGE_MONITOR_SPARKLE_APPCAST_URL: DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
+  }, STABLE_RELEASE_CHANNEL, { architecture: "x64" }), { code: "MACOS_RELEASE_ENDPOINTS_MISMATCH" });
+});
+
 test("macOS architecture selection is explicit and leaves ARM defaults intact", () => {
   const defaults = parseMacOSBuildArguments(["--output", output], {});
   assert.equal(defaults.architecture, "arm64");
@@ -10057,33 +10177,32 @@ test("macOS architecture selection is explicit and leaves ARM defaults intact", 
   ]) {
     assert.throws(() => parseMacOSBuildArguments(["--output", output, ...arguments_], {}));
   }
-  assert.throws(() => parseMacOSBuildArguments([
-    "--validate-preview", "--app", output, "--architecture", "arm64",
-  ], {}), { code: "MACOS_PREVIEW_VALIDATION_ARGUMENTS_INVALID" });
+  assert.equal(parseMacOSBuildArguments([
+    "--validate-preview", "--app", output, "--architecture", "x64",
+  ], {}).architecture, "x64");
 });
 
-test("Intel cannot enter Preview or external release through any builder entrypoint", async () => {
-  for (const flag of ["--preview-distribution", "--external-distribution"]) {
-    assert.throws(() => parseMacOSBuildArguments([
-      flag, "--architecture", "x64", "--node-runtime", nodeRuntime,
-    ], {}), { code: "MACOS_INTEL_DISTRIBUTION_UNQUALIFIED" });
-  }
-  for (const configuration of [
-    { previewDistribution: true },
-    { externalDistribution: true },
-  ]) {
-    await assert.rejects(buildMacOSApp({
-      output, architecture: "x64", nodeRuntime, ...configuration,
-    }), { code: "MACOS_INTEL_DISTRIBUTION_UNQUALIFIED" });
-  }
+test("Intel Preview is isolated while external builds retain release-core authorization", async () => {
+  const preview = parseMacOSBuildArguments([
+    "--preview-distribution", "--architecture", "x64", "--node-runtime", nodeRuntime,
+  ], {});
+  assert.equal(preview.architecture, "x64");
+  assert.match(preview.output, /\/macos-preview\/intel\/current\/TiboTattle Preview\.app$/u);
+  assert.equal(new URL(preview.sparkleAppcastURL).pathname, "/preview/intel/appcast.xml");
+  assert.throws(() => parseMacOSBuildArguments([
+    "--external-distribution", "--architecture", "x64", "--node-runtime", nodeRuntime,
+  ], {}), { code: "MACOS_EXTERNAL_BUILD_RELEASE_CORE_REQUIRED" });
+  await assert.rejects(buildMacOSApp({
+    output, architecture: "x64", nodeRuntime, externalDistribution: true,
+  }), { code: "MACOS_EXTERNAL_BUILD_RELEASE_CORE_REQUIRED" });
+  assert.throws(() => parseMacOSBuildArguments([
+    "--preview-distribution", "--architecture", "x64", "--node-runtime", nodeRuntime, "--test-build",
+  ], {}), { code: "MACOS_TEST_BUILD_DISTRIBUTION_FORBIDDEN" });
   for (const builder of [buildMacOSReleaseCandidate, buildMacOSAppForRelease]) {
     await assert.rejects(builder({
       output, candidateAppPath: output, architecture: "x64", nodeRuntime,
-      externalDistribution: true,
-      environment: new Proxy({}, {
-        get() { throw new Error("Credential environment must not be read"); },
-      }),
-    }), { code: "MACOS_INTEL_DISTRIBUTION_UNQUALIFIED" });
+      externalDistribution: true, environment: {},
+    }), { code: "MACOS_UPDATER_REQUIRED_FOR_DISTRIBUTION" });
   }
 });
 

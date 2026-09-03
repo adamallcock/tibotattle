@@ -7,16 +7,19 @@ status: in-progress
 
 # Separate macOS Intel build and release
 
-Start Intel work independently of the Apple Silicon 0.1.17 publication. Keep
-one codebase, two thin installers, and explicit platform availability on the
-website. This plan records intended work and local implementation evidence;
-it does not declare Intel supported or a candidate publicly released.
+Implement separate Apple silicon and Intel installers from one source, with
+architecture-specific updates and manifest-driven website availability. This
+plan records implementation and local checks; it does not declare Intel
+supported or publish a release.
 
-Baseline: `394c8a03a986e0daadbe662679fd002202682e44`, reviewed 2026-09-03,
-package version 0.1.17. The task branch is `codex/macos-intel-foundation`.
-The existing [feasibility report](../research/2026-08-31-macos-intel-universal2-feasibility.md)
-records earlier probes against a different source revision; it does not qualify
-this baseline's newly added native Keychain migration helper.
+On 2026-09-03 the user requested complete implementation after 0.1.17 launched.
+The branch `codex/macos-intel-foundation` now includes main `9e1c3333` through
+local merge `8c8a149f`. Published `v0.1.17` points to
+`aa660b24a66196155ba59267ab832cc4ef6e1c7d` and is immutable. GitHub's release API
+confirmed its ARM DMG, appcast, manifest, checksums and verification guide.
+The working candidate is **0.1.18**, with no source tag or release created.
+The [feasibility report](../research/2026-08-31-macos-intel-universal2-feasibility.md)
+retains its earlier snapshot and is not current qualification evidence.
 
 Current operational authorities remain the
 [macOS release runbook](../runbooks/macos-stable-release-runbook.md) and
@@ -24,29 +27,46 @@ Current operational authorities remain the
 
 ## Version and publication boundary
 
-The user requested an Intel 0.1.17 alongside the Apple Silicon release already
-being prepared. macOS permits the same marketing version on two architectures,
-but the current release contract binds every artifact to the same version, tag,
-and source commit. The reviewed baseline needs source changes to build Intel.
+The first request proposed Intel 0.1.17 alongside Apple silicon. That release
+is now immutable, so later source changes cannot be represented by its tag or
+added as release assets. See [GitHub's immutable-release contract](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases).
+Both 0.1.18 installers must identify one common annotated source tag and commit.
+Each has independent final bytes, digest, native trust and artifact evidence.
 
-- Before the stable source is frozen, a deliberate hold could allow Intel
-  changes into one common commit, followed by fresh qualification of both
-  architectures and both installers in the draft release.
-- Once the source is frozen, a later Intel source commit cannot honestly use
-  that tag. Once the release is immutable, its assets cannot be appended or
-  replaced. See [GitHub's immutable-release contract](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases).
-- A separate later release still displaying 0.1.17 would require a deliberately
-  designed architecture-specific source/provenance contract. It is not an
-  existing release option and is not introduced by this foundation.
-- The recommended path is to let 0.1.17 proceed unchanged, qualify Intel, then
-  use the next available numeric version. Version/build allocation remains
-  pending; this branch does not move a tag, bump a version, or alter a feed.
+The checked-in candidate allocations are dogfood **1025** and stable **1026**,
+above 0.1.17 stable **1024**. Both architectures use the same allocation. This
+reserves ordering in code; it is not proof of signing, installation or release.
+Do not reuse the ARM 0.1.17 artifact as Intel recovery/update history.
 
-The live GitHub release-by-tag read returned 404 during this investigation.
-That observation does not authorize interrupting the owner's release work or
-imply that a release could not have been created subsequently.
+## Complete implementation acceptance
 
-## Initial implementation boundary
+- [x] Native builder, inspector, DMG packaging and release CLI accept explicit
+  `x64`, enforce exact `x86_64` slices for every bundled executable, and retain
+  the Node 26.2.0 ARM build-host requirement and verified Intel runtime inputs.
+- [x] Stable, dogfood and Preview updater contracts select the matching feed.
+  ARM paths stay unchanged. Intel uses `/intel/appcast.xml`,
+  `/internal-dogfood/intel/appcast.xml`, and `/preview/intel/appcast.xml`.
+  Publication uses separate immutable prefixes and authenticated atomic guard
+  targets in the existing channel buckets; no new external resources are created.
+- [x] Native runtime and publication reject cross-architecture destinations,
+  manifests, prior-release pairs and appcasts; key continuity remains required.
+- [x] A single public evidence manifest can contain both independently verified
+  DMGs with the same version/tag/commit. Website Intel download, version, minimum
+  macOS and checksum appear only for validated Intel evidence. Intel Homebrew
+  remains unadvertised until the separate tap supports it.
+- [ ] Source tests, Worker checks, retained native artifact gates, actual Intel
+  development build/DMG and isolated synthetic Rosetta smoke pass on this source.
+- [x] Browser checks cover available and unavailable Intel states, ARM regression,
+  keyboard selection and mobile layout, distinguishing synthetic UI fixtures
+  from published evidence.
+- [x] Maintained developer, release and support documents match the implementation
+  without promoting source compatibility to public platform support.
+
+All local work proceeds without Developer ID signing, notarization, system
+installation, pushing, deployment or publication. Those remain protected steps;
+physical Intel qualification is also outstanding.
+
+## Earlier foundation checkpoint
 
 - [x] Explicit Intel development/test target on the existing pinned arm64
   builder, using the verified official Node 26.2.0 x64 runtime.
@@ -68,7 +88,7 @@ synthetic data and isolated state, without real Keychain access, application
 replacement, login-item changes, Developer ID signing, notarization, or
 publication. The local builder retains its existing ad-hoc signing step.
 
-## Local verification on 2026-09-03
+## Earlier foundation verification on 2026-09-03
 
 These are working-branch results, not release receipts or physical Intel
 qualification. No source tag, release allocation, published artifact or feed
@@ -93,26 +113,58 @@ installed from their lockfile before the complete release-site gate was run.
 Neither environment issue was resolved by skipping assertions or loosening a
 release rule.
 
+## Implementation review and qualification limits
+
+An independent read-only code-quality review against merge base `8c8a149f`
+found no actionable P1/P2 architecture, release-trust or publication-boundary
+regressions. This is source review, not a hardware or signing receipt.
+
+The website passes 490 UI tests and 36 release-site tests, including Worker
+release staging contracts. Available Intel UI was inspected with an explicitly
+labelled synthetic fixture; public metadata inspected separately still
+advertised ARM 0.1.16 and kept Intel unavailable. Desktop, mobile, Spanish,
+Chinese, keyboard navigation and checksum copying were checked. Preview
+servers were stopped after inspection.
+
+Updater tests cover first Intel bootstrap while an ARM feed already exists,
+unchanged ARM bytes, signature/CAS/nonce checks, wrong-architecture history,
+wrong namespaces and mismatched signed version/filename. Worker checks pass
+through type, script and runtime tests; final clean-tree asset staging/dry
+bundling is tracked separately from deployment.
+
+The initial full root run found three stale native test expectations for the
+extracted feed policy/new validation fields and a missing tool-inventory caller
+entry. Those were corrected without weakening runtime assertions. A fresh full
+run is pending at this checkpoint. The two R7 freshness failures remain:
+0.1.18 changes six version/compatibility files in the hashed R7 workload closure.
+All retained R7 receipts are consequently stale. They were not rewritten,
+skipped or relabelled. The [R7 runbook](../runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md)
+requires separately authorized local regeneration because the real-history
+profile reads the owner's private Codex corpus.
+
 ## Gates before an Intel release
 
-1. Define architecture-aware release metadata, source provenance, filename and
-   evidence contracts, and allocate monotonic tester/stable build numbers.
-2. Create reviewed Intel test/stable feed policy and matching publisher/Worker
-   checks. Preserve the existing Apple Silicon endpoints and trust chain. The
-   development build remains updater-disabled; it is not a test feed.
-3. Qualify all nested Intel binaries, including the five Sparkle binaries, and
-   the final signed/notarized/stapled artifact's source and payload integrity.
-4. Test on physical Intel hardware at the declared macOS floor: offline usage,
-   provider discovery, attribution, native lifecycle, login items, clean install,
-   and prompt-free Keychain operation. Rosetta is supplementary evidence only.
-5. Prove Intel candidate A updates to B, cross-architecture delivery is refused,
-   invalid feed/signature/version data is rejected, and first-feed bootstrap
-   does not borrow an Apple Silicon installation's update history.
-6. Preserve an Intel-compatible recovery artifact and state backup when needed;
-   an ARM-only 0.1.17 app cannot recover an Intel installation.
-7. Make website/Homebrew selection agree with actual published artifacts before
-   advertising Intel as available. Verify public bytes and real installation
-   after the normal immutable-release/publication sequence.
+1. Complete local regression and clean-tree Worker dry-build evidence, including
+   protected R7 receipt regeneration before relying on those release receipts.
+2. Finalize a common clean annotated 0.1.18 source tag only after review. Keep
+   dogfood/stable build allocation and source identity identical across the two
+   architectures. Do not change the immutable 0.1.17 release or tag.
+3. Independently sign, notarize, staple and verify the final ARM and Intel
+   artifacts, including all eight nested Intel executable components.
+4. Test on physical Intel hardware at macOS 14: offline usage, provider discovery,
+   attribution, lifecycle, login items, clean install and prompt-free Keychain
+   operation. Rosetta remains supplementary evidence.
+5. Prove installed Intel candidate A updates to B; reject invalid signatures,
+   versions and cross-architecture delivery. Preserve an Intel-compatible
+   recovery artifact and data backup; ARM 0.1.17 is not Intel recovery history.
+6. Deploy the reviewed guard, assemble both artifacts plus one canonical evidence
+   manifest before immutable GitHub publication, then publish each feed through
+   its authenticated architecture target. These are separately authorized writes.
+7. Enable the website Intel metadata only from verified published Intel bytes.
+   Intel Homebrew requires a separate reviewed tap change and remains absent
+   from the Intel card until then. Recheck public bytes and installation after
+   publication; local browser checks are not deployment proof.
 
-Signed probes, physical-hardware checks and publication remain separate gates.
-Source tests and a development app must not be presented as those receipts.
+The implementation remains **in progress toward release qualification**, not a
+supported Intel release. No Developer ID signing, notarization, system install,
+public feed update, website deployment, push or tag occurred in this work.

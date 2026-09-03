@@ -62,6 +62,7 @@ async function writeFakeAppBundle(root, { bundleVersion, shortVersion }) {
 }
 
 function officialToolOutput({
+  architecture = "arm64",
   artifactBytes,
   bundleVersion,
   downloadURLPrefix,
@@ -92,8 +93,8 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
             <pubDate>Sun, 10 Aug 2026 12:00:00 -0400</pubDate>
             <sparkle:version>${bundleVersion}</sparkle:version>
             <sparkle:shortVersionString>${shortVersion}</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <sparkle:minimumSystemVersion>${architecture === "x64" ? "14.0" : "13.0"}</sparkle:minimumSystemVersion>
+            ${architecture === "arm64" ? "<sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>" : ""}
             <enclosure url="${url}" length="${artifactBytes.length}" type="application/octet-stream" sparkle:edSignature="${artifactSignature}"></enclosure>
         </item>
     </channel>
@@ -110,16 +111,17 @@ length: ${Buffer.byteLength(prefix, "utf8")}
 `;
 }
 
-async function createStableFixture({ bundleVersion = "3", shortVersion = "0.1.3" } = {}) {
+async function createStableFixture({ architecture = "arm64", bundleVersion = "3", shortVersion = "0.1.3" } = {}) {
   const root = await mkdtemp(
     join(await realpath(tmpdir()), "tibotattle-stable-feed-generator-test-"),
   );
   const appPath = await writeFakeAppBundle(root, { bundleVersion, shortVersion });
-  const dmgFileName = `TiboTattle-${shortVersion}-macOS-arm64.dmg`;
+  const dmgFileName = `TiboTattle-${shortVersion}-macOS-${architecture}.dmg`;
   const dmgBytes = Buffer.from(`stable-signed-dmg-${bundleVersion}`);
   const dmgPath = join(root, dmgFileName);
   await writeFile(dmgPath, dmgBytes);
   return {
+    architecture,
     appPath,
     bundleVersion,
     cleanup: () => rm(root, { recursive: true, force: true }),
@@ -155,6 +157,7 @@ function fakeGenerateAppcastTool(fixture, { calls, mutateOutput = null } = {}) {
     const stagedBytes = await readFile(join(stagingDirectory, fixture.dmgFileName));
     assert.deepEqual(stagedBytes, fixture.dmgBytes);
     let output = officialToolOutput({
+      architecture: fixture.architecture,
       artifactBytes: stagedBytes,
       bundleVersion: fixture.bundleVersion,
       downloadURLPrefix,
@@ -471,4 +474,26 @@ test("stable path fails closed when the tool reports a different bundle version"
   } finally {
     await fixture.cleanup();
   }
+});
+
+
+test("Intel generation retains the ARM archive and signs its own namespace", async () => {
+  const fixture = await createStableFixture({ architecture: "x64" });
+  try {
+    const archive = join(fixture.root, "release-archive");
+    const armMarker = join(archive, "stable", fixture.bundleVersion, "preserve.txt");
+    await mkdir(join(archive, "stable", fixture.bundleVersion), { recursive: true });
+    await writeFile(armMarker, "existing-arm-release");
+    const result = await generateSparkleAppcast({
+      ...stableOptions(fixture, ["--architecture", "x64"]),
+      runGenerateAppcastTool: fakeGenerateAppcastTool(fixture),
+    });
+    assert.match(result.full.url, /\/intel\/releases\//u);
+    const written = await readFile(result.appcastPath, "utf8");
+    assert.doesNotMatch(written, /hardwareRequirements/u);
+    const metadata = JSON.parse(await readFile(join(archive, "stable-x64", fixture.bundleVersion, RETAINED_ARCHIVE_METADATA_FILE), "utf8"));
+    assert.equal(metadata.architecture, "x64");
+    assert.equal(await readFile(armMarker, "utf8"), "existing-arm-release");
+    assert.throws(() => validateCandidateAppcastShape(written, "stable"));
+  } finally { await fixture.cleanup(); }
 });

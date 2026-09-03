@@ -1346,6 +1346,7 @@ export const WEB_MESSAGES = Object.freeze({
   "installer.choosePlatform": ["Choose your platform", "选择你的平台", "Elige tu plataforma"],
   "installer.platform.macos": ["macOS Apple silicon", "macOS Apple 芯片", "macOS Apple Silicon"],
   "installer.platform.macosIntel": ["macOS Intel", "macOS Intel", "macOS Intel"],
+  "installer.macosIntel.download": ["Download for macOS Intel", "下载 Intel Mac 版", "Descargar para macOS Intel"],
   "installer.platform.windows": ["Windows", "Windows", "Windows"],
   "installer.platform.linux": ["Linux", "Linux", "Linux"],
   "installer.availability.notYetAvailable": ["Not yet available", "尚未提供", "Aún no disponible"],

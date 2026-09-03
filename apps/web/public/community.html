@@ -23,6 +23,12 @@
     <meta name="usage-monitor-installer-bytes" content="">
     <meta name="usage-monitor-minimum-macos" content="">
     <meta name="usage-monitor-architectures" content="">
+    <meta name="usage-monitor-intel-installer-url" content="">
+    <meta name="usage-monitor-intel-installer-version" content="">
+    <meta name="usage-monitor-intel-installer-sha256" content="">
+    <meta name="usage-monitor-intel-installer-bytes" content="">
+    <meta name="usage-monitor-intel-minimum-macos" content="">
+    <meta name="usage-monitor-intel-architectures" content="">
     <meta name="usage-monitor-release-notes-url" content="">
     <meta name="usage-monitor-privacy-url" content="">
     <meta name="usage-monitor-security-url" content="">
@@ -285,7 +291,7 @@
             </section>
 
             <section
-              class="platform-panel platform-unavailable-panel"
+              class="platform-panel"
               id="platform-panel-macos-intel"
               role="tabpanel"
               aria-labelledby="platform-tab-macos-intel"
@@ -293,10 +299,51 @@
               tabindex="0"
               hidden
             >
-              <p class="platform-availability" data-i18n="installer.availability.notYetAvailable">Not yet available</p>
-              <h2 data-i18n="installer.macosIntel.unavailableTitle">TiboTattle for macOS Intel is not available yet.</h2>
-              <p data-i18n="installer.macosIntel.unavailableCopy">Follow the macOS Intel support work for progress. A download will appear only after the macOS Intel release passes its platform and release checks.</p>
-              <a href="https://github.com/adamallcock/tibotattle/issues/93" data-i18n="installer.macosIntel.trackSupport">Track macOS Intel support</a>
+              <div id="intel-installation" hidden>
+                <div class="install-actions">
+                  <a class="button mac-download-button" id="intel-installer-link" hidden>
+                    <img class="download-platform-icon" src="./apple.svg" alt="" width="22" height="22">
+                    <span data-i18n="installer.macosIntel.download">Download for macOS Intel</span>
+                  </a>
+                </div>
+                <div class="installer-details installer-details-compact" id="intel-installer-details" hidden>
+                  <span class="installer-summary">
+                    <span id="intel-installer-version"></span>
+                    <span class="installer-summary-divider" aria-hidden="true">·</span>
+                    <span id="intel-installer-compatibility"></span>
+                  </span>
+                  <button
+                    class="installer-checksum-copy"
+                    id="intel-installer-sha256-copy"
+                    type="button"
+                    aria-label="Copy the published SHA-256 checksum"
+                    aria-describedby="intel-installer-sha256-copy-status"
+                    data-i18n-aria-label="aria.copyInstallerSha256"
+                  >
+                    <span id="intel-installer-sha256-copy-label" data-i18n="installer.sha256.copy">Copy SHA-256</span>
+                  </button>
+                  <code class="installer-checksum-fallback" id="intel-installer-sha256" data-i18n-skip hidden></code>
+                  <span class="sr-only" id="intel-installer-size" aria-hidden="true"></span>
+                  <span class="sr-only" id="intel-installer-sha256-copy-status" role="status" aria-live="polite" aria-atomic="true"></span>
+                </div>
+                <nav class="installer-links" id="intel-installer-links" aria-label="Release information" data-i18n-aria-label="aria.releaseInformation" hidden>
+                  <a id="intel-release-notes-link" hidden>Release notes</a>
+                  <a id="intel-privacy-link" hidden>Privacy</a>
+                  <a id="intel-security-link" hidden>Security</a>
+                  <a id="intel-support-link" hidden>Support</a>
+                </nav>
+                <p class="download-assurance" id="intel-download-assurance" hidden>
+                  <span class="download-assurance-mark" aria-hidden="true"></span>
+                  <strong data-i18n="installer.assurance.message">Developer ID signed and Apple notarized.</strong>
+                  <a href="./docs.html#download-security" data-i18n="installer.assurance.details">Security and verification</a>
+                </p>
+              </div>
+              <div class="platform-unavailable-panel" id="intel-installer-unavailable">
+                <p class="platform-availability" data-i18n="installer.availability.notYetAvailable">Not yet available</p>
+                <h2 data-i18n="installer.macosIntel.unavailableTitle">TiboTattle for macOS Intel is not available yet.</h2>
+                <p data-i18n="installer.macosIntel.unavailableCopy">Follow the macOS Intel support work for progress. A download will appear only after the macOS Intel release passes its platform and release checks.</p>
+                <a href="https://github.com/adamallcock/tibotattle/issues/93" data-i18n="installer.macosIntel.trackSupport">Track macOS Intel support</a>
+              </div>
             </section>
 
             <section

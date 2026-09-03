@@ -24,6 +24,7 @@ import {
   copyHomebrewInstallCommand,
   detectPublicPlatform,
   resolveInitialPublicPlatform,
+  renderPublicInstallerJourney,
   wirePublicPlatformSelector,
 } from "../public/community.js";
 import {
@@ -52,6 +53,7 @@ class FakeElement {
     this.tag = tag;
     this.children = [];
     this.attributes = new Map();
+    this.dataset = {};
     this.className = "";
     this.textContent = "";
     this.hidden = false;
@@ -496,8 +498,8 @@ test("the first visit leads with the product, platform choice, and daily communi
   assert.match(html, /Download for macOS/u);
   assert.equal(
     html.match(/Download for macOS/gu)?.length,
-    2,
-    "the verified and unavailable macOS actions retain their platform-specific labels",
+    3,
+    "the ARM actions and optional Intel action retain their platform-specific labels",
   );
   assert.match(html, /Copy SHA-256/u);
   assert.match(
@@ -584,7 +586,7 @@ test("platform tabs keep the live macOS release separate from honest unavailable
   assert.match(macosPanel, /Developer ID signed and Apple notarized\./u);
 
   for (const [platform, panel] of [
-    ["macOS Intel", intelPanel],
+    ["macOS Intel", intelPanel.slice(intelPanel.indexOf('id="intel-installer-unavailable"'))],
     ["Windows", windowsPanel],
     ["Linux", linuxPanel],
   ]) {
@@ -597,6 +599,8 @@ test("platform tabs keep the live macOS release separate from honest unavailable
     assert.doesNotMatch(panel, /<button\b[^>]*disabled/iu);
   }
   assert.match(intelPanel, /tibotattle\/issues\/93/u);
+  assert.match(openingTagForId(html, "intel-installation"), /\bhidden(?:\s|>)/u);
+  assert.match(openingTagForId(html, "intel-download-assurance"), /\bhidden(?:\s|>)/u);
   assert.match(windowsPanel, /tibotattle\/issues\/3/u);
   assert.match(linuxPanel, /tibotattle\/issues\/4/u);
 
@@ -2151,6 +2155,58 @@ test("the allowance section follows the active UI language", () => {
   });
   assert.equal(stateNode.textContent, "额度估计可用");
   assert.match(container.text, /来自 1 个贡献账户/u);
+});
+
+test("Intel download rendering stays independent and refuses partial or ARM metadata", () => {
+  const metadata = {
+    "usage-monitor-installer-url": "https://downloads.example.org/TiboTattle-1.2.3-macOS-arm64.dmg",
+    "usage-monitor-installer-version": "1.2.3",
+    "usage-monitor-installer-sha256": "a".repeat(64),
+    "usage-monitor-installer-bytes": "12000000",
+    "usage-monitor-minimum-macos": "13.0",
+    "usage-monitor-architectures": "arm64",
+    "usage-monitor-release-notes-url": "https://example.org/releases/1.2.3",
+    "usage-monitor-privacy-url": "https://example.org/privacy",
+    "usage-monitor-security-url": "https://example.org/security",
+    "usage-monitor-support-url": "https://example.org/support",
+  };
+  const intel = {
+    "usage-monitor-intel-installer-url": "https://downloads.example.org/TiboTattle-1.2.3-macOS-x64.dmg",
+    "usage-monitor-intel-installer-version": "1.2.3",
+    "usage-monitor-intel-installer-sha256": "b".repeat(64),
+    "usage-monitor-intel-installer-bytes": "13000000",
+    "usage-monitor-intel-minimum-macos": "14.0",
+    "usage-monitor-intel-architectures": "x64",
+  };
+  const documentRef = fakeDocument({ ...metadata, ...intel });
+  renderPublicInstallerJourney(documentRef);
+  assert.equal(documentRef.byId.get("installer-link").href, metadata["usage-monitor-installer-url"]);
+  assert.equal(documentRef.byId.get("intel-installer-link").href, intel["usage-monitor-intel-installer-url"]);
+  assert.equal(documentRef.byId.get("intel-installation").hidden, false);
+  assert.equal(documentRef.byId.get("intel-installer-unavailable").hidden, true);
+  assert.equal(documentRef.byId.get("intel-download-assurance").hidden, false);
+  assert.equal(documentRef.byId.get("intel-installer-sha256-copy").dataset.checksum, "b".repeat(64));
+  assert.equal(documentRef.byId.get("installer-sha256-copy").dataset.checksum, "a".repeat(64));
+  assert.equal(documentRef.byId.get("intel-installer-version").textContent, "Version 1.2.3");
+  assert.equal(documentRef.byId.get("intel-installer-compatibility").textContent, "macOS 14 or later · Intel");
+  assert.equal(documentRef.byId.has("intel-homebrew-install"), false);
+
+  for (const invalid of [
+    {},
+    ...Object.keys(intel).map((key) => ({ ...intel, [key]: "" })),
+    { ...intel, "usage-monitor-intel-architectures": "arm64" },
+    { ...intel, "usage-monitor-intel-installer-url": metadata["usage-monitor-installer-url"] },
+  ]) {
+    const unavailable = fakeDocument({ ...metadata, ...invalid });
+    renderPublicInstallerJourney(unavailable);
+    assert.equal(unavailable.byId.get("installer-link").hidden, false);
+    assert.equal(unavailable.byId.get("intel-installation").hidden, true);
+    assert.equal(unavailable.byId.get("intel-installer-link").hidden, true);
+    assert.equal(Object.hasOwn(unavailable.byId.get("intel-installer-link"), "href"), false);
+    assert.equal(unavailable.byId.get("intel-download-assurance").hidden, true);
+    assert.equal(unavailable.byId.get("intel-installer-unavailable").hidden, false);
+    assert.equal(unavailable.byId.get("intel-installer-sha256-copy").dataset.checksum, undefined);
+  }
 });
 
 test("the install card refuses a partially injected release", () => {

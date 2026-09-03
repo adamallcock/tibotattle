@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-03
 type: status
 status: current
-source_commit: 9494c0776892127284fca744a304cc3c0c58bdf3
+source_commit: 8c8a149fa0c7f1597108892f9ad4baf1571abfad
 observation_date: 2026-09-03
 ---
 
@@ -18,11 +18,11 @@ using this page for a later release or operational decision.
 
 | Boundary | Verified state |
 |---|---|
-| Documentation/source review | Release-preparation source `9494c0776892127284fca744a304cc3c0c58bdf3`, reviewed 2026-09-03; product runtime is unchanged from PR #102 merge `394c8a03a986e0daadbe662679fd002202682e44` |
+| Documentation/source review | Intel working candidate `0.1.18` on merge base `8c8a149f`, including published 0.1.17 source; no 0.1.18 tag or release created |
 | Installed internal dogfood | Version `0.1.17`, RC9 build `1023.7`, source `394c8a03`; owner accepted the inspected apps on 2026-09-03. Plist version/build/minimum-OS were independently rechecked; this does not qualify every historical credential or clean-profile case |
 | Public service | Read-only `GET https://tibotattle.com/api/health`, HTTP 200, deployment source `304f3d736b6f9451d32a616bf3046ea628e828a3`, observed 2026-08-31 |
 | Public updater | Stable `0.1.16`; read-only feed check recorded 2026-09-03 in the release plan |
-| Published release | Immutable GitHub `v0.1.16`, exact five-asset set rechecked 2026-09-03; `v0.1.17` is not yet published at this snapshot |
+| Published release | Immutable GitHub `v0.1.17`, published 2026-09-03 at 19:47:43 UTC; ARM DMG, appcast, manifest, checksums and verification guide; exact source tag commit `aa660b24a66196155ba59267ab832cc4ef6e1c7d` |
 
 This is a snapshot, not an automatic monitor. A newer commit, deployment, feed,
 or release makes the corresponding row stale without changing the other rows.
@@ -89,10 +89,15 @@ assumed current.
 
 ## Published macOS release and updater
 
-The latest public GitHub release was immutable stable release `v0.1.16`,
-published 2026-08-21. It includes the Apple-silicon DMG, appcast, release
-manifest, checksums, and verification guide. The public appcast returned HTTP
-200 and advertised the same `0.1.16` arm64 DMG with macOS 14.0 as the minimum.
+GitHub's release API confirmed immutable stable release `v0.1.17`, published
+2026-09-03 at 19:47:43 UTC. Its exact source tag commit is
+`aa660b24a66196155ba59267ab832cc4ef6e1c7d`; its five assets are the Apple silicon
+DMG, appcast, release manifest, checksums and verification guide.
+
+The earlier public appcast observation advertised `0.1.16`. A fresh read during
+Intel implementation returned HTTP 403, as did the public health endpoint, so
+this document does not claim current feed or service state from that attempt.
+GitHub publication alone does not prove updater or website deployment.
 
 These observations prove public availability of the named release endpoints.
 They do not re-run code signing, notarization, Gatekeeper, clean-install, or
@@ -103,8 +108,8 @@ point-in-time evidence only.
 ## Platform support
 
 - **Supported:** macOS 14 or later on Apple silicon, through the published
-  `v0.1.16` stable artifact described above.
-- **Not supported:** Windows and Linux. Source, contract, or simulated lanes do
+  `v0.1.17` stable artifact described above.
+- **Not supported:** Intel macOS, Windows and Linux. Source, contract, or simulated lanes do
   not establish an installed, signed, updateable product on those platforms.
 The complete qualification matrix and rules for changing these claims are in
 [platform-support.md](./reference/platform-support.md).

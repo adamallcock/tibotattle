@@ -19,10 +19,12 @@ import {
   calculateMacOSSourceInputDigest,
   collectMacOSKeychainMigrationHelperSources,
   collectMacOSSwiftSources,
+  normalizeMacOSBuildArchitecture,
 } from "../scripts/build-macos-app.js";
 import {
   createMacOSSignedReplacementContract,
   inspectMacOSApp,
+  macOSReleaseManifestArchitecture,
   validateInstalledMacOSApp,
   validateMacOSDMG,
   validateMacOSKeychainMigrationSignatureDescriptions,
@@ -532,7 +534,7 @@ test("historical stable DMG validation rechecks exact bytes before native trust 
     const harness = runInNewContext(`${pin}\n${capabilityValidator}\n${dmgSource}\n`
       + "const token = Object.freeze({}); VERIFIED_LEGACY_STABLE_CAPABILITIES.add(token);"
       + "({ validateMacOSDMG, options: { [VERIFIED_LEGACY_STABLE_PREVIOUS_ARTIFACT]: token } })", {
-      resolve, PRODUCT_BRAND, STABLE_RELEASE_CHANNEL,
+      resolve, PRODUCT_BRAND, STABLE_RELEASE_CHANNEL, normalizeMacOSBuildArchitecture,
       VERIFIED_LEGACY_DOGFOOD_PREVIOUS_ARTIFACT: Symbol("synthetic dogfood"),
       VERIFIED_PRE_MIGRATION_PREVIOUS_ARTIFACT: Symbol("synthetic pre-migration"),
       validateLegacyDogfoodPreviousCapability: () => false,
@@ -573,6 +575,7 @@ test("stable previous capabilities expire on success and failure before candidat
       isExactLegacyDogfoodPreviousRelease: () => false,
       isExactPreMigrationDogfoodPreviousRelease: () => false,
       validateMacOSSignedReplacementPair,
+      macOSReleaseManifestArchitecture,
       readReplacementReleaseArtifact: async (path) => path === "previous" ? previous : candidate,
       fail(message, code) { throw Object.assign(new Error(message), { code }); },
     });
@@ -639,7 +642,7 @@ test("historical stable inspection binds the app build digests before accepting 
     const harness = runInNewContext(`${pin}\n${capabilityValidator}\n${inspectorSource}\n`
       + "const token = Object.freeze({}); VERIFIED_LEGACY_STABLE_CAPABILITIES.add(token);"
       + "({ inspectMacOSApp, options: { [VERIFIED_LEGACY_STABLE_PREVIOUS_ARTIFACT]: token } })", {
-      resolve, join, basename: (path) => path.split("/").at(-1),
+      resolve, join, normalizeMacOSBuildArchitecture, basename: (path) => path.split("/").at(-1),
       STABLE_RELEASE_CHANNEL,
       APP_NAME: PRODUCT_BRAND.bundleName,
       BUNDLE_IDENTIFIER: PRODUCT_BRAND.bundleIdentifier,

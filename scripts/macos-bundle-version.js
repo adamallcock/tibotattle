@@ -29,6 +29,12 @@ export const SIGNED_MACOS_BUNDLE_VERSION_PLAN = Object.freeze({
     "internal-dogfood": "1023.7",
     stable: "1024",
   }),
+  // Separate ARM and Intel installers share the same source and build ordering.
+  // These are candidate allocations, not signing or publication evidence.
+  "0.1.18": Object.freeze({
+    "internal-dogfood": "1025",
+    stable: "1026",
+  }),
 });
 
 export function resolveSignedMacOSBundleVersion(releaseVersion, channel) {
