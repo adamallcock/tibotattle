@@ -508,7 +508,7 @@ Acceptance and execution sequence:
   RC9 and optimized RC9 on one immutable private index with a pinned clock.
   Keep exact output equality, raw wall/CPU/peak-RSS and lifecycle results
   content-free; never infer end-to-end timing from separate phase sums.
-- [ ] Freeze the corrected combined source; run complete protected R7 and the
+- [x] Freeze the corrected combined source; run complete protected R7 and the
   full source/native/Worker gates without weakening checks.
 - [ ] Prepare signed/notarized dogfood `1023.7` and stable-channel `1024`
   artifacts for owner inspection; preserve previous DMGs and local state.
@@ -576,3 +576,44 @@ hosted deployment/migrations and contribution uploads remain withheld. A local
 stable-channel build is only an inspection candidate, not a claim that the open
 PR #94 comparator or hosted pairing gates have passed. Unexpected Keychain
 prompts remain a stop condition; never automate approval or change access rules.
+
+The complete optimized R7 generation on `f67908fe` exited zero on
+2026-09-03 UTC after 36.2 minutes, replacing exactly ten validated receipts.
+The separate retained-receipt tests passed 2/2. Independent diff review found
+unchanged outcomes and failure classifications, no new hard resource failure,
+and matching execution-input hashes in both decision receipts. Both decisions
+remain `release_open`, with all 19 ceiling decisions unresolved. Two external
+RSS sampling failures remain explicit in Node 24 synthetic profiles; the
+real-history profiles have none. Maximum real-history RSS changed from
+1,060.22 to 1,232.92 MiB on Node 24 and from 1,158.88 to 1,132.97 MiB on
+Node 26, below the unchanged 1,536 MiB ceiling. Selected file and record
+counts are unchanged, but source bytes grew between runs; these deltas are not
+a fixed-input causal performance comparison.
+
+The complete Worker gate passed on `f67908fe`: 524 Worker tests, 179 operation
+tests, package guards, generated types, TypeScript, endpoint checks, and both
+default/staging dry-run bundles. No hosted write occurred. The post-R7 full
+root run completed 3,592 tests with 3,574 passes, one failure, 17 platform
+skips and no cancellations (exit 1, 459.9 seconds). Its sole failure correctly
+identified the benchmark's missing caller declaration for the shared ESM parser
+in the tool inventory. The declaration is now repaired without changing the
+parser, product code, test assertion, or protected workload. This required a
+full rerun; that failed command is not described as green.
+
+After the declaration repair, the full-root rerun exited zero: 3,592 tests,
+3,575 passed, 17 designated Windows skips, no failures or cancellations,
+458.6 seconds. The focused inventory/R7 checks passed 7/7; preflight passed
+20/20; architecture passed with 382 files, 1,538 imports and zero debt. The
+installed Codex contract and release-documentation checks passed. No assertion,
+timeout, exclusion or resource ceiling was weakened. The inventory repair and
+updated prose do not change the protected workload; its freshly regenerated
+receipts remain current. Signed artifacts and real-profile physical checks are
+still separate from these completed source gates.
+
+Normal live launch can resume previously consented contribution uploads.
+Automated native artifact checks must use the supported isolated profile when
+real delivery is outside the authorized QA scope. Preserve live consent and
+all local evidence unchanged, and leave the installed dogfood closed for owner
+inspection.
+Do not change consent, disconnect the device, or broaden network authority to
+make automated QA easier.

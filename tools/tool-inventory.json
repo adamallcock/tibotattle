@@ -569,6 +569,7 @@
       "stableAliasReason": "Imported parser helper is not a command entry point.",
       "additionalAliases": [],
       "callers": [
+        "scripts/benchmark-detailed-accounting.mjs",
         "scripts/build-local-review-artifact.js",
         "scripts/build-macos-app.js",
         "scripts/check-architecture-boundaries.mjs",
