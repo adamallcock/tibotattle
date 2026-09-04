@@ -24,5 +24,7 @@ export const RELEASE_MANIFEST = Object.freeze({
   macOS: Object.freeze({
     arm64DmgFileName:
       `${PRODUCT_BRAND.displayName}-${RELEASE_VERSION}-macOS-arm64.dmg`,
+    x64DmgFileName:
+      `${PRODUCT_BRAND.displayName}-${RELEASE_VERSION}-macOS-x64.dmg`,
   }),
 });

@@ -73,6 +73,14 @@ v1 profile/path**. A native/checksum-only artifact may publish with explicit
 `null` evidence and may claim only the native/checksum assurances it actually
 carries. It must not imply source-to-binary provenance.
 
+For a two-architecture macOS release, supply separate `arm64` and `x64` DMG
+entries from the same version, tag and commit. Each needs its own native
+assurances and artifact-specific metadata filenames. Both final subjects must
+be attached before GitHub publication makes the release immutable. Missing
+Intel evidence must not be inferred from the ARM entry or presented as a
+supported website download. The [macOS runbook](./macos-stable-release-runbook.md#separate-apple-silicon-and-intel-candidates)
+defines architecture routing and the first Intel feed bootstrap boundary.
+
 The generator re-hashes supplied files and fails closed on path traversal,
 symlinks, duplicate subjects, digest drift, source mismatch, invalid SPDX
 documents, incomplete assurances, direct/store conflation, or non-canonical

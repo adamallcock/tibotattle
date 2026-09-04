@@ -19,31 +19,33 @@ function fakeBackend() {
   });
 }
 
-test("macOS arm64 production selection constructs only the audited injected Keychain route", () => {
-  const backend = fakeBackend();
-  let constructions = 0;
-  const selected = selectProductionParticipantIdentity({
-    environmentSecret: null,
-    explicitSecretFile: null,
-    platform: "darwin",
-    architecture: "arm64",
-    appStateSecretFile: "/fixed/app-state/export-secret",
-    createKeychainBackend() {
-      constructions += 1;
-      return backend;
-    },
+for (const architecture of ["arm64", "x64"]) {
+  test(`macOS ${architecture} production selection constructs only the injected Keychain route`, () => {
+    const backend = fakeBackend();
+    let constructions = 0;
+    const selected = selectProductionParticipantIdentity({
+      environmentSecret: null,
+      explicitSecretFile: null,
+      platform: "darwin",
+      architecture,
+      appStateSecretFile: "/fixed/app-state/export-secret",
+      createKeychainBackend() {
+        constructions += 1;
+        return backend;
+      },
+    });
+    assert.equal(constructions, 1);
+    assert.equal(selected.mode, "macos_keychain");
+    assert.equal(selected.identityOptions.environmentSecret, null);
+    assert.equal(selected.identityOptions.secretFile, "/fixed/app-state/export-secret");
+    assert.equal(selected.identityOptions.participantSecretBackend, backend);
+    assert.equal(
+      selected.identityOptions.participantSecretCapability,
+      EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity,
+    );
+    assert.equal(Object.hasOwn(selected.identityOptions, "legacySecretFile"), false);
   });
-  assert.equal(constructions, 1);
-  assert.equal(selected.mode, "macos_keychain");
-  assert.equal(selected.identityOptions.environmentSecret, null);
-  assert.equal(selected.identityOptions.secretFile, "/fixed/app-state/export-secret");
-  assert.equal(selected.identityOptions.participantSecretBackend, backend);
-  assert.equal(
-    selected.identityOptions.participantSecretCapability,
-    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity,
-  );
-  assert.equal(Object.hasOwn(selected.identityOptions, "legacySecretFile"), false);
-});
+}
 
 test("Windows x64 export-identity production selection remains fail closed", () => {
   let constructions = 0;
@@ -114,7 +116,7 @@ test("explicit file and environment development overrides never construct or mix
 });
 
 test("unsupported production platforms fail closed unless a development override is explicit", () => {
-  for (const [platform, architecture] of [["linux", "arm64"], ["darwin", "x64"]]) {
+  for (const [platform, architecture] of [["linux", "arm64"], ["linux", "x64"], ["darwin", "ia32"], ["darwin", "x86_64"]]) {
     assert.throws(
       () => selectProductionParticipantIdentity({
         environmentSecret: null,
@@ -126,47 +128,51 @@ test("unsupported production platforms fail closed unless a development override
   }
 });
 
-test("production backend construction errors are fixed and content-free", () => {
-  const canary = "DO-NOT-LEAK-production-selector";
-  assert.throws(
-    () => selectProductionParticipantIdentity({
-      environmentSecret: null,
-      platform: "darwin",
-      architecture: "arm64",
-      createKeychainBackend() { throw new Error(canary); },
-    }),
-    (error) => {
-      assert.equal(error.code, "EXPORT_IDENTITY_PRODUCTION_BACKEND_UNAVAILABLE");
-      assert.equal(`${error.stack}\n${JSON.stringify(error)}`.includes(canary), false);
-      return true;
-    },
-  );
-});
-
-test("production selection refuses account-observation or arbitrary Keychain capabilities", () => {
-  let constructions = 0;
-  const createKeychainBackend = () => {
-    constructions += 1;
-    return fakeBackend();
-  };
-  for (const keychainCapability of [
-    EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation,
-    { service: "private-service", account: "private-account", secretPrefix: "private-prefix" },
-  ]) {
+for (const architecture of ["arm64", "x64"]) {
+  test(`macOS ${architecture} backend construction errors are fixed and content-free`, () => {
+    const canary = "DO-NOT-LEAK-production-selector";
     assert.throws(
       () => selectProductionParticipantIdentity({
         environmentSecret: null,
         platform: "darwin",
-        architecture: "arm64",
-        keychainCapability,
-        createKeychainBackend,
+        architecture,
+        createKeychainBackend() { throw new Error(canary); },
       }),
-      (error) => error.code === "EXPORT_IDENTITY_PRODUCTION_BACKEND_INVALID"
-        && error.message === "Production participant identity backend selection failed",
+      (error) => {
+        assert.equal(error.code, "EXPORT_IDENTITY_PRODUCTION_BACKEND_UNAVAILABLE");
+        assert.equal(`${error.stack}\n${JSON.stringify(error)}`.includes(canary), false);
+        return true;
+      },
     );
-  }
-  assert.equal(constructions, 0);
-});
+  });
+}
+
+for (const architecture of ["arm64", "x64"]) {
+  test(`macOS ${architecture} production selection refuses account-observation or arbitrary Keychain capabilities`, () => {
+    let constructions = 0;
+    const createKeychainBackend = () => {
+      constructions += 1;
+      return fakeBackend();
+    };
+    for (const keychainCapability of [
+      EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation,
+      { service: "private-service", account: "private-account", secretPrefix: "private-prefix" },
+    ]) {
+      assert.throws(
+        () => selectProductionParticipantIdentity({
+          environmentSecret: null,
+          platform: "darwin",
+          architecture,
+          keychainCapability,
+          createKeychainBackend,
+        }),
+        (error) => error.code === "EXPORT_IDENTITY_PRODUCTION_BACKEND_INVALID"
+          && error.message === "Production participant identity backend selection failed",
+      );
+    }
+    assert.equal(constructions, 0);
+  });
+}
 
 test("CLI rotation preflight and confirmation use injected selection without disclosing backend details", async () => {
   const canaries = [

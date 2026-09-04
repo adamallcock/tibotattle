@@ -52,7 +52,7 @@
         "checkpointParserVersion": { "const": "codex-checkpoint-state-v0.2" },
         "checkpointScanVersion": { "const": "codex-export-checkpoint-scan-v0.4" },
         "packageName": { "const": "app-usagemonitor" },
-        "packageVersion": { "const": "0.1.17" }
+        "packageVersion": { "const": "0.1.18" }
       }
     },
     "providerAdapters": {

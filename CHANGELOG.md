@@ -34,7 +34,11 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-Future changes will be recorded here.
+The [0.1.18 candidate](./release-notes/0.1.18.md) prepares separate Apple silicon
+and Intel macOS installers and architecture-specific updates for
+[issue #93](https://github.com/adamallcock/tibotattle/issues/93). Intel remains
+unreleased and unsupported until native hardware, signing, update-install and
+publication qualification is complete.
 
 ## [0.1.17](./release-notes/0.1.17.md) - 2026-09-03
 

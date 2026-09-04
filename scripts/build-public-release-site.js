@@ -121,6 +121,9 @@ const INSTALLER_OPTION_KEYS = Object.freeze([
   "minimumMacos",
   "architectures",
 ]);
+const INTEL_INSTALLER_OPTION_KEYS = Object.freeze([
+  "intelInstallerPath", "intelInstallerUrl", "intelMinimumMacos",
+]);
 const PUBLIC_ROUTE_MARKERS = Object.freeze([
   "./app.js",
   "/app.js",
@@ -225,6 +228,10 @@ function usage() {
     "     --installer-version 1.2.3 \\",
     "     --installer-sha256 <64 lowercase hex> \\",
     "     --minimum-macos 14.0 --architectures arm64]",
+    "    [--intel-installer-path /absolute/path/to/TiboTattle-1.2.3-macOS-x64.dmg \\",
+    "     --intel-installer-url https://downloads.approved.example/TiboTattle-1.2.3-macOS-x64.dmg \\",
+    "     --intel-minimum-macos 14.0]",
+    "    Intel requires the same canonical cross-platform release manifest as Apple silicon.",
     "    [--replace]",
   ].join("\n");
 }
@@ -242,6 +249,9 @@ export function parseArgs(argv) {
     "--installer-sha256": "installerSha256",
     "--minimum-macos": "minimumMacos",
     "--architectures": "architectures",
+    "--intel-installer-path": "intelInstallerPath",
+    "--intel-installer-url": "intelInstallerUrl",
+    "--intel-minimum-macos": "intelMinimumMacos",
     "--release-notes-url": "releaseNotesUrl",
     "--privacy-url": "privacyUrl",
     "--security-url": "securityUrl",
@@ -477,6 +487,16 @@ function validateInputs(args) {
     const value = args[key];
     return value !== undefined && value !== null && value !== "";
   });
+  const intelInstallerConfigured = INTEL_INSTALLER_OPTION_KEYS.some((key) =>
+    args[key] !== undefined && args[key] !== null && args[key] !== "");
+  if (intelInstallerConfigured && (!installerConfigured
+      || INTEL_INSTALLER_OPTION_KEYS.some((key) => !args[key]))) {
+    throw new TypeError("Intel installer metadata requires the Apple silicon release and complete Intel artifact metadata");
+  }
+  if (intelInstallerConfigured && (!isAbsolute(args.intelInstallerPath)
+      || !/^(?:1[0-9]|[2-9][0-9])\.(?:0|[1-9][0-9]?)(?:\.(?:0|[1-9][0-9]?))?$/u.test(args.intelMinimumMacos))) {
+    throw new TypeError("Intel installer path must be absolute and minimum macOS must be canonical");
+  }
   const requiredInstallerMetadata = [
     "installerReleaseManifest",
     "installerUrl",
@@ -502,7 +522,15 @@ function validateInputs(args) {
     ? resolve(args.installerReleaseManifest)
     : null;
   const socialImage = resolve(args.socialImage);
-  const releaseInputs = [installerPath, installerReleaseManifest].filter(Boolean);
+  const intelInstaller = intelInstallerConfigured ? {
+    installerPath: resolve(args.intelInstallerPath),
+    installerUrl: validatedPublicHttpsUrl(args.intelInstallerUrl, "Intel installer URL", { requiredSuffix: ".dmg" }),
+    installerVersion: args.installerVersion,
+    minimumMacos: args.intelMinimumMacos,
+    architectures: ["x64"],
+    architecturesText: "x64",
+  } : null;
+  const releaseInputs = [installerPath, installerReleaseManifest, intelInstaller?.installerPath].filter(Boolean);
   if (output === source
       || output === REPOSITORY_ROOT
       || output === homedir()
@@ -544,6 +572,7 @@ function validateInputs(args) {
     supportUrl: validatedPublicHttpsUrl(args.supportUrl, "Support URL"),
     replace: args.replace,
     installerConfigured,
+    intelInstaller,
   };
   if (!installerConfigured) return options;
 
@@ -690,7 +719,9 @@ async function assertReleaseSitePathBoundaries(options) {
       options.installerReleaseManifest,
       "Installer release manifest",
     );
-  const releaseInputs = [installerPath, installerManifest].filter(Boolean);
+  const intelInstallerPath = options.intelInstaller === null ? null
+    : await canonicalReleasePath(options.intelInstaller.installerPath, "Intel installer artifact");
+  const releaseInputs = [installerPath, installerManifest, intelInstallerPath].filter(Boolean);
   if (output === source
       || isWithin(output, source)
       || isWithin(source, output)
@@ -905,6 +936,15 @@ function injectReleaseMetadata(html, values, canonicalUrl) {
       values.installerConfigured
         ? `empty ${name} meta tag`
         : `empty ${name} no-installer metadata slot`,
+    );
+    const intelName = name.replace("usage-monitor-", "usage-monitor-intel-");
+    output = replaceExactlyOnce(
+      output,
+      `<meta name="${intelName}" content="">`,
+      values.intelInstaller
+        ? `<meta name="${intelName}" content="${htmlAttribute(values.intelInstaller[valueKey])}">`
+        : "",
+      `empty ${intelName} meta tag`,
     );
   }
   for (const token of REQUIRED_STATIC_SOCIAL_TAGS) {
@@ -1302,6 +1342,9 @@ async function validateCrossPlatformReleaseArtifact({
   installerVersion,
   installerSha256,
   validateArtifact,
+  architecture = "arm64",
+  minimumMacos = null,
+  requireSourceMatch = false,
 }) {
   if (artifactPath === null) {
     throw new TypeError(
@@ -1323,14 +1366,17 @@ async function validateCrossPlatformReleaseArtifact({
   const candidates = releaseManifest.artifacts.filter((artifact) =>
     artifact.platform === "macos"
       && artifact.channel === "direct"
-      && artifact.architecture === RELEASE_ARCHITECTURE
+      && artifact.architecture === architecture
       && artifact.format === "dmg");
   if (candidates.length !== 1) {
     throw new TypeError(
-      `Cross-platform release manifest must contain exactly one macOS direct arm64 DMG (found ${candidates.length})`,
+      `Cross-platform release manifest must contain exactly one macOS direct ${architecture} DMG (found ${candidates.length})`,
     );
   }
   const selected = candidates[0];
+  if (architecture === "x64" && selected.fileName !== `TiboTattle-${installerVersion}-macOS-x64.dmg`) {
+    throw new TypeError("Intel release artifact must use the canonical macOS-x64 DMG filename");
+  }
   if (releaseManifest.version !== installerVersion
       || selected.version !== installerVersion) {
     throw new TypeError(
@@ -1357,10 +1403,19 @@ async function validateCrossPlatformReleaseArtifact({
   }
   assertMacOSReleaseEvidenceTrust(selected);
   const nativeValidation = await validateArtifact(localArtifact.path, {
+    architecture,
     expectedShortVersion: installerVersion,
     production: true,
   });
   assertMacOSNativeValidationMatches(selected, nativeValidation);
+  if (architecture === "x64" || requireSourceMatch) {
+    if (nativeValidation.architecture !== architecture
+        || nativeValidation.minimumMacos !== minimumMacos
+        || nativeValidation.source?.commit !== releaseManifest.commit
+        || nativeValidation.source?.tag !== releaseManifest.tag) {
+      throw new TypeError("macOS native architecture, minimum OS, or source does not match the release metadata");
+    }
+  }
   const finalArtifact = await digestInstallerFile(localArtifact.path);
   if (finalArtifact.bytes !== selected.bytes
       || finalArtifact.sha256 !== selected.sha256) {
@@ -1454,6 +1509,7 @@ export async function buildPublicReleaseSite(rawArgs, {
     TypeError,
   );
   let installerEvidence = null;
+  let intelInstallerEvidence = null;
   if (options.installerConfigured) {
     // The platform-neutral v1 manifest is the forward path.  A receipt that
     // does not carry that exact schema is deliberately handed to the legacy
@@ -1461,6 +1517,9 @@ export async function buildPublicReleaseSite(rawArgs, {
     const releaseManifest = await readReleaseManifestJson(
       options.installerReleaseManifest,
     );
+    if (options.intelInstaller !== null && releaseManifest === null) {
+      throw new TypeError("Intel requires one canonical cross-platform release manifest for both architectures");
+    }
     installerEvidence = releaseManifest === null
       ? await validateMacOSSignedReleaseArtifact({
         releaseManifestPath: options.installerReleaseManifest,
@@ -1475,6 +1534,8 @@ export async function buildPublicReleaseSite(rawArgs, {
         installerVersion: options.installerVersion,
         installerSha256: options.installerSha256,
         validateArtifact: validateInstallerArtifact,
+        minimumMacos: options.minimumMacos,
+        requireSourceMatch: options.intelInstaller !== null,
       });
     const releaseVersion = installerEvidence.manifest.application.shortVersion;
     if (releaseVersion !== options.installerVersion) {
@@ -1514,6 +1575,25 @@ export async function buildPublicReleaseSite(rawArgs, {
       expectedSha256: installerEvidence.artifact.sha256,
       installerUrl: options.installerUrl,
     });
+    if (options.intelInstaller !== null) {
+      const intel = options.intelInstaller;
+      intelInstallerEvidence = await validateCrossPlatformReleaseArtifact({
+        releaseManifestPath: options.installerReleaseManifest,
+        releaseManifest,
+        artifactPath: intel.installerPath,
+        installerUrl: intel.installerUrl,
+        installerVersion: intel.installerVersion,
+        installerSha256: null,
+        architecture: "x64",
+        minimumMacos: intel.minimumMacos,
+        validateArtifact: validateInstallerArtifact,
+      });
+      await verifyPublishedInstaller({
+        expectedBytes: intelInstallerEvidence.artifact.bytes,
+        expectedSha256: intelInstallerEvidence.artifact.sha256,
+        installerUrl: intel.installerUrl,
+      });
+    }
   }
   const socialStats = await regularFile(
     options.socialImage,
@@ -1527,6 +1607,11 @@ export async function buildPublicReleaseSite(rawArgs, {
     ...options,
     installerBytes: installerEvidence?.artifact.bytes ?? null,
     installerSha256: installerEvidence?.artifact.sha256 ?? null,
+    intelInstaller: intelInstallerEvidence ? {
+      ...options.intelInstaller,
+      installerBytes: intelInstallerEvidence.artifact.bytes,
+      installerSha256: intelInstallerEvidence.artifact.sha256,
+    } : null,
   };
   const releaseHtml = injectReleaseMetadata(
     sourceHtml,
@@ -1705,6 +1790,23 @@ export async function buildPublicReleaseSite(rawArgs, {
         },
       }
       : {}),
+    ...(intelInstallerEvidence ? {
+      intelInstaller: {
+        url: options.intelInstaller.installerUrl,
+        version: options.intelInstaller.installerVersion,
+        sha256: intelInstallerEvidence.artifact.sha256,
+        bytes: intelInstallerEvidence.artifact.bytes,
+        minimumMacos: options.intelInstaller.minimumMacos,
+        architectures: ["x64"],
+        artifactAndNativeTrustVerified: true,
+        releaseEvidence: {
+          schemaVersion: intelInstallerEvidence.manifest.schemaVersion,
+          verificationScope: ["artifact-bytes", "native-platform-trust", "architecture", "minimum-macos", "tagged-source"],
+          evidenceDeclared: intelInstallerEvidence.manifest.evidencePresence,
+          attestationVerificationPerformedBySiteBuild: false,
+        },
+      },
+    } : {}),
     files,
   };
   await writeFile(
@@ -1753,6 +1855,13 @@ export async function buildPublicReleaseSite(rawArgs, {
     verifiedHtml.includes(`<meta name="${name}"`))) {
     throw new Error("No-installer release output retained installer metadata");
   }
+  for (const name of Object.keys(INSTALLER_META)) {
+    const intelName = name.replace("usage-monitor-", "usage-monitor-intel-");
+    if (verifiedHtml.includes(`<meta name="${intelName}" content="">`)
+        || (!intelInstallerEvidence && verifiedHtml.includes(`<meta name="${intelName}"`))) {
+      throw new Error("Release output retained unverified Intel installer metadata");
+    }
+  }
   for (const token of [
     '<link rel="canonical" href="">',
     '<meta property="og:url" content="">',
@@ -1773,6 +1882,7 @@ export async function buildPublicReleaseSite(rawArgs, {
     output: options.output,
     site: manifest.site,
     installer: manifest.installer ?? null,
+    intelInstaller: manifest.intelInstaller ?? null,
     source: manifest.source,
     fileCount: manifest.files.length + 1,
   };

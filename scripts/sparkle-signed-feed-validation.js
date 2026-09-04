@@ -22,6 +22,7 @@
  * mirror update.
  */
 import { createPublicKey, verify } from "node:crypto";
+import { normalizeReleaseArchitecture } from "../config/release-channels.js";
 import { isAppleMacOSBundleVersion } from "./macos-bundle-version.js";
 
 /**
@@ -34,7 +35,7 @@ export const SPARKLE_SIGNED_FEED_TRAILER_PATTERN = /<!-- sparkle-signatures:\ned
  * Mirrors `official` in parseOfficialSignedSparkleAppcast
  * (apps/worker/src/sparkle-appcast-guard.ts). Must stay character-identical.
  */
-export const OFFICIAL_SIGNED_SPARKLE_APPCAST_PATTERN = /^<\?xml version="1\.0" standalone="yes"\?><!-- sparkle-sign-warning:\n[^\u0000\r]*?--><rss xmlns:sparkle="http:\/\/www\.andymatuschak\.org\/xml-namespaces\/sparkle" version="2\.0">\s*<channel>\s*<title>([^<&\r\n]{1,128})<\/title>\s*<item>\s*<title>([^<&\r\n]{1,64})<\/title>\s*<pubDate>([^<&\r\n]{1,64})<\/pubDate>\s*<sparkle:version>([^<&\r\n]{1,32})<\/sparkle:version>\s*<sparkle:shortVersionString>([^<&\r\n]{1,32})<\/sparkle:shortVersionString>\s*<sparkle:minimumSystemVersion>([0-9]+(?:\.[0-9]+){1,2})<\/sparkle:minimumSystemVersion>\s*<sparkle:hardwareRequirements>arm64<\/sparkle:hardwareRequirements>\s*<enclosure\b([^>]*?)>\s*<\/enclosure\s*>\s*<\/item>\s*<\/channel>\s*<\/rss>$/u;
+export const OFFICIAL_SIGNED_SPARKLE_APPCAST_PATTERN = /^<\?xml version="1\.0" standalone="yes"\?><!-- sparkle-sign-warning:\n[^\u0000\r]*?--><rss xmlns:sparkle="http:\/\/www\.andymatuschak\.org\/xml-namespaces\/sparkle" version="2\.0">\s*<channel>\s*<title>([^<&\r\n]{1,128})<\/title>\s*<item>\s*<title>([^<&\r\n]{1,64})<\/title>\s*<pubDate>([^<&\r\n]{1,64})<\/pubDate>\s*<sparkle:version>([^<&\r\n]{1,32})<\/sparkle:version>\s*<sparkle:shortVersionString>([^<&\r\n]{1,32})<\/sparkle:shortVersionString>\s*<sparkle:minimumSystemVersion>([0-9]+(?:\.[0-9]+){1,2})<\/sparkle:minimumSystemVersion>\s*(?:<sparkle:hardwareRequirements>(arm64)<\/sparkle:hardwareRequirements>\s*)?<enclosure\b([^>]*?)>\s*<\/enclosure\s*>\s*<\/item>\s*<\/channel>\s*<\/rss>$/u;
 
 const SHORT_VERSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/u;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
@@ -196,6 +197,7 @@ export function hasSparkleSignedFeedTrailer(text) {
  * sha256, size }` (bytes optional when only consistency is wanted).
  */
 export function validateSignedSparkleFeed({
+  architecture = "arm64",
   appcastText = null,
   appcastBytes = null,
   dmg = null,
@@ -203,6 +205,7 @@ export function validateSignedSparkleFeed({
   publicEdKey = null,
   updateOrigin,
 } = {}) {
+  normalizeReleaseArchitecture(architecture);
   if (typeof updateOrigin !== "string" || updateOrigin.length === 0
       || typeof objectPrefix !== "string" || objectPrefix.length === 0) {
     fail(
@@ -283,6 +286,7 @@ export function validateSignedSparkleFeed({
     bundleVersion,
     shortVersion,
     minimumSystemVersion,
+    hardwareRequirements,
     attributeSource,
   ] = official;
   if (!isAppleMacOSBundleVersion(bundleVersion)
@@ -293,6 +297,11 @@ export function validateSignedSparkleFeed({
     );
   }
 
+  if ((architecture === "arm64" && hardwareRequirements !== "arm64")
+      || (architecture === "x64" && (hardwareRequirements !== undefined
+        || minimumSystemVersion !== "14.0"))) {
+    fail("Signed appcast hardware requirements do not match its architecture", "SPARKLE_SIGNED_FEED_ARCHITECTURE_MISMATCH");
+  }
   const attributes = parseEnclosureAttributes(attributeSource);
   const expectedAttributes = ["url", "length", "type", "sparkle:edSignature"];
   if (attributes.size !== expectedAttributes.length
@@ -329,6 +338,12 @@ export function validateSignedSparkleFeed({
     version: bundleVersion,
   });
 
+  if ((architecture === "x64" && (
+      !/^TiboTattle-[0-9]+\.[0-9]+\.[0-9]+-macOS-x64\.dmg$/u.test(object.fileName)
+      || object.fileName !== `TiboTattle-${shortVersion}-macOS-x64.dmg`))
+      || (architecture === "arm64" && /-macOS-x64\.dmg$/u.test(object.fileName))) {
+    fail("Signed appcast artifact does not match its architecture", "SPARKLE_SIGNED_FEED_ARCHITECTURE_MISMATCH");
+  }
   if (dmg !== null && dmg !== undefined) {
     if (typeof dmg !== "object") {
       fail(

@@ -15,9 +15,15 @@ function defaultMessage(key, values = {}) {
   return translate(key, values, DEFAULT_LOCALE);
 }
 
-function configuredInstallerUrl(documentRef) {
+function installerMetaName(name, architecture) {
+  return architecture === "x64"
+    ? name.replace("usage-monitor-", "usage-monitor-intel-")
+    : name;
+}
+
+function configuredInstallerUrl(documentRef, architecture) {
   const raw = documentRef
-    .querySelector('meta[name="usage-monitor-installer-url"]')
+    .querySelector(`meta[name="${installerMetaName("usage-monitor-installer-url", architecture)}"]`)
     ?.getAttribute("content")
     ?.trim();
   if (!raw) return null;
@@ -66,32 +72,31 @@ function configuredReleaseUrl(documentRef, name) {
   }
 }
 
-export function configuredInstallerRelease(documentRef) {
-  const installerUrl = configuredInstallerUrl(documentRef);
-  const version = configuredInstallerMetadata(
-    documentRef,
+export function configuredInstallerRelease(documentRef, { architecture = "arm64" } = {}) {
+  if (architecture !== "arm64" && architecture !== "x64") return null;
+  const installerUrl = configuredInstallerUrl(documentRef, architecture);
+  const metadata = (name, pattern) => configuredInstallerMetadata(
+    documentRef, installerMetaName(name, architecture), pattern,
+  );
+  const version = metadata(
     "usage-monitor-installer-version",
     /^[0-9]+(?:\.[0-9]+){2,3}$/u,
   );
-  const sha256 = configuredInstallerMetadata(
-    documentRef,
+  const sha256 = metadata(
     "usage-monitor-installer-sha256",
     /^[a-f0-9]{64}$/u,
   );
-  const byteText = configuredInstallerMetadata(
-    documentRef,
+  const byteText = metadata(
     "usage-monitor-installer-bytes",
     /^[1-9][0-9]{0,15}$/u,
   );
-  const minimumMacos = configuredInstallerMetadata(
-    documentRef,
+  const minimumMacos = metadata(
     "usage-monitor-minimum-macos",
     /^(?:1[0-9]|[2-9][0-9])\.(?:0|[1-9][0-9]?)(?:\.(?:0|[1-9][0-9]?))?$/u,
   );
-  const architectureText = configuredInstallerMetadata(
-    documentRef,
+  const architectureText = metadata(
     "usage-monitor-architectures",
-    /^(?:arm64|x86_64)(?:,(?:arm64|x86_64))?$/u,
+    architecture === "x64" ? /^x64$/u : /^(?:arm64|x86_64)(?:,(?:arm64|x86_64))?$/u,
   );
   const architectures = architectureText?.split(",") ?? [];
   const links = {
@@ -115,6 +120,9 @@ export function configuredInstallerRelease(documentRef) {
       || Object.values(links).some((value) => value === null)) {
     return null;
   }
+  if (architecture === "x64" && (new URL(installerUrl).pathname.split("/").at(-1)
+      !== `TiboTattle-${version}-macOS-x64.dmg`
+      || configuredInstallerRelease(documentRef)?.version !== version)) return null;
   return {
     installerUrl,
     version,
@@ -130,8 +138,9 @@ export function configuredInstallerRelease(documentRef) {
  * Show the compact assurance only when the download itself passed the closed
  * release-metadata contract. Detailed verification guidance lives in Docs.
  */
-export function renderInstallerAssurance(documentRef, release) {
-  const assurance = documentRef.querySelector("#download-assurance");
+export function renderInstallerAssurance(documentRef, release, { architecture = "arm64" } = {}) {
+  const assurance = documentRef.querySelector(architecture === "x64"
+    ? "#intel-download-assurance" : "#download-assurance");
   if (!assurance) return null;
   assurance.hidden = !release;
   return release ?? null;
@@ -161,14 +170,16 @@ export function compactMacOSVersion(version) {
 }
 
 export function renderInstallerJourney(documentRef, {
+  architecture = "arm64",
   compactDetails = false,
   showUnavailableAction = false,
   showReleaseLinks = true,
   formatLocale = getFormattingLocale(),
   translateMessage = defaultMessage,
 } = {}) {
-  const select = (selector) => documentRef.querySelector(selector);
-  const release = configuredInstallerRelease(documentRef);
+  const select = (selector) => documentRef.querySelector(architecture === "x64"
+    ? selector.replace("#", "#intel-") : selector);
+  const release = configuredInstallerRelease(documentRef, { architecture });
   const link = select("#installer-link");
   const details = select("#installer-details");
   const releaseLinks = select("#installer-links");

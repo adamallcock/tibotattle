@@ -255,13 +255,43 @@ The ordinary uninstall journey is simply: quit TiboTattle and move
 
 ## Developer build
 
-The current bundle is pinned to Node 26.2.0 and Apple silicon:
+The builder requires Node 26.2.0 on Apple silicon. Its default target remains
+Apple silicon:
 
 ```bash
 npm run product:macos:build
 npm run product:macos:validate:development
 open ".release-build/macos/TiboTattle.app"
 ```
+
+An Intel target is available on the same builder; it is not yet publicly qualified:
+
+```bash
+node scripts/build-macos-app.js --architecture x64 \
+  --node-runtime "<verified-node-v26.2.0-darwin-x64>/bin/node" \
+  --test-build --output ".release-build/macos-intel-test/TiboTattle.app"
+```
+
+Use the official Node 26.2.0 Darwin x64 distribution, including its adjacent
+`LICENSE`. The builder checks the pinned executable and license hashes before
+executing the staged runtime. It compiles the launcher and native Keychain
+migration helper for `x86_64`. A development build retains ad-hoc signing and a
+disabled updater. Do not install this shared-identity development app over a
+stable app or run it against stable user state as a qualification shortcut.
+
+The DMG packager, installer validator and release CLI accept `--architecture
+x64`; native inspection checks all bundled executables against that target.
+Release construction also requires the verified `--node-runtime`. Preview and
+release modes retain their existing signing, source, identity and credential
+gates. Intel uses separate stable/dogfood/Preview feeds; it cannot consume the
+Apple silicon feed. No new Homebrew Intel support is claimed.
+
+These source paths do not qualify real Intel hardware, final signed/notarized
+installers or updater installation. See the
+[Intel release plan](../../docs/plans/2026-09-03-macos-intel-release.md) and
+[macOS release runbook](../../docs/runbooks/macos-stable-release-runbook.md)
+for the remaining gates. The commands below show the default Apple silicon
+packaging path; pass `--architecture x64` and the Intel app path for Intel.
 
 Create a deterministic-layout developer DMG:
 
@@ -436,7 +466,9 @@ uses build `1024` and accepted runtime basis
 preceding dogfood allocation. The exact source provenance is the annotated
 [`v0.1.17` tag](https://github.com/adamallcock/tibotattle/tree/v0.1.17). A future
 signed version/channel must add a reviewed monotonic allocation before release
-tooling will run.
+tooling will run. The untagged 0.1.18 candidate reserves `1025` for dogfood and
+`1026` for stable on both architectures; neither allocation proves release or
+installation.
 
 Earlier RCs are historical qualification evidence only. The build-1024
 release retains the fail-closed source, generation, resource, validation,

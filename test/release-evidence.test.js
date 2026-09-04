@@ -334,6 +334,53 @@ test("existing macOS RELEASE_MANIFEST filename compatibility remains intact", ()
     RELEASE_MANIFEST.macOS.arm64DmgFileName,
     `TiboTattle-${RELEASE_MANIFEST.version}-macOS-arm64.dmg`,
   );
+  assert.equal(
+    RELEASE_MANIFEST.macOS.x64DmgFileName,
+    `TiboTattle-${RELEASE_MANIFEST.version}-macOS-x64.dmg`,
+  );
+});
+
+test("separate macOS architectures share source but retain independent bytes and trust", async () => {
+  const value = await buildBaseFixture();
+  try {
+    const intelName = RELEASE_MANIFEST.macOS.x64DmgFileName;
+    await value.add(intelName, "independent Intel artifact");
+    const intel = structuredClone(value.input.artifacts[0]);
+    intel.architecture = "x64";
+    intel.fileName = intelName;
+    intel.path = relative(value.root, value.files.get(intelName));
+    intel.downloadUrl = `https://github.com/adamallcock/tibotattle/releases/download/${RELEASE.tag}/${intelName}`;
+    intel.build.unsignedPayloadSha256 = "4".repeat(64);
+    // Evidence is independent: ARM metadata must not become Intel evidence.
+    intel.sbom = null;
+    intel.provenance = null;
+    intel.updater = { enabled: false, mechanism: "none" };
+    const manifest = await generateReleaseEvidence({
+      descriptor: { ...value.input, artifacts: [...value.input.artifacts, intel] },
+      baseDir: value.root,
+    });
+    await validateReleaseEvidenceManifest(manifest, { artifactRoot: value.root });
+    assert.deepEqual(manifest.artifacts.map((entry) => entry.architecture), ["arm64", "x64"]);
+    const [armArtifact, intelArtifact] = manifest.artifacts;
+    assert.deepEqual(armArtifact.source, intelArtifact.source);
+    assert.notEqual(armArtifact.sha256, intelArtifact.sha256);
+    assert.notEqual(armArtifact.build.unsignedPayloadSha256, intelArtifact.build.unsignedPayloadSha256);
+    assert.equal(intelArtifact.sbom, null);
+    assert.equal(intelArtifact.provenance, null);
+
+    const mixedSource = structuredClone(manifest);
+    mixedSource.artifacts[1].source.commit = "e".repeat(40);
+    await assertCode("RELEASE_EVIDENCE_SOURCE_MISMATCH", () => validateReleaseEvidenceManifest(mixedSource));
+    const missingIntelTrust = structuredClone(manifest);
+    missingIntelTrust.artifacts[1].assurances.notarizationAccepted = false;
+    await assertCode("RELEASE_EVIDENCE_ASSURANCES_INCOMPLETE", () => validateReleaseEvidenceManifest(missingIntelTrust));
+    await writeFile(value.files.get(intelName), "tampered Intel artifact");
+    await assertCode("RELEASE_EVIDENCE_HASH_MISMATCH", () => validateReleaseEvidenceManifest(manifest, {
+      artifactRoot: value.root,
+    }));
+  } finally {
+    await value.close();
+  }
 });
 
 test("published JSON Schema stays aligned with the v1 runtime vocabulary", async () => {
