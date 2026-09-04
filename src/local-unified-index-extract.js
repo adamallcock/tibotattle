@@ -46,16 +46,18 @@ const NEEDLE_RELEVANT_PREFIX = Buffer.from('"t');
 const COMPACTION_TIMESTAMP_PREFIX = Buffer.from('{"timestamp":"');
 const COMPACTION_TYPE_SUFFIX = Buffer.from(',"type":"compacted"');
 const COMPACTION_TYPE_PREFIX = Buffer.from('{"type":"compacted","timestamp":"');
+const COMPACTION_ORDINAL_PREFIX = Buffer.from(',"ordinal":');
 
 // A compacted record can contain an enormous replacement_history payload. Its
 // top-level header is bounded and arrives first. Codex's current serializer
-// emits timestamp then type, while a standards-compliant producer may emit
+// emits timestamp, optional ordinal, then type; older producers may emit
 // the two top-level scalars in the opposite order:
 //
 //   {"timestamp":"...","type":"compacted","payload":...}
+//   {"timestamp":"...","ordinal":123,"type":"compacted","payload":...}
 //   {"type":"compacted","timestamp":"...","payload":...}
 //
-// Match only those two exact byte headers and decode only the timestamp
+// Match only those exact byte headers and decode only the timestamp
 // scalar. Unknown fields, whitespace variants and any marker appearing after
 // payload fail closed. This is
 // deliberately not JSON.parse, and it never converts even the bounded start
@@ -81,7 +83,22 @@ export function parseCompactionPrefix(line) {
   if (timestampEnd < timestampStart
       || timestampEnd - timestampStart > 64) return null;
   if (timestampFirst) {
-    const typeStart = timestampEnd + 1;
+    let typeStart = timestampEnd + 1;
+    if (line.subarray(typeStart, typeStart + COMPACTION_ORDINAL_PREFIX.length)
+      .equals(COMPACTION_ORDINAL_PREFIX)) {
+      const ordinalStart = typeStart + COMPACTION_ORDINAL_PREFIX.length;
+      let ordinalEnd = ordinalStart;
+      while (ordinalEnd < line.length && ordinalEnd - ordinalStart < 20
+          && line[ordinalEnd] >= 0x30 && line[ordinalEnd] <= 0x39) ordinalEnd += 1;
+      const digits = ordinalEnd - ordinalStart;
+      // Validate the bounded unsigned integer without reading payload or
+      // rounding a possible u64 ordinal through a JavaScript number.
+      if (digits === 0 || line[ordinalEnd] !== 0x2c
+          || (digits > 1 && line[ordinalStart] === 0x30)
+          || (digits === 20 && line.toString("ascii", ordinalStart, ordinalEnd)
+            > "18446744073709551615")) return null;
+      typeStart = ordinalEnd;
+    }
     const typeEnd = typeStart + COMPACTION_TYPE_SUFFIX.length;
     if (line.length <= typeEnd
         || !line.subarray(typeStart, typeEnd).equals(COMPACTION_TYPE_SUFFIX)

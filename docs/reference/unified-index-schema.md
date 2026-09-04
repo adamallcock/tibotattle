@@ -28,7 +28,7 @@ one another:
 | Stable filename | `local-unified-index-v1.sqlite` | Machine path continuity across app releases. |
 | Schema-family metadata | `local-unified-index-v2` | Logical family stored in `meta.schema_version`. |
 | SQLite `PRAGMA user_version` | `11` | Physical table/index/migration generation. |
-| Parser version | `unified-rollout-typed-v12` | Meaning and provenance of facts extracted from rollout sources. |
+| Parser version | `unified-rollout-typed-v13` | Meaning and provenance of facts extracted from rollout sources, including ordinal-bearing compaction headers. |
 | Source identity version | `codex-immutable-rollout-v1` | Rules for physical rollout identity/generation. |
 
 The application id is a separate SQLite format guard. A file with the wrong
@@ -69,6 +69,12 @@ invalid provider quota window at record level while retaining unrelated valid
 usage, tool, and quota facts from that source. It also treats a selected
 paginated replacement with no `history_base` as a segment-start lineage reset,
 so descendants do not inherit snapshots from the replaced physical branch.
+
+Parser v13 recognizes the current `timestamp, ordinal, type` compaction header
+alongside both legacy header orders. It validates the bounded unsigned ordinal
+without decoding replacement history. The version change reparses present
+sources so earlier missed compaction boundaries can be recovered safely.
+
 Parser v12 additionally preserves omitted or null usage counters as SQL NULL,
 including the cumulative cursor carried across refreshes. Explicit zero remains
 observed zero. A derived component requires all its input counters and consistent

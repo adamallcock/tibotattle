@@ -1,10 +1,10 @@
 ---
 title: Current product and release status
-date: 2026-09-03
+date: 2026-09-04
 type: status
 status: current
-source_commit: 18c7065b780b3ff2eb11b0c60f2f0725ec8a3aeb
-observation_date: 2026-09-03
+source_commit: 33b79d943478d7faea76cf07c2dbc5efbde0241b
+observation_date: 2026-09-04
 ---
 
 # Current product and release status
@@ -18,8 +18,8 @@ using this page for a later release or operational decision.
 
 | Boundary | Verified state |
 |---|---|
-| Documentation/source review | Intel candidate `0.1.18`, source `18c7065b780b3ff2eb11b0c60f2f0725ec8a3aeb`, includes published 0.1.17 source and refreshed R7 receipts; local annotated dogfood tag, no stable 0.1.18 tag or public release |
-| Intel tester artifact | Signed/notarized `0.1.18` build `1025` dogfood DMG, verified locally; [exact receipt](./receipts/2026-09-03-macos-intel-signed-candidate.md); not installed system-wide or physically Intel-qualified |
+| Documentation/source review | Combined Astra/Intel candidate `0.1.18`, merge `33b79d943478d7faea76cf07c2dbc5efbde0241b`, based on requested `9e1c3333`; integration and live-log follow-up tracked in the [integration plan](./plans/2026-09-04-release-0-1-18-integration.md). No final combined artifact or stable tag |
+| Intel tester artifact | Inherited signed/notarized `0.1.18` build `1025` dogfood DMG from source `18c7065b`; [exact receipt](./receipts/2026-09-03-macos-intel-signed-candidate.md). Predates combined Astra changes; not physically Intel-qualified |
 | Installed internal dogfood | Version `0.1.17`, RC9 build `1023.7`, source `394c8a03`; owner accepted the inspected apps on 2026-09-03. Plist version/build/minimum-OS were independently rechecked; this does not qualify every historical credential or clean-profile case |
 | Public service | Health/readiness HTTP 200, enrollment and upload processing enabled; deployment source `b4c8f103bf697fb530434e6de196f2c187645661`, observed 2026-09-04 03:57 UTC (2026-09-03 locally) |
 | Public updater | Stable `0.1.16`; read-only feed check recorded 2026-09-03 in the release plan |
@@ -120,11 +120,13 @@ The complete qualification matrix and rules for changing these claims are in
 - The [Intel implementation plan](./plans/2026-09-03-macos-intel-release.md)
   records separate thin builds, architecture-specific update/publication
   contracts and manifest-driven website availability. Native/Rosetta and Worker
-  checks pass. The owner-authorized R7 regeneration refreshed all ten receipts;
+  checks passed on that Intel branch. Its owner-authorized R7 regeneration refreshed all ten receipts;
   both pinned-runtime freshness checks pass. The final root run has 3,738 passes,
   zero failures and 17 existing conditional skips. The
   [Intel dogfood candidate](./receipts/2026-09-03-macos-intel-signed-candidate.md)
-  now passes signing/notarization and local artifact checks. Physical Intel,
+  passes signing/notarization and local artifact checks for source `18c7065b`.
+  The combined Astra/Intel workload invalidates those inherited R7 receipts;
+  integrated tests and a final candidate need their own evidence. Physical Intel,
   actual consented upload and installed update qualification remain separate
   gates. No public Intel release, feed or website was published.
 
