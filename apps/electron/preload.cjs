@@ -265,6 +265,13 @@ function installDesktopBridge() {
       subscribeToDesktopCommands,
     ),
     getSettings: (...values) => noArguments("getSettings", values),
+    getSharingPreference: (...values) => noArguments("getSharingPreference", values),
+    setSharingEnabled: (...values) => oneArgument("setSharingEnabled", values,
+      (enabled) => booleanMethod("setSharingEnabled", enabled)),
+    sharingNoticePresented: (...values) => oneArgument("sharingNoticePresented", values,
+      (index) => Number.isInteger(index) && index >= 1 && index <= 3
+        ? invoke("sharingNoticePresented", { index })
+        : rejected("notice index is invalid")),
     getCodexHomesForSettings: (...values) => noArguments(
       "getCodexHomesForSettings",
       values,

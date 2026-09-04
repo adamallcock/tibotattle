@@ -167,6 +167,28 @@
         </div>
       </div>
 
+      <section
+        class="notice notice-info electron-sharing-notice"
+        id="electron-sharing-notice"
+        role="region"
+        aria-labelledby="electron-sharing-notice-title"
+        data-dashboard-page="overview"
+        hidden
+      >
+        <div>
+          <p class="eyebrow" data-i18n="electron.sharing.notice.eyebrow">Community sharing</p>
+          <strong id="electron-sharing-notice-title" data-i18n="electron.sharing.notice.title">Share usage measurements</strong>
+          <p id="electron-sharing-notice-copy" data-i18n="electron.sharing.notice.copy">Community sharing will turn on automatically unless you choose Keep sharing off. This is notice {index} of 3. Shared measurements include token counts, model labels, quota measurements, and pseudonymous identifiers. Prompts, responses, credentials, private paths, and raw account identifiers stay on this device. No sign-in is needed.</p>
+          <p class="annotation" id="electron-sharing-notice-earliest" data-i18n="electron.sharing.notice.earliest">Earliest automatic sharing: {date}; activation also requires all three notices and at least 24 hours after the final notice.</p>
+          <p class="annotation" id="electron-sharing-notice-transport" role="status" aria-live="polite" data-i18n="electron.sharing.transport.unavailable">Uploads are not available in this build.</p>
+          <p class="participant-action-status" id="electron-sharing-notice-status" role="status" aria-live="polite" hidden></p>
+        </div>
+        <div class="notice-actions">
+          <button class="button button-primary" id="electron-sharing-share-now" type="button" data-i18n="electron.sharing.notice.shareNow">Share now</button>
+          <button class="button button-quiet" id="electron-sharing-keep-off" type="button" data-i18n="electron.sharing.notice.keepOff">Keep sharing off</button>
+        </div>
+      </section>
+
       <section class="companion-setup" id="companion-setup" aria-labelledby="companion-setup-title" data-dashboard-page="overview" hidden>
         <div class="companion-setup-copy">
           <p class="eyebrow">First-time setup</p>
@@ -1017,6 +1039,17 @@
         aria-hidden="true"
         inert
       >
+        <section class="panel electron-accountless-community" id="electron-accountless-community" aria-labelledby="electron-accountless-community-title" hidden>
+          <div class="panel-heading">
+            <div>
+              <p class="panel-kicker" data-i18n="electron.sharing.community.eyebrow">Community sharing</p>
+              <h2 id="electron-accountless-community-title" data-i18n="electron.sharing.community.title">Share usage measurements</h2>
+            </div>
+          </div>
+          <p id="electron-accountless-community-state" class="annotation" role="status" aria-live="polite" data-i18n="electron.sharing.state.unavailable">Community sharing preference unavailable; nothing will be shared.</p>
+          <p id="electron-accountless-community-transport" class="annotation" role="status" aria-live="polite" data-i18n="electron.sharing.transport.unavailable">Uploads are not available in this build.</p>
+          <button class="button button-secondary" id="electron-accountless-open-settings" type="button" data-i18n="electron.sharing.community.openSettings">Open sharing settings</button>
+        </section>
         <!--
           The guided journey, stated as stages with visible state, rendered
           from measured facts. Trimmed to two boxes (owner-directed,

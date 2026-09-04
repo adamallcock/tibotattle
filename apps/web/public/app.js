@@ -103,6 +103,87 @@ setMessageLocale(localization.locale());
 const t = localization.t;
 const tPlural = localization.tPlural;
 
+// Accountless sharing is an Electron-only presentation surface. The Electron
+// main/application controller remains the policy owner; this page receives only
+// its bounded projection through the versioned preload bridge. A missing or malformed
+// projection keeps the legacy hosted contribution controls unavailable in the
+// new Electron composition and never becomes an implied permission.
+const ELECTRON_SHARING_API_VERSION = "v1";
+const ELECTRON_SHARING_BASES = new Set([
+  "default_on",
+  "default_off",
+  "migration_default_on",
+  "user_choice",
+  "legacy_preserved",
+]);
+const ELECTRON_SHARING_STATES = new Set([
+  "pending_notices",
+  "enabled",
+  "disabled",
+  "legacy_preserved",
+]);
+const ELECTRON_SHARING_TRANSPORT_STATUSES = new Set(["unavailable", "off"]);
+
+function electronSharingBridge(windowRef = globalThis.window) {
+  const bridge = windowRef?.tibotattleDesktop;
+  if (bridge?.version !== ELECTRON_SHARING_API_VERSION
+      || typeof bridge.getSharingPreference !== "function"
+      || typeof bridge.setSharingEnabled !== "function"
+      || typeof bridge.sharingNoticePresented !== "function") {
+    return null;
+  }
+  return bridge;
+}
+
+function validSharingTimestamp(value) {
+  if (value === null) return true;
+  if (typeof value !== "string" || value.length !== 24) return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds)
+    && new Date(milliseconds).toISOString() === value;
+}
+
+function normalizeElectronSharingPreference(raw) {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const available = raw.available === true;
+  const current = raw.current === true;
+  const state = ELECTRON_SHARING_STATES.has(raw.state) ? raw.state : null;
+  const basis = ELECTRON_SHARING_BASES.has(raw.basis) ? raw.basis : null;
+  const noticeCount = Number.isInteger(raw.noticeCount)
+    && raw.noticeCount >= 0 && raw.noticeCount <= 3
+    ? raw.noticeCount
+    : 0;
+  const nextNoticeIndex = raw.nextNoticeIndex === null
+    ? null
+    : Number.isInteger(raw.nextNoticeIndex)
+      && raw.nextNoticeIndex >= 1 && raw.nextNoticeIndex <= 3
+      ? raw.nextNoticeIndex
+      : null;
+  const nextNoticeAt = validSharingTimestamp(raw.nextNoticeAt) ? raw.nextNoticeAt : null;
+  const earliestActivationAt = validSharingTimestamp(raw.earliestActivationAt)
+    ? raw.earliestActivationAt
+    : validSharingTimestamp(raw.activatesAt) ? raw.activatesAt : null;
+  const transportStatus = ELECTRON_SHARING_TRANSPORT_STATUSES.has(raw.transportStatus)
+    ? raw.transportStatus
+    : raw.enabled === true ? "unavailable" : "off";
+  if (raw.nextNoticeAt !== undefined && !validSharingTimestamp(raw.nextNoticeAt)) return null;
+  if (raw.earliestActivationAt !== undefined && !validSharingTimestamp(raw.earliestActivationAt)) return null;
+  if (raw.activatesAt !== undefined && !validSharingTimestamp(raw.activatesAt)) return null;
+  return Object.freeze({
+    available,
+    current,
+    enabled: available && current && raw.enabled === true,
+    state,
+    basis,
+    noticeCount,
+    nextNoticeIndex,
+    noticeDue: raw.noticeDue === true,
+    nextNoticeAt,
+    earliestActivationAt,
+    transportStatus,
+  });
+}
+
 const localClient = new LocalCompanionClient();
 let communitySession = null;
 const communityClient = new CommunityClient({
@@ -202,6 +283,15 @@ function paginateCacheImpactRows(rows, state, signature) {
 // read that loses the race lands as null. Both latch every capability gate
 // below into "this build has no v1.0 transport" for the life of the page.
 let localCompanionHealth = null;
+// Accountless sharing is deliberately page-local presentation state. Durable
+// choice, transition receipts, and transport authority stay in the companion.
+let electronSharingPreference = null;
+let electronSharingBusy = false;
+let electronSharingNoticeAcked = new Set();
+let electronSharingNoticeReceiptIndex = null;
+let electronSharingNoticeAckScheduled = null;
+let electronSharingNoticeAckCleanup = null;
+let electronSharingNoticeAckError = false;
 // The last refresh run's accounting-rebuild deferral, read from the local
 // refresh status alongside each dashboard load. A rebuild that keeps missing
 // its memory budget is otherwise invisible here: the refresh SUCCEEDS, the
@@ -469,6 +559,8 @@ function rerenderLocalizedDashboard() {
   // writes populate. Nothing has to be named here for it to be covered.
   retranslateLocalizedNodes();
   localization.localizeTree();
+  renderElectronAccountlessCommunity();
+  renderElectronSharingNotice();
 }
 
 window.addEventListener("tibotattle:locale-change", (event) => {
@@ -921,6 +1013,318 @@ function renderConnectionNotice() {
 function hideConnectionNotice() {
   visibleConnectionNotice = null;
   $("#connection-notice").hidden = true;
+}
+
+function electronSharingStateMessageKey(preference) {
+  if (!preference?.available || !preference.current) {
+    return "electron.sharing.state.unavailable";
+  }
+  if (preference.state === "pending_notices") {
+    return "electron.sharing.state.pending";
+  }
+  if (preference.enabled && ["default_on", "migration_default_on"].includes(preference.basis)) {
+    return "electron.sharing.state.defaultOn";
+  }
+  if (preference.enabled) return "electron.sharing.state.enabled";
+  return preference.state === "legacy_preserved"
+    ? "electron.sharing.state.legacy"
+    : "electron.sharing.state.off";
+}
+
+function electronSharingTransportMessageKey(preference) {
+  switch (preference?.transportStatus) {
+    case "off":
+      return "electron.sharing.transport.off";
+    case "unavailable":
+    default:
+      return "electron.sharing.transport.unavailable";
+  }
+}
+
+function applyElectronAccountlessContributionMode() {
+  const electronMode = electronSharingBridge() !== null;
+  document.documentElement.classList.toggle(
+    "electron-accountless-sharing",
+    electronMode,
+  );
+  const community = document.querySelector("#community");
+  if (community) {
+    community.setAttribute(
+      "aria-labelledby",
+      electronMode ? "electron-accountless-community-title" : "contribution-cta-title",
+    );
+  }
+  const legacySurfaces = [
+    document.querySelector("#community-journey"),
+    document.querySelector("#community .contribution-cta-copy"),
+    document.querySelector("#community .contribution-cta-action"),
+  ];
+  for (const surface of legacySurfaces) {
+    if (surface) surface.hidden = electronMode;
+  }
+  const accountlessCommunity = $("#electron-accountless-community");
+  if (accountlessCommunity) accountlessCommunity.hidden = !electronMode;
+  return electronMode;
+}
+
+function clearElectronSharingNoticeAckSchedule() {
+  const cleanup = electronSharingNoticeAckCleanup;
+  electronSharingNoticeAckCleanup = null;
+  electronSharingNoticeAckScheduled = null;
+  cleanup?.();
+}
+
+function electronSharingSurfaceIsVisible() {
+  if (document.visibilityState !== "visible") return false;
+  const notice = $("#electron-sharing-notice");
+  if (!notice || notice.hidden || notice.isConnected === false) return false;
+  for (let element = notice; element; element = element.parentElement) {
+    if (element.hidden || element.inert || element.getAttribute?.("aria-hidden") === "true") {
+      return false;
+    }
+  }
+  return true;
+}
+
+function scheduleElectronSharingNoticeAck(index) {
+  if (electronSharingNoticeAcked.has(index)
+      || electronSharingNoticeAckScheduled === index) return;
+  const bridge = electronSharingBridge();
+  if (!bridge) return;
+  electronSharingNoticeAckScheduled = index;
+  let finished = false;
+  let framePending = false;
+  const removers = [];
+  const listen = (target, type, handler) => {
+    if (typeof target?.addEventListener !== "function") return;
+    target.addEventListener(type, handler);
+    removers.push(() => target.removeEventListener?.(type, handler));
+  };
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    for (const remove of removers.splice(0)) remove();
+    if (electronSharingNoticeAckCleanup === finish) {
+      electronSharingNoticeAckCleanup = null;
+      electronSharingNoticeAckScheduled = null;
+    }
+  };
+  electronSharingNoticeAckCleanup = finish;
+  const scheduleFrame = (callback) => {
+    const raf = globalThis.window?.requestAnimationFrame;
+    if (typeof raf === "function") {
+      raf.call(globalThis.window, callback);
+      return;
+    }
+    const schedule = globalThis.window?.setTimeout ?? globalThis.setTimeout;
+    if (typeof schedule === "function") schedule(callback, 0);
+  };
+  const attempt = () => {
+    if (finished || framePending) return;
+    const preference = electronSharingPreference;
+    if (!preference || preference.state !== "pending_notices"
+        || preference.nextNoticeIndex !== index || !preference.noticeDue) {
+      finish();
+      return;
+    }
+    // A hidden Electron renderer can run JavaScript while its BrowserWindow is
+    // backgrounded. Do not count a notice until the two-frame paint has landed
+    // while the document is visible. Visibility/focus listeners retry it.
+    if (!electronSharingSurfaceIsVisible()) return;
+    framePending = true;
+    scheduleFrame(() => scheduleFrame(async () => {
+      framePending = false;
+      if (finished || !electronSharingSurfaceIsVisible()) return;
+      const current = electronSharingPreference;
+      if (!current || current.state !== "pending_notices"
+          || current.nextNoticeIndex !== index || !current.noticeDue) {
+        finish();
+        return;
+      }
+      electronSharingNoticeAckError = false;
+      try {
+        const result = await bridge.sharingNoticePresented(index);
+        const next = normalizeElectronSharingPreference(result);
+        if (next === null) throw new Error("Sharing notice response was invalid");
+        electronSharingPreference = next;
+        electronSharingNoticeAcked.add(index);
+        electronSharingNoticeReceiptIndex = index;
+        finish();
+        renderElectronAccountlessCommunity();
+        renderElectronSharingNotice();
+      } catch {
+        // Keep the visible notice and its retry listeners. A transient bridge
+        // failure must not be turned into a false displayed receipt.
+        electronSharingNoticeAckError = true;
+        renderElectronSharingNotice();
+      }
+    }));
+  };
+  const retry = () => {
+    if (electronSharingSurfaceIsVisible()) attempt();
+  };
+  listen(document, "visibilitychange", retry);
+  listen(globalThis.window, "focus", retry);
+  listen(globalThis.window, "hashchange", retry);
+  listen(globalThis.window, "popstate", retry);
+  attempt();
+}
+
+function renderElectronSharingNotice() {
+  const notice = $("#electron-sharing-notice");
+  if (!notice) return;
+  const bridge = electronSharingBridge();
+  const preference = electronSharingPreference;
+  const receiptIndex = electronSharingNoticeReceiptIndex;
+  const receiptStillCurrent = Number.isInteger(receiptIndex)
+    && preference?.available === true
+    && preference.current === true
+    && preference.state === "pending_notices"
+    && preference.noticeCount === receiptIndex
+    && preference.nextNoticeIndex === (receiptIndex < 3 ? receiptIndex + 1 : null)
+    && !(preference.noticeDue === true
+      && preference.nextNoticeIndex === (receiptIndex < 3 ? receiptIndex + 1 : null));
+  if (Number.isInteger(receiptIndex) && !receiptStillCurrent) {
+    electronSharingNoticeReceiptIndex = null;
+  }
+  const heldIndex = receiptStillCurrent ? receiptIndex : null;
+  const index = heldIndex ?? preference?.nextNoticeIndex;
+  const projectedNoticeEligible = preference?.noticeDue === true
+    && Number.isInteger(preference?.nextNoticeIndex)
+    && preference.noticeCount === preference.nextNoticeIndex - 1;
+  const eligible = bridge !== null
+    && dashboard !== null
+    && document.documentElement.dataset.localDashboardReady === "true"
+    && preference?.available === true
+    && preference.current === true
+    && preference.state === "pending_notices"
+    && Number.isInteger(index)
+    && index >= 1 && index <= 3
+    && (heldIndex !== null || projectedNoticeEligible);
+  if (!eligible) {
+    notice.hidden = true;
+    clearElectronSharingNoticeAckSchedule();
+    return;
+  }
+  notice.hidden = false;
+  notice.dataset.noticeIndex = String(index);
+  setLocalizedText(
+    $("#electron-sharing-notice-copy"),
+    "electron.sharing.notice.copy",
+    { index },
+  );
+  const earliest = $("#electron-sharing-notice-earliest");
+  if (earliest) {
+    if (preference.earliestActivationAt) {
+      setLocalizedText(
+        earliest,
+        "electron.sharing.notice.earliest",
+        { date: formatLocal(preference.earliestActivationAt, { dateOnly: true }) },
+      );
+      earliest.hidden = false;
+    } else {
+      earliest.hidden = true;
+    }
+  }
+  setLocalizedText(
+    $("#electron-sharing-notice-transport"),
+    electronSharingTransportMessageKey(preference),
+  );
+  const shareNow = $("#electron-sharing-share-now");
+  const keepOff = $("#electron-sharing-keep-off");
+  if (shareNow) shareNow.disabled = electronSharingBusy;
+  if (keepOff) keepOff.disabled = electronSharingBusy;
+  const status = $("#electron-sharing-notice-status");
+  if (status) {
+    status.hidden = !electronSharingNoticeAckError;
+    if (electronSharingNoticeAckError) {
+      setLocalizedText(status, "electron.sharing.notice.error");
+    }
+  }
+  if (!electronSharingNoticeAckError) scheduleElectronSharingNoticeAck(index);
+}
+
+function renderElectronAccountlessCommunity() {
+  const surface = $("#electron-accountless-community");
+  if (!surface) return;
+  const bridge = electronSharingBridge();
+  if (!bridge) {
+    surface.hidden = true;
+    return;
+  }
+  surface.hidden = false;
+  setLocalizedText(
+    $("#electron-accountless-community-state"),
+    electronSharingStateMessageKey(electronSharingPreference),
+  );
+  setLocalizedText(
+    $("#electron-accountless-community-transport"),
+    electronSharingTransportMessageKey(electronSharingPreference),
+  );
+  const settings = $("#electron-accountless-open-settings");
+  if (settings) settings.disabled = typeof bridge.openSettings !== "function";
+}
+
+async function loadElectronSharingPreference({ dashboardReady = false } = {}) {
+  applyElectronAccountlessContributionMode();
+  const bridge = electronSharingBridge();
+  if (!bridge || !dashboardReady || dashboard === null) {
+    electronSharingPreference = null;
+    electronSharingNoticeAckError = false;
+    renderElectronAccountlessCommunity();
+    renderElectronSharingNotice();
+    return null;
+  }
+  try {
+    const next = normalizeElectronSharingPreference(
+      await bridge.getSharingPreference(),
+    );
+    electronSharingPreference = next;
+    electronSharingNoticeAckError = false;
+  } catch {
+    electronSharingPreference = null;
+    electronSharingNoticeAckError = false;
+  }
+  renderElectronAccountlessCommunity();
+  renderElectronSharingNotice();
+  return electronSharingPreference;
+}
+
+async function setElectronSharingEnabled(enabled) {
+  if (typeof enabled !== "boolean" || electronSharingBusy) return false;
+  const bridge = electronSharingBridge();
+  if (!bridge) return false;
+  electronSharingBusy = true;
+  electronSharingNoticeAckError = false;
+  renderElectronSharingNotice();
+  try {
+    const next = normalizeElectronSharingPreference(
+      await bridge.setSharingEnabled(enabled),
+    );
+    if (next === null) throw new Error("Sharing preference response was invalid");
+    electronSharingPreference = next;
+    renderElectronAccountlessCommunity();
+    renderElectronSharingNotice();
+    return true;
+  } catch {
+    electronSharingNoticeAckError = true;
+    renderElectronSharingNotice();
+    return false;
+  } finally {
+    electronSharingBusy = false;
+    renderElectronSharingNotice();
+  }
+}
+
+function openElectronSharingSettings() {
+  const bridge = electronSharingBridge();
+  if (!bridge || typeof bridge.openSettings !== "function") return false;
+  try {
+    void Promise.resolve(bridge.openSettings()).catch(() => {});
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function renderDashboardUnavailableState(kind) {
@@ -11314,6 +11718,10 @@ async function loadLocalDashboard() {
     }
   }
   if (isCurrent()) {
+    // The dashboard has painted a real local result before the accountless
+    // preference is read. This ordering is also the authorization boundary for
+    // a notice receipt: unavailable/hidden startup never counts as displayed.
+    void loadElectronSharingPreference({ dashboardReady: primaryAvailable }).catch(() => {});
     // Optional reads never own primary readiness or the action's busy state.
     void loadLocalDashboardSecondaryState({ isCurrent, primaryAvailable }).catch(() => {
       if (isCurrent()) scheduleIncrementalSyncStatusPoll();
@@ -14747,6 +15155,18 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("focus", () => {
   void resumePendingHostedSignIn();
+  if (electronSharingBridge() !== null && dashboard !== null) {
+    void loadElectronSharingPreference({ dashboardReady: true }).catch(() => {});
+  }
+});
+$("#electron-sharing-share-now")?.addEventListener("click", () => {
+  void setElectronSharingEnabled(true);
+});
+$("#electron-sharing-keep-off")?.addEventListener("click", () => {
+  void setElectronSharingEnabled(false);
+});
+$("#electron-accountless-open-settings")?.addEventListener("click", () => {
+  openElectronSharingSettings();
 });
 window.addEventListener("tibotattle:local-evidence-updated", () => {
   void reloadLocalEvidenceAfterNativeRefresh();
@@ -15081,6 +15501,7 @@ async function bootstrapDashboard() {
     formatLocale: getFormattingLocale(),
     translateMessage: t,
   });
+  applyElectronAccountlessContributionMode();
   renderHostedIdentity();
   updateLocalActionButtons();
   await loadLocalDashboard();

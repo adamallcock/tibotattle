@@ -109,6 +109,26 @@
             </label>
           </section>
 
+          <section class="settings-card settings-sharing-card" aria-labelledby="settings-sharing-title">
+            <div class="settings-card-copy">
+              <h3 id="settings-sharing-title" data-i18n="electron.settings.sharing.title">Community sharing</h3>
+              <p data-i18n="electron.settings.sharing.description">
+                Choose whether this installation may share content-free usage measurements. No sign-in is required. Shared measurements may include token counts, model labels, quota measurements, and pseudonymous continuity identifiers. Prompts, responses, credentials, private paths, and raw account identifiers stay on this device.
+              </p>
+              <p class="settings-status" id="settings-sharing-state" role="status" aria-live="polite" data-i18n="electron.sharing.state.unavailable">
+                Community sharing preference unavailable; nothing will be shared.
+              </p>
+              <p class="settings-status" id="settings-sharing-transport" role="status" aria-live="polite" data-i18n="electron.sharing.transport.unavailable">
+                Uploads are not available in this build.
+              </p>
+            </div>
+            <label class="settings-switch" for="settings-sharing-enabled">
+              <input id="settings-sharing-enabled" type="checkbox" role="switch" disabled aria-describedby="settings-sharing-state settings-sharing-transport">
+              <span class="settings-switch-track" aria-hidden="true"><span></span></span>
+              <span data-i18n="electron.settings.sharing.label">Share usage measurements</span>
+            </label>
+          </section>
+
           <section class="settings-card settings-roots-card" aria-labelledby="settings-codex-roots-title">
             <div class="settings-roots-heading">
               <div class="settings-card-copy">

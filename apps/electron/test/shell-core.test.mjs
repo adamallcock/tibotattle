@@ -23,6 +23,9 @@ import {
   createDesktopLifecycle,
 } from "../desktop-lifecycle.js";
 import {
+  launchDesktopRuntime,
+} from "../desktop-runtime.js";
+import {
   DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
 } from "../desktop-first-run.js";
 import {
@@ -407,6 +410,190 @@ class FakeTray extends EventEmitter {
   destroy() {
     this.destroyed = true;
   }
+}
+
+class RuntimeApp extends FakeApp {
+  constructor() {
+    super();
+    this.ready = false;
+  }
+
+  async whenReady() {
+    this.ready = true;
+    return super.whenReady();
+  }
+
+  getPath(name) {
+    assert.equal(name, "userData");
+    return "/private/tibotattle-shell-test-user-data";
+  }
+}
+
+class RuntimeWebContents extends FakeWebContents {
+  constructor() {
+    super();
+    this.url = "";
+  }
+
+  getURL() {
+    return this.url;
+  }
+}
+
+class RuntimeWindow extends FakeWindow {
+  static instances = [];
+
+  constructor(options) {
+    super(options);
+    this.webContents = new RuntimeWebContents();
+    RuntimeWindow.instances.push(this);
+  }
+
+  loadURL(url) {
+    this.loaded.push(url);
+    this.webContents.url = url;
+    return Promise.resolve();
+  }
+}
+
+class RuntimeChild extends FakeChild {
+  kill(signal) {
+    this.kills.push(signal);
+    queueMicrotask(() => this.emit("exit", 0, null));
+    return true;
+  }
+}
+
+function runtimePlatformServices() {
+  return {
+    defaultCodexHome: "/Users/adam/.codex",
+    defaultCodexHomeDisplay: "Default location (~/.codex)",
+    validateCodexHome: async (path) => path,
+    loginItemStatus: () => ({ status: "unavailable", canSet: false, detail: "unavailable" }),
+    setStartAtLogin: () => ({ status: "unavailable", canSet: false, detail: "unavailable" }),
+    notificationStatus: () => ({
+      permission: "unavailable",
+      available: false,
+      detail: "unavailable",
+    }),
+    chooseCodexHome: async () => "/Users/adam/.codex-custom",
+    openSystemSettings: async () => {},
+    openExternal: async () => {},
+    about: () => ({
+      version: "0.1.17",
+      build: "test",
+      update: { status: "unavailable", canCheck: false, detail: "unavailable" },
+      automaticUpdates: {
+        enabled: false,
+        available: false,
+        canSet: false,
+        detail: "unavailable",
+      },
+    }),
+  };
+}
+
+async function launchSharingRuntimeFixture({
+  sharingInstallationState = "existing_unselected",
+  environmentOverrides = {},
+} = {}) {
+  RuntimeWindow.instances = [];
+  const app = new RuntimeApp();
+  const child = new RuntimeChild();
+  const spawnCalls = [];
+  const ipcMain = {
+    handler: null,
+    handle(channel, handler) {
+      assert.equal(channel, "tibotattle:desktop:v1");
+      this.handler = handler;
+    },
+    removeHandler(channel) {
+      assert.equal(channel, "tibotattle:desktop:v1");
+      this.handler = null;
+    },
+  };
+  const settingsBackend = {
+    async load() {
+      return null;
+    },
+    async save(value) {
+      return value;
+    },
+  };
+  const sharingBackend = {
+    stored: null,
+    async load() {
+      return this.stored;
+    },
+    async save(value) {
+      this.stored = value;
+      return value;
+    },
+  };
+  const launch = launchDesktopRuntime({
+    runtime: {
+      app,
+      dialog: {
+        showMessageBox: async () => {
+          assert.equal(app.ready, true);
+          return { response: 0 };
+        },
+      },
+      BrowserWindow: RuntimeWindow,
+      Tray: FakeTray,
+      Menu: { buildFromTemplate: (template) => ({ template }) },
+      icon: "test-icon",
+      ipcMain,
+    },
+    app,
+    paths: {
+      companionScript: "/repo/apps/local/server.js",
+      companionCwd: "/repo",
+      resourceRoot: "/repo",
+      preloadPath: "/private/preload.cjs",
+    },
+    environment: {
+      HOME: "/Users/adam",
+      USAGE_MONITOR_RESOURCE_ROOT: "/repo",
+      USAGE_MONITOR_STATE_ROOT: "/private/tibotattle-shell-test-companion-state",
+      USAGE_MONITOR_CENTRAL_ORIGIN: "http://127.0.0.1:8792",
+      ...environmentOverrides,
+    },
+    platformServices: runtimePlatformServices(),
+    settingsBackend,
+    firstRunReceiptBackend: {
+      load: async () => ({
+        schemaVersion: DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
+        acknowledged: true,
+      }),
+      save: async () => {},
+    },
+    notificationBackend: {
+      load: async () => null,
+      save: async (value) => value,
+    },
+    sharingBackend,
+    sharingInstallationState,
+    platform: "darwin",
+    supervisorOptions: {
+      spawnChild(_command, args, options) {
+        spawnCalls.push({ args: [...args], options });
+        queueMicrotask(() => {
+          child.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4811/\n"));
+        });
+        return child;
+      },
+      startupTimeoutMs: 1_000,
+      shutdownTimeoutMs: 1_000,
+    },
+  });
+  launch.catch(() => {});
+  const desktop = await launch;
+  const dashboard = RuntimeWindow.instances.find((candidate) => (
+    candidate.loaded[0] === "http://127.0.0.1:4811/"
+  ));
+  assert.notEqual(dashboard, undefined);
+  return { app, child, desktop, dashboard, ipcMain, sharingBackend, spawnCalls };
 }
 
 function dashboardWindowsForTest(windows) {
@@ -2701,13 +2888,81 @@ test("packaged Electron composition keeps the companion in app.asar and uses phy
   );
   assert.equal(
     spawnCalls[0].options.env.USAGE_MONITOR_CENTRAL_ORIGIN,
-    "https://tibotattle.com",
+    undefined,
+    "accountless desktop runtime must not expose the legacy central transport",
   );
   child.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4711/\n"));
   const lifecycle = await launch;
   const dispose = lifecycle.dispose();
   child.emit("exit", 0, null);
   await dispose;
+});
+
+test("accountless sharing notices require a visible trusted frame and block hosted sign-in", async () => {
+  const fixture = await launchSharingRuntimeFixture();
+  const event = {
+    sender: fixture.dashboard.webContents,
+    senderFrame: fixture.dashboard.webContents.mainFrame,
+  };
+  const noticeRequest = { action: "sharingNoticePresented", args: { index: 1 } };
+
+  assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_CENTRAL_ORIGIN, undefined);
+  assert.equal(fixture.desktop.childEnvironment.USAGE_MONITOR_CENTRAL_ORIGIN, undefined);
+  assert.equal(fixture.desktop.lifecycle.state.windowVisible, false);
+  await assert.rejects(
+    fixture.ipcMain.handler(event, noticeRequest),
+    (error) => error?.code === "desktop_ipc_untrusted_context",
+    "a hidden dashboard cannot acknowledge a sharing notice",
+  );
+
+  assert.equal(fixture.desktop.lifecycle.showSettingsWindow(), true);
+  const settings = RuntimeWindow.instances.find((candidate) => (
+    candidate.loaded[0]?.includes("electron-settings.html")
+  ));
+  assert.notEqual(settings, undefined);
+  settings.emit("ready-to-show");
+  assert.equal(fixture.desktop.lifecycle.state.settingsWindowVisible, true);
+  const settingsEvent = {
+    sender: settings.webContents,
+    senderFrame: settings.webContents.mainFrame,
+  };
+  const storedBeforeSettingsNotice = fixture.sharingBackend.stored;
+  await assert.rejects(
+    fixture.ipcMain.handler(settingsEvent, noticeRequest),
+    (error) => error?.code === "desktop_ipc_untrusted_context",
+    "a visible Settings frame cannot acknowledge a sharing notice",
+  );
+  assert.equal(
+    fixture.sharingBackend.stored,
+    storedBeforeSettingsNotice,
+    "a rejected Settings receipt must not persist or increment the notice",
+  );
+
+  fixture.dashboard.emit("ready-to-show");
+  assert.equal(fixture.desktop.lifecycle.state.windowVisible, true);
+  const acknowledged = await fixture.ipcMain.handler(event, noticeRequest);
+  assert.equal(acknowledged.noticeCount, 1);
+  assert.equal(fixture.sharingBackend.stored.notice1PresentedAt !== null, true);
+
+  fixture.desktop.lifecycle.hideWindow();
+  assert.equal(fixture.desktop.lifecycle.state.windowVisible, false);
+  await assert.rejects(
+    fixture.ipcMain.handler(event, noticeRequest),
+    (error) => error?.code === "desktop_ipc_untrusted_context",
+    "a hidden dashboard cannot acknowledge another sharing notice",
+  );
+
+  await assert.rejects(
+    fixture.ipcMain.handler(event, {
+      action: "openHostedSignIn",
+      args: {
+        authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth?client_id=test",
+      },
+    }),
+    (error) => error?.code === "desktop_ipc_handler_failed",
+    "accountless runtime must block social sign-in",
+  );
+  await fixture.desktop.lifecycle.dispose();
 });
 
 test("preload exposes only the exact frozen v1 desktop bridge allowlist", async () => {
@@ -2759,6 +3014,9 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     "version",
     "onCommand",
     "getSettings",
+    "getSharingPreference",
+    "setSharingEnabled",
+    "sharingNoticePresented",
     "getCodexHomesForSettings",
     "openSettings",
     "toggleSidebar",
@@ -2818,6 +3076,9 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   unsubscribe();
   assert.equal(commandListeners.size, 0);
   await bridge.getSettings();
+  await bridge.getSharingPreference();
+  await bridge.setSharingEnabled(true);
+  await bridge.sharingNoticePresented(1);
   await bridge.getCodexHomesForSettings();
   await bridge.openSettings();
   await bridge.toggleSidebar();
@@ -2852,6 +3113,9 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   await bridge.refreshSettled(1);
   assert.deepEqual(JSON.parse(JSON.stringify(calls.map(({ channel, request }) => ({ channel, request })))), [
     { channel: "tibotattle:desktop:v1", request: { action: "getSettings", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "getSharingPreference", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "setSharingEnabled", args: { enabled: true } } },
+    { channel: "tibotattle:desktop:v1", request: { action: "sharingNoticePresented", args: { index: 1 } } },
     { channel: "tibotattle:desktop:v1", request: { action: "getCodexHomesForSettings", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "openSettings", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "toggleSidebar", args: {} } },
@@ -2928,6 +3192,9 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   );
   for (const operation of [
     () => bridge.onCommand(() => {}, "extra"),
+    () => bridge.getSharingPreference("extra"),
+    () => bridge.setSharingEnabled(true, "extra"),
+    () => bridge.sharingNoticePresented(1, "extra"),
     () => bridge.setLanguage("en", "extra"),
     () => bridge.toggleSidebar("extra"),
     () => bridge.getCodexHomesForSettings("extra"),
@@ -2956,6 +3223,11 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     () => bridge.refreshStarted("extra"),
     () => bridge.refreshSettled("extra"),
     () => bridge.refreshSettled(0),
+    () => bridge.setSharingEnabled("true"),
+    () => bridge.sharingNoticePresented(0),
+    () => bridge.sharingNoticePresented(4),
+    () => bridge.sharingNoticePresented(1.5),
+    () => bridge.sharingNoticePresented("1"),
   ]) {
     await assert.rejects(operation(), (error) => error?.name === "TypeError");
   }

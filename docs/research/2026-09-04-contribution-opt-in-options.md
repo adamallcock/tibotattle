@@ -7,7 +7,15 @@ status: proposed
 
 # Easier community contribution and consent options
 
-Recommendation: keep explicit opt-in; first make the existing sign-in-once
+**Decision update:** the owner subsequently selected accountless automatic
+sharing for fresh Electron installations, a three-notice transition for existing
+installations without a prior choice, and persistent opt-out. The accepted
+[sharing policy](../decisions/2026-09-04-accountless-sharing-policy.md) and
+[convergence plan](../plans/2026-09-04-desktop-convergence.md) supersede the
+initial recommendation below. The research is retained as evidence and options,
+not as the current implementation authority.
+
+Initial recommendation: keep explicit opt-in; first make the existing sign-in-once
 flow dependable and understandable, then test accountless contribution with
 credentials created after consent. Default-on upload is not recommended for
 the current linked usage dataset. Authentication, consent and background

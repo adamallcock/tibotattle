@@ -561,6 +561,7 @@ h1 {
 .notice-info { border-color: rgba(49, 95, 132, .25); background: var(--blue-soft); }
 .notice-info p { color: #31536d; }
 .notice-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.electron-sharing-notice .notice-actions { display: grid; flex: 0 0 auto; min-width: 10rem; }
 
 .companion-setup {
   display: grid;

@@ -23,6 +23,31 @@ text have no allowed destination in contribution schemas, diagnostics, or
 public aggregates. Unknown fields are omitted; an input that cannot be safely
 projected is refused or shown as unavailable.
 
+## Electron sharing transition
+
+The [accepted accountless policy](../decisions/2026-09-04-accountless-sharing-policy.md)
+applies to the unified Electron workstream. Fresh installations default to
+sharing; existing installations with no prior choice receive three visible
+notices before activation. A persistent Settings choice enables sharing now or
+keeps it off, cancelling all remaining reminders. Known off, paused and
+disconnected states remain off. Uncertain or unreadable state does not enable
+sharing. No social sign-in is required by this new mode.
+
+Electron stores the policy version, destination, basis and notice timestamps
+in the protected `desktop-settings/accountless-sharing-v1.json` profile record.
+It distinguishes automatic activation from affirmative choice and never invents
+an explicit-consent event. Classification reads metadata for a fixed set of
+managed files, not their contents or provider histories. Removing every app
+state marker can make a reinstall indistinguishable from a fresh installation;
+an upgrade or ordinary reinstall preserving the profile preserves the choice.
+
+The current candidate implements local preferences and notices. Accountless
+upload ownership, renewal/revocation and scheduling remain unfinished, so the
+Electron host disables the older hosted transport and the UI reports uploads
+unavailable. The native and standalone review/consent path described below
+remains unchanged. Production privacy disclosures must change before a build
+that actually sends under the new policy is distributed.
+
 ## Normal refresh sources
 
 | Provider | Exact source | What is read | What is retained by TiboTattle | Network boundary | Removal/reset |
@@ -102,7 +127,8 @@ a temporary availability condition, not evidence of a corrupt credential.
 
 ## Optional hosted contribution
 
-Contribution is off until the person completes the review, identity, consent,
+In the released native and standalone flow, contribution is off until the
+person completes the review, identity, consent,
 and pairing flow. A contribution can include closed-schema derived fields such
 as:
 

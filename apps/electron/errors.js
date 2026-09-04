@@ -11,6 +11,8 @@ const SAFE_ERROR_CODES = new Set([
   "windows_readiness_unavailable",
   "windows_qualification_launch_override_forbidden",
   "desktop_ipc_unavailable",
+  "desktop_sharing_unavailable",
+  "accountless_signin_unavailable",
   "electron_configuration_invalid",
   "desktop_dashboard_browser_unavailable",
   "desktop_diagnostics_unavailable",

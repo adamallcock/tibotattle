@@ -1,7 +1,6 @@
 # TiboTattle agent guidance
 
-Canonical guidance for capable, long-horizon agents: prefer principles,
-constraints, and verifiable outcomes over tutorials or canned examples.
+Prefer principles, constraints and verifiable outcomes over canned examples.
 
 ## Use progressive disclosure
 
@@ -36,16 +35,14 @@ constraints, and verifiable outcomes over tutorials or canned examples.
 | Build, generator, verification, or release tooling | `scripts/AGENTS.md` |
 | Documentation, evidence, plans, or release claims | `docs/AGENTS.md`, then `docs/README.md` |
 
-`CLAUDE.md` imports this policy for all agents. Keep client-specific guidance
-out unless it changes a repository contract.
+`CLAUDE.md` imports this policy for all agents.
 
 ## Product invariants
 
 Changing an invariant requires an explicit product decision, matching tests,
 and updated authoritative documentation.
 
-- TiboTattle is local-first and privacy-first. Local analysis must work offline,
-  and local HTTP services must bind only to loopback.
+- Local analysis must work offline, and local HTTP services bind only to loopback.
 - Unexpected Keychain security prompts block release. Routine access must be
   non-interactive; never weaken protection to suppress prompts. Follow
   `apps/macos/AGENTS.md` for silent migration, explicit recovery, and proof.
@@ -53,8 +50,10 @@ and updated authoritative documentation.
   and filenames, raw account identifiers, and other session content must not
   enter derived artifacts, fixtures, logs, diagnostics, issues, commits, or
   pull requests.
-- Hosted contribution is optional, off by default, content-free, pseudonymous,
-  consent-gated, and reviewable before first upload; hosted erasure is owner-only.
+- Hosted contribution is optional, content-free and pseudonymous. Follow the
+  accountless Electron defaults and transition in
+  `docs/decisions/2026-09-04-accountless-sharing-policy.md`; preserve durable
+  opt-outs and legacy consent contracts; hosted erasure is owner-only.
 - Derived data is allowlisted and schema-validated. Unknown upstream fields are
   omitted; unknown, stale, unavailable, or unattributed evidence stays explicit.
   Never convert missing evidence to zero or inferred continuity.
@@ -177,8 +176,8 @@ and updated authoritative documentation.
 
 Flag changes that:
 
-- weaken local-only, loopback, consent, redaction, pseudonymity, or deletion
-  guarantees;
+- weaken loopback, recorded sharing choices, versioned authorization, legacy
+  consent, redaction, pseudonymity, or deletion guarantees;
 - turn sparse or stale evidence into confident values, attribution, or support
   claims;
 - allow replay, retries, partial writes, account switching, or source duplication

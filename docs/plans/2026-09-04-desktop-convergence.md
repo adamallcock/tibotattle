@@ -22,22 +22,21 @@ modified by this plan.
 
 The related [contribution research](../research/2026-09-04-contribution-opt-in-options.md)
 records the investigation. The accepted direction is one coordinated
-workstream: Electron convergence plus accountless contribution. Automatic
-default-on activation is awaiting a precise confirmation: the user's latest
-phrase "opt in" conflicts with the preceding default-on discussion, and
-automatic approval review rejected changing the standing privacy guidance on
-that ambiguous basis. Implementation may continue on the shell, disabled
-enrollment foundations and synthetic tests. Preserve explicit
-existing off, paused and disconnected choices during migration. Source work
-and synthetic qualification may proceed; activation in distributed builds and
-hosted production awaits the matching policy, abuse and release gates.
+workstream: Electron convergence plus accountless contribution. The owner
+resolved the sharing default on 2026-09-04: fresh installations share
+automatically without sign-in, with a persistent opt-out. Existing installations
+without a prior choice receive three visible notices before activation;
+**Share now** or **Keep sharing off** cancels the remaining notices. Preserve
+explicit existing off, paused and disconnected choices. The accepted
+[sharing policy](../decisions/2026-09-04-accountless-sharing-policy.md) records
+the detailed state and timing contract. This supersedes the earlier ambiguity
+and approval-review hold on changing the default.
 
 ## Implementation boundary
 
-The default-on clauses below describe the proposed mode, pending the
-confirmation above. They do not override current repository privacy guidance
-or activate collection. Accountless enrollment and Electron reconciliation are
-authorized independently of the final sharing default.
+The policy is accepted for the new Electron mode. Source implementation and
+synthetic qualification may proceed; distributed collection still depends on
+upload ownership, honest authorization, abuse controls and release evidence.
 
 - Keep local analysis available offline. Contribution failure never blocks it.
 - Remove mandatory social sign-in for the new Electron contribution mode.
@@ -60,7 +59,7 @@ authorized independently of the final sharing default.
   outside the first combined migration milestone; do not merge its dirty
   worktree wholesale or make it a second product/release train.
 
-The pending default-on decision would change the earlier default-off design for
+The accepted default-on decision changes the earlier default-off design for
 this new mode. Current authorization does not include remote migrations, publication, signing, system installs,
 real-corpus uploads, erasure, or re-enabling previously declined contribution.
 Update applicable invariants and disclosures as each implemented path changes;
@@ -101,12 +100,12 @@ migration.
 | Luna: enrollment | `codex/accountless-enrollment-backend` | Disabled enrollment-only endpoint, additive ledger, bounded issuance and synthetic lifecycle tests |
 | Luna: attribution | Read-only attribution trace, then owned client files | Join contract verified; bounded enrollment helper implemented; independent backend concurrency review |
 
-Local preference foundation is implemented with a closed versioned record and
-the existing protected settings adapter. Its nine focused tests pass, including
+First-tranche preference foundation was implemented with a closed versioned record and
+the existing protected settings adapter. Its nine focused tests passed, including
 real-file restart, first-operation opt-out, corrupt/unknown state, failed writes,
-policy/destination changes and concurrent selections. It is not connected to
-the installed application or an upload scheduler. The new sharing default
-remains pending confirmation; no existing production behavior changed.
+policy/destination changes and concurrent selections. At that milestone it was not connected to the application or an upload
+scheduler. The second tranche below connects the accepted policy to Electron;
+no existing production behavior changed.
 
 The initial source integration selectively brings the retained Electron shell
 onto the current shared core. It preserves current native accounting, hosted
@@ -169,6 +168,36 @@ or remote migration was attempted.
 | macOS x64 | Shared source reconciled; active native 0.1.18 candidate left separate | Exact Intel Electron/native-dependency build and installed lifecycle |
 | Windows x64 | Retained protected-state/platform seams integrated; production readiness remains disabled | Qualified native binding, installer, credentials and update on Windows |
 | Linux x64 | Retained shell/adapter foundations; no installed support claim | Secret Service, tray/display environment, package/update and relaunch |
+
+### Second tranche: accepted sharing policy and visible controls
+
+Implemented source scope: protected local policy v2, fresh-install default-on,
+metadata-only installation classification, durable three-notice transition,
+explicit-choice cancellation, a narrow Electron bridge, visible dashboard
+notices and persistent Settings controls. The candidate schedule is days 0, 3
+and 6, at least 24 hours between actual displays, with activation no earlier
+than day 7 and 24 hours after the third displayed notice. Late visits extend
+that schedule. Policy records distinguish `default_on`, `migration_default_on`
+and `user_choice`; automatic activation creates no consent timestamp.
+
+The Electron host removes the legacy hosted contribution origin and rejects
+hosted sign-in. This prevents a previously paired legacy scheduler from
+bypassing the new choice while accountless upload ownership is unfinished.
+The preference UI explicitly reports that uploads are unavailable in this
+build. This is a candidate source milestone, not a shipping replacement for
+existing contributors.
+
+The next backend change must generalize contribution ownership without a
+parallel ingestion pipeline. Existing participants, device credentials,
+consent triggers and aggregate eligibility depend on social enrollment;
+enrollment-only receipts cannot safely be promoted into upload credentials.
+Add a common owner/principal contract, honest policy authorization,
+authenticated renewal/revocation and conservative aggregate admission, then
+wire scheduling and cancellation through the same durable preference.
+Do not fabricate participants, consent events, sessions or browser pairings.
+
+Second-tranche validation is in progress. Source tests, rendered/package
+inspection and remaining gates will be recorded here before handoff.
 
 ### Usage-to-quota attribution contract
 
@@ -463,7 +492,7 @@ exact candidate/source/artifact references for these gates:
 | State/security | Protected state and credentials, consent continuity, interrupted migration recovery, future-schema refusal, no duplicated/lost history |
 | Distribution | Signed/trusted install, update to next version, interrupted update/recovery, correct architecture/feed and uninstall preserving intended data |
 | Existing Mac migration | Every supported predecessor profile class, salt/credential/consent continuity, old login-item cleanup and no unexpected automatic Keychain prompts |
-| Product parity | Current stable customer capabilities on replacement Mac; optional hosted contribution remains opt-in and compatible. Reduced Windows/Linux functionality is disclosed and classified, not silently called full parity |
+| Product parity | Current stable customer capabilities on replacement Mac; hosted contribution follows the accepted Electron sharing policy with persistent opt-out and preserved prior choices. Reduced Windows/Linux functionality is disclosed and classified, not silently called full parity |
 | Performance/accessibility | Measured startup, idle CPU/RSS, large-history responsiveness, keyboard/navigation, readable failure states and retained localization; agree budgets against current native before sign-off |
 
 Shared deterministic accounting/provider tests run once in their owning

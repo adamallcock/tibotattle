@@ -23,6 +23,9 @@ test("desktop contract freezes the exact bridge action and enum vocabulary", () 
   assert.equal(DESKTOP_IPC_CHANNEL, "tibotattle:desktop:v1");
   assert.deepEqual(DESKTOP_ACTIONS, [
     "getSettings",
+    "getSharingPreference",
+    "setSharingEnabled",
+    "sharingNoticePresented",
     "getCodexHomesForSettings",
     "openSettings",
     "toggleSidebar",
@@ -83,6 +86,7 @@ test("request validation accepts exact envelopes and freezes the result", () => 
 
   for (const action of [
     "getSettings",
+    "getSharingPreference",
     "getCodexHomesForSettings",
     "openSettings",
     "toggleSidebar",
@@ -97,6 +101,18 @@ test("request validation accepts exact envelopes and freezes the result", () => 
     "refreshStarted",
   ]) {
     assert.deepEqual(validateDesktopRequest({ action, args: {} }), { action, args: {} });
+  }
+  for (const enabled of [true, false]) {
+    assert.deepEqual(
+      validateDesktopRequest({ action: "setSharingEnabled", args: { enabled } }),
+      { action: "setSharingEnabled", args: { enabled } },
+    );
+  }
+  for (const index of [1, 2, 3]) {
+    assert.deepEqual(
+      validateDesktopRequest({ action: "sharingNoticePresented", args: { index } }),
+      { action: "sharingNoticePresented", args: { index } },
+    );
   }
   assert.deepEqual(
     validateDesktopRequest({ action: "refreshSettled", args: { lease: 1 } }),
@@ -155,6 +171,16 @@ test("request validation rejects unknown actions, extra keys, malformed values, 
   const invalidRequests = [
     { action: "unknown", args: {} },
     { action: "getSettings", args: { extra: true } },
+    { action: "getSharingPreference", args: { extra: true } },
+    { action: "setSharingEnabled", args: {} },
+    { action: "setSharingEnabled", args: { enabled: "true" } },
+    { action: "setSharingEnabled", args: { enabled: true, extra: true } },
+    { action: "sharingNoticePresented", args: {} },
+    { action: "sharingNoticePresented", args: { index: 0 } },
+    { action: "sharingNoticePresented", args: { index: 4 } },
+    { action: "sharingNoticePresented", args: { index: 1.5 } },
+    { action: "sharingNoticePresented", args: { index: "1" } },
+    { action: "sharingNoticePresented", args: { index: 1, extra: true } },
     { action: "getSettings", args: {}, extra: true },
     { action: "setLanguage", args: { value: "fr" } },
     { action: "setLanguage", args: { value: "en", extra: true } },

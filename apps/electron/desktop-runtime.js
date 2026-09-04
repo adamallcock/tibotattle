@@ -1,5 +1,6 @@
 import { isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { DEPLOYMENT_ENDPOINTS } from "../../config/deployment-endpoints.js";
 
 import { createCompanionSupervisor } from "./companion-supervisor.js";
 import { createDesktopCommand } from "./desktop-command.js";
@@ -34,6 +35,8 @@ import {
 import { createDesktopFirstRunLoginRegistrar } from "./desktop-first-run-login.js";
 import { createDesktopRecoverySettingsAction } from "./desktop-recovery-settings.js";
 import { createDesktopOwnedDownloadRegistry } from "./desktop-owned-downloads.js";
+import { createDesktopSharingBackend, createDesktopSharingCoordinator } from "./desktop-sharing.js";
+import { classifyDesktopSharingInstallation } from "./desktop-sharing-installation.js";
 import {
   createDesktopNotificationCoordinator,
   createDesktopNotificationPolicyCodec,
@@ -44,6 +47,7 @@ import { shellError } from "./errors.js";
 import {
   createWindowsFilesystemAdapter,
   createWindowsProtectedStateStore,
+  defaultExportStateDirectory,
 } from "../../src/platform/index.js";
 
 const DESKTOP_SETTINGS_DIRECTORY = "desktop-settings";
@@ -157,6 +161,8 @@ function assertNoWindowsTestOverrides({
   settingsBackend,
   settingsStore,
   notificationBackend,
+  sharingBackend,
+  sharingInstallationState,
   firstRunReceiptBackend,
   ownedDownloadsRegistry,
   argv,
@@ -168,6 +174,8 @@ function assertNoWindowsTestOverrides({
       || firstRunReceiptBackend !== undefined
       || ownedDownloadsRegistry !== undefined
       || notificationBackend !== undefined
+      || sharingBackend !== undefined
+      || sharingInstallationState !== undefined
       || argv !== undefined) {
     throw shellError("windows_qualification_launch_override_forbidden");
   }
@@ -370,6 +378,8 @@ export async function launchDesktopRuntime({
   settingsBackend,
   settingsStore,
   notificationBackend,
+  sharingBackend,
+  sharingInstallationState,
   firstRunReceiptBackend,
   ownedDownloadsRegistry,
   argv,
@@ -392,6 +402,8 @@ export async function launchDesktopRuntime({
     settingsBackend,
     settingsStore,
     notificationBackend,
+    sharingBackend,
+    sharingInstallationState,
     firstRunReceiptBackend,
     ownedDownloadsRegistry,
     argv,
@@ -405,6 +417,12 @@ export async function launchDesktopRuntime({
     throw new TypeError("BrowserWindow is required");
   }
   const childEnvironment = childEnvironmentWithStateRoot({ app, environment });
+  const sharingDestinationOrigin = childEnvironment.USAGE_MONITOR_CENTRAL_ORIGIN
+    ?? DEPLOYMENT_ENDPOINTS.public.origin;
+  // The accountless candidate has no upload authority yet. Do not let an old
+  // participant scheduler bypass its new opt-out or fall back to social login.
+  // Local provider capture and offline analysis remain independently available.
+  delete childEnvironment.USAGE_MONITOR_CENTRAL_ORIGIN;
   // Keep one mutable argument vector for the lifetime of this runtime. The
   // supervisor snapshots it for each spawn, so a Settings root change can
   // persist first, update this vector, and then use the ordinary bounded
@@ -512,6 +530,19 @@ export async function launchDesktopRuntime({
   const desktopSystemLocales = requestedDesktopSystemLocales
     ?? electronSystemLocales(app);
   const settingsRootPath = join(userDataPath(app), DESKTOP_SETTINGS_DIRECTORY);
+  const injectedSettings = settingsBackend !== undefined || settingsStore !== undefined
+    || firstRunReceiptBackend !== undefined;
+  const homeDirectory = runtimeHomeDirectory({ platform, environment });
+  const legacyStateRoots = [defaultExportStateDirectory({ platform, homeDirectory, environment })];
+  if (platform === "darwin") {
+    legacyStateRoots.push(join(homeDirectory, "Library", "Application Support", "Usage Monitor"));
+  }
+  // Establish provenance before the first-run receipt or settings create a new
+  // managed marker. Injected test backends never inspect real profile state.
+  const installationState = sharingInstallationState ?? (injectedSettings
+    ? "unknown"
+    : await classifyDesktopSharingInstallation({ profileRoot: userDataPath(app),
+      stateRoot: childEnvironment.USAGE_MONITOR_STATE_ROOT, legacyStateRoots }));
   const needsWindowsProtectedStateStore = platform === "win32"
     && (qualificationContext !== null
       && qualificationContext !== undefined
@@ -552,6 +583,22 @@ export async function launchDesktopRuntime({
       ipc: createNoopIpcInstallation(),
       childEnvironment,
     });
+  }
+  let sharingCoordinator;
+  try {
+    const selectedSharingBackend = sharingBackend ?? (injectedSettings
+      ? { load: async () => { throw new Error("Sharing unavailable"); },
+        save: async () => { throw new Error("Sharing unavailable"); } }
+      : createDesktopSharingBackend({ platform, rootPath: settingsRootPath,
+        windowsProtectedStateStore }));
+    sharingCoordinator = createDesktopSharingCoordinator({ backend: selectedSharingBackend,
+      installationState, destinationOrigin: sharingDestinationOrigin });
+    await sharingCoordinator.initialize();
+  } catch {
+    // Preference or protected-store failure blocks contribution, never local use.
+    const unavailable = async () => { throw shellError("desktop_sharing_unavailable"); };
+    sharingCoordinator = { inspect: unavailable, setEnabled: unavailable,
+      markNoticePresented: unavailable, dispose() {} };
   }
   const runtimeOwnedDownloadsRegistry = await createRuntimeOwnedDownloadsRegistry({
     app,
@@ -817,6 +864,7 @@ export async function launchDesktopRuntime({
   }
 
   controller = createDesktopController({
+    sharingCoordinator,
     settingsStore: store,
     platformServices: services,
     notificationCoordinator,
@@ -942,6 +990,7 @@ export async function launchDesktopRuntime({
       removeNativeThemeListener();
       removeNativeThemeListener = () => {};
       ipcInstallation.dispose?.();
+      sharingCoordinator.dispose();
       await controller.dispose();
       // Drain first so a final status evaluation cannot race disposal. The
       // coordinator is idempotent, which also tolerates a future controller
@@ -976,6 +1025,13 @@ export async function launchDesktopRuntime({
         trustedSender: (sender, event) => lifecycle?.isAuthorizedDesktopSender?.(sender, event) === true,
         trustedFrame: (frame, event) => lifecycle?.isAuthorizedDesktopFrame?.(frame, event) === true,
         trustedAction: (action, event) => {
+          if (action === "sharingNoticePresented") {
+            const context = { sender: event?.sender };
+            // The scheduled notice is rendered only in the dashboard. Settings
+            // can select a preference, but cannot supply a display receipt.
+            return lifecycle?.state.windowVisible === true
+              && lifecycle.isAuthorizedDashboardFrame?.(event?.senderFrame, context) === true;
+          }
           if (SETTINGS_CODEX_ROOT_ACTIONS.has(action)) {
             return lifecycle?.isAuthorizedSettingsFrame?.(
               event?.senderFrame,
@@ -1064,6 +1120,7 @@ export async function launchDesktopRuntime({
     supervisor,
     controller,
     notificationCoordinator,
+    sharingCoordinator,
     settingsStore: store,
     settingsBackend: backend,
     ipc: ipcInstallation,

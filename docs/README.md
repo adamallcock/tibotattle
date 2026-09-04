@@ -19,6 +19,7 @@ an informal archive.
 | User help | [User guide](./user-guide.md) | Installation, first run, uncertainty, refresh/recovery, optional contribution, data, updates, and support |
 | Architecture | [System architecture](./reference/system-architecture.md) | Current components, trust boundaries, stores, identities, and data flow |
 | Privacy | [Local data, network, and privacy](./reference/local-data-and-privacy.md) | Exact source reads, local and hosted stores, Keychain, network, retention, deletion, and uninstall boundaries |
+| Electron sharing policy | [Accountless sharing defaults](./decisions/2026-09-04-accountless-sharing-policy.md) | Accepted fresh-install default-on and three-notice existing-install transition; persistent opt-out, no sign-in, and distinct source/release gates |
 | Hosted erasure | [Self-service deletion retirement](./decisions/2026-08-30-self-service-deletion-retirement.md) | Accepted source contract: confirmed device disconnect, private owner erasure, and retained restore safeguards; not deployment evidence |
 | Calibration semantics | [Composition-aware expected-line contract](./design/composition-aware-expected-line.md) | Maintained model-mix, saturation, reset, and lineage carry-forward interpretation; not a provider capacity claim |
 | APIs | [API and integration surface](./reference/api-surface.md) | Stable entry point for the source-checked HTTP, native, process, package, schema, binding, and external-service inventory |

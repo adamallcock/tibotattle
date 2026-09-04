@@ -72,6 +72,9 @@ export const DESKTOP_EXTERNAL_TARGETS = Object.freeze([
 
 export const DESKTOP_ACTIONS = Object.freeze([
   "getSettings",
+  "getSharingPreference",
+  "setSharingEnabled",
+  "sharingNoticePresented",
   "getCodexHomesForSettings",
   "openSettings",
   "toggleSidebar",
@@ -102,6 +105,9 @@ export const DESKTOP_ACTIONS = Object.freeze([
 
 const ACTION_ARGUMENT_KEYS = Object.freeze({
   getSettings: Object.freeze([]),
+  getSharingPreference: Object.freeze([]),
+  setSharingEnabled: Object.freeze(["enabled"]),
+  sharingNoticePresented: Object.freeze(["index"]),
   getCodexHomesForSettings: Object.freeze([]),
   openSettings: Object.freeze([]),
   toggleSidebar: Object.freeze([]),
@@ -242,7 +248,13 @@ export function validateDesktopRequest(request) {
       assertSeconds(args.seconds);
       break;
     case "setStartAtLogin":
+    case "setSharingEnabled":
       assertBoolean(args.enabled, "enabled");
+      break;
+    case "sharingNoticePresented":
+      if (!Number.isInteger(args.index) || args.index < 1 || args.index > 3) {
+        throw new TypeError("notice index is invalid");
+      }
       break;
     case "setNotificationPreferences":
       assertBoolean(args.enabled, "enabled");

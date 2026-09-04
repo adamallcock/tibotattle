@@ -8,9 +8,11 @@ first.
 - Contribution begins only after local data has been projected into the current
   allowlisted telemetry contract and passed recursive privacy validation. This
   domain never receives raw rollout or transcript records.
-- Preserve the sequence: explicit consent, exact-data review, prepared immutable
-  set, authenticated capability, accepted first upload, then while-open recurring
-  contribution. Do not turn code availability into consent or background service.
+- Bind prepared immutable data to the applicable versioned authorization and
+  authenticated capability before upload, then retain while-open recurrence.
+  Legacy consent/review flows remain compatible; the accepted accountless
+  Electron policy is in `docs/decisions/2026-09-04-accountless-sharing-policy.md`.
+  Never convert automatic authorization into a fabricated consent event.
 - Keep local-only use account-free. Hosted sign-in identity, participant identity,
   device capability, account track, and event/session pseudonyms have distinct
   purposes and must not be joined into a richer identity.

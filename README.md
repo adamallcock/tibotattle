@@ -1,6 +1,6 @@
 # TiboTattle
 
-Privacy-first, local-first monitoring for coding-agent usage. TiboTattle
+Local-first monitoring for coding-agent usage. TiboTattle
 processes local Codex usage metadata and provider-reported quota evidence to
 show where your allowance stands, what observed work would have cost at
 standard API prices, and where the available evidence does not support a
@@ -8,16 +8,19 @@ confident answer.
 
 Personal analysis runs locally and works without an account. Raw source logs do
 not leave your machine, and prompts, responses, file paths, and raw account
-identifiers do not enter TiboTattle's derived artifacts. The optional hosted
-community contribution service is a separate, off-by-default capability with
-an exact local review and explicit send step.
+identifiers do not enter TiboTattle's derived artifacts. The released native app's hosted contribution path remains off by default,
+with local review and an explicit send. The unified Electron workstream adopts
+[accountless automatic sharing](docs/decisions/2026-09-04-accountless-sharing-policy.md):
+fresh installs default on, existing users receive three notices, and a persistent
+opt-out is available without sign-in. The current Electron candidate implements
+the preference and notices; its accountless upload transport is not yet active.
 
 
 > **The name:** TiboTattle is named with affection for the Codex community and
 > its patron saint of quota resets. It is not affiliated with or endorsed by
 > OpenAI or Thibault Sottiaux, and we will happily rename it if asked. Your
-> tokens tattle only to you: personal analysis stays local and nothing is
-> contributed without your explicit, reviewed consent.
+> personal analysis stays local, and sharing follows the applicable versioned
+> policy and your saved preference.
 
 ## What it shows
 

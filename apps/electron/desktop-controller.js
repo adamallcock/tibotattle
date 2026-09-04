@@ -286,6 +286,7 @@ function fixedNotificationPreferences(value) {
  * their failure/rollback behavior remains plain-Node testable.
  */
 export function createDesktopController({
+  sharingCoordinator,
   settingsStore,
   platformServices,
   notificationCoordinator,
@@ -348,6 +349,12 @@ export function createDesktopController({
   const coordinator = notificationCoordinator === undefined
     ? createUnavailableNotificationCoordinator()
     : assertPort(notificationCoordinator, ["initialize", "status", "setPreferences"], "notificationCoordinator");
+  const sharing = sharingCoordinator === undefined ? null
+    : assertPort(sharingCoordinator, ["inspect", "setEnabled", "markNoticePresented"], "sharingCoordinator");
+  function requireSharing() {
+    if (disposed || sharing === null) throw controllerError("desktop_sharing_unavailable");
+    return sharing;
+  }
   if (typeof getLifecycle !== "function") throw new TypeError("getLifecycle is required");
   if (typeof applyCodexHome !== "function") throw new TypeError("applyCodexHome is required");
   if (applyCodexHomes !== undefined && typeof applyCodexHomes !== "function") {
@@ -920,6 +927,9 @@ export function createDesktopController({
   }
 
   const handlers = Object.freeze({
+    getSharingPreference: () => requireSharing().inspect(),
+    setSharingEnabled: ({ enabled }) => requireSharing().setEnabled(enabled),
+    sharingNoticePresented: ({ index }) => requireSharing().markNoticePresented(index),
     async getSettings() {
       return snapshot();
     },
@@ -1093,6 +1103,7 @@ export function createDesktopController({
       await platform.openExternal(target);
     },
     async openHostedSignIn({ authorizeUrl }) {
+      if (sharing !== null) throw controllerError("accountless_signin_unavailable");
       if (typeof platform.openHostedSignIn !== "function") {
         throw controllerError("desktop_hosted_signin_unavailable");
       }

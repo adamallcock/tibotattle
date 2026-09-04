@@ -294,7 +294,11 @@ is for acquisition, downloads, documentation, and delayed public community
 aggregates; it does not receive permission to read Codex files and is not a
 substitute for the personal dashboard.
 
-Contribution is off by default. The affirmative path requires:
+The native/standalone contribution path is off by default. The Electron
+workstream uses the [accepted accountless policy](../../docs/decisions/2026-09-04-accountless-sharing-policy.md)
+and disables this legacy hosted transport while accountless upload ownership
+is completed. The following gates continue to describe the legacy path:
+
 
 1. an explicit consent choice;
 2. local preparation of a bounded content-free pseudonymous set;

@@ -5225,6 +5225,10 @@ async function createDashboardStartupHarness({
     renderDashboardUnavailableState(kind) { state.events.push(["unavailable", kind]); },
     renderHostedIdentity() { state.events.push(["identity"]); },
     renderAccounting() { state.events.push(["accounting"]); },
+    // The extracted startup harness has no Electron preload bridge. Keep the
+    // production loader's optional accountless-sharing read on its faithful
+    // no-bridge path while the startup assertions exercise primary readiness.
+    loadElectronSharingPreference: async () => null,
     renderContributionActionState() { state.events.push(["consent", context.incrementalConsentApproved]); },
     renderContributionSyncStatus(value) { state.events.push(["sync-status", value]); },
   });
