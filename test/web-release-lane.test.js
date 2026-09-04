@@ -27,6 +27,7 @@ import {
 import {
   inspectWebReleaseScope,
   isAllowedWebReleasePath,
+  isExactWebInstallerCompatibilityPatch,
   verifyWebReleaseReceipt,
   WEB_RELEASE_OUTPUT_DIRECTORY,
   writeWebReleaseReceipt,
@@ -158,6 +159,50 @@ test("web-only scope rejects a package version change", async (t) => {
     }),
     /changed unsupported package metadata/u,
   );
+});
+
+test("installer compatibility is one exact patch, never a general native allowlist", () => {
+  const proof = {
+    baseCommit: "304f3d736b6f9451d32a616bf3046ea628e828a3",
+    artifacts: [
+      {
+        path: "scripts/macos-release-core.js", status: "M",
+        before: { mode: "100644", sha256: "46404fe315c72c5108e92e41aa53709c408399af79e2d43bf2f2f39a90ec841f" },
+        after: { mode: "100644", sha256: "65dfb3f8e378948d58b1ffc1dda5d2454387d98df391e897106368124fe06a33" },
+      },
+      {
+        path: "scripts/macos-keychain-migration-validation.js", status: "A", before: null,
+        after: { mode: "100644", sha256: "586e929fffd486a68832c1cabad236133fc8e9b6f1577c95c5a15ec8315462ba" },
+      },
+      {
+        path: "test/macos-keychain-migration-validation.test.js", status: "A", before: null,
+        after: { mode: "100644", sha256: "50a689c33456d6a2974c576ae0b1e237057a18e701a967bb869df57086236af0" },
+      },
+    ],
+  };
+  assert.equal(isExactWebInstallerCompatibilityPatch(proof), true);
+  for (const mutate of [
+    (value) => { value.baseCommit = "a".repeat(40); },
+    (value) => { value.artifacts.pop(); },
+    (value) => { value.artifacts.push(value.artifacts[0]); },
+    (value) => { value.artifacts[0].after.sha256 = "b".repeat(64); },
+    (value) => { value.artifacts[0].before.sha256 = "b".repeat(64); },
+    (value) => { value.artifacts[0].after.mode = "120000"; },
+    (value) => { value.artifacts[0].status = "D"; },
+    (value) => { value.artifacts[0].from = "scripts/other.js"; },
+    (value) => { value.artifacts[1].before = value.artifacts[0].before; },
+  ]) {
+    const changed = structuredClone(proof);
+    mutate(changed);
+    assert.equal(isExactWebInstallerCompatibilityPatch(changed), false);
+  }
+  for (const path of [
+    ...proof.artifacts.map((entry) => entry.path),
+    "scripts/build-macos-app.js", "apps/macos/Sources/KeychainMigration.swift",
+    "apps/worker/src/index.ts", "apps/worker/migrations/0042_account_plan.sql",
+    "apps/worker/wrangler.jsonc", "apps/worker/package.json",
+    "apps/worker/package-lock.json", "pnpm-lock.yaml",
+  ]) assert.equal(isAllowedWebReleasePath(path), false, path);
 });
 
 test("web-only preparation records the committed source SHA in its receipt and catches changed output", async (t) => {

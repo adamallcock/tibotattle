@@ -52,6 +52,11 @@ import {
   buildMacOSReleaseCandidate,
   validateMacOSPreviewApp,
 } from "./build-macos-app.js";
+import {
+  MACOS_KEYCHAIN_MIGRATION_HELPER,
+  validateMacOSKeychainMigrationCompatibility,
+  validateMacOSKeychainMigrationSource,
+} from "./macos-keychain-migration-validation.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
@@ -116,6 +121,7 @@ const SPARKLE_NORMALIZED_MACH_O_PATHS = Object.freeze(
 );
 const NORMALIZED_MACH_O_PATHS = new Set([
   ...BASE_NORMALIZED_MACH_O_PATHS,
+  MACOS_KEYCHAIN_MIGRATION_HELPER.executable,
   ...SPARKLE_NORMALIZED_MACH_O_PATHS,
   ...LEGACY_NORMALIZED_MACH_O_PATHS,
 ]);
@@ -664,6 +670,7 @@ function validateManifestPayloadPath(path) {
 }
 
 async function verifyMacOSBuildPayload(appPath, manifest) {
+  const helperRequired = validateMacOSKeychainMigrationCompatibility(manifest);
   const payload = manifest.payload;
   const updaterEnabled = manifest.release?.updater?.enabled === true;
   if (!payload
@@ -690,7 +697,9 @@ async function verifyMacOSBuildPayload(appPath, manifest) {
       );
     }
     previousPath = entry.path;
-    const expectedNormalization = expectedMacOSPayloadNormalization(entry.path);
+    const expectedNormalization = helperRequired
+        && LEGACY_NORMALIZED_MACH_O_PATHS.includes(entry.path)
+      ? "raw" : expectedMacOSPayloadNormalization(entry.path);
     if (!Number.isSafeInteger(entry.bytes)
         || entry.bytes < 0
         || typeof entry.mode !== "string"
@@ -713,7 +722,10 @@ async function verifyMacOSBuildPayload(appPath, manifest) {
       ...SPARKLE_NORMALIZED_MACH_O_PATHS,
     ]
     : BASE_NORMALIZED_MACH_O_PATHS;
-  for (const required of requiredMachOPaths) {
+  for (const required of [
+    ...requiredMachOPaths,
+    ...(helperRequired ? [MACOS_KEYCHAIN_MIGRATION_HELPER.executable] : []),
+  ]) {
     if (!expected.has(required)) {
       fail(
         "Application payload inventory omits required signed code",
@@ -1030,6 +1042,9 @@ export async function inspectMacOSApp(appPath, {
   const plistPath = join(selected, "Contents", "Info.plist");
   await regularPath(plistPath);
   const plist = parsePlist(plistPath);
+  const helperRequired = validateMacOSKeychainMigrationCompatibility(
+    manifest, plist.CFBundleShortVersionString,
+  );
   if (plist.CFBundleIdentifier !== BUNDLE_IDENTIFIER
       || plist.CFBundleExecutable !== PRODUCT_BRAND.executableName
       || !hasAppOpenScheme(plist)
@@ -1047,6 +1062,12 @@ export async function inspectMacOSApp(appPath, {
   }
   if (requireExternalDistribution) {
     const releaseChannel = resolveOperationalReleaseChannel(channel);
+    if (helperRequired || manifest.release?.source !== undefined) {
+      validateMacOSKeychainMigrationSource(manifest.release?.source, {
+        channel: releaseChannel.name,
+        shortVersion: plist.CFBundleShortVersionString,
+      });
+    }
     const centralOrigin = validateProductionOrigin(plist, {
       channel: releaseChannel.name,
       expectedMode: releaseChannel.serviceOriginMode,
@@ -2277,6 +2298,140 @@ function parseMacOSDeveloperIDNativeTrust(signature) {
   });
 }
 
+function keychainMigrationSignatureFailure() {
+  fail(
+    "Keychain migration helper does not preserve the approved legacy reader signing boundary",
+    "MACOS_KEYCHAIN_MIGRATION_SIGNATURE_INVALID",
+  );
+}
+
+function normalizedDesignatedRequirement(value) {
+  return value.replace(/\/\*\s*exists\s*\*\//gu, "")
+    .replace(/\s+/gu, " ").trim()
+    // codesign renders this simple identifier without quotes on some versions.
+    // Canonicalize only the reviewed leading Node token, not arbitrary clauses.
+    .replace(/^identifier node(?= and )/u, 'identifier "node"');
+}
+
+function keychainMigrationCodeDescription(description, identifier) {
+  if (typeof description !== "string" || description.length > 128 * 1024) {
+    keychainMigrationSignatureFailure();
+  }
+  const identifiers = [...description.matchAll(/^Identifier=([^\r\n]+)$/gmu)];
+  const requirements = [...description.matchAll(/^designated => ([^\r\n]+)$/gmu)];
+  if (identifiers.length !== 1 || identifiers[0][1] !== identifier
+      || requirements.length !== 1
+      || !/flags=0x[0-9a-f]+\(runtime\)/iu.test(description)) {
+    keychainMigrationSignatureFailure();
+  }
+  let trust;
+  try {
+    trust = parseMacOSDeveloperIDNativeTrust(description);
+  } catch {
+    keychainMigrationSignatureFailure();
+  }
+  return {
+    ...trust,
+    requirement: normalizedDesignatedRequirement(requirements[0][1]),
+    rawRequirement: requirements[0][1],
+  };
+}
+
+/**
+ * Validate the exact default Developer ID requirement used by the legacy Node
+ * reader, not merely membership in its Team. Inputs are captured code-sign
+ * metadata only; the result never exposes identities or requirements.
+ */
+export function validateMacOSKeychainMigrationSignatureDescriptions({
+  application,
+  node,
+  helper,
+  helperEntitlements,
+} = {}) {
+  const appDescription = keychainMigrationCodeDescription(application, BUNDLE_IDENTIFIER);
+  const nodeDescription = keychainMigrationCodeDescription(node, "node");
+  const helperDescription = keychainMigrationCodeDescription(
+    helper,
+    MACOS_KEYCHAIN_MIGRATION_HELPER.signingIdentifier,
+  );
+  const expectedRequirement = `identifier "node" and anchor apple generic `
+    + "and certificate 1[field.1.2.840.113635.100.6.2.6] "
+    + "and certificate leaf[field.1.2.840.113635.100.6.1.13] "
+    + `and certificate leaf[subject.OU] = "${appDescription.teamIdentifier}"`;
+  const emptyEntitlements = typeof helperEntitlements?.stdout === "string"
+    && helperEntitlements.stdout.length <= 128 * 1024
+    && (helperEntitlements.stdout.trim() === ""
+      || /^\s*(?:<\?xml[^?]*\?>\s*)?(?:<!DOCTYPE plist[^>]*>\s*)?<plist version="1\.0">\s*(?:<dict\s*\/>|<dict>\s*<\/dict>)\s*<\/plist>\s*$/u
+        .test(helperEntitlements.stdout));
+  if (nodeDescription.teamIdentifier !== appDescription.teamIdentifier
+      || helperDescription.teamIdentifier !== appDescription.teamIdentifier
+      || nodeDescription.developerIdAuthority !== appDescription.developerIdAuthority
+      || helperDescription.developerIdAuthority !== appDescription.developerIdAuthority
+      || nodeDescription.requirement !== expectedRequirement
+      || helperDescription.requirement !== nodeDescription.requirement
+      || !emptyEntitlements
+      || typeof helperEntitlements?.stderr !== "string"
+      || helperEntitlements.stderr.length > 128 * 1024
+      || /^\s*(?:warning|error):/imu.test(helperEntitlements.stderr)) {
+    keychainMigrationSignatureFailure();
+  }
+  return Object.freeze({
+    legacyNodeDesignatedRequirementMatched: true,
+    sameDeveloperIDTeam: true,
+    helperHardenedRuntime: true,
+    helperEntitlementsAbsent: true,
+  });
+}
+
+export function verifyMacOSKeychainMigrationSignatures(appPath, {
+  commandRunner = runMacOSReleaseCommand,
+  secrets = [],
+} = {}) {
+  const selected = resolve(appPath);
+  const inspect = (relativePath) => {
+    const result = commandRunner("/usr/bin/codesign", [
+      "-d", "-r-", "--verbose=4", join(selected, ...relativePath.split("/")),
+    ], {
+      env: releaseEnvironment(),
+      failureMessage: "Keychain migration signing metadata is unavailable",
+      secrets,
+    });
+    return `${result.stdout}${result.stderr}`;
+  };
+  // A code-sign diagnostic can contain an identity or requirement even when
+  // codesign fails. Keep this boundary's errors content-free in every case.
+  try {
+    const application = inspect(APP_EXECUTABLE);
+    const node = inspect(NODE_EXECUTABLE);
+    const helper = inspect(MACOS_KEYCHAIN_MIGRATION_HELPER.executable);
+    const helperPath = join(selected, ...MACOS_KEYCHAIN_MIGRATION_HELPER.executable.split("/"));
+    const helperEntitlements = commandRunner("/usr/bin/codesign", [
+      "--display", "--entitlements", "-", "--xml", helperPath,
+    ], {
+      env: releaseEnvironment(),
+      failureMessage: "Keychain migration helper entitlement inspection failed",
+      secrets,
+    });
+    const result = validateMacOSKeychainMigrationSignatureDescriptions({
+      application, node, helper, helperEntitlements,
+    });
+    const requirement = keychainMigrationCodeDescription(node, "node").rawRequirement;
+    for (const relativePath of [NODE_EXECUTABLE, MACOS_KEYCHAIN_MIGRATION_HELPER.executable]) {
+      commandRunner("/usr/bin/codesign", [
+        "--verify", "--strict", `-R=${requirement}`,
+        join(selected, ...relativePath.split("/")),
+      ], {
+        env: releaseEnvironment(),
+        failureMessage: "Keychain migration reader requirement verification failed",
+        secrets: [...secrets, requirement],
+      });
+    }
+    return result;
+  } catch {
+    keychainMigrationSignatureFailure();
+  }
+}
+
 export async function validateInstalledMacOSApp(appPath, {
   channel = "stable",
   expectedBundleIdentifier = null,
@@ -2322,6 +2477,11 @@ export async function validateInstalledMacOSApp(appPath, {
       fail("Installed application is not Developer ID hardened");
     }
     nativeTrust = parseMacOSDeveloperIDNativeTrust(signature);
+    if (validateMacOSKeychainMigrationCompatibility(
+      inspected.buildManifest, inspected.shortVersion,
+    )) {
+      verifyMacOSKeychainMigrationSignatures(inspected.appPath);
+    }
     runMacOSReleaseCommand("/usr/bin/xcrun", [
       "stapler",
       "validate",

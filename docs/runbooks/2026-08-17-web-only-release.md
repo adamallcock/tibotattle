@@ -50,18 +50,29 @@ code, migrations, package-lock files, and deployment configuration. If
 field and unrelated script to remain semantically unchanged; only the exact
 release-lane script entries are allowed.
 
+For the 0.1.17 website update only, the guard recognizes one exact read-only
+installer-validator backport from deployed base
+`304f3d736b6f9451d32a616bf3046ea628e828a3`. It pins the before/after SHA-256 and
+regular-file mode of all three reviewed files (native release core, migration
+artifact validator, and its focused tests). This validates the already-signed
+helper inventory, source seal, and signing boundary. These paths remain outside
+the general allowlist: any other patch, base, missing file, or later edit is
+rejected. Native build/sign/publish paths, Worker runtime, dependencies,
+configuration, and migrations remain excluded.
+
 ## 2. Reuse the existing installer evidence
 
 The site builder still verifies the live HTTPS installer bytes against the
 signed release manifest. Supply the already-published DMG and its matching
-`.release.json` from the release archive; do not rebuild, sign, upload, tag, or
+canonical `release-manifest.json` (or supported matching native `.release.json`)
+from the release archive; do not rebuild, sign, upload, tag, or
 bump the macOS app. The social image must be an approved, absolute-path
 1200×630 PNG outside `.release-build/public-release-site`.
 
 ```bash
 DEPLOYED_SOURCE_COMMIT="<full deployed source SHA>"
 RELEASED_DMG_PATH="/absolute/path/to/TiboTattle-X.Y.Z-macOS-arm64.dmg"
-RELEASED_RELEASE_MANIFEST_PATH="${RELEASED_DMG_PATH}.release.json"
+RELEASED_RELEASE_MANIFEST_PATH="/absolute/path/to/release-manifest.json"
 SOCIAL_IMAGE_PATH="/absolute/path/to/approved-1200x630.png"
 
 npm run product:web-release:prepare -- \

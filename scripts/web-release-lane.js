@@ -63,6 +63,78 @@ const WEB_RELEASE_PACKAGE_SCRIPTS = Object.freeze({
   "product:web-release:test": "node --test test/web-release-lane.test.js",
 });
 
+// One reviewed read-only validator backport for the already-published 0.1.17
+// installer. These paths are NOT added to the general web-release allowlist.
+// Any other base, mode, patch, omission, or later edit remains out of scope.
+const INSTALLER_COMPATIBILITY_BASE = "304f3d736b6f9451d32a616bf3046ea628e828a3";
+const INSTALLER_COMPATIBILITY_PATCH = Object.freeze([
+  {
+    path: "scripts/macos-release-core.js",
+    status: "M",
+    before: "46404fe315c72c5108e92e41aa53709c408399af79e2d43bf2f2f39a90ec841f",
+    after: "65dfb3f8e378948d58b1ffc1dda5d2454387d98df391e897106368124fe06a33",
+  },
+  {
+    path: "scripts/macos-keychain-migration-validation.js",
+    status: "A",
+    before: null,
+    after: "586e929fffd486a68832c1cabad236133fc8e9b6f1577c95c5a15ec8315462ba",
+  },
+  {
+    path: "test/macos-keychain-migration-validation.test.js",
+    status: "A",
+    before: null,
+    after: "50a689c33456d6a2974c576ae0b1e237057a18e701a967bb869df57086236af0",
+  },
+]);
+
+export function isExactWebInstallerCompatibilityPatch({ baseCommit, artifacts }) {
+  if (baseCommit !== INSTALLER_COMPATIBILITY_BASE
+      || !Array.isArray(artifacts)
+      || artifacts.length !== INSTALLER_COMPATIBILITY_PATCH.length) return false;
+  return INSTALLER_COMPATIBILITY_PATCH.every((expected) => {
+    const matches = artifacts.filter((entry) => entry.path === expected.path);
+    if (matches.length !== 1) return false;
+    const [entry] = matches;
+    return entry.status === expected.status && entry.from === undefined
+      && (expected.before === null ? entry.before === null
+        : entry.before?.mode === "100644" && entry.before.sha256 === expected.before)
+      && entry.after?.mode === "100644" && entry.after.sha256 === expected.after;
+  });
+}
+
+function exactInstallerCompatibilityPaths({
+  repositoryRoot, baseCommit, sourceCommit, changes, git,
+}) {
+  const approved = new Set();
+  if (baseCommit !== INSTALLER_COMPATIBILITY_BASE) return approved;
+  const paths = new Set(INSTALLER_COMPATIBILITY_PATCH.map((entry) => entry.path));
+  const selected = changes.filter((entry) => paths.has(entry.path));
+  if (selected.length !== paths.size) return approved;
+  const blob = (commit, path) => {
+    const row = git(repositoryRoot, ["ls-tree", commit, "--", path]).trim();
+    if (row === "") return null;
+    if (!row.startsWith("100644 blob ") || !row.endsWith(`\t${path}`)) return null;
+    return {
+      mode: "100644",
+      sha256: sha256(git(repositoryRoot, ["show", `${commit}:${path}`])),
+    };
+  };
+  try {
+    const artifacts = selected.map((entry) => ({
+      ...entry,
+      before: blob(baseCommit, entry.path),
+      after: blob(sourceCommit, entry.path),
+    }));
+    if (isExactWebInstallerCompatibilityPatch({ baseCommit, artifacts })) {
+      return paths;
+    }
+  } catch {
+    // An unreadable Git object cannot grant an exception.
+  }
+  return approved;
+}
+
 function pathWithin(parent, child) {
   const value = relative(parent, child);
   return value === "" || (value !== ".." && !value.startsWith(`..${sep}`)
@@ -248,8 +320,11 @@ export function inspectWebReleaseScope({
   if (changes.length === 0) {
     throw new Error("Web-only release candidate has no committed changes.");
   }
+  const compatibilityPaths = exactInstallerCompatibilityPaths({
+    repositoryRoot: root, baseCommit, sourceCommit, changes, git,
+  });
   const unsupported = changes.find((change) =>
-    !isAllowedWebReleasePath(change.path)
+    (!isAllowedWebReleasePath(change.path) && !compatibilityPaths.has(change.path))
       || (change.from !== undefined && !isAllowedWebReleasePath(change.from)),
   );
   if (unsupported) {
