@@ -40,6 +40,9 @@ const REVIEWED_SANDBOXED_PRELOADS = new Map([
   ["apps/electron/preload.cjs", "electron"],
   ["apps/electron/recovery-preload.cjs", "electron"],
 ]);
+const REVIEWED_SANDBOXED_PRELOAD_DECLARATION_PATTERN =
+  /^const\s*\{\s*contextBridge\s*,\s*ipcRenderer\s*\}\s*=\s*require\(\s*["']electron["']\s*\)\s*;\s*/u;
+const IMPORT_META_PATTERN = /\bimport\s*\.\s*meta\b/u;
 const EXCLUDED_DIRECTORY_NAMES = new Set([
   ".git",
   ".release-build",
@@ -581,23 +584,48 @@ function staticJsonRequireArgument(argument) {
   return unquoted.endsWith(".json");
 }
 
-function isReviewedSandboxedPreload(relativePath, source) {
+async function isReviewedSandboxedPreload(relativePath, source) {
   const requiredSpecifier = REVIEWED_SANDBOXED_PRELOADS.get(relativePath);
+  const declaration = source.match(
+    REVIEWED_SANDBOXED_PRELOAD_DECLARATION_PATTERN,
+  );
   if (requiredSpecifier === undefined
       || DIRECT_CREATE_REQUIRE_IMPORT_PATTERN.test(source)
       || CREATE_REQUIRE_REFERENCE_PATTERN.test(source)
-      || MODULE_CREATE_REQUIRE_PATTERN.test(source)) {
+      || MODULE_CREATE_REQUIRE_PATTERN.test(source)
+      || requiredSpecifier !== "electron"
+      || declaration === null
+      || IMPORT_META_PATTERN.test(source)) {
     CREATE_REQUIRE_REFERENCE_PATTERN.lastIndex = 0;
     MODULE_CREATE_REQUIRE_PATTERN.lastIndex = 0;
     return false;
   }
   CREATE_REQUIRE_REFERENCE_PATTERN.lastIndex = 0;
   MODULE_CREATE_REQUIRE_PATTERN.lastIndex = 0;
+  if (/\brequire\b/u.test(source.slice(declaration[0].length))) {
+    return false;
+  }
   DIRECT_REQUIRE_CALL_PATTERN.lastIndex = 0;
   const calls = [...source.matchAll(DIRECT_REQUIRE_CALL_PATTERN)];
   DIRECT_REQUIRE_CALL_PATTERN.lastIndex = 0;
-  return calls.length === 1
-    && calls[0][1].trim() === JSON.stringify(requiredSpecifier);
+  if (
+    calls.length !== 1
+    || calls[0][1].trim() !== JSON.stringify(requiredSpecifier)
+  ) {
+    return false;
+  }
+  // The exception is intentionally a CommonJS bridge with one fixed require,
+  // so even a valid-looking preload must not gain static or dynamic ESM
+  // imports that bypass this allowlist. The normal import graph still runs
+  // below for the accepted file; this check only rejects the exception shape.
+  try {
+    const imports = await extractEsmImports(source, {
+      sourceName: relativePath,
+    });
+    return imports.length === 0;
+  } catch {
+    return false;
+  }
 }
 
 function esmCommonJsLoadingIssue(source) {
@@ -1252,28 +1280,33 @@ export async function checkArchitectureBoundaries({
 
   for (const importer of files) {
     const source = await readFile(join(absoluteRoot, importer), "utf8");
+    const reviewedSandboxedPreload = COMMONJS_SOURCE_EXTENSIONS.has(extname(importer))
+      && await isReviewedSandboxedPreload(importer, source);
     if (COMMONJS_SOURCE_EXTENSIONS.has(extname(importer))) {
-      if (isReviewedSandboxedPreload(importer, source)) continue;
-      detectedViolations.push({
-        category: "commonjs_production_source",
-        importer,
-        kind: "commonjs",
-        line: 1,
-        specifier: "<commonjs-source>",
-        target: importer,
-      });
-      continue;
+      if (!reviewedSandboxedPreload) {
+        detectedViolations.push({
+          category: "commonjs_production_source",
+          importer,
+          kind: "commonjs",
+          line: 1,
+          specifier: "<commonjs-source>",
+          target: importer,
+        });
+        continue;
+      }
     }
-    const commonJsLoadingIssue = esmCommonJsLoadingIssue(source);
-    if (commonJsLoadingIssue) {
-      detectedViolations.push({
-        category: "esm_commonjs_loading",
-        importer,
-        kind: "commonjs-loading",
-        line: commonJsLoadingIssue.line,
-        specifier: commonJsLoadingIssue.specifier,
-        target: "<runtime-commonjs-loader>",
-      });
+    if (!reviewedSandboxedPreload) {
+      const commonJsLoadingIssue = esmCommonJsLoadingIssue(source);
+      if (commonJsLoadingIssue) {
+        detectedViolations.push({
+          category: "esm_commonjs_loading",
+          importer,
+          kind: "commonjs-loading",
+          line: commonJsLoadingIssue.line,
+          specifier: commonJsLoadingIssue.specifier,
+          target: "<runtime-commonjs-loader>",
+        });
+      }
     }
     const imports = await extractEsmImports(source, {
       sourceName: importer,

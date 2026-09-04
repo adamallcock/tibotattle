@@ -26,10 +26,23 @@ const PLATFORM_PUBLIC_EXPORTS = Object.freeze([
   "WINDOWS_PRODUCTION_READINESS",
   "WINDOWS_PRODUCTION_READINESS_CONTRACT_VERSION",
   "WINDOWS_PRODUCTION_READINESS_FACTS",
+  "WINDOWS_PROTECTED_STATE_STORE_CONTRACT_VERSION",
+  "WINDOWS_PROTECTED_STATE_STORE_DEFAULT_MAX_BYTES",
+  "WINDOWS_QUALIFICATION_MODE_ACCOUNTING_SOURCE_MODE",
+  "WINDOWS_QUALIFICATION_MODE_CONTRACT_VERSION",
+  "WINDOWS_QUALIFICATION_MODE_ENVIRONMENT_VALUE",
+  "WINDOWS_QUALIFICATION_MODE_ENVIRONMENT_VARIABLE",
+  "WINDOWS_QUALIFICATION_MODE_PRODUCTION_SAFE",
+  "WINDOWS_QUALIFICATION_MODE_QUALIFICATION_ONLY",
+  "WINDOWS_QUALIFICATION_MODE_TEST_LANE",
   "WindowsProductionReadinessError",
+  "WindowsProtectedStateStoreError",
+  "WindowsQualificationModeError",
   "assertOwnerControlledDirectory",
+  "assertWindowsFilesystemProductionSafe",
   "assertWindowsProductionBackend",
   "assertWindowsProductionReadiness",
+  "assertWindowsQualificationResourceAuthority",
   "contributionDeviceDurableAddArguments",
   "contributionDeviceReaderRequirement",
   "contributionDeviceReaderRequirementVerificationArguments",
@@ -48,8 +61,11 @@ const PLATFORM_PUBLIC_EXPORTS = Object.freeze([
   "createOwnerOnlyExportWorkspaceLeaseContext",
   "createOwnerOnlyExportWorkspaceStorageContext",
   "createTelemetryV11Envelope",
+  "createWindowsFilesystemAdapter",
   "createWindowsProductionCapabilityBackend",
   "createWindowsProductionReadinessAttestation",
+  "createWindowsProtectedStateStore",
+  "createWindowsQualificationModeContext",
   "defaultActivityMarkerFile",
   "defaultExportSecretFile",
   "defaultExportStateDirectory",
@@ -73,6 +89,13 @@ const PLATFORM_PUBLIC_EXPORTS = Object.freeze([
   "exportIdentityKeychainCapabilitiesForEnvironment",
   "exportIdentityKeychainItemPresenceByAttributes",
   "inspectParticipantSecret",
+  "isWindowsFilesystemAdapter",
+  "isWindowsFilesystemIdentity",
+  "isWindowsProtectedStateStore",
+  "isWindowsProtectedStateStoreError",
+  "isWindowsQualificationModeContext",
+  "isWindowsQualificationModeContextFor",
+  "isWindowsQualificationProtectedStateStoreFor",
   "keytarSignedBindingRequirement",
   "keytarSignedBindingVerificationArguments",
   "legacyWorkingDirectorySecretFile",
@@ -102,12 +125,15 @@ const PLATFORM_PUBLIC_EXPORTS = Object.freeze([
 test("platform adapters expose one exact reviewed public API", () => {
   assert.deepEqual(Object.keys(platform).sort(), [...PLATFORM_PUBLIC_EXPORTS]);
   for (const privateWindowsAdapter of [
+    "KEYTAR_WIN32_X64_SHA256",
     "createWindowsCredentialManagerBackend",
-    "createWindowsFilesystemAdapter",
+    "loadAuditedWindowsCredentialBinding",
     "loadWindowsFilesystemBinding",
+    "runWindowsCredentialManagerProbe",
   ]) {
     assert.equal(Object.hasOwn(platform, privateWindowsAdapter), false);
   }
+  assert.equal(typeof platform.createWindowsFilesystemAdapter, "function");
 });
 
 test("local export resource context injects runtime ports and fixed marker limits", async () => {

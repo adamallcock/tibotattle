@@ -427,6 +427,93 @@ test("rejects CommonJS production modules instead of missing literal, computed, 
   );
 });
 
+test("allows only the exact sandboxed Electron preload shape", async () => {
+  await withFixtureTree(
+    {
+      "apps/electron/preload.cjs": [
+        'const { contextBridge, ipcRenderer } = require("electron");',
+        "contextBridge.exposeInMainWorld('bounded', { invoke: () => ipcRenderer.invoke('fixed') });",
+        "",
+      ].join("\n"),
+    },
+    async (rootDirectory) => {
+      const result = await checkArchitectureBoundaries({
+        baseline: [],
+        rootDirectory,
+      });
+      assert.equal(result.ok, true, formatArchitectureBoundaryReport(result));
+    },
+  );
+
+  await withFixtureTree(
+    {
+      "apps/electron/not-a-preload.cjs":
+        'const { contextBridge, ipcRenderer } = require("electron");',
+    },
+    async (rootDirectory) => {
+      const result = await checkArchitectureBoundaries({
+        baseline: [],
+        rootDirectory,
+      });
+      assert.deepEqual(
+        result.violations.map(({ category, importer }) => ({ category, importer })),
+        [{
+          category: "commonjs_production_source",
+          importer: "apps/electron/not-a-preload.cjs",
+        }],
+      );
+    },
+  );
+
+  for (const unsafeSource of [
+    [
+      'const { contextBridge, ipcRenderer } = require("electron");',
+      'import "./extra-static.js";',
+    ].join("\n"),
+    [
+      'const { contextBridge, ipcRenderer } = require("electron");',
+      'const extra = import("./extra-dynamic.js");',
+    ].join("\n"),
+    [
+      'const { contextBridge, ipcRenderer } = require("electron");',
+      "const extra = import(runtimePath);",
+    ].join("\n"),
+    [
+      'const { contextBridge, ipcRenderer } = require("electron");',
+      'const { createRequire } = require("node:module");',
+    ].join("\n"),
+    [
+      'const { contextBridge, ipcRenderer } = require("electron");',
+      'const fs = require("node:fs");',
+    ].join("\n"),
+    [
+      'const { contextBridge, ipcRenderer } = require("electron");',
+      'const target = "node:fs"; const fs = require(target);',
+    ].join("\n"),
+    [
+      'const { contextBridge, ipcRenderer } = require("electron");',
+      'const load = require; load("node:fs");',
+    ].join("\n"),
+  ]) {
+    await withFixtureTree(
+      { "apps/electron/preload.cjs": unsafeSource },
+      async (rootDirectory) => {
+        const result = await checkArchitectureBoundaries({
+          baseline: [],
+          rootDirectory,
+        });
+        assert.deepEqual(
+          result.violations.map(({ category, importer }) => ({ category, importer })),
+          [{
+            category: "commonjs_production_source",
+            importer: "apps/electron/preload.cjs",
+          }],
+        );
+      },
+    );
+  }
+});
+
 test("rejects ESM CommonJS loaders before they can hide cross-app dependencies", async () => {
   await withFixtureTree(
     {
