@@ -481,8 +481,8 @@
     "resourcePolicySourceSha256": "d9748895468534062e9c8c436db75cbf5acf4ccf54f84319db37e88197627870",
     "resourcePolicyValuesSha256": "3cbe7853c8f75e96912885f64ba4ad1aeb13aff8a22e4ffbd51806b27c73b418",
     "schemaModuleSha256": "594d035e641e87b29db4027dca35157f8225fd5621816d67d5d9f25825468bbf",
-    "workloadCodeFileCount": 359,
-    "workloadCodeSha256": "c3060c6a243e67dd8d04733284d43daf068926159f78a7d8edebec9bc70ae52c"
+    "workloadCodeFileCount": 362,
+    "workloadCodeSha256": "76ee96306c297f7e77279e7dc382411c801f6a020a0c26e61864f698d3e782af"
   },
   "determinism": {
     "comparisons": {
@@ -500,8 +500,8 @@
     "projectionVersion": "g1-r7-release-deterministic-projection-v0.1",
     "runCount": 2,
     "runProjectionSha256es": [
-      "84124dfd35381d6e8d790f3b0ab54f9649980e19350502a5a3417f90ed47cdd7",
-      "84124dfd35381d6e8d790f3b0ab54f9649980e19350502a5a3417f90ed47cdd7"
+      "f5f41417be48a65c51cbd9b5075ef9876027d415f0f0957864fc2e8406d1936e",
+      "f5f41417be48a65c51cbd9b5075ef9876027d415f0f0957864fc2e8406d1936e"
     ],
     "status": "partial"
   },
@@ -822,16 +822,16 @@
       "decodedBytes": 0,
       "durablePeakRssBytes": 0,
       "encodedBytes": 0,
-      "externalPeakRssBytes": 349372416,
-      "externalRssSampleCount": 64,
+      "externalPeakRssBytes": 359120896,
+      "externalRssSampleCount": 62,
       "externalRssSampleFailureCount": 0,
       "filesystem": {
         "afterBytes": 0,
         "beforeBytes": 0,
-        "sampledHighWaterBytes": 30868083
+        "sampledHighWaterBytes": 30808895
       },
       "outputRecords": 0,
-      "parentElapsedMs": 3224,
+      "parentElapsedMs": 3142,
       "runCount": 2,
       "sourceBytes": 0,
       "sourceFiles": 0,
@@ -894,7 +894,7 @@
     }
   },
   "protocolVersion": "g1-r7-release-evidence-v0.1",
-  "receiptSha256": "769e63afa97f06438afc73a107547092e8e565c725a150112f4da012ac4cdd1e",
+  "receiptSha256": "345d443e84f28bceee9c5033429c4afe175b44a37c509943e4db014c517538b0",
   "runtimeProvenance": {
     "architecture": "arm64",
     "elapsedClock": "parent_monotonic",

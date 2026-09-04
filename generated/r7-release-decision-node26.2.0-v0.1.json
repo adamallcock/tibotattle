@@ -481,8 +481,8 @@
     "resourcePolicySourceSha256": "d9748895468534062e9c8c436db75cbf5acf4ccf54f84319db37e88197627870",
     "resourcePolicyValuesSha256": "3cbe7853c8f75e96912885f64ba4ad1aeb13aff8a22e4ffbd51806b27c73b418",
     "schemaModuleSha256": "594d035e641e87b29db4027dca35157f8225fd5621816d67d5d9f25825468bbf",
-    "workloadCodeFileCount": 359,
-    "workloadCodeSha256": "c3060c6a243e67dd8d04733284d43daf068926159f78a7d8edebec9bc70ae52c"
+    "workloadCodeFileCount": 362,
+    "workloadCodeSha256": "76ee96306c297f7e77279e7dc382411c801f6a020a0c26e61864f698d3e782af"
   },
   "determinism": {
     "comparisons": {
@@ -849,7 +849,7 @@
         "decision": "unresolved",
         "dimension": "source_bytes",
         "exactBoundaryValue": "not_identified",
-        "realHistoryValue": 26388216585,
+        "realHistoryValue": 12068007861,
         "selectionBasis": "not_identified",
         "unit": "bytes"
       },
@@ -909,7 +909,7 @@
         "decision": "unresolved",
         "dimension": "output_records_export_set",
         "exactBoundaryValue": "not_identified",
-        "realHistoryValue": 436557,
+        "realHistoryValue": 456918,
         "selectionBasis": "not_identified",
         "unit": "records"
       },
@@ -929,7 +929,7 @@
         "decision": "unresolved",
         "dimension": "export_set_decoded_bytes",
         "exactBoundaryValue": "not_identified",
-        "realHistoryValue": 518442273,
+        "realHistoryValue": 541586222,
         "selectionBasis": "not_identified",
         "unit": "bytes"
       },
@@ -939,7 +939,7 @@
         "decision": "unresolved",
         "dimension": "export_set_encoded_bytes",
         "exactBoundaryValue": "not_identified",
-        "realHistoryValue": 29091382,
+        "realHistoryValue": 30253881,
         "selectionBasis": "not_identified",
         "unit": "bytes"
       },
@@ -989,7 +989,7 @@
         "decision": "unresolved",
         "dimension": "elapsed_time",
         "exactBoundaryValue": "not_identified",
-        "realHistoryValue": 367068,
+        "realHistoryValue": 227596,
         "selectionBasis": "not_identified",
         "unit": "milliseconds"
       },
@@ -999,7 +999,7 @@
         "decision": "unresolved",
         "dimension": "rss",
         "exactBoundaryValue": "not_identified",
-        "realHistoryValue": 1308606464,
+        "realHistoryValue": 1002471424,
         "selectionBasis": "not_identified",
         "unit": "bytes"
       }
@@ -1007,20 +1007,20 @@
     "headroomBasisPoints": 2000,
     "inputReceipts": {
       "materializedBoundaries": {
-        "node24Sha256": "c816c95d1780f1043d1171a5f7af73a16f927914a871e6b08e79f53970c9a689",
-        "node26Sha256": "769e63afa97f06438afc73a107547092e8e565c725a150112f4da012ac4cdd1e"
+        "node24Sha256": "8801869b7301468711a037e41bcda4651bf636d55be235cf01f433953694b91b",
+        "node26Sha256": "345d443e84f28bceee9c5033429c4afe175b44a37c509943e4db014c517538b0"
       },
       "realLocalHistory": {
-        "node24Sha256": "225b899dbb20fbed61a52eb066b97dafc265da8382a6523e5ede1cc008d1e167",
-        "node26Sha256": "d23ee69eacc027fbffd10ae6c10dd2e8e0b1853e9a86d02574ae64b18440c3a4"
+        "node24Sha256": "b5fc7bd2f2a2e6b37d158b9b8aa4602e7bbc8a94594f1feef581acbc3dfd112d",
+        "node26Sha256": "1a3cdf66cc6191e434c46cafe8f3d2d070cbdf0d4be2da1f6d2815ef85942b6e"
       },
       "syntheticPressure": {
-        "node24Sha256": "35167d155509147b3207355c423674f5d3c0a93714ea4c6cc94b1097a605785a",
-        "node26Sha256": "f08418541440c78ff836889b8fec927f0430aa242aa4462f7fa76ce4ac498774"
+        "node24Sha256": "92d970f89201a09e809bce67e77b932b81fd246b5d88798dfdcbdbf102e85cfc",
+        "node26Sha256": "e0d6352cd3e575d1504ad95ce37d0ba5b16ff7907a14ce0d21af022dc3d284f4"
       },
       "syntheticSemantics": {
-        "node24Sha256": "a73a433426a3b95d13c14d8558d7f5165fd0c1a84aac76d77cc55e2b3d81ad5b",
-        "node26Sha256": "0a65b3053fe4ec4d6ec500624c154fad6f32237e303eb232db5a6088386df511"
+        "node24Sha256": "170d941dfb3687612cafe9cceece768b30e3151568588736fdfcc61b0d8b2739",
+        "node26Sha256": "6d551761eb06d3f8ec3e82100c3cfb03bc3eb63ed262ebbd2e0c5e9db8029266"
       }
     },
     "kind": "release_decision",
@@ -1039,7 +1039,7 @@
     "singleMachineLimitation": true
   },
   "protocolVersion": "g1-r7-release-evidence-v0.1",
-  "receiptSha256": "57d80e8998237e22fded255760269efd93b6a963246881ca497d7bd650153bb0",
+  "receiptSha256": "68aa2d38549c1e900c2d77fddd98f2df95c573dbb44902b8153c512140cfe616",
   "runtimeProvenance": {
     "architecture": "arm64",
     "elapsedClock": "parent_monotonic",
