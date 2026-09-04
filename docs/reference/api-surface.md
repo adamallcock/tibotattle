@@ -140,6 +140,7 @@ is never an arbitrary local proxy.
 | Method | Path | Caller | Authority | Storage or network effect | Owner |
 | --- | --- | --- | --- | --- | --- |
 | `GET` | `/api/local/health` | Dashboard/native shell | Loopback read | Reports companion/snapshot readiness and enabled local capabilities. | Local companion |
+| `GET` | `/api/local/desktop-status` | Electron shell | Loopback read | Projects closed lifecycle, allowance and notification evidence without account identifiers or filesystem paths; available before the first snapshot. | Local companion |
 | `GET` | `/api/local/diagnostics/contribution` | Dashboard/native shell | Loopback read | Reads a content-free local support projection. | Diagnostics |
 | `POST` | `/api/local/diagnostics/note` | Native shell | Loopback mutation | Records a bounded, fixed-vocabulary diagnostic reference; no prompt or path content. | Diagnostics |
 | `GET`, `POST` | `/api/local/identity/hosted-signin-handoff` | Dashboard/native shell | Loopback mutation | Inspects, stores, or clears the bounded local OAuth restart handle. | Hosted identity |

@@ -39,7 +39,7 @@ Those remain separate verification gates in the relevant runbooks.
 
 | Surface | Boundary | Implemented surface |
 |---|---|---:|
-| Local companion API | Browser/native shell → loopback Node companion | 26 paths, 28 method/path operations |
+| Local companion API | Browser/native shell → loopback Node companion | 27 paths, 29 method/path operations |
 | Local report pages | Browser → fixed loopback report allowlist | 4 `GET` paths |
 | Central public relay | Loopback companion → configured hosted origin | 1 fixed `GET` path |
 | Participant relay | Loopback companion → configured hosted origin | 9 paths, 9 method/path operations |
@@ -148,7 +148,7 @@ enforce their closed JSON shape and byte ceiling.
 
 `GET /api/local/timeline/window-breakdown` is the sole local API route that
 accepts a query string, and only `from` and `to` as bounded base-ten safe
-integers. Health, contribution diagnostics, diagnostic notes, and the
+integers. Health, desktop status, contribution diagnostics, diagnostic notes, and the
 hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
 
 ### Local route inventory
@@ -156,6 +156,7 @@ hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/local/health` | Companion readiness, refresh state, schema versions, and configured capabilities |
+| `GET` | `/api/local/desktop-status` | Closed lifecycle, allowance and notification evidence for the Electron shell, available before the first snapshot and without account identifiers or filesystem paths |
 | `GET` | `/api/local/diagnostics/contribution` | Closed, path-free contribution support diagnostics for the native shell |
 | `POST` | `/api/local/diagnostics/note` | Record one bounded fixed-vocabulary local diagnostic note |
 | `GET`, `POST` | `/api/local/identity/hosted-signin-handoff` | Read or update the bounded local recovery handle for an in-flight hosted sign-in |
