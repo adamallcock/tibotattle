@@ -51,9 +51,9 @@ test("checked-in staging configuration is closed and intentionally unprovisioned
 
 test("migration inventory is exact and rejects missing or unreviewed files", () => {
   assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-3), [
-    "0042_analytical_input_fencing.sql",
     "0043_attribution_transport_staging.sql",
     "0044_attribution_domain_activation.sql",
+    "0045_accountless_enrollment_ledger.sql",
   ]);
   const inventory = structuredClone(EXPECTED_STAGING_MIGRATIONS);
   assert.deepEqual(validateStagingMigrationInventory(inventory), {
@@ -93,11 +93,25 @@ test("attribution metadata probe checks every new guard, view, index and persist
       "SELECT type, name FROM sqlite_master WHERE sql IS NOT NULL",
     ).all().map(({ type, name }) => `${type}:${name}`);
     let oldObjects;
+    let accountlessObjectsBefore;
     for (const name of EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB) {
       if (name.startsWith("0042_")) oldObjects = new Set(objectNames());
+      if (name.startsWith("0045_")) {
+        accountlessObjectsBefore = new Set(objectNames());
+      }
       database.exec(readFileSync(join(workerDirectory, "migrations", name), "utf8"));
     }
-    assert.deepEqual(objectNames().filter((name) => !oldObjects.has(name)).sort(),
+    const accountlessObjects = objectNames()
+      .filter((name) => !accountlessObjectsBefore.has(name))
+      .sort();
+    assert.deepEqual(accountlessObjects, [
+      "index:accountless_enrollment_ledger_state",
+      "table:accountless_enrollment_issuance",
+      "table:accountless_enrollment_ledger",
+    ]);
+    assert.deepEqual(objectNames()
+      .filter((name) => !oldObjects.has(name) && !accountlessObjects.includes(name))
+      .sort(),
       ATTRIBUTION_SCHEMA_OBJECTS.map(([type, name]) => `${type}:${name}`).sort());
     assert.deepEqual({ ...database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get() }, {
       attribution_objects: 1,

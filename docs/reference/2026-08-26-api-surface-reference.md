@@ -43,7 +43,7 @@ Those remain separate verification gates in the relevant runbooks.
 | Local report pages | Browser → fixed loopback report allowlist | 4 `GET` paths |
 | Central public relay | Loopback companion → configured hosted origin | 1 fixed `GET` path |
 | Participant relay | Loopback companion → configured hosted origin | 9 paths, 9 method/path operations |
-| Hosted Worker API | Internet/native collector → Cloudflare Worker | 35 API paths, 36 method/path operations |
+| Hosted Worker API | Internet/native collector → Cloudflare Worker | 36 API paths, 37 method/path operations |
 | Deliberate negative Worker route | Internet → fixed non-API interception | 1 always-`404` path |
 | Native/browser bridge | WKWebView ↔ macOS shell | 4 message handlers, 4 DOM events, 1 fixed URL scheme |
 | Process protocols | Native shell, companion, analysis owners ↔ child/worker | 8 explicit runtime protocol families |
@@ -303,6 +303,9 @@ Authority vocabulary:
 - **Handoff / reattachment** — a Handoff proof establishes identity; an
   identity already bound to a participant reattaches that participant. It does
   not accept a recovery code.
+- **Accountless enrollment** — a bounded native-installation request records a
+  versioned enrollment-only ledger row keyed by the stable device ID and its
+  256-bit secret hash. It does not create participant or upload authority.
 - **Session** — hardened hosted cookie; mutations also require same-origin
   CSRF authority.
 - **Pairing code** — an expiring, one-use claim minted under Session authority
@@ -324,6 +327,7 @@ Authority vocabulary:
 | `GET` | `/api/health` | Public | Service posture and declared capabilities; not dependency readiness |
 | `GET` | `/api/ready` | Public | D1, lifecycle, reconciliation, rebuild, and upload-budget readiness |
 | `POST` | `/api/v1/enroll` | Handoff / reattachment | Consume a one-use identity proof and create a participant or reattach the identity's existing participant; recovery codes are not accepted |
+| `POST` | `/api/v1/accountless/enrollment` | Accountless enrollment | Record one bounded, versioned enrollment-only installation row when the synthetic gate is enabled; exact replays are idempotent and no participant, session, pairing, device credential, upload authority, or community eligibility is created |
 | `POST` | `/api/v1/internal/release/appcast` | Operator | Validate and atomically publish the exact Sparkle appcast object |
 | `POST` | `/api/v1/identity/google/start` | Handoff | Create state, binding, PKCE material, and a Google authorization URL |
 | `GET` | `/api/v1/identity/google/callback` | Handoff | State-bound Google OAuth callback and server-side token exchange |

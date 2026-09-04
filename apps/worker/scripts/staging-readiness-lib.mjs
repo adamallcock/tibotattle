@@ -90,6 +90,10 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     "0042_analytical_input_fencing.sql",
     "0043_attribution_transport_staging.sql",
     "0044_attribution_domain_activation.sql",
+    // Accountless enrollment remains an enrollment-only ledger in this
+    // tranche. It creates no participant, upload authority, or eligibility
+    // rows and is disabled by default at the Worker route.
+    "0045_accountless_enrollment_ledger.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",

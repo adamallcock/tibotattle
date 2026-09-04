@@ -23,6 +23,13 @@ import {
   type BoundedBodyReadPolicy,
 } from "./bounded-body";
 import {
+  ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES,
+  configuredAccountlessEnrollmentMode,
+  enrollAccountlessDevice,
+  parseAccountlessEnrollmentJson,
+  type AccountlessEnrollmentRequest,
+} from "./accountless-enrollment";
+import {
   assertAccountScopedLocalPreview,
   configuredAccountScopedIngestMode,
 } from "./account-scoped-ingest";
@@ -336,6 +343,43 @@ async function readBoundedJson(
   }
 }
 
+/**
+ * The accountless enrollment body is a small closed contract. Keep its cap
+ * independent from contribution envelopes so a future upload schema change
+ * cannot widen this unauthenticated admission boundary accidentally.
+ */
+async function readBoundedAccountlessJson(
+  request: Request,
+): Promise<AccountlessEnrollmentRequest> {
+  const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
+  if (contentType !== "application/json") {
+    throw new ApiError(415, "CONTENT_TYPE_INVALID");
+  }
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw new ApiError(400, "BODY_INVALID");
+    }
+    if (length > ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES) {
+      throw new ApiError(413, "BODY_TOO_LARGE");
+    }
+  }
+  const combined = await readBoundedRequestBody(
+    request,
+    ACCOUNTLESS_ENROLLMENT_MAX_REQUEST_BYTES,
+    CONTROL_BODY_READ_POLICY,
+  );
+  try {
+    const raw = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false })
+      .decode(combined);
+    return parseAccountlessEnrollmentJson(raw);
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(400, "BODY_INVALID");
+  }
+}
+
 const DEVICE_UPLOAD_AUTHORIZATION_HEADER =
   /^Upload um_device_upload_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/u;
 
@@ -423,6 +467,39 @@ function assertWorkerRouteMethod(
   if (!route.methods.includes(request.method as WorkerRouteMethod)) {
     methodNotAllowed(route.methods);
   }
+}
+
+async function handleAccountlessEnrollment(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  // Accountless enrollment has no ambient browser authority. Reject an
+  // existing participant cookie rather than allowing a browser session to be
+  // mistaken for the installation's stable device proof.
+  if (hasSessionCookie(request.headers.get("cookie"))) {
+    throw new ApiError(401, "AUTH_INVALID");
+  }
+  if (configuredAccountlessEnrollmentMode(env) !== "enabled") {
+    throw new ApiError(503, "ACCOUNTLESS_ENROLLMENT_DISABLED");
+  }
+  assertAdmissionBindings(env);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "enrollment");
+  await assertAttemptAllowed(
+    env.ENROLLMENT_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "enrollment",
+  );
+  const body = await readBoundedAccountlessJson(request);
+  const result = await enrollAccountlessDevice(
+    env.USAGE_MONITOR_DB,
+    // The bounded reader performs duplicate-key rejection and the helper
+    // validates the closed request shape; no raw body or secret is logged.
+    body,
+  );
+  return jsonResponse(result.response, result.status);
 }
 
 function allowedHeader(error: ApiError): HeadersInit | undefined {
@@ -3354,6 +3431,8 @@ async function routeApi(
       return handleRetiredAppleDomainAssociation();
     case "enroll":
       return handleEnroll(request, env);
+    case "accountless_enrollment":
+      return handleAccountlessEnrollment(request, env);
     case "sparkle_appcast_guard":
       return handleSparkleAppcastGuard(request, env);
     case "identity_google_start":
@@ -3650,6 +3729,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
     const expectedContainment = [
       "COLLECTION_ENROLLMENT_DISABLED",
+      "ACCOUNTLESS_ENROLLMENT_DISABLED",
       "UPLOAD_REGISTRATION_DISABLED",
       "PROCESSING_DISABLED",
       "PUBLICATION_DISABLED",

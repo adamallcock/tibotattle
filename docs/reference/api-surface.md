@@ -24,6 +24,7 @@ actions.
 | --- | --- |
 | Public | No participant credential; bounded admission and publication controls can still apply. |
 | Enrollment | Same-origin enrollment plus the configured identity or invitation proof. |
+| Accountless enrollment | Native installation enrollment proof with a bounded device-hash body and no ambient participant/session authority. |
 | Handoff | Short-lived, state-bound hosted identity handoff; provider callbacks terminate at the Worker. |
 | Session | Secure, HTTP-only participant session cookie and CSRF on mutations. |
 | Device | Rotating device bearer stored by the native app in the platform credential store. |
@@ -47,6 +48,7 @@ site.
 | `GET` | `/api/health` | App and operator probes | Public | Reads D1, deletion ledger, R2, ingress state, controls, and contract configuration; no mutation. | Worker operations |
 | `GET` | `/api/ready` | Deployment probes | Public | Reads lifecycle, retention, reconciliation, and rebuild readiness; no mutation. | Worker operations |
 | `POST` | `/api/v1/enroll` | Website or loopback relay | Enrollment | Validates identity/consent, creates or reattaches a D1 participant, and may bootstrap a device pairing. | Identity and contribution |
+| `POST` | `/api/v1/accountless/enrollment` | Native installation | Accountless enrollment | When the synthetic accountless gate is enabled, atomically records one versioned enrollment-only ledger row keyed by device ID and a 256-bit device-secret hash. It creates no participant, session, pairing, device credential, upload authority, identity link, or community eligibility. | Accountless enrollment pilot |
 | `POST` | `/api/v1/internal/release/appcast` | Release publisher | Operator | Authenticated conditional appcast write to R2 with nonce/replay state in D1. | Release operations |
 | `POST` | `/api/v1/identity/google/start` | Website or loopback relay | Handoff | Creates a short-lived D1 handoff and returns the Google authorization URL. | Hosted identity |
 | `GET` | `/api/v1/identity/google/callback` | Google | Handoff | Exchanges the provider code, verifies identity, and completes the bounded D1 handoff. | Hosted identity |

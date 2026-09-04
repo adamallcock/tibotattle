@@ -315,7 +315,7 @@ test("release preflight applies both local migration streams, checks schema, and
   assert.equal(result.checks.deletionLedgerSchemaPresent, true);
   assert.equal(result.checks.collectionControlsCoherent, true);
   assert.equal(result.checks.isolatedStateCleaned, true);
-  assert.equal(result.evidence.migrationWindow, "0001-0044");
+  assert.equal(result.evidence.migrationWindow, "0001-0045");
   assert.ok(statePath);
   await assert.rejects(access(statePath));
   assert.equal(calls.filter((args) => args.includes("migrations")).length, 4);

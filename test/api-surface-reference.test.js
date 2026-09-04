@@ -116,7 +116,7 @@ function workerRoutePolicy(source) {
   const fieldCount = [...block.matchAll(/\bpathname\s*:/gu)].length;
   assert.equal(entries.length, fieldCount, "every Worker route needs method and authority metadata");
   const authorities = new Set([
-    "none", "public", "enrollment", "handoff", "recovery", "session",
+    "none", "public", "enrollment", "accountless_enrollment", "handoff", "recovery", "session",
     "device", "upload", "pairing_code", "admin", "operator",
   ]);
   for (const entry of entries) {
@@ -233,7 +233,7 @@ test("both maintained API references cover every registered HTTP boundary", asyn
   const centralPolicy = centralRoutePolicy(central);
   const participantPolicy = participantRelayPolicy(participant);
 
-  assert.equal(workerPolicy.length, 36, "review Worker route-count changes");
+  assert.equal(workerPolicy.length, 37, "review Worker route-count changes");
   assert.equal(localPolicy.length, 26, "review local route-count changes");
   assert.equal(reportPolicy.length, 4, "review fixed report-count changes");
   assert.equal(centralPolicy.length, 1, "review central relay-count changes");
