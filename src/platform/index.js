@@ -32,6 +32,35 @@ export {
   createWindowsProductionReadinessAttestation,
 } from "./windows-production-readiness.js";
 export {
+  assertWindowsFilesystemProductionSafe,
+  createWindowsFilesystemAdapter,
+  isWindowsFilesystemAdapter,
+  isWindowsFilesystemIdentity,
+} from "./windows-filesystem.js";
+export {
+  assertWindowsQualificationResourceAuthority,
+  createWindowsQualificationModeContext,
+  isWindowsQualificationModeContext,
+  isWindowsQualificationModeContextFor,
+  WINDOWS_QUALIFICATION_MODE_ACCOUNTING_SOURCE_MODE,
+  WINDOWS_QUALIFICATION_MODE_CONTRACT_VERSION,
+  WINDOWS_QUALIFICATION_MODE_ENVIRONMENT_VARIABLE,
+  WINDOWS_QUALIFICATION_MODE_ENVIRONMENT_VALUE,
+  WINDOWS_QUALIFICATION_MODE_PRODUCTION_SAFE,
+  WINDOWS_QUALIFICATION_MODE_QUALIFICATION_ONLY,
+  WINDOWS_QUALIFICATION_MODE_TEST_LANE,
+  WindowsQualificationModeError,
+} from "./windows-qualification-mode.js";
+export {
+  WINDOWS_PROTECTED_STATE_STORE_CONTRACT_VERSION,
+  WINDOWS_PROTECTED_STATE_STORE_DEFAULT_MAX_BYTES,
+  WindowsProtectedStateStoreError,
+  createWindowsProtectedStateStore,
+  isWindowsProtectedStateStore,
+  isWindowsProtectedStateStoreError,
+  isWindowsQualificationProtectedStateStoreFor,
+} from "./windows-protected-state-store.js";
+export {
   CONTRIBUTION_DEVICE_READER_CODE_IDENTIFIER,
   CONTRIBUTION_DEVICE_READER_TEAM_IDENTIFIER,
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,

@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <meta name="theme-color" content="#f5f1e8">
+    <title data-i18n="electron.settings.title">TiboTattle Settings</title>
+    <link rel="stylesheet" href="./styles.css">
+    <link rel="stylesheet" href="./electron-settings.css">
+    <script type="module" src="./electron-settings.js"></script>
+  </head>
+  <body class="electron-settings-page" data-i18n-root>
+    <a class="skip-link" href="#settings-content" data-i18n="electron.settings.skip">Skip to settings</a>
+
+    <main class="settings-window" id="settings-content" tabindex="-1">
+      <header class="settings-header">
+        <div class="settings-heading">
+          <img class="settings-brand-icon" src="./tibotattle-icon.png" alt="">
+          <div>
+            <p class="eyebrow">TiboTattle</p>
+            <h1 data-i18n="electron.settings.heading">Settings</h1>
+            <p class="settings-lede" data-i18n="electron.settings.lede">
+              Keep the local dashboard aligned with the way you work.
+              Raw Codex logs stay on this device.
+            </p>
+          </div>
+        </div>
+        <p class="settings-bridge-status" id="settings-bridge-status" role="status" aria-live="polite">
+          Connecting to desktop settings…
+        </p>
+      </header>
+
+      <nav class="settings-tabs" aria-label="Settings sections" data-i18n-aria-label="electron.settings.sections" role="tablist">
+        <button
+          class="settings-tab"
+          id="settings-tab-general"
+          type="button"
+          role="tab"
+          aria-controls="settings-panel-general"
+          aria-selected="true"
+          tabindex="0"
+          data-settings-tab="general"
+        data-i18n="electron.settings.tab.general">General</button>
+        <button
+          class="settings-tab"
+          id="settings-tab-notifications"
+          type="button"
+          role="tab"
+          aria-controls="settings-panel-notifications"
+          aria-selected="false"
+          tabindex="-1"
+          data-settings-tab="notifications"
+        data-i18n="electron.settings.tab.notifications">Notifications</button>
+        <button
+          class="settings-tab"
+          id="settings-tab-about"
+          type="button"
+          role="tab"
+          aria-controls="settings-panel-about"
+          aria-selected="false"
+          tabindex="-1"
+          data-settings-tab="about"
+        data-i18n="electron.settings.tab.about">About</button>
+      </nav>
+
+      <div class="settings-panels">
+        <section
+          class="settings-panel"
+          id="settings-panel-general"
+          role="tabpanel"
+          aria-labelledby="settings-tab-general"
+          data-settings-panel="general"
+        >
+          <div class="settings-panel-heading">
+            <p class="eyebrow" data-i18n="electron.settings.general.eyebrow">Local behavior</p>
+            <h2 data-i18n="electron.settings.general.title">General</h2>
+            <p data-i18n="electron.settings.general.description">Choose where TiboTattle reads from and how often it refreshes while open.</p>
+          </div>
+
+          <section class="settings-card" aria-labelledby="settings-language-title">
+            <div class="settings-card-copy">
+              <h3 id="settings-language-title" data-i18n="electron.settings.language.title">Language</h3>
+              <p data-i18n="electron.settings.language.description">Choose the language used for TiboTattle controls and explanations.</p>
+            </div>
+            <label class="settings-field" for="settings-language">
+              <span data-i18n="electron.settings.language.label">Language</span>
+              <select id="settings-language" autocomplete="off">
+                <option value="system" data-i18n="language.system">System</option>
+                <option value="en" data-i18n="language.english">English</option>
+                <option value="zh-Hans" data-i18n="language.simplifiedChinese">Simplified Chinese</option>
+                <option value="es" data-i18n="language.spanish">Spanish</option>
+              </select>
+            </label>
+          </section>
+
+          <section class="settings-card" aria-labelledby="settings-appearance-title">
+            <div class="settings-card-copy">
+              <h3 id="settings-appearance-title" data-i18n="electron.settings.appearance.title">Appearance</h3>
+              <p data-i18n="electron.settings.appearance.description">Choose whether TiboTattle follows the operating system or uses a fixed light or dark appearance.</p>
+            </div>
+            <label class="settings-field" for="settings-appearance">
+              <span data-i18n="electron.settings.appearance.label">Appearance</span>
+              <select id="settings-appearance" autocomplete="off">
+                <option value="system" data-i18n="appearance.system">System</option>
+                <option value="light" data-i18n="appearance.light">Light</option>
+                <option value="dark" data-i18n="appearance.dark">Dark</option>
+              </select>
+            </label>
+          </section>
+
+          <section class="settings-card settings-roots-card" aria-labelledby="settings-codex-roots-title">
+            <div class="settings-roots-heading">
+              <div class="settings-card-copy">
+                <h3 id="settings-codex-roots-title" data-i18n="electron.settings.codexRoots.title">Codex folders</h3>
+                <p data-i18n="electron.settings.codexRoots.description">
+                  All roots contribute history. The primary root alone supplies live quota and app-server behavior.
+                </p>
+                <p data-i18n="electron.settings.codexRoots.removalNote">
+                  Removing a root stops future reads, deletes no source files, and retained accepted history remains.
+                </p>
+                <output class="settings-value" id="settings-codex-folder-status" aria-live="polite">
+                  Default location (~/.codex)
+                </output>
+              </div>
+              <div class="settings-actions" aria-label="Codex folder actions" data-i18n-aria-label="electron.settings.codexRoots.actions">
+                <button class="button button-secondary" id="settings-add-codex-root" type="button" data-i18n="electron.settings.codexRoots.add">
+                  Add Codex Folder…
+                </button>
+                <button class="button button-quiet" id="settings-use-default-codex-folder" type="button" data-i18n="electron.settings.codexRoots.useDefault">
+                  Use Default
+                </button>
+              </div>
+            </div>
+            <p class="settings-roots-status" id="settings-codex-roots-status" role="status" aria-live="polite" aria-atomic="true"></p>
+            <div class="settings-roots-list" id="settings-codex-roots" role="list" aria-label="Configured Codex folders" data-i18n-aria-label="electron.settings.codexRoots.list"></div>
+          </section>
+
+          <section class="settings-card" aria-labelledby="settings-refresh-title">
+            <div class="settings-card-copy">
+              <h3 id="settings-refresh-title" data-i18n="electron.settings.refresh.title">Refresh interval</h3>
+              <p data-i18n="electron.settings.refresh.description">Local usage refreshes while TiboTattle is open.</p>
+            </div>
+            <label class="settings-field" for="settings-refresh-interval">
+              <span data-i18n="electron.settings.refresh.label">Refresh interval</span>
+              <select id="settings-refresh-interval" autocomplete="off">
+                <option value="60" data-i18n="electron.settings.refresh.minute">Every minute</option>
+                <option value="300" data-i18n="electron.settings.refresh.fiveMinutes">Every 5 minutes</option>
+                <option value="900" data-i18n="electron.settings.refresh.fifteenMinutes">Every 15 minutes</option>
+                <option value="1800" data-i18n="electron.settings.refresh.thirtyMinutes">Every 30 minutes</option>
+              </select>
+            </label>
+          </section>
+
+          <section class="settings-card settings-local-tools-card" aria-labelledby="settings-local-tools-title">
+            <div class="settings-card-copy">
+              <h3 id="settings-local-tools-title" data-i18n="electron.settings.localTools.title">Local tools</h3>
+              <p data-i18n="electron.settings.localTools.description">
+                Open the current dashboard in your browser, inspect content-free diagnostics, or reveal TiboTattle's local data folder. These actions do not upload or erase data.
+              </p>
+            </div>
+            <div class="settings-actions" aria-label="Local tools" data-i18n-aria-label="electron.settings.localTools.actions">
+              <button class="button button-secondary" id="settings-open-dashboard-browser" type="button" data-i18n="electron.settings.localTools.openBrowser">
+                Open dashboard in browser
+              </button>
+              <button class="button button-quiet" id="settings-show-diagnostics" type="button" data-i18n="electron.settings.localTools.diagnostics">
+                Show diagnostics
+              </button>
+              <button class="button button-quiet" id="settings-reveal-local-data" type="button" data-i18n="electron.settings.localTools.revealData">
+                Show local data
+              </button>
+            </div>
+          </section>
+
+          <section class="settings-card settings-login-card" aria-labelledby="settings-login-title">
+            <div class="settings-card-copy">
+              <h3 id="settings-login-title" data-i18n="electron.settings.login.title">Start at login</h3>
+              <p
+                id="settings-start-at-login-summary"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+              >
+                Start TiboTattle when you sign in. Manage this in your operating system settings.
+              </p>
+            </div>
+            <div class="settings-control-column">
+              <label class="settings-switch" for="settings-start-at-login">
+                <input
+                  id="settings-start-at-login"
+                  type="checkbox"
+                  role="switch"
+                  aria-describedby="settings-start-at-login-summary"
+                >
+                <span class="settings-switch-track" aria-hidden="true"><span></span></span>
+                <span data-i18n="electron.settings.login.label">Start TiboTattle at login</span>
+              </label>
+              <div class="settings-actions">
+                <button class="button button-quiet" id="settings-open-login-items" type="button">
+                  <span data-i18n="electron.settings.login.open">Open Login Items Settings</span>
+                </button>
+                <button class="button button-quiet" id="settings-refresh-login-status" type="button">
+                  <span data-i18n="electron.settings.login.refresh">Refresh Login Item Status</span>
+                </button>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <section
+          class="settings-panel"
+          id="settings-panel-notifications"
+          role="tabpanel"
+          aria-labelledby="settings-tab-notifications"
+          data-settings-panel="notifications"
+          hidden
+        >
+          <div class="settings-panel-heading">
+            <p class="eyebrow" data-i18n="electron.settings.notifications.eyebrow">Local notification controls</p>
+            <h2 data-i18n="electron.settings.notifications.title">Notifications</h2>
+            <p data-i18n="electron.settings.notifications.description">
+              Allowance alerts are local, off by default, and evaluated only from fresh provider-reported evidence while the app is open.
+            </p>
+          </div>
+
+          <section class="settings-card" aria-labelledby="settings-notifications-title">
+            <div class="settings-card-copy">
+              <h3 id="settings-notifications-title" data-i18n="electron.settings.notifications.alertsTitle">Allowance alerts</h3>
+              <p id="settings-notifications-detail" data-i18n="electron.settings.notifications.status.checking">
+                Checking local alert capability…
+              </p>
+            </div>
+            <label class="settings-switch" for="settings-notifications-enabled">
+              <input id="settings-notifications-enabled" type="checkbox" role="switch" disabled aria-describedby="settings-notifications-detail">
+              <span class="settings-switch-track" aria-hidden="true"><span></span></span>
+              <span data-i18n="electron.settings.notifications.label">Allow local allowance alerts</span>
+            </label>
+          </section>
+
+          <section class="settings-card" aria-labelledby="settings-thresholds-title">
+            <div class="settings-card-copy">
+              <h3 id="settings-thresholds-title" data-i18n="electron.settings.notifications.thresholdTitle">Usage alerts</h3>
+              <p data-i18n="electron.settings.notifications.thresholdDescription">Choose which local usage thresholds should produce an alert when delivery is available.</p>
+            </div>
+            <fieldset class="settings-radio-group">
+              <legend class="sr-only" data-i18n="electron.settings.notifications.thresholdLegend">Usage alert thresholds</legend>
+              <label>
+                <input type="radio" name="settings-notification-threshold" value="off" disabled checked>
+                <span data-i18n="electron.settings.notifications.off">Off</span>
+              </label>
+              <label>
+                <input type="radio" name="settings-notification-threshold" value="ninety" disabled>
+                <span data-i18n="electron.settings.notifications.ninety">90% only</span>
+              </label>
+              <label>
+                <input type="radio" name="settings-notification-threshold" value="eighty_and_ninety" disabled>
+                <span data-i18n="electron.settings.notifications.eightyAndNinety">80% and 90%</span>
+              </label>
+            </fieldset>
+          </section>
+
+          <section class="settings-card" aria-labelledby="settings-notification-permission-title">
+            <div class="settings-card-copy">
+              <h3 id="settings-notification-permission-title" data-i18n="electron.settings.notifications.permissionTitle">Operating system permission</h3>
+              <p id="settings-notification-status" class="settings-status" role="status" aria-live="polite" data-i18n="electron.settings.notifications.permission.unknown">
+                Operating-system notification permission has not been confirmed.
+              </p>
+            </div>
+            <button class="button button-secondary" id="settings-open-notification-settings" type="button" disabled>
+              <span data-i18n="electron.settings.notifications.openPermission">Open Notification Settings</span>
+            </button>
+          </section>
+        </section>
+
+        <section
+          class="settings-panel"
+          id="settings-panel-about"
+          role="tabpanel"
+          aria-labelledby="settings-tab-about"
+          data-settings-panel="about"
+          hidden
+        >
+          <div class="settings-panel-heading">
+            <p class="eyebrow" data-i18n="electron.settings.about.eyebrow">Build and support</p>
+            <h2 data-i18n="electron.settings.about.title">About TiboTattle</h2>
+            <p data-i18n="electron.settings.about.description">Local Codex allowance, measured on your device.</p>
+          </div>
+
+          <section class="settings-card settings-about-brand" aria-labelledby="settings-about-product-title">
+            <img class="settings-about-icon" src="./tibotattle-icon.png" alt="">
+            <div>
+              <h3 id="settings-about-product-title">TiboTattle</h3>
+              <p class="settings-value" id="settings-version">Version unavailable</p>
+              <p class="settings-value" id="settings-build">Build unavailable</p>
+            </div>
+          </section>
+
+          <section class="settings-card settings-updates-card" aria-labelledby="settings-updates-title">
+            <div class="settings-card-copy">
+              <h3 id="settings-updates-title" data-i18n="electron.settings.updates.title">Automatic updates</h3>
+              <p id="settings-updates-status" class="settings-status" role="status" aria-live="polite">
+                Update checks are unavailable in this development build.
+              </p>
+            </div>
+            <div class="settings-updates-controls">
+              <label class="settings-switch" for="settings-automatic-updates">
+                <input id="settings-automatic-updates" type="checkbox" role="switch" disabled>
+                <span class="settings-switch-track" aria-hidden="true"><span></span></span>
+                <span data-i18n="electron.settings.updates.downloadLabel">Download verified updates automatically</span>
+              </label>
+              <button class="button button-secondary" id="settings-check-for-updates" type="button">
+                Check for Updates…
+              </button>
+            </div>
+          </section>
+
+          <nav class="settings-project-links" aria-label="Project links" data-i18n-aria-label="electron.settings.links">
+            <a href="https://tibotattle.com" data-external-target="website" data-i18n="electron.settings.link.website">Website</a>
+            <a href="https://github.com/adamallcock/tibotattle" data-external-target="github" data-i18n="electron.settings.link.github">GitHub</a>
+            <a href="https://x.com/adamallcock" data-external-target="x" data-i18n="electron.settings.link.x">X / Twitter</a>
+          </nav>
+        </section>
+      </div>
+
+      <p class="settings-operation-status" id="settings-operation-status" role="status" aria-live="polite"></p>
+    </main>
+  </body>
+</html>

@@ -124,6 +124,14 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 }
 [hidden] { display: none !important; }
 
+/* The desktop shell adds Settings to the shared dashboard only after its
+ * preload marker lands. Keep the control out of the browser dashboard while
+ * leaving the same current page and styles usable in Electron. */
+.electron-only-control { display: none !important; }
+html.electron-dashboard .electron-only-control,
+body.electron-dashboard .electron-only-control { display: inline-flex !important; }
+.electron-settings-control { flex: 0 0 auto; }
+
 .skip-link {
   position: fixed;
   z-index: 100;

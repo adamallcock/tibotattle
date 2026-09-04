@@ -147,6 +147,8 @@
   },
   "packageManager": "pnpm@11.9.0",
   "devDependencies": {
+    "electron": "43.2.0",
+    "electron-builder": "26.15.7",
     "es-module-lexer": "2.3.1",
     "fast-check": "^4.9.0"
   }

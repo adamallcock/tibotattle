@@ -43,6 +43,7 @@ const REQUIRED_METHODS = Object.freeze([
   "acquireCredentialMutex",
   "releaseCredentialMutex",
 ]);
+const WINDOWS_FILESYSTEM_ADAPTERS = new WeakSet();
 const MANIFEST_KEYS = Object.freeze([
   "schemaVersion",
   "bindingFile",
@@ -368,12 +369,83 @@ export function createWindowsFilesystemAdapter({
   } else {
     native = assertBinding(binding);
   }
-  return Object.freeze({
+  const adapter = Object.freeze({
     productionSafe: approvedPolicy?.productionSafe === true
       && native.productionSafe === true
       && native.pathWalkRaceSafe === true,
     pathWalkRaceSafe: approvedPolicy?.pathWalkRaceSafe === true
       && native.pathWalkRaceSafe === true,
+    // The current native contract predates the protected-child operations.
+    // Preserve the existing filesystem adapter surface while forwarding these
+    // optional methods when a newer, explicitly injected/native binding has
+    // them. The protected Windows state store validates the branded adapter
+    // before using this optional closure.
+    ...(typeof native.inspectProtectedChild === "function"
+      ? {
+        inspectProtectedChild(rootPath, rootIdentity, childPath) {
+          return call(native, "inspectProtectedChild", [
+            rootPath,
+            rootIdentity,
+            childPath,
+          ]);
+        },
+      }
+      : {}),
+    ...(typeof native.readProtectedChild === "function"
+      ? {
+        readProtectedChild(rootPath, rootIdentity, childPath, maximumBytes) {
+          return call(native, "readProtectedChild", [
+            rootPath,
+            rootIdentity,
+            childPath,
+            maximumBytes,
+          ]);
+        },
+      }
+      : {}),
+    ...(typeof native.createProtectedChild === "function"
+      ? {
+        createProtectedChild(rootPath, rootIdentity, childPath, data) {
+          return call(native, "createProtectedChild", [
+            rootPath,
+            rootIdentity,
+            childPath,
+            data,
+          ]);
+        },
+      }
+      : {}),
+    ...(typeof native.deleteProtectedChild === "function"
+      ? {
+        deleteProtectedChild(rootPath, rootIdentity, childPath, identity) {
+          return call(native, "deleteProtectedChild", [
+            rootPath,
+            rootIdentity,
+            childPath,
+            identity,
+          ]);
+        },
+      }
+      : {}),
+    ...(typeof native.replaceProtectedChild === "function"
+      ? {
+        replaceProtectedChild(
+          rootPath,
+          rootIdentity,
+          childPath,
+          identity,
+          data,
+        ) {
+          return call(native, "replaceProtectedChild", [
+            rootPath,
+            rootIdentity,
+            childPath,
+            identity,
+            data,
+          ]);
+        },
+      }
+      : {}),
     inspectPath(path) {
       try {
         const result = call(native, "inspectPath", [path]);
@@ -433,6 +505,18 @@ export function createWindowsFilesystemAdapter({
       }
     },
   });
+  WINDOWS_FILESYSTEM_ADAPTERS.add(adapter);
+  return adapter;
+}
+
+export function isWindowsFilesystemAdapter(adapter) {
+  try {
+    return adapter !== null
+      && typeof adapter === "object"
+      && WINDOWS_FILESYSTEM_ADAPTERS.has(adapter);
+  } catch {
+    return false;
+  }
 }
 
 export function isWindowsFilesystemNotFound(error) {
