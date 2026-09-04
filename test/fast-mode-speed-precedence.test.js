@@ -234,6 +234,7 @@ test("the ratio map holds every registered published Priority model", () => {
     "gpt-5.6-terra": 2,
     "gpt-5.5": 2.5,
     "gpt-5.4": 2,
+    "gpt-6-astra": 2,
   });
   // Every ratio is strictly greater than 1x: Fast never costs less quota
   // than Standard, and is never accidentally recorded as 1x (which would
@@ -243,4 +244,15 @@ test("the ratio map holds every registered published Priority model", () => {
     assert.equal(multiplier > 1, true);
   }
   assert.equal(FAST_MODE_ASSUMED_MULTIPLIER > 1, true);
+});
+
+test("Astra published Fast ratio follows its exact request context and release epoch", () => {
+  for (const totalInputContextTokens of [271_999, 272_000, 272_001]) {
+    assert.equal(fastModeQuotaMultiplier("gpt-6-astra", {
+      eventTime: "2026-09-03T12:00:00.000Z", totalInputContextTokens,
+    }), 2);
+  }
+  assert.equal(fastModeQuotaMultiplier("gpt-6-astra", { eventTime: "2026-09-02T12:00:00.000Z", totalInputContextTokens: 1_000 }), null);
+  assert.equal(fastModeQuotaMultiplier("gpt-6-astra", { eventTime: "2026-09-03T12:00:00.000Z" }), null);
+  assert.equal(fastModeQuotaMultiplier("gpt-6t"), null);
 });

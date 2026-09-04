@@ -402,10 +402,14 @@ export function fastModeModelFamily(model, evidence = undefined) {
   const context = evidence.totalInputContextTokens;
   const contextProvided = context !== null && context !== undefined;
   if (contextProvided && (!Number.isSafeInteger(context) || context < 0)) return null;
-  const contextBand = contextProvided ? context >= 272_000 ? "long" : "short" : null;
   const matchingBand = (card) => {
-    const cardBand = card.metadata?.total_input_context_band ?? null;
-    return cardBand === null || cardBand === contextBand;
+    if (card.metadata?.total_input_context_band == null) return true;
+    if (!contextProvided) return false;
+    // Follow each exact card's boundary, not a universal model-family cutoff.
+    return card.components.every(({ conditions }) => (
+      (conditions?.min_total_input_tokens === undefined || context >= Number(conditions.min_total_input_tokens))
+      && (conditions?.max_total_input_tokens === undefined || context <= Number(conditions.max_total_input_tokens))
+    ));
   };
   const priorityCards = REGISTERED_PRIORITY_CARDS.get(canonicalModel).filter(coversDay);
   if (evidence.standardPriceCardIds !== undefined) {

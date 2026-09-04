@@ -2613,7 +2613,7 @@ describe("synthetic usage monitor service", () => {
         combined: { fitCount: number; centralUsd: number | null };
       }[];
     }>();
-    expect(body.schemaVersion).toBe("admin-community-allowance-preview-v0.2");
+    expect(body.schemaVersion).toBe("admin-community-allowance-preview-v0.3");
     expect(body.basis).toBe(
       "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview",
     );

@@ -7,6 +7,61 @@ import WebKit
 import Sparkle
 #endif
 
+private enum MacOSUpdaterFeedPolicy {
+    #if arch(x86_64)
+    static let architecture = "x64"
+    static let stableURL = "https://updates.tibotattle.com/intel/appcast.xml"
+    static let stablePath = "/intel/appcast.xml"
+    static let dogfoodURL = "https://dogfood-updates.tibotattle.com/internal-dogfood/intel/appcast.xml"
+    static let dogfoodPath = "/internal-dogfood/intel/appcast.xml"
+    static let previewPath = "/preview/intel/appcast.xml"
+    #else
+    static let architecture = "arm64"
+    static let stableURL = "https://updates.tibotattle.com/appcast.xml"
+    static let stablePath = "/appcast.xml"
+    static let dogfoodURL = "https://dogfood-updates.tibotattle.com/internal-dogfood/appcast.xml"
+    static let dogfoodPath = "/internal-dogfood/appcast.xml"
+    static let previewPath = "/preview/appcast.xml"
+    #endif
+
+    static func accepts(_ appcast: String, expectedURL: String?, requiredPath: String) -> Bool {
+        guard let components = URLComponents(string: appcast),
+              components.scheme?.lowercased() == "https",
+              let host = components.host?.lowercased(),
+              !host.isEmpty,
+              !["127.0.0.1", "localhost", "::1"].contains(host),
+              components.user == nil,
+              components.password == nil,
+              components.percentEncodedPath == requiredPath,
+              components.query == nil,
+              components.fragment == nil,
+              components.url?.absoluteString == appcast,
+              expectedURL == nil || appcast == expectedURL
+        else { return false }
+        return true
+    }
+
+    static func runContractSmokeTest() -> Int32 {
+        let cases: [(String, String, String?)] = [
+            (stableURL, stablePath, stableURL),
+            (dogfoodURL, dogfoodPath, dogfoodURL),
+            ("https://preview.example.test" + previewPath, previewPath, nil),
+        ]
+        for (url, path, expected) in cases {
+            let otherPath = architecture == "x64"
+                ? path.replacingOccurrences(of: "/intel/", with: "/")
+                : path.replacingOccurrences(of: "/appcast.xml", with: "/intel/appcast.xml")
+            let otherURL = url.replacingOccurrences(of: path, with: otherPath)
+            guard accepts(url, expectedURL: expected, requiredPath: path),
+                  !accepts(otherURL, expectedURL: expected, requiredPath: path),
+                  !accepts(url + "?architecture=other", expectedURL: expected, requiredPath: path)
+            else { return 1 }
+        }
+        print("USAGE_MONITOR_MACOS_UPDATER_ARCHITECTURE_CONTRACT architecture=\(architecture) cross_architecture=rejected")
+        return 0
+    }
+}
+
 private enum BundledProduct {
     private static func requiredString(_ key: String) -> String {
         guard let value = Bundle.main.object(
@@ -164,6 +219,7 @@ private enum BundledProduct {
         }
         validateSemanticOpenRegistration()
 
+
         switch (
             bundleIdentifier,
             buildChannel,
@@ -184,9 +240,8 @@ private enum BundledProduct {
             false
         ):
             validateDistributionUpdaterPolicy(
-                expectedAppcastURL:
-                    "https://updates.tibotattle.com/appcast.xml",
-                requiredAppcastPath: "/appcast.xml",
+                expectedAppcastURL: MacOSUpdaterFeedPolicy.stableURL,
+                requiredAppcastPath: MacOSUpdaterFeedPolicy.stablePath,
                 automaticUpdates: true
             )
         case (
@@ -196,10 +251,8 @@ private enum BundledProduct {
             false
         ):
             validateDistributionUpdaterPolicy(
-                expectedAppcastURL:
-                    "https://dogfood-updates.tibotattle.com/"
-                    + "internal-dogfood/appcast.xml",
-                requiredAppcastPath: "/internal-dogfood/appcast.xml",
+                expectedAppcastURL: MacOSUpdaterFeedPolicy.dogfoodURL,
+                requiredAppcastPath: MacOSUpdaterFeedPolicy.dogfoodPath,
                 automaticUpdates: true
             )
         case (
@@ -213,7 +266,7 @@ private enum BundledProduct {
             // manual-only behavior remain an invariant of the bundle ID.
             validateDistributionUpdaterPolicy(
                 expectedAppcastURL: nil,
-                requiredAppcastPath: "/preview/appcast.xml",
+                requiredAppcastPath: MacOSUpdaterFeedPolicy.previewPath,
                 automaticUpdates: false
             )
         default:
@@ -278,19 +331,11 @@ private enum BundledProduct {
         }
 
         let appcast = requiredString("SUFeedURL")
-        guard let components = URLComponents(string: appcast),
-              components.scheme?.lowercased() == "https",
-              let host = components.host?.lowercased(),
-              !host.isEmpty,
-              !["127.0.0.1", "localhost", "::1"].contains(host),
-              components.user == nil,
-              components.password == nil,
-              components.percentEncodedPath == requiredAppcastPath,
-              components.query == nil,
-              components.fragment == nil,
-              components.url?.absoluteString == appcast,
-              expectedAppcastURL == nil || appcast == expectedAppcastURL
-        else {
+        guard MacOSUpdaterFeedPolicy.accepts(
+            appcast,
+            expectedURL: expectedAppcastURL,
+            requiredPath: requiredAppcastPath
+        ) else {
             fatalError("Invalid bundled runtime identity")
         }
 
@@ -13825,6 +13870,9 @@ private struct UsageMonitorMain {
         // constructing the production login-item adapter.
         if arguments.contains("--login-item-contract-smoke-test") {
             exit(LoginItemContractSmokeTest.run())
+        }
+        if arguments.contains("--updater-architecture-contract-smoke-test") {
+            exit(MacOSUpdaterFeedPolicy.runContractSmokeTest())
         }
         BundledProduct.validateRuntimeIdentity()
         if arguments.contains("--keychain-broker-contract-smoke-test") {

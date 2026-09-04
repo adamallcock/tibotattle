@@ -29,6 +29,13 @@ export const SIGNED_MACOS_BUNDLE_VERSION_PLAN = Object.freeze({
     "internal-dogfood": "1023.7",
     stable: "1024",
   }),
+  // Separate ARM and Intel installers share the same source and build ordering.
+  // The earlier Intel RC1 used 1025; combined Astra/Intel RC2 reserves 1025.1.
+  // Allocation does not establish signing, installation, or publication.
+  "0.1.18": Object.freeze({
+    "internal-dogfood": "1025.1",
+    stable: "1026",
+  }),
 });
 
 export function resolveSignedMacOSBundleVersion(releaseVersion, channel) {

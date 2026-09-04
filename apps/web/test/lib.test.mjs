@@ -5658,11 +5658,11 @@ test("first run is a truthful install and local preflight journey", async () => 
     new URL("../public/install-cta.js", import.meta.url),
     "utf8",
   );
-  assert.match(installSource, /function configuredInstallerUrl\(documentRef\)/u);
+  assert.match(installSource, /function configuredInstallerUrl\(documentRef, architecture\)/u);
   assert.match(installSource, /function configuredInstallerMetadata\(/u);
   assert.match(
     installSource,
-    /export function configuredInstallerRelease\(documentRef\)/u,
+    /export function configuredInstallerRelease\(documentRef, \{ architecture = "arm64" \} = \{\}\)/u,
   );
   assert.doesNotMatch(installSource, /configuredSemanticOpenTarget|usage-monitor-semantic-open-target/u);
   assert.match(appSource, /from "\.\/install-cta\.js"/u);

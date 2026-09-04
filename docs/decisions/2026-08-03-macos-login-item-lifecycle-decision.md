@@ -117,8 +117,9 @@ calls. It never changes an operator's Login Items.
 Before publishing a signed build, a human must complete a disposable-profile
 rehearsal on the Developer-ID-signed app installed at
 `/Applications/TiboTattle.app`. The machine-checkable, privacy-safe receipt
-schema is `usage-monitor-macos-login-item-release-rehearsal-v1`; the release
-gate rejects a receipt unless it records all of these verified checks:
+schema was originally `usage-monitor-macos-login-item-release-rehearsal-v1`.
+The current gate uses v2 under the 2026-09-04 amendment below and rejects a
+receipt unless it records all of these verified checks:
 
 - first-run consent is visibly preselected and remains affirmative-only;
 - Settings reconciles after an external System Settings change, including the
@@ -140,6 +141,33 @@ npm run product:macos:validate:login-item-release -- \
   --app "/Applications/TiboTattle.app" \
   --rehearsal "docs/receipts/YYYY-MM-DD-macos-login-item-release-rehearsal.json"
 ```
+
+### 2026-09-04 two-architecture receipt amendment
+
+Current qualification requires
+`usage-monitor-macos-login-item-release-rehearsal-v2`, with
+`evidenceKind: "manual_observation"`. V1 records remain historical; the current
+gate rejects them rather than inferring missing architecture or source proof.
+All ten lifecycle checks and the disposable-profile/Applications requirements
+remain mandatory.
+
+The receipt's `application` binds bundle identifier, build, short version,
+`architecture`, `channel`, `sourceCommit` and `payloadSha256` to the inspected
+signed installed app. The last field is its verified normalized payload digest,
+not the final DMG or signature digest. Exact DMG evidence still comes from
+separate checksum/finalizer and installed-artifact qualification.
+
+The closed `environment` also records `hardwareArchitecture`, `macosVersion`
+and `rosetta: false`. Hardware must match the app architecture; the reported OS
+must meet the inspected minimum (at least macOS 14). These are explicit human
+observations, not facts inferred from cross-compilation or automated smoke
+tests. A matching schema cannot establish that a human performed the rehearsal.
+Do not manufacture those observations or reuse ARM receipts for Intel.
+
+The CLI defaults to `--architecture arm64 --channel stable`. Intel RC2 uses
+`--architecture x64 --channel internal-dogfood`, with its own matching receipt.
+Both native validators receive the exact selection. The gate still makes no
+real ServiceManagement changes and does not install the app.
 
 ## Privacy and removal
 

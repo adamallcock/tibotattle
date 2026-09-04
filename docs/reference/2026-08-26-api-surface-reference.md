@@ -698,7 +698,7 @@ The package's `index.js` and `index.d.ts` are its complete public contract.
 |---|---|
 | [`@app-usagemonitor/accounting`](../../packages/accounting/index.js) | Exact decimal cost ledger; pinned official price registry; Codex fast-mode inference/weighting; local Codex and Claude API-price-equivalent projections |
 | [`@app-usagemonitor/quota-analysis`](../../packages/quota-analysis/index.js) | Quota tracks/reset evidence; capacity calibration; rolling comparisons; pace forecast; model composition; provider-pool naming, classification, and window formatting |
-| [`@app-usagemonitor/telemetry-contract`](../../packages/telemetry-contract/index.js) | Closed constants and error codes; telemetry v0.1/v0.2 parse/inspect/validate; canonicalization; envelope validation; upload validation |
+| [`@app-usagemonitor/telemetry-contract`](../../packages/telemetry-contract/index.js) | Reviewed model catalog and requested-effort mapping; bounded admin model history; closed constants and error codes; telemetry v0.1/v0.2 parse/inspect/validate; staged v1.1 attribution/chunks; canonicalization; envelope and upload validation |
 | [`@app-usagemonitor/identity-core`](../../packages/identity-core/index.js) | `deriveExportPseudonym` and `deriveExportPseudonymV2` |
 | [`@app-usagemonitor/i18n`](../../packages/i18n/index.js) | Locale catalogs and negotiation; closed language preferences; translation/interpolation; locale-aware number, percent, and date formatting |
 
@@ -706,11 +706,11 @@ The complete symbol inventory follows as a reviewable appendix. Each package
 is grouped by capability so readers can scan the contract without a wall of
 undifferentiated names.
 
-#### `@app-usagemonitor/accounting` — 27 public symbols
+#### `@app-usagemonitor/accounting` — 30 public symbols
 
 - Cost ledger: `addUsdStrings`, `priceUsageEvent`.
 - Price registry: `APP_OFFICIAL_PRICE_CARDS`, `APP_PRICE_REGISTRY_MANIFEST`, `OPENAI_PRICE_EVIDENCE_START_DATE`.
-- Speed accounting: `CODEX_SPEED_MODE_DECLARATION`, `CODEX_SPEED_MODE_OBSERVABILITY`, `DEFAULT_FAST_MODE_PREFERENCE`, `FAST_MODE_MODEL_FAMILY_KEYS`, `FAST_MODE_MULTIPLIER_SOURCE`, `FAST_MODE_PREFERENCE_VALUES`, `FAST_MODE_QUOTA_MULTIPLIERS`, `OBSERVED_SPEED_MODE_KEYS`, `QUOTA_WEIGHTED_API_PRICE_METRIC`, `emptySpeedWeightingCrossing`, `fastModeModelFamilyKey`, `fastModeQuotaMultiplier`, `inferFastModeFromCalibrationWindows`, `isFastModePreference`, `resolveEffectiveSpeedMode`, `summarizeQuotaWeightedAccounting`.
+- Speed accounting: `CODEX_SPEED_MODE_DECLARATION`, `CODEX_SPEED_MODE_OBSERVABILITY`, `DEFAULT_UNRESOLVED_SPEED_SCENARIO`, `FAST_MODE_ASSUMED_MULTIPLIER`, `FAST_MODE_ASSUMED_MULTIPLIER_SOURCE`, `FAST_MODE_MODEL_FAMILY_KEYS`, `FAST_MODE_MULTIPLIER_SOURCE`, `FAST_MODE_QUOTA_MULTIPLIERS`, `OBSERVED_SPEED_MODE_KEYS`, `QUOTA_WEIGHTED_API_PRICE_METRIC`, `SPEED_MODE_PROVENANCE_VALUES`, `deriveFastModePriorityRatiosFromRegistry`, `emptySpeedWeightingCrossing`, `fastModeModelFamilyKey`, `fastModeQuotaMultiplier`, `inferFastModeFromCalibrationWindows`, `quotaWeightedApiPriceEquivalent`, `resolveEffectiveSpeedMode`, `summarizeQuotaWeightedAccounting`.
 - Local pricing: `aggregateLocalApiPriceResults`, `apiPriceResolutionSummary`, `costWarningCodes`, `priceClaudeUsageRecord`, `priceCodexProviderToolUnits`, `priceCodexUsageEvent`.
 
 #### `@app-usagemonitor/quota-analysis` — 32 public symbols
@@ -721,13 +721,17 @@ undifferentiated names.
 - Composition: `MODEL_COMPOSITION_POLICY`, `blendedCompositionCapacityUsd`, `buildCompositionObservations`, `calibrateCompositionCapacities`, `compositionExpectedPp`.
 - Windows and provider pools: `CODEX_PRIMARY_LIMIT_ID`, `CODEX_SPARK_LIMIT_ID`, `CODEX_SPARK_LIMIT_IDS`, `CODEX_SPARK_RESERVED_LIMIT_ID`, `FIVE_HOUR_WINDOW_MINUTES`, `formatQuotaWindowDuration`, `MAX_QUOTA_LIMIT_DISPLAY_NAME_LENGTH`, `MAX_QUOTA_WINDOW_DURATION_MINUTES`, `QUOTA_LIMIT_DISPLAY_ALIASES`, `QUOTA_WINDOW_KINDS`, `classifyQuotaWindowKind`, `isSparkQuotaLimitId`, `isSupportedQuotaWindowDuration`, `isValidQuotaWindowDuration`, `quotaLimitDisplayAlias`, `quotaWindowLabel`, `sanitizeQuotaLimitDisplayName`, `sanitizeQuotaLimitId`, `SEVEN_DAY_WINDOW_MINUTES`.
 
-#### `@app-usagemonitor/telemetry-contract` — 24 public symbols
+#### `@app-usagemonitor/telemetry-contract` — 63 public symbols
 
+- Reviewed model catalog: `REVIEWED_MODEL_CATALOG_VERSION`, `REVIEWED_MODEL_CATALOG`, `REVIEWED_CODEX_MODEL_IDS`, `REVIEWED_CLAUDE_MODEL_IDS`, `reviewedModelIdentity`, `codexRequestReasoningEffort`, `codexCacheReasoningConfiguration`.
+- Admin model history: `ADMIN_MODEL_CONFIG`, `ADMIN_MODEL_HISTORY_CATALOG_VERSION`, `LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION`, `projectAdminModelHistoryDay`, `expandAdminModelHistoryDay`.
 - Constants: `ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION`, `ACCOUNT_SCOPED_TELEMETRY_ENVELOPE_SCHEMA_VERSION`, `ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION`, `MAX_TELEMETRY_BROWSER_BYTES`, `TELEMETRY_CONTRIBUTION_SCHEMA_VERSION`, `TELEMETRY_ENVELOPE_SCHEMA_VERSION`, `TELEMETRY_MODEL_IDS`, `TELEMETRY_PLAN_DISPLAY_NAMES`, `TELEMETRY_PLAN_TYPES`, `TELEMETRY_SCHEMA_VERSION`, `TELEMETRY_TOOL_CLASSES`.
 - Errors: `TELEMETRY_CONTRACT_ERROR_CODES`, `TelemetryContractError`, `isTelemetryContractError`.
 - Telemetry v0.1: `parseTelemetryContribution`, `validateTelemetryContribution`.
 - Telemetry v0.2: `canonicalTelemetryContributionV01`, `inspectTelemetryContributionDatasetV02`, `inspectTelemetryContributionV02`, `parseTelemetryContributionV02`, `validateAccountScopedTelemetryContribution`.
 - Envelope and upload: `parseTelemetryEnvelope`, `validateTelemetryEnvelope`, `validateContributionForUpload`.
+- Staged v1.1 constants: `TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION`, `TELEMETRY_V11_ENVELOPE_SCHEMA_VERSION`, `TELEMETRY_V11_DAY_MANIFEST_SCHEMA_VERSION`, `TELEMETRY_V11_FIELD_DICTIONARY_VERSION`, `TELEMETRY_V11_PRIVACY_CONTRACT_VERSION`, `TELEMETRY_V11_CONTRACT_STATE`, `MAX_TELEMETRY_V11_CHUNK_RECORDS`, `MAX_TELEMETRY_V11_CHUNK_CANONICAL_BYTES`, `MAX_TELEMETRY_V11_DAY_CHUNKS`, `TELEMETRY_V11_STREAMS`, `TELEMETRY_V11_ACCOUNT_BASES`, `TELEMETRY_V11_PLAN_BASES`, `TELEMETRY_V11_DOMAIN_MANIFEST_SCHEMA_VERSION`, `MAX_TELEMETRY_V11_DOMAIN_DAYS`.
+- Staged v1.1 behavior: `telemetryV11RequiredConsent`, `isTelemetryV11ConsentCurrent`, `parseTelemetryV11Attribution`, `parseTelemetryV11Record`, `parseTelemetryV11ChunkId`, `parseTelemetryV11Chunk`, `parseTelemetryV11DayManifest`, `telemetryV11RecordAnchor`, `canonicalTelemetryV11Json`, `telemetryV11DayManifestDigestInput`, `validateTelemetryV11Envelope`, `parseTelemetryV11DomainManifest`, `telemetryV11DomainManifestDigestInput`.
 
 #### `@app-usagemonitor/identity-core` — 2 public symbols
 

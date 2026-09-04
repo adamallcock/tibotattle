@@ -38,10 +38,11 @@ generated test result rather than inferring reachability from a filename.
 
 ## Protected inputs
 
-The real-history profile reads the owner's private local Codex corpus. Running
-it is an owner-authorized, local-only operation. Never upload the corpus, copy
-it into fixtures, print private paths, or send it to an external model. A normal
-documentation or source change does not authorize regeneration.
+The real-history profile reads the owner's private local Codex and Claude
+corpora. Running it is an owner-authorized, local-only operation. Never upload
+these corpora, copy them into fixtures, print private paths, or send them to an
+external model. A normal documentation or source change does not authorize
+regeneration.
 
 The generator requires exact, hash-pinned binaries:
 

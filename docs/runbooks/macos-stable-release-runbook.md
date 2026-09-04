@@ -27,6 +27,78 @@ previous stable version.
 
 ---
 
+## Separate Apple silicon and Intel candidates
+
+The 0.1.18 working candidate adds a separate Intel lane; it is not a public
+support declaration. The published 0.1.17 release is immutable and remains
+unchanged. Complete the [Intel qualification plan](../plans/2026-09-03-macos-intel-release.md)
+before declaring Intel supported. Both installers must come from the same
+frozen annotated tag and source commit and enter the draft release before it
+is made immutable. Never append a later source build under an older tag.
+
+| Target | CLI architecture | Native slices | Stable feed | Immutable prefix |
+|---|---|---|---|---|
+| Apple silicon | `arm64` (default) | exactly `arm64` | `/appcast.xml` | `releases` |
+| Intel | `x64` | exactly `x86_64` | `/intel/appcast.xml` | `intel/releases` |
+
+Both stable feeds use the existing stable update origin, bucket and trusted
+public key. Dogfood retains its independent origin/bucket/key; Intel dogfood
+uses `/internal-dogfood/intel/appcast.xml` and `internal-dogfood/intel/releases`.
+Intel Preview uses `/preview/intel/appcast.xml`. Native runtime checks the
+compiled architecture's exact feed path. The publishing guard authenticates
+requests before selecting its allowlisted architecture target; compare-and-swap
+operates on that target's appcast key. Deploy the updated guard through the
+normal protected deployment gate before attempting Intel publication.
+
+Build on macOS ARM with Node 26.2.0. Supply `--architecture x64` and
+`--node-runtime <verified-node-v26.2.0-darwin-x64>/bin/node` to the builder and
+release CLI. The official runtime's adjacent `LICENSE` must also be present;
+both input and private staged copies are pinned and verified before execution.
+Use distinct app/output directories per architecture. The packaging, installer
+validation, appcast and publication commands accept `--architecture x64`; use
+`TiboTattle-X.Y.Z-macOS-x64.dmg` for the Intel final artifact. ARM filenames
+and default CLI behavior are unchanged. Universal binaries are not accepted.
+
+The combined Astra/Intel 0.1.18 RC2 allocations are dogfood `1025.1` and stable
+`1026` for both architectures, above the earlier Intel RC1 build `1025` and
+0.1.17 stable `1024`. Allocation is not a qualification receipt. A first Intel
+stable release has no previous Intel installation:
+use the existing explicit owner-only `--stable-bootstrap` flow, never an ARM
+receipt as Intel prior-release or rollback evidence. The current stable key
+must still match the authenticated publishing guard. Later Intel releases
+require a previous Intel manifest and preserve that lane's key and ordering.
+
+Sign/finalize/validate each architecture independently. Preserve unique filenames
+for both appcast evidence files in the flat public manifest, even though each
+live feed ends in `appcast.xml`. Each artifact has its own checksum, native
+assurances and any SBOM/attestation evidence. Do not copy ARM evidence into an
+Intel entry. Cross-compilation, Rosetta and ad-hoc packaging do not qualify
+physical Intel clean install, login items, silent Keychain access or A-to-B
+signed update installation.
+
+The installed Login Item gate accepts explicit `--architecture` and `--channel`
+selection and requires the v2 [manual rehearsal receipt](../decisions/2026-08-03-macos-login-item-lifecycle-decision.md#2026-09-04-two-architecture-receipt-amendment).
+It binds the inspected app's architecture, channel, source commit and normalized
+payload alongside version identity. Native hardware, supported macOS and
+non-Rosetta execution remain human observations; neither old v1 receipts nor an
+ARM rehearsal can qualify Intel. The payload binding is not a final-DMG digest
+and does not replace independent artifact/signature checks.
+
+The existing website command below remains ARM-compatible. To expose a qualified
+Intel artifact from the same canonical `release-manifest.json`, also supply:
+
+~~~text
+--intel-installer-path <absolute-path>/TiboTattle-X.Y.Z-macOS-x64.dmg
+--intel-installer-url https://github.com/adamallcock/tibotattle/releases/download/vX.Y.Z/TiboTattle-X.Y.Z-macOS-x64.dmg
+--intel-minimum-macos 14.0
+~~~
+
+The generator validates Intel source, bytes, trust, architecture and minimum
+macOS independently, including the published download. Omit these flags to
+retain the unavailable Intel tab. The separate Homebrew tap currently selects
+ARM only; do not show a Homebrew command on the Intel tab until that tap has
+an architecture-aware cask and updater workflow, with its own validation.
+
 ## 0. Version lockstep and preflight
 
 A version bump is **not** just package.json. Bump or regenerate all of:
@@ -399,14 +471,14 @@ npm run product:macos:appcast -- \
   --channel stable \
   --app ".release-build/macos-production/TiboTattle.app" \
   --dmg ".release-build/macos-release/TiboTattle-X.Y.Z-macOS-arm64.dmg" \
-  --bundle-version "1024" \
+  --bundle-version "1026" \
   --sparkle-public-ed-key "jhgPwmvWLMr7TGURJUoi6sXias7YP1F+hejZawKVTGw="
 ~~~
 
 This uses the pinned generate_appcast and embeds the feed signature required by
 the installed client's SURequireSignedFeed=true. A hand-built minimal appcast
-is not a valid updater subject. `1024` is the reviewed 0.1.17 bundle build, not
-the marketing version; future releases must use their reviewed allocation.
+is not a valid updater subject. `1026` is the allocated 0.1.18 stable build,
+not the marketing version; future releases must use their reviewed allocation.
 
 Do **not** run the publishing command yet. The appcast is carried as updater
 metadata in the release evidence descriptor and is published only after the

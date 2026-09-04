@@ -439,36 +439,65 @@ test("locked and migration-required Keychain states remain distinct and content-
   }
 });
 
-test("production selection cannot reuse export identity and never reads the legacy environment variable", async () => {
-  const root = await mkdtemp(join(tmpdir(), "app-usagemonitor-account-production-"));
-  const backend = memoryBackend(Buffer.alloc(32, 74));
-  const prior = process.env.APP_USAGEMONITOR_ACCOUNT_HMAC_KEY;
-  process.env.APP_USAGEMONITOR_ACCOUNT_HMAC_KEY = "legacy-environment-canary";
-  try {
-    const selected = selectProductionAccountObservationSecret({
-      platform: "darwin",
-      architecture: "arm64",
-      operationLockFile: join(root, "operation.lock"),
-      createKeychainBackend: () => backend,
-    });
-    assert.equal(selected.mode, "macos_keychain_account_observation");
-    assert.deepEqual(await selected.loadAccountObservationSecret(), Buffer.alloc(32, 74));
-    assert.equal(backend.calls.every(([, capability]) => capability === ACCOUNT_CAPABILITY), true);
-
-    assert.throws(
-      () => selectProductionAccountObservationSecret({
+for (const architecture of ["arm64", "x64"]) {
+  test(`macOS ${architecture} account selection preserves the observation secret and rejects export identity`, async () => {
+    const root = await mkdtemp(join(tmpdir(), "app-usagemonitor-account-production-"));
+    const backend = memoryBackend(Buffer.alloc(32, 74));
+    const prior = process.env.APP_USAGEMONITOR_ACCOUNT_HMAC_KEY;
+    process.env.APP_USAGEMONITOR_ACCOUNT_HMAC_KEY = "legacy-environment-canary";
+    try {
+      const selected = selectProductionAccountObservationSecret({
         platform: "darwin",
-        architecture: "arm64",
+        architecture,
+        operationLockFile: join(root, "operation.lock"),
         createKeychainBackend: () => backend,
-        keychainCapability: EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity,
-      }),
-      (error) => error.code === "ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_INVALID",
-    );
-  } finally {
-    if (prior === undefined) delete process.env.APP_USAGEMONITOR_ACCOUNT_HMAC_KEY;
-    else process.env.APP_USAGEMONITOR_ACCOUNT_HMAC_KEY = prior;
-    await rm(root, { recursive: true, force: true });
+      });
+      assert.equal(selected.mode, "macos_keychain_account_observation");
+      assert.deepEqual(await selected.loadAccountObservationSecret(), Buffer.alloc(32, 74));
+      assert.equal(backend.calls.every(([, capability]) => capability === ACCOUNT_CAPABILITY), true);
+
+      assert.throws(
+        () => selectProductionAccountObservationSecret({
+          platform: "darwin",
+          architecture,
+          createKeychainBackend: () => backend,
+          keychainCapability: EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity,
+        }),
+        (error) => error.code === "ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_INVALID",
+      );
+    } finally {
+      if (prior === undefined) delete process.env.APP_USAGEMONITOR_ACCOUNT_HMAC_KEY;
+      else process.env.APP_USAGEMONITOR_ACCOUNT_HMAC_KEY = prior;
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("account selection rejects unknown macOS architectures before constructing a credential backend", () => {
+  for (const architecture of ["ia32", "x86_64", "arm", "", null]) {
+    let constructions = 0;
+    assert.throws(() => selectProductionAccountObservationSecret({
+      platform: "darwin",
+      architecture,
+      createKeychainBackend() { constructions += 1; },
+    }), { code: "ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_UNAVAILABLE" });
+    assert.equal(constructions, 0);
   }
+});
+
+test("Intel account selection preserves a broker failure without legacy or file fallback", () => {
+  let constructions = 0;
+  const canary = "PRIVATE-INTEL-BROKER-FAILURE";
+  assert.throws(() => selectProductionAccountObservationSecret({
+    platform: "darwin",
+    architecture: "x64",
+    createKeychainBackend() {
+      constructions += 1;
+      throw new Error(canary);
+    },
+  }), (error) => error.code === "ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_UNAVAILABLE"
+    && !`${error.stack}\n${JSON.stringify(error)}`.includes(canary));
+  assert.equal(constructions, 1);
 });
 
 test("Windows x64 account-observation production selection remains fail closed", () => {

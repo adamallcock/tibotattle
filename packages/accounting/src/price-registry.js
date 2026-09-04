@@ -1,5 +1,5 @@
 // Reviewed provider price evidence shared by local and edge accounting adapters.
-export const APP_PRICE_REGISTRY_OBSERVED_AT = "2026-08-30T06:01:00Z";
+export const APP_PRICE_REGISTRY_OBSERVED_AT = "2026-09-04T02:30:56Z";
 // First official-page review. This is the review boundary, not a lower bound
 // on the reviewed model rates: recognized OpenAI/Codex events before this date
 // remain priceable unless a card has an explicit vendor-effective boundary.
@@ -10,7 +10,7 @@ export const OPENAI_PRICE_EVIDENCE_START_DATE = OPENAI_FIRST_OBSERVED_DATE;
 // lower bound on the reviewed model rates.
 const ANTHROPIC_OBSERVED_AT = "2026-07-25T14:18:33Z";
 const PER_MILLION = "1000000";
-export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.6";
+export const APP_PRICE_REGISTRY_VERSION = "app-official-api-prices-v0.7";
 
 export const OFFICIAL_PRICE_SOURCE_URLS = Object.freeze({
   openai: "https://developers.openai.com/api/docs/pricing",
@@ -41,7 +41,7 @@ const SOURCE_DEFINITIONS = Object.freeze({
     provider: "openai",
     name: "openai-official-api-pricing",
     url: OFFICIAL_PRICE_SOURCE_URLS.openai,
-    observedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
+    observedAt: "2026-08-30T06:01:00Z",
     evidenceVersion: "openai-api-pricing-reviewed-2026-08-30",
     evidenceUrls: Object.freeze([
       OFFICIAL_PRICE_SOURCE_URLS.openai,
@@ -57,7 +57,33 @@ const SOURCE_DEFINITIONS = Object.freeze({
     evidenceVersion: "anthropic-api-pricing-reviewed-2026-07-25",
     evidenceUrls: Object.freeze([OFFICIAL_PRICE_SOURCE_URLS.anthropic]),
   }),
+  openaiAstra: Object.freeze({
+    provider: "openai",
+    name: "openai-official-astra-api-pricing",
+    url: OFFICIAL_PRICE_SOURCE_URLS.openai,
+    observedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
+    evidenceVersion: "openai-astra-api-pricing-reviewed-2026-09-03",
+    evidenceUrls: Object.freeze([
+      OFFICIAL_PRICE_SOURCE_URLS.openai,
+      "https://developers.openai.com/api/docs/models/gpt-6-astra",
+      "https://learn.chatgpt.com/docs/changelog",
+    ]),
+  }),
 });
+
+// Astra's release-date lower bound is independent of the later review time.
+// These eight cells were each reviewed on the official pricing tabs. Unlike
+// legacy cards, Astra's documented long band starts strictly above 272K.
+const OPENAI_ASTRA_ROWS = Object.freeze([
+  ["gpt-6-astra", "standard", "10", "1", "12.5", "50", "short", "from-2026-09-03"],
+  ["gpt-6-astra", "standard", "20", "2", "25", "75", "long", "from-2026-09-03"],
+  ["gpt-6-astra", "batch", "5", "0.5", "6.25", "25", "short", "from-2026-09-03"],
+  ["gpt-6-astra", "batch", "10", "1", "12.5", "37.5", "long", "from-2026-09-03"],
+  ["gpt-6-astra", "flex", "5", "0.5", "6.25", "25", "short", "from-2026-09-03"],
+  ["gpt-6-astra", "flex", "10", "1", "12.5", "37.5", "long", "from-2026-09-03"],
+  ["gpt-6-astra", "priority", "20", "2", "25", "100", "short", "from-2026-09-03"],
+  ["gpt-6-astra", "priority", "40", "4", "50", "150", "long", "from-2026-09-03"],
+]);
 
 const OPENAI_ROWS = Object.freeze([
   // Values are model, API tier, input, cache read, cache write, output
@@ -283,6 +309,7 @@ const ANTHROPIC_TOOL_ROWS = Object.freeze([
 export const NORMALIZED_PRICE_EVIDENCE_ROWS = deepFreeze({
   openai: [OPENAI_ROWS, OPENAI_TOOL_ROWS],
   anthropic: [ANTHROPIC_ROWS, ANTHROPIC_TOOL_ROWS],
+  openaiAstra: [OPENAI_ASTRA_ROWS],
 });
 
 // These hashes are generated from the normalized reviewed rows during an
@@ -291,6 +318,7 @@ export const NORMALIZED_PRICE_EVIDENCE_ROWS = deepFreeze({
 const EVIDENCE_HASHES = Object.freeze({
   openai: "ec99367fb7d91dc68f1501e325384eda7a5cf885c763deebd28e1eff594dad57",
   anthropic: "7653380aa58230fef8a39a17f141fe04bd763ca39390a69671825e6f6109d76e",
+  openaiAstra: "546af74276392ac5cd4f3faab783fff6d2b62235c7a5288012e8a24fd309301b",
 });
 
 function component(usageComponent, amount, conditions) {
@@ -346,7 +374,7 @@ function source(provider) {
 
 function cardId(provider, model, tier, suffix = "current") {
   const observedDate = SOURCE_DEFINITIONS[provider].observedAt.slice(0, 10);
-  return `${provider}:${model}:${tier}:${suffix}:official-observed-${observedDate}`;
+  return `${SOURCE_DEFINITIONS[provider].provider}:${model}:${tier}:${suffix}:official-observed-${observedDate}`;
 }
 
 // Effective-window helpers. The review dates remain provenance metadata for
@@ -409,17 +437,19 @@ const OPENAI_ALIAS_ASSUMPTIONS = Object.freeze({
 });
 
 function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextBand = null, period = null]) {
+  const isAstra = model === "gpt-6-astra";
+  const sourceKey = isAstra ? "openaiAstra" : "openai";
   const contextConditions = contextBand === "short"
-    ? { max_total_input_tokens: "271999" }
+    ? { max_total_input_tokens: isAstra ? "272000" : "271999" }
     : contextBand === "long"
-      ? { min_total_input_tokens: "272000" }
+      ? { min_total_input_tokens: isAstra ? "272001" : "272000" }
       : null;
   const aliases = OPENAI_MODEL_ALIASES[model];
   const validity = openAiEffective(period);
   const bandSuffix = contextBand ?? "current";
   return {
     schema_version: "0.1",
-    id: cardId("openai", model, tier, period ? `${bandSuffix}-${validity.suffix}` : bandSuffix),
+    id: cardId(sourceKey, model, tier, period ? `${bandSuffix}-${validity.suffix}` : bandSuffix),
     provider: "openai",
     model,
     ...(aliases ? { aliases } : {}),
@@ -434,20 +464,22 @@ function openAiCard([model, tier, input, cacheRead, cacheWrite, output, contextB
       providerUnitComponent("web_search_units", "10", "search", "1000", contextConditions),
       providerUnitComponent("file_search_units", "2.5", "call", "1000", contextConditions),
     ].filter(Boolean),
-    source: source("openai"),
+    source: source(sourceKey),
     metadata: {
       pricing_basis: "official_api_price_not_subscription_allowance",
       api_service_tier: tier,
       subscription_speed_tier: null,
       total_input_context_band: contextBand,
-      provenance: provenance("openai", validity),
+      provenance: provenance(sourceKey, validity),
       ...(aliases ? {
         alias_assumptions: Object.fromEntries(
           aliases.map((alias) => [alias, OPENAI_ALIAS_ASSUMPTIONS[alias]]),
         ),
       } : {}),
       ...(contextBand ? {
-        coverage_note: contextBand === "short"
+        coverage_note: isAstra
+          ? "Astra short-context prices apply through 272,000 total request input tokens; above 272,000, long prices apply to the entire request."
+          : contextBand === "short"
           ? "Short-context prices apply through 271,999 total input tokens; the long band begins at 272,000."
           : "Long-context prices apply from 272,000 total input tokens using the official 2x input and 1.5x output rule.",
       } : {}),
@@ -543,7 +575,7 @@ function providerToolCard(provider, model, rows) {
   };
 }
 
-export const OPENAI_OFFICIAL_PRICE_CARDS = deepFreeze(OPENAI_ROWS.map(openAiCard));
+export const OPENAI_OFFICIAL_PRICE_CARDS = deepFreeze([...OPENAI_ROWS, ...OPENAI_ASTRA_ROWS].map(openAiCard));
 export const ANTHROPIC_OFFICIAL_PRICE_CARDS = deepFreeze(ANTHROPIC_ROWS.map(anthropicCard));
 export const PROVIDER_TOOL_PRICE_CARDS = deepFreeze([
   providerToolCard("openai", "openai-provider-tools", OPENAI_TOOL_ROWS),
@@ -556,7 +588,7 @@ export const APP_OFFICIAL_PRICE_CARDS = deepFreeze([
 ]);
 
 export const APP_PRICE_REGISTRY_SHA256 =
-  "0a5879e981f20f1d244ef193427cf198199bd5e7fd407eca4c0ae48f11d717ac";
+  "303374d522e7ef695beefe1fbf6f3d2b5c84b8b9c6130921a70bc5e8ec1d56e0";
 
 export const APP_PRICE_REGISTRY_MANIFEST = deepFreeze({
   version: APP_PRICE_REGISTRY_VERSION,
@@ -564,13 +596,13 @@ export const APP_PRICE_REGISTRY_MANIFEST = deepFreeze({
   observedAt: APP_PRICE_REGISTRY_OBSERVED_AT,
   priceBasis: "official_api_price_not_subscription_allowance",
   historicalDefault: "event_time_when_official_effective_window_matches",
-  sources: Object.values(SOURCE_DEFINITIONS).map((definition) => ({
+  sources: Object.entries(SOURCE_DEFINITIONS).map(([sourceKey, definition]) => ({
     provider: definition.provider,
     url: definition.url,
     observedAt: definition.observedAt,
     evidenceVersion: definition.evidenceVersion,
     evidenceUrls: definition.evidenceUrls,
-    evidenceSha256: EVIDENCE_HASHES[definition.provider],
+    evidenceSha256: EVIDENCE_HASHES[sourceKey],
   })),
 });
 
@@ -648,12 +680,12 @@ export function validateOfficialPriceRegistry(cards = APP_OFFICIAL_PRICE_CARDS) 
       assertDecimalString(priceComponent.price?.amount, `${card.id} component price amount`);
       assertDecimalString(priceComponent.price?.per, `${card.id} component price divisor`);
       if (contextBand === "short"
-        && (priceComponent.conditions?.max_total_input_tokens !== "271999"
+        && (priceComponent.conditions?.max_total_input_tokens !== (card.model === "gpt-6-astra" ? "272000" : "271999")
           || priceComponent.conditions?.min_total_input_tokens !== undefined)) {
         throw new TypeError(`${card.id} has a malformed short-context component boundary.`);
       }
       if (contextBand === "long"
-        && (priceComponent.conditions?.min_total_input_tokens !== "272000"
+        && (priceComponent.conditions?.min_total_input_tokens !== (card.model === "gpt-6-astra" ? "272001" : "272000")
           || priceComponent.conditions?.max_total_input_tokens !== undefined)) {
         throw new TypeError(`${card.id} has a malformed long-context component boundary.`);
       }
@@ -693,7 +725,7 @@ export function addOfficialPriceRegistry(resolution, cards = APP_OFFICIAL_PRICE_
     retrieved_at: definition.observedAt,
     version: definition.evidenceVersion,
     evidence_urls: definition.evidenceUrls,
-    card_count: cards.filter((card) => card.provider === definition.provider).length,
+    card_count: cards.filter((card) => card.source?.name === definition.name).length,
     selected: true,
   }));
 

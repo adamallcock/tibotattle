@@ -3024,7 +3024,7 @@ footer p { margin: 0; }
 }
 .community-site .platform-selector {
   display: inline-flex;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   align-items: center;
   justify-self: start;
   width: auto;

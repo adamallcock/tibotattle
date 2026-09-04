@@ -1,4 +1,5 @@
 import { setImmediate as cooperativeYield } from "node:timers/promises";
+import { codexCacheReasoningConfiguration } from "@app-usagemonitor/telemetry-contract";
 import {
   openLocalUnifiedIndex,
   readUnifiedIndexGenerationDescriptor,
@@ -23,8 +24,6 @@ const CURRENT_PARSERS = new Set([
   LOCAL_UNIFIED_INDEX_PARSER_VERSION, LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
 ]);
 const EFFORTS = new Set(REASONING_EFFORTS.filter((value) => value !== "unknown"));
-const MAX_EFFORT = reasoningEffortOrdinal("max");
-const ULTRA_EFFORT = reasoningEffortOrdinal("ultra");
 const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const POSITIVE_INPUT = `COALESCE(tokens_in_uncached, 0)
   + COALESCE(tokens_in_cache_read, 0) + COALESCE(tokens_in_cache_write, 0) > 0`;
@@ -157,13 +156,15 @@ function previousConfigurationMatches(reference, previous, current) {
     return previous.reasoning_effort === reference.previousEffort;
   }
   // Continuity details expose only the current label. Match the analyzer's
-  // effective-effort boundary: Max and Ultra are equivalent, but a different
-  // observed tier or surface is not cache continuity. Analyzer-backed tests
+  // model-specific request-effort boundary, not an inferred backend update.
+  // A different observed tier or surface is not cache continuity. Tests
   // pin this to sameContinuityConfiguration without widening the anonymous DTO.
-  const previousEffort = previous.reasoning_effort === ULTRA_EFFORT
-    ? MAX_EFFORT : previous.reasoning_effort;
-  const currentEffort = reference.currentEffort === ULTRA_EFFORT
-    ? MAX_EFFORT : reference.currentEffort;
+  const previousEffort = codexCacheReasoningConfiguration(
+    reference.currentModel, REASONING_EFFORTS[previous.reasoning_effort],
+  );
+  const currentEffort = codexCacheReasoningConfiguration(
+    reference.currentModel, REASONING_EFFORTS[reference.currentEffort],
+  );
   return previousEffort === currentEffort
     && sameObservedDimension(previous.tier_id, current.tier_id)
     && sameObservedDimension(previous.surface_id, current.surface_id);

@@ -208,23 +208,39 @@ function canonicalSubject(value) {
   return createHash("sha256").update(stableJson(value)).digest("hex");
 }
 
+function sourceOccurrenceScopeId(event) {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(event, "sourceOccurrenceScopeId");
+    if (descriptor === undefined) return null;
+    if ("value" in descriptor && typeof descriptor.value === "string"
+        && SESSION_SCOPE_PATTERN.test(descriptor.value)) return descriptor.value;
+  } catch {
+    // Rejected provider-derived material must not enter errors or diagnostics.
+  }
+  throw new TypeError("Invalid privacy-safe source occurrence scope");
+}
+
 function usageEventIdentitySubject(event) {
+  const occurrenceScope = sourceOccurrenceScopeId(event);
   return {
-    identityVersion: "codex-source-occurrence-v1",
+    identityVersion: occurrenceScope === null ? "codex-source-occurrence-v1" : "codex-source-occurrence-v2",
     provider: "openai_codex",
     sourceFormat: "codex-rollout-jsonl",
     sourceScopeId: event.sourceScopeId,
+    ...(occurrenceScope === null ? {} : { sourceOccurrenceScopeId: occurrenceScope }),
     sourceRecordOrdinal: event.sourceRecordOrdinal,
     recordKind: "token_count",
   };
 }
 
 function quotaObservationIdentitySubject(event, slot) {
+  const occurrenceScope = sourceOccurrenceScopeId(event);
   return {
-    identityVersion: "codex-source-occurrence-v1",
+    identityVersion: occurrenceScope === null ? "codex-source-occurrence-v1" : "codex-source-occurrence-v2",
     provider: "openai_codex",
     sourceFormat: "codex-rollout-jsonl",
     sourceScopeId: event.sourceScopeId,
+    ...(occurrenceScope === null ? {} : { sourceOccurrenceScopeId: occurrenceScope }),
     sourceRecordOrdinal: event.sourceRecordOrdinal,
     recordKind: "rate_limit_snapshot",
     slot,
@@ -711,21 +727,28 @@ async function scanCodexSafeRecords({
     });
   }
 
-  const toolCountsBySession = new Map();
+  // Paginated resets keep the logical session but restart physical ordinals
+  // and pending tools. Legacy sources retain their original session grouping.
+  const toolCountsByScope = new Map();
   const scan = await scanCodexLogEvents({
     startAt: bounds.startAt,
     endAt: bounds.endAt,
     codexHome,
     sourceScopeForRollout: (rawScope) => deriveSessionScopeId(secret, rawScope),
+    sourceOccurrenceScopeForRollout: (rawScope) => (
+      deriveSessionScopeId(secret, `codex-rollout-occurrence/v1\0${rawScope}`)
+    ),
     onToolCall(event) {
       if (!event.sourceScopeId) throw new Error("Missing privacy-safe session scope for tool event");
-      const counts = toolCountsBySession.get(event.sourceScopeId) ?? createEmptySafeToolClassCounts();
+      const scope = sourceOccurrenceScopeId(event) ?? event.sourceScopeId;
+      const counts = toolCountsByScope.get(scope) ?? createEmptySafeToolClassCounts();
       counts[safeToolCountFieldForScannerToolClass(event.toolClass)] += 1;
-      toolCountsBySession.set(event.sourceScopeId, counts);
+      toolCountsByScope.set(scope, counts);
     },
     async onUsage(event) {
-      const toolClassCounts = toolCountsBySession.get(event.sourceScopeId) ?? createEmptySafeToolClassCounts();
-      toolCountsBySession.delete(event.sourceScopeId);
+      const scope = sourceOccurrenceScopeId(event) ?? event.sourceScopeId;
+      const toolClassCounts = toolCountsByScope.get(scope) ?? createEmptySafeToolClassCounts();
+      toolCountsByScope.delete(scope);
       await emitSafeRecord(onRecord, resourceGuard, "usageEvent", normalizeCodexUsageEvent(secret, event, toolClassCounts));
     },
     async onRateLimitSnapshot(event) {
@@ -753,7 +776,7 @@ async function scanCodexSafeRecords({
     if (normalized) await emitSafeRecord(onRecord, resourceGuard, "activityMarker", normalized);
   }
 
-  const leftoverToolCalls = [...toolCountsBySession.values()]
+  const leftoverToolCalls = [...toolCountsByScope.values()]
     .reduce((total, counts) => total + Object.values(counts).reduce((sum, count) => sum + count, 0), 0);
   return {
     parserVersion: scan.parserVersion,

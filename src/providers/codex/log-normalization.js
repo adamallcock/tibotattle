@@ -21,6 +21,9 @@ export function validAbortSignal(signal) {
       && typeof signal.addEventListener === "function");
 }
 
+// #41912 response-usage records and compacted.latest_token_usage_record are
+// overlapping evidence, not additive spend. Keep legacy token_count as the
+// supported accounting source until response-identity reconciliation exists.
 export const CODEX_LOG_RELEVANT_LINE_NEEDLES = Object.freeze([
   '"type":"session_meta"',
   '"type":"turn_context"',
@@ -60,7 +63,10 @@ export function normalizeTokenUsage(value) {
 }
 
 export function tokenComponentPresence(value) {
-  return Object.fromEntries(COMPONENT_KEYS.map((key) => [key, Boolean(value && Object.hasOwn(value, key))]));
+  return Object.fromEntries(COMPONENT_KEYS.map((key) => [key,
+    Boolean(value && Object.hasOwn(value, key)
+      && Number.isSafeInteger(value[key]) && value[key] >= 0),
+  ]));
 }
 
 export function deltaComponentPresence(current, previous) {

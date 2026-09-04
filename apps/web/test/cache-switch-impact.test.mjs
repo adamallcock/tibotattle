@@ -589,6 +589,26 @@ test("incomplete compaction coverage withholds a continuity premium", () => {
   })).status, "unavailable");
 });
 
+test("Astra switches preserve mode boundaries and reject unknown-model evidence", () => {
+  for (const previousEffort of ["max", "xhigh", "low"]) {
+    const selected = period({ recent: [recentRow(0, {
+      changeType: "reasoning_only",
+      previous: { model: "gpt-6-astra", reasoningEffort: previousEffort },
+      current: { model: "gpt-6-astra", reasoningEffort: "ultra" },
+    })] });
+    const result = normalizedImpact(impact({ ...selected, periods: [selected] }));
+    assert.equal(result.recent.length, 1);
+    assert.equal(result.recent[0].previous.reasoningEffort, previousEffort);
+    assert.equal(result.recent[0].current.model, "gpt-6-astra");
+  }
+  const unknown = period({ recent: [recentRow(0, {
+    changeType: "reasoning_only",
+    previous: { model: "private-model", reasoningEffort: "max" },
+    current: { model: "private-model", reasoningEffort: "ultra" },
+  })] });
+  assert.deepEqual(normalizedImpact(impact({ ...unknown, periods: [unknown] })).recent, []);
+});
+
 test("cache-switch normalization fails closed on methodology and semantic mismatches", () => {
   assert.equal(normalizedImpact({}).status, "unavailable");
   assert.equal(

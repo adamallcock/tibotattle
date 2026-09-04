@@ -69,8 +69,86 @@ export const TELEMETRY_MODEL_IDS: readonly [
   "claude-opus-4-8",
   "claude-sonnet-4-6",
   "claude-sonnet-5",
+  "codex-auto-review",
+  "gpt-4-turbo-2024-04-09",
+  "gpt-4.1-mini",
+  "gpt-4.1-nano",
+  "gpt-4o",
+  "gpt-4o-2024-05-13",
+  "gpt-4o-mini",
+  "gpt-5-codex",
+  "gpt-5-mini",
+  "gpt-5-nano",
+  "gpt-5-pro",
+  "gpt-5.1",
+  "gpt-5.1-codex",
+  "gpt-5.1-codex-mini",
+  "gpt-5.2",
+  "gpt-5.2-codex",
+  "gpt-5.2-pro",
+  "gpt-5.3-codex",
+  "gpt-5.3-codex-spark",
+  "gpt-5.4-nano",
+  "gpt-5.4-pro",
+  "gpt-5.5-pro",
+  "gpt-5.6-sol-wm",
+  "gpt-6-astra",
+  "o1",
+  "o1-pro",
+  "o3",
+  "o3-mini",
+  "o3-pro",
+  "o4-mini",
 ];
 export type TelemetryModelId = typeof TELEMETRY_MODEL_IDS[number];
+
+export interface ReviewedModelIdentity {
+  readonly id: Exclude<TelemetryModelId, "unknown">;
+  readonly label: string;
+  readonly provider: "openai_codex" | "anthropic_claude_code";
+  readonly allowanceTrack: "primary" | "spark";
+  readonly pricingStatus: "published" | "assumed_alias" | "unpriced";
+  readonly priceModelId: Exclude<TelemetryModelId, "unknown"> | null;
+}
+export const REVIEWED_MODEL_CATALOG_VERSION: "reviewed-model-catalog-2026-09-03.1";
+export const REVIEWED_MODEL_CATALOG: readonly ReviewedModelIdentity[];
+export const REVIEWED_CODEX_MODEL_IDS: readonly Exclude<TelemetryModelId, "unknown">[];
+export const REVIEWED_CLAUDE_MODEL_IDS: readonly Exclude<TelemetryModelId, "unknown">[];
+export function reviewedModelIdentity(value: unknown): ReviewedModelIdentity | null;
+export function codexRequestReasoningEffort(modelId: unknown, effort: unknown):
+  "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "unknown" | null;
+export function codexCacheReasoningConfiguration(modelId: unknown, effort: unknown):
+  ReturnType<typeof codexRequestReasoningEffort>;
+
+export interface AdminModelHistoryCounts {
+  readonly fittedParticipantCount: number;
+  readonly unstableParticipantCount: number;
+  readonly staleParticipantCount: number;
+  readonly refusedParticipantCount: number;
+  readonly v1ParticipantCount: number;
+  readonly unsupportedSourceParticipantCount: number;
+}
+export interface AdminModelHistoryDay extends AdminModelHistoryCounts {
+  readonly day: string;
+  readonly catalogVersion: string;
+  readonly values: readonly (readonly [string, number, number])[];
+}
+export interface ExpandedAdminModelHistoryDay extends AdminModelHistoryDay {
+  readonly byModel: Readonly<Record<string, Readonly<{
+    capacityUsd: number | null;
+    participantCount: number | null;
+  }>>>;
+}
+export const ADMIN_MODEL_CONFIG: readonly Readonly<{
+  modelId: Exclude<TelemetryModelId, "unknown">;
+  label: string;
+  allowanceTrack: "primary" | "spark";
+  pricingStatus: "published" | "assumed_alias" | "unpriced";
+}>[];
+export const ADMIN_MODEL_HISTORY_CATALOG_VERSION: typeof REVIEWED_MODEL_CATALOG_VERSION;
+export const LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION: "admin-model-roster-v0.2";
+export function projectAdminModelHistoryDay(value: unknown): AdminModelHistoryDay | null;
+export function expandAdminModelHistoryDay(value: unknown): ExpandedAdminModelHistoryDay | null;
 
 export const TELEMETRY_CONTRACT_ERROR_CODES: readonly [
   "ENVELOPE_INVALID",

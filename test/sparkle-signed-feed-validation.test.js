@@ -236,7 +236,7 @@ test("rejects an unsigned minimal document outright", () => {
   );
 });
 
-test("rejects a signed document that is not the official shape", () => {
+test("rejects an ARM feed with missing hardware requirements", () => {
   const text = officialSignedAppcastText({
     mutatePrefix: (value) => value.replace(
       /\s*<sparkle:hardwareRequirements>arm64<\/sparkle:hardwareRequirements>/u,
@@ -245,7 +245,7 @@ test("rejects a signed document that is not the official shape", () => {
   });
   assert.throws(
     () => validate(text),
-    { code: "SPARKLE_SIGNED_FEED_SHAPE_INVALID" },
+    { code: "SPARKLE_SIGNED_FEED_ARCHITECTURE_MISMATCH" },
   );
 });
 
@@ -390,4 +390,32 @@ test("validator regex literals are character-identical to the Worker guard", asy
     validatorOfficial,
     `/${OFFICIAL_SIGNED_SPARKLE_APPCAST_PATTERN.source}/${OFFICIAL_SIGNED_SPARKLE_APPCAST_PATTERN.flags}`,
   );
+});
+
+
+test("Intel signed feeds are isolated by hardware requirements, artifact, and namespace", () => {
+  const intel = getReleaseChannel("stable", { architecture: "x64" });
+  const intelName = "TiboTattle-0.1.0-macOS-x64.dmg";
+  const intelText = (mutate = (value) => value) => officialSignedAppcastText({
+    fileName: intelName,
+    mutatePrefix: (value) => mutate(value
+      .replace("/releases/", "/intel/releases/")
+      .replace("<sparkle:minimumSystemVersion>13.0", "<sparkle:minimumSystemVersion>14.0")
+      .replace(/\s*<sparkle:hardwareRequirements>arm64<\/sparkle:hardwareRequirements>/u, "")),
+  });
+  const options = { architecture: "x64", objectPrefix: intel.sparkle.objectPrefix, dmg: null };
+  assert.equal(validate(intelText(), options).enclosure.fileName, intelName);
+  assert.throws(() => validate(intelText()), { code: "SPARKLE_SIGNED_FEED_ARCHITECTURE_MISMATCH" });
+  assert.throws(() => validate(officialSignedAppcastText(), options), { code: "SPARKLE_SIGNED_FEED_ARCHITECTURE_MISMATCH" });
+  for (const mutate of [
+    (value) => value.replace(intelName, ARTIFACT_FILE_NAME),
+    (value) => value.replace("<sparkle:shortVersionString>0.1.0", "<sparkle:shortVersionString>0.1.1"),
+    (value) => value.replace("<sparkle:minimumSystemVersion>14.0", "<sparkle:minimumSystemVersion>13.0"),
+    (value) => value.replace("<enclosure", "<sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements><enclosure"),
+  ]) {
+    assert.throws(() => validate(intelText(mutate), options), { code: "SPARKLE_SIGNED_FEED_ARCHITECTURE_MISMATCH" });
+  }
+  assert.throws(() => validate(intelText((value) => value.replace("/intel/releases/", "/releases/")), options),
+    { code: "SPARKLE_SIGNED_FEED_ENCLOSURE_URL_INVALID" });
+  assert.equal(validateCandidateAppcastShape(intelText(), "stable", { architecture: "x64" }).length, 1);
 });

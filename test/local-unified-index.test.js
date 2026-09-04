@@ -309,9 +309,10 @@ function tokenCountTotalOnly(timestamp, total) {
   });
 }
 
-function compacted(timestamp, paddingBytes = 0) {
+function compacted(timestamp, paddingBytes = 0, ordinal = null) {
   return JSON.stringify({
     timestamp,
+    ...(ordinal === null ? {} : { ordinal }),
     type: "compacted",
     payload: {
       message: "SECRET COMPACTION SUMMARY DO NOT INDEX",
@@ -2572,6 +2573,23 @@ test("a compaction is recognized only from its bounded top-level header", async 
     )),
     { observedAtMs: Date.parse("2026-07-25T00:00:02.000Z") },
   );
+  for (const ordinal of ["0", "123", "18446744073709551615"]) {
+    assert.deepEqual(parseCompactionPrefix(Buffer.from(
+      `{"timestamp":"2026-07-25T00:00:02.000Z","ordinal":${ordinal},`
+      + '"type":"compacted","payload":{"content":"SECRET"}}',
+    )), { observedAtMs: Date.parse("2026-07-25T00:00:02.000Z") });
+  }
+  for (const ordinal of ["", "-1", "1.5", "1e3", '"1"', "null", "01",
+    "18446744073709551616", "1".repeat(1000)]) {
+    assert.equal(parseCompactionPrefix(Buffer.from(
+      `{"timestamp":"2026-07-25T00:00:02.000Z","ordinal":${ordinal},`
+      + '"type":"compacted","payload":{}}',
+    )), null);
+  }
+  assert.equal(parseCompactionPrefix(Buffer.from(
+    '{"timestamp":"2026-07-25T00:00:02.000Z","ordinal":1,"payload":'
+      + '{"type":"compacted"},"type":"compacted"}',
+  )), null);
   // A content-bearing record may itself contain an object whose type happens
   // to be `compacted`. Anchoring on the top-level timestamp/type header keeps
   // that nested marker from becoming a false boundary (or making the parser
@@ -2591,7 +2609,8 @@ test("a compaction is recognized only from its bounded top-level header", async 
   }))), null);
 });
 
-test("an oversized compaction stores only a content-free boundary with provenance", async () => {
+for (const ordinal of [null, 123]) {
+test(`an oversized compaction stores only a content-free boundary with provenance (ordinal ${ordinal})`, async () => {
   const root = await mkdtemp(join(tmpdir(), "unified-compaction-"));
   const sessions = join(root, "sessions", "2026", "07", "25");
   await mkdir(sessions, { recursive: true });
@@ -2605,7 +2624,7 @@ test("an oversized compaction stores only a content-free boundary with provenanc
       type: "response_item",
       payload: { metadata: { type: "compacted" }, content: "SECRET NESTED" },
     }),
-    compacted(compactedAt, 20_000),
+    compacted(compactedAt, 20_000, ordinal),
     tokenCount("2026-07-25T00:00:02.000Z", usage(100, 10), usage(100, 10)),
   ].join("\n")}\n`);
   try {
@@ -2665,6 +2684,7 @@ test("an oversized compaction stores only a content-free boundary with provenanc
     await rm(root, { recursive: true });
   }
 });
+}
 
 test("boundaries attach to the exact next positive input and require a real turn marker", async () => {
   const tied = "2026-07-25T00:05:00.000Z";

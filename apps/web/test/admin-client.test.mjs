@@ -2,6 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import {
+  ADMIN_MODEL_CONFIG, LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+} from "../public/telemetry-shared.generated.js";
+import {
   AdminResponseError,
   adminActionErrorMessage,
   adminResponseError,
@@ -65,7 +68,7 @@ function allowancePreviewPayload() {
     },
   };
   return {
-    schemaVersion: "admin-community-allowance-preview-v0.2",
+    schemaVersion: "admin-community-allowance-preview-v0.3",
     generatedAt: "2026-08-23T10:30:00.000Z",
     from: "2026-06-15",
     to: "2026-08-23",
@@ -81,22 +84,17 @@ function allowancePreviewPayload() {
     ],
     days,
     models: {
-      modelConfig: [
-        { modelId: "gpt-5.6-sol", label: "Sol" },
-        { modelId: "gpt-5.6-terra", label: "Terra" },
-        { modelId: "gpt-5.6-luna", label: "Luna" },
-        { modelId: "gpt-5.5", label: "GPT-5.5" },
-      ],
+      modelConfig: ADMIN_MODEL_CONFIG,
       basis: "seven_day_codex_pro20x_equivalent_per_model_composition",
       gate: "shared_composition_kernel_identification",
       days: [{
         day: "2026-08-23",
-        byModel: {
-          "gpt-5.6-sol": { capacityUsd: 2_423, participantCount: 1 },
-          "gpt-5.6-terra": { capacityUsd: 1_101, participantCount: 1 },
-          "gpt-5.6-luna": { capacityUsd: null, participantCount: 0 },
-          "gpt-5.5": { capacityUsd: 2_124, participantCount: 1 },
-        },
+        catalogVersion: LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+        values: [
+          ["gpt-5.6-sol", 2_423, 1],
+          ["gpt-5.6-terra", 1_101, 1],
+          ["gpt-5.5", 2_124, 1],
+        ],
         fittedParticipantCount: 1,
         unstableParticipantCount: 0,
         staleParticipantCount: 0,
@@ -165,6 +163,10 @@ test("admin allowance preview projects the fixed merge trial contract", () => {
     capacityUsd: null,
     participantCount: 0,
   });
+  assert.deepEqual(preview.models.days[0].byModel["gpt-6-astra"], {
+    capacityUsd: null, participantCount: null,
+  });
+  assert.equal(preview.models.modelConfig.length, ADMIN_MODEL_CONFIG.length);
   assert.throws(() => projectAdminAllowancePreview({
     ...allowancePreviewPayload(),
     models: undefined,

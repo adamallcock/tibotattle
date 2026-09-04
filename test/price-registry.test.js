@@ -46,14 +46,14 @@ function price({ provider, model, tier = "standard", pricedAt = "2026-07-26", co
 
 test("registry validates and preserves exact decimal strings and provenance", () => {
   assert.equal(validateOfficialPriceRegistry(), APP_OFFICIAL_PRICE_CARDS);
-  assert.equal(OPENAI_OFFICIAL_PRICE_CARDS.length, 135);
+  assert.equal(OPENAI_OFFICIAL_PRICE_CARDS.length, 143);
   assert.equal(ANTHROPIC_OFFICIAL_PRICE_CARDS.length, 13);
   const batch54 = OPENAI_OFFICIAL_PRICE_CARDS.find((card) => card.model === "gpt-5.4" && card.service_tier === "batch");
   assert.equal(batch54.components.find((item) => item.usage_component === "input_cache_read_tokens").price.amount, "0.13");
   assert.match(batch54.metadata.provenance.evidence_sha256, /^[a-f0-9]{64}$/);
   assert.match(APP_PRICE_REGISTRY_SHA256, /^[a-f0-9]{64}$/);
   assert.equal(APP_PRICE_REGISTRY_MANIFEST.sha256, APP_PRICE_REGISTRY_SHA256);
-  assert.equal(APP_PRICE_REGISTRY_MANIFEST.sources.length, 2);
+  assert.equal(APP_PRICE_REGISTRY_MANIFEST.sources.length, 3);
   assert.equal(batch54.metadata.provenance.vendor_effective_from, null);
   assert.equal(OPENAI_PRICE_EVIDENCE_START_DATE, "2026-07-26");
   assert.equal(batch54.effective.from, undefined);
@@ -70,6 +70,50 @@ test("registry validates and preserves exact decimal strings and provenance", ()
     APP_PRICE_REGISTRY_MANIFEST.sources.find((source) => source.provider === "anthropic").evidenceSha256,
   );
   assert.equal(sha256Json(APP_OFFICIAL_PRICE_CARDS), APP_PRICE_REGISTRY_SHA256);
+  assert.equal(
+    sha256Json(NORMALIZED_PRICE_EVIDENCE_ROWS.openaiAstra),
+    APP_PRICE_REGISTRY_MANIFEST.sources.find((source) => source.evidenceVersion === "openai-astra-api-pricing-reviewed-2026-09-03").evidenceSha256,
+  );
+  // This addition must not change even the provenance bytes of legacy cards.
+  assert.equal(
+    sha256Json(APP_OFFICIAL_PRICE_CARDS.filter((card) => card.model !== "gpt-6-astra")),
+    "0a5879e981f20f1d244ef193427cf198199bd5e7fd407eca4c0ae48f11d717ac",
+  );
+});
+
+test("Astra has eight exact cards with a strict above-272K boundary and independent release provenance", () => {
+  const expected = {
+    standard: { short: ["10", "1", "12.5", "50"], long: ["20", "2", "25", "75"] },
+    batch: { short: ["5", "0.5", "6.25", "25"], long: ["10", "1", "12.5", "37.5"] },
+    flex: { short: ["5", "0.5", "6.25", "25"], long: ["10", "1", "12.5", "37.5"] },
+    priority: { short: ["20", "2", "25", "100"], long: ["40", "4", "50", "150"] },
+  };
+  const names = ["input_uncached_tokens", "input_cache_read_tokens", "input_cache_write_tokens", "output_text_tokens"];
+  assert.equal(OPENAI_OFFICIAL_PRICE_CARDS.filter((card) => card.model === "gpt-6-astra").length, 8);
+  for (const [tier, bands] of Object.entries(expected)) {
+    for (const totalInputTokens of [271_999, 272_000, 272_001]) {
+      const values = totalInputTokens > 272_000 ? bands.long : bands.short;
+      for (const [index, name] of names.entries()) {
+        const result = price({ provider: "openai", model: "gpt-6-astra", tier,
+          pricedAt: "2026-09-03", totalInputTokens, components: { [name]: 1_000_000 } });
+        assert.equal(result.total, values[index], `${tier}/${totalInputTokens}/${name}`);
+        assert.deepEqual(result.warnings, []);
+      }
+    }
+  }
+  const card = OPENAI_OFFICIAL_PRICE_CARDS.find((item) => item.model === "gpt-6-astra");
+  assert.deepEqual(card.effective, { from: "2026-09-03" });
+  assert.equal(card.metadata.provenance.vendor_effective_from, "2026-09-03");
+  assert.equal(card.source.retrieved_at, "2026-09-04T02:30:56Z");
+  assert.equal(card.aliases, undefined);
+  assert.ok(card.metadata.provenance.evidence_urls.includes("https://developers.openai.com/api/docs/models/gpt-6-astra"));
+  for (const request of [
+    { model: "gpt-6-astra", pricedAt: "2026-09-02", totalInputTokens: 1_000 },
+    { model: "gpt-6t", pricedAt: "2026-09-03", totalInputTokens: 1_000 },
+  ]) {
+    const result = price({ provider: "openai", ...request, components: { input_uncached_tokens: 1_000 } });
+    assert.notEqual(result.warnings.length, 0, JSON.stringify(request));
+  }
 });
 
 test("exact provider tool units use official call prices without pricing client wrappers", () => {

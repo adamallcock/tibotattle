@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { applyD1Migrations, reset } from "cloudflare:test";
 import type { D1Migration } from "cloudflare:test";
 import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { expandAdminModelHistoryDay } from "@app-usagemonitor/telemetry-contract";
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { handleRequest } from "../src/index";
 import {
@@ -2250,19 +2251,19 @@ describe("per-model composition from the v1.0 chunk corpus", () => {
     expect(day.refusedParticipantCount).toBe(1);
     expect(day.v1ParticipantCount).toBe(4);
     expect(day.unsupportedSourceParticipantCount).toBe(2);
-    expect(day.byModel["gpt-5.6-sol"]).toEqual({
+    expect(expandAdminModelHistoryDay(day)!.byModel["gpt-5.6-sol"]).toEqual({
       capacityUsd: 2_400,
       participantCount: 2,
     });
-    expect(day.byModel["gpt-5.6-terra"]).toEqual({
+    expect(expandAdminModelHistoryDay(day)!.byModel["gpt-5.6-terra"]).toEqual({
       capacityUsd: 1_100,
       participantCount: 1,
     });
-    expect(day.byModel["gpt-5.6-luna"]).toEqual({
+    expect(expandAdminModelHistoryDay(day)!.byModel["gpt-5.6-luna"]).toEqual({
       capacityUsd: null,
       participantCount: 0,
     });
-    expect(day.byModel["gpt-5.5"]).toEqual({
+    expect(expandAdminModelHistoryDay(day)!.byModel["gpt-5.5"]).toEqual({
       capacityUsd: null,
       participantCount: 0,
     });
@@ -2319,7 +2320,7 @@ describe("per-model composition from the v1.0 chunk corpus", () => {
     }, "2026-08-30");
     expect(day.fittedParticipantCount).toBe(1);
     expect(day.staleParticipantCount).toBe(1);
-    expect(day.byModel["gpt-5.6-sol"]).toEqual({
+    expect(expandAdminModelHistoryDay(day)!.byModel["gpt-5.6-sol"]).toEqual({
       capacityUsd: 2_400,
       participantCount: 1,
     });

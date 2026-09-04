@@ -39,7 +39,10 @@ export function selectProductionParticipantIdentity({
       }),
     });
   }
-  if (platform !== "darwin" || architecture !== "arm64") {
+  // The native app injects the same capability-scoped broker on both macOS
+  // architectures. Legacy binding availability remains the adapter's concern.
+  if (platform !== "darwin"
+      || (architecture !== "arm64" && architecture !== "x64")) {
     throw selectionError("EXPORT_IDENTITY_PRODUCTION_BACKEND_UNAVAILABLE");
   }
   if (

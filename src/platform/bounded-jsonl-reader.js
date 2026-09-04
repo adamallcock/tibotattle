@@ -1,5 +1,6 @@
 import { createReadStream } from "node:fs";
 import { lstat } from "node:fs/promises";
+import { isCompressedRolloutSource, readCompressedRolloutBytes } from "./bounded-rollout-bytes.js";
 
 const DEFAULT_MAXIMUM_LINE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_HIGH_WATER_MARK = 256 * 1024;
@@ -66,7 +67,8 @@ export async function* readBoundedUtf8LineEntries(path, {
   throwIfAborted(signal);
   if (maximumTotalBytes === 0 || startByte === maximumTotalBytes) return;
   const callerOwnedHandle = path && typeof path === "object" && Number.isInteger(path.fd);
-  const input = callerOwnedHandle ? null : createReadStream(path, {
+  const compressed = isCompressedRolloutSource(path);
+  const input = callerOwnedHandle || compressed ? null : createReadStream(path, {
     highWaterMark,
     ...(startByte !== 0 ? { start: startByte } : {}),
     ...(maximumTotalBytes === Number.POSITIVE_INFINITY ? {} : { end: maximumTotalBytes - 1 }),
@@ -76,7 +78,14 @@ export async function* readBoundedUtf8LineEntries(path, {
   // was intended to remain with the caller. Read caller-owned FileHandles
   // positionally so post-read integrity verification always retains its exact
   // descriptor and the original exception cannot be masked by EBADF.
-  const chunksInput = callerOwnedHandle ? {
+  const chunksInput = compressed ? {
+    async *[Symbol.asyncIterator]() {
+      for await (const chunk of readCompressedRolloutBytes(path, {
+        start: startByte, end: maximumTotalBytes, highWaterMark, signal, resourceGuard,
+        createLimitError: limitError,
+      })) yield { chunk, reused: false };
+    },
+  } : callerOwnedHandle ? {
     async *[Symbol.asyncIterator]() {
       let position = startByte;
       const scratch = Buffer.allocUnsafe(highWaterMark);
