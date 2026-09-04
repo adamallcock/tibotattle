@@ -167,7 +167,9 @@ function interpolate(message, values = {}) {
 // product-owned legacy nodes only.
 export const WEB_MESSAGES = Object.freeze({
   ...Object.fromEntries(Object.keys(CATALOGS[DEFAULT_LOCALE])
-    .filter((key) => key.startsWith("contribution."))
+    .filter((key) => key.startsWith("contribution.")
+      || key.startsWith("appearance.")
+      || key.startsWith("electron."))
     .map((key) => [key, SUPPORTED_LOCALES.map((locale) => CATALOGS[locale][key])])),
   "language.label": ["Language", "语言", "Idioma"],
   "language.system": ["System", "跟随系统", "Sistema"],
