@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-04
 type: status
 status: current
-source_commit: dc2d0d32a1e82f5b037b0a7094a37c1d4bfdef76
+source_commit: 4ea16586d83c72d0a4af506b102a267251f45a2b
 observation_date: 2026-09-04
 ---
 
@@ -18,8 +18,9 @@ using this page for a later release or operational decision.
 
 | Boundary | Verified state |
 |---|---|
-| Documentation/source review | Combined Astra/Intel candidate `0.1.18`, reviewed source `dc2d0d32a1e82f5b037b0a7094a37c1d4bfdef76`, based on requested `9e1c3333`; [publication preparation](./plans/2026-09-04-release-0-1-18-publication-preparation.md) fixes native rehearsal target/receipt binding and passes 110/110 macOS tests, the full Worker gate and production deployment dry run. App/R7 workload and all ten validated receipts are unchanged from the earlier [paginated qualification](./reviews/2026-09-04-paginated-export-qualification.md), which retains its exact root/build evidence. RC2 `1025.1`; no production-signed combined artifact or stable tag |
-| Intel tester artifact | Inherited signed/notarized `0.1.18` build `1025` dogfood DMG from source `18c7065b`; [exact receipt](./receipts/2026-09-03-macos-intel-signed-candidate.md). Predates combined Astra changes; not physically Intel-qualified |
+| Documentation/source review | Combined Astra/Intel candidate `0.1.18`, frozen source `4ea16586d83c72d0a4af506b102a267251f45a2b`, based on requested `9e1c3333`; [publication preparation](./plans/2026-09-04-release-0-1-18-publication-preparation.md) fixes native rehearsal target/receipt binding and passes 110/110 macOS tests, the full Worker gate and production deployment dry run. App/R7 workload and all ten validated receipts are unchanged from the earlier [paginated qualification](./reviews/2026-09-04-paginated-export-qualification.md), which retains its exact root/build evidence. No stable tag or publication |
+| Combined signed RC2 | ARM and Intel `0.1.18` build `1025.1` dogfood DMGs from common source `4ea16586` and a new local annotated tag; [exact receipt](./receipts/2026-09-04-macos-combined-rc2-signed-candidates.md). Both signed/notarized/stapled with independent exact-byte and same-architecture replacement checks; not installed-upgrade, manual lifecycle or physical Intel proof |
+| Earlier Intel tester artifact | Preserved signed/notarized `0.1.18` build `1025` dogfood DMG from source `18c7065b`; [historical receipt](./receipts/2026-09-03-macos-intel-signed-candidate.md). Predates combined Astra changes; remains immutable rollback/test evidence, not physically Intel-qualified |
 | Installed internal dogfood | Version `0.1.17`, RC9 build `1023.7`, source `394c8a03`; owner accepted the inspected apps on 2026-09-03. Plist version/build/minimum-OS were independently rechecked; this does not qualify every historical credential or clean-profile case |
 | Public service | Health/readiness HTTP 200, enrollment and upload processing enabled; deployment source `b4c8f103bf697fb530434e6de196f2c187645661`, observed 2026-09-04 03:57 UTC (2026-09-03 locally) |
 | Public updater | Stable `0.1.16`; read-only feed check recorded 2026-09-03 in the release plan |
@@ -121,8 +122,9 @@ The complete qualification matrix and rules for changing these claims are in
   closes two native qualification-tooling gaps: architecture/channel selection
   and cross-target manual receipt reuse. Current v2 receipts bind inspected
   source/payload and require explicit human-observed native hardware/OS; they
-  cannot turn synthetic tests into physical qualification. Local checks pass,
-  but signing/notarization, installed lifecycle, physical Intel and hosted
+  cannot turn synthetic tests into physical qualification. Local checks and
+  [combined RC2 signing/notarization](./receipts/2026-09-04-macos-combined-rc2-signed-candidates.md)
+  pass, but installed lifecycle, physical Intel, stable finalization and hosted
   activation remain open. The 0.1.17-only manual-matrix deferral does not carry
   forward. No publication or update activation occurred.
 
@@ -142,8 +144,9 @@ The complete qualification matrix and rules for changing these claims are in
   now passes focused tests; complete R7 regeneration and both runtime freshness
   checks pass. Both optimized development artifacts, twelve isolated smokes,
   the full root suite and all 108 retained macOS tests pass. RC2
-  allocation is now `1025.1`, stable remains `1026`, and a newly signed combined
-  candidate remains outstanding. Physical Intel,
+  allocation is now `1025.1`, stable remains `1026`, and both newly signed
+  combined candidates pass exact-artifact and replacement checks in the
+  [RC2 receipt](./receipts/2026-09-04-macos-combined-rc2-signed-candidates.md). Physical Intel,
   actual consented upload and installed update qualification remain separate
   gates. No public Intel release, feed or website was published.
 

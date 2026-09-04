@@ -2,7 +2,7 @@
 title: Release 0.1.18 publication preparation
 date: 2026-09-04
 type: plan
-status: awaiting-authorization
+status: qualification-blocked
 ---
 
 # Release 0.1.18 publication preparation
@@ -14,11 +14,15 @@ binds the implementation, fresh R7 receipts and ARM/Intel development artifacts.
 It does not supply signed, installed, physical-Intel or hosted-release proof.
 Public release, updater activation and website/Worker deployment remain held.
 
-Local preparation is complete on source
-`dc2d0d32a1e82f5b037b0a7094a37c1d4bfdef76`. This is ready for the explicit
-credentialed RC2 preparation decision, not publication-ready: the signed,
-installed, hardware and remote gates below remain open. No signing credentials
-were accessed and no source tag, push, installation or publication occurred.
+Local preparation was completed on source
+`dc2d0d32a1e82f5b037b0a7094a37c1d4bfdef76`. The owner then approved combined
+ARM/Intel RC2 tagging, signing and Apple notarization without installation or
+publication, and subsequently authorized publication only if ready. Both
+signed RC2 candidates now pass the [exact artifact and replacement checks](../receipts/2026-09-04-macos-combined-rc2-signed-candidates.md)
+from clean frozen source `4ea16586d83c72d0a4af506b102a267251f45a2b`.
+The local annotated RC2 tag exists; no push, installation, stable finalization or
+publication occurred. Installed-runtime, hardware and remote gates remain open,
+so the conditional publication authority has not been exercised.
 
 ## Local preparation
 
@@ -78,22 +82,25 @@ Nonfatal missing-local-envelope-secret/sourcemap warnings and intentionally
 unprovisioned staging are not represented as live-environment qualification.
 
 Logs are retained only in ignored `.release-build/prepublish-*` files. A
-read-only remote-ref check found no release branch, stable 0.1.18 tag or RC2
-source tag matching this candidate; no exact-head hosted CI claim is made.
+read-only remote-ref check during local preparation found no release branch,
+stable 0.1.18 tag or RC2 source tag matching this candidate. The subsequently
+created local RC2 tag has not been pushed; no exact-head hosted CI claim is made.
 
 ## Protected continuation and evidence gates
 
 The canonical [macOS runbook](../runbooks/macos-stable-release-runbook.md)
 requires explicit operation/target authority. `--prepare-candidate` continues
 into Developer ID signing and Apple submission; it is not a dry run. Obtain
-explicit permission for combined ARM/Intel RC2 `1025.1`, its new local annotated
-source tag, signing and notarization before that credentialed operation. Use
-fresh distinct outputs; preserve Intel RC1 `1025`, source `18c7065b`, its DMG,
-receipt, checksum, tester README and verified Node runtime.
+explicit permission before that credentialed operation. The owner supplied
+this authority for combined ARM/Intel RC2 `1025.1`, its new local annotated
+source tag, signing and notarization; those operations are now complete with
+fresh distinct outputs. Intel RC1 `1025`, source `18c7065b`, its DMG, receipt,
+checksum, tester README and verified Node runtime were preserved. Installation
+was explicitly excluded and requires a separate owner decision.
 
 | Boundary | Required proof before the corresponding claim |
 | --- | --- |
-| Signed RC2 | One clean annotated dogfood source tag; independent ARM/Intel Developer ID, notarization, staple, Gatekeeper, exact-byte and replacement receipts |
+| Signed RC2 — complete | One clean annotated dogfood source tag; independent ARM/Intel Developer ID, notarization, staple, Gatekeeper, exact-byte and same-architecture replacement receipts; not installed-upgrade proof |
 | Installed ARM | Exact signed same-identity upgrade with preserved state; prompt-free launch/refresh/restart and manual clean-profile/Login Item and failure-path matrix |
 | Physical Intel | Physical macOS 14+ clean install, discovery/offline accounting, lifecycle, silent Keychain and installed Intel A-to-B update; actual upload requires the tester's own consent |
 | Stable artifacts | New common exact annotated `v0.1.18` source, reviewed release text, build `1026`, ARM previous-stable continuity and explicit Intel first-stable bootstrap; repeat final-byte native gates |
