@@ -155,7 +155,6 @@ test("Linux AMD64 image pins the reviewed native Node child, GUI, and Secret Ser
   for (const required of [
     "!package.json",
     "!pnpm-lock.yaml",
-    "!patches/**",
     "!packages/**",
     "!apps/electron/**",
     "!apps/local/**",
