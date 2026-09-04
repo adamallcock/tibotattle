@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-04
 type: status
 status: current
-source_commit: 33b79d943478d7faea76cf07c2dbc5efbde0241b
+source_commit: de386d3136a4cb0f5c70a848919567aac3887f53
 observation_date: 2026-09-04
 ---
 
@@ -18,7 +18,7 @@ using this page for a later release or operational decision.
 
 | Boundary | Verified state |
 |---|---|
-| Documentation/source review | Combined Astra/Intel candidate `0.1.18`, merge `33b79d943478d7faea76cf07c2dbc5efbde0241b`, based on requested `9e1c3333`; integration and live-log follow-up tracked in the [integration plan](./plans/2026-09-04-release-0-1-18-integration.md). No final combined artifact or stable tag |
+| Documentation/source review | Combined Astra/Intel candidate `0.1.18`, implementation `de386d3136a4cb0f5c70a848919567aac3887f53`, based on requested `9e1c3333`; [integrated validation](./reviews/2026-09-04-release-0-1-18-integrated-validation.md) records live-log checks, 3,771 root passes / two stale-R7 failures, green Worker checks and a verified Intel development build. No production-signed combined artifact or stable tag |
 | Intel tester artifact | Inherited signed/notarized `0.1.18` build `1025` dogfood DMG from source `18c7065b`; [exact receipt](./receipts/2026-09-03-macos-intel-signed-candidate.md). Predates combined Astra changes; not physically Intel-qualified |
 | Installed internal dogfood | Version `0.1.17`, RC9 build `1023.7`, source `394c8a03`; owner accepted the inspected apps on 2026-09-03. Plist version/build/minimum-OS were independently rechecked; this does not qualify every historical credential or clean-profile case |
 | Public service | Health/readiness HTTP 200, enrollment and upload processing enabled; deployment source `b4c8f103bf697fb530434e6de196f2c187645661`, observed 2026-09-04 03:57 UTC (2026-09-03 locally) |
@@ -126,7 +126,9 @@ The complete qualification matrix and rules for changing these claims are in
   [Intel dogfood candidate](./receipts/2026-09-03-macos-intel-signed-candidate.md)
   passes signing/notarization and local artifact checks for source `18c7065b`.
   The combined Astra/Intel workload invalidates those inherited R7 receipts;
-  integrated tests and a final candidate need their own evidence. Physical Intel,
+  [integrated tests](./reviews/2026-09-04-release-0-1-18-integrated-validation.md)
+  pass apart from the two freshness checks, and a newly signed combined
+  candidate remains outstanding. Physical Intel,
   actual consented upload and installed update qualification remain separate
   gates. No public Intel release, feed or website was published.
 
@@ -151,11 +153,13 @@ The complete qualification matrix and rules for changing these claims are in
   `codex_rollout_content_invalid` / `benchmark_cold_rebuild_incomplete` and
   produced no comparison receipt. Later admitted-index qualification does not
   relabel that attempt as passed or establish repair of its raw sources.
-- Retained dual-runtime R7 receipts were regenerated locally on 2026-09-03 and
-  revalidated against the source snapshot above. Their generated provenance is
-  authoritative; use the [R7 freshness check](./runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md#freshness-check)
-  before relying on a later tree. Decisions remain `release_open` with unresolved
-  resource ceilings, not a claim that every native or publication gate passed.
+- Retained dual-runtime R7 receipts were regenerated on the earlier Intel tree,
+  but fail freshness on the combined source snapshot above. The protected
+  [R7 workflow](./runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md)
+  must regenerate them before release use. Earlier decisions remain
+  `release_open` with unresolved export resource ceilings; that expected state
+  is not a generic macOS release blocker. Receipt freshness is a separate gate,
+  and neither inherited files nor new synthetic tests establish fresh evidence.
 - Following the owner's 2026-09-03 confidence-based release direction, the full
   clean-profile/physical Login Item matrix is deferred for 0.1.17, not passed.
   The release still stops for data loss, invalid signatures or updater bytes,
