@@ -133,6 +133,14 @@ test("Linux Electron smoke keeps the desktop boundary explicit", async () => {
   assert.doesNotMatch(dockerfile, /COPY --chown=node:node patches \.\/patches/u);
   assert.match(dockerfile, /pnpm install --frozen-lockfile/u);
   assert.match(dockerfile, /pnpm install --frozen-lockfile --ignore-scripts/u);
+  assert.match(dockerfile, /curl --fail --silent --show-error --location --retry 3/u);
+  assert.match(
+    dockerfile,
+    /50e1cdefbf8590e0d89b0276314a99c7b98e8eed732204c6f1a1c2a38376ed87/u,
+  );
+  assert.match(dockerfile, /sha256sum --check --strict/u);
+  assert.match(dockerfile, /unzip -q/u);
+  assert.doesNotMatch(dockerfile, /node node_modules\/electron\/install\.js/u);
   assert.match(dockerfile, /xvfb-run/u);
   assert.match(dockerfile, /-nolisten tcp/u);
   assert.match(dockerfile, /ELECTRON_DISABLE_SANDBOX=0/u);

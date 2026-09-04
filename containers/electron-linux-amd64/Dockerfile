@@ -28,6 +28,7 @@ WORKDIR /workspace
 RUN apt-get update \
   && apt-get install --yes --no-install-recommends \
     ca-certificates \
+    curl \
     dbus-daemon \
     fonts-liberation \
     gnome-keyring \
@@ -54,6 +55,7 @@ RUN apt-get update \
     libxrandr2 \
     libxss1 \
     libxtst6 \
+    unzip \
     xauth \
     xvfb \
   && rm -rf /var/lib/apt/lists/* \
@@ -69,9 +71,20 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY packages ./packages
 RUN pnpm install --frozen-lockfile --ignore-scripts
 # `allowBuilds` intentionally blocks Electron's package install hook in the
-# repository. Fetch the exact locked Linux Electron artifact during the image
-# build instead; the test phase then has no package-manager or network work.
-RUN node node_modules/electron/install.js
+# repository. Fetch the exact locked Linux Electron artifact with a pinned
+# checksum during the image build instead; the test phase then has no package-
+# manager or network work. A direct archive fetch also avoids the asynchronous
+# installer path, which aborts under local QEMU amd64 emulation.
+RUN curl --fail --silent --show-error --location --retry 3 \
+    --output /tmp/electron-v43.2.0-linux-x64.zip \
+    https://github.com/electron/electron/releases/download/v43.2.0/electron-v43.2.0-linux-x64.zip \
+  && printf '%s  %s\n' \
+    f77ca6ed67bbc68702b69b56ad499bca6ae090705ade7d04f0ac545e409dec68 \
+    /tmp/electron-v43.2.0-linux-x64.zip \
+    | sha256sum --check --strict \
+  && unzip -q /tmp/electron-v43.2.0-linux-x64.zip -d /workspace/node_modules/electron/dist \
+  && printf 'electron\n' > /workspace/node_modules/electron/path.txt \
+  && rm -f /tmp/electron-v43.2.0-linux-x64.zip
 
 COPY apps/electron ./apps/electron
 COPY apps/local ./apps/local

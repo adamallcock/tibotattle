@@ -28,6 +28,7 @@ WORKDIR /workspace
 RUN apt-get update \
   && apt-get install --yes --no-install-recommends \
     ca-certificates \
+    curl \
     fonts-liberation \
     libasound2 \
     libatk-bridge2.0-0 \
@@ -51,6 +52,7 @@ RUN apt-get update \
     libxrandr2 \
     libxss1 \
     libxtst6 \
+    unzip \
     xauth \
     xvfb \
   && rm -rf /var/lib/apt/lists/* \
@@ -66,9 +68,19 @@ COPY --chown=node:node package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY --chown=node:node packages ./packages
 RUN pnpm install --frozen-lockfile --ignore-scripts
 # `allowBuilds` intentionally blocks Electron's package install hook in the
-# repository. Fetch the exact locked Linux Electron artifact during the image
-# build instead; the test phase then has no package-manager or network work.
-RUN node node_modules/electron/install.js
+# repository. Fetch the exact locked Linux Electron artifact with a pinned
+# checksum during the image build instead; the test phase then has no package-
+# manager or network work.
+RUN curl --fail --silent --show-error --location --retry 3 \
+    --output /tmp/electron-v43.2.0-linux-arm64.zip \
+    https://github.com/electron/electron/releases/download/v43.2.0/electron-v43.2.0-linux-arm64.zip \
+  && printf '%s  %s\n' \
+    50e1cdefbf8590e0d89b0276314a99c7b98e8eed732204c6f1a1c2a38376ed87 \
+    /tmp/electron-v43.2.0-linux-arm64.zip \
+    | sha256sum --check --strict \
+  && unzip -q /tmp/electron-v43.2.0-linux-arm64.zip -d /workspace/node_modules/electron/dist \
+  && printf 'electron\n' > /workspace/node_modules/electron/path.txt \
+  && rm -f /tmp/electron-v43.2.0-linux-arm64.zip
 
 COPY --chown=node:node apps/electron ./apps/electron
 COPY --chown=node:node apps/local ./apps/local
