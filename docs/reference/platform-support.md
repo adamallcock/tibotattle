@@ -17,7 +17,7 @@ supported; Intel macOS, Windows and Linux are not.
 | Platform | Source and contract | Native/physical qualification | Install, trust, update, release | Public status |
 |---|---|---|---|---|
 | macOS 14+ arm64 | Implemented | Native macOS product and retained qualification paths | Developer ID, notarization, Sparkle, stable DMG, and public `v0.1.17` release paths exist | **Supported** |
-| macOS 14+ x86_64 | Explicit thin Intel build, native broker, packaging and isolated updater contracts | Cross-compilation and synthetic Rosetta probes; no physical Intel qualification | Release tooling implemented; no qualified signed Intel installer or published feed | **Unsupported** |
+| macOS 14+ x86_64 | Explicit thin Intel build, native broker, packaging and isolated updater contracts | Cross-compilation and synthetic Rosetta probes; no physical Intel qualification | Signed/notarized 0.1.18 build 1025 tester DMG verified locally; no installed-update qualification or published feed | **Unsupported** |
 | Windows x64 | Portable core and fail-closed native filesystem/credential adapter exist | Partial qualification evidence; not a standing release gate | No supported signed installer, clean install/upgrade/uninstall receipt, updater, or stable artifact | **Unsupported** |
 | Linux x86_64 | Portable/core and container checks may run | Contract or container results are not physical desktop qualification | No supported signed package/repository, clean install/uninstall receipt, updater boundary, or stable artifact | **Unsupported** |
 
@@ -64,6 +64,9 @@ Intel tab that remains unavailable unless validated Intel release evidence is
 supplied. Source implementation does not establish a supported download. See the
 [native developer build](../../apps/macos/README.md#developer-build) and
 [Intel release plan](../plans/2026-09-03-macos-intel-release.md).
+The [signed tester candidate](../receipts/2026-09-03-macos-intel-signed-candidate.md)
+is available locally for physical testing; its native trust checks do not
+complete the support ladder.
 
 ## Windows
 

@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-03
 type: status
 status: current
-source_commit: 1cbe357e43e692218f56c3d9d4f54ee703d3ebac
+source_commit: 18c7065b780b3ff2eb11b0c60f2f0725ec8a3aeb
 observation_date: 2026-09-03
 ---
 
@@ -18,9 +18,10 @@ using this page for a later release or operational decision.
 
 | Boundary | Verified state |
 |---|---|
-| Documentation/source review | Intel implementation candidate `0.1.18`, local commit `1cbe357e43e692218f56c3d9d4f54ee703d3ebac`, includes published 0.1.17 source and refreshed R7 receipts; no 0.1.18 tag or release created |
+| Documentation/source review | Intel candidate `0.1.18`, source `18c7065b780b3ff2eb11b0c60f2f0725ec8a3aeb`, includes published 0.1.17 source and refreshed R7 receipts; local annotated dogfood tag, no stable 0.1.18 tag or public release |
+| Intel tester artifact | Signed/notarized `0.1.18` build `1025` dogfood DMG, verified locally; [exact receipt](./receipts/2026-09-03-macos-intel-signed-candidate.md); not installed system-wide or physically Intel-qualified |
 | Installed internal dogfood | Version `0.1.17`, RC9 build `1023.7`, source `394c8a03`; owner accepted the inspected apps on 2026-09-03. Plist version/build/minimum-OS were independently rechecked; this does not qualify every historical credential or clean-profile case |
-| Public service | Read-only `GET https://tibotattle.com/api/health`, HTTP 200, deployment source `304f3d736b6f9451d32a616bf3046ea628e828a3`, observed 2026-08-31 |
+| Public service | Health/readiness HTTP 200, enrollment and upload processing enabled; deployment source `b4c8f103bf697fb530434e6de196f2c187645661`, observed 2026-09-04 03:57 UTC (2026-09-03 locally) |
 | Public updater | Stable `0.1.16`; read-only feed check recorded 2026-09-03 in the release plan |
 | Published release | Immutable GitHub `v0.1.17`, published 2026-09-03 at 19:47:43 UTC; ARM DMG, appcast, manifest, checksums and verification guide; exact source tag commit `aa660b24a66196155ba59267ab832cc4ef6e1c7d` |
 
@@ -34,8 +35,8 @@ analysis service, the public website and optional hosted contribution service,
 and release tooling. The maintained architecture, interface, privacy, schema,
 and command contracts are indexed in [the documentation index](./README.md).
 
-The source tree at the reviewed commit is ahead of the live Worker reported
-below. Source merge therefore does not prove public deployment.
+The source snapshot and live Worker identity below are separate observations.
+Source merge does not prove public deployment.
 
 ### Source-only amendments through 2026-08-31
 
@@ -74,18 +75,18 @@ hosted-deployment, updater, or stable-release evidence.
 
 ## Public service
 
-At the observation time, `/api/health` returned HTTP 200 and deployment source
+The earlier 2026-08-31 `/api/health` observation returned HTTP 200 and source
 commit `304f3d736b6f9451d32a616bf3046ea628e828a3`. That deployment predates PR
 #94's device-continuity protocol. It can treat replay of one pairing identifier
 idempotently, but does not establish the fresh-pairing recovery protocol needed
 for an already registered local device.
 
-The live Worker commit is behind this document's reviewed source commit. Do not
-describe PR #89 or PR #94 Worker behavior as deployed until the live health
-identity advances and the affected migration and route are checked directly.
-Read-only production migration-ledger inspection was unavailable to the current
-operator credentials, so remote migration state remains unknown rather than
-assumed current.
+The Intel handoff recheck returned health/readiness HTTP 200, open enrollment,
+enabled v1.0 uploads and deployment source
+`b4c8f103bf697fb530434e6de196f2c187645661`. This supersedes the older identity
+observation, but does not independently qualify PR #89/94 migrations, device
+repair or optional v1.1 grants. Those routes and migrations require their own
+evidence; no migration-ledger inspection or live account upload was performed.
 
 ## Published macOS release and updater
 
@@ -121,9 +122,11 @@ The complete qualification matrix and rules for changing these claims are in
   contracts and manifest-driven website availability. Native/Rosetta and Worker
   checks pass. The owner-authorized R7 regeneration refreshed all ten receipts;
   both pinned-runtime freshness checks pass. The final root run has 3,738 passes,
-  zero failures and 17 existing conditional skips. Physical Intel,
-  signing/notarization and installed update qualification remain separate gates.
-  No Intel release, feed or website was published.
+  zero failures and 17 existing conditional skips. The
+  [Intel dogfood candidate](./receipts/2026-09-03-macos-intel-signed-candidate.md)
+  now passes signing/notarization and local artifact checks. Physical Intel,
+  actual consented upload and installed update qualification remain separate
+  gates. No public Intel release, feed or website was published.
 
 - The [public-release plan](./plans/2026-09-03-public-0.1.17-release.md)
   tracks final build `1024`, exact signed-artifact and prior-stable replacement

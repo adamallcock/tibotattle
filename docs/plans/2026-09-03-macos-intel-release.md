@@ -17,7 +17,8 @@ The branch `codex/macos-intel-foundation` now includes main `9e1c3333` through
 local merge `8c8a149f`. Published `v0.1.17` points to
 `aa660b24a66196155ba59267ab832cc4ef6e1c7d` and is immutable. GitHub's release API
 confirmed its ARM DMG, appcast, manifest, checksums and verification guide.
-The working candidate is **0.1.18**, with no source tag or release created.
+The working candidate is **0.1.18**. A local annotated dogfood source tag now
+identifies its signed tester build; no stable source tag or public release exists.
 The [feasibility report](../research/2026-08-31-macos-intel-universal2-feasibility.md)
 retains its earlier snapshot and is not current qualification evidence.
 
@@ -65,9 +66,10 @@ Do not reuse the ARM 0.1.17 artifact as Intel recovery/update history.
 - [x] Maintained developer, release and support documents match the implementation
   without promoting source compatibility to public platform support.
 
-All local work proceeds without Developer ID signing, notarization, system
-installation, pushing, deployment or publication. Those remain protected steps;
-physical Intel qualification is also outstanding.
+The implementation and R7 work above did not sign or publish an installer. The
+owner subsequently authorized the signed Intel tester candidate recorded below.
+System installation, public publication and physical Intel qualification remain
+separate steps.
 
 ## Earlier foundation checkpoint
 
@@ -162,7 +164,7 @@ evidence, not proof of byte-identical historical inputs or improved performance.
 Both decisions remain `release_open` with their existing unresolved resource
 ceilings. These ARM64 R7 runs do not qualify physical Intel hardware.
 
-## Final local Intel artifacts
+## Earlier local Intel artifacts
 
 These are ad-hoc local outputs, not Developer ID/notarized installers. All eight
 Preview binaries and all three Development binaries were independently checked
@@ -185,7 +187,18 @@ is `.release-build/intel-r7-regeneration.log`, and the Worker log is
 `.release-build/intel-website-*.png`. These ignored local outputs are not public
 release evidence and must not be uploaded as a substitute for qualification.
 
-## Gates before an Intel release
+## Signed Intel tester candidate
+
+The [signed candidate receipt](../receipts/2026-09-03-macos-intel-signed-candidate.md)
+records the owner-authorized 0.1.18 / build 1025 Intel dogfood DMG from source
+`18c7065b`. Developer ID signing, app and DMG notarization/stapling, Gatekeeper,
+isolated clean-profile checks and independent final-artifact inspection passed.
+The normal opt-in production upload flow is included; no live account upload
+was performed. Tester instructions explain consent and shared stable state.
+The candidate is ready for the owner to hand to the physical Intel tester;
+no public release, feed or website was published.
+
+## Gates before a public Intel release
 
 1. Keep the retained R7 receipts fresh against the final integrated workload.
    The owner-authorized branch regeneration passed; any later workload-source
@@ -210,5 +223,6 @@ release evidence and must not be uploaded as a substitute for qualification.
    publication; local browser checks are not deployment proof.
 
 The implementation remains **in progress toward release qualification**, not a
-supported Intel release. No Developer ID signing, notarization, system install,
-public feed update, website deployment, push or tag occurred in this work.
+supported Intel release. A local annotated dogfood source tag and signed,
+notarized tester candidate now exist. No system install, public feed update,
+website deployment, push or public stable tag occurred in this work.
