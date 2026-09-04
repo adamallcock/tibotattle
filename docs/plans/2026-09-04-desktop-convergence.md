@@ -2,7 +2,7 @@
 title: One TiboTattle desktop app and release train
 date: 2026-09-04
 type: plan
-status: proposed
+status: in-progress
 ---
 
 # One TiboTattle desktop app and release train
@@ -13,16 +13,145 @@ core. Treat Codex and Claude as providers inside that product. Make installed
 migration and the next update the first major proof, rather than leaving
 distribution until after feature development.
 
-This is a proposed workstream design, not implementation, release approval or
-platform qualification. It assumes the four targets mean macOS arm64, macOS
+Implementation was authorized on 2026-09-04, including accountless contribution
+in the unified Electron app. This is not release approval or platform
+qualification. The four targets mean macOS arm64, macOS
 x64, Windows x64 and Linux x64. Additional architectures and package formats
 are outside the first convergence milestone. The active 0.1.18 work is not
 modified by this plan.
 
-The related [contribution opt-in research](../research/2026-09-04-contribution-opt-in-options.md)
-proposes reliable sign-in-once improvements followed by a bounded accountless
-pilot. Preserve existing contribution identity/consent during desktop migration;
-a new enrollment architecture is not a prerequisite for shell convergence.
+The related [contribution research](../research/2026-09-04-contribution-opt-in-options.md)
+records the investigation. The accepted direction is one coordinated
+workstream: Electron convergence plus accountless contribution. Automatic
+default-on activation is awaiting a precise confirmation: the user's latest
+phrase "opt in" conflicts with the preceding default-on discussion, and
+automatic approval review rejected changing the standing privacy guidance on
+that ambiguous basis. Implementation may continue on the shell, disabled
+enrollment foundations and synthetic tests. Preserve explicit
+existing off, paused and disconnected choices during migration. Source work
+and synthetic qualification may proceed; activation in distributed builds and
+hosted production awaits the matching policy, abuse and release gates.
+
+## Implementation boundary
+
+The default-on clauses below describe the proposed mode, pending the
+confirmation above. They do not override current repository privacy guidance
+or activate collection. Accountless enrollment and Electron reconciliation are
+authorized independently of the final sharing default.
+
+- Keep local analysis available offline. Contribution failure never blocks it.
+- Remove mandatory social sign-in for the new Electron contribution mode.
+  Reuse per-installation credentials, authenticated uploads and revocation.
+  Existing social enrollment remains compatible during migration.
+- Record automatic enrollment as `default_on` authorization under a versioned
+  policy. Never manufacture an explicit-consent timestamp or claim a review
+  occurred. Local privacy settings must distinguish default from user choice.
+- Enable the new default only for a positively identified fresh installation
+  in a candidate whose composition explicitly selects that policy. Missing or
+  unreadable migrated settings do not prove freshness. Preserve a durable
+  opt-out before cancelling work; restart, failed revocation, missing secrets,
+  or upgrades must not silently re-enroll a user who turned sharing off.
+- Keep enrollment and contribution disabled in existing production settings
+  while the new path is qualified in an isolated synthetic laboratory.
+- Match provider-account and quota-window evidence independently of the
+  uploader's credential. Do not equate a social login, installation, provider
+  account or person. Unknown historical account attribution remains unknown.
+- Keep Claude as a capability in the same binaries. Full Claude activation is
+  outside the first combined migration milestone; do not merge its dirty
+  worktree wholesale or make it a second product/release train.
+
+The pending default-on decision would change the earlier default-off design for
+this new mode. Current authorization does not include remote migrations, publication, signing, system installs,
+real-corpus uploads, erasure, or re-enabling previously declined contribution.
+Update applicable invariants and disclosures as each implemented path changes;
+the distributed native application's current behavior remains unchanged.
+
+### Work estimate and first implementation tranche
+
+Initial estimate: **12–25 focused engineering days**, with parallel work
+potentially yielding a qualified four-target release in **2–4 calendar weeks**.
+These are planning ranges, not delivery guarantees. Physical Windows/Linux and
+Intel access, signing and installed migration/update evidence are dependencies.
+
+| Work | Initial engineering-day range |
+|---|---:|
+| Reconcile current Electron and native shared core | 2–4 |
+| Accountless enrollment, renewal, honest authorization and opt-out UX | 3–5 |
+| Usage/quota attribution, replay and abuse/influence controls | 2–4 |
+| State/credential migration, updater and four-target packaging | 3–7 |
+| Cross-target integration, installed regression and release qualification | 2–5 |
+
+First tranche: reconcile the shell, freeze the identity/enrollment contract,
+implement bounded accountless backend/client foundations and preference
+semantics, then verify synthetic enrollment. The enrollment-only receipt must
+not grant upload authority: current credentials require a browser-pairing FK
+and participants require a non-null consent timestamp. Do not work around
+those constraints with invented browser sessions, pairings or consent events.
+Additive upload ownership and honest policy authorization are a subsequent
+integration gate. This is a useful
+source milestone, not a claim that all four installers are ready. Use separate
+reviewable commits and compatible server-first deployment gates inside the
+single workstream; avoid coupling rollback of the shell to a destructive data
+migration.
+
+| Owner | Isolated work | Status |
+|---|---|---|
+| Integrator | `codex/unified-desktop-accountless` | Plan, local contribution policy/client and integration |
+| Luna: Electron | `codex/electron-accountless-reconcile` | Inspect divergence and reconcile retained shell/platform code |
+| Luna: enrollment | `codex/accountless-enrollment-backend` | Bounded opt-in-configured endpoint, lifecycle and synthetic tests |
+| Luna: attribution | Read-only initial trace | Verify usage/quota join and define required regression cases |
+
+Local preference foundation is implemented with a closed versioned record and
+the existing protected settings adapter. Its nine focused tests pass, including
+real-file restart, first-operation opt-out, corrupt/unknown state, failed writes,
+policy/destination changes and concurrent selections. It is not connected to
+the installed application or an upload scheduler. The new sharing default
+remains pending confirmation; no existing production behavior changed.
+
+### Usage-to-quota attribution contract
+
+Four identities have separate jobs:
+
+| Dimension | Purpose | Must not imply |
+|---|---|---|
+| Installation credential and hosted participant/device | Authenticate an uploader, retain enrollment continuity, revoke and budget requests | One person or one provider account |
+| Provider-account track | Partition measured usage/quota within a provider and observed account context | Global identity across devices or retroactive historical ownership |
+| Plan era, limit/pool and reset window | Select comparable quota observations and the usage interval between them | Additive quota across devices or a provider-authoritative token denominator |
+| Source session and occurrence | Replay/copy deduplication and correction provenance | Ownership of every record sharing a session UUID |
+
+For one installation, match usage and quota through compatible **provider,
+account track, plan era, limit/pool and time/reset interval** evidence. A quota
+observation is a sample of an account allowance; never sum those samples as if
+they were independent consumption. One machine can change accounts, and one
+account can have usage on other machines or unobserved surfaces. Preserve those
+coverage limits in fit eligibility and confidence.
+
+Current local scope is keyed from the observed normalized account email using
+the installation's account-observation secret
+(`src/providers/codex/account-scope.js`). It is not a verified tenant/pool ID.
+The bracketed account read refuses an account switch during quota retrieval;
+fresh markers apply prospectively, never backward to arbitrary old rollouts.
+
+The v1.1 projection (`src/contribution/telemetry-v11-chunks.js`) retains explicit
+account/plan evidence and derives `accountTrackId` only with the captured,
+matching destination/enrollment binding. Preserve the account-observation
+secret, enrollment namespace and binding during supported native migration.
+New enrollment alone must not retroactively attach unknown history to the
+currently signed-in provider account.
+
+Current account tracks are installation/enrollment scoped, and usage occurrence
+IDs still depend on a salted local source key. Two devices using the same
+provider account therefore do not automatically coalesce. Do not call them
+independent people, sum their quota samples, or dedupe quota by equal values and
+timestamps. First accountless collection remains excluded from public fit and
+participant-support eligibility until source/copy deduplication and scoped fit
+selection are qualified. Global account linking is a separate, explicit data
+contract; it must not be smuggled in by hashing an email with a public constant.
+
+Required regression cases: account A to B on one installation; account change
+during quota read; same account copied to two devices; repeated upload/reinstall;
+quota reset and plan change; lost/locked account secret; unknown historical
+account evidence; migrated namespace mismatch; and opt-out during enrollment.
 
 ## Verified starting point
 
