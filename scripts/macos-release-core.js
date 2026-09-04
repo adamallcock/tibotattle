@@ -232,7 +232,16 @@ const REQUIRED_NODE_RUNTIME_ENTITLEMENTS = Object.freeze([
   "com.apple.security.cs.allow-unsigned-executable-memory",
 ]);
 const LOGIN_ITEM_RELEASE_REHEARSAL_SCHEMA =
-  "usage-monitor-macos-login-item-release-rehearsal-v1";
+  "usage-monitor-macos-login-item-release-rehearsal-v2";
+const LOGIN_ITEM_REHEARSAL_APPLICATION_FIELDS = Object.freeze([
+  "bundleIdentifier",
+  "bundleVersion",
+  "shortVersion",
+  "architecture",
+  "channel",
+  "sourceCommit",
+  "payloadSha256",
+]);
 const REQUIRED_LOGIN_ITEM_REHEARSAL_CHECKS = Object.freeze([
   "firstRunConsentIsVisibleAndAffirmative",
   "settingsReconcileAfterSystemSettingsChange",
@@ -3028,39 +3037,88 @@ function isValidRehearsalDate(value) {
     && candidate.getUTCDate() === day;
 }
 
-function isSafeRehearsalString(value) {
-  return typeof value === "string"
-    && value.length > 0
-    && value.length <= 128
-    && !value.includes("\0");
+function hasExactRehearsalFields(value, fields) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).length === fields.length
+    && fields.every((field) => Object.hasOwn(value, field));
+}
+
+function rehearsalMacOSVersionParts(value) {
+  if (typeof value !== "string"
+      || !/^[1-9][0-9]?\.(?:0|[1-9][0-9]?)(?:\.(?:0|[1-9][0-9]?))?$/u.test(value)) {
+    return null;
+  }
+  const [major, minor, patch = 0] = value.split(".").map(Number);
+  return [major, minor, patch];
+}
+
+function rehearsalMacOSAtLeast(actual, minimum) {
+  const actualParts = rehearsalMacOSVersionParts(actual);
+  const minimumParts = rehearsalMacOSVersionParts(minimum);
+  if (actualParts === null || minimumParts === null || minimumParts[0] < 14) {
+    return false;
+  }
+  for (let index = 0; index < minimumParts.length; index += 1) {
+    if (actualParts[index] !== minimumParts[index]) {
+      return actualParts[index] > minimumParts[index];
+    }
+  }
+  return true;
+}
+
+function isValidRehearsalApplication(application) {
+  return application?.bundleIdentifier === BUNDLE_IDENTIFIER
+    && isAppleMacOSBundleVersion(application.bundleVersion)
+    && typeof application.shortVersion === "string"
+    && application.shortVersion.length <= 32
+    && RELEASE_SOURCE_VERSION_PATTERN.test(application.shortVersion)
+    && (application.architecture === "arm64" || application.architecture === "x64")
+    && (application.channel === STABLE_RELEASE_CHANNEL
+      || application.channel === INTERNAL_DOGFOOD_RELEASE_CHANNEL)
+    && typeof application.sourceCommit === "string"
+    && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(application.sourceCommit)
+    && typeof application.payloadSha256 === "string"
+    && /^[a-f0-9]{64}$/u.test(application.payloadSha256);
 }
 
 /**
  * Validate a privacy-safe human rehearsal receipt. The receipt makes the
  * non-automatable lifecycle checks (real sign-in, replacement, move, and
  * uninstall) explicit without allowing release tooling to mutate a person's
- * Login Items database itself.
+ * Login Items database itself. Native hardware, OS, and non-Rosetta execution
+ * are manual observations, not facts automatically proved by this validator.
+ * All expected identity fields must come from the verified installed artifact;
+ * historical v1 receipts cannot qualify a current artifact.
  */
-export function validateMacOSLoginItemReleaseRehearsal(receipt, {
-  bundleIdentifier = BUNDLE_IDENTIFIER,
-  bundleVersion,
-  shortVersion,
-} = {}) {
+export function validateMacOSLoginItemReleaseRehearsal(receipt, expected = {}) {
   const recordedOn = receipt?.recordedOn;
-  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)
+  if (!hasExactRehearsalFields(expected, [
+    ...LOGIN_ITEM_REHEARSAL_APPLICATION_FIELDS, "minimumMacos",
+  ])
+      || !isValidRehearsalApplication(expected)
+      || !hasExactRehearsalFields(receipt, [
+        "schemaVersion", "evidenceKind", "recordedOn", "environment", "application", "checks",
+      ])
       || receipt.schemaVersion !== LOGIN_ITEM_RELEASE_REHEARSAL_SCHEMA
+      || receipt.evidenceKind !== "manual_observation"
       || !isValidRehearsalDate(recordedOn)
-      || receipt.environment?.cleanDisposableProfile !== true
-      || receipt.environment?.installedInApplications !== true
-      || receipt.application?.bundleIdentifier !== bundleIdentifier
-      || !isSafeRehearsalString(receipt.application?.bundleVersion)
-      || !isSafeRehearsalString(receipt.application?.shortVersion)
-      || (bundleVersion !== undefined
-        && receipt.application.bundleVersion !== bundleVersion)
-      || (shortVersion !== undefined
-        && receipt.application.shortVersion !== shortVersion)
+      || !hasExactRehearsalFields(receipt.environment, [
+        "cleanDisposableProfile", "installedInApplications", "hardwareArchitecture",
+        "macosVersion", "rosetta",
+      ])
+      || receipt.environment.cleanDisposableProfile !== true
+      || receipt.environment.installedInApplications !== true
+      || receipt.environment.hardwareArchitecture !== expected.architecture
+      || receipt.environment.rosetta !== false
+      || !rehearsalMacOSAtLeast(receipt.environment.macosVersion, expected.minimumMacos)
+      || !hasExactRehearsalFields(receipt.application, LOGIN_ITEM_REHEARSAL_APPLICATION_FIELDS)
+      || !isValidRehearsalApplication(receipt.application)
+      || LOGIN_ITEM_REHEARSAL_APPLICATION_FIELDS.some(
+        (key) => receipt.application[key] !== expected[key],
+      )
+      || !hasExactRehearsalFields(receipt.checks, REQUIRED_LOGIN_ITEM_REHEARSAL_CHECKS)
       || REQUIRED_LOGIN_ITEM_REHEARSAL_CHECKS.some(
-        (key) => receipt.checks?.[key] !== true,
+        (key) => receipt.checks[key] !== true,
       )) {
     fail(
       "Login Item release rehearsal receipt is incomplete or does not match the installed app",
@@ -3068,10 +3126,11 @@ export function validateMacOSLoginItemReleaseRehearsal(receipt, {
     );
   }
   return Object.freeze({
-    bundleIdentifier: receipt.application.bundleIdentifier,
-    bundleVersion: receipt.application.bundleVersion,
+    ...receipt.application,
+    evidenceKind: "manual_observation",
+    environment: Object.freeze({ ...receipt.environment }),
     recordedOn,
-    requiredChecks: [...REQUIRED_LOGIN_ITEM_REHEARSAL_CHECKS],
+    requiredChecks: Object.freeze([...REQUIRED_LOGIN_ITEM_REHEARSAL_CHECKS]),
   });
 }
 

@@ -527,10 +527,11 @@ npm run product:macos:release -- \
 into Developer ID signing and notarization. It is a protected release action,
 not a secret-free build check or dry run.
 
-`--stable-bootstrap` is retained only as the historical first-stable-release
-decision and is not the normal current path. Every later stable release must
-use the manifest from the immediately previous stable release so the gate can
-prove version continuity.
+`--stable-bootstrap` is an explicit owner-only first-stable-release decision
+for one architecture, not the normal upgrade path. The first Intel stable
+release has no prior Intel artifact and uses this flow. Every later release
+in that lane must use its immediately previous same-architecture stable
+manifest; an ARM receipt cannot establish Intel continuity.
 
 The command rejects a missing origin, HTTP, loopback, credentials, paths,
 queries, fragments, missing artwork, missing provenance, placeholder
@@ -581,8 +582,9 @@ For a later stable release, use `--previous-stable-manifest` in place of
 the release command refuses to guess which continuity policy applies.
 `USAGE_MONITOR_BUNDLE_VERSION` is optional as an operator assertion only; when
 present it must exactly equal the checked-in allocation for the selected
-signed release version and channel (`1023.7` for 0.1.17 internal dogfood,
-`1024` for 0.1.17 stable).
+signed release version and channel (`1025.1` for combined 0.1.18 RC2 internal
+dogfood, `1026` for 0.1.18 stable). Earlier Intel RC1 build `1025` and its
+immutable evidence remain unchanged.
 
 `config/deployment-endpoints.js` is the reviewed source for the public origin
 and the distinct stable and preview Sparkle appcasts. Legacy
@@ -698,8 +700,9 @@ The automated validator proves the bundle and Gatekeeper contract on the build
 Mac with an empty temporary home. It also runs the packaged Login Item contract
 smoke against an injected fake manager; that check makes zero real
 ServiceManagement calls. It is not a substitute for a truly clean machine.
-The manual clean-profile and physical Login Item matrix remains deferred; see
-the [native release plan](../../docs/plans/2026-09-03-public-0.1.17-release.md).
+The manual clean-profile and physical Login Item matrix was deferred for
+0.1.17 only; see the [release-specific decision](../../docs/plans/2026-09-03-public-0.1.17-release.md).
+That decision does not qualify or waive the matrix for 0.1.18 or Intel.
 
 For Finder metadata, inspect the app directly on the final frozen DMG, read-only,
 after stapling. Derive the expected timestamp from the sealed source commit in
@@ -748,6 +751,17 @@ disposable-VM rehearsal:
      --app "/Applications/TiboTattle.app" \
      --rehearsal "docs/receipts/YYYY-MM-DD-macos-login-item-release-rehearsal.json"
    ```
+
+   This gate defaults to Apple silicon (`--architecture arm64`) and
+   `--channel stable`. For an Intel internal-dogfood rehearsal, add
+   `--architecture x64 --channel internal-dogfood`; both installed-app validation
+   and bundle inspection require that exact selection. The receipt still binds
+   to the inspected signed app's identity/version at the required Applications
+   path; these options neither install it nor perform the manual rehearsal.
+   The current v2 receipt additionally binds architecture, channel, source commit
+   and normalized payload SHA-256, and requires human-observed native hardware,
+   a supported macOS version and `rosetta: false`. Old v1 receipts are historical,
+   not current qualification. See the [receipt amendment](../../docs/decisions/2026-08-03-macos-login-item-lifecycle-decision.md#2026-09-04-two-architecture-receipt-amendment).
 
 ## Protected per-release inputs and gates
 

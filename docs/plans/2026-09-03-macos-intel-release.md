@@ -34,9 +34,11 @@ added as release assets. See [GitHub's immutable-release contract](https://docs.
 Both 0.1.18 installers must identify one common annotated source tag and commit.
 Each has independent final bytes, digest, native trust and artifact evidence.
 
-The checked-in candidate allocations are dogfood **1025** and stable **1026**,
-above 0.1.17 stable **1024**. Both architectures use the same allocation. This
-reserves ordering in code; it is not proof of signing, installation or release.
+The initial Intel RC1 dogfood allocation was **1025**. The combined Astra/Intel
+RC2 allocation, updated on 2026-09-04, is **1025.1**; stable remains **1026**,
+above 0.1.17 stable **1024**. Both architectures use the combined allocation.
+This reserves ordering in code; it is not proof of signing, installation or
+release. The signed RC1 artifact and its build-1025 evidence below are immutable.
 Do not reuse the ARM 0.1.17 artifact as Intel recovery/update history.
 
 ## Complete implementation acceptance

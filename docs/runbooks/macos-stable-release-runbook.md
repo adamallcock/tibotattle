@@ -76,6 +76,14 @@ Intel entry. Cross-compilation, Rosetta and ad-hoc packaging do not qualify
 physical Intel clean install, login items, silent Keychain access or A-to-B
 signed update installation.
 
+The installed Login Item gate accepts explicit `--architecture` and `--channel`
+selection and requires the v2 [manual rehearsal receipt](../decisions/2026-08-03-macos-login-item-lifecycle-decision.md#2026-09-04-two-architecture-receipt-amendment).
+It binds the inspected app's architecture, channel, source commit and normalized
+payload alongside version identity. Native hardware, supported macOS and
+non-Rosetta execution remain human observations; neither old v1 receipts nor an
+ARM rehearsal can qualify Intel. The payload binding is not a final-DMG digest
+and does not replace independent artifact/signature checks.
+
 The existing website command below remains ARM-compatible. To expose a qualified
 Intel artifact from the same canonical `release-manifest.json`, also supply:
 

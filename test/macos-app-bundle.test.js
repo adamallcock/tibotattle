@@ -125,6 +125,10 @@ import {
   parseArguments as parseMacOSDMGArguments,
 } from "../scripts/package-macos-dmg.js";
 import {
+  main as validateMacOSLoginItemRelease,
+  parseArguments as parseMacOSLoginItemReleaseArguments,
+} from "../scripts/validate-macos-login-item-release.js";
+import {
   SPARKLE_FRAMEWORK_LINKS,
   SPARKLE_FRAMEWORK_SHA256,
   SPARKLE_MACH_O_PATHS,
@@ -5204,70 +5208,153 @@ test("preview CLI inputs are opt-in and development parsing ignores preview envi
   );
 });
 
-test("Login Item release rehearsal requires the installed signed-app lifecycle evidence", () => {
-  const checks = {
-    firstRunConsentIsVisibleAndAffirmative: true,
-    settingsReconcileAfterSystemSettingsChange: true,
-    enableDisableAndPendingRemoval: true,
-    automaticLoginLaunch: true,
-    upgradeRetainsSingleMainAppLoginItem: true,
-    moveAndReinstallLeavesNoStaleDuplicate: true,
-    uninstallAndReinstallLeavesNoStaleDuplicate: true,
-    duplicateLaunchExplainsExistingApp: true,
-    windowCloseKeepsMenuBarAndQuitStopsApp: true,
-    noAgentDaemonOrBackgroundUpload: true,
+function syntheticLoginItemRehearsal({ architecture = "arm64", channel = "stable" } = {}) {
+  const application = {
+    bundleIdentifier: "com.usagemonitor.local",
+    bundleVersion: "1025.1",
+    shortVersion: "0.1.18",
+    architecture,
+    channel,
+    sourceCommit: "c".repeat(40),
+    payloadSha256: (architecture === "arm64" ? "a" : "b").repeat(64),
   };
-  const rehearsal = {
-    schemaVersion: "usage-monitor-macos-login-item-release-rehearsal-v1",
+  const receipt = {
+    schemaVersion: "usage-monitor-macos-login-item-release-rehearsal-v2",
+    evidenceKind: "manual_observation",
     recordedOn: "2026-08-04",
     environment: {
       cleanDisposableProfile: true,
       installedInApplications: true,
+      hardwareArchitecture: architecture,
+      macosVersion: "14.0",
+      rosetta: false,
     },
-    application: {
-      bundleIdentifier: "com.usagemonitor.local",
-      bundleVersion: "17",
-      shortVersion: "0.1.0",
+    application,
+    checks: {
+      firstRunConsentIsVisibleAndAffirmative: true,
+      settingsReconcileAfterSystemSettingsChange: true,
+      enableDisableAndPendingRemoval: true,
+      automaticLoginLaunch: true,
+      upgradeRetainsSingleMainAppLoginItem: true,
+      moveAndReinstallLeavesNoStaleDuplicate: true,
+      uninstallAndReinstallLeavesNoStaleDuplicate: true,
+      duplicateLaunchExplainsExistingApp: true,
+      windowCloseKeepsMenuBarAndQuitStopsApp: true,
+      noAgentDaemonOrBackgroundUpload: true,
     },
-    checks,
   };
-  const validated = validateMacOSLoginItemReleaseRehearsal(rehearsal, {
-    bundleVersion: "17",
-    shortVersion: "0.1.0",
-  });
-  assert.equal(validated.bundleIdentifier, "com.usagemonitor.local");
-  assert.equal(validated.bundleVersion, "17");
-  assert.equal(validated.requiredChecks.length, 10);
-  assert.throws(
-    () => validateMacOSLoginItemReleaseRehearsal({
-      ...rehearsal,
-      checks: {
-        ...checks,
-        automaticLoginLaunch: false,
+  return {
+    receipt,
+    expected: { ...application, minimumMacos: "14.0" },
+    inspected: {
+      bundleIdentifier: application.bundleIdentifier,
+      bundleVersion: application.bundleVersion,
+      shortVersion: application.shortVersion,
+      architecture,
+      minimumMacos: "14.0",
+      buildManifest: {
+        release: { channelName: channel, source: { commit: application.sourceCommit } },
+        payload: { payloadSha256: application.payloadSha256 },
       },
-    }, {
-      bundleVersion: "17",
-      shortVersion: "0.1.0",
-    }),
+    },
+  };
+}
+
+test("Login Item release rehearsal requires the exact signed artifact and manual native-runtime evidence", () => {
+  const { receipt, expected } = syntheticLoginItemRehearsal();
+  const validated = validateMacOSLoginItemReleaseRehearsal(receipt, expected);
+  assert.equal(validated.bundleIdentifier, "com.usagemonitor.local");
+  assert.equal(validated.bundleVersion, "1025.1");
+  assert.equal(validated.architecture, "arm64");
+  assert.equal(validated.channel, "stable");
+  assert.equal(validated.sourceCommit, expected.sourceCommit);
+  assert.equal(validated.payloadSha256, expected.payloadSha256);
+  assert.equal(validated.evidenceKind, "manual_observation");
+  assert.deepEqual(validated.environment, receipt.environment);
+  assert.equal(validated.requiredChecks.length, 10);
+  const refuse = (candidate, identity = expected) => assert.throws(
+    () => validateMacOSLoginItemReleaseRehearsal(candidate, identity),
     { code: "MACOS_LOGIN_ITEM_REHEARSAL_INVALID" },
   );
-  assert.throws(
-    () => validateMacOSLoginItemReleaseRehearsal(rehearsal, {
-      bundleVersion: "18",
-      shortVersion: "0.1.0",
-    }),
-    { code: "MACOS_LOGIN_ITEM_REHEARSAL_INVALID" },
-  );
-  assert.throws(
-    () => validateMacOSLoginItemReleaseRehearsal({
-      ...rehearsal,
-      recordedOn: "2026-02-30",
-    }, {
-      bundleVersion: "17",
-      shortVersion: "0.1.0",
-    }),
-    { code: "MACOS_LOGIN_ITEM_REHEARSAL_INVALID" },
-  );
+  for (const [key, mismatch] of Object.entries({
+    bundleIdentifier: "com.usagemonitor.other",
+    bundleVersion: "1026",
+    shortVersion: "0.1.19",
+    architecture: "x64",
+    channel: "internal-dogfood",
+    sourceCommit: "d".repeat(40),
+    payloadSha256: "e".repeat(64),
+  })) {
+    refuse({ ...receipt, application: { ...receipt.application, [key]: mismatch } });
+    refuse(receipt, { ...expected, [key]: mismatch });
+    const missing = structuredClone(receipt);
+    delete missing.application[key];
+    refuse(missing);
+  }
+  for (const key of Object.keys(expected)) {
+    const missing = { ...expected };
+    delete missing[key];
+    refuse(receipt, missing);
+    refuse(receipt, { ...expected, [key]: undefined });
+  }
+  refuse(receipt, {});
+  refuse(receipt, null);
+  assert.throws(() => validateMacOSLoginItemReleaseRehearsal(receipt), {
+    code: "MACOS_LOGIN_ITEM_REHEARSAL_INVALID",
+  });
+  for (const [key, invalid] of [
+    ["bundleVersion", "candidate"], ["shortVersion", "0.1.18 extra"],
+    ["architecture", "universal"], ["channel", "preview_distribution"],
+    ["sourceCommit", "c".repeat(41)], ["sourceCommit", "C".repeat(40)],
+    ["payloadSha256", "a".repeat(63)], ["payloadSha256", "g".repeat(64)],
+  ]) {
+    refuse({ ...receipt, application: { ...receipt.application, [key]: invalid } }, {
+      ...expected, [key]: invalid,
+    });
+  }
+  for (const key of Object.keys(receipt.checks)) {
+    const missing = structuredClone(receipt);
+    delete missing.checks[key];
+    refuse(missing);
+    refuse({ ...receipt, checks: { ...receipt.checks, [key]: false } });
+  }
+  for (const key of Object.keys(receipt.environment)) {
+    const missing = structuredClone(receipt);
+    delete missing.environment[key];
+    refuse(missing);
+  }
+  for (const [key, invalid] of [
+    ["cleanDisposableProfile", false], ["installedInApplications", false],
+    ["hardwareArchitecture", "x64"], ["hardwareArchitecture", "unknown"],
+    ["rosetta", true], ["rosetta", "false"], ["rosetta", null],
+    ["macosVersion", "13.6"], ["macosVersion", "14"], ["macosVersion", "14.0.0.1"],
+    ["macosVersion", "014.0"], ["macosVersion", "14.-1"], ["macosVersion", " 14.0"],
+    ["macosVersion", "14.100"], ["macosVersion", 14], ["macosVersion", null],
+  ]) {
+    refuse({ ...receipt, environment: { ...receipt.environment, [key]: invalid } });
+  }
+  for (const minimumMacos of ["13.0", "14", "14.0.0.1", null, 14, "14.0.1", "14.1", "15.0"]) {
+    refuse(receipt, { ...expected, minimumMacos });
+  }
+  for (const macosVersion of ["14.0.0", "14.1", "26.0.1"]) {
+    assert.doesNotThrow(() => validateMacOSLoginItemReleaseRehearsal({
+      ...receipt, environment: { ...receipt.environment, macosVersion },
+    }, expected));
+  }
+  assert.doesNotThrow(() => validateMacOSLoginItemReleaseRehearsal({
+    ...receipt, environment: { ...receipt.environment, macosVersion: "14.0.1" },
+  }, { ...expected, minimumMacos: "14.0.1" }));
+  refuse({ ...receipt, schemaVersion: "usage-monitor-macos-login-item-release-rehearsal-v1" });
+  refuse({ ...receipt, evidenceKind: "automatic_physical_proof" });
+  refuse({ ...receipt, recordedOn: "2026-02-30" });
+  refuse({ ...receipt, extra: "unexpected" });
+  for (const section of ["environment", "application", "checks"]) {
+    refuse({ ...receipt, [section]: { ...receipt[section], extra: "unexpected" } });
+  }
+  const intel = syntheticLoginItemRehearsal({ architecture: "x64", channel: "internal-dogfood" });
+  assert.doesNotThrow(() => validateMacOSLoginItemReleaseRehearsal(intel.receipt, intel.expected));
+  refuse(receipt, intel.expected);
+  refuse(intel.receipt);
 });
 
 test("Login Item release tooling validates only the fake seam and an Applications receipt", async () => {
@@ -5296,7 +5383,8 @@ test("Login Item release tooling validates only the fake seam and an Application
     gateSource,
     /const REQUIRED_APPLICATION_PATH\s*=\s*`\/Applications\/\$\{PRODUCT_BRAND\.bundleName\}`/u,
   );
-  assert.match(gateSource, /validateInstalledMacOSApp\(appPath, \{ production: true \}\)/u);
+  assert.match(gateSource,
+    /validateInstalled\(appPath, \{ architecture, channel, production: true \}\)/u);
   assert.match(gateSource, /validateMacOSLoginItemReleaseRehearsal/u);
   assert.equal(gateSource.includes("register()"), false);
   assert.equal(gateSource.includes("unregister()"), false);
@@ -5320,6 +5408,104 @@ test("Login Item release tooling validates only the fake seam and an Application
     refusedDevelopmentPath.stderr,
     /must use \/Applications\/TiboTattle\.app/u,
   );
+});
+
+test("Login Item release CLI validates architecture and channel with legacy defaults", () => {
+  const required = [
+    "--app", "/Applications/TiboTattle.app",
+    "--rehearsal", "/tmp/synthetic-login-item-rehearsal.json",
+  ];
+  assert.deepEqual(parseMacOSLoginItemReleaseArguments(required), {
+    appPath: "/Applications/TiboTattle.app",
+    architecture: "arm64",
+    channel: "stable",
+    rehearsalPath: "/tmp/synthetic-login-item-rehearsal.json",
+  });
+  assert.deepEqual(parseMacOSLoginItemReleaseArguments([
+    "--channel", "internal-dogfood", ...required, "--architecture", "x64",
+  ]), {
+    appPath: "/Applications/TiboTattle.app",
+    architecture: "x64",
+    channel: "internal-dogfood",
+    rehearsalPath: "/tmp/synthetic-login-item-rehearsal.json",
+  });
+  for (const options of [
+    ["--architecture", "universal"],
+    ["--architecture", ""],
+    ["--architecture"],
+    ["--architecture", "x64", "--architecture", "arm64"],
+    ["--channel", "preview_distribution"],
+    ["--channel", "unknown"],
+    ["--channel", ""],
+    ["--channel"],
+    ["--channel", "stable", "--channel", "internal-dogfood"],
+  ]) {
+    assert.throws(() => parseMacOSLoginItemReleaseArguments([...required, ...options]));
+  }
+});
+
+test("Login Item release CLI carries release identity to both validators and refuses invalid options first", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-login-item-cli-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const selection of [
+    { arguments: [], architecture: "arm64", channel: "stable" },
+    {
+      arguments: ["--architecture", "x64", "--channel", "internal-dogfood"],
+      architecture: "x64",
+      channel: "internal-dogfood",
+    },
+  ]) {
+    const { receipt, inspected } = syntheticLoginItemRehearsal(selection);
+    const rehearsalPath = join(root, `synthetic-${selection.architecture}-${selection.channel}.json`);
+    await writeFile(rehearsalPath, JSON.stringify(receipt), { mode: 0o600 });
+    const calls = [];
+    const dependencies = {
+      validateInstalledMacOSApp: async (...args) => { calls.push(["validate", ...args]); },
+      inspectMacOSApp: async (...args) => {
+        calls.push(["inspect", ...args]);
+        return inspected;
+      },
+    };
+    await validateMacOSLoginItemRelease([
+      "--app", "/Applications/TiboTattle.app", "--rehearsal", rehearsalPath,
+      ...selection.arguments,
+    ], dependencies);
+    assert.deepEqual(calls, [
+      ["validate", "/Applications/TiboTattle.app", {
+        architecture: selection.architecture,
+        channel: selection.channel,
+        production: true,
+      }],
+      ["inspect", "/Applications/TiboTattle.app", {
+        architecture: selection.architecture,
+        channel: selection.channel,
+        requireExternalDistribution: true,
+      }],
+    ]);
+    const mismatchedReceipt = syntheticLoginItemRehearsal({
+      architecture: selection.architecture === "arm64" ? "x64" : "arm64",
+      channel: selection.channel === "stable" ? "internal-dogfood" : "stable",
+    }).receipt;
+    await writeFile(rehearsalPath, JSON.stringify(mismatchedReceipt), { mode: 0o600 });
+    await assert.rejects(validateMacOSLoginItemRelease([
+      "--app", "/Applications/TiboTattle.app", "--rehearsal", rehearsalPath,
+      ...selection.arguments,
+    ], dependencies), { code: "MACOS_LOGIN_ITEM_REHEARSAL_INVALID" });
+  }
+  const refusedCalls = [];
+  const dependencies = {
+    validateInstalledMacOSApp: async () => { refusedCalls.push("validate"); },
+    inspectMacOSApp: async () => { refusedCalls.push("inspect"); return {}; },
+  };
+  for (const invalid of [
+    ["--architecture", "universal"], ["--channel", "preview_distribution"],
+  ]) {
+    await assert.rejects(validateMacOSLoginItemRelease([
+      "--app", "/Applications/TiboTattle.app", "--rehearsal", join(root, "unused.json"),
+      ...invalid,
+    ], dependencies));
+  }
+  assert.deepEqual(refusedCalls, []);
 });
 
 test("signed updater replacement contract validates upgrade and rollback artifacts", async () => {
