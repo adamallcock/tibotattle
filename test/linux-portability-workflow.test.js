@@ -135,6 +135,7 @@ test("Linux AMD64 image pins the reviewed native Node child, GUI, and Secret Ser
   assert.match(dockerfile, /natively on a[\s\S]*x86_64 Linux runner/u);
   assert.match(dockerfile, /development smoke rather than a reproducible release artifact/u);
   assert.match(dockerfile, /pnpm install --frozen-lockfile/u);
+  assert.match(dockerfile, /pnpm install --frozen-lockfile --ignore-scripts/u);
   assert.match(dockerfile, /node node_modules\/electron\/install\.js/u);
   assert.match(dockerfile, /ELECTRON_DISABLE_SANDBOX=0/u);
   assert.match(dockerfile, /chmod 4755[\s\S]*chrome-sandbox/u);

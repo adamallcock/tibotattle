@@ -64,7 +64,7 @@ RUN apt-get update \
 # output, reports, and unrelated applications from the build context.
 COPY --chown=node:node package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY --chown=node:node packages ./packages
-RUN pnpm install --frozen-lockfile
+RUN pnpm install --frozen-lockfile --ignore-scripts
 # `allowBuilds` intentionally blocks Electron's package install hook in the
 # repository. Fetch the exact locked Linux Electron artifact during the image
 # build instead; the test phase then has no package-manager or network work.
