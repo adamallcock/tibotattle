@@ -33,6 +33,30 @@ const states = [
   ["unavailable", "Status unavailable", "状态不可用", "Estado no disponible"],
 ];
 
+const actionStates = {
+  "en-US": {
+    starting: ["Starting", false],
+    analyzing: ["Analyzing", false],
+    fresh: ["Update Local Usage", true],
+    stale: ["Update Local Usage", true],
+    unavailable: ["Retry", true],
+  },
+  "zh-Hans": {
+    starting: ["正在启动", false],
+    analyzing: ["正在分析", false],
+    fresh: ["更新本地使用情况", true],
+    stale: ["更新本地使用情况", true],
+    unavailable: ["重试", true],
+  },
+  es: {
+    starting: ["Iniciando", false],
+    analyzing: ["Analizando", false],
+    fresh: ["Actualizar uso local", true],
+    stale: ["Actualizar uso local", true],
+    unavailable: ["Reintentar", true],
+  },
+};
+
 test("semantic tray states project fixed status copy in every supported locale", () => {
   for (const [status, ...labels] of states) {
     for (const [locale, expected] of [
@@ -54,7 +78,10 @@ test("semantic tray states project fixed status copy in every supported locale",
       assert.equal(template[0].label, expectedTitle);
       assert.equal(template[1].label, expected);
       assert.equal(template[1].enabled, false);
-      assert.equal(template.filter((entry) => entry.enabled === false).length, 3);
+      const action = template[4];
+      const [actionLabel, actionEnabled] = actionStates[locale][status];
+      assert.equal(action.label, actionLabel);
+      assert.equal(action.enabled ?? true, actionEnabled);
       const checkForUpdates = template.find((entry) => entry.label === "Check for Updates…"
         || entry.label === "检查更新…"
         || entry.label === "Buscar actualizaciones…");
@@ -66,6 +93,37 @@ test("semantic tray states project fixed status copy in every supported locale",
     }
   }
 });
+
+test("tray refresh control follows companion lifecycle and avoids overlap", () => {
+  const calls = [];
+  const actions = {
+    refresh: () => calls.push("refresh"),
+    retry: () => calls.push("retry"),
+  };
+  for (const [status, expectedLabel, expectedEnabled, expectedCall] of [
+    ["starting", "Starting", false, null],
+    ["analyzing", "Analyzing", false, null],
+    ["fresh", "Update Local Usage", true, "refresh"],
+    ["stale", "Update Local Usage", true, "refresh"],
+    ["unavailable", "Retry", true, "retry"],
+  ]) {
+    const template = createDesktopTrayTemplate({
+      actions,
+      trayStatus: { status, allowance: null, notificationEvidence: null },
+    });
+    const control = template[4];
+    assert.equal(control.label, expectedLabel);
+    assert.equal(control.enabled ?? true, expectedEnabled);
+    if (expectedCall === null) {
+      assert.equal(control.click, undefined);
+    } else {
+      control.click();
+      assert.equal(calls.at(-1), expectedCall);
+    }
+  }
+  assert.deepEqual(calls, ["refresh", "refresh", "retry"]);
+});
+
 test("fresh direct evidence projects compact title, evidence age, and quota lanes", () => {
   const notificationEvidence = {
     schemaVersion: "tibotattle-notification-evidence-v2",
@@ -211,9 +269,8 @@ test("default and legacy label callers remain bounded and preserve action identi
     STATUS_PLACEHOLDER,
     "separator",
     "Open TiboTattle Dev",
-    "Update Local Usage",
-    "Check for Updates…",
     "Retry",
+    "Check for Updates…",
     "Settings…",
     "About TiboTattle Dev",
     "separator",
@@ -221,7 +278,6 @@ test("default and legacy label callers remain bounded and preserve action identi
   ]);
   for (const [label, action] of [
     ["Open TiboTattle Dev", "show"],
-    ["Update Local Usage", "refresh"],
     ["Retry", "retry"],
     ["Settings…", "settings"],
     ["About TiboTattle Dev", "about"],

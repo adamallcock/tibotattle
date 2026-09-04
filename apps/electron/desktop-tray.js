@@ -101,6 +101,30 @@ export function createDesktopTrayTemplate({
   const headerSubLabel = projectedStatus.status === "analyzing"
     ? projectedStatus.label
     : projectedStatus.evidenceLabel;
+  // Match the native menu-bar action's lifecycle truth. A refresh is useful
+  // only once the companion has become ready; while a pass is active it must
+  // not invite a second overlapping request, and an unavailable companion
+  // gets the recovery action directly instead of a misleading update label.
+  const refreshAction = projectedStatus.status === "starting"
+    ? {
+      label: desktopText("electron.tray.statusStarting", {}, textOptions),
+      enabled: false,
+    }
+    : projectedStatus.status === "analyzing"
+      ? {
+        label: desktopText("electron.tray.statusAnalyzing", {}, textOptions),
+        enabled: false,
+      }
+      : projectedStatus.status === "unavailable"
+        ? {
+          label: desktopText("electron.tray.retry", {}, textOptions),
+          click: boundedActions.retry,
+        }
+        : {
+          label: desktopText("electron.tray.refresh", {}, textOptions),
+          click: boundedActions.refresh,
+          accelerator: "CmdOrCtrl+R",
+        };
   // Electron maps `sublabel` to AppKit's native secondary line. Keep the
   // second disabled item as a hidden compatibility row so older injected
   // callers/tests that inspect the fallback shape remain safe; it is visible
@@ -132,11 +156,7 @@ export function createDesktopTrayTemplate({
       label: desktopText("electron.tray.open", { appName }, textOptions),
       click: boundedActions.show,
     },
-    {
-      label: desktopText("electron.tray.refresh", {}, textOptions),
-      click: boundedActions.refresh,
-      accelerator: "CmdOrCtrl+R",
-    },
+    refreshAction,
     // Keep the native status-menu affordance visible even in the Electron
     // development shell, where no updater action is wired. A disabled item
     // makes the capability boundary explicit without pretending that a check
@@ -162,7 +182,7 @@ export function createDesktopTrayTemplate({
       accelerator: "CmdOrCtrl+Q",
     },
   );
-  if (["stale", "unavailable"].includes(projectedStatus.status)) {
+  if (projectedStatus.status === "stale") {
     const settingsIndex = template.findIndex((entry) => entry.accelerator === "CmdOrCtrl+,");
     template.splice(settingsIndex, 0, {
       label: desktopText("electron.tray.retry", {}, textOptions),

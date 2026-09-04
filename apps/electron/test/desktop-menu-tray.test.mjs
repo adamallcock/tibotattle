@@ -141,7 +141,7 @@ test("desktop menu and tray copy resolves every supported language", () => {
       tray: "Open TiboTattle Dev",
       update: "Update Local Usage",
       quit: "Quit TiboTattle Dev",
-      status: STATUS_PLACEHOLDER,
+      status: "Stale",
     },
     "zh-Hans": {
       file: "文件",
@@ -150,7 +150,7 @@ test("desktop menu and tray copy resolves every supported language", () => {
       tray: "打开 TiboTattle Dev",
       update: "更新本地使用情况",
       quit: "退出 TiboTattle Dev",
-      status: "状态不可用",
+      status: "已过期",
     },
     es: {
       file: "Archivo",
@@ -159,7 +159,7 @@ test("desktop menu and tray copy resolves every supported language", () => {
       tray: "Abrir TiboTattle Dev",
       update: "Actualizar uso local",
       quit: "Salir de TiboTattle Dev",
-      status: "Estado no disponible",
+      status: "Desactualizado",
     },
   };
   for (const [locale, copy] of Object.entries(expected)) {
@@ -174,7 +174,11 @@ test("desktop menu and tray copy resolves every supported language", () => {
     assert.equal(file[1].label, locale === "en-US" ? "Settings…" : locale === "zh-Hans" ? "设置…" : "Configuración…");
     const view = menu.find(({ label }) => label === (locale === "en-US" ? "View" : locale === "zh-Hans" ? "视图" : "Ver"));
     assert.equal(view.submenu[0].label, copy.refresh);
-    const tray = createDesktopTrayTemplate({ appName: "TiboTattle Dev", locale });
+    const tray = createDesktopTrayTemplate({
+      appName: "TiboTattle Dev",
+      locale,
+      trayStatus: { status: "stale", allowance: null, notificationEvidence: null },
+    });
     assert.equal(tray.find((entry) => entry.label === copy.tray)?.label, copy.tray);
     assert.equal(tray.find((entry) => entry.label === copy.update)?.label, copy.update);
     const checkForUpdates = tray.find((entry) => entry.label === copy.checkForUpdates);
@@ -215,9 +219,8 @@ test("tray menu exposes truthful status and shared action callbacks", () => {
     STATUS_PLACEHOLDER,
     "separator",
     "Open TiboTattle Dev",
-    "Update Local Usage",
-    "Check for Updates…",
     "Retry",
+    "Check for Updates…",
     "Settings…",
     "About TiboTattle Dev",
     "separator",
@@ -225,14 +228,12 @@ test("tray menu exposes truthful status and shared action callbacks", () => {
   ]);
   assert.equal(item(template, STATUS_PLACEHOLDER).enabled, false);
   item(template, "Open TiboTattle Dev").click();
-  item(template, "Update Local Usage").click();
   item(template, "Retry").click();
   item(template, "Settings…").click();
   item(template, "About TiboTattle Dev").click();
   item(template, "Quit TiboTattle Dev").click();
   assert.deepEqual(calls, [
     "show",
-    "refresh",
     "retry",
     "settings",
     "about",
@@ -240,7 +241,7 @@ test("tray menu exposes truthful status and shared action callbacks", () => {
   ]);
   assert.equal(item(template, "Check for Updates…").enabled, false);
   assert.equal(item(template, "Check for Updates…").click, undefined);
-  assert.equal(item(template, "Update Local Usage").accelerator, "CmdOrCtrl+R");
+  assert.equal(item(template, "Retry").accelerator, undefined);
   assert.equal(item(template, "Settings…").accelerator, "CmdOrCtrl+,");
   assert.equal(item(template, "Quit TiboTattle Dev").accelerator, "CmdOrCtrl+Q");
 });
