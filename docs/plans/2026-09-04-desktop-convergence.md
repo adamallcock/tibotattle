@@ -19,6 +19,11 @@ x64, Windows x64 and Linux x64. Additional architectures and package formats
 are outside the first convergence milestone. The active 0.1.18 work is not
 modified by this plan.
 
+The related [contribution opt-in research](../research/2026-09-04-contribution-opt-in-options.md)
+proposes reliable sign-in-once improvements followed by a bounded accountless
+pilot. Preserve existing contribution identity/consent during desktop migration;
+a new enrollment architecture is not a prerequisite for shell convergence.
+
 ## Verified starting point
 
 Source and GitHub state were inspected on 2026-09-04. Historical runtime
