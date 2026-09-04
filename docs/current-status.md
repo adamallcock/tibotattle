@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-03
 type: status
 status: current
-source_commit: a53319e506ca49fa9b65de99f51ba3e6c03f1272
+source_commit: 1cbe357e43e692218f56c3d9d4f54ee703d3ebac
 observation_date: 2026-09-03
 ---
 
@@ -18,7 +18,7 @@ using this page for a later release or operational decision.
 
 | Boundary | Verified state |
 |---|---|
-| Documentation/source review | Intel implementation candidate `0.1.18`, local commit `a53319e506ca49fa9b65de99f51ba3e6c03f1272`, includes published 0.1.17 source; no 0.1.18 tag or release created |
+| Documentation/source review | Intel implementation candidate `0.1.18`, local commit `1cbe357e43e692218f56c3d9d4f54ee703d3ebac`, includes published 0.1.17 source and refreshed R7 receipts; no 0.1.18 tag or release created |
 | Installed internal dogfood | Version `0.1.17`, RC9 build `1023.7`, source `394c8a03`; owner accepted the inspected apps on 2026-09-03. Plist version/build/minimum-OS were independently rechecked; this does not qualify every historical credential or clean-profile case |
 | Public service | Read-only `GET https://tibotattle.com/api/health`, HTTP 200, deployment source `304f3d736b6f9451d32a616bf3046ea628e828a3`, observed 2026-08-31 |
 | Public updater | Stable `0.1.16`; read-only feed check recorded 2026-09-03 in the release plan |
@@ -119,10 +119,11 @@ The complete qualification matrix and rules for changing these claims are in
 - The [Intel implementation plan](./plans/2026-09-03-macos-intel-release.md)
   records separate thin builds, architecture-specific update/publication
   contracts and manifest-driven website availability. Native/Rosetta and Worker
-  checks pass; the final root run has 3,736 passes and two stale R7 receipt
-  failures following the 0.1.18 version bump. Physical Intel, private-history R7
-  regeneration, signing/notarization and installed update qualification remain
-  separate gates. No Intel release, feed or website was published.
+  checks pass. The owner-authorized R7 regeneration refreshed all ten receipts;
+  both pinned-runtime freshness checks pass. The final root run has 3,738 passes,
+  zero failures and 17 existing conditional skips. Physical Intel,
+  signing/notarization and installed update qualification remain separate gates.
+  No Intel release, feed or website was published.
 
 - The [public-release plan](./plans/2026-09-03-public-0.1.17-release.md)
   tracks final build `1024`, exact signed-artifact and prior-stable replacement
@@ -145,11 +146,11 @@ The complete qualification matrix and rules for changing these claims are in
   `codex_rollout_content_invalid` / `benchmark_cold_rebuild_incomplete` and
   produced no comparison receipt. Later admitted-index qualification does not
   relabel that attempt as passed or establish repair of its raw sources.
-- Retained dual-runtime R7 receipts bind workload SHA-256
-  `371af38d9066d4fd2d605efee1bc83a8618f20bb72403e4c9f80410d81b18299`.
-  Their decisions remain `release_open`, not a claim that every native or
-  publication gate passed. Release-tooling changes do not require regeneration
-  when the protected workload and freshness checks remain unchanged.
+- Retained dual-runtime R7 receipts were regenerated locally on 2026-09-03 and
+  revalidated against the source snapshot above. Their generated provenance is
+  authoritative; use the [R7 freshness check](./runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md#freshness-check)
+  before relying on a later tree. Decisions remain `release_open` with unresolved
+  resource ceilings, not a claim that every native or publication gate passed.
 - Following the owner's 2026-09-03 confidence-based release direction, the full
   clean-profile/physical Login Item matrix is deferred for 0.1.17, not passed.
   The release still stops for data loss, invalid signatures or updater bytes,

@@ -56,9 +56,9 @@ Do not reuse the ARM 0.1.17 artifact as Intel recovery/update history.
   remains unadvertised until the separate tap supports it.
 - [x] Native artifact gates, actual Intel development build/DMG, isolated
   synthetic Rosetta smoke and full Worker checks pass; full-root results and
-  the separate R7 freshness failure are recorded below.
-- [ ] Regenerate retained R7 receipts through the protected real-history workflow
-  before claiming a completely green root suite or fresh release evidence.
+  the protected R7 regeneration are recorded below.
+- [x] Regenerate all ten retained R7 receipts through the owner-authorized
+  real-history workflow and verify freshness under both pinned runtimes.
 - [x] Browser checks cover available and unavailable Intel states, ARM regression,
   keyboard selection and mobile layout, distinguishing synthetic UI fixtures
   from published evidence.
@@ -138,15 +138,29 @@ Intel metadata remains null. Nothing was deployed.
 
 The initial full root run found three stale native test expectations for the
 extracted feed policy/new validation fields and a missing tool-inventory caller
-entry. Those were corrected without weakening runtime assertions. The final
-full root run on the implementation committed as `a53319e5` completed with
+entry. Those were corrected without weakening runtime assertions. The
+pre-regeneration root run on implementation commit `a53319e5` completed with
 **3,736 passed, 2 failed and 17 existing conditional skips** (3,755 total).
-Both remaining failures are the R7 freshness/decision checks:
+Both failures were the R7 freshness/decision checks:
 0.1.18 changes six version/compatibility files in the hashed R7 workload closure.
-All retained R7 receipts are consequently stale. They were not rewritten,
-skipped or relabelled. The [R7 runbook](../runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md)
-requires separately authorized local regeneration because the real-history
-profile reads the owner's private Codex corpus.
+Those stale receipts were not hand-edited, skipped or relabelled. After the
+owner explicitly authorized the protected local run, the
+[R7 workflow](../runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md)
+regenerated and validated all ten receipts in 39.3 minutes, with exit code 0.
+Both exact runtimes, Node 24.14.0 and 26.2.0, then passed both retained-evidence
+tests, including reconstruction of their respective decision receipts.
+The final full root rerun then passed **3,738 tests, with zero failures and
+17 existing conditional skips** (3,755 total), in 486.6 seconds. The refreshed
+receipts are committed locally as `1cbe357e`; no product code or test assertion
+changed during regeneration. Documentation governance and preflight also pass.
+
+Receipt review confirmed unchanged runtime identities, privacy/preservation
+flags, operation outcomes and comparison states. Each repeated-run projection
+pair matches. Aggregate Claude input bytes and encoded artifact bytes changed
+from the earlier run; record counts and decoded bytes did not. This is fresh
+evidence, not proof of byte-identical historical inputs or improved performance.
+Both decisions remain `release_open` with their existing unresolved resource
+ceilings. These ARM64 R7 runs do not qualify physical Intel hardware.
 
 ## Final local Intel artifacts
 
@@ -164,16 +178,18 @@ An additional 31 credential, accounting and telemetry tests passed using the
 pinned Intel Node binary under Rosetta. This does not qualify physical Intel
 provider discovery, user state, Keychain prompts or installed update behavior.
 
-Local evidence is retained under `.release-build/intel-complete/`; root and
-Worker logs are `.release-build/intel-full-root-final.log` and
+Local evidence is retained under `.release-build/intel-complete/`; the final
+root log is `.release-build/intel-full-root-after-r7.log`, regeneration progress
+is `.release-build/intel-r7-regeneration.log`, and the Worker log is
 `.release-build/intel-worker-complete-check.log`. Browser captures are
 `.release-build/intel-website-*.png`. These ignored local outputs are not public
 release evidence and must not be uploaded as a substitute for qualification.
 
 ## Gates before an Intel release
 
-1. Regenerate the protected R7 receipts and rerun their freshness tests before
-   claiming a completely green root suite or relying on those release receipts.
+1. Keep the retained R7 receipts fresh against the final integrated workload.
+   The owner-authorized branch regeneration passed; any later workload-source
+   change requires another complete regeneration before relying on its evidence.
 2. Finalize a common clean annotated 0.1.18 source tag only after review. Keep
    dogfood/stable build allocation and source identity identical across the two
    architectures. Do not change the immutable 0.1.17 release or tag.
