@@ -466,9 +466,11 @@ uses build `1024` and accepted runtime basis
 preceding dogfood allocation. The exact source provenance is the annotated
 [`v0.1.17` tag](https://github.com/adamallcock/tibotattle/tree/v0.1.17). A future
 signed version/channel must add a reviewed monotonic allocation before release
-tooling will run. The untagged 0.1.18 candidate reserves `1025` for dogfood and
-`1026` for stable on both architectures; neither allocation proves release or
-installation.
+tooling will run. The untagged combined Astra/Intel 0.1.18 RC2 reserves `1025.1`
+for dogfood and retains `1026` for stable on both architectures. The earlier
+signed Intel RC1 remains build `1025`; its evidence does not qualify the combined
+RC2. The ordering is `1025 < 1025.1 < 1026`, and allocation alone proves neither
+signing, installation nor release.
 
 Earlier RCs are historical qualification evidence only. The build-1024
 release retains the fail-closed source, generation, resource, validation,
