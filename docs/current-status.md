@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-04
 type: status
 status: current
-source_commit: ef2d26ac78e75d9c9a1245d539d3ffd8c8c3476b
+source_commit: dc2d0d32a1e82f5b037b0a7094a37c1d4bfdef76
 observation_date: 2026-09-04
 ---
 
@@ -18,7 +18,7 @@ using this page for a later release or operational decision.
 
 | Boundary | Verified state |
 |---|---|
-| Documentation/source review | Combined Astra/Intel candidate `0.1.18`, source/evidence `ef2d26ac78e75d9c9a1245d539d3ffd8c8c3476b`, based on requested `9e1c3333`; [paginated export qualification](./reviews/2026-09-04-paginated-export-qualification.md) records the reset fix, ten fresh R7 receipts validated on both runtimes, optimized ARM/Intel builds with twelve isolated smoke passes, 3,815 passing root tests (17 Windows-only skips), and 108/108 retained macOS tests. RC2 allocation `1025.1`; no production-signed combined artifact or stable tag |
+| Documentation/source review | Combined Astra/Intel candidate `0.1.18`, reviewed source `dc2d0d32a1e82f5b037b0a7094a37c1d4bfdef76`, based on requested `9e1c3333`; [publication preparation](./plans/2026-09-04-release-0-1-18-publication-preparation.md) fixes native rehearsal target/receipt binding and passes 110/110 macOS tests, the full Worker gate and production deployment dry run. App/R7 workload and all ten validated receipts are unchanged from the earlier [paginated qualification](./reviews/2026-09-04-paginated-export-qualification.md), which retains its exact root/build evidence. RC2 `1025.1`; no production-signed combined artifact or stable tag |
 | Intel tester artifact | Inherited signed/notarized `0.1.18` build `1025` dogfood DMG from source `18c7065b`; [exact receipt](./receipts/2026-09-03-macos-intel-signed-candidate.md). Predates combined Astra changes; not physically Intel-qualified |
 | Installed internal dogfood | Version `0.1.17`, RC9 build `1023.7`, source `394c8a03`; owner accepted the inspected apps on 2026-09-03. Plist version/build/minimum-OS were independently rechecked; this does not qualify every historical credential or clean-profile case |
 | Public service | Health/readiness HTTP 200, enrollment and upload processing enabled; deployment source `b4c8f103bf697fb530434e6de196f2c187645661`, observed 2026-09-04 03:57 UTC (2026-09-03 locally) |
@@ -116,6 +116,15 @@ The complete qualification matrix and rules for changing these claims are in
 [platform-support.md](./reference/platform-support.md).
 
 ## Release qualification and known boundaries
+
+- The subsequent [publication preparation](./plans/2026-09-04-release-0-1-18-publication-preparation.md)
+  closes two native qualification-tooling gaps: architecture/channel selection
+  and cross-target manual receipt reuse. Current v2 receipts bind inspected
+  source/payload and require explicit human-observed native hardware/OS; they
+  cannot turn synthetic tests into physical qualification. Local checks pass,
+  but signing/notarization, installed lifecycle, physical Intel and hosted
+  activation remain open. The 0.1.17-only manual-matrix deferral does not carry
+  forward. No publication or update activation occurred.
 
 - The [Intel implementation plan](./plans/2026-09-03-macos-intel-release.md)
   records separate thin builds, architecture-specific update/publication
