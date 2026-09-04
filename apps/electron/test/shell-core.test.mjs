@@ -810,6 +810,49 @@ test("loopback session admits only the dashboard same-origin Blob download", () 
   dashboardInstall.remove();
 });
 
+test("companion supervisor restricts file identity selection to complete local Mac QA inputs", async () => {
+  const pair = {
+    USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
+    USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "/private/fixture/export-identity",
+  };
+  for (const lane of [undefined, "windows-electron-smoke", "macos-electron-local-qa-v1"]) {
+    const child = new FakeChild();
+    let selected;
+    const supervisor = createCompanionSupervisor({
+      environment: { ...pair, USAGE_MONITOR_TEST_LANE: lane },
+      spawnChild(_command, _args, { env }) { selected = env; return child; },
+    });
+    const ready = supervisor.start();
+    child.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4545/\n"));
+    await ready;
+    const allowed = lane === "macos-electron-local-qa-v1";
+    assert.equal(selected.USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY, allowed ? "1" : undefined);
+    assert.equal(selected.USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE,
+      allowed ? pair.USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE : undefined);
+    const stopped = supervisor.stop();
+    child.emit("exit", 0, null);
+    await stopped;
+  }
+  for (const patch of [
+    { USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: undefined },
+    { USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "0" },
+    { USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: undefined },
+    { USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "relative" },
+    { USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "/invalid\0file" },
+    { USAGE_MONITOR_CENTRAL_ORIGIN: "https://example.invalid" },
+    { APP_USAGEMONITOR_EXPORT_SECRET: "must-not-escape" },
+  ]) {
+    let spawned = false;
+    const supervisor = createCompanionSupervisor({
+      environment: { ...pair, USAGE_MONITOR_TEST_LANE: "macos-electron-local-qa-v1", ...patch },
+      spawnChild() { spawned = true; return new FakeChild(); },
+    });
+    await assert.rejects(supervisor.start());
+    assert.equal(spawned, false);
+    assert.equal(supervisor.state.state, "stopped");
+  }
+});
+
 test("companion supervisor owns one child, injects a parent contract, and strips child output", async () => {
   const child = new FakeChild();
   const spawnCalls = [];

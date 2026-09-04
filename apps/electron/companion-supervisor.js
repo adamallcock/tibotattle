@@ -73,6 +73,21 @@ function companionEnvironment(environment, parentPid) {
       selected[key] = environment[key];
     }
   }
+  // Only the explicit local Mac QA lane can select a private identity file.
+  // Never pass secret bytes or silently fall back to Keychain on a broken pair.
+  if (environment.USAGE_MONITOR_TEST_LANE === "macos-electron-local-qa-v1") {
+    const file = environment.USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE;
+    const enabled = environment.USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY;
+    if (file !== undefined || enabled !== undefined) {
+      if (typeof file !== "string" || !file.startsWith("/") || file.includes("\0")
+          || enabled !== "1" || environment.USAGE_MONITOR_CENTRAL_ORIGIN
+          || environment.APP_USAGEMONITOR_EXPORT_SECRET !== undefined) {
+        throw shellError("electron_configuration_invalid");
+      }
+      selected.USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE = file;
+      selected.USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY = "1";
+    }
+  }
   // The child is a Node companion launched by Electron, never another GUI.
   selected.ELECTRON_RUN_AS_NODE = "1";
   selected.USAGE_MONITOR_PORT = "0";

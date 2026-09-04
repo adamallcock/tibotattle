@@ -45,6 +45,7 @@ import {
 import {
   DESKTOP_SETTINGS_SCHEMA_VERSION,
 } from "../apps/electron/desktop-contract.js";
+import { loadOrCreateParticipantSecret } from "../src/export-identity.js";
 
 const MAX_STARTUP_MS = 30_000;
 const MAX_OPERATION_MS = 10_000;
@@ -518,6 +519,7 @@ export async function createSyntheticFixture() {
   const configHome = join(home, ".config");
   const dataHome = join(home, ".local", "share");
   const cacheHome = join(home, ".cache");
+  const identityFile = join(profile, "export-identity");
   const directories = [
     root,
     profile,
@@ -542,6 +544,11 @@ export async function createSyntheticFixture() {
       mode: 0o700,
     })));
     await Promise.all(directories.map((directory) => chmod(directory, 0o700)));
+    await loadOrCreateParticipantSecret({
+      environmentSecret: null,
+      secretFile: identityFile,
+      legacySecretFile: null,
+    });
 
     const now = Date.now();
     const usage = {
@@ -652,6 +659,7 @@ export async function createSyntheticFixture() {
       configHome,
       dataHome,
       cacheHome,
+      identityFile,
     });
   } catch (error) {
     await rm(root, { recursive: true, force: true }).catch(() => {});
@@ -2329,6 +2337,8 @@ async function runSmoke(appPath, progress = {}, {
     USAGE_MONITOR_ACCOUNTING_SOURCE_MODE: "unified",
     USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: MACOS_SMOKE_CONTROL,
     USAGE_MONITOR_TEST_LANE: MACOS_LOCAL_QA_TEST_LANE,
+    USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
+    USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: fixture.identityFile,
     ELECTRON_NO_ATTACH_CONSOLE: "1",
   };
   let port = null;
