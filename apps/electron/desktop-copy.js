@@ -416,6 +416,16 @@ const DESKTOP_MESSAGES = Object.freeze({
     "zh-Hans": "更新本地使用情况",
     es: "Actualizar uso local",
   }),
+  "electron.menu.weekly": Object.freeze({
+    "en-US": "Weekly Allowance",
+    "zh-Hans": "每周配额",
+    es: "Asignación semanal",
+  }),
+  "electron.menu.timeline": Object.freeze({
+    "en-US": "Usage Timeline",
+    "zh-Hans": "使用时间线",
+    es: "Cronología de uso",
+  }),
   "electron.menu.toggleSidebar": Object.freeze({
     "en-US": "Toggle Sidebar",
     "zh-Hans": "切换侧边栏",
@@ -445,6 +455,16 @@ const DESKTOP_MESSAGES = Object.freeze({
     "en-US": "Open {appName}",
     "zh-Hans": "打开 {appName}",
     es: "Abrir {appName}",
+  }),
+  "electron.tray.weekly": Object.freeze({
+    "en-US": "Weekly Allowance",
+    "zh-Hans": "每周配额",
+    es: "Asignación semanal",
+  }),
+  "electron.tray.timeline": Object.freeze({
+    "en-US": "Usage Timeline",
+    "zh-Hans": "使用时间线",
+    es: "Cronología de uso",
   }),
   "electron.tray.allowanceTitle": Object.freeze({
     "en-US": "{appName} · {allowance} allowance",

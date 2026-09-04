@@ -2,6 +2,7 @@ export const DESKTOP_COMMAND_CHANNEL = "tibotattle:desktop-command:v1";
 
 export const DESKTOP_COMMAND_NAMES = Object.freeze([
   "refresh",
+  "dashboardSection",
   "language",
   "appearance",
   "sidebar",
@@ -12,6 +13,10 @@ export const DESKTOP_COMMAND_NAMES = Object.freeze([
 
 const LANGUAGES = Object.freeze(["system", "en", "zh-Hans", "es"]);
 const APPEARANCES = Object.freeze(["system", "light", "dark"]);
+// These are the only dashboard destinations the native shell may request.
+// Keeping the values closed prevents a menu or tray action from becoming a
+// renderer-controlled selector, path, or URL navigation primitive.
+const DASHBOARD_SECTIONS = Object.freeze(["weekly", "timeline"]);
 
 function plainExactObject(value, keys) {
   if (value === null || typeof value !== "object" || Array.isArray(value)
@@ -28,6 +33,11 @@ function plainExactObject(value, keys) {
 export function validateDesktopCommand(value) {
   if (value?.command === "refresh" && plainExactObject(value, ["command"])) {
     return Object.freeze({ command: "refresh" });
+  }
+  if (value?.command === "dashboardSection"
+      && plainExactObject(value, ["command", "section"])
+      && DASHBOARD_SECTIONS.includes(value.section)) {
+    return Object.freeze({ command: "dashboardSection", section: value.section });
   }
   if (value?.command === "language"
       && plainExactObject(value, ["command", "value"])
@@ -68,6 +78,10 @@ export function createDesktopCommand(command, value) {
   if (command === "language") {
     if (arguments.length !== 2) throw new TypeError("desktop command is invalid");
     return validateDesktopCommand({ command, value });
+  }
+  if (command === "dashboardSection") {
+    if (arguments.length !== 2) throw new TypeError("desktop command is invalid");
+    return validateDesktopCommand({ command, section: value });
   }
   if (command === "sidebar") {
     if (arguments.length !== 2 || typeof value !== "boolean") {

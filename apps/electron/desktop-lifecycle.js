@@ -343,6 +343,16 @@ export function createDesktopLifecycle({
     return delivered;
   }
 
+  // Keep native dashboard navigation bounded to the two evidence-rich views
+  // that are useful from a menu-bar shell. The renderer owns the page state
+  // and existing projections; the main process only requests a fixed hash
+  // after bringing the dashboard window to the front.
+  function navigateDashboardSection(section) {
+    if (section !== "weekly" && section !== "timeline") return false;
+    if (!showWindow()) return false;
+    return sendDashboardCommand({ command: "dashboardSection", section });
+  }
+
   function isLiveBrowserWindow(candidate) {
     return candidate !== null && candidate !== undefined
       && candidate.isDestroyed?.() !== true;
@@ -606,6 +616,8 @@ export function createDesktopLifecycle({
       show: suppliedActions.show ?? showWindow,
       focus: suppliedActions.focus ?? showWindow,
       refresh: suppliedActions.refresh ?? (() => sendDashboardCommand({ command: "refresh" })),
+      weekly: suppliedActions.weekly ?? (() => navigateDashboardSection("weekly")),
+      timeline: suppliedActions.timeline ?? (() => navigateDashboardSection("timeline")),
       toggleSidebar: suppliedActions.toggleSidebar ?? (() => false),
       retry: suppliedActions.retry ?? (() => retry()),
       settings: suppliedActions.settings ?? (() => showSettingsWindow()),
@@ -1343,6 +1355,7 @@ export function createDesktopLifecycle({
     hideWindow,
     toggleWindow,
     sendDashboardCommand,
+    navigateDashboardSection,
     setDesktopLanguage,
     invokeTrayCommand,
     requestQuit,

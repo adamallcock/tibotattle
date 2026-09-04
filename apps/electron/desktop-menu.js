@@ -16,6 +16,8 @@ const DESKTOP_ACTION_NAMES = Object.freeze([
   "show",
   "focus",
   "refresh",
+  "weekly",
+  "timeline",
   "toggleSidebar",
   "retry",
   "settings",
@@ -154,6 +156,8 @@ export function createDesktopMenuTemplate({
         actionItem(desktopText("electron.menu.refresh", {}, textOptions), boundedActions.refresh, {
           accelerator: "CmdOrCtrl+R",
         }),
+        actionItem(desktopText("electron.menu.weekly", {}, textOptions), boundedActions.weekly),
+        actionItem(desktopText("electron.menu.timeline", {}, textOptions), boundedActions.timeline),
         actionItem(desktopText("electron.menu.toggleSidebar", {}, textOptions), boundedActions.toggleSidebar, {
           accelerator: "CmdOrCtrl+Shift+S",
         }),

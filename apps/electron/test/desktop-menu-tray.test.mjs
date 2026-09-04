@@ -86,6 +86,8 @@ test("application menu maps all desktop commands to the injected action interfac
 
   const view = template.find(({ label }) => label === "View").submenu;
   item(view, "Update Local Usage").click();
+  item(view, "Weekly Allowance").click();
+  item(view, "Usage Timeline").click();
   item(view, "Toggle Sidebar").click();
   item(view, "Show TiboTattle Dev").click();
   item(view, "Focus TiboTattle Dev").click();
@@ -94,6 +96,8 @@ test("application menu maps all desktop commands to the injected action interfac
     "settings",
     "quit",
     "refresh",
+    "weekly",
+    "timeline",
     "toggleSidebar",
     "show",
     "focus",
@@ -219,6 +223,8 @@ test("tray menu exposes truthful status and shared action callbacks", () => {
     STATUS_PLACEHOLDER,
     "separator",
     "Open TiboTattle Dev",
+    "Weekly Allowance",
+    "Usage Timeline",
     "Retry",
     "Check for Updates…",
     "Settings…",
@@ -228,12 +234,16 @@ test("tray menu exposes truthful status and shared action callbacks", () => {
   ]);
   assert.equal(item(template, STATUS_PLACEHOLDER).enabled, false);
   item(template, "Open TiboTattle Dev").click();
+  item(template, "Weekly Allowance").click();
+  item(template, "Usage Timeline").click();
   item(template, "Retry").click();
   item(template, "Settings…").click();
   item(template, "About TiboTattle Dev").click();
   item(template, "Quit TiboTattle Dev").click();
   assert.deepEqual(calls, [
     "show",
+    "weekly",
+    "timeline",
     "retry",
     "settings",
     "about",

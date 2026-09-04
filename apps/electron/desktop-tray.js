@@ -156,6 +156,14 @@ export function createDesktopTrayTemplate({
       label: desktopText("electron.tray.open", { appName }, textOptions),
       click: boundedActions.show,
     },
+    {
+      label: desktopText("electron.tray.weekly", {}, textOptions),
+      click: boundedActions.weekly,
+    },
+    {
+      label: desktopText("electron.tray.timeline", {}, textOptions),
+      click: boundedActions.timeline,
+    },
     refreshAction,
     // Keep the native status-menu affordance visible even in the Electron
     // development shell, where no updater action is wired. A disabled item

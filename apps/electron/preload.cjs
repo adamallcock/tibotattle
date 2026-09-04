@@ -29,6 +29,7 @@ const WINDOWS_TEST_LANE_ENV = "USAGE_MONITOR_TEST_LANE";
 const WINDOWS_TEST_LANE = "windows-electron-smoke";
 const LANGUAGES = Object.freeze(["system", "en", "zh-Hans", "es"]);
 const APPEARANCES = Object.freeze(["system", "light", "dark"]);
+const DASHBOARD_SECTIONS = Object.freeze(["weekly", "timeline"]);
 const REFRESH_INTERVALS = Object.freeze([60, 300, 900, 1800]);
 const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
 const NOTIFICATION_THRESHOLDS = Object.freeze([
@@ -189,6 +190,12 @@ function validDesktopCommand(value) {
   if (value?.command === "refresh") {
     return exactObject(value, ["command"], "command")
       ? Object.freeze({ command: "refresh" })
+      : null;
+  }
+  if (value?.command === "dashboardSection") {
+    return exactObject(value, ["command", "section"], "command")
+      && DASHBOARD_SECTIONS.includes(value.section)
+      ? Object.freeze({ command: "dashboardSection", section: value.section })
       : null;
   }
   if (value?.command === "language") {

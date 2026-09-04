@@ -1090,6 +1090,7 @@ export async function launchDesktopRuntime({
     hideWindow: lifecycle.hideWindow,
     toggleWindow: lifecycle.toggleWindow,
     sendDashboardCommand: lifecycle.sendDashboardCommand,
+    navigateDashboardSection: lifecycle.navigateDashboardSection,
     setDesktopLanguage: lifecycle.setDesktopLanguage,
     invokeTrayCommand: lifecycle.invokeTrayCommand,
     requestQuit,

@@ -18,6 +18,10 @@ const DESKTOP_LANGUAGE_BY_PICKER_VALUE = Object.freeze(
     Object.entries(LANGUAGE_PICKER_VALUES).map(([desktop, picker]) => [picker, desktop]),
   ),
 );
+const DASHBOARD_SECTION_HASHES = Object.freeze({
+  weekly: "#weekly",
+  timeline: "#timeline",
+});
 const mountedDocuments = new WeakMap();
 
 function electronDashboard(documentRef, windowRef) {
@@ -83,6 +87,22 @@ function navigateToSharePanel(documentRef, windowRef) {
   };
   windowRef.addEventListener("hashchange", onHashChange);
   location.hash = "#weekly";
+}
+
+/**
+ * Navigate to one of the dashboard's evidence views from a native menu or
+ * tray action. The main process validates the same fixed values before this
+ * command reaches the page, and this local mapping keeps the renderer from
+ * ever accepting an arbitrary selector, hash, path, or URL.
+ */
+export function navigateToDashboardSection(_documentRef, windowRef, section) {
+  const hash = DASHBOARD_SECTION_HASHES[section];
+  const location = windowRef?.location;
+  if (typeof hash !== "string" || !location || typeof location !== "object") {
+    return false;
+  }
+  if (location.hash !== hash) location.hash = hash;
+  return true;
 }
 
 function openSettings(windowRef) {
@@ -172,6 +192,12 @@ function installCommandBridge(documentRef, windowRef, applyLanguage, applySideba
     if (!command || typeof command !== "object") return;
     if (command.command === "refresh") {
       documentRef.querySelector?.("#refresh-button")?.click?.();
+      return;
+    }
+    if (command.command === "dashboardSection") {
+      if (Reflect.ownKeys(command).length !== 2
+          || !Object.hasOwn(command, "section")) return;
+      navigateToDashboardSection(documentRef, windowRef, command.section);
       return;
     }
     if (command.command === "hostedSignInReturn") {

@@ -1648,6 +1648,16 @@ test("desktop lifecycle composes secure window, tray, single instance, retry, an
   firstDashboard.emit("ready-to-show");
   assert.equal(firstDashboard.visible, true);
   assert.equal(lifecycle.state.windowVisible, true);
+  trays[0].menu.template.find((item) => item.label === "Weekly Allowance").click();
+  assert.deepEqual(firstDashboard.webContents.sent.at(-1), {
+    channel: "tibotattle:desktop-command:v1",
+    command: { command: "dashboardSection", section: "weekly" },
+  });
+  trays[0].menu.template.find((item) => item.label === "Usage Timeline").click();
+  assert.deepEqual(firstDashboard.webContents.sent.at(-1), {
+    channel: "tibotattle:desktop-command:v1",
+    command: { command: "dashboardSection", section: "timeline" },
+  });
   trays[0].emit("click");
   assert.equal(lifecycle.state.windowVisible, false);
   trays[0].menu.template.find((item) => item.label === "Open TiboTattle").click();
@@ -3050,6 +3060,8 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   const commandListener = commandListeners.get("tibotattle:desktop-command:v1");
   assert.equal(typeof commandListener, "function");
   commandListener({}, { command: "refresh" });
+  commandListener({}, { command: "dashboardSection", section: "weekly" });
+  commandListener({}, { command: "dashboardSection", section: "timeline" });
   commandListener({}, { command: "language", value: "es" });
   commandListener({}, { command: "sidebar", collapsed: true });
   commandListener({}, { command: "hostedSignInReturn" });
@@ -3065,8 +3077,11 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   });
   commandListener({}, { command: "language", value: "fr" });
   commandListener({}, { command: "refresh", selector: "#private" });
+  commandListener({}, { command: "dashboardSection", section: "accounting" });
   assert.deepEqual(JSON.parse(JSON.stringify(commands)), [
     { command: "refresh" },
+    { command: "dashboardSection", section: "weekly" },
+    { command: "dashboardSection", section: "timeline" },
     { command: "language", value: "es" },
     { command: "sidebar", collapsed: true },
     { command: "hostedSignInReturn" },

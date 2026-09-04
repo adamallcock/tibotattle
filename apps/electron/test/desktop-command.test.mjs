@@ -10,6 +10,14 @@ import {
 test("desktop commands contain only the fixed presentation vocabulary", () => {
   assert.equal(DESKTOP_COMMAND_CHANNEL, "tibotattle:desktop-command:v1");
   assert.deepEqual(createDesktopCommand("refresh"), { command: "refresh" });
+  assert.deepEqual(createDesktopCommand("dashboardSection", "weekly"), {
+    command: "dashboardSection",
+    section: "weekly",
+  });
+  assert.deepEqual(createDesktopCommand("dashboardSection", "timeline"), {
+    command: "dashboardSection",
+    section: "timeline",
+  });
   assert.deepEqual(createDesktopCommand("language", "zh-Hans"), {
     command: "language",
     value: "zh-Hans",
@@ -40,6 +48,9 @@ test("desktop commands reject selectors, paths, URLs, extra keys, and prototypes
   for (const value of [
     null,
     { command: "refresh", selector: "#refresh-button" },
+    { command: "dashboardSection", section: "accounting" },
+    { command: "dashboardSection", section: "#weekly" },
+    { command: "dashboardSection", section: "weekly", path: "/private/secret" },
     { command: "navigate", value: "https://attacker.example" },
     { command: "language", value: "fr" },
     { command: "language", value: "en", path: "/tmp/private" },
@@ -62,6 +73,8 @@ test("desktop commands reject selectors, paths, URLs, extra keys, and prototypes
     () => createDesktopCommand("shareCardDownloadFailed", { path: "/private/download.png" }),
     TypeError,
   );
+  assert.throws(() => createDesktopCommand("dashboardSection", "accounting"), TypeError);
+  assert.throws(() => createDesktopCommand("dashboardSection"), TypeError);
   assert.throws(() => createDesktopCommand("sidebar"), TypeError);
   assert.throws(() => createDesktopCommand("appearance", "dark"), TypeError);
 });
