@@ -62,6 +62,9 @@ import {
 import {
   buildTelemetryContributionsFromBundle,
 } from "../../src/telemetry-contribution-builder.js";
+import {
+  DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
+} from "../../src/desktop-shell-status.js";
 import { TELEMETRY_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
 import {
   PREVIEW_PRODUCT_BRAND,
@@ -1008,6 +1011,20 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     });
     assert.equal(health.headers.get("access-control-allow-origin"), null);
     assert.match(health.headers.get("content-security-policy"), /default-src 'none'/);
+
+    await app.snapshotReady;
+    const desktopStatus = await fetch(`${base}/api/local/desktop-status`);
+    assert.equal(desktopStatus.status, 200);
+    assert.deepEqual(await desktopStatus.json(), {
+      schemaVersion: DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
+      state: "unavailable",
+      allowance: null,
+      notificationEvidence: null,
+    });
+    assert.equal((await fetch(`${base}/api/local/desktop-status`, {
+      method: "POST",
+    })).status, 405);
+
     const retirement = app.automaticContributionRetirement();
     assert.equal(retirement.status, "retired");
     assert.equal(retirement.priorState, "absent");
@@ -2254,6 +2271,101 @@ test("server rejects forged hosts and requires same-origin refresh authorization
     });
     assert.equal(JSON.stringify(completed).includes("/Users/private"), false);
     assert.equal(store.reloads, 1);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("desktop status route projects refresh lifecycle without dashboard payloads", async () => {
+  const files = await fixture();
+  const now = Date.parse("2026-08-25T12:00:00.000Z");
+  const notificationEvidence = {
+    schemaVersion: "tibotattle-notification-evidence-v2",
+    status: "fresh_provider_observation",
+    provider: "openai_codex",
+    source: "app_server_read",
+    freshness: "fresh",
+    observedAt: new Date(now).toISOString(),
+    continuityKey: "a".repeat(43),
+    windows: [{
+      lane: "primary",
+      usedPercent: 26,
+      durationMinutes: 300,
+      resetAt: "2026-08-25T15:00:00.000Z",
+      resetProofKind: "provider_reported_schedule_only",
+    }],
+  };
+  let releaseRefresh;
+  const refreshGate = new Promise((resolve) => {
+    releaseRefresh = resolve;
+  });
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: fakeStore(),
+    refreshRunner: async () => {
+      await refreshGate;
+      return {
+        notificationEvidence,
+        privatePath: "/Users/private",
+      };
+    },
+    clock: () => now,
+    port: 0,
+  });
+  try {
+    await app.snapshotReady;
+    const base = `http://127.0.0.1:${app.port}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const started = await fetch(`${base}/api/local/refresh`, {
+      method: "POST",
+      headers,
+      body: "{}",
+    });
+    assert.equal(started.status, 202);
+
+    const analyzing = await fetch(`${base}/api/local/desktop-status`);
+    assert.equal(analyzing.status, 200);
+    assert.deepEqual(await analyzing.json(), {
+      schemaVersion: DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
+      state: "analyzing",
+      allowance: null,
+      notificationEvidence: null,
+    });
+
+    releaseRefresh();
+    await waitFor(async () => {
+      const response = await fetch(`${base}/api/local/refresh`);
+      return (await response.json()).refresh.status === "succeeded";
+    });
+    const completed = await fetch(`${base}/api/local/refresh`)
+      .then((response) => response.json());
+    assert.deepEqual(completed.refresh.result?.notificationEvidence, notificationEvidence);
+    const fresh = await fetch(`${base}/api/local/desktop-status`);
+    assert.equal(fresh.status, 200);
+    const freshPayload = await fresh.json();
+    assert.deepEqual(freshPayload, {
+      schemaVersion: DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
+      state: "fresh",
+      allowance: {
+        source: "direct",
+        window: "five_hour",
+        remainingPercent: 74,
+      },
+      notificationEvidence,
+    });
+    assert.equal(JSON.stringify(freshPayload).includes("rollout"), false);
+    assert.equal(JSON.stringify(freshPayload).includes("/Users/private"), false);
+    assert.equal((await fetch(`${base}/api/local/desktop-status`, {
+      method: "POST",
+    })).status, 405);
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });

@@ -144,6 +144,9 @@ import {
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
 } from "../../config/product-brand.js";
 import {
+  projectDesktopShellStatus,
+} from "../../src/desktop-shell-status.js";
+import {
   RELEASE_VERSION,
   RELEASE_VERSION_PLACEHOLDER,
 } from "../../config/release-manifest.js";
@@ -740,6 +743,7 @@ const REPORT_ROUTES = createLocalCompanionReportRoutes(
 
 const API_ROUTES = new Set([
   "/api/local/health",
+  "/api/local/desktop-status",
   "/api/local/diagnostics/contribution",
   "/api/local/diagnostics/note",
   "/api/local/identity/hosted-signin-handoff",
@@ -772,6 +776,7 @@ const API_ROUTES = new Set([
 // diagnostics.
 const SNAPSHOT_INDEPENDENT_API_ROUTES = new Set([
   "/api/local/health",
+  "/api/local/desktop-status",
   "/api/local/diagnostics/contribution",
   "/api/local/diagnostics/note",
   "/api/local/identity/hosted-signin-handoff",
@@ -3837,6 +3842,7 @@ function createPreparedLocalCompanionServer({
     dataStore,
     timeoutMs: refreshTimeoutMs,
     timeoutMsForRun: refreshTimeoutMsForRun,
+    clock,
     // Five hours of refresh_resource_limited loops once left zero local
     // trail: the terminal classification lived only in this controller's
     // in-memory state. Every terminal refresh failure now files one bounded,
@@ -4091,6 +4097,22 @@ function createPreparedLocalCompanionServer({
             remoteProxy: false,
           },
         });
+        return;
+      }
+      if (path === "/api/local/desktop-status") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        // The shell receives only the closed projection. It deliberately reads
+        // the in-memory lifecycle and refresh receipt rather than the full
+        // dashboard snapshot, so startup and refresh transitions remain
+        // observable without exposing paths, source details, or accounting.
+        send(response, 200, projectDesktopShellStatus({
+          snapshotStatus: snapshotState.status,
+          refresh: refresh.getStatus(),
+          now: clock(),
+        }));
         return;
       }
       if (path === "/api/local/diagnostics/contribution") {
