@@ -164,7 +164,7 @@ or remote migration was attempted.
 
 | Candidate target | Current workstream status | Next physical gate |
 |---|---|---|
-| macOS arm64 | Reconciled Electron source and companion HTTP assets; browser preview inspected | Fresh packaged Electron launch, credential/state migration and first update |
+| macOS arm64 | Fresh Electron 43.2.0 development app and exact ASAR closure verified; synthetic notice, Settings and opt-out restart inspected | Credential/state migration, installed replacement and first update |
 | macOS x64 | Shared source reconciled; active native 0.1.18 candidate left separate | Exact Intel Electron/native-dependency build and installed lifecycle |
 | Windows x64 | Retained protected-state/platform seams integrated; production readiness remains disabled | Qualified native binding, installer, credentials and update on Windows |
 | Linux x64 | Retained shell/adapter foundations; no installed support claim | Secret Service, tray/display environment, package/update and relaunch |
@@ -196,8 +196,47 @@ authenticated renewal/revocation and conservative aggregate admission, then
 wire scheduling and cancellation through the same durable preference.
 Do not fabricate participants, consent events, sessions or browser pairings.
 
-Second-tranche validation is in progress. Source tests, rendered/package
-inspection and remaining gates will be recorded here before handoff.
+The reviewed development packager and exact-artifact verifier were restored
+from the retained Electron branch, with both sharing modules added to their
+closed source inventories. This avoids a parallel packaging implementation.
+The current packager still targets development macOS arm64 and Windows x64;
+restoration does not qualify the other target artifacts.
+
+Second-tranche source commits are `29c99016` (policy and UI), `6971c479`
+(development packaging) and `b4314a1b` (viewport visibility guard). Validation:
+
+| Evidence | Result and boundary |
+|---|---|
+| Complete Electron source suite | 328/328 passed, including hidden/foreign/settings-frame notice refusal and legacy hosted transport suppression |
+| Complete shared web suite | 492/492 passed after the viewport guard, including notice retention, actual visibility and startup regression coverage |
+| Domain, protected desktop store and classifier | 31/31 passed: trusted clock, restart, three receipts, choices, corrupt state and unsafe metadata |
+| Restored packaging/verifier suite | 41 passed, two platform/artifact fixture skips; a subsequent direct verifier matched the actual macOS artifact to its staged source |
+| Architecture, catalogs, API/docs guidance, tool inventory and preflight | Passed; four restored packaging tools have explicit ownership |
+| Packaged macOS arm64 UI | Actual Electron 43.2.0 directory app: first notice remained visible after its one display receipt; Settings on/off persisted; clean quit and relaunch preserved off and cancelled notices |
+| Complete root suite | 3,804 tests: 3,783 passed, 19 skipped, two retained R7 receipt/current-workload provenance failures. This run began at `6971c479`; the subsequent UI-only guard passed the complete 492-test web suite |
+
+The packaged UI check uses a disposable synthetic profile and export-identity
+override, with the hosted contribution origin absent. It does not qualify real
+account/credential migration, live uploads, Intel/Windows/Linux, startup-item
+registration, signing/notarization, an installed replacement or an update.
+Host HOME was preserved; this is not whole-process Keychain isolation.
+Rendered notice and Settings captures plus the content-free runtime and
+artifact receipts are retained under the ignored
+`.release-build/electron-sharing-qa-viewport-final/evidence/` directory.
+
+The final artifact was rebuilt from `b4314a1bcbd97c1663f17ddda23610b8366a1c26`.
+Its raw ASAR SHA-256 is
+`678f0658d098626d51d530b160d392f8993b78a7104df51fcf8d7a24eb307142`.
+The direct verifier matched all 466 staged and packaged files, including the
+one unpacked native module. The final packaged runtime check passed again:
+one visible notice produced exactly one receipt, Settings toggled on then off,
+and a clean relaunch retained the opt-out with reminders cancelled.
+
+The viewport guard has four passing UI tests: offscreen, zero-area or
+CSS-hidden notices wait until sufficient banner area is visible before the
+renderer supplies a display receipt. Scroll, resize and visibility changes
+retry presentation without duplicating receipts. Actual rendered notice and
+Settings captures were inspected after rebuilding the final app.
 
 ### Usage-to-quota attribution contract
 
