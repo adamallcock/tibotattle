@@ -14,6 +14,14 @@ the current linked usage dataset. Authentication, consent and background
 delivery are separate decisions: removing an account requirement does not
 require removing consent.
 
+**Technical follow-up:** the user clarified that changing the privacy/default
+policy is an option and that perfect person-level identity is not required.
+Under that threat model, accountless enrollment is technically reasonable.
+The [duplicate and abuse design below](#technical-follow-up-duplicates-and-bulk-abuse)
+supersedes any implication that social identity or strong unique-person proof
+is an engineering prerequisite. The default permission choice can be made
+independently of that mechanism; this document changes neither setting.
+
 This is research and a proposed workstream, not a change to defaults,
 credentials, collection, retention or production. It complements the
 [desktop convergence plan](../plans/2026-09-04-desktop-convergence.md) without
@@ -274,6 +282,116 @@ Then spend a short design/spike cycle on B. Exit with explicit admission,
 eligibility and lost-key decisions plus a consent-bound synthetic enrollment
 demonstration. Keep pilot data out of public participant counts until those
 gates pass. Do not build C, a new identity platform or E as prerequisites.
+
+## Technical follow-up: duplicates and bulk abuse
+
+Scope: prevent accidental repeat accounting and make mass automated submissions
+bounded and disruptable. Accept that motivated users can have many identities,
+including many Google accounts. Do not build person verification as a
+prerequisite. Source observations below remain pinned to `9e1c3333`; configured
+limits are not freshly measured live deployment behavior.
+
+### Duplicate handling
+
+| Case | Current mechanism | Smallest additional work |
+|---|---|---|
+| Retry after timeout, restart or repeated upload | Digest/revision idempotency; uniqueness within participant/device and stream | Reuse it, with durable installation credentials across ordinary updates |
+| Repeated history from another device of the same participant | Analytical source selection elects a device per participant/day | Retain conservative source selection and correction handling |
+| Reinstall with lost identity, copied logs or unrelated enrollments | Source `sessionUuid` normally contains the upstream session UUID, but server uniqueness is not global | Add provider-namespaced session/source deduplication across enrollments; retain provenance and choose a consistent validated source revision |
+| Account-wide quota polls on multiple machines | Scoped observations without a global account identity; session UUID is insufficient | Need a reviewed cross-device provider-account tag and quota-stream selection, or a narrower explicit exclusion/unknown policy |
+
+Current usage `eventId` is a device-salted HMAC involving physical source,
+offset and timestamp (`src/local-unified-index-build.js:545`). It is not a
+portable event identity. `sessionUuid` has a salted fallback for older records
+(`src/contribution/telemetry-v1-chunks.js:378`). D1 uniqueness is
+participant/device/stream/occurrence
+(`apps/worker/migrations/0031_incremental_contribution_v1.sql:283`). Neither
+v1 nor the staged v1.1 provides universal cross-enrollment deduplication.
+
+Start with logical `(provider, upstream session UUID)` recognition and
+consistent source-revision selection, rather than blindly summing copies.
+If merging events from multiple copies is needed, add a canonical upstream
+occurrence identity independent of installation salt/path. Session ID alone
+must not collapse all valid events in a session; timestamp or value equality
+alone also cannot prove duplicate events. A hash of mutable token fields is
+insufficient to distinguish a correction from new usage.
+
+Treat a repeat revision as idempotent, a verified correction as supersession,
+and conflicting submissions as a reviewable conflict. Keep logical accounting
+selection separate from who submitted/stored the record. First arrival must
+not permanently own an arbitrary session ID or permit one sender to delete
+another's data. Cross-participant deduplication also needs provenance-aware
+erasure and aggregate recomputation.
+
+Quota is a distinct problem: different sessions may report the same
+account-wide window. If cross-device deduplication is required, specify a
+purpose-specific stable provider-account tag plus a window/reset identity and
+one authoritative observation stream. Existing enrollment-scoped account tags
+are not automatically global. Do not deduplicate merely on equal quota values,
+or pretend unknown account linkage is proven.
+
+### Bulk abuse protection
+
+Already implemented/configured:
+
+- Enrollment and upload rate limits by coarse/global key, address and/or
+  participant, with fail-closed admission errors.
+- Expiring, one-use upload authorizations bound to payload digest and length;
+  a shared ingress gate is entered before body processing, and authorization
+  is claimed before expensive decryption.
+- One named Durable Object limits ingress to 64 concurrent uploads, with
+  token refill of 1,200 starts/minute and a 1,200-token burst allowance; body
+  deadlines and idle timeouts bound occupied capacity.
+- v1 chunks have at most 200 records and 1,250,000 canonical bytes. Per-device
+  admission currently allows 20,000 chunks/day for the first seven days and
+  2,000 thereafter. These are generous backfill ceilings, not recommended new
+  anonymous-enrollment quotas.
+- Schema/semantic validation, quarantine, revocation and collection switches.
+  Weekly cohort publication already has maturity and contribution caps;
+  equivalent clipping is not established for daily totals or allowance fits.
+
+Weekly cohorts currently also require linked social identity. Accountless
+publication must deliberately replace that eligibility condition; removing
+the sign-in requirement at enrollment alone would not make the new data eligible.
+
+These protect resources and malformed input; they do not establish that a
+syntactically valid fabricated measurement came from a real provider session.
+
+Recommended accountless additions:
+
+1. A bounded enrollment bootstrap issues a persistent, revocable installation
+   credential. Rate-limit identity creation as well as subsequent uploads.
+2. Use smaller new-installation admission budgets, with a bounded backfill lane
+   that preserves progress and capacity for established contributors. Count
+   rejected/invalid attempts too; current accepted-chunk quotas alone do not
+   account for all crypto/validation work.
+3. Add strict global byte/work/storage budgets and stop-admission controls.
+   Per-minute limits alone do not cap cumulative cost, especially because
+   current retained upload envelopes have no automatic age expiry.
+4. Add a browser-based Turnstile check for new-enrollment bursts or other
+   suspicious activity if needed. Bind its server-verified result to one
+   enrollment request; keep its secret on the server. A normal installation
+   should not need a challenge for each background upload. Electron/desktop
+   integration needs a tested hosted page and return flow; this is additional
+   capability, not already implemented.
+5. Apply deliberate per-source influence limits, maturity checks and anomaly
+   quarantine to the actual published estimator. Reuse weekly policy concepts
+   where suitable, but test their effect on legitimate heavy users and
+   backfills. Robust statistics alone cannot defeat enough coordinated fakes.
+
+Cloudflare documents [server verification and single-use challenge tokens](https://developers.cloudflare.com/turnstile/get-started/server-side-validation/)
+and [WebView integration](https://developers.cloudflare.com/turnstile/get-started/mobile-implementation/).
+Its [Worker Rate Limiting binding](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/)
+is per-location and eventually consistent; it must not be treated as a strict
+worldwide spending counter. Reuse the existing shared Durable Object or another
+transactional authority for hard global budgets.
+
+The practical target is accountless enrollment, canonical duplicate handling,
+and layered resource/quality limits. This can underpin either an opt-in or
+an opt-out product decision. Perfect uniqueness and authenticity remain outside
+the accepted threat model, just as having a Google account does not prove the
+truth of uploaded measurements. No default or live collection change follows
+from this research.
 
 ## Source references
 
