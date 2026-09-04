@@ -53,6 +53,8 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
     // index/archive modules in the reviewed runtime inventory while rollback
     // remains supported; this test makes both halves of that boundary explicit.
     for (const path of [
+      "src/desktop-shell-status.js",
+      "scripts/validate-macos-login-item-release.js",
       "src/local-cache-drop-thread-links.js",
       "src/platform/local-codex-thread-store.js",
       "test/local-cache-drop-thread-links.test.js",

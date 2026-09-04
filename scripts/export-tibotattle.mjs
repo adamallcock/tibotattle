@@ -195,6 +195,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/local-collector-state.js",
   "src/local-companion-central-proxy.js",
   "src/local-companion-data.js",
+  "src/desktop-shell-status.js",
   "src/local-authoritative-dashboard-snapshot.js",
   "src/local-companion-refresh.js",
   "src/local-contribution-preparation.js",
@@ -398,6 +399,7 @@ export const CLIENT_SCRIPT_FILES = Object.freeze([
   "scripts/prepare-sparkle-framework.js",
   "scripts/release-macos-app.js",
   "scripts/validate-macos-install.js",
+  "scripts/validate-macos-login-item-release.js",
   "scripts/validate-macos-replacement.js",
 ]);
 
