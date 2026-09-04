@@ -38,6 +38,10 @@ import {
 import {
   transformElectronBuilderPackageJsonBytes,
 } from "./lib/electron-builder-package-json.mjs";
+import {
+  WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION,
+  WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS,
+} from "../src/platform/windows-filesystem.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const require = createRequire(import.meta.url);
@@ -129,54 +133,17 @@ const WINDOWS_NATIVE_MANIFEST_KEYS = Object.freeze([
   "contractVersion",
   "securityContractVersion",
   "credentialAuditFileGuardContractVersion",
-  "sqliteStateLeaseContractVersion",
   "credentialMutexContractVersion",
-  "companionInstanceMutexContractVersion",
-  "preparedArtifactContractVersion",
   "requiredMethods",
   "nativeClaims",
   "approvedPolicy",
-  "bindingProvenance",
 ]);
-const WINDOWS_REQUIRED_METHODS = Object.freeze([
-  "inspectPath",
-  "ensureDirectory",
-  "readFile",
-  "readFileBounded",
-  "createFile",
-  "deleteFile",
-  "replaceFile",
-  "inspectProtectedChild",
-  "readProtectedChild",
-  "createProtectedChild",
-  "deleteProtectedChild",
-  "replaceProtectedChild",
-  "acquireSqliteStateLease",
-  "releaseSqliteStateLease",
-  "acquireCredentialAuditFileGuard",
-  "releaseCredentialAuditFileGuard",
-  "acquireCredentialMutex",
-  "releaseCredentialMutex",
-  "acquireCompanionInstanceMutex",
-  "releaseCompanionInstanceMutex",
-  "inspectPreparedChild",
-  "ensurePreparedDirectory",
-  "enumeratePreparedDirectory",
-  "removePreparedDirectory",
-  "renamePreparedDirectory",
-  "createPreparedFile",
-  "readPreparedFile",
-  "deletePreparedFile",
-  "publishPreparedFile",
-]);
+const WINDOWS_REQUIRED_METHODS = WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS;
 const WINDOWS_NATIVE_CLAIM_KEYS = Object.freeze([
   "productionSafe",
   "pathWalkRaceSafe",
   "credentialMutexSafe",
-  "companionInstanceMutexSafe",
   "credentialAuditFileGuardSafe",
-  "sqliteStateLeaseSafe",
-  "preparedArtifactSafe",
 ]);
 const WINDOWS_APPROVED_POLICY_KEYS = WINDOWS_NATIVE_CLAIM_KEYS;
 const MAXIMUM_WINDOWS_BINDING_BYTES = 64 * 1024 * 1024;
@@ -600,12 +567,11 @@ function validateNativeManifestShape(value) {
   assertContentFree(value, FIXED_STATUS.bindingInvalid);
   const nativeClaims = value.nativeClaims;
   const approvedPolicy = value.approvedPolicy;
-  const bindingProvenance = value.bindingProvenance;
   const exactBooleanShape = (candidate, keys) =>
     exactObjectKeys(candidate, keys)
       && keys.every((key) => typeof candidate[key] === "boolean");
   if (!exactObjectKeys(value, WINDOWS_NATIVE_MANIFEST_KEYS)
-      || value.schemaVersion !== "windows-filesystem-binding-manifest-v1"
+      || value.schemaVersion !== WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION
       || value.bindingFile !== "windows_filesystem.node"
       || value.platform !== "win32"
       || value.architecture !== "x64"
@@ -617,12 +583,7 @@ function validateNativeManifestShape(value) {
       || value.securityContractVersion !== "windows-filesystem-security-v1"
       || value.credentialAuditFileGuardContractVersion
         !== "windows-credential-audit-file-guard-v1"
-      || value.sqliteStateLeaseContractVersion !== "windows-sqlite-state-lease-v1"
       || value.credentialMutexContractVersion !== "windows-credential-mutex-v1"
-      || value.companionInstanceMutexContractVersion
-        !== "windows-companion-instance-mutex-v1"
-      || value.preparedArtifactContractVersion
-        !== "windows-prepared-artifact-v1"
       || !Array.isArray(value.requiredMethods)
       || value.requiredMethods.length !== WINDOWS_REQUIRED_METHODS.length
       || value.requiredMethods.some((method, index) => method !== WINDOWS_REQUIRED_METHODS[index])
@@ -631,22 +592,13 @@ function validateNativeManifestShape(value) {
       || nativeClaims.productionSafe !== false
       || nativeClaims.pathWalkRaceSafe !== false
       || nativeClaims.credentialMutexSafe !== true
-      || nativeClaims.companionInstanceMutexSafe !== false
       || nativeClaims.credentialAuditFileGuardSafe !== true
-      || nativeClaims.sqliteStateLeaseSafe !== false
-      || nativeClaims.preparedArtifactSafe !== false
       || approvedPolicy.productionSafe !== false
       || approvedPolicy.pathWalkRaceSafe !== false
       || approvedPolicy.credentialMutexSafe !== true
-      || approvedPolicy.companionInstanceMutexSafe !== false
       || approvedPolicy.credentialAuditFileGuardSafe !== true
-      || approvedPolicy.sqliteStateLeaseSafe !== false
-      || approvedPolicy.preparedArtifactSafe !== false
       || WINDOWS_NATIVE_CLAIM_KEYS.some((key) => nativeClaims[key] !== approvedPolicy[key])
-      || !exactObjectKeys(bindingProvenance, ["contractVersion", "source", "status"])
-      || bindingProvenance.contractVersion !== "windows-binding-provenance-v1"
-      || bindingProvenance.status !== "unqualified"
-      || bindingProvenance.source !== "unsigned-development-binding") {
+      ) {
     fail(FIXED_STATUS.bindingInvalid);
   }
   return value;

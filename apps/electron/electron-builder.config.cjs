@@ -120,7 +120,11 @@ module.exports = {
   npmRebuild: true,
   buildDependenciesFromSource: false,
   nodeGypRebuild: false,
-  publish: "never",
+  // `publish` is a provider configuration, not the CLI publish policy. A
+  // string here is interpreted as a provider name during distribution builds
+  // (so `"never"` would try to load electron-publisher-never). The packaging
+  // entrypoint supplies `--publish never` explicitly.
+  publish: null,
 };
 
 if (darwinTarget) {

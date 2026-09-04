@@ -195,7 +195,7 @@ test("Electron builder configuration is an unsigned macOS arm64 directory build"
     "node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
   ]);
   assert.equal(BUILDER_CONFIG.extraMetadata.main, "apps/electron/main.js");
-  assert.equal(BUILDER_CONFIG.publish, "never");
+  assert.equal(BUILDER_CONFIG.publish, null);
   assert.equal(BUILDER_CONFIG.forceCodeSigning, false);
   assert.equal(BUILDER_CONFIG.beforeBuild(), false);
   assert.equal(BUILDER_CONFIG.npmRebuild, true);
@@ -224,7 +224,7 @@ test("Electron builder configuration exposes an unsigned Windows x64 directory t
   assert.deepEqual(config.win.target, [{ target: "dir", arch: ["x64"] }]);
   assert.equal(config.win.signAndEditExecutable, false);
   assert.equal(config.win.signExecutable, false);
-  assert.equal(config.publish, "never");
+  assert.equal(config.publish, null);
   assert.equal(config.forceCodeSigning, false);
 });
 
@@ -263,6 +263,7 @@ test("Electron builder configuration maps every development target to its native
     const config = loadBuilderConfigForTarget(target);
     assert.match(config.directories.app, expectation.app, target);
     assert.match(config.directories.output, expectation.artifact, target);
+    assert.equal(config.publish, null, target);
     assert.deepEqual(config.asarUnpack.filter((value) => value.includes("keytar.node")), [
       `node_modules/@github/keytar/prebuilds/${expectation.keytar}/keytar.node`,
     ], target);
