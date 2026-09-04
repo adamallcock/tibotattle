@@ -37,6 +37,15 @@ prototype and benchmark readers remain in the source tree for development
 evaluation, but the installed companion exposes no setting, route, UI, or
 upload surface that enables them.
 
+Codex history discovery also recognizes cold `.jsonl.zst` representations. On
+native-Zstd-capable runtimes, bounded streaming decompression feeds the same
+allowlisted metadata projection. It creates no decoded transcript files and
+never edits the source tree. The physical filename remains private; durable
+cursors refer to logical uncompressed byte offsets. Unsupported runtimes or
+damaged histories produce explicit partial coverage. See the
+[compressed-history contract](./unified-index-schema.md#compressed-codex-histories)
+for runtime and resource limits.
+
 ## Optional local integrations
 
 | Integration | Activation | Data boundary | Persistence |

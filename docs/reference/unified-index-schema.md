@@ -28,7 +28,7 @@ one another:
 | Stable filename | `local-unified-index-v1.sqlite` | Machine path continuity across app releases. |
 | Schema-family metadata | `local-unified-index-v2` | Logical family stored in `meta.schema_version`. |
 | SQLite `PRAGMA user_version` | `11` | Physical table/index/migration generation. |
-| Parser version | `unified-rollout-typed-v11` | Meaning and provenance of facts extracted from rollout sources. |
+| Parser version | `unified-rollout-typed-v12` | Meaning and provenance of facts extracted from rollout sources. |
 | Source identity version | `codex-immutable-rollout-v1` | Rules for physical rollout identity/generation. |
 
 The application id is a separate SQLite format guard. A file with the wrong
@@ -69,8 +69,35 @@ invalid provider quota window at record level while retaining unrelated valid
 usage, tool, and quota facts from that source. It also treats a selected
 paginated replacement with no `history_base` as a segment-start lineage reset,
 so descendants do not inherit snapshots from the replaced physical branch.
-The parser stamp forces still-present v10 sources to rescan; rotated rows retain
-their recorded parser provenance.
+Parser v12 additionally preserves omitted or null usage counters as SQL NULL,
+including the cumulative cursor carried across refreshes. Explicit zero remains
+observed zero. A derived component requires all its input counters and consistent
+totals; an incomplete cache vector cannot manufacture a measured cache miss.
+This is an interpretation change, not a physical schema migration. The parser
+stamp forces still-present older sources to rescan; rotated rows retain their
+recorded parser provenance and are not silently relabeled as complete evidence.
+
+### Codex response usage and effective effort boundaries
+
+The supported offline accounting source remains legacy `event_msg.token_count`.
+Codex [#41912](https://github.com/openai/codex/pull/41912) still emits that stream
+and also persists top-level `token_usage_record` containing overlapping response,
+turn and thread totals. Its `compacted.latest_token_usage_record` is a checkpoint
+copy, not fresh consumption. Unified, provider, passive and export-checkpoint
+readers deliberately do not add these records. A response-record-only source has
+no supported measured usage, not an observed zero-token request. Adopting those
+records requires a separate response identity, replay and overlap reconciliation
+contract; this release does not claim record-only accounting support.
+
+The index's `reasoning_effort` remains the observed turn/request setting. The
+upstream [#42328](https://github.com/openai/codex/pull/42328) marker
+`metadata.harness_authored_configuration` proves that a durable
+`configuration_update` was authored by the harness; it is not a backend
+acknowledgement that the update applied. Such controls, including custom/unknown
+efforts, do not overwrite the observed setting or create an inferred effective
+effort. No effective-effort carry is inferred across compaction, fork or resume.
+Actual application/eligible-mode and installed-client evidence remains a
+qualification gate, separate from catalogue recognition.
 
 The foreground companion treats a verified published v10-to-v11 parser upgrade
 as cold work even when the physical schema is already 11. That run receives the
@@ -169,6 +196,46 @@ rehearsal.
 - Migration/schema failure preserves the original transaction state.
 - A successful physical migration does not prove source coverage; generation
   completeness and parser provenance remain separate.
+
+## Compressed Codex histories
+
+Cold `.jsonl.zst` histories use read-only native streaming decompression. No
+source is rewritten and no decoded transcript is persisted to a temporary file.
+Canonical thread/rollout identity is independent of compression. Discovery keeps
+the real physical path and filesystem identity; `physicalSize` is the compressed
+file length while `size`, history-base cutoffs, event offsets, and persisted
+cursors use uncompressed JSONL bytes. Byte-identical decoded plain/compressed
+siblings collapse to one source, preferring the plain representation; divergent
+representations quarantine the logical thread. A representation change forces a
+safe source rescan, never an append into compressed bytes.
+
+The shared adapter is used by direct provider scans, single/worker rebuilds,
+incremental refresh, and supported checkpoint exports. The live passive collector
+continues its plain-JSONL capture path; cold compressed history belongs to the
+unified/scanner path. Compression alone does not delete or reset its previously
+retained live cursors or usage. Checkpoint export still explicitly refuses
+paginated history because its stored inheritance cannot represent an exact
+ordinal cutoff; direct scans and the unified index do support that history.
+
+Native support is capability-detected. Node's streaming Zstd APIs were introduced
+in Node 22.15.0 and 23.8.0; the project's minimum Node 22.13.0 remains importable
+but reports `codex_rollout_compression_unsupported` for compressed source groups.
+The packaged Node 26.2.0 runtime exposes these APIs. This is source/runtime
+compatibility, not installed-artifact qualification. [Node Zstd API](https://nodejs.org/api/zlib.html#zlibcreatezstddecompressoptions)
+
+Each stream is bounded to 2 GiB compressed, 16 GiB decoded, a 128 MiB native
+decoder window, and 120 seconds. Decoded expansion is further limited to the
+larger of 64 MiB or 4,096 times the physical length; caller line/resource limits
+and cancellation remain active. Discovery permits at most two decoders at once
+and retains only a 1 MiB metadata-search prefix. These are refusal ceilings, not
+performance targets or evidence that large histories were qualified.
+
+The adapter validates frame/header/block boundaries independently of native EOF:
+synthetic Node 26.2.0 probes showed that truncated native Zstd input can end with
+empty output instead of an error. It also validates concatenated/skippable frames,
+checksums through the decoder, and complete JSONL tails. Unsupported runtimes,
+corrupt/truncated data, unsafe sources, and resource limits stay explicit and
+content-free. The framing implementation follows the [Zstandard format](https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md).
 
 ## Change contract
 

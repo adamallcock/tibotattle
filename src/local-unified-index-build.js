@@ -791,6 +791,8 @@ async function runWorkerLane(lane, laneIndex, { maximumLineBytes, signal, onBatc
           components: lane.components.map((members) => members.map((info) => ({
             path: info.path,
             size: Number(info.size ?? 0),
+            physicalSize: info.physicalSize,
+            compressed: info.compressed === true,
             sessionId: info.lineage?.sessionId ?? null,
             parentId: info.lineage?.parentId ?? null,
             isFork: info.lineage?.isFork === true,

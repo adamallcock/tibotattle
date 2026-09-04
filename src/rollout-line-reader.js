@@ -1,4 +1,5 @@
 import { createReadStream } from "node:fs";
+import { isCompressedRolloutSource, readCompressedRolloutBytes } from "./platform/index.js";
 
 // Bounded, content-free line reader for Codex rollout JSONL.
 //
@@ -77,10 +78,13 @@ export async function forEachRolloutLine(path, {
 
   const callerOwnedHandle = path && typeof path === "object"
     && Number.isInteger(path.fd) && typeof path.read === "function";
-  const input = callerOwnedHandle
+  const compressed = isCompressedRolloutSource(path);
+  const input = callerOwnedHandle || compressed
     ? null
     : createReadStream(path, { start, end: end - 1, highWaterMark });
-  const chunks = callerOwnedHandle ? {
+  const chunks = compressed ? readCompressedRolloutBytes(path, {
+    start, end, highWaterMark, signal,
+  }) : callerOwnedHandle ? {
     async *[Symbol.asyncIterator]() {
       const scratch = Buffer.allocUnsafe(highWaterMark);
       let position = start;

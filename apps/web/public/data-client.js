@@ -17,6 +17,8 @@
  */
 
 import {
+  codexCacheReasoningConfiguration,
+  REVIEWED_CODEX_MODEL_IDS,
   TELEMETRY_PLAN_TYPES,
   TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
   TELEMETRY_V11_ACCOUNT_BASES,
@@ -2140,25 +2142,7 @@ const LOCAL_COMPONENT_KEYS = Object.freeze([
   "output_reasoning_tokens",
   "output_combined_tokens"
 ]);
-const LOCAL_MODELS = new Set([
-  "gpt-5.6-sol",
-  "gpt-5.6-sol-wm",
-  "gpt-5.6-terra",
-  "gpt-5.6-luna",
-  "gpt-5.5",
-  "gpt-5.5-codex",
-  "gpt-5.4",
-  "gpt-5.4-mini",
-  "gpt-5",
-  "gpt-4.1",
-  // Recognised identities that carry no published API price card. They were
-  // missing here, so the local report's rows for them were discarded at this
-  // boundary and their usage silently reappeared as "unknown".
-  "codex-auto-review",
-  // Metered against its own subscription allowance, never the primary pool.
-  "gpt-5.3-codex-spark",
-  "unknown"
-]);
+const LOCAL_MODELS = new Set([...REVIEWED_CODEX_MODEL_IDS, "unknown"]);
 const LOCAL_MODEL_PRICING_STATUSES = new Set([
   "priced",
   "known_unpriced",
@@ -2688,10 +2672,6 @@ function normalizeCacheSwitchState(value) {
   return { model, reasoningEffort };
 }
 
-function effectiveCacheSwitchEffort(value) {
-  return value === "ultra" ? "max" : value;
-}
-
 // This separate contract is only for interactive local navigation. Never add
 // its names or raw thread identifiers to normalized accounting/report DTOs.
 const LOCAL_CACHE_DROP_THREAD_LINKS_SCHEMA = "local-cache-drop-thread-links-v1";
@@ -2824,14 +2804,15 @@ function normalizeCacheSwitchRecent(rows, maximumRows) {
         && previous.model !== current.model;
       const reasoningChanged = previous.reasoningEffort !== "unknown"
         && current.reasoningEffort !== "unknown"
-        && effectiveCacheSwitchEffort(previous.reasoningEffort)
-          !== effectiveCacheSwitchEffort(current.reasoningEffort);
+        && codexCacheReasoningConfiguration(previous.model, previous.reasoningEffort)
+          !== codexCacheReasoningConfiguration(current.model, current.reasoningEffort);
       const changeMatches = changeType === "model_only"
         ? modelChanged && !reasoningChanged
         : changeType === "reasoning_only"
           ? !modelChanged && reasoningChanged
           : modelChanged && reasoningChanged;
       if (observedAt === null
+          || previous.model === "unknown" || current.model === "unknown"
           || !changeMatches
           || previousCacheReadTokens === null
           || currentCacheReadTokens === null
@@ -3323,7 +3304,8 @@ const FAST_MODE_MULTIPLIERS = Object.freeze({
   "gpt-5.5": 2.5,
   "gpt-5.6-luna": 2,
   "gpt-5.6-sol": 2,
-  "gpt-5.6-terra": 2
+  "gpt-5.6-terra": 2,
+  "gpt-6-astra": 2
 });
 const FAST_MODE_FAMILY_KEYS = Object.freeze([
   ...Object.keys(FAST_MODE_MULTIPLIERS), "unsupported"

@@ -2,6 +2,7 @@ import { createLocalCodexLogScanner } from "../local-codex-log-scanner.js";
 import {
   EXPORT_SOURCE_PLAN_VERSION,
   ExportSourcePlanError,
+  ExportResourceLimitError,
   createSourcePlanSummaryContract,
   stableJson,
   summarizeExportSourcePlan,
@@ -21,6 +22,23 @@ const {
   discoverCodexRolloutInfos,
   codexRolloutDiscoveryReceipt,
 } = createLocalCodexLogScanner(codexLogPorts);
+const { compressedRolloutHandle, inspectCompressedRollout } = codexLogPorts.lineReader;
+
+function isCompressedSource(source) {
+  return typeof source?.path === "string" && source.path.endsWith(".jsonl.zst");
+}
+
+async function inspectCompressedSource(handle, resourceGuard) {
+  try {
+    return await inspectCompressedRollout(compressedRolloutHandle(handle), {
+      resourceGuard,
+      createLimitError: (code) => new ExportResourceLimitError(code),
+    });
+  } catch (error) {
+    if (error?.name === "AbortError" || error instanceof ExportResourceLimitError) throw error;
+    fail("source_changed");
+  }
+}
 
 function fail(code) { throw new ExportSourcePlanError(code); }
 
@@ -121,7 +139,14 @@ async function createCodexExportSourcePlan({
     resourceGuard?.checkRuntime();
     const { handle, stats } = await openSource(info.path, info);
     try {
-      const prefixBytes = await completeLinePrefixBytes(handle, stats.size, resourceGuard);
+      const inspected = info.compressed
+        ? await inspectCompressedSource(handle, resourceGuard)
+        : null;
+      if (inspected !== null && (stats.size !== info.physicalSize
+          || inspected.size !== info.size || inspected.sha256 !== info.contentSha256)) fail("source_changed");
+      if (inspected !== null && inspected.size > 0 && inspected.lastByte !== 0x0a) fail("codex_rollout_tail_incomplete");
+      const prefixBytes = inspected?.size
+        ?? await completeLinePrefixBytes(handle, stats.size, resourceGuard);
       sources.push({
         ordinal,
         sourceKey: sourceKey(info.rolloutKey),
@@ -130,7 +155,7 @@ async function createCodexExportSourcePlan({
         ino: stats.ino,
         birthtimeMs: Math.trunc(stats.birthtimeMs),
         prefixBytes,
-        prefixSha256: await sha256Prefix(handle, prefixBytes, resourceGuard),
+        prefixSha256: inspected?.sha256 ?? await sha256Prefix(handle, prefixBytes, resourceGuard),
         rolloutInfo: { ...info, size: prefixBytes },
       });
     } finally {
@@ -198,7 +223,7 @@ async function openVerifiedCodexExportSource(source, { resourceGuard = null } = 
   const { handle, stats } = await openSource(source.path, source);
   try {
     await verifyCodexExportSourceHandle(source, handle, { resourceGuard, stats });
-    return handle;
+    return isCompressedSource(source) ? compressedRolloutHandle(handle) : handle;
   } catch (error) {
     await handle.close().catch(() => {});
     throw error;
@@ -212,6 +237,13 @@ async function verifyCodexExportSourceHandle(source, handle, {
   if (!source || !handle || !Number.isInteger(handle.fd)) fail("source_changed");
   const stats = suppliedStats ?? await handle.stat();
   assertSafeSourceStats(stats);
+  if (isCompressedSource(source)) {
+    if (!sameIdentity(stats, source)) fail("source_changed");
+    const inspected = await inspectCompressedSource(handle, resourceGuard);
+    if (inspected.size !== source.prefixBytes || inspected.sha256 !== source.prefixSha256
+        || (inspected.size > 0 && inspected.lastByte !== 0x0a)) fail("source_changed");
+    return;
+  }
   if (!sameIdentity(stats, source) || stats.size < source.prefixBytes) fail("source_changed");
   if (source.prefixBytes > 0) {
     const tail = allocUnsafe(1);

@@ -42,6 +42,9 @@ const { ExportWorkspaceError, sourceCheckpointBatchSha256 } = workspace;
 
 const DEFAULT_CHECKPOINT_LINES_PER_BATCH = 8_192;
 
+// Match the provider scanner's legacy-only accounting contract. Top-level
+// token_usage_record and compacted checkpoint copies overlap token_count;
+// they must not be charged once more during checkpoint/resume scans.
 const RELEVANT_NEEDLES = Object.freeze([
   '"type":"session_meta"', '"type":"turn_context"',
   '"type":"thread_settings_applied"', '"type":"token_count"',

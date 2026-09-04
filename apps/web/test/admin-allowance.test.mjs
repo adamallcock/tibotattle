@@ -189,6 +189,46 @@ test("the numerical axis is identical across all three modes", async () => {
   assert.deepEqual(axes[2], axes[0]);
 });
 
+test("model filtering preserves catalog visibility without manufacturing evidence", async () => {
+  const { adminAllowanceChartModel } = await importAdminModule();
+  const preview = allowancePreviewWithModels();
+  preview.models.modelConfig.push({ modelId: "gpt-6-astra", label: "GPT-6 Astra" });
+  const all = adminAllowanceChartModel(preview, { mode: "models" });
+  const observed = adminAllowanceChartModel(preview, { mode: "models", modelFilter: "observed" });
+  assert.deepEqual(observed.legendSeries.map((series) => series.key), [
+    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.5",
+  ]);
+  assert.equal(all.legendSeries.at(-1).key, "gpt-6-astra");
+  const sol = adminAllowanceChartModel(preview, { mode: "models", modelFilter: "gpt-5.6-sol" });
+  assert.equal(sol.series.length, 1);
+  assert.deepEqual(sol.dollarTicks, all.dollarTicks);
+  assert.equal(adminAllowanceChartModel(preview, { mode: "models", modelFilter: "gpt-6-astra" }), null);
+});
+
+test("new model series have defined matching line, dot and legend palette styles", async () => {
+  const { adminAllowanceChartModel } = await importAdminModule();
+  const preview = allowancePreviewWithModels();
+  preview.models.modelConfig.push({ modelId: "gpt-6-astra", label: "GPT-6 Astra" });
+  const model = adminAllowanceChartModel(preview, { mode: "models" });
+  const astra = model.legendSeries.find((series) => series.key === "gpt-6-astra");
+  assert.match(astra.className, /^model-catalog-[0-7]$/u);
+  const css = await readFile(new URL("../public/admin.css", import.meta.url), "utf8");
+  for (const [kind, property] of [["line", "stroke"], ["dot", "fill"], ["swatch", "background"]]) {
+    assert.ok(css.includes(`.admin-allowance-${kind}[class*="model-catalog-"] { ${property}: var(--model-series-color); }`));
+  }
+  for (let index = 0; index < 8; index += 1) {
+    assert.ok(css.includes(`[class$="model-catalog-${index}"] { --model-series-color: #`));
+  }
+});
+
+test("model cards use the existing responsive summary grid", async () => {
+  const source = await readFile(new URL("../public/admin.js", import.meta.url), "utf8");
+  const css = await readFile(new URL("../public/admin.css", import.meta.url), "utf8");
+  assert.ok(source.includes('grid.className = "admin-allowance-plan-summaries";'));
+  assert.match(css, /\.admin-allowance-plan-summaries \{ display: grid; grid-template-columns: repeat\(3, minmax\(0, 1fr\)\)/u);
+  assert.match(css, /@media \(max-width: 560px\)[\s\S]*\.admin-allowance-plan-summaries \{ grid-template-columns: 1fr; \}/u);
+});
+
 test("allowance preview switches series without changing its numerical axes", async () => {
   const { adminAllowanceChartModel } = await importAdminModule();
   const preview = allowancePreview();

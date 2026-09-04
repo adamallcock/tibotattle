@@ -1,3 +1,5 @@
+import { REVIEWED_MODEL_CATALOG } from "./model-catalog.js";
+
 export const TELEMETRY_SCHEMA_VERSION = "telemetry-contribution-v0.1";
 export const TELEMETRY_CONTRIBUTION_SCHEMA_VERSION =
   TELEMETRY_SCHEMA_VERSION;
@@ -89,4 +91,11 @@ export const TELEMETRY_MODEL_IDS = Object.freeze([
   "claude-opus-4-8",
   "claude-sonnet-4-6",
   "claude-sonnet-5",
+  // Append newly reviewed identities; never reorder the legacy vocabulary.
+  ...REVIEWED_MODEL_CATALOG.map((entry) => entry.id).filter((id) => ![
+    "gpt-4.1", "gpt-5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5",
+    "gpt-5.5-codex", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra",
+    "claude-fable-5", "claude-haiku-4-5-20251001", "claude-opus-4-8",
+    "claude-sonnet-4-6", "claude-sonnet-5",
+  ].includes(id)),
 ]);

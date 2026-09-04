@@ -1,7 +1,12 @@
+import {
+  ADMIN_MODEL_CONFIG,
+  expandAdminModelHistoryDay,
+} from "./telemetry-shared.generated.js";
+
 const ADMIN_OVERVIEW_SCHEMA_VERSION = "admin-overview-v0.3";
 const ADMIN_ACTION_SCHEMA_VERSION = "admin-action-v0.1";
 const ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION =
-  "admin-community-allowance-preview-v0.2";
+  "admin-community-allowance-preview-v0.3";
 const ADMIN_ALLOWANCE_PREVIEW_BASIS =
   "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview";
 const ADMIN_ALLOWANCE_PREVIEW_DAYS = 70;
@@ -14,12 +19,7 @@ const ADMIN_ALLOWANCE_PREVIEW_PLANS = Object.freeze([
   Object.freeze({ planType: "prolite", label: "Pro 5x", multiplier: 4 }),
   Object.freeze({ planType: "plus", label: "Plus", multiplier: 20 }),
 ]);
-const ADMIN_ALLOWANCE_PREVIEW_MODELS = Object.freeze([
-  Object.freeze({ modelId: "gpt-5.6-sol", label: "Sol" }),
-  Object.freeze({ modelId: "gpt-5.6-terra", label: "Terra" }),
-  Object.freeze({ modelId: "gpt-5.6-luna", label: "Luna" }),
-  Object.freeze({ modelId: "gpt-5.5", label: "GPT-5.5" }),
-]);
+const ADMIN_ALLOWANCE_PREVIEW_MODELS = ADMIN_MODEL_CONFIG;
 const ADMIN_ALLOWANCE_MODELS_BASIS =
   "seven_day_codex_pro20x_equivalent_per_model_composition";
 const ADMIN_ALLOWANCE_MODELS_GATE =
@@ -204,21 +204,6 @@ function projectAllowancePreviewSummary(value) {
   });
 }
 
-function projectAllowanceModelSummary(value) {
-  const code = "ADMIN_ALLOWANCE_PREVIEW_INVALID";
-  const summary = record(value, code);
-  const participantCount = count(summary.participantCount, code);
-  if (summary.capacityUsd === null) {
-    if (participantCount !== 0) invalid(code);
-    return Object.freeze({ capacityUsd: null, participantCount: 0 });
-  }
-  if (participantCount === 0) invalid(code);
-  return Object.freeze({
-    capacityUsd: positiveNumber(summary.capacityUsd, code),
-    participantCount,
-  });
-}
-
 function projectAllowanceModels(value, latestAllowedDay) {
   const code = "ADMIN_ALLOWANCE_PREVIEW_INVALID";
   const models = record(value, code);
@@ -231,49 +216,24 @@ function projectAllowanceModels(value, latestAllowedDay) {
     const expected = ADMIN_ALLOWANCE_PREVIEW_MODELS[index];
     if (!expected
         || model.modelId !== expected.modelId
-        || model.label !== expected.label) {
+        || model.label !== expected.label
+        || model.allowanceTrack !== expected.allowanceTrack
+        || model.pricingStatus !== expected.pricingStatus) {
       invalid(code);
     }
     return expected;
   });
   if (modelConfig.length !== ADMIN_ALLOWANCE_PREVIEW_MODELS.length) invalid(code);
-  const expectedModelKeys = ADMIN_ALLOWANCE_PREVIEW_MODELS
-    .map((model) => model.modelId)
-    .sort();
   let previousDay = "";
-  const days = array(models.days, code).map((entry) => {
+  const days = boundedArray(models.days, ADMIN_ALLOWANCE_PREVIEW_DAYS, code).map((entry) => {
     const day = record(entry, code);
     const dayValue = calendarDay(day.day, code);
     if (dayValue <= previousDay || dayValue > latestAllowedDay) invalid(code);
     previousDay = dayValue;
-    const fitted = count(day.fittedParticipantCount, code);
-    const unstable = count(day.unstableParticipantCount, code);
-    const stale = count(day.staleParticipantCount, code);
-    const refused = count(day.refusedParticipantCount, code);
-    const v1Count = count(day.v1ParticipantCount, code);
-    const unsupported = count(day.unsupportedSourceParticipantCount, code);
-    if (fitted + unstable + stale + refused !== v1Count) invalid(code);
-    const byModel = record(day.byModel, code);
-    if (Object.keys(byModel).sort().join("|") !== expectedModelKeys.join("|")) {
-      invalid(code);
-    }
-    const projectedByModel = Object.freeze(Object.fromEntries(
-      ADMIN_ALLOWANCE_PREVIEW_MODELS.map((model) => {
-        const summary = projectAllowanceModelSummary(byModel[model.modelId]);
-        if (summary.participantCount > fitted) invalid(code);
-        return [model.modelId, summary];
-      }),
-    ));
-    return Object.freeze({
-      day: dayValue,
-      byModel: projectedByModel,
-      fittedParticipantCount: fitted,
-      unstableParticipantCount: unstable,
-      staleParticipantCount: stale,
-      refusedParticipantCount: refused,
-      v1ParticipantCount: v1Count,
-      unsupportedSourceParticipantCount: unsupported,
-    });
+    if (day.catalogVersion === undefined) invalid(code);
+    const projected = expandAdminModelHistoryDay(day);
+    if (projected === null) invalid(code);
+    return projected;
   });
   if (days.length > ADMIN_ALLOWANCE_PREVIEW_DAYS) invalid(code);
   return Object.freeze({

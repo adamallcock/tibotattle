@@ -320,6 +320,33 @@ test("Max and Ultra share one effective effort while model and combined changes 
   assert.equal(period.byChangeType.reasoning_only.configurationChanges, 0);
 });
 
+test("Astra effort aliases retain observed-cache gates and do not imply a reset", () => {
+  const astra = (previous, current, overrides = {}) => row({
+    model_id: "gpt-6-astra", previous_model_id: "gpt-6-astra",
+    previous_reasoning_effort: reasoningEffortOrdinal(previous),
+    reasoning_effort: reasoningEffortOrdinal(current), ...overrides,
+  });
+  const all = (rows) => analyzeCacheSwitchRows(rows, {
+    nowMs: NOW_MS, pricer: fullyPriced,
+  }).periods.find((period) => period.periodId === "all");
+  // Same API effort, different delegation configuration; do not call it continuity.
+  assert.equal(all([astra("xhigh", "ultra")]).configurationChanges, 1);
+  assert.equal(all([astra("ultra", "xhigh")]).configurationChanges, 1);
+  const changed = all([astra("max", "ultra")]);
+  assert.equal(changed.byChangeType.reasoning_only.configurationChanges, 1);
+  assert.equal(changed.cacheReadDrops, 1);
+  assert.equal(changed.recent[0].previous.reasoningEffort, "max");
+  assert.equal(changed.recent[0].current.reasoningEffort, "ultra");
+  for (const overrides of [
+    { tokens_in_cache_read: 1_000 },
+    { tokens_in_cache_read: null },
+    { tokens_in_cache_write: null },
+    { compaction_between: 1 },
+  ]) {
+    assert.equal(all([astra("low", "high", overrides)]).cacheReadDrops, 0);
+  }
+});
+
 test("long gaps, missing prior cache, malformed dimensions, and unpriced drops fail closed", () => {
   const longGap = row({
     previous_observed_at_ms: NOW_MS - 10 * 60_000,

@@ -31,7 +31,7 @@ test("every shipped Priority card and reviewed alias equals the event-weighted S
   for (const card of PRIORITY_CARDS) {
     const eventTime = `${card.effective.from ?? card.effective.to ?? "2026-08-30"}T12:00:00.000Z`;
     const totalInputContextTokens = card.metadata.total_input_context_band === "long"
-      ? 272_000 : 4_000;
+      ? Number(card.components[0].conditions.min_total_input_tokens) : 4_000;
     const components = Object.fromEntries(card.components
       .filter((component) => component.usage_component.endsWith("_tokens"))
       .map((component) => [component.usage_component, 1_000]));
@@ -62,8 +62,8 @@ test("every shipped Priority card and reviewed alias equals the event-weighted S
       checked += 1;
     }
   }
-  assert.equal(checked, 26);
-  assert.equal(FAST_MODE_MODEL_FAMILY_KEYS.length, 16);
+  assert.equal(checked, 28);
+  assert.equal(FAST_MODE_MODEL_FAMILY_KEYS.length, 17);
   assert.equal(Math.max(...Object.values(FAST_MODE_QUOTA_MULTIPLIERS)), 2.5);
 });
 

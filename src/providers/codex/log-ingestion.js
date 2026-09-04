@@ -120,7 +120,7 @@ export function createCodexLogIngestion({
     diagnostics.sourceProvenance = sources.summarizeCodexRolloutSources(rolloutInfos, { endAt });
     if (requireCompleteDiscovery) {
       for (const info of rolloutInfos) {
-        await sources.assertCompleteRolloutTail(info, signal);
+        await sources.assertCompleteRolloutTail(info, signal, resourceGuard);
       }
     }
 

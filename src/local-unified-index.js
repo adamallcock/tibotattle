@@ -109,7 +109,10 @@ export const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION =
 // valid usage, tool, and quota facts from the same source remain available.
 // A paginated replacement without history_base resets the selected lineage
 // snapshot generation at the source-start boundary accepted by Codex.
-export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v11";
+// v12 (2026-09-04): preserve missing usage components as nullable facts and
+// cursor counters. Existing retained sources reparse from byte zero; removed
+// sources keep their original parser provenance rather than inventing proof.
+export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v12";
 export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
   "codex-immutable-rollout-v1";
 
@@ -120,7 +123,7 @@ export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
 // degraded row is recorded. Kept in lockstep with the main constant: salvaged
 // rows run the same delta derivation.
 export const LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION =
-  "unified-rollout-typed-v11-partial";
+  "unified-rollout-typed-v12-partial";
 
 export const LOCAL_UNIFIED_INDEX_APPLICATION_ID = 0x554d5549;
 const INDEX_APPLICATION_ID = LOCAL_UNIFIED_INDEX_APPLICATION_ID;

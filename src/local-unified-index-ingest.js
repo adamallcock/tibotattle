@@ -177,11 +177,11 @@ function carriedTotals(cursor) {
     total_tokens: cursor.carry_total_total,
   };
   for (const value of Object.values(totals)) {
-    if (!Number.isSafeInteger(Number(value))) return null;
+    if (value !== null && (!Number.isSafeInteger(value) || value < 0)) return null;
   }
-  return Object.fromEntries(
-    Object.entries(totals).map(([key, value]) => [key, Number(value)]),
-  );
+  // SQL NULL is unavailable evidence, not Number(null) === 0. An entirely
+  // absent vector is the no-baseline state; sparse vectors retain their gaps.
+  return Object.values(totals).every((value) => value === null) ? null : totals;
 }
 
 function carriedTier(cursor) {
@@ -248,6 +248,7 @@ export function classifySource(info, cursor, expectedParserVersion = null) {
     return { mode: "rescan", reason: "same_size_changed" };
   }
   if (size > cursorSize) {
+    if (info.compressed === true) return { mode: "rescan", reason: "compressed_changed" };
     return cursor.quarantine_code === null
       ? { mode: "resume" }
       : { mode: "rescan", reason: "quarantine_changed" };

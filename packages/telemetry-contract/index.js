@@ -1,4 +1,22 @@
 export {
+  ADMIN_MODEL_CONFIG,
+  ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+  LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+  projectAdminModelHistoryDay,
+  expandAdminModelHistoryDay,
+} from "./src/admin-model-history.js";
+
+export {
+  REVIEWED_MODEL_CATALOG_VERSION,
+  REVIEWED_MODEL_CATALOG,
+  REVIEWED_CODEX_MODEL_IDS,
+  REVIEWED_CLAUDE_MODEL_IDS,
+  reviewedModelIdentity,
+  codexRequestReasoningEffort,
+  codexCacheReasoningConfiguration,
+} from "./src/model-catalog.js";
+
+export {
   ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION,
   ACCOUNT_SCOPED_TELEMETRY_ENVELOPE_SCHEMA_VERSION,
   ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION,
