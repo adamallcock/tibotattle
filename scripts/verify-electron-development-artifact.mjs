@@ -32,8 +32,9 @@ import {
 import { fileURLToPath } from "node:url";
 
 import {
-  KEYTAR_WIN32_X64_SHA256,
-} from "../src/platform/windows-credential-manager-probe.js";
+  ELECTRON_KEYTAR_PREBUILD_SHA256,
+  ELECTRON_TARGETS,
+} from "./build-electron-runtime.mjs";
 import {
   transformElectronBuilderPackageJsonBytes,
 } from "./lib/electron-builder-package-json.mjs";
@@ -46,18 +47,18 @@ const RUNTIME_MANIFEST_SCHEMA = "usage-monitor-electron-runtime-v0.1";
 const WINDOWS_BINDING_PATH =
   "native/windows-filesystem/build/Release/windows_filesystem.node";
 const WINDOWS_BINDING_MANIFEST_PATH = `${WINDOWS_BINDING_PATH}.manifest.json`;
-const TARGETS = Object.freeze({
-  "darwin-arm64": Object.freeze({
-    manifestTarget: "darwin",
-    architecture: "arm64",
-    keytar: "node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
-  }),
-  "win32-x64": Object.freeze({
-    manifestTarget: "win32",
-    architecture: "x64",
-    keytar: "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node",
-  }),
-});
+const WINDOWS_TARGET = "win32-x64";
+const TARGETS = Object.freeze(Object.fromEntries(
+  Object.entries(ELECTRON_TARGETS).map(([target, spec]) => [
+    target,
+    Object.freeze({
+      manifestTarget: spec.platform,
+      architecture: spec.architecture,
+      keytarArchitecture: spec.keytarArchitecture,
+      keytar: `node_modules/@github/keytar/prebuilds/${spec.keytarArchitecture}/keytar.node`,
+    }),
+  ]),
+));
 export const ELECTRON_SHELL_FILES = Object.freeze([
   "apps/electron/companion-supervisor.js",
   "apps/electron/desktop-command.js",
@@ -699,7 +700,7 @@ function validateRuntimeManifest(manifest, target) {
   }
 
   const windowsBinding = manifest.windowsBinding;
-  if (target === "darwin-arm64") {
+  if (target !== WINDOWS_TARGET) {
     if (!exactObjectKeys(windowsBinding, ["included", "status", "verified"])
         || windowsBinding.included !== false
         || windowsBinding.status !== "not_requested"
@@ -911,17 +912,17 @@ function expectedNativePaths(target) {
 }
 
 /**
- * The Windows development artifact may only ship the audited keytar
+ * Each development artifact may only ship the audited target-specific Keytar
  * prebuild. The staged inventory has already been read and hashed from the
  * exact app tree, so checking its row here covers both the staged source and
  * (via compareArtifactToStaged) the archive/unpacked union without reading or
- * logging credential-binding bytes a second time. The existing bindingInvalid
- * status intentionally covers any native binding integrity failure.
+ * logging native bytes a second time. The existing bindingInvalid status
+ * intentionally covers any native binding integrity failure.
  */
-function validateWindowsKeytar({ target, staged }) {
-  if (target !== "win32-x64") return;
+function validateTargetKeytar({ target, staged }) {
   const keytarRow = staged.rowMap.get(TARGETS[target].keytar);
-  if (!keytarRow || keytarRow.sha256 !== KEYTAR_WIN32_X64_SHA256) {
+  const expectedDigest = ELECTRON_KEYTAR_PREBUILD_SHA256[TARGETS[target].keytarArchitecture];
+  if (!keytarRow || keytarRow.sha256 !== expectedDigest) {
     fail(FIXED_STATUS.bindingInvalid);
   }
 }
@@ -978,7 +979,7 @@ function validateNativeBoundary({
       fail(FIXED_STATUS.nativeInventoryInvalid);
     }
   }
-  if (target === "darwin-arm64") {
+  if (target !== WINDOWS_TARGET) {
     if (manifest.windowsBinding.included !== false) {
       fail(FIXED_STATUS.nativeInventoryInvalid);
     }
@@ -1069,7 +1070,7 @@ async function compareArtifactToStaged({ appPath, staged, archive, unpacked }) {
 }
 
 function summarizeBinding(target, binding) {
-  if (target === "darwin-arm64") {
+  if (target !== WINDOWS_TARGET) {
     return Object.freeze({ status: "not_applicable", bytes: 0, sha256: "0".repeat(64) });
   }
   return Object.freeze({
@@ -1102,10 +1103,10 @@ export async function verifyElectronDevelopmentArtifact({
     const archiveResult = await readArchive(selectedAsarPath);
     const archive = archiveResult.rows;
     const unpacked = await walkFiles(selectedUnpackedPath);
-    const binding = target === "win32-x64"
+    const binding = target === WINDOWS_TARGET
       ? await validateWindowsBinding({ appPath: selectedAppPath, staged })
       : null;
-    validateWindowsKeytar({ target, staged });
+    validateTargetKeytar({ target, staged });
     validateNativeBoundary({
       target,
       staged,

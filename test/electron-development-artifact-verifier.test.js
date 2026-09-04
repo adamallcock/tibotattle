@@ -16,6 +16,7 @@ import test from "node:test";
 
 import {
   ELECTRON_SHELL_RUNTIME_FILES,
+  ELECTRON_TARGETS,
 } from "../scripts/build-electron-runtime.mjs";
 import {
   ELECTRON_SHELL_FILES,
@@ -72,14 +73,16 @@ const SHELL_FILES = [
 ];
 const KEYTAR = Object.freeze({
   "darwin-arm64": "node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
+  "darwin-x64": "node_modules/@github/keytar/prebuilds/darwin-x64/keytar.node",
   "win32-x64": "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node",
+  "linux-x64": "node_modules/@github/keytar/prebuilds/linux-x64/keytar.node",
 });
 const WINDOWS_BINDING =
   "native/windows-filesystem/build/Release/windows_filesystem.node";
 const WINDOWS_BINDING_MANIFEST = `${WINDOWS_BINDING}.manifest.json`;
-const REAL_MAC_STAGED_APP = resolve(".release-build/electron-dev/mac-arm64/app");
+const REAL_MAC_STAGED_APP = resolve(".release-build/electron-dev/darwin-arm64/app");
 const REAL_MAC_ASAR = resolve(
-  ".release-build/electron-dev/artifacts/mac-arm64/TiboTattle Dev.app/Contents/Resources/app.asar",
+  ".release-build/electron-dev/darwin-arm64/artifacts/TiboTattle Dev.app/Contents/Resources/app.asar",
 );
 const REAL_MAC_UNPACKED = `${REAL_MAC_ASAR}.unpacked`;
 const REAL_MAC_ARTIFACT_AVAILABLE = [
@@ -228,11 +231,10 @@ async function makeFixture(
   ]);
   for (const path of SHELL_FILES) files.set(path, Buffer.from(`// ${path}\n`));
 
-  const keytar = target === "win32-x64"
-    ? Buffer.from(await readFile(require.resolve(
-      "@github/keytar/prebuilds/win32-x64/keytar.node",
-    )))
-    : Buffer.from(`${target} keytar bytes\n`);
+  const targetSpec = ELECTRON_TARGETS[target];
+  const keytar = Buffer.from(await readFile(require.resolve(
+    `@github/keytar/prebuilds/${targetSpec.keytarArchitecture}/keytar.node`,
+  )));
   const fixtureKeytar = keytarMutation === null
     ? keytar
     : Buffer.from(keytarMutation(Buffer.from(keytar)));
@@ -270,8 +272,8 @@ async function makeFixture(
     .sort((left, right) => left.path.localeCompare(right.path));
   const runtimeManifest = {
     schemaVersion: "usage-monitor-electron-runtime-v0.1",
-    target: target === "win32-x64" ? "win32" : "darwin",
-    architecture: target === "win32-x64" ? "x64" : "arm64",
+    target: targetSpec.platform,
+    architecture: targetSpec.architecture,
     releaseVersion: "0.1.12",
     entrypoint: "apps/electron/main.js",
     dashboardRoot: "apps/web/public",
@@ -359,6 +361,19 @@ test("verifies a macOS arm64 archive/unpacked union with aggregate-only output",
       "asar", "artifact", "binding", "nativeFileCount", "staged", "status", "target", "unpacked",
     ].sort());
   });
+});
+
+test("verifies the target-specific Keytar boundary for macOS x64 and Linux x64", async () => {
+  for (const target of ["darwin-x64", "linux-x64"]) {
+    await withFixture(target, {}, async (fixture) => {
+      const result = await verify(fixture, target);
+      assert.equal(result.status, FIXED_STATUS.verified, target);
+      assert.equal(result.target, target, target);
+      assert.equal(result.nativeFileCount, 1, target);
+      assert.equal(result.binding.status, "not_applicable", target);
+      assert.equal(result.staged.sha256, result.artifact.sha256, target);
+    });
+  }
 });
 
 test("verifies the rebuilt macOS arm64 Electron directory artifact when present", {

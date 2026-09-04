@@ -65,10 +65,49 @@ const MANIFEST_FILE = "electron-runtime-manifest.json";
 const MANIFEST_SCHEMA = "usage-monitor-electron-runtime-v0.1";
 const MAXIMUM_BINDING_BYTES = 64 * 1024 * 1024;
 const MAXIMUM_MANIFEST_BYTES = 1 * 1024 * 1024;
-const DEFAULT_TARGET = "darwin";
 const DEFAULT_PACKAGING_PROFILE = "development";
-const WINDOWS_TARGET = "win32";
-const DARWIN_TARGET = "darwin";
+const DEFAULT_TARGET = "darwin-arm64";
+const DARWIN_ARM64_TARGET = "darwin-arm64";
+const DARWIN_X64_TARGET = "darwin-x64";
+const WINDOWS_X64_TARGET = "win32-x64";
+const LINUX_X64_TARGET = "linux-x64";
+const WINDOWS_PLATFORM = "win32";
+const TARGET_SPECS = Object.freeze({
+  [DARWIN_ARM64_TARGET]: Object.freeze({
+    platform: "darwin",
+    architecture: "arm64",
+    keytarArchitecture: "darwin-arm64",
+  }),
+  [DARWIN_X64_TARGET]: Object.freeze({
+    platform: "darwin",
+    architecture: "x64",
+    keytarArchitecture: "darwin-x64",
+  }),
+  [WINDOWS_X64_TARGET]: Object.freeze({
+    platform: "win32",
+    architecture: "x64",
+    keytarArchitecture: "win32-x64",
+  }),
+  [LINUX_X64_TARGET]: Object.freeze({
+    platform: "linux",
+    architecture: "x64",
+    keytarArchitecture: "linux-x64",
+  }),
+});
+const TARGET_ALIASES = Object.freeze({
+  darwin: DARWIN_ARM64_TARGET,
+  macos: DARWIN_ARM64_TARGET,
+  macOS: DARWIN_ARM64_TARGET,
+  "darwin-arm64": DARWIN_ARM64_TARGET,
+  "darwin-x64": DARWIN_X64_TARGET,
+  windows: WINDOWS_X64_TARGET,
+  win: WINDOWS_X64_TARGET,
+  win32: WINDOWS_X64_TARGET,
+  "win32-x64": WINDOWS_X64_TARGET,
+  linux: LINUX_X64_TARGET,
+  "linux-x64": LINUX_X64_TARGET,
+});
+export const ELECTRON_TARGETS = TARGET_SPECS;
 // Electron still owns this reviewed cross-platform credential binding. The
 // native macOS app retired Keytar in PR #81, so its packager is deliberately
 // no longer the authority for this dependency. Preserve the previously
@@ -77,6 +116,12 @@ export const ELECTRON_KEYTAR_PACKAGE_PIN = Object.freeze({
   name: "@github/keytar",
   version: "7.10.6",
   treeDigest: "0a09b62fbf597c176747009631e671c0625530132a471b6a1aa47153edf131be",
+});
+export const ELECTRON_KEYTAR_PREBUILD_SHA256 = Object.freeze({
+  "darwin-arm64": "855c21e1e702967230bd87f600d04c311b77f29150f3372d547e72882c58de6a",
+  "darwin-x64": "5ce10f1f83f917fb555ff2ba43a80cab0f215d266cfdbd9bce5d6affa61c8aa1",
+  "win32-x64": "b82625e7c713fd20b5cb57993e073076c87660652202893fad39d874d77169fc",
+  "linux-x64": "e7894a1e1001764de29ff08d3dae418ccbaaf78889c5673d367e05df1682fc7c",
 });
 const WINDOWS_BINDING_RELATIVE_PATH =
   "native/windows-filesystem/build/Release/windows_filesystem.node";
@@ -244,11 +289,9 @@ function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function normalizeTarget(value = DEFAULT_TARGET) {
-  if (value === "macos" || value === "macOS") return DARWIN_TARGET;
-  if (value === "windows" || value === "win") return WINDOWS_TARGET;
-  if (value === DARWIN_TARGET || value === WINDOWS_TARGET) return value;
-  fail("INVALID_TARGET", `Unsupported Electron runtime target: ${value}`);
+export function normalizeElectronTarget(value = DEFAULT_TARGET) {
+  if (typeof value === "string" && Object.hasOwn(TARGET_ALIASES, value)) return TARGET_ALIASES[value];
+  fail("INVALID_TARGET", "Unsupported Electron runtime target");
 }
 
 function normalizePackagingProfile(value = DEFAULT_PACKAGING_PROFILE) {
@@ -342,7 +385,7 @@ export function electronRuntimeOutputIsInsideRepositoryForTest(
   return isRepositoryOutputPathInside(
     repository,
     selected,
-    platform === WINDOWS_TARGET ? win32 : NATIVE_PATH_MODULE,
+    platform === WINDOWS_PLATFORM ? win32 : NATIVE_PATH_MODULE,
   );
 }
 
@@ -706,12 +749,30 @@ async function resolveThirdPartyPackages(repositoryRoot, target) {
   const keytarPackage = rootRequire.resolve("@github/keytar/package.json");
   const keytarRoot = dirname(keytarPackage);
   const keytar = await pinnedElectronKeytarPackage(keytarPackage);
-  const keytarArchitecture = target === WINDOWS_TARGET
-    ? "win32-x64"
-    : "darwin-arm64";
+  const targetSpec = TARGET_SPECS[target];
+  const keytarArchitecture = targetSpec.keytarArchitecture;
+  const keytarPath = join(
+    keytarRoot,
+    "prebuilds",
+    keytarArchitecture,
+    "keytar.node",
+  );
+  const keytarPrebuild = await captureRegularFile(
+    keytarPath,
+    `Electron Keytar ${keytarArchitecture} prebuild`,
+  );
+  if (keytarPrebuild.sha256 !== ELECTRON_KEYTAR_PREBUILD_SHA256[keytarArchitecture]) {
+    fail("NATIVE_PACKAGE_MISMATCH", "Electron Keytar prebuild bytes are not pinned");
+  }
   return Object.freeze({
     ajv: { name: "ajv", root: ajvRoot, pin: ajv },
-    keytar: { name: "@github/keytar", root: keytarRoot, pin: keytar, keytarArchitecture },
+    keytar: {
+      name: "@github/keytar",
+      root: keytarRoot,
+      pin: keytar,
+      keytarArchitecture,
+      keytarPrebuildSha256: keytarPrebuild.sha256,
+    },
     runcost: { name: "runcost", root: runcostRoot, pin: runcost },
     transitive: Object.freeze(transitive),
   });
@@ -828,7 +889,7 @@ async function inspectWindowsBindingPair({
     fail("WINDOWS_BINDING_MANIFEST", "Windows binding manifest contains a source path");
   }
   if (manifest?.bindingFile !== "windows_filesystem.node"
-      || manifest?.platform !== WINDOWS_TARGET
+      || manifest?.platform !== WINDOWS_PLATFORM
       || manifest?.architecture !== "x64"
       || manifest?.bytes !== capturedBinding.byteLength
       || manifest?.sha256 !== capturedBinding.sha256) {
@@ -955,14 +1016,17 @@ function validateRuntimeManifestShape(manifest) {
   ])) {
     fail("EXISTING_OUTPUT_INVALID", "Runtime manifest has an unexpected schema");
   }
+  const manifestTarget = Object.entries(TARGET_SPECS).find(([, spec]) => (
+    spec.platform === manifest.target && spec.architecture === manifest.architecture
+  ));
   if (manifest.schemaVersion !== MANIFEST_SCHEMA
       || manifest.releaseVersion !== RELEASE_VERSION
       || !["apps/local/server.js", "apps/electron/main.js"].includes(manifest.entrypoint)
       || manifest.dashboardRoot !== "apps/web/public"
-      || ![DARWIN_TARGET, WINDOWS_TARGET].includes(manifest.target)
-      || manifest.architecture !== (manifest.target === WINDOWS_TARGET ? "x64" : "arm64")) {
+      || manifestTarget === undefined) {
     fail("EXISTING_OUTPUT_INVALID", "Runtime manifest identity does not match this packager");
   }
+  const [, manifestTargetSpec] = manifestTarget;
   if (!Array.isArray(manifest.files) || manifest.files.length === 0) {
     fail("EXISTING_OUTPUT_INVALID", "Runtime manifest inventory is missing");
   }
@@ -1020,6 +1084,10 @@ function validateRuntimeManifestShape(manifest) {
       || !/^[0-9a-f]{64}$/u.test(windowsBinding.binding.sha256)) {
     fail("EXISTING_OUTPUT_INVALID", "Runtime Windows binding declaration is invalid");
   }
+  if (manifestTargetSpec.platform !== WINDOWS_PLATFORM
+      && windowsBinding.included) {
+    fail("EXISTING_OUTPUT_INVALID", "Non-Windows runtime cannot include a Windows binding");
+  }
   return manifest;
 }
 
@@ -1050,7 +1118,7 @@ function expectedDirectoryPaths(rows) {
   return [...expected].sort(comparePathBytes);
 }
 
-async function validateExistingRuntime(output) {
+async function validateExistingRuntime(output, expectedTarget = null) {
   await assertNoSymlinkPathComponents(output, "existing Electron runtime");
   let metadata;
   try {
@@ -1082,6 +1150,14 @@ async function validateExistingRuntime(output) {
     fail("EXISTING_OUTPUT_INVALID", "Existing runtime manifest is not JSON");
   }
   validateRuntimeManifestShape(manifest);
+  if (expectedTarget !== null) {
+    const expectedSpec = TARGET_SPECS[expectedTarget];
+    if (expectedSpec === undefined
+        || manifest.target !== expectedSpec.platform
+        || manifest.architecture !== expectedSpec.architecture) {
+      fail("EXISTING_OUTPUT_INVALID", "Existing runtime target does not match destination");
+    }
+  }
   const inventory = await collectInventory(output);
   if (stableJson(inventory) !== stableJson(manifest.files)) {
     fail("EXISTING_OUTPUT_INVALID", "Existing runtime inventory does not match its files");
@@ -1125,12 +1201,13 @@ export async function buildElectronRuntime({
   if (typeof includeElectronShell !== "boolean") {
     fail("INVALID_SHELL_MODE", "includeElectronShell must be a boolean");
   }
-  const selectedTarget = normalizeTarget(target);
+  const selectedTarget = normalizeElectronTarget(target);
+  const selectedTargetSpec = TARGET_SPECS[selectedTarget];
   const selectedPackagingProfile = normalizePackagingProfile(packagingProfile);
   // The production profile is paired with the protected Windows release
   // config: it may never silently label a companion-only or macOS tree.
   if (selectedPackagingProfile === "windows-production"
-      && (selectedTarget !== WINDOWS_TARGET || !includeElectronShell)) {
+      && (selectedTarget !== WINDOWS_X64_TARGET || !includeElectronShell)) {
     fail(
       "PACKAGING_PROFILE_TARGET",
       "The Windows production profile requires a Windows Electron shell build",
@@ -1143,12 +1220,12 @@ export async function buildElectronRuntime({
       profile: selectedPackagingProfile,
     })
     : undefined;
-  if (selectedTarget !== WINDOWS_TARGET
+  if (selectedTarget !== WINDOWS_X64_TARGET
       && (windowsBindingPath || windowsManifestPath)) {
     fail("WINDOWS_BINDING_TARGET", "Windows binding arguments require the Windows target");
   }
   const destination = await validateOutputDestination(output, REPOSITORY_ROOT, replace);
-  if (destination.existed) await validateExistingRuntime(destination.output);
+  if (destination.existed) await validateExistingRuntime(destination.output, selectedTarget);
   const temporaryRoot = await mkdtemp(join(
     destination.parent,
     `.${basename(destination.output)}.staging-`,
@@ -1237,7 +1314,7 @@ export async function buildElectronRuntime({
     );
 
     let windowsBinding;
-    if (selectedTarget === WINDOWS_TARGET) {
+    if (selectedTarget === WINDOWS_X64_TARGET) {
       const bindingPath = windowsBindingPath
         ? resolve(windowsBindingPath)
         : defaultWindowsInput(WINDOWS_BINDING_RELATIVE_PATH);
@@ -1276,8 +1353,8 @@ export async function buildElectronRuntime({
     const payload = payloadDigest(inventory);
     const manifest = Object.freeze({
       schemaVersion: MANIFEST_SCHEMA,
-      target: selectedTarget,
-      architecture: selectedTarget === WINDOWS_TARGET ? "x64" : "arm64",
+      target: selectedTargetSpec.platform,
+      architecture: selectedTargetSpec.architecture,
       releaseVersion: selectedPackageVersion,
       entrypoint: includeElectronShell ? "apps/electron/main.js" : "apps/local/server.js",
       dashboardRoot: "apps/web/public",
@@ -1322,7 +1399,7 @@ export async function buildElectronRuntime({
         || commitDestination.parent !== destination.parent) {
       fail("UNSAFE_OUTPUT", "Electron runtime destination changed before commit");
     }
-    if (destination.existed) await validateExistingRuntime(destination.output);
+    if (destination.existed) await validateExistingRuntime(destination.output, selectedTarget);
     else {
       let currentMetadata;
       try {
@@ -1387,7 +1464,9 @@ export function parseElectronRuntimeArguments(argv) {
     }
     index += 1;
     if (argument === "--output") parsed.output = value;
-    else if (argument === "--target" || argument === "--platform") parsed.target = normalizeTarget(value);
+    else if (argument === "--target" || argument === "--platform") {
+      parsed.target = normalizeElectronTarget(value);
+    }
     else if (argument === "--windows-binding") parsed.windowsBindingPath = value;
     else if (argument === "--profile") parsed.packagingProfile = normalizePackagingProfile(value);
     else if (argument === "--version") parsed.packageVersion = value;
@@ -1398,7 +1477,7 @@ export function parseElectronRuntimeArguments(argv) {
       || (!parsed.windowsBindingPath && parsed.windowsManifestPath)) {
     fail("WINDOWS_BINDING_PAIR", "Windows binding and manifest must be supplied together");
   }
-  if (parsed.target !== WINDOWS_TARGET
+  if (parsed.target !== WINDOWS_X64_TARGET
       && (parsed.windowsBindingPath || parsed.windowsManifestPath)) {
     fail("WINDOWS_BINDING_TARGET", "Windows binding arguments require the Windows target");
   }
@@ -1412,7 +1491,9 @@ async function main(argv) {
     process.stdout.write(`${JSON.stringify({
       output: result.output,
       manifest: result.manifestPath,
-      target: result.manifest.target,
+      target: parsed.target,
+      platform: result.manifest.target,
+      architecture: result.manifest.architecture,
       files: result.manifest.files.length,
       payloadBytes: result.manifest.payload.bytes,
       payloadSha256: result.manifest.payload.sha256,

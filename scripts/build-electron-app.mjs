@@ -4,7 +4,7 @@
  * Stage the unsigned Electron development app source tree.
  *
  * This deliberately stops before electron-builder: the output is a reviewed,
- * directory-only input for the later macOS arm64 or Windows x64 `dir` build.
+ * directory-only input for the later target-specific Electron `dir` build.
  * The companion runtime packager owns the exact source/dependency closure and
  * this wrapper opts it into the Electron shell files and shell entrypoint.
  */
@@ -15,6 +15,8 @@ import { fileURLToPath } from "node:url";
 
 import {
   buildElectronRuntime,
+  ELECTRON_TARGETS,
+  normalizeElectronTarget,
 } from "./build-electron-runtime.mjs";
 import {
   ELECTRON_BUILDER_PACKAGE_PROFILES,
@@ -22,16 +24,22 @@ import {
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
+const DEFAULT_TARGET = "darwin-arm64";
 export const DEFAULT_ELECTRON_APP_OUTPUT = resolve(
   REPOSITORY_ROOT,
-  ".release-build/electron-dev/mac-arm64/app",
+  ".release-build/electron-dev/darwin-arm64/app",
 );
 export const DEFAULT_WINDOWS_ELECTRON_APP_OUTPUT = resolve(
   REPOSITORY_ROOT,
-  ".release-build/electron-dev/windows-x64/app",
+  ".release-build/electron-dev/win32-x64/app",
 );
-const DARWIN_TARGET = "darwin";
-const WINDOWS_TARGET = "win32";
+export const ELECTRON_APP_OUTPUTS = Object.freeze(
+  Object.fromEntries(Object.keys(ELECTRON_TARGETS).map((target) => [
+    target,
+    resolve(REPOSITORY_ROOT, ".release-build", "electron-dev", target, "app"),
+  ])),
+);
+const WINDOWS_TARGET = "win32-x64";
 const DEFAULT_WINDOWS_BINDING_PATH = resolve(
   REPOSITORY_ROOT,
   "native/windows-filesystem/build/Release/windows_filesystem.node",
@@ -55,16 +63,6 @@ function normalizePackagingProfile(value) {
     fail("INVALID_PROFILE", "The Electron packaging profile is not supported");
   }
   return value;
-}
-
-function normalizeTarget(value = DARWIN_TARGET) {
-  if (value === "macos" || value === "macOS" || value === DARWIN_TARGET) {
-    return DARWIN_TARGET;
-  }
-  if (value === "windows" || value === "win" || value === WINDOWS_TARGET) {
-    return WINDOWS_TARGET;
-  }
-  fail("UNSUPPORTED_TARGET", "The Electron development app supports macOS arm64 and Windows x64 only");
 }
 
 async function requireWindowsInputs({ windowsBindingPath, windowsManifestPath } = {}) {
@@ -96,25 +94,25 @@ async function requireWindowsInputs({ windowsBindingPath, windowsManifestPath } 
  */
 export async function buildElectronApp({
   output,
-  target = DARWIN_TARGET,
+  target = DEFAULT_TARGET,
   replace = false,
   windowsBindingPath,
   windowsManifestPath,
   packagingProfile,
   packageVersion,
 } = {}) {
-  const selectedTarget = normalizeTarget(target);
+  const selectedTarget = normalizeElectronTarget(target);
   const selectedPackagingProfile = normalizePackagingProfile(packagingProfile);
   const windowsInputs = selectedTarget === WINDOWS_TARGET
     ? await requireWindowsInputs({ windowsBindingPath, windowsManifestPath })
     : null;
-  if (selectedTarget === DARWIN_TARGET && (windowsBindingPath || windowsManifestPath)) {
+  if (selectedTarget !== WINDOWS_TARGET && (windowsBindingPath || windowsManifestPath)) {
     fail("WINDOWS_INPUT_TARGET", "Windows binding inputs require the Windows target");
   }
   return buildElectronRuntime({
     output: output ?? (selectedTarget === WINDOWS_TARGET
       ? DEFAULT_WINDOWS_ELECTRON_APP_OUTPUT
-      : DEFAULT_ELECTRON_APP_OUTPUT),
+      : ELECTRON_APP_OUTPUTS[selectedTarget] ?? DEFAULT_ELECTRON_APP_OUTPUT),
     target: selectedTarget,
     replace,
     includeElectronShell: true,
@@ -128,7 +126,7 @@ export function parseElectronAppArguments(argv) {
   if (!Array.isArray(argv)) throw new TypeError("argv must be an array");
   const parsed = {
     output: null,
-    target: DARWIN_TARGET,
+    target: DEFAULT_TARGET,
     replace: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -148,7 +146,9 @@ export function parseElectronAppArguments(argv) {
     }
     index += 1;
     if (argument === "--output") parsed.output = value;
-    else if (argument === "--target" || argument === "--platform") parsed.target = normalizeTarget(value);
+    else if (argument === "--target" || argument === "--platform") {
+      parsed.target = normalizeElectronTarget(value);
+    }
     else if (argument === "--windows-binding") parsed.windowsBindingPath = value;
     else if (argument === "--profile") parsed.packagingProfile = normalizePackagingProfile(value);
     else if (argument === "--version") parsed.packageVersion = value;
@@ -166,17 +166,19 @@ export function parseElectronAppArguments(argv) {
     ...parsed,
     output: parsed.output ?? (parsed.target === WINDOWS_TARGET
       ? DEFAULT_WINDOWS_ELECTRON_APP_OUTPUT
-      : DEFAULT_ELECTRON_APP_OUTPUT),
+      : ELECTRON_APP_OUTPUTS[parsed.target] ?? DEFAULT_ELECTRON_APP_OUTPUT),
   });
 }
 
 async function main(argv) {
   try {
-    const result = await buildElectronApp(parseElectronAppArguments(argv));
+    const parsed = parseElectronAppArguments(argv);
+    const result = await buildElectronApp(parsed);
     process.stdout.write(`${JSON.stringify({
       output: result.output,
       manifest: result.manifestPath,
-      target: result.manifest.target,
+      target: parsed.target,
+      platform: result.manifest.target,
       architecture: result.manifest.architecture,
       entrypoint: result.manifest.entrypoint,
       files: result.manifest.files.length,

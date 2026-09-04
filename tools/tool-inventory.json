@@ -1729,6 +1729,7 @@
       "additionalAliases": [],
       "callers": [
         ".github/workflows/windows-portability.yml",
+        "scripts/package-electron-development.mjs",
         "test/electron-app-package.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
@@ -1745,6 +1746,8 @@
       "additionalAliases": [],
       "callers": [
         "scripts/build-electron-app.mjs",
+        "scripts/package-electron-development.mjs",
+        "scripts/verify-electron-development-artifact.mjs",
         "test/electron-app-package.test.js",
         "test/electron-development-artifact-verifier.test.js",
         "test/electron-package-layout.test.js"
@@ -1762,7 +1765,128 @@
       "stableAliasReason": "Development packaging is invoked explicitly and qualified before any production release.",
       "additionalAliases": [],
       "callers": [
+        "scripts/package-electron-development.mjs",
         "test/electron-development-artifact-verifier.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/build-electron-linux-container.mjs",
+      "stableAlias": "container:electron-linux:build",
+      "stableAliasReason": null,
+      "additionalAliases": [
+        "container:electron-linux:build:amd64"
+      ],
+      "callers": [
+        ".github/workflows/linux-portability.yml",
+        "package.json#scripts.container:electron-linux:build",
+        "package.json#scripts.container:electron-linux:build:amd64",
+        "test/linux-portability-workflow.test.js"
+      ],
+      "decision": "retain_as_development_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/package-electron-development.mjs",
+      "stableAlias": "package:electron:development",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-development-packages.yml",
+        "package.json#scripts.package:electron:development",
+        "test/electron-development-package.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/qa-electron-macos-real-history.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Content-free real-history Electron qualification is an internal package/runtime gate, not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/electron-macos-real-history-qa-contract.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "platform_security",
+      "canonicalPath": "scripts/qualify-linux-secret-service.mjs",
+      "stableAlias": "test:linux:credentials",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/linux-portability.yml",
+        "package.json#scripts.test:linux:credentials",
+        "scripts/run-linux-secret-service-qualification.mjs",
+        "test/linux-secret-service-qualification.test.js"
+      ],
+      "decision": "retain_as_development_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "platform_security",
+      "canonicalPath": "scripts/run-linux-secret-service-qualification.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The supervisor is the fixed in-container entry point behind the AMD64 credential command, not a host-side Node alias.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/linux-portability.yml",
+        "containers/electron-linux-amd64/Dockerfile",
+        "package.json#scripts.container:electron-linux:test:credentials:amd64",
+        "test/linux-secret-service-supervisor.test.js"
+      ],
+      "decision": "retain_as_development_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/smoke-electron-linux.mjs",
+      "stableAlias": "smoke:electron:linux",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.smoke:electron:linux",
+        "test/electron-linux-smoke-contract.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/smoke-electron-macos.mjs",
+      "stableAlias": "smoke:electron:macos",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.smoke:electron:macos",
+        "test/electron-macos-smoke-contract.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",

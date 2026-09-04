@@ -31,6 +31,7 @@ import {
   parseElectronAppArguments,
 } from "../scripts/build-electron-app.mjs";
 import {
+  ELECTRON_TARGETS,
   ELECTRON_SHELL_RUNTIME_FILES,
 } from "../scripts/build-electron-runtime.mjs";
 import { RELEASE_VERSION } from "../config/release-manifest.js";
@@ -208,12 +209,13 @@ test("Electron builder configuration is an unsigned macOS arm64 directory build"
   assert.ok(!macIconMetadata.isSymbolicLink());
   assert.equal(BUILDER_CONFIG.mac.identity, null);
   assert.equal(BUILDER_CONFIG.mac.notarize, false);
+  assert.equal(BUILDER_CONFIG.mac.protocols, undefined);
 });
 
 test("Electron builder configuration exposes an unsigned Windows x64 directory target", () => {
   const config = loadBuilderConfigForTarget("win32");
-  assert.match(config.directories.app, /\.release-build[\\/]electron-dev[\\/]windows-x64[\\/]app$/u);
-  assert.match(config.directories.output, /\.release-build[\\/]electron-dev[\\/]windows-x64[\\/]artifacts$/u);
+  assert.match(config.directories.app, /\.release-build[\\/]electron-dev[\\/]win32-x64[\\/]app$/u);
+  assert.match(config.directories.output, /\.release-build[\\/]electron-dev[\\/]win32-x64[\\/]artifacts$/u);
   assert.deepEqual(config.asarUnpack, [
     "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node",
     "native/windows-filesystem/build/Release/windows_filesystem.node",
@@ -224,6 +226,79 @@ test("Electron builder configuration exposes an unsigned Windows x64 directory t
   assert.equal(config.win.signExecutable, false);
   assert.equal(config.publish, "never");
   assert.equal(config.forceCodeSigning, false);
+});
+
+test("Electron builder configuration maps every development target to its native closure", () => {
+  const expected = {
+    "darwin-arm64": {
+      app: /electron-dev[\\/]darwin-arm64[\\/]app$/u,
+      artifact: /electron-dev[\\/]darwin-arm64[\\/]artifacts$/u,
+      keytar: "darwin-arm64",
+      platform: "mac",
+      architecture: "arm64",
+    },
+    "darwin-x64": {
+      app: /electron-dev[\\/]darwin-x64[\\/]app$/u,
+      artifact: /electron-dev[\\/]darwin-x64[\\/]artifacts$/u,
+      keytar: "darwin-x64",
+      platform: "mac",
+      architecture: "x64",
+    },
+    "win32-x64": {
+      app: /electron-dev[\\/]win32-x64[\\/]app$/u,
+      artifact: /electron-dev[\\/]win32-x64[\\/]artifacts$/u,
+      keytar: "win32-x64",
+      platform: "win",
+      architecture: "x64",
+    },
+    "linux-x64": {
+      app: /electron-dev[\\/]linux-x64[\\/]app$/u,
+      artifact: /electron-dev[\\/]linux-x64[\\/]artifacts$/u,
+      keytar: "linux-x64",
+      platform: "linux",
+      architecture: "x64",
+    },
+  };
+  for (const [target, expectation] of Object.entries(expected)) {
+    const config = loadBuilderConfigForTarget(target);
+    assert.match(config.directories.app, expectation.app, target);
+    assert.match(config.directories.output, expectation.artifact, target);
+    assert.deepEqual(config.asarUnpack.filter((value) => value.includes("keytar.node")), [
+      `node_modules/@github/keytar/prebuilds/${expectation.keytar}/keytar.node`,
+    ], target);
+    assert.deepEqual(
+      config[expectation.platform].target,
+      [{ target: "dir", arch: [expectation.architecture] }],
+      target,
+    );
+    if (target === "linux-x64") {
+      assert.equal(config.linux.category, "Utility");
+      // electron-builder 26 otherwise supplies a legacy --no-sandbox default
+      // for AppImage desktop entries when executableArgs is omitted.
+      assert.deepEqual(config.linux.executableArgs, []);
+    }
+    else assert.equal(config.linux, undefined);
+    if (target === "linux-x64") assert.equal(config.linux.executableName, "tibotattle-dev");
+  }
+});
+
+test("Electron app staging supports the non-Windows target-specific shell inputs", async () => {
+  await withTemporaryDirectory(async (root) => {
+    for (const target of ["darwin-x64", "linux-x64"]) {
+      const result = await buildElectronApp({
+        output: join(root, target),
+        target,
+      });
+      const manifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
+      assert.equal(manifest.target, ELECTRON_TARGETS[target].platform, target);
+      assert.equal(manifest.architecture, ELECTRON_TARGETS[target].architecture, target);
+      assert.equal(manifest.entrypoint, "apps/electron/main.js", target);
+      assert.equal(manifest.windowsBinding.included, false, target);
+      assert.ok(manifest.files.some(({ path }) => path
+        === `node_modules/@github/keytar/prebuilds/${ELECTRON_TARGETS[target].keytarArchitecture}/keytar.node`), target);
+      assert.ok(manifest.files.some(({ path }) => path === "apps/electron/main.js"), target);
+    }
+  });
 });
 
 test("Windows Electron staging requires the reviewed native binding pair", async () => {
@@ -293,12 +368,12 @@ test("Windows Electron staging includes the exact binding pair and shell", async
 test("Electron app argument parsing selects macOS or Windows inputs explicitly", () => {
   assert.deepEqual(parseElectronAppArguments([]), {
     output: DEFAULT_ELECTRON_APP_OUTPUT,
-    target: "darwin",
+    target: "darwin-arm64",
     replace: false,
   });
   assert.deepEqual(parseElectronAppArguments(["--target", "windows"]), {
-    output: resolve(".release-build/electron-dev/windows-x64/app"),
-    target: "win32",
+    output: resolve(".release-build/electron-dev/win32-x64/app"),
+    target: "win32-x64",
     replace: false,
   });
   assert.deepEqual(parseElectronAppArguments([
@@ -306,8 +381,8 @@ test("Electron app argument parsing selects macOS or Windows inputs explicitly",
     "--profile", "windows-production",
     "--version", RELEASE_VERSION,
   ]), {
-    output: resolve(".release-build/electron-dev/windows-x64/app"),
-    target: "win32",
+    output: resolve(".release-build/electron-dev/win32-x64/app"),
+    target: "win32-x64",
     replace: false,
     packagingProfile: "windows-production",
     packageVersion: RELEASE_VERSION,
@@ -320,7 +395,7 @@ test("Electron app argument parsing selects macOS or Windows inputs explicitly",
     ]),
     {
       output: "/private/tmp/tibotattle-electron-app",
-      target: "darwin",
+      target: "darwin-arm64",
       replace: true,
     },
   );
@@ -334,7 +409,7 @@ test("Electron app argument parsing selects macOS or Windows inputs explicitly",
     ]),
     {
       output: "/private/tmp/tibotattle-electron-windows-app",
-      target: "win32",
+      target: "win32-x64",
       replace: true,
       windowsBindingPath: "/private/tmp/windows_filesystem.node",
       windowsManifestPath: "/private/tmp/windows_filesystem.node.manifest.json",
@@ -378,6 +453,6 @@ test("Electron app rejects production profile outside the Windows shell release 
 });
 
 test("Electron app staging default remains a disposable reviewed destination", () => {
-  assert.match(DEFAULT_ELECTRON_APP_OUTPUT, /\.release-build[\\/]electron-dev[\\/]mac-arm64[\\/]app$/u);
+  assert.match(DEFAULT_ELECTRON_APP_OUTPUT, /\.release-build[\\/]electron-dev[\\/]darwin-arm64[\\/]app$/u);
   assert.doesNotMatch(DEFAULT_ELECTRON_APP_OUTPUT, /(?:docs?|tests?)(?:\/|$)/iu);
 });

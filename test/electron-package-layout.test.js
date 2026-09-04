@@ -23,6 +23,8 @@ import {
   electronRuntimeStatOptionsForTest,
   parseElectronRuntimeArguments,
   ELECTRON_KEYTAR_PACKAGE_PIN,
+  ELECTRON_TARGETS,
+  normalizeElectronTarget,
   pinnedElectronKeytarPackage,
   validateElectronRuntimeOutput,
 } from "../scripts/build-electron-runtime.mjs";
@@ -49,6 +51,13 @@ function filePaths(manifest) {
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
 }
+
+test("Electron target normalization accepts only declared string keys", () => {
+  for (const value of ["constructor", "__proto__", "toString", "linux-arm64", null, {}, { toString() { throw new Error("must not coerce"); } }]) {
+    assert.throws(() => normalizeElectronTarget(value), (error) => error.code === "ELECTRON_RUNTIME_INVALID_TARGET");
+  }
+  assert.equal(normalizeElectronTarget("darwin-x64"), "darwin-x64");
+});
 
 function payloadFor(rows) {
   const hash = createHash("sha256");
@@ -175,6 +184,26 @@ test("Electron runtime staging is deterministic and contains only the reviewed c
   });
 });
 
+test("Electron runtime stages the same reviewed closure for every development target", async () => {
+  await withTemporaryDirectory(async (root) => {
+    for (const [target, spec] of Object.entries(ELECTRON_TARGETS)) {
+      assert.equal(normalizeElectronTarget(target), target);
+      const result = await buildElectronRuntime({
+        output: join(root, target),
+        target,
+      });
+      assert.equal(result.manifest.target, spec.platform, target);
+      assert.equal(result.manifest.architecture, spec.architecture, target);
+      assert.equal(result.manifest.windowsBinding.included, false, target);
+      assert.ok(filePaths(result.manifest).includes(
+        `node_modules/@github/keytar/prebuilds/${spec.keytarArchitecture}/keytar.node`,
+      ), target);
+      assert.ok(filePaths(result.manifest).every((path) =>
+        !path.includes("windows_filesystem_qualification")), target);
+    }
+  });
+});
+
 test("Electron runtime output rejects broad or source destinations", async () => {
   await assert.rejects(
     () => validateElectronRuntimeOutput({ output: REPOSITORY_ROOT }),
@@ -277,7 +306,7 @@ test("Windows target can include an exact binding pair while remaining explicitl
 
     const result = await buildElectronRuntime({
       output: join(root, "windows-runtime"),
-      target: "win32",
+      target: "win32-x64",
       windowsBindingPath: bindingPath,
       windowsManifestPath: manifestPath,
     });
@@ -330,7 +359,7 @@ test("Electron runtime argument parsing requires an output and paired Windows in
     ]),
     {
       output: "/tmp/tibotattle-runtime",
-      target: "win32",
+      target: "win32-x64",
       replace: true,
       windowsBindingPath: null,
       windowsManifestPath: null,
@@ -357,7 +386,7 @@ test("Electron runtime argument parsing requires an output and paired Windows in
     ]),
     {
       output: "/tmp/tibotattle-runtime",
-      target: "win32",
+      target: "win32-x64",
       replace: false,
       windowsBindingPath: null,
       windowsManifestPath: null,

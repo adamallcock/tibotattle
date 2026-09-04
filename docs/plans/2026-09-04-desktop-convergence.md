@@ -34,6 +34,24 @@ and approval-review hold on changing the default.
 
 ## Implementation boundary
 
+Continuation authorized on 2026-09-04: finish reconciliation with the latest
+native 0.1.18 changes and controls, provide a durable Electron app the owner can
+test, and prepare packaging for all four targets. The integration baseline is
+native commit `645cd250`, merged locally as `970af98f`. This includes the
+combined RC2 Astra/Intel work, compressed-history support and paginated-export
+fixes. GitHub PRs and remote references were refreshed before selecting it.
+Open PRs are evaluated for relevant product changes; their presence alone does
+not authorize adopting unrelated research or obsolete implementations.
+
+The next acceptance boundary is a versioned development package for each of
+`darwin-arm64`, `darwin-x64`, `win32-x64` and `linux-x64`, one packaging command
+and native-runner workflow, a source-backed Mac control parity ledger, and a
+durable side-by-side Mac test app with isolated writable state. Exact native
+runtime, installed lifecycle, production signing and update proofs stay visible
+per target. Docker x64 emulation can produce/test a Linux development artifact;
+it cannot be reported as physical x64 desktop qualification. Existing native
+release artifacts and checkouts remain intact.
+
 The policy is accepted for the new Electron mode. Source implementation and
 synthetic qualification may proceed; distributed collection still depends on
 upload ownership, honest authorization, abuse controls and release evidence.

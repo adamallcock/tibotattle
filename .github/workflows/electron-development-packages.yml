@@ -1,0 +1,205 @@
+name: Electron four-target development packages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: electron-development-packages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  darwin-arm64:
+    name: darwin-arm64 unsigned development packages
+    runs-on: macos-26
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: "1"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - name: Check out this exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: arm64
+          check-latest: false
+          package-manager-cache: false
+      - name: Install locked dependencies and verify native target
+        run: |
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          node -e "if(process.version!=='v26.2.0'||process.platform!=='darwin'||process.arch!=='arm64')process.exit(1)"
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Validate packaging contracts
+        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js
+      - name: Build and verify development distributions
+        run: node scripts/package-electron-development.mjs --target darwin-arm64 --format distribution --replace-staging
+      - name: Retain verified development packages and receipts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-development-darwin-arm64-${{ github.sha }}
+          path: .release-build/electron-candidates/${{ github.sha }}/darwin-arm64/distribution/
+          if-no-files-found: error
+          retention-days: 14
+
+  darwin-x64:
+    name: darwin-x64 unsigned development packages
+    runs-on: macos-26-intel
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: "1"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - name: Check out this exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: x64
+          check-latest: false
+          package-manager-cache: false
+      - name: Install locked dependencies and verify native target
+        run: |
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          node -e "if(process.version!=='v26.2.0'||process.platform!=='darwin'||process.arch!=='x64')process.exit(1)"
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Validate packaging contracts
+        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js
+      - name: Build and verify development distributions
+        run: node scripts/package-electron-development.mjs --target darwin-x64 --format distribution --replace-staging
+      - name: Retain verified development packages and receipts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-development-darwin-x64-${{ github.sha }}
+          path: .release-build/electron-candidates/${{ github.sha }}/darwin-x64/distribution/
+          if-no-files-found: error
+          retention-days: 14
+
+  win32-x64:
+    name: win32-x64 unsigned development packages
+    runs-on: windows-2025
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CI: "1"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - name: Check out this exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: x64
+          check-latest: false
+          package-manager-cache: false
+      - name: Install locked dependencies and verify native target
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'COREPACK_INSTALL_FAILED' }
+          corepack enable
+          if ($LASTEXITCODE -ne 0) { throw 'COREPACK_ENABLE_FAILED' }
+          corepack prepare pnpm@11.9.0 --activate
+          if ($LASTEXITCODE -ne 0) { throw 'PNPM_PREPARE_FAILED' }
+          node -e "if(process.version!=='v26.2.0'||process.platform!=='win32'||process.arch!=='x64')process.exit(1)"
+          if ($LASTEXITCODE -ne 0) { throw 'NATIVE_RUNTIME_REQUIRED' }
+          pnpm install --frozen-lockfile --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'DEPENDENCY_INSTALL_FAILED' }
+      - name: Build the reviewed Windows filesystem binding
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $npmCommand = (Get-Command npm.cmd).Source
+          $nodeRoot = Split-Path $npmCommand -Parent
+          $nodeGypScript = Join-Path $nodeRoot 'node_modules/npm/node_modules/node-gyp/bin/node-gyp.js'
+          if (-not (Test-Path -LiteralPath $nodeGypScript -PathType Leaf)) { throw 'WINDOWS_BINDING_BUILDER_UNAVAILABLE' }
+          node $nodeGypScript rebuild --directory native/windows-filesystem
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_BINDING_BUILD_FAILED' }
+          node scripts/build-windows-filesystem-manifest.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_BINDING_MANIFEST_FAILED' }
+      - name: Validate packaging contracts
+        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js
+      - name: Build and verify development distributions
+        run: node scripts/package-electron-development.mjs --target win32-x64 --format distribution --replace-staging
+      - name: Retain verified development packages and receipts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-development-win32-x64-${{ github.sha }}
+          path: .release-build/electron-candidates/${{ github.sha }}/win32-x64/distribution/
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-x64:
+    name: linux-x64 unsigned development packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI: "1"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - name: Check out this exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: x64
+          check-latest: false
+          package-manager-cache: false
+      - name: Install locked dependencies and verify native target
+        run: |
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          node -e "if(process.version!=='v26.2.0'||process.platform!=='linux'||process.arch!=='x64')process.exit(1)"
+          pnpm install --frozen-lockfile --ignore-scripts
+      - name: Install Linux package and desktop prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libsecret-1-0 libarchive-tools libfuse2t64
+      - name: Validate packaging contracts
+        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js
+      - name: Build and verify development distributions
+        run: node scripts/package-electron-development.mjs --target linux-x64 --format distribution --replace-staging
+      - name: Retain verified development packages and receipts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-development-linux-x64-${{ github.sha }}
+          path: .release-build/electron-candidates/${{ github.sha }}/linux-x64/distribution/
+          if-no-files-found: error
+          retention-days: 14
