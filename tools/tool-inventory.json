@@ -99,6 +99,7 @@
         "product:macos:preview:validate"
       ],
       "callers": [
+        "apps/local/electron-static-assets.test.mjs",
         "package.json#scripts.product:macos:build",
         "package.json#scripts.product:macos:preview:build",
         "package.json#scripts.product:macos:preview:validate",
@@ -414,6 +415,7 @@
       "stableAliasReason": "Client boundary exporter is invoked directly with an output path and is not a supported npm command.",
       "additionalAliases": [],
       "callers": [
+        "apps/local/electron-static-assets.test.mjs",
         "test/export-tibotattle.test.js",
         "test/weekly-pace-macos-runtime.test.js"
       ],

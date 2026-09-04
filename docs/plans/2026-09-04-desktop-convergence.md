@@ -96,10 +96,10 @@ migration.
 
 | Owner | Isolated work | Status |
 |---|---|---|
-| Integrator | `codex/unified-desktop-accountless` | Plan, local contribution policy/client and integration |
-| Luna: Electron | `codex/electron-accountless-reconcile` | Inspect divergence and reconcile retained shell/platform code |
-| Luna: enrollment | `codex/accountless-enrollment-backend` | Bounded opt-in-configured endpoint, lifecycle and synthetic tests |
-| Luna: attribution | Read-only initial trace | Verify usage/quota join and define required regression cases |
+| Integrator | `codex/unified-desktop-accountless` | Isolated integration branch, policy/client, asset closure and combined validation |
+| Luna: Electron | `codex/electron-accountless-reconcile`, then `codex/electron-architecture-exception-tightening` | Selective shell reconciliation, narrow preload boundary and complete browser catalogs integrated |
+| Luna: enrollment | `codex/accountless-enrollment-backend` | Disabled enrollment-only endpoint, additive ledger, bounded issuance and synthetic lifecycle tests |
+| Luna: attribution | Read-only attribution trace, then owned client files | Join contract verified; bounded enrollment helper implemented; independent backend concurrency review |
 
 Local preference foundation is implemented with a closed versioned record and
 the existing protected settings adapter. Its nine focused tests pass, including
@@ -107,6 +107,68 @@ real-file restart, first-operation opt-out, corrupt/unknown state, failed writes
 policy/destination changes and concurrent selections. It is not connected to
 the installed application or an upload scheduler. The new sharing default
 remains pending confirmation; no existing production behavior changed.
+
+The initial source integration selectively brings the retained Electron shell
+onto the current shared core. It preserves current native accounting, hosted
+authentication and the active 0.1.18 checkout. A real companion HTTP test caught
+and now covers the settings routes, MIME types, exporter inventory and native
+shared-web asset closure. The browser preview caught missing localization;
+152 retained Electron/appearance catalog entries are now present across all
+three locales. Rendered Settings was inspected after that repair. This is
+browser evidence only, not a packaged Electron or native lifecycle receipt.
+
+The client helper has 13 focused passing tests. It reuses the existing secure
+installation capability, sends an exact five-field request, and validates an
+enrollment-only receipt. It bounds response streaming and deadlines, rejects
+revoked/expired/overlong receipts, and rechecks the durable preference around
+asynchronous operations. It is not wired into the application: the composition
+must additionally abort or serialize enrollment with opt-out to close the
+last preference-read/send race. No scheduler, credential renewal, upload
+authorization or automatic collection is introduced by this tranche.
+
+Before activation, complete additive upload ownership without synthetic consent
+events, preference UI and cancellation wiring, explicit legacy choice/identity
+migration, source-level duplicate selection, contribution influence controls,
+and installed update qualification. Enrollment's provisional 1,000-per-day and
+10,000-lifetime global caps bound the disabled candidate's ledger; they are
+laboratory containment limits, not the production onboarding capacity plan.
+
+Validation for the first tranche (2026-09-04):
+
+| Evidence | Result and boundary |
+|---|---|
+| Electron source suite on integrated branch | 308/308 passed; synthetic lifecycle/IPC/platform contracts |
+| Complete Worker Vitest on integrated branch | 537/537 passed across 44 files; isolated local Cloudflare fixtures |
+| Required macOS artifact lane | 121/121 passed across its three test groups after preparing the pinned public Sparkle dependency; disposable development/preview and loopback fixtures, no installed migration or production signing proof |
+| Worker script/type/schema checks | 179/179 script checks, 19/19 staging-readiness checks and TypeScript passed on the backend branch; 17/17 focused route/enrollment tests passed |
+| Preference/client/export/application focused suite | 30/30 passed, including 9 preference and 13 client cases |
+| Usage/account attribution regressions | 43/43 passed in the focused provider and telemetry lanes |
+| Browser Settings inspection | Rendered repaired English catalog and layout; ordinary browser correctly reports absent native bridge |
+| Architecture, i18n mirror, documentation governance | Passed after shell/catalog/client integration |
+| Integrated API/docs/tool inventory/HTTP asset checks | 15/15 passed after recording both new static tool callers |
+| Complete root suite | 3,755 tests: 3,731 passed, 21 skipped, 3 failed. One missing static tool caller was repaired afterward; two retained R7 evidence checks remain unqualified for the changed workload source |
+
+The R7 failures are the retained receipt/current-workload digest and exact
+decision reconstruction checks. Preserve those assertions and old receipts.
+The full regenerator includes a real-history pass and documents prior durations
+of 42–59 minutes; do not rewrite hashes or represent historical measurements as
+new evidence. Run it on the final accepted source with an explicitly approved
+corpus and pinned runtimes during release qualification. Native Windows tests
+remain skipped on this Mac host; no test count closes their physical gates.
+
+The complete Worker product gate is not claimed green. Its Vitest and script
+components pass, while `deploy:dry` and `staging:check` stop at the absent
+generated public release manifest in a clean checkout. Prepare the exact public
+asset/provenance inputs for the accepted candidate before those dry-run gates;
+do not bypass the manifest checks or stage a fabricated release. No deployment
+or remote migration was attempted.
+
+| Candidate target | Current workstream status | Next physical gate |
+|---|---|---|
+| macOS arm64 | Reconciled Electron source and companion HTTP assets; browser preview inspected | Fresh packaged Electron launch, credential/state migration and first update |
+| macOS x64 | Shared source reconciled; active native 0.1.18 candidate left separate | Exact Intel Electron/native-dependency build and installed lifecycle |
+| Windows x64 | Retained protected-state/platform seams integrated; production readiness remains disabled | Qualified native binding, installer, credentials and update on Windows |
+| Linux x64 | Retained shell/adapter foundations; no installed support claim | Secret Service, tray/display environment, package/update and relaunch |
 
 ### Usage-to-quota attribution contract
 
