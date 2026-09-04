@@ -23,6 +23,7 @@ constraints, and verifiable outcomes over tutorials or canned examples.
 | Local companion, dashboard API, or unified index | `apps/local/AGENTS.md` |
 | Browser dashboard or public web UI | `apps/web/AGENTS.md` |
 | Native macOS, app bundles, updater, or signing | `apps/macos/AGENTS.md` |
+| Electron desktop lifecycle, IPC, settings, or shell integration | `apps/electron/AGENTS.md` |
 | Hosted Worker, D1/R2, auth, or deployment | `apps/worker/AGENTS.md` |
 | Standalone local-review CLI, artifact, install, or deletion | `local-review/AGENTS.md` |
 | Exact accounting or price semantics | `packages/accounting/AGENTS.md` |

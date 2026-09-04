@@ -5,7 +5,7 @@ export const CONTRIBUTION_PREFERENCE_SCHEMA_VERSION = "local-contribution-prefer
 const MAXIMUM_BYTES = 4_096;
 const VERSION = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 const KEYS = ["basis", "destinationOrigin", "enabled", "policyVersion", "schemaVersion", "updatedAt"];
-const BASES = new Set(["default_on", "user_choice", "legacy_preserved"]);
+const BASES = new Set(["default_on", "default_off", "user_choice", "legacy_preserved"]);
 
 function failure() {
   const error = new Error("Contribution preference unavailable");
@@ -29,7 +29,7 @@ function validRecord(value) {
     && value.schemaVersion === CONTRIBUTION_PREFERENCE_SCHEMA_VERSION
     && typeof value.enabled === "boolean" && BASES.has(value.basis)
     && !(value.basis === "default_on" && !value.enabled)
-    && !(value.basis === "legacy_preserved" && value.enabled)
+    && !(["legacy_preserved", "default_off"].includes(value.basis) && value.enabled)
     && typeof value.policyVersion === "string" && VERSION.test(value.policyVersion)
     && validOrigin(value.destinationOrigin)
     && typeof value.updatedAt === "string" && value.updatedAt.length === 24
@@ -103,7 +103,8 @@ export function createLocalContributionPreference({
       if (text === null) {
         const enabled = initialSelection ?? (installationState === "fresh" && defaultEnabled);
         await persist(enabled, initialSelection === null
-          ? (enabled ? "default_on" : "legacy_preserved") : "user_choice");
+          ? (installationState === "fresh" ? (enabled ? "default_on" : "default_off") : "legacy_preserved")
+          : "user_choice");
       } else {
         if (typeof text !== "string" || text.length > MAXIMUM_BYTES) throw failure();
         const parsed = JSON.parse(text);

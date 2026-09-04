@@ -252,12 +252,19 @@ function assertMacOSPreviewAppcastBoundary(value) {
 
 export const MACOS_WEB_MODULE_ENTRYPOINTS = Object.freeze([
   "apps/web/public/app.js",
+  "apps/web/public/desktop-shell.js",
+  "apps/web/public/electron-settings.js",
 ]);
 
 export const MACOS_RUNTIME_STATIC_ASSETS = Object.freeze([
   "apps/macos/reset-local-keychain.js",
   "apps/web/public/index.html",
   "apps/web/public/styles.css",
+  "apps/web/public/electron-settings.html",
+  "apps/web/public/electron-settings.css",
+  "apps/web/public/icon-panel-left.svg",
+  "apps/web/public/icon-refresh-cw.svg",
+  "apps/web/public/icon-settings.svg",
   "apps/web/public/tibotattle-icon.png",
 ]);
 

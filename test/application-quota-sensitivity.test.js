@@ -20,9 +20,11 @@ const QUOTA_SENSITIVITY_EXPORTS = [
 const APPLICATION_PUBLIC_EXPORTS = [
   ...QUOTA_SENSITIVITY_EXPORTS,
   "ClaudeCallbackCapabilityError",
+  "CONTRIBUTION_PREFERENCE_SCHEMA_VERSION",
   "createClaudeCallbackCapabilityContext",
   "createExportCompatibilityContext",
   "createLocalContributionSyncQueueContext",
+  "createLocalContributionPreference",
   "createLocalExportArtifactStorageContext",
   "createLocalExportDeletion",
   "createLocalExportSetVerificationContext",

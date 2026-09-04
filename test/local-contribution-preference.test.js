@@ -30,7 +30,9 @@ test("missing settings do not prove installation freshness", async () => {
   for (const installationState of ["existing", "unknown"]) {
     assert.equal((await create(memoryStorage(), { installationState }).initialize()).enabled, false);
   }
-  assert.equal((await create(memoryStorage(), { defaultEnabled: false }).initialize()).enabled, false);
+  const defaultOff = await create(memoryStorage(), { defaultEnabled: false }).initialize();
+  assert.equal(defaultOff.enabled, false);
+  assert.equal(defaultOff.basis, "default_off");
 });
 
 test("opt-out survives restart, policy replacement and a fresh-install hint", async () => {

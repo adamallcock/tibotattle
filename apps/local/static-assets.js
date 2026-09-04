@@ -19,6 +19,34 @@ export const LOCAL_COMPANION_STATIC_FILES = Object.freeze({
     file: "data-client.js",
     type: "text/javascript; charset=utf-8",
   }),
+  "/desktop-shell.js": Object.freeze({
+    file: "desktop-shell.js",
+    type: "text/javascript; charset=utf-8",
+  }),
+  "/electron-settings.html": Object.freeze({
+    file: "electron-settings.html",
+    type: "text/html; charset=utf-8",
+  }),
+  "/electron-settings.js": Object.freeze({
+    file: "electron-settings.js",
+    type: "text/javascript; charset=utf-8",
+  }),
+  "/electron-settings.css": Object.freeze({
+    file: "electron-settings.css",
+    type: "text/css; charset=utf-8",
+  }),
+  "/icon-panel-left.svg": Object.freeze({
+    file: "icon-panel-left.svg",
+    type: "image/svg+xml",
+  }),
+  "/icon-refresh-cw.svg": Object.freeze({
+    file: "icon-refresh-cw.svg",
+    type: "image/svg+xml",
+  }),
+  "/icon-settings.svg": Object.freeze({
+    file: "icon-settings.svg",
+    type: "image/svg+xml",
+  }),
   "/i18n.generated.js": Object.freeze({
     file: "i18n.generated.js",
     type: "text/javascript; charset=utf-8",
