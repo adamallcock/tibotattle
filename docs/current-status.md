@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-04
 type: status
 status: current
-source_commit: de386d3136a4cb0f5c70a848919567aac3887f53
+source_commit: e0f35518d8e85fa35d40af54871f3013b13673fe
 observation_date: 2026-09-04
 ---
 
@@ -18,7 +18,7 @@ using this page for a later release or operational decision.
 
 | Boundary | Verified state |
 |---|---|
-| Documentation/source review | Combined Astra/Intel candidate `0.1.18`, implementation `de386d3136a4cb0f5c70a848919567aac3887f53`, based on requested `9e1c3333`; [integrated validation](./reviews/2026-09-04-release-0-1-18-integrated-validation.md) records live-log checks, 3,771 root passes / two stale-R7 failures, green Worker checks and a verified Intel development build. No production-signed combined artifact or stable tag |
+| Documentation/source review | Combined Astra/Intel candidate `0.1.18`, source `e0f35518d8e85fa35d40af54871f3013b13673fe`, based on requested `9e1c3333`; [RC2 build proof](./reviews/2026-09-04-release-0-1-18-rc2-build-proof.md) records allocation `1025.1`, optimized ARM/Intel development builds and twelve isolated smoke passes. Fresh R7 generation is blocked by paginated export checkpoints. No production-signed combined artifact or stable tag |
 | Intel tester artifact | Inherited signed/notarized `0.1.18` build `1025` dogfood DMG from source `18c7065b`; [exact receipt](./receipts/2026-09-03-macos-intel-signed-candidate.md). Predates combined Astra changes; not physically Intel-qualified |
 | Installed internal dogfood | Version `0.1.17`, RC9 build `1023.7`, source `394c8a03`; owner accepted the inspected apps on 2026-09-03. Plist version/build/minimum-OS were independently rechecked; this does not qualify every historical credential or clean-profile case |
 | Public service | Health/readiness HTTP 200, enrollment and upload processing enabled; deployment source `b4c8f103bf697fb530434e6de196f2c187645661`, observed 2026-09-04 03:57 UTC (2026-09-03 locally) |
@@ -125,9 +125,12 @@ The complete qualification matrix and rules for changing these claims are in
   zero failures and 17 existing conditional skips. The
   [Intel dogfood candidate](./receipts/2026-09-03-macos-intel-signed-candidate.md)
   passes signing/notarization and local artifact checks for source `18c7065b`.
-  The combined Astra/Intel workload invalidates those inherited R7 receipts;
-  [integrated tests](./reviews/2026-09-04-release-0-1-18-integrated-validation.md)
-  pass apart from the two freshness checks, and a newly signed combined
+  The combined Astra/Intel workload invalidates those inherited R7 receipts.
+  The owner-authorized [RC2 proof](./reviews/2026-09-04-release-0-1-18-rc2-build-proof.md)
+  passed optimized builds and isolated smokes on both architectures, but the
+  fresh R7 attempt refused paginated Codex history in resumable export source
+  planning. All ten previous receipts remain byte-identical and stale. RC2
+  allocation is now `1025.1`, stable remains `1026`, and a newly signed combined
   candidate remains outstanding. Physical Intel,
   actual consented upload and installed update qualification remain separate
   gates. No public Intel release, feed or website was published.
@@ -154,9 +157,15 @@ The complete qualification matrix and rules for changing these claims are in
   produced no comparison receipt. Later admitted-index qualification does not
   relabel that attempt as passed or establish repair of its raw sources.
 - Retained dual-runtime R7 receipts were regenerated on the earlier Intel tree,
-  but fail freshness on the combined source snapshot above. The protected
-  [R7 workflow](./runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md)
-  must regenerate them before release use. Earlier decisions remain
+  but fail freshness on the combined source snapshot above. The latest protected
+  [R7 attempt](./reviews/2026-09-04-release-0-1-18-rc2-build-proof.md)
+  completed six runtime profiles, then stopped at
+  `export_source_codex_rollout_checkpoint_history_unsupported`. The current
+  selected corpus genuinely declares paginated history; resumable export
+  support needs a design and implementation decision before another
+  complete [R7 run](./runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md).
+  Do not narrow the corpus or bypass the guard to obtain a receipt. Earlier
+  decisions remain
   `release_open` with unresolved export resource ceilings; that expected state
   is not a generic macOS release blocker. Receipt freshness is a separate gate,
   and neither inherited files nor new synthetic tests establish fresh evidence.
