@@ -4598,26 +4598,28 @@ test("development and preview builds treat the release-channel policy as optiona
   assert.match(source, /if \(selectedPublicEdKeySha256 !== null/u);
 });
 
-test("combined 0.1.18 RC2 orders after Intel RC1 and before stable", () => {
-  const combinedRC2 = resolveSignedMacOSBundleVersion("0.1.18", INTERNAL_DOGFOOD_RELEASE_CHANNEL);
+test("corrected 0.1.18 RC3 orders after signed RC1 and RC2 and before stable", () => {
+  const correctedRC3 = resolveSignedMacOSBundleVersion("0.1.18", INTERNAL_DOGFOOD_RELEASE_CHANNEL);
   const stable = resolveSignedMacOSBundleVersion("0.1.18", STABLE_RELEASE_CHANNEL);
-  assert.equal(combinedRC2, "1025.1");
+  assert.equal(correctedRC3, "1025.2");
   assert.equal(stable, "1026");
-  assert.equal(compareMacOSBundleVersions("1025", combinedRC2), -1);
-  assert.equal(compareMacOSBundleVersions(combinedRC2, "1025"), 1);
-  assert.equal(compareMacOSBundleVersions(combinedRC2, stable), -1);
-  assert.equal(compareMacOSBundleVersions(stable, combinedRC2), 1);
+  for (const previous of ["1025", "1025.1"]) {
+    assert.equal(compareMacOSBundleVersions(previous, correctedRC3), -1);
+    assert.equal(compareMacOSBundleVersions(correctedRC3, previous), 1);
+  }
+  assert.equal(compareMacOSBundleVersions(correctedRC3, stable), -1);
+  assert.equal(compareMacOSBundleVersions(stable, correctedRC3), 1);
 });
 
 test("macOS release metadata validates versions, production mode, and Keychain references", async () => {
   assert.equal(normalizeMacOSBundleVersion(), DERIVED_MACOS_BUNDLE_VERSION);
-  assert.equal(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION, "1025.1");
+  assert.equal(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION, "1025.2");
   assert.equal(STABLE_SIGNED_BUNDLE_VERSION, "1026");
   assert.equal(resolveSignedMacOSBundleVersion("0.1.17", INTERNAL_DOGFOOD_RELEASE_CHANNEL), "1023.7");
   assert.equal(resolveSignedMacOSBundleVersion("0.1.17", STABLE_RELEASE_CHANNEL), "1024");
   assert.equal(
     normalizeMacOSBundleVersion(INTERNAL_DOGFOOD_SIGNED_BUNDLE_VERSION),
-    "1025.1",
+    "1025.2",
   );
   assert.equal(
     compareMacOSBundleVersions(
@@ -4668,7 +4670,7 @@ test("macOS release metadata validates versions, production mode, and Keychain r
     ) > 0,
     true,
   );
-  for (const unallocated of ["1023", "1023.0", "1023.1", "1023.1.0", "1023.2", "1023.2.0", "1023.3", "1023.3.0", "1023.4", "1023.4.0", "1023.5", "1023.5.0", "1023.6", "1023.6.0", "1023.7.0", "1024", "1025", "1025.0", "1025.1.0", "1026", "2000.1.17"]) {
+  for (const unallocated of ["1023", "1023.0", "1023.1", "1023.1.0", "1023.2", "1023.2.0", "1023.3", "1023.3.0", "1023.4", "1023.4.0", "1023.5", "1023.5.0", "1023.6", "1023.6.0", "1023.7.0", "1024", "1025", "1025.0", "1025.1", "1025.1.0", "1025.2.0", "1026", "2000.1.17"]) {
     assert.throws(
       () => readMacOSReleaseBuildConfiguration({
         USAGE_MONITOR_BUNDLE_VERSION: unallocated,

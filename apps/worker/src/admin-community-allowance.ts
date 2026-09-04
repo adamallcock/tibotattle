@@ -709,7 +709,7 @@ export async function buildAdminCommunityAllowancePreviewFromSource(
   if (!Number.isSafeInteger(sourceEpoch) || sourceEpoch! < 0) return null;
   const corpus = await readCachedCommunityAllowanceCorpus(db, nowMs);
   if (corpus === null) return null;
-  // The per-model series is additive evidence: any failure here (missing 0041
+  // The per-model series is additive evidence: any failure here (missing 0042
   // migration, a refusing analyzer) degrades to whatever day rows already
   // exist — or an empty series — and never withholds the blended preview.
   const today = new Date(nowMs).toISOString().slice(0, 10);

@@ -59,9 +59,11 @@ validation, appcast and publication commands accept `--architecture x64`; use
 `TiboTattle-X.Y.Z-macOS-x64.dmg` for the Intel final artifact. ARM filenames
 and default CLI behavior are unchanged. Universal binaries are not accepted.
 
-The combined Astra/Intel 0.1.18 RC2 allocations are dogfood `1025.1` and stable
-`1026` for both architectures, above the earlier Intel RC1 build `1025` and
-0.1.17 stable `1024`. Allocation is not a qualification receipt. A first Intel
+The corrected combined Astra/Intel 0.1.18 RC3 allocations are dogfood `1025.2`
+and stable `1026` for both architectures, above signed RC2 `1025.1`, earlier
+Intel RC1 `1025`, and 0.1.17 stable `1024`. Preserve RC1/RC2 artifacts and
+receipts; neither prior build may be reused for the corrected source.
+Allocation is not a qualification receipt. A first Intel
 stable release has no previous Intel installation:
 use the existing explicit owner-only `--stable-bootstrap` flow, never an ARM
 receipt as Intel prior-release or rollback evidence. The current stable key

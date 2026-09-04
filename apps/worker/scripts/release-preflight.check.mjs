@@ -315,7 +315,7 @@ test("release preflight applies both local migration streams, checks schema, and
   assert.equal(result.checks.deletionLedgerSchemaPresent, true);
   assert.equal(result.checks.collectionControlsCoherent, true);
   assert.equal(result.checks.isolatedStateCleaned, true);
-  assert.equal(result.evidence.migrationWindow, "0001-0045");
+  assert.equal(result.evidence.migrationWindow, "0001-0046");
   assert.ok(statePath);
   await assert.rejects(access(statePath));
   assert.equal(calls.filter((args) => args.includes("migrations")).length, 4);
@@ -659,7 +659,16 @@ test("real Wrangler proves both local D1 streams, schema, and controls coherence
     // Freshly migrated databases seed an operational controls row; that is a
     // coherent, passing outcome under the migration-gate governance
     // (docs/governance/2026-08-07-production-deploy-migration-gate.md).
-    assert.equal(result.state, "ready");
+    assert.equal(result.state, "ready", JSON.stringify({
+      blockers: result.blockers,
+      checks: result.checks,
+      commandFailures: commands.filter(({ result }) => result.status !== 0).map(({ result }) => ({
+        status: result.status,
+        errorCode: result.error?.code ?? null,
+        permissionFailure: /EPERM|EACCES/u.test(result.stderr ?? ""),
+        bindFailure: /listen|bind/u.test(result.stderr ?? ""),
+      })),
+    }));
     assert.equal(result.collectionAuthorized, false);
     assert.deepEqual(result.blockers, []);
     assert.equal(result.checks.localOnly, true);

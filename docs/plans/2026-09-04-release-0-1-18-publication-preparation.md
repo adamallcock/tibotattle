@@ -24,7 +24,44 @@ The local annotated RC2 tag exists; no push, installation, stable finalization o
 publication occurred. Installed-runtime, hardware and remote gates remain open,
 so the conditional publication authority has not been exercised.
 
-## Local preparation
+The owner subsequently authorized the installed ARM upgrade with data and a
+rollback copy preserved, and continuation up to the publication decision.
+The [installed-upgrade review](../reviews/2026-09-04-installed-upgrade-readiness.md)
+records a newer live starting point (stable 0.1.17/1024), verified full backups,
+and a newly identified parser-upgrade deadline regression. Corrected source
+requires fresh RC3 `1025.2`; the signed RC2 `1025.1` artifacts remain unchanged.
+The publication gate is still open, not waived.
+
+## RC3 continuation
+
+The corrected parser deadline and RC3 allocation are committed in `a9220795`.
+The complete affected local suite passes 305/305; the native suite passes
+110/110, with no skips. Release trust plus release-note tests pass 89/89,
+and retained R7 freshness passes 2/2 on each pinned Node runtime. The original
+installed stable app also passes signed/stapled/Gatekeeper validation and the
+validator's isolated fake-manager smoke; it has not been replaced or normally
+relaunched.
+
+An isolated full-state copy has completed v11-to-v13 ingestion without a rebuild,
+skipped sources, missing historical usage/tool keys or receding source coverage.
+Copy-only accounting completes and binds to the new exact generation. Model
+reclassification review is still pending before installed-upgrade qualification;
+these observations do not authorize destructive replay against the working state.
+
+The [hosted lineage review](../reviews/2026-09-04-hosted-migration-lineage-reconciliation.md)
+records a separate live deployment blocker. Production applied the historical
+`0041_community_model_composition_cache.sql`, not the independently authored
+composition-table migration. Read-only schema probes confirm that the new
+tables/withdrawal trigger and attribution schema are absent; all query receipts
+report zero writes. No configured staging database exists in the inspected
+project inventory. The local repair restores all 41 historical migrations
+byte-for-byte and gives the four unapplied successors unique 0042-0045 names,
+with unchanged SQL and exact-prefix refusal for alternative applied histories.
+Fresh-schema and production-shaped synthetic regressions pass; the full affected
+Worker gate remains to be completed on clean committed source. No database
+migration, deployment, source push, stable finalization or publication occurred.
+
+## Completed RC2 local preparation
 
 - [x] Recheck current Astra pricing and installed Codex contract. The
   [official pricing table](https://developers.openai.com/api/docs/pricing)
@@ -50,7 +87,7 @@ so the conditional publication authority has not been exercised.
 - [x] Freeze reviewed local source and record exact final results and remaining
   protected inputs. Do not describe unsigned development apps as signed RC2.
 
-## Final local evidence
+## Retained RC2 local evidence
 
 | Check on the frozen source | Result |
 | --- | --- |
@@ -96,19 +133,24 @@ this authority for combined ARM/Intel RC2 `1025.1`, its new local annotated
 source tag, signing and notarization; those operations are now complete with
 fresh distinct outputs. Intel RC1 `1025`, source `18c7065b`, its DMG, receipt,
 checksum, tester README and verified Node runtime were preserved. Installation
-was explicitly excluded and requires a separate owner decision.
+was excluded from that signing operation; the subsequent owner approval now
+permits the installed ARM upgrade with preservation. Do not infer approval for
+credential resets, broad access changes, destructive clean-profile exercises
+on the owner's working profile, or publication before qualification.
 
 | Boundary | Required proof before the corresponding claim |
 | --- | --- |
 | Signed RC2 — complete | One clean annotated dogfood source tag; independent ARM/Intel Developer ID, notarization, staple, Gatekeeper, exact-byte and same-architecture replacement receipts; not installed-upgrade proof |
+| Corrected signed RC3 — pending | Fresh common clean source/tag and build `1025.2`, new ARM/Intel final bytes and receipts; never relabel or overwrite RC2 |
 | Installed ARM | Exact signed same-identity upgrade with preserved state; prompt-free launch/refresh/restart and manual clean-profile/Login Item and failure-path matrix |
 | Physical Intel | Physical macOS 14+ clean install, discovery/offline accounting, lifecycle, silent Keychain and installed Intel A-to-B update; actual upload requires the tester's own consent |
 | Stable artifacts | New common exact annotated `v0.1.18` source, reviewed release text, build `1026`, ARM previous-stable continuity and explicit Intel first-stable bootstrap; repeat final-byte native gates |
-| Hosted model dashboard | Read-only migration/schema confirmation for existing 0041 through applicable current 0044, separately authorized pending migrations/deployment, scheduled warming and authenticated rendered model evidence; health alone is insufficient |
+| Hosted model dashboard | Verified historical 0041 ledger/schema followed by reconciled 0042-0045; separately authorized pending migrations/deployment, scheduled warming and authenticated rendered model evidence; health alone is insufficient |
 | Public release preparation | Authorized branch/tag push and exact-head CI/merge; native/checksum manifest with truthful null attestation fields, frozen signed appcasts, exact asset set and freshly verified draft downloads |
 
-The model expansion introduces no additional D1 migration beyond the existing
-schema through 0044. Its model history depends on 0041; missing migration can
+The model expansion introduces no additional SQL beyond the restored historical
+0041 and reconciled schema through 0045. Its model history depends on the new
+composition tables in 0042; a missing migration can
 degrade to empty/stale history. The Intel authenticated appcast guard must be
 deployed before an Intel feed is published. Optional v1.1 consent activation,
 public Intel support and Intel Homebrew remain separate decisions/evidence.

@@ -253,11 +253,21 @@ function openImmutableLocalUnifiedIndex(indexFile) {
   });
 }
 
+const COLD_REFRESH_V13_PREDECESSOR_PARSERS = Object.freeze([
+  "unified-rollout-typed-v10",
+  "unified-rollout-typed-v11",
+  "unified-rollout-typed-v12",
+]);
+
 function publishedParserUpgradeNeedsColdRefresh(database, compatibility, schemaVersion) {
   // This is a deadline decision, not permission to read or publish facts. The
-  // worker still validates the complete index. Admit only the observed v10 ->
-  // v11 transition; unknown/future parser stamps never earn a longer deadline.
-  if (LOCAL_UNIFIED_INDEX_PARSER_VERSION !== "unified-rollout-typed-v11"
+  // worker still validates the complete index. Only the reviewed v10/v11/v12
+  // predecessors can receive the v13 rescan window. Their physical schema and
+  // immutable source identity remain compatible; v12 nullable counters and
+  // v13 ordinal-bearing compaction headers require reparsing present sources.
+  // Keep the target pinned too: a future parser needs an explicit review and
+  // must not silently inherit this longer deadline for every mismatch.
+  if (LOCAL_UNIFIED_INDEX_PARSER_VERSION !== "unified-rollout-typed-v13"
       || schemaVersion !== LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
       || !compatibility.metadataPresent
       || compatibility.formatUserVersion !== LOCAL_UNIFIED_INDEX_USER_VERSION
@@ -299,7 +309,7 @@ function publishedParserUpgradeNeedsColdRefresh(database, compatibility, schemaV
           AND g.tool_provenance_complete = 0)
       )
   `).get(generationId);
-  return generation?.parser_version === "unified-rollout-typed-v10"
+  return COLD_REFRESH_V13_PREDECESSOR_PARSERS.includes(generation?.parser_version)
     && generation.parser_contract_version === TELEMETRY_SCHEMA_VERSION
     && generation.contract_version === TELEMETRY_SCHEMA_VERSION
     && Number.isSafeInteger(generation.completed_at_ms)

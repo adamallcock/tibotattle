@@ -18,11 +18,11 @@ using this page for a later release or operational decision.
 
 | Boundary | Verified state |
 |---|---|
-| Documentation/source review | Combined Astra/Intel candidate `0.1.18`, frozen source `4ea16586d83c72d0a4af506b102a267251f45a2b`, based on requested `9e1c3333`; [publication preparation](./plans/2026-09-04-release-0-1-18-publication-preparation.md) fixes native rehearsal target/receipt binding and passes 110/110 macOS tests, the full Worker gate and production deployment dry run. App/R7 workload and all ten validated receipts are unchanged from the earlier [paginated qualification](./reviews/2026-09-04-paginated-export-qualification.md), which retains its exact root/build evidence. No stable tag or publication |
+| Documentation/source review | Combined Astra/Intel `0.1.18` RC3 preparation follows frozen RC2 source `4ea16586d83c72d0a4af506b102a267251f45a2b`, based on requested `9e1c3333`. The [installed-upgrade review](./reviews/2026-09-04-installed-upgrade-readiness.md) records a corrected supported-parser upgrade deadline, 305/305 local tests and 110/110 native tests. RC3 `1025.2` is allocated, not yet a signed artifact; stable remains `1026`. App/R7 workload and all ten validated receipts remain unchanged. No stable tag or publication |
 | Combined signed RC2 | ARM and Intel `0.1.18` build `1025.1` dogfood DMGs from common source `4ea16586` and a new local annotated tag; [exact receipt](./receipts/2026-09-04-macos-combined-rc2-signed-candidates.md). Both signed/notarized/stapled with independent exact-byte and same-architecture replacement checks; not installed-upgrade, manual lifecycle or physical Intel proof |
 | Earlier Intel tester artifact | Preserved signed/notarized `0.1.18` build `1025` dogfood DMG from source `18c7065b`; [historical receipt](./receipts/2026-09-03-macos-intel-signed-candidate.md). Predates combined Astra changes; remains immutable rollback/test evidence, not physically Intel-qualified |
-| Installed internal dogfood | Version `0.1.17`, RC9 build `1023.7`, source `394c8a03`; owner accepted the inspected apps on 2026-09-03. Plist version/build/minimum-OS were independently rechecked; this does not qualify every historical credential or clean-profile case |
-| Public service | Health/readiness HTTP 200, enrollment and upload processing enabled; deployment source `b4c8f103bf697fb530434e6de196f2c187645661`, observed 2026-09-04 03:57 UTC (2026-09-03 locally) |
+| Installed app | Direct 2026-09-04 inspection supersedes the older RC9 observation: ARM stable `0.1.17` / `1024`, source `aa660b24`, tag `v0.1.17`. The app was gracefully stopped and its exact bundle, full state and native preferences preserved and checked. No replacement yet; the isolated-copy upgrade rehearsal is not installed qualification |
+| Public service | Health/readiness HTTP 200, enrollment and upload processing enabled; deployment source `b4c8f103bf697fb530434e6de196f2c187645661`, observed 2026-09-04 03:57 UTC (2026-09-03 locally). Later read-only ledger/schema checks found a divergent historical migration 0041 and absent new composition tables. Hosted release remains blocked; no remote schema changes were made |
 | Public updater | Stable `0.1.16`; read-only feed check recorded 2026-09-03 in the release plan |
 | Published release | Immutable GitHub `v0.1.17`, published 2026-09-03 at 19:47:43 UTC; ARM DMG, appcast, manifest, checksums and verification guide; exact source tag commit `aa660b24a66196155ba59267ab832cc4ef6e1c7d` |
 
@@ -52,7 +52,9 @@ independent live-service, installed-artifact, release, or updater observations
 below; deployment and release remain separate gates.
 
 [PR #89](https://github.com/adamallcock/tibotattle/pull/89) adds a hosted
-admin-only per-model allowance series and **By model** view. Migration 0041,
+admin-only per-model allowance series and **By model** view. Its original
+migration 0041 is now the distinct forward migration 0042 under the
+[verified lineage reconciliation](./reviews/2026-09-04-hosted-migration-lineage-reconciliation.md).
 Worker deployment, warming, and real cohort evidence remain separate; desktop
 installation does not activate it.
 
@@ -60,7 +62,7 @@ installation does not activate it.
 attribution plus a staged telemetry v1.1 transport and device-continuity repair.
 Local estimates, history, ranges, forecasts, and share cards use one compatible
 selected population; missing or conflicting identity remains unavailable.
-Migrations 0042-0044, stronger-format hosted activation, and new explicit
+Current migrations 0043-0045 (originally 0042-0044), stronger-format hosted activation, and new explicit
 consent are not supplied by installing the desktop app.
 
 [PR #95](https://github.com/adamallcock/tibotattle/pull/95) makes compatible
@@ -87,7 +89,18 @@ enabled v1.0 uploads and deployment source
 `b4c8f103bf697fb530434e6de196f2c187645661`. This supersedes the older identity
 observation, but does not independently qualify PR #89/94 migrations, device
 repair or optional v1.1 grants. Those routes and migrations require their own
-evidence; no migration-ledger inspection or live account upload was performed.
+evidence. A later read-only inspection found 41 applied primary migrations,
+ending in historical `0041_community_model_composition_cache.sql`, not the
+different composition migration inherited by the candidate. Schema metadata
+confirms the historical column/table and absence of the new composition tables
+and withdrawal trigger. Both deletion-ledger migrations are applied. No
+configured staging database appears in the current account's database-name
+inventory. This is a forward-sequence repair requirement, not permission to
+rewrite the ledger or apply migrations; no live account upload was performed.
+The local reconciliation restores all 41 historical SQL files byte-identically
+to the deployed source and moves only the four unapplied successors to unique
+0042-0045 names, without SQL edits. Alternative applied histories still fail
+the unchanged ordered-prefix deployment gate.
 
 ## Published macOS release and updater
 
@@ -124,8 +137,10 @@ The complete qualification matrix and rules for changing these claims are in
   source/payload and require explicit human-observed native hardware/OS; they
   cannot turn synthetic tests into physical qualification. Local checks and
   [combined RC2 signing/notarization](./receipts/2026-09-04-macos-combined-rc2-signed-candidates.md)
-  pass, but installed lifecycle, physical Intel, stable finalization and hosted
-  activation remain open. The 0.1.17-only manual-matrix deferral does not carry
+  pass on their named source. A subsequently discovered parser-upgrade deadline
+  regression now requires fresh RC3 `1025.2` bytes. Installed lifecycle,
+  physical Intel, stable finalization and hosted activation remain open.
+  The 0.1.17-only manual-matrix deferral does not carry
   forward. No publication or update activation occurred.
 
 - The [Intel implementation plan](./plans/2026-09-03-macos-intel-release.md)
@@ -144,7 +159,7 @@ The complete qualification matrix and rules for changing these claims are in
   now passes focused tests; complete R7 regeneration and both runtime freshness
   checks pass. Both optimized development artifacts, twelve isolated smokes,
   the full root suite and all 108 retained macOS tests pass. RC2
-  allocation is now `1025.1`, stable remains `1026`, and both newly signed
+  allocation was `1025.1`, stable remains `1026`, and both signed
   combined candidates pass exact-artifact and replacement checks in the
   [RC2 receipt](./receipts/2026-09-04-macos-combined-rc2-signed-candidates.md). Physical Intel,
   actual consented upload and installed update qualification remain separate

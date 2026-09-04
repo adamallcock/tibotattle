@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
@@ -51,9 +52,9 @@ test("checked-in staging configuration is closed and intentionally unprovisioned
 
 test("migration inventory is exact and rejects missing or unreviewed files", () => {
   assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-3), [
-    "0043_attribution_transport_staging.sql",
-    "0044_attribution_domain_activation.sql",
-    "0045_accountless_enrollment_ledger.sql",
+    "0044_attribution_transport_staging.sql",
+    "0045_attribution_domain_activation.sql",
+    "0046_accountless_enrollment_ledger.sql",
   ]);
   const inventory = structuredClone(EXPECTED_STAGING_MIGRATIONS);
   assert.deepEqual(validateStagingMigrationInventory(inventory), {
@@ -86,7 +87,122 @@ test("migration inventory is exact and rejects missing or unreviewed files", () 
   );
 });
 
-test("attribution metadata probe checks every new guard, view, index and persisted column", () => {
+test("reconciled migration lineage preserves historical and renumbered SQL bytes", () => {
+  // Historical 0041 is the deployed 4519b349 migration. The other digests pin
+  // the unchanged SQL from the pre-reconciliation release source a9220795.
+  // The unpublished accountless ledger follows that lineage with its original
+  // integration bytes, renumbered from 0045 to 0046 to avoid a collision.
+  const expectedDigests = {
+    "0041_community_model_composition_cache.sql": "52ff5ff182023bd504c5d584e4c96494c04db7f29a70661dd5713c4a8770d12d",
+    "0042_community_model_composition.sql": "c61629ef87facfc8f8d8e16fc5cdc1d4adaf788df7bcc9ee760b60f86e577330",
+    "0043_analytical_input_fencing.sql": "4c36ed9342365adceb0dc5c4d576a93ffd557b9bc39dfd2a7c9239c5c9b0ca9a",
+    "0044_attribution_transport_staging.sql": "6d79465243432097aebc20f50718f891e01de234a3b264a984816c54b338e713",
+    "0045_attribution_domain_activation.sql": "0e4bd66cc391f64b8b1a3d1533751cec461882282160cc283330bfba22ff9690",
+    "0046_accountless_enrollment_ledger.sql": "aa8b6542a3d5fcadad24a5c7be59f2ed0b727e491c454705f37b9d00502a4b6c",
+  };
+  const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
+  assert.equal(names.length, 46);
+  assert.deepEqual(names.slice(-6), Object.keys(expectedDigests));
+  assert.deepEqual(names.map((name) => name.slice(0, 4)),
+    Array.from({ length: 46 }, (_, index) => String(index + 1).padStart(4, "0")));
+  // Unique numeric prefixes make staging, production and Wrangler ordering
+  // agree; never admit two differently authored migrations numbered 0041.
+  assert.deepEqual([...names].sort(), [...names].sort((a, b) => a.localeCompare(b, "en")));
+  for (const [name, expected] of Object.entries(expectedDigests)) {
+    const bytes = readFileSync(join(workerDirectory, "migrations", name));
+    assert.equal(createHash("sha256").update(bytes).digest("hex"), expected, name);
+  }
+});
+
+test("historical production prefix upgrades forward without losing source rows or legacy schema", () => {
+  const database = new DatabaseSync(":memory:");
+  const apply = (name) => database.exec(readFileSync(join(workerDirectory, "migrations", name), "utf8"));
+  const rows = (sql) => database.prepare(sql).all().map((row) => ({ ...row }));
+  try {
+    const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
+    for (const name of names.slice(0, 41)) apply(name);
+    assert.equal(names[40], "0041_community_model_composition_cache.sql");
+    assert.equal(database.prepare("SELECT count(*) AS count FROM sqlite_master WHERE name = 'community_model_composition_cache'").get().count, 0);
+    assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
+    database.exec(`
+      INSERT INTO participants (id, access_token_id, access_token_hash,
+        recovery_token_id, recovery_token_hash, consent_version, consented_at, created_at)
+      VALUES ('fixture-participant', 'fixture-access', X'01', 'fixture-recovery', X'02',
+        'fixture-consent', '2026-08-29T00:00:00.000Z', '2026-08-29T00:00:00.000Z');
+      INSERT INTO web_sessions (id, participant_id, secret_hash, csrf_hash,
+        issued_at, expires_at, last_used_at)
+      VALUES ('fixture-session', 'fixture-participant', zeroblob(32), zeroblob(32),
+        '2026-08-29T00:00:00.000Z', strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+1 day'),
+        '2026-08-29T00:00:00.000Z');
+      INSERT INTO upload_authorizations (id, participant_id, issued_by_session_id,
+        secret_hash, envelope_digest, body_bytes, content_type, state,
+        issued_at, expires_at, consume_lease_expires_at)
+      VALUES ('fixture-upload', 'fixture-participant', 'fixture-session', zeroblob(32),
+        lower(hex(zeroblob(32))), 1, 'application/json', 'consuming',
+        '2026-08-29T00:00:00.000Z', strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+1 day'),
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+1 day'));
+      INSERT INTO telemetry_contributions (id, participant_id, plaintext_digest,
+        envelope_digest, r2_key, schema_version, range_start, range_end,
+        client_platform, provider_policy_epoch, priced_event_coverage_percent,
+        unknown_model_event_count, unknown_billable_units, price_basis,
+        declared_record_count, created_at, upload_authorization_id)
+      VALUES ('fixture-contribution', 'fixture-participant', 'fixture-plaintext',
+        'fixture-envelope', 'fixture-quarantine-key', 'telemetry-contribution-v0.1',
+        '2026-08-29T00:00:00.000Z', '2026-08-29T01:00:00.000Z', 'macos',
+        'fixture-policy', 100, 0, 0, 'fixture-basis', 1, '2026-08-29T01:00:00.000Z', 'fixture-upload');
+      UPDATE admin_community_allowance_preview_refresh_state
+        SET last_attempted_at = '2026-08-29T02:00:00.000Z' WHERE singleton = 1;
+      INSERT INTO community_allowance_fit_cache
+        (participant_id, cache_key, fits_json, computed_at, model_observations_json)
+      VALUES ('fixture-participant', 'fixture-old-fit', '[]', '2026-08-29T02:00:00.000Z', '[]');
+    `);
+    const participantBefore = rows("SELECT * FROM participants");
+    const contributionBefore = rows("SELECT * FROM telemetry_contributions");
+    const refreshBefore = rows("SELECT * FROM admin_community_allowance_preview_refresh_state");
+    const legacyColumnBefore = rows("SELECT * FROM pragma_table_info('community_allowance_fit_cache') WHERE name = 'model_observations_json'");
+    apply(names[41]);
+    database.exec(`
+      INSERT INTO community_model_composition_cache
+        (participant_id, cache_key, composition_json, computed_at)
+      VALUES ('fixture-participant', 'fixture-old-composition', '{}', '2026-08-29T02:00:00.000Z');
+      INSERT INTO community_model_composition_days (day, payload_json, computed_at)
+      VALUES ('2026-08-29', '{}', '2026-08-29T02:00:00.000Z');
+    `);
+    for (const name of names.slice(42)) apply(name);
+    assert.deepEqual(rows("SELECT * FROM participants"), participantBefore);
+    assert.deepEqual(rows("SELECT * FROM telemetry_contributions"), contributionBefore);
+    assert.deepEqual(rows("SELECT * FROM admin_community_allowance_preview_refresh_state"), refreshBefore);
+    assert.deepEqual(rows("SELECT * FROM pragma_table_info('community_allowance_fit_cache') WHERE name = 'model_observations_json'"), legacyColumnBefore);
+    // The existing fencing SQL deliberately invalidates old-method derived
+    // fits, not accepted source history or the historical refresh singleton.
+    assert.equal(database.prepare("SELECT count(*) AS count FROM community_allowance_fit_cache").get().count, 0);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM community_model_composition_cache").get().count, 0);
+    assert.deepEqual(rows("SELECT day, payload_json, attribution_method_version, source_mutation_epoch FROM community_model_composition_days"), [{
+      day: "2026-08-29", payload_json: "{}", attribution_method_version: null, source_mutation_epoch: null,
+    }]);
+    assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    assert.deepEqual(rows("SELECT minimum_rank, revision FROM telemetry_transport_participant_floors"), [{ minimum_rank: 1, revision: 0 }]);
+    assert.equal(database.prepare("SELECT lifecycle FROM telemetry_transport_formats WHERE format_rank = 11").get().lifecycle, "staged");
+    assert.equal(database.prepare("SELECT count(*) AS count FROM telemetry_v11_device_consents").get().count, 0);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM telemetry_v11_domain_heads").get().count, 0);
+    // The composition withdrawal trigger predates the attribution probe's
+    // object inventory and must remain independently effective after upgrade.
+    assert.equal(database.prepare("SELECT count(*) AS count FROM sqlite_master WHERE type = 'trigger' AND name = 'community_model_composition_day_withdrawal'").get().count, 1);
+    database.exec("UPDATE participants SET state = 'deleting' WHERE id = 'fixture-participant'");
+    assert.equal(database.prepare("SELECT count(*) AS count FROM community_model_composition_days").get().count, 0);
+    assert.equal(database.prepare("SELECT revision FROM community_analytical_input_versions WHERE participant_id = 'fixture-participant'").get().revision, 2);
+    database.exec(`INSERT INTO community_model_composition_cache
+      (participant_id, cache_key, composition_json, computed_at)
+      VALUES ('fixture-participant', 'fixture-current-composition', '{}', '2026-08-29T03:00:00.000Z');
+      DELETE FROM participants WHERE id = 'fixture-participant';`);
+    assert.equal(database.prepare("SELECT count(*) AS count FROM community_model_composition_cache").get().count, 0);
+    assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
+  } finally {
+    database.close();
+  }
+});
+
+test("fresh reconciled schema and attribution metadata probe cover every new guard, view, index and persisted column", () => {
   const database = new DatabaseSync(":memory:");
   try {
     const objectNames = () => database.prepare(
@@ -95,8 +211,8 @@ test("attribution metadata probe checks every new guard, view, index and persist
     let oldObjects;
     let accountlessObjectsBefore;
     for (const name of EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB) {
-      if (name.startsWith("0042_")) oldObjects = new Set(objectNames());
-      if (name.startsWith("0045_")) {
+      if (name === "0043_analytical_input_fencing.sql") oldObjects = new Set(objectNames());
+      if (name === "0046_accountless_enrollment_ledger.sql") {
         accountlessObjectsBefore = new Set(objectNames());
       }
       database.exec(readFileSync(join(workerDirectory, "migrations", name), "utf8"));
@@ -117,6 +233,8 @@ test("attribution metadata probe checks every new guard, view, index and persist
       attribution_objects: 1,
       attribution_columns: 1,
     });
+    assert.deepEqual(database.prepare("SELECT last_attempted_at FROM admin_community_allowance_preview_refresh_state").get().last_attempted_at, "1970-01-01T00:00:00.000Z");
+    assert.equal(database.prepare("SELECT count(*) AS count FROM pragma_table_info('community_allowance_fit_cache') WHERE name = 'model_observations_json'").get().count, 1);
     // A migration label cannot substitute for a lost integrity guard. Every
     // reviewed non-table object must independently make the probe fail closed.
     for (const [type, name] of ATTRIBUTION_SCHEMA_OBJECTS) {
@@ -191,6 +309,35 @@ test("staging requires pending attribution migrations before its schema probe", 
   assert.equal(result.checks.attributionSchemaCurrent, false);
   assert.equal(calls.some((args) => args.includes(ATTRIBUTION_SCHEMA_PROBE_SQL)), false);
   assert.equal(calls.some((args) => args.includes("apply")), false);
+});
+
+test("staging treats the historical prefix as pending but rejects an alternate applied 0041", () => {
+  const config = provisionedConfig();
+  const historical = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, 41);
+  for (const [names, expectedBlocker] of [
+    [historical, "REMOTE_MIGRATIONS_PENDING"],
+    [[...historical.slice(0, 40), "0041_community_model_composition.sql"], "REMOTE_MIGRATION_INVENTORY_DRIFT"],
+    [[...historical, "0041_community_model_composition.sql"], "REMOTE_MIGRATION_INVENTORY_DRIFT"],
+  ]) {
+    const calls = [];
+    const baseSpawn = successSpawn(config, calls);
+    const result = probeStagingLive({
+      config, wrangler: "/fake/wrangler", workerDirectory,
+      spawn: (command, args, options) => {
+        if (args[2] === "USAGE_MONITOR_DB" && args.some((arg) => arg.includes("FROM d1_migrations"))) {
+          calls.push(args);
+          return { status: 0, stdout: JSON.stringify([{ results: names.map((name) => ({ name })) }]), stderr: "" };
+        }
+        return baseSpawn(command, args, options);
+      },
+    });
+    assert.equal(result.state, "blocked");
+    assert.equal(result.blockers.includes(expectedBlocker), true, expectedBlocker);
+    assert.equal(result.checks.remoteMigrationInventoryCurrent, false);
+    assert.equal(result.collectionAuthorized, false);
+    assert.equal(calls.some((args) => args.includes("apply")), false);
+    assert.equal(calls.some((args) => args.includes(ATTRIBUTION_SCHEMA_PROBE_SQL)), false);
+  }
 });
 
 test("staging readiness rejects production resources and custom-domain targets", () => {

@@ -80,14 +80,34 @@ Compare the copy with the current constants in `src/local-unified-index.js`:
 
 - schema family `local-unified-index-v2`;
 - `user_version` 11;
-- parser `unified-rollout-typed-v11`; and
+- parser `unified-rollout-typed-v13`; and
 - source identity `codex-immutable-rollout-v1`.
 
-A physical schema-11 index can still need a one-time v10-to-v11 parser rescan.
-The companion grants a proven supported published transition the bounded
-four-hour cold-refresh deadline; ordinary current-parser refreshes keep five
-minutes. Missing, unknown, or inconsistent provenance must not be relabelled to
-obtain that budget.
+A physical schema-11 index can still need older-parser sources reparsed under
+v13. Still-present sources are rescanned; facts whose sources have rotated away
+retain their original parser provenance. Parser v12 preserves missing counters
+as unknown rather than zero, and v13 recognizes ordinal-bearing compaction
+headers. These interpretation changes do not change the physical schema or the
+`codex-immutable-rollout-v1` source-identity contract; never relabel retained
+facts to the new parser.
+
+The companion grants the bounded four-hour cold-refresh deadline only to the
+reviewed published v10/v11/v12-to-v13 parser transitions. The target is pinned
+to v13; a future parser must review its predecessor set explicitly. Physical
+schema, reader/writer compatibility, source identity, and telemetry contracts
+must match, and the published generation must be complete or one of the
+already supported quarantine/tool-provenance partial states. Only the current
+publication selects the budget: rotated sources' older parser rows do not
+extend an ordinary refresh. Current, unknown, malformed, future, and otherwise
+uncertain parser evidence retains the five-minute deadline.
+
+An absent index or a proven supported older physical schema also qualifies
+for the bounded four-hour cold-refresh deadline. This replaces the former
+parser-only v10-to-v11 deadline exception, not the historical physical-schema
+migration rules. Missing, unknown, or inconsistent provenance must not be
+relabelled to obtain that budget. If a rescan cannot finish inside its actual
+bound, preserve state and resolve the qualification gap instead of repeatedly
+restarting it.
 
 A current-parser index can also require a full accounting rebuild after the
 current cache fails its authoritative schema, generation, context, or reuse

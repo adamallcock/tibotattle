@@ -105,8 +105,10 @@ effort. No effective-effort carry is inferred across compaction, fork or resume.
 Actual application/eligible-mode and installed-client evidence remains a
 qualification gate, separate from catalogue recognition.
 
-The foreground companion treats a verified published v10-to-v11 parser upgrade
-as cold work even when the physical schema is already 11. That run receives the
+The foreground companion treats verified published v10/v11/v12-to-v13 parser
+upgrades as cold work even when the physical schema is already 11. The target
+and predecessor set are deliberately closed; current, unknown, malformed and
+future parser evidence cannot obtain a longer deadline. That run receives the
 same bounded four-hour deadline as an absent or supported older-schema index;
 subsequent current-parser refreshes retain the normal five-minute deadline.
 Only the published generation selects this budget. Older parser rows retained

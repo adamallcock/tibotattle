@@ -135,10 +135,10 @@ and opaque plan-era ID (or null). Quota identities represent exact occurrences;
 nullable quota measurements preserve plan-only evidence without inventing a
 reset, percentage or window duration. Conflicting evidence remains explicit.
 
-Code availability is not rollout: migration `0043` initializes v1.1 as `staged`
+Code availability is not rollout: migration `0044` initializes v1.1 as `staged`
 and v0.2 as `blocked`. Accepted lifecycle, an explicit current v1.1 consent grant,
 and the participant's persisted minimum write rank gate every upload route.
-Device renewal/re-pair cannot lower that floor. `0044` activates only complete
+Device renewal/re-pair cannot lower that floor. `0045` activates only complete
 comparison domains after proving predecessor coverage. Partial day arrivals do
 not displace old data. See [architecture](./system-architecture.md) and
 [privacy](./local-data-and-privacy.md) for semantics and lifecycle boundaries.
