@@ -1,0 +1,251 @@
+name: Linux portability development smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-portability-development-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-linux-amd64:
+    name: Native Linux x86_64 development smoke (${{ matrix.cache-mode }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        cache-mode:
+          - warm
+          - clean
+    env:
+      CI: "1"
+      USAGE_MONITOR_TEST_LANE_REPORTER: dot
+      TIBOTATTLE_QUALIFICATION_CACHE_MODE: ${{ matrix.cache-mode }}
+      TIBOTATTLE_LINUX_IMAGE: tibotattle-electron-linux-amd64:test
+    steps:
+      - name: Check out the selected revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind the exact revision and native x86_64 runner
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          expected_revision="$(printf '%s' "$EXPECTED_REVISION" | tr '[:upper:]' '[:lower:]')"
+          actual_revision="$(git rev-parse HEAD | tr '[:upper:]' '[:lower:]')"
+          if ! printf '%s' "$expected_revision" | grep -Eq '^[0-9a-f]{40}$' \
+            || [ "$actual_revision" != "$expected_revision" ]; then
+            echo "LINUX_PORTABILITY_REVISION_MISMATCH" >&2
+            exit 1
+          fi
+          if [ "$(uname -m)" != "x86_64" ] \
+            || [ "$(docker info --format '{{.Architecture}}')" != "x86_64" ]; then
+            echo "LINUX_PORTABILITY_NATIVE_AMD64_REQUIRED" >&2
+            exit 1
+          fi
+          printf 'TIBOTATTLE_QUALIFICATION_REVISION=%s\n' "$actual_revision" >> "$GITHUB_ENV"
+
+      - name: Install pinned Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Install locked contract dependencies
+        run: |
+          set -euo pipefail
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+          test "$(node --version)" = "v26.2.0"
+          test "$(corepack --version)" = "0.34.0"
+          test "$(pnpm --version)" = "11.9.0"
+          pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Test Linux smoke and workflow contracts
+        run: pnpm test:linux:foundation
+
+      - name: Prime the reviewed AMD64 image cache
+        if: ${{ matrix.cache-mode == 'warm' }}
+        run: pnpm container:electron-linux:build:amd64
+
+      - name: Rebuild the reviewed AMD64 image from the warm cache
+        if: ${{ matrix.cache-mode == 'warm' }}
+        run: pnpm container:electron-linux:build:amd64
+
+      - name: Build the reviewed AMD64 image without cache
+        if: ${{ matrix.cache-mode == 'clean' }}
+        run: node ./scripts/build-electron-linux-container.mjs --architecture amd64 --no-cache
+
+      - name: Prove native Linux AMD64 image execution
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "x86_64"
+          test "$(docker info --format '{{.Architecture}}')" = "x86_64"
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$TIBOTATTLE_LINUX_IMAGE")" = "linux/amd64"
+          runtime="$(docker run --rm --network none --platform=linux/amd64 \
+            --entrypoint node "$TIBOTATTLE_LINUX_IMAGE" \
+            --print 'process.platform + "/" + process.arch')"
+          test "$runtime" = "linux/x64"
+
+      - name: Run network-isolated Linux GUI smoke
+        run: |
+          set -euo pipefail
+          evidence_directory=".release-build/linux-portability/$TIBOTATTLE_QUALIFICATION_CACHE_MODE"
+          mkdir -p "$evidence_directory"
+          receipt_file="$evidence_directory/smoke.json"
+          pnpm --silent container:electron-linux:test:amd64 > "$receipt_file"
+          printf 'TIBOTATTLE_LINUX_SMOKE_RECEIPT=%s\n' "$receipt_file" >> "$GITHUB_ENV"
+
+      - name: Run isolated Secret Service qualification
+        run: |
+          set -euo pipefail
+          evidence_directory=".release-build/linux-portability/$TIBOTATTLE_QUALIFICATION_CACHE_MODE"
+          mkdir -p "$evidence_directory"
+          credential_receipt="$evidence_directory/credentials.json"
+          credential_status=0
+          pnpm --silent container:electron-linux:test:credentials:amd64 > "$credential_receipt" \
+            || credential_status=$?
+          if [ -n "$(docker ps --all --quiet --filter "ancestor=$TIBOTATTLE_LINUX_IMAGE")" ]; then
+            echo "LINUX_PORTABILITY_SECRET_SERVICE_CONTAINER_SURVIVED" >&2
+            exit 1
+          fi
+          if [ "$credential_status" -ne 0 ]; then
+            echo "LINUX_PORTABILITY_CREDENTIAL_QUALIFICATION_FAILED" >&2
+            exit 1
+          fi
+          printf 'TIBOTATTLE_LINUX_CREDENTIAL_RECEIPT=%s\n' "$credential_receipt" >> "$GITHUB_ENV"
+
+      - name: Validate development-only smoke evidence
+        env:
+          RECEIPT_FILE: .release-build/linux-portability/${{ matrix.cache-mode }}/smoke.json
+          CREDENTIAL_RECEIPT_FILE: .release-build/linux-portability/${{ matrix.cache-mode }}/credentials.json
+        run: |
+          set -euo pipefail
+          node --input-type=module --eval '
+            import { createHash } from "node:crypto";
+            import { dirname, join } from "node:path";
+            import { readFileSync, writeFileSync } from "node:fs";
+            const bytes = readFileSync(process.env.RECEIPT_FILE);
+            const smoke = JSON.parse(bytes.toString("utf8"));
+            const required = {
+              status: "passed",
+              rendererReloaded: true,
+              cleanQuit: true,
+              networkBoundary: "network-none",
+              networkBoundaryEvidence: "loopback-only",
+              imagePlatform: "linux/amd64",
+              runtimeArchitecture: "x64",
+              sourceRevision: process.env.TIBOTATTLE_QUALIFICATION_REVISION,
+              qualification: "development-only",
+            };
+            const smokeKeys = new Set([
+              "status",
+              "electron",
+              "dashboardOrigin",
+              "descendantCountAtReady",
+              "rendererReloaded",
+              "windowMinimizedAndRestored",
+              "cleanQuit",
+              "networkBoundary",
+              "networkBoundaryEvidence",
+              "imagePlatform",
+              "runtimeArchitecture",
+              "sourceRevision",
+              "qualification",
+              "startupRefresh",
+            ]);
+            if (Object.keys(smoke).length !== smokeKeys.size
+                || Object.keys(smoke).some((key) => !smokeKeys.has(key))
+                || typeof smoke.electron !== "string"
+                || !/^Chrome\/[0-9.]+$/.test(smoke.electron)
+                || !/^http:\/\/127\.0\.0\.1:[0-9]+$/.test(smoke.dashboardOrigin)
+                || !Number.isSafeInteger(smoke.descendantCountAtReady)
+                || smoke.descendantCountAtReady < 1
+                || typeof smoke.windowMinimizedAndRestored !== "boolean") {
+              throw new Error("LINUX_PORTABILITY_SMOKE_RECEIPT_SHAPE_INVALID");
+            }
+            for (const [key, expected] of Object.entries(required)) {
+              if (smoke[key] !== expected) throw new Error("LINUX_PORTABILITY_SMOKE_RECEIPT_INVALID");
+            }
+            const degradedCodes = new Set([
+              "codex_rollout_compression_unsupported",
+              "codex_rollout_filename_identity_mismatch",
+              "codex_rollout_generation_ambiguous",
+              "codex_rollout_lineage_invalid",
+              "codex_rollout_content_invalid",
+              "codex_rollout_tail_incomplete",
+            ]);
+            if (!smoke.startupRefresh
+                || Object.keys(smoke.startupRefresh).length !== 2
+                || !Object.hasOwn(smoke.startupRefresh, "terminalStatus")
+                || !Object.hasOwn(smoke.startupRefresh, "degradedFailureCode")
+                || !["succeeded", "degraded"].includes(smoke.startupRefresh.terminalStatus)
+                || (smoke.startupRefresh.terminalStatus === "succeeded"
+                  && smoke.startupRefresh.degradedFailureCode !== null)
+                || (smoke.startupRefresh.terminalStatus === "degraded"
+                  && !degradedCodes.has(smoke.startupRefresh.degradedFailureCode))) {
+              throw new Error("LINUX_PORTABILITY_SMOKE_REFRESH_INVALID");
+            }
+            const credentialBytes = readFileSync(process.env.CREDENTIAL_RECEIPT_FILE);
+            const credentials = JSON.parse(credentialBytes.toString("utf8"));
+            const credentialRequired = {
+              schemaVersion: "linux-credential-qualification-v1",
+              status: "passed",
+              scope: "development_only",
+              platform: "linux",
+              architecture: "x64",
+              subject: "pinned_native_binding",
+              capabilities: 4,
+              lifecycle: "round_trip_absence_confirmed",
+              cleanup: "confirmed",
+              leaseCrossProcessSafe: false,
+              crashRecoveryComplete: false,
+            };
+            if (Object.keys(credentials).length !== Object.keys(credentialRequired).length
+                || Object.entries(credentialRequired).some(([key, value]) => credentials[key] !== value)) {
+              throw new Error("LINUX_PORTABILITY_CREDENTIAL_RECEIPT_INVALID");
+            }
+            if (!/^[0-9a-f]{40}$/.test(process.env.TIBOTATTLE_QUALIFICATION_REVISION)) {
+              throw new Error("LINUX_PORTABILITY_REVISION_INVALID");
+            }
+            if (!["warm", "clean"].includes(process.env.TIBOTATTLE_QUALIFICATION_CACHE_MODE)) {
+              throw new Error("LINUX_PORTABILITY_CACHE_MODE_INVALID");
+            }
+            const evidence = {
+              schemaVersion: "tibotattle-linux-portability-development-v1",
+              qualification: "development-only",
+              sourceRevision: process.env.TIBOTATTLE_QUALIFICATION_REVISION,
+              cacheMode: process.env.TIBOTATTLE_QUALIFICATION_CACHE_MODE,
+              runner: "ubuntu-24.04",
+              execution: "native-x86_64",
+              containerPlatform: "linux/amd64",
+              smokeReceiptSha256: createHash("sha256").update(bytes).digest("hex"),
+              credentialReceiptSha256: createHash("sha256").update(credentialBytes).digest("hex"),
+              smoke,
+              credentials,
+            };
+            writeFileSync(
+              join(dirname(process.env.RECEIPT_FILE), "development-evidence.json"),
+              `${JSON.stringify(evidence, null, 2)}\n`,
+              { mode: 0o600 },
+            );
+          '
+
+      - name: Upload development-only Linux evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-amd64-development-${{ matrix.cache-mode }}-${{ github.sha }}
+          path: .release-build/linux-portability/${{ matrix.cache-mode }}/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
