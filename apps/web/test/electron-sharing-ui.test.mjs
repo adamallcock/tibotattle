@@ -88,6 +88,10 @@ test("Electron sharing UI uses the accountless bridge and visible receipt gate",
   assert.match(appSource, /setSharingEnabled\(enabled\)/u);
   assert.match(appSource, /sharingNoticePresented\(index\)/u);
   assert.match(appSource, /document\.visibilityState === "visible"/u);
+  assert.match(appSource, /getBoundingClientRect\(\)/u);
+  assert.match(appSource, /innerWidth/u);
+  assert.match(appSource, /listen\(globalThis\.window, "scroll", retry\)/u);
+  assert.match(appSource, /listen\(globalThis\.window, "resize", retry\)/u);
   assert.match(appSource, /electronSharingNoticeReceiptIndex = index/u);
   assert.match(appSource, /preference\.noticeCount === receiptIndex/u);
   assert.match(indexHtml, /id="electron-sharing-notice"/u);
@@ -110,7 +114,7 @@ test("a successful visible notice receipt keeps its current banner actionable", 
     "scheduleElectronSharingNoticeAck",
     "renderElectronSharingNotice",
   ].map((name) => extractFunction(source, name));
-  const factory = new Function("bridge", "initialPreference", "initialVisibility", `
+  const factory = new Function("bridge", "initialPreference", "initialVisibility", "initialRect", `
     const ELECTRON_SHARING_API_VERSION = "v1";
     const ELECTRON_SHARING_BASES = new Set([
       "default_on", "default_off", "migration_default_on", "user_choice", "legacy_preserved",
@@ -123,11 +127,21 @@ test("a successful visible notice receipt keeps its current banner actionable", 
     const documentListeners = new Map();
     const windowListeners = new Map();
     const elements = new Map();
+    const rectangle = initialRect ?? {
+      left: 0,
+      top: 0,
+      right: 100,
+      bottom: 40,
+      width: 100,
+      height: 40,
+    };
     const makeElement = () => ({
       hidden: true,
       disabled: false,
+      isConnected: true,
       dataset: {},
       textContent: "",
+      getBoundingClientRect() { return { ...rectangle }; },
       removeAttribute() {},
       classList: { toggle() {} },
     });
@@ -156,6 +170,8 @@ test("a successful visible notice receipt keeps its current banner actionable", 
     };
     const window = {
       tibotattleDesktop: bridge,
+      innerWidth: 100,
+      innerHeight: 100,
       requestAnimationFrame(callback) { frames.push(callback); },
       addEventListener(type, listener) {
         const values = windowListeners.get(type) ?? [];
@@ -196,6 +212,13 @@ test("a successful visible notice receipt keeps its current banner actionable", 
         document.visibilityState = "visible";
         for (const listener of documentListeners.get("visibilitychange") ?? []) listener();
       },
+      setRect(nextRect) {
+        Object.assign(rectangle, nextRect);
+      },
+      emit(type) {
+        for (const listener of documentListeners.get(type) ?? []) listener();
+        for (const listener of windowListeners.get(type) ?? []) listener();
+      },
     };
   `);
   const initial = validProjection();
@@ -226,4 +249,157 @@ test("a successful visible notice receipt keeps its current banner actionable", 
   assert.equal(harness.preference().noticeCount, 1);
   assert.equal(harness.notice.hidden, false);
   assert.equal(harness.notice.dataset.noticeIndex, "1");
+});
+
+test("offscreen or zero-area notices wait for a visible scroll or resize", async () => {
+  const source = await readFile(APP_SOURCE_URL, "utf8");
+  const functions = [
+    "validSharingTimestamp",
+    "normalizeElectronSharingPreference",
+    "electronSharingBridge",
+    "electronSharingTransportMessageKey",
+    "clearElectronSharingNoticeAckSchedule",
+    "electronSharingSurfaceIsVisible",
+    "scheduleElectronSharingNoticeAck",
+    "renderElectronSharingNotice",
+  ].map((name) => extractFunction(source, name));
+  const factory = new Function("bridge", "initialPreference", "initialVisibility", "initialRect", `
+    const ELECTRON_SHARING_API_VERSION = "v1";
+    const ELECTRON_SHARING_BASES = new Set([
+      "default_on", "default_off", "migration_default_on", "user_choice", "legacy_preserved",
+    ]);
+    const ELECTRON_SHARING_STATES = new Set([
+      "pending_notices", "enabled", "disabled", "legacy_preserved",
+    ]);
+    const ELECTRON_SHARING_TRANSPORT_STATUSES = new Set(["unavailable", "off"]);
+    const frames = [];
+    const documentListeners = new Map();
+    const windowListeners = new Map();
+    const elements = new Map();
+    const rectangle = initialRect ?? {
+      left: 0,
+      top: 0,
+      right: 100,
+      bottom: 40,
+      width: 100,
+      height: 40,
+    };
+    const makeElement = () => ({
+      hidden: true,
+      disabled: false,
+      isConnected: true,
+      dataset: {},
+      textContent: "",
+      getBoundingClientRect() { return { ...rectangle }; },
+      removeAttribute() {},
+      classList: { toggle() {} },
+    });
+    const selectors = [
+      "#electron-sharing-notice",
+      "#electron-sharing-notice-copy",
+      "#electron-sharing-notice-earliest",
+      "#electron-sharing-notice-transport",
+      "#electron-sharing-share-now",
+      "#electron-sharing-keep-off",
+      "#electron-sharing-notice-status",
+    ];
+    for (const selector of selectors) elements.set(selector, makeElement());
+    const $ = (selector) => elements.get(selector) ?? null;
+    const document = {
+      visibilityState: initialVisibility,
+      documentElement: { dataset: { localDashboardReady: "true" } },
+      addEventListener(type, listener) {
+        const values = documentListeners.get(type) ?? [];
+        values.push(listener);
+        documentListeners.set(type, values);
+      },
+      removeEventListener(type, listener) {
+        documentListeners.set(type, (documentListeners.get(type) ?? []).filter((value) => value !== listener));
+      },
+    };
+    const window = {
+      tibotattleDesktop: bridge,
+      innerWidth: 100,
+      innerHeight: 100,
+      requestAnimationFrame(callback) { frames.push(callback); },
+      addEventListener(type, listener) {
+        const values = windowListeners.get(type) ?? [];
+        values.push(listener);
+        windowListeners.set(type, values);
+      },
+      removeEventListener(type, listener) {
+        windowListeners.set(type, (windowListeners.get(type) ?? []).filter((value) => value !== listener));
+      },
+    };
+    const globalThis = { window, setTimeout(callback) { frames.push(callback); } };
+    let electronSharingPreference = initialPreference;
+    let electronSharingBusy = false;
+    const electronSharingNoticeAcked = new Set();
+    let electronSharingNoticeReceiptIndex = null;
+    let electronSharingNoticeAckScheduled = null;
+    let electronSharingNoticeAckCleanup = null;
+    let electronSharingNoticeAckError = false;
+    const dashboard = { marker: "synthetic" };
+    const formatLocal = (value) => value.slice(0, 10);
+    const setLocalizedText = (element, key, values = {}) => {
+      if (element) element.textContent = key + JSON.stringify(values);
+    };
+    ${functions.join("\n")}
+    return {
+      renderElectronSharingNotice,
+      notice: $("#electron-sharing-notice"),
+      async drainFrames() {
+        while (frames.length > 0) {
+          const frame = frames.shift();
+          await frame();
+          await Promise.resolve();
+        }
+      },
+      setRect(nextRect) {
+        Object.assign(rectangle, nextRect);
+      },
+      emit(type) {
+        for (const listener of documentListeners.get(type) ?? []) listener();
+        for (const listener of windowListeners.get(type) ?? []) listener();
+      },
+    };
+  `);
+  const initial = validProjection();
+  const calls = [];
+  const bridge = {
+    version: "v1",
+    getSharingPreference: async () => initial,
+    setSharingEnabled: async () => initial,
+    sharingNoticePresented: async (index) => {
+      calls.push(index);
+      return validProjection({
+        noticeCount: 1,
+        nextNoticeIndex: 2,
+        noticeDue: false,
+        nextNoticeAt: "2026-09-07T00:00:00.000Z",
+      });
+    },
+  };
+  const harness = factory(bridge, initial, "visible", {
+    left: 0,
+    top: 120,
+    right: 100,
+    bottom: 160,
+    width: 100,
+    height: 40,
+  });
+  harness.renderElectronSharingNotice();
+  await harness.drainFrames();
+  assert.deepEqual(calls, [], "an offscreen banner does not count as displayed");
+  harness.setRect({ left: 0, top: 0, right: 0, bottom: 40, width: 0, height: 40 });
+  harness.emit("resize");
+  await harness.drainFrames();
+  assert.deepEqual(calls, [], "a zero-area banner does not count as displayed");
+  harness.setRect({ left: 0, top: 0, right: 100, bottom: 40, width: 100, height: 40 });
+  harness.emit("scroll");
+  await harness.drainFrames();
+  assert.deepEqual(calls, [1], "scrolling the banner into view permits one receipt");
+  harness.emit("scroll");
+  await harness.drainFrames();
+  assert.deepEqual(calls, [1], "a retained banner cannot be receipted twice");
 });

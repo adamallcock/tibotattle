@@ -1083,7 +1083,26 @@ function electronSharingSurfaceIsVisible() {
       return false;
     }
   }
-  return true;
+  if (typeof notice.getBoundingClientRect !== "function") return false;
+  const rectangle = notice.getBoundingClientRect();
+  const viewportWidth = Number(globalThis.window?.innerWidth);
+  const viewportHeight = Number(globalThis.window?.innerHeight);
+  const left = Number(rectangle?.left);
+  const right = Number(rectangle?.right);
+  const top = Number(rectangle?.top);
+  const bottom = Number(rectangle?.bottom);
+  const width = Number(rectangle?.width ?? right - left);
+  const height = Number(rectangle?.height ?? bottom - top);
+  if (![viewportWidth, viewportHeight, left, right, top, bottom, width, height]
+    .every(Number.isFinite)
+    || viewportWidth <= 0 || viewportHeight <= 0 || width <= 0 || height <= 0) {
+    return false;
+  }
+  const visibleWidth = Math.min(right, viewportWidth) - Math.max(left, 0);
+  const visibleHeight = Math.min(bottom, viewportHeight) - Math.max(top, 0);
+  const requiredWidth = Math.min(width, viewportWidth) / 2;
+  const requiredHeight = Math.min(height, viewportHeight) / 2;
+  return visibleWidth >= requiredWidth && visibleHeight >= requiredHeight;
 }
 
 function scheduleElectronSharingNoticeAck(index) {
@@ -1167,6 +1186,9 @@ function scheduleElectronSharingNoticeAck(index) {
   listen(globalThis.window, "focus", retry);
   listen(globalThis.window, "hashchange", retry);
   listen(globalThis.window, "popstate", retry);
+  listen(document, "scroll", retry);
+  listen(globalThis.window, "scroll", retry);
+  listen(globalThis.window, "resize", retry);
   attempt();
 }
 
