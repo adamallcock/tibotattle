@@ -99,14 +99,17 @@
         "product:macos:preview:validate"
       ],
       "callers": [
+        "apps/local/README.md",
         "apps/local/electron-static-assets.test.mjs",
+        "apps/macos/README.md",
+        "apps/worker/scripts/check-deployment-endpoints.mjs",
         "package.json#scripts.product:macos:build",
         "package.json#scripts.product:macos:preview:build",
         "package.json#scripts.product:macos:preview:validate",
-        "apps/worker/scripts/check-deployment-endpoints.mjs",
-        "scripts/macos-release-core.js",
+        "scripts/build-electron-runtime.mjs",
         "scripts/build-public-release-site.js",
         "scripts/install-macos-preview-app.js",
+        "scripts/macos-release-core.js",
         "scripts/validate-macos-install.js",
         "scripts/verify-macos-preview-remote.js",
         "test/browser-module-serving-parity.test.js",
@@ -115,9 +118,7 @@
         "test/macos-localization.test.js",
         "test/macos-test-build.test.mjs",
         "test/public-release-site.test.js",
-        "test/weekly-pace-macos-runtime.test.js",
-        "apps/local/README.md",
-        "apps/macos/README.md"
+        "test/weekly-pace-macos-runtime.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
@@ -165,9 +166,9 @@
       "additionalAliases": [],
       "callers": [
         "package.json#scripts.product:release-site",
-        "test/public-release-site.test.js",
         "scripts/prepare-web-release.js",
-        "scripts/preview-public-release-site.js"
+        "scripts/preview-public-release-site.js",
+        "test/public-release-site.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
@@ -182,9 +183,9 @@
       "stableAliasReason": null,
       "additionalAliases": [],
       "callers": [
+        "docs/runbooks/2026-08-17-web-only-release.md",
         "package.json#scripts.product:web-release:deploy",
-        "test/web-release-lane.test.js",
-        "docs/runbooks/2026-08-17-web-only-release.md"
+        "test/web-release-lane.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": "docs/runbooks/2026-08-17-web-only-release.md",
@@ -199,9 +200,9 @@
       "stableAliasReason": null,
       "additionalAliases": [],
       "callers": [
+        "docs/runbooks/2026-08-17-web-only-release.md",
         "package.json#scripts.product:web-release:prepare",
-        "test/web-release-lane.test.js",
-        "docs/runbooks/2026-08-17-web-only-release.md"
+        "test/web-release-lane.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": "docs/runbooks/2026-08-17-web-only-release.md",
@@ -216,10 +217,10 @@
       "stableAliasReason": null,
       "additionalAliases": [],
       "callers": [
+        "docs/runbooks/2026-08-17-public-site-local-preview.md",
         "package.json#scripts.product:release-site:preview",
         "test/public-release-site-preview.test.js",
-        "test/web-release-lane.test.js",
-        "docs/runbooks/2026-08-17-public-site-local-preview.md"
+        "test/web-release-lane.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": "docs/runbooks/2026-08-17-public-site-local-preview.md",
@@ -234,11 +235,11 @@
       "stableAliasReason": "Internal helper for hashing the generated public source closure; it is not a supported standalone command.",
       "additionalAliases": [],
       "callers": [
-        "scripts/build-public-release-site.js",
-        "scripts/web-release-lane.js",
         "apps/worker/scripts/production-deploy.check.mjs",
         "apps/worker/scripts/stage-production-assets.check.mjs",
         "apps/worker/scripts/stage-production-assets.mjs",
+        "scripts/build-public-release-site.js",
+        "scripts/web-release-lane.js",
         "test/public-release-site.test.js",
         "test/web-release-lane.test.js"
       ],
@@ -255,10 +256,10 @@
       "stableAliasReason": "Internal scope and receipt guard for the web-only release lane; it is not a supported standalone command.",
       "additionalAliases": [],
       "callers": [
+        "docs/runbooks/2026-08-17-web-only-release.md",
         "scripts/deploy-web-release.js",
         "scripts/prepare-web-release.js",
-        "test/web-release-lane.test.js",
-        "docs/runbooks/2026-08-17-web-only-release.md"
+        "test/web-release-lane.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/runbooks/2026-08-17-web-only-release.md",
@@ -273,8 +274,8 @@
       "stableAliasReason": null,
       "additionalAliases": [],
       "callers": [
-        "package.json#scripts.product:prepare-contribution",
-        "README.md"
+        "README.md",
+        "package.json#scripts.product:prepare-contribution"
       ],
       "decision": "retain_in_product_source_until_a_product_composition_root_replaces_it",
       "provenance": null,
@@ -306,8 +307,8 @@
       "additionalAliases": [],
       "callers": [
         "package.json#scripts.architecture:check",
-        "test/architecture-boundaries.test.js",
         "test/accounting-package-boundary.test.js",
+        "test/architecture-boundaries.test.js",
         "test/export-artifact-storage-owner-boundary.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
@@ -326,15 +327,15 @@
         "codex:contract:release:check"
       ],
       "callers": [
+        ".github/workflows/codex-contract-drift.yml",
+        ".github/workflows/release-trust-policy.yml",
+        "CONTRIBUTING.md",
+        "docs/design/2026-08-26-codex-plan-display-names.md",
+        "docs/runbooks/macos-stable-release-runbook.md",
         "package.json#scripts.codex:contract:check",
         "package.json#scripts.codex:contract:record-installed",
         "package.json#scripts.codex:contract:release:check",
-        ".github/workflows/codex-contract-drift.yml",
-        ".github/workflows/release-trust-policy.yml",
-        "test/codex-contract-drift.test.js",
-        "CONTRIBUTING.md",
-        "docs/design/2026-08-26-codex-plan-display-names.md",
-        "docs/runbooks/macos-stable-release-runbook.md"
+        "test/codex-contract-drift.test.js"
       ],
       "decision": "retain_as_upstream_contract_quality_gate",
       "provenance": "docs/design/2026-08-26-codex-plan-display-names.md",
@@ -364,8 +365,8 @@
       "stableAliasReason": null,
       "additionalAliases": [],
       "callers": [
-        "package.json#scripts.tools:root-workspace:check",
         "package.json#scripts.test:preflight",
+        "package.json#scripts.tools:root-workspace:check",
         "test/agent-guidance.test.js",
         "test/root-workspace-hygiene.test.js"
       ],
@@ -383,9 +384,9 @@
       "additionalAliases": [],
       "callers": [
         ".github/workflows/release-trust-policy.yml",
-        "test/release-notes.test.js",
         "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
-        "docs/runbooks/macos-stable-release-runbook.md"
+        "docs/runbooks/macos-stable-release-runbook.md",
+        "test/release-notes.test.js"
       ],
       "decision": "retain_as_release_documentation_gate",
       "provenance": null,
@@ -434,10 +435,10 @@
         "i18n:browser:check"
       ],
       "callers": [
-        "package.json#scripts.i18n:browser:generate",
+        "apps/web/test/i18n-browser-parity.test.mjs",
         "package.json#scripts.i18n:browser:check",
-        "scripts/export-tibotattle.mjs",
-        "apps/web/test/i18n-browser-parity.test.mjs"
+        "package.json#scripts.i18n:browser:generate",
+        "scripts/export-tibotattle.mjs"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
@@ -470,13 +471,13 @@
         "telemetry:browser:check"
       ],
       "callers": [
-        "package.json#scripts.telemetry:browser:generate",
+        "apps/web/test/telemetry-shared-parity.test.mjs",
         "package.json#scripts.telemetry:browser:check",
-        "scripts/build-public-release-site.js",
+        "package.json#scripts.telemetry:browser:generate",
         "scripts/build-macos-app.js",
-        "test/public-release-site.test.js",
+        "scripts/build-public-release-site.js",
         "test/macos-app-bundle.test.js",
-        "apps/web/test/telemetry-shared-parity.test.mjs"
+        "test/public-release-site.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
@@ -493,10 +494,10 @@
         "telemetry:check"
       ],
       "callers": [
-        "package.json#scripts.telemetry:generate",
+        "docs/reference/schema-contracts.md",
         "package.json#scripts.telemetry:check",
-        "test/telemetry-contract.test.js",
-        "docs/reference/schema-contracts.md"
+        "package.json#scripts.telemetry:generate",
+        "test/telemetry-contract.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": "docs/reference/schema-contracts.md",
@@ -524,9 +525,9 @@
       "stableAliasReason": null,
       "additionalAliases": [],
       "callers": [
+        "apps/macos/README.md",
         "package.json#scripts.product:macos:preview:install",
-        "test/macos-preview-install.test.js",
-        "apps/macos/README.md"
+        "test/macos-preview-install.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
@@ -584,6 +585,7 @@
         "test/codex-local-usage-analysis-boundary.test.js",
         "test/codex-provider-log-boundary.test.js",
         "test/contribution-owner-boundary.test.js",
+        "test/electron-app-package.test.js",
         "test/export-owner-boundary.test.js",
         "test/metadata-export-owner-boundary.test.js",
         "test/participant-identity-owner-boundary.test.js",
@@ -783,20 +785,20 @@
       "stableAliasReason": "Shared release module is imported by macOS release commands and tests, not invoked directly.",
       "additionalAliases": [],
       "callers": [
+        "docs/runbooks/macos-stable-release-runbook.md",
         "scripts/build-macos-app.js",
-        "scripts/validate-macos-replacement.js",
+        "scripts/build-public-release-site.js",
         "scripts/package-macos-dmg.js",
+        "scripts/publish-sparkle-update.js",
         "scripts/release-macos-app.js",
         "scripts/validate-macos-install.js",
         "scripts/validate-macos-login-item-release.js",
+        "scripts/validate-macos-replacement.js",
         "scripts/verify-macos-preview-remote.js",
-        "scripts/build-public-release-site.js",
-        "scripts/publish-sparkle-update.js",
         "test/macos-app-bundle.test.js",
         "test/macos-keychain-migration-artifact.test.js",
         "test/public-release-site.test.js",
-        "test/publish-sparkle-update.test.js",
-        "docs/runbooks/macos-stable-release-runbook.md"
+        "test/publish-sparkle-update.test.js"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/runbooks/macos-stable-release-runbook.md",
@@ -972,8 +974,8 @@
       "stableAliasReason": "Internal benchmark worker is launched by the R7 benchmark module and tests.",
       "additionalAliases": [],
       "callers": [
-        "src/r7-resource-benchmark.js",
         "src/r7-release-evidence-schema.js",
+        "src/r7-resource-benchmark.js",
         "test/r7-release-evidence-schema.test.js",
         "test/r7-resource-benchmark.test.js"
       ],
@@ -1006,8 +1008,8 @@
       "stableAliasReason": null,
       "additionalAliases": [],
       "callers": [
-        "package.json#scripts.index:rebuild",
-        "docs/reference/unified-index-schema.md"
+        "docs/reference/unified-index-schema.md",
+        "package.json#scripts.index:rebuild"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": "docs/reference/unified-index-schema.md",
@@ -1038,9 +1040,9 @@
       "stableAliasReason": null,
       "additionalAliases": [],
       "callers": [
+        "docs/runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md",
         "package.json#scripts.benchmark:r7:release:regenerate",
-        "test/r7-release-evidence-regeneration.test.js",
-        "docs/runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md"
+        "test/r7-release-evidence-regeneration.test.js"
       ],
       "decision": "retain_without_modification_until_final_r7_regeneration",
       "provenance": "docs/runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md",
@@ -1173,14 +1175,14 @@
         "test:macos:artifact"
       ],
       "callers": [
-        "package.json#scripts.test:preflight",
-        "package.json#scripts.test:portable",
-        "package.json#scripts.test:fast",
         "package.json#scripts.test:changed",
         "package.json#scripts.test:changed:full",
-        "package.json#scripts.test:macos:source",
-        "package.json#scripts.test:macos:smoke",
+        "package.json#scripts.test:fast",
         "package.json#scripts.test:macos:artifact",
+        "package.json#scripts.test:macos:smoke",
+        "package.json#scripts.test:macos:source",
+        "package.json#scripts.test:portable",
+        "package.json#scripts.test:preflight",
         "scripts/benchmark-test-lanes.mjs",
         "test/test-lanes.test.js"
       ],
@@ -1197,11 +1199,11 @@
       "stableAliasReason": "Manifest is executable-adjacent data imported by the portable test lane, not a standalone command.",
       "additionalAliases": [],
       "callers": [
+        "docs/runbooks/2026-08-17-windows-portability-environments.md",
         "scripts/test-lanes.mjs",
         "test/test-lanes.test.js",
         "test/windows-skip-ledger.test.js",
-        "test/windows-test-manifest.test.js",
-        "docs/runbooks/2026-08-17-windows-portability-environments.md"
+        "test/windows-test-manifest.test.js"
       ],
       "decision": "retain_as_internal_test_support",
       "provenance": "docs/runbooks/2026-08-17-windows-portability-environments.md",
@@ -1218,11 +1220,11 @@
         "product:macos:validate:release"
       ],
       "callers": [
+        "apps/macos/README.md",
+        "docs/runbooks/macos-stable-release-runbook.md",
         "package.json#scripts.product:macos:validate:development",
         "package.json#scripts.product:macos:validate:release",
-        "test/validate-macos-install.test.js",
-        "apps/macos/README.md",
-        "docs/runbooks/macos-stable-release-runbook.md"
+        "test/validate-macos-install.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": "docs/runbooks/macos-stable-release-runbook.md",
@@ -1285,10 +1287,10 @@
       "stableAliasReason": null,
       "additionalAliases": [],
       "callers": [
-        "package.json#scripts.product:macos:preview:remote",
-        "package.json#scripts.product:macos:preview:remote:live",
         "apps/macos/README.md",
         "apps/worker/scripts/release-readiness-lib.mjs",
+        "package.json#scripts.product:macos:preview:remote",
+        "package.json#scripts.product:macos:preview:remote:live",
         "test/macos-preview-remote.test.js",
         "test/verify-macos-preview-remote.test.js"
       ],
@@ -1538,8 +1540,8 @@
       "additionalAliases": [],
       "callers": [
         ".github/workflows/release-trust-policy.yml",
-        "test/release-workflow-policy.test.js",
-        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+        "test/release-workflow-policy.test.js"
       ],
       "decision": "retain_as_protected_release_quality_gate",
       "provenance": null,
@@ -1556,13 +1558,13 @@
         "release:evidence:validate"
       ],
       "callers": [
+        ".github/actions/attest-release-artifact/action.yml",
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+        "docs/runbooks/macos-stable-release-runbook.md",
         "package.json#scripts.release:evidence:generate",
         "package.json#scripts.release:evidence:validate",
-        ".github/actions/attest-release-artifact/action.yml",
         "scripts/release-attestation-evidence.mjs",
-        "test/release-evidence.test.js",
-        "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
-        "docs/runbooks/macos-stable-release-runbook.md"
+        "test/release-evidence.test.js"
       ],
       "decision": "retain_as_cross_platform_release_manifest_entrypoint",
       "provenance": null,
@@ -1578,8 +1580,8 @@
       "additionalAliases": [],
       "callers": [
         ".github/actions/attest-release-artifact/action.yml",
-        "test/release-attestation-action.test.js",
-        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+        "test/release-attestation-action.test.js"
       ],
       "decision": "retain_as_protected_release_evidence_support",
       "provenance": null,
@@ -1610,9 +1612,9 @@
       "stableAliasReason": "Manifest and SHA256SUMS output locking is an imported release-generation helper, not a standalone command.",
       "additionalAliases": [],
       "callers": [
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
         "scripts/release-evidence.js",
-        "test/release-evidence.test.js",
-        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+        "test/release-evidence.test.js"
       ],
       "decision": "retain_as_internal_release_evidence_support",
       "provenance": null,
@@ -1687,12 +1689,79 @@
       "additionalAliases": [],
       "callers": [
         ".github/actions/generate-release-sbom/action.yml",
-        "test/release-sbom-action.test.js",
-        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+        "test/release-sbom-action.test.js"
       ],
       "decision": "retain_as_protected_release_sbom_support",
       "provenance": null,
       "provenanceReason": "The helper downloads and verifies the pinned Syft release, bounds SPDX output, and validates the final SBOM subject; focused SBOM action tests cover the boundary.",
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/lib/electron-builder-package-json.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Development packaging is invoked explicitly and qualified before any production release.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/build-electron-app.mjs",
+        "scripts/build-electron-runtime.mjs",
+        "scripts/verify-electron-development-artifact.mjs",
+        "test/electron-builder-package-json.test.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/build-electron-app.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Development packaging is invoked explicitly and qualified before any production release.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/windows-portability.yml",
+        "test/electron-app-package.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/build-electron-runtime.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Development packaging is invoked explicitly and qualified before any production release.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/build-electron-app.mjs",
+        "test/electron-app-package.test.js",
+        "test/electron-development-artifact-verifier.test.js",
+        "test/electron-package-layout.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/verify-electron-development-artifact.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Development packaging is invoked explicitly and qualified before any production release.",
+      "additionalAliases": [],
+      "callers": [
+        "test/electron-development-artifact-verifier.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
+      "provenanceReason": null,
       "legacyPaths": []
     }
   ]
