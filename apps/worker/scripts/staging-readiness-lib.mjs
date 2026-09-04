@@ -82,14 +82,18 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     // cache rows instead of event or per-account analysis tables.
     "0039_admin_metrics_history_cache.sql",
     "0040_community_allowance_publication_state.sql",
+    // Preserve the historical production migration under its applied name.
+    // The independently authored composition tables have a unique successor
+    // number; an alternate applied ledger still fails the exact-prefix guard.
+    "0041_community_model_composition_cache.sql",
     // Added with the per-model allowance fit (2026-08-30): the per-participant
     // composition cache plus the published per-day cohort series.
-    "0041_community_model_composition.sql",
+    "0042_community_model_composition.sql",
     // Account/plan attribution remains staged: these migrations add input
     // fencing, explicit consent/floors, and complete-domain activation guards.
-    "0042_analytical_input_fencing.sql",
-    "0043_attribution_transport_staging.sql",
-    "0044_attribution_domain_activation.sql",
+    "0043_analytical_input_fencing.sql",
+    "0044_attribution_transport_staging.sql",
+    "0045_attribution_domain_activation.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",

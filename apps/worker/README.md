@@ -131,13 +131,13 @@ renew or disconnect itself, and mint Upload authority; it cannot read session
 controls, export data, manage other devices, or delete hosted participation.
 
 The account/plan-attributed v1.1 successor is implemented but starts **staged**
-in migration 0043. It requires accepted server capabilities, an explicit
+in migration 0044. It requires accepted server capabilities, an explicit
 hosted-session grant for the exact contract, and separate local field review
 and approval. Pairing, device renewal and existing v1 consent cannot grant it.
 The participant's persisted minimum write rank applies to every ingestion path,
 including v0.2 if that dormant format is deliberately re-enabled.
 
-Staged day chunks are immutable. Migration 0044 adds a complete-domain activation
+Staged day chunks are immutable. Migration 0045 adds a complete-domain activation
 boundary with exact legacy/successor occurrence compatibility proof, rather than
 a per-day schema switch. Partial delivery leaves the old analytical source
 selected; same-vector retries do not republish. Quota, usage, daily and model
@@ -200,6 +200,14 @@ the live row counts or deployed Worker revision.
 Forward-only D1 migrations are under `migrations/` and are applied in numeric
 order. Never document a hard-coded migration ceiling as the operating contract;
 the checked-in directory is the current set.
+
+The 2026-09-04 lineage reconciliation preserves the already-applied historical
+`0041_community_model_composition_cache.sql` and numbers the separate model
+composition and attribution migrations `0042`–`0045`. These are not aliases for
+the historical migration. See the
+[lineage review](../../docs/reviews/2026-09-04-hosted-migration-lineage-reconciliation.md)
+before reconciling any environment with a different ledger; exact ordered-prefix
+validation remains fail-closed.
 
 Deploying Worker code does not apply D1 migrations. Applying D1 migrations does
 not deploy code. For schema-dependent changes, locally prove both pre-migration

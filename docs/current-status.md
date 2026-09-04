@@ -52,7 +52,9 @@ independent live-service, installed-artifact, release, or updater observations
 below; deployment and release remain separate gates.
 
 [PR #89](https://github.com/adamallcock/tibotattle/pull/89) adds a hosted
-admin-only per-model allowance series and **By model** view. Migration 0041,
+admin-only per-model allowance series and **By model** view. Its original
+migration 0041 is now the distinct forward migration 0042 under the
+[verified lineage reconciliation](./reviews/2026-09-04-hosted-migration-lineage-reconciliation.md).
 Worker deployment, warming, and real cohort evidence remain separate; desktop
 installation does not activate it.
 
@@ -60,7 +62,7 @@ installation does not activate it.
 attribution plus a staged telemetry v1.1 transport and device-continuity repair.
 Local estimates, history, ranges, forecasts, and share cards use one compatible
 selected population; missing or conflicting identity remains unavailable.
-Migrations 0042-0044, stronger-format hosted activation, and new explicit
+Current migrations 0043-0045 (originally 0042-0044), stronger-format hosted activation, and new explicit
 consent are not supplied by installing the desktop app.
 
 [PR #95](https://github.com/adamallcock/tibotattle/pull/95) makes compatible
@@ -95,6 +97,10 @@ and withdrawal trigger. Both deletion-ledger migrations are applied. No
 configured staging database appears in the current account's database-name
 inventory. This is a forward-sequence repair requirement, not permission to
 rewrite the ledger or apply migrations; no live account upload was performed.
+The local reconciliation restores all 41 historical SQL files byte-identically
+to the deployed source and moves only the four unapplied successors to unique
+0042-0045 names, without SQL edits. Alternative applied histories still fail
+the unchanged ordered-prefix deployment gate.
 
 ## Published macOS release and updater
 

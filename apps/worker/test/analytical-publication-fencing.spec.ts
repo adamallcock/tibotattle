@@ -137,7 +137,7 @@ describe("analytical input and publication fencing", () => {
     expect((await db.prepare("SELECT attribution_method_version FROM community_model_composition_days").first())?.attribution_method_version)
       .toBe(COMMUNITY_ATTRIBUTION_METHOD_VERSION);
     await db.prepare("UPDATE participants SET state='deleting' WHERE id='fence-participant'").run();
-    // The retained 0041 withdrawal trigger removes aggregate snapshots whose
+    // The retained 0042 withdrawal trigger removes aggregate snapshots whose
     // contributor membership cannot be reconstructed; no new erasure path.
     expect(await db.prepare("SELECT attribution_method_version,payload_json FROM community_model_composition_days").first())
       .toBeNull();

@@ -50,7 +50,7 @@ Those remain separate verification gates in the relevant runbooks.
 | Cloudflare service bindings | Worker → platform-managed resources | 3 D1 bindings, 3 production R2 bindings, 1 Durable Object, 8 rate limiters, 1 assets binding, 1 cron schedule |
 | Reviewed code APIs | App/source owners → reusable modules | 5 workspace packages and 24 reviewed source-owner entrypoints |
 | JSON/wire contracts | Collectors, exports, release tooling, hosted intake | Closed versioned families, including generated staged v1.1 and frozen code-defined telemetry v1.0; see schema lifecycle inventory |
-| Storage schema APIs | Hosted and local persistence owners | Ordered hosted SQL migrations, local SQLite schemas, and object/Keychain contracts; attribution adds hosted 0042–0044 without relabeling local schema 11 |
+| Storage schema APIs | Hosted and local persistence owners | Ordered hosted SQL migrations, local SQLite schemas, and object/Keychain contracts; attribution adds hosted 0043–0045 without relabeling local schema 11 |
 
 The route counts are checked against the source allowlists by
 [`test/api-surface-reference.test.js`](../../test/api-surface-reference.test.js).
