@@ -24,6 +24,14 @@ The local annotated RC2 tag exists; no push, installation, stable finalization o
 publication occurred. Installed-runtime, hardware and remote gates remain open,
 so the conditional publication authority has not been exercised.
 
+The owner subsequently authorized the installed ARM upgrade with data and a
+rollback copy preserved, and continuation up to the publication decision.
+The [installed-upgrade review](../reviews/2026-09-04-installed-upgrade-readiness.md)
+records a newer live starting point (stable 0.1.17/1024), verified full backups,
+and a newly identified parser-upgrade deadline regression. Corrected source
+requires fresh RC3 `1025.2`; the signed RC2 `1025.1` artifacts remain unchanged.
+The publication gate is still open, not waived.
+
 ## Local preparation
 
 - [x] Recheck current Astra pricing and installed Codex contract. The
@@ -96,7 +104,10 @@ this authority for combined ARM/Intel RC2 `1025.1`, its new local annotated
 source tag, signing and notarization; those operations are now complete with
 fresh distinct outputs. Intel RC1 `1025`, source `18c7065b`, its DMG, receipt,
 checksum, tester README and verified Node runtime were preserved. Installation
-was explicitly excluded and requires a separate owner decision.
+was excluded from that signing operation; the subsequent owner approval now
+permits the installed ARM upgrade with preservation. Do not infer approval for
+credential resets, broad access changes, destructive clean-profile exercises
+on the owner's working profile, or publication before qualification.
 
 | Boundary | Required proof before the corresponding claim |
 | --- | --- |

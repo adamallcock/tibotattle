@@ -466,11 +466,12 @@ uses build `1024` and accepted runtime basis
 preceding dogfood allocation. The exact source provenance is the annotated
 [`v0.1.17` tag](https://github.com/adamallcock/tibotattle/tree/v0.1.17). A future
 signed version/channel must add a reviewed monotonic allocation before release
-tooling will run. The untagged combined Astra/Intel 0.1.18 RC2 reserves `1025.1`
-for dogfood and retains `1026` for stable on both architectures. The earlier
-signed Intel RC1 remains build `1025`; its evidence does not qualify the combined
-RC2. The ordering is `1025 < 1025.1 < 1026`, and allocation alone proves neither
-signing, installation nor release.
+tooling will run. Corrected combined Astra/Intel 0.1.18 RC3 reserves `1025.2`
+for dogfood and retains `1026` for stable on both architectures. Signed Intel
+RC1 build `1025` and combined RC2 build `1025.1` remain immutable; their evidence
+does not qualify the corrected RC3 source. The ordering is
+`1025 < 1025.1 < 1025.2 < 1026`, and allocation alone proves neither signing,
+installation nor release.
 
 Earlier RCs are historical qualification evidence only. The build-1024
 release retains the fail-closed source, generation, resource, validation,
@@ -582,9 +583,10 @@ For a later stable release, use `--previous-stable-manifest` in place of
 the release command refuses to guess which continuity policy applies.
 `USAGE_MONITOR_BUNDLE_VERSION` is optional as an operator assertion only; when
 present it must exactly equal the checked-in allocation for the selected
-signed release version and channel (`1025.1` for combined 0.1.18 RC2 internal
-dogfood, `1026` for 0.1.18 stable). Earlier Intel RC1 build `1025` and its
-immutable evidence remain unchanged.
+signed release version and channel (`1025.2` for corrected 0.1.18 RC3 internal
+dogfood, `1026` for 0.1.18 stable). Earlier signed RC1 build `1025` and RC2 build
+`1025.1`, together with their immutable evidence, remain unchanged and cannot
+be reused as the current signing allocation.
 
 `config/deployment-endpoints.js` is the reviewed source for the public origin
 and the distinct stable and preview Sparkle appcasts. Legacy

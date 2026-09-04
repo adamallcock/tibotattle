@@ -351,8 +351,11 @@ test("refresh timeout classifier grants the cold window only to missing or prove
   }
 });
 
-test("published v10 parser upgrades receive a cold deadline without extending current or uncertain state", async () => {
+test("published v10 v11 v12 upgrades to v13 receive a cold deadline without extending current or uncertain state", async () => {
   const root = await mkdtemp(join(tmpdir(), "local-timeout-parser-upgrade-"));
+  // Deliberately pin the target: another parser release must review its
+  // predecessor set, not silently keep passing a generic mismatch test.
+  assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v13");
   const fixtures = [
     { name: "complete", cold: true },
     { name: "quarantine-partial", cold: true, generation: {
@@ -364,9 +367,15 @@ test("published v10 parser upgrades receive a cold deadline without extending cu
     // Every fixture retains an older parser/generation row. Only publication
     // provenance may select the deadline, so this stays an ordinary refresh.
     { name: "current-with-old-history", parserVersion: LOCAL_UNIFIED_INDEX_PARSER_VERSION },
-    { name: "future", parserVersion: "unified-rollout-typed-v12" },
+    { name: "future", parserVersion: "unified-rollout-typed-v14" },
     { name: "unknown", parserVersion: "unknown-parser" },
+    { name: "empty", parserVersion: "" },
+    { name: "malformed-version", parserVersion: "unified-rollout-typed-v011" },
+    { name: "decorated-version", parserVersion: "unified-rollout-typed-v11 " },
     { name: "partial-parser", parserVersion: "unified-rollout-typed-v10-partial" },
+    { name: "v11-partial-parser", parserVersion: "unified-rollout-typed-v11-partial" },
+    { name: "v12-partial-parser", parserVersion: "unified-rollout-typed-v12-partial" },
+    { name: "current-partial-parser", parserVersion: "unified-rollout-typed-v13-partial" },
     { name: "unreviewed-predecessor", parserVersion: "unified-rollout-typed-v9" },
     { name: "missing-publication", metadata: { current_generation_id: undefined } },
     { name: "unknown-publication", metadata: { current_generation_id: "99" } },
@@ -397,17 +406,23 @@ test("published v10 parser upgrades receive a cold deadline without extending cu
       .map((key) => ({ name: `incomplete-${key}`, generation: { [key]: 0 } })),
   ];
   try {
-    for (const fixture of fixtures) {
-      const indexFile = join(root, `${fixture.name}.sqlite`);
-      writeParserUpgradeTimeoutIndex(indexFile, fixture);
-      await chmod(indexFile, 0o600);
-      const beforeBytes = await readFile(indexFile);
-      const beforeNames = await readdir(root);
-      assert.equal(localCompanionRefreshTimeoutForUnifiedIndex(indexFile),
-        fixture.cold === true ? 14_400_000 : LOCAL_COMPANION_INCREMENTAL_REFRESH_TIMEOUT_MS,
-        fixture.name);
-      assert.deepEqual(await readFile(indexFile), beforeBytes, fixture.name);
-      assert.deepEqual(await readdir(root), beforeNames, fixture.name);
+    for (const predecessor of [10, 11, 12]) {
+      for (const fixture of fixtures) {
+        const name = `v${predecessor}-${fixture.name}`;
+        const indexFile = join(root, `${name}.sqlite`);
+        writeParserUpgradeTimeoutIndex(indexFile, {
+          parserVersion: `unified-rollout-typed-v${predecessor}`,
+          ...fixture,
+        });
+        await chmod(indexFile, 0o600);
+        const beforeBytes = await readFile(indexFile);
+        const beforeNames = await readdir(root);
+        assert.equal(localCompanionRefreshTimeoutForUnifiedIndex(indexFile),
+          fixture.cold === true ? 14_400_000 : LOCAL_COMPANION_INCREMENTAL_REFRESH_TIMEOUT_MS,
+          name);
+        assert.deepEqual(await readFile(indexFile), beforeBytes, name);
+        assert.deepEqual(await readdir(root), beforeNames, name);
+      }
     }
   } finally {
     await rm(root, { recursive: true });
@@ -487,8 +502,18 @@ test("large legacy and parser-upgrade timeout classification never scans integri
     );
     assert.deepEqual(await readdir(root), beforeNames);
 
-    const parserIndex = join(root, "schema11-parser10-large.sqlite");
-    writeParserUpgradeTimeoutIndex(parserIndex);
+    const parserIndex = join(root, "schema11-parser11-large.sqlite");
+    // Match the stable predecessor for RC3: v11, physical schema11,
+    // no skipped sources, and only incomplete historical tool provenance.
+    writeParserUpgradeTimeoutIndex(parserIndex, {
+      parserVersion: "unified-rollout-typed-v11",
+      generation: {
+        status: "partial",
+        blockReason: "tool_provenance_incomplete",
+        toolProvenanceComplete: 0,
+        skippedSourceCount: 0,
+      },
+    });
     await chmod(parserIndex, 0o600);
     await truncate(parserIndex, sparseSize);
     const parserBefore = await lstat(parserIndex);
