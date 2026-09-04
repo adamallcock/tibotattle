@@ -2,7 +2,7 @@ import { createCodexLogIngestion } from "./log-ingestion.js";
 import { createCodexLogParser } from "./log-parser.js";
 import { createCodexLogSources } from "./log-sources.js";
 
-export const CODEX_LOG_SCAN_VERSION = "codex-log-scan-v8";
+export const CODEX_LOG_SCAN_VERSION = "codex-log-scan-v9";
 
 const FILESYSTEM_METHODS = Object.freeze([
   "defaultCodexHome",
@@ -89,7 +89,7 @@ export function createCodexLogScanner(options) {
   const { filesystem, lineReader } = normalizePorts(options);
 
   const sources = createCodexLogSources({ filesystem, lineReader });
-  const parser = createCodexLogParser({ lineReader });
+  const parser = createCodexLogParser({ lineReader, createSha256: filesystem.createSha256 });
   const scanCodexLogEvents = createCodexLogIngestion({
     parserVersion: CODEX_LOG_SCAN_VERSION,
     sources,

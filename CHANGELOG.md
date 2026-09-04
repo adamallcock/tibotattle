@@ -37,6 +37,9 @@ remains accountable for release wording, validation, signing, and publication.
 The [0.1.18 candidate](./release-notes/0.1.18.md) adds GPT-6 Astra pricing and
 model recognition, preserves missing token evidence, supports compressed Codex
 history and current compaction headers, and expands the admin model dashboard.
+Resumable exports accept paginated reset histories without confusing logical
+forks or repeated physical generations with copied history. Exact physical-base
+continuations remain explicitly unsupported by that export lane.
 It also prepares separate Apple silicon and Intel macOS installers and
 architecture-specific updates for
 [issue #93](https://github.com/adamallcock/tibotattle/issues/93). Intel remains

@@ -219,9 +219,17 @@ The shared adapter is used by direct provider scans, single/worker rebuilds,
 incremental refresh, and supported checkpoint exports. The live passive collector
 continues its plain-JSONL capture path; cold compressed history belongs to the
 unified/scanner path. Compression alone does not delete or reset its previously
-retained live cursors or usage. Checkpoint export still explicitly refuses
-paginated history because its stored inheritance cannot represent an exact
-ordinal cutoff; direct scans and the unified index do support that history.
+retained live cursors or usage. Checkpoint export accepts paginated resets with
+an absent/null physical history base and an explicit valid start ordinal zero.
+Logical parents do not imply copied inline history; physical generations have
+distinct export occurrence identities while retaining logical session scope.
+Creation freezes the discovered parent selection into the source-plan digest;
+verification and resume validate those edges against frozen source metadata,
+without retargeting them to a later selected head. Malformed bases fail closed.
+Actual physical-base continuations remain explicitly unsupported because the
+checkpoint state cannot represent an exact ordinal cutoff; direct scans and
+the unified index do support that history. Scanner v9, metadata adapter v6 and
+checkpoint scan v0.5 fence incompatible prior export workspaces before mutation.
 
 Native support is capability-detected. Node's streaming Zstd APIs were introduced
 in Node 22.15.0 and 23.8.0; the project's minimum Node 22.13.0 remains importable

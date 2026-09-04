@@ -530,16 +530,18 @@ export function createCodexLogSources({ filesystem, lineReader }) {
           ? "paginated"
           : "legacy";
         const rawBase = record.payload.history_base;
-        const historyBase = rawBase && typeof rawBase === "object"
-          && !Array.isArray(rawBase)
-          ? {
-            rolloutId: typeof rawBase.thread_id === "string"
+        // Only absent/null means an independent reset. Preserve malformed
+        // non-null shapes as an invalid base so discovery cannot silently
+        // reinterpret a damaged continuation as fresh, countable history.
+        const historyBase = rawBase === undefined || rawBase === null
+          ? null
+          : {
+            rolloutId: typeof rawBase?.thread_id === "string"
               ? normalizeCodexIdentity(rawBase.thread_id)
               : null,
-            endOrdinalExclusive: rawBase.end_ordinal_exclusive,
-            endByteOffset: rawBase.end_byte_offset,
-          }
-          : null;
+            endOrdinalExclusive: rawBase?.end_ordinal_exclusive,
+            endByteOffset: rawBase?.end_byte_offset,
+          };
         const startOrdinalValid = Number.isSafeInteger(record.ordinal)
           && record.ordinal >= 0;
         return {

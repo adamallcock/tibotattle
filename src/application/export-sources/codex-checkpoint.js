@@ -297,6 +297,13 @@ async function scanRecordPhase({ workspace, source, checkpoint, secret, bounds, 
     secret,
     source.rolloutInfo?.lineage?.sessionId ?? source.rolloutInfo?.rolloutKey ?? source.sourceKey,
   );
+  // Frozen rollout metadata proves this physical generation. Do not persist
+  // its identity in parser state or conflate it with the logical session.
+  const sourceOccurrenceScopeId = source.rolloutInfo?.lineage?.historyMode === "paginated"
+    ? deriveSessionScopeId(secret, `codex-rollout-occurrence/v1\0${
+      source.rolloutInfo.sourceIdentity ?? source.rolloutInfo.rolloutId ?? source.rolloutInfo.rolloutKey
+    }`)
+    : null;
   try {
     let current = checkpoint;
     let state = cloneState(current.parserState);
@@ -475,6 +482,7 @@ async function scanRecordPhase({ workspace, source, checkpoint, secret, bounds, 
               window,
               surfaceClassification: source.rolloutInfo.lineage.surfaceClassification,
               sourceScopeId,
+              ...(sourceOccurrenceScopeId === null ? {} : { sourceOccurrenceScopeId }),
               sourceRecordOrdinal: entry.lineOrdinal,
             }), resourceGuard);
           }
@@ -537,6 +545,7 @@ async function scanRecordPhase({ workspace, source, checkpoint, secret, bounds, 
               tierSemantics: tierSemantics(tier),
               surfaceClassification: source.rolloutInfo.lineage.surfaceClassification,
               sourceScopeId,
+              ...(sourceOccurrenceScopeId === null ? {} : { sourceOccurrenceScopeId }),
               sourceRecordOrdinal: entry.lineOrdinal,
             }, state.pendingToolCounts), resourceGuard);
             state.pendingToolCounts = createEmptySafeToolClassCounts();

@@ -20,6 +20,7 @@ export function createCodexLogIngestion({
     excludeSessionIds = [],
     activeTaskRecencyMs = null,
     sourceScopeForRollout = null,
+    sourceOccurrenceScopeForRollout = null,
     resourceGuard = null,
     signal = null,
     rolloutInfos: suppliedRolloutInfos = null,
@@ -41,6 +42,10 @@ export function createCodexLogIngestion({
     }
     if (typeof requireCompleteDiscovery !== "boolean") {
       throw new TypeError("requireCompleteDiscovery must be a boolean");
+    }
+    if (sourceOccurrenceScopeForRollout !== null
+        && typeof sourceOccurrenceScopeForRollout !== "function") {
+      throw new TypeError("sourceOccurrenceScopeForRollout must be a function or null");
     }
     if (!validAbortSignal(signal)) throw new TypeError("signal must be an AbortSignal or null");
     throwIfAborted(signal);
@@ -113,6 +118,28 @@ export function createCodexLogIngestion({
       .filter((info) => info.lineage?.isInlineFork === true)
       .map((info) => info.lineage?.parentId)
       .filter((value) => typeof value === "string" && value.length > 0));
+    const replayCandidates = new Map();
+    for (const info of rolloutInfos) {
+      const sessionId = info.lineage?.sessionId;
+      if (!replayParentSessionIds.has(sessionId)) continue;
+      const candidates = replayCandidates.get(sessionId) ?? [];
+      candidates.push(info);
+      replayCandidates.set(sessionId, candidates);
+    }
+    const replaySnapshotSources = new Set();
+    for (const candidates of replayCandidates.values()) {
+      const heads = candidates.filter((info) => info.resolvedHead === true);
+      if (heads.length === 1) {
+        replaySnapshotSources.add(heads[0]);
+      } else if (heads.length === 0 && candidates.length === 1) {
+        // A sole noncanonical legacy source has no canonical resolved head.
+        replaySnapshotSources.add(candidates[0]);
+      } else if (heads.length === 0 && candidates.every((info) => !Object.hasOwn(info, "resolvedHead"))) {
+        // Older callers may supply their own ordered source infos without
+        // head metadata. Preserve that explicit legacy callback contract.
+        for (const info of candidates) replaySnapshotSources.add(info);
+      }
+    }
     const discardedSnapshots = Object.freeze({
       add() { return this; },
       has() { return false; },
@@ -236,9 +263,7 @@ export function createCodexLogIngestion({
           ?? 0) + 1;
       diagnostics.rolloutsByAgentScope[classification.agentScope]
         = (diagnostics.rolloutsByAgentScope[classification.agentScope] ?? 0) + 1;
-      const collectOwnSnapshots = replayParentSessionIds.has(
-        info.lineage?.sessionId,
-      );
+      const collectOwnSnapshots = replaySnapshotSources.has(info);
       const historySeed = await resolveHistorySeed(info, {
         includeSnapshots: collectOwnSnapshots,
       });
@@ -327,6 +352,22 @@ export function createCodexLogIngestion({
       const sourceDedupeScope = info.sourceIdentity
         ?? info.rolloutId
         ?? info.rolloutKey;
+      let sourceOccurrenceScopeId = null;
+      if (info.lineage.historyMode === "paginated"
+          && sourceOccurrenceScopeForRollout !== null) {
+        try {
+          sourceOccurrenceScopeId = await sourceOccurrenceScopeForRollout(sourceDedupeScope);
+        } catch {
+          // A failed derivation may echo the private input in its error.
+          // Reject below using the same bounded pseudonym error instead.
+        }
+        if (typeof sourceOccurrenceScopeId !== "string"
+            || !/^session:v1:[a-f0-9]{64}$/.test(sourceOccurrenceScopeId)) {
+          throw new Error(
+            "sourceOccurrenceScopeForRollout must return a versioned privacy-safe pseudonym",
+          );
+        }
+      }
       if (sourceScopeId !== null
           && (typeof sourceScopeId !== "string"
             || !/^session:v1:[a-f0-9]{64}$/.test(sourceScopeId))) {
@@ -339,6 +380,7 @@ export function createCodexLogIngestion({
           forked: info.lineage.isInlineFork === true,
           inheritedSnapshots: inheritedSnapshots ?? createSnapshotLineage(),
           rolloutSnapshots,
+          collectOwnSnapshots,
           startMs,
           endMs,
           seenEvents,
@@ -353,6 +395,7 @@ export function createCodexLogIngestion({
           serverBillableUnits,
           surfaceClassification: classification,
           sourceScopeId,
+          sourceOccurrenceScopeId,
           sourceDedupeScope,
           resourceGuard,
           maximumTotalBytes: info.size,
