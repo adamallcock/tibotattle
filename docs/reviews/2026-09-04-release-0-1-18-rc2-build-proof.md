@@ -7,6 +7,10 @@ status: release-gated
 
 # Release 0.1.18 RC2 optimized local build proof
 
+Historical attempt on `e0f35518`; the later approved compatibility fix and its
+qualification are tracked in the [paginated export review](./2026-09-04-paginated-export-qualification.md).
+The observations below remain bound to this earlier source and artifacts.
+
 ## Verdict and source
 
 Both optimized architecture builds and all twelve isolated native smoke checks

@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-04
 type: status
 status: current
-source_commit: e0f35518d8e85fa35d40af54871f3013b13673fe
+source_commit: ef2d26ac78e75d9c9a1245d539d3ffd8c8c3476b
 observation_date: 2026-09-04
 ---
 
@@ -18,7 +18,7 @@ using this page for a later release or operational decision.
 
 | Boundary | Verified state |
 |---|---|
-| Documentation/source review | Combined Astra/Intel candidate `0.1.18`, source `e0f35518d8e85fa35d40af54871f3013b13673fe`, based on requested `9e1c3333`; [RC2 build proof](./reviews/2026-09-04-release-0-1-18-rc2-build-proof.md) records allocation `1025.1`, optimized ARM/Intel development builds and twelve isolated smoke passes. Fresh R7 generation is blocked by paginated export checkpoints. No production-signed combined artifact or stable tag |
+| Documentation/source review | Combined Astra/Intel candidate `0.1.18`, source/evidence `ef2d26ac78e75d9c9a1245d539d3ffd8c8c3476b`, based on requested `9e1c3333`; [paginated export qualification](./reviews/2026-09-04-paginated-export-qualification.md) records the reset fix, ten fresh R7 receipts validated on both runtimes, optimized ARM/Intel builds with twelve isolated smoke passes, 3,815 passing root tests (17 Windows-only skips), and 108/108 retained macOS tests. RC2 allocation `1025.1`; no production-signed combined artifact or stable tag |
 | Intel tester artifact | Inherited signed/notarized `0.1.18` build `1025` dogfood DMG from source `18c7065b`; [exact receipt](./receipts/2026-09-03-macos-intel-signed-candidate.md). Predates combined Astra changes; not physically Intel-qualified |
 | Installed internal dogfood | Version `0.1.17`, RC9 build `1023.7`, source `394c8a03`; owner accepted the inspected apps on 2026-09-03. Plist version/build/minimum-OS were independently rechecked; this does not qualify every historical credential or clean-profile case |
 | Public service | Health/readiness HTTP 200, enrollment and upload processing enabled; deployment source `b4c8f103bf697fb530434e6de196f2c187645661`, observed 2026-09-04 03:57 UTC (2026-09-03 locally) |
@@ -129,7 +129,10 @@ The complete qualification matrix and rules for changing these claims are in
   The owner-authorized [RC2 proof](./reviews/2026-09-04-release-0-1-18-rc2-build-proof.md)
   passed optimized builds and isolated smokes on both architectures, but the
   fresh R7 attempt refused paginated Codex history in resumable export source
-  planning. All ten previous receipts remain byte-identical and stale. RC2
+  planning. The [approved reset compatibility fix](./reviews/2026-09-04-paginated-export-qualification.md)
+  now passes focused tests; complete R7 regeneration and both runtime freshness
+  checks pass. Both optimized development artifacts, twelve isolated smokes,
+  the full root suite and all 108 retained macOS tests pass. RC2
   allocation is now `1025.1`, stable remains `1026`, and a newly signed combined
   candidate remains outstanding. Physical Intel,
   actual consented upload and installed update qualification remain separate
@@ -156,14 +159,16 @@ The complete qualification matrix and rules for changing these claims are in
   `codex_rollout_content_invalid` / `benchmark_cold_rebuild_incomplete` and
   produced no comparison receipt. Later admitted-index qualification does not
   relabel that attempt as passed or establish repair of its raw sources.
-- Retained dual-runtime R7 receipts were regenerated on the earlier Intel tree,
-  but fail freshness on the combined source snapshot above. The latest protected
+- Retained dual-runtime R7 receipts were fully regenerated on the combined
+  source snapshot above and pass both pinned-runtime freshness checks. The earlier protected
   [R7 attempt](./reviews/2026-09-04-release-0-1-18-rc2-build-proof.md)
   completed six runtime profiles, then stopped at
   `export_source_codex_rollout_checkpoint_history_unsupported`. The current
-  selected corpus genuinely declares paginated history; resumable export
-  support needs a design and implementation decision before another
-  complete [R7 run](./runbooks/2026-08-19-r7-release-evidence-receipt-maintenance.md).
+  selected corpus genuinely declares paginated history. The approved ordinal-zero,
+  no-physical-base reset subset is implemented; the new complete
+  [R7 run](./reviews/2026-09-04-paginated-export-qualification.md#fresh-r7-evidence)
+  completed all ten validated receipts on frozen source. Actual physical-base
+  continuations remain refused.
   Do not narrow the corpus or bypass the guard to obtain a receipt. Earlier
   decisions remain
   `release_open` with unresolved export resource ceilings; that expected state
