@@ -41,7 +41,7 @@ const ACTION_SET = new Set(TRAY_POPOVER_ACTIONS);
 const MAX_TEXT_BYTES = 512;
 const MAX_WINDOWS = 2;
 const POPOVER_WIDTH = 408;
-const POPOVER_HEIGHT = 500;
+const POPOVER_HEIGHT = 720;
 const POPOVER_MIN_HEIGHT = 1;
 const POPOVER_WORKAREA_MARGIN = 12;
 const POPOVER_OFFSET = 8;
@@ -422,7 +422,7 @@ export function createDesktopTrayPopover({
     const options = {
       width: POPOVER_WIDTH,
       height: POPOVER_HEIGHT,
-      minWidth: POPOVER_WIDTH,
+      minWidth: 1,
       maxWidth: POPOVER_WIDTH,
       minHeight: POPOVER_MIN_HEIGHT,
       maxHeight: POPOVER_HEIGHT,

@@ -245,6 +245,9 @@ test("popover controller lazily positions, updates, routes, and destroys a trust
   const window = windows[0];
   assert.equal(window.options.frame, false);
   assert.equal(window.options.skipTaskbar, true);
+  assert.equal(window.options.height, 720);
+  assert.equal(window.options.minWidth, 1);
+  assert.equal(window.options.maxWidth, 408);
   assert.equal(window.options.webPreferences.nodeIntegration, false);
   assert.equal(window.options.webPreferences.contextIsolation, true);
   assert.equal(window.options.webPreferences.sandbox, true);
