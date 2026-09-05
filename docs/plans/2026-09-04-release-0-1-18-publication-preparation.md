@@ -66,6 +66,26 @@ app's dollar ledger explicitly uses API-equivalent prices, not subscription
 credits or an inferred percentage-allowance conversion. No pricing code or
 historical review timestamp was changed merely to record this recheck.
 
+The reviewed v14 correction is frozen in local commit `014380c7`. Its owning
+suite passes 238/238 and independent targeted regressions pass 30/30. The full
+native suite passes 110/110. The complete Worker gate passes 183 script tests,
+533 application tests across 43 files, type checks and default/staging dry runs;
+the explicit production dry run also passes. The installed Codex contract
+remains current on both available channels at CLI `0.153.0-alpha.5` with 17
+PlanType values. No test skips, remote writes or installation are inferred.
+Fresh copy-only v14 and R7 evidence remain pending.
+
+The new copy-only verifier requires an owner decision after safety review
+refused correcting a draft assertion. The shared `model` dimension is unique
+by `model_id` and retains its first recognition label; it cannot prove an
+individual event's missing-versus-unrecognized state. The proposed replacement
+requires missing model evidence from exact-occurrence seedless extraction and
+an unknown stored model identity, with all counter/effort/tier/preservation
+checks retained. The draft stricter assertion remains unchanged pending owner
+approval. This is a verifier limitation, not permission to modify stored facts
+or claim completed rehearsal. Independent R7 regeneration can proceed on the
+frozen product source.
+
 The [hosted lineage review](../reviews/2026-09-04-hosted-migration-lineage-reconciliation.md)
 records a separate live deployment blocker. Production applied the historical
 `0041_community_model_composition_cache.sql`, not the independently authored
