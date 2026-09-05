@@ -37,10 +37,11 @@ and approval-review hold on changing the default.
 Continuation authorized on 2026-09-04: finish reconciliation with the latest
 native 0.1.18 changes and controls, provide a durable Electron app the owner can
 test, and prepare packaging for all four targets. The integration baseline is
-native commit `38aaeef4` (including the earlier `6731e6d4` integration). This includes the
+native commit `3a785e6d` (including the earlier `6731e6d4` integration). This includes the
 combined Astra/Intel work, compressed-history support, paginated-export fixes,
 the parser-v14 exact-history inheritance correction, RC3 upgrade deadlines,
-and the subsequent strict filesystem refusal diagnostics.
+the subsequent strict filesystem refusal diagnostics, Login Item tooling
+closure and refreshed native v14 qualification receipts.
 GitHub PRs and remote references were refreshed before selecting the release
 lineage; the active local release checkout was checked again at each freeze.
 Open PRs are evaluated for relevant product changes; their presence alone does

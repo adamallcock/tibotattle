@@ -8,7 +8,7 @@ status: release-gated
 # Electron and native 0.1.18 parity ledger
 
 This is a source comparison for the native 0.1.18 baseline at revision
-`38aaeef4` and the current Electron composition. It records implemented
+`3a785e6d` and the current Electron composition. It records implemented
 behavior and deliberate gaps; it does not qualify a packaged, signed,
 installed, or published application, and it does not establish real-corpus
 coverage.
@@ -21,7 +21,7 @@ development qualification entrypoint and does not change production support.
 
 The open native PR review is bounded to source differences. PR #73
 (`57b04b7a`, customizable menu-bar allowance display) is not part of the
-`38aaeef4` native baseline, and its 5-hour/week/both/off menu-bar title
+`3a785e6d` native baseline, and its 5-hour/week/both/off menu-bar title
 preference is not ported. Electron's 7-day, 30-day, and All dashboard controls
 are a different surface and are not treated as an equivalent implementation.
 PR #74's retained reconciliation is already in the current composition. PR
