@@ -2349,15 +2349,17 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath, chil
     settingsCdp.close();
     settingsCdp = null;
     const syntheticSharingEnabled = !initialSharingEnabled;
-    const communityPreferencePersisted = await cdp.evaluate(`(() => {
+    const communityToggleRequested = await cdp.evaluate(`(() => {
       const toggle = document.querySelector("#electron-accountless-sharing-enabled");
       if (!toggle || toggle.disabled) return false;
       toggle.click();
-      return toggle.checked === ${JSON.stringify(syntheticSharingEnabled)};
+      return true;
     })()`).catch(() => false);
-    if (communityPreferencePersisted !== true) {
+    if (communityToggleRequested !== true) {
       fail("ELECTRON_MACOS_SMOKE_SETTINGS_SHARING_INVALID", "settings");
     }
+    // The controlled switch keeps the saved value while its async write is
+    // pending. Verify the enabled, persisted result after that write settles.
     const persistedCommunityPreference = await waitFor(async () => {
       const snapshot = await cdp.evaluate(`(async () => {
         const preference = await globalThis.tibotattleDesktop?.getSharingPreference?.();
@@ -2366,6 +2368,7 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath, chil
           && preference?.current === true
           && preference?.enabled === ${JSON.stringify(syntheticSharingEnabled)}
           && toggle?.checked === ${JSON.stringify(syntheticSharingEnabled)}
+          && toggle?.disabled === false
           ? true
           : null;
       })()`);
