@@ -396,6 +396,47 @@ test("macOS tray icon removes the app plate and keeps only a template mark", () 
   assert.deepEqual(calls.template, [true]);
 });
 
+test("macOS tray icon falls back to a PNG decoder when raw bitmap construction is rejected", () => {
+  const bitmap = Buffer.alloc(64 * 64 * 4);
+  bitmap.set([240, 245, 250, 255], 0);
+  bitmap.set([40, 70, 35, 255], 4);
+  const calls = { bitmap: 0, png: null, template: [] };
+  const finalImage = {
+    isEmpty: () => false,
+    setTemplateImage: (value) => calls.template.push(value),
+  };
+  const source = {
+    isEmpty: () => false,
+    resize: () => ({
+      isEmpty: () => false,
+      toBitmap: () => bitmap,
+    }),
+  };
+  const result = resolveDesktopTrayIcon({
+    nativeImage: {
+      createFromPath: () => source,
+      createFromBitmap: () => {
+        calls.bitmap += 1;
+        throw new Error("platform bitmap constructor rejected bytes");
+      },
+      createFromBuffer: (value) => {
+        calls.png = Buffer.from(value);
+        return {
+          resize: () => finalImage,
+        };
+      },
+    },
+    resourceRoot: "/trusted/app",
+    platform: "darwin",
+  });
+  assert.equal(result, finalImage);
+  assert.equal(calls.bitmap, 0);
+  assert.deepEqual([...calls.png.subarray(0, 8)], [
+    137, 80, 78, 71, 13, 10, 26, 10,
+  ]);
+  assert.deepEqual(calls.template, [true]);
+});
+
 test("real packaged bird asset produces a sparse template, not a white plate", async () => {
   const { readFile } = await import("node:fs/promises");
   const { inflateSync } = await import("node:zlib");

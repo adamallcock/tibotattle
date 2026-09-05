@@ -6,6 +6,7 @@
  */
 
 import { isAbsolute, join } from "node:path";
+import { deflateSync } from "node:zlib";
 
 import {
   createDesktopActionInterface,
@@ -210,6 +211,113 @@ function isNonEmptyNativeImage(value) {
   }
 }
 
+function pngChunk(type, data) {
+  const label = Buffer.from(type, "ascii");
+  const payload = Buffer.concat([label, data]);
+  let crc = 0xffffffff;
+  for (const byte of payload) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+  const output = Buffer.alloc(12 + data.length);
+  output.writeUInt32BE(data.length, 0);
+  payload.copy(output, 4);
+  output.writeUInt32BE((crc ^ 0xffffffff) >>> 0, 8 + data.length);
+  return output;
+}
+
+/**
+ * Encode the extracted BGRA bitmap as a tiny PNG fallback.
+ *
+ * Electron documents `createFromBitmap` as platform-dependent raw pixels.
+ * The primary path below uses a format-validated PNG through
+ * `createFromBuffer`, which keeps alpha semantics stable across platforms.
+ * The raw bitmap path remains a fallback for runtimes without a PNG decoder.
+ */
+function encodeDesktopTrayTemplatePNG(bitmap) {
+  const width = TRAY_TEMPLATE_WORK_SIZE;
+  const height = TRAY_TEMPLATE_WORK_SIZE;
+  const rowBytes = width * 4;
+  const scanlines = Buffer.alloc(height * (rowBytes + 1));
+  for (let y = 0; y < height; y += 1) {
+    const sourceRow = y * rowBytes;
+    const targetRow = y * (rowBytes + 1);
+    // Filter 0 keeps the fallback decoder independent of any PNG predictor.
+    scanlines[targetRow] = 0;
+    for (let x = 0; x < width; x += 1) {
+      const source = sourceRow + x * 4;
+      const target = targetRow + 1 + x * 4;
+      scanlines[target] = bitmap[source + 2];
+      scanlines[target + 1] = bitmap[source + 1];
+      scanlines[target + 2] = bitmap[source];
+      scanlines[target + 3] = bitmap[source + 3];
+    }
+  }
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 8;
+  header[9] = 6;
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  return Buffer.concat([
+    signature,
+    pngChunk("IHDR", header),
+    pngChunk("IDAT", deflateSync(scanlines)),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+function resizedTemplateImage(nativeImage, bitmap) {
+  const extracted = extractDesktopTrayTemplateBitmap(bitmap);
+  if (extracted === undefined) return null;
+  const options = {
+    width: TRAY_TEMPLATE_WORK_SIZE,
+    height: TRAY_TEMPLATE_WORK_SIZE,
+    scaleFactor: 1,
+  };
+  const resizeTemplate = (source) => {
+    if (source === null
+        || typeof source !== "object"
+        || typeof source.resize !== "function") return null;
+    let resized;
+    try {
+      resized = source.resize({
+        width: TRAY_ICON_SIZE,
+        height: TRAY_ICON_SIZE,
+        quality: "best",
+      });
+    } catch {
+      return null;
+    }
+    return isNonEmptyNativeImage(resized) ? resized : null;
+  };
+  if (typeof nativeImage?.createFromBuffer === "function") {
+    try {
+      const source = nativeImage.createFromBuffer(
+        encodeDesktopTrayTemplatePNG(extracted),
+        { scaleFactor: 1 },
+      );
+      const resized = resizeTemplate(source);
+      if (resized !== null) return resized;
+    } catch {
+      // Fall through to the raw bitmap decoder below.
+    }
+  }
+  if (typeof nativeImage?.createFromBitmap === "function") {
+    try {
+      const source = nativeImage.createFromBitmap(extracted, options);
+      const resized = resizeTemplate(source);
+      if (resized !== null) return resized;
+    } catch {
+      // The caller retains the non-empty source image as a final fail-soft
+      // fallback, so a renderer cannot lose its tray entry on this path.
+    }
+  }
+  return null;
+}
+
 /**
  * Resolve the reviewed tray asset from the trusted application root.
  *
@@ -290,24 +398,18 @@ export function resolveDesktopTrayIcon({
 
   if (platform === "darwin"
       && typeof resized.toBitmap === "function"
-      && typeof nativeImage.createFromBitmap === "function") {
+      && (typeof nativeImage.createFromBitmap === "function"
+        || typeof nativeImage.createFromBuffer === "function")) {
     try {
-      const bitmap = extractDesktopTrayTemplateBitmap(
-        Buffer.from(resized.toBitmap()),
-      );
-      if (bitmap === undefined) return undefined;
-      const templateSource = nativeImage.createFromBitmap(bitmap, {
-        width: TRAY_TEMPLATE_WORK_SIZE,
-        height: TRAY_TEMPLATE_WORK_SIZE,
-        scaleFactor: 1,
-      });
-      resized = templateSource.resize({
-        width: TRAY_ICON_SIZE,
-        height: TRAY_ICON_SIZE,
-        quality: "best",
-      });
+      const bitmap = Buffer.from(resized.toBitmap());
+      const template = resizedTemplateImage(nativeImage, bitmap);
+      if (template !== null) resized = template;
     } catch {
-      return undefined;
+      // Keep the non-empty resized source and mark it as a template below.
+      // A runtime-specific bitmap conversion failure must not remove the
+      // status item altogether; the PNG fallback above handles runtimes that
+      // reject createFromBitmap while this path protects older ones that do
+      // not expose either conversion helper.
     }
   }
 
