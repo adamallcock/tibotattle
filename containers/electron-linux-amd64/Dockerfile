@@ -9,6 +9,7 @@
 FROM node:26.2.0-bookworm-slim@sha256:ba2f9edd0785ee291c1a5287764cb41fdb7922336f878993f9d58622613e67a8
 
 ARG TIBOTATTLE_QUALIFICATION_REVISION
+ARG TIBOTATTLE_ALLOW_QEMU_PNPM_ABORT=0
 LABEL org.opencontainers.image.revision="${TIBOTATTLE_QUALIFICATION_REVISION}"
 ENV CI=1 \
     ELECTRON_DISABLE_SANDBOX=0 \
@@ -69,7 +70,17 @@ RUN apt-get update \
 # output, reports, and unrelated applications from the build context.
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY packages ./packages
-RUN pnpm install --frozen-lockfile --ignore-scripts
+RUN if [ "$TIBOTATTLE_ALLOW_QEMU_PNPM_ABORT" = "1" ]; then \
+      pnpm install --frozen-lockfile --ignore-scripts || status=$?; \
+      test "${status:-0}" -eq 0 || test "${status:-0}" -eq 134; \
+      if [ "${status:-0}" -eq 134 ]; then \
+        echo 'accepted QEMU-only pnpm abort after complete install output'; \
+      fi; \
+    else \
+      pnpm install --frozen-lockfile --ignore-scripts; \
+    fi \
+  && node -e 'for (const name of ["electron", "es-module-lexer", "fast-check", "@github/keytar"]) require.resolve(`${name}/package.json`)' \
+  && test -f /workspace/node_modules/.pnpm/lock.yaml
 # `allowBuilds` intentionally blocks Electron's package install hook in the
 # repository. Fetch the exact locked Linux Electron artifact with a pinned
 # checksum during the image build instead; the test phase then has no package-

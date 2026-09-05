@@ -124,6 +124,7 @@ test("Linux Electron smoke keeps the desktop boundary explicit", async () => {
   assert.match(dockerfile, /node:26\.2\.0-bookworm-slim@sha256:/u);
   assert.doesNotMatch(dockerfile, /TARGETPLATFORM/u);
   assert.match(dockerfile, /ARG TIBOTATTLE_QUALIFICATION_REVISION/u);
+  assert.match(dockerfile, /ARG TIBOTATTLE_ALLOW_QEMU_PNPM_ABORT=0/u);
   assert.match(dockerfile, /org\.opencontainers\.image\.revision/u);
   assert.match(dockerfile, /TIBOTATTLE_IMAGE_SOURCE_REVISION/u);
   assert.match(
@@ -133,6 +134,10 @@ test("Linux Electron smoke keeps the desktop boundary explicit", async () => {
   assert.doesNotMatch(dockerfile, /COPY --chown=node:node patches \.\/patches/u);
   assert.match(dockerfile, /pnpm install --frozen-lockfile/u);
   assert.match(dockerfile, /pnpm install --frozen-lockfile --ignore-scripts/u);
+  assert.match(dockerfile, /TIBOTATTLE_ALLOW_QEMU_PNPM_ABORT/u);
+  assert.match(dockerfile, /accepted QEMU-only pnpm abort/u);
+  assert.match(dockerfile, /require\.resolve\(`\$\{name\}\/package\.json`\)/u);
+  assert.match(dockerfile, /node_modules\/.pnpm\/lock\.yaml/u);
   assert.match(dockerfile, /curl --fail --silent --show-error --location --retry 3/u);
   assert.match(
     dockerfile,

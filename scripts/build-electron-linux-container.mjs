@@ -67,6 +67,8 @@ function main() {
     return fail("LINUX_CONTAINER_BUILD_REVISION_INVALID");
   }
   const target = TARGETS[options.architecture];
+  const qemuPnpmWorkaround = target.platform === "linux/amd64"
+    && process.arch !== "x64";
   const buildArguments = [
     "build",
     `--platform=${target.platform}`,
@@ -76,6 +78,8 @@ function main() {
     target.tag,
     "--build-arg",
     `TIBOTATTLE_QUALIFICATION_REVISION=${revision}`,
+    "--build-arg",
+    `TIBOTATTLE_ALLOW_QEMU_PNPM_ABORT=${qemuPnpmWorkaround ? "1" : "0"}`,
   ];
   if (options.noCache) buildArguments.push("--no-cache");
   buildArguments.push(".");
