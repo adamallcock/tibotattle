@@ -1150,7 +1150,6 @@ async function launchInteractiveRealHistoryProfile(options) {
   try {
     child = spawn(executable, [
       `--user-data-dir=${join(profile.profile, "user-data")}`,
-      "--disable-gpu",
     ], {
       cwd: join(options.appPath, "Contents", "Resources"),
       env: interactiveEnvironment(profile, options.codexHomePath),
