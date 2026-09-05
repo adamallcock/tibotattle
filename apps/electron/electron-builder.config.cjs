@@ -59,6 +59,7 @@ const artifactDirectory = path.join(
 module.exports = {
   appId: "com.adamallcock.tibotattle.electron.dev",
   productName: "TiboTattle Dev",
+  artifactName: "TiboTattle-Dev-${version}-${os}-${arch}.${ext}",
   directories: {
     app: appDirectory,
     output: artifactDirectory,
