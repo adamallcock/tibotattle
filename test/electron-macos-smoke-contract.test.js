@@ -115,7 +115,11 @@ test("macOS Electron smoke is an explicit packaged arm64 lane", async () => {
   assert.match(source, /USAGE_MONITOR_TEST_LANE: MACOS_LOCAL_QA_TEST_LANE/u);
   assert.match(source, /Page\.enable/u);
   assert.match(source, /Network\.enable/u);
-  assert.doesNotMatch(source, /Page\.reload/u);
+  // The dashboard's first-load proof must never be rescued by a reload.
+  // Settings alone reloads once to exercise an initial fragment deep link.
+  const settingsDeepLinkReload = 'await settingsCdp.request("Page.reload");';
+  assert.equal(source.split(settingsDeepLinkReload).length, 2);
+  assert.doesNotMatch(source.replace(settingsDeepLinkReload, ""), /Page\.reload/u);
   assert.match(source, /Page\.getFrameTree/u);
   assert.match(source, /localDashboardReady/u);
   assert.match(source, /assertDashboardData/u);

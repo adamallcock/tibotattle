@@ -2060,11 +2060,16 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath) {
     await settingsCdp.request("Page.navigate", {
       url: `${dashboardOrigin}/electron-settings.html#data`,
     });
+    // Changing only the fragment is a same-document navigation. Reload so
+    // this checks an initial Data deep link, including the real mount/IPC
+    // path, rather than expecting an already-mounted page to mount again.
+    await settingsCdp.request("Page.reload");
     const deepLinkedData = await waitFor(async () => settingsCdp.evaluate(`(() => {
       const activeTabs = [...document.querySelectorAll('[data-settings-tab][aria-selected="true"]')];
       const activePanels = [...document.querySelectorAll('[data-settings-panel]')]
         .filter((panel) => panel.hidden === false);
-      return activeTabs.length === 1
+      return document.querySelector("#settings-bridge-status")?.classList.contains("is-ready") === true
+        && activeTabs.length === 1
         && activeTabs[0].dataset.settingsTab === "data"
         && activePanels.length === 1
         && activePanels[0].dataset.settingsPanel === "data";
@@ -2334,8 +2339,16 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath) {
     ), MAX_STARTUP_MS, "Electron Settings sharing reopen").catch(() => {
       fail("ELECTRON_MACOS_SMOKE_SETTINGS_SHARING_INVALID", "settings");
     });
-    await settingsCdp.request("Page.navigate", {
-      url: `${dashboardOrigin}/electron-settings.html#data`,
+    // Return through the actual tab control without reloading: the Settings
+    // focus refresh must expose the newly saved Community preference itself.
+    await waitFor(async () => settingsCdp.evaluate(`(() => {
+      const tab = document.querySelector('[data-settings-tab="data"]');
+      const ready = document.querySelector("#settings-bridge-status")?.classList.contains("is-ready");
+      if (!ready || !tab) return false;
+      tab.click();
+      return true;
+    })()`), MAX_STARTUP_MS, "Electron Settings sharing Data tab").catch(() => {
+      fail("ELECTRON_MACOS_SMOKE_SETTINGS_SHARING_INVALID", "settings");
     });
     const reopenedSharingStatus = await waitFor(async () => {
       const snapshot = await settingsCdp.evaluate(`(async () => {
