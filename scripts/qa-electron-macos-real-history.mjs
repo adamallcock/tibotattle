@@ -2266,15 +2266,22 @@ async function assertCommunity(session, health, terminalStatus) {
   })()`), REAL_HISTORY_QA_TIMEOUTS.uiMs, "real-history Community parity");
   const serviceState = communityServiceConfigurationState(health);
   const serviceConfigured = serviceState === "configured";
-  const valid = serviceState === "configured"
+  // Accountless Electron has no hosted service-reachability field. Its
+  // all-disabled capability set and visible local controls are the complete
+  // contract, so classify it before the legacy local/production service gate.
+  const valid = community.accountlessMode === true
     ? communityParitySnapshotValid(community, health, {
       requirePartialDetail: terminalStatus === "degraded",
     })
-    : serviceState === "not_configured"
-      ? localQaCommunityParitySnapshotValid(community, health, {
+    : serviceState === "configured"
+      ? communityParitySnapshotValid(community, health, {
         requirePartialDetail: terminalStatus === "degraded",
       })
-      : false;
+      : serviceState === "not_configured"
+        ? localQaCommunityParitySnapshotValid(community, health, {
+          requirePartialDetail: terminalStatus === "degraded",
+        })
+        : false;
   if (!valid) fail("REAL_HISTORY_QA_COMMUNITY_INVALID", "parity", "community_invalid");
   return Object.freeze({
     pageVisible: true,

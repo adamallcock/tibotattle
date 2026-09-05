@@ -1105,6 +1105,32 @@ test("real-history parity helpers reject blank model metrics, hidden advanced mo
     capabilities: { ...health.capabilities, incrementalContributionSync: false },
   }), false);
 
+  const accountlessCommunity = {
+    accountlessMode: true,
+    route: "#community",
+    pageVisible: true,
+    accountlessPanel: true,
+    accountlessPreferenceReady: true,
+    accountlessState: true,
+    accountlessTransport: true,
+    sharingSettingsEnabled: true,
+    legacyJourneyVisible: false,
+    googleButton: false,
+    appleButton: false,
+    googleButtonEnabled: false,
+    appleButtonEnabled: false,
+    consentVisible: false,
+    partialHistoryDetail: false,
+  };
+  const accountlessHealth = {
+    capabilities: {
+      centralServiceProxy: false,
+      contributionDevicePairing: false,
+      incrementalContributionSync: false,
+    },
+  };
+  assert.equal(communityParitySnapshotValid(accountlessCommunity, accountlessHealth), true);
+
   const localHealth = {
     capabilities: {
       centralServiceProxy: false,
