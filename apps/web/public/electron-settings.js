@@ -711,16 +711,41 @@ function renderCodexRoots(
   const list = queryRequired(documentRef, "#settings-codex-roots");
   const status = queryRequired(documentRef, "#settings-codex-roots-status");
   const add = queryRequired(documentRef, "#settings-add-codex-root");
+  const useDefault = queryRequired(documentRef, "#settings-use-default-codex-folder");
   const roots = state.codexHomesForSettings?.activityRoots
     ?? state.codexHomes.activityRoots;
   const primaryRootId = state.codexHomesForSettings?.primaryRootId
     ?? state.codexHomes.primaryRootId;
   const detailsAvailable = state.codexHomesForSettings !== null;
+  const primaryRoot = roots.find(({ rootId }) => rootId === primaryRootId);
+  const defaultRoot = roots.find(({ kind }) => kind === "default");
+  const canResetSingleton = roots.length === 1 && primaryRoot?.kind !== "default";
+  const canSelectRetainedDefault = roots.length > 1
+    && defaultRoot !== undefined
+    && defaultRoot.rootId !== primaryRootId;
 
-  add.disabled = !bridgeAvailable || roots.length >= SETTINGS_CODEX_ROOT_LIMIT;
-  status.textContent = detailsAvailable
-    ? ""
-    : translateSettingsMessage(localizer, "electron.settings.codexRoots.unavailable");
+  // Adding a root would make the single-folder capability claim misleading.
+  // A reset is safe for a singleton, and a retained default can safely become
+  // primary without changing the saved root records.
+  add.hidden = true;
+  add.disabled = true;
+  useDefault.hidden = false;
+  useDefault.disabled = !bridgeAvailable
+    || !detailsAvailable
+    || (!canResetSingleton && !canSelectRetainedDefault);
+  useDefault.setAttribute(
+    "title",
+    !detailsAvailable
+      ? translateSettingsMessage(localizer, "electron.settings.codexRoots.unavailable")
+      : roots.length > 1 && defaultRoot === undefined
+        ? translateSettingsMessage(localizer, "electron.settings.codexRoots.defaultUnavailable")
+        : "",
+  );
+  status.textContent = !detailsAvailable
+    ? translateSettingsMessage(localizer, "electron.settings.codexRoots.unavailable")
+    : roots.length > 1 && defaultRoot === undefined
+      ? translateSettingsMessage(localizer, "electron.settings.codexRoots.defaultUnavailable")
+      : "";
   list.replaceChildren?.();
   if (!detailsAvailable && typeof list.replaceChildren !== "function") {
     list.textContent = "";
@@ -733,19 +758,18 @@ function renderCodexRoots(
     const location = createSettingsElement(documentRef, "span", "settings-root-path");
     const role = createSettingsElement(documentRef, "div", "settings-root-role");
     const actions = createSettingsElement(documentRef, "div", "settings-root-actions");
-    const primaryLabel = createSettingsElement(documentRef, "label", "settings-root-primary");
-    const primaryInput = createSettingsElement(documentRef, "input");
-    const primaryText = createSettingsElement(documentRef, "span");
-    if (!card || !info || !heading || !location || !role || !actions
-        || !primaryLabel || !primaryInput || !primaryText) return;
+    if (!card || !info || !heading || !location || !role || !actions) return;
 
+    const isPrimary = root.rootId === primaryRootId;
     const rootLabel = translateSettingsMessage(
       localizer,
-      "electron.settings.codexRoots.rootLabel",
+      isPrimary
+        ? "electron.settings.codexRoots.rootLabel"
+        : "electron.settings.codexRoots.retainedRootLabel",
       { position: index + 1 },
     );
-    const isPrimary = root.rootId === primaryRootId;
     card.dataset.primary = String(isPrimary);
+    card.dataset.analysisScope = isPrimary ? "primary" : "retained";
     card.setAttribute("role", "listitem");
     card.setAttribute("aria-labelledby", `settings-codex-root-${root.rootId}`);
     heading.id = `settings-codex-root-${root.rootId}`;
@@ -757,89 +781,37 @@ function renderCodexRoots(
         "electron.settings.codexRoots.missingPath",
       ));
 
-    primaryInput.type = "radio";
-    primaryInput.name = "settings-primary-codex-root";
-    primaryInput.value = root.rootId;
-    primaryInput.checked = isPrimary;
-    primaryInput.disabled = !bridgeAvailable;
-    primaryInput.setAttribute(
-      "aria-label",
-      translateSettingsMessage(localizer, "electron.settings.codexRoots.setPrimary"),
-    );
-    primaryText.textContent = translateSettingsMessage(
-      localizer,
-      isPrimary
-        ? "electron.settings.codexRoots.primary"
-        : "electron.settings.codexRoots.setPrimary",
-    );
-    primaryLabel.append(primaryInput, primaryText);
-    primaryLabel.setAttribute(
-      "title",
-      translateSettingsMessage(localizer, "electron.settings.codexRoots.primaryHelp"),
-    );
-    primaryInput.addEventListener("change", () => {
-      if (primaryInput.checked && typeof onAction === "function") {
-        onAction("setPrimaryCodexHome", { rootId: root.rootId });
-      }
-    });
-
     const roleText = createSettingsElement(documentRef, "span");
     if (roleText) {
       roleText.textContent = translateSettingsMessage(
         localizer,
         isPrimary
           ? "electron.settings.codexRoots.primaryHelp"
-          : "electron.settings.codexRoots.historyHelp",
+          : "electron.settings.codexRoots.retained",
       );
-      role.append(primaryLabel, roleText);
-    } else {
-      role.append(primaryLabel);
+      role.append(roleText);
     }
 
-    const edit = createSettingsElement(documentRef, "button", "button button-quiet");
-    const remove = createSettingsElement(documentRef, "button", "button button-quiet");
-    const moveUp = createSettingsElement(documentRef, "button", "button button-quiet");
-    const moveDown = createSettingsElement(documentRef, "button", "button button-quiet");
-    if (!edit || !remove || !moveUp || !moveDown) return;
-    const editLabel = translateSettingsMessage(localizer, "electron.settings.codexRoots.edit");
-    const removeLabel = translateSettingsMessage(localizer, "electron.settings.codexRoots.remove");
-    const moveUpLabel = translateSettingsMessage(localizer, "electron.settings.codexRoots.moveUp");
-    const moveDownLabel = translateSettingsMessage(localizer, "electron.settings.codexRoots.moveDown");
-    configureRootAction(edit, "editCodexHome", root.rootId, `${editLabel}: ${rootLabel}`);
-    configureRootAction(remove, "removeCodexHome", root.rootId, `${removeLabel}: ${rootLabel}`);
-    configureRootAction(moveUp, "moveUpCodexHome", root.rootId, `${moveUpLabel}: ${rootLabel}`);
-    configureRootAction(moveDown, "moveDownCodexHome", root.rootId, `${moveDownLabel}: ${rootLabel}`);
-    edit.textContent = editLabel;
-    remove.textContent = removeLabel;
-    moveUp.textContent = moveUpLabel;
-    moveDown.textContent = moveDownLabel;
-    edit.disabled = !bridgeAvailable || root.kind !== "custom";
-    remove.disabled = !bridgeAvailable || roots.length <= 1 || isPrimary;
-    remove.setAttribute(
-      "title",
-      isPrimary
-        ? translateSettingsMessage(localizer, "electron.settings.codexRoots.removeDisabled")
-        : translateSettingsMessage(localizer, "electron.settings.codexRoots.only"),
-    );
-    moveUp.disabled = !bridgeAvailable || index === 0;
-    moveDown.disabled = !bridgeAvailable || index === roots.length - 1;
-    edit.addEventListener("click", () => onAction?.("editCodexHome", { rootId: root.rootId }));
-    remove.addEventListener("click", () => onAction?.("removeCodexHome", { rootId: root.rootId }));
-    moveUp.addEventListener("click", () => {
-      if (index === 0) return;
-      const rootIds = roots.map(({ rootId }) => rootId);
-      [rootIds[index - 1], rootIds[index]] = [rootIds[index], rootIds[index - 1]];
-      onAction?.("reorderCodexHomes", { rootIds });
-    });
-    moveDown.addEventListener("click", () => {
-      if (index === roots.length - 1) return;
-      const rootIds = roots.map(({ rootId }) => rootId);
-      [rootIds[index], rootIds[index + 1]] = [rootIds[index + 1], rootIds[index]];
-      onAction?.("reorderCodexHomes", { rootIds });
-    });
-    actions.append(edit, remove, moveUp, moveDown);
+    // A custom primary can be replaced in place, preserving the IDs and
+    // paths of every retained v2 root. No secondary action is exposed while
+    // only the primary is passed to the companion.
+    if (isPrimary && detailsAvailable && (root.kind === "custom" || roots.length === 1)) {
+      const edit = createSettingsElement(documentRef, "button", "button button-quiet");
+      if (!edit) return;
+      const editLabel = translateSettingsMessage(localizer, "electron.settings.codexRoots.edit");
+      const action = root.kind === "custom" ? "editCodexHome" : "chooseCodexHome";
+      configureRootAction(edit, action, root.rootId, `${editLabel}: ${rootLabel}`);
+      edit.textContent = editLabel;
+      edit.disabled = !bridgeAvailable;
+      edit.addEventListener("click", () => onAction?.(
+        action,
+        action === "editCodexHome" ? { rootId: root.rootId } : undefined,
+      ));
+      actions.append(edit);
+    }
     info.append(heading, location, role);
-    card.append(info, actions);
+    card.append(info);
+    if (actions.childNodes?.length > 0) card.append(actions);
     list.append(card);
   });
 }
@@ -1308,11 +1280,16 @@ export async function mountSettingsPage({
   listen(queryRequired(documentRef, "#settings-appearance"), "change", (event) => {
     void invoke("setAppearance", event.target.value);
   });
-  listen(queryRequired(documentRef, "#settings-add-codex-root"), "click", () => {
-    void invoke("addCodexHome");
-  });
   listen(queryRequired(documentRef, "#settings-use-default-codex-folder"), "click", () => {
-    void invoke("useDefaultCodexHome");
+    const roots = currentState.codexHomesForSettings?.activityRoots;
+    if (!Array.isArray(roots) || roots.length < 1) return;
+    const defaultRoot = roots.find(({ kind }) => kind === "default");
+    if (roots.length === 1) {
+      void invoke("useDefaultCodexHome");
+      return;
+    }
+    if (defaultRoot?.rootId === currentState.codexHomesForSettings?.primaryRootId) return;
+    if (defaultRoot) void invoke("setPrimaryCodexHome", { rootId: defaultRoot.rootId });
   });
   listen(queryRequired(documentRef, "#settings-refresh-interval"), "change", (event) => {
     void invoke("setRefreshInterval", Number(event.target.value));

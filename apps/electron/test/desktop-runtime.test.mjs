@@ -25,6 +25,26 @@ function customCodexHomes(path, rootId = CUSTOM_CODEX_ROOT_ID) {
   };
 }
 
+function twoCodexHomes(primaryRootId = DEFAULT_CODEX_ROOT_ID) {
+  return {
+    activityRoots: [
+      {
+        rootId: DEFAULT_CODEX_ROOT_ID,
+        kind: "default",
+        path: null,
+        enabled: true,
+      },
+      {
+        rootId: CUSTOM_CODEX_ROOT_ID,
+        kind: "custom",
+        path: "/Users/adam/.codex-custom",
+        enabled: true,
+      },
+    ],
+    primaryRootId,
+  };
+}
+
 class FakeChild extends EventEmitter {
   constructor() {
     super();
@@ -553,57 +573,42 @@ test("runtime applies persisted custom CODEX_HOME before first child start", asy
     }),
   });
   assert.equal(fixture.desktop.childEnvironment.CODEX_HOME, "/Users/adam/.codex-first");
-  assert.deepEqual(fixture.spawnCalls[0].args, [
-    "/repo/apps/local/server.js",
-    "--codex-home",
-    "/Users/adam/.codex-first",
-    "--primary-codex-home",
-    "/Users/adam/.codex-first",
-  ]);
+  assert.deepEqual(fixture.spawnCalls[0].args, ["/repo/apps/local/server.js"]);
   await fixture.desktop.lifecycle.dispose();
 });
 
-test("runtime relaunches with every configured root and exactly one primary flag", async () => {
-  const fixture = await launchFixture({ load: async () => null });
-  const add = fixture.desktop.controller.handlers.addCodexHome({});
+test("runtime launches the companion with only the selected primary CODEX_HOME", async () => {
+  const fixture = await launchFixture({
+    load: async () => ({
+      ...DESKTOP_DEFAULT_SETTINGS,
+      codexHomes: twoCodexHomes(CUSTOM_CODEX_ROOT_ID),
+    }),
+  });
+  assert.deepEqual(fixture.spawnCalls[0].args, ["/repo/apps/local/server.js"]);
+  assert.equal(fixture.spawnCalls[0].options.env.CODEX_HOME, "/Users/adam/.codex-custom");
+
+  const roots = await fixture.desktop.controller.handlers.getCodexHomesForSettings({});
+  assert.deepEqual(roots.activityRoots.map(({ rootId }) => rootId), [
+    DEFAULT_CODEX_ROOT_ID,
+    CUSTOM_CODEX_ROOT_ID,
+  ]);
+  const setPrimary = fixture.desktop.controller.handlers.setPrimaryCodexHome({
+    rootId: DEFAULT_CODEX_ROOT_ID,
+  });
   for (let attempt = 0; attempt < 20 && fixture.children.length < 2; attempt += 1) {
     await new Promise((resolve) => setImmediate(resolve));
   }
   assert.equal(fixture.children.length, 2);
   fixture.children[1].stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4812/\n"));
-  await add;
-  assert.deepEqual(fixture.spawnCalls[1].args, [
-    "/repo/apps/local/server.js",
-    "--codex-home",
-    "/Users/adam/.codex",
-    "--codex-home",
-    "/Users/adam/.codex-custom",
-    "--primary-codex-home",
-    "/Users/adam/.codex",
-  ]);
-  assert.equal(fixture.spawnCalls[1].options.env.CODEX_HOME, "/Users/adam/.codex");
-
-  const roots = await fixture.desktop.controller.handlers.getCodexHomesForSettings({});
-  const custom = roots.activityRoots.find(({ kind }) => kind === "custom");
-  const setPrimary = fixture.desktop.controller.handlers.setPrimaryCodexHome({
-    rootId: custom.rootId,
-  });
-  for (let attempt = 0; attempt < 20 && fixture.children.length < 3; attempt += 1) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-  assert.equal(fixture.children.length, 3);
-  fixture.children[2].stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4813/\n"));
   await setPrimary;
-  assert.deepEqual(fixture.spawnCalls[2].args, [
-    "/repo/apps/local/server.js",
-    "--codex-home",
-    "/Users/adam/.codex",
-    "--codex-home",
-    "/Users/adam/.codex-custom",
-    "--primary-codex-home",
-    "/Users/adam/.codex-custom",
+  assert.deepEqual(fixture.spawnCalls[1].args, ["/repo/apps/local/server.js"]);
+  assert.equal(fixture.spawnCalls[1].options.env.CODEX_HOME, "/Users/adam/.codex");
+  const persisted = await fixture.desktop.controller.handlers.getCodexHomesForSettings({});
+  assert.deepEqual(persisted.activityRoots.map(({ rootId }) => rootId), [
+    DEFAULT_CODEX_ROOT_ID,
+    CUSTOM_CODEX_ROOT_ID,
   ]);
-  assert.equal(fixture.spawnCalls[2].options.env.CODEX_HOME, "/Users/adam/.codex-custom");
+  assert.equal(persisted.primaryRootId, DEFAULT_CODEX_ROOT_ID);
   await fixture.desktop.lifecycle.dispose();
 });
 
@@ -794,13 +799,7 @@ test("runtime retains a configured root when its path is currently unavailable",
   });
   assert.deepEqual(validated, []);
   assert.equal(fixture.desktop.childEnvironment.CODEX_HOME, missing);
-  assert.deepEqual(fixture.spawnCalls[0].args, [
-    "/repo/apps/local/server.js",
-    "--codex-home",
-    missing,
-    "--primary-codex-home",
-    missing,
-  ]);
+  assert.deepEqual(fixture.spawnCalls[0].args, ["/repo/apps/local/server.js"]);
   assert.equal(
     (await fixture.desktop.controller.handlers.getCodexHomesForSettings({})).activityRoots[0].path,
     missing,
@@ -827,13 +826,7 @@ test("runtime keeps the prior child and environment when root persistence fails"
   assert.equal(saves, 1);
   assert.equal(fixture.children.length, 1);
   assert.equal(fixture.desktop.childEnvironment.CODEX_HOME, "/Users/adam/.codex");
-  assert.deepEqual(fixture.spawnCalls[0].args, [
-    "/repo/apps/local/server.js",
-    "--codex-home",
-    "/Users/adam/.codex",
-    "--primary-codex-home",
-    "/Users/adam/.codex",
-  ]);
+  assert.deepEqual(fixture.spawnCalls[0].args, ["/repo/apps/local/server.js"]);
   await fixture.desktop.lifecycle.dispose();
 });
 

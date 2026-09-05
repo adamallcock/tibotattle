@@ -1198,12 +1198,16 @@ export function classifyMacSettingsEvidence({
   rootCount = 0,
   renderedRootCount = 0,
   primaryRadioCount = 0,
-  selectedPrimaryCount = 0,
   primaryCardCount = 0,
-  selectedPrimaryRootId = null,
+  primaryHeadingId = null,
+  primaryCardLabelledBy = null,
+  retainedCardCount = 0,
+  renderedRetainedCardCount = 0,
+  retainedNotAnalyzedCount = 0,
   listRole = false,
   cardsHaveSemantics = false,
   addPresent = false,
+  addHidden = false,
   addDisabled = true,
   genericSettings = null,
   genericDashboardSettings = null,
@@ -1213,8 +1217,15 @@ export function classifyMacSettingsEvidence({
   const normalizedRenderedRootCount = Number.isInteger(renderedRootCount)
     ? renderedRootCount
     : 0;
-  const belowLimit = normalizedRootCount >= 1
-    && normalizedRootCount < MACOS_SMOKE_CODEX_ROOT_LIMIT;
+  const normalizedRetainedCardCount = Number.isInteger(retainedCardCount)
+    ? retainedCardCount
+    : 0;
+  const normalizedRenderedRetainedCardCount = Number.isInteger(renderedRetainedCardCount)
+    ? renderedRetainedCardCount
+    : 0;
+  const normalizedRetainedNotAnalyzedCount = Number.isInteger(retainedNotAnalyzedCount)
+    ? retainedNotAnalyzedCount
+    : 0;
   const genericSnapshotPathFree = isMacPathFreeSettingsSnapshot(genericSettings)
     && isMacPathFreeSettingsSnapshot(genericDashboardSettings);
   const pathfulRead = isMacPathfulCodexHomes(pathfulRoots);
@@ -1224,19 +1235,24 @@ export function classifyMacSettingsEvidence({
   const genericDashboardHomes = isPlainSmokeRecord(genericDashboardSettings?.settings)
     ? genericDashboardSettings.settings.codexHomes
     : genericDashboardSettings?.codexHomes;
-  const primaryIdentityMatches = typeof selectedPrimaryRootId === "string"
-    && selectedPrimaryRootId === genericHomes?.primaryRootId
-    && selectedPrimaryRootId === genericDashboardHomes?.primaryRootId
-    && selectedPrimaryRootId === pathfulRoots?.primaryRootId;
-  const primarySelected = normalizedRootCount >= 1
-    && primaryRadioCount === normalizedRootCount
-    && selectedPrimaryCount === 1
+  const primaryRootId = genericHomes?.primaryRootId;
+  const expectedPrimaryHeadingId = typeof primaryRootId === "string"
+    ? `settings-codex-root-${primaryRootId}`
+    : null;
+  const primaryIdentityMatches = primaryRootId === genericDashboardHomes?.primaryRootId
+    && primaryRootId === pathfulRoots?.primaryRootId
+    && primaryHeadingId === expectedPrimaryHeadingId
+    && primaryCardLabelledBy === primaryHeadingId;
+  const primaryCardBound = normalizedRootCount >= 1
+    && primaryRadioCount === 0
     && primaryCardCount === 1
     && primaryIdentityMatches;
+  const expectedRetainedCount = Math.max(0, normalizedRootCount - 1);
+  const retainedCardsNotAnalyzed = normalizedRetainedCardCount === expectedRetainedCount
+    && normalizedRenderedRetainedCardCount === expectedRetainedCount
+    && normalizedRetainedNotAnalyzedCount === expectedRetainedCount;
   const listSemantics = listRole === true && cardsHaveSemantics === true;
-  const addEnabled = addPresent === true && addDisabled === false;
-  const addSemantics = addPresent === true
-    && (belowLimit ? addDisabled === false : addDisabled === true);
+  const addSemantics = addPresent === true && addHidden === true && addDisabled === true;
   const pathfulRootCount = Array.isArray(pathfulRoots?.activityRoots)
     ? pathfulRoots.activityRoots.length
     : 0;
@@ -1255,7 +1271,8 @@ export function classifyMacSettingsEvidence({
   const status = normalizedRootCount >= 1
     && normalizedRenderedRootCount >= 1
     && normalizedRenderedRootCount === normalizedRootCount
-    && primarySelected
+    && primaryCardBound
+    && retainedCardsNotAnalyzed
     && listSemantics
     && addSemantics
     && genericSnapshotPathFree
@@ -1268,10 +1285,12 @@ export function classifyMacSettingsEvidence({
     status: status ? "passed" : "failed",
     rootCount: normalizedRootCount,
     renderedRootCount: normalizedRenderedRootCount,
-    primarySelected,
+    primaryCardBound,
+    retainedCardsNotAnalyzed,
     listSemantics,
     addPresent: addPresent === true,
-    addEnabled,
+    addHidden: addHidden === true,
+    addDisabled: addDisabled === true,
     genericSnapshotPathFree,
     pathfulRead,
   });
@@ -2132,33 +2151,40 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath) {
       const radios = [...document.querySelectorAll(
         '#settings-codex-roots input[type="radio"][name="settings-primary-codex-root"]',
       )];
-      const selected = radios.filter((input) => input.checked === true);
-      const primaryCards = cards.filter((card) => card.dataset.primary === "true");
+      const primaryCards = cards.filter((card) => card.dataset.primary === "true"
+        && card.dataset.analysisScope === "primary");
+      const retainedCards = cards.filter((card) => card.dataset.primary === "false"
+        && card.dataset.analysisScope === "retained");
       const cardsHaveSemantics = cards.length > 0 && cards.every((card) => {
         const heading = card.querySelector("h4");
-        const radio = card.querySelector(
-          'input[type="radio"][name="settings-primary-codex-root"]',
-        );
+        const primary = card.dataset.primary;
+        const analysisScope = card.dataset.analysisScope;
         return heading !== null
           && typeof heading.id === "string"
           && heading.id.startsWith("settings-codex-root-")
           && card.getAttribute("aria-labelledby") === heading.id
-          && radio !== null
-          && typeof radio.value === "string"
-          && radio.value.length > 0;
+          && ((primary === "true" && analysisScope === "primary")
+            || (primary === "false" && analysisScope === "retained"));
       });
+      const primaryCard = primaryCards.length === 1 ? primaryCards[0] : null;
+      const primaryHeading = primaryCard?.querySelector("h4") ?? null;
       const genericSettings = await globalThis.tibotattleDesktop?.getSettings?.();
       const pathfulRoots = await globalThis.tibotattleDesktop?.getCodexHomesForSettings?.();
       return {
         rootCount: cards.length,
         renderedRootCount: cards.filter(visible).length,
         primaryRadioCount: radios.length,
-        selectedPrimaryCount: selected.length,
-        selectedPrimaryRootId: selected.length === 1 ? selected[0].value : null,
         primaryCardCount: primaryCards.length,
+        primaryHeadingId: primaryHeading?.id ?? null,
+        primaryCardLabelledBy: primaryCard?.getAttribute("aria-labelledby") ?? null,
+        retainedCardCount: retainedCards.length,
+        renderedRetainedCardCount: retainedCards.filter(visible).length,
+        retainedNotAnalyzedCount: retainedCards.filter((card) =>
+          card.dataset.analysisScope === "retained").length,
         listRole: list?.getAttribute("role") === "list",
         cardsHaveSemantics,
         addPresent: document.querySelector("#settings-add-codex-root") !== null,
+        addHidden: document.querySelector("#settings-add-codex-root")?.hidden === true,
         addDisabled: document.querySelector("#settings-add-codex-root")?.disabled === true,
         genericSettings,
         pathfulRoots,
@@ -2175,10 +2201,12 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath) {
       tabs: true,
       rootCount: settingsEvidence.rootCount,
       renderedRootCount: settingsEvidence.renderedRootCount,
-      primarySelected: settingsEvidence.primarySelected,
+      primaryCardBound: settingsEvidence.primaryCardBound,
+      retainedCardsNotAnalyzed: settingsEvidence.retainedCardsNotAnalyzed,
       listSemantics: settingsEvidence.listSemantics,
       addPresent: settingsEvidence.addPresent,
-      addEnabled: settingsEvidence.addEnabled,
+      addHidden: settingsEvidence.addHidden,
+      addDisabled: settingsEvidence.addDisabled,
       genericSnapshotPathFree: settingsEvidence.genericSnapshotPathFree,
       pathfulRead: settingsEvidence.pathfulRead,
       refreshIntervalPersisted: persistence.status === "passed",
@@ -2371,10 +2399,12 @@ export function buildClosedReceipt({
       renderedRootCount: Number.isInteger(settings.renderedRootCount)
         ? settings.renderedRootCount
         : 0,
-      primarySelected: settings.primarySelected === true,
+      primaryCardBound: settings.primaryCardBound === true,
+      retainedCardsNotAnalyzed: settings.retainedCardsNotAnalyzed === true,
       listSemantics: settings.listSemantics === true,
       addPresent: settings.addPresent === true,
-      addEnabled: settings.addEnabled === true,
+      addHidden: settings.addHidden === true,
+      addDisabled: settings.addDisabled === true,
       genericSnapshotPathFree: settings.genericSnapshotPathFree === true,
       pathfulRead: settings.pathfulRead === true,
       refreshIntervalPersisted: settings.refreshIntervalPersisted === true,

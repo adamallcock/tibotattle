@@ -29,10 +29,23 @@ function twoCodexHomes() {
   });
 }
 
+function readyLifecycleState(overrides = {}) {
+  return {
+    started: true,
+    quitting: false,
+    primaryInstance: true,
+    hasWindow: true,
+    hasRecoveryWindow: false,
+    windowVisible: true,
+    dashboardReady: true,
+    ...overrides,
+  };
+}
+
 function fixture({
   platformOverrides = {},
   lifecycleOverrides = {},
-  lifecycleState = { windowVisible: true, dashboardReady: true },
+  lifecycleState = readyLifecycleState(),
   actionOverrides = {},
   clock = () => Date.now(),
   settingsLoad = async () => null,
@@ -381,22 +394,40 @@ test("controller keeps automatic detailed cadence across controller instances", 
   await second.controller.dispose();
 });
 
-test("automatic cadence pauses while the dashboard is hidden, while manual refresh stays detailed", async () => {
-  const lifecycleState = { windowVisible: false, dashboardReady: true };
-  const value = fixture({ lifecycleState });
-  await value.controller.initialize();
-  await fireAutomaticTimer(value, value.timers[0]);
-  assert.deepEqual(value.commands, []);
-
-  lifecycleState.windowVisible = true;
-  await fireAutomaticTimer(value);
-  assert.deepEqual(value.commands, [{ command: "automaticRefresh", mode: "quick" }]);
-
-  assert.equal(value.controller.refreshUsage(), true);
-  assert.deepEqual(value.commands, [
+test("automatic cadence continues while the live dashboard is hidden and refuses recovery or quit", async () => {
+  const hidden = fixture({
+    lifecycleState: readyLifecycleState({ windowVisible: false }),
+  });
+  await hidden.controller.initialize();
+  await fireAutomaticTimer(hidden, hidden.timers[0]);
+  assert.deepEqual(hidden.commands, [{ command: "automaticRefresh", mode: "quick" }]);
+  assert.equal(hidden.controller.refreshUsage(), true);
+  assert.deepEqual(hidden.commands, [
     { command: "automaticRefresh", mode: "quick" },
     { command: "refresh" },
   ]);
+
+  const recovery = fixture({
+    lifecycleState: readyLifecycleState({
+      started: false,
+      hasWindow: false,
+      hasRecoveryWindow: true,
+      dashboardReady: false,
+      windowVisible: false,
+    }),
+  });
+  await recovery.controller.initialize();
+  await fireAutomaticTimer(recovery, recovery.timers[0]);
+  assert.deepEqual(recovery.commands, []);
+  assert.equal(recovery.timers.at(-1).milliseconds, 300_000);
+
+  const quitting = fixture({
+    lifecycleState: readyLifecycleState({ quitting: true, windowVisible: false }),
+  });
+  await quitting.controller.initialize();
+  await fireAutomaticTimer(quitting, quitting.timers[0]);
+  assert.deepEqual(quitting.commands, []);
+  assert.equal(quitting.timers.at(-1).milliseconds, 300_000);
 });
 
 test("refresh leases ignore stale completion and only the current lease rearms cadence", async () => {

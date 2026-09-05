@@ -31,7 +31,7 @@ native product control.
 | Native 0.1.18 behavior and source | Electron current equivalent and source | Status | Next gate |
 | --- | --- | --- | --- |
 | Startup loads the dashboard and requests one quick foreground refresh in [`UsageMonitorApp.swift`](../../apps/macos/UsageMonitorApp.swift) (`dashboardWebViewLoaded`). | [`apps/web/public/app.js`](../../apps/web/public/app.js) gates startup on the Electron marker and local readiness, selects detailed for a deferred projection and quick for a trusted available projection, and settles the main-process lease. | Source-complete for the selected cold/warm modes; focused route tests pass. | Fresh packaged smoke must observe the expected POST and updated dashboard for the exact artifact. |
-| Foreground cadence uses a persisted 60/300/900/1800-second interval and rate-limits automatic detailed accounting to one attempt per hour in [`UsageMonitorApp.swift`](../../apps/macos/UsageMonitorApp.swift) (`NativeRefreshIntervalPreference`, `NativeDetailedRefreshCadence`, `scheduleNativeRefresh`). | [`apps/electron/desktop-controller.js`](../../apps/electron/desktop-controller.js) owns the persisted timer and lease; its closed `automaticRefresh` command carries `quick` or `detailed`, uses a monotonic in-process hourly reservation plus a protected persisted attempt record, and pauses while the dashboard is hidden. Manual `refresh` remains detailed; browser return refresh remains quick. | Source-complete with cross-launch persistence wired in `7b384986`; cadence, controller and runtime tests passed 50/50, including restart and protected-backend behavior. | Run packaged timer smoke on each target before claiming installed cadence qualification. |
+| Foreground cadence uses a persisted 60/300/900/1800-second interval and rate-limits automatic detailed accounting to one attempt per hour in [`UsageMonitorApp.swift`](../../apps/macos/UsageMonitorApp.swift) (`NativeRefreshIntervalPreference`, `NativeDetailedRefreshCadence`, `scheduleNativeRefresh`). | [`apps/electron/desktop-controller.js`](../../apps/electron/desktop-controller.js) owns the persisted timer and lease; its closed `automaticRefresh` command carries `quick` or `detailed`, uses a monotonic in-process hourly reservation plus a protected persisted attempt record, and continues while the app is hidden in the tray. It refuses dispatch during recovery, shutdown, or an unready dashboard. Manual `refresh` remains detailed; browser return refresh remains quick. | Source-complete with cross-launch persistence wired in `7b384986`; cadence, controller and runtime tests passed 50/50, including restart and protected-backend behavior. | Run packaged timer smoke on each target before claiming installed cadence qualification. |
 | Toolbar refresh explicitly requests detailed accounting in [`UsageMonitorApp.swift`](../../apps/macos/UsageMonitorApp.swift) (`refreshDashboardFromToolbar`). | The dashboard and setup refresh controls in [`apps/web/public/app.js`](../../apps/web/public/app.js) call the detailed route; Electron menu/tray actions use the separate manual `refresh` command. | Current for visible dashboard and menu/tray controls; focused tests prove automatic mode cannot change manual intent. | Verify menu/tray detailed refresh on each packaged target. |
 | The menu-bar popover provides weekly pace and outlook from [`MenuBarPaceOutlook.swift`](../../apps/macos/Sources/MenuBarPaceOutlook.swift) and renders the control surface in [`MenuBarPopover.swift`](../../apps/macos/Sources/MenuBarPopover.swift). | Electron opens the same-origin [`electron-tray-popup.html`](../../apps/web/public/electron-tray-popup.html) from the tray through [`apps/electron/desktop-tray-popover.js`](../../apps/electron/desktop-tray-popover.js); its renderer consumes the companion's validated `paceOutlook` projection in [`electron-tray-popup.js`](../../apps/web/public/electron-tray-popup.js). Fixed `weekly` actions remain available through [`desktop-menu.js`](../../apps/electron/desktop-menu.js) and [`desktop-tray.js`](../../apps/electron/desktop-tray.js). | Source-complete for a shared visual popup with allowance lanes, weekly pace/outlook, and bounded action routing. The dedicated Swift presentation and Electron window geometry differ. | Run the packaged popup smoke on each target and retain the screenshot/target receipt. |
 | Native menu-bar history shows 7-day and 30-day horizons and retained-history state in [`MenuBarPopupModel.swift`](../../apps/macos/Sources/MenuBarPopupModel.swift) and [`MenuBarPopover.swift`](../../apps/macos/Sources/MenuBarPopover.swift). | The Electron popup renders 7-day/30-day history, coverage, pricing, and retained-history disclosures from the normalized local DTO in [`electron-tray-popup.js`](../../apps/web/public/electron-tray-popup.js); dashboard weekly/timeline/Usage and Costs destinations remain available through [`desktop-shell.js`](../../apps/web/public/desktop-shell.js) and [`app.js`](../../apps/web/public/app.js). | Source-complete for the bounded shared projection; the popup uses local range controls and preserves unavailable/partial evidence states. | Verify the packaged popup's history and coverage states, then retain the rendered screenshot/receipt. |
@@ -44,7 +44,38 @@ native product control.
 | Native has no equivalent to the accepted accountless Electron transition policy in its 0.1.18 shell. | Electron sharing controls use the main-process preference bridge and show a truthful unavailable transport state; the Electron composition suppresses legacy sign-in controls. | Electron-specific current behavior; transport is unavailable in this tranche. | Keep policy and upload authority separate; qualify transport only after its own accountless authority exists. |
 | Native packaging and distribution are governed by the macOS build and signing lanes. | Electron builder configuration targets `darwin-arm64`, `darwin-x64`, `win32-x64`, and `linux-x64`; the isolated Windows launcher `.mjs` and generated `.cmd` wrapper request the reviewed qualification marker and a `%LOCALAPPDATA%` profile. | Source/build plan present; no release or platform-support claim. | Build and inspect each exact artifact, then retain separate qualification, signing, publication, and support gates. |
 
+## Background integration review
+
+The follow-up audit compared actual production entrypoints, not only shared
+module presence or launch-argument tests. It found two Electron integration
+defects: secondary folder arguments were ignored by the directly launched
+companion, and automatic refresh paused while the dashboard was hidden.
+The candidate therefore uses the native single-folder analysis contract,
+retains saved additional folder configurations, and keeps the owned refresh
+cadence active while hidden. Full multi-folder ingestion requires a future
+end-to-end proof that secondary records enter the index without duplication.
+
+Parser-v14, Astra model definitions, paginated history/index, pricing/replay and
+account/quota linkage sources match the frozen native baseline. The accounting
+child additionally preserves the exact Electron Node-mode flag so that the
+same rebuild code runs under the packaged Electron executable. Shared-source
+identity is evidence about the algorithm; it is not an installed migration or
+real-corpus qualification receipt.
+
+The hosted/admin audit found unchanged existing contribution, participant
+identity, upload replay, admin UI and operations implementations. The additive
+accountless enrollment route is disabled by default and grants enrollment only;
+its separate ledger does not create upload authority or participant identity.
+Seventeen enrollment/route tests passed in local Miniflare. No hosted service,
+configuration or remote migration was changed by this work.
+
 ## Focused evidence
+
+The background/UI correction passed the combined Electron, web and packaged
+macOS smoke-contract suite: 904 tests, no failures or skips. An independent
+Terra verifier traced the composition and reran 135 affected tests successfully.
+Documentation governance, architecture boundaries, i18n mirror and 20 preflight
+tests passed. These are source checks; exact-package receipts remain separate.
 
 ### Page-by-page follow-up
 
@@ -69,8 +100,9 @@ The review identified and repaired these source gaps:
 | Tray popup | Add native-equivalent More actions and keep the action menu mutually exclusive with the popup. | Primary, right and Control clicks; More; Escape/outside dismissal; repeat after status/language updates. |
 | Settings confirmation | Successful preference saves use a success state; failures retain their error state and live announcement. | Save in a disposable profile and inspect text, color and persistence. |
 
-Core General settings expose equivalent controls, while multi-root management
-and accountless sharing are Electron additions. Notification and updater
+Core General settings target native single-folder behavior. Saved additional
+folder entries are retained for future support and are explicitly not analyzed.
+Accountless sharing is an Electron addition. Notification and updater
 controls retain explicit unavailable states where their adapters are not
 qualified; visible controls do not establish native updater or delivery parity.
 Native AppKit sidebar, toolbar, window chrome and popup styling differ from the

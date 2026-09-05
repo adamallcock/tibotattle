@@ -447,6 +447,18 @@ test("unavailable accounting never turns absent history into zero", () => {
   assert.equal(projection.history.days.every((day) => day.usageEvents === null), true);
 });
 
+test("missing daily history does not label available aggregate accounting unavailable", () => {
+  const data = fixture({ historyStatus: "unavailable" });
+  data.timeline.usage = [];
+  const projection = createTrayPopupProjection(data, { now: NOW, timeZone: "UTC" });
+  assert.notEqual(projection.history.period, null);
+  const documentRef = new FakeDocument();
+  renderTrayPopup(documentRef, projection);
+  const copy = documentRef.getElementById("history-coverage").textContent;
+  assert.match(copy, /missing-data state/u);
+  assert.doesNotMatch(copy, /accounting is unavailable/u);
+});
+
 test("history keeps fractional currency totals when rows include integer-priced buckets", () => {
   const data = fixture();
   data.timeline.usage.push(usageRow(4, 18, { events: 1, tokens: 100, cost: 1 }));

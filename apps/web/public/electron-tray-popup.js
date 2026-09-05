@@ -1032,9 +1032,9 @@ function renderHistory(documentRef, projection, t, numberFormatter, localFormatt
   setElementText(documentRef, "history-cost", period && period.pricingState !== "unavailable"
     ? displayMoney(period.apiPriceEquivalentUsd, numberFormatter)
     : "—");
-  const coverageCopy = history.status === "unavailable"
+  const coverageCopy = history.status === "unavailable" && period === null
     ? t("accounting.projection.unavailable")
-    : history.status === "partial"
+    : history.status !== "complete"
       ? t("dashboard.timeline.missingData")
       : t("accounting.apiEquivalent.standardRateBasis");
   setElementText(documentRef, "history-coverage", coverageCopy);

@@ -2927,11 +2927,12 @@ test("packaged Electron composition keeps the companion in app.asar and uses phy
   assert.equal(spawnCalls.length, 1);
   assert.deepEqual(spawnCalls[0].args, [
     "/private/TiboTattle.app/Contents/Resources/app.asar/apps/local/server.js",
-    "--codex-home",
-    "/Users/adamallcock/.codex",
-    "--primary-codex-home",
-    "/Users/adamallcock/.codex",
   ]);
+  assert.equal(
+    spawnCalls[0].options.env.CODEX_HOME,
+    "/Users/adamallcock/.codex",
+    "the direct companion entrypoint receives its analyzed root through CODEX_HOME",
+  );
   assert.equal(
     spawnCalls[0].options.cwd,
     "/private/TiboTattle.app/Contents/Resources",

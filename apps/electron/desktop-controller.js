@@ -453,7 +453,7 @@ export function createDesktopController({
     }
   }
 
-  function automaticRefreshIsVisible() {
+  function automaticRefreshHasLiveDashboard() {
     let selected;
     try {
       selected = getLifecycle();
@@ -470,10 +470,16 @@ export function createDesktopController({
     if (state === null || typeof state !== "object" || Array.isArray(state)) {
       return false;
     }
-    // The real lifecycle state is the supported host contract. Requiring both
-    // flags prevents an embedding or stale facade from treating a live but
-    // hidden/unready BrowserWindow as a foreground refresh surface.
-    return state.windowVisible === true && state.dashboardReady === true;
+    // The lifecycle owns the companion and the only trusted dashboard
+    // BrowserWindow. A close-to-tray window remains that live foreground app,
+    // so visibility must not suppress its persisted cadence. Recovery,
+    // shutdown, secondary-instance, and stale-window states remain ineligible.
+    return state.started === true
+      && state.quitting === false
+      && state.primaryInstance === true
+      && state.hasWindow === true
+      && state.hasRecoveryWindow !== true
+      && state.dashboardReady === true;
   }
 
   function notifyLanguageChanged(value) {
@@ -550,7 +556,7 @@ export function createDesktopController({
     automaticRefreshTickInFlight = true;
     let followupArmed = false;
     try {
-      if (!automaticRefreshIsVisible()) {
+      if (!automaticRefreshHasLiveDashboard()) {
         startRefreshTimer(seconds);
         followupArmed = true;
         return;

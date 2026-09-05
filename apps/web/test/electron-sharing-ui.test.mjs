@@ -108,6 +108,152 @@ test("Electron sharing UI uses the accountless bridge and visible receipt gate",
   assert.match(settingsCss, /\.settings-operation-status\.is-error\s*\{\s*color: var\(--rust\);/u);
 });
 
+test("Electron settings expose one analyzed Codex folder and retain extras without actions", async () => {
+  const [settingsHtml, settingsSource] = await Promise.all([
+    readFile(new URL("../public/electron-settings.html", import.meta.url), "utf8"),
+    readFile(new URL("../public/electron-settings.js", import.meta.url), "utf8"),
+  ]);
+  const renderer = extractFunction(settingsSource, "renderCodexRoots");
+  assert.match(settingsHtml, /TiboTattle analyzes the selected Codex folder/u);
+  assert.match(settingsHtml, /retained for future multi-folder support and are not analyzed/u);
+  assert.match(settingsHtml, /id="settings-add-codex-root"[^>]*hidden[^>]*disabled/u);
+  assert.match(settingsHtml, /id="settings-use-default-codex-folder"[^>]*disabled/u);
+  assert.match(renderer, /add\.hidden = true;[\s\S]*?add\.disabled = true;/u);
+  assert.match(renderer, /useDefault\.hidden = false;[\s\S]*?useDefault\.disabled = !bridgeAvailable/u);
+  assert.match(renderer, /electron\.settings\.codexRoots\.retained/u);
+  assert.match(renderer, /if \(isPrimary && detailsAvailable && \(root\.kind === "custom" \|\| roots\.length === 1\)\)/u);
+  assert.doesNotMatch(renderer, /addCodexHome|removeCodexHome|setPrimaryCodexHome|reorderCodexHomes/u);
+  assert.match(
+    settingsSource,
+    /if \(roots\.length === 1\) \{\s*void invoke\("useDefaultCodexHome"\);/u,
+  );
+  assert.match(
+    settingsSource,
+    /void invoke\("setPrimaryCodexHome", \{ rootId: defaultRoot\.rootId \}\);/u,
+  );
+
+  const configureRootAction = extractFunction(settingsSource, "configureRootAction");
+  const renderCodexRoots = new Function(
+    "queryRequired",
+    "translateSettingsMessage",
+    "createSettingsElement",
+    "configureRootAction",
+    `${renderer}\nreturn renderCodexRoots;`,
+  )(
+    (documentRef, selector) => documentRef.elements.get(selector),
+    (_localizer, key, values = {}) => `${key}${values.position === undefined ? "" : `:${values.position}`}`,
+    (documentRef, tagName, className = "") => documentRef.createElement(tagName, className),
+    new Function(`${configureRootAction}\nreturn configureRootAction;`)(),
+  );
+  const element = (tagName = "div", className = "") => ({
+    tagName,
+    className,
+    childNodes: [],
+    dataset: {},
+    attributes: new Map(),
+    textContent: "",
+    hidden: false,
+    disabled: false,
+    append(...children) { this.childNodes.push(...children); },
+    replaceChildren(...children) { this.childNodes = children; },
+    setAttribute(name, value) { this.attributes.set(name, value); },
+    addEventListener() {},
+  });
+  const documentRef = {
+    elements: new Map(),
+    createElement(tagName, className) { return element(tagName, className); },
+  };
+  const list = element();
+  const status = element();
+  const add = element("button");
+  const useDefault = element("button");
+  documentRef.elements.set("#settings-codex-roots", list);
+  documentRef.elements.set("#settings-codex-roots-status", status);
+  documentRef.elements.set("#settings-add-codex-root", add);
+  documentRef.elements.set("#settings-use-default-codex-folder", useDefault);
+  renderCodexRoots(documentRef, {
+    codexHomesForSettings: {
+      primaryRootId: "11111111-1111-4111-8111-111111111111",
+      activityRoots: [
+        {
+          rootId: "11111111-1111-4111-8111-111111111111",
+          kind: "custom",
+          path: "/synthetic/primary",
+        },
+        {
+          rootId: "22222222-2222-4222-8222-222222222222",
+          kind: "custom",
+          path: "/synthetic/retained",
+        },
+      ],
+    },
+    codexHomes: { activityRoots: [], primaryRootId: "" },
+  }, true, null, () => assert.fail("retained roots must not dispatch an action"));
+  const descendants = (node) => [node, ...node.childNodes.flatMap(descendants)];
+  assert.equal(add.hidden, true);
+  assert.equal(add.disabled, true);
+  assert.equal(useDefault.hidden, false);
+  assert.equal(useDefault.disabled, true);
+  assert.equal(list.childNodes.length, 2);
+  const [primary, retained] = list.childNodes;
+  assert.equal(primary.dataset.primary, "true");
+  assert.equal(retained.dataset.primary, "false");
+  assert.equal(primary.dataset.analysisScope, "primary");
+  assert.equal(retained.dataset.analysisScope, "retained");
+  assert.ok(descendants(primary).some((node) => (
+    node.textContent === "electron.settings.codexRoots.primaryHelp"
+  )));
+  assert.ok(descendants(primary).some((node) => node.tagName === "button"));
+  assert.ok(descendants(retained).some((node) => (
+    node.textContent === "electron.settings.codexRoots.retained"
+  )));
+  assert.equal(descendants(retained).some((node) => node.tagName === "button"), false);
+
+  const defaultList = element();
+  const defaultStatus = element();
+  const defaultAdd = element("button");
+  const defaultUse = element("button");
+  documentRef.elements.set("#settings-codex-roots", defaultList);
+  documentRef.elements.set("#settings-codex-roots-status", defaultStatus);
+  documentRef.elements.set("#settings-add-codex-root", defaultAdd);
+  documentRef.elements.set("#settings-use-default-codex-folder", defaultUse);
+  renderCodexRoots(documentRef, {
+    codexHomesForSettings: {
+      primaryRootId: "00000000-0000-4000-8000-000000000001",
+      activityRoots: [{
+        rootId: "00000000-0000-4000-8000-000000000001",
+        kind: "default",
+        path: null,
+      }],
+    },
+    codexHomes: { activityRoots: [], primaryRootId: "" },
+  }, true, null, () => assert.fail("rendering must not dispatch an action"));
+  const defaultButton = descendants(defaultList).find((node) => node.tagName === "button");
+  assert.equal(defaultButton?.dataset.rootAction, "chooseCodexHome");
+  assert.equal(defaultUse.disabled, true, "the current default root needs no reset");
+
+  const customList = element();
+  const customStatus = element();
+  const customAdd = element("button");
+  const customUse = element("button");
+  documentRef.elements.set("#settings-codex-roots", customList);
+  documentRef.elements.set("#settings-codex-roots-status", customStatus);
+  documentRef.elements.set("#settings-add-codex-root", customAdd);
+  documentRef.elements.set("#settings-use-default-codex-folder", customUse);
+  renderCodexRoots(documentRef, {
+    codexHomesForSettings: {
+      primaryRootId: "11111111-1111-4111-8111-111111111111",
+      activityRoots: [{
+        rootId: "11111111-1111-4111-8111-111111111111",
+        kind: "custom",
+        path: "/synthetic/only-root",
+      }],
+    },
+    codexHomes: { activityRoots: [], primaryRootId: "" },
+  }, true, null, () => assert.fail("rendering must not dispatch an action"));
+  assert.equal(customUse.disabled, false, "a single selected custom folder can return to default");
+});
+
 test("a successful visible notice receipt keeps its current banner actionable", async () => {
   const source = await readFile(APP_SOURCE_URL, "utf8");
   const functions = [

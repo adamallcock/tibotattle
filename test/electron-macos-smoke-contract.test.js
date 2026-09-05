@@ -145,7 +145,10 @@ test("macOS Electron smoke is an explicit packaged arm64 lane", async () => {
   assert.match(source, /genericSnapshotPathFree/u);
   assert.match(source, /pathfulRead/u);
   assert.match(source, /settings-codex-roots/u);
-  assert.match(source, /settings-primary-codex-root/u);
+  assert.match(source, /analysisScope === "primary"/u);
+  assert.match(source, /analysisScope === "retained"/u);
+  assert.match(source, /retainedNotAnalyzedCount/u);
+  assert.doesNotMatch(source, /primaryRadioCount === normalizedRootCount/u);
   assert.match(source, /settings-add-codex-root/u);
   assert.match(source, /readMacSyntheticFixtureRefreshInterval/u);
   assert.match(source, /classifyMacSettingsPersistenceEvidence/u);
@@ -518,7 +521,7 @@ test("macOS smoke selects Settings only for the exact dashboard origin and CDP p
   );
 });
 
-test("macOS Settings smoke requires multi-root semantics and separate pathful read", () => {
+test("macOS Settings smoke requires one analyzed root, retained roots, and a separate pathful read", () => {
   const defaultRootId = "00000000-0000-4000-8000-000000000001";
   const customRootId = "11111111-1111-4111-8111-111111111111";
   const genericSettings = {
@@ -555,14 +558,18 @@ test("macOS Settings smoke requires multi-root semantics and separate pathful re
     classifyMacSettingsEvidence({
       rootCount: 2,
       renderedRootCount: 2,
-      primaryRadioCount: 2,
-      selectedPrimaryCount: 1,
-      selectedPrimaryRootId: defaultRootId,
+      primaryRadioCount: 0,
       primaryCardCount: 1,
+      primaryHeadingId: `settings-codex-root-${defaultRootId}`,
+      primaryCardLabelledBy: `settings-codex-root-${defaultRootId}`,
+      retainedCardCount: 1,
+      renderedRetainedCardCount: 1,
+      retainedNotAnalyzedCount: 1,
       listRole: true,
       cardsHaveSemantics: true,
       addPresent: true,
-      addDisabled: false,
+      addHidden: true,
+      addDisabled: true,
       genericSettings,
       genericDashboardSettings: genericSettings,
       pathfulRoots,
@@ -571,10 +578,12 @@ test("macOS Settings smoke requires multi-root semantics and separate pathful re
       status: "passed",
       rootCount: 2,
       renderedRootCount: 2,
-      primarySelected: true,
+      primaryCardBound: true,
+      retainedCardsNotAnalyzed: true,
       listSemantics: true,
       addPresent: true,
-      addEnabled: true,
+      addHidden: true,
+      addDisabled: true,
       genericSnapshotPathFree: true,
       pathfulRead: true,
     },
@@ -598,12 +607,19 @@ test("macOS Settings smoke requires multi-root semantics and separate pathful re
     false,
   );
   for (const invalid of [
-    { selectedPrimaryCount: 2 },
+    { primaryRadioCount: 1 },
     { primaryCardCount: 0 },
+    { primaryCardCount: 2 },
+    { primaryHeadingId: `settings-codex-root-${customRootId}` },
+    { retainedCardCount: 0 },
+    { renderedRetainedCardCount: 0 },
+    { retainedNotAnalyzedCount: 0 },
+    { retainedNotAnalyzedCount: 2 },
     { listRole: false },
     { cardsHaveSemantics: false },
     { addPresent: false },
-    { addDisabled: true },
+    { addHidden: false },
+    { addDisabled: false },
     {
       genericDashboardSettings: {
         settings: {
@@ -627,14 +643,18 @@ test("macOS Settings smoke requires multi-root semantics and separate pathful re
       classifyMacSettingsEvidence({
         rootCount: 2,
         renderedRootCount: 2,
-        primaryRadioCount: 2,
-        selectedPrimaryCount: 1,
-        selectedPrimaryRootId: defaultRootId,
+        primaryRadioCount: 0,
         primaryCardCount: 1,
+        primaryHeadingId: `settings-codex-root-${defaultRootId}`,
+        primaryCardLabelledBy: `settings-codex-root-${defaultRootId}`,
+        retainedCardCount: 1,
+        renderedRetainedCardCount: 1,
+        retainedNotAnalyzedCount: 1,
         listRole: true,
         cardsHaveSemantics: true,
         addPresent: true,
-        addDisabled: false,
+        addHidden: true,
+        addDisabled: true,
         genericSettings,
         genericDashboardSettings: genericSettings,
         pathfulRoots,
@@ -645,7 +665,7 @@ test("macOS Settings smoke requires multi-root semantics and separate pathful re
   }
 });
 
-test("macOS Settings smoke requires Add to be disabled exactly at the root limit", () => {
+test("macOS Settings smoke keeps Add hidden and disabled even below the former root limit", () => {
   const defaultRootId = "00000000-0000-4000-8000-000000000001";
   const customRootIds = [
     "22222222-2222-4222-8222-222222222222",
@@ -686,33 +706,44 @@ test("macOS Settings smoke requires Add to be disabled exactly at the root limit
   const base = {
     rootCount: 8,
     renderedRootCount: 8,
-    primaryRadioCount: 8,
-    selectedPrimaryCount: 1,
-    selectedPrimaryRootId: defaultRootId,
+    primaryRadioCount: 0,
     primaryCardCount: 1,
+    primaryHeadingId: `settings-codex-root-${defaultRootId}`,
+    primaryCardLabelledBy: `settings-codex-root-${defaultRootId}`,
+    retainedCardCount: 7,
+    renderedRetainedCardCount: 7,
+    retainedNotAnalyzedCount: 7,
     listRole: true,
     cardsHaveSemantics: true,
     addPresent: true,
+    addHidden: true,
+    addDisabled: true,
     genericSettings,
     genericDashboardSettings: genericSettings,
     pathfulRoots,
   };
   assert.deepEqual(
-    classifyMacSettingsEvidence({ ...base, addDisabled: true }),
+    classifyMacSettingsEvidence(base),
     {
       status: "passed",
       rootCount: 8,
       renderedRootCount: 8,
-      primarySelected: true,
+      primaryCardBound: true,
+      retainedCardsNotAnalyzed: true,
       listSemantics: true,
       addPresent: true,
-      addEnabled: false,
+      addHidden: true,
+      addDisabled: true,
       genericSnapshotPathFree: true,
       pathfulRead: true,
     },
   );
   assert.equal(
     classifyMacSettingsEvidence({ ...base, addDisabled: false }).status,
+    "failed",
+  );
+  assert.equal(
+    classifyMacSettingsEvidence({ ...base, addHidden: false }).status,
     "failed",
   );
 });
@@ -1193,10 +1224,12 @@ test("closed macOS receipt is content-free and has no runtime identifiers", () =
       tabs: true,
       rootCount: 2,
       renderedRootCount: 2,
-      primarySelected: true,
+      primaryCardBound: true,
+      retainedCardsNotAnalyzed: true,
       listSemantics: true,
       addPresent: true,
-      addEnabled: true,
+      addHidden: true,
+      addDisabled: true,
       genericSnapshotPathFree: true,
       pathfulRead: true,
       refreshIntervalPersisted: true,
@@ -1241,10 +1274,12 @@ test("closed macOS receipt is content-free and has no runtime identifiers", () =
   assert.equal(receipt.settings.connected, true);
   assert.equal(receipt.settings.rootCount, 2);
   assert.equal(receipt.settings.renderedRootCount, 2);
-  assert.equal(receipt.settings.primarySelected, true);
+  assert.equal(receipt.settings.primaryCardBound, true);
+  assert.equal(receipt.settings.retainedCardsNotAnalyzed, true);
   assert.equal(receipt.settings.listSemantics, true);
   assert.equal(receipt.settings.addPresent, true);
-  assert.equal(receipt.settings.addEnabled, true);
+  assert.equal(receipt.settings.addHidden, true);
+  assert.equal(receipt.settings.addDisabled, true);
   assert.equal(receipt.settings.genericSnapshotPathFree, true);
   assert.equal(receipt.settings.pathfulRead, true);
   assert.equal(receipt.settings.refreshIntervalPersisted, true);

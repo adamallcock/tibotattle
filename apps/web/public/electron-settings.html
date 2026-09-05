@@ -132,28 +132,28 @@
           <section class="settings-card settings-roots-card" aria-labelledby="settings-codex-roots-title">
             <div class="settings-roots-heading">
               <div class="settings-card-copy">
-                <h3 id="settings-codex-roots-title" data-i18n="electron.settings.codexRoots.title">Codex folders</h3>
+                <h3 id="settings-codex-roots-title" data-i18n="electron.settings.codexRoots.title">Codex folder</h3>
                 <p data-i18n="electron.settings.codexRoots.description">
-                  All roots contribute history. The primary root alone supplies live quota and app-server behavior.
+                  TiboTattle analyzes the selected Codex folder for local usage and quota evidence.
                 </p>
                 <p data-i18n="electron.settings.codexRoots.removalNote">
-                  Removing a root stops future reads, deletes no source files, and retained accepted history remains.
+                  Saved additional folders are retained for future multi-folder support and are not analyzed.
                 </p>
                 <output class="settings-value" id="settings-codex-folder-status" aria-live="polite">
                   Default location (~/.codex)
                 </output>
               </div>
               <div class="settings-actions" aria-label="Codex folder actions" data-i18n-aria-label="electron.settings.codexRoots.actions">
-                <button class="button button-secondary" id="settings-add-codex-root" type="button" data-i18n="electron.settings.codexRoots.add">
+                <button class="button button-secondary" id="settings-add-codex-root" type="button" hidden disabled data-i18n="electron.settings.codexRoots.add">
                   Add Codex Folder…
                 </button>
-                <button class="button button-quiet" id="settings-use-default-codex-folder" type="button" data-i18n="electron.settings.codexRoots.useDefault">
+                <button class="button button-quiet" id="settings-use-default-codex-folder" type="button" disabled data-i18n="electron.settings.codexRoots.useDefault">
                   Use Default
                 </button>
               </div>
             </div>
             <p class="settings-roots-status" id="settings-codex-roots-status" role="status" aria-live="polite" aria-atomic="true"></p>
-            <div class="settings-roots-list" id="settings-codex-roots" role="list" aria-label="Configured Codex folders" data-i18n-aria-label="electron.settings.codexRoots.list"></div>
+            <div class="settings-roots-list" id="settings-codex-roots" role="list" aria-label="Codex folder configuration" data-i18n-aria-label="electron.settings.codexRoots.list"></div>
           </section>
 
           <section class="settings-card" aria-labelledby="settings-refresh-title">

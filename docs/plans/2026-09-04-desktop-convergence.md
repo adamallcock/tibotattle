@@ -44,6 +44,16 @@ fresh packaged app; passing a direct popup smoke does not exercise an actual
 status-item click. AppKit window chrome and web chrome remain distinct, so
 feature parity must not be described as pixel-identical native rendering.
 
+The owner also requested a background/backoffice parity check. That audit
+confirmed the shared accounting/history lineage but found unsupported
+secondary-folder ingestion and a hidden-window refresh mismatch. The candidate
+uses one analyzed folder, matching native 0.1.18, while preserving saved extra
+folder configurations. The owned automatic cadence must continue while the app
+is hidden in the tray. Full multi-folder ingestion remains a separate, explicit
+acceptance gate; future tests must exercise the actual companion and index,
+not merely assert proposed argv. Accountless uploads remain unavailable until
+upload ownership and scheduler integration are complete.
+
 Continuation authorized on 2026-09-04: finish reconciliation with the latest
 native 0.1.18 changes and controls, provide a durable Electron app the owner can
 test, and prepare packaging for all four targets. The integration baseline is

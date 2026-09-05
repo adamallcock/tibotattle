@@ -804,54 +804,45 @@ export async function launchDesktopRuntime({
     } catch {
       throw shellError("desktop_codex_roots_invalid");
     }
-    const resolvedRoots = [];
-    const seen = new Set();
-    for (const root of selected.activityRoots) {
-      let path = root.kind === "default"
-        ? services.defaultCodexHome
-          ?? join(runtimeHomeDirectory({ platform, environment }), ".codex")
-        : root.path;
-      if (typeof path !== "string" || !isPlatformCodexPath(path, platform)) {
-        throw shellError("desktop_codex_roots_invalid");
-      }
-      // Tests can compose a Win32 runtime on a POSIX host. Do not run a
-      // Windows drive/UNC spelling through the host's node:path resolver;
-      // the real Windows process already treats it as absolute.
-      if (platform !== "win32" && !isWindowsCodexPath(path)) path = resolve(path);
-      let comparison;
-      try {
-        comparison = normalizeCodexPathForComparison(path);
-      } catch {
-        throw shellError("desktop_codex_roots_invalid");
-      }
-      // The default sentinel is a physical root too. Reject a custom root
-      // that resolves to the same location before mutating child argv/env;
-      // otherwise the local companion would silently double-read one root.
-      if (seen.has(comparison)) throw shellError("desktop_codex_roots_invalid");
-      seen.add(comparison);
-      resolvedRoots.push(Object.freeze({ root, path }));
-    }
-    const primary = resolvedRoots.find(
-      ({ root }) => root.rootId === selected.primaryRootId,
+    // v2 settings can retain additional roots for a future multi-folder
+    // release. The current local companion supports one CODEX_HOME only, so
+    // resolve and validate just the persisted primary rather than passing
+    // ignored argv flags or treating retained roots as activity sources.
+    const primary = selected.activityRoots.find(
+      ({ rootId }) => rootId === selected.primaryRootId,
     );
     if (!primary) throw shellError("desktop_codex_roots_invalid");
+    let primaryPath = primary.kind === "default"
+      ? services.defaultCodexHome
+        ?? join(runtimeHomeDirectory({ platform, environment }), ".codex")
+      : primary.path;
+    if (typeof primaryPath !== "string" || !isPlatformCodexPath(primaryPath, platform)) {
+      throw shellError("desktop_codex_roots_invalid");
+    }
+    // Tests can compose a Win32 runtime on a POSIX host. Do not run a
+    // Windows drive/UNC spelling through the host's node:path resolver; the
+    // real Windows process already treats it as absolute.
+    if (platform !== "win32" && !isWindowsCodexPath(primaryPath)) {
+      primaryPath = resolve(primaryPath);
+    }
+    try {
+      normalizeCodexPathForComparison(primaryPath);
+    } catch {
+      throw shellError("desktop_codex_roots_invalid");
+    }
     return Object.freeze({
       configuration: selected,
-      roots: Object.freeze(resolvedRoots),
-      primaryPath: primary.path,
+      primaryPath,
     });
   }
 
   function assignCodexHomes(configuration) {
     const selected = effectiveCodexHomes(configuration);
-    const nextArguments = [];
-    for (const { path } of selected.roots) {
-      nextArguments.push("--codex-home", path);
-    }
-    nextArguments.push("--primary-codex-home", selected.primaryPath);
-    // Mutate in place so createCompanionSupervisor's closure sees the exact
-    // candidate on its next start, while preserving the script at argv[0].
-    companionArgs.splice(1, companionArgs.length - 1, ...nextArguments);
+    // The production companion reads CODEX_HOME. It does not implement the
+    // historical multi-root argv proposal, so keep its invocation honest.
+    // Mutate in place in case a previous runtime candidate supplied flags,
+    // while preserving the server script at argv[0].
+    companionArgs.splice(1);
     childEnvironment.CODEX_HOME = selected.primaryPath;
     return selected;
   }
