@@ -126,12 +126,26 @@ records evidence, qualification and the unchanged consent/activation boundary.
   performance index while retaining a scanning query.
 - [x] Repair only unapplied `0043` and affected readers/tests; retain every
   historical migration and the already applied `0042` exactly.
-- [ ] Prove lossless pagination, preserved pricing/plan/interval semantics,
+- [x] Prove lossless pagination, preserved pricing/plan/interval semantics,
   bounded query plans and realistic-scale performance; rerun owning/full gates.
-- [ ] Verify the exact deployed prefix again, apply only the reviewed remaining
+- [x] Verify the exact deployed prefix again, apply only the reviewed remaining
   forward migrations and retain independent after-state checks. Keep v1.1 staged.
 - [ ] Refresh release source/tag/artifact qualification before any publication;
   retain all first-attempt receipts without relabeling them as the repaired source.
+
+The syntax repair passes the complete final Worker gate: 543 application tests,
+185 script checks, all three dry bundles, 20 preflight/docs checks and both
+pinned-runtime R7 checks. The interim -200-record discrepancy was held and then
+fully reconciled to exact retained revision links and concurrent first revisions;
+same-statement current journal/record parity passes. Only then were `0044` and
+`0045` applied. The 05:47 UTC aftermath verifies exact prefix 45, complete schema,
+unchanged controls/consent/floors and staged v1.1 lifecycle. The exact count
+supplement and retained bounded snapshot remain separate evidence. Worker
+deployment and fresh exact-source stable artifacts still follow this boundary.
+The independent 05:53 UTC supplement exactly reconciles the +16,172 full
+before/after delta and current-view parity; all sixteen checks pass, with no
+identity, consent or deletion-marker changes. The production-repair hold is
+resolved. This does not replace final deployment or artifact qualification.
 
 Cloudflare documents [per-file migration rollback](https://developers.cloudflare.com/d1/wrangler-commands/)
 and the [CPU/memory limits on D1 operations](https://developers.cloudflare.com/d1/platform/limits/).

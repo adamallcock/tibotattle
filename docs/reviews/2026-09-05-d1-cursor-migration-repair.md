@@ -2,7 +2,7 @@
 title: D1 cursor migration repair for 0.1.18
 date: 2026-09-05
 type: review
-status: in-progress
+status: completed
 ---
 
 # D1 cursor migration repair for 0.1.18
@@ -79,9 +79,9 @@ these metadata interfaces in its [SQL statement reference](https://developers.cl
   model history and publication evidence cannot bypass the new guards.
 - The initial script-suite attempt was refused by the sandbox's local listener
   restriction. The authorized local-runtime rerun passed all 183 script checks;
-  a later added id-alias test is separately green. Full final owning validation,
-  remote repaired migration application and final-source qualification remain
-  pending and must be recorded before release.
+  a later added id-alias test is separately green. The complete final owning
+  validation and remote repair application are recorded below; exact-source
+  desktop rebuilding remains a separate release gate.
 
 ## Subsequent remote parser compatibility repair
 
@@ -131,17 +131,54 @@ The 05:13:49 UTC read-only aftermath confirms exact ledger 43, all ten repaired
 `0043` objects/nine columns present, all forty attempted `0044` objects and its
 one column absent, and unchanged controls/consent. The expected epoch increment
 and publication `updating` state are present; old-source health is HTTP 200.
-However, the exact v1 record count is now 3,192,617, down 200 from the retained
-baseline and previous post-refusal supplement. Further production mutations
-are held while this concurrent-activity/preservation discrepancy is explained.
-A successful diagnostic command is not acceptance of this decrease.
+Its exact v1 record count was 3,192,617, down 200 from the retained baseline
+and previous post-refusal supplement. Further production mutations were held
+until read-only retained-journal investigation explained the entire difference.
+
+At 05:22:51 UTC, all 748 superseded revisions had exact full-identity,
+revision-plus-one and timestamp-matching successors, with zero unmatched
+links in either direction. Their 123,996 replacement records minus 124,370
+superseded records contribute -374; four first revisions contribute 174,
+exactly explaining -200. The retained journal reconstructs all three earlier
+exact counts. One SELECT independently matches the current journal sum and
+actual record count at 3,208,989. Participant/device/consent counts are
+unchanged, deletion tombstones/cooldowns are zero, and no erasure markers are
+present. Eight diagnostic SELECTs report zero writes. This closes the
+aggregate/current-view discrepancy; it is not payload-level preservation proof.
+Private lifecycle and exact-link receipt SHA-256 values are respectively
+`cfb8e089b51691cd120a66572c6483ba0f4a89e380472ce9616f4a2086a257fc`
+and `9132172cb604f27813e5e63d8ae549ffd6ad3b9c6cbd711c185fccb062ee4486`.
 
 Independent memory-only compilation compared original/current `0044` and
 `0045` in all four combinations: 312 compiled DML programs across 26
 trigger-bearing tables, with 234 cross-variant comparisons, match after
 excluding only trace text and connection-specific virtual-table pointers.
 No DML was executed. Forty focused transport/domain/credential tests and the
-24-test schema/lineage suite pass; complete final owning validation follows.
+24-test schema/lineage suite pass. The final clean repair source `68d7451b`
+passes all 543 Worker tests across 43 files, 185 script checks, workspace and
+generated-type/TypeScript/endpoint guards, and default/staging/production dry
+bundles. Preflight/docs pass 20/20 and R7 reconstruction passes 2/2 on each
+of pinned Node 26.2.0 and 24.14.0, without skips.
+
+After a fresh exact `[0044, 0045]` pending-set and all reviewed-hash guard,
+both repaired files applied successfully. The 05:47 UTC read-only aftermath
+verifies exact prefix 45 and complete attribution schema, unchanged collection
+controls, all expected participant seeds, zero v1.1/rollback records, unchanged
+rank-one floors and the staged v1.1 lifecycle. The frozen snapshot intentionally
+reports its one saturated record count rather than pretending it is exact;
+the independent exact supplement records 3,208,989. The existing Worker is
+still healthy at its prior source; this is not new-deployment qualification.
+
+The independent 05:53:47 UTC reconciliation closes the complete before/after
+aggregate boundary: 750 exactly linked replacements contribute -206 records,
+and 91 first revisions contribute 16,378, matching the exact +16,172 delta.
+Both historical totals reconstruct exactly and same-statement current journal
+and record counts both equal 3,208,989. All sixteen checks pass, including
+unchanged identity/consent counts and zero independent deletion markers; five
+SELECTs report zero writes. Its private receipt SHA-256 is
+`82ff84142e117624018b9df2e0617b7732ca5225d4f31a912c3b43faeadee395`.
+An initial follow-up ledger read failed without a completed reconciliation;
+its diagnostic evidence is retained and is not counted as a passing result.
 
 All current repair paths are outside the desktop payload and R7 input closures.
 This avoids unnecessary R7 regeneration, not exact-source desktop rebuilding:
