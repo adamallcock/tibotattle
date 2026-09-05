@@ -11,6 +11,7 @@ import {
   installDesktopTrayPopoverPolicy,
   TRAY_POPOVER_ACTION_CHANNEL,
   TRAY_POPOVER_MODEL_CHANNEL,
+  TRAY_POPOVER_VISIBILITY_CHANNEL,
 } from "../desktop-tray-popover.js";
 
 const POPOVER_ORIGIN = "http://127.0.0.1:54321";
@@ -256,6 +257,12 @@ test("popover controller lazily positions, updates, routes, and destroys a trust
   assert.equal(window.showCalls, 1);
   assert.equal(window.focusCalls, 1);
   assert.equal(window.showInactiveCalls, 0);
+  assert.deepEqual(
+    window.webContents.sent
+      .filter(({ channel }) => channel === TRAY_POPOVER_VISIBILITY_CHANNEL)
+      .map(({ value }) => value),
+    [true],
+  );
   assert.deepEqual(window.positions, [[208, 52]]);
   assert.equal(popover.visible, true);
 
@@ -269,9 +276,13 @@ test("popover controller lazily positions, updates, routes, and destroys a trust
   }, TRAY_POPOVER_ACTION_CHANNEL, "weekly");
   assert.deepEqual(actions, ["weekly"]);
   assert.equal(popover.visible, false);
+  assert.equal(window.webContents.sent.at(-1).channel, TRAY_POPOVER_VISIBILITY_CHANNEL);
+  assert.equal(window.webContents.sent.at(-1).value, false);
   assert.equal(popover.toggle(), true);
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(popover.visible, true);
+  assert.equal(window.webContents.sent.at(-1).channel, TRAY_POPOVER_VISIBILITY_CHANNEL);
+  assert.equal(window.webContents.sent.at(-1).value, true);
   popover.destroy();
   assert.equal(popover.visible, false);
   assert.equal(popover.available, false);

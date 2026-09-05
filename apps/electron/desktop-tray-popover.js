@@ -25,6 +25,7 @@ import {
 export const TRAY_POPOVER_VERSION = "v1";
 export const TRAY_POPOVER_ACTION_CHANNEL = "tibotattle:electron-tray-popover:v1";
 export const TRAY_POPOVER_MODEL_CHANNEL = "tibotattle:electron-tray-popover-model:v1";
+export const TRAY_POPOVER_VISIBILITY_CHANNEL = "tibotattle:electron-tray-popover-visibility:v1";
 export const TRAY_POPOVER_PRELOAD_FILE = "tray-popover-preload.cjs";
 export const TRAY_POPOVER_ACTIONS = Object.freeze([
   "open",
@@ -309,6 +310,21 @@ function clamp(value, minimum, maximum) {
   return Math.max(minimum, Math.min(maximum, value));
 }
 
+function sendVisibility(candidate) {
+  if (!isLiveWindow(candidate)
+      || typeof candidate.webContents?.send !== "function"
+      || typeof candidate.isVisible !== "function") return false;
+  try {
+    candidate.webContents.send(
+      TRAY_POPOVER_VISIBILITY_CHANNEL,
+      candidate.isVisible() === true,
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Lazily construct and control the visual tray surface.  A missing preload in
  * a plain-Node composition simply disables this optional surface; the normal
@@ -404,6 +420,7 @@ export function createDesktopTrayPopover({
       // previous application, so explicitly activate and focus it.
       window.show?.();
       window.focus?.();
+      sendVisibility(window);
       pendingShow = false;
       return true;
     } catch {
@@ -477,6 +494,8 @@ export function createDesktopTrayPopover({
     const onBlur = () => {
       if (!destroying) hide();
     };
+    const onShow = () => sendVisibility(candidate);
+    const onHide = () => sendVisibility(candidate);
     const onBeforeInputEvent = (_event, input) => {
       if (input?.type === "keyDown" && input.key === "Escape") hide();
     };
@@ -489,10 +508,14 @@ export function createDesktopTrayPopover({
       pendingShow = false;
     };
     candidate.on?.("blur", onBlur);
+    candidate.on?.("show", onShow);
+    candidate.on?.("hide", onHide);
     candidate.on?.("closed", onClosed);
     candidate.webContents?.on?.("before-input-event", onBeforeInputEvent);
     windowCleanup = () => {
       candidate.off?.("blur", onBlur);
+      candidate.off?.("show", onShow);
+      candidate.off?.("hide", onHide);
       candidate.off?.("closed", onClosed);
       candidate.webContents?.off?.("before-input-event", onBeforeInputEvent);
       policy?.remove?.();
@@ -558,8 +581,10 @@ export function createDesktopTrayPopover({
     if (!isLiveWindow(window)) return false;
     try {
       window.hide?.();
+      sendVisibility(window);
       return true;
     } catch {
+      sendVisibility(window);
       return false;
     }
   }
