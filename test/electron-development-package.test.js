@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readFile } from "node:fs/promises";
-import { developmentBuildEnvironment, developmentPackagePlan, executableArchitecture, parseDevelopmentPackageArguments } from "../scripts/package-electron-development.mjs";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { developmentBuildEnvironment, developmentPackagePlan, executableArchitecture, parseDevelopmentPackageArguments, writeDevelopmentHandoff } from "../scripts/package-electron-development.mjs";
 
 const sourceRevision = "a".repeat(40);
 
@@ -77,18 +80,38 @@ test("the development workflow builds each target on a static native runner with
     assert.ok(job.includes(`package-electron-development.mjs --target ${target} --format distribution --replace-staging`));
     assert.ok(job.includes(`/\${{ github.sha }}/${target}/distribution/`));
   }
-  assert.match(workflow, /Add the Windows development launch handoff/u);
-  assert.match(workflow, /TiboTattle-Windows-Development-Launch\.txt/u);
-  assert.match(workflow, /TiboTattle-Windows-Development-Launch\.cmd/u);
-  assert.match(workflow, /TiboTattle-Windows-Development-Launcher\.mjs/u);
-  assert.match(workflow, /win-unpacked\\TiboTattle Dev\.exe/u);
-  assert.match(workflow, /%~dp0TiboTattle-Windows-Development-Launcher\.mjs/u);
-  assert.match(workflow, /ELECTRON_RUN_AS_NODE=1/u);
-  assert.match(workflow, /%LOCALAPPDATA%\\TiboTattle\\electron-user-test/u);
-  assert.match(workflow, /does not require a separate Node\.js installation or source checkout/u);
-  assert.match(workflow, /launch-electron-windows-development\.mjs --app/u);
-  assert.match(workflow, /Node\.js 26\.2\.0/u);
+  assert.doesNotMatch(workflow, /Add the (?:Windows|Linux) development launch handoff/u,
+    "handoff assembly belongs to the common local/CI packaging command");
   assert.equal((workflow.match(/persist-credentials: false/gu) ?? []).length, 4);
   assert.equal((workflow.match(/if-no-files-found: error/gu) ?? []).length, 4);
   assert.match(workflow, /WINDOWS_BINDING_BUILD_FAILED/u);
+});
+
+test("common packaging assembles usable, hashed handoffs without a source checkout", async () => {
+  for (const target of ["darwin-arm64", "darwin-x64", "win32-x64", "linux-x64"]) {
+    const outputDirectory = await mkdtemp(join(tmpdir(), "electron-development-handoff-"));
+    try {
+      const files = await writeDevelopmentHandoff({ target, outputDirectory });
+      assert.equal(files.length, target.startsWith("darwin-") ? 1 : 3);
+      for (const file of files) {
+        const bytes = await readFile(join(outputDirectory, file.file));
+        assert.equal(bytes.length, file.bytes);
+        assert.equal(createHash("sha256").update(bytes).digest("hex"), file.sha256);
+        if (file.executable && process.platform !== "win32") {
+          assert.equal((await stat(join(outputDirectory, file.file))).mode & 0o111, 0o111);
+        }
+      }
+      const readme = await readFile(join(outputDirectory, "DEVELOPMENT-TESTING.txt"), "utf8");
+      assert.match(readme, /hosted accountless uploads remain unavailable/u);
+      if (!target.startsWith("darwin-")) {
+        assert.match(readme, /No separate Node\.js installation or source checkout is needed/u);
+        const wrapper = files.find(({ file }) => /\.(?:cmd|sh)$/u.test(file));
+        const source = await readFile(join(outputDirectory, wrapper.file), "utf8");
+        assert.match(source, /ELECTRON_RUN_AS_NODE=1/u);
+        assert.doesNotMatch(source, /SOURCE_CHECKOUT|%SOURCE%|source checkout.*required/iu);
+      }
+      await assert.rejects(writeDevelopmentHandoff({ target, outputDirectory }), { code: "EEXIST" });
+      assert.equal(await readFile(join(outputDirectory, "DEVELOPMENT-TESTING.txt"), "utf8"), readme);
+    } finally { await rm(outputDirectory, { recursive: true, force: true }); }
+  }
 });

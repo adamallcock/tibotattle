@@ -4,7 +4,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream, constants } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, readdir, realpath, rename, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, readdir, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -154,6 +154,52 @@ function artifactPaths(output, target) {
   return { executable: join(unpacked, target === "win32-x64" ? "TiboTattle Dev.exe" : "tibotattle-dev"), resources: join(unpacked, "resources") };
 }
 
+// Local and CI builds receive the same complete test handoff. These sidecars
+// use the package's own Electron executable as Node, then the reviewed launcher
+// strips node mode and ambient credentials before creating its GUI child.
+export async function writeDevelopmentHandoff({ target, outputDirectory }) {
+  if (!TARGET_NAMES.includes(target)) fail("TARGET_OR_FORMAT_INVALID");
+  const scripts = target === "win32-x64" ? [
+    ["launch-electron-windows-development.mjs", "TiboTattle-Windows-Development-Launcher.mjs", false],
+    ["launch-electron-windows-development.cmd", "TiboTattle-Windows-Development-Launch.cmd", false],
+  ] : target === "linux-x64" ? [
+    ["launch-electron-linux-development.mjs", "TiboTattle-Linux-Development-Launcher.mjs", false],
+    ["launch-electron-linux-development.sh", "TiboTattle-Linux-Development-Launch.sh", true],
+  ] : [];
+  const files = [];
+  async function retain(file, bytes, executable = false) {
+    const destination = join(outputDirectory, file);
+    await writeFile(destination, bytes, { flag: "wx", mode: executable ? 0o755 : 0o644 });
+    if (executable) await chmod(destination, 0o755);
+    files.push({ file, bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"), executable });
+  }
+  for (const [source, file, executable] of scripts) {
+    const handle = await open(join(ROOT, "scripts", source), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    try {
+      const info = await handle.stat();
+      if (!info.isFile() || info.size > 128 * 1024) fail("HANDOFF_SOURCE_INVALID");
+      const bytes = await handle.readFile();
+      if (bytes.length !== info.size) fail("HANDOFF_SOURCE_CHANGED");
+      await retain(file, bytes, executable);
+    } finally { await handle.close(); }
+  }
+  const instructions = target === "win32-x64"
+    ? "Extract the complete bundle, keeping win-unpacked beside the launch files. Double-click TiboTattle-Windows-Development-Launch.cmd. No separate Node.js installation or source checkout is needed. The persistent private test profile is under %LOCALAPPDATA%\\TiboTattle\\electron-user-test\\win32-x64\\profile. The packaged main process verifies the development runtime and native binding before opening."
+    : target === "linux-x64"
+      ? "Extract the complete bundle, keeping linux-unpacked beside the launch files. Run ./TiboTattle-Linux-Development-Launch.sh from a Linux x64 desktop. No separate Node.js installation or source checkout is needed. The persistent private test profile uses XDG_STATE_HOME or ~/.local/state/tibotattle/linux-x64-development. Chromium's normal sandbox requirements apply; the launcher never disables the sandbox."
+      : "For side-by-side testing with an existing native installation, use the prepared isolated-profile launcher generated with scripts/electron-macos-real-history-profile.mjs from this exact source. The raw app bundle is not an installed migration or update candidate. Keep native writable state separate from the development profile.";
+  await retain("DEVELOPMENT-TESTING.txt", Buffer.from([
+    `TiboTattle Dev ${RELEASE_VERSION} — ${target}`,
+    "",
+    instructions,
+    "",
+    "Use Settings to select the Codex history to read. Local analysis and sharing controls are testable; hosted accountless uploads remain unavailable in this candidate.",
+    "These are unsigned development artifacts. Production signing, installed migration, updates and native desktop qualification remain separate gates.",
+    "",
+  ].join("\n")));
+  return files;
+}
+
 export async function packageElectronDevelopment(options) {
   const sourceRevision = options.dryRun ? await run("git", ["rev-parse", "HEAD"]) : await cleanSource();
   const plan = developmentPackagePlan({ ...options, sourceRevision });
@@ -197,10 +243,12 @@ export async function packageElectronDevelopment(options) {
   }
   const required = options.target.startsWith("darwin-") ? [".dmg", ".zip"] : options.target === "win32-x64" ? [".exe", ".zip"] : [".AppImage", ".tar.gz"];
   if (options.format === "distribution" && required.some((extension) => !distributions.some(({ file }) => file.endsWith(extension)))) fail("DISTRIBUTION_MISSING");
+  const handoff = await writeDevelopmentHandoff({ target: options.target, outputDirectory: partial });
   if (await cleanSource() !== sourceRevision) fail("SOURCE_CHANGED");
-  const receipt = { ...plan, status: "development_package_verified", runtimeExecuted: false, appImageLauncherContractChecked: options.target === "linux-x64", verification, executable: await digestFile(paths.executable), asar: await digestFile(asarPath), distributions };
+  const receipt = { ...plan, status: "development_package_verified", runtimeExecuted: false, appImageLauncherContractChecked: options.target === "linux-x64", verification, executable: await digestFile(paths.executable), asar: await digestFile(asarPath), distributions, handoff };
   await writeFile(join(partial, "development-package.json"), `${JSON.stringify(receipt, null, 2)}\n`, { flag: "wx", mode: 0o600 });
   await writeFile(join(partial, "SHA256SUMS.txt"), distributions.map(({ file, sha256 }) => `${sha256}  ${file}\n`).join(""), { flag: "wx", mode: 0o600 });
+  await writeFile(join(partial, "HANDOFF_SHA256SUMS.txt"), handoff.map(({ file, sha256 }) => `${sha256}  ${file}\n`).join(""), { flag: "wx", mode: 0o600 });
   await rename(partial, output);
   return receipt;
   } finally { await lock.close(); await unlink(lockPath); }
