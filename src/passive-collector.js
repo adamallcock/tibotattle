@@ -11,10 +11,12 @@ import {
   sanitizeAccountScope,
 } from "./providers/codex/account.js";
 import {
+  canonicalComponentAvailability,
   canonicalComponents,
   canonicalRateLimitWindows,
   classifyToolCall,
   normalizeTokenUsage,
+  tokenComponentPresence,
 } from "./providers/codex/logs.js";
 import { localCodexLogScanner } from "./local-node-runtime.js";
 import {
@@ -63,6 +65,8 @@ const MAX_RELEVANT_ROLLOUT_LINE_BYTES = 64 * 1024;
 // marker matched large records that were never going to classify as a tool
 // call, and tightening it was worth 6.8s of cumulative scan time across the
 // corpus on its own.
+// Response-usage records/checkpoint copies deliberately do not enter this
+// legacy token_count stream: neither cumulative totals nor copies are new spend.
 const ROLLOUT_LINE_NEEDLES = Object.freeze([
   Buffer.from('"turn_context"'),
   Buffer.from('"token_count"'),
@@ -416,14 +420,33 @@ function tierForUsage(state, observedAt) {
 function addUsageDelta(current, previous) {
   const result = {};
   for (const key of ["input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens"]) {
-    result[key] = Math.max(0, current[key] - (previous?.[key] ?? 0));
+    result[key] = current[key] === null
+      || (previous !== null && previous !== undefined && previous[key] == null)
+      ? null
+      : Math.max(0, current[key] - (previous?.[key] ?? 0));
   }
   return result;
 }
 
+function nullableTokenUsage(value) {
+  const normalized = normalizeTokenUsage(value);
+  if (normalized === null) return null;
+  const presence = tokenComponentPresence(value);
+  return Object.fromEntries(Object.entries(normalized)
+    .map(([key, quantity]) => [key, presence[key] ? quantity : null]));
+}
+
+function availableUsageComponents(usage) {
+  if (usage === null) return null;
+  const availability = canonicalComponentAvailability(tokenComponentPresence(usage), usage);
+  // The passive v0.3 record has a complete-vector-or-null contract. Preserve
+  // missingness without adding fields or publishing a fabricated zero vector.
+  return Object.values(availability).every(Boolean) ? canonicalComponents(usage) : null;
+}
+
 function sameUsage(left, right) {
   return ["input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens"]
-    .every((key) => left[key] === right[key]);
+    .every((key) => right[key] === null || left[key] === right[key]);
 }
 
 function positiveSafeInteger(value, label) {
@@ -655,7 +678,7 @@ async function seedCursorFromTail(path, size, {
       } else if (record.type === "event_msg" && record.payload?.type === "thread_settings_applied") {
         updateTierState(tierState, tierUpdateFromRecord(record, diagnostics));
       } else if (record.type === "event_msg" && record.payload?.type === "token_count") {
-        const total = normalizeTokenUsage(record.payload?.info?.total_token_usage);
+        const total = nullableTokenUsage(record.payload?.info?.total_token_usage);
         if (total) previousTotals = total;
       }
     }
@@ -786,8 +809,8 @@ function rolloutRecord({ record, state, receivedAt, checkpoint }) {
   }
   if (record.type !== "event_msg" || record.payload?.type !== "token_count") return null;
   const info = record.payload?.info;
-  const total = normalizeTokenUsage(info?.total_token_usage);
-  const last = normalizeTokenUsage(info?.last_token_usage);
+  const total = nullableTokenUsage(info?.total_token_usage);
+  const last = nullableTokenUsage(info?.last_token_usage);
   if ((info?.total_token_usage && !total) || (info?.last_token_usage && !last)) {
     checkpoint.diagnostics.malformedUsageRecords += 1;
   }
@@ -812,7 +835,7 @@ function rolloutRecord({ record, state, receivedAt, checkpoint }) {
     usage = last;
   }
   const windows = canonicalRateLimitWindows(record.payload?.rate_limits);
-  if ((!usage || (usage.input_tokens === 0 && usage.output_tokens === 0)) && windows.length === 0) return null;
+  if ((!usage || !(usage.input_tokens > 0 || usage.output_tokens > 0)) && windows.length === 0) return null;
   const safe = {
     schemaVersion: RECORD_SCHEMA_VERSION,
     kind: "codex_rollout_usage_snapshot",
@@ -822,7 +845,7 @@ function rolloutRecord({ record, state, receivedAt, checkpoint }) {
     stalenessMs: Math.max(0, Date.parse(receivedAt) - observedMs),
     source: "rollout_token_count",
     model: record.payload?.model ?? info?.model ?? state.currentModel ?? "unknown",
-    components: usage ? canonicalComponents(usage) : null,
+    components: availableUsageComponents(usage),
     tierSemantics: tierForUsage(state, record.timestamp),
     surfaceClassification: state.surfaceClassification,
     ...provisionalRolloutAccount({ checkpoint, observedMs, receivedAt, windows }),

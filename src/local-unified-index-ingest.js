@@ -9,6 +9,7 @@ import {
   extractRolloutUsage,
   inheritedTierSeed,
   ownObservedTier,
+  resolveLogicalRolloutHeads,
   rolloutContentQuarantineReason,
 } from "./local-unified-index-extract.js";
 import {
@@ -26,7 +27,10 @@ import {
   validateLocalUnifiedIndexAttemptToken,
   writeCursorForOutcome,
 } from "./local-unified-index-build.js";
-import { createHistoryBaseSeedResolver } from "./local-unified-index-history.js";
+import {
+  createHistoryBaseSeedResolver,
+  selectRolloutUsageSeed,
+} from "./local-unified-index-history.js";
 import { withStableRolloutSource } from "./rollout-source-snapshot.js";
 import {
   assertLocalUnifiedIndexNotNewer,
@@ -177,11 +181,11 @@ function carriedTotals(cursor) {
     total_tokens: cursor.carry_total_total,
   };
   for (const value of Object.values(totals)) {
-    if (!Number.isSafeInteger(Number(value))) return null;
+    if (value !== null && (!Number.isSafeInteger(value) || value < 0)) return null;
   }
-  return Object.fromEntries(
-    Object.entries(totals).map(([key, value]) => [key, Number(value)]),
-  );
+  // SQL NULL is unavailable evidence, not Number(null) === 0. An entirely
+  // absent vector is the no-baseline state; sparse vectors retain their gaps.
+  return Object.values(totals).every((value) => value === null) ? null : totals;
 }
 
 function carriedTier(cursor) {
@@ -248,6 +252,7 @@ export function classifySource(info, cursor, expectedParserVersion = null) {
     return { mode: "rescan", reason: "same_size_changed" };
   }
   if (size > cursorSize) {
+    if (info.compressed === true) return { mode: "rescan", reason: "compressed_changed" };
     return cursor.quarantine_code === null
       ? { mode: "resume" }
       : { mode: "rescan", reason: "quarantine_changed" };
@@ -771,13 +776,7 @@ export async function ingestLocalUnifiedIndexIncrement({
       );
     }
 
-    const bySessionId = new Map();
-    for (const info of infos) {
-      if (!info.lineage?.sessionId) continue;
-      const generations = bySessionId.get(info.lineage.sessionId) ?? [];
-      generations.push(info);
-      bySessionId.set(info.lineage.sessionId, generations);
-    }
+    const logicalHeads = resolveLogicalRolloutHeads(infos);
     const sessionLocals = new Map();
     const localForSession = (sessionId) => {
       let cached = sessionLocals.get(sessionId);
@@ -792,7 +791,8 @@ export async function ingestLocalUnifiedIndexIncrement({
       return cached;
     };
     // Final carried state for sources scanned in THIS pass, keyed by session
-    // id, so a child scanned after its parent seeds from the freshest values.
+    // id, so a child seeds from the selected head's freshest values. Retired
+    // physical generations still emit facts but cannot replace that authority.
     const finalBySessionId = new Map();
     const sourceOrdinals = new Map();
     let nextSourceOrdinal = -1;
@@ -1242,7 +1242,7 @@ export async function ingestLocalUnifiedIndexIncrement({
       if (scanned !== undefined) {
         return { seedModel: scanned.model, seedEffort: scanned.effort };
       }
-      const parent = bySessionId.get(parentId)?.at(-1);
+      const parent = logicalHeads.get(parentId);
       if (parent === undefined) return { seedModel: null, seedEffort: null };
       const cursor = cursors.get(
         sourceLocal(deviceSalt, sourceIdentityForInfo(parent)).toString("hex"),
@@ -1262,10 +1262,11 @@ export async function ingestLocalUnifiedIndexIncrement({
     // named by `lineage.parentId` is ever consulted, never concurrent
     // unrelated threads — Codex `service_tier` is per-thread, and a global
     // "most recent switch anywhere" carry would mislabel the majority of Fast
-    // sessions. No reachable declaration anywhere up the chain leaves the
-    // seed null and the child's turns unobserved.
+    // sessions. A paginated ancestor closes the logical chain: only its own
+    // declaration or exact physical base can supply a tier. No reachable
+    // declaration within that boundary leaves the child's turns unobserved.
     const lineageTierSeeds = new Map();
-    function lineageSeedTier(info) {
+    async function lineageSeedTier(info) {
       const seen = new Set();
       const visited = [];
       let parentId = info.lineage?.parentId ?? null;
@@ -1288,7 +1289,7 @@ export async function ingestLocalUnifiedIndexIncrement({
           }
           break;
         } else {
-          const parent = bySessionId.get(parentId)?.at(-1);
+          const parent = logicalHeads.get(parentId);
           const cursor = parent === undefined
             ? undefined
             : cursors.get(
@@ -1302,8 +1303,19 @@ export async function ingestLocalUnifiedIndexIncrement({
             resolved = inheritedTierSeed(carried);
             break;
           }
+          if (parent?.lineage?.historyMode === "paginated") {
+            // An unchanged paginated parent intentionally omits inherited
+            // tiers from its own cursor. Recover only its immutable base,
+            // including an explicit unknown; do not walk past its reset to
+            // a logical grandparent's later declaration.
+            const exact = parent.lineage.historyBase == null
+              ? null
+              : await historySeeds.resolveSeed(parent);
+            resolved = inheritedTierSeed(exact?.seedTier ?? null);
+            break;
+          }
         }
-        parentId = bySessionId.get(parentId)?.at(-1)?.lineage?.parentId ?? null;
+        parentId = logicalHeads.get(parentId)?.lineage?.parentId ?? null;
       }
       for (const sessionId of visited) {
         lineageTierSeeds.set(sessionId, resolved);
@@ -1318,7 +1330,12 @@ export async function ingestLocalUnifiedIndexIncrement({
       while (parentId && !seen.has(parentId)) {
         seen.add(parentId);
         chain.push(localForSession(parentId));
-        parentId = bySessionId.get(parentId)?.at(-1)?.lineage?.parentId ?? null;
+        const parent = logicalHeads.get(parentId);
+        // Its persisted set already resolves the exact paginated history.
+        // Consulting logical ancestors beyond that set resurrects discarded
+        // snapshots and can suppress legitimate post-reset work.
+        if (parent?.lineage?.historyMode === "paginated") break;
+        parentId = parent?.lineage?.parentId ?? null;
       }
       return chain;
     }
@@ -1343,11 +1360,10 @@ export async function ingestLocalUnifiedIndexIncrement({
           ? { ...plan, mode: "rescan", reason: "session_rescan" }
           : plan
       ));
-      const planBySessionId = new Map();
+      const planByInfo = new Map(plans.map((plan) => [plan.info, plan]));
       const plansBySessionId = new Map();
       for (const plan of plans) {
         if (plan.info.lineage?.sessionId) {
-          planBySessionId.set(plan.info.lineage.sessionId, plan);
           const sessionPlans = plansBySessionId.get(
             plan.info.lineage.sessionId,
           ) ?? [];
@@ -1398,7 +1414,8 @@ export async function ingestLocalUnifiedIndexIncrement({
         let parentId = ancestryQueue[index].info.lineage?.parentId ?? null;
         while (parentId && !requiredAncestorSessions.has(parentId)) {
           requiredAncestorSessions.add(parentId);
-          const ancestor = planBySessionId.get(parentId);
+          const parent = logicalHeads.get(parentId);
+          const ancestor = planByInfo.get(parent);
           if (ancestor !== undefined
               && ["skip", "resume"].includes(ancestor.mode)
               && Number(ancestor.cursor?.snapshots_persisted ?? 0) !== 1) {
@@ -1406,8 +1423,8 @@ export async function ingestLocalUnifiedIndexIncrement({
             ancestor.reason = "snapshot_persistence";
             rescanSession(parentId);
           }
-          parentId = bySessionId.get(parentId)?.at(-1)?.lineage?.parentId
-            ?? null;
+          if (parent?.lineage?.historyMode === "paginated") break;
+          parentId = parent?.lineage?.parentId ?? null;
         }
       }
       const snapshots = createLineageSnapshots(component.members);
@@ -1496,18 +1513,35 @@ export async function ingestLocalUnifiedIndexIncrement({
               parserReparse: reason === "parser_version",
             });
           }
-          const logicalSeed = resuming
-            ? {
-              seedModel: cursor.carry_model ?? null,
-              seedEffort: cursor.carry_effort ?? null,
-            }
-            : seedForNew(info);
+          const paginated = info.lineage?.historyMode === "paginated";
+          const ownCursorTier = resuming ? carriedTier(cursor) : null;
+          const logicalSeed = paginated || resuming ? null : {
+            ...seedForNew(info),
+            seedTier: await lineageSeedTier(info),
+          };
+          const cursorSeed = resuming ? {
+            seedModel: cursor.carry_model ?? null,
+            seedEffort: cursor.carry_effort ?? null,
+            seedTier: ownCursorTier ?? (paginated ? null : await lineageSeedTier(info)),
+            seedTotals: carriedTotals(cursor),
+          } : null;
           const collector = snapshots.collectorFor(info);
-          const historySeed = resuming
-            ? null
-            : await historySeeds.resolveSeed(info, {
-              includeSnapshots: collector !== null,
-            });
+          // Inherited tiers are deliberately absent from the own-file cursor.
+          // Reconstruct only that missing tier from the exact immutable base;
+          // never from the logical parent's newer state. An explicit null tier
+          // has a timestamped cursor object and does not enter this branch.
+          const needsHistorySeed = !resuming || (paginated
+            && ownCursorTier === null && info.lineage?.historyBase != null);
+          const historySeed = needsHistorySeed
+            ? await historySeeds.resolveSeed(info, {
+              includeSnapshots: !resuming && collector !== null,
+            })
+            : null;
+          const selectedSeed = selectRolloutUsageSeed(info, {
+            historySeed,
+            logicalSeed,
+            cursorSeed,
+          });
           const memoryInherited = snapshots.inheritedFor(info);
           const ancestors = info.lineage?.isInlineFork === true
             ? ancestorSessionLocalsFor(info)
@@ -1549,20 +1583,7 @@ export async function ingestLocalUnifiedIndexIncrement({
               deviceSalt,
               state.sessionLocal,
             ),
-            seedModel: historySeed?.seedModel ?? logicalSeed.seedModel,
-            seedEffort: historySeed?.seedEffort ?? logicalSeed.seedEffort,
-            // A resumed segment carries its own cursor tier (own-file
-            // declarations, still `rollout_thread_settings`). When the cursor
-            // carries none — the file never declared, or only ever inherited —
-            // the ancestor chain is consulted, exactly as a whole-file rescan
-            // would, so provenance survives resume instead of degrading to
-            // unobserved.
-            seedTier: resuming
-              ? carriedTier(cursor) ?? lineageSeedTier(info)
-              : historySeed?.seedTier ?? lineageSeedTier(info),
-            seedTotals: resuming
-              ? carriedTotals(cursor)
-              : historySeed?.seedTotals ?? null,
+            ...selectedSeed,
             seedCompactionPending: resuming ? carriedCompaction(cursor) : null,
             seedTurnContextPending: resuming
               && carriedTurnContextPending(cursor),
@@ -1597,7 +1618,8 @@ export async function ingestLocalUnifiedIndexIncrement({
             });
             continue;
           }
-          if (info.lineage?.sessionId) {
+          if (info.lineage?.sessionId
+              && logicalHeads.get(info.lineage.sessionId) === info) {
             finalBySessionId.set(info.lineage.sessionId, {
               model: outcome.finalModel,
               effort: outcome.finalEffort,
@@ -1609,9 +1631,9 @@ export async function ingestLocalUnifiedIndexIncrement({
             finalModel: outcome.finalModel,
             finalEffort: outcome.finalEffort,
             // Only this file's own declarations are carried in the cursor. An
-            // inherited seed is re-derived from the ancestor chain on the
-            // next pass, so `lineage_inherited` provenance is never laundered
-            // into an own observation by a resume.
+            // inherited seed is re-derived from the exact physical base or
+            // selected inline ancestor chain on the next pass, so its
+            // provenance is never laundered into an own observation by resume.
             finalTierRaw: ownObservedTier(outcome.finalTier)?.providerTierRaw ?? null,
             finalTierObservedAtMs: ownObservedTier(outcome.finalTier)?.observedAtMs ?? null,
             finalTotals: outcome.finalTotals,

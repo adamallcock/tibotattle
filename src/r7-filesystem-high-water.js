@@ -14,6 +14,9 @@ export const R7_FILESYSTEM_HIGH_WATER_OUTCOMES = Object.freeze([
   "root_unsafe",
   "root_replaced",
   "symlink_rejected",
+  "symlink_unowned_rejected",
+  "symlink_zero_rejected",
+  "symlink_many_rejected",
   "hardlink_rejected",
   "hardlink_unowned_rejected",
   "hardlink_zero_rejected",
@@ -323,9 +326,10 @@ export async function measureR7FilesystemRoot(binding, {
         totals.entryCount += 1;
         if (stat.isSymbolicLink()) {
           const owned = typeof process.getuid !== "function" || stat.uid === process.getuid();
-          if (!allowedTransientSymlinks.has(name) || !owned || stat.nlink < 1 || stat.nlink > 2) {
-            fail("symlink_rejected");
-          }
+          if (!allowedTransientSymlinks.has(name)) fail("symlink_rejected");
+          if (!owned) fail("symlink_unowned_rejected");
+          if (stat.nlink < 1) fail("symlink_zero_rejected");
+          if (stat.nlink > 2) fail("symlink_many_rejected");
           continue;
         }
         if (stat.isDirectory()) {

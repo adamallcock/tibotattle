@@ -143,9 +143,11 @@ export const LOCAL_REVIEW_WORKSPACE_RUNTIME_FILES = Object.freeze({
   "@app-usagemonitor/telemetry-contract": Object.freeze([
     "index.js",
     "package.json",
+    "src/admin-model-history.js",
     "src/constants.js",
     "src/envelope.js",
     "src/errors.js",
+    "src/model-catalog.js",
     "src/primitives.js",
     "src/telemetry-v0.1.js",
     "src/telemetry-v0.2.js",

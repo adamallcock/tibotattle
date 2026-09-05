@@ -740,7 +740,7 @@ export async function collectCommunityModelCompositions(
   let v1ParticipantCount = 0;
   let unsupportedSourceParticipantCount = 0;
   let refusedParticipantCount = 0;
-  // Without the 0041 store, every warm pass would silently re-run the full
+  // Without the 0042 store, every warm pass would silently re-run the full
   // per-participant corpus scan and throw the result away. Probe once and
   // skip the expensive work entirely; the day series just does not advance
   // until the migration is applied, which the caller reports rather than
@@ -801,7 +801,7 @@ export async function collectCommunityModelCompositions(
         }
       }
     } catch {
-      // The cache is a pure optimization; migration 0041 may not be applied
+      // The cache is a pure optimization; migration 0042 may not be applied
       // yet. cacheKey stays null so the write below is skipped too, and the
       // next pass retries the cache.
       cacheKey = null;

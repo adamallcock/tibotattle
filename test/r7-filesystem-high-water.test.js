@@ -7,6 +7,7 @@ import { join } from "node:path";
 import {
   createR7FilesystemRootBinding,
   measureR7FilesystemRoot,
+  R7_FILESYSTEM_HIGH_WATER_OUTCOMES,
   R7_FILESYSTEM_HIGH_WATER_VERSION,
   R7_FILESYSTEM_SAMPLE_INTERVAL_MS,
   R7FilesystemHighWaterError,
@@ -326,6 +327,99 @@ test("only the fixed export coordination symlink can be explicitly excluded with
     measureR7FilesystemRoot(binding, { allowedTransientSymlinkNames: ["private-link"] }),
     /transient symlink exclusion is unsupported/,
   );
+});
+
+test("transient symlink refusal categories preserve name and owner precedence without rechecks or leakage", async (t) => {
+  const lockName = ".app-usagemonitor-export.lock";
+  const allowed = { allowedTransientSymlinkNames: [lockName] };
+  for (const [label, name, options, nlink, uidDelta, reason] of [
+    ["owned zero", lockName, allowed, 0, 0, "symlink_zero_rejected"],
+    ["owned negative", lockName, allowed, -1, 0, "symlink_zero_rejected"],
+    ["owned below one", lockName, allowed, 0.5, 0, "symlink_zero_rejected"],
+    ["owned many", lockName, allowed, 3, 0, "symlink_many_rejected"],
+    ["unowned one", lockName, allowed, 1, 1, "symlink_unowned_rejected"],
+    ["owner before zero", lockName, allowed, 0, 1, "symlink_unowned_rejected"],
+    ["owner before many", lockName, allowed, 3, 1, "symlink_unowned_rejected"],
+    ["default remains strict", lockName, {}, 1, 0, "symlink_rejected"],
+    ["default precedes zero", lockName, {}, 0, 0, "symlink_rejected"],
+    ["explicit empty remains strict", lockName, { allowedTransientSymlinkNames: [] }, 1, 0, "symlink_rejected"],
+    ["unsupported name", "PRIVATE_SYMLINK_NAME", allowed, 1, 0, "symlink_rejected"],
+    ["name before owner and zero", "PRIVATE_SYMLINK_NAME", allowed, 0, 1, "symlink_rejected"],
+    ["claim is not an allowed name", `${lockName}.claim.1.00000000-0000-4000-8000-000000000000`,
+      allowed, 1, 0, "symlink_rejected"],
+  ]) {
+    await t.test(label, async (t) => {
+      const created = await fixture(t);
+      const root = await realpath(created.root);
+      const path = join(root, name);
+      const privateTarget = "PRIVATE_SYMLINK_TARGET_NEVER_REPORT";
+      await symlink(privateTarget, path);
+      const binding = await createR7FilesystemRootBinding(root);
+      let targetReads = 0;
+      const overrides = {
+        async lstatPath(candidate) {
+          const stat = await lstat(candidate);
+          if (candidate !== path) return stat;
+          targetReads += 1;
+          return statWithOverrides(stat, { nlink, uid: stat.uid + uidDelta });
+        },
+      };
+      assert.equal(R7_FILESYSTEM_HIGH_WATER_OUTCOMES.includes(reason), true);
+      await assert.rejects(measureR7FilesystemRoot(binding, options, overrides), (error) => {
+        assert.ok(error instanceof R7FilesystemHighWaterError);
+        assert.equal(error.code, `r7_filesystem_${reason}`);
+        assert.equal(error.reason, reason);
+        assert.equal(error.message, `R7 filesystem sampling stopped: ${reason}`);
+        assert.deepEqual(Object.keys(error).sort(), ["code", "name", "reason"]);
+        for (const canary of [root, path, name, privateTarget, "PRIVATE_SYMLINK_NAME"]) {
+          assert.equal(error.message.includes(canary), false);
+          assert.equal(JSON.stringify(error).includes(canary), false);
+        }
+        return true;
+      });
+      assert.equal(targetReads, 1, "refusal must not retry an unsafe symlink observation");
+      targetReads = 0;
+      let operationCalls = 0;
+      const sampled = await runR7FilesystemHighWaterSampler({
+        root,
+        ...options,
+        operation() { operationCalls += 1; },
+      }, overrides);
+      assert.equal(sampled.outcome, reason);
+      assert.equal(sampled.sampleCount, 0);
+      assert.deepEqual(sampled.measurements, { before: null, highWater: null, after: null });
+      assert.equal(operationCalls, 0, "initial rejection must not start the measured operation");
+      assert.equal(targetReads, 1);
+      for (const canary of [root, path, name, privateTarget, "PRIVATE_SYMLINK_NAME"]) {
+        assert.equal(JSON.stringify(sampled).includes(canary), false);
+      }
+    });
+  }
+});
+
+test("owned one-link and two-link export symlinks retain their original measurement behavior", async (t) => {
+  const created = await fixture(t);
+  const root = await realpath(created.root);
+  const path = join(root, ".app-usagemonitor-export.lock");
+  await symlink("PRIVATE_ALLOWED_SYMLINK_TARGET_NEVER_TRAVERSE", path);
+  const binding = await createR7FilesystemRootBinding(root);
+  const options = { allowedTransientSymlinkNames: [".app-usagemonitor-export.lock"] };
+  for (const expectedLinks of [1, 2]) {
+    let targetReads = 0;
+    assert.deepEqual(await measureR7FilesystemRoot(binding, options, {
+      async lstatPath(candidate) {
+        const stat = await lstat(candidate);
+        if (candidate !== path) return stat;
+        assert.equal(stat.isSymbolicLink(), true);
+        targetReads += 1;
+        // Inject the count: link(2) may follow its symlink operand on the host.
+        return statWithOverrides(stat, { nlink: expectedLinks });
+      },
+    }), {
+      bytes: 0, entryCount: 1, fileCount: 0, directoryCount: 0,
+    });
+    assert.equal(targetReads, 1);
+  }
 });
 
 test("owned two-link transaction files are counted only under the explicit transient option", async (t) => {

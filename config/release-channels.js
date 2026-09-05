@@ -137,13 +137,23 @@ function normalizePublicKeyFingerprint(value, { required }) {
   return value;
 }
 
-function stableChannelDefinition() {
+export function normalizeReleaseArchitecture(architecture = "arm64") {
+  if (architecture !== "arm64" && architecture !== "x64") {
+    fail("Release architecture must be arm64 or x64", "RELEASE_ARCHITECTURE_INVALID");
+  }
+  return architecture;
+}
+
+function stableChannelDefinition(architecture = "arm64") {
   const appcast = canonicalAppcastURL(
-    DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
+    architecture === "x64"
+      ? DEPLOYMENT_ENDPOINTS.sparkle.intelAppcastURL
+      : DEPLOYMENT_ENDPOINTS.sparkle.appcastURL,
     DEPLOYMENT_ENDPOINTS.sparkle.origin,
   );
   return {
     schemaVersion: RELEASE_CHANNELS_SCHEMA_VERSION,
+    architecture,
     name: STABLE_RELEASE_CHANNEL,
     configured: true,
     buildManifestChannel: "production",
@@ -155,7 +165,7 @@ function stableChannelDefinition() {
       appcastURL: appcast.href,
       appcastObjectKey: appcast.key,
       r2Bucket: DEPLOYMENT_ENDPOINTS.sparkle.r2Bucket,
-      objectPrefix: "releases",
+      objectPrefix: architecture === "x64" ? "intel/releases" : "releases",
       atomicGuardURL:
         `${DEPLOYMENT_ENDPOINTS.public.origin}${APPCAST_ATOMIC_GUARD_ROUTE}`,
       // Stable's public key remains an explicit operator input for backwards
@@ -170,14 +180,15 @@ function stableChannelDefinition() {
   };
 }
 
-function internalDogfoodChannelDefinition() {
+function internalDogfoodChannelDefinition(architecture = "arm64") {
   const updateOrigin = "https://dogfood-updates.tibotattle.com";
   const appcast = canonicalAppcastURL(
-    `${updateOrigin}/internal-dogfood/appcast.xml`,
+    `${updateOrigin}/internal-dogfood/${architecture === "x64" ? "intel/" : ""}appcast.xml`,
     updateOrigin,
   );
   return {
     schemaVersion: RELEASE_CHANNELS_SCHEMA_VERSION,
+    architecture,
     name: INTERNAL_DOGFOOD_RELEASE_CHANNEL,
     configured: true,
     buildManifestChannel: "internal-dogfood",
@@ -193,7 +204,8 @@ function internalDogfoodChannelDefinition() {
       appcastURL: appcast.href,
       appcastObjectKey: appcast.key,
       r2Bucket: "tibotattle-dogfood-updates",
-      objectPrefix: "internal-dogfood/releases",
+      objectPrefix: architecture === "x64"
+        ? "internal-dogfood/intel/releases" : "internal-dogfood/releases",
       atomicGuardURL:
         `https://dogfood-release.tibotattle.com${APPCAST_ATOMIC_GUARD_ROUTE}`,
       publicEdKeySha256:
@@ -219,6 +231,11 @@ export const RELEASE_CHANNELS = deepFreeze({
   [INTERNAL_DOGFOOD_RELEASE_CHANNEL]: internalDogfoodChannel,
 });
 
+const INTEL_RELEASE_CHANNELS = deepFreeze({
+  [STABLE_RELEASE_CHANNEL]: stableChannelDefinition("x64"),
+  [INTERNAL_DOGFOOD_RELEASE_CHANNEL]: internalDogfoodChannelDefinition("x64"),
+});
+
 function assertChannelShape(channel) {
   if (!channel || typeof channel !== "object" || Array.isArray(channel)) {
     fail("release channel must be an object");
@@ -237,6 +254,7 @@ function assertChannelShape(channel) {
       || Array.isArray(channel.sparkle)) {
     fail("release channel is missing its Sparkle policy");
   }
+  normalizeReleaseArchitecture(channel.architecture);
   return channel;
 }
 
@@ -306,7 +324,9 @@ function assertDistinctFromStable(channel, stable) {
  */
 export function assertReleaseChannelConfiguration(channel) {
   const selected = assertChannelShape(channel);
-  const stable = RELEASE_CHANNELS[STABLE_RELEASE_CHANNEL];
+  const architecture = normalizeReleaseArchitecture(selected.architecture);
+  const reviewed = architecture === "x64" ? INTEL_RELEASE_CHANNELS : RELEASE_CHANNELS;
+  const stable = reviewed[STABLE_RELEASE_CHANNEL];
   if (selected.name === STABLE_RELEASE_CHANNEL) {
     if (selected.configured !== true
         || selected.serviceOriginMode !== STABLE_SERVICE_ORIGIN_MODE
@@ -314,11 +334,11 @@ export function assertReleaseChannelConfiguration(channel) {
         || selected.serviceOrigin !== DEPLOYMENT_ENDPOINTS.public.origin
         || selected.publicWebsiteOrigin !== DEPLOYMENT_ENDPOINTS.public.origin
         || selected.sparkle.origin !== DEPLOYMENT_ENDPOINTS.sparkle.origin
-        || selected.sparkle.appcastURL !== DEPLOYMENT_ENDPOINTS.sparkle.appcastURL
+        || selected.sparkle.appcastURL !== stable.sparkle.appcastURL
         || selected.sparkle.r2Bucket !== DEPLOYMENT_ENDPOINTS.sparkle.r2Bucket
         || selected.sparkle.appcastObjectKey
-          !== new URL(DEPLOYMENT_ENDPOINTS.sparkle.appcastURL).pathname.slice(1)
-        || selected.sparkle.objectPrefix !== "releases"
+          !== stable.sparkle.appcastObjectKey
+        || selected.sparkle.objectPrefix !== stable.sparkle.objectPrefix
         || selected.sparkle.atomicGuardURL
           !== `${DEPLOYMENT_ENDPOINTS.public.origin}${APPCAST_ATOMIC_GUARD_ROUTE}`
         || selected.sparkle.publicEdKeySha256 !== null
@@ -339,20 +359,33 @@ export function assertReleaseChannelConfiguration(channel) {
   }
   assertConfiguredChannelEndpoints(selected);
   assertDistinctFromStable(selected, stable);
+  const expected = reviewed[selected.name];
+  if (architecture === "x64" && (!expected || selected.sparkle.appcastURL !== expected.sparkle.appcastURL
+      || selected.sparkle.appcastObjectKey !== expected.sparkle.appcastObjectKey
+      || selected.sparkle.objectPrefix !== expected.sparkle.objectPrefix
+      || selected.sparkle.origin !== expected.sparkle.origin
+      || selected.sparkle.r2Bucket !== expected.sparkle.r2Bucket
+      || selected.sparkle.atomicGuardURL !== expected.sparkle.atomicGuardURL
+      || selected.sparkle.publicEdKeySha256 !== expected.sparkle.publicEdKeySha256)) {
+    fail("Release channel does not match its reviewed architecture", "RELEASE_CHANNEL_PUBLICATION_MISMATCH");
+  }
   return selected;
 }
 
 /** Return a named reviewed policy descriptor. */
-export function getReleaseChannel(name) {
+export function getReleaseChannel(name, { architecture = "arm64" } = {}) {
+  normalizeReleaseArchitecture(architecture);
   if (typeof name !== "string" || !Object.hasOwn(RELEASE_CHANNELS, name)) {
     fail(`Unknown release channel: ${String(name)}`, "RELEASE_CHANNEL_UNKNOWN");
   }
-  return assertReleaseChannelConfiguration(RELEASE_CHANNELS[name]);
+  return assertReleaseChannelConfiguration(
+    (architecture === "x64" ? INTEL_RELEASE_CHANNELS : RELEASE_CHANNELS)[name],
+  );
 }
 
 /** Resolve an operational channel. */
-export function resolveReleaseChannel(name) {
-  const selected = getReleaseChannel(name);
+export function resolveReleaseChannel(name, options = {}) {
+  const selected = getReleaseChannel(name, options);
   if (!selected.configured) {
     fail(
       `Release channel ${selected.name} has no reviewed dedicated endpoints yet`,
@@ -369,7 +402,7 @@ export function resolveReleaseChannel(name) {
  */
 export function assertReleaseChannelPublication(channelOrName, publication) {
   const selected = typeof channelOrName === "string"
-    ? resolveReleaseChannel(channelOrName)
+    ? resolveReleaseChannel(channelOrName, { architecture: publication?.architecture })
     : assertReleaseChannelConfiguration(channelOrName);
   if (!selected.configured) {
     fail(
@@ -378,6 +411,7 @@ export function assertReleaseChannelPublication(channelOrName, publication) {
     );
   }
   if (!publication || typeof publication !== "object"
+      || normalizeReleaseArchitecture(publication.architecture) !== normalizeReleaseArchitecture(selected.architecture)
       || publication.name !== selected.name
       || publication.serviceOriginMode !== selected.serviceOriginMode
       || publication.serviceOrigin !== selected.serviceOrigin
@@ -410,10 +444,10 @@ export function assertReleaseChannelPublication(channelOrName, publication) {
 /** Build the exact endpoint/key record stored in a release manifest. */
 export function createReleaseChannelProvenance(
   channelOrName,
-  { publicEdKeySha256 } = {},
+  { publicEdKeySha256, architecture = "arm64" } = {},
 ) {
   const selected = typeof channelOrName === "string"
-    ? resolveReleaseChannel(channelOrName)
+    ? resolveReleaseChannel(channelOrName, { architecture })
     : assertReleaseChannelConfiguration(channelOrName);
   if (!selected.configured || typeof publicEdKeySha256 !== "string"
       || !SHA256_PATTERN.test(publicEdKeySha256)) {
@@ -424,6 +458,7 @@ export function createReleaseChannelProvenance(
   }
   const publication = deepFreeze({
     name: selected.name,
+    architecture: selected.architecture,
     serviceOriginMode: selected.serviceOriginMode,
     serviceOrigin: selected.serviceOrigin,
     publicWebsiteOrigin: selected.publicWebsiteOrigin,
@@ -443,3 +478,7 @@ export function createReleaseChannelProvenance(
 
 assertReleaseChannelConfiguration(stableChannel);
 assertReleaseChannelConfiguration(internalDogfoodChannel);
+
+for (const channel of Object.values(INTEL_RELEASE_CHANNELS)) {
+  assertReleaseChannelConfiguration(channel);
+}

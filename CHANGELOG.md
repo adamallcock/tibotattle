@@ -34,7 +34,38 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-Future changes will be recorded here.
+No changes recorded after 0.1.18.
+
+## [0.1.18](./release-notes/0.1.18.md) - 2026-09-05
+
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.18) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.18) ·
+[changes since v0.1.17](https://github.com/adamallcock/tibotattle/compare/v0.1.17...v0.1.18)
+
+- Adds GPT-6 Astra model recognition and Standard, Batch, Flex and Fast
+  API-equivalent pricing, including cache writes and long-context pricing.
+  Missing token components remain unavailable; an Astra reasoning-effort
+  change does not automatically imply a cache reset.
+- Supports compressed Codex histories and current compaction headers, and
+  expands the admin model dashboard to all 39 reviewed OpenAI identities.
+- Fixes resumable paginated reset exports, logical-fork and repeated-generation
+  accounting, and inherited model/speed attribution after a history reset.
+  Exact physical-base continuations remain explicitly unsupported in the
+  checkpoint export lane.
+- Applies the bounded four-hour first-upgrade refresh window to reviewed
+  parser v10/v11/v12/v13-to-v14 rescans; normal warm-refresh limits and
+  preservation safeguards remain unchanged.
+- Introduces separate Apple silicon and Intel macOS 14+ installers, with
+  architecture-specific updates and stable build `1026`
+  ([issue #93](https://github.com/adamallcock/tibotattle/issues/93)). The owner
+  explicitly accepted the unavailable disposable-profile/manual and physical
+  Intel qualification for this release only; reported tester success is not
+  a formal receipt. See the [release-specific waiver](./docs/decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md).
+
+Final artifact trust, data preservation, updater integrity and unexpected
+Keychain prompts remain non-waived gates. This release does not add Windows,
+Linux, Electron or Homebrew Intel support, or activate hosted migrations,
+device pairing or new contribution consent.
 
 ## [0.1.17](./release-notes/0.1.17.md) - 2026-09-03
 

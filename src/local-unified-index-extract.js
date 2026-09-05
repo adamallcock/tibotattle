@@ -8,6 +8,13 @@ import { forEachRolloutLine, ROLLOUT_LINE_BYTES } from "./rollout-line-reader.js
 
 // Projection from one Codex rollout file to typed usage facts.
 //
+// Codex #41912 also persists top-level token_usage_record and compaction
+// checkpoint copies. They overlap the still-emitted legacy token_count stream
+// and are intentionally not additional accounting sources. Authored
+// configuration_update controls are likewise not backend application receipts;
+// reasoningEffort remains the recorded turn/request setting, not inferred
+// effective effort. See docs/reference/unified-index-schema.md.
+//
 // This module is pure: no SQLite, no filesystem writes, no identity. That is
 // what lets the identical code run in-process and inside a worker thread. Its
 // one owner-area import is the reviewed `cumulativeSnapshotKey`, measured at
@@ -39,16 +46,18 @@ const NEEDLE_RELEVANT_PREFIX = Buffer.from('"t');
 const COMPACTION_TIMESTAMP_PREFIX = Buffer.from('{"timestamp":"');
 const COMPACTION_TYPE_SUFFIX = Buffer.from(',"type":"compacted"');
 const COMPACTION_TYPE_PREFIX = Buffer.from('{"type":"compacted","timestamp":"');
+const COMPACTION_ORDINAL_PREFIX = Buffer.from(',"ordinal":');
 
 // A compacted record can contain an enormous replacement_history payload. Its
 // top-level header is bounded and arrives first. Codex's current serializer
-// emits timestamp then type, while a standards-compliant producer may emit
+// emits timestamp, optional ordinal, then type; older producers may emit
 // the two top-level scalars in the opposite order:
 //
 //   {"timestamp":"...","type":"compacted","payload":...}
+//   {"timestamp":"...","ordinal":123,"type":"compacted","payload":...}
 //   {"type":"compacted","timestamp":"...","payload":...}
 //
-// Match only those two exact byte headers and decode only the timestamp
+// Match only those exact byte headers and decode only the timestamp
 // scalar. Unknown fields, whitespace variants and any marker appearing after
 // payload fail closed. This is
 // deliberately not JSON.parse, and it never converts even the bounded start
@@ -74,7 +83,22 @@ export function parseCompactionPrefix(line) {
   if (timestampEnd < timestampStart
       || timestampEnd - timestampStart > 64) return null;
   if (timestampFirst) {
-    const typeStart = timestampEnd + 1;
+    let typeStart = timestampEnd + 1;
+    if (line.subarray(typeStart, typeStart + COMPACTION_ORDINAL_PREFIX.length)
+      .equals(COMPACTION_ORDINAL_PREFIX)) {
+      const ordinalStart = typeStart + COMPACTION_ORDINAL_PREFIX.length;
+      let ordinalEnd = ordinalStart;
+      while (ordinalEnd < line.length && ordinalEnd - ordinalStart < 20
+          && line[ordinalEnd] >= 0x30 && line[ordinalEnd] <= 0x39) ordinalEnd += 1;
+      const digits = ordinalEnd - ordinalStart;
+      // Validate the bounded unsigned integer without reading payload or
+      // rounding a possible u64 ordinal through a JavaScript number.
+      if (digits === 0 || line[ordinalEnd] !== 0x2c
+          || (digits > 1 && line[ordinalStart] === 0x30)
+          || (digits === 20 && line.toString("ascii", ordinalStart, ordinalEnd)
+            > "18446744073709551615")) return null;
+      typeStart = ordinalEnd;
+    }
     const typeEnd = typeStart + COMPACTION_TYPE_SUFFIX.length;
     if (line.length <= typeEnd
         || !line.subarray(typeStart, typeEnd).equals(COMPACTION_TYPE_SUFFIX)
@@ -160,17 +184,35 @@ function normalizeUsage(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const normalized = {};
   for (const key of TOKEN_KEYS) {
-    const quantity = value[key] ?? 0;
+    const quantity = value[key];
+    // Nullable counters preserve provider missingness through worker messages,
+    // SQLite and incremental cursor seeds. Missing is not an observed zero.
+    if (quantity === undefined || quantity === null) {
+      normalized[key] = null;
+      continue;
+    }
     if (!Number.isSafeInteger(quantity) || quantity < 0) return null;
     normalized[key] = quantity;
   }
   return normalized;
 }
 
+function lineageUsage(value) {
+  if (value === null) return null;
+  // This is only the pre-existing replay identity representation, never usage
+  // evidence. Retain the provider scanner/v11 snapshot-key contract so a new
+  // child still matches snapshots of a parent whose source has rotated away.
+  if (TOKEN_KEYS.every((key) => value[key] !== null)) return value;
+  return Object.fromEntries(TOKEN_KEYS.map((key) => [key, value[key] ?? 0]));
+}
+
 function subtract(current, previous) {
   const result = {};
   for (const key of TOKEN_KEYS) {
-    result[key] = Math.max(0, current[key] - (previous?.[key] ?? 0));
+    result[key] = current[key] === null
+      || (previous !== null && previous !== undefined && previous[key] == null)
+      ? null
+      : Math.max(0, current[key] - (previous?.[key] ?? 0));
   }
   return result;
 }
@@ -188,27 +230,34 @@ function subtract(current, previous) {
 const CUMULATIVE_DELTA_VS_LAST_TOLERANCE_TOKENS = 16;
 
 function sameUsage(left, right) {
-  return TOKEN_KEYS.every((key) => left[key] === right[key]);
+  // A missing cumulative component cannot contradict an explicit per-response
+  // component. Prefer the latter when the observed delta agrees everywhere
+  // it has evidence, including the total used to enter this branch.
+  return TOKEN_KEYS.every((key) => right[key] === null || left[key] === right[key]);
 }
 
-// Mirrors the reviewed provider normalization exactly, restated so that the
-// hot path does not cross a facade for five subtractions. `cumulativeSnapshotKey`
+// Mirrors the reviewed provider normalization and component availability,
+// projecting unavailable components directly as null instead of a separate
+// presence object. `cumulativeSnapshotKey`
 // above is imported rather than restated for the opposite reason: it defines
 // the fork-replay boundary, and a boundary that drifts from the reviewed
 // definition would silently change what counts as spend.
 export function canonicalComponents(raw) {
-  const cacheRead = Math.min(raw.cached_input_tokens, raw.input_tokens);
-  const cacheWrite = Math.min(
-    raw.cache_write_input_tokens,
-    Math.max(0, raw.input_tokens - cacheRead),
-  );
-  const reasoning = Math.min(raw.reasoning_output_tokens, raw.output_tokens);
+  const has = (key) => Number.isSafeInteger(raw[key]) && raw[key] >= 0;
+  const inputKnown = has("input_tokens") && has("cached_input_tokens");
+  const allInputKnown = inputKnown && has("cache_write_input_tokens");
+  const inputConsistent = (raw.cached_input_tokens ?? 0)
+    + (raw.cache_write_input_tokens ?? 0) <= (raw.input_tokens ?? 0);
+  const outputKnown = has("output_tokens") && has("reasoning_output_tokens")
+    && raw.reasoning_output_tokens <= raw.output_tokens;
   return {
-    inputUncachedTokens: Math.max(0, raw.input_tokens - cacheRead - cacheWrite),
-    inputCacheReadTokens: cacheRead,
-    inputCacheWriteTokens: cacheWrite,
-    outputTextTokens: Math.max(0, raw.output_tokens - reasoning),
-    outputReasoningTokens: reasoning,
+    inputUncachedTokens: allInputKnown && inputConsistent
+      ? raw.input_tokens - raw.cached_input_tokens - raw.cache_write_input_tokens
+      : null,
+    inputCacheReadTokens: inputKnown && inputConsistent ? raw.cached_input_tokens : null,
+    inputCacheWriteTokens: allInputKnown && inputConsistent ? raw.cache_write_input_tokens : null,
+    outputTextTokens: outputKnown ? raw.output_tokens - raw.reasoning_output_tokens : null,
+    outputReasoningTokens: outputKnown ? raw.reasoning_output_tokens : null,
   };
 }
 
@@ -277,7 +326,8 @@ export function salvagePartialTokenCount(text) {
  * resume cursor carried, which is the same declaration seen earlier). An
  * inherited seed is provenance-distinct: it must never be persisted into the
  * cursor's carry as if it were an own observation — the next pass re-derives
- * it from the ancestor chain instead, so the `lineage_inherited` label
+ * it only from the exact physical history base for a paginated source or the
+ * ancestor chain for a legacy inline source, so the `lineage_inherited` label
  * survives a resume rather than being laundered into
  * `rollout_thread_settings`.
  */
@@ -716,7 +766,7 @@ export async function extractRolloutUsage(path, {
       // A skipped row still rebases the cumulative baseline. Without that, the
       // first genuine post-fork turn would be charged the entire inherited
       // total as if it were one enormous turn.
-      const snapshotKey = cumulativeSnapshotKey(total, last);
+      const snapshotKey = cumulativeSnapshotKey(lineageUsage(total), lineageUsage(last));
       if (isFork && snapshotKey !== null && inheritedSnapshots?.has(snapshotKey)) {
         consumeReplayedBoundary(last ?? total);
         if (total) rebaseTotals(total);
@@ -782,7 +832,7 @@ export async function extractRolloutUsage(path, {
           && normalizedQuota === null) {
         diagnostics.malformedRateLimitRecords += 1;
       }
-      if ((!usage || (usage.input_tokens === 0 && usage.output_tokens === 0))
+      if ((!usage || !(usage.input_tokens > 0 || usage.output_tokens > 0))
           && quota.length === 0) return;
       if (currentModel === null) diagnostics.modelMissing += 1;
       return emitUsage({
@@ -820,6 +870,33 @@ export async function extractRolloutUsage(path, {
 }
 
 /**
+ * Resolve logical-parent authority independently of physical scan order.
+ * Every physical source remains accounting evidence, but only the explicit
+ * selected head supplies descendants. Old noncanonical single-source inputs
+ * have no immutable rollout id or head receipt and remain unambiguous; a
+ * canonical retired source or an unresolved multi-source thread never wins
+ * merely because it happened to be visited last.
+ */
+export function resolveLogicalRolloutHeads(members) {
+  const bySessionId = new Map();
+  for (const info of members) {
+    const sessionId = info.lineage?.sessionId;
+    if (!sessionId) continue;
+    const generations = bySessionId.get(sessionId) ?? [];
+    generations.push(info);
+    bySessionId.set(sessionId, generations);
+  }
+  const heads = new Map();
+  for (const [sessionId, generations] of bySessionId) {
+    const selected = generations.filter((generation) => generation.resolvedHead === true);
+    if (selected.length === 1) heads.set(sessionId, selected[0]);
+    else if (selected.length === 0 && generations.length === 1
+        && generations[0].rolloutId == null) heads.set(sessionId, generations[0]);
+  }
+  return heads;
+}
+
+/**
  * A tracker for the fork-replay boundary over one lineage component.
  *
  * These in-memory sets exist for the length of a component and are dropped
@@ -844,26 +921,13 @@ export function createLineageSnapshots(members) {
     const parentId = info.lineage?.parentId;
     if (parentId) referenced.add(parentId);
   }
-  const bySessionId = new Map();
-  for (const info of members) {
-    if (!info.lineage?.sessionId) continue;
-    const generations = bySessionId.get(info.lineage.sessionId) ?? [];
-    generations.push(info);
-    bySessionId.set(info.lineage.sessionId, generations);
-  }
+  const logicalHeads = resolveLogicalRolloutHeads(members);
   const sets = new Map();
 
   function suppliesResolvedHistory(info) {
     const sessionId = info.lineage?.sessionId;
     if (!sessionId) return false;
-    const generations = bySessionId.get(sessionId) ?? [];
-    const resolved = generations.find(
-      (generation) => generation.resolvedHead === true,
-    );
-    // Legacy/noncanonical single-rollout fixtures have no immutable rollout
-    // identity from which discovery can stamp a head. One generation is still
-    // unambiguous; multiple unresolved generations are never chosen here.
-    return resolved === undefined ? generations.length === 1 : info === resolved;
+    return logicalHeads.get(sessionId) === info;
   }
 
   return {
@@ -890,7 +954,7 @@ export function createLineageSnapshots(members) {
       sets.set(sessionId, set);
       return true;
     },
-    /** A view over every ancestor's set, nearest first. */
+    /** Ancestor sets nearest first, ending at an exact paginated history. */
     inheritedFor(info) {
       const chain = [];
       const seen = new Set();
@@ -899,10 +963,12 @@ export function createLineageSnapshots(members) {
         seen.add(parentId);
         const set = sets.get(parentId);
         if (set) chain.push(set);
-        const parentGenerations = bySessionId.get(parentId) ?? [];
-        const selected = parentGenerations.find(
-          (generation) => generation.resolvedHead === true,
-        ) ?? parentGenerations.at(-1);
+        const selected = logicalHeads.get(parentId);
+        // This set already is the selected physical base-prefix plus own
+        // snapshots, or only own snapshots after an independent reset. A
+        // logical grandparent beyond it may contain discarded history and
+        // must not suppress genuinely new matching counters in a descendant.
+        if (selected?.lineage?.historyMode === "paginated") break;
         parentId = selected?.lineage?.parentId ?? null;
       }
       if (chain.length === 0) return null;

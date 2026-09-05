@@ -82,14 +82,18 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     // cache rows instead of event or per-account analysis tables.
     "0039_admin_metrics_history_cache.sql",
     "0040_community_allowance_publication_state.sql",
+    // Preserve the historical production migration under its applied name.
+    // The independently authored composition tables have a unique successor
+    // number; an alternate applied ledger still fails the exact-prefix guard.
+    "0041_community_model_composition_cache.sql",
     // Added with the per-model allowance fit (2026-08-30): the per-participant
     // composition cache plus the published per-day cohort series.
-    "0041_community_model_composition.sql",
+    "0042_community_model_composition.sql",
     // Account/plan attribution remains staged: these migrations add input
     // fencing, explicit consent/floors, and complete-domain activation guards.
-    "0042_analytical_input_fencing.sql",
-    "0043_attribution_transport_staging.sql",
-    "0044_attribution_domain_activation.sql",
+    "0043_analytical_input_fencing.sql",
+    "0044_attribution_transport_staging.sql",
+    "0045_attribution_domain_activation.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",
@@ -117,7 +121,6 @@ export const ATTRIBUTION_SCHEMA_OBJECTS = Object.freeze(Object.entries({
     "telemetry_v11_domain_heads",
   ],
   index: [
-    "telemetry_v1_records_time_cursor",
     "telemetry_contributions_successor_compatibility",
     "telemetry_v11_consents_device",
     "telemetry_v11_manifests_device_day",
@@ -216,6 +219,33 @@ export const ATTRIBUTION_SCHEMA_COLUMNS = Object.freeze(Object.fromEntries(
   }).map(([table, columns]) => [table, Object.freeze(columns)]),
 ));
 
+// The repaired reader depends on the historical 0036 non-partial index and its
+// ascending binary keys, including the implicit rowid suffix. Keep this
+// prerequisite separate from the inventory of objects added by 0043 onward.
+export const V1_USAGE_CURSOR_INDEX_PROBE_SQL = `
+SELECT EXISTS (
+  SELECT 1 FROM pragma_table_info('telemetry_v1_records')
+   WHERE name = 'id' AND upper(type) = 'INTEGER' AND pk = 1
+) AND (SELECT count(*) FROM pragma_table_info('telemetry_v1_records') WHERE pk > 0) = 1
+AND NOT EXISTS (
+  SELECT 1 FROM pragma_index_list('telemetry_v1_records') WHERE origin = 'pk'
+) AND EXISTS (
+  SELECT 1 FROM pragma_index_list('telemetry_v1_records')
+   WHERE name = 'telemetry_v1_records_participant_stream_observed'
+     AND "unique" = 0 AND partial = 0 AND origin = 'c'
+) AND (SELECT count(*) FROM pragma_index_xinfo(
+  'telemetry_v1_records_participant_stream_observed')) = 4
+AND NOT EXISTS (
+  SELECT 1 FROM pragma_index_xinfo('telemetry_v1_records_participant_stream_observed')
+   WHERE "desc" IS NOT 0 OR coll IS NOT 'BINARY' OR NOT (
+     (seqno = 0 AND name IS 'participant_id' AND "key" = 1) OR
+     (seqno = 1 AND name IS 'stream' AND "key" = 1) OR
+     (seqno = 2 AND name IS 'observed_at' AND "key" = 1) OR
+     (seqno = 3 AND cid = -1 AND name IS NULL AND "key" = 0)
+   )
+) AS v1_usage_cursor_index
+`;
+
 // One bounded metadata query: no contribution, identity, token or policy-state
 // values leave the database, and no table-per-column remote round trips.
 export const ATTRIBUTION_SCHEMA_PROBE_SQL = `
@@ -231,7 +261,7 @@ SELECT NOT EXISTS (
   SELECT 1 FROM required_objects expected
    WHERE NOT EXISTS (SELECT 1 FROM sqlite_master actual
      WHERE actual.type = expected.type AND actual.name = expected.name)
-) AS attribution_objects,
+) AND (${V1_USAGE_CURSOR_INDEX_PROBE_SQL}) AS attribution_objects,
 NOT EXISTS (
   SELECT 1 FROM required_columns expected
    WHERE NOT EXISTS (SELECT 1 FROM pragma_table_info(expected.table_name) actual

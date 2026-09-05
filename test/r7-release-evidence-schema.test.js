@@ -102,9 +102,11 @@ test("release provenance binds both executable R7 worker scripts", () => {
     ),
   );
   assert.deepEqual(telemetryPaths, [
+    "packages/telemetry-contract/src/admin-model-history.js",
     "packages/telemetry-contract/src/constants.js",
     "packages/telemetry-contract/src/envelope.js",
     "packages/telemetry-contract/src/errors.js",
+    "packages/telemetry-contract/src/model-catalog.js",
     "packages/telemetry-contract/src/primitives.js",
     "packages/telemetry-contract/src/telemetry-v0.1.js",
     "packages/telemetry-contract/src/telemetry-v0.2.js",

@@ -43,6 +43,7 @@ import {
 import {
   extractRolloutUsage,
   parseCompactionPrefix,
+  resolveLogicalRolloutHeads,
   salvagePartialTokenCount,
 } from "../src/local-unified-index-extract.js";
 import {
@@ -208,7 +209,7 @@ function paginatedSessionMeta(sessionId, {
   });
 }
 
-function paginatedResetSessionMeta(sessionId, { ordinal = 0 } = {}) {
+function paginatedResetSessionMeta(sessionId, { ordinal = 0, parentId = null } = {}) {
   return JSON.stringify({
     ordinal,
     timestamp: "2026-07-25T00:00:00.000Z",
@@ -217,6 +218,10 @@ function paginatedResetSessionMeta(sessionId, { ordinal = 0 } = {}) {
       id: sessionId,
       session_id: sessionId,
       history_mode: "paginated",
+      ...(parentId === null ? {} : {
+        forked_from_id: parentId,
+        parent_thread_id: parentId,
+      }),
       thread_source: "user",
       originator: "codex_cli_rs",
     },
@@ -309,9 +314,10 @@ function tokenCountTotalOnly(timestamp, total) {
   });
 }
 
-function compacted(timestamp, paddingBytes = 0) {
+function compacted(timestamp, paddingBytes = 0, ordinal = null) {
   return JSON.stringify({
     timestamp,
+    ...(ordinal === null ? {} : { ordinal }),
     type: "compacted",
     payload: {
       message: "SECRET COMPACTION SUMMARY DO NOT INDEX",
@@ -1836,6 +1842,476 @@ test("a paginated replacement charges old removed work and only its post-boundar
   }
 });
 
+function paginatedSeedRows(indexFile) {
+  const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+  try {
+    return database.prepare(`
+      SELECT m.model_id AS model, u.reasoning_effort AS effort,
+             t.codex_speed_mode AS speed, t.tier_source AS tierSource,
+             t.provider_tier_raw AS rawTier, u.tokens_in_uncached AS input,
+             u.tokens_out_text AS output
+      FROM usage_event u
+      JOIN model m ON m.id = u.model_id
+      JOIN tier_semantics t ON t.id = u.tier_id
+      WHERE u.observed_at_ms >= ? AND u.observed_at_ms < ?
+      ORDER BY u.observed_at_ms`).all(
+      Date.parse("2026-07-25T01:00:00.000Z"),
+      Date.parse("2026-07-25T02:00:00.000Z"),
+    ).map((row) => ({ ...row }));
+  } finally {
+    database.close();
+  }
+}
+
+const UNKNOWN_PAGINATED_SEED_ROW = Object.freeze({
+  model: "unknown",
+  effort: reasoningEffortOrdinal(null),
+  speed: "unknown",
+  tierSource: "unobserved",
+  rawTier: null,
+  input: 50,
+  output: 5,
+});
+
+for (const history of ["reset", "anchored-null"]) {
+  for (const pipeline of ["serial rebuild", "worker rebuild", "incremental"]) {
+    test(`paginated seed isolation: ${history} ${pipeline} ignores the live parent's final state`, async () => {
+      const parentName = canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE);
+      const childName = canonicalRolloutName("2026-07-25T01-00-00", THREAD_TWO);
+      const prefix = [sessionMeta(THREAD_ONE)];
+      const childMeta = history === "reset"
+        ? paginatedResetSessionMeta(THREAD_TWO, { parentId: THREAD_ONE })
+        : paginatedSessionMeta(THREAD_TWO, {
+          ordinal: prefix.length,
+          baseRolloutId: THREAD_ONE,
+          endOrdinalExclusive: prefix.length,
+          endByteOffset: jsonlBytes(prefix),
+          parentId: THREAD_ONE,
+        });
+      const laterParentSettings = [
+        turnContext("2026-07-25T03:00:00.000Z", "gpt-6-astra", "ultra"),
+        threadSettings("2026-07-25T03:00:00.500Z", "priority"),
+        tokenCount("2026-07-25T03:00:01.000Z", usage(300, 30), usage(200, 20)),
+      ];
+      const { root, sessions } = await corpus({
+        [parentName]: [
+          ...prefix,
+          turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol", "low"),
+          tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+          // This update occurs after the child's usage. Neither a reset nor
+          // the exact all-null prefix may inherit the live parent's suffix.
+          ...(pipeline === "incremental" ? [] : laterParentSettings),
+        ],
+        [childName]: [
+          childMeta,
+          // The first own observation establishes the independent counter;
+          // its later total-only append must continue from this exact value.
+          tokenCount("2026-07-25T01:00:01.000Z", usage(50, 5), usage(50, 5)),
+        ],
+      });
+      const indexFile = join(root, "index.sqlite");
+      const ingest = () => ingestLocalUnifiedIndexIncrement({
+        codexHome: root,
+        indexFile,
+        secretFile: join(root, "salt"),
+        contractVersion: CONTRACT,
+      });
+      try {
+        const initial = pipeline === "incremental"
+          ? await ingest()
+          : await build(root, { workerCount: pipeline === "serial rebuild" ? 1 : 2 });
+        assert.equal(initial.generation.status, "complete");
+        if (pipeline !== "incremental") {
+          assert.equal(initial.modelSeededFromLineage, 0);
+        }
+        assert.deepEqual(paginatedSeedRows(indexFile), [UNKNOWN_PAGINATED_SEED_ROW]);
+
+        if (pipeline !== "incremental") return;
+
+        // The parent also changes physically between passes: neither its
+        // newly observed final model nor tier may rewrite the child's past.
+        await appendFile(join(sessions, parentName), `${laterParentSettings.join("\n")}\n`);
+        await appendFile(join(sessions, childName), `${tokenCountTotalOnly(
+          "2026-07-25T01:00:02.000Z", usage(80, 8),
+        )}\n`);
+        const resumed = await ingest();
+        assert.equal(resumed.sourcesResumed, 2);
+        assert.equal(resumed.insertedUsageEvents, 2);
+        const unknownRows = [
+          UNKNOWN_PAGINATED_SEED_ROW,
+          { ...UNKNOWN_PAGINATED_SEED_ROW, input: 30, output: 3 },
+        ];
+        assert.deepEqual(paginatedSeedRows(indexFile), unknownRows);
+
+        // A later own declaration is positive evidence from this point only;
+        // replay must neither backfill the earlier unknowns nor duplicate work.
+        await appendFile(join(sessions, childName), `${[
+          turnContext("2026-07-25T01:00:03.000Z", "gpt-5.6-terra", "high"),
+          threadSettings("2026-07-25T01:00:03.500Z", "default"),
+          tokenCountTotalOnly("2026-07-25T01:00:04.000Z", usage(120, 12)),
+        ].join("\n")}\n`);
+        const own = await ingest();
+        assert.equal(own.sourcesResumed, 1);
+        assert.equal(own.insertedUsageEvents, 1);
+        assert.equal(own.totalUsageEvents, 5);
+        const expected = [...unknownRows, {
+          model: "gpt-5.6-terra",
+          effort: reasoningEffortOrdinal("high"),
+          speed: "standard",
+          tierSource: "rollout_thread_settings",
+          rawTier: "default",
+          input: 40,
+          output: 4,
+        }];
+        assert.deepEqual(paginatedSeedRows(indexFile), expected);
+
+        const raw = openLocalUnifiedIndex(indexFile, { readOnly: false });
+        try {
+          raw.prepare(
+            "UPDATE parser_version SET parser_version = 'unified-rollout-typed-v13'",
+          ).run();
+        } finally {
+          raw.close();
+        }
+        const reparsed = await ingest();
+        assert.equal(reparsed.sourcesReparsedForParserVersion, 2);
+        assert.equal(reparsed.usageRowsDeletedForReparse, 5);
+        assert.equal(reparsed.totalUsageEvents, 5);
+        assert.deepEqual(paginatedSeedRows(indexFile), expected);
+        const settled = await ingest();
+        assert.equal(settled.insertedUsageEvents, 0);
+        assert.equal(settled.totalUsageEvents, 5);
+        assert.deepEqual(paginatedSeedRows(indexFile), expected);
+      } finally {
+        await rm(root, { recursive: true });
+      }
+    });
+  }
+}
+
+for (const ownTier of ["absent", "explicit-null"]) {
+  test(`paginated seed isolation: anchored resume preserves ${ownTier} tier authority`, async () => {
+    const parentName = canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE);
+    const childName = canonicalRolloutName("2026-07-25T01-00-00", THREAD_TWO);
+    const prefix = [
+      sessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol", "high"),
+      threadSettings("2026-07-25T00:00:00.500Z", "priority"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ];
+    const ownDeclarationMs = Date.parse("2026-07-25T01:00:00.500Z");
+    const { root, sessions } = await corpus({
+      [parentName]: [
+        ...prefix,
+        turnContext("2026-07-25T03:00:00.000Z", "gpt-6-astra", "ultra"),
+        threadSettings("2026-07-25T03:00:00.500Z", "default"),
+        tokenCount("2026-07-25T03:00:01.000Z", usage(300, 30), usage(200, 20)),
+      ],
+      [childName]: [
+        paginatedSessionMeta(THREAD_TWO, {
+          ordinal: prefix.length,
+          baseRolloutId: THREAD_ONE,
+          endOrdinalExclusive: prefix.length,
+          endByteOffset: jsonlBytes(prefix),
+          parentId: THREAD_ONE,
+        }),
+        ...(ownTier === "explicit-null" ? [
+          threadSettings(new Date(ownDeclarationMs).toISOString(), null),
+        ] : []),
+        tokenCountTotalOnly("2026-07-25T01:00:01.000Z", usage(150, 15)),
+      ],
+    });
+    const indexFile = join(root, "index.sqlite");
+    const ingest = () => ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    const row = {
+      model: "gpt-5.6-sol",
+      effort: reasoningEffortOrdinal("high"),
+      speed: ownTier === "explicit-null" ? "unknown" : "fast",
+      tierSource: ownTier === "explicit-null"
+        ? "rollout_thread_settings" : "lineage_inherited",
+      rawTier: ownTier === "explicit-null" ? null : "priority",
+      input: 50,
+      output: 5,
+    };
+    try {
+      const initial = await ingest();
+      assert.equal(initial.generation.status, "complete");
+      assert.deepEqual(paginatedSeedRows(indexFile), [row]);
+      const database = openLocalUnifiedIndex(indexFile, { readOnly: true });
+      try {
+        const cursor = database.prepare(`
+          SELECT carry_tier_raw AS raw, carry_tier_observed_at_ms AS observed
+          FROM source_cursor WHERE carry_model = 'gpt-5.6-sol'`).get();
+        assert.equal(cursor.raw, null);
+        assert.equal(cursor.observed, ownTier === "explicit-null" ? ownDeclarationMs : null);
+      } finally {
+        database.close();
+      }
+      await appendFile(join(sessions, childName), `${tokenCountTotalOnly(
+        "2026-07-25T01:00:02.000Z", usage(180, 18),
+      )}\n`);
+      const resumed = await ingest();
+      assert.equal(resumed.sourcesResumed, 1);
+      assert.equal(resumed.insertedUsageEvents, 1);
+      assert.equal(resumed.totalUsageEvents, 4);
+      const expected = [row, { ...row, input: 30, output: 3 }];
+      assert.deepEqual(paginatedSeedRows(indexFile), expected);
+
+      // Reconstructing an inherited tier must use exactly the retained prefix,
+      // and an own explicit null remains authoritative after restart/rebuild.
+      for (const workerCount of [1, 2]) {
+        const rebuiltIndex = join(root, `rebuilt-${workerCount}.sqlite`);
+        const rebuilt = await build(root, { indexFile: rebuiltIndex, workerCount });
+        assert.equal(rebuilt.usageEvents, 4);
+        assert.deepEqual(paginatedSeedRows(rebuiltIndex), expected);
+        const reference = openLocalUnifiedIndex(indexFile, { readOnly: true });
+        const fresh = openLocalUnifiedIndex(rebuiltIndex, { readOnly: true });
+        try {
+          assert.deepEqual(logicalProjection(reference), logicalProjection(fresh));
+        } finally {
+          reference.close();
+          fresh.close();
+        }
+      }
+      const settled = await ingest();
+      assert.equal(settled.insertedUsageEvents, 0);
+      assert.equal(settled.totalUsageEvents, 4);
+    } finally {
+      await rm(root, { recursive: true });
+    }
+  });
+}
+
+for (const history of ["reset", "anchored", "anchored-own-null"]) {
+  for (const entry of ["new child", "resumed child"]) {
+    test(`paginated ancestor isolation: ${history} retains tier authority for a warm inline ${entry}`, async () => {
+      const childId = "33333333-3333-4333-8333-333333333333";
+      const laterChildId = "44444444-4444-4444-8444-444444444444";
+      const grandparentName = canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE);
+      const parentName = canonicalRolloutName("2026-07-25T00-30-00", THREAD_TWO);
+      const childName = canonicalRolloutName("2026-07-25T01-00-00", childId);
+      const prefix = [
+        sessionMeta(THREAD_ONE),
+        turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol", "high"),
+        threadSettings("2026-07-25T00:00:00.500Z", "default"),
+        tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+      ];
+      const parentMeta = history === "reset"
+        ? paginatedResetSessionMeta(THREAD_TWO, { parentId: THREAD_ONE })
+        : paginatedSessionMeta(THREAD_TWO, {
+          ordinal: prefix.length,
+          baseRolloutId: THREAD_ONE,
+          endOrdinalExclusive: prefix.length,
+          endByteOffset: jsonlBytes(prefix),
+          parentId: THREAD_ONE,
+        });
+      const childLines = (id, minute) => [
+        sessionMeta(id, { parentId: THREAD_TWO, threadSource: "subagent" }),
+        turnContext(`2026-07-25T01:${minute}:00.000Z`, "gpt-5.6-sol", "high"),
+        tokenCount(`2026-07-25T01:${minute}:01.000Z`, usage(225, 22), usage(75, 7)),
+      ];
+      const { root, sessions } = await corpus({
+        [grandparentName]: [
+          ...prefix,
+          // The live logical grandparent is Fast. An unchanged paginated
+          // ancestor must terminate traversal before this unrelated suffix.
+          turnContext("2026-07-25T03:00:00.000Z", "gpt-6-astra", "ultra"),
+          threadSettings("2026-07-25T03:00:00.500Z", "priority"),
+          tokenCount("2026-07-25T03:00:01.000Z", usage(300, 30), usage(200, 20)),
+        ],
+        [parentName]: [
+          parentMeta,
+          turnContext("2026-07-25T00:30:00.000Z", "gpt-5.6-sol", "high"),
+          ...(history === "anchored-own-null" ? [
+            threadSettings("2026-07-25T00:30:00.500Z", null),
+          ] : []),
+          tokenCount("2026-07-25T00:30:01.000Z", usage(150, 15), usage(50, 5)),
+        ],
+        // This first inline descendant makes replay snapshots durable before
+        // the warm pass; the paginated parent must genuinely remain unscanned.
+        [childName]: childLines(childId, "00"),
+      });
+      const indexFile = join(root, "index.sqlite");
+      const ingest = () => ingestLocalUnifiedIndexIncrement({
+        codexHome: root,
+        indexFile,
+        secretFile: join(root, "salt"),
+        contractVersion: CONTRACT,
+      });
+      const row = {
+        model: "gpt-5.6-sol",
+        effort: reasoningEffortOrdinal("high"),
+        speed: history === "anchored" ? "standard" : "unknown",
+        tierSource: history === "reset" ? "unobserved" : "lineage_inherited",
+        rawTier: history === "anchored" ? "default" : null,
+        input: 75,
+        output: 7,
+      };
+      try {
+        const initial = await ingest();
+        assert.equal(initial.generation.status, "complete");
+        assert.equal(initial.totalUsageEvents, 4);
+        assert.deepEqual(paginatedSeedRows(indexFile), [row]);
+        for (const workerCount of [1, 2]) {
+          const freshIndex = join(root, `fresh-${workerCount}.sqlite`);
+          const fresh = await build(root, { indexFile: freshIndex, workerCount });
+          assert.equal(fresh.usageEvents, 4);
+          assert.deepEqual(paginatedSeedRows(freshIndex), [row]);
+        }
+        if (entry === "new child") {
+          await writeFile(join(sessions, canonicalRolloutName(
+            "2026-07-25T01-10-00", laterChildId,
+          )), `${childLines(laterChildId, "10").join("\n")}\n`);
+        } else {
+          await appendFile(join(sessions, childName), `${tokenCount(
+            "2026-07-25T01:00:02.000Z", usage(250, 25), usage(25, 3),
+          )}\n`);
+        }
+        const warm = await ingest();
+        assert.equal(warm.sourcesRescanned, entry === "new child" ? 1 : 0);
+        assert.equal(warm.sourcesResumed, entry === "resumed child" ? 1 : 0);
+        assert.equal(warm.sourcesSkipped, entry === "new child" ? 3 : 2);
+        assert.equal(warm.insertedUsageEvents, 1);
+        assert.equal(warm.totalUsageEvents, 5);
+        const expected = [row, entry === "new child"
+          ? row : { ...row, input: 25, output: 3 }];
+        assert.deepEqual(paginatedSeedRows(indexFile), expected);
+        for (const workerCount of [1, 2]) {
+          const freshIndex = join(root, `fresh-warm-${workerCount}.sqlite`);
+          const fresh = await build(root, { indexFile: freshIndex, workerCount });
+          assert.equal(fresh.usageEvents, 5);
+          assert.deepEqual(paginatedSeedRows(freshIndex), expected);
+          const warmDatabase = openLocalUnifiedIndex(indexFile, { readOnly: true });
+          const freshDatabase = openLocalUnifiedIndex(freshIndex, { readOnly: true });
+          try {
+            assert.deepEqual(logicalProjection(warmDatabase), logicalProjection(freshDatabase));
+          } finally {
+            warmDatabase.close();
+            freshDatabase.close();
+          }
+        }
+        const settled = await ingest();
+        assert.equal(settled.insertedUsageEvents, 0);
+        assert.equal(settled.totalUsageEvents, warm.totalUsageEvents);
+        assert.deepEqual(paginatedSeedRows(indexFile), expected);
+      } finally {
+        await rm(root, { recursive: true });
+      }
+    });
+  }
+}
+
+for (const history of ["reset", "anchored"]) {
+  for (const pipeline of ["serial rebuild", "worker rebuild", "warm new child", "warm resume"]) {
+    test(`paginated replay isolation: ${history} ${pipeline} limits inline suppression to selected history`, async () => {
+      const childId = "33333333-3333-4333-8333-333333333333";
+      const grandparentName = canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE);
+      const parentName = canonicalRolloutName("2026-07-25T00-30-00", THREAD_TWO);
+      const childName = canonicalRolloutName("2026-07-25T01-00-00", childId);
+      const prefix = [
+        sessionMeta(THREAD_ONE),
+        turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol", "high"),
+        tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+      ];
+      const parentMeta = history === "reset"
+        ? paginatedResetSessionMeta(THREAD_TWO, { parentId: THREAD_ONE })
+        : paginatedSessionMeta(THREAD_TWO, {
+          ordinal: prefix.length,
+          baseRolloutId: THREAD_ONE,
+          endOrdinalExclusive: prefix.length,
+          endByteOffset: jsonlBytes(prefix),
+          parentId: THREAD_ONE,
+        });
+      const parentTotal = history === "reset" ? usage(50, 5) : usage(150, 15);
+      const childTail = [
+        // X is new work after a reset, but actual selected history for an
+        // anchored parent. It is suppressed only in the anchored variant.
+        tokenCount("2026-07-25T01:00:01.000Z", usage(100, 10), usage(100, 10)),
+        // Z matches removed grandparent suffix work, never the parent's
+        // selected history. It is real child usage in both variants.
+        tokenCount("2026-07-25T01:00:02.000Z", usage(300, 30), usage(200, 20)),
+        // Y is the paginated parent's own snapshot and must still suppress.
+        tokenCount("2026-07-25T01:00:03.000Z", parentTotal, usage(50, 5)),
+      ];
+      const { root, sessions } = await corpus({
+        [grandparentName]: [
+          ...prefix,
+          tokenCount("2026-07-25T00:00:02.000Z", usage(300, 30), usage(200, 20)),
+        ],
+        [parentName]: [
+          parentMeta,
+          turnContext("2026-07-25T00:30:00.000Z", "gpt-5.6-sol", "high"),
+          tokenCount("2026-07-25T00:30:01.000Z", parentTotal, usage(50, 5)),
+        ],
+        [childName]: [
+          sessionMeta(childId, { parentId: THREAD_TWO, threadSource: "subagent" }),
+          turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-sol", "high"),
+          ...(pipeline.startsWith("warm ") ? [] : childTail),
+        ],
+      });
+      const indexFile = join(root, "index.sqlite");
+      const ingest = () => ingestLocalUnifiedIndexIncrement({
+        codexHome: root,
+        indexFile,
+        secretFile: join(root, "salt"),
+        contractVersion: CONTRACT,
+      });
+      const row = {
+        model: "gpt-5.6-sol",
+        effort: reasoningEffortOrdinal("high"),
+        speed: "unknown",
+        tierSource: "unobserved",
+        rawTier: null,
+        input: 100,
+        output: 10,
+      };
+      const expected = [
+        ...(history === "reset" ? [row] : []),
+        { ...row, input: 200, output: 20 },
+      ];
+      try {
+        let result;
+        if (pipeline.startsWith("warm ")) {
+          const initial = await ingest();
+          assert.equal(initial.totalUsageEvents, 3);
+          if (pipeline === "warm new child") {
+            const laterChildId = "44444444-4444-4444-8444-444444444444";
+            await writeFile(join(sessions, canonicalRolloutName(
+              "2026-07-25T01-10-00", laterChildId,
+            )), `${[
+              sessionMeta(laterChildId, { parentId: THREAD_TWO, threadSource: "subagent" }),
+              turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-sol", "high"),
+              ...childTail,
+            ].join("\n")}\n`);
+          } else {
+            await appendFile(join(sessions, childName), `${childTail.join("\n")}\n`);
+          }
+          result = await ingest();
+          assert.equal(result.sourcesRescanned, pipeline === "warm new child" ? 1 : 0);
+          assert.equal(result.sourcesResumed, pipeline === "warm resume" ? 1 : 0);
+          assert.equal(result.sourcesSkipped, pipeline === "warm new child" ? 3 : 2);
+        } else {
+          result = await build(root, { workerCount: pipeline === "serial rebuild" ? 1 : 2 });
+        }
+        assert.equal(result.generation.status, "complete");
+        assert.deepEqual(paginatedSeedRows(indexFile), expected);
+        assert.equal(result.forkReplayEventsSkipped, history === "reset" ? 1 : 2);
+        const settled = await ingest();
+        assert.equal(settled.insertedUsageEvents, 0);
+        assert.equal(settled.totalUsageEvents, 3 + expected.length);
+        assert.deepEqual(paginatedSeedRows(indexFile), expected);
+      } finally {
+        await rm(root, { recursive: true });
+      }
+    });
+  }
+}
+
 test("a later inline fork inherits only the selected paginated history snapshots", async () => {
   const baseLines = [
     sessionMeta(THREAD_ONE),
@@ -2136,6 +2612,193 @@ test("lineage snapshots follow the selected original instead of a newer unselect
     await rm(root, { recursive: true });
   }
 });
+
+test("selected head isolation: logical head resolution refuses ambiguous and retired canonical sources", () => {
+  const source = (fields = {}) => Object.freeze({
+    lineage: Object.freeze({ sessionId: THREAD_ONE }),
+    ...fields,
+  });
+  const selected = source({ rolloutId: ROLLOUT_TWO, resolvedHead: true });
+  const retired = source({ rolloutId: ROLLOUT_THREE, resolvedHead: false });
+  const original = source({ rolloutId: THREAD_ONE, resolvedHead: false });
+  for (const members of [
+    [selected, original, retired],
+    [retired, selected, original],
+    [original, retired, selected],
+  ]) {
+    const heads = resolveLogicalRolloutHeads(Object.freeze(members));
+    assert.equal(heads.size, 1);
+    assert.equal(heads.get(THREAD_ONE), selected, "return the explicit head, not the last visited source");
+  }
+  for (const legacy of [source(), source({ rolloutId: null })]) {
+    const heads = resolveLogicalRolloutHeads([legacy]);
+    assert.equal(heads.size, 1);
+    assert.equal(heads.get(THREAD_ONE), legacy, "single legacy source remains compatible");
+  }
+  for (const members of [
+    [],
+    [retired],
+    [source({ rolloutId: THREAD_ONE })],
+    [original, retired],
+    [source(), source()],
+    [source(), retired],
+    [selected, source({ rolloutId: ROLLOUT_THREE, resolvedHead: true })],
+    [{ rolloutId: THREAD_ONE, resolvedHead: true }],
+  ]) {
+    assert.equal(resolveLogicalRolloutHeads(members).size, 0);
+  }
+  const otherLegacy = source({ lineage: Object.freeze({ sessionId: THREAD_TWO }) });
+  const mixed = resolveLogicalRolloutHeads([original, retired, otherLegacy]);
+  assert.equal(mixed.size, 1);
+  assert.equal(mixed.has(THREAD_ONE), false);
+  assert.equal(mixed.get(THREAD_TWO), otherLegacy, "ambiguity is scoped to its logical session");
+});
+
+for (const pipeline of ["serial rebuild", "worker rebuild", "warm new child", "warm resume"]) {
+  test(`selected head isolation: ${pipeline} ignores a deeper retired continuation for inline inheritance`, async () => {
+    const originalName = canonicalRolloutName("2026-07-25T00-00-00", THREAD_ONE);
+    const selectedName = canonicalRolloutName("2026-07-25T01-00-00", THREAD_ONE, ROLLOUT_TWO);
+    const retiredName = canonicalRolloutName("2026-07-25T02-00-00", THREAD_ONE, ROLLOUT_THREE);
+    const childName = canonicalRolloutName("2026-07-25T03-00-00", THREAD_TWO);
+    const original = [
+      sessionMeta(THREAD_ONE),
+      turnContext("2026-07-25T00:00:00.000Z", "gpt-5.6-sol", "high"),
+      tokenCount("2026-07-25T00:00:01.000Z", usage(100, 10), usage(100, 10)),
+    ];
+    const childContext = JSON.stringify({
+      timestamp: "2026-07-25T03:00:00.000Z",
+      type: "turn_context",
+      payload: {},
+    });
+    const childTail = [
+      // The retired branch's snapshot is not selected history. Coincidentally
+      // equal work after the child's own turn remains a genuine new charge.
+      tokenCount("2026-07-25T03:00:01.000Z", usage(300, 30), usage(200, 20)),
+      // Conversely, the selected reset's own snapshot still suppresses.
+      tokenCount("2026-07-25T03:00:02.000Z", usage(50, 5), usage(50, 5)),
+    ];
+    const { root, sessions } = await corpus({
+      [originalName]: original,
+      [selectedName]: [
+        paginatedResetSessionMeta(THREAD_ONE),
+        turnContext("2026-07-25T01:00:00.000Z", "gpt-5.6-terra", "low"),
+        threadSettings("2026-07-25T01:00:00.500Z", "default"),
+        tokenCount("2026-07-25T01:00:01.000Z", usage(50, 5), usage(50, 5)),
+      ],
+      [retiredName]: [
+        paginatedSessionMeta(THREAD_ONE, {
+          ordinal: original.length,
+          baseRolloutId: THREAD_ONE,
+          endOrdinalExclusive: original.length,
+          endByteOffset: jsonlBytes(original),
+        }),
+        turnContext("2026-07-25T02:00:00.000Z", "gpt-6-astra", "ultra"),
+        threadSettings("2026-07-25T02:00:00.500Z", "priority"),
+        tokenCount("2026-07-25T02:00:01.000Z", usage(300, 30), usage(200, 20)),
+      ],
+      [childName]: [
+        sessionMeta(THREAD_TWO, { parentId: THREAD_ONE, threadSource: "subagent" }),
+        childContext,
+        ...(pipeline.startsWith("warm ") ? [] : childTail),
+      ],
+    });
+    const indexFile = join(root, "index.sqlite");
+    const ingest = () => ingestLocalUnifiedIndexIncrement({
+      codexHome: root,
+      indexFile,
+      secretFile: join(root, "salt"),
+      contractVersion: CONTRACT,
+    });
+    const expected = [{
+      model: "gpt-5.6-terra",
+      effort: reasoningEffortOrdinal("low"),
+      speed: "standard",
+      tierSource: "lineage_inherited",
+      input: 200,
+      output: 20,
+    }];
+    const inspectSelected = (file) => {
+      const database = openLocalUnifiedIndex(file, { readOnly: true });
+      try {
+        const childRows = database.prepare(`
+          SELECT m.model_id AS model, u.reasoning_effort AS effort,
+                 t.codex_speed_mode AS speed, t.tier_source AS tierSource,
+                 u.tokens_in_uncached AS input, u.tokens_out_text AS output
+          FROM usage_event u
+          JOIN model m ON m.id = u.model_id
+          JOIN tier_semantics t ON t.id = u.tier_id
+          WHERE u.observed_at_ms >= ?
+          ORDER BY u.observed_at_ms`).all(Date.parse("2026-07-25T03:00:00.000Z"))
+          .map((row) => ({ ...row }));
+        assert.deepEqual(childRows, expected);
+        const totals = database.prepare(`
+          SELECT COUNT(*) AS events, SUM(tokens_in_uncached) AS input,
+                 SUM(tokens_out_text) AS output FROM usage_event`).get();
+        assert.equal(totals.events, 4);
+        assert.equal(totals.input, 550);
+        assert.equal(totals.output, 55);
+        // Selection controls inheritance, not retention: all three paid
+        // parent physical generations remain accounted under their own model.
+        assert.deepEqual(database.prepare(`
+          SELECT m.model_id AS model, SUM(u.tokens_in_uncached) AS input
+          FROM usage_event u JOIN model m ON m.id = u.model_id
+          WHERE u.observed_at_ms < ? GROUP BY m.model_id ORDER BY m.model_id`)
+          .all(Date.parse("2026-07-25T03:00:00.000Z")).map((row) => ({ ...row })), [
+          { model: "gpt-5.6-sol", input: 100 },
+          { model: "gpt-5.6-terra", input: 50 },
+          { model: "gpt-6-astra", input: 200 },
+        ]);
+      } finally {
+        database.close();
+      }
+    };
+    try {
+      const stateFile = join(root, "state_5.sqlite");
+      const state = new DatabaseSync(stateFile);
+      try {
+        state.exec("CREATE TABLE threads(id TEXT, rollout_path TEXT)");
+        state.prepare("INSERT INTO threads(id, rollout_path) VALUES (?, ?)").run(
+          THREAD_ONE, join(sessions, selectedName),
+        );
+      } finally {
+        state.close();
+      }
+      await chmod(stateFile, 0o600);
+      let result;
+      if (pipeline.startsWith("warm ")) {
+        const initial = await ingest();
+        assert.equal(initial.totalUsageEvents, 3);
+        if (pipeline === "warm new child") {
+          const laterChildId = "33333333-3333-4333-8333-333333333333";
+          await writeFile(join(sessions, canonicalRolloutName(
+            "2026-07-25T03-10-00", laterChildId,
+          )), `${[
+            sessionMeta(laterChildId, { parentId: THREAD_ONE, threadSource: "subagent" }),
+            childContext,
+            ...childTail,
+          ].join("\n")}\n`);
+        } else {
+          await appendFile(join(sessions, childName), `${childTail.join("\n")}\n`);
+        }
+        result = await ingest();
+        assert.equal(result.sourcesRescanned, pipeline === "warm new child" ? 1 : 0);
+        assert.equal(result.sourcesResumed, pipeline === "warm resume" ? 1 : 0);
+        assert.equal(result.sourcesSkipped, pipeline === "warm new child" ? 4 : 3);
+      } else {
+        result = await build(root, { workerCount: pipeline === "serial rebuild" ? 1 : 2 });
+      }
+      assert.equal(result.generation.status, "complete");
+      assert.equal(result.forkReplayEventsSkipped, 1);
+      inspectSelected(indexFile);
+      const settled = await ingest();
+      assert.equal(settled.insertedUsageEvents, 0);
+      assert.equal(settled.totalUsageEvents, 4);
+      inspectSelected(indexFile);
+    } finally {
+      await rm(root, { recursive: true });
+    }
+  });
+}
 
 test("a replacement counter reset re-anchors once, charges per-turn usage, and records the regression", async () => {
   const baseLines = [
@@ -2572,6 +3235,23 @@ test("a compaction is recognized only from its bounded top-level header", async 
     )),
     { observedAtMs: Date.parse("2026-07-25T00:00:02.000Z") },
   );
+  for (const ordinal of ["0", "123", "18446744073709551615"]) {
+    assert.deepEqual(parseCompactionPrefix(Buffer.from(
+      `{"timestamp":"2026-07-25T00:00:02.000Z","ordinal":${ordinal},`
+      + '"type":"compacted","payload":{"content":"SECRET"}}',
+    )), { observedAtMs: Date.parse("2026-07-25T00:00:02.000Z") });
+  }
+  for (const ordinal of ["", "-1", "1.5", "1e3", '"1"', "null", "01",
+    "18446744073709551616", "1".repeat(1000)]) {
+    assert.equal(parseCompactionPrefix(Buffer.from(
+      `{"timestamp":"2026-07-25T00:00:02.000Z","ordinal":${ordinal},`
+      + '"type":"compacted","payload":{}}',
+    )), null);
+  }
+  assert.equal(parseCompactionPrefix(Buffer.from(
+    '{"timestamp":"2026-07-25T00:00:02.000Z","ordinal":1,"payload":'
+      + '{"type":"compacted"},"type":"compacted"}',
+  )), null);
   // A content-bearing record may itself contain an object whose type happens
   // to be `compacted`. Anchoring on the top-level timestamp/type header keeps
   // that nested marker from becoming a false boundary (or making the parser
@@ -2591,7 +3271,8 @@ test("a compaction is recognized only from its bounded top-level header", async 
   }))), null);
 });
 
-test("an oversized compaction stores only a content-free boundary with provenance", async () => {
+for (const ordinal of [null, 123]) {
+test(`an oversized compaction stores only a content-free boundary with provenance (ordinal ${ordinal})`, async () => {
   const root = await mkdtemp(join(tmpdir(), "unified-compaction-"));
   const sessions = join(root, "sessions", "2026", "07", "25");
   await mkdir(sessions, { recursive: true });
@@ -2605,7 +3286,7 @@ test("an oversized compaction stores only a content-free boundary with provenanc
       type: "response_item",
       payload: { metadata: { type: "compacted" }, content: "SECRET NESTED" },
     }),
-    compacted(compactedAt, 20_000),
+    compacted(compactedAt, 20_000, ordinal),
     tokenCount("2026-07-25T00:00:02.000Z", usage(100, 10), usage(100, 10)),
   ].join("\n")}\n`);
   try {
@@ -2665,6 +3346,7 @@ test("an oversized compaction stores only a content-free boundary with provenanc
     await rm(root, { recursive: true });
   }
 });
+}
 
 test("boundaries attach to the exact next positive input and require a real turn marker", async () => {
   const tied = "2026-07-25T00:05:00.000Z";

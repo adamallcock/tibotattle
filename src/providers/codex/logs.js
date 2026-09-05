@@ -2,7 +2,7 @@ import { createCodexLogIngestion } from "./log-ingestion.js";
 import { createCodexLogParser } from "./log-parser.js";
 import { createCodexLogSources } from "./log-sources.js";
 
-export const CODEX_LOG_SCAN_VERSION = "codex-log-scan-v7";
+export const CODEX_LOG_SCAN_VERSION = "codex-log-scan-v9";
 
 const FILESYSTEM_METHODS = Object.freeze([
   "defaultCodexHome",
@@ -51,6 +51,13 @@ function normalizePorts(options) {
   const filesystem = readPortOwner(options, "filesystem");
   const lineReader = readPortOwner(options, "lineReader");
   const normalizedFilesystem = {};
+  const compressedReader = {};
+  if (Object.hasOwn(lineReader ?? {}, "supportsCompressedRollouts")) {
+    for (const method of ["compressedRolloutHandle", "inspectCompressedRollout",
+      "readCompressedRolloutBytes", "supportsCompressedRollouts"]) {
+      compressedReader[method] = requireMethod(lineReader, "lineReader", method);
+    }
+  }
   for (const method of FILESYSTEM_METHODS) {
     normalizedFilesystem[method] = requireMethod(
       filesystem,
@@ -61,6 +68,7 @@ function normalizePorts(options) {
   return Object.freeze({
     filesystem: Object.freeze(normalizedFilesystem),
     lineReader: Object.freeze({
+      ...compressedReader,
       readBoundedUtf8Lines: requireMethod(
         lineReader,
         "lineReader",
@@ -81,7 +89,7 @@ export function createCodexLogScanner(options) {
   const { filesystem, lineReader } = normalizePorts(options);
 
   const sources = createCodexLogSources({ filesystem, lineReader });
-  const parser = createCodexLogParser({ lineReader });
+  const parser = createCodexLogParser({ lineReader, createSha256: filesystem.createSha256 });
   const scanCodexLogEvents = createCodexLogIngestion({
     parserVersion: CODEX_LOG_SCAN_VERSION,
     sources,

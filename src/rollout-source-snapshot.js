@@ -1,5 +1,6 @@
 import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
+import { compressedRolloutHandle } from "./platform/index.js";
 
 export class RolloutSourceChangedError extends Error {
   constructor() {
@@ -77,6 +78,11 @@ export async function openStableRolloutSource(info) {
     throw new TypeError("rollout source metadata is invalid");
   }
   const discoveredSize = Number(info.size);
+  const compressed = info.compressed === true || info.path.endsWith(".jsonl.zst");
+  const physicalSize = compressed ? Number(info.physicalSize) : discoveredSize;
+  if (!Number.isSafeInteger(physicalSize) || physicalSize < 0) {
+    throw new TypeError("rollout physical source metadata is invalid");
+  }
   const handle = await open(
     info.path,
     constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
@@ -85,33 +91,34 @@ export async function openStableRolloutSource(info) {
     const before = await handle.stat();
     assertIdentity(before, info);
     const pathBefore = await assertPathIdentity(info.path, before);
-    if (before.size < discoveredSize || pathBefore.size < discoveredSize) {
+    if (before.size < physicalSize || pathBefore.size < physicalSize
+        || (compressed && (before.size !== physicalSize || pathBefore.size !== physicalSize))) {
       sourceChanged();
     }
-    if (before.size === discoveredSize
+    if (before.size === physicalSize
         && (!sameTimestamp(before.mtimeMs, info.mtimeMs)
           || !sameTimestamp(before.ctimeMs, info.ctimeMs))) {
       sourceChanged();
     }
-    if (before.size > discoveredSize) {
+    if (before.size > physicalSize) {
       await assertAppendBoundary(handle, discoveredSize);
     }
 
     let closed = false;
     return Object.freeze({
-      handle,
+      handle: compressed ? compressedRolloutHandle(handle) : handle,
       discoveredSize,
       async verify() {
         if (closed) sourceChanged();
         const after = await handle.stat();
         assertIdentity(after, before);
         const pathAfter = await assertPathIdentity(info.path, after);
-        if (after.size < discoveredSize || pathAfter.size < discoveredSize) {
+        if (after.size < physicalSize || pathAfter.size < physicalSize) {
           sourceChanged();
         }
         const unchanged = sameState(before, after)
           && sameState(after, pathAfter);
-        const appendOnlyGrowth = after.size >= before.size
+        const appendOnlyGrowth = !compressed && after.size >= before.size
           && pathAfter.size >= after.size
           && (after.size > before.size || pathAfter.size > before.size);
         if (!unchanged && !appendOnlyGrowth) sourceChanged();

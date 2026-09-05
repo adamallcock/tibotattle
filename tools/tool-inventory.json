@@ -106,7 +106,10 @@
         "scripts/macos-release-core.js",
         "scripts/build-public-release-site.js",
         "scripts/install-macos-preview-app.js",
+        "scripts/package-macos-dmg.js",
+        "scripts/release-macos-app.js",
         "scripts/validate-macos-install.js",
+        "scripts/validate-macos-login-item-release.js",
         "scripts/verify-macos-preview-remote.js",
         "test/browser-module-serving-parity.test.js",
         "test/macos-app-bundle.test.js",
@@ -882,7 +885,8 @@
       "additionalAliases": [],
       "callers": [
         "package.json#scripts.product:macos:dmg",
-        "test/macos-app-bundle.test.js"
+        "test/macos-app-bundle.test.js",
+        "test/validate-macos-install.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
@@ -1054,7 +1058,8 @@
       "additionalAliases": [],
       "callers": [
         "package.json#scripts.product:macos:release",
-        "test/release-channel-policy.test.js"
+        "test/release-channel-policy.test.js",
+        "test/validate-macos-install.test.js"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": null,
