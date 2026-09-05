@@ -3,6 +3,10 @@ import { homedir } from "node:os";
 import { DEPLOYMENT_ENDPOINTS } from "../../config/deployment-endpoints.js";
 
 import { createCompanionSupervisor } from "./companion-supervisor.js";
+import {
+  createDesktopAutomaticRefreshCadence,
+  createDesktopAutomaticRefreshCadenceBackend,
+} from "./desktop-automatic-refresh-cadence.js";
 import { createDesktopCommand } from "./desktop-command.js";
 import { createDesktopController } from "./desktop-controller.js";
 import { createDesktopDeepLinkQueue } from "./desktop-deep-links.js";
@@ -165,6 +169,7 @@ function assertNoWindowsTestOverrides({
   sharingInstallationState,
   firstRunReceiptBackend,
   ownedDownloadsRegistry,
+  automaticRefreshCadence,
   argv,
 } = {}) {
   if (qualificationContext === null || qualificationContext === undefined) return;
@@ -176,6 +181,7 @@ function assertNoWindowsTestOverrides({
       || notificationBackend !== undefined
       || sharingBackend !== undefined
       || sharingInstallationState !== undefined
+      || automaticRefreshCadence !== undefined
       || argv !== undefined) {
     throw shellError("windows_qualification_launch_override_forbidden");
   }
@@ -382,6 +388,7 @@ export async function launchDesktopRuntime({
   sharingInstallationState,
   firstRunReceiptBackend,
   ownedDownloadsRegistry,
+  automaticRefreshCadence,
   argv,
 } = {}) {
   assertObject(runtime, "runtime");
@@ -406,6 +413,7 @@ export async function launchDesktopRuntime({
     sharingInstallationState,
     firstRunReceiptBackend,
     ownedDownloadsRegistry,
+    automaticRefreshCadence,
     argv,
   });
   if (platform === "win32" && qualificationContext !== null
@@ -619,6 +627,17 @@ export async function launchDesktopRuntime({
       windowsProtectedStateStore,
     })
     : null;
+  const runtimeAutomaticRefreshCadence = automaticRefreshCadence
+    ?? (!injectedSettings
+      && (platform !== "win32" || windowsProtectedStateStore !== null)
+      ? createDesktopAutomaticRefreshCadence({
+        backend: createDesktopAutomaticRefreshCadenceBackend({
+          platform,
+          rootPath: settingsRootPath,
+          windowsProtectedStateStore,
+        }),
+      })
+      : undefined);
   const policyBackend = createNotificationPolicyBackend({
     app,
     platform,
@@ -878,6 +897,7 @@ export async function launchDesktopRuntime({
     openDashboardInBrowserAction: openDashboardInBrowser,
     showDiagnosticsAction: showDesktopDiagnostics,
     revealLocalDataAction: revealLocalData,
+    automaticRefreshCadence: runtimeAutomaticRefreshCadence,
   });
 
   // Load persisted settings before starting the child. This is what makes a

@@ -65,6 +65,7 @@ const TARGETS = Object.freeze(Object.fromEntries(
 ));
 export const ELECTRON_SHELL_FILES = Object.freeze([
   "apps/electron/companion-supervisor.js",
+  "apps/electron/desktop-automatic-refresh-cadence.js",
   "apps/electron/desktop-command.js",
   "apps/electron/desktop-contract.js",
   "apps/electron/desktop-codex-roots.js",

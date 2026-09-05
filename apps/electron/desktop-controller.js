@@ -1,4 +1,8 @@
 import { DESKTOP_ACTIONS, DESKTOP_APPEARANCES } from "./desktop-contract.js";
+import {
+  createDesktopAutomaticRefreshCadence,
+  DESKTOP_AUTOMATIC_REFRESH_CADENCE_INTERVAL_MS,
+} from "./desktop-automatic-refresh-cadence.js";
 import { createDesktopCommand } from "./desktop-command.js";
 import { desktopText } from "./desktop-copy.js";
 import {
@@ -21,7 +25,8 @@ export const DESKTOP_REFRESH_LEASE_WATCHDOG_MS = 123 * 60_000;
 // Native foreground refreshes reserve at most one detailed attempt per hour.
 // Keep this host-side constant separate from the user-configured quick timer:
 // a short cadence must never turn into repeated expensive accounting passes.
-export const DESKTOP_AUTOMATIC_DETAILED_REFRESH_INTERVAL_MS = 60 * 60_000;
+export const DESKTOP_AUTOMATIC_DETAILED_REFRESH_INTERVAL_MS =
+  DESKTOP_AUTOMATIC_REFRESH_CADENCE_INTERVAL_MS;
 
 const NOTIFICATION_THRESHOLDS = Object.freeze([
   "off",
@@ -284,6 +289,26 @@ function fixedNotificationPreferences(value) {
   });
 }
 
+// Plain-Node controller compositions do not have an application-owned
+// settings root. Keep those callers on the same cadence implementation while
+// making their state explicitly process-local; the real Electron runtime
+// injects the protected, durable backend instead.
+function createTransientAutomaticRefreshCadence(clock) {
+  let state = null;
+  return createDesktopAutomaticRefreshCadence({
+    backend: {
+      async load() {
+        return state;
+      },
+      async save(next) {
+        state = next;
+        return next;
+      },
+    },
+    clock,
+  });
+}
+
 /**
  * Coordinates the exact desktop bridge actions without giving any renderer a
  * generic command, path, or URL primitive. Settings persistence, OS services,
@@ -311,6 +336,7 @@ export function createDesktopController({
   revealLocalDataAction = async () => {
     throw controllerError("desktop_local_data_unavailable");
   },
+  automaticRefreshCadence,
   clock = () => Date.now(),
   setRecurringTimer = setTimeout,
   clearRecurringTimer = clearTimeout,
@@ -390,6 +416,14 @@ export function createDesktopController({
   }
   if (typeof clock !== "function") throw new TypeError("clock is required");
 
+  const cadence = automaticRefreshCadence === undefined
+    ? createTransientAutomaticRefreshCadence(clock)
+    : assertPort(automaticRefreshCadence, [
+      "automaticMode",
+      "recordDetailedAttempt",
+      "restoreAfterQuickJoin",
+    ], "automaticRefreshCadence");
+
   let initialized = false;
   let disposed = false;
   let refreshTimer = null;
@@ -397,15 +431,13 @@ export function createDesktopController({
   let refreshLeaseWatchdogTimer = null;
   let refreshLeaseCounter = 0;
   let activeRefreshLease = null;
+  let automaticRefreshTickInFlight = false;
   let operation = Promise.resolve();
   let activeCodexHome = null;
   let activeCodexHomes = null;
   let codexHomeRecovery = null;
   let notificationCoordinatorInitialized = false;
   let notificationSafetyFailure = false;
-  let lastAutomaticDetailedAtMs = null;
-  let lastObservedClockMs = null;
-
   function enqueue(run) {
     const previous = operation;
     const current = previous.catch(() => {}).then(run);
@@ -419,42 +451,6 @@ export function createDesktopController({
     } catch {
       return false;
     }
-  }
-
-  function readMonotonicClock() {
-    let candidate;
-    try {
-      candidate = clock();
-    } catch {
-      return lastObservedClockMs;
-    }
-    if (typeof candidate !== "number"
-        || !Number.isFinite(candidate)
-        || candidate < 0) {
-      return lastObservedClockMs;
-    }
-    if (lastObservedClockMs !== null && candidate < lastObservedClockMs) {
-      // Date.now can move backwards when the system clock is corrected. Keep
-      // a logical monotonic value so a correction cannot unlock a second
-      // detailed attempt early.
-      return lastObservedClockMs;
-    }
-    lastObservedClockMs = candidate;
-    return candidate;
-  }
-
-  function automaticRefreshMode() {
-    const now = readMonotonicClock();
-    if (now === null || lastAutomaticDetailedAtMs === null) {
-      // A missing timestamp seeds the same quick-first behavior as the native
-      // shell. The first valid automatic check establishes the hourly window.
-      if (now !== null) lastAutomaticDetailedAtMs = now;
-      return "quick";
-    }
-    return now - lastAutomaticDetailedAtMs
-      >= DESKTOP_AUTOMATIC_DETAILED_REFRESH_INTERVAL_MS
-      ? "detailed"
-      : "quick";
   }
 
   function automaticRefreshIsVisible() {
@@ -534,6 +530,88 @@ export function createDesktopController({
     refreshLeaseWatchdogTimer?.unref?.();
   }
 
+  function armAutomaticRefreshFollowup(seconds) {
+    refreshTimer = setRecurringTimer(() => {
+      refreshTimer = null;
+      if (automaticRefreshTickInFlight) {
+        // A settings change may have armed a timer while the protected cadence
+        // read was in flight. Preserve one timer and let that read publish the
+        // next normal tick when it completes.
+        startRefreshTimer(seconds);
+        return;
+      }
+      if (!refreshInFlight) startRefreshTimer(seconds);
+    }, seconds * 1_000);
+    refreshTimer?.unref?.();
+  }
+
+  async function runAutomaticRefreshTick(seconds) {
+    if (disposed || refreshInFlight || automaticRefreshTickInFlight) return;
+    automaticRefreshTickInFlight = true;
+    let followupArmed = false;
+    try {
+      if (!automaticRefreshIsVisible()) {
+        startRefreshTimer(seconds);
+        followupArmed = true;
+        return;
+      }
+
+      let mode = "quick";
+      try {
+        mode = await cadence.automaticMode();
+      } catch {
+        // A cadence failure must leave local analysis available through the
+        // conservative quick path, while never authorizing detailed work.
+      }
+      if (mode !== "quick" && mode !== "detailed") mode = "quick";
+
+      let reservation = null;
+      if (mode === "detailed") {
+        try {
+          reservation = await cadence.recordDetailedAttempt();
+        } catch {
+          reservation = null;
+        }
+        // Persistence is the detailed-attempt authority. Without a durable
+        // reservation, downgrade this tick to quick rather than spending an
+        // untracked detailed pass.
+        if (reservation === null) mode = "quick";
+      }
+
+      if (disposed) return;
+      const delivered = emitDashboardCommand(
+        createDesktopCommand("automaticRefresh", mode),
+      );
+      if (!delivered) {
+        // No renderer accepted the command, so this was not an attempt. A
+        // matching reservation can safely be restored; a failed restore stays
+        // conservatively stamped inside the cadence coordinator.
+        if (reservation !== null) {
+          try {
+            await cadence.restoreAfterQuickJoin(reservation, { mode: "quick" });
+          } catch {
+            // Keep the consumed stamp when rollback cannot be proven.
+          }
+        }
+        startRefreshTimer(seconds);
+        followupArmed = true;
+        return;
+      }
+
+      // The renderer reports refreshStarted after its bounded POST boundary;
+      // that handler replaces this fallback with the lease watchdog. Until
+      // then, one normal-cadence fallback keeps an unaccepted tick from
+      // spinning commands.
+      armAutomaticRefreshFollowup(seconds);
+      followupArmed = true;
+    } finally {
+      automaticRefreshTickInFlight = false;
+      if (!followupArmed && !disposed && !refreshInFlight && refreshTimer === null) {
+        startRefreshTimer(seconds);
+      }
+    }
+  }
+
   function startRefreshTimer(seconds) {
     stopRefreshTimer();
     if (disposed || refreshInFlight) return;
@@ -543,37 +621,11 @@ export function createDesktopController({
       // long accounting pass cannot be started again merely because the app
       // has been open longer than the configured interval.
       refreshTimer = null;
-      if (!automaticRefreshIsVisible()) {
-        // Match the native foreground scheduler: hiding or replacing the
-        // dashboard pauses automatic work while retaining the next cadence.
+      if (automaticRefreshTickInFlight) {
         startRefreshTimer(seconds);
         return;
       }
-      const mode = automaticRefreshMode();
-      const delivered = emitDashboardCommand(
-        createDesktopCommand("automaticRefresh", mode),
-      );
-      if (!delivered) {
-        // A hidden/restarting dashboard may ignore this tick. Keep a bounded
-        // retry armed rather than losing the cadence or spinning commands.
-        startRefreshTimer(seconds);
-        return;
-      }
-      if (mode === "detailed") {
-        // Reserve on delivery, before the renderer can report a busy/conflict
-        // result. Native cadence is attempt-based, so failed or cancelled
-        // detailed work still consumes the hourly window.
-        const now = readMonotonicClock();
-        if (now !== null) lastAutomaticDetailedAtMs = now;
-      }
-      // The renderer calls refreshStarted after its POST is accepted. If the
-      // command was delivered to a busy renderer and no POST is accepted,
-      // this one-shot fallback retries at the normal cadence. An accepted
-      // refreshStarted clears it, so long accounting never overlaps itself.
-      refreshTimer = setRecurringTimer(() => {
-        refreshTimer = null;
-        if (!refreshInFlight) startRefreshTimer(seconds);
-      }, seconds * 1_000);
+      void runAutomaticRefreshTick(seconds).catch(() => {});
     }, seconds * 1_000);
     refreshTimer?.unref?.();
   }

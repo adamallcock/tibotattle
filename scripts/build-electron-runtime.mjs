@@ -136,6 +136,7 @@ const NATIVE_PATH_MODULE = Object.freeze({
 export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
   "config/deployment-endpoints.js",
   "apps/electron/companion-supervisor.js",
+  "apps/electron/desktop-automatic-refresh-cadence.js",
   "apps/electron/desktop-command.js",
   "apps/electron/desktop-contract.js",
   "apps/electron/desktop-codex-roots.js",

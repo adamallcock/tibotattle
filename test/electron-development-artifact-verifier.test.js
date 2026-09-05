@@ -31,6 +31,7 @@ const require = createRequire(import.meta.url);
 const asar = createRequire(require.resolve("electron-builder"))("@electron/asar");
 const SHELL_FILES = [
   "apps/electron/companion-supervisor.js",
+  "apps/electron/desktop-automatic-refresh-cadence.js",
   "apps/electron/desktop-command.js",
   "apps/electron/desktop-contract.js",
   "apps/electron/desktop-codex-roots.js",

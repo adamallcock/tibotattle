@@ -7,6 +7,10 @@ import {
   DESKTOP_REFRESH_LEASE_WATCHDOG_MS,
 } from "../desktop-controller.js";
 import {
+  createDesktopAutomaticRefreshCadence,
+  DESKTOP_AUTOMATIC_REFRESH_CADENCE_INTERVAL_MS,
+} from "../desktop-automatic-refresh-cadence.js";
+import {
   createDefaultCodexHomes,
   normalizeCodexHomes,
 } from "../desktop-codex-roots.js";
@@ -34,6 +38,7 @@ function fixture({
   settingsLoad = async () => null,
   settingsSave = null,
   settingsStore: suppliedSettingsStore = null,
+  automaticRefreshCadence,
 } = {}) {
   let persisted = null;
   const store = suppliedSettingsStore ?? createDesktopSettingsStore({
@@ -132,6 +137,7 @@ function fixture({
       return true;
     },
     ...actionOverrides,
+    automaticRefreshCadence,
     clock,
     setRecurringTimer(callback, milliseconds) {
       const timer = { callback, milliseconds, unref() {} };
@@ -152,6 +158,28 @@ function fixture({
     languageChanges,
     notificationCoordinator,
     get persisted() { return persisted; },
+  };
+}
+
+async function fireAutomaticTimer(value, timer = value.timers.at(-1)) {
+  timer.callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
+function automaticCadenceBackend() {
+  let stored = null;
+  return {
+    get stored() {
+      return stored;
+    },
+    async load() {
+      return stored;
+    },
+    async save(next) {
+      stored = next;
+      return next;
+    },
   };
 }
 
@@ -203,7 +231,7 @@ test("controller initializes persisted cadence and projects truthful settings st
       },
     },
   });
-  value.timers[0].callback();
+  await fireAutomaticTimer(value, value.timers[0]);
   assert.deepEqual(value.commands, [{ command: "automaticRefresh", mode: "quick" }]);
 });
 
@@ -263,11 +291,11 @@ test("controller exposes bounded browser, diagnostics, local-data, and refresh l
   await value.controller.handlers.revealLocalData({});
   assert.deepEqual(actions, ["browser", "diagnostics", "local-data"]);
 
-  value.timers[0].callback();
+  await fireAutomaticTimer(value, value.timers[0]);
   assert.deepEqual(value.commands, [{ command: "automaticRefresh", mode: "quick" }]);
   const fallbackTimer = value.timers.at(-1);
   assert.notEqual(fallbackTimer, value.timers[0]);
-  fallbackTimer.callback();
+  await fireAutomaticTimer(value, fallbackTimer);
   assert.deepEqual(
     value.commands,
     [{ command: "automaticRefresh", mode: "quick" }],
@@ -289,23 +317,23 @@ test("automatic cadence stays quick-first, detailed at most hourly, and monotoni
   const value = fixture({ clock: () => nowMs });
   await value.controller.initialize();
 
-  value.timers[0].callback();
+  await fireAutomaticTimer(value, value.timers[0]);
   assert.deepEqual(value.commands, [{ command: "automaticRefresh", mode: "quick" }]);
-  value.timers.at(-1).callback();
+  await fireAutomaticTimer(value);
 
   nowMs += 60 * 60_000;
-  value.timers.at(-1).callback();
+  await fireAutomaticTimer(value);
   assert.deepEqual(value.commands, [
     { command: "automaticRefresh", mode: "quick" },
     { command: "automaticRefresh", mode: "detailed" },
   ]);
-  value.timers.at(-1).callback();
+  await fireAutomaticTimer(value);
 
   nowMs += 60 * 60_000 - 1;
-  value.timers.at(-1).callback();
-  value.timers.at(-1).callback();
+  await fireAutomaticTimer(value);
+  await fireAutomaticTimer(value);
   nowMs = 1;
-  value.timers.at(-1).callback();
+  await fireAutomaticTimer(value);
   assert.deepEqual(value.commands, [
     { command: "automaticRefresh", mode: "quick" },
     { command: "automaticRefresh", mode: "detailed" },
@@ -314,15 +342,54 @@ test("automatic cadence stays quick-first, detailed at most hourly, and monotoni
   ], "a clock rollback cannot unlock a second detailed attempt");
 });
 
+test("controller keeps automatic detailed cadence across controller instances", async () => {
+  let nowMs = 1_000_000;
+  const backend = automaticCadenceBackend();
+  const create = () => fixture({
+    clock: () => nowMs,
+    automaticRefreshCadence: createDesktopAutomaticRefreshCadence({
+      backend,
+      clock: () => nowMs,
+    }),
+  });
+
+  const first = create();
+  await first.controller.initialize();
+  await fireAutomaticTimer(first, first.timers[0]);
+  await fireAutomaticTimer(first);
+  nowMs += DESKTOP_AUTOMATIC_REFRESH_CADENCE_INTERVAL_MS;
+  await fireAutomaticTimer(first);
+  assert.deepEqual(first.commands, [
+    { command: "automaticRefresh", mode: "quick" },
+    { command: "automaticRefresh", mode: "detailed" },
+  ]);
+  await first.controller.dispose();
+
+  const second = create();
+  await second.controller.initialize();
+  await fireAutomaticTimer(second, second.timers[0]);
+  assert.deepEqual(second.commands, [
+    { command: "automaticRefresh", mode: "quick" },
+  ]);
+  await fireAutomaticTimer(second);
+  nowMs += DESKTOP_AUTOMATIC_REFRESH_CADENCE_INTERVAL_MS;
+  await fireAutomaticTimer(second);
+  assert.deepEqual(second.commands, [
+    { command: "automaticRefresh", mode: "quick" },
+    { command: "automaticRefresh", mode: "detailed" },
+  ]);
+  await second.controller.dispose();
+});
+
 test("automatic cadence pauses while the dashboard is hidden, while manual refresh stays detailed", async () => {
   const lifecycleState = { windowVisible: false, dashboardReady: true };
   const value = fixture({ lifecycleState });
   await value.controller.initialize();
-  value.timers[0].callback();
+  await fireAutomaticTimer(value, value.timers[0]);
   assert.deepEqual(value.commands, []);
 
   lifecycleState.windowVisible = true;
-  value.timers.at(-1).callback();
+  await fireAutomaticTimer(value);
   assert.deepEqual(value.commands, [{ command: "automaticRefresh", mode: "quick" }]);
 
   assert.equal(value.controller.refreshUsage(), true);
