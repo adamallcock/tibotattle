@@ -23,6 +23,18 @@ export const LOCAL_COMPANION_STATIC_FILES = Object.freeze({
     file: "desktop-shell.js",
     type: "text/javascript; charset=utf-8",
   }),
+  "/electron-tray-popup.html": Object.freeze({
+    file: "electron-tray-popup.html",
+    type: "text/html; charset=utf-8",
+  }),
+  "/electron-tray-popup.js": Object.freeze({
+    file: "electron-tray-popup.js",
+    type: "text/javascript; charset=utf-8",
+  }),
+  "/electron-tray-popup.css": Object.freeze({
+    file: "electron-tray-popup.css",
+    type: "text/css; charset=utf-8",
+  }),
   "/electron-settings.html": Object.freeze({
     file: "electron-settings.html",
     type: "text/html; charset=utf-8",

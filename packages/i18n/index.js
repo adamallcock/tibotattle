@@ -228,6 +228,17 @@ export const EN_US_CATALOG = Object.freeze({
   "electron.tray.settings": "Settings…",
   "electron.tray.about": "About {appName}",
   "electron.tray.quit": "Quit {appName}",
+  "electron.trayPopover.weeklyPace": "Weekly pace",
+  "electron.trayPopover.localHistory": "Local usage history",
+  "electron.trayPopover.pricingPartial": "Some events have incomplete pricing; the amount shown is a known subtotal.",
+  "electron.trayPopover.paceCollecting": "Collecting pace",
+  "electron.trayPopover.paceUnder": "Under sustainable pace",
+  "electron.trayPopover.paceOn": "Near sustainable pace",
+  "electron.trayPopover.paceOver": "Over sustainable pace",
+  "electron.trayPopover.paceCritical": "Well over sustainable pace",
+  "electron.trayPopover.paceResetFirst": "Projected to reach reset before exhaustion",
+  "electron.trayPopover.paceExhaustion": "Projected exhaustion {time}",
+  "electron.trayPopover.paceEarly": "Early estimate",
 });
 
 export const ZH_HANS_CATALOG = Object.freeze({
@@ -439,6 +450,17 @@ export const ZH_HANS_CATALOG = Object.freeze({
   "electron.tray.settings": "设置…",
   "electron.tray.about": "关于 {appName}",
   "electron.tray.quit": "退出 {appName}",
+  "electron.trayPopover.weeklyPace": "每周进度",
+  "electron.trayPopover.localHistory": "本地使用历史",
+  "electron.trayPopover.pricingPartial": "部分事件的定价不完整；显示的金额是已知小计。",
+  "electron.trayPopover.paceCollecting": "正在收集进度",
+  "electron.trayPopover.paceUnder": "低于可持续进度",
+  "electron.trayPopover.paceOn": "接近可持续进度",
+  "electron.trayPopover.paceOver": "高于可持续进度",
+  "electron.trayPopover.paceCritical": "远高于可持续进度",
+  "electron.trayPopover.paceResetFirst": "预计会先达到重置时间",
+  "electron.trayPopover.paceExhaustion": "预计耗尽时间：{time}",
+  "electron.trayPopover.paceEarly": "早期估计",
 });
 
 export const ES_CATALOG = Object.freeze({
@@ -650,6 +672,17 @@ export const ES_CATALOG = Object.freeze({
   "electron.tray.settings": "Configuración…",
   "electron.tray.about": "Acerca de {appName}",
   "electron.tray.quit": "Salir de {appName}",
+  "electron.trayPopover.weeklyPace": "Ritmo semanal",
+  "electron.trayPopover.localHistory": "Historial de uso local",
+  "electron.trayPopover.pricingPartial": "Algunos eventos tienen precios incompletos; el importe mostrado es un subtotal conocido.",
+  "electron.trayPopover.paceCollecting": "Recopilando el ritmo",
+  "electron.trayPopover.paceUnder": "Por debajo del ritmo sostenible",
+  "electron.trayPopover.paceOn": "Cerca del ritmo sostenible",
+  "electron.trayPopover.paceOver": "Por encima del ritmo sostenible",
+  "electron.trayPopover.paceCritical": "Muy por encima del ritmo sostenible",
+  "electron.trayPopover.paceResetFirst": "Se prevé que llegue primero al restablecimiento",
+  "electron.trayPopover.paceExhaustion": "Agotamiento previsto {time}",
+  "electron.trayPopover.paceEarly": "Estimación inicial",
 });
 
 export const CATALOGS = Object.freeze({

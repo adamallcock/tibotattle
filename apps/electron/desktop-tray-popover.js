@@ -4,9 +4,9 @@
  * The native shell has a compact popover beside its menu-bar status item.
  * Electron's Tray API exposes a context menu, but it does not provide a
  * platform-neutral popover.  This module supplies the smallest equivalent:
- * a sandboxed, in-memory BrowserWindow whose data comes only from the
- * main-process tray projection.  It never reads renderer state or performs
- * accounting itself.
+ * a sandboxed BrowserWindow loading the same-origin local popup page. Its
+ * renderer reads the companion's existing dashboard projection; main-process
+ * tray updates signal freshness. Opening the popup performs no accounting.
  */
 
 import { existsSync } from "node:fs";

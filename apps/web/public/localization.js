@@ -171,6 +171,9 @@ export const WEB_MESSAGES = Object.freeze({
       || key.startsWith("appearance.")
       || key.startsWith("electron."))
     .map((key) => [key, SUPPORTED_LOCALES.map((locale) => CATALOGS[locale][key])])),
+  "dashboard.title": ["Usage overview", "使用概览", "Resumen de uso"],
+  "usage.events": ["Usage events: {count}", "使用事件：{count}", "Eventos de uso: {count}"],
+  "usage.tokens": ["Tokens: {count}", "令牌：{count}", "Tokens: {count}"],
   "language.label": ["Language", "语言", "Idioma"],
   "language.system": ["System", "跟随系统", "Sistema"],
   "language.english": ["English", "English", "English"],

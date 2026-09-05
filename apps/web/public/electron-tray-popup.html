@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'">
+    <title>TiboTattle</title>
+    <link rel="stylesheet" href="./electron-tray-popup.css">
+    <script type="module" src="./electron-tray-popup.js" defer></script>
+  </head>
+  <body data-i18n-root>
+    <main class="electron-tray-popup" id="tray-popup" aria-labelledby="tray-popup-title">
+      <header class="electron-tray-popup-header">
+        <div class="electron-tray-popup-brand">
+          <img src="./tibotattle-icon.png" width="28" height="28" alt="" aria-hidden="true">
+          <span>TiboTattle</span>
+        </div>
+        <h1 id="tray-popup-title" data-i18n="dashboard.title">Usage overview</h1>
+        <p class="electron-tray-popup-freshness" id="tray-popup-freshness" role="status" aria-live="polite">Loading…</p>
+      </header>
+
+      <section class="electron-tray-popup-section" aria-labelledby="allowance-heading">
+        <h2 id="allowance-heading" data-i18n="dashboard.quota.observations">Quota observations</h2>
+        <div id="allowance-lanes" class="electron-tray-popup-allowances"></div>
+        <p id="allowance-unavailable" class="electron-tray-popup-notice" hidden></p>
+      </section>
+
+      <section class="electron-tray-popup-section" aria-labelledby="pace-heading">
+        <h2 id="pace-heading" data-i18n="electron.trayPopover.weeklyPace">Weekly pace</h2>
+        <p id="pace-state" class="electron-tray-popup-muted">Loading…</p>
+        <p id="pace-outlook" class="electron-tray-popup-outlook" hidden></p>
+        <p id="pace-early" class="electron-tray-popup-notice" hidden></p>
+        <div id="pace-metrics" class="electron-tray-popup-metrics" hidden>
+          <span id="pace-used"></span>
+          <span id="pace-remaining"></span>
+          <span id="pace-rate"></span>
+          <span id="pace-reset"></span>
+        </div>
+        <div id="pace-track" class="electron-tray-popup-pace-track" hidden>
+          <span id="pace-fill" class="electron-tray-popup-pace-fill"></span>
+          <span id="pace-active-marker" class="electron-tray-popup-pace-active-marker" aria-hidden="true"></span>
+        </div>
+      </section>
+
+      <section class="electron-tray-popup-section" aria-labelledby="history-heading">
+        <div class="electron-tray-popup-section-heading">
+          <h2 id="history-heading" data-i18n="electron.trayPopover.localHistory">Local usage history</h2>
+          <div class="electron-tray-popup-range" role="group"
+            data-i18n-aria-label="electron.trayPopover.localHistory"
+            aria-label="Local usage history">
+            <button type="button" data-history-range="7d" aria-pressed="true">7d</button>
+            <button type="button" data-history-range="30d" aria-pressed="false">30d</button>
+          </div>
+        </div>
+        <div class="electron-tray-popup-history-summary">
+          <span id="history-summary"></span>
+          <strong id="history-cost"
+            data-i18n-aria-label="accounting.apiEquivalent.standardRateBasis"
+            aria-label="Calculated at Standard API rates.">—</strong>
+        </div>
+        <div id="history-bars" class="electron-tray-popup-history-bars" role="group"
+          data-i18n-aria-label="electron.trayPopover.localHistory"
+          aria-label="Local usage history"></div>
+        <p id="history-coverage" class="electron-tray-popup-muted"></p>
+        <p id="history-retained" class="electron-tray-popup-notice" hidden></p>
+        <p id="history-pricing" class="electron-tray-popup-notice" hidden></p>
+      </section>
+
+      <footer class="electron-tray-popup-footer">
+        <button type="button" data-action="open" class="electron-tray-popup-primary" data-i18n="electron.tray.open">Open TiboTattle</button>
+        <button type="button" data-action="refresh" data-i18n="electron.tray.refresh">Update Local Usage</button>
+      </footer>
+      <div class="sr-only" id="tray-popup-live" role="status" aria-live="polite"></div>
+    </main>
+  </body>
+</html>
