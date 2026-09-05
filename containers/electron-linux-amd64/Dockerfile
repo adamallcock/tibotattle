@@ -83,7 +83,7 @@ RUN curl --fail --silent --show-error --location --retry 3 \
     /tmp/electron-v43.2.0-linux-x64.zip \
     | sha256sum --check --strict \
   && unzip -q /tmp/electron-v43.2.0-linux-x64.zip -d /workspace/node_modules/electron/dist \
-  && printf 'electron\n' > /workspace/node_modules/electron/path.txt \
+  && printf 'electron' > /workspace/node_modules/electron/path.txt \
   && rm -f /tmp/electron-v43.2.0-linux-x64.zip
 
 COPY apps/electron ./apps/electron
