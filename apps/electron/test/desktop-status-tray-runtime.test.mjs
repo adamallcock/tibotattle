@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { createDesktopLifecycle } from "../desktop-lifecycle.js";
+import { TRAY_POPOVER_ACTION_CHANNEL } from "../desktop-tray-popover.js";
 
 const EVIDENCE = Object.freeze({
   schemaVersion: "tibotattle-notification-evidence-v2",
@@ -49,6 +51,7 @@ class FakeWebContents extends EventEmitter {
     this.mainFrame = { isMainFrame: true, parent: null };
     this.session = {};
   }
+  getURL() { return this.url; }
 }
 
 class FakeWindow extends EventEmitter {
@@ -60,7 +63,7 @@ class FakeWindow extends EventEmitter {
     this.destroyed = false;
   }
 
-  loadURL() { return Promise.resolve(); }
+  loadURL(url) { this.url = url; this.webContents.url = url; return Promise.resolve(); }
   show() { this.visible = true; }
   hide() { this.visible = false; }
   focus() {}
@@ -82,10 +85,11 @@ class FakeTray extends EventEmitter {
   destroy() {}
 }
 
-function fixture({ fetchImpl, onDesktopStatus, platform = "darwin" } = {}) {
+function fixture({ fetchImpl, onDesktopStatus, platform = "darwin", visualTray = false } = {}) {
   const app = new FakeApp();
   const windows = [];
   const trays = [];
+  const menus = [];
   const supervisor = {
     starts: 0,
     stops: 0,
@@ -108,12 +112,26 @@ function fixture({ fetchImpl, onDesktopStatus, platform = "darwin" } = {}) {
     Tray: class extends FakeTray {
       constructor(icon) {
         super(icon);
+        if (visualTray) {
+          this.presentedMenus = [];
+          this.popUpContextMenu = (menu) => {
+            menu.emit("menu-will-show");
+            this.presentedMenus.push(menu);
+          };
+          this.closeContextMenu = () => {};
+        }
         trays.push(this);
       }
     },
-    Menu: { buildFromTemplate: (template) => ({ template }) },
+    Menu: { buildFromTemplate: (template) => {
+      const menu = Object.assign(new EventEmitter(), { template });
+      menus.push(menu);
+      return menu;
+    } },
     icon: "test-icon",
-    preloadPath: "/private/preload.cjs",
+    preloadPath: visualTray
+      ? fileURLToPath(new URL("../preload.cjs", import.meta.url))
+      : "/private/preload.cjs",
     supervisor,
     createNavigationPolicy: () => ({}),
     installNavigationPolicy: () => ({ remove() {} }),
@@ -125,7 +143,7 @@ function fixture({ fetchImpl, onDesktopStatus, platform = "darwin" } = {}) {
       timeoutMs: 60_000,
     },
   });
-  return { app, lifecycle, supervisor, windows, trays };
+  return { app, lifecycle, supervisor, windows, trays, menus };
 }
 
 function jsonResponse(value, url) {
@@ -212,4 +230,74 @@ test("lifecycle keeps the compact title Darwin-only", async () => {
     assert.ok(fixtureValue.trays[0].titles.every((value) => value === ""));
     await fixtureValue.lifecycle.dispose();
   }
+});
+
+test("macOS primary and secondary tray clicks cannot present both surfaces", async (t) => {
+  const f = fixture({ visualTray: true, fetchImpl: async (url) => jsonResponse(status(), url) });
+  t.after(() => f.lifecycle.dispose());
+  await f.lifecycle.start();
+  const tray = f.trays[0];
+  // A non-null attached menu lets AppKit show it on the same primary click
+  // that opens the BrowserWindow. This is the reported two-overlay defect.
+  assert.equal(tray.menu, null);
+  tray.emit("click", {});
+  const popup = f.windows.find((window) => window.url?.endsWith("/electron-tray-popup.html"));
+  await waitFor(() => popup?.isVisible());
+  assert.equal(tray.presentedMenus.length, 0);
+
+  tray.emit("right-click", {});
+  assert.equal(popup.isVisible(), false);
+  assert.equal(tray.presentedMenus.length, 1);
+  assert.ok(tray.presentedMenus[0].template.some((item) => item.label === "Settings…"));
+
+  tray.emit("click", {});
+  await waitFor(() => popup.isVisible());
+  tray.emit("click", { ctrlKey: true });
+  assert.equal(popup.isVisible(), false);
+  assert.equal(tray.presentedMenus.length, 2);
+
+  // Language/status refresh must update the explicit menu without silently
+  // reattaching it and bringing back the overlap on the next click.
+  f.lifecycle.setDesktopLanguage("zh-Hans");
+  assert.equal(tray.menu, null);
+  tray.emit("right-click", {});
+  assert.notEqual(tray.presentedMenus[2], tray.presentedMenus[1]);
+  assert.ok(tray.presentedMenus[2].template.some((item) => item.label === "设置…"));
+
+  tray.emit("click", {});
+  await waitFor(() => popup.isVisible());
+  popup.webContents.emit("ipc-message", {
+    sender: popup.webContents,
+    senderFrame: popup.webContents.mainFrame,
+  }, TRAY_POPOVER_ACTION_CHANNEL, "more");
+  assert.equal(popup.isVisible(), false);
+  assert.equal(tray.presentedMenus.length, 4);
+});
+
+test("opening the context menu cancels a pending visual tray load", async (t) => {
+  const f = fixture({ visualTray: true, fetchImpl: async (url) => jsonResponse(status(), url) });
+  t.after(() => f.lifecycle.dispose());
+  await f.lifecycle.start();
+  const tray = f.trays[0];
+  tray.emit("click", {});
+  tray.emit("right-click", {});
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const popup = f.windows.find((window) => window.url?.endsWith("/electron-tray-popup.html"));
+  assert.ok(popup);
+  assert.equal(popup.isVisible(), false);
+  assert.equal(tray.presentedMenus.length, 1);
+});
+
+test("a native Windows menu presentation dismisses the visual tray first", async (t) => {
+  const f = fixture({ platform: "win32", visualTray: true, fetchImpl: async (url) => jsonResponse(status(), url) });
+  t.after(() => f.lifecycle.dispose());
+  await f.lifecycle.start();
+  const tray = f.trays[0];
+  assert.ok(tray.menu);
+  tray.emit("click", {});
+  const popup = f.windows.find((window) => window.url?.endsWith("/electron-tray-popup.html"));
+  await waitFor(() => popup?.isVisible());
+  tray.menu.emit("menu-will-show");
+  assert.equal(popup.isVisible(), false);
+  assert.equal(tray.presentedMenus.length, 0);
 });

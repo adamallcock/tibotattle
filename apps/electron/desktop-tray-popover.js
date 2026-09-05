@@ -34,6 +34,7 @@ export const TRAY_POPOVER_ACTIONS = Object.freeze([
   "accounting",
   "refresh",
   "settings",
+  "more",
   "quit",
 ]);
 

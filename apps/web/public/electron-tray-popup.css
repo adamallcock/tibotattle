@@ -327,7 +327,7 @@ body {
 
 .electron-tray-popup-footer {
   display: grid;
-  grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr) 34px;
   gap: 8px;
   padding-top: 14px;
 }

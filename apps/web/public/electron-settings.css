@@ -590,8 +590,16 @@
 .settings-operation-status {
   min-height: 1.5em;
   margin: var(--space-3) 0 0;
-  color: var(--rust);
+  color: var(--muted);
   font-size: .88rem;
+}
+
+.settings-operation-status.is-success {
+  color: var(--green);
+}
+
+.settings-operation-status.is-error {
+  color: var(--rust);
 }
 
 @media (max-width: 720px) {

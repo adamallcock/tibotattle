@@ -34,6 +34,16 @@ and approval-review hold on changing the default.
 
 ## Implementation boundary
 
+The owner's subsequent page-by-page review identified overlapping tray surfaces
+in the first 0.1.18 Electron candidate. The follow-up acceptance boundary is
+native primary/secondary tray interaction, rendered navigation through all five
+dashboard pages and every Settings tab, and working Share and More shortcuts.
+Three Terra agents independently reviewed Usage pages, Settings/sharing, and
+the native control inventory. Each repaired interaction must be checked in a
+fresh packaged app; passing a direct popup smoke does not exercise an actual
+status-item click. AppKit window chrome and web chrome remain distinct, so
+feature parity must not be described as pixel-identical native rendering.
+
 Continuation authorized on 2026-09-04: finish reconciliation with the latest
 native 0.1.18 changes and controls, provide a durable Electron app the owner can
 test, and prepare packaging for all four targets. The integration baseline is

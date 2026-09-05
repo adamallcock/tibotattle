@@ -32,7 +32,7 @@ export const TRAY_POPUP_HISTORY_RANGES = Object.freeze({
   "7d": 7,
   "30d": 30,
 });
-export const TRAY_POPUP_ACTIONS = Object.freeze(["open", "refresh"]);
+export const TRAY_POPUP_ACTIONS = Object.freeze(["open", "refresh", "more"]);
 
 const MAX_TIMELINE_ROWS = 3_000;
 const MAX_HISTORY_DAYS = 30;
@@ -835,7 +835,7 @@ export function createTrayPopupProjection(data = {}, {
   });
 }
 
-/** Send only the two reviewed host actions accepted by the Electron bridge. */
+/** Send only the reviewed host actions accepted by the Electron bridge. */
 export function requestTrayPopupAction(bridge, action) {
   if (arguments.length !== 2
       || !TRAY_POPUP_ACTIONS.includes(action)
@@ -1120,7 +1120,11 @@ export function renderTrayPopup(documentRef, projection, {
     const action = button.dataset.action;
     button.textContent = action === "open"
       ? translated("electron.tray.open", { appName: PRODUCT_APP_NAME })
-      : translated("electron.tray.refresh");
+      : action === "more" ? "⋯" : translated("electron.tray.refresh");
+    if (action === "more") {
+      button.setAttribute("aria-label", translated("electron.trayPopover.more"));
+      button.setAttribute("title", translated("electron.trayPopover.more"));
+    }
     button.disabled = !TRAY_POPUP_ACTIONS.includes(action)
       || typeof bridge?.requestAction !== "function";
   }

@@ -15,6 +15,9 @@ function fakeButton() {
     removeEventListener(type, listener) {
       if (listeners.get(type) === listener) listeners.delete(type);
     },
+    click() {
+      listeners.get("click")?.();
+    },
   };
 }
 
@@ -49,13 +52,18 @@ function fakeWindow() {
   return { commandListeners, events, windowRef };
 }
 
-function fakeDocument(settingsButton = fakeButton()) {
+function fakeDocument({
+  settingsButton = fakeButton(),
+  shareButton = null,
+  sharePanel = null,
+} = {}) {
   const classList = { contains: (value) => value === "electron-dashboard" };
   return {
     documentElement: { classList },
     querySelector(selector) {
       if (selector === "#electron-settings-button") return settingsButton;
-      if (selector === "#electron-share-button") return null;
+      if (selector === "#electron-share-button") return shareButton;
+      if (selector === "#share-panel") return sharePanel;
       if (selector === "[data-language-picker]") return null;
       return null;
     },
@@ -110,5 +118,38 @@ test("desktop command bridge forwards only the closed automatic refresh mode", (
     { type: "tibotattle:automatic-refresh", detail: { mode: "quick" } },
     { type: "tibotattle:automatic-refresh", detail: { mode: "detailed" } },
   ]);
+  mounted.teardown();
+});
+
+test("Electron Share selects Allowance and focuses the existing results card", () => {
+  const { windowRef } = fakeWindow();
+  const shareButton = fakeButton();
+  let focused = false;
+  let scrolled = false;
+  const sharePanel = {
+    setAttribute(name, value) {
+      assert.equal(name, "tabindex");
+      assert.equal(value, "-1");
+    },
+    focus(options) {
+      assert.deepEqual(options, { preventScroll: true });
+      focused = true;
+    },
+    scrollIntoView(options) {
+      assert.deepEqual(options, { block: "start", behavior: "smooth" });
+      scrolled = true;
+    },
+  };
+  windowRef.requestAnimationFrame = (callback) => callback();
+  const mounted = mountDesktopShell({
+    documentRef: fakeDocument({ shareButton, sharePanel }),
+    windowRef,
+  });
+
+  shareButton.click();
+
+  assert.equal(windowRef.location.hash, "#weekly");
+  assert.equal(focused, true);
+  assert.equal(scrolled, true);
   mounted.teardown();
 });

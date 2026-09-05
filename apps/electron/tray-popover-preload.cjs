@@ -10,6 +10,7 @@ const ACTIONS = new Set([
   "accounting",
   "refresh",
   "settings",
+  "more",
   "quit",
 ]);
 

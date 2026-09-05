@@ -246,7 +246,7 @@ class FakeDocument {
       "history-pricing", "history-bars", "tray-popup-freshness", "tray-popup-live",
     ]) this.elements.set(id, new FakeElement());
     this.ranges = [new FakeElement({ historyRange: "7d" }), new FakeElement({ historyRange: "30d" })];
-    this.actions = [new FakeElement({ action: "open" }), new FakeElement({ action: "refresh" })];
+    this.actions = [new FakeElement({ action: "open" }), new FakeElement({ action: "refresh" }), new FakeElement({ action: "more" })];
   }
 
   createElement() {
@@ -307,6 +307,7 @@ test("tray popup assets are local, bounded, and wired as a visual surface", asyn
   assert.match(html, /data-history-range="30d"/u);
   assert.match(html, /data-action="open"/u);
   assert.match(html, /data-action="refresh"/u);
+  assert.match(html, /data-action="more"/u);
   assert.doesNotMatch(html, /https?:\/\//u);
   assert.match(js, /pace-active-marker/u);
   assert.match(js, /totalTokens/u);
@@ -325,6 +326,8 @@ test("rendered action labels interpolate the product name", () => {
   renderTrayPopup(documentRef, createTrayPopupProjection(fixture(), { now: NOW, timeZone: "UTC" }));
   assert.equal(documentRef.actions[0].textContent, "Open TiboTattle");
   assert.equal(documentRef.actions[1].textContent, "Update Local Usage");
+  assert.equal(documentRef.actions[2].textContent, "⋯");
+  assert.equal(documentRef.actions[2].attributes.get("aria-label"), "More actions");
   assert.doesNotMatch(documentRef.actions[0].textContent, /\{appName\}/u);
 });
 
@@ -585,8 +588,9 @@ test("tray bridge admits only the reviewed no-secret actions", () => {
   const bridge = { requestAction: (...args) => calls.push(args) };
   assert.equal(requestTrayPopupAction(bridge, "open"), true);
   assert.equal(requestTrayPopupAction(bridge, "refresh"), true);
+  assert.equal(requestTrayPopupAction(bridge, "more"), true);
   assert.equal(requestTrayPopupAction(bridge, "weekly"), false);
   assert.equal(requestTrayPopupAction(bridge, "open", "unexpected"), false);
   assert.equal(requestTrayPopupAction(null, "open"), false);
-  assert.deepEqual(calls, [["open"], ["refresh"]]);
+  assert.deepEqual(calls, [["open"], ["refresh"], ["more"]]);
 });

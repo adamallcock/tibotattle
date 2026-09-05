@@ -1332,7 +1332,7 @@ async function assertDashboardShell(cdp) {
         ".dashboard-section[data-dashboard-page]:not(.dashboard-page-inactive)",
       ).length,
       refresh: Boolean(document.querySelector("#refresh-button")),
-      redundantShareLauncherAbsent: document.querySelector("#electron-share-button") === null,
+      shareLauncherAvailable: visible(document.querySelector("#electron-share-button")),
       settings: Boolean(document.querySelector("#electron-settings-button")),
     };
   })()`);
@@ -1342,7 +1342,7 @@ async function assertDashboardShell(cdp) {
       || snapshot?.activeLinkCount !== 1
       || snapshot?.activePageCount !== 1
       || snapshot?.refresh !== true
-      || snapshot?.redundantShareLauncherAbsent !== true
+      || snapshot?.shareLauncherAvailable !== true
       || snapshot?.settings !== true) {
     fail("ELECTRON_MACOS_SMOKE_DASHBOARD_CHROME_INVALID", "dashboard");
   }
@@ -1843,6 +1843,7 @@ async function captureTrayPopover({ child, port, dashboardOrigin, screenshotPath
         openLabelResolved: Boolean(document.querySelector('[data-action="open"]')?.textContent.trim())
           && !document.querySelector('[data-action="open"]')?.textContent.includes("{appName}"),
         refresh: Boolean(document.querySelector('[data-action="refresh"]')),
+        more: Boolean(document.querySelector('[data-action="more"]')?.getAttribute("aria-label")),
         hiddenElementsHidden: Array.from(document.querySelectorAll("[hidden]"))
           .every((element) => getComputedStyle(element).display === "none"),
         weeklyPace: Boolean(document.querySelector("#pace-state")),
@@ -1855,7 +1856,7 @@ async function captureTrayPopover({ child, port, dashboardOrigin, screenshotPath
       }))()`);
       return value?.bridge && value.ready && value.visible && value.nativeVisibilityTracked
         && value.open && value.openLabelResolved
-        && value.refresh && value.hiddenElementsHidden
+        && value.refresh && value.more && value.hiddenElementsHidden
         && value.weeklyPace && value.history && value.coverage && value.rangeCount === 2
         && value.width > 0 && value.width <= 480
         && value.height > 0 && !value.horizontalOverflow ? value : null;
@@ -1887,15 +1888,10 @@ async function captureTrayPopover({ child, port, dashboardOrigin, screenshotPath
 async function assertShareFlow(cdp) {
   const share = await waitFor(async () => {
     const snapshot = await cdp.evaluate(`(() => {
-    // The toolbar intentionally has no duplicate Share launcher. Exercise the
-    // same real share card through its owning Allowance navigation surface.
-    document.querySelector('[data-nav="weekly"]')?.click();
+    // The toolbar action itself must navigate and focus the share card.
+    document.querySelector('#electron-share-button')?.click();
     const panel = document.querySelector("#share-panel");
     const canvas = document.querySelector("#share-card-canvas");
-    if (${visible.toString()}(panel)) {
-      panel.setAttribute("tabindex", "-1");
-      panel.focus({ preventScroll: true });
-    }
     return {
       route: location.hash,
       panelVisible: ${visible.toString()}(panel),

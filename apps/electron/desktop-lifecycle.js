@@ -141,6 +141,7 @@ export function createDesktopLifecycle({
   let settingsWindow = null;
   let recovery = null;
   let tray = null;
+  let trayContextMenu = null;
   let trayPopover = null;
   let applicationMenu = null;
   let desktopActionInterface = null;
@@ -630,6 +631,7 @@ export function createDesktopLifecycle({
     else if (action === "timeline") selected = actions.timeline;
     else if (action === "accounting") selected = actions.accounting;
     else if (action === "settings") selected = actions.settings;
+    else if (action === "more") selected = showTrayContextMenu;
     else if (action === "quit") selected = actions.quit;
     else if (action === "refresh") {
       selected = desktopTrayStatus?.status === "unavailable"
@@ -1078,6 +1080,32 @@ export function createDesktopLifecycle({
     return true;
   }
 
+  function usesExplicitTrayContextMenu() {
+    return platform === "darwin" && typeof tray?.popUpContextMenu === "function";
+  }
+
+  function updateTrayContextMenu(template) {
+    trayContextMenu = Menu?.buildFromTemplate?.(template) ?? null;
+    // An attached AppKit tray menu opens on primary click as well. Keeping it
+    // attached while toggling our BrowserWindow stacks both surfaces. Own its
+    // secondary-click presentation explicitly on macOS; other desktops retain
+    // their native context-menu integration.
+    trayContextMenu?.on?.("menu-will-show", () => trayPopover?.hide?.());
+    tray.setContextMenu?.(usesExplicitTrayContextMenu() ? null : trayContextMenu);
+  }
+
+  function showTrayContextMenu() {
+    trayPopover?.hide?.();
+    if (trayContextMenu === null) return false;
+    if (platform !== "linux" && typeof tray?.popUpContextMenu === "function") {
+      tray.popUpContextMenu(trayContextMenu);
+      return true;
+    }
+    if (typeof trayContextMenu.popup !== "function") return false;
+    trayContextMenu.popup();
+    return true;
+  }
+
   function createTray() {
     if (tray || typeof Tray !== "function") return tray;
     if (icon === undefined) throw shellError("electron_configuration_invalid");
@@ -1090,18 +1118,23 @@ export function createDesktopLifecycle({
       locale: activeDesktopLocale,
       systemLocales: desktopSystemLocales,
     });
-    const menu = Menu?.buildFromTemplate?.(template);
-    tray.setContextMenu?.(menu);
+    updateTrayContextMenu(template);
     const projected = desktopTrayStatusReducer.project();
     tray.setTitle?.(platform === "darwin" ? projected.compactTitle : "");
-    tray.on?.("click", (_event, bounds) => {
+    tray.on?.("click", (event, bounds) => {
+      if (usesExplicitTrayContextMenu() && event?.ctrlKey === true) {
+        showTrayContextMenu();
+        return;
+      }
+      if (usesExplicitTrayContextMenu()) tray.closeContextMenu?.();
       const selectedPopover = trayPopover ?? createTrayPopover();
       if (selectedPopover?.toggle(bounds) === true) return;
       invokeTrayCommand("toggle");
     });
-    // Electron opens the context menu for the native secondary click. Hiding
-    // the visual surface first keeps the two tray affordances from stacking.
-    tray.on?.("right-click", () => trayPopover?.hide?.());
+    tray.on?.("right-click", () => {
+      if (usesExplicitTrayContextMenu()) showTrayContextMenu();
+      else trayPopover?.hide?.();
+    });
     return tray;
   }
 
@@ -1137,7 +1170,7 @@ export function createDesktopLifecycle({
         locale: activeDesktopLocale,
         systemLocales: desktopSystemLocales,
       });
-      tray.setContextMenu?.(Menu.buildFromTemplate(template));
+      updateTrayContextMenu(template);
       const projected = desktopTrayStatusReducer.project();
       tray.setTitle?.(platform === "darwin" ? projected.compactTitle : "");
       trayPopover?.setModel(currentTrayPopoverModel());

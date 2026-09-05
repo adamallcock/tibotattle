@@ -63,6 +63,13 @@ test("tray popup preload exposes immutable actions and main-owned visibility", a
     channel: TRAY_POPOVER_ACTION_CHANNEL,
     values: ["open"],
   }]);
+  bridge.requestAction("more");
+  bridge.requestAction("arbitrary-command");
+  assert.deepEqual(sent.at(-1), {
+    channel: TRAY_POPOVER_ACTION_CHANNEL,
+    values: ["more"],
+  });
+  assert.equal(sent.length, 2);
 
   for (const listener of listeners.get(TRAY_POPOVER_VISIBILITY_CHANNEL) ?? []) {
     listener({}, true);

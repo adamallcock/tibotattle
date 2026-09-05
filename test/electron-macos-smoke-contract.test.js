@@ -167,7 +167,7 @@ test("macOS Electron smoke is an explicit packaged arm64 lane", async () => {
   assert.match(source, /partialHistoryDetail/u);
   assert.match(source, /#weekly/u);
   assert.match(source, /#share-panel/u);
-  assert.match(source, /redundantShareLauncherAbsent/u);
+  assert.match(source, /shareLauncherAvailable/u);
   assert.doesNotMatch(source, /querySelector\("#electron-share-button"\)\?\.click/u);
   assert.match(source, /electron-settings/u);
   assert.match(source, /SIGUSR2/u);

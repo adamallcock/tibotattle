@@ -46,6 +46,37 @@ native product control.
 
 ## Focused evidence
 
+### Page-by-page follow-up
+
+The owner reproduced a native context menu stacked above the rich popup in
+candidate `7bdd3f86`. The macOS tray now keeps its context menu detached and
+presents it explicitly for secondary/Control-click; primary click toggles the
+rich popup. A native menu presentation also hides any visible or loading popup.
+The additional More button routes through the same closed action boundary.
+Electron's [Tray API](https://www.electronjs.org/docs/latest/api/tray) distinguishes
+native menu integration from click events; both paths need actual runtime QA.
+
+Three independent Terra passes reviewed the five dashboard pages, all three
+Settings tabs, sharing, and the native control inventory. The pre-fix packaged
+app rendered coherent page layouts and basic controls with a disposable
+synthetic profile. That fixture establishes sparse/empty chart states, not
+real-corpus plotted-series equivalence or native AppKit pixel equivalence.
+The review identified and repaired these source gaps:
+
+| Surface | Correction | Required fresh-package check |
+| --- | --- | --- |
+| Dashboard toolbar | Restore the native-equivalent Share shortcut using the existing Allowance/card focus handler. | Click Share from another page; verify navigation, visible card, and app-owned focus. |
+| Tray popup | Add native-equivalent More actions and keep the action menu mutually exclusive with the popup. | Primary, right and Control clicks; More; Escape/outside dismissal; repeat after status/language updates. |
+| Settings confirmation | Successful preference saves use a success state; failures retain their error state and live announcement. | Save in a disposable profile and inspect text, color and persistence. |
+
+Core General settings expose equivalent controls, while multi-root management
+and accountless sharing are Electron additions. Notification and updater
+controls retain explicit unavailable states where their adapters are not
+qualified; visible controls do not establish native updater or delivery parity.
+Native AppKit sidebar, toolbar, window chrome and popup styling differ from the
+Electron web presentation. These are feature-level comparisons, not a claim
+that the two applications look identical in every pixel.
+
 The cold/warm route-mode regression is covered by
 `node --test apps/web/test/refresh-policy.test.mjs` (12 passing tests at the
 source snapshot containing `1cfc6ba9`). The browser startup extraction remains

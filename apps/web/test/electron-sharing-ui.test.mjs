@@ -78,11 +78,12 @@ test("Electron sharing projection is bounded and fail-closed", () => {
 });
 
 test("Electron sharing UI uses the accountless bridge and visible receipt gate", async () => {
-  const [appSource, indexHtml, settingsHtml, settingsSource] = await Promise.all([
+  const [appSource, indexHtml, settingsHtml, settingsSource, settingsCss] = await Promise.all([
     readFile(APP_SOURCE_URL, "utf8"),
     readFile(new URL("../public/index.html", import.meta.url), "utf8"),
     readFile(new URL("../public/electron-settings.html", import.meta.url), "utf8"),
     readFile(new URL("../public/electron-settings.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/electron-settings.css", import.meta.url), "utf8"),
   ]);
   assert.match(appSource, /getSharingPreference\(\)/u);
   assert.match(appSource, /setSharingEnabled\(enabled\)/u);
@@ -100,6 +101,11 @@ test("Electron sharing UI uses the accountless bridge and visible receipt gate",
   assert.match(settingsHtml, /id="settings-sharing-enabled"/u);
   assert.match(settingsSource, /settingsSharingBridge\.getSharingPreference\(\)/u);
   assert.match(settingsSource, /settingsSharingBridge\.setSharingEnabled\(enabled\)/u);
+  assert.match(settingsSource, /function setOperationStatus\(documentRef, value, \{ error = false \} = \{\}\)/u);
+  assert.match(settingsSource, /"is-success", hasMessage && !error/u);
+  assert.match(settingsSource, /"is-error", hasMessage && error/u);
+  assert.match(settingsCss, /\.settings-operation-status\.is-success\s*\{\s*color: var\(--green\);/u);
+  assert.match(settingsCss, /\.settings-operation-status\.is-error\s*\{\s*color: var\(--rust\);/u);
 });
 
 test("a successful visible notice receipt keeps its current banner actionable", async () => {

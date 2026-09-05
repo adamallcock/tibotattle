@@ -646,6 +646,14 @@ function setText(documentRef, selector, value) {
   queryRequired(documentRef, selector).textContent = value;
 }
 
+function setOperationStatus(documentRef, value, { error = false } = {}) {
+  const element = queryRequired(documentRef, "#settings-operation-status");
+  const hasMessage = typeof value === "string" && value.trim() !== "";
+  element.textContent = value;
+  element.classList?.toggle?.("is-success", hasMessage && !error);
+  element.classList?.toggle?.("is-error", hasMessage && error);
+}
+
 function setBridgeStatus(documentRef, messageKey, available, localizer) {
   const element = queryRequired(documentRef, "#settings-bridge-status");
   element.textContent = translateSettingsMessage(localizer, messageKey);
@@ -1004,17 +1012,16 @@ function initialTab(windowRef) {
 }
 
 function operationError(documentRef, localizer) {
-  setText(
+  setOperationStatus(
     documentRef,
-    "#settings-operation-status",
     translateSettingsMessage(localizer, "electron.settings.operationError"),
+    { error: true },
   );
 }
 
 function notificationOperationStatus(documentRef, state, localizer) {
-  setText(
+  setOperationStatus(
     documentRef,
-    "#settings-operation-status",
     translateSettingsMessage(
       localizer,
       state.notifications.enabled
@@ -1194,7 +1201,7 @@ export async function mountSettingsPage({
       if (actionName === "setNotificationPreferences") {
         notificationOperationStatus(documentRef, currentState, pageLocalizer);
       } else {
-        setText(documentRef, "#settings-operation-status", "");
+        setOperationStatus(documentRef, "");
       }
       setBridgeStatus(documentRef, "electron.settings.bridge.connected", true, pageLocalizer);
     } catch {
@@ -1229,9 +1236,8 @@ export async function mountSettingsPage({
       );
       if (next === null) throw new Error("Sharing preference response was invalid");
       currentSharingPreference = next;
-      setText(
+      setOperationStatus(
         documentRef,
-        "#settings-operation-status",
         translateSettingsMessage(pageLocalizer, "electron.settings.sharing.saved"),
       );
     } catch {
