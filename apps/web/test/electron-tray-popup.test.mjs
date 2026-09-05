@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   bootstrapTrayPopup,
   createTrayPopupProjection,
+  renderTrayPopup,
   requestTrayPopupAction,
   TRAY_POPUP_SCHEMA_VERSION,
 } from "../public/electron-tray-popup.js";
@@ -314,8 +315,17 @@ test("tray popup assets are local, bounded, and wired as a visual surface", asyn
   assert.doesNotMatch(js, /recalculateDetailedAccounting/u);
   assert.match(css, /width:\s*min\(400px/u);
   assert.match(css, /height:\s*104px/u);
+  assert.match(css, /\[hidden\][\s\S]*display:\s*none\s*!important/u);
   assert.match(css, /prefers-reduced-motion/u);
   assert.match(css, /prefers-color-scheme:\s*dark/u);
+});
+
+test("rendered action labels interpolate the product name", () => {
+  const documentRef = new FakeDocument();
+  renderTrayPopup(documentRef, createTrayPopupProjection(fixture(), { now: NOW, timeZone: "UTC" }));
+  assert.equal(documentRef.actions[0].textContent, "Open TiboTattle");
+  assert.equal(documentRef.actions[1].textContent, "Update Local Usage");
+  assert.doesNotMatch(documentRef.actions[0].textContent, /\{appName\}/u);
 });
 
 test("the popup's three new messages stay translated in every shipped locale", () => {

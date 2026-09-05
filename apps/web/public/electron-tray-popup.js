@@ -27,6 +27,7 @@ import {
 } from "./ui-format.js";
 
 export const TRAY_POPUP_SCHEMA_VERSION = "electron-tray-popup-v1";
+const PRODUCT_APP_NAME = "TiboTattle";
 export const TRAY_POPUP_HISTORY_RANGES = Object.freeze({
   "7d": 7,
   "30d": 30,
@@ -1117,6 +1118,9 @@ export function renderTrayPopup(documentRef, projection, {
   if (live) live.textContent = freshnessCopy;
   for (const button of documentRef.querySelectorAll?.("[data-action]") ?? []) {
     const action = button.dataset.action;
+    button.textContent = action === "open"
+      ? translated("electron.tray.open", { appName: PRODUCT_APP_NAME })
+      : translated("electron.tray.refresh");
     button.disabled = !TRAY_POPUP_ACTIONS.includes(action)
       || typeof bridge?.requestAction !== "function";
   }

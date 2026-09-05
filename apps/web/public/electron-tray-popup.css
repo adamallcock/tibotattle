@@ -21,6 +21,11 @@
   box-sizing: border-box;
 }
 
+/* Presentation styles must never make a disclosure row visible again. */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   min-width: 0;
