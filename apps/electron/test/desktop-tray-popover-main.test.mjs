@@ -278,6 +278,54 @@ test("popover controller lazily positions, updates, routes, and destroys a trust
   assert.equal(popover.setModel(nextModel), false);
 });
 
+test("a failed initial load is discarded so reopening retries the route", async () => {
+  for (const failure of ["reject", "throw"]) {
+    const preloadPath = await preloadFixture();
+    const windows = [];
+    let attempts = 0;
+    class RetryWindow extends FakeWindow {
+      loadURL(url) {
+        this.loaded.push(url);
+        this.webContents.currentURL = url;
+        attempts += 1;
+        if (attempts === 1 && failure === "throw") {
+          throw new Error("synthetic load failure");
+        }
+        if (attempts === 1) return Promise.reject(new Error("synthetic load failure"));
+        return Promise.resolve();
+      }
+    }
+    const popover = createDesktopTrayPopover({
+      BrowserWindow: class extends RetryWindow {
+        constructor(options) {
+          super(options);
+          windows.push(this);
+        }
+      },
+      preloadPath,
+      pageURL: POPOVER_PAGE_URL,
+      origin: POPOVER_ORIGIN,
+      platform: "darwin",
+      model: createDesktopTrayPopoverModel({ trayStatus: status("unavailable") }),
+      onAction: () => {},
+    });
+    assert.equal(popover.show(), true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(attempts, 1);
+    assert.equal(windows.length, 1);
+    assert.equal(windows[0].destroyed, true);
+    assert.equal(popover.visible, false);
+
+    assert.equal(popover.show(), true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(attempts, 2);
+    assert.equal(windows.length, 2);
+    assert.deepEqual(windows[1].loaded, [POPOVER_PAGE_URL]);
+    assert.equal(popover.visible, true);
+    popover.destroy();
+  }
+});
+
 test("popover accepts negative display origins, caps to work area, and dismisses on Escape", async () => {
   const preloadPath = await preloadFixture();
   const windows = [];

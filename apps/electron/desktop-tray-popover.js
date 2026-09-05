@@ -498,6 +498,23 @@ export function createDesktopTrayPopover({
       policy?.remove?.();
       policy = null;
     };
+    const discardFailedLoad = () => {
+      if (window !== candidate) return;
+      // A failed load leaves a live but unusable BrowserWindow. Tear it down
+      // before the next show attempt so the validated route is loaded again.
+      // Remove listeners first because destroy() may synchronously emit
+      // "closed" in test doubles and on some Electron shutdown paths.
+      windowCleanup();
+      window = null;
+      loaded = false;
+      pendingShow = false;
+      try {
+        if (!candidate.isDestroyed?.()) candidate.destroy?.();
+      } catch {
+        // The failed candidate is already detached from controller state;
+        // the next explicit show can still create a fresh window.
+      }
+    };
     try {
       const loadResult = candidate.loadURL?.(initialURL);
       Promise.resolve(loadResult).then(
@@ -507,12 +524,11 @@ export function createDesktopTrayPopover({
           if (pendingShow) present();
         },
         () => {
-          if (window !== candidate) return;
-          loaded = false;
+          discardFailedLoad();
         },
       );
     } catch {
-      loaded = false;
+      discardFailedLoad();
     }
     return true;
   }
