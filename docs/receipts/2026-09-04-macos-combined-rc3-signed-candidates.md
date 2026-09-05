@@ -105,6 +105,20 @@ evidence tests pass 35/35, and Node 24.14.0 R7 freshness/reconstruction passes
 by this documentation handoff. Later documentation commits do not move the
 frozen RC3 source tag or relabel its artifacts.
 
+A fresh history-free client source export from clean documentation commit
+`473dd67b7116f26000023a6b1b487bc77a710813` passes its independent manifest,
+exact allowlist, source-byte, import-boundary and forbidden-path checks: 384
+files, including 376 source files and the Login Item release-validation CLI.
+Manifest SHA-256 is
+`7e3bbb13b2c3a01ad5acc261427e3904a817117594290e5d6250a99af59aee18`.
+Three entrypoint syntax checks and browser telemetry-mirror verification pass.
+The separate telemetry check cannot resolve its uninstalled workspace package;
+the full client gate requires dependency installation and native builds and
+was not run. The export remains unchanged and contains no Git history,
+node_modules or private lockfile. No dependencies, network, signing or user-state
+access were added by this check; this is a source-boundary result, not a new
+packaged-runtime or publication claim.
+
 ## Uncompleted gates
 
 Resume the authorized installed ARM launch, detailed refresh, generation-bound
