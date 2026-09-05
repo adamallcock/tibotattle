@@ -107,6 +107,24 @@ real-corpus uploads, erasure, or re-enabling previously declined contribution.
 Update applicable invariants and disclosures as each implemented path changes;
 the distributed native application's current behavior remains unchanged.
 
+### Deferred UI follow-up: auto-review thread links
+
+The owner reports that Codex Auto Review rows in **See recent large cache
+drops** show internal thread IDs whose links do not open a useful user-visible
+conversation. Investigate whether local session metadata provides a verified
+parent conversation, and use that parent's title and canonical thread link for
+navigation when available. Keep an **Auto review** label so the row's origin is
+clear. If no accessible parent can be resolved, show a truthful non-link label
+instead of an ineffective internal-thread link; do not guess a parent from
+timing or proximity.
+
+This is a deferred navigation/presentation change. Usage and cache-drop
+attribution must remain on the original auto-review session, with no ledger
+reassignment or duplicate counting. Acceptance covers a resolvable parent,
+missing/inaccessible parent, and unchanged ordinary thread links. Preserve
+the existing local-only title/link privacy boundary. No runtime change or
+candidate rebuild is part of recording this follow-up.
+
 ### Work estimate and first implementation tranche
 
 Initial estimate: **12–25 focused engineering days**, with parallel work
