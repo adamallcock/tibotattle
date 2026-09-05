@@ -433,6 +433,10 @@ export function createDesktopTrayPopover({
   function present(bounds) {
     if (!position(bounds)) return false;
     try {
+      // A newly loaded renderer has not observed a status transition yet.
+      // Seed the current model before visibility lets it load or enable
+      // controls; repeat on reopen to recover any event sent while loading.
+      if (!setModel(currentModel)) return false;
       // The popover is an interactive, keyboard-accessible surface. A
       // nonactivating panel would leave Escape and button focus with the
       // previous application, so explicitly activate and focus it.

@@ -80,9 +80,18 @@ launch. The rejected copy was preserved; recopying with `verbatimSymlinks`
 retained all 14 relative framework links. The corrected copy launched and
 exited cleanly. Copying an ASAR digest alone does not qualify a Mac bundle.
 
-The remaining interaction correction consumes the existing main-process
-Refresh availability while starting/analyzing. It requires a new package
-check before final handoff. Retina image runtime inspection is separate from
-the rendered popup checks. Physical Windows, Linux and Intel desktop behavior,
+The interaction correction consumes main-process Refresh availability while
+starting/analyzing. Its first package exposed an existing missing initial
+model delivery: the controller only sent subsequent status changes. The
+controller now sends its current model before each presentation; initial and
+reopen ordering are covered by regression assertions. A new package check is
+required before final handoff.
+
+An actual Electron 43.2.0 NativeImage probe verified the unchanged icon
+factory against its exact source hash and the packaged ASAR asset. Live
+0/50/100, analyzing and stale states all produced nonempty 16-point template
+images with scale factors 1 and 2 and valid 32-pixel PNG exports. This proves
+runtime image generation, separately from the rendered popup checks.
+Physical Windows, Linux and Intel desktop behavior,
 automatic contribution activation, signing and publication remain separate
 gates; four successful package builds do not close those gates.

@@ -52,7 +52,7 @@ function subscribe(listener) {
 let visible = false;
 const visibilityListeners = new Set();
 function handleVisibility(_event, value) {
-  if (typeof value !== "boolean") return;
+  if (typeof value !== "boolean" || value === visible) return;
   visible = value;
   for (const listener of visibilityListeners) {
     try {

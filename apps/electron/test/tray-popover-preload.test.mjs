@@ -88,6 +88,11 @@ test("tray popup preload exposes immutable actions and main-owned visibility", a
   assert.equal(bridge.getVisibility(), true);
   assert.deepEqual(received, [true]);
   for (const listener of listeners.get(TRAY_POPOVER_VISIBILITY_CHANNEL) ?? []) {
+    listener({}, true);
+  }
+  assert.deepEqual(received, [true],
+    "native show and explicit visibility publication represent one transition");
+  for (const listener of listeners.get(TRAY_POPOVER_VISIBILITY_CHANNEL) ?? []) {
     listener({}, "true");
   }
   assert.equal(bridge.getVisibility(), true);

@@ -258,6 +258,9 @@ test("popover controller lazily positions, updates, routes, and destroys a trust
   assert.equal(window.showCalls, 1);
   assert.equal(window.focusCalls, 1);
   assert.equal(window.showInactiveCalls, 0);
+  assert.equal(window.webContents.sent[0].channel, TRAY_POPOVER_MODEL_CHANNEL,
+    "first presentation seeds controls before publishing visibility");
+  assert.equal(window.webContents.sent[0].value.refreshEnabled, true);
   assert.deepEqual(
     window.webContents.sent
       .filter(({ channel }) => channel === TRAY_POPOVER_VISIBILITY_CHANNEL)
@@ -284,6 +287,9 @@ test("popover controller lazily positions, updates, routes, and destroys a trust
   assert.equal(popover.visible, true);
   assert.equal(window.webContents.sent.at(-1).channel, TRAY_POPOVER_VISIBILITY_CHANNEL);
   assert.equal(window.webContents.sent.at(-1).value, true);
+  assert.equal(window.webContents.sent.at(-2).channel, TRAY_POPOVER_MODEL_CHANNEL);
+  assert.equal(window.webContents.sent.at(-2).value.compactTitle, "74%",
+    "reopening republishes the latest model without waiting for a quota change");
   popover.destroy();
   assert.equal(popover.visible, false);
   assert.equal(popover.available, false);
