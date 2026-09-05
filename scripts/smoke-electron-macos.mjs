@@ -9,6 +9,8 @@
  * build step is kept outside the smoke so the receipt always identifies the
  * exact artifact the caller selected, rather than silently testing a stale
  * staging directory or a different architecture.
+ * Optional --screenshot captures only this script's disposable synthetic
+ * renderer, before clean quit, for visual inspection of the exact package.
  */
 
 import { execFileSync, spawn } from "node:child_process";
@@ -2359,6 +2361,7 @@ async function persistReceipt(receipt, destination) {
 async function runSmoke(appPath, progress = {}, {
   sourceRevision,
   artifactSha256,
+  screenshotPath = null,
 } = {}) {
   await assertPackagedMacApp(appPath);
   const fixture = await createSyntheticFixture();
@@ -2563,6 +2566,16 @@ async function runSmoke(appPath, progress = {}, {
     if (descendantsOf(child.pid).length < 1) {
       fail("ELECTRON_MACOS_SMOKE_COMPANION_NOT_RUNNING", "dashboard");
     }
+    if (screenshotPath !== null) {
+      const capture = await cdp.request("Page.captureScreenshot", {
+        format: "png",
+        captureBeyondViewport: false,
+      });
+      await writeFile(screenshotPath, Buffer.from(capture.data, "base64"), {
+        flag: "wx",
+        mode: 0o600,
+      });
+    }
     cdp.close();
     cdp = null;
     stage = "quit";
@@ -2624,6 +2637,10 @@ if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
   const receiptPath = receiptPathFromArguments();
   const sourceRevision = sourceRevisionFromArguments();
   const expectedArtifactSha256 = artifactSha256FromArguments();
+  const screenshotIndex = process.argv.indexOf("--screenshot");
+  const screenshotPath = screenshotIndex >= 0
+    ? resolve(process.argv[screenshotIndex + 1] ?? "")
+    : null;
   const progress = {};
   let verifiedArtifactSha256 = null;
   let receipt;
@@ -2642,6 +2659,7 @@ if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
     receipt = await runSmoke(appPath, progress, {
       sourceRevision,
       artifactSha256: verifiedArtifactSha256,
+      screenshotPath,
     });
     process.stdout.write(`${JSON.stringify(receipt, null, 2)}\n`);
   } catch (error) {
