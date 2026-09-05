@@ -2,10 +2,17 @@
 title: Release 0.1.18 publication preparation
 date: 2026-09-04
 type: plan
-status: qualification-blocked
+status: historical-release-evidence
 ---
 
 # Release 0.1.18 publication preparation
+
+This preparation history is retained for its RC2/RC3 qualification and recovery
+evidence. Its earlier authorization holds describe their recorded moments, not
+the current decision: the owner subsequently authorized publication under the
+[0.1.18-only waiver](../decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md)
+and separately approved production migrations `0042`–`0045` and the Worker update.
+Continue through the [2026-09-05 execution plan](./2026-09-05-public-0-1-18-release.md).
 
 Prepare the combined Astra/Intel candidate to the publication boundary, starting
 from clean `c5a10c6de76a6c5b9150832b3552ce35cb22a87c` on

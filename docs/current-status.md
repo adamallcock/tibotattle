@@ -1,10 +1,10 @@
 ---
 title: Current product and release status
-date: 2026-09-04
+date: 2026-09-05
 type: status
 status: current
-source_commit: 7701debf44e046ac9f25bb74f7214532e32c5c5d
-observation_date: 2026-09-04
+source_commit: ce80f5f26650ce489e678e9ee2ff2adbb36fbedf
+observation_date: 2026-09-05
 ---
 
 # Current product and release status
@@ -22,8 +22,8 @@ using this page for a later release or operational decision.
 | Combined signed RC3 | ARM and Intel `0.1.18` build `1025.2` dogfood DMGs from common clean `7701debf` and a local annotated tag; [exact receipt](./receipts/2026-09-04-macos-combined-rc3-signed-candidates.md). Both signed/notarized/stapled with independent final-byte and RC2-to-RC3 replacement checks; real installed runtime, manual lifecycle and physical Intel remain separate |
 | Combined signed RC2 | ARM and Intel `0.1.18` build `1025.1` dogfood DMGs from common source `4ea16586` and a new local annotated tag; [exact receipt](./receipts/2026-09-04-macos-combined-rc2-signed-candidates.md). Both signed/notarized/stapled with independent exact-byte and same-architecture replacement checks; not installed-upgrade, manual lifecycle or physical Intel proof |
 | Earlier Intel tester artifact | Preserved signed/notarized `0.1.18` build `1025` dogfood DMG from source `18c7065b`; [historical receipt](./receipts/2026-09-03-macos-intel-signed-candidate.md). Predates combined Astra changes; remains immutable rollback/test evidence, not physically Intel-qualified |
-| Installed app | The final signed ARM RC3 `0.1.18` / `1025.2`, source `7701debf`, was Finder-installed after full stable `0.1.17` / `1024` app/state/preferences rollback verification. Production installed-artifact validation passes. The Mac locked before observable normal launch; no TiboTattle process was running afterward. Working-state migration, normal refresh/restart and manual proof remain pending |
-| Public service | Health/readiness HTTP 200, enrollment and upload processing enabled; deployment source `b4c8f103bf697fb530434e6de196f2c187645661`, observed 2026-09-04 03:57 UTC (2026-09-03 locally). Later read-only ledger/schema checks found a divergent historical migration 0041 and absent new composition tables. Hosted release remains blocked; no remote schema changes were made |
+| Installed app | Final signed ARM RC3 `0.1.18` / `1025.2`, source `7701debf`, passes production installed-artifact validation. After owner unlock, a native-menu detailed refresh completed at 2026-09-05 03:58 UTC with replay-safe accounting bound to exact v14 generation 71, complete usage coverage and zero fallback. Stopped-state verification preserves all baseline/rehearsal historical keys, reviewed counter changes, salt and paused contribution settings; SQLite quick checks pass. Normal relaunch is observed; stable `1026` installation remains a separate gate |
+| Public service | Health HTTP 200 at 2026-09-05 03:45 UTC; source `b4c8f103bf697fb530434e6de196f2c187645661`. Fresh read-only checks confirm 41 primary and two deletion-ledger migrations, exactly `0042`–`0045` pending after the reviewed historical-lineage repair. The owner separately approved those migrations and the Worker deployment; recovery bookmarks are retained before any apply. No migration or deployment is claimed by this snapshot |
 | Public updater | Stable `0.1.16`; read-only feed check recorded 2026-09-03 in the release plan |
 | Published release | Immutable GitHub `v0.1.17`, published 2026-09-03 at 19:47:43 UTC; ARM DMG, appcast, manifest, checksums and verification guide; exact source tag commit `aa660b24a66196155ba59267ab832cc4ef6e1c7d` |
 
@@ -140,11 +140,14 @@ The complete qualification matrix and rules for changing these claims are in
   [combined RC2 signing/notarization](./receipts/2026-09-04-macos-combined-rc2-signed-candidates.md)
   pass on their named source. Corrected parser v14 and its upgrade deadline now
   have fresh [signed RC3 evidence](./receipts/2026-09-04-macos-combined-rc3-signed-candidates.md).
-  Final ARM installation and production installed-artifact checks pass; normal
-  runtime observation awaits an owner-unlocked Mac. Installed lifecycle,
-  physical Intel, stable finalization and hosted activation remain open.
-  The 0.1.17-only manual-matrix deferral does not carry
-  forward. No publication or update activation occurred.
+  Final ARM installation, production installed-artifact checks, detailed
+  accounting and stopped-state preservation now pass; normal relaunch is observed.
+  The owner explicitly authorized publication and separately accepted the
+  [0.1.18-only manual/physical waiver](./decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md).
+  Those unavailable tests are waived, not passed; the 0.1.17 decision does not
+  carry forward. Follow the [current execution plan](./plans/2026-09-05-public-0-1-18-release.md)
+  for remaining stable-artifact, installed-stable, CI, publication and hosted gates.
+  No publication or update activation is claimed by this snapshot.
 
 - The [Intel implementation plan](./plans/2026-09-03-macos-intel-release.md)
   records separate thin builds, architecture-specific update/publication

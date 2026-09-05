@@ -26,6 +26,20 @@ Current operational authorities remain the
 [macOS release runbook](../runbooks/macos-stable-release-runbook.md) and
 [platform support matrix](../reference/platform-support.md).
 
+### 2026-09-05 release-specific qualification decision
+
+The owner separately authorized release under the [0.1.18-only manual
+qualification waiver](../decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md),
+because a disposable macOS profile and physical Intel Mac are unavailable.
+The clean-profile/manual Login Item matrix and physical Intel qualification
+remain unperformed, not passed. Other testers running the app is an owner report,
+not independently verified architecture- or artifact-bound evidence. Do not
+manufacture a v2 manual receipt or reinterpret Rosetta as physical Intel proof.
+Native signatures, final-byte and source binding, data preservation, updater
+integrity and unexpected-Keychain-prompt stop conditions remain unchanged.
+The earlier implementation checkpoints and signed receipts below retain their
+original scope; this exception does not qualify later releases.
+
 ## Version and publication boundary
 
 The first request proposed Intel 0.1.17 alongside Apple silicon. That release
@@ -203,6 +217,12 @@ The candidate is ready for the owner to hand to the physical Intel tester;
 no public release, feed or website was published.
 
 ## Gates before a public Intel release
+
+The list below states the normal qualification policy. For 0.1.18 only, the
+linked 2026-09-05 decision waives unavailable manual/physical Intel execution,
+including the physical installed A-to-B rehearsal; signature/version/architecture
+refusals, final artifact checks and recovery preservation remain required. A
+waived step is not a successful test or a verified tester receipt.
 
 1. Keep the retained R7 receipts fresh against the final integrated workload.
    The owner-authorized branch regeneration passed; any later workload-source

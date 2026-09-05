@@ -290,7 +290,10 @@ These source paths do not qualify real Intel hardware, final signed/notarized
 installers or updater installation. See the
 [Intel release plan](../../docs/plans/2026-09-03-macos-intel-release.md) and
 [macOS release runbook](../../docs/runbooks/macos-stable-release-runbook.md)
-for the remaining gates. The commands below show the default Apple silicon
+for the remaining gates. The owner's [0.1.18-only manual qualification
+waiver](../../docs/decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md)
+accepts unavailable physical Intel testing as a release risk, not a passed
+hardware test. The commands below show the default Apple silicon
 packaging path; pass `--architecture x64` and the Intel app path for Intel.
 
 Create a deterministic-layout developer DMG:
@@ -704,7 +707,14 @@ smoke against an injected fake manager; that check makes zero real
 ServiceManagement calls. It is not a substitute for a truly clean machine.
 The manual clean-profile and physical Login Item matrix was deferred for
 0.1.17 only; see the [release-specific decision](../../docs/plans/2026-09-03-public-0.1.17-release.md).
-That decision does not qualify or waive the matrix for 0.1.18 or Intel.
+That historical decision does not carry forward. The owner separately approved
+the [0.1.18-only waiver](../../docs/decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md)
+of the disposable clean-profile/manual Login Item matrix and physical Intel
+qualification. Those checks remain unperformed, not passed. Reports that other
+testers are running the app are owner-reported, not independently verified
+hardware or artifact-bound evidence. The waiver does not change the v2 receipt
+validator or justify manufacturing a manual receipt; exact signed-artifact,
+data-preservation, updater-integrity and unexpected-Keychain-prompt gates remain.
 
 For Finder metadata, inspect the app directly on the final frozen DMG, read-only,
 after stapling. Derive the expected timestamp from the sealed source commit in
@@ -712,8 +722,10 @@ after stapling. Derive the expected timestamp from the sealed source commit in
 dates with that source-derived value. The isolated `ditto` copy used for
 clean-profile smoke is not evidence of mounted-volume Finder metadata.
 
-Before sending the DMG to any external user, perform a human clean-Mac or
-disposable-VM rehearsal:
+The normal release policy requires the following human clean-Mac or disposable-VM
+rehearsal before external distribution. For 0.1.18, apply only the explicitly
+waived scope above; do not report the unperformed matrix or its receipt gate as
+passed:
 
 1. transfer the DMG through the intended download channel so quarantine
    metadata is present;

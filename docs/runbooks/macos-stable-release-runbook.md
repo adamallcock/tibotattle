@@ -31,8 +31,11 @@ previous stable version.
 
 The 0.1.18 working candidate adds a separate Intel lane; it is not a public
 support declaration. The published 0.1.17 release is immutable and remains
-unchanged. Complete the [Intel qualification plan](../plans/2026-09-03-macos-intel-release.md)
-before declaring Intel supported. Both installers must come from the same
+unchanged. Follow the [Intel qualification plan](../plans/2026-09-03-macos-intel-release.md)
+before publishing Intel, with the owner's explicit
+[0.1.18-only manual qualification waiver](../decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md).
+That release decision accepts missing physical evidence; it does not establish
+that the waived tests passed. Both installers must come from the same
 frozen annotated tag and source commit and enter the draft release before it
 is made immutable. Never append a later source build under an older tag.
 
@@ -85,6 +88,15 @@ payload alongside version identity. Native hardware, supported macOS and
 non-Rosetta execution remain human observations; neither old v1 receipts nor an
 ARM rehearsal can qualify Intel. The payload binding is not a final-DMG digest
 and does not replace independent artifact/signature checks.
+
+For 0.1.18 only, the owner waived the disposable clean-profile/manual Login Item
+matrix and physical Intel qualification in the linked release decision. Record
+these as waived and unperformed, not passed; do not manufacture a v2 receipt or
+claim its validator succeeded. Other testers running the app is an owner report,
+not independently verified, architecture- and artifact-bound evidence. The v2
+validator, actual automated isolated smoke, native signatures, exact-byte
+verification, data preservation, updater integrity and unexpected-Keychain-prompt
+stop conditions remain unchanged. This does not carry forward to a later release.
 
 The existing website command below remains ARM-compatible. To expose a qualified
 Intel artifact from the same canonical `release-manifest.json`, also supply:
@@ -346,7 +358,7 @@ design.
 rm -rf .release-build/macos-production
 export USAGE_MONITOR_DEVELOPER_ID_APPLICATION="Developer ID Application: … (…)"
 export USAGE_MONITOR_NOTARY_PROFILE="…"
-export USAGE_MONITOR_BUNDLE_VERSION="1024"
+export USAGE_MONITOR_BUNDLE_VERSION="1026"
 export USAGE_MONITOR_SPARKLE_FRAMEWORK=".release-deps/Sparkle.framework"
 export USAGE_MONITOR_SPARKLE_APPCAST_URL="https://updates.tibotattle.com/appcast.xml"
 export USAGE_MONITOR_SPARKLE_PUBLIC_ED_KEY="jhgPwmvWLMr7TGURJUoi6sXias7YP1F+hejZawKVTGw="
@@ -366,8 +378,8 @@ RC7 `1023.5`, accounting-deadline RC6 `1023.4`, integrated RC5 `1023.3`,
 startup-recovery RC4 `1023.2`, migration RC3 `1023.1`, retained RC2 `1023`,
 and earlier shared-identity dogfood `1022`. The
 checked-in allocation is authoritative; the
-`USAGE_MONITOR_BUNDLE_VERSION` value above is only an exact assertion and
-cannot select or override a different build. A future stable version must add
+current 0.1.18 `USAGE_MONITOR_BUNDLE_VERSION=1026` example above is only an exact
+assertion and cannot select or override a different build. A future stable version must add
 and test a new monotonic channel allocation before the release path will run.
 The separate `TiboTattle Preview.app` identity may use the deterministic
 preview epoch (`2000.1.17` for 0.1.17); it does not participate in stable
@@ -394,6 +406,11 @@ manual results. Data conservation, signatures, updater integrity, and the
 unexpected-Keychain-prompt stop condition remain unchanged. Hosted migrations,
 protocol activation, live contribution tests, and website publication remain
 separate; this release decision does not authorize them.
+
+The [2026-09-05 owner decision](../decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md)
+is the separate forward exception for 0.1.18's unavailable manual/physical
+matrix. It does not alter the historical 0.1.17 decision or create a passing
+manual receipt for either architecture.
 
 Signing-key access on the release machine is a separate owner provisioning
 step, not an end-user permission requirement. If signing requests approval,
