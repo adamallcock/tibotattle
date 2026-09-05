@@ -83,8 +83,14 @@ requires missing model evidence from exact-occurrence seedless extraction and
 an unknown stored model identity, with all counter/effort/tier/preservation
 checks retained. The draft stricter assertion remains unchanged pending owner
 approval. This is a verifier limitation, not permission to modify stored facts
-or claim completed rehearsal. Independent R7 regeneration can proceed on the
-frozen product source.
+or claim completed rehearsal. Independent R7 regeneration is also held after
+the exact attempted operation on clean `c955fed1` was refused before execution:
+safety review requires fresh explicit authorization for reading the private
+corpus and replacing the ten receipts on this corrected source. No retry or
+workaround was attempted. All ten receipt bytes remain identical to HEAD,
+there is no installation journal, no v14 rehearsal clone exists, and no RC3
+DMG exists. Source tests do not waive either approval or the downstream
+signed/installed/manual/hardware/publication gates.
 
 The [hosted lineage review](../reviews/2026-09-04-hosted-migration-lineage-reconciliation.md)
 records a separate live deployment blocker. Production applied the historical

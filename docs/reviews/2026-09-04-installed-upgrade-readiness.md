@@ -121,6 +121,17 @@ The full companion suite passes 305/305 and pricing/catalog checks pass 25/25.
 All have no skips. Architecture and the 20-test documentation preflight pass.
 These are synthetic/source gates, not fresh real-corpus or installed evidence.
 
+A verifier review found that an earlier helper's source-status comparison used
+the nonexistent `indexed` status. A separate immutable read confirmed the
+actual preserved v11 generation has 8,062 unchanged `skipped`, 15 `resumed` and
+nine `rescanned` sources, all with complete diagnostics; the v13 rehearsal has
+8,091 `rescanned`, all with complete diagnostics. Here `skipped` means a valid
+unchanged-source fast path, not the generation's quarantined-source count.
+The fresh verifier must use the actual closed status contract. Its additional
+event-recognition check also needs owner approval to correct the shared-model
+dimension assumption, as recorded in the preparation plan. Neither fresh v14
+rehearsal nor R7 regeneration has run.
+
 The v13 rehearsal is useful preservation/diagnostic evidence, not completed
 attribution or RC3 qualification. Fresh synthetic, copy-only v14 and full R7
 evidence are required before signing or installed replacement.
