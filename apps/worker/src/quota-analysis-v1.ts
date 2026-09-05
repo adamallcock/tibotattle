@@ -81,7 +81,8 @@ export const V1_PLAN_ATTRIBUTION_ADAPTER_VERSION =
  *     trailing horizon snapped to whole reset cycles, pre-filters to the only
  *     track the consumer keeps (limit_id='codex', window=10080), drops reset
  *     groups the shared calibration always refuses (the fitable HAVING), and
- *     collapses each flat used_percent run to its endpoints via LAG/LEAD. A
+ *     collapses each flat used_percent run to its endpoints via indexed
+ *     predecessor/successor seeks. A
  *     boundary is emitted only on a strict used_percent increase and anchors
  *     lowerCost on the LAST row of the preceding run and upperCost on the FIRST
  *     row of the new run, so keeping both run endpoints is byte-identical for
@@ -533,25 +534,50 @@ function attributeSnapshot(
  * window) includes a reset only when its ENTIRE first..last series is within the
  * window, so a cycle straddling the cutoff is excluded wholesale rather than
  * read partially and mis-fit. The fitable HAVING drops reset groups the shared
- * calibration always refuses; the LAG/LEAD collapse keeps every row that differs
+ * calibration always refuses; the neighbor collapse keeps every row that differs
  * from its predecessor OR successor — the first and last row of every flat
  * used_percent run — because a boundary anchors lowerCost on the last row of the
  * preceding run and upperCost on the first row of the new run. The partition
  * INCLUDES slot (an eligible multi-slot reset has time-disjoint slots); the
  * fitable GROUP BY EXCLUDES slot (= the shared resetKey).
  */
-// Binds (in order): era markers JSON, winnersJson, participantId, observedAt cutoff, resetsAt
-// cutoff, window minutes, minimum boundaries, minimum span, row limit. Anonymous
-// `?` because the leading json_each winner filter binds one parameter and fixed
-// numbering across the CTE chain buys nothing. Plan-era bounds are disjoint
-// within each provider/limit context, including conflict gaps. Seek each era's
-// range through the deployed 0036 index; no wide raw or marker-stream table is
-// needed. Only rowids and compact partition values cross the window sorter.
+const QUOTA_WINNER_FILTER_SQL = WINNER_FILTER_SQL.replace("?", "?2");
+
+// The tuple (time,id) predecessor/successor must use two explicit seeks, just
+// like the usage cursor below. Looking within the tied timestamp first preserves
+// rowid order; only an absent neighbor advances to the adjacent time. The other
+// partition fields and the exact winner/era bounds must also match. Every
+// accepted percentage is nonnegative, so -1 denotes an absent neighbor without
+// becoming a retained value or confusing a genuine zero-percent endpoint.
+function quotaNeighborSql(previous: boolean): string {
+  const comparison = previous ? "<" : ">";
+  const direction = previous ? "DESC" : "ASC";
+  const select = (sameTime: boolean) => `(SELECT n.used_percent FROM telemetry_v1_records n
+      INDEXED BY telemetry_v1_records_participant_stream_observed
+    WHERE n.participant_id = r.participant_id AND n.stream = 'quota'
+      AND ${sameTime ? `n.observed_at = r.observed_at AND n.id ${comparison} r.id` : `n.observed_at ${comparison} r.observed_at`}
+      AND n.observed_at >= MAX(?4, e.lower_bound)
+      AND n.observed_at <= COALESCE(e.upper_bound, '9999-12-31T23:59:59.999Z')
+      AND n.provider = r.provider AND n.limit_id = r.limit_id
+      AND n.plan_type = r.plan_type AND n.plan_variant = r.plan_variant
+      AND n.window_duration_minutes = r.window_duration_minutes
+      AND n.resets_at = r.resets_at AND n.slot = r.slot
+      AND n.used_percent IS NOT NULL AND ${QUOTA_WINNER_FILTER_SQL.replaceAll("r.", "n.")}
+    ORDER BY ${sameTime ? "" : `n.observed_at ${direction}, `}n.id ${direction} LIMIT 1)`;
+  return `COALESCE(${select(true)}, ${select(false)}, -1)`;
+}
+
+// Binds (in order): era markers JSON, winnersJson, participantId, observedAt
+// cutoff, resetsAt cutoff, window minutes, minimum boundaries, minimum span,
+// row limit. Numbered parameters reuse the same winner and cutoff bindings in
+// all four neighbor seeks. Plan-era bounds are disjoint within each
+// provider/limit context, including conflict gaps. Seek through deployed 0036;
+// no dense marker-stream table, partition sorter, or window spool is needed.
 // Materialize endpoints BEFORE reset eligibility: collapse preserves every
 // distinct percentage and extremum, so the same slot-independent gates commute
 // with this slot-partitioned reduction. Hydrate wide rows only after the cap.
-// NOT MATERIALIZED keeps SQLite from retaining the entire compact window output
-// as a second dense table; the owning query-plan test verifies its coroutine.
+// NOT MATERIALIZED prevents retaining the dense per-record neighbor results;
+// the owning query-plan test forbids a sort/materialization before endpoints.
 export const QUOTA_DOWNSAMPLE_SQL = `WITH era_markers AS MATERIALIZED (
     SELECT json_extract(e.value, '$[0]') AS provider,
       json_extract(e.value, '$[1]') AS limit_id,
@@ -561,21 +587,21 @@ export const QUOTA_DOWNSAMPLE_SQL = `WITH era_markers AS MATERIALIZED (
       json_extract(e.value, '$[5]') AS lower_bound,
       json_extract(e.value, '$[6]') AS upper_bound,
       json_extract(e.value, '$[7]') AS era_ordinal
-    FROM json_each(?) e
+    FROM json_each(?1) e
   ), marked AS NOT MATERIALIZED (
     SELECT r.id, r.observed_at, r.resets_at, r.used_percent, e.era_ordinal,
-           LAG(r.used_percent) OVER win AS prev_up,
-           LEAD(r.used_percent) OVER win AS next_up
+           ${quotaNeighborSql(true)} AS prev_up,
+           ${quotaNeighborSql(false)} AS next_up
       FROM era_markers e
       CROSS JOIN telemetry_v1_records r INDEXED BY telemetry_v1_records_participant_stream_observed
       JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
-     WHERE ${WINNER_FILTER_SQL}
-       AND r.participant_id = ?
+     WHERE ${QUOTA_WINNER_FILTER_SQL}
+       AND r.participant_id = ?3
        AND r.stream = 'quota'
-       AND r.observed_at >= MAX(?, e.lower_bound)
-       AND r.resets_at >= ?
+       AND r.observed_at >= MAX(?4, e.lower_bound)
+       AND r.resets_at >= ?5
        AND r.limit_id = 'codex'
-       AND r.window_duration_minutes = ?
+       AND r.window_duration_minutes = ?6
        AND r.resets_at IS NOT NULL
        AND r.slot IS NOT NULL
        AND r.used_percent IS NOT NULL
@@ -586,25 +612,20 @@ export const QUOTA_DOWNSAMPLE_SQL = `WITH era_markers AS MATERIALIZED (
        -- Accepted v1 anchors have canonical four-digit-year chunk days. A
        -- finite open-era bound preserves that domain and makes BOTH ends seekable.
        AND r.observed_at <= COALESCE(e.upper_bound, '9999-12-31T23:59:59.999Z')
-    WINDOW win AS (
-      PARTITION BY e.era_ordinal, r.resets_at, r.slot
-      ORDER BY r.observed_at, r.id
-    )
   ), endpoints AS MATERIALIZED (
     SELECT id, observed_at, resets_at, used_percent, era_ordinal
       FROM marked
-     WHERE prev_up IS NULL OR next_up IS NULL
-        OR used_percent <> prev_up OR used_percent <> next_up
+     WHERE used_percent <> prev_up OR used_percent <> next_up
   ), fitable AS (
     SELECT era_ordinal, resets_at FROM endpoints
      GROUP BY era_ordinal, resets_at
-    HAVING COUNT(DISTINCT used_percent) >= ?
-       AND MAX(used_percent) - MIN(used_percent) >= ?
+    HAVING COUNT(DISTINCT used_percent) >= ?7
+       AND MAX(used_percent) - MIN(used_percent) >= ?8
   ), selected AS (
     SELECT s.id, s.observed_at, s.era_ordinal FROM endpoints s
       JOIN fitable f ON f.era_ordinal = s.era_ordinal AND f.resets_at = s.resets_at
      ORDER BY s.observed_at, s.id
-     LIMIT ?
+     LIMIT ?9
   )
   SELECT r.occurrence_id, r.observed_at, r.provider, r.plan_type, r.plan_variant,
          r.limit_id, r.slot, r.used_percent, r.window_duration_minutes, r.resets_at,
