@@ -15,10 +15,7 @@ import { ADMIN_UI_ASSETS } from "./admin-ui.generated";
 // which probes them post-deploy on the public origin.
 export const ADMIN_SURFACE_PATHS = Object.freeze([
   "/admin",
-  "/admin.html",
-  "/admin.js",
-  "/admin-client.js",
-  "/admin.css",
+  ...Object.keys(ADMIN_UI_ASSETS),
 ]);
 
 const ADMIN_SURFACE_PATH_SET = new Set<string>(ADMIN_SURFACE_PATHS);

@@ -29,6 +29,7 @@ import { parse } from "jsonc-parser";
 import { checkDeploymentEndpointConsumers } from "./check-deployment-endpoints.mjs";
 import { checkLocalWorkspacePackages } from "./check-local-workspace-packages.mjs";
 import { stageProductionAssets } from "./stage-production-assets.mjs";
+import { ADMIN_UI_SOURCES } from "./generate-admin-ui-assets.mjs";
 import { runReleasePreflight } from "./release-preflight.mjs";
 
 // Renamed from DEPLOY_CONTAINED_PRODUCTION on 2026-08-07: production deploys
@@ -48,10 +49,7 @@ const PRODUCTION_PUBLIC_SURFACE_FORBIDDEN_PATHS = Object.freeze([
   "/data-client.js",
   "/navigation.js",
   "/admin",
-  "/admin.html",
-  "/admin.js",
-  "/admin-client.js",
-  "/admin.css",
+  ...ADMIN_UI_SOURCES.map(({ route }) => route),
   "/api/v1/admin/community/allowance-preview",
 ]);
 const PRODUCTION_PUBLIC_ROOT_FORBIDDEN_MARKERS = Object.freeze([
