@@ -5210,6 +5210,11 @@ async function createDashboardStartupHarness({
     boundedOutcomeDetailCode: () => null,
     observeContributionDisconnectPause() {},
     runsInsideNativeDashboard: () => true,
+    // The extracted startup harness exercises the loader without evaluating
+    // Electron's launch coordinator. Keep that path explicitly inert so the
+    // optional onboarding callback remains faithful to the browser/native
+    // readiness tests.
+    startElectronStartupRefresh: () => false,
     setJourneyState(value) { state.journey = value; },
     scheduleIncrementalSyncStatusPoll() { state.polls += 1; },
     scheduleReturningUserRefresh() { state.returnRefreshChecks += 1; },

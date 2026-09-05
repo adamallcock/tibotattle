@@ -14,7 +14,7 @@ function productionFunction(name) {
   return match[0];
 }
 
-function refreshHarness({ rejection = null, native = false } = {}) {
+function refreshHarness({ rejection = null, native = false, electron = false, bridge = undefined } = {}) {
   const calls = [];
   const notices = [];
   const timers = [];
@@ -30,6 +30,9 @@ function refreshHarness({ rejection = null, native = false } = {}) {
     lastReindexProgressReceipt: null,
     returnRefreshScheduled: false,
     returnRefreshDeferrals: 0,
+    electronStartupRefreshTriggered: false,
+    ELECTRON_REFRESH_LIFECYCLE_SIGNAL_TIMEOUT_MS: 1_000,
+    tibotattleDesktop: bridge,
     $: (selector) => {
       if (!buttons.has(selector)) buttons.set(selector, {
         textContent: "Refresh",
@@ -47,9 +50,11 @@ function refreshHarness({ rejection = null, native = false } = {}) {
     currentHistoryContinuationDecision: () => ({ terminalGap: false }),
     localAnalysisAllowed: () => true,
     runsInsideNativeDashboard: () => native,
+    runsInsideElectronDashboard: () => electron,
     updateLocalActionButtons() {},
     setGlobalState() {},
     setTimeout: (resolve) => resolve(),
+    clearTimeout() {},
     window: { setTimeout: (callback) => timers.push(callback) },
     showConnectionNotice: (notice) => notices.push(notice),
     refreshNeedsContinuation: () => false,
@@ -58,6 +63,7 @@ function refreshHarness({ rejection = null, native = false } = {}) {
     describeFailure: async () => { calls.push("diagnostic"); return { text: "An update could not be started." }; },
     t: (key) => translate(key, {}, "en-US"),
   });
+  runInContext(productionFunction("signalElectronRefreshLifecycle"), context);
   runInContext(productionFunction("requestRefresh"), context);
   runInContext(productionFunction("scheduleReturningUserRefresh"), context);
   return { context, calls, notices, timers, buttons, priorDashboard };
@@ -100,6 +106,63 @@ test("the shared default and automatic browser return refresh stay quick", async
   native.context.scheduleReturningUserRefresh();
   assert.deepEqual(native.timers, [], "the native host retains sole cadence ownership");
   assert.deepEqual(native.calls, []);
+});
+
+test("Electron startup performs one guarded quick refresh after readiness", async () => {
+  const harness = refreshHarness({ electron: true });
+  runInContext(productionFunction("startElectronStartupRefresh"), harness.context);
+
+  assert.equal(harness.context.startElectronStartupRefresh(), true);
+  assert.equal(harness.context.electronStartupRefreshTriggered, true);
+  assert.equal(harness.context.startElectronStartupRefresh(), false);
+  await new Promise(setImmediate);
+
+  assert.deepEqual(harness.calls, ["quick", "status", "reload"]);
+  assert.equal(harness.context.localActionBusy, false);
+  assert.equal(harness.context.localRefreshInProgress, false);
+});
+
+test("qualified Electron startup waits for the preload smoke barrier", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const harness = refreshHarness({ electron: true });
+  harness.context.__TIBOTATTLE_ELECTRON_MACOS_SMOKE__ = {
+    version: "v1",
+    waitForStartupRefresh: () => gate,
+  };
+  runInContext(productionFunction("startElectronStartupRefresh"), harness.context);
+
+  assert.equal(harness.context.startElectronStartupRefresh(), true);
+  await new Promise(setImmediate);
+  assert.deepEqual(harness.calls, [], "the renderer waits for qualified observation");
+
+  release();
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  assert.deepEqual(harness.calls, ["quick", "status", "reload"]);
+});
+
+test("accepted Electron refreshes acquire and settle the main-process lease", async () => {
+  const lifecycle = [];
+  const harness = refreshHarness({
+    electron: true,
+    bridge: {
+      refreshStarted() {
+        lifecycle.push("started");
+        return 41;
+      },
+      refreshSettled({ lease }) {
+        lifecycle.push(["settled", lease]);
+        return true;
+      },
+    },
+  });
+
+  await harness.context.requestRefresh();
+  await new Promise(setImmediate);
+
+  assert.deepEqual(harness.calls, ["quick", "status", "reload"]);
+  assert.deepEqual(lifecycle, ["started", ["settled", 41]]);
 });
 
 test("an initial controller conflict is informational and cannot queue detailed work", async () => {

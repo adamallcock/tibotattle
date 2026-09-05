@@ -429,6 +429,12 @@ let localRefreshCancelRequested = false;
 let archiveHistoryScanActive = false;
 let returnRefreshScheduled = false;
 let returnRefreshDeferrals = 0;
+// Electron's main process owns the recurring cadence. A renderer refresh must
+// hand it a bounded lease after the companion accepts the POST, otherwise a
+// one-shot timer can fire again while the same accounting pass is still
+// running. The controller watchdog remains the outer safety bound.
+const ELECTRON_REFRESH_LIFECYCLE_SIGNAL_TIMEOUT_MS = 1_000;
+let electronStartupRefreshTriggered = false;
 let globalState = null;
 let visibleConnectionNotice = null;
 let dashboardUnavailableState = null;
@@ -11646,8 +11652,10 @@ async function loadLocalDashboardSecondaryState({ isCurrent, primaryAvailable })
   const onboarding = read(() => localClient.onboarding(), (value) => {
     if (value === null) return;
     renderLocalOnboarding(value);
-    // Bootstrap may have finished before this verdict arrived. Preserve the
-    // browser's existing return-visit cadence; the native shell owns its own.
+    // Bootstrap may have finished before this verdict arrived. Electron's
+    // launch pass is gated on this readiness verdict, so retry it here before
+    // preserving the browser's return-visit cadence.
+    startElectronStartupRefresh();
     scheduleReturningUserRefresh();
   });
   const refresh = read(() => localClient.refreshStatus(), (refreshState) => {
@@ -11865,6 +11873,61 @@ function scheduleReindexAutoContinuation() {
   }, REINDEX_AUTO_CONTINUE_DELAY_MS);
 }
 
+/**
+ * Notify Electron main that a renderer-owned refresh has crossed its accepted
+ * POST boundary, or that the leased pass reached a terminal state. The
+ * renderer never waits indefinitely for cadence bookkeeping: a delayed start
+ * response is settled after the renderer finishes through the late-value
+ * callback below.
+ */
+function signalElectronRefreshLifecycle(action, args = [], options = {}) {
+  if (!runsInsideElectronDashboard()) return Promise.resolve(null);
+  const bridge = globalThis.tibotattleDesktop;
+  if (typeof bridge?.[action] !== "function" || !Array.isArray(args)) {
+    return Promise.resolve(null);
+  }
+  const onLateValue = typeof options?.onLateValue === "function"
+    ? options.onLateValue
+    : null;
+  let call;
+  try {
+    call = Promise.resolve(bridge[action](...args));
+  } catch {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    let timedOut = false;
+    const reportLateValue = (value) => {
+      if (!onLateValue) return;
+      try {
+        onLateValue(value);
+      } catch {
+        // Cadence cleanup is best effort and must not affect the refresh.
+      }
+    };
+    const timer = setTimeout(() => {
+      settled = true;
+      timedOut = true;
+      resolve(null);
+    }, ELECTRON_REFRESH_LIFECYCLE_SIGNAL_TIMEOUT_MS);
+    call.then((value) => {
+      if (settled) {
+        if (timedOut) reportLateValue(value);
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    }, () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(null);
+    });
+  });
+}
+
 async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
   if (localActionBusy) return;
   // Fence continuation against the exact coverage visible before this pass.
@@ -11887,10 +11950,24 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
     return;
   }
   const button = $("#refresh-button");
+  const electronRefresh = runsInsideElectronDashboard();
   let refreshAccepted = false;
   let cancelled = false;
   let quickResultLoaded = false;
   let continuationLimitReached = false;
+  let refreshStartSignal = Promise.resolve(null);
+  let lateRefreshLease = null;
+  let refreshLifecycleFinished = false;
+  const handleLateRefreshLease = (lease) => {
+    if (!Number.isSafeInteger(lease) || lease <= 0) return;
+    if (!refreshLifecycleFinished) {
+      lateRefreshLease = lease;
+      return;
+    }
+    // The renderer may finish while the main-process start reply is still
+    // crossing its bounded bridge timeout. Settle that late lease directly.
+    void signalElectronRefreshLifecycle("refreshSettled", [{ lease }]);
+  };
   localActionBusy = true;
   localRefreshInProgress = true;
   localRefreshCancelRequested = false;
@@ -11905,6 +11982,15 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       ? localClient.recalculateDetailedAccounting()
       : localClient.refresh());
     refreshAccepted = true;
+    if (electronRefresh) {
+      // Do not delay status polling on cadence bookkeeping. A late lease is
+      // settled from the finally block or its callback above.
+      refreshStartSignal = signalElectronRefreshLifecycle(
+        "refreshStarted",
+        [],
+        { onLateValue: handleLateRefreshLease },
+      );
+    }
     let activePassStartedMs = Date.now();
     const pollingBudget = createRefreshPollingBudget();
     let consecutiveStatusFailures = 0;
@@ -12152,6 +12238,14 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       showDemo: !dashboard
     });
   } finally {
+    if (electronRefresh && refreshAccepted) {
+      let lease = await refreshStartSignal;
+      if (!Number.isSafeInteger(lease) || lease <= 0) lease = lateRefreshLease;
+      if (Number.isSafeInteger(lease) && lease > 0) {
+        await signalElectronRefreshLifecycle("refreshSettled", [{ lease }]);
+      }
+      refreshLifecycleFinished = true;
+    }
     const wasArchiveScanning = archiveHistoryScanActive;
     archiveHistoryScanActive = false;
     if (wasArchiveScanning && dashboard) renderPricing(dashboard);
@@ -12237,6 +12331,49 @@ async function reloadLocalEvidenceAfterNativeRefresh() {
   }
 }
 
+/**
+ * Start Electron's one launch-time refresh after the local onboarding verdict
+ * is available. The qualified smoke preload may hold this call behind its
+ * CDP observation barrier; ordinary Electron renderers have no such bridge.
+ */
+function startElectronStartupRefresh() {
+  if (electronStartupRefreshTriggered
+      || !runsInsideElectronDashboard()
+      || !localAnalysisAllowed()) {
+    return false;
+  }
+  electronStartupRefreshTriggered = true;
+  const macSmokeBridge = globalThis.__TIBOTATTLE_ELECTRON_MACOS_SMOKE__;
+  const windowsSmokeBridge = globalThis.__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__;
+  // A mixed or stale preload must not choose one platform barrier silently.
+  const smokeBridge = macSmokeBridge !== undefined
+    && windowsSmokeBridge !== undefined
+    ? null
+    : windowsSmokeBridge !== undefined
+      ? windowsSmokeBridge
+      : macSmokeBridge;
+  if (smokeBridge !== undefined) {
+    if (smokeBridge === null
+        || smokeBridge.version !== "v1"
+        || typeof smokeBridge.waitForStartupRefresh !== "function") {
+      return true;
+    }
+    let gate;
+    try {
+      gate = smokeBridge.waitForStartupRefresh();
+    } catch {
+      return true;
+    }
+    if (!gate || typeof gate.then !== "function") return true;
+    void Promise.resolve(gate).then(() => {
+      void requestRefresh();
+    }).catch(() => {});
+    return true;
+  }
+  void requestRefresh();
+  return true;
+}
+
 function scheduleReturningUserRefresh() {
   // The native macOS shell owns the foreground cadence. Running both the web
   // return-visit timer and the native timer races the same bounded companion
@@ -12244,6 +12381,7 @@ function scheduleReturningUserRefresh() {
   // What the shell owes in return is a signal when its refresh finished, which
   // `tibotattle:local-evidence-updated` carries.
   if (runsInsideNativeDashboard()) return;
+  if (runsInsideElectronDashboard() && electronStartupRefreshTriggered) return;
   const priorEvidence = dashboard?.mode !== "demo"
     && Boolean(
       dashboard?.activity?.lastScanAt
@@ -12976,6 +13114,15 @@ function isTransientSignInRelayError(error) {
 function runsInsideNativeDashboard() {
   return document.documentElement.classList.contains("native-dashboard")
     || document.body?.classList.contains("native-dashboard");
+}
+
+// Electron's preload stamps this marker before the dashboard module runs. It
+// is separate from the native macOS marker because Electron's main process
+// owns refresh cadence and the browser/native return scheduler must stand down
+// for it as well.
+function runsInsideElectronDashboard() {
+  return document.documentElement.classList.contains("electron-dashboard")
+    || document.body?.classList.contains("electron-dashboard");
 }
 
 function openHostedSignInInBrowser(authorizeUrl) {
@@ -15527,6 +15674,7 @@ async function bootstrapDashboard() {
   renderHostedIdentity();
   updateLocalActionButtons();
   await loadLocalDashboard();
+  startElectronStartupRefresh();
   if (
     localCompanionHealth === null
     || localCompanionHealth?.capabilities?.centralServiceProxy === true
