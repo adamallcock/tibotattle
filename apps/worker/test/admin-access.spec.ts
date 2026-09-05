@@ -7,7 +7,8 @@ import { clearAdminAccessJwksCacheForTests } from "../src/admin-access";
 import {
   warmAdminCommunityAllowancePreviewCache,
 } from "../src/admin-community-allowance";
-import { adminHostname } from "../src/admin-ui";
+import { ADMIN_SURFACE_PATHS, adminHostname } from "../src/admin-ui";
+import { ADMIN_UI_ASSETS } from "../src/admin-ui.generated";
 import { handleRequest } from "../src/index";
 
 interface TestBindings extends Env {
@@ -171,13 +172,8 @@ describe("admin hostname derivation", () => {
 describe("admin surface hostname gating", () => {
   it("keeps the public origin's deliberate 404 for every admin path", async () => {
     const runtimeEnv = adminSurfaceBindings();
-    for (const path of [
-      "/admin",
-      "/admin.html",
-      "/admin.js",
-      "/admin-client.js",
-      "/admin.css",
-    ]) {
+    expect(ADMIN_SURFACE_PATHS).toContain("/telemetry-shared.generated.js");
+    for (const path of ADMIN_SURFACE_PATHS) {
       const response = await handleRequest(
         new Request(`${PUBLIC_ORIGIN}${path}`),
         runtimeEnv,
@@ -234,15 +230,17 @@ describe("admin surface hostname gating", () => {
   });
 
   it("rejects admin-host requests without an Access assertion", async () => {
-    const response = await handleRequest(
-      new Request(`${ADMIN_ORIGIN}/admin.html`),
-      adminSurfaceBindings(),
-    );
-    expect(response.status).toBe(403);
-    expect(response.headers.get("cache-control")).toBe("no-store");
-    await expect(response.json()).resolves.toMatchObject({
-      error: { code: "ACCESS_REQUIRED" },
-    });
+    for (const path of ADMIN_SURFACE_PATHS) {
+      const response = await handleRequest(
+        new Request(`${ADMIN_ORIGIN}${path}`),
+        adminSurfaceBindings(),
+      );
+      expect(response.status, path).toBe(403);
+      expect(response.headers.get("cache-control"), path).toBe("no-store");
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "ACCESS_REQUIRED" },
+      });
+    }
   });
 
   it("rejects invalid Access assertions with 403 and no detail", async () => {
@@ -304,6 +302,11 @@ describe("admin surface hostname gating", () => {
         /projectAdminOverview|adminResponseError/u,
       ],
       ["/admin.css", "text/css; charset=utf-8", /admin/u],
+      [
+        "/telemetry-shared.generated.js",
+        "text/javascript; charset=utf-8",
+        /ADMIN_MODEL_CONFIG/u,
+      ],
     ];
     for (const [path, contentType, marker] of expectations) {
       const response = await handleRequest(
@@ -318,6 +321,23 @@ describe("admin surface hostname gating", () => {
       expect(response.headers.get("x-robots-tag"), path)
         .toBe("noindex, nofollow");
       expect(await response.text(), path).toMatch(marker);
+    }
+    for (const [path, asset] of Object.entries(ADMIN_UI_ASSETS)) {
+      for (const method of ["GET", "HEAD"]) {
+        const response = await handleRequest(
+          new Request(`${ADMIN_ORIGIN}${path}`, {
+            method,
+            headers: { "cf-access-jwt-assertion": token },
+          }),
+          runtimeEnv,
+        );
+        expect(response.status, `${method} ${path}`).toBe(200);
+        expect(response.headers.get("content-type"), path).toBe(asset.contentType);
+        expect(response.headers.get("cache-control"), path).toBe("no-store");
+        expect(await response.text(), `${method} ${path}`).toBe(
+          method === "HEAD" ? "" : asset.content,
+        );
+      }
     }
   });
 

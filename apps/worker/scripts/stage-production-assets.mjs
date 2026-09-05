@@ -18,6 +18,7 @@ import {
   PUBLIC_RELEASE_SOURCE_COMMIT_PATTERN,
   verifyPublicReleaseSourceProvenance,
 } from "../../../scripts/public-release-provenance.js";
+import { ADMIN_UI_SHARED_SOURCES } from "./generate-admin-ui-assets.mjs";
 
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 export const REPOSITORY_ROOT = resolve(SCRIPT_DIRECTORY, "../../..");
@@ -75,6 +76,7 @@ const LOCAL_ONLY_BASENAMES = Object.freeze([
   "community.html",
   "data-client.js",
   "navigation.js",
+  "telemetry-shared.generated.js",
 ]);
 const PUBLIC_ROUTE_MARKERS = Object.freeze([
   "./app.js",
@@ -105,6 +107,10 @@ const PUBLIC_ROUTE_MARKERS = Object.freeze([
   "/admin.html",
   '"admin.html"',
   "'admin.html'",
+  "./telemetry-shared.generated.js",
+  "/telemetry-shared.generated.js",
+  '"telemetry-shared.generated.js"',
+  "'telemetry-shared.generated.js'",
   'id="refresh-button"',
   'id="connect-community"',
   'id="open-installed-app"',
@@ -242,6 +248,11 @@ async function verifiedGeneratedSite(sourceDirectory) {
       throw new Error(
         `Generated public release output must contain ${basename}.`,
       );
+    }
+  }
+  for (const basename of ADMIN_UI_SHARED_SOURCES) {
+    if (!expectedFiles.has(basename)) {
+      throw new Error(`Generated public release output is missing a shared admin dependency: ${basename}.`);
     }
   }
 

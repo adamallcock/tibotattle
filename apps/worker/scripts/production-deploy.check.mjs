@@ -103,6 +103,12 @@ async function immutableSnapshotFixture() {
   }
 
   const generatedFiles = {
+    "styles.css": "body { color: green; }\n",
+    "ui-format.js": "export const format = true;\n",
+    "localization.js": "export const localization = true;\n",
+    "i18n.generated.js": "export const catalog = {};\n",
+    "community-data.js": "export const data = true;\n",
+    "community-view.js": "export const view = true;\n",
     "community.js": "console.log('snapshot community');\n",
     "index.html": '<script type="module" src="./community.js"></script>\n',
     "robots.txt": "User-agent: *\nAllow: /\nSitemap: https://example.test/sitemap.xml\n",
@@ -1279,7 +1285,11 @@ test("production public-surface recheck requires a public root and real 404s for
   assert.equal(calls[2].url, PUBLIC_SITEMAP_URL);
   assert.equal(calls[3].url, PUBLIC_WWW_ROOT_URL);
   assert.equal(calls[3].request.redirect, "manual");
-  assert.equal(calls.length, 13);
+  assert.equal(calls.length, 14);
+  assert.equal(calls.some(({ url }) => url === new URL(
+    "/telemetry-shared.generated.js",
+    PUBLIC_ROOT_URL,
+  ).href), true);
   assert.equal(calls.some(({ url }) => url === new URL(
     "/api/v1/admin/community/allowance-preview",
     PUBLIC_ROOT_URL,
