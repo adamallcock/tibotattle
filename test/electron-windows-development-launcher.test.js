@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdtemp, realpath, readFile, rm } from "node:fs/promises";
 import test from "node:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +23,22 @@ import {
   WINDOWS_ELECTRON_QUALIFICATION_MARKER,
   WINDOWS_ELECTRON_TEST_LANE,
 } from "../apps/electron/windows-qualification.js";
+
+test("Windows development distribution wrapper is self-contained", async () => {
+  const wrapper = await readFile(
+    new URL("../scripts/launch-electron-windows-development.cmd", import.meta.url),
+    "utf8",
+  );
+  assert.match(wrapper, /^@echo off\r?\n/u);
+  assert.match(wrapper, /set "APP=%~dp0win-unpacked\\TiboTattle Dev\.exe"/u);
+  assert.match(wrapper, /set "LAUNCHER=%~dp0TiboTattle-Windows-Development-Launcher\.mjs"/u);
+  assert.match(wrapper, /set "PROFILE=%LOCALAPPDATA%\\TiboTattle\\electron-user-test\\win32-x64\\profile"/u);
+  assert.match(wrapper, /set "ELECTRON_RUN_AS_NODE=1"/u);
+  assert.match(wrapper, /"%APP%" "%LAUNCHER%" --app "%APP%" --profile "%PROFILE%"/u);
+  assert.match(wrapper, /set "ELECTRON_RUN_AS_NODE="/u);
+  assert.match(wrapper, /exit \/b %EXIT_CODE%/u);
+  assert.doesNotMatch(wrapper, /(?:--)?source|(?:^|[\\/])node(?:\.exe)?\b/iu);
+});
 
 test("Windows development launcher parses one absolute app and isolated profile", () => {
   assert.equal(LAUNCHER_BINDING_PATH, WINDOWS_ELECTRON_BINDING_RELATIVE_PATH);

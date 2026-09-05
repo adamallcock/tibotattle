@@ -303,7 +303,7 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  // 109 records / 111 executable paths: release-documentation, Codex contract,
+  // 110 records / 111 executable paths: release-documentation, Codex contract,
   // documentation governance, repository-layout, macOS bundle-version, and
   // local index-recovery gates are reviewed repository operations invoked by
   // CI, release runbooks, or supported internal product tooling.
@@ -313,7 +313,7 @@ test("the checked-in inventory classifies every retained tool entry point and np
   // plus the isolated macOS real-history profile and Linux launcher.
   // Includes the reviewed exact-output accounting child benchmark and eight
   // protected PR94 qualification entrypoints/helpers; neither is a product API.
-  assert.equal(result.records, 109);
+  assert.equal(result.records, 110);
   assert.equal(result.candidates.length, 111);
   assert.ok(result.aliases >= 25);
 });
