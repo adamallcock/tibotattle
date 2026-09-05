@@ -60,6 +60,7 @@ module.exports = {
   appId: "com.adamallcock.tibotattle.electron.dev",
   productName: "TiboTattle Dev",
   artifactName: "TiboTattle-Dev-${version}-${os}-${arch}.${ext}",
+  icon: path.join(repositoryRoot, "apps/web/public/tibotattle-icon.png"),
   directories: {
     app: appDirectory,
     output: artifactDirectory,

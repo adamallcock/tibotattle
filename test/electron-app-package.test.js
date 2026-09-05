@@ -265,6 +265,7 @@ test("Electron builder configuration maps every development target to its native
     assert.match(config.directories.output, expectation.artifact, target);
     assert.equal(config.publish, null, target);
     assert.equal(config.artifactName, "TiboTattle-Dev-${version}-${os}-${arch}.${ext}", target);
+    assert.match(config.icon, /apps[\\/]web[\\/]public[\\/]tibotattle-icon\.png$/u, target);
     assert.deepEqual(config.asarUnpack.filter((value) => value.includes("keytar.node")), [
       `node_modules/@github/keytar/prebuilds/${expectation.keytar}/keytar.node`,
     ], target);
