@@ -26,6 +26,7 @@ import {
   classifyMacSettingsPersistenceEvidence,
   isMacDashboardTarget,
   isMacSettingsTarget,
+  isMacTrayPopoverTarget,
   observeLocalRefreshRequests,
   selectMacDashboardTarget,
   selectMacSettingsTarget,
@@ -33,6 +34,32 @@ import {
 } from "../scripts/smoke-electron-macos.mjs";
 
 const TEST_SOURCE_REVISION = "a".repeat(40);
+
+test("tray capture binds the transient page to its owned debugging endpoint", () => {
+  const origin = "http://127.0.0.1:54321";
+  const target = {
+    type: "page",
+    url: `${origin}/electron-tray-popup.html`,
+    webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/page/popup",
+  };
+  assert.equal(isMacTrayPopoverTarget(target, origin, 9222), true);
+  for (const webSocketDebuggerUrl of [
+    "ws://127.0.0.1:9223/devtools/page/popup",
+    "ws://localhost:9222/devtools/page/popup",
+    "ws://user@127.0.0.1:9222/devtools/page/popup",
+    "ws://127.0.0.1:9222/devtools/page/popup?other=1",
+    "wss://127.0.0.1:9222/devtools/page/popup",
+  ]) assert.equal(isMacTrayPopoverTarget({ ...target, webSocketDebuggerUrl }, origin, 9222), false);
+  assert.equal(isMacTrayPopoverTarget({ ...target, type: "worker" }, origin, 9222), false);
+  for (const url of [
+    "https://example.com/electron-tray-popup.html",
+    "http://127.0.0.1:54322/electron-tray-popup.html",
+    `${origin}/electron-settings.html`,
+    `${origin}/electron-tray-popup.html?redirect=other`,
+    `${origin}/electron-tray-popup.html#other`,
+    "data:text/html;charset=utf-8,synthetic",
+  ]) assert.equal(isMacTrayPopoverTarget({ ...target, url }, origin, 9222), false);
+});
 const TEST_ARTIFACT_SHA256 = "b".repeat(64);
 const TEST_RECEIPT_IDENTITY = Object.freeze({
   sourceRevision: TEST_SOURCE_REVISION,

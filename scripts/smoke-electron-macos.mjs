@@ -11,6 +11,8 @@
  * staging directory or a different architecture.
  * Optional --screenshot captures only this script's disposable synthetic
  * renderer, before clean quit, for visual inspection of the exact package.
+ * Optional --tray-screenshot also opens the owned tray popup, captures its
+ * synthetic renderer, and checks that its Open action reaches the main process.
  */
 
 import { execFileSync, spawn } from "node:child_process";
@@ -1797,6 +1799,84 @@ export function selectMacSettingsTarget(targets, dashboardOrigin, debugPort) {
   return targets.find((target) => isMacSettingsTarget(target, dashboardOrigin, debugPort));
 }
 
+export function isMacTrayPopoverTarget(target, dashboardOrigin, debugPort) {
+  if (target?.type !== "page"
+      || typeof target.url !== "string"
+      || !isExactMacLoopbackOrigin(dashboardOrigin)
+      || !Number.isInteger(debugPort) || debugPort < 1 || debugPort > 65_535) return false;
+  try {
+    const page = new URL(target.url);
+    const websocket = new URL(target.webSocketDebuggerUrl);
+    return page.origin === dashboardOrigin
+      && page.pathname === "/electron-tray-popup.html"
+      && page.username === "" && page.password === ""
+      && page.search === "" && page.hash === ""
+      && websocket.protocol === "ws:"
+      && websocket.hostname === "127.0.0.1"
+      && websocket.port === String(debugPort)
+      && /^\/devtools\/page\/[^/]+$/u.test(websocket.pathname)
+      && websocket.username === "" && websocket.password === ""
+      && websocket.search === "" && websocket.hash === "";
+  } catch {
+    return false;
+  }
+}
+
+async function captureTrayPopover({ child, port, dashboardOrigin, screenshotPath, sourceRevision, artifactSha256 }) {
+  if (!child.kill("SIGUSR1")) fail("ELECTRON_MACOS_SMOKE_TRAY_SHOW_FAILED", "dashboard");
+  let popup = null;
+  try {
+    const target = await waitFor(async () => {
+      const targets = await jsonFetch(`http://127.0.0.1:${port}/json/list`);
+      return Array.isArray(targets) && targets.length <= 16
+        ? targets.find((candidate) => isMacTrayPopoverTarget(candidate, dashboardOrigin, port))
+        : null;
+    }, MAX_OPERATION_MS, "owned tray popup target");
+    popup = await connectCdp(target);
+    const presentation = await waitFor(async () => {
+      const value = await popup.evaluate(`(() => ({
+        bridge: globalThis.tibotattleTrayPopover?.version === "v1",
+        ready: document.documentElement.dataset.trayPopupReady === "true",
+        visible: document.visibilityState === "visible",
+        open: Boolean(document.querySelector('[data-action="open"]')),
+        refresh: Boolean(document.querySelector('[data-action="refresh"]')),
+        weeklyPace: Boolean(document.querySelector("#pace-state")),
+        history: Boolean(document.querySelector("#history-bars")),
+        coverage: Boolean(document.querySelector("#history-coverage")?.textContent.trim()),
+        rangeCount: document.querySelectorAll("[data-history-range]").length,
+        width: innerWidth,
+        height: innerHeight,
+        horizontalOverflow: document.documentElement.scrollWidth > innerWidth + 1,
+      }))()`);
+      return value?.bridge && value.ready && value.visible && value.open && value.refresh
+        && value.weeklyPace && value.history && value.coverage && value.rangeCount === 2
+        && value.width > 0 && value.width <= 480
+        && value.height > 0 && !value.horizontalOverflow ? value : null;
+    }, MAX_OPERATION_MS, "tray popup renderer");
+    for (const range of ["30d", "7d"]) {
+      await popup.evaluate(`document.querySelector('[data-history-range="${range}"]').click()`);
+      await waitFor(() => popup.evaluate(`document.querySelector('[data-history-range="${range}"]')?.getAttribute("aria-pressed") === "true"`),
+        MAX_OPERATION_MS, "tray history range selection");
+    }
+    const capture = await popup.request("Page.captureScreenshot", {
+      format: "png", captureBeyondViewport: false,
+    });
+    const png = Buffer.from(capture.data, "base64");
+    await writeFile(screenshotPath, png, { flag: "wx", mode: 0o600 });
+    await popup.evaluate(`document.querySelector('[data-action="open"]').click()`);
+    await waitFor(() => popup.evaluate(`document.visibilityState === "hidden"`),
+      MAX_OPERATION_MS, "tray Open action and main-process dismissal");
+    await writeFile(`${screenshotPath}.json`, `${JSON.stringify({
+      schemaVersion: "tibotattle-electron-tray-rendered-smoke-v1",
+      sourceRevision, artifactSha256,
+      screenshotSha256: createHash("sha256").update(png).digest("hex"),
+      status: "passed", presentation, historyRanges: ["7d", "30d"], openActionDismissed: true,
+    }, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+  } finally {
+    popup?.close();
+  }
+}
+
 async function assertShareFlow(cdp) {
   const share = await waitFor(async () => {
     const snapshot = await cdp.evaluate(`(() => {
@@ -2362,6 +2442,7 @@ async function runSmoke(appPath, progress = {}, {
   sourceRevision,
   artifactSha256,
   screenshotPath = null,
+  trayScreenshotPath = null,
 } = {}) {
   await assertPackagedMacApp(appPath);
   const fixture = await createSyntheticFixture();
@@ -2576,6 +2657,11 @@ async function runSmoke(appPath, progress = {}, {
         mode: 0o600,
       });
     }
+    if (trayScreenshotPath !== null) {
+      stage = "dashboard";
+      await captureTrayPopover({ child, port, dashboardOrigin: dashboardUrl.origin, screenshotPath: trayScreenshotPath,
+        sourceRevision, artifactSha256 });
+    }
     cdp.close();
     cdp = null;
     stage = "quit";
@@ -2641,6 +2727,10 @@ if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
   const screenshotPath = screenshotIndex >= 0
     ? resolve(process.argv[screenshotIndex + 1] ?? "")
     : null;
+  const trayScreenshotIndex = process.argv.indexOf("--tray-screenshot");
+  const trayScreenshotPath = trayScreenshotIndex >= 0
+    ? resolve(process.argv[trayScreenshotIndex + 1] ?? "")
+    : null;
   const progress = {};
   let verifiedArtifactSha256 = null;
   let receipt;
@@ -2660,6 +2750,7 @@ if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
       sourceRevision,
       artifactSha256: verifiedArtifactSha256,
       screenshotPath,
+      trayScreenshotPath,
     });
     process.stdout.write(`${JSON.stringify(receipt, null, 2)}\n`);
   } catch (error) {
