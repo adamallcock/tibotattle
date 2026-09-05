@@ -23,7 +23,7 @@
  */
 
 import { createHash, timingSafeEqual } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, mkdtempSync, rmSync } from "node:fs";
 import {
   chmod,
   lstat,
@@ -44,6 +44,7 @@ import {
   resolve,
   sep,
 } from "node:path";
+import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -377,6 +378,40 @@ function databaseStructureDigest(database) {
       + "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
   ).all();
   return createHash("sha256").update(JSON.stringify(schema)).digest("hex");
+}
+
+let currentUnifiedIndexStructureDigest;
+
+/**
+ * Return the exact schema digest produced by this checkout's current writer.
+ *
+ * The handoff receipt deliberately records the digest observed at copy time,
+ * but the packaged runtime may apply a supported forward migration before
+ * the next launch. Comparing only with that receipt would brick a durable
+ * profile after an otherwise valid migration. Build a tiny disposable
+ * current-schema reference instead; this remains a closed allowlist because
+ * every table, constraint, index and SQL definition still has to match the
+ * reviewed writer schema byte-for-byte. No source state is opened or changed.
+ */
+function currentRuntimeUnifiedIndexStructureDigest() {
+  if (typeof currentUnifiedIndexStructureDigest === "string") {
+    return currentUnifiedIndexStructureDigest;
+  }
+  const directory = mkdtempSync(join(
+    tmpdir(),
+    "tibotattle-electron-real-history-schema-",
+  ));
+  let database;
+  try {
+    database = openLocalUnifiedIndex(join(directory, INDEX_NAME), { create: true });
+    currentUnifiedIndexStructureDigest = databaseStructureDigest(database);
+    return currentUnifiedIndexStructureDigest;
+  } catch {
+    fail("ELECTRON_REAL_HISTORY_PROFILE_SOURCE_SCHEMA_INVALID");
+  } finally {
+    database?.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 }
 
 function configureReadOnlyDatabase(database) {
@@ -962,9 +997,16 @@ export async function validateRealHistoryProfile(profilePath) {
     validateCopiedDatabase(indexPath, "unified_index", { deep: false }),
     validateCopiedDatabase(collectorPath, "collector_state", { deep: false }),
   ]);
+  const indexDigestMatchesReceipt =
+    index.structureDigest === receipt.nativeState.unifiedIndex.structureDigest;
+  // Older handoff receipts describe the pre-migration SQL text. The copied
+  // index is still launch-safe when it has moved to this checkout's exact
+  // current writer schema; keep rejecting any other post-handoff schema.
+  const indexDigestMatchesCurrentRuntime = !indexDigestMatchesReceipt
+    && index.structureDigest === currentRuntimeUnifiedIndexStructureDigest();
   if (index.schemaVersion !== receipt.nativeState.unifiedIndex.schemaVersion
       || collector.schemaVersion !== receipt.nativeState.collectorState.schemaVersion
-      || index.structureDigest !== receipt.nativeState.unifiedIndex.structureDigest
+      || (!indexDigestMatchesReceipt && !indexDigestMatchesCurrentRuntime)
       || collector.structureDigest !== receipt.nativeState.collectorState.structureDigest) {
     fail("ELECTRON_REAL_HISTORY_PROFILE_HANDOFF_INVALID");
   }

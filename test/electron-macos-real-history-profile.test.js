@@ -196,6 +196,30 @@ test("a later durable profile write remains launch-valid without touching source
   assert.deepEqual(await readFile(fixture.saltFile), await readFile(profile.saltPath));
 });
 
+test("a supported runtime schema migration can refresh a stale receipt without widening the gate", async (t) => {
+  const fixture = await makeSyntheticState(t);
+  await prepareRealHistoryProfile(fixture);
+  const receiptPath = join(fixture.profilePath, "profile-handoff-v1.json");
+  const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+  // Model a profile prepared by the prior writer, then opened by the current
+  // packaged writer. The exact receipt digest remains copy provenance, while
+  // the current database is checked against the current writer schema.
+  receipt.nativeState.unifiedIndex.structureDigest = "a".repeat(64);
+  await writeFile(receiptPath, `${JSON.stringify(receipt)}\n`);
+  await assert.doesNotReject(() => validateRealHistoryProfile(fixture.profilePath));
+
+  const database = new DatabaseSync(join(
+    fixture.profilePath,
+    "state/local-unified-index-v1.sqlite",
+  ));
+  database.exec("ALTER TABLE meta ADD COLUMN qa_unrecognized TEXT");
+  database.close();
+  await assert.rejects(
+    () => validateRealHistoryProfile(fixture.profilePath),
+    (error) => error.code === "ELECTRON_REAL_HISTORY_PROFILE_HANDOFF_INVALID",
+  );
+});
+
 test("a recognized pre-current index migrates only inside the private profile", async (t) => {
   const fixture = await makeSyntheticState(t, { legacyIndex: true });
   const source = new DatabaseSync(fixture.indexFile, { readOnly: true });
