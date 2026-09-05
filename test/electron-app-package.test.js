@@ -276,6 +276,7 @@ test("Electron builder configuration maps every development target to its native
     );
     if (target === "linux-x64") {
       assert.equal(config.linux.category, "Utility");
+      assert.equal(config.linux.syncDesktopName, true);
       // electron-builder 26 otherwise supplies a legacy --no-sandbox default
       // for AppImage desktop entries when executableArgs is omitted.
       assert.deepEqual(config.linux.executableArgs, []);

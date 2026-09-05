@@ -112,6 +112,7 @@ module.exports = {
     main: "apps/electron/main.js",
     name: "app-usagemonitor",
     productName: "TiboTattle Dev",
+    desktopName: "com.adamallcock.tibotattle.electron.dev.desktop",
   },
   forceCodeSigning: false,
   // The staged app deliberately has no lockfile. Returning false from the
@@ -153,6 +154,7 @@ if (linuxTarget) {
     target: [{ target: "dir", arch: [targetSpec.architecture] }],
     category: "Utility",
     executableName: "tibotattle-dev",
+    syncDesktopName: true,
     // Passing an explicit empty list prevents electron-builder 26's legacy
     // AppImage default from adding --no-sandbox to the desktop entry. The
     // packaged runtime still owns the separate refusal path if its launcher

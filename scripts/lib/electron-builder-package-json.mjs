@@ -14,6 +14,7 @@ export const ELECTRON_BUILDER_PACKAGE_PROFILES = Object.freeze({
     main: "apps/electron/main.js",
     name: "app-usagemonitor",
     productName: "TiboTattle Dev",
+    desktopName: "com.adamallcock.tibotattle.electron.dev.desktop",
   }),
   "windows-production": Object.freeze({
     main: "apps/electron/main.js",
@@ -90,6 +91,7 @@ export function transformElectronBuilderPackageJsonBytes(
       main: selectedProfile.main,
       name: selectedProfile.name,
       productName: selectedProfile.productName,
+      ...(selectedProfile.desktopName ? { desktopName: selectedProfile.desktopName } : {}),
       version: packageVersion,
     })) {
       data[property] = value;

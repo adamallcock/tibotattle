@@ -46,6 +46,7 @@ test("canonicalizes the Electron root package with the selected fixed profile", 
   );
 
   assert.equal(JSON.parse(development).productName, "TiboTattle Dev");
+  assert.equal(JSON.parse(development).desktopName, "com.adamallcock.tibotattle.electron.dev.desktop");
   assert.equal(JSON.parse(production).productName, "TiboTattle");
   assert.equal(JSON.parse(production).version, VERSION);
   assert.equal(development.toString("utf8").endsWith("\n"), false);
@@ -161,6 +162,7 @@ test("matches pinned app-builder-lib 26.15.7 for the development profile", async
         main: "apps/electron/main.js",
         name: "app-usagemonitor",
         productName: "TiboTattle Dev",
+        desktopName: "com.adamallcock.tibotattle.electron.dev.desktop",
         version: VERSION,
       },
     );
