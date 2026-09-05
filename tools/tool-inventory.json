@@ -109,6 +109,7 @@
         "scripts/package-macos-dmg.js",
         "scripts/release-macos-app.js",
         "scripts/validate-macos-install.js",
+        "scripts/validate-macos-login-item-release.js",
         "scripts/verify-macos-preview-remote.js",
         "test/browser-module-serving-parity.test.js",
         "test/macos-app-bundle.test.js",

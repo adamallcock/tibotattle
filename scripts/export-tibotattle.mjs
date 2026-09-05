@@ -386,6 +386,7 @@ export const CLIENT_SCRIPT_FILES = Object.freeze([
   "scripts/prepare-sparkle-framework.js",
   "scripts/release-macos-app.js",
   "scripts/validate-macos-install.js",
+  "scripts/validate-macos-login-item-release.js",
   "scripts/validate-macos-replacement.js",
 ]);
 
