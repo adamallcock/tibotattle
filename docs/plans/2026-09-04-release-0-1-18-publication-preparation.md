@@ -73,24 +73,39 @@ native suite passes 110/110. The complete Worker gate passes 183 script tests,
 the explicit production dry run also passes. The installed Codex contract
 remains current on both available channels at CLI `0.153.0-alpha.5` with 17
 PlanType values. No test skips, remote writes or installation are inferred.
-Fresh copy-only v14 and R7 evidence remain pending.
+Fresh R7 evidence remains pending. The subsequent copy-only v14 semantic review
+and its distinct static-snapshot/active-append proofs are recorded in the
+[installed-upgrade review](../reviews/2026-09-04-installed-upgrade-readiness.md).
 
-The new copy-only verifier requires an owner decision after safety review
+The new copy-only verifier required an owner decision after safety review
 refused correcting a draft assertion. The shared `model` dimension is unique
 by `model_id` and retains its first recognition label; it cannot prove an
 individual event's missing-versus-unrecognized state. The proposed replacement
 requires missing model evidence from exact-occurrence seedless extraction and
 an unknown stored model identity, with all counter/effort/tier/preservation
-checks retained. The draft stricter assertion remains unchanged pending owner
-approval. This is a verifier limitation, not permission to modify stored facts
-or claim completed rehearsal. Independent R7 regeneration is also held after
+checks retained. The owner subsequently explicitly approved that correction,
+fresh local R7 regeneration and receipt replacement, then signing and installed
+qualification up to publication readiness. The approved helper correction is
+now applied; it does not modify stored facts or waive any retention, counter,
+effort or tier check. Independent R7 regeneration previously stopped after
 the exact attempted operation on clean `c955fed1` was refused before execution:
-safety review requires fresh explicit authorization for reading the private
-corpus and replacing the ten receipts on this corrected source. No retry or
-workaround was attempted. All ten receipt bytes remain identical to HEAD,
-there is no installation journal, no v14 rehearsal clone exists, and no RC3
-DMG exists. Source tests do not waive either approval or the downstream
-signed/installed/manual/hardware/publication gates.
+safety review required fresh explicit authorization for reading the private
+corpus and replacing the ten receipts on this corrected source. No workaround
+was attempted. The fresh owner approval resolves those authority blockers.
+The v14 isolated-copy ingestion preserves every historical occurrence and
+source-coverage bound. All model/effort/tier and nullable-component changes have
+now been independently explained and checked against exact raw occurrences.
+Three actively appended sources have separate retained-prefix semantic proof;
+their earlier non-passing static-snapshot result has not been relabeled. The
+coordinator approved the exact generation's hash-bound semantic report. Copy-only
+accounting completes in 71 seconds, publishing and reading back a v0.15 cache
+bound to exact v14 generation 70 with complete source coverage and no skipped
+sources. Original backup, cloned index, unrelated clone state and all four
+speed-baseline windows remain unchanged; no network or credential operation
+occurs. R7 regeneration is next. No RC3 DMG has been created yet.
+Publication remains held. Signing-key prompt approval, changes to
+real credential protection, physical/manual proof and external deployment are
+not inferred from source tests or this continuation.
 
 The [hosted lineage review](../reviews/2026-09-04-hosted-migration-lineage-reconciliation.md)
 records a separate live deployment blocker. Production applied the historical
