@@ -37,9 +37,11 @@ and approval-review hold on changing the default.
 Continuation authorized on 2026-09-04: finish reconciliation with the latest
 native 0.1.18 changes and controls, provide a durable Electron app the owner can
 test, and prepare packaging for all four targets. The integration baseline is
-native commit `645cd250`, merged locally as `970af98f`. This includes the
-combined RC2 Astra/Intel work, compressed-history support and paginated-export
-fixes. GitHub PRs and remote references were refreshed before selecting it.
+native commit `6731e6d4`, merged locally as `7c9f2727`. This includes the
+combined Astra/Intel work, compressed-history support, paginated-export fixes,
+the parser-v14 exact-history inheritance correction and RC3 upgrade deadlines.
+GitHub PRs and remote references were refreshed before selecting the release
+lineage; the active local release checkout was checked again at each freeze.
 Open PRs are evaluated for relevant product changes; their presence alone does
 not authorize adopting unrelated research or obsolete implementations.
 
@@ -217,8 +219,9 @@ Do not fabricate participants, consent events, sessions or browser pairings.
 The reviewed development packager and exact-artifact verifier were restored
 from the retained Electron branch, with both sharing modules added to their
 closed source inventories. This avoids a parallel packaging implementation.
-The current packager still targets development macOS arm64 and Windows x64;
-restoration does not qualify the other target artifacts.
+At this historical milestone the restored packager targeted development macOS
+arm64 and Windows x64. The four-target continuation below supersedes that
+packaging limitation.
 
 Second-tranche source commits are `29c99016` (policy and UI), `6971c479`
 (development packaging) and `b4314a1b` (viewport visibility guard). Validation:
@@ -238,6 +241,53 @@ override, with the hosted contribution origin absent. It does not qualify real
 account/credential migration, live uploads, Intel/Windows/Linux, startup-item
 registration, signing/notarization, an installed replacement or an update.
 Host HOME was preserved; this is not whole-process Keychain isolation.
+
+### Four-target continuation: current implementation and acceptance
+
+One development packager now handles all four target tuples, with explicit
+platform/architecture artifact names, clean-commit provenance, complete ASAR
+and native-executable checks, bounded logs and SHA-256 receipts. The manual
+native-runner workflow uses the same command and pinned dependencies. It has no
+signing or publication authority. Windows builds its security binding from the
+current source on the Windows runner; a retained older binary cannot substitute
+for that build.
+
+Verified development distributions have been produced locally for both Mac
+architectures (DMG and ZIP) and Linux x64 (AppImage and tar.gz). These initial
+artifacts exposed two runtime regressions before handoff: missing startup
+refresh and a scrubbed `ELECTRON_RUN_AS_NODE` switch in the accounting child.
+The final candidate must include both repairs and pass an actual packaged
+refresh. Initial distribution receipts alone do not close that runtime gate.
+
+The Linux AppImage dependency has a small pinned patch that removes its
+implicit sandbox bypass; executable launcher tests cover the actual installed
+template. Linux cross-packaging on this Mac is artifact evidence. It does not
+establish desktop, Secret Service, tray or installed lifecycle behavior on
+Linux. Windows installer production remains pending a native Windows build.
+
+The tester profile copies retained derived databases through SQLite read-only
+backup, preserves the matching index salt and uses a separate development
+export identity. Native writable state and native credential storage are not
+the tester profile. Repeated launches must accept normal changes to those
+private copies. The launch command must bind the selected app to its exact
+ASAR digest and keep hosted contribution unavailable.
+
+Current validation includes 546/546 Worker Vitest tests, 59/59 migration and
+staging contract tests, 426/426 Electron/local tests before the final runtime
+repairs, 78/78 release trust checks and 20/20 preflight tests. Focused runtime,
+parser-v14 and final package results belong in the candidate's retained
+receipts. The last complete root run had 4,041 tests, with five failures: two
+source inventory/API documentation omissions were repaired and rechecked,
+one tool inventory entry was concurrent work, and the two historical R7
+provenance checks remain unqualified. No historical receipt was rewritten.
+
+Remaining release gates are explicit: exact Windows distributions, rendered
+final Mac inspection, physical target runtime checks, production signing,
+installed state/credential migration and first update, and accountless upload
+ownership/scheduling. Sharing controls already implement the accepted policy;
+they truthfully report unavailable uploads until the transport integration is
+qualified. Claude remains a provider inside this same product and packaging
+matrix.
 Rendered notice and Settings captures plus the content-free runtime and
 artifact receipts are retained under the ignored
 `.release-build/electron-sharing-qa-viewport-final/evidence/` directory.

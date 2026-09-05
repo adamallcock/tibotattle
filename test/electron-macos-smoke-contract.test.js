@@ -937,6 +937,48 @@ test("macOS parity evidence rejects empty Usage rows and hidden legacy Community
     classifyMacDashboardParityEvidence({ health, usage, community }),
     { status: "passed", reason: null },
   );
+  const accountlessHealth = { capabilities: {
+    centralServiceProxy: false,
+    contributionDevicePairing: false,
+    incrementalContributionSync: false,
+  } };
+  const accountlessCommunity = {
+    route: "#community",
+    pageVisible: true,
+    accountlessMode: true,
+    accountlessPanel: true,
+    accountlessPreferenceReady: true,
+    accountlessState: true,
+    accountlessTransport: true,
+    sharingSettingsEnabled: true,
+    legacyJourneyVisible: false,
+    googleButton: false,
+    appleButton: false,
+    googleButtonEnabled: false,
+    appleButtonEnabled: false,
+    consentVisible: false,
+    partialHistoryDetail: false,
+  };
+  const accountlessEvidence = { health: accountlessHealth, usage, community: accountlessCommunity };
+  assert.deepEqual(classifyMacDashboardParityEvidence(accountlessEvidence),
+    { status: "passed", reason: null });
+  for (const key of ["accountlessPanel", "accountlessPreferenceReady", "accountlessState",
+    "accountlessTransport", "sharingSettingsEnabled"]) {
+    assert.deepEqual(classifyMacDashboardParityEvidence({
+      ...accountlessEvidence, community: { ...accountlessCommunity, [key]: false },
+    }), { status: "failed", reason: "community" }, key);
+  }
+  for (const key of ["legacyJourneyVisible", "googleButton", "appleButton",
+    "googleButtonEnabled", "appleButtonEnabled", "consentVisible"]) {
+    assert.deepEqual(classifyMacDashboardParityEvidence({
+      ...accountlessEvidence, community: { ...accountlessCommunity, [key]: true },
+    }), { status: "failed", reason: "community" }, key);
+  }
+  assert.deepEqual(classifyMacDashboardParityEvidence({ ...accountlessEvidence, health }),
+    { status: "failed", reason: "community" }, "accountless mode cannot retain hosted upload authority");
+  assert.deepEqual(classifyMacDashboardParityEvidence({
+    ...accountlessEvidence, startupRefresh: { terminalStatus: "degraded" },
+  }), { status: "failed", reason: "community" }, "hidden legacy partial detail is not visible disclosure");
   assert.deepEqual(
     classifyMacDashboardParityEvidence({
       health: {
@@ -1139,7 +1181,7 @@ test("closed macOS receipt is content-free and has no runtime identifiers", () =
       canvas: true,
     },
   });
-  assert.equal(receipt.schemaVersion, "tibotattle-electron-macos-smoke-v3");
+  assert.equal(receipt.schemaVersion, "tibotattle-electron-macos-smoke-v4");
   assert.equal(receipt.status, "passed");
   assert.equal(receipt.cleanQuit, true);
   assert.equal(receipt.contentFree, true);

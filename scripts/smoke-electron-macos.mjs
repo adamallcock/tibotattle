@@ -51,7 +51,7 @@ const MAX_STARTUP_MS = 30_000;
 const MAX_OPERATION_MS = 10_000;
 const MAX_REFRESH_MS = 45_000;
 const MAX_SHUTDOWN_MS = 10_000;
-const MACOS_SMOKE_SCHEMA_VERSION = "tibotattle-electron-macos-smoke-v3";
+const MACOS_SMOKE_SCHEMA_VERSION = "tibotattle-electron-macos-smoke-v4";
 const MACOS_SMOKE_CONTROL = "quit-v1";
 const MACOS_LOCAL_QA_TEST_LANE = "macos-electron-local-qa-v1";
 const REQUIRED_APP_NAME = "TiboTattle Dev";
@@ -1396,6 +1396,25 @@ function usageParitySnapshotValid(snapshot) {
 }
 
 function communityParitySnapshotValid(snapshot, health, { requirePartialDetail = false } = {}) {
+  if (snapshot?.accountlessMode === true) {
+    return health?.capabilities?.centralServiceProxy === false
+      && health?.capabilities?.contributionDevicePairing === false
+      && health?.capabilities?.incrementalContributionSync === false
+      && snapshot.route === "#community"
+      && snapshot.pageVisible === true
+      && snapshot.accountlessPanel === true
+      && snapshot.accountlessPreferenceReady === true
+      && snapshot.accountlessState === true
+      && snapshot.accountlessTransport === true
+      && snapshot.sharingSettingsEnabled === true
+      && snapshot.legacyJourneyVisible === false
+      && snapshot.googleButton === false
+      && snapshot.appleButton === false
+      && snapshot.googleButtonEnabled === false
+      && snapshot.appleButtonEnabled === false
+      && snapshot.consentVisible === false
+      && (!requirePartialDetail || snapshot.partialHistoryDetail === true);
+  }
   const serviceConfigured = health?.capabilities?.centralServiceProxy === true
     && health?.capabilities?.contributionDevicePairing === true
     && health?.capabilities?.incrementalContributionSync
@@ -1531,7 +1550,7 @@ async function assertDashboardParitySurfaces(cdp, health, startupRefresh = {}) {
   }
 
   const community = await waitFor(async () => {
-    const snapshot = await cdp.evaluate(`(() => {
+    const snapshot = await cdp.evaluate(`(async () => {
       const visible = ${visible.toString()};
       document.querySelector('[data-nav="community"]')?.click();
       const page = document.querySelector('#community[data-dashboard-page="community"]');
@@ -1540,14 +1559,34 @@ async function assertDashboardParitySurfaces(cdp, health, startupRefresh = {}) {
         ?.textContent?.trim() ?? '';
       const nextAction = document.querySelector('#identity-signin-next');
       const consent = document.querySelector('#incremental-consent');
+      const bridge = globalThis.tibotattleDesktop;
+      const accountlessMode = bridge?.version === 'v1'
+        && typeof bridge.getSharingPreference === 'function'
+        && document.documentElement.classList.contains('electron-accountless-sharing');
+      const preference = accountlessMode ? await bridge.getSharingPreference() : null;
+      const sharingState = document.querySelector('#electron-accountless-community-state');
+      const transport = document.querySelector('#electron-accountless-community-transport');
+      const settings = document.querySelector('#electron-accountless-open-settings');
       return {
         route: location.hash,
         pageVisible: visible(page) && page?.inert !== true,
+        accountlessMode,
+        accountlessPanel: visible(document.querySelector('#electron-accountless-community')),
+        accountlessPreferenceReady: preference?.available === true && preference?.current === true,
+        accountlessState: visible(sharingState)
+          && (sharingState?.textContent?.trim() ?? '').length > 0
+          && !(sharingState?.textContent ?? '').includes('preference unavailable'),
+        accountlessTransport: visible(transport)
+          && ['off', 'unavailable'].includes(preference?.transportStatus)
+          && /uploads are not available|sharing is off/iu.test(transport?.textContent ?? ''),
+        sharingSettingsEnabled: visible(settings) && settings.disabled !== true,
+        legacyJourneyVisible: visible(document.querySelector('#community-journey')),
         journeyStageCount: document.querySelectorAll('#community-journey .journey-stage').length,
         indexTerminal: document.querySelector('#journey-stage-index')
           ?.classList?.contains('journey-stage-done') === true,
         indexDetail: indexDetail.length > 0,
-        partialHistoryDetail: /partial|quarantined/iu.test(indexDetail),
+        partialHistoryDetail: /partial|quarantined/iu.test(indexDetail)
+          && (!accountlessMode || visible(document.querySelector('#journey-stage-index-detail'))),
         googleButton: visible(document.querySelector('#identity-google-signin')),
         appleButton: visible(document.querySelector('#identity-apple-signin')),
         googleButtonEnabled: (() => {
@@ -1616,9 +1655,13 @@ async function assertDashboardParitySurfaces(cdp, health, startupRefresh = {}) {
         && health?.capabilities?.incrementalContributionSync
           === "telemetry-contribution-v1.0",
       journeyStageCount: community.journeyStageCount,
-      currentLayout: true,
-      providerControls: true,
-      indexTerminal: true,
+      currentLayout: community.accountlessMode === true ? community.accountlessPanel : community.currentLayout,
+      providerControls: community.googleButton === true && community.appleButton === true,
+      accountlessControls: community.accountlessMode === true
+        && community.sharingSettingsEnabled === true
+        && community.accountlessPreferenceReady === true,
+      transportUnavailable: community.accountlessMode === true && community.accountlessTransport === true,
+      indexTerminal: community.accountlessMode !== true && community.indexTerminal === true,
       partialHistoryDetail: community.partialHistoryDetail,
     }),
   });
@@ -2229,6 +2272,8 @@ export function buildClosedReceipt({
           : 0,
         currentLayout: parity.community?.currentLayout === true,
         providerControls: parity.community?.providerControls === true,
+        accountlessControls: parity.community?.accountlessControls === true,
+        transportUnavailable: parity.community?.transportUnavailable === true,
         indexTerminal: parity.community?.indexTerminal === true,
         partialHistoryDetail: parity.community?.partialHistoryDetail === true,
       }),
