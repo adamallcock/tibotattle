@@ -26,6 +26,10 @@ test("desktop commands contain only the fixed presentation vocabulary", () => {
     command: "dashboardSection",
     section: "timeline",
   });
+  assert.deepEqual(createDesktopCommand("dashboardSection", "accounting"), {
+    command: "dashboardSection",
+    section: "accounting",
+  });
   assert.deepEqual(createDesktopCommand("language", "zh-Hans"), {
     command: "language",
     value: "zh-Hans",
@@ -58,7 +62,6 @@ test("desktop commands reject selectors, paths, URLs, extra keys, and prototypes
     { command: "refresh", selector: "#refresh-button" },
     { command: "automaticRefresh", mode: "quick", reason: "unexpected" },
     { command: "automaticRefresh", mode: "background" },
-    { command: "dashboardSection", section: "accounting" },
     { command: "dashboardSection", section: "#weekly" },
     { command: "dashboardSection", section: "weekly", path: "/private/secret" },
     { command: "navigate", value: "https://attacker.example" },
@@ -83,7 +86,6 @@ test("desktop commands reject selectors, paths, URLs, extra keys, and prototypes
     () => createDesktopCommand("shareCardDownloadFailed", { path: "/private/download.png" }),
     TypeError,
   );
-  assert.throws(() => createDesktopCommand("dashboardSection", "accounting"), TypeError);
   assert.throws(() => createDesktopCommand("dashboardSection"), TypeError);
   assert.throws(() => createDesktopCommand("automaticRefresh"), TypeError);
   assert.throws(() => createDesktopCommand("automaticRefresh", "background"), TypeError);

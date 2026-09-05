@@ -62,14 +62,14 @@ function fakeDocument(settingsButton = fakeButton()) {
   };
 }
 
-test("native navigation accepts only the weekly and timeline destinations", () => {
+test("native navigation accepts only the fixed dashboard destinations", () => {
   const { windowRef } = fakeWindow();
   assert.equal(navigateToDashboardSection({}, windowRef, "weekly"), true);
   assert.equal(windowRef.location.hash, "#weekly");
   assert.equal(navigateToDashboardSection({}, windowRef, "timeline"), true);
   assert.equal(windowRef.location.hash, "#timeline");
-  assert.equal(navigateToDashboardSection({}, windowRef, "accounting"), false);
-  assert.equal(windowRef.location.hash, "#timeline");
+  assert.equal(navigateToDashboardSection({}, windowRef, "accounting"), true);
+  assert.equal(windowRef.location.hash, "#accounting");
   assert.equal(navigateToDashboardSection({}, windowRef, "#weekly"), false);
   assert.equal(navigateToDashboardSection({}, {}, "weekly"), false);
 });
@@ -85,9 +85,9 @@ test("desktop command bridge navigates the dashboard through the fixed section m
   commandListeners[0]({ command: "dashboardSection", section: "timeline" });
   assert.equal(windowRef.location.hash, "#timeline");
   commandListeners[0]({ command: "dashboardSection", section: "accounting" });
-  assert.equal(windowRef.location.hash, "#timeline");
+  assert.equal(windowRef.location.hash, "#accounting");
   commandListeners[0]({ command: "dashboardSection", section: "weekly", path: "/private/secret" });
-  assert.equal(windowRef.location.hash, "#timeline");
+  assert.equal(windowRef.location.hash, "#accounting");
 
   mounted.teardown();
   await Promise.resolve();

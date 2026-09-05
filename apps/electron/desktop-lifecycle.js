@@ -1,4 +1,5 @@
 import { dirname, resolve } from "node:path";
+import { existsSync } from "node:fs";
 
 import {
   createLoopbackNavigationPolicy,
@@ -13,6 +14,11 @@ import {
   installDesktopApplicationMenu,
 } from "./desktop-menu.js";
 import { createDesktopTrayTemplate } from "./desktop-tray.js";
+import {
+  createDesktopTrayPopover,
+  createDesktopTrayPopoverModel,
+  TRAY_POPOVER_PRELOAD_FILE,
+} from "./desktop-tray-popover.js";
 import {
   createRecoveryWindow,
   RECOVERY_STATUSES,
@@ -65,6 +71,7 @@ export function createDesktopLifecycle({
   BrowserWindow,
   Tray,
   Menu,
+  screen,
   supervisor,
   preloadPath,
   icon,
@@ -79,6 +86,7 @@ export function createDesktopLifecycle({
   settingsWindowOptions = {},
   recoveryWindowOptions = {},
   recoveryPreloadPath,
+  trayPopoverWindowOptions = {},
   ownedDownloadsRegistry = null,
   singleInstanceLockAcquired = false,
   onDashboardReady,
@@ -133,6 +141,7 @@ export function createDesktopLifecycle({
   let settingsWindow = null;
   let recovery = null;
   let tray = null;
+  let trayPopover = null;
   let applicationMenu = null;
   let desktopActionInterface = null;
   let activeDesktopLocale = desktopLocale;
@@ -348,7 +357,7 @@ export function createDesktopLifecycle({
   // and existing projections; the main process only requests a fixed hash
   // after bringing the dashboard window to the front.
   function navigateDashboardSection(section) {
-    if (section !== "weekly" && section !== "timeline") return false;
+    if (section !== "weekly" && section !== "timeline" && section !== "accounting") return false;
     if (!showWindow()) return false;
     return sendDashboardCommand({ command: "dashboardSection", section });
   }
@@ -604,6 +613,80 @@ export function createDesktopLifecycle({
     return false;
   }
 
+  function currentTrayPopoverModel() {
+    return createDesktopTrayPopoverModel({
+      appName,
+      trayStatus: desktopTrayStatus,
+      locale: activeDesktopLocale,
+      systemLocales: desktopSystemLocales,
+    });
+  }
+
+  function invokeTrayPopoverAction(action) {
+    const actions = getDesktopActionInterface();
+    let selected = null;
+    if (action === "open") selected = actions.show;
+    else if (action === "weekly") selected = actions.weekly;
+    else if (action === "timeline") selected = actions.timeline;
+    else if (action === "accounting") selected = actions.accounting;
+    else if (action === "settings") selected = actions.settings;
+    else if (action === "quit") selected = actions.quit;
+    else if (action === "refresh") {
+      selected = desktopTrayStatus?.status === "unavailable"
+        ? actions.retry
+        : actions.refresh;
+    }
+    if (typeof selected !== "function") return false;
+    try {
+      const result = selected();
+      result?.catch?.(() => {});
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function createTrayPopover() {
+    if (trayPopover !== null || typeof BrowserWindow !== "function") return trayPopover;
+    const selectedPreloadPath = resolve(dirname(preloadPath), TRAY_POPOVER_PRELOAD_FILE);
+    // Keep plain-Node lifecycle compositions and old development staging
+    // trees on the existing menu path until the reviewed preload is present.
+    if (!existsSync(selectedPreloadPath)
+        || !isExactLoopbackOrigin(ready?.origin)) return null;
+    const selectedPageURL = new URL(
+      "/electron-tray-popup.html",
+      `${ready.origin}/`,
+    ).href;
+    try {
+      trayPopover = createDesktopTrayPopover({
+        BrowserWindow,
+        preloadPath: selectedPreloadPath,
+        pageURL: selectedPageURL,
+        origin: ready.origin,
+        tray,
+        screen,
+        platform,
+        model: currentTrayPopoverModel(),
+        onAction: invokeTrayPopoverAction,
+        windowOptions: trayPopoverWindowOptions,
+      });
+    } catch {
+      trayPopover = null;
+    }
+    return trayPopover;
+  }
+
+  function destroyTrayPopover() {
+    trayPopover?.destroy?.();
+    trayPopover = null;
+  }
+
+  function showTrayPopover(bounds) {
+    const selectedPopover = trayPopover ?? createTrayPopover();
+    if (selectedPopover === null) return false;
+    return selectedPopover.show(bounds) === true;
+  }
+
   function getDesktopActionInterface() {
     if (desktopActionInterface !== null) return desktopActionInterface;
     const suppliedActions = desktopActions === null
@@ -618,6 +701,7 @@ export function createDesktopLifecycle({
       refresh: suppliedActions.refresh ?? (() => sendDashboardCommand({ command: "refresh" })),
       weekly: suppliedActions.weekly ?? (() => navigateDashboardSection("weekly")),
       timeline: suppliedActions.timeline ?? (() => navigateDashboardSection("timeline")),
+      accounting: suppliedActions.accounting ?? (() => navigateDashboardSection("accounting")),
       toggleSidebar: suppliedActions.toggleSidebar ?? (() => false),
       retry: suppliedActions.retry ?? (() => retry()),
       settings: suppliedActions.settings ?? (() => showSettingsWindow()),
@@ -1010,7 +1094,14 @@ export function createDesktopLifecycle({
     tray.setContextMenu?.(menu);
     const projected = desktopTrayStatusReducer.project();
     tray.setTitle?.(platform === "darwin" ? projected.compactTitle : "");
-    tray.on?.("click", () => invokeTrayCommand("toggle"));
+    tray.on?.("click", (_event, bounds) => {
+      const selectedPopover = trayPopover ?? createTrayPopover();
+      if (selectedPopover?.toggle(bounds) === true) return;
+      invokeTrayCommand("toggle");
+    });
+    // Electron opens the context menu for the native secondary click. Hiding
+    // the visual surface first keeps the two tray affordances from stacking.
+    tray.on?.("right-click", () => trayPopover?.hide?.());
     return tray;
   }
 
@@ -1049,6 +1140,7 @@ export function createDesktopLifecycle({
       tray.setContextMenu?.(Menu.buildFromTemplate(template));
       const projected = desktopTrayStatusReducer.project();
       tray.setTitle?.(platform === "darwin" ? projected.compactTitle : "");
+      trayPopover?.setModel(currentTrayPopoverModel());
     }
   }
 
@@ -1166,6 +1258,7 @@ export function createDesktopLifecycle({
       destroyWindow();
       destroySettingsWindow();
       destroyRecoveryWindow();
+      destroyTrayPopover();
       tray?.destroy?.();
       tray = null;
       await supervisor.stop().catch(() => {});
@@ -1187,6 +1280,7 @@ export function createDesktopLifecycle({
     const operation = enqueueExclusive(async () => {
       if (quitting || epoch !== lifecycleEpoch) throw shellError("companion_busy");
       stopDesktopStatusMonitor();
+      destroyTrayPopover();
       destroyWindow();
       destroySettingsWindow();
       showRecoveryWindow("starting");
@@ -1253,6 +1347,7 @@ export function createDesktopLifecycle({
     automaticRetryUsed = true;
     const epoch = lifecycleEpoch;
     ready = null;
+    destroyTrayPopover();
     // Invalidate the old webview synchronously before queueing the restart, so
     // no stale origin remains usable while the child is being replaced.
     destroyWindow();
@@ -1308,6 +1403,7 @@ export function createDesktopLifecycle({
       destroyWindow();
       destroySettingsWindow();
       destroyRecoveryWindow();
+      destroyTrayPopover();
       // The supervisor owns the child created during its bounded startup
       // handshake. Wait for that handshake to settle before allowing Electron
       // to exit; otherwise a child that has not emitted its ready line could
@@ -1331,6 +1427,7 @@ export function createDesktopLifecycle({
       destroyWindow();
       destroySettingsWindow();
       destroyRecoveryWindow();
+      destroyTrayPopover();
       tray?.destroy?.();
       tray = null;
       await supervisor.stop().catch(() => {});
@@ -1362,6 +1459,7 @@ export function createDesktopLifecycle({
     openDashboardInBrowser,
     dispose,
     createWindow,
+    showTrayPopover,
     isAuthorizedDesktopSender,
     isAuthorizedDesktopFrame,
     isAuthorizedDashboardSender,

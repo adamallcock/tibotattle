@@ -483,6 +483,13 @@ if (process.versions.electron) {
       if (lifecycle !== null
           && process.platform !== "win32"
           && process.env.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL === ELECTRON_SMOKE_CONTROL) {
+        // This signal is installed only for the explicit local smoke lane. It
+        // asks the lifecycle to open the validated loopback popup route, so
+        // the harness can inspect the real tray renderer without accepting a
+        // renderer-controlled URL or exposing a production command.
+        process.once("SIGUSR1", () => {
+          lifecycle.showTrayPopover?.();
+        });
         process.once("SIGUSR2", () => {
           void lifecycle.requestQuit().catch(() => {
             process.exitCode = 1;

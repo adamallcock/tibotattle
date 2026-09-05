@@ -78,7 +78,7 @@ test("semantic tray states project fixed status copy in every supported locale",
       assert.equal(template[0].label, expectedTitle);
       assert.equal(template[1].label, expected);
       assert.equal(template[1].enabled, false);
-      const action = template[6];
+      const action = template[7];
       const [actionLabel, actionEnabled] = actionStates[locale][status];
       assert.equal(action.label, actionLabel);
       assert.equal(action.enabled ?? true, actionEnabled);
@@ -114,7 +114,7 @@ test("tray refresh control follows companion lifecycle and avoids overlap", () =
       actions,
       trayStatus: { status, allowance: null, notificationEvidence: null },
     });
-    const control = template[6];
+    const control = template[7];
     assert.equal(control.label, expectedLabel);
     assert.equal(control.enabled ?? true, expectedEnabled);
     if (expectedCall === null) {
@@ -163,6 +163,7 @@ test("fresh direct evidence projects compact title, evidence age, and quota lane
     "Open TiboTattle Dev",
     "Weekly Allowance",
     "Usage Timeline",
+    "Usage and Costs",
     "Update Local Usage",
     "Check for Updates…",
     "Settings…",
@@ -276,6 +277,7 @@ test("default and legacy label callers remain bounded and preserve action identi
     "Open TiboTattle Dev",
     "Weekly Allowance",
     "Usage Timeline",
+    "Usage and Costs",
     "Retry",
     "Check for Updates…",
     "Settings…",
@@ -287,6 +289,7 @@ test("default and legacy label callers remain bounded and preserve action identi
     ["Open TiboTattle Dev", "show"],
     ["Weekly Allowance", "weekly"],
     ["Usage Timeline", "timeline"],
+    ["Usage and Costs", "accounting"],
     ["Retry", "retry"],
     ["Settings…", "settings"],
     ["About TiboTattle Dev", "about"],

@@ -21,6 +21,7 @@ const DESKTOP_LANGUAGE_BY_PICKER_VALUE = Object.freeze(
 const DASHBOARD_SECTION_HASHES = Object.freeze({
   weekly: "#weekly",
   timeline: "#timeline",
+  accounting: "#accounting",
 });
 const mountedDocuments = new WeakMap();
 

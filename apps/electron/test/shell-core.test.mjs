@@ -1701,6 +1701,11 @@ test("desktop lifecycle composes secure window, tray, single instance, retry, an
     channel: "tibotattle:desktop-command:v1",
     command: { command: "dashboardSection", section: "timeline" },
   });
+  trays[0].menu.template.find((item) => item.label === "Usage and Costs").click();
+  assert.deepEqual(firstDashboard.webContents.sent.at(-1), {
+    channel: "tibotattle:desktop-command:v1",
+    command: { command: "dashboardSection", section: "accounting" },
+  });
   trays[0].emit("click");
   assert.equal(lifecycle.state.windowVisible, false);
   trays[0].menu.template.find((item) => item.label === "Open TiboTattle").click();
@@ -3107,6 +3112,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   commandListener({}, { command: "automaticRefresh", mode: "detailed" });
   commandListener({}, { command: "dashboardSection", section: "weekly" });
   commandListener({}, { command: "dashboardSection", section: "timeline" });
+  commandListener({}, { command: "dashboardSection", section: "accounting" });
   commandListener({}, { command: "language", value: "es" });
   commandListener({}, { command: "sidebar", collapsed: true });
   commandListener({}, { command: "hostedSignInReturn" });
@@ -3124,13 +3130,13 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   commandListener({}, { command: "refresh", selector: "#private" });
   commandListener({}, { command: "automaticRefresh", mode: "background" });
   commandListener({}, { command: "automaticRefresh", mode: "quick", extra: true });
-  commandListener({}, { command: "dashboardSection", section: "accounting" });
   assert.deepEqual(JSON.parse(JSON.stringify(commands)), [
     { command: "refresh" },
     { command: "automaticRefresh", mode: "quick" },
     { command: "automaticRefresh", mode: "detailed" },
     { command: "dashboardSection", section: "weekly" },
     { command: "dashboardSection", section: "timeline" },
+    { command: "dashboardSection", section: "accounting" },
     { command: "language", value: "es" },
     { command: "sidebar", collapsed: true },
     { command: "hostedSignInReturn" },

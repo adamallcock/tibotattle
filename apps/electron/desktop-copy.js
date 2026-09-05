@@ -426,6 +426,11 @@ const DESKTOP_MESSAGES = Object.freeze({
     "zh-Hans": "使用时间线",
     es: "Cronología de uso",
   }),
+  "electron.menu.accounting": Object.freeze({
+    "en-US": "Usage and Costs",
+    "zh-Hans": "使用情况与成本",
+    es: "Uso y costos",
+  }),
   "electron.menu.toggleSidebar": Object.freeze({
     "en-US": "Toggle Sidebar",
     "zh-Hans": "切换侧边栏",
@@ -465,6 +470,11 @@ const DESKTOP_MESSAGES = Object.freeze({
     "en-US": "Usage Timeline",
     "zh-Hans": "使用时间线",
     es: "Cronología de uso",
+  }),
+  "electron.tray.accounting": Object.freeze({
+    "en-US": "Usage and Costs",
+    "zh-Hans": "使用情况与成本",
+    es: "Uso y costos",
   }),
   "electron.tray.allowanceTitle": Object.freeze({
     "en-US": "{appName} · {allowance} allowance",
@@ -550,6 +560,31 @@ const DESKTOP_MESSAGES = Object.freeze({
     "en-US": "Quit {appName}",
     "zh-Hans": "退出 {appName}",
     es: "Salir de {appName}",
+  }),
+  "electron.trayPopover.title": Object.freeze({
+    "en-US": "{appName} usage overview",
+    "zh-Hans": "{appName} 使用概览",
+    es: "Resumen de uso de {appName}",
+  }),
+  "electron.trayPopover.compactLabel": Object.freeze({
+    "en-US": "Allowance remaining",
+    "zh-Hans": "剩余配额",
+    es: "Asignación restante",
+  }),
+  "electron.trayPopover.windowsLabel": Object.freeze({
+    "en-US": "Allowance windows",
+    "zh-Hans": "配额窗口",
+    es: "Ventanas de asignación",
+  }),
+  "electron.trayPopover.noEvidence": Object.freeze({
+    "en-US": "No current allowance evidence is available.",
+    "zh-Hans": "没有可用的当前配额证据。",
+    es: "No hay evidencia actual de asignación disponible.",
+  }),
+  "electron.trayPopover.dashboardHint": Object.freeze({
+    "en-US": "Open the dashboard for weekly pace and detailed retained history.",
+    "zh-Hans": "打开仪表板查看每周进度和保留历史详情。",
+    es: "Abre el panel para ver el ritmo semanal y el historial detallado conservado.",
   }),
 });
 

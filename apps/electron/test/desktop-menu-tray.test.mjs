@@ -88,6 +88,7 @@ test("application menu maps all desktop commands to the injected action interfac
   item(view, "Update Local Usage").click();
   item(view, "Weekly Allowance").click();
   item(view, "Usage Timeline").click();
+  item(view, "Usage and Costs").click();
   item(view, "Toggle Sidebar").click();
   item(view, "Show TiboTattle Dev").click();
   item(view, "Focus TiboTattle Dev").click();
@@ -98,6 +99,7 @@ test("application menu maps all desktop commands to the injected action interfac
     "refresh",
     "weekly",
     "timeline",
+    "accounting",
     "toggleSidebar",
     "show",
     "focus",
@@ -225,6 +227,7 @@ test("tray menu exposes truthful status and shared action callbacks", () => {
     "Open TiboTattle Dev",
     "Weekly Allowance",
     "Usage Timeline",
+    "Usage and Costs",
     "Retry",
     "Check for Updates…",
     "Settings…",
@@ -236,6 +239,7 @@ test("tray menu exposes truthful status and shared action callbacks", () => {
   item(template, "Open TiboTattle Dev").click();
   item(template, "Weekly Allowance").click();
   item(template, "Usage Timeline").click();
+  item(template, "Usage and Costs").click();
   item(template, "Retry").click();
   item(template, "Settings…").click();
   item(template, "About TiboTattle Dev").click();
@@ -244,6 +248,7 @@ test("tray menu exposes truthful status and shared action callbacks", () => {
     "show",
     "weekly",
     "timeline",
+    "accounting",
     "retry",
     "settings",
     "about",

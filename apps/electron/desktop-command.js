@@ -18,7 +18,7 @@ const AUTOMATIC_REFRESH_MODES = Object.freeze(["quick", "detailed"]);
 // These are the only dashboard destinations the native shell may request.
 // Keeping the values closed prevents a menu or tray action from becoming a
 // renderer-controlled selector, path, or URL navigation primitive.
-const DASHBOARD_SECTIONS = Object.freeze(["weekly", "timeline"]);
+const DASHBOARD_SECTIONS = Object.freeze(["weekly", "timeline", "accounting"]);
 
 function plainExactObject(value, keys) {
   if (value === null || typeof value !== "object" || Array.isArray(value)
