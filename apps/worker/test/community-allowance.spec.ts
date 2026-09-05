@@ -1801,6 +1801,10 @@ describe("v1 analyzer scale fix — fit-preserving reduction", () => {
     expect(outputs[1]).toBe(outputs[0]);
   });
 
+  // Fixed-size correctness fixture: 500 seed batches plus two 100k read
+  // passes exceed Vitest's default 5s budget under the complete Worker suite.
+  // This local test budget changes neither production caps nor query-plan
+  // performance assertions, and both exact 100k boundary checks remain below.
   it("bounds the union of retained and pending session clocks at the existing 100k cap", async () => {
     const scenario = await seedPlanEraScenario("session-cap", [{ plan: "pro", offsetMinutes: 0 }]);
     // DROP-only usage still advances clocks. Two timestamps leave 50k prior
@@ -1824,7 +1828,7 @@ describe("v1 analyzer scale fix — fit-preserving reduction", () => {
       createdAt: `${scenario.day}T21:00:00.000Z`, records: [row(100_000)] });
     expect(await accountScopedQuotaAnalysisV1(db(), scenario.participantId, { nowMs: SCALE_NOW }))
       .toMatchObject({ status: "not_testable", reason: "session_interval_scope_limit_exceeded" });
-  });
+  }, 20_000);
 
   for (const laterPoison of [false, true]) {
     it(`handles composition aggregate overflow without losing later poison evidence (${laterPoison})`, async () => {
