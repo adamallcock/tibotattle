@@ -539,6 +539,21 @@
     },
     {
       "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/launch-electron-windows-development.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Windows development launch is invoked explicitly with an already-built candidate and is not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/electron-windows-development-launcher.test.js"
+      ],
+      "decision": "retain_as_development_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
       "owner": "repository_architecture",
       "canonicalPath": "scripts/lib/application-layout-policy.mjs",
       "stableAlias": null,

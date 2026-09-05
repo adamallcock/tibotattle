@@ -149,6 +149,26 @@ jobs:
         run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js
       - name: Build and verify development distributions
         run: node scripts/package-electron-development.mjs --target win32-x64 --format distribution --replace-staging
+      - name: Add the Windows development launch handoff
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $distribution = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-candidates/${{ github.sha }}/win32-x64/distribution'
+          if (-not (Test-Path -LiteralPath $distribution -PathType Container)) { throw 'WINDOWS_DISTRIBUTION_MISSING' }
+          $handoff = @'
+          TiboTattle Dev Windows development qualification
+
+          This unsigned package is for isolated development testing. It is not a production-ready or supported Windows release.
+
+          Requirements: Windows x64 and Node.js 26.2.0.
+
+          From a checkout of the exact source revision that built this package, run:
+
+          node scripts/launch-electron-windows-development.mjs --app "C:\path\to\TiboTattle Dev.exe"
+
+          The launcher creates a durable private profile, sets the fixed Windows Electron qualification marker, and lets the packaged main process verify its runtime manifest, native binding, and Keytar bytes. An ordinary direct launch may remain unavailable when the qualification context is absent. Do not reuse the installed native app's profile or credentials.
+          '@
+          $handoffPath = Join-Path $distribution 'TiboTattle-Windows-Development-Launch.txt'
+          Set-Content -LiteralPath $handoffPath -Value $handoff -Encoding utf8NoBOM -NoNewline
       - name: Retain verified development packages and receipts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

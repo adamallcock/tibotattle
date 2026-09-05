@@ -77,6 +77,10 @@ test("the development workflow builds each target on a static native runner with
     assert.ok(job.includes(`package-electron-development.mjs --target ${target} --format distribution --replace-staging`));
     assert.ok(job.includes(`/\${{ github.sha }}/${target}/distribution/`));
   }
+  assert.match(workflow, /Add the Windows development launch handoff/u);
+  assert.match(workflow, /TiboTattle-Windows-Development-Launch\.txt/u);
+  assert.match(workflow, /launch-electron-windows-development\.mjs --app/u);
+  assert.match(workflow, /Node\.js 26\.2\.0/u);
   assert.equal((workflow.match(/persist-credentials: false/gu) ?? []).length, 4);
   assert.equal((workflow.match(/if-no-files-found: error/gu) ?? []).length, 4);
   assert.match(workflow, /WINDOWS_BINDING_BUILD_FAILED/u);
