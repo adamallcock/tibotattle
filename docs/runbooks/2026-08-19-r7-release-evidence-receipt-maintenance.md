@@ -113,6 +113,12 @@ without changing product verification, resource limits, or retrying until a
 sample passes. A sampler change invalidates prior workload-source provenance
 and requires the complete protected regeneration, not partial receipt reuse.
 
+Symlink refusals distinguish an unapproved basename, a different owner, fewer
+than one link, and more than two links using fixed outcome labels. These labels
+never include paths, targets or owner identifiers. They do not broaden the
+single explicitly allowed export-lock name or permit a zero-link symlink;
+failure classification alone is not evidence that an entry was safe.
+
 ## Interrupted generation
 
 The generator journals replacement state at the repository root and uses a

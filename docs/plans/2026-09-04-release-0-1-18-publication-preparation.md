@@ -102,7 +102,24 @@ accounting completes in 71 seconds, publishing and reading back a v0.15 cache
 bound to exact v14 generation 70 with complete source coverage and no skipped
 sources. Original backup, cloned index, unrelated clone state and all four
 speed-baseline windows remain unchanged; no network or credential operation
-occurs. R7 regeneration is next. No RC3 DMG has been created yet.
+occurs. The approved R7 generation on clean `49486ba0` completed Node 24
+synthetic semantics, then stopped in synthetic pressure with
+`symlink_rejected`. It exited before receipt replacement; all ten retained
+receipts remain unchanged, and no replacement journal or staging directory
+remains. The failed log and empty summary are preserved. A separate bounded,
+synthetic-only diagnostic observes the unmodified refusal; no unsafe entry is
+accepted merely to obtain a passing run. Full fresh generation remains required.
+That single diagnostic completed all 20 operations across the pressure profile's
+two built-in passes without reproducing the refusal. Its injected refusal control
+passed. A separate 10,000-iteration native synthetic unlink observation also
+found no zero-link result. Neither establishes the original failure's cause or
+supplies release receipts. The subsequent source change distinguishes fixed,
+privacy-safe symlink refusal categories without changing which entries are
+accepted, following links, retrying a refused sample or changing measurements.
+All 97 filesystem/schema/synthetic-evidence tests pass on each pinned runtime,
+including deterministic refusal precedence, redaction and unchanged accepted
+one/two-link observations. Documentation and the 20-test preflight also pass.
+No RC3 DMG has been created yet.
 Publication remains held. Signing-key prompt approval, changes to
 real credential protection, physical/manual proof and external deployment are
 not inferred from source tests or this continuation.
