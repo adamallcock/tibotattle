@@ -77,8 +77,8 @@ function safeBuildLabel(value) {
     : "development";
 }
 
-// The runtime manifest is already an authenticated, content-addressed record
-// of the packaged shell. Read only a small bounded manifest and label its
+// The runtime manifest records content hashes for the packaged shell.
+// Read only a small bounded manifest and label its
 // digest as content-derived so About never presents it as a source revision.
 const MAXIMUM_RUNTIME_MANIFEST_BYTES = 2 * 1024 * 1024;
 
