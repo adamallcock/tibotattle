@@ -10,6 +10,14 @@ import {
 test("desktop commands contain only the fixed presentation vocabulary", () => {
   assert.equal(DESKTOP_COMMAND_CHANNEL, "tibotattle:desktop-command:v1");
   assert.deepEqual(createDesktopCommand("refresh"), { command: "refresh" });
+  assert.deepEqual(createDesktopCommand("automaticRefresh", "quick"), {
+    command: "automaticRefresh",
+    mode: "quick",
+  });
+  assert.deepEqual(createDesktopCommand("automaticRefresh", "detailed"), {
+    command: "automaticRefresh",
+    mode: "detailed",
+  });
   assert.deepEqual(createDesktopCommand("dashboardSection", "weekly"), {
     command: "dashboardSection",
     section: "weekly",
@@ -48,6 +56,8 @@ test("desktop commands reject selectors, paths, URLs, extra keys, and prototypes
   for (const value of [
     null,
     { command: "refresh", selector: "#refresh-button" },
+    { command: "automaticRefresh", mode: "quick", reason: "unexpected" },
+    { command: "automaticRefresh", mode: "background" },
     { command: "dashboardSection", section: "accounting" },
     { command: "dashboardSection", section: "#weekly" },
     { command: "dashboardSection", section: "weekly", path: "/private/secret" },
@@ -75,6 +85,12 @@ test("desktop commands reject selectors, paths, URLs, extra keys, and prototypes
   );
   assert.throws(() => createDesktopCommand("dashboardSection", "accounting"), TypeError);
   assert.throws(() => createDesktopCommand("dashboardSection"), TypeError);
+  assert.throws(() => createDesktopCommand("automaticRefresh"), TypeError);
+  assert.throws(() => createDesktopCommand("automaticRefresh", "background"), TypeError);
+  assert.throws(
+    () => createDesktopCommand("automaticRefresh", "quick", "unexpected"),
+    TypeError,
+  );
   assert.throws(() => createDesktopCommand("sidebar"), TypeError);
   assert.throws(() => createDesktopCommand("appearance", "dark"), TypeError);
 });

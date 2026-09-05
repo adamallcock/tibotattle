@@ -12426,6 +12426,23 @@ function scheduleReturningUserRefresh() {
   }, 750);
 }
 
+/**
+ * Consume only the closed automatic refresh mode sent by the Electron main
+ * process. Manual dashboard controls continue to request detailed accounting;
+ * this event keeps the host-owned foreground cadence explicit in the page.
+ */
+function handleElectronAutomaticRefresh(event) {
+  const detail = event?.detail;
+  if (detail === null
+      || typeof detail !== "object"
+      || Array.isArray(detail)
+      || Object.getPrototypeOf(detail) !== Object.prototype
+      || Reflect.ownKeys(detail).length !== 1
+      || !Object.hasOwn(detail, "mode")
+      || (detail.mode !== "quick" && detail.mode !== "detailed")) return;
+  void requestRefresh({ detailed: detail.mode === "detailed" });
+}
+
 const HOSTED_IDENTITY_ERROR_COPY = {
   IDENTITY_REQUIRED:
     "Hosted participation requires sign-in. Sign in with Google or Apple above, then try again. Nothing was uploaded.",
@@ -15323,6 +15340,7 @@ $("#identity-signout").addEventListener("click", () => {
 $("#identity-signin-check").addEventListener("click", checkHostedSignInNow);
 $("#identity-signin-cancel").addEventListener("click", cancelHostedSignIn);
 window.addEventListener("tibotattle:hosted-sign-in-return", checkHostedSignInNow);
+window.addEventListener("tibotattle:automatic-refresh", handleElectronAutomaticRefresh);
 // Reactivation hooks for the persisted handoff (owner-reported orphaned
 // proof, 2026-08-08): the deep-link return, the page becoming visible again,
 // and the window regaining focus each try to collect a pending sign-in this

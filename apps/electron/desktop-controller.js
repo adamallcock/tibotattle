@@ -18,6 +18,11 @@ const DASHBOARD_COMMANDS = Object.freeze({
 // still allowing a legitimate cold index pass to settle first.
 export const DESKTOP_REFRESH_LEASE_WATCHDOG_MS = 123 * 60_000;
 
+// Native foreground refreshes reserve at most one detailed attempt per hour.
+// Keep this host-side constant separate from the user-configured quick timer:
+// a short cadence must never turn into repeated expensive accounting passes.
+export const DESKTOP_AUTOMATIC_DETAILED_REFRESH_INTERVAL_MS = 60 * 60_000;
+
 const NOTIFICATION_THRESHOLDS = Object.freeze([
   "off",
   "ninety",
@@ -306,6 +311,7 @@ export function createDesktopController({
   revealLocalDataAction = async () => {
     throw controllerError("desktop_local_data_unavailable");
   },
+  clock = () => Date.now(),
   setRecurringTimer = setTimeout,
   clearRecurringTimer = clearTimeout,
 } = {}) {
@@ -382,6 +388,7 @@ export function createDesktopController({
   if (typeof setRecurringTimer !== "function" || typeof clearRecurringTimer !== "function") {
     throw new TypeError("timer functions are required");
   }
+  if (typeof clock !== "function") throw new TypeError("clock is required");
 
   let initialized = false;
   let disposed = false;
@@ -396,6 +403,8 @@ export function createDesktopController({
   let codexHomeRecovery = null;
   let notificationCoordinatorInitialized = false;
   let notificationSafetyFailure = false;
+  let lastAutomaticDetailedAtMs = null;
+  let lastObservedClockMs = null;
 
   function enqueue(run) {
     const previous = operation;
@@ -410,6 +419,65 @@ export function createDesktopController({
     } catch {
       return false;
     }
+  }
+
+  function readMonotonicClock() {
+    let candidate;
+    try {
+      candidate = clock();
+    } catch {
+      return lastObservedClockMs;
+    }
+    if (typeof candidate !== "number"
+        || !Number.isFinite(candidate)
+        || candidate < 0) {
+      return lastObservedClockMs;
+    }
+    if (lastObservedClockMs !== null && candidate < lastObservedClockMs) {
+      // Date.now can move backwards when the system clock is corrected. Keep
+      // a logical monotonic value so a correction cannot unlock a second
+      // detailed attempt early.
+      return lastObservedClockMs;
+    }
+    lastObservedClockMs = candidate;
+    return candidate;
+  }
+
+  function automaticRefreshMode() {
+    const now = readMonotonicClock();
+    if (now === null || lastAutomaticDetailedAtMs === null) {
+      // A missing timestamp seeds the same quick-first behavior as the native
+      // shell. The first valid automatic check establishes the hourly window.
+      if (now !== null) lastAutomaticDetailedAtMs = now;
+      return "quick";
+    }
+    return now - lastAutomaticDetailedAtMs
+      >= DESKTOP_AUTOMATIC_DETAILED_REFRESH_INTERVAL_MS
+      ? "detailed"
+      : "quick";
+  }
+
+  function automaticRefreshIsVisible() {
+    let selected;
+    try {
+      selected = getLifecycle();
+    } catch {
+      return false;
+    }
+    if (selected === null || typeof selected !== "object") return false;
+    let state;
+    try {
+      state = selected.state;
+    } catch {
+      return false;
+    }
+    if (state === null || typeof state !== "object" || Array.isArray(state)) {
+      return false;
+    }
+    // The real lifecycle state is the supported host contract. Requiring both
+    // flags prevents an embedding or stale facade from treating a live but
+    // hidden/unready BrowserWindow as a foreground refresh surface.
+    return state.windowVisible === true && state.dashboardReady === true;
   }
 
   function notifyLanguageChanged(value) {
@@ -475,12 +543,28 @@ export function createDesktopController({
       // long accounting pass cannot be started again merely because the app
       // has been open longer than the configured interval.
       refreshTimer = null;
-      const delivered = emitDashboardCommand(DASHBOARD_COMMANDS.refresh);
+      if (!automaticRefreshIsVisible()) {
+        // Match the native foreground scheduler: hiding or replacing the
+        // dashboard pauses automatic work while retaining the next cadence.
+        startRefreshTimer(seconds);
+        return;
+      }
+      const mode = automaticRefreshMode();
+      const delivered = emitDashboardCommand(
+        createDesktopCommand("automaticRefresh", mode),
+      );
       if (!delivered) {
         // A hidden/restarting dashboard may ignore this tick. Keep a bounded
         // retry armed rather than losing the cadence or spinning commands.
         startRefreshTimer(seconds);
         return;
+      }
+      if (mode === "detailed") {
+        // Reserve on delivery, before the renderer can report a busy/conflict
+        // result. Native cadence is attempt-based, so failed or cancelled
+        // detailed work still consumes the hourly window.
+        const now = readMonotonicClock();
+        if (now !== null) lastAutomaticDetailedAtMs = now;
       }
       // The renderer calls refreshStarted after its POST is accepted. If the
       // command was delivered to a busy renderer and no POST is accepted,

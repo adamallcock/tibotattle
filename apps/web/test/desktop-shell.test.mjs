@@ -20,6 +20,13 @@ function fakeButton() {
 
 function fakeWindow() {
   const commandListeners = [];
+  const events = [];
+  class FakeCustomEvent {
+    constructor(type, init = {}) {
+      this.type = type;
+      this.detail = init.detail;
+    }
+  }
   const windowRef = {
     tibotattleDesktop: {
       version: "v1",
@@ -33,8 +40,13 @@ function fakeWindow() {
       getSettings: async () => ({}),
     },
     location: { hash: "#overview" },
+    CustomEvent: FakeCustomEvent,
+    dispatchEvent(event) {
+      events.push(event);
+      return true;
+    },
   };
-  return { commandListeners, windowRef };
+  return { commandListeners, events, windowRef };
 }
 
 function fakeDocument(settingsButton = fakeButton()) {
@@ -80,4 +92,23 @@ test("desktop command bridge navigates the dashboard through the fixed section m
   mounted.teardown();
   await Promise.resolve();
   assert.equal(commandListeners.length, 0);
+});
+
+test("desktop command bridge forwards only the closed automatic refresh mode", () => {
+  const { commandListeners, events, windowRef } = fakeWindow();
+  const mounted = mountDesktopShell({
+    documentRef: fakeDocument(),
+    windowRef,
+  });
+
+  commandListeners[0]({ command: "automaticRefresh", mode: "quick" });
+  commandListeners[0]({ command: "automaticRefresh", mode: "detailed" });
+  commandListeners[0]({ command: "automaticRefresh", mode: "quick", path: "/private/secret" });
+  commandListeners[0]({ command: "automaticRefresh", mode: "background" });
+
+  assert.deepEqual(events.map(({ type, detail }) => ({ type, detail })), [
+    { type: "tibotattle:automatic-refresh", detail: { mode: "quick" } },
+    { type: "tibotattle:automatic-refresh", detail: { mode: "detailed" } },
+  ]);
+  mounted.teardown();
 });

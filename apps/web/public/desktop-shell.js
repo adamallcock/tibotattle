@@ -162,6 +162,18 @@ function dispatchFixedDesktopEvent(windowRef, type) {
   return true;
 }
 
+function dispatchAutomaticRefresh(windowRef, mode) {
+  if (mode !== "quick" && mode !== "detailed") return false;
+  const CustomEventConstructor = windowRef?.CustomEvent;
+  if (typeof CustomEventConstructor !== "function"
+      || typeof windowRef?.dispatchEvent !== "function") return false;
+  windowRef.dispatchEvent(new CustomEventConstructor(
+    "tibotattle:automatic-refresh",
+    { detail: Object.freeze({ mode }) },
+  ));
+  return true;
+}
+
 function dispatchAppearanceOverride(windowRef, command) {
   if (![
     "system",
@@ -192,6 +204,12 @@ function installCommandBridge(documentRef, windowRef, applyLanguage, applySideba
     if (!command || typeof command !== "object") return;
     if (command.command === "refresh") {
       documentRef.querySelector?.("#refresh-button")?.click?.();
+      return;
+    }
+    if (command.command === "automaticRefresh") {
+      if (Reflect.ownKeys(command).length !== 2
+          || !Object.hasOwn(command, "mode")) return;
+      dispatchAutomaticRefresh(windowRef, command.mode);
       return;
     }
     if (command.command === "dashboardSection") {

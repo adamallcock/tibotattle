@@ -28,7 +28,9 @@ function twoCodexHomes() {
 function fixture({
   platformOverrides = {},
   lifecycleOverrides = {},
+  lifecycleState = { windowVisible: true, dashboardReady: true },
   actionOverrides = {},
+  clock = () => Date.now(),
   settingsLoad = async () => null,
   settingsSave = null,
   settingsStore: suppliedSettingsStore = null,
@@ -116,6 +118,7 @@ function fixture({
         settingsWindows.push(section);
         return true;
       },
+      state: lifecycleState,
       ...lifecycleOverrides,
     }),
     applyCodexHome: async (next, previous) => homes.push([next, previous]),
@@ -129,6 +132,7 @@ function fixture({
       return true;
     },
     ...actionOverrides,
+    clock,
     setRecurringTimer(callback, milliseconds) {
       const timer = { callback, milliseconds, unref() {} };
       timers.push(timer);
@@ -200,7 +204,7 @@ test("controller initializes persisted cadence and projects truthful settings st
     },
   });
   value.timers[0].callback();
-  assert.deepEqual(value.commands, [{ command: "refresh" }]);
+  assert.deepEqual(value.commands, [{ command: "automaticRefresh", mode: "quick" }]);
 });
 
 test("controller implements every bounded bridge action and desktop command", async () => {
@@ -260,13 +264,13 @@ test("controller exposes bounded browser, diagnostics, local-data, and refresh l
   assert.deepEqual(actions, ["browser", "diagnostics", "local-data"]);
 
   value.timers[0].callback();
-  assert.deepEqual(value.commands, [{ command: "refresh" }]);
+  assert.deepEqual(value.commands, [{ command: "automaticRefresh", mode: "quick" }]);
   const fallbackTimer = value.timers.at(-1);
   assert.notEqual(fallbackTimer, value.timers[0]);
   fallbackTimer.callback();
   assert.deepEqual(
     value.commands,
-    [{ command: "refresh" }],
+    [{ command: "automaticRefresh", mode: "quick" }],
     "a delivered-but-unaccepted tick only rearms the cadence; it does not spin refresh commands",
   );
   const rearmedTimer = value.timers.at(-1);
@@ -278,6 +282,54 @@ test("controller exposes bounded browser, diagnostics, local-data, and refresh l
   assert.equal(await value.controller.handlers.refreshSettled({}), false);
   assert.equal(await value.controller.handlers.refreshSettled({ lease }), true);
   assert.equal(value.timers.at(-1).milliseconds, 300_000);
+});
+
+test("automatic cadence stays quick-first, detailed at most hourly, and monotonic", async () => {
+  let nowMs = 1_000_000;
+  const value = fixture({ clock: () => nowMs });
+  await value.controller.initialize();
+
+  value.timers[0].callback();
+  assert.deepEqual(value.commands, [{ command: "automaticRefresh", mode: "quick" }]);
+  value.timers.at(-1).callback();
+
+  nowMs += 60 * 60_000;
+  value.timers.at(-1).callback();
+  assert.deepEqual(value.commands, [
+    { command: "automaticRefresh", mode: "quick" },
+    { command: "automaticRefresh", mode: "detailed" },
+  ]);
+  value.timers.at(-1).callback();
+
+  nowMs += 60 * 60_000 - 1;
+  value.timers.at(-1).callback();
+  value.timers.at(-1).callback();
+  nowMs = 1;
+  value.timers.at(-1).callback();
+  assert.deepEqual(value.commands, [
+    { command: "automaticRefresh", mode: "quick" },
+    { command: "automaticRefresh", mode: "detailed" },
+    { command: "automaticRefresh", mode: "quick" },
+    { command: "automaticRefresh", mode: "quick" },
+  ], "a clock rollback cannot unlock a second detailed attempt");
+});
+
+test("automatic cadence pauses while the dashboard is hidden, while manual refresh stays detailed", async () => {
+  const lifecycleState = { windowVisible: false, dashboardReady: true };
+  const value = fixture({ lifecycleState });
+  await value.controller.initialize();
+  value.timers[0].callback();
+  assert.deepEqual(value.commands, []);
+
+  lifecycleState.windowVisible = true;
+  value.timers.at(-1).callback();
+  assert.deepEqual(value.commands, [{ command: "automaticRefresh", mode: "quick" }]);
+
+  assert.equal(value.controller.refreshUsage(), true);
+  assert.deepEqual(value.commands, [
+    { command: "automaticRefresh", mode: "quick" },
+    { command: "refresh" },
+  ]);
 });
 
 test("refresh leases ignore stale completion and only the current lease rearms cadence", async () => {

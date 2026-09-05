@@ -135,6 +135,38 @@ test("the shared default and automatic browser return refresh stay quick", async
   assert.deepEqual(native.calls, []);
 });
 
+test("Electron automatic refresh events honor the host-selected mode", async () => {
+  const quick = refreshHarness({ electron: true });
+  runInContext(productionFunction("handleElectronAutomaticRefresh"), quick.context);
+  runInContext(
+    "handleElectronAutomaticRefresh({ detail: { mode: 'quick' } });",
+    quick.context,
+  );
+  await new Promise(setImmediate);
+  assert.deepEqual(quick.routes, ["/api/local/refresh/quick"]);
+
+  const detailed = refreshHarness({ electron: true });
+  runInContext(productionFunction("handleElectronAutomaticRefresh"), detailed.context);
+  runInContext(
+    "handleElectronAutomaticRefresh({ detail: { mode: 'detailed' } });",
+    detailed.context,
+  );
+  await new Promise(setImmediate);
+  assert.deepEqual(detailed.routes, ["/api/local/refresh"]);
+
+  const ignored = refreshHarness({ electron: true });
+  runInContext(productionFunction("handleElectronAutomaticRefresh"), ignored.context);
+  for (const expression of [
+    "handleElectronAutomaticRefresh({ detail: { mode: 'quick', extra: true } });",
+    "handleElectronAutomaticRefresh({ detail: { mode: 'background' } });",
+    "handleElectronAutomaticRefresh({ detail: ['quick'] });",
+  ]) {
+    runInContext(expression, ignored.context);
+  }
+  await new Promise(setImmediate);
+  assert.deepEqual(ignored.calls, []);
+});
+
 test("Electron startup performs one guarded detailed refresh without a trusted projection", async () => {
   const harness = refreshHarness({ electron: true });
   runInContext(productionFunction("startElectronStartupRefresh"), harness.context);

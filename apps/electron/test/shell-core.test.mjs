@@ -3103,6 +3103,8 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   const commandListener = commandListeners.get("tibotattle:desktop-command:v1");
   assert.equal(typeof commandListener, "function");
   commandListener({}, { command: "refresh" });
+  commandListener({}, { command: "automaticRefresh", mode: "quick" });
+  commandListener({}, { command: "automaticRefresh", mode: "detailed" });
   commandListener({}, { command: "dashboardSection", section: "weekly" });
   commandListener({}, { command: "dashboardSection", section: "timeline" });
   commandListener({}, { command: "language", value: "es" });
@@ -3120,9 +3122,13 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   });
   commandListener({}, { command: "language", value: "fr" });
   commandListener({}, { command: "refresh", selector: "#private" });
+  commandListener({}, { command: "automaticRefresh", mode: "background" });
+  commandListener({}, { command: "automaticRefresh", mode: "quick", extra: true });
   commandListener({}, { command: "dashboardSection", section: "accounting" });
   assert.deepEqual(JSON.parse(JSON.stringify(commands)), [
     { command: "refresh" },
+    { command: "automaticRefresh", mode: "quick" },
+    { command: "automaticRefresh", mode: "detailed" },
     { command: "dashboardSection", section: "weekly" },
     { command: "dashboardSection", section: "timeline" },
     { command: "language", value: "es" },
