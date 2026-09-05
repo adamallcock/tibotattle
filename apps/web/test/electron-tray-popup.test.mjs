@@ -492,6 +492,50 @@ test("hidden popup model events wait for visibility before reading the companion
   assert.equal(documentRef.documentElement.attributes.get("data-tray-popup-ready"), "true");
 });
 
+test("native popup visibility gates visible-DOM loads and reopens on the host signal", async () => {
+  const documentRef = new FakeDocument("visible");
+  const windowRef = fakeWindow();
+  let modelListener;
+  let visibilityListener;
+  let nativeVisible = false;
+  let loadCalls = 0;
+  const client = {
+    async load() {
+      loadCalls += 1;
+      return {};
+    },
+  };
+  const bridge = {
+    getVisibility() {
+      return nativeVisible;
+    },
+    onModel(listener) {
+      modelListener = listener;
+    },
+    onVisibility(listener) {
+      visibilityListener = listener;
+    },
+    requestAction() {},
+  };
+
+  await bootstrapTrayPopup({
+    windowRef: { ...windowRef, tibotattleTrayPopover: bridge },
+    documentRef,
+    client,
+  });
+  assert.equal(loadCalls, 0);
+  modelListener();
+  documentRef.dispatch("visibilitychange");
+  await tick();
+  assert.equal(loadCalls, 0);
+
+  nativeVisible = true;
+  visibilityListener(true);
+  await tick();
+  assert.equal(loadCalls, 1);
+  assert.equal(documentRef.documentElement.attributes.get("data-tray-popup-ready"), "true");
+});
+
 test("visible popup model events coalesce in-flight reads and fence one follow-up per burst", async () => {
   const documentRef = new FakeDocument("visible");
   const windowRef = fakeWindow();

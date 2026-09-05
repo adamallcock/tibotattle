@@ -1142,7 +1142,19 @@ export async function bootstrapTrayPopup({
   let loadSequence = 0;
   let loadInFlight = null;
   let loadPending = false;
-  const isVisible = () => documentRef.visibilityState !== "hidden";
+  const hasNativeVisibility = typeof bridge?.getVisibility === "function";
+  const isVisible = () => {
+    if (hasNativeVisibility) {
+      try {
+        return bridge.getVisibility() === true;
+      } catch {
+        // A native visibility read that fails cannot prove that the popup is
+        // visible, so keep the transient surface closed until the host says so.
+        return false;
+      }
+    }
+    return documentRef.visibilityState !== "hidden";
+  };
   const render = () => {
     const projection = createTrayPopupProjection(data ?? {}, {
       range,
@@ -1232,6 +1244,9 @@ export async function bootstrapTrayPopup({
     }
   };
   documentRef.addEventListener?.("visibilitychange", onVisibilityChange);
+  if (typeof bridge?.onVisibility === "function") {
+    bridge.onVisibility(() => onVisibilityChange());
+  }
   windowRef.addEventListener?.("tibotattle:locale-change", () => {
     setMessageLocale(localization.locale());
     setFormattingLocale(localization.formatLocale());
