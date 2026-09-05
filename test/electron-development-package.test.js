@@ -70,6 +70,7 @@ test("artifact machine verification rejects an incorrect or malformed executable
 test("the development workflow builds each target on a static native runner without release authority", async () => {
   const workflow = await readFile(new URL("../.github/workflows/electron-development-packages.yml", import.meta.url), "utf8");
   assert.match(workflow, /workflow_dispatch:/u);
+  assert.match(workflow, /  push:\n    branches:\n      - codex\/unified-desktop-accountless\n/u);
   assert.match(workflow, /contents: read/u);
   assert.doesNotMatch(workflow, /pull_request_target|secrets\.|contents: write|id-token: write|--publish always/u);
   const jobs = workflow.split(/\n(?= {2}[a-z][a-z0-9-]+:\n)/u);

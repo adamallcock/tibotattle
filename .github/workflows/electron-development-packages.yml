@@ -2,6 +2,9 @@ name: Electron four-target development packages
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - codex/unified-desktop-accountless
 
 permissions:
   contents: read
