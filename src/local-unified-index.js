@@ -114,7 +114,15 @@ export const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION =
 // sources keep their original parser provenance rather than inventing proof.
 // v13 (2026-09-04): recover compaction boundaries whose top-level header
 // includes the current Codex serializer's ordinal before type.
-export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v13";
+// v14 (2026-09-04): paginated resets and exact history-base unknowns cannot
+// inherit a logical parent's later model, effort, tier or counter state.
+// Resume keeps own cursor state and reconstructs an absent inherited tier
+// only from the same exact physical base, never the parent's final state.
+// Inline descendants also stop tier and replay-snapshot traversal at that
+// physical boundary instead of reviving discarded logical-ancestor history.
+// Logical-parent state and ancestry are selected by resolved head, never by
+// dependency/scan order among retained physical generations of one thread.
+export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v14";
 export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
   "codex-immutable-rollout-v1";
 
@@ -125,7 +133,7 @@ export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
 // degraded row is recorded. Kept in lockstep with the main constant: salvaged
 // rows run the same delta derivation.
 export const LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION =
-  "unified-rollout-typed-v13-partial";
+  "unified-rollout-typed-v14-partial";
 
 export const LOCAL_UNIFIED_INDEX_APPLICATION_ID = 0x554d5549;
 const INDEX_APPLICATION_ID = LOCAL_UNIFIED_INDEX_APPLICATION_ID;

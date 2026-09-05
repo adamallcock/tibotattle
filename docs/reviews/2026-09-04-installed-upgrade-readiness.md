@@ -11,8 +11,8 @@ The owner authorized replacing the installed app with a signed candidate while
 preserving data and a rollback copy, and asked to continue to the publication
 decision point. Publication remains held until actual release gates pass.
 The [signed RC2 receipt](../receipts/2026-09-04-macos-combined-rc2-signed-candidates.md)
-remains immutable historical evidence; a newly identified upgrade timeout
-regression requires corrected source and fresh RC3 bytes before qualification.
+remains immutable historical evidence; upgrade timeout and paginated-setting
+regressions require corrected source and fresh RC3 bytes before qualification.
 
 ## Observed starting point and preservation
 
@@ -47,11 +47,11 @@ This is suitable future ARM stable continuity input, not an Intel predecessor.
 ## Upgrade deadline regression
 
 RC2's companion still restricted its extended parser-upgrade deadline to target
-v11, while the current ingestion parser is v13. The preserved installed v11
+v11, while its ingestion parser was v13. The preserved installed v11
 generation therefore received the ordinary five-minute limit before accounting
 could start, despite requiring a full supported parser rescan.
 
-The correction admits only reviewed published v10/v11/v12-to-exact-v13
+The initial correction admitted only reviewed published v10/v11/v12-to-exact-v13
 transitions. Existing physical/schema, minimum reader/writer, source identity,
 contract and terminal-publication checks remain intact. Current, unknown,
 malformed, future and uncertain parser states retain five minutes. This changes
@@ -61,9 +61,9 @@ v11/tool-partial/no-skipped-source shape without scanning user data in tests.
 
 Focused deadline tests pass 3/3, with no skips; two parser-upgrade tests failed
 against the pre-fix source. The changed companion/deadline documentation is
-outside the R7 workload closure, so the retained ten receipts do not require
-regeneration. Current recovery guidance now names v13 rather than silently
-retaining the historical v11 parser claim.
+outside the R7 workload closure, so that correction alone did not require
+regeneration. The subsequent v14 source correction below does invalidate the
+retained ten receipts and requires fresh generation before release use.
 
 The complete affected companion suite passes 305/305 with no skips, and the
 retained native suite passes 110/110 with no skips. The initial sandboxed
@@ -72,6 +72,58 @@ rerun passed without changing source or weakening tests. Independent quality
 and test/documentation reviews found no remaining actionable issues in the
 deadline/allocation changes. The production classifier also assigns the
 preserved actual index the exact four-hour deadline without reading its facts.
+
+## Copy-only rehearsal and attribution finding
+
+One isolated v11-to-v13 ingestion completed in 189 seconds, with `rebuilt: false`,
+8,091 discovered/scanned sources, no skipped sources and no malformed lines.
+All 8,086 prior sources, 804,238 prior usage keys and 844,934 prior tool-fact keys
+remain present. No source history lost rows or receded at its first/last bound.
+The resulting generation remains partial solely for historical tool provenance.
+
+One copy-only accounting run completed in 61 seconds, publishing and reading
+back a v0.15 cache bound to that exact v13 generation. Accounting coverage is
+complete with no block reason. The original backup, cloned index, unrelated
+cloned state and four copied speed-baseline windows remain unchanged by this
+accounting stage. No quota refresh, Keychain access, upload controller, baseline
+recording or network request was constructed.
+
+Semantic comparison nevertheless found two retained events changing from Sol
+to Astra without own-file model evidence. Both are independent paginated fork
+resets with no physical `history_base`; their exact raw counters and bounded
+prefixes are unchanged. Neither prefix supplies a turn context. Both logical
+parents have Astra usage after the child's event, but none at or before it.
+The old Sol labels are historical incremental results, not proof that Sol is
+the correct replacement label.
+
+The cause is fallback from an absent/unknown physical history seed to a logical
+parent's latest model in unified ingestion and rebuild lanes. Resume has a
+similar tier fallback. This is future-parent attribution, not an Astra price
+table error; unanchored missing settings must remain unknown. Parser v14 must
+close the boundary across serial/parallel rebuild and incremental/resume, retain
+explicit physical-base evidence without null-coalescing to later settings, and
+force reparsing of earlier private v13 candidates. Physical schema remains 11.
+The deadline's reviewed predecessor set consequently becomes v10-v13 to exact
+v14, with all existing compatibility and publication checks retained.
+
+The synthetic follow-up also reproduced descendant tier/replay traversal past
+paginated resets and selected-head confusion: physical dependency ordering can
+scan a retired continuation after a selected reset. Shared resolved-head
+selection now controls parent settings, snapshot traversal and warm snapshot
+planning. Retired physical sources still contribute their accounting facts;
+they cannot overwrite the selected head. Ambiguous heads fail closed, while
+legacy noncanonical singleton inheritance is retained. Serial, worker, warm-new
+and warm-resume regressions cover both settings and replay boundaries.
+
+The corrected source's five-file owning suite passes 238/238; the independent
+targeted selected-head/legacy matrix passes 30/30, including ambiguity refusal.
+The full companion suite passes 305/305 and pricing/catalog checks pass 25/25.
+All have no skips. Architecture and the 20-test documentation preflight pass.
+These are synthetic/source gates, not fresh real-corpus or installed evidence.
+
+The v13 rehearsal is useful preservation/diagnostic evidence, not completed
+attribution or RC3 qualification. Fresh synthetic, copy-only v14 and full R7
+evidence are required before signing or installed replacement.
 
 ## Remaining work
 
@@ -87,5 +139,5 @@ preserved actual index the exact four-hour deadline without reading its facts.
   decision, then finish the separate stable artifacts, CI/merge, hosted and
   publication gates in the [preparation plan](../plans/2026-09-04-release-0-1-18-publication-preparation.md).
 
-No installation, state migration, new candidate signing or publication is
-inferred from the preservation and source tests above.
+No installed-state migration, app replacement, new candidate signing or
+publication is inferred from the isolated rehearsal and source tests above.

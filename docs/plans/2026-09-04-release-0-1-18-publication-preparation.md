@@ -45,8 +45,26 @@ relaunched.
 An isolated full-state copy has completed v11-to-v13 ingestion without a rebuild,
 skipped sources, missing historical usage/tool keys or receding source coverage.
 Copy-only accounting completes and binds to the new exact generation. Model
-reclassification review is still pending before installed-upgrade qualification;
-these observations do not authorize destructive replay against the working state.
+reclassification review found a real future-parent seed bug affecting two
+paginated reset events; those sources have no own model or physical history base.
+Parser v14 correction across rebuild/ingest/resume, fresh copy-only qualification
+and complete R7 regeneration are required. The correction also closes
+descendant tier/replay traversal beyond paginated history and chooses logical
+parent authority from the resolved head rather than physical scan order.
+Retired source facts remain counted. Earlier R7 freshness passes above
+apply to the initial deadline-only source, not the new parser correction. These
+observations do not authorize destructive replay against the working state.
+
+The complete companion suite on the corrected v14 source passes 305/305 with
+no skips. A fresh official-page check at 2026-09-05 00:12 UTC confirms all eight
+Astra API tier/context rows remain unchanged, including the strictly-above-272K
+long-context boundary and 1.25x cache writes. The
+[Codex credit rate card](https://learn.chatgpt.com/docs/pricing#token-rates)
+separately lists 250/25/1,250 credits per million input/cached/output tokens and
+a 2.5x Astra Fast multiplier. This is not the API Fast multiplier (2x): the
+app's dollar ledger explicitly uses API-equivalent prices, not subscription
+credits or an inferred percentage-allowance conversion. No pricing code or
+historical review timestamp was changed merely to record this recheck.
 
 The [hosted lineage review](../reviews/2026-09-04-hosted-migration-lineage-reconciliation.md)
 records a separate live deployment blocker. Production applied the historical
@@ -57,8 +75,11 @@ report zero writes. No configured staging database exists in the inspected
 project inventory. The local repair restores all 41 historical migrations
 byte-for-byte and gives the four unapplied successors unique 0042-0045 names,
 with unchanged SQL and exact-prefix refusal for alternative applied histories.
-Fresh-schema and production-shaped synthetic regressions pass; the full affected
-Worker gate remains to be completed on clean committed source. No database
+Fresh-schema and production-shaped synthetic regressions pass. The complete
+Worker gate on clean `0cb0916f` passes 183 script and 533 application tests across
+43 files, types and default/staging deployment dry runs. A fresh read-only
+production ledger gate now recognizes the historical prefix and reports exactly
+the four pending 0042-0045 migrations. No database
 migration, deployment, source push, stable finalization or publication occurred.
 
 ## Completed RC2 local preparation

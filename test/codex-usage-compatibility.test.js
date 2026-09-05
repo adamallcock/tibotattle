@@ -77,7 +77,7 @@ test("missing cache components remain null; explicit zero remains observed acros
     const refreshed = await ingestLocalUnifiedIndexIncrement({ ...options, indexFile: incremental });
     assert.equal(refreshed.sourcesReparsedForParserVersion, 1);
     assert.deepEqual(rows(incremental), expected);
-    assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v13");
+    assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v14");
   } finally { await rm(value.root, { recursive: true }); }
 });
 

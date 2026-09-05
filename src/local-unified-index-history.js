@@ -11,6 +11,32 @@ function fixedError(code) {
 }
 
 /**
+ * A paginated source inherits only its exact physical history boundary, never
+ * a logical parent's later final state. An absent base and an explicitly
+ * unknown field both stay unknown. Resume cursors already hold model, effort
+ * and counters; only an absent own-file tier may be reconstructed from the
+ * same immutable base, because inherited tiers are not persisted as own
+ * observations. An explicit own null-tier observation remains an object and
+ * therefore overrides the base. Legacy inline inheritance is unchanged.
+ */
+export function selectRolloutUsageSeed(info, {
+  historySeed = null,
+  logicalSeed = null,
+  cursorSeed = null,
+} = {}) {
+  const paginated = info.lineage?.historyMode === "paginated";
+  const selected = cursorSeed ?? (paginated ? historySeed : logicalSeed);
+  return {
+    seedModel: selected?.seedModel ?? null,
+    seedEffort: selected?.seedEffort ?? null,
+    seedTier: cursorSeed !== null && paginated
+      ? cursorSeed.seedTier ?? historySeed?.seedTier ?? null
+      : selected?.seedTier ?? null,
+    seedTotals: selected?.seedTotals ?? null,
+  };
+}
+
+/**
  * Resolve a paginated rollout's carried state at the exact physical history
  * boundary named by Codex. The scan is content-free and emits no facts; its
  * only output is the same bounded model/tier/counter and replay-snapshot state

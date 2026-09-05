@@ -326,7 +326,8 @@ export function salvagePartialTokenCount(text) {
  * resume cursor carried, which is the same declaration seen earlier). An
  * inherited seed is provenance-distinct: it must never be persisted into the
  * cursor's carry as if it were an own observation — the next pass re-derives
- * it from the ancestor chain instead, so the `lineage_inherited` label
+ * it only from the exact physical history base for a paginated source or the
+ * ancestor chain for a legacy inline source, so the `lineage_inherited` label
  * survives a resume rather than being laundered into
  * `rollout_thread_settings`.
  */
@@ -869,6 +870,33 @@ export async function extractRolloutUsage(path, {
 }
 
 /**
+ * Resolve logical-parent authority independently of physical scan order.
+ * Every physical source remains accounting evidence, but only the explicit
+ * selected head supplies descendants. Old noncanonical single-source inputs
+ * have no immutable rollout id or head receipt and remain unambiguous; a
+ * canonical retired source or an unresolved multi-source thread never wins
+ * merely because it happened to be visited last.
+ */
+export function resolveLogicalRolloutHeads(members) {
+  const bySessionId = new Map();
+  for (const info of members) {
+    const sessionId = info.lineage?.sessionId;
+    if (!sessionId) continue;
+    const generations = bySessionId.get(sessionId) ?? [];
+    generations.push(info);
+    bySessionId.set(sessionId, generations);
+  }
+  const heads = new Map();
+  for (const [sessionId, generations] of bySessionId) {
+    const selected = generations.filter((generation) => generation.resolvedHead === true);
+    if (selected.length === 1) heads.set(sessionId, selected[0]);
+    else if (selected.length === 0 && generations.length === 1
+        && generations[0].rolloutId == null) heads.set(sessionId, generations[0]);
+  }
+  return heads;
+}
+
+/**
  * A tracker for the fork-replay boundary over one lineage component.
  *
  * These in-memory sets exist for the length of a component and are dropped
@@ -893,26 +921,13 @@ export function createLineageSnapshots(members) {
     const parentId = info.lineage?.parentId;
     if (parentId) referenced.add(parentId);
   }
-  const bySessionId = new Map();
-  for (const info of members) {
-    if (!info.lineage?.sessionId) continue;
-    const generations = bySessionId.get(info.lineage.sessionId) ?? [];
-    generations.push(info);
-    bySessionId.set(info.lineage.sessionId, generations);
-  }
+  const logicalHeads = resolveLogicalRolloutHeads(members);
   const sets = new Map();
 
   function suppliesResolvedHistory(info) {
     const sessionId = info.lineage?.sessionId;
     if (!sessionId) return false;
-    const generations = bySessionId.get(sessionId) ?? [];
-    const resolved = generations.find(
-      (generation) => generation.resolvedHead === true,
-    );
-    // Legacy/noncanonical single-rollout fixtures have no immutable rollout
-    // identity from which discovery can stamp a head. One generation is still
-    // unambiguous; multiple unresolved generations are never chosen here.
-    return resolved === undefined ? generations.length === 1 : info === resolved;
+    return logicalHeads.get(sessionId) === info;
   }
 
   return {
@@ -939,7 +954,7 @@ export function createLineageSnapshots(members) {
       sets.set(sessionId, set);
       return true;
     },
-    /** A view over every ancestor's set, nearest first. */
+    /** Ancestor sets nearest first, ending at an exact paginated history. */
     inheritedFor(info) {
       const chain = [];
       const seen = new Set();
@@ -948,10 +963,12 @@ export function createLineageSnapshots(members) {
         seen.add(parentId);
         const set = sets.get(parentId);
         if (set) chain.push(set);
-        const parentGenerations = bySessionId.get(parentId) ?? [];
-        const selected = parentGenerations.find(
-          (generation) => generation.resolvedHead === true,
-        ) ?? parentGenerations.at(-1);
+        const selected = logicalHeads.get(parentId);
+        // This set already is the selected physical base-prefix plus own
+        // snapshots, or only own snapshots after an independent reset. A
+        // logical grandparent beyond it may contain discarded history and
+        // must not suppress genuinely new matching counters in a descendant.
+        if (selected?.lineage?.historyMode === "paginated") break;
         parentId = selected?.lineage?.parentId ?? null;
       }
       if (chain.length === 0) return null;
