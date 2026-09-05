@@ -1144,7 +1144,8 @@ export async function mountSettingsPage({
           && (result?.settings !== undefined || result?.language !== undefined)) {
         currentState = normalizeSettingsState(result, currentState.codexHomesForSettings);
       }
-      if (actionName === "addCodexHome"
+      if (actionName === "chooseCodexHome"
+          || actionName === "addCodexHome"
           || actionName === "editCodexHome"
           || actionName === "removeCodexHome"
           || actionName === "setPrimaryCodexHome"

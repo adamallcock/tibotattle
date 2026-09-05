@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFile } from "node:fs/promises";
 
-import { normalizeElectronSharingPreference } from "../public/electron-settings.js";
+import {
+  mountSettingsPage,
+  normalizeElectronSharingPreference,
+} from "../public/electron-settings.js";
 
 const APP_SOURCE_URL = new URL("../public/app.js", import.meta.url);
 
@@ -252,6 +255,105 @@ test("Electron settings expose one analyzed Codex folder and retain extras witho
     codexHomes: { activityRoots: [], primaryRootId: "" },
   }, true, null, () => assert.fail("rendering must not dispatch an action"));
   assert.equal(customUse.disabled, false, "a single selected custom folder can return to default");
+});
+
+test("the singleton default chooser refreshes the rendered folder card after selection", async () => {
+  const listeners = new Map();
+  const element = (tagName = "div", className = "") => ({
+    tagName,
+    className,
+    childNodes: [],
+    dataset: {},
+    attributes: new Map(),
+    textContent: "",
+    value: "",
+    checked: false,
+    disabled: false,
+    hidden: false,
+    classList: { toggle() {} },
+    append(...children) { this.childNodes.push(...children); },
+    replaceChildren(...children) { this.childNodes = children; },
+    setAttribute(name, value) { this.attributes.set(name, value); },
+    getAttribute(name) { return this.attributes.get(name) ?? null; },
+    removeAttribute(name) { this.attributes.delete(name); },
+    addEventListener(type, handler) { this.listeners ??= new Map(); this.listeners.set(type, handler); },
+    removeEventListener(type, handler) { if (this.listeners?.get(type) === handler) this.listeners.delete(type); },
+    click() { this.listeners?.get("click")?.({ preventDefault() {} }); },
+  });
+  const selectors = [
+    "#settings-bridge-status", "#settings-language", "#settings-appearance",
+    "#settings-codex-folder-status", "#settings-codex-roots",
+    "#settings-codex-roots-status", "#settings-add-codex-root",
+    "#settings-use-default-codex-folder", "#settings-refresh-interval",
+    "#settings-start-at-login", "#settings-start-at-login-summary",
+    "#settings-open-login-items", "#settings-refresh-login-status",
+    "#settings-notifications-enabled", "#settings-notifications-detail",
+    "#settings-notification-status", "#settings-open-notification-settings",
+    "#settings-automatic-updates", "#settings-check-for-updates",
+    "#settings-open-dashboard-browser", "#settings-show-diagnostics",
+    "#settings-reveal-local-data", "#settings-version", "#settings-build",
+    "#settings-updates-status", "#settings-operation-status",
+  ];
+  const elements = new Map(selectors.map((selector) => [selector, element()]));
+  const documentRef = {
+    documentElement: { dataset: {}, classList: { toggle() {} } },
+    createElement: element,
+    querySelector(selector) { return elements.get(selector) ?? null; },
+    querySelectorAll() { return []; },
+  };
+  const defaultRootId = "00000000-0000-4000-8000-000000000001";
+  const customRootId = "11111111-1111-4111-8111-111111111111";
+  let roots = {
+    activityRoots: [{ rootId: defaultRootId, kind: "default", path: null, enabled: true }],
+    primaryRootId: defaultRootId,
+  };
+  const bridge = {
+    version: "v1",
+    getSettings: async () => ({
+      settings: {
+        language: "en", appearance: "system", refreshIntervalSeconds: 300,
+        codexHomes: roots,
+        codexFolder: { kind: roots.activityRoots[0].kind },
+        startAtLogin: { status: "disabled", canSet: false },
+        notifications: { enabled: false, threshold: "off", canSet: false },
+      },
+      about: { version: "0.1.18", build: "test", update: {}, automaticUpdates: {} },
+    }),
+    getCodexHomesForSettings: async () => roots,
+    chooseCodexHome: async () => {
+      roots = {
+        activityRoots: [{
+          rootId: customRootId,
+          kind: "custom",
+          path: "/synthetic/chosen-codex",
+          enabled: true,
+        }],
+        primaryRootId: customRootId,
+      };
+      return { settings: { codexHomes: roots, codexFolder: { kind: "custom" } } };
+    },
+  };
+  const mounted = await mountSettingsPage({
+    documentRef,
+    windowRef: { tibotattleDesktop: bridge, location: { hash: "#general" } },
+    bridge,
+  });
+  const list = elements.get("#settings-codex-roots");
+  const beforeButton = list.childNodes[0].childNodes
+    .flatMap((node) => node.childNodes)
+    .find((node) => node.tagName === "button");
+  assert.equal(beforeButton?.dataset.rootAction, "chooseCodexHome");
+  beforeButton.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  const card = list.childNodes[0];
+  assert.equal(card.dataset.primary, "true");
+  assert.equal(card.dataset.analysisScope, "primary");
+  assert.equal(card.getAttribute("aria-labelledby"), `settings-codex-root-${customRootId}`);
+  const text = [card, ...card.childNodes, ...card.childNodes.flatMap((node) => node.childNodes)]
+    .map((node) => node.textContent)
+    .join(" ");
+  assert.match(text, /\/synthetic\/chosen-codex/u);
+  mounted.teardown();
 });
 
 test("a successful visible notice receipt keeps its current banner actionable", async () => {
