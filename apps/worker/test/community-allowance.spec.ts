@@ -28,6 +28,7 @@ import {
   downsampleQuotaForTest,
   MAX_DOWNSAMPLED_QUOTA_ROWS,
   MAX_WINDOWED_USAGE_ROWS,
+  QUOTA_DOWNSAMPLE_SQL,
   V1_ANALYSIS_WINDOW_DAYS,
   V1_PLAN_ATTRIBUTION_ADAPTER_VERSION,
   V1_USAGE_PAGE_AT_TIME_SQL,
@@ -1668,6 +1669,50 @@ describe("v1 plan attribution before fit and cost reduction", () => {
 });
 
 describe("v1 analyzer scale fix — fit-preserving reduction", () => {
+  it("reduces dense quota before materializing and preserves exact run endpoints and fits", async () => {
+    const participantId = await newV1Participant("quota-working-set");
+    const device = "v1-device-quota-working-set";
+    const baseMs = SCALE_NOW - 2 * DAY_MS;
+    const resetsAt = new Date(baseMs + 7 * DAY_MS).toISOString();
+    const day = new Date(baseMs).toISOString().slice(0, 10);
+    const dense = buildDenseReset({ tag: "quota-working-set", baseMs, resetsAt,
+      levels: 17, startPp: 5, stepPp: 5, repeats: 300, snapshotStepMs: 1_000,
+      usageOffsetMs: 500, gridExactLevels: [3, 8] });
+    await seedChunkedRecords(participantId, device, "quota", day, dense.quota);
+    await seedChunkedRecords(participantId, device, "usage", day, dense.usage);
+    const pin = await loadV1SourcePin(db(), { participantId, fromDay: day });
+    const markers = JSON.stringify([["openai_codex", "codex", "pro", "unknown", "synthetic-era", "", null, 1]]);
+    const cutoff = new Date(SCALE_NOW - V1_ANALYSIS_WINDOW_DAYS * DAY_MS)
+      .toISOString().slice(0, 10) + "T00:00:00.000Z";
+    const plan = await db().prepare("EXPLAIN QUERY PLAN " + QUOTA_DOWNSAMPLE_SQL)
+      .bind(markers, pin.winnersJson, participantId, cutoff,
+        new Date(Date.parse(cutoff) + 7 * DAY_MS).toISOString(), 10_080,
+        QUOTA_CALIBRATION_POLICY.minimumBoundaries,
+        QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp,
+        MAX_DOWNSAMPLED_QUOTA_ROWS + 1)
+      .all<{ detail: string }>();
+    const materialized = plan.results.map((row) => row.detail)
+      .filter((detail) => detail.startsWith("MATERIALIZE "));
+    // No wide raw/assigned/survivor table may be retained before the dense
+    // stream is reduced. The bounded era vector and endpoint table may be.
+    expect(materialized).not.toEqual([]);
+    expect(materialized.every((detail) => ["MATERIALIZE era_markers", "MATERIALIZE endpoints", "MATERIALIZE fitable"]
+      .includes(detail)), materialized.join("\n")).toBe(true);
+    expect(plan.results.some(({ detail }) => detail.includes("telemetry_v1_records_participant_stream_observed")
+      && detail.includes("participant_id=? AND stream=? AND observed_at>? AND observed_at<?"))).toBe(true);
+    expect(plan.results.some(({ detail }) => detail.includes("SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"))).toBe(true);
+    const reducedRows = await downsampleQuotaForTest(db(), participantId, SCALE_NOW);
+    expect(reducedRows.map((row) => row.occurrence_id)).toEqual(
+      Array.from({ length: 17 }, (_, level) => [
+        `q-quota-working-set-${level}-0`, `q-quota-working-set-${level}-299`,
+      ]).flat(),
+    );
+    const reference = await accountScopedQuotaAnalysisV1FullReferenceForTest(db(), participantId) as AnalysisLike;
+    const actual = await accountScopedQuotaAnalysisV1(db(), participantId, { nowMs: SCALE_NOW }) as AnalysisLike;
+    expect(bandResets(actual)).toHaveLength(1);
+    expect(bandResets(actual)).toEqual(bandResets(reference));
+  }, 20_000);
+
   it("preserves occurrence-first same-session intervals when insertion order disagrees", async () => {
     const scenario = await seedPlanEraScenario("tie-order", [
       { plan: "pro", offsetMinutes: 0, sharedSession: true },

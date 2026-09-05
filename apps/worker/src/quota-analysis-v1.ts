@@ -543,10 +543,16 @@ function attributeSnapshot(
 // Binds (in order): era markers JSON, winnersJson, participantId, observedAt cutoff, resetsAt
 // cutoff, window minutes, minimum boundaries, minimum span, row limit. Anonymous
 // `?` because the leading json_each winner filter binds one parameter and fixed
-// numbering across the CTE chain buys nothing. `scoped` is MATERIALIZED so its
-// winner-filtered index scan runs once rather than being re-evaluated by both
-// `fitable` and `survivors`.
-const QUOTA_DOWNSAMPLE_SQL = `WITH era_markers AS MATERIALIZED (
+// numbering across the CTE chain buys nothing. Plan-era bounds are disjoint
+// within each provider/limit context, including conflict gaps. Seek each era's
+// range through the deployed 0036 index; no wide raw or marker-stream table is
+// needed. Only rowids and compact partition values cross the window sorter.
+// Materialize endpoints BEFORE reset eligibility: collapse preserves every
+// distinct percentage and extremum, so the same slot-independent gates commute
+// with this slot-partitioned reduction. Hydrate wide rows only after the cap.
+// NOT MATERIALIZED keeps SQLite from retaining the entire compact window output
+// as a second dense table; the owning query-plan test verifies its coroutine.
+export const QUOTA_DOWNSAMPLE_SQL = `WITH era_markers AS MATERIALIZED (
     SELECT json_extract(e.value, '$[0]') AS provider,
       json_extract(e.value, '$[1]') AS limit_id,
       json_extract(e.value, '$[2]') AS plan_type,
@@ -556,24 +562,17 @@ const QUOTA_DOWNSAMPLE_SQL = `WITH era_markers AS MATERIALIZED (
       json_extract(e.value, '$[6]') AS upper_bound,
       json_extract(e.value, '$[7]') AS era_ordinal
     FROM json_each(?) e
-  ), raw_scoped AS MATERIALIZED (
-    SELECT r.occurrence_id AS occurrence_id,
-           r.observed_at AS observed_at,
-           r.provider AS provider,
-           r.plan_type AS plan_type,
-           r.plan_variant AS plan_variant,
-           r.limit_id AS limit_id,
-           r.slot AS slot,
-           r.used_percent AS used_percent,
-           r.window_duration_minutes AS window_duration_minutes,
-           r.resets_at AS resets_at,
-           r.id AS id
-      FROM telemetry_v1_records r
+  ), marked AS NOT MATERIALIZED (
+    SELECT r.id, r.observed_at, r.resets_at, r.used_percent, e.era_ordinal,
+           LAG(r.used_percent) OVER win AS prev_up,
+           LEAD(r.used_percent) OVER win AS next_up
+      FROM era_markers e
+      CROSS JOIN telemetry_v1_records r INDEXED BY telemetry_v1_records_participant_stream_observed
       JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
      WHERE ${WINNER_FILTER_SQL}
        AND r.participant_id = ?
        AND r.stream = 'quota'
-       AND r.observed_at >= ?
+       AND r.observed_at >= MAX(?, e.lower_bound)
        AND r.resets_at >= ?
        AND r.limit_id = 'codex'
        AND r.window_duration_minutes = ?
@@ -582,70 +581,37 @@ const QUOTA_DOWNSAMPLE_SQL = `WITH era_markers AS MATERIALIZED (
        AND r.used_percent IS NOT NULL
        AND r.plan_type IS NOT NULL
        AND r.plan_variant IS NOT NULL
-  ),
-  marker_stream AS (
-    SELECT r.*, 0 AS is_marker, 0 AS era_ordinal FROM raw_scoped r
-    UNION ALL
-    SELECT NULL AS occurrence_id, e.lower_bound AS observed_at, e.provider,
-      e.plan_type, e.plan_variant, e.limit_id, NULL AS slot,
-      NULL AS used_percent, NULL AS window_duration_minutes, NULL AS resets_at,
-      0 AS id, 1 AS is_marker, e.era_ordinal
-      FROM era_markers e
-  ), assigned AS (
-    SELECT *, MAX(era_ordinal) OVER (
-      PARTITION BY provider, limit_id ORDER BY observed_at, is_marker DESC, id
-      ROWS UNBOUNDED PRECEDING
-    ) AS assigned_era FROM marker_stream
-  ), scoped AS MATERIALIZED (
-    SELECT a.*, e.plan_era_key
-    FROM assigned a JOIN era_markers e ON e.era_ordinal = a.assigned_era
-    WHERE a.is_marker = 0 AND a.plan_type = e.plan_type
-      AND a.plan_variant = e.plan_variant AND a.observed_at >= e.lower_bound
-      AND (e.upper_bound IS NULL OR a.observed_at <= e.upper_bound)
-  ), fragment_stats AS (
-    SELECT provider, plan_type, plan_variant, limit_id,
-           window_duration_minutes, resets_at, plan_era_key,
-           COUNT(DISTINCT used_percent) AS boundary_count,
-           MAX(used_percent) - MIN(used_percent) AS displayed_span,
-           MAX(observed_at) AS last_observed_at
-      FROM scoped
-     GROUP BY provider, plan_type, plan_variant, limit_id,
-              window_duration_minutes, resets_at, plan_era_key
-  ), fitable AS (
-    SELECT * FROM fragment_stats WHERE boundary_count >= ? AND displayed_span >= ?
-  ),
-  survivors AS (
-    SELECT s.*
-      FROM scoped s
-      JOIN fitable f
-        ON f.provider = s.provider
-       AND f.plan_type = s.plan_type
-       AND f.plan_variant = s.plan_variant
-       AND f.limit_id = s.limit_id
-       AND f.window_duration_minutes = s.window_duration_minutes
-       AND f.resets_at = s.resets_at
-       AND f.plan_era_key = s.plan_era_key
-  ),
-  marked AS (
-    SELECT survivors.*,
-           LAG(used_percent) OVER win AS prev_up,
-           LEAD(used_percent) OVER win AS next_up
-      FROM survivors
+       AND r.provider = e.provider AND r.limit_id = e.limit_id
+       AND r.plan_type = e.plan_type AND r.plan_variant = e.plan_variant
+       -- Accepted v1 anchors have canonical four-digit-year chunk days. A
+       -- finite open-era bound preserves that domain and makes BOTH ends seekable.
+       AND r.observed_at <= COALESCE(e.upper_bound, '9999-12-31T23:59:59.999Z')
     WINDOW win AS (
-      PARTITION BY provider, plan_type, plan_variant, limit_id,
-                   window_duration_minutes, resets_at, slot, plan_era_key
-      ORDER BY observed_at, id
+      PARTITION BY e.era_ordinal, r.resets_at, r.slot
+      ORDER BY r.observed_at, r.id
     )
+  ), endpoints AS MATERIALIZED (
+    SELECT id, observed_at, resets_at, used_percent, era_ordinal
+      FROM marked
+     WHERE prev_up IS NULL OR next_up IS NULL
+        OR used_percent <> prev_up OR used_percent <> next_up
+  ), fitable AS (
+    SELECT era_ordinal, resets_at FROM endpoints
+     GROUP BY era_ordinal, resets_at
+    HAVING COUNT(DISTINCT used_percent) >= ?
+       AND MAX(used_percent) - MIN(used_percent) >= ?
+  ), selected AS (
+    SELECT s.id, s.observed_at, s.era_ordinal FROM endpoints s
+      JOIN fitable f ON f.era_ordinal = s.era_ordinal AND f.resets_at = s.resets_at
+     ORDER BY s.observed_at, s.id
+     LIMIT ?
   )
-  SELECT occurrence_id, observed_at, provider, plan_type, plan_variant,
-         limit_id, slot, used_percent, window_duration_minutes, resets_at, plan_era_key
-    FROM marked
-   WHERE prev_up IS NULL
-      OR next_up IS NULL
-      OR used_percent <> prev_up
-      OR used_percent <> next_up
-   ORDER BY observed_at, id
-   LIMIT ?`;
+  SELECT r.occurrence_id, r.observed_at, r.provider, r.plan_type, r.plan_variant,
+         r.limit_id, r.slot, r.used_percent, r.window_duration_minutes, r.resets_at,
+         e.plan_era_key
+    FROM selected s JOIN telemetry_v1_records r ON r.id = s.id
+    JOIN era_markers e ON e.era_ordinal = s.era_ordinal
+   ORDER BY s.observed_at, s.id`;
 
 // The already-deployed 0036 index has implicit rowid (= id) as its last key.
 // D1 does not seek that suffix through a row-value (time,id) predicate, but
