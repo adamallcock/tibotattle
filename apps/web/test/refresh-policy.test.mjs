@@ -14,12 +14,28 @@ function productionFunction(name) {
   return match[0];
 }
 
-function refreshHarness({ rejection = null, native = false, electron = false, bridge = undefined } = {}) {
+function refreshHarness({
+  rejection = null,
+  native = false,
+  electron = false,
+  bridge = undefined,
+  detailedSnapshot = false,
+} = {}) {
   const calls = [];
+  const routes = [];
   const notices = [];
   const timers = [];
   const buttons = new Map();
-  const priorDashboard = { mode: "local", state: "stale", activity: { lastScanAt: "2026-09-02T00:00:00.000Z" } };
+  const priorDashboard = {
+    mode: "local",
+    state: "stale",
+    activity: { lastScanAt: "2026-09-02T00:00:00.000Z" },
+    accounting: {
+      projection: detailedSnapshot
+        ? { status: "available", reason: null, terminal: false }
+        : { status: "unavailable", reason: "local_unified_index_deferred", terminal: true },
+    },
+  };
   const context = createContext({
     dashboard: priorDashboard,
     localActionBusy: false,
@@ -41,8 +57,16 @@ function refreshHarness({ rejection = null, native = false, electron = false, br
       return buttons.get(selector);
     },
     localClient: {
-      async refresh() { calls.push("quick"); if (rejection) throw rejection; },
-      async recalculateDetailedAccounting() { calls.push("detailed"); if (rejection) throw rejection; },
+      async refresh() {
+        calls.push("quick");
+        routes.push("/api/local/refresh/quick");
+        if (rejection) throw rejection;
+      },
+      async recalculateDetailedAccounting() {
+        calls.push("detailed");
+        routes.push("/api/local/refresh");
+        if (rejection) throw rejection;
+      },
       async refreshStatus() { calls.push("status"); return { refresh: { status: "succeeded" } }; },
     },
     createRefreshPollingBudget: () => ({ hasTime: () => true }),
@@ -66,7 +90,7 @@ function refreshHarness({ rejection = null, native = false, electron = false, br
   runInContext(productionFunction("signalElectronRefreshLifecycle"), context);
   runInContext(productionFunction("requestRefresh"), context);
   runInContext(productionFunction("scheduleReturningUserRefresh"), context);
-  return { context, calls, notices, timers, buttons, priorDashboard };
+  return { context, calls, routes, notices, timers, buttons, priorDashboard };
 }
 
 test("both visible manual refresh controls request detailed accounting once", async (t) => {
@@ -82,6 +106,7 @@ test("both visible manual refresh controls request detailed accounting once", as
       harness.buttons.get(selector).click({ type: "click", detailed: false });
       await new Promise(setImmediate);
       assert.deepEqual(harness.calls, ["detailed", "status", "reload", "continuation-check"]);
+      assert.deepEqual(harness.routes, ["/api/local/refresh"]);
       assert.equal(harness.context.localActionBusy, false);
       assert.equal(harness.context.localRefreshInProgress, false);
       assert.equal(harness.context.dashboard, harness.priorDashboard,
@@ -94,6 +119,7 @@ test("the shared default and automatic browser return refresh stay quick", async
   const direct = refreshHarness();
   await direct.context.requestRefresh();
   assert.deepEqual(direct.calls, ["quick", "status", "reload"]);
+  assert.deepEqual(direct.routes, ["/api/local/refresh/quick"]);
 
   const returning = refreshHarness();
   returning.context.scheduleReturningUserRefresh();
@@ -101,6 +127,7 @@ test("the shared default and automatic browser return refresh stay quick", async
   returning.timers[0]();
   await new Promise(setImmediate);
   assert.deepEqual(returning.calls, ["quick", "status", "reload"]);
+  assert.deepEqual(returning.routes, ["/api/local/refresh/quick"]);
 
   const native = refreshHarness({ native: true });
   native.context.scheduleReturningUserRefresh();
@@ -108,7 +135,7 @@ test("the shared default and automatic browser return refresh stay quick", async
   assert.deepEqual(native.calls, []);
 });
 
-test("Electron startup performs one guarded quick refresh after readiness", async () => {
+test("Electron startup performs one guarded detailed refresh without a trusted projection", async () => {
   const harness = refreshHarness({ electron: true });
   runInContext(productionFunction("startElectronStartupRefresh"), harness.context);
 
@@ -117,9 +144,21 @@ test("Electron startup performs one guarded quick refresh after readiness", asyn
   assert.equal(harness.context.startElectronStartupRefresh(), false);
   await new Promise(setImmediate);
 
-  assert.deepEqual(harness.calls, ["quick", "status", "reload"]);
+  assert.deepEqual(harness.calls, ["detailed", "status", "reload", "continuation-check"]);
+  assert.deepEqual(harness.routes, ["/api/local/refresh"]);
   assert.equal(harness.context.localActionBusy, false);
   assert.equal(harness.context.localRefreshInProgress, false);
+});
+
+test("Electron startup stays quick when a trusted detailed projection is present", async () => {
+  const harness = refreshHarness({ electron: true, detailedSnapshot: true });
+  runInContext(productionFunction("startElectronStartupRefresh"), harness.context);
+
+  assert.equal(harness.context.startElectronStartupRefresh(), true);
+  await new Promise(setImmediate);
+
+  assert.deepEqual(harness.calls, ["quick", "status", "reload"]);
+  assert.deepEqual(harness.routes, ["/api/local/refresh/quick"]);
 });
 
 test("qualified Electron startup waits for the preload smoke barrier", async () => {
@@ -139,7 +178,8 @@ test("qualified Electron startup waits for the preload smoke barrier", async () 
   release();
   await new Promise(setImmediate);
   await new Promise(setImmediate);
-  assert.deepEqual(harness.calls, ["quick", "status", "reload"]);
+  assert.deepEqual(harness.calls, ["detailed", "status", "reload", "continuation-check"]);
+  assert.deepEqual(harness.routes, ["/api/local/refresh"]);
 });
 
 test("accepted Electron refreshes acquire and settle the main-process lease", async () => {

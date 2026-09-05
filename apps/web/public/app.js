@@ -12343,6 +12343,20 @@ function startElectronStartupRefresh() {
     return false;
   }
   electronStartupRefreshTriggered = true;
+  // The companion's launch snapshot intentionally defers the unified history
+  // projection. A cold install therefore needs one detailed pass before the
+  // dashboard can claim retained history or accounting. Once a validated
+  // detailed projection is already present, the normal startup observation is
+  // the cheaper quick pass and the Electron controller owns later cadence.
+  const projection = dashboard?.accounting?.projection;
+  const startupRefreshOptions = projection?.status === "available"
+    && projection.reason === null
+    && projection.terminal === false
+    ? {}
+    : { detailed: true };
+  const runStartupRefresh = () => {
+    void requestRefresh(startupRefreshOptions);
+  };
   const macSmokeBridge = globalThis.__TIBOTATTLE_ELECTRON_MACOS_SMOKE__;
   const windowsSmokeBridge = globalThis.__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__;
   // A mixed or stale preload must not choose one platform barrier silently.
@@ -12365,12 +12379,10 @@ function startElectronStartupRefresh() {
       return true;
     }
     if (!gate || typeof gate.then !== "function") return true;
-    void Promise.resolve(gate).then(() => {
-      void requestRefresh();
-    }).catch(() => {});
+    void Promise.resolve(gate).then(runStartupRefresh).catch(() => {});
     return true;
   }
-  void requestRefresh();
+  runStartupRefresh();
   return true;
 }
 
