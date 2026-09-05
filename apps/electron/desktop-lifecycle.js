@@ -757,6 +757,7 @@ export function createDesktopLifecycle({
   }
 
   function destroySettingsWindow() {
+    if (settingsLoadState) settingsLoadState.requestedVisible = false;
     settingsLoadState = null;
     settingsWindowReadyListenerCleanup?.();
     settingsWindowReadyListenerCleanup = null;
@@ -850,7 +851,9 @@ export function createDesktopLifecycle({
       () => {
         if (settingsLoadState !== state || state.failed) return;
         state.loadSucceeded = true;
-        if (state.readyToShow) showApplicationWindow(candidate);
+        if (state.readyToShow && state.requestedVisible) {
+          showApplicationWindow(candidate);
+        }
       },
       () => {
         handleSettingsLoadFailure(candidate);
@@ -1018,12 +1021,13 @@ export function createDesktopLifecycle({
       failed: false,
       loadSucceeded: false,
       readyToShow: false,
+      requestedVisible: false,
     };
     settingsLoadState = settingsState;
     const onReadyToShow = () => {
       if (settingsLoadState !== settingsState || settingsState.failed) return;
       settingsState.readyToShow = true;
-      if (isLiveBrowserWindow(settingsWindow)) {
+      if (settingsState.requestedVisible && isLiveBrowserWindow(settingsWindow)) {
         showApplicationWindow(settingsWindow);
       }
     };
@@ -1045,6 +1049,7 @@ export function createDesktopLifecycle({
     const onWindowClose = (event) => {
       if (quitting || destroyingSettingsWindow) return;
       event?.preventDefault?.();
+      settingsState.requestedVisible = false;
       settingsWindow?.hide?.();
     };
     const onWindowClosed = () => {
@@ -1060,6 +1065,7 @@ export function createDesktopLifecycle({
       settingsWindowListenerCleanup = null;
       settingsPolicyInstallation?.remove?.();
       settingsPolicyInstallation = null;
+      settingsState.requestedVisible = false;
       settingsWindow = null;
       settingsLoadedURL = null;
       if (settingsLoadState === settingsState) settingsLoadState = null;
@@ -1084,6 +1090,7 @@ export function createDesktopLifecycle({
     if (hadWindow && settingsLoadedURL !== targetURL) {
       if (!startSettingsLoad(target, targetURL)) return false;
     }
+    if (settingsLoadState) settingsLoadState.requestedVisible = true;
     // A newly-created window waits for ready-to-show to avoid a blank flash;
     // an existing window is already safe to show and should be focused now.
     if (hadWindow) {
@@ -1094,6 +1101,7 @@ export function createDesktopLifecycle({
 
   function hideSettingsWindow() {
     if (!isLiveBrowserWindow(settingsWindow)) return false;
+    if (settingsLoadState) settingsLoadState.requestedVisible = false;
     settingsWindow.hide?.();
     return true;
   }

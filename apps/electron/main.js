@@ -21,6 +21,10 @@ const DEFAULT_RESOURCE_ROOT = resolve(MODULE_DIRECTORY, "../..");
 const ELECTRON_SMOKE_CONTROL = "quit-v1";
 export const MACOS_ELECTRON_LOCAL_QA_TEST_LANE =
   "macos-electron-local-qa-v1";
+const MACOS_ELECTRON_SMOKE_OBSERVE_MESSAGE_TYPE =
+  "tibotattle-macos-smoke-observe-v1";
+const MACOS_ELECTRON_SMOKE_STATE_MESSAGE_TYPE =
+  "tibotattle-macos-smoke-state-v1";
 const WINDOWS_ELECTRON_SMOKE_CONTROL = "windows-v1";
 const WINDOWS_ELECTRON_SMOKE_MESSAGE_TYPE = "windows-electron-smoke-v1";
 const WINDOWS_ELECTRON_SMOKE_COMMAND_MESSAGE = "command-v1";
@@ -180,6 +184,66 @@ function windowsSmokeCredentialMessage(operation, status) {
     operation,
     status,
   });
+}
+
+/**
+ * Observe only native BrowserWindow visibility for the exact local macOS
+ * smoke lane. This parent-process IPC seam intentionally accepts a single
+ * fixed request and emits two lifecycle-derived booleans. It is never exposed
+ * to a renderer, preload bridge, loopback route, or production environment.
+ */
+export function installMacosSmokeObservation(lifecycle, {
+  environment = process.env,
+  messageSource = process,
+  sendMessage = null,
+  platform = process.platform,
+} = {}) {
+  if (platform !== "darwin"
+      || environment.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL !== ELECTRON_SMOKE_CONTROL
+      || environment.USAGE_MONITOR_TEST_LANE !== MACOS_ELECTRON_LOCAL_QA_TEST_LANE
+      || typeof messageSource?.on !== "function"
+      || messageSource?.connected !== true
+      || typeof messageSource?.send !== "function") {
+    return () => {};
+  }
+  const sendControlMessage = sendMessage ?? messageSource.send;
+  if (typeof sendControlMessage !== "function") return () => {};
+  let active = true;
+  const sendState = () => {
+    if (!active) return;
+    const state = lifecycle?.state ?? {};
+    const message = Object.freeze({
+      type: MACOS_ELECTRON_SMOKE_STATE_MESSAGE_TYPE,
+      windowVisible: state.windowVisible === true,
+      settingsWindowVisible: state.settingsWindowVisible === true,
+    });
+    try {
+      sendControlMessage.call(messageSource, message, () => {});
+    } catch {
+      // A closed smoke parent channel must never change normal app behavior.
+    }
+  };
+  const onMessage = (message) => {
+    if (!active
+        || message === null
+        || typeof message !== "object"
+        || Array.isArray(message)
+        || Reflect.ownKeys(message).length !== 1
+        || message.type !== MACOS_ELECTRON_SMOKE_OBSERVE_MESSAGE_TYPE) {
+      return;
+    }
+    sendState();
+  };
+  const onDisconnect = () => cleanup();
+  const cleanup = () => {
+    if (!active) return;
+    active = false;
+    messageSource.off?.("message", onMessage);
+    messageSource.off?.("disconnect", onDisconnect);
+  };
+  messageSource.on("message", onMessage);
+  messageSource.on("disconnect", onDisconnect);
+  return cleanup;
 }
 
 /**
@@ -475,6 +539,7 @@ export async function launchElectronShell({
 if (process.versions.electron) {
   launchElectronShell({ emitFailureDiagnostic: true })
     .then((lifecycle) => {
+      if (lifecycle !== null) installMacosSmokeObservation(lifecycle);
       // The Linux GUI smoke needs a deterministic way to exercise the same
       // main-process shutdown path as the tray's Quit action. Keep that
       // control test-only, opt-in, and out of the renderer/preload boundary.

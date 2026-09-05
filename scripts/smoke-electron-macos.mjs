@@ -127,6 +127,7 @@ export const ELECTRON_MACOS_SMOKE_FAILURE_REASONS = Object.freeze([
   "share_flow_invalid",
   "settings_flow_invalid",
   "settings_tabs_invalid",
+  "settings_sharing_invalid",
   "clean_quit_invalid",
   "quit_signal_failed",
   "non_loopback_request",
@@ -157,6 +158,7 @@ const FAILURE_REASON_BY_CODE = Object.freeze({
   ELECTRON_MACOS_SMOKE_SHARE_FLOW_INVALID: "share_flow_invalid",
   ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID: "settings_flow_invalid",
   ELECTRON_MACOS_SMOKE_SETTINGS_TABS_INVALID: "settings_tabs_invalid",
+  ELECTRON_MACOS_SMOKE_SETTINGS_SHARING_INVALID: "settings_sharing_invalid",
   ELECTRON_MACOS_SMOKE_EXITED_BEFORE_QUIT: "clean_quit_invalid",
   ELECTRON_MACOS_SMOKE_QUIT_SIGNAL_FAILED: "quit_signal_failed",
   ELECTRON_MACOS_SMOKE_CLEAN_QUIT_INVALID: "clean_quit_invalid",
@@ -1965,6 +1967,49 @@ async function findSettingsTarget(port, dashboardOrigin) {
   return selectMacSettingsTarget(targets, dashboardOrigin, port);
 }
 
+/** Read only native visibility from the exact synthetic child over Node IPC. */
+export async function readMacSmokeWindowState(child) {
+  if (child?.connected !== true || typeof child.send !== "function"
+      || typeof child.on !== "function" || typeof child.off !== "function") {
+    fail("ELECTRON_MACOS_SMOKE_SETTINGS_SHARING_INVALID", "settings");
+  }
+  let resolveResponse;
+  let rejectResponse;
+  const response = new Promise((resolve, reject) => {
+    resolveResponse = resolve;
+    rejectResponse = reject;
+  });
+  const onMessage = (message) => {
+    if (message?.type !== "tibotattle-macos-smoke-state-v1") return;
+    if (Object.keys(message).length !== 3
+        || typeof message.windowVisible !== "boolean"
+        || typeof message.settingsWindowVisible !== "boolean") {
+      rejectResponse(new Error("Invalid native window state"));
+      return;
+    }
+    resolveResponse(Object.freeze({
+      windowVisible: message.windowVisible,
+      settingsWindowVisible: message.settingsWindowVisible,
+    }));
+  };
+  const onUnavailable = () => rejectResponse(new Error("Native window state unavailable"));
+  child.on("message", onMessage);
+  child.on("disconnect", onUnavailable);
+  child.on("exit", onUnavailable);
+  try {
+    child.send({ type: "tibotattle-macos-smoke-observe-v1" }, (error) => {
+      if (error) onUnavailable();
+    });
+    return await withTimeout(response, MAX_OPERATION_MS, "Native window state");
+  } catch {
+    fail("ELECTRON_MACOS_SMOKE_SETTINGS_SHARING_INVALID", "settings");
+  } finally {
+    child.off("message", onMessage);
+    child.off("disconnect", onUnavailable);
+    child.off("exit", onUnavailable);
+  }
+}
+
 /**
  * Close the real Settings renderer and observe the resulting lifecycle state.
  * Electron intentionally hides auxiliary Settings windows on ordinary close;
@@ -1972,7 +2017,7 @@ async function findSettingsTarget(port, dashboardOrigin) {
  * create a fresh BrowserWindow. A still-visible target is never accepted as
  * evidence of close/reopen.
  */
-async function closeMacSettingsWindow(settingsCdp, port, dashboardOrigin) {
+async function closeMacSettingsWindow(settingsCdp, port, dashboardOrigin, child) {
   const requested = await settingsCdp.evaluate(`(() => {
     try {
       window.close();
@@ -1986,22 +2031,15 @@ async function closeMacSettingsWindow(settingsCdp, port, dashboardOrigin) {
     return await waitFor(async () => {
       const target = await findSettingsTarget(port, dashboardOrigin);
       if (target === undefined) return "destroyed";
-      try {
-        return await settingsCdp.evaluate(
-          "document.visibilityState === 'hidden' ? 'hidden' : null",
-        );
-      } catch {
-        // A renderer target that disappears between /json and evaluate is a
-        // valid destroyed-close observation.
-        return "destroyed";
-      }
+      const native = await readMacSmokeWindowState(child);
+      return native.settingsWindowVisible === false ? "hidden" : null;
     }, MAX_OPERATION_MS, "Electron Settings close");
   } catch {
     fail("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
   }
 }
 
-async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath) {
+async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath, child) {
   const initialRefreshInterval = await readMacSyntheticFixtureRefreshInterval(settingsPath)
     .catch(() => null);
   if (initialRefreshInterval !== 300) {
@@ -2057,23 +2095,37 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath) {
         || state?.generalLanguageEnabled !== true) {
       fail("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
     }
+    const initialSettingsLoader = await mainFrameLoaderId(settingsCdp);
+    if (!initialSettingsLoader) {
+      fail("ELECTRON_MACOS_SMOKE_SETTINGS_TABS_INVALID", "settings");
+    }
     await settingsCdp.request("Page.navigate", {
       url: `${dashboardOrigin}/electron-settings.html#data`,
     });
+    await waitFor(() => settingsCdp.evaluate('location.hash === "#data"'),
+      MAX_STARTUP_MS, "Electron Settings Data fragment commit");
     // Changing only the fragment is a same-document navigation. Reload so
     // this checks an initial Data deep link, including the real mount/IPC
     // path, rather than expecting an already-mounted page to mount again.
     await settingsCdp.request("Page.reload");
-    const deepLinkedData = await waitFor(async () => settingsCdp.evaluate(`(() => {
+    const deepLinkedData = await waitFor(async () => {
+      // CDP acknowledges reload before the new document commits. Never let
+      // the previous document's ready bridge satisfy the deep-link proof.
+      const loader = await mainFrameLoaderId(settingsCdp);
+      if (!loader || loader === initialSettingsLoader) return false;
+      return settingsCdp.evaluate(`(() => {
       const activeTabs = [...document.querySelectorAll('[data-settings-tab][aria-selected="true"]')];
       const activePanels = [...document.querySelectorAll('[data-settings-panel]')]
         .filter((panel) => panel.hidden === false);
-      return document.querySelector("#settings-bridge-status")?.classList.contains("is-ready") === true
+      return document.readyState === "complete"
+        && location.hash === "#data"
+        && document.querySelector("#settings-bridge-status")?.classList.contains("is-ready") === true
         && activeTabs.length === 1
         && activeTabs[0].dataset.settingsTab === "data"
         && activePanels.length === 1
         && activePanels[0].dataset.settingsPanel === "data";
-    })()`), MAX_STARTUP_MS, "Electron Settings Data deep link").catch(() => false);
+    })()`);
+    }, MAX_STARTUP_MS, "Electron Settings Data deep link").catch(() => false);
     if (deepLinkedData !== true) {
       fail("ELECTRON_MACOS_SMOKE_SETTINGS_TABS_INVALID", "settings");
     }
@@ -2159,7 +2211,7 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath) {
       fail("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
     }
 
-    const closeObserved = await closeMacSettingsWindow(settingsCdp, port, dashboardOrigin);
+    const closeObserved = await closeMacSettingsWindow(settingsCdp, port, dashboardOrigin, child);
     settingsCdp.close();
     settingsCdp = null;
 
@@ -2176,15 +2228,15 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath) {
     settingsCdp = reopenedCdp;
     await reopenedCdp.request("Page.enable");
     const reopenedState = await waitFor(async () => {
+      const native = await readMacSmokeWindowState(child);
       const snapshot = await reopenedCdp.evaluate(`(() => ({
-        visibility: document.visibilityState,
         title: document.title,
         interval: document.querySelector("#settings-refresh-interval")?.value ?? null,
       }))()`);
-      return snapshot?.visibility === "visible"
+      return native.settingsWindowVisible === true
         && snapshot.title === "TiboTattle Settings"
         && snapshot.interval === "900"
-        ? snapshot
+        ? { ...snapshot, visibility: "visible" }
         : null;
     }, MAX_STARTUP_MS, "Electron Settings reopen render");
     const reopenedRefreshInterval = await waitFor(async () => {
@@ -2285,11 +2337,10 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath) {
         : null;
     }, MAX_OPERATION_MS, "Electron Community sharing").catch(() => null);
     const settingsVisibilityAfterManage = await waitFor(async () => {
-      const targetAfterManage = await findSettingsTarget(port, dashboardOrigin);
-      if (targetAfterManage === undefined) return "destroyed";
-      return await settingsCdp.evaluate(
-        "document.visibilityState === 'hidden' ? 'hidden' : null",
-      ).catch(() => "destroyed");
+      const native = await readMacSmokeWindowState(child);
+      return native.windowVisible === true && native.settingsWindowVisible === false
+        ? "hidden"
+        : null;
     }, MAX_OPERATION_MS, "Electron Settings hides for Community").catch(() => null);
     if (communitySharing === null
         || !["hidden", "destroyed"].includes(settingsVisibilityAfterManage)) {
@@ -2334,9 +2385,10 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath) {
     );
     settingsCdp = await connectCdp(sharingReopenedTarget);
     await settingsCdp.request("Page.enable");
-    await waitFor(async () => settingsCdp.evaluate(
-      "document.visibilityState === 'visible' ? true : null",
-    ), MAX_STARTUP_MS, "Electron Settings sharing reopen").catch(() => {
+    await waitFor(async () => {
+      const native = await readMacSmokeWindowState(child);
+      return native.settingsWindowVisible === true;
+    }, MAX_STARTUP_MS, "Electron Settings sharing reopen").catch(() => {
       fail("ELECTRON_MACOS_SMOKE_SETTINGS_SHARING_INVALID", "settings");
     });
     // Return through the actual tab control without reloading: the Settings
@@ -2780,7 +2832,7 @@ async function runSmoke(appPath, progress = {}, {
     ], {
       cwd: join(appPath, "Contents", "Resources"),
       env: Object.fromEntries(Object.entries(environment).filter(([, value]) => value !== undefined)),
-      stdio: "ignore",
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
     });
     // A missing executable or a launch-service rejection otherwise emits an
     // unhandled ChildProcess error before the bounded endpoint timeout can
@@ -2914,6 +2966,7 @@ async function runSmoke(appPath, progress = {}, {
       port,
       dashboardUrl.origin,
       fixture.settingsPath,
+      child,
     );
     recordSmokeProgress(progressRecord, "settings", settingsReceipt);
     if (networkEvidenceInvalid

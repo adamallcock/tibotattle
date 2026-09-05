@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,6 +23,7 @@ import {
   macSmokeCodexHomes,
   readMacSyntheticFixtureSettings,
   readMacSyntheticFixtureRefreshInterval,
+  readMacSmokeWindowState,
   classifyMacSettingsEvidence,
   classifyMacSettingsPersistenceEvidence,
   isMacDashboardTarget,
@@ -34,6 +36,51 @@ import {
 } from "../scripts/smoke-electron-macos.mjs";
 
 const TEST_SOURCE_REVISION = "a".repeat(40);
+
+test("native Settings visibility observation is bounded and removes listeners", async () => {
+  const child = new EventEmitter();
+  child.connected = true;
+  child.send = (request, callback) => {
+    assert.deepEqual(request, { type: "tibotattle-macos-smoke-observe-v1" });
+    callback(null);
+    queueMicrotask(() => child.emit("message", {
+      type: "tibotattle-macos-smoke-state-v1",
+      windowVisible: true,
+      settingsWindowVisible: false,
+    }));
+  };
+  assert.deepEqual(await readMacSmokeWindowState(child), {
+    windowVisible: true,
+    settingsWindowVisible: false,
+  });
+  assert.equal(child.listenerCount("message"), 0);
+  assert.equal(child.listenerCount("exit"), 0);
+  assert.equal(child.listenerCount("disconnect"), 0);
+});
+
+test("native Settings observation refuses malformed replies and unavailable children", async () => {
+  for (const reply of [
+    { type: "tibotattle-macos-smoke-state-v1", windowVisible: true, settingsWindowVisible: "false" },
+    { type: "tibotattle-macos-smoke-state-v1", windowVisible: true, settingsWindowVisible: false, extra: true },
+  ]) {
+    const child = new EventEmitter();
+    child.connected = true;
+    child.send = () => queueMicrotask(() => child.emit("message", reply));
+    await assert.rejects(readMacSmokeWindowState(child), {
+      code: "ELECTRON_MACOS_SMOKE_SETTINGS_SHARING_INVALID",
+    });
+    assert.equal(child.listenerCount("message"), 0);
+  }
+  const disconnected = new EventEmitter();
+  disconnected.connected = false;
+  disconnected.send = () => assert.fail("must not send to a disconnected child");
+  await assert.rejects(readMacSmokeWindowState(disconnected));
+  const exiting = new EventEmitter();
+  exiting.connected = true;
+  exiting.send = () => queueMicrotask(() => exiting.emit("disconnect"));
+  await assert.rejects(readMacSmokeWindowState(exiting));
+  assert.equal(exiting.listenerCount("disconnect"), 0);
+});
 
 test("tray capture binds the transient page to its owned debugging endpoint", () => {
   const origin = "http://127.0.0.1:54321";

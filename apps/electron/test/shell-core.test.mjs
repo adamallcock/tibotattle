@@ -2331,6 +2331,128 @@ for (const failureMode of ["loadURL", "did-fail-load", "render-process-gone"]) {
   });
 }
 
+test("Settings hide intent blocks late load completion until explicit reopen", async () => {
+  const app = new FakeApp();
+  const windows = [];
+  const supervisor = {
+    setUnexpectedExitHandler() {},
+    async start() {
+      return { origin: "http://127.0.0.1:4082" };
+    },
+    async stop() {},
+  };
+  let resolveSettingsLoad;
+  class DeferredSettingsWindow extends FakeWindow {
+    constructor(options) {
+      super(options);
+      windows.push(this);
+    }
+
+    loadURL(url) {
+      this.loaded.push(url);
+      if (url.includes("electron-settings.html")) {
+        return new Promise((resolve) => {
+          resolveSettingsLoad = resolve;
+        });
+      }
+      return Promise.resolve();
+    }
+  }
+  const lifecycle = createDesktopLifecycle({
+    app,
+    BrowserWindow: DeferredSettingsWindow,
+    Tray: FakeTray,
+    Menu: { buildFromTemplate: (template) => ({ template }) },
+    icon: "empty-icon",
+    preloadPath: "/private/preload.cjs",
+    supervisor,
+  });
+
+  await lifecycle.start();
+  assert.equal(lifecycle.showSettingsWindow(), true);
+  const settings = windows.find((candidate) => (
+    candidate.loaded[0]?.includes("electron-settings.html")
+  ));
+  assert.notEqual(settings, undefined);
+  assert.equal(typeof resolveSettingsLoad, "function");
+  settings.emit("ready-to-show");
+  assert.equal(settings.visible, true);
+  assert.equal(lifecycle.hideSettingsWindow(), true);
+  assert.equal(settings.visible, false);
+
+  resolveSettingsLoad();
+  await nextTick();
+  assert.equal(settings.visible, false, "late load completion must respect the hidden intent");
+
+  assert.equal(lifecycle.showSettingsWindow(), true);
+  assert.equal(settings.visible, true, "an explicit reopen restores visibility");
+  await lifecycle.dispose();
+});
+
+test("Settings close intent blocks deferred readiness until explicit reopen", async () => {
+  const app = new FakeApp();
+  const windows = [];
+  const supervisor = {
+    setUnexpectedExitHandler() {},
+    async start() {
+      return { origin: "http://127.0.0.1:4083" };
+    },
+    async stop() {},
+  };
+  let resolveSettingsLoad;
+  class DeferredSettingsWindow extends FakeWindow {
+    constructor(options) {
+      super(options);
+      windows.push(this);
+    }
+
+    loadURL(url) {
+      this.loaded.push(url);
+      if (url.includes("electron-settings.html")) {
+        return new Promise((resolve) => {
+          resolveSettingsLoad = resolve;
+        });
+      }
+      return Promise.resolve();
+    }
+  }
+  const lifecycle = createDesktopLifecycle({
+    app,
+    BrowserWindow: DeferredSettingsWindow,
+    Tray: FakeTray,
+    Menu: { buildFromTemplate: (template) => ({ template }) },
+    icon: "empty-icon",
+    preloadPath: "/private/preload.cjs",
+    supervisor,
+  });
+
+  await lifecycle.start();
+  assert.equal(lifecycle.showSettingsWindow(), true);
+  const settings = windows.find((candidate) => (
+    candidate.loaded[0]?.includes("electron-settings.html")
+  ));
+  assert.notEqual(settings, undefined);
+  assert.equal(typeof resolveSettingsLoad, "function");
+  let closePrevented = false;
+  settings.emit("close", {
+    preventDefault() {
+      closePrevented = true;
+    },
+  });
+  assert.equal(closePrevented, true);
+  assert.equal(settings.visible, false);
+
+  settings.emit("ready-to-show");
+  assert.equal(settings.visible, false, "late readiness must respect the closed intent");
+  resolveSettingsLoad();
+  await nextTick();
+  assert.equal(settings.visible, false);
+
+  assert.equal(lifecycle.showSettingsWindow(), true);
+  assert.equal(settings.visible, true, "an explicit reopen restores visibility");
+  await lifecycle.dispose();
+});
+
 test("desktop lifecycle invalidates a dead companion, auto-restarts once, then requires tray Retry", async () => {
   const app = new FakeApp();
   const windows = [];
