@@ -3837,7 +3837,7 @@ export class LocalCompanionDataStore {
     if (this.#snapshot === null) {
       const restored = await this.#restoreLastAuthoritativeSnapshot();
       try {
-        await this.reload(options);
+        await this.reload({ ...options, returnOverview: false });
       } catch (error) {
         if (!restored) throw error;
         this.#markRestoredSnapshotUnavailable();
@@ -3847,7 +3847,11 @@ export class LocalCompanionDataStore {
   }
 
   async reload(options) {
-    const signal = options?.signal ?? null;
+    const { returnOverview = true, ...builderOptions } = options ?? {};
+    if (typeof returnOverview !== "boolean") {
+      throw new TypeError("options.returnOverview must be a boolean");
+    }
+    const signal = builderOptions.signal ?? null;
     if (signal !== null
         && (typeof signal !== "object"
           || typeof signal.aborted !== "boolean"
@@ -3857,7 +3861,7 @@ export class LocalCompanionDataStore {
     if (signal?.aborted === true) {
       throw fixedError("local_companion_snapshot_reload_aborted");
     }
-    const candidate = await this.#builder(options);
+    const candidate = await this.#builder(builderOptions);
     // Cancellation may arrive while an off-main projection is finishing. Do
     // not publish the candidate after the controller has cancelled its run.
     if (signal?.aborted === true) {
@@ -3868,10 +3872,13 @@ export class LocalCompanionDataStore {
     }
     this.#snapshot = this.#withRetainedProjection(
       structuredClone(candidate),
-      options,
+      builderOptions,
     );
     await this.#persistAuthoritativeSnapshot(candidate);
-    return this.getOverview();
+    // Refresh orchestration needs publication, not another deep copy of the
+    // retained timeline. Accessors and ordinary reload callers still receive
+    // isolated copies; the builder never sees this presentation-only option.
+    return returnOverview ? this.getOverview() : undefined;
   }
 
   async #restoreLastAuthoritativeSnapshot() {

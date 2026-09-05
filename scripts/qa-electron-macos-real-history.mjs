@@ -54,7 +54,9 @@ export const REAL_HISTORY_QA_TIMEOUTS = Object.freeze({
   startupMs: 60_000,
   healthMs: 10_000,
   timerMs: 30_000,
-  controlPlaneMs: 10_000,
+  // Two warm-up rounds plus twenty active rounds run in parallel per endpoint.
+  // This remains bounded even when a request reaches the three-second ceiling.
+  controlPlaneMs: 75_000,
   cancelMs: 45_000,
   retryMs: 15_000,
   uiMs: 30_000,
@@ -71,6 +73,12 @@ export const REAL_HISTORY_QA_TIMEOUTS = Object.freeze({
 // eventual refresh result is correct. Keep this per-request ceiling separate
 // from the G1 p95 ceiling and the much longer work/terminal budgets below.
 export const REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS = 3_000;
+// Receipt diagnostics retain only a bounded over-limit marker. A serialized
+// value of 3,001 means "at least 3,001 ms" rather than an exact elapsed time,
+// so a pathological response cannot be hidden as zero or expand the
+// content-free receipt without bound.
+export const REAL_HISTORY_QA_CONTROL_PLANE_OVER_LIMIT_LATENCY_MS =
+  REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS + 1;
 // G1 requires the sampled health/status control-plane latency p95 to remain at
 // or below 250 ms. The max ceiling above remains in force for every sample;
 // p95 is an additional aggregate gate, not a replacement for that check.
@@ -78,8 +86,20 @@ export const REAL_HISTORY_QA_CONTROL_PLANE_P95_MAX_LATENCY_MS = 250;
 // The first useful refresh result is a separate G1 startup gate. Snapshot mode
 // deliberately does not evaluate it, so its receipt may retain null here.
 export const REAL_HISTORY_QA_QUICK_RESULT_MAX_MS = 30_000;
-const CONTROL_PLANE_MIN_SAMPLES = 3;
-const CONTROL_PLANE_SAMPLE_INTERVAL_MS = 500;
+// Legacy v4 receipts recorded three combined health/status rounds. Keep their
+// validator so historical receipts remain readable, while new samples use a
+// separately identified endpoint shape below.
+const CONTROL_PLANE_LEGACY_MIN_SAMPLES = 3;
+const CONTROL_PLANE_WARMUP_SAMPLES = 2;
+const CONTROL_PLANE_ACTIVE_MIN_SAMPLES = 20;
+const CONTROL_PLANE_SAMPLE_INTERVAL_MS = 250;
+const CONTROL_PLANE_ENDPOINT_SAMPLING_VERSION_V1 = "endpoint-separated-v1";
+const CONTROL_PLANE_ENDPOINT_SAMPLING_VERSION = "endpoint-separated-v2";
+const CONTROL_PLANE_ENDPOINT_SAMPLING_VERSIONS = new Set([
+  CONTROL_PLANE_ENDPOINT_SAMPLING_VERSION_V1,
+  CONTROL_PLANE_ENDPOINT_SAMPLING_VERSION,
+]);
+const CONTROL_PLANE_MAX_RECEIPT_SAMPLES = 1_000;
 
 const DEGRADED_FAILURE_CODES = new Set([
   "codex_rollout_compression_unsupported",
@@ -117,6 +137,7 @@ const FAILURE_REASONS = new Set([
   "quick_result_timeout",
   "timer_stalled",
   "control_plane_unresponsive",
+  "control_plane_phase_coverage_invalid",
   "cancel_unavailable",
   "cancel_not_acknowledged",
   "cancel_http_invalid",
@@ -1187,8 +1208,8 @@ async function refreshStatus(session, timeoutMs = REAL_HISTORY_QA_TIMEOUTS.healt
   );
 }
 
-async function fetchJsonMeasured(url, timeoutMs) {
-  const startedAt = Date.now();
+export async function fetchJsonMeasured(url, timeoutMs) {
+  const startedAtMonotonicMs = monotonicNowMs();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let status = null;
@@ -1209,14 +1230,14 @@ async function fetchJsonMeasured(url, timeoutMs) {
   return Object.freeze({
     status,
     body,
-    latencyMs: Math.max(0, Date.now() - startedAt),
+    latencyMs: Math.max(0, Math.round(monotonicNowMs() - startedAtMonotonicMs)),
   });
 }
 
 /**
  * Calculate the nearest-rank p95 without retaining the individual response
- * timings in a receipt. A p95 of a small sample is intentionally conservative:
- * with six request timings (three health/status pairs), it is the maximum.
+ * timings in a receipt. Endpoint samples stay in memory only; the receipt
+ * records their bounded count and summary.
  */
 export function controlPlaneLatencyP95Ms(values) {
   if (!Array.isArray(values)
@@ -1230,15 +1251,64 @@ export function controlPlaneLatencyP95Ms(values) {
   return sorted[rank - 1];
 }
 
-export function controlPlaneSnapshotValid(snapshot) {
+function controlPlanePhaseSummaryValid(
+  summary,
+  minimumSampleCount,
+  p95MaxLatencyMs,
+) {
+  return summary !== null
+    && typeof summary === "object"
+    && Number.isSafeInteger(summary.sampleCount)
+    && summary.sampleCount >= minimumSampleCount
+    && Number.isSafeInteger(summary.successCount)
+    && summary.successCount === summary.sampleCount
+    && Number.isSafeInteger(summary.maxLatencyMs)
+    && summary.maxLatencyMs >= 0
+    && summary.maxLatencyMs <= REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS
+    && Number.isSafeInteger(summary.p95LatencyMs)
+    && summary.p95LatencyMs >= 0
+    && summary.p95LatencyMs <= p95MaxLatencyMs
+    && summary.p95LatencyMs <= summary.maxLatencyMs;
+}
+
+function controlPlaneCoveragePhaseValid(coverage, sampleCount) {
+  return coverage !== null
+    && typeof coverage === "object"
+    && !Array.isArray(coverage)
+    && Number.isSafeInteger(coverage.beforeQuickResultRounds)
+    && coverage.beforeQuickResultRounds >= 0
+    && coverage.beforeQuickResultRounds <= CONTROL_PLANE_MAX_RECEIPT_SAMPLES
+    && Number.isSafeInteger(coverage.atOrAfterQuickResultRounds)
+    && coverage.atOrAfterQuickResultRounds >= 0
+    && coverage.atOrAfterQuickResultRounds <= CONTROL_PLANE_MAX_RECEIPT_SAMPLES
+    && coverage.beforeQuickResultRounds + coverage.atOrAfterQuickResultRounds === sampleCount;
+}
+
+function phaseInclusiveControlPlaneCoverageValid(coverage, warmupSampleCount, activeSampleCount) {
+  return coverage !== null
+    && typeof coverage === "object"
+    && !Array.isArray(coverage)
+    && coverage.startedBeforeQuickResult === true
+    && coverage.quickResultObserved === true
+    && controlPlaneCoveragePhaseValid(coverage.warmup, warmupSampleCount)
+    && controlPlaneCoveragePhaseValid(coverage.active, activeSampleCount)
+    // The first sampler response, rather than a caller-supplied constant,
+    // establishes the pre-quick claim. Keep that observed warm-up evidence
+    // explicit when publication happens during the remainder of warm-up.
+    && coverage.warmup.beforeQuickResultRounds >= 1
+    && coverage.warmup.atOrAfterQuickResultRounds
+      + coverage.active.atOrAfterQuickResultRounds >= 1;
+}
+
+function legacyControlPlaneSnapshotValid(snapshot) {
   return snapshot?.active === true
     && Number.isSafeInteger(snapshot.sampleCount)
-    && snapshot.sampleCount >= CONTROL_PLANE_MIN_SAMPLES
+    && snapshot.sampleCount >= CONTROL_PLANE_LEGACY_MIN_SAMPLES
     && Number.isSafeInteger(snapshot.healthSuccessCount)
-    && snapshot.healthSuccessCount >= CONTROL_PLANE_MIN_SAMPLES
+    && snapshot.healthSuccessCount >= CONTROL_PLANE_LEGACY_MIN_SAMPLES
     && snapshot.healthSuccessCount <= snapshot.sampleCount
     && Number.isSafeInteger(snapshot.refreshStatusSuccessCount)
-    && snapshot.refreshStatusSuccessCount >= CONTROL_PLANE_MIN_SAMPLES
+    && snapshot.refreshStatusSuccessCount >= CONTROL_PLANE_LEGACY_MIN_SAMPLES
     && snapshot.refreshStatusSuccessCount <= snapshot.sampleCount
     && Number.isSafeInteger(snapshot.maxLatencyMs)
     && snapshot.maxLatencyMs >= 0
@@ -1247,6 +1317,193 @@ export function controlPlaneSnapshotValid(snapshot) {
     && snapshot.p95LatencyMs >= 0
     && snapshot.p95LatencyMs <= REAL_HISTORY_QA_CONTROL_PLANE_P95_MAX_LATENCY_MS
     && snapshot.p95LatencyMs <= snapshot.maxLatencyMs;
+}
+
+function endpointSeparatedControlPlaneSnapshotValid(snapshot) {
+  const endpointLatency = snapshot?.endpointLatency;
+  if (endpointLatency === null || typeof endpointLatency !== "object"
+      || !CONTROL_PLANE_ENDPOINT_SAMPLING_VERSIONS.has(endpointLatency.samplingVersion)) {
+    return false;
+  }
+  const health = endpointLatency.health;
+  const refreshStatus = endpointLatency.refreshStatus;
+  if (health === null || typeof health !== "object"
+      || refreshStatus === null || typeof refreshStatus !== "object"
+      || !controlPlanePhaseSummaryValid(
+        health.warmup,
+        CONTROL_PLANE_WARMUP_SAMPLES,
+        REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS,
+      )
+      || !controlPlanePhaseSummaryValid(
+        refreshStatus.warmup,
+        CONTROL_PLANE_WARMUP_SAMPLES,
+        REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS,
+      )
+      || !controlPlanePhaseSummaryValid(
+        health.active,
+        CONTROL_PLANE_ACTIVE_MIN_SAMPLES,
+        REAL_HISTORY_QA_CONTROL_PLANE_P95_MAX_LATENCY_MS,
+      )
+      || !controlPlanePhaseSummaryValid(
+        refreshStatus.active,
+        CONTROL_PLANE_ACTIVE_MIN_SAMPLES,
+        REAL_HISTORY_QA_CONTROL_PLANE_P95_MAX_LATENCY_MS,
+      )) {
+    return false;
+  }
+  if (endpointLatency.samplingVersion === CONTROL_PLANE_ENDPOINT_SAMPLING_VERSION
+      && !phaseInclusiveControlPlaneCoverageValid(
+        endpointLatency.coverage,
+        health.warmup.sampleCount,
+        health.active.sampleCount,
+      )) {
+    return false;
+  }
+  return snapshot.active === true
+    && health.warmup.sampleCount === refreshStatus.warmup.sampleCount
+    && health.active.sampleCount === refreshStatus.active.sampleCount
+    && snapshot.sampleCount === health.active.sampleCount
+    && snapshot.sampleCount === refreshStatus.active.sampleCount
+    && snapshot.healthSuccessCount === health.active.successCount
+    && snapshot.refreshStatusSuccessCount === refreshStatus.active.successCount
+    && snapshot.maxLatencyMs === Math.max(
+      health.warmup.maxLatencyMs,
+      health.active.maxLatencyMs,
+      refreshStatus.warmup.maxLatencyMs,
+      refreshStatus.active.maxLatencyMs,
+    )
+    && snapshot.p95LatencyMs === Math.max(
+      health.active.p95LatencyMs,
+      refreshStatus.active.p95LatencyMs,
+    );
+}
+
+export function controlPlaneSnapshotValid(snapshot) {
+  return snapshot?.endpointLatency === undefined
+    ? legacyControlPlaneSnapshotValid(snapshot)
+    : endpointSeparatedControlPlaneSnapshotValid(snapshot);
+}
+
+function createControlPlanePhaseSamples() {
+  return {
+    sampleCount: 0,
+    healthSuccessCount: 0,
+    refreshStatusSuccessCount: 0,
+    healthLatencies: [],
+    refreshStatusLatencies: [],
+  };
+}
+
+function createControlPlaneQuickResultCoverage() {
+  return {
+    // The first sampled /refresh response sets this from observed state. It
+    // starts unknown so a caller cannot claim pre-quick coverage by fiat.
+    startedBeforeQuickResult: null,
+    quickResultObserved: false,
+    warmup: {
+      beforeQuickResultRounds: 0,
+      atOrAfterQuickResultRounds: 0,
+    },
+    active: {
+      beforeQuickResultRounds: 0,
+      atOrAfterQuickResultRounds: 0,
+    },
+  };
+}
+
+function recordControlPlaneQuickResultCoverage(coverage, phaseName, refresh) {
+  if (coverage === null) return;
+  const quickResultPublished = coverage.quickResultObserved
+    || validQuickResultAt(refresh?.quickResultAt);
+  if (coverage.startedBeforeQuickResult === null) {
+    coverage.startedBeforeQuickResult = !quickResultPublished;
+  }
+  if (quickResultPublished) coverage.quickResultObserved = true;
+  const phase = phaseName === "warmup" ? coverage.warmup : coverage.active;
+  if (quickResultPublished) {
+    phase.atOrAfterQuickResultRounds += 1;
+  } else {
+    phase.beforeQuickResultRounds += 1;
+  }
+}
+
+function controlPlaneQuickResultCoverageSnapshot(coverage) {
+  if (coverage === null) return null;
+  const phase = (value) => Object.freeze({
+    beforeQuickResultRounds: value.beforeQuickResultRounds,
+    atOrAfterQuickResultRounds: value.atOrAfterQuickResultRounds,
+  });
+  return Object.freeze({
+    startedBeforeQuickResult: coverage.startedBeforeQuickResult === true,
+    quickResultObserved: coverage.quickResultObserved === true,
+    warmup: phase(coverage.warmup),
+    active: phase(coverage.active),
+  });
+}
+
+function controlPlanePhaseSummary(sampleCount, successCount, latencies) {
+  return Object.freeze({
+    sampleCount,
+    successCount,
+    maxLatencyMs: latencies.length === 0 ? 0 : Math.max(...latencies),
+    p95LatencyMs: controlPlaneLatencyP95Ms(latencies),
+  });
+}
+
+function controlPlaneSnapshotFromPhaseSamples({
+  warmup,
+  activeSamples,
+  isActive,
+  quickResultCoverage = null,
+}) {
+  const healthWarmup = controlPlanePhaseSummary(
+    warmup.sampleCount,
+    warmup.healthSuccessCount,
+    warmup.healthLatencies,
+  );
+  const healthActive = controlPlanePhaseSummary(
+    activeSamples.sampleCount,
+    activeSamples.healthSuccessCount,
+    activeSamples.healthLatencies,
+  );
+  const refreshStatusWarmup = controlPlanePhaseSummary(
+    warmup.sampleCount,
+    warmup.refreshStatusSuccessCount,
+    warmup.refreshStatusLatencies,
+  );
+  const refreshStatusActive = controlPlanePhaseSummary(
+    activeSamples.sampleCount,
+    activeSamples.refreshStatusSuccessCount,
+    activeSamples.refreshStatusLatencies,
+  );
+  const coverage = controlPlaneQuickResultCoverageSnapshot(quickResultCoverage);
+  const endpointLatency = Object.freeze({
+    samplingVersion: coverage === null
+      ? CONTROL_PLANE_ENDPOINT_SAMPLING_VERSION_V1
+      : CONTROL_PLANE_ENDPOINT_SAMPLING_VERSION,
+    health: Object.freeze({ warmup: healthWarmup, active: healthActive }),
+    refreshStatus: Object.freeze({ warmup: refreshStatusWarmup, active: refreshStatusActive }),
+    ...(coverage === null ? {} : { coverage }),
+  });
+  const activeP95Latencies = [healthActive.p95LatencyMs, refreshStatusActive.p95LatencyMs];
+  return Object.freeze({
+    active: isActive,
+    // The top-level count continues to identify the samples used for the p95.
+    // Warm-up rounds remain available separately for diagnosis.
+    sampleCount: activeSamples.sampleCount,
+    healthSuccessCount: activeSamples.healthSuccessCount,
+    refreshStatusSuccessCount: activeSamples.refreshStatusSuccessCount,
+    maxLatencyMs: Math.max(
+      healthWarmup.maxLatencyMs,
+      healthActive.maxLatencyMs,
+      refreshStatusWarmup.maxLatencyMs,
+      refreshStatusActive.maxLatencyMs,
+    ),
+    p95LatencyMs: activeP95Latencies.every(Number.isSafeInteger)
+      ? Math.max(...activeP95Latencies)
+      : null,
+    endpointLatency,
+  });
 }
 
 export function cancelHttpResponseValid(response) {
@@ -1326,55 +1583,68 @@ async function sampleControlPlaneStatus(
   session,
   expectedRefreshId,
   maxDurationMs = REAL_HISTORY_QA_TIMEOUTS.controlPlaneMs,
+  { requireQuickResultCoverage = false } = {},
 ) {
   const healthUrl = new URL("/api/local/health", session.dashboardUrl);
   const refreshUrl = new URL("/api/local/refresh", session.dashboardUrl);
-  const requestTimeoutMs = Math.min(
-    REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS,
-    Math.max(0, maxDurationMs),
-  );
-  const deadline = Date.now() + Math.min(
+  const deadlineMonotonicMs = monotonicNowMs() + Math.min(
     REAL_HISTORY_QA_TIMEOUTS.controlPlaneMs,
     Math.max(0, maxDurationMs),
   );
-  let sampleCount = 0;
-  let healthSuccessCount = 0;
-  let refreshStatusSuccessCount = 0;
-  let maxLatencyMs = 0;
-  const latencySamples = [];
-  const failure = () => {
+  const warmup = createControlPlanePhaseSamples();
+  const active = createControlPlanePhaseSamples();
+  const quickResultCoverage = requireQuickResultCoverage
+    ? createControlPlaneQuickResultCoverage()
+    : null;
+  const snapshot = (isActive) => controlPlaneSnapshotFromPhaseSamples({
+    warmup,
+    activeSamples: active,
+    isActive,
+    quickResultCoverage,
+  });
+  const failure = (reason = "control_plane_unresponsive") => {
     const error = qaError(
-      "REAL_HISTORY_QA_CONTROL_PLANE_UNRESPONSIVE",
+      reason === "control_plane_phase_coverage_invalid"
+        ? "REAL_HISTORY_QA_CONTROL_PLANE_PHASE_COVERAGE_INVALID"
+        : "REAL_HISTORY_QA_CONTROL_PLANE_UNRESPONSIVE",
       "refresh",
-      "control_plane_unresponsive",
+      reason,
     );
     attachQaEvidence(error, {
-      controlPlane: {
-        active: false,
-        sampleCount,
-        healthSuccessCount,
-        refreshStatusSuccessCount,
-        maxLatencyMs,
-        p95LatencyMs: controlPlaneLatencyP95Ms(latencySamples),
-      },
+      controlPlane: snapshot(false),
     });
     return error;
   };
-  while (Date.now() < deadline) {
+  const sampleRound = async (samples, phaseName) => {
+    const requestTimeoutMs = Math.min(
+      REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS,
+      Math.max(0, Math.ceil(deadlineMonotonicMs - monotonicNowMs())),
+    );
+    if (requestTimeoutMs === 0) {
+      throw failure(requireQuickResultCoverage
+        ? "control_plane_phase_coverage_invalid"
+        : "control_plane_unresponsive");
+    }
     const [health, status] = await Promise.all([
       fetchJsonMeasured(healthUrl, requestTimeoutMs),
       fetchJsonMeasured(refreshUrl, requestTimeoutMs),
     ]);
-    sampleCount += 1;
-    latencySamples.push(health.latencyMs, status.latencyMs);
-    maxLatencyMs = Math.max(maxLatencyMs, health.latencyMs, status.latencyMs);
+    samples.sampleCount += 1;
+    samples.healthLatencies.push(health.latencyMs);
+    samples.refreshStatusLatencies.push(status.latencyMs);
     if (health.status === 200 && health.body?.status === "ready") {
-      healthSuccessCount += 1;
+      samples.healthSuccessCount += 1;
     }
-    if (status.status === 200
-        && status.body?.refresh?.refreshId === expectedRefreshId
-        && ["running", "cancelling"].includes(status.body.refresh.status)) {
-      refreshStatusSuccessCount += 1;
+    const refreshStatusAccepted = status.status === 200
+      && status.body?.refresh?.refreshId === expectedRefreshId
+      && ["running", "cancelling"].includes(status.body.refresh.status);
+    if (refreshStatusAccepted) {
+      samples.refreshStatusSuccessCount += 1;
+      recordControlPlaneQuickResultCoverage(
+        quickResultCoverage,
+        phaseName,
+        status.body.refresh,
+      );
     }
     // A slow successful response is just as user-visible as a timeout. Fail
     // at the measured boundary rather than allowing a later fast sample to
@@ -1383,26 +1653,34 @@ async function sampleControlPlaneStatus(
         || status.latencyMs > REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS) {
       throw failure();
     }
-    if (healthSuccessCount >= CONTROL_PLANE_MIN_SAMPLES
-        && refreshStatusSuccessCount >= CONTROL_PLANE_MIN_SAMPLES) {
-      const result = Object.freeze({
-        active: true,
-        sampleCount,
-        healthSuccessCount,
-        refreshStatusSuccessCount,
-        maxLatencyMs,
-        p95LatencyMs: controlPlaneLatencyP95Ms(latencySamples),
-      });
-      if (!controlPlaneSnapshotValid(result)) {
-        const error = failure();
-        attachQaEvidence(error, { controlPlane: result });
-        throw error;
-      }
-      return result;
+  };
+  for (let round = 0; round < CONTROL_PLANE_WARMUP_SAMPLES; round += 1) {
+    await sampleRound(warmup, "warmup");
+    // A v2 target only qualifies if its first sampled status explicitly saw
+    // the refresh before quick publication. Do not infer this from the caller
+    // or from later status; the partial receipt remains available on failure.
+    if (quickResultCoverage !== null
+        && warmup.sampleCount === 1
+        && quickResultCoverage.startedBeforeQuickResult !== true) {
+      throw failure("control_plane_phase_coverage_invalid");
     }
     await wait(CONTROL_PLANE_SAMPLE_INTERVAL_MS);
   }
-  throw failure();
+  while (true) {
+    await sampleRound(active, "active");
+    const activeSamplesComplete = active.sampleCount >= CONTROL_PLANE_ACTIVE_MIN_SAMPLES;
+    const quickResultCoverageComplete = quickResultCoverage === null
+      || quickResultCoverage.quickResultObserved === true;
+    if (activeSamplesComplete && quickResultCoverageComplete) break;
+    await wait(CONTROL_PLANE_SAMPLE_INTERVAL_MS);
+  }
+  const result = snapshot(true);
+  if (!controlPlaneSnapshotValid(result)) {
+    const error = failure();
+    attachQaEvidence(error, { controlPlane: result });
+    throw error;
+  }
+  return result;
 }
 
 async function waitCancelHttpResponse(session) {
@@ -1781,28 +2059,26 @@ async function waitCancelAcknowledged(session) {
   }
 }
 
-export function realHistoryCancelBoundaryReady(refresh) {
-  if (refresh === null
-      || typeof refresh !== "object"
-      || Array.isArray(refresh)
-      || refresh.status !== "running"
-      || typeof refresh.refreshId !== "string"
-      || refresh.refreshId.length === 0
-      || typeof refresh.quickResultAt !== "string"
-      || !Number.isFinite(Date.parse(refresh.quickResultAt))) return false;
-  if (refresh.progress?.phase === "quick_result") return true;
-  const progress = refresh.progress;
-  return progress?.kind === "unified_index"
-    && progress.status === "scanning"
-    && progress.phase === "rollout_index"
-    && [
-      progress.filesDiscovered,
-      progress.filesSelected,
-      progress.filesProcessed,
-      progress.recordsWritten,
-    ].every((value) => Number.isSafeInteger(value) && value >= 0)
-    && progress.filesSelected <= progress.filesDiscovered
-    && progress.filesProcessed <= progress.filesSelected;
+export function realHistoryCancelPreQuickBoundaryReady(refresh) {
+  return refresh !== null
+    && typeof refresh === "object"
+    && !Array.isArray(refresh)
+    && refresh.status === "running"
+    && typeof refresh.refreshId === "string"
+    && refresh.refreshId.length > 0
+    // This comes from the observed local refresh status immediately before
+    // the sampler starts. The first sampled status below independently has to
+    // confirm it before a v2 receipt may claim pre-quick coverage.
+    && refresh.quickResultAt === null;
+}
+
+function realHistoryQuickResultPublished(refresh) {
+  return refresh !== null
+    && typeof refresh === "object"
+    && !Array.isArray(refresh)
+    && typeof refresh.refreshId === "string"
+    && refresh.refreshId.length > 0
+    && validQuickResultAt(refresh.quickResultAt);
 }
 
 async function runCancelMode(session) {
@@ -1822,9 +2098,16 @@ async function runCancelMode(session) {
         requestStartedAtMonotonicMs,
         status?.refresh,
       );
-      return realHistoryCancelBoundaryReady(status?.refresh)
-        ? status.refresh : null;
-    }, REAL_HISTORY_QA_TIMEOUTS.startupMs, "cancel mode quick-result boundary");
+      if (realHistoryCancelPreQuickBoundaryReady(status?.refresh)) return status.refresh;
+      if (realHistoryQuickResultPublished(status?.refresh)) {
+        fail(
+          "REAL_HISTORY_QA_CONTROL_PLANE_PHASE_COVERAGE_INVALID",
+          "refresh",
+          "control_plane_phase_coverage_invalid",
+        );
+      }
+      return null;
+    }, REAL_HISTORY_QA_TIMEOUTS.startupMs, "cancel mode pre-quick control-plane boundary");
   } catch (error) {
     if (error?.qaStage) throw error;
     fail("REAL_HISTORY_QA_REFRESH_NOT_STARTED", "refresh", "refresh_not_started");
@@ -1834,11 +2117,29 @@ async function runCancelMode(session) {
   let controlPlane = {};
   let cancelEvidence = {};
   let retryEvidence = {};
+  let timerResult = null;
+  let timerError = null;
+  // The timer begins with the control-plane probe, but it must not delay the
+  // cancellation click once the v2 probe has its required twenty accepted
+  // in-flight status rounds. Attaching a rejection handler immediately keeps
+  // a later cancellation failure classified by its own gate while preserving
+  // timer evidence for the receipt.
+  const timerPromise = sampleAdvancingTimer(session).then((result) => {
+    timerResult = result;
+  }).catch((error) => {
+    timerError = error;
+  });
   try {
-    ({ timer, controlPlane } = await sampleTimerAndControlPlaneConcurrently(
-      () => sampleAdvancingTimer(session),
-      () => sampleControlPlaneStatus(session, first.refreshId),
-    ));
+    const controlPlanePromise = sampleControlPlaneStatus(session, first.refreshId, undefined, {
+      requireQuickResultCoverage: true,
+    });
+    controlPlane = await controlPlanePromise;
+    // A valid v2 result already proves: the first accepted status was
+    // pre-quick, quick publication was observed, and every active status
+    // response identified this still in-flight refresh. Do not add another
+    // status poll between that final in-flight observation and the click: on
+    // a fast optimized run it can turn an otherwise exercisable cancel into
+    // terminal completion without improving the latency sample.
     const cancelStartedAt = Date.now();
     await clickCancel(session);
     await waitCancelAcknowledged(session);
@@ -1907,6 +2208,9 @@ async function runCancelMode(session) {
       terminalStatus: "cancelled",
       cancelHttp: retryCancelHttp,
     };
+    await timerPromise;
+    if (timerError !== null) throw timerError;
+    timer = timerResult ?? {};
     return Object.freeze({
       startup: Object.freeze({
         requestCount: 1,
@@ -1937,8 +2241,12 @@ async function runCancelMode(session) {
       }),
     });
   } catch (error) {
+    await timerPromise;
+    if (Object.keys(timer).length === 0 && timerResult !== null) timer = timerResult;
     attachQaEvidence(error, {
-      timer: Object.keys(timer).length > 0 ? timer : samplerEvidence(error, "timer"),
+      timer: Object.keys(timer).length > 0
+        ? timer
+        : (timerResult ?? samplerEvidence(timerError, "timer") ?? samplerEvidence(error, "timer")),
       controlPlane: Object.keys(controlPlane).length > 0
         ? controlPlane
         : samplerEvidence(error, "controlPlane"),
@@ -2354,7 +2662,19 @@ export function buildRealHistoryReceipt({
   const sourceRevisionBound = SOURCE_REVISION_PATTERN.test(sourceRevision ?? "");
   const artifactIdentityBound = artifactIdentityVerified === true
     && SHA256_PATTERN.test(artifactSha256 ?? "");
-  const controlPlaneValid = controlPlaneSnapshotValid(controlPlane);
+  const controlPlaneEvidence = controlPlane !== null && typeof controlPlane === "object"
+    ? controlPlane
+    : {};
+  const controlPlaneValid = controlPlaneSnapshotValid(controlPlaneEvidence);
+  // The generic validator intentionally accepts legacy and v1 snapshots so
+  // preserved receipts remain readable. New successful cancel/snapshot
+  // receipts, however, must carry v2's observed pre-quick coverage.
+  const controlPlaneV2Required = requestedPassed
+    && ["cancel", "snapshot"].includes(acceptedMode);
+  const controlPlaneV2Present = controlPlaneEvidence.endpointLatency?.samplingVersion
+    === CONTROL_PLANE_ENDPOINT_SAMPLING_VERSION;
+  const controlPlaneQualifies = controlPlaneValid
+    && (!controlPlaneV2Required || controlPlaneV2Present);
   const quickResultDurationProvided = startup.quickResultDurationMs !== undefined
     && startup.quickResultDurationMs !== null;
   const quickResultDurationValid = !quickResultDurationProvided
@@ -2369,7 +2689,7 @@ export function buildRealHistoryReceipt({
   const passed = requestedPassed
     && sourceRevisionBound
     && artifactIdentityBound
-    && controlPlaneValid
+    && controlPlaneQualifies
     && quickResultDurationValid;
   const sourceBindingFailure = requestedPassed && !sourceRevisionBound;
   const artifactBindingFailure = requestedPassed
@@ -2378,17 +2698,67 @@ export function buildRealHistoryReceipt({
   const controlPlaneFailure = requestedPassed
     && sourceRevisionBound
     && artifactIdentityBound
-    && !controlPlaneValid;
+    && !controlPlaneQualifies;
+  const controlPlanePhaseCoverageFailure = controlPlaneFailure
+    && controlPlaneValid
+    && controlPlaneV2Required
+    && !controlPlaneV2Present;
   const quickResultFailure = requestedPassed
     && sourceRevisionBound
     && artifactIdentityBound
-    && controlPlaneValid
+    && controlPlaneQualifies
     && !quickResultDurationValid;
   const boundedLatency = (value) => Number.isSafeInteger(value)
       && value >= 0
-      && value <= REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS
+    ? Math.min(value, REAL_HISTORY_QA_CONTROL_PLANE_OVER_LIMIT_LATENCY_MS)
+    : 0;
+  const boundedControlPlaneCount = (value) => Number.isSafeInteger(value)
+      && value >= 0
+      && value <= CONTROL_PLANE_MAX_RECEIPT_SAMPLES
     ? value
     : 0;
+  const receiptControlPlanePhase = (phase) => Object.freeze({
+    sampleCount: boundedControlPlaneCount(phase?.sampleCount),
+    successCount: boundedControlPlaneCount(phase?.successCount),
+    maxLatencyMs: boundedLatency(phase?.maxLatencyMs),
+    p95LatencyMs: boundedLatency(phase?.p95LatencyMs),
+  });
+  const receiptQuickResultCoveragePhase = (phase) => Object.freeze({
+    beforeQuickResultRounds: boundedControlPlaneCount(phase?.beforeQuickResultRounds),
+    atOrAfterQuickResultRounds: boundedControlPlaneCount(
+      phase?.atOrAfterQuickResultRounds,
+    ),
+  });
+  const receiptQuickResultCoverage = (coverage) => Object.freeze({
+    startedBeforeQuickResult: coverage?.startedBeforeQuickResult === true,
+    quickResultObserved: coverage?.quickResultObserved === true,
+    warmup: receiptQuickResultCoveragePhase(coverage?.warmup),
+    active: receiptQuickResultCoveragePhase(coverage?.active),
+  });
+  const receiptEndpointLatency = (endpointLatency) => {
+    if (endpointLatency === null || typeof endpointLatency !== "object"
+        || !CONTROL_PLANE_ENDPOINT_SAMPLING_VERSIONS.has(endpointLatency.samplingVersion)
+        || endpointLatency.health === null || typeof endpointLatency.health !== "object"
+        || endpointLatency.refreshStatus === null
+        || typeof endpointLatency.refreshStatus !== "object") {
+      return null;
+    }
+    const receipt = {
+      samplingVersion: endpointLatency.samplingVersion,
+      health: Object.freeze({
+        warmup: receiptControlPlanePhase(endpointLatency.health.warmup),
+        active: receiptControlPlanePhase(endpointLatency.health.active),
+      }),
+      refreshStatus: Object.freeze({
+        warmup: receiptControlPlanePhase(endpointLatency.refreshStatus.warmup),
+        active: receiptControlPlanePhase(endpointLatency.refreshStatus.active),
+      }),
+    };
+    if (endpointLatency.samplingVersion === CONTROL_PLANE_ENDPOINT_SAMPLING_VERSION) {
+      receipt.coverage = receiptQuickResultCoverage(endpointLatency.coverage);
+    }
+    return Object.freeze(receipt);
+  };
   const validLatency = (value) => Number.isSafeInteger(value)
       && value >= 0
       && value <= REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS;
@@ -2410,6 +2780,23 @@ export function buildRealHistoryReceipt({
       && retry.cancelHttp?.accepted === true
       && validLatency(retry.cancelHttp?.latencyMs),
   };
+  const endpointLatency = receiptEndpointLatency(controlPlaneEvidence.endpointLatency);
+  const receiptControlPlane = {
+    active: controlPlaneQualifies,
+    // Preserve bounded partial counts when the gate fails. Earlier receipts
+    // zeroed these fields after any failure, making observed samples look like
+    // no samples ran and preventing diagnosis of an endpoint-specific breach.
+    sampleCount: boundedControlPlaneCount(controlPlaneEvidence.sampleCount),
+    healthSuccessCount: boundedControlPlaneCount(controlPlaneEvidence.healthSuccessCount),
+    refreshStatusSuccessCount: boundedControlPlaneCount(
+      controlPlaneEvidence.refreshStatusSuccessCount,
+    ),
+    // Preserve bounded latency diagnostics even on a failed gate so the
+    // receipt explains a p95 breach without ever accepting it as active.
+    maxLatencyMs: boundedLatency(controlPlaneEvidence.maxLatencyMs),
+    p95LatencyMs: boundedLatency(controlPlaneEvidence.p95LatencyMs),
+  };
+  if (endpointLatency !== null) receiptControlPlane.endpointLatency = endpointLatency;
   return Object.freeze({
     schemaVersion: REAL_HISTORY_SCHEMA_VERSION,
     status: passed ? "passed" : "failed",
@@ -2440,7 +2827,9 @@ export function buildRealHistoryReceipt({
         : artifactBindingFailure
           ? "artifact_invalid"
           : controlPlaneFailure
-            ? "control_plane_unresponsive"
+            ? controlPlanePhaseCoverageFailure
+              ? "control_plane_phase_coverage_invalid"
+              : "control_plane_unresponsive"
             : quickResultFailure
               ? "quick_result_timeout"
               : FAILURE_REASONS.has(failureReason) ? failureReason : "runtime_failed"
@@ -2473,17 +2862,7 @@ export function buildRealHistoryReceipt({
         ? startup.degradedFailureCode
         : null,
     }),
-    controlPlane: Object.freeze({
-      active: controlPlaneValid,
-      sampleCount: controlPlaneValid ? controlPlane.sampleCount : 0,
-      healthSuccessCount: controlPlaneValid ? controlPlane.healthSuccessCount : 0,
-      refreshStatusSuccessCount: controlPlaneValid
-        ? controlPlane.refreshStatusSuccessCount : 0,
-      // Preserve bounded latency diagnostics even on a failed gate so the
-      // receipt explains a p95 breach without ever accepting it as active.
-      maxLatencyMs: boundedLatency(controlPlane.maxLatencyMs),
-      p95LatencyMs: boundedLatency(controlPlane.p95LatencyMs),
-    }),
+    controlPlane: Object.freeze(receiptControlPlane),
     parity: Object.freeze({
       dashboardPopulated: parity.dashboard?.populated === true,
       usage: Object.freeze({

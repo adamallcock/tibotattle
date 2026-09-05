@@ -790,3 +790,59 @@ test("a persistence clock failure cannot fail an authoritative dashboard reload"
   assert.equal(overview.accounting.events, 12);
   assert.equal(writes, 0);
 });
+
+test("publication-only reload preserves persistence and isolated access without a discarded overview", async () => {
+  let reads = 0;
+  let writes = 0;
+  const calls = [];
+  class ObservedStore extends LocalCompanionDataStore {
+    getOverview() { reads += 1; return super.getOverview(); }
+  }
+  const store = new ObservedStore({
+    snapshotFile: "/synthetic/dashboard.json",
+    snapshotWriter: async () => { writes += 1; return true; },
+    builder: async (options) => { calls.push(options); return authoritativeSnapshot(); },
+  });
+  const result = await store.reload({ purpose: "full", returnOverview: false });
+  assert.equal(result, undefined);
+  assert.equal(reads, 0, "publication does not allocate an unused overview copy");
+  assert.equal(writes, 1, "publication still persists the authoritative snapshot");
+  assert.deepEqual(calls, [{ purpose: "full" }], "the builder receives only its own options");
+  const first = store.getOverview();
+  first.timeline.usage[0].events = 999;
+  assert.equal(store.getOverview().timeline.usage[0].events, 12);
+  const ordinary = await store.reload({ purpose: "full" });
+  assert.equal(ordinary.accounting.events, 12, "the default return contract is unchanged");
+  await assert.rejects(store.reload({ returnOverview: "false" }), TypeError);
+  assert.equal(calls.length, 2, "invalid publication mode is rejected before building");
+});
+
+test("initialize returns exactly one overview copy after publication", async () => {
+  let reads = 0;
+  class ObservedStore extends LocalCompanionDataStore {
+    getOverview() { reads += 1; return super.getOverview(); }
+  }
+  const store = new ObservedStore({ builder: async () => authoritativeSnapshot() });
+  const value = await store.initialize({ purpose: "full" });
+  assert.equal(reads, 1);
+  assert.equal(value.accounting.events, 12);
+});
+
+test("publication-only quick reload keeps the same retained evidence as ordinary reload", async () => {
+  const builder = async ({ purpose }) => {
+    const snapshot = authoritativeSnapshot();
+    if (purpose === "quick") {
+      snapshot.overview.usage = [];
+      snapshot.overview.timeline.usage = [];
+    }
+    return snapshot;
+  };
+  const ordinary = new LocalCompanionDataStore({ builder });
+  const publishing = new LocalCompanionDataStore({ builder });
+  await ordinary.reload({ purpose: "full" });
+  await publishing.reload({ purpose: "full", returnOverview: false });
+  const expected = await ordinary.reload({ purpose: "quick" });
+  await publishing.reload({ purpose: "quick", returnOverview: false });
+  assert.deepEqual(publishing.getOverview(), expected);
+  assert.equal(expected.timeline.usage[0].events, 12);
+});

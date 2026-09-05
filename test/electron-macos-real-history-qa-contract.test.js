@@ -7,6 +7,7 @@ import test from "node:test";
 
 import {
   REAL_HISTORY_QA_MODES,
+  REAL_HISTORY_QA_CONTROL_PLANE_OVER_LIMIT_LATENCY_MS,
   REAL_HISTORY_QA_CONTROL_PLANE_P95_MAX_LATENCY_MS,
   REAL_HISTORY_QA_TIMEOUTS,
   REAL_HISTORY_QA_QUICK_RESULT_MAX_MS,
@@ -23,10 +24,11 @@ import {
   createControlPlaneObserver,
   createNetworkBoundaryObserver,
   createRefreshObserver,
+  fetchJsonMeasured,
   localQaCommunityParitySnapshotValid,
   parseRealHistoryArguments,
   realHistoryDashboardReadySnapshotValid,
-  realHistoryCancelBoundaryReady,
+  realHistoryCancelPreQuickBoundaryReady,
   releaseRealHistoryRefreshGate,
   runLaunchGate,
   sampleTimerAndControlPlaneConcurrently,
@@ -43,6 +45,49 @@ const VALID_ARGS = [
   "--artifact-sha256", "a".repeat(64),
   "--source-revision", "1".repeat(40),
 ];
+
+function qualifyingV2ControlPlane({ maxLatencyMs = 40, p95LatencyMs = 40 } = {}) {
+  const warmup = {
+    sampleCount: 2,
+    successCount: 2,
+    maxLatencyMs,
+    p95LatencyMs,
+  };
+  const active = {
+    sampleCount: 20,
+    successCount: 20,
+    maxLatencyMs,
+    p95LatencyMs,
+  };
+  return {
+    active: true,
+    sampleCount: 20,
+    healthSuccessCount: 20,
+    refreshStatusSuccessCount: 20,
+    maxLatencyMs,
+    p95LatencyMs,
+    endpointLatency: {
+      samplingVersion: "endpoint-separated-v2",
+      health: { warmup, active },
+      refreshStatus: {
+        warmup: { ...warmup },
+        active: { ...active },
+      },
+      coverage: {
+        startedBeforeQuickResult: true,
+        quickResultObserved: true,
+        warmup: {
+          beforeQuickResultRounds: 2,
+          atOrAfterQuickResultRounds: 0,
+        },
+        active: {
+          beforeQuickResultRounds: 4,
+          atOrAfterQuickResultRounds: 16,
+        },
+      },
+    },
+  };
+}
 
 function degradedRefresh(overrides = {}) {
   return {
@@ -169,6 +214,41 @@ test("real-history timeout budgets are finite and bounded", () => {
   assert.equal(REAL_HISTORY_QA_TIMEOUTS.refreshMs, 45 * 60_000);
   assert.equal(REAL_HISTORY_QA_CONTROL_PLANE_P95_MAX_LATENCY_MS, 250);
   assert.equal(REAL_HISTORY_QA_QUICK_RESULT_MAX_MS, 30_000);
+});
+
+test("measured control-plane fetch ignores a backward wall-clock correction", async () => {
+  const originalDateNow = Date.now;
+  const originalFetch = globalThis.fetch;
+  try {
+    let wallClockMs = 10_000;
+    Date.now = () => {
+      const value = wallClockMs;
+      wallClockMs -= 10_000;
+      return value;
+    };
+    globalThis.fetch = async () => {
+      await new Promise((resolveDelay) => setTimeout(resolveDelay, 15));
+      return {
+        status: 200,
+        ok: true,
+        json: async () => ({ status: "ready" }),
+      };
+    };
+    const measured = await fetchJsonMeasured(
+      new URL("http://127.0.0.1:1/api/local/health"),
+      100,
+    );
+    assert.equal(measured.status, 200);
+    assert.equal(measured.body?.status, "ready");
+    assert.ok(Number.isSafeInteger(measured.latencyMs));
+    assert.ok(
+      measured.latencyMs >= 1,
+      "a backward wall clock must not serialize a delayed fetch as zero milliseconds",
+    );
+  } finally {
+    Date.now = originalDateNow;
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("real-history launch gates classify raw timeout and setup errors without exposing them", async () => {
@@ -521,14 +601,7 @@ test("snapshot receipt proves seeded parity without claiming terminal refresh", 
       refreshId: "private-snapshot-refresh-id",
     },
     timer: { sampleCount: 5, uniqueCount: 5, advanced: true },
-    controlPlane: {
-      active: true,
-      sampleCount: 3,
-      healthSuccessCount: 3,
-      refreshStatusSuccessCount: 3,
-      maxLatencyMs: 17,
-      p95LatencyMs: 17,
-    },
+    controlPlane: qualifyingV2ControlPlane({ maxLatencyMs: 17, p95LatencyMs: 17 }),
     parity: {
       dashboard: { populated: true },
       usage: {
@@ -686,6 +759,84 @@ test("passed v4 receipts fail closed without exact source, artifact, or p95 proo
   assert.equal(lateQuickResult.startupRefresh.quickResultObserved, false);
 });
 
+test("new successful cancel and snapshot receipts require phase-inclusive v2 coverage", () => {
+  const artifactIdentity = {
+    artifactSha256: "e".repeat(64),
+    artifactIdentityVerified: true,
+  };
+  const legacyControlPlane = {
+    active: true,
+    sampleCount: 3,
+    healthSuccessCount: 3,
+    refreshStatusSuccessCount: 3,
+    maxLatencyMs: 40,
+    p95LatencyMs: 40,
+  };
+  const v1ControlPlane = qualifyingV2ControlPlane();
+  v1ControlPlane.endpointLatency.samplingVersion = "endpoint-separated-v1";
+  delete v1ControlPlane.endpointLatency.coverage;
+  // Both historical shapes stay readable but cannot qualify a new phase test.
+  for (const controlPlane of [legacyControlPlane, v1ControlPlane]) {
+    assert.equal(controlPlaneSnapshotValid(controlPlane), true);
+    for (const mode of ["cancel", "snapshot"]) {
+      const receipt = buildRealHistoryReceipt({
+        mode,
+        status: "passed",
+        ...artifactIdentity,
+        sourceRevision: "4".repeat(40),
+        controlPlane,
+      });
+      assert.equal(receipt.status, "failed");
+      assert.equal(receipt.controlPlane.active, false);
+      assert.equal(receipt.failureStage, "refresh");
+      assert.equal(receipt.failureReason, "control_plane_phase_coverage_invalid");
+    }
+  }
+
+  const currentCancelReceipt = buildRealHistoryReceipt({
+    mode: "cancel",
+    status: "passed",
+    ...artifactIdentity,
+    sourceRevision: "4".repeat(40),
+    controlPlane: qualifyingV2ControlPlane(),
+  });
+  assert.equal(currentCancelReceipt.status, "passed");
+  assert.equal(currentCancelReceipt.controlPlane.active, true);
+});
+
+test("over-ceiling latency receipt uses the bounded 3001ms sentinel and fails", () => {
+  assert.equal(REAL_HISTORY_QA_CONTROL_PLANE_OVER_LIMIT_LATENCY_MS, 3_001);
+  const receipt = buildRealHistoryReceipt({
+    status: "passed",
+    artifactSha256: "f".repeat(64),
+    artifactIdentityVerified: true,
+    sourceRevision: "5".repeat(40),
+    controlPlane: {
+      active: true,
+      sampleCount: 3,
+      healthSuccessCount: 3,
+      refreshStatusSuccessCount: 3,
+      maxLatencyMs: 3_001,
+      p95LatencyMs: 250,
+    },
+    cancel: {
+      http: {
+        requestCount: 1,
+        status: 202,
+        latencyMs: 3_001,
+        accepted: true,
+      },
+    },
+  });
+  assert.equal(receipt.status, "failed");
+  assert.equal(receipt.failureStage, "refresh");
+  assert.equal(receipt.failureReason, "control_plane_unresponsive");
+  assert.equal(receipt.controlPlane.active, false);
+  assert.equal(receipt.controlPlane.maxLatencyMs, 3_001);
+  assert.equal(receipt.cancel.http.latencyMs, 3_001);
+  assert.equal(receipt.cancel.http.accepted, false);
+});
+
 test("refresh timeout evidence remains an unevaluated failure", () => {
   const receipt = buildRealHistoryReceipt({
     status: "failed",
@@ -708,12 +859,22 @@ test("refresh timeout evidence remains an unevaluated failure", () => {
   assert.equal(receipt.startupRefresh.timedOut, true);
 });
 
-test("control-plane gate requires bounded health/status samples", () => {
+test("control-plane gate preserves legacy receipts and separates endpoint samples", () => {
   assert.equal(controlPlaneLatencyP95Ms([0, 10, 20, 30, 40, 50]), 50);
   assert.equal(controlPlaneLatencyP95Ms([0, 250, 250]), 250);
+  assert.equal(
+    controlPlaneLatencyP95Ms([
+      ...Array.from({ length: 18 }, () => 10),
+      240,
+      999,
+    ]),
+    240,
+  );
   assert.equal(controlPlaneLatencyP95Ms([]), null);
   assert.equal(controlPlaneLatencyP95Ms([0, -1]), null);
   assert.equal(controlPlaneLatencyP95Ms([0, 3_001]), null);
+  // Historical v4 receipts do not carry endpointLatency, so their original
+  // three-round contract remains valid when read by the newer harness.
   assert.equal(controlPlaneSnapshotValid({
     active: true,
     sampleCount: 3,
@@ -751,6 +912,134 @@ test("control-plane gate requires bounded health/status samples", () => {
     refreshStatusSuccessCount: 3,
     maxLatencyMs: 0,
   }), false);
+  const endpointLatency = {
+    samplingVersion: "endpoint-separated-v1",
+    health: {
+      warmup: {
+        sampleCount: 2,
+        successCount: 2,
+        maxLatencyMs: 900,
+        p95LatencyMs: 900,
+      },
+      active: {
+        sampleCount: 20,
+        successCount: 20,
+        maxLatencyMs: 999,
+        p95LatencyMs: 240,
+      },
+    },
+    refreshStatus: {
+      warmup: {
+        sampleCount: 2,
+        successCount: 2,
+        maxLatencyMs: 850,
+        p95LatencyMs: 850,
+      },
+      active: {
+        sampleCount: 20,
+        successCount: 20,
+        maxLatencyMs: 999,
+        p95LatencyMs: 240,
+      },
+    },
+  };
+  const endpointSeparated = {
+    active: true,
+    sampleCount: 20,
+    healthSuccessCount: 20,
+    refreshStatusSuccessCount: 20,
+    maxLatencyMs: 999,
+    p95LatencyMs: 240,
+    endpointLatency,
+  };
+  // Warm-up remains diagnostic. The active phase supplies the >=20 response
+  // values used for the 250ms p95 gate, while the 3s max still applies.
+  assert.equal(controlPlaneSnapshotValid(endpointSeparated), true);
+  assert.equal(controlPlaneSnapshotValid({
+    ...endpointSeparated,
+    endpointLatency: {
+      ...endpointLatency,
+      refreshStatus: {
+        ...endpointLatency.refreshStatus,
+        warmup: {
+          ...endpointLatency.refreshStatus.warmup,
+          sampleCount: 3,
+          successCount: 3,
+        },
+      },
+    },
+  }), false);
+  assert.equal(controlPlaneSnapshotValid({
+    ...endpointSeparated,
+    p95LatencyMs: 251,
+    endpointLatency: {
+      ...endpointLatency,
+      health: {
+        ...endpointLatency.health,
+        active: { ...endpointLatency.health.active, p95LatencyMs: 251 },
+      },
+      refreshStatus: {
+        ...endpointLatency.refreshStatus,
+        active: { ...endpointLatency.refreshStatus.active, p95LatencyMs: 251 },
+      },
+    },
+  }), false);
+  const phaseInclusiveEndpointLatency = {
+    ...endpointLatency,
+    samplingVersion: "endpoint-separated-v2",
+    // A quick publication during warm-up is explicit: it contributes to the
+    // warm-up maximum and does not invent an active pre-quick round.
+    coverage: {
+      startedBeforeQuickResult: true,
+      quickResultObserved: true,
+      warmup: {
+        beforeQuickResultRounds: 1,
+        atOrAfterQuickResultRounds: 1,
+      },
+      active: {
+        beforeQuickResultRounds: 0,
+        atOrAfterQuickResultRounds: 20,
+      },
+    },
+  };
+  const phaseInclusive = {
+    ...endpointSeparated,
+    endpointLatency: phaseInclusiveEndpointLatency,
+  };
+  assert.equal(controlPlaneSnapshotValid(phaseInclusive), true);
+  assert.equal(controlPlaneSnapshotValid({
+    ...phaseInclusive,
+    endpointLatency: {
+      ...phaseInclusiveEndpointLatency,
+      coverage: {
+        ...phaseInclusiveEndpointLatency.coverage,
+        active: {
+          beforeQuickResultRounds: 0,
+          atOrAfterQuickResultRounds: 19,
+        },
+      },
+    },
+  }), false);
+  assert.equal(controlPlaneSnapshotValid({
+    ...phaseInclusive,
+    endpointLatency: {
+      ...phaseInclusiveEndpointLatency,
+      coverage: {
+        ...phaseInclusiveEndpointLatency.coverage,
+        startedBeforeQuickResult: false,
+      },
+    },
+  }), false);
+  assert.equal(controlPlaneSnapshotValid({
+    ...endpointSeparated,
+    endpointLatency: {
+      ...endpointLatency,
+      health: {
+        ...endpointLatency.health,
+        active: { ...endpointLatency.health.active, sampleCount: 19, successCount: 19 },
+      },
+    },
+  }), false);
   const untrusted = buildRealHistoryReceipt({
     status: "passed",
     controlPlane: {
@@ -766,10 +1055,10 @@ test("control-plane gate requires bounded health/status samples", () => {
   });
   assert.deepEqual(untrusted.controlPlane, {
     active: false,
-    sampleCount: 0,
-    healthSuccessCount: 0,
-    refreshStatusSuccessCount: 0,
-    maxLatencyMs: 0,
+    sampleCount: 1,
+    healthSuccessCount: 1,
+    refreshStatusSuccessCount: 1,
+    maxLatencyMs: REAL_HISTORY_QA_CONTROL_PLANE_OVER_LIMIT_LATENCY_MS,
     p95LatencyMs: 0,
   });
   assert.deepEqual(untrusted.cancel.http, {
@@ -778,40 +1067,82 @@ test("control-plane gate requires bounded health/status samples", () => {
     latencyMs: 0,
     accepted: false,
   });
+
+  const failedEndpointEvidence = buildRealHistoryReceipt({
+    status: "failed",
+    controlPlane: {
+      active: false,
+      sampleCount: 7,
+      healthSuccessCount: 7,
+      refreshStatusSuccessCount: 6,
+      maxLatencyMs: 582,
+      p95LatencyMs: 582,
+      endpointLatency: {
+        samplingVersion: "endpoint-separated-v1",
+        health: {
+          warmup: endpointLatency.health.warmup,
+          active: {
+            sampleCount: 7,
+            successCount: 7,
+            maxLatencyMs: 582,
+            p95LatencyMs: 582,
+          },
+        },
+        refreshStatus: {
+          warmup: endpointLatency.refreshStatus.warmup,
+          active: {
+            sampleCount: 7,
+            successCount: 6,
+            maxLatencyMs: 471,
+            p95LatencyMs: 471,
+          },
+        },
+      },
+    },
+  });
+  assert.equal(failedEndpointEvidence.controlPlane.active, false);
+  assert.equal(failedEndpointEvidence.controlPlane.sampleCount, 7);
+  assert.equal(failedEndpointEvidence.controlPlane.healthSuccessCount, 7);
+  assert.equal(failedEndpointEvidence.controlPlane.refreshStatusSuccessCount, 6);
+  assert.equal(failedEndpointEvidence.controlPlane.p95LatencyMs, 582);
+  assert.equal(failedEndpointEvidence.controlPlane.endpointLatency.health.active.sampleCount, 7);
+  assert.equal(
+    failedEndpointEvidence.controlPlane.endpointLatency.refreshStatus.active.successCount,
+    6,
+  );
+
+  const failedPhaseCoverageEvidence = buildRealHistoryReceipt({
+    status: "failed",
+    controlPlane: {
+      ...phaseInclusive,
+      active: false,
+    },
+  });
+  assert.equal(
+    failedPhaseCoverageEvidence.controlPlane.endpointLatency.samplingVersion,
+    "endpoint-separated-v2",
+  );
+  assert.deepEqual(
+    failedPhaseCoverageEvidence.controlPlane.endpointLatency.coverage,
+    phaseInclusiveEndpointLatency.coverage,
+  );
 });
 
-test("cancel mode accepts both quick-result and bounded deep-index progress", () => {
-  const base = {
+test("cancel mode requires an observed pre-quick refresh boundary", () => {
+  const preQuick = {
     status: "running",
     refreshId: "refresh-id",
-    quickResultAt: "2026-08-27T12:00:00.000Z",
+    quickResultAt: null,
   };
-  assert.equal(realHistoryCancelBoundaryReady({
-    ...base,
-    progress: { phase: "quick_result" },
-  }), true);
-  assert.equal(realHistoryCancelBoundaryReady({
-    ...base,
-    progress: {
-      kind: "unified_index",
-      status: "scanning",
-      phase: "rollout_index",
-      filesDiscovered: 12,
-      filesSelected: 10,
-      filesProcessed: 4,
-      recordsWritten: 27,
-    },
-  }), true);
-  for (const refresh of [
-    { ...base, status: "succeeded", progress: { phase: "quick_result" } },
-    { ...base, quickResultAt: "invalid", progress: { phase: "quick_result" } },
-    { ...base, progress: { kind: "unified_index", status: "scanning", phase: "rollout_index",
-      filesDiscovered: 2, filesSelected: 3, filesProcessed: 1, recordsWritten: 1 } },
-    { ...base, progress: { kind: "unified_index", status: "scanning", phase: "rollout_index",
-      filesDiscovered: 2, filesSelected: 2, filesProcessed: -1, recordsWritten: 1 } },
-  ]) {
-    assert.equal(realHistoryCancelBoundaryReady(refresh), false);
-  }
+  assert.equal(realHistoryCancelPreQuickBoundaryReady(preQuick), true);
+  assert.equal(realHistoryCancelPreQuickBoundaryReady({
+    ...preQuick,
+    quickResultAt: "2026-08-27T12:00:00.000Z",
+  }), false);
+  assert.equal(realHistoryCancelPreQuickBoundaryReady({
+    ...preQuick,
+    status: "succeeded",
+  }), false);
 });
 
 test("timer and control-plane probes run concurrently and retain safe evidence on timer failure", async () => {
@@ -1253,6 +1584,7 @@ test("source contract preserves the real profile and bounds every health poll", 
   assert.match(source, /new URL\("\/api\/health", session\.dashboardUrl\)/u);
   assert.match(source, /serviceHealth\?\.status === "ok"/u);
   assert.match(source, /REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS/u);
+  assert.match(source, /REAL_HISTORY_QA_CONTROL_PLANE_OVER_LIMIT_LATENCY_MS/u);
   assert.match(source, /REAL_HISTORY_QA_CONTROL_PLANE_P95_MAX_LATENCY_MS/u);
   assert.match(source, /controlPlaneLatencyP95Ms/u);
   assert.match(source, /p95LatencyMs/u);
@@ -1263,6 +1595,13 @@ test("source contract preserves the real profile and bounds every health poll", 
   assert.match(source, /timedOut/u);
   assert.match(source, /sampleTimerAndControlPlaneConcurrently/u);
   assert.match(source, /sampleControlPlaneStatus\(session/u);
+  assert.match(source, /deadlineMonotonicMs/u);
+  const controlPlaneSamplerStart = source.indexOf("async function sampleControlPlaneStatus");
+  const controlPlaneSamplerEnd = source.indexOf("async function waitCancelHttpResponse");
+  assert.doesNotMatch(
+    source.slice(controlPlaneSamplerStart, controlPlaneSamplerEnd),
+    /Date\.now\(\)/u,
+  );
   assert.doesNotMatch(source, /sampleControlPlane\s*\?\s*sampleControlPlane\(/u);
   assert.match(source, /let completionError = null/u);
   assert.match(source, /attachQaEvidence\(completionError, \{/u);
@@ -1287,8 +1626,19 @@ test("source contract preserves the real profile and bounds every health poll", 
   assert.match(source, /REAL_HISTORY_QA_REFRESH_TIMEOUT/u);
   assert.match(source, /cancelHttp/u);
   assert.match(source, /refresh\.quickResultAt/u);
-  assert.match(source, /realHistoryCancelBoundaryReady\(status\?\.refresh\)/u);
-  assert.match(source, /refresh\.progress\?\.phase === "quick_result"/u);
+  assert.match(source, /realHistoryCancelPreQuickBoundaryReady\(status\?\.refresh\)/u);
+  assert.match(source, /requireQuickResultCoverage: true/u);
+  assert.match(source, /startedBeforeQuickResult/u);
+  assert.match(source, /atOrAfterQuickResultRounds/u);
+  assert.match(source, /controlPlaneV2Required/u);
+  assert.match(source, /const controlPlanePromise = sampleControlPlaneStatus/u);
+  assert.match(source, /controlPlane = await controlPlanePromise/u);
+  assert.match(source, /await clickCancel\(session\);/u);
+  assert.ok(
+    source.indexOf("controlPlane = await controlPlanePromise")
+      < source.indexOf("const cancelStartedAt = Date.now()"),
+    "the cancel click follows the valid in-flight v2 sample without a fresh status poll",
+  );
   assert.match(source, /snapshot seeded snapshot -> Usage\/Community parity/u);
   assert.match(source, /deferStartupRefresh: options\.mode === "snapshot"/u);
   assert.match(source, /terminalStatus: "not_evaluated"/u);
