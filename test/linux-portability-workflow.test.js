@@ -130,17 +130,12 @@ test("Linux AMD64 image pins the reviewed native Node child, GUI, and Secret Ser
   assert.equal((dockerfile.match(/^FROM /gmu) ?? []).length, 1);
   assert.match(dockerfile, /exact amd64 child digest[\s\S]*reviewed/u);
   assert.match(dockerfile, /ARG TIBOTATTLE_QUALIFICATION_REVISION/u);
-  assert.match(dockerfile, /ARG TIBOTATTLE_ALLOW_QEMU_PNPM_ABORT=0/u);
   assert.match(dockerfile, /org\.opencontainers\.image\.revision/u);
   assert.match(dockerfile, /TIBOTATTLE_IMAGE_SOURCE_REVISION/u);
   assert.match(dockerfile, /natively on a[\s\S]*x86_64 Linux runner/u);
   assert.match(dockerfile, /development smoke rather than a reproducible release artifact/u);
   assert.match(dockerfile, /pnpm install --frozen-lockfile/u);
   assert.match(dockerfile, /pnpm install --frozen-lockfile --ignore-scripts/u);
-  assert.match(dockerfile, /TIBOTATTLE_ALLOW_QEMU_PNPM_ABORT/u);
-  assert.match(dockerfile, /accepted QEMU-only pnpm abort/u);
-  assert.match(dockerfile, /require\.resolve\(`\$\{name\}\/package\.json`\)/u);
-  assert.match(dockerfile, /node_modules\/.pnpm\/lock\.yaml/u);
   assert.match(dockerfile, /curl --fail --silent --show-error --location --retry 3/u);
   assert.match(
     dockerfile,
@@ -280,8 +275,6 @@ test("Linux AMD64 package scripts preserve native image and network boundaries",
   assert.match(buildHelper, /git[\s\S]*status[\s\S]*--porcelain=v1/u);
   assert.match(buildHelper, /LINUX_CONTAINER_BUILD_REQUIRES_CLEAN_SOURCE/u);
   assert.match(buildHelper, /TIBOTATTLE_QUALIFICATION_REVISION=\$\{revision\}/u);
-  assert.match(buildHelper, /TIBOTATTLE_ALLOW_QEMU_PNPM_ABORT=\$\{qemuPnpmWorkaround \? "1" : "0"\}/u);
-  assert.match(buildHelper, /process\.arch !== "x64"/u);
   assert.match(buildHelper, /org\.opencontainers\.image\.revision/u);
   assert.match(buildHelper, /platform: "linux\/amd64"/u);
   assert.match(buildHelper, /dockerfile: "containers\/electron-linux-amd64\/Dockerfile"/u);
@@ -392,11 +385,10 @@ exit 92
     assert.equal(result.stderr, "LINUX_CONTAINER_BUILD_REVISION_MISMATCH\n");
     const dockerLog = await readFile(join(fixtureRoot, "docker.log"), "utf8");
     const dockerCalls = dockerLog.trim().split("\n");
-    const qemuPnpmWorkaround = process.arch !== "x64" ? "1" : "0";
     assert.equal(dockerCalls.length, 2);
     assert.match(
       dockerCalls[0],
-      new RegExp(`^build --platform=linux/amd64 .*--build-arg TIBOTATTLE_QUALIFICATION_REVISION=${sourceRevision} --build-arg TIBOTATTLE_ALLOW_QEMU_PNPM_ABORT=${qemuPnpmWorkaround} --no-cache \\.$`, "u"),
+      new RegExp(`^build --platform=linux/amd64 .*--build-arg TIBOTATTLE_QUALIFICATION_REVISION=${sourceRevision} --no-cache \\.$`, "u"),
     );
     assert.equal(
       dockerCalls[1],
