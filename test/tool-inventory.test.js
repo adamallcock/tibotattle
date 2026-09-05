@@ -303,17 +303,18 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  // 106 records / 108 executable paths: release-documentation, Codex contract,
+  // 108 records / 110 executable paths: release-documentation, Codex contract,
   // documentation governance, repository-layout, macOS bundle-version, and
   // local index-recovery gates are reviewed repository operations invoked by
   // CI, release runbooks, or supported internal product tooling.
   // Keep these exact so any future executable still requires an ownership
   // decision.
-  // Includes four restored Electron development packaging/verifier tools.
+  // Includes four restored Electron development packaging/verifier tools,
+  // plus the isolated macOS real-history profile and Linux launcher.
   // Includes the reviewed exact-output accounting child benchmark and eight
   // protected PR94 qualification entrypoints/helpers; neither is a product API.
-  assert.equal(result.records, 106);
-  assert.equal(result.candidates.length, 108);
+  assert.equal(result.records, 108);
+  assert.equal(result.candidates.length, 110);
   assert.ok(result.aliases >= 25);
 });
 

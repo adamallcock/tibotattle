@@ -1828,12 +1828,43 @@
     {
       "classification": "build_release_operation",
       "owner": "electron_packaging",
+      "canonicalPath": "scripts/electron-macos-real-history-profile.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Private real-history profile preparation and interactive launch are explicit development qualification inputs, not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/electron-macos-real-history-profile.test.js"
+      ],
+      "decision": "retain_as_development_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/launch-electron-linux-development.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The isolated Linux development launcher is an explicit qualification entrypoint, not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/electron-linux-development-launcher.test.js"
+      ],
+      "decision": "retain_as_development_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
       "canonicalPath": "scripts/qa-electron-macos-real-history.mjs",
       "stableAlias": null,
       "stableAliasReason": "Content-free real-history Electron qualification is an internal package/runtime gate, not a supported product command.",
       "additionalAliases": [],
       "callers": [
-        "test/electron-macos-real-history-qa-contract.test.js"
+        "test/electron-macos-real-history-qa-contract.test.js",
+        "scripts/electron-macos-real-history-profile.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",

@@ -90,6 +90,7 @@ test("real-history QA requires explicit isolated inputs and bounded modes", () =
     appPath: "/tmp/TiboTattle Dev.app",
     profilePath: "/tmp/tibotattle-real-history-profile",
     codexHomePath: "/tmp/codex-home",
+    identityFilePath: null,
     mode: "relaunch",
     debugPort: 43210,
     receiptPath: null,
@@ -124,6 +125,11 @@ test("real-history QA requires explicit isolated inputs and bounded modes", () =
     parseRealHistoryArguments(VALID_ARGS.concat(["--mode", "snapshot"]))
       .mode,
     "snapshot",
+  );
+  assert.equal(
+    parseRealHistoryArguments(VALID_ARGS.concat(["--identity-file", "/tmp/profile/identity"]))
+      .identityFilePath,
+    "/tmp/profile/identity",
   );
   assert.equal(
     parseRealHistoryArguments(
@@ -565,7 +571,7 @@ test("snapshot receipt proves seeded parity without claiming terminal refresh", 
     },
   });
 
-  assert.equal(receipt.schemaVersion, "tibotattle-electron-macos-real-history-v3");
+  assert.equal(receipt.schemaVersion, "tibotattle-electron-macos-real-history-v4");
   assert.equal(receipt.status, "passed");
   assert.equal(receipt.mode, "snapshot");
   assert.equal(receipt.sourceRevision, "2".repeat(40));
@@ -580,7 +586,7 @@ test("snapshot receipt proves seeded parity without claiming terminal refresh", 
   assert.equal(JSON.stringify(receipt).includes("private-snapshot-refresh-id"), false);
 });
 
-test("passed v3 receipts fail closed without exact source, artifact, or p95 proof", () => {
+test("passed v4 receipts fail closed without exact source, artifact, or p95 proof", () => {
   const artifactIdentity = {
     artifactSha256: "d".repeat(64),
     artifactIdentityVerified: true,

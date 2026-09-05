@@ -39,7 +39,7 @@ import { fileURLToPath } from "node:url";
 const REQUIRED_APP_NAME = "TiboTattle Dev";
 // v3 binds the receipt to the exact source revision and verified packaged
 // artifact, and records the bounded quick-result/control-plane evidence.
-const REAL_HISTORY_SCHEMA_VERSION = "tibotattle-electron-macos-real-history-v3";
+const REAL_HISTORY_SCHEMA_VERSION = "tibotattle-electron-macos-real-history-v4";
 const FIRST_RUN_SCHEMA_VERSION = "tibotattle-desktop-first-run-v1";
 const SETTINGS_SCHEMA_VERSION = "tibotattle-desktop-settings-v1";
 const QUIT_CONTROL = "quit-v1";
@@ -269,6 +269,7 @@ export function parseRealHistoryArguments(argv = process.argv.slice(2), environm
     "--app",
     "--profile",
     "--codex-home",
+    "--identity-file",
     "--mode",
     "--debug-port",
     "--receipt",
@@ -291,6 +292,7 @@ export function parseRealHistoryArguments(argv = process.argv.slice(2), environm
   const appPath = argumentValue(argv, "--app");
   const profilePath = argumentValue(argv, "--profile");
   const codexHomePath = argumentValue(argv, "--codex-home");
+  const identityFilePath = argumentValue(argv, "--identity-file");
   const mode = argumentValue(argv, "--mode") ?? "full";
   const debugPortText = argumentValue(argv, "--debug-port");
   const receiptPath = argumentValue(argv, "--receipt");
@@ -312,6 +314,7 @@ export function parseRealHistoryArguments(argv = process.argv.slice(2), environm
       || !isAbsolute(appPath)
       || !isAbsolute(profilePath)
       || !isAbsolute(codexHomePath)
+      || (identityFilePath !== null && !isAbsolute(identityFilePath))
       || (receiptPath !== null && !isAbsolute(receiptPath))
       || !SHA256_PATTERN.test(artifactSha256 ?? "")
       || !SOURCE_REVISION_PATTERN.test(sourceRevision ?? "")
@@ -333,6 +336,7 @@ export function parseRealHistoryArguments(argv = process.argv.slice(2), environm
     appPath: app,
     profilePath: profile,
     codexHomePath: codexHome,
+    identityFilePath: identityFilePath === null ? null : resolve(identityFilePath),
     mode,
     debugPort,
     receiptPath: receiptPath === null ? null : resolve(receiptPath),
@@ -474,7 +478,7 @@ async function prepareProfile(profilePath, codexHomePath) {
   return Object.freeze({ userData, settings, roots });
 }
 
-function environmentForProfile(fixture, codexHomePath) {
+function environmentForProfile(fixture, codexHomePath, identityFilePath = null) {
   return Object.fromEntries(Object.entries({
     PATH: process.env.PATH,
     LANG: "en_US.UTF-8",
@@ -493,6 +497,10 @@ function environmentForProfile(fixture, codexHomePath) {
     USAGE_MONITOR_ACCOUNTING_SOURCE_MODE: "unified",
     USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: QUIT_CONTROL,
     USAGE_MONITOR_TEST_LANE: MACOS_LOCAL_QA_TEST_LANE,
+    ...(identityFilePath === null ? {} : {
+      USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
+      USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: identityFilePath,
+    }),
     ELECTRON_NO_ATTACH_CONSOLE: "1",
   }).filter(([, value]) => value !== undefined));
 }
@@ -995,6 +1003,7 @@ async function launchSession({
   codexHomePath,
   fixture,
   debugPort,
+  identityFilePath = null,
   deferStartupRefresh = false,
 }) {
   const executable = join(appPath, "Contents", "MacOS", REQUIRED_APP_NAME);
@@ -1005,7 +1014,7 @@ async function launchSession({
     "--disable-gpu",
   ], {
     cwd: join(appPath, "Contents", "Resources"),
-    env: environmentForProfile(fixture, codexHomePath),
+    env: environmentForProfile(fixture, codexHomePath, identityFilePath),
     stdio: "ignore",
   });
   child.on("error", () => {});
@@ -2046,6 +2055,29 @@ export function communityParitySnapshotValid(
   health,
   { requirePartialDetail = false } = {},
 ) {
+  if (snapshot?.accountlessMode === true) {
+    return health?.capabilities?.centralServiceProxy === false
+      && health?.capabilities?.contributionDevicePairing === false
+      && health?.capabilities?.incrementalContributionSync === false
+      && snapshot.route === "#community"
+      && snapshot.pageVisible === true
+      && snapshot.accountlessPanel === true
+      && snapshot.accountlessPreferenceReady === true
+      && snapshot.accountlessState === true
+      && snapshot.accountlessTransport === true
+      && snapshot.sharingSettingsEnabled === true
+      && snapshot.legacyJourneyVisible === false
+      && snapshot.googleButton === false
+      && snapshot.appleButton === false
+      && snapshot.googleButtonEnabled === false
+      && snapshot.appleButtonEnabled === false
+      && snapshot.consentVisible === false
+      // The accountless composition intentionally hides the legacy index
+      // journey. A degraded refresh must not claim detail that is not visible.
+      && (!requirePartialDetail
+        || snapshot.accountlessMode === true
+        || snapshot.partialHistoryDetail === true);
+  }
   return communityServiceConfigurationState(health) === "configured"
     && snapshot?.route === "#community"
     && snapshot?.pageVisible === true
@@ -2166,19 +2198,49 @@ async function assertUsage(session) {
 }
 
 async function assertCommunity(session, health, terminalStatus) {
-  const community = await waitFor(async () => session.cdp.evaluate(`(() => {
+  const community = await waitFor(async () => session.cdp.evaluate(`(async () => {
     const visible = ${visibleInRenderer.toString()};
     document.querySelector('[data-nav="community"]')?.click();
     const page = document.querySelector('#community[data-dashboard-page="community"]');
     const pageText = page?.textContent?.toLowerCase() ?? '';
     const detail = document.querySelector('#journey-stage-index-detail')?.textContent?.trim() ?? '';
+    const nextAction = document.querySelector('#identity-signin-next');
+    const consent = document.querySelector('#incremental-consent');
+    const bridge = globalThis.tibotattleDesktop;
+    const accountlessMode = bridge?.version === 'v1'
+      && typeof bridge.getSharingPreference === 'function'
+      && document.documentElement.classList.contains('electron-accountless-sharing');
+    let preference = null;
+    if (accountlessMode) {
+      try {
+        preference = await bridge.getSharingPreference();
+      } catch {
+        preference = null;
+      }
+    }
+    const sharingState = document.querySelector('#electron-accountless-community-state');
+    const transport = document.querySelector('#electron-accountless-community-transport');
+    const settings = document.querySelector('#electron-accountless-open-settings');
     return {
       route: location.hash,
       pageVisible: visible(page) && page?.inert !== true,
+      accountlessMode,
+      accountlessPanel: visible(document.querySelector('#electron-accountless-community')),
+      accountlessPreferenceReady: preference?.available === true && preference?.current === true,
+      accountlessState: visible(sharingState)
+        && (sharingState?.textContent?.trim() ?? '').length > 0
+        && !(sharingState?.textContent ?? '').includes('preference unavailable'),
+      accountlessTransport: visible(transport)
+        && ['off', 'unavailable'].includes(preference?.transportStatus)
+        && /uploads are not available|sharing is off/iu.test(transport?.textContent ?? ''),
+      sharingSettingsEnabled: visible(settings) && settings.disabled !== true,
+      legacyJourneyVisible: visible(document.querySelector('#community-journey')),
       journeyStageCount: document.querySelectorAll('#community-journey .journey-stage').length,
       indexTerminal: document.querySelector('#journey-stage-index')?.classList?.contains('journey-stage-done') === true,
       indexDetail: detail.length > 0,
-      partialHistoryDetail: /partial|quarantined/iu.test(detail),
+      partialHistoryDetail: accountlessMode
+        ? false
+        : /partial|quarantined/iu.test(detail),
       googleButton: visible(document.querySelector('#identity-google-signin')),
       appleButton: visible(document.querySelector('#identity-apple-signin')),
       googleButtonEnabled: (() => {
@@ -2189,10 +2251,10 @@ async function assertCommunity(session, health, terminalStatus) {
         const button = document.querySelector('#identity-apple-signin');
         return visible(button) && button.disabled !== true;
       })(),
-      currentLayout: visible(document.querySelector('#identity-signin-next'))
-        && (document.querySelector('#identity-signin-next')?.textContent?.trim() ?? '').length > 0
-        && document.querySelector('#incremental-consent') !== null
-        && (document.querySelector('#incremental-consent')?.textContent?.trim() ?? '').length > 0,
+      currentLayout: visible(nextAction)
+        && (nextAction.textContent?.trim() ?? '').length > 0
+        && consent !== null
+        && (consent.textContent?.trim() ?? '').length > 0,
       consentVisible: visible(document.querySelector('#incremental-consent')),
       noServiceCopy: pageText.includes('no contribution service'),
       noServiceNoticeCount: [
@@ -2220,13 +2282,22 @@ async function assertCommunity(session, health, terminalStatus) {
     serviceReachability: health.serviceReachability,
     serviceReachabilityProven: health.serviceReachabilityProven,
     journeyStageCount: community.journeyStageCount,
-    currentLayout: true,
-    providerControls: true,
+    currentLayout: community.accountlessMode === true
+      ? community.accountlessPanel === true
+      : community.currentLayout === true,
+    providerControls: community.googleButton === true && community.appleButton === true,
     providerControlsEnabled: serviceConfigured
       && community.googleButtonEnabled === true
       && community.appleButtonEnabled === true,
-    indexTerminal: true,
-    partialHistoryDetail: community.partialHistoryDetail,
+    accountlessControls: community.accountlessMode === true
+      && community.sharingSettingsEnabled === true
+      && community.accountlessPreferenceReady === true,
+    transportUnavailable: community.accountlessMode === true
+      && community.accountlessTransport === true,
+    indexTerminal: community.accountlessMode !== true && community.indexTerminal === true,
+    partialHistoryDetail: community.accountlessMode === true
+      ? false
+      : community.partialHistoryDetail,
     noServiceCopy: community.noServiceCopy,
     noServiceNoticeCount: community.noServiceNoticeCount,
   });
@@ -2434,6 +2505,8 @@ export function buildRealHistoryReceipt({
         serviceReachabilityProven: parity.community?.serviceReachabilityProven === true,
         currentLayout: parity.community?.currentLayout === true,
         providerControlsEnabled: parity.community?.providerControlsEnabled === true,
+        accountlessControls: parity.community?.accountlessControls === true,
+        transportUnavailable: parity.community?.transportUnavailable === true,
         indexTerminal: parity.community?.indexTerminal === true,
         partialHistoryDetail: parity.community?.partialHistoryDetail === true,
         noServiceCopy: parity.community?.noServiceCopy === true,
@@ -2489,6 +2562,7 @@ async function runQa(options) {
   const appOptions = {
     appPath: options.appPath,
     codexHomePath: options.codexHomePath,
+    identityFilePath: options.identityFilePath,
     fixture,
     debugPort,
     // Snapshot mode reads the already-seeded dashboard before releasing the
