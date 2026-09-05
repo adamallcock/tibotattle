@@ -132,8 +132,9 @@ ALTER TABLE community_model_composition_days ADD COLUMN source_mutation_epoch IN
 UPDATE community_snapshot_mutation_control
    SET mutation_epoch = mutation_epoch + 1 WHERE singleton_id = 1;
 
--- True usage keyset pagination, including very large equal-time runs. D1's
--- planner does not seek an implicit rowid tuple suffix on the older 0036
--- index; an explicit non-null occurrence key provides the complete seek.
-CREATE INDEX telemetry_v1_records_time_cursor
-  ON telemetry_v1_records(participant_id, stream, observed_at, occurrence_id);
+-- The approved repair of this unapplied migration avoids rebuilding an index
+-- across all retained telemetry after D1 refused the original file with
+-- SQLITE_NOMEM. Readers use the existing 0036 index with two explicit seeks:
+-- equal observed_at plus id, then later observed_at. A tuple predicate alone
+-- cannot seek its implicit rowid suffix. Attribution retains occurrence order
+-- in bounded application state; no telemetry rows or historical SQL change.

@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-05
 type: status
 status: current
-source_commit: ce80f5f26650ce489e678e9ee2ff2adbb36fbedf
+source_commit: eac8df4589b8ce67eb3873764b99c170ccdb3ed2
 observation_date: 2026-09-05
 ---
 
@@ -14,16 +14,24 @@ the checked-out source, the public service, published artifacts, and platform
 support because those are independent facts. Re-check the named source before
 using this page for a later release or operational decision.
 
+Continuation on 2026-09-05: both first-attempt stable `1026` installers from
+`eac8df45` pass final native artifact checks, but publication is held on the
+production `0043` migration's `SQLITE_NOMEM` failure. Only `0042` applied;
+read-only schema checks corroborate complete `0043` rollback and unchanged
+collection/publication controls. The owner explicitly approved a data-preserving
+repair and source/build requalification. The [execution plan](./plans/2026-09-05-public-0-1-18-release.md#approved-migration-repair-continuation)
+records the active boundary; the frozen pre-repair artifacts are not public.
+
 ## Snapshot identity
 
 | Boundary | Verified state |
 |---|---|
-| Documentation/source review | Combined Astra/Intel `0.1.18` RC3 is frozen at `7701debf44e046ac9f25bb74f7214532e32c5c5d`, based on requested `9e1c3333`. Parser v14 corrects paginated reset attribution and the upgrade deadline. Copy-only preservation/semantic/accounting proof and all ten fresh R7 receipts pass their respective checks; full root run has 3,859 passes, zero failures and seventeen existing native-Windows skips. R7 resource decisions remain open. Stable `1026` is unbuilt, with no stable tag or publication |
+| Documentation/source review | Combined Astra/Intel `0.1.18` remains based on requested `9e1c3333`. Parser v14, copy-only preservation/accounting proof, ten fresh R7 receipts and the 3,859-pass root qualification are retained. Both first-attempt stable `1026` artifacts from `eac8df45` passed native finalization; their local-only annotated tag and bytes are preserved, not published. The approved Worker migration repair requires a new final source freeze and fresh exact-source artifacts. R7 resource decisions remain open |
 | Combined signed RC3 | ARM and Intel `0.1.18` build `1025.2` dogfood DMGs from common clean `7701debf` and a local annotated tag; [exact receipt](./receipts/2026-09-04-macos-combined-rc3-signed-candidates.md). Both signed/notarized/stapled with independent final-byte and RC2-to-RC3 replacement checks; real installed runtime, manual lifecycle and physical Intel remain separate |
 | Combined signed RC2 | ARM and Intel `0.1.18` build `1025.1` dogfood DMGs from common source `4ea16586` and a new local annotated tag; [exact receipt](./receipts/2026-09-04-macos-combined-rc2-signed-candidates.md). Both signed/notarized/stapled with independent exact-byte and same-architecture replacement checks; not installed-upgrade, manual lifecycle or physical Intel proof |
 | Earlier Intel tester artifact | Preserved signed/notarized `0.1.18` build `1025` dogfood DMG from source `18c7065b`; [historical receipt](./receipts/2026-09-03-macos-intel-signed-candidate.md). Predates combined Astra changes; remains immutable rollback/test evidence, not physically Intel-qualified |
 | Installed app | Final signed ARM RC3 `0.1.18` / `1025.2`, source `7701debf`, passes production installed-artifact validation. After owner unlock, a native-menu detailed refresh completed at 2026-09-05 03:58 UTC with replay-safe accounting bound to exact v14 generation 71, complete usage coverage and zero fallback. Stopped-state verification preserves all baseline/rehearsal historical keys, reviewed counter changes, salt and paused contribution settings; SQLite quick checks pass. Normal relaunch is observed; stable `1026` installation remains a separate gate |
-| Public service | Health HTTP 200 at 2026-09-05 03:45 UTC; source `b4c8f103bf697fb530434e6de196f2c187645661`. Fresh read-only checks confirm 41 primary and two deletion-ledger migrations, exactly `0042`–`0045` pending after the reviewed historical-lineage repair. The owner separately approved those migrations and the Worker deployment; recovery bookmarks are retained before any apply. No migration or deployment is claimed by this snapshot |
+| Public service | Health HTTP 200 at 2026-09-05 04:26 UTC; unchanged source `b4c8f103bf697fb530434e6de196f2c187645661`. The approved apply completed `0042`, then `0043` failed and rolled back. Read-only checks confirm primary prefix 42, absent `0043` additions and unchanged 3,192,817-record count. Recovery bookmarks are retained; repaired `0043`–`0045` and Worker deployment remain pending. Consent and v1.1 activation are unchanged |
 | Public updater | Stable `0.1.16`; read-only feed check recorded 2026-09-03 in the release plan |
 | Published release | Immutable GitHub `v0.1.17`, published 2026-09-03 at 19:47:43 UTC; ARM DMG, appcast, manifest, checksums and verification guide; exact source tag commit `aa660b24a66196155ba59267ab832cc4ef6e1c7d` |
 

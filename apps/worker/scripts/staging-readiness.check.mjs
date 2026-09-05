@@ -17,6 +17,7 @@ import {
   STAGING_PROOF_TYPES,
   stagingOperationReceipt,
   validateStagingMigrationInventory,
+  V1_USAGE_CURSOR_INDEX_PROBE_SQL,
 } from "./staging-readiness-lib.mjs";
 import {
   checkedInConfig,
@@ -87,13 +88,15 @@ test("migration inventory is exact and rejects missing or unreviewed files", () 
   );
 });
 
-test("reconciled migration lineage preserves historical and renumbered SQL bytes", () => {
+test("reconciled migration lineage pins historical SQL and the approved unapplied 0043 repair", () => {
   // Historical 0041 is the deployed 4519b349 migration. The other digests pin
-  // the unchanged SQL from the pre-reconciliation release source a9220795.
+  // the unchanged SQL from the pre-reconciliation release source a9220795,
+  // except the owner-approved repair of rolled-back, unapplied 0043. Never
+  // change already-applied 0042 or silently update these historical pins.
   const expectedDigests = {
     "0041_community_model_composition_cache.sql": "52ff5ff182023bd504c5d584e4c96494c04db7f29a70661dd5713c4a8770d12d",
     "0042_community_model_composition.sql": "c61629ef87facfc8f8d8e16fc5cdc1d4adaf788df7bcc9ee760b60f86e577330",
-    "0043_analytical_input_fencing.sql": "4c36ed9342365adceb0dc5c4d576a93ffd557b9bc39dfd2a7c9239c5c9b0ca9a",
+    "0043_analytical_input_fencing.sql": "acc7c319478487eec408c5bbcebd90e60f029fb02a608c901b7c6f71706c2f49",
     "0044_attribution_transport_staging.sql": "6d79465243432097aebc20f50718f891e01de234a3b264a984816c54b338e713",
     "0045_attribution_domain_activation.sql": "0e4bd66cc391f64b8b1a3d1533751cec461882282160cc283330bfba22ff9690",
   };
@@ -228,6 +231,29 @@ test("fresh reconciled schema and attribution metadata probe cover every new gua
       assert.equal(attributionSchemaComplete(row), false, name);
       database.exec("ROLLBACK TO missing_schema; RELEASE missing_schema;");
     }
+    // An object with the prerequisite's name but a different seek contract is
+    // insufficient. Exercise absent, reordered, partial and descending keys.
+    const cursorIndex = "telemetry_v1_records_participant_stream_observed";
+    for (const replacement of [
+      "",
+      `CREATE INDEX ${cursorIndex} ON telemetry_v1_records(participant_id, observed_at, stream)`,
+      `CREATE INDEX ${cursorIndex} ON telemetry_v1_records(participant_id, stream, observed_at) WHERE stream = 'usage'`,
+      `CREATE INDEX ${cursorIndex} ON telemetry_v1_records(participant_id, stream, observed_at DESC)`,
+      `CREATE INDEX ${cursorIndex} ON telemetry_v1_records(participant_id, stream, observed_at COLLATE NOCASE)`,
+      `CREATE INDEX ${cursorIndex} ON telemetry_v1_records(participant_id, stream, substr(observed_at, 1))`,
+      `CREATE INDEX ${cursorIndex} ON telemetry_v1_records(participant_id, stream, observed_at, occurrence_id)`,
+    ]) {
+      database.exec(`SAVEPOINT wrong_cursor; DROP INDEX ${cursorIndex}; ${replacement};`);
+      const row = database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get();
+      assert.equal(row.attribution_objects, 0, replacement || "missing 0036 cursor index");
+      assert.equal(attributionSchemaComplete(row), false);
+      database.exec("ROLLBACK TO wrong_cursor; RELEASE wrong_cursor;");
+    }
+    // The physical suffix is rowid; the SQL cursor specifically uses r.id.
+    // A renamed column keeps index metadata intact but breaks that contract.
+    database.exec("SAVEPOINT wrong_cursor_id; ALTER TABLE telemetry_v1_records RENAME COLUMN id TO non_cursor_id;");
+    assert.equal(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get().attribution_objects, 0);
+    database.exec("ROLLBACK TO wrong_cursor_id; RELEASE wrong_cursor_id;");
     for (const [table, column] of [
       ["device_credential_rotations", "recovery_proof_hash"],
       ["community_allowance_fit_cache", "input_fingerprint"],
@@ -255,6 +281,29 @@ test("fresh reconciled schema and attribution metadata probe cover every new gua
     assert.equal(attributionSchemaComplete({ attribution_objects: true, attribution_columns: true }), false);
   } finally {
     database.close();
+  }
+});
+
+test("v1 cursor prerequisite requires id to be the rowid alias, not merely an indexed column", () => {
+  for (const [idDefinition, suffix, expected] of [
+    ["id INTEGER PRIMARY KEY", "", 1],
+    ["id INTEGER PRIMARY KEY AUTOINCREMENT", "", 1],
+    ["id INTEGER PRIMARY KEY DESC", "", 0],
+    ["id INT PRIMARY KEY", "", 0],
+    ["id INTEGER", "", 0],
+    ["id INTEGER", ", PRIMARY KEY (id, participant_id)", 0],
+  ]) {
+    const database = new DatabaseSync(":memory:");
+    try {
+      database.exec(`CREATE TABLE telemetry_v1_records (${idDefinition}, participant_id TEXT,
+        stream TEXT, observed_at TEXT ${suffix});
+        CREATE INDEX telemetry_v1_records_participant_stream_observed
+          ON telemetry_v1_records(participant_id, stream, observed_at);`);
+      assert.equal(database.prepare(V1_USAGE_CURSOR_INDEX_PROBE_SQL).get().v1_usage_cursor_index,
+        expected, `${idDefinition}${suffix}`);
+    } finally {
+      database.close();
+    }
   }
 });
 

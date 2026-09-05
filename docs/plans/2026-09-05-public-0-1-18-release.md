@@ -46,7 +46,7 @@ must have new bytes from the final clean annotated `v0.1.18` source.
 
 ## Ordered execution
 
-- [ ] Complete installed ARM detailed refresh, exact-generation accounting,
+- [x] Complete installed ARM detailed refresh, exact-generation accounting,
   graceful quit, read-only historical preservation/integrity and relaunch.
 - [ ] Finalize/review release notes, dated changelog, waiver and support wording;
   commit clean source, create exact annotated `v0.1.18`, rerun final preflight
@@ -80,6 +80,53 @@ implied by the manual-testing waiver alone. Follow the
 [lineage review](../reviews/2026-09-04-hosted-migration-lineage-reconciliation.md)
 and [production runbook](../runbooks/production-operations.md); do not publish
 an Intel feed until its authenticated guard is deployed and verified.
+
+## Approved migration repair continuation
+
+The first stable source freeze was clean `eac8df4589b8ce67eb3873764b99c170ccdb3ed2`,
+with a local-only annotated `v0.1.18`. Both new `1026` DMGs passed signing,
+notarization and independent final-byte/source/payload/Finder verification;
+ARM previous-stable `1024` replacement validation also passed. Their bytes,
+receipts and local tag-object identity are preserved as pre-repair evidence,
+not published or installed stable qualification. No branch/tag push, GitHub
+release, appcast publication, Homebrew update or Worker deployment occurred.
+
+The approved production migration attempt applied `0042`, then failed in `0043`
+with `out of memory: SQLITE_NOMEM [code: 7500]`. Fresh read-only checks found
+the exact 42-entry primary prefix, both new `0042` tables and its trigger, and
+all eleven objects and nine columns introduced by `0043` absent. Collection
+controls, publication readiness and mutation epoch match the before-state.
+This corroborates the documented per-file rollback, not a partial `0043`.
+The failed statement is not identified by that rollback: its final all-record
+cursor-index creation is the leading hypothesis, not a proven server trace.
+
+Both databases' recovery bookmarks were retained at the same pre-apply UTC
+timestamp. A bounded table count was explicitly saturated; a separate later
+pre-apply exact count recorded 3,192,817 v1 records with 41 migrations and zero
+writes. The original bounded snapshot and failed log remain unchanged.
+
+The owner then explicitly approved repairing the unapplied migration and
+affected queries, validating preservation and performance, resuming deployment,
+and requalifying the release source/builds as needed. Do not delete telemetry,
+change consent, restore production or rewrite any published tag. The next
+source freeze must preserve the first attempt and use fresh finalization outputs.
+
+- [x] Review a bounded existing-index cursor strategy, including equal-time
+  ordering/accounting semantics and all callers; avoid merely removing a required
+  performance index while retaining a scanning query.
+- [x] Repair only unapplied `0043` and affected readers/tests; retain every
+  historical migration and the already applied `0042` exactly.
+- [ ] Prove lossless pagination, preserved pricing/plan/interval semantics,
+  bounded query plans and realistic-scale performance; rerun owning/full gates.
+- [ ] Verify the exact deployed prefix again, apply only the reviewed remaining
+  forward migrations and retain independent after-state checks. Keep v1.1 staged.
+- [ ] Refresh release source/tag/artifact qualification before any publication;
+  retain all first-attempt receipts without relabeling them as the repaired source.
+
+Cloudflare documents [per-file migration rollback](https://developers.cloudflare.com/d1/wrangler-commands/)
+and the [CPU/memory limits on D1 operations](https://developers.cloudflare.com/d1/platform/limits/).
+No undocumented memory override, blind retry, destructive export/import or
+ledger rewrite is a qualified recovery path.
 
 ## Stop conditions
 

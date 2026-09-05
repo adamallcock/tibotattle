@@ -30,7 +30,10 @@ import {
   MAX_WINDOWED_USAGE_ROWS,
   V1_ANALYSIS_WINDOW_DAYS,
   V1_PLAN_ATTRIBUTION_ADAPTER_VERSION,
-  V1_USAGE_PAGE_SQL,
+  V1_USAGE_PAGE_AT_TIME_SQL,
+  V1_USAGE_PAGE_AFTER_TIME_SQL,
+  readV1UsagePage,
+  priceChunkUsageRecord,
 } from "../src/quota-analysis-v1";
 import { loadV1SourcePin } from "../src/telemetry-v1-source-selection";
 import { createV11DeviceFixture } from "./helpers/telemetry-v11";
@@ -1665,7 +1668,242 @@ describe("v1 plan attribution before fit and cost reduction", () => {
 });
 
 describe("v1 analyzer scale fix — fit-preserving reduction", () => {
-  it("seeks by time and occurrence through a full equal-time page without rescanning the window prefix", async () => {
+  it("preserves occurrence-first same-session intervals when insertion order disagrees", async () => {
+    const scenario = await seedPlanEraScenario("tie-order", [
+      { plan: "pro", offsetMinutes: 0, sharedSession: true },
+      { plan: "plus", offsetMinutes: 120 },
+    ]);
+    // The minimum occurrence is a DROP record, but still advances the old
+    // reader's session clock. In rowid order the measurable record comes first
+    // and incorrectly inherits the cross-plan interval instead.
+    const observedAt = new Date(scenario.baseMs + 122 * MINUTE_MS).toISOString();
+    await seedV1Chunk({ participantId: scenario.participantId, deviceId: scenario.device,
+      stream: "usage", chunkDay: scenario.day, seq: 1,
+      createdAt: `${scenario.day}T21:00:00.000Z`, records: [
+        { occurrence_id: "z-tie-measured", observed_at: observedAt, provider: "openai_codex",
+          session_uuid: "00000000-0000-4000-8000-000000000001", record_json: v1PriceableUsageJson() },
+        { occurrence_id: "a-tie-dropped", observed_at: observedAt, provider: "openai_codex",
+          session_uuid: "00000000-0000-4000-8000-000000000001", record_json: "{}" },
+      ] });
+    const intended = await accountScopedQuotaAnalysisV1FullReferenceForTest(db(), scenario.participantId) as AnalysisLike;
+    const rowid = await accountScopedQuotaAnalysisV1FullReferenceForTest(db(), scenario.participantId,
+      { usageTieOrder: "rowid" }) as AnalysisLike;
+    expect(bandResets(intended)).toHaveLength(2);
+    expect(bandResets(rowid)).toHaveLength(1);
+    const actual = await accountScopedQuotaAnalysisV1(db(), scenario.participantId, { nowMs: SCALE_NOW }) as AnalysisLike;
+    expect(bandResets(actual)).toEqual(bandResets(intended));
+  });
+
+  for (const tiedRows of [4_984, 5_005]) {
+    it(`flushes pending occurrence minima across pages and terminal reads (${tiedRows} ties)`, async () => {
+      const scenario = await seedPlanEraScenario(`tie-pages-${tiedRows}`, [
+        { plan: "pro", offsetMinutes: 0, sharedSession: true },
+        { plan: "plus", offsetMinutes: 120 },
+      ]);
+      const observedAt = new Date(scenario.baseMs + 122 * MINUTE_MS).toISOString();
+      const session = "00000000-0000-4000-8000-000000000001";
+      const rows: V1SeedRecord[] = Array.from({ length: tiedRows }, (_, index) => ({
+        occurrence_id: `tied-${String(tiedRows - index).padStart(6, "0")}`,
+        observed_at: observedAt, provider: "openai_codex", session_uuid: session,
+        record_json: index === tiedRows - 1 ? "{}" : JSON.stringify({ ...JSON.parse(v1PriceableUsageJson()),
+          components: { inputUncachedTokens: index % 3 + 1, inputCacheReadTokens: 0,
+            inputCacheWriteTokens: 0, outputTextTokens: 0, outputReasoningTokens: 0, outputCombinedTokens: null } }),
+      }));
+      for (let offset = 0; offset < rows.length; offset += 200) {
+        await seedV1Chunk({ participantId: scenario.participantId, deviceId: scenario.device,
+          stream: "usage", chunkDay: scenario.day, seq: 1 + offset / 200,
+          createdAt: `${scenario.day}T21:00:00.000Z`, records: rows.slice(offset, offset + 200) });
+      }
+      const reference = await accountScopedQuotaAnalysisV1FullReferenceForTest(db(), scenario.participantId) as AnalysisLike;
+      const actual = await accountScopedQuotaAnalysisV1(db(), scenario.participantId, { nowMs: SCALE_NOW }) as AnalysisLike;
+      expect(actual.tracks).toEqual(reference.tracks);
+      // 4,984 + the 16 original events makes exactly one full physical page;
+      // 5,005 ties carries the minimum candidate into a second physical page.
+      expect(await accountScopedQuotaAnalysisV1(db(), scenario.participantId,
+        { nowMs: SCALE_NOW, maxWindowedUsageRows: tiedRows + 15 }))
+        .toMatchObject({ status: "not_testable", reason: "windowed_usage_limit_exceeded" });
+    });
+  }
+
+  it("keeps cutoff, gaps, selected-device, and inactive-participant boundaries in both seeks", async () => {
+    const participantId = await newV1Participant("seek-boundaries");
+    const device = "v1-device-seek-boundaries";
+    const loser = "v1-device-seek-loser";
+    await seedV1Device(participantId, loser, "v1-session-seek-boundaries");
+    const cutoff = new Date(SCALE_NOW - 2 * DAY_MS).toISOString();
+    const later = new Date(Date.parse(cutoff) + 1_000).toISOString();
+    const day = cutoff.slice(0, 10);
+    const own = [
+      { occurrence_id: "before", observed_at: new Date(Date.parse(cutoff) - 1).toISOString() },
+      { occurrence_id: "at-z", observed_at: cutoff },
+      { occurrence_id: "at-a", observed_at: cutoff },
+      { occurrence_id: "later-z", observed_at: later },
+      { occurrence_id: "later-a", observed_at: later },
+    ].map((row) => ({ ...row, provider: "openai_codex", record_json: v1PriceableUsageJson() }));
+    await seedChunkedRecords(participantId, device, "usage", day, own);
+    await seedChunkedRecords(participantId, loser, "usage", day,
+      own.map((row) => ({ ...row, occurrence_id: `loser-${row.occurrence_id}` })), `${day}T19:00:00.000Z`);
+    const pin = await loadV1SourcePin(db(), { participantId, fromDay: day });
+    expect(pin.winners).toEqual([expect.objectContaining({ device_id: device })]);
+    let time = cutoff;
+    let id = 0;
+    const seen: string[] = [];
+    for (;;) {
+      const page = await readV1UsagePage(db(), pin.winnersJson, participantId, time, id, 3);
+      seen.push(...page.map((row) => row.occurrence_id));
+      if (page.length < 3) break;
+      time = page.at(-1)!.observed_at;
+      id = page.at(-1)!.id;
+    }
+    expect(seen).toEqual(["at-z", "at-a", "later-z", "later-a"]);
+    expect(new Set(seen).size).toBe(seen.length);
+    expect(await readV1UsagePage(db(), "[]", participantId, cutoff, 0, 3)).toEqual([]);
+    await db().prepare("UPDATE participants SET state = 'deleting' WHERE id = ?").bind(participantId).run();
+    expect(await readV1UsagePage(db(), pin.winnersJson, participantId, cutoff, 0, 3)).toEqual([]);
+  });
+
+  it("keeps model-composition costs and ordering stable under reversed equal-time insertion", async () => {
+    const outputs = [];
+    for (const reversed of [false, true]) {
+      const scenario = await seedPlanEraScenario(`composition-ties-${reversed}`, [{ plan: "pro", offsetMinutes: 0 }]);
+      const observedAt = new Date(scenario.baseMs + 2 * MINUTE_MS).toISOString();
+      const usageJson = (model: string, tokens: number) => JSON.stringify({ ...JSON.parse(v1PriceableUsageJson()), modelId: model,
+        components: { inputUncachedTokens: tokens, inputCacheReadTokens: 0, inputCacheWriteTokens: 0,
+          outputTextTokens: 0, outputReasoningTokens: 0, outputCombinedTokens: null } });
+      const largeUnit = priceChunkUsageRecord(usageJson("gpt-5.5", 1), observedAt)!.costNanousd;
+      const miniUnit = priceChunkUsageRecord(usageJson("gpt-5.4-mini", 1), observedAt)!.costNanousd;
+      const rows = [
+        { model: "gpt-5.5", tokens: miniUnit, occurrence: "b-composition-large" },
+        { model: "gpt-5.4-mini", tokens: largeUnit, occurrence: "c-composition-mini" },
+        // This zero-cost row gives mini the first old-order Map position.
+        // Equal final model shares make that tie order observable in JSON.
+        { model: "gpt-5.4-mini", tokens: 0, occurrence: "a-composition-mini-zero" },
+      ].map(({ model, tokens, occurrence }) => ({
+        occurrence_id: occurrence,
+        observed_at: observedAt,
+        provider: "openai_codex", model_id: model,
+        record_json: usageJson(model, tokens),
+      }));
+      expect(priceChunkUsageRecord(rows[0]!.record_json, observedAt)!.costNanousd)
+        .toBe(priceChunkUsageRecord(rows[1]!.record_json, observedAt)!.costNanousd);
+      await seedV1Chunk({ participantId: scenario.participantId, deviceId: scenario.device,
+        stream: "usage", chunkDay: scenario.day, seq: 1, createdAt: `${scenario.day}T21:00:00.000Z`,
+        records: reversed ? rows.reverse() : rows });
+      const result = await accountScopedModelCompositionV1(db(), scenario.participantId, { nowMs: SCALE_NOW });
+      expect(result.status).toBe("ready");
+      if (result.status !== "ready") throw new Error("synthetic composition unavailable");
+      expect(result.fit.modelCostShares["gpt-5.5"]).toBe(result.fit.modelCostShares["gpt-5.4-mini"]);
+      expect(Object.keys(result.fit.modelCostShares).indexOf("gpt-5.4-mini"))
+        .toBeLessThan(Object.keys(result.fit.modelCostShares).indexOf("gpt-5.5"));
+      const { inputFingerprint: _fingerprint, ...output } = result;
+      outputs.push(JSON.stringify(output));
+    }
+    expect(outputs[1]).toBe(outputs[0]);
+  });
+
+  it("bounds the union of retained and pending session clocks at the existing 100k cap", async () => {
+    const scenario = await seedPlanEraScenario("session-cap", [{ plan: "pro", offsetMinutes: 0 }]);
+    // DROP-only usage still advances clocks. Two timestamps leave 50k prior
+    // scopes plus 50k current pending scopes, rather than only testing one map.
+    const row = (index: number): V1SeedRecord => ({
+      occurrence_id: `scope-${String(index).padStart(6, "0")}`,
+      observed_at: new Date(scenario.baseMs + (index < 50_000 ? 1 : 2) * MINUTE_MS).toISOString(),
+      provider: "openai_codex", record_json: "{}",
+      session_uuid: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+    });
+    for (let offset = 0; offset < 100_000; offset += 200) {
+      await seedV1Chunk({ participantId: scenario.participantId, deviceId: scenario.device,
+        stream: "usage", chunkDay: scenario.day, seq: 1 + offset / 200,
+        createdAt: `${scenario.day}T21:00:00.000Z`,
+        records: Array.from({ length: 200 }, (_, index) => row(offset + index)) });
+    }
+    expect(await accountScopedQuotaAnalysisV1(db(), scenario.participantId, { nowMs: SCALE_NOW }))
+      .toMatchObject({ status: "ready" });
+    await seedV1Chunk({ participantId: scenario.participantId, deviceId: scenario.device,
+      stream: "usage", chunkDay: scenario.day, seq: 501,
+      createdAt: `${scenario.day}T21:00:00.000Z`, records: [row(100_000)] });
+    expect(await accountScopedQuotaAnalysisV1(db(), scenario.participantId, { nowMs: SCALE_NOW }))
+      .toMatchObject({ status: "not_testable", reason: "session_interval_scope_limit_exceeded" });
+  });
+
+  for (const laterPoison of [false, true]) {
+    it(`handles composition aggregate overflow without losing later poison evidence (${laterPoison})`, async () => {
+      const scenario = await seedPlanEraScenario(`composition-overflow-${laterPoison}`, [{ plan: "pro", offsetMinutes: 0 }]);
+      const observedAt = new Date(scenario.baseMs + MINUTE_MS).toISOString();
+      const usageJson = (tokens: number) => JSON.stringify({ ...JSON.parse(v1PriceableUsageJson()),
+        components: { inputUncachedTokens: 0, inputCacheReadTokens: 0, inputCacheWriteTokens: 0,
+          outputTextTokens: tokens, outputReasoningTokens: 0, outputCombinedTokens: null } });
+      const unit = priceChunkUsageRecord(usageJson(1), observedAt);
+      expect(unit).toMatchObject({ pricingStatus: "fully_priced" });
+      expect(unit!.costNanousd).toBeGreaterThan(0);
+      // Each event stays below the server's existing per-event bound; enough
+      // admitted events in one bin exceed exact integer aggregate range.
+      const recordJson = usageJson(Math.floor(450_000_000_000 / unit!.costNanousd));
+      const priced = priceChunkUsageRecord(recordJson, observedAt);
+      expect(priced).toMatchObject({ pricingStatus: "fully_priced" });
+      const count = Math.floor(Number.MAX_SAFE_INTEGER / priced!.costNanousd) + 1;
+      expect(count).toBeGreaterThan(20_000);
+      expect(count).toBeLessThan(25_000);
+      expect(BigInt(count) * BigInt(priced!.costNanousd)).toBeGreaterThan(BigInt(Number.MAX_SAFE_INTEGER));
+      for (let offset = 0; offset < count; offset += 200) {
+        await seedV1Chunk({ participantId: scenario.participantId, deviceId: scenario.device,
+          stream: "usage", chunkDay: scenario.day, seq: 1 + offset / 200,
+          createdAt: `${scenario.day}T21:00:00.000Z`,
+          records: Array.from({ length: Math.min(200, count - offset) }, (_, index) => ({
+            occurrence_id: `overflow-${String(offset + index).padStart(6, "0")}`,
+            observed_at: observedAt, provider: "openai_codex", record_json: recordJson,
+          })) });
+      }
+      if (laterPoison) {
+        await seedV1Chunk({ participantId: scenario.participantId, deviceId: scenario.device,
+          stream: "usage", chunkDay: scenario.day, seq: 1 + Math.ceil(count / 200),
+          createdAt: `${scenario.day}T21:00:00.000Z`, records: [{
+            occurrence_id: "overflow-later-poison", observed_at: new Date(Date.parse(observedAt) + MINUTE_MS).toISOString(),
+            provider: "openai_codex", record_json: v1UnpriceableUsageJson(),
+          }] });
+      }
+      const actual = await accountScopedModelCompositionV1(db(), scenario.participantId, { nowMs: SCALE_NOW });
+      expect(actual).toMatchObject(laterPoison
+        ? { status: "ready", poisonedBinCount: 1, unpricedUsageEventCount: 1, fit: { totalCostUsd: 0 } }
+        : { status: "not_testable", reason: "usage_cost_limit_exceeded" });
+    });
+  }
+
+  for (const partialPricing of [false, true]) {
+    it(`refuses scalar bucket overflow without omitting partially priced evidence (${partialPricing})`, async () => {
+      const scenario = await seedPlanEraScenario(`scalar-overflow-${partialPricing}`, [{ plan: "pro", offsetMinutes: 0 }]);
+      const observedAt = new Date(scenario.baseMs + MINUTE_MS).toISOString();
+      const usageJson = (tokens: number) => JSON.stringify({ ...JSON.parse(v1PriceableUsageJson()),
+        components: { inputUncachedTokens: 0, inputCacheReadTokens: 0, inputCacheWriteTokens: 0,
+          outputTextTokens: tokens, outputReasoningTokens: 0, outputCombinedTokens: null } });
+      const unit = priceChunkUsageRecord(usageJson(1), observedAt)!;
+      const recordJson = usageJson(Math.floor(450_000_000_000 / unit.costNanousd));
+      const priced = priceChunkUsageRecord(recordJson, observedAt)!;
+      expect(priced.pricingStatus).toBe("fully_priced");
+      const count = Math.floor(90_000_000_000_000 / priced.costNanousd) + 1;
+      expect(count).toBeLessThan(250);
+      const rows = Array.from({ length: count }, (_, index) => ({
+        occurrence_id: `scalar-overflow-${String(index).padStart(4, "0")}`,
+        observed_at: observedAt, provider: "openai_codex", record_json: recordJson,
+      }));
+      if (partialPricing) rows.push({ occurrence_id: "scalar-overflow-unpriced",
+        observed_at: observedAt, provider: "openai_codex", record_json: v1UnpriceableUsageJson() });
+      for (let offset = 0; offset < rows.length; offset += 200) {
+        await seedV1Chunk({ participantId: scenario.participantId, deviceId: scenario.device,
+          stream: "usage", chunkDay: scenario.day, seq: 1 + offset / 200,
+          createdAt: `${scenario.day}T21:00:00.000Z`, records: rows.slice(offset, offset + 200) });
+      }
+      expect(await accountScopedQuotaAnalysisV1(db(), scenario.participantId, { nowMs: SCALE_NOW }))
+        .toMatchObject({ status: "not_testable", reason: "usage_cost_limit_exceeded" });
+    });
+  }
+
+  it("seeks by time and rowid through a full equal-time page without rescanning the window prefix", async () => {
+    // The production repair must work using only the already-deployed 0036
+    // index; building the newer all-row index exceeds D1 memory limits.
+    await db().exec("DROP INDEX IF EXISTS telemetry_v1_records_time_cursor");
+    expect(await db().prepare("SELECT count(*) AS count FROM sqlite_schema WHERE name = 'telemetry_v1_records_time_cursor'")
+      .first<number>("count")).toBe(0);
     const participantId = await newV1Participant("tuple-cursor");
     const device = "v1-device-tuple-cursor";
     const startMs = SCALE_NOW - 2 * DAY_MS;
@@ -1684,27 +1922,33 @@ describe("v1 analyzer scale fix — fit-preserving reduction", () => {
     await seedChunkedRecords(participantId, device, "quota", day, records.quota);
     await seedChunkedRecords(participantId, device, "usage", day, records.usage);
     const sourcePin = await loadV1SourcePin(db(), { participantId, fromDay: day });
-    const cursor = await db().prepare(`SELECT occurrence_id, observed_at FROM telemetry_v1_records
-      WHERE participant_id = ? AND stream = 'usage' ORDER BY observed_at, occurrence_id LIMIT 1 OFFSET 4999`)
-      .bind(participantId).first<{ occurrence_id: string; observed_at: string }>();
+    const cursor = await db().prepare(`SELECT id, occurrence_id, observed_at FROM telemetry_v1_records
+      WHERE participant_id = ? AND stream = 'usage' ORDER BY observed_at, id LIMIT 1 OFFSET 4999`)
+      .bind(participantId).first<{ id: number; occurrence_id: string; observed_at: string }>();
     expect(cursor).not.toBeNull();
-    const args = [sourcePin.winnersJson, participantId, cursor!.observed_at, cursor!.occurrence_id, 5_000];
-    const plan = await db().prepare("EXPLAIN QUERY PLAN " + V1_USAGE_PAGE_SQL).bind(...args)
-      .all<{ detail: string }>();
-    const steps = plan.results.map((row) => row.detail);
-    const program = await db().prepare("EXPLAIN " + V1_USAGE_PAGE_SQL).bind(...args)
-      .all<{ opcode: string; p1: number; p2: number; p3: number; p4: string | null }>();
-    expect(steps.some((step) => step.includes("telemetry_v1_records_time_cursor")
-      && step.includes("(observed_at,occurrence_id)>(?,?)")), steps.join("\n")).toBe(true);
-    expect(program.results.some((row) => ["SeekGE", "SeekGT"].includes(row.opcode) && row.p4 === "4"))
-      .toBe(true); // participant + stream + BOTH cursor keys, not just time.
-    expect(steps.some((step) => step.includes("TEMP B-TREE FOR ORDER BY"))).toBe(false);
+    for (const [sql, args, seekKeys, seekPredicate] of [
+      [V1_USAGE_PAGE_AT_TIME_SQL, [sourcePin.winnersJson, participantId, cursor!.observed_at, cursor!.id, 5_000],
+        "4", "observed_at=? AND rowid>?)"],
+      [V1_USAGE_PAGE_AFTER_TIME_SQL, [sourcePin.winnersJson, participantId, cursor!.observed_at, 5_000],
+        "3", "observed_at>?)"],
+    ] as const) {
+      const plan = await db().prepare("EXPLAIN QUERY PLAN " + sql).bind(...args).all<{ detail: string }>();
+      const steps = plan.results.map((row) => row.detail);
+      const program = await db().prepare("EXPLAIN " + sql).bind(...args)
+        .all<{ opcode: string; p4: string | null }>();
+      expect(steps.some((step) => step.includes("telemetry_v1_records_participant_stream_observed")
+        && step.includes(seekPredicate)), steps.join("\n")).toBe(true);
+      expect(program.results.some((row) => ["SeekGE", "SeekGT"].includes(row.opcode) && row.p4 === seekKeys)).toBe(true);
+      expect(steps.some((step) => /TEMP B-TREE.*ORDER BY/u.test(step))).toBe(false);
+    }
     // The second page starts WITHIN the tied timestamp, not at its beginning.
-    const page = await db().prepare(V1_USAGE_PAGE_SQL).bind(...args)
-      .all<{ occurrence_id: string; observed_at: string }>();
-    expect(page.results).toHaveLength(8);
-    expect(page.results[0]!.observed_at).toBe(cursor!.observed_at);
-    expect(page.results[0]!.occurrence_id > cursor!.occurrence_id).toBe(true);
+    const page = await readV1UsagePage(db(), sourcePin.winnersJson, participantId, cursor!.observed_at, cursor!.id, 5_000);
+    expect(page).toHaveLength(8);
+    expect(page[0]!.observed_at).toBe(cursor!.observed_at);
+    expect(page[0]!.id).toBeGreaterThan(cursor!.id);
+    expect(page.map((row) => row.occurrence_id)).toEqual([
+      records.usage[5_000]!.occurrence_id, ...records.usage.slice(5_001).map((row) => row.occurrence_id),
+    ]);
     const composition = await accountScopedModelCompositionV1(db(), participantId, { nowMs: SCALE_NOW });
     expect(composition).toMatchObject({ status: "ready", usageEventCount: 5_008, unpricedUsageEventCount: 0 });
     // The scalar reader uses the same cursor and budget across pages; neither
