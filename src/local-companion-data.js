@@ -3790,6 +3790,118 @@ export const RETAINED_PROJECTION_SURFACE_PATHS = Object.freeze(
   PROJECTION_SURFACES.map((surface) => surface.path.join(".")),
 );
 
+// The desktop shell is intentionally not another dashboard consumer. Keep a
+// cache of only the two normal Codex allowance lanes it can render, so its
+// five-second poll neither clones nor walks the large published overview.
+const DESKTOP_SHELL_DISPLAY_DURATIONS = Object.freeze([300, 10_080]);
+const DESKTOP_SHELL_DISPLAY_DURATION_SET = new Set(
+  DESKTOP_SHELL_DISPLAY_DURATIONS,
+);
+
+function canonicalDesktopShellDisplayInstant(value) {
+  if (typeof value !== "string") return null;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds)
+      && new Date(milliseconds).toISOString() === value
+    ? value
+    : null;
+}
+
+function desktopShellDisplayCandidate(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)
+      || value.limitId !== "codex"
+      || !DESKTOP_SHELL_DISPLAY_DURATION_SET.has(value.durationMinutes)
+      || !["primary", "secondary"].includes(value.slot)
+      || typeof value.usedPercent !== "number"
+      || !Number.isFinite(value.usedPercent)
+      || value.usedPercent < 0
+      || value.usedPercent > 100
+      || typeof value.remainingPercent !== "number"
+      || !Number.isFinite(value.remainingPercent)
+      || value.remainingPercent < 0
+      || value.remainingPercent > 100
+      || Math.abs((value.usedPercent + value.remainingPercent) - 100) > 0.001) {
+    return null;
+  }
+  const observedAt = canonicalDesktopShellDisplayInstant(value.observedAt);
+  const resetAt = canonicalDesktopShellDisplayInstant(value.resetAt);
+  if (observedAt === null || resetAt === null) return null;
+  const observedAtMs = Date.parse(observedAt);
+  const resetAtMs = Date.parse(resetAt);
+  if (resetAtMs <= observedAtMs
+      || resetAtMs - observedAtMs > value.durationMinutes * 60_000) {
+    return null;
+  }
+  return Object.freeze({
+    durationMinutes: value.durationMinutes,
+    slot: value.slot,
+    usedPercent: Object.is(value.usedPercent, -0) ? 0 : value.usedPercent,
+    remainingPercent: Object.is(value.remainingPercent, -0)
+      ? 0
+      : value.remainingPercent,
+    observedAt,
+    resetAt,
+  });
+}
+
+function desktopShellCandidateWins(candidate, previous) {
+  if (previous === null) return true;
+  if (candidate.slot !== previous.slot) return candidate.slot === "primary";
+  const candidateObservedAt = Date.parse(candidate.observedAt);
+  const previousObservedAt = Date.parse(previous.observedAt);
+  if (candidateObservedAt !== previousObservedAt) {
+    return candidateObservedAt > previousObservedAt;
+  }
+  // Match the native reader's final deterministic tie-break without carrying
+  // provider names, plans, account labels, or any other dashboard field.
+  return [
+    candidate.slot,
+    candidate.resetAt,
+    candidate.observedAt,
+    String(candidate.remainingPercent),
+  ].join("\0") < [
+    previous.slot,
+    previous.resetAt,
+    previous.observedAt,
+    String(previous.remainingPercent),
+  ].join("\0");
+}
+
+function desktopShellDisplayEvidence(snapshot) {
+  const overview = snapshot?.overview;
+  const freshness = overview?.freshness;
+  const sourceWindows = Array.isArray(overview?.quotaWindows)
+    ? overview.quotaWindows
+    : [];
+  const selected = new Map();
+  for (const sourceWindow of sourceWindows) {
+    const candidate = desktopShellDisplayCandidate(sourceWindow);
+    if (candidate === null) continue;
+    const previous = selected.get(candidate.durationMinutes) ?? null;
+    if (desktopShellCandidateWins(candidate, previous)) {
+      selected.set(candidate.durationMinutes, candidate);
+    }
+  }
+  const staleAfterSeconds = typeof freshness?.staleAfterSeconds === "number"
+      && Number.isFinite(freshness.staleAfterSeconds)
+      && freshness.staleAfterSeconds >= 0
+    ? freshness.staleAfterSeconds
+    : null;
+  return Object.freeze({
+    evidenceStatus: snapshot?.mode === "real_local_evidence"
+        && overview?.evidenceStatus === "available"
+      ? "available"
+      : "unavailable",
+    freshness: Object.freeze({
+      status: freshness?.status === "live" ? "live" : "unavailable",
+      staleAfterSeconds,
+    }),
+    windows: Object.freeze(DESKTOP_SHELL_DISPLAY_DURATIONS
+      .map((durationMinutes) => selected.get(durationMinutes))
+      .filter((candidate) => candidate !== undefined)),
+  });
+}
+
 export class LocalCompanionDataStore {
   #builder;
   #snapshotFile;
@@ -3799,6 +3911,7 @@ export class LocalCompanionDataStore {
   #snapshotWriteIntervalMs;
   #lastSnapshotPersistedAt = null;
   #snapshot = null;
+  #desktopShellDisplayEvidence = null;
 
   constructor({
     builder = buildLocalCompanionSnapshot,
@@ -3874,6 +3987,7 @@ export class LocalCompanionDataStore {
       structuredClone(candidate),
       builderOptions,
     );
+    this.#desktopShellDisplayEvidence = desktopShellDisplayEvidence(this.#snapshot);
     await this.#persistAuthoritativeSnapshot(candidate);
     // Refresh orchestration needs publication, not another deep copy of the
     // retained timeline. Accessors and ordinary reload callers still receive
@@ -3897,6 +4011,7 @@ export class LocalCompanionDataStore {
       return false;
     }
     this.#snapshot = structuredClone(retained.snapshot);
+    this.#desktopShellDisplayEvidence = desktopShellDisplayEvidence(this.#snapshot);
     this.#lastSnapshotPersistedAt = persistedAt;
     return true;
   }
@@ -3931,6 +4046,10 @@ export class LocalCompanionDataStore {
   }
 
   #markRestoredSnapshotUnavailable() {
+    // A cross-launch receipt can retain derived history, but it cannot prove
+    // that a quota observation is current after this launch's source read
+    // failed. Never carry that display claim across the failure boundary.
+    this.#desktopShellDisplayEvidence = null;
     const accounting = this.#snapshot?.overview?.accounting;
     if (accounting && typeof accounting === "object") {
       accounting.generationMatched = false;
@@ -4137,6 +4256,13 @@ export class LocalCompanionDataStore {
       generatedAt: snapshot.generatedAt,
       ...structuredClone(snapshot.overview),
     };
+  }
+
+  // The shell poller uses this frozen, cache-only projection rather than
+  // `getOverview()`: a dashboard snapshot can contain large timeline arrays,
+  // while this value contains at most two scalar allowance lanes and no I/O.
+  getDesktopShellDisplayEvidence() {
+    return this.#desktopShellDisplayEvidence;
   }
 
   getGradient() {

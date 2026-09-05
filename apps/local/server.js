@@ -4117,12 +4117,24 @@ function createPreparedLocalCompanionServer({
           return;
         }
         // The shell receives only the closed projection. It deliberately reads
-        // the in-memory lifecycle and refresh receipt rather than the full
-        // dashboard snapshot, so startup and refresh transitions remain
-        // observable without exposing paths, source details, or accounting.
+        // the in-memory lifecycle, refresh receipt, and a tiny cached display
+        // proof rather than the full dashboard snapshot, so five-second polls
+        // neither clone timeline data nor expose paths, source details, or
+        // accounting. Notification evidence remains exclusively on the refresh
+        // receipt; the display proof cannot authorize a notification.
+        let displayEvidence = null;
+        try {
+          displayEvidence = typeof dataStore.getDesktopShellDisplayEvidence === "function"
+            ? dataStore.getDesktopShellDisplayEvidence()
+            : null;
+        } catch {
+          // A local accessor fault is indistinguishable from unavailable
+          // display evidence at this closed route boundary.
+        }
         send(response, 200, projectDesktopShellStatus({
           snapshotStatus: snapshotState.status,
           refresh: refresh.getStatus(),
+          displayEvidence,
           now: clock(),
         }));
         return;

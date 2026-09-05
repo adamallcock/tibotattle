@@ -27,6 +27,20 @@ const TRAY_ICON_SIZE = 16;
 const TRAY_TEMPLATE_WORK_SIZE = 64;
 const TRAY_TEMPLATE_CROP_INSET_RATIO = 0.14;
 const TRAY_TEMPLATE_CROP_SIZE_RATIO = 0.72;
+const TRAY_TEMPLATE_SCALE_FACTORS = Object.freeze([1, 2]);
+const TRAY_TEMPLATE_DRAW_SCALE = TRAY_TEMPLATE_WORK_SIZE / TRAY_ICON_SIZE;
+const NATIVE_TRAY_BIRD_RECT = Object.freeze({
+  x: 0.5,
+  y: 2.5,
+  width: 15,
+  height: 12.5,
+});
+const NATIVE_TRAY_METER_RECT = Object.freeze({
+  x: 1.5,
+  y: 0.25,
+  width: 13,
+  height: 1.75,
+});
 
 function defaultSystemLocales() {
   try {
@@ -273,74 +287,344 @@ function encodeDesktopTrayTemplatePNG(bitmap) {
   ]);
 }
 
-function resizedTemplateImage(nativeImage, bitmap) {
-  const extracted = extractDesktopTrayTemplateBitmap(bitmap);
-  if (extracted === undefined) return null;
+function resizeTemplate(source) {
+  if (source === null
+      || typeof source !== "object"
+      || typeof source.resize !== "function") return null;
+  let resized;
+  try {
+    resized = source.resize({
+      width: TRAY_ICON_SIZE,
+      height: TRAY_ICON_SIZE,
+      quality: "best",
+    });
+  } catch {
+    return null;
+  }
+  return isNonEmptyNativeImage(resized) ? resized : null;
+}
+
+function templateSourceFromBitmap(nativeImage, bitmap) {
+  if (!(bitmap instanceof Uint8Array)
+      || bitmap.byteLength !== TRAY_TEMPLATE_WORK_SIZE * TRAY_TEMPLATE_WORK_SIZE * 4) {
+    return null;
+  }
   const options = {
     width: TRAY_TEMPLATE_WORK_SIZE,
     height: TRAY_TEMPLATE_WORK_SIZE,
     scaleFactor: 1,
   };
-  const resizeTemplate = (source) => {
-    if (source === null
-        || typeof source !== "object"
-        || typeof source.resize !== "function") return null;
-    let resized;
-    try {
-      resized = source.resize({
-        width: TRAY_ICON_SIZE,
-        height: TRAY_ICON_SIZE,
-        quality: "best",
-      });
-    } catch {
-      return null;
-    }
-    return isNonEmptyNativeImage(resized) ? resized : null;
-  };
   if (typeof nativeImage?.createFromBuffer === "function") {
     try {
       const source = nativeImage.createFromBuffer(
-        encodeDesktopTrayTemplatePNG(extracted),
+        encodeDesktopTrayTemplatePNG(bitmap),
         { scaleFactor: 1 },
       );
-      const resized = resizeTemplate(source);
-      if (resized !== null) return resized;
+      if (source !== null
+          && typeof source === "object"
+          && typeof source.resize === "function") return source;
     } catch {
       // Fall through to the raw bitmap decoder below.
     }
   }
   if (typeof nativeImage?.createFromBitmap === "function") {
     try {
-      const source = nativeImage.createFromBitmap(extracted, options);
-      const resized = resizeTemplate(source);
-      if (resized !== null) return resized;
+      const source = nativeImage.createFromBitmap(bitmap, options);
+      if (source !== null
+          && typeof source === "object"
+          && typeof source.resize === "function") return source;
     } catch {
-      // The caller retains the non-empty source image as a final fail-soft
-      // fallback, so a renderer cannot lose its tray entry on this path.
+      // The caller retains the already-decoded app asset as a final fallback.
     }
   }
   return null;
 }
 
+function markTemplateImage(image) {
+  if (image === undefined || image === null || typeof image !== "object") return image;
+  if (typeof image.setTemplateImage === "function") {
+    try {
+      image.setTemplateImage(true);
+    } catch {
+      return null;
+    }
+  }
+  return image;
+}
+
 /**
- * Resolve the reviewed tray asset from the trusted application root.
+ * Build the exact 16pt tray mark with distinct 1x and Retina bitmaps.
  *
- * `resourceRoot` is supplied by the main process after it has resolved the
- * packaged application path. The resolver deliberately accepts no arbitrary
- * asset path: the only file it can load is the fixed, packaged brand asset.
- * An explicitly injected `icon` remains available for dependency-injected
- * tests and callers that already own a validated NativeImage.
+ * Resizing a 64px source directly to a 16px scale-1 NativeImage leaves
+ * AppKit no 2x backing to select, so macOS enlarges that one representation
+ * on a Retina menu bar.  Use Electron's representation API to retain the
+ * same reviewed mark at both physical sizes.  The source remains the
+ * PNG-decoded 64px alpha template above; this helper never draws new art.
  */
-export function resolveDesktopTrayIcon({
-  nativeImage,
-  resourceRoot,
-  platform = process.platform,
-  icon,
-} = {}) {
-  if (icon !== undefined) return icon;
-  if (typeof nativeImage?.createFromPath !== "function") return undefined;
+function highDensityTemplateImage(nativeImage, source) {
+  if (typeof nativeImage?.createEmpty !== "function"
+      || source === null
+      || typeof source !== "object"
+      || typeof source.resize !== "function") return null;
+
+  let template;
+  try {
+    template = nativeImage.createEmpty();
+  } catch {
+    return null;
+  }
+  if (template === null
+      || typeof template !== "object"
+      || typeof template.addRepresentation !== "function") return null;
+
+  for (const scaleFactor of TRAY_TEMPLATE_SCALE_FACTORS) {
+    const pixelSize = TRAY_ICON_SIZE * scaleFactor;
+    let representation;
+    try {
+      representation = source.resize({
+        width: pixelSize,
+        height: pixelSize,
+        quality: "best",
+      });
+      if (!isNonEmptyNativeImage(representation)
+          || typeof representation.toBitmap !== "function") return null;
+      const buffer = Buffer.from(representation.toBitmap());
+      if (buffer.byteLength !== pixelSize * pixelSize * 4) return null;
+      template.addRepresentation({
+        scaleFactor,
+        width: pixelSize,
+        height: pixelSize,
+        buffer,
+      });
+    } catch {
+      return null;
+    }
+  }
+  return isNonEmptyNativeImage(template) ? template : null;
+}
+
+function finalizeTemplateSource(nativeImage, source) {
+  return highDensityTemplateImage(nativeImage, source) ?? resizeTemplate(source);
+}
+
+function scaledNativeRect(rect) {
+  const scale = TRAY_TEMPLATE_DRAW_SCALE;
+  return {
+    x: rect.x * scale,
+    // Native AppKit coordinates begin at the lower-left; Electron bitmaps
+    // are top-down. Keep the reviewed 16pt geometry exactly when composing
+    // the 64px extraction surface.
+    y: TRAY_TEMPLATE_WORK_SIZE - (rect.y + rect.height) * scale,
+    width: rect.width * scale,
+    height: rect.height * scale,
+  };
+}
+
+function clamp(value, minimum, maximum) {
+  return Math.max(minimum, Math.min(maximum, value));
+}
+
+function insideRoundedRect(x, y, rect, radius) {
+  const boundedRadius = clamp(radius, 0, Math.min(rect.width, rect.height) / 2);
+  const centerX = clamp(x, rect.x + boundedRadius, rect.x + rect.width - boundedRadius);
+  const centerY = clamp(y, rect.y + boundedRadius, rect.y + rect.height - boundedRadius);
+  const deltaX = x - centerX;
+  const deltaY = y - centerY;
+  return deltaX * deltaX + deltaY * deltaY <= boundedRadius * boundedRadius;
+}
+
+function paintShape(bitmap, bounds, predicate, alpha) {
+  const boundedAlpha = clamp(alpha, 0, 1);
+  if (boundedAlpha === 0) return;
+  const samples = [0.25, 0.75];
+  const minX = clamp(Math.floor(bounds.x), 0, TRAY_TEMPLATE_WORK_SIZE - 1);
+  const maxX = clamp(Math.ceil(bounds.x + bounds.width) - 1, 0, TRAY_TEMPLATE_WORK_SIZE - 1);
+  const minY = clamp(Math.floor(bounds.y), 0, TRAY_TEMPLATE_WORK_SIZE - 1);
+  const maxY = clamp(Math.ceil(bounds.y + bounds.height) - 1, 0, TRAY_TEMPLATE_WORK_SIZE - 1);
+  for (let y = minY; y <= maxY; y += 1) {
+    for (let x = minX; x <= maxX; x += 1) {
+      let covered = 0;
+      for (const sampleY of samples) {
+        for (const sampleX of samples) {
+          if (predicate(x + sampleX, y + sampleY)) covered += 1;
+        }
+      }
+      if (covered === 0) continue;
+      const offset = (y * TRAY_TEMPLATE_WORK_SIZE + x) * 4;
+      const sourceAlpha = boundedAlpha * covered / (samples.length * samples.length);
+      const destinationAlpha = bitmap[offset + 3] / 255;
+      bitmap[offset] = 255;
+      bitmap[offset + 1] = 255;
+      bitmap[offset + 2] = 255;
+      bitmap[offset + 3] = Math.round((sourceAlpha + destinationAlpha * (1 - sourceAlpha)) * 255);
+    }
+  }
+}
+
+function paintRoundedRect(bitmap, rect, radius, alpha) {
+  paintShape(
+    bitmap,
+    rect,
+    (x, y) => insideRoundedRect(x, y, rect, radius),
+    alpha,
+  );
+}
+
+function paintRoundedOutline(bitmap, rect, lineWidth, alpha) {
+  const inner = {
+    x: rect.x + lineWidth,
+    y: rect.y + lineWidth,
+    width: rect.width - lineWidth * 2,
+    height: rect.height - lineWidth * 2,
+  };
+  const radius = rect.height / 2;
+  paintShape(
+    bitmap,
+    rect,
+    (x, y) => insideRoundedRect(x, y, rect, radius)
+      && (inner.width <= 0
+        || inner.height <= 0
+        || !insideRoundedRect(x, y, inner, Math.max(0, radius - lineWidth))),
+    alpha,
+  );
+}
+
+function paintCircle(bitmap, centerX, centerY, radius, alpha) {
+  paintShape(
+    bitmap,
+    {
+      x: centerX - radius,
+      y: centerY - radius,
+      width: radius * 2,
+      height: radius * 2,
+    },
+    (x, y) => {
+      const deltaX = x - centerX;
+      const deltaY = y - centerY;
+      return deltaX * deltaX + deltaY * deltaY <= radius * radius;
+    },
+    alpha,
+  );
+}
+
+function trayGlyphDescriptor(trayStatus) {
+  if (trayStatus === undefined) return { kind: "unavailable", birdAlpha: 0.42 };
+  let status;
+  try {
+    status = validateDesktopTrayStatus(trayStatus);
+  } catch {
+    return { kind: "unavailable", birdAlpha: 0.42 };
+  }
+  if (status.status === "analyzing") return { kind: "analyzing", birdAlpha: 1 };
+  if (status.status === "stale") return { kind: "stale", birdAlpha: 0.58 };
+  if (status.status === "fresh" && status.allowance !== null) {
+    return {
+      kind: "live",
+      birdAlpha: 1,
+      remainingPercent: status.allowance.remainingPercent,
+    };
+  }
+  return { kind: "unavailable", birdAlpha: 0.42 };
+}
+
+function trayGlyphKey(descriptor) {
+  return descriptor.kind === "live"
+    ? `live:${Object.is(descriptor.remainingPercent, -0) ? 0 : descriptor.remainingPercent}`
+    : descriptor.kind;
+}
+
+function drawNativeTrayMeter(bitmap, descriptor) {
+  const rect = scaledNativeRect(NATIVE_TRAY_METER_RECT);
+  const radius = rect.height / 2;
+  if (descriptor.kind === "live") {
+    paintRoundedRect(bitmap, rect, radius, 0.24);
+    if (descriptor.remainingPercent <= 0) return;
+    paintRoundedRect(bitmap, {
+      ...rect,
+      width: Math.min(
+        rect.width,
+        Math.max(0.8 * TRAY_TEMPLATE_DRAW_SCALE, rect.width * descriptor.remainingPercent / 100),
+      ),
+    }, radius, 1);
+    return;
+  }
+  if (descriptor.kind === "analyzing") {
+    paintRoundedRect(bitmap, rect, radius, 0.3);
+    for (const fraction of [0.25, 0.5, 0.75]) {
+      paintCircle(
+        bitmap,
+        rect.x + rect.width * fraction,
+        rect.y + rect.height / 2,
+        0.6 * TRAY_TEMPLATE_DRAW_SCALE,
+        1,
+      );
+    }
+    return;
+  }
+  paintRoundedOutline(
+    bitmap,
+    rect,
+    0.8 * TRAY_TEMPLATE_DRAW_SCALE,
+    descriptor.kind === "stale" ? 0.55 : 0.42,
+  );
+}
+
+function composeNativeTrayGlyph(baseSource, descriptor) {
+  if (baseSource === null
+      || typeof baseSource !== "object"
+      || typeof baseSource.resize !== "function") return null;
+  const birdRect = scaledNativeRect(NATIVE_TRAY_BIRD_RECT);
+  let bird;
+  try {
+    bird = baseSource.resize({
+      width: Math.round(birdRect.width),
+      height: Math.round(birdRect.height),
+      quality: "best",
+    });
+    if (!isNonEmptyNativeImage(bird) || typeof bird.toBitmap !== "function") return null;
+  } catch {
+    return null;
+  }
+  let birdBitmap;
+  try {
+    birdBitmap = Buffer.from(bird.toBitmap());
+  } catch {
+    return null;
+  }
+  const birdWidth = Math.round(birdRect.width);
+  const birdHeight = Math.round(birdRect.height);
+  if (birdBitmap.byteLength !== birdWidth * birdHeight * 4) return null;
+
+  const output = Buffer.alloc(TRAY_TEMPLATE_WORK_SIZE * TRAY_TEMPLATE_WORK_SIZE * 4);
+  const left = Math.round(birdRect.x);
+  const top = Math.round(birdRect.y);
+  for (let y = 0; y < birdHeight; y += 1) {
+    for (let x = 0; x < birdWidth; x += 1) {
+      const sourceOffset = (y * birdWidth + x) * 4;
+      const targetOffset = ((top + y) * TRAY_TEMPLATE_WORK_SIZE + left + x) * 4;
+      output[targetOffset] = 255;
+      output[targetOffset + 1] = 255;
+      output[targetOffset + 2] = 255;
+      output[targetOffset + 3] = Math.round(birdBitmap[sourceOffset + 3] * descriptor.birdAlpha);
+    }
+  }
+  drawNativeTrayMeter(output, descriptor);
+  return output;
+}
+
+function dynamicTemplateImage(nativeImage, baseSource, descriptor) {
+  const bitmap = composeNativeTrayGlyph(baseSource, descriptor);
+  if (bitmap === null) return null;
+  const source = templateSourceFromBitmap(nativeImage, bitmap);
+  if (source === null) return null;
+  return markTemplateImage(finalizeTemplateSource(nativeImage, source));
+}
+
+function desktopTrayAsset({ nativeImage, resourceRoot, platform, icon }) {
+  if (icon !== undefined) return { baseSource: null, fallback: icon };
+  if (typeof nativeImage?.createFromPath !== "function") return { baseSource: null, fallback: undefined };
   if (typeof resourceRoot !== "string" || !isAbsolute(resourceRoot)) {
-    return undefined;
+    return { baseSource: null, fallback: undefined };
   }
 
   const iconPath = join(resourceRoot, TRAY_ICON_RELATIVE_PATH);
@@ -348,10 +632,10 @@ export function resolveDesktopTrayIcon({
   try {
     source = nativeImage.createFromPath(iconPath);
   } catch {
-    return undefined;
+    return { baseSource: null, fallback: undefined };
   }
   if (!isNonEmptyNativeImage(source) || typeof source.resize !== "function") {
-    return undefined;
+    return { baseSource: null, fallback: undefined };
   }
 
   // The reviewed application artwork is a full squircle. At menu-bar size,
@@ -396,35 +680,96 @@ export function resolveDesktopTrayIcon({
       quality: "best",
     });
   } catch {
-    return undefined;
+    return { baseSource: null, fallback: undefined };
   }
-  if (!isNonEmptyNativeImage(resized)) return undefined;
+  if (!isNonEmptyNativeImage(resized)) return { baseSource: null, fallback: undefined };
+  if (platform !== "darwin") return { baseSource: null, fallback: resized };
 
-  if (platform === "darwin"
-      && typeof resized.toBitmap === "function"
-      && (typeof nativeImage.createFromBitmap === "function"
-        || typeof nativeImage.createFromBuffer === "function")) {
+  let baseSource = null;
+  if (typeof resized.toBitmap === "function") {
     try {
-      const bitmap = Buffer.from(resized.toBitmap());
-      const template = resizedTemplateImage(nativeImage, bitmap);
-      if (template !== null) resized = template;
+      const extracted = extractDesktopTrayTemplateBitmap(Buffer.from(resized.toBitmap()));
+      if (extracted !== undefined) baseSource = templateSourceFromBitmap(nativeImage, extracted);
     } catch {
-      // Keep the non-empty resized source and mark it as a template below.
-      // A runtime-specific bitmap conversion failure must not remove the
-      // status item altogether; the PNG fallback above handles runtimes that
-      // reject createFromBitmap while this path protects older ones that do
-      // not expose either conversion helper.
+      baseSource = null;
     }
   }
+  return { baseSource, fallback: resized };
+}
 
-  if (platform === "darwin" && typeof resized.setTemplateImage === "function") {
-    try {
-      resized.setTemplateImage(true);
-    } catch {
-      return undefined;
+/**
+ * Create a bounded dynamic macOS tray-image resolver.
+ *
+ * It loads and extracts the trusted brand asset once. Each status change may
+ * compose a new 16pt template glyph, but the last semantic state and image
+ * are retained so the five-second status poll neither reloads nor rescales
+ * the source asset when nothing visual changed.
+ */
+export function createDesktopTrayIconFactory(options = {}) {
+  const {
+    nativeImage,
+    resourceRoot,
+    platform = process.platform,
+    icon,
+  } = options;
+  const asset = desktopTrayAsset({ nativeImage, resourceRoot, platform, icon });
+  let lastKey = null;
+  let lastIcon;
+  let fallbackResolved = false;
+  let fallback;
+
+  function resolveFallback() {
+    if (!fallbackResolved) {
+      fallbackResolved = true;
+      if (platform !== "darwin") {
+        fallback = asset.fallback;
+      } else {
+        fallback = asset.baseSource === null
+          ? markTemplateImage(asset.fallback)
+          : markTemplateImage(finalizeTemplateSource(nativeImage, asset.baseSource))
+            ?? markTemplateImage(asset.fallback);
+      }
     }
+    return fallback;
   }
-  return resized;
+
+  function resolve(trayStatus) {
+    if (platform !== "darwin" || asset.baseSource === null) return resolveFallback();
+    const descriptor = trayGlyphDescriptor(trayStatus);
+    const key = trayGlyphKey(descriptor);
+    if (key === lastKey) return lastIcon;
+    const next = dynamicTemplateImage(nativeImage, asset.baseSource, descriptor)
+      ?? resolveFallback();
+    lastKey = key;
+    lastIcon = next;
+    return next;
+  }
+
+  return Object.freeze({ resolve });
+}
+
+/**
+ * Resolve the reviewed tray asset from the trusted application root.
+ *
+ * `resourceRoot` is supplied by the main process after it has resolved the
+ * packaged application path. The resolver deliberately accepts no arbitrary
+ * asset path: the only file it can load is the fixed, packaged brand asset.
+ * An explicitly injected `icon` remains available for dependency-injected
+ * tests and callers that already own a validated NativeImage.
+ */
+export function resolveDesktopTrayIcon({
+  nativeImage,
+  resourceRoot,
+  platform = process.platform,
+  icon,
+  trayStatus,
+} = {}) {
+  return createDesktopTrayIconFactory({
+    nativeImage,
+    resourceRoot,
+    platform,
+    icon,
+  }).resolve(trayStatus);
 }
 
 /**

@@ -12,6 +12,7 @@ import {
   TRAY_POPOVER_ACTION_CHANNEL,
   TRAY_POPOVER_MODEL_CHANNEL,
   TRAY_POPOVER_VISIBILITY_CHANNEL,
+  TRAY_POPOVER_CONTENT_HEIGHT_CHANNEL,
 } from "../desktop-tray-popover.js";
 
 const POPOVER_ORIGIN = "http://127.0.0.1:54321";
@@ -246,9 +247,9 @@ test("popover controller lazily positions, updates, routes, and destroys a trust
   const window = windows[0];
   assert.equal(window.options.frame, false);
   assert.equal(window.options.skipTaskbar, true);
-  assert.equal(window.options.height, 720);
+  assert.equal(window.options.height, 500);
   assert.equal(window.options.minWidth, 1);
-  assert.equal(window.options.maxWidth, 408);
+  assert.equal(window.options.maxWidth, 400);
   assert.equal(window.options.webPreferences.nodeIntegration, false);
   assert.equal(window.options.webPreferences.contextIsolation, true);
   assert.equal(window.options.webPreferences.sandbox, true);
@@ -263,7 +264,7 @@ test("popover controller lazily positions, updates, routes, and destroys a trust
       .map(({ value }) => value),
     [true],
   );
-  assert.deepEqual(window.positions, [[208, 52]]);
+  assert.deepEqual(window.positions, [[212, 52]]);
   assert.equal(popover.visible, true);
 
   const nextModel = createDesktopTrayPopoverModel({ trayStatus: status() });
@@ -337,6 +338,60 @@ test("a failed initial load is discarded so reopening retries the route", async 
   }
 });
 
+test("content height fits the popup without reopening it and restores after a small display", async () => {
+  const preloadPath = await preloadFixture();
+  const windows = [];
+  let area = { x: 0, y: 24, width: 1200, height: 900 };
+  const popover = createDesktopTrayPopover({
+    BrowserWindow: class extends FakeWindow {
+      constructor(options) { super(options); windows.push(this); }
+    },
+    preloadPath,
+    pageURL: POPOVER_PAGE_URL,
+    origin: POPOVER_ORIGIN,
+    tray: { getBounds: () => ({ x: 500, y: 0, width: 40, height: 24 }) },
+    screen: { getDisplayMatching: () => ({ workArea: area }) },
+    platform: "darwin",
+    onAction: () => {},
+  });
+  popover.show();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const window = windows[0];
+  const event = { sender: window.webContents, senderFrame: window.webContents.mainFrame };
+  const report = (...values) => window.webContents.emit(
+    "ipc-message", event, TRAY_POPOVER_CONTENT_HEIGHT_CHANNEL, ...values,
+  );
+  report(476);
+  assert.deepEqual(window.getSize(), [400, 476]);
+  assert.equal(window.showCalls, 1, "layout changes never show or focus the window again");
+  assert.equal(window.focusCalls, 1);
+  for (const value of [0, -1, 4097, 476.5, "600", NaN, Infinity, {}]) report(value);
+  report(600, "extra");
+  window.webContents.emit("ipc-message", { ...event, senderFrame: {} },
+    TRAY_POPOVER_CONTENT_HEIGHT_CHANNEL, 600);
+  window.webContents.emit("ipc-message", { ...event, sender: {} },
+    TRAY_POPOVER_CONTENT_HEIGHT_CHANNEL, 600);
+  assert.deepEqual(window.getSize(), [400, 476]);
+  popover.hide();
+  report(590);
+  assert.equal(window.visible, false);
+  assert.equal(window.showCalls, 1);
+  area = { x: -300, y: 0, width: 300, height: 300 };
+  popover.show();
+  assert.deepEqual(window.getSize(), [276, 276]);
+  area = { x: 0, y: 24, width: 1200, height: 900 };
+  popover.show();
+  assert.deepEqual(window.getSize(), [400, 590], "the natural size survives the work-area cap");
+  report(4096);
+  assert.deepEqual(window.getSize(), [400, 720]);
+  report(1);
+  assert.deepEqual(window.getSize(), [400, 240]);
+  window.webContents.currentURL = "http://127.0.0.1:54321/other";
+  report(590);
+  assert.deepEqual(window.getSize(), [400, 240], "a navigated frame cannot resize the popup");
+  popover.destroy();
+});
+
 test("popover accepts negative display origins, caps to work area, and dismisses on Escape", async () => {
   const preloadPath = await preloadFixture();
   const windows = [];
@@ -367,9 +422,9 @@ test("popover accepts negative display origins, caps to work area, and dismisses
   assert.equal(popover.show(), true);
   await new Promise((resolve) => setTimeout(resolve, 0));
   const window = windows[0];
-  assert.deepEqual(window.sizes, [[408, 436]]);
+  assert.deepEqual(window.sizes, [[400, 436]]);
   const [x, y] = window.positions.at(-1);
-  assert.ok(x >= -1_440 && x + 408 <= 480, `x=${x}`);
+  assert.ok(x >= -1_440 && x + 400 <= 480, `x=${x}`);
   assert.ok(y >= -900 && y + 436 <= -440, `y=${y}`);
   assert.equal(popover.visible, true);
   window.webContents.emit("before-input-event", {}, { type: "keyDown", key: "Escape" });

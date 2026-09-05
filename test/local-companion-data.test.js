@@ -1700,6 +1700,118 @@ test("data store retains its last good snapshot when a reload fails", async () =
   assert.equal(store.getOverview().marker, "last-good");
 });
 
+test("desktop shell display evidence is a cached bounded projection of current normal Codex lanes", async () => {
+  const observedAt = "2026-09-05T11:59:00.000Z";
+  const store = new LocalCompanionDataStore({
+    builder: async () => ({
+      schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+      mode: "real_local_evidence",
+      generatedAt: "2026-09-05T12:00:00.000Z",
+      overview: {
+        evidenceStatus: "available",
+        freshness: { status: "live", staleAfterSeconds: 1_800 },
+        quotaWindows: [
+          // Another provider pool cannot become a compact-shell fallback.
+          {
+            limitId: "codex_bengalfox",
+            slot: "primary",
+            usedPercent: 1,
+            remainingPercent: 99,
+            durationMinutes: 10_080,
+            observedAt,
+            resetAt: "2026-09-05T14:00:00.000Z",
+          },
+          // The native selection prefers a primary slot when both report the
+          // same normal Codex duration, even at exactly 0% remaining.
+          {
+            limitId: "codex",
+            slot: "secondary",
+            usedPercent: 25,
+            remainingPercent: 75,
+            durationMinutes: 10_080,
+            observedAt,
+            resetAt: "2026-09-05T14:00:00.000Z",
+          },
+          {
+            limitId: "codex",
+            slot: "primary",
+            usedPercent: 100,
+            remainingPercent: 0,
+            durationMinutes: 10_080,
+            observedAt,
+            resetAt: "2026-09-05T14:00:00.000Z",
+          },
+          {
+            limitId: "codex",
+            slot: "secondary",
+            usedPercent: 58,
+            remainingPercent: 42,
+            durationMinutes: 300,
+            observedAt,
+            resetAt: "2026-09-05T12:30:00.000Z",
+          },
+          // A malformed complement must not make the cache or the shell lie.
+          {
+            limitId: "codex",
+            slot: "primary",
+            usedPercent: 25,
+            remainingPercent: 76,
+            durationMinutes: 300,
+            observedAt,
+            resetAt: "2026-09-05T12:30:00.000Z",
+          },
+        ],
+        accounting: {
+          projection: { status: "retained" },
+          privateDiagnostic: "/Users/private/retained-history.json",
+        },
+        timeline: { usage: [{ private: "not projected" }] },
+      },
+      gradient: {},
+      weekly: {},
+      quality: {},
+      reports: [],
+    }),
+  });
+
+  // `reload` would normally return the full cloned overview. Suppress that
+  // response, then make any accidental accessor call fail, proving this path
+  // serves the cached small projection instead.
+  await store.reload({ returnOverview: false });
+  store.getOverview = () => {
+    throw new Error("full overview clone is forbidden in the shell poll path");
+  };
+  const evidence = store.getDesktopShellDisplayEvidence();
+
+  assert.deepEqual(evidence, {
+    evidenceStatus: "available",
+    freshness: { status: "live", staleAfterSeconds: 1_800 },
+    windows: [
+      {
+        durationMinutes: 300,
+        slot: "secondary",
+        usedPercent: 58,
+        remainingPercent: 42,
+        observedAt,
+        resetAt: "2026-09-05T12:30:00.000Z",
+      },
+      {
+        durationMinutes: 10_080,
+        slot: "primary",
+        usedPercent: 100,
+        remainingPercent: 0,
+        observedAt,
+        resetAt: "2026-09-05T14:00:00.000Z",
+      },
+    ],
+  });
+  assert.equal(Object.isFrozen(evidence), true);
+  assert.equal(Object.isFrozen(evidence.freshness), true);
+  assert.equal(Object.isFrozen(evidence.windows), true);
+  assert.equal(JSON.stringify(evidence).includes("private"), false);
+  assert.equal(JSON.stringify(evidence).includes("bengalfox"), false);
+});
+
 test("an aborted candidate cannot publish after its projection completes", async () => {
   let calls = 0;
   let releaseCandidate;

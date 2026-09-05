@@ -5,10 +5,12 @@ import { isValidQuotaWindowDuration } from "@app-usagemonitor/quota-analysis";
  *
  * This boundary is deliberately smaller than the dashboard contract.  The
  * shell may use it for a tray/menu label and for the notification policy, but
- * it may not use it as a second dashboard API.  Only the closed v2 direct
- * provider evidence produced by the companion refresh boundary is accepted.
- * Malformed, stale, inferred, and mixed-source evidence is projected as an
- * unavailable allowance rather than being repaired or guessed here.
+ * it may not use it as a second dashboard API. Notification authority remains
+ * the closed v2 direct-provider evidence produced by the companion refresh
+ * boundary. A separate, bounded local-overview proof may supply a display-only
+ * allowance; it can never become notification evidence. Malformed, stale,
+ * inferred, and mixed-source inputs are projected as unavailable rather than
+ * being repaired or guessed here.
  */
 
 export const DESKTOP_SHELL_STATUS_SCHEMA_VERSION =
@@ -52,6 +54,26 @@ const EVIDENCE_WINDOW_KEYS = Object.freeze([
   "usedPercent",
 ]);
 const EVIDENCE_LANES = new Set(["primary", "secondary"]);
+const DISPLAY_EVIDENCE_KEYS = Object.freeze([
+  "evidenceStatus",
+  "freshness",
+  "windows",
+]);
+const DISPLAY_FRESHNESS_KEYS = Object.freeze([
+  "staleAfterSeconds",
+  "status",
+]);
+const DISPLAY_WINDOW_KEYS = Object.freeze([
+  "durationMinutes",
+  "observedAt",
+  "remainingPercent",
+  "resetAt",
+  "slot",
+  "usedPercent",
+]);
+const DISPLAY_WINDOW_DURATIONS = new Set([300, 10_080]);
+const DISPLAY_WINDOW_SLOTS = new Set(["primary", "secondary"]);
+const DISPLAY_EVIDENCE_MAX_WINDOWS = 2;
 const REFRESH_STATES = new Set([
   "idle",
   "running",
@@ -194,6 +216,84 @@ function primaryAllowance(evidence) {
   });
 }
 
+/**
+ * Project a compact display allowance from the already-published local
+ * overview. This proof is deliberately distinct from notification evidence:
+ * it has no continuity key, provider identity, or notification authority.
+ *
+ * The data-store accessor supplies only the two native-supported Codex window
+ * durations. We still validate every scalar here because this route is polled
+ * independently of the dashboard and must fail closed on a malformed accessor
+ * result.
+ */
+function displayAllowance(displayEvidence, { now }) {
+  if (!hasExactKeys(displayEvidence, DISPLAY_EVIDENCE_KEYS)
+      || displayEvidence.evidenceStatus !== "available"
+      || !hasExactKeys(displayEvidence.freshness, DISPLAY_FRESHNESS_KEYS)
+      || displayEvidence.freshness.status !== "live"
+      || typeof displayEvidence.freshness.staleAfterSeconds !== "number"
+      || !Number.isFinite(displayEvidence.freshness.staleAfterSeconds)
+      || displayEvidence.freshness.staleAfterSeconds < 0
+      || !Array.isArray(displayEvidence.windows)
+      || displayEvidence.windows.length < 1
+      || displayEvidence.windows.length > DISPLAY_EVIDENCE_MAX_WINDOWS
+      || !Number.isFinite(now)) {
+    return null;
+  }
+
+  const selected = new Map();
+  for (const candidate of displayEvidence.windows) {
+    if (!hasExactKeys(candidate, DISPLAY_WINDOW_KEYS)
+        || !DISPLAY_WINDOW_DURATIONS.has(candidate.durationMinutes)
+        || !DISPLAY_WINDOW_SLOTS.has(candidate.slot)
+        || typeof candidate.usedPercent !== "number"
+        || !Number.isFinite(candidate.usedPercent)
+        || candidate.usedPercent < 0
+        || candidate.usedPercent > 100
+        || typeof candidate.remainingPercent !== "number"
+        || !Number.isFinite(candidate.remainingPercent)
+        || candidate.remainingPercent < 0
+        || candidate.remainingPercent > 100
+        || Math.abs((candidate.usedPercent + candidate.remainingPercent) - 100) > 0.001) {
+      return null;
+    }
+    const observedAt = canonicalInstant(candidate.observedAt);
+    const resetAt = canonicalInstant(candidate.resetAt);
+    if (observedAt === null || resetAt === null) return null;
+    const observedAtMs = Date.parse(observedAt);
+    const resetAtMs = Date.parse(resetAt);
+    if (resetAtMs <= observedAtMs
+        || resetAtMs - observedAtMs > candidate.durationMinutes * 60_000
+        || selected.has(candidate.durationMinutes)) {
+      return null;
+    }
+    // A current five-hour lane may remain usable after a weekly lane has
+    // independently expired. Match the native reader by excluding that one
+    // lane instead of letting it erase its current sibling.
+    if (observedAtMs > now
+        || now - observedAtMs > displayEvidence.freshness.staleAfterSeconds * 1_000
+        || resetAtMs <= now) {
+      continue;
+    }
+    selected.set(candidate.durationMinutes, Object.freeze({
+      durationMinutes: candidate.durationMinutes,
+      remainingPercent: Object.is(candidate.remainingPercent, -0)
+        ? 0
+        : candidate.remainingPercent,
+    }));
+  }
+
+  // Native presentation gives the seven-day lane precedence when both are
+  // current; the five-hour lane is the normal fallback.
+  const primary = selected.get(10_080) ?? selected.get(300);
+  if (primary === undefined) return null;
+  return Object.freeze({
+    source: "direct",
+    window: primary.durationMinutes === 10_080 ? "seven_day" : "five_hour",
+    remainingPercent: primary.remainingPercent,
+  });
+}
+
 function cloneAllowance(value) {
   if (value === null) return null;
   if (!hasExactKeys(value, ["remainingPercent", "source", "window"])
@@ -281,6 +381,7 @@ function coherentQuarantinedRefresh(refresh) {
 export function projectDesktopShellStatus({
   snapshotStatus = "ready",
   refresh = null,
+  displayEvidence = null,
   now = Date.now(),
 } = {}) {
   if (!["building", "ready", "failed"].includes(snapshotStatus)) {
@@ -289,6 +390,7 @@ export function projectDesktopShellStatus({
   if (snapshotStatus === "building") return closedOutput("starting");
   if (snapshotStatus === "failed") return closedOutput("unavailable");
 
+  const currentDisplayAllowance = displayAllowance(displayEvidence, { now });
   const refreshStatus = safeRefreshState(refresh);
   if (refreshStatus === "running" || refreshStatus === "cancelling") {
     // A refresh receipt may retain the last closed provider observation while
@@ -301,16 +403,21 @@ export function projectDesktopShellStatus({
       { now },
     );
     return retainedEvidence === null
-      ? closedOutput("analyzing")
+      ? closedOutput("analyzing", currentDisplayAllowance)
       : closedOutput(
         "analyzing",
-        primaryAllowance(retainedEvidence),
+        primaryAllowance(retainedEvidence) ?? currentDisplayAllowance,
         retainedEvidence,
       );
   }
   if (refreshStatus === "degraded"
       && !coherentQuarantinedRefresh(refresh)) {
     return closedOutput("unavailable");
+  }
+  if (refreshStatus === "idle") {
+    return currentDisplayAllowance === null
+      ? closedOutput("unavailable")
+      : closedOutput("fresh", currentDisplayAllowance);
   }
   if (refreshStatus !== "succeeded" && refreshStatus !== "degraded") {
     return closedOutput(
@@ -322,8 +429,16 @@ export function projectDesktopShellStatus({
     refresh.result?.notificationEvidence,
     { now },
   );
-  if (evidence === null) return closedOutput("stale");
-  return closedOutput("fresh", primaryAllowance(evidence), evidence);
+  if (evidence !== null) {
+    return closedOutput(
+      "fresh",
+      primaryAllowance(evidence) ?? currentDisplayAllowance,
+      evidence,
+    );
+  }
+  return currentDisplayAllowance === null
+    ? closedOutput("stale")
+    : closedOutput("fresh", currentDisplayAllowance);
 }
 
 export function validateDesktopShellStatus(value) {
@@ -343,17 +458,14 @@ export function validateDesktopShellStatus(value) {
       { now: Date.parse(value.notificationEvidence?.observedAt) },
     )
     : null;
-  if (value.state === "fresh" && evidence === null) {
+  if (value.state === "fresh"
+      && evidence === null
+      && value.allowance === null) {
     throw new TypeError("desktop shell status is invalid");
   }
   if (value.state === "analyzing"
       && value.notificationEvidence !== null
       && evidence === null) {
-    throw new TypeError("desktop shell status is invalid");
-  }
-  if (value.state === "analyzing"
-      && value.notificationEvidence === null
-      && value.allowance !== null) {
     throw new TypeError("desktop shell status is invalid");
   }
   if (!["fresh", "analyzing"].includes(value.state)

@@ -982,6 +982,7 @@ export async function launchDesktopRuntime({
       Menu: runtime.Menu,
       screen: runtime.screen,
       icon: runtime.icon,
+      createTrayIcon: runtime.createTrayIcon,
       preloadPath: paths.preloadPath,
       supervisor,
       ...selectedLifecycleOptions,

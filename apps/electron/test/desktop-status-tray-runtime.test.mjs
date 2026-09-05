@@ -23,14 +23,17 @@ const EVIDENCE = Object.freeze({
   })]),
 });
 
-function status(state = "fresh") {
+function status(state = "fresh", {
+  allowance = state === "fresh"
+    ? { source: "direct", window: "five_hour", remainingPercent: 74 }
+    : null,
+  notificationEvidence = state === "fresh" ? EVIDENCE : null,
+} = {}) {
   return {
     schemaVersion: "tibotattle-desktop-shell-status-v1",
     state,
-    allowance: state === "fresh"
-      ? { source: "direct", window: "five_hour", remainingPercent: 74 }
-      : null,
-    notificationEvidence: state === "fresh" ? EVIDENCE : null,
+    allowance,
+    notificationEvidence,
   };
 }
 
@@ -73,19 +76,28 @@ class FakeWindow extends EventEmitter {
 }
 
 class FakeTray extends EventEmitter {
-  constructor() {
+  constructor(icon) {
     super();
+    this.initialIcon = icon;
+    this.images = [];
     this.menu = null;
     this.titles = [];
   }
 
   setToolTip() {}
   setContextMenu(menu) { this.menu = menu; }
+  setImage(value) { this.images.push(value); }
   setTitle(value) { this.titles.push(value); }
   destroy() {}
 }
 
-function fixture({ fetchImpl, onDesktopStatus, platform = "darwin", visualTray = false } = {}) {
+function fixture({
+  fetchImpl,
+  onDesktopStatus,
+  createTrayIcon,
+  platform = "darwin",
+  visualTray = false,
+} = {}) {
   const app = new FakeApp();
   const windows = [];
   const trays = [];
@@ -129,6 +141,7 @@ function fixture({ fetchImpl, onDesktopStatus, platform = "darwin", visualTray =
       return menu;
     } },
     icon: "test-icon",
+    createTrayIcon,
     preloadPath: visualTray
       ? fileURLToPath(new URL("../preload.cjs", import.meta.url))
       : "/private/preload.cjs",
@@ -189,6 +202,53 @@ test("lifecycle projects monitor status into a dynamic localized tray and observ
 
   assert.equal(fixtureValue.lifecycle.setDesktopLanguage("zh-Hans"), true);
   assert.equal(tray.menu.template[0].label, "TiboTattle · 剩余 74%");
+  await fixtureValue.lifecycle.dispose();
+});
+
+test("lifecycle forwards a current analyzing overview allowance without notification evidence", async () => {
+  const observed = [];
+  const fixtureValue = fixture({
+    fetchImpl: async (url) => jsonResponse(status("analyzing", {
+      allowance: { source: "direct", window: "seven_day", remainingPercent: 0 },
+      notificationEvidence: null,
+    }), url),
+    onDesktopStatus: (value) => observed.push(value),
+  });
+
+  await fixtureValue.lifecycle.start();
+  const tray = fixtureValue.trays[0];
+  await waitFor(() => tray.menu.template[0].label === "TiboTattle · 0% allowance");
+  assert.equal(tray.menu.template[0].label, "TiboTattle · 0% allowance");
+  assert.equal(tray.menu.template[1].label, "Analyzing");
+  assert.equal(tray.titles.at(-1), "0%");
+  assert.deepEqual(observed.map((value) => value.state), ["starting", "analyzing"]);
+  assert.equal(observed.at(-1).notificationEvidence, null);
+  await fixtureValue.lifecycle.dispose();
+});
+
+test("lifecycle updates the macOS image only when a dynamic tray state changes", async () => {
+  const icons = Object.freeze({
+    starting: Object.freeze({ name: "starting" }),
+    fresh: Object.freeze({ name: "fresh" }),
+  });
+  const resolved = [];
+  const fixtureValue = fixture({
+    fetchImpl: async (url) => jsonResponse(status(), url),
+    createTrayIcon: (trayStatus) => {
+      resolved.push(trayStatus.status);
+      return trayStatus.status === "fresh" ? icons.fresh : icons.starting;
+    },
+  });
+
+  await fixtureValue.lifecycle.start();
+  const tray = fixtureValue.trays[0];
+  await waitFor(() => tray.menu.template[0].label === "TiboTattle · 74% allowance");
+  assert.equal(tray.initialIcon, icons.starting);
+  assert.deepEqual(tray.images, [icons.fresh]);
+  assert.ok(resolved.includes("fresh"));
+
+  assert.equal(fixtureValue.lifecycle.setDesktopLanguage("zh-Hans"), true);
+  assert.deepEqual(tray.images, [icons.fresh], "locale-only refresh keeps the cached image");
   await fixtureValue.lifecycle.dispose();
 });
 

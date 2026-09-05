@@ -6,10 +6,12 @@
  * five user-visible states the tray may claim and carries only the companion's
  * closed, direct allowance windows when it has supplied fresh, validated
  * evidence. During an active refresh, a prior fresh observation may be
- * retained in the reducer, but it is revalidated against the observation age
- * at projection time so a stale number can never remain visible. It does not
- * read the filesystem, inspect a renderer, preserve raw errors, or infer a
- * value from stale data.
+ * retained in the reducer, or the companion may publish a separately
+ * validated overview allowance while notification evidence remains absent.
+ * Retained v2 evidence is revalidated against its observation age at
+ * projection time; the overview path is accepted only through the closed
+ * main-process status contract. This module does not read the filesystem,
+ * inspect a renderer, preserve raw errors, or infer a value from stale data.
  */
 
 import { projectDesktopShellNotificationEvidence } from "../../src/desktop-shell-status.js";
@@ -162,7 +164,7 @@ function statusSnapshot(status, allowance = null, notificationEvidence = null) {
 /**
  * Validate and freeze the reducer state. Stale, unavailable, and starting
  * states intentionally have no allowance field beyond `null`; analyzing may
- * carry only the reducer's retained prior evidence.
+ * carry retained v2 evidence or a current closed overview allowance.
  */
 export function validateDesktopTrayStatus(value) {
   assertPlainRecord(value, "tray status");
@@ -186,11 +188,12 @@ export function validateDesktopTrayAllowance(value) {
  *
  * Events use the same closed vocabulary as the output status. A `fresh`
  * event carries the already-validated notification evidence alongside its
- * optional primary summary. An `analyzing` event is intentionally payload-free
- * and may retain the prior fresh evidence in memory; the projector applies
- * the current freshness clock before displaying it. All other events reject
- * evidence and error payloads and clear every previously displayed numeric
- * claim.
+ * optional primary summary. A payload-free `analyzing` event may retain the
+ * prior fresh evidence in memory. An explicit analyzing snapshot replaces
+ * that retained state with the companion's current closed allowance; it may
+ * have null notification evidence because notification authority remains
+ * separate from display authority. All other events reject evidence and error
+ * payloads and clear every previously displayed numeric claim.
  */
 export function reduceDesktopTrayStatus(current, event) {
   const previous = validateDesktopTrayStatus(current);
@@ -207,8 +210,21 @@ export function reduceDesktopTrayStatus(current, event) {
       }
       return statusSnapshot(event.type);
     case "analyzing": {
-      if (!hasExactKeys(event, ["type"])) {
+      const isPayloadFreeTransition = hasExactKeys(event, ["type"]);
+      const isExplicitSnapshot = hasExactKeys(event, [
+        "type",
+        "allowance",
+        "notificationEvidence",
+      ]);
+      if (!isPayloadFreeTransition && !isExplicitSnapshot) {
         throw new TypeError("tray event has unexpected fields");
+      }
+      if (isExplicitSnapshot) {
+        return statusSnapshot(
+          "analyzing",
+          event.allowance,
+          event.notificationEvidence,
+        );
       }
       // The status endpoint intentionally reports only the lifecycle phase.
       // Keep an already-validated live observation across that transition so
@@ -314,9 +330,11 @@ export function projectDesktopTrayStatus(value, options = {}) {
     "status label",
   );
   let allowance = null;
-  const canDisplayAllowance = status.allowance !== null
-    && !(status.status === "analyzing" && evidence === null)
-    && !evidenceExpired;
+  // A closed analyzing snapshot may carry a current overview allowance while
+  // its stricter notification evidence is deliberately null. That allowance
+  // remains displayable because the companion has already proved its own
+  // freshness; only a retained v2 observation can expire locally here.
+  const canDisplayAllowance = status.allowance !== null && !evidenceExpired;
   if (canDisplayAllowance) {
     const roundedRemainingPercent = Math.round(status.allowance.remainingPercent);
     allowance = Object.freeze({

@@ -10,6 +10,7 @@ import {
   resolveDesktopLocale,
 } from "../desktop-menu.js";
 import {
+  createDesktopTrayIconFactory,
   createDesktopTrayTemplate,
   extractDesktopTrayTemplateBitmap,
   resolveDesktopTrayIcon,
@@ -440,6 +441,144 @@ test("macOS tray icon falls back to a PNG decoder when raw bitmap construction i
     137, 80, 78, 71, 13, 10, 26, 10,
   ]);
   assert.deepEqual(calls.template, [true]);
+});
+
+test("macOS dynamic tray glyph preserves the native meter states at 1x and Retina", () => {
+  const bitmap = Buffer.alloc(64 * 64 * 4);
+  bitmap.set([240, 245, 250, 255], 0);
+  const calls = {
+    bitmaps: [],
+    representations: [],
+    representationResize: [],
+    templates: [],
+  };
+  const opaqueBird = Buffer.alloc(60 * 50 * 4, 0xff);
+  const representation = (options) => ({
+    isEmpty: () => false,
+    toBitmap: () => Buffer.alloc(options.width * options.height * 4, 0xff),
+  });
+  const baseSource = {
+    resize: (options) => {
+      calls.representationResize.push(options);
+      assert.deepEqual(options, { width: 60, height: 50, quality: "best" });
+      return { isEmpty: () => false, toBitmap: () => opaqueBird };
+    },
+  };
+  const glyphSource = {
+    resize: (options) => {
+      calls.representationResize.push(options);
+      return representation(options);
+    },
+  };
+  const source = {
+    isEmpty: () => false,
+    resize: () => ({
+      isEmpty: () => false,
+      toBitmap: () => bitmap,
+    }),
+  };
+  const factory = createDesktopTrayIconFactory({
+    nativeImage: {
+      createFromPath: () => source,
+      createFromBitmap: (value) => {
+        calls.bitmaps.push(Buffer.from(value));
+        return calls.bitmaps.length === 1 ? baseSource : glyphSource;
+      },
+      createEmpty: () => {
+        const template = {
+          isEmpty: () => false,
+          addRepresentation: (options) => {
+            calls.representations.push({
+              ...options,
+              buffer: Buffer.from(options.buffer),
+            });
+          },
+          setTemplateImage: (value) => calls.templates.push(value),
+        };
+        return template;
+      },
+    },
+    resourceRoot: "/trusted/app",
+    platform: "darwin",
+  });
+
+  const freshZero = factory.resolve({
+    status: "fresh",
+    allowance: { source: "direct", window: "seven_day", remainingPercent: 0 },
+    notificationEvidence: null,
+  });
+  assert.equal(calls.bitmaps.length, 2, "extract once, then compose the live glyph");
+  assert.equal(factory.resolve({
+    status: "fresh",
+    allowance: { source: "direct", window: "seven_day", remainingPercent: 0 },
+    notificationEvidence: null,
+  }), freshZero, "unchanged status reuses the prior NativeImage");
+  assert.equal(calls.bitmaps.length, 2, "unchanged polls do not decode or resize the asset");
+
+  const alphaAt = (glyph, x, y) => glyph[(y * 64 + x) * 4 + 3];
+  const liveGlyph = calls.bitmaps[1];
+  assert.equal(alphaAt(liveGlyph, 2, 4), 255, "bird begins at native x=0.5pt, y=2.5pt");
+  assert.equal(alphaAt(liveGlyph, 0, 0), 0, "the 16pt canvas has no app plate");
+  assert.ok(alphaAt(liveGlyph, 32, 59) > 0, "0% retains the live meter track");
+  assert.ok(alphaAt(liveGlyph, 32, 59) < 255, "0% is not rendered as a full meter");
+
+  factory.resolve({
+    status: "fresh",
+    allowance: { source: "direct", window: "seven_day", remainingPercent: 50 },
+    notificationEvidence: null,
+  });
+  const halfGlyph = calls.bitmaps[2];
+  assert.equal(alphaAt(halfGlyph, 20, 59), 255, "live allowance fills the lower meter");
+  assert.ok(alphaAt(halfGlyph, 50, 59) < 255, "live allowance leaves its remaining track visible");
+
+  factory.resolve({
+    status: "analyzing",
+    allowance: { source: "direct", window: "seven_day", remainingPercent: 0 },
+    notificationEvidence: null,
+  });
+  const analyzingGlyph = calls.bitmaps[3];
+  assert.equal(alphaAt(analyzingGlyph, 32, 59), 255, "analyzing uses the native center dot");
+  assert.ok(alphaAt(analyzingGlyph, 26, 59) < 255, "analyzing leaves the meter track visible");
+
+  factory.resolve({
+    status: "stale",
+    allowance: null,
+    notificationEvidence: null,
+  });
+  const staleGlyph = calls.bitmaps[4];
+  assert.ok(alphaAt(staleGlyph, 6, 59) > 0, "stale uses a meter outline");
+  assert.equal(alphaAt(staleGlyph, 32, 59), 0, "stale does not imply a remaining percentage");
+
+  assert.deepEqual(calls.representationResize, [
+    { width: 60, height: 50, quality: "best" },
+    { width: 16, height: 16, quality: "best" },
+    { width: 32, height: 32, quality: "best" },
+    { width: 60, height: 50, quality: "best" },
+    { width: 16, height: 16, quality: "best" },
+    { width: 32, height: 32, quality: "best" },
+    { width: 60, height: 50, quality: "best" },
+    { width: 16, height: 16, quality: "best" },
+    { width: 32, height: 32, quality: "best" },
+    { width: 60, height: 50, quality: "best" },
+    { width: 16, height: 16, quality: "best" },
+    { width: 32, height: 32, quality: "best" },
+  ]);
+  assert.deepEqual(calls.representations.map((representation) => ({
+    scaleFactor: representation.scaleFactor,
+    width: representation.width,
+    height: representation.height,
+    byteLength: representation.buffer.byteLength,
+  })), [
+    { scaleFactor: 1, width: 16, height: 16, byteLength: 16 * 16 * 4 },
+    { scaleFactor: 2, width: 32, height: 32, byteLength: 32 * 32 * 4 },
+    { scaleFactor: 1, width: 16, height: 16, byteLength: 16 * 16 * 4 },
+    { scaleFactor: 2, width: 32, height: 32, byteLength: 32 * 32 * 4 },
+    { scaleFactor: 1, width: 16, height: 16, byteLength: 16 * 16 * 4 },
+    { scaleFactor: 2, width: 32, height: 32, byteLength: 32 * 32 * 4 },
+    { scaleFactor: 1, width: 16, height: 16, byteLength: 16 * 16 * 4 },
+    { scaleFactor: 2, width: 32, height: 32, byteLength: 32 * 32 * 4 },
+  ]);
+  assert.deepEqual(calls.templates, [true, true, true, true]);
 });
 
 test("real packaged bird asset produces a sparse template, not a white plate", async () => {

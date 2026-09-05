@@ -13,31 +13,36 @@
     <main class="electron-tray-popup" id="tray-popup" aria-labelledby="tray-popup-title">
       <header class="electron-tray-popup-header">
         <div class="electron-tray-popup-brand">
-          <img src="./tibotattle-icon.png" width="28" height="28" alt="" aria-hidden="true">
-          <span>TiboTattle</span>
+          <img src="./tibotattle-icon.png" width="29" height="29" alt="" aria-hidden="true">
+          <div class="electron-tray-popup-brand-copy">
+            <h1 id="tray-popup-title">TiboTattle</h1>
+            <p class="electron-tray-popup-freshness" id="tray-popup-freshness" role="status" aria-live="polite">Loading…</p>
+          </div>
         </div>
-        <h1 id="tray-popup-title" data-i18n="dashboard.title">Usage overview</h1>
-        <p class="electron-tray-popup-freshness" id="tray-popup-freshness" role="status" aria-live="polite">Loading…</p>
+        <button type="button" data-action="more" class="electron-tray-popup-more"
+          data-i18n-aria-label="electron.trayPopover.more" aria-label="More actions"
+          data-i18n-title="electron.trayPopover.more" title="More actions">⋯</button>
       </header>
 
       <section class="electron-tray-popup-section" aria-labelledby="allowance-heading">
-        <h2 id="allowance-heading" data-i18n="dashboard.quota.observations">Quota observations</h2>
+        <h2 id="allowance-heading" data-i18n="electron.trayPopover.allowance">Allowance</h2>
         <div id="allowance-lanes" class="electron-tray-popup-allowances"></div>
         <p id="allowance-unavailable" class="electron-tray-popup-notice" hidden></p>
       </section>
 
-      <section class="electron-tray-popup-section" aria-labelledby="pace-heading">
+      <section id="pace-section" class="electron-tray-popup-section electron-tray-popup-pace" aria-labelledby="pace-heading" hidden>
         <h2 id="pace-heading" data-i18n="electron.trayPopover.weeklyPace">Weekly pace</h2>
-        <p id="pace-state" class="electron-tray-popup-muted">Loading…</p>
-        <p id="pace-outlook" class="electron-tray-popup-outlook" hidden></p>
-        <p id="pace-early" class="electron-tray-popup-notice" hidden></p>
-        <div id="pace-metrics" class="electron-tray-popup-metrics" hidden>
+        <div class="electron-tray-popup-pace-heading">
+          <p id="pace-state"></p>
+          <p id="pace-outlook" class="electron-tray-popup-muted"></p>
+        </div>
+        <div id="pace-metrics" class="electron-tray-popup-pace-metrics">
           <span id="pace-used"></span>
           <span id="pace-remaining"></span>
           <span id="pace-rate"></span>
           <span id="pace-reset"></span>
         </div>
-        <div id="pace-track" class="electron-tray-popup-pace-track" hidden>
+        <div id="pace-track" class="electron-tray-popup-pace-track">
           <span id="pace-fill" class="electron-tray-popup-pace-fill"></span>
           <span id="pace-active-marker" class="electron-tray-popup-pace-active-marker" aria-hidden="true"></span>
         </div>
@@ -45,32 +50,43 @@
 
       <section class="electron-tray-popup-section" aria-labelledby="history-heading">
         <div class="electron-tray-popup-section-heading">
-          <h2 id="history-heading" data-i18n="electron.trayPopover.localHistory">Local usage history</h2>
+          <h2 id="history-heading" data-i18n="electron.trayPopover.localUsage">Local usage</h2>
           <div class="electron-tray-popup-range" role="group"
-            data-i18n-aria-label="electron.trayPopover.localHistory"
-            aria-label="Local usage history">
+            data-i18n-aria-label="electron.trayPopover.localUsage"
+            aria-label="Local usage">
             <button type="button" data-history-range="7d" aria-pressed="true">7d</button>
             <button type="button" data-history-range="30d" aria-pressed="false">30d</button>
           </div>
         </div>
-        <div class="electron-tray-popup-history-summary">
-          <span id="history-summary"></span>
-          <strong id="history-cost"
-            data-i18n-aria-label="accounting.apiEquivalent.standardRateBasis"
-            aria-label="Calculated at Standard API rates.">—</strong>
+        <p id="history-retained" class="electron-tray-popup-muted electron-tray-popup-history-retained" hidden></p>
+        <div id="history-available">
+          <p id="history-period" class="electron-tray-popup-history-period"></p>
+          <div class="electron-tray-popup-history-metrics">
+            <strong id="history-tokens"></strong>
+            <span id="history-events"></span>
+          </div>
+          <p id="history-price" class="electron-tray-popup-history-price"></p>
+          <div id="history-bars" class="electron-tray-popup-history-bars" role="group"
+            data-i18n-aria-label="electron.trayPopover.localUsage"
+            aria-label="Local usage"></div>
+          <div class="electron-tray-popup-history-endpoints" aria-hidden="true">
+            <span id="history-start"></span>
+            <span id="history-end"></span>
+          </div>
+          <p id="history-coverage" class="electron-tray-popup-muted" hidden></p>
         </div>
-        <div id="history-bars" class="electron-tray-popup-history-bars" role="group"
-          data-i18n-aria-label="electron.trayPopover.localHistory"
-          aria-label="Local usage history"></div>
-        <p id="history-coverage" class="electron-tray-popup-muted"></p>
-        <p id="history-retained" class="electron-tray-popup-notice" hidden></p>
-        <p id="history-pricing" class="electron-tray-popup-notice" hidden></p>
+        <div id="history-unavailable" class="electron-tray-popup-history-unavailable" hidden>
+          <p id="history-unavailable-title"></p>
+          <p id="history-unavailable-body" class="electron-tray-popup-muted"></p>
+        </div>
       </section>
 
       <footer class="electron-tray-popup-footer">
-        <button type="button" data-action="open" class="electron-tray-popup-primary" data-i18n="electron.tray.open">Open TiboTattle</button>
-        <button type="button" data-action="refresh" data-i18n="electron.tray.refresh">Update Local Usage</button>
-        <button type="button" data-action="more" data-i18n-aria-label="electron.trayPopover.more" aria-label="More actions" data-i18n-title="electron.trayPopover.more" title="More actions">⋯</button>
+        <div class="electron-tray-popup-footer-actions">
+          <button type="button" data-action="open" class="electron-tray-popup-primary" data-i18n="electron.tray.open">Open TiboTattle</button>
+          <button type="button" data-action="refresh" data-i18n="electron.trayPopover.refresh">Refresh</button>
+        </div>
+        <p class="electron-tray-popup-disclaimer" data-i18n="electron.trayPopover.notSubscriptionBill">Not a subscription bill</p>
       </footer>
       <div class="sr-only" id="tray-popup-live" role="status" aria-live="polite"></div>
     </main>

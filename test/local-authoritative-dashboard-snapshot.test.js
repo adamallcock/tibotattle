@@ -472,6 +472,19 @@ test("the data store restores only the last authoritative receipt across launche
   const files = await fixture();
   try {
     const authoritative = authoritativeSnapshot();
+    Object.assign(authoritative.overview, {
+      evidenceStatus: "available",
+      freshness: { status: "live", staleAfterSeconds: 1_800 },
+      quotaWindows: [{
+        limitId: "codex",
+        slot: "primary",
+        usedPercent: 100,
+        remainingPercent: 0,
+        durationMinutes: 10_080,
+        observedAt: "2026-08-27T11:59:00.000Z",
+        resetAt: "2026-08-27T15:00:00.000Z",
+      }],
+    });
     const first = new LocalCompanionDataStore({
       snapshotFile: files.snapshotFile,
       builder: async () => structuredClone(authoritative),
@@ -518,6 +531,11 @@ test("the data store restores only the last authoritative receipt across launche
       retainedAt: "2026-08-27T12:00:00.000Z",
       coveredAt: null,
     });
+    assert.equal(
+      third.getDesktopShellDisplayEvidence(),
+      null,
+      "a retained receipt is not current quota display evidence after a failed live read",
+    );
   } finally {
     await rm(files.root, { recursive: true });
   }

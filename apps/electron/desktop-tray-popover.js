@@ -26,6 +26,7 @@ export const TRAY_POPOVER_VERSION = "v1";
 export const TRAY_POPOVER_ACTION_CHANNEL = "tibotattle:electron-tray-popover:v1";
 export const TRAY_POPOVER_MODEL_CHANNEL = "tibotattle:electron-tray-popover-model:v1";
 export const TRAY_POPOVER_VISIBILITY_CHANNEL = "tibotattle:electron-tray-popover-visibility:v1";
+export const TRAY_POPOVER_CONTENT_HEIGHT_CHANNEL = "tibotattle:electron-tray-popover-content-height:v1";
 export const TRAY_POPOVER_PRELOAD_FILE = "tray-popover-preload.cjs";
 export const TRAY_POPOVER_ACTIONS = Object.freeze([
   "open",
@@ -42,8 +43,11 @@ const STATUS_SET = new Set(DESKTOP_TRAY_STATUS_STATES);
 const ACTION_SET = new Set(TRAY_POPOVER_ACTIONS);
 const MAX_TEXT_BYTES = 512;
 const MAX_WINDOWS = 2;
-const POPOVER_WIDTH = 408;
-const POPOVER_HEIGHT = 720;
+const POPOVER_WIDTH = 400;
+const POPOVER_HEIGHT = 500;
+const POPOVER_MAX_HEIGHT = 720;
+const POPOVER_MIN_CONTENT_HEIGHT = 240;
+const MAX_REPORTED_CONTENT_HEIGHT = 4096;
 const POPOVER_MIN_HEIGHT = 1;
 const POPOVER_WORKAREA_MARGIN = 12;
 const POPOVER_OFFSET = 8;
@@ -213,6 +217,7 @@ export function installDesktopTrayPopoverPolicy({
   webContents,
   initialURL,
   onAction,
+  onContentHeight = null,
 } = {}) {
   if (!webContents || typeof webContents.on !== "function") {
     throw new TypeError("webContents is required");
@@ -221,6 +226,9 @@ export function installDesktopTrayPopoverPolicy({
     throw new TypeError("initialURL is required");
   }
   if (typeof onAction !== "function") throw new TypeError("onAction is required");
+  if (onContentHeight !== null && typeof onContentHeight !== "function") {
+    throw new TypeError("onContentHeight must be a function or null");
+  }
   let removed = false;
   const onWillNavigate = (event, url) => {
     if (url !== initialURL) event?.preventDefault?.();
@@ -246,13 +254,16 @@ export function installDesktopTrayPopoverPolicy({
     }
   };
   const onIPCMessage = (event, channel, ...values) => {
-    if (channel !== TRAY_POPOVER_ACTION_CHANNEL
-        || event?.sender !== webContents
+    if (event?.sender !== webContents
         || !isCommittedMainFrame(event)
-        || values.length !== 1
-        || !validAction(values[0])) return;
+        || values.length !== 1) return;
     try {
-      onAction(values[0]);
+      if (channel === TRAY_POPOVER_CONTENT_HEIGHT_CHANNEL) {
+        if (Number.isSafeInteger(values[0]) && values[0] >= 1
+            && values[0] <= MAX_REPORTED_CONTENT_HEIGHT) onContentHeight?.(values[0]);
+      } else if (channel === TRAY_POPOVER_ACTION_CHANNEL && validAction(values[0])) {
+        onAction(values[0]);
+      }
     } catch {
       // The lifecycle owns each bounded action. Renderer failure must not
       // interrupt shutdown or the dashboard.
@@ -357,34 +368,35 @@ export function createDesktopTrayPopover({
   let destroyed = false;
   let destroying = false;
   let windowCleanup = () => {};
+  let contentHeight = POPOVER_HEIGHT;
 
-  function present(bounds) {
+  function position(bounds) {
     if (!isLiveWindow(window)) return false;
     const selectedBounds = normalizeBounds(bounds)
       ?? normalizeBounds(tray?.getBounds?.());
-    if (selectedBounds !== null) {
-      const size = window.getSize?.() ?? [POPOVER_WIDTH, POPOVER_HEIGHT];
-      let width = finite(size?.[0], POPOVER_WIDTH);
-      let height = finite(size?.[1], POPOVER_HEIGHT);
-      const workArea = matchingWorkArea(screen, selectedBounds);
-      if (workArea !== null) {
-        // Keep the fixed-width surface usable on compact/high-DPI displays;
-        // the page itself scrolls when this cap is below its natural height.
-        width = Math.min(width, Math.max(1, Math.floor(
-          workArea.width - (POPOVER_WORKAREA_MARGIN * 2),
-        )));
-        height = Math.min(height, Math.max(1, Math.floor(
-          workArea.height - (POPOVER_WORKAREA_MARGIN * 2),
-        )));
-        if (typeof window.setSize === "function"
-            && (width !== size?.[0] || height !== size?.[1])) {
-          try {
-            window.setSize(Math.round(width), Math.round(height), false);
-          } catch {
-            // Positioning below still receives the capped dimensions.
-          }
-        }
+    const size = window.getSize?.() ?? [POPOVER_WIDTH, POPOVER_HEIGHT];
+    let width = POPOVER_WIDTH;
+    let height = contentHeight;
+    const workArea = selectedBounds === null ? null : matchingWorkArea(screen, selectedBounds);
+    if (workArea !== null) {
+      // Use the natural size again when moving back to a larger display.
+      // The page scrolls when the work area is smaller than its content.
+      width = Math.min(width, Math.max(1, Math.floor(
+        workArea.width - (POPOVER_WORKAREA_MARGIN * 2),
+      )));
+      height = Math.min(height, Math.max(1, Math.floor(
+        workArea.height - (POPOVER_WORKAREA_MARGIN * 2),
+      )));
+    }
+    if (typeof window.setSize === "function"
+        && (width !== size?.[0] || height !== size?.[1])) {
+      try {
+        window.setSize(Math.round(width), Math.round(height), false);
+      } catch {
+        // Positioning below still receives the capped dimensions.
       }
+    }
+    if (selectedBounds !== null) {
       const centeredX = selectedBounds.x + (selectedBounds.width / 2) - (width / 2);
       const spaceAbove = selectedBounds.y - (workArea?.y ?? Number.NEGATIVE_INFINITY);
       const spaceBelow = workArea === null
@@ -415,6 +427,11 @@ export function createDesktopTrayPopover({
         // A disappearing display can invalidate tray bounds during activation.
       }
     }
+    return true;
+  }
+
+  function present(bounds) {
+    if (!position(bounds)) return false;
     try {
       // The popover is an interactive, keyboard-accessible surface. A
       // nonactivating panel would leave Escape and button focus with the
@@ -443,7 +460,7 @@ export function createDesktopTrayPopover({
       minWidth: 1,
       maxWidth: POPOVER_WIDTH,
       minHeight: POPOVER_MIN_HEIGHT,
-      maxHeight: POPOVER_HEIGHT,
+      maxHeight: POPOVER_MAX_HEIGHT,
       frame: false,
       resizable: false,
       movable: false,
@@ -479,6 +496,14 @@ export function createDesktopTrayPopover({
       policy = installDesktopTrayPopoverPolicy({
         webContents: candidate.webContents,
         initialURL,
+        onContentHeight: (height) => {
+          const next = clamp(height, POPOVER_MIN_CONTENT_HEIGHT, POPOVER_MAX_HEIGHT);
+          if (next === contentHeight) return;
+          contentHeight = next;
+          // Resizing is presentation only: it must not reopen or steal focus
+          // from a dismissed popup. Restore the natural size on the next show.
+          if (window === candidate && candidate.isVisible?.()) position();
+        },
         onAction: (action) => {
           try {
             onAction(action);

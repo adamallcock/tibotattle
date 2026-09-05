@@ -124,6 +124,67 @@ test("analyzing retains a prior live observation but the projector expires it", 
   assert.equal(expiredProjection.evidenceLabel, "Analyzing");
 });
 
+test("an explicit analyzing overview snapshot keeps a current direct allowance without notification evidence", () => {
+  const analyzing = reduceDesktopTrayStatus(
+    DESKTOP_TRAY_INITIAL_STATUS,
+    {
+      type: "analyzing",
+      allowance: { source: "direct", window: "seven_day", remainingPercent: 0 },
+      notificationEvidence: null,
+    },
+  );
+  assert.deepEqual(analyzing, {
+    status: "analyzing",
+    allowance: { source: "direct", window: "seven_day", remainingPercent: 0 },
+    notificationEvidence: null,
+  });
+  const projected = projectDesktopTrayStatus(analyzing);
+  assert.equal(projected.status, "analyzing");
+  assert.equal(projected.compactTitle, "0%");
+  assert.deepEqual(projected.allowance, {
+    window: "seven_day",
+    remainingPercent: 0,
+    label: "Seven-day allowance: 0% remaining",
+  });
+  assert.equal(projected.evidenceLabel, "Analyzing");
+  assert.deepEqual(projected.windows, []);
+});
+
+test("an explicit empty analyzing snapshot clears retained notification evidence", () => {
+  const notificationEvidence = {
+    schemaVersion: "tibotattle-notification-evidence-v2",
+    status: "fresh_provider_observation",
+    provider: "openai_codex",
+    source: "app_server_read",
+    freshness: "fresh",
+    observedAt: "2026-08-22T12:00:00.000Z",
+    continuityKey: "a".repeat(43),
+    windows: [{
+      lane: "primary",
+      usedPercent: 26,
+      durationMinutes: 300,
+      resetAt: "2026-08-22T15:00:00.000Z",
+      resetProofKind: "provider_reported_schedule_only",
+    }],
+  };
+  const fresh = reduceDesktopTrayStatus(DESKTOP_TRAY_INITIAL_STATUS, {
+    type: "fresh",
+    allowance: directAllowance,
+    notificationEvidence,
+  });
+  const analyzing = reduceDesktopTrayStatus(fresh, {
+    type: "analyzing",
+    allowance: null,
+    notificationEvidence: null,
+  });
+  assert.deepEqual(analyzing, {
+    status: "analyzing",
+    allowance: null,
+    notificationEvidence: null,
+  });
+  assert.equal(projectDesktopTrayStatus(analyzing).compactTitle, "…");
+});
+
 test("fresh status may be current without a primary allowance summary", () => {
   const state = reduceDesktopTrayStatus(
     DESKTOP_TRAY_INITIAL_STATUS,
@@ -280,6 +341,41 @@ test("compact title never promotes a secondary-only lane", () => {
   });
   assert.equal(projected.compactTitle, "–");
   assert.equal(projected.allowance, null);
+});
+
+test("a qualified exhausted primary allowance remains an honest zero title", () => {
+  const projected = projectDesktopTrayStatus({
+    status: "fresh",
+    allowance: {
+      source: "direct",
+      window: "seven_day",
+      remainingPercent: 0,
+    },
+    notificationEvidence: {
+      schemaVersion: "tibotattle-notification-evidence-v2",
+      status: "fresh_provider_observation",
+      provider: "openai_codex",
+      source: "app_server_read",
+      freshness: "fresh",
+      observedAt: "2026-08-22T12:00:00.000Z",
+      continuityKey: "a".repeat(43),
+      windows: [{
+        lane: "primary",
+        usedPercent: 100,
+        durationMinutes: 10_080,
+        resetAt: "2026-08-29T12:00:00.000Z",
+        resetProofKind: "provider_reported_schedule_only",
+      }],
+    },
+  }, {
+    now: Date.parse("2026-08-22T12:00:00.000Z"),
+  });
+  assert.equal(projected.compactTitle, "0%");
+  assert.deepEqual(projected.allowance, {
+    window: "seven_day",
+    remainingPercent: 0,
+    label: "Seven-day allowance: 0% remaining",
+  });
 });
 
 test("localization output is bounded and cannot smuggle control text", () => {

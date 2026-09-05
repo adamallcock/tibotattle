@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   bootstrapTrayPopup,
   createTrayPopupProjection,
+  observeTrayPopupContentHeight,
   renderTrayPopup,
   requestTrayPopupAction,
   TRAY_POPUP_SCHEMA_VERSION,
@@ -60,6 +61,7 @@ function fixture({ accountingProjection = "available", historyStatus = "complete
       status: "live",
       latestObservedAt: NOW,
       ageSeconds: 15,
+      staleAfterSeconds: 1_800,
       accountingStatus: accountingProjection,
       accountingAgeSeconds: 15,
     },
@@ -71,6 +73,7 @@ function fixture({ accountingProjection = "available", historyStatus = "complete
         usedPercent: 25,
         remainingPercent: 75,
         resetAt: "2026-09-04T20:00:00.000Z",
+        observedAt: NOW,
         status: "live",
       },
       {
@@ -80,6 +83,7 @@ function fixture({ accountingProjection = "available", historyStatus = "complete
         usedPercent: 40,
         remainingPercent: 60,
         resetAt: "2026-09-07T20:00:00.000Z",
+        observedAt: NOW,
         status: "live",
       },
       {
@@ -203,6 +207,7 @@ class FakeElement {
     this.disabled = false;
     this.isConnected = true;
     this.nodeType = 1;
+    this.rect = { height: 480 };
   }
 
   addEventListener(type, listener) {
@@ -230,6 +235,10 @@ class FakeElement {
   removeAttribute(name) {
     this.attributes.delete(name);
   }
+
+  getBoundingClientRect() {
+    return this.rect;
+  }
 }
 
 class FakeDocument {
@@ -239,11 +248,13 @@ class FakeDocument {
     this.documentElement = new FakeElement();
     this.elements = new Map();
     for (const id of [
-      "allowance-lanes", "allowance-unavailable", "pace-metrics", "pace-track",
-      "pace-outlook", "pace-early", "pace-state", "pace-used", "pace-remaining",
-      "pace-reset", "pace-rate", "pace-fill", "pace-active-marker",
-      "history-summary", "history-cost", "history-coverage", "history-retained",
-      "history-pricing", "history-bars", "tray-popup-freshness", "tray-popup-live",
+      "tray-popup", "allowance-lanes", "allowance-unavailable", "history-available",
+      "history-unavailable", "history-unavailable-title", "history-unavailable-body",
+      "history-period", "history-tokens", "history-events", "history-price",
+      "history-start", "history-end", "history-coverage", "history-retained",
+      "history-bars", "pace-section", "pace-state", "pace-outlook", "pace-metrics",
+      "pace-used", "pace-remaining", "pace-rate", "pace-reset", "pace-track",
+      "pace-fill", "pace-active-marker", "tray-popup-freshness", "tray-popup-live",
     ]) this.elements.set(id, new FakeElement());
     this.ranges = [new FakeElement({ historyRange: "7d" }), new FakeElement({ historyRange: "30d" })];
     this.actions = [new FakeElement({ action: "open" }), new FakeElement({ action: "refresh" }), new FakeElement({ action: "more" })];
@@ -301,6 +312,11 @@ test("tray popup assets are local, bounded, and wired as a visual surface", asyn
   assert.match(html, /electron-tray-popup\.js/u);
   assert.match(html, /data-i18n-root/u);
   assert.match(html, /id="allowance-lanes"/u);
+  assert.match(html, /id="history-start"/u);
+  assert.match(html, /id="history-end"/u);
+  // The compact pace feature is initially hidden and becomes visible only
+  // after a current weekly allowance binds the validated outlook.
+  assert.match(html, /id="pace-section"[^>]*hidden/u);
   assert.match(html, /id="pace-track"/u);
   assert.match(html, /id="history-bars"/u);
   assert.match(html, /data-history-range="7d"/u);
@@ -308,14 +324,19 @@ test("tray popup assets are local, bounded, and wired as a visual surface", asyn
   assert.match(html, /data-action="open"/u);
   assert.match(html, /data-action="refresh"/u);
   assert.match(html, /data-action="more"/u);
+  assert.doesNotMatch(html, /Usage overview/u);
   assert.doesNotMatch(html, /https?:\/\//u);
-  assert.match(js, /pace-active-marker/u);
+  assert.match(js, /function buildWeeklyPace/u);
+  assert.match(js, /function renderWeeklyPace/u);
+  assert.match(js, /observeTrayPopupContentHeight/u);
+  assert.match(js, /reportContentHeight/u);
   assert.match(js, /totalTokens/u);
   assert.match(js, /visibilitychange/u);
   assert.match(js, /data-tray-popup-ready/u);
   assert.doesNotMatch(js, /recalculateDetailedAccounting/u);
-  assert.match(css, /width:\s*min\(400px/u);
-  assert.match(css, /height:\s*104px/u);
+  assert.match(css, /width:\s*100%/u);
+  assert.doesNotMatch(css, /min-height:\s*100vh/u);
+  assert.match(css, /repeating-linear-gradient/u);
   assert.match(css, /\[hidden\][\s\S]*display:\s*none\s*!important/u);
   assert.match(css, /prefers-reduced-motion/u);
   assert.match(css, /prefers-color-scheme:\s*dark/u);
@@ -325,10 +346,70 @@ test("rendered action labels interpolate the product name", () => {
   const documentRef = new FakeDocument();
   renderTrayPopup(documentRef, createTrayPopupProjection(fixture(), { now: NOW, timeZone: "UTC" }));
   assert.equal(documentRef.actions[0].textContent, "Open TiboTattle");
-  assert.equal(documentRef.actions[1].textContent, "Update Local Usage");
+  assert.equal(documentRef.actions[1].textContent, "Refresh");
   assert.equal(documentRef.actions[2].textContent, "⋯");
   assert.equal(documentRef.actions[2].attributes.get("aria-label"), "More actions");
   assert.doesNotMatch(documentRef.actions[0].textContent, /\{appName\}/u);
+});
+
+test("header and allowance rows use the compact native wording", () => {
+  const documentRef = new FakeDocument();
+  renderTrayPopup(documentRef, createTrayPopupProjection(fixture(), { now: NOW, timeZone: "UTC" }));
+  assert.equal(documentRef.getElementById("tray-popup-freshness").textContent, "Live");
+  const allowance = documentRef.getElementById("allowance-lanes").children[0];
+  assert.equal(allowance.children[0].children[1].textContent, "75% remaining");
+  assert.equal(allowance.children[1].textContent, "Resets in 2h 0m");
+
+  const updated = new FakeDocument();
+  renderTrayPopup(updated, createTrayPopupProjection(fixture(), {
+    now: "2026-09-04T18:05:00.000Z",
+    timeZone: "UTC",
+  }));
+  assert.match(updated.getElementById("tray-popup-freshness").textContent, /Live · updated 5 minutes ago/u);
+});
+
+test("content-height reporting follows intrinsic changes through the narrow bridge", () => {
+  class FakeResizeObserver {
+    static latest = null;
+
+    constructor(callback) {
+      this.callback = callback;
+      this.disconnected = false;
+      FakeResizeObserver.latest = this;
+    }
+
+    observe(target) {
+      this.target = target;
+    }
+
+    disconnect() {
+      this.disconnected = true;
+    }
+  }
+
+  const documentRef = new FakeDocument();
+  const root = documentRef.getElementById("tray-popup");
+  root.rect = { height: 489.1 };
+  const reported = [];
+  const cleanup = observeTrayPopupContentHeight({
+    windowRef: {
+      ResizeObserver: FakeResizeObserver,
+      tibotattleTrayPopover: {
+        reportContentHeight(height) {
+          reported.push(height);
+        },
+      },
+    },
+    documentRef,
+  });
+  assert.deepEqual(reported, [490]);
+  FakeResizeObserver.latest.callback();
+  assert.deepEqual(reported, [490]);
+  root.rect = { height: 501 };
+  FakeResizeObserver.latest.callback();
+  assert.deepEqual(reported, [490, 501]);
+  cleanup();
+  assert.equal(FakeResizeObserver.latest.disconnected, true);
 });
 
 test("the popup's three new messages stay translated in every shipped locale", () => {
@@ -337,6 +418,11 @@ test("the popup's three new messages stay translated in every shipped locale", (
       "electron.trayPopover.weeklyPace",
       "electron.trayPopover.localHistory",
       "electron.trayPopover.pricingPartial",
+      "electron.trayPopover.allowance",
+      "electron.trayPopover.localUsage",
+      "electron.trayPopover.notSubscriptionBill",
+      "electron.trayPopover.retainedHistory",
+      "electron.trayPopover.refresh",
     ]) {
       const value = translate(key, {}, locale);
       assert.equal(typeof value, "string");
@@ -359,6 +445,110 @@ test("projection keeps the normal Codex lanes and exact shared pace outlook", ()
   assert.equal(projection.weeklyPace.outlook.coveredFraction, 1);
   assert.equal(Object.hasOwn(projection, "accountId"), false);
   assert.equal(Object.hasOwn(projection, "raw"), false);
+});
+
+test("weekly pace renders only for a current allowance bound to its valid outlook", () => {
+  const documentRef = new FakeDocument();
+  renderTrayPopup(documentRef, createTrayPopupProjection(fixture(), { now: NOW, timeZone: "UTC" }));
+  assert.equal(documentRef.getElementById("pace-section").hidden, false);
+  assert.equal(documentRef.getElementById("pace-state").textContent, "Under sustainable pace");
+  assert.equal(documentRef.getElementById("pace-track").attributes.get("aria-valuenow"), "100");
+
+  const stale = fixture();
+  stale.freshness.status = "stale";
+  const staleDocument = new FakeDocument();
+  renderTrayPopup(staleDocument, createTrayPopupProjection(stale, { now: NOW, timeZone: "UTC" }));
+  assert.equal(staleDocument.getElementById("pace-section").hidden, true);
+
+  const mismatched = fixture();
+  mismatched.quotaWindows[1].remainingPercent = 61;
+  const mismatchedDocument = new FakeDocument();
+  renderTrayPopup(mismatchedDocument, createTrayPopupProjection(mismatched, { now: NOW, timeZone: "UTC" }));
+  assert.equal(mismatchedDocument.getElementById("pace-section").hidden, true);
+});
+
+test("allowance claims require each lane's live fresh observation and future reset", () => {
+  const data = fixture();
+  data.quotaWindows[0].usedPercent = 24.4;
+  data.quotaWindows[0].remainingPercent = 75.6;
+  data.quotaWindows[1].observedAt = "2026-09-04T17:29:59.000Z";
+  const oneCurrentLane = createTrayPopupProjection(data, { now: NOW, timeZone: "UTC" });
+  assert.deepEqual(oneCurrentLane.allowances.map((row) => row.durationMinutes), [300]);
+  assert.equal(oneCurrentLane.allowances[0].remainingPercent, 76);
+
+  const resetPassed = fixture();
+  resetPassed.quotaWindows[0].resetAt = "2026-09-04T17:59:59.000Z";
+  assert.deepEqual(
+    createTrayPopupProjection(resetPassed, { now: NOW, timeZone: "UTC" })
+      .allowances.map((row) => row.durationMinutes),
+    [10_080],
+  );
+
+  const stale = fixture();
+  stale.freshness.status = "stale";
+  assert.deepEqual(
+    createTrayPopupProjection(stale, { now: NOW, timeZone: "UTC" }).allowances,
+    [],
+  );
+});
+
+test("allowance admission rejects an inconsistent percentage and an overlong provider window", () => {
+  const inconsistent = fixture();
+  inconsistent.quotaWindows[0].usedPercent = 90;
+  assert.deepEqual(
+    createTrayPopupProjection(inconsistent, { now: NOW, timeZone: "UTC" })
+      .allowances.map((row) => row.durationMinutes),
+    [10_080],
+  );
+
+  const overlong = fixture();
+  overlong.quotaWindows[0].resetAt = "2026-10-04T18:00:00.000Z";
+  assert.deepEqual(
+    createTrayPopupProjection(overlong, { now: NOW, timeZone: "UTC" })
+      .allowances.map((row) => row.durationMinutes),
+    [10_080],
+  );
+});
+
+test("allowance and weekly pace share the native primary then newest lane selection", () => {
+  const primary = fixture();
+  const secondaryWeekly = {
+    ...primary.quotaWindows[1],
+    slot: "secondary",
+    usedPercent: 39,
+    remainingPercent: 61,
+  };
+  const explicitPrimaryWeekly = {
+    ...primary.quotaWindows[1],
+    slot: "primary",
+  };
+  primary.quotaWindows = [primary.quotaWindows[0], secondaryWeekly, explicitPrimaryWeekly];
+  const primaryProjection = createTrayPopupProjection(primary, { now: NOW, timeZone: "UTC" });
+  assert.equal(
+    primaryProjection.allowances.find((row) => row.durationMinutes === 10_080)?.remainingPercent,
+    60,
+  );
+  assert.equal(primaryProjection.weeklyPace.status, "available");
+
+  const newest = fixture();
+  const olderWeekly = {
+    ...newest.quotaWindows[1],
+    slot: "secondary",
+    usedPercent: 39,
+    remainingPercent: 61,
+    observedAt: "2026-09-04T17:55:00.000Z",
+  };
+  const newestWeekly = {
+    ...newest.quotaWindows[1],
+    slot: "secondary",
+  };
+  newest.quotaWindows = [newest.quotaWindows[0], olderWeekly, newestWeekly];
+  const newestProjection = createTrayPopupProjection(newest, { now: NOW, timeZone: "UTC" });
+  assert.equal(
+    newestProjection.allowances.find((row) => row.durationMinutes === 10_080)?.remainingPercent,
+    60,
+  );
+  assert.equal(newestProjection.weeklyPace.status, "available");
 });
 
 test("pace outlook rejects malformed geometry and a different weekly reset", () => {
@@ -436,6 +626,32 @@ test("partial pricing and retained accounting stay visibly qualified", () => {
   assert.equal(projection.history.period.pricingState, "partial");
 });
 
+test("compact history keeps tokens primary and makes partial coverage explicit", () => {
+  const data = fixture({ accountingProjection: "retained", historyStatus: "partial" });
+  data.accounting.periods[0] = period("7d", {
+    events: 3,
+    totalTokens: 1_200,
+    apiPriceEquivalentUsd: 1.25,
+    fullyPricedEvents: 2,
+    partiallyPricedEvents: 1,
+  });
+  const documentRef = new FakeDocument();
+  renderTrayPopup(documentRef, createTrayPopupProjection(data, { now: NOW, timeZone: "UTC" }));
+  assert.match(documentRef.getElementById("history-period").textContent, /Last 7 days/u);
+  assert.match(documentRef.getElementById("history-tokens").textContent, /tokens$/u);
+  assert.equal(documentRef.getElementById("history-events").textContent, "3 local usage changes");
+  assert.match(documentRef.getElementById("history-price").textContent, /Known API-price equivalent.*Partial pricing/u);
+  assert.match(documentRef.getElementById("history-coverage").textContent, /Coverage: \d+ complete · \d+ partial · \d+ unavailable/u);
+  assert.match(documentRef.getElementById("history-start").textContent, /Aug|Sep/u);
+  assert.match(documentRef.getElementById("history-end").textContent, /Sep/u);
+  assert.equal(documentRef.getElementById("history-retained").textContent, "Showing the last completed analysis.");
+  assert.equal(
+    documentRef.getElementById("history-bars").children.some((bar) =>
+      bar.className.includes("evidence-partial")),
+    true,
+  );
+});
+
 test("unavailable accounting never turns absent history into zero", () => {
   const projection = createTrayPopupProjection(
     fixture({ accountingProjection: "unavailable", historyStatus: "complete" }),
@@ -447,6 +663,22 @@ test("unavailable accounting never turns absent history into zero", () => {
   assert.equal(projection.history.days.every((day) => day.usageEvents === null), true);
 });
 
+test("unavailable accounting hides the numeric history and chart", () => {
+  const projection = createTrayPopupProjection(
+    fixture({ accountingProjection: "unavailable", historyStatus: "complete" }),
+    { now: NOW, timeZone: "UTC" },
+  );
+  const documentRef = new FakeDocument();
+  renderTrayPopup(documentRef, projection);
+  assert.equal(documentRef.getElementById("history-available").hidden, true);
+  assert.equal(documentRef.getElementById("history-unavailable").hidden, false);
+  assert.equal(documentRef.getElementById("history-bars").children.length, 0);
+  assert.equal(
+    documentRef.getElementById("history-unavailable-title").textContent,
+    "Local usage history is not available yet",
+  );
+});
+
 test("missing daily history does not label available aggregate accounting unavailable", () => {
   const data = fixture({ historyStatus: "unavailable" });
   data.timeline.usage = [];
@@ -455,8 +687,8 @@ test("missing daily history does not label available aggregate accounting unavai
   const documentRef = new FakeDocument();
   renderTrayPopup(documentRef, projection);
   const copy = documentRef.getElementById("history-coverage").textContent;
-  assert.match(copy, /missing-data state/u);
-  assert.doesNotMatch(copy, /accounting is unavailable/u);
+  assert.match(copy, /Coverage: 0 complete · 0 partial · 7 unavailable/u);
+  assert.doesNotMatch(copy, /Local usage history is not available yet/u);
 });
 
 test("history keeps fractional currency totals when rows include integer-priced buckets", () => {

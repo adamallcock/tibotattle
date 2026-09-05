@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 
 import { DEPLOYMENT_ENDPOINTS } from "../../config/deployment-endpoints.js";
 import { launchDesktopRuntime } from "./desktop-runtime.js";
-import { resolveDesktopTrayIcon } from "./desktop-tray.js";
+import { createDesktopTrayIconFactory } from "./desktop-tray.js";
 import { ELECTRON_ENTRY_FAILURE_DIAGNOSTIC, shellError } from "./errors.js";
 import { assertElectronPlatformGate } from "./platform-gate.js";
 import {
@@ -490,14 +490,16 @@ export async function launchElectronShell({
       architecture: process.arch,
       qualificationContext,
     });
+    const trayIconFactory = createDesktopTrayIconFactory({
+      nativeImage: runtime.nativeImage,
+      resourceRoot: paths.resourceRoot,
+      platform: process.platform,
+    });
     const desktop = await launchDesktopRuntime({
       runtime: {
         ...runtime,
-        icon: resolveDesktopTrayIcon({
-          nativeImage: runtime.nativeImage,
-          resourceRoot: paths.resourceRoot,
-          platform: process.platform,
-        }),
+        icon: trayIconFactory.resolve(),
+        createTrayIcon: trayIconFactory.resolve,
       },
       app,
       paths: {

@@ -83,6 +83,7 @@ export function createDesktopLifecycle({
   supervisor,
   preloadPath,
   icon,
+  createTrayIcon,
   windowOptions = {},
   createNavigationPolicy = createLoopbackNavigationPolicy,
   installNavigationPolicy = installLoopbackNavigationPolicy,
@@ -109,6 +110,9 @@ export function createDesktopLifecycle({
   assertFunction(supervisor?.stop, "supervisor.stop");
   if (typeof preloadPath !== "string" || preloadPath.length === 0) {
     throw new TypeError("preloadPath is required");
+  }
+  if (createTrayIcon !== undefined && typeof createTrayIcon !== "function") {
+    throw new TypeError("createTrayIcon must be a function");
   }
   if (typeof createNavigationPolicy !== "function"
       || typeof installNavigationPolicy !== "function") {
@@ -149,6 +153,7 @@ export function createDesktopLifecycle({
   let settingsWindow = null;
   let recovery = null;
   let tray = null;
+  let trayImage;
   let trayContextMenu = null;
   let trayPopover = null;
   let applicationMenu = null;
@@ -219,6 +224,33 @@ export function createDesktopLifecycle({
       && left.notificationEvidence?.observedAt === right.notificationEvidence?.observedAt;
   }
 
+  function resolveTrayIcon() {
+    if (typeof createTrayIcon !== "function") return icon;
+    try {
+      const resolved = createTrayIcon(desktopTrayStatus);
+      return resolved === undefined ? icon : resolved;
+    } catch {
+      // A tray image is presentation-only. Keep the last trusted fallback
+      // rather than allowing a status-image update to interrupt lifecycle.
+      return icon;
+    }
+  }
+
+  function refreshTrayImage() {
+    if (platform !== "darwin" || tray === null || typeof tray.setImage !== "function") {
+      return false;
+    }
+    const next = resolveTrayIcon();
+    if (next === undefined || next === trayImage) return false;
+    try {
+      tray.setImage(next);
+      trayImage = next;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   function dispatchDesktopTrayEvent(event) {
     let next;
     try {
@@ -238,9 +270,9 @@ export function createDesktopLifecycle({
     let validated;
     try {
       validated = validateDesktopShellStatus(status);
-      const event = validated.state === "fresh"
+      const event = ["fresh", "analyzing"].includes(validated.state)
         ? {
-          type: "fresh",
+          type: validated.state,
           allowance: validated.allowance,
           notificationEvidence: validated.notificationEvidence,
         }
@@ -1134,8 +1166,10 @@ export function createDesktopLifecycle({
 
   function createTray() {
     if (tray || typeof Tray !== "function") return tray;
-    if (icon === undefined) throw shellError("electron_configuration_invalid");
-    tray = new Tray(icon);
+    const initialIcon = resolveTrayIcon();
+    if (initialIcon === undefined) throw shellError("electron_configuration_invalid");
+    tray = new Tray(initialIcon);
+    trayImage = initialIcon;
     tray.setToolTip?.(appName);
     const template = createDesktopTrayTemplate({
       appName,
@@ -1188,6 +1222,7 @@ export function createDesktopLifecycle({
         systemLocales: desktopSystemLocales,
       });
     }
+    refreshTrayImage();
     if (tray && typeof Menu?.buildFromTemplate === "function") {
       const template = createDesktopTrayTemplate({
         appName,

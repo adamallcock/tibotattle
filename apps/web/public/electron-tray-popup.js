@@ -19,6 +19,7 @@ import {
 } from "./localization.js";
 import {
   compact,
+  formatAge,
   formatLocal,
   formatNumber,
   setFormattingLocale,
@@ -37,6 +38,7 @@ export const TRAY_POPUP_ACTIONS = Object.freeze(["open", "refresh", "more"]);
 const MAX_TIMELINE_ROWS = 3_000;
 const MAX_HISTORY_DAYS = 30;
 const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
+const DEFAULT_ALLOWANCE_STALE_AFTER_SECONDS = 30 * 60;
 const PACE_STATUSES = new Set([
   "unavailable",
   "insufficient_observations",
@@ -367,13 +369,97 @@ function projectionStatus(accounting) {
     ? accounting.projection.status : "unavailable";
 }
 
-function buildWeeklyPace(data, nowMs = Date.now()) {
+const NORMAL_CODEX_ALLOWANCE_DURATIONS = Object.freeze([
+  CODEX_FIVE_HOUR_ALLOWANCE_MINUTES,
+  CODEX_WEEKLY_ALLOWANCE_MINUTES,
+]);
+const NORMAL_CODEX_ALLOWANCE_DURATION_SET = new Set(NORMAL_CODEX_ALLOWANCE_DURATIONS);
+
+/**
+ * The popup has its own small admission boundary because the generic dashboard
+ * normalizer preserves several display-only quota fields independently. Keep
+ * the compact lanes aligned with the native reader: an inconsistent or
+ * overlong provider window is unavailable, never rounded into a percentage.
+ */
+function canonicalAllowanceInstant(value) {
+  if (typeof value !== "string") return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) && new Date(ms).toISOString() === value ? value : null;
+}
+
+function normalCodexAllowanceCandidate(window, nowMs) {
+  const durationMinutes = window?.durationMinutes;
+  if (!isObject(window)
+      || !isPrimaryCodexQuotaWindow(window)
+      || !NORMAL_CODEX_ALLOWANCE_DURATION_SET.has(durationMinutes)) return null;
+  const usedPercent = boundedPercent(window.usedPercent);
+  const remainingPercent = boundedPercent(window.remainingPercent);
+  const observedAt = canonicalAllowanceInstant(window.observedAt);
+  const resetAt = canonicalAllowanceInstant(window.resetAt);
+  const observedAtMs = instantMs(observedAt);
+  const resetAtMs = instantMs(resetAt);
+  if (usedPercent === null || remainingPercent === null
+      || Math.abs((usedPercent + remainingPercent) - 100) > 0.001
+      || observedAtMs === null || resetAtMs === null
+      || observedAtMs > nowMs
+      || resetAtMs <= observedAtMs
+      || resetAtMs - observedAtMs > durationMinutes * 60_000) return null;
+  // Unknown legacy slot values remain admissible but can never outrank the
+  // provider's explicit primary slot. The bounded form exists only for a
+  // deterministic internal tie-break and never reaches the rendered DTO.
+  const slot = boundedText(window.slot, 80);
+  return Object.freeze({
+    durationMinutes,
+    preferredSlot: slot === "primary",
+    remainingPercent,
+    observedAt,
+    observedAtMs,
+    resetAt,
+    resetAtMs,
+    status: window.status === "live" ? "live" : "unavailable",
+    stableKey: [slot, resetAt, observedAt, String(remainingPercent)].join("\0"),
+  });
+}
+
+function normalCodexAllowanceCandidateWins(candidate, prior) {
+  if (prior === undefined) return true;
+  if (candidate.preferredSlot !== prior.preferredSlot) return candidate.preferredSlot;
+  if (candidate.observedAtMs !== prior.observedAtMs) {
+    return candidate.observedAtMs > prior.observedAtMs;
+  }
+  return candidate.stableKey < prior.stableKey;
+}
+
+/**
+ * Select exactly one structurally valid normal Codex lane for each duration.
+ * This deliberately precedes freshness display checks: a stale explicit
+ * primary does not authorize silently borrowing a sibling lane.
+ */
+function selectNormalCodexAllowanceLanes(data, nowMs) {
+  const selected = new Map();
+  for (const window of Array.isArray(data?.quotaWindows) ? data.quotaWindows : []) {
+    const candidate = normalCodexAllowanceCandidate(window, nowMs);
+    if (candidate === null) continue;
+    const prior = selected.get(candidate.durationMinutes);
+    if (normalCodexAllowanceCandidateWins(candidate, prior)) {
+      selected.set(candidate.durationMinutes, candidate);
+    }
+  }
+  return Object.freeze(NORMAL_CODEX_ALLOWANCE_DURATIONS
+    .map((durationMinutes) => selected.get(durationMinutes))
+    .filter((candidate) => candidate !== undefined));
+}
+
+function buildWeeklyPace(
+  data,
+  nowMs = Date.now(),
+  selectedLanes = selectNormalCodexAllowanceLanes(data, nowMs),
+) {
   const forecast = data?.weekly?.paceForecast;
   const outlook = data?.weekly?.paceOutlook;
   const nowInstant = instantMs(nowMs) ?? Date.now();
-  const weeklyLane = (Array.isArray(data?.quotaWindows) ? data.quotaWindows : [])
-    .find((window) => isPrimaryCodexQuotaWindow(window)
-      && window.durationMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES);
+  const weeklyLane = selectedLanes.find((window) =>
+    window.durationMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES);
   if (isObject(outlook)
       && outlook.schemaVersion === "local-weekly-pace-outlook-v0.1") {
     const invalid = () => Object.freeze({
@@ -667,26 +753,35 @@ function buildWeeklyPace(data, nowMs = Date.now()) {
   });
 }
 
-function buildAllowances(data) {
-  const seenDurations = new Set();
-  return (Array.isArray(data?.quotaWindows) ? data.quotaWindows : [])
-    .filter((window) => isPrimaryCodexQuotaWindow(window)
-      && [CODEX_FIVE_HOUR_ALLOWANCE_MINUTES, CODEX_WEEKLY_ALLOWANCE_MINUTES]
-        .includes(window.durationMinutes))
-    .sort((left, right) => left.durationMinutes - right.durationMinutes)
+/**
+ * Keep each numerical allowance tied to its own observation. A current weekly
+ * reading does not make an older five-hour value current, and a reset that has
+ * already passed never implies a new allowance window.
+ */
+function buildAllowances(
+  data,
+  nowMs = Date.now(),
+  selectedLanes = selectNormalCodexAllowanceLanes(data, nowMs),
+) {
+  const nowInstant = instantMs(nowMs) ?? Date.now();
+  const freshnessStatus = data?.freshness?.status ?? data?.state;
+  const staleAfterSeconds = nonNegativeNumber(data?.freshness?.staleAfterSeconds)
+    ?? DEFAULT_ALLOWANCE_STALE_AFTER_SECONDS;
+  return selectedLanes
     .flatMap((window) => {
-      if (seenDurations.has(window.durationMinutes)) return [];
-      seenDurations.add(window.durationMinutes);
+      const isCurrent = freshnessStatus === "live"
+        && window.status === "live"
+        && nowInstant - window.observedAtMs <= staleAfterSeconds * 1_000
+        && window.resetAtMs > nowInstant;
+      if (!isCurrent) return [];
       const labelKey = window.durationMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
         ? "dashboard.quota.windowFiveHour" : "dashboard.quota.windowSevenDay";
       return [Object.freeze({
         durationMinutes: window.durationMinutes,
         labelKey,
-        usedPercent: boundedPercent(window.usedPercent),
-        remainingPercent: boundedPercent(window.remainingPercent),
-        resetAt: isoInstant(window.resetAt),
-        status: ["live", "stale", "demo", "offline", "insufficient"]
-          .includes(window.status) ? window.status : "unavailable",
+        remainingPercent: Math.round(window.remainingPercent),
+        resetAt: window.resetAt,
+        resetInSeconds: Math.max(0, (window.resetAtMs - nowInstant) / 1_000),
       })];
     });
 }
@@ -754,11 +849,14 @@ function buildHistory(data, range, nowMs, timeZone, accountingState) {
     });
   });
   const selectedDays = days.slice(-clampDayCount(range));
-  const period = accountingPeriod(
+  const rawPeriod = accountingPeriod(
     (Array.isArray(projection?.periods) ? projection.periods : [])
       .find((row) => row?.periodId === range),
     range,
   );
+  // A period record from an unavailable accounting projection cannot make a
+  // numerical history claim. Keep its absence explicit to the renderer.
+  const period = accountingState === "unavailable" ? null : rawPeriod;
   const pricingState = period?.pricingState ?? "unavailable";
   return Object.freeze({
     range,
@@ -801,6 +899,7 @@ export function createTrayPopupProjection(data = {}, {
   const selectedTimeZone = safeTimeZone(timeZone);
   const accounting = data?.accounting;
   const projection = projectionStatus(accounting);
+  const selectedAllowanceLanes = selectNormalCodexAllowanceLanes(data, nowMs);
   const retained = projection === "retained"
     || isObject(accounting?.staleServe);
   const accountingState = retained ? "retained" : projection === "available" ? "current" : "unavailable";
@@ -808,10 +907,16 @@ export function createTrayPopupProjection(data = {}, {
     .includes(data?.freshness?.status) ? data.freshness.status
     : ["live", "stale", "demo", "offline", "insufficient"].includes(data?.state)
       ? data.state : "insufficient";
+  const latestObservedAt = isoInstant(data?.freshness?.latestObservedAt);
+  const latestObservedMs = instantMs(latestObservedAt);
+  const ageSeconds = latestObservedMs !== null && latestObservedMs <= nowMs
+    ? (nowMs - latestObservedMs) / 1_000 : null;
   const freshness = Object.freeze({
     status: freshnessStatus,
-    latestObservedAt: isoInstant(data?.freshness?.latestObservedAt),
-    ageSeconds: nonNegativeNumber(data?.freshness?.ageSeconds),
+    latestObservedAt,
+    ageSeconds,
+    staleAfterSeconds: nonNegativeNumber(data?.freshness?.staleAfterSeconds)
+      ?? DEFAULT_ALLOWANCE_STALE_AFTER_SECONDS,
     accountingStatus: ACCOUNTING_STATUSES.has(data?.freshness?.accountingStatus)
       ? data.freshness.accountingStatus : "",
     accountingAgeSeconds: nonNegativeNumber(data?.freshness?.accountingAgeSeconds),
@@ -820,8 +925,8 @@ export function createTrayPopupProjection(data = {}, {
     schemaVersion: TRAY_POPUP_SCHEMA_VERSION,
     state: freshnessStatus,
     freshness,
-    allowances: Object.freeze(buildAllowances(data)),
-    weeklyPace: buildWeeklyPace(data, nowMs),
+    allowances: Object.freeze(buildAllowances(data, nowMs, selectedAllowanceLanes)),
+    weeklyPace: buildWeeklyPace(data, nowMs, selectedAllowanceLanes),
     accounting: Object.freeze({
       status: accountingState,
       retained,
@@ -871,7 +976,7 @@ function setHidden(documentRef, id, hidden) {
 }
 
 function displayPercent(value, numberFormatter = formatNumber) {
-  return value === null ? "—" : `${numberFormatter(value, { maximumFractionDigits: 1 })}%`;
+  return value === null ? "—" : `${numberFormatter(value, { maximumFractionDigits: 0 })}%`;
 }
 
 function displayMoney(value, numberFormatter = formatNumber) {
@@ -902,7 +1007,65 @@ function calendarLabel(key, locale) {
   }).format(new Date(ms));
 }
 
-function renderAllowances(documentRef, projection, t, numberFormatter, localFormatter) {
+function resetCountdown(seconds, t, numberFormatter) {
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return t("electron.trayPopover.resetUnavailable");
+  }
+  const totalMinutes = Math.max(1, Math.floor(seconds / 60));
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.floor(totalMinutes % (24 * 60) / 60);
+  const minutes = totalMinutes % 60;
+  const count = (value) => numberFormatter(value, { maximumFractionDigits: 0 });
+  if (days > 0) {
+    return t("electron.trayPopover.resetDaysHours", {
+      days: count(days),
+      hours: count(hours),
+    });
+  }
+  if (hours > 0) {
+    return t("electron.trayPopover.resetHoursMinutes", {
+      hours: count(hours),
+      minutes: count(minutes),
+    });
+  }
+  return t("electron.trayPopover.resetMinutes", { minutes: count(minutes) });
+}
+
+function historyCoverageCounts(days) {
+  return days.reduce((counts, day) => {
+    if (day?.evidence === "available") counts.complete += 1;
+    else if (day?.evidence === "partial") counts.partial += 1;
+    else counts.unavailable += 1;
+    return counts;
+  }, { complete: 0, partial: 0, unavailable: 0 });
+}
+
+function historyPriceCopy(period, t, numberFormatter) {
+  if (period.pricingState === "complete") {
+    return t("electron.trayPopover.usageSummary", {
+      amount: displayMoney(period.apiPriceEquivalentUsd, numberFormatter),
+      basis: t("electron.trayPopover.apiPriceEquivalent"),
+    });
+  }
+  const pricedEvents = period.pricingCoverage.fullyPricedEvents
+    + period.pricingCoverage.partiallyPricedEvents;
+  if (period.pricingState === "partial" && pricedEvents > 0) {
+    return `${t("electron.trayPopover.usageSummary", {
+      amount: displayMoney(period.apiPriceEquivalentUsd, numberFormatter),
+      basis: t("electron.trayPopover.apiPriceEquivalentPartial"),
+    })} · ${t("electron.trayPopover.partialPricing")}`;
+  }
+  return `${t("electron.trayPopover.apiPriceEquivalentUnavailable")} ${t("electron.trayPopover.partialPricing")}`;
+}
+
+function allowanceUnavailableCopy(freshness, t) {
+  if (freshness.status === "offline") return t("electron.trayPopover.errorTitle");
+  if (freshness.status === "demo") return t("dashboard.quota.demo");
+  if (freshness.status === "insufficient") return t("electron.trayPopover.startingTitle");
+  return t("electron.trayPopover.staleTitle");
+}
+
+function renderAllowances(documentRef, projection, t, numberFormatter) {
   const list = documentRef.getElementById("allowance-lanes");
   if (!list) return;
   list.replaceChildren();
@@ -913,7 +1076,7 @@ function renderAllowances(documentRef, projection, t, numberFormatter, localForm
     heading.className = "electron-tray-popup-allowance-heading";
     const title = textNode(documentRef, t(allowance.labelKey));
     title.className = "electron-tray-popup-allowance-title";
-    const value = textNode(documentRef, t("dashboard.quota.remaining", {
+    const value = textNode(documentRef, t("electron.trayPopover.remaining", {
       value: displayPercent(allowance.remainingPercent, numberFormatter),
     }));
     value.className = "electron-tray-popup-allowance-value";
@@ -924,132 +1087,159 @@ function renderAllowances(documentRef, projection, t, numberFormatter, localForm
     track.setAttribute("aria-label", t(allowance.labelKey));
     track.setAttribute("aria-valuemin", "0");
     track.setAttribute("aria-valuemax", "100");
-    if (allowance.remainingPercent === null) {
-      track.setAttribute("aria-valuetext", t("dashboard.quota.resetUnknown"));
-    } else {
-      track.setAttribute("aria-valuenow", String(allowance.remainingPercent));
-      track.setAttribute("aria-valuetext", displayPercent(allowance.remainingPercent, numberFormatter));
-    }
+    track.setAttribute("aria-valuenow", String(allowance.remainingPercent));
+    track.setAttribute("aria-valuetext", displayPercent(allowance.remainingPercent, numberFormatter));
     const fill = documentRef.createElement("span");
     fill.className = "electron-tray-popup-progress-fill";
-    if (allowance.remainingPercent !== null) {
-      fill.style.width = `${allowance.remainingPercent}%`;
-    }
+    fill.style.width = `${allowance.remainingPercent}%`;
     track.append(fill);
-    const detail = textNode(documentRef, allowance.resetAt
-      ? t("dashboard.quota.resets", { time: localFormatter(allowance.resetAt) })
-      : t("dashboard.quota.resetUnknown"));
-    detail.className = "electron-tray-popup-muted";
-    article.append(heading, track, detail);
+    const detail = textNode(documentRef, t("electron.trayPopover.resets", {
+      time: resetCountdown(allowance.resetInSeconds, t, numberFormatter),
+    }));
+    detail.className = "electron-tray-popup-muted electron-tray-popup-allowance-detail";
+    article.append(heading, detail, track);
     list.append(article);
   }
   setHidden(documentRef, "allowance-unavailable", projection.allowances.length > 0);
   if (projection.allowances.length === 0) {
-    setElementText(documentRef, "allowance-unavailable", t("dashboard.quota.noCurrent"));
+    setElementText(
+      documentRef,
+      "allowance-unavailable",
+      allowanceUnavailableCopy(projection.freshness, t),
+    );
   }
 }
 
+/**
+ * The compact pace view is conditional. Its outlook has already passed the
+ * exact reset/remaining validation in buildWeeklyPace; this last gate also
+ * requires the matching weekly allowance to remain current for presentation.
+ */
 function renderWeeklyPace(documentRef, projection, t, numberFormatter, localFormatter) {
+  const section = documentRef.getElementById("pace-section");
   const pace = projection.weeklyPace;
-  const available = pace.status === "available" || pace.status === "will_reach_reset_first";
-  const hasTrack = available || pace.status === "collecting";
-  const standingKey = pace.outlook?.critical
+  const weeklyAllowance = projection.allowances.find((allowance) =>
+    allowance.durationMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES);
+  const resetMatches = weeklyAllowance !== undefined
+    && instantMs(weeklyAllowance.resetAt) !== null
+    && instantMs(pace.resetsAt) !== null
+    && Math.abs(instantMs(weeklyAllowance.resetAt) - instantMs(pace.resetsAt)) <= 1_000;
+  const hasBoundOutlook = ["reset_first", "exhaustion"].includes(pace.outlook?.kind);
+  const available = pace.status === "available"
+    && hasBoundOutlook
+    && resetMatches;
+  setHidden(documentRef, "pace-section", !available);
+  if (!available) return;
+
+  const standingKey = pace.outlook.critical
     ? "electron.trayPopover.paceCritical"
-    : pace.outlook?.standing === "over"
+    : pace.outlook.standing === "over"
       ? "electron.trayPopover.paceOver"
-      : pace.outlook?.standing === "on"
+      : pace.outlook.standing === "on"
         ? "electron.trayPopover.paceOn"
-        : pace.outlook?.standing === "under"
-          ? "electron.trayPopover.paceUnder" : null;
-  setHidden(documentRef, "pace-metrics", !available);
-  setHidden(documentRef, "pace-track", !hasTrack);
-  setHidden(documentRef, "pace-outlook", !available || pace.outlook?.kind === "unavailable");
-  setHidden(documentRef, "pace-early", !available || pace.outlook?.earlyEstimate !== true);
-  setElementText(documentRef, "pace-state", pace.status === "collecting"
-    ? t("electron.trayPopover.paceCollecting")
-    : standingKey ? t(standingKey) : t("weekly.headline.insufficient"));
+        : "electron.trayPopover.paceUnder";
+  setElementText(documentRef, "pace-state", t(standingKey));
+  const outlookCopy = pace.outlook.kind === "reset_first"
+    ? t("electron.trayPopover.paceResetFirst")
+    : pace.outlook.projectedExhaustionAt
+      ? t("electron.trayPopover.paceExhaustion", {
+        time: localFormatter(pace.outlook.projectedExhaustionAt),
+      }) : t("weekly.headline.insufficient");
+  setElementText(documentRef, "pace-outlook", outlookCopy);
+  setElementText(documentRef, "pace-used", t("dashboard.quota.used", {
+    value: displayPercent(pace.currentUsedPercent, numberFormatter),
+  }));
+  setElementText(documentRef, "pace-remaining", t("electron.trayPopover.remaining", {
+    value: displayPercent(pace.remainingPercent, numberFormatter),
+  }));
+  const rate = pace.pace.overallPercentagePointsPerHour;
+  setElementText(documentRef, "pace-rate", rate === null
+    ? "—"
+    : `${numberFormatter(rate, { maximumFractionDigits: 1 })} pp/h`);
+  setElementText(documentRef, "pace-reset", t("electron.trayPopover.resets", {
+    time: resetCountdown(weeklyAllowance.resetInSeconds, t, numberFormatter),
+  }));
   const track = documentRef.getElementById("pace-track");
+  const coveredPercent = pace.outlook.coveredFraction === null
+    ? null : pace.outlook.coveredFraction * 100;
   if (track) {
-    track.dataset.paceState = pace.status;
-    track.dataset.paceStanding = pace.outlook?.critical
-      ? "critical" : pace.outlook?.standing ?? "";
     track.setAttribute("role", "progressbar");
     track.setAttribute("aria-valuemin", "0");
     track.setAttribute("aria-valuemax", "100");
-    if (!available || pace.outlook?.coveredFraction === null) {
+    if (coveredPercent === null) {
       track.removeAttribute("aria-valuenow");
-      track.setAttribute("aria-valuetext", t("electron.trayPopover.paceCollecting"));
+      track.setAttribute("aria-valuetext", t("weekly.headline.insufficient"));
     } else {
-      const coveredPercent = pace.outlook.coveredFraction * 100;
       track.setAttribute("aria-valuenow", String(coveredPercent));
       track.setAttribute("aria-valuetext", displayPercent(coveredPercent, numberFormatter));
     }
   }
   const fill = documentRef.getElementById("pace-fill");
-  if (fill) fill.style.width = !available || pace.outlook?.coveredFraction === null
-    ? "0%" : `${pace.outlook.coveredFraction * 100}%`;
+  if (fill) fill.style.width = coveredPercent === null ? "0%" : `${coveredPercent}%`;
   const marker = documentRef.getElementById("pace-active-marker");
   if (marker) {
-    const activeFraction = available ? pace.outlook?.activeExhaustionFraction : null;
+    const activeFraction = pace.outlook.activeExhaustionFraction;
     marker.hidden = activeFraction === null;
     if (activeFraction !== null) marker.style.left = `${activeFraction * 100}%`;
   }
-  if (!available) return;
-  const outlookCopy = pace.outlook?.kind === "reset_first"
-    ? t("electron.trayPopover.paceResetFirst")
-    : pace.outlook?.projectedExhaustionAt
-      ? t("electron.trayPopover.paceExhaustion", {
-        time: localFormatter(pace.outlook.projectedExhaustionAt),
-      }) : t("weekly.headline.insufficient");
-  setElementText(documentRef, "pace-outlook", outlookCopy);
-  setElementText(documentRef, "pace-early", t("electron.trayPopover.paceEarly"));
-  setElementText(documentRef, "pace-used", t("dashboard.quota.used", {
-    value: displayPercent(pace.currentUsedPercent, numberFormatter),
-  }));
-  setElementText(documentRef, "pace-remaining", t("dashboard.quota.remaining", {
-    value: displayPercent(pace.remainingPercent, numberFormatter),
-  }));
-  setElementText(documentRef, "pace-reset", pace.resetsAt
-    ? t("dashboard.quota.resets", { time: localFormatter(pace.resetsAt) })
-    : t("dashboard.quota.resetUnknown"));
-  const rate = pace.pace.overallPercentagePointsPerHour;
-  setElementText(documentRef, "pace-rate", rate === null
-    ? "—"
-    : `${numberFormatter(rate, { maximumFractionDigits: 1 })} pp/h`);
 }
 
-function renderHistory(documentRef, projection, t, numberFormatter, localFormatter, formattingLocale) {
+function renderHistory(documentRef, projection, t, numberFormatter, formattingLocale) {
   const history = projection.history;
   for (const button of documentRef.querySelectorAll?.("[data-history-range]") ?? []) {
     const active = button.dataset.historyRange === history.range;
     button.setAttribute("aria-pressed", String(active));
     button.classList.toggle("is-selected", active);
   }
+
   const period = history.period;
-  setElementText(documentRef, "history-summary", period
-    ? `${t("usage.events", { count: compact(period.events) })} · ${t("usage.tokens", { count: compact(period.totalTokens) })}`
-    : t("accounting.projection.unavailable"));
-  setElementText(documentRef, "history-cost", period && period.pricingState !== "unavailable"
-    ? displayMoney(period.apiPriceEquivalentUsd, numberFormatter)
-    : "—");
-  const coverageCopy = history.status === "unavailable" && period === null
-    ? t("accounting.projection.unavailable")
-    : history.status !== "complete"
-      ? t("dashboard.timeline.missingData")
-      : t("accounting.apiEquivalent.standardRateBasis");
-  setElementText(documentRef, "history-coverage", coverageCopy);
-  setHidden(documentRef, "history-retained", !history.retained);
-  if (history.retained) setElementText(
-    documentRef,
-    "history-retained",
-    t("accounting.projection.lastVerifiedPeriod", {
-      period: period?.periodLabel ?? t("accounting.projection.periodUnavailable"),
-    }),
-  );
-  setHidden(documentRef, "history-pricing", history.pricingState !== "partial");
-  if (history.pricingState === "partial") {
-    setElementText(documentRef, "history-pricing", t("electron.trayPopover.pricingPartial"));
+  const available = projection.accounting.status !== "unavailable" && period !== null;
+  setHidden(documentRef, "history-available", !available);
+  setHidden(documentRef, "history-unavailable", available);
+  setHidden(documentRef, "history-retained", !available || !history.retained);
+  if (!available) {
+    setElementText(documentRef, "history-unavailable-title", t("electron.trayPopover.accountingUnavailableTitle"));
+    setElementText(documentRef, "history-unavailable-body", t("electron.trayPopover.accountingUnavailableBody"));
+    const bars = documentRef.getElementById("history-bars");
+    if (bars) bars.replaceChildren();
+    return;
   }
+
+  if (history.retained) {
+    setElementText(documentRef, "history-retained", t("electron.trayPopover.retainedHistory"));
+  }
+  const periodCopy = history.range === "30d"
+    ? t("electron.trayPopover.periodLastThirtyDays")
+    : t("electron.trayPopover.periodLastSevenDays");
+  setElementText(documentRef, "history-period", periodCopy);
+  setElementText(documentRef, "history-tokens", t("electron.trayPopover.tokenCount", {
+    count: compact(period.totalTokens),
+  }));
+  const eventsCopy = period.events === 0
+    ? t("electron.trayPopover.noUsageObserved", { period: periodCopy })
+    : period.events === 1
+      ? t("electron.trayPopover.usageChangeOne")
+      : t("electron.trayPopover.usageChangesMany", {
+        count: numberFormatter(period.events, { maximumFractionDigits: 0 }),
+      });
+  setElementText(documentRef, "history-events", eventsCopy);
+  setElementText(documentRef, "history-price", historyPriceCopy(period, t, numberFormatter));
+
+  const start = history.days.at(0)?.key ?? "";
+  const end = history.days.at(-1)?.key ?? "";
+  setElementText(documentRef, "history-start", calendarLabel(start, formattingLocale));
+  setElementText(documentRef, "history-end", calendarLabel(end, formattingLocale));
+  const counts = historyCoverageCounts(history.days);
+  const hasCoverageGap = counts.partial > 0 || counts.unavailable > 0;
+  setHidden(documentRef, "history-coverage", !hasCoverageGap);
+  if (hasCoverageGap) {
+    setElementText(documentRef, "history-coverage", t("electron.trayPopover.coverageMixed", {
+      complete: numberFormatter(counts.complete, { maximumFractionDigits: 0 }),
+      partial: numberFormatter(counts.partial, { maximumFractionDigits: 0 }),
+      unavailable: numberFormatter(counts.unavailable, { maximumFractionDigits: 0 }),
+    }));
+  }
+
   const bars = documentRef.getElementById("history-bars");
   if (!bars) return;
   bars.dataset.range = history.range;
@@ -1065,8 +1255,8 @@ function renderHistory(documentRef, projection, t, numberFormatter, localFormatt
     const label = calendarLabel(day.key, formattingLocale);
     const detail = day.totalTokens === null
       ? t("dashboard.timeline.missingData")
-      : `${t("usage.tokens", { count: compact(day.totalTokens) })} · ${t("usage.events", {
-        count: compact(day.usageEvents ?? 0),
+      : `${t("electron.trayPopover.tokenCount", { count: compact(day.totalTokens) })} · ${t("electron.trayPopover.usageChangesMany", {
+        count: numberFormatter(day.usageEvents ?? 0, { maximumFractionDigits: 0 }),
       })}`;
     bar.setAttribute("aria-label", `${label}: ${detail}`);
     const fill = documentRef.createElement("span");
@@ -1077,6 +1267,22 @@ function renderHistory(documentRef, projection, t, numberFormatter, localFormatt
     bar.append(fill);
     bars.append(bar);
   }
+}
+
+function headerFreshnessCopy(freshness, t) {
+  if (freshness.status === "live"
+      && freshness.latestObservedAt !== null
+      && freshness.ageSeconds !== null) {
+    return freshness.ageSeconds < 90
+      ? t("electron.trayPopover.headerLive")
+      : t("electron.trayPopover.headerLiveUpdated", {
+        age: formatAge(freshness.ageSeconds),
+      });
+  }
+  if (freshness.status === "stale") return t("electron.trayPopover.staleTitle");
+  if (freshness.status === "demo") return t("dashboard.quota.demo");
+  if (freshness.status === "offline") return t("electron.trayPopover.errorTitle");
+  return t("electron.trayPopover.startingTitle");
 }
 
 /**
@@ -1096,31 +1302,19 @@ export function renderTrayPopup(documentRef, projection, {
   const translated = typeof t === "function" ? t : defaultText;
   const formatNumberImpl = typeof numberFormatter === "function" ? numberFormatter : formatNumber;
   const formatLocalImpl = typeof localFormatter === "function" ? localFormatter : formatLocal;
-  // The helper above uses the shared formatter; this local alias keeps the
-  // public option explicit for tests and future embedded surfaces.
-  void formatLocalImpl;
-  renderAllowances(documentRef, projection, translated, formatNumberImpl, formatLocalImpl);
+  renderAllowances(documentRef, projection, translated, formatNumberImpl);
   renderWeeklyPace(documentRef, projection, translated, formatNumberImpl, formatLocalImpl);
-  renderHistory(documentRef, projection, translated, formatNumberImpl, formatLocalImpl, formattingLocale);
+  renderHistory(documentRef, projection, translated, formatNumberImpl, formattingLocale);
   const freshness = projection.freshness;
-  const freshnessCopy = freshness.status === "live"
-    ? translated("status.fresh")
-    : freshness.status === "stale"
-      ? translated("status.needsRefresh")
-      : freshness.status === "demo"
-        ? translated("dashboard.quota.demo")
-        : freshness.status === "offline"
-          ? translated("dashboard.unavailable.offline")
-          : translated("status.noData");
-  setElementText(documentRef, "tray-popup-freshness", freshness.latestObservedAt
-    ? `${freshnessCopy} · ${formatLocalImpl(freshness.latestObservedAt)}` : freshnessCopy);
+  const freshnessCopy = headerFreshnessCopy(freshness, translated);
+  setElementText(documentRef, "tray-popup-freshness", freshnessCopy);
   const live = documentRef.getElementById("tray-popup-live");
   if (live) live.textContent = freshnessCopy;
   for (const button of documentRef.querySelectorAll?.("[data-action]") ?? []) {
     const action = button.dataset.action;
     button.textContent = action === "open"
       ? translated("electron.tray.open", { appName: PRODUCT_APP_NAME })
-      : action === "more" ? "⋯" : translated("electron.tray.refresh");
+      : action === "more" ? "⋯" : translated("electron.trayPopover.refresh");
     if (action === "more") {
       button.setAttribute("aria-label", translated("electron.trayPopover.more"));
       button.setAttribute("title", translated("electron.trayPopover.more"));
@@ -1129,6 +1323,60 @@ export function renderTrayPopup(documentRef, projection, {
       || typeof bridge?.requestAction !== "function";
   }
   return projection;
+}
+
+/**
+ * Report the intrinsic popup height through the narrow preload bridge. The
+ * renderer never chooses a window size itself; the main process clamps and
+ * places the transient surface.
+ */
+export function observeTrayPopupContentHeight({
+  windowRef = globalThis.window,
+  documentRef = globalThis.document,
+} = {}) {
+  const root = documentRef?.getElementById?.("tray-popup");
+  const bridge = windowRef?.tibotattleTrayPopover;
+  const ResizeObserverImpl = windowRef?.ResizeObserver ?? globalThis.ResizeObserver;
+  if (!root || typeof bridge?.reportContentHeight !== "function"
+      || typeof ResizeObserverImpl !== "function") return () => {};
+  let lastReportedHeight = null;
+  const report = () => {
+    let height;
+    try {
+      height = Math.ceil(root.getBoundingClientRect().height);
+    } catch {
+      return;
+    }
+    if (!Number.isSafeInteger(height) || height < 1 || height === lastReportedHeight) {
+      return;
+    }
+    lastReportedHeight = height;
+    try {
+      bridge.reportContentHeight(height);
+    } catch {
+      // The bridge can disappear while this transient renderer closes.
+    }
+  };
+  let observer;
+  try {
+    observer = new ResizeObserverImpl(report);
+    observer.observe(root);
+    report();
+  } catch {
+    try {
+      observer?.disconnect?.();
+    } catch {
+      // A failed observer setup has no usable lifecycle to preserve.
+    }
+    return () => {};
+  }
+  return () => {
+    try {
+      observer.disconnect();
+    } catch {
+      // The page can already be gone when Electron closes its transient view.
+    }
+  };
 }
 
 export async function bootstrapTrayPopup({
@@ -1208,6 +1456,11 @@ export async function bootstrapTrayPopup({
     return promise;
   };
   render();
+  const stopContentHeightObserver = observeTrayPopupContentHeight({
+    windowRef,
+    documentRef,
+  });
+  windowRef.addEventListener?.("pagehide", stopContentHeightObserver, { once: true });
   for (const button of documentRef.querySelectorAll?.("[data-history-range]") ?? []) {
     button.addEventListener("click", () => {
       if (Object.hasOwn(TRAY_POPUP_HISTORY_RANGES, button.dataset.historyRange)) {

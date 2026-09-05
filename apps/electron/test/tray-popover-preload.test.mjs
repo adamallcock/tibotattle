@@ -9,6 +9,7 @@ import {
   TRAY_POPOVER_ACTION_CHANNEL,
   TRAY_POPOVER_MODEL_CHANNEL,
   TRAY_POPOVER_VISIBILITY_CHANNEL,
+  TRAY_POPOVER_CONTENT_HEIGHT_CHANNEL,
 } from "../desktop-tray-popover.js";
 
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -70,6 +71,16 @@ test("tray popup preload exposes immutable actions and main-owned visibility", a
     values: ["more"],
   });
   assert.equal(sent.length, 2);
+
+  bridge.reportContentHeight(476);
+  assert.deepEqual(sent.at(-1), {
+    channel: TRAY_POPOVER_CONTENT_HEIGHT_CHANNEL,
+    values: [476],
+  });
+  for (const height of [0, -1, 4097, 476.5, "476", NaN, Infinity, {}]) {
+    bridge.reportContentHeight(height);
+  }
+  assert.equal(sent.length, 3, "only a bounded integer content height leaves the preload");
 
   for (const listener of listeners.get(TRAY_POPOVER_VISIBILITY_CHANNEL) ?? []) {
     listener({}, true);

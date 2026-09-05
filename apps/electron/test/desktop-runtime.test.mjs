@@ -156,6 +156,7 @@ class FakeTray extends EventEmitter {
 
   constructor(...args) {
     super(...args);
+    this.icon = args[0];
     FakeTray.instances.push(this);
   }
 
@@ -714,6 +715,24 @@ test("runtime applies the persisted desktop language to the initial tray menu", 
   });
   const tray = FakeTray.instances.at(-1);
   assert.equal(tray.menu.template.find((item) => item.label === "打开 TiboTattle")?.label, "打开 TiboTattle");
+  await fixture.desktop.lifecycle.dispose();
+});
+
+test("runtime forwards the trusted dynamic tray-image factory to lifecycle", async () => {
+  const dynamicIcon = Object.freeze({ kind: "dynamic-tray-icon" });
+  const calls = [];
+  const fixture = await launchFixture({
+    load: async () => null,
+    runtimeOverrides: {
+      createTrayIcon: (trayStatus) => {
+        calls.push(trayStatus.status);
+        return dynamicIcon;
+      },
+    },
+  });
+  const tray = FakeTray.instances.at(-1);
+  assert.equal(tray.icon, dynamicIcon);
+  assert.ok(calls.includes("starting"));
   await fixture.desktop.lifecycle.dispose();
 });
 

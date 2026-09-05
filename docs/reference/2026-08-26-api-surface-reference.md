@@ -156,7 +156,7 @@ hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/local/health` | Companion readiness, refresh state, schema versions, and configured capabilities |
-| `GET` | `/api/local/desktop-status` | Closed lifecycle, allowance and notification evidence for the Electron shell, available before the first snapshot and without account identifiers or filesystem paths |
+| `GET` | `/api/local/desktop-status` | Closed lifecycle plus a current direct display allowance from bounded published-overview metadata; strict v2 notification evidence remains receipt-only. Available before the first snapshot and without account identifiers or filesystem paths. |
 | `GET` | `/api/local/diagnostics/contribution` | Closed, path-free contribution support diagnostics for the native shell |
 | `POST` | `/api/local/diagnostics/note` | Record one bounded fixed-vocabulary local diagnostic note |
 | `GET`, `POST` | `/api/local/identity/hosted-signin-handoff` | Read or update the bounded local recovery handle for an in-flight hosted sign-in |

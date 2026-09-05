@@ -765,6 +765,9 @@ function fakeStore() {
         evidenceStatus: "available",
       };
     },
+    getDesktopShellDisplayEvidence() {
+      return null;
+    },
     getGradient() {
       return { status: "available", datasets: { rolling: [{ quota_change_pp: 3 }] } };
     },
@@ -2392,6 +2395,68 @@ test("desktop status route projects refresh lifecycle without dashboard payloads
     assert.equal((await fetch(`${base}/api/local/desktop-status`, {
       method: "POST",
     })).status, 405);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("desktop status route serves cached current overview evidence without a completed refresh or notification evidence", async () => {
+  const files = await fixture();
+  const now = Date.parse("2026-09-05T12:00:00.000Z");
+  const store = fakeStore();
+  let overviewReads = 0;
+  let displayReads = 0;
+  store.getOverview = () => {
+    overviewReads += 1;
+    throw new Error("desktop status must not clone the full overview");
+  };
+  store.getDesktopShellDisplayEvidence = () => {
+    displayReads += 1;
+    return Object.freeze({
+      evidenceStatus: "available",
+      freshness: Object.freeze({ status: "live", staleAfterSeconds: 1_800 }),
+      windows: Object.freeze([Object.freeze({
+        durationMinutes: 10_080,
+        slot: "primary",
+        usedPercent: 100,
+        remainingPercent: 0,
+        observedAt: "2026-09-05T11:59:00.000Z",
+        resetAt: "2026-09-05T15:00:00.000Z",
+      })]),
+    });
+  };
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: store,
+    refreshRunner: async () => ({}),
+    clock: () => now,
+    port: 0,
+  });
+  try {
+    await app.snapshotReady;
+    const response = await fetch(
+      `http://127.0.0.1:${app.port}/api/local/desktop-status`,
+    );
+    assert.equal(response.status, 200);
+    const status = await response.json();
+    assert.deepEqual(status, {
+      schemaVersion: DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
+      state: "fresh",
+      allowance: {
+        source: "direct",
+        window: "seven_day",
+        remainingPercent: 0,
+      },
+      notificationEvidence: null,
+    });
+    assert.equal(displayReads, 1);
+    assert.equal(overviewReads, 0);
+    assert.equal(JSON.stringify(status).includes("continuity"), false);
+    assert.equal(JSON.stringify(status).includes("openai_codex"), false);
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });
