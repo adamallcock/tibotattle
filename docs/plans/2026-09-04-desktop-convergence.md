@@ -37,9 +37,10 @@ and approval-review hold on changing the default.
 Continuation authorized on 2026-09-04: finish reconciliation with the latest
 native 0.1.18 changes and controls, provide a durable Electron app the owner can
 test, and prepare packaging for all four targets. The integration baseline is
-native commit `6731e6d4`, merged locally as `7c9f2727`. This includes the
+native commit `38aaeef4` (including the earlier `6731e6d4` integration). This includes the
 combined Astra/Intel work, compressed-history support, paginated-export fixes,
-the parser-v14 exact-history inheritance correction and RC3 upgrade deadlines.
+the parser-v14 exact-history inheritance correction, RC3 upgrade deadlines,
+and the subsequent strict filesystem refusal diagnostics.
 GitHub PRs and remote references were refreshed before selecting the release
 lineage; the active local release checkout was checked again at each freeze.
 Open PRs are evaluated for relevant product changes; their presence alone does
@@ -265,7 +266,8 @@ The Linux AppImage dependency has a small pinned patch that removes its
 implicit sandbox bypass; executable launcher tests cover the actual installed
 template. Linux cross-packaging on this Mac is artifact evidence. It does not
 establish desktop, Secret Service, tray or installed lifecycle behavior on
-Linux. Windows installer production remains pending a native Windows build.
+Linux. Native Windows CI has produced the installer and ZIP; installed Windows
+runtime qualification remains separate.
 
 The tester profile copies retained derived databases through SQLite read-only
 backup, preserves the matching index salt and uses a separate development
@@ -285,19 +287,29 @@ rewritten and this is not a green complete-root claim.
 
 The `a6226a4b` snapshot produced verified Mac arm64, Mac x64 and Linux x64
 development distributions with complete hashed testing handoffs. A subsequent
-native CI run at `daaff299` is in progress. The first manual dispatch failed
+native CI run at `daaff299` completed successfully for all four targets:
+[run 33936034045](https://github.com/adamallcock/tibotattle/actions/runs/33936034045).
+The Windows installer, ZIP, ASAR, current native binding and testing handoff
+were downloaded and matched their SHA-256 receipts. The first manual dispatch failed
 because the workflow was absent from the default branch; the approved branch
 push now runs the four native jobs without a merge or release.
 
-The owner-reported missing cache views and broken tray remain active acceptance
-items. Process inspection found the owner was running the older `18b8de56`
-app. Its cache reuse plot was visibly populated, but this alone does not prove
-parity with the latest cache details. The current tray also needs an actual
-image-format repair and enhanced allowance presentation. A final candidate
-must include these changes, expose its build identity and pass rendered checks;
-source freshness and module-presence tests cannot substitute for that proof.
+The owner-reported visual differences are part of final acceptance. Process
+inspection found the owner was running the older `18b8de56` app. Its cache
+reuse plot was visibly populated on Usage and costs, with the switch-overhead
+and recent-drop expansions present. Current native and Electron share these
+cache views; recent attribution changes affect the data behind them. Direct
+tray/menu navigation to Usage and costs now makes that surface discoverable.
 
-Remaining release gates are explicit: exact Windows distributions, rendered
+The real Electron NativeImage probe reproduced an opaque square and verified
+the alpha-preserving PNG repair as a bird silhouette with transparent pixels.
+The richer tray now has a shared local renderer, and the browser adapter
+preserves native `paceOutlook` data for the selected current plan. Its packaged
+render/action proof remains required. The final candidate must include these
+changes, expose its build identity and pass rendered checks; source freshness
+and module-presence tests cannot substitute for that proof.
+
+Remaining release gates are explicit: final four-target distributions, rendered
 final Mac inspection, physical target runtime checks, production signing,
 installed state/credential migration and first update, and accountless upload
 ownership/scheduling. Sharing controls already implement the accepted policy;
