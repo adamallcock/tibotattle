@@ -148,6 +148,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_BINDING_BUILD_FAILED' }
           node scripts/build-windows-filesystem-manifest.mjs
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_BINDING_MANIFEST_FAILED' }
+      - name: Check native binding and synthetic filesystem contracts
+        run: node --test test/windows-filesystem-loader.test.js test/windows-filesystem-manifest.test.js test/windows-filesystem-native-contract.test.js test/windows-filesystem-security.test.js
       - name: Validate packaging contracts
         run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js
       - name: Build and verify development distributions
