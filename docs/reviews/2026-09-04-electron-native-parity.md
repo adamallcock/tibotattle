@@ -46,7 +46,7 @@ adds a missing native product control.
 ## Focused evidence
 
 The cold/warm route-mode regression is covered by
-`node --test apps/web/test/refresh-policy.test.mjs` (11 passing tests at the
+`node --test apps/web/test/refresh-policy.test.mjs` (12 passing tests at the
 source snapshot containing `1cfc6ba9`). The browser startup extraction remains
 covered by `node --test apps/web/test/lib.test.mjs`, and `node --check
 apps/web/public/app.js` passes. These checks do not replace packaged Electron
