@@ -72,6 +72,36 @@ test("historical plan selection cannot carry the current account's pace outlook"
   assert.equal(selectAllowancePlanPopulation(normalized, "plus").weekly.paceOutlook, null);
 });
 
+test("the shared outlook boundary enforces native classification and geometry invariants", () => {
+  const valid = outlook();
+  for (const paceOutlook of [
+    { ...valid, critical: false },
+    { ...valid, standing: "on", critical: false,
+      projection: { ...valid.projection, projectedExhaustionAt: null } },
+    { ...valid, earlyEstimate: true, observationCount: 3, elapsedHours: 2 },
+    { ...valid, rates: { ...valid.rates, activePercentagePointsPerHour: 0 } },
+    { ...valid, rates: { ...valid.rates, sustainablePercentagePointsPerHour: 1 } },
+    { ...valid, rates: { ...valid.rates, ratio: 1 } },
+    { ...valid, projection: { ...valid.projection, coveredHours: valid.projection.coveredHours + 1 } },
+    { ...valid, projection: { ...valid.projection, dryHours: valid.projection.dryHours + 1 } },
+    { ...valid, projection: { ...valid.projection, sparePercent: 50 } },
+    { ...valid, track: { ...valid.track, coveredFraction: 0.5 } },
+    { ...valid, track: { ...valid.track, activeExhaustionFraction: 0.5 } },
+    { ...valid, projection: { ...valid.projection,
+      projectedExhaustionAt: new Date(Date.parse(valid.projection.projectedExhaustionAt) + 1_000).toISOString() } },
+  ]) assert.equal(normalizeDashboardPayload({ weekly: { paceOutlook } }).weekly.paceOutlook, null);
+
+  for (const active of [0.2, 2]) {
+    const paceOutlook = projectWeeklyPaceOutlook({
+      forecast: forecast({ pace: { ...forecast().pace,
+        activePercentagePointsPerHour: active, overallPercentagePointsPerHour: 0.2 } }),
+      nowMs: Date.parse("2026-08-03T12:30:00.000Z"),
+    });
+    assert.equal(paceOutlook.standing, "under");
+    assert.deepEqual(normalizeDashboardPayload({ weekly: { paceOutlook } }).weekly.paceOutlook, paceOutlook);
+  }
+});
+
 test("weekly browser data boundary retains only the exact safe pace forecast", () => {
   const normalized = normalizeDashboardPayload({
     weekly: { paceForecast: forecast() },

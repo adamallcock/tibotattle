@@ -5675,6 +5675,9 @@ function normalizeWeeklyPaceForecast(value) {
 // The companion owns pace classification and geometry. Retain its newer
 // native-menu-bar DTO without recalculating a second forecast in the browser.
 function normalizeWeeklyPaceOutlook(value) {
+  const approximatelyEqual = (left, right) => Number.isFinite(left)
+    && Number.isFinite(right)
+    && Math.abs(left - right) <= 0.000_001 * Math.max(1, Math.abs(left), Math.abs(right));
   const rateKeys = ["activePercentagePointsPerHour", "overallPercentagePointsPerHour",
     "headlinePercentagePointsPerHour", "sustainablePercentagePointsPerHour", "ratio"];
   const projectionKeys = ["hoursToReset", "coveredHours", "dryHours", "sparePercent", "projectedExhaustionAt"];
@@ -5725,14 +5728,39 @@ function normalizeWeeklyPaceOutlook(value) {
           || value.observationCount < 2 || !(elapsedHours > 0) || !(remainingPercent > 0)
           || !(rates.headlinePercentagePointsPerHour > 0)
           || !(rates.sustainablePercentagePointsPerHour > 0) || !(rates.ratio > 0)
-          || rates.headlinePercentagePointsPerHour
-            !== (rates.overallPercentagePointsPerHour ?? rates.activePercentagePointsPerHour)
+          || (rates.activePercentagePointsPerHour !== null && !(rates.activePercentagePointsPerHour > 0))
+          || (rates.overallPercentagePointsPerHour !== null && !(rates.overallPercentagePointsPerHour > 0))
+          || !approximatelyEqual(rates.headlinePercentagePointsPerHour,
+            rates.overallPercentagePointsPerHour ?? rates.activePercentagePointsPerHour)
           || projection.coveredHours === null || projection.dryHours === null
           || projection.sparePercent === null || track.coveredFraction === null
-          || (value.critical && value.standing !== "over")
+          || !approximatelyEqual(rates.sustainablePercentagePointsPerHour,
+            remainingPercent / projection.hoursToReset)
+          || !approximatelyEqual(rates.ratio,
+            rates.headlinePercentagePointsPerHour / rates.sustainablePercentagePointsPerHour)
+          || !approximatelyEqual(projection.coveredHours + projection.dryHours, projection.hoursToReset)
+          || !approximatelyEqual(projection.coveredHours,
+            Math.min(projection.hoursToReset, remainingPercent / rates.headlinePercentagePointsPerHour))
+          || !approximatelyEqual(projection.sparePercent,
+            Math.max(0, remainingPercent - rates.headlinePercentagePointsPerHour * projection.hoursToReset))
+          || !approximatelyEqual(track.coveredFraction, projection.coveredHours / projection.hoursToReset)
+          || !(value.standing === "under" ? rates.ratio < 0.85
+            : value.standing === "on" ? rates.ratio >= 0.85 && rates.ratio <= 1.15 : rates.ratio > 1.15)
+          || value.critical !== (value.standing === "over" && rates.ratio >= 2)
+          || (value.earlyEstimate && value.observationCount > 2 && elapsedHours >= 1)
           || (value.standing === "over"
             ? projectedExhaustionAt === null || Date.parse(projectedExhaustionAt) >= Date.parse(resetsAt)
             : projectedExhaustionAt !== null)) return null;
+      const activeHours = rates.activePercentagePointsPerHour === null
+        ? null : remainingPercent / rates.activePercentagePointsPerHour;
+      const expectedActiveFraction = activeHours !== null && activeHours < projection.coveredHours * 0.95
+        ? Math.max(0, Math.min(1, activeHours / projection.hoursToReset)) : null;
+      if (expectedActiveFraction === null
+        ? track.activeExhaustionFraction !== null
+        : !approximatelyEqual(track.activeExhaustionFraction, expectedActiveFraction)) return null;
+      if (value.standing === "over"
+          && Math.abs(Date.parse(projectedExhaustionAt)
+            - (Date.parse(resetsAt) - projection.dryHours * 3_600_000)) > 10) return null;
     }
   }
   return {
