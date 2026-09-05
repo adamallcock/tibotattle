@@ -1839,7 +1839,11 @@ async function captureTrayPopover({ child, port, dashboardOrigin, screenshotPath
         ready: document.documentElement.dataset.trayPopupReady === "true",
         visible: document.visibilityState === "visible",
         open: Boolean(document.querySelector('[data-action="open"]')),
+        openLabelResolved: Boolean(document.querySelector('[data-action="open"]')?.textContent.trim())
+          && !document.querySelector('[data-action="open"]')?.textContent.includes("{appName}"),
         refresh: Boolean(document.querySelector('[data-action="refresh"]')),
+        hiddenElementsHidden: Array.from(document.querySelectorAll("[hidden]"))
+          .every((element) => getComputedStyle(element).display === "none"),
         weeklyPace: Boolean(document.querySelector("#pace-state")),
         history: Boolean(document.querySelector("#history-bars")),
         coverage: Boolean(document.querySelector("#history-coverage")?.textContent.trim()),
@@ -1848,7 +1852,8 @@ async function captureTrayPopover({ child, port, dashboardOrigin, screenshotPath
         height: innerHeight,
         horizontalOverflow: document.documentElement.scrollWidth > innerWidth + 1,
       }))()`);
-      return value?.bridge && value.ready && value.visible && value.open && value.refresh
+      return value?.bridge && value.ready && value.visible && value.open && value.openLabelResolved
+        && value.refresh && value.hiddenElementsHidden
         && value.weeklyPace && value.history && value.coverage && value.rangeCount === 2
         && value.width > 0 && value.width <= 480
         && value.height > 0 && !value.horizontalOverflow ? value : null;
