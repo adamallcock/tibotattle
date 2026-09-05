@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildReplaySafeAccountingCache,
+  minimalRebuildChildEnvironment,
   refreshReplaySafeAccountingCache,
   readReplaySafeAccountingCache,
   REPLAY_SAFE_ACCOUNTING_MEMORY_POLICY,
@@ -1427,6 +1428,83 @@ test("a rebuild completes in the child while the parent sits past the RSS ceilin
 // at its own small pressure point by design — the mechanism is scale-free, and
 // the SHIPPED numbers are the invariant test's job, not this one's.
 // ---------------------------------------------------------------------------
+
+test("rebuild subprocess environment preserves Electron node mode and strips ambient secrets", () => {
+  const electronEnvironment = minimalRebuildChildEnvironment({
+    ELECTRON_RUN_AS_NODE: "1",
+    TMPDIR: "/private/tmp/usage-monitor-rebuild-child",
+    HOME: "/private/secret-home",
+    PATH: "/private/secret-bin",
+    NODE_OPTIONS: "--require=/private/secret-preload.cjs",
+    APP_USAGEMONITOR_EXPORT_SECRET: "secret-canary",
+    USAGE_MONITOR_CENTRAL_ORIGIN: "https://secret.example.invalid",
+  });
+  assert.deepEqual(electronEnvironment, {
+    ELECTRON_RUN_AS_NODE: "1",
+    TMPDIR: "/private/tmp/usage-monitor-rebuild-child",
+  });
+
+  const probe = spawnSync(process.execPath, [
+    "--input-type=module",
+    "--eval",
+    [
+      "process.stdout.write(JSON.stringify({",
+      "  electron: process.env.ELECTRON_RUN_AS_NODE ?? null,",
+      "  tmpdir: process.env.TMPDIR ?? null,",
+      "  home: process.env.HOME ?? null,",
+      "  path: process.env.PATH ?? null,",
+      "  nodeOptions: process.env.NODE_OPTIONS ?? null,",
+      "  exportSecret: process.env.APP_USAGEMONITOR_EXPORT_SECRET ?? null,",
+      "  centralOrigin: process.env.USAGE_MONITOR_CENTRAL_ORIGIN ?? null,",
+      "}));",
+    ].join("\n"),
+  ], {
+    env: electronEnvironment,
+    encoding: "utf8",
+  });
+  assert.equal(probe.status, 0, probe.stderr);
+  assert.equal(probe.stderr, "");
+  assert.deepEqual(JSON.parse(probe.stdout), {
+    electron: "1",
+    tmpdir: "/private/tmp/usage-monitor-rebuild-child",
+    home: null,
+    path: null,
+    nodeOptions: null,
+    exportSecret: null,
+    centralOrigin: null,
+  });
+
+  const ordinaryEnvironment = minimalRebuildChildEnvironment({
+    TMPDIR: "/private/tmp/usage-monitor-ordinary-node",
+    HOME: "/private/ordinary-home",
+    PATH: "/private/ordinary-bin",
+    NODE_OPTIONS: "--inspect",
+  });
+  assert.deepEqual(ordinaryEnvironment, {
+    TMPDIR: "/private/tmp/usage-monitor-ordinary-node",
+  });
+  const ordinaryProbe = spawnSync(process.execPath, [
+    "--input-type=module",
+    "--eval",
+    "process.stdout.write(process.env.ELECTRON_RUN_AS_NODE ?? 'unset');",
+  ], {
+    env: ordinaryEnvironment,
+    encoding: "utf8",
+  });
+  assert.equal(ordinaryProbe.status, 0, ordinaryProbe.stderr);
+  assert.equal(ordinaryProbe.stdout, "unset");
+  assert.equal(ordinaryProbe.stderr, "");
+
+  for (const mode of ["0", "true", "1 ", " 1", 1, null]) {
+    assert.equal(
+      Object.hasOwn(minimalRebuildChildEnvironment({
+        ELECTRON_RUN_AS_NODE: mode,
+      }), "ELECTRON_RUN_AS_NODE"),
+      false,
+      `non-exact Electron node mode must not cross the child boundary: ${String(mode)}`,
+    );
+  }
+});
 
 test("the rebuild child is spawned with a heap cap at or above the RSS ceiling it is handed", async () => {
   const directory = await mkdtemp(join(tmpdir(), "usage-monitor-rebuild-cap-order-"));

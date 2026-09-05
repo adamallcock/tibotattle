@@ -5006,18 +5006,22 @@ export async function buildReplaySafeAccountingCache({
 const SUBPROCESS_FAILURE_CODE_PATTERN = /^[a-z0-9_]{1,64}$/u;
 const SUBPROCESS_SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 
-// The child inherits almost nothing. TMPDIR is the one passthrough: inside the
-// sandboxed macOS app it names the container's writable temp root, which
-// SQLite may need for spill files. Deliberately absent: NODE_OPTIONS (nothing
-// may override the child's pinned old-space cap or preload code into the
-// rebuild), HOME (every path the child touches arrives resolved in the
-// request), and PATH (the child execs nothing).
-function minimalRebuildChildEnvironment() {
-  const environment = {};
-  if (typeof process.env.TMPDIR === "string" && process.env.TMPDIR.length > 0) {
-    environment.TMPDIR = process.env.TMPDIR;
+// The child inherits almost nothing. TMPDIR is the one ordinary passthrough:
+// inside the sandboxed macOS app it names the container's writable temp root,
+// which SQLite may need for spill files. The packaged Electron executable also
+// needs its exact node-mode switch to run the child entrypoint. Deliberately
+// absent: NODE_OPTIONS (nothing may override the child's pinned old-space cap
+// or preload code into the rebuild), HOME (every path the child touches arrives
+// resolved in the request), and PATH (the child execs nothing).
+export function minimalRebuildChildEnvironment(environment = process.env) {
+  const selected = {};
+  if (typeof environment?.TMPDIR === "string" && environment.TMPDIR.length > 0) {
+    selected.TMPDIR = environment.TMPDIR;
   }
-  return environment;
+  if (environment?.ELECTRON_RUN_AS_NODE === "1") {
+    selected.ELECTRON_RUN_AS_NODE = "1";
+  }
+  return selected;
 }
 
 function parseRebuildChildEnvelope(stdoutText) {
