@@ -1837,7 +1837,8 @@ async function captureTrayPopover({ child, port, dashboardOrigin, screenshotPath
       const value = await popup.evaluate(`(() => ({
         bridge: globalThis.tibotattleTrayPopover?.version === "v1",
         ready: document.documentElement.dataset.trayPopupReady === "true",
-        visible: document.visibilityState === "visible",
+        visible: globalThis.tibotattleTrayPopover?.getVisibility?.() === true,
+        nativeVisibilityTracked: typeof globalThis.tibotattleTrayPopover?.onVisibility === "function",
         open: Boolean(document.querySelector('[data-action="open"]')),
         openLabelResolved: Boolean(document.querySelector('[data-action="open"]')?.textContent.trim())
           && !document.querySelector('[data-action="open"]')?.textContent.includes("{appName}"),
@@ -1852,7 +1853,8 @@ async function captureTrayPopover({ child, port, dashboardOrigin, screenshotPath
         height: innerHeight,
         horizontalOverflow: document.documentElement.scrollWidth > innerWidth + 1,
       }))()`);
-      return value?.bridge && value.ready && value.visible && value.open && value.openLabelResolved
+      return value?.bridge && value.ready && value.visible && value.nativeVisibilityTracked
+        && value.open && value.openLabelResolved
         && value.refresh && value.hiddenElementsHidden
         && value.weeklyPace && value.history && value.coverage && value.rangeCount === 2
         && value.width > 0 && value.width <= 480
@@ -1869,7 +1871,7 @@ async function captureTrayPopover({ child, port, dashboardOrigin, screenshotPath
     const png = Buffer.from(capture.data, "base64");
     await writeFile(screenshotPath, png, { flag: "wx", mode: 0o600 });
     await popup.evaluate(`document.querySelector('[data-action="open"]').click()`);
-    await waitFor(() => popup.evaluate(`document.visibilityState === "hidden"`),
+    await waitFor(() => popup.evaluate(`globalThis.tibotattleTrayPopover?.getVisibility?.() === false`),
       MAX_OPERATION_MS, "tray Open action and main-process dismissal");
     await writeFile(`${screenshotPath}.json`, `${JSON.stringify({
       schemaVersion: "tibotattle-electron-tray-rendered-smoke-v1",
