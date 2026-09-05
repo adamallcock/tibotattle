@@ -554,6 +554,22 @@
     },
     {
       "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/launch-electron-windows-development.cmd",
+      "stableAlias": null,
+      "stableAliasReason": "The downloaded Windows development handoff wrapper is an auxiliary qualification entrypoint, not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/package-electron-development.mjs",
+        "test/electron-windows-development-launcher.test.js"
+      ],
+      "decision": "retain_as_development_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
       "owner": "repository_architecture",
       "canonicalPath": "scripts/lib/application-layout-policy.mjs",
       "stableAlias": null,
@@ -1849,6 +1865,22 @@
       "additionalAliases": [],
       "callers": [
         "test/electron-linux-development-launcher.test.js"
+      ],
+      "decision": "retain_as_development_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/launch-electron-linux-development.sh",
+      "stableAlias": null,
+      "stableAliasReason": "The downloaded Linux development handoff is an auxiliary qualification wrapper, not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-development-packages.yml",
+        "test/electron-linux-development-sidecar.test.js"
       ],
       "decision": "retain_as_development_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
