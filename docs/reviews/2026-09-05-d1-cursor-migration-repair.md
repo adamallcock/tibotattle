@@ -8,7 +8,8 @@ status: in-progress
 # D1 cursor migration repair for 0.1.18
 
 Scope: the owner-approved repair of unapplied migration `0043` and its two v1
-analytical readers. This is not a production-deployment or desktop-publication
+analytical readers, plus the subsequent expression-parentheses-only remote
+parser compatibility repair of unapplied `0044`/`0045`. This is not a production-deployment or desktop-publication
 receipt. The [release plan](../plans/2026-09-05-public-0-1-18-release.md) retains
 the ordered release gates and the separate manual-testing waiver.
 
@@ -81,6 +82,66 @@ these metadata interfaces in its [SQL statement reference](https://developers.cl
   a later added id-alias test is separately green. Full final owning validation,
   remote repaired migration application and final-source qualification remain
   pending and must be recorded before release.
+
+## Subsequent remote parser compatibility repair
+
+The complete Worker gate at `15325bbc6bf2aa42fb29902ff6d32a72ef7f14ac`
+passed 184 script checks and 543 application tests across 43 files, plus
+workspace/package, generated-type, TypeScript, endpoint and all three dry
+bundles. The first complete attempt had one five-second test-harness timeout;
+only the fixed 100,000-session fixture received a documented 20-second budget.
+Its exact acceptance/refusal assertions and production limits are unchanged.
+Dual-runtime R7 freshness and reconstruction remain green.
+
+The approved retry applied repaired `0043`, then `0044` was rejected with
+`incomplete input: SQLITE_ERROR [code: 7500]`; `0045` was not attempted.
+The pinned Wrangler remote migration path sends the entire SQL file and its
+tracking INSERT to D1's query API. Unlike its local path, it does not use the
+client-side statement splitter. Both remaining files use LF, not CRLF, so
+upgrading for the separately documented CRLF fix would not address this input.
+Source: [Cloudflare's remote-command explanation](https://github.com/cloudflare/workers-sdk/pull/15044).
+
+Cloudflare previously documented a parser problem with unparenthesized CASE
+expressions inside triggers: [workers-sdk issue 4727](https://github.com/cloudflare/workers-sdk/issues/4727).
+A synthetic read-only production EXPLAIN probe reproduced it at 05:09:21 UTC:
+the bare expression returned the same incomplete-input refusal, while the
+parenthesized expression returned 15 instruction rows and zero writes. The
+ledger remained at 43 and the synthetic object count stayed zero before and
+after. EXPLAIN compiles the statement without executing CREATE TRIGGER; this
+does not create a production probe object or expose user rows. It is a direct
+synthetic reproduction, not a server trace identifying the failed statement
+within the original migration. [SQLite EXPLAIN semantics](https://www.sqlite.org/lang_explain.html).
+
+The compatibility change adds parentheses around exactly twelve complete CASE
+expressions in `0044` and seven in `0045`. No comments, whitespace outside the
+wrappers, predicates, literals, NULL branches or operations change. A regression
+removes exactly those wrappers and requires each original reviewed SHA-256;
+all already-applied migrations, including repaired `0043`, are untouched.
+New digests:
+
+- `0044`: `9b2661a5052ca8a08e18098e960891a49e7f1c7516b2c1b8cacf32c6f294f5e4`.
+- `0045`: `89f0df9e95eb98fa7ae8cb00dc82fe19f8933689a8002e647e638fdc870990fe`.
+
+Local compiled-program and branch parity, full owning validation, observed
+rollback/preservation and a fresh exact pending-set check precede another apply.
+Consent remains staged, and no new consent, activation, telemetry deletion,
+production restore or migration-ledger rewrite is authorized by this syntax fix.
+
+The 05:13:49 UTC read-only aftermath confirms exact ledger 43, all ten repaired
+`0043` objects/nine columns present, all forty attempted `0044` objects and its
+one column absent, and unchanged controls/consent. The expected epoch increment
+and publication `updating` state are present; old-source health is HTTP 200.
+However, the exact v1 record count is now 3,192,617, down 200 from the retained
+baseline and previous post-refusal supplement. Further production mutations
+are held while this concurrent-activity/preservation discrepancy is explained.
+A successful diagnostic command is not acceptance of this decrease.
+
+Independent memory-only compilation compared original/current `0044` and
+`0045` in all four combinations: 312 compiled DML programs across 26
+trigger-bearing tables, with 234 cross-variant comparisons, match after
+excluding only trace text and connection-specific virtual-table pointers.
+No DML was executed. Forty focused transport/domain/credential tests and the
+24-test schema/lineage suite pass; complete final owning validation follows.
 
 All current repair paths are outside the desktop payload and R7 input closures.
 This avoids unnecessary R7 regeneration, not exact-source desktop rebuilding:

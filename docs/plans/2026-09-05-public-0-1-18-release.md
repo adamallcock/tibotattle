@@ -111,6 +111,16 @@ and requalifying the release source/builds as needed. Do not delete telemetry,
 change consent, restore production or rewrite any published tag. The next
 source freeze must preserve the first attempt and use fresh finalization outputs.
 
+The existing-index repair passed the complete Worker gate (184 script checks,
+543 application tests, all three dry bundles) and repaired `0043` applied.
+The next `0044` was rejected by D1's remote CASE-expression trigger parser.
+A read-only EXPLAIN probe reproduced the bare-CASE failure and parenthesized
+success with no object creation or data writes. The same syntax-only wrappers
+are applied to both unapplied `0044`/`0045`; an inverse-byte regression pins
+their unchanged original predicates, literals and operations. The
+[repair review](../reviews/2026-09-05-d1-cursor-migration-repair.md)
+records evidence, qualification and the unchanged consent/activation boundary.
+
 - [x] Review a bounded existing-index cursor strategy, including equal-time
   ordering/accounting semantics and all callers; avoid merely removing a required
   performance index while retaining a scanning query.

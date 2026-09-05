@@ -88,17 +88,18 @@ test("migration inventory is exact and rejects missing or unreviewed files", () 
   );
 });
 
-test("reconciled migration lineage pins historical SQL and the approved unapplied 0043 repair", () => {
+test("reconciled migration lineage pins historical SQL and reviewed unapplied repairs", () => {
   // Historical 0041 is the deployed 4519b349 migration. The other digests pin
   // the unchanged SQL from the pre-reconciliation release source a9220795,
-  // except the owner-approved repair of rolled-back, unapplied 0043. Never
-  // change already-applied 0042 or silently update these historical pins.
+  // except the owner-approved 0043 repair and expression-parentheses-only
+  // remote-parser compatibility repair of unapplied 0044/0045. Never change
+  // already-applied SQL or silently update these historical pins.
   const expectedDigests = {
     "0041_community_model_composition_cache.sql": "52ff5ff182023bd504c5d584e4c96494c04db7f29a70661dd5713c4a8770d12d",
     "0042_community_model_composition.sql": "c61629ef87facfc8f8d8e16fc5cdc1d4adaf788df7bcc9ee760b60f86e577330",
     "0043_analytical_input_fencing.sql": "acc7c319478487eec408c5bbcebd90e60f029fb02a608c901b7c6f71706c2f49",
-    "0044_attribution_transport_staging.sql": "6d79465243432097aebc20f50718f891e01de234a3b264a984816c54b338e713",
-    "0045_attribution_domain_activation.sql": "0e4bd66cc391f64b8b1a3d1533751cec461882282160cc283330bfba22ff9690",
+    "0044_attribution_transport_staging.sql": "9b2661a5052ca8a08e18098e960891a49e7f1c7516b2c1b8cacf32c6f294f5e4",
+    "0045_attribution_domain_activation.sql": "89f0df9e95eb98fa7ae8cb00dc82fe19f8933689a8002e647e638fdc870990fe",
   };
   const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
   assert.equal(names.length, 45);
@@ -111,6 +112,28 @@ test("reconciled migration lineage pins historical SQL and the approved unapplie
   for (const [name, expected] of Object.entries(expectedDigests)) {
     const bytes = readFileSync(join(workerDirectory, "migrations", name));
     assert.equal(createHash("sha256").update(bytes).digest("hex"), expected, name);
+  }
+});
+
+test("remote trigger parser repair changes only complete CASE expression parentheses", () => {
+  // D1's remote query parser misidentifies an unparenthesized CASE END inside
+  // a trigger as its terminator (workers-sdk#4727, reproduced read-only with
+  // EXPLAIN on 2026-09-05). Local SQLite/Miniflare alone does not expose this.
+  // Undo exactly the new wrappers and require the original reviewed bytes;
+  // no guard, literal, NULL branch or data operation may change incidentally.
+  for (const [name, selectCount, originalDigest] of [
+    ["0044_attribution_transport_staging.sql", 11, "6d79465243432097aebc20f50718f891e01de234a3b264a984816c54b338e713"],
+    ["0045_attribution_domain_activation.sql", 7, "0e4bd66cc391f64b8b1a3d1533751cec461882282160cc283330bfba22ff9690"],
+  ]) {
+    const sql = readFileSync(join(workerDirectory, "migrations", name), "utf8");
+    assert.equal((sql.match(/SELECT \(CASE\b/gu) ?? []).length, selectCount);
+    assert.equal((sql.match(/\bCASE\b/gu) ?? []).length, name.startsWith("0044") ? 12 : 7);
+    assert.equal(/SELECT CASE\b/u.test(sql), false);
+    const original = sql.replaceAll("SELECT (CASE", "SELECT CASE")
+      .replaceAll(" END);", " END;")
+      .replaceAll(">= (CASE WHEN (", ">= CASE WHEN (")
+      .replaceAll("THEN 20000 ELSE 2000 END)", "THEN 20000 ELSE 2000 END");
+    assert.equal(createHash("sha256").update(original).digest("hex"), originalDigest, name);
   }
 });
 

@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-05
 type: status
 status: current
-source_commit: eac8df4589b8ce67eb3873764b99c170ccdb3ed2
+source_commit: 15325bbc6bf2aa42fb29902ff6d32a72ef7f14ac
 observation_date: 2026-09-05
 ---
 
@@ -15,12 +15,20 @@ support because those are independent facts. Re-check the named source before
 using this page for a later release or operational decision.
 
 Continuation on 2026-09-05: both first-attempt stable `1026` installers from
-`eac8df45` pass final native artifact checks, but publication is held on the
-production `0043` migration's `SQLITE_NOMEM` failure. Only `0042` applied;
-read-only schema checks corroborate complete `0043` rollback and unchanged
-collection/publication controls. The owner explicitly approved a data-preserving
-repair and source/build requalification. The [execution plan](./plans/2026-09-05-public-0-1-18-release.md#approved-migration-repair-continuation)
+`eac8df45` pass final native artifact checks, but remain unpublished pre-repair
+evidence. The reviewed existing-index repair passed the complete Worker gate,
+and production `0043` now applied successfully. The next `0044` was rejected
+with `incomplete input`; a read-only probe reproduced D1's CASE-expression
+trigger parser issue. A parentheses-only compatibility repair of unapplied
+`0044`/`0045` is under qualification. The owner explicitly approved a
+data-preserving repair and source/build requalification. The [execution plan](./plans/2026-09-05-public-0-1-18-release.md#approved-migration-repair-continuation)
 records the active boundary; the frozen pre-repair artifacts are not public.
+
+The 05:13 UTC rollback check confirms exact primary prefix 43, all repaired
+`0043` additions present and all attempted `0044` additions absent. It also
+found a 200-record decrease in the v1 aggregate count. Further production
+mutations are held while concurrent lifecycle activity/preservation is reviewed;
+no telemetry-loss or preservation conclusion is inferred from that count alone.
 
 ## Snapshot identity
 
@@ -31,7 +39,7 @@ records the active boundary; the frozen pre-repair artifacts are not public.
 | Combined signed RC2 | ARM and Intel `0.1.18` build `1025.1` dogfood DMGs from common source `4ea16586` and a new local annotated tag; [exact receipt](./receipts/2026-09-04-macos-combined-rc2-signed-candidates.md). Both signed/notarized/stapled with independent exact-byte and same-architecture replacement checks; not installed-upgrade, manual lifecycle or physical Intel proof |
 | Earlier Intel tester artifact | Preserved signed/notarized `0.1.18` build `1025` dogfood DMG from source `18c7065b`; [historical receipt](./receipts/2026-09-03-macos-intel-signed-candidate.md). Predates combined Astra changes; remains immutable rollback/test evidence, not physically Intel-qualified |
 | Installed app | Final signed ARM RC3 `0.1.18` / `1025.2`, source `7701debf`, passes production installed-artifact validation. After owner unlock, a native-menu detailed refresh completed at 2026-09-05 03:58 UTC with replay-safe accounting bound to exact v14 generation 71, complete usage coverage and zero fallback. Stopped-state verification preserves all baseline/rehearsal historical keys, reviewed counter changes, salt and paused contribution settings; SQLite quick checks pass. Normal relaunch is observed; stable `1026` installation remains a separate gate |
-| Public service | Health HTTP 200 at 2026-09-05 04:26 UTC; unchanged source `b4c8f103bf697fb530434e6de196f2c187645661`. The approved apply completed `0042`, then `0043` failed and rolled back. Read-only checks confirm primary prefix 42, absent `0043` additions and unchanged 3,192,817-record count. Recovery bookmarks are retained; repaired `0043`–`0045` and Worker deployment remain pending. Consent and v1.1 activation are unchanged |
+| Public service | Health HTTP 200 at 2026-09-05 05:13 UTC, source `b4c8f103bf697fb530434e6de196f2c187645661`; no Worker deployment has occurred. Repaired `0043` applied, then `0044` was rejected and its additions are absent. Exact primary prefix 43 and unchanged controls/consent are verified. The 200-record count decrease needs explanation before further production mutation. Recovery bookmarks are retained; no v1.1 activation operation has been performed |
 | Public updater | Stable `0.1.16`; read-only feed check recorded 2026-09-03 in the release plan |
 | Published release | Immutable GitHub `v0.1.17`, published 2026-09-03 at 19:47:43 UTC; ARM DMG, appcast, manifest, checksums and verification guide; exact source tag commit `aa660b24a66196155ba59267ab832cc4ef6e1c7d` |
 
