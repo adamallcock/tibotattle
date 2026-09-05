@@ -5672,6 +5672,76 @@ function normalizeWeeklyPaceForecast(value) {
   };
 }
 
+// The companion owns pace classification and geometry. Retain its newer
+// native-menu-bar DTO without recalculating a second forecast in the browser.
+function normalizeWeeklyPaceOutlook(value) {
+  const rateKeys = ["activePercentagePointsPerHour", "overallPercentagePointsPerHour",
+    "headlinePercentagePointsPerHour", "sustainablePercentagePointsPerHour", "ratio"];
+  const projectionKeys = ["hoursToReset", "coveredHours", "dryHours", "sparePercent", "projectedExhaustionAt"];
+  const trackKeys = ["coveredFraction", "activeExhaustionFraction"];
+  if (!hasExactKeys(value, ["schemaVersion", "status", "standing", "critical", "earlyEstimate",
+    "remainingPercent", "resetsAt", "observationCount", "elapsedHours", "rates", "projection", "track"])
+      || value.schemaVersion !== "local-weekly-pace-outlook-v0.1"
+      || !["unavailable", "collecting", "available"].includes(value.status)
+      || typeof value.critical !== "boolean" || typeof value.earlyEstimate !== "boolean"
+      || !Number.isSafeInteger(value.observationCount)
+      || value.observationCount < 0 || value.observationCount > 8_192
+      || !hasExactKeys(value.rates, rateKeys)
+      || !hasExactKeys(value.projection, projectionKeys)
+      || !hasExactKeys(value.track, trackKeys)) return null;
+  const remainingPercent = weeklyPaceNumber(value.remainingPercent, { minimum: 0, maximum: 100 });
+  const elapsedHours = weeklyPaceNumber(value.elapsedHours, { minimum: 0 });
+  const resetsAt = value.resetsAt === null ? null : canonicalInstant(value.resetsAt);
+  const projectedExhaustionAt = value.projection.projectedExhaustionAt === null
+    ? null : canonicalInstant(value.projection.projectedExhaustionAt);
+  const rates = Object.fromEntries(rateKeys.map((key) => [key, weeklyPaceNumber(value.rates[key], {
+    minimum: 0, maximum: key === "ratio" || key === "sustainablePercentagePointsPerHour" ? Infinity : 100,
+  })]));
+  const projection = Object.fromEntries(projectionKeys.slice(0, -1).map((key) => [key,
+    weeklyPaceNumber(value.projection[key], { minimum: 0, maximum: key === "sparePercent" ? 100 : Infinity })]));
+  projection.projectedExhaustionAt = projectedExhaustionAt;
+  const track = Object.fromEntries(trackKeys.map((key) => [key,
+    weeklyPaceNumber(value.track[key], { minimum: 0, maximum: 1 })]));
+  const numbers = [remainingPercent, elapsedHours, ...Object.values(rates),
+    ...Object.values(projection), ...Object.values(track)];
+  if (numbers.includes(undefined)
+      || (value.resetsAt !== null && resetsAt === null)
+      || (value.projection.projectedExhaustionAt !== null && projectedExhaustionAt === null)) return null;
+  if (value.status === "unavailable") {
+    if (value.standing !== null || value.critical || value.earlyEstimate
+        || value.observationCount !== 0 || resetsAt !== null
+        || numbers.some((number) => number !== null)) return null;
+  } else {
+    if (remainingPercent === null || resetsAt === null || elapsedHours === null
+        || !(projection.hoursToReset > 0)) return null;
+    if (value.status === "collecting") {
+      if (value.standing !== null || value.critical || value.earlyEstimate
+          || value.observationCount !== 1
+          || [...Object.values(rates), ...Object.values(track), projection.coveredHours,
+            projection.dryHours, projection.sparePercent, projectedExhaustionAt]
+            .some((number) => number !== null)) return null;
+    } else {
+      if (!["under", "on", "over"].includes(value.standing)
+          || value.observationCount < 2 || !(elapsedHours > 0) || !(remainingPercent > 0)
+          || !(rates.headlinePercentagePointsPerHour > 0)
+          || !(rates.sustainablePercentagePointsPerHour > 0) || !(rates.ratio > 0)
+          || rates.headlinePercentagePointsPerHour
+            !== (rates.overallPercentagePointsPerHour ?? rates.activePercentagePointsPerHour)
+          || projection.coveredHours === null || projection.dryHours === null
+          || projection.sparePercent === null || track.coveredFraction === null
+          || (value.critical && value.standing !== "over")
+          || (value.standing === "over"
+            ? projectedExhaustionAt === null || Date.parse(projectedExhaustionAt) >= Date.parse(resetsAt)
+            : projectedExhaustionAt !== null)) return null;
+    }
+  }
+  return {
+    schemaVersion: value.schemaVersion, status: value.status, standing: value.standing,
+    critical: value.critical, earlyEstimate: value.earlyEstimate, remainingPercent,
+    resetsAt, observationCount: value.observationCount, elapsedHours, rates, projection, track,
+  };
+}
+
 function normalizeWeeklyPlanAttribution(value) {
   if (value?.methodVersion !== "plan-era-v1"
       || value?.status !== "historical_plan_conditional"
@@ -5740,6 +5810,7 @@ function normalizeWeeklyPopulation(envelope = {}) {
     dataClass: text(envelope?.dataClass, ""),
     stale: normalizeStaleProvenance(envelope?.stale),
     paceForecast: normalizeWeeklyPaceForecast(envelope?.paceForecast),
+    paceOutlook: normalizeWeeklyPaceOutlook(envelope?.paceOutlook),
     accountAttribution: {
       status: text(envelope?.accountAttribution?.status, ""),
       maySpanMultipleAccounts:
@@ -5824,6 +5895,7 @@ export function selectAllowancePlanPopulation(data, requestedPlanType = null) {
       planPopulations: populations,
       stale: weekly.stale,
       paceForecast: isCurrentPlan ? weekly.paceForecast : null,
+      paceOutlook: isCurrentPlan ? weekly.paceOutlook : null,
     },
     quotaWindows: isCurrentPlan
       ? array(root.quotaWindows).filter((window) => window.planType === selectedPlanType)
