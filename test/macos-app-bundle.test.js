@@ -7269,16 +7269,19 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
   assert.deepEqual(MACOS_WEB_MODULE_ENTRYPOINTS, [
     "apps/web/public/app.js",
     "apps/web/public/desktop-shell.js",
+    "apps/web/public/electron-tray-popup.js",
     "apps/web/public/electron-settings.js",
   ]);
-  // Shared dashboard/settings entries plus their dependencies. The Electron
-  // bridge is inert without its preload; the community entry stays website-only.
+  // Shared dashboard, tray-popup, and settings entries plus their
+  // dependencies. The Electron bridge is inert without its preload; the
+  // community entry stays website-only.
   assert.deepEqual(webModules.relativeFiles, [
     "apps/web/public/app.js",
     "apps/web/public/community-data.js",
     "apps/web/public/data-client.js",
     "apps/web/public/desktop-shell.js",
     "apps/web/public/electron-settings.js",
+    "apps/web/public/electron-tray-popup.js",
     "apps/web/public/i18n.generated.js",
     "apps/web/public/install-cta.js",
     "apps/web/public/lib.js",
@@ -7322,6 +7325,9 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/electron-settings.css",
     "apps/web/public/electron-settings.html",
     "apps/web/public/electron-settings.js",
+    "apps/web/public/electron-tray-popup.css",
+    "apps/web/public/electron-tray-popup.html",
+    "apps/web/public/electron-tray-popup.js",
     "apps/web/public/i18n.generated.js",
     "apps/web/public/icon-panel-left.svg",
     "apps/web/public/icon-refresh-cw.svg",
