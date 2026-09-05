@@ -220,13 +220,17 @@ exact replay and branch observation supply the acceptance proof.
 
 The v13 rehearsal remains preservation/diagnostic evidence, not RC3 qualification.
 Fresh synthetic and copy-only v14 evidence now close their respective source and
-real-state semantics gates. Fresh full R7 evidence remains required before
-signing or installed replacement.
+real-state semantics gates. Fresh full R7 regeneration subsequently completed
+on `38aaeef4`: all ten receipts validate and reconstruct on both pinned runtimes.
+Its unchanged open resource decisions, original aborted run and measurement
+limitations remain explicit in the [preparation plan](../plans/2026-09-04-release-0-1-18-publication-preparation.md).
+The complete root-suite rerun remains required before signing or replacement.
 
 ## Remaining work
 
-- Regenerate and verify all ten R7 receipts on the corrected source, then rerun
-  the full root suite without excluding stale-evidence tests.
+- Complete the full root-suite rerun after the verified R7 generation and the
+  exact export/inventory corrections, without test exclusions or new skips.
+  Existing native-Windows checks cannot be qualified on this Mac.
 - Build and verify fresh signed ARM/Intel RC3 `1025.2` on a common new clean
   annotated source tag. Keep RC2 `1025.1` unchanged; stable remains `1026`.
 - Perform the authorized installed ARM transition after the completed copy-only

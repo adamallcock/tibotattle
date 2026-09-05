@@ -119,6 +119,28 @@ accepted, following links, retrying a refused sample or changing measurements.
 All 97 filesystem/schema/synthetic-evidence tests pass on each pinned runtime,
 including deterministic refusal precedence, redaction and unchanged accepted
 one/two-link observations. Documentation and the 20-test preflight also pass.
+The complete generation on clean `38aaeef4` then completed in 31.2 minutes,
+including 25.0 minutes of real-history work, and installed all ten validated
+receipts. Freshness and exact decision reconstruction pass 2/2 on each pinned
+runtime. Independent review confirms all runtime/source bindings and sixteen
+decision input links, with unchanged outcomes, preservation, privacy and gates.
+Claude's frozen source prefixes grew by 498,628 bytes; source counts, output
+record counts and decoded sizes are unchanged. Three synthetic operations
+record one failed RSS sample each, without a failed operation or resource gate.
+Both decisions remain `release_open`: nineteen unresolved resource decisions
+and seven open promotion gates are not relabeled, and network absence is not
+measured. The original aborted run's cause remains unproven.
+
+The first complete root run recorded 3,854 passes, five failures and seventeen
+existing native-Windows skips. Three failures came from the launcher's `077`
+umask masking deliberately unsafe fixture modes; the permission guards are
+unchanged. Two real bookkeeping omissions are corrected: the reviewed client
+export now includes the Login Item release-validation CLI, and the tool
+inventory records its builder import. All 44 owning tests, architecture,
+inventory and preflight checks pass. R7 freshness remains valid because those
+edits are outside its workload closure. The failed full-run log is retained;
+the complete rerun uses `022` only in the test child while keeping its outer
+log redirection owner-private. No test exclusions or new skips are introduced.
 No RC3 DMG has been created yet.
 Publication remains held. Signing-key prompt approval, changes to
 real credential protection, physical/manual proof and external deployment are
