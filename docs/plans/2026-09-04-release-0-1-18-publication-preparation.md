@@ -141,6 +141,12 @@ inventory and preflight checks pass. R7 freshness remains valid because those
 edits are outside its workload closure. The failed full-run log is retained;
 the complete rerun uses `022` only in the test child while keeping its outer
 log redirection owner-private. No test exclusions or new skips are introduced.
+The complete rerun on clean `3a785e6d` passes: 3,859 tests, zero failures and
+seventeen existing native-Windows skips, in 479.3 seconds. Those skips supply no
+Windows qualification. Both pinned-runtime R7 freshness/reconstruction checks
+and documentation governance also pass. RC1's four retained files and both RC2
+DMGs/receipts match their recorded hashes; RC2's tester files have fresh
+before-signing baselines without a claim about an unavailable earlier hash.
 No RC3 DMG has been created yet.
 Publication remains held. Signing-key prompt approval, changes to
 real credential protection, physical/manual proof and external deployment are
