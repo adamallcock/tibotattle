@@ -1,5 +1,12 @@
+import { createHash } from "node:crypto";
 import { access, lstat, realpath } from "node:fs/promises";
-import { constants as fileSystemConstants } from "node:fs";
+import {
+  closeSync,
+  constants as fileSystemConstants,
+  fstatSync,
+  openSync,
+  readSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
@@ -68,6 +75,58 @@ function safeBuildLabel(value) {
   return typeof value === "string" && /^[A-Za-z0-9._+-]{1,80}$/u.test(value)
     ? value
     : "development";
+}
+
+// The runtime manifest is already an authenticated, content-addressed record
+// of the packaged shell. Read only a small bounded manifest and label its
+// digest as content-derived so About never presents it as a source revision.
+const MAXIMUM_RUNTIME_MANIFEST_BYTES = 2 * 1024 * 1024;
+
+function packagedRuntimeContentBuild(app) {
+  if (typeof app?.getAppPath !== "function") return null;
+
+  let manifestPath;
+  try {
+    const appPath = app.getAppPath();
+    if (typeof appPath !== "string" || !isAbsolute(appPath)) return null;
+    manifestPath = join(resolve(appPath), "electron-runtime-manifest.json");
+  } catch {
+    return null;
+  }
+
+  let descriptor = null;
+  try {
+    descriptor = openSync(manifestPath, fileSystemConstants.O_RDONLY ?? 0);
+    const before = fstatSync(descriptor);
+    if (!before.isFile()
+        || !Number.isSafeInteger(before.size)
+        || before.size < 1
+        || before.size > MAXIMUM_RUNTIME_MANIFEST_BYTES) {
+      return null;
+    }
+
+    const bytes = Buffer.allocUnsafe(before.size);
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const count = readSync(descriptor, bytes, offset, bytes.byteLength - offset, null);
+      if (!Number.isInteger(count) || count < 1) return null;
+      offset += count;
+    }
+    const after = fstatSync(descriptor);
+    if (!after.isFile() || after.size !== before.size) return null;
+    return `content-${createHash("sha256").update(bytes).digest("hex").slice(0, 12)}`;
+  } catch {
+    return null;
+  } finally {
+    if (descriptor !== null) {
+      try {
+        closeSync(descriptor);
+      } catch {
+        // The About surface is best effort; a close failure must not prevent
+        // the shell from starting or hide the remaining settings controls.
+      }
+    }
+  }
 }
 
 function assertDialog(dialog) {
@@ -296,7 +355,10 @@ export function createDesktopPlatformServices({
     const version = typeof app.getVersion === "function"
       ? safeBuildLabel(app.getVersion())
       : "unknown";
-    const build = safeBuildLabel(environment.TIBOTATTLE_BUILD_ID);
+    const configuredBuild = environment?.TIBOTATTLE_BUILD_ID;
+    const build = typeof configuredBuild === "string" && configuredBuild.length > 0
+      ? safeBuildLabel(configuredBuild)
+      : packagedRuntimeContentBuild(app) ?? "development";
     return Object.freeze({
       version,
       build,

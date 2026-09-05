@@ -428,14 +428,23 @@ test("rejects CommonJS production modules instead of missing literal, computed, 
 });
 
 test("allows only the exact sandboxed Electron preload shape", async () => {
+  const exactPreloadSource = [
+    'const { contextBridge, ipcRenderer } = require("electron");',
+    "contextBridge.exposeInMainWorld('bounded', { invoke: () => ipcRenderer.invoke('fixed') });",
+    "",
+  ].join("\n");
   await withFixtureTree(
-    {
-      "apps/electron/preload.cjs": [
-        'const { contextBridge, ipcRenderer } = require("electron");',
-        "contextBridge.exposeInMainWorld('bounded', { invoke: () => ipcRenderer.invoke('fixed') });",
-        "",
-      ].join("\n"),
+    { "apps/electron/preload.cjs": exactPreloadSource },
+    async (rootDirectory) => {
+      const result = await checkArchitectureBoundaries({
+        baseline: [],
+        rootDirectory,
+      });
+      assert.equal(result.ok, true, formatArchitectureBoundaryReport(result));
     },
+  );
+  await withFixtureTree(
+    { "apps/electron/tray-popover-preload.cjs": exactPreloadSource },
     async (rootDirectory) => {
       const result = await checkArchitectureBoundaries({
         baseline: [],

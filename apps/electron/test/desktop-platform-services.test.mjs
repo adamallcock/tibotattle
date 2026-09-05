@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 
@@ -140,6 +143,60 @@ test("platform services use only native-picker paths and fixed open targets", as
   assert.equal(dialogOptions.at(-1).title, "Elegir carpeta de Codex");
   assert.equal(dialogOptions.at(-1).buttonLabel, "Usar esta carpeta");
   assert.throws(() => services.setLocale("file:///tmp/not-a-language"), /locale is invalid/u);
+});
+
+test("About identifies packaged runtime content when no explicit build label exists", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-about-runtime-"));
+  const manifest = Buffer.from("{\"schemaVersion\":\"usage-monitor-electron-runtime-v0.1\"}\n");
+  const environment = {};
+  try {
+    await writeFile(join(root, "electron-runtime-manifest.json"), manifest);
+    const services = createDesktopPlatformServices({
+      app: {
+        isPackaged: true,
+        getVersion: () => "0.1.18",
+        getAppPath: () => root,
+      },
+      platform: "darwin",
+      homeDirectory: "/Users/adam",
+      environment,
+      dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) },
+      shell: { openExternal: async () => {} },
+      Notification: { isSupported: () => false },
+    });
+    const expected = `content-${createHash("sha256").update(manifest).digest("hex").slice(0, 12)}`;
+    assert.equal(services.about().build, expected);
+    environment.TIBOTATTLE_BUILD_ID = "fixture-build";
+    assert.equal(services.about().build, "fixture-build");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("About refuses to hash an oversized runtime manifest", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-about-runtime-limit-"));
+  try {
+    await writeFile(
+      join(root, "electron-runtime-manifest.json"),
+      Buffer.alloc(2 * 1024 * 1024 + 1, 0x78),
+    );
+    const services = createDesktopPlatformServices({
+      app: {
+        isPackaged: true,
+        getVersion: () => "0.1.18",
+        getAppPath: () => root,
+      },
+      platform: "darwin",
+      homeDirectory: "/Users/adam",
+      environment: {},
+      dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) },
+      shell: { openExternal: async () => {} },
+      Notification: { isSupported: () => false },
+    });
+    assert.equal(services.about().build, "development");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("login-item state is reread and requires exact confirmation", () => {

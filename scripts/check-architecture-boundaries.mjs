@@ -39,6 +39,7 @@ const COMMONJS_SOURCE_EXTENSIONS = new Set([".cjs", ".cts"]);
 const REVIEWED_SANDBOXED_PRELOADS = new Map([
   ["apps/electron/preload.cjs", "electron"],
   ["apps/electron/recovery-preload.cjs", "electron"],
+  ["apps/electron/tray-popover-preload.cjs", "electron"],
 ]);
 const REVIEWED_SANDBOXED_PRELOAD_DECLARATION_PATTERN =
   /^const\s*\{\s*contextBridge\s*,\s*ipcRenderer\s*\}\s*=\s*require\(\s*["']electron["']\s*\)\s*;\s*/u;
