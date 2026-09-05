@@ -246,8 +246,10 @@ Host HOME was preserved; this is not whole-process Keychain isolation.
 
 One development packager now handles all four target tuples, with explicit
 platform/architecture artifact names, clean-commit provenance, complete ASAR
-and native-executable checks, bounded logs and SHA-256 receipts. The manual
-native-runner workflow uses the same command and pinned dependencies. It has no
+and native-executable checks, bounded logs and SHA-256 receipts. The
+native-runner workflow uses the same command and pinned dependencies, with
+manual dispatch and a push trigger restricted to the approved integration
+branch. It has no
 signing or publication authority. Windows builds its security binding from the
 current source on the Windows runner; a retained older binary cannot substitute
 for that build.
@@ -273,13 +275,27 @@ private copies. The launch command must bind the selected app to its exact
 ASAR digest and keep hosted contribution unavailable.
 
 Current validation includes 546/546 Worker Vitest tests, 59/59 migration and
-staging contract tests, 426/426 Electron/local tests before the final runtime
-repairs, 78/78 release trust checks and 20/20 preflight tests. Focused runtime,
-parser-v14 and final package results belong in the candidate's retained
-receipts. The last complete root run had 4,041 tests, with five failures: two
-source inventory/API documentation omissions were repaired and rechecked,
-one tool inventory entry was concurrent work, and the two historical R7
-provenance checks remain unqualified. No historical receipt was rewritten.
+staging contract tests, 934/934 Electron/web/local tests after the refresh
+cadence repair, 195/195 parser-v14 integration tests, 78/78 release trust
+checks and 20/20 preflight tests. The latest complete root run had 4,081 tests:
+4,057 passed, 20 skipped and four failed. Two concurrent inventory/caller
+omissions were subsequently repaired and passed their focused checks; the two
+historical R7 provenance checks remain unqualified. No historical receipt was
+rewritten and this is not a green complete-root claim.
+
+The `a6226a4b` snapshot produced verified Mac arm64, Mac x64 and Linux x64
+development distributions with complete hashed testing handoffs. A subsequent
+native CI run at `daaff299` is in progress. The first manual dispatch failed
+because the workflow was absent from the default branch; the approved branch
+push now runs the four native jobs without a merge or release.
+
+The owner-reported missing cache views and broken tray remain active acceptance
+items. Process inspection found the owner was running the older `18b8de56`
+app. Its cache reuse plot was visibly populated, but this alone does not prove
+parity with the latest cache details. The current tray also needs an actual
+image-format repair and enhanced allowance presentation. A final candidate
+must include these changes, expose its build identity and pass rendered checks;
+source freshness and module-presence tests cannot substitute for that proof.
 
 Remaining release gates are explicit: exact Windows distributions, rendered
 final Mac inspection, physical target runtime checks, production signing,
@@ -292,7 +308,9 @@ Rendered notice and Settings captures plus the content-free runtime and
 artifact receipts are retained under the ignored
 `.release-build/electron-sharing-qa-viewport-final/evidence/` directory.
 
-The final artifact was rebuilt from `b4314a1bcbd97c1663f17ddda23610b8366a1c26`.
+The earlier sharing-policy artifact was rebuilt from
+`b4314a1bcbd97c1663f17ddda23610b8366a1c26`; it is not the current convergence
+candidate.
 Its raw ASAR SHA-256 is
 `678f0658d098626d51d530b160d392f8993b78a7104df51fcf8d7a24eb307142`.
 The direct verifier matched all 466 staged and packaged files, including the
