@@ -248,6 +248,47 @@ test("controller initializes persisted cadence and projects truthful settings st
   assert.deepEqual(value.commands, [{ command: "automaticRefresh", mode: "quick" }]);
 });
 
+test("controller opens the fixed Community dashboard section without changing settings", async () => {
+  const navigations = [];
+  const value = fixture({
+    lifecycleOverrides: {
+      navigateDashboardSection(section) {
+        navigations.push(section);
+        return true;
+      },
+    },
+  });
+  await value.controller.initialize();
+  const persistedBefore = value.persisted;
+  assert.equal(await value.controller.handlers.openCommunity({}), true);
+  assert.deepEqual(navigations, ["community"]);
+  assert.equal(value.persisted, persistedBefore);
+});
+
+test("controller fails closed when Community navigation is unavailable", async () => {
+  const value = fixture();
+  await value.controller.initialize();
+  await assert.rejects(
+    value.controller.handlers.openCommunity({}),
+    (error) => error?.code === "desktop_community_unavailable",
+  );
+});
+
+test("controller fails closed when Community navigation is rejected", async () => {
+  const value = fixture({
+    lifecycleOverrides: {
+      navigateDashboardSection() {
+        return false;
+      },
+    },
+  });
+  await value.controller.initialize();
+  await assert.rejects(
+    value.controller.handlers.openCommunity({}),
+    (error) => error?.code === "desktop_community_unavailable",
+  );
+});
+
 test("controller implements every bounded bridge action and desktop command", async () => {
   const value = fixture();
   await value.controller.initialize();

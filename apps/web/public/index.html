@@ -1058,7 +1058,12 @@
           </div>
           <p id="electron-accountless-community-state" class="annotation" role="status" aria-live="polite" data-i18n="electron.sharing.state.unavailable">Community sharing preference unavailable; nothing will be shared.</p>
           <p id="electron-accountless-community-transport" class="annotation" role="status" aria-live="polite" data-i18n="electron.sharing.transport.unavailable">Uploads are not available in this build.</p>
-          <button class="button button-secondary" id="electron-accountless-open-settings" type="button" data-i18n="electron.sharing.community.openSettings">Open sharing settings</button>
+          <p id="electron-accountless-sharing-description" class="annotation" data-i18n="electron.settings.sharing.description">Choose whether this installation may share content-free usage measurements. No sign-in is required. Shared measurements may include token counts, model labels, quota measurements, and pseudonymous continuity identifiers. Prompts, responses, credentials, private paths, and raw account identifiers stay on this device.</p>
+          <label class="electron-accountless-sharing-control">
+            <input id="electron-accountless-sharing-enabled" type="checkbox" role="switch" disabled aria-describedby="electron-accountless-sharing-description electron-accountless-community-state electron-accountless-community-transport electron-accountless-sharing-error">
+            <span data-i18n="electron.settings.sharing.label">Share usage measurements</span>
+          </label>
+          <p id="electron-accountless-sharing-error" class="annotation" role="status" aria-live="polite" hidden data-i18n="electron.sharing.notice.error">This sharing choice was not confirmed. Try again.</p>
         </section>
         <!--
           The guided journey, stated as stages with visible state, rendered

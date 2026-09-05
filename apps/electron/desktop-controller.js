@@ -1079,6 +1079,16 @@ export function createDesktopController({
       lifecycle().showSettingsWindow?.("general");
       return snapshot();
     },
+    async openCommunity() {
+      const selected = lifecycle();
+      if (typeof selected.navigateDashboardSection !== "function") {
+        throw controllerError("desktop_community_unavailable");
+      }
+      if (selected.navigateDashboardSection("community") !== true) {
+        throw controllerError("desktop_community_unavailable");
+      }
+      return true;
+    },
     async toggleSidebar() {
       return toggleSidebar();
     },

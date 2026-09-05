@@ -94,8 +94,10 @@ test("desktop command bridge navigates the dashboard through the fixed section m
   assert.equal(windowRef.location.hash, "#timeline");
   commandListeners[0]({ command: "dashboardSection", section: "accounting" });
   assert.equal(windowRef.location.hash, "#accounting");
+  commandListeners[0]({ command: "dashboardSection", section: "community" });
+  assert.equal(windowRef.location.hash, "#community");
   commandListeners[0]({ command: "dashboardSection", section: "weekly", path: "/private/secret" });
-  assert.equal(windowRef.location.hash, "#accounting");
+  assert.equal(windowRef.location.hash, "#community");
 
   mounted.teardown();
   await Promise.resolve();

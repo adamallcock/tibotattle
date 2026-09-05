@@ -479,6 +479,25 @@ test("runtime accepts Codex handoff only from the ready dashboard main frame", a
     (error) => error?.code === "desktop_ipc_invalid_request",
   );
   assert.deepEqual(opened, [canonical]);
+  assert.equal(
+    await ipcMain.handler(event, { action: "openCommunity", args: {} }),
+    true,
+  );
+  assert.deepEqual(dashboard.webContents.commands.at(-1), {
+    channel: "tibotattle:desktop-command:v1",
+    value: { command: "dashboardSection", section: "community" },
+  });
+  await assert.rejects(
+    ipcMain.handler(
+      { sender: dashboard.webContents, senderFrame: {} },
+      { action: "openCommunity", args: {} },
+    ),
+    (error) => error?.code === "desktop_ipc_untrusted_context",
+  );
+  await assert.rejects(
+    ipcMain.handler(event, { action: "openCommunity", args: { extra: true } }),
+    (error) => error?.code === "desktop_ipc_invalid_request",
+  );
   await desktop.lifecycle.dispose();
 });
 

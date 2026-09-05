@@ -320,6 +320,7 @@ html.native-dashboard #setup-card,
 body.native-dashboard #setup-card { display: none !important; }
 .top-actions { display: flex; flex: 0 1 auto; align-items: center; justify-content: flex-end; gap: .55rem; }
 .language-picker { display: inline-flex; align-items: center; }
+.electron-dashboard .topbar .language-picker { display: none; }
 .language-picker select {
   min-height: 37px;
   max-width: 10.5rem;
@@ -4794,3 +4795,20 @@ html[data-theme="dark"] .noscript {
 #attribution-consent { margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--line); }
 #attribution-review-inventory dd { margin: .25rem 0 1rem; overflow-wrap: anywhere; }
 #attribution-review-contract { overflow-wrap: anywhere; }
+
+.electron-accountless-sharing-control {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 44px;
+  padding: var(--space-2) 0;
+  color: var(--ink);
+  font-weight: var(--weight-semibold);
+  cursor: pointer;
+}
+.electron-accountless-sharing-control input {
+  width: 20px;
+  height: 20px;
+  accent-color: var(--green);
+  flex: 0 0 auto;
+}

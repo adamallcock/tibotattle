@@ -125,6 +125,21 @@ missing/inaccessible parent, and unchanged ordinary thread links. Preserve
 the existing local-only title/link privacy boundary. No runtime change or
 candidate rebuild is part of recording this follow-up.
 
+### Settings and sharing navigation refinement
+
+Owner-directed Settings refinement: General contains language, appearance and
+startup; Data & privacy contains the Codex folder, refresh cadence, sharing
+status and local tools; Notifications and About remain separate. The About
+icon and build identity form one aligned group. Language selection is available
+in Settings General and removed from the Electron dashboard header.
+
+Community is the primary sharing control surface, using the existing saved
+installation preference and persistent opt-out. Settings shows that preference
+and a fixed **Manage sharing** action opening Community; it refreshes its status
+when focus returns. This UI organization does not activate hosted uploads.
+Qualification must cover all four Settings tabs, keyboard navigation, narrow
+layouts and the packaged Settings-to-Community-to-Settings persistence flow.
+
 ### Work estimate and first implementation tranche
 
 Initial estimate: **12–25 focused engineering days**, with parallel work

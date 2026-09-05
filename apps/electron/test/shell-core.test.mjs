@@ -1725,6 +1725,18 @@ test("desktop lifecycle composes secure window, tray, single instance, retry, an
   assert.equal(windows.length, 4);
   const secondDashboard = dashboardWindowsForTest(windows)[1];
   assert.deepEqual(secondDashboard.loaded, ["http://127.0.0.1:4002/"]);
+  assert.equal(lifecycle.showSettingsWindow(), true);
+  const settings = windows.at(-1);
+  settings.emit("ready-to-show");
+  assert.equal(settings.visible, true);
+  assert.equal(lifecycle.navigateDashboardSection("community"), true);
+  assert.equal(secondDashboard.visible, true);
+  assert.equal(settings.visible, false);
+  assert.deepEqual(secondDashboard.webContents.sent.at(-1), {
+    channel: "tibotattle:desktop-command:v1",
+    command: { command: "dashboardSection", section: "community" },
+  });
+  assert.equal(lifecycle.navigateDashboardSection("https://evil.example"), false);
   await lifecycle.requestQuit();
   assert.equal(supervisor.stops, 2);
   assert.equal(app.quitCalls, 1);
@@ -2468,6 +2480,13 @@ test("desktop lifecycle owns a bounded Settings window and authorizes only its t
     "http://127.0.0.1:4701/electron-settings.html#about",
   ]);
   assert.equal(settings.visible, true);
+  assert.equal(lifecycle.showSettingsWindow("data"), true);
+  assert.deepEqual(settings.loaded, [
+    "http://127.0.0.1:4701/electron-settings.html#general",
+    "http://127.0.0.1:4701/electron-settings.html#about",
+    "http://127.0.0.1:4701/electron-settings.html#data",
+  ]);
+  assert.equal(settings.visible, true);
   assert.throws(
     () => lifecycle.showSettingsWindow("unsupported"),
     /settings section is invalid/u,
@@ -3078,6 +3097,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     "sharingNoticePresented",
     "getCodexHomesForSettings",
     "openSettings",
+    "openCommunity",
     "toggleSidebar",
     "chooseCodexHome",
     "addCodexHome",
@@ -3114,6 +3134,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   commandListener({}, { command: "dashboardSection", section: "weekly" });
   commandListener({}, { command: "dashboardSection", section: "timeline" });
   commandListener({}, { command: "dashboardSection", section: "accounting" });
+  commandListener({}, { command: "dashboardSection", section: "community" });
   commandListener({}, { command: "language", value: "es" });
   commandListener({}, { command: "sidebar", collapsed: true });
   commandListener({}, { command: "hostedSignInReturn" });
@@ -3138,6 +3159,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     { command: "dashboardSection", section: "weekly" },
     { command: "dashboardSection", section: "timeline" },
     { command: "dashboardSection", section: "accounting" },
+    { command: "dashboardSection", section: "community" },
     { command: "language", value: "es" },
     { command: "sidebar", collapsed: true },
     { command: "hostedSignInReturn" },
@@ -3152,6 +3174,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   await bridge.sharingNoticePresented(1);
   await bridge.getCodexHomesForSettings();
   await bridge.openSettings();
+  await bridge.openCommunity();
   await bridge.toggleSidebar();
   await bridge.chooseCodexHome();
   await bridge.addCodexHome();
@@ -3189,6 +3212,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     { channel: "tibotattle:desktop:v1", request: { action: "sharingNoticePresented", args: { index: 1 } } },
     { channel: "tibotattle:desktop:v1", request: { action: "getCodexHomesForSettings", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "openSettings", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "openCommunity", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "toggleSidebar", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "chooseCodexHome", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "addCodexHome", args: {} } },
@@ -3289,6 +3313,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     ),
     () => bridge.revealLatestDownload("extra"),
     () => bridge.openDashboardInBrowser("extra"),
+    () => bridge.openCommunity("extra"),
     () => bridge.showDiagnostics("extra"),
     () => bridge.revealLocalData("extra"),
     () => bridge.refreshStarted("extra"),

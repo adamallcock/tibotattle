@@ -1351,6 +1351,8 @@ async function assertDashboardShell(cdp) {
         ".dashboard-section[data-dashboard-page]:not(.dashboard-page-inactive)",
       ).length,
       refresh: Boolean(document.querySelector("#refresh-button")),
+      headerLanguagePickerPresent: document.querySelector(".topbar .language-picker") !== null,
+      headerLanguagePickerHidden: !visible(document.querySelector(".topbar .language-picker")),
       shareLauncherAvailable: visible(document.querySelector("#electron-share-button")),
       settings: Boolean(document.querySelector("#electron-settings-button")),
     };
@@ -1361,6 +1363,8 @@ async function assertDashboardShell(cdp) {
       || snapshot?.activeLinkCount !== 1
       || snapshot?.activePageCount !== 1
       || snapshot?.refresh !== true
+      || snapshot?.headerLanguagePickerPresent !== true
+      || snapshot?.headerLanguagePickerHidden !== true
       || snapshot?.shareLauncherAvailable !== true
       || snapshot?.settings !== true) {
     fail("ELECTRON_MACOS_SMOKE_DASHBOARD_CHROME_INVALID", "dashboard");
@@ -1429,7 +1433,8 @@ function communityParitySnapshotValid(snapshot, health, { requirePartialDetail =
       && snapshot.accountlessPreferenceReady === true
       && snapshot.accountlessState === true
       && snapshot.accountlessTransport === true
-      && snapshot.sharingSettingsEnabled === true
+      && snapshot.sharingToggleEnabled === true
+      && snapshot.sharingDescriptionComplete === true
       && snapshot.legacyJourneyVisible === false
       && snapshot.googleButton === false
       && snapshot.appleButton === false
@@ -1589,7 +1594,9 @@ async function assertDashboardParitySurfaces(cdp, health, startupRefresh = {}) {
       const preference = accountlessMode ? await bridge.getSharingPreference() : null;
       const sharingState = document.querySelector('#electron-accountless-community-state');
       const transport = document.querySelector('#electron-accountless-community-transport');
-      const settings = document.querySelector('#electron-accountless-open-settings');
+      const sharingToggle = document.querySelector('#electron-accountless-sharing-enabled');
+      const sharingDescription = document.querySelector('#electron-accountless-sharing-description');
+      const sharingDescriptionText = sharingDescription?.textContent?.trim() ?? '';
       return {
         route: location.hash,
         pageVisible: visible(page) && page?.inert !== true,
@@ -1602,7 +1609,13 @@ async function assertDashboardParitySurfaces(cdp, health, startupRefresh = {}) {
         accountlessTransport: visible(transport)
           && ['off', 'unavailable'].includes(preference?.transportStatus)
           && /uploads are not available|sharing is off/iu.test(transport?.textContent ?? ''),
-        sharingSettingsEnabled: visible(settings) && settings.disabled !== true,
+        sharingToggleEnabled: visible(sharingToggle)
+          && sharingToggle.disabled !== true
+          && sharingToggle.getAttribute("role") === "switch",
+        sharingDescriptionComplete: visible(sharingDescription)
+          && sharingDescriptionText.length >= 80
+          && /prompts|responses/iu.test(sharingDescriptionText)
+          && /credentials|private/iu.test(sharingDescriptionText),
         legacyJourneyVisible: visible(document.querySelector('#community-journey')),
         journeyStageCount: document.querySelectorAll('#community-journey .journey-stage').length,
         indexTerminal: document.querySelector('#journey-stage-index')
@@ -1681,7 +1694,8 @@ async function assertDashboardParitySurfaces(cdp, health, startupRefresh = {}) {
       currentLayout: community.accountlessMode === true ? community.accountlessPanel : community.currentLayout,
       providerControls: community.googleButton === true && community.appleButton === true,
       accountlessControls: community.accountlessMode === true
-        && community.sharingSettingsEnabled === true
+        && community.sharingToggleEnabled === true
+        && community.sharingDescriptionComplete === true
         && community.accountlessPreferenceReady === true,
       transportUnavailable: community.accountlessMode === true && community.accountlessTransport === true,
       indexTerminal: community.accountlessMode !== true && community.indexTerminal === true,
@@ -2009,45 +2023,96 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath) {
       const snapshot = await settingsCdp.evaluate(`(() => {
       const status = document.querySelector("#settings-bridge-status");
       const tabs = [...document.querySelectorAll("[data-settings-tab]")];
+      const panels = [...document.querySelectorAll("[data-settings-panel]")];
       const general = document.querySelector('[data-settings-panel="general"]');
       return {
         title: document.title,
         connected: status?.classList.contains("is-ready") === true,
         tabCount: tabs.length,
+        panelCount: panels.length,
+        tabNames: tabs.map((tab) => tab.dataset.settingsTab),
         generalVisible: general?.hidden === false,
+        generalLanguageVisible: ${visible.toString()}(document.querySelector("#settings-language")),
+        generalLanguageEnabled: document.querySelector("#settings-language")?.disabled === false,
       };
     })()`);
       return snapshot?.title === "TiboTattle Settings"
         && snapshot?.connected === true
-        && snapshot?.tabCount === 3
+        && snapshot?.tabCount === 4
+        && snapshot?.panelCount === 4
+        && JSON.stringify(snapshot?.tabNames) === JSON.stringify(["general", "data", "notifications", "about"])
         && snapshot?.generalVisible === true
+        && snapshot?.generalLanguageVisible === true
+        && snapshot?.generalLanguageEnabled === true
         ? snapshot
         : null;
     }, MAX_STARTUP_MS, "Electron Settings render");
     if (state?.title !== "TiboTattle Settings"
         || state?.connected !== true
-        || state?.tabCount !== 3
-        || state?.generalVisible !== true) {
+        || state?.tabCount !== 4
+        || state?.panelCount !== 4
+        || JSON.stringify(state?.tabNames) !== JSON.stringify(["general", "data", "notifications", "about"])
+        || state?.generalVisible !== true
+        || state?.generalLanguageVisible !== true
+        || state?.generalLanguageEnabled !== true) {
       fail("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
     }
+    await settingsCdp.request("Page.navigate", {
+      url: `${dashboardOrigin}/electron-settings.html#data`,
+    });
+    const deepLinkedData = await waitFor(async () => settingsCdp.evaluate(`(() => {
+      const activeTabs = [...document.querySelectorAll('[data-settings-tab][aria-selected="true"]')];
+      const activePanels = [...document.querySelectorAll('[data-settings-panel]')]
+        .filter((panel) => panel.hidden === false);
+      return activeTabs.length === 1
+        && activeTabs[0].dataset.settingsTab === "data"
+        && activePanels.length === 1
+        && activePanels[0].dataset.settingsPanel === "data";
+    })()`), MAX_STARTUP_MS, "Electron Settings Data deep link").catch(() => false);
+    if (deepLinkedData !== true) {
+      fail("ELECTRON_MACOS_SMOKE_SETTINGS_TABS_INVALID", "settings");
+    }
     const tabs = await settingsCdp.evaluate(`(() => {
-      const notifications = document.querySelector('[data-settings-tab="notifications"]');
-      const about = document.querySelector('[data-settings-tab="about"]');
-      notifications?.click();
-      const notificationsVisible = document.querySelector(
-        '[data-settings-panel="notifications"]',
-      )?.hidden === false;
-      about?.click();
-      const aboutVisible = document.querySelector(
-        '[data-settings-panel="about"]',
-      )?.hidden === false;
-      return { notificationsVisible, aboutVisible };
+      const expected = ["general", "data", "notifications", "about"];
+      const activeState = () => {
+        const activeTabs = [...document.querySelectorAll('[data-settings-tab][aria-selected="true"]')];
+        const activePanels = [...document.querySelectorAll('[data-settings-panel]')]
+          .filter((panel) => panel.hidden === false);
+        return {
+          activeTabs: activeTabs.map((tab) => tab.dataset.settingsTab),
+          activePanels: activePanels.map((panel) => panel.dataset.settingsPanel),
+          linked: activeTabs.length === 1
+            && activePanels.length === 1
+            && activeTabs[0].getAttribute("aria-controls") === activePanels[0].id
+            && activePanels[0].getAttribute("aria-labelledby") === activeTabs[0].id,
+        };
+      };
+      const clicks = [];
+      for (const name of expected) {
+        document.querySelector('[data-settings-tab="' + name + '"]')?.click();
+        clicks.push(activeState());
+      }
+      const general = document.querySelector('[data-settings-tab="general"]');
+      general?.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+      const keyboardData = activeState();
+      const data = document.querySelector('[data-settings-tab="data"]');
+      data?.dispatchEvent(new KeyboardEvent("keydown", { key: "End", bubbles: true }));
+      const keyboardAbout = activeState();
+      return { clicks, keyboardData, keyboardAbout };
     })()`);
-    if (tabs?.notificationsVisible !== true || tabs?.aboutVisible !== true) {
+    const expectedTabState = (value, name) => value?.linked === true
+      && JSON.stringify(value.activeTabs) === JSON.stringify([name])
+      && JSON.stringify(value.activePanels) === JSON.stringify([name]);
+    if (!Array.isArray(tabs?.clicks)
+        || !["general", "data", "notifications", "about"].every(
+          (name, index) => expectedTabState(tabs.clicks[index], name),
+        )
+        || !expectedTabState(tabs?.keyboardData, "data")
+        || !expectedTabState(tabs?.keyboardAbout, "about")) {
       fail("ELECTRON_MACOS_SMOKE_SETTINGS_TABS_INVALID", "settings");
     }
     await settingsCdp.evaluate(
-      "document.querySelector('[data-settings-tab=\"general\"]')?.click(); true",
+      "document.querySelector('[data-settings-tab=\"data\"]')?.click(); true",
     );
 
     // Exercise the real renderer -> preload -> main-process settings bridge,
@@ -2136,11 +2201,182 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath) {
       fail("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
     }
 
-    // The root list lives on General. Return to that panel before collecting
+    // Sharing is deliberately read-only in Settings. The only mutation route is
+    // the canonical Community control in the dashboard. Exercise that route in
+    // the disposable fixture and keep its result out of the closed receipt.
+    await settingsCdp.evaluate(
+      "document.querySelector('[data-settings-tab=\"data\"]')?.click(); true",
+    );
+    const settingsSharingBefore = await waitFor(async () => {
+      const snapshot = await settingsCdp.evaluate(`(async () => {
+        const visible = ${visible.toString()};
+        const manage = document.querySelector("#settings-manage-sharing");
+        const state = document.querySelector("#settings-sharing-state");
+        const transport = document.querySelector("#settings-sharing-transport");
+        const preference = await globalThis.tibotattleDesktop?.getSharingPreference?.();
+        return {
+          manageVisible: visible(manage),
+          manageEnabled: manage?.disabled === false,
+          stateVisible: visible(state) && (state?.textContent?.trim() ?? "").length > 0,
+          transportVisible: visible(transport) && (transport?.textContent?.trim() ?? "").length > 0,
+          writableControlAbsent: document.querySelector("#settings-sharing-enabled") === null,
+          preference,
+        };
+      })()`);
+      return snapshot?.manageVisible === true
+        && snapshot?.manageEnabled === true
+        && snapshot?.stateVisible === true
+        && snapshot?.transportVisible === true
+        && snapshot?.writableControlAbsent === true
+        && snapshot.preference?.available === true
+        && snapshot.preference?.current === true
+        && typeof snapshot.preference?.enabled === "boolean"
+        ? snapshot
+        : null;
+    }, MAX_OPERATION_MS, "Electron Settings sharing status").catch(() => null);
+    if (settingsSharingBefore === null) {
+      fail("ELECTRON_MACOS_SMOKE_SETTINGS_SHARING_INVALID", "settings");
+    }
+    const initialSharingEnabled = settingsSharingBefore.preference.enabled;
+    const manageSharingRequested = await settingsCdp.evaluate(`(() => {
+      const button = document.querySelector("#settings-manage-sharing");
+      if (!button || button.disabled || button.hidden) return false;
+      button.click();
+      return true;
+    })()`).catch(() => false);
+    if (manageSharingRequested !== true) {
+      fail("ELECTRON_MACOS_SMOKE_SETTINGS_SHARING_INVALID", "settings");
+    }
+    const communitySharing = await waitFor(async () => {
+      const snapshot = await cdp.evaluate(`(async () => {
+        const visible = ${visible.toString()};
+        const page = document.querySelector('#community[data-dashboard-page="community"]');
+        const toggle = document.querySelector("#electron-accountless-sharing-enabled");
+        const description = document.querySelector("#electron-accountless-sharing-description");
+        const preference = await globalThis.tibotattleDesktop?.getSharingPreference?.();
+        const text = description?.textContent?.trim() ?? "";
+        return {
+          pageVisible: visible(page) && page?.inert !== true && location.hash === "#community",
+          toggleVisible: visible(toggle),
+          toggleEnabled: toggle?.disabled === false,
+          toggleRole: toggle?.getAttribute("role") === "switch",
+          descriptionVisible: visible(description),
+          descriptionComplete: text.length >= 80
+            && /prompts|responses/iu.test(text)
+            && /credentials|private/iu.test(text),
+          preference,
+        };
+      })()`);
+      return snapshot?.pageVisible === true
+        && snapshot?.toggleVisible === true
+        && snapshot?.toggleEnabled === true
+        && snapshot?.toggleRole === true
+        && snapshot?.descriptionVisible === true
+        && snapshot?.descriptionComplete === true
+        && snapshot.preference?.available === true
+        && snapshot.preference?.current === true
+        && snapshot.preference?.enabled === initialSharingEnabled
+        ? snapshot
+        : null;
+    }, MAX_OPERATION_MS, "Electron Community sharing").catch(() => null);
+    const settingsVisibilityAfterManage = await waitFor(async () => {
+      const targetAfterManage = await findSettingsTarget(port, dashboardOrigin);
+      if (targetAfterManage === undefined) return "destroyed";
+      return await settingsCdp.evaluate(
+        "document.visibilityState === 'hidden' ? 'hidden' : null",
+      ).catch(() => "destroyed");
+    }, MAX_OPERATION_MS, "Electron Settings hides for Community").catch(() => null);
+    if (communitySharing === null
+        || !["hidden", "destroyed"].includes(settingsVisibilityAfterManage)) {
+      fail("ELECTRON_MACOS_SMOKE_SETTINGS_SHARING_INVALID", "settings");
+    }
+    settingsCdp.close();
+    settingsCdp = null;
+    const syntheticSharingEnabled = !initialSharingEnabled;
+    const communityPreferencePersisted = await cdp.evaluate(`(() => {
+      const toggle = document.querySelector("#electron-accountless-sharing-enabled");
+      if (!toggle || toggle.disabled) return false;
+      toggle.click();
+      return toggle.checked === ${JSON.stringify(syntheticSharingEnabled)};
+    })()`).catch(() => false);
+    if (communityPreferencePersisted !== true) {
+      fail("ELECTRON_MACOS_SMOKE_SETTINGS_SHARING_INVALID", "settings");
+    }
+    const persistedCommunityPreference = await waitFor(async () => {
+      const snapshot = await cdp.evaluate(`(async () => {
+        const preference = await globalThis.tibotattleDesktop?.getSharingPreference?.();
+        const toggle = document.querySelector("#electron-accountless-sharing-enabled");
+        return preference?.available === true
+          && preference?.current === true
+          && preference?.enabled === ${JSON.stringify(syntheticSharingEnabled)}
+          && toggle?.checked === ${JSON.stringify(syntheticSharingEnabled)}
+          ? true
+          : null;
+      })()`);
+      return snapshot === true;
+    }, MAX_OPERATION_MS, "Electron Community sharing preference persistence").catch(() => false);
+    if (persistedCommunityPreference !== true) {
+      fail("ELECTRON_MACOS_SMOKE_SETTINGS_SHARING_INVALID", "settings");
+    }
+
+    // Reopen the read-only Settings summary through the real dashboard control
+    // and verify it reflects the Community mutation via the shared bridge.
+    await cdp.evaluate("document.querySelector('#electron-settings-button')?.click()");
+    const sharingReopenedTarget = await waitFor(
+      () => findSettingsTarget(port, dashboardOrigin),
+      MAX_STARTUP_MS,
+      "Electron Settings sharing reopen target",
+    );
+    settingsCdp = await connectCdp(sharingReopenedTarget);
+    await settingsCdp.request("Page.enable");
+    await waitFor(async () => settingsCdp.evaluate(
+      "document.visibilityState === 'visible' ? true : null",
+    ), MAX_STARTUP_MS, "Electron Settings sharing reopen").catch(() => {
+      fail("ELECTRON_MACOS_SMOKE_SETTINGS_SHARING_INVALID", "settings");
+    });
+    await settingsCdp.request("Page.navigate", {
+      url: `${dashboardOrigin}/electron-settings.html#data`,
+    });
+    const reopenedSharingStatus = await waitFor(async () => {
+      const snapshot = await settingsCdp.evaluate(`(async () => {
+        const visible = ${visible.toString()};
+        const tab = document.querySelector('[data-settings-tab="data"]');
+        const panel = document.querySelector('[data-settings-panel="data"]');
+        const manage = document.querySelector("#settings-manage-sharing");
+        const state = document.querySelector("#settings-sharing-state");
+        const transport = document.querySelector("#settings-sharing-transport");
+        const preference = await globalThis.tibotattleDesktop?.getSharingPreference?.();
+        return {
+          dataActive: tab?.getAttribute("aria-selected") === "true" && panel?.hidden === false,
+          manageVisible: visible(manage),
+          manageEnabled: manage?.disabled === false,
+          stateVisible: visible(state) && (state?.textContent?.trim() ?? "").length > 0,
+          transportVisible: visible(transport) && (transport?.textContent?.trim() ?? "").length > 0,
+          writableControlAbsent: document.querySelector("#settings-sharing-enabled") === null,
+          preference,
+        };
+      })()`);
+      return snapshot?.dataActive === true
+        && snapshot?.manageVisible === true
+        && snapshot?.manageEnabled === true
+        && snapshot?.stateVisible === true
+        && snapshot?.transportVisible === true
+        && snapshot?.writableControlAbsent === true
+        && snapshot.preference?.available === true
+        && snapshot.preference?.current === true
+        && snapshot.preference?.enabled === syntheticSharingEnabled
+        ? snapshot
+        : null;
+    }, MAX_OPERATION_MS, "Electron Settings sharing read-only status").catch(() => null);
+    if (reopenedSharingStatus === null) {
+      fail("ELECTRON_MACOS_SMOKE_SETTINGS_SHARING_INVALID", "settings");
+    }
+
+    // The root list lives on Data & privacy. Return to that panel before collecting
     // rendered-root evidence; otherwise a semantically correct list would be
     // hidden behind the About tab and look like an empty UI.
     await settingsCdp.evaluate(
-      "document.querySelector('[data-settings-tab=\"general\"]')?.click(); true",
+      "document.querySelector('[data-settings-tab=\"data\"]')?.click(); true",
     );
     const evidence = await settingsCdp.evaluate(`(async () => {
       const visible = ${visible.toString()};
@@ -2197,7 +2433,7 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath) {
     }
     return Object.freeze({
       connected: true,
-      tabCount: 3,
+      tabCount: 4,
       tabs: true,
       rootCount: settingsEvidence.rootCount,
       renderedRootCount: settingsEvidence.renderedRootCount,
@@ -2210,6 +2446,7 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath) {
       genericSnapshotPathFree: settingsEvidence.genericSnapshotPathFree,
       pathfulRead: settingsEvidence.pathfulRead,
       refreshIntervalPersisted: persistence.status === "passed",
+      sharingPreferencePersisted: reopenedSharingStatus !== null,
     });
   } finally {
     settingsCdp?.close?.();
@@ -2408,6 +2645,7 @@ export function buildClosedReceipt({
       genericSnapshotPathFree: settings.genericSnapshotPathFree === true,
       pathfulRead: settings.pathfulRead === true,
       refreshIntervalPersisted: settings.refreshIntervalPersisted === true,
+      sharingPreferencePersisted: settings.sharingPreferencePersisted === true,
     }),
     share: Object.freeze({
       route: share.route === "#weekly" ? "#weekly" : "unknown",

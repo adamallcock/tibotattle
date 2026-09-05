@@ -1289,8 +1289,15 @@ function renderElectronAccountlessCommunity() {
     $("#electron-accountless-community-transport"),
     electronSharingTransportMessageKey(electronSharingPreference),
   );
-  const settings = $("#electron-accountless-open-settings");
-  if (settings) settings.disabled = typeof bridge.openSettings !== "function";
+  const enabled = $("#electron-accountless-sharing-enabled");
+  const usable = electronSharingPreference?.available === true
+    && electronSharingPreference.current === true;
+  if (enabled) {
+    enabled.checked = usable && electronSharingPreference.enabled === true;
+    enabled.disabled = !usable || electronSharingBusy;
+  }
+  const error = $("#electron-accountless-sharing-error");
+  if (error) error.hidden = !electronSharingNoticeAckError;
 }
 
 async function loadElectronSharingPreference({ dashboardReady = false } = {}) {
@@ -1324,6 +1331,7 @@ async function setElectronSharingEnabled(enabled) {
   if (!bridge) return false;
   electronSharingBusy = true;
   electronSharingNoticeAckError = false;
+  renderElectronAccountlessCommunity();
   renderElectronSharingNotice();
   try {
     const next = normalizeElectronSharingPreference(
@@ -1340,18 +1348,8 @@ async function setElectronSharingEnabled(enabled) {
     return false;
   } finally {
     electronSharingBusy = false;
+    renderElectronAccountlessCommunity();
     renderElectronSharingNotice();
-  }
-}
-
-function openElectronSharingSettings() {
-  const bridge = electronSharingBridge();
-  if (!bridge || typeof bridge.openSettings !== "function") return false;
-  try {
-    void Promise.resolve(bridge.openSettings()).catch(() => {});
-    return true;
-  } catch {
-    return false;
   }
 }
 
@@ -15364,8 +15362,8 @@ $("#electron-sharing-share-now")?.addEventListener("click", () => {
 $("#electron-sharing-keep-off")?.addEventListener("click", () => {
   void setElectronSharingEnabled(false);
 });
-$("#electron-accountless-open-settings")?.addEventListener("click", () => {
-  openElectronSharingSettings();
+$("#electron-accountless-sharing-enabled")?.addEventListener("change", (event) => {
+  void setElectronSharingEnabled(event.target.checked === true);
 });
 window.addEventListener("tibotattle:local-evidence-updated", () => {
   void reloadLocalEvidenceAfterNativeRefresh();

@@ -552,8 +552,14 @@
 }
 
 .settings-about-brand {
+  display: flex;
   align-items: center;
   justify-content: flex-start;
+  gap: var(--space-3);
+}
+
+.settings-about-brand-copy {
+  min-width: 0;
 }
 
 .settings-about-icon {
@@ -676,6 +682,16 @@
   }
 }
 
+@media (max-width: 620px) {
+  .settings-tab {
+    flex: 1 1 calc(50% - var(--space-1));
+  }
+
+  .settings-about-brand {
+    align-items: flex-start;
+  }
+}
+
 @media (max-width: 420px) {
   .settings-window {
     width: min(100% - 16px, 640px);
@@ -698,6 +714,15 @@
 
   .settings-tabs {
     top: var(--space-1);
+  }
+
+  .settings-about-brand {
+    gap: var(--space-2);
+  }
+
+  .settings-about-icon {
+    width: 40px;
+    height: 40px;
   }
 }
 

@@ -40,8 +40,18 @@
           aria-controls="settings-panel-general"
           aria-selected="true"
           tabindex="0"
-          data-settings-tab="general"
+        data-settings-tab="general"
         data-i18n="electron.settings.tab.general">General</button>
+        <button
+          class="settings-tab"
+          id="settings-tab-data"
+          type="button"
+          role="tab"
+          aria-controls="settings-panel-data"
+          aria-selected="false"
+          tabindex="-1"
+          data-settings-tab="data"
+        data-i18n="electron.settings.tab.data">Data &amp; privacy</button>
         <button
           class="settings-tab"
           id="settings-tab-notifications"
@@ -75,7 +85,7 @@
           <div class="settings-panel-heading">
             <p class="eyebrow" data-i18n="electron.settings.general.eyebrow">Local behavior</p>
             <h2 data-i18n="electron.settings.general.title">General</h2>
-            <p data-i18n="electron.settings.general.description">Choose where TiboTattle reads from and how often it refreshes while open.</p>
+            <p data-i18n="electron.settings.general.description">Choose the language, appearance, and startup behavior of TiboTattle.</p>
           </div>
 
           <section class="settings-card" aria-labelledby="settings-language-title">
@@ -109,11 +119,60 @@
             </label>
           </section>
 
+          <section class="settings-card settings-login-card" aria-labelledby="settings-login-title">
+            <div class="settings-card-copy">
+              <h3 id="settings-login-title" data-i18n="electron.settings.login.title">Start at login</h3>
+              <p
+                id="settings-start-at-login-summary"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+              >
+                Start TiboTattle when you sign in. Manage this in your operating system settings.
+              </p>
+            </div>
+            <div class="settings-control-column">
+              <label class="settings-switch" for="settings-start-at-login">
+                <input
+                  id="settings-start-at-login"
+                  type="checkbox"
+                  role="switch"
+                  aria-describedby="settings-start-at-login-summary"
+                >
+                <span class="settings-switch-track" aria-hidden="true"><span></span></span>
+                <span data-i18n="electron.settings.login.label">Start TiboTattle at login</span>
+              </label>
+              <div class="settings-actions">
+                <button class="button button-quiet" id="settings-open-login-items" type="button">
+                  <span data-i18n="electron.settings.login.open">Open Login Items Settings</span>
+                </button>
+                <button class="button button-quiet" id="settings-refresh-login-status" type="button">
+                  <span data-i18n="electron.settings.login.refresh">Refresh Login Item Status</span>
+                </button>
+              </div>
+            </div>
+          </section>
+        </section>
+
+        <section
+          class="settings-panel"
+          id="settings-panel-data"
+          role="tabpanel"
+          aria-labelledby="settings-tab-data"
+          data-settings-panel="data"
+          hidden
+        >
+          <div class="settings-panel-heading">
+            <p class="eyebrow" data-i18n="electron.settings.data.eyebrow">Local data and sharing</p>
+            <h2 data-i18n="electron.settings.data.title">Data &amp; privacy</h2>
+            <p data-i18n="electron.settings.data.description">Manage your Codex folder, refresh frequency, sharing choice, and local tools.</p>
+          </div>
+
           <section class="settings-card settings-sharing-card" aria-labelledby="settings-sharing-title">
             <div class="settings-card-copy">
               <h3 id="settings-sharing-title" data-i18n="electron.settings.sharing.title">Community sharing</h3>
-              <p data-i18n="electron.settings.sharing.description">
-                Choose whether this installation may share content-free usage measurements. No sign-in is required. Shared measurements may include token counts, model labels, quota measurements, and pseudonymous continuity identifiers. Prompts, responses, credentials, private paths, and raw account identifiers stay on this device.
+              <p data-i18n="electron.settings.sharing.summary">
+                Manage what this installation shares from the Community page. Your saved choice applies throughout TiboTattle.
               </p>
               <p class="settings-status" id="settings-sharing-state" role="status" aria-live="polite" data-i18n="electron.sharing.state.unavailable">
                 Community sharing preference unavailable; nothing will be shared.
@@ -122,11 +181,9 @@
                 Uploads are not available in this build.
               </p>
             </div>
-            <label class="settings-switch" for="settings-sharing-enabled">
-              <input id="settings-sharing-enabled" type="checkbox" role="switch" disabled aria-describedby="settings-sharing-state settings-sharing-transport">
-              <span class="settings-switch-track" aria-hidden="true"><span></span></span>
-              <span data-i18n="electron.settings.sharing.label">Share usage measurements</span>
-            </label>
+            <button class="button button-secondary" id="settings-manage-sharing" type="button" disabled data-i18n="electron.settings.sharing.manage">
+              Manage sharing
+            </button>
           </section>
 
           <section class="settings-card settings-roots-card" aria-labelledby="settings-codex-roots-title">
@@ -189,40 +246,6 @@
               <button class="button button-quiet" id="settings-reveal-local-data" type="button" data-i18n="electron.settings.localTools.revealData">
                 Show local data
               </button>
-            </div>
-          </section>
-
-          <section class="settings-card settings-login-card" aria-labelledby="settings-login-title">
-            <div class="settings-card-copy">
-              <h3 id="settings-login-title" data-i18n="electron.settings.login.title">Start at login</h3>
-              <p
-                id="settings-start-at-login-summary"
-                role="status"
-                aria-live="polite"
-                aria-atomic="true"
-              >
-                Start TiboTattle when you sign in. Manage this in your operating system settings.
-              </p>
-            </div>
-            <div class="settings-control-column">
-              <label class="settings-switch" for="settings-start-at-login">
-                <input
-                  id="settings-start-at-login"
-                  type="checkbox"
-                  role="switch"
-                  aria-describedby="settings-start-at-login-summary"
-                >
-                <span class="settings-switch-track" aria-hidden="true"><span></span></span>
-                <span data-i18n="electron.settings.login.label">Start TiboTattle at login</span>
-              </label>
-              <div class="settings-actions">
-                <button class="button button-quiet" id="settings-open-login-items" type="button">
-                  <span data-i18n="electron.settings.login.open">Open Login Items Settings</span>
-                </button>
-                <button class="button button-quiet" id="settings-refresh-login-status" type="button">
-                  <span data-i18n="electron.settings.login.refresh">Refresh Login Item Status</span>
-                </button>
-              </div>
             </div>
           </section>
         </section>
@@ -308,7 +331,7 @@
 
           <section class="settings-card settings-about-brand" aria-labelledby="settings-about-product-title">
             <img class="settings-about-icon" src="./tibotattle-icon.png" alt="">
-            <div>
+            <div class="settings-about-brand-copy">
               <h3 id="settings-about-product-title">TiboTattle</h3>
               <p class="settings-value" id="settings-version">Version unavailable</p>
               <p class="settings-value" id="settings-build">Build unavailable</p>

@@ -52,8 +52,16 @@ const DEFAULT_SETTINGS_WINDOW_OPTIONS = Object.freeze({
 
 const SETTINGS_SECTIONS = Object.freeze([
   "general",
+  "data",
   "notifications",
   "about",
+]);
+
+const DASHBOARD_SECTIONS = Object.freeze([
+  "weekly",
+  "timeline",
+  "accounting",
+  "community",
 ]);
 
 function assertFunction(value, label) {
@@ -353,13 +361,17 @@ export function createDesktopLifecycle({
     return delivered;
   }
 
-  // Keep native dashboard navigation bounded to the two evidence-rich views
-  // that are useful from a menu-bar shell. The renderer owns the page state
-  // and existing projections; the main process only requests a fixed hash
-  // after bringing the dashboard window to the front.
+  // Keep native dashboard navigation bounded to the shell's fixed views. The
+  // renderer owns the page state and existing projections; the main process
+  // only requests a fixed hash after bringing the dashboard window to the
+  // front.
   function navigateDashboardSection(section) {
-    if (section !== "weekly" && section !== "timeline" && section !== "accounting") return false;
+    if (!DASHBOARD_SECTIONS.includes(section)) return false;
     if (!showWindow()) return false;
+    // Settings is a separate auxiliary BrowserWindow. Close-to-tray and
+    // single-instance wakeups may leave it visible over the dashboard; a
+    // dashboard navigation must make the selected main surface authoritative.
+    hideSettingsWindow();
     return sendDashboardCommand({ command: "dashboardSection", section });
   }
 
@@ -1080,6 +1092,12 @@ export function createDesktopLifecycle({
     return true;
   }
 
+  function hideSettingsWindow() {
+    if (!isLiveBrowserWindow(settingsWindow)) return false;
+    settingsWindow.hide?.();
+    return true;
+  }
+
   function usesExplicitTrayContextMenu() {
     return platform === "darwin" && typeof tray?.popUpContextMenu === "function";
   }
@@ -1482,6 +1500,7 @@ export function createDesktopLifecycle({
     retry,
     showWindow,
     showSettingsWindow,
+    hideSettingsWindow,
     hideWindow,
     toggleWindow,
     sendDashboardCommand,

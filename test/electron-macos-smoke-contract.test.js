@@ -150,6 +150,19 @@ test("macOS Electron smoke is an explicit packaged arm64 lane", async () => {
   assert.match(source, /retainedNotAnalyzedCount/u);
   assert.doesNotMatch(source, /primaryRadioCount === normalizedRootCount/u);
   assert.match(source, /settings-add-codex-root/u);
+  assert.match(source, /tabCount === 4/u);
+  assert.match(source, /\["general", "data", "notifications", "about"\]/u);
+  assert.match(source, /KeyboardEvent\("keydown", \{ key: "ArrowRight"/u);
+  assert.match(source, /KeyboardEvent\("keydown", \{ key: "End"/u);
+  assert.match(source, /data-settings-tab.*data/u);
+  assert.match(source, /electron-settings\.html#data/u);
+  assert.match(source, /Electron Settings Data deep link/u);
+  assert.match(source, /settings-manage-sharing/u);
+  assert.match(source, /electron-accountless-sharing-enabled/u);
+  assert.match(source, /electron-accountless-sharing-description/u);
+  assert.match(source, /Electron Settings hides for Community/u);
+  assert.match(source, /Electron Community sharing preference persistence/u);
+  assert.match(source, /sharingPreferencePersisted/u);
   assert.match(source, /readMacSyntheticFixtureRefreshInterval/u);
   assert.match(source, /classifyMacSettingsPersistenceEvidence/u);
   assert.match(source, /window\.close\(\)/u);
@@ -171,6 +184,10 @@ test("macOS Electron smoke is an explicit packaged arm64 lane", async () => {
   assert.match(source, /#weekly/u);
   assert.match(source, /#share-panel/u);
   assert.match(source, /shareLauncherAvailable/u);
+  assert.match(source, /headerLanguagePickerPresent/u);
+  assert.match(source, /headerLanguagePickerHidden/u);
+  assert.match(source, /generalLanguageVisible/u);
+  assert.match(source, /generalLanguageEnabled/u);
   assert.doesNotMatch(source, /querySelector\("#electron-share-button"\)\?\.click/u);
   assert.match(source, /electron-settings/u);
   assert.match(source, /SIGUSR2/u);
@@ -1008,7 +1025,8 @@ test("macOS parity evidence rejects empty Usage rows and hidden legacy Community
     accountlessPreferenceReady: true,
     accountlessState: true,
     accountlessTransport: true,
-    sharingSettingsEnabled: true,
+    sharingToggleEnabled: true,
+    sharingDescriptionComplete: true,
     legacyJourneyVisible: false,
     googleButton: false,
     appleButton: false,
@@ -1021,7 +1039,7 @@ test("macOS parity evidence rejects empty Usage rows and hidden legacy Community
   assert.deepEqual(classifyMacDashboardParityEvidence(accountlessEvidence),
     { status: "passed", reason: null });
   for (const key of ["accountlessPanel", "accountlessPreferenceReady", "accountlessState",
-    "accountlessTransport", "sharingSettingsEnabled"]) {
+    "accountlessTransport", "sharingToggleEnabled", "sharingDescriptionComplete"]) {
     assert.deepEqual(classifyMacDashboardParityEvidence({
       ...accountlessEvidence, community: { ...accountlessCommunity, [key]: false },
     }), { status: "failed", reason: "community" }, key);
@@ -1220,7 +1238,7 @@ test("closed macOS receipt is content-free and has no runtime identifiers", () =
     },
     settings: {
       connected: true,
-      tabCount: 3,
+      tabCount: 4,
       tabs: true,
       rootCount: 2,
       renderedRootCount: 2,
@@ -1233,6 +1251,7 @@ test("closed macOS receipt is content-free and has no runtime identifiers", () =
       genericSnapshotPathFree: true,
       pathfulRead: true,
       refreshIntervalPersisted: true,
+      sharingPreferencePersisted: true,
     },
     share: {
       route: "#weekly",
@@ -1283,7 +1302,9 @@ test("closed macOS receipt is content-free and has no runtime identifiers", () =
   assert.equal(receipt.settings.genericSnapshotPathFree, true);
   assert.equal(receipt.settings.pathfulRead, true);
   assert.equal(receipt.settings.refreshIntervalPersisted, true);
+  assert.equal(receipt.settings.sharingPreferencePersisted, true);
   assert.equal(Object.hasOwn(receipt.settings, "path"), false);
+  assert.equal(Object.hasOwn(receipt.settings, "sharingEnabled"), false);
   assert.equal(Object.hasOwn(receipt.settings, "activityRoots"), false);
   assert.equal(receipt.share.route, "#weekly");
   assert.equal(Object.hasOwn(receipt, "refreshId"), false);
@@ -1403,5 +1424,6 @@ test("failed renderer readiness receipt retains completed chrome and refresh pro
   assert.equal(receipt.startupRefresh.terminalStatus, "succeeded");
   assert.equal(receipt.settings.connected, false);
   assert.equal(receipt.settings.refreshIntervalPersisted, false);
+  assert.equal(receipt.settings.sharingPreferencePersisted, false);
   assert.equal(receipt.share.panelVisible, false);
 });

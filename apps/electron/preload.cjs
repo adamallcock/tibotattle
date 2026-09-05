@@ -29,7 +29,7 @@ const WINDOWS_TEST_LANE_ENV = "USAGE_MONITOR_TEST_LANE";
 const WINDOWS_TEST_LANE = "windows-electron-smoke";
 const LANGUAGES = Object.freeze(["system", "en", "zh-Hans", "es"]);
 const APPEARANCES = Object.freeze(["system", "light", "dark"]);
-const DASHBOARD_SECTIONS = Object.freeze(["weekly", "timeline", "accounting"]);
+const DASHBOARD_SECTIONS = Object.freeze(["weekly", "timeline", "accounting", "community"]);
 const AUTOMATIC_REFRESH_MODES = Object.freeze(["quick", "detailed"]);
 const REFRESH_INTERVALS = Object.freeze([60, 300, 900, 1800]);
 const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
@@ -291,6 +291,7 @@ function installDesktopBridge() {
       values,
     ),
     openSettings: (...values) => noArguments("openSettings", values),
+    openCommunity: (...values) => noArguments("openCommunity", values),
     toggleSidebar: (...values) => noArguments("toggleSidebar", values),
     chooseCodexHome: (...values) => noArguments("chooseCodexHome", values),
     addCodexHome: (...values) => noArguments("addCodexHome", values),

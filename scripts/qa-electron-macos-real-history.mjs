@@ -2220,7 +2220,7 @@ async function assertCommunity(session, health, terminalStatus) {
     }
     const sharingState = document.querySelector('#electron-accountless-community-state');
     const transport = document.querySelector('#electron-accountless-community-transport');
-    const settings = document.querySelector('#electron-accountless-open-settings');
+    const sharingControl = document.querySelector('#electron-accountless-sharing-enabled');
     return {
       route: location.hash,
       pageVisible: visible(page) && page?.inert !== true,
@@ -2233,7 +2233,10 @@ async function assertCommunity(session, health, terminalStatus) {
       accountlessTransport: visible(transport)
         && ['off', 'unavailable'].includes(preference?.transportStatus)
         && /uploads are not available|sharing is off/iu.test(transport?.textContent ?? ''),
-      sharingSettingsEnabled: visible(settings) && settings.disabled !== true,
+      sharingSettingsEnabled: visible(sharingControl)
+        && sharingControl.disabled !== true
+        && sharingControl.getAttribute('role') === 'switch'
+        && sharingControl.checked === preference?.enabled,
       legacyJourneyVisible: visible(document.querySelector('#community-journey')),
       journeyStageCount: document.querySelectorAll('#community-journey .journey-stage').length,
       indexTerminal: document.querySelector('#journey-stage-index')?.classList?.contains('journey-stage-done') === true,

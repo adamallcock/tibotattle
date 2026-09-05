@@ -101,14 +101,70 @@ test("Electron sharing UI uses the accountless bridge and visible receipt gate",
   assert.match(indexHtml, /id="electron-sharing-notice"/u);
   assert.match(indexHtml, /id="electron-sharing-share-now"/u);
   assert.match(indexHtml, /id="electron-sharing-keep-off"/u);
-  assert.match(settingsHtml, /id="settings-sharing-enabled"/u);
+  assert.doesNotMatch(settingsHtml, /id="settings-sharing-enabled"/u);
+  assert.match(settingsHtml, /id="settings-manage-sharing"/u);
+  assert.match(indexHtml, /id="electron-accountless-sharing-enabled"/u);
+  assert.match(indexHtml, /id="electron-accountless-sharing-description"/u);
+  assert.doesNotMatch(indexHtml, /id="electron-accountless-open-settings"/u);
   assert.match(settingsSource, /settingsSharingBridge\.getSharingPreference\(\)/u);
-  assert.match(settingsSource, /settingsSharingBridge\.setSharingEnabled\(enabled\)/u);
+  assert.doesNotMatch(settingsSource, /settingsSharingBridge\.setSharingEnabled/u);
   assert.match(settingsSource, /function setOperationStatus\(documentRef, value, \{ error = false \} = \{\}\)/u);
   assert.match(settingsSource, /"is-success", hasMessage && !error/u);
   assert.match(settingsSource, /"is-error", hasMessage && error/u);
   assert.match(settingsCss, /\.settings-operation-status\.is-success\s*\{\s*color: var\(--green\);/u);
   assert.match(settingsCss, /\.settings-operation-status\.is-error\s*\{\s*color: var\(--rust\);/u);
+});
+
+test("Community sharing confirms saved state and restores it after a rejected change", async () => {
+  const source = await readFile(APP_SOURCE_URL, "utf8");
+  const elements = new Map([
+    "#electron-accountless-community", "#electron-accountless-community-state",
+    "#electron-accountless-community-transport", "#electron-accountless-sharing-enabled",
+    "#electron-accountless-sharing-error",
+  ].map((key) => [key, { hidden: false, checked: false, disabled: true, textContent: "" }]));
+  let resolveSave;
+  let rejectSave;
+  const calls = [];
+  const bridge = { setSharingEnabled(enabled) {
+    calls.push(enabled);
+    return new Promise((resolve, reject) => { resolveSave = resolve; rejectSave = reject; });
+  } };
+  const fixture = new Function(
+    "$", "electronSharingBridge", "normalizeElectronSharingPreference", "initialPreference",
+    `let electronSharingPreference = initialPreference;
+     let electronSharingBusy = false;
+     let electronSharingNoticeAckError = false;
+     const electronSharingStateMessageKey = value => value.enabled ? "enabled" : "off";
+     const electronSharingTransportMessageKey = value => value.transportStatus;
+     const setLocalizedText = (element, key) => { element.textContent = key; };
+     const renderElectronSharingNotice = () => {};
+     ${extractFunction(source, "renderElectronAccountlessCommunity")}
+     async ${extractFunction(source, "setElectronSharingEnabled")}
+     return { render: renderElectronAccountlessCommunity, set: setElectronSharingEnabled };`,
+  )((key) => elements.get(key), () => bridge, normalizeElectronSharingPreference, validProjection());
+  const control = elements.get("#electron-accountless-sharing-enabled");
+  const error = elements.get("#electron-accountless-sharing-error");
+  fixture.render();
+  assert.equal(control.disabled, false);
+  const saving = fixture.set(true);
+  assert.equal(control.disabled, true, "prevent a competing change while saving");
+  assert.equal(await fixture.set(false), false);
+  assert.deepEqual(calls, [true]);
+  resolveSave(validProjection({ enabled: true, state: "enabled", basis: "user_choice",
+    noticeDue: false, nextNoticeIndex: null, nextNoticeAt: null, earliestActivationAt: null }));
+  assert.equal(await saving, true);
+  assert.equal(control.checked, true);
+  assert.equal(control.disabled, false);
+  assert.equal(error.hidden, true);
+  assert.equal(elements.get("#electron-accountless-community-transport").textContent, "unavailable");
+
+  control.checked = false;
+  const failedSave = fixture.set(false);
+  rejectSave(new Error("synthetic unavailable store"));
+  assert.equal(await failedSave, false);
+  assert.equal(control.checked, true, "restore the last confirmed choice after a failed save");
+  assert.equal(control.disabled, false);
+  assert.equal(error.hidden, false);
 });
 
 test("Electron settings expose one analyzed Codex folder and retain extras without actions", async () => {
@@ -353,6 +409,96 @@ test("the singleton default chooser refreshes the rendered folder card after sel
     .map((node) => node.textContent)
     .join(" ");
   assert.match(text, /\/synthetic\/chosen-codex/u);
+  mounted.teardown();
+});
+
+test("Settings restores its saved language when the language bridge rejects", async () => {
+  const element = (tagName = "div", className = "") => ({
+    tagName,
+    className,
+    childNodes: [],
+    dataset: {},
+    attributes: new Map(),
+    textContent: "",
+    value: "",
+    checked: false,
+    disabled: false,
+    hidden: false,
+    classList: { toggle() {} },
+    append(...children) { this.childNodes.push(...children); },
+    replaceChildren(...children) { this.childNodes = children; },
+    setAttribute(name, value) { this.attributes.set(name, value); },
+    getAttribute(name) { return this.attributes.get(name) ?? null; },
+    removeAttribute(name) { this.attributes.delete(name); },
+    addEventListener(type, handler) { this.listeners ??= new Map(); this.listeners.set(type, handler); },
+    removeEventListener(type, handler) { if (this.listeners?.get(type) === handler) this.listeners.delete(type); },
+    dispatchChange() { this.listeners?.get("change")?.({ target: this }); },
+  });
+  const selectors = [
+    "#settings-bridge-status", "#settings-language", "#settings-appearance",
+    "#settings-codex-folder-status", "#settings-codex-roots",
+    "#settings-codex-roots-status", "#settings-add-codex-root",
+    "#settings-use-default-codex-folder", "#settings-refresh-interval",
+    "#settings-start-at-login", "#settings-start-at-login-summary",
+    "#settings-open-login-items", "#settings-refresh-login-status",
+    "#settings-notifications-enabled", "#settings-notifications-detail",
+    "#settings-notification-status", "#settings-open-notification-settings",
+    "#settings-automatic-updates", "#settings-check-for-updates",
+    "#settings-open-dashboard-browser", "#settings-show-diagnostics",
+    "#settings-reveal-local-data", "#settings-version", "#settings-build",
+    "#settings-updates-status", "#settings-operation-status",
+  ];
+  const elements = new Map(selectors.map((selector) => [selector, element()]));
+  const documentRef = {
+    documentElement: { dataset: {}, classList: { toggle() {} } },
+    createElement: element,
+    querySelector(selector) { return elements.get(selector) ?? null; },
+    querySelectorAll() { return []; },
+  };
+  const languagePreferences = [];
+  const localizer = {
+    t(key) { return key; },
+    setLanguagePreference(value, options) { languagePreferences.push({ value, options }); },
+  };
+  const bridge = {
+    version: "v1",
+    getSettings: async () => ({
+      settings: {
+        language: "en", appearance: "system", refreshIntervalSeconds: 300,
+        codexHomes: {
+          activityRoots: [{
+            rootId: "00000000-0000-4000-8000-000000000001",
+            kind: "default",
+            path: null,
+            enabled: true,
+          }],
+          primaryRootId: "00000000-0000-4000-8000-000000000001",
+        },
+        codexFolder: { kind: "default" },
+        startAtLogin: { status: "disabled", canSet: false },
+        notifications: { enabled: false, threshold: "off", canSet: false },
+      },
+      about: { version: "0.1.18", build: "test", update: {}, automaticUpdates: {} },
+    }),
+    setLanguage: async () => { throw new Error("synthetic persistence failure"); },
+  };
+  const mounted = await mountSettingsPage({
+    documentRef,
+    windowRef: { tibotattleDesktop: bridge, location: { hash: "#general" } },
+    bridge,
+    localizer,
+  });
+  const language = elements.get("#settings-language");
+  assert.equal(language.value, "en");
+  language.value = "es";
+  language.dispatchChange();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(language.value, "en", "restore the persisted select value after a rejected save");
+  assert.deepEqual(
+    languagePreferences.map(({ value }) => value),
+    ["en-US", "es", "en-US"],
+    "restore the persisted document locale after a rejected save",
+  );
   mounted.teardown();
 });
 

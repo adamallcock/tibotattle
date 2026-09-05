@@ -46,6 +46,7 @@ export const SETTINGS_ACTION_NAMES = Object.freeze([
   "getSettings",
   "getCodexHomesForSettings",
   "openSettings",
+  "openCommunity",
   "setLanguage",
   "setAppearance",
   "chooseCodexHome",
@@ -521,8 +522,6 @@ export function normalizeElectronSharingPreference(raw) {
 function sharingBridge(bridge) {
   return bridge
     && typeof bridge.getSharingPreference === "function"
-    && typeof bridge.setSharingEnabled === "function"
-    && typeof bridge.sharingNoticePresented === "function"
     ? bridge
     : null;
 }
@@ -821,17 +820,13 @@ function renderSharingPreference(
   preference,
   bridgeAvailable,
   localizer,
-  { busy = false } = {},
 ) {
-  const enabled = documentRef.querySelector?.("#settings-sharing-enabled");
   const state = documentRef.querySelector?.("#settings-sharing-state");
   const transport = documentRef.querySelector?.("#settings-sharing-transport");
-  if (!enabled || !state || !transport) return;
+  if (!state || !transport) return;
   const usable = bridgeAvailable
     && preference?.available === true
     && preference.current === true;
-  enabled.checked = usable && preference.enabled === true;
-  enabled.disabled = !usable || busy;
   state.textContent = translateSettingsMessage(
     localizer,
     sharingStateMessageKey(preference),
@@ -978,7 +973,7 @@ function initialTab(windowRef) {
   const candidate = typeof windowRef?.location?.hash === "string"
     ? windowRef.location.hash.slice(1)
     : "";
-  return ["general", "notifications", "about"].includes(candidate)
+  return ["general", "data", "notifications", "about"].includes(candidate)
     ? candidate
     : "general";
 }
@@ -1029,7 +1024,6 @@ export async function mountSettingsPage({
   let busy = false;
   const settingsSharingBridge = sharingBridge(settingsBridge);
   let currentSharingPreference = null;
-  let sharingBusy = false;
   let invoke = null;
   let unsubscribeDesktopCommands = () => {};
   const listeners = [];
@@ -1179,6 +1173,10 @@ export async function mountSettingsPage({
       setBridgeStatus(documentRef, "electron.settings.bridge.connected", true, pageLocalizer);
     } catch {
       operationError(documentRef, pageLocalizer);
+      pageLocalizer?.setLanguagePreference?.(
+        browserLanguagePreference(currentState.language),
+        { notifyHost: false, announce: false },
+      );
       renderSettingsState(
         documentRef,
         currentState,
@@ -1190,40 +1188,6 @@ export async function mountSettingsPage({
       );
     } finally {
       busy = false;
-    }
-  };
-
-  const setSharingPreference = async (enabled) => {
-    if (!settingsSharingBridge || typeof enabled !== "boolean" || busy || sharingBusy) return;
-    sharingBusy = true;
-    renderSharingPreference(
-      documentRef,
-      currentSharingPreference,
-      true,
-      pageLocalizer,
-      { busy: true },
-    );
-    try {
-      const next = normalizeElectronSharingPreference(
-        await settingsSharingBridge.setSharingEnabled(enabled),
-      );
-      if (next === null) throw new Error("Sharing preference response was invalid");
-      currentSharingPreference = next;
-      setOperationStatus(
-        documentRef,
-        translateSettingsMessage(pageLocalizer, "electron.settings.sharing.saved"),
-      );
-    } catch {
-      operationError(documentRef, pageLocalizer);
-    } finally {
-      sharingBusy = false;
-      renderSharingPreference(
-        documentRef,
-        currentSharingPreference,
-        true,
-        pageLocalizer,
-        { busy: false },
-      );
     }
   };
 
@@ -1312,11 +1276,13 @@ export async function mountSettingsPage({
       : "off";
     void invoke("setNotificationPreferences", { enabled, threshold });
   });
-  const sharingInput = documentRef.querySelector?.("#settings-sharing-enabled");
-  if (sharingInput) {
-    listen(sharingInput, "change", (event) => {
-      void setSharingPreference(event.target.checked === true);
-    });
+  const manageSharing = documentRef.querySelector?.("#settings-manage-sharing");
+  if (manageSharing) {
+    manageSharing.disabled = typeof settingsBridge?.openCommunity !== "function";
+    listen(manageSharing, "click", () => { void invoke("openCommunity"); });
+  }
+  if (typeof windowRef?.addEventListener === "function") {
+    listen(windowRef, "focus", () => { void refresh(); });
   }
   for (const input of documentRef.querySelectorAll(
     "input[name=\"settings-notification-threshold\"]",
