@@ -344,11 +344,16 @@ test("tray popup assets are local, bounded, and wired as a visual surface", asyn
 
 test("rendered action labels interpolate the product name", () => {
   const documentRef = new FakeDocument();
-  renderTrayPopup(documentRef, createTrayPopupProjection(fixture(), { now: NOW, timeZone: "UTC" }));
+  renderTrayPopup(documentRef, createTrayPopupProjection(fixture(), { now: NOW, timeZone: "UTC" }), {
+    // A non-native host keeps the established action-bridge behavior; only a
+    // host that supplies onModel starts Refresh in the conservative state.
+    bridge: { requestAction() {} },
+  });
   assert.equal(documentRef.actions[0].textContent, "Open TiboTattle");
   assert.equal(documentRef.actions[1].textContent, "Refresh");
   assert.equal(documentRef.actions[2].textContent, "⋯");
   assert.equal(documentRef.actions[2].attributes.get("aria-label"), "More actions");
+  assert.equal(documentRef.actions[1].disabled, false);
   assert.doesNotMatch(documentRef.actions[0].textContent, /\{appName\}/u);
 });
 
@@ -364,7 +369,11 @@ test("header and allowance rows use the compact native wording", () => {
   renderTrayPopup(updated, createTrayPopupProjection(fixture(), {
     now: "2026-09-04T18:05:00.000Z",
     timeZone: "UTC",
-  }));
+  }), {
+    bridge: { requestAction() {} },
+    requiresMainModel: true,
+    mainModel: { status: "fresh", refreshEnabled: true },
+  });
   assert.match(updated.getElementById("tray-popup-freshness").textContent, /Live · updated 5 minutes ago/u);
 });
 
@@ -737,6 +746,55 @@ test("hidden popup model events wait for visibility before reading the companion
   await tick();
   assert.equal(loadCalls, 1);
   assert.equal(documentRef.documentElement.attributes.get("data-tray-popup-ready"), "true");
+});
+
+test("native model disables Refresh immediately without hidden companion reads", async () => {
+  const documentRef = new FakeDocument("hidden");
+  const windowRef = fakeWindow();
+  let modelListener;
+  let loadCalls = 0;
+  let actionCalls = 0;
+  const client = {
+    async load() {
+      loadCalls += 1;
+      return {};
+    },
+  };
+  const bridge = {
+    onModel(listener) {
+      modelListener = listener;
+    },
+    requestAction() {
+      actionCalls += 1;
+    },
+  };
+
+  await bootstrapTrayPopup({ windowRef: { ...windowRef, tibotattleTrayPopover: bridge }, documentRef, client });
+  const refresh = documentRef.actions.find((button) => button.dataset.action === "refresh");
+  assert.equal(refresh.disabled, true);
+  assert.equal(loadCalls, 0);
+
+  modelListener({ status: "starting", refreshEnabled: false });
+  assert.equal(refresh.disabled, true);
+  assert.equal(documentRef.getElementById("tray-popup-freshness").textContent, "Preparing local usage");
+  assert.equal(loadCalls, 0);
+
+  // Lifecycle remains fail-closed even if a malformed status event claims it
+  // can refresh while analyzing.
+  modelListener({ status: "analyzing", refreshEnabled: true });
+  assert.equal(refresh.disabled, true);
+  assert.equal(documentRef.getElementById("tray-popup-freshness").textContent, "Updating…");
+  refresh.dispatch("click");
+  assert.equal(actionCalls, 0);
+  assert.equal(loadCalls, 0);
+
+  modelListener({ status: "fresh", refreshEnabled: true });
+  assert.equal(refresh.disabled, false);
+  assert.equal(loadCalls, 0);
+
+  modelListener({ status: "unknown", refreshEnabled: true });
+  assert.equal(refresh.disabled, true);
+  assert.equal(loadCalls, 0);
 });
 
 test("native popup visibility gates visible-DOM loads and reopens on the host signal", async () => {

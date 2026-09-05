@@ -47,6 +47,13 @@ const PACE_STATUSES = new Set([
 ]);
 const HISTORY_STATUSES = new Set(["complete", "partial", "loading", "unavailable"]);
 const ACCOUNTING_STATUSES = new Set(["available", "retained", "unavailable"]);
+const TRAY_POPUP_MAIN_STATUSES = new Set([
+  "starting",
+  "analyzing",
+  "fresh",
+  "stale",
+  "unavailable",
+]);
 const DAY_KEY_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/u;
 
 function isObject(value) {
@@ -1269,7 +1276,9 @@ function renderHistory(documentRef, projection, t, numberFormatter, formattingLo
   }
 }
 
-function headerFreshnessCopy(freshness, t) {
+function headerFreshnessCopy(freshness, t, mainStatus = null) {
+  if (mainStatus === "starting") return t("electron.trayPopover.startingTitle");
+  if (mainStatus === "analyzing") return t("electron.trayPopover.headerUpdating");
   if (freshness.status === "live"
       && freshness.latestObservedAt !== null
       && freshness.ageSeconds !== null) {
@@ -1286,12 +1295,36 @@ function headerFreshnessCopy(freshness, t) {
 }
 
 /**
+ * The Electron main process owns lifecycle state. The companion DTO remains
+ * the source of allowance and history display, so only this small, known
+ * presentation subset may cross from the model event into this renderer.
+ */
+function mainTrayPresentation(model) {
+  try {
+    if (!isObject(model)
+        || !TRAY_POPUP_MAIN_STATUSES.has(model.status)
+        || typeof model.refreshEnabled !== "boolean") return null;
+    return Object.freeze({
+      status: model.status,
+      // Native never enables a refresh while it is starting or analyzing,
+      // even if a malformed event tries to claim otherwise.
+      refreshEnabled: model.refreshEnabled
+        && !["starting", "analyzing"].includes(model.status),
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Render the popup with DOM APIs only. The renderer accepts injected formatters
  * so its closed projection and sparse/error states remain easy to test.
  */
 export function renderTrayPopup(documentRef, projection, {
   t = defaultText,
   bridge = globalThis.window?.tibotattleTrayPopover,
+  mainModel = null,
+  requiresMainModel = false,
   numberFormatter = formatNumber,
   localFormatter = formatLocal,
   formattingLocale = DEFAULT_LOCALE,
@@ -1302,11 +1335,12 @@ export function renderTrayPopup(documentRef, projection, {
   const translated = typeof t === "function" ? t : defaultText;
   const formatNumberImpl = typeof numberFormatter === "function" ? numberFormatter : formatNumber;
   const formatLocalImpl = typeof localFormatter === "function" ? localFormatter : formatLocal;
+  const presentation = mainTrayPresentation(mainModel);
   renderAllowances(documentRef, projection, translated, formatNumberImpl);
   renderWeeklyPace(documentRef, projection, translated, formatNumberImpl, formatLocalImpl);
   renderHistory(documentRef, projection, translated, formatNumberImpl, formattingLocale);
   const freshness = projection.freshness;
-  const freshnessCopy = headerFreshnessCopy(freshness, translated);
+  const freshnessCopy = headerFreshnessCopy(freshness, translated, presentation?.status ?? null);
   setElementText(documentRef, "tray-popup-freshness", freshnessCopy);
   const live = documentRef.getElementById("tray-popup-live");
   if (live) live.textContent = freshnessCopy;
@@ -1319,8 +1353,11 @@ export function renderTrayPopup(documentRef, projection, {
       button.setAttribute("aria-label", translated("electron.trayPopover.more"));
       button.setAttribute("title", translated("electron.trayPopover.more"));
     }
-    button.disabled = !TRAY_POPUP_ACTIONS.includes(action)
-      || typeof bridge?.requestAction !== "function";
+    const transportReady = typeof bridge?.requestAction === "function";
+    const refreshReady = action !== "refresh"
+      || requiresMainModel !== true
+      || presentation?.refreshEnabled === true;
+    button.disabled = !TRAY_POPUP_ACTIONS.includes(action) || !transportReady || !refreshReady;
   }
   return projection;
 }
@@ -1389,6 +1426,8 @@ export async function bootstrapTrayPopup({
   setFormattingLocale(localization.formatLocale());
   setMessageLocale(localization.locale());
   const bridge = windowRef.tibotattleTrayPopover;
+  const requiresMainModel = typeof bridge?.onModel === "function";
+  let mainModel = null;
   let range = "7d";
   let data = null;
   let loadSequence = 0;
@@ -1415,6 +1454,8 @@ export async function bootstrapTrayPopup({
     renderTrayPopup(documentRef, projection, {
       t: localization.t,
       bridge,
+      mainModel,
+      requiresMainModel,
       formattingLocale: localization.locale(),
     });
   };
@@ -1471,6 +1512,7 @@ export async function bootstrapTrayPopup({
   }
   for (const button of documentRef.querySelectorAll?.("[data-action]") ?? []) {
     button.addEventListener("click", async () => {
+      if (button.disabled) return;
       const action = button.dataset.action;
       if (requestTrayPopupAction(bridge, action)) return;
       if (action !== "refresh") return;
@@ -1482,8 +1524,12 @@ export async function bootstrapTrayPopup({
       }
     });
   }
-  if (typeof bridge?.onModel === "function") {
-    bridge.onModel(() => {
+  if (requiresMainModel) {
+    bridge.onModel((nextModel) => {
+      // This repaint is synchronous and presentation-only: lifecycle state
+      // must disable Refresh before any companion read completes or begins.
+      mainModel = mainTrayPresentation(nextModel);
+      render();
       // The model is a lifecycle signal only. A hidden popup does not issue
       // requests; visibility/opening below coalesces one refresh instead.
       loadPending = true;

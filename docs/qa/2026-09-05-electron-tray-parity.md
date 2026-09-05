@@ -59,6 +59,30 @@ documentation, i18n mirror and preflight checks also passed. Final native-size
 CSS corrections and strict popup duplicate/invalid-lane selection receive
 their focused checks before packaging.
 
-Fresh packaged inspection remains the next gate. These source checks do not
-claim installed visual parity, other physical operating systems, activation
-of automatic contributions, signing or publication.
+## Packaged checks
+
+Source `250be5b956041611ee8084de0493576a10175906` built a verified unsigned
+darwin-arm64 directory package. Its ASAR digest is
+`95f221281b803f30478516f90a3d11a912ba40021921844df565ac8d0ec79ad2`.
+All four development packaging jobs and retained artifacts passed for that
+exact source: [Actions run 33971482768](https://github.com/adamallcock/tibotattle/actions/runs/33971482768).
+
+Actual Mac inspection used a durable private SQLite backup with the matching
+device salt and no hosted contribution origin. A local detailed refresh
+completed and clean relaunch preserved the derived history. The 400-point
+popup rendered both 7-day and 30-day charts with proportional teal hatching,
+coverage counts, partial-pricing disclosure and both footer actions visible.
+Range switching, More, Open and Escape passed native UI checks. More replaced
+the popup with the context menu instead of displaying both overlays.
+
+The first durable copy used Node's default symlink rewriting and failed to
+launch. The rejected copy was preserved; recopying with `verbatimSymlinks`
+retained all 14 relative framework links. The corrected copy launched and
+exited cleanly. Copying an ASAR digest alone does not qualify a Mac bundle.
+
+The remaining interaction correction consumes the existing main-process
+Refresh availability while starting/analyzing. It requires a new package
+check before final handoff. Retina image runtime inspection is separate from
+the rendered popup checks. Physical Windows, Linux and Intel desktop behavior,
+automatic contribution activation, signing and publication remain separate
+gates; four successful package builds do not close those gates.
