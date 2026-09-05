@@ -21,11 +21,12 @@ development qualification entrypoint and does not change production support.
 
 The open native PR review is bounded to source differences. PR #73
 (`57b04b7a`, customizable menu-bar allowance display) is not part of the
-`6731e6d4` native baseline; the current Electron dashboard already exposes the
-corresponding 7-day, 30-day, and All controls, so no native popover port is
-included here. PR #74's retained reconciliation is already in the current
-composition. PR #91 is a research tool and PR #99 is dependency-only; neither
-adds a missing native product control.
+`6731e6d4` native baseline, and its 5-hour/week/both/off menu-bar title
+preference is not ported. Electron's 7-day, 30-day, and All dashboard controls
+are a different surface and are not treated as an equivalent implementation.
+PR #74's retained reconciliation is already in the current composition. PR
+#91 is a research tool and PR #99 is dependency-only; neither adds a missing
+native product control.
 
 | Native 0.1.18 behavior and source | Electron current equivalent and source | Status | Next gate |
 | --- | --- | --- | --- |
@@ -41,7 +42,7 @@ adds a missing native product control.
 | Native app lifecycle is foreground-only and owns its embedded WebKit host, startup, refresh, and quit paths in [`UsageMonitorApp.swift`](../../apps/macos/UsageMonitorApp.swift). | Electron lifecycle, single-instance, companion supervision, tray, and bounded shutdown are owned by [`desktop-runtime.js`](../../apps/electron/desktop-runtime.js), [`companion-supervisor.js`](../../apps/electron/companion-supervisor.js), and [`desktop-controller.js`](../../apps/electron/desktop-controller.js). | Source-complete at the composition boundary. | Run fresh packaged launch, refresh, quit, and relaunch checks with a disposable profile; browser tests do not establish this gate. |
 | Native Sparkle updater behavior is guarded by [`UsageMonitorApp.swift`](../../apps/macos/UsageMonitorApp.swift) (`AppUpdater`). | Electron development settings and platform services report updater availability according to the current qualified adapter; development candidates do not claim signed updater support. | Gap/qualified unavailable state by design. | Add a separately qualified Electron updater before any updater-support claim. |
 | Native has no equivalent to the accepted accountless Electron transition policy in its 0.1.18 shell. | Electron sharing controls use the main-process preference bridge and show a truthful unavailable transport state; the Electron composition suppresses legacy sign-in controls. | Electron-specific current behavior; transport is unavailable in this tranche. | Keep policy and upload authority separate; qualify transport only after its own accountless authority exists. |
-| Native packaging and distribution are governed by the macOS build and signing lanes. | Electron builder configuration targets `darwin-arm64`, `darwin-x64`, `win32-x64`, and `linux-x64`; the isolated Windows launcher and generated `.cmd` wrapper request the reviewed qualification marker and a `%LOCALAPPDATA%` profile. | Source/build plan present; no release or platform-support claim. | Build and inspect each exact artifact, then retain separate qualification, signing, publication, and support gates. |
+| Native packaging and distribution are governed by the macOS build and signing lanes. | Electron builder configuration targets `darwin-arm64`, `darwin-x64`, `win32-x64`, and `linux-x64`; the isolated Windows launcher `.mjs` and generated `.cmd` wrapper request the reviewed qualification marker and a `%LOCALAPPDATA%` profile. | Source/build plan present; no release or platform-support claim. | Build and inspect each exact artifact, then retain separate qualification, signing, publication, and support gates. |
 
 ## Focused evidence
 

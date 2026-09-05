@@ -159,35 +159,37 @@ jobs:
 
           This unsigned package is for isolated development testing. It is not a production-ready or supported Windows release.
 
-          Requirements: Windows x64. The downloaded bundle does not require a separate Node.js installation when the wrapper below is used. Node.js 26.2.0 is needed only when invoking the repository launcher directly.
+          Requirements: Windows x64. The downloaded bundle does not require a separate Node.js installation or source checkout when the wrapper below is used.
 
-          From a checkout of the exact source revision that built this package, run:
+          From the downloaded distribution directory, run:
 
-          TiboTattle-Windows-Development-Launch.cmd "C:\path\to\app-usagemonitor"
+          TiboTattle-Windows-Development-Launch.cmd
 
-          The wrapper uses the packaged TiboTattle Dev.exe as its Node host and expects the unpacked executable at win-unpacked\TiboTattle Dev.exe. It keeps the persistent test profile under %LOCALAPPDATA%\TiboTattle\electron-user-test\win32-x64\profile. To invoke the launcher directly instead, run `node scripts/launch-electron-windows-development.mjs --app "C:\path\to\TiboTattle Dev.exe"` with Node.js 26.2.0.
+          The wrapper uses the packaged TiboTattle Dev.exe as its Node host, runs the bundled standalone launcher, and expects the unpacked executable at win-unpacked\TiboTattle Dev.exe. It keeps the persistent test profile under %LOCALAPPDATA%\TiboTattle\electron-user-test\win32-x64\profile. To invoke the launcher from a repository checkout instead, run `node scripts/launch-electron-windows-development.mjs --app "C:\path\to\TiboTattle Dev.exe"` with Node.js 26.2.0.
 
           The launcher creates a durable private profile, sets the fixed Windows Electron qualification marker, and lets the packaged main process verify its runtime manifest, native binding, and Keytar bytes. An ordinary direct launch may remain unavailable when the qualification context is absent. Do not reuse the installed native app's profile or credentials.
           '@
           $handoffPath = Join-Path $distribution 'TiboTattle-Windows-Development-Launch.txt'
           Set-Content -LiteralPath $handoffPath -Value $handoff -Encoding utf8NoBOM -NoNewline
+          $launcherPath = Join-Path $distribution 'TiboTattle-Windows-Development-Launcher.mjs'
+          Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'scripts/launch-electron-windows-development.mjs') -Destination $launcherPath
+          if (-not (Test-Path -LiteralPath $launcherPath -PathType Leaf)) { throw 'WINDOWS_LAUNCHER_MISSING' }
           $wrapper = @'
           @echo off
           setlocal
-          if "%~1"=="" (
-            echo Usage: TiboTattle-Windows-Development-Launch.cmd ^<exact source checkout^>
+          if not "%~1"=="" (
+            echo Usage: TiboTattle-Windows-Development-Launch.cmd
             exit /b 2
           )
-          set "SOURCE=%~f1"
           set "APP=%~dp0win-unpacked\TiboTattle Dev.exe"
-          set "LAUNCHER=%SOURCE%\scripts\launch-electron-windows-development.mjs"
+          set "LAUNCHER=%~dp0TiboTattle-Windows-Development-Launcher.mjs"
           set "PROFILE=%LOCALAPPDATA%\TiboTattle\electron-user-test\win32-x64\profile"
           if not exist "%APP%" (
             echo The unpacked TiboTattle Dev.exe was not found beside this wrapper.
             exit /b 3
           )
           if not exist "%LAUNCHER%" (
-            echo The exact source checkout does not contain the Windows development launcher.
+            echo The bundled Windows development launcher was not found beside this wrapper.
             exit /b 4
           )
           set "ELECTRON_RUN_AS_NODE=1"

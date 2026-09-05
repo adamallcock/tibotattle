@@ -80,10 +80,12 @@ test("the development workflow builds each target on a static native runner with
   assert.match(workflow, /Add the Windows development launch handoff/u);
   assert.match(workflow, /TiboTattle-Windows-Development-Launch\.txt/u);
   assert.match(workflow, /TiboTattle-Windows-Development-Launch\.cmd/u);
+  assert.match(workflow, /TiboTattle-Windows-Development-Launcher\.mjs/u);
   assert.match(workflow, /win-unpacked\\TiboTattle Dev\.exe/u);
+  assert.match(workflow, /%~dp0TiboTattle-Windows-Development-Launcher\.mjs/u);
   assert.match(workflow, /ELECTRON_RUN_AS_NODE=1/u);
   assert.match(workflow, /%LOCALAPPDATA%\\TiboTattle\\electron-user-test/u);
-  assert.match(workflow, /does not require a separate Node\.js installation/u);
+  assert.match(workflow, /does not require a separate Node\.js installation or source checkout/u);
   assert.match(workflow, /launch-electron-windows-development\.mjs --app/u);
   assert.match(workflow, /Node\.js 26\.2\.0/u);
   assert.equal((workflow.match(/persist-credentials: false/gu) ?? []).length, 4);
