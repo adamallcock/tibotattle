@@ -31,7 +31,7 @@ export const SIGNED_MACOS_BUNDLE_VERSION_PLAN = Object.freeze({
   }),
   // Separate ARM and Intel installers share the same source and build ordering.
   // Preserve signed Intel RC1 1025 and combined Astra/Intel RC2 1025.1.
-  // RC3 reserves 1025.2 for the corrected parser-upgrade refresh deadline.
+  // RC3 reserves 1025.2 for parser-upgrade deadlines and paginated seed isolation.
   // Allocation does not establish signing, installation, or publication.
   "0.1.18": Object.freeze({
     "internal-dogfood": "1025.2",

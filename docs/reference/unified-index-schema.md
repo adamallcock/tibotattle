@@ -28,7 +28,7 @@ one another:
 | Stable filename | `local-unified-index-v1.sqlite` | Machine path continuity across app releases. |
 | Schema-family metadata | `local-unified-index-v2` | Logical family stored in `meta.schema_version`. |
 | SQLite `PRAGMA user_version` | `11` | Physical table/index/migration generation. |
-| Parser version | `unified-rollout-typed-v13` | Meaning and provenance of facts extracted from rollout sources, including ordinal-bearing compaction headers. |
+| Parser version | `unified-rollout-typed-v14` | Meaning and provenance of facts extracted from rollout sources, including ordinal-bearing compaction headers and settings pinned to paginated history boundaries. |
 | Source identity version | `codex-immutable-rollout-v1` | Rules for physical rollout identity/generation. |
 
 The application id is a separate SQLite format guard. A file with the wrong
@@ -75,6 +75,21 @@ alongside both legacy header orders. It validates the bounded unsigned ordinal
 without decoding replacement history. The version change reparses present
 sources so earlier missed compaction boundaries can be recovered safely.
 
+Parser v14 isolates paginated settings from logical-parent state. An independent
+reset starts with unknown model, effort and tier; an anchored continuation uses
+only its exact physical history boundary, including unknown values at that
+boundary. A parent's later final settings cannot fill those gaps. Resume keeps
+the segment's own cursor observations; inherited tier provenance may be
+reconstructed only from its immutable physical base, never the live parent's
+final state. Inline descendants stop tier and replay-snapshot traversal at a
+paginated ancestor's exact selected history; discarded logical-grandparent
+snapshots cannot suppress new work. Logical-parent authority comes from the
+explicit resolved head, independently of physical scan order. Retired physical
+sources remain accounting evidence but cannot overwrite that head's settings;
+ambiguous heads do not supply inherited state. Legacy noncanonical singleton
+sources remain unambiguous. This interpretation change reparses present sources without
+changing physical schema 11 or relabeling rotated-source facts.
+
 Parser v12 additionally preserves omitted or null usage counters as SQL NULL,
 including the cumulative cursor carried across refreshes. Explicit zero remains
 observed zero. A derived component requires all its input counters and consistent
@@ -105,7 +120,7 @@ effort. No effective-effort carry is inferred across compaction, fork or resume.
 Actual application/eligible-mode and installed-client evidence remains a
 qualification gate, separate from catalogue recognition.
 
-The foreground companion treats verified published v10/v11/v12-to-v13 parser
+The foreground companion treats verified published v10/v11/v12/v13-to-v14 parser
 upgrades as cold work even when the physical schema is already 11. The target
 and predecessor set are deliberately closed; current, unknown, malformed and
 future parser evidence cannot obtain a longer deadline. That run receives the

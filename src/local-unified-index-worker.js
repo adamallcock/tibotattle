@@ -5,9 +5,13 @@ import {
   extractRolloutUsage,
   inheritedTierSeed,
   ownObservedTier,
+  resolveLogicalRolloutHeads,
   rolloutContentQuarantineReason,
 } from "./local-unified-index-extract.js";
-import { createHistoryBaseSeedResolver } from "./local-unified-index-history.js";
+import {
+  createHistoryBaseSeedResolver,
+  selectRolloutUsageSeed,
+} from "./local-unified-index-history.js";
 import { withStableRolloutSource } from "./rollout-source-snapshot.js";
 
 // One lane of a parallel rebuild.
@@ -133,6 +137,7 @@ async function run() {
       },
     }));
     const snapshots = createLineageSnapshots(shaped);
+    const logicalHeads = resolveLogicalRolloutHeads(shaped);
     const finalBySessionId = new Map();
     const historySeeds = createHistoryBaseSeedResolver(shaped, {
       maximumLineBytes,
@@ -156,7 +161,8 @@ async function run() {
     };
     try {
       for (const source of shaped) {
-        const logicalSeed = source.parentId === null || source.parentId === undefined
+        const logicalSeed = source.historyMode === "paginated"
+          || source.parentId === null || source.parentId === undefined
           ? null
           : finalBySessionId.get(source.parentId) ?? null;
         if (dependencyUnavailable(source)) {
@@ -180,6 +186,14 @@ async function run() {
         const collector = snapshots.collectorFor(source);
         const historySeed = await historySeeds.resolveSeed(source, {
           includeSnapshots: collector !== null,
+        });
+        const selectedSeed = selectRolloutUsageSeed(source, {
+          historySeed,
+          logicalSeed: logicalSeed === null ? null : {
+            seedModel: logicalSeed.model,
+            seedEffort: logicalSeed.effort,
+            seedTier: inheritedTierSeed(logicalSeed.tier),
+          },
         });
         const snapshotReset = collector !== null
           && snapshots.replaceFor(source, historySeed?.seedSnapshots ?? []);
@@ -242,13 +256,7 @@ async function run() {
               }
             },
           },
-          seedModel: historySeed?.seedModel ?? logicalSeed?.model ?? null,
-          seedEffort: historySeed?.seedEffort ?? logicalSeed?.effort ?? null,
-          // Lineage speed carry-forward: the parent's final tier already folds
-          // in its own seed, so a direct-parent lookup spans the whole chain.
-          seedTier: historySeed?.seedTier
-            ?? inheritedTierSeed(logicalSeed?.tier ?? null),
-          seedTotals: historySeed?.seedTotals ?? null,
+          ...selectedSeed,
           ...(maximumLineBytes === undefined ? {} : { maximumLineBytes }),
           onEvent: (event) => {
             events.push(event);
@@ -272,7 +280,8 @@ async function run() {
         ));
         const quarantineReason = rolloutContentQuarantineReason(outcome);
         if (quarantineReason !== null) markUnavailable(source);
-        if (source.sessionId && quarantineReason === null) {
+        if (source.sessionId && quarantineReason === null
+            && logicalHeads.get(source.sessionId) === source) {
           finalBySessionId.set(source.sessionId, {
             model: outcome.finalModel,
             effort: outcome.finalEffort,
@@ -298,13 +307,14 @@ async function run() {
           toolRecordsSkipped: outcome.diagnostics.toolRecordsSkipped,
           oversizedLines: outcome.read.oversizedLines,
           retainedSnapshotKeys: snapshots.retainedKeys,
-          seeded: historySeed?.seedModel != null || logicalSeed?.model != null,
+          seeded: selectedSeed.seedModel !== null,
         }, quarantineReason === null ? {
           nextOffset: outcome.read.nextOffset,
           finalModel: outcome.finalModel,
           finalEffort: outcome.finalEffort,
           // Own-file declarations only: an inherited seed is re-derived from
-          // the ancestor chain on the next pass, keeping its provenance.
+          // the exact physical base or legacy inline ancestor chain on the
+          // next pass, keeping its provenance.
           finalTierRaw: ownObservedTier(outcome.finalTier)?.providerTierRaw ?? null,
           finalTierObservedAtMs: ownObservedTier(outcome.finalTier)?.observedAtMs ?? null,
           finalTotals: outcome.finalTotals,
