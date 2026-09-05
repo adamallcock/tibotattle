@@ -127,21 +127,110 @@ actual preserved v11 generation has 8,062 unchanged `skipped`, 15 `resumed` and
 nine `rescanned` sources, all with complete diagnostics; the v13 rehearsal has
 8,091 `rescanned`, all with complete diagnostics. Here `skipped` means a valid
 unchanged-source fast path, not the generation's quarantined-source count.
-The fresh verifier must use the actual closed status contract. Its additional
-event-recognition check also needs owner approval to correct the shared-model
-dimension assumption, as recorded in the preparation plan. Neither fresh v14
-rehearsal nor R7 regeneration has run.
+The fresh verifier uses that actual closed status contract. Its additional
+event-recognition check received explicit owner approval to correct the
+shared-model dimension assumption: missing evidence is proved by exact-occurrence
+seedless extraction, while the stored model identity must be unknown. All
+counter, effort, tier, identity and preservation checks remain. Fresh R7
+regeneration and receipt replacement also have explicit owner approval; they
+have not yet run on the corrected source.
 
-The v13 rehearsal is useful preservation/diagnostic evidence, not completed
-attribution or RC3 qualification. Fresh synthetic, copy-only v14 and full R7
-evidence are required before signing or installed replacement.
+The fresh copy-only v14 ingestion now completes without rebuilding, scanning
+8,096 sources with no malformed records or quarantined sources. All 804,238
+original usage keys, 844,934 original tool keys and 8,086 original sources remain;
+source coverage does not recede. Both motivating rows have unknown model identity
+and exact own-prefix missing-model proof. The original backup, salt and prior
+v13 evidence remain unchanged. Accounting is deliberately a separate stage,
+gated by independent semantic review of the new generation.
+
+The v13-to-v14 comparison preserves all 805,386 existing occurrences, their
+identities and all counter values/nullability. The broader classification review
+covers 62,428 known-model rows becoming unknown, 50,663 effort rows that
+change, and 269,505 speed/tier classifications change. Metadata tracing places
+all model/effort changes and 269,503 tier changes on paginated resets without a
+physical history base; two tier changes are inline descendants of such resets.
+No affected source has an exact physical history anchor or a lost selected
+parent. The independent own-prefix audit now covers every one of the 289,476
+affected occurrences across 5,185 sources. All changed model/effort/tier values
+match the source's own evidence or the two explicit reset-boundary descendants;
+there are no classification mismatches, unresolved partial contexts or malformed
+relevant records. All removed labels match the prior logical ancestor's final
+state. In 8,392 effort changes, removing the unsupported inherited effort restores
+the thread's explicit own setting; the other 42,271 have no own effort evidence.
+
+The audit preserves a failed first attempt: later repeated metadata had
+incorrectly overwritten the verifier's first-header identity. Discovery correctly
+uses the first session metadata. The corrected audit retains that authority,
+counts later records separately, and parses complete relevant root records
+without relying on JSON field ordering. This is a diagnostic correction, not a
+production parser change.
+
+Of the affected sources, 5,182 still match the indexed size, timestamps and full
+physical identity/state tokens exactly. Three active files have appended data;
+their 125 affected rows are tier-only changes and still agree with their current,
+hash-stable prefixes. The audit deliberately returns a non-passing static-snapshot
+gate for those three exceptions; neither an append nor a current hash proves
+retroactive full-file byte identity. A separate production-extractor replay now
+closes their semantic review: all 2,303 retained occurrences across exactly
+175,601,701 indexed-prefix bytes match their offset, timestamp, model, effort,
+tier, outcome and all nine available/unavailable token fields. All 125 changed
+tiers reproduce as own-unobserved. Immutable canonical identities, monotonic
+append, unanchored reset metadata and before/after bounded-prefix hashes pass.
+The prior non-passing static-snapshot report remains unchanged; the separate
+proof establishes current-prefix agreement with the retained generation, not
+retroactive whole-file byte identity. Both databases and published generation
+fingerprints remain unchanged.
+
+After reviewing that separate closure and the nullable-component proof below,
+the coordinating task approved the exact generation-70 semantic report through
+its hash-bound review receipt. Copy-only accounting completes in 71 seconds,
+publishes and reads back a v0.15 cache bound to exact v14 generation 70, and
+reports complete source coverage: 8,096 sources, 807,434 usage events and no
+quarantined sources. Source coverage is not a claim that unknown models or
+components became fully priced. The original backup, cloned index, unrelated
+clone state and four speed-baseline windows remain unchanged; no quota refresh,
+Keychain access, baseline recording or network operation occurs. This approval
+is not a manual native-observation receipt or release authorization.
+
+A separate local raw-record review explains the older v11-to-v14 nullable
+component changes across all 1,053 affected occurrences in 68 source files.
+Of these, 1,005 omit `cache_write_input_tokens`; an uncached-input split cannot
+be measured without that component. The other 48 have individually consistent
+complete vectors but inconsistent cumulative differences: 34 input splits and
+16 output splits, with two rows in both groups. Those derived components remain
+unavailable rather than being clamped into apparently measured counts. No
+existing combined-output or input-context value changes. The review emits only
+closed aggregate presence/consistency categories; no raw content or source
+identity is retained in its output. This explains nullability, not full pricing
+coverage or acceptance of the separate model/tier changes.
+
+An independent follow-up closes a diagnostic gap in that initial explanation:
+a hypothetical cumulative difference alone does not prove which vector the
+parser selected. The unmodified extractor reproduced all 1,053 exact occurrences
+and all five stored components, with zero identity, timestamp, component,
+missing-row or duplicate-row mismatches. All 68 files exactly match their saved
+size, timestamps and physical identity/state tokens, before and after the read.
+An in-process observer directly confirmed the actual delta-selection branch for
+all 48 fully present rows; three synthetic observer cases distinguish delta,
+per-turn excess and regression selection. The 60 inline forks use persisted
+ancestor snapshot membership, and normal partial-line handling remains enabled.
+No production source, database, credentials or network state is changed by this
+verification. The earlier hypothetical calculation is corroboration only; the
+exact replay and branch observation supply the acceptance proof.
+
+The v13 rehearsal remains preservation/diagnostic evidence, not RC3 qualification.
+Fresh synthetic and copy-only v14 evidence now close their respective source and
+real-state semantics gates. Fresh full R7 evidence remains required before
+signing or installed replacement.
 
 ## Remaining work
 
-- Allocate and verify fresh signed ARM/Intel RC3 `1025.2` on a common new clean
+- Regenerate and verify all ten R7 receipts on the corrected source, then rerun
+  the full root suite without excluding stale-evidence tests.
+- Build and verify fresh signed ARM/Intel RC3 `1025.2` on a common new clean
   annotated source tag. Keep RC2 `1025.1` unchanged; stable remains `1026`.
-- Rehearse forward parser recovery against a separate state copy, then perform
-  the authorized installed ARM transition and observe launch/refresh/restart,
+- Perform the authorized installed ARM transition after the completed copy-only
+  rehearsal, then observe launch/refresh/restart,
   preserved state and prompt behavior. Do not reopen migrated state with an
   older reader; rollback includes its matching pre-upgrade state copy.
 - Record the actual manual-v2 clean-profile/Login Item and failure-path matrix;
