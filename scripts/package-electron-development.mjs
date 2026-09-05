@@ -57,7 +57,10 @@ export function developmentPackagePlan({ target, format = "distribution", source
     schemaVersion: SCHEMA, sourceRevision, version: RELEASE_VERSION, target, format,
     host: Object.freeze({ platform: hostPlatform, architecture: hostArchitecture }),
     nativeHost: hostPlatform === spec.platform && hostArchitecture === spec.architecture,
-    buildHostAvailable: spec.platform === "win32" || hostPlatform === spec.platform,
+    // The pinned builder ships checksum-verified Darwin tools for Linux
+    // AppImage and archive generation. Native execution remains separate.
+    buildHostAvailable: spec.platform === "win32" || hostPlatform === spec.platform
+      || (spec.platform === "linux" && hostPlatform === "darwin"),
     stagingDirectory: `.release-build/electron-dev/${target}/app`,
     outputDirectory: `.release-build/electron-candidates/${sourceRevision}/${target}/${format}`,
     builderArguments: Object.freeze([platformFlag, ...(format === "dir" ? ["dir"] : distributionTargets), `--${spec.architecture}`, "--publish", "never"]),
@@ -168,6 +171,11 @@ export async function packageElectronDevelopment(options) {
   try { await lstat(output); fail("OUTPUT_EXISTS"); } catch (error) { if (error.code !== "ENOENT") throw error; }
   const partial = await mkdtemp(join(dirname(output), `.${options.format}-`));
   const env = developmentBuildEnvironment(process.env, options.target);
+  if (options.target === "linux-x64") {
+    await run(process.execPath, ["--test", "test/electron-appimage-launcher.test.js"], {
+      env, logPath: join(partial, "launcher-check.log"),
+    });
+  }
   const stage = await buildElectronApp({ target: options.target, replace: options.replaceStaging, windowsBindingPath: options.windowsBindingPath, windowsManifestPath: options.windowsManifestPath });
   void stage;
   const builder = require.resolve("electron-builder/cli.js");
@@ -190,7 +198,7 @@ export async function packageElectronDevelopment(options) {
   const required = options.target.startsWith("darwin-") ? [".dmg", ".zip"] : options.target === "win32-x64" ? [".exe", ".zip"] : [".AppImage", ".tar.gz"];
   if (options.format === "distribution" && required.some((extension) => !distributions.some(({ file }) => file.endsWith(extension)))) fail("DISTRIBUTION_MISSING");
   if (await cleanSource() !== sourceRevision) fail("SOURCE_CHANGED");
-  const receipt = { ...plan, status: "development_package_verified", runtimeExecuted: false, verification, executable: await digestFile(paths.executable), asar: await digestFile(asarPath), distributions };
+  const receipt = { ...plan, status: "development_package_verified", runtimeExecuted: false, appImageLauncherContractChecked: options.target === "linux-x64", verification, executable: await digestFile(paths.executable), asar: await digestFile(asarPath), distributions };
   await writeFile(join(partial, "development-package.json"), `${JSON.stringify(receipt, null, 2)}\n`, { flag: "wx", mode: 0o600 });
   await writeFile(join(partial, "SHA256SUMS.txt"), distributions.map(({ file, sha256 }) => `${sha256}  ${file}\n`).join(""), { flag: "wx", mode: 0o600 });
   await rename(partial, output);

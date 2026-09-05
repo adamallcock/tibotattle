@@ -43,7 +43,7 @@ jobs:
           node -e "if(process.version!=='v26.2.0'||process.platform!=='darwin'||process.arch!=='arm64')process.exit(1)"
           pnpm install --frozen-lockfile --ignore-scripts
       - name: Validate packaging contracts
-        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js
+        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js
       - name: Build and verify development distributions
         run: node scripts/package-electron-development.mjs --target darwin-arm64 --format distribution --replace-staging
       - name: Retain verified development packages and receipts
@@ -86,7 +86,7 @@ jobs:
           node -e "if(process.version!=='v26.2.0'||process.platform!=='darwin'||process.arch!=='x64')process.exit(1)"
           pnpm install --frozen-lockfile --ignore-scripts
       - name: Validate packaging contracts
-        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js
+        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js
       - name: Build and verify development distributions
         run: node scripts/package-electron-development.mjs --target darwin-x64 --format distribution --replace-staging
       - name: Retain verified development packages and receipts
@@ -146,7 +146,7 @@ jobs:
           node scripts/build-windows-filesystem-manifest.mjs
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_BINDING_MANIFEST_FAILED' }
       - name: Validate packaging contracts
-        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js
+        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js
       - name: Build and verify development distributions
         run: node scripts/package-electron-development.mjs --target win32-x64 --format distribution --replace-staging
       - name: Retain verified development packages and receipts
@@ -193,7 +193,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends libsecret-1-0 libarchive-tools libfuse2t64
       - name: Validate packaging contracts
-        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js
+        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js
       - name: Build and verify development distributions
         run: node scripts/package-electron-development.mjs --target linux-x64 --format distribution --replace-staging
       - name: Retain verified development packages and receipts

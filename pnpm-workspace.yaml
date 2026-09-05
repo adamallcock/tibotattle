@@ -3,3 +3,6 @@ packages:
 
 allowBuilds:
   '@github/keytar': false
+
+patchedDependencies:
+  app-builder-lib@26.15.7: config/patches/app-builder-lib@26.15.7.patch

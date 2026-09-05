@@ -22,7 +22,8 @@ test("one development packaging contract covers the four actual target architect
     assert.equal(plan.updaterEnabled, false);
     assert.equal(plan.installedLifecycleQualified, false);
   }
-  assert.equal(developmentPackagePlan({ target: "linux-x64", sourceRevision, hostPlatform: "darwin" }).buildHostAvailable, false);
+  assert.equal(developmentPackagePlan({ target: "linux-x64", sourceRevision, hostPlatform: "darwin" }).buildHostAvailable, true);
+  assert.equal(developmentPackagePlan({ target: "darwin-x64", sourceRevision, hostPlatform: "linux" }).buildHostAvailable, false);
   assert.equal(developmentPackagePlan({ target: "linux-x64", sourceRevision, hostPlatform: "linux", hostArchitecture: "arm64" }).nativeHost, false);
 });
 
