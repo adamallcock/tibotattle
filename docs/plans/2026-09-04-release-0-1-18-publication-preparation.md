@@ -39,8 +39,9 @@ The complete affected local suite passes 305/305; the native suite passes
 110/110, with no skips. Release trust plus release-note tests pass 89/89,
 and retained R7 freshness passes 2/2 on each pinned Node runtime. The original
 installed stable app also passes signed/stapled/Gatekeeper validation and the
-validator's isolated fake-manager smoke; it has not been replaced or normally
-relaunched.
+validator's isolated fake-manager smoke. At that initial qualification point,
+it had not yet been replaced or normally relaunched. The later RC3 replacement
+is recorded below.
 
 An isolated full-state copy has completed v11-to-v13 ingestion without a rebuild,
 skipped sources, missing historical usage/tool keys or receding source coverage.
@@ -147,7 +148,15 @@ Windows qualification. Both pinned-runtime R7 freshness/reconstruction checks
 and documentation governance also pass. RC1's four retained files and both RC2
 DMGs/receipts match their recorded hashes; RC2's tester files have fresh
 before-signing baselines without a claim about an unavailable earlier hash.
-No RC3 DMG has been created yet.
+Both RC3 DMGs have now been finalized from clean `7701debf` under a new local
+annotated RC3 source tag. Signing, notarization, exact final-artifact validation
+and both same-architecture RC2-to-RC3 replacement checks pass; the
+[RC3 receipt](../receipts/2026-09-04-macos-combined-rc3-signed-candidates.md)
+binds the bytes. The final ARM app was Finder-installed with the verified full
+rollback copy preserved and passes production installed-artifact validation.
+The Mac locked before normal launch; the UI refused to proceed and a process
+check found no TiboTattle process. Actual launch, refresh/migration and restart
+remain pending an owner unlock. No security prompt was bypassed.
 Publication remains held. Signing-key prompt approval, changes to
 real credential protection, physical/manual proof and external deployment are
 not inferred from source tests or this continuation.
@@ -248,8 +257,8 @@ on the owner's working profile, or publication before qualification.
 | Boundary | Required proof before the corresponding claim |
 | --- | --- |
 | Signed RC2 — complete | One clean annotated dogfood source tag; independent ARM/Intel Developer ID, notarization, staple, Gatekeeper, exact-byte and same-architecture replacement receipts; not installed-upgrade proof |
-| Corrected signed RC3 — pending | Fresh common clean source/tag and build `1025.2`, new ARM/Intel final bytes and receipts; never relabel or overwrite RC2 |
-| Installed ARM | Exact signed same-identity upgrade with preserved state; prompt-free launch/refresh/restart and manual clean-profile/Login Item and failure-path matrix |
+| Corrected signed RC3 — complete | Common clean `7701debf` source/local annotated tag, build `1025.2`, independently verified new ARM/Intel final bytes and receipts; RC1/RC2 preserved |
+| Installed ARM — in progress | Final ARM DMG app Finder-installed with rollback preservation; production installed-artifact validator passes. Normal launch/refresh/restart awaits unlocked UI; manual clean-profile/Login Item and failure-path matrix remains open |
 | Physical Intel | Physical macOS 14+ clean install, discovery/offline accounting, lifecycle, silent Keychain and installed Intel A-to-B update; actual upload requires the tester's own consent |
 | Stable artifacts | New common exact annotated `v0.1.18` source, reviewed release text, build `1026`, ARM previous-stable continuity and explicit Intel first-stable bootstrap; repeat final-byte native gates |
 | Hosted model dashboard | Verified historical 0041 ledger/schema followed by reconciled 0042-0045; separately authorized pending migrations/deployment, scheduled warming and authenticated rendered model evidence; health alone is insufficient |

@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-04
 type: status
 status: current
-source_commit: 4ea16586d83c72d0a4af506b102a267251f45a2b
+source_commit: 7701debf44e046ac9f25bb74f7214532e32c5c5d
 observation_date: 2026-09-04
 ---
 
@@ -18,10 +18,11 @@ using this page for a later release or operational decision.
 
 | Boundary | Verified state |
 |---|---|
-| Documentation/source review | Combined Astra/Intel `0.1.18` RC3 preparation follows frozen RC2 source `4ea16586d83c72d0a4af506b102a267251f45a2b`, based on requested `9e1c3333`. The [installed-upgrade review](./reviews/2026-09-04-installed-upgrade-readiness.md) records a corrected upgrade deadline and a copy-only preservation/accounting rehearsal that exposed future-parent model attribution in paginated resets. Parser v14 correction and fresh R7 evidence are now required. Earlier 305/305 local and 110/110 native results remain bound to the initial deadline correction. RC3 `1025.2` is allocated, not signed; stable remains `1026`. No stable tag or publication |
+| Documentation/source review | Combined Astra/Intel `0.1.18` RC3 is frozen at `7701debf44e046ac9f25bb74f7214532e32c5c5d`, based on requested `9e1c3333`. Parser v14 corrects paginated reset attribution and the upgrade deadline. Copy-only preservation/semantic/accounting proof and all ten fresh R7 receipts pass their respective checks; full root run has 3,859 passes, zero failures and seventeen existing native-Windows skips. R7 resource decisions remain open. Stable `1026` is unbuilt, with no stable tag or publication |
+| Combined signed RC3 | ARM and Intel `0.1.18` build `1025.2` dogfood DMGs from common clean `7701debf` and a local annotated tag; [exact receipt](./receipts/2026-09-04-macos-combined-rc3-signed-candidates.md). Both signed/notarized/stapled with independent final-byte and RC2-to-RC3 replacement checks; real installed runtime, manual lifecycle and physical Intel remain separate |
 | Combined signed RC2 | ARM and Intel `0.1.18` build `1025.1` dogfood DMGs from common source `4ea16586` and a new local annotated tag; [exact receipt](./receipts/2026-09-04-macos-combined-rc2-signed-candidates.md). Both signed/notarized/stapled with independent exact-byte and same-architecture replacement checks; not installed-upgrade, manual lifecycle or physical Intel proof |
 | Earlier Intel tester artifact | Preserved signed/notarized `0.1.18` build `1025` dogfood DMG from source `18c7065b`; [historical receipt](./receipts/2026-09-03-macos-intel-signed-candidate.md). Predates combined Astra changes; remains immutable rollback/test evidence, not physically Intel-qualified |
-| Installed app | Direct 2026-09-04 inspection supersedes the older RC9 observation: ARM stable `0.1.17` / `1024`, source `aa660b24`, tag `v0.1.17`. The app was gracefully stopped and its exact bundle, full state and native preferences preserved and checked. No replacement yet; the isolated-copy upgrade rehearsal is not installed qualification |
+| Installed app | The final signed ARM RC3 `0.1.18` / `1025.2`, source `7701debf`, was Finder-installed after full stable `0.1.17` / `1024` app/state/preferences rollback verification. Production installed-artifact validation passes. The Mac locked before observable normal launch; no TiboTattle process was running afterward. Working-state migration, normal refresh/restart and manual proof remain pending |
 | Public service | Health/readiness HTTP 200, enrollment and upload processing enabled; deployment source `b4c8f103bf697fb530434e6de196f2c187645661`, observed 2026-09-04 03:57 UTC (2026-09-03 locally). Later read-only ledger/schema checks found a divergent historical migration 0041 and absent new composition tables. Hosted release remains blocked; no remote schema changes were made |
 | Public updater | Stable `0.1.16`; read-only feed check recorded 2026-09-03 in the release plan |
 | Published release | Immutable GitHub `v0.1.17`, published 2026-09-03 at 19:47:43 UTC; ARM DMG, appcast, manifest, checksums and verification guide; exact source tag commit `aa660b24a66196155ba59267ab832cc4ef6e1c7d` |
@@ -137,8 +138,10 @@ The complete qualification matrix and rules for changing these claims are in
   source/payload and require explicit human-observed native hardware/OS; they
   cannot turn synthetic tests into physical qualification. Local checks and
   [combined RC2 signing/notarization](./receipts/2026-09-04-macos-combined-rc2-signed-candidates.md)
-  pass on their named source. A subsequently discovered parser-upgrade deadline
-  regression now requires fresh RC3 `1025.2` bytes. Installed lifecycle,
+  pass on their named source. Corrected parser v14 and its upgrade deadline now
+  have fresh [signed RC3 evidence](./receipts/2026-09-04-macos-combined-rc3-signed-candidates.md).
+  Final ARM installation and production installed-artifact checks pass; normal
+  runtime observation awaits an owner-unlocked Mac. Installed lifecycle,
   physical Intel, stable finalization and hosted activation remain open.
   The 0.1.17-only manual-matrix deferral does not carry
   forward. No publication or update activation occurred.

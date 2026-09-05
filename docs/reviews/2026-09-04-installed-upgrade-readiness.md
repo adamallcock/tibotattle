@@ -231,10 +231,16 @@ Documentation and both pinned-runtime R7 freshness checks also pass.
 
 ## Remaining work
 
-- Build and verify fresh signed ARM/Intel RC3 `1025.2` on a common new clean
-  annotated source tag. Keep RC2 `1025.1` unchanged; stable remains `1026`.
-- Perform the authorized installed ARM transition after the completed copy-only
-  rehearsal, then observe launch/refresh/restart,
+- Fresh signed ARM/Intel RC3 `1025.2` now passes exact-artifact and replacement
+  checks on common clean `7701debf` and its new local annotated tag; see the
+  [RC3 receipt](../receipts/2026-09-04-macos-combined-rc3-signed-candidates.md).
+  RC1/RC2 remain unchanged; stable remains `1026`.
+- The authorized Finder replacement installed the final signed ARM app and
+  production installed-artifact validation passes. Full original state,
+  preferences and old app matched the rollback copy immediately before
+  replacement. The Mac locked before observable normal launch; the UI refused
+  to proceed and no TiboTattle process was running afterward. Resume after the
+  owner unlocks, then observe launch/refresh/restart,
   preserved state and prompt behavior. Do not reopen migrated state with an
   older reader; rollback includes its matching pre-upgrade state copy.
 - Record the actual manual-v2 clean-profile/Login Item and failure-path matrix;
