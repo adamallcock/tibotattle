@@ -9,8 +9,8 @@ status: maintained
 
 This is the authority for public operating-system support claims. It defines
 what must be proven before a platform moves from source work to supported use.
-macOS 14+ on Apple silicon is supported. The 0.1.18 release adds Intel macOS
-14+ support on publication under the narrow, owner-approved
+macOS 14+ on Apple silicon and Intel is supported through the published 0.1.18
+release. Intel support is covered by the narrow, owner-approved
 [manual-qualification waiver](../decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md).
 This support declaration does not assert that the missing physical/manual
 tests passed. Windows and Linux remain unsupported; Electron is not a released
@@ -20,8 +20,8 @@ desktop surface.
 
 | Platform | Source and contract | Native/physical qualification | Install, trust, update, release | Public status |
 |---|---|---|---|---|
-| macOS 14+ arm64 | Implemented | Native macOS product and retained qualification paths; 0.1.18 disposable-profile/manual matrix explicitly waived, not passed | Existing stable support; 0.1.18 build 1026 must retain its own final native trust, update and publication evidence | **Supported** |
-| macOS 14+ x86_64 | Explicit thin Intel build, native broker, packaging and isolated updater contracts | Cross-compilation and Rosetta checks; formal physical Intel/manual matrix explicitly waived for 0.1.18, not passed | Signed/notarized RC3 verified locally; final stable 1026 trust, architecture-specific update and public-delivery gates remain required | **Supported from v0.1.18 publication under the release-specific waiver** |
+| macOS 14+ arm64 | Implemented | Native macOS product and retained qualification paths; 0.1.18 disposable-profile/manual matrix explicitly waived, not passed | Stable 0.1.18 / 1026 published with exact final native trust, installed refresh/restart, signed update feed and public-delivery checks | **Supported** |
+| macOS 14+ x86_64 | Explicit thin Intel build, native broker, packaging and isolated updater contracts | Cross-compilation and Rosetta checks; formal physical Intel/manual matrix explicitly waived for 0.1.18, not passed | Stable 0.1.18 / 1026 published with its own final native trust, independent signed update feed and public-delivery checks | **Supported under the release-specific waiver** |
 | Windows x64 | Portable core and fail-closed native filesystem/credential adapter exist | Partial qualification evidence; not a standing release gate | No supported signed installer, clean install/upgrade/uninstall receipt, updater, or stable artifact | **Unsupported** |
 | Linux x86_64 | Portable/core and container checks may run | Contract or container results are not physical desktop qualification | No supported signed package/repository, clean install/uninstall receipt, updater boundary, or stable artifact | **Unsupported** |
 
