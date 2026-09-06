@@ -5,116 +5,137 @@ type: plan
 status: in-progress
 ---
 
-# Target and baseline
+# Objective and current position
 
-Prepare one Electron app for Apple Silicon Mac, Intel Mac, Windows x64 and
-Linux x64. Keep provider support inside that app. Preserve the accepted
-[accountless sharing policy](../decisions/2026-09-04-accountless-sharing-policy.md)
-and finish local and hosted integration without treating development packages
-as production qualification.
+Updated 2026-09-06. Deliver one primary Electron application for Apple Silicon
+Mac, Intel Mac, Windows x64 and Linux x64, with one shared product and release
+process. Provider support stays inside that app. The accepted
+[sharing policy](../decisions/2026-09-04-accountless-sharing-policy.md) remains
+fresh-install automatic sharing, persistent opt-out, no sign-in, and three
+visible notices before activation for existing undecided installations.
 
-The published [native 0.1.18 release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.18)
-was verified on 2026-09-05. Its annotated tag resolves to
-`55c813a1bf7e67c00e47410b760104c0d9fbc0ea`. Electron starts this pass at
-`14e6a02c131936177cbb0acf1d801d3653658a1b`; its shared desktop accounting/cache
-release fixes are already present. Remaining release-branch differences are
-hosted Worker repairs and release evidence, not a missing local accounting
-implementation. Reconcile those differences deliberately with the accountless
-schema work.
+The current tested development candidate is
+`65a1132bf5ecf4505a8c3d1d456cb1f955db8cea`. Its four unsigned packages passed
+[CI run 34012137047](https://github.com/adamallcock/tibotattle/actions/runs/34012137047).
+The Mac app started, its owned companion reported ready with hosted
+contributions disabled, and a copied-history refresh completed. The shared
+accounting/cache release changes are present; released Worker repairs were
+also reconciled. Native 0.1.18 is the predecessor baseline, whose tag resolves
+to `55c813a1bf7e67c00e47410b760104c0d9fbc0ea`.
 
-All four unsigned development targets passed [run 33979427838](https://github.com/adamallcock/tibotattle/actions/runs/33979427838)
-at that exact Electron source. Mac popup inspection and interaction evidence
-are retained in the local tester handoff. The older tracked tray QA record is
-a point-in-time record and predates the final control fix and package run.
+This establishes a development candidate, not a production replacement.
+Final rendered inspection of the corrected package remains uncompleted after
+the Mac locked. The current update UI is disabled. Accountless scheduling and
+credentials work only in the injected local laboratory; ordinary distributed
+launches do not have accountless upload authority. Physical platform and
+installed upgrade evidence remain incomplete.
 
-The original dirty accountless checkout is preserved. A private patch/file
-snapshot was made before applying its changes to this isolated integration
-checkout. The generated translation mirror was rebuilt from both sets of
-canonical entries; the tested tray changes remain in place.
+# Workstreams and completion evidence
 
-## Completion sequence
+| Workstream | Remaining work | Required demonstration |
+| --- | --- | --- |
+| 1. Product and background parity | Finish a fixed page/action matrix against native 0.1.18: overview, allowance, trends, usage/cost/cache, community, settings/about and tray. Compare accounting, quota, refresh, retry/cancel, persistence and relevant hosted/admin behavior on the same evidence. Record intentional visual differences. | Exact packaged candidate passes journeys, with no unexplained data/behavior differences or unresolved blocking interaction defects. Cold, active-refresh and recovery behavior remain usable. |
+| 2. Native Mac handover | Implement production state/credential migration, stable app identity, exclusive writer ownership and old login-item handover. Preserve history, identity salt, settings and sharing choices; test interrupted migration and recovery. | Supported native predecessor upgrades to signed Electron without loss, duplicate writers/uploads or reset choices; restart and interrupted migration recover. Cover both Mac architectures. A copied development profile does not satisfy this gate. |
+| 3. Accountless contributions | Implement the reviewed ownership/schema bridge; connect enrollment, private credentials, authorization and the existing encrypted upload pipeline. Preserve old social clients. Complete disclosure/reminder delivery and production activation controls. | Fresh automatic sharing; three actual notices for existing undecided installs; persistent explicit opt-out; usage/quota linkage across provider/account changes; deduplicated lost-response retries; bounded abuse; revocation/expiry and no unexpected public aggregate admission. Test first against disposable synthetic Worker databases, then an authorized controlled hosted rehearsal. |
+| 4. Production packaging and updates | Turn the four-target development pipeline into one production pipeline: final app identity, signing/trust, compatible pinned updater, architecture-correct feeds, protected release metadata and safe interrupted-update handling. | A signed/trusted Electron candidate updates to a subsequent signed/trusted Electron candidate on each claimed target. Installers, update payloads, checksums and support/download metadata identify the same frozen source/version. |
+| 5. Platform runtime qualification | Finish Windows/Linux production adapter composition where still gated. Exercise actual credentials, filesystem permissions, tray, notifications, login startup, sleep/resume, install/upgrade/uninstall and recovery on declared environments. | Reproducible native runtime/lifecycle receipts for Apple Silicon, Intel, Windows x64 and the explicitly supported Linux environment(s). A build or container pass alone is insufficient. |
+| 6. Rollout and native retirement | Integrate through one source/release line; prepare compatible backend rollout, tester cohorts, support/privacy copy, recovery instructions and a defined observation window. Retain long-tail native migration access. | Controlled rollout succeeds, subsequent Electron update succeeds, all advertised targets qualify, and the observation/recovery gate passes before the active native feature/build lane retires. |
 
-1. Reconcile released Worker fixes and finish the reviewed accountless ownership
-   source migration with preservation tests. The earlier automatic-review
-   rejection remains a gate: explicit source-only/disposable-database approval
-   is pending under the [prepared migration proposal](../reviews/2026-09-05-accountless-migration-proposal.md).
-2. Exercise the real local Worker enrollment and encrypted v1.1 pipeline from
-   the desktop client: one installation namespace for usage/quota, lost-response
-   duplicate retries, expiry/revocation, restart and opt-out fencing. Preserve
-   the existing social path and accountless public-aggregate exclusion.
-3. Resolve remaining page/navigation gaps, starting with verified parent links
-   for Auto Review cache drops. Inspect rendered fixtures and the final packaged
-   app; source inspection alone is not page parity.
-4. Complete the Mac state/credential/update cutover and equivalent Windows/Linux
-   runtime composition. Keep each platform's capability declarations tied to
-   its actual adapter and artifact evidence; do not enable a platform by changing
-   readiness booleans.
-5. Run focused checks, affected surface gates, copied-profile responsiveness,
-   then regenerate four development packages for the final integrated source.
-   Retain failures and distinguish cold, idle and active-refresh measurements.
+# Execution order
 
-## External gates
+The earliest decisive milestone is **native 0.1.18 -> Electron candidate ->
+next Electron candidate**, preserving data and choices throughout. Prioritize
+streams 2 and 4 together; this tests the most consequential unproven part of
+the transition. Test supported 0.1.17 upgrade paths as well, or provide a
+qualified bridge rather than silently excluding users who skipped a release.
 
-This pass authorizes source work, isolated tests and the existing development
-branch/CI flow. Remote migrations, deployments, hosted activation, real uploads,
-signing, system-app replacement and publication remain separate operations.
-Physical Intel/Windows/Linux behavior and installed update recovery must be
-qualified on those targets before public support is claimed.
+Run product parity, accountless integration and Windows/Linux preparation in
+parallel. The accountless schema approval does not block product QA, updater
+source work, migration design or platform qualification preparation. Likewise,
+a locked Mac blocks visible inspection, not the rest of the programme.
 
-## Integrated local checks
+Use three explicit readiness milestones:
 
-The preserved contribution prototype combined with the final tray source
-passed 122 focused contribution/projection/retry tests before the next
-credential-hardening edits. Architecture and documentation checks passed.
+1. **Daily-use tester:** product journeys pass on the packaged Mac candidate,
+   copied-profile refresh/cancel/restart are reliable, known limitations are
+   visible, and the original installation is preserved. This is the next
+   short completion target; it can precede hosted contribution activation.
+2. **Release candidate:** real native migration, accountless end-to-end tests,
+   production updater/signing and required native platform journeys pass on
+   frozen candidates. The next Electron update is part of this milestone.
+3. **Primary public app:** authorize compatible server preparation and staged
+   client rollout, verify live delivery and updates, then retire native feature
+   development after the agreed observation/recovery gate. Four-platform
+   support requires all four platform gates; earlier previews are labelled.
 
-The desktop laboratory now constructs the protected credential adapter after
-Electron readiness and carries it over the existing private child channel.
-Normal desktop launches still cannot activate that laboratory through ambient
-environment variables. An actual owned-child test composes the desktop, local
-contribution scheduler and encrypted synthetic credential store; it covers
-opt-out during a pending pass, restart off, and re-enable retaining the same
-credential. Its runner performs no enrollment or upload, so this is local
-composition evidence and does not replace the pending real-Worker test.
+One programme and one intended app release do not require one simultaneous
+production switch. Prepare backward-compatible server changes before client
+activation. Test local app migration while contribution sending is held, then
+test the full enabled policy before its release. A temporary hold must be
+explicit in tester copy; it must not silently become a change to the accepted
+fresh/existing-install sharing policy.
 
-On 2026-09-06 the combined source passed 542 web tests, 315 local-companion
-tests, and 437 Electron/contribution security tests. The final configuration
-shape change then passed all 24 owning desktop-runtime tests. The first
-restricted runtime invocation could not start its loopback child; the same
-suite passed with local loopback access. That environment failure is retained
-alongside the successful log. Architecture, documentation, and the 20-test
-preflight also passed.
+# Scope and ownership that keep this bounded
 
-Auto Review cache-drop rows now resolve only a verified ordinary parent from
-the selected local Codex store and bounded session metadata. Unavailable or
-review-to-review parents produce a non-link label. All 66 owning tests passed;
-the actual cell renderer with the unmodified stylesheet was inspected using
-synthetic rows. This is renderer evidence, pending the fresh packaged-app
-inspection. No ledger attribution changes accompany the navigation fix.
+- Assign narrow owners for product parity, migration, contribution ownership,
+  and distribution/platform adapters. Use one integration owner and one
+  acceptance ledger. Parallel agents can implement and review isolated pieces;
+  physical-device and signing evidence still requires the actual environments.
+- Reconcile the released base once, then bring necessary shared fixes through
+  the integration line. Keep native-shell changes to urgent fixes and migration
+  support; new features target the shared app. Do not create another detached
+  "latest features" product or competing release manifest.
+- Keep current primary package formats: two thin Mac packages, Windows NSIS,
+  and Linux AppImage with its declared support environment. Additional stores,
+  Linux formats, universal Mac packaging and more CPU targets are outside the
+  initial cutover. One source can still produce platform-specific binaries.
+- Reuse electron-builder and a compatible pinned electron-updater behind the
+  existing release trust policy. [Official updater documentation](https://www.electron.build/docs/features/auto-update/)
+  confirms the existing Mac/NSIS/AppImage direction; it does not qualify this
+  repository's pinned versions. Sign early in migration/update experiments:
+  [Electron documents](https://www.electronjs.org/docs/latest/tutorial/code-signing)
+  that Mac key storage, login registration and updating depend on app signing.
+- Keep Claude off the initial shell migration critical path. Enable it later
+  through the same shared provider interface and the same four packages.
+- Timebox the direct native-updater-to-Electron handover experiment. If it is
+  not viable, select a minimal bridge or a guided signed install with the same
+  data-preservation checks. Do not build a general migration framework.
+- Set a short initial budget for that handover/updater spike and product QA,
+  then estimate the release date from its results and confirmed hardware/
+  signing access. A calendar promise before those checks would be speculative.
 
-The released Worker repairs have been reconciled, including the exact released
-0043–0045 migration bytes, bounded analytical queries, and current snapshot and
-administrative tooling. Migration 0046 remains an upload-free enrollment ledger;
-no 0047 migration or ownership route has been added. An independent review of
-the local credential and IPC boundary found no blocking issue. These results
-do not remove the pending source-migration approval or hosted end-to-end gate.
+# Evidence and outstanding access
 
-## Packaged startup rejection
+The previous candidate `88245f7d` passed CI but failed actual startup because
+its Electron inventory omitted the credential adapter. It remains rejected;
+its failure evidence and disabled launcher are preserved. Candidate `65a1132b`
+adds both the missing file and a mandatory staged module-linkage check, including
+an isolated plain-Node load before package staging completes. This failure is
+why artifact execution is a required gate in addition to source tests.
 
-Source `88245f7d5bcbdb764751e83a185a8739bb48c373` passed all four development
-builds in [run 34011211557](https://github.com/adamallcock/tibotattle/actions/runs/34011211557),
-but its actual Mac startup failed before opening the dashboard. The explicit
-Electron file inventory omitted `desktop-contribution-credential.js`; exact-set
-artifact verification compared against that same incomplete inventory. This
-candidate is rejected for user testing, with its bundle and failure evidence
-preserved and its launcher disabled. A corrected inventory and a module-linkage
-gate must pass before a fresh package is handed over. A green build receipt is
-not evidence that the app starts.
+Relevant affected suites passed: 542 web, 315 local-companion, 437 combined
+Electron/contribution security checks, 24 final desktop-runtime checks, 66 Auto
+Review checks, and 570 Worker tests plus its script/package/type checks. The
+Worker's dry-deployment/staging portions passed locally after preparing the
+required generated site artifact. This is component-wise gate evidence; the
+full root/native artifact suite is not claimed green.
 
-The Mac subsequently locked during the requested native UI inspection. The
-user has been asked to unlock it; source checks and packaging can continue,
-but rendered window/tray qualification remains pending that access.
+The corrected Mac candidate's 45-second active interval had 180 successful
+rounds, per-endpoint p95 1 ms, and maxima of 22 ms (health) and 7 ms (refresh
+status), within the unchanged 250 ms p95 budget. This does not cover every cold
+or quick-publication phase, renderer responsiveness or UI Quit. Keep those
+qualification cases in the product journey ledger.
 
-Earlier detailed implementation and evidence remain in the
+Current dependencies are an unlocked Mac for final visible QA, actual target
+OS/desktop environments, production signing/update access, and the pending
+[source-only accountless migration approval](../reviews/2026-09-05-accountless-migration-proposal.md).
+Automatic approval review rejected rebuilding the ownership tables without
+specific authorization. The pending request is for source implementation and
+fresh disposable synthetic D1 rehearsals only; no 0047 migration or routed
+ownership endpoint has been added. Remote migrations, hosted activation,
+signing, installed replacement and publication remain separate authorizations.
+
+The larger [desktop convergence plan](2026-09-04-desktop-convergence.md) and
 [contribution integration plan](2026-09-04-accountless-integration-and-responsiveness.md)
-and [desktop convergence plan](2026-09-04-desktop-convergence.md). This short
-record coordinates the remaining work against the published release.
+retain the detailed design history. This document coordinates the remaining
+work and exit criteria for the current candidate.
