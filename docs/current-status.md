@@ -68,11 +68,17 @@ authenticated Operations view recovered. The allowance graph remains a
 separate, unfinished recovery gate.
 
 The [restartable calculator replacement](./decisions/2026-09-06-hosted-calculator-recovery.md)
-is implemented locally and undergoing combined runtime qualification. The
+has passed local Worker, shared-package and combined runtime checks, subject
+to the documented production-memory measurement limitations. The
 owner approved validated migrations `0046`–`0047` and deployment, but neither
 has been applied in this snapshot. Production remains paused. Recovery
 requires successful scheduled rebuilding, a current preview cache and the
 rendered live graph; health HTTP 200 alone is not sufficient.
+
+The two root R7 evidence checks are stale after the shared-library change.
+They remain open for future desktop qualification, not a requirement of the
+maintained hosted deployment gate. The hosted repair neither reads private
+local usage history nor rebuilds the published desktop app.
 
 The requested [all-token detail and API-equivalent spend](./decisions/2026-09-06-community-detail-totals.md)
 are implemented and locally rendered, but not deployed. Recovery preserves

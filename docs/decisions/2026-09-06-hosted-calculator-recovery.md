@@ -81,8 +81,14 @@ measurements and their limitations must be recorded explicitly.
 
 The shared-kernel change invalidates the retained source-bound R7 receipts.
 Their protected local-history regeneration needs owner authorization and the
-existing pinned-runtime workflow; routine tests cannot refresh or waive it.
-No published 0.1.18 receipt, installer or release tag is changed by this repair.
+existing pinned-runtime workflow before a future desktop release uses this
+source; routine tests cannot refresh or waive it. R7 is not a prerequisite of
+the maintained Worker deployment gate. The explained stale-evidence failures
+remain reported, with no altered tests, receipts or provenance exclusions.
+This hosted-only deployment uses the Worker, shared-package parity, migration
+and public-surface checks; it does not access private local usage history or
+qualify a new desktop release. No published 0.1.18 receipt, installer or release
+tag is changed by this repair.
 
 Before applying the approved migrations, verify both migration ledgers,
 database headroom and current recovery bookmarks. The migrations create
