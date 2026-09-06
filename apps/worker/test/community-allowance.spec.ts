@@ -1739,7 +1739,7 @@ describe("v1 analyzer scale fix — fit-preserving reduction", () => {
       QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp, 1).all()).results).toEqual([]);
   });
 
-  it("reduces dense quota before materializing and preserves exact run endpoints and fits", async () => {
+  it("preserves exact dense quota run endpoints and fits after the query rollback", async () => {
     const participantId = await newV1Participant("quota-working-set");
     const device = "v1-device-quota-working-set";
     const baseMs = SCALE_NOW - 2 * DAY_MS;
@@ -1750,40 +1750,9 @@ describe("v1 analyzer scale fix — fit-preserving reduction", () => {
       usageOffsetMs: 500, gridExactLevels: [3, 8] });
     await seedChunkedRecords(participantId, device, "quota", day, dense.quota);
     await seedChunkedRecords(participantId, device, "usage", day, dense.usage);
-    const pin = await loadV1SourcePin(db(), { participantId, fromDay: day });
-    const markers = JSON.stringify([["openai_codex", "codex", "pro", "unknown", "synthetic-era", "", null, 1]]);
-    const cutoff = new Date(SCALE_NOW - V1_ANALYSIS_WINDOW_DAYS * DAY_MS)
-      .toISOString().slice(0, 10) + "T00:00:00.000Z";
-    const plan = await db().prepare("EXPLAIN QUERY PLAN " + QUOTA_DOWNSAMPLE_SQL)
-      .bind(markers, pin.winnersJson, participantId, cutoff,
-        new Date(Date.parse(cutoff) + 7 * DAY_MS).toISOString(), 10_080,
-        QUOTA_CALIBRATION_POLICY.minimumBoundaries,
-        QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp,
-        MAX_DOWNSAMPLED_QUOTA_ROWS + 1)
-      .all<{ id: number; parent: number; detail: string }>();
-    const materialized = plan.results.map((row) => row.detail)
-      .filter((detail) => detail.startsWith("MATERIALIZE "));
-    // No wide raw/assigned/survivor table may be retained before the dense
-    // stream is reduced. The bounded era vector and endpoint table may be.
-    expect(materialized).not.toEqual([]);
-    expect(materialized.every((detail) => ["MATERIALIZE era_markers", "MATERIALIZE endpoints", "MATERIALIZE fitable"]
-      .includes(detail)), materialized.join("\n")).toBe(true);
-    expect(plan.results.some(({ detail }) => detail.includes("telemetry_v1_records_participant_stream_observed")
-      && detail.includes("participant_id=? AND stream=? AND observed_at>? AND observed_at<?"))).toBe(true);
-    expect(plan.results.some(({ detail }) => detail.includes("SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"))).toBe(true);
-    const endpointNode = plan.results.find(({ detail }) => detail === "MATERIALIZE endpoints");
-    expect(endpointNode).toBeDefined();
-    const endpointDescendants = new Set([endpointNode!.id]);
-    for (const row of plan.results) {
-      if (endpointDescendants.has(row.parent)) endpointDescendants.add(row.id);
-    }
-    expect(plan.results.filter((row) => endpointDescendants.has(row.id))
-      .some(({ detail }) => /TEMP B-TREE/u.test(detail))).toBe(false);
-    const neighborSeeks = plan.results.filter(({ detail }) => detail.includes("SEARCH n USING INDEX telemetry_v1_records_participant_stream_observed"));
-    expect(neighborSeeks).toHaveLength(4);
-    for (const predicate of ["observed_at=? AND rowid<?", "observed_at=? AND rowid>?", "observed_at>? AND observed_at<?"]) {
-      expect(neighborSeeks.some(({ detail }) => detail.includes(predicate)), predicate).toBe(true);
-    }
+    // The predecessor/successor plan was rolled back after production CPU
+    // resets on sparse partitions. Retain its exact-result regressions, but
+    // do not require the rejected query shape or claim a memory bound here.
     const reducedRows = await downsampleQuotaForTest(db(), participantId, SCALE_NOW);
     expect(reducedRows.map((row) => row.occurrence_id)).toEqual(
       Array.from({ length: 17 }, (_, level) => [
