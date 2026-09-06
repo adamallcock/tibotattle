@@ -2898,6 +2898,24 @@ function render(overview) {
   notifyAttention(attention);
 }
 
+function renderOverviewUnavailable() {
+  const hasPreviousData = state.overview !== null;
+  const serviceState = $("#service-state");
+  if (serviceState) {
+    serviceState.textContent = hasPreviousData
+      ? "Refresh unavailable · showing last successful data"
+      : "Refresh unavailable · no successful data loaded";
+  }
+  const badge = $("#operator-attention-badge");
+  if (badge) {
+    badge.className = "admin-source-badge admin-source-partial";
+    badge.textContent = hasPreviousData
+      ? "Stale · refresh unavailable"
+      : "Unavailable · not loaded";
+  }
+  if (isAdminPage) document.title = `• ${ADMIN_TITLE}`;
+}
+
 async function load() {
   if (state.loading) return;
   const loadGeneration = ++state.loadGeneration;
@@ -2920,6 +2938,7 @@ async function load() {
     void loadAdminCommunityAllowance(loadGeneration);
     void loadGrowthHistory(loadGeneration);
   } catch (error) {
+    renderOverviewUnavailable();
     showNotice(`Operations view unavailable: ${error.message}.`);
     state.retryDelayMilliseconds = Math.min(
       state.retryDelayMilliseconds * 2,

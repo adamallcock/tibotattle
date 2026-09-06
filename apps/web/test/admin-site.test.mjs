@@ -55,6 +55,10 @@ class FakeNode {
   getBoundingClientRect() {
     return this.rect;
   }
+
+  querySelectorAll() {
+    return [];
+  }
 }
 
 function fakeDocument() {
@@ -181,6 +185,155 @@ async function waitFor(predicate) {
   }
   assert.fail("timed out waiting for the admin view to render");
 }
+
+async function withAdminPage(fetchResponse, check) {
+  const documentRef = fakeDocument();
+  const html = await readFile(new URL("../public/admin.html", import.meta.url), "utf8");
+  for (const [, id] of html.matchAll(/\bid="([\w-]+)"/gu)) {
+    if (!documentRef.byId.has(id)) documentRef.byId.set(id, new FakeNode("div"));
+  }
+  documentRef.body = { classList: { contains: (name) => name === "admin-operator-page" } };
+  documentRef.addEventListener = () => {};
+  documentRef.querySelectorAll = () => [];
+  documentRef.byId.get("notice").hidden = true;
+  documentRef.byId.get("service-state").textContent = "Checking session…";
+  const storedPreferences = new Map([
+    ["tibotattle-admin-auto-refresh-minutes-v1", "0"],
+  ]);
+  const replacements = {
+    document: documentRef,
+    fetch: fetchResponse,
+    window: { innerHeight: 844, innerWidth: 390, addEventListener() {} },
+    localStorage: {
+      getItem: (key) => storedPreferences.get(key) ?? null,
+      setItem: (key, value) => storedPreferences.set(key, value),
+    },
+    // Keep actual load/refresh execution while preventing background timers
+    // from outliving the isolated page and touching a later test's globals.
+    setInterval: () => 0,
+  };
+  const descriptors = new Map(Object.keys(replacements).map((key) => [
+    key, Object.getOwnPropertyDescriptor(globalThis, key),
+  ]));
+  for (const [key, value] of Object.entries(replacements)) {
+    Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
+  }
+  try {
+    const moduleUrl = new URL("../public/admin.js", import.meta.url);
+    moduleUrl.search = `?admin-refresh-test=${process.hrtime.bigint()}`;
+    await import(moduleUrl.href);
+    await check(documentRef, storedPreferences);
+  } finally {
+    for (const [key, descriptor] of descriptors) {
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+      else delete globalThis[key];
+    }
+  }
+}
+
+function unavailableResponse() {
+  return {
+    ok: false,
+    status: 500,
+    async json() {
+      return { error: { code: "INTERNAL_ERROR" } };
+    },
+  };
+}
+
+test("an initial overview failure marks operations unavailable without inventing a successful snapshot", async () => {
+  const requests = [];
+  await withAdminPage(async (path) => {
+    requests.push(path);
+    return unavailableResponse();
+  }, async (documentRef) => {
+    await waitFor(() => !documentRef.byId.get("notice").hidden);
+    assert.deepEqual(requests, ["/api/v1/admin/overview"]);
+    assert.equal(documentRef.byId.get("last-refresh").textContent, "Not loaded");
+    assert.equal(documentRef.byId.get("service-state").textContent,
+      "Refresh unavailable · no successful data loaded");
+    assert.equal(documentRef.byId.get("operator-attention-badge").textContent,
+      "Unavailable · not loaded");
+    assert.equal(documentRef.byId.get("operator-attention-badge").className,
+      "admin-source-badge admin-source-partial");
+    assert.equal(documentRef.byId.get("counts").children.length, 0);
+    assert.equal(documentRef.byId.get("refresh").disabled, false);
+    assert.equal(documentRef.title, "• TiboTattle operations");
+    assert.equal(documentRef.byId.get("notice").textContent,
+      "Operations view unavailable: INTERNAL_ERROR.");
+  });
+});
+
+test("overview success, failed refresh, and recovery preserve then replace the last successful data", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const recovered = structuredClone(overview);
+  recovered.generatedAt = "2026-08-18T12:00:00.000Z";
+  recovered.counts.contributions.acceptedLast24Hours += 1;
+  const overviewResponses = [response(overview), unavailableResponse(), response(recovered)];
+  let overviewRequests = 0;
+  await withAdminPage(async (path) => path === "/api/v1/admin/overview"
+    ? overviewResponses[overviewRequests++]
+    : unavailableResponse(), async (documentRef, storedPreferences) => {
+    await waitFor(() => documentRef.byId.get("admin-community-status").textContent === "Preview unavailable"
+      && documentRef.byId.get("growth-status").textContent === "History unavailable");
+    const counts = metricTexts(documentRef, "counts");
+    const lastRefresh = documentRef.byId.get("last-refresh").textContent;
+    const preferences = [...storedPreferences];
+    assert.equal(documentRef.byId.get("service-state").textContent, "production · operational");
+    assert.equal(documentRef.byId.get("operator-attention-badge").textContent, "No action indicated");
+
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.equal(overviewRequests, 2);
+    assert.equal(documentRef.byId.get("service-state").textContent,
+      "Refresh unavailable · showing last successful data");
+    assert.equal(documentRef.byId.get("operator-attention-badge").textContent,
+      "Stale · refresh unavailable");
+    assert.equal(documentRef.byId.get("operator-attention-badge").className,
+      "admin-source-badge admin-source-partial");
+    assert.equal(documentRef.byId.get("last-refresh").textContent, lastRefresh);
+    assert.deepEqual(metricTexts(documentRef, "counts"), counts);
+    assert.deepEqual([...storedPreferences], preferences);
+    assert.equal(documentRef.byId.get("notice").hidden, false);
+
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(overviewRequests, 3);
+    assert.equal(documentRef.byId.get("service-state").textContent, "production · operational");
+    assert.equal(documentRef.byId.get("operator-attention-badge").textContent, "No action indicated");
+    assert.equal(documentRef.byId.get("operator-attention-badge").className,
+      "admin-source-badge admin-source-available");
+    assert.equal(documentRef.byId.get("last-refresh").textContent, formatReportingTime(recovered.generatedAt));
+    assert.notEqual(documentRef.byId.get("last-refresh").textContent, lastRefresh);
+    assert.deepEqual(metricTexts(documentRef, "counts").find(([label]) => label === "Accepted uploads last 24h"),
+      ["Accepted uploads last 24h", "6", "14 in the last 7 days"]);
+    assert.equal(documentRef.byId.get("notice").hidden, true);
+    assert.equal(documentRef.title, "TiboTattle operations");
+  });
+});
+
+test("an independent allowance-preview failure does not mark a successful overview stale", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const requests = [];
+  await withAdminPage(async (path) => {
+    requests.push(path);
+    return path === "/api/v1/admin/overview" ? response(overview) : unavailableResponse();
+  }, async (documentRef) => {
+    await waitFor(() => documentRef.byId.get("admin-community-status").textContent === "Preview unavailable"
+      && documentRef.byId.get("growth-status").textContent === "History unavailable");
+    assert.deepEqual(requests, [
+      "/api/v1/admin/overview",
+      "/api/v1/admin/community/allowance-preview",
+      "/api/v1/admin/metrics/history",
+    ]);
+    assert.equal(documentRef.byId.get("service-state").textContent, "production · operational");
+    assert.equal(documentRef.byId.get("operator-attention-badge").textContent, "No action indicated");
+    assert.equal(documentRef.byId.get("operator-attention-badge").className,
+      "admin-source-badge admin-source-available");
+    assert.equal(documentRef.byId.get("notice").hidden, true);
+    assert.equal(documentRef.byId.get("last-refresh").textContent, formatReportingTime(overview.generatedAt));
+    assert.equal(documentRef.title, "TiboTattle operations");
+  });
+});
 
 test("admin tables preserve row order, text rendering, and empty states", async () => {
   const overview = await fixture("admin-overview-valid.json");
