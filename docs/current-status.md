@@ -68,12 +68,15 @@ authenticated Operations view recovered. The allowance graph remains a
 separate, unfinished recovery gate.
 
 The [restartable calculator replacement](./decisions/2026-09-06-hosted-calculator-recovery.md)
-has passed local Worker, shared-package and combined runtime checks, subject
-to the documented production-memory measurement limitations. The
-owner approved validated migrations `0046`–`0047` and deployment, but neither
-has been applied in this snapshot. Production remains paused. Recovery
-requires successful scheduled rebuilding, a current preview cache and the
-rendered live graph; health HTTP 200 alone is not sufficient.
+deployed as `91171029fb5a16255502b380677fac27df18a70a`, with exact source
+confirmed at 19:00 UTC on 2026-09-06. Approved migrations `0046`–`0047` are
+applied and verified; the normal guarded deployment passed with no health
+exception. The lookup backfill has completed, and natural scheduled runs are
+advancing restartable calculations without exceptions. The authenticated
+Operations view loads. The main allowance graph and spend total remain
+unavailable while fresh caches and historical publications rebuild: this is
+verified deployment and progress, not completed graph recovery. See the
+[deployment receipt](./receipts/2026-09-06-hosted-calculator-deployment.md).
 
 The two root R7 evidence checks are stale after the shared-library change.
 They remain open for future desktop qualification, not a requirement of the
@@ -81,9 +84,10 @@ maintained hosted deployment gate. The hosted repair neither reads private
 local usage history nor rebuilds the published desktop app.
 
 The requested [all-token detail and API-equivalent spend](./decisions/2026-09-06-community-detail-totals.md)
-are implemented and locally rendered, but not deployed. Recovery preserves
-the existing pricing and analytical refusal rules; the display change does
-not authorize a historical telemetry rewrite or different statistical policy.
+are deployed. Live Chrome rendering confirms the all-token activity chart and
+replacement spend card; the latter correctly reports unavailable while existing
+published days lack repriced totals. Recovery preserves pricing and analytical
+refusal rules, with no historical telemetry rewrite or statistical-policy change.
 
 The existing dated social preview was temporarily retained to prioritize the
 verified 0.1.18 download rollout. Regenerate it from the recovered live estimate;
