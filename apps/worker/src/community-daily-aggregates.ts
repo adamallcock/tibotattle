@@ -9,6 +9,13 @@ import {
 import type { CommunityAllowanceFit } from "./community-allowance";
 import { sha256Hex } from "./crypto";
 import {
+  DAILY_SPEND_CHUNKS_PER_PASS,
+  DAILY_SPEND_EVENTS_PER_PASS,
+  isCurrentCommunityDailySpend,
+  priceCommunityDailySpend,
+} from "./community-daily-spend";
+import type { DailySpendBudget } from "./community-daily-spend";
+import {
   loadV1SourcePin,
   V1_WINNER_FILTER_SQL,
 } from "./telemetry-v1-source-selection";
@@ -234,13 +241,45 @@ async function enqueueCommunityAllowanceDriftRebuilds(
   }
 }
 
+/** Additive price-cache backfill covers the displayed year, not fit lookback. */
+async function readCommunitySpendDriftDays(
+  db: D1Database, nowMs: number,
+): Promise<Set<string>> {
+  const to = driftReconcileToDay(nowMs);
+  const from = new Date(Date.parse(`${to}T00:00:00.000Z`) - 365 * MILLISECONDS_PER_DAY)
+    .toISOString().slice(0, 10);
+  const published = await db.prepare(`SELECT a.day,
+      CASE WHEN json_valid(a.payload_json)
+        THEN json_extract(a.payload_json, '$.apiEquivalentSpend') ELSE NULL END AS spend_json,
+      CASE WHEN json_valid(a.payload_json)
+        THEN json_extract(a.payload_json, '$.totals.usageEvents') ELSE NULL END AS usage_events
+    FROM community_daily_aggregates a JOIN (
+      SELECT day, MAX(revision) AS revision FROM community_daily_aggregates
+      WHERE release_state = 'published' AND day >= ?1 AND day <= ?2 GROUP BY day
+    ) latest ON latest.day = a.day AND latest.revision = a.revision
+    WHERE a.release_state = 'published' ORDER BY a.day LIMIT 366`)
+    .bind(from, to).all<{ day: string; spend_json: string | null; usage_events: number | null }>();
+  const drifted = new Set<string>();
+  for (const row of published.results) {
+    let spend: unknown;
+    try { spend = row.spend_json === null ? undefined : JSON.parse(row.spend_json); } catch { spend = undefined; }
+    if (!isCurrentCommunityDailySpend(spend) || spend.usageEvents !== row.usage_events) drifted.add(row.day);
+  }
+  // Missing/stale price blocks themselves are the convergent backfill journal.
+  // Do not mix synthetic requests with source-correction requests: preserving
+  // an aged allowance is valid only for a positively price-only rebuild.
+  return drifted;
+}
+
 async function buildCommunityDailyAggregate(
   db: D1Database,
-  rebuild: DailyRebuildRow,
+  rebuild: DailyRebuildRow | { day: string },
   scheduledTime: number,
   allowanceFitsForEpoch: AllowanceFitsForEpoch,
-): Promise<{ state: "built" | "conflicted"; aggregateId: string }> {
+  spendBudget: DailySpendBudget,
+): Promise<{ state: "built" | "conflicted" | "deferred"; aggregateId: string }> {
   const { day } = rebuild;
+  const priceBackfill = !("requested_at" in rebuild);
   // Bind the build to the mutation epoch it read its sources under, exactly
   // as the weekly builder does: a participant deletion bumps the epoch (0012
   // trigger), so a build racing a deletion cannot publish the deleted data —
@@ -310,9 +349,11 @@ async function buildCommunityDailyAggregate(
        LIMIT ?`,
     ).bind(sourcePin.winnersJson, day, MAX_DAILY_AGGREGATE_CELLS + 1).all<DailyCellRow>(),
     db.prepare(
-      `SELECT COALESCE(MAX(revision), 0) + 1 AS revision
-         FROM community_daily_aggregates WHERE day = ?`,
-    ).bind(day).first<{ revision: number }>(),
+      `SELECT COALESCE(MAX(revision), 0) + 1 AS revision,
+         (SELECT payload_json FROM community_daily_aggregates
+           WHERE day = ?1 AND release_state = 'published' ORDER BY revision DESC LIMIT 1) AS previous_payload_json
+         FROM community_daily_aggregates WHERE day = ?1`,
+    ).bind(day).first<{ revision: number; previous_payload_json: string | null }>(),
   ]);
   const revision = Number(revisionRow?.revision ?? 1);
   if (!Number.isSafeInteger(revision) || revision < 1) {
@@ -321,9 +362,20 @@ async function buildCommunityDailyAggregate(
   // The allowance block is additive on schema v1.0: the site normalizer
   // treats a missing or invalid block as per-day-absent, so older published
   // revisions without it stay renderable and old clients ignore it entirely.
-  const fits = await allowanceFitsForEpoch(buildEpoch);
-  const allowance = summarizeCommunityAllowanceDay(fits, day);
   const aggregateId = `community-daily:${day}:r${revision}`;
+  const spendResult = await priceCommunityDailySpend(
+    db, day, sourcePin.winnersJson, Number(totals?.usage_events ?? 0), spendBudget,
+  );
+  if (spendResult.state !== "priced") return { state: spendResult.state, aggregateId };
+  const fits = await allowanceFitsForEpoch(buildEpoch);
+  let allowance = summarizeCommunityAllowanceDay(fits, day);
+  if (priceBackfill && day < driftReconcileFromDay(scheduledTime) && revisionRow?.previous_payload_json) {
+    // A price-only backfill must not erase a historical estimate whose full
+    // trailing fit corpus is no longer reconstructable. Its original basis is
+    // retained; the existing public allowance gate still decides eligibility.
+    const previous = JSON.parse(revisionRow.previous_payload_json) as { allowance?: typeof allowance };
+    if (previous.allowance !== undefined) allowance = previous.allowance;
+  }
   const releasedAt = new Date(scheduledTime).toISOString();
   const cellRows = cells.results.slice(0, MAX_DAILY_AGGREGATE_CELLS);
   const payload = {
@@ -342,6 +394,7 @@ async function buildCommunityDailyAggregate(
     // explicitly owner-approved for publication; no per-account identifier
     // exists anywhere in this block.
     allowance,
+    apiEquivalentSpend: spendResult.spend,
     totals: {
       contributingParticipants: Number(totals?.contributing_participants ?? 0),
       contributingDevices: Number(totals?.contributing_devices ?? 0),
@@ -390,7 +443,11 @@ async function buildCommunityDailyAggregate(
       AND EXISTS (
         SELECT 1 FROM community_snapshot_mutation_control
          WHERE singleton_id = 1 AND mutation_epoch = ?
-      )`,
+      )
+      AND (? = 0 OR (
+        NOT EXISTS (SELECT 1 FROM community_daily_aggregate_rebuilds WHERE day = ?)
+        AND EXISTS (SELECT 1 FROM community_daily_aggregates WHERE day = ? AND release_state = 'published')
+      ))`,
     ).bind(
       aggregateId,
       day,
@@ -403,12 +460,15 @@ async function buildCommunityDailyAggregate(
       day,
       revision,
       buildEpoch,
+      priceBackfill ? 1 : 0,
+      day,
+      day,
     ),
     // Clear exactly the request this build answered, and only when this
     // build's revision actually published. A cancelled build leaves the row
     // queued for the next pass; a concurrent arrival upserts a fresh
     // requested_at and the delete no-ops — convergent, never lossy.
-    db.prepare(
+    ...("requested_at" in rebuild ? [db.prepare(
       `DELETE FROM community_daily_aggregate_rebuilds
         WHERE day = ? AND requested_at = ? AND requested_epoch = ?
           AND EXISTS (
@@ -423,7 +483,7 @@ async function buildCommunityDailyAggregate(
       day,
       revision,
       buildEpoch,
-    ),
+    )] : []),
   ]);
   if (results[0]?.meta.changes === 1) {
     return { state: "built", aggregateId };
@@ -435,6 +495,7 @@ export async function rebuildPendingCommunityDailyAggregates(
   db: D1Database,
   scheduledTime: number,
   maximumRebuilds = 24,
+  spendLimits: { chunks?: number; events?: number } = {},
 ): Promise<{ processed: number; remaining: boolean; aggregateIds: string[] }> {
   if (!Number.isFinite(scheduledTime)
       || !Number.isSafeInteger(maximumRebuilds)
@@ -442,12 +503,23 @@ export async function rebuildPendingCommunityDailyAggregates(
       || maximumRebuilds > 48) {
     throw new Error("invalid community daily aggregate rebuild request");
   }
+  const spendBudget: DailySpendBudget = {
+    remainingChunks: spendLimits.chunks ?? DAILY_SPEND_CHUNKS_PER_PASS,
+    remainingEvents: spendLimits.events ?? DAILY_SPEND_EVENTS_PER_PASS,
+  };
+  if (!Number.isSafeInteger(spendBudget.remainingChunks) || spendBudget.remainingChunks < 0
+      || spendBudget.remainingChunks > DAILY_SPEND_CHUNKS_PER_PASS
+      || !Number.isSafeInteger(spendBudget.remainingEvents) || spendBudget.remainingEvents < 0
+      || spendBudget.remainingEvents > DAILY_SPEND_EVENTS_PER_PASS) {
+    throw new Error("invalid community daily spend budget");
+  }
   const allowanceFitsForEpoch = memoizedAllowanceFits(db, scheduledTime);
   // Reconcile before draining, so days a late v0.2 contribution drifted are
   // enqueued in time for this same pass to rebuild them.
   await enqueueCommunityAllowanceDriftRebuilds(
     db, allowanceFitsForEpoch, scheduledTime,
   );
+  const priceBackfills = await readCommunitySpendDriftDays(db, scheduledTime);
   const rows = await db.prepare(
     `SELECT day, requested_epoch, requested_at
        FROM community_daily_aggregate_rebuilds
@@ -462,14 +534,29 @@ export async function rebuildPendingCommunityDailyAggregates(
       row,
       scheduledTime,
       allowanceFitsForEpoch,
+      spendBudget,
     );
-    processed += 1;
-    aggregateIds.push(result.aggregateId);
+    if (result.state !== "deferred") {
+      processed += 1;
+      aggregateIds.push(result.aggregateId);
+    }
+    if (result.state === "built") priceBackfills.delete(row.day);
+  }
+  // A real source journal always has priority. A concurrently queued correction
+  // also fences the price-only INSERT itself, so it cannot inherit old fits.
+  const queuedDays = new Set(rows.results.map(row => row.day));
+  for (const day of [...priceBackfills].filter(day => !queuedDays.has(day)).slice(0, maximumRebuilds - processed)) {
+    const result = await buildCommunityDailyAggregate(db, { day }, scheduledTime, allowanceFitsForEpoch, spendBudget);
+    if (result.state !== "deferred") {
+      processed += 1;
+      aggregateIds.push(result.aggregateId);
+    }
+    if (result.state === "built") priceBackfills.delete(day);
   }
   const pending = await db.prepare(
     "SELECT 1 AS pending FROM community_daily_aggregate_rebuilds LIMIT 1",
   ).first<{ pending: number }>();
-  return { processed, remaining: Boolean(pending), aggregateIds };
+  return { processed, remaining: Boolean(pending) || priceBackfills.size > 0, aggregateIds };
 }
 
 export interface LatestCommunityDailyAggregateRow {

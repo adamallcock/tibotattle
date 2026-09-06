@@ -275,6 +275,7 @@ import {
   isCurrentCommunityAllowancePublication,
   rebuildPendingCommunityDailyAggregates,
 } from "./community-daily-aggregates";
+import { isCurrentCommunityDailySpend } from "./community-daily-spend";
 import {
   COMMUNITY_ALLOWANCE_BASIS,
   COMMUNITY_ATTRIBUTION_METHOD_VERSION,
@@ -3202,6 +3203,12 @@ async function handleCommunityDaily(
     // Historical revisions carried a per-plan diagnostic object. It remains
     // private admin evidence and is never part of the public combined system.
     delete publicPayload.capacityByPlanType;
+    const spend = publicPayload.apiEquivalentSpend;
+    const totals = publicPayload.totals;
+    if (!isCurrentCommunityDailySpend(spend) || !totals || typeof totals !== "object"
+        || Array.isArray(totals) || (totals as Record<string, unknown>).usageEvents !== spend.usageEvents) {
+      delete publicPayload.apiEquivalentSpend;
+    }
     const allowance = publicPayload.allowance;
     const allowanceBasis = typeof allowance === "object"
         && allowance !== null

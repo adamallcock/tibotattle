@@ -344,6 +344,41 @@ function normalizedDailyTotals(candidate) {
   return totals;
 }
 
+export const COMMUNITY_DAILY_SPEND_BASIS = "reported_usage_event_time_api_price_equivalent_v1";
+
+function normalizedDailySpend(candidate, usageEvents) {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)
+      || candidate.basis !== COMMUNITY_DAILY_SPEND_BASIS || candidate.currency !== "USD"
+      || typeof candidate.pricingMethodVersion !== "string"
+      || !/^server-api-price-equivalent-v\d+\.\d+$/u.test(candidate.pricingMethodVersion)
+      || typeof candidate.registrySha256 !== "string" || !/^[a-f0-9]{64}$/u.test(candidate.registrySha256)) return null;
+  const unprocessed = candidate.unprocessedUsageEvents ?? 0;
+  const counts = [candidate.usageEvents, candidate.fullyPricedUsageEvents,
+    candidate.partiallyPricedUsageEvents, candidate.unpricedUsageEvents, unprocessed];
+  if (!counts.every(value => Number.isSafeInteger(value) && value >= 0)) return null;
+  const [events, full, partial, unpriced] = counts;
+  if (events !== usageEvents || full + partial + unpriced + unprocessed !== events) return null;
+  const resourceLimited = unprocessed > 0;
+  if (resourceLimited && (unprocessed !== events || candidate.unavailableReason !== "processing_capacity_exceeded"
+      || typeof candidate.processingPolicyVersion !== "string"
+      || !/^daily-spend-capacity-[1-9]\d{0,5}-chunks-[1-9]\d{0,8}-events$/u.test(candidate.processingPolicyVersion))) return null;
+  if (!resourceLimited && (candidate.unavailableReason !== undefined || candidate.processingPolicyVersion !== undefined)) return null;
+  const known = events === 0 || full + partial > 0;
+  const coverage = !known ? "unavailable" : full === events ? "complete" : "partial";
+  if (candidate.coverage !== coverage || (known
+    ? typeof candidate.knownCostUsd !== "number" || !Number.isFinite(candidate.knownCostUsd)
+      || candidate.knownCostUsd < 0 || (events === 0 && candidate.knownCostUsd !== 0)
+    : candidate.knownCostUsd !== null)) return null;
+  // Fresh allowlist: neither unknown fields nor private diagnostics reach UI.
+  return {
+    basis: COMMUNITY_DAILY_SPEND_BASIS, currency: "USD", knownCostUsd: candidate.knownCostUsd, coverage,
+    usageEvents: events, fullyPricedUsageEvents: full, partiallyPricedUsageEvents: partial, unpricedUsageEvents: unpriced,
+    pricingMethodVersion: candidate.pricingMethodVersion, registrySha256: candidate.registrySha256,
+    ...(resourceLimited ? { unprocessedUsageEvents: unprocessed, unavailableReason: "processing_capacity_exceeded",
+      processingPolicyVersion: candidate.processingPolicyVersion } : {}),
+  };
+}
+
 function normalizedDailyDay(candidate) {
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
     return null;
@@ -379,6 +414,7 @@ function normalizedDailyDay(candidate) {
     releasedAt,
     totals,
     allowance: normalizedDailyAllowance(payload.allowance),
+    apiEquivalentSpend: normalizedDailySpend(payload.apiEquivalentSpend, totals.usageEvents),
   };
 }
 

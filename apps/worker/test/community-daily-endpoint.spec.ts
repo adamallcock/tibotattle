@@ -8,6 +8,11 @@ import {
   readPublishedCommunityDailyAggregates,
   rebuildPendingCommunityDailyAggregates,
 } from "../src/community-daily-aggregates";
+import {
+  COMMUNITY_DAILY_SPEND_BASIS, COMMUNITY_DAILY_SPEND_PRICING_METHOD,
+  COMMUNITY_DAILY_SPEND_REGISTRY_SHA256,
+  DAILY_SPEND_CAPACITY_POLICY,
+} from "../src/community-daily-spend";
 
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
@@ -134,6 +139,44 @@ beforeEach(async () => {
 });
 
 describe("GET /api/v1/community/daily", () => {
+  it("keeps explicit resource-unavailable publication distinct and settled until policy/source changes", async () => {
+    const resource = { basis: COMMUNITY_DAILY_SPEND_BASIS, currency: "USD", knownCostUsd: null,
+      coverage: "unavailable", usageEvents: 200001, fullyPricedUsageEvents: 0,
+      partiallyPricedUsageEvents: 0, unpricedUsageEvents: 0, unprocessedUsageEvents: 200001,
+      unavailableReason: "processing_capacity_exceeded", processingPolicyVersion: DAILY_SPEND_CAPACITY_POLICY,
+      pricingMethodVersion: COMMUNITY_DAILY_SPEND_PRICING_METHOD, registrySha256: COMMUNITY_DAILY_SPEND_REGISTRY_SHA256 };
+    await seedDailyRevision({ day: "2026-08-01", revision: 1, usageEvents: 200001,
+      payload: { apiEquivalentSpend: resource } });
+    const response = await api("/api/v1/community/daily?from=2026-08-01&to=2026-08-01");
+    expect(response.status).toBe(200);
+    const body = await response.json<{ days: Array<{ payload: Record<string, unknown> }> }>();
+    expect(body.days[0]?.payload.apiEquivalentSpend).toEqual(resource);
+    expect(body.days[0]?.payload.totals).toMatchObject({ usageEvents: 200001 });
+    // Existing immutable cache metadata, not a synthetic 200k-row live corpus.
+    expect(await rebuildPendingCommunityDailyAggregates(db(), Date.parse("2026-11-01T00:00:00.000Z")))
+      .toEqual({ processed: 0, remaining: false, aggregateIds: [] });
+  });
+  it("publishes only current complete-contract spend and leaves old pricing unavailable", async () => {
+    const current = { basis: COMMUNITY_DAILY_SPEND_BASIS, currency: "USD", knownCostUsd: 0.01,
+      coverage: "complete", usageEvents: 1, fullyPricedUsageEvents: 1,
+      partiallyPricedUsageEvents: 0, unpricedUsageEvents: 0,
+      pricingMethodVersion: COMMUNITY_DAILY_SPEND_PRICING_METHOD,
+      registrySha256: COMMUNITY_DAILY_SPEND_REGISTRY_SHA256 };
+    const blocks = [undefined, current, { ...current, registrySha256: "0".repeat(64) },
+      { ...current, knownCostUsd: null }, { ...current, usageEvents: 2, fullyPricedUsageEvents: 2 },
+      { ...current, privateDiagnostic: "synthetic-private-canary" }];
+    for (let index = 0; index < blocks.length; index += 1) {
+      await seedDailyRevision({ day: `2026-08-0${index + 1}`, revision: 1,
+        payload: blocks[index] === undefined ? {} : { apiEquivalentSpend: blocks[index] } });
+    }
+    const response = await api("/api/v1/community/daily?from=2026-08-01&to=2026-08-06");
+    expect(response.status).toBe(200);
+    const body = await response.json<{ days: Array<{ payload: Record<string, unknown> }> }>();
+    expect(body.days).toHaveLength(6);
+    expect(body.days[1]?.payload.apiEquivalentSpend).toEqual(current);
+    for (const index of [0, 2, 3, 4, 5]) expect(body.days[index]?.payload).not.toHaveProperty("apiEquivalentSpend");
+    expect(JSON.stringify(body)).not.toContain("synthetic-private-canary");
+  });
   it("returns the latest published revision per day and omits withdrawn-only days", async () => {
     // Day 1: two published revisions — only r2 is current.
     await seedDailyRevision({ day: "2026-08-01", revision: 1, usageEvents: 1 });
