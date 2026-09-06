@@ -6,6 +6,7 @@ import {
   mkdtemp,
   mkdir,
   readdir,
+  readFile,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -13,6 +14,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { DatabaseSync } from "node:sqlite";
 import {
   assessDisabledEnrollmentConfiguration,
   REQUIRED_COLUMNS,
@@ -25,7 +27,9 @@ import {
   runReleasePreflight,
 } from "./release-preflight.mjs";
 import {
+  ATTRIBUTION_SCHEMA_COLUMNS,
   ATTRIBUTION_SCHEMA_OBJECTS,
+  ATTRIBUTION_SCHEMA_PROBE_SQL,
   EXPECTED_STAGING_MIGRATIONS,
 } from "./staging-readiness-lib.mjs";
 
@@ -315,7 +319,7 @@ test("release preflight applies both local migration streams, checks schema, and
   assert.equal(result.checks.deletionLedgerSchemaPresent, true);
   assert.equal(result.checks.collectionControlsCoherent, true);
   assert.equal(result.checks.isolatedStateCleaned, true);
-  assert.equal(result.evidence.migrationWindow, "0001-0045");
+  assert.equal(result.evidence.migrationWindow, "0001-0047");
   assert.ok(statePath);
   await assert.rejects(access(statePath));
   assert.equal(calls.filter((args) => args.includes("migrations")).length, 4);
@@ -473,8 +477,10 @@ test("release preflight blocks a missing community schema invariant", async () =
   assert.equal(result.collectionAuthorized, false);
 });
 
-test("release preflight refuses missing attribution guards despite complete migration labels", async () => {
-  for (const [type, name] of ATTRIBUTION_SCHEMA_OBJECTS.filter(([type]) => type === "trigger" || type === "view")) {
+test("release preflight refuses missing attribution guards and acquisition objects despite complete migration labels", async () => {
+  for (const [type, name] of ATTRIBUTION_SCHEMA_OBJECTS.filter(([type, name]) =>
+    type === "trigger" || type === "view"
+      || name.startsWith("telemetry_v1_quota_fit_") || name.startsWith("community_analysis_work"))) {
     const { spawn } = await standardFixture({ schemaObjectMissing: `${type}:${name}` });
     const result = await runReleasePreflight({
       config: safeConfig(), workerDirectory, wrangler: "fake-wrangler", spawn,
@@ -492,6 +498,8 @@ test("release preflight refuses missing attribution guards despite complete migr
 test("release preflight refuses absent or incomplete attribution column proof", async () => {
   for (const attributionSchemaRows of [[], [{}], [
     { attribution_objects: 1, attribution_columns: 0 },
+  ], [
+    { attribution_objects: 0, attribution_columns: 1 },
   ]]) {
     const { spawn } = await standardFixture({ attributionSchemaRows });
     const result = await runReleasePreflight({
@@ -503,6 +511,37 @@ test("release preflight refuses absent or incomplete attribution column proof", 
     assert.equal(result.state, "blocked");
     assert.deepEqual(result.blockers, ["LOCAL_SCHEMA_INCOMPLETE"]);
     assert.equal(result.collectionAuthorized, false);
+  }
+});
+
+test("release preflight requires every staged checkpoint column without authorizing collection", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    for (const name of EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB) {
+      database.exec(await readFile(join(workerDirectory, "migrations", name), "utf8"));
+    }
+    assert.equal(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get().attribution_columns, 1);
+    for (const column of ATTRIBUTION_SCHEMA_COLUMNS.community_analysis_work_stage) {
+      database.exec(`SAVEPOINT missing_stage_column;
+        ALTER TABLE community_analysis_work_stage RENAME COLUMN "${column}" TO synthetic_missing_column;`);
+      const actualProbe = { ...database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get() };
+      assert.equal(actualProbe.attribution_columns, 0, column);
+      const { calls, spawn } = await standardFixture({ attributionSchemaRows: [actualProbe] });
+      const result = await runReleasePreflight({
+        config: safeConfig(), workerDirectory, wrangler: "fake-wrangler", spawn,
+        createState: disposableState, cleanupState: removeState,
+      });
+      assert.equal(result.checks.primaryMigrationsAppliedInOrder, true, column);
+      assert.equal(result.checks.requiredSchemaPresent, false, column);
+      assert.equal(result.state, "blocked", column);
+      assert.deepEqual(result.blockers, ["LOCAL_SCHEMA_INCOMPLETE"], column);
+      assert.equal(result.collectionAuthorized, false, column);
+      assert.equal(result.checks.isolatedStateCleaned, true, column);
+      assert.equal(calls.some(args => args.includes("--remote") || args.includes("deploy")), false, column);
+      database.exec("ROLLBACK TO missing_stage_column; RELEASE missing_stage_column;");
+    }
+  } finally {
+    database.close();
   }
 });
 

@@ -282,6 +282,9 @@
       },
       "vars": {
         "ENVIRONMENT": "production",
+        // Preserve live containment until the complete replacement and new
+        // derived-state migrations are separately approved for production.
+        "ALLOWANCE_RECONSTRUCTION_MODE": "paused",
         "PUBLIC_ORIGIN": "https://tibotattle.com",
         // Owner decision 2026-08-07: community enrollment is OPEN. The
         // containment-era "disabled" default was never a product choice, and

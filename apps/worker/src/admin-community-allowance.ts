@@ -12,11 +12,13 @@ import {
   COMMUNITY_ALLOWANCE_TRAILING_DAYS,
   collectCommunityModelCompositions,
   readCachedCommunityAllowanceCorpus,
+  readCachedCommunityModelCompositions,
   summarizeCommunityAllowanceFits,
 } from "./community-allowance";
 import type {
   CommunityAllowanceFit,
   CommunityModelComposition,
+  CommunityModelCacheReadBudget,
 } from "./community-allowance";
 import { ApiError } from "./errors";
 
@@ -528,17 +530,17 @@ export function buildCommunityModelCompositionDay(
 
 const MODEL_COMPOSITION_DAY_JSON_LIMIT_BYTES = 16 * 1024;
 
-async function upsertCommunityModelCompositionDay(
+function prepareCommunityModelCompositionDay(
   db: D1Database,
   payload: AdminCommunityModelCompositionDay,
   sourceMutationEpoch: number,
-): Promise<void> {
+): D1PreparedStatement | null {
   const payloadJson = JSON.stringify(payload);
   if (new TextEncoder().encode(payloadJson).byteLength
       > MODEL_COMPOSITION_DAY_JSON_LIMIT_BYTES) {
-    return;
+    return null;
   }
-  await db.prepare(
+  return db.prepare(
     `INSERT INTO community_model_composition_days (
        day, payload_json, computed_at, attribution_method_version, source_mutation_epoch
      ) SELECT ?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3, ?4
@@ -549,7 +551,13 @@ async function upsertCommunityModelCompositionDay(
        computed_at = excluded.computed_at,
        attribution_method_version = excluded.attribution_method_version,
        source_mutation_epoch = excluded.source_mutation_epoch`,
-  ).bind(payload.day, payloadJson, COMMUNITY_ATTRIBUTION_METHOD_VERSION, sourceMutationEpoch).run();
+  ).bind(payload.day, payloadJson, COMMUNITY_ATTRIBUTION_METHOD_VERSION, sourceMutationEpoch);
+}
+
+async function upsertCommunityModelCompositionDay(
+  db: D1Database, payload: AdminCommunityModelCompositionDay, sourceMutationEpoch: number,
+): Promise<void> {
+  await prepareCommunityModelCompositionDay(db, payload, sourceMutationEpoch)?.run();
 }
 
 async function readCommunityModelCompositionDays(
@@ -698,10 +706,64 @@ export function buildAdminCommunityAllowancePreview(
  * community_model_composition_days row, so browser requests must never call
  * this path.
  */
+export interface AdminCommunityCacheRecovery {
+  mode: "cache-only";
+  /** Distinct phase allocation; root separately meters every actual D1 statement. */
+  budget: CommunityModelCacheReadBudget;
+}
+
+function reserveRecoveryStatements(recovery: AdminCommunityCacheRecovery, count: number): boolean {
+  const budget = recovery.budget, reserve = budget.reserveQueries ?? 0;
+  const now = (budget.now ?? Date.now)();
+  if (recovery.mode !== "cache-only" || !Number.isSafeInteger(budget.remainingQueries)
+      || !Number.isSafeInteger(reserve) || reserve < 0 || !Number.isFinite(now)
+      || !Number.isFinite(budget.deadlineMs) || now >= budget.deadlineMs
+      || budget.remainingQueries - reserve < count) return false;
+  budget.remainingQueries -= count;
+  return true;
+}
+
+/** Build the entire recovery publication before preparing any mutation. */
+async function prepareCachedAdminPreview(
+  db: D1Database, nowMs: number, recovery: AdminCommunityCacheRecovery,
+): Promise<{ preview: AdminCommunityAllowancePreview; modelDay: D1PreparedStatement; sourceEpoch: number } | null> {
+  const source = await db.prepare("SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id = 1")
+    .first<{ mutation_epoch: number }>();
+  if (!Number.isSafeInteger(source?.mutation_epoch) || source!.mutation_epoch < 0) return null;
+  const corpus = await readCachedCommunityAllowanceCorpus(db, nowMs, { budget: recovery.budget });
+  if (corpus === null) return null;
+  const collection = await readCachedCommunityModelCompositions(db, nowMs, { budget: recovery.budget });
+  if (collection === null) return null;
+  const today = new Date(nowMs).toISOString().slice(0, 10);
+  const day = buildCommunityModelCompositionDay(collection, today);
+  const retained = await readCommunityModelCompositionDays(db, today);
+  const modelDays = [...retained.filter(row => row.day !== today), day].slice(-ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS);
+  const preview = buildAdminCommunityAllowancePreview(corpus.fits, nowMs, corpus.participantIds,
+    Object.freeze({ modelConfig: ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG,
+      basis: ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS, gate: ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE,
+      days: Object.freeze(modelDays) }));
+  if (!validCachedAdminCommunityAllowancePreview(preview, preview.generatedAt, nowMs)
+      || new TextEncoder().encode(JSON.stringify(preview)).byteLength > PREVIEW_CACHE_JSON_LIMIT_BYTES) return null;
+  const current = await db.prepare("SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id = 1")
+    .first<{ mutation_epoch: number }>();
+  if (current?.mutation_epoch !== source!.mutation_epoch) return null;
+  const modelDay = prepareCommunityModelCompositionDay(db, day, source!.mutation_epoch);
+  return modelDay === null ? null : { preview, modelDay, sourceEpoch: source!.mutation_epoch };
+}
+
 export async function buildAdminCommunityAllowancePreviewFromSource(
   db: D1Database,
   nowMs: number = Date.now(),
+  recovery?: AdminCommunityCacheRecovery,
 ): Promise<AdminCommunityAllowancePreview | null> {
+  if (recovery) {
+    try {
+      if (!reserveRecoveryStatements(recovery, 4)) return null;
+      const prepared = await prepareCachedAdminPreview(db, nowMs, recovery);
+      if (prepared === null || (await prepared.modelDay.run()).meta.changes !== 1) return null;
+      return prepared.preview;
+    } catch { return null; }
+  }
   const sourceEpochRow = await db.prepare(
     "SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id = 1",
   ).first<{ mutation_epoch: number }>();
@@ -814,8 +876,10 @@ export interface AdminCommunityAllowancePreviewCacheResult {
 export async function warmAdminCommunityAllowancePreviewCache(
   db: D1Database,
   nowEpoch: number,
+  recovery?: AdminCommunityCacheRecovery,
 ): Promise<AdminCommunityAllowancePreviewCacheResult> {
   try {
+    if (recovery && !reserveRecoveryStatements(recovery, 6)) return { code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" };
     const existing = await db.prepare(
       `SELECT generated_at, payload_json
          FROM admin_community_allowance_preview_cache
@@ -848,14 +912,16 @@ export async function warmAdminCommunityAllowancePreviewCache(
       }
     }
 
-    const epochRow = await db.prepare(
+    const prepared = recovery ? await prepareCachedAdminPreview(db, nowEpoch, recovery) : undefined;
+    if (prepared === null) return { code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" };
+    const epochRow = prepared ? { mutation_epoch: prepared.sourceEpoch } : await db.prepare(
       "SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id = 1",
     ).first<{ mutation_epoch: number }>();
     const sourceEpoch = epochRow?.mutation_epoch;
     if (!Number.isSafeInteger(sourceEpoch) || sourceEpoch! < 0) {
       return { code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" };
     }
-    const preview = await buildAdminCommunityAllowancePreviewFromSource(
+    const preview = prepared?.preview ?? await buildAdminCommunityAllowancePreviewFromSource(
       db,
       nowEpoch,
     );
@@ -872,7 +938,7 @@ export async function warmAdminCommunityAllowancePreviewCache(
         )) {
       return { code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" };
     }
-    const write = await db.prepare(
+    const statement = db.prepare(
       `INSERT INTO admin_community_allowance_preview_cache (
          singleton, generated_at, payload_json, attribution_method_version, source_mutation_epoch
        ) SELECT 1, ?1, ?2, ?3, ?4
@@ -883,7 +949,8 @@ export async function warmAdminCommunityAllowancePreviewCache(
          payload_json = excluded.payload_json,
          attribution_method_version = excluded.attribution_method_version,
          source_mutation_epoch = excluded.source_mutation_epoch`,
-    ).bind(preview.generatedAt, payloadJson, COMMUNITY_ATTRIBUTION_METHOD_VERSION, sourceEpoch).run();
+    ).bind(preview.generatedAt, payloadJson, COMMUNITY_ATTRIBUTION_METHOD_VERSION, sourceEpoch);
+    const write = prepared ? (await db.batch([prepared.modelDay, statement]))[1]! : await statement.run();
     return write.meta.changes === 1
       ? { code: "ALLOWANCE_PREVIEW_CACHE_REFRESHED" }
       : { code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" };

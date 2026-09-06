@@ -1,0 +1,419 @@
+import { env } from "cloudflare:workers";
+import { applyD1Migrations, reset, type D1Migration } from "cloudflare:test";
+import { beforeEach, describe, expect, it } from "vitest";
+import { warmCommunityAnalysisCaches } from "../src/community-analysis-warmer";
+import { createD1InvocationBudget } from "../src/d1-invocation-budget";
+import { CACHED_COMMUNITY_ALLOWANCE_PAGE_SQL, CACHED_COMMUNITY_MODEL_COMPOSITIONS_PAGE_SQL,
+  COMMUNITY_ATTRIBUTION_METHOD_VERSION, communityAnalysisCachesCurrent, loadCommunitySourcePin,
+  publishCommunityAnalysisCaches, readCachedCommunityAllowanceCorpus, readCachedCommunityModelCompositions,
+  type CommunityAnalysisCacheIdentity } from "../src/community-allowance";
+import { warmAdminCommunityAllowancePreviewCache } from "../src/admin-community-allowance";
+import { rebuildPendingCommunityDailyAggregates } from "../src/community-daily-aggregates";
+import { V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION, V1_ANALYSIS_WINDOW_DAYS } from "../src/quota-analysis-v1";
+import { V1_PLAN_QUOTA_PAGE_SQL, V1_FIT_QUOTA_PAGE_SQL } from "../src/quota-fit-projection";
+import { createV11DeviceFixture, makeV11Day, stageV11Day } from "./helpers/telemetry-v11";
+import { authenticateDevice, createDeviceUploadAuthorization, claimDeviceUploadAuthorization } from "../src/device-auth";
+import { createUploadAuthorizationMaterial, storeUploadAuthorization, claimUploadAuthorization } from "../src/session";
+import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from "../src/telemetry-v11-domain";
+import { telemetryV11DomainManifestDigestInput, type TelemetryV11DomainManifest } from "@app-usagemonitor/telemetry-contract";
+import { sha256Hex } from "../src/crypto";
+
+const db = () => env.USAGE_MONITOR_DB;
+const NOW = Date.parse("2026-09-01T12:00:00.000Z"), DAY = "2026-08-01";
+const TIME = `${DAY}T00:00:00.000Z`, RESET = "2026-08-08T00:00:00.000Z", LEASE = "synthetic-warmer-lease";
+const FROM = new Date(NOW-V1_ANALYSIS_WINDOW_DAYS*86_400_000).toISOString().slice(0,10);
+const allocation = (remainingQueries=800) => ({ remainingQueries,deadlineMs:Date.now()+30_000 });
+const refusal = { status:"not_testable" as const,reason:"plan_attribution_limit_exceeded" };
+
+beforeEach(async () => {
+  await reset();await applyD1Migrations(db(),(env as Env & {TEST_MIGRATIONS:D1Migration[]}).TEST_MIGRATIONS);
+  await db().prepare("UPDATE retention_state SET maintenance_lease_token=?,maintenance_lease_expires_at='2027-01-01T00:00:00.000Z' WHERE singleton=1")
+    .bind(LEASE).run();
+});
+
+async function seed(participantId="warmer-participant",count=120) {
+  const fixture=await createV11DeviceFixture(db(),{participantId});
+  const principal=await authenticateDevice(db(),fixture.authorization);
+  for(let offset=0;offset<count;offset+=200) {
+    const digest=(offset+1).toString(16).padStart(64,"0");
+    const upload=await createDeviceUploadAuthorization(db(),principal,digest,200);
+    const claimed=await claimDeviceUploadAuthorization(db(),`Upload ${upload.uploadAuthorization}`,
+      {envelopeDigest:digest,bodyBytes:200,contentType:"application/json"});
+    await db().prepare(`INSERT INTO telemetry_v1_chunks(id,participant_id,device_id,stream,chunk_day,chunk_seq,revision,
+      chunk_digest,envelope_digest,parser_version,record_count,accepted_record_count,r2_key,device_upload_authorization_id,created_at)
+      VALUES (?,?,?,'quota',?,?,1,?,?,'synthetic-warmer',?,?,?,?,?)`)
+      .bind(`${participantId}:chunk:${offset}`,participantId,fixture.deviceId,DAY,offset/200,digest,digest,
+        Math.min(200,count-offset),Math.min(200,count-offset),`synthetic/warmer/${participantId}/${offset}`,claimed.authorizationId,TIME).run();
+  }
+  await db().prepare(`WITH RECURSIVE s(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM s WHERE n<?)
+    INSERT INTO telemetry_v1_records(chunk_row_id,participant_id,device_id,stream,occurrence_id,observed_at,observed_day,
+      provider,plan_type,plan_variant,limit_id,slot,used_percent,window_duration_minutes,resets_at,record_json)
+    SELECT ?||':chunk:'||(CAST((n-1)/200 AS INTEGER)*200),?,?,'quota','synthetic-quota-'||n,
+      strftime('%Y-%m-%dT%H:%M:%fZ',?,'+'||n||' seconds'),?,'openai_codex','pro','unknown','codex','seven_day',
+      CAST((n-1)/2 AS INTEGER)%100,10080,?,'{}' FROM s`)
+    .bind(count,participantId,participantId,fixture.deviceId,TIME,DAY,RESET).run();
+  return fixture;
+}
+async function seedPricedReset() {
+  const fixture=await seed("warmer-participant",9);
+  await db().prepare(`UPDATE telemetry_v1_records SET used_percent=10+(id-1)*5,
+    observed_at=strftime('%Y-%m-%dT%H:%M:%fZ',?,'+'||((id-1)*300)||' seconds')`).bind(TIME).run();
+  const digest="c".repeat(64),principal=await authenticateDevice(db(),fixture.authorization);
+  const upload=await createDeviceUploadAuthorization(db(),principal,digest,200);
+  const claimed=await claimDeviceUploadAuthorization(db(),`Upload ${upload.uploadAuthorization}`,
+    {envelopeDigest:digest,bodyBytes:200,contentType:"application/json"});
+  const chunk=`${fixture.participantId}:usage`;
+  await db().prepare(`INSERT INTO telemetry_v1_chunks(id,participant_id,device_id,stream,chunk_day,chunk_seq,revision,
+    chunk_digest,envelope_digest,parser_version,record_count,accepted_record_count,r2_key,device_upload_authorization_id,created_at)
+    VALUES(?,?,?,'usage',?,0,1,?,?,'synthetic-warmer',8,8,?,?,?)`)
+    .bind(chunk,fixture.participantId,fixture.deviceId,DAY,digest,digest,`synthetic/${chunk}`,claimed.authorizationId,TIME).run();
+  const record=JSON.stringify({provider:"openai_codex",modelId:"gpt-5.6-sol",billingSurface:"chatgpt_subscription",
+    apiServiceTier:"priority",speedMode:"fast",reasoningEffort:"xhigh",totalInputContextTokens:null,
+    components:{inputUncachedTokens:100,inputCacheReadTokens:900,inputCacheWriteTokens:0,outputTextTokens:50,
+      outputReasoningTokens:25,outputCombinedTokens:null}});
+  await db().prepare(`WITH RECURSIVE s(n) AS (VALUES(0) UNION ALL SELECT n+1 FROM s WHERE n<7)
+    INSERT INTO telemetry_v1_records(chunk_row_id,participant_id,device_id,stream,occurrence_id,observed_at,observed_day,
+      provider,model_id,record_json)
+    SELECT ?,?,?,'usage','synthetic-usage-'||n,strftime('%Y-%m-%dT%H:%M:%fZ',?,'+'||(n*300+150)||' seconds'),
+      ?,'openai_codex','gpt-5.6-sol',? FROM s`).bind(chunk,fixture.participantId,fixture.deviceId,TIME,DAY,record).run();
+  return fixture;
+}
+async function identity(participantId="warmer-participant",source:CommunityAnalysisCacheIdentity["source"]="v1",compositionSupported=true) {
+  const pin=await loadCommunitySourcePin(db(),participantId,FROM,source);
+  return {participantId,source,sourcePin:pin.sourcePin,fitFingerprint:pin.fingerprint,fromDay:FROM,compositionSupported};
+}
+async function legacy(fixture:Awaited<ReturnType<typeof createV11DeviceFixture>>,overlap=false) {
+  // The current deployment rejects new v0.2 uploads. Explicitly accept that
+  // format in this synthetic database to reconstruct retained legacy history.
+  await db().prepare("UPDATE telemetry_transport_formats SET lifecycle='accepted' WHERE format_rank=2").run();
+  const authorization=await createUploadAuthorizationMaterial(fixture.participantId,fixture.sessionId,"b".repeat(64),1);
+  await storeUploadAuthorization(db(),authorization);
+  const claimed=await claimUploadAuthorization(db(),`Upload ${authorization.encoded}`,
+    {envelopeDigest:"b".repeat(64),bodyBytes:1,contentType:"application/json"});
+  const id=`legacy:${fixture.participantId}`;
+  await db().prepare(`INSERT INTO telemetry_contributions(id,participant_id,plaintext_digest,envelope_digest,r2_key,status,
+    schema_version,transport_schema_version,range_start,range_end,client_platform,provider_policy_epoch,
+    estimated_api_cost_usd,priced_event_coverage_percent,unknown_model_event_count,unknown_billable_units,
+    price_basis,declared_record_count,created_at,upload_authorization_id)
+    VALUES(?,?,?,?,?,'accepted','telemetry-contribution-v0.1','telemetry-contribution-v0.2',?,?,'macos','unknown',
+      NULL,0,0,0,'unavailable',?,?,?)`)
+    .bind(id,fixture.participantId,"a".repeat(64),"b".repeat(64),`synthetic/${id}`,TIME,`${DAY}T23:59:59.999Z`,
+      overlap?1:0,TIME,claimed.authorizationId).run();
+  if(overlap)await db().batch([
+    db().prepare(`INSERT INTO telemetry_records(origin_contribution_id,participant_id,record_kind,occurrence_id,
+      observed_at,provider,limit_id,record_json) VALUES(?,?,'quota','legacy-quota',?,'openai_codex','codex','{}')`)
+      .bind(id,fixture.participantId,TIME),
+    db().prepare(`INSERT INTO telemetry_contribution_occurrences(contribution_id,participant_id,record_kind,occurrence_id)
+      VALUES(?,?,'quota','legacy-quota')`).bind(id,fixture.participantId),
+  ]);
+}
+
+async function activateEmptySuccessor(fixture:Awaited<ReturnType<typeof createV11DeviceFixture>>) {
+  const day=new Date().toISOString().slice(0,10);
+  const staged=await stageV11Day(db(),fixture,await makeV11Day(day,{}));
+  const prior=await createTelemetryV11DomainPredecessor(db(),fixture);
+  expect(prior.fromDay).toBe(day);expect(prior.throughDay).toBe(day);
+  const manifest:TelemetryV11DomainManifest={schemaVersion:"telemetry-domain-manifest-v1.1",fromDay:day,throughDay:day,
+    predecessor:{token:prior.token,previousGenerationId:prior.previousGenerationId,legacyFingerprint:prior.legacyFingerprint},
+    days:[{day,manifestId:staged.manifestId,manifestDigest:staged.manifestDigest}],manifestDigest:"0".repeat(64)};
+  manifest.manifestDigest=await sha256Hex(telemetryV11DomainManifestDigestInput(manifest));
+  await activateTelemetryV11Domain(db(),fixture,manifest);
+  return day;
+}
+async function cacheRows() {
+  return Promise.all(["community_allowance_fit_cache","community_model_composition_cache"].map(async table =>
+    (await db().prepare(`SELECT * FROM ${table} ORDER BY participant_id`).all()).results));
+}
+function observer(hook?: (sql:string,moment:"before"|"after")=>Promise<void>) {
+  const queries:string[]=[], originals=new WeakMap<D1PreparedStatement,D1PreparedStatement>(), texts=new WeakMap<D1PreparedStatement,string>();
+  const wrap=(statement:D1PreparedStatement,sql:string):D1PreparedStatement=>{
+    const proxy=new Proxy(statement,{get(target,key){
+      if(key==="bind")return(...values:unknown[])=>wrap(target.bind(...values),sql);
+      if(["first","all","run","raw"].includes(String(key)))return async(...args:unknown[])=>{
+        queries.push(sql);await hook?.(sql,"before");
+        const value:unknown=await Reflect.apply(Reflect.get(target,key),target,args);
+        await hook?.(sql,"after");return value;
+      };
+      const value:unknown=Reflect.get(target,key);return typeof value==="function"?value.bind(target):value;
+    }});originals.set(proxy,statement);texts.set(proxy,sql);return proxy;
+  };
+  const database=new Proxy(db(),{get(target,key){
+    if(key==="prepare")return(sql:string)=>wrap(target.prepare(sql),sql);
+    if(key==="batch")return async(statements:D1PreparedStatement[])=>{
+      const sql=statements.map(statement=>texts.get(statement)??"");queries.push(...sql);
+      for(const text of sql)await hook?.(text,"before");
+      const result=await target.batch(statements.map(statement=>originals.get(statement)??statement));
+      for(const text of sql)await hook?.(text,"after");return result;
+    };
+    const value:unknown=Reflect.get(target,key);return typeof value==="function"?value.bind(target):value;
+  }});
+  return {database,queries,raw:()=>queries.filter(sql=>sql===V1_PLAN_QUOTA_PAGE_SQL||sql===V1_FIT_QUOTA_PAGE_SQL)};
+}
+async function warm(queries=900,nowMs=NOW,observation=observer()) {
+  const meter=createD1InvocationBudget(queries);
+  const result=await warmCommunityAnalysisCaches(meter.wrap(observation.database),nowMs,
+    {meter,deadlineMs:Date.now()+30_000,maintenanceLease:LEASE});
+  expect(meter.queriesUsed).toBe(observation.queries.length);expect(meter.queriesUsed).toBeLessThanOrEqual(queries);
+  return {result,meter,observation};
+}
+
+describe("scheduled analysis warmer and atomic cache promotion",()=>{
+  it("fills both caches from fresh real D1 acquisition and feeds cache-only graph consumers",async()=>{
+    await seedPricedReset();const run=await warm();
+    expect(run.result).toMatchObject({status:"complete",visited:1,published:1,resumed:1});
+    expect(run.observation.raw().length).toBeGreaterThan(0);
+    const rows=await cacheRows();expect(rows.map(value=>value.length)).toEqual([1,1]);
+    expect(await communityAnalysisCachesCurrent(db(),await identity())).toBe(true);
+    const fits=await readCachedCommunityAllowanceCorpus(db(),NOW,{budget:allocation()});
+    const models=await readCachedCommunityModelCompositions(db(),NOW,{budget:allocation()});
+    expect(fits).toEqual(await readCachedCommunityAllowanceCorpus(db(),NOW));
+    expect(fits?.participantIds).toEqual(["warmer-participant"]);expect(models?.v1ParticipantCount).toBe(1);
+    expect(fits?.fits).toHaveLength(1);expect(fits!.fits[0]!.capacityNanousd).toBeGreaterThan(0);
+    expect(models?.compositions).toHaveLength(1);
+    expect(models!.compositions[0]!.composition.fit.totalCostUsd).toBeGreaterThan(0);
+    expect((await warmAdminCommunityAllowancePreviewCache(db(),NOW,{mode:"cache-only",budget:allocation()})).code)
+      .toBe("ALLOWANCE_PREVIEW_CACHE_REFRESHED");
+    expect(await rebuildPendingCommunityDailyAggregates(db(),NOW,1,{chunks:8},{mode:"cache-only",budget:allocation()}))
+      .toMatchObject({processed:1,remaining:false});
+    const second=await warm();expect(second.result).toMatchObject({published:0,resumed:0,status:"complete"});
+    expect(second.observation.raw()).toEqual([]);expect(await cacheRows()).toEqual(rows);
+  });
+
+  it("reuses the durable fixed-now checkpoint after an acquisition-only invocation",async()=>{
+    await seed( "warmer-participant",1200);const first=await warm(100);
+    expect(first.result).toMatchObject({status:"deferred",published:0,resumed:1});
+    const before=await db().prepare("SELECT fixed_now,run_id,progress_revision FROM community_analysis_work").first();
+    expect(before?.fixed_now).toBe(new Date(NOW).toISOString());expect(await cacheRows()).toEqual([[],[]]);
+    const second=await warm(900,NOW+60_000);
+    expect(second.result).toMatchObject({published:1,resumed:1});
+    const after=await db().prepare("SELECT fixed_now,run_id,source_method_version,phase FROM community_analysis_work").first();
+    expect(after).toMatchObject({fixed_now:before!.fixed_now,run_id:before!.run_id,source_method_version:V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,phase:"complete"});
+  });
+
+  it("repairs corrupt cache payloads rather than declaring a matching key current",async()=>{
+    await seed();await warm();
+    for(const [table,column]of[["community_allowance_fit_cache","fits_json"],["community_model_composition_cache","composition_json"]]){
+      await db().prepare(`UPDATE ${table} SET ${column}='{}'`).run();
+      expect(await communityAnalysisCachesCurrent(db(),await identity())).toBe(false);
+      const run=await warm();expect(run.result.published).toBe(1);expect(run.observation.raw()).toEqual([]);
+      expect(await communityAnalysisCachesCurrent(db(),await identity())).toBe(true);
+    }
+  });
+
+  it.each([
+    ["community_allowance_fit_cache","cache_key"],
+    ["community_allowance_fit_cache","input_fingerprint"],
+    ["community_allowance_fit_cache","source_method_version"],
+    ["community_model_composition_cache","cache_key"],
+    ["community_model_composition_cache","input_fingerprint"],
+    ["community_model_composition_cache","source_method_version"],
+  ])("bounds corrupt %s.%s metadata before it enters a page response",async(table,column)=>{
+    await seed();await warm();
+    const scalar=table==="community_allowance_fit_cache";
+    const sql=scalar?CACHED_COMMUNITY_ALLOWANCE_PAGE_SQL:CACHED_COMMUNITY_MODEL_COMPOSITIONS_PAGE_SQL;
+    const readPage=()=>db().prepare(sql).bind(...(scalar?["",65]:["",65,`${FROM}T00:00:00.000Z`,16*1024])).all();
+    const valid=(await readPage()).results[0]!;
+    expect(new TextEncoder().encode(String(valid.cache_key)).byteLength).toBeLessThanOrEqual(512);
+    expect(new TextEncoder().encode(String(valid.source_method_version)).byteLength).toBeLessThanOrEqual(2048);
+    expect(new TextEncoder().encode(String(valid.input_fingerprint)).byteLength).toBe(64);
+    await db().prepare(`UPDATE ${table} SET ${column}=?`).bind("x".repeat(256*1024)).run();
+    const rows=(await readPage()).results;expect(rows).toHaveLength(1);expect(rows[0]![column]).toBeNull();
+    expect(new TextEncoder().encode(JSON.stringify(rows)).byteLength).toBeLessThan(8*1024);
+    expect(await (scalar?readCachedCommunityAllowanceCorpus:readCachedCommunityModelCompositions)(db(),NOW,{budget:allocation()})).toBeNull();
+  });
+
+  it("accepts complete acquired refusals but rejects missing source results and transient error labels",async()=>{
+    await seed();const pin=await identity();
+    for(const analyses of [[],[{source:"v1" as const,analysis:{status:"deferred"}}],
+      [{source:"v1" as const,analysis:{status:"not_testable",reason:"INTERNAL_ERROR"}}],
+      [{source:"v1" as const,analysis:{status:"ready",tracks:[]}}],
+      [{source:"v1" as const,analysis:{schemaVersion:"account-scoped-quota-analysis-v0.1",status:"ready",tracks:[null]}}],
+      [{source:"v1" as const,analysis:{...refusal,tracks:[{}]}}]]){
+      await expect(publishCommunityAnalysisCaches(db(),pin,analyses,refusal,LEASE)).rejects.toThrow();
+      expect(await cacheRows()).toEqual([[],[]]);
+    }
+    expect(await publishCommunityAnalysisCaches(db(),pin,[{source:"v1",analysis:refusal}],refusal,LEASE)).toBe(true);
+    expect((await readCachedCommunityModelCompositions(db(),NOW,{budget:allocation()}))?.refusedParticipantCount).toBe(1);
+  });
+
+  it("publishes a real acquisition limit refusal without fitting or accepting partial quota evidence",async()=>{
+    await seed("warmer-participant",257);
+    await db().prepare("UPDATE telemetry_v1_records SET provider='synthetic-provider-'||id").run();
+    const run=await warm();expect(run.result).toMatchObject({status:"complete",published:1,resumed:1});
+    expect(run.observation.queries.filter(sql=>sql===V1_PLAN_QUOTA_PAGE_SQL).length).toBeGreaterThan(0);
+    expect(run.observation.queries.filter(sql=>sql===V1_FIT_QUOTA_PAGE_SQL)).toEqual([]);
+    const rows=await cacheRows();expect(rows.map(value=>value.length)).toEqual([1,1]);
+    expect(JSON.parse(String(rows[0]![0]!.fits_json))).toEqual([]);
+    expect(JSON.parse(String(rows[1]![0]!.composition_json))).toEqual(refusal);
+    expect(await communityAnalysisCachesCurrent(db(),await identity())).toBe(true);
+  });
+
+  it.each(["legacy","mixed-disjoint","mixed-overlap"])("preserves %s precedence and only publishes supported composition",async(kind)=>{
+    const mixed=kind!=="legacy",overlap=kind==="mixed-overlap";
+    const fixture=mixed?await seed():await createV11DeviceFixture(db(),{participantId:"warmer-participant"});
+    await legacy(fixture,overlap);
+    const run=await warm();expect(run.result).toMatchObject({status:"complete",published:1,resumed:mixed?1:0});
+    const rows=await cacheRows();expect(rows.map(value=>value.length)).toEqual([1,mixed&&!overlap?1:0]);
+    expect(String(rows[0]![0]!.cache_key)).toMatch(mixed?/^mixed:/u:/^v0\.2:/u);
+    expect(await communityAnalysisCachesCurrent(db(),await identity(fixture.participantId,mixed?"mixed":"v0.2",mixed&&!overlap))).toBe(true);
+    const models=await readCachedCommunityModelCompositions(db(),NOW,{budget:allocation()});
+    expect(models).not.toBeNull();
+    expect(models?.refusedParticipantCount).toBe(0);
+    expect(models?.v1ParticipantCount).toBe(mixed&&!overlap?1:0);
+    expect(models?.unsupportedSourceParticipantCount).toBe(mixed&&!overlap?0:1);
+    expect((await readCachedCommunityAllowanceCorpus(db(),NOW,{budget:allocation()}))?.participantIds).toEqual([fixture.participantId]);
+    if(!mixed)expect(run.observation.raw()).toEqual([]);
+  });
+
+  it("gives an activated v1.1 domain precedence over the retained v1 journal",async()=>{
+    const original=await seed();
+    // Retained zero-accepted old journals are genuine predecessor inputs, but
+    // contain no canonical evidence requiring semantic transfer to this domain.
+    await db().prepare("DELETE FROM telemetry_v1_records WHERE participant_id=?").bind(original.participantId).run();
+    await db().prepare("UPDATE telemetry_v1_chunks SET accepted_record_count=0 WHERE participant_id=?").bind(original.participantId).run();
+    const fixture=await createV11DeviceFixture(db(),{participantId:original.participantId,grant:true});
+    const successorDay=await activateEmptySuccessor(fixture);
+    const run=await warm();expect(run.result).toMatchObject({status:"complete",published:1,resumed:0});
+    expect(run.observation.raw()).toEqual([]);
+    const rows=await cacheRows();expect(rows.map(value=>value.length)).toEqual([1,1]);
+    expect(rows.every(table=>String(table[0]!.cache_key).startsWith("v1.1:"))).toBe(true);
+    const pin=await identity(fixture.participantId,"v1.1");
+    expect("source" in pin.sourcePin&&pin.sourcePin.fromDay).toBe(successorDay);
+    expect(pin.fromDay).toBe(FROM); // Source pin covers the domain, not the analysis cutoff.
+    expect(await communityAnalysisCachesCurrent(db(),pin)).toBe(true);
+    expect((await readCachedCommunityModelCompositions(db(),NOW,{budget:allocation()}))?.refusedParticipantCount).toBe(1);
+    expect((await readCachedCommunityAllowanceCorpus(db(),NOW,{budget:allocation()}))?.participantIds).toEqual([fixture.participantId]);
+  });
+
+  it("does not bypass the real successor-consent guard for accepted legacy history",async()=>{
+    const fixture=await createV11DeviceFixture(db(),{participantId:"warmer-participant"});await legacy(fixture);
+    await expect(createV11DeviceFixture(db(),{participantId:fixture.participantId,grant:true}))
+      .rejects.toMatchObject({code:"TELEMETRY_TRANSPORT_BLOCKED"});
+    expect(await db().prepare("SELECT count(*) AS n FROM telemetry_v11_domain_heads").first()).toEqual({n:0});
+    expect(await cacheRows()).toEqual([[],[]]);
+  });
+
+  it("invalidates method, fingerprint and day cutoffs instead of trusting the prior cache revision",async()=>{
+    await seed();await warm();
+    for(const [table,column,value]of[
+      ["community_allowance_fit_cache","source_method_version","obsolete-method"],
+      ["community_model_composition_cache","input_fingerprint","0".repeat(64)],
+      ["community_model_composition_cache","cache_key","obsolete-day"],
+    ]){
+      await db().prepare(`UPDATE ${table} SET ${column}=?`).bind(value).run();
+      expect(await communityAnalysisCachesCurrent(db(),await identity())).toBe(false);
+      expect((await warm()).result.published).toBe(1);
+      expect(await communityAnalysisCachesCurrent(db(),await identity())).toBe(true);
+    }
+    const old=await db().prepare("SELECT run_id FROM community_analysis_work").first();
+    const next=await warm(900,NOW+86_400_000);expect(next.result.published).toBe(1);
+    const current=await db().prepare("SELECT run_id,observed_at_cutoff FROM community_analysis_work").first();
+    expect(current?.run_id).not.toBe(old?.run_id);expect(current?.observed_at_cutoff).toBe("2026-05-25T00:00:00.000Z");
+    expect((await cacheRows()).every(rows=>rows[0]!.source_method_version===COMMUNITY_ATTRIBUTION_METHOD_VERSION)).toBe(true);
+  });
+
+  it.each(["correction","deleting","erasure","lease-loss","lease-expired"])("rejects both cache writes on final %s fence",async(action)=>{
+    await seed();const pin=await identity();let raced=false;
+    const observation=observer(async(sql,moment)=>{
+      if(raced||moment!=="before"||!sql.includes("INSERT INTO community_allowance_fit_cache"))return;
+      raced=true;
+      if(action==="correction")await db().prepare("UPDATE telemetry_v1_chunks SET chunk_digest=?").bind("e".repeat(64)).run();
+      if(action==="deleting")await db().prepare("UPDATE participants SET state='deleting'").run();
+      if(action==="erasure")await db().prepare("DELETE FROM participants WHERE id='warmer-participant'").run();
+      if(action==="lease-loss")await db().prepare("UPDATE retention_state SET maintenance_lease_token='another-owner'").run();
+      if(action==="lease-expired")await db().prepare("UPDATE retention_state SET maintenance_lease_expires_at='2000-01-01T00:00:00.000Z'").run();
+    });
+    expect(await publishCommunityAnalysisCaches(observation.database,pin,[{source:"v1",analysis:refusal}],refusal,LEASE)).toBe(false);
+    expect(raced).toBe(true);expect(await cacheRows()).toEqual([[],[]]);
+  });
+
+  it("rolls back the first cache when the second cache insert fails",async()=>{
+    await seed();const pin=await identity();
+    await db().prepare(`CREATE TRIGGER synthetic_composition_failure BEFORE INSERT ON community_model_composition_cache
+      BEGIN SELECT RAISE(ABORT,'synthetic second cache failure'); END`).run();
+    await expect(publishCommunityAnalysisCaches(db(),pin,[{source:"v1",analysis:refusal}],refusal,LEASE)).rejects.toThrow();
+    expect(await cacheRows()).toEqual([[],[]]);
+  });
+
+  it("rolls back both conditional writes when the lease expires between batch members",async()=>{
+    await seed();const pin=await identity();
+    await db().prepare(`CREATE TRIGGER synthetic_mid_batch_lease_expiry AFTER INSERT ON community_allowance_fit_cache
+      BEGIN UPDATE retention_state SET maintenance_lease_expires_at='2000-01-01T00:00:00.000Z' WHERE singleton=1; END`).run();
+    expect(await publishCommunityAnalysisCaches(db(),pin,[{source:"v1",analysis:refusal}],refusal,LEASE)).toBe(false);
+    expect(await cacheRows()).toEqual([[],[]]);
+    expect(await db().prepare("SELECT maintenance_lease_expires_at AS expires FROM retention_state WHERE singleton=1").first())
+      .toEqual({expires:"2027-01-01T00:00:00.000Z"});
+  });
+
+  it("rotates bounded work fairly and leaves a spent invocation unchanged",async()=>{
+    for(let n=0;n<5;n++)await seed(`warmer-${n}`,1);
+    const first=await warm();expect(first.result.visited).toBeLessThanOrEqual(4);expect(first.result.published).toBeGreaterThan(0);
+    const second=await warm(900,NOW+60_000);expect(second.result.visited).toBeLessThanOrEqual(4);
+    expect((await cacheRows()).map(rows=>rows.length)).toEqual([5,5]);
+    const prior=await cacheRows(),spent=await warm(12);
+    expect(spent.result).toMatchObject({status:"deferred",visited:0,published:0});expect(spent.meter.queriesUsed).toBe(0);
+    expect(await cacheRows()).toEqual(prior);
+  });
+
+  it("uses the current-chunk and time-range indexes while preserving legacy overlap parity",async()=>{
+    const fixture=await seed();await legacy(fixture,true);
+    const candidateSql=(await warm(20)).observation.queries[0]!;
+    for(const [sql,bindings]of[
+      [CACHED_COMMUNITY_ALLOWANCE_PAGE_SQL,["",65]],
+      [CACHED_COMMUNITY_MODEL_COMPOSITIONS_PAGE_SQL,["",65,`${FROM}T00:00:00.000Z`,16*1024]],
+      [candidateSql,["",65,`${FROM}T00:00:00.000Z`]],
+    ] as const){
+      const plan=(await db().prepare("EXPLAIN QUERY PLAN "+sql).bind(...bindings).all<{detail:string}>()).results.map(row=>row.detail);
+      expect(plan.some(row=>row.includes("SEARCH c USING INDEX telemetry_v1_chunks_current_identity")),plan.join("\n")).toBe(true);
+      if(sql===CACHED_COMMUNITY_ALLOWANCE_PAGE_SQL)continue;
+      expect(plan.some(row=>row.includes("telemetry_records_participant_time")&&row.includes("participant_id=? AND observed_at>?")),plan.join("\n")).toBe(true);
+      expect(plan.some(row=>row.includes("telemetry_contribution_occurrences_record")&&row.includes("occurrence_id=?")),plan.join("\n")).toBe(true);
+    }
+    const oldOverlap=`SELECT EXISTS(SELECT 1 FROM telemetry_records r JOIN telemetry_contribution_occurrences o
+      ON o.participant_id=r.participant_id AND o.record_kind=r.record_kind AND o.occurrence_id=r.occurrence_id
+      JOIN telemetry_contributions c ON c.id=o.contribution_id WHERE r.participant_id=?1 AND r.record_kind='quota'
+      AND r.provider='openai_codex' AND r.limit_id='codex' AND r.observed_at>=?2 AND c.status='accepted'
+      AND c.transport_schema_version='telemetry-contribution-v0.2') AS overlap`;
+    for(const [time,provider,status,expected]of[
+      [TIME,"openai_codex","accepted",1],
+      [`${FROM}T00:00:00.000Z`,"openai_codex","accepted",1],
+      ["2020-01-01T00:00:00.000Z","openai_codex","accepted",0],
+      [TIME,"foreign","accepted",0],
+      [TIME,"openai_codex","deleting",0],
+    ] as const){
+      await db().prepare("UPDATE telemetry_records SET observed_at=?,provider=? WHERE participant_id=?").bind(time,provider,fixture.participantId).run();
+      await db().prepare("UPDATE telemetry_contributions SET status=? WHERE participant_id=?").bind(status,fixture.participantId).run();
+      const prior=await db().prepare(oldOverlap).bind(fixture.participantId,`${FROM}T00:00:00.000Z`).first<{overlap:number}>();
+      expect(prior?.overlap).toBe(expected);
+      const cached=(await db().prepare(CACHED_COMMUNITY_MODEL_COMPOSITIONS_PAGE_SQL)
+        .bind("",65,`${FROM}T00:00:00.000Z`,16*1024).all<{legacy_overlap:number}>()).results[0]!;
+      const candidate=(await db().prepare(candidateSql).bind("",65,`${FROM}T00:00:00.000Z`).all<{legacy_overlap:number}>()).results[0]!;
+      expect([cached.legacy_overlap,candidate.legacy_overlap]).toEqual([prior!.overlap,prior!.overlap]);
+    }
+  });
+
+  it("reads 16 complete participant caches before sizing a 500-query daily publication phase",async()=>{
+    for(let n=0;n<16;n++)await seed(`daily-budget-${n.toString().padStart(2,"0")}`,1);
+    for(let pass=0;pass<4;pass++)await warm(900,NOW+pass*4*60_000);
+    expect((await cacheRows()).map(rows=>rows.length)).toEqual([16,16]);
+    const corpus=await readCachedCommunityAllowanceCorpus(db(),NOW,{budget:allocation()});
+    expect(corpus?.participantIds).toHaveLength(16);expect(corpus).toEqual(await readCachedCommunityAllowanceCorpus(db(),NOW));
+    const queued=(await db().prepare("SELECT * FROM community_daily_aggregate_rebuilds").all()).results;
+    expect(queued).toHaveLength(1);
+    const target="daily-budget-15";
+    await db().prepare("UPDATE community_allowance_fit_cache SET fits_json='{}' WHERE participant_id=?").bind(target).run();
+    const missing=observer(),missingMeter=createD1InvocationBudget(500),missingBudget=allocation(500);
+    expect(await rebuildPendingCommunityDailyAggregates(missingMeter.wrap(missing.database),NOW,24,undefined,
+      {mode:"cache-only",budget:missingBudget})).toMatchObject({processed:0,deferred:true});
+    expect(missing.queries.filter(sql=>/^\s*(?:INSERT|UPDATE|DELETE|REPLACE)\b/u.test(sql))).toEqual([]);
+    expect((await db().prepare("SELECT * FROM community_daily_aggregate_rebuilds").all()).results).toEqual(queued);
+    await db().prepare("UPDATE community_allowance_fit_cache SET fits_json='[]' WHERE participant_id=?").bind(target).run();
+    const observed=observer(),meter=createD1InvocationBudget(500),budget=allocation(500);
+    expect(await rebuildPendingCommunityDailyAggregates(meter.wrap(observed.database),NOW,24,undefined,
+      {mode:"cache-only",budget})).toMatchObject({processed:1,remaining:false});
+    expect(observed.queries.filter(sql=>sql.includes("THEN fits_json ELSE NULL END AS fits_json FROM community_allowance_fit_cache"))).toHaveLength(16);
+    expect(meter.queriesUsed).toBe(observed.queries.length);expect(meter.queriesUsed).toBeLessThanOrEqual(500);
+    expect(budget.remainingQueries).toBeGreaterThanOrEqual(0);expect(Object.hasOwn(budget,"reserveQueries")).toBe(false);
+    expect(await db().prepare("SELECT count(*) AS n FROM community_daily_aggregate_rebuilds").first()).toEqual({n:0});
+  });
+});

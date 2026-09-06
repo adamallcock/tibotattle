@@ -9,6 +9,7 @@ import {
   ATTRIBUTION_SCHEMA_COLUMNS,
   ATTRIBUTION_SCHEMA_OBJECTS,
   ATTRIBUTION_SCHEMA_PROBE_SQL,
+  COMMUNITY_ANALYSIS_WORK_SCHEMA_PROBE_SQL,
   attributionSchemaComplete,
   EXPECTED_STAGING_MIGRATIONS,
   GENERATED_WORKER_ASSET_DIRECTORY,
@@ -17,6 +18,8 @@ import {
   STAGING_PROOF_TYPES,
   stagingOperationReceipt,
   validateStagingMigrationInventory,
+  V1_QUOTA_FIT_CURSOR_INDEX_PROBE_SQL,
+  V1_QUOTA_FIT_PROJECTION_SCHEMA_PROBE_SQL,
   V1_USAGE_CURSOR_INDEX_PROBE_SQL,
 } from "./staging-readiness-lib.mjs";
 import {
@@ -52,10 +55,12 @@ test("checked-in staging configuration is closed and intentionally unprovisioned
 });
 
 test("migration inventory is exact and rejects missing or unreviewed files", () => {
-  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-3), [
+  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-5), [
     "0043_analytical_input_fencing.sql",
     "0044_attribution_transport_staging.sql",
     "0045_attribution_domain_activation.sql",
+    "0046_v1_quota_fit_projection.sql",
+    "0047_community_analysis_work.sql",
   ]);
   const inventory = structuredClone(EXPECTED_STAGING_MIGRATIONS);
   assert.deepEqual(validateStagingMigrationInventory(inventory), {
@@ -102,10 +107,10 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
     "0045_attribution_domain_activation.sql": "89f0df9e95eb98fa7ae8cb00dc82fe19f8933689a8002e647e638fdc870990fe",
   };
   const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
-  assert.equal(names.length, 45);
-  assert.deepEqual(names.slice(-5), Object.keys(expectedDigests));
+  assert.equal(names.length, 47);
+  assert.deepEqual(names.slice(40, 45), Object.keys(expectedDigests));
   assert.deepEqual(names.map((name) => name.slice(0, 4)),
-    Array.from({ length: 45 }, (_, index) => String(index + 1).padStart(4, "0")));
+    Array.from({ length: 47 }, (_, index) => String(index + 1).padStart(4, "0")));
   // Unique numeric prefixes make staging, production and Wrangler ordering
   // agree; never admit two differently authored migrations numbered 0041.
   assert.deepEqual([...names].sort(), [...names].sort((a, b) => a.localeCompare(b, "en")));
@@ -135,6 +140,17 @@ test("remote trigger parser repair changes only complete CASE expression parenth
       .replaceAll("THEN 20000 ELSE 2000 END)", "THEN 20000 ELSE 2000 END");
     assert.equal(createHash("sha256").update(original).digest("hex"), originalDigest, name);
   }
+});
+
+test("the local-only staged checkpoint migration is pinned to its reviewed immutable schema", () => {
+  const bytes = readFileSync(join(workerDirectory, "migrations", "0047_community_analysis_work.sql"));
+  assert.equal(createHash("sha256").update(bytes).digest("hex"),
+    "33dee59044b36e87839b6fb33447f81bfb75cb2cdd208b4624c0a8ec91a1ef5d");
+  assert.equal(ATTRIBUTION_SCHEMA_OBJECTS.some(([type, name]) =>
+    type === "table" && name === "community_analysis_work_stage"), true);
+  assert.equal(ATTRIBUTION_SCHEMA_OBJECTS.some(([type, name]) =>
+    type === "trigger" && name === "community_analysis_work_parts_immutable"), true);
+  assert.equal(ATTRIBUTION_SCHEMA_COLUMNS.community_analysis_work_parts.includes("part_key"), false);
 });
 
 test("historical production prefix upgrades forward without losing source rows or legacy schema", () => {
@@ -330,6 +346,212 @@ test("v1 cursor prerequisite requires id to be the rowid alias, not merely an in
   }
 });
 
+test("quota projection readiness requires 0046, its physical cursor, and the separate 0047 schema", () => {
+  const database = new DatabaseSync(":memory:");
+  const indexName = "telemetry_v1_quota_fit_rows_cursor";
+  const apply = (name) => database.exec(readFileSync(join(workerDirectory, "migrations", name), "utf8"));
+  const probe = () => database.prepare(V1_QUOTA_FIT_CURSOR_INDEX_PROBE_SQL).get().v1_quota_fit_cursor_index;
+  try {
+    const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
+    for (const name of names.slice(0, 45)) apply(name);
+    assert.equal(names[44], "0045_attribution_domain_activation.sql");
+    assert.equal(names[45], "0046_v1_quota_fit_projection.sql");
+    assert.equal(names[46], "0047_community_analysis_work.sql");
+    assert.equal(probe(), 0);
+    assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
+    apply(names[45]);
+    assert.equal(probe(), 1);
+    assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
+    apply(names[46]);
+    assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    const original = database.prepare("SELECT sql FROM sqlite_master WHERE name = ?").get(indexName).sql;
+    const variants = [
+      ["missing index", ""],
+      ["reordered keys", original.replace("participant_id, resets_at", "resets_at, participant_id")],
+      ["descending key", original.replace("resets_at, observed_at", "resets_at, observed_at DESC")],
+      ["nonbinary collation", original.replace("resets_at, observed_at", "resets_at, observed_at COLLATE NOCASE")],
+      ["expression key", original.replace("resets_at, observed_at", "resets_at, substr(observed_at, 1)")],
+      ["extra key", original.replace("resets_at, observed_at", "resets_at, observed_at, resets_at")],
+      ["explicit rowid key", original.replace("resets_at, observed_at", "resets_at, observed_at, record_id")],
+      ["unique index", original.replace("CREATE INDEX", "CREATE UNIQUE INDEX")],
+      ["partial index", `${original} WHERE resets_at > ''`],
+    ];
+    for (const [label, replacement] of variants) {
+      assert.notEqual(replacement, original, label);
+      database.exec(`SAVEPOINT wrong_quota_cursor; DROP INDEX ${indexName}; ${replacement};`);
+      assert.equal(probe(), 0, label);
+      const row = database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get();
+      assert.equal(row.attribution_objects, 0, label);
+      assert.equal(attributionSchemaComplete(row), false, label);
+      database.exec("ROLLBACK TO wrong_quota_cursor; RELEASE wrong_quota_cursor;");
+    }
+    assert.equal(probe(), 1);
+  } finally {
+    database.close();
+  }
+});
+
+function assertMigrationSchemaVariants(migrationName, probeSql, field, variants) {
+  const original = readFileSync(join(workerDirectory, "migrations", migrationName), "utf8");
+  for (const [label, replace] of variants) {
+    const replacement = replace(original);
+    assert.notEqual(replacement, original, label);
+    const database = new DatabaseSync(":memory:");
+    try {
+      for (const name of EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB) {
+        database.exec(name === migrationName ? replacement
+          : readFileSync(join(workerDirectory, "migrations", name), "utf8"));
+      }
+      assert.equal(database.prepare(probeSql).get()[field], 0, label);
+      assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false, label);
+    } finally {
+      database.close();
+    }
+  }
+}
+
+test("projection schema rejects altered table/FK/cursor guards and literal-sensitive maintenance triggers", () => {
+  assertMigrationSchemaVariants("0046_v1_quota_fit_projection.sql",
+    V1_QUOTA_FIT_PROJECTION_SCHEMA_PROBE_SQL, "v1_quota_fit_projection_schema", [
+      ["projection non-rowid key", sql => sql.replace("record_id INTEGER PRIMARY KEY", "record_id INT PRIMARY KEY")],
+      ["projection nullable participant", sql => sql.replace("participant_id TEXT NOT NULL", "participant_id TEXT")],
+      ["projection nullable reset", sql => sql.replace("resets_at TEXT NOT NULL", "resets_at TEXT")],
+      ["projection nullable observation", sql => sql.replace("observed_at TEXT NOT NULL", "observed_at TEXT")],
+      ["projection non-strict", sql => sql.replace(") STRICT;", ");")],
+      ["projection wrong FK action", sql => sql.replace("ON DELETE CASCADE", "ON DELETE RESTRICT")],
+      ["projection wrong FK target", sql => sql.replace("REFERENCES telemetry_v1_records(id)", "REFERENCES participants(id)")],
+      ["missing singleton constraint", sql => sql.replace("CHECK (singleton_id = 1)", "")],
+      ["wrong completion default", sql => sql.replace("is_complete INTEGER NOT NULL DEFAULT 0", "is_complete INTEGER NOT NULL DEFAULT 1")],
+      ["missing completion constraint", sql => sql.replace("CHECK (is_complete IN (0, 1))", "")],
+      ["negative highwater accepted", sql => sql.replace("CHECK (through_record_id >= 0)", "")],
+      ["negative cursor accepted", sql => sql.replace("CHECK (last_record_id >= 0)", "")],
+      ["cursor beyond highwater", sql => sql.replace("CHECK (last_record_id <= through_record_id)", "CHECK (last_record_id >= 0)")],
+      ...["WHEN NEW.stream", "WHERE NEW.stream"].flatMap(prefix => [
+        [`${prefix} wrong stream`, sql => sql.replace(`${prefix} = 'quota'`, `${prefix} = 'usage'`)],
+        [`${prefix} case changed literal`, sql => sql.replace(`${prefix} = 'quota'`, `${prefix} = 'QUOTA'`)],
+        [`${prefix} whitespace literal`, sql => sql.replace(`${prefix} = 'quota' AND NEW.limit_id = 'codex'`, `${prefix} = 'quota' AND NEW.limit_id = 'codex '`)],
+      ]),
+      ["wrong window", sql => sql.replaceAll("10080", "300")],
+      ...["provider", "plan_type", "plan_variant", "resets_at", "slot", "used_percent"].map(column =>
+        [`missing ${column} null guard`, sql => sql.replaceAll(`AND NEW.${column} IS NOT NULL`, "")]),
+      ["extra eligibility restriction", sql => sql.replace("WHEN NEW.stream = 'quota'", "WHEN NEW.used_percent > 0 AND NEW.stream = 'quota'")],
+      ["broadened eligibility", sql => sql.replace("WHEN NEW.stream = 'quota'", "WHEN NEW.stream = 'usage' OR NEW.stream = 'quota'")],
+      ["missing update provider event", sql => sql.replace("  provider, plan_type, plan_variant, resets_at, slot, used_percent, observed_at", "  plan_type, plan_variant, resets_at, slot, used_percent, observed_at")],
+      ["missing correction removal", sql => sql.replace("  DELETE FROM telemetry_v1_quota_fit_rows WHERE record_id = OLD.id;", "  SELECT 1;")],
+      ["missing deletion maintenance", sql => sql.replace("AFTER DELETE ON telemetry_v1_records\nBEGIN\n  DELETE FROM telemetry_v1_quota_fit_rows WHERE record_id = OLD.id;", "AFTER DELETE ON telemetry_v1_records\nBEGIN\n  SELECT 1;")],
+      ["wrong projected timestamp", sql => sql.replace("NEW.resets_at, NEW.observed_at);", "NEW.resets_at, NEW.resets_at);")],
+    ]);
+});
+
+test("analysis work schema rejects altered bounds, source/phase/component literals and cascade contracts", () => {
+  assertMigrationSchemaVariants("0047_community_analysis_work.sql",
+    COMMUNITY_ANALYSIS_WORK_SCHEMA_PROBE_SQL, "community_analysis_work_schema", [
+      ["wrong source case", sql => sql.replace("source_kind = 'v1'", "source_kind = 'V1'")],
+      ["wrong source whitespace", sql => sql.replace("source_kind = 'v1'", "source_kind = 'v1 '")],
+      ["wrong phase spelling", sql => sql.replace("'fitability'", "'fitAbility'")],
+      ["wrong component spelling", sql => sql.replace("'plan-anchors'", "'plan-anchors '")],
+      ["wrong fingerprint vocabulary", sql => sql.replace("input_fingerprint NOT GLOB '*[^0-9a-f]*'", "input_fingerprint NOT GLOB '*[^0-9A-F]*'")],
+      ["wrong state digest vocabulary", sql => sql.replace("state_sha256 NOT GLOB '*[^0-9a-f]*'", "state_sha256 NOT GLOB '*[^0-9A-F]*'")],
+      ["wrong part digest vocabulary", sql => sql.replace("payload_sha256 NOT GLOB '*[^0-9a-f]*'", "payload_sha256 NOT GLOB '*[^0-9A-F]*'")],
+      ["missing input revision bound", sql => sql.replace("input_revision < 9007199254740991", "input_revision <= 9007199254740991")],
+      ["missing progress revision bound", sql => sql.replace("progress_revision < 9007199254740991", "progress_revision <= 9007199254740991")],
+      ["wrong quota row cap", sql => sql.replace("BETWEEN 1 AND 60000", "BETWEEN 1 AND 60001")],
+      ["wrong control bytes cap", sql => sql.replace("<= 16384", "<= 16385")],
+      ["wrong manifest bytes cap", sql => sql.replace("<= 131072", "<= 131073")],
+      ["unbounded part count", sql => sql.replace("json_array_length(target_manifest_json) <= 1024", "json_array_length(target_manifest_json) <= 1025")],
+      ["wrong payload bytes cap", sql => sql.replace("BETWEEN 1 AND 131072", "BETWEEN 1 AND 131073")],
+      ["character count instead of byte count", sql => sql.replace("length(CAST(payload_json AS BLOB))", "length(payload_json)")],
+      ["missing control JSON validation", sql => sql.replace("json_valid(control_json)", "length(control_json) > 0")],
+      ["missing manifest JSON validation", sql => sql.replace("json_valid(manifest_json)", "length(manifest_json) > 0")],
+      ["missing part JSON validation", sql => sql.replace("json_valid(payload_json)", "length(payload_json) > 0")],
+      ["wrong owner deletion action", sql => sql.replace("REFERENCES participants(id) ON DELETE CASCADE", "REFERENCES participants(id) ON DELETE RESTRICT")],
+      ["wrong part deletion action", sql => sql.replace("REFERENCES community_analysis_work(participant_id, run_id) ON DELETE CASCADE", "REFERENCES community_analysis_work(participant_id, run_id) ON DELETE RESTRICT")],
+      ["missing run uniqueness", sql => sql.replace(",\n  UNIQUE (participant_id, run_id)", "")],
+      ["wrong part primary key order", sql => sql.replace("PRIMARY KEY (participant_id, run_id, component, payload_sha256)", "PRIMARY KEY (participant_id, run_id, payload_sha256, component)")],
+      ["non-strict work table", sql => sql.replace(") STRICT;", ");")],
+      ["rowid work parts", sql => sql.replace(") STRICT, WITHOUT ROWID;", ") STRICT;")],
+    ]);
+});
+
+test("staged checkpoint schema rejects mutable parts and altered replay, progress, cleanup, or erasure contracts", () => {
+  const stageStart = "CREATE TABLE community_analysis_work_stage (";
+  const inStage = (sql, change) => {
+    const offset = sql.indexOf(stageStart);
+    assert.notEqual(offset, -1);
+    return sql.slice(0, offset) + change(sql.slice(offset));
+  };
+  assertMigrationSchemaVariants("0047_community_analysis_work.sql",
+    COMMUNITY_ANALYSIS_WORK_SCHEMA_PROBE_SQL, "community_analysis_work_schema", [
+      ["missing staged table", sql => sql.slice(0, sql.indexOf(stageStart))],
+      ["old ordinal-keyed parts", sql => sql.replace("component TEXT NOT NULL CHECK", "part_key INTEGER NOT NULL,\n  component TEXT NOT NULL CHECK")
+        .replace("PRIMARY KEY (participant_id, run_id, component, payload_sha256)", "PRIMARY KEY (participant_id, run_id, component, part_key)")],
+      ["missing immutable trigger", sql => sql.replace(/CREATE TRIGGER community_analysis_work_parts_immutable[\s\S]*?END;/u, "")],
+      ["immutable trigger no-op", sql => sql.replace("SELECT RAISE(ABORT, 'community analysis part immutable');", "SELECT 1;")],
+      ["immutable trigger wrong action", sql => sql.replace("SELECT RAISE(ABORT, 'community analysis part immutable');", "SELECT RAISE(IGNORE);")],
+      ["immutable trigger late timing", sql => sql.replace("BEFORE UPDATE ON community_analysis_work_parts", "AFTER UPDATE ON community_analysis_work_parts")],
+      ["immutable trigger changed literal case", sql => sql.replace("'community analysis part immutable'", "'Community analysis part immutable'")],
+      ["immutable trigger changed literal whitespace", sql => sql.replace("'community analysis part immutable'", "'community  analysis part immutable'")],
+      ...[
+        ["more than one staged target", sql => sql.replace("participant_id TEXT PRIMARY KEY", "participant_id TEXT NOT NULL")],
+        ["nullable stage identity", sql => sql.replace("stage_id TEXT NOT NULL", "stage_id TEXT")],
+        ["wrong base progress bound", sql => sql.replace("base_progress_revision < 9007199254740990", "base_progress_revision <= 9007199254740990")],
+        ["wrong stage revision bound", sql => sql.replace("stage_revision < 9007199254740991", "stage_revision <= 9007199254740991")],
+        ["wrong discard revision bound", sql => sql.replace("discard_input_revision < 9007199254740991", "discard_input_revision <= 9007199254740991")],
+        ["negative discard revision allowed", sql => sql.replace("discard_input_revision >= 0", "discard_input_revision >= -1")],
+        ["wrong stage mode case", sql => sql.replace("'writing'", "'Writing'")],
+        ["wrong stage mode whitespace", sql => sql.replace("'discarding'", "'discarding '")],
+        ["wrong target phase literal", sql => sql.replace("'complete'", "'Complete'")],
+        ["unbounded write cursor", sql => sql.replace("write_offset BETWEEN 0 AND 1024", "write_offset BETWEEN 0 AND 1025")],
+        ["unbounded verification cursor", sql => sql.replace("verified_offset BETWEEN 0 AND 1024", "verified_offset BETWEEN 0 AND 1025")],
+        ["nullable cleanup component", sql => sql.replace("gc_component TEXT NOT NULL", "gc_component TEXT")],
+        ["nullable cleanup digest", sql => sql.replace("gc_sha256 TEXT NOT NULL", "gc_sha256 TEXT")],
+        ["wrong staged erasure action", sql => sql.replace("ON DELETE CASCADE", "ON DELETE RESTRICT")],
+        ["wrong staged run fence", sql => sql.replace("FOREIGN KEY (participant_id, run_id)", "FOREIGN KEY (run_id, participant_id)")],
+        ["non-strict staged table", sql => sql.replace(") STRICT;", ");")],
+        ...["target_control_json", "target_manifest_json", "write_manifest_json", "replay_json"].flatMap(column => [
+          [`missing ${column} JSON check`, sql => sql.replace(`json_valid(${column})`, `length(${column}) > 0`)],
+          [`character count for ${column}`, sql => sql.replace(`length(CAST(${column} AS BLOB))`, `length(${column})`)],
+          [`wrong ${column} byte cap`, sql => sql.replace(`length(CAST(${column} AS BLOB)) <= ${column.includes("manifest") ? 131072 : 16384}`,
+            `length(CAST(${column} AS BLOB)) <= ${column.includes("manifest") ? 131073 : 16385}`)],
+        ]),
+        ...["target_manifest_json", "write_manifest_json"].flatMap(column => [
+          [`wrong ${column} array type`, sql => sql.replace(`json_type(${column}) = 'array'`, `json_type(${column}) = 'object'`)],
+          [`wrong ${column} part cap`, sql => sql.replace(`json_array_length(${column}) <= 1024`, `json_array_length(${column}) <= 1025`)],
+        ]),
+        ...["target_state_sha256", "state_sha256"].map(column =>
+          [`wrong ${column} digest alphabet`, sql => sql.replace(`AND ${column} NOT GLOB '*[^0-9a-f]*'`, `AND ${column} NOT GLOB '*[^0-9A-F]*'`)]),
+      ].map(([label, change]) => [label, sql => inStage(sql, change)]),
+    ]);
+});
+
+test("projection metadata readiness accepts the intentionally incomplete populated-source backfill", () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    // Minimal synthetic canonical source: the production-shaped full migration
+    // chain is exercised separately; this isolates deployment/runtime gates.
+    database.exec(`CREATE TABLE telemetry_v1_records (
+      id INTEGER PRIMARY KEY, participant_id TEXT, stream TEXT, limit_id TEXT,
+      window_duration_minutes INTEGER, provider TEXT, plan_type TEXT,
+      plan_variant TEXT, resets_at TEXT, slot TEXT, used_percent REAL, observed_at TEXT);
+      INSERT INTO telemetry_v1_records VALUES
+        (1, 'synthetic-participant', 'quota', 'codex', 10080, 'openai_codex', 'pro',
+         'default', '2026-08-08T00:00:00.000Z', 'primary', 10, '2026-08-01T00:00:00.000Z');`);
+    database.exec(readFileSync(join(workerDirectory, "migrations", "0046_v1_quota_fit_projection.sql"), "utf8"));
+    const state = () => ({ ...database.prepare("SELECT * FROM telemetry_v1_quota_fit_backfill").get() });
+    const before = state();
+    assert.deepEqual(before, { singleton_id: 1, through_record_id: 1, last_record_id: 0, is_complete: 0 });
+    assert.equal(database.prepare(V1_QUOTA_FIT_PROJECTION_SCHEMA_PROBE_SQL).get().v1_quota_fit_projection_schema, 1);
+    assert.deepEqual(state(), before);
+    assert.equal(database.prepare("SELECT count(*) AS n FROM telemetry_v1_quota_fit_rows").get().n, 0);
+    assert.equal(database.prepare("SELECT count(*) AS n FROM telemetry_v1_records").get().n, 1);
+    // Missing or extra runtime rows are not a schema assertion either. This
+    // metadata-only proof does not silently claim reader readiness.
+    assert.doesNotMatch(V1_QUOTA_FIT_PROJECTION_SCHEMA_PROBE_SQL, /FROM telemetry_v1_quota_fit_backfill\b/u);
+  } finally {
+    database.close();
+  }
+});
+
 test("current migration labels do not hide missing attribution metadata in staging readiness", () => {
   const config = provisionedConfig();
   const result = probeStagingLive({
@@ -353,7 +575,7 @@ test("staging requires pending attribution migrations before its schema probe", 
       if (args[2] === "USAGE_MONITOR_DB" && args.some((arg) => arg.includes("FROM d1_migrations"))) {
         calls.push(args);
         return { status: 0, stdout: JSON.stringify([{ results:
-          EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, -3).map((name) => ({ name })),
+          EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, 42).map((name) => ({ name })),
         }]), stderr: "" };
       }
       return baseSpawn(command, args, options);
@@ -364,6 +586,39 @@ test("staging requires pending attribution migrations before its schema probe", 
   assert.equal(result.checks.attributionSchemaCurrent, false);
   assert.equal(calls.some((args) => args.includes(ATTRIBUTION_SCHEMA_PROBE_SQL)), false);
   assert.equal(calls.some((args) => args.includes("apply")), false);
+});
+
+test("staging blocks incomplete 0045/0046 prefixes and unreviewed 0046/0047 before schema probing", () => {
+  const config = provisionedConfig();
+  const through45 = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, 45);
+  assert.equal(through45.at(-1), "0045_attribution_domain_activation.sql");
+  for (const [names, expectedBlocker] of [
+    [through45, "REMOTE_MIGRATIONS_PENDING"],
+    [[...through45, "0046_v1_quota_fit_projection.sql"], "REMOTE_MIGRATIONS_PENDING"],
+    [[...through45, "0046_unreviewed_quota_index.sql"], "REMOTE_MIGRATION_INVENTORY_DRIFT"],
+    [[...through45, "0046_v1_quota_fit_cursor.sql"], "REMOTE_MIGRATION_INVENTORY_DRIFT"],
+    [[...through45, "0046_v1_quota_fit_projection.sql", "0047_unreviewed_work.sql"], "REMOTE_MIGRATION_INVENTORY_DRIFT"],
+  ]) {
+    const calls = [];
+    const baseSpawn = successSpawn(config, calls);
+    const result = probeStagingLive({
+      config, wrangler: "/fake/wrangler", workerDirectory,
+      spawn: (command, args, options) => {
+        if (args[2] === "USAGE_MONITOR_DB" && args.some((arg) => arg.includes("FROM d1_migrations"))) {
+          calls.push(args);
+          return { status: 0, stdout: JSON.stringify([{ results: names.map((name) => ({ name })) }]), stderr: "" };
+        }
+        return baseSpawn(command, args, options);
+      },
+    });
+    assert.equal(result.state, "blocked");
+    assert.equal(result.blockers.includes(expectedBlocker), true, expectedBlocker);
+    assert.equal(result.checks.remoteMigrationInventoryCurrent, false);
+    assert.equal(result.checks.attributionSchemaCurrent, false);
+    assert.equal(result.collectionAuthorized, false);
+    assert.equal(calls.some((args) => args.includes("apply")), false);
+    assert.equal(calls.some((args) => args.includes(ATTRIBUTION_SCHEMA_PROBE_SQL)), false);
+  }
 });
 
 test("staging treats the historical prefix as pending but rejects an alternate applied 0041", () => {

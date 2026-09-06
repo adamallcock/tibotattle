@@ -1,3 +1,7 @@
+import { allowanceReconstructionMode } from "./allowance-reconstruction";
+import { createD1InvocationBudget, D1InvocationBudgetExceededError } from "./d1-invocation-budget";
+import { warmCommunityAnalysisCaches } from "./community-analysis-warmer";
+import { backfillV1QuotaFitProjection } from "./quota-fit-projection";
 import {
   assertAdmissionBindings,
   assertAttemptAllowed,
@@ -3776,6 +3780,16 @@ export async function runScheduledMaintenance(
   env: Env,
   scheduledTime: number,
 ): Promise<ScheduledMaintenanceLog> {
+  const reconstructionMode = allowanceReconstructionMode(env);
+  const queryMeter = createD1InvocationBudget();
+  queryMeter.reserveQueries = 1;
+  const originalEnv = env;
+  env = new Proxy(originalEnv, { get(target, property) {
+    if (property === "USAGE_MONITOR_DB") return queryMeter.wrap(target.USAGE_MONITOR_DB);
+    if (property === "DELETION_LEDGER") return queryMeter.wrap(target.DELETION_LEDGER);
+    return Reflect.get(target, property);
+  } });
+  const optionalDeadlineMs = Date.now() + 40_000;
   let lifecycleComplete = false;
   let quarantineRetentionComplete = false;
   let restoreReplayComplete = false;
@@ -3836,94 +3850,9 @@ export async function runScheduledMaintenance(
     const ownedMaintenanceLease = maintenanceLease;
     await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
     await pruneDiagnosticErrors(env.USAGE_MONITOR_DB);
-    // Distribution snapshots are independent owner diagnostics. A transient
-    // GitHub failure must be recorded for the admin view but must never block
-    // deletion retention, object reconciliation, or community publication.
-    try {
-      const distributionSync = await syncGithubDistributionSnapshots(
-        env.USAGE_MONITOR_DB,
-        {
-          enabled: env.ENVIRONMENT === "production",
-          githubApiToken: Reflect.get(env, "DISTRIBUTION_GITHUB_API_TOKEN"),
-        },
-        Date.now(),
-      );
-      if (distributionSync.code === "GITHUB_SYNC_FAILED") {
-        console.warn(JSON.stringify({
-          level: "warn",
-          event: "github_distribution_sync",
-          outcome: "failure",
-          code: distributionSync.failureCode,
-        }));
-      }
-    } catch {
-      // The regular maintenance work below remains authoritative. The next
-      // overview will surface a snapshot-storage failure as source-unavailable.
-    }
-    // Hourly gauge snapshots for the owner metrics history. Same isolation
-    // contract as the distribution sync: an unavailable snapshot store (or an
-    // unapplied migration 0038) must never block retention, reconciliation,
-    // or publication. The capture self-throttles to hourly and never throws.
-    try {
-      const snapshot = await captureAdminMetricSnapshot(
-        env.USAGE_MONITOR_DB,
-        Date.now(),
-      );
-      if (snapshot.code === "SNAPSHOT_UNAVAILABLE") {
-        console.warn(JSON.stringify({
-          level: "warn",
-          event: "admin_metric_snapshot",
-          outcome: "failure",
-          code: snapshot.code,
-        }));
-      }
-    } catch {
-      // captureAdminMetricSnapshot reports rather than throws; this guard
-      // exists so no future edit can turn a metrics failure into a
-      // maintenance failure.
-    }
-    // The authenticated browser endpoint reads exactly one singleton cache
-    // row. Rebuilding that row is scheduled work only: it self-throttles to
-    // roughly hourly and any failure remains isolated from retention,
-    // reconciliation, and publication.
-    try {
-      const historyCache = await warmAdminMetricsHistoryCache(
-        env.USAGE_MONITOR_DB,
-        Date.now(),
-      );
-      if (historyCache.code === "HISTORY_CACHE_UNAVAILABLE") {
-        console.warn(JSON.stringify({
-          level: "warn",
-          event: "admin_metrics_history_cache",
-          outcome: "failure",
-          code: historyCache.code,
-        }));
-      }
-    } catch {
-      // warmAdminMetricsHistoryCache reports rather than throws; preserve this
-      // belt-and-suspenders boundary against future cache implementation edits.
-    }
-    // The merged allowance preview follows the same browser contract: exactly
-    // one singleton aggregate read after authentication. Source-cache scanning
-    // and preview construction happen only here, at a bounded cadence, and a
-    // preview failure cannot impede the service's required maintenance work.
-    try {
-      const allowanceCache = await warmAdminCommunityAllowancePreviewCache(
-        env.USAGE_MONITOR_DB,
-        Date.now(),
-      );
-      if (allowanceCache.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE") {
-        console.warn(JSON.stringify({
-          level: "warn",
-          event: "admin_allowance_preview_cache",
-          outcome: "failure",
-          code: allowanceCache.code,
-        }));
-      }
-    } catch {
-      // The warmer reports rather than throws. Retain an explicit isolation
-      // guard so future cache changes cannot widen its operational blast radius.
-    }
+    // Required lifecycle work runs before optional analytics and diagnostics.
+    // Catching a memory/time failure after the fact cannot protect work that
+    // never got a chance to execute.
     const handoffPurge = await purgeExpiredIdentityHandoffs(
       env.USAGE_MONITOR_DB,
       // A delayed Cron invocation must still clear handoffs that have expired
@@ -4018,16 +3947,102 @@ export async function runScheduledMaintenance(
         env.USAGE_MONITOR_DB,
         scheduledTime,
       );
-      await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
-      const dailyRebuild = await rebuildPendingCommunityDailyAggregates(
-        env.USAGE_MONITOR_DB,
-        scheduledTime,
-      );
-      rebuildComplete = !rebuild.remaining && !dailyRebuild.remaining;
+      if (reconstructionMode !== "paused") {
+        queryMeter.reserveQueries = 12;
+        try {
+          await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
+          if (reconstructionMode === "resumable") {
+            // Budget admissions refresh from actual queries used. Helpers share
+            // their conservative allocation within each phase, while this one
+            // meter enforces the sum across both bindings and ALL phases.
+            const phaseBudget = () => ({ remainingQueries: Math.max(0, queryMeter.remainingQueries), deadlineMs: optionalDeadlineMs });
+            try {
+              if (queryMeter.remainingQueries >= 249 && Date.now() < optionalDeadlineMs) {
+              let backfill = await backfillV1QuotaFitProjection(env.USAGE_MONITOR_DB);
+              // Fill the cheap lookup progressively without spending one minute
+              // per tiny batch. Every helper call remains <=49 statements and
+              // <=4096 physical rows/page; the actual shared meter bounds the sum.
+              for (let pass=1;pass<8 && backfill.status!=="complete"
+                && queryMeter.remainingQueries>=249 && Date.now()<optionalDeadlineMs;pass++) {
+                backfill=await backfillV1QuotaFitProjection(env.USAGE_MONITOR_DB);
+              }
+              if (backfill.status === "complete" && queryMeter.remainingQueries >= 50) {
+                const warming = await warmCommunityAnalysisCaches(env.USAGE_MONITOR_DB, scheduledTime,
+                  {meter:queryMeter,deadlineMs:optionalDeadlineMs,maintenanceLease});
+                console.log(JSON.stringify({level:"info",event:"scheduled_allowance_reconstruction",outcome:warming.status,
+                  code:"BOUNDED_ANALYSIS_PROGRESS",visited:warming.visited,published:warming.published,
+                  resumed:warming.resumed,queriesUsed:queryMeter.queriesUsed}));
+              }
+              }
+            } catch (error) {
+              // A stale/corrupt account or unavailable lookup must not prevent
+              // publishing other already-complete evidence or new activity.
+              console.warn(JSON.stringify({level:"warn",event:"scheduled_allowance_reconstruction",outcome:"deferred",
+                stage:"analysis",code:error instanceof D1InvocationBudgetExceededError ? error.code : "ALLOWANCE_RECONSTRUCTION_UNAVAILABLE",
+                queriesUsed:queryMeter.queriesUsed}));
+            }
+            const dailyRebuild = await rebuildPendingCommunityDailyAggregates(env.USAGE_MONITOR_DB, scheduledTime,
+              24, undefined, {mode:"cache-only",budget:phaseBudget()});
+            if (dailyRebuild.deferred && queryMeter.remainingQueries >= 100 && Date.now() < optionalDeadlineMs) {
+              await rebuildPendingCommunityDailyAggregates(env.USAGE_MONITOR_DB, scheduledTime,
+                4, undefined, {mode:"activity-only",budget:phaseBudget()});
+            }
+            rebuildComplete = !rebuild.remaining && !dailyRebuild.remaining;
+            const allowanceCache = await warmAdminCommunityAllowancePreviewCache(env.USAGE_MONITOR_DB, scheduledTime,
+              {mode:"cache-only",budget:phaseBudget()});
+            if (allowanceCache.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE") {
+              console.warn(JSON.stringify({level:"warn",event:"admin_allowance_preview_cache",outcome:"failure",code:allowanceCache.code}));
+            }
+          } else {
+            const dailyRebuild = await rebuildPendingCommunityDailyAggregates(env.USAGE_MONITOR_DB, scheduledTime);
+            rebuildComplete = !rebuild.remaining && !dailyRebuild.remaining;
+            const allowanceCache = await warmAdminCommunityAllowancePreviewCache(env.USAGE_MONITOR_DB, scheduledTime);
+            if (allowanceCache.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE") {
+              console.warn(JSON.stringify({level:"warn",event:"admin_allowance_preview_cache",outcome:"failure",code:allowanceCache.code}));
+            }
+          }
+        } catch (error) {
+          // Optional reconstruction cannot undo successful essential maintenance.
+          // All incomplete work/cache/publication writes are independently fenced.
+          console.warn(JSON.stringify({level:"warn",event:"scheduled_allowance_reconstruction",outcome:"deferred",
+            code:error instanceof D1InvocationBudgetExceededError ? error.code : "ALLOWANCE_RECONSTRUCTION_UNAVAILABLE",
+            queriesUsed:queryMeter.queriesUsed}));
+        }
+      } else {
+        console.log(JSON.stringify({level:"info",event:"scheduled_allowance_reconstruction",outcome:"paused",
+          code:"ALLOWANCE_RECONSTRUCTION_PAUSED"}));
+      }
     } else {
-      rebuildComplete = await aggregateRebuildComplete(
+      rebuildComplete = reconstructionMode !== "paused" && await aggregateRebuildComplete(
         env.USAGE_MONITOR_DB,
       );
+    }
+
+    // Independent owner diagnostics retain their cadence and failure isolation,
+    // but no longer precede deletion, retention, or source reconciliation.
+    queryMeter.reserveQueries = 1;
+    if (queryMeter.remainingQueries >= 40 && Date.now() < optionalDeadlineMs) {
+      try {
+        const sync = await syncGithubDistributionSnapshots(env.USAGE_MONITOR_DB,
+          {enabled:env.ENVIRONMENT === "production",githubApiToken:Reflect.get(env,"DISTRIBUTION_GITHUB_API_TOKEN")}, Date.now());
+        if (sync.code === "GITHUB_SYNC_FAILED") console.warn(JSON.stringify({level:"warn",event:"github_distribution_sync",outcome:"failure",code:sync.failureCode}));
+      } catch { /* Optional diagnostics never block maintenance. */ }
+    }
+    if (queryMeter.remainingQueries >= 40 && Date.now() < optionalDeadlineMs) {
+      try {
+        const snapshot = await captureAdminMetricSnapshot(env.USAGE_MONITOR_DB, Date.now());
+        if (snapshot.code === "SNAPSHOT_UNAVAILABLE") {
+          console.warn(JSON.stringify({level:"warn",event:"admin_metrics_snapshot",outcome:"failure",code:snapshot.code}));
+        }
+      } catch { /* Source remains unavailable. */ }
+    }
+    if (queryMeter.remainingQueries >= 40 && Date.now() < optionalDeadlineMs) {
+      try {
+        const historyCache = await warmAdminMetricsHistoryCache(env.USAGE_MONITOR_DB, Date.now());
+        if (historyCache.code === "HISTORY_CACHE_UNAVAILABLE") {
+          console.warn(JSON.stringify({level:"warn",event:"admin_metrics_history_cache",outcome:"failure",code:historyCache.code}));
+        }
+      } catch { /* Keep prior cache. */ }
     }
 
     const complete = lifecycleComplete
@@ -4098,6 +4113,7 @@ export async function runScheduledMaintenance(
     console.error(JSON.stringify(log));
     throw error;
   } finally {
+    queryMeter.reserveQueries = 0;
     if (maintenanceLease !== null) {
       try {
         // A successor may have acquired an expired lease while this pass was

@@ -1091,8 +1091,43 @@ test("reconciled production ledger preserves the historical prefix and refuses a
       "USAGE_MONITOR_DB:0043_analytical_input_fencing.sql",
       "USAGE_MONITOR_DB:0044_attribution_transport_staging.sql",
       "USAGE_MONITOR_DB:0045_attribution_domain_activation.sql",
+      "USAGE_MONITOR_DB:0046_v1_quota_fit_projection.sql",
+      "USAGE_MONITOR_DB:0047_community_analysis_work.sql",
     ],
   });
+  const through45 = expected.USAGE_MONITOR_DB.slice(0, 45);
+  assert.equal(through45.at(-1), "0045_attribution_domain_activation.sql");
+  assert.deepEqual(await inspect(through45), {
+    ok: true,
+    code: null,
+    pending: [
+      "USAGE_MONITOR_DB:0046_v1_quota_fit_projection.sql",
+      "USAGE_MONITOR_DB:0047_community_analysis_work.sql",
+    ],
+  });
+  assert.deepEqual(await inspect(expected.USAGE_MONITOR_DB.slice(0, 46)), {
+    ok: true,
+    code: null,
+    pending: ["USAGE_MONITOR_DB:0047_community_analysis_work.sql"],
+  });
+  for (const applied of [
+    [...through45, "0046_unreviewed_quota_index.sql"],
+    [...through45, "0046_v1_quota_fit_cursor.sql"],
+    [...through45.slice(0, 44), "0046_v1_quota_fit_projection.sql"],
+    [...through45, "0046_v1_quota_fit_projection.sql", "0047_unreviewed_work.sql"],
+  ]) {
+    const index = applied.findIndex((name, item) => name !== expected.USAGE_MONITOR_DB[item]);
+    assert.deepEqual(await inspect(applied), {
+      ok: false,
+      code: "PRODUCTION_MIGRATION_LEDGER_DRIFT",
+      detail: {
+        binding: "USAGE_MONITOR_DB",
+        appliedCount: applied.length,
+        localCount: 47,
+        firstMismatch: { index, applied: applied[index], local: expected.USAGE_MONITOR_DB[index] },
+      },
+    });
+  }
   assert.deepEqual(await inspect(expected.USAGE_MONITOR_DB), { ok: true, code: null, pending: [] });
   for (const applied of [
     [...historicalPrefix.slice(0, 40), "0041_community_model_composition.sql"],
@@ -1109,7 +1144,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
       detail: {
         binding: "USAGE_MONITOR_DB",
         appliedCount: applied.length,
-        localCount: 45,
+        localCount: 47,
         firstMismatch: { index, applied: applied[index], local: expected.USAGE_MONITOR_DB[index] },
       },
     });

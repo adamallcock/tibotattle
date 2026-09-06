@@ -22,7 +22,7 @@ the [macOS stable release runbook](./macos-stable-release-runbook.md).
 |---|---|
 | Public and `www` hosts | One production Worker and manifest-verified static release-site assets |
 | Admin host | Same Worker, but admin routes exist only on `admin.tibotattle.com`, behind Cloudflare Access and a Worker-side owner check |
-| Primary durable state | `USAGE_MONITOR_DB` D1 binding; checked-in migrations through `0045_attribution_domain_activation.sql`; this is a source inventory, not proof of remote application |
+| Primary durable state | `USAGE_MONITOR_DB` D1 binding; checked-in migrations through `0047_community_analysis_work.sql`; this is a source inventory, not proof of remote application |
 | Deletion ledger | Separate `DELETION_LEDGER` D1 binding and migration ledger |
 | Encrypted/quarantined objects | Production `QUARANTINE` R2 binding with explicit deletion/reconciliation and deletion-safe restore rules; automatic age-based deletion is disabled in this source snapshot |
 | Upload admission | `UPLOAD_INGRESS_BUDGET` Durable Object plus explicit rate-limit bindings |
@@ -32,6 +32,42 @@ the [macOS stable release runbook](./macos-stable-release-runbook.md).
 The exact binding names, routes, required secret names, controls, and limits live
 in `apps/worker/wrangler.jsonc`; [api-surface.md](../reference/api-surface.md)
 owns the route inventory.
+
+### Bounded allowance reconstruction
+
+`ALLOWANCE_RECONSTRUCTION_MODE` controls optional calculation only. Explicit
+`resumable` uses the restartable lookup/checkpoint path; `paused` leaves
+required lifecycle, retention, deletion-safe restore, upload reconciliation
+and weekly publication running. Missing or unrecognized production values
+fail closed. The compatibility `enabled` value selects the old direct path;
+it is not an incident-recovery fallback.
+
+The resumable path requires migrations `0046` and `0047`. The first adds an
+initially empty quota lookup with a finite, restartable historical backfill;
+triggers maintain later source corrections and erasure. The second stores
+bounded source-pinned acquisition checkpoints. Neither rewrites telemetry.
+Preserve their source and migration ledgers; do not clear a checkpoint or cache
+to conceal a source mismatch.
+
+One physical-statement meter covers both D1 bindings and all scheduled phases
+(900 statements, with lease-release headroom). Required maintenance runs
+first. Optional calculation has a 40-second admission deadline, rotates
+participants, and yields durable progress when it cannot finish. A completed
+head is admitted before rehydration only if its entire read and the shared
+usage-finishing reserve fit. Sustained required-work saturation may defer
+large accounts; it is not permission to lower evidence caps.
+
+Public and admin graph rebuilds consume only complete, source-current caches.
+A cache miss, stale source, deadline or malformed value defers the whole
+cohort. New unpublished activity days may publish token/spend totals without
+an allowance; their rebuild queue stays pending, and existing published
+allowance days are preserved until a complete replacement is available.
+
+Resume only after the approved migration set, full validation and recovery
+review pass, through the normal guarded deploy wrapper. Verify natural
+scheduled progress, cache source identity, public/admin responses and the
+rendered graph independently. See the
+[recovery decision](../decisions/2026-09-06-hosted-calculator-recovery.md).
 
 ## Read-only observation
 

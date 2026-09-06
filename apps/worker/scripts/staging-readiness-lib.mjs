@@ -94,6 +94,8 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     "0043_analytical_input_fencing.sql",
     "0044_attribution_transport_staging.sql",
     "0045_attribution_domain_activation.sql",
+    "0046_v1_quota_fit_projection.sql",
+    "0047_community_analysis_work.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",
@@ -106,6 +108,11 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
 // probes use this reviewed inventory; it never authorizes transport cutover.
 export const ATTRIBUTION_SCHEMA_OBJECTS = Object.freeze(Object.entries({
   table: [
+    "telemetry_v1_quota_fit_rows",
+    "telemetry_v1_quota_fit_backfill",
+    "community_analysis_work",
+    "community_analysis_work_parts",
+    "community_analysis_work_stage",
     "community_analytical_input_versions",
     "attribution_enrollments",
     "telemetry_transport_formats",
@@ -121,6 +128,7 @@ export const ATTRIBUTION_SCHEMA_OBJECTS = Object.freeze(Object.entries({
     "telemetry_v11_domain_heads",
   ],
   index: [
+    "telemetry_v1_quota_fit_rows_cursor",
     "telemetry_contributions_successor_compatibility",
     "telemetry_v11_consents_device",
     "telemetry_v11_manifests_device_day",
@@ -141,6 +149,10 @@ export const ATTRIBUTION_SCHEMA_OBJECTS = Object.freeze(Object.entries({
     "telemetry_v11_records_time_cursor",
   ],
   trigger: [
+    "community_analysis_work_parts_immutable",
+    "telemetry_v1_quota_fit_rows_insert",
+    "telemetry_v1_quota_fit_rows_update",
+    "telemetry_v1_quota_fit_rows_delete",
     "community_analytical_input_participant_created",
     "community_analytical_input_participant_state",
     "community_analytical_input_v1_insert",
@@ -197,6 +209,11 @@ export const ATTRIBUTION_SCHEMA_OBJECTS = Object.freeze(Object.entries({
 
 export const ATTRIBUTION_SCHEMA_COLUMNS = Object.freeze(Object.fromEntries(
   Object.entries({
+    telemetry_v1_quota_fit_rows: ["record_id", "participant_id", "resets_at", "observed_at"],
+    telemetry_v1_quota_fit_backfill: ["singleton_id", "through_record_id", "last_record_id", "is_complete"],
+    community_analysis_work: ["participant_id", "run_id", "input_revision", "input_fingerprint", "source_kind", "source_method_version", "fixed_now", "observed_at_cutoff", "resets_at_cutoff", "window_minutes", "max_quota_rows", "phase", "progress_revision", "control_json", "manifest_json", "state_sha256"],
+    community_analysis_work_parts: ["participant_id", "run_id", "component", "payload_json", "payload_sha256", "payload_bytes"],
+    community_analysis_work_stage: ["participant_id", "run_id", "stage_id", "base_progress_revision", "stage_revision", "mode", "target_phase", "target_control_json", "target_manifest_json", "write_manifest_json", "target_state_sha256", "replay_json", "write_offset", "verified_offset", "gc_component", "gc_sha256", "discard_input_revision", "state_sha256"],
     community_analytical_input_versions: ["participant_id", "revision"],
     community_allowance_publication_state: ["attribution_method_version"],
     admin_community_allowance_preview_cache: ["attribution_method_version", "source_mutation_epoch"],
@@ -246,6 +263,159 @@ AND NOT EXISTS (
 ) AS v1_usage_cursor_index
 `;
 
+// The projection is indexed while empty and backfilled separately. Deployment
+// checks schema only: an incomplete backfill on a populated database is valid
+// here, while the runtime reader must refuse it until completion.
+// These are independent, exact stored-SQL contracts, not SQL loaded from the
+// migrations being checked. Preserve case and whitespace inside literals:
+// normalizing them could admit a different eligibility or checkpoint contract.
+const QUOTA_PROJECTION_SCHEMA_SQL = Object.freeze({
+  telemetry_v1_quota_fit_rows: `CREATE TABLE telemetry_v1_quota_fit_rows (
+  record_id INTEGER PRIMARY KEY
+    REFERENCES telemetry_v1_records(id) ON DELETE CASCADE,
+  participant_id TEXT NOT NULL,
+  resets_at TEXT NOT NULL,
+  observed_at TEXT NOT NULL
+) STRICT`,
+  telemetry_v1_quota_fit_backfill: `CREATE TABLE telemetry_v1_quota_fit_backfill (
+  singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+  through_record_id INTEGER NOT NULL CHECK (through_record_id >= 0),
+  last_record_id INTEGER NOT NULL DEFAULT 0 CHECK (last_record_id >= 0),
+  is_complete INTEGER NOT NULL DEFAULT 0 CHECK (is_complete IN (0, 1)),
+  CHECK (last_record_id <= through_record_id)
+) STRICT`,
+  telemetry_v1_quota_fit_rows_insert: `CREATE TRIGGER telemetry_v1_quota_fit_rows_insert
+AFTER INSERT ON telemetry_v1_records
+WHEN NEW.stream = 'quota' AND NEW.limit_id = 'codex'
+  AND NEW.window_duration_minutes = 10080
+  AND NEW.provider IS NOT NULL AND NEW.plan_type IS NOT NULL
+  AND NEW.plan_variant IS NOT NULL AND NEW.resets_at IS NOT NULL
+  AND NEW.slot IS NOT NULL AND NEW.used_percent IS NOT NULL
+BEGIN
+  INSERT INTO telemetry_v1_quota_fit_rows
+    (record_id, participant_id, resets_at, observed_at)
+  VALUES (NEW.id, NEW.participant_id, NEW.resets_at, NEW.observed_at);
+END`,
+  telemetry_v1_quota_fit_rows_update: `CREATE TRIGGER telemetry_v1_quota_fit_rows_update
+AFTER UPDATE OF id, participant_id, stream, limit_id, window_duration_minutes,
+  provider, plan_type, plan_variant, resets_at, slot, used_percent, observed_at
+ON telemetry_v1_records
+BEGIN
+  DELETE FROM telemetry_v1_quota_fit_rows WHERE record_id = OLD.id;
+  INSERT INTO telemetry_v1_quota_fit_rows
+    (record_id, participant_id, resets_at, observed_at)
+  SELECT NEW.id, NEW.participant_id, NEW.resets_at, NEW.observed_at
+  WHERE NEW.stream = 'quota' AND NEW.limit_id = 'codex'
+    AND NEW.window_duration_minutes = 10080
+    AND NEW.provider IS NOT NULL AND NEW.plan_type IS NOT NULL
+    AND NEW.plan_variant IS NOT NULL AND NEW.resets_at IS NOT NULL
+    AND NEW.slot IS NOT NULL AND NEW.used_percent IS NOT NULL;
+END`,
+  telemetry_v1_quota_fit_rows_delete: `CREATE TRIGGER telemetry_v1_quota_fit_rows_delete
+AFTER DELETE ON telemetry_v1_records
+BEGIN
+  DELETE FROM telemetry_v1_quota_fit_rows WHERE record_id = OLD.id;
+END`,
+});
+
+const COMMUNITY_ANALYSIS_WORK_SCHEMA_SQL = Object.freeze({
+  community_analysis_work: `CREATE TABLE community_analysis_work (
+  participant_id TEXT PRIMARY KEY REFERENCES participants(id) ON DELETE CASCADE,
+  run_id TEXT NOT NULL,
+  input_revision INTEGER NOT NULL CHECK (input_revision >= 0 AND input_revision < 9007199254740991),
+  input_fingerprint TEXT NOT NULL CHECK (length(input_fingerprint) = 64 AND input_fingerprint NOT GLOB '*[^0-9a-f]*'),
+  source_kind TEXT NOT NULL CHECK (source_kind = 'v1'),
+  source_method_version TEXT NOT NULL CHECK (length(source_method_version) BETWEEN 1 AND 2048),
+  fixed_now TEXT NOT NULL,
+  observed_at_cutoff TEXT NOT NULL,
+  resets_at_cutoff TEXT NOT NULL,
+  window_minutes INTEGER NOT NULL CHECK (window_minutes > 0),
+  max_quota_rows INTEGER NOT NULL CHECK (max_quota_rows BETWEEN 1 AND 60000),
+  phase TEXT NOT NULL CHECK (phase IN ('plan', 'fitability', 'endpoints', 'complete')),
+  progress_revision INTEGER NOT NULL CHECK (progress_revision >= 0 AND progress_revision < 9007199254740991),
+  control_json TEXT NOT NULL CHECK (json_valid(control_json) AND length(CAST(control_json AS BLOB)) <= 16384),
+  manifest_json TEXT NOT NULL CHECK (json_valid(manifest_json) AND length(CAST(manifest_json AS BLOB)) <= 131072),
+  state_sha256 TEXT NOT NULL CHECK (length(state_sha256) = 64 AND state_sha256 NOT GLOB '*[^0-9a-f]*'),
+  UNIQUE (participant_id, run_id)
+) STRICT`,
+  community_analysis_work_parts: `CREATE TABLE community_analysis_work_parts (
+  participant_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  component TEXT NOT NULL CHECK (component IN ('plan-anchors', 'plan-runs', 'plan-equal-time', 'fit-stats', 'eligible', 'endpoint-runs', 'endpoints')),
+  payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+  payload_sha256 TEXT NOT NULL CHECK (length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),
+  payload_bytes INTEGER NOT NULL CHECK (payload_bytes BETWEEN 1 AND 131072 AND payload_bytes = length(CAST(payload_json AS BLOB))),
+  PRIMARY KEY (participant_id, run_id, component, payload_sha256),
+  FOREIGN KEY (participant_id, run_id) REFERENCES community_analysis_work(participant_id, run_id) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID`,
+  community_analysis_work_parts_immutable: `CREATE TRIGGER community_analysis_work_parts_immutable
+BEFORE UPDATE ON community_analysis_work_parts
+BEGIN
+  SELECT RAISE(ABORT, 'community analysis part immutable');
+END`,
+  community_analysis_work_stage: `CREATE TABLE community_analysis_work_stage (
+  participant_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  stage_id TEXT NOT NULL,
+  base_progress_revision INTEGER NOT NULL CHECK (base_progress_revision >= 0 AND base_progress_revision < 9007199254740990),
+  stage_revision INTEGER NOT NULL CHECK (stage_revision >= 0 AND stage_revision < 9007199254740991),
+  mode TEXT NOT NULL CHECK (mode IN ('writing', 'verifying', 'garbage_collecting', 'discarding')),
+  target_phase TEXT NOT NULL CHECK (target_phase IN ('plan', 'fitability', 'endpoints', 'complete')),
+  target_control_json TEXT NOT NULL CHECK (json_valid(target_control_json) AND length(CAST(target_control_json AS BLOB)) <= 16384),
+  target_manifest_json TEXT NOT NULL CHECK (json_valid(target_manifest_json) AND json_type(target_manifest_json) = 'array' AND json_array_length(target_manifest_json) <= 1024 AND length(CAST(target_manifest_json AS BLOB)) <= 131072),
+  write_manifest_json TEXT NOT NULL CHECK (json_valid(write_manifest_json) AND json_type(write_manifest_json) = 'array' AND json_array_length(write_manifest_json) <= 1024 AND length(CAST(write_manifest_json AS BLOB)) <= 131072),
+  target_state_sha256 TEXT NOT NULL CHECK (length(target_state_sha256) = 64 AND target_state_sha256 NOT GLOB '*[^0-9a-f]*'),
+  replay_json TEXT NOT NULL CHECK (json_valid(replay_json) AND length(CAST(replay_json AS BLOB)) <= 16384),
+  write_offset INTEGER NOT NULL CHECK (write_offset BETWEEN 0 AND 1024),
+  verified_offset INTEGER NOT NULL CHECK (verified_offset BETWEEN 0 AND 1024),
+  gc_component TEXT NOT NULL,
+  gc_sha256 TEXT NOT NULL,
+  discard_input_revision INTEGER CHECK (discard_input_revision >= 0 AND discard_input_revision < 9007199254740991),
+  state_sha256 TEXT NOT NULL CHECK (length(state_sha256) = 64 AND state_sha256 NOT GLOB '*[^0-9a-f]*'),
+  FOREIGN KEY (participant_id, run_id) REFERENCES community_analysis_work(participant_id, run_id) ON DELETE CASCADE
+) STRICT`,
+});
+
+function exactStoredSchemaProbe(objects) {
+  return Object.entries(objects).map(([name, sql]) => `EXISTS (
+  SELECT 1 FROM sqlite_master WHERE name = ${sqlStringLiteral(name)}
+    AND type = ${sqlStringLiteral(sql.startsWith("CREATE TABLE") ? "table" : "trigger")}
+    AND sql IS ${sqlStringLiteral(sql)}
+)`).join(" AND ");
+}
+
+export const V1_QUOTA_FIT_CURSOR_INDEX_PROBE_SQL = `
+SELECT EXISTS (
+  SELECT 1 FROM pragma_table_info('telemetry_v1_quota_fit_rows')
+   WHERE name = 'record_id' AND upper(type) = 'INTEGER' AND pk = 1
+) AND (SELECT count(*) FROM pragma_table_info('telemetry_v1_quota_fit_rows') WHERE pk > 0) = 1
+AND NOT EXISTS (
+  SELECT 1 FROM pragma_index_list('telemetry_v1_quota_fit_rows') WHERE origin = 'pk'
+) AND EXISTS (
+  SELECT 1 FROM pragma_index_list('telemetry_v1_quota_fit_rows')
+   WHERE name = 'telemetry_v1_quota_fit_rows_cursor'
+     AND "unique" = 0 AND partial = 0 AND origin = 'c'
+) AND (SELECT count(*) FROM pragma_index_xinfo(
+  'telemetry_v1_quota_fit_rows_cursor')) = 4
+AND NOT EXISTS (
+  SELECT 1 FROM pragma_index_xinfo('telemetry_v1_quota_fit_rows_cursor')
+   WHERE "desc" IS NOT 0 OR coll IS NOT 'BINARY' OR NOT (
+     (seqno = 0 AND name IS 'participant_id' AND "key" = 1) OR
+     (seqno = 1 AND name IS 'resets_at' AND "key" = 1) OR
+     (seqno = 2 AND name IS 'observed_at' AND "key" = 1) OR
+     (seqno = 3 AND cid = -1 AND name IS NULL AND "key" = 0)
+   )
+) AS v1_quota_fit_cursor_index
+`;
+
+export const V1_QUOTA_FIT_PROJECTION_SCHEMA_PROBE_SQL = `
+SELECT (${V1_QUOTA_FIT_CURSOR_INDEX_PROBE_SQL})
+AND ${exactStoredSchemaProbe(QUOTA_PROJECTION_SCHEMA_SQL)} AS v1_quota_fit_projection_schema
+`;
+export const COMMUNITY_ANALYSIS_WORK_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(COMMUNITY_ANALYSIS_WORK_SCHEMA_SQL)} AS community_analysis_work_schema
+`;
+
 // One bounded metadata query: no contribution, identity, token or policy-state
 // values leave the database, and no table-per-column remote round trips.
 export const ATTRIBUTION_SCHEMA_PROBE_SQL = `
@@ -261,7 +431,9 @@ SELECT NOT EXISTS (
   SELECT 1 FROM required_objects expected
    WHERE NOT EXISTS (SELECT 1 FROM sqlite_master actual
      WHERE actual.type = expected.type AND actual.name = expected.name)
-) AND (${V1_USAGE_CURSOR_INDEX_PROBE_SQL}) AS attribution_objects,
+) AND (${V1_USAGE_CURSOR_INDEX_PROBE_SQL})
+AND (${V1_QUOTA_FIT_PROJECTION_SCHEMA_PROBE_SQL})
+AND (${COMMUNITY_ANALYSIS_WORK_SCHEMA_PROBE_SQL}) AS attribution_objects,
 NOT EXISTS (
   SELECT 1 FROM required_columns expected
    WHERE NOT EXISTS (SELECT 1 FROM pragma_table_info(expected.table_name) actual

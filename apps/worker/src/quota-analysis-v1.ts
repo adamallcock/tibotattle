@@ -5,7 +5,7 @@ import {
   SEVEN_DAY_WINDOW_MINUTES,
   analyzeQuotaCalibration,
   buildPlanAttributionIndex,
-  buildCompositionObservations,
+  buildCompositionObservationsFromOrderedUsage,
   buildResetEvidence,
   calibrateCompositionCapacities,
   isSupportedQuotaWindowDuration,
@@ -35,10 +35,22 @@ import {
   V1_WINNER_FILTER_SQL,
 } from "./telemetry-v1-source-selection";
 import type { V1SourcePin } from "./telemetry-v1-source-selection";
+import {
+  V1_QUOTA_ACQUISITION_VERSION,
+  validateV1CompletedQuotaAcquisition,
+  type V1CompletedQuotaAcquisition,
+  type V1QuotaAcquisitionIdentity,
+  type V1QuotaInvocationBudget,
+} from "./quota-analysis-v1-reader";
 
 /** Bump fit/composition caches whenever this adapter attribution changes. */
 export const V1_PLAN_ATTRIBUTION_ADAPTER_VERSION =
   `${V1_SOURCE_SELECTION_METHOD_VERSION}:${PLAN_ATTRIBUTION_POLICY.methodVersion}:v1-era-buckets-2`;
+
+/** Separate until the cache-only scheduler is integrated. Never label the old
+ * synchronous acquisition with the corrected equal-time plan barrier method. */
+export const V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION =
+  `${V1_SOURCE_SELECTION_METHOD_VERSION}:${PLAN_ATTRIBUTION_POLICY.methodVersion}:v1-era-buckets-3:${V1_QUOTA_ACQUISITION_VERSION}`;
 
 /**
  * Reset-fit analysis for the telemetry-contribution-v1.0 chunk corpus, computed
@@ -262,6 +274,116 @@ export interface V1AnalysisOptions {
   sourcePin?: V1SourcePin;
 }
 
+export interface V1AcquiredQuotaEvidence {
+  identity: V1QuotaAcquisitionIdentity;
+  acquisition: V1CompletedQuotaAcquisition;
+}
+
+/** The whole non-resumable usage/fit phase must fit the SAME invocation budget.
+ * This is a conservative reservation, not a report of queries actually used.
+ * With a supplied pin: 1 successor check + 2 initial source checks + at most
+ * 2 queries per 5,000-row usage page (including EOF/overflow) + 2 final checks.
+ * Caller separately reserves checkpoint/cache promotion and maintenance costs.
+ * CPU and combined retained-memory qualification remain required before wiring
+ * this entry point into production; a query reservation alone proves neither.
+ */
+export function v1QuotaFinishQueryReserve(maxUsageRows = MAX_WINDOWED_USAGE_ROWS): number {
+  if (!Number.isSafeInteger(maxUsageRows) || maxUsageRows < 0 || maxUsageRows > MAX_WINDOWED_USAGE_ROWS) {
+    throw new TypeError("v1 finish usage bound invalid");
+  }
+  return 5 + 2 * (Math.floor(maxUsageRows / USAGE_PAGE_SIZE) + 1);
+}
+
+function reserveV1QuotaFinish(budget: V1QuotaInvocationBudget, options: V1AnalysisOptions): boolean {
+  if (!Number.isSafeInteger(budget.remainingQueries) || budget.remainingQueries < 0
+      || !Number.isFinite(budget.deadlineMs)) throw new TypeError("v1 finish budget invalid");
+  const maxQuotaRows = options.maxDownsampledQuotaRows ?? MAX_DOWNSAMPLED_QUOTA_ROWS;
+  if (!Number.isSafeInteger(maxQuotaRows) || maxQuotaRows < 1 || maxQuotaRows > MAX_DOWNSAMPLED_QUOTA_ROWS) {
+    throw new TypeError("v1 finish quota bound invalid");
+  }
+  const required = v1QuotaFinishQueryReserve(options.maxWindowedUsageRows);
+  const now = (budget.now ?? Date.now)();
+  if (!Number.isFinite(now)) throw new TypeError("v1 finish budget clock invalid");
+  if (budget.remainingQueries < required || now >= budget.deadlineMs) return false;
+  budget.remainingQueries -= required;
+  return true;
+}
+
+function requireAcquiredQuotaEvidence(evidence: unknown): void {
+  if (evidence === null || typeof evidence !== "object" || Array.isArray(evidence)
+      || Object.keys(evidence).length !== 2 || !Object.hasOwn(evidence, "identity")
+      || !Object.hasOwn(evidence, "acquisition")) throw new Error("v1 acquired quota evidence required");
+  for (const key of ["identity", "acquisition"]) {
+    const value: unknown = Reflect.get(evidence, key);
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("v1 acquired quota evidence required");
+    }
+  }
+}
+
+async function validateAcquiredQuotaEvidence(
+  db: D1Database, participantId: string, evidence: V1AcquiredQuotaEvidence,
+  sourcePin: V1SourcePin, observedAtCutoff: string, resetsAtCutoff: string, maxQuotaRows: number,
+): Promise<{ attributionIndex: PlanAttributionIndex; results: DownsampledQuotaRow[] }> {
+  const identity = evidence.identity;
+  if (!identity || identity.participantId !== participantId
+      || identity.inputFingerprint !== sourcePin.fingerprint
+      || identity.sourceMethodVersion !== V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION
+      || identity.observedAtCutoff !== observedAtCutoff || identity.resetsAtCutoff !== resetsAtCutoff
+      || identity.windowMinutes !== SEVEN_DAY_WINDOW_MINUTES || identity.maxQuotaRows !== maxQuotaRows
+      || !validateV1CompletedQuotaAcquisition(evidence.acquisition)
+      || evidence.acquisition.quotaRows.length > maxQuotaRows) {
+    throw new Error("v1 acquired quota evidence mismatch");
+  }
+  // Check before doing expensive fitting, not only after it. A stored payload
+  // with a valid shape is never proof that its source is still current.
+  await assertV1SourcePinCurrent(db, sourcePin);
+  return { attributionIndex: buildPlanAttributionIndex(evidence.acquisition.planAnchors),
+    results: evidence.acquisition.quotaRows };
+}
+
+/** Explicit acquired-input path; never falls back to the unbounded quota SQL.
+ * The caller must load/verify a complete durable acquisition
+ * and positively source-fence the eventual cache promotion.
+ */
+export async function finishAccountScopedQuotaAnalysisV1(
+  db: D1Database, participantId: string, evidence: V1AcquiredQuotaEvidence,
+  budget: V1QuotaInvocationBudget, options: V1AnalysisOptions & { sourcePin: V1SourcePin },
+): Promise<{ status: "deferred" } | { status: "complete"; analysis: object }> {
+  requireAcquiredQuotaEvidence(evidence);
+  if (!options.sourcePin) throw new Error("v1 acquired finish requires source pin");
+  if (!reserveV1QuotaFinish(budget, options)) return { status: "deferred" };
+  const result = await finishAcquiredAnalyses(db, participantId, evidence, options, true, false);
+  return { status: "complete", analysis: result.quotaAnalysis };
+}
+
+export async function finishAccountScopedModelCompositionV1(
+  db: D1Database, participantId: string, evidence: V1AcquiredQuotaEvidence,
+  budget: V1QuotaInvocationBudget, options: V1AnalysisOptions & { sourcePin: V1SourcePin },
+): Promise<{ status: "deferred" } | { status: "complete"; analysis: V1ModelCompositionResult }> {
+  requireAcquiredQuotaEvidence(evidence);
+  if (!options.sourcePin) throw new Error("v1 acquired finish requires source pin");
+  if (!reserveV1QuotaFinish(budget, options)) return { status: "deferred" };
+  const result = await finishAcquiredAnalyses(db, participantId, evidence, options, false, true);
+  return { status: "complete", analysis: result.modelComposition };
+}
+
+/** One acquired corpus, one admitted usage scan and one server-pricing pass.
+ * The existing 407-query default reserve covers BOTH results; the caller owns
+ * checkpoint/cache promotion and the invocation-wide database statement meter.
+ * Evidence is borrowed, never mutated. Release acquisition indexes/checkpoints
+ * before calling: completed normalized evidence is the sole retained input.
+ */
+export async function finishAccountScopedAnalysesV1(
+  db: D1Database, participantId: string, evidence: V1AcquiredQuotaEvidence,
+  budget: V1QuotaInvocationBudget, options: V1AnalysisOptions & { sourcePin: V1SourcePin },
+): Promise<{ status: "deferred" } | { status: "complete"; quotaAnalysis: object; modelComposition: V1ModelCompositionResult }> {
+  requireAcquiredQuotaEvidence(evidence);
+  if (!options.sourcePin) throw new Error("v1 acquired finish requires source pin");
+  if (!reserveV1QuotaFinish(budget, options)) return { status: "deferred" };
+  return { status: "complete", ...await finishAcquiredAnalyses(db, participantId, evidence, options, true, true) };
+}
+
 function notTestable(reason: string): object {
   return {
     schemaVersion: "account-scoped-quota-analysis-v0.1",
@@ -407,45 +529,46 @@ async function buildQuotaSnapshotInput(
   accountTrackId: string,
   datasetId: string,
 ): Promise<QuotaSnapshotInput | null> {
-  if (row.slot === null || !SLOT_VALUES.has(row.slot)) return null;
-  if (row.resets_at === null || row.observed_at === null) return null;
-  if (Date.parse(row.resets_at) <= Date.parse(row.observed_at)) return null;
-  if (row.used_percent === null
-      || !Number.isFinite(row.used_percent)
-      || row.used_percent < 0
-      || row.used_percent > 100) return null;
-  if (row.plan_type === null
-      || row.plan_variant === null
-      || row.limit_id === null) return null;
-  if (!SAFE_TOKEN.test(row.provider)
-      || !SAFE_TOKEN.test(row.plan_type)
-      || !SAFE_TOKEN.test(row.plan_variant)
-      || !SAFE_TOKEN.test(row.limit_id)
-      || !SAFE_TOKEN.test(row.slot)) return null;
-  // A quota snapshot needs a window; a missing one can neither seed nor bucket
-  // (matching the v0.2 path, where a null window drops out).
-  if (row.window_duration_minutes === null) return null;
+  if (!validQuotaSnapshotRow(row)) return null;
   const snapshotId = `q:v1:${await sha256Hex(row.occurrence_id)}`;
   return {
     snapshotId,
     datasetId,
     accountTrackId,
     provider: row.provider,
-    planType: row.plan_type,
-    planVariant: row.plan_variant,
-    limitId: row.limit_id,
+    planType: row.plan_type!,
+    planVariant: row.plan_variant!,
+    limitId: row.limit_id!,
     slot: row.slot as QuotaSlot,
-    windowDurationMinutes:
-      row.window_duration_minutes as QuotaWindowDurationMinutes,
-    resetsAt: row.resets_at,
-    observedAt: row.observed_at,
-    // Receipt lag 0: v1 records carry no receipt timestamp distinct from the
-    // observation, so the reset is never stale or backward on lag.
-    receivedAt: row.observed_at,
-    usedPercent: row.used_percent,
+    windowDurationMinutes: row.window_duration_minutes as QuotaWindowDurationMinutes,
+    resetsAt: row.resets_at!,
+    observedAt: row.observed_at!,
+    receivedAt: row.observed_at!,
+    usedPercent: row.used_percent!,
     displayPrecision: 0,
     policyEpoch: V1_POLICY_EPOCH,
   };
+}
+
+function validQuotaSnapshotRow(row: RawQuotaRow): boolean {
+  if (row.slot === null || !SLOT_VALUES.has(row.slot)) return false;
+  if (row.resets_at === null || row.observed_at === null) return false;
+  if (Date.parse(row.resets_at) <= Date.parse(row.observed_at)) return false;
+  if (row.used_percent === null
+      || !Number.isFinite(row.used_percent)
+      || row.used_percent < 0
+      || row.used_percent > 100) return false;
+  if (row.plan_type === null
+      || row.plan_variant === null
+      || row.limit_id === null) return false;
+  if (!SAFE_TOKEN.test(row.provider)
+      || !SAFE_TOKEN.test(row.plan_type)
+      || !SAFE_TOKEN.test(row.plan_variant)
+      || !SAFE_TOKEN.test(row.limit_id)
+      || !SAFE_TOKEN.test(row.slot)) return false;
+  // A quota snapshot needs a window; a missing one can neither seed nor bucket
+  // (matching the v0.2 path, where a null window drops out).
+  return row.window_duration_minutes !== null;
 }
 
 async function v1DatasetId(participantId: string): Promise<string> {
@@ -742,6 +865,130 @@ interface BucketAccumulator {
   placementMs: number;
 }
 
+/** Exact session dictionary: hashes choose a slot, full identifiers decide
+ * equality. Fixed-size typed storage bounds maximum-length admitted identities
+ * and pending ties without 100k duplicate strings/objects. The fallback keeps
+ * legacy malformed stored strings behavior; admission normally excludes it.
+ */
+function createUsageSessionState() {
+  const WIDTH = 128, SLOTS = 262_144, ASCII_ID = /^[A-Za-z0-9._:-]{8,128}$/u;
+  const providerIds = new Map<string, number>(), providers: string[] = [];
+  const fallbackSessions = new Map<string, number>(), fallbackOccurrences = new Map<number, string>();
+  const PENDING_BLOCK_SIZE = 1024;
+  interface PendingBlock {
+    sessions: Uint32Array; previous: Float64Array; costs: Float64Array;
+    flags: Uint8Array; occurrences: Uint8Array; occurrenceLengths: Uint8Array;
+  }
+  const pendingBlocks: PendingBlock[] = [];
+  let count = 0, pendingCount = 0;
+  let slots = new Uint32Array(0), names = new Uint8Array(0), lengths = new Uint8Array(0);
+  let providerBySession = new Uint32Array(0), times = new Float64Array(0);
+  let pendingBySession = new Uint32Array(0);
+  const pendingLocation = (index: number) => {
+    const ordinal = pendingBySession[index]! - 1;
+    return { block: pendingBlocks[Math.floor(ordinal / PENDING_BLOCK_SIZE)]!, offset: ordinal % PENDING_BLOCK_SIZE };
+  };
+  const ensureClocks = () => {
+    if (slots.length) return;
+    slots = new Uint32Array(SLOTS); names = new Uint8Array(MAX_SESSION_INTERVAL_SCOPES * WIDTH);
+    lengths = new Uint8Array(MAX_SESSION_INTERVAL_SCOPES); providerBySession = new Uint32Array(MAX_SESSION_INTERVAL_SCOPES);
+    times = new Float64Array(MAX_SESSION_INTERVAL_SCOPES);
+  };
+  const write = (target: Uint8Array, index: number, value: string) => {
+    for (let i = 0; i < value.length; i++) target[index * WIDTH + i] = value.charCodeAt(i);
+  };
+  const compare = (target: Uint8Array, index: number, length: number, value: string) => {
+    for (let i = 0; i < Math.min(length, value.length); i++) {
+      const difference = value.charCodeAt(i) - target[index * WIDTH + i]!;
+      if (difference) return difference;
+    }
+    return value.length - length;
+  };
+  return {
+    find(provider: string, session: string): number {
+      ensureClocks();
+      let providerId = providerIds.get(provider);
+      if (providerId === undefined) { providerId = providers.length; providers.push(provider); providerIds.set(provider, providerId); }
+      let slot = -1, fallbackKey: string | null = null;
+      if (ASCII_ID.test(session)) {
+        let hash = Math.imul(2166136261 ^ providerId, 16777619);
+        for (let i = 0; i < session.length; i++) hash = Math.imul(hash ^ session.charCodeAt(i), 16777619);
+        slot = (hash >>> 0) & (SLOTS - 1);
+        while (slots[slot]) {
+          const index = slots[slot]! - 1;
+          if (providerBySession[index] === providerId && compare(names, index, lengths[index]!, session) === 0) return index;
+          slot = (slot + 1) & (SLOTS - 1);
+        }
+      } else {
+        fallbackKey = JSON.stringify([provider, session]);
+        const existing = fallbackSessions.get(fallbackKey);
+        if (existing !== undefined) return existing;
+      }
+      if (count === MAX_SESSION_INTERVAL_SCOPES) return -1;
+      const index = count++;
+      providerBySession[index] = providerId; times[index] = NaN;
+      if (fallbackKey === null) { slots[slot] = index + 1; lengths[index] = session.length; write(names, index, session); }
+      else fallbackSessions.set(fallbackKey, index);
+      return index;
+    },
+    time(index: number): number | undefined { return Number.isNaN(times[index]) ? undefined : times[index]; },
+    setTime(index: number, value: number) { times[index] = value; },
+    hasPending(index: number) { return Boolean(pendingBySession[index]); },
+    earlier(index: number, occurrence: string) {
+      const fallback = fallbackOccurrences.get(index);
+      if (fallback !== undefined) return occurrence < fallback;
+      const { block, offset } = pendingLocation(index);
+      return compare(block.occurrences, offset, block.occurrenceLengths[offset]!, occurrence) < 0;
+    },
+    save(index: number, occurrence: string, priced: ReturnType<typeof priceChunkUsageRecord>, intervalStart?: number) {
+      if (!pendingBySession.length) pendingBySession = new Uint32Array(MAX_SESSION_INTERVAL_SCOPES);
+      if (!pendingBySession[index]) {
+        // Only active elections occupy storage. A single ambiguous session
+        // must not allocate 100k maximum-length occurrence identities.
+        const ordinal = pendingCount++, blockIndex = Math.floor(ordinal / PENDING_BLOCK_SIZE);
+        if (!pendingBlocks[blockIndex]) {
+          const length = Math.min(PENDING_BLOCK_SIZE, MAX_SESSION_INTERVAL_SCOPES - blockIndex * PENDING_BLOCK_SIZE);
+          pendingBlocks.push({ sessions: new Uint32Array(length), previous: new Float64Array(length),
+            costs: new Float64Array(length), flags: new Uint8Array(length),
+            occurrences: new Uint8Array(length * WIDTH), occurrenceLengths: new Uint8Array(length) });
+        }
+        pendingBySession[index] = ordinal + 1;
+        const { block, offset } = pendingLocation(index);
+        block.sessions[offset] = index; block.previous[offset] = intervalStart ?? NaN;
+      }
+      const { block, offset } = pendingLocation(index);
+      block.flags[offset] = priced === null ? 1 : priced.pricingStatus === "fully_priced" ? 2 : 3;
+      block.costs[offset] = priced?.costNanousd ?? 0;
+      if (ASCII_ID.test(occurrence)) {
+        fallbackOccurrences.delete(index); block.occurrenceLengths[offset] = occurrence.length; write(block.occurrences, offset, occurrence);
+      } else fallbackOccurrences.set(index, occurrence);
+    },
+    point(index: number) {
+      const { block, offset } = pendingLocation(index);
+      return { provider: providers[providerBySession[index]!]!, observedAtMs: times[index]!,
+        priced: block.flags[offset] === 1 ? null : { costNanousd: block.costs[offset]!,
+          pricingStatus: block.flags[offset] === 2 ? "fully_priced" as const : "partially_priced" as const, modelId: null } };
+    },
+    flush(consume: (point: { provider: string; observedAtMs: number; priced: ReturnType<typeof priceChunkUsageRecord> }, start: number | undefined) => void) {
+      for (let i = 0; i < pendingCount; i++) {
+        const block = pendingBlocks[Math.floor(i / PENDING_BLOCK_SIZE)]!, offset = i % PENDING_BLOCK_SIZE;
+        const index = block.sessions[offset]!;
+        consume(this.point(index), Number.isNaN(block.previous[offset]) ? undefined : block.previous[offset]);
+        pendingBySession[index] = 0;
+      }
+      pendingCount = 0; fallbackOccurrences.clear();
+    },
+    clear() {
+      providerIds.clear(); providers.length = 0; fallbackSessions.clear(); fallbackOccurrences.clear();
+      count = pendingCount = 0;
+      pendingBlocks.length = 0;
+      slots = providerBySession = pendingBySession = new Uint32Array(0);
+      names = lengths = new Uint8Array(0);
+      times = new Float64Array(0);
+    },
+  };
+}
+
 /**
  * Stream the windowed usage (keyset-paginated), reprice each event, and fold it
  * into synthetic per-bucket rows aligned to the retained quota grid. Returns the
@@ -758,6 +1005,8 @@ async function readAndBucketUsage(
   maxWindowedUsageRows: number,
   winnersJsonArg: string,
   attributionIndex: PlanAttributionIndex,
+  composition?: ReturnType<typeof createCompositionUsageAccumulator>,
+  scalarEnabled = true,
 ): Promise<AttributedUsageEventPartial[] | "limit_exceeded" | "session_scope_limit_exceeded" | "cost_limit_exceeded"> {
   // Per provider: strictly-interior events keyed by their ceiling grid instant,
   // and grid-exact events kept as their own singleton at that instant (the
@@ -767,24 +1016,20 @@ async function readAndBucketUsage(
   const buckets = new Map<string, Map<number, BucketAccumulator>>();
   const singletons = new Map<string, Map<number, BucketAccumulator>>();
   const bucketScopes = new Map<string, { provider: string; planEraKey: string | null }>();
-  const priorSessionTimes = new Map<string, number>();
+  const sessions = createUsageSessionState();
+  let scalarFailure: "session_scope_limit_exceeded" | null = null;
 
   // Physical reads now use id within a timestamp, while the attribution
   // contract uses occurrence order. Only the minimum occurrence for a session
   // can inherit its earlier interval; every other tie has interval [t,t].
   // Retain that one compact candidate, not the raw JSON or the whole tie run.
-  // priorSessionTimes includes pending sessions, so its existing cap bounds
-  // the UNION of both maps rather than permitting a second set of 100k scopes.
+  // Pending candidates reference the same session indices as the clocks;
+  // their union cannot exceed the existing 100k-session cap.
   interface UsagePoint {
     provider: string;
     observedAtMs: number;
     priced: ReturnType<typeof priceChunkUsageRecord>;
   }
-  const pendingFirst = new Map<string, {
-    occurrenceId: string;
-    intervalStartMs: number | undefined;
-    point: UsagePoint;
-  }>();
   let pendingObservedAt: string | null = null;
   let costLimitExceeded = false;
 
@@ -827,8 +1072,7 @@ async function readAndBucketUsage(
   };
 
   const flushFirst = (): void => {
-    for (const candidate of pendingFirst.values()) foldPoint(candidate.point, candidate.intervalStartMs);
-    pendingFirst.clear();
+    sessions.flush(foldPoint);
   };
 
   let total = 0;
@@ -838,41 +1082,72 @@ async function readAndBucketUsage(
     const rows = await readV1UsagePage(db, winnersJsonArg, participantId, cursorObs, cursorId, USAGE_PAGE_SIZE);
     if (rows.length === 0) break;
     total += rows.length;
-    if (total > maxWindowedUsageRows) return "limit_exceeded";
+    if (total > maxWindowedUsageRows) {
+      composition?.limitExceeded();
+      return scalarFailure ?? "limit_exceeded";
+    }
     for (const row of rows) {
       if (!SAFE_TOKEN.test(row.provider)) continue;
       const eMs = Date.parse(row.observed_at);
       if (!Number.isFinite(eMs)) continue;
+      const grid = gridByProvider.get(row.provider);
+      const scalarPriceNeeded = scalarEnabled && !scalarFailure && grid && grid.sortedMs.length > 0
+        && eMs <= grid.sortedMs[grid.sortedMs.length - 1]!;
+      const priced = scalarPriceNeeded || composition?.accepts(row.provider)
+        ? priceChunkUsageRecord(row.record_json, row.observed_at) : null;
+      composition?.add(row, eMs, priced);
+      if (!scalarEnabled || scalarFailure) continue;
       if (pendingObservedAt !== row.observed_at) {
         flushFirst();
         pendingObservedAt = row.observed_at;
       }
       // v1 has no quantity-basis field. A prior usage record in the SAME
       // session gives a conservative interval bound, never account proof.
-      const sessionKey = row.session_uuid === null ? null
-        : JSON.stringify([row.provider, row.session_uuid]);
-      if (sessionKey !== null && !priorSessionTimes.has(sessionKey)
-          && priorSessionTimes.size >= MAX_SESSION_INTERVAL_SCOPES) {
-        return "session_scope_limit_exceeded";
+      const sessionKey = row.session_uuid;
+      const sessionIndex = sessionKey === null ? null : sessions.find(row.provider, sessionKey);
+      if (sessionIndex === -1) {
+        if (!composition) return "session_scope_limit_exceeded";
+        scalarFailure = "session_scope_limit_exceeded";
+        sessions.clear();
+        buckets.clear(); singletons.clear(); bucketScopes.clear();
+        continue;
       }
-      const grid = gridByProvider.get(row.provider);
+      if (!scalarPriceNeeded) {
+        // A timestamp beyond this provider's final grid (or without a grid)
+        // cannot contribute under either interval election. Still register
+        // every session, enforce its cap, and advance its clock; the prior
+        // timestamp's pending candidates were flushed above. In-grid DROP
+        // rows do NOT take this shortcut: their occurrence can win a tie.
+        if (sessionIndex !== null) sessions.setTime(sessionIndex, eMs);
+        continue;
+      }
       const point: UsagePoint = { provider: row.provider, observedAtMs: eMs,
-        priced: !grid || grid.sortedMs.length === 0 || eMs > grid.sortedMs[grid.sortedMs.length - 1]!
-          ? null : priceChunkUsageRecord(row.record_json, row.observed_at) };
-      if (sessionKey === null) {
+        priced: scalarPriceNeeded ? priced : null };
+      if (sessionIndex === null) {
         foldPoint(point, undefined);
       } else {
-        const candidate = pendingFirst.get(sessionKey);
-        if (!candidate) {
-          pendingFirst.set(sessionKey, { occurrenceId: row.occurrence_id,
-            intervalStartMs: priorSessionTimes.get(sessionKey), point });
+        if (!sessions.hasPending(sessionIndex)) {
+          const intervalStartMs = sessions.time(sessionIndex);
           // Includes DROP/grid-ineligible candidates: the original clock
           // advanced before those filters. Null sessions never share a clock.
-          priorSessionTimes.set(sessionKey, eMs);
-        } else if (row.occurrence_id < candidate.occurrenceId) {
-          foldPoint(candidate.point, eMs);
-          candidate.occurrenceId = row.occurrence_id;
-          candidate.point = point;
+          sessions.setTime(sessionIndex, eMs);
+          // A missing start is the shared kernel's point interval [t,t].
+          // No occurrence-order election is needed when both possible intervals
+          // have the same era (including the same unresolved disposition).
+          const era = (start: number | undefined) => {
+            const match = planEraForInterval(attributionIndex, {
+              contextKey: planAttributionContextKey(row.provider, "codex"), observedAtMs: eMs, intervalStartMs: start,
+            });
+            return match.status === "matched" ? match.era.eraKey : null;
+          };
+          if (intervalStartMs === undefined || intervalStartMs === eMs || era(intervalStartMs) === era(eMs)) {
+            foldPoint(point, intervalStartMs);
+          } else {
+            sessions.save(sessionIndex, row.occurrence_id, point.priced, intervalStartMs);
+          }
+        } else if (sessions.earlier(sessionIndex, row.occurrence_id)) {
+          foldPoint(sessions.point(sessionIndex), eMs);
+          sessions.save(sessionIndex, row.occurrence_id, point.priced);
         } else {
           foldPoint(point, eMs);
         }
@@ -884,6 +1159,8 @@ async function readAndBucketUsage(
     cursorId = last.id;
   }
   flushFirst();
+  sessions.clear();
+  if (scalarFailure) return scalarFailure;
   if (costLimitExceeded) return "cost_limit_exceeded";
 
   const usageEvents: AttributedUsageEventPartial[] = [];
@@ -1112,6 +1389,13 @@ export async function accountScopedQuotaAnalysisV1(
   participantId: string,
   options: V1AnalysisOptions = {},
 ): Promise<object> {
+  return analyzeAccountScopedQuotaV1(db, participantId, options);
+}
+
+async function analyzeAccountScopedQuotaV1(
+  db: D1Database, participantId: string, options: V1AnalysisOptions,
+  acquired?: V1AcquiredQuotaEvidence,
+): Promise<object> {
   const nowMs = options.nowMs ?? Date.now();
   const maxDownsampledQuotaRows =
     options.maxDownsampledQuotaRows ?? MAX_DOWNSAMPLED_QUOTA_ROWS;
@@ -1129,13 +1413,17 @@ export async function accountScopedQuotaAnalysisV1(
   // triple row-IN filter shared with the daily totals/model cells.
   // No winners means no analyzable records.
   const sourcePin = await analysisSourcePin(db, participantId, observedAtCutoff, options.sourcePin);
+  const prepared = acquired ? await validateAcquiredQuotaEvidence(db, participantId, acquired,
+    sourcePin, observedAtCutoff, resetsAtCutoff, maxDownsampledQuotaRows) : null;
   if (sourcePin.winners.length === 0) {
     return notTestable("supported_quota_track_unavailable");
   }
-  const attributionIndex = await loadPlanAttributionIndex(db, participantId, sourcePin.winnersJson, observedAtCutoff);
+  const attributionIndex = prepared?.attributionIndex
+    ?? await loadPlanAttributionIndex(db, participantId, sourcePin.winnersJson, observedAtCutoff);
   if (attributionIndex === null) return notTestable("plan_attribution_limit_exceeded");
+  if (attributionIndex.status === "limit_exceeded") return notTestable("plan_attribution_limit_exceeded");
 
-  const quotaResult = await db.prepare(QUOTA_DOWNSAMPLE_SQL).bind(
+  const quotaResult = prepared ?? await db.prepare(QUOTA_DOWNSAMPLE_SQL).bind(
     eraMarkersJson(attributionIndex),
     sourcePin.winnersJson,
     participantId,
@@ -1192,7 +1480,8 @@ export async function accountScopedQuotaAnalysisV1(
 
   const analysis = runV1SeedLoop(datasets, quotaSnapshots, usageEvents);
   await assertV1SourcePinCurrent(db, sourcePin);
-  return { ...analysis, attributionMethod: V1_PLAN_ATTRIBUTION_ADAPTER_VERSION,
+  return { ...analysis, attributionMethod: acquired
+      ? V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION : V1_PLAN_ATTRIBUTION_ADAPTER_VERSION,
     inputFingerprint: sourcePin.fingerprint };
 }
 
@@ -1343,6 +1632,235 @@ export type V1ModelCompositionResult =
   | V1ModelComposition
   | V1ModelCompositionRefusal;
 
+function validCompositionQuotaRow(row: DownsampledQuotaRow): boolean {
+  const observed = Date.parse(row.observed_at), reset = Date.parse(row.resets_at);
+  return Number.isFinite(observed) && Number.isFinite(reset) && reset > observed
+    && Number.isFinite(row.used_percent) && row.used_percent >= 0 && row.used_percent <= 100
+    && SLOT_VALUES.has(row.slot) && SAFE_TOKEN.test(row.plan_type) && SAFE_TOKEN.test(row.provider);
+}
+
+/** Only a quota reading's bin can contain a kernel envelope crossing. This is
+ * a conservative superset, not a new time horizon or fit eligibility rule. */
+function compositionQuotaBins(observedTimes: Iterable<number>): Set<number> {
+  return new Set(Array.from(observedTimes, time =>
+    Math.floor(time / MODEL_COMPOSITION_POLICY.grainMs) * MODEL_COMPOSITION_POLICY.grainMs));
+}
+
+/** Physical usage pages are ordered by canonical admitted (time,id). Finish
+ * one chronological bin at a time, including its late poison/occurrence ties.
+ * Irrelevant bins still contribute every count and overflow refusal, but need
+ * no retained cost cells. Relevant cells use compact numeric blocks until the
+ * scalar's session/snapshot work has finished; never retain raw usage rows or
+ * one occurrence string per completed (bin,model) pair.
+ */
+function createCompositionUsageAccumulator(providers: ReadonlySet<string>, relevantBins: ReadonlySet<number>) {
+  const costs = new Map<string, { model: string; costNanousd: number;
+    firstObservedAt: string; firstOccurrenceId: string; overflowed: boolean }>();
+  const modelIds = new Map<string, number>(), models: string[] = [];
+  const blockSize = 1024;
+  const blocks: ({ costs: Float64Array; models: Uint32Array; length: number } | null)[] = [];
+  // One timestamp/end offset per completed bin, not per model cell. There
+  // cannot be more relevant bins than retained quota rows (60,000).
+  const binStarts: number[] = [], binEnds: number[] = [];
+  let cellCount = 0;
+  let currentBin: number | null = null, poisoned = false, overflowed = false;
+  let usageEventCount = 0, unpricedUsageEventCount = 0, poisonedBinCount = 0, limited = false;
+  function release(): void {
+    costs.clear(); blocks.length = 0; models.length = 0; modelIds.clear(); binStarts.length = 0; binEnds.length = 0;
+  }
+  function flush(): void {
+    if (currentBin === null) return;
+    if (poisoned) poisonedBinCount += 1;
+    else {
+      const ordered = [];
+      for (const entry of costs.values()) {
+        if (entry.overflowed) overflowed = true;
+        if (entry.costNanousd > 0 && relevantBins.has(currentBin)) ordered.push(entry);
+      }
+      // Preserve the original first-observed/occurrence ordering before any
+      // floating USD conversion or kernel model insertion (ties can span pages).
+      ordered.sort((a, b) => a.firstObservedAt < b.firstObservedAt ? -1 : a.firstObservedAt > b.firstObservedAt ? 1
+        : a.firstOccurrenceId < b.firstOccurrenceId ? -1 : a.firstOccurrenceId > b.firstOccurrenceId ? 1 : 0);
+      for (const entry of ordered) {
+        let modelId = modelIds.get(entry.model);
+        if (modelId === undefined) { modelId = models.length; models.push(entry.model); modelIds.set(entry.model, modelId); }
+        let block = blocks[blocks.length - 1];
+        if (!block || block.length === blockSize) {
+          block = { costs: new Float64Array(blockSize), models: new Uint32Array(blockSize), length: 0 }; blocks.push(block);
+        }
+        const at = block.length++;
+        block.costs[at] = entry.costNanousd; block.models[at] = modelId; cellCount += 1;
+      }
+      if (ordered.length > 0) { binStarts.push(currentBin); binEnds.push(cellCount); }
+    }
+    costs.clear(); poisoned = false;
+  }
+  return {
+    accepts(provider: string) { return providers.has(provider); },
+    limitExceeded() { limited = true; },
+    add(row: WindowedUsageRow, observedAtMs: number, priced: ReturnType<typeof priceChunkUsageRecord>) {
+      if (!providers.has(row.provider) || priced === null) return;
+      const bin = Math.floor(observedAtMs / MODEL_COMPOSITION_POLICY.grainMs) * MODEL_COMPOSITION_POLICY.grainMs;
+      if (currentBin !== bin) { flush(); currentBin = bin; }
+      if (priced.pricingStatus !== "fully_priced") {
+        unpricedUsageEventCount += 1; poisoned = true; return;
+      }
+      usageEventCount += 1;
+      const model = priced.modelId ?? COMPOSITION_UNKNOWN_MODEL;
+      const previous = costs.get(model), valid = Number.isSafeInteger(priced.costNanousd) && priced.costNanousd >= 0;
+      if (previous) {
+        if (!valid || priced.costNanousd > Number.MAX_SAFE_INTEGER - previous.costNanousd) previous.overflowed = true;
+        else if (!previous.overflowed) previous.costNanousd += priced.costNanousd;
+        if (row.observed_at < previous.firstObservedAt
+            || row.observed_at === previous.firstObservedAt && row.occurrence_id < previous.firstOccurrenceId) {
+          previous.firstObservedAt = row.observed_at; previous.firstOccurrenceId = row.occurrence_id;
+        }
+      } else costs.set(model, { model, costNanousd: valid ? priced.costNanousd : 0,
+        overflowed: !valid, firstObservedAt: row.observed_at, firstOccurrenceId: row.occurrence_id });
+    },
+    finish(): { status: "ready"; usageRows: Iterable<CompositionUsageRow>; usageEventCount: number;
+      unpricedUsageEventCount: number; poisonedBinCount: number } | V1ModelCompositionRefusal {
+      if (limited) { release(); return { status: "not_testable", reason: "windowed_usage_limit_exceeded" }; }
+      flush();
+      if (overflowed) { release(); return { status: "not_testable", reason: "usage_cost_limit_exceeded" }; }
+      function* usageRows(): Generator<CompositionUsageRow> {
+        let binIndex = 0, consumed = 0;
+        try {
+          for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
+            const block = blocks[blockIndex]!;
+            for (let index = 0; index < block.length; index++) {
+              const costNanousd = block.costs[index]!;
+              while (consumed >= binEnds[binIndex]!) binIndex += 1;
+              consumed += 1;
+              yield { observedAtMs: binStarts[binIndex]!, model: models[block.models[index]!]!,
+                costUsd: costNanousd / NANOUSD_PER_USD_COMPOSITION };
+            }
+            // Consumed backing stores need not coexist with the growing final
+            // observation corpus. The shared ordered API consumes exactly once.
+            blocks[blockIndex] = null;
+          }
+        } finally { release(); }
+      }
+      return { status: "ready", usageRows: usageRows(), usageEventCount, unpricedUsageEventCount, poisonedBinCount };
+    },
+  };
+}
+
+/** Build rich kernel snapshots only AFTER the usage reader has released session
+ * clocks and pending ties. Never move track-count refusal before usage: its
+ * existing row/session/cost refusal precedence is part of the adapter contract.
+ */
+async function finishAcquiredScalar(rows: DownsampledQuotaRow[], attributionIndex: PlanAttributionIndex,
+  datasetId: string, accountTracks: Map<string, string>, usage: AttributedUsageEventPartial[]): Promise<object> {
+  const snapshots: AttributedQuotaSnapshot[] = [];
+  for (const row of rows) {
+    const accountTrack = accountTracks.get(row.provider);
+    if (!accountTrack) continue;
+    const snapshot = await buildQuotaSnapshotInput(row, accountTrack, datasetId);
+    const attributed = snapshot ? attributeSnapshot(snapshot, attributionIndex) : null;
+    if (attributed) snapshots.push(attributed);
+  }
+  const result = runV1SeedLoop([{ datasetId, complete: true }], snapshots, usage);
+  snapshots.length = 0; usage.length = 0;
+  return result;
+}
+
+/** This async frame ENDS before composition corpus/solver allocation. The
+ * newly built plan index, scalar grids and snapshots are owned temporaries;
+ * do not keep them alive through the second fit or the final source await.
+ * Returned rows remain the original borrowed, validated evidence. */
+async function collectAcquiredAnalyses(db: D1Database, participantId: string, evidence: V1AcquiredQuotaEvidence,
+  options: V1AnalysisOptions & { sourcePin: V1SourcePin }, scalarRequested: boolean, compositionRequested: boolean,
+  sourcePin: V1SourcePin, observedAtCutoff: string, resetsAtCutoff: string,
+) {
+  const prepared = await validateAcquiredQuotaEvidence(db, participantId, evidence, sourcePin,
+    observedAtCutoff, resetsAtCutoff, options.maxDownsampledQuotaRows ?? MAX_DOWNSAMPLED_QUOTA_ROWS);
+  const { attributionIndex: index, results: rows } = prepared;
+  let scalarReason: string | null = !scalarRequested ? "supported_quota_track_unavailable" : null;
+  let compositionReason: string | null = !compositionRequested ? "supported_quota_track_unavailable" : null;
+  if (sourcePin.winners.length === 0) scalarReason = compositionReason = "supported_quota_track_unavailable";
+  else if (index.status === "limit_exceeded") scalarReason = compositionReason = "plan_attribution_limit_exceeded";
+  if (compositionReason === null) {
+    const plans = new Set(index.eras.map(era => era.planType).filter(plan => plan !== "unknown"));
+    if (plans.size > 1 || index.conflicts.length > 0) compositionReason = "multi_plan_window_unsupported";
+    else if (new Set(index.eras.map(era => era.contextKey)).size > 1) compositionReason = "multi_provider_window_unsupported";
+  }
+  // Only timestamp sets, not a second full array of quota objects, coexist with
+  // the session reader. Recheck the identical domain/era predicate on synthesis.
+  const gridByProvider = new Map<string, ProviderGrid>(), accountTracks = new Map<string, string>();
+  const compositionProviders = new Set<string>(), compositionPlans = new Set<string>();
+  let compositionQuotaCount = 0, latestQuotaMs = -Infinity;
+  for (const row of rows) {
+    if (scalarReason === null && validQuotaSnapshotRow(row)) {
+      const match = planEraForInterval(index, { contextKey: planAttributionContextKey(row.provider, row.limit_id),
+        observedAtMs: Date.parse(row.observed_at) });
+      if (match.status === "matched" && match.era.planType === row.plan_type && match.era.planVariant === row.plan_variant) {
+        let grid = gridByProvider.get(row.provider);
+        if (!grid) { grid = { set: new Set(), sortedMs: [] }; gridByProvider.set(row.provider, grid); }
+        grid.set.add(Date.parse(row.observed_at));
+      }
+    }
+    if (compositionReason === null && validCompositionQuotaRow(row)) {
+      compositionQuotaCount += 1; compositionProviders.add(row.provider); compositionPlans.add(row.plan_type);
+      latestQuotaMs = Math.max(latestQuotaMs, Date.parse(row.observed_at));
+    }
+  }
+  if (scalarReason === null && gridByProvider.size === 0) scalarReason = "supported_quota_track_unavailable";
+  if (compositionReason === null && compositionQuotaCount === 0) compositionReason = "supported_quota_track_unavailable";
+  if (compositionReason === null && compositionPlans.size > 1) compositionReason = "multi_plan_window_unsupported";
+  for (const [provider, grid] of gridByProvider) {
+    grid.sortedMs = [...grid.set].sort((a, b) => a - b);
+    accountTracks.set(provider, await v1AccountTrackId(participantId, provider));
+  }
+  const datasetId = await v1DatasetId(participantId);
+  const composition = compositionReason === null ? createCompositionUsageAccumulator(compositionProviders,
+    compositionQuotaBins(rows.filter(validCompositionQuotaRow).map(row => Date.parse(row.observed_at)))) : undefined;
+  const usage = scalarReason === null || composition ? await readAndBucketUsage(db, participantId, datasetId,
+    observedAtCutoff, accountTracks, gridByProvider, options.maxWindowedUsageRows ?? MAX_WINDOWED_USAGE_ROWS,
+    sourcePin.winnersJson, index, composition, scalarReason === null) : [];
+  gridByProvider.clear();
+  if (scalarReason === null && typeof usage === "string") scalarReason = usage === "limit_exceeded"
+    ? "windowed_usage_limit_exceeded" : usage === "session_scope_limit_exceeded"
+      ? "session_interval_scope_limit_exceeded" : "usage_cost_limit_exceeded";
+  const scalar = scalarReason !== null ? notTestable(scalarReason)
+    : await finishAcquiredScalar(rows, index, datasetId, accountTracks, usage as AttributedUsageEventPartial[]);
+  const quotaAnalysis = scalarReason === null ? { ...scalar,
+    attributionMethod: V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION, inputFingerprint: sourcePin.fingerprint } : scalar;
+  return { quotaAnalysis, composition, compositionReason, compositionPlans, latestQuotaMs, rows };
+}
+
+async function finishAcquiredAnalyses(db: D1Database, participantId: string, evidence: V1AcquiredQuotaEvidence,
+  options: V1AnalysisOptions & { sourcePin: V1SourcePin }, scalarRequested: boolean, compositionRequested: boolean,
+): Promise<{ quotaAnalysis: object; modelComposition: V1ModelCompositionResult }> {
+  const nowMs = options.nowMs ?? Date.now();
+  const observedAtCutoff = new Date(nowMs - V1_ANALYSIS_WINDOW_MS).toISOString().slice(0, 10) + "T00:00:00.000Z";
+  const resetsAtCutoff = new Date(Date.parse(observedAtCutoff) + SEVEN_DAY_WINDOW_MS).toISOString();
+  const sourcePin = await analysisSourcePin(db, participantId, observedAtCutoff, options.sourcePin);
+  const { quotaAnalysis, composition, compositionReason, compositionPlans, latestQuotaMs, rows } =
+    await collectAcquiredAnalyses(db, participantId, evidence, options, scalarRequested, compositionRequested,
+      sourcePin, observedAtCutoff, resetsAtCutoff);
+  let modelComposition: V1ModelCompositionResult = { status: "not_testable", reason: compositionReason ?? "supported_quota_track_unavailable" };
+  if (composition) {
+    const folded = composition.finish();
+    if (folded.status === "not_testable") modelComposition = folded;
+    else {
+      const quotaRows: CompositionQuotaRow[] = [];
+      for (const row of rows) if (validCompositionQuotaRow(row)) quotaRows.push({ observedAtMs: Date.parse(row.observed_at),
+        planType: row.plan_type, resetsAtMs: Date.parse(row.resets_at), usedPercent: row.used_percent });
+      const corpus = buildCompositionObservationsFromOrderedUsage({ usageRows: folded.usageRows, quotaRows });
+      const fit = calibrateCompositionCapacities(corpus.observations);
+      modelComposition = { status: "ready", planType: [...compositionPlans][0]!, fit,
+        voidedBinCount: corpus.voidedBinCount, poolCount: corpus.poolCount, quotaRowCount: quotaRows.length,
+        usageEventCount: folded.usageEventCount, unpricedUsageEventCount: folded.unpricedUsageEventCount,
+        poisonedBinCount: folded.poisonedBinCount, latestQuotaObservedAt: new Date(latestQuotaMs).toISOString(),
+        attributionStatus: "legacy_conditional", attributionMethod: V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
+        inputFingerprint: sourcePin.fingerprint };
+    }
+  }
+  await assertV1SourcePinCurrent(db, sourcePin);
+  return { quotaAnalysis, modelComposition };
+}
+
 /**
  * Per-model NNLS composition fit over a participant's v1 corpus: how many
  * Pro-plan-relative dollars of each model one hundred weekly percentage
@@ -1373,6 +1891,13 @@ export async function accountScopedModelCompositionV1(
   participantId: string,
   options: V1AnalysisOptions = {},
 ): Promise<V1ModelCompositionResult> {
+  return analyzeAccountScopedModelCompositionV1(db, participantId, options);
+}
+
+async function analyzeAccountScopedModelCompositionV1(
+  db: D1Database, participantId: string, options: V1AnalysisOptions,
+  acquired?: V1AcquiredQuotaEvidence,
+): Promise<V1ModelCompositionResult> {
   const nowMs = options.nowMs ?? Date.now();
   const maxDownsampledQuotaRows =
     options.maxDownsampledQuotaRows ?? MAX_DOWNSAMPLED_QUOTA_ROWS;
@@ -1384,12 +1909,16 @@ export async function accountScopedModelCompositionV1(
   const resetsAtCutoff = new Date(cutoffMs + SEVEN_DAY_WINDOW_MS).toISOString();
 
   const sourcePin = await analysisSourcePin(db, participantId, observedAtCutoff, options.sourcePin);
+  const prepared = acquired ? await validateAcquiredQuotaEvidence(db, participantId, acquired,
+    sourcePin, observedAtCutoff, resetsAtCutoff, maxDownsampledQuotaRows) : null;
   if (sourcePin.winners.length === 0) {
     return { status: "not_testable", reason: "supported_quota_track_unavailable" };
   }
   const winnersJsonArg = sourcePin.winnersJson;
-  const attributionIndex = await loadPlanAttributionIndex(db, participantId, winnersJsonArg, observedAtCutoff);
+  const attributionIndex = prepared?.attributionIndex
+    ?? await loadPlanAttributionIndex(db, participantId, winnersJsonArg, observedAtCutoff);
   if (attributionIndex === null) return { status: "not_testable", reason: "plan_attribution_limit_exceeded" };
+  if (attributionIndex.status === "limit_exceeded") return { status: "not_testable", reason: "plan_attribution_limit_exceeded" };
   // The single-plan composition contract is intentional at this gate. Inspect
   // ALL admitted plan evidence first, including a one-row foreign plan or a
   // five-hour-only observation that the weekly fitability query would drop.
@@ -1401,7 +1930,7 @@ export async function accountScopedModelCompositionV1(
     return { status: "not_testable", reason: "multi_provider_window_unsupported" };
   }
 
-  const quotaResult = await db.prepare(QUOTA_DOWNSAMPLE_SQL).bind(
+  const quotaResult = prepared ?? await db.prepare(QUOTA_DOWNSAMPLE_SQL).bind(
     eraMarkersJson(attributionIndex),
     winnersJsonArg,
     participantId,
@@ -1469,100 +1998,28 @@ export async function accountScopedModelCompositionV1(
   // Usage fold: per (kernel bin, model), cost from the shared server pricer.
   // Only providers that carry the retained quota series contribute — cost from
   // an unrelated provider cannot have debited this pool.
-  const grainMs = MODEL_COMPOSITION_POLICY.grainMs;
-  const costByBinAndModel = new Map<string, {
-    observedAtMs: number; model: string; costNanousd: number;
-    firstObservedAt: string; firstOccurrenceId: string;
-    overflowed: boolean;
-  }>();
-  let usageEventCount = 0;
-  let unpricedUsageEventCount = 0;
-  const poisonedBins = new Set<number>();
-  let total = 0;
-  let cursorObs = observedAtCutoff;
-  let cursorId = 0;
+  const accumulator = createCompositionUsageAccumulator(quotaProviders, compositionQuotaBins(quotaRows.map(row => row.observedAtMs)));
+  let total = 0, cursorObs = observedAtCutoff, cursorId = 0;
   for (;;) {
     const rows = await readV1UsagePage(db, winnersJsonArg, participantId, cursorObs, cursorId, USAGE_PAGE_SIZE);
     if (rows.length === 0) break;
     total += rows.length;
-    if (total > maxWindowedUsageRows) {
-      return { status: "not_testable", reason: "windowed_usage_limit_exceeded" };
-    }
+    if (total > maxWindowedUsageRows) return { status: "not_testable", reason: "windowed_usage_limit_exceeded" };
     for (const row of rows) {
       if (!SAFE_TOKEN.test(row.provider) || !quotaProviders.has(row.provider)) continue;
       const observedAtMs = Date.parse(row.observed_at);
       if (!Number.isFinite(observedAtMs)) continue;
-      const priced = priceChunkUsageRecord(row.record_json, row.observed_at);
-      if (priced === null) continue;
-      const eventBinStartMs = Math.floor(observedAtMs / grainMs) * grainMs;
-      if (priced.pricingStatus !== "fully_priced") {
-        // The blended path refuses a whole reset over one unpriced event; the
-        // mirror here is voiding the bin. Training on a bin with understated
-        // cost would shift the unpriced model's quota movement onto whatever
-        // priced models co-occur — a systematic bias the split-half gate
-        // passes.
-        unpricedUsageEventCount += 1;
-        poisonedBins.add(eventBinStartMs);
-        continue;
-      }
-      usageEventCount += 1;
-      const model = priced.modelId ?? COMPOSITION_UNKNOWN_MODEL;
-      const binStartMs = eventBinStartMs;
-      const key = `${binStartMs}\u0000${model}`;
-      const existing = costByBinAndModel.get(key);
-      if (existing) {
-        if (!Number.isSafeInteger(priced.costNanousd) || priced.costNanousd < 0
-            || priced.costNanousd > Number.MAX_SAFE_INTEGER - existing.costNanousd) {
-          existing.overflowed = true;
-        } else if (!existing.overflowed) {
-          existing.costNanousd += priced.costNanousd;
-        }
-        if (row.observed_at < existing.firstObservedAt
-            || (row.observed_at === existing.firstObservedAt && row.occurrence_id < existing.firstOccurrenceId)) {
-          existing.firstObservedAt = row.observed_at;
-          existing.firstOccurrenceId = row.occurrence_id;
-        }
-      } else {
-        const validCost = Number.isSafeInteger(priced.costNanousd) && priced.costNanousd >= 0;
-        costByBinAndModel.set(key, { observedAtMs: binStartMs, model,
-          costNanousd: validCost ? priced.costNanousd : 0, overflowed: !validCost,
-          firstObservedAt: row.observed_at, firstOccurrenceId: row.occurrence_id });
-      }
+      accumulator.add(row, observedAtMs, priceChunkUsageRecord(row.record_json, row.observed_at));
     }
     if (rows.length < USAGE_PAGE_SIZE) break;
     const last = rows[rows.length - 1]!;
-    cursorObs = last.observed_at;
-    cursorId = last.id;
+    cursorObs = last.observed_at; cursorId = last.id;
   }
+  const folded = accumulator.finish();
+  if (folded.status === "not_testable") return folded;
+  const { usageRows, usageEventCount, unpricedUsageEventCount, poisonedBinCount } = folded;
 
-  const usageRows: CompositionUsageRow[] = [];
-  // Reconstruct the former (time,occurrence) stream's first-model insertion
-  // order before the kernel converts costs to floating USD. Sorting by model
-  // instead would be deterministic but could change its reduction order.
-  // Fully priced zero-cost rows participate in this first-seen key just as
-  // before; poisoned/zero-total bins are still omitted below.
-  const orderedCosts = [];
-  for (const entry of costByBinAndModel.values()) {
-    if (poisonedBins.has(entry.observedAtMs)) continue;
-    // Keep scanning after overflow: later unpriced evidence may legitimately
-    // poison this whole bin. Only a contributing, otherwise retained entry
-    // refuses the fit; never emit its partial sum or silently drop its cost.
-    if (entry.overflowed) return { status: "not_testable", reason: "usage_cost_limit_exceeded" };
-    if (entry.costNanousd > 0) orderedCosts.push(entry);
-  }
-  orderedCosts.sort((left, right) => (
-    left.firstObservedAt < right.firstObservedAt ? -1 : left.firstObservedAt > right.firstObservedAt ? 1
-      : left.firstOccurrenceId < right.firstOccurrenceId ? -1 : left.firstOccurrenceId > right.firstOccurrenceId ? 1 : 0
-  ));
-  for (const entry of orderedCosts) {
-    usageRows.push({
-      observedAtMs: entry.observedAtMs,
-      model: entry.model,
-      costUsd: entry.costNanousd / NANOUSD_PER_USD_COMPOSITION,
-    });
-  }
-
-  const corpus = buildCompositionObservations({ usageRows, quotaRows });
+  const corpus = buildCompositionObservationsFromOrderedUsage({ usageRows, quotaRows });
   const fit = calibrateCompositionCapacities(corpus.observations);
   await assertV1SourcePinCurrent(db, sourcePin);
   return {
@@ -1574,10 +2031,10 @@ export async function accountScopedModelCompositionV1(
     quotaRowCount: quotaRows.length,
     usageEventCount,
     unpricedUsageEventCount,
-    poisonedBinCount: poisonedBins.size,
+    poisonedBinCount,
     latestQuotaObservedAt: new Date(latestQuotaObservedAtMs).toISOString(),
     attributionStatus: "legacy_conditional",
-    attributionMethod: V1_PLAN_ATTRIBUTION_ADAPTER_VERSION,
+    attributionMethod: acquired ? V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION : V1_PLAN_ATTRIBUTION_ADAPTER_VERSION,
     inputFingerprint: sourcePin.fingerprint,
   };
 }

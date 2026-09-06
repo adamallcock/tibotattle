@@ -59,18 +59,25 @@ partitions. Cloudflare reported database CPU exhaustion/reset (7429), and some
 public data and health requests returned 503. The earlier memory failure is
 not resolved by replacing it with this timeout.
 
-On 2026-09-06, protected code-only rollback attempts passed freshly retried
-migration checks but still failed the required health check before deployment.
-Do not claim rollback or graph recovery. The rejected query is reverted in
-the pending website branch; the previously released desktop remains unchanged.
-Recovery requires successful scheduled rebuilding, a subsequent valid preview
-cache and a rendered live graph; health HTTP 200 alone is not sufficient.
+At 15:48 UTC on 2026-09-06, source
+`1a14a9efb443914b965a84dd1143b036178b10e0` deployed the narrowly scoped
+allowance-reconstruction pause. Normal pre/post health and source checks
+passed; the approved emergency health exception was not used. Natural
+scheduled runs completed essential maintenance without exceptions, and the
+authenticated Operations view recovered. The allowance graph remains a
+separate, unfinished recovery gate.
+
+The [restartable calculator replacement](./decisions/2026-09-06-hosted-calculator-recovery.md)
+is implemented locally and undergoing combined runtime qualification. The
+owner approved validated migrations `0046`–`0047` and deployment, but neither
+has been applied in this snapshot. Production remains paused. Recovery
+requires successful scheduled rebuilding, a current preview cache and the
+rendered live graph; health HTTP 200 alone is not sufficient.
 
 The requested [all-token detail and API-equivalent spend](./decisions/2026-09-06-community-detail-totals.md)
-are implemented and locally rendered, but not deployed. Price backfill still
-depends on allowance analysis. Production maintenance containment and a new
-bounded-streaming allowance refusal policy await separate owner decisions;
-neither is silently authorized by the display change.
+are implemented and locally rendered, but not deployed. Recovery preserves
+the existing pricing and analytical refusal rules; the display change does
+not authorize a historical telemetry rewrite or different statistical policy.
 
 The existing dated social preview was temporarily retained to prioritize the
 verified 0.1.18 download rollout. Regenerate it from the recovered live estimate;
