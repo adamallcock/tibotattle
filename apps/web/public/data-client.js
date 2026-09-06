@@ -2757,10 +2757,12 @@ export function normalizeCacheDropThreadLinks(value) {
   const entries = [];
   for (const entry of value.entries) {
     const thread = entry?.thread;
+    const autoReview = hasExactKeys(thread, ["id", "name", "nickname", "parent", "origin"])
+      && thread.origin === "auto_review";
     if (!hasExactKeys(entry, ["kind", "key", "thread"])
         || !validCacheDropThreadKey(entry.kind, entry.key)
         || seen.has(entry.key)
-        || !hasExactKeys(thread, ["id", "name", "nickname", "parent"])
+        || (!autoReview && !hasExactKeys(thread, ["id", "name", "nickname", "parent"]))
         || typeof thread.id !== "string" || !CACHE_DROP_THREAD_ID.test(thread.id)
         || !validLocalThreadName(thread.name)
         || !validLocalThreadName(thread.nickname, 80)) return unavailable;
@@ -2769,13 +2771,15 @@ export function normalizeCacheDropThreadLinks(value) {
         || typeof parent.id !== "string" || !CACHE_DROP_THREAD_ID.test(parent.id)
         || parent.id === thread.id || !validLocalThreadName(parent.name))) return unavailable;
     seen.add(entry.key);
+    const normalizedThread = {
+      id: thread.id, name: thread.name, nickname: thread.nickname,
+      parent: parent === null ? null : { id: parent.id, name: parent.name }
+    };
+    if (autoReview) normalizedThread.origin = "auto_review";
     entries.push({
       kind: entry.kind,
       key: entry.key,
-      thread: {
-        id: thread.id, name: thread.name, nickname: thread.nickname,
-        parent: parent === null ? null : { id: parent.id, name: parent.name }
-      }
+      thread: normalizedThread
     });
   }
   return { schemaVersion: LOCAL_CACHE_DROP_THREAD_LINKS_SCHEMA, status: "available", generation, entries };

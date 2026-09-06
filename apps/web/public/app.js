@@ -122,7 +122,7 @@ const ELECTRON_SHARING_STATES = new Set([
   "disabled",
   "legacy_preserved",
 ]);
-const ELECTRON_SHARING_TRANSPORT_STATUSES = new Set(["unavailable", "off"]);
+const ELECTRON_SHARING_TRANSPORT_STATUSES = new Set(["unavailable", "off", "uploading", "pending", "up_to_date", "retry_wait", "paused"]);
 
 function electronSharingBridge(windowRef = globalThis.window) {
   const bridge = windowRef?.tibotattleDesktop;
@@ -1039,6 +1039,8 @@ function electronSharingStateMessageKey(preference) {
 
 function electronSharingTransportMessageKey(preference) {
   switch (preference?.transportStatus) {
+    case "uploading": case "pending": case "up_to_date": case "retry_wait": case "paused":
+      return `electron.sharing.transport.${preference.transportStatus}`;
     case "off":
       return "electron.sharing.transport.off";
     case "unavailable":
@@ -8613,6 +8615,8 @@ function isCacheDropThreadDashboard(data) {
   return ["local", "real_local_evidence"].includes(data?.mode);
 }
 
+const CACHE_DROP_AUTO_REVIEW_LABEL = "Auto review";
+
 function cacheDropThreadId(value) {
   return typeof value === "string"
       && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value)
@@ -8633,6 +8637,21 @@ function cacheDropThreadParts(thread) {
   if (id === null) return [];
   const parentId = cacheDropThreadId(thread.parent?.id);
   const parent = parentId !== null && parentId !== id ? thread.parent : null;
+  if (thread?.origin === "auto_review") {
+    // The internal guardian-review thread has no user-visible conversation of
+    // its own. Its resolver supplies a parent only after Codex metadata proves
+    // that parent remains accessible; do not fall back to the internal UUID.
+    return parent === null ? [{
+      name: CACHE_DROP_AUTO_REVIEW_LABEL,
+      href: null,
+      autoReview: true,
+    }] : [{
+      name: cacheDropThreadName(parent),
+      href: `codex://threads/${parentId}`,
+      worker: false,
+      autoReview: true,
+    }];
+  }
   const nickname = typeof thread.nickname === "string"
     ? thread.nickname.trim()
     : "";
@@ -8677,6 +8696,15 @@ function fillCacheDropThreadCell(cell, thread, observedAt) {
     content.append(unavailable);
   }
   for (const part of parts) {
+    if (part.href === null) {
+      const unavailableText = `${part.name}: ${t("accounting.cacheDropThread.unavailable")}`;
+      const unavailable = rawNode("span", "cache-drop-thread-unavailable", unavailableText);
+      unavailable.tabIndex = 0;
+      unavailable.setAttribute("title", time);
+      unavailable.setAttribute("aria-label", `${unavailableText}. ${time}`);
+      content.append(unavailable);
+      continue;
+    }
     const link = rawNode("a", "cache-drop-thread-link", part.name);
     link.href = part.href;
     link.setAttribute("title", time);
@@ -8693,6 +8721,13 @@ function fillCacheDropThreadCell(cell, thread, observedAt) {
       content.append(document.createTextNode(parts.length > 1 ? " " : ""), worker);
     } else {
       content.append(link);
+      if (part.autoReview) {
+        const origin = rawNode("span", "cache-drop-subworker", "");
+        origin.append(document.createTextNode(" ["),
+          document.createTextNode(CACHE_DROP_AUTO_REVIEW_LABEL),
+          document.createTextNode("]"));
+        content.append(origin);
+      }
     }
   }
   cell.append(content);

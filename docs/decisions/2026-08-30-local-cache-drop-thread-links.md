@@ -37,9 +37,12 @@ paths and requires the same-origin custom request header. Responses are
 
 Attribution requires an exact event-pair match in the published unified index,
 including proven local source ordering. Names come only from explicit Codex
-display-name metadata; worker nicknames and parent links come from allowlisted
-thread metadata. The prompt-bearing `threads.title`, first messages, transcripts,
-private paths, and arbitrary provider fields are not name sources.
+display-name metadata; worker nicknames and ordinary parent links come from
+allowlisted thread metadata. A `guardian_review` row may link only to the
+matching explicit parent UUID in its own first bounded `session_meta` header,
+after state-store source and selected-path validation. The prompt-bearing
+`threads.title`, first messages, transcripts, private paths, and arbitrary
+provider fields are not name sources.
 
 No schema migration or accounting-cache rebuild is required. Names, raw thread
 identifiers, and links must not enter persisted dashboard snapshots, accounting

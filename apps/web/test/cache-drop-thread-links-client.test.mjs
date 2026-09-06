@@ -97,6 +97,32 @@ test("local thread lookup preserves only its exact bounded contract, including n
   assert.deepEqual(normalizeCacheDropThreadLinks(unnamed), unnamed);
 });
 
+test("auto review is the only compatible navigation-origin extension", () => {
+  const input = payload();
+  input.entries[0].thread = {
+    id: THREAD_ID,
+    name: "Internal review session",
+    nickname: null,
+    parent: { id: PARENT_ID, name: "Visible parent" },
+    origin: "auto_review",
+  };
+  const result = normalizeCacheDropThreadLinks(input);
+  assert.deepEqual(result, input);
+  assert.notEqual(result.entries[0].thread, input.entries[0].thread);
+  assert.notEqual(result.entries[0].thread.parent, input.entries[0].thread.parent);
+
+  const unavailableParent = structuredClone(input);
+  unavailableParent.entries[0].thread.parent = null;
+  assert.deepEqual(normalizeCacheDropThreadLinks(unavailableParent), unavailableParent,
+    "the UI needs the origin even when no parent can be linked");
+
+  for (const origin of ["ordinary", "guardian_review", "AUTO_REVIEW", null, 1]) {
+    const malformed = structuredClone(input);
+    malformed.entries[0].thread.origin = origin;
+    assert.deepEqual(normalizeCacheDropThreadLinks(malformed), UNAVAILABLE);
+  }
+});
+
 test("hostile extra or missing lookup fields fail closed at every contract level", () => {
   const mutations = [
     (v) => { v.schemaVersion = "local-cache-drop-thread-links-v2"; },
@@ -109,6 +135,8 @@ test("hostile extra or missing lookup fields fail closed at every contract level
     (v) => { v.entries[0].eventKey = "synthetic-private-event"; },
     (v) => { v.entries[0].thread.href = "javascript:alert(1)"; },
     (v) => { v.entries[0].thread.command = "synthetic-private-command"; },
+    (v) => { v.entries[0].thread.origin = "ordinary"; },
+    (v) => { v.entries[0].thread.origin = "auto_review"; v.entries[0].thread.extra = "untrusted"; },
     (v) => { delete v.entries[0].thread.name; },
     (v) => { delete v.entries[0].thread.nickname; },
     (v) => { delete v.entries[0].thread.parent; },

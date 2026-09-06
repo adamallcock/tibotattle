@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
-import { lstat, open } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { lstat, open, realpath } from "node:fs/promises";
+import { basename, isAbsolute, join, relative, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { readBoundedUtf8LineEntries } from "./bounded-jsonl-reader.js";
 
@@ -78,6 +78,11 @@ const MAX_SESSION_INDEX_LINES = 200_000;
 const MAX_THREAD_DISPLAY_NAME_LENGTH = 512;
 const MAX_AGENT_NICKNAME_LENGTH = 80;
 const MAX_THREAD_SOURCE_LENGTH = 4_096;
+const MAX_THREAD_SOURCE_CLASS_LENGTH = 80;
+const MAX_ROLLOUT_PATH_LENGTH = 4_096;
+const MAX_SESSION_METADATA_LINE_BYTES = 64 * 1024;
+const AUTO_REVIEW_THREAD_SOURCE = "guardian_review";
+const AUTO_REVIEW_SOURCE_KIND = "guardian";
 const LOCAL_NAVIGATION_THREAD_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
@@ -111,19 +116,22 @@ async function ownerControlledCodexHome(codexHome) {
   }
 }
 
-function workerMetadata(source, id) {
-  if (typeof source !== "string" || source.length > MAX_THREAD_SOURCE_LENGTH) {
-    return null;
-  }
-  let parsed;
+function parseThreadSource(value) {
+  if (typeof value !== "string" || value.length > MAX_THREAD_SOURCE_LENGTH) return null;
   try {
-    parsed = JSON.parse(source);
+    const parsed = JSON.parse(value);
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed
+      : null;
   } catch {
     return null;
   }
+}
+
+function workerMetadata(source, id) {
   // This is Codex's explicit collaboration ancestry, not rollout-fork lineage
   // or an inferred relationship from timestamps, names, or working directory.
-  const spawn = parsed?.subagent?.thread_spawn;
+  const spawn = source?.subagent?.thread_spawn;
   if (spawn === null || typeof spawn !== "object" || Array.isArray(spawn)) {
     return null;
   }
@@ -132,6 +140,68 @@ function workerMetadata(source, id) {
     parentId,
     nickname: displayName(spawn.agent_nickname, MAX_AGENT_NICKNAME_LENGTH),
   };
+}
+
+function isAutoReviewThreadSource(value) {
+  return value === AUTO_REVIEW_THREAD_SOURCE;
+}
+
+function isAutoReviewSource(value) {
+  return value?.subagent?.other === AUTO_REVIEW_SOURCE_KIND;
+}
+
+function isAutoReviewSessionMetadata(record, id) {
+  const payload = record?.payload;
+  return record?.type === "session_meta"
+    && threadId(payload?.id) === id
+    && payload?.thread_source === AUTO_REVIEW_THREAD_SOURCE
+    && payload?.source?.subagent?.other === AUTO_REVIEW_SOURCE_KIND;
+}
+
+function isCodexSessionPath(codexHome, rolloutPath) {
+  const path = relative(codexHome, rolloutPath);
+  return path.startsWith(`sessions${sep}`);
+}
+
+/**
+ * Guardian-review records have no parent column in Codex's thread store. Their
+ * own first, bounded session-metadata record is the only accepted source for
+ * this relationship. It is never retained or exposed: this returns one UUID
+ * only after both the selected thread and its source classification agree.
+ */
+async function readAutoReviewParent(codexHome, rolloutPath, id) {
+  if (typeof rolloutPath !== "string" || rolloutPath.length === 0
+      || !isAbsolute(rolloutPath)) return null;
+  let handle;
+  try {
+    const [home, path] = await Promise.all([realpath(codexHome), realpath(rolloutPath)]);
+    if (!isCodexSessionPath(home, path)) return null;
+    const before = await lstat(path);
+    if (!ownerControlledRegularFile(before)) return null;
+    handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    if (!sameOwnerControlledFile(before, await handle.stat())) return null;
+    const bytes = Buffer.alloc(MAX_SESSION_METADATA_LINE_BYTES + 1);
+    const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+    const newline = bytes.subarray(0, bytesRead).indexOf(0x0a);
+    if (newline < 0) return null;
+    const line = bytes.toString("utf8", 0, newline);
+    if (line.includes("\ufffd")) return null;
+    const record = JSON.parse(line);
+    const parentId = threadId(record?.payload?.parent_thread_id);
+    if (!isAutoReviewSessionMetadata(record, id) || parentId === null || parentId === id) {
+      return null;
+    }
+    const after = await handle.stat();
+    return sameOwnerControlledFile(before, after)
+        && before.size === after.size && before.mtimeMs === after.mtimeMs
+        && sameOwnerControlledFile(before, await lstat(path))
+      ? parentId
+      : null;
+  } catch {
+    return null;
+  } finally {
+    await handle?.close();
+  }
 }
 
 function boundedTextColumn(columns, name, maximumLength) {
@@ -186,6 +256,8 @@ async function readSelectedThreadMetadata(codexHome, ids) {
       boundedTextColumn(columns, "name", MAX_THREAD_DISPLAY_NAME_LENGTH),
       boundedTextColumn(columns, "agent_nickname", MAX_AGENT_NICKNAME_LENGTH),
       boundedTextColumn(columns, "source", MAX_THREAD_SOURCE_LENGTH),
+      boundedTextColumn(columns, "thread_source", MAX_THREAD_SOURCE_CLASS_LENGTH),
+      boundedTextColumn(columns, "rollout_path", MAX_ROLLOUT_PATH_LENGTH),
     ].join(", ");
     const statement = database.prepare(`SELECT ${selected} FROM threads WHERE id = ?`);
     const result = new Map();
@@ -193,24 +265,41 @@ async function readSelectedThreadMetadata(codexHome, ids) {
     for (const id of ids) {
       const row = statement.get(id);
       if (row === undefined || threadId(row.id) !== id) continue;
-      const worker = workerMetadata(row.source, id);
-      const parentId = worker?.parentId ?? null;
+      const source = parseThreadSource(row.source);
+      const threadStoreAutoReview = isAutoReviewThreadSource(row.thread_source);
+      const sourceAutoReview = isAutoReviewSource(source);
+      // Either exact guardian classification suppresses navigation to a review
+      // row's internal UUID. A parent is trusted only when both stores agree.
+      const autoReview = threadStoreAutoReview || sourceAutoReview;
+      const verifiedAutoReview = threadStoreAutoReview && sourceAutoReview;
+      const worker = autoReview ? null : workerMetadata(source, id);
+      const parentId = verifiedAutoReview
+        ? await readAutoReviewParent(codexHome, row.rollout_path, id)
+        : worker?.parentId ?? null;
       if (parentId !== null) parentIds.add(parentId);
       result.set(id, {
         name: displayName(row.name),
         nickname: displayName(row.agent_nickname, MAX_AGENT_NICKNAME_LENGTH)
           ?? worker?.nickname ?? null,
         parentId,
+        origin: autoReview ? "auto_review" : null,
       });
     }
     for (const id of parentIds) {
       if (result.has(id)) continue;
       const row = statement.get(id);
       if (row !== undefined && threadId(row.id) === id) {
+        const source = parseThreadSource(row.source);
+        // A guardian review is an internal review surface even when it happens
+        // to exist locally. Do not chain it into another review's navigation.
+        if (isAutoReviewThreadSource(row.thread_source) || isAutoReviewSource(source)) {
+          continue;
+        }
         result.set(id, {
           name: displayName(row.name),
           nickname: null,
           parentId: null,
+          origin: null,
         });
       }
     }
@@ -305,16 +394,23 @@ export async function readCodexLocalThreadMetadata(codexHome, threadIds) {
   return new Map(ids.map((id) => {
     const metadata = selected.get(id);
     const parentId = metadata?.parentId ?? null;
-    return [id, {
+    const parentMetadata = parentId === null ? null : selected.get(parentId);
+    const result = {
       id,
       name: names.has(id) ? names.get(id) : metadata?.name ?? null,
       nickname: metadata?.nickname ?? null,
-      parent: parentId === null ? null : {
+      // A generic worker keeps its existing explicit-parent fallback. Guardian
+      // review may navigate only to a parent that is itself still accessible
+      // from Codex's selected local thread store.
+      parent: parentId === null || (metadata?.origin === "auto_review"
+        && (parentMetadata === undefined || parentMetadata.origin === "auto_review")) ? null : {
         id: parentId,
         name: names.has(parentId)
           ? names.get(parentId)
-          : selected.get(parentId)?.name ?? null,
+          : parentMetadata?.name ?? null,
       },
-    }];
+    };
+    if (metadata?.origin === "auto_review") result.origin = "auto_review";
+    return [id, result];
   }));
 }
