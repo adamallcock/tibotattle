@@ -40,7 +40,9 @@ import { createDesktopFirstRunLoginRegistrar } from "./desktop-first-run-login.j
 import { createDesktopRecoverySettingsAction } from "./desktop-recovery-settings.js";
 import { createDesktopOwnedDownloadRegistry } from "./desktop-owned-downloads.js";
 import { createDesktopSharingBackend, createDesktopSharingCoordinator } from "./desktop-sharing.js";
+import { createDesktopContributionCredentialBackend } from "./desktop-contribution-credential.js";
 import { classifyDesktopSharingInstallation } from "./desktop-sharing-installation.js";
+import { attachAccountlessParentChannel } from "../../src/platform/index.js";
 import {
   createDesktopNotificationCoordinator,
   createDesktopNotificationPolicyCodec,
@@ -390,6 +392,7 @@ export async function launchDesktopRuntime({
   ownedDownloadsRegistry,
   automaticRefreshCadence,
   argv,
+  accountlessLaboratory,
 } = {}) {
   assertObject(runtime, "runtime");
   if (!app || typeof app.on !== "function") throw new TypeError("app is required");
@@ -401,6 +404,25 @@ export async function launchDesktopRuntime({
     throw new TypeError("companion launch paths are invalid");
   }
   assertObject(environment, "environment");
+  // Test-only loopback composition. Normal main.js does not provide this port.
+  // Hosted activation is deliberately absent until the exact payload and
+  // destination have completed their separate approval/release gate.
+  if (accountlessLaboratory !== undefined) {
+    let url;
+    try { url = new URL(accountlessLaboratory.origin); } catch { throw shellError("electron_configuration_invalid"); }
+    const credentialBackend = accountlessLaboratory.backend;
+    if (credentialBackend !== undefined && (!credentialBackend
+        || typeof credentialBackend !== "object" || Array.isArray(credentialBackend)
+        || ["read", "createIfMissing", "deleteExact"]
+          .some((operation) => typeof credentialBackend[operation] !== "function"))) {
+      throw shellError("electron_configuration_invalid");
+    }
+    if (url.origin !== accountlessLaboratory.origin || url.protocol !== "http:"
+        || url.hostname !== "127.0.0.1" || !url.port || url.username || url.password
+        || environment.USAGE_MONITOR_TEST_LANE !== "accountless-local-lab-v1"
+        || sharingBackend === undefined || sharingInstallationState === undefined
+        || qualificationContext !== null) throw shellError("electron_configuration_invalid");
+  }
   assertObject(supervisorOptions, "supervisorOptions");
   assertObject(lifecycleOptions, "lifecycleOptions");
   assertNoWindowsTestOverrides({
@@ -425,12 +447,16 @@ export async function launchDesktopRuntime({
     throw new TypeError("BrowserWindow is required");
   }
   const childEnvironment = childEnvironmentWithStateRoot({ app, environment });
-  const sharingDestinationOrigin = childEnvironment.USAGE_MONITOR_CENTRAL_ORIGIN
+  const sharingDestinationOrigin = accountlessLaboratory?.origin ?? childEnvironment.USAGE_MONITOR_CENTRAL_ORIGIN
     ?? DEPLOYMENT_ENDPOINTS.public.origin;
   // The accountless candidate has no upload authority yet. Do not let an old
   // participant scheduler bypass its new opt-out or fall back to social login.
   // Local provider capture and offline analysis remain independently available.
   delete childEnvironment.USAGE_MONITOR_CENTRAL_ORIGIN;
+  delete childEnvironment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN;
+  if (accountlessLaboratory) childEnvironment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN = accountlessLaboratory.origin;
+  let sharingCoordinator;
+  let laboratoryCredentialBackend;
   // Keep one mutable argument vector for the lifetime of this runtime. The
   // supervisor snapshots it for each spawn, so a Settings root change can
   // persist first, update this vector, and then use the ordinary bounded
@@ -453,6 +479,12 @@ export async function launchDesktopRuntime({
     args: companionArgs,
     cwd: paths.companionCwd,
     environment: childEnvironment,
+    attachPrivateChannel: accountlessLaboratory ? (channel) => attachAccountlessParentChannel({
+      channel,
+      readPreference: () => sharingCoordinator.readAuthorization(),
+      backend: laboratoryCredentialBackend,
+      onStatus: (value) => sharingCoordinator.updateTransport?.(value),
+    }) : undefined,
   });
   const services = platformServices ?? runtimePlatformServices({
     runtime,
@@ -566,6 +598,18 @@ export async function launchDesktopRuntime({
       rootPath: settingsRootPath,
     })
     : null;
+  // Construct the adapter only after Electron readiness and only for the
+  // explicitly injected loopback laboratory. The normal launcher never
+  // enters this path, and unavailable encryption cannot authorize a send.
+  if (accountlessLaboratory) {
+    laboratoryCredentialBackend = accountlessLaboratory.backend
+      ?? createDesktopContributionCredentialBackend({
+        safeStorage: runtime.safeStorage,
+        platform,
+        rootPath: settingsRootPath,
+        windowsProtectedStateStore,
+      });
+  }
   const firstRunBackend = firstRunReceiptBackend
     ?? createDesktopFirstRunReceiptBackend({
       platform,
@@ -592,7 +636,6 @@ export async function launchDesktopRuntime({
       childEnvironment,
     });
   }
-  let sharingCoordinator;
   try {
     const selectedSharingBackend = sharingBackend ?? (injectedSettings
       ? { load: async () => { throw new Error("Sharing unavailable"); },
@@ -600,13 +643,17 @@ export async function launchDesktopRuntime({
       : createDesktopSharingBackend({ platform, rootPath: settingsRootPath,
         windowsProtectedStateStore }));
     sharingCoordinator = createDesktopSharingCoordinator({ backend: selectedSharingBackend,
-      installationState, destinationOrigin: sharingDestinationOrigin });
+      installationState, destinationOrigin: sharingDestinationOrigin,
+      onAuthorizationChanged: () => supervisor.invalidatePrivateChannel() });
     await sharingCoordinator.initialize();
   } catch {
     // Preference or protected-store failure blocks contribution, never local use.
     const unavailable = async () => { throw shellError("desktop_sharing_unavailable"); };
     sharingCoordinator = { inspect: unavailable, setEnabled: unavailable,
-      markNoticePresented: unavailable, dispose() {} };
+      markNoticePresented: unavailable,
+      readAuthorization: async () => ({ available: false, current: false,
+        enabled: false, policyVersion: null, destinationOrigin: null }),
+      updateTransport() {}, dispose() {} };
   }
   const runtimeOwnedDownloadsRegistry = await createRuntimeOwnedDownloadsRegistry({
     app,

@@ -63,6 +63,7 @@ import {
   readIncrementalContributionV11Capabilities,
   readIncrementalContributionV11Review,
 } from "../../src/contribution-incremental-sync.js";
+import { createLocalAccountlessContribution } from "./accountless-contribution.js";
 import { readLocalCollectorCheckpoint } from "../../src/local-collector-state.js";
 import {
   HostedSignInHandoffError,
@@ -3694,6 +3695,11 @@ function createPreparedLocalCompanionServer({
   // the next launch retries, and delivery state is never touched.
   let contributionRuntimeStart = null;
   let contributionRuntimeShutdown = null;
+  const accountlessContribution = createLocalAccountlessContribution({
+    environment, stateRoot, indexFile: statePaths.unifiedIndexFile,
+    readAccountMarkers: readContributionAccountMarkers,
+    loadExistingAccountObservationSecret,
+  });
   let supersededContributionRetirementPending = null;
   let supersededContributionRetirementRequested = false;
   const maybeRetireSupersededPreparedSets = () => {
@@ -3758,6 +3764,11 @@ function createPreparedLocalCompanionServer({
         } catch {
           onError("incremental_contribution_stop_failed");
         }
+        try {
+          await accountlessContribution?.stop();
+        } catch {
+          onError("accountless_contribution_stop_failed");
+        }
         // Retirement includes its consent probe and may still write private
         // state. Keep the instance lock until that accepted work has settled.
         await supersededContributionRetirementPending?.catch(() => {});
@@ -3806,19 +3817,24 @@ function createPreparedLocalCompanionServer({
           // validated prior evidence with its provenance; the normal refresh
           // supplies the subsequent quick and full projections.
           await dataStore.initialize({ purpose: "startup" });
-          // The v1.0 incremental sync remains the only contribution scheduler.
-          // A failure here must never take the local dashboard down.
-          try {
-            if (contributionRuntimeShutdown === null) {
-              contributionRuntimeStart = Promise.resolve().then(() => {
-                if (contributionRuntimeShutdown === null) {
-                  return incrementalContribution?.start();
-                }
-              });
-              await contributionRuntimeStart;
-            }
-          } catch {
-            onError("incremental_contribution_start_failed");
+          // The legacy scheduler and the explicitly injected accountless lab
+          // keep independent failures. Neither can take local analysis down.
+          if (contributionRuntimeShutdown === null) {
+            contributionRuntimeStart = Promise.resolve().then(async () => {
+              if (contributionRuntimeShutdown !== null) return;
+              try {
+                await incrementalContribution?.start();
+              } catch {
+                onError("incremental_contribution_start_failed");
+              }
+              if (contributionRuntimeShutdown !== null) return;
+              try {
+                await accountlessContribution?.start();
+              } catch {
+                onError("accountless_contribution_start_failed");
+              }
+            });
+            await contributionRuntimeStart;
           }
           // Superseded v0.1 sets are cleanup, not readiness: only shutdown
           // drains the tracked pass, so the snapshot never waits on it.

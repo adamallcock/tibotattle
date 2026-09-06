@@ -6,6 +6,10 @@ import {
   telemetryV11RequiredConsent, telemetryV11DomainManifestDigestInput,
 } from "@app-usagemonitor/telemetry-contract";
 import {
+  ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+  ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+  ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+  ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
   createTelemetryV11Day, readTelemetryV11Capabilities, runTelemetryV11Sync, telemetryV11FieldInventory,
 } from "../src/contribution/index.js";
 
@@ -29,12 +33,20 @@ function usage(index, selectedDay = day) {
       outputTextTokens: 20, outputReasoningTokens: 1, outputCombinedTokens: null },
   };
 }
+function quota(index = 0, selectedDay = day) {
+  return {
+    observationId: `quota-occurrence:v1:${index.toString(16).padStart(64, "0")}`,
+    observedTime: selectedDay + "T12:05:00.000Z", provider: "openai_codex",
+    planType: "plus", planVariant: "unknown", limitId: "codex", slot: "secondary",
+    usedPercent: 12, windowDurationMinutes: 10_080, resetsAt: "2026-08-31T12:00:00.000Z",
+  };
+}
 function preparedDay(selectedDay = day, count = 1, parserVersion = "synthetic-v11-sync") {
   return createTelemetryV11Day({ day: selectedDay, parserVersion,
     recordsByStream: { usage: Array.from({ length: count }, (_, index) => usage(index, selectedDay)) } });
 }
 
-function server({ count = 1, capabilitiesChange = {}, predecessorChange = {} } = {}) {
+function server({ count = 1, capabilitiesChange = {}, predecessorChange = {}, destinationOrigin = origin } = {}) {
   let sequence = 10;
   const manifests = new Map();
   const envelopes = new Map();
@@ -42,7 +54,7 @@ function server({ count = 1, capabilitiesChange = {}, predecessorChange = {} } =
   const calls = [];
   let active = null;
   const capability = {
-    schemaVersion: "device-sync-capabilities-v1.1", destinationOrigin: origin,
+    schemaVersion: "device-sync-capabilities-v1.1", destinationOrigin,
     enrollmentNamespace: "synthetic_enrollment_namespace", identityVersion: "account-track-v2",
     minimumWriteRank: 11, policyRevision: 1, requiredConsent: telemetryV11RequiredConsent(), consentCurrent: true,
     formats: [
@@ -58,7 +70,7 @@ function server({ count = 1, capabilitiesChange = {}, predecessorChange = {} } =
     assert.equal(options.redirect, "error");
     assert.equal(options.cache, "no-store");
     assert.ok(options.signal instanceof AbortSignal);
-    assert.equal(new URL(url).origin, origin);
+    assert.equal(new URL(url).origin, destinationOrigin);
     const path = new URL(url).pathname;
     const body = options.body === undefined ? null : JSON.parse(options.body);
     calls.push({ path, body });
@@ -121,7 +133,7 @@ function server({ count = 1, capabilitiesChange = {}, predecessorChange = {} } =
   return {
     calls, manifests, envelopes, capability, active: () => active,
     options: {
-      serverBaseUrl: origin, deviceAuthorization: authorization, consent: telemetryV11RequiredConsent(),
+      serverBaseUrl: destinationOrigin, deviceAuthorization: authorization, consent: telemetryV11RequiredConsent(),
       days: [day], clock: () => now, readDay: (selectedDay) => preparedDay(selectedDay, selectedDay === day ? count : 0),
       createEnvelope: async (chunk) => {
         assert.ok(Object.isFrozen(chunk.records[0].components));
@@ -200,6 +212,41 @@ test("missing, old, broadened and malformed local consent fail before any networ
     const fixture = server();
     await assert.rejects(runTelemetryV11Sync({ ...fixture.options, consent }), { code: "contribution_incremental_sync_consent_invalid" });
     assert.equal(fixture.calls.length, 0);
+  }
+});
+
+test("accountless policy authorization is laboratory-only and never becomes a consent event", async () => {
+  const laboratoryOrigin = "http://127.0.0.1:8787";
+  const accountlessAuthorization = {
+    schemaVersion: ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+    policyVersion: ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+    authorizationBasis: ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+    telemetrySchemaVersion: ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+  };
+  const fixture = server({ destinationOrigin: laboratoryOrigin });
+  const { consent: ignoredConsent, ...options } = fixture.options;
+  void ignoredConsent;
+  const result = await runTelemetryV11Sync({
+    ...options,
+    laboratory: true,
+    authorization: accountlessAuthorization,
+  });
+  assert.equal(result.status, "complete");
+  assert.equal(result.recordsUploaded, 1);
+  assert.equal(fixture.calls.some((call) => call.path.includes("device-telemetry-consents")), false);
+
+  for (const unsafe of [
+    { laboratory: false, authorization: accountlessAuthorization },
+    { laboratory: true, authorization: { ...accountlessAuthorization, extra: true } },
+    { laboratory: true, authorization: accountlessAuthorization, consent: telemetryV11RequiredConsent() },
+  ]) {
+    const rejected = server({ destinationOrigin: laboratoryOrigin });
+    const { consent: ignored, ...rejectedOptions } = rejected.options;
+    void ignored;
+    await assert.rejects(runTelemetryV11Sync({ ...rejectedOptions, ...unsafe }), {
+      code: "contribution_incremental_sync_authorization_invalid",
+    });
+    assert.equal(rejected.calls.length, 0);
   }
 });
 
@@ -556,6 +603,71 @@ test("a lost activation response is not acknowledged; retry reuses staged chunks
   assert.equal(second.chunksSkipped, 1);
 });
 
+test("a lost committed usage or quota receipt resumes from the day manifest without a duplicate POST", async () => {
+  const laboratoryOrigin = "http://127.0.0.1:8787";
+  const accountlessAuthorization = {
+    schemaVersion: ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+    policyVersion: ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+    authorizationBasis: ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+    telemetrySchemaVersion: ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+  };
+  const prepared = createTelemetryV11Day({
+    day,
+    parserVersion: "synthetic-v11-sync",
+    recordsByStream: { usage: [usage(1)], quota: [quota(1)] },
+  });
+  for (const stream of ["usage", "quota"]) {
+    const fixture = server({ destinationOrigin: laboratoryOrigin });
+    const { consent: ignoredConsent, ...options } = fixture.options;
+    void ignoredConsent;
+    const contributionPosts = [];
+    let loseTargetReceipt = true;
+    const fetchImpl = async (url, request) => {
+      const path = new URL(url).pathname;
+      let chunkId = null;
+      if (path === "/api/v1/contributions") {
+        const envelope = JSON.parse(request.body);
+        chunkId = fixture.envelopes.get(envelope.ciphertext)?.chunkId ?? null;
+        contributionPosts.push(chunkId);
+      }
+      const response = await fixture.options.fetchImpl(url, request);
+      if (loseTargetReceipt && chunkId?.startsWith(`${stream}:`)) {
+        loseTargetReceipt = false;
+        throw new Error("synthetic committed receipt lost");
+      }
+      return response;
+    };
+    const first = await runTelemetryV11Sync({
+      ...options,
+      laboratory: true,
+      authorization: accountlessAuthorization,
+      days: [day],
+      readDay: () => prepared,
+      fetchImpl,
+    });
+    assert.equal(first.status, "failed", stream);
+    assert.equal(first.failure.code, "service_unavailable", stream);
+    assert.equal(first.acknowledgedThroughDay, null, stream);
+    assert.equal(first.daysSynced, 0, stream);
+    const target = `${stream}:${day}:0`;
+    assert.equal(contributionPosts.filter((item) => item === target).length, 1, stream);
+
+    const resumed = await runTelemetryV11Sync({
+      ...options,
+      laboratory: true,
+      authorization: accountlessAuthorization,
+      days: [day],
+      readDay: () => prepared,
+      fetchImpl,
+    });
+    assert.equal(resumed.status, "complete", stream);
+    assert.equal(resumed.acknowledgedThroughDay, day, stream);
+    assert.equal(resumed.daysSynced, 1, stream);
+    assert.ok(resumed.chunksSkipped >= 1, stream);
+    assert.equal(contributionPosts.filter((item) => item === target).length, 1, stream);
+  }
+});
+
 test("unchanged-domain receipts link the submitted digest while retaining the real generation", async () => {
   const fixture = server();
   const first = await runTelemetryV11Sync(fixture.options);
@@ -662,6 +774,10 @@ test("HTTP admission, consent, device loss and compatibility rejection retain ty
     [429, "CHUNK_ADMISSION_LIMIT_REACHED", "admission_exhausted", "partial"],
     [403, "TELEMETRY_TRANSPORT_BLOCKED", "consent_rejected", "failed"],
     [401, "DEVICE_AUTH_INVALID", "device_unavailable", "failed"],
+    [410, "ACCOUNTLESS_ENROLLMENT_EXPIRED", "device_unavailable", "failed"],
+    [401, "ACCOUNTLESS_ENROLLMENT_REVOKED", "device_unavailable", "failed"],
+    [410, "ACCOUNTLESS_OWNERSHIP_EXPIRED", "device_unavailable", "failed"],
+    [401, "ACCOUNTLESS_OWNERSHIP_REVOKED", "device_unavailable", "failed"],
     [409, "TELEMETRY_COMPATIBILITY_PROOF_UNAVAILABLE", "revision_conflict", "failed"],
   ];
   for (const [status, code, failure, expectedStatus] of errors) {

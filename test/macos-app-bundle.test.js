@@ -7220,7 +7220,8 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     ...MACOS_RUNTIME_STATIC_ASSETS,
     ...webModules.relativeFiles,
   ].sort();
-  assert.equal(graph.relativeFiles[0], "apps/local/server.js");
+  assert.equal(graph.relativeFiles[0], "apps/local/accountless-contribution.js");
+  assert.equal(graph.relativeFiles.includes("apps/local/server.js"), true);
   assert.deepEqual(graph.externalSpecifiers, [
     "@app-usagemonitor/accounting",
     "@app-usagemonitor/identity-core",

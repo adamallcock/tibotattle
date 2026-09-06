@@ -44,6 +44,7 @@ const COMPANION_ENVIRONMENT_KEYS = Object.freeze([
   "USAGE_MONITOR_CENTRAL_ORIGIN",
   "USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION",
   "USAGE_MONITOR_TEST_LANE",
+  "USAGE_MONITOR_ACCOUNTLESS_ORIGIN",
 ]);
 
 function assertTimeout(value, label) {
@@ -111,6 +112,7 @@ export function createCompanionSupervisor({
   onUnexpectedExit,
   setTimer = setTimeout,
   clearTimer = clearTimeout,
+  attachPrivateChannel,
 } = {}) {
   if (typeof spawnChild !== "function") throw new TypeError("spawnChild is required");
   if (typeof command !== "string" || command.length === 0) {
@@ -121,6 +123,9 @@ export function createCompanionSupervisor({
   }
   if (typeof environment !== "object" || environment === null || Array.isArray(environment)) {
     throw new TypeError("environment must be an object");
+  }
+  if (attachPrivateChannel !== undefined && typeof attachPrivateChannel !== "function") {
+    throw new TypeError("private channel factory is invalid");
   }
   assertTimeout(startupTimeoutMs, "startupTimeoutMs");
   assertTimeout(shutdownTimeoutMs, "shutdownTimeoutMs");
@@ -138,6 +143,7 @@ export function createCompanionSupervisor({
   let stopPromise = null;
   let generation = 0;
   let unexpectedExitHandler = onUnexpectedExit;
+  let privateChannel = null;
 
   function stateSnapshot() {
     return Object.freeze({
@@ -158,6 +164,7 @@ export function createCompanionSupervisor({
       let settled = false;
       let startupTimer = null;
       let currentChild = null;
+      let currentPrivateChannel = null;
       let parser;
 
       const cleanupStartup = () => {
@@ -230,6 +237,8 @@ export function createCompanionSupervisor({
       };
 
       const onExit = () => {
+        currentPrivateChannel?.dispose();
+        if (privateChannel === currentPrivateChannel) privateChannel = null;
         if (!settled) {
           fail(shellError("companion_exit_before_ready"));
           return;
@@ -253,7 +262,7 @@ export function createCompanionSupervisor({
         currentChild = spawnChild(command, [...args], {
           cwd,
           env: companionEnvironment(environment, parentPid),
-          stdio: ["ignore", "pipe", "pipe"],
+          stdio: attachPrivateChannel ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"],
           windowsHide: true,
         });
       } catch {
@@ -264,6 +273,12 @@ export function createCompanionSupervisor({
         fail(shellError("companion_spawn_failed"));
         return;
       }
+      try {
+        if (attachPrivateChannel) {
+          currentPrivateChannel = attachPrivateChannel(currentChild);
+          privateChannel = currentPrivateChannel;
+        }
+      } catch { fail(shellError("companion_spawn_failed")); return; }
       discardStream(currentChild.stderr);
       if (!currentChild.stdout || typeof currentChild.stdout.on !== "function") {
         fail(shellError("companion_spawn_failed"));
@@ -293,6 +308,7 @@ export function createCompanionSupervisor({
     const currentChild = child;
     const currentGeneration = generation;
     state = "stopping";
+    privateChannel?.invalidate();
     ++generation;
     stopPromise = new Promise((resolveStop, rejectStop) => {
       let finished = false;
@@ -329,6 +345,7 @@ export function createCompanionSupervisor({
   return Object.freeze({
     start,
     stop,
+    invalidatePrivateChannel() { return privateChannel?.invalidate(); },
     setUnexpectedExitHandler(handler) {
       if (handler !== undefined && typeof handler !== "function") {
         throw new TypeError("handler must be a function");

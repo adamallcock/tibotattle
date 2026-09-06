@@ -54,9 +54,17 @@ export function createDesktopSharingCoordinator({
   installationState = "unknown",
   destinationOrigin,
   now = () => new Date(),
+  onAuthorizationChanged = () => {},
 } = {}) {
-  if (typeof backend?.load !== "function" || typeof backend?.save !== "function") fail();
+  if (typeof backend?.load !== "function" || typeof backend?.save !== "function"
+      || typeof onAuthorizationChanged !== "function") fail();
   let disposed = false;
+  let changing = 0;
+  let transportStatus = "unavailable";
+  const signalChange = () => {
+    try { return Promise.resolve(onAuthorizationChanged()); }
+    catch { return Promise.reject(new Error("Sharing cancellation unavailable")); }
+  };
   const policy = createLocalContributionPreference({
     settingsFile: DESKTOP_SHARING_FILE_NAME,
     policyVersion: DESKTOP_SHARING_POLICY_VERSION,
@@ -81,9 +89,7 @@ export function createDesktopSharingCoordinator({
       noticeDue: value.noticeDue === true,
       nextNoticeAt: value.nextNoticeAt ?? null,
       earliestActivationAt: value.earliestActivationAt ?? null,
-      // The enrollment-only backend cannot accept uploads. Never imply that
-      // an enabled preference means a working transport or create old consent.
-      transportStatus: value.enabled === true ? "unavailable" : "off",
+      transportStatus: value.enabled === true ? transportStatus : "off",
     });
   }
 
@@ -91,11 +97,36 @@ export function createDesktopSharingCoordinator({
   return Object.freeze({
     async initialize() { active(); return project(await policy.initialize()); },
     async inspect() { active(); return project(await policy.evaluateAutomatic()); },
-    async setEnabled(enabled) { active(); return project(await policy.setEnabled(enabled)); },
+    async readAuthorization() {
+      active();
+      if (changing > 0) return { available: false, current: false, enabled: false };
+      const value = await policy.evaluateAutomatic();
+      return changing > 0 ? { available: false, current: false, enabled: false } : value;
+    },
+    async setEnabled(enabled) {
+      active();
+      changing += 1;
+      let fence;
+      try {
+        fence = signalChange();
+        fence.catch(() => {});
+        const saved = await policy.setEnabled(enabled);
+        await fence.catch(() => fail());
+        return project(saved);
+      } finally {
+        changing -= 1;
+        signalChange().catch(() => {});
+      }
+    },
+    updateTransport(value) {
+      if (["off", "unavailable", "uploading", "pending", "up_to_date", "retry_wait", "paused"].includes(value?.state)) {
+        transportStatus = value.state;
+      }
+    },
     async markNoticePresented(index) {
       active();
       return project(await policy.markNoticePresented(index));
     },
-    dispose() { disposed = true; },
+    dispose() { disposed = true; signalChange().catch(() => {}); },
   });
 }

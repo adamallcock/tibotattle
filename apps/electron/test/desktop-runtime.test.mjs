@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
+import { spawn } from "node:child_process";
+import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 
 import { DESKTOP_DEFAULT_SETTINGS } from "../desktop-contract.js";
 import { DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION } from "../desktop-first-run.js";
@@ -305,6 +311,10 @@ async function launchFixture({
   app: suppliedApp,
   runtimeOverrides = {},
   lifecycleOptions = {},
+  accountlessLaboratory,
+  sharingBackend,
+  sharingInstallationState,
+  ownedCompanionScript,
   environment = {
     HOME: "/Users/adam",
     USAGE_MONITOR_RESOURCE_ROOT: "/repo",
@@ -320,8 +330,8 @@ async function launchFixture({
     runtime: { ...runtime(app), ...runtimeOverrides },
     app,
     paths: {
-      companionScript: "/repo/apps/local/server.js",
-      companionCwd: "/repo",
+      companionScript: ownedCompanionScript ?? "/repo/apps/local/server.js",
+      companionCwd: ownedCompanionScript ? process.cwd() : "/repo",
       resourceRoot: "/repo",
       preloadPath: "/repo/apps/electron/preload.cjs",
     },
@@ -332,15 +342,18 @@ async function launchFixture({
     platform,
     argv,
     lifecycleOptions,
+    accountlessLaboratory,
+    sharingBackend,
+    sharingInstallationState,
     settingsBackend: backend,
     supervisorOptions: {
       spawnChild(_command, args, options) {
         spawnCalls.push({ args: [...args], options });
-        const child = new FakeChild();
+        const child = ownedCompanionScript ? spawn(_command, args, options) : new FakeChild();
         children.push(child);
         return child;
       },
-      startupTimeoutMs: 1_000,
+      startupTimeoutMs: ownedCompanionScript ? 5_000 : 1_000,
       shutdownTimeoutMs: 1_000,
     },
   });
@@ -349,10 +362,123 @@ async function launchFixture({
   // can return its outer promise to the test.
   launch.catch(() => {});
   await new Promise((resolve) => setImmediate(resolve));
-  children[0]?.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4811/\n"));
+  if (!ownedCompanionScript) children[0]?.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4811/\n"));
   const desktop = await launch;
   return { app, children, spawnCalls, desktop };
 }
+
+test("normal desktop cannot enable accountless uploads through environment variables", async () => {
+  const fixture = await launchFixture({ load: async () => null, environment: {
+    HOME: "/Users/adam", USAGE_MONITOR_CENTRAL_ORIGIN: "https://tibotattle.com",
+    USAGE_MONITOR_ACCOUNTLESS_ORIGIN: "https://tibotattle.com",
+  } });
+  assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_CENTRAL_ORIGIN, undefined);
+  assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_ACCOUNTLESS_ORIGIN, undefined);
+  assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe"]);
+  await fixture.desktop.lifecycle.requestQuit();
+});
+
+test("accountless laboratory rejects hosted destinations and absent synthetic lane", async () => {
+  for (const [origin, lane] of [["https://tibotattle.com", "accountless-local-lab-v1"], ["http://127.0.0.1:18901", undefined]]) {
+    await assert.rejects(launchFixture({ load: async () => null,
+      environment: { HOME: "/Users/adam", ...(lane ? { USAGE_MONITOR_TEST_LANE: lane } : {}) },
+      sharingBackend: { load: async () => null, save: async () => {} }, sharingInstallationState: "fresh",
+      accountlessLaboratory: { origin, backend: {} },
+    }), { code: "electron_shell_electron_configuration_invalid" });
+  }
+});
+
+test("accountless laboratory rejects incomplete injected credential capabilities before readiness", async () => {
+  for (const backend of [null, {}, { read: async () => null }, {
+    read: async () => null, createIfMissing: async () => "created", deleteExact: false,
+  }]) {
+    const app = new FakeApp();
+    await assert.rejects(launchFixture({ app, load: async () => null,
+      environment: { HOME: "/synthetic", USAGE_MONITOR_TEST_LANE: "accountless-local-lab-v1" },
+      sharingBackend: { load: async () => null, save: async () => {} }, sharingInstallationState: "fresh",
+      accountlessLaboratory: { origin: "http://127.0.0.1:18901", backend },
+    }), { code: "electron_shell_electron_configuration_invalid" });
+    assert.equal(app.readyCalls, 0);
+  }
+});
+
+test("desktop laboratory composes encrypted credentials with an owned companion and durable opt-out", async (t) => {
+  const profile = await mkdtemp(join(tmpdir(), "accountless-runtime-"));
+  const launched = [];
+  const app = new FakeApp();
+  app.getPath = () => profile;
+  const key = randomBytes(32);
+  t.after(async () => {
+    try { await Promise.all(launched.map((fixture) => fixture.desktop.lifecycle.requestQuit())); }
+    finally { key.fill(0); await rm(profile, { recursive: true, force: true }); }
+  });
+  let encryptions = 0;
+  let decryptions = 0;
+  let encryptionAvailable = false;
+  const safeStorage = {
+    isAsyncEncryptionAvailable: async () => { assert.equal(app.ready, true); return encryptionAvailable; },
+    async encryptStringAsync(value) {
+      encryptions += 1;
+      const nonce = randomBytes(12);
+      const cipher = createCipheriv("aes-256-gcm", key, nonce);
+      const body = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
+      return Buffer.concat([nonce, cipher.getAuthTag(), body]);
+    },
+    async decryptStringAsync(bytes) {
+      decryptions += 1;
+      const decipher = createDecipheriv("aes-256-gcm", key, bytes.subarray(0, 12));
+      decipher.setAuthTag(bytes.subarray(12, 28));
+      return { result: Buffer.concat([decipher.update(bytes.subarray(28)), decipher.final()]).toString("utf8"), shouldReEncrypt: false };
+    },
+  };
+  let savedChoice = null;
+  const sharingBackend = {
+    load: async () => savedChoice,
+    save: async (value) => { savedChoice = structuredClone(value); },
+  };
+  const options = {
+    app, load: async () => null, runtimeOverrides: { safeStorage },
+    environment: { HOME: profile, USAGE_MONITOR_TEST_LANE: "accountless-local-lab-v1" },
+    sharingBackend, sharingInstallationState: "fresh",
+    accountlessLaboratory: { origin: "http://127.0.0.1:18901" },
+    ownedCompanionScript: fileURLToPath(new URL("../../../test/fixtures/accountless-runtime-child.mjs", import.meta.url)),
+  };
+  const waitFor = async (predicate) => {
+    const deadline = Date.now() + 5_000;
+    while (!await predicate()) {
+      assert.ok(Date.now() < deadline, "owned companion did not reach expected state");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+  const first = await launchFixture(options);
+  launched.push(first);
+  assert.deepEqual(first.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ipc"]);
+  await waitFor(async () => (await first.desktop.sharingCoordinator.inspect()).transportStatus === "retry_wait");
+  assert.equal(encryptions, 0, "unavailable encryption must not create a credential or block local launch");
+  encryptionAvailable = true;
+  first.children[0].send({ schemaVersion: "synthetic-accountless-runtime-control-v1", action: "run" });
+  await waitFor(async () => (await first.desktop.sharingCoordinator.inspect()).transportStatus === "up_to_date");
+  assert.equal(encryptions, 1);
+  const credentialPath = join(profile, "desktop-settings", "accountless-installation-credential-v1.json");
+  const stored = await readFile(credentialPath, "utf8");
+  assert.deepEqual(Object.keys(JSON.parse(stored)).sort(), ["encrypted", "schemaVersion"]);
+  first.children[0].send({ schemaVersion: "synthetic-accountless-runtime-control-v1", action: "run" });
+  await waitFor(async () => (await first.desktop.sharingCoordinator.inspect()).transportStatus === "uploading");
+  await first.desktop.sharingCoordinator.setEnabled(false);
+  assert.equal((await first.desktop.sharingCoordinator.inspect()).transportStatus, "off");
+  await first.desktop.lifecycle.requestQuit();
+  const readsBeforeRestart = decryptions;
+  const restarted = await launchFixture(options);
+  launched.push(restarted);
+  await waitFor(async () => (await restarted.desktop.sharingCoordinator.inspect()).transportStatus === "off");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(decryptions, readsBeforeRestart, "saved opt-out must deny credential access on restart");
+  assert.equal(await readFile(credentialPath, "utf8"), stored, "restart must not rotate the installation");
+  await restarted.desktop.sharingCoordinator.setEnabled(true);
+  await waitFor(async () => (await restarted.desktop.sharingCoordinator.inspect()).transportStatus === "up_to_date");
+  assert.equal(encryptions, 1, "explicit re-enable reuses the same installation credential");
+  await restarted.desktop.lifecycle.requestQuit();
+});
 
 test("runtime persists the fixed Electron appearance and updates live renderers", async () => {
   const nativeTheme = new EventEmitter();

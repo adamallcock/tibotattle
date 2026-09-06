@@ -1,4 +1,8 @@
 export {
+  attachAccountlessParentChannel,
+  createAccountlessChildChannel,
+} from "./accountless-contribution-channel.js";
+export {
   readBoundedJsonLines,
   readBoundedUtf8LineEntries,
   readBoundedUtf8Lines,

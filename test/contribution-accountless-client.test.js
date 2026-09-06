@@ -6,10 +6,20 @@ import {
   ACCOUNTLESS_ENROLLMENT_POLICY_VERSION,
   ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION,
   ContributionAccountlessClientError,
+  claimAccountlessContributionOwnership,
   enrollAccountlessContribution,
+  runAccountlessContributionSyncOnce,
 } from "../src/contribution-accountless-client.js";
+import {
+  ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+  ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+  ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+  ACCOUNTLESS_UPLOAD_OWNER_SCOPE,
+  ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+} from "../src/contribution/index.js";
 
 const ORIGIN = "https://usage.example";
+const LABORATORY_ORIGIN = "http://127.0.0.1:8787";
 const DEVICE_ID = "11111111-1111-4111-8111-111111111111";
 const DEVICE_SECRET_HASH = "a".repeat(64);
 const EXPIRES_AT = "2026-09-10T00:00:00.000Z";
@@ -48,6 +58,38 @@ function enrollmentReceipt(overrides = {}) {
     authorizationBasis: ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS,
     scope: "enrollment_only",
     ...overrides,
+  };
+}
+
+function ownershipReceipt(overrides = {}) {
+  return {
+    schemaVersion: ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+    state: "created",
+    deviceId: DEVICE_ID,
+    expiresAt: EXPIRES_AT,
+    policyVersion: ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+    authorizationBasis: ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+    scope: ACCOUNTLESS_UPLOAD_OWNER_SCOPE,
+    telemetrySchemaVersion: ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+    ...overrides,
+  };
+}
+
+function laboratoryLease({ onSecret = () => {} } = {}) {
+  return async ({ backend, expectedOrigin, operation }) => {
+    assert.deepEqual(backend, { laboratory: true });
+    assert.equal(expectedOrigin, LABORATORY_ORIGIN);
+    const secret = Buffer.alloc(32, 7);
+    try {
+      onSecret(secret);
+      return await operation(secret, {
+        origin: LABORATORY_ORIGIN,
+        deviceId: DEVICE_ID,
+        createdAt: "2026-09-01T00:00:00.000Z",
+      });
+    } finally {
+      secret.fill(0);
+    }
   };
 }
 
@@ -454,4 +496,310 @@ test("missing secure capability state fails once without an enrollment attempt",
   );
   assert.equal(capabilityCalls, 1);
   assert.equal(networkCalls, 0);
+});
+
+test("the accountless runner retries only explicit temporary credential availability", async () => {
+  let networkCalls = 0;
+  const transient = Object.assign(new Error("temporary protected credential unavailable"), {
+    code: "contribution_device_credential_unavailable",
+    retryable: true,
+  });
+  const result = await runAccountlessContributionSyncOnce({
+    laboratory: true,
+    origin: LABORATORY_ORIGIN,
+    indexFile: "/synthetic/index.sqlite",
+    backend: { laboratory: true },
+    now: () => NOW,
+    readPreference: async () => preference({ destinationOrigin: LABORATORY_ORIGIN }),
+    ensureCapability: async () => { throw transient; },
+    fetchImpl: async () => { networkCalls += 1; return jsonResponse(enrollmentReceipt()); },
+  });
+  assert.equal(networkCalls, 0);
+  assert.deepEqual(result.failure, {
+    code: "credential_unavailable",
+    retryable: true,
+    deviceUnavailable: false,
+    retryAfterMilliseconds: null,
+  });
+
+  const malformed = await runAccountlessContributionSyncOnce({
+    laboratory: true,
+    origin: LABORATORY_ORIGIN,
+    indexFile: "/synthetic/index.sqlite",
+    backend: { laboratory: true },
+    now: () => NOW,
+    readPreference: async () => preference({ destinationOrigin: LABORATORY_ORIGIN }),
+    ensureCapability: async () => ({ ...capability({ origin: LABORATORY_ORIGIN }), deviceId: "not-a-device-id" }),
+    fetchImpl: async () => assert.fail("a malformed capability must not reach transport"),
+  });
+  assert.deepEqual(malformed.failure, {
+    code: "credential_unavailable",
+    retryable: false,
+    deviceUnavailable: false,
+    retryAfterMilliseconds: null,
+  });
+});
+
+test("the accountless runner retries an explicitly unavailable private credential channel", async () => {
+  let networkCalls = 0;
+  const result = await runAccountlessContributionSyncOnce({
+    laboratory: true,
+    origin: LABORATORY_ORIGIN,
+    indexFile: "/synthetic/index.sqlite",
+    backend: { laboratory: true },
+    now: () => NOW,
+    readPreference: async () => preference({ destinationOrigin: LABORATORY_ORIGIN }),
+    enroll: async () => Object.freeze({ status: "existing" }),
+    withDeviceSecret: async () => {
+      throw Object.assign(new Error("temporary private channel unavailable"), {
+        code: "contribution_device_credential_unavailable",
+        retryable: true,
+      });
+    },
+    fetchImpl: async () => { networkCalls += 1; return jsonResponse(ownershipReceipt()); },
+    runIncrementalSync: async () => assert.fail("a failed credential lease must not enter incremental upload"),
+  });
+  assert.equal(networkCalls, 0);
+  assert.deepEqual(result.failure, {
+    code: "credential_unavailable",
+    retryable: true,
+    deviceUnavailable: false,
+    retryAfterMilliseconds: null,
+  });
+});
+
+test("laboratory ownership sends the fixed policy record under a leased device credential", async () => {
+  const calls = [];
+  let secretObserved = null;
+  const result = await claimAccountlessContributionOwnership({
+    laboratory: true,
+    origin: LABORATORY_ORIGIN,
+    readPreference: async () => preference({ destinationOrigin: LABORATORY_ORIGIN }),
+    backend: { laboratory: true },
+    now: () => NOW,
+    withDeviceSecret: laboratoryLease({ onSecret: (secret) => { secretObserved = secret; } }),
+    fetchImpl: async (url, options) => {
+      calls.push({ url: String(url), options });
+      return jsonResponse(ownershipReceipt());
+    },
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, `${LABORATORY_ORIGIN}/api/v1/accountless/ownership`);
+  assert.equal(calls[0].options.method, "POST");
+  assert.equal(calls[0].options.credentials, "omit");
+  assert.equal(calls[0].options.redirect, "error");
+  assert.deepEqual(calls[0].options.headers, {
+    Accept: "application/json",
+    "Content-Type": "application/json",
+    Authorization: `Device um_device_${DEVICE_ID}.${Buffer.alloc(32, 7).toString("base64url")}`,
+  });
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    schemaVersion: ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+    policyVersion: ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+    authorizationBasis: ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+    telemetrySchemaVersion: ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+  });
+  assert.deepEqual(result, {
+    status: "created",
+    origin: LABORATORY_ORIGIN,
+    deviceId: DEVICE_ID,
+    scope: "upload_registration",
+    expiresAt: EXPIRES_AT,
+  });
+  assert.equal(Object.hasOwn(result, "authorization"), false);
+  assert.equal(Object.hasOwn(result, "token"), false);
+  assert.equal(Object.hasOwn(result, "secret"), false);
+  assert.equal(Object.isFrozen(result), true);
+  assert.ok(secretObserved?.every((value) => value === 0), "the test lease was zeroized after the request");
+});
+
+test("a mismatched ownership device receipt cannot enter the v1.1 runner", async () => {
+  let enrollmentCalls = 0;
+  let syncCalls = 0;
+  const result = await runAccountlessContributionSyncOnce({
+    laboratory: true,
+    origin: LABORATORY_ORIGIN,
+    indexFile: "/synthetic/index.sqlite",
+    backend: { laboratory: true },
+    now: () => NOW,
+    readPreference: async () => preference({ destinationOrigin: LABORATORY_ORIGIN }),
+    enroll: async () => {
+      enrollmentCalls += 1;
+      return Object.freeze({ status: "existing" });
+    },
+    withDeviceSecret: laboratoryLease(),
+    fetchImpl: async () => jsonResponse(ownershipReceipt({
+      deviceId: "22222222-2222-4222-8222-222222222222",
+    })),
+    runIncrementalSync: async () => {
+      syncCalls += 1;
+      return Object.freeze({ status: "complete", chunksUploaded: 0 });
+    },
+  });
+
+  assert.equal(enrollmentCalls, 1);
+  assert.equal(syncCalls, 0);
+  assert.equal(result.status, "failed");
+  assert.deepEqual(result.failure, {
+    code: "response_invalid",
+    retryable: false,
+    deviceUnavailable: false,
+    retryAfterMilliseconds: null,
+  });
+  assert.equal(Object.hasOwn(result, "receipt"), false);
+});
+
+test("ownership is loopback laboratory-only before preference, credential, or network work", async () => {
+  for (const { laboratory, origin } of [
+    { laboratory: false, origin: LABORATORY_ORIGIN },
+    { laboratory: true, origin: ORIGIN },
+    { laboratory: true, origin: "http://localhost:8787" },
+  ]) {
+    let preferenceCalls = 0;
+    let leaseCalls = 0;
+    let networkCalls = 0;
+    await assert.rejects(claimAccountlessContributionOwnership({
+      laboratory,
+      origin,
+      readPreference: async () => { preferenceCalls += 1; return preference({ destinationOrigin: origin }); },
+      backend: { laboratory: true },
+      now: () => NOW,
+      withDeviceSecret: async () => { leaseCalls += 1; },
+      fetchImpl: async () => { networkCalls += 1; return jsonResponse(ownershipReceipt()); },
+    }), isClientError("invalid_configuration"));
+    assert.equal(preferenceCalls, 0);
+    assert.equal(leaseCalls, 0);
+    assert.equal(networkCalls, 0);
+  }
+});
+
+test("ownership retries only through a later pass and terminal policy loss disables the device", async () => {
+  for (const { response, code, retryable } of [
+    { response: jsonResponse({ error: { code: "TEMPORARY_FAILURE" } }, 503), code: "service_unavailable", retryable: true },
+    { response: jsonResponse({ error: { code: "ACCOUNTLESS_OWNERSHIP_REVOKED" } }, 403), code: "device_unavailable", retryable: false },
+    { response: jsonResponse({ error: { code: "ACCOUNTLESS_POLICY_MISMATCH" } }, 409), code: "ownership_rejected", retryable: false },
+  ]) {
+    let networkCalls = 0;
+    await assert.rejects(claimAccountlessContributionOwnership({
+      laboratory: true,
+      origin: LABORATORY_ORIGIN,
+      readPreference: async () => preference({ destinationOrigin: LABORATORY_ORIGIN }),
+      backend: { laboratory: true },
+      now: () => NOW,
+      withDeviceSecret: laboratoryLease(),
+      fetchImpl: async () => { networkCalls += 1; return response; },
+    }), isClientError(code, { retryable }));
+    assert.equal(networkCalls, 1);
+  }
+});
+
+test("ownership rechecks an opt-out before its leased request and withholds its receipt", async () => {
+  const snapshots = [
+    preference({ destinationOrigin: LABORATORY_ORIGIN }),
+    preference({ destinationOrigin: LABORATORY_ORIGIN, enabled: false, basis: "default_off" }),
+  ];
+  let networkCalls = 0;
+  await assert.rejects(claimAccountlessContributionOwnership({
+    laboratory: true,
+    origin: LABORATORY_ORIGIN,
+    readPreference: async () => snapshots.shift() ?? snapshots.at(-1),
+    backend: { laboratory: true },
+    now: () => NOW,
+    withDeviceSecret: laboratoryLease(),
+    fetchImpl: async () => { networkCalls += 1; return jsonResponse(ownershipReceipt()); },
+  }), isClientError("preference_ineligible"));
+  assert.equal(networkCalls, 0);
+});
+
+test("the accountless runner carries only versioned policy authorization into v1.1 and fences every request", async () => {
+  const calls = [];
+  const order = [];
+  let preferenceReads = 0;
+  const result = await runAccountlessContributionSyncOnce({
+    laboratory: true,
+    origin: LABORATORY_ORIGIN,
+    indexFile: "/synthetic/index.sqlite",
+    backend: { laboratory: true },
+    now: () => NOW,
+    readPreference: async () => {
+      preferenceReads += 1;
+      return preference({ destinationOrigin: LABORATORY_ORIGIN });
+    },
+    fetchImpl: async (url) => {
+      calls.push(String(url));
+      return jsonResponse({ ok: true });
+    },
+    enroll: async (options) => {
+      order.push("enroll");
+      await options.fetchImpl(`${LABORATORY_ORIGIN}/api/v1/accountless/enrollment`);
+      return Object.freeze({ status: "enrolled" });
+    },
+    claimOwnership: async (options) => {
+      order.push("ownership");
+      assert.equal(options.laboratory, true);
+      await options.fetchImpl(`${LABORATORY_ORIGIN}/api/v1/accountless/ownership`);
+      return Object.freeze({ status: "created" });
+    },
+    runIncrementalSync: async (options) => {
+      order.push("sync");
+      assert.equal(options.laboratory, true);
+      assert.equal(Object.hasOwn(options, "consent"), false);
+      assert.deepEqual(options.authorization, {
+        schemaVersion: ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+        policyVersion: ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+        authorizationBasis: ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+        telemetrySchemaVersion: ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+      });
+      await options.fetchImpl(`${LABORATORY_ORIGIN}/api/v1/device/sync-capabilities`);
+      return Object.freeze({
+        schemaVersion: "incremental-contribution-sync-run-v1.0",
+        status: "complete",
+        daysSynced: 1,
+        chunksAccepted: 1,
+        networkActivity: true,
+        failure: null,
+      });
+    },
+  });
+
+  assert.deepEqual(order, ["enroll", "ownership", "sync"]);
+  assert.deepEqual(calls, [
+    `${LABORATORY_ORIGIN}/api/v1/accountless/enrollment`,
+    `${LABORATORY_ORIGIN}/api/v1/accountless/ownership`,
+    `${LABORATORY_ORIGIN}/api/v1/device/sync-capabilities`,
+  ]);
+  assert.ok(preferenceReads >= 7, "preference is read around phases and each actual request");
+  assert.equal(result.status, "complete");
+  assert.equal(result.networkActivity, true);
+  assert.equal(Object.hasOwn(result, "receipt"), false);
+});
+
+test("the accountless runner cancels after enrollment and preserves the durable opt-out", async () => {
+  let enabled = true;
+  let ownershipCalls = 0;
+  let syncCalls = 0;
+  const result = await runAccountlessContributionSyncOnce({
+    laboratory: true,
+    origin: LABORATORY_ORIGIN,
+    indexFile: "/synthetic/index.sqlite",
+    backend: { laboratory: true },
+    now: () => NOW,
+    readPreference: async () => preference({
+      destinationOrigin: LABORATORY_ORIGIN,
+      enabled,
+      basis: enabled ? "default_on" : "default_off",
+    }),
+    enroll: async () => { enabled = false; return Object.freeze({ status: "enrolled" }); },
+    claimOwnership: async () => { ownershipCalls += 1; },
+    runIncrementalSync: async () => { syncCalls += 1; },
+  });
+  assert.equal(ownershipCalls, 0);
+  assert.equal(syncCalls, 0);
+  assert.deepEqual(result.failure, {
+    code: "preference_ineligible",
+    retryable: false,
+    deviceUnavailable: false,
+    retryAfterMilliseconds: null,
+  });
 });

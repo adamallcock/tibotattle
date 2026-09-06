@@ -18,6 +18,13 @@ import * as v02Compatibility from "../src/telemetry-contribution-v0.2.js";
 import * as preparedCompatibility from "../src/telemetry-prepared-set.js";
 
 const CONTRIBUTION_PUBLIC_EXPORTS = Object.freeze([
+  "accountlessDeviceUnavailableCode",
+  "accountlessLocalLaboratoryOrigin",
+  "ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS",
+  "ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION",
+  "ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION",
+  "ACCOUNTLESS_UPLOAD_OWNER_SCOPE",
+  "ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION",
   "MAX_PREPARED_CONTRIBUTION_BATCHES",
   "PREPARED_CONTRIBUTION_ELIGIBLE_SCHEMA",
   "PREPARED_CONTRIBUTION_LIMITS",

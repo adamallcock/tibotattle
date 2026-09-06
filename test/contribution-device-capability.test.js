@@ -503,6 +503,43 @@ test("locked, denied, malformed, and partial states fail closed with fixed conte
   });
 });
 
+test("only explicitly retryable protected credential availability survives the capability boundary", async () => {
+  await fixture(async ({ stateFile }) => {
+    const backend = memoryBackend();
+    backend.read = async () => {
+      const error = new Error(CANARY);
+      error.code = "contribution_device_credential_unavailable";
+      error.retryable = true;
+      throw error;
+    };
+    await assert.rejects(
+      ensureContributionDeviceCapability({ backend, origin: ORIGIN, stateFile }),
+      (error) => {
+        assert.equal(fixedError("credential_unavailable")(error), true);
+        assert.equal(error.retryable, true);
+        return true;
+      },
+    );
+  });
+
+  await fixture(async ({ stateFile }) => {
+    const backend = memoryBackend();
+    backend.read = async () => {
+      const error = new Error(CANARY);
+      error.code = "contribution_device_credential_unavailable";
+      throw error;
+    };
+    await assert.rejects(
+      ensureContributionDeviceCapability({ backend, origin: ORIGIN, stateFile }),
+      (error) => {
+        assert.equal(fixedError("credential_unavailable")(error), true);
+        assert.equal(error.retryable, false);
+        return true;
+      },
+    );
+  });
+});
+
 test("invalid origins and device IDs fail before persisting credentials", async () => {
   for (const origin of [
     "http://example.com",

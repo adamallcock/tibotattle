@@ -46,6 +46,7 @@ const ERROR_CODES = new Set([
   "credential_denied",
   "credential_migration_required",
   "credential_unavailable",
+  "credential_mutation_uncertain",
   "credential_missing",
   "credential_conflict",
   "state_unavailable",
@@ -57,16 +58,17 @@ const ERROR_CODES = new Set([
 ]);
 
 export class ContributionDeviceCapabilityError extends Error {
-  constructor(code) {
+  constructor(code, { retryable = false } = {}) {
     if (!ERROR_CODES.has(code)) throw new TypeError("Unknown contribution device capability error code");
     super("Contribution device capability operation failed");
     this.name = "ContributionDeviceCapabilityError";
     this.code = `contribution_device_${code}`;
+    this.retryable = retryable === true;
   }
 }
 
-function fail(code) {
-  throw new ContributionDeviceCapabilityError(code);
+function fail(code, options = {}) {
+  throw new ContributionDeviceCapabilityError(code, options);
 }
 
 function assertBackend(backend) {
@@ -85,8 +87,10 @@ function assertBackend(backend) {
 
 function translateBackendFailure(error) {
   let code;
+  let retryable;
   try {
     code = error?.code;
+    retryable = error?.retryable === true;
   } catch {
     fail("credential_unavailable");
   }
@@ -94,6 +98,15 @@ function translateBackendFailure(error) {
   if (code === "export_identity_keychain_denied") fail("credential_denied");
   if (code === "export_identity_keychain_migration_required") {
     fail("credential_migration_required");
+  }
+  if (code === "contribution_device_credential_mutation_uncertain") {
+    fail("credential_mutation_uncertain", { retryable });
+  }
+  // A protected parent channel and the Electron credential adapter mark only
+  // provider availability failures as retryable. Do not infer retryability for
+  // malformed, missing, conflicting, or unauthorized credential state.
+  if (code === "contribution_device_credential_unavailable") {
+    fail("credential_unavailable", { retryable });
   }
   fail("credential_unavailable");
 }
@@ -841,6 +854,7 @@ export async function ensureContributionDeviceCapability({
   let readback = null;
   let publication = null;
   let stored = false;
+  let mutationOutcomeUncertain = false;
   try {
     let generatedDeviceId;
     let now;
@@ -871,7 +885,14 @@ export async function ensureContributionDeviceCapability({
     }
     generated = copySecret(generatedValue);
     publication = await writeNewState(stateFile, canonicalState(state));
-    const outcome = await invokeBackend(selected, "createIfMissing", generated);
+    let outcome;
+    try {
+      outcome = await invokeBackend(selected, "createIfMissing", generated);
+    } catch (error) {
+      mutationOutcomeUncertain = error instanceof ContributionDeviceCapabilityError
+        && error.code === "contribution_device_credential_mutation_uncertain";
+      throw error;
+    }
     if (outcome !== "created") fail("credential_conflict");
     stored = true;
     readback = await invokeBackend(selected, "read");
@@ -884,7 +905,9 @@ export async function ensureContributionDeviceCapability({
     if (Buffer.isBuffer(generatedValue)) generatedValue.fill(0);
     generated?.fill(0);
     if (Buffer.isBuffer(readback)) readback.fill(0);
-    if (publication !== null && !stored) await removeCreatedState(publication);
+    if (publication !== null && !stored && !mutationOutcomeUncertain) {
+      await removeCreatedState(publication);
+    }
   }
 }
 

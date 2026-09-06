@@ -1,4 +1,16 @@
-import { ensureContributionDeviceCapability } from "./contribution-device-capability.js";
+import {
+  ensureContributionDeviceCapability,
+  withContributionDeviceSecret,
+} from "./contribution-device-capability.js";
+import {
+  accountlessLocalLaboratoryOrigin,
+  ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+  ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+  ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+  ACCOUNTLESS_UPLOAD_OWNER_SCOPE,
+  ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+} from "./contribution/index.js";
+import { runIncrementalContributionSyncOnce } from "./contribution-incremental-sync.js";
 
 export const ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION = "accountless-enrollment-v0.1";
 export const ACCOUNTLESS_ENROLLMENT_POLICY_VERSION = "accountless-opt-out-v1";
@@ -18,12 +30,25 @@ const DEVICE_ID_PATTERN =
 const SECRET_HASH_PATTERN = /^[0-9a-f]{64}$/u;
 const RECEIPT_KEYS =
   "authorizationBasis\0deviceId\0expiresAt\0policyVersion\0schemaVersion\0scope\0state";
+const OWNERSHIP_RECEIPT_KEYS =
+  "authorizationBasis\0deviceId\0expiresAt\0policyVersion\0schemaVersion\0scope\0state\0telemetrySchemaVersion";
 const REVOKED_CODES = new Set([
   "DEVICE_AUTH_INVALID",
   "DEVICE_REVOKED",
   "ACCOUNTLESS_DEVICE_REVOKED",
   "ACCOUNTLESS_ENROLLMENT_REVOKED",
+  "ACCOUNTLESS_ENROLLMENT_EXPIRED",
+  "ACCOUNTLESS_OWNERSHIP_REVOKED",
+  "ACCOUNTLESS_OWNERSHIP_EXPIRED",
 ]);
+const MAXIMUM_RETRY_AFTER_MILLISECONDS = 7 * 24 * 60 * 60 * 1000;
+const RUN_SCHEMA_VERSION = "incremental-contribution-sync-run-v1.0";
+const ACCOUNTLESS_RUN_AUTHORIZATION = Object.freeze({
+  schemaVersion: ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+  policyVersion: ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+  authorizationBasis: ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+  telemetrySchemaVersion: ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+});
 
 const ERROR_CODES = new Set([
   "invalid_configuration",
@@ -33,23 +58,50 @@ const ERROR_CODES = new Set([
   "service_unavailable",
   "device_unavailable",
   "enrollment_rejected",
+  "ownership_rejected",
   "response_invalid",
+  "interrupted",
+]);
+const RETRYABLE_CREDENTIAL_AVAILABILITY_CODES = new Set([
+  "contribution_device_credential_unavailable",
+  "contribution_device_credential_mutation_uncertain",
 ]);
 
 export class ContributionAccountlessClientError extends Error {
-  constructor(code, { retryable = false } = {}) {
+  constructor(code, { retryable = false, retryAfterMilliseconds = null } = {}) {
     if (!ERROR_CODES.has(code)) {
       throw new TypeError("Unknown accountless contribution client error code");
     }
-    super("Accountless contribution enrollment failed");
+    if (retryAfterMilliseconds !== null
+        && (!Number.isSafeInteger(retryAfterMilliseconds)
+          || retryAfterMilliseconds < 0
+          || retryAfterMilliseconds > MAXIMUM_RETRY_AFTER_MILLISECONDS)) {
+      throw new TypeError("Invalid accountless contribution retry delay");
+    }
+    super("Accountless contribution transport failed");
     this.name = "ContributionAccountlessClientError";
     this.code = `contribution_accountless_client_${code}`;
     this.retryable = retryable;
+    this.retryAfterMilliseconds = retryAfterMilliseconds;
   }
 }
 
 function fail(code, options = {}) {
   throw new ContributionAccountlessClientError(code, options);
+}
+
+// The protected credential layer distinguishes explicitly transient provider or
+// private-channel availability from malformed, missing, conflicting, or revoked
+// local state. Only the former may ask the scheduler for a later bounded pass.
+function credentialAccessFailure(error) {
+  let retryable = false;
+  try {
+    retryable = error?.retryable === true
+      && RETRYABLE_CREDENTIAL_AVAILABILITY_CODES.has(error?.code);
+  } catch {
+    retryable = false;
+  }
+  fail("credential_unavailable", { retryable });
 }
 
 function canonicalOrigin(value) {
@@ -217,7 +269,35 @@ async function readBoundedResponseText(response, signal) {
   }
 }
 
-async function readJsonResponse(response, signal) {
+function retryAfterMilliseconds(response, now = Date.now) {
+  const value = response.headers.get("retry-after")?.trim() ?? "";
+  if (value.length === 0 || value.length > 128) return null;
+  let milliseconds = null;
+  if (/^\d+$/u.test(value)) {
+    const seconds = Number(value);
+    if (!Number.isSafeInteger(seconds)) return null;
+    milliseconds = seconds * 1_000;
+  } else {
+    const then = Date.parse(value);
+    let current;
+    try { current = epochMilliseconds(now()); } catch { return null; }
+    if (!Number.isFinite(then)) return null;
+    milliseconds = Math.max(0, then - current);
+  }
+  return Number.isSafeInteger(milliseconds)
+    && milliseconds <= MAXIMUM_RETRY_AFTER_MILLISECONDS ? milliseconds : null;
+}
+
+function accountlessRevocationCode(value) {
+  return typeof value === "string"
+    && /^ACCOUNTLESS_[A-Z0-9_]{1,120}$/u.test(value);
+}
+
+async function readJsonResponse(response, signal, {
+  rejectionCode = "enrollment_rejected",
+  ownership = false,
+  now = Date.now,
+} = {}) {
   const validHeaders = response instanceof Response
     && response.headers.get("cache-control") === "no-store"
     && (response.headers.get("content-type") ?? "")
@@ -242,13 +322,20 @@ async function readJsonResponse(response, signal) {
   }
   if (!response.ok) {
     if (response.status === 408 || response.status === 429 || response.status >= 500) {
-      fail("service_unavailable", { retryable: true });
+      fail("service_unavailable", {
+        retryable: true,
+        retryAfterMilliseconds: retryAfterMilliseconds(response, now),
+      });
     }
     const backendCode = payload?.error?.code;
-    if (response.status === 401 || REVOKED_CODES.has(backendCode)) {
+    // A version or body mismatch remains a terminal contract error even if
+    // its machine code happens to share the accountless namespace.
+    if (ownership && response.status === 409) fail("ownership_rejected");
+    if (response.status === 401 || REVOKED_CODES.has(backendCode)
+        || (ownership && accountlessRevocationCode(backendCode))) {
       fail("device_unavailable");
     }
-    fail("enrollment_rejected");
+    fail(rejectionCode);
   }
   return payload;
 }
@@ -261,6 +348,7 @@ async function requestJsonWithDeadline({
   requestTimeoutMilliseconds,
   setTimeoutImpl,
   clearTimeoutImpl,
+  responseOptions = undefined,
 }) {
   if (signal?.aborted) fail("service_unavailable");
   const controller = new AbortController();
@@ -271,13 +359,13 @@ async function requestJsonWithDeadline({
     const fetchPromise = Promise.resolve().then(async () => {
       if (controller.signal.aborted) fail("service_unavailable");
       const response = await fetchImpl(url, {
+        ...options,
         credentials: "omit",
         redirect: "error",
-        ...options,
         signal: controller.signal,
       });
       if (controller.signal.aborted) fail("service_unavailable");
-      return readJsonResponse(response, controller.signal);
+      return readJsonResponse(response, controller.signal, responseOptions);
     });
     const timeoutPromise = new Promise((_, reject) => {
       timer = setTimeoutImpl(() => {
@@ -376,6 +464,108 @@ function parseReceipt(value, capability, origin, now) {
   });
 }
 
+function exactKeys(value, keys) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).sort().join("\0") === keys;
+}
+
+function assertLocalLaboratory(laboratory, origin) {
+  const selected = accountlessLocalLaboratoryOrigin(laboratory, origin);
+  if (selected === null) fail("invalid_configuration");
+  return selected;
+}
+
+function assertLeasedDevice(value, origin) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || value.origin !== origin || typeof value.deviceId !== "string"
+      || !DEVICE_ID_PATTERN.test(value.deviceId)) {
+    fail("credential_unavailable");
+  }
+  return Object.freeze({ origin, deviceId: value.deviceId });
+}
+
+function parseOwnershipReceipt(value, device, origin, now) {
+  if (!exactKeys(value, OWNERSHIP_RECEIPT_KEYS)
+      || value.schemaVersion !== ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION
+      || value.policyVersion !== ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION
+      || value.authorizationBasis !== ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS
+      || value.telemetrySchemaVersion !== ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION
+      || value.scope !== ACCOUNTLESS_UPLOAD_OWNER_SCOPE
+      || !["created", "existing"].includes(value.state)
+      || value.deviceId !== device.deviceId
+      || typeof value.expiresAt !== "string"
+      || !Number.isFinite(Date.parse(value.expiresAt))
+      || new Date(value.expiresAt).toISOString() !== value.expiresAt) {
+    fail("response_invalid");
+  }
+  const expiresEpoch = Date.parse(value.expiresAt);
+  let currentTime;
+  try {
+    currentTime = now();
+  } catch {
+    fail("invalid_configuration");
+  }
+  const nowEpoch = epochMilliseconds(currentTime);
+  if (expiresEpoch <= nowEpoch
+      || expiresEpoch > nowEpoch
+        + ACCOUNTLESS_ENROLLMENT_LEASE_MILLISECONDS
+        + ACCOUNTLESS_ENROLLMENT_CLOCK_SKEW_MILLISECONDS) {
+    fail("response_invalid");
+  }
+  return Object.freeze({
+    status: value.state,
+    origin,
+    deviceId: device.deviceId,
+    scope: ACCOUNTLESS_UPLOAD_OWNER_SCOPE,
+    expiresAt: new Date(value.expiresAt).toISOString(),
+  });
+}
+
+function safeLeaseFailure(error) {
+  if (error instanceof ContributionAccountlessClientError) {
+    const code = error.code.slice("contribution_accountless_client_".length);
+    if (ERROR_CODES.has(code)) return Object.freeze({
+      type: "failure",
+      code,
+      retryable: error.retryable === true,
+      retryAfterMilliseconds: error.retryAfterMilliseconds ?? null,
+    });
+  }
+  return Object.freeze({
+    type: "failure",
+    code: "service_unavailable",
+    retryable: true,
+    retryAfterMilliseconds: null,
+  });
+}
+
+function assertOwnershipRequestOptions({
+  fetchImpl,
+  readPreference,
+  backend,
+  withDeviceSecret,
+  stateFile,
+  signal,
+  requestTimeoutMilliseconds,
+  now,
+  setTimeoutImpl,
+  clearTimeoutImpl,
+}) {
+  if (typeof fetchImpl !== "function" || typeof readPreference !== "function"
+      || !backend || typeof backend !== "object" || Array.isArray(backend)
+      || typeof withDeviceSecret !== "function"
+      || (stateFile !== undefined && (typeof stateFile !== "string" || !stateFile))
+      || (signal !== undefined && !(signal instanceof AbortSignal))
+      || !Number.isSafeInteger(requestTimeoutMilliseconds)
+      || requestTimeoutMilliseconds < 1
+      || requestTimeoutMilliseconds > MAXIMUM_REQUEST_TIMEOUT_MILLISECONDS
+      || typeof now !== "function"
+      || typeof setTimeoutImpl !== "function"
+      || typeof clearTimeoutImpl !== "function") {
+    fail("invalid_configuration");
+  }
+}
+
 /**
  * Enroll one local installation capability without granting upload authority.
  * The caller supplies a preference reader; this
@@ -417,8 +607,8 @@ export async function enrollAccountlessContribution({
   let capability;
   try {
     capability = await ensureCapability({ ...capabilityOptions, origin: selectedOrigin });
-  } catch {
-    fail("credential_unavailable");
+  } catch (error) {
+    credentialAccessFailure(error);
   }
   capability = assertCapability(capability, selectedOrigin);
   assertSignalActive(signal);
@@ -454,6 +644,352 @@ export async function enrollAccountlessContribution({
   await readEligiblePreference(readPreference, selectedOrigin);
   assertSignalActive(signal);
   return receipt;
+}
+
+/**
+ * Synthetic-laboratory ownership registration. This entrypoint is deliberately
+ * loopback-only: distributed/hosted accountless upload activation needs its
+ * own reviewed release authorization. Enrollment remains a separate,
+ * non-upload-capable operation.
+ */
+export async function claimAccountlessContributionOwnership({
+  laboratory = false,
+  origin,
+  readPreference,
+  backend,
+  stateFile = undefined,
+  fetchImpl = globalThis.fetch,
+  withDeviceSecret = withContributionDeviceSecret,
+  signal = undefined,
+  requestTimeoutMilliseconds = DEFAULT_REQUEST_TIMEOUT_MILLISECONDS,
+  now = () => Date.now(),
+  setTimeoutImpl = globalThis.setTimeout,
+  clearTimeoutImpl = globalThis.clearTimeout,
+} = {}) {
+  assertOwnershipRequestOptions({
+    fetchImpl,
+    readPreference,
+    backend,
+    withDeviceSecret,
+    stateFile,
+    signal,
+    requestTimeoutMilliseconds,
+    now,
+    setTimeoutImpl,
+    clearTimeoutImpl,
+  });
+  const selectedOrigin = canonicalOrigin(origin);
+  assertLocalLaboratory(laboratory, selectedOrigin);
+  assertSignalActive(signal);
+  await readEligiblePreference(readPreference, selectedOrigin);
+  assertSignalActive(signal);
+
+  let leased;
+  try {
+    leased = await withDeviceSecret({
+      backend,
+      ...(stateFile === undefined ? {} : { stateFile }),
+      expectedOrigin: selectedOrigin,
+      operation: async (secret, leasedDevice) => {
+        try {
+          const device = assertLeasedDevice(leasedDevice, selectedOrigin);
+          assertSignalActive(signal);
+          await readEligiblePreference(readPreference, selectedOrigin);
+          assertSignalActive(signal);
+          const response = await requestJsonWithDeadline({
+            fetchImpl,
+            url: new URL("/api/v1/accountless/ownership", selectedOrigin),
+            options: {
+              method: "POST",
+              headers: {
+                Accept: "application/json",
+                "Content-Type": "application/json",
+                Authorization: `Device um_device_${device.deviceId}.${secret.toString("base64url")}`,
+              },
+              body: JSON.stringify(ACCOUNTLESS_RUN_AUTHORIZATION),
+            },
+            signal,
+            requestTimeoutMilliseconds,
+            setTimeoutImpl,
+            clearTimeoutImpl,
+            responseOptions: {
+              rejectionCode: "ownership_rejected",
+              ownership: true,
+              now,
+            },
+          });
+          assertSignalActive(signal);
+          const receipt = parseOwnershipReceipt(response, device, selectedOrigin, now);
+          assertSignalActive(signal);
+          await readEligiblePreference(readPreference, selectedOrigin);
+          assertSignalActive(signal);
+          return Object.freeze({ type: "success", receipt });
+        } catch (error) {
+          // Carry only a fixed transport classification across the zeroized
+          // secret lease; never return its header, request, or error message.
+          return safeLeaseFailure(error);
+        }
+      },
+    });
+  } catch (error) {
+    if (error instanceof ContributionAccountlessClientError) throw error;
+    credentialAccessFailure(error);
+  }
+  if (!leased || typeof leased !== "object" || Array.isArray(leased)) {
+    fail("credential_unavailable");
+  }
+  if (leased.type === "success") {
+    if (!Object.hasOwn(leased, "receipt")) fail("credential_unavailable");
+    return leased.receipt;
+  }
+  if (leased.type !== "failure" || !ERROR_CODES.has(leased.code)
+      || typeof leased.retryable !== "boolean"
+      || (leased.retryAfterMilliseconds !== null
+        && (!Number.isSafeInteger(leased.retryAfterMilliseconds)
+          || leased.retryAfterMilliseconds < 0
+          || leased.retryAfterMilliseconds > MAXIMUM_RETRY_AFTER_MILLISECONDS))) {
+    fail("credential_unavailable");
+  }
+  fail(leased.code, {
+    retryable: leased.retryable,
+    retryAfterMilliseconds: leased.retryAfterMilliseconds,
+  });
+}
+
+function configuredAccountlessSync(options) {
+  if (!options || typeof options !== "object" || Array.isArray(options)
+      || ["consent", "authorization", "approve", "approval"].some((key) => Object.hasOwn(options, key))) {
+    fail("invalid_configuration");
+  }
+  const {
+    laboratory = false,
+    origin,
+    readPreference,
+    backend,
+    stateFile = undefined,
+    indexFile,
+    fetchImpl = globalThis.fetch,
+    ensureCapability = ensureContributionDeviceCapability,
+    withDeviceSecret = withContributionDeviceSecret,
+    enroll = enrollAccountlessContribution,
+    claimOwnership = claimAccountlessContributionOwnership,
+    runIncrementalSync = runIncrementalContributionSyncOnce,
+    signal = undefined,
+    requestTimeoutMilliseconds = DEFAULT_REQUEST_TIMEOUT_MILLISECONDS,
+    maximumChunks = 500,
+    maximumDurationMilliseconds = 60_000,
+    now = Date.now,
+    setTimeoutImpl = globalThis.setTimeout,
+    clearTimeoutImpl = globalThis.clearTimeout,
+    readAccountMarkers = async () => [],
+    loadExistingAccountObservationSecret = async () => null,
+    onAttributionBinding = null,
+    progressStore = undefined,
+    progressFile = null,
+  } = options;
+  if (typeof readPreference !== "function" || !backend || typeof backend !== "object"
+      || Array.isArray(backend) || typeof indexFile !== "string" || !indexFile
+      || (stateFile !== undefined && (typeof stateFile !== "string" || !stateFile))
+      || [fetchImpl, ensureCapability, withDeviceSecret, enroll, claimOwnership,
+        runIncrementalSync, now, setTimeoutImpl, clearTimeoutImpl, readAccountMarkers,
+        loadExistingAccountObservationSecret].some((value) => typeof value !== "function")
+      || (onAttributionBinding !== null && typeof onAttributionBinding !== "function")
+      || (progressFile !== null && (typeof progressFile !== "string" || !progressFile))
+      || (progressStore !== undefined && (!progressStore || typeof progressStore.read !== "function"
+        || typeof progressStore.write !== "function"))
+      || !Number.isSafeInteger(requestTimeoutMilliseconds)
+      || requestTimeoutMilliseconds < 1_000
+      || requestTimeoutMilliseconds > MAXIMUM_REQUEST_TIMEOUT_MILLISECONDS
+      || !Number.isSafeInteger(maximumChunks) || maximumChunks < 1 || maximumChunks > 2_000
+      || !Number.isSafeInteger(maximumDurationMilliseconds)
+      || maximumDurationMilliseconds < 1 || maximumDurationMilliseconds > 300_000
+      || (signal !== undefined && !(signal instanceof AbortSignal))) {
+    fail("invalid_configuration");
+  }
+  const selectedOrigin = canonicalOrigin(origin);
+  assertLocalLaboratory(laboratory, selectedOrigin);
+  return Object.freeze({
+    laboratory,
+    origin: selectedOrigin,
+    readPreference,
+    backend,
+    stateFile,
+    indexFile,
+    fetchImpl,
+    ensureCapability,
+    withDeviceSecret,
+    enroll,
+    claimOwnership,
+    runIncrementalSync,
+    signal,
+    requestTimeoutMilliseconds,
+    maximumChunks,
+    maximumDurationMilliseconds,
+    now,
+    setTimeoutImpl,
+    clearTimeoutImpl,
+    readAccountMarkers,
+    loadExistingAccountObservationSecret,
+    onAttributionBinding,
+    progressStore,
+    progressFile,
+  });
+}
+
+function accountlessRunFailure(error, { networkActivity = false, signal = undefined } = {}) {
+  let code = "service_unavailable";
+  let retryable = true;
+  let retryAfterMilliseconds = null;
+  if (signal?.aborted) {
+    code = "interrupted";
+  } else if (error instanceof ContributionAccountlessClientError) {
+    const candidate = error.code.slice("contribution_accountless_client_".length);
+    if (ERROR_CODES.has(candidate)) {
+      code = candidate;
+      retryable = error.retryable === true;
+      retryAfterMilliseconds = error.retryAfterMilliseconds ?? null;
+    }
+  }
+  if (code === "interrupted") retryable = true;
+  return Object.freeze({
+    schemaVersion: RUN_SCHEMA_VERSION,
+    status: "failed",
+    daysTotal: 0,
+    daysSynced: 0,
+    daysPending: 0,
+    chunksUploaded: 0,
+    chunksSkipped: 0,
+    recordsUploaded: 0,
+    acknowledgedThroughDay: null,
+    orphanChunkIds: Object.freeze([]),
+    stagedDays: 0,
+    domainGenerationId: null,
+    networkActivity,
+    failure: Object.freeze({
+      code,
+      retryable,
+      deviceUnavailable: code === "device_unavailable",
+      retryAfterMilliseconds,
+    }),
+  });
+}
+
+/**
+ * Run one bounded, synthetic accountless pass against the explicit local
+ * laboratory. It is unavailable for hosted origins. Each actual request is
+ * fenced by a fresh protected preference read; Electron additionally aborts
+ * the signal on opt-out, so a stale pass cannot proceed to a later request.
+ */
+export async function runAccountlessContributionSyncOnce(options = {}) {
+  const configured = configuredAccountlessSync(options);
+  const {
+    laboratory,
+    origin,
+    readPreference,
+    backend,
+    stateFile,
+    indexFile,
+    fetchImpl,
+    ensureCapability,
+    withDeviceSecret,
+    enroll,
+    claimOwnership,
+    runIncrementalSync,
+    signal,
+    requestTimeoutMilliseconds,
+    maximumChunks,
+    maximumDurationMilliseconds,
+    now,
+    setTimeoutImpl,
+    clearTimeoutImpl,
+    readAccountMarkers,
+    loadExistingAccountObservationSecret,
+    onAttributionBinding,
+    progressStore,
+    progressFile,
+  } = configured;
+  let networkActivity = false;
+  const guardedFetch = async (...args) => {
+    assertSignalActive(signal);
+    await readEligiblePreference(readPreference, origin);
+    assertSignalActive(signal);
+    const response = await fetchImpl(...args);
+    networkActivity = true;
+    assertSignalActive(signal);
+    return response;
+  };
+  try {
+    assertSignalActive(signal);
+    await readEligiblePreference(readPreference, origin);
+    assertSignalActive(signal);
+    await enroll({
+      origin,
+      readPreference,
+      fetchImpl: guardedFetch,
+      ensureCapability,
+      capabilityOptions: {
+        backend,
+        ...(stateFile === undefined ? {} : { stateFile }),
+      },
+      signal,
+      requestTimeoutMilliseconds,
+      now,
+      setTimeoutImpl,
+      clearTimeoutImpl,
+    });
+    assertSignalActive(signal);
+    await readEligiblePreference(readPreference, origin);
+    assertSignalActive(signal);
+    await claimOwnership({
+      laboratory,
+      origin,
+      readPreference,
+      backend,
+      ...(stateFile === undefined ? {} : { stateFile }),
+      fetchImpl: guardedFetch,
+      withDeviceSecret,
+      signal,
+      requestTimeoutMilliseconds,
+      now,
+      setTimeoutImpl,
+      clearTimeoutImpl,
+    });
+    assertSignalActive(signal);
+    await readEligiblePreference(readPreference, origin);
+    assertSignalActive(signal);
+    const result = await runIncrementalSync({
+      laboratory,
+      origin,
+      backend,
+      ...(stateFile === undefined ? {} : { stateFile }),
+      indexFile,
+      authorization: ACCOUNTLESS_RUN_AUTHORIZATION,
+      fetchImpl: guardedFetch,
+      withDeviceSecret,
+      maximumChunks,
+      requestTimeoutMilliseconds,
+      maximumDurationMilliseconds,
+      now,
+      readAccountMarkers,
+      loadExistingAccountObservationSecret,
+      onAttributionBinding,
+      progressStore,
+      progressFile,
+      signal,
+    });
+    assertSignalActive(signal);
+    await readEligiblePreference(readPreference, origin);
+    assertSignalActive(signal);
+    if (!result || typeof result !== "object" || Array.isArray(result)) {
+      throw new ContributionAccountlessClientError("response_invalid");
+    }
+    return Object.freeze({
+      ...result,
+      networkActivity: result.networkActivity === true || networkActivity,
+    });
+  } catch (error) {
+    return accountlessRunFailure(error, { networkActivity, signal });
+  }
 }
 
 export {

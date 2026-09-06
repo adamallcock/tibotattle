@@ -39,6 +39,7 @@ export const CLIENT_MANIFEST_FILE = "client-export-manifest.json";
  * Update it only as part of a separately reviewed client-boundary change.
  */
 export const CLIENT_RUNTIME_FILES = Object.freeze([
+  "apps/local/accountless-contribution.js",
   "apps/local/server.js",
   "apps/local/static-assets.js",
   "apps/local/transport/participant-relay-routes.js",
@@ -82,6 +83,8 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "schemas/telemetry-v0.1/usage-event.schema.json",
   "src/account-observation-production.js",
   "src/account-observation-secret.js",
+  "src/platform/accountless-contribution-channel.js",
+  "src/application/accountless-contribution-scheduler.js",
   "src/application/claude-callback-capability.js",
   "src/application/export-compatibility.js",
   "src/application/export-sources/claude-status-export.js",
@@ -146,6 +149,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/contribution-device-sync.js",
   "src/contribution-incremental-sync.js",
   "src/contribution/account-track.js",
+  "src/contribution/accountless-transport-contract.js",
   "src/contribution/index.js",
   "src/contribution/prepared-set-contract.js",
   "src/contribution/telemetry-v01-projection.js",

@@ -470,7 +470,7 @@ const SHARING_STATES = new Set([
   "disabled",
   "legacy_preserved",
 ]);
-const SHARING_TRANSPORT_STATUSES = new Set(["unavailable", "off"]);
+const SHARING_TRANSPORT_STATUSES = new Set(["unavailable", "off", "uploading", "pending", "up_to_date", "retry_wait", "paused"]);
 
 function validSharingTimestamp(value) {
   if (value === null) return true;
@@ -542,6 +542,8 @@ function sharingStateMessageKey(preference) {
 
 function sharingTransportMessageKey(preference) {
   switch (preference?.transportStatus) {
+    case "uploading": case "pending": case "up_to_date": case "retry_wait": case "paused":
+      return `electron.sharing.transport.${preference.transportStatus}`;
     case "off":
       return "electron.sharing.transport.off";
     case "unavailable":

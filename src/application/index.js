@@ -19,6 +19,7 @@ export {
   CONTRIBUTION_PREFERENCE_SCHEMA_VERSION,
   createLocalContributionPreference,
 } from "./local-contribution-preference.js";
+export { createAccountlessContributionScheduler } from "./accountless-contribution-scheduler.js";
 export {
   createLocalMetadataBundleVerificationContext,
 } from "./local-metadata-bundle-verification.js";
